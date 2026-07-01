@@ -162,12 +162,18 @@ func runCommand(args []string, configDir string, stdout, stderr io.Writer, getwd
 		return err
 	}
 
+	if selectedProviderName, selectedProvider, ok := selectedProviderForRun(cfg, *providerName); ok {
+		if err := rejectRunProviderWithoutAdapter(selectedProviderName, selectedProvider); err != nil {
+			return err
+		}
+	}
+
 	resolved, err := cfg.ResolveModel(*providerName, *modelProfile)
 	if err != nil {
 		return err
 	}
-	if resolved.Provider.Type != "openai-chat" {
-		return fmt.Errorf("unsupported provider type %q for provider %q; only openai-chat is supported", resolved.Provider.Type, resolved.ProviderName)
+	if err := rejectRunProviderWithoutAdapter(resolved.ProviderName, resolved.Provider); err != nil {
+		return err
 	}
 
 	provider, err := openaichat.NewProvider(openAIChatProviderConfig(resolved.Provider))
@@ -432,6 +438,30 @@ func loadConfig(configDir string, getwd func() (string, error)) (*config.Config,
 		configDir = filepath.Join(cwd, ".agents")
 	}
 	return config.Load(configDir)
+}
+
+func selectedProviderForRun(cfg *config.Config, providerName string) (string, config.ProviderConfig, bool) {
+	providerName = strings.TrimSpace(providerName)
+	if providerName == "" {
+		providerName = strings.TrimSpace(cfg.DefaultProvider)
+	}
+	if providerName == "" {
+		return "", config.ProviderConfig{}, false
+	}
+
+	provider, ok := cfg.Providers[providerName]
+	return providerName, provider, ok
+}
+
+func rejectRunProviderWithoutAdapter(providerName string, provider config.ProviderConfig) error {
+	switch provider.Type {
+	case config.ProviderTypeOpenAIChat:
+		return nil
+	case config.ProviderTypeAnthropicMessages:
+		return fmt.Errorf("provider type %q for provider %q is recognized, but the sai run adapter is not implemented yet; sai run currently supports only %q", provider.Type, providerName, config.ProviderTypeOpenAIChat)
+	default:
+		return fmt.Errorf("unsupported provider type %q for provider %q", provider.Type, providerName)
+	}
 }
 
 func openAIChatProviderConfig(provider config.ProviderConfig) openaichat.ProviderConfig {

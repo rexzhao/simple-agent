@@ -25,6 +25,11 @@ type Config struct {
 	Providers       map[string]ProviderConfig  `json:"providers" yaml:"providers"`
 }
 
+const (
+	ProviderTypeOpenAIChat        = "openai-chat"
+	ProviderTypeAnthropicMessages = "anthropic-messages"
+)
+
 type AgentConfig struct {
 	MaxTurns      int  `json:"max_turns" yaml:"max_turns"`
 	Stream        bool `json:"stream" yaml:"stream"`
@@ -344,6 +349,8 @@ func loadProviders(providerDir string) (map[string]ProviderConfig, error) {
 		if err := yaml.Unmarshal(data, &provider); err != nil {
 			return nil, fmt.Errorf("parse provider file %q: %w", path, err)
 		}
+		provider.Name = strings.TrimSpace(provider.Name)
+		provider.Type = strings.TrimSpace(provider.Type)
 		if err := validateProvider(path, provider); err != nil {
 			return nil, err
 		}
@@ -359,12 +366,31 @@ func validateProvider(path string, provider ProviderConfig) error {
 	if provider.Name == "" {
 		return fmt.Errorf("provider file %q is missing name", path)
 	}
+	if provider.Type == "" {
+		return fmt.Errorf("provider file %q provider %q is missing type", path, provider.Name)
+	}
+	if !isKnownProviderType(provider.Type) {
+		return fmt.Errorf("provider file %q provider %q has unknown provider type %q; supported provider types: %s", path, provider.Name, provider.Type, formatSupportedProviderTypes())
+	}
 	for profileName, profile := range provider.Models {
 		if profile.ID == "" {
 			return fmt.Errorf("provider file %q model %q is missing id", path, profileName)
 		}
 	}
 	return nil
+}
+
+func isKnownProviderType(providerType string) bool {
+	switch providerType {
+	case ProviderTypeAnthropicMessages, ProviderTypeOpenAIChat:
+		return true
+	default:
+		return false
+	}
+}
+
+func formatSupportedProviderTypes() string {
+	return strings.Join([]string{ProviderTypeAnthropicMessages, ProviderTypeOpenAIChat}, ", ")
 }
 
 func isYAMLFile(name string) bool {

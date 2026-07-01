@@ -23,7 +23,9 @@
   - Model: `glm-5.2`
   - API key 配置: `api_key: $PAPERHUB_API_KEY`
 - skills 是后续开发项，v0.1 不实现。
-- Anthropic Messages 和 OpenAI Responses 后续作为独立 provider adapter 接入。
+- M5 先为 Anthropic Messages 添加 provider type 配置识别和示例；真实 runtime adapter、
+  streaming event 转换和 tool call 转换后续接入。
+- OpenAI Responses 后续作为独立 provider adapter 接入。
 - MCP 不属于 MVP 核心；后续接入时第一种传输只做 stdio。
 - 配置根目录默认是启动时当前工作目录下的 `.agents`，也可以通过 `--config-dir` 指定。
 - 默认读取启动目录下的 `AGENTS.md` 作为项目指令；文件不存在时继续执行。
@@ -180,6 +182,26 @@ models:
   glm-5.2-fast:
     id: glm-5.2
     temperature: 0.2
+    max_tokens: 2048
+```
+
+配置层识别的 provider type 包括 `openai-chat` 和 `anthropic-messages`。当前 `sai run`
+只实际支持 `openai-chat`；`anthropic-messages` 是 M5 配置基础，配置可以加载和列出，
+但运行时会提示 adapter 尚未实现。
+
+```yaml
+# providers/anthropic.yaml
+name: anthropic
+type: anthropic-messages
+base_url: https://api.anthropic.com/v1
+api_key: $ANTHROPIC_API_KEY
+
+models:
+  claude-sonnet-5:
+    id: claude-sonnet-5
+    max_tokens: 4096
+  claude-haiku-4-5:
+    id: claude-haiku-4-5
     max_tokens: 2048
 ```
 

@@ -116,7 +116,9 @@
 
 ## 后续协议
 
-- [ ] 在 provider interface 后添加 Anthropic Messages adapter。
+- [x] 配置层识别 `anthropic-messages` provider type。
+- [x] 添加 Anthropic Messages provider 配置示例。
+- [ ] 实现 Anthropic Messages runtime adapter。
 - [ ] 添加 Anthropic streaming fixture tests。
 - [ ] 添加 Anthropic tool call fixture tests。
 - [ ] 在 provider interface 后添加 OpenAI Responses adapter。

@@ -853,6 +853,25 @@ func TestRunErrorsDoNotLeakAPIKeyValues(t *testing.T) {
 		assertCLIErrorOmits(t, stderr.String(), "direct-secret-value")
 	})
 
+	t.Run("recognized provider type without run adapter", func(t *testing.T) {
+		configDir := t.TempDir()
+		writeCLIRunFixtureInDir(t, configDir, "https://api.anthropic.com/v1", "direct-secret-value", "anthropic-messages")
+
+		var stdout, stderr bytes.Buffer
+		code := RunWithGetwd([]string{"--config-dir", configDir, "run", "Hello"}, &stdout, &stderr, func() (string, error) {
+			return t.TempDir(), nil
+		})
+
+		if code != 1 {
+			t.Fatalf("RunWithGetwd() code = %d, want 1", code)
+		}
+		if stdout.String() != "" {
+			t.Fatalf("stdout = %q, want empty", stdout.String())
+		}
+		assertCLIErrorContains(t, stderr.String(), `provider type "anthropic-messages" for provider "fake" is recognized`, "adapter is not implemented yet", `currently supports only "openai-chat"`)
+		assertCLIErrorOmits(t, stderr.String(), "direct-secret-value")
+	})
+
 	t.Run("unsupported provider type", func(t *testing.T) {
 		configDir := t.TempDir()
 		writeCLIRunFixtureInDir(t, configDir, "http://127.0.0.1:1", "direct-secret-value", "not-openai")
@@ -865,7 +884,7 @@ func TestRunErrorsDoNotLeakAPIKeyValues(t *testing.T) {
 		if code != 1 {
 			t.Fatalf("RunWithGetwd() code = %d, want 1", code)
 		}
-		assertCLIErrorContains(t, stderr.String(), `unsupported provider type "not-openai"`)
+		assertCLIErrorContains(t, stderr.String(), `unknown provider type "not-openai"`, "supported provider types: anthropic-messages, openai-chat")
 		assertCLIErrorOmits(t, stderr.String(), "direct-secret-value")
 	})
 }

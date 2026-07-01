@@ -108,8 +108,11 @@ models:
 字段说明：
 
 - `name`：provider 名称，必须和命令行 `--provider` 可选值一致。
-- `type`：provider adapter 类型。v0.1 只实现 `openai-chat`。
-- `base_url`：OpenAI-compatible API base URL，不包含 `/chat/completions`。
+- `type`：provider adapter 类型。配置层识别 `openai-chat` 和 `anthropic-messages`。
+  `sai run` 当前只实现 `openai-chat`；`anthropic-messages` 是 M5 配置基础，
+  runtime adapter 后续实现。
+- `base_url`：provider API base URL。`openai-chat` 不包含 `/chat/completions`；
+  `anthropic-messages` 使用 Anthropic Messages API base，例如 `https://api.anthropic.com/v1`。
 - `api_key`：provider 的 API key 配置值，遵循敏感配置值的 `$ENV_NAME` 约定。
 - `models`：该 provider 下可选的模型配置。
 - `models.<name>.id`：实际发送给 API 的模型 id。
@@ -117,6 +120,26 @@ models:
 
 model profile 的 key 是 CLI 选择时使用的名字。`id` 是实际传给模型服务的名称。这样可以
 用同一个底层模型创建多个参数不同的 profile。
+
+Anthropic Messages provider 使用同一套 provider/model profile 配置形态：
+
+```yaml
+name: anthropic
+type: anthropic-messages
+base_url: https://api.anthropic.com/v1
+api_key: $ANTHROPIC_API_KEY
+
+models:
+  claude-sonnet-5:
+    id: claude-sonnet-5
+    max_tokens: 4096
+  claude-haiku-4-5:
+    id: claude-haiku-4-5
+    max_tokens: 2048
+```
+
+这类配置可以被加载、列入 `sai models list`，并参与模型解析；但 `sai run` 仍会停止并提示
+`anthropic-messages` 已识别、运行 adapter 尚未实现。
 
 `api_key` 是这次 provider 配置中的具体字段。其他需要脱敏的敏感配置值也可以采用同样
 约定：字符串以 `$` 开头时，`$` 后面的内容作为环境变量名读取实际值；不以 `$` 开头时

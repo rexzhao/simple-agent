@@ -55,6 +55,90 @@ func TestLoadResolvesConfigAndProviderModels(t *testing.T) {
 	}
 }
 
+func TestLoadRecognizesAnthropicMessagesProvider(t *testing.T) {
+	dir := t.TempDir()
+	providersDir := filepath.Join(dir, "providers")
+	if err := os.MkdirAll(providersDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll() error = %v", err)
+	}
+
+	writeFile(t, filepath.Join(dir, "sai.yaml"), `default_provider: anthropic
+default_model: claude-sonnet-5
+provider_dir: providers
+`)
+	writeFile(t, filepath.Join(providersDir, "anthropic.yaml"), `name: anthropic
+type: anthropic-messages
+base_url: https://api.anthropic.com/v1
+api_key: $ANTHROPIC_API_KEY
+
+models:
+  claude-sonnet-5:
+    id: claude-sonnet-5
+    max_tokens: 4096
+  claude-haiku-4-5:
+    id: claude-haiku-4-5
+    max_tokens: 2048
+`)
+
+	cfg, err := Load(dir)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+
+	provider := cfg.Providers["anthropic"]
+	if provider.Type != ProviderTypeAnthropicMessages {
+		t.Fatalf("provider.Type = %q, want %q", provider.Type, ProviderTypeAnthropicMessages)
+	}
+
+	gotModels := cfg.ModelList()
+	wantModels := []ModelInfo{
+		{Provider: "anthropic", Profile: "claude-haiku-4-5", ID: "claude-haiku-4-5"},
+		{Provider: "anthropic", Profile: "claude-sonnet-5", ID: "claude-sonnet-5"},
+	}
+	if len(gotModels) != len(wantModels) {
+		t.Fatalf("len(ModelList()) = %d, want %d: %#v", len(gotModels), len(wantModels), gotModels)
+	}
+	for i := range wantModels {
+		if gotModels[i] != wantModels[i] {
+			t.Fatalf("ModelList()[%d] = %#v, want %#v", i, gotModels[i], wantModels[i])
+		}
+	}
+
+	t.Setenv("ANTHROPIC_API_KEY", "resolved-anthropic-secret")
+	resolved, err := cfg.ResolveModel("", "")
+	if err != nil {
+		t.Fatalf("ResolveModel() error = %v", err)
+	}
+	if resolved.Provider.Type != ProviderTypeAnthropicMessages {
+		t.Fatalf("resolved.Provider.Type = %q, want %q", resolved.Provider.Type, ProviderTypeAnthropicMessages)
+	}
+	if resolved.ModelID != "claude-sonnet-5" {
+		t.Fatalf("resolved.ModelID = %q, want claude-sonnet-5", resolved.ModelID)
+	}
+	if resolved.Provider.ResolvedAPIKey != "resolved-anthropic-secret" {
+		t.Fatalf("resolved API key = %q, want resolved Anthropic API key", resolved.Provider.ResolvedAPIKey)
+	}
+	if got := resolved.Parameters["max_tokens"]; got != 4096 {
+		t.Fatalf("max_tokens = %#v, want 4096", got)
+	}
+}
+
+func TestLoadRejectsUnknownProviderType(t *testing.T) {
+	dir := writeConfigFixture(t)
+	writeFile(t, filepath.Join(dir, "providers", "unknown.yaml"), `name: unknown
+type: not-openai
+base_url: http://localhost:8080/v1
+api_key: direct-secret
+
+models:
+  default:
+    id: model-default
+`)
+
+	_, err := Load(dir)
+	assertErrorContains(t, err, `unknown provider type "not-openai"`, "supported provider types: anthropic-messages, openai-chat")
+}
+
 func TestLoadReadsMCPServerYAMLFiles(t *testing.T) {
 	dir := writeConfigFixture(t)
 	writeMCPFixture(t, dir)

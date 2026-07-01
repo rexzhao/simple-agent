@@ -1,0 +1,12 @@
+name: anthropic
+type: anthropic-messages
+base_url: https://api.anthropic.com/v1
+api_key: $ANTHROPIC_API_KEY
+
+models:
+  claude-sonnet-5:
+    id: claude-sonnet-5
+    max_tokens: 4096
+  claude-haiku-4-5:
+    id: claude-haiku-4-5
+    max_tokens: 2048
