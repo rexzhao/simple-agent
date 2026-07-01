@@ -48,7 +48,7 @@
 - [ ] 默认 provider/model 无效时给出可读错误和可选列表。
 - [ ] 会话进行中不支持切换模型。
 - [ ] 将 `AGENTS.md` 内容加入本次会话上下文。
-- [ ] 实现 SSE scanner。
+- [x] 实现 SSE scanner。
 - [x] 解析 `data: [DONE]`。
 - [x] 解析 `choices[].delta.content`。
 - [x] 解析 `choices[].delta.reasoning_content`。
