@@ -13,6 +13,7 @@ import (
 	"github.com/rexzhao/simple-agent/internal/agent"
 	"github.com/rexzhao/simple-agent/internal/config"
 	projectcontext "github.com/rexzhao/simple-agent/internal/context"
+	eventlog "github.com/rexzhao/simple-agent/internal/logging"
 	"github.com/rexzhao/simple-agent/internal/model"
 	openaichat "github.com/rexzhao/simple-agent/internal/model/openai_chat"
 	"github.com/rexzhao/simple-agent/internal/tools"
@@ -147,15 +148,31 @@ func runCommand(args []string, configDir string, stdout io.Writer, getwd func() 
 		Parameters: resolved.Parameters,
 	}
 
+	logger, err := eventlog.Open(cfg.Logging.Path, eventlog.Attributes{
+		Provider: resolved.ProviderName,
+		Model:    resolved.ModelID,
+		Level:    cfg.Logging.Level,
+	})
+	if err != nil {
+		return err
+	}
+
 	events, err := agent.Stream(context.Background(), request, agent.Options{
 		Provider:     provider,
 		ToolExecutor: toolRegistry,
 		MaxTurns:     cfg.Agent.MaxTurns,
 	})
 	if err != nil {
+		_ = logger.Close()
 		return err
 	}
-	return writeStream(stdout, events, *showReasoning || cfg.Agent.ShowReasoning)
+
+	streamErr := writeStream(stdout, events, *showReasoning || cfg.Agent.ShowReasoning, logger)
+	closeErr := logger.Close()
+	if streamErr != nil {
+		return streamErr
+	}
+	return closeErr
 }
 
 type toolNamesFlag struct {
@@ -251,10 +268,13 @@ func roleForInstruction(source projectcontext.InstructionSource) model.MessageRo
 	}
 }
 
-func writeStream(stdout io.Writer, events <-chan model.Event, showReasoning bool) error {
+func writeStream(stdout io.Writer, events <-chan model.Event, showReasoning bool, logger *eventlog.Logger) error {
 	needsReasoningBreak := false
 	reasoningEndedWithNewline := false
 	for event := range events {
+		if err := logger.LogEvent(event); err != nil {
+			return err
+		}
 		switch event := event.(type) {
 		case model.TextDeltaEvent:
 			if event.Text != "" && needsReasoningBreak {

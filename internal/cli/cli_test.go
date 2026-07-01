@@ -264,6 +264,71 @@ func TestRunExecutesToolCallAndContinuesToFinalText(t *testing.T) {
 	assertNoAdditionalCLIRunRequest(t, requests)
 }
 
+func TestRunWritesJSONLLogForToolCallWithoutSensitiveContent(t *testing.T) {
+	server, requests := newSequentialCLIRunServer(t,
+		[]string{
+			`{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"read_file","arguments":"{\"path\":\"note.txt\"}"}}]}}]}`,
+			`{"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`,
+			`[DONE]`,
+		},
+		[]string{
+			`{"choices":[{"delta":{"content":"final response secret"}}]}`,
+			`{"choices":[],"usage":{"prompt_tokens":11,"completion_tokens":13,"total_tokens":24}}`,
+			`[DONE]`,
+		},
+	)
+	defer server.Close()
+
+	projectDir := t.TempDir()
+	writeCLIFile(t, filepath.Join(projectDir, "note.txt"), "tool output secret")
+	configDir := t.TempDir()
+	writeCLIRunFixtureInDir(t, configDir, server.URL, "secret-api-key", "openai-chat")
+
+	var stdout, stderr bytes.Buffer
+	code := RunWithGetwd([]string{"--config-dir", configDir, "run", "--enable-tools", "read_file", "user prompt secret"}, &stdout, &stderr, func() (string, error) {
+		return projectDir, nil
+	})
+
+	if code != 0 {
+		t.Fatalf("RunWithGetwd() code = %d, stderr = %s", code, stderr.String())
+	}
+	if got, want := stdout.String(), "final response secret"; got != want {
+		t.Fatalf("stdout = %q, want %q", got, want)
+	}
+	<-requests
+	<-requests
+	assertNoAdditionalCLIRunRequest(t, requests)
+
+	logPath := filepath.Join(configDir, "logs", "sai.jsonl")
+	logData, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("ReadFile(%q) error = %v", logPath, err)
+	}
+	logText := string(logData)
+	for _, leaked := range []string{"user prompt secret", "final response secret", "tool output secret", "secret-api-key"} {
+		if strings.Contains(logText, leaked) {
+			t.Fatalf("log leaked %q:\n%s", leaked, logText)
+		}
+	}
+
+	records := readJSONLRecords(t, logData)
+	assertCLILogBaseFields(t, records)
+	if !hasCLILogRecord(records, "tool_call_done", "tool_name", "read_file") {
+		t.Fatalf("log records missing read_file tool_call_done: %#v", records)
+	}
+	if !hasCLILogRecord(records, "tool_result", "tool_name", "read_file") || !hasCLILogRecord(records, "tool_result", "is_error", false) {
+		t.Fatalf("log records missing successful tool_result metadata: %#v", records)
+	}
+	usage := firstCLILogRecord(t, records, "usage")["usage"]
+	usageMap, ok := usage.(map[string]any)
+	if !ok {
+		t.Fatalf("usage field = %T(%#v), want object", usage, usage)
+	}
+	assertJSONNumber(t, usageMap["input_tokens"], "11")
+	assertJSONNumber(t, usageMap["output_tokens"], "13")
+	assertJSONNumber(t, usageMap["total_tokens"], "24")
+}
+
 func TestRunEnableToolsRejectsUnknownTool(t *testing.T) {
 	server, requests := newCLIRunServer(t,
 		`{"choices":[{"delta":{"content":"unexpected"}}]}`,
@@ -694,6 +759,29 @@ func decodeCLIJSON(t *testing.T, data []byte) map[string]any {
 	return value
 }
 
+func readJSONLRecords(t *testing.T, data []byte) []map[string]any {
+	t.Helper()
+
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	records := make([]map[string]any, 0, len(lines))
+	for _, line := range lines {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		var record map[string]any
+		decoder := json.NewDecoder(strings.NewReader(line))
+		decoder.UseNumber()
+		if err := decoder.Decode(&record); err != nil {
+			t.Fatalf("decode JSONL line %q: %v", line, err)
+		}
+		records = append(records, record)
+	}
+	if len(records) == 0 {
+		t.Fatal("JSONL log has no records")
+	}
+	return records
+}
+
 func requestMessages(t *testing.T, body map[string]any) []any {
 	t.Helper()
 
@@ -864,6 +952,45 @@ func assertCLIErrorOmits(t *testing.T, got string, values ...string) {
 			t.Fatalf("stderr leaked %q: %s", value, got)
 		}
 	}
+}
+
+func assertCLILogBaseFields(t *testing.T, records []map[string]any) {
+	t.Helper()
+
+	for _, record := range records {
+		for _, key := range []string{"time", "level", "event", "provider", "model"} {
+			if value, ok := record[key].(string); !ok || value == "" {
+				t.Fatalf("log record %v missing string field %q", record, key)
+			}
+		}
+		if record["provider"] != "fake" {
+			t.Fatalf("log provider = %#v, want fake", record["provider"])
+		}
+		if record["model"] != "model-default" {
+			t.Fatalf("log model = %#v, want model-default", record["model"])
+		}
+	}
+}
+
+func firstCLILogRecord(t *testing.T, records []map[string]any, event string) map[string]any {
+	t.Helper()
+
+	for _, record := range records {
+		if record["event"] == event {
+			return record
+		}
+	}
+	t.Fatalf("missing log event %q in %#v", event, records)
+	return nil
+}
+
+func hasCLILogRecord(records []map[string]any, event, key string, value any) bool {
+	for _, record := range records {
+		if record["event"] == event && record[key] == value {
+			return true
+		}
+	}
+	return false
 }
 
 func assertNoAdditionalCLIRunRequest(t *testing.T, requests <-chan capturedCLIRunRequest) {
