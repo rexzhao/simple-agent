@@ -54,3 +54,24 @@ func ConvertTools(serverID string, definitions []ToolDefinition) ([]model.Tool, 
 
 	return tools, nil
 }
+
+func EnabledSchemas(tools []model.Tool, enabled []string) ([]model.Tool, error) {
+	byName := make(map[string]model.Tool, len(tools))
+	for _, tool := range tools {
+		byName[tool.Name] = tool
+	}
+
+	schemas := make([]model.Tool, 0, len(enabled))
+	for _, name := range enabled {
+		if !strings.HasPrefix(name, "mcp.") {
+			continue
+		}
+
+		tool, ok := byName[name]
+		if !ok {
+			return nil, fmt.Errorf("enabled MCP tool %q is not available", name)
+		}
+		schemas = append(schemas, tool)
+	}
+	return schemas, nil
+}

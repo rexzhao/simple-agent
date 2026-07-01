@@ -2,7 +2,10 @@ package mcp
 
 import (
 	"reflect"
+	"strings"
 	"testing"
+
+	"github.com/rexzhao/simple-agent/internal/model"
 )
 
 func TestToolNamePrefixesServerAndTool(t *testing.T) {
@@ -83,5 +86,86 @@ func TestConvertToolsRejectsDuplicateConvertedNames(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatalf("ConvertTools() error = nil, want error")
+	}
+}
+
+func TestEnabledSchemasReturnsOnlyEnabledMCPTools(t *testing.T) {
+	tools := []model.Tool{
+		{Name: "mcp.local.search", Description: "search"},
+		{Name: "mcp.local.read", Description: "read"},
+		{Name: "mcp.git.status", Description: "status"},
+	}
+
+	got, err := EnabledSchemas(tools, []string{"mcp.local.read"})
+	if err != nil {
+		t.Fatalf("EnabledSchemas() error = %v", err)
+	}
+
+	want := []model.Tool{tools[1]}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("EnabledSchemas() = %#v, want %#v", got, want)
+	}
+}
+
+func TestEnabledSchemasSkipsNonMCPEnabledTools(t *testing.T) {
+	tools := []model.Tool{
+		{Name: "mcp.local.search", Description: "search"},
+		{Name: "mcp.local.read", Description: "read"},
+	}
+
+	got, err := EnabledSchemas(tools, []string{"list_files", "mcp.local.read", "read_file"})
+	if err != nil {
+		t.Fatalf("EnabledSchemas() error = %v", err)
+	}
+
+	want := []model.Tool{tools[1]}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("EnabledSchemas() = %#v, want %#v", got, want)
+	}
+}
+
+func TestEnabledSchemasPreservesEnabledOrder(t *testing.T) {
+	tools := []model.Tool{
+		{Name: "mcp.local.search"},
+		{Name: "mcp.local.read"},
+		{Name: "mcp.git.status"},
+	}
+
+	got, err := EnabledSchemas(tools, []string{"mcp.git.status", "mcp.local.search"})
+	if err != nil {
+		t.Fatalf("EnabledSchemas() error = %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("EnabledSchemas() returned %d tools, want 2", len(got))
+	}
+
+	gotNames := []string{got[0].Name, got[1].Name}
+	wantNames := []string{"mcp.git.status", "mcp.local.search"}
+	if !reflect.DeepEqual(gotNames, wantNames) {
+		t.Fatalf("EnabledSchemas() names = %#v, want %#v", gotNames, wantNames)
+	}
+}
+
+func TestEnabledSchemasRejectsUnknownTool(t *testing.T) {
+	tools := []model.Tool{{Name: "mcp.local.search"}}
+
+	_, err := EnabledSchemas(tools, []string{"mcp.local.missing"})
+	if err == nil {
+		t.Fatalf("EnabledSchemas() error = nil, want error")
+	}
+	if !strings.Contains(err.Error(), `enabled MCP tool "mcp.local.missing" is not available`) {
+		t.Fatalf("EnabledSchemas() error = %q, want unknown tool message", err)
+	}
+}
+
+func TestEnabledSchemasReturnsEmptyWhenEnabledIsEmpty(t *testing.T) {
+	tools := []model.Tool{{Name: "mcp.local.search"}}
+
+	got, err := EnabledSchemas(tools, nil)
+	if err != nil {
+		t.Fatalf("EnabledSchemas() error = %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("EnabledSchemas() returned %d tools, want 0", len(got))
 	}
 }
