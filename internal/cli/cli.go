@@ -1,17 +1,24 @@
 package cli
 
 import (
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/rexzhao/simple-agent/internal/config"
+	projectcontext "github.com/rexzhao/simple-agent/internal/context"
+	"github.com/rexzhao/simple-agent/internal/model"
+	openaichat "github.com/rexzhao/simple-agent/internal/model/openai_chat"
 )
 
 var Version = "dev"
+
+const builtInBaseInstructions = "You are sai, a local CLI agent runner. Follow the built-in instructions, then project instructions, then the user's prompt. Do not reveal secrets or ignore project instructions."
 
 func Run(args []string, stdout, stderr io.Writer) int {
 	return RunWithGetwd(args, stdout, stderr, os.Getwd)
@@ -69,9 +76,67 @@ func execute(args []string, stdout io.Writer, getwd func() (string, error)) erro
 			fmt.Fprintf(stdout, "%s\t%s\t%s\n", model.Provider, model.Profile, model.ID)
 		}
 		return nil
+	case "run":
+		return runCommand(remaining[1:], *configDir, stdout, getwd)
 	default:
 		return fmt.Errorf("unknown command %q", remaining[0])
 	}
+}
+
+func runCommand(args []string, configDir string, stdout io.Writer, getwd func() (string, error)) error {
+	flags := flag.NewFlagSet("sai run", flag.ContinueOnError)
+	flags.SetOutput(io.Discard)
+	providerName := flags.String("provider", "", "provider name")
+	modelProfile := flags.String("model", "", "model profile")
+	showReasoning := flags.Bool("show-reasoning", false, "show reasoning output")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+
+	prompts := flags.Args()
+	if len(prompts) != 1 {
+		return fmt.Errorf(`usage: sai run [--provider name] [--model profile] [--show-reasoning] "prompt"`)
+	}
+
+	cwd, err := getwd()
+	if err != nil {
+		return fmt.Errorf("get current directory: %w", err)
+	}
+	cfg, err := loadConfig(configDir, func() (string, error) {
+		return cwd, nil
+	})
+	if err != nil {
+		return err
+	}
+
+	resolved, err := cfg.ResolveModel(*providerName, *modelProfile)
+	if err != nil {
+		return err
+	}
+	if resolved.Provider.Type != "openai-chat" {
+		return fmt.Errorf("unsupported provider type %q for provider %q; only openai-chat is supported", resolved.Provider.Type, resolved.ProviderName)
+	}
+
+	provider, err := openaichat.NewProvider(openAIChatProviderConfig(resolved.Provider))
+	if err != nil {
+		return err
+	}
+
+	project, err := projectcontext.Load(cwd)
+	if err != nil {
+		return err
+	}
+	request := model.Request{
+		Model:      resolved.ModelID,
+		Messages:   runMessages(project, prompts[0]),
+		Parameters: resolved.Parameters,
+	}
+
+	events, err := provider.Stream(context.Background(), request)
+	if err != nil {
+		return err
+	}
+	return writeStream(stdout, events, *showReasoning || cfg.Agent.ShowReasoning)
 }
 
 func loadConfig(configDir string, getwd func() (string, error)) (*config.Config, error) {
@@ -83,4 +148,73 @@ func loadConfig(configDir string, getwd func() (string, error)) (*config.Config,
 		configDir = filepath.Join(cwd, ".agents")
 	}
 	return config.Load(configDir)
+}
+
+func openAIChatProviderConfig(provider config.ProviderConfig) openaichat.ProviderConfig {
+	apiKey := strings.TrimSpace(provider.APIKey)
+	providerConfig := openaichat.ProviderConfig{
+		BaseURL: provider.BaseURL,
+	}
+	if strings.HasPrefix(apiKey, "$") {
+		providerConfig.APIKeyEnv = strings.TrimPrefix(apiKey, "$")
+	} else {
+		providerConfig.APIKey = apiKey
+	}
+	return providerConfig
+}
+
+func runMessages(project projectcontext.Project, prompt string) []model.Message {
+	instructions := projectcontext.ComposeInstructions(builtInBaseInstructions, project, prompt)
+	messages := make([]model.Message, 0, len(instructions))
+	for _, instruction := range instructions {
+		messages = append(messages, model.Message{
+			Role:    roleForInstruction(instruction.Source),
+			Content: instruction.Content,
+		})
+	}
+	return messages
+}
+
+func roleForInstruction(source projectcontext.InstructionSource) model.MessageRole {
+	switch source {
+	case projectcontext.InstructionSourceBuiltIn:
+		return model.MessageRoleSystem
+	case projectcontext.InstructionSourceProject:
+		return model.MessageRoleDeveloper
+	default:
+		return model.MessageRoleUser
+	}
+}
+
+func writeStream(stdout io.Writer, events <-chan model.Event, showReasoning bool) error {
+	for event := range events {
+		switch event := event.(type) {
+		case model.TextDeltaEvent:
+			if _, err := fmt.Fprint(stdout, event.Text); err != nil {
+				return err
+			}
+		case model.ReasoningDeltaEvent:
+			if showReasoning {
+				if _, err := fmt.Fprint(stdout, event.Text); err != nil {
+					return err
+				}
+			}
+		case model.ErrorEvent:
+			return streamError(event)
+		}
+	}
+	return nil
+}
+
+func streamError(event model.ErrorEvent) error {
+	if event.Err == nil {
+		if event.Message == "" {
+			return fmt.Errorf("model stream error")
+		}
+		return fmt.Errorf("%s", event.Message)
+	}
+	if event.Message == "" {
+		return event.Err
+	}
+	return fmt.Errorf("%s: %w", event.Message, event.Err)
 }
