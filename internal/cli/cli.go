@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 
 	"github.com/rexzhao/simple-agent/internal/config"
 )
@@ -79,7 +80,7 @@ func loadConfig(configDir string, getwd func() (string, error)) (*config.Config,
 		if err != nil {
 			return nil, fmt.Errorf("get current directory: %w", err)
 		}
-		configDir = cwd
+		configDir = filepath.Join(cwd, ".agents")
 	}
 	return config.Load(configDir)
 }

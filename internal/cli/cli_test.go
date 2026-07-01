@@ -31,12 +31,13 @@ func TestModelsListUsesGlobalConfigDirFlag(t *testing.T) {
 	}
 }
 
-func TestModelsListDefaultsConfigDirToCurrentWorkingDirectory(t *testing.T) {
-	dir := writeCLIFixture(t)
+func TestModelsListDefaultsConfigDirToAgentsUnderCurrentWorkingDirectory(t *testing.T) {
+	projectDir := t.TempDir()
+	writeCLIFixtureInDir(t, filepath.Join(projectDir, ".agents"))
 
 	var stdout, stderr bytes.Buffer
 	code := RunWithGetwd([]string{"models", "list"}, &stdout, &stderr, func() (string, error) {
-		return dir, nil
+		return projectDir, nil
 	})
 
 	if code != 0 {
@@ -86,12 +87,19 @@ func writeCLIFixture(t *testing.T) string {
 	t.Helper()
 
 	dir := t.TempDir()
+	writeCLIFixtureInDir(t, dir)
+	return dir
+}
+
+func writeCLIFixtureInDir(t *testing.T, dir string) {
+	t.Helper()
+
 	providersDir := filepath.Join(dir, "providers")
 	if err := os.MkdirAll(providersDir, 0o755); err != nil {
 		t.Fatalf("MkdirAll() error = %v", err)
 	}
 
-	writeCLIFile(t, filepath.Join(dir, "config.yaml"), `default_provider: paperhub
+	writeCLIFile(t, filepath.Join(dir, "sai.yaml"), `default_provider: paperhub
 default_model: glm-5.2
 provider_dir: providers
 
@@ -123,8 +131,6 @@ models:
     temperature: 0.2
     max_tokens: 2048
 `)
-
-	return dir
 }
 
 func writeCLIFile(t *testing.T, path, content string) {

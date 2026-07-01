@@ -68,13 +68,13 @@ func Load(configDir string) (*Config, error) {
 	absConfigDir = filepath.Clean(absConfigDir)
 
 	cfg := defaultConfig()
-	configPath := filepath.Join(absConfigDir, "config.yaml")
+	configPath := filepath.Join(absConfigDir, "sai.yaml")
 	data, err := os.ReadFile(configPath)
 	if err != nil {
-		return nil, fmt.Errorf("read config.yaml: %w", err)
+		return nil, fmt.Errorf("read sai.yaml: %w", err)
 	}
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
-		return nil, fmt.Errorf("parse config.yaml: %w", err)
+		return nil, fmt.Errorf("parse sai.yaml: %w", err)
 	}
 
 	cfg.ConfigDir = absConfigDir

@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -73,6 +74,18 @@ func TestModelListIsSortedAndIncludesActualIDs(t *testing.T) {
 	}
 }
 
+func TestLoadMissingConfigMentionsSaiYAML(t *testing.T) {
+	dir := t.TempDir()
+
+	_, err := Load(dir)
+	if err == nil {
+		t.Fatal("Load() error = nil, want error")
+	}
+	if got := err.Error(); !strings.Contains(got, "sai.yaml") {
+		t.Fatalf("Load() error = %q, want mention sai.yaml", got)
+	}
+}
+
 func writeConfigFixture(t *testing.T) string {
 	t.Helper()
 
@@ -82,7 +95,7 @@ func writeConfigFixture(t *testing.T) string {
 		t.Fatalf("MkdirAll() error = %v", err)
 	}
 
-	writeFile(t, filepath.Join(dir, "config.yaml"), `default_provider: paperhub
+	writeFile(t, filepath.Join(dir, "sai.yaml"), `default_provider: paperhub
 default_model: glm-5.2
 provider_dir: providers
 
