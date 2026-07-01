@@ -41,6 +41,8 @@
 
 - [x] 实现 OpenAI-compatible request body。
 - [x] 从 provider 配置加载 `base_url` 和 `api_key`。
+- [ ] 在配置读取阶段解析 `api_key` 的 `$ENV_NAME` 敏感配置值。
+- [ ] 移除 `openai-chat` adapter 的通用 `APIKeyEnv` / `lookupEnv` 配置入口；仅在需要时保留协议特定默认环境变量。
 - [x] 从 model profile 加载模型 id 和模型参数。
 - [x] 添加 PaperHub provider 配置示例。
 - [x] 支持会话开始时通过 `--provider` 和 `--model` 选择模型。
