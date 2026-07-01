@@ -12,6 +12,9 @@
 
 暂时不读取用户目录，也不向用户目录写入默认配置。
 
+`AGENTS.md` 不属于配置目录。它是项目上下文文件，v0.1 默认只从启动时当前工作目录读取。
+`--config-dir` 不改变 `AGENTS.md` 的查找位置。
+
 ```text
 sai run "你好"
 sai --config-dir ./config run "你好"
@@ -23,6 +26,7 @@ sai --config-dir ./examples/paperhub chat
 推荐布局：
 
 ```text
+AGENTS.md
 config.yaml
 providers/
   paperhub.yaml
@@ -36,6 +40,9 @@ logs/
 这些路径都位于配置根目录下。`config.yaml` 是全局配置，负责默认 provider、默认
 model、provider 目录、MCP 目录、工具启用和 agent 通用参数。`providers/*.yaml`
 每个文件描述一个 provider。`mcp/*.yaml` 每个文件描述一个 MCP server。
+
+当配置根目录由 `--config-dir` 指定时，上面的配置文件从该目录读取；`AGENTS.md` 仍从
+启动时当前工作目录读取。
 
 ## 全局配置
 
@@ -127,7 +134,7 @@ env: {}
 - `env`：传给 MCP server 的环境变量。
 
 MCP tools 会转换成内部 tool schema，但仍然需要出现在 enabled tools 列表中才会暴露给
-模型。MCP tool 名称建议使用 `mcp.<server>.<tool>` 形式，避免和内置工具冲突。
+模型。MCP tool 名称必须使用 `mcp.<server>.<tool>` 形式，避免和内置工具冲突。
 
 默认启用 `enabled: true` 的 MCP server。如果传入 `--enable-mcp`，本次运行的 MCP server
 启用列表完全由命令行决定，忽略各 MCP 文件中的 `enabled` 字段。
@@ -174,6 +181,8 @@ sai run --enable-tools list_files,read_file "看看当前目录"
 
 `--enable-tools` 是覆盖，不是追加。`shell` 不需要额外 flag；只要它被启用，就按普通工具
 暴露给模型。如果后续加入 `write_file`，也遵循同一规则。
+
+`shell` 工具默认在启动目录执行命令。v0.1 不提供 `--workdir` 配置。
 
 注意：`--enable-mcp` 只决定启动哪些 MCP server；`--enable-tools` 决定哪些工具暴露给
 模型。一个 MCP server 被启用后，它的工具仍需要出现在 enabled tools 列表中才会被模型
@@ -224,5 +233,5 @@ logging:
 ```
 
 每行日志是一个 JSON object。日志可以记录模型请求生命周期、工具调用、usage、HTTP 错误
-和 MCP 错误。API key、Authorization header 和其他密钥不能进入日志。默认日志不记录完整
-prompt、response、tool result 正文。
+和 MCP 错误。API key、Authorization header 和其他密钥不能进入日志。v0.1 不记录完整
+prompt、response、tool result 正文，也不提供开启正文日志的配置。

@@ -26,6 +26,7 @@
 - Anthropic Messages 和 OpenAI Responses 后续作为独立 provider adapter 接入。
 - MCP 第一阶段只做 stdio。
 - 配置默认从启动目录读取，也可以通过 `--config-dir` 指定。
+- 默认读取启动目录下的 `AGENTS.md` 作为项目指令；文件不存在时继续执行。
 - 只落盘 JSONL 日志；会话历史、上下文快照和其他状态暂不落盘。
 
 ## v0.1 非目标
@@ -53,6 +54,9 @@ internal/config
 
 internal/agent
   对话循环、max turns、tool 执行循环
+
+internal/context
+  项目上下文加载，例如 AGENTS.md
 
 internal/model
   provider interface 和统一 stream event 类型
@@ -190,6 +194,32 @@ sai chat --provider paperhub --model glm-5.2
 如果命令行没有指定模型，则使用全局默认值。若默认值缺失或无效，CLI 应给出可选
 provider/model 列表并停止。v0.1 不支持会话进行中切换模型。
 
+## 项目上下文
+
+`sai` 默认读取启动目录下的 `AGENTS.md`，并把其中的内容作为项目指令加入本次会话的
+system/developer context。`AGENTS.md` 缺失时不报错。
+
+v0.1 只读取启动目录的 `AGENTS.md`：
+
+```text
+AGENTS.md
+config.yaml
+providers/
+mcp/
+```
+
+`--config-dir` 只影响配置文件位置，不影响 `AGENTS.md` 位置。`sai` 暂时不读取用户目录
+里的 `AGENTS.md`，也不做多层目录向上/向下查找。
+
+项目指令优先级：
+
+```text
+sai 内置基础约束 > AGENTS.md > 当前用户 prompt
+```
+
+用户 prompt 不应覆盖 `sai` 的基础安全和执行约束，也不应隐式覆盖 `AGENTS.md` 中的项目
+约定。后续如需临时忽略项目指令，应增加显式参数，而不是通过普通 prompt 实现。
+
 ## OpenAI-Compatible Streaming 注意点
 
 PaperHub smoke test 已确认 `glm-5.2` 返回 OpenAI Chat Completions 风格的
@@ -262,6 +292,9 @@ sai run --enable-tools list_files,read_file "列出当前目录"
 `--enable-tools` 覆盖配置文件中的 enabled tools 列表，而不是追加。`shell` 不需要额外
 审核 flag；只要它被启用，就按普通工具处理。如果后续加入 `write_file`，也遵循同一规则。
 
+`shell` 工具默认在启动目录执行命令。v0.1 不提供 `--workdir`，也不做复杂沙箱；后续如需
+改变执行目录，再增加显式参数。
+
 ## MCP
 
 MCP 使用单独目录配置，不放进 provider 配置。每个 MCP server 一个 YAML 文件，和
@@ -284,6 +317,9 @@ MCP 在第一阶段作为一种 tool source：
 4. 将 MCP tool schema 转换为内部 tool schema。
 5. 只有 enabled tools 中包含对应 MCP tool 时，才暴露给模型。
 6. 模型调用对应工具时，转发给 MCP server。
+
+MCP tool 名称必须使用 `mcp.<server>.<tool>` 形式，避免和内置工具冲突。实现中应固定该
+命名规则，而不是把 MCP 原始 tool name 直接暴露给模型。
 
 默认启用 `enabled: true` 的 MCP server。如果命令行传入 `--enable-mcp`，本次运行的
 MCP server 启用列表完全由该参数决定，忽略 MCP 文件中的 `enabled` 字段。
@@ -310,7 +346,8 @@ model
 ```
 
 工具调用、usage、HTTP 错误、MCP 错误可以写入日志。API key、Authorization header
-和其他密钥不能写入日志。默认日志不记录完整 prompt、response、tool result 正文。
+和其他密钥不能写入日志。v0.1 不记录完整 prompt、response、tool result 正文，也不提供
+开启正文日志的配置。
 
 ## 测试策略
 
@@ -319,6 +356,10 @@ model
 - 单元测试：stream parser、event 转换、config 加载、tool call delta 累积。
 - 集成测试：本地 fake OpenAI-compatible server、本地 fake MCP server。
 - 手动 smoke test：使用 `PAPERHUB_API_KEY` 调 PaperHub。
+
+M2 完成前需要额外做一次 PaperHub tool call smoke test，确认 `glm-5.2` 对
+OpenAI-compatible `tools` / `tool_calls` 的真实兼容性。若服务不支持，保留协议层实现，
+并将 PaperHub 的 tool calling 标记为已知限制。
 
 手动测试命令：
 

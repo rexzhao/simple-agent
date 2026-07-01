@@ -26,6 +26,11 @@
 - [ ] 支持每个 model profile 设置自己的请求参数。
 - [ ] 支持每个 MCP server 一个独立 YAML 文件。
 - [ ] 支持 `--enable-mcp` 覆盖 MCP 文件中的 `enabled` 字段。
+- [ ] 默认读取启动目录下的 `AGENTS.md`。
+- [ ] 缺失 `AGENTS.md` 时继续执行。
+- [ ] `--config-dir` 不改变 `AGENTS.md` 查找位置。
+- [ ] 暂时不读取用户目录中的 `AGENTS.md`。
+- [ ] 实现指令优先级：`sai` 内置基础约束 > `AGENTS.md` > 当前用户 prompt。
 - [ ] 支持 JSONL 日志配置。
 - [ ] 添加 provider interface。
 - [ ] 添加内部 stream event 类型。
@@ -43,6 +48,7 @@
 - [ ] 未指定模型时使用全局默认 provider/model。
 - [ ] 默认 provider/model 无效时给出可读错误和可选列表。
 - [ ] 会话进行中不支持切换模型。
+- [ ] 将 `AGENTS.md` 内容加入本次会话上下文。
 - [ ] 实现 SSE scanner。
 - [ ] 解析 `data: [DONE]`。
 - [ ] 解析 `choices[].delta.content`。
@@ -65,6 +71,7 @@
 - [ ] 默认不启用任何工具。
 - [ ] 通过配置 `tools.enabled` 启用工具。
 - [ ] 通过 `--enable-tools` 覆盖配置中的 enabled tools。
+- [ ] `shell` 默认在启动目录执行命令。
 - [ ] 累积 streamed tool call arguments。
 - [ ] 执行完整 tool call。
 - [ ] 追加 tool result messages。
@@ -72,6 +79,7 @@
 - [ ] 添加 `max_turns`。
 - [ ] 添加 partial JSON argument chunks 测试。
 - [ ] 添加 malformed tool arguments 测试。
+- [ ] 执行 PaperHub tool call smoke test，或记录不兼容限制。
 
 ## M3：MCP
 
@@ -83,6 +91,7 @@
 - [ ] 发送 MCP initialize request。
 - [ ] 列出 MCP tools。
 - [ ] 将 MCP tools 转换为内部 tool schema。
+- [ ] MCP tool 名称固定为 `mcp.<server>.<tool>`。
 - [ ] MCP tools 仍受 enabled tools 列表控制。
 - [ ] 将 tool call route 到 MCP。
 - [ ] 将 MCP tool result 回传给模型。
@@ -96,6 +105,7 @@
 - [ ] 添加 `--verbose`。
 - [ ] 添加 JSONL 日志。
 - [ ] 除 JSONL 日志外，不落盘会话历史或上下文快照。
+- [ ] v0.1 不记录完整 prompt、response、tool result 正文。
 - [ ] missing API key 有可读错误。
 - [ ] HTTP failure 有可读错误。
 - [ ] invalid SSE chunk 有可读错误。

@@ -18,6 +18,8 @@
 - 支持单独的 `mcp/` 配置目录，每个 MCP server 一个 YAML 文件。
 - 支持 `--enable-mcp` 覆盖 MCP 文件中的 `enabled` 字段。
 - 支持 `tools.enabled` 配置，默认不启用工具。
+- 支持读取启动目录下的 `AGENTS.md`，缺失时继续执行。
+- 明确项目指令优先级：`sai` 内置基础约束 > `AGENTS.md` > 当前用户 prompt。
 - 支持 JSONL 日志配置。
 - 定义 provider interface 和内部事件类型。
 - 记录 PaperHub provider profile。
@@ -28,6 +30,7 @@
 - `sai config show` 能输出不含密钥的解析后配置。
 - `sai config show --config-dir ./example-config` 能从指定目录读取配置。
 - `sai models list` 能列出配置中的 provider/model。
+- `sai` 在启动目录存在 `AGENTS.md` 时能加载项目指令。
 
 ## M1：OpenAI-Compatible Streaming
 
@@ -41,12 +44,14 @@
 - 处理 `delta.reasoning_content`。
 - `sai run "prompt"` 命令。
 - 会话开始时根据 `--provider` 和 `--model` 选择模型。
+- 将启动目录的 `AGENTS.md` 内容加入本次会话上下文。
 - `--show-reasoning` 参数。
 
 验证：
 
 - `sai run --provider paperhub "你是谁？"` 能流式输出可见文本。
 - `sai chat --provider paperhub --model glm-5.2` 在会话开始时固定模型。
+- 缺失 `AGENTS.md` 时命令仍可正常运行。
 - reasoning 内容默认隐藏。
 - `--show-reasoning` 能单独显示 reasoning 内容。
 - 单元测试覆盖普通 chunk、reasoning chunk、usage chunk 和 `[DONE]`。
@@ -66,6 +71,7 @@
 - 工具默认不启用。
 - `tools.enabled` 控制默认暴露给模型的工具。
 - `--enable-tools` 覆盖配置中的 enabled tools 列表。
+- `shell` 工具默认在启动目录执行命令。
 - JSONL 日志记录工具调用事件。
 
 验证：
@@ -74,6 +80,7 @@
 - fake OpenAI-compatible server 能请求工具并收到工具结果。
 - 未启用工具时，请求 payload 不包含 tools。
 - `--enable-tools list_files,read_file` 只暴露这两个工具。
+- PaperHub tool call smoke test 已执行，或将不兼容情况记录为已知限制。
 - 达到 `max_turns` 时 agent 给出清晰错误并停止。
 
 ## M3：MCP Stdio Tools
@@ -89,7 +96,7 @@
 - MCP initialize 流程。
 - MCP tool listing。
 - MCP tool call routing。
-- MCP tools 通过 enabled tools 控制是否暴露给模型。
+- MCP tools 使用 `mcp.<server>.<tool>` 命名，并通过 enabled tools 控制是否暴露给模型。
 - `sai mcp list` 命令。
 
 验证：
