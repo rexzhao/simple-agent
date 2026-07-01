@@ -14,28 +14,28 @@
 
 ## M0：项目骨架
 
-- [ ] 初始化 Go module。
-- [ ] 添加 `sai` CLI 入口。
-- [ ] 添加 version 命令。
-- [ ] 添加 config package。
-- [ ] 使用 YAML 作为第一配置格式。
-- [ ] 默认从启动时当前工作目录读取 `config.yaml`。
-- [ ] 支持通过 `--config-dir` 指定配置目录。
-- [ ] 暂时不读取或写入用户目录配置。
-- [ ] 支持每个 provider 一个独立 YAML 文件。
-- [ ] 支持一个 provider 声明多个 model profile。
-- [ ] 支持每个 model profile 设置自己的请求参数。
+- [x] 初始化 Go module。
+- [x] 添加 `sai` CLI 入口。
+- [x] 添加 version 命令。
+- [x] 添加 config package。
+- [x] 使用 YAML 作为第一配置格式。
+- [x] 默认从启动时当前工作目录读取 `config.yaml`。
+- [x] 支持通过 `--config-dir` 指定配置目录。
+- [x] 暂时不读取或写入用户目录配置。
+- [x] 支持每个 provider 一个独立 YAML 文件。
+- [x] 支持一个 provider 声明多个 model profile。
+- [x] 支持每个 model profile 设置自己的请求参数。
 - [ ] 默认读取启动目录下的 `AGENTS.md`。
 - [ ] 缺失 `AGENTS.md` 时继续执行。
 - [ ] `--config-dir` 不改变 `AGENTS.md` 查找位置。
 - [ ] 暂时不读取用户目录中的 `AGENTS.md`。
 - [ ] 实现指令优先级：`sai` 内置基础约束 > `AGENTS.md` > 当前用户 prompt。
-- [ ] 支持 JSONL 日志配置。
-- [ ] 添加 provider interface。
-- [ ] 添加内部 stream event 类型。
-- [ ] 添加 `sai models list`。
-- [ ] 添加初始测试。
-- [ ] 验证 `go test ./...`。
+- [x] 支持 JSONL 日志配置。
+- [x] 添加 provider interface。
+- [x] 添加内部 stream event 类型。
+- [x] 添加 `sai models list`。
+- [x] 添加初始测试。
+- [x] 验证 `go test ./...`。
 
 ## M1：Streaming
 
