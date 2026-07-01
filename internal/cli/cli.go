@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -14,6 +15,7 @@ import (
 	"github.com/rexzhao/simple-agent/internal/config"
 	projectcontext "github.com/rexzhao/simple-agent/internal/context"
 	eventlog "github.com/rexzhao/simple-agent/internal/logging"
+	"github.com/rexzhao/simple-agent/internal/mcp"
 	"github.com/rexzhao/simple-agent/internal/model"
 	openaichat "github.com/rexzhao/simple-agent/internal/model/openai_chat"
 	"github.com/rexzhao/simple-agent/internal/tools"
@@ -125,7 +127,7 @@ func mcpCommand(args []string, configDir string, stdout io.Writer, getwd func() 
 	return nil
 }
 
-func runCommand(args []string, configDir string, stdout, stderr io.Writer, getwd func() (string, error)) error {
+func runCommand(args []string, configDir string, stdout, stderr io.Writer, getwd func() (string, error)) (runErr error) {
 	flags := flag.NewFlagSet("sai run", flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
 	providerName := flags.String("provider", "", "provider name")
@@ -155,7 +157,8 @@ func runCommand(args []string, configDir string, stdout, stderr io.Writer, getwd
 	if err != nil {
 		return err
 	}
-	if _, err := cfg.SelectedMCPServers(enabledMCP.ids, enabledMCP.set); err != nil {
+	selectedMCPServers, err := cfg.SelectedMCPServers(enabledMCP.ids, enabledMCP.set)
+	if err != nil {
 		return err
 	}
 
@@ -180,6 +183,16 @@ func runCommand(args []string, configDir string, stdout, stderr io.Writer, getwd
 	if err != nil {
 		return err
 	}
+	mcpSessions, mcpToolSchemas, err := mcpToolsForRun(context.Background(), selectedMCPServers, enabledToolNames)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if closeErr := closeMCPSessions(mcpSessions); closeErr != nil {
+			runErr = errors.Join(runErr, closeErr)
+		}
+	}()
+	toolSchemas = append(toolSchemas, mcpToolSchemas...)
 
 	resolvedShowReasoning := *showReasoning || cfg.Agent.ShowReasoning
 	if *verbose {
@@ -317,7 +330,13 @@ func parseCommaSeparatedNames(value, emptyName, flagName string) ([]string, erro
 }
 
 func enabledToolsForRun(rootDir string, enabled []string) (*tools.Registry, []model.Tool, error) {
-	if len(enabled) == 0 {
+	builtinEnabled := make([]string, 0, len(enabled))
+	for _, name := range enabled {
+		if !strings.HasPrefix(name, "mcp.") {
+			builtinEnabled = append(builtinEnabled, name)
+		}
+	}
+	if len(builtinEnabled) == 0 {
 		return nil, nil, nil
 	}
 
@@ -325,11 +344,53 @@ func enabledToolsForRun(rootDir string, enabled []string) (*tools.Registry, []mo
 	if err := tools.RegisterBuiltins(registry, rootDir); err != nil {
 		return nil, nil, fmt.Errorf("register built-in tools: %w", err)
 	}
-	schemas, err := registry.EnabledSchemas(enabled)
+	schemas, err := registry.EnabledSchemas(builtinEnabled)
 	if err != nil {
 		return nil, nil, err
 	}
 	return registry, schemas, nil
+}
+
+func mcpToolsForRun(ctx context.Context, servers []config.MCPServerConfig, enabled []string) ([]*mcp.Session, []model.Tool, error) {
+	sessions := make([]*mcp.Session, 0, len(servers))
+	convertedTools := []model.Tool{}
+
+	for _, server := range servers {
+		session, _, err := mcp.StartStdioSession(ctx, server)
+		if err != nil {
+			return nil, nil, errors.Join(err, closeMCPSessions(sessions))
+		}
+		sessions = append(sessions, session)
+
+		definitions, err := session.ListTools(ctx)
+		if err != nil {
+			return nil, nil, errors.Join(fmt.Errorf("list MCP tools for server %q: %w", server.ID, err), closeMCPSessions(sessions))
+		}
+		tools, err := mcp.ConvertTools(server.ID, definitions)
+		if err != nil {
+			return nil, nil, errors.Join(fmt.Errorf("convert MCP tools for server %q: %w", server.ID, err), closeMCPSessions(sessions))
+		}
+		convertedTools = append(convertedTools, tools...)
+	}
+
+	schemas, err := mcp.EnabledSchemas(convertedTools, enabled)
+	if err != nil {
+		return nil, nil, errors.Join(err, closeMCPSessions(sessions))
+	}
+	return sessions, schemas, nil
+}
+
+func closeMCPSessions(sessions []*mcp.Session) error {
+	var closeErr error
+	for _, session := range sessions {
+		if err := session.Close(); err != nil {
+			closeErr = errors.Join(closeErr, err)
+		}
+	}
+	if closeErr != nil {
+		return fmt.Errorf("close MCP sessions: %w", closeErr)
+	}
+	return nil
 }
 
 func loadConfig(configDir string, getwd func() (string, error)) (*config.Config, error) {

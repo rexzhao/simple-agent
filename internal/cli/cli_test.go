@@ -1,8 +1,10 @@
 package cli
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -12,6 +14,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestModelsListUsesGlobalConfigDirFlag(t *testing.T) {
@@ -281,6 +284,36 @@ func TestRunEnableToolsOverridesConfiguredTools(t *testing.T) {
 		t.Fatalf("RunWithGetwd() code = %d, stderr = %s", code, stderr.String())
 	}
 	assertCLIToolNames(t, (<-requests).Body, []string{"list_files", "read_file"})
+}
+
+func TestRunEnableMCPExposesOnlyEnabledMCPSchemas(t *testing.T) {
+	server, requests := newCLIRunServer(t,
+		`{"choices":[{"delta":{"content":"ok"}}]}`,
+		`[DONE]`,
+	)
+	defer server.Close()
+
+	configDir := t.TempDir()
+	exitFile := filepath.Join(t.TempDir(), "mcp-exited")
+	writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
+	writeCLIRunMCPFixture(t, configDir, exitFile)
+
+	var stdout, stderr bytes.Buffer
+	code := RunWithGetwd([]string{"--config-dir", configDir, "run", "--enable-mcp", "local", "--enable-tools", "list_files,mcp.local.search", "Use mixed tools"}, &stdout, &stderr, func() (string, error) {
+		return t.TempDir(), nil
+	})
+
+	if code != 0 {
+		t.Fatalf("RunWithGetwd() code = %d, stderr = %s", code, stderr.String())
+	}
+	if got, want := stdout.String(), "ok"; got != want {
+		t.Fatalf("stdout = %q, want %q", got, want)
+	}
+
+	request := <-requests
+	assertCLIToolNames(t, request.Body, []string{"list_files", "mcp.local.search"})
+	assertNoAdditionalCLIRunRequest(t, requests)
+	assertCLIFileEventuallyContains(t, exitFile, "closed")
 }
 
 func TestRunVerboseWritesDiagnosticsWithoutSensitiveContent(t *testing.T) {
@@ -873,6 +906,27 @@ env: {}
 `)
 }
 
+func writeCLIRunMCPFixture(t *testing.T, dir, exitFile string) {
+	t.Helper()
+
+	mcpDir := filepath.Join(dir, "mcp")
+	if err := os.MkdirAll(mcpDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll() error = %v", err)
+	}
+
+	writeCLIFile(t, filepath.Join(mcpDir, "local.yaml"), fmt.Sprintf(`id: local
+enabled: false
+command: %q
+args:
+  - "-test.run=TestCLIMCPHelperProcess"
+  - "--"
+  - "fake-mcp"
+env:
+  SAI_CLI_MCP_HELPER_PROCESS: "1"
+  SAI_CLI_MCP_EXIT_FILE: %q
+`, os.Args[0], exitFile))
+}
+
 func writeCLIFile(t *testing.T, path, content string) {
 	t.Helper()
 	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
@@ -1270,4 +1324,144 @@ func assertNoAdditionalCLIRunRequest(t *testing.T, requests <-chan capturedCLIRu
 		t.Fatalf("unexpected additional model request: path=%s body=%s", request.Path, request.RawBody)
 	default:
 	}
+}
+
+func assertCLIFileEventuallyContains(t *testing.T, path, want string) {
+	t.Helper()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		data, err := os.ReadFile(path)
+		if err == nil && strings.Contains(string(data), want) {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("file %q did not contain %q before timeout; last read error = %v, data = %q", path, want, err, data)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestCLIMCPHelperProcess(t *testing.T) {
+	if os.Getenv("SAI_CLI_MCP_HELPER_PROCESS") != "1" {
+		return
+	}
+
+	code := runCLIFakeMCPServer()
+	if code == 0 {
+		if exitFile := os.Getenv("SAI_CLI_MCP_EXIT_FILE"); exitFile != "" {
+			_ = os.WriteFile(exitFile, []byte("closed"), 0o644)
+		}
+	}
+	os.Exit(code)
+}
+
+func runCLIFakeMCPServer() int {
+	reader := bufio.NewReader(os.Stdin)
+
+	request, err := readCLIMCPRequest(reader)
+	if err != nil {
+		return 2
+	}
+	if request.JSONRPC != "2.0" || request.Method != "initialize" || request.Params.ClientInfo.Name != "sai" {
+		return 3
+	}
+	if err := writeCLIMCPMessage(os.Stdout, map[string]any{
+		"jsonrpc": "2.0",
+		"id":      request.ID,
+		"result": map[string]any{
+			"protocolVersion": request.Params.ProtocolVersion,
+			"capabilities":    map[string]any{},
+			"serverInfo": map[string]any{
+				"name":    "cli-fake-mcp",
+				"version": "test",
+			},
+		},
+	}); err != nil {
+		return 4
+	}
+
+	notification, err := readCLIMCPRequest(reader)
+	if err != nil {
+		return 5
+	}
+	if notification.JSONRPC != "2.0" || notification.Method != "notifications/initialized" {
+		return 6
+	}
+
+	for {
+		request, err := readCLIMCPRequest(reader)
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				return 0
+			}
+			return 7
+		}
+		if request.JSONRPC != "2.0" || request.Method != "tools/list" {
+			return 8
+		}
+		if err := writeCLIMCPMessage(os.Stdout, map[string]any{
+			"jsonrpc": "2.0",
+			"id":      request.ID,
+			"result": map[string]any{
+				"tools": []map[string]any{
+					{
+						"name":        "search",
+						"description": "search local fixture data",
+						"inputSchema": map[string]any{
+							"type": "object",
+							"properties": map[string]any{
+								"query": map[string]any{"type": "string"},
+							},
+						},
+					},
+					{
+						"name":        "ignored",
+						"description": "disabled fixture tool",
+						"inputSchema": map[string]any{"type": "object"},
+					},
+				},
+			},
+		}); err != nil {
+			return 9
+		}
+	}
+}
+
+type cliMCPRequest struct {
+	JSONRPC string `json:"jsonrpc"`
+	ID      int    `json:"id"`
+	Method  string `json:"method"`
+	Params  struct {
+		ProtocolVersion string `json:"protocolVersion"`
+		ClientInfo      struct {
+			Name string `json:"name"`
+		} `json:"clientInfo"`
+	} `json:"params"`
+}
+
+func readCLIMCPRequest(reader *bufio.Reader) (cliMCPRequest, error) {
+	payload, err := reader.ReadBytes('\n')
+	if err != nil {
+		if errors.Is(err, io.EOF) {
+			return cliMCPRequest{}, io.EOF
+		}
+		return cliMCPRequest{}, err
+	}
+
+	var request cliMCPRequest
+	if err := json.Unmarshal(payload, &request); err != nil {
+		return cliMCPRequest{}, err
+	}
+	return request, nil
+}
+
+func writeCLIMCPMessage(w io.Writer, message any) error {
+	payload, err := json.Marshal(message)
+	if err != nil {
+		return err
+	}
+	payload = append(payload, '\n')
+	_, err = w.Write(payload)
+	return err
 }

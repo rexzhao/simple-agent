@@ -108,7 +108,7 @@
 - [x] 列出 MCP tools。
 - [x] 将 MCP tools 转换为内部 tool schema。
 - [x] MCP tool 名称固定为 `mcp.<server>.<tool>`。
-- [ ] MCP tools 仍受 enabled tools 列表控制。
+- [x] MCP tools 仍受 enabled tools 列表控制。
 - [ ] 将 tool call route 到 MCP。
 - [ ] 将 MCP tool result 回传给模型。
 - [x] `sai` 退出时关闭 MCP server 进程。
