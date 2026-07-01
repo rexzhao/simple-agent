@@ -132,6 +132,7 @@ func TestRunUsesDefaultProviderModelAndOutputsTextDelta(t *testing.T) {
 	messages := requestMessages(t, request.Body)
 	assertMessage(t, messages, 0, "system", builtInBaseInstructions)
 	assertMessage(t, messages, 1, "user", "Say hi")
+	assertCLIRequestOmitsKey(t, request.Body, "tools")
 }
 
 func TestRunExplicitProviderModelSelectsProfileParameters(t *testing.T) {
@@ -165,6 +166,73 @@ func TestRunExplicitProviderModelSelectsProfileParameters(t *testing.T) {
 	}
 	assertJSONNumber(t, request.Body["temperature"], "0.2")
 	assertJSONNumber(t, request.Body["max_tokens"], "64")
+	assertNoAdditionalCLIRunRequest(t, requests)
+}
+
+func TestRunUsesConfiguredEnabledTools(t *testing.T) {
+	server, requests := newCLIRunServer(t,
+		`{"choices":[{"delta":{"content":"ok"}}]}`,
+		`[DONE]`,
+	)
+	defer server.Close()
+
+	configDir := t.TempDir()
+	writeCLIRunFixtureInDirWithTools(t, configDir, server.URL, "direct-secret-value", "openai-chat", []string{"read_file", "shell"})
+
+	var stdout, stderr bytes.Buffer
+	code := RunWithGetwd([]string{"--config-dir", configDir, "run", "Use configured tools"}, &stdout, &stderr, func() (string, error) {
+		return t.TempDir(), nil
+	})
+
+	if code != 0 {
+		t.Fatalf("RunWithGetwd() code = %d, stderr = %s", code, stderr.String())
+	}
+	assertCLIToolNames(t, (<-requests).Body, []string{"read_file", "shell"})
+}
+
+func TestRunEnableToolsOverridesConfiguredTools(t *testing.T) {
+	server, requests := newCLIRunServer(t,
+		`{"choices":[{"delta":{"content":"ok"}}]}`,
+		`[DONE]`,
+	)
+	defer server.Close()
+
+	configDir := t.TempDir()
+	writeCLIRunFixtureInDirWithTools(t, configDir, server.URL, "direct-secret-value", "openai-chat", []string{"read_file", "shell"})
+
+	var stdout, stderr bytes.Buffer
+	code := RunWithGetwd([]string{"--config-dir", configDir, "run", "--enable-tools", "list_files,read_file", "Use CLI tools"}, &stdout, &stderr, func() (string, error) {
+		return t.TempDir(), nil
+	})
+
+	if code != 0 {
+		t.Fatalf("RunWithGetwd() code = %d, stderr = %s", code, stderr.String())
+	}
+	assertCLIToolNames(t, (<-requests).Body, []string{"list_files", "read_file"})
+}
+
+func TestRunEnableToolsRejectsUnknownTool(t *testing.T) {
+	server, requests := newCLIRunServer(t,
+		`{"choices":[{"delta":{"content":"unexpected"}}]}`,
+		`[DONE]`,
+	)
+	defer server.Close()
+
+	configDir := t.TempDir()
+	writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
+
+	var stdout, stderr bytes.Buffer
+	code := RunWithGetwd([]string{"--config-dir", configDir, "run", "--enable-tools", "missing", "Use tools"}, &stdout, &stderr, func() (string, error) {
+		return t.TempDir(), nil
+	})
+
+	if code != 1 {
+		t.Fatalf("RunWithGetwd() code = %d, want 1", code)
+	}
+	if stdout.String() != "" {
+		t.Fatalf("stdout = %q, want empty", stdout.String())
+	}
+	assertCLIErrorContains(t, stderr.String(), `enabled tool "missing" is not registered`)
 	assertNoAdditionalCLIRunRequest(t, requests)
 }
 
@@ -468,13 +536,18 @@ func newCLIRunServer(t *testing.T, chunks ...string) (*httptest.Server, <-chan c
 
 func writeCLIRunFixtureInDir(t *testing.T, dir, baseURL, apiKey, providerType string) {
 	t.Helper()
+	writeCLIRunFixtureInDirWithTools(t, dir, baseURL, apiKey, providerType, nil)
+}
+
+func writeCLIRunFixtureInDirWithTools(t *testing.T, dir, baseURL, apiKey, providerType string, enabledTools []string) {
+	t.Helper()
 
 	providersDir := filepath.Join(dir, "providers")
 	if err := os.MkdirAll(providersDir, 0o755); err != nil {
 		t.Fatalf("MkdirAll() error = %v", err)
 	}
 
-	writeCLIFile(t, filepath.Join(dir, "sai.yaml"), `default_provider: fake
+	writeCLIFile(t, filepath.Join(dir, "sai.yaml"), fmt.Sprintf(`default_provider: fake
 default_model: default
 provider_dir: providers
 
@@ -484,12 +557,12 @@ agent:
   show_reasoning: false
 
 tools:
-  enabled: []
+  enabled: %s
 
 logging:
   path: logs/sai.jsonl
   level: info
-`)
+`, formatEnabledToolsYAML(enabledTools)))
 
 	writeCLIFile(t, filepath.Join(providersDir, "fake.yaml"), fmt.Sprintf(`name: fake
 type: %s
@@ -506,6 +579,19 @@ models:
     temperature: 0.2
     max_tokens: 64
 `, providerType, baseURL, apiKey))
+}
+
+func formatEnabledToolsYAML(enabledTools []string) string {
+	if len(enabledTools) == 0 {
+		return "[]"
+	}
+
+	var out strings.Builder
+	out.WriteByte('\n')
+	for _, name := range enabledTools {
+		fmt.Fprintf(&out, "    - %s\n", name)
+	}
+	return strings.TrimRight(out.String(), "\n")
 }
 
 func decodeCLIJSON(t *testing.T, data []byte) map[string]any {
@@ -545,6 +631,52 @@ func assertMessage(t *testing.T, messages []any, index int, role, content string
 	}
 	if got := message["content"]; got != content {
 		t.Fatalf("message[%d].content = %#v, want %q", index, got, content)
+	}
+}
+
+func assertCLIRequestOmitsKey(t *testing.T, body map[string]any, key string) {
+	t.Helper()
+
+	if _, ok := body[key]; ok {
+		t.Fatalf("request body contains unexpected key %q: %#v", key, body[key])
+	}
+}
+
+func assertCLIToolNames(t *testing.T, body map[string]any, want []string) {
+	t.Helper()
+
+	toolsValue, ok := body["tools"].([]any)
+	if !ok {
+		t.Fatalf("tools = %T(%#v), want []any", body["tools"], body["tools"])
+	}
+	if len(toolsValue) != len(want) {
+		t.Fatalf("len(tools) = %d, want %d: %#v", len(toolsValue), len(want), toolsValue)
+	}
+	for i, wantName := range want {
+		tool, ok := toolsValue[i].(map[string]any)
+		if !ok {
+			t.Fatalf("tools[%d] = %T, want object", i, toolsValue[i])
+		}
+		if got := tool["type"]; got != "function" {
+			t.Fatalf("tools[%d].type = %#v, want function", i, got)
+		}
+		function, ok := tool["function"].(map[string]any)
+		if !ok {
+			t.Fatalf("tools[%d].function = %T, want object", i, tool["function"])
+		}
+		if got := function["name"]; got != wantName {
+			t.Fatalf("tools[%d].function.name = %#v, want %q", i, got, wantName)
+		}
+		if got := function["description"]; got == "" {
+			t.Fatalf("tools[%d].function.description is empty", i)
+		}
+		parameters, ok := function["parameters"].(map[string]any)
+		if !ok {
+			t.Fatalf("tools[%d].function.parameters = %T, want object", i, function["parameters"])
+		}
+		if got := parameters["type"]; got != "object" {
+			t.Fatalf("tools[%d].function.parameters.type = %#v, want object", i, got)
+		}
 	}
 }
 

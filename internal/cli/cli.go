@@ -14,6 +14,7 @@ import (
 	projectcontext "github.com/rexzhao/simple-agent/internal/context"
 	"github.com/rexzhao/simple-agent/internal/model"
 	openaichat "github.com/rexzhao/simple-agent/internal/model/openai_chat"
+	"github.com/rexzhao/simple-agent/internal/tools"
 )
 
 var Version = "dev"
@@ -90,13 +91,15 @@ func runCommand(args []string, configDir string, stdout io.Writer, getwd func() 
 	providerName := flags.String("provider", "", "provider name")
 	modelProfile := flags.String("model", "", "model profile")
 	showReasoning := flags.Bool("show-reasoning", false, "show reasoning output")
+	var enabledTools toolNamesFlag
+	flags.Var(&enabledTools, "enable-tools", "comma-separated tool names to expose")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
 
 	prompts := flags.Args()
 	if len(prompts) != 1 {
-		return fmt.Errorf(`usage: sai run [--provider name] [--model profile] [--show-reasoning] "prompt"`)
+		return fmt.Errorf(`usage: sai run [--provider name] [--model profile] [--show-reasoning] [--enable-tools names] "prompt"`)
 	}
 
 	cwd, err := getwd()
@@ -123,6 +126,15 @@ func runCommand(args []string, configDir string, stdout io.Writer, getwd func() 
 		return err
 	}
 
+	enabledToolNames := cfg.Tools.Enabled
+	if enabledTools.set {
+		enabledToolNames = enabledTools.names
+	}
+	toolSchemas, err := enabledToolSchemas(cwd, enabledToolNames)
+	if err != nil {
+		return err
+	}
+
 	project, err := projectcontext.Load(cwd)
 	if err != nil {
 		return err
@@ -130,6 +142,7 @@ func runCommand(args []string, configDir string, stdout io.Writer, getwd func() 
 	request := model.Request{
 		Model:      resolved.ModelID,
 		Messages:   runMessages(project, prompts[0]),
+		Tools:      toolSchemas,
 		Parameters: resolved.Parameters,
 	}
 
@@ -138,6 +151,54 @@ func runCommand(args []string, configDir string, stdout io.Writer, getwd func() 
 		return err
 	}
 	return writeStream(stdout, events, *showReasoning || cfg.Agent.ShowReasoning)
+}
+
+type toolNamesFlag struct {
+	set   bool
+	names []string
+}
+
+func (f *toolNamesFlag) Set(value string) error {
+	names, err := parseToolNames(value)
+	if err != nil {
+		return err
+	}
+	f.set = true
+	f.names = names
+	return nil
+}
+
+func (f *toolNamesFlag) String() string {
+	return strings.Join(f.names, ",")
+}
+
+func parseToolNames(value string) ([]string, error) {
+	if strings.TrimSpace(value) == "" {
+		return nil, nil
+	}
+
+	parts := strings.Split(value, ",")
+	names := make([]string, 0, len(parts))
+	for _, part := range parts {
+		name := strings.TrimSpace(part)
+		if name == "" {
+			return nil, fmt.Errorf("empty tool name in --enable-tools")
+		}
+		names = append(names, name)
+	}
+	return names, nil
+}
+
+func enabledToolSchemas(rootDir string, enabled []string) ([]model.Tool, error) {
+	if len(enabled) == 0 {
+		return nil, nil
+	}
+
+	registry := tools.NewRegistry()
+	if err := tools.RegisterBuiltins(registry, rootDir); err != nil {
+		return nil, fmt.Errorf("register built-in tools: %w", err)
+	}
+	return registry.EnabledSchemas(enabled)
 }
 
 func loadConfig(configDir string, getwd func() (string, error)) (*config.Config, error) {

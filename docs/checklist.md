@@ -70,9 +70,9 @@
 - [x] 内置 `list_files`。
 - [x] 内置 `read_file`。
 - [x] 内置 `shell`。
-- [ ] 默认不启用任何工具。
-- [ ] 通过配置 `tools.enabled` 启用工具。
-- [ ] 通过 `--enable-tools` 覆盖配置中的 enabled tools。
+- [x] 默认不启用任何工具。
+- [x] 通过配置 `tools.enabled` 启用工具。
+- [x] 通过 `--enable-tools` 覆盖配置中的 enabled tools。
 - [x] `shell` 默认在启动目录执行命令。
 - [ ] 累积 streamed tool call arguments。
 - [ ] 执行完整 tool call。
