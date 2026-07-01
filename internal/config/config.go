@@ -20,6 +20,7 @@ type Config struct {
 	SkillDir        string                     `json:"skill_dir" yaml:"skill_dir"`
 	Agent           AgentConfig                `json:"agent" yaml:"agent"`
 	Tools           ToolsConfig                `json:"tools" yaml:"tools"`
+	Skills          SkillsConfig               `json:"skills" yaml:"skills"`
 	Logging         LoggingConfig              `json:"logging" yaml:"logging"`
 	MCPDir          string                     `json:"mcp_dir,omitempty" yaml:"mcp_dir,omitempty"`
 	MCPServers      map[string]MCPServerConfig `json:"mcp_servers,omitempty" yaml:"-"`
@@ -39,6 +40,10 @@ type AgentConfig struct {
 }
 
 type ToolsConfig struct {
+	Enabled []string `json:"enabled" yaml:"enabled"`
+}
+
+type SkillsConfig struct {
 	Enabled []string `json:"enabled" yaml:"enabled"`
 }
 
@@ -318,6 +323,9 @@ func defaultConfig() Config {
 			Stream:   true,
 		},
 		Tools: ToolsConfig{
+			Enabled: []string{},
+		},
+		Skills: SkillsConfig{
 			Enabled: []string{},
 		},
 		Logging: LoggingConfig{

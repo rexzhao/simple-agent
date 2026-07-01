@@ -190,8 +190,11 @@ function tools / function_call_output，使现有 agent tool loop 能通过 `ope
 - skill 显式启用或选择。
 - instruction composition。
 
-M7 第一小步只实现本地发现/读取，不接入 CLI runtime，不配置 `skills.enabled`，也不把
-skill instructions 注入 `sai run` 消息。
+M7 当前实现只覆盖配置目录下的本地 skills：通过 `skills.enabled` 或 `sai run
+--enable-skills` 显式启用，`--enable-skills` 覆盖配置，`--disable-skills` 本次运行禁用
+所有 skills。已启用 skill 的 instructions 作为 developer message 注入在内置 system
+和 `AGENTS.md` 之后、用户 prompt 之前；多个 skill 按 enabled 列表顺序注入。M7 不读取
+用户目录，不实现 marketplace、递归 skill discovery、plugin lifecycle 或复杂依赖解析。
 
 验证：
 
@@ -207,3 +210,5 @@ skill instructions 注入 `sai run` 消息。
 - 本地测试 skill 能改变模型 instructions。
 - skill 可以关闭。
 - 缺失或格式错误的 skill 有清晰错误。
+- CLI fake server 测试覆盖 skill 注入顺序、CLI 覆盖配置、disablement、unknown id 和
+  malformed frontmatter。

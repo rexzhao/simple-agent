@@ -45,7 +45,8 @@ AGENTS.md
 `sai.yaml` 是全局配置入口，负责默认 provider、默认 model、provider 目录、工具启用和
 agent 通用参数。`providers/*.yaml`
 每个文件描述一个 provider。`skills/<skill_id>/SKILL.md` 是 M7 后的本地 skill 推荐布局；
-当前只支持发现和读取，不启用或注入到运行时。`mcp/*.yaml` 每个文件描述一个 MCP server；
+本地 skill 只有出现在 `skills.enabled` 或 `--enable-skills` 中才会注入运行时。
+`mcp/*.yaml` 每个文件描述一个 MCP server；
 MCP 是 M4 后能力，不属于 MVP 必需配置。
 
 当配置根目录由 `--config-dir` 指定时，`sai.yaml` 和上述配置子目录从该目录读取；
@@ -68,6 +69,9 @@ agent:
 tools:
   enabled: []
 
+skills:
+  enabled: []
+
 logging:
   path: logs/sai.jsonl
   level: info
@@ -87,6 +91,7 @@ mcp_dir: mcp
 - `agent.stream`：默认是否启用 streaming。
 - `agent.show_reasoning`：默认是否显示 reasoning stream。
 - `tools.enabled`：默认启用的工具列表。空列表表示不向模型暴露工具。
+- `skills.enabled`：默认启用的本地 skill id 列表。空列表表示不读取或注入任何 skill。
 - `logging.path`：JSONL 日志文件路径。相对路径基于配置根目录解析。
 - `logging.level`：日志级别。
 
@@ -205,8 +210,32 @@ body...
 ```
 
 如果没有 frontmatter，skill 名称默认使用目录名，description 为空，正文全文作为
-instructions。当前 M7 第一小步只实现本地发现和读取：不读取用户目录，不配置
-`skills.enabled`，也不提供 CLI activation 或 instruction composition。
+instructions。启用方式有两种：
+
+```yaml
+skills:
+  enabled:
+    - my-skill
+```
+
+```text
+sai run --enable-skills my-skill,other-skill "prompt"
+sai run --disable-skills "prompt"
+```
+
+`--enable-skills` 覆盖配置中的 `skills.enabled`，不是追加；`--disable-skills` 本次运行
+禁用所有 skills。二者同时出现时命令会失败。空 enabled 列表表示不发现、不读取、不注入
+任何 skill。
+
+已启用 skill 的 instructions 会作为 developer message 注入到模型请求中，顺序是：
+
+```text
+sai 内置基础约束 > AGENTS.md > enabled skills > 当前用户 prompt
+```
+
+多个 skill 按配置或 CLI 中的 enabled 顺序注入。未知 skill id 会报错并列出当前
+`skill_dir` 下可用的 skill id；frontmatter 格式错误会让命令失败并指出对应
+`SKILL.md`。
 
 ## MCP 配置（M4 后）
 

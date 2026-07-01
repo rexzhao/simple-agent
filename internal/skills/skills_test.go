@@ -3,6 +3,8 @@ package skills
 import (
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"testing"
 )
 
@@ -46,6 +48,30 @@ func TestDiscoverIgnoresEntriesWithoutDirectSkillMD(t *testing.T) {
 	}
 	if got[0].ID != "found" {
 		t.Fatalf("Discover()[0].ID = %q, want found", got[0].ID)
+	}
+}
+
+func TestDiscoverRefsDoesNotParseSkillFiles(t *testing.T) {
+	dir := t.TempDir()
+	writeSkill(t, filepath.Join(dir, "valid"), "Valid instructions")
+	writeSkill(t, filepath.Join(dir, "malformed"), "---\nname: [bad\n---\nBad instructions\n")
+
+	got, err := DiscoverRefs(dir)
+	if err != nil {
+		t.Fatalf("DiscoverRefs() error = %v", err)
+	}
+
+	wantIDs := []string{"malformed", "valid"}
+	if len(got) != len(wantIDs) {
+		t.Fatalf("len(DiscoverRefs()) = %d, want %d: %#v", len(got), len(wantIDs), got)
+	}
+	for i, want := range wantIDs {
+		if got[i].ID != want {
+			t.Fatalf("DiscoverRefs()[%d].ID = %q, want %q", i, got[i].ID, want)
+		}
+		if wantPath := filepath.Join(dir, want); got[i].Path != wantPath {
+			t.Fatalf("DiscoverRefs()[%d].Path = %q, want %q", i, got[i].Path, wantPath)
+		}
 	}
 }
 
@@ -102,6 +128,22 @@ func TestLoadWithoutFrontmatterFallsBackToID(t *testing.T) {
 	}
 	if got.Instructions != instructions {
 		t.Fatalf("Instructions = %q, want %q", got.Instructions, instructions)
+	}
+}
+
+func TestLoadRejectsUnterminatedFrontmatter(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "bad")
+	writeSkill(t, dir, "---\nname: bad\nmissing closing marker\n")
+
+	_, err := Load(dir)
+	if err == nil {
+		t.Fatal("Load() error = nil, want unterminated frontmatter error")
+	}
+	got := err.Error()
+	for _, want := range []string{"parse skill frontmatter", "unterminated frontmatter", strconv.Quote(filepath.Join(dir, skillFileName))} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("Load() error = %q, want contain %q", got, want)
+		}
 	}
 }
 

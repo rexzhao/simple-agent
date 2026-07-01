@@ -508,6 +508,209 @@ func TestRunEnableToolsOverridesConfiguredTools(t *testing.T) {
 	assertCLIToolNames(t, (<-requests).Body, []string{"list_files", "read_file"})
 }
 
+func TestRunUsesConfiguredEnabledSkillsInMessageOrder(t *testing.T) {
+	server, requests := newCLIRunServer(t,
+		`{"choices":[{"delta":{"content":"ok"}}]}`,
+		`[DONE]`,
+	)
+	defer server.Close()
+
+	configDir := t.TempDir()
+	writeCLIRunFixtureInDirWithSkills(t, configDir, server.URL, "direct-secret-value", "openai-chat", []string{"zeta", "alpha"})
+	alphaInstructions := "Alpha instructions.\n"
+	zetaInstructions := "Zeta instructions.\n"
+	writeCLISkill(t, configDir, "alpha", "---\nname: Alpha Skill\ndescription: alpha desc\n---\n"+alphaInstructions)
+	writeCLISkill(t, configDir, "zeta", "---\nname: Zeta Skill\ndescription: zeta desc\n---\n"+zetaInstructions)
+	projectDir := t.TempDir()
+	writeCLIFile(t, filepath.Join(projectDir, "AGENTS.md"), "Project instructions\n")
+
+	var stdout, stderr bytes.Buffer
+	code := RunWithGetwd([]string{"--config-dir", configDir, "run", "Use configured skills"}, &stdout, &stderr, func() (string, error) {
+		return projectDir, nil
+	})
+
+	if code != 0 {
+		t.Fatalf("RunWithGetwd() code = %d, stderr = %s", code, stderr.String())
+	}
+	if got, want := stdout.String(), "ok"; got != want {
+		t.Fatalf("stdout = %q, want %q", got, want)
+	}
+
+	messages := requestMessages(t, (<-requests).Body)
+	if len(messages) != 5 {
+		t.Fatalf("len(messages) = %d, want 5: %#v", len(messages), messages)
+	}
+	assertMessage(t, messages, 0, "system", builtInBaseInstructions)
+	assertMessage(t, messages, 1, "developer", "Project instructions\n")
+	assertMessage(t, messages, 2, "developer", "Skill zeta (Zeta Skill):\n"+zetaInstructions)
+	assertMessage(t, messages, 3, "developer", "Skill alpha (Alpha Skill):\n"+alphaInstructions)
+	assertMessage(t, messages, 4, "user", "Use configured skills")
+	assertNoAdditionalCLIRunRequest(t, requests)
+}
+
+func TestRunEnableSkillsOverridesConfiguredSkills(t *testing.T) {
+	server, requests := newCLIRunServer(t,
+		`{"choices":[{"delta":{"content":"ok"}}]}`,
+		`[DONE]`,
+	)
+	defer server.Close()
+
+	configDir := t.TempDir()
+	writeCLIRunFixtureInDirWithSkills(t, configDir, server.URL, "direct-secret-value", "openai-chat", []string{"alpha"})
+	writeCLISkill(t, configDir, "alpha", "Alpha config instructions\n")
+	writeCLISkill(t, configDir, "beta", "Beta CLI instructions\n")
+
+	var stdout, stderr bytes.Buffer
+	code := RunWithGetwd([]string{"--config-dir", configDir, "run", "--enable-skills", "beta", "Use CLI skills"}, &stdout, &stderr, func() (string, error) {
+		return t.TempDir(), nil
+	})
+
+	if code != 0 {
+		t.Fatalf("RunWithGetwd() code = %d, stderr = %s", code, stderr.String())
+	}
+
+	messages := requestMessages(t, (<-requests).Body)
+	if len(messages) != 3 {
+		t.Fatalf("len(messages) = %d, want 3: %#v", len(messages), messages)
+	}
+	assertMessage(t, messages, 0, "system", builtInBaseInstructions)
+	assertMessage(t, messages, 1, "developer", "Skill beta (beta):\nBeta CLI instructions\n")
+	assertMessage(t, messages, 2, "user", "Use CLI skills")
+}
+
+func TestRunConfiguredSkillIgnoresDisabledMalformedSkill(t *testing.T) {
+	server, requests := newCLIRunServer(t,
+		`{"choices":[{"delta":{"content":"ok"}}]}`,
+		`[DONE]`,
+	)
+	defer server.Close()
+
+	configDir := t.TempDir()
+	writeCLIRunFixtureInDirWithSkills(t, configDir, server.URL, "direct-secret-value", "openai-chat", []string{"valid"})
+	writeCLISkill(t, configDir, "valid", "Valid instructions\n")
+	writeCLISkill(t, configDir, "bad", "---\nname: [bad\n---\nBad instructions\n")
+
+	var stdout, stderr bytes.Buffer
+	code := RunWithGetwd([]string{"--config-dir", configDir, "run", "Use configured skill"}, &stdout, &stderr, func() (string, error) {
+		return t.TempDir(), nil
+	})
+
+	if code != 0 {
+		t.Fatalf("RunWithGetwd() code = %d, stderr = %s", code, stderr.String())
+	}
+	messages := requestMessages(t, (<-requests).Body)
+	if len(messages) != 3 {
+		t.Fatalf("len(messages) = %d, want 3: %#v", len(messages), messages)
+	}
+	assertMessage(t, messages, 0, "system", builtInBaseInstructions)
+	assertMessage(t, messages, 1, "developer", "Skill valid (valid):\nValid instructions\n")
+	assertMessage(t, messages, 2, "user", "Use configured skill")
+	assertNoAdditionalCLIRunRequest(t, requests)
+}
+
+func TestRunDisableSkillsSkipsConfiguredSkillLoading(t *testing.T) {
+	server, requests := newCLIRunServer(t,
+		`{"choices":[{"delta":{"content":"ok"}}]}`,
+		`[DONE]`,
+	)
+	defer server.Close()
+
+	configDir := t.TempDir()
+	writeCLIRunFixtureInDirWithSkills(t, configDir, server.URL, "direct-secret-value", "openai-chat", []string{"bad"})
+	writeCLISkill(t, configDir, "bad", "---\nname: [bad\n---\nBad instructions\n")
+
+	var stdout, stderr bytes.Buffer
+	code := RunWithGetwd([]string{"--config-dir", configDir, "run", "--disable-skills", "Do not use skills"}, &stdout, &stderr, func() (string, error) {
+		return t.TempDir(), nil
+	})
+
+	if code != 0 {
+		t.Fatalf("RunWithGetwd() code = %d, stderr = %s", code, stderr.String())
+	}
+	messages := requestMessages(t, (<-requests).Body)
+	if len(messages) != 2 {
+		t.Fatalf("len(messages) = %d, want 2: %#v", len(messages), messages)
+	}
+	assertMessage(t, messages, 0, "system", builtInBaseInstructions)
+	assertMessage(t, messages, 1, "user", "Do not use skills")
+}
+
+func TestRunEnableSkillsAndDisableSkillsConflict(t *testing.T) {
+	server, requests := newCLIRunServer(t,
+		`{"choices":[{"delta":{"content":"unexpected"}}]}`,
+		`[DONE]`,
+	)
+	defer server.Close()
+
+	var stdout, stderr bytes.Buffer
+	code := RunWithGetwd([]string{"run", "--enable-skills", "alpha", "--disable-skills", "Use skills"}, &stdout, &stderr, func() (string, error) {
+		return t.TempDir(), nil
+	})
+
+	if code != 1 {
+		t.Fatalf("RunWithGetwd() code = %d, want 1", code)
+	}
+	if stdout.String() != "" {
+		t.Fatalf("stdout = %q, want empty", stdout.String())
+	}
+	assertCLIErrorContains(t, stderr.String(), "cannot use --enable-skills with --disable-skills")
+	assertNoAdditionalCLIRunRequest(t, requests)
+}
+
+func TestRunEnableSkillsRejectsUnknownSkill(t *testing.T) {
+	server, requests := newCLIRunServer(t,
+		`{"choices":[{"delta":{"content":"unexpected"}}]}`,
+		`[DONE]`,
+	)
+	defer server.Close()
+
+	configDir := t.TempDir()
+	writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
+	writeCLISkill(t, configDir, "beta", "Beta instructions\n")
+	writeCLISkill(t, configDir, "alpha", "Alpha instructions\n")
+	writeCLISkill(t, configDir, "bad", "---\nname: [bad\n---\nBad instructions\n")
+
+	var stdout, stderr bytes.Buffer
+	code := RunWithGetwd([]string{"--config-dir", configDir, "run", "--enable-skills", "missing", "Use skills"}, &stdout, &stderr, func() (string, error) {
+		return t.TempDir(), nil
+	})
+
+	if code != 1 {
+		t.Fatalf("RunWithGetwd() code = %d, want 1", code)
+	}
+	if stdout.String() != "" {
+		t.Fatalf("stdout = %q, want empty", stdout.String())
+	}
+	assertCLIErrorContains(t, stderr.String(), `unknown skill "missing"`, "available skills: alpha, bad, beta")
+	assertNoAdditionalCLIRunRequest(t, requests)
+}
+
+func TestRunEnableSkillsReportsMalformedFrontmatter(t *testing.T) {
+	server, requests := newCLIRunServer(t,
+		`{"choices":[{"delta":{"content":"unexpected"}}]}`,
+		`[DONE]`,
+	)
+	defer server.Close()
+
+	configDir := t.TempDir()
+	writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
+	writeCLISkill(t, configDir, "bad", "---\nname: [bad\n---\nBad instructions\n")
+
+	var stdout, stderr bytes.Buffer
+	code := RunWithGetwd([]string{"--config-dir", configDir, "run", "--enable-skills", "bad", "Use skills"}, &stdout, &stderr, func() (string, error) {
+		return t.TempDir(), nil
+	})
+
+	if code != 1 {
+		t.Fatalf("RunWithGetwd() code = %d, want 1", code)
+	}
+	if stdout.String() != "" {
+		t.Fatalf("stdout = %q, want empty", stdout.String())
+	}
+	assertCLIErrorContains(t, stderr.String(), "load skills: parse skill frontmatter", "bad", "SKILL.md")
+	assertNoAdditionalCLIRunRequest(t, requests)
+}
+
 func TestRunEnableMCPExposesOnlyEnabledMCPSchemas(t *testing.T) {
 	server, requests := newCLIRunServer(t,
 		`{"choices":[{"delta":{"content":"ok"}}]}`,
@@ -1203,6 +1406,15 @@ func writeCLIFile(t *testing.T, path, content string) {
 	}
 }
 
+func writeCLISkill(t *testing.T, configDir, id, content string) {
+	t.Helper()
+	skillDir := filepath.Join(configDir, "skills", id)
+	if err := os.MkdirAll(skillDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll(%q) error = %v", skillDir, err)
+	}
+	writeCLIFile(t, filepath.Join(skillDir, "SKILL.md"), content)
+}
+
 type capturedCLIRunRequest struct {
 	Path             string
 	Authorization    string
@@ -1285,6 +1497,16 @@ func writeCLIRunFixtureInDir(t *testing.T, dir, baseURL, apiKey, providerType st
 
 func writeCLIRunFixtureInDirWithTools(t *testing.T, dir, baseURL, apiKey, providerType string, enabledTools []string) {
 	t.Helper()
+	writeCLIRunFixtureInDirWithToolsAndSkills(t, dir, baseURL, apiKey, providerType, enabledTools, nil)
+}
+
+func writeCLIRunFixtureInDirWithSkills(t *testing.T, dir, baseURL, apiKey, providerType string, enabledSkills []string) {
+	t.Helper()
+	writeCLIRunFixtureInDirWithToolsAndSkills(t, dir, baseURL, apiKey, providerType, nil, enabledSkills)
+}
+
+func writeCLIRunFixtureInDirWithToolsAndSkills(t *testing.T, dir, baseURL, apiKey, providerType string, enabledTools []string, enabledSkills []string) {
+	t.Helper()
 
 	providersDir := filepath.Join(dir, "providers")
 	if err := os.MkdirAll(providersDir, 0o755); err != nil {
@@ -1303,10 +1525,13 @@ agent:
 tools:
   enabled: %s
 
+skills:
+  enabled: %s
+
 logging:
   path: logs/sai.jsonl
   level: info
-`, formatEnabledToolsYAML(enabledTools)))
+`, formatEnabledToolsYAML(enabledTools), formatEnabledToolsYAML(enabledSkills)))
 
 	writeCLIFile(t, filepath.Join(providersDir, "fake.yaml"), fmt.Sprintf(`name: fake
 type: %s

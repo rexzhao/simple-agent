@@ -34,6 +34,9 @@ func TestLoadResolvesConfigAndProviderModels(t *testing.T) {
 	if cfg.SkillDir != wantSkillDir {
 		t.Fatalf("SkillDir = %q, want %q", cfg.SkillDir, wantSkillDir)
 	}
+	if len(cfg.Skills.Enabled) != 0 {
+		t.Fatalf("Skills.Enabled = %#v, want empty default", cfg.Skills.Enabled)
+	}
 
 	wantLogPath := filepath.Join(wantConfigDir, "logs", "sai.jsonl")
 	if cfg.Logging.Path != wantLogPath {
@@ -80,6 +83,35 @@ skill_dir: local-skills
 	wantSkillDir := filepath.Join(filepath.Clean(wantConfigDir), "local-skills")
 	if cfg.SkillDir != wantSkillDir {
 		t.Fatalf("SkillDir = %q, want %q", cfg.SkillDir, wantSkillDir)
+	}
+}
+
+func TestLoadReadsSkillsEnabled(t *testing.T) {
+	dir := writeConfigFixture(t)
+	writeFile(t, filepath.Join(dir, "sai.yaml"), `default_provider: paperhub
+default_model: glm-5.2
+provider_dir: providers
+skill_dir: skills
+
+skills:
+  enabled:
+    - zeta
+    - alpha
+`)
+
+	cfg, err := Load(dir)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+
+	want := []string{"zeta", "alpha"}
+	if len(cfg.Skills.Enabled) != len(want) {
+		t.Fatalf("len(Skills.Enabled) = %d, want %d: %#v", len(cfg.Skills.Enabled), len(want), cfg.Skills.Enabled)
+	}
+	for i, wantID := range want {
+		if cfg.Skills.Enabled[i] != wantID {
+			t.Fatalf("Skills.Enabled[%d] = %q, want %q", i, cfg.Skills.Enabled[i], wantID)
+		}
 	}
 }
 

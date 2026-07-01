@@ -20,25 +20,47 @@ type Skill struct {
 	Instructions string
 }
 
+type SkillRef struct {
+	ID   string
+	Path string
+}
+
 type skillFrontmatter struct {
 	Name        string `yaml:"name"`
 	Description string `yaml:"description"`
 }
 
 func Discover(dir string) ([]Skill, error) {
+	refs, err := DiscoverRefs(dir)
+	if err != nil {
+		return nil, err
+	}
+
+	found := make([]Skill, 0, len(refs))
+	for _, ref := range refs {
+		skill, err := Load(ref.Path)
+		if err != nil {
+			return nil, err
+		}
+		found = append(found, skill)
+	}
+	return found, nil
+}
+
+func DiscoverRefs(dir string) ([]SkillRef, error) {
 	if strings.TrimSpace(dir) == "" {
-		return []Skill{}, nil
+		return []SkillRef{}, nil
 	}
 
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return []Skill{}, nil
+			return []SkillRef{}, nil
 		}
 		return nil, fmt.Errorf("read skill_dir %q: %w", dir, err)
 	}
 
-	found := make([]Skill, 0, len(entries))
+	found := make([]SkillRef, 0, len(entries))
 	for _, entry := range entries {
 		if !entry.IsDir() {
 			continue
@@ -56,11 +78,10 @@ func Discover(dir string) ([]Skill, error) {
 			continue
 		}
 
-		skill, err := Load(filepath.Join(dir, entry.Name()))
-		if err != nil {
-			return nil, err
-		}
-		found = append(found, skill)
+		found = append(found, SkillRef{
+			ID:   entry.Name(),
+			Path: filepath.Clean(filepath.Join(dir, entry.Name())),
+		})
 	}
 
 	sort.Slice(found, func(i, j int) bool {
@@ -99,7 +120,10 @@ func parseSkill(id, path, text string) (Skill, error) {
 		Instructions: text,
 	}
 
-	frontmatter, body, ok := splitFrontmatter(text)
+	frontmatter, body, ok, err := splitFrontmatter(text)
+	if err != nil {
+		return Skill{}, fmt.Errorf("parse skill frontmatter %q: %w", path, err)
+	}
 	if !ok {
 		return skill, nil
 	}
@@ -117,10 +141,10 @@ func parseSkill(id, path, text string) (Skill, error) {
 	return skill, nil
 }
 
-func splitFrontmatter(text string) (string, string, bool) {
+func splitFrontmatter(text string) (string, string, bool, error) {
 	lines := strings.SplitAfter(text, "\n")
 	if len(lines) == 0 || strings.TrimRight(lines[0], "\r\n") != "---" {
-		return "", "", false
+		return "", "", false, nil
 	}
 
 	frontmatterStart := len(lines[0])
@@ -128,9 +152,9 @@ func splitFrontmatter(text string) (string, string, bool) {
 	for _, line := range lines[1:] {
 		if strings.TrimRight(line, "\r\n") == "---" {
 			bodyStart := offset + len(line)
-			return text[frontmatterStart:offset], text[bodyStart:], true
+			return text[frontmatterStart:offset], text[bodyStart:], true, nil
 		}
 		offset += len(line)
 	}
-	return "", "", false
+	return "", "", false, fmt.Errorf("unterminated frontmatter")
 }

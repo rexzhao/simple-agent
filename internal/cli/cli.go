@@ -20,6 +20,7 @@ import (
 	anthropicmessages "github.com/rexzhao/simple-agent/internal/model/anthropic_messages"
 	openaichat "github.com/rexzhao/simple-agent/internal/model/openai_chat"
 	openairesponses "github.com/rexzhao/simple-agent/internal/model/openai_responses"
+	localskills "github.com/rexzhao/simple-agent/internal/skills"
 	"github.com/rexzhao/simple-agent/internal/tools"
 )
 
@@ -138,15 +139,21 @@ func runCommand(args []string, configDir string, stdout, stderr io.Writer, getwd
 	verbose := flags.Bool("verbose", false, "write non-sensitive diagnostics to stderr")
 	var enabledTools toolNamesFlag
 	flags.Var(&enabledTools, "enable-tools", "comma-separated tool names to expose")
+	var enabledSkills skillIDsFlag
+	flags.Var(&enabledSkills, "enable-skills", "comma-separated skill ids to enable")
+	disableSkills := flags.Bool("disable-skills", false, "disable all skills for this run")
 	var enabledMCP mcpServerIDsFlag
 	flags.Var(&enabledMCP, "enable-mcp", "comma-separated MCP server ids to enable")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
+	if enabledSkills.set && *disableSkills {
+		return fmt.Errorf("cannot use --enable-skills with --disable-skills")
+	}
 
 	prompts := flags.Args()
 	if len(prompts) != 1 {
-		return fmt.Errorf(`usage: sai run [--provider name] [--model profile] [--show-reasoning] [--verbose] [--enable-tools names] [--enable-mcp ids] "prompt"`)
+		return fmt.Errorf(`usage: sai run [--provider name] [--model profile] [--show-reasoning] [--verbose] [--enable-tools names] [--enable-skills ids] [--disable-skills] [--enable-mcp ids] "prompt"`)
 	}
 
 	cwd, err := getwd()
@@ -198,6 +205,10 @@ func runCommand(args []string, configDir string, stdout, stderr io.Writer, getwd
 			return err
 		}
 	}
+	selectedSkills, err := enabledSkillsForRun(cfg, enabledSkills.ids, enabledSkills.set, *disableSkills)
+	if err != nil {
+		return err
+	}
 
 	project, err := projectcontext.Load(cwd)
 	if err != nil {
@@ -205,7 +216,7 @@ func runCommand(args []string, configDir string, stdout, stderr io.Writer, getwd
 	}
 	request := model.Request{
 		Model:      resolved.ModelID,
-		Messages:   runMessages(project, prompts[0]),
+		Messages:   runMessages(project, selectedSkills, prompts[0]),
 		Tools:      toolSchemas,
 		Parameters: resolved.Parameters,
 	}
@@ -272,6 +283,25 @@ func (f *mcpServerIDsFlag) Set(value string) error {
 }
 
 func (f *mcpServerIDsFlag) String() string {
+	return strings.Join(f.ids, ",")
+}
+
+type skillIDsFlag struct {
+	set bool
+	ids []string
+}
+
+func (f *skillIDsFlag) Set(value string) error {
+	ids, err := parseCommaSeparatedNames(value, "skill id", "--enable-skills")
+	if err != nil {
+		return err
+	}
+	f.set = true
+	f.ids = ids
+	return nil
+}
+
+func (f *skillIDsFlag) String() string {
 	return strings.Join(f.ids, ",")
 }
 
@@ -408,6 +438,59 @@ func mcpToolsForRun(ctx context.Context, servers []config.MCPServerConfig, enabl
 	return sessions, sessionsByID, schemas, nil
 }
 
+func enabledSkillsForRun(cfg *config.Config, overrideIDs []string, useOverride bool, disabled bool) ([]localskills.Skill, error) {
+	if disabled {
+		return nil, nil
+	}
+
+	enabledIDs := cfg.Skills.Enabled
+	if useOverride {
+		enabledIDs = overrideIDs
+	}
+	if len(enabledIDs) == 0 {
+		return nil, nil
+	}
+
+	available, err := localskills.DiscoverRefs(cfg.SkillDir)
+	if err != nil {
+		return nil, fmt.Errorf("list skills: %w", err)
+	}
+	byID := make(map[string]localskills.SkillRef, len(available))
+	for _, ref := range available {
+		byID[ref.ID] = ref
+	}
+
+	selected := make([]localskills.Skill, 0, len(enabledIDs))
+	for _, id := range enabledIDs {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			return nil, fmt.Errorf("empty skill id in enabled skills")
+		}
+		ref, ok := byID[id]
+		if !ok {
+			return nil, fmt.Errorf("unknown skill %q; available skills: %s", id, formatSkillChoices(available))
+		}
+		skill, err := localskills.Load(ref.Path)
+		if err != nil {
+			return nil, fmt.Errorf("load skills: %w", err)
+		}
+		selected = append(selected, skill)
+	}
+	return selected, nil
+}
+
+func formatSkillChoices(refs []localskills.SkillRef) string {
+	if len(refs) == 0 {
+		return "(none)"
+	}
+
+	ids := make([]string, 0, len(refs))
+	for _, ref := range refs {
+		ids = append(ids, ref.ID)
+	}
+	return strings.Join(ids, ", ")
+}
+
 func closeMCPSessions(sessions []*mcp.Session) error {
 	var closeErr error
 	for _, session := range sessions {
@@ -466,16 +549,28 @@ func anthropicMessagesProviderConfig(provider config.ProviderConfig) anthropicme
 	}
 }
 
-func runMessages(project projectcontext.Project, prompt string) []model.Message {
+func runMessages(project projectcontext.Project, enabledSkills []localskills.Skill, prompt string) []model.Message {
 	instructions := projectcontext.ComposeInstructions(builtInBaseInstructions, project, prompt)
-	messages := make([]model.Message, 0, len(instructions))
+	messages := make([]model.Message, 0, len(instructions)+len(enabledSkills))
 	for _, instruction := range instructions {
+		if instruction.Source == projectcontext.InstructionSourceUser {
+			for _, skill := range enabledSkills {
+				messages = append(messages, model.Message{
+					Role:    model.MessageRoleDeveloper,
+					Content: formatSkillInstructions(skill),
+				})
+			}
+		}
 		messages = append(messages, model.Message{
 			Role:    roleForInstruction(instruction.Source),
 			Content: instruction.Content,
 		})
 	}
 	return messages
+}
+
+func formatSkillInstructions(skill localskills.Skill) string {
+	return fmt.Sprintf("Skill %s (%s):\n%s", skill.ID, skill.Name, skill.Instructions)
 }
 
 func roleForInstruction(source projectcontext.InstructionSource) model.MessageRole {

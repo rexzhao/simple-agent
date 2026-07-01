@@ -22,8 +22,9 @@
   - Base URL: `https://tc-paperhub.diezhi.net/v1`
   - Model: `glm-5.2`
   - API key 配置: `api_key: $PAPERHUB_API_KEY`
-- skills 是后续开发项，v0.1 不接入运行时。M7 先实现本地 `SKILL.md` 发现/读取，
-  不启用 skill activation 或 instruction composition。
+- skills 是后续开发项，v0.1 不作为 MVP 核心。M7 使用配置目录下的本地
+  `SKILL.md`，支持显式 activation 和 instruction composition；不读取用户目录，
+  不实现 marketplace、递归 skill discovery 或复杂依赖解析。
 - M5 已为 Anthropic Messages 添加 provider type 配置识别、示例、文本 streaming
   和 tool use runtime adapter。
 - M6 已为 OpenAI Responses 添加 provider type 配置识别、文本 input mapping、
@@ -82,7 +83,7 @@ internal/mcp
   MCP stdio client 和 MCP tool adapter，MVP 后实现
 
 internal/skills
-  本地 skill 目录发现和 SKILL.md 读取，M7 后实现，暂不接入 CLI runtime
+  本地 skill 目录发现、显式 activation 和 SKILL.md instruction composition
 
 internal/logging
   JSONL event log
@@ -141,6 +142,8 @@ sai mcp list  # M4
 --show-reasoning
 --max-turns 8
 --enable-tools read_file,list_files,shell
+--enable-skills writing,review
+--disable-skills
 --verbose
 --enable-mcp local  # M4
 ```
@@ -169,6 +172,9 @@ agent:
   show_reasoning: false
 
 tools:
+  enabled: []
+
+skills:
   enabled: []
 
 logging:
@@ -247,9 +253,10 @@ stateful `previous_response_id` 对话续写、reasoning output item passthrough
 和 resolved config 都不能打印实际值。
 `provider_dir` 相对配置根目录解析，除非显式写成绝对路径。
 `skill_dir` 是 M7 后的本地 skill 目录，默认是配置根目录下的 `skills`，同样相对配置
-根目录解析；推荐布局是 `.agents/skills/<skill_id>/SKILL.md`。当前只做发现和读取，
-暂不读取用户目录，也不支持 `skills.enabled`、CLI activation 或将 skill instructions
-组合进 `sai run` 消息。
+根目录解析；推荐布局是 `.agents/skills/<skill_id>/SKILL.md`。`skills.enabled`
+保存默认启用的本地 skill id 列表，空列表表示不读取或注入任何 skill。`sai run
+--enable-skills id1,id2` 覆盖配置中的 enabled skills，`--disable-skills` 本次运行禁用
+所有 skills；二者不能同时使用。只读取 `skill_dir`，不读取用户目录。
 `logging.path` 相对配置根目录解析，除非显式写成绝对路径。`mcp_dir` 是 M4 后启用的
 MCP 配置目录，同样相对配置根目录解析。
 
@@ -284,11 +291,13 @@ AGENTS.md
 项目指令优先级：
 
 ```text
-sai 内置基础约束 > AGENTS.md > 当前用户 prompt
+sai 内置基础约束 > AGENTS.md > enabled skills > 当前用户 prompt
 ```
 
 用户 prompt 不应覆盖 `sai` 的基础安全和执行约束，也不应隐式覆盖 `AGENTS.md` 中的项目
 约定。后续如需临时忽略项目指令，应增加显式参数，而不是通过普通 prompt 实现。
+已启用 skill 的 instructions 作为 developer message 追加在 `AGENTS.md` 之后、用户
+prompt 之前；多个 skill 按 `skills.enabled` 或 `--enable-skills` 中的顺序注入。
 
 ## OpenAI-Compatible Streaming 注意点
 
