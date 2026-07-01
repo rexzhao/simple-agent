@@ -1,0 +1,15 @@
+default_provider: paperhub
+default_model: glm-5.2
+provider_dir: providers
+
+agent:
+  max_turns: 8
+  stream: true
+  show_reasoning: false
+
+tools:
+  enabled: []
+
+logging:
+  path: logs/sai.jsonl
+  level: info
