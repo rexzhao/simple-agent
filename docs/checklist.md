@@ -1,0 +1,121 @@
+# 开发 Checklist
+
+这份清单用于实现阶段逐项勾选。每个检查项都应对应可观察行为或测试。
+
+## 范围约束
+
+- [ ] v0.1 保持纯 CLI，不引入 TUI。
+- [ ] v0.1 聚焦 OpenAI-compatible Chat Completions。
+- [ ] v0.1 不实现 skills。
+- [ ] 核心 OpenAI-compatible 路径稳定前，不实现 Anthropic Messages。
+- [ ] 核心 OpenAI-compatible 路径稳定前，不实现 OpenAI Responses。
+- [ ] 日志中不打印 API key 或 Authorization header。
+
+## M0：项目骨架
+
+- [ ] 初始化 Go module。
+- [ ] 添加 `sai` CLI 入口。
+- [ ] 添加 version 命令。
+- [ ] 添加 config package。
+- [ ] 使用 YAML 作为第一配置格式。
+- [ ] 默认从启动时当前工作目录读取 `config.yaml`。
+- [ ] 支持通过 `--config-dir` 指定配置目录。
+- [ ] 暂时不读取或写入用户目录配置。
+- [ ] 支持每个 provider 一个独立 YAML 文件。
+- [ ] 支持一个 provider 声明多个 model profile。
+- [ ] 支持每个 model profile 设置自己的请求参数。
+- [ ] 支持每个 MCP server 一个独立 YAML 文件。
+- [ ] 支持 `--enable-mcp` 覆盖 MCP 文件中的 `enabled` 字段。
+- [ ] 支持 JSONL 日志配置。
+- [ ] 添加 provider interface。
+- [ ] 添加内部 stream event 类型。
+- [ ] 添加 `sai models list`。
+- [ ] 添加初始测试。
+- [ ] 验证 `go test ./...`。
+
+## M1：Streaming
+
+- [ ] 实现 OpenAI-compatible request body。
+- [ ] 从 provider 配置加载 `base_url` 和 `api_key_env`。
+- [ ] 从 model profile 加载模型 id 和模型参数。
+- [ ] 添加 PaperHub provider 配置示例。
+- [ ] 支持会话开始时通过 `--provider` 和 `--model` 选择模型。
+- [ ] 未指定模型时使用全局默认 provider/model。
+- [ ] 默认 provider/model 无效时给出可读错误和可选列表。
+- [ ] 会话进行中不支持切换模型。
+- [ ] 实现 SSE scanner。
+- [ ] 解析 `data: [DONE]`。
+- [ ] 解析 `choices[].delta.content`。
+- [ ] 解析 `choices[].delta.reasoning_content`。
+- [ ] 默认隐藏 reasoning 输出。
+- [ ] 添加 `--show-reasoning`。
+- [ ] 解析 final `usage`。
+- [ ] 使用 `PAPERHUB_API_KEY` 验证 PaperHub smoke test。
+- [ ] 验证 non-streaming fallback，或明确记录暂不支持。
+
+## M2：Tool Calls
+
+- [ ] 定义内部 tool schema。
+- [ ] 定义 tool executor interface。
+- [ ] 添加 tool registry。
+- [ ] 将内部 tools 转换为 OpenAI-compatible `tools` payload。
+- [ ] 内置 `list_files`。
+- [ ] 内置 `read_file`。
+- [ ] 内置 `shell`。
+- [ ] 默认不启用任何工具。
+- [ ] 通过配置 `tools.enabled` 启用工具。
+- [ ] 通过 `--enable-tools` 覆盖配置中的 enabled tools。
+- [ ] 累积 streamed tool call arguments。
+- [ ] 执行完整 tool call。
+- [ ] 追加 tool result messages。
+- [ ] tool result 后继续 model loop。
+- [ ] 添加 `max_turns`。
+- [ ] 添加 partial JSON argument chunks 测试。
+- [ ] 添加 malformed tool arguments 测试。
+
+## M3：MCP
+
+- [ ] 添加 `mcp/` 配置目录。
+- [ ] 每个 MCP server 使用一个 YAML 文件。
+- [ ] 读取 MCP 文件中的 `enabled` 字段。
+- [ ] 通过 `--enable-mcp` 覆盖 MCP 文件中的 `enabled` 字段。
+- [ ] 启动 stdio MCP server 进程。
+- [ ] 发送 MCP initialize request。
+- [ ] 列出 MCP tools。
+- [ ] 将 MCP tools 转换为内部 tool schema。
+- [ ] MCP tools 仍受 enabled tools 列表控制。
+- [ ] 将 tool call route 到 MCP。
+- [ ] 将 MCP tool result 回传给模型。
+- [ ] `sai` 退出时关闭 MCP server 进程。
+- [ ] 添加 fake MCP server 集成测试。
+
+## M4：打包
+
+- [ ] 添加 Windows、Linux、macOS build 命令。
+- [ ] 构建单文件可执行程序。
+- [ ] 添加 `--verbose`。
+- [ ] 添加 JSONL 日志。
+- [ ] 除 JSONL 日志外，不落盘会话历史或上下文快照。
+- [ ] missing API key 有可读错误。
+- [ ] HTTP failure 有可读错误。
+- [ ] invalid SSE chunk 有可读错误。
+- [ ] 添加最小 README。
+- [ ] 验证 fresh checkout build。
+
+## 后续协议
+
+- [ ] 在 provider interface 后添加 Anthropic Messages adapter。
+- [ ] 添加 Anthropic streaming fixture tests。
+- [ ] 添加 Anthropic tool call fixture tests。
+- [ ] 在 provider interface 后添加 OpenAI Responses adapter。
+- [ ] 添加 Responses semantic streaming fixture tests。
+- [ ] 添加 Responses function call fixture tests。
+
+## 后续 Skills
+
+- [ ] 定义 skill 目录结构。
+- [ ] 读取 `SKILL.md`。
+- [ ] 添加显式 skill activation。
+- [ ] 将 skill instructions 组合进 system/developer messages。
+- [ ] 添加 malformed skill 错误处理。
+- [ ] 添加 skill selection 和 disablement 测试。
