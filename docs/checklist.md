@@ -25,11 +25,11 @@
 - [x] 支持每个 provider 一个独立 YAML 文件。
 - [x] 支持一个 provider 声明多个 model profile。
 - [x] 支持每个 model profile 设置自己的请求参数。
-- [ ] 默认读取启动目录下的 `AGENTS.md`。
-- [ ] 缺失 `AGENTS.md` 时继续执行。
-- [ ] `--config-dir` 不改变 `AGENTS.md` 查找位置。
-- [ ] 暂时不读取用户目录中的 `AGENTS.md`。
-- [ ] 实现指令优先级：`sai` 内置基础约束 > `AGENTS.md` > 当前用户 prompt。
+- [x] 默认读取启动目录下的 `AGENTS.md`。
+- [x] 缺失 `AGENTS.md` 时继续执行。
+- [x] `--config-dir` 不改变 `AGENTS.md` 查找位置。
+- [x] 暂时不读取用户目录中的 `AGENTS.md`。
+- [x] 实现指令优先级：`sai` 内置基础约束 > `AGENTS.md` > 当前用户 prompt。
 - [x] 支持 JSONL 日志配置。
 - [x] 添加 provider interface。
 - [x] 添加内部 stream event 类型。
