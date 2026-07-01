@@ -51,7 +51,7 @@ cmd/sai
   CLI 命令和终端输出
 
 internal/config
-  YAML 配置加载、环境变量覆盖、provider/model profile
+  YAML 配置加载、敏感配置值解析、provider/model profile
 
 internal/agent
   对话循环、max turns、tool 执行循环
@@ -184,8 +184,10 @@ models:
 
 命令行参数覆盖配置文件。`api_key` 是 provider 配置中的具体字段。对需要脱敏的敏感
 配置值，统一使用简单字符串约定：值以 `$` 开头时，`$` 后面的内容作为环境变量名读取
-实际值；不以 `$` 开头时表示直接配置值。无论实际值来自环境变量还是直接配置，日志、
-verbose 输出和 resolved config 都不能打印实际值。
+实际值；不以 `$` 开头时表示直接配置值。这个解析发生在配置读取阶段；provider adapter
+接收解析后的实际值。除非某个 adapter 明确声明协议特定的默认环境变量，否则 adapter
+不承担通用环境变量解析职责。无论实际值来自环境变量还是直接配置，日志、verbose 输出
+和 resolved config 都不能打印实际值。
 `provider_dir` 相对配置根目录解析，除非显式写成绝对路径。
 `logging.path` 相对配置根目录解析，除非显式写成绝对路径。`mcp_dir` 是 M4 后启用的
 MCP 配置目录，同样相对配置根目录解析。

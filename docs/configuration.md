@@ -120,8 +120,10 @@ model profile 的 key 是 CLI 选择时使用的名字。`id` 是实际传给模
 
 `api_key` 是这次 provider 配置中的具体字段。其他需要脱敏的敏感配置值也可以采用同样
 约定：字符串以 `$` 开头时，`$` 后面的内容作为环境变量名读取实际值；不以 `$` 开头时
-表示直接配置值。无论实际值来自环境变量还是直接配置，logs、verbose、resolved config
-等输出都不能泄露实际值。
+表示直接配置值。这个解析发生在配置读取阶段；provider adapter 接收解析后的实际值。
+除非某个 adapter 明确声明协议特定的默认环境变量，否则 adapter 不承担通用环境变量解析
+职责。无论实际值来自环境变量还是直接配置，logs、verbose、resolved config 等输出都
+不能泄露实际值。
 
 ## MCP 配置（M4 后）
 
