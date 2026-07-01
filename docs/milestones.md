@@ -46,7 +46,7 @@ MCP 放到 MVP 之后。
 - `sai run "prompt"` 命令。
 - 会话开始时根据 `--provider` 和 `--model` 选择模型。
 - 将启动目录的 `AGENTS.md` 内容加入本次会话上下文。
-- `--show-reasoning` 参数。
+- `--show-reasoning` 参数，并在 reasoning 输出结束后换行再输出最终消息。
 
 验证：
 
@@ -54,7 +54,7 @@ MCP 放到 MVP 之后。
 - `sai chat --provider paperhub --model glm-5.2` 在会话开始时固定模型。
 - 缺失 `AGENTS.md` 时命令仍可正常运行。
 - reasoning 内容默认隐藏。
-- `--show-reasoning` 能单独显示 reasoning 内容。
+- `--show-reasoning` 能单独显示 reasoning 内容，且 reasoning 和最终消息之间有换行分隔。
 - 单元测试覆盖普通 chunk、reasoning chunk、usage chunk 和 `[DONE]`。
 
 ## M2：Tool Call Loop

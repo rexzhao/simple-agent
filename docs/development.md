@@ -247,7 +247,9 @@ choices[0].delta.content
 ```
 
 默认只把 `delta.content` 作为用户可见输出。`delta.reasoning_content` 需要解析成
-内部事件，但默认不打印。
+内部事件，但默认不打印。启用 `--show-reasoning` 时，CLI 可以打印 reasoning 输出；
+当事件流从 reasoning 输出切换到最终消息输出时，必须先补齐一个行尾换行，避免 reasoning
+和最终消息混在同一行。
 
 ## Tool Calling
 
