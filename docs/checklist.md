@@ -57,7 +57,7 @@
 - [x] 默认隐藏 reasoning 输出。
 - [x] 添加 `--show-reasoning`。
 - [x] 解析 final `usage`。
-- [ ] 使用 `PAPERHUB_API_KEY` 验证 PaperHub smoke test。
+- [x] 使用 `PAPERHUB_API_KEY` 验证 PaperHub smoke test。
 - [ ] 验证 non-streaming fallback，或明确记录暂不支持。
 
 ## M2：Tool Calls
