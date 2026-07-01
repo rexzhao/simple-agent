@@ -74,6 +74,153 @@ func TestModelListIsSortedAndIncludesActualIDs(t *testing.T) {
 	}
 }
 
+func TestResolveModelExplicitProviderModel(t *testing.T) {
+	dir := writeConfigFixture(t)
+
+	cfg, err := Load(dir)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+
+	got, err := cfg.ResolveModel("paperhub", "glm-5.2-fast")
+	if err != nil {
+		t.Fatalf("ResolveModel() error = %v", err)
+	}
+
+	if got.ProviderName != "paperhub" {
+		t.Fatalf("ProviderName = %q, want paperhub", got.ProviderName)
+	}
+	if got.Provider.Name != "paperhub" {
+		t.Fatalf("Provider.Name = %q, want paperhub", got.Provider.Name)
+	}
+	if got.Provider.BaseURL != "https://tc-paperhub.diezhi.net/v1" {
+		t.Fatalf("Provider.BaseURL = %q, want PaperHub base URL", got.Provider.BaseURL)
+	}
+	if got.Provider.APIKeyEnv != "PAPERHUB_API_KEY" {
+		t.Fatalf("Provider.APIKeyEnv = %q, want PAPERHUB_API_KEY", got.Provider.APIKeyEnv)
+	}
+	if got.Profile != "glm-5.2-fast" {
+		t.Fatalf("Profile = %q, want glm-5.2-fast", got.Profile)
+	}
+	if got.ModelID != "glm-5.2" {
+		t.Fatalf("ModelID = %q, want glm-5.2", got.ModelID)
+	}
+	if got.Parameters["temperature"] != 0.2 {
+		t.Fatalf("temperature = %#v, want 0.2", got.Parameters["temperature"])
+	}
+	if got.Parameters["max_tokens"] != 2048 {
+		t.Fatalf("max_tokens = %#v, want 2048", got.Parameters["max_tokens"])
+	}
+}
+
+func TestResolveModelUsesDefaultProviderAndModel(t *testing.T) {
+	dir := writeConfigFixture(t)
+
+	cfg, err := Load(dir)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+
+	got, err := cfg.ResolveModel("", "")
+	if err != nil {
+		t.Fatalf("ResolveModel() error = %v", err)
+	}
+
+	if got.ProviderName != "paperhub" {
+		t.Fatalf("ProviderName = %q, want paperhub", got.ProviderName)
+	}
+	if got.Profile != "glm-5.2" {
+		t.Fatalf("Profile = %q, want glm-5.2", got.Profile)
+	}
+	if got.ModelID != "glm-5.2" {
+		t.Fatalf("ModelID = %q, want glm-5.2", got.ModelID)
+	}
+	if got.Parameters["max_tokens"] != 4096 {
+		t.Fatalf("max_tokens = %#v, want 4096", got.Parameters["max_tokens"])
+	}
+}
+
+func TestResolveModelUnknownProviderIncludesChoices(t *testing.T) {
+	dir := writeConfigFixture(t)
+
+	cfg, err := Load(dir)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+
+	_, err = cfg.ResolveModel("missing", "glm-5.2")
+	assertErrorContains(t, err, `unknown provider "missing"`, "available providers: local, paperhub")
+}
+
+func TestResolveModelUnknownModelIncludesChoices(t *testing.T) {
+	dir := writeConfigFixture(t)
+
+	cfg, err := Load(dir)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+
+	_, err = cfg.ResolveModel("paperhub", "missing")
+	assertErrorContains(t, err, `unknown model "missing" for provider "paperhub"`, "available models: glm-5.2 (id glm-5.2), glm-5.2-fast (id glm-5.2)")
+}
+
+func TestResolveModelMissingDefaultsIncludesChoices(t *testing.T) {
+	dir := writeConfigFixture(t)
+
+	cfg, err := Load(dir)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	cfg.DefaultProvider = ""
+	cfg.DefaultModel = ""
+
+	_, err = cfg.ResolveModel("", "")
+	assertErrorContains(t, err, "provider and model are required", "default_provider/default_model", "available models:", "local/small (id local-small)", "paperhub/glm-5.2 (id glm-5.2)")
+}
+
+func TestResolveModelInvalidDefaultModelIncludesChoices(t *testing.T) {
+	dir := writeConfigFixture(t)
+
+	cfg, err := Load(dir)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	cfg.DefaultModel = "missing"
+
+	_, err = cfg.ResolveModel("", "")
+	assertErrorContains(t, err, `unknown model "missing" for provider "paperhub"`, "available models: glm-5.2 (id glm-5.2), glm-5.2-fast (id glm-5.2)")
+}
+
+func TestResolveModelCopiesParameters(t *testing.T) {
+	dir := writeConfigFixture(t)
+
+	cfg, err := Load(dir)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+
+	got, err := cfg.ResolveModel("paperhub", "glm-5.2")
+	if err != nil {
+		t.Fatalf("ResolveModel() error = %v", err)
+	}
+
+	got.Parameters["max_tokens"] = 1
+	got.Parameters["new_param"] = true
+	providerProfile := got.Provider.Models["glm-5.2"]
+	providerProfile.Parameters["temperature"] = 1.0
+
+	original := cfg.Providers["paperhub"].Models["glm-5.2"].Parameters
+	if original["max_tokens"] != 4096 {
+		t.Fatalf("original max_tokens = %#v, want 4096", original["max_tokens"])
+	}
+	if _, ok := original["new_param"]; ok {
+		t.Fatal("original parameters contain new_param from resolved copy")
+	}
+	if original["temperature"] != 0.6 {
+		t.Fatalf("original temperature = %#v, want 0.6", original["temperature"])
+	}
+}
+
 func TestLoadMissingConfigMentionsSaiYAML(t *testing.T) {
 	dir := t.TempDir()
 
@@ -83,6 +230,19 @@ func TestLoadMissingConfigMentionsSaiYAML(t *testing.T) {
 	}
 	if got := err.Error(); !strings.Contains(got, "sai.yaml") {
 		t.Fatalf("Load() error = %q, want mention sai.yaml", got)
+	}
+}
+
+func assertErrorContains(t *testing.T, err error, wants ...string) {
+	t.Helper()
+	if err == nil {
+		t.Fatal("error = nil, want error")
+	}
+	got := err.Error()
+	for _, want := range wants {
+		if !strings.Contains(got, want) {
+			t.Fatalf("error = %q, want contain %q", got, want)
+		}
 	}
 }
 

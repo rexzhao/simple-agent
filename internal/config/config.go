@@ -56,6 +56,14 @@ type ModelInfo struct {
 	ID       string
 }
 
+type ResolvedModel struct {
+	ProviderName string
+	Provider     ProviderConfig
+	Profile      string
+	ModelID      string
+	Parameters   map[string]any
+}
+
 func Load(configDir string) (*Config, error) {
 	if strings.TrimSpace(configDir) == "" {
 		return nil, fmt.Errorf("config directory is required")
@@ -94,6 +102,45 @@ func Load(configDir string) (*Config, error) {
 	return &cfg, nil
 }
 
+func (c *Config) ResolveModel(providerName, modelName string) (ResolvedModel, error) {
+	providerName = strings.TrimSpace(providerName)
+	modelName = strings.TrimSpace(modelName)
+	if providerName == "" {
+		providerName = strings.TrimSpace(c.DefaultProvider)
+	}
+	if modelName == "" {
+		modelName = strings.TrimSpace(c.DefaultModel)
+	}
+
+	if providerName == "" && modelName == "" {
+		return ResolvedModel{}, fmt.Errorf("provider and model are required; set default_provider/default_model or pass provider/model; available models: %s", c.formatModelChoices())
+	}
+	if providerName == "" {
+		return ResolvedModel{}, fmt.Errorf("provider is required; set default_provider or pass provider; available providers: %s", c.formatProviderChoices())
+	}
+
+	provider, ok := c.Providers[providerName]
+	if !ok {
+		return ResolvedModel{}, fmt.Errorf("unknown provider %q; available providers: %s", providerName, c.formatProviderChoices())
+	}
+	if modelName == "" {
+		return ResolvedModel{}, fmt.Errorf("model is required for provider %q; set default_model or pass model; available models: %s", providerName, formatProviderModelChoices(provider))
+	}
+
+	profile, ok := provider.Models[modelName]
+	if !ok {
+		return ResolvedModel{}, fmt.Errorf("unknown model %q for provider %q; available models: %s", modelName, providerName, formatProviderModelChoices(provider))
+	}
+
+	return ResolvedModel{
+		ProviderName: providerName,
+		Provider:     copyProvider(provider),
+		Profile:      modelName,
+		ModelID:      profile.ID,
+		Parameters:   copyParameters(profile.Parameters),
+	}, nil
+}
+
 func (c *Config) ModelList() []ModelInfo {
 	providerNames := make([]string, 0, len(c.Providers))
 	for name := range c.Providers {
@@ -118,6 +165,78 @@ func (c *Config) ModelList() []ModelInfo {
 		}
 	}
 	return models
+}
+
+func (c *Config) formatProviderChoices() string {
+	names := make([]string, 0, len(c.Providers))
+	for name := range c.Providers {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	if len(names) == 0 {
+		return "(none)"
+	}
+	return strings.Join(names, ", ")
+}
+
+func (c *Config) formatModelChoices() string {
+	models := c.ModelList()
+	if len(models) == 0 {
+		return "(none)"
+	}
+
+	choices := make([]string, 0, len(models))
+	for _, model := range models {
+		choices = append(choices, fmt.Sprintf("%s/%s (id %s)", model.Provider, model.Profile, model.ID))
+	}
+	return strings.Join(choices, ", ")
+}
+
+func formatProviderModelChoices(provider ProviderConfig) string {
+	names := make([]string, 0, len(provider.Models))
+	for name := range provider.Models {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	if len(names) == 0 {
+		return "(none)"
+	}
+
+	choices := make([]string, 0, len(names))
+	for _, name := range names {
+		choices = append(choices, fmt.Sprintf("%s (id %s)", name, provider.Models[name].ID))
+	}
+	return strings.Join(choices, ", ")
+}
+
+func copyProvider(provider ProviderConfig) ProviderConfig {
+	provider.Models = copyModels(provider.Models)
+	return provider
+}
+
+func copyModels(models map[string]ModelProfile) map[string]ModelProfile {
+	if models == nil {
+		return nil
+	}
+
+	copied := make(map[string]ModelProfile, len(models))
+	for name, profile := range models {
+		profile.Parameters = copyParameters(profile.Parameters)
+		copied[name] = profile
+	}
+	return copied
+}
+
+func copyParameters(parameters map[string]any) map[string]any {
+	if parameters == nil {
+		return nil
+	}
+
+	copied := make(map[string]any, len(parameters))
+	for name, value := range parameters {
+		copied[name] = value
+	}
+	return copied
 }
 
 func (m *ModelProfile) UnmarshalYAML(value *yaml.Node) error {

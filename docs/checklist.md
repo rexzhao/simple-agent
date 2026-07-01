@@ -40,12 +40,12 @@
 ## M1：Streaming
 
 - [x] 实现 OpenAI-compatible request body。
-- [ ] 从 provider 配置加载 `base_url` 和 `api_key`。
-- [ ] 从 model profile 加载模型 id 和模型参数。
+- [x] 从 provider 配置加载 `base_url` 和 `api_key`。
+- [x] 从 model profile 加载模型 id 和模型参数。
 - [ ] 添加 PaperHub provider 配置示例。
 - [ ] 支持会话开始时通过 `--provider` 和 `--model` 选择模型。
-- [ ] 未指定模型时使用全局默认 provider/model。
-- [ ] 默认 provider/model 无效时给出可读错误和可选列表。
+- [x] 未指定模型时使用全局默认 provider/model。
+- [x] 默认 provider/model 无效时给出可读错误和可选列表。
 - [ ] 会话进行中不支持切换模型。
 - [ ] 将 `AGENTS.md` 内容加入本次会话上下文。
 - [x] 实现 SSE scanner。
