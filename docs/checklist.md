@@ -85,8 +85,8 @@
 
 ## M3：打包
 
-- [ ] 添加 Windows、Linux、macOS build 命令。
-- [ ] 构建单文件可执行程序。
+- [x] 添加 Windows、Linux、macOS build 命令。
+- [x] 构建单文件可执行程序。
 - [ ] 添加 `--verbose`。
 - [x] 添加 JSONL 日志。
 - [x] 除 JSONL 日志外，不落盘会话历史或上下文快照。
@@ -94,8 +94,8 @@
 - [ ] missing API key 有可读错误。
 - [ ] HTTP failure 有可读错误。
 - [ ] invalid SSE chunk 有可读错误。
-- [ ] 添加最小 README。
-- [ ] 验证 fresh checkout build。
+- [x] 添加最小 README。
+- [x] 验证 fresh checkout build。
 
 ## M4：MCP
 
