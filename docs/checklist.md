@@ -63,9 +63,9 @@
 
 ## M2：Tool Calls
 
-- [ ] 定义内部 tool schema。
-- [ ] 定义 tool executor interface。
-- [ ] 添加 tool registry。
+- [x] 定义内部 tool schema。
+- [x] 定义 tool executor interface。
+- [x] 添加 tool registry。
 - [ ] 将内部 tools 转换为 OpenAI-compatible `tools` payload。
 - [ ] 内置 `list_files`。
 - [ ] 内置 `read_file`。
