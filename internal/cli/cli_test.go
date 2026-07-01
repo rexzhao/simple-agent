@@ -50,7 +50,7 @@ func TestModelsListDefaultsConfigDirToAgentsUnderCurrentWorkingDirectory(t *test
 
 func TestConfigShowDoesNotPrintAPIKeyValue(t *testing.T) {
 	dir := writeCLIFixture(t)
-	t.Setenv("PAPERHUB_API_KEY", "super-secret-value")
+	t.Setenv("PAPERHUB_API_KEY", "env-secret-value")
 
 	var stdout, stderr bytes.Buffer
 	code := RunWithGetwd([]string{"--config-dir", dir, "config", "show"}, &stdout, &stderr, func() (string, error) {
@@ -61,8 +61,10 @@ func TestConfigShowDoesNotPrintAPIKeyValue(t *testing.T) {
 		t.Fatalf("RunWithGetwd() code = %d, stderr = %s", code, stderr.String())
 	}
 	out := stdout.String()
-	if strings.Contains(out, "super-secret-value") {
-		t.Fatalf("config show leaked API key value:\n%s", out)
+	for _, leaked := range []string{"env-secret-value", "direct-secret-value"} {
+		if strings.Contains(out, leaked) {
+			t.Fatalf("config show leaked API key value %q:\n%s", leaked, out)
+		}
 	}
 	if !strings.Contains(out, "PAPERHUB_API_KEY") {
 		t.Fatalf("config show should include API key env var name:\n%s", out)
@@ -119,7 +121,7 @@ logging:
 	writeCLIFile(t, filepath.Join(providersDir, "paperhub.yaml"), `name: paperhub
 type: openai-chat
 base_url: https://tc-paperhub.diezhi.net/v1
-api_key_env: PAPERHUB_API_KEY
+api_key: $PAPERHUB_API_KEY
 
 models:
   glm-5.2:
@@ -130,6 +132,16 @@ models:
     id: glm-5.2
     temperature: 0.2
     max_tokens: 2048
+`)
+
+	writeCLIFile(t, filepath.Join(providersDir, "local.yaml"), `name: local
+type: openai-chat
+base_url: http://localhost:8080/v1
+api_key: direct-secret-value
+
+models:
+  small:
+    id: local-small
 `)
 }
 

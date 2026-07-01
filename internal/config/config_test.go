@@ -38,8 +38,8 @@ func TestLoadResolvesConfigAndProviderModels(t *testing.T) {
 	if provider.Name != "paperhub" {
 		t.Fatalf("provider name = %q, want paperhub", provider.Name)
 	}
-	if provider.APIKeyEnv != "PAPERHUB_API_KEY" {
-		t.Fatalf("APIKeyEnv = %q, want PAPERHUB_API_KEY", provider.APIKeyEnv)
+	if provider.APIKey != "$PAPERHUB_API_KEY" {
+		t.Fatalf("APIKey = %q, want $PAPERHUB_API_KEY", provider.APIKey)
 	}
 	if got := provider.Models["glm-5.2-fast"].ID; got != "glm-5.2" {
 		t.Fatalf("fast profile id = %q, want glm-5.2", got)
@@ -96,8 +96,8 @@ func TestResolveModelExplicitProviderModel(t *testing.T) {
 	if got.Provider.BaseURL != "https://tc-paperhub.diezhi.net/v1" {
 		t.Fatalf("Provider.BaseURL = %q, want PaperHub base URL", got.Provider.BaseURL)
 	}
-	if got.Provider.APIKeyEnv != "PAPERHUB_API_KEY" {
-		t.Fatalf("Provider.APIKeyEnv = %q, want PAPERHUB_API_KEY", got.Provider.APIKeyEnv)
+	if got.Provider.APIKey != "$PAPERHUB_API_KEY" {
+		t.Fatalf("Provider.APIKey = %q, want $PAPERHUB_API_KEY", got.Provider.APIKey)
 	}
 	if got.Profile != "glm-5.2-fast" {
 		t.Fatalf("Profile = %q, want glm-5.2-fast", got.Profile)
@@ -275,7 +275,7 @@ logging:
 	writeFile(t, filepath.Join(providersDir, "paperhub.yaml"), `name: paperhub
 type: openai-chat
 base_url: https://tc-paperhub.diezhi.net/v1
-api_key_env: PAPERHUB_API_KEY
+api_key: $PAPERHUB_API_KEY
 
 models:
   glm-5.2:
@@ -291,7 +291,7 @@ models:
 	writeFile(t, filepath.Join(providersDir, "local.yml"), `name: local
 type: openai-chat
 base_url: http://localhost:8080/v1
-api_key_env: LOCAL_API_KEY
+api_key: direct-local-secret
 
 models:
   small:

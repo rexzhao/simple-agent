@@ -1,6 +1,7 @@
 package config
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -38,11 +39,11 @@ type LoggingConfig struct {
 }
 
 type ProviderConfig struct {
-	Name      string                  `json:"name" yaml:"name"`
-	Type      string                  `json:"type" yaml:"type"`
-	BaseURL   string                  `json:"base_url" yaml:"base_url"`
-	APIKeyEnv string                  `json:"api_key_env" yaml:"api_key_env"`
-	Models    map[string]ModelProfile `json:"models" yaml:"models"`
+	Name    string                  `json:"name" yaml:"name"`
+	Type    string                  `json:"type" yaml:"type"`
+	BaseURL string                  `json:"base_url" yaml:"base_url"`
+	APIKey  string                  `json:"api_key" yaml:"api_key"`
+	Models  map[string]ModelProfile `json:"models" yaml:"models"`
 }
 
 type ModelProfile struct {
@@ -62,6 +63,24 @@ type ResolvedModel struct {
 	Profile      string
 	ModelID      string
 	Parameters   map[string]any
+}
+
+func (p ProviderConfig) MarshalJSON() ([]byte, error) {
+	type providerJSON struct {
+		Name    string                  `json:"name"`
+		Type    string                  `json:"type"`
+		BaseURL string                  `json:"base_url"`
+		APIKey  string                  `json:"api_key"`
+		Models  map[string]ModelProfile `json:"models"`
+	}
+
+	return json.Marshal(providerJSON{
+		Name:    p.Name,
+		Type:    p.Type,
+		BaseURL: p.BaseURL,
+		APIKey:  redactedSecretValue(p.APIKey),
+		Models:  p.Models,
+	})
 }
 
 func Load(configDir string) (*Config, error) {
@@ -331,4 +350,11 @@ func resolvePath(baseDir, path string) string {
 		return filepath.Clean(path)
 	}
 	return filepath.Clean(filepath.Join(baseDir, path))
+}
+
+func redactedSecretValue(value string) string {
+	if value == "" || strings.HasPrefix(value, "$") {
+		return value
+	}
+	return "<redacted>"
 }
