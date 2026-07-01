@@ -48,7 +48,7 @@
 - [x] 支持会话开始时通过 `--provider` 和 `--model` 选择模型。
 - [x] 未指定模型时使用全局默认 provider/model。
 - [x] 默认 provider/model 无效时给出可读错误和可选列表。
-- [ ] 会话进行中不支持切换模型。
+- [x] 会话进行中不支持切换模型。
 - [x] 将 `AGENTS.md` 内容加入本次会话上下文。
 - [x] 实现 SSE scanner。
 - [x] 解析 `data: [DONE]`。

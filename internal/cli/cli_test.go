@@ -165,6 +165,22 @@ func TestRunExplicitProviderModelSelectsProfileParameters(t *testing.T) {
 	}
 	assertJSONNumber(t, request.Body["temperature"], "0.2")
 	assertJSONNumber(t, request.Body["max_tokens"], "64")
+	assertNoAdditionalCLIRunRequest(t, requests)
+}
+
+func TestRunRejectsPostPromptModelFlagInsteadOfSwitching(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	code := RunWithGetwd([]string{"run", "--model", "fast", "Use fast", "--model", "default"}, &stdout, &stderr, func() (string, error) {
+		return "unused", nil
+	})
+
+	if code != 1 {
+		t.Fatalf("RunWithGetwd() code = %d, want 1", code)
+	}
+	if stdout.String() != "" {
+		t.Fatalf("stdout = %q, want empty", stdout.String())
+	}
+	assertCLIErrorContains(t, stderr.String(), `usage: sai run`)
 }
 
 func TestRunIncludesStartupAgentsAndConfigDirDoesNotChangeLookup(t *testing.T) {
@@ -561,5 +577,15 @@ func assertCLIErrorOmits(t *testing.T, got string, values ...string) {
 		if strings.Contains(got, value) {
 			t.Fatalf("stderr leaked %q: %s", value, got)
 		}
+	}
+}
+
+func assertNoAdditionalCLIRunRequest(t *testing.T, requests <-chan capturedCLIRunRequest) {
+	t.Helper()
+
+	select {
+	case request := <-requests:
+		t.Fatalf("unexpected additional model request: path=%s body=%s", request.Path, request.RawBody)
+	default:
 	}
 }
