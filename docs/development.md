@@ -125,13 +125,14 @@ sai mcp list  # M4
 --model glm-5.2
 --config-dir ./config
 --base-url https://tc-paperhub.diezhi.net/v1
---no-stream
 --show-reasoning
 --max-turns 8
 --enable-tools read_file,list_files,shell
 --verbose
 --enable-mcp local  # M4
 ```
+
+v0.1 暂不支持 non-streaming fallback，`sai run` 当前强制使用 streaming；后续如要支持再引入 `--no-stream` 或 adapter 非流式路径。
 
 ## 配置形态
 
