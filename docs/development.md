@@ -376,6 +376,10 @@ M2 完成前需要额外做一次 PaperHub tool call smoke test，确认 `glm-5.
 OpenAI-compatible `tools` / `tool_calls` 的真实兼容性。若服务不支持，保留协议层实现，
 并将 PaperHub 的 tool calling 标记为已知限制。
 
+2026-07-01 已执行 PaperHub tool call smoke test。命令形态为：
+`go run ./cmd/sai --config-dir <temp-config> run --provider paperhub --model glm-5.2 --enable-tools list_files "<prompt>"`。
+结果：PaperHub `glm-5.2` 成功返回 tool call，`sai` 执行 `list_files` 后继续输出最终文本。
+
 手动测试命令：
 
 ```powershell

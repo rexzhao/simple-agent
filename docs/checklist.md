@@ -81,7 +81,7 @@
 - [x] 添加 `max_turns`。
 - [x] 添加 partial JSON argument chunks 测试。
 - [x] 添加 malformed tool arguments 测试。
-- [ ] 执行 PaperHub tool call smoke test，或记录不兼容限制。
+- [x] 执行 PaperHub tool call smoke test，或记录不兼容限制。
 
 ## M3：打包
 
