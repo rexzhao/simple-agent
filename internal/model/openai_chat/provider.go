@@ -68,7 +68,7 @@ func (p *Provider) Stream(ctx context.Context, request model.Request) (<-chan mo
 	}
 	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
 		defer response.Body.Close()
-		return nil, fmt.Errorf("OpenAI chat request failed: %s: %s", response.Status, readErrorBody(response.Body))
+		return nil, fmt.Errorf("OpenAI chat request failed: %s: %s", response.Status, readErrorBody(response.Body, apiKey))
 	}
 
 	events := make(chan model.Event)
@@ -129,7 +129,7 @@ func emitSSEFrame(decoder *streamEventDecoder, frame []byte, events chan<- model
 	return done
 }
 
-func readErrorBody(body io.Reader) string {
+func readErrorBody(body io.Reader, apiKey string) string {
 	data, err := io.ReadAll(io.LimitReader(body, 4096))
 	if err != nil {
 		return "read response body: " + err.Error()
@@ -137,6 +137,9 @@ func readErrorBody(body io.Reader) string {
 	message := strings.TrimSpace(string(data))
 	if message == "" {
 		return "empty response body"
+	}
+	if apiKey = strings.TrimSpace(apiKey); apiKey != "" {
+		message = strings.ReplaceAll(message, apiKey, "<redacted>")
 	}
 	return message
 }

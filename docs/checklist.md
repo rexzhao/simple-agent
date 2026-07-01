@@ -91,9 +91,9 @@
 - [x] 添加 JSONL 日志。
 - [x] 除 JSONL 日志外，不落盘会话历史或上下文快照。
 - [x] v0.1 不记录完整 prompt、response、tool result 正文。
-- [ ] missing API key 有可读错误。
-- [ ] HTTP failure 有可读错误。
-- [ ] invalid SSE chunk 有可读错误。
+- [x] missing API key 有可读错误。
+- [x] HTTP failure 有可读错误。
+- [x] invalid SSE chunk 有可读错误。
 - [x] 添加最小 README。
 - [x] 验证 fresh checkout build。
 

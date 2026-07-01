@@ -573,7 +573,7 @@ func TestRunReasoningIsHiddenUnlessShowReasoningIsSet(t *testing.T) {
 
 func TestRunErrorsDoNotLeakAPIKeyValues(t *testing.T) {
 	t.Run("missing API key", func(t *testing.T) {
-		server, _ := newCLIRunServer(t, `[DONE]`)
+		server, requests := newCLIRunServer(t, `[DONE]`)
 		defer server.Close()
 
 		configDir := t.TempDir()
@@ -588,7 +588,77 @@ func TestRunErrorsDoNotLeakAPIKeyValues(t *testing.T) {
 		if code != 1 {
 			t.Fatalf("RunWithGetwd() code = %d, want 1", code)
 		}
+		if stdout.String() != "" {
+			t.Fatalf("stdout = %q, want empty", stdout.String())
+		}
 		assertCLIErrorContains(t, stderr.String(), `API key environment variable "SAI_MISSING_API_KEY" is not set`)
+		assertCLIErrorOmits(t, stderr.String(), "Bearer ")
+		assertNoAdditionalCLIRunRequest(t, requests)
+	})
+
+	t.Run("HTTP failure", func(t *testing.T) {
+		requests := make(chan capturedCLIRunRequest, 1)
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				t.Errorf("ReadAll() error = %v", err)
+			}
+			requests <- capturedCLIRunRequest{
+				Path:          r.URL.Path,
+				Authorization: r.Header.Get("Authorization"),
+				RawBody:       body,
+				Body:          decodeCLIJSON(t, body),
+			}
+			http.Error(w, "rate limited for Authorization: Bearer direct-secret-value", http.StatusTooManyRequests)
+		}))
+		defer server.Close()
+
+		configDir := t.TempDir()
+		writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
+
+		var stdout, stderr bytes.Buffer
+		code := RunWithGetwd([]string{"--config-dir", configDir, "run", "Hello"}, &stdout, &stderr, func() (string, error) {
+			return t.TempDir(), nil
+		})
+
+		if code != 1 {
+			t.Fatalf("RunWithGetwd() code = %d, want 1", code)
+		}
+		if stdout.String() != "" {
+			t.Fatalf("stdout = %q, want empty", stdout.String())
+		}
+		assertCLIErrorContains(t, stderr.String(), "request model", "OpenAI chat request failed", "429 Too Many Requests", "rate limited")
+		assertCLIErrorOmits(t, stderr.String(), "direct-secret-value", "Bearer direct-secret-value")
+
+		request := <-requests
+		if request.Authorization != "Bearer direct-secret-value" {
+			t.Fatalf("Authorization = %q, want direct API key", request.Authorization)
+		}
+		assertNoAdditionalCLIRunRequest(t, requests)
+	})
+
+	t.Run("invalid SSE chunk", func(t *testing.T) {
+		server, requests := newCLIRunServer(t, `{not-json`)
+		defer server.Close()
+
+		configDir := t.TempDir()
+		writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
+
+		var stdout, stderr bytes.Buffer
+		code := RunWithGetwd([]string{"--config-dir", configDir, "run", "Hello"}, &stdout, &stderr, func() (string, error) {
+			return t.TempDir(), nil
+		})
+
+		if code != 1 {
+			t.Fatalf("RunWithGetwd() code = %d, want 1", code)
+		}
+		if stdout.String() != "" {
+			t.Fatalf("stdout = %q, want empty", stdout.String())
+		}
+		assertCLIErrorContains(t, stderr.String(), "parse OpenAI chat stream", "parse chat completion chunk")
+		assertCLIErrorOmits(t, stderr.String(), "direct-secret-value", "Bearer direct-secret-value")
+		<-requests
+		assertNoAdditionalCLIRunRequest(t, requests)
 	})
 
 	t.Run("unknown model", func(t *testing.T) {

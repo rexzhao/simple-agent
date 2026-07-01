@@ -171,13 +171,13 @@ func TestProviderStreamEmitsCompleteToolCallDoneFromSplitArguments(t *testing.T)
 
 func TestProviderStreamReturnsUsefulHTTPError(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		http.Error(w, "rate limited", http.StatusTooManyRequests)
+		http.Error(w, "rate limited for Authorization: Bearer http-secret-value", http.StatusTooManyRequests)
 	}))
 	defer server.Close()
 
 	provider, err := NewProvider(ProviderConfig{
 		BaseURL:    server.URL,
-		APIKey:     "test-key",
+		APIKey:     "http-secret-value",
 		HTTPClient: server.Client(),
 	})
 	if err != nil {
@@ -195,6 +195,11 @@ func TestProviderStreamReturnsUsefulHTTPError(t *testing.T) {
 	for _, want := range []string{"429 Too Many Requests", "rate limited"} {
 		if !strings.Contains(message, want) {
 			t.Fatalf("error %q missing %q", message, want)
+		}
+	}
+	for _, leaked := range []string{"http-secret-value", "Bearer http-secret-value"} {
+		if strings.Contains(message, leaked) {
+			t.Fatalf("error leaked %q: %s", leaked, message)
 		}
 	}
 }
