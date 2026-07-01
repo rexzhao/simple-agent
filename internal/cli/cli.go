@@ -80,11 +80,49 @@ func execute(args []string, stdout, stderr io.Writer, getwd func() (string, erro
 			fmt.Fprintf(stdout, "%s\t%s\t%s\n", model.Provider, model.Profile, model.ID)
 		}
 		return nil
+	case "mcp":
+		return mcpCommand(remaining[1:], *configDir, stdout, getwd)
 	case "run":
 		return runCommand(remaining[1:], *configDir, stdout, stderr, getwd)
 	default:
 		return fmt.Errorf("unknown command %q", remaining[0])
 	}
+}
+
+func mcpCommand(args []string, configDir string, stdout io.Writer, getwd func() (string, error)) error {
+	if len(args) == 0 || args[0] != "list" {
+		return fmt.Errorf("usage: sai mcp list [--enable-mcp ids]")
+	}
+
+	flags := flag.NewFlagSet("sai mcp list", flag.ContinueOnError)
+	flags.SetOutput(io.Discard)
+	var enabledMCP mcpServerIDsFlag
+	flags.Var(&enabledMCP, "enable-mcp", "comma-separated MCP server ids to enable")
+	if err := flags.Parse(args[1:]); err != nil {
+		return err
+	}
+	if flags.NArg() != 0 {
+		return fmt.Errorf("usage: sai mcp list [--enable-mcp ids]")
+	}
+
+	cfg, err := loadConfig(configDir, getwd)
+	if err != nil {
+		return err
+	}
+	selected, err := cfg.SelectedMCPServers(enabledMCP.ids, enabledMCP.set)
+	if err != nil {
+		return err
+	}
+	enabledIDs := make(map[string]bool, len(selected))
+	for _, server := range selected {
+		enabledIDs[server.ID] = true
+	}
+
+	fmt.Fprintln(stdout, "ID\tENABLED")
+	for _, server := range cfg.MCPServerList() {
+		fmt.Fprintf(stdout, "%s\t%t\n", server.ID, enabledIDs[server.ID])
+	}
+	return nil
 }
 
 func runCommand(args []string, configDir string, stdout, stderr io.Writer, getwd func() (string, error)) error {
@@ -96,13 +134,15 @@ func runCommand(args []string, configDir string, stdout, stderr io.Writer, getwd
 	verbose := flags.Bool("verbose", false, "write non-sensitive diagnostics to stderr")
 	var enabledTools toolNamesFlag
 	flags.Var(&enabledTools, "enable-tools", "comma-separated tool names to expose")
+	var enabledMCP mcpServerIDsFlag
+	flags.Var(&enabledMCP, "enable-mcp", "comma-separated MCP server ids to enable")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
 
 	prompts := flags.Args()
 	if len(prompts) != 1 {
-		return fmt.Errorf(`usage: sai run [--provider name] [--model profile] [--show-reasoning] [--verbose] [--enable-tools names] "prompt"`)
+		return fmt.Errorf(`usage: sai run [--provider name] [--model profile] [--show-reasoning] [--verbose] [--enable-tools names] [--enable-mcp ids] "prompt"`)
 	}
 
 	cwd, err := getwd()
@@ -113,6 +153,9 @@ func runCommand(args []string, configDir string, stdout, stderr io.Writer, getwd
 		return cwd, nil
 	})
 	if err != nil {
+		return err
+	}
+	if _, err := cfg.SelectedMCPServers(enabledMCP.ids, enabledMCP.set); err != nil {
 		return err
 	}
 
@@ -189,7 +232,7 @@ type toolNamesFlag struct {
 }
 
 func (f *toolNamesFlag) Set(value string) error {
-	names, err := parseToolNames(value)
+	names, err := parseCommaSeparatedNames(value, "tool name", "--enable-tools")
 	if err != nil {
 		return err
 	}
@@ -200,6 +243,25 @@ func (f *toolNamesFlag) Set(value string) error {
 
 func (f *toolNamesFlag) String() string {
 	return strings.Join(f.names, ",")
+}
+
+type mcpServerIDsFlag struct {
+	set bool
+	ids []string
+}
+
+func (f *mcpServerIDsFlag) Set(value string) error {
+	ids, err := parseCommaSeparatedNames(value, "MCP server id", "--enable-mcp")
+	if err != nil {
+		return err
+	}
+	f.set = true
+	f.ids = ids
+	return nil
+}
+
+func (f *mcpServerIDsFlag) String() string {
+	return strings.Join(f.ids, ",")
 }
 
 func writeVerboseDiagnostics(stderr io.Writer, cfg *config.Config, resolved config.ResolvedModel, enabledTools []string, showReasoning bool) error {
@@ -237,9 +299,9 @@ func formatVerboseToolNames(names []string) string {
 	return strings.Join(names, ",")
 }
 
-func parseToolNames(value string) ([]string, error) {
+func parseCommaSeparatedNames(value, emptyName, flagName string) ([]string, error) {
 	if strings.TrimSpace(value) == "" {
-		return nil, nil
+		return []string{}, nil
 	}
 
 	parts := strings.Split(value, ",")
@@ -247,7 +309,7 @@ func parseToolNames(value string) ([]string, error) {
 	for _, part := range parts {
 		name := strings.TrimSpace(part)
 		if name == "" {
-			return nil, fmt.Errorf("empty tool name in --enable-tools")
+			return nil, fmt.Errorf("empty %s in %s", emptyName, flagName)
 		}
 		names = append(names, name)
 	}

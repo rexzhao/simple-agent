@@ -99,10 +99,10 @@
 
 ## M4：MCP
 
-- [ ] 添加 `mcp/` 配置目录。
-- [ ] 每个 MCP server 使用一个 YAML 文件。
-- [ ] 读取 MCP 文件中的 `enabled` 字段。
-- [ ] 通过 `--enable-mcp` 覆盖 MCP 文件中的 `enabled` 字段。
+- [x] 添加 `mcp/` 配置目录。
+- [x] 每个 MCP server 使用一个 YAML 文件。
+- [x] 读取 MCP 文件中的 `enabled` 字段。
+- [x] 通过 `--enable-mcp` 覆盖 MCP 文件中的 `enabled` 字段。
 - [ ] 启动 stdio MCP server 进程。
 - [ ] 发送 MCP initialize request。
 - [ ] 列出 MCP tools。

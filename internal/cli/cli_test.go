@@ -54,6 +54,77 @@ func TestModelsListDefaultsConfigDirToAgentsUnderCurrentWorkingDirectory(t *test
 	}
 }
 
+func TestMCPListShowsConfiguredServersAndEnabledState(t *testing.T) {
+	dir := writeCLIFixture(t)
+	writeCLIMCPFixture(t, dir)
+
+	var stdout, stderr bytes.Buffer
+	code := RunWithGetwd([]string{"--config-dir", dir, "mcp", "list"}, &stdout, &stderr, func() (string, error) {
+		return "unused", nil
+	})
+
+	if code != 0 {
+		t.Fatalf("RunWithGetwd() code = %d, stderr = %s", code, stderr.String())
+	}
+	out := stdout.String()
+	for _, want := range []string{
+		"ID\tENABLED",
+		"local\ttrue",
+		"remote\tfalse",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("mcp list output missing %q:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "COMMAND") || strings.Contains(out, "example-mcp-server") || strings.Contains(out, "remote-mcp-server") {
+		t.Fatalf("mcp list output included command details:\n%s", out)
+	}
+}
+
+func TestMCPListEnableMCPOverridesConfiguredEnabledState(t *testing.T) {
+	dir := writeCLIFixture(t)
+	writeCLIMCPFixture(t, dir)
+
+	var stdout, stderr bytes.Buffer
+	code := RunWithGetwd([]string{"--config-dir", dir, "mcp", "list", "--enable-mcp", "remote"}, &stdout, &stderr, func() (string, error) {
+		return "unused", nil
+	})
+
+	if code != 0 {
+		t.Fatalf("RunWithGetwd() code = %d, stderr = %s", code, stderr.String())
+	}
+	out := stdout.String()
+	for _, want := range []string{
+		"local\tfalse",
+		"remote\ttrue",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("mcp list override output missing %q:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "COMMAND") || strings.Contains(out, "example-mcp-server") || strings.Contains(out, "remote-mcp-server") {
+		t.Fatalf("mcp list override output included command details:\n%s", out)
+	}
+}
+
+func TestMCPListRejectsUnknownEnableMCPServer(t *testing.T) {
+	dir := writeCLIFixture(t)
+	writeCLIMCPFixture(t, dir)
+
+	var stdout, stderr bytes.Buffer
+	code := RunWithGetwd([]string{"--config-dir", dir, "mcp", "list", "--enable-mcp", "missing"}, &stdout, &stderr, func() (string, error) {
+		return "unused", nil
+	})
+
+	if code != 1 {
+		t.Fatalf("RunWithGetwd() code = %d, want 1", code)
+	}
+	if stdout.String() != "" {
+		t.Fatalf("stdout = %q, want empty", stdout.String())
+	}
+	assertCLIErrorContains(t, stderr.String(), `unknown MCP server "missing"`, "available MCP servers: local, remote")
+}
+
 func TestConfigShowDoesNotPrintAPIKeyValue(t *testing.T) {
 	dir := writeCLIFixture(t)
 	t.Setenv("PAPERHUB_API_KEY", "env-secret-value")
@@ -424,6 +495,31 @@ func TestRunEnableToolsRejectsUnknownTool(t *testing.T) {
 	assertNoAdditionalCLIRunRequest(t, requests)
 }
 
+func TestRunEnableMCPRejectsUnknownServer(t *testing.T) {
+	server, requests := newCLIRunServer(t,
+		`{"choices":[{"delta":{"content":"unexpected"}}]}`,
+		`[DONE]`,
+	)
+	defer server.Close()
+
+	configDir := t.TempDir()
+	writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
+
+	var stdout, stderr bytes.Buffer
+	code := RunWithGetwd([]string{"--config-dir", configDir, "run", "--enable-mcp", "missing", "Use MCP"}, &stdout, &stderr, func() (string, error) {
+		return t.TempDir(), nil
+	})
+
+	if code != 1 {
+		t.Fatalf("RunWithGetwd() code = %d, want 1", code)
+	}
+	if stdout.String() != "" {
+		t.Fatalf("stdout = %q, want empty", stdout.String())
+	}
+	assertCLIErrorContains(t, stderr.String(), `unknown MCP server "missing"`, "available MCP servers: (none)")
+	assertNoAdditionalCLIRunRequest(t, requests)
+}
+
 func TestRunRejectsPostPromptModelFlagInsteadOfSwitching(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	code := RunWithGetwd([]string{"run", "--model", "fast", "Use fast", "--model", "default"}, &stdout, &stderr, func() (string, error) {
@@ -751,6 +847,29 @@ api_key: direct-secret-value
 models:
   small:
     id: local-small
+`)
+}
+
+func writeCLIMCPFixture(t *testing.T, dir string) {
+	t.Helper()
+
+	mcpDir := filepath.Join(dir, "mcp")
+	if err := os.MkdirAll(mcpDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll() error = %v", err)
+	}
+
+	writeCLIFile(t, filepath.Join(mcpDir, "local.yaml"), `id: local
+enabled: true
+command: example-mcp-server
+args: []
+env: {}
+`)
+
+	writeCLIFile(t, filepath.Join(mcpDir, "remote.yaml"), `id: remote
+enabled: false
+command: remote-mcp-server
+args: []
+env: {}
 `)
 }
 

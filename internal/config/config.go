@@ -13,15 +13,16 @@ import (
 )
 
 type Config struct {
-	ConfigDir       string                    `json:"config_dir" yaml:"config_dir"`
-	DefaultProvider string                    `json:"default_provider" yaml:"default_provider"`
-	DefaultModel    string                    `json:"default_model" yaml:"default_model"`
-	ProviderDir     string                    `json:"provider_dir" yaml:"provider_dir"`
-	Agent           AgentConfig               `json:"agent" yaml:"agent"`
-	Tools           ToolsConfig               `json:"tools" yaml:"tools"`
-	Logging         LoggingConfig             `json:"logging" yaml:"logging"`
-	MCPDir          string                    `json:"mcp_dir,omitempty" yaml:"mcp_dir,omitempty"`
-	Providers       map[string]ProviderConfig `json:"providers" yaml:"providers"`
+	ConfigDir       string                     `json:"config_dir" yaml:"config_dir"`
+	DefaultProvider string                     `json:"default_provider" yaml:"default_provider"`
+	DefaultModel    string                     `json:"default_model" yaml:"default_model"`
+	ProviderDir     string                     `json:"provider_dir" yaml:"provider_dir"`
+	Agent           AgentConfig                `json:"agent" yaml:"agent"`
+	Tools           ToolsConfig                `json:"tools" yaml:"tools"`
+	Logging         LoggingConfig              `json:"logging" yaml:"logging"`
+	MCPDir          string                     `json:"mcp_dir,omitempty" yaml:"mcp_dir,omitempty"`
+	MCPServers      map[string]MCPServerConfig `json:"mcp_servers,omitempty" yaml:"-"`
+	Providers       map[string]ProviderConfig  `json:"providers" yaml:"providers"`
 }
 
 type AgentConfig struct {
@@ -126,6 +127,12 @@ func Load(configDir string) (*Config, error) {
 		return nil, err
 	}
 	cfg.Providers = providers
+
+	mcpServers, err := loadMCPServers(cfg.MCPDir)
+	if err != nil {
+		return nil, err
+	}
+	cfg.MCPServers = mcpServers
 	return &cfg, nil
 }
 
@@ -307,7 +314,9 @@ func defaultConfig() Config {
 		Logging: LoggingConfig{
 			Path: "logs/sai.jsonl",
 		},
-		Providers: map[string]ProviderConfig{},
+		MCPDir:     "mcp",
+		Providers:  map[string]ProviderConfig{},
+		MCPServers: map[string]MCPServerConfig{},
 	}
 }
 
