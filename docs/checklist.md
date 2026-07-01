@@ -75,12 +75,12 @@
 - [x] 通过 `--enable-tools` 覆盖配置中的 enabled tools。
 - [x] `shell` 默认在启动目录执行命令。
 - [x] 累积 streamed tool call arguments。
-- [ ] 执行完整 tool call。
-- [ ] 追加 tool result messages。
-- [ ] tool result 后继续 model loop。
-- [ ] 添加 `max_turns`。
+- [x] 执行完整 tool call。
+- [x] 追加 tool result messages。
+- [x] tool result 后继续 model loop。
+- [x] 添加 `max_turns`。
 - [x] 添加 partial JSON argument chunks 测试。
-- [ ] 添加 malformed tool arguments 测试。
+- [x] 添加 malformed tool arguments 测试。
 - [ ] 执行 PaperHub tool call smoke test，或记录不兼容限制。
 
 ## M3：打包

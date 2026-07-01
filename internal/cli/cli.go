@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/rexzhao/simple-agent/internal/agent"
 	"github.com/rexzhao/simple-agent/internal/config"
 	projectcontext "github.com/rexzhao/simple-agent/internal/context"
 	"github.com/rexzhao/simple-agent/internal/model"
@@ -130,7 +131,7 @@ func runCommand(args []string, configDir string, stdout io.Writer, getwd func() 
 	if enabledTools.set {
 		enabledToolNames = enabledTools.names
 	}
-	toolSchemas, err := enabledToolSchemas(cwd, enabledToolNames)
+	toolRegistry, toolSchemas, err := enabledToolsForRun(cwd, enabledToolNames)
 	if err != nil {
 		return err
 	}
@@ -146,7 +147,11 @@ func runCommand(args []string, configDir string, stdout io.Writer, getwd func() 
 		Parameters: resolved.Parameters,
 	}
 
-	events, err := provider.Stream(context.Background(), request)
+	events, err := agent.Stream(context.Background(), request, agent.Options{
+		Provider:     provider,
+		ToolExecutor: toolRegistry,
+		MaxTurns:     cfg.Agent.MaxTurns,
+	})
 	if err != nil {
 		return err
 	}
@@ -189,16 +194,20 @@ func parseToolNames(value string) ([]string, error) {
 	return names, nil
 }
 
-func enabledToolSchemas(rootDir string, enabled []string) ([]model.Tool, error) {
+func enabledToolsForRun(rootDir string, enabled []string) (*tools.Registry, []model.Tool, error) {
 	if len(enabled) == 0 {
-		return nil, nil
+		return nil, nil, nil
 	}
 
 	registry := tools.NewRegistry()
 	if err := tools.RegisterBuiltins(registry, rootDir); err != nil {
-		return nil, fmt.Errorf("register built-in tools: %w", err)
+		return nil, nil, fmt.Errorf("register built-in tools: %w", err)
 	}
-	return registry.EnabledSchemas(enabled)
+	schemas, err := registry.EnabledSchemas(enabled)
+	if err != nil {
+		return nil, nil, err
+	}
+	return registry, schemas, nil
 }
 
 func loadConfig(configDir string, getwd func() (string, error)) (*config.Config, error) {

@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -209,6 +210,58 @@ func TestRunEnableToolsOverridesConfiguredTools(t *testing.T) {
 		t.Fatalf("RunWithGetwd() code = %d, stderr = %s", code, stderr.String())
 	}
 	assertCLIToolNames(t, (<-requests).Body, []string{"list_files", "read_file"})
+}
+
+func TestRunExecutesToolCallAndContinuesToFinalText(t *testing.T) {
+	server, requests := newSequentialCLIRunServer(t,
+		[]string{
+			`{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"read_file","arguments":"{\"path\":\"note.txt\"}"}}]}}]}`,
+			`{"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`,
+			`[DONE]`,
+		},
+		[]string{
+			`{"choices":[{"delta":{"content":"done"}}]}`,
+			`[DONE]`,
+		},
+	)
+	defer server.Close()
+
+	projectDir := t.TempDir()
+	writeCLIFile(t, filepath.Join(projectDir, "note.txt"), "tool output")
+	configDir := t.TempDir()
+	writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
+
+	var stdout, stderr bytes.Buffer
+	code := RunWithGetwd([]string{"--config-dir", configDir, "run", "--enable-tools", "read_file", "Read note"}, &stdout, &stderr, func() (string, error) {
+		return projectDir, nil
+	})
+
+	if code != 0 {
+		t.Fatalf("RunWithGetwd() code = %d, stderr = %s", code, stderr.String())
+	}
+	if got, want := stdout.String(), "done"; got != want {
+		t.Fatalf("stdout = %q, want %q", got, want)
+	}
+
+	firstRequest := <-requests
+	if got := firstRequest.Body["model"]; got != "model-default" {
+		t.Fatalf("first request model = %#v, want model-default", got)
+	}
+	assertCLIToolNames(t, firstRequest.Body, []string{"read_file"})
+
+	secondRequest := <-requests
+	if got := secondRequest.Body["model"]; got != "model-default" {
+		t.Fatalf("second request model = %#v, want model-default", got)
+	}
+	messages := requestMessages(t, secondRequest.Body)
+	if len(messages) != 4 {
+		t.Fatalf("len(second request messages) = %d, want 4: %#v", len(messages), messages)
+	}
+	assertMessage(t, messages, 0, "system", builtInBaseInstructions)
+	assertMessage(t, messages, 1, "user", "Read note")
+	assertAssistantToolCallMessage(t, messages, 2, "call_1", "read_file", `{"path":"note.txt"}`)
+	assertToolMessage(t, messages, 3, "call_1", "tool output")
+	assertNoAdditionalCLIRunRequest(t, requests)
 }
 
 func TestRunEnableToolsRejectsUnknownTool(t *testing.T) {
@@ -534,6 +587,41 @@ func newCLIRunServer(t *testing.T, chunks ...string) (*httptest.Server, <-chan c
 	return server, requests
 }
 
+func newSequentialCLIRunServer(t *testing.T, responses ...[]string) (*httptest.Server, <-chan capturedCLIRunRequest) {
+	t.Helper()
+
+	requests := make(chan capturedCLIRunRequest, len(responses))
+	var mu sync.Mutex
+	requestCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("ReadAll() error = %v", err)
+		}
+		requests <- capturedCLIRunRequest{
+			Path:          r.URL.Path,
+			Authorization: r.Header.Get("Authorization"),
+			RawBody:       body,
+			Body:          decodeCLIJSON(t, body),
+		}
+
+		mu.Lock()
+		index := requestCount
+		requestCount++
+		mu.Unlock()
+		if index >= len(responses) {
+			http.Error(w, "unexpected request", http.StatusInternalServerError)
+			return
+		}
+
+		w.Header().Set("Content-Type", "text/event-stream")
+		for _, chunk := range responses[index] {
+			_, _ = fmt.Fprintf(w, "data: %s\n\n", chunk)
+		}
+	}))
+	return server, requests
+}
+
 func writeCLIRunFixtureInDir(t *testing.T, dir, baseURL, apiKey, providerType string) {
 	t.Helper()
 	writeCLIRunFixtureInDirWithTools(t, dir, baseURL, apiKey, providerType, nil)
@@ -628,6 +716,72 @@ func assertMessage(t *testing.T, messages []any, index int, role, content string
 	}
 	if got := message["role"]; got != role {
 		t.Fatalf("message[%d].role = %#v, want %q", index, got, role)
+	}
+	if got := message["content"]; got != content {
+		t.Fatalf("message[%d].content = %#v, want %q", index, got, content)
+	}
+}
+
+func assertAssistantToolCallMessage(t *testing.T, messages []any, index int, id, name, arguments string) {
+	t.Helper()
+
+	if index >= len(messages) {
+		t.Fatalf("missing message %d in %#v", index, messages)
+	}
+	message, ok := messages[index].(map[string]any)
+	if !ok {
+		t.Fatalf("message[%d] = %T, want object", index, messages[index])
+	}
+	if got := message["role"]; got != "assistant" {
+		t.Fatalf("message[%d].role = %#v, want assistant", index, got)
+	}
+	if got := message["content"]; got != "" {
+		t.Fatalf("message[%d].content = %#v, want empty string", index, got)
+	}
+	toolCalls, ok := message["tool_calls"].([]any)
+	if !ok {
+		t.Fatalf("message[%d].tool_calls = %T, want []any", index, message["tool_calls"])
+	}
+	if len(toolCalls) != 1 {
+		t.Fatalf("len(message[%d].tool_calls) = %d, want 1", index, len(toolCalls))
+	}
+	toolCall, ok := toolCalls[0].(map[string]any)
+	if !ok {
+		t.Fatalf("tool_calls[0] = %T, want object", toolCalls[0])
+	}
+	if got := toolCall["id"]; got != id {
+		t.Fatalf("tool_calls[0].id = %#v, want %q", got, id)
+	}
+	if got := toolCall["type"]; got != "function" {
+		t.Fatalf("tool_calls[0].type = %#v, want function", got)
+	}
+	function, ok := toolCall["function"].(map[string]any)
+	if !ok {
+		t.Fatalf("tool_calls[0].function = %T, want object", toolCall["function"])
+	}
+	if got := function["name"]; got != name {
+		t.Fatalf("tool_calls[0].function.name = %#v, want %q", got, name)
+	}
+	if got := function["arguments"]; got != arguments {
+		t.Fatalf("tool_calls[0].function.arguments = %#v, want %q", got, arguments)
+	}
+}
+
+func assertToolMessage(t *testing.T, messages []any, index int, toolCallID, content string) {
+	t.Helper()
+
+	if index >= len(messages) {
+		t.Fatalf("missing message %d in %#v", index, messages)
+	}
+	message, ok := messages[index].(map[string]any)
+	if !ok {
+		t.Fatalf("message[%d] = %T, want object", index, messages[index])
+	}
+	if got := message["role"]; got != "tool" {
+		t.Fatalf("message[%d].role = %#v, want tool", index, got)
+	}
+	if got := message["tool_call_id"]; got != toolCallID {
+		t.Fatalf("message[%d].tool_call_id = %#v, want %q", index, got, toolCallID)
 	}
 	if got := message["content"]; got != content {
 		t.Fatalf("message[%d].content = %#v, want %q", index, got, content)

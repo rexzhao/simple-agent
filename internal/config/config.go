@@ -298,7 +298,8 @@ func defaultConfig() Config {
 	return Config{
 		ProviderDir: "providers",
 		Agent: AgentConfig{
-			Stream: true,
+			MaxTurns: defaultAgentMaxTurns,
+			Stream:   true,
 		},
 		Tools: ToolsConfig{
 			Enabled: []string{},
@@ -309,6 +310,8 @@ func defaultConfig() Config {
 		Providers: map[string]ProviderConfig{},
 	}
 }
+
+const defaultAgentMaxTurns = 8
 
 func loadProviders(providerDir string) (map[string]ProviderConfig, error) {
 	entries, err := os.ReadDir(providerDir)

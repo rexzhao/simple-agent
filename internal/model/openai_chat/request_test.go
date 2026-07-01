@@ -146,6 +146,49 @@ func TestBuildRequestBodyMapsNilToolSchemaAndPreservesToolOrder(t *testing.T) {
 	}`)
 }
 
+func TestBuildRequestBodyMapsAssistantToolCallsAndToolMessages(t *testing.T) {
+	body, err := BuildRequestBody(model.Request{
+		Model: "glm-5.2",
+		Messages: []model.Message{
+			{Role: model.MessageRoleUser, Content: "Read a file"},
+			{
+				Role:    model.MessageRoleAssistant,
+				Content: "",
+				ToolCalls: []model.ToolCall{
+					{ID: "call_1", Name: "read_file", Arguments: `{"path":"README.md"}`},
+				},
+			},
+			{Role: model.MessageRoleTool, Content: "file body", ToolCallID: "call_1"},
+		},
+	}, true)
+	if err != nil {
+		t.Fatalf("BuildRequestBody() error = %v", err)
+	}
+
+	assertJSONEqual(t, body, `{
+		"model": "glm-5.2",
+		"messages": [
+			{"role": "user", "content": "Read a file"},
+			{
+				"role": "assistant",
+				"content": "",
+				"tool_calls": [
+					{
+						"id": "call_1",
+						"type": "function",
+						"function": {
+							"name": "read_file",
+							"arguments": "{\"path\":\"README.md\"}"
+						}
+					}
+				]
+			},
+			{"role": "tool", "content": "file body", "tool_call_id": "call_1"}
+		],
+		"stream": true
+	}`)
+}
+
 func assertJSONEqual(t *testing.T, got []byte, want string) {
 	t.Helper()
 

@@ -29,7 +29,28 @@ func buildMessages(messages []model.Message) []map[string]any {
 			"role":    string(message.Role),
 			"content": message.Content,
 		}
+		if len(message.ToolCalls) > 0 {
+			item["tool_calls"] = buildMessageToolCalls(message.ToolCalls)
+		}
+		if message.Role == model.MessageRoleTool {
+			item["tool_call_id"] = message.ToolCallID
+		}
 		out = append(out, item)
+	}
+	return out
+}
+
+func buildMessageToolCalls(toolCalls []model.ToolCall) []map[string]any {
+	out := make([]map[string]any, 0, len(toolCalls))
+	for _, toolCall := range toolCalls {
+		out = append(out, map[string]any{
+			"id":   toolCall.ID,
+			"type": "function",
+			"function": map[string]any{
+				"name":      toolCall.Name,
+				"arguments": toolCall.Arguments,
+			},
+		})
 	}
 	return out
 }
