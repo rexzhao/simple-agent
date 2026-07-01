@@ -128,8 +128,8 @@
 
 ## 后续 Skills
 
-- [ ] 定义 skill 目录结构。
-- [ ] 读取 `SKILL.md`。
+- [x] 定义 skill 目录结构。
+- [x] 读取 `SKILL.md`。
 - [ ] 添加显式 skill activation。
 - [ ] 将 skill instructions 组合进 system/developer messages。
 - [ ] 添加 malformed skill 错误处理。

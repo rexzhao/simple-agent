@@ -30,6 +30,11 @@ func TestLoadResolvesConfigAndProviderModels(t *testing.T) {
 		t.Fatalf("ProviderDir = %q, want %q", cfg.ProviderDir, wantProviderDir)
 	}
 
+	wantSkillDir := filepath.Join(wantConfigDir, "skills")
+	if cfg.SkillDir != wantSkillDir {
+		t.Fatalf("SkillDir = %q, want %q", cfg.SkillDir, wantSkillDir)
+	}
+
 	wantLogPath := filepath.Join(wantConfigDir, "logs", "sai.jsonl")
 	if cfg.Logging.Path != wantLogPath {
 		t.Fatalf("Logging.Path = %q, want %q", cfg.Logging.Path, wantLogPath)
@@ -52,6 +57,29 @@ func TestLoadResolvesConfigAndProviderModels(t *testing.T) {
 	}
 	if got := provider.Models["glm-5.2-fast"].Parameters["max_tokens"]; got != 2048 {
 		t.Fatalf("fast profile max_tokens = %#v, want 2048", got)
+	}
+}
+
+func TestLoadResolvesCustomSkillDir(t *testing.T) {
+	dir := writeConfigFixture(t)
+	writeFile(t, filepath.Join(dir, "sai.yaml"), `default_provider: paperhub
+default_model: glm-5.2
+provider_dir: providers
+skill_dir: local-skills
+`)
+
+	cfg, err := Load(dir)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+
+	wantConfigDir, err := filepath.Abs(dir)
+	if err != nil {
+		t.Fatalf("filepath.Abs() error = %v", err)
+	}
+	wantSkillDir := filepath.Join(filepath.Clean(wantConfigDir), "local-skills")
+	if cfg.SkillDir != wantSkillDir {
+		t.Fatalf("SkillDir = %q, want %q", cfg.SkillDir, wantSkillDir)
 	}
 }
 

@@ -22,7 +22,8 @@
   - Base URL: `https://tc-paperhub.diezhi.net/v1`
   - Model: `glm-5.2`
   - API key 配置: `api_key: $PAPERHUB_API_KEY`
-- skills 是后续开发项，v0.1 不实现。
+- skills 是后续开发项，v0.1 不接入运行时。M7 先实现本地 `SKILL.md` 发现/读取，
+  不启用 skill activation 或 instruction composition。
 - M5 已为 Anthropic Messages 添加 provider type 配置识别、示例、文本 streaming
   和 tool use runtime adapter。
 - M6 已为 OpenAI Responses 添加 provider type 配置识别、文本 input mapping、
@@ -79,6 +80,9 @@ internal/tools
 
 internal/mcp
   MCP stdio client 和 MCP tool adapter，MVP 后实现
+
+internal/skills
+  本地 skill 目录发现和 SKILL.md 读取，M7 后实现，暂不接入 CLI runtime
 
 internal/logging
   JSONL event log
@@ -157,6 +161,7 @@ v0.1 暂不支持 non-streaming fallback，`sai run` 当前强制使用 streamin
 default_provider: paperhub
 default_model: glm-5.2
 provider_dir: providers
+skill_dir: skills
 
 agent:
   max_turns: 8
@@ -241,6 +246,10 @@ stateful `previous_response_id` 对话续写、reasoning output item passthrough
 不承担通用环境变量解析职责。无论实际值来自环境变量还是直接配置，日志、verbose 输出
 和 resolved config 都不能打印实际值。
 `provider_dir` 相对配置根目录解析，除非显式写成绝对路径。
+`skill_dir` 是 M7 后的本地 skill 目录，默认是配置根目录下的 `skills`，同样相对配置
+根目录解析；推荐布局是 `.agents/skills/<skill_id>/SKILL.md`。当前只做发现和读取，
+暂不读取用户目录，也不支持 `skills.enabled`、CLI activation 或将 skill instructions
+组合进 `sai run` 消息。
 `logging.path` 相对配置根目录解析，除非显式写成绝对路径。`mcp_dir` 是 M4 后启用的
 MCP 配置目录，同样相对配置根目录解析。
 

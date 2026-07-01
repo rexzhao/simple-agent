@@ -183,12 +183,26 @@ function tools / function_call_output，使现有 agent tool loop 能通过 `ope
 
 交付物：
 
-- skill discovery。
-- `SKILL.md` 读取。
+- 配置层定义 `skill_dir`，默认指向配置根目录下的 `skills`。
+- 推荐本地目录布局：`.agents/skills/<skill_id>/SKILL.md`。
+- skill discovery，只发现 `skill_dir` 下包含 `SKILL.md` 的直接子目录。
+- `SKILL.md` 读取，支持可选 YAML frontmatter 中的 `name` 和 `description`。
 - skill 显式启用或选择。
 - instruction composition。
 
+M7 第一小步只实现本地发现/读取，不接入 CLI runtime，不配置 `skills.enabled`，也不把
+skill instructions 注入 `sai run` 消息。
+
 验证：
+
+第一小步验证：
+
+- discovery 单元测试能稳定列出 `skill_dir` 下含 `SKILL.md` 的直接子目录。
+- `SKILL.md` loader 能读取 frontmatter 中的 `name` / `description` 和正文。
+- 无 frontmatter 时，loader 使用 skill id 作为名称、description 为空、全文作为 instructions。
+- config test 能证明 `skill_dir` 默认路径和自定义路径都相对配置根目录解析。
+
+最终态验证：
 
 - 本地测试 skill 能改变模型 instructions。
 - skill 可以关闭。

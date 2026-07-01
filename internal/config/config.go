@@ -17,6 +17,7 @@ type Config struct {
 	DefaultProvider string                     `json:"default_provider" yaml:"default_provider"`
 	DefaultModel    string                     `json:"default_model" yaml:"default_model"`
 	ProviderDir     string                     `json:"provider_dir" yaml:"provider_dir"`
+	SkillDir        string                     `json:"skill_dir" yaml:"skill_dir"`
 	Agent           AgentConfig                `json:"agent" yaml:"agent"`
 	Tools           ToolsConfig                `json:"tools" yaml:"tools"`
 	Logging         LoggingConfig              `json:"logging" yaml:"logging"`
@@ -121,6 +122,7 @@ func Load(configDir string) (*Config, error) {
 
 	cfg.ConfigDir = absConfigDir
 	cfg.ProviderDir = resolvePath(absConfigDir, cfg.ProviderDir)
+	cfg.SkillDir = resolvePath(absConfigDir, cfg.SkillDir)
 	if cfg.Logging.Path != "" {
 		cfg.Logging.Path = resolvePath(absConfigDir, cfg.Logging.Path)
 	}
@@ -310,6 +312,7 @@ func (m *ModelProfile) UnmarshalYAML(value *yaml.Node) error {
 func defaultConfig() Config {
 	return Config{
 		ProviderDir: "providers",
+		SkillDir:    "skills",
 		Agent: AgentConfig{
 			MaxTurns: defaultAgentMaxTurns,
 			Stream:   true,

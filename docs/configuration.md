@@ -32,6 +32,9 @@ AGENTS.md
   providers/
     paperhub.yaml
     local.yaml
+  skills/
+    my-skill/
+      SKILL.md
   mcp/
     local.yaml
   logs/
@@ -41,8 +44,9 @@ AGENTS.md
 `.agents/` 是默认配置根目录；通过 `--config-dir` 指定时，配置根目录改为指定目录。
 `sai.yaml` 是全局配置入口，负责默认 provider、默认 model、provider 目录、工具启用和
 agent 通用参数。`providers/*.yaml`
-每个文件描述一个 provider。`mcp/*.yaml` 每个文件描述一个 MCP server；MCP 是 M4 后
-能力，不属于 MVP 必需配置。
+每个文件描述一个 provider。`skills/<skill_id>/SKILL.md` 是 M7 后的本地 skill 推荐布局；
+当前只支持发现和读取，不启用或注入到运行时。`mcp/*.yaml` 每个文件描述一个 MCP server；
+MCP 是 M4 后能力，不属于 MVP 必需配置。
 
 当配置根目录由 `--config-dir` 指定时，`sai.yaml` 和上述配置子目录从该目录读取；
 `AGENTS.md` 仍从启动时当前工作目录读取。
@@ -54,6 +58,7 @@ agent 通用参数。`providers/*.yaml`
 default_provider: paperhub
 default_model: glm-5.2
 provider_dir: providers
+skill_dir: skills
 
 agent:
   max_turns: 8
@@ -76,6 +81,7 @@ mcp_dir: mcp
 - `default_provider`：未通过命令行指定 provider 时使用。
 - `default_model`：未通过命令行指定 model 时使用。
 - `provider_dir`：provider 配置文件目录。相对路径基于配置根目录解析。
+- `skill_dir`：本地 skill 目录。默认是配置根目录下的 `skills`；相对路径基于配置根目录解析。
 - `mcp_dir`：MCP 配置文件目录。M4 后启用；相对路径基于配置根目录解析。
 - `agent.max_turns`：一次 agent loop 最多请求模型的轮数。
 - `agent.stream`：默认是否启用 streaming。
@@ -175,6 +181,32 @@ passthrough 仍是后续项。
 除非某个 adapter 明确声明协议特定的默认环境变量，否则 adapter 不承担通用环境变量解析
 职责。无论实际值来自环境变量还是直接配置，logs、verbose、resolved config 等输出都
 不能泄露实际值。
+
+## Skills 配置（M7 后）
+
+本地 skill 目录由 `skill_dir` 指定，默认是配置根目录下的 `skills`。本项目推荐每个
+skill 使用一个直接子目录，并在子目录下放置 `SKILL.md`：
+
+```text
+.agents/
+  skills/
+    my-skill/
+      SKILL.md
+```
+
+`SKILL.md` 可以使用可选 YAML frontmatter：
+
+```markdown
+---
+name: my-skill
+description: short text
+---
+body...
+```
+
+如果没有 frontmatter，skill 名称默认使用目录名，description 为空，正文全文作为
+instructions。当前 M7 第一小步只实现本地发现和读取：不读取用户目录，不配置
+`skills.enabled`，也不提供 CLI activation 或 instruction composition。
 
 ## MCP 配置（M4 后）
 
