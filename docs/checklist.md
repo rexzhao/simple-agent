@@ -106,8 +106,8 @@
 - [x] 启动 stdio MCP server 进程。
 - [x] 发送 MCP initialize request。
 - [x] 列出 MCP tools。
-- [ ] 将 MCP tools 转换为内部 tool schema。
-- [ ] MCP tool 名称固定为 `mcp.<server>.<tool>`。
+- [x] 将 MCP tools 转换为内部 tool schema。
+- [x] MCP tool 名称固定为 `mcp.<server>.<tool>`。
 - [ ] MCP tools 仍受 enabled tools 列表控制。
 - [ ] 将 tool call route 到 MCP。
 - [ ] 将 MCP tool result 回传给模型。
