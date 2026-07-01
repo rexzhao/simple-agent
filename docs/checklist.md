@@ -4,12 +4,12 @@
 
 ## 范围约束
 
-- [ ] v0.1 保持纯 CLI，不引入 TUI。
-- [ ] v0.1 聚焦 OpenAI-compatible Chat Completions。
-- [ ] v0.1 不实现 skills。
-- [ ] MVP 不实现 MCP；MCP 从 M4 开始。
-- [ ] 核心 OpenAI-compatible 路径稳定前，不实现 Anthropic Messages。
-- [ ] 核心 OpenAI-compatible 路径稳定前，不实现 OpenAI Responses。
+- [x] v0.1 保持纯 CLI，不引入 TUI。
+- [x] MVP 先完成 OpenAI-compatible Chat Completions 核心路径（M0-M3）。
+- [x] MCP 是 MVP 后的 M4 能力。
+- [x] Anthropic Messages 是 M5 能力，在核心 OpenAI-compatible 路径稳定后接入。
+- [x] OpenAI Responses 是 M6 能力，在核心 OpenAI-compatible 路径稳定后接入。
+- [x] Skills 是 M7 能力，当前仅覆盖配置目录下的本地 skills。
 - [x] 日志、verbose、resolved config 中不打印 API key、Authorization header 或其他敏感配置值的实际值。
 
 ## M0：项目骨架
