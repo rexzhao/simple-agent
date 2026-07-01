@@ -47,6 +47,11 @@ type ToolDefinition struct {
 	InputSchema map[string]any `json:"inputSchema,omitempty"`
 }
 
+type ToolCallResult struct {
+	Content []json.RawMessage `json:"content"`
+	IsError bool              `json:"isError,omitempty"`
+}
+
 func StartStdioSession(ctx context.Context, server config.MCPServerConfig) (*Session, InitializeResult, error) {
 	if strings.TrimSpace(server.Command) == "" {
 		return nil, InitializeResult{}, fmt.Errorf("MCP server %q command must not be blank", server.ID)
@@ -146,6 +151,17 @@ func (s *Session) ListTools(ctx context.Context) ([]ToolDefinition, error) {
 		}
 		cursor = nextCursor
 	}
+}
+
+func (s *Session) CallTool(ctx context.Context, name string, arguments map[string]any) (ToolCallResult, error) {
+	var result ToolCallResult
+	if err := s.call(ctx, "tools/call", callToolParams{
+		Name:      name,
+		Arguments: arguments,
+	}, &result); err != nil {
+		return ToolCallResult{}, err
+	}
+	return result, nil
 }
 
 func (s *Session) listToolsPage(ctx context.Context, cursor string) ([]ToolDefinition, string, error) {
@@ -289,6 +305,11 @@ type listToolsParams struct {
 type listToolsResult struct {
 	Tools      []ToolDefinition `json:"tools"`
 	NextCursor string           `json:"nextCursor,omitempty"`
+}
+
+type callToolParams struct {
+	Name      string         `json:"name"`
+	Arguments map[string]any `json:"arguments,omitempty"`
 }
 
 type rpcResponse struct {

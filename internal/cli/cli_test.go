@@ -316,6 +316,53 @@ func TestRunEnableMCPExposesOnlyEnabledMCPSchemas(t *testing.T) {
 	assertCLIFileEventuallyContains(t, exitFile, "closed")
 }
 
+func TestRunRoutesMCPToolCallAndReturnsResultToModel(t *testing.T) {
+	server, requests := newSequentialCLIRunServer(t,
+		[]string{
+			`{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_mcp","function":{"name":"mcp.local.search","arguments":"{\"query\":\"needle\"}"}}]}}]}`,
+			`{"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`,
+			`[DONE]`,
+		},
+		[]string{
+			`{"choices":[{"delta":{"content":"final answer"}}]}`,
+			`[DONE]`,
+		},
+	)
+	defer server.Close()
+
+	configDir := t.TempDir()
+	exitFile := filepath.Join(t.TempDir(), "mcp-exited")
+	writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
+	writeCLIRunMCPFixture(t, configDir, exitFile)
+
+	var stdout, stderr bytes.Buffer
+	code := RunWithGetwd([]string{"--config-dir", configDir, "run", "--enable-mcp", "local", "--enable-tools", "mcp.local.search", "Use MCP search"}, &stdout, &stderr, func() (string, error) {
+		return t.TempDir(), nil
+	})
+
+	if code != 0 {
+		t.Fatalf("RunWithGetwd() code = %d, stderr = %s", code, stderr.String())
+	}
+	if got, want := stdout.String(), "final answer"; got != want {
+		t.Fatalf("stdout = %q, want %q", got, want)
+	}
+
+	firstRequest := <-requests
+	assertCLIToolNames(t, firstRequest.Body, []string{"mcp.local.search"})
+
+	secondRequest := <-requests
+	messages := requestMessages(t, secondRequest.Body)
+	if len(messages) != 4 {
+		t.Fatalf("len(second request messages) = %d, want 4: %#v", len(messages), messages)
+	}
+	assertMessage(t, messages, 0, "system", builtInBaseInstructions)
+	assertMessage(t, messages, 1, "user", "Use MCP search")
+	assertAssistantToolCallMessage(t, messages, 2, "call_mcp", "mcp.local.search", `{"query":"needle"}`)
+	assertToolMessage(t, messages, 3, "call_mcp", "mcp result one\nmcp result two")
+	assertNoAdditionalCLIRunRequest(t, requests)
+	assertCLIFileEventuallyContains(t, exitFile, "closed")
+}
+
 func TestRunVerboseWritesDiagnosticsWithoutSensitiveContent(t *testing.T) {
 	t.Run("direct API key", func(t *testing.T) {
 		server, requests := newCLIRunServer(t,
@@ -1397,33 +1444,56 @@ func runCLIFakeMCPServer() int {
 			}
 			return 7
 		}
-		if request.JSONRPC != "2.0" || request.Method != "tools/list" {
+		if request.JSONRPC != "2.0" {
 			return 8
 		}
-		if err := writeCLIMCPMessage(os.Stdout, map[string]any{
-			"jsonrpc": "2.0",
-			"id":      request.ID,
-			"result": map[string]any{
-				"tools": []map[string]any{
-					{
-						"name":        "search",
-						"description": "search local fixture data",
-						"inputSchema": map[string]any{
-							"type": "object",
-							"properties": map[string]any{
-								"query": map[string]any{"type": "string"},
+
+		switch request.Method {
+		case "tools/list":
+			if err := writeCLIMCPMessage(os.Stdout, map[string]any{
+				"jsonrpc": "2.0",
+				"id":      request.ID,
+				"result": map[string]any{
+					"tools": []map[string]any{
+						{
+							"name":        "search",
+							"description": "search local fixture data",
+							"inputSchema": map[string]any{
+								"type": "object",
+								"properties": map[string]any{
+									"query": map[string]any{"type": "string"},
+								},
 							},
 						},
-					},
-					{
-						"name":        "ignored",
-						"description": "disabled fixture tool",
-						"inputSchema": map[string]any{"type": "object"},
+						{
+							"name":        "ignored",
+							"description": "disabled fixture tool",
+							"inputSchema": map[string]any{"type": "object"},
+						},
 					},
 				},
-			},
-		}); err != nil {
-			return 9
+			}); err != nil {
+				return 9
+			}
+		case "tools/call":
+			if request.Params.Name != "search" || request.Params.Arguments["query"] != "needle" {
+				return 10
+			}
+			if err := writeCLIMCPMessage(os.Stdout, map[string]any{
+				"jsonrpc": "2.0",
+				"id":      request.ID,
+				"result": map[string]any{
+					"content": []map[string]any{
+						{"type": "text", "text": "mcp result one"},
+						{"type": "text", "text": "mcp result two"},
+					},
+					"isError": false,
+				},
+			}); err != nil {
+				return 11
+			}
+		default:
+			return 12
 		}
 	}
 }
@@ -1437,6 +1507,8 @@ type cliMCPRequest struct {
 		ClientInfo      struct {
 			Name string `json:"name"`
 		} `json:"clientInfo"`
+		Name      string         `json:"name"`
+		Arguments map[string]any `json:"arguments"`
 	} `json:"params"`
 }
 

@@ -1,6 +1,7 @@
 package mcp
 
 import (
+	"encoding/json"
 	"reflect"
 	"strings"
 	"testing"
@@ -17,6 +18,25 @@ func TestToolNamePrefixesServerAndTool(t *testing.T) {
 	want := "mcp.local.search"
 	if got != want {
 		t.Fatalf("ToolName() = %q, want %q", got, want)
+	}
+}
+
+func TestParseToolNameReturnsServerAndOriginalTool(t *testing.T) {
+	serverID, toolName, err := ParseToolName("mcp.local.search")
+	if err != nil {
+		t.Fatalf("ParseToolName() error = %v", err)
+	}
+	if serverID != "local" || toolName != "search" {
+		t.Fatalf("ParseToolName() = %q, %q; want local, search", serverID, toolName)
+	}
+}
+
+func TestParseToolNameRejectsMalformedNames(t *testing.T) {
+	for _, name := range []string{"search", "mcp.local", "mcp..search", "mcp.local."} {
+		_, _, err := ParseToolName(name)
+		if err == nil {
+			t.Fatalf("ParseToolName(%q) error = nil, want error", name)
+		}
 	}
 }
 
@@ -167,5 +187,36 @@ func TestEnabledSchemasReturnsEmptyWhenEnabledIsEmpty(t *testing.T) {
 	}
 	if len(got) != 0 {
 		t.Fatalf("EnabledSchemas() returned %d tools, want 0", len(got))
+	}
+}
+
+func TestToModelToolResultJoinsTextBlocksAndPreservesIsError(t *testing.T) {
+	result := ToModelToolResult("mcp.local.search", ToolCallResult{
+		Content: []json.RawMessage{
+			json.RawMessage(`{"type":"text","text":"first"}`),
+			json.RawMessage(`{"type":"text","text":"second"}`),
+		},
+		IsError: true,
+	})
+
+	want := model.ToolResult{
+		Name:    "mcp.local.search",
+		Content: "first\nsecond",
+		IsError: true,
+	}
+	if !reflect.DeepEqual(result, want) {
+		t.Fatalf("ToModelToolResult() = %#v, want %#v", result, want)
+	}
+}
+
+func TestToModelToolResultStringifiesNonTextBlocks(t *testing.T) {
+	result := ToModelToolResult("mcp.local.search", ToolCallResult{
+		Content: []json.RawMessage{
+			json.RawMessage(`{"type":"image","data":"abc"}`),
+		},
+	})
+
+	if result.Content != `{"type":"image","data":"abc"}` {
+		t.Fatalf("Content = %q, want JSON block", result.Content)
 	}
 }

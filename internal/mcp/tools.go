@@ -1,6 +1,7 @@
 package mcp
 
 import (
+	"encoding/json"
 	"fmt"
 	"strings"
 
@@ -19,6 +20,20 @@ func ToolName(serverID, toolName string) (string, error) {
 	}
 
 	return "mcp." + serverID + "." + toolName, nil
+}
+
+func ParseToolName(name string) (string, string, error) {
+	name = strings.TrimSpace(name)
+	if !strings.HasPrefix(name, "mcp.") {
+		return "", "", fmt.Errorf("MCP tool name %q must start with mcp.", name)
+	}
+
+	rest := strings.TrimPrefix(name, "mcp.")
+	serverID, toolName, ok := strings.Cut(rest, ".")
+	if !ok || strings.TrimSpace(serverID) == "" || strings.TrimSpace(toolName) == "" {
+		return "", "", fmt.Errorf("MCP tool name %q must have form mcp.<server>.<tool>", name)
+	}
+	return serverID, toolName, nil
 }
 
 func ConvertTools(serverID string, definitions []ToolDefinition) ([]model.Tool, error) {
@@ -74,4 +89,30 @@ func EnabledSchemas(tools []model.Tool, enabled []string) ([]model.Tool, error) 
 		schemas = append(schemas, tool)
 	}
 	return schemas, nil
+}
+
+func ToModelToolResult(name string, result ToolCallResult) model.ToolResult {
+	return model.ToolResult{
+		Name:    name,
+		Content: toolResultContent(result.Content),
+		IsError: result.IsError,
+	}
+}
+
+func toolResultContent(blocks []json.RawMessage) string {
+	parts := make([]string, 0, len(blocks))
+	for _, block := range blocks {
+		var textBlock struct {
+			Type string `json:"type"`
+			Text string `json:"text"`
+		}
+		if err := json.Unmarshal(block, &textBlock); err == nil && textBlock.Type == "text" {
+			parts = append(parts, textBlock.Text)
+			continue
+		}
+		if len(block) > 0 {
+			parts = append(parts, string(block))
+		}
+	}
+	return strings.Join(parts, "\n")
 }

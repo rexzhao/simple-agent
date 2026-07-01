@@ -183,7 +183,7 @@ func runCommand(args []string, configDir string, stdout, stderr io.Writer, getwd
 	if err != nil {
 		return err
 	}
-	mcpSessions, mcpToolSchemas, err := mcpToolsForRun(context.Background(), selectedMCPServers, enabledToolNames)
+	mcpSessions, mcpSessionsByID, mcpToolSchemas, err := mcpToolsForRun(context.Background(), selectedMCPServers, enabledToolNames)
 	if err != nil {
 		return err
 	}
@@ -223,7 +223,7 @@ func runCommand(args []string, configDir string, stdout, stderr io.Writer, getwd
 
 	events, err := agent.Stream(context.Background(), request, agent.Options{
 		Provider:     provider,
-		ToolExecutor: toolRegistry,
+		ToolExecutor: runToolExecutor{builtins: toolRegistry, mcpSessions: mcpSessionsByID},
 		MaxTurns:     cfg.Agent.MaxTurns,
 	})
 	if err != nil {
@@ -351,33 +351,63 @@ func enabledToolsForRun(rootDir string, enabled []string) (*tools.Registry, []mo
 	return registry, schemas, nil
 }
 
-func mcpToolsForRun(ctx context.Context, servers []config.MCPServerConfig, enabled []string) ([]*mcp.Session, []model.Tool, error) {
+type runToolExecutor struct {
+	builtins    *tools.Registry
+	mcpSessions map[string]*mcp.Session
+}
+
+func (e runToolExecutor) Execute(ctx context.Context, name string, arguments map[string]any) (model.ToolResult, error) {
+	if strings.HasPrefix(name, "mcp.") {
+		serverID, toolName, err := mcp.ParseToolName(name)
+		if err != nil {
+			return model.ToolResult{}, err
+		}
+		session, ok := e.mcpSessions[serverID]
+		if !ok {
+			return model.ToolResult{}, fmt.Errorf("MCP server %q is not running for tool %q", serverID, name)
+		}
+		result, err := session.CallTool(ctx, toolName, arguments)
+		if err != nil {
+			return model.ToolResult{}, fmt.Errorf("call MCP tool %q: %w", name, err)
+		}
+		return mcp.ToModelToolResult(name, result), nil
+	}
+
+	if e.builtins == nil {
+		return model.ToolResult{}, fmt.Errorf("tool %q is not registered", name)
+	}
+	return e.builtins.Execute(ctx, name, arguments)
+}
+
+func mcpToolsForRun(ctx context.Context, servers []config.MCPServerConfig, enabled []string) ([]*mcp.Session, map[string]*mcp.Session, []model.Tool, error) {
 	sessions := make([]*mcp.Session, 0, len(servers))
+	sessionsByID := make(map[string]*mcp.Session, len(servers))
 	convertedTools := []model.Tool{}
 
 	for _, server := range servers {
 		session, _, err := mcp.StartStdioSession(ctx, server)
 		if err != nil {
-			return nil, nil, errors.Join(err, closeMCPSessions(sessions))
+			return nil, nil, nil, errors.Join(err, closeMCPSessions(sessions))
 		}
 		sessions = append(sessions, session)
+		sessionsByID[server.ID] = session
 
 		definitions, err := session.ListTools(ctx)
 		if err != nil {
-			return nil, nil, errors.Join(fmt.Errorf("list MCP tools for server %q: %w", server.ID, err), closeMCPSessions(sessions))
+			return nil, nil, nil, errors.Join(fmt.Errorf("list MCP tools for server %q: %w", server.ID, err), closeMCPSessions(sessions))
 		}
 		tools, err := mcp.ConvertTools(server.ID, definitions)
 		if err != nil {
-			return nil, nil, errors.Join(fmt.Errorf("convert MCP tools for server %q: %w", server.ID, err), closeMCPSessions(sessions))
+			return nil, nil, nil, errors.Join(fmt.Errorf("convert MCP tools for server %q: %w", server.ID, err), closeMCPSessions(sessions))
 		}
 		convertedTools = append(convertedTools, tools...)
 	}
 
 	schemas, err := mcp.EnabledSchemas(convertedTools, enabled)
 	if err != nil {
-		return nil, nil, errors.Join(err, closeMCPSessions(sessions))
+		return nil, nil, nil, errors.Join(err, closeMCPSessions(sessions))
 	}
-	return sessions, schemas, nil
+	return sessions, sessionsByID, schemas, nil
 }
 
 func closeMCPSessions(sessions []*mcp.Session) error {
