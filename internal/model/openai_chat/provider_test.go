@@ -131,6 +131,44 @@ func TestProviderStreamEmitsContentReasoningUsageAndStopsAtDone(t *testing.T) {
 	}
 }
 
+func TestProviderStreamEmitsCompleteToolCallDoneFromSplitArguments(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"docs/\"}}]}}]}\n\n")
+		_, _ = io.WriteString(w, "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"checklist.md\\\"}\"}}]}}]}\n\n")
+		_, _ = io.WriteString(w, "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n")
+		_, _ = io.WriteString(w, "data: [DONE]\n\n")
+	}))
+	defer server.Close()
+
+	provider, err := NewProvider(ProviderConfig{
+		BaseURL:    server.URL,
+		APIKey:     "test-key",
+		HTTPClient: server.Client(),
+	})
+	if err != nil {
+		t.Fatalf("NewProvider() error = %v", err)
+	}
+
+	events, err := provider.Stream(context.Background(), model.Request{Model: "glm-5.2"})
+	if err != nil {
+		t.Fatalf("Stream() error = %v", err)
+	}
+
+	got := collectEvents(t, events)
+	if len(got) != 3 {
+		t.Fatalf("len(events) = %d, want 3: %#v", len(got), got)
+	}
+	done, ok := got[2].(model.ToolCallDoneEvent)
+	if !ok {
+		t.Fatalf("event[2] = %T, want model.ToolCallDoneEvent", got[2])
+	}
+	want := model.ToolCall{ID: "call_1", Name: "read_file", Arguments: `{"path":"docs/checklist.md"}`}
+	if done.ToolCall != want {
+		t.Fatalf("ToolCall = %#v, want %#v", done.ToolCall, want)
+	}
+}
+
 func TestProviderStreamReturnsUsefulHTTPError(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "rate limited", http.StatusTooManyRequests)

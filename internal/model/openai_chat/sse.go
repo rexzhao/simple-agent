@@ -3,6 +3,7 @@ package openaichat
 import (
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/rexzhao/simple-agent/internal/model"
@@ -42,6 +43,30 @@ func ParseSSE(data []byte) []SSEMessage {
 }
 
 func EventsFromSSE(data []byte) ([]model.Event, bool, error) {
+	return newStreamEventDecoder().EventsFromSSE(data)
+}
+
+func EventsFromChunk(data []byte) ([]model.Event, error) {
+	return newStreamEventDecoder().eventsFromChunk(data)
+}
+
+type streamEventDecoder struct {
+	choices map[int]map[int]*toolCallAccumulator
+}
+
+type toolCallAccumulator struct {
+	ID        string
+	Name      string
+	Arguments strings.Builder
+}
+
+func newStreamEventDecoder() *streamEventDecoder {
+	return &streamEventDecoder{
+		choices: make(map[int]map[int]*toolCallAccumulator),
+	}
+}
+
+func (d *streamEventDecoder) EventsFromSSE(data []byte) ([]model.Event, bool, error) {
 	var events []model.Event
 	done := false
 	for _, message := range ParseSSE(data) {
@@ -50,7 +75,7 @@ func EventsFromSSE(data []byte) ([]model.Event, bool, error) {
 			continue
 		}
 
-		chunkEvents, err := EventsFromChunk([]byte(message.Data))
+		chunkEvents, err := d.eventsFromChunk([]byte(message.Data))
 		if err != nil {
 			return nil, false, err
 		}
@@ -59,7 +84,7 @@ func EventsFromSSE(data []byte) ([]model.Event, bool, error) {
 	return events, done, nil
 }
 
-func EventsFromChunk(data []byte) ([]model.Event, error) {
+func (d *streamEventDecoder) eventsFromChunk(data []byte) ([]model.Event, error) {
 	var chunk chatCompletionChunk
 	if err := json.Unmarshal(data, &chunk); err != nil {
 		return nil, fmt.Errorf("parse chat completion chunk: %w", err)
@@ -73,6 +98,10 @@ func EventsFromChunk(data []byte) ([]model.Event, error) {
 		if choice.Delta.ReasoningContent != nil && *choice.Delta.ReasoningContent != "" {
 			events = append(events, model.ReasoningDeltaEvent{Text: *choice.Delta.ReasoningContent})
 		}
+		events = d.appendToolCallDeltaEvents(events, choice)
+		if choice.FinishReason != nil && *choice.FinishReason == "tool_calls" {
+			events = d.appendToolCallDoneEvents(events, choice.Index)
+		}
 	}
 	if chunk.Usage != nil {
 		events = append(events, model.UsageEvent{
@@ -84,6 +113,84 @@ func EventsFromChunk(data []byte) ([]model.Event, error) {
 		})
 	}
 	return events, nil
+}
+
+func (d *streamEventDecoder) appendToolCallDeltaEvents(events []model.Event, choice chatCompletionChoice) []model.Event {
+	for _, delta := range choice.Delta.ToolCalls {
+		accumulator := d.toolCallAccumulator(choice.Index, delta.Index)
+		id := ""
+		if delta.ID != nil {
+			id = *delta.ID
+			accumulator.ID = id
+		} else {
+			id = accumulator.ID
+		}
+
+		name := ""
+		argumentsDelta := ""
+		if delta.Function != nil {
+			if delta.Function.Name != nil {
+				name = *delta.Function.Name
+				accumulator.Name = name
+			} else {
+				name = accumulator.Name
+			}
+			if delta.Function.Arguments != nil {
+				argumentsDelta = *delta.Function.Arguments
+				accumulator.Arguments.WriteString(argumentsDelta)
+			}
+		} else {
+			name = accumulator.Name
+		}
+
+		events = append(events, model.ToolCallDeltaEvent{
+			Index:          delta.Index,
+			ID:             id,
+			Name:           name,
+			ArgumentsDelta: argumentsDelta,
+		})
+	}
+	return events
+}
+
+func (d *streamEventDecoder) appendToolCallDoneEvents(events []model.Event, choiceIndex int) []model.Event {
+	toolCalls := d.choices[choiceIndex]
+	if len(toolCalls) == 0 {
+		return events
+	}
+
+	indexes := make([]int, 0, len(toolCalls))
+	for index := range toolCalls {
+		indexes = append(indexes, index)
+	}
+	sort.Ints(indexes)
+
+	for _, index := range indexes {
+		accumulator := toolCalls[index]
+		events = append(events, model.ToolCallDoneEvent{
+			ToolCall: model.ToolCall{
+				ID:        accumulator.ID,
+				Name:      accumulator.Name,
+				Arguments: accumulator.Arguments.String(),
+			},
+		})
+	}
+	delete(d.choices, choiceIndex)
+	return events
+}
+
+func (d *streamEventDecoder) toolCallAccumulator(choiceIndex int, toolCallIndex int) *toolCallAccumulator {
+	toolCalls := d.choices[choiceIndex]
+	if toolCalls == nil {
+		toolCalls = make(map[int]*toolCallAccumulator)
+		d.choices[choiceIndex] = toolCalls
+	}
+	accumulator := toolCalls[toolCallIndex]
+	if accumulator == nil {
+		accumulator = &toolCallAccumulator{}
+		toolCalls[toolCallIndex] = accumulator
+	}
+	return accumulator
 }
 
 func appendSSEMessage(messages []SSEMessage, dataLines []string) []SSEMessage {
@@ -105,12 +212,26 @@ type chatCompletionChunk struct {
 }
 
 type chatCompletionChoice struct {
-	Delta chatCompletionDelta `json:"delta"`
+	Index        int                 `json:"index"`
+	Delta        chatCompletionDelta `json:"delta"`
+	FinishReason *string             `json:"finish_reason"`
 }
 
 type chatCompletionDelta struct {
-	Content          *string `json:"content"`
-	ReasoningContent *string `json:"reasoning_content"`
+	Content          *string                       `json:"content"`
+	ReasoningContent *string                       `json:"reasoning_content"`
+	ToolCalls        []chatCompletionToolCallDelta `json:"tool_calls"`
+}
+
+type chatCompletionToolCallDelta struct {
+	Index    int                              `json:"index"`
+	ID       *string                          `json:"id"`
+	Function *chatCompletionToolFunctionDelta `json:"function"`
+}
+
+type chatCompletionToolFunctionDelta struct {
+	Name      *string `json:"name"`
+	Arguments *string `json:"arguments"`
 }
 
 type chatCompletionUsage struct {

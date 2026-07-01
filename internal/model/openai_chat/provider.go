@@ -91,11 +91,12 @@ func streamResponseEvents(body io.Reader, events chan<- model.Event) {
 	scanner := bufio.NewScanner(body)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 
+	decoder := newStreamEventDecoder()
 	var frame bytes.Buffer
 	for scanner.Scan() {
 		line := scanner.Text()
 		if line == "" || line == "\r" {
-			if emitSSEFrame(frame.Bytes(), events) {
+			if emitSSEFrame(decoder, frame.Bytes(), events) {
 				return
 			}
 			frame.Reset()
@@ -105,19 +106,19 @@ func streamResponseEvents(body io.Reader, events chan<- model.Event) {
 		frame.WriteByte('\n')
 	}
 	if frame.Len() > 0 {
-		emitSSEFrame(frame.Bytes(), events)
+		emitSSEFrame(decoder, frame.Bytes(), events)
 	}
 	if err := scanner.Err(); err != nil {
 		events <- model.ErrorEvent{Err: err, Message: "read OpenAI chat stream"}
 	}
 }
 
-func emitSSEFrame(frame []byte, events chan<- model.Event) bool {
+func emitSSEFrame(decoder *streamEventDecoder, frame []byte, events chan<- model.Event) bool {
 	if len(frame) == 0 {
 		return false
 	}
 
-	chunkEvents, done, err := EventsFromSSE(frame)
+	chunkEvents, done, err := decoder.EventsFromSSE(frame)
 	if err != nil {
 		events <- model.ErrorEvent{Err: err, Message: "parse OpenAI chat stream"}
 		return true
