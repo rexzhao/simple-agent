@@ -7,7 +7,7 @@
 
 配置根目录只有两种来源：
 
-1. 默认使用启动时的当前工作目录。
+1. 默认使用启动时当前工作目录下的 `.agents`。
 2. 通过 `--config-dir` 显式指定目录。
 
 暂时不读取用户目录，也不向用户目录写入默认配置。
@@ -27,27 +27,30 @@ sai --config-dir ./examples/paperhub chat
 
 ```text
 AGENTS.md
-config.yaml
-providers/
-  paperhub.yaml
-  local.yaml
-mcp/
-  local.yaml
-logs/
-  sai.jsonl
+.agents/
+  sai.yaml
+  providers/
+    paperhub.yaml
+    local.yaml
+  mcp/
+    local.yaml
+  logs/
+    sai.jsonl
 ```
 
-这些路径都位于配置根目录下。`config.yaml` 是全局配置，负责默认 provider、默认
-model、provider 目录、工具启用和 agent 通用参数。`providers/*.yaml`
+`.agents/` 是默认配置根目录；通过 `--config-dir` 指定时，配置根目录改为指定目录。
+`sai.yaml` 是全局配置入口，负责默认 provider、默认 model、provider 目录、工具启用和
+agent 通用参数。`providers/*.yaml`
 每个文件描述一个 provider。`mcp/*.yaml` 每个文件描述一个 MCP server；MCP 是 M4 后
 能力，不属于 MVP 必需配置。
 
-当配置根目录由 `--config-dir` 指定时，上面的配置文件从该目录读取；`AGENTS.md` 仍从
-启动时当前工作目录读取。
+当配置根目录由 `--config-dir` 指定时，`sai.yaml` 和上述配置子目录从该目录读取；
+`AGENTS.md` 仍从启动时当前工作目录读取。
 
 ## 全局配置
 
 ```yaml
+# sai.yaml
 default_provider: paperhub
 default_model: glm-5.2
 provider_dir: providers
@@ -203,13 +206,13 @@ sai chat --provider paperhub --model glm-5.2
 选择优先级：
 
 1. 命令行参数。
-2. 全局 `config.yaml` 默认值。
+2. 全局 `sai.yaml` 默认值。
 3. 如果仍无法确定，打印可选 provider/model 并停止。
 
 配置目录选择优先级：
 
 1. `--config-dir`。
-2. 启动时当前工作目录。
+2. 启动时当前工作目录下的 `.agents`。
 
 v0.1 不支持会话进行中切换模型。`sai chat` 进入会话后，provider/model 固定到会话
 结束。

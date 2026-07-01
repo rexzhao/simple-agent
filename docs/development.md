@@ -25,7 +25,7 @@
 - skills 是后续开发项，v0.1 不实现。
 - Anthropic Messages 和 OpenAI Responses 后续作为独立 provider adapter 接入。
 - MCP 不属于 MVP 核心；后续接入时第一种传输只做 stdio。
-- 配置默认从启动目录读取，也可以通过 `--config-dir` 指定。
+- 配置根目录默认是启动时当前工作目录下的 `.agents`，也可以通过 `--config-dir` 指定。
 - 默认读取启动目录下的 `AGENTS.md` 作为项目指令；文件不存在时继续执行。
 - 只落盘 JSONL 日志；会话历史、上下文快照和其他状态暂不落盘。
 
@@ -136,7 +136,7 @@ sai mcp list  # M4
 
 ## 配置形态
 
-配置优先使用 YAML。配置根目录默认为启动时的当前工作目录，也可以通过
+配置优先使用 YAML。配置根目录默认为启动时当前工作目录下的 `.agents`，也可以通过
 `--config-dir` 指定。暂时不读取或写入用户目录。
 
 全局配置只保存默认选择、provider 文件目录和 agent 默认参数。
@@ -144,7 +144,7 @@ sai mcp list  # M4
 可以有自己的参数。
 
 ```yaml
-# config.yaml
+# sai.yaml
 default_provider: paperhub
 default_model: glm-5.2
 provider_dir: providers
@@ -207,13 +207,14 @@ v0.1 只读取启动目录的 `AGENTS.md`：
 
 ```text
 AGENTS.md
-config.yaml
-providers/
-mcp/
+.agents/
+  sai.yaml
+  providers/
+  mcp/
 ```
 
-`--config-dir` 只影响配置文件位置，不影响 `AGENTS.md` 位置。`sai` 暂时不读取用户目录
-里的 `AGENTS.md`，也不做多层目录向上/向下查找。
+`--config-dir` 只影响配置根目录和其中的 `sai.yaml` 位置，不影响 `AGENTS.md` 位置。
+`sai` 暂时不读取用户目录里的 `AGENTS.md`，也不做多层目录向上/向下查找。
 
 项目指令优先级：
 

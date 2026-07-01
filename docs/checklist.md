@@ -19,8 +19,8 @@
 - [x] 添加 version 命令。
 - [x] 添加 config package。
 - [x] 使用 YAML 作为第一配置格式。
-- [x] 默认从启动时当前工作目录读取 `config.yaml`。
-- [x] 支持通过 `--config-dir` 指定配置目录。
+- [ ] 默认使用启动时当前工作目录下的 `.agents` 作为配置根目录，并读取 `sai.yaml`。
+- [x] 支持通过 `--config-dir` 指定配置根目录。
 - [x] 暂时不读取或写入用户目录配置。
 - [x] 支持每个 provider 一个独立 YAML 文件。
 - [x] 支持一个 provider 声明多个 model profile。

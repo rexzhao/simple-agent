@@ -13,7 +13,9 @@ MCP 放到 MVP 之后。
 - 初始化 Go module。
 - 创建 `sai` CLI 入口。
 - 记录并 stub YAML 配置结构。
-- 支持从当前工作目录或 `--config-dir` 指定目录读取配置。
+- 支持默认从启动时当前工作目录下的 `.agents` 读取配置。
+- 支持通过 `--config-dir` 显式指定配置根目录。
+- 支持从配置根目录的 `sai.yaml` 读取全局配置。
 - 支持全局配置和每个 provider 一个配置文件的目录布局。
 - 支持 provider 下声明多个 model profile。
 - 支持 `tools.enabled` 配置，默认不启用工具。
@@ -27,7 +29,7 @@ MCP 放到 MVP 之后。
 
 - `go test ./...` 通过。
 - `sai config show` 能输出不含密钥的解析后配置。
-- `sai config show --config-dir ./example-config` 能从指定目录读取配置。
+- `sai config show --config-dir ./example-config` 能从指定配置根目录的 `sai.yaml` 读取配置。
 - `sai models list` 能列出配置中的 provider/model。
 - `sai` 在启动目录存在 `AGENTS.md` 时能加载项目指令。
 
