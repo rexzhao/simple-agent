@@ -8,7 +8,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"strings"
 
 	"github.com/rexzhao/simple-agent/internal/config"
 	projectcontext "github.com/rexzhao/simple-agent/internal/context"
@@ -62,6 +61,7 @@ func execute(args []string, stdout io.Writer, getwd func() (string, error)) erro
 		}
 		encoder := json.NewEncoder(stdout)
 		encoder.SetIndent("", "  ")
+		encoder.SetEscapeHTML(false)
 		return encoder.Encode(cfg)
 	case "models":
 		if len(remaining) != 2 || remaining[1] != "list" {
@@ -151,16 +151,10 @@ func loadConfig(configDir string, getwd func() (string, error)) (*config.Config,
 }
 
 func openAIChatProviderConfig(provider config.ProviderConfig) openaichat.ProviderConfig {
-	apiKey := strings.TrimSpace(provider.APIKey)
-	providerConfig := openaichat.ProviderConfig{
+	return openaichat.ProviderConfig{
 		BaseURL: provider.BaseURL,
+		APIKey:  provider.ResolvedAPIKey,
 	}
-	if strings.HasPrefix(apiKey, "$") {
-		providerConfig.APIKeyEnv = strings.TrimPrefix(apiKey, "$")
-	} else {
-		providerConfig.APIKey = apiKey
-	}
-	return providerConfig
 }
 
 func runMessages(project projectcontext.Project, prompt string) []model.Message {

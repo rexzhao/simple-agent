@@ -74,6 +74,9 @@ func TestConfigShowDoesNotPrintAPIKeyValue(t *testing.T) {
 	if !strings.Contains(out, "PAPERHUB_API_KEY") {
 		t.Fatalf("config show should include API key env var name:\n%s", out)
 	}
+	if !strings.Contains(out, "<redacted>") {
+		t.Fatalf("config show should include redacted direct API key:\n%s", out)
+	}
 }
 
 func TestVersionCommand(t *testing.T) {

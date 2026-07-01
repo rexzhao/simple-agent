@@ -1,6 +1,7 @@
 package config
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -39,11 +40,12 @@ type LoggingConfig struct {
 }
 
 type ProviderConfig struct {
-	Name    string                  `json:"name" yaml:"name"`
-	Type    string                  `json:"type" yaml:"type"`
-	BaseURL string                  `json:"base_url" yaml:"base_url"`
-	APIKey  string                  `json:"api_key" yaml:"api_key"`
-	Models  map[string]ModelProfile `json:"models" yaml:"models"`
+	Name           string                  `json:"name" yaml:"name"`
+	Type           string                  `json:"type" yaml:"type"`
+	BaseURL        string                  `json:"base_url" yaml:"base_url"`
+	APIKey         string                  `json:"api_key" yaml:"api_key"`
+	ResolvedAPIKey string                  `json:"-" yaml:"-"`
+	Models         map[string]ModelProfile `json:"models" yaml:"models"`
 }
 
 type ModelProfile struct {
@@ -74,13 +76,19 @@ func (p ProviderConfig) MarshalJSON() ([]byte, error) {
 		Models  map[string]ModelProfile `json:"models"`
 	}
 
-	return json.Marshal(providerJSON{
+	var buf bytes.Buffer
+	encoder := json.NewEncoder(&buf)
+	encoder.SetEscapeHTML(false)
+	if err := encoder.Encode(providerJSON{
 		Name:    p.Name,
 		Type:    p.Type,
 		BaseURL: p.BaseURL,
 		APIKey:  redactedSecretValue(p.APIKey),
 		Models:  p.Models,
-	})
+	}); err != nil {
+		return nil, err
+	}
+	return bytes.TrimSpace(buf.Bytes()), nil
 }
 
 func Load(configDir string) (*Config, error) {
@@ -151,9 +159,16 @@ func (c *Config) ResolveModel(providerName, modelName string) (ResolvedModel, er
 		return ResolvedModel{}, fmt.Errorf("unknown model %q for provider %q; available models: %s", modelName, providerName, formatProviderModelChoices(provider))
 	}
 
+	resolvedProvider := copyProvider(provider)
+	apiKey, err := resolveAPIKey(provider.APIKey)
+	if err != nil {
+		return ResolvedModel{}, fmt.Errorf("resolve api_key for provider %q: %w", providerName, err)
+	}
+	resolvedProvider.ResolvedAPIKey = apiKey
+
 	return ResolvedModel{
 		ProviderName: providerName,
-		Provider:     copyProvider(provider),
+		Provider:     resolvedProvider,
 		Profile:      modelName,
 		ModelID:      profile.ID,
 		Parameters:   copyParameters(profile.Parameters),
@@ -350,6 +365,30 @@ func resolvePath(baseDir, path string) string {
 		return filepath.Clean(path)
 	}
 	return filepath.Clean(filepath.Join(baseDir, path))
+}
+
+func resolveAPIKey(value string) (string, error) {
+	return resolveSensitiveValue("API key", value, os.LookupEnv)
+}
+
+func resolveSensitiveValue(name, value string, lookup func(string) (string, bool)) (string, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "", nil
+	}
+	if !strings.HasPrefix(value, "$") {
+		return value, nil
+	}
+
+	envName := strings.TrimPrefix(value, "$")
+	if strings.TrimSpace(envName) == "" {
+		return "", fmt.Errorf("%s environment variable name is required", name)
+	}
+	resolved, ok := lookup(envName)
+	if !ok || strings.TrimSpace(resolved) == "" {
+		return "", fmt.Errorf("%s environment variable %q is not set", name, envName)
+	}
+	return resolved, nil
 }
 
 func redactedSecretValue(value string) string {

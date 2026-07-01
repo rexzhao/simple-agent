@@ -32,14 +32,8 @@ func TestProviderStreamPostsChatCompletionsRequest(t *testing.T) {
 	defer server.Close()
 
 	provider, err := NewProvider(ProviderConfig{
-		BaseURL:   server.URL + "/v1/",
-		APIKeyEnv: "OPENAI_API_KEY",
-		LookupEnv: func(name string) (string, bool) {
-			if name != "OPENAI_API_KEY" {
-				return "", false
-			}
-			return "test-key", true
-		},
+		BaseURL:    server.URL + "/v1/",
+		APIKey:     "test-key",
 		HTTPClient: server.Client(),
 	})
 	if err != nil {
@@ -164,6 +158,26 @@ func TestProviderStreamReturnsUsefulHTTPError(t *testing.T) {
 		if !strings.Contains(message, want) {
 			t.Fatalf("error %q missing %q", message, want)
 		}
+	}
+}
+
+func TestProviderStreamRequiresAPIKey(t *testing.T) {
+	provider, err := NewProvider(ProviderConfig{
+		BaseURL: "http://127.0.0.1:1/v1",
+	})
+	if err != nil {
+		t.Fatalf("NewProvider() error = %v", err)
+	}
+
+	events, err := provider.Stream(context.Background(), model.Request{Model: "glm-5.2"})
+	if err == nil {
+		t.Fatal("Stream() error = nil, want missing API key error")
+	}
+	if events != nil {
+		t.Fatalf("events = %#v, want nil", events)
+	}
+	if got := err.Error(); !strings.Contains(got, "API key is required") {
+		t.Fatalf("Stream() error = %q, want missing API key message", got)
 	}
 }
 

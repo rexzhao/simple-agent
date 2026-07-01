@@ -1,6 +1,7 @@
 package config
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -81,6 +82,7 @@ func TestResolveModelExplicitProviderModel(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
 	}
+	t.Setenv("PAPERHUB_API_KEY", "resolved-paperhub-secret")
 
 	got, err := cfg.ResolveModel("paperhub", "glm-5.2-fast")
 	if err != nil {
@@ -98,6 +100,9 @@ func TestResolveModelExplicitProviderModel(t *testing.T) {
 	}
 	if got.Provider.APIKey != "$PAPERHUB_API_KEY" {
 		t.Fatalf("Provider.APIKey = %q, want $PAPERHUB_API_KEY", got.Provider.APIKey)
+	}
+	if got.Provider.ResolvedAPIKey != "resolved-paperhub-secret" {
+		t.Fatalf("Provider.ResolvedAPIKey = %q, want resolved API key", got.Provider.ResolvedAPIKey)
 	}
 	if got.Profile != "glm-5.2-fast" {
 		t.Fatalf("Profile = %q, want glm-5.2-fast", got.Profile)
@@ -120,6 +125,7 @@ func TestResolveModelUsesDefaultProviderAndModel(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
 	}
+	t.Setenv("PAPERHUB_API_KEY", "resolved-paperhub-secret")
 
 	got, err := cfg.ResolveModel("", "")
 	if err != nil {
@@ -135,8 +141,85 @@ func TestResolveModelUsesDefaultProviderAndModel(t *testing.T) {
 	if got.ModelID != "glm-5.2" {
 		t.Fatalf("ModelID = %q, want glm-5.2", got.ModelID)
 	}
+	if got.Provider.ResolvedAPIKey != "resolved-paperhub-secret" {
+		t.Fatalf("Provider.ResolvedAPIKey = %q, want resolved API key", got.Provider.ResolvedAPIKey)
+	}
 	if got.Parameters["max_tokens"] != 4096 {
 		t.Fatalf("max_tokens = %#v, want 4096", got.Parameters["max_tokens"])
+	}
+}
+
+func TestResolveModelEnvAPIKeyErrorsWhenEnvIsMissingOrEmpty(t *testing.T) {
+	tests := []struct {
+		name   string
+		env    string
+		setEnv bool
+	}{
+		{name: "missing", env: "SAI_CONFIG_TEST_MISSING_API_KEY"},
+		{name: "empty", env: "SAI_CONFIG_TEST_EMPTY_API_KEY", setEnv: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := writeConfigFixture(t)
+			cfg, err := Load(dir)
+			if err != nil {
+				t.Fatalf("Load() error = %v", err)
+			}
+
+			if tt.setEnv {
+				t.Setenv(tt.env, "")
+			} else {
+				unsetEnvForTest(t, tt.env)
+			}
+			provider := cfg.Providers["paperhub"]
+			provider.APIKey = "$" + tt.env
+			cfg.Providers["paperhub"] = provider
+
+			_, err = cfg.ResolveModel("paperhub", "glm-5.2")
+			assertErrorContains(t, err, `resolve api_key for provider "paperhub"`, `API key environment variable "`+tt.env+`" is not set`)
+		})
+	}
+}
+
+func TestResolveModelDirectAPIKeyIsResolvedAndRedactedInJSON(t *testing.T) {
+	dir := writeConfigFixture(t)
+
+	cfg, err := Load(dir)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+
+	got, err := cfg.ResolveModel("local", "small")
+	if err != nil {
+		t.Fatalf("ResolveModel() error = %v", err)
+	}
+
+	if got.Provider.APIKey != "direct-local-secret" {
+		t.Fatalf("Provider.APIKey = %q, want raw direct API key", got.Provider.APIKey)
+	}
+	if got.Provider.ResolvedAPIKey != "direct-local-secret" {
+		t.Fatalf("Provider.ResolvedAPIKey = %q, want direct API key", got.Provider.ResolvedAPIKey)
+	}
+
+	cfgJSON, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatalf("Marshal(cfg) error = %v", err)
+	}
+	resolvedJSON, err := json.Marshal(got)
+	if err != nil {
+		t.Fatalf("Marshal(resolved) error = %v", err)
+	}
+	for name, output := range map[string]string{
+		"config":   string(cfgJSON),
+		"resolved": string(resolvedJSON),
+	} {
+		if strings.Contains(output, "direct-local-secret") {
+			t.Fatalf("%s JSON leaked direct API key: %s", name, output)
+		}
+		if !strings.Contains(output, "<redacted>") && !strings.Contains(output, `\u003credacted\u003e`) {
+			t.Fatalf("%s JSON = %s, want redacted API key", name, output)
+		}
 	}
 }
 
@@ -198,6 +281,7 @@ func TestResolveModelCopiesParameters(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
 	}
+	t.Setenv("PAPERHUB_API_KEY", "resolved-paperhub-secret")
 
 	got, err := cfg.ResolveModel("paperhub", "glm-5.2")
 	if err != nil {
@@ -244,6 +328,22 @@ func assertErrorContains(t *testing.T, err error, wants ...string) {
 			t.Fatalf("error = %q, want contain %q", got, want)
 		}
 	}
+}
+
+func unsetEnvForTest(t *testing.T, name string) {
+	t.Helper()
+
+	oldValue, hadValue := os.LookupEnv(name)
+	if err := os.Unsetenv(name); err != nil {
+		t.Fatalf("Unsetenv(%q) error = %v", name, err)
+	}
+	t.Cleanup(func() {
+		if hadValue {
+			_ = os.Setenv(name, oldValue)
+		} else {
+			_ = os.Unsetenv(name)
+		}
+	})
 }
 
 func writeConfigFixture(t *testing.T) string {

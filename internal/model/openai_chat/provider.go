@@ -7,27 +7,20 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"os"
 	"strings"
 
 	"github.com/rexzhao/simple-agent/internal/model"
 )
 
-type EnvLookupFunc func(string) (string, bool)
-
 type ProviderConfig struct {
 	BaseURL    string
 	APIKey     string
-	APIKeyEnv  string
-	LookupEnv  EnvLookupFunc
 	HTTPClient *http.Client
 }
 
 type Provider struct {
 	baseURL    string
 	apiKey     string
-	apiKeyEnv  string
-	lookupEnv  EnvLookupFunc
 	httpClient *http.Client
 }
 
@@ -44,16 +37,9 @@ func NewProvider(config ProviderConfig) (*Provider, error) {
 		httpClient = http.DefaultClient
 	}
 
-	lookupEnv := config.LookupEnv
-	if lookupEnv == nil {
-		lookupEnv = os.LookupEnv
-	}
-
 	return &Provider{
 		baseURL:    baseURL,
-		apiKey:     config.APIKey,
-		apiKeyEnv:  config.APIKeyEnv,
-		lookupEnv:  lookupEnv,
+		apiKey:     strings.TrimSpace(config.APIKey),
 		httpClient: httpClient,
 	}, nil
 }
@@ -98,13 +84,7 @@ func (p *Provider) apiKeyValue() (string, error) {
 	if p.apiKey != "" {
 		return p.apiKey, nil
 	}
-	if p.apiKeyEnv == "" {
-		return "", fmt.Errorf("API key is required")
-	}
-	if value, ok := p.lookupEnv(p.apiKeyEnv); ok && value != "" {
-		return value, nil
-	}
-	return "", fmt.Errorf("API key environment variable %q is not set", p.apiKeyEnv)
+	return "", fmt.Errorf("API key is required")
 }
 
 func streamResponseEvents(body io.Reader, events chan<- model.Event) {
