@@ -66,7 +66,7 @@
 - [x] 定义内部 tool schema。
 - [x] 定义 tool executor interface。
 - [x] 添加 tool registry。
-- [ ] 将内部 tools 转换为 OpenAI-compatible `tools` payload。
+- [x] 将内部 tools 转换为 OpenAI-compatible `tools` payload。
 - [ ] 内置 `list_files`。
 - [ ] 内置 `read_file`。
 - [ ] 内置 `shell`。

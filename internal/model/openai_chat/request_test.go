@@ -87,6 +87,65 @@ func TestBuildRequestBodyMapsToolsToOpenAIFunctionShape(t *testing.T) {
 	}`)
 }
 
+func TestBuildRequestBodyMapsNilToolSchemaAndPreservesToolOrder(t *testing.T) {
+	body, err := BuildRequestBody(model.Request{
+		Model: "glm-5.2",
+		Messages: []model.Message{
+			{Role: model.MessageRoleUser, Content: "Use tools"},
+		},
+		Tools: []model.Tool{
+			{
+				Name:        "list_files",
+				Description: "List files in the workspace.",
+			},
+			{
+				Name:        "read_file",
+				Description: "Read a file from the workspace.",
+				InputSchema: map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"path": map[string]any{"type": "string"},
+					},
+				},
+			},
+		},
+	}, true)
+	if err != nil {
+		t.Fatalf("BuildRequestBody() error = %v", err)
+	}
+
+	assertJSONEqual(t, body, `{
+		"model": "glm-5.2",
+		"messages": [
+			{"role": "user", "content": "Use tools"}
+		],
+		"stream": true,
+		"tools": [
+			{
+				"type": "function",
+				"function": {
+					"name": "list_files",
+					"description": "List files in the workspace.",
+					"parameters": {}
+				}
+			},
+			{
+				"type": "function",
+				"function": {
+					"name": "read_file",
+					"description": "Read a file from the workspace.",
+					"parameters": {
+						"type": "object",
+						"properties": {
+							"path": {"type": "string"}
+						}
+					}
+				}
+			}
+		]
+	}`)
+}
+
 func assertJSONEqual(t *testing.T, got []byte, want string) {
 	t.Helper()
 
