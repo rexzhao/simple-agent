@@ -212,6 +212,76 @@ func TestRunEnableToolsOverridesConfiguredTools(t *testing.T) {
 	assertCLIToolNames(t, (<-requests).Body, []string{"list_files", "read_file"})
 }
 
+func TestRunVerboseWritesDiagnosticsWithoutSensitiveContent(t *testing.T) {
+	t.Run("direct API key", func(t *testing.T) {
+		server, requests := newCLIRunServer(t,
+			`{"choices":[{"delta":{"content":"model response secret"}}]}`,
+			`[DONE]`,
+		)
+		defer server.Close()
+
+		configDir := t.TempDir()
+		writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
+
+		var stdout, stderr bytes.Buffer
+		code := RunWithGetwd([]string{"--config-dir", configDir, "run", "--verbose", "--enable-tools", "list_files,read_file", "user prompt secret"}, &stdout, &stderr, func() (string, error) {
+			return t.TempDir(), nil
+		})
+
+		if code != 0 {
+			t.Fatalf("RunWithGetwd() code = %d, stderr = %s", code, stderr.String())
+		}
+		if got, want := stdout.String(), "model response secret"; got != want {
+			t.Fatalf("stdout = %q, want %q", got, want)
+		}
+		assertCLIVerboseContains(t, stderr.String(),
+			"config_dir: "+filepath.Clean(configDir),
+			"provider: fake",
+			"model_profile: default",
+			"model_id: model-default",
+			"log_path: "+filepath.Join(configDir, "logs", "sai.jsonl"),
+			"max_turns: 8",
+			"enabled_tools: list_files,read_file",
+			"show_reasoning: false",
+		)
+		assertCLIErrorOmits(t, stderr.String(), "direct-secret-value", "user prompt secret", "model response secret")
+		<-requests
+		assertNoAdditionalCLIRunRequest(t, requests)
+	})
+
+	t.Run("env API key", func(t *testing.T) {
+		server, requests := newCLIRunServer(t,
+			`{"choices":[{"delta":{"content":"env response secret"}}]}`,
+			`[DONE]`,
+		)
+		defer server.Close()
+
+		configDir := t.TempDir()
+		writeCLIRunFixtureInDir(t, configDir, server.URL, "$SAI_VERBOSE_API_KEY", "openai-chat")
+		t.Setenv("SAI_VERBOSE_API_KEY", "env-secret-value")
+
+		var stdout, stderr bytes.Buffer
+		code := RunWithGetwd([]string{"--config-dir", configDir, "run", "--verbose", "env user prompt secret"}, &stdout, &stderr, func() (string, error) {
+			return t.TempDir(), nil
+		})
+
+		if code != 0 {
+			t.Fatalf("RunWithGetwd() code = %d, stderr = %s", code, stderr.String())
+		}
+		if got, want := stdout.String(), "env response secret"; got != want {
+			t.Fatalf("stdout = %q, want %q", got, want)
+		}
+		assertCLIVerboseContains(t, stderr.String(),
+			"provider: fake",
+			"model_id: model-default",
+			"enabled_tools: (none)",
+		)
+		assertCLIErrorOmits(t, stderr.String(), "env-secret-value", "env user prompt secret", "env response secret")
+		<-requests
+		assertNoAdditionalCLIRunRequest(t, requests)
+	})
+}
+
 func TestRunExecutesToolCallAndContinuesToFinalText(t *testing.T) {
 	server, requests := newSequentialCLIRunServer(t,
 		[]string{
@@ -940,6 +1010,16 @@ func assertCLIErrorContains(t *testing.T, got string, wants ...string) {
 	for _, want := range wants {
 		if !strings.Contains(got, want) {
 			t.Fatalf("stderr = %q, want contain %q", got, want)
+		}
+	}
+}
+
+func assertCLIVerboseContains(t *testing.T, got string, wants ...string) {
+	t.Helper()
+
+	for _, want := range wants {
+		if !strings.Contains(got, want) {
+			t.Fatalf("verbose stderr = %q, want contain %q", got, want)
 		}
 	}
 }

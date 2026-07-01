@@ -58,6 +58,12 @@ Enable tools for a single run:
 sai run --enable-tools list_files,read_file "List this project"
 ```
 
+Write non-sensitive run diagnostics to stderr without changing streamed stdout:
+
+```sh
+sai run --verbose --provider paperhub --model glm-5.2 "Hello"
+```
+
 Other useful commands:
 
 ```sh

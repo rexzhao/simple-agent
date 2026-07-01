@@ -28,14 +28,14 @@ func Run(args []string, stdout, stderr io.Writer) int {
 }
 
 func RunWithGetwd(args []string, stdout, stderr io.Writer, getwd func() (string, error)) int {
-	if err := execute(args, stdout, getwd); err != nil {
+	if err := execute(args, stdout, stderr, getwd); err != nil {
 		fmt.Fprintf(stderr, "sai: %v\n", err)
 		return 1
 	}
 	return 0
 }
 
-func execute(args []string, stdout io.Writer, getwd func() (string, error)) error {
+func execute(args []string, stdout, stderr io.Writer, getwd func() (string, error)) error {
 	flags := flag.NewFlagSet("sai", flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
 	configDir := flags.String("config-dir", "", "configuration directory")
@@ -81,18 +81,19 @@ func execute(args []string, stdout io.Writer, getwd func() (string, error)) erro
 		}
 		return nil
 	case "run":
-		return runCommand(remaining[1:], *configDir, stdout, getwd)
+		return runCommand(remaining[1:], *configDir, stdout, stderr, getwd)
 	default:
 		return fmt.Errorf("unknown command %q", remaining[0])
 	}
 }
 
-func runCommand(args []string, configDir string, stdout io.Writer, getwd func() (string, error)) error {
+func runCommand(args []string, configDir string, stdout, stderr io.Writer, getwd func() (string, error)) error {
 	flags := flag.NewFlagSet("sai run", flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
 	providerName := flags.String("provider", "", "provider name")
 	modelProfile := flags.String("model", "", "model profile")
 	showReasoning := flags.Bool("show-reasoning", false, "show reasoning output")
+	verbose := flags.Bool("verbose", false, "write non-sensitive diagnostics to stderr")
 	var enabledTools toolNamesFlag
 	flags.Var(&enabledTools, "enable-tools", "comma-separated tool names to expose")
 	if err := flags.Parse(args); err != nil {
@@ -101,7 +102,7 @@ func runCommand(args []string, configDir string, stdout io.Writer, getwd func() 
 
 	prompts := flags.Args()
 	if len(prompts) != 1 {
-		return fmt.Errorf(`usage: sai run [--provider name] [--model profile] [--show-reasoning] [--enable-tools names] "prompt"`)
+		return fmt.Errorf(`usage: sai run [--provider name] [--model profile] [--show-reasoning] [--verbose] [--enable-tools names] "prompt"`)
 	}
 
 	cwd, err := getwd()
@@ -137,6 +138,13 @@ func runCommand(args []string, configDir string, stdout io.Writer, getwd func() 
 		return err
 	}
 
+	resolvedShowReasoning := *showReasoning || cfg.Agent.ShowReasoning
+	if *verbose {
+		if err := writeVerboseDiagnostics(stderr, cfg, resolved, enabledToolNames, resolvedShowReasoning); err != nil {
+			return err
+		}
+	}
+
 	project, err := projectcontext.Load(cwd)
 	if err != nil {
 		return err
@@ -167,7 +175,7 @@ func runCommand(args []string, configDir string, stdout io.Writer, getwd func() 
 		return err
 	}
 
-	streamErr := writeStream(stdout, events, *showReasoning || cfg.Agent.ShowReasoning, logger)
+	streamErr := writeStream(stdout, events, resolvedShowReasoning, logger)
 	closeErr := logger.Close()
 	if streamErr != nil {
 		return streamErr
@@ -192,6 +200,41 @@ func (f *toolNamesFlag) Set(value string) error {
 
 func (f *toolNamesFlag) String() string {
 	return strings.Join(f.names, ",")
+}
+
+func writeVerboseDiagnostics(stderr io.Writer, cfg *config.Config, resolved config.ResolvedModel, enabledTools []string, showReasoning bool) error {
+	_, err := fmt.Fprintf(stderr, "config_dir: %s\nprovider: %s\nmodel_profile: %s\nmodel_id: %s\nlog_path: %s\nmax_turns: %d\nenabled_tools: %s\nshow_reasoning: %t\n",
+		cfg.ConfigDir,
+		resolved.ProviderName,
+		resolved.Profile,
+		resolved.ModelID,
+		verbosePath(cfg.Logging.Path),
+		effectiveMaxTurns(cfg.Agent.MaxTurns),
+		formatVerboseToolNames(enabledTools),
+		showReasoning,
+	)
+	return err
+}
+
+func verbosePath(path string) string {
+	if strings.TrimSpace(path) == "" {
+		return "(disabled)"
+	}
+	return path
+}
+
+func effectiveMaxTurns(maxTurns int) int {
+	if maxTurns <= 0 {
+		return agent.DefaultMaxTurns
+	}
+	return maxTurns
+}
+
+func formatVerboseToolNames(names []string) string {
+	if len(names) == 0 {
+		return "(none)"
+	}
+	return strings.Join(names, ",")
 }
 
 func parseToolNames(value string) ([]string, error) {

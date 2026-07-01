@@ -10,7 +10,7 @@
 - [ ] MVP 不实现 MCP；MCP 从 M4 开始。
 - [ ] 核心 OpenAI-compatible 路径稳定前，不实现 Anthropic Messages。
 - [ ] 核心 OpenAI-compatible 路径稳定前，不实现 OpenAI Responses。
-- [ ] 日志、verbose、resolved config 中不打印 API key、Authorization header 或其他敏感配置值的实际值。
+- [x] 日志、verbose、resolved config 中不打印 API key、Authorization header 或其他敏感配置值的实际值。
 
 ## M0：项目骨架
 
@@ -87,7 +87,7 @@
 
 - [x] 添加 Windows、Linux、macOS build 命令。
 - [x] 构建单文件可执行程序。
-- [ ] 添加 `--verbose`。
+- [x] 添加 `--verbose`。
 - [x] 添加 JSONL 日志。
 - [x] 除 JSONL 日志外，不落盘会话历史或上下文快照。
 - [x] v0.1 不记录完整 prompt、response、tool result 正文。
