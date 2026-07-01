@@ -270,6 +270,61 @@ func TestRunOpenAIResponsesProviderOutputsTextDelta(t *testing.T) {
 	assertNoAdditionalCLIRunRequest(t, requests)
 }
 
+func TestRunOpenAIResponsesExecutesFunctionCallAndContinuesToFinalText(t *testing.T) {
+	server, requests := newSequentialCLIRunServer(t,
+		[]string{
+			`{"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","id":"fc_1","call_id":"call_1","name":"read_file","arguments":""}}`,
+			`{"type":"response.function_call_arguments.delta","item_id":"fc_1","output_index":0,"delta":"{\"path\":\"note.txt\"}"}`,
+			`{"type":"response.function_call_arguments.done","item_id":"fc_1","output_index":0,"arguments":"{\"path\":\"note.txt\"}"}`,
+			`{"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","id":"fc_1","call_id":"call_1","name":"read_file","arguments":"{\"path\":\"note.txt\"}"}}`,
+			`{"type":"response.completed","response":{"usage":{"input_tokens":7,"output_tokens":3,"total_tokens":10}}}`,
+		},
+		[]string{
+			`{"type":"response.output_text.delta","delta":"done"}`,
+			`{"type":"response.completed","response":{"usage":{"input_tokens":11,"output_tokens":2,"total_tokens":13}}}`,
+		},
+	)
+	defer server.Close()
+
+	projectDir := t.TempDir()
+	writeCLIFile(t, filepath.Join(projectDir, "note.txt"), "tool output")
+	configDir := t.TempDir()
+	writeCLIRunFixtureInDir(t, configDir, server.URL, "responses-secret-value", "openai-responses")
+
+	var stdout, stderr bytes.Buffer
+	code := RunWithGetwd([]string{"--config-dir", configDir, "run", "--enable-tools", "read_file", "Read note"}, &stdout, &stderr, func() (string, error) {
+		return projectDir, nil
+	})
+
+	if code != 0 {
+		t.Fatalf("RunWithGetwd() code = %d, stderr = %s", code, stderr.String())
+	}
+	if got, want := stdout.String(), "done"; got != want {
+		t.Fatalf("stdout = %q, want %q", got, want)
+	}
+
+	firstRequest := <-requests
+	if firstRequest.Path != "/responses" {
+		t.Fatalf("first request path = %q, want /responses", firstRequest.Path)
+	}
+	assertCLIResponsesToolNames(t, firstRequest.Body, []string{"read_file"})
+
+	secondRequest := <-requests
+	if secondRequest.Path != "/responses" {
+		t.Fatalf("second request path = %q, want /responses", secondRequest.Path)
+	}
+	assertCLIResponsesToolNames(t, secondRequest.Body, []string{"read_file"})
+	input := requestInput(t, secondRequest.Body)
+	if len(input) != 4 {
+		t.Fatalf("len(second request input) = %d, want 4: %#v", len(input), input)
+	}
+	assertMessage(t, input, 0, "system", builtInBaseInstructions)
+	assertMessage(t, input, 1, "user", "Read note")
+	assertResponseFunctionCallInput(t, input, 2, "call_1", "read_file", `{"path":"note.txt"}`)
+	assertResponseFunctionCallOutput(t, input, 3, "call_1", "tool output")
+	assertNoAdditionalCLIRunRequest(t, requests)
+}
+
 func TestRunAnthropicMessagesProviderOutputsTextDelta(t *testing.T) {
 	server, requests := newCLIRunServer(t,
 		`{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hello anthropic"}}`,
@@ -1576,6 +1631,85 @@ func assertCLIToolNames(t *testing.T, body map[string]any, want []string) {
 		if got := parameters["type"]; got != "object" {
 			t.Fatalf("tools[%d].function.parameters.type = %#v, want object", i, got)
 		}
+	}
+}
+
+func assertCLIResponsesToolNames(t *testing.T, body map[string]any, want []string) {
+	t.Helper()
+
+	toolsValue, ok := body["tools"].([]any)
+	if !ok {
+		t.Fatalf("tools = %T(%#v), want []any", body["tools"], body["tools"])
+	}
+	if len(toolsValue) != len(want) {
+		t.Fatalf("len(tools) = %d, want %d: %#v", len(toolsValue), len(want), toolsValue)
+	}
+	for i, wantName := range want {
+		tool, ok := toolsValue[i].(map[string]any)
+		if !ok {
+			t.Fatalf("tools[%d] = %T, want object", i, toolsValue[i])
+		}
+		if got := tool["type"]; got != "function" {
+			t.Fatalf("tools[%d].type = %#v, want function", i, got)
+		}
+		if got := tool["name"]; got != wantName {
+			t.Fatalf("tools[%d].name = %#v, want %q", i, got, wantName)
+		}
+		if got := tool["description"]; got == "" {
+			t.Fatalf("tools[%d].description is empty", i)
+		}
+		parameters, ok := tool["parameters"].(map[string]any)
+		if !ok {
+			t.Fatalf("tools[%d].parameters = %T, want object", i, tool["parameters"])
+		}
+		if got := parameters["type"]; got != "object" {
+			t.Fatalf("tools[%d].parameters.type = %#v, want object", i, got)
+		}
+	}
+}
+
+func assertResponseFunctionCallInput(t *testing.T, input []any, index int, callID, name, arguments string) {
+	t.Helper()
+
+	if index >= len(input) {
+		t.Fatalf("missing input %d in %#v", index, input)
+	}
+	item, ok := input[index].(map[string]any)
+	if !ok {
+		t.Fatalf("input[%d] = %T, want object", index, input[index])
+	}
+	if got := item["type"]; got != "function_call" {
+		t.Fatalf("input[%d].type = %#v, want function_call", index, got)
+	}
+	if got := item["call_id"]; got != callID {
+		t.Fatalf("input[%d].call_id = %#v, want %q", index, got, callID)
+	}
+	if got := item["name"]; got != name {
+		t.Fatalf("input[%d].name = %#v, want %q", index, got, name)
+	}
+	if got := item["arguments"]; got != arguments {
+		t.Fatalf("input[%d].arguments = %#v, want %q", index, got, arguments)
+	}
+}
+
+func assertResponseFunctionCallOutput(t *testing.T, input []any, index int, callID, output string) {
+	t.Helper()
+
+	if index >= len(input) {
+		t.Fatalf("missing input %d in %#v", index, input)
+	}
+	item, ok := input[index].(map[string]any)
+	if !ok {
+		t.Fatalf("input[%d] = %T, want object", index, input[index])
+	}
+	if got := item["type"]; got != "function_call_output" {
+		t.Fatalf("input[%d].type = %#v, want function_call_output", index, got)
+	}
+	if got := item["call_id"]; got != callID {
+		t.Fatalf("input[%d].call_id = %#v, want %q", index, got, callID)
+	}
+	if got := item["output"]; got != output {
+		t.Fatalf("input[%d].output = %#v, want %q", index, got, output)
 	}
 }
 

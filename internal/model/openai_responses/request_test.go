@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"encoding/json"
 	"reflect"
-	"strings"
 	"testing"
 
 	"github.com/rexzhao/simple-agent/internal/model"
@@ -77,11 +76,11 @@ func TestBuildRequestBodyRejectsUnsupportedToolParameters(t *testing.T) {
 		value     any
 	}{
 		{name: "tools", parameter: "tools", value: []any{map[string]any{"type": "function"}}},
-		{name: "tool choice", parameter: "tool_choice", value: "auto"},
-		{name: "parallel tool calls", parameter: "parallel_tool_calls", value: true},
-		{name: "max tool calls", parameter: "max_tool_calls", value: 1},
+		{name: "web search options", parameter: "web_search_options", value: map[string]any{"search_context_size": "low"}},
+		{name: "tool resources", parameter: "tool_resources", value: map[string]any{}},
 		{name: "legacy functions", parameter: "functions", value: []any{map[string]any{"name": "read_file"}}},
 		{name: "function call output", parameter: "function_call_output", value: map[string]any{"call_id": "call_1"}},
+		{name: "previous response id", parameter: "previous_response_id", value: "resp_1"},
 	}
 
 	for _, tt := range tests {
@@ -100,7 +99,7 @@ func TestBuildRequestBodyRejectsUnsupportedToolParameters(t *testing.T) {
 				t.Fatalf("BuildRequestBody() error = nil, want error; body = %s", body)
 			}
 
-			want := `OpenAI Responses adapter does not support tools yet: parameter "` + tt.parameter + `" is not supported`
+			want := `OpenAI Responses adapter does not support parameter "` + tt.parameter + `"`
 			if err.Error() != want {
 				t.Fatalf("BuildRequestBody() error = %q, want %q", err, want)
 			}
@@ -108,56 +107,190 @@ func TestBuildRequestBodyRejectsUnsupportedToolParameters(t *testing.T) {
 	}
 }
 
-func TestBuildRequestBodyRejectsUnsupportedToolPayloads(t *testing.T) {
-	tests := []struct {
-		name    string
-		request model.Request
-		want    string
-	}{
-		{
-			name: "request tools",
-			request: model.Request{
-				Model: "gpt-5.1",
-				Tools: []model.Tool{{Name: "read_file"}},
+func TestBuildRequestBodyMapsToolsFunctionCallsToolOutputsAndToolParameters(t *testing.T) {
+	body, err := BuildRequestBody(model.Request{
+		Model: "gpt-5.1",
+		Messages: []model.Message{
+			{Role: model.MessageRoleUser, Content: "Search local files"},
+			{
+				Role:    model.MessageRoleAssistant,
+				Content: "I'll search.",
+				ToolCalls: []model.ToolCall{
+					{ID: "call_search", Name: "mcp.local.search", Arguments: `{"query":"needle"}`},
+					{ID: "call_read", Name: "read_file"},
+				},
 			},
-			want: "does not support tools yet",
+			{Role: model.MessageRoleTool, ToolCallID: "call_search", Content: "found"},
+			{Role: model.MessageRoleTool, ToolCallID: "call_read", Content: "missing file", IsError: true},
 		},
-		{
-			name: "assistant tool calls",
-			request: model.Request{
-				Model: "gpt-5.1",
-				Messages: []model.Message{
-					{
-						Role:      model.MessageRoleAssistant,
-						ToolCalls: []model.ToolCall{{ID: "call_1", Name: "read_file", Arguments: "{}"}},
+		Tools: []model.Tool{
+			{
+				Name:        "read_file",
+				Description: "Read a file.",
+				InputSchema: map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"path": map[string]any{"type": "string"},
 					},
 				},
 			},
-			want: "does not support assistant tool calls yet",
-		},
-		{
-			name: "tool messages",
-			request: model.Request{
-				Model: "gpt-5.1",
-				Messages: []model.Message{
-					{Role: model.MessageRoleTool, ToolCallID: "call_1", Content: "tool output"},
-				},
+			{
+				Name:        "mcp.local.search",
+				Description: "Search local data.",
 			},
-			want: "does not support tool messages yet",
 		},
+		Parameters: map[string]any{
+			"tool_choice":         "auto",
+			"parallel_tool_calls": true,
+		},
+	}, true)
+	if err != nil {
+		t.Fatalf("BuildRequestBody() error = %v", err)
 	}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			body, err := BuildRequestBody(tt.request, true)
-			if err == nil {
-				t.Fatalf("BuildRequestBody() error = nil, want error; body = %s", body)
+	assertJSONEqual(t, body, `{
+		"model": "gpt-5.1",
+		"input": [
+			{"role": "user", "content": "Search local files"},
+			{"role": "assistant", "content": "I'll search."},
+			{"type": "function_call", "call_id": "call_search", "name": "tool_0", "arguments": "{\"query\":\"needle\"}"},
+			{"type": "function_call", "call_id": "call_read", "name": "read_file", "arguments": "{}"},
+			{"type": "function_call_output", "call_id": "call_search", "output": "found"},
+			{"type": "function_call_output", "call_id": "call_read", "output": "missing file"}
+		],
+		"stream": true,
+		"tool_choice": "auto",
+		"parallel_tool_calls": true,
+		"tools": [
+			{
+				"type": "function",
+				"name": "read_file",
+				"description": "Read a file.",
+				"parameters": {
+					"type": "object",
+					"properties": {
+						"path": {"type": "string"}
+					}
+				}
+			},
+			{
+				"type": "function",
+				"name": "tool_0",
+				"description": "Search local data.",
+				"parameters": {
+					"type": "object",
+					"properties": {}
+				}
 			}
-			if !strings.Contains(err.Error(), tt.want) {
-				t.Fatalf("BuildRequestBody() error = %q, want contain %q", err, tt.want)
-			}
-		})
+		]
+	}`)
+}
+
+func TestBuildRequestBodyAvoidsResponsesToolNameAliasConflicts(t *testing.T) {
+	body, err := BuildRequestBody(model.Request{
+		Model: "gpt-5.1",
+		Tools: []model.Tool{
+			{Name: "tool_0", Description: "Already legal."},
+			{Name: "mcp.local.search", Description: "Needs an alias."},
+		},
+	}, false)
+	if err != nil {
+		t.Fatalf("BuildRequestBody() error = %v", err)
 	}
+
+	assertJSONEqual(t, body, `{
+		"model": "gpt-5.1",
+		"input": [],
+		"stream": false,
+		"tools": [
+			{
+				"type": "function",
+				"name": "tool_0",
+				"description": "Already legal.",
+				"parameters": {"type": "object", "properties": {}}
+			},
+			{
+				"type": "function",
+				"name": "tool_1",
+				"description": "Needs an alias.",
+				"parameters": {"type": "object", "properties": {}}
+			}
+		]
+	}`)
+}
+
+func TestBuildRequestBodyMapsForcedToolChoiceAlias(t *testing.T) {
+	body, err := BuildRequestBody(model.Request{
+		Model: "gpt-5.1",
+		Tools: []model.Tool{{Name: "mcp.local.search", Description: "Search local data."}},
+		Parameters: map[string]any{
+			"tool_choice": map[string]any{
+				"type": "function",
+				"name": "mcp.local.search",
+			},
+		},
+	}, true)
+	if err != nil {
+		t.Fatalf("BuildRequestBody() error = %v", err)
+	}
+
+	assertJSONEqual(t, body, `{
+		"model": "gpt-5.1",
+		"input": [],
+		"stream": true,
+		"tool_choice": {"type": "function", "name": "tool_0"},
+		"tools": [
+			{
+				"type": "function",
+				"name": "tool_0",
+				"description": "Search local data.",
+				"parameters": {"type": "object", "properties": {}}
+			}
+		]
+	}`)
+}
+
+func TestBuildRequestBodyMapsAllowedToolsToolChoiceAliases(t *testing.T) {
+	body, err := BuildRequestBody(model.Request{
+		Model: "gpt-5.1",
+		Tools: []model.Tool{{Name: "mcp.local.search", Description: "Search local data."}},
+		Parameters: map[string]any{
+			"tool_choice": map[string]any{
+				"type": "allowed_tools",
+				"mode": "auto",
+				"tools": []any{
+					map[string]any{
+						"type": "function",
+						"name": "mcp.local.search",
+					},
+				},
+			},
+		},
+	}, true)
+	if err != nil {
+		t.Fatalf("BuildRequestBody() error = %v", err)
+	}
+
+	assertJSONEqual(t, body, `{
+		"model": "gpt-5.1",
+		"input": [],
+		"stream": true,
+		"tool_choice": {
+			"type": "allowed_tools",
+			"mode": "auto",
+			"tools": [
+				{"type": "function", "name": "tool_0"}
+			]
+		},
+		"tools": [
+			{
+				"type": "function",
+				"name": "tool_0",
+				"description": "Search local data.",
+				"parameters": {"type": "object", "properties": {}}
+			}
+		]
+	}`)
 }
 
 func assertJSONEqual(t *testing.T, got []byte, want string) {

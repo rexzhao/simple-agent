@@ -50,7 +50,7 @@ func (p *Provider) Stream(ctx context.Context, request model.Request) (<-chan mo
 		return nil, err
 	}
 
-	body, err := BuildRequestBody(request, true)
+	body, toolNames, err := buildRequestBody(request, true)
 	if err != nil {
 		return nil, fmt.Errorf("build OpenAI Responses request body: %w", err)
 	}
@@ -75,7 +75,7 @@ func (p *Provider) Stream(ctx context.Context, request model.Request) (<-chan mo
 	go func() {
 		defer close(events)
 		defer response.Body.Close()
-		streamResponseEvents(response.Body, events)
+		streamResponseEvents(response.Body, events, toolNames)
 	}()
 	return events, nil
 }
@@ -87,11 +87,11 @@ func (p *Provider) apiKeyValue() (string, error) {
 	return "", fmt.Errorf("API key is required")
 }
 
-func streamResponseEvents(body io.Reader, events chan<- model.Event) {
+func streamResponseEvents(body io.Reader, events chan<- model.Event, toolNames *toolNameMapper) {
 	scanner := bufio.NewScanner(body)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 
-	decoder := newStreamEventDecoder()
+	decoder := newStreamEventDecoder(toolNames)
 	var frame bytes.Buffer
 	for scanner.Scan() {
 		line := scanner.Text()

@@ -111,7 +111,8 @@ models:
 - `type`：provider adapter 类型。配置层识别 `openai-chat`、`anthropic-messages` 和
   `openai-responses`。`sai run` 支持 `openai-chat`，也支持 `anthropic-messages`
   的文本 streaming；Anthropic tool use adapter 已接入同一套内部 tool loop。
-  `openai-responses` 当前支持文本 streaming，function calling 后续再接。
+  `openai-responses` 当前支持文本 streaming 和 function tool calling，并接入同一套内部
+  tool loop。
 - `base_url`：provider API base URL。`openai-chat` 不包含 `/chat/completions`；
   `anthropic-messages` 使用 Anthropic Messages API base，例如 `https://api.anthropic.com/v1`；
   `openai-responses` 不包含 `/responses`，例如 `https://api.openai.com/v1`。
@@ -158,13 +159,15 @@ models:
 ```
 
 这类配置可以被加载、列入 `sai models list`，并参与模型解析；`sai run` 会请求
-`<base_url>/responses` 并转换 Responses semantic text streaming 事件。当前只支持文本
-messages 和文本 delta；tools、assistant tool calls、tool result messages 仍留给后续
-function calling 小步。`openai-responses` 使用 Responses API 的 `max_output_tokens`；
+`<base_url>/responses` 并转换 Responses semantic text streaming 事件和 streamed
+function_call 事件。`openai-responses` 支持顶层 function `tools`、assistant 历史里的
+`function_call` input item，以及 tool result 的 `function_call_output` input item。
+`openai-responses` 使用 Responses API 的 `max_output_tokens`；
 为兼容已有 profile，adapter 会把 legacy `max_tokens` 请求参数映射为
-`max_output_tokens`，但不会覆盖显式配置的 `max_output_tokens`。在 function calling
-小步前，`openai-responses` 会拒绝 `tools`、`tool_choice` 等 tool/function-calling
-请求参数。
+`max_output_tokens`，但不会覆盖显式配置的 `max_output_tokens`。`tool_choice`、
+`parallel_tool_calls` 等普通 Responses function tool 参数可以透传。custom tools、
+built-in web/code tools、stateful `previous_response_id` 对话续写、reasoning output item
+passthrough 仍是后续项。
 
 `api_key` 是这次 provider 配置中的具体字段。其他需要脱敏的敏感配置值也可以采用同样
 约定：字符串以 `$` 开头时，`$` 后面的内容作为环境变量名读取实际值；不以 `$` 开头时

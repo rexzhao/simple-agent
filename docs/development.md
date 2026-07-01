@@ -25,8 +25,8 @@
 - skills 是后续开发项，v0.1 不实现。
 - M5 已为 Anthropic Messages 添加 provider type 配置识别、示例、文本 streaming
   和 tool use runtime adapter。
-- M6 第一小步已为 OpenAI Responses 添加 provider type 配置识别、文本 input mapping
-  和 semantic text streaming adapter；Responses function calling 后续再接。
+- M6 已为 OpenAI Responses 添加 provider type 配置识别、文本 input mapping、
+  semantic text streaming adapter，以及 function tools / function_call_output tool loop adapter。
 - MCP 不属于 MVP 核心；后续接入时第一种传输只做 stdio。
 - 配置根目录默认是启动时当前工作目录下的 `.agents`，也可以通过 `--config-dir` 指定。
 - 默认读取启动目录下的 `AGENTS.md` 作为项目指令；文件不存在时继续执行。
@@ -39,7 +39,8 @@
 - multi-agent 编排。
 - 长期记忆。
 - skill 加载。
-- OpenAI Responses function calling。
+- OpenAI Responses custom tools、built-in web/code tools、stateful `previous_response_id`
+  对话续写，以及 reasoning output item passthrough。
 - MCP stdio。
 - remote MCP over HTTP/SSE。
 - 插件市场或插件生命周期管理。
@@ -71,7 +72,7 @@ internal/model/anthropic_messages
   Anthropic Messages streaming and tool use adapter
 
 internal/model/openai_responses
-  OpenAI Responses text streaming adapter
+  OpenAI Responses text streaming and function tool adapter
 
 internal/tools
   内置工具定义和执行
@@ -194,7 +195,7 @@ models:
 配置层识别的 provider type 包括 `openai-chat`、`anthropic-messages` 和
 `openai-responses`。当前 `sai run` 支持 `openai-chat`，也支持
 `anthropic-messages` 的文本 streaming 和 tool use，并支持 `openai-responses` 的
-文本 streaming。Responses function calling 尚未接入。
+文本 streaming 和 function tool calling。
 
 ```yaml
 # providers/anthropic.yaml
@@ -228,6 +229,10 @@ models:
 `openai-responses` 使用 Responses API 的 `max_output_tokens`。为兼容已有 profile，
 adapter 会把 legacy `max_tokens` 请求参数映射为 `max_output_tokens`；如果显式配置了
 `max_output_tokens`，则保留显式值。
+`openai-responses` 支持顶层 function `tools`、streamed function_call 事件，以及
+`function_call_output` input item。`tool_choice`、`parallel_tool_calls` 等普通
+Responses function tool 参数可以透传。custom tools、built-in web/code tools、
+stateful `previous_response_id` 对话续写、reasoning output item passthrough 仍是后续项。
 
 命令行参数覆盖配置文件。`api_key` 是 provider 配置中的具体字段。对需要脱敏的敏感
 配置值，统一使用简单字符串约定：值以 `$` 开头时，`$` 后面的内容作为环境变量名读取
@@ -323,6 +328,24 @@ tools: [
   }
 ]
 ```
+
+OpenAI Responses adapter 将内部 tool schema 转换成 Responses 顶层 function tools：
+
+```text
+tools: [
+  {
+    type: "function",
+    name,
+    description,
+    parameters
+  }
+]
+```
+
+Responses function tool 名称只发送字母、数字、下划线和连字符组成的合法名；例如
+`mcp.local.search` 会在单次请求内稳定映射为 `tool_0`，stream 返回时再映射回内部名。
+assistant 历史里的 tool calls 会转换成 `function_call` input item，tool result 会转换成
+`function_call_output` input item，并使用 `call_id` 关联。
 
 v0.1 内置三个工具：
 

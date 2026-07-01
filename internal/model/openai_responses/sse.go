@@ -48,10 +48,28 @@ func EventsFromChunk(data []byte) ([]model.Event, bool, error) {
 	return newStreamEventDecoder().eventsFromChunk(data)
 }
 
-type streamEventDecoder struct{}
+type streamEventDecoder struct {
+	toolNames *toolNameMapper
+	toolCalls map[int]*responsesToolCallAccumulator
+}
 
-func newStreamEventDecoder() *streamEventDecoder {
-	return &streamEventDecoder{}
+type responsesToolCallAccumulator struct {
+	ItemID    string
+	CallID    string
+	Name      string
+	Arguments strings.Builder
+	Done      bool
+}
+
+func newStreamEventDecoder(toolNames ...*toolNameMapper) *streamEventDecoder {
+	var mapper *toolNameMapper
+	if len(toolNames) > 0 {
+		mapper = toolNames[0]
+	}
+	return &streamEventDecoder{
+		toolNames: mapper,
+		toolCalls: make(map[int]*responsesToolCallAccumulator),
+	}
 }
 
 func (d *streamEventDecoder) EventsFromSSE(data []byte) ([]model.Event, bool, error) {
@@ -86,6 +104,14 @@ func (d *streamEventDecoder) eventsFromChunk(data []byte) ([]model.Event, bool, 
 			return nil, false, nil
 		}
 		return []model.Event{model.TextDeltaEvent{Text: event.Delta}}, false, nil
+	case "response.output_item.added":
+		return d.outputItemAddedEvents(event), false, nil
+	case "response.function_call_arguments.delta":
+		return d.functionCallArgumentsDeltaEvents(event), false, nil
+	case "response.function_call_arguments.done":
+		return d.functionCallArgumentsDoneEvents(event), false, nil
+	case "response.output_item.done":
+		return d.outputItemDoneEvents(event), false, nil
 	case "response.completed":
 		if event.Response == nil || event.Response.Usage == nil {
 			return nil, true, nil
@@ -111,6 +137,120 @@ func (d *streamEventDecoder) eventsFromChunk(data []byte) ([]model.Event, bool, 
 		}
 		return nil, false, nil
 	}
+}
+
+func (d *streamEventDecoder) outputItemAddedEvents(event responseStreamEvent) []model.Event {
+	if event.Item == nil || event.Item.Type != "function_call" {
+		return nil
+	}
+	accumulator := d.toolCallAccumulator(event.OutputIndex)
+	d.applyOutputItem(accumulator, event.Item, false)
+	return nil
+}
+
+func (d *streamEventDecoder) functionCallArgumentsDeltaEvents(event responseStreamEvent) []model.Event {
+	if event.Delta == "" {
+		return nil
+	}
+
+	accumulator := d.toolCallAccumulator(event.OutputIndex)
+	if event.ItemID != "" {
+		accumulator.ItemID = event.ItemID
+	}
+	accumulator.Arguments.WriteString(event.Delta)
+
+	return []model.Event{model.ToolCallDeltaEvent{
+		Index:          event.OutputIndex,
+		ID:             accumulator.CallID,
+		Name:           accumulator.Name,
+		ArgumentsDelta: event.Delta,
+	}}
+}
+
+func (d *streamEventDecoder) functionCallArgumentsDoneEvents(event responseStreamEvent) []model.Event {
+	accumulator := d.toolCallAccumulator(event.OutputIndex)
+	if event.ItemID != "" {
+		accumulator.ItemID = event.ItemID
+	}
+	if event.Arguments != nil {
+		accumulator.setArguments(*event.Arguments)
+	}
+	if event.Item != nil && event.Item.Type == "function_call" {
+		d.applyOutputItem(accumulator, event.Item, true)
+	}
+	return d.toolCallDoneEvents(event.OutputIndex)
+}
+
+func (d *streamEventDecoder) outputItemDoneEvents(event responseStreamEvent) []model.Event {
+	if event.Item == nil || event.Item.Type != "function_call" {
+		return nil
+	}
+	accumulator := d.toolCallAccumulator(event.OutputIndex)
+	d.applyOutputItem(accumulator, event.Item, true)
+	return d.toolCallDoneEvents(event.OutputIndex)
+}
+
+func (d *streamEventDecoder) applyOutputItem(accumulator *responsesToolCallAccumulator, item *responseOutputItem, replaceArguments bool) {
+	if item.ID != "" {
+		accumulator.ItemID = item.ID
+	}
+	if item.CallID != "" {
+		accumulator.CallID = item.CallID
+	}
+	if item.Name != "" {
+		accumulator.Name = d.internalToolName(item.Name)
+	}
+	if replaceArguments {
+		accumulator.setArguments(item.Arguments)
+		return
+	}
+	if item.Arguments != "" && accumulator.Arguments.Len() == 0 {
+		accumulator.Arguments.WriteString(item.Arguments)
+	}
+}
+
+func (d *streamEventDecoder) toolCallDoneEvents(outputIndex int) []model.Event {
+	accumulator := d.toolCalls[outputIndex]
+	if accumulator == nil || accumulator.Done {
+		return nil
+	}
+	if accumulator.CallID == "" || accumulator.Name == "" {
+		return nil
+	}
+
+	arguments := accumulator.Arguments.String()
+	if strings.TrimSpace(arguments) == "" {
+		arguments = "{}"
+	}
+	accumulator.Done = true
+	return []model.Event{model.ToolCallDoneEvent{
+		ToolCall: model.ToolCall{
+			ID:        accumulator.CallID,
+			Name:      accumulator.Name,
+			Arguments: arguments,
+		},
+	}}
+}
+
+func (d *streamEventDecoder) toolCallAccumulator(outputIndex int) *responsesToolCallAccumulator {
+	accumulator := d.toolCalls[outputIndex]
+	if accumulator == nil {
+		accumulator = &responsesToolCallAccumulator{}
+		d.toolCalls[outputIndex] = accumulator
+	}
+	return accumulator
+}
+
+func (d *streamEventDecoder) internalToolName(name string) string {
+	if d.toolNames == nil {
+		return name
+	}
+	return d.toolNames.internalName(name)
+}
+
+func (a *responsesToolCallAccumulator) setArguments(arguments string) {
+	a.Arguments.Reset()
+	a.Arguments.WriteString(arguments)
 }
 
 func isReasoningDeltaEvent(eventType string) bool {
@@ -160,12 +300,24 @@ func appendSSEMessage(messages []SSEMessage, dataLines []string) []SSEMessage {
 }
 
 type responseStreamEvent struct {
-	Type     string          `json:"type"`
-	Delta    string          `json:"delta"`
-	Text     string          `json:"text"`
-	Message  string          `json:"message"`
-	Error    *responseError  `json:"error"`
-	Response *responseObject `json:"response"`
+	Type        string              `json:"type"`
+	Delta       string              `json:"delta"`
+	Text        string              `json:"text"`
+	Message     string              `json:"message"`
+	ItemID      string              `json:"item_id"`
+	OutputIndex int                 `json:"output_index"`
+	Arguments   *string             `json:"arguments"`
+	Item        *responseOutputItem `json:"item"`
+	Error       *responseError      `json:"error"`
+	Response    *responseObject     `json:"response"`
+}
+
+type responseOutputItem struct {
+	Type      string `json:"type"`
+	ID        string `json:"id"`
+	CallID    string `json:"call_id"`
+	Name      string `json:"name"`
+	Arguments string `json:"arguments"`
 }
 
 type responseObject struct {

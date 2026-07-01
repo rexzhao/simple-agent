@@ -124,7 +124,7 @@
 - [x] 添加 Anthropic tool call fixture tests。
 - [x] 在 provider interface 后添加 OpenAI Responses adapter。
 - [x] 添加 Responses semantic streaming fixture tests。
-- [ ] 添加 Responses function call fixture tests。
+- [x] 添加 Responses function call fixture tests。
 
 ## 后续 Skills
 

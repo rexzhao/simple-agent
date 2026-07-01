@@ -82,6 +82,83 @@ func TestEventsFromChunkConvertsReasoningSummaryDelta(t *testing.T) {
 	}
 }
 
+func TestEventsFromSSEConvertsFunctionCallArgumentDeltasAndDoneOnce(t *testing.T) {
+	toolNames := newToolNameMapper([]model.Tool{{Name: "mcp.local.search"}})
+	events, done, err := newStreamEventDecoder(toolNames).EventsFromSSE([]byte(
+		"event: response.output_item.added\n" +
+			"data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"call_1\",\"name\":\"tool_0\",\"arguments\":\"\"}}\n\n" +
+			"event: response.function_call_arguments.delta\n" +
+			"data: {\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"fc_1\",\"output_index\":0,\"delta\":\"{\\\"query\\\":\"}\n\n" +
+			"event: response.function_call_arguments.delta\n" +
+			"data: {\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"fc_1\",\"output_index\":0,\"delta\":\"\\\"needle\\\"}\"}\n\n" +
+			"event: response.function_call_arguments.done\n" +
+			"data: {\"type\":\"response.function_call_arguments.done\",\"item_id\":\"fc_1\",\"output_index\":0,\"arguments\":\"{\\\"query\\\":\\\"needle\\\"}\"}\n\n" +
+			"event: response.output_item.done\n" +
+			"data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"call_1\",\"name\":\"tool_0\",\"arguments\":\"{\\\"query\\\":\\\"needle\\\"}\"}}\n\n",
+	))
+	if err != nil {
+		t.Fatalf("EventsFromSSE() error = %v", err)
+	}
+	if done {
+		t.Fatalf("done = true, want false")
+	}
+	if len(events) != 3 {
+		t.Fatalf("len(events) = %d, want 3: %#v", len(events), events)
+	}
+	firstDelta, ok := events[0].(model.ToolCallDeltaEvent)
+	if !ok {
+		t.Fatalf("event[0] = %T, want model.ToolCallDeltaEvent", events[0])
+	}
+	if firstDelta.Index != 0 || firstDelta.ID != "call_1" || firstDelta.Name != "mcp.local.search" || firstDelta.ArgumentsDelta != `{"query":` {
+		t.Fatalf("first delta = %#v, want mapped call_1 mcp.local.search", firstDelta)
+	}
+	secondDelta, ok := events[1].(model.ToolCallDeltaEvent)
+	if !ok {
+		t.Fatalf("event[1] = %T, want model.ToolCallDeltaEvent", events[1])
+	}
+	if secondDelta.Index != 0 || secondDelta.ID != "call_1" || secondDelta.Name != "mcp.local.search" || secondDelta.ArgumentsDelta != `"needle"}` {
+		t.Fatalf("second delta = %#v, want mapped call_1 mcp.local.search", secondDelta)
+	}
+	doneEvent, ok := events[2].(model.ToolCallDoneEvent)
+	if !ok {
+		t.Fatalf("event[2] = %T, want model.ToolCallDoneEvent", events[2])
+	}
+	want := model.ToolCall{ID: "call_1", Name: "mcp.local.search", Arguments: `{"query":"needle"}`}
+	if doneEvent.ToolCall != want {
+		t.Fatalf("ToolCall = %#v, want %#v", doneEvent.ToolCall, want)
+	}
+}
+
+func TestEventsFromSSEConvertsFunctionCallOutputItemDone(t *testing.T) {
+	events, done, err := EventsFromSSE([]byte(
+		"event: response.output_item.added\n" +
+			"data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"call_1\",\"name\":\"read_file\",\"arguments\":\"\"}}\n\n" +
+			"event: response.function_call_arguments.delta\n" +
+			"data: {\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"fc_1\",\"output_index\":0,\"delta\":\"{\\\"path\\\":\"}\n\n" +
+			"event: response.function_call_arguments.delta\n" +
+			"data: {\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"fc_1\",\"output_index\":0,\"delta\":\"\\\"note.txt\\\"}\"}\n\n" +
+			"event: response.output_item.done\n" +
+			"data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"call_1\",\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"note.txt\\\"}\"}}\n\n",
+	))
+	if err != nil {
+		t.Fatalf("EventsFromSSE() error = %v", err)
+	}
+	if done {
+		t.Fatalf("done = true, want false")
+	}
+	if len(events) != 3 {
+		t.Fatalf("len(events) = %d, want 3: %#v", len(events), events)
+	}
+	doneEvent, ok := events[2].(model.ToolCallDoneEvent)
+	if !ok {
+		t.Fatalf("event[2] = %T, want model.ToolCallDoneEvent", events[2])
+	}
+	want := model.ToolCall{ID: "call_1", Name: "read_file", Arguments: `{"path":"note.txt"}`}
+	if doneEvent.ToolCall != want {
+		t.Fatalf("ToolCall = %#v, want %#v", doneEvent.ToolCall, want)
+	}
+}
+
 func TestEventsFromChunkConvertsErrorEvents(t *testing.T) {
 	events, done, err := EventsFromChunk([]byte(`{
 		"type": "response.failed",

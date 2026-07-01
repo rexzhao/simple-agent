@@ -145,20 +145,36 @@ MCP 放到 MVP 之后。
 
 ## M6：OpenAI Responses Adapter
 
-目标：增加 OpenAI Responses provider adapter。第一小步先接入文本 streaming；
-Responses function calling / tool loop 后续再做。
+目标：增加 OpenAI Responses provider adapter。先接入文本 streaming，再接入 Responses
+function tools / function_call_output，使现有 agent tool loop 能通过 `openai-responses`
+跑通 function tools。
 
 交付物：
 
 - Responses provider 配置。
 - Responses 文本 input mapping。
 - semantic text streaming event 转换。
-- function call event 处理（后续小步）。
+- function tools request mapping，使用顶层 `{type:"function", name, description, parameters}`。
+- 非法内部 tool 名称的请求内稳定 alias mapping，并在 stream 返回时映射回内部名。
+- assistant `ToolCalls` 到 `function_call` input item 的转换。
+- tool result message 到 `function_call_output` input item 的转换。
+- function call argument delta / done / output_item.done event 处理。
+
+后续项：
+
+- custom tools。
+- built-in web/code tools。
+- stateful `previous_response_id` 对话续写。
+- reasoning output item passthrough。
 
 验证：
 
 - Responses text fixture tests 能映射到同一套内部事件流。
 - fake Responses server 能验证 `openai-responses` 请求 `<base_url>/responses` 并流式输出文本。
+- Responses function call fixture tests 能重建 streamed arguments，并只发出一个完整
+  `ToolCallDoneEvent`。
+- fake Responses server 能请求 `read_file`，收到 `function_call` 和
+  `function_call_output` input items 后继续输出最终文本。
 - OpenAI-compatible adapter 不需要为 Responses 做特殊改动。
 
 ## M7：Skills
