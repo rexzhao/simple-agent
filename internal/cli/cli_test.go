@@ -210,6 +210,61 @@ func TestRunUsesDefaultProviderModelAndOutputsTextDelta(t *testing.T) {
 	assertCLIRequestOmitsKey(t, request.Body, "tools")
 }
 
+func TestRunAnthropicMessagesProviderOutputsTextDelta(t *testing.T) {
+	server, requests := newCLIRunServer(t,
+		`{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hello anthropic"}}`,
+		`{"type":"message_stop"}`,
+	)
+	defer server.Close()
+
+	configDir := t.TempDir()
+	writeCLIRunFixtureInDir(t, configDir, server.URL, "anthropic-secret-value", "anthropic-messages")
+
+	var stdout, stderr bytes.Buffer
+	code := RunWithGetwd([]string{"--config-dir", configDir, "run", "Say hi"}, &stdout, &stderr, func() (string, error) {
+		return t.TempDir(), nil
+	})
+
+	if code != 0 {
+		t.Fatalf("RunWithGetwd() code = %d, stderr = %s", code, stderr.String())
+	}
+	if got, want := stdout.String(), "hello anthropic"; got != want {
+		t.Fatalf("stdout = %q, want %q", got, want)
+	}
+	if stderr.String() != "" {
+		t.Fatalf("stderr = %q, want empty", stderr.String())
+	}
+
+	request := <-requests
+	if request.Path != "/messages" {
+		t.Fatalf("request path = %q, want /messages", request.Path)
+	}
+	if request.XAPIKey != "anthropic-secret-value" {
+		t.Fatalf("x-api-key = %q, want Anthropic API key", request.XAPIKey)
+	}
+	if request.AnthropicVersion != "2023-06-01" {
+		t.Fatalf("anthropic-version = %q, want 2023-06-01", request.AnthropicVersion)
+	}
+	if request.ContentType != "application/json" {
+		t.Fatalf("Content-Type = %q, want application/json", request.ContentType)
+	}
+	if got := request.Body["model"]; got != "model-default" {
+		t.Fatalf("model = %#v, want model-default", got)
+	}
+	if got := request.Body["system"]; got != builtInBaseInstructions {
+		t.Fatalf("system = %#v, want built-in instructions", got)
+	}
+	assertJSONNumber(t, request.Body["temperature"], "0.6")
+	assertJSONNumber(t, request.Body["max_tokens"], "128")
+	messages := requestMessages(t, request.Body)
+	if len(messages) != 1 {
+		t.Fatalf("len(messages) = %d, want 1: %#v", len(messages), messages)
+	}
+	assertMessage(t, messages, 0, "user", "Say hi")
+	assertCLIRequestOmitsKey(t, request.Body, "tools")
+	assertNoAdditionalCLIRunRequest(t, requests)
+}
+
 func TestRunExplicitProviderModelSelectsProfileParameters(t *testing.T) {
 	server, requests := newCLIRunServer(t,
 		`{"choices":[{"delta":{"content":"ok"}}]}`,
@@ -853,25 +908,6 @@ func TestRunErrorsDoNotLeakAPIKeyValues(t *testing.T) {
 		assertCLIErrorOmits(t, stderr.String(), "direct-secret-value")
 	})
 
-	t.Run("recognized provider type without run adapter", func(t *testing.T) {
-		configDir := t.TempDir()
-		writeCLIRunFixtureInDir(t, configDir, "https://api.anthropic.com/v1", "direct-secret-value", "anthropic-messages")
-
-		var stdout, stderr bytes.Buffer
-		code := RunWithGetwd([]string{"--config-dir", configDir, "run", "Hello"}, &stdout, &stderr, func() (string, error) {
-			return t.TempDir(), nil
-		})
-
-		if code != 1 {
-			t.Fatalf("RunWithGetwd() code = %d, want 1", code)
-		}
-		if stdout.String() != "" {
-			t.Fatalf("stdout = %q, want empty", stdout.String())
-		}
-		assertCLIErrorContains(t, stderr.String(), `provider type "anthropic-messages" for provider "fake" is recognized`, "adapter is not implemented yet", `currently supports only "openai-chat"`)
-		assertCLIErrorOmits(t, stderr.String(), "direct-secret-value")
-	})
-
 	t.Run("unsupported provider type", func(t *testing.T) {
 		configDir := t.TempDir()
 		writeCLIRunFixtureInDir(t, configDir, "http://127.0.0.1:1", "direct-secret-value", "not-openai")
@@ -1001,10 +1037,13 @@ func writeCLIFile(t *testing.T, path, content string) {
 }
 
 type capturedCLIRunRequest struct {
-	Path          string
-	Authorization string
-	RawBody       []byte
-	Body          map[string]any
+	Path             string
+	Authorization    string
+	XAPIKey          string
+	AnthropicVersion string
+	ContentType      string
+	RawBody          []byte
+	Body             map[string]any
 }
 
 func newCLIRunServer(t *testing.T, chunks ...string) (*httptest.Server, <-chan capturedCLIRunRequest) {
@@ -1017,10 +1056,13 @@ func newCLIRunServer(t *testing.T, chunks ...string) (*httptest.Server, <-chan c
 			t.Errorf("ReadAll() error = %v", err)
 		}
 		requests <- capturedCLIRunRequest{
-			Path:          r.URL.Path,
-			Authorization: r.Header.Get("Authorization"),
-			RawBody:       body,
-			Body:          decodeCLIJSON(t, body),
+			Path:             r.URL.Path,
+			Authorization:    r.Header.Get("Authorization"),
+			XAPIKey:          r.Header.Get("x-api-key"),
+			AnthropicVersion: r.Header.Get("anthropic-version"),
+			ContentType:      r.Header.Get("Content-Type"),
+			RawBody:          body,
+			Body:             decodeCLIJSON(t, body),
 		}
 
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -1043,10 +1085,13 @@ func newSequentialCLIRunServer(t *testing.T, responses ...[]string) (*httptest.S
 			t.Errorf("ReadAll() error = %v", err)
 		}
 		requests <- capturedCLIRunRequest{
-			Path:          r.URL.Path,
-			Authorization: r.Header.Get("Authorization"),
-			RawBody:       body,
-			Body:          decodeCLIJSON(t, body),
+			Path:             r.URL.Path,
+			Authorization:    r.Header.Get("Authorization"),
+			XAPIKey:          r.Header.Get("x-api-key"),
+			AnthropicVersion: r.Header.Get("anthropic-version"),
+			ContentType:      r.Header.Get("Content-Type"),
+			RawBody:          body,
+			Body:             decodeCLIJSON(t, body),
 		}
 
 		mu.Lock()

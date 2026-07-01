@@ -17,6 +17,7 @@ import (
 	eventlog "github.com/rexzhao/simple-agent/internal/logging"
 	"github.com/rexzhao/simple-agent/internal/mcp"
 	"github.com/rexzhao/simple-agent/internal/model"
+	anthropicmessages "github.com/rexzhao/simple-agent/internal/model/anthropic_messages"
 	openaichat "github.com/rexzhao/simple-agent/internal/model/openai_chat"
 	"github.com/rexzhao/simple-agent/internal/tools"
 )
@@ -162,21 +163,11 @@ func runCommand(args []string, configDir string, stdout, stderr io.Writer, getwd
 		return err
 	}
 
-	if selectedProviderName, selectedProvider, ok := selectedProviderForRun(cfg, *providerName); ok {
-		if err := rejectRunProviderWithoutAdapter(selectedProviderName, selectedProvider); err != nil {
-			return err
-		}
-	}
-
 	resolved, err := cfg.ResolveModel(*providerName, *modelProfile)
 	if err != nil {
 		return err
 	}
-	if err := rejectRunProviderWithoutAdapter(resolved.ProviderName, resolved.Provider); err != nil {
-		return err
-	}
-
-	provider, err := openaichat.NewProvider(openAIChatProviderConfig(resolved.Provider))
+	provider, err := newProviderForRun(resolved.ProviderName, resolved.Provider)
 	if err != nil {
 		return err
 	}
@@ -440,32 +431,26 @@ func loadConfig(configDir string, getwd func() (string, error)) (*config.Config,
 	return config.Load(configDir)
 }
 
-func selectedProviderForRun(cfg *config.Config, providerName string) (string, config.ProviderConfig, bool) {
-	providerName = strings.TrimSpace(providerName)
-	if providerName == "" {
-		providerName = strings.TrimSpace(cfg.DefaultProvider)
-	}
-	if providerName == "" {
-		return "", config.ProviderConfig{}, false
-	}
-
-	provider, ok := cfg.Providers[providerName]
-	return providerName, provider, ok
-}
-
-func rejectRunProviderWithoutAdapter(providerName string, provider config.ProviderConfig) error {
+func newProviderForRun(providerName string, provider config.ProviderConfig) (model.Provider, error) {
 	switch provider.Type {
 	case config.ProviderTypeOpenAIChat:
-		return nil
+		return openaichat.NewProvider(openAIChatProviderConfig(provider))
 	case config.ProviderTypeAnthropicMessages:
-		return fmt.Errorf("provider type %q for provider %q is recognized, but the sai run adapter is not implemented yet; sai run currently supports only %q", provider.Type, providerName, config.ProviderTypeOpenAIChat)
+		return anthropicmessages.NewProvider(anthropicMessagesProviderConfig(provider))
 	default:
-		return fmt.Errorf("unsupported provider type %q for provider %q", provider.Type, providerName)
+		return nil, fmt.Errorf("unsupported provider type %q for provider %q", provider.Type, providerName)
 	}
 }
 
 func openAIChatProviderConfig(provider config.ProviderConfig) openaichat.ProviderConfig {
 	return openaichat.ProviderConfig{
+		BaseURL: provider.BaseURL,
+		APIKey:  provider.ResolvedAPIKey,
+	}
+}
+
+func anthropicMessagesProviderConfig(provider config.ProviderConfig) anthropicmessages.ProviderConfig {
+	return anthropicmessages.ProviderConfig{
 		BaseURL: provider.BaseURL,
 		APIKey:  provider.ResolvedAPIKey,
 	}

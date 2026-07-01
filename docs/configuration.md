@@ -109,8 +109,8 @@ models:
 
 - `name`：provider 名称，必须和命令行 `--provider` 可选值一致。
 - `type`：provider adapter 类型。配置层识别 `openai-chat` 和 `anthropic-messages`。
-  `sai run` 当前只实现 `openai-chat`；`anthropic-messages` 是 M5 配置基础，
-  runtime adapter 后续实现。
+  `sai run` 支持 `openai-chat`，也支持 `anthropic-messages` 的文本 streaming；
+  Anthropic tool use adapter 后续实现。
 - `base_url`：provider API base URL。`openai-chat` 不包含 `/chat/completions`；
   `anthropic-messages` 使用 Anthropic Messages API base，例如 `https://api.anthropic.com/v1`。
 - `api_key`：provider 的 API key 配置值，遵循敏感配置值的 `$ENV_NAME` 约定。
@@ -138,8 +138,8 @@ models:
     max_tokens: 2048
 ```
 
-这类配置可以被加载、列入 `sai models list`，并参与模型解析；但 `sai run` 仍会停止并提示
-`anthropic-messages` 已识别、运行 adapter 尚未实现。
+这类配置可以被加载、列入 `sai models list`，并参与模型解析；`sai run` 可以使用
+`anthropic-messages` 做文本 streaming。Anthropic tool use / tool result 转换仍是后续项。
 
 `api_key` 是这次 provider 配置中的具体字段。其他需要脱敏的敏感配置值也可以采用同样
 约定：字符串以 `$` 开头时，`$` 后面的内容作为环境变量名读取实际值；不以 `$` 开头时
