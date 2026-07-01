@@ -67,13 +67,13 @@
 - [x] 定义 tool executor interface。
 - [x] 添加 tool registry。
 - [x] 将内部 tools 转换为 OpenAI-compatible `tools` payload。
-- [ ] 内置 `list_files`。
-- [ ] 内置 `read_file`。
-- [ ] 内置 `shell`。
+- [x] 内置 `list_files`。
+- [x] 内置 `read_file`。
+- [x] 内置 `shell`。
 - [ ] 默认不启用任何工具。
 - [ ] 通过配置 `tools.enabled` 启用工具。
 - [ ] 通过 `--enable-tools` 覆盖配置中的 enabled tools。
-- [ ] `shell` 默认在启动目录执行命令。
+- [x] `shell` 默认在启动目录执行命令。
 - [ ] 累积 streamed tool call arguments。
 - [ ] 执行完整 tool call。
 - [ ] 追加 tool result messages。
