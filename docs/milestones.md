@@ -1,7 +1,8 @@
 # 里程碑
 
-每个里程碑都应该结束于一个可运行状态，并配套一个明确的验证方式。不要在核心事件流
-和 tool loop 稳定之前扩展太多协议。
+每个里程碑都应该结束于一个可运行状态，并配套一个明确的验证方式。MVP 路径是
+M0 到 M3：先把 `sai` 跑起来、能调用模型、能执行基础 tool call，并能单文件分发。
+MCP 放到 MVP 之后。
 
 ## M0：项目骨架和关键决策
 
@@ -15,8 +16,6 @@
 - 支持从当前工作目录或 `--config-dir` 指定目录读取配置。
 - 支持全局配置和每个 provider 一个配置文件的目录布局。
 - 支持 provider 下声明多个 model profile。
-- 支持单独的 `mcp/` 配置目录，每个 MCP server 一个 YAML 文件。
-- 支持 `--enable-mcp` 覆盖 MCP 文件中的 `enabled` 字段。
 - 支持 `tools.enabled` 配置，默认不启用工具。
 - 支持读取启动目录下的 `AGENTS.md`，缺失时继续执行。
 - 明确项目指令优先级：`sai` 内置基础约束 > `AGENTS.md` > 当前用户 prompt。
@@ -83,9 +82,29 @@
 - PaperHub tool call smoke test 已执行，或将不兼容情况记录为已知限制。
 - 达到 `max_turns` 时 agent 给出清晰错误并停止。
 
-## M3：MCP Stdio Tools
+## M3：打包和可用性
 
-目标：将 MCP stdio server 的 tools 暴露给模型调用。
+目标：让 v0.1 成为一个可实际使用的单文件 CLI。
+
+交付物：
+
+- 跨平台 build 命令。
+- version 命令。
+- 可读错误信息。
+- `--verbose` 诊断信息，且不泄露 API key。
+- JSONL 日志，且不泄露 API key 或 Authorization header。
+- 除 JSONL 日志外，不保存会话历史、上下文快照或其他状态。
+- 最小 README 使用说明。
+
+验证：
+
+- Windows 单文件可执行程序能运行 `sai run`。
+- 能产出目标平台构建产物。
+- missing API key、bad base URL、invalid model response 都有可读错误。
+
+## M4：MCP Stdio Tools
+
+目标：在 MVP 可运行、可分发之后，将 MCP stdio server 的 tools 暴露给模型调用。
 
 交付物：
 
@@ -105,26 +124,6 @@
 - `--enable-mcp local` 只启动 `local` MCP server。
 - fake model tool call 能到达 MCP server 并返回结果。
 - `sai` 退出时 MCP 进程一并退出。
-
-## M4：打包和可用性
-
-目标：让 v0.1 成为一个可实际使用的单文件 CLI。
-
-交付物：
-
-- 跨平台 build 命令。
-- version 命令。
-- 可读错误信息。
-- `--verbose` 诊断信息，且不泄露 API key。
-- JSONL 日志，且不泄露 API key 或 Authorization header。
-- 除 JSONL 日志外，不保存会话历史、上下文快照或其他状态。
-- 最小 README 使用说明。
-
-验证：
-
-- Windows 单文件可执行程序能运行 `sai run`。
-- 能产出目标平台构建产物。
-- missing API key、bad base URL、invalid model response 都有可读错误。
 
 ## M5：Anthropic Messages Adapter
 

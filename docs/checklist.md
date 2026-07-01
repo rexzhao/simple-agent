@@ -7,6 +7,7 @@
 - [ ] v0.1 保持纯 CLI，不引入 TUI。
 - [ ] v0.1 聚焦 OpenAI-compatible Chat Completions。
 - [ ] v0.1 不实现 skills。
+- [ ] MVP 不实现 MCP；MCP 从 M4 开始。
 - [ ] 核心 OpenAI-compatible 路径稳定前，不实现 Anthropic Messages。
 - [ ] 核心 OpenAI-compatible 路径稳定前，不实现 OpenAI Responses。
 - [ ] 日志中不打印 API key 或 Authorization header。
@@ -24,8 +25,6 @@
 - [ ] 支持每个 provider 一个独立 YAML 文件。
 - [ ] 支持一个 provider 声明多个 model profile。
 - [ ] 支持每个 model profile 设置自己的请求参数。
-- [ ] 支持每个 MCP server 一个独立 YAML 文件。
-- [ ] 支持 `--enable-mcp` 覆盖 MCP 文件中的 `enabled` 字段。
 - [ ] 默认读取启动目录下的 `AGENTS.md`。
 - [ ] 缺失 `AGENTS.md` 时继续执行。
 - [ ] `--config-dir` 不改变 `AGENTS.md` 查找位置。
@@ -81,7 +80,21 @@
 - [ ] 添加 malformed tool arguments 测试。
 - [ ] 执行 PaperHub tool call smoke test，或记录不兼容限制。
 
-## M3：MCP
+## M3：打包
+
+- [ ] 添加 Windows、Linux、macOS build 命令。
+- [ ] 构建单文件可执行程序。
+- [ ] 添加 `--verbose`。
+- [ ] 添加 JSONL 日志。
+- [ ] 除 JSONL 日志外，不落盘会话历史或上下文快照。
+- [ ] v0.1 不记录完整 prompt、response、tool result 正文。
+- [ ] missing API key 有可读错误。
+- [ ] HTTP failure 有可读错误。
+- [ ] invalid SSE chunk 有可读错误。
+- [ ] 添加最小 README。
+- [ ] 验证 fresh checkout build。
+
+## M4：MCP
 
 - [ ] 添加 `mcp/` 配置目录。
 - [ ] 每个 MCP server 使用一个 YAML 文件。
@@ -97,20 +110,6 @@
 - [ ] 将 MCP tool result 回传给模型。
 - [ ] `sai` 退出时关闭 MCP server 进程。
 - [ ] 添加 fake MCP server 集成测试。
-
-## M4：打包
-
-- [ ] 添加 Windows、Linux、macOS build 命令。
-- [ ] 构建单文件可执行程序。
-- [ ] 添加 `--verbose`。
-- [ ] 添加 JSONL 日志。
-- [ ] 除 JSONL 日志外，不落盘会话历史或上下文快照。
-- [ ] v0.1 不记录完整 prompt、response、tool result 正文。
-- [ ] missing API key 有可读错误。
-- [ ] HTTP failure 有可读错误。
-- [ ] invalid SSE chunk 有可读错误。
-- [ ] 添加最小 README。
-- [ ] 验证 fresh checkout build。
 
 ## 后续协议
 

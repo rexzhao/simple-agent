@@ -38,8 +38,9 @@ logs/
 ```
 
 这些路径都位于配置根目录下。`config.yaml` 是全局配置，负责默认 provider、默认
-model、provider 目录、MCP 目录、工具启用和 agent 通用参数。`providers/*.yaml`
-每个文件描述一个 provider。`mcp/*.yaml` 每个文件描述一个 MCP server。
+model、provider 目录、工具启用和 agent 通用参数。`providers/*.yaml`
+每个文件描述一个 provider。`mcp/*.yaml` 每个文件描述一个 MCP server；MCP 是 M4 后
+能力，不属于 MVP 必需配置。
 
 当配置根目录由 `--config-dir` 指定时，上面的配置文件从该目录读取；`AGENTS.md` 仍从
 启动时当前工作目录读取。
@@ -50,7 +51,6 @@ model、provider 目录、MCP 目录、工具启用和 agent 通用参数。`pro
 default_provider: paperhub
 default_model: glm-5.2
 provider_dir: providers
-mcp_dir: mcp
 
 agent:
   max_turns: 8
@@ -63,6 +63,9 @@ tools:
 logging:
   path: logs/sai.jsonl
   level: info
+
+# M4 后启用
+mcp_dir: mcp
 ```
 
 字段说明：
@@ -70,7 +73,7 @@ logging:
 - `default_provider`：未通过命令行指定 provider 时使用。
 - `default_model`：未通过命令行指定 model 时使用。
 - `provider_dir`：provider 配置文件目录。相对路径基于配置根目录解析。
-- `mcp_dir`：MCP 配置文件目录。相对路径基于配置根目录解析。
+- `mcp_dir`：MCP 配置文件目录。M4 后启用；相对路径基于配置根目录解析。
 - `agent.max_turns`：一次 agent loop 最多请求模型的轮数。
 - `agent.stream`：默认是否启用 streaming。
 - `agent.show_reasoning`：默认是否显示 reasoning stream。
@@ -112,7 +115,7 @@ models:
 model profile 的 key 是 CLI 选择时使用的名字。`id` 是实际传给模型服务的名称。这样可以
 用同一个底层模型创建多个参数不同的 profile。
 
-## MCP 配置
+## MCP 配置（M4 后）
 
 MCP 使用单独目录，不放入 provider 配置。每个 MCP server 一个 YAML 文件。
 

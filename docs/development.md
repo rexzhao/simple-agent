@@ -1,8 +1,8 @@
 # 开发说明
 
 这个项目是一个简易的纯命令行 agent runner，命令名为 `sai`
-（Simple Agent Interface）。第一阶段优先把核心闭环做稳：
-命令行输入、OpenAI-compatible streaming、tool call、MCP stdio。不要引入 TUI，
+（Simple Agent Interface）。MVP 优先把核心闭环做稳：
+命令行输入、OpenAI-compatible streaming、tool call、打包和基础可用性。不要引入 TUI，
 也不要提前实现还没有进入第一阶段的扩展能力。
 
 ## 目标
@@ -11,7 +11,7 @@
 - 第一优先级支持 OpenAI-compatible Chat Completions。
 - 支持 streaming 输出。
 - 支持模型发起 tool call。
-- 支持通过 MCP stdio server 暴露工具。
+- MVP 后支持通过 MCP stdio server 暴露工具。
 - 发布形态尽量保持为单文件可执行程序。
 
 ## 第一阶段假设
@@ -24,7 +24,7 @@
   - API key 环境变量: `PAPERHUB_API_KEY`
 - skills 是后续开发项，v0.1 不实现。
 - Anthropic Messages 和 OpenAI Responses 后续作为独立 provider adapter 接入。
-- MCP 第一阶段只做 stdio。
+- MCP 不属于 MVP 核心；后续接入时第一种传输只做 stdio。
 - 配置默认从启动目录读取，也可以通过 `--config-dir` 指定。
 - 默认读取启动目录下的 `AGENTS.md` 作为项目指令；文件不存在时继续执行。
 - 只落盘 JSONL 日志；会话历史、上下文快照和其他状态暂不落盘。
@@ -38,6 +38,7 @@
 - skill 加载。
 - OpenAI Responses adapter。
 - Anthropic Messages adapter。
+- MCP stdio。
 - remote MCP over HTTP/SSE。
 - 插件市场或插件生命周期管理。
 
@@ -68,7 +69,7 @@ internal/tools
   内置工具定义和执行
 
 internal/mcp
-  MCP stdio client 和 MCP tool adapter
+  MCP stdio client 和 MCP tool adapter，MVP 后实现
 
 internal/logging
   JSONL event log
@@ -112,9 +113,9 @@ v0.1 不需要并发执行 tool call。等真实场景需要时再加。
 sai run "prompt"
 sai chat
 sai tools list
-sai mcp list
 sai models list
 sai config show
+sai mcp list  # M4
 ```
 
 常用参数：
@@ -129,8 +130,8 @@ sai config show
 --show-reasoning
 --max-turns 8
 --enable-tools read_file,list_files,shell
---enable-mcp local
 --verbose
+--enable-mcp local  # M4
 ```
 
 ## 配置形态
@@ -147,7 +148,6 @@ sai config show
 default_provider: paperhub
 default_model: glm-5.2
 provider_dir: providers
-mcp_dir: mcp
 
 agent:
   max_turns: 8
@@ -160,6 +160,9 @@ tools:
 logging:
   path: logs/sai.jsonl
   level: info
+
+# M4 后启用
+mcp_dir: mcp
 ```
 
 ```yaml
@@ -182,7 +185,8 @@ models:
 
 命令行参数覆盖配置文件。环境变量用于提供密钥，但日志中不能打印密钥值。
 `provider_dir` 相对配置根目录解析，除非显式写成绝对路径。
-`mcp_dir` 和 `logging.path` 也相对配置根目录解析，除非显式写成绝对路径。
+`logging.path` 相对配置根目录解析，除非显式写成绝对路径。`mcp_dir` 是 M4 后启用的
+MCP 配置目录，同样相对配置根目录解析。
 
 模型选择发生在会话开始时：
 
@@ -296,6 +300,9 @@ sai run --enable-tools list_files,read_file "列出当前目录"
 改变执行目录，再增加显式参数。
 
 ## MCP
+
+MCP 不属于 MVP 必需能力。先完成 `sai run`、streaming、tool call loop、错误处理、
+JSONL 日志和单文件构建，再实现 MCP。
 
 MCP 使用单独目录配置，不放进 provider 配置。每个 MCP server 一个 YAML 文件，和
 `providers/` 的组织方式保持一致。
