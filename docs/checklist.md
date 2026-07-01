@@ -39,7 +39,7 @@
 
 ## M1：Streaming
 
-- [ ] 实现 OpenAI-compatible request body。
+- [x] 实现 OpenAI-compatible request body。
 - [ ] 从 provider 配置加载 `base_url` 和 `api_key_env`。
 - [ ] 从 model profile 加载模型 id 和模型参数。
 - [ ] 添加 PaperHub provider 配置示例。
@@ -49,12 +49,12 @@
 - [ ] 会话进行中不支持切换模型。
 - [ ] 将 `AGENTS.md` 内容加入本次会话上下文。
 - [ ] 实现 SSE scanner。
-- [ ] 解析 `data: [DONE]`。
-- [ ] 解析 `choices[].delta.content`。
-- [ ] 解析 `choices[].delta.reasoning_content`。
+- [x] 解析 `data: [DONE]`。
+- [x] 解析 `choices[].delta.content`。
+- [x] 解析 `choices[].delta.reasoning_content`。
 - [ ] 默认隐藏 reasoning 输出。
 - [ ] 添加 `--show-reasoning`。
-- [ ] 解析 final `usage`。
+- [x] 解析 final `usage`。
 - [ ] 使用 `PAPERHUB_API_KEY` 验证 PaperHub smoke test。
 - [ ] 验证 non-streaming fallback，或明确记录暂不支持。
 
