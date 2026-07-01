@@ -19,6 +19,7 @@ import (
 	"github.com/rexzhao/simple-agent/internal/model"
 	anthropicmessages "github.com/rexzhao/simple-agent/internal/model/anthropic_messages"
 	openaichat "github.com/rexzhao/simple-agent/internal/model/openai_chat"
+	openairesponses "github.com/rexzhao/simple-agent/internal/model/openai_responses"
 	"github.com/rexzhao/simple-agent/internal/tools"
 )
 
@@ -435,6 +436,8 @@ func newProviderForRun(providerName string, provider config.ProviderConfig) (mod
 	switch provider.Type {
 	case config.ProviderTypeOpenAIChat:
 		return openaichat.NewProvider(openAIChatProviderConfig(provider))
+	case config.ProviderTypeOpenAIResponses:
+		return openairesponses.NewProvider(openAIResponsesProviderConfig(provider))
 	case config.ProviderTypeAnthropicMessages:
 		return anthropicmessages.NewProvider(anthropicMessagesProviderConfig(provider))
 	default:
@@ -444,6 +447,13 @@ func newProviderForRun(providerName string, provider config.ProviderConfig) (mod
 
 func openAIChatProviderConfig(provider config.ProviderConfig) openaichat.ProviderConfig {
 	return openaichat.ProviderConfig{
+		BaseURL: provider.BaseURL,
+		APIKey:  provider.ResolvedAPIKey,
+	}
+}
+
+func openAIResponsesProviderConfig(provider config.ProviderConfig) openairesponses.ProviderConfig {
+	return openairesponses.ProviderConfig{
 		BaseURL: provider.BaseURL,
 		APIKey:  provider.ResolvedAPIKey,
 	}

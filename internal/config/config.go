@@ -27,6 +27,7 @@ type Config struct {
 
 const (
 	ProviderTypeOpenAIChat        = "openai-chat"
+	ProviderTypeOpenAIResponses   = "openai-responses"
 	ProviderTypeAnthropicMessages = "anthropic-messages"
 )
 
@@ -382,7 +383,7 @@ func validateProvider(path string, provider ProviderConfig) error {
 
 func isKnownProviderType(providerType string) bool {
 	switch providerType {
-	case ProviderTypeAnthropicMessages, ProviderTypeOpenAIChat:
+	case ProviderTypeAnthropicMessages, ProviderTypeOpenAIChat, ProviderTypeOpenAIResponses:
 		return true
 	default:
 		return false
@@ -390,7 +391,7 @@ func isKnownProviderType(providerType string) bool {
 }
 
 func formatSupportedProviderTypes() string {
-	return strings.Join([]string{ProviderTypeAnthropicMessages, ProviderTypeOpenAIChat}, ", ")
+	return strings.Join([]string{ProviderTypeAnthropicMessages, ProviderTypeOpenAIChat, ProviderTypeOpenAIResponses}, ", ")
 }
 
 func isYAMLFile(name string) bool {

@@ -108,11 +108,13 @@ models:
 字段说明：
 
 - `name`：provider 名称，必须和命令行 `--provider` 可选值一致。
-- `type`：provider adapter 类型。配置层识别 `openai-chat` 和 `anthropic-messages`。
-  `sai run` 支持 `openai-chat`，也支持 `anthropic-messages` 的文本 streaming；
-  Anthropic tool use adapter 已接入同一套内部 tool loop。
+- `type`：provider adapter 类型。配置层识别 `openai-chat`、`anthropic-messages` 和
+  `openai-responses`。`sai run` 支持 `openai-chat`，也支持 `anthropic-messages`
+  的文本 streaming；Anthropic tool use adapter 已接入同一套内部 tool loop。
+  `openai-responses` 当前支持文本 streaming，function calling 后续再接。
 - `base_url`：provider API base URL。`openai-chat` 不包含 `/chat/completions`；
-  `anthropic-messages` 使用 Anthropic Messages API base，例如 `https://api.anthropic.com/v1`。
+  `anthropic-messages` 使用 Anthropic Messages API base，例如 `https://api.anthropic.com/v1`；
+  `openai-responses` 不包含 `/responses`，例如 `https://api.openai.com/v1`。
 - `api_key`：provider 的 API key 配置值，遵循敏感配置值的 `$ENV_NAME` 约定。
 - `models`：该 provider 下可选的模型配置。
 - `models.<name>.id`：实际发送给 API 的模型 id。
@@ -140,6 +142,29 @@ models:
 
 这类配置可以被加载、列入 `sai models list`，并参与模型解析；`sai run` 可以使用
 `anthropic-messages` 做文本 streaming，并支持 tool use / tool result 转换。
+
+OpenAI Responses provider 使用同一套 provider/model profile 配置形态：
+
+```yaml
+name: openai
+type: openai-responses
+base_url: https://api.openai.com/v1
+api_key: $OPENAI_API_KEY
+
+models:
+  default:
+    id: gpt-5.1
+    max_output_tokens: 4096
+```
+
+这类配置可以被加载、列入 `sai models list`，并参与模型解析；`sai run` 会请求
+`<base_url>/responses` 并转换 Responses semantic text streaming 事件。当前只支持文本
+messages 和文本 delta；tools、assistant tool calls、tool result messages 仍留给后续
+function calling 小步。`openai-responses` 使用 Responses API 的 `max_output_tokens`；
+为兼容已有 profile，adapter 会把 legacy `max_tokens` 请求参数映射为
+`max_output_tokens`，但不会覆盖显式配置的 `max_output_tokens`。在 function calling
+小步前，`openai-responses` 会拒绝 `tools`、`tool_choice` 等 tool/function-calling
+请求参数。
 
 `api_key` 是这次 provider 配置中的具体字段。其他需要脱敏的敏感配置值也可以采用同样
 约定：字符串以 `$` 开头时，`$` 后面的内容作为环境变量名读取实际值；不以 `$` 开头时

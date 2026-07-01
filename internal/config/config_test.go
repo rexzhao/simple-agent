@@ -123,6 +123,70 @@ models:
 	}
 }
 
+func TestLoadRecognizesOpenAIResponsesProvider(t *testing.T) {
+	dir := t.TempDir()
+	providersDir := filepath.Join(dir, "providers")
+	if err := os.MkdirAll(providersDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll() error = %v", err)
+	}
+
+	writeFile(t, filepath.Join(dir, "sai.yaml"), `default_provider: openai
+default_model: default
+provider_dir: providers
+`)
+	writeFile(t, filepath.Join(providersDir, "openai.yaml"), `name: openai
+type: openai-responses
+base_url: https://api.openai.com/v1
+api_key: $OPENAI_API_KEY
+
+models:
+  default:
+    id: gpt-5.1
+    temperature: 0.2
+`)
+
+	cfg, err := Load(dir)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+
+	provider := cfg.Providers["openai"]
+	if provider.Type != ProviderTypeOpenAIResponses {
+		t.Fatalf("provider.Type = %q, want %q", provider.Type, ProviderTypeOpenAIResponses)
+	}
+
+	gotModels := cfg.ModelList()
+	wantModels := []ModelInfo{
+		{Provider: "openai", Profile: "default", ID: "gpt-5.1"},
+	}
+	if len(gotModels) != len(wantModels) {
+		t.Fatalf("len(ModelList()) = %d, want %d: %#v", len(gotModels), len(wantModels), gotModels)
+	}
+	for i := range wantModels {
+		if gotModels[i] != wantModels[i] {
+			t.Fatalf("ModelList()[%d] = %#v, want %#v", i, gotModels[i], wantModels[i])
+		}
+	}
+
+	t.Setenv("OPENAI_API_KEY", "resolved-openai-secret")
+	resolved, err := cfg.ResolveModel("", "")
+	if err != nil {
+		t.Fatalf("ResolveModel() error = %v", err)
+	}
+	if resolved.Provider.Type != ProviderTypeOpenAIResponses {
+		t.Fatalf("resolved.Provider.Type = %q, want %q", resolved.Provider.Type, ProviderTypeOpenAIResponses)
+	}
+	if resolved.ModelID != "gpt-5.1" {
+		t.Fatalf("resolved.ModelID = %q, want gpt-5.1", resolved.ModelID)
+	}
+	if resolved.Provider.ResolvedAPIKey != "resolved-openai-secret" {
+		t.Fatalf("resolved API key = %q, want resolved OpenAI API key", resolved.Provider.ResolvedAPIKey)
+	}
+	if got := resolved.Parameters["temperature"]; got != 0.2 {
+		t.Fatalf("temperature = %#v, want 0.2", got)
+	}
+}
+
 func TestLoadRejectsUnknownProviderType(t *testing.T) {
 	dir := writeConfigFixture(t)
 	writeFile(t, filepath.Join(dir, "providers", "unknown.yaml"), `name: unknown
@@ -136,7 +200,7 @@ models:
 `)
 
 	_, err := Load(dir)
-	assertErrorContains(t, err, `unknown provider type "not-openai"`, "supported provider types: anthropic-messages, openai-chat")
+	assertErrorContains(t, err, `unknown provider type "not-openai"`, "supported provider types: anthropic-messages, openai-chat, openai-responses")
 }
 
 func TestLoadReadsMCPServerYAMLFiles(t *testing.T) {

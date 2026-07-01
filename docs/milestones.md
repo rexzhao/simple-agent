@@ -145,18 +145,20 @@ MCP 放到 MVP 之后。
 
 ## M6：OpenAI Responses Adapter
 
-目标：增加 OpenAI Responses provider adapter。
+目标：增加 OpenAI Responses provider adapter。第一小步先接入文本 streaming；
+Responses function calling / tool loop 后续再做。
 
 交付物：
 
 - Responses provider 配置。
-- Responses input mapping。
-- semantic streaming event 转换。
-- function call event 处理。
+- Responses 文本 input mapping。
+- semantic text streaming event 转换。
+- function call event 处理（后续小步）。
 
 验证：
 
-- Responses fixture tests 能映射到同一套内部事件流。
+- Responses text fixture tests 能映射到同一套内部事件流。
+- fake Responses server 能验证 `openai-responses` 请求 `<base_url>/responses` 并流式输出文本。
 - OpenAI-compatible adapter 不需要为 Responses 做特殊改动。
 
 ## M7：Skills

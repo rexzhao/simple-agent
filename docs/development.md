@@ -25,7 +25,8 @@
 - skills 是后续开发项，v0.1 不实现。
 - M5 已为 Anthropic Messages 添加 provider type 配置识别、示例、文本 streaming
   和 tool use runtime adapter。
-- OpenAI Responses 后续作为独立 provider adapter 接入。
+- M6 第一小步已为 OpenAI Responses 添加 provider type 配置识别、文本 input mapping
+  和 semantic text streaming adapter；Responses function calling 后续再接。
 - MCP 不属于 MVP 核心；后续接入时第一种传输只做 stdio。
 - 配置根目录默认是启动时当前工作目录下的 `.agents`，也可以通过 `--config-dir` 指定。
 - 默认读取启动目录下的 `AGENTS.md` 作为项目指令；文件不存在时继续执行。
@@ -38,7 +39,7 @@
 - multi-agent 编排。
 - 长期记忆。
 - skill 加载。
-- OpenAI Responses adapter。
+- OpenAI Responses function calling。
 - MCP stdio。
 - remote MCP over HTTP/SSE。
 - 插件市场或插件生命周期管理。
@@ -68,6 +69,9 @@ internal/model/openai_chat
 
 internal/model/anthropic_messages
   Anthropic Messages streaming and tool use adapter
+
+internal/model/openai_responses
+  OpenAI Responses text streaming adapter
 
 internal/tools
   内置工具定义和执行
@@ -187,8 +191,10 @@ models:
     max_tokens: 2048
 ```
 
-配置层识别的 provider type 包括 `openai-chat` 和 `anthropic-messages`。当前 `sai run`
-支持 `openai-chat`，也支持 `anthropic-messages` 的文本 streaming 和 tool use。
+配置层识别的 provider type 包括 `openai-chat`、`anthropic-messages` 和
+`openai-responses`。当前 `sai run` 支持 `openai-chat`，也支持
+`anthropic-messages` 的文本 streaming 和 tool use，并支持 `openai-responses` 的
+文本 streaming。Responses function calling 尚未接入。
 
 ```yaml
 # providers/anthropic.yaml
@@ -205,6 +211,23 @@ models:
     id: claude-haiku-4-5
     max_tokens: 2048
 ```
+
+```yaml
+# providers/openai.yaml
+name: openai
+type: openai-responses
+base_url: https://api.openai.com/v1
+api_key: $OPENAI_API_KEY
+
+models:
+  default:
+    id: gpt-5.1
+    max_output_tokens: 4096
+```
+
+`openai-responses` 使用 Responses API 的 `max_output_tokens`。为兼容已有 profile，
+adapter 会把 legacy `max_tokens` 请求参数映射为 `max_output_tokens`；如果显式配置了
+`max_output_tokens`，则保留显式值。
 
 命令行参数覆盖配置文件。`api_key` 是 provider 配置中的具体字段。对需要脱敏的敏感
 配置值，统一使用简单字符串约定：值以 `$` 开头时，`$` 后面的内容作为环境变量名读取

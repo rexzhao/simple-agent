@@ -122,8 +122,8 @@
 - [x] 添加 Anthropic text streaming fixture tests。
 - [x] 实现 Anthropic Messages tool use adapter。
 - [x] 添加 Anthropic tool call fixture tests。
-- [ ] 在 provider interface 后添加 OpenAI Responses adapter。
-- [ ] 添加 Responses semantic streaming fixture tests。
+- [x] 在 provider interface 后添加 OpenAI Responses adapter。
+- [x] 添加 Responses semantic streaming fixture tests。
 - [ ] 添加 Responses function call fixture tests。
 
 ## 后续 Skills

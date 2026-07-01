@@ -19,6 +19,15 @@ import (
 
 func TestModelsListUsesGlobalConfigDirFlag(t *testing.T) {
 	dir := writeCLIFixture(t)
+	writeCLIFile(t, filepath.Join(dir, "providers", "responses.yaml"), `name: openai
+type: openai-responses
+base_url: https://api.openai.com/v1
+api_key: $OPENAI_API_KEY
+
+models:
+  default:
+    id: gpt-5.1
+`)
 
 	var stdout, stderr bytes.Buffer
 	code := RunWithGetwd([]string{"--config-dir", dir, "models", "list"}, &stdout, &stderr, func() (string, error) {
@@ -31,6 +40,7 @@ func TestModelsListUsesGlobalConfigDirFlag(t *testing.T) {
 	out := stdout.String()
 	for _, want := range []string{
 		"PROVIDER\tPROFILE\tMODEL ID",
+		"openai\tdefault\tgpt-5.1",
 		"paperhub\tglm-5.2\tglm-5.2",
 		"paperhub\tglm-5.2-fast\tglm-5.2",
 	} {
@@ -208,6 +218,56 @@ func TestRunUsesDefaultProviderModelAndOutputsTextDelta(t *testing.T) {
 	assertMessage(t, messages, 0, "system", builtInBaseInstructions)
 	assertMessage(t, messages, 1, "user", "Say hi")
 	assertCLIRequestOmitsKey(t, request.Body, "tools")
+}
+
+func TestRunOpenAIResponsesProviderOutputsTextDelta(t *testing.T) {
+	server, requests := newCLIRunServer(t,
+		`{"type":"response.output_text.delta","delta":"hello "}`,
+		`{"type":"response.output_text.delta","delta":"responses"}`,
+		`{"type":"response.completed","response":{"usage":{"input_tokens":3,"output_tokens":5,"total_tokens":8}}}`,
+		`[DONE]`,
+	)
+	defer server.Close()
+
+	configDir := t.TempDir()
+	writeCLIRunFixtureInDir(t, configDir, server.URL, "responses-secret-value", "openai-responses")
+
+	var stdout, stderr bytes.Buffer
+	code := RunWithGetwd([]string{"--config-dir", configDir, "run", "Say hi"}, &stdout, &stderr, func() (string, error) {
+		return t.TempDir(), nil
+	})
+
+	if code != 0 {
+		t.Fatalf("RunWithGetwd() code = %d, stderr = %s", code, stderr.String())
+	}
+	if got, want := stdout.String(), "hello responses"; got != want {
+		t.Fatalf("stdout = %q, want %q", got, want)
+	}
+	if stderr.String() != "" {
+		t.Fatalf("stderr = %q, want empty", stderr.String())
+	}
+
+	request := <-requests
+	if request.Path != "/responses" {
+		t.Fatalf("request path = %q, want /responses", request.Path)
+	}
+	if request.Authorization != "Bearer responses-secret-value" {
+		t.Fatalf("Authorization = %q, want Responses API key", request.Authorization)
+	}
+	if request.ContentType != "application/json" {
+		t.Fatalf("Content-Type = %q, want application/json", request.ContentType)
+	}
+	if got := request.Body["model"]; got != "model-default" {
+		t.Fatalf("model = %#v, want model-default", got)
+	}
+	assertJSONNumber(t, request.Body["temperature"], "0.6")
+	assertJSONNumber(t, request.Body["max_output_tokens"], "128")
+	assertCLIRequestOmitsKey(t, request.Body, "max_tokens")
+	input := requestInput(t, request.Body)
+	assertMessage(t, input, 0, "system", builtInBaseInstructions)
+	assertMessage(t, input, 1, "user", "Say hi")
+	assertCLIRequestOmitsKey(t, request.Body, "tools")
+	assertNoAdditionalCLIRunRequest(t, requests)
 }
 
 func TestRunAnthropicMessagesProviderOutputsTextDelta(t *testing.T) {
@@ -972,7 +1032,7 @@ func TestRunErrorsDoNotLeakAPIKeyValues(t *testing.T) {
 		if code != 1 {
 			t.Fatalf("RunWithGetwd() code = %d, want 1", code)
 		}
-		assertCLIErrorContains(t, stderr.String(), `unknown provider type "not-openai"`, "supported provider types: anthropic-messages, openai-chat")
+		assertCLIErrorContains(t, stderr.String(), `unknown provider type "not-openai"`, "supported provider types: anthropic-messages, openai-chat, openai-responses")
 		assertCLIErrorOmits(t, stderr.String(), "direct-secret-value")
 	})
 }
@@ -1266,6 +1326,16 @@ func requestMessages(t *testing.T, body map[string]any) []any {
 		t.Fatalf("messages = %T, want []any", body["messages"])
 	}
 	return messages
+}
+
+func requestInput(t *testing.T, body map[string]any) []any {
+	t.Helper()
+
+	input, ok := body["input"].([]any)
+	if !ok {
+		t.Fatalf("input = %T, want []any", body["input"])
+	}
+	return input
 }
 
 func assertMessage(t *testing.T, messages []any, index int, role, content string) {
