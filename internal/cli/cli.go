@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/rexzhao/simple-agent/internal/config"
 	projectcontext "github.com/rexzhao/simple-agent/internal/context"
@@ -181,17 +182,29 @@ func roleForInstruction(source projectcontext.InstructionSource) model.MessageRo
 }
 
 func writeStream(stdout io.Writer, events <-chan model.Event, showReasoning bool) error {
+	needsReasoningBreak := false
+	reasoningEndedWithNewline := false
 	for event := range events {
 		switch event := event.(type) {
 		case model.TextDeltaEvent:
+			if event.Text != "" && needsReasoningBreak {
+				if !reasoningEndedWithNewline {
+					if _, err := fmt.Fprint(stdout, "\n"); err != nil {
+						return err
+					}
+				}
+				needsReasoningBreak = false
+			}
 			if _, err := fmt.Fprint(stdout, event.Text); err != nil {
 				return err
 			}
 		case model.ReasoningDeltaEvent:
-			if showReasoning {
+			if showReasoning && event.Text != "" {
 				if _, err := fmt.Fprint(stdout, event.Text); err != nil {
 					return err
 				}
+				needsReasoningBreak = true
+				reasoningEndedWithNewline = strings.HasSuffix(event.Text, "\n")
 			}
 		case model.ErrorEvent:
 			return streamError(event)

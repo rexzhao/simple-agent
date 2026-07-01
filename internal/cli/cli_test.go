@@ -246,7 +246,54 @@ func TestRunReasoningIsHiddenUnlessShowReasoningIsSet(t *testing.T) {
 		if code != 0 {
 			t.Fatalf("RunWithGetwd() code = %d, stderr = %s", code, stderr.String())
 		}
-		if got, want := stdout.String(), "shownvisible"; got != want {
+		if got, want := stdout.String(), "shown\nvisible"; got != want {
+			t.Fatalf("stdout = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("flag does not duplicate reasoning newline", func(t *testing.T) {
+		server, _ := newCLIRunServer(t,
+			`{"choices":[{"delta":{"reasoning_content":"shown\n"}}]}`,
+			`{"choices":[{"delta":{"content":"visible"}}]}`,
+			`[DONE]`,
+		)
+		defer server.Close()
+
+		configDir := t.TempDir()
+		writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
+
+		var stdout, stderr bytes.Buffer
+		code := RunWithGetwd([]string{"--config-dir", configDir, "run", "--show-reasoning", "Think"}, &stdout, &stderr, func() (string, error) {
+			return t.TempDir(), nil
+		})
+
+		if code != 0 {
+			t.Fatalf("RunWithGetwd() code = %d, stderr = %s", code, stderr.String())
+		}
+		if got, want := stdout.String(), "shown\nvisible"; got != want {
+			t.Fatalf("stdout = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("flag without reasoning does not add newline", func(t *testing.T) {
+		server, _ := newCLIRunServer(t,
+			`{"choices":[{"delta":{"content":"visible"}}]}`,
+			`[DONE]`,
+		)
+		defer server.Close()
+
+		configDir := t.TempDir()
+		writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
+
+		var stdout, stderr bytes.Buffer
+		code := RunWithGetwd([]string{"--config-dir", configDir, "run", "--show-reasoning", "Think"}, &stdout, &stderr, func() (string, error) {
+			return t.TempDir(), nil
+		})
+
+		if code != 0 {
+			t.Fatalf("RunWithGetwd() code = %d, stderr = %s", code, stderr.String())
+		}
+		if got, want := stdout.String(), "visible"; got != want {
 			t.Fatalf("stdout = %q, want %q", got, want)
 		}
 	})

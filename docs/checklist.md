@@ -56,7 +56,7 @@
 - [x] 解析 `choices[].delta.reasoning_content`。
 - [x] 默认隐藏 reasoning 输出。
 - [x] 添加 `--show-reasoning`。
-- [ ] `--show-reasoning` 输出 reasoning 结束后强制换行，避免和最终消息混行。
+- [x] `--show-reasoning` 输出 reasoning 结束后强制换行，避免和最终消息混行。
 - [x] 解析 final `usage`。
 - [x] 使用 `PAPERHUB_API_KEY` 验证 PaperHub smoke test。
 - [ ] 验证 non-streaming fallback，或明确记录暂不支持。
