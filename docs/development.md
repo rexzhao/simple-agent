@@ -23,8 +23,8 @@
   - Model: `glm-5.2`
   - API key 配置: `api_key: $PAPERHUB_API_KEY`
 - skills 是后续开发项，v0.1 不实现。
-- M5 已为 Anthropic Messages 添加 provider type 配置识别、示例和文本 streaming
-  runtime adapter；tool call 转换后续接入。
+- M5 已为 Anthropic Messages 添加 provider type 配置识别、示例、文本 streaming
+  和 tool use runtime adapter。
 - OpenAI Responses 后续作为独立 provider adapter 接入。
 - MCP 不属于 MVP 核心；后续接入时第一种传输只做 stdio。
 - 配置根目录默认是启动时当前工作目录下的 `.agents`，也可以通过 `--config-dir` 指定。
@@ -39,7 +39,6 @@
 - 长期记忆。
 - skill 加载。
 - OpenAI Responses adapter。
-- Anthropic Messages tool use adapter。
 - MCP stdio。
 - remote MCP over HTTP/SSE。
 - 插件市场或插件生命周期管理。
@@ -68,7 +67,7 @@ internal/model/openai_chat
   OpenAI-compatible Chat Completions adapter
 
 internal/model/anthropic_messages
-  Anthropic Messages text streaming adapter
+  Anthropic Messages streaming and tool use adapter
 
 internal/tools
   内置工具定义和执行
@@ -189,8 +188,7 @@ models:
 ```
 
 配置层识别的 provider type 包括 `openai-chat` 和 `anthropic-messages`。当前 `sai run`
-支持 `openai-chat`，也支持 `anthropic-messages` 的文本 streaming；Anthropic tool use
-仍是后续接入项。
+支持 `openai-chat`，也支持 `anthropic-messages` 的文本 streaming 和 tool use。
 
 ```yaml
 # providers/anthropic.yaml

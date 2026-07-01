@@ -114,6 +114,9 @@ func TestStreamMalformedToolArgumentsAppendsToolErrorAndContinues(t *testing.T) 
 
 	secondMessages := provider.requests[1].Messages
 	assertAgentMessage(t, secondMessages[2], model.MessageRoleTool, result.Content, "call_1")
+	if !secondMessages[2].IsError {
+		t.Fatalf("tool result message IsError = false, want true")
+	}
 }
 
 func TestStreamStopsWithClearErrorAtMaxTurns(t *testing.T) {

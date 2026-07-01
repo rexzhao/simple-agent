@@ -64,6 +64,7 @@ func run(ctx context.Context, request model.Request, options Options, maxTurns i
 				Role:       model.MessageRoleTool,
 				Content:    result.Content,
 				ToolCallID: result.ToolCallID,
+				IsError:    result.IsError,
 			})
 		}
 

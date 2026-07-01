@@ -100,3 +100,91 @@ func TestStreamEventDecoderCarriesMessageStartInputTokensIntoUsage(t *testing.T)
 		t.Fatalf("Usage = %#v, want %#v", got.Usage, want)
 	}
 }
+
+func TestStreamEventDecoderAccumulatesToolUseInputJSONDeltas(t *testing.T) {
+	decoder := newStreamEventDecoder(newToolNameMapper([]model.Tool{
+		{Name: "mcp.local.search"},
+	}))
+
+	events, done, err := decoder.EventsFromSSE([]byte(
+		"event: content_block_start\n" +
+			`data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"call_search","name":"tool_0","input":{}}}` + "\n\n" +
+			"event: content_block_delta\n" +
+			`data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"query\":\""}}` + "\n\n" +
+			"event: content_block_delta\n" +
+			`data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"needle\"}"}}` + "\n\n" +
+			"event: content_block_stop\n" +
+			`data: {"type":"content_block_stop","index":0}` + "\n\n" +
+			"event: message_stop\n" +
+			`data: {"type":"message_stop"}` + "\n\n",
+	))
+	if err != nil {
+		t.Fatalf("EventsFromSSE() error = %v", err)
+	}
+	if !done {
+		t.Fatalf("done = false, want true")
+	}
+	if len(events) != 4 {
+		t.Fatalf("len(events) = %d, want 4: %#v", len(events), events)
+	}
+
+	start, ok := events[0].(model.ToolCallDeltaEvent)
+	if !ok {
+		t.Fatalf("event[0] = %T, want model.ToolCallDeltaEvent", events[0])
+	}
+	if start.ID != "call_search" || start.Name != "mcp.local.search" || start.ArgumentsDelta != "" {
+		t.Fatalf("start delta = %#v, want mapped tool start", start)
+	}
+
+	firstDelta, ok := events[1].(model.ToolCallDeltaEvent)
+	if !ok {
+		t.Fatalf("event[1] = %T, want model.ToolCallDeltaEvent", events[1])
+	}
+	if firstDelta.ArgumentsDelta != `{"query":"` {
+		t.Fatalf("first ArgumentsDelta = %q, want first partial JSON chunk", firstDelta.ArgumentsDelta)
+	}
+	secondDelta, ok := events[2].(model.ToolCallDeltaEvent)
+	if !ok {
+		t.Fatalf("event[2] = %T, want model.ToolCallDeltaEvent", events[2])
+	}
+	if secondDelta.ArgumentsDelta != `needle"}` {
+		t.Fatalf("second ArgumentsDelta = %q, want second partial JSON chunk", secondDelta.ArgumentsDelta)
+	}
+
+	doneEvent, ok := events[3].(model.ToolCallDoneEvent)
+	if !ok {
+		t.Fatalf("event[3] = %T, want model.ToolCallDoneEvent", events[3])
+	}
+	want := model.ToolCall{ID: "call_search", Name: "mcp.local.search", Arguments: `{"query":"needle"}`}
+	if doneEvent.ToolCall != want {
+		t.Fatalf("ToolCall = %#v, want %#v", doneEvent.ToolCall, want)
+	}
+}
+
+func TestStreamEventDecoderUsesToolUseStartInputWhenNoDeltasArrive(t *testing.T) {
+	events, done, err := EventsFromSSE([]byte(
+		"event: content_block_start\n" +
+			`data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"call_read","name":"read_file","input":{"path":"note.txt"}}}` + "\n\n" +
+			"event: content_block_stop\n" +
+			`data: {"type":"content_block_stop","index":0}` + "\n\n" +
+			"event: message_stop\n" +
+			`data: {"type":"message_stop"}` + "\n\n",
+	))
+	if err != nil {
+		t.Fatalf("EventsFromSSE() error = %v", err)
+	}
+	if !done {
+		t.Fatalf("done = false, want true")
+	}
+	if len(events) != 2 {
+		t.Fatalf("len(events) = %d, want 2: %#v", len(events), events)
+	}
+	doneEvent, ok := events[1].(model.ToolCallDoneEvent)
+	if !ok {
+		t.Fatalf("event[1] = %T, want model.ToolCallDoneEvent", events[1])
+	}
+	want := model.ToolCall{ID: "call_read", Name: "read_file", Arguments: `{"path":"note.txt"}`}
+	if doneEvent.ToolCall != want {
+		t.Fatalf("ToolCall = %#v, want %#v", doneEvent.ToolCall, want)
+	}
+}

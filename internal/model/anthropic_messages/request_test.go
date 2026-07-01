@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"encoding/json"
 	"reflect"
-	"strings"
 	"testing"
 
 	"github.com/rexzhao/simple-agent/internal/model"
@@ -42,54 +41,116 @@ func TestBuildRequestBodyMapsSystemMessagesAndTextMessages(t *testing.T) {
 	}`)
 }
 
-func TestBuildRequestBodyRejectsToolUseUntilImplemented(t *testing.T) {
-	tests := []struct {
-		name    string
-		request model.Request
-		want    string
-	}{
-		{
-			name: "request tools",
-			request: model.Request{
-				Tools: []model.Tool{{Name: "read_file"}},
+func TestBuildRequestBodyMapsToolsAssistantToolUseAndToolResults(t *testing.T) {
+	body, err := BuildRequestBody(model.Request{
+		Model: "claude-sonnet-5",
+		Messages: []model.Message{
+			{Role: model.MessageRoleUser, Content: "Search local files"},
+			{
+				Role:    model.MessageRoleAssistant,
+				Content: "I'll search.",
+				ToolCalls: []model.ToolCall{
+					{ID: "call_search", Name: "mcp.local.search", Arguments: `{"query":"needle"}`},
+					{ID: "call_read", Name: "read_file"},
+				},
 			},
-			want: "request tools are not supported",
+			{Role: model.MessageRoleTool, ToolCallID: "call_search", Content: "found"},
+			{Role: model.MessageRoleTool, ToolCallID: "call_read", Content: "missing file", IsError: true},
 		},
-		{
-			name: "tool result message",
-			request: model.Request{
-				Messages: []model.Message{{Role: model.MessageRoleTool, Content: "result", ToolCallID: "call_1"}},
-			},
-			want: "tool result messages are not supported",
-		},
-		{
-			name: "assistant tool calls",
-			request: model.Request{
-				Messages: []model.Message{
-					{
-						Role:      model.MessageRoleAssistant,
-						ToolCalls: []model.ToolCall{{ID: "call_1", Name: "read_file"}},
+		Tools: []model.Tool{
+			{
+				Name:        "read_file",
+				Description: "Read a file.",
+				InputSchema: map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"path": map[string]any{"type": "string"},
 					},
 				},
 			},
-			want: "assistant tool calls are not supported",
+			{
+				Name:        "mcp.local.search",
+				Description: "Search local data.",
+			},
 		},
+	}, true)
+	if err != nil {
+		t.Fatalf("BuildRequestBody() error = %v", err)
 	}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			body, err := BuildRequestBody(tt.request, true)
-			if err == nil {
-				t.Fatalf("BuildRequestBody() error = nil, want unsupported tool use error; body = %s", body)
+	assertJSONEqual(t, body, `{
+		"model": "claude-sonnet-5",
+		"messages": [
+			{"role": "user", "content": "Search local files"},
+			{
+				"role": "assistant",
+				"content": [
+					{"type": "text", "text": "I'll search."},
+					{"type": "tool_use", "id": "call_search", "name": "tool_0", "input": {"query": "needle"}},
+					{"type": "tool_use", "id": "call_read", "name": "read_file", "input": {}}
+				]
+			},
+			{
+				"role": "user",
+				"content": [
+					{"type": "tool_result", "tool_use_id": "call_search", "content": "found"},
+					{"type": "tool_result", "tool_use_id": "call_read", "content": "missing file", "is_error": true}
+				]
 			}
-			message := err.Error()
-			for _, want := range []string{toolUseNotImplementedMessage, tt.want} {
-				if !strings.Contains(message, want) {
-					t.Fatalf("error = %q, want contain %q", message, want)
+		],
+		"stream": true,
+		"tools": [
+			{
+				"name": "read_file",
+				"description": "Read a file.",
+				"input_schema": {
+					"type": "object",
+					"properties": {
+						"path": {"type": "string"}
+					}
+				}
+			},
+			{
+				"name": "tool_0",
+				"description": "Search local data.",
+				"input_schema": {
+					"type": "object",
+					"properties": {}
 				}
 			}
-		})
+		]
+	}`)
+}
+
+func TestBuildRequestBodyAvoidsAnthropicToolNameAliasConflicts(t *testing.T) {
+	body, err := BuildRequestBody(model.Request{
+		Model: "claude-sonnet-5",
+		Tools: []model.Tool{
+			{Name: "tool_0", Description: "Already legal."},
+			{Name: "mcp.local.search", Description: "Needs an alias."},
+		},
+	}, false)
+	if err != nil {
+		t.Fatalf("BuildRequestBody() error = %v", err)
 	}
+
+	assertJSONEqual(t, body, `{
+		"model": "claude-sonnet-5",
+		"messages": [],
+		"stream": false,
+		"tools": [
+			{
+				"name": "tool_0",
+				"description": "Already legal.",
+				"input_schema": {"type": "object", "properties": {}}
+			},
+			{
+				"name": "tool_1",
+				"description": "Needs an alias.",
+				"input_schema": {"type": "object", "properties": {}}
+			}
+		]
+	}`)
 }
 
 func assertJSONEqual(t *testing.T, got []byte, want string) {

@@ -1,6 +1,7 @@
 package anthropicmessages
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -51,10 +52,26 @@ func EventsFromChunk(data []byte) ([]model.Event, bool, error) {
 type streamEventDecoder struct {
 	inputTokens int
 	hasInput    bool
+	toolNames   *toolNameMapper
+	toolUses    map[int]*anthropicToolUseAccumulator
 }
 
-func newStreamEventDecoder() *streamEventDecoder {
-	return &streamEventDecoder{}
+type anthropicToolUseAccumulator struct {
+	ID         string
+	Name       string
+	StartInput string
+	Arguments  strings.Builder
+}
+
+func newStreamEventDecoder(toolNames ...*toolNameMapper) *streamEventDecoder {
+	var mapper *toolNameMapper
+	if len(toolNames) > 0 {
+		mapper = toolNames[0]
+	}
+	return &streamEventDecoder{
+		toolNames: mapper,
+		toolUses:  make(map[int]*anthropicToolUseAccumulator),
+	}
 }
 
 func (d *streamEventDecoder) EventsFromSSE(data []byte) ([]model.Event, bool, error) {
@@ -86,8 +103,12 @@ func (d *streamEventDecoder) eventsFromChunk(data []byte) ([]model.Event, bool, 
 			d.hasInput = true
 		}
 		return nil, false, nil
+	case "content_block_start":
+		return d.contentBlockStartEvents(chunk), false, nil
 	case "content_block_delta":
-		return contentBlockDeltaEvents(chunk.Delta), false, nil
+		return d.contentBlockDeltaEvents(chunk), false, nil
+	case "content_block_stop":
+		return d.contentBlockStopEvents(chunk.Index), false, nil
 	case "message_delta":
 		if chunk.Usage == nil {
 			return nil, false, nil
@@ -100,25 +121,92 @@ func (d *streamEventDecoder) eventsFromChunk(data []byte) ([]model.Event, bool, 
 	}
 }
 
-func contentBlockDeltaEvents(delta anthropicDelta) []model.Event {
-	switch delta.Type {
+func (d *streamEventDecoder) contentBlockStartEvents(chunk anthropicStreamEvent) []model.Event {
+	block := chunk.ContentBlock
+	if block == nil || block.Type != "tool_use" {
+		return nil
+	}
+
+	name := d.internalToolName(block.Name)
+	d.toolUses[chunk.Index] = &anthropicToolUseAccumulator{
+		ID:         block.ID,
+		Name:       name,
+		StartInput: compactRawJSON(block.Input),
+	}
+	return []model.Event{model.ToolCallDeltaEvent{
+		Index: chunk.Index,
+		ID:    block.ID,
+		Name:  name,
+	}}
+}
+
+func (d *streamEventDecoder) contentBlockDeltaEvents(chunk anthropicStreamEvent) []model.Event {
+	switch chunk.Delta.Type {
 	case "text_delta":
-		if delta.Text == "" {
+		if chunk.Delta.Text == "" {
 			return nil
 		}
-		return []model.Event{model.TextDeltaEvent{Text: delta.Text}}
+		return []model.Event{model.TextDeltaEvent{Text: chunk.Delta.Text}}
 	case "thinking_delta":
-		text := delta.Thinking
+		text := chunk.Delta.Thinking
 		if text == "" {
-			text = delta.Text
+			text = chunk.Delta.Text
 		}
 		if text == "" {
 			return nil
 		}
 		return []model.Event{model.ReasoningDeltaEvent{Text: text}}
+	case "input_json_delta":
+		accumulator := d.toolUseAccumulator(chunk.Index)
+		accumulator.Arguments.WriteString(chunk.Delta.PartialJSON)
+		return []model.Event{model.ToolCallDeltaEvent{
+			Index:          chunk.Index,
+			ID:             accumulator.ID,
+			Name:           accumulator.Name,
+			ArgumentsDelta: chunk.Delta.PartialJSON,
+		}}
 	default:
 		return nil
 	}
+}
+
+func (d *streamEventDecoder) contentBlockStopEvents(index int) []model.Event {
+	accumulator, ok := d.toolUses[index]
+	if !ok {
+		return nil
+	}
+	delete(d.toolUses, index)
+
+	arguments := accumulator.Arguments.String()
+	if arguments == "" {
+		arguments = accumulator.StartInput
+	}
+	if strings.TrimSpace(arguments) == "" {
+		arguments = "{}"
+	}
+	return []model.Event{model.ToolCallDoneEvent{
+		ToolCall: model.ToolCall{
+			ID:        accumulator.ID,
+			Name:      accumulator.Name,
+			Arguments: arguments,
+		},
+	}}
+}
+
+func (d *streamEventDecoder) toolUseAccumulator(index int) *anthropicToolUseAccumulator {
+	accumulator := d.toolUses[index]
+	if accumulator == nil {
+		accumulator = &anthropicToolUseAccumulator{}
+		d.toolUses[index] = accumulator
+	}
+	return accumulator
+}
+
+func (d *streamEventDecoder) internalToolName(name string) string {
+	if d.toolNames == nil {
+		return name
+	}
+	return d.toolNames.internalName(name)
 }
 
 func (d *streamEventDecoder) usageEvent(usage *anthropicUsage) model.UsageEvent {
@@ -156,10 +244,12 @@ func appendSSEMessage(messages []SSEMessage, dataLines []string) []SSEMessage {
 }
 
 type anthropicStreamEvent struct {
-	Type    string            `json:"type"`
-	Message *anthropicMessage `json:"message"`
-	Delta   anthropicDelta    `json:"delta"`
-	Usage   *anthropicUsage   `json:"usage"`
+	Type         string                 `json:"type"`
+	Index        int                    `json:"index"`
+	Message      *anthropicMessage      `json:"message"`
+	ContentBlock *anthropicContentBlock `json:"content_block"`
+	Delta        anthropicDelta         `json:"delta"`
+	Usage        *anthropicUsage        `json:"usage"`
 }
 
 type anthropicMessage struct {
@@ -167,12 +257,33 @@ type anthropicMessage struct {
 }
 
 type anthropicDelta struct {
-	Type     string `json:"type"`
-	Text     string `json:"text"`
-	Thinking string `json:"thinking"`
+	Type        string `json:"type"`
+	Text        string `json:"text"`
+	Thinking    string `json:"thinking"`
+	PartialJSON string `json:"partial_json"`
+}
+
+type anthropicContentBlock struct {
+	Type  string          `json:"type"`
+	ID    string          `json:"id"`
+	Name  string          `json:"name"`
+	Input json.RawMessage `json:"input"`
 }
 
 type anthropicUsage struct {
 	InputTokens  *int `json:"input_tokens"`
 	OutputTokens *int `json:"output_tokens"`
+}
+
+func compactRawJSON(raw json.RawMessage) string {
+	raw = bytes.TrimSpace(raw)
+	if len(raw) == 0 || bytes.Equal(raw, []byte("null")) {
+		return ""
+	}
+
+	var buffer bytes.Buffer
+	if err := json.Compact(&buffer, raw); err != nil {
+		return string(raw)
+	}
+	return buffer.String()
 }

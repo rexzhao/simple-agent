@@ -265,6 +265,58 @@ func TestRunAnthropicMessagesProviderOutputsTextDelta(t *testing.T) {
 	assertNoAdditionalCLIRunRequest(t, requests)
 }
 
+func TestRunAnthropicMessagesProviderExecutesToolUseAndReturnsToolResult(t *testing.T) {
+	server, requests := newSequentialCLIRunServer(t,
+		[]string{
+			`{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"call_read","name":"read_file","input":{}}}`,
+			`{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"path\":\"note.txt\"}"}}`,
+			`{"type":"content_block_stop","index":0}`,
+			`{"type":"message_stop"}`,
+		},
+		[]string{
+			`{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"done"}}`,
+			`{"type":"message_stop"}`,
+		},
+	)
+	defer server.Close()
+
+	projectDir := t.TempDir()
+	writeCLIFile(t, filepath.Join(projectDir, "note.txt"), "tool output")
+	configDir := t.TempDir()
+	writeCLIRunFixtureInDir(t, configDir, server.URL, "anthropic-secret-value", "anthropic-messages")
+
+	var stdout, stderr bytes.Buffer
+	code := RunWithGetwd([]string{"--config-dir", configDir, "run", "--enable-tools", "read_file", "Read note"}, &stdout, &stderr, func() (string, error) {
+		return projectDir, nil
+	})
+
+	if code != 0 {
+		t.Fatalf("RunWithGetwd() code = %d, stderr = %s", code, stderr.String())
+	}
+	if got, want := stdout.String(), "done"; got != want {
+		t.Fatalf("stdout = %q, want %q", got, want)
+	}
+
+	firstRequest := <-requests
+	if firstRequest.Path != "/messages" {
+		t.Fatalf("first request path = %q, want /messages", firstRequest.Path)
+	}
+	assertCLIAnthropicToolNames(t, firstRequest.Body, []string{"read_file"})
+
+	secondRequest := <-requests
+	if secondRequest.Path != "/messages" {
+		t.Fatalf("second request path = %q, want /messages", secondRequest.Path)
+	}
+	messages := requestMessages(t, secondRequest.Body)
+	if len(messages) != 3 {
+		t.Fatalf("len(second request messages) = %d, want 3: %#v", len(messages), messages)
+	}
+	assertMessage(t, messages, 0, "user", "Read note")
+	assertAnthropicAssistantToolUseMessage(t, messages, 1, "call_read", "read_file", "path", "note.txt")
+	assertAnthropicToolResultMessage(t, messages, 2, "call_read", "tool output")
+	assertNoAdditionalCLIRunRequest(t, requests)
+}
+
 func TestRunExplicitProviderModelSelectsProfileParameters(t *testing.T) {
 	server, requests := newCLIRunServer(t,
 		`{"choices":[{"delta":{"content":"ok"}}]}`,
@@ -1300,11 +1352,122 @@ func assertToolMessage(t *testing.T, messages []any, index int, toolCallID, cont
 	}
 }
 
+func assertAnthropicAssistantToolUseMessage(t *testing.T, messages []any, index int, id, name, inputKey, inputValue string) {
+	t.Helper()
+
+	if index >= len(messages) {
+		t.Fatalf("missing message %d in %#v", index, messages)
+	}
+	message, ok := messages[index].(map[string]any)
+	if !ok {
+		t.Fatalf("message[%d] = %T, want object", index, messages[index])
+	}
+	if got := message["role"]; got != "assistant" {
+		t.Fatalf("message[%d].role = %#v, want assistant", index, got)
+	}
+	blocks, ok := message["content"].([]any)
+	if !ok {
+		t.Fatalf("message[%d].content = %T, want []any", index, message["content"])
+	}
+	if len(blocks) != 1 {
+		t.Fatalf("len(message[%d].content) = %d, want 1: %#v", index, len(blocks), blocks)
+	}
+	block, ok := blocks[0].(map[string]any)
+	if !ok {
+		t.Fatalf("message[%d].content[0] = %T, want object", index, blocks[0])
+	}
+	if got := block["type"]; got != "tool_use" {
+		t.Fatalf("message[%d].content[0].type = %#v, want tool_use", index, got)
+	}
+	if got := block["id"]; got != id {
+		t.Fatalf("message[%d].content[0].id = %#v, want %q", index, got, id)
+	}
+	if got := block["name"]; got != name {
+		t.Fatalf("message[%d].content[0].name = %#v, want %q", index, got, name)
+	}
+	input, ok := block["input"].(map[string]any)
+	if !ok {
+		t.Fatalf("message[%d].content[0].input = %T, want object", index, block["input"])
+	}
+	if got := input[inputKey]; got != inputValue {
+		t.Fatalf("message[%d].content[0].input[%q] = %#v, want %q", index, inputKey, got, inputValue)
+	}
+}
+
+func assertAnthropicToolResultMessage(t *testing.T, messages []any, index int, toolUseID, content string) {
+	t.Helper()
+
+	if index >= len(messages) {
+		t.Fatalf("missing message %d in %#v", index, messages)
+	}
+	message, ok := messages[index].(map[string]any)
+	if !ok {
+		t.Fatalf("message[%d] = %T, want object", index, messages[index])
+	}
+	if got := message["role"]; got != "user" {
+		t.Fatalf("message[%d].role = %#v, want user", index, got)
+	}
+	blocks, ok := message["content"].([]any)
+	if !ok {
+		t.Fatalf("message[%d].content = %T, want []any", index, message["content"])
+	}
+	if len(blocks) != 1 {
+		t.Fatalf("len(message[%d].content) = %d, want 1: %#v", index, len(blocks), blocks)
+	}
+	block, ok := blocks[0].(map[string]any)
+	if !ok {
+		t.Fatalf("message[%d].content[0] = %T, want object", index, blocks[0])
+	}
+	if got := block["type"]; got != "tool_result" {
+		t.Fatalf("message[%d].content[0].type = %#v, want tool_result", index, got)
+	}
+	if got := block["tool_use_id"]; got != toolUseID {
+		t.Fatalf("message[%d].content[0].tool_use_id = %#v, want %q", index, got, toolUseID)
+	}
+	if got := block["content"]; got != content {
+		t.Fatalf("message[%d].content[0].content = %#v, want %q", index, got, content)
+	}
+	if got, ok := block["is_error"]; ok && got != false {
+		t.Fatalf("message[%d].content[0].is_error = %#v, want absent or false", index, got)
+	}
+}
+
 func assertCLIRequestOmitsKey(t *testing.T, body map[string]any, key string) {
 	t.Helper()
 
 	if _, ok := body[key]; ok {
 		t.Fatalf("request body contains unexpected key %q: %#v", key, body[key])
+	}
+}
+
+func assertCLIAnthropicToolNames(t *testing.T, body map[string]any, want []string) {
+	t.Helper()
+
+	toolsValue, ok := body["tools"].([]any)
+	if !ok {
+		t.Fatalf("tools = %T(%#v), want []any", body["tools"], body["tools"])
+	}
+	if len(toolsValue) != len(want) {
+		t.Fatalf("len(tools) = %d, want %d: %#v", len(toolsValue), len(want), toolsValue)
+	}
+	for i, wantName := range want {
+		tool, ok := toolsValue[i].(map[string]any)
+		if !ok {
+			t.Fatalf("tools[%d] = %T, want object", i, toolsValue[i])
+		}
+		if got := tool["name"]; got != wantName {
+			t.Fatalf("tools[%d].name = %#v, want %q", i, got, wantName)
+		}
+		if got := tool["description"]; got == "" {
+			t.Fatalf("tools[%d].description is empty", i)
+		}
+		inputSchema, ok := tool["input_schema"].(map[string]any)
+		if !ok {
+			t.Fatalf("tools[%d].input_schema = %T, want object", i, tool["input_schema"])
+		}
+		if got := inputSchema["type"]; got != "object" {
+			t.Fatalf("tools[%d].input_schema.type = %#v, want object", i, got)
+		}
 	}
 }
 

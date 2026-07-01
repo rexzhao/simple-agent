@@ -28,6 +28,7 @@ type Message struct {
 	Content    string
 	ToolCallID string
 	ToolCalls  []ToolCall
+	IsError    bool
 }
 
 type Tool struct {
