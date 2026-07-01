@@ -21,7 +21,7 @@
 - 第一阶段真实测试服务使用 PaperHub：
   - Base URL: `https://tc-paperhub.diezhi.net/v1`
   - Model: `glm-5.2`
-  - API key 环境变量: `PAPERHUB_API_KEY`
+  - API key 配置: `api_key: $PAPERHUB_API_KEY`
 - skills 是后续开发项，v0.1 不实现。
 - Anthropic Messages 和 OpenAI Responses 后续作为独立 provider adapter 接入。
 - MCP 不属于 MVP 核心；后续接入时第一种传输只做 stdio。
@@ -125,7 +125,6 @@ sai mcp list  # M4
 --model glm-5.2
 --config-dir ./config
 --base-url https://tc-paperhub.diezhi.net/v1
---api-key-env PAPERHUB_API_KEY
 --no-stream
 --show-reasoning
 --max-turns 8
@@ -170,7 +169,7 @@ mcp_dir: mcp
 name: paperhub
 type: openai-chat
 base_url: https://tc-paperhub.diezhi.net/v1
-api_key_env: PAPERHUB_API_KEY
+api_key: $PAPERHUB_API_KEY
 
 models:
   glm-5.2:
@@ -183,7 +182,10 @@ models:
     max_tokens: 2048
 ```
 
-命令行参数覆盖配置文件。环境变量用于提供密钥，但日志中不能打印密钥值。
+命令行参数覆盖配置文件。`api_key` 是 provider 配置中的具体字段。对需要脱敏的敏感
+配置值，统一使用简单字符串约定：值以 `$` 开头时，`$` 后面的内容作为环境变量名读取
+实际值；不以 `$` 开头时表示直接配置值。无论实际值来自环境变量还是直接配置，日志、
+verbose 输出和 resolved config 都不能打印实际值。
 `provider_dir` 相对配置根目录解析，除非显式写成绝对路径。
 `logging.path` 相对配置根目录解析，除非显式写成绝对路径。`mcp_dir` 是 M4 后启用的
 MCP 配置目录，同样相对配置根目录解析。
@@ -354,8 +356,8 @@ model
 ```
 
 工具调用、usage、HTTP 错误、MCP 错误可以写入日志。API key、Authorization header
-和其他密钥不能写入日志。v0.1 不记录完整 prompt、response、tool result 正文，也不提供
-开启正文日志的配置。
+和其他敏感配置值的实际值不能写入日志。v0.1 不记录完整 prompt、response、
+tool result 正文，也不提供开启正文日志的配置。
 
 ## 测试策略
 

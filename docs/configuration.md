@@ -92,7 +92,7 @@ mcp_dir: mcp
 name: paperhub
 type: openai-chat
 base_url: https://tc-paperhub.diezhi.net/v1
-api_key_env: PAPERHUB_API_KEY
+api_key: $PAPERHUB_API_KEY
 
 models:
   glm-5.2:
@@ -110,13 +110,18 @@ models:
 - `name`：provider 名称，必须和命令行 `--provider` 可选值一致。
 - `type`：provider adapter 类型。v0.1 只实现 `openai-chat`。
 - `base_url`：OpenAI-compatible API base URL，不包含 `/chat/completions`。
-- `api_key_env`：读取 API key 的环境变量名。
+- `api_key`：provider 的 API key 配置值，遵循敏感配置值的 `$ENV_NAME` 约定。
 - `models`：该 provider 下可选的模型配置。
 - `models.<name>.id`：实际发送给 API 的模型 id。
 - `models.<name>.*`：该 model profile 的请求参数。
 
 model profile 的 key 是 CLI 选择时使用的名字。`id` 是实际传给模型服务的名称。这样可以
 用同一个底层模型创建多个参数不同的 profile。
+
+`api_key` 是这次 provider 配置中的具体字段。其他需要脱敏的敏感配置值也可以采用同样
+约定：字符串以 `$` 开头时，`$` 后面的内容作为环境变量名读取实际值；不以 `$` 开头时
+表示直接配置值。无论实际值来自环境变量还是直接配置，logs、verbose、resolved config
+等输出都不能泄露实际值。
 
 ## MCP 配置（M4 后）
 
@@ -225,8 +230,9 @@ v0.1 不支持会话进行中切换模型。`sai chat` 进入会话后，provide
 2. model profile 参数。
 3. 命令行参数。
 
-命令行参数只覆盖明确传入的值。API key 从环境变量读取，不能写入 resolved config 输出，
-也不能出现在 verbose 日志中。
+命令行参数只覆盖明确传入的值。`api_key` 和其他敏感配置值遵循上述 `$ENV_NAME`
+约定；无论实际值来自环境变量还是直接配置，都不能写入 resolved config 输出，也不能
+出现在 verbose 日志中。
 
 ## 日志
 
@@ -239,5 +245,5 @@ logging:
 ```
 
 每行日志是一个 JSON object。日志可以记录模型请求生命周期、工具调用、usage、HTTP 错误
-和 MCP 错误。API key、Authorization header 和其他密钥不能进入日志。v0.1 不记录完整
-prompt、response、tool result 正文，也不提供开启正文日志的配置。
+和 MCP 错误。API key、Authorization header 和其他敏感配置值的实际值不能进入日志。
+v0.1 不记录完整 prompt、response、tool result 正文，也不提供开启正文日志的配置。

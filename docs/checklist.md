@@ -10,7 +10,7 @@
 - [ ] MVP 不实现 MCP；MCP 从 M4 开始。
 - [ ] 核心 OpenAI-compatible 路径稳定前，不实现 Anthropic Messages。
 - [ ] 核心 OpenAI-compatible 路径稳定前，不实现 OpenAI Responses。
-- [ ] 日志中不打印 API key 或 Authorization header。
+- [ ] 日志、verbose、resolved config 中不打印 API key、Authorization header 或其他敏感配置值的实际值。
 
 ## M0：项目骨架
 
@@ -40,7 +40,7 @@
 ## M1：Streaming
 
 - [x] 实现 OpenAI-compatible request body。
-- [ ] 从 provider 配置加载 `base_url` 和 `api_key_env`。
+- [ ] 从 provider 配置加载 `base_url` 和 `api_key`。
 - [ ] 从 model profile 加载模型 id 和模型参数。
 - [ ] 添加 PaperHub provider 配置示例。
 - [ ] 支持会话开始时通过 `--provider` 和 `--model` 选择模型。

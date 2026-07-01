@@ -28,7 +28,7 @@ MCP 放到 MVP 之后。
 验证：
 
 - `go test ./...` 通过。
-- `sai config show` 能输出不含密钥的解析后配置。
+- `sai config show` 能输出不含 API key 或其他敏感配置值实际值的解析后配置。
 - `sai config show --config-dir ./example-config` 能从指定配置根目录的 `sai.yaml` 读取配置。
 - `sai models list` 能列出配置中的 provider/model。
 - `sai` 在启动目录存在 `AGENTS.md` 时能加载项目指令。
@@ -93,8 +93,8 @@ MCP 放到 MVP 之后。
 - 跨平台 build 命令。
 - version 命令。
 - 可读错误信息。
-- `--verbose` 诊断信息，且不泄露 API key。
-- JSONL 日志，且不泄露 API key 或 Authorization header。
+- `--verbose` 诊断信息，且不泄露 API key 或其他敏感配置值的实际值。
+- JSONL 日志，且不泄露 API key、Authorization header 或其他敏感配置值的实际值。
 - 除 JSONL 日志外，不保存会话历史、上下文快照或其他状态。
 - 最小 README 使用说明。
 
