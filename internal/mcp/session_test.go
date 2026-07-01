@@ -13,7 +13,7 @@ import (
 	"github.com/rexzhao/simple-agent/internal/config"
 )
 
-func TestStartStdioSessionInitializesAndCloseExits(t *testing.T) {
+func TestStartStdioSessionInitializesListsToolsAndCloseExits(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
@@ -34,6 +34,20 @@ func TestStartStdioSessionInitializesAndCloseExits(t *testing.T) {
 	}
 	if result.ServerInfo.Name != "fake-mcp" {
 		t.Fatalf("server name = %q, want fake-mcp", result.ServerInfo.Name)
+	}
+
+	tools, err := session.ListTools(ctx)
+	if err != nil {
+		t.Fatalf("ListTools() error = %v", err)
+	}
+	if len(tools) != 2 {
+		t.Fatalf("ListTools() returned %d tools, want 2", len(tools))
+	}
+	if tools[0].Name != "first_tool" || tools[1].Name != "second_tool" {
+		t.Fatalf("ListTools() names = %q, %q; want first_tool, second_tool", tools[0].Name, tools[1].Name)
+	}
+	if got := tools[0].InputSchema["type"]; got != "object" {
+		t.Fatalf("first tool input schema type = %v, want object", got)
 	}
 
 	if err := session.Close(); err != nil {
@@ -74,17 +88,17 @@ func runFakeMCPServer() int {
 		return 4
 	}
 
-	response := initializeResponse{
+	response := rpcResponse{
 		JSONRPC: "2.0",
 		ID:      request.ID,
-		Result: InitializeResult{
+		Result: mustMarshalJSON(InitializeResult{
 			ProtocolVersion: request.Params.ProtocolVersion,
 			Capabilities:    map[string]any{},
 			ServerInfo: PartyInfo{
 				Name:    "fake-mcp",
 				Version: "test",
 			},
-		},
+		}),
 	}
 	if err := writeTestMessage(os.Stdout, response); err != nil {
 		return 5
@@ -103,13 +117,74 @@ func runFakeMCPServer() int {
 	}
 
 	for {
-		if _, err := readMessageLine(reader); err != nil {
+		payload, err := readMessageLine(reader)
+		if err != nil {
 			if errors.Is(err, io.EOF) {
 				return 0
 			}
 			return 9
 		}
+
+		var request struct {
+			JSONRPC string `json:"jsonrpc"`
+			ID      int    `json:"id"`
+			Method  string `json:"method"`
+			Params  struct {
+				Cursor string `json:"cursor"`
+			} `json:"params"`
+		}
+		if err := json.Unmarshal(payload, &request); err != nil {
+			return 10
+		}
+		if request.JSONRPC != "2.0" || request.Method != "tools/list" {
+			return 11
+		}
+
+		result := listToolsResult{
+			Tools: []ToolDefinition{
+				{
+					Name:        "first_tool",
+					Description: "first test tool",
+					InputSchema: map[string]any{
+						"type": "object",
+					},
+				},
+			},
+			NextCursor: "second-page",
+		}
+		if request.Params.Cursor == "second-page" {
+			result = listToolsResult{
+				Tools: []ToolDefinition{
+					{
+						Name:        "second_tool",
+						Description: "second test tool",
+						InputSchema: map[string]any{
+							"type": "object",
+						},
+					},
+				},
+			}
+		} else if request.Params.Cursor != "" {
+			return 12
+		}
+
+		response := rpcResponse{
+			JSONRPC: "2.0",
+			ID:      request.ID,
+			Result:  mustMarshalJSON(result),
+		}
+		if err := writeTestMessage(os.Stdout, response); err != nil {
+			return 13
+		}
 	}
+}
+
+func mustMarshalJSON(value any) json.RawMessage {
+	payload, err := json.Marshal(value)
+	if err != nil {
+		panic(err)
+	}
+	return payload
 }
 
 func writeTestMessage(w io.Writer, message any) error {

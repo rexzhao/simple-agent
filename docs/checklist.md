@@ -105,7 +105,7 @@
 - [x] 通过 `--enable-mcp` 覆盖 MCP 文件中的 `enabled` 字段。
 - [x] 启动 stdio MCP server 进程。
 - [x] 发送 MCP initialize request。
-- [ ] 列出 MCP tools。
+- [x] 列出 MCP tools。
 - [ ] 将 MCP tools 转换为内部 tool schema。
 - [ ] MCP tool 名称固定为 `mcp.<server>.<tool>`。
 - [ ] MCP tools 仍受 enabled tools 列表控制。

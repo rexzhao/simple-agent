@@ -23,6 +23,9 @@ type Session struct {
 	stdin  io.WriteCloser
 	stdout *bufio.Reader
 
+	requestMu sync.Mutex
+	nextID    int
+
 	closeOnce sync.Once
 	closeErr  error
 }
@@ -36,6 +39,12 @@ type InitializeResult struct {
 type PartyInfo struct {
 	Name    string `json:"name"`
 	Version string `json:"version,omitempty"`
+}
+
+type ToolDefinition struct {
+	Name        string         `json:"name"`
+	Description string         `json:"description,omitempty"`
+	InputSchema map[string]any `json:"inputSchema,omitempty"`
 }
 
 func StartStdioSession(ctx context.Context, server config.MCPServerConfig) (*Session, InitializeResult, error) {
@@ -65,6 +74,7 @@ func StartStdioSession(ctx context.Context, server config.MCPServerConfig) (*Ses
 		cmd:    cmd,
 		stdin:  stdin,
 		stdout: bufio.NewReader(stdout),
+		nextID: 1,
 	}
 	result, err := session.initialize(ctx)
 	if err != nil {
@@ -99,37 +109,16 @@ func (s *Session) Close() error {
 }
 
 func (s *Session) initialize(ctx context.Context) (InitializeResult, error) {
-	request := rpcRequest{
-		JSONRPC: "2.0",
-		ID:      1,
-		Method:  "initialize",
-		Params: initializeParams{
-			ProtocolVersion: protocolVersion,
-			Capabilities:    map[string]any{},
-			ClientInfo: PartyInfo{
-				Name:    "sai",
-				Version: "dev",
-			},
+	var result InitializeResult
+	if err := s.call(ctx, "initialize", initializeParams{
+		ProtocolVersion: protocolVersion,
+		Capabilities:    map[string]any{},
+		ClientInfo: PartyInfo{
+			Name:    "sai",
+			Version: "dev",
 		},
-	}
-	if err := s.writeMessage(request); err != nil {
+	}, &result); err != nil {
 		return InitializeResult{}, err
-	}
-
-	payload, err := s.readMessage(ctx)
-	if err != nil {
-		return InitializeResult{}, err
-	}
-
-	var response initializeResponse
-	if err := json.Unmarshal(payload, &response); err != nil {
-		return InitializeResult{}, fmt.Errorf("decode initialize response: %w", err)
-	}
-	if response.Error != nil {
-		return InitializeResult{}, fmt.Errorf("initialize response error %d: %s", response.Error.Code, response.Error.Message)
-	}
-	if response.JSONRPC != "2.0" {
-		return InitializeResult{}, fmt.Errorf("initialize response has jsonrpc %q", response.JSONRPC)
 	}
 
 	notification := rpcNotification{
@@ -140,7 +129,82 @@ func (s *Session) initialize(ctx context.Context) (InitializeResult, error) {
 	if err := s.writeMessage(notification); err != nil {
 		return InitializeResult{}, err
 	}
-	return response.Result, nil
+	return result, nil
+}
+
+func (s *Session) ListTools(ctx context.Context) ([]ToolDefinition, error) {
+	var tools []ToolDefinition
+	cursor := ""
+	for {
+		page, nextCursor, err := s.listToolsPage(ctx, cursor)
+		if err != nil {
+			return nil, err
+		}
+		tools = append(tools, page...)
+		if nextCursor == "" {
+			return tools, nil
+		}
+		cursor = nextCursor
+	}
+}
+
+func (s *Session) listToolsPage(ctx context.Context, cursor string) ([]ToolDefinition, string, error) {
+	var params any
+	if cursor != "" {
+		params = listToolsParams{Cursor: cursor}
+	}
+
+	var result listToolsResult
+	if err := s.call(ctx, "tools/list", params, &result); err != nil {
+		return nil, "", err
+	}
+	return result.Tools, result.NextCursor, nil
+}
+
+func (s *Session) call(ctx context.Context, method string, params any, result any) error {
+	s.requestMu.Lock()
+	defer s.requestMu.Unlock()
+
+	id := s.nextID
+	s.nextID++
+	request := rpcRequest{
+		JSONRPC: "2.0",
+		ID:      id,
+		Method:  method,
+		Params:  params,
+	}
+	if err := s.writeMessage(request); err != nil {
+		return err
+	}
+
+	payload, err := s.readMessage(ctx)
+	if err != nil {
+		return err
+	}
+
+	var response rpcResponse
+	if err := json.Unmarshal(payload, &response); err != nil {
+		return fmt.Errorf("decode %s response: %w", method, err)
+	}
+	if response.JSONRPC != "2.0" {
+		return fmt.Errorf("%s response has jsonrpc %q", method, response.JSONRPC)
+	}
+	if response.ID != id {
+		return fmt.Errorf("%s response id = %d, want %d", method, response.ID, id)
+	}
+	if response.Error != nil {
+		return fmt.Errorf("%s response error %d: %s", method, response.Error.Code, response.Error.Message)
+	}
+	if result == nil {
+		return nil
+	}
+	if len(response.Result) == 0 {
+		return fmt.Errorf("%s response missing result", method)
+	}
+	if err := json.Unmarshal(response.Result, result); err != nil {
+		return fmt.Errorf("decode %s result: %w", method, err)
+	}
+	return nil
 }
 
 func (s *Session) writeMessage(message any) error {
@@ -218,11 +282,20 @@ type initializeParams struct {
 	ClientInfo      PartyInfo      `json:"clientInfo"`
 }
 
-type initializeResponse struct {
-	JSONRPC string           `json:"jsonrpc"`
-	ID      int              `json:"id"`
-	Result  InitializeResult `json:"result"`
-	Error   *rpcError        `json:"error"`
+type listToolsParams struct {
+	Cursor string `json:"cursor,omitempty"`
+}
+
+type listToolsResult struct {
+	Tools      []ToolDefinition `json:"tools"`
+	NextCursor string           `json:"nextCursor,omitempty"`
+}
+
+type rpcResponse struct {
+	JSONRPC string          `json:"jsonrpc"`
+	ID      int             `json:"id"`
+	Result  json.RawMessage `json:"result"`
+	Error   *rpcError       `json:"error"`
 }
 
 type rpcError struct {
