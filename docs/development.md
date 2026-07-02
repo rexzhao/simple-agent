@@ -148,8 +148,11 @@ v0.1 不需要并发执行 tool call。等真实场景需要时再加。
 目标命令：
 
 ```text
-sai chat ["prompt"]
-sai chat --quit "prompt"
+sai chat [--prompt "prompt"]
+sai chat --prompt "prompt" --quit
+sai chat --save-session --prompt "prompt" --quit
+sai chat --resume <id> --prompt "prompt" --quit
+sai chat --continue --prompt "prompt" --quit
 sai tools list
 sai models list
 sai config show
@@ -192,10 +195,11 @@ help 输出写到 stdout，exit code 为 0。help 必须在配置加载前完成
 `Run "sai help" for usage.` 的提示。
 
 根层解析从 argv 左到右扫描，跳过已知 flag 及其 value；第一个真正的非 flag token 是命令。
-带值 flag 的 value 不参与命令识别，因此 `sai --model fast chat "hi" --quit` 中的 `fast`
-不是命令。命令 token 之外的参数交给对应命令解析，命令前后的 flags 都可以和 positional
-参数混排。全局 `--config-dir` 也可以放在命令后，例如 `sai models list --config-dir
-./config` 或 `sai chat "hi" --config-dir ./config --quit`。`-h` / `--help` 在命令范围内
+带值 flag 的 value 不参与命令识别，因此 `sai --model fast chat --prompt "hi" --quit` 中的
+`fast` 不是命令。命令 token 之外的参数交给对应命令解析，命令前后的 flags 可以混排；
+chat 初始 prompt 使用 `--prompt`，不使用 positional 参数。全局 `--config-dir` 也可以放在
+命令后，例如 `sai models list --config-dir ./config` 或
+`sai chat --prompt "hi" --config-dir ./config --quit`。`-h` / `--help` 在命令范围内
 优先显示 help，且不加载配置。`--` 终止 flag 解析；其后的 token 全部作为 positional，
 不再被识别为 help、`--config-dir` 或命令参数 flag。
 
@@ -225,26 +229,44 @@ skills 和 reasoning 展示设置；会话进行中不支持模型切换或额�
 可选初始 prompt 和 `--quit`：
 
 ```text
-sai chat "先回答这个问题，然后进入 REPL"
-sai chat --quit "只跑这一轮然后退出"
+sai chat --prompt "先回答这个问题，然后进入 REPL"
+sai chat --prompt "只跑这一轮然后退出" --quit
 sai chat --provider paperhub --model glm-5.2
 sai chat --enable-tools list_files,read_file
 sai chat --enable-mcp local --enable-tools mcp.local.some_tool
+sai chat --save-session --prompt "保存这一轮" --quit
+sai chat --resume 20260702T030405.000000000Z-a1b2c3d4 --prompt "继续" --quit
+sai chat --continue --prompt "继续最近会话" --quit
 ```
 
 无初始 prompt 时，输入从 stdin 逐行读取，空白行忽略。`/exit`、`/quit` 或 EOF 正常退出。
-有初始 prompt 且没有 `--quit` 时，先完整执行该 prompt 的一轮 agent loop，成功后补齐
+有 `--prompt` 且没有 `--quit` 时，先完整执行该 prompt 的一轮 agent loop，成功后补齐
 必要换行并进入同一 REPL，会话历史包含初始 prompt、assistant 消息和 tool messages。
-有初始 prompt 且带 `--quit` 时，只执行这一轮然后退出，不进入 REPL。`--quit` 没有初始
-prompt 时作为用法错误处理。`chat` 命令的 flags 和唯一初始 prompt 可以混排，例如
-`sai chat "hi" --model fast --quit`。REPL prompt 写到 stderr（例如 `> `），模型输出继续
+有 `--prompt` 且带 `--quit` 时，只执行这一轮然后退出，不进入 REPL。`--quit` 没有
+`--prompt` 时作为用法错误处理。`chat` 命令的 flags 可以混排，例如
+`sai chat --prompt "hi" --model fast --quit`；positional 参数不再作为初始 prompt。REPL
+prompt 写到 stderr（例如 `> `），模型输出继续
 通过现有 `writeStream` streaming 到 stdout，包括 reasoning 的隐藏、显示和终端样式规则。
 
-chat 会话历史只保存在当前进程内。每一轮成功后，agent 返回 updated messages，供下一轮
+未启用 resumable sessions 时，chat 会话历史只保存在当前进程内。每一轮成功后，agent 返回 updated messages，供下一轮
 请求复用；其中包括原有 messages、当前 user message、assistant tool calls、tool result
 messages 和最终 assistant 文本。model stream error 仍通过 error event 失败，不伪造成功
-assistant 历史，也不继续下一轮。除 JSONL 日志外，chat 不落盘会话历史、上下文快照或
+assistant 历史，也不继续下一轮。默认除 JSONL 日志外，chat 不落盘会话历史、上下文快照或
 prompt/response/tool result 正文。MCP stdio server 在 chat 会话开始时启动，退出时关闭。
+
+M13 后，`sai chat --save-session` 或配置 `sessions.enabled: true` 会在每个成功 turn 后
+把完整 updated messages 保存到 `sessions.dir/<id>/session.json`。这包含完整用户输入、
+assistant 输出、assistant tool calls 和 tool result messages，属于显式 opt-in 的敏感
+内容落盘能力。`sai chat --resume <id>` 从指定 session 恢复 messages，`sai chat
+--continue` 等价于恢复最近更新的 session；二者互斥。恢复后可以带 `--prompt` 和 `--quit`
+继续一轮，也可以不带 `--prompt` 进入 REPL。
+
+恢复时优先使用 session 文件中保存的 provider、model profile、model id、model parameters、
+enabled tools、enabled MCP、enabled skills 和 show_reasoning 来准备 runtime，避免“恢复了
+messages 却发给不同模型或工具集合”。如果本次命令显式传入了冲突的 `--provider`、
+`--model`、`--enable-tools`、`--enable-mcp`、`--enable-skills`、`--disable-skills` 或
+`--show-reasoning`，命令会失败并给出可读错误。可靠保存和恢复要求
+`sessions.save_tool_results: true`；设为 `false` 时，`sai chat` 会拒绝启用保存或恢复。
 
 ## 配置形态
 
@@ -360,7 +382,7 @@ stateful `previous_response_id` 对话续写、reasoning output item passthrough
 模型选择发生在会话开始时：
 
 ```text
-sai chat --quit --provider paperhub --model glm-5.2 "你是谁？"
+sai chat --quit --provider paperhub --model glm-5.2 --prompt "你是谁？"
 sai chat --provider paperhub --model glm-5.2
 ```
 
@@ -512,7 +534,7 @@ tools:
 ```
 
 ```text
-sai chat --quit --enable-tools list_files,read_file "列出当前目录"
+sai chat --quit --enable-tools list_files,read_file --prompt "列出当前目录"
 ```
 
 `--enable-tools` 覆盖配置文件中的 enabled tools 列表，而不是追加。`shell`、`write_file`
@@ -554,7 +576,7 @@ MCP tool 名称必须使用 `mcp.<server>.<tool>` 形式，避免和内置工具
 MCP server 启用列表完全由该参数决定，忽略 MCP 文件中的 `enabled` 字段。
 
 ```text
-sai chat --quit --enable-mcp local --enable-tools mcp.local.some_tool "使用 MCP 工具"
+sai chat --quit --enable-mcp local --enable-tools mcp.local.some_tool --prompt "使用 MCP 工具"
 ```
 
 v0.1 中 MCP server 进程生命周期由当前 agent 进程管理。后台常驻管理后续再做。
@@ -597,6 +619,9 @@ profile parameters、cwd、配置根目录、启用 tools/MCP/skills/reasoning�
 tool result messages。缺少这些信息时，只能得到 transcript 或诊断日志，不能承诺可靠
 resume。
 
+当前 M13 已接入 `sai chat --save-session`、`sai chat --resume <id>` 和
+`sai chat --continue`。`sai sessions list/show/delete/prune` 仍是后续管理命令，暂未实现。
+
 ## 测试策略
 
 测试分三层：
@@ -610,13 +635,13 @@ OpenAI-compatible `tools` / `tool_calls` 的真实兼容性。若服务不支持
 并将 PaperHub 的 tool calling 标记为已知限制。
 
 2026-07-01 已执行 PaperHub tool call smoke test。命令形态为：
-`go run ./cmd/sai --config-dir <temp-config> chat --quit --provider paperhub --model glm-5.2 --enable-tools list_files "<prompt>"`。
+`go run ./cmd/sai --config-dir <temp-config> chat --quit --provider paperhub --model glm-5.2 --enable-tools list_files --prompt "<prompt>"`。
 结果：PaperHub `glm-5.2` 成功返回 tool call，`sai` 执行 `list_files` 后继续输出最终文本。
 
 手动测试命令：
 
 ```powershell
-sai chat --quit --provider paperhub "你是谁？"
+sai chat --quit --provider paperhub --prompt "你是谁？"
 ```
 
 预期行为：

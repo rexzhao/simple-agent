@@ -16,8 +16,8 @@
 `--config-dir` 不改变 `AGENTS.md` 的查找位置。
 
 ```text
-sai chat --quit "你好"
-sai --config-dir ./config chat --quit "你好"
+sai chat --prompt "你好" --quit
+sai --config-dir ./config chat --prompt "你好" --quit
 sai --config-dir ./examples/paperhub chat
 ```
 
@@ -234,8 +234,8 @@ skills:
 ```
 
 ```text
-sai chat --quit --enable-skills my-skill,other-skill "prompt"
-sai chat --quit --disable-skills "prompt"
+sai chat --quit --enable-skills my-skill,other-skill --prompt "prompt"
+sai chat --quit --disable-skills --prompt "prompt"
 ```
 
 `--enable-skills` 覆盖配置中的 `skills.enabled`，不是追加；`--disable-skills` 本次运行
@@ -280,9 +280,9 @@ MCP tools 会转换成内部 tool schema，但仍然需要出现在 enabled tool
 启用列表完全由命令行决定，忽略各 MCP 文件中的 `enabled` 字段。
 
 ```text
-sai chat --quit --enable-mcp local "只启用 local MCP server"
-sai chat --quit --enable-mcp local,git "使用多个 MCP 服务"
-sai chat --quit --enable-mcp local --enable-tools mcp.local.some_tool "暴露 MCP 工具给模型"
+sai chat --quit --enable-mcp local --prompt "只启用 local MCP server"
+sai chat --quit --enable-mcp local,git --prompt "使用多个 MCP 服务"
+sai chat --quit --enable-mcp local --enable-tools mcp.local.some_tool --prompt "暴露 MCP 工具给模型"
 ```
 
 ## 工具启用
@@ -320,7 +320,7 @@ tools:
 命令行可以覆盖配置中的 enabled tools：
 
 ```text
-sai chat --quit --enable-tools list_files,read_file "看看当前目录"
+sai chat --quit --enable-tools list_files,read_file --prompt "看看当前目录"
 ```
 
 `--enable-tools` 是覆盖，不是追加。`shell`、`write_file` 和 `edit_file` 不需要额外
@@ -344,7 +344,7 @@ arguments；状态也不包含 tool result 正文，stdout 仍只输出模型文
 会话开始时确定 provider 和 model：
 
 ```text
-sai chat --quit --provider paperhub --model glm-5.2 "你是谁？"
+sai chat --quit --provider paperhub --model glm-5.2 --prompt "你是谁？"
 sai chat --provider paperhub --model glm-5.2
 ```
 
@@ -360,11 +360,11 @@ sai chat --provider paperhub --model glm-5.2
 2. 启动时当前工作目录下的 `.agents`。
 
 根层解析从 argv 左到右扫描，跳过已知 flag 及其 value；第一个真正的非 flag token 是命令。
-带值 flag 的 value 不参与命令识别，因此 `sai --model fast chat "hi" --quit` 中的 `fast`
-不是命令。命令 token 之外的参数交给对应命令解析，命令前后的 flags 都可以和 positional
-参数混排。`--config-dir` 是全局 flag，可以出现在命令前，也可以出现在命令或子命令后，
-例如 `sai --config-dir ./config models list` 和 `sai models list --config-dir ./config`
-等价。`-h` / `--help` 在命令范围内优先显示 help，且不加载配置。`--` 终止 flag
+带值 flag 的 value 不参与命令识别，因此 `sai --model fast chat --prompt "hi" --quit` 中的
+`fast` 不是命令。命令 token 之外的参数交给对应命令解析，命令前后的 flags 可以混排；
+chat 初始 prompt 使用 `--prompt`，不使用 positional 参数。`--config-dir` 是全局 flag，
+可以出现在命令前，也可以出现在命令或子命令后，例如 `sai --config-dir ./config models list`
+和 `sai models list --config-dir ./config` 等价。`-h` / `--help` 在命令范围内优先显示 help，且不加载配置。`--` 终止 flag
 解析；其后的 token 全部作为 positional，不再被识别为 help、`--config-dir` 或命令参数
 flag。
 
@@ -374,8 +374,9 @@ v0.1 不支持会话进行中切换模型。`sai chat` 进入会话后，provide
 `sai chat` 使用同一套会话启动时配置与命令行覆盖规则。以下 flags 在 chat 会话开始时
 解析一次，并固定到会话结束：`--provider`、`--model`、
 `--show-reasoning`、`--verbose`、`--enable-tools`、`--enable-skills`、
-`--disable-skills`、`--enable-mcp`。`--quit` 只有在提供初始 prompt 时有效，用于完成
-该轮后退出。chat 不支持会话进行中切换模型、工具、MCP 或 skills。
+`--disable-skills`、`--enable-mcp`、`--save-session`、`--resume` 和
+`--continue`。`--resume` 与 `--continue` 互斥。`--quit` 只有在提供 `--prompt` 时有效，
+用于完成该轮后退出。chat 不支持会话进行中切换模型、工具、MCP 或 skills。
 
 ## 参数合并
 
@@ -438,3 +439,22 @@ tool calls 和 tool result messages。
 provider/model/parameters、启用 tools/MCP/skills/reasoning，以及注入指令快照或可重建
 信息。因此 `sessions.enabled` 必须默认是 `false`，CLI 和文档都应提示用户这是显式
 opt-in 的落盘能力。
+
+命令行也可以显式启用和恢复：
+
+```text
+sai chat --save-session --prompt "保存这一轮" --quit
+sai chat --resume <id> --prompt "继续这一轮" --quit
+sai chat --continue --prompt "继续最近 session" --quit
+```
+
+启用保存后，`sai chat` 每个成功 turn 都会写入 `sessions.dir/<id>/session.json`，其中
+包含完整 updated messages：user messages、assistant final messages、assistant tool
+calls 和 tool result messages。`--resume <id>` 会从 `sessions.dir/<id>/session.json`
+恢复，`--continue` 会选择 `sessions.dir` 下 `updated_at` 最新的 session。
+
+恢复时，runtime 使用 session 文件中保存的 provider、model profile、model id、model
+parameters、enabled tools、enabled MCP、enabled skills 和 show_reasoning。显式 CLI
+覆盖如果和 session 文件冲突会失败，例如恢复时同时传入不同的 `--model`、不同的
+`--enable-tools` 或冲突的 `--show-reasoning`。`sessions.save_tool_results: false` 当前不
+提供可靠降级模式；只要启用保存或恢复，CLI 会拒绝继续并提示必须设为 `true`。

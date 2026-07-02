@@ -22,6 +22,7 @@ import (
 	anthropicmessages "github.com/rexzhao/simple-agent/internal/model/anthropic_messages"
 	openaichat "github.com/rexzhao/simple-agent/internal/model/openai_chat"
 	openairesponses "github.com/rexzhao/simple-agent/internal/model/openai_responses"
+	"github.com/rexzhao/simple-agent/internal/sessions"
 	localskills "github.com/rexzhao/simple-agent/internal/skills"
 	"github.com/rexzhao/simple-agent/internal/tools"
 )
@@ -140,7 +141,7 @@ func execute(ctx context.Context, args []string, stdin io.Reader, stdout, stderr
 const rootUsageText = `usage: sai [--config-dir dir] <command> [args]
 
 Commands:
-  chat ["prompt"]    Start a chat session, optionally with an initial prompt
+  chat              Start a chat session
   config show        Print resolved config with secrets redacted
   models list        List configured provider model profiles
   tools list         List built-in tools
@@ -151,12 +152,15 @@ Commands:
 Run "sai help <command>" for command usage.
 `
 
-const chatUsageText = `usage: sai chat [--provider name] [--model profile] [--show-reasoning] [--verbose] [--enable-tools names] [--enable-skills ids] [--disable-skills] [--enable-mcp ids] [--quit] ["prompt"]
+const chatUsageText = `usage: sai chat [--provider name] [--model profile] [--prompt text] [--show-reasoning] [--verbose] [--enable-tools names] [--enable-skills ids] [--disable-skills] [--enable-mcp ids] [--save-session] [--resume id | --continue] [--quit]
 
 Starts a line-oriented chat session using the configured provider and model. When
-an initial prompt is provided, sai runs that turn first; --quit exits after that
-turn instead of entering the REPL.
+--prompt is provided, sai runs that turn first; --quit exits after that
+turn instead of entering the REPL. Resumable sessions save full sensitive content,
+including prompts, assistant output, assistant tool calls, and tool results.
 `
+
+const resumableSessionSaveNoticeText = "sai: resumable sessions enabled; full prompts, assistant output, and tool results will be saved to the session file."
 
 const versionUsageText = `usage: sai version
 
@@ -346,14 +350,18 @@ func splitRootArgs(args []string) (rootArgs, error) {
 		"config-dir":     flagKindValue,
 		"provider":       flagKindValue,
 		"model":          flagKindValue,
+		"prompt":         flagKindValue,
 		"enable-tools":   flagKindValue,
 		"enable-skills":  flagKindValue,
 		"enable-mcp":     flagKindValue,
+		"resume":         flagKindValue,
 		"h":              flagKindBool,
 		"help":           flagKindBool,
 		"show-reasoning": flagKindBool,
 		"verbose":        flagKindBool,
 		"disable-skills": flagKindBool,
+		"save-session":   flagKindBool,
+		"continue":       flagKindBool,
 		"quit":           flagKindBool,
 	}
 	var out rootArgs
@@ -612,30 +620,41 @@ func builtInToolNames() []string {
 }
 
 type agentCommandFlags struct {
-	providerName  string
-	modelProfile  string
-	showReasoning bool
-	verbose       bool
-	enabledTools  toolNamesFlag
-	enabledSkills skillIDsFlag
-	disableSkills bool
-	enabledMCP    mcpServerIDsFlag
+	providerName    string
+	modelProfile    string
+	prompt          promptTextFlag
+	showReasoning   bool
+	verbose         bool
+	enabledTools    toolNamesFlag
+	enabledSkills   skillIDsFlag
+	disableSkills   bool
+	enabledMCP      mcpServerIDsFlag
+	saveSession     bool
+	resumeID        string
+	continueSession bool
 }
 
 func registerAgentCommandFlags(flags *flag.FlagSet, options *agentCommandFlags) {
 	flags.StringVar(&options.providerName, "provider", "", "provider name")
 	flags.StringVar(&options.modelProfile, "model", "", "model profile")
+	flags.Var(&options.prompt, "prompt", "initial prompt text")
 	flags.BoolVar(&options.showReasoning, "show-reasoning", false, "show reasoning output")
 	flags.BoolVar(&options.verbose, "verbose", false, "write non-sensitive diagnostics to stderr")
 	flags.Var(&options.enabledTools, "enable-tools", "comma-separated tool names to expose")
 	flags.Var(&options.enabledSkills, "enable-skills", "comma-separated skill ids to enable")
 	flags.BoolVar(&options.disableSkills, "disable-skills", false, "disable all skills for this run")
 	flags.Var(&options.enabledMCP, "enable-mcp", "comma-separated MCP server ids to enable")
+	flags.BoolVar(&options.saveSession, "save-session", false, "save a resumable session with full sensitive content")
+	flags.StringVar(&options.resumeID, "resume", "", "resume a saved session id")
+	flags.BoolVar(&options.continueSession, "continue", false, "resume the latest saved session")
 }
 
 func (options agentCommandFlags) validate(helpCommand string) error {
 	if options.enabledSkills.set && options.disableSkills {
 		return usageError("cannot use --enable-skills with --disable-skills", "", helpCommand)
+	}
+	if options.resumeID != "" && options.continueSession {
+		return usageError("cannot use --resume with --continue", "", helpCommand)
 	}
 	return nil
 }
@@ -645,18 +664,18 @@ func chatCommand(ctx context.Context, args []string, configDir string, stdin io.
 	var options agentCommandFlags
 	registerAgentCommandFlags(flags, &options)
 	quit := flags.Bool("quit", false, "exit after the initial prompt turn")
-	prompts, done, err := parseCommandFlagArgs(flags, args, stdout, printChatUsage, "sai help chat")
+	positionals, done, err := parseCommandFlagArgs(flags, args, stdout, printChatUsage, "sai help chat")
 	if done || err != nil {
 		return err
 	}
 	if err := options.validate("sai help chat"); err != nil {
 		return err
 	}
-	if len(prompts) > 1 {
-		return usageError("expected at most one prompt", chatUsageText, "sai help chat")
+	if len(positionals) != 0 {
+		return usageError("unexpected positional argument; use --prompt for the initial prompt", chatUsageText, "sai help chat")
 	}
-	if *quit && len(prompts) == 0 {
-		return usageError("--quit requires an initial prompt", chatUsageText, "sai help chat")
+	if *quit && !options.prompt.set {
+		return usageError("--quit requires --prompt", chatUsageText, "sai help chat")
 	}
 
 	runtime, err := prepareAgentRuntime(ctx, configDir, options, stderr, getwd)
@@ -667,9 +686,9 @@ func chatCommand(ctx context.Context, args []string, configDir string, stdin io.
 		chatErr = errors.Join(chatErr, runtime.Close())
 	}()
 
-	messages := chatBaseMessages(runtime.project, runtime.selectedSkills)
-	if len(prompts) == 1 {
-		updated, err := runChatTurn(ctx, runtime, messages, prompts[0], stdout, stderr, !*quit, false)
+	messages := runtime.initialMessages()
+	if options.prompt.set {
+		updated, err := runChatTurn(ctx, runtime, messages, options.prompt.text, stdout, stderr, !*quit, false)
 		if err != nil {
 			return err
 		}
@@ -737,6 +756,13 @@ func runChatTurn(ctx context.Context, runtime *agentRuntime, messages []model.Me
 		Tools:      runtime.toolSchemas,
 		Parameters: runtime.parameters,
 	}
+	noticeWritten, err := runtime.writeSessionSaveNotice(stderr, stderrNeedsLeadingBreak)
+	if err != nil {
+		return nil, err
+	}
+	if noticeWritten {
+		stderrNeedsLeadingBreak = false
+	}
 	events, results, err := agent.StreamWithResult(turnCtx, request, agent.Options{
 		Provider:     runtime.provider,
 		ToolExecutor: runtime.toolExecutor,
@@ -760,6 +786,9 @@ func runChatTurn(ctx context.Context, runtime *agentRuntime, messages []model.Me
 			return nil, err
 		}
 		return nil, newRecoverableTurnError(fmt.Errorf("agent did not return updated messages"))
+	}
+	if err := runtime.saveUpdatedMessages(result.Messages); err != nil {
+		return nil, err
 	}
 	if addTrailingNewline && tracker.wrote && tracker.lastByte != '\n' {
 		if _, err := fmt.Fprintln(stdout); err != nil {
@@ -825,22 +854,88 @@ func isBoolFlagValue(value flag.Value) bool {
 }
 
 type agentRuntime struct {
-	cwd            string
-	modelID        string
-	parameters     map[string]any
-	provider       model.Provider
-	toolExecutor   runToolExecutor
-	toolSchemas    []model.Tool
-	maxTurns       int
-	showReasoning  bool
-	logger         *eventlog.Logger
-	mcpSessions    []*mcp.Session
-	project        projectcontext.Project
-	selectedSkills []localskills.Skill
+	cwd                   string
+	configDir             string
+	providerName          string
+	modelProfile          string
+	modelID               string
+	parameters            map[string]any
+	provider              model.Provider
+	toolExecutor          runToolExecutor
+	toolSchemas           []model.Tool
+	maxTurns              int
+	showReasoning         bool
+	enabledTools          []string
+	enabledMCP            []string
+	enabledSkills         []string
+	baseMessages          []model.Message
+	resumed               bool
+	resumableSession      sessions.Session
+	resumableSessionStore *sessions.Store
+	saveSessions          bool
+	sessionSaveNoticeDone bool
+	logger                *eventlog.Logger
+	mcpSessions           []*mcp.Session
 }
 
 func (r *agentRuntime) Close() error {
 	return errors.Join(r.logger.Close(), closeMCPSessions(r.mcpSessions))
+}
+
+func (r *agentRuntime) initialMessages() []model.Message {
+	if r.resumed {
+		return copyMessageSlice(r.resumableSession.Messages)
+	}
+	return copyMessageSlice(r.baseMessages)
+}
+
+func (r *agentRuntime) writeSessionSaveNotice(stderr io.Writer, needsLeadingBreak bool) (bool, error) {
+	if !r.saveSessions || r.sessionSaveNoticeDone || stderr == nil {
+		return false, nil
+	}
+	if needsLeadingBreak {
+		if _, err := fmt.Fprintln(stderr); err != nil {
+			return false, err
+		}
+	}
+	if _, err := fmt.Fprintln(stderr, resumableSessionSaveNoticeText); err != nil {
+		return false, err
+	}
+	r.sessionSaveNoticeDone = true
+	return true, nil
+}
+
+func (r *agentRuntime) saveUpdatedMessages(messages []model.Message) error {
+	if !r.saveSessions {
+		return nil
+	}
+	if r.resumableSessionStore == nil {
+		return fmt.Errorf("session store is not configured")
+	}
+
+	session := r.resumableSession
+	session.Provider = r.providerName
+	session.ModelProfile = r.modelProfile
+	session.ModelID = r.modelID
+	session.ModelParameters = copyParameterMap(r.parameters)
+	session.CWD = r.cwd
+	session.ConfigDir = r.configDir
+	session.EnabledTools = copyStringSlice(r.enabledTools)
+	session.EnabledMCP = copyStringSlice(r.enabledMCP)
+	session.EnabledSkills = copyStringSlice(r.enabledSkills)
+	session.ShowReasoning = r.showReasoning
+	if len(session.InstructionsSnapshot) == 0 {
+		session.InstructionsSnapshot = copyMessageSlice(r.baseMessages)
+	}
+	session.Messages = copyMessageSlice(messages)
+	session.SaveToolResults = true
+
+	saved, err := r.resumableSessionStore.Save(session)
+	if err != nil {
+		return fmt.Errorf("save resumable session: %w", err)
+	}
+	r.resumableSession = saved
+	return nil
 }
 
 func prepareAgentRuntime(ctx context.Context, configDir string, options agentCommandFlags, stderr io.Writer, getwd func() (string, error)) (runtime *agentRuntime, err error) {
@@ -854,14 +949,43 @@ func prepareAgentRuntime(ctx context.Context, configDir string, options agentCom
 	if err != nil {
 		return nil, err
 	}
-	selectedMCPServers, err := cfg.SelectedMCPServers(options.enabledMCP.ids, options.enabledMCP.set)
-	if err != nil {
-		return nil, err
+
+	var resumedSession sessions.Session
+	resumed := false
+	saveSessions := cfg.Sessions.Enabled || options.saveSession || options.resumeID != "" || options.continueSession
+	if saveSessions && !cfg.Sessions.SaveToolResults {
+		return nil, fmt.Errorf("resumable sessions require sessions.save_tool_results: true")
+	}
+	sessionStore := sessions.NewStore(cfg.Sessions.Dir)
+	if options.resumeID != "" || options.continueSession {
+		resumedSession, err = loadResumableSession(sessionStore, options.resumeID, options.continueSession)
+		if err != nil {
+			return nil, err
+		}
+		if resumedSession.Version > sessions.CurrentVersion {
+			return nil, fmt.Errorf("session %q uses unsupported version %d; current version is %d", resumedSession.ID, resumedSession.Version, sessions.CurrentVersion)
+		}
+		if !resumedSession.SaveToolResults {
+			return nil, fmt.Errorf("session %q cannot be reliably resumed because save_tool_results is false", resumedSession.ID)
+		}
+		if err := validateResumeCLIConflicts(resumedSession, options); err != nil {
+			return nil, err
+		}
+		applyResumeOptions(&options, resumedSession)
+		resumed = true
 	}
 
 	resolved, err := cfg.ResolveModel(options.providerName, options.modelProfile)
 	if err != nil {
 		return nil, err
+	}
+	if resumed {
+		if resumedSession.ModelID != "" {
+			resolved.ModelID = resumedSession.ModelID
+		}
+		if resumedSession.ModelParameters != nil {
+			resolved.Parameters = copyParameterMap(resumedSession.ModelParameters)
+		}
 	}
 	provider, err := newProviderForRun(resolved.ProviderName, resolved.Provider)
 	if err != nil {
@@ -873,6 +997,10 @@ func prepareAgentRuntime(ctx context.Context, configDir string, options agentCom
 		enabledToolNames = options.enabledTools.names
 	}
 	toolRegistry, toolSchemas, err := enabledToolsForRun(cwd, enabledToolNames)
+	if err != nil {
+		return nil, err
+	}
+	selectedMCPServers, err := cfg.SelectedMCPServers(options.enabledMCP.ids, options.enabledMCP.set)
 	if err != nil {
 		return nil, err
 	}
@@ -889,14 +1017,26 @@ func prepareAgentRuntime(ctx context.Context, configDir string, options agentCom
 	toolSchemas = append(toolSchemas, mcpToolSchemas...)
 
 	resolvedShowReasoning := options.showReasoning || cfg.Agent.ShowReasoning
-	selectedSkills, err := enabledSkillsForRun(cfg, options.enabledSkills.ids, options.enabledSkills.set, options.disableSkills)
-	if err != nil {
-		return nil, err
+	if resumed {
+		resolvedShowReasoning = resumedSession.ShowReasoning
 	}
 
-	project, err := projectcontext.Load(cwd)
-	if err != nil {
-		return nil, err
+	var baseMessages []model.Message
+	var enabledSkillIDs []string
+	if resumed {
+		baseMessages = copyMessageSlice(resumedSession.InstructionsSnapshot)
+		enabledSkillIDs = copyStringSlice(resumedSession.EnabledSkills)
+	} else {
+		selectedSkills, err := enabledSkillsForRun(cfg, options.enabledSkills.ids, options.enabledSkills.set, options.disableSkills)
+		if err != nil {
+			return nil, err
+		}
+		project, err := projectcontext.Load(cwd)
+		if err != nil {
+			return nil, err
+		}
+		baseMessages = chatBaseMessages(project, selectedSkills)
+		enabledSkillIDs = skillIDs(selectedSkills)
 	}
 
 	logger, err := eventlog.Open(cfg.Logging.Path, eventlog.Attributes{
@@ -914,19 +1054,137 @@ func prepareAgentRuntime(ctx context.Context, configDir string, options agentCom
 	}
 
 	return &agentRuntime{
-		cwd:            cwd,
-		modelID:        resolved.ModelID,
-		parameters:     resolved.Parameters,
-		provider:       provider,
-		toolExecutor:   runToolExecutor{builtins: toolRegistry, mcpSessions: mcpSessionsByID},
-		toolSchemas:    toolSchemas,
-		maxTurns:       cfg.Agent.MaxTurns,
-		showReasoning:  resolvedShowReasoning,
-		logger:         logger,
-		mcpSessions:    mcpSessions,
-		project:        project,
-		selectedSkills: selectedSkills,
+		cwd:                   cwd,
+		configDir:             cfg.ConfigDir,
+		providerName:          resolved.ProviderName,
+		modelProfile:          resolved.Profile,
+		modelID:               resolved.ModelID,
+		parameters:            resolved.Parameters,
+		provider:              provider,
+		toolExecutor:          runToolExecutor{builtins: toolRegistry, mcpSessions: mcpSessionsByID},
+		toolSchemas:           toolSchemas,
+		maxTurns:              cfg.Agent.MaxTurns,
+		showReasoning:         resolvedShowReasoning,
+		enabledTools:          copyStringSlice(enabledToolNames),
+		enabledMCP:            mcpServerIDs(selectedMCPServers),
+		enabledSkills:         enabledSkillIDs,
+		baseMessages:          baseMessages,
+		resumed:               resumed,
+		resumableSession:      resumedSession,
+		resumableSessionStore: sessionStore,
+		saveSessions:          saveSessions,
+		logger:                logger,
+		mcpSessions:           mcpSessions,
 	}, nil
+}
+
+func loadResumableSession(store *sessions.Store, id string, latest bool) (sessions.Session, error) {
+	if latest {
+		session, err := store.Latest()
+		if err != nil {
+			if errors.Is(err, sessions.ErrNotFound) {
+				return sessions.Session{}, fmt.Errorf("no resumable sessions found")
+			}
+			return sessions.Session{}, err
+		}
+		return session, nil
+	}
+
+	session, err := store.Load(id)
+	if err != nil {
+		if errors.Is(err, sessions.ErrNotFound) {
+			return sessions.Session{}, fmt.Errorf("resumable session %q was not found", id)
+		}
+		return sessions.Session{}, err
+	}
+	return session, nil
+}
+
+func validateResumeCLIConflicts(session sessions.Session, options agentCommandFlags) error {
+	if options.providerName != "" && options.providerName != session.Provider {
+		return fmt.Errorf("cannot resume session %q with --provider %q; session uses provider %q", session.ID, options.providerName, session.Provider)
+	}
+	if options.modelProfile != "" && options.modelProfile != session.ModelProfile {
+		return fmt.Errorf("cannot resume session %q with --model %q; session uses model profile %q", session.ID, options.modelProfile, session.ModelProfile)
+	}
+	if options.enabledTools.set && !sameStringSlice(options.enabledTools.names, session.EnabledTools) {
+		return fmt.Errorf("cannot resume session %q with --enable-tools %q; session uses %q", session.ID, strings.Join(options.enabledTools.names, ","), strings.Join(session.EnabledTools, ","))
+	}
+	if options.enabledMCP.set && !sameStringSlice(options.enabledMCP.ids, session.EnabledMCP) {
+		return fmt.Errorf("cannot resume session %q with --enable-mcp %q; session uses %q", session.ID, strings.Join(options.enabledMCP.ids, ","), strings.Join(session.EnabledMCP, ","))
+	}
+	if options.enabledSkills.set && !sameStringSlice(options.enabledSkills.ids, session.EnabledSkills) {
+		return fmt.Errorf("cannot resume session %q with --enable-skills %q; session uses %q", session.ID, strings.Join(options.enabledSkills.ids, ","), strings.Join(session.EnabledSkills, ","))
+	}
+	if options.disableSkills && len(session.EnabledSkills) != 0 {
+		return fmt.Errorf("cannot resume session %q with --disable-skills; session uses enabled skills %q", session.ID, strings.Join(session.EnabledSkills, ","))
+	}
+	if options.showReasoning && !session.ShowReasoning {
+		return fmt.Errorf("cannot resume session %q with --show-reasoning; session was saved with show_reasoning false", session.ID)
+	}
+	return nil
+}
+
+func applyResumeOptions(options *agentCommandFlags, session sessions.Session) {
+	options.providerName = session.Provider
+	options.modelProfile = session.ModelProfile
+	options.enabledTools = toolNamesFlag{set: true, names: copyStringSlice(session.EnabledTools)}
+	options.enabledMCP = mcpServerIDsFlag{set: true, ids: copyStringSlice(session.EnabledMCP)}
+	options.enabledSkills = skillIDsFlag{set: true, ids: copyStringSlice(session.EnabledSkills)}
+	options.disableSkills = false
+	options.showReasoning = session.ShowReasoning
+}
+
+func sameStringSlice(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func mcpServerIDs(servers []config.MCPServerConfig) []string {
+	if len(servers) == 0 {
+		return nil
+	}
+	ids := make([]string, 0, len(servers))
+	for _, server := range servers {
+		ids = append(ids, server.ID)
+	}
+	return ids
+}
+
+func skillIDs(skills []localskills.Skill) []string {
+	if len(skills) == 0 {
+		return nil
+	}
+	ids := make([]string, 0, len(skills))
+	for _, skill := range skills {
+		ids = append(ids, skill.ID)
+	}
+	return ids
+}
+
+func copyStringSlice(values []string) []string {
+	if values == nil {
+		return nil
+	}
+	return append([]string(nil), values...)
+}
+
+func copyParameterMap(values map[string]any) map[string]any {
+	if values == nil {
+		return nil
+	}
+	copied := make(map[string]any, len(values))
+	for key, value := range values {
+		copied[key] = value
+	}
+	return copied
 }
 
 type chatOutputWriter struct {
@@ -946,6 +1204,21 @@ func (w *chatOutputWriter) Write(p []byte) (int, error) {
 
 func (w *chatOutputWriter) UnwrapWriter() io.Writer {
 	return w.w
+}
+
+type promptTextFlag struct {
+	set  bool
+	text string
+}
+
+func (f *promptTextFlag) Set(value string) error {
+	f.set = true
+	f.text = value
+	return nil
+}
+
+func (f *promptTextFlag) String() string {
+	return f.text
 }
 
 type toolNamesFlag struct {

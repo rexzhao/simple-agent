@@ -178,12 +178,12 @@
 - [x] 无工具单轮 result messages 追加 assistant final message。
 - [x] tool call 单轮 result messages 包含 assistant tool call、tool result 和最终 assistant text。
 - [x] model stream error 不伪造成功 assistant 历史，继续通过 error event 失败。
-- [x] 添加 `sai chat [flags] [--quit] ["prompt"]`。
+- [x] 添加 `sai chat [flags] [--prompt text] [--quit]`。
 - [x] `sai chat` 会话开始时固定 provider/model/tools/MCP/skills/show-reasoning。
 - [x] `sai chat` 支持 `--provider`、`--model`、`--show-reasoning`、`--verbose`、`--enable-tools`、`--enable-skills`、`--disable-skills`、`--enable-mcp` 语义。
-- [x] 有初始 prompt 且无 `--quit` 时，先跑完初始 prompt 再进入 REPL，历史保留首轮 user、assistant 和 tool messages。
-- [x] 有初始 prompt 且有 `--quit` 时，跑完这一轮后退出，不进入 REPL。
-- [x] 根层用“跳过已知 flag 及其 value 后的第一个非 flag token”识别命令；命令前后 flags 可混排，全局 `--config-dir` 可放在命令后，help 混排不加载配置，`--` 后的 token 全部作为 positional。
+- [x] 有 `--prompt` 且无 `--quit` 时，先跑完初始 prompt 再进入 REPL，历史保留首轮 user、assistant 和 tool messages。
+- [x] 有 `--prompt` 且有 `--quit` 时，跑完这一轮后退出，不进入 REPL。
+- [x] 根层用“跳过已知 flag 及其 value 后的第一个非 flag token”识别命令；命令前后 flags 可混排，全局 `--config-dir` 可放在命令后，help 混排不加载配置，`--` 后的 token 全部作为 positional，chat 初始 prompt 使用 `--prompt`。
 - [x] stdin 逐行读取用户输入，空白行忽略。
 - [x] `/exit`、`/quit` 和 EOF 正常退出。
 - [x] prompt 写到 stderr，不污染 stdout。
@@ -233,22 +233,22 @@
 
 - [x] 区分 JSONL session log / transcript 和 resumable session。
 - [x] 默认 `sessions.enabled: false`，不保存完整会话上下文。
-- [ ] 启用后保存可恢复 session id、创建时间、更新时间和版本信息。
-- [ ] 启用后保存 provider、model、model profile parameters、cwd 和配置根目录。
-- [ ] 启用后保存 enabled tools、MCP、skills 和 reasoning 展示设置。
-- [ ] 启用后保存注入指令快照，或保存可重建信息并能检测源文件变化。
-- [ ] 启用后保存完整 user messages。
-- [ ] 启用后保存完整 assistant final messages。
-- [ ] 启用后保存完整 assistant tool calls。
-- [ ] 启用后保存完整 tool result messages。
-- [ ] `sai chat --save-session` 可保存完整可恢复 session。
-- [ ] `sai chat --resume <id>` 可恢复指定 session。
-- [ ] `sai chat --continue` 可继续最近 session。
+- [x] 启用后保存可恢复 session id、创建时间、更新时间和版本信息。
+- [x] 启用后保存 provider、model、model profile parameters、cwd 和配置根目录。
+- [x] 启用后保存 enabled tools、MCP、skills 和 reasoning 展示设置。
+- [x] 启用后保存注入指令快照，或保存可重建信息并能检测源文件变化。
+- [x] 启用后保存完整 user messages。
+- [x] 启用后保存完整 assistant final messages。
+- [x] 启用后保存完整 assistant tool calls。
+- [x] 启用后保存完整 tool result messages。
+- [x] `sai chat --save-session` 可保存完整可恢复 session。
+- [x] `sai chat --resume <id>` 可恢复指定 session。
+- [x] `sai chat --continue` 可继续最近 session。
 - [ ] `sai sessions list` 可列出 sessions。
 - [ ] `sai sessions show <id>` 可展示 session 元数据并提示敏感数据风险。
 - [ ] `sai sessions delete <id>` 可删除指定 session。
 - [ ] `sai sessions prune` 可清理旧 sessions。
-- [ ] 文档和 CLI 输出提示 sessions 保存完整 prompt、assistant 输出和 tool result。
+- [x] 文档和 CLI 输出提示 sessions 保存完整 prompt、assistant 输出和 tool result。
 
 ## M14：Context Window Management
 

@@ -59,7 +59,7 @@ models:
 ## Basic Usage
 
 ```sh
-sai chat --quit --provider paperhub --model glm-5.2 "Hello"
+sai chat --quit --provider paperhub --model glm-5.2 --prompt "Hello"
 ```
 
 Start a line-oriented chat session with the same provider/model selection rules:
@@ -68,11 +68,11 @@ Start a line-oriented chat session with the same provider/model selection rules:
 sai chat --provider paperhub --model glm-5.2
 ```
 
-`sai chat "Hello"` runs that initial prompt first, then enters the line-oriented
-session. Add `--quit` to exit after the initial prompt turn. In chat, type one
-message per line. Blank lines are ignored; `/exit`, `/quit`, or EOF exits
-normally. Session history stays in memory for the current process and is not
-written to disk.
+`sai chat --prompt "Hello"` runs that initial prompt first, then enters the
+line-oriented session. Add `--quit` to exit after the initial prompt turn. In
+chat, type one message per line. Blank lines are ignored; `/exit`, `/quit`, or
+EOF exits normally. Session history stays in memory for the current process and
+is not written to disk unless resumable sessions are enabled.
 
 Show CLI usage without loading configuration:
 
@@ -92,7 +92,7 @@ sai help mcp
 Enable tools for one prompt or a chat session:
 
 ```sh
-sai chat --quit --enable-tools list_files,read_file "List this project"
+sai chat --quit --enable-tools list_files,read_file --prompt "List this project"
 sai chat --enable-tools list_files,read_file
 ```
 
@@ -111,13 +111,13 @@ stdout.
 Write non-sensitive diagnostics to stderr without changing streamed stdout:
 
 ```sh
-sai chat --quit --verbose --provider paperhub --model glm-5.2 "Hello"
+sai chat --quit --verbose --provider paperhub --model glm-5.2 --prompt "Hello"
 ```
 
 Show reasoning output, which is hidden by default:
 
 ```sh
-sai chat --quit --show-reasoning --provider paperhub --model glm-5.2 "Hello"
+sai chat --quit --show-reasoning --provider paperhub --model glm-5.2 --prompt "Hello"
 ```
 
 Shown reasoning is printed directly without a marker line. When stdout is an
