@@ -143,6 +143,8 @@
 - [x] 添加 group help：`sai config -h`、`sai models -h`、`sai mcp -h`。
 - [x] 添加 nested command help：`sai config show -h`、`sai models list -h`、`sai mcp list -h`。
 - [x] 添加对应的 group 和 nested `sai help ...` 入口。
+- [x] 添加 `sai tools list`，静态列出内置工具且不加载配置。
+- [x] 添加 `sai tools` / `sai tools list` help，help 不加载配置。
 - [x] help 输出到 stdout，exit code 为 0。
 - [x] help 不加载配置、不解析敏感配置值。
 - [x] 未知命令和错误参数继续 exit code 1，并包含可读 help 提示。

@@ -223,11 +223,13 @@ M7 当前实现只覆盖配置目录下的本地 skills：通过 `skills.enabled
 - simple command help：`sai version -h`、`sai version --help`、
   `sai help version`。
 - command help：`sai run -h`、`sai run --help`、`sai help run`。
-- group help：`sai config -h`、`sai models -h`、`sai mcp -h`，以及对应的
-  `sai help config`、`sai help models`、`sai help mcp`。
+- group help：`sai config -h`、`sai models -h`、`sai tools -h`、`sai mcp -h`，
+  以及对应的 `sai help config`、`sai help models`、`sai help tools`、
+  `sai help mcp`。
 - nested command help：`sai config show -h`、`sai models list -h`、
-  `sai mcp list -h`，以及对应的 `sai help config show`、
-  `sai help models list`、`sai help mcp list`。
+  `sai tools list -h`、`sai mcp list -h`，以及对应的 `sai help config show`、
+  `sai help models list`、`sai help tools list`、`sai help mcp list`。
+- `sai tools list` 静态列出内置工具，不加载配置或 provider/API key。
 - help 输出写到 stdout，exit code 为 0。
 - help 在配置加载前完成，不读取 `.agents` 配置、不解析 API key，也不泄露 secrets。
 - 未知命令和错误参数继续 exit code 1，并给出可读错误和 help 提示。
@@ -237,6 +239,7 @@ M7 当前实现只覆盖配置目录下的本地 skills：通过 `skills.enabled
 
 - CLI 单元测试覆盖 root help、simple command help、group help、run help、
   nested command help 和无需配置文件的 help 路径。
+- CLI 单元测试覆盖 `sai tools list` 无需配置文件。
 - CLI 单元测试覆盖未知命令错误提示。
 - CLI 单元测试覆盖 `sai run` 缺 prompt 的错误提示。
 - `go test ./...` 通过。

@@ -307,6 +307,10 @@ sai run --enable-tools list_files,read_file "看看当前目录"
 `--enable-tools` 是覆盖，不是追加。`shell` 不需要额外 flag；只要它被启用，就按普通工具
 暴露给模型。如果后续加入 `write_file`，也遵循同一规则。
 
+`sai tools list` 可以在不加载配置、不解析 provider API key 的情况下列出内置工具。发生
+tool call 时，`sai run` 和 `sai chat` 默认向 stderr 打印 `tool: <name>` 形式的简短
+状态；该状态不包含 tool arguments 或 tool result 正文，stdout 仍只输出模型文本。
+
 `shell` 工具默认在启动目录执行命令。v0.1 不提供 `--workdir` 配置。
 
 注意：`--enable-mcp` 只决定启动哪些 MCP server；`--enable-tools` 决定哪些工具暴露给

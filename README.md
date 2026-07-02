@@ -74,6 +74,8 @@ sai chat -h
 sai help config
 sai help config show
 sai help models
+sai help tools
+sai help tools list
 sai help mcp
 ```
 
@@ -83,6 +85,16 @@ Enable tools for a single run:
 sai run --enable-tools list_files,read_file "List this project"
 sai chat --enable-tools list_files,read_file
 ```
+
+List built-in tools without loading configuration or provider credentials:
+
+```sh
+sai tools list
+```
+
+When a model calls a tool, `sai run` and `sai chat` print a short status line
+such as `tool: read_file` to stderr. Tool arguments and tool results are not
+printed in that status line, and streamed model output remains on stdout.
 
 Write non-sensitive run diagnostics to stderr without changing streamed stdout:
 
@@ -107,6 +119,7 @@ Other useful commands:
 sai version
 sai config show
 sai models list
+sai tools list
 ```
 
 ## Build

@@ -96,6 +96,37 @@ func TestMCPListShowsConfiguredServersAndEnabledState(t *testing.T) {
 	}
 }
 
+func TestToolsListWritesBuiltInToolsWithoutConfig(t *testing.T) {
+	for _, args := range [][]string{
+		{"tools", "list"},
+		{"tools", "list", "-h"},
+		{"help", "tools", "list"},
+	} {
+		t.Run(strings.Join(args, " "), func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			code := RunWithGetwd(args, &stdout, &stderr, func() (string, error) {
+				return "", errors.New("getwd should not be called")
+			})
+			if code != 0 {
+				t.Fatalf("RunWithGetwd(%v) code = %d, stderr = %s", args, code, stderr.String())
+			}
+			if stderr.String() != "" {
+				t.Fatalf("stderr = %q, want empty", stderr.String())
+			}
+			out := stdout.String()
+			if containsHelpArg(args) || args[0] == "help" {
+				if !strings.Contains(out, "usage: sai tools list") {
+					t.Fatalf("stdout = %q, want tools list usage", out)
+				}
+				return
+			}
+			if got, want := out, "list_files\nread_file\nshell\n"; got != want {
+				t.Fatalf("stdout = %q, want %q", got, want)
+			}
+		})
+	}
+}
+
 func TestMCPListEnableMCPOverridesConfiguredEnabledState(t *testing.T) {
 	dir := writeCLIFixture(t)
 	writeCLIMCPFixture(t, dir)
@@ -186,7 +217,7 @@ func TestRootHelpWritesUsageWithoutConfig(t *testing.T) {
 		{"help"},
 	} {
 		t.Run(strings.Join(args, " "), func(t *testing.T) {
-			assertCLIHelpWithoutConfig(t, args, "usage: sai", "run \"prompt\"", "chat", "config show", "models list", "Run \"sai help <command>\" for command usage.")
+			assertCLIHelpWithoutConfig(t, args, "usage: sai", "run \"prompt\"", "chat", "config show", "models list", "tools list", "Run \"sai help <command>\" for command usage.")
 		})
 	}
 }
@@ -263,6 +294,21 @@ func TestGroupHelpWritesUsageWithoutConfig(t *testing.T) {
 			wants: []string{"usage: sai models <command>", "models list"},
 		},
 		{
+			name:  "tools flag short",
+			args:  []string{"tools", "-h"},
+			wants: []string{"usage: sai tools <command>", "tools list"},
+		},
+		{
+			name:  "tools flag long",
+			args:  []string{"tools", "--help"},
+			wants: []string{"usage: sai tools <command>", "tools list"},
+		},
+		{
+			name:  "tools help",
+			args:  []string{"help", "tools"},
+			wants: []string{"usage: sai tools <command>", "tools list"},
+		},
+		{
 			name:  "mcp flag short",
 			args:  []string{"mcp", "-h"},
 			wants: []string{"usage: sai mcp <command>", "mcp list"},
@@ -311,6 +357,16 @@ func TestNestedHelpWritesUsageWithoutConfig(t *testing.T) {
 			name:  "models list help",
 			args:  []string{"help", "models", "list"},
 			wants: []string{"usage: sai models list", "provider model profiles"},
+		},
+		{
+			name:  "tools list flag",
+			args:  []string{"tools", "list", "-h"},
+			wants: []string{"usage: sai tools list", "built-in tools"},
+		},
+		{
+			name:  "tools list help",
+			args:  []string{"help", "tools", "list"},
+			wants: []string{"usage: sai tools list", "built-in tools"},
 		},
 		{
 			name:  "mcp list flag",
@@ -488,6 +544,7 @@ func TestChatToolCallHistoryCarriesIntoNextTurn(t *testing.T) {
 	if got, want := stdout.String(), "done\nnext\n"; got != want {
 		t.Fatalf("stdout = %q, want %q", got, want)
 	}
+	assertCLIToolStatus(t, stdout.String(), stderr.String(), "read_file", "note.txt", "tool output")
 
 	<-requests
 	<-requests
@@ -629,6 +686,7 @@ func TestRunOpenAIResponsesExecutesFunctionCallAndContinuesToFinalText(t *testin
 	if got, want := stdout.String(), "done"; got != want {
 		t.Fatalf("stdout = %q, want %q", got, want)
 	}
+	assertCLIToolStatus(t, stdout.String(), stderr.String(), "read_file", "note.txt", "tool output")
 
 	firstRequest := <-requests
 	if firstRequest.Path != "/responses" {
@@ -738,6 +796,7 @@ func TestRunAnthropicMessagesProviderExecutesToolUseAndReturnsToolResult(t *test
 	if got, want := stdout.String(), "done"; got != want {
 		t.Fatalf("stdout = %q, want %q", got, want)
 	}
+	assertCLIToolStatus(t, stdout.String(), stderr.String(), "read_file", "note.txt", "tool output")
 
 	firstRequest := <-requests
 	if firstRequest.Path != "/messages" {
@@ -1215,6 +1274,7 @@ func TestRunExecutesToolCallAndContinuesToFinalText(t *testing.T) {
 	if got, want := stdout.String(), "done"; got != want {
 		t.Fatalf("stdout = %q, want %q", got, want)
 	}
+	assertCLIToolStatus(t, stdout.String(), stderr.String(), "read_file", "note.txt", "tool output")
 
 	firstRequest := <-requests
 	if got := firstRequest.Body["model"]; got != "model-default" {
@@ -1268,6 +1328,7 @@ func TestRunWritesJSONLLogForToolCallWithoutSensitiveContent(t *testing.T) {
 	if got, want := stdout.String(), "final response secret"; got != want {
 		t.Fatalf("stdout = %q, want %q", got, want)
 	}
+	assertCLIToolStatus(t, stdout.String(), stderr.String(), "read_file", "note.txt", "tool output secret")
 	<-requests
 	<-requests
 	assertNoAdditionalCLIRunRequest(t, requests)
@@ -1501,7 +1562,8 @@ func TestRunReasoningIsHiddenUnlessShowReasoningIsSet(t *testing.T) {
 
 func TestWriteStreamDoesNotColorReasoningForBufferOutput(t *testing.T) {
 	var stdout bytes.Buffer
-	err := writeStream(&stdout, cliEventStream(
+	var stderr bytes.Buffer
+	err := writeStream(&stdout, &stderr, cliEventStream(
 		model.ReasoningDeltaEvent{Text: "shown"},
 		model.TextDeltaEvent{Text: "visible"},
 	), true, nil)
@@ -1519,7 +1581,8 @@ func TestWriteStreamDoesNotColorReasoningForBufferOutput(t *testing.T) {
 
 func TestWriteStreamWithOptionsColorsReasoningAndResetsBeforeFinalText(t *testing.T) {
 	var stdout bytes.Buffer
-	err := writeStreamWithOptions(&stdout, cliEventStream(
+	var stderr bytes.Buffer
+	err := writeStreamWithOptions(&stdout, &stderr, cliEventStream(
 		model.ReasoningDeltaEvent{Text: "thinking"},
 		model.TextDeltaEvent{Text: "final"},
 	), true, nil, streamOutputOptions{colorReasoning: true})
@@ -1534,7 +1597,8 @@ func TestWriteStreamWithOptionsColorsReasoningAndResetsBeforeFinalText(t *testin
 
 func TestWriteStreamWithOptionsResetsAfterReasoningOnly(t *testing.T) {
 	var stdout bytes.Buffer
-	err := writeStreamWithOptions(&stdout, cliEventStream(
+	var stderr bytes.Buffer
+	err := writeStreamWithOptions(&stdout, &stderr, cliEventStream(
 		model.ReasoningDeltaEvent{Text: "thinking"},
 	), true, nil, streamOutputOptions{colorReasoning: true})
 
@@ -2395,6 +2459,22 @@ func assertCLIVerboseContains(t *testing.T, got string, wants ...string) {
 	for _, want := range wants {
 		if !strings.Contains(got, want) {
 			t.Fatalf("verbose stderr = %q, want contain %q", got, want)
+		}
+	}
+}
+
+func assertCLIToolStatus(t *testing.T, stdout, stderr, toolName string, hiddenValues ...string) {
+	t.Helper()
+
+	if strings.Contains(stdout, "tool:") || strings.Contains(stdout, toolName) {
+		t.Fatalf("stdout contains tool status: %q", stdout)
+	}
+	if !strings.Contains(stderr, "tool: "+toolName+"\n") {
+		t.Fatalf("stderr = %q, want tool status for %q", stderr, toolName)
+	}
+	for _, value := range hiddenValues {
+		if strings.Contains(stderr, value) {
+			t.Fatalf("stderr leaked tool detail %q: %s", value, stderr)
 		}
 	}
 }

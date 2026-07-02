@@ -103,7 +103,9 @@ error
 ```
 
 CLI 默认只打印 `text_delta`。`reasoning_delta` 默认隐藏，后续通过
-`--show-reasoning` 显示。
+`--show-reasoning` 显示。发生 tool call 时，CLI 默认向 stderr 打印简短工具状态
+（例如 `tool: read_file`），不需要 `--verbose`；状态只包含工具名，不包含 arguments
+或 tool result 正文，stdout 仍只承载模型可见输出。
 
 ## Agent Loop
 
@@ -152,6 +154,10 @@ sai models -h
 sai help models
 sai models list -h
 sai help models list
+sai tools -h
+sai help tools
+sai tools list -h
+sai help tools list
 sai mcp -h
 sai help mcp
 sai mcp list -h
@@ -443,6 +449,9 @@ list_files
 read_file
 shell
 ```
+
+可用 `sai tools list` 静态列出上述内置工具。该命令和 help 路径一样在配置加载前完成，
+不读取 `.agents` 配置、不解析 provider API key。
 
 工具默认不启用。只有出现在配置文件 `tools.enabled` 中，或通过命令行
 `--enable-tools` 指定时，才会暴露给模型。

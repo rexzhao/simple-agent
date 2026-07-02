@@ -121,6 +121,16 @@ func execute(args []string, stdin io.Reader, stdout, stderr io.Writer, getwd fun
 			fmt.Fprintf(stdout, "%s\t%s\t%s\n", model.Provider, model.Profile, model.ID)
 		}
 		return nil
+	case "tools":
+		if len(remaining) == 2 && isHelpArg(remaining[1]) {
+			printToolsUsage(stdout)
+			return nil
+		}
+		if isNestedHelp(remaining[1:], "list") {
+			printToolsListUsage(stdout)
+			return nil
+		}
+		return toolsCommand(remaining[1:], stdout)
 	case "mcp":
 		if len(remaining) == 2 && isHelpArg(remaining[1]) {
 			printMCPUsage(stdout)
@@ -147,6 +157,7 @@ Commands:
   chat               Start a line-oriented chat session
   config show        Print resolved config with secrets redacted
   models list        List configured provider model profiles
+  tools list         List built-in tools
   mcp list           List configured MCP servers
   version            Print version
   help [command]     Show usage
@@ -195,6 +206,19 @@ const modelsListUsageText = `usage: sai models list
 Lists configured provider model profiles.
 `
 
+const toolsUsageText = `usage: sai tools <command>
+
+Commands:
+  tools list         List built-in tools
+
+Run "sai help tools list" for command usage.
+`
+
+const toolsListUsageText = `usage: sai tools list
+
+Lists built-in tools.
+`
+
 const mcpUsageText = `usage: sai mcp <command>
 
 Commands:
@@ -229,6 +253,10 @@ func helpCommand(args []string, stdout io.Writer) error {
 		printModelsUsage(stdout)
 	case "models list":
 		printModelsListUsage(stdout)
+	case "tools":
+		printToolsUsage(stdout)
+	case "tools list":
+		printToolsListUsage(stdout)
 	case "mcp":
 		printMCPUsage(stdout)
 	case "mcp list":
@@ -269,6 +297,14 @@ func printModelsUsage(stdout io.Writer) {
 
 func printModelsListUsage(stdout io.Writer) {
 	fmt.Fprint(stdout, modelsListUsageText)
+}
+
+func printToolsUsage(stdout io.Writer) {
+	fmt.Fprint(stdout, toolsUsageText)
+}
+
+func printToolsListUsage(stdout io.Writer) {
+	fmt.Fprint(stdout, toolsListUsageText)
 }
 
 func printMCPUsage(stdout io.Writer) {
@@ -351,6 +387,38 @@ func mcpCommand(args []string, configDir string, stdout io.Writer, getwd func() 
 	return nil
 }
 
+func toolsCommand(args []string, stdout io.Writer) error {
+	if len(args) == 0 || args[0] != "list" {
+		return usageError("usage: sai tools list", "", "sai help tools list")
+	}
+
+	flags := flag.NewFlagSet("sai tools list", flag.ContinueOnError)
+	flags.SetOutput(io.Discard)
+	if err := flags.Parse(args[1:]); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			printToolsListUsage(stdout)
+			return nil
+		}
+		return usageError(err.Error(), "", "sai help tools list")
+	}
+	if flags.NArg() != 0 {
+		return usageError("usage: sai tools list", "", "sai help tools list")
+	}
+
+	for _, name := range builtInToolNames() {
+		fmt.Fprintln(stdout, name)
+	}
+	return nil
+}
+
+func builtInToolNames() []string {
+	return []string{
+		tools.BuiltinListFiles,
+		tools.BuiltinReadFile,
+		tools.BuiltinShell,
+	}
+}
+
 type agentCommandFlags struct {
 	providerName  string
 	modelProfile  string
@@ -429,7 +497,7 @@ func runCommand(args []string, configDir string, stdout, stderr io.Writer, getwd
 		return err
 	}
 
-	return writeStream(stdout, events, runtime.showReasoning, runtime.logger)
+	return writeStream(stdout, stderr, events, runtime.showReasoning, runtime.logger)
 }
 
 func chatCommand(args []string, configDir string, stdin io.Reader, stdout, stderr io.Writer, getwd func() (string, error)) (chatErr error) {
@@ -501,7 +569,7 @@ func chatCommand(args []string, configDir string, stdin io.Reader, stdout, stder
 		}
 
 		tracker := &chatOutputWriter{w: stdout}
-		if err := writeStream(tracker, events, runtime.showReasoning, runtime.logger); err != nil {
+		if err := writeStream(tracker, stderr, events, runtime.showReasoning, runtime.logger); err != nil {
 			return err
 		}
 		result, ok := <-results
@@ -998,13 +1066,13 @@ type streamOutputOptions struct {
 	colorReasoning bool
 }
 
-func writeStream(stdout io.Writer, events <-chan model.Event, showReasoning bool, logger *eventlog.Logger) error {
-	return writeStreamWithOptions(stdout, events, showReasoning, logger, streamOutputOptions{
+func writeStream(stdout, stderr io.Writer, events <-chan model.Event, showReasoning bool, logger *eventlog.Logger) error {
+	return writeStreamWithOptions(stdout, stderr, events, showReasoning, logger, streamOutputOptions{
 		colorReasoning: shouldColorizeReasoning(stdout),
 	})
 }
 
-func writeStreamWithOptions(stdout io.Writer, events <-chan model.Event, showReasoning bool, logger *eventlog.Logger, options streamOutputOptions) (err error) {
+func writeStreamWithOptions(stdout, stderr io.Writer, events <-chan model.Event, showReasoning bool, logger *eventlog.Logger, options streamOutputOptions) (err error) {
 	needsReasoningBreak := false
 	reasoningEndedWithNewline := false
 	reasoningColorActive := false
@@ -1065,6 +1133,12 @@ func writeStreamWithOptions(stdout io.Writer, events <-chan model.Event, showRea
 				}
 				needsReasoningBreak = true
 				reasoningEndedWithNewline = strings.HasSuffix(event.Text, "\n")
+			}
+		case model.ToolCallDoneEvent:
+			if stderr != nil && event.ToolCall.Name != "" {
+				if _, err := fmt.Fprintf(stderr, "tool: %s\n", event.ToolCall.Name); err != nil {
+					return err
+				}
 			}
 		case model.ErrorEvent:
 			return streamError(event)
