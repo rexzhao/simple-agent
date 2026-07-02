@@ -284,20 +284,23 @@ assistant 输出、assistant tool calls 和 tool result messages，属于显式 
 --continue` 等价于恢复最近更新的 session；二者互斥。恢复后可以带 `--prompt` 和 `--quit`
 继续一轮，也可以不带 `--prompt` 进入 REPL。
 
+普通新 chat 中，`agent.show_reasoning` 可以从配置启用或关闭 reasoning 展示；命令行 bool
+flag 支持双向覆盖，`--show-reasoning` 等价于 `--show-reasoning=true`，而
+`--show-reasoning=false` 可以关闭本次 reasoning 展示。`sessions.enabled` 是 save-session
+默认值入口；`--save-session` 等价于 `--save-session=true`，而 `--save-session=false`
+可以关闭本次完整 session 保存，不另设重复配置字段。
+
 恢复时优先使用 session 文件中保存的 provider、model profile、model id、model parameters、
-enabled tools、enabled MCP、enabled skills 和 show_reasoning 来准备 runtime，避免“恢复了
-messages 却发给不同模型或工具集合”。如果本次命令显式传入了冲突的 `--provider`、
-`--model`、`--enable-tools`、`--enable-mcp`、`--enable-skills`、`--disable-skills` 或
-`--show-reasoning`，命令会失败并给出可读错误。可靠保存和恢复要求
+enabled tools、enabled MCP、enabled skills、show_reasoning 和保存行为来准备 runtime，避免
+“恢复了 messages 却发给不同模型或工具集合”。如果本次命令显式传入了冲突的
+`--provider`、`--model`、`--enable-tools`、`--enable-mcp`、`--enable-skills`、
+`--disable-skills`、`--show-reasoning=true/false`，或试图用 `--save-session=false` 改变
+恢复后的保存语义，命令会失败并给出可读错误。可靠保存和恢复要求
 `sessions.save_tool_results: true`；设为 `false` 时，`sai chat` 会拒绝启用保存或恢复。
 
-后续待办：把 reasoning 展示和 session 保存也纳入更明确的配置/CLI 覆盖模型。普通新
-chat 应允许在配置文件中设置 `show_reasoning` 和 save-session 默认值，并允许命令行显式
-覆盖这些配置；但 resume 例外，恢复时必须使用上一 session 保存的 provider、model、
-model parameters、tools、MCP、skills、show_reasoning、save-session 等关键参数，如果 CLI
-传入冲突覆盖，仍应拒绝而不是覆盖已保存参数。另一个后续 UX 要求是：一旦本次 chat 会
-保存完整敏感 session，首次敏感数据提示应在 CLI 启动完成后、读取用户输入前输出，不要等到
-第一次 provider 请求时才提示。
+一旦本次 chat 会保存完整敏感 session，CLI 会在 runtime 准备完成后、读取用户输入或发起
+provider 请求前输出一次敏感数据提示。提示只说明保存风险，不包含 prompt、assistant output、
+tool result 或注入指令正文。
 
 `sai sessions list`、`sai sessions show <id>`、`sai sessions delete <id>` 和
 `sai sessions prune --keep N` 使用配置解析后的 `sessions.dir`。即使

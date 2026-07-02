@@ -102,14 +102,16 @@ mcp_dir: mcp
 - `agent.max_turns`：一次 agent loop 最多请求模型的轮数。
 - `agent.stream`：默认是否启用 streaming。
 - `agent.show_reasoning`：默认是否显示 reasoning stream。
-- 后续待办：`agent.show_reasoning` 和 session 保存默认值需要支持更明确的配置/CLI 覆盖；
-  普通新 chat 可由 CLI 显式覆盖配置，但 resume 必须沿用已保存 session 的关键参数。
+  普通新 chat 中可用 `--show-reasoning=true/false` 显式覆盖配置；`--show-reasoning`
+  等价于 `--show-reasoning=true`。
 - `tools.enabled`：默认启用的工具列表。空列表表示不向模型暴露工具。
 - `skills.enabled`：默认启用的本地 skill id 列表。空列表表示不读取或注入任何 skill。
 - `logging.path`：JSONL 日志根/基准路径。相对路径基于配置根目录解析；例如
   `logs/sai.jsonl` 使用 `logs/` 作为 session root。空字符串表示禁用日志。
 - `logging.level`：日志级别。
 - `sessions.enabled`：M13 后的可恢复 session 开关。默认 `false`，不保存完整上下文。
+  普通新 chat 中可用 `--save-session=true/false` 显式覆盖配置；`--save-session`
+  等价于 `--save-session=true`。
 - `sessions.dir`：M13 后的可恢复 session 存储目录。相对路径基于配置根目录解析。
 - `sessions.save_tool_results`：M13 后启用 session 保存时是否保存完整 tool result messages。
   可靠 resume 需要保存 tool results；关闭后只能作为降级或诊断模式设计。
@@ -489,17 +491,15 @@ calls 和 tool result messages。`--resume <id>` 会从 `sessions.dir/<id>/sessi
 恢复，`--continue` 会选择 `sessions.dir` 下 `updated_at` 最新的 session。
 
 恢复时，runtime 使用 session 文件中保存的 provider、model profile、model id、model
-parameters、enabled tools、enabled MCP、enabled skills 和 show_reasoning。显式 CLI
-覆盖如果和 session 文件冲突会失败，例如恢复时同时传入不同的 `--model`、不同的
-`--enable-tools` 或冲突的 `--show-reasoning`。`sessions.save_tool_results: false` 当前不
-提供可靠降级模式；只要启用保存或恢复，CLI 会拒绝继续并提示必须设为 `true`。
+parameters、enabled tools、enabled MCP、enabled skills、show_reasoning 和保存行为。显式
+CLI 覆盖如果和 session 文件冲突会失败，例如恢复时同时传入不同的 `--model`、不同的
+`--enable-tools`、冲突的 `--show-reasoning=true/false`，或试图用 `--save-session=false`
+改变恢复后的保存语义。`sessions.save_tool_results: false` 当前不提供可靠降级模式；只要启用保存或恢复，
+CLI 会拒绝继续并提示必须设为 `true`。
 
-后续待办：普通新 chat 中，`show_reasoning` 和 save-session 默认值可以放在配置文件中，
-并允许命令行显式覆盖配置。`--resume` 和 `--continue` 不参与这类覆盖：恢复时必须使用
-之前 session 保存的 provider、model、model parameters、enabled tools、enabled MCP、
-enabled skills、show_reasoning、save-session 等关键参数；如果 CLI 传入冲突覆盖，继续
-拒绝。本次 chat 如果会保存完整敏感 session，首次敏感数据提示应在 CLI 启动完成后、读取
-用户输入前输出，而不是等到第一次 provider 请求。
+本次 chat 如果会保存完整敏感 session，首次敏感数据提示会在 CLI runtime 准备完成后、读取
+用户输入或发起 provider 请求前输出，并且整个进程只输出一次。提示不包含 prompt、assistant
+output、tool result 或注入指令正文。
 
 session 管理命令使用解析后的 `sessions.dir`，不要求 `sessions.enabled: true`，因此可以在
 关闭自动保存时查看或清理已有文件。`sai sessions list` 只列出 ID、更新时间、provider 和

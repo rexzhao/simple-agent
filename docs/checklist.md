@@ -266,9 +266,9 @@
 
 ## M14 后续待办：配置覆盖和 session 提示时机
 
-- [ ] 配置文件支持 `show_reasoning` 和 save-session 默认值，普通新 chat 可由 CLI 显式覆盖。
-- [ ] `--resume` / `--continue` 使用已保存 session 的 provider、model、参数、tools、MCP、skills、show_reasoning、save-session 等关键参数，CLI 冲突覆盖继续拒绝。
-- [ ] 启用 session 保存时，首次敏感数据提示在 CLI 启动完成后、读取用户输入前输出，而不是等到第一次 provider 请求。
+- [x] 配置文件支持 `show_reasoning` 和 save-session 默认值，普通新 chat 可由 CLI 显式覆盖。
+- [x] `--resume` / `--continue` 使用已保存 session 的 provider、model、参数、tools、MCP、skills、show_reasoning、save-session 等关键参数，CLI 冲突覆盖继续拒绝。
+- [x] 启用 session 保存时，首次敏感数据提示在 CLI 启动完成后、读取用户输入前输出，而不是等到第一次 provider 请求。
 
 ## M15：Input UX and Doctor
 

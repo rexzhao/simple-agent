@@ -109,6 +109,13 @@ sai sessions delete <id>
 sai sessions prune --keep 10
 ```
 
+Set `sessions.enabled: true` to make saving the default for new chats. Use
+`--save-session` or `--save-session=true` to enable it for one run, and
+`--save-session=false` to disable it for one new chat when the config default is
+true. When session saving is enabled, `sai chat` prints the sensitive-data
+notice after startup and before the first REPL prompt or provider request, and
+only prints it once.
+
 `sai sessions list` works even when `sessions.enabled` is `false`, so existing
 files can be inspected after automatic saving is disabled. `list` and `show`
 only print metadata and warnings; they do not print full messages, prompt
@@ -167,7 +174,10 @@ Show reasoning output, which is hidden by default:
 sai chat --quit --show-reasoning --provider paperhub --model glm-5.2 --prompt "Hello"
 ```
 
-Shown reasoning is printed directly without a marker line. When stdout is an
+You can also set `agent.show_reasoning: true` in config. `--show-reasoning` or
+`--show-reasoning=true` enables reasoning for one run, and
+`--show-reasoning=false` disables it for one new chat when the config default is
+true. Shown reasoning is printed directly without a marker line. When stdout is an
 interactive terminal, reasoning is shown in gray/dark ANSI style so it is easier
 to distinguish from the final answer. Tool status lines use their own muted
 stderr styling when supported, and every non-reasoning output resets the style

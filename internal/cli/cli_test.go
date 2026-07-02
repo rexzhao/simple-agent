@@ -1588,6 +1588,56 @@ func TestChatSaveSessionFlagWritesFullToolHistory(t *testing.T) {
 	assertSavedMessage(t, session.Messages, 4, model.MessageRoleAssistant, "done")
 }
 
+func TestChatSaveSessionFlagOverridesDisabledConfigAndPrintsNoticeBeforeProviderRequest(t *testing.T) {
+	var stdout bytes.Buffer
+	stderr := newSignalingWriter(resumableSessionSaveNoticeText)
+	requests := make(chan capturedCLIRunRequest, 1)
+	noticeAtRequest := make(chan string, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("ReadAll() error = %v", err)
+		}
+		noticeAtRequest <- stderr.String()
+		requests <- capturedCLIRunRequest{
+			Path:             r.URL.Path,
+			Authorization:    r.Header.Get("Authorization"),
+			XAPIKey:          r.Header.Get("x-api-key"),
+			AnthropicVersion: r.Header.Get("anthropic-version"),
+			ContentType:      r.Header.Get("Content-Type"),
+			RawBody:          body,
+			Body:             decodeCLIJSON(t, body),
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"one\"}}]}\n\n")
+		_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
+	}))
+	defer server.Close()
+
+	configDir := t.TempDir()
+	writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
+
+	code := RunWithIO([]string{"--config-dir", configDir, "chat", "--save-session", "--quit", "--prompt", "first prompt secret"}, strings.NewReader(""), &stdout, stderr, func() (string, error) {
+		return t.TempDir(), nil
+	})
+
+	if code != 0 {
+		t.Fatalf("RunWithIO() code = %d, stderr = %s", code, stderr.String())
+	}
+	atRequest := <-noticeAtRequest
+	if !strings.Contains(atRequest, resumableSessionSaveNoticeText) {
+		t.Fatalf("stderr at provider request = %q, want session save notice", atRequest)
+	}
+	assertCLIErrorOmits(t, atRequest, "first prompt secret", "one", "direct-secret-value")
+	<-requests
+	assertNoAdditionalCLIRunRequest(t, requests)
+	assertResumableSessionNoticeOnce(t, stderr.String())
+	session := loadOnlyCLISession(t, filepath.Join(configDir, "sessions"))
+	if len(session.Messages) != 3 {
+		t.Fatalf("len(saved messages) = %d, want 3: %#v", len(session.Messages), session.Messages)
+	}
+}
+
 func TestChatConfiguredSessionsSaveFullMessages(t *testing.T) {
 	server, requests := newCLIRunServer(t,
 		`{"choices":[{"delta":{"content":"one"}}]}`,
@@ -1607,6 +1657,8 @@ func TestChatConfiguredSessionsSaveFullMessages(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("RunWithIO() code = %d, stderr = %s", code, stderr.String())
 	}
+	assertResumableSessionNoticeOnce(t, stderr.String())
+	assertCLIErrorOmits(t, stderr.String(), "first", "one", "direct-secret-value")
 	<-requests
 	assertNoAdditionalCLIRunRequest(t, requests)
 
@@ -1625,6 +1677,36 @@ func TestChatConfiguredSessionsSaveFullMessages(t *testing.T) {
 	}
 	if session.Context.LastRequestTokens <= 0 || session.Context.LastInputTokens <= 0 || session.Context.LastTotalTokens <= 0 {
 		t.Fatalf("session context metadata missing usage estimates: %#v", session.Context)
+	}
+}
+
+func TestChatConfiguredSessionsCanBeDisabledBySaveSessionFalse(t *testing.T) {
+	server, requests := newCLIRunServer(t,
+		`{"choices":[{"delta":{"content":"one"}}]}`,
+		`[DONE]`,
+	)
+	defer server.Close()
+
+	configDir := t.TempDir()
+	writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
+	setCLISessionsConfig(t, configDir, true, true)
+
+	var stdout, stderr bytes.Buffer
+	code := RunWithIO([]string{"--config-dir", configDir, "chat", "--save-session=false", "--quit", "--prompt", "first prompt secret"}, strings.NewReader(""), &stdout, &stderr, func() (string, error) {
+		return t.TempDir(), nil
+	})
+
+	if code != 0 {
+		t.Fatalf("RunWithIO() code = %d, stderr = %s", code, stderr.String())
+	}
+	<-requests
+	assertNoAdditionalCLIRunRequest(t, requests)
+	if strings.Contains(stderr.String(), resumableSessionSaveNoticeText) {
+		t.Fatalf("stderr = %q, want no session save notice", stderr.String())
+	}
+	assertCLIErrorOmits(t, stderr.String(), "first prompt secret", "one", "direct-secret-value")
+	if _, err := os.Stat(filepath.Join(configDir, "sessions")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("sessions dir stat error = %v, want not exist", err)
 	}
 }
 
@@ -1695,8 +1777,12 @@ func TestChatConfiguredSessionNoticePrintsOnceWithoutSensitiveContent(t *testing
 	<-requests
 	<-requests
 	assertNoAdditionalCLIRunRequest(t, requests)
-	assertResumableSessionNoticeOnce(t, stderr.String())
-	assertCLIErrorOmits(t, stderr.String(), "first prompt secret", "second prompt secret", "first assistant secret", "second assistant secret", "direct-secret-value")
+	errOut := stderr.String()
+	assertResumableSessionNoticeOnce(t, errOut)
+	if !strings.HasPrefix(errOut, resumableSessionSaveNoticeText+"\n> ") {
+		t.Fatalf("stderr = %q, want session notice before first REPL prompt", errOut)
+	}
+	assertCLIErrorOmits(t, errOut, "first prompt secret", "second prompt secret", "first assistant secret", "second assistant secret", "direct-secret-value")
 }
 
 func TestChatResumeSendsRestoredMessagesAndSavesContinuation(t *testing.T) {
@@ -1861,6 +1947,51 @@ func TestChatResumeUsesSavedContextMetadataForBudget(t *testing.T) {
 	assertNoAdditionalCLIRunRequest(t, requests)
 }
 
+func TestChatResumeKeepsSavedShowReasoningWhenConfigEnablesIt(t *testing.T) {
+	server, requests := newCLIRunServer(t,
+		`{"choices":[{"delta":{"reasoning_content":"hidden reasoning secret"}}]}`,
+		`{"choices":[{"delta":{"content":"visible"}}]}`,
+		`[DONE]`,
+	)
+	defer server.Close()
+
+	configDir := t.TempDir()
+	writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
+	setCLIAgentShowReasoning(t, configDir, true)
+	sessionRoot := filepath.Join(configDir, "sessions")
+	writeCLISession(t, sessionRoot, sessions.Session{
+		ID:              "reasoning-session",
+		CreatedAt:       time.Date(2026, 7, 2, 3, 4, 5, 0, time.UTC),
+		UpdatedAt:       time.Date(2026, 7, 2, 3, 4, 6, 0, time.UTC),
+		Version:         sessions.CurrentVersion,
+		Provider:        "fake",
+		ModelProfile:    "default",
+		ModelID:         "model-default",
+		ShowReasoning:   false,
+		Messages:        []model.Message{{Role: model.MessageRoleUser, Content: "old prompt secret"}},
+		SaveToolResults: true,
+	})
+
+	var stdout, stderr bytes.Buffer
+	code := RunWithIO([]string{"--config-dir", configDir, "chat", "--resume", "reasoning-session", "--quit", "--prompt", "next prompt secret"}, strings.NewReader(""), &stdout, &stderr, func() (string, error) {
+		return t.TempDir(), nil
+	})
+
+	if code != 0 {
+		t.Fatalf("RunWithIO() code = %d, stderr = %s", code, stderr.String())
+	}
+	if got, want := stdout.String(), "visible"; got != want {
+		t.Fatalf("stdout = %q, want %q", got, want)
+	}
+	<-requests
+	assertNoAdditionalCLIRunRequest(t, requests)
+	assertCLIErrorOmits(t, stdout.String(), "hidden reasoning secret")
+	session := loadCLISession(t, sessionRoot, "reasoning-session")
+	if session.ShowReasoning {
+		t.Fatal("saved ShowReasoning = true, want false from resumed session")
+	}
+}
+
 func TestChatResumeRejectsConflictingCLISelections(t *testing.T) {
 	configDir := t.TempDir()
 	writeCLIRunFixtureInDir(t, configDir, "http://127.0.0.1:1", "direct-secret-value", "openai-chat")
@@ -1891,6 +2022,7 @@ func TestChatResumeRejectsConflictingCLISelections(t *testing.T) {
 		{name: "mcp", args: []string{"--enable-mcp", "remote"}, want: "--enable-mcp"},
 		{name: "skills", args: []string{"--enable-skills", "beta"}, want: "--enable-skills"},
 		{name: "reasoning", args: []string{"--show-reasoning"}, want: "--show-reasoning"},
+		{name: "save session false", args: []string{"--save-session=false"}, want: "--save-session=false"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -1909,6 +2041,30 @@ func TestChatResumeRejectsConflictingCLISelections(t *testing.T) {
 			assertCLIErrorContains(t, stderr.String(), "cannot resume session", tt.want)
 		})
 	}
+
+	writeCLISession(t, filepath.Join(configDir, "sessions"), sessions.Session{
+		ID:              "reasoning-enabled-session",
+		CreatedAt:       time.Date(2026, 7, 2, 3, 2, 0, 0, time.UTC),
+		UpdatedAt:       time.Date(2026, 7, 2, 3, 3, 0, 0, time.UTC),
+		Version:         sessions.CurrentVersion,
+		Provider:        "fake",
+		ModelProfile:    "default",
+		ModelID:         "model-default",
+		ShowReasoning:   true,
+		Messages:        []model.Message{{Role: model.MessageRoleUser, Content: "first"}},
+		SaveToolResults: true,
+	})
+	var stdout, stderr bytes.Buffer
+	code := RunWithIO([]string{"--config-dir", configDir, "chat", "--resume", "reasoning-enabled-session", "--show-reasoning=false", "--quit", "--prompt", "next"}, strings.NewReader(""), &stdout, &stderr, func() (string, error) {
+		return t.TempDir(), nil
+	})
+	if code != 1 {
+		t.Fatalf("RunWithIO(show reasoning false) code = %d, want 1", code)
+	}
+	if stdout.String() != "" {
+		t.Fatalf("stdout = %q, want empty", stdout.String())
+	}
+	assertCLIErrorContains(t, stderr.String(), "cannot resume session", "--show-reasoning=false")
 }
 
 func TestChatResumeAndContinueAreMutuallyExclusiveWithoutConfigLoad(t *testing.T) {
@@ -1924,6 +2080,78 @@ func TestChatResumeAndContinueAreMutuallyExclusiveWithoutConfigLoad(t *testing.T
 		t.Fatalf("stdout = %q, want empty", stdout.String())
 	}
 	assertCLIErrorContains(t, stderr.String(), "cannot use --resume with --continue", `Run "sai help chat" for usage.`)
+}
+
+func TestChatContinueRejectsConflictingReasoningAndSaveFlags(t *testing.T) {
+	configDir := t.TempDir()
+	writeCLIRunFixtureInDir(t, configDir, "http://127.0.0.1:1", "direct-secret-value", "openai-chat")
+	writeCLISession(t, filepath.Join(configDir, "sessions"), sessions.Session{
+		ID:              "latest-session",
+		CreatedAt:       time.Date(2026, 7, 2, 3, 0, 0, 0, time.UTC),
+		UpdatedAt:       time.Date(2026, 7, 2, 3, 1, 0, 0, time.UTC),
+		Version:         sessions.CurrentVersion,
+		Provider:        "fake",
+		ModelProfile:    "default",
+		ModelID:         "model-default",
+		ShowReasoning:   true,
+		Messages:        []model.Message{{Role: model.MessageRoleUser, Content: "first prompt secret"}},
+		SaveToolResults: true,
+	})
+
+	tests := []struct {
+		name string
+		args []string
+		want string
+	}{
+		{name: "reasoning false", args: []string{"--show-reasoning=false"}, want: "--show-reasoning=false"},
+		{name: "save false", args: []string{"--save-session=false"}, want: "--save-session=false"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			args := []string{"--config-dir", configDir, "chat", "--continue", "--quit", "--prompt", "next prompt secret"}
+			args = append(args, tt.args...)
+			var stdout, stderr bytes.Buffer
+			code := RunWithIO(args, strings.NewReader(""), &stdout, &stderr, func() (string, error) {
+				return t.TempDir(), nil
+			})
+			if code != 1 {
+				t.Fatalf("RunWithIO() code = %d, want 1", code)
+			}
+			if stdout.String() != "" {
+				t.Fatalf("stdout = %q, want empty", stdout.String())
+			}
+			assertCLIErrorContains(t, stderr.String(), "cannot resume session", tt.want)
+			assertCLIErrorOmits(t, stderr.String(), "first prompt secret", "next prompt secret", "direct-secret-value")
+		})
+	}
+}
+
+func TestChatResumeRejectsSessionSavedWithoutReliableToolResults(t *testing.T) {
+	configDir := t.TempDir()
+	writeCLIRunFixtureInDir(t, configDir, "http://127.0.0.1:1", "direct-secret-value", "openai-chat")
+	writeCLISession(t, filepath.Join(configDir, "sessions"), sessions.Session{
+		ID:              "partial-session",
+		Version:         sessions.CurrentVersion,
+		Provider:        "fake",
+		ModelProfile:    "default",
+		ModelID:         "model-default",
+		Messages:        []model.Message{{Role: model.MessageRoleUser, Content: "first prompt secret"}},
+		SaveToolResults: false,
+	})
+
+	var stdout, stderr bytes.Buffer
+	code := RunWithIO([]string{"--config-dir", configDir, "chat", "--resume", "partial-session", "--quit", "--prompt", "next prompt secret"}, strings.NewReader(""), &stdout, &stderr, func() (string, error) {
+		return t.TempDir(), nil
+	})
+
+	if code != 1 {
+		t.Fatalf("RunWithIO() code = %d, want 1", code)
+	}
+	if stdout.String() != "" {
+		t.Fatalf("stdout = %q, want empty", stdout.String())
+	}
+	assertCLIErrorContains(t, stderr.String(), `session "partial-session" cannot be reliably resumed because save_tool_results is false`)
+	assertCLIErrorOmits(t, stderr.String(), "first prompt secret", "next prompt secret", "direct-secret-value")
 }
 
 func TestChatSaveToolResultsFalseRejectsSaveAndResume(t *testing.T) {
@@ -3580,6 +3808,56 @@ func TestRunReasoningIsHiddenUnlessShowReasoningIsSet(t *testing.T) {
 		}
 	})
 
+	t.Run("config shows reasoning", func(t *testing.T) {
+		server, _ := newCLIRunServer(t,
+			`{"choices":[{"delta":{"reasoning_content":"shown"}}]}`,
+			`{"choices":[{"delta":{"content":"visible"}}]}`,
+			`[DONE]`,
+		)
+		defer server.Close()
+
+		configDir := t.TempDir()
+		writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
+		setCLIAgentShowReasoning(t, configDir, true)
+
+		var stdout, stderr bytes.Buffer
+		code := RunWithGetwd([]string{"--config-dir", configDir, "chat", "--quit", "--prompt", "Think"}, &stdout, &stderr, func() (string, error) {
+			return t.TempDir(), nil
+		})
+
+		if code != 0 {
+			t.Fatalf("RunWithGetwd() code = %d, stderr = %s", code, stderr.String())
+		}
+		if got, want := stdout.String(), "shown\nvisible"; got != want {
+			t.Fatalf("stdout = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("flag false hides configured reasoning", func(t *testing.T) {
+		server, _ := newCLIRunServer(t,
+			`{"choices":[{"delta":{"reasoning_content":"hidden"}}]}`,
+			`{"choices":[{"delta":{"content":"visible"}}]}`,
+			`[DONE]`,
+		)
+		defer server.Close()
+
+		configDir := t.TempDir()
+		writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
+		setCLIAgentShowReasoning(t, configDir, true)
+
+		var stdout, stderr bytes.Buffer
+		code := RunWithGetwd([]string{"--config-dir", configDir, "chat", "--quit", "--show-reasoning=false", "--prompt", "Think"}, &stdout, &stderr, func() (string, error) {
+			return t.TempDir(), nil
+		})
+
+		if code != 0 {
+			t.Fatalf("RunWithGetwd() code = %d, stderr = %s", code, stderr.String())
+		}
+		if got, want := stdout.String(), "visible"; got != want {
+			t.Fatalf("stdout = %q, want %q", got, want)
+		}
+	})
+
 	t.Run("flag does not duplicate reasoning newline", func(t *testing.T) {
 		server, _ := newCLIRunServer(t,
 			`{"choices":[{"delta":{"reasoning_content":"shown\n"}}]}`,
@@ -4068,6 +4346,21 @@ sessions:
   dir: sessions
   save_tool_results: %t
 `, enabled, saveToolResults)
+	writeCLIFile(t, configPath, updated)
+}
+
+func setCLIAgentShowReasoning(t *testing.T, configDir string, enabled bool) {
+	t.Helper()
+
+	configPath := filepath.Join(configDir, "sai.yaml")
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("ReadFile(%q) error = %v", configPath, err)
+	}
+	updated := strings.Replace(string(data), "  show_reasoning: false", fmt.Sprintf("  show_reasoning: %t", enabled), 1)
+	if updated == string(data) {
+		t.Fatalf("sai.yaml did not contain show_reasoning to replace:\n%s", data)
+	}
 	writeCLIFile(t, configPath, updated)
 }
 

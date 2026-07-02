@@ -888,18 +888,20 @@ func builtInToolNames() []string {
 }
 
 type agentCommandFlags struct {
-	providerName    string
-	modelProfile    string
-	prompt          promptTextFlag
-	showReasoning   bool
-	verbose         bool
-	enabledTools    toolNamesFlag
-	enabledSkills   skillIDsFlag
-	disableSkills   bool
-	enabledMCP      mcpServerIDsFlag
-	saveSession     bool
-	resumeID        string
-	continueSession bool
+	providerName     string
+	modelProfile     string
+	prompt           promptTextFlag
+	showReasoning    bool
+	showReasoningSet bool
+	verbose          bool
+	enabledTools     toolNamesFlag
+	enabledSkills    skillIDsFlag
+	disableSkills    bool
+	enabledMCP       mcpServerIDsFlag
+	saveSession      bool
+	saveSessionSet   bool
+	resumeID         string
+	continueSession  bool
 }
 
 func registerAgentCommandFlags(flags *flag.FlagSet, options *agentCommandFlags) {
@@ -936,6 +938,14 @@ func chatCommand(ctx context.Context, args []string, configDir string, stdin io.
 	if done || err != nil {
 		return err
 	}
+	flags.Visit(func(flag *flag.Flag) {
+		switch flag.Name {
+		case "show-reasoning":
+			options.showReasoningSet = true
+		case "save-session":
+			options.saveSessionSet = true
+		}
+	})
 	if err := options.validate("sai help chat"); err != nil {
 		return err
 	}
@@ -953,6 +963,9 @@ func chatCommand(ctx context.Context, args []string, configDir string, stdin io.
 	defer func() {
 		chatErr = errors.Join(chatErr, runtime.Close())
 	}()
+	if err := runtime.writeSessionSaveNotice(stderr); err != nil {
+		return err
+	}
 
 	messages := runtime.initialMessages()
 	if options.prompt.set {
@@ -1023,13 +1036,6 @@ func runChatTurn(ctx context.Context, runtime *agentRuntime, messages []model.Me
 		Messages:   requestMessages,
 		Tools:      runtime.toolSchemas,
 		Parameters: runtime.parameters,
-	}
-	noticeWritten, err := runtime.writeSessionSaveNotice(stderr, stderrNeedsLeadingBreak)
-	if err != nil {
-		return nil, err
-	}
-	if noticeWritten {
-		stderrNeedsLeadingBreak = false
 	}
 	events, results, err := agent.StreamWithResult(turnCtx, request, agent.Options{
 		Provider:     runtime.provider,
@@ -1158,20 +1164,15 @@ func (r *agentRuntime) initialMessages() []model.Message {
 	return copyMessageSlice(r.baseMessages)
 }
 
-func (r *agentRuntime) writeSessionSaveNotice(stderr io.Writer, needsLeadingBreak bool) (bool, error) {
+func (r *agentRuntime) writeSessionSaveNotice(stderr io.Writer) error {
 	if !r.saveSessions || r.sessionSaveNoticeDone || stderr == nil {
-		return false, nil
-	}
-	if needsLeadingBreak {
-		if _, err := fmt.Fprintln(stderr); err != nil {
-			return false, err
-		}
+		return nil
 	}
 	if _, err := fmt.Fprintln(stderr, resumableSessionSaveNoticeText); err != nil {
-		return false, err
+		return err
 	}
 	r.sessionSaveNoticeDone = true
-	return true, nil
+	return nil
 }
 
 func (r *agentRuntime) saveUpdatedMessages(messages []model.Message) error {
@@ -1224,7 +1225,13 @@ func prepareAgentRuntime(ctx context.Context, configDir string, options agentCom
 
 	var resumedSession sessions.Session
 	resumed := false
-	saveSessions := cfg.Sessions.Enabled || options.saveSession || options.resumeID != "" || options.continueSession
+	saveSessions := cfg.Sessions.Enabled
+	if options.saveSessionSet {
+		saveSessions = options.saveSession
+	}
+	if options.resumeID != "" || options.continueSession {
+		saveSessions = true
+	}
 	if saveSessions && !cfg.Sessions.SaveToolResults {
 		return nil, fmt.Errorf("resumable sessions require sessions.save_tool_results: true")
 	}
@@ -1297,7 +1304,10 @@ func prepareAgentRuntime(ctx context.Context, configDir string, options agentCom
 	}
 	toolSchemas = append(toolSchemas, mcpToolSchemas...)
 
-	resolvedShowReasoning := options.showReasoning || cfg.Agent.ShowReasoning
+	resolvedShowReasoning := cfg.Agent.ShowReasoning
+	if options.showReasoningSet {
+		resolvedShowReasoning = options.showReasoning
+	}
 	if resumed {
 		resolvedShowReasoning = resumedSession.ShowReasoning
 	}
@@ -1401,8 +1411,11 @@ func validateResumeCLIConflicts(session sessions.Session, options agentCommandFl
 	if options.disableSkills && len(session.EnabledSkills) != 0 {
 		return fmt.Errorf("cannot resume session %q with --disable-skills; session uses enabled skills %q", session.ID, strings.Join(session.EnabledSkills, ","))
 	}
-	if options.showReasoning && !session.ShowReasoning {
-		return fmt.Errorf("cannot resume session %q with --show-reasoning; session was saved with show_reasoning false", session.ID)
+	if options.showReasoningSet && options.showReasoning != session.ShowReasoning {
+		return fmt.Errorf("cannot resume session %q with --show-reasoning=%t; session was saved with show_reasoning %t", session.ID, options.showReasoning, session.ShowReasoning)
+	}
+	if options.saveSessionSet && !options.saveSession {
+		return fmt.Errorf("cannot resume session %q with --save-session=false; session continuation must keep resumable session saving enabled", session.ID)
 	}
 	return nil
 }

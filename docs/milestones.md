@@ -457,15 +457,17 @@ resumable session 保存 context management metadata，恢复后继续用该 met
 
 ## M14 后续待办：配置覆盖和 session 提示时机
 
-这些需求是 M14 候选实现后的追加记录，尚未进入当前实现范围：
+这些需求已作为 M14 后续小任务完成：
 
-- `show_reasoning` 和 save-session 默认值可以放在配置文件中，普通新 chat 允许命令行显式
-  覆盖配置。
+- `agent.show_reasoning` 和 `sessions.enabled` 分别作为 reasoning 展示和 save-session 的
+  配置默认值。普通新 chat 中，bool flag 支持 `--show-reasoning=true/false` 和
+  `--save-session=true/false` 双向覆盖配置；不带 `=false` 时等价于启用。
 - `--resume` 和 `--continue` 不允许这类覆盖：恢复时使用之前 session 保存的 provider、
   model、model parameters、tools、MCP、skills、show_reasoning、save-session 等关键参数；
-  如果 CLI 传入冲突覆盖，继续拒绝。
-- 启用 session 保存时，首次敏感数据提示应在 CLI 启动完成后、读取用户输入前输出，不要等到
-  第一次 provider 请求时才提示。
+  如果 CLI 传入冲突覆盖，继续拒绝，包括 `--show-reasoning=false` 或
+  `--save-session=false` 这类关键语义变化。
+- 启用 session 保存时，首次敏感数据提示在 CLI runtime 准备完成后、读取用户输入或发起
+  provider 请求前输出；整个进程只提示一次，且不打印正文敏感内容。
 
 ## M15：Input UX and Doctor
 
