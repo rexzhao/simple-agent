@@ -116,6 +116,26 @@ func (p ProviderConfig) MarshalJSON() ([]byte, error) {
 }
 
 func Load(configDir string) (*Config, error) {
+	cfg, err := LoadBase(configDir)
+	if err != nil {
+		return nil, err
+	}
+
+	providers, err := LoadProviderConfigs(cfg.ProviderDir)
+	if err != nil {
+		return nil, err
+	}
+	cfg.Providers = providers
+
+	mcpServers, err := LoadMCPServerConfigs(cfg.MCPDir)
+	if err != nil {
+		return nil, err
+	}
+	cfg.MCPServers = mcpServers
+	return cfg, nil
+}
+
+func LoadBase(configDir string) (*Config, error) {
 	if strings.TrimSpace(configDir) == "" {
 		return nil, fmt.Errorf("config directory is required")
 	}
@@ -149,17 +169,6 @@ func Load(configDir string) (*Config, error) {
 		cfg.MCPDir = resolvePath(absConfigDir, cfg.MCPDir)
 	}
 
-	providers, err := loadProviders(cfg.ProviderDir)
-	if err != nil {
-		return nil, err
-	}
-	cfg.Providers = providers
-
-	mcpServers, err := loadMCPServers(cfg.MCPDir)
-	if err != nil {
-		return nil, err
-	}
-	cfg.MCPServers = mcpServers
 	return &cfg, nil
 }
 
@@ -394,6 +403,14 @@ func defaultConfig() Config {
 }
 
 const defaultAgentMaxTurns = 8
+
+func LoadProviderConfigs(providerDir string) (map[string]ProviderConfig, error) {
+	return loadProviders(providerDir)
+}
+
+func LoadMCPServerConfigs(mcpDir string) (map[string]MCPServerConfig, error) {
+	return loadMCPServers(mcpDir)
+}
 
 func loadProviders(providerDir string) (map[string]ProviderConfig, error) {
 	entries, err := os.ReadDir(providerDir)

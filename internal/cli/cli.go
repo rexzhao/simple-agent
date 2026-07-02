@@ -57,11 +57,16 @@ func RunWithContext(ctx context.Context, args []string, stdin io.Reader, stdout,
 		ctx = context.Background()
 	}
 	if err := execute(ctx, args, stdin, stdout, stderr, getwd); err != nil {
+		if errors.Is(err, errSilentExit) {
+			return 1
+		}
 		fmt.Fprintf(stderr, "sai: %v\n", err)
 		return 1
 	}
 	return 0
 }
+
+var errSilentExit = errors.New("silent exit")
 
 func execute(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer, getwd func() (string, error)) error {
 	rootArgs, err := splitRootArgs(args)
@@ -107,6 +112,8 @@ func execute(ctx context.Context, args []string, stdin io.Reader, stdout, stderr
 			return usageError("usage: sai models list", "", "sai help models list")
 		}
 		return modelsListCommand(subArgs, rootArgs.configDir, stdout, getwd)
+	case "doctor":
+		return doctorCommand(rootArgs.commandArgs, rootArgs.configDir, stdout, getwd)
 	case "tools":
 		subcommand, subArgs, groupHelp, err := splitSubcommandArgs(rootArgs.commandArgs, nil, "sai help tools")
 		if err != nil {
@@ -167,6 +174,7 @@ Commands:
   chat              Start a chat session
   config show        Print resolved config with secrets redacted
   models list        List configured provider model profiles
+  doctor            Check local configuration health
   tools list         List built-in tools
   mcp list           List configured MCP servers
   sessions           Manage resumable sessions
@@ -218,6 +226,14 @@ Run "sai help models list" for command usage.
 const modelsListUsageText = `usage: sai models list
 
 Lists configured provider model profiles.
+`
+
+const doctorUsageText = `usage: sai doctor
+
+Checks local configuration files, default model selection, enabled local tools,
+skills, MCP server configuration, and JSONL log directory writability without
+sending provider HTTP requests, starting MCP servers, running a model, or
+printing secrets.
 `
 
 const toolsUsageText = `usage: sai tools <command>
@@ -299,6 +315,8 @@ func helpCommand(args []string, stdout io.Writer) error {
 		printModelsUsage(stdout)
 	case "models list":
 		printModelsListUsage(stdout)
+	case "doctor":
+		printDoctorUsage(stdout)
 	case "tools":
 		printToolsUsage(stdout)
 	case "tools list":
@@ -349,6 +367,10 @@ func printModelsUsage(stdout io.Writer) {
 
 func printModelsListUsage(stdout io.Writer) {
 	fmt.Fprint(stdout, modelsListUsageText)
+}
+
+func printDoctorUsage(stdout io.Writer) {
+	fmt.Fprint(stdout, doctorUsageText)
 }
 
 func printToolsUsage(stdout io.Writer) {
@@ -638,6 +660,374 @@ func modelsListCommand(args []string, configDir string, stdout io.Writer, getwd 
 		fmt.Fprintf(stdout, "%s\t%s\t%s\n", model.Provider, model.Profile, model.ID)
 	}
 	return nil
+}
+
+func doctorCommand(args []string, configDir string, stdout io.Writer, getwd func() (string, error)) error {
+	flags := flag.NewFlagSet("sai doctor", flag.ContinueOnError)
+	positionals, done, err := parseCommandFlagArgs(flags, args, stdout, printDoctorUsage, "sai help doctor")
+	if done || err != nil {
+		return err
+	}
+	if len(positionals) != 0 {
+		return usageError("usage: sai doctor", "", "sai help doctor")
+	}
+
+	results := runDoctor(configDir, getwd)
+	hasError := false
+	for _, result := range results {
+		if result.status == doctorStatusError {
+			hasError = true
+		}
+		if _, err := fmt.Fprintf(stdout, "%s %s %s\n", result.status, result.subject, result.detail); err != nil {
+			return err
+		}
+	}
+	if hasError {
+		return errSilentExit
+	}
+	return nil
+}
+
+type doctorStatus string
+
+const (
+	doctorStatusOK    doctorStatus = "OK"
+	doctorStatusWarn  doctorStatus = "WARN"
+	doctorStatusError doctorStatus = "ERROR"
+)
+
+type doctorResult struct {
+	status  doctorStatus
+	subject string
+	detail  string
+}
+
+func runDoctor(configDir string, getwd func() (string, error)) []doctorResult {
+	var results []doctorResult
+	add := func(status doctorStatus, subject, detail string) {
+		results = append(results, doctorResult{status: status, subject: subject, detail: detail})
+	}
+
+	resolvedConfigDir, err := resolveConfigDir(configDir, getwd)
+	if err != nil {
+		add(doctorStatusError, "config_dir", err.Error())
+		return results
+	}
+	if err := checkExistingDirectory(resolvedConfigDir); err != nil {
+		add(doctorStatusError, "config_dir", fmt.Sprintf("%s: %v", resolvedConfigDir, err))
+	} else {
+		add(doctorStatusOK, "config_dir", resolvedConfigDir)
+	}
+
+	configPath := filepath.Join(resolvedConfigDir, "sai.yaml")
+	if _, err := os.ReadFile(configPath); err != nil {
+		add(doctorStatusError, "sai.yaml", fmt.Sprintf("%s: %v", configPath, err))
+		return results
+	}
+	add(doctorStatusOK, "sai.yaml", fmt.Sprintf("%s readable", configPath))
+
+	cfg, err := config.LoadBase(resolvedConfigDir)
+	if err != nil {
+		add(doctorStatusError, "sai.yaml", err.Error())
+		return results
+	}
+
+	providersLoaded := checkDoctorProviders(cfg, add)
+	if providersLoaded {
+		checkDoctorDefaultModel(cfg, add)
+	}
+	selectedMCPServers := checkDoctorMCP(cfg, add)
+	checkDoctorSkills(cfg, add)
+	checkDoctorTools(cfg, selectedMCPServers, getwd, add)
+	checkDoctorLogging(cfg, add)
+	return results
+}
+
+func checkDoctorProviders(cfg *config.Config, add func(doctorStatus, string, string)) bool {
+	providers, err := config.LoadProviderConfigs(cfg.ProviderDir)
+	if err != nil {
+		add(doctorStatusError, "provider_files", err.Error())
+		return false
+	}
+	cfg.Providers = providers
+	add(doctorStatusOK, "provider_files", fmt.Sprintf("%d loaded from %s", len(providers), cfg.ProviderDir))
+	return true
+}
+
+func checkDoctorDefaultModel(cfg *config.Config, add func(doctorStatus, string, string)) {
+	resolved, err := cfg.ResolveModel("", "")
+	if err != nil {
+		subject := "default_model"
+		if strings.Contains(err.Error(), "api_key") {
+			subject = "api_key"
+		}
+		add(doctorStatusError, subject, err.Error())
+		return
+	}
+	add(doctorStatusOK, "default_model", fmt.Sprintf("%s/%s -> %s", resolved.ProviderName, resolved.Profile, resolved.ModelID))
+	if strings.TrimSpace(resolved.Provider.ResolvedAPIKey) == "" {
+		add(doctorStatusError, "api_key", fmt.Sprintf("provider %q has no api_key configured", resolved.ProviderName))
+		return
+	}
+	add(doctorStatusOK, "api_key", fmt.Sprintf("provider %q configured", resolved.ProviderName))
+}
+
+func checkDoctorMCP(cfg *config.Config, add func(doctorStatus, string, string)) []config.MCPServerConfig {
+	if strings.TrimSpace(cfg.MCPDir) == "" {
+		add(doctorStatusWarn, "mcp_dir", "disabled; no MCP servers configured")
+		return nil
+	}
+
+	mcpDirExists := true
+	if err := checkExistingDirectory(cfg.MCPDir); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			mcpDirExists = false
+			add(doctorStatusWarn, "mcp_dir", fmt.Sprintf("%s not found; no MCP servers configured", cfg.MCPDir))
+		} else {
+			add(doctorStatusError, "mcp_dir", fmt.Sprintf("%s: %v", cfg.MCPDir, err))
+			return nil
+		}
+	}
+
+	servers, err := config.LoadMCPServerConfigs(cfg.MCPDir)
+	if err != nil {
+		add(doctorStatusError, "mcp_dir", err.Error())
+		return nil
+	}
+	cfg.MCPServers = servers
+	if mcpDirExists {
+		add(doctorStatusOK, "mcp_dir", fmt.Sprintf("%d servers loaded from %s", len(servers), cfg.MCPDir))
+	}
+
+	selected, err := cfg.SelectedMCPServers(nil, false)
+	if err != nil {
+		add(doctorStatusError, "enabled_mcp", err.Error())
+		return nil
+	}
+	if len(selected) == 0 {
+		add(doctorStatusOK, "enabled_mcp", "(none)")
+		return nil
+	}
+	add(doctorStatusOK, "enabled_mcp", formatDoctorServerIDs(selected))
+	return selected
+}
+
+func checkDoctorSkills(cfg *config.Config, add func(doctorStatus, string, string)) {
+	if strings.TrimSpace(cfg.SkillDir) == "" {
+		if len(cfg.Skills.Enabled) == 0 {
+			add(doctorStatusWarn, "skill_dir", "disabled; no skills enabled")
+		} else {
+			add(doctorStatusError, "skill_dir", "disabled but skills.enabled is not empty")
+		}
+		return
+	}
+
+	skillDirExists := true
+	if err := checkExistingDirectory(cfg.SkillDir); err != nil {
+		if errors.Is(err, os.ErrNotExist) && len(cfg.Skills.Enabled) == 0 {
+			skillDirExists = false
+			add(doctorStatusWarn, "skill_dir", fmt.Sprintf("%s not found; no skills enabled", cfg.SkillDir))
+		} else {
+			add(doctorStatusError, "skill_dir", fmt.Sprintf("%s: %v", cfg.SkillDir, err))
+		}
+	}
+
+	if skillDirExists {
+		refs, err := localskills.DiscoverRefs(cfg.SkillDir)
+		if err != nil {
+			add(doctorStatusError, "skill_dir", err.Error())
+		} else {
+			add(doctorStatusOK, "skill_dir", fmt.Sprintf("%d available in %s", len(refs), cfg.SkillDir))
+		}
+	}
+
+	if len(cfg.Skills.Enabled) == 0 {
+		add(doctorStatusOK, "enabled_skills", "(none)")
+		return
+	}
+	selected, err := enabledSkillsForRun(cfg, nil, false, false)
+	if err != nil {
+		add(doctorStatusError, "enabled_skills", err.Error())
+		return
+	}
+	add(doctorStatusOK, "enabled_skills", strings.Join(skillIDs(selected), ","))
+}
+
+func checkDoctorTools(cfg *config.Config, selectedMCPServers []config.MCPServerConfig, getwd func() (string, error), add func(doctorStatus, string, string)) {
+	if len(cfg.Tools.Enabled) == 0 {
+		add(doctorStatusOK, "enabled_tools", "(none)")
+		return
+	}
+
+	errorsBefore := 0
+	addToolError := func(detail string) {
+		errorsBefore++
+		add(doctorStatusError, "enabled_tools", detail)
+	}
+
+	if hasBuiltinEnabledTool(cfg.Tools.Enabled) {
+		cwd, err := getwd()
+		if err != nil {
+			addToolError(fmt.Sprintf("get current directory: %v", err))
+		} else if _, _, err := enabledToolsForRun(cwd, cfg.Tools.Enabled); err != nil {
+			addToolError(err.Error())
+		}
+	}
+
+	selectedMCP := make(map[string]bool, len(selectedMCPServers))
+	for _, server := range selectedMCPServers {
+		selectedMCP[server.ID] = true
+	}
+	for _, name := range cfg.Tools.Enabled {
+		if !strings.HasPrefix(name, "mcp.") {
+			continue
+		}
+		serverID, _, err := mcp.ParseToolName(name)
+		if err != nil {
+			addToolError(err.Error())
+			continue
+		}
+		if _, ok := cfg.MCPServers[serverID]; !ok {
+			addToolError(fmt.Sprintf("enabled MCP tool %q references unknown MCP server %q", name, serverID))
+			continue
+		}
+		if !selectedMCP[serverID] {
+			addToolError(fmt.Sprintf("enabled MCP tool %q references MCP server %q, but it is not enabled", name, serverID))
+		}
+	}
+
+	if errorsBefore == 0 {
+		add(doctorStatusOK, "enabled_tools", strings.Join(cfg.Tools.Enabled, ","))
+	}
+}
+
+func checkDoctorLogging(cfg *config.Config, add func(doctorStatus, string, string)) {
+	if strings.TrimSpace(cfg.Logging.Path) == "" {
+		add(doctorStatusOK, "logging", "disabled")
+		return
+	}
+
+	root := doctorLogSessionRoot(cfg.Logging.Path)
+	if err := probeWritableDirectory(root); err != nil {
+		add(doctorStatusError, "logging", fmt.Sprintf("%s: %v", root, err))
+		return
+	}
+	add(doctorStatusOK, "logging", fmt.Sprintf("%s writable", root))
+}
+
+func resolveConfigDir(configDir string, getwd func() (string, error)) (string, error) {
+	if strings.TrimSpace(configDir) == "" {
+		cwd, err := getwd()
+		if err != nil {
+			return "", fmt.Errorf("get current directory: %w", err)
+		}
+		configDir = filepath.Join(cwd, ".agents")
+	}
+	abs, err := filepath.Abs(configDir)
+	if err != nil {
+		return "", fmt.Errorf("resolve config directory: %w", err)
+	}
+	return filepath.Clean(abs), nil
+}
+
+func checkExistingDirectory(path string) error {
+	info, err := os.Stat(path)
+	if err != nil {
+		return err
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("not a directory")
+	}
+	return nil
+}
+
+func hasBuiltinEnabledTool(enabled []string) bool {
+	for _, name := range enabled {
+		if !strings.HasPrefix(name, "mcp.") {
+			return true
+		}
+	}
+	return false
+}
+
+func formatDoctorServerIDs(servers []config.MCPServerConfig) string {
+	if len(servers) == 0 {
+		return "(none)"
+	}
+	ids := make([]string, 0, len(servers))
+	for _, server := range servers {
+		ids = append(ids, server.ID)
+	}
+	return strings.Join(ids, ",")
+}
+
+func doctorLogSessionRoot(path string) string {
+	path = filepath.Clean(path)
+	if filepath.Ext(filepath.Base(path)) != "" {
+		return filepath.Dir(path)
+	}
+	return path
+}
+
+func probeWritableDirectory(path string) error {
+	path = filepath.Clean(path)
+	if strings.TrimSpace(path) == "" || path == "." {
+		return fmt.Errorf("directory is required")
+	}
+
+	created := missingDirectoryAncestors(path)
+	if err := os.MkdirAll(path, 0o755); err != nil {
+		cleanupCreatedDirectories(created)
+		return fmt.Errorf("create directory: %w", err)
+	}
+	defer cleanupCreatedDirectories(created)
+
+	info, err := os.Stat(path)
+	if err != nil {
+		return fmt.Errorf("stat directory: %w", err)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("not a directory")
+	}
+
+	file, err := os.CreateTemp(path, ".sai-doctor-*")
+	if err != nil {
+		return fmt.Errorf("create probe file: %w", err)
+	}
+	name := file.Name()
+	closeErr := file.Close()
+	removeErr := os.Remove(name)
+	if closeErr != nil {
+		return fmt.Errorf("close probe file: %w", closeErr)
+	}
+	if removeErr != nil {
+		return fmt.Errorf("remove probe file: %w", removeErr)
+	}
+	return nil
+}
+
+func missingDirectoryAncestors(path string) []string {
+	var missing []string
+	for {
+		if _, err := os.Stat(path); err == nil {
+			return missing
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return missing
+		}
+
+		missing = append(missing, path)
+		parent := filepath.Dir(path)
+		if parent == path {
+			return missing
+		}
+		path = parent
+	}
+}
+
+func cleanupCreatedDirectories(paths []string) {
+	for _, path := range paths {
+		_ = os.Remove(path)
+	}
 }
 
 func mcpListCommand(args []string, configDir string, stdout io.Writer, getwd func() (string, error)) error {

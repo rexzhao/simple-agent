@@ -166,6 +166,7 @@ sai sessions prune --keep 10
 sai tools list
 sai models list
 sai config show
+sai doctor
 sai mcp list  # M4
 ```
 
@@ -189,6 +190,8 @@ sai models -h
 sai help models
 sai models list -h
 sai help models list
+sai doctor -h
+sai help doctor
 sai tools -h
 sai help tools
 sai tools list -h
@@ -213,6 +216,14 @@ help 输出写到 stdout，exit code 为 0。help 必须在配置加载前完成
 配置、不解析 provider API key、不读取 enabled skills 或 MCP 配置，也不能打印任何配置值
 或 secrets。未知命令和错误参数仍以 exit code 1 失败，并给出可读错误和类似
 `Run "sai help" for usage.` 的提示。
+
+`sai doctor` 是本地配置健康检查命令。`sai doctor -h`、`sai doctor --help` 和
+`sai help doctor` 只显示 help，不加载配置。真正执行检查时，它读取配置根目录、
+`sai.yaml`、provider 文件、skills/MCP 配置和 enabled tools，用简单的
+`OK ...`、`WARN ...`、`ERROR ...` 行写到 stdout；只要出现 `ERROR`，退出码就是 1。
+doctor 不发起 provider HTTP 请求、不启动 MCP server、不运行模型，也不能打印 API key、
+直接 secret 值、环境变量实际值、MCP env 实际值或 Authorization 信息。日志检查只验证
+`logging.path` 对应的 session root/父目录可创建可写，不创建真正的 session log 文件。
 
 根层解析从 argv 左到右扫描，跳过已知 flag 及其 value；第一个真正的非 flag token 是命令。
 没有命令 token 时默认执行 `chat`，并把已扫描到的 chat flags 交给 `chat` 解析，因此

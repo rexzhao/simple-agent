@@ -109,6 +109,19 @@ to stderr with only token counts and the window size. At or above the window it
 refuses to send the provider request. It does not silently truncate or summarize
 system/developer instructions, tool schemas, tool results, or prior messages.
 
+Check local configuration health without starting a chat:
+
+```sh
+sai doctor
+sai --config-dir ./config doctor
+```
+
+`sai doctor` checks local config files, provider/default model resolution, API
+key configuration, enabled tools/skills/MCP config, and log directory
+writability. It does not send model requests or start MCP servers, and its
+output is redacted so it does not print secrets. It writes `OK`, `WARN`, and
+`ERROR` lines to stdout; any `ERROR` makes the command exit with code 1.
+
 Resumable sessions are an explicit opt-in feature. They save full prompts,
 assistant output, assistant tool calls, and tool results under `sessions.dir`,
 so treat those files as sensitive:

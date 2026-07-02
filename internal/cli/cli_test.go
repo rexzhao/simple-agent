@@ -363,6 +363,324 @@ func TestConfigShowMixedHelpDoesNotLoadConfig(t *testing.T) {
 	}
 }
 
+func TestDoctorHelpDoesNotLoadConfig(t *testing.T) {
+	for _, args := range [][]string{
+		{"doctor", "-h"},
+		{"doctor", "--help"},
+		{"help", "doctor"},
+	} {
+		t.Run(strings.Join(args, " "), func(t *testing.T) {
+			assertCLIHelpWithoutConfig(t, args, "usage: sai doctor", "provider HTTP requests", "starting MCP servers", "running a model", "printing secrets")
+		})
+	}
+}
+
+func TestDoctorAcceptsConfigDirBeforeAndAfterCommand(t *testing.T) {
+	dir := t.TempDir()
+	writeCLIRunFixtureInDir(t, dir, "http://127.0.0.1:1", "direct-secret-value", "openai-chat")
+
+	for _, args := range [][]string{
+		{"--config-dir", dir, "doctor"},
+		{"doctor", "--config-dir", dir},
+	} {
+		t.Run(strings.Join(args, " "), func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			code := RunWithGetwd(args, &stdout, &stderr, func() (string, error) {
+				return "", errors.New("getwd should not be called")
+			})
+			if code != 0 {
+				t.Fatalf("RunWithGetwd() code = %d, stderr = %s, stdout = %s", code, stderr.String(), stdout.String())
+			}
+			if stderr.String() != "" {
+				t.Fatalf("stderr = %q, want empty", stderr.String())
+			}
+			out := stdout.String()
+			for _, want := range []string{"OK config_dir", "OK sai.yaml", "OK provider_files", "OK default_model", "OK api_key"} {
+				if !strings.Contains(out, want) {
+					t.Fatalf("doctor output = %s, want contain %q", out, want)
+				}
+			}
+			assertCLIErrorOmits(t, out, "direct-secret-value")
+		})
+	}
+}
+
+func TestDoctorSuccessChecksEnabledLocalConfig(t *testing.T) {
+	configDir := t.TempDir()
+	projectDir := t.TempDir()
+	writeCLIRunFixtureInDirWithToolsAndSkills(t, configDir, "http://127.0.0.1:1", "direct-secret-value", "openai-chat", []string{"list_files", "mcp.local.search"}, []string{"alpha"})
+	writeCLISkill(t, configDir, "alpha", "skill instructions")
+	if err := os.MkdirAll(filepath.Join(configDir, "mcp"), 0o755); err != nil {
+		t.Fatalf("MkdirAll(mcp) error = %v", err)
+	}
+	writeCLIFile(t, filepath.Join(configDir, "mcp", "local.yaml"), `id: local
+enabled: true
+command: fake-mcp-server
+args: []
+env: {}
+`)
+
+	var stdout, stderr bytes.Buffer
+	code := RunWithGetwd([]string{"--config-dir", configDir, "doctor"}, &stdout, &stderr, func() (string, error) {
+		return projectDir, nil
+	})
+
+	if code != 0 {
+		t.Fatalf("RunWithGetwd() code = %d, stderr = %s, stdout = %s", code, stderr.String(), stdout.String())
+	}
+	if stderr.String() != "" {
+		t.Fatalf("stderr = %q, want empty", stderr.String())
+	}
+	out := stdout.String()
+	for _, want := range []string{
+		"OK config_dir",
+		"OK sai.yaml",
+		"OK provider_files",
+		"OK default_model fake/default -> model-default",
+		"OK api_key",
+		"OK mcp_dir 1 servers loaded",
+		"OK enabled_mcp local",
+		"OK skill_dir 1 available",
+		"OK enabled_skills alpha",
+		"OK enabled_tools list_files,mcp.local.search",
+		"OK logging",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("doctor output = %s, want contain %q", out, want)
+		}
+	}
+	assertCLIErrorOmits(t, out, "direct-secret-value", "fake-mcp-server")
+}
+
+func TestDoctorReportsConfigProviderModelAndAPIKeyErrors(t *testing.T) {
+	t.Run("missing config", func(t *testing.T) {
+		missing := filepath.Join(t.TempDir(), "missing")
+		var stdout, stderr bytes.Buffer
+		code := RunWithGetwd([]string{"--config-dir", missing, "doctor"}, &stdout, &stderr, func() (string, error) {
+			return "", errors.New("getwd should not be called")
+		})
+		if code != 1 {
+			t.Fatalf("RunWithGetwd() code = %d, want 1", code)
+		}
+		if stderr.String() != "" {
+			t.Fatalf("stderr = %q, want empty", stderr.String())
+		}
+		assertCLIOutputContains(t, stdout.String(), "ERROR config_dir", "ERROR sai.yaml")
+	})
+
+	t.Run("missing providers", func(t *testing.T) {
+		dir := t.TempDir()
+		writeCLIRunFixtureInDir(t, dir, "http://127.0.0.1:1", "direct-secret-value", "openai-chat")
+		if err := os.RemoveAll(filepath.Join(dir, "providers")); err != nil {
+			t.Fatalf("RemoveAll(providers) error = %v", err)
+		}
+		var stdout, stderr bytes.Buffer
+		code := RunWithGetwd([]string{"--config-dir", dir, "doctor"}, &stdout, &stderr, func() (string, error) {
+			return "", errors.New("getwd should not be called")
+		})
+		if code != 1 {
+			t.Fatalf("RunWithGetwd() code = %d, want 1", code)
+		}
+		if stderr.String() != "" {
+			t.Fatalf("stderr = %q, want empty", stderr.String())
+		}
+		assertCLIOutputContains(t, stdout.String(), "ERROR provider_files")
+	})
+
+	t.Run("invalid default model", func(t *testing.T) {
+		dir := t.TempDir()
+		writeCLIRunFixtureInDir(t, dir, "http://127.0.0.1:1", "direct-secret-value", "openai-chat")
+		replaceCLIFileText(t, filepath.Join(dir, "sai.yaml"), "default_model: default", "default_model: missing")
+		var stdout, stderr bytes.Buffer
+		code := RunWithGetwd([]string{"--config-dir", dir, "doctor"}, &stdout, &stderr, func() (string, error) {
+			return "", errors.New("getwd should not be called")
+		})
+		if code != 1 {
+			t.Fatalf("RunWithGetwd() code = %d, want 1", code)
+		}
+		if stderr.String() != "" {
+			t.Fatalf("stderr = %q, want empty", stderr.String())
+		}
+		assertCLIOutputContains(t, stdout.String(), "ERROR default_model", `unknown model "missing"`)
+		assertCLIErrorOmits(t, stdout.String(), "direct-secret-value")
+	})
+
+	t.Run("missing api key env", func(t *testing.T) {
+		dir := t.TempDir()
+		writeCLIRunFixtureInDir(t, dir, "http://127.0.0.1:1", "$SAI_DOCTOR_MISSING_API_KEY", "openai-chat")
+		unsetEnvForCLITest(t, "SAI_DOCTOR_MISSING_API_KEY")
+		var stdout, stderr bytes.Buffer
+		code := RunWithGetwd([]string{"--config-dir", dir, "doctor"}, &stdout, &stderr, func() (string, error) {
+			return "", errors.New("getwd should not be called")
+		})
+		if code != 1 {
+			t.Fatalf("RunWithGetwd() code = %d, want 1", code)
+		}
+		if stderr.String() != "" {
+			t.Fatalf("stderr = %q, want empty", stderr.String())
+		}
+		assertCLIOutputContains(t, stdout.String(), "ERROR api_key", `API key environment variable "SAI_DOCTOR_MISSING_API_KEY" is not set`)
+	})
+}
+
+func TestDoctorReportsEnabledToolMCPAndSkillErrors(t *testing.T) {
+	t.Run("unknown built-in tool", func(t *testing.T) {
+		dir := t.TempDir()
+		writeCLIRunFixtureInDirWithTools(t, dir, "http://127.0.0.1:1", "direct-secret-value", "openai-chat", []string{"missing"})
+		var stdout, stderr bytes.Buffer
+		code := RunWithGetwd([]string{"--config-dir", dir, "doctor"}, &stdout, &stderr, func() (string, error) {
+			return t.TempDir(), nil
+		})
+		if code != 1 {
+			t.Fatalf("RunWithGetwd() code = %d, want 1", code)
+		}
+		if stderr.String() != "" {
+			t.Fatalf("stderr = %q, want empty", stderr.String())
+		}
+		assertCLIOutputContains(t, stdout.String(), "ERROR enabled_tools", `enabled tool "missing" is not registered`)
+	})
+
+	t.Run("unknown skill", func(t *testing.T) {
+		dir := t.TempDir()
+		writeCLIRunFixtureInDirWithSkills(t, dir, "http://127.0.0.1:1", "direct-secret-value", "openai-chat", []string{"missing"})
+		var stdout, stderr bytes.Buffer
+		code := RunWithGetwd([]string{"--config-dir", dir, "doctor"}, &stdout, &stderr, func() (string, error) {
+			return "", errors.New("getwd should not be called")
+		})
+		if code != 1 {
+			t.Fatalf("RunWithGetwd() code = %d, want 1", code)
+		}
+		if stderr.String() != "" {
+			t.Fatalf("stderr = %q, want empty", stderr.String())
+		}
+		assertCLIOutputContains(t, stdout.String(), "ERROR enabled_skills", `unknown skill "missing"`)
+	})
+
+	t.Run("MCP tool server disabled", func(t *testing.T) {
+		dir := t.TempDir()
+		writeCLIRunFixtureInDirWithTools(t, dir, "http://127.0.0.1:1", "direct-secret-value", "openai-chat", []string{"mcp.local.search"})
+		if err := os.MkdirAll(filepath.Join(dir, "mcp"), 0o755); err != nil {
+			t.Fatalf("MkdirAll(mcp) error = %v", err)
+		}
+		writeCLIFile(t, filepath.Join(dir, "mcp", "local.yaml"), `id: local
+enabled: false
+command: fake-mcp-server
+args: []
+env: {}
+`)
+		var stdout, stderr bytes.Buffer
+		code := RunWithGetwd([]string{"--config-dir", dir, "doctor"}, &stdout, &stderr, func() (string, error) {
+			return "", errors.New("getwd should not be called")
+		})
+		if code != 1 {
+			t.Fatalf("RunWithGetwd() code = %d, want 1", code)
+		}
+		if stderr.String() != "" {
+			t.Fatalf("stderr = %q, want empty", stderr.String())
+		}
+		assertCLIOutputContains(t, stdout.String(), "OK enabled_mcp (none)", "ERROR enabled_tools", `references MCP server "local", but it is not enabled`)
+	})
+
+	t.Run("invalid MCP config", func(t *testing.T) {
+		dir := t.TempDir()
+		writeCLIRunFixtureInDir(t, dir, "http://127.0.0.1:1", "direct-secret-value", "openai-chat")
+		if err := os.MkdirAll(filepath.Join(dir, "mcp"), 0o755); err != nil {
+			t.Fatalf("MkdirAll(mcp) error = %v", err)
+		}
+		writeCLIFile(t, filepath.Join(dir, "mcp", "local.yaml"), `id: local
+enabled: true
+`)
+		var stdout, stderr bytes.Buffer
+		code := RunWithGetwd([]string{"--config-dir", dir, "doctor"}, &stdout, &stderr, func() (string, error) {
+			return "", errors.New("getwd should not be called")
+		})
+		if code != 1 {
+			t.Fatalf("RunWithGetwd() code = %d, want 1", code)
+		}
+		if stderr.String() != "" {
+			t.Fatalf("stderr = %q, want empty", stderr.String())
+		}
+		assertCLIOutputContains(t, stdout.String(), "ERROR mcp_dir", `server "local" is missing command`)
+	})
+}
+
+func TestDoctorLoggingDisabledAndProbeDoesNotCreateSessionLog(t *testing.T) {
+	t.Run("disabled", func(t *testing.T) {
+		dir := t.TempDir()
+		writeCLIRunFixtureInDir(t, dir, "http://127.0.0.1:1", "direct-secret-value", "openai-chat")
+		setCLILoggingPath(t, dir, `""`)
+		var stdout, stderr bytes.Buffer
+		code := RunWithGetwd([]string{"--config-dir", dir, "doctor"}, &stdout, &stderr, func() (string, error) {
+			return "", errors.New("getwd should not be called")
+		})
+		if code != 0 {
+			t.Fatalf("RunWithGetwd() code = %d, stderr = %s, stdout = %s", code, stderr.String(), stdout.String())
+		}
+		assertCLIOutputContains(t, stdout.String(), "OK logging disabled")
+	})
+
+	t.Run("probe only", func(t *testing.T) {
+		dir := t.TempDir()
+		writeCLIRunFixtureInDir(t, dir, "http://127.0.0.1:1", "direct-secret-value", "openai-chat")
+		var stdout, stderr bytes.Buffer
+		code := RunWithGetwd([]string{"--config-dir", dir, "doctor"}, &stdout, &stderr, func() (string, error) {
+			return "", errors.New("getwd should not be called")
+		})
+		if code != 0 {
+			t.Fatalf("RunWithGetwd() code = %d, stderr = %s, stdout = %s", code, stderr.String(), stdout.String())
+		}
+		assertCLIOutputContains(t, stdout.String(), "OK logging")
+		if logPaths := sessionLogPaths(t, dir); len(logPaths) != 0 {
+			t.Fatalf("doctor created session log paths: %#v", logPaths)
+		}
+		if _, err := os.Stat(filepath.Join(dir, "logs")); err == nil {
+			t.Fatalf("doctor left log root behind")
+		} else if !os.IsNotExist(err) {
+			t.Fatalf("Stat(logs) error = %v", err)
+		}
+	})
+}
+
+func TestDoctorOutputDoesNotLeakSecrets(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("SAI_DOCTOR_API_KEY", "doctor-env-secret")
+	t.Setenv("SAI_DOCTOR_MCP_TOKEN", "doctor-mcp-env-secret")
+	writeCLIRunFixtureInDirWithTools(t, dir, "http://127.0.0.1:1", "$SAI_DOCTOR_API_KEY", "openai-chat", []string{"mcp.local.search"})
+	if err := os.MkdirAll(filepath.Join(dir, "mcp"), 0o755); err != nil {
+		t.Fatalf("MkdirAll(mcp) error = %v", err)
+	}
+	writeCLIFile(t, filepath.Join(dir, "mcp", "local.yaml"), `id: local
+enabled: true
+command: fake-mcp-server
+args:
+  - "--token"
+  - "doctor-mcp-arg-secret"
+env:
+  DIRECT_SECRET: doctor-mcp-direct-secret
+  TOKEN: $SAI_DOCTOR_MCP_TOKEN
+`)
+
+	var stdout, stderr bytes.Buffer
+	code := RunWithGetwd([]string{"--config-dir", dir, "doctor"}, &stdout, &stderr, func() (string, error) {
+		return "", errors.New("getwd should not be called")
+	})
+
+	if code != 0 {
+		t.Fatalf("RunWithGetwd() code = %d, stderr = %s, stdout = %s", code, stderr.String(), stdout.String())
+	}
+	if stderr.String() != "" {
+		t.Fatalf("stderr = %q, want empty", stderr.String())
+	}
+	assertCLIErrorOmits(t, stdout.String(),
+		"doctor-env-secret",
+		"doctor-mcp-env-secret",
+		"doctor-mcp-direct-secret",
+		"doctor-mcp-arg-secret",
+		"Authorization",
+		"Bearer ",
+	)
+}
+
 func TestVersionCommand(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	code := RunWithGetwd([]string{"version"}, &stdout, &stderr, func() (string, error) {
@@ -393,7 +711,7 @@ func TestRootHelpWritesUsageWithoutConfig(t *testing.T) {
 				t.Fatalf("RunWithGetwd(%v) code = %d, stderr = %s", args, code, stderr.String())
 			}
 			out := stdout.String()
-			for _, want := range []string{"usage: sai", "chat              Start a chat session", "config show", "models list", "tools list", "sessions", "With no command, sai defaults to chat.", `Run "sai help <command>" for command usage.`} {
+			for _, want := range []string{"usage: sai", "chat              Start a chat session", "config show", "models list", "doctor", "tools list", "sessions", "With no command, sai defaults to chat.", `Run "sai help <command>" for command usage.`} {
 				if !strings.Contains(out, want) {
 					t.Fatalf("stdout = %q, want contain %q", out, want)
 				}
@@ -5554,6 +5872,46 @@ func assertCLIHelpWithoutConfig(t *testing.T, args []string, wants ...string) {
 			t.Fatalf("stdout = %q, want contain %q", out, want)
 		}
 	}
+}
+
+func assertCLIOutputContains(t *testing.T, got string, wants ...string) {
+	t.Helper()
+
+	for _, want := range wants {
+		if !strings.Contains(got, want) {
+			t.Fatalf("output = %q, want contain %q", got, want)
+		}
+	}
+}
+
+func replaceCLIFileText(t *testing.T, path, old, new string) {
+	t.Helper()
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile(%q) error = %v", path, err)
+	}
+	updated := strings.Replace(string(data), old, new, 1)
+	if updated == string(data) {
+		t.Fatalf("file %q did not contain %q", path, old)
+	}
+	writeCLIFile(t, path, updated)
+}
+
+func unsetEnvForCLITest(t *testing.T, name string) {
+	t.Helper()
+
+	oldValue, hadValue := os.LookupEnv(name)
+	if err := os.Unsetenv(name); err != nil {
+		t.Fatalf("Unsetenv(%q) error = %v", name, err)
+	}
+	t.Cleanup(func() {
+		if hadValue {
+			_ = os.Setenv(name, oldValue)
+		} else {
+			_ = os.Unsetenv(name)
+		}
+	})
 }
 
 func assertCLIVerboseContains(t *testing.T, got string, wants ...string) {

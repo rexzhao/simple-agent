@@ -279,11 +279,11 @@
 - [x] stdin/file 输入复用同一套 message 构造、provider 选择、tools/MCP/skills 启用和日志路径。
 - [x] stdin/file 输入不改变 JSONL 日志默认边界。
 - [x] REPL `/usage` 输出 context window / usage 元数据，不请求 provider，不泄露正文敏感内容。
-- [ ] 增加 `sai doctor` 或 `sai config check`。
-- [ ] 健康检查覆盖配置根目录和 provider 文件。
-- [ ] 健康检查覆盖默认 provider/model 和 API key 环境变量是否存在。
-- [ ] 健康检查覆盖 skill_dir、mcp_dir、enabled tools/MCP/skills。
-- [ ] 健康检查覆盖日志目录可写性。
-- [ ] 健康检查输出脱敏，不打印 API key 或其他敏感配置值实际值。
+- [x] 增加 `sai doctor` 或 `sai config check`。
+- [x] 健康检查覆盖配置根目录和 provider 文件。
+- [x] 健康检查覆盖默认 provider/model 和 API key 环境变量是否存在。
+- [x] 健康检查覆盖 skill_dir、mcp_dir、enabled tools/MCP/skills。
+- [x] 健康检查覆盖日志目录可写性。
+- [x] 健康检查输出脱敏，不打印 API key 或其他敏感配置值实际值。
 - [x] 不引入 TUI。
 - [x] 不做 Markdown 渲染。

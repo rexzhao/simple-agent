@@ -482,6 +482,11 @@ REPL 的普通单行模式支持 `/usage`，只向 stderr 打印 context window 
 请求模型、不记录 JSONL 事件、不打印正文敏感内容；多行块内 `/usage` 仍作为普通文本。
 `sai run` 继续不可用。
 
+当前最后一部分已实现配置健康检查命令 `sai doctor`，不提供别名或 `config check`。
+`sai doctor` 只做本地配置、provider/model/API key、skills、MCP 配置、enabled tools
+和日志目录可写性检查；它不发 provider HTTP 请求、不启动 MCP server、不运行模型。输出为
+stdout 上的 `OK` / `WARN` / `ERROR` 行，任何 `ERROR` 都让退出码为 1，且输出必须脱敏。
+
 交付物：
 
 - 多行输入支持属于 `sai chat` 能力，和现有 REPL / `--quit` 语义兼容。
@@ -491,10 +496,11 @@ REPL 的普通单行模式支持 `/usage`，只向 stderr 打印 context window 
 - stdin/file 输入进入同一套 message 构造、provider 选择、tools/MCP/skills 启用和日志路径。
 - stdin/file 输入不改变 JSONL 日志默认边界；仍不记录完整 prompt、response 或 tool result。
 - REPL `/usage` 展示 context window / usage 元数据，不请求 provider，不记录正文敏感内容。
-- 增加配置健康检查命令，命令名可为 `sai doctor` 或 `sai config check`。
+- 增加配置健康检查命令 `sai doctor`，不新增别名或 `sai config check`。
 - 健康检查覆盖配置根目录、provider 文件、默认 provider/model、API key 环境变量是否存在、
   skill_dir、mcp_dir、enabled tools/MCP/skills 和日志目录可写性。
 - 健康检查输出脱敏，不打印 API key 或其他敏感配置值实际值。
+- 健康检查不发 HTTP 请求、不启动 MCP server、不运行模型。
 - 不引入 TUI、不做 Markdown 渲染；Markdown 渲染最多作为远期低优先级非目标记录。
 
 验证：
@@ -503,7 +509,7 @@ REPL 的普通单行模式支持 `/usage`，只向 stderr 打印 context window 
 - CLI 测试覆盖 stdin 输入通过 `sai chat --quit` 执行。
 - CLI 测试覆盖 file 输入通过 `sai chat --quit` 执行。
 - CLI 测试覆盖 `sai run` 仍不可用。
-- CLI 测试覆盖 `sai doctor` 或 `sai config check` 的成功、警告和错误输出。
+- CLI 测试覆盖 `sai doctor` 的成功、警告和错误输出。
 - 测试覆盖健康检查不泄露敏感配置值。
 - `go test ./...` 通过。
 - `git diff --check` 通过。

@@ -404,6 +404,27 @@ v0.1 不支持会话进行中切换模型。`sai chat` 进入会话后，provide
 usage 摘要。该命令不请求 provider、不写 JSONL 日志，也不打印 prompt、assistant output
 或 tool result 正文；多行输入块里的 `/usage` 按普通文本发送。
 
+## 配置健康检查
+
+`sai doctor` 用于本地检查配置健康状态，可以和全局 `--config-dir` 混排使用，例如
+`sai --config-dir ./config doctor` 或 `sai doctor --config-dir ./config`。它输出简单的
+`OK ...`、`WARN ...`、`ERROR ...` 行到 stdout；发现任何 `ERROR` 时退出码为 1，只有
+`OK` / `WARN` 时退出码为 0。
+
+检查范围包括：
+
+- 配置根目录和 `sai.yaml` 是否存在且可读。
+- provider 文件是否可加载，默认 provider/model 是否能解析。
+- 默认 provider 的 API key 是否配置可用：`$ENV_NAME` 会按 `ResolveModel` 的同一逻辑检查
+  环境变量是否存在且非空，直接配置 API key 也算通过。
+- `skill_dir`、`mcp_dir` 是否可加载，以及 `skills.enabled` / 默认 enabled MCP 是否存在且可选择。
+- `tools.enabled` 中的内置工具是否注册；MCP 工具名是否指向已配置且本次默认启用的 MCP server。
+- `logging.path` 为空时报告 disabled；非空时检查对应 session root/父目录可创建可写，
+  不创建真正的 session log 文件，临时探测文件或目录会清理。
+
+doctor 不发 provider HTTP 请求、不启动 MCP server、不运行模型。输出必须脱敏：不打印
+API key、直接 secret 值、环境变量实际值、MCP env 实际值或 Authorization 信息。
+
 ## 参数合并
 
 请求参数按以下顺序合并：
