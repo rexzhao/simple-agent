@@ -150,9 +150,12 @@ v0.1 不需要并发执行 tool call。等真实场景需要时再加。
 ```text
 sai
 sai [--prompt "prompt"]
+sai --stdin --quit
 sai --prompt "prompt" --quit
 sai chat [--prompt "prompt"]
 sai chat --prompt "prompt" --quit
+sai chat --stdin --quit
+sai chat --file prompt.md --quit
 sai chat --save-session --prompt "prompt" --quit
 sai chat --resume <id> --prompt "prompt" --quit
 sai chat --continue --prompt "prompt" --quit
@@ -238,6 +241,8 @@ chat 初始 prompt 使用 `--prompt`，不使用 positional 参数；`sai "promp
 --verbose
 --quit
 --enable-mcp local  # M4
+--stdin
+--file prompt.md
 ```
 
 v0.1 暂不支持 non-streaming fallback，`sai chat` 当前强制使用 streaming；后续如要支持再引入 `--no-stream` 或 adapter 非流式路径。
@@ -251,9 +256,12 @@ skills 和 reasoning 展示设置；会话进行中不支持模型切换或额�
 ```text
 sai
 sai --prompt "只跑这一轮然后退出" --quit
+sai --stdin --quit
 sai --provider paperhub --model glm-5.2
 sai chat --prompt "先回答这个问题，然后进入 REPL"
 sai chat --prompt "只跑这一轮然后退出" --quit
+sai chat --stdin --quit
+sai chat --file prompt.md --quit
 sai chat --provider paperhub --model glm-5.2
 sai chat --enable-tools list_files,read_file
 sai chat --enable-mcp local --enable-tools mcp.local.some_tool
@@ -262,11 +270,21 @@ sai chat --resume 20260702T030405.000000000Z-a1b2c3d4 --prompt "继续" --quit
 sai chat --continue --prompt "继续最近会话" --quit
 ```
 
-无初始 prompt 时，输入从 stdin 逐行读取，空白行忽略。`/exit`、`/quit` 或 EOF 正常退出。
+无初始 prompt / stdin / file 输入时，交互式输入从 stdin 逐行读取，空白行忽略。
+一行只包含 `"""` 时进入多行收集模式，再遇到一行只包含 `"""` 时结束，并把中间内容
+按原样保留换行作为一条 user message；空的多行内容忽略。`/exit`、`/quit` 或 EOF
+正常退出，但退出命令只在普通单行模式生效，多行内容里的 `/exit` 和 `/quit` 按普通文本
+发送。普通单行模式中输入 `/usage` 不发送给模型，而是向 stderr 打印当前 context window
+和最近 usage 摘要：context window、来源、warning threshold、last request/input/output/
+total tokens 和 last usage source；尚未请求模型时 token 显示 0，usage source 显示
+`(none)`。该摘要不包含 prompt、assistant output 或 tool result 正文，也不产生 JSONL
+日志事件。多行内容里的 `/usage` 按普通文本发送。
 有 `--prompt` 且没有 `--quit` 时，先完整执行该 prompt 的一轮 agent loop，成功后补齐
 必要换行并进入同一 REPL，会话历史包含初始 prompt、assistant 消息和 tool messages。
-有 `--prompt` 且带 `--quit` 时，只执行这一轮然后退出，不进入 REPL。`--quit` 没有
-`--prompt` 时作为用法错误处理。`chat` 命令的 flags 可以混排，例如
+有 `--prompt` 且带 `--quit` 时，只执行这一轮然后退出，不进入 REPL。`--stdin` 和
+`--file` 只能和 `--quit` 一起使用，分别读取 stdin 或指定文件的完整内容作为一次 prompt，
+执行一轮后退出；它们和 `--prompt` 三者互斥。`--quit` 没有 `--prompt`、`--stdin` 或
+`--file` 时作为用法错误处理。`chat` 命令的 flags 可以混排，例如
 `sai chat --prompt "hi" --model fast --quit`；positional 参数不再作为初始 prompt。REPL
 prompt 写到 stderr（例如 `> `），模型输出继续
 通过现有 `writeStream` streaming 到 stdout，包括 reasoning 的隐藏、显示和终端样式规则。

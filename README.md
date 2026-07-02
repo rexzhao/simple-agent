@@ -71,6 +71,8 @@ source as `estimated`; configured values are recorded as `configured`.
 ```sh
 sai --prompt "Hello" --quit
 sai chat --quit --provider paperhub --model glm-5.2 --prompt "Hello"
+sai --quit --stdin < prompt.md
+sai chat --quit --file prompt.md
 ```
 
 Start a line-oriented chat session with the same provider/model selection rules:
@@ -85,9 +87,21 @@ and `sai chat --prompt "Hello"` both run that initial prompt first, then enter
 the line-oriented session. Add `--quit` to exit after the initial prompt turn.
 Initial prompts must use `--prompt`; `sai "Hello"` is treated as an unknown
 command instead of a prompt. In chat, type one message per line. Blank lines are
-ignored; `/exit`, `/quit`, or EOF exits normally. Session history stays in
-memory for the current process and is not written to disk unless resumable
-sessions are enabled.
+ignored; `/exit`, `/quit`, or EOF exits normally. To enter a multiline message,
+type a line containing only `"""`, then the message body, then another line
+containing only `"""`; newlines inside the body are preserved and slash commands
+inside the body are sent as text. Empty multiline messages are ignored.
+
+In normal single-line chat mode, `/usage` prints the current context window and
+latest usage summary to stderr without sending anything to the model. It shows
+window size/source, warning threshold, last request/input/output/total tokens,
+and the last usage source. It does not print prompt, assistant output, or tool
+result content, and `/usage` inside a multiline block is sent as regular text.
+
+Use `--stdin` or `--file` with `--quit` to run one complete prompt from stdin or
+a file. `--prompt`, `--stdin`, and `--file` are mutually exclusive. Session
+history stays in memory for the current process and is not written to disk
+unless resumable sessions are enabled.
 
 Before each provider request, `sai` estimates input tokens from the full message
 history and tool schemas. At 80% of the model context window it writes a warning

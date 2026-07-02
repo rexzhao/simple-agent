@@ -444,7 +444,7 @@ func TestChatHelpWritesUsageWithoutConfig(t *testing.T) {
 		{"help", "chat"},
 	} {
 		t.Run(strings.Join(args, " "), func(t *testing.T) {
-			assertCLIHelpWithoutConfig(t, args, "usage: sai chat", "--prompt text", "--save-session", "--resume id | --continue", "full sensitive content")
+			assertCLIHelpWithoutConfig(t, args, "usage: sai chat", "--prompt text | --stdin | --file path", "--save-session", "--resume id | --continue", "full sensitive content")
 		})
 	}
 }
@@ -753,7 +753,197 @@ func TestChatQuitWithoutPromptIsUsageError(t *testing.T) {
 	if stdout.String() != "" {
 		t.Fatalf("stdout = %q, want empty", stdout.String())
 	}
-	assertCLIErrorContains(t, stderr.String(), "--quit requires --prompt", "usage: sai chat", `Run "sai help chat" for usage.`)
+	assertCLIErrorContains(t, stderr.String(), "--quit requires --prompt, --stdin, or --file", "usage: sai chat", `Run "sai help chat" for usage.`)
+}
+
+func TestChatStdinWithQuitRunsOneTurnAndExits(t *testing.T) {
+	tests := []struct {
+		name string
+		args func(configDir string) []string
+	}{
+		{
+			name: "chat command",
+			args: func(configDir string) []string {
+				return []string{"--config-dir", configDir, "chat", "--quit", "--stdin"}
+			},
+		},
+		{
+			name: "default chat command",
+			args: func(configDir string) []string {
+				return []string{"--config-dir", configDir, "--quit", "--stdin"}
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server, requests := newCLIRunServer(t,
+				`{"choices":[{"delta":{"content":"one"}}]}`,
+				`[DONE]`,
+			)
+			defer server.Close()
+
+			configDir := t.TempDir()
+			writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
+
+			var stdout, stderr bytes.Buffer
+			code := RunWithIO(tt.args(configDir), strings.NewReader("stdin prompt\nline two\n"), &stdout, &stderr, func() (string, error) {
+				return t.TempDir(), nil
+			})
+
+			if code != 0 {
+				t.Fatalf("RunWithIO() code = %d, stderr = %s", code, stderr.String())
+			}
+			if got, want := stdout.String(), "one"; got != want {
+				t.Fatalf("stdout = %q, want %q", got, want)
+			}
+			if stderr.String() != "" {
+				t.Fatalf("stderr = %q, want empty", stderr.String())
+			}
+			messages := requestMessages(t, (<-requests).Body)
+			assertMessage(t, messages, 0, "system", builtInBaseInstructions)
+			assertMessage(t, messages, 1, "user", "stdin prompt\nline two\n")
+			assertNoAdditionalCLIRunRequest(t, requests)
+		})
+	}
+}
+
+func TestChatFileWithQuitRunsOneTurnAndExits(t *testing.T) {
+	server, requests := newCLIRunServer(t,
+		`{"choices":[{"delta":{"content":"one"}}]}`,
+		`[DONE]`,
+	)
+	defer server.Close()
+
+	configDir := t.TempDir()
+	writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
+	promptPath := filepath.Join(t.TempDir(), "prompt.md")
+	writeCLIFile(t, promptPath, "file prompt\nline two\n")
+
+	var stdout, stderr bytes.Buffer
+	code := RunWithIO([]string{"--config-dir", configDir, "chat", "--quit", "--file", promptPath}, strings.NewReader("unused\n"), &stdout, &stderr, func() (string, error) {
+		return t.TempDir(), nil
+	})
+
+	if code != 0 {
+		t.Fatalf("RunWithIO() code = %d, stderr = %s", code, stderr.String())
+	}
+	if got, want := stdout.String(), "one"; got != want {
+		t.Fatalf("stdout = %q, want %q", got, want)
+	}
+	if stderr.String() != "" {
+		t.Fatalf("stderr = %q, want empty", stderr.String())
+	}
+	messages := requestMessages(t, (<-requests).Body)
+	assertMessage(t, messages, 0, "system", builtInBaseInstructions)
+	assertMessage(t, messages, 1, "user", "file prompt\nline two\n")
+	assertNoAdditionalCLIRunRequest(t, requests)
+}
+
+func TestChatStdinAndFileDoNotExpandJSONLLogContent(t *testing.T) {
+	tests := []struct {
+		name   string
+		args   func(configDir string) []string
+		stdin  io.Reader
+		prompt string
+	}{
+		{
+			name: "stdin",
+			args: func(configDir string) []string {
+				return []string{"--config-dir", configDir, "chat", "--quit", "--stdin"}
+			},
+			stdin:  strings.NewReader("stdin prompt secret"),
+			prompt: "stdin prompt secret",
+		},
+		{
+			name: "file",
+			args: func(configDir string) []string {
+				promptPath := filepath.Join(t.TempDir(), "prompt.md")
+				writeCLIFile(t, promptPath, "file prompt secret")
+				return []string{"--config-dir", configDir, "chat", "--quit", "--file", promptPath}
+			},
+			stdin:  strings.NewReader("unused"),
+			prompt: "file prompt secret",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server, requests := newCLIRunServer(t,
+				`{"choices":[{"delta":{"content":"streamed response secret"}}]}`,
+				`[DONE]`,
+			)
+			defer server.Close()
+
+			configDir := t.TempDir()
+			writeCLIRunFixtureInDir(t, configDir, server.URL, "secret-api-key", "openai-chat")
+
+			var stdout, stderr bytes.Buffer
+			code := RunWithIO(tt.args(configDir), tt.stdin, &stdout, &stderr, func() (string, error) {
+				return t.TempDir(), nil
+			})
+
+			if code != 0 {
+				t.Fatalf("RunWithIO() code = %d, stderr = %s", code, stderr.String())
+			}
+			if got, want := stdout.String(), "streamed response secret"; got != want {
+				t.Fatalf("stdout = %q, want %q", got, want)
+			}
+			assertMessage(t, requestMessages(t, (<-requests).Body), 1, "user", tt.prompt)
+			assertNoAdditionalCLIRunRequest(t, requests)
+
+			logPaths := sessionLogPaths(t, configDir)
+			if len(logPaths) != 1 {
+				t.Fatalf("session log paths = %#v, want one", logPaths)
+			}
+			logData, err := os.ReadFile(logPaths[0])
+			if err != nil {
+				t.Fatalf("ReadFile(%q) error = %v", logPaths[0], err)
+			}
+			logText := string(logData)
+			for _, leaked := range []string{tt.prompt, "streamed response secret", "secret-api-key"} {
+				if strings.Contains(logText, leaked) {
+					t.Fatalf("log leaked %q:\n%s", leaked, logText)
+				}
+			}
+			records := readJSONLRecords(t, logData)
+			assertCLILogBaseFields(t, records)
+			if !hasCLILogRecord(records, "text_delta", "event", "text_delta") {
+				t.Fatalf("chat log records missing text_delta: %#v", records)
+			}
+		})
+	}
+}
+
+func TestChatInitialInputSourceValidation(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+		want string
+	}{
+		{name: "stdin without quit", args: []string{"chat", "--stdin"}, want: "--stdin requires --quit"},
+		{name: "file without quit", args: []string{"chat", "--file", "prompt.md"}, want: "--file requires --quit"},
+		{name: "stdin with prompt", args: []string{"chat", "--quit", "--stdin", "--prompt", "prompt"}, want: "--prompt, --stdin, and --file are mutually exclusive"},
+		{name: "file with prompt", args: []string{"chat", "--quit", "--file", "prompt.md", "--prompt", "prompt"}, want: "--prompt, --stdin, and --file are mutually exclusive"},
+		{name: "stdin with file", args: []string{"chat", "--quit", "--stdin", "--file", "prompt.md"}, want: "--prompt, --stdin, and --file are mutually exclusive"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			code := RunWithIO(tt.args, strings.NewReader("stdin"), &stdout, &stderr, func() (string, error) {
+				return "", errors.New("getwd should not be called")
+			})
+
+			if code != 1 {
+				t.Fatalf("RunWithIO() code = %d, want 1", code)
+			}
+			if stdout.String() != "" {
+				t.Fatalf("stdout = %q, want empty", stdout.String())
+			}
+			assertCLIErrorContains(t, stderr.String(), tt.want, "usage: sai chat", `Run "sai help chat" for usage.`)
+		})
+	}
 }
 
 func TestChatExitReturnsWithoutModelRequest(t *testing.T) {
@@ -1271,6 +1461,235 @@ func TestChatTwoTurnsCarryForwardUserAndAssistantHistory(t *testing.T) {
 	if !hasCLILogRecord(records, "text_delta", "event", "text_delta") {
 		t.Fatalf("chat log records missing text_delta: %#v", records)
 	}
+}
+
+func TestChatUsageCommandPrintsSummaryWithoutModelRequest(t *testing.T) {
+	server, requests := newCLIRunServer(t,
+		`{"choices":[{"delta":{"content":"unexpected"}}]}`,
+		`[DONE]`,
+	)
+	defer server.Close()
+
+	configDir := t.TempDir()
+	writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
+	setCLIModelContextWindow(t, configDir, 1234)
+
+	var stdout, stderr bytes.Buffer
+	code := RunWithIO([]string{"--config-dir", configDir, "chat"}, strings.NewReader("/usage\n/quit\n"), &stdout, &stderr, func() (string, error) {
+		return t.TempDir(), nil
+	})
+
+	if code != 0 {
+		t.Fatalf("RunWithIO() code = %d, stderr = %s", code, stderr.String())
+	}
+	if stdout.String() != "" {
+		t.Fatalf("stdout = %q, want empty", stdout.String())
+	}
+	errOut := stderr.String()
+	for _, want := range []string{
+		"CONTEXT_WINDOW\t1234",
+		"CONTEXT_WINDOW_SOURCE\tconfigured",
+		"CONTEXT_WARNING_THRESHOLD_PERCENT\t80",
+		"CONTEXT_LAST_REQUEST_TOKENS\t0",
+		"CONTEXT_LAST_INPUT_TOKENS\t0",
+		"CONTEXT_LAST_OUTPUT_TOKENS\t0",
+		"CONTEXT_LAST_TOTAL_TOKENS\t0",
+		"CONTEXT_LAST_USAGE_SOURCE\t(none)",
+	} {
+		if !strings.Contains(errOut, want) {
+			t.Fatalf("stderr = %q, want contain %q", errOut, want)
+		}
+	}
+	if logPaths := sessionLogPaths(t, configDir); len(logPaths) != 0 {
+		t.Fatalf("session log paths = %#v, want none", logPaths)
+	}
+	assertNoAdditionalCLIRunRequest(t, requests)
+}
+
+func TestChatUsageCommandShowsProviderUsageAfterTurn(t *testing.T) {
+	server, requests := newCLIRunServer(t,
+		`{"choices":[{"delta":{"content":"one"}}]}`,
+		`{"choices":[],"usage":{"prompt_tokens":11,"completion_tokens":13,"total_tokens":24}}`,
+		`[DONE]`,
+	)
+	defer server.Close()
+
+	configDir := t.TempDir()
+	writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
+
+	var stdout, stderr bytes.Buffer
+	code := RunWithIO([]string{"--config-dir", configDir, "chat"}, strings.NewReader("first\n/usage\n/quit\n"), &stdout, &stderr, func() (string, error) {
+		return t.TempDir(), nil
+	})
+
+	if code != 0 {
+		t.Fatalf("RunWithIO() code = %d, stderr = %s", code, stderr.String())
+	}
+	if got, want := stdout.String(), "one\n"; got != want {
+		t.Fatalf("stdout = %q, want %q", got, want)
+	}
+	errOut := stderr.String()
+	for _, want := range []string{
+		"CONTEXT_WINDOW\t32000",
+		"CONTEXT_WINDOW_SOURCE\testimated",
+		"CONTEXT_LAST_INPUT_TOKENS\t11",
+		"CONTEXT_LAST_OUTPUT_TOKENS\t13",
+		"CONTEXT_LAST_TOTAL_TOKENS\t24",
+		"CONTEXT_LAST_USAGE_SOURCE\tprovider",
+	} {
+		if !strings.Contains(errOut, want) {
+			t.Fatalf("stderr = %q, want contain %q", errOut, want)
+		}
+	}
+	assertMessage(t, requestMessages(t, (<-requests).Body), 1, "user", "first")
+	assertNoAdditionalCLIRunRequest(t, requests)
+}
+
+func TestChatUsageCommandShowsEstimatedUsageAfterTurn(t *testing.T) {
+	server, requests := newCLIRunServer(t,
+		`{"choices":[{"delta":{"content":"abcd"}}]}`,
+		`[DONE]`,
+	)
+	defer server.Close()
+
+	configDir := t.TempDir()
+	writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
+
+	var stdout, stderr bytes.Buffer
+	code := RunWithIO([]string{"--config-dir", configDir, "chat"}, strings.NewReader("first\n/usage\n/quit\n"), &stdout, &stderr, func() (string, error) {
+		return t.TempDir(), nil
+	})
+
+	if code != 0 {
+		t.Fatalf("RunWithIO() code = %d, stderr = %s", code, stderr.String())
+	}
+	if got, want := stdout.String(), "abcd\n"; got != want {
+		t.Fatalf("stdout = %q, want %q", got, want)
+	}
+	errOut := stderr.String()
+	for _, want := range []string{
+		"CONTEXT_LAST_OUTPUT_TOKENS\t4",
+		"CONTEXT_LAST_USAGE_SOURCE\testimated",
+	} {
+		if !strings.Contains(errOut, want) {
+			t.Fatalf("stderr = %q, want contain %q", errOut, want)
+		}
+	}
+	if strings.Contains(errOut, "CONTEXT_LAST_INPUT_TOKENS\t0") || strings.Contains(errOut, "CONTEXT_LAST_TOTAL_TOKENS\t0") {
+		t.Fatalf("stderr = %q, want nonzero estimated input and total tokens", errOut)
+	}
+	assertMessage(t, requestMessages(t, (<-requests).Body), 1, "user", "first")
+	assertNoAdditionalCLIRunRequest(t, requests)
+}
+
+func TestChatUsageCommandDoesNotLeakPromptAssistantOrToolContent(t *testing.T) {
+	server, requests := newSequentialCLIRunServer(t,
+		[]string{
+			`{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"read_file","arguments":"{\"path\":\"note.txt\"}"}}]}}]}`,
+			`{"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`,
+			`[DONE]`,
+		},
+		[]string{
+			`{"choices":[{"delta":{"content":"final response secret"}}]}`,
+			`{"choices":[],"usage":{"prompt_tokens":21,"completion_tokens":34,"total_tokens":55}}`,
+			`[DONE]`,
+		},
+	)
+	defer server.Close()
+
+	projectDir := t.TempDir()
+	writeCLIFile(t, filepath.Join(projectDir, "note.txt"), "tool output secret")
+	configDir := t.TempDir()
+	writeCLIRunFixtureInDir(t, configDir, server.URL, "secret-api-key", "openai-chat")
+
+	var stdout, stderr bytes.Buffer
+	code := RunWithIO([]string{"--config-dir", configDir, "chat", "--enable-tools", "read_file"}, strings.NewReader("user prompt secret\n/usage\n/quit\n"), &stdout, &stderr, func() (string, error) {
+		return projectDir, nil
+	})
+
+	if code != 0 {
+		t.Fatalf("RunWithIO() code = %d, stderr = %s", code, stderr.String())
+	}
+	if got, want := stdout.String(), "final response secret\n"; got != want {
+		t.Fatalf("stdout = %q, want %q", got, want)
+	}
+	errOut := stderr.String()
+	for _, want := range []string{
+		"tool: read_file note.txt",
+		"CONTEXT_LAST_INPUT_TOKENS\t21",
+		"CONTEXT_LAST_OUTPUT_TOKENS\t34",
+		"CONTEXT_LAST_TOTAL_TOKENS\t55",
+		"CONTEXT_LAST_USAGE_SOURCE\tprovider",
+	} {
+		if !strings.Contains(errOut, want) {
+			t.Fatalf("stderr = %q, want contain %q", errOut, want)
+		}
+	}
+	assertCLIErrorOmits(t, errOut, "user prompt secret", "final response secret", "tool output secret", "secret-api-key")
+	<-requests
+	<-requests
+	assertNoAdditionalCLIRunRequest(t, requests)
+}
+
+func TestChatMultilineREPLCollectsOneMessagePreservingNewlines(t *testing.T) {
+	server, requests := newCLIRunServer(t,
+		`{"choices":[{"delta":{"content":"one"}}]}`,
+		`[DONE]`,
+	)
+	defer server.Close()
+
+	configDir := t.TempDir()
+	writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
+
+	var stdout, stderr bytes.Buffer
+	input := "\"\"\"\nfirst\n/usage\n/quit\nsecond\n\"\"\"\n/quit\n"
+	code := RunWithIO([]string{"--config-dir", configDir, "chat"}, strings.NewReader(input), &stdout, &stderr, func() (string, error) {
+		return t.TempDir(), nil
+	})
+
+	if code != 0 {
+		t.Fatalf("RunWithIO() code = %d, stderr = %s", code, stderr.String())
+	}
+	if got, want := stdout.String(), "one\n"; got != want {
+		t.Fatalf("stdout = %q, want %q", got, want)
+	}
+	if got, want := stderr.String(), "> > > > > > > "; got != want {
+		t.Fatalf("stderr = %q, want %q", got, want)
+	}
+	messages := requestMessages(t, (<-requests).Body)
+	assertMessage(t, messages, 0, "system", builtInBaseInstructions)
+	assertMessage(t, messages, 1, "user", "first\n/usage\n/quit\nsecond")
+	assertNoAdditionalCLIRunRequest(t, requests)
+}
+
+func TestChatEmptyMultilineREPLInputIsIgnored(t *testing.T) {
+	server, requests := newCLIRunServer(t,
+		`{"choices":[{"delta":{"content":"unexpected"}}]}`,
+		`[DONE]`,
+	)
+	defer server.Close()
+
+	configDir := t.TempDir()
+	writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
+
+	var stdout, stderr bytes.Buffer
+	code := RunWithIO([]string{"--config-dir", configDir, "chat"}, strings.NewReader("\"\"\"\n\"\"\"\n/quit\n"), &stdout, &stderr, func() (string, error) {
+		return t.TempDir(), nil
+	})
+
+	if code != 0 {
+		t.Fatalf("RunWithIO() code = %d, stderr = %s", code, stderr.String())
+	}
+	if stdout.String() != "" {
+		t.Fatalf("stdout = %q, want empty", stdout.String())
+	}
+	if got, want := stderr.String(), "> > > "; got != want {
+		t.Fatalf("stderr = %q, want %q", got, want)
+	}
+	if logPaths := sessionLogPaths(t, configDir); len(logPaths) != 0 {
+		t.Fatalf("session log paths = %#v, want none", logPaths)
+	}
+	assertNoAdditionalCLIRunRequest(t, requests)
 }
 
 func TestChatREPLRecoverableErrorContinuesWithoutFailedHistory(t *testing.T) {

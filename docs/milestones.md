@@ -474,6 +474,14 @@ resumable session 保存 context management metadata，恢复后继续用该 met
 目标：改善输入和配置诊断体验，但继续保持纯 CLI，不恢复 `sai run`，不引入 TUI，也不把
 Markdown 渲染纳入近期目标。
 
+当前第一部分已实现输入 UX：多行 REPL、`--stdin` 和 `--file` 都作为 `sai chat`
+能力提供。`sai chat --quit --stdin` / `sai --quit --stdin` 会读取完整 stdin 作为一次
+prompt，`sai chat --quit --file prompt.md` 会读取完整文件作为一次 prompt；两者都复用
+同一套 chat runtime、日志、工具/MCP/skills、session 保存和上下文窗口路径。交互式
+REPL 的普通单行模式支持 `/usage`，只向 stderr 打印 context window / usage 元数据，不
+请求模型、不记录 JSONL 事件、不打印正文敏感内容；多行块内 `/usage` 仍作为普通文本。
+`sai run` 继续不可用。
+
 交付物：
 
 - 多行输入支持属于 `sai chat` 能力，和现有 REPL / `--quit` 语义兼容。
@@ -482,6 +490,7 @@ Markdown 渲染纳入近期目标。
   或等价的克制 CLI 设计。
 - stdin/file 输入进入同一套 message 构造、provider 选择、tools/MCP/skills 启用和日志路径。
 - stdin/file 输入不改变 JSONL 日志默认边界；仍不记录完整 prompt、response 或 tool result。
+- REPL `/usage` 展示 context window / usage 元数据，不请求 provider，不记录正文敏感内容。
 - 增加配置健康检查命令，命令名可为 `sai doctor` 或 `sai config check`。
 - 健康检查覆盖配置根目录、provider 文件、默认 provider/model、API key 环境变量是否存在、
   skill_dir、mcp_dir、enabled tools/MCP/skills 和日志目录可写性。

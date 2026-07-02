@@ -178,11 +178,12 @@ With no command, sai defaults to chat.
 Run "sai help <command>" for command usage.
 `
 
-const chatUsageText = `usage: sai chat [--provider name] [--model profile] [--prompt text] [--show-reasoning] [--verbose] [--enable-tools names] [--enable-skills ids] [--disable-skills] [--enable-mcp ids] [--save-session] [--resume id | --continue] [--quit]
+const chatUsageText = `usage: sai chat [--provider name] [--model profile] [--prompt text | --stdin | --file path] [--show-reasoning] [--verbose] [--enable-tools names] [--enable-skills ids] [--disable-skills] [--enable-mcp ids] [--save-session] [--resume id | --continue] [--quit]
 
 Starts a line-oriented chat session using the configured provider and model. When
---prompt is provided, sai runs that turn first; --quit exits after that
-turn instead of entering the REPL. Resumable sessions save full sensitive content,
+--prompt is provided, sai runs that turn first; --quit exits after that turn
+instead of entering the REPL. --stdin and --file read one complete prompt and
+must be used with --quit. Resumable sessions save full sensitive content,
 including prompts, assistant output, assistant tool calls, and tool results.
 `
 
@@ -441,6 +442,7 @@ func splitRootArgs(args []string) (rootArgs, error) {
 		"provider":       flagKindValue,
 		"model":          flagKindValue,
 		"prompt":         flagKindValue,
+		"file":           flagKindValue,
 		"enable-tools":   flagKindValue,
 		"enable-skills":  flagKindValue,
 		"enable-mcp":     flagKindValue,
@@ -450,6 +452,7 @@ func splitRootArgs(args []string) (rootArgs, error) {
 		"help":           flagKindBool,
 		"show-reasoning": flagKindBool,
 		"verbose":        flagKindBool,
+		"stdin":          flagKindBool,
 		"disable-skills": flagKindBool,
 		"save-session":   flagKindBool,
 		"continue":       flagKindBool,
@@ -891,6 +894,8 @@ type agentCommandFlags struct {
 	providerName     string
 	modelProfile     string
 	prompt           promptTextFlag
+	stdin            bool
+	file             filePathFlag
 	showReasoning    bool
 	showReasoningSet bool
 	verbose          bool
@@ -908,6 +913,8 @@ func registerAgentCommandFlags(flags *flag.FlagSet, options *agentCommandFlags) 
 	flags.StringVar(&options.providerName, "provider", "", "provider name")
 	flags.StringVar(&options.modelProfile, "model", "", "model profile")
 	flags.Var(&options.prompt, "prompt", "initial prompt text")
+	flags.BoolVar(&options.stdin, "stdin", false, "read initial prompt from stdin")
+	flags.Var(&options.file, "file", "read initial prompt from file")
 	flags.BoolVar(&options.showReasoning, "show-reasoning", false, "show reasoning output")
 	flags.BoolVar(&options.verbose, "verbose", false, "write non-sensitive diagnostics to stderr")
 	flags.Var(&options.enabledTools, "enable-tools", "comma-separated tool names to expose")
@@ -952,8 +959,18 @@ func chatCommand(ctx context.Context, args []string, configDir string, stdin io.
 	if len(positionals) != 0 {
 		return usageError("unexpected positional argument; use --prompt for the initial prompt", chatUsageText, "sai help chat")
 	}
-	if *quit && !options.prompt.set {
-		return usageError("--quit requires --prompt", chatUsageText, "sai help chat")
+	initialSources := options.initialInputSourceCount()
+	if initialSources > 1 {
+		return usageError("--prompt, --stdin, and --file are mutually exclusive", chatUsageText, "sai help chat")
+	}
+	if *quit && initialSources == 0 {
+		return usageError("--quit requires --prompt, --stdin, or --file", chatUsageText, "sai help chat")
+	}
+	if !*quit && options.stdin {
+		return usageError("--stdin requires --quit", chatUsageText, "sai help chat")
+	}
+	if !*quit && options.file.set {
+		return usageError("--file requires --quit", chatUsageText, "sai help chat")
 	}
 
 	runtime, err := prepareAgentRuntime(ctx, configDir, options, stderr, getwd)
@@ -968,8 +985,12 @@ func chatCommand(ctx context.Context, args []string, configDir string, stdin io.
 	}
 
 	messages := runtime.initialMessages()
-	if options.prompt.set {
-		updated, err := runChatTurn(ctx, runtime, messages, options.prompt.text, stdout, stderr, !*quit, false)
+	initialPrompt, hasInitialPrompt, err := readInitialPrompt(options, stdin)
+	if err != nil {
+		return err
+	}
+	if hasInitialPrompt {
+		updated, err := runChatTurn(ctx, runtime, messages, initialPrompt, stdout, stderr, !*quit, false)
 		if err != nil {
 			return err
 		}
@@ -981,26 +1002,26 @@ func chatCommand(ctx context.Context, args []string, configDir string, stdin io.
 
 	scanner := bufio.NewScanner(stdin)
 	for {
-		if err := ctx.Err(); err != nil {
+		line, multiline, ok, err := readChatInput(ctx, scanner, stderr)
+		if err != nil {
 			return err
 		}
-		if _, err := fmt.Fprint(stderr, "> "); err != nil {
-			return err
-		}
-		if !scanner.Scan() {
-			if err := scanner.Err(); err != nil {
-				return fmt.Errorf("read chat input: %w", err)
-			}
+		if !ok {
 			return nil
 		}
 
-		line := scanner.Text()
 		command := strings.TrimSpace(line)
 		if command == "" {
 			continue
 		}
-		if command == "/exit" || command == "/quit" {
+		if !multiline && (command == "/exit" || command == "/quit") {
 			return nil
+		}
+		if !multiline && command == "/usage" {
+			if err := runtime.writeUsageSummary(stderr); err != nil {
+				return err
+			}
+			continue
 		}
 
 		updated, err := runChatTurn(ctx, runtime, messages, line, stdout, stderr, true, true)
@@ -1018,6 +1039,81 @@ func chatCommand(ctx context.Context, args []string, configDir string, stdin io.
 		}
 		messages = updated
 	}
+}
+
+func (options agentCommandFlags) initialInputSourceCount() int {
+	count := 0
+	if options.prompt.set {
+		count++
+	}
+	if options.stdin {
+		count++
+	}
+	if options.file.set {
+		count++
+	}
+	return count
+}
+
+func readInitialPrompt(options agentCommandFlags, stdin io.Reader) (string, bool, error) {
+	switch {
+	case options.prompt.set:
+		return options.prompt.text, true, nil
+	case options.stdin:
+		data, err := io.ReadAll(stdin)
+		if err != nil {
+			return "", false, fmt.Errorf("read stdin prompt: %w", err)
+		}
+		return string(data), true, nil
+	case options.file.set:
+		data, err := os.ReadFile(options.file.path)
+		if err != nil {
+			return "", false, fmt.Errorf("read prompt file %q: %w", options.file.path, err)
+		}
+		return string(data), true, nil
+	default:
+		return "", false, nil
+	}
+}
+
+const multilineInputDelimiter = `"""`
+
+func readChatInput(ctx context.Context, scanner *bufio.Scanner, stderr io.Writer) (string, bool, bool, error) {
+	line, ok, err := scanChatLine(ctx, scanner, stderr)
+	if !ok || err != nil {
+		return "", false, ok, err
+	}
+	if strings.TrimSpace(line) != multilineInputDelimiter {
+		return line, false, true, nil
+	}
+
+	lines := []string{}
+	for {
+		line, ok, err := scanChatLine(ctx, scanner, stderr)
+		if !ok || err != nil {
+			return "", true, ok, err
+		}
+		if strings.TrimSpace(line) == multilineInputDelimiter {
+			return strings.Join(lines, "\n"), true, true, nil
+		}
+		lines = append(lines, line)
+	}
+}
+
+func scanChatLine(ctx context.Context, scanner *bufio.Scanner, stderr io.Writer) (string, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return "", false, err
+	}
+	if _, err := fmt.Fprint(stderr, "> "); err != nil {
+		return "", false, err
+	}
+	if !scanner.Scan() {
+		if err := scanner.Err(); err != nil {
+			return "", false, fmt.Errorf("read chat input: %w", err)
+		}
+		return "", false, nil
+	}
+	return scanner.Text(), true, nil
 }
 
 func runChatTurn(ctx context.Context, runtime *agentRuntime, messages []model.Message, prompt string, stdout, stderr io.Writer, addTrailingNewline bool, stderrNeedsLeadingBreak bool) ([]model.Message, error) {
@@ -1173,6 +1269,31 @@ func (r *agentRuntime) writeSessionSaveNotice(stderr io.Writer) error {
 	}
 	r.sessionSaveNoticeDone = true
 	return nil
+}
+
+func (r *agentRuntime) writeUsageSummary(stderr io.Writer) error {
+	metadata := contextwindow.Metadata{}
+	if r.contextTracker != nil {
+		metadata = r.contextTracker.Metadata()
+	}
+	_, err := fmt.Fprintf(stderr, "CONTEXT_WINDOW\t%d\nCONTEXT_WINDOW_SOURCE\t%s\nCONTEXT_WARNING_THRESHOLD_PERCENT\t%d\nCONTEXT_LAST_REQUEST_TOKENS\t%d\nCONTEXT_LAST_INPUT_TOKENS\t%d\nCONTEXT_LAST_OUTPUT_TOKENS\t%d\nCONTEXT_LAST_TOTAL_TOKENS\t%d\nCONTEXT_LAST_USAGE_SOURCE\t%s\n",
+		metadata.ContextWindow,
+		formatContextMetadataValue(metadata.ContextWindowSource),
+		metadata.WarningThresholdPercent,
+		metadata.LastRequestTokens,
+		metadata.LastInputTokens,
+		metadata.LastOutputTokens,
+		metadata.LastTotalTokens,
+		formatContextMetadataValue(metadata.LastUsageSource),
+	)
+	return err
+}
+
+func formatContextMetadataValue(value string) string {
+	if strings.TrimSpace(value) == "" {
+		return "(none)"
+	}
+	return value
 }
 
 func (r *agentRuntime) saveUpdatedMessages(messages []model.Message) error {
@@ -1514,6 +1635,21 @@ func (f *promptTextFlag) Set(value string) error {
 
 func (f *promptTextFlag) String() string {
 	return f.text
+}
+
+type filePathFlag struct {
+	set  bool
+	path string
+}
+
+func (f *filePathFlag) Set(value string) error {
+	f.set = true
+	f.path = value
+	return nil
+}
+
+func (f *filePathFlag) String() string {
+	return f.path
 }
 
 type toolNamesFlag struct {

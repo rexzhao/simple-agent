@@ -17,8 +17,11 @@
 
 ```text
 sai --prompt "你好" --quit
+sai --stdin --quit
 sai --config-dir ./config --prompt "你好" --quit
 sai chat --prompt "你好" --quit
+sai chat --stdin --quit
+sai chat --file prompt.md --quit
 sai --config-dir ./config chat --prompt "你好" --quit
 sai --config-dir ./examples/paperhub chat
 ```
@@ -392,8 +395,14 @@ v0.1 不支持会话进行中切换模型。`sai chat` 进入会话后，provide
 解析一次，并固定到会话结束：`--provider`、`--model`、
 `--show-reasoning`、`--verbose`、`--enable-tools`、`--enable-skills`、
 `--disable-skills`、`--enable-mcp`、`--save-session`、`--resume` 和
-`--continue`。`--resume` 与 `--continue` 互斥。`--quit` 只有在提供 `--prompt` 时有效，
-用于完成该轮后退出。chat 不支持会话进行中切换模型、工具、MCP 或 skills。
+`--continue`。`--resume` 与 `--continue` 互斥。初始输入来源只能是 `--prompt`、
+`--stdin` 或 `--file` 三者之一；`--stdin` 和 `--file` 必须和 `--quit` 一起使用，读取
+完整 stdin 或文件内容作为一次 prompt，完成该轮后退出。chat 不支持会话进行中切换模型、
+工具、MCP 或 skills。
+
+交互式 chat 的普通单行模式支持 `/usage`，用于向 stderr 打印当前 context window 和最近
+usage 摘要。该命令不请求 provider、不写 JSONL 日志，也不打印 prompt、assistant output
+或 tool result 正文；多行输入块里的 `/usage` 按普通文本发送。
 
 ## 参数合并
 
