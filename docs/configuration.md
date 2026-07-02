@@ -16,6 +16,8 @@
 `--config-dir` 不改变 `AGENTS.md` 的查找位置。
 
 ```text
+sai --prompt "你好" --quit
+sai --config-dir ./config --prompt "你好" --quit
 sai chat --prompt "你好" --quit
 sai --config-dir ./config chat --prompt "你好" --quit
 sai --config-dir ./examples/paperhub chat
@@ -360,9 +362,12 @@ sai chat --provider paperhub --model glm-5.2
 2. 启动时当前工作目录下的 `.agents`。
 
 根层解析从 argv 左到右扫描，跳过已知 flag 及其 value；第一个真正的非 flag token 是命令。
+没有命令 token 时默认执行 `chat`，并把已扫描到的 chat flags 交给 `chat` 解析，例如
+`sai --model fast --prompt "hi" --quit` 等价于 `sai chat --model fast --prompt "hi" --quit`。
 带值 flag 的 value 不参与命令识别，因此 `sai --model fast chat --prompt "hi" --quit` 中的
 `fast` 不是命令。命令 token 之外的参数交给对应命令解析，命令前后的 flags 可以混排；
-chat 初始 prompt 使用 `--prompt`，不使用 positional 参数。`--config-dir` 是全局 flag，
+chat 初始 prompt 使用 `--prompt`，不使用 positional 参数；`sai "prompt"` 会把 `prompt`
+识别为未知命令，而不是默认 chat 的初始提示词。`--config-dir` 是全局 flag，
 可以出现在命令前，也可以出现在命令或子命令后，例如 `sai --config-dir ./config models list`
 和 `sai models list --config-dir ./config` 等价。`-h` / `--help` 在命令范围内优先显示 help，且不加载配置。`--` 终止 flag
 解析；其后的 token 全部作为 positional，不再被识别为 help、`--config-dir` 或命令参数

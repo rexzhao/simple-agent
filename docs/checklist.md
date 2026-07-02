@@ -178,12 +178,12 @@
 - [x] 无工具单轮 result messages 追加 assistant final message。
 - [x] tool call 单轮 result messages 包含 assistant tool call、tool result 和最终 assistant text。
 - [x] model stream error 不伪造成功 assistant 历史，继续通过 error event 失败。
-- [x] 添加 `sai chat [flags] [--prompt text] [--quit]`。
+- [x] 添加 `sai [chat] [flags] [--prompt text] [--quit]`，没有命令 token 时默认进入 chat。
 - [x] `sai chat` 会话开始时固定 provider/model/tools/MCP/skills/show-reasoning。
 - [x] `sai chat` 支持 `--provider`、`--model`、`--show-reasoning`、`--verbose`、`--enable-tools`、`--enable-skills`、`--disable-skills`、`--enable-mcp` 语义。
 - [x] 有 `--prompt` 且无 `--quit` 时，先跑完初始 prompt 再进入 REPL，历史保留首轮 user、assistant 和 tool messages。
 - [x] 有 `--prompt` 且有 `--quit` 时，跑完这一轮后退出，不进入 REPL。
-- [x] 根层用“跳过已知 flag 及其 value 后的第一个非 flag token”识别命令；命令前后 flags 可混排，全局 `--config-dir` 可放在命令后，help 混排不加载配置，`--` 后的 token 全部作为 positional，chat 初始 prompt 使用 `--prompt`。
+- [x] 根层用“跳过已知 flag 及其 value 后的第一个非 flag token”识别命令；命令前后 flags 可混排，全局 `--config-dir` 可放在命令后，没有命令 token 时默认执行 chat，help 混排不加载配置，`--` 后的 token 全部作为 positional，chat 初始 prompt 使用 `--prompt`。
 - [x] stdin 逐行读取用户输入，空白行忽略。
 - [x] `/exit`、`/quit` 和 EOF 正常退出。
 - [x] prompt 写到 stderr，不污染 stdout。
@@ -197,7 +197,7 @@
 - [x] 支持 `sai chat -h`、`sai chat --help`、`sai help chat`，help 不加载配置。
 - [x] chat 未知/错误参数包含 `Run "sai help chat" for usage.`。
 - [x] 添加可注入 stdin 的 CLI 测试入口。
-- [x] 添加 chat help、退出、多轮 history、tool history、prompt stderr、错误参数测试。
+- [x] 添加默认 chat、chat help、退出、多轮 history、tool history、prompt stderr、错误参数测试。
 
 ## M11：Reliability
 

@@ -295,7 +295,8 @@ M7 当前实现只覆盖配置目录下的本地 skills：通过 `skills.enabled
   `agent.Stream` 兼容内部单轮调用。
 - updated messages 包含原有 messages、当前 user message、assistant final text、
   assistant tool calls 和 tool result messages。
-- `sai chat [flags] [--prompt "prompt"] [--quit]` 逐行读取 stdin；空白行忽略，`/exit`、`/quit`
+- `sai [chat] [flags] [--prompt "prompt"] [--quit]` 逐行读取 stdin；没有命令 token 时默认进入
+  `chat`；空白行忽略，`/exit`、`/quit`
   或 EOF 正常退出。
 - 有 `--prompt` 时先执行完整一轮 agent loop；无 `--quit` 则继续进入 REPL，带
   `--quit` 则完成后退出；`--quit` 无 `--prompt` 为用法错误。
@@ -304,7 +305,7 @@ M7 当前实现只覆盖配置目录下的本地 skills：通过 `skills.enabled
   `--verbose`、`--enable-tools`、`--enable-skills`、`--disable-skills`、`--enable-mcp`。
 - 参数解析使用统一混排规则：跳过已知 flag 及其 value 后的第一个非 flag token 是命令；
   命令前后 flags 可混排，`--config-dir` 可放在命令后，`--` 后的 token 全部作为
-  positional；chat 不把 positional 参数作为初始 prompt。
+  positional；没有命令 token 时默认执行 `chat`；chat 不把 positional 参数作为初始 prompt。
 - 每轮模型输出继续 streaming 到 stdout；prompt 写到 stderr；chat 成功轮次在输出末尾
   缺少换行时补一个换行，避免下一个 REPL prompt 和模型输出粘在一起。
 - 会话历史只保存在当前进程内；不落盘 chat history；JSONL 日志继续不记录完整
@@ -317,7 +318,7 @@ M7 当前实现只覆盖配置目录下的本地 skills：通过 `skills.enabled
 - Agent 单元测试覆盖无工具单轮追加 assistant final message。
 - Agent 单元测试覆盖 tool call 后 result messages 包含 assistant tool call、tool result
   和最终 assistant text。
-- CLI 单元测试覆盖 chat help 不加载配置、`/exit` 正常退出、`--prompt` + `--quit`、
+- CLI 单元测试覆盖 chat help 不加载配置、无命令默认 chat、`/exit` 正常退出、`--prompt` + `--quit`、
   `--prompt` 后继续 REPL、两轮 history、tool call history、prompt 写 stderr 和错误参数
   help hint。
 - `gofmt -w internal/agent/agent.go internal/agent/agent_test.go internal/cli/cli.go internal/cli/cli_test.go` 通过。

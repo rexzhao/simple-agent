@@ -71,7 +71,7 @@ func execute(ctx context.Context, args []string, stdin io.Reader, stdout, stderr
 			printRootUsage(stdout)
 			return nil
 		}
-		return usageError("missing command", "", "sai help")
+		return chatCommand(ctx, rootArgs.commandArgs, rootArgs.configDir, stdin, stdout, stderr, getwd)
 	}
 
 	switch rootArgs.command {
@@ -138,7 +138,7 @@ func execute(ctx context.Context, args []string, stdin io.Reader, stdout, stderr
 	}
 }
 
-const rootUsageText = `usage: sai [--config-dir dir] <command> [args]
+const rootUsageText = `usage: sai [--config-dir dir] [command] [args]
 
 Commands:
   chat              Start a chat session
@@ -148,6 +148,8 @@ Commands:
   mcp list           List configured MCP servers
   version            Print version
   help [command]     Show usage
+
+With no command, sai defaults to chat.
 
 Run "sai help <command>" for command usage.
 `
@@ -413,6 +415,7 @@ func splitRootArgs(args []string) (rootArgs, error) {
 		}
 	}
 
+	out.commandArgs = prefixArgs
 	return out, nil
 }
 

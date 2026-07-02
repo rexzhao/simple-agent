@@ -59,20 +59,25 @@ models:
 ## Basic Usage
 
 ```sh
+sai --prompt "Hello" --quit
 sai chat --quit --provider paperhub --model glm-5.2 --prompt "Hello"
 ```
 
 Start a line-oriented chat session with the same provider/model selection rules:
 
 ```sh
+sai --provider paperhub --model glm-5.2
 sai chat --provider paperhub --model glm-5.2
 ```
 
-`sai chat --prompt "Hello"` runs that initial prompt first, then enters the
-line-oriented session. Add `--quit` to exit after the initial prompt turn. In
-chat, type one message per line. Blank lines are ignored; `/exit`, `/quit`, or
-EOF exits normally. Session history stays in memory for the current process and
-is not written to disk unless resumable sessions are enabled.
+When no command is provided, `sai` defaults to `chat`. `sai --prompt "Hello"`
+and `sai chat --prompt "Hello"` both run that initial prompt first, then enter
+the line-oriented session. Add `--quit` to exit after the initial prompt turn.
+Initial prompts must use `--prompt`; `sai "Hello"` is treated as an unknown
+command instead of a prompt. In chat, type one message per line. Blank lines are
+ignored; `/exit`, `/quit`, or EOF exits normally. Session history stays in
+memory for the current process and is not written to disk unless resumable
+sessions are enabled.
 
 Show CLI usage without loading configuration:
 

@@ -379,6 +379,8 @@ func TestVersionCommand(t *testing.T) {
 func TestRootHelpWritesUsageWithoutConfig(t *testing.T) {
 	for _, args := range [][]string{
 		{"-h"},
+		{"--help"},
+		{"--config-dir", filepath.Join(t.TempDir(), "missing"), "--help"},
 		{"help"},
 	} {
 		t.Run(strings.Join(args, " "), func(t *testing.T) {
@@ -390,7 +392,7 @@ func TestRootHelpWritesUsageWithoutConfig(t *testing.T) {
 				t.Fatalf("RunWithGetwd(%v) code = %d, stderr = %s", args, code, stderr.String())
 			}
 			out := stdout.String()
-			for _, want := range []string{"usage: sai", "chat              Start a chat session", "config show", "models list", "tools list", `Run "sai help <command>" for command usage.`} {
+			for _, want := range []string{"usage: sai", "chat              Start a chat session", "config show", "models list", "tools list", "With no command, sai defaults to chat.", `Run "sai help <command>" for command usage.`} {
 				if !strings.Contains(out, want) {
 					t.Fatalf("stdout = %q, want contain %q", out, want)
 				}
@@ -603,6 +605,21 @@ func TestUnknownCommandIncludesHelpHint(t *testing.T) {
 	assertCLIErrorContains(t, stderr.String(), `unknown command "nope"`, `Run "sai help" for usage.`)
 }
 
+func TestPositionalPromptWithoutCommandIsUnknownCommand(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	code := RunWithGetwd([]string{"prompt"}, &stdout, &stderr, func() (string, error) {
+		return "", errors.New("getwd should not be called")
+	})
+
+	if code != 1 {
+		t.Fatalf("RunWithGetwd() code = %d, want 1", code)
+	}
+	if stdout.String() != "" {
+		t.Fatalf("stdout = %q, want empty", stdout.String())
+	}
+	assertCLIErrorContains(t, stderr.String(), `unknown command "prompt"`, `Run "sai help" for usage.`)
+}
+
 func TestUnknownRootFlagBeforeCommandIncludesHelpHint(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	code := RunWithGetwd([]string{"--bad", "chat"}, &stdout, &stderr, func() (string, error) {
@@ -710,6 +727,121 @@ func TestChatExitReturnsWithoutModelRequest(t *testing.T) {
 	if logPaths := sessionLogPaths(t, configDir); len(logPaths) != 0 {
 		t.Fatalf("session log paths = %#v, want none", logPaths)
 	}
+	assertNoAdditionalCLIRunRequest(t, requests)
+}
+
+func TestDefaultChatNoCommandEntersREPL(t *testing.T) {
+	server, requests := newCLIRunServer(t,
+		`{"choices":[{"delta":{"content":"unexpected"}}]}`,
+		`[DONE]`,
+	)
+	defer server.Close()
+
+	projectDir := t.TempDir()
+	configDir := filepath.Join(projectDir, ".agents")
+	writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
+
+	var stdout, stderr bytes.Buffer
+	code := RunWithIO(nil, strings.NewReader("/exit\n"), &stdout, &stderr, func() (string, error) {
+		return projectDir, nil
+	})
+
+	if code != 0 {
+		t.Fatalf("RunWithIO() code = %d, stderr = %s", code, stderr.String())
+	}
+	if stdout.String() != "" {
+		t.Fatalf("stdout = %q, want empty", stdout.String())
+	}
+	if got, want := stderr.String(), "> "; got != want {
+		t.Fatalf("stderr = %q, want %q", got, want)
+	}
+	if logPaths := sessionLogPaths(t, configDir); len(logPaths) != 0 {
+		t.Fatalf("session log paths = %#v, want none", logPaths)
+	}
+	assertNoAdditionalCLIRunRequest(t, requests)
+}
+
+func TestDefaultChatAcceptsConfigDirWithoutCommand(t *testing.T) {
+	server, requests := newCLIRunServer(t,
+		`{"choices":[{"delta":{"content":"unexpected"}}]}`,
+		`[DONE]`,
+	)
+	defer server.Close()
+
+	configDir := t.TempDir()
+	writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
+
+	var stdout, stderr bytes.Buffer
+	code := RunWithIO([]string{"--config-dir", configDir}, strings.NewReader("/exit\n"), &stdout, &stderr, func() (string, error) {
+		return t.TempDir(), nil
+	})
+
+	if code != 0 {
+		t.Fatalf("RunWithIO() code = %d, stderr = %s", code, stderr.String())
+	}
+	if stdout.String() != "" {
+		t.Fatalf("stdout = %q, want empty", stdout.String())
+	}
+	if got, want := stderr.String(), "> "; got != want {
+		t.Fatalf("stderr = %q, want %q", got, want)
+	}
+	assertNoAdditionalCLIRunRequest(t, requests)
+}
+
+func TestDefaultChatInitialPromptWithQuitRunsOneTurnAndExits(t *testing.T) {
+	server, requests := newCLIRunServer(t,
+		`{"choices":[{"delta":{"content":"one"}}]}`,
+		`[DONE]`,
+	)
+	defer server.Close()
+
+	configDir := t.TempDir()
+	writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
+
+	var stdout, stderr bytes.Buffer
+	code := RunWithIO([]string{"--config-dir", configDir, "--prompt", "first", "--quit"}, strings.NewReader("second\n"), &stdout, &stderr, func() (string, error) {
+		return t.TempDir(), nil
+	})
+
+	if code != 0 {
+		t.Fatalf("RunWithIO() code = %d, stderr = %s", code, stderr.String())
+	}
+	if got, want := stdout.String(), "one"; got != want {
+		t.Fatalf("stdout = %q, want %q", got, want)
+	}
+	if stderr.String() != "" {
+		t.Fatalf("stderr = %q, want empty", stderr.String())
+	}
+	messages := requestMessages(t, (<-requests).Body)
+	assertMessage(t, messages, 0, "system", builtInBaseInstructions)
+	assertMessage(t, messages, 1, "user", "first")
+	assertNoAdditionalCLIRunRequest(t, requests)
+}
+
+func TestDefaultChatAcceptsModelAndEnableToolsFlags(t *testing.T) {
+	server, requests := newCLIRunServer(t,
+		`{"choices":[{"delta":{"content":"ok"}}]}`,
+		`[DONE]`,
+	)
+	defer server.Close()
+
+	configDir := t.TempDir()
+	writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
+
+	var stdout, stderr bytes.Buffer
+	code := RunWithIO([]string{"--config-dir", configDir, "--model", "fast", "--enable-tools", "read_file", "--prompt", "first", "--quit"}, strings.NewReader(""), &stdout, &stderr, func() (string, error) {
+		return t.TempDir(), nil
+	})
+
+	if code != 0 {
+		t.Fatalf("RunWithIO() code = %d, stderr = %s", code, stderr.String())
+	}
+	request := <-requests
+	if got := request.Body["model"]; got != "model-fast" {
+		t.Fatalf("model = %#v, want model-fast", got)
+	}
+	assertMessage(t, requestMessages(t, request.Body), 1, "user", "first")
+	assertCLIToolNames(t, request.Body, []string{"read_file"})
 	assertNoAdditionalCLIRunRequest(t, requests)
 }
 
