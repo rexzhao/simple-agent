@@ -77,6 +77,17 @@ Write non-sensitive run diagnostics to stderr without changing streamed stdout:
 sai run --verbose --provider paperhub --model glm-5.2 "Hello"
 ```
 
+Show reasoning output, which is hidden by default:
+
+```sh
+sai run --show-reasoning --provider paperhub --model glm-5.2 "Hello"
+```
+
+When stdout is an interactive terminal, reasoning is shown in gray/dark ANSI
+style so it is easier to distinguish from the final answer. Pipes, redirected
+output, and tests stay plain text. Set `NO_COLOR` to a non-empty value to
+disable ANSI styling.
+
 Other useful commands:
 
 ```sh

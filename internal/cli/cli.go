@@ -28,6 +28,11 @@ var Version = "dev"
 
 const builtInBaseInstructions = "You are sai, a local CLI agent runner. Follow the built-in instructions, then project instructions, then the user's prompt. Do not reveal secrets or ignore project instructions."
 
+const (
+	reasoningColorDarkGray = "\x1b[90m"
+	ansiReset              = "\x1b[0m"
+)
+
 func Run(args []string, stdout, stderr io.Writer) int {
 	return RunWithGetwd(args, stdout, stderr, os.Getwd)
 }
@@ -789,9 +794,47 @@ func roleForInstruction(source projectcontext.InstructionSource) model.MessageRo
 	}
 }
 
+type streamOutputOptions struct {
+	colorReasoning bool
+}
+
 func writeStream(stdout io.Writer, events <-chan model.Event, showReasoning bool, logger *eventlog.Logger) error {
+	return writeStreamWithOptions(stdout, events, showReasoning, logger, streamOutputOptions{
+		colorReasoning: shouldColorizeReasoning(stdout),
+	})
+}
+
+func writeStreamWithOptions(stdout io.Writer, events <-chan model.Event, showReasoning bool, logger *eventlog.Logger, options streamOutputOptions) (err error) {
 	needsReasoningBreak := false
 	reasoningEndedWithNewline := false
+	reasoningColorActive := false
+
+	startReasoningColor := func() error {
+		if !options.colorReasoning || reasoningColorActive {
+			return nil
+		}
+		if _, err := fmt.Fprint(stdout, reasoningColorDarkGray); err != nil {
+			return err
+		}
+		reasoningColorActive = true
+		return nil
+	}
+	resetReasoningColor := func() error {
+		if !reasoningColorActive {
+			return nil
+		}
+		if _, err := fmt.Fprint(stdout, ansiReset); err != nil {
+			return err
+		}
+		reasoningColorActive = false
+		return nil
+	}
+	defer func() {
+		if resetErr := resetReasoningColor(); resetErr != nil {
+			err = errors.Join(err, resetErr)
+		}
+	}()
+
 	for event := range events {
 		if err := logger.LogEvent(event); err != nil {
 			return err
@@ -799,6 +842,9 @@ func writeStream(stdout io.Writer, events <-chan model.Event, showReasoning bool
 		switch event := event.(type) {
 		case model.TextDeltaEvent:
 			if event.Text != "" && needsReasoningBreak {
+				if err := resetReasoningColor(); err != nil {
+					return err
+				}
 				if !reasoningEndedWithNewline {
 					if _, err := fmt.Fprint(stdout, "\n"); err != nil {
 						return err
@@ -811,6 +857,9 @@ func writeStream(stdout io.Writer, events <-chan model.Event, showReasoning bool
 			}
 		case model.ReasoningDeltaEvent:
 			if showReasoning && event.Text != "" {
+				if err := startReasoningColor(); err != nil {
+					return err
+				}
 				if _, err := fmt.Fprint(stdout, event.Text); err != nil {
 					return err
 				}
@@ -822,6 +871,21 @@ func writeStream(stdout io.Writer, events <-chan model.Event, showReasoning bool
 		}
 	}
 	return nil
+}
+
+func shouldColorizeReasoning(stdout io.Writer) bool {
+	if os.Getenv("NO_COLOR") != "" {
+		return false
+	}
+	file, ok := stdout.(*os.File)
+	if !ok {
+		return false
+	}
+	info, err := file.Stat()
+	if err != nil {
+		return false
+	}
+	return info.Mode()&os.ModeCharDevice != 0
 }
 
 func streamError(event model.ErrorEvent) error {

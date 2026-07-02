@@ -241,3 +241,30 @@ M7 当前实现只覆盖配置目录下的本地 skills：通过 `skills.enabled
 - CLI 单元测试覆盖 `sai run` 缺 prompt 的错误提示。
 - `go test ./...` 通过。
 - `git diff --check` 通过。
+
+## M9：Reasoning Output Styling
+
+目标：启用 reasoning 输出时，用终端灰色/暗色样式区分 reasoning 和最终输出，同时保持
+默认隐藏 reasoning 的行为不变。
+
+交付物：
+
+- `--show-reasoning` 和配置 `agent.show_reasoning: true` 显示 reasoning 时，在支持颜色
+  的终端 stdout 上用 ANSI 暗灰色输出 reasoning。
+- stdout 不是终端时不输出 ANSI，避免污染 pipe、redirect 和测试输出。
+- `NO_COLOR` 环境变量存在且非空时禁用 ANSI 样式。
+- reasoning 切换到最终 `text_delta` 前先 reset，再沿用已有 reasoning/final 换行逻辑。
+- 只有 reasoning、没有最终文本时，stream 结束前也 reset，避免终端颜色泄漏。
+- 日志继续记录原始事件，不包含 ANSI 样式。
+- 不引入 TUI、不引入第三方依赖，不新增 `--no-color` 或改动 help/usage。
+
+验证：
+
+- 现有 reasoning 隐藏/显示 CLI 测试继续通过，`bytes.Buffer` 默认输出无 ANSI。
+- 单元测试覆盖强制 color option 时 reasoning 被 `\x1b[90m` 和 `\x1b[0m` 包裹，最终
+  text 在 reset 后输出，且 reasoning/final 换行正确。
+- 单元测试覆盖 `NO_COLOR` 和非终端 stdout 的颜色禁用判断。
+- 单元测试覆盖只有 reasoning 没有最终文本时仍输出 reset。
+- `gofmt -w internal/cli/cli.go internal/cli/cli_test.go` 通过。
+- `go test ./...` 通过。
+- `git diff --check` 通过。

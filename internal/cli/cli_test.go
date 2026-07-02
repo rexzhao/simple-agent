@@ -15,6 +15,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/rexzhao/simple-agent/internal/model"
 )
 
 func TestModelsListUsesGlobalConfigDirFlag(t *testing.T) {
@@ -1341,6 +1343,75 @@ func TestRunReasoningIsHiddenUnlessShowReasoningIsSet(t *testing.T) {
 	})
 }
 
+func TestWriteStreamDoesNotColorReasoningForBufferOutput(t *testing.T) {
+	var stdout bytes.Buffer
+	err := writeStream(&stdout, cliEventStream(
+		model.ReasoningDeltaEvent{Text: "shown"},
+		model.TextDeltaEvent{Text: "visible"},
+	), true, nil)
+
+	if err != nil {
+		t.Fatalf("writeStream() error = %v", err)
+	}
+	if got, want := stdout.String(), "shown\nvisible"; got != want {
+		t.Fatalf("stdout = %q, want %q", got, want)
+	}
+	if strings.Contains(stdout.String(), "\x1b[") {
+		t.Fatalf("stdout contains ANSI escape sequence: %q", stdout.String())
+	}
+}
+
+func TestWriteStreamWithOptionsColorsReasoningAndResetsBeforeFinalText(t *testing.T) {
+	var stdout bytes.Buffer
+	err := writeStreamWithOptions(&stdout, cliEventStream(
+		model.ReasoningDeltaEvent{Text: "thinking"},
+		model.TextDeltaEvent{Text: "final"},
+	), true, nil, streamOutputOptions{colorReasoning: true})
+
+	if err != nil {
+		t.Fatalf("writeStreamWithOptions() error = %v", err)
+	}
+	if got, want := stdout.String(), reasoningColorDarkGray+"thinking"+ansiReset+"\nfinal"; got != want {
+		t.Fatalf("stdout = %q, want %q", got, want)
+	}
+}
+
+func TestWriteStreamWithOptionsResetsAfterReasoningOnly(t *testing.T) {
+	var stdout bytes.Buffer
+	err := writeStreamWithOptions(&stdout, cliEventStream(
+		model.ReasoningDeltaEvent{Text: "thinking"},
+	), true, nil, streamOutputOptions{colorReasoning: true})
+
+	if err != nil {
+		t.Fatalf("writeStreamWithOptions() error = %v", err)
+	}
+	if got, want := stdout.String(), reasoningColorDarkGray+"thinking"+ansiReset; got != want {
+		t.Fatalf("stdout = %q, want %q", got, want)
+	}
+}
+
+func TestShouldColorizeReasoningRequiresTerminalAndHonorsNOColor(t *testing.T) {
+	t.Setenv("NO_COLOR", "")
+	var buffer bytes.Buffer
+	if shouldColorizeReasoning(&buffer) {
+		t.Fatal("shouldColorizeReasoning(bytes.Buffer) = true, want false")
+	}
+
+	file, err := os.CreateTemp(t.TempDir(), "stdout")
+	if err != nil {
+		t.Fatalf("CreateTemp() error = %v", err)
+	}
+	defer file.Close()
+	if shouldColorizeReasoning(file) {
+		t.Fatal("shouldColorizeReasoning(regular file) = true, want false")
+	}
+
+	t.Setenv("NO_COLOR", "1")
+	if shouldColorizeReasoning(os.Stdout) {
+		t.Fatal("shouldColorizeReasoning(os.Stdout) = true with NO_COLOR set, want false")
+	}
+}
+
 func TestRunErrorsDoNotLeakAPIKeyValues(t *testing.T) {
 	t.Run("missing API key", func(t *testing.T) {
 		server, requests := newCLIRunServer(t, `[DONE]`)
@@ -1765,6 +1836,15 @@ func readJSONLRecords(t *testing.T, data []byte) []map[string]any {
 		t.Fatal("JSONL log has no records")
 	}
 	return records
+}
+
+func cliEventStream(events ...model.Event) <-chan model.Event {
+	ch := make(chan model.Event, len(events))
+	for _, event := range events {
+		ch <- event
+	}
+	close(ch)
+	return ch
 }
 
 func requestMessages(t *testing.T, body map[string]any) []any {

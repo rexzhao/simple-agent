@@ -350,6 +350,22 @@ choices[0].delta.content
 当事件流从 reasoning 输出切换到最终消息输出时，必须先补齐一个行尾换行，避免 reasoning
 和最终消息混在同一行。
 
+## Reasoning 输出样式
+
+M9 后，reasoning 样式只属于 CLI stdout 展示层，不改变内部 stream event，也不改变
+JSONL 日志。`reasoning_delta` 仍按原始事件记录；ANSI 控制符不能写入日志。
+
+只有 reasoning 被显式显示时才考虑上色：命令行 `--show-reasoning` 或配置
+`agent.show_reasoning: true` 生效后，`writeStream` 在支持颜色的终端 stdout 上使用
+ANSI 暗灰色显示 reasoning。当前样式是 `\x1b[90m` 开始、`\x1b[0m` reset。
+如果 stdout 不是终端，例如 pipe、redirect 或测试中的 `bytes.Buffer`，不输出 ANSI。
+如果环境变量 `NO_COLOR` 存在且非空，即使 stdout 是终端也不输出 ANSI。
+
+从 reasoning 切换到最终 `text_delta` 前必须先 reset，再沿用原有 reasoning/final
+换行规则，确保最终输出不是灰色。若 stream 只有 reasoning 没有最终文本，函数结束前也
+必须 reset，避免调用方终端颜色泄漏。M9 不引入 TUI、不引入第三方依赖，也不新增
+`--no-color`；若以后需要显式颜色开关，应作为单独里程碑设计。
+
 ## Tool Calling
 
 内部 tool schema 建议保持稳定：

@@ -149,3 +149,15 @@
 - [x] `sai run` 缺 prompt 时包含 run usage 或 help 提示。
 - [x] 不引入 TUI 或第三方 CLI 框架。
 - [x] 添加 CLI help 测试并验证 `go test ./...`。
+
+## M9：Reasoning Output Styling
+
+- [x] 默认继续隐藏 reasoning 输出。
+- [x] `--show-reasoning` 和 `agent.show_reasoning: true` 显示 reasoning 时可使用终端暗灰色样式。
+- [x] stdout 不是终端时不输出 ANSI。
+- [x] `NO_COLOR` 存在且非空时不输出 ANSI。
+- [x] 切换到最终 `text_delta` 前先 reset，最终输出不继承 reasoning 颜色。
+- [x] 只有 reasoning、没有最终文本时，stream 结束前 reset。
+- [x] JSONL 日志继续记录原始事件，不包含 ANSI 样式。
+- [x] 不引入 TUI、不引入第三方依赖，不新增 `--no-color` 或改动 help/usage。
+- [x] 添加 reasoning 样式测试并验证 `go test ./...`。
