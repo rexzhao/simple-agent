@@ -156,6 +156,10 @@ sai chat --prompt "prompt" --quit
 sai chat --save-session --prompt "prompt" --quit
 sai chat --resume <id> --prompt "prompt" --quit
 sai chat --continue --prompt "prompt" --quit
+sai sessions list
+sai sessions show <id>
+sai sessions delete <id>
+sai sessions prune --keep 10
 sai tools list
 sai models list
 sai config show
@@ -190,6 +194,16 @@ sai mcp -h
 sai help mcp
 sai mcp list -h
 sai help mcp list
+sai sessions -h
+sai help sessions
+sai sessions list -h
+sai help sessions list
+sai sessions show -h
+sai help sessions show
+sai sessions delete -h
+sai help sessions delete
+sai sessions prune -h
+sai help sessions prune
 ```
 
 help 输出写到 stdout，exit code 为 0。help 必须在配置加载前完成：不读取 `.agents`
@@ -276,6 +290,14 @@ messages 却发给不同模型或工具集合”。如果本次命令显式传�
 `--model`、`--enable-tools`、`--enable-mcp`、`--enable-skills`、`--disable-skills` 或
 `--show-reasoning`，命令会失败并给出可读错误。可靠保存和恢复要求
 `sessions.save_tool_results: true`；设为 `false` 时，`sai chat` 会拒绝启用保存或恢复。
+
+`sai sessions list`、`sai sessions show <id>`、`sai sessions delete <id>` 和
+`sai sessions prune --keep N` 使用配置解析后的 `sessions.dir`。即使
+`sessions.enabled: false`，这些管理命令也可以查看或清理已有 session 文件。`list` 只输出
+ID、更新时间、provider 和 model/profile 等元数据；`show` 只输出 session 元数据和敏感
+数据风险提示，不打印完整 messages、prompt、assistant output、tool result 正文或注入指令
+正文。`prune` 按 `updated_at` 保留最新的 N 个 session，`--keep` 必须显式提供且 N 必须
+大于等于 0；命令输出删除数量和被删除的 session ID，不做额外确认。
 
 ## 配置形态
 
@@ -628,8 +650,10 @@ profile parameters、cwd、配置根目录、启用 tools/MCP/skills/reasoning�
 tool result messages。缺少这些信息时，只能得到 transcript 或诊断日志，不能承诺可靠
 resume。
 
-当前 M13 已接入 `sai chat --save-session`、`sai chat --resume <id>` 和
-`sai chat --continue`。`sai sessions list/show/delete/prune` 仍是后续管理命令，暂未实现。
+当前 M13 已接入 `sai chat --save-session`、`sai chat --resume <id>`、
+`sai chat --continue`、`sai sessions list`、`sai sessions show <id>`、
+`sai sessions delete <id>` 和 `sai sessions prune --keep N`。管理命令只展示元数据或删除
+文件，不打印完整 messages、prompt、assistant output 或 tool result 正文。
 
 ## 测试策略
 

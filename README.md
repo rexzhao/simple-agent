@@ -30,6 +30,11 @@ tools:
 logging:
   path: logs/sai.jsonl
   level: info
+
+sessions:
+  enabled: false
+  dir: sessions
+  save_tool_results: true
 ```
 
 `logging.path` is a log root hint, kept compatible with older configs. For
@@ -79,6 +84,25 @@ ignored; `/exit`, `/quit`, or EOF exits normally. Session history stays in
 memory for the current process and is not written to disk unless resumable
 sessions are enabled.
 
+Resumable sessions are an explicit opt-in feature. They save full prompts,
+assistant output, assistant tool calls, and tool results under `sessions.dir`,
+so treat those files as sensitive:
+
+```sh
+sai chat --save-session --prompt "Save this turn" --quit
+sai chat --resume <id> --prompt "Continue" --quit
+sai chat --continue --prompt "Continue the latest session" --quit
+sai sessions list
+sai sessions show <id>
+sai sessions delete <id>
+sai sessions prune --keep 10
+```
+
+`sai sessions list` works even when `sessions.enabled` is `false`, so existing
+files can be inspected after automatic saving is disabled. `list` and `show`
+only print metadata and warnings; they do not print full messages, prompt
+text, assistant output, or tool result content.
+
 Show CLI usage without loading configuration:
 
 ```sh
@@ -92,6 +116,11 @@ sai help models
 sai help tools
 sai help tools list
 sai help mcp
+sai help sessions
+sai help sessions list
+sai help sessions show
+sai help sessions delete
+sai help sessions prune
 ```
 
 Enable tools for one prompt or a chat session:
@@ -139,6 +168,7 @@ sai version
 sai config show
 sai models list
 sai tools list
+sai sessions list
 ```
 
 ## Build

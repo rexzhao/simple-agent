@@ -392,7 +392,7 @@ func TestRootHelpWritesUsageWithoutConfig(t *testing.T) {
 				t.Fatalf("RunWithGetwd(%v) code = %d, stderr = %s", args, code, stderr.String())
 			}
 			out := stdout.String()
-			for _, want := range []string{"usage: sai", "chat              Start a chat session", "config show", "models list", "tools list", "With no command, sai defaults to chat.", `Run "sai help <command>" for command usage.`} {
+			for _, want := range []string{"usage: sai", "chat              Start a chat session", "config show", "models list", "tools list", "sessions", "With no command, sai defaults to chat.", `Run "sai help <command>" for command usage.`} {
 				if !strings.Contains(out, want) {
 					t.Fatalf("stdout = %q, want contain %q", out, want)
 				}
@@ -526,6 +526,21 @@ func TestGroupHelpWritesUsageWithoutConfig(t *testing.T) {
 			args:  []string{"help", "mcp"},
 			wants: []string{"usage: sai mcp <command>", "mcp list"},
 		},
+		{
+			name:  "sessions flag short",
+			args:  []string{"sessions", "-h"},
+			wants: []string{"usage: sai sessions <command>", "sessions list", "sessions prune --keep N"},
+		},
+		{
+			name:  "sessions flag long",
+			args:  []string{"sessions", "--help"},
+			wants: []string{"usage: sai sessions <command>", "sessions list", "sessions prune --keep N"},
+		},
+		{
+			name:  "sessions help",
+			args:  []string{"help", "sessions"},
+			wants: []string{"usage: sai sessions <command>", "sessions list", "sessions prune --keep N"},
+		},
 	}
 
 	for _, tt := range tests {
@@ -580,6 +595,46 @@ func TestNestedHelpWritesUsageWithoutConfig(t *testing.T) {
 			name:  "mcp list help",
 			args:  []string{"help", "mcp", "list"},
 			wants: []string{"usage: sai mcp list", "--enable-mcp ids"},
+		},
+		{
+			name:  "sessions list flag",
+			args:  []string{"sessions", "list", "-h"},
+			wants: []string{"usage: sai sessions list", "messages, prompts, assistant output"},
+		},
+		{
+			name:  "sessions list help",
+			args:  []string{"help", "sessions", "list"},
+			wants: []string{"usage: sai sessions list", "messages, prompts, assistant output"},
+		},
+		{
+			name:  "sessions show flag",
+			args:  []string{"sessions", "show", "-h"},
+			wants: []string{"usage: sai sessions show <id>", "full sensitive"},
+		},
+		{
+			name:  "sessions show help",
+			args:  []string{"help", "sessions", "show"},
+			wants: []string{"usage: sai sessions show <id>", "full sensitive"},
+		},
+		{
+			name:  "sessions delete flag",
+			args:  []string{"sessions", "delete", "-h"},
+			wants: []string{"usage: sai sessions delete <id>"},
+		},
+		{
+			name:  "sessions delete help",
+			args:  []string{"help", "sessions", "delete"},
+			wants: []string{"usage: sai sessions delete <id>"},
+		},
+		{
+			name:  "sessions prune flag",
+			args:  []string{"--keep", "1", "sessions", "prune", "-h"},
+			wants: []string{"usage: sai sessions prune --keep N", "--keep must be provided"},
+		},
+		{
+			name:  "sessions prune help",
+			args:  []string{"help", "sessions", "prune"},
+			wants: []string{"usage: sai sessions prune --keep N", "--keep must be provided"},
 		},
 	}
 
@@ -1717,6 +1772,288 @@ func TestChatSaveToolResultsFalseRejectsSaveAndResume(t *testing.T) {
 				t.Fatalf("stdout = %q, want empty", stdout.String())
 			}
 			assertCLIErrorContains(t, stderr.String(), "resumable sessions require sessions.save_tool_results: true")
+		})
+	}
+}
+
+func TestSessionsListShowsMetadataWithoutSensitiveMessagesWhenDisabled(t *testing.T) {
+	configDir := writeCLIFixture(t)
+	sessionRoot := filepath.Join(configDir, "sessions")
+	writeCLISession(t, sessionRoot, sessions.Session{
+		ID:           "older-session",
+		CreatedAt:    time.Date(2026, 7, 2, 3, 0, 0, 0, time.UTC),
+		UpdatedAt:    time.Date(2026, 7, 2, 3, 1, 0, 0, time.UTC),
+		Version:      sessions.CurrentVersion,
+		Provider:     "paperhub",
+		ModelProfile: "glm-5.2",
+		ModelID:      "glm-5.2",
+		Messages: []model.Message{
+			{Role: model.MessageRoleUser, Content: "older prompt secret"},
+			{Role: model.MessageRoleAssistant, Content: "older assistant secret"},
+			{Role: model.MessageRoleTool, ToolCallID: "call_older", Content: "older tool secret"},
+		},
+		SaveToolResults: true,
+	})
+	writeCLISession(t, sessionRoot, sessions.Session{
+		ID:           "newer-session",
+		CreatedAt:    time.Date(2026, 7, 2, 3, 0, 0, 0, time.UTC),
+		UpdatedAt:    time.Date(2026, 7, 2, 3, 2, 0, 0, time.UTC),
+		Version:      sessions.CurrentVersion,
+		Provider:     "openai",
+		ModelProfile: "default",
+		ModelID:      "gpt-5.1",
+		Messages: []model.Message{
+			{Role: model.MessageRoleUser, Content: "newer prompt secret"},
+			{Role: model.MessageRoleAssistant, Content: "newer assistant secret"},
+			{Role: model.MessageRoleTool, ToolCallID: "call_newer", Content: "newer tool secret"},
+		},
+		SaveToolResults: true,
+	})
+
+	var stdout, stderr bytes.Buffer
+	code := RunWithGetwd([]string{"--config-dir", configDir, "sessions", "list"}, &stdout, &stderr, func() (string, error) {
+		return "", errors.New("getwd should not be called")
+	})
+
+	if code != 0 {
+		t.Fatalf("RunWithGetwd() code = %d, stderr = %s", code, stderr.String())
+	}
+	out := stdout.String()
+	for _, want := range []string{
+		"ID\tUPDATED\tPROVIDER\tMODEL/PROFILE",
+		"newer-session\t2026-07-02T03:02:00Z\topenai\tgpt-5.1/default",
+		"older-session\t2026-07-02T03:01:00Z\tpaperhub\tglm-5.2/glm-5.2",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("sessions list output missing %q:\n%s", want, out)
+		}
+	}
+	if strings.Index(out, "newer-session") > strings.Index(out, "older-session") {
+		t.Fatalf("sessions list order = %q, want newest first", out)
+	}
+	assertCLIErrorOmits(t, out, "older prompt secret", "older assistant secret", "older tool secret", "newer prompt secret", "newer assistant secret", "newer tool secret")
+	if stderr.String() != "" {
+		t.Fatalf("stderr = %q, want empty", stderr.String())
+	}
+}
+
+func TestSessionsShowPrintsMetadataAndSensitiveContentWarning(t *testing.T) {
+	configDir := writeCLIFixture(t)
+	writeCLISession(t, filepath.Join(configDir, "sessions"), sessions.Session{
+		ID:           "show-session",
+		CreatedAt:    time.Date(2026, 7, 2, 3, 0, 0, 0, time.UTC),
+		UpdatedAt:    time.Date(2026, 7, 2, 3, 1, 0, 0, time.UTC),
+		Version:      sessions.CurrentVersion,
+		Provider:     "paperhub",
+		ModelProfile: "glm-5.2-fast",
+		ModelID:      "glm-5.2",
+		CWD:          filepath.Join(t.TempDir(), "project"),
+		ConfigDir:    configDir,
+		EnabledTools: []string{"read_file"},
+		EnabledMCP:   []string{"local"},
+		EnabledSkills: []string{
+			"review",
+		},
+		ShowReasoning: true,
+		InstructionsSnapshot: []model.Message{
+			{Role: model.MessageRoleSystem, Content: "instruction secret"},
+		},
+		Messages: []model.Message{
+			{Role: model.MessageRoleUser, Content: "prompt body secret"},
+			{Role: model.MessageRoleAssistant, Content: "assistant body secret"},
+			{Role: model.MessageRoleTool, ToolCallID: "call_show", Content: "tool body secret"},
+		},
+		SaveToolResults: true,
+	})
+
+	var stdout, stderr bytes.Buffer
+	code := RunWithGetwd([]string{"sessions", "show", "show-session", "--config-dir", configDir}, &stdout, &stderr, func() (string, error) {
+		return "", errors.New("getwd should not be called")
+	})
+
+	if code != 0 {
+		t.Fatalf("RunWithGetwd() code = %d, stderr = %s", code, stderr.String())
+	}
+	out := stdout.String()
+	for _, want := range []string{
+		"WARNING: session files contain full sensitive content",
+		"ID\tshow-session",
+		"UPDATED\t2026-07-02T03:01:00Z",
+		"PROVIDER\tpaperhub",
+		"MODEL_PROFILE\tglm-5.2-fast",
+		"MODEL_ID\tglm-5.2",
+		"ENABLED_TOOLS\tread_file",
+		"ENABLED_MCP\tlocal",
+		"ENABLED_SKILLS\treview",
+		"SHOW_REASONING\ttrue",
+		"SAVE_TOOL_RESULTS\ttrue",
+		"INSTRUCTION_COUNT\t1",
+		"MESSAGE_COUNT\t3",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("sessions show output missing %q:\n%s", want, out)
+		}
+	}
+	assertCLIErrorOmits(t, out, "instruction secret", "prompt body secret", "assistant body secret", "tool body secret")
+	if stderr.String() != "" {
+		t.Fatalf("stderr = %q, want empty", stderr.String())
+	}
+}
+
+func TestSessionsDeleteRemovesSessionAndReportsMissingSession(t *testing.T) {
+	configDir := writeCLIFixture(t)
+	sessionRoot := filepath.Join(configDir, "sessions")
+	writeCLISession(t, sessionRoot, sessions.Session{
+		ID:           "delete-session",
+		CreatedAt:    time.Date(2026, 7, 2, 3, 0, 0, 0, time.UTC),
+		UpdatedAt:    time.Date(2026, 7, 2, 3, 1, 0, 0, time.UTC),
+		Version:      sessions.CurrentVersion,
+		Provider:     "paperhub",
+		ModelProfile: "glm-5.2",
+		ModelID:      "glm-5.2",
+		Messages:     []model.Message{{Role: model.MessageRoleUser, Content: "delete prompt secret"}},
+	})
+
+	var stdout, stderr bytes.Buffer
+	code := RunWithGetwd([]string{"--config-dir", configDir, "sessions", "delete", "delete-session"}, &stdout, &stderr, func() (string, error) {
+		return "", errors.New("getwd should not be called")
+	})
+
+	if code != 0 {
+		t.Fatalf("RunWithGetwd(delete) code = %d, stderr = %s", code, stderr.String())
+	}
+	if got, want := stdout.String(), "deleted session delete-session\n"; got != want {
+		t.Fatalf("stdout = %q, want %q", got, want)
+	}
+	if _, err := sessions.NewStore(sessionRoot).Load("delete-session"); !errors.Is(err, sessions.ErrNotFound) {
+		t.Fatalf("Load(deleted) error = %v, want ErrNotFound", err)
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	code = RunWithGetwd([]string{"--config-dir", configDir, "sessions", "delete", "missing-session"}, &stdout, &stderr, func() (string, error) {
+		return "", errors.New("getwd should not be called")
+	})
+
+	if code != 1 {
+		t.Fatalf("RunWithGetwd(missing) code = %d, want 1", code)
+	}
+	if stdout.String() != "" {
+		t.Fatalf("stdout = %q, want empty", stdout.String())
+	}
+	assertCLIErrorContains(t, stderr.String(), `resumable session "missing-session" was not found`)
+}
+
+func TestSessionsPruneRequiresExplicitKeepWithoutConfigLoad(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+		want string
+	}{
+		{name: "missing", args: []string{"sessions", "prune"}, want: "--keep must be provided"},
+		{name: "negative", args: []string{"sessions", "prune", "--keep", "-1"}, want: "--keep must be 0 or greater"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			code := RunWithGetwd(tt.args, &stdout, &stderr, func() (string, error) {
+				return "", errors.New("getwd should not be called")
+			})
+
+			if code != 1 {
+				t.Fatalf("RunWithGetwd() code = %d, want 1", code)
+			}
+			if stdout.String() != "" {
+				t.Fatalf("stdout = %q, want empty", stdout.String())
+			}
+			assertCLIErrorContains(t, stderr.String(), tt.want, `Run "sai help sessions prune" for usage.`)
+		})
+	}
+}
+
+func TestSessionsPruneKeepsNewestSessionsWithMixedKeepFlag(t *testing.T) {
+	tests := []struct {
+		name string
+		args func(configDir string) []string
+	}{
+		{
+			name: "root keep",
+			args: func(configDir string) []string {
+				return []string{"--config-dir", configDir, "--keep", "1", "sessions", "prune"}
+			},
+		},
+		{
+			name: "group keep",
+			args: func(configDir string) []string {
+				return []string{"sessions", "--keep", "1", "--config-dir", configDir, "prune"}
+			},
+		},
+		{
+			name: "command keep",
+			args: func(configDir string) []string {
+				return []string{"sessions", "prune", "--config-dir", configDir, "--keep", "1"}
+			},
+		},
+		{
+			name: "keep zero",
+			args: func(configDir string) []string {
+				return []string{"--config-dir", configDir, "sessions", "prune", "--keep", "0"}
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			configDir := writeCLIFixture(t)
+			sessionRoot := filepath.Join(configDir, "sessions")
+			writeCLIPruneSession(t, sessionRoot, "oldest-session", time.Date(2026, 7, 2, 3, 0, 0, 0, time.UTC))
+			writeCLIPruneSession(t, sessionRoot, "older-session", time.Date(2026, 7, 2, 3, 1, 0, 0, time.UTC))
+			writeCLIPruneSession(t, sessionRoot, "newest-session", time.Date(2026, 7, 2, 3, 2, 0, 0, time.UTC))
+
+			var stdout, stderr bytes.Buffer
+			code := RunWithGetwd(tt.args(configDir), &stdout, &stderr, func() (string, error) {
+				return "", errors.New("getwd should not be called")
+			})
+
+			if code != 0 {
+				t.Fatalf("RunWithGetwd() code = %d, stderr = %s", code, stderr.String())
+			}
+			out := stdout.String()
+			if tt.name == "keep zero" {
+				for _, want := range []string{"deleted 3 sessions", "newest-session", "older-session", "oldest-session"} {
+					if !strings.Contains(out, want) {
+						t.Fatalf("prune output missing %q:\n%s", want, out)
+					}
+				}
+				infos, err := sessions.NewStore(sessionRoot).List()
+				if err != nil {
+					t.Fatalf("List() after prune error = %v", err)
+				}
+				if len(infos) != 0 {
+					t.Fatalf("remaining sessions = %#v, want none", infos)
+				}
+				return
+			}
+
+			for _, want := range []string{"deleted 2 sessions", "older-session", "oldest-session"} {
+				if !strings.Contains(out, want) {
+					t.Fatalf("prune output missing %q:\n%s", want, out)
+				}
+			}
+			if strings.Contains(out, "newest-session") {
+				t.Fatalf("prune output included kept session:\n%s", out)
+			}
+			infos, err := sessions.NewStore(sessionRoot).List()
+			if err != nil {
+				t.Fatalf("List() after prune error = %v", err)
+			}
+			if len(infos) != 1 || infos[0].ID != "newest-session" {
+				t.Fatalf("remaining sessions = %#v, want only newest-session", infos)
+			}
+			if stderr.String() != "" {
+				t.Fatalf("stderr = %q, want empty", stderr.String())
+			}
 		})
 	}
 }
@@ -3575,6 +3912,21 @@ func writeCLISession(t *testing.T, root string, session sessions.Session) {
 	if err := os.WriteFile(path, data, 0o600); err != nil {
 		t.Fatalf("WriteFile(%q) error = %v", path, err)
 	}
+}
+
+func writeCLIPruneSession(t *testing.T, root, id string, updatedAt time.Time) {
+	t.Helper()
+
+	writeCLISession(t, root, sessions.Session{
+		ID:           id,
+		CreatedAt:    updatedAt.Add(-time.Minute),
+		UpdatedAt:    updatedAt,
+		Version:      sessions.CurrentVersion,
+		Provider:     "paperhub",
+		ModelProfile: "glm-5.2",
+		ModelID:      "glm-5.2",
+		Messages:     []model.Message{{Role: model.MessageRoleUser, Content: id + " prompt secret"}},
+	})
 }
 
 type capturedCLIRunRequest struct {

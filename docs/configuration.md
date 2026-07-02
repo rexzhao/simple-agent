@@ -451,6 +451,10 @@ opt-in 的落盘能力。
 sai chat --save-session --prompt "保存这一轮" --quit
 sai chat --resume <id> --prompt "继续这一轮" --quit
 sai chat --continue --prompt "继续最近 session" --quit
+sai sessions list
+sai sessions show <id>
+sai sessions delete <id>
+sai sessions prune --keep 10
 ```
 
 启用保存后，`sai chat` 每个成功 turn 都会写入 `sessions.dir/<id>/session.json`，其中
@@ -463,3 +467,11 @@ parameters、enabled tools、enabled MCP、enabled skills 和 show_reasoning。�
 覆盖如果和 session 文件冲突会失败，例如恢复时同时传入不同的 `--model`、不同的
 `--enable-tools` 或冲突的 `--show-reasoning`。`sessions.save_tool_results: false` 当前不
 提供可靠降级模式；只要启用保存或恢复，CLI 会拒绝继续并提示必须设为 `true`。
+
+session 管理命令使用解析后的 `sessions.dir`，不要求 `sessions.enabled: true`，因此可以在
+关闭自动保存时查看或清理已有文件。`sai sessions list` 只列出 ID、更新时间、provider 和
+model/profile 等元数据。`sai sessions show <id>` 只展示元数据，并提示 session 文件包含
+完整 prompt、assistant 输出和 tool result 等敏感内容；它不会打印完整 messages、tool
+result 正文、prompt 正文或注入指令正文。`sai sessions delete <id>` 删除指定 session；
+不存在时给出可读错误。`sai sessions prune --keep N` 保留 `updated_at` 最新的 N 个
+session，删除更旧的 session；`--keep` 必须显式提供，N 必须大于等于 0。

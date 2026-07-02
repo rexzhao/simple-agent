@@ -402,8 +402,10 @@ M7 当前实现只覆盖配置目录下的本地 skills：通过 `skills.enabled
 - 启用后保存完整 tool results，除非后续提供明确的不可恢复降级模式。
 - 命令形态建议：`sai chat --save-session`、`sai chat --resume <id>`、
   `sai chat --continue`。
-- session 管理命令建议：`sai sessions list`、`sai sessions show <id>`、
-  `sai sessions delete <id>`、`sai sessions prune`。
+- session 管理命令：`sai sessions list`、`sai sessions show <id>`、
+  `sai sessions delete <id>`、`sai sessions prune --keep N`。
+- session 管理命令只输出元数据或删除确认，不打印完整 messages、prompt、assistant output
+  或 tool result 正文。
 - CLI、配置文档和错误信息都明确提示 resumable sessions 会保存敏感数据，包含完整
   prompt、assistant 输出和 tool result。
 

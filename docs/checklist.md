@@ -244,10 +244,10 @@
 - [x] `sai chat --save-session` 可保存完整可恢复 session。
 - [x] `sai chat --resume <id>` 可恢复指定 session。
 - [x] `sai chat --continue` 可继续最近 session。
-- [ ] `sai sessions list` 可列出 sessions。
-- [ ] `sai sessions show <id>` 可展示 session 元数据并提示敏感数据风险。
-- [ ] `sai sessions delete <id>` 可删除指定 session。
-- [ ] `sai sessions prune` 可清理旧 sessions。
+- [x] `sai sessions list` 可列出 sessions。
+- [x] `sai sessions show <id>` 可展示 session 元数据并提示敏感数据风险。
+- [x] `sai sessions delete <id>` 可删除指定 session。
+- [x] `sai sessions prune` 可清理旧 sessions。
 - [x] 文档和 CLI 输出提示 sessions 保存完整 prompt、assistant 输出和 tool result。
 
 ## M14：Context Window Management
