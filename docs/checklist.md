@@ -216,18 +216,18 @@
 
 ## M12：Editing Tools
 
-- [ ] 新增 `write_file` 工具。
-- [ ] 新增 `edit_file` 或 patch-style 编辑工具。
-- [ ] 编辑工具默认不启用。
-- [ ] 编辑工具仅通过 `tools.enabled` 或 `--enable-tools` 暴露给模型。
-- [ ] `sai tools list` 静态列出新增编辑工具。
-- [ ] 编辑工具状态写 stderr，不打印完整写入内容、patch 正文或文件内容。
-- [ ] 工具结果消息只包含必要摘要和错误，不向终端泄露完整内容。
-- [ ] 覆盖写入测试通过。
-- [ ] 局部编辑测试通过。
-- [ ] 路径错误测试通过。
-- [ ] 未启用时 registry / request payload 不暴露编辑工具。
-- [ ] 启用后 registry / request payload 暴露对应编辑工具。
+- [x] 新增 `write_file` 工具。
+- [x] 新增 `edit_file` 或 patch-style 编辑工具。
+- [x] 编辑工具默认不启用。
+- [x] 编辑工具仅通过 `tools.enabled` 或 `--enable-tools` 暴露给模型。
+- [x] `sai tools list` 静态列出新增编辑工具。
+- [x] 编辑工具状态写 stderr，不打印完整写入内容、patch 正文或文件内容。
+- [x] 工具结果消息只包含必要摘要和错误，不向终端泄露完整内容。
+- [x] 覆盖写入测试通过。
+- [x] 局部编辑测试通过。
+- [x] 路径错误测试通过。
+- [x] 未启用时 registry / request payload 不暴露编辑工具。
+- [x] 启用后 registry / request payload 暴露对应编辑工具。
 
 ## M13：Resumable Sessions
 

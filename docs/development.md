@@ -124,10 +124,10 @@ error
 
 CLI 默认只打印 `text_delta`。`reasoning_delta` 默认隐藏，后续通过
 `--show-reasoning` 显示。发生 tool call 时，CLI 默认向 stderr 打印独立的简短工具状态
-（例如 `tool: read_file docs/notes.md`），不需要 `--verbose`；`read_file` 和
-`list_files` 状态可以显示目标路径/目录，其中 `list_files` 未提供 path 时显示 `.`。
-`shell` 和 MCP tool 状态只显示工具名，不显示命令参数或任意 arguments，也不打印 tool
-result 正文，stdout 仍只承载模型可见输出。
+（例如 `tool: read_file docs/notes.md`），不需要 `--verbose`；`read_file`、`write_file`、
+`edit_file` 和 `list_files` 状态可以显示目标路径/目录，其中 `list_files` 未提供 path
+时显示 `.`。`shell` 和 MCP tool 状态只显示工具名，不显示命令参数或任意 arguments，
+也不打印 tool result 正文，stdout 仍只承载模型可见输出。
 
 ## Agent Loop
 
@@ -485,11 +485,13 @@ Responses function tool 名称只发送字母、数字、下划线和连字符�
 assistant 历史里的 tool calls 会转换成 `function_call` input item，tool result 会转换成
 `function_call_output` input item，并使用 `call_id` 关联。
 
-v0.1 内置三个工具：
+当前内置工具：
 
 ```text
 list_files
 read_file
+write_file
+edit_file
 shell
 ```
 
@@ -504,6 +506,8 @@ tools:
   enabled:
     - list_files
     - read_file
+    - write_file
+    - edit_file
     - shell
 ```
 
@@ -511,8 +515,8 @@ tools:
 sai chat --quit --enable-tools list_files,read_file "列出当前目录"
 ```
 
-`--enable-tools` 覆盖配置文件中的 enabled tools 列表，而不是追加。`shell` 不需要额外
-审核 flag；只要它被启用，就按普通工具处理。如果后续加入 `write_file`，也遵循同一规则。
+`--enable-tools` 覆盖配置文件中的 enabled tools 列表，而不是追加。`shell`、`write_file`
+和 `edit_file` 不需要额外审核 flag；只要它被启用，就按普通工具处理。
 
 `shell` 工具默认在启动目录执行命令。v0.1 不提供 `--workdir`，也不做复杂沙箱；后续如需
 改变执行目录，再增加显式参数。

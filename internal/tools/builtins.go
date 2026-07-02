@@ -21,6 +21,8 @@ import (
 const (
 	BuiltinListFiles = "list_files"
 	BuiltinReadFile  = "read_file"
+	BuiltinWriteFile = "write_file"
+	BuiltinEditFile  = "edit_file"
 	BuiltinShell     = "shell"
 )
 
@@ -58,6 +60,14 @@ func RegisterBuiltins(registry *Registry, rootDir string) error {
 		{
 			Definition: readFileDefinition(),
 			Executor:   newReadFileExecutor(canonicalRoot),
+		},
+		{
+			Definition: writeFileDefinition(),
+			Executor:   newWriteFileExecutor(canonicalRoot),
+		},
+		{
+			Definition: editFileDefinition(),
+			Executor:   newEditFileExecutor(canonicalRoot),
 		},
 		{
 			Definition: shellDefinition(),
@@ -125,6 +135,54 @@ func shellDefinition() model.Tool {
 	}
 }
 
+func writeFileDefinition() model.Tool {
+	return model.Tool{
+		Name:        BuiltinWriteFile,
+		Description: "Write a text file under the workspace, creating parent directories if needed.",
+		InputSchema: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"path": map[string]any{
+					"type":        "string",
+					"description": "File path relative to the workspace.",
+				},
+				"content": map[string]any{
+					"type":        "string",
+					"description": "File content to write.",
+				},
+			},
+			"required":             []any{"path", "content"},
+			"additionalProperties": false,
+		},
+	}
+}
+
+func editFileDefinition() model.Tool {
+	return model.Tool{
+		Name:        BuiltinEditFile,
+		Description: "Edit a text file under the workspace by replacing one exact text match.",
+		InputSchema: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"path": map[string]any{
+					"type":        "string",
+					"description": "File path relative to the workspace.",
+				},
+				"old": map[string]any{
+					"type":        "string",
+					"description": "Existing text to replace. It must appear exactly once.",
+				},
+				"new": map[string]any{
+					"type":        "string",
+					"description": "Replacement text.",
+				},
+			},
+			"required":             []any{"path", "old", "new"},
+			"additionalProperties": false,
+		},
+	}
+}
+
 func newListFilesExecutor(rootDir string) Executor {
 	return ExecutorFunc(func(ctx context.Context, arguments map[string]any) (model.ToolResult, error) {
 		path, err := optionalStringArgument(arguments, "path", ".")
@@ -177,6 +235,82 @@ func newReadFileExecutor(rootDir string) Executor {
 		return model.ToolResult{
 			Name:    BuiltinReadFile,
 			Content: string(data),
+		}, nil
+	})
+}
+
+func newWriteFileExecutor(rootDir string) Executor {
+	return ExecutorFunc(func(ctx context.Context, arguments map[string]any) (model.ToolResult, error) {
+		path, err := requiredStringArgument(arguments, "path")
+		if err != nil {
+			return model.ToolResult{}, err
+		}
+		content, err := requiredStringArgumentAllowEmpty(arguments, "content")
+		if err != nil {
+			return model.ToolResult{}, err
+		}
+		resolved, err := resolveWritableFilePath(rootDir, path)
+		if err != nil {
+			return model.ToolResult{}, err
+		}
+		if err := os.MkdirAll(filepath.Dir(resolved), 0o755); err != nil {
+			return model.ToolResult{}, fmt.Errorf("create parent directories for %q: %w", path, err)
+		}
+		data := []byte(content)
+		if err := os.WriteFile(resolved, data, 0o644); err != nil {
+			return model.ToolResult{}, fmt.Errorf("write file %q: %w", path, err)
+		}
+		return model.ToolResult{
+			Name:    BuiltinWriteFile,
+			Content: fmt.Sprintf("wrote %s (%d bytes)", path, len(data)),
+		}, nil
+	})
+}
+
+func newEditFileExecutor(rootDir string) Executor {
+	return ExecutorFunc(func(ctx context.Context, arguments map[string]any) (model.ToolResult, error) {
+		path, err := requiredStringArgument(arguments, "path")
+		if err != nil {
+			return model.ToolResult{}, err
+		}
+		oldText, err := requiredNonEmptyStringArgument(arguments, "old")
+		if err != nil {
+			return model.ToolResult{}, err
+		}
+		newText, err := requiredStringArgumentAllowEmpty(arguments, "new")
+		if err != nil {
+			return model.ToolResult{}, err
+		}
+		resolved, err := resolveRootPath(rootDir, path)
+		if err != nil {
+			return model.ToolResult{}, err
+		}
+		info, err := os.Stat(resolved)
+		if err != nil {
+			return model.ToolResult{}, fmt.Errorf("stat file %q: %w", path, err)
+		}
+		if info.IsDir() {
+			return model.ToolResult{}, fmt.Errorf("path %q is a directory", path)
+		}
+		data, err := os.ReadFile(resolved)
+		if err != nil {
+			return model.ToolResult{}, fmt.Errorf("read file %q: %w", path, err)
+		}
+		content := string(data)
+		matches := strings.Count(content, oldText)
+		if matches == 0 {
+			return model.ToolResult{}, fmt.Errorf("edit file %q: old text not found", path)
+		}
+		if matches > 1 {
+			return model.ToolResult{}, fmt.Errorf("edit file %q: old text matched %d times", path, matches)
+		}
+		updated := strings.Replace(content, oldText, newText, 1)
+		if err := os.WriteFile(resolved, []byte(updated), 0o644); err != nil {
+			return model.ToolResult{}, fmt.Errorf("write file %q: %w", path, err)
+		}
+		return model.ToolResult{
+			Name:    BuiltinEditFile,
+			Content: fmt.Sprintf("edited %s (1 replacement)", path),
 		}, nil
 	})
 }
@@ -321,6 +455,29 @@ func requiredStringArgument(arguments map[string]any, name string) (string, erro
 	return text, nil
 }
 
+func requiredStringArgumentAllowEmpty(arguments map[string]any, name string) (string, error) {
+	value, ok := arguments[name]
+	if !ok {
+		return "", fmt.Errorf("%s is required", name)
+	}
+	text, ok := value.(string)
+	if !ok {
+		return "", fmt.Errorf("%s must be a string", name)
+	}
+	return text, nil
+}
+
+func requiredNonEmptyStringArgument(arguments map[string]any, name string) (string, error) {
+	text, err := requiredStringArgumentAllowEmpty(arguments, name)
+	if err != nil {
+		return "", err
+	}
+	if text == "" {
+		return "", fmt.Errorf("%s must not be empty", name)
+	}
+	return text, nil
+}
+
 func resolveRootPath(rootDir string, path string) (string, error) {
 	if strings.TrimSpace(path) == "" {
 		return "", fmt.Errorf("path must not be blank")
@@ -361,4 +518,93 @@ func resolveRootPath(rootDir string, path string) (string, error) {
 		return "", fmt.Errorf("path %q is outside rootDir", path)
 	}
 	return canonicalTarget, nil
+}
+
+func resolveWritableFilePath(rootDir string, path string) (string, error) {
+	if strings.TrimSpace(path) == "" {
+		return "", fmt.Errorf("path must not be blank")
+	}
+
+	root, err := filepath.Abs(rootDir)
+	if err != nil {
+		return "", fmt.Errorf("resolve rootDir: %w", err)
+	}
+	canonicalRoot, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		return "", fmt.Errorf("resolve rootDir: %w", err)
+	}
+
+	var target string
+	if filepath.IsAbs(path) {
+		target = filepath.Clean(path)
+	} else {
+		target = filepath.Join(canonicalRoot, path)
+	}
+	target, err = filepath.Abs(target)
+	if err != nil {
+		return "", fmt.Errorf("resolve path %q: %w", path, err)
+	}
+	if err := ensurePathInsideRoot(canonicalRoot, target, path); err != nil {
+		return "", err
+	}
+
+	if _, err := os.Lstat(target); err == nil {
+		canonicalTarget, err := filepath.EvalSymlinks(target)
+		if err != nil {
+			return "", fmt.Errorf("resolve path %q: %w", path, err)
+		}
+		if err := ensurePathInsideRoot(canonicalRoot, canonicalTarget, path); err != nil {
+			return "", err
+		}
+		info, err := os.Stat(canonicalTarget)
+		if err != nil {
+			return "", fmt.Errorf("stat file %q: %w", path, err)
+		}
+		if info.IsDir() {
+			return "", fmt.Errorf("path %q is a directory", path)
+		}
+		return target, nil
+	} else if !os.IsNotExist(err) {
+		return "", fmt.Errorf("stat path %q: %w", path, err)
+	}
+
+	ancestor := filepath.Dir(target)
+	for {
+		info, err := os.Stat(ancestor)
+		if err == nil {
+			if !info.IsDir() {
+				return "", fmt.Errorf("parent path %q is not a directory", ancestor)
+			}
+			canonicalAncestor, err := filepath.EvalSymlinks(ancestor)
+			if err != nil {
+				return "", fmt.Errorf("resolve parent path %q: %w", path, err)
+			}
+			if err := ensurePathInsideRoot(canonicalRoot, canonicalAncestor, path); err != nil {
+				return "", err
+			}
+			return target, nil
+		}
+		if !os.IsNotExist(err) {
+			return "", fmt.Errorf("stat parent path %q: %w", path, err)
+		}
+		next := filepath.Dir(ancestor)
+		if next == ancestor {
+			return "", fmt.Errorf("resolve parent path %q: no existing parent directory", path)
+		}
+		ancestor = next
+	}
+}
+
+func ensurePathInsideRoot(canonicalRoot, target, originalPath string) error {
+	relative, err := filepath.Rel(canonicalRoot, target)
+	if err != nil {
+		return fmt.Errorf("resolve path %q: %w", originalPath, err)
+	}
+	if relative == "." {
+		return nil
+	}
+	if relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) || filepath.IsAbs(relative) {
+		return fmt.Errorf("path %q is outside rootDir", originalPath)
+	}
+	return nil
 }

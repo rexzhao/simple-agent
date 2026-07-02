@@ -287,11 +287,13 @@ sai chat --quit --enable-mcp local --enable-tools mcp.local.some_tool "暴露 MC
 
 ## 工具启用
 
-v0.1 内置工具：
+当前内置工具：
 
 ```text
 list_files
 read_file
+write_file
+edit_file
 shell
 ```
 
@@ -309,6 +311,8 @@ tools:
   enabled:
     - list_files
     - read_file
+    - write_file
+    - edit_file
     - shell
     - mcp.local.some_tool
 ```
@@ -319,15 +323,15 @@ tools:
 sai chat --quit --enable-tools list_files,read_file "看看当前目录"
 ```
 
-`--enable-tools` 是覆盖，不是追加。`shell` 不需要额外 flag；只要它被启用，就按普通工具
-暴露给模型。如果后续加入 `write_file`，也遵循同一规则。
+`--enable-tools` 是覆盖，不是追加。`shell`、`write_file` 和 `edit_file` 不需要额外
+flag；只要它被启用，就按普通工具暴露给模型。
 
 `sai tools list` 可以在不加载配置、不解析 provider API key 的情况下列出内置工具。发生
 tool call 时，`sai chat` 默认向 stderr 打印 `tool: <name>` 形式的独立简短状态；支持
-颜色且未设置 `NO_COLOR` 时，状态行使用 muted 样式并在行尾 reset。`read_file` 会追加
-目标文件路径，`list_files` 会追加目标目录且未提供 path 时显示 `.`。`shell` 和 MCP tool
-状态只显示工具名，不显示命令参数或任意 arguments；状态也不包含 tool result 正文，
-stdout 仍只输出模型文本。
+颜色且未设置 `NO_COLOR` 时，状态行使用 muted 样式并在行尾 reset。`read_file`、
+`write_file` 和 `edit_file` 会追加目标文件路径，`list_files` 会追加目标目录且未提供
+path 时显示 `.`。`shell` 和 MCP tool 状态只显示工具名，不显示命令参数或任意
+arguments；状态也不包含 tool result 正文，stdout 仍只输出模型文本。
 
 `shell` 工具默认在启动目录执行命令。v0.1 不提供 `--workdir` 配置。
 

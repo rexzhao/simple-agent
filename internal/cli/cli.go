@@ -605,6 +605,8 @@ func builtInToolNames() []string {
 	return []string{
 		tools.BuiltinListFiles,
 		tools.BuiltinReadFile,
+		tools.BuiltinWriteFile,
+		tools.BuiltinEditFile,
 		tools.BuiltinShell,
 	}
 }
@@ -1452,7 +1454,7 @@ func formatToolStatus(toolCall model.ToolCall) string {
 }
 
 func toolStatusPath(toolCall model.ToolCall) (string, bool) {
-	if toolCall.Name != tools.BuiltinReadFile && toolCall.Name != tools.BuiltinListFiles {
+	if toolCall.Name != tools.BuiltinReadFile && toolCall.Name != tools.BuiltinListFiles && toolCall.Name != tools.BuiltinWriteFile && toolCall.Name != tools.BuiltinEditFile {
 		return "", false
 	}
 	if toolCall.Name == tools.BuiltinListFiles && strings.TrimSpace(toolCall.Arguments) == "" {

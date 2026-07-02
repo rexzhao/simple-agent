@@ -21,7 +21,7 @@ func TestRegisterBuiltinsRegistersExpectedTools(t *testing.T) {
 		t.Fatalf("RegisterBuiltins() error = %v", err)
 	}
 
-	for _, name := range []string{BuiltinListFiles, BuiltinReadFile, BuiltinShell} {
+	for _, name := range []string{BuiltinListFiles, BuiltinReadFile, BuiltinWriteFile, BuiltinEditFile, BuiltinShell} {
 		entry, ok := registry.Lookup(name)
 		if !ok {
 			t.Fatalf("Lookup(%q) ok = false, want true", name)
@@ -82,6 +82,113 @@ func TestReadFileOutputsFileContent(t *testing.T) {
 	want := "hello\nworld\n"
 	if result.Name != BuiltinReadFile || result.Content != want || result.IsError {
 		t.Fatalf("Execute(read_file) result = %#v, want name %q content %q IsError false", result, BuiltinReadFile, want)
+	}
+}
+
+func TestWriteFileOverwritesAndCreatesParentDirs(t *testing.T) {
+	root := t.TempDir()
+	writeTestFile(t, filepath.Join(root, "notes.txt"), "old")
+
+	registry := registerBuiltinsForTest(t, root)
+	result, err := registry.Execute(context.Background(), BuiltinWriteFile, map[string]any{
+		"path":    "notes.txt",
+		"content": "secret-body",
+	})
+	if err != nil {
+		t.Fatalf("Execute(write_file overwrite) error = %v", err)
+	}
+	if result.Name != BuiltinWriteFile || result.Content != "wrote notes.txt (11 bytes)" || result.IsError {
+		t.Fatalf("Execute(write_file overwrite) result = %#v", result)
+	}
+	if strings.Contains(result.Content, "secret-body") {
+		t.Fatalf("Execute(write_file overwrite) leaked content in result: %q", result.Content)
+	}
+	if got := readTestFile(t, filepath.Join(root, "notes.txt")); got != "secret-body" {
+		t.Fatalf("written content = %q, want secret-body", got)
+	}
+
+	result, err = registry.Execute(context.Background(), BuiltinWriteFile, map[string]any{
+		"path":    filepath.Join("nested", "dir", "created.txt"),
+		"content": "created",
+	})
+	if err != nil {
+		t.Fatalf("Execute(write_file create parents) error = %v", err)
+	}
+	if result.Name != BuiltinWriteFile || result.Content != "wrote "+filepath.Join("nested", "dir", "created.txt")+" (7 bytes)" || result.IsError {
+		t.Fatalf("Execute(write_file create parents) result = %#v", result)
+	}
+	if got := readTestFile(t, filepath.Join(root, "nested", "dir", "created.txt")); got != "created" {
+		t.Fatalf("created content = %q, want created", got)
+	}
+}
+
+func TestEditFileReplacesSingleMatch(t *testing.T) {
+	root := t.TempDir()
+	writeTestFile(t, filepath.Join(root, "notes.txt"), "alpha SECRET_OLD omega")
+
+	registry := registerBuiltinsForTest(t, root)
+	result, err := registry.Execute(context.Background(), BuiltinEditFile, map[string]any{
+		"path": "notes.txt",
+		"old":  "SECRET_OLD",
+		"new":  "SECRET_NEW",
+	})
+	if err != nil {
+		t.Fatalf("Execute(edit_file) error = %v", err)
+	}
+	if result.Name != BuiltinEditFile || result.Content != "edited notes.txt (1 replacement)" || result.IsError {
+		t.Fatalf("Execute(edit_file) result = %#v", result)
+	}
+	if strings.Contains(result.Content, "SECRET_OLD") || strings.Contains(result.Content, "SECRET_NEW") {
+		t.Fatalf("Execute(edit_file) leaked edit text in result: %q", result.Content)
+	}
+	if got := readTestFile(t, filepath.Join(root, "notes.txt")); got != "alpha SECRET_NEW omega" {
+		t.Fatalf("edited content = %q, want replacement", got)
+	}
+}
+
+func TestEditFileErrorsForNotFoundAndMultipleMatches(t *testing.T) {
+	root := t.TempDir()
+	writeTestFile(t, filepath.Join(root, "not-found.txt"), "alpha beta")
+	writeTestFile(t, filepath.Join(root, "multiple.txt"), "old middle old")
+
+	registry := registerBuiltinsForTest(t, root)
+	tests := []struct {
+		name    string
+		path    string
+		old     string
+		wantErr string
+	}{
+		{
+			name:    "not found",
+			path:    "not-found.txt",
+			old:     "missing",
+			wantErr: "old text not found",
+		},
+		{
+			name:    "multiple matches",
+			path:    "multiple.txt",
+			old:     "old",
+			wantErr: "old text matched 2 times",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := registry.Execute(context.Background(), BuiltinEditFile, map[string]any{
+				"path": tt.path,
+				"old":  tt.old,
+				"new":  "new",
+			})
+			if err == nil {
+				t.Fatal("Execute(edit_file) error = nil, want error")
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("Execute(edit_file) error = %q, want %q", err, tt.wantErr)
+			}
+		})
+	}
+	if got := readTestFile(t, filepath.Join(root, "multiple.txt")); got != "old middle old" {
+		t.Fatalf("multiple match file changed to %q", got)
 	}
 }
 
@@ -223,6 +330,36 @@ func TestBuiltinArgumentErrorsAreReadable(t *testing.T) {
 			wantErr: "path must be a string",
 		},
 		{
+			name:    "write file missing content",
+			tool:    BuiltinWriteFile,
+			args:    map[string]any{"path": "notes.txt"},
+			wantErr: "content is required",
+		},
+		{
+			name:    "write file content type",
+			tool:    BuiltinWriteFile,
+			args:    map[string]any{"path": "notes.txt", "content": 42},
+			wantErr: "content must be a string",
+		},
+		{
+			name:    "edit file missing old",
+			tool:    BuiltinEditFile,
+			args:    map[string]any{"path": "notes.txt", "new": "new"},
+			wantErr: "old is required",
+		},
+		{
+			name:    "edit file empty old",
+			tool:    BuiltinEditFile,
+			args:    map[string]any{"path": "notes.txt", "old": "", "new": "new"},
+			wantErr: "old must not be empty",
+		},
+		{
+			name:    "edit file new type",
+			tool:    BuiltinEditFile,
+			args:    map[string]any{"path": "notes.txt", "old": "old", "new": true},
+			wantErr: "new must be a string",
+		},
+		{
 			name:    "shell missing command",
 			tool:    BuiltinShell,
 			args:    map[string]any{},
@@ -246,6 +383,79 @@ func TestBuiltinArgumentErrorsAreReadable(t *testing.T) {
 				t.Fatalf("Execute() error = %q, want %q", err, tt.wantErr)
 			}
 		})
+	}
+}
+
+func TestWriteAndEditRejectPathErrors(t *testing.T) {
+	root := t.TempDir()
+	outside := t.TempDir()
+	writeTestFile(t, filepath.Join(root, "notes.txt"), "old")
+	mkdirTestDir(t, filepath.Join(root, "dir"))
+	writeTestFile(t, filepath.Join(outside, "secret.txt"), "secret")
+
+	registry := registerBuiltinsForTest(t, root)
+	tests := []struct {
+		name    string
+		tool    string
+		args    map[string]any
+		wantErr string
+	}{
+		{
+			name: "write outside root",
+			tool: BuiltinWriteFile,
+			args: map[string]any{
+				"path":    filepath.Join(outside, "new-secret.txt"),
+				"content": "secret",
+			},
+			wantErr: "outside rootDir",
+		},
+		{
+			name: "edit outside root",
+			tool: BuiltinEditFile,
+			args: map[string]any{
+				"path": filepath.Join(outside, "secret.txt"),
+				"old":  "secret",
+				"new":  "changed",
+			},
+			wantErr: "outside rootDir",
+		},
+		{
+			name: "write directory",
+			tool: BuiltinWriteFile,
+			args: map[string]any{
+				"path":    "dir",
+				"content": "secret",
+			},
+			wantErr: "is a directory",
+		},
+		{
+			name: "edit directory",
+			tool: BuiltinEditFile,
+			args: map[string]any{
+				"path": "dir",
+				"old":  "old",
+				"new":  "new",
+			},
+			wantErr: "is a directory",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := registry.Execute(context.Background(), tt.tool, tt.args)
+			if err == nil {
+				t.Fatal("Execute() error = nil, want error")
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("Execute() error = %q, want %q", err, tt.wantErr)
+			}
+		})
+	}
+	if _, err := os.Stat(filepath.Join(outside, "new-secret.txt")); !os.IsNotExist(err) {
+		t.Fatalf("outside file creation error = %v, want not exist", err)
+	}
+	if got := readTestFile(t, filepath.Join(outside, "secret.txt")); got != "secret" {
+		t.Fatalf("outside file changed to %q", got)
 	}
 }
 
@@ -302,6 +512,54 @@ func TestReadFileRejectsSymlinkOutsideRoot(t *testing.T) {
 	}
 }
 
+func TestWriteAndEditRejectFileSymlinkOutsideRoot(t *testing.T) {
+	root := t.TempDir()
+	outside := t.TempDir()
+	outsideFile := filepath.Join(outside, "secret.txt")
+	writeTestFile(t, outsideFile, "secret")
+	createFileSymlinkOrSkip(t, outsideFile, filepath.Join(root, "secret-link.txt"))
+
+	registry := registerBuiltinsForTest(t, root)
+	tests := []struct {
+		name string
+		tool string
+		args map[string]any
+	}{
+		{
+			name: "write file symlink",
+			tool: BuiltinWriteFile,
+			args: map[string]any{
+				"path":    "secret-link.txt",
+				"content": "changed",
+			},
+		},
+		{
+			name: "edit file symlink",
+			tool: BuiltinEditFile,
+			args: map[string]any{
+				"path": "secret-link.txt",
+				"old":  "secret",
+				"new":  "changed",
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := registry.Execute(context.Background(), tt.tool, tt.args)
+			if err == nil {
+				t.Fatal("Execute() error = nil, want error")
+			}
+			if !strings.Contains(err.Error(), "outside rootDir") {
+				t.Fatalf("Execute() error = %q, want outside rootDir", err)
+			}
+		})
+	}
+	if got := readTestFile(t, outsideFile); got != "secret" {
+		t.Fatalf("outside file changed to %q", got)
+	}
+}
+
 func TestListFilesRejectsSymlinkedDirectoryOutsideRoot(t *testing.T) {
 	root := t.TempDir()
 	outside := t.TempDir()
@@ -317,6 +575,29 @@ func TestListFilesRejectsSymlinkedDirectoryOutsideRoot(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "outside rootDir") {
 		t.Fatalf("Execute(list_files) error = %q, want outside rootDir", err)
+	}
+}
+
+func TestWriteFileRejectsSymlinkedParentDirectoryOutsideRoot(t *testing.T) {
+	root := t.TempDir()
+	outside := t.TempDir()
+	outsideDir := filepath.Join(outside, "secret-dir")
+	mkdirTestDir(t, outsideDir)
+	createDirSymlinkOrSkip(t, outsideDir, filepath.Join(root, "secret-dir-link"))
+
+	registry := registerBuiltinsForTest(t, root)
+	_, err := registry.Execute(context.Background(), BuiltinWriteFile, map[string]any{
+		"path":    filepath.Join("secret-dir-link", "created.txt"),
+		"content": "secret",
+	})
+	if err == nil {
+		t.Fatal("Execute(write_file) error = nil, want error")
+	}
+	if !strings.Contains(err.Error(), "outside rootDir") {
+		t.Fatalf("Execute(write_file) error = %q, want outside rootDir", err)
+	}
+	if _, err := os.Stat(filepath.Join(outsideDir, "created.txt")); !os.IsNotExist(err) {
+		t.Fatalf("outside file creation error = %v, want not exist", err)
 	}
 }
 
@@ -355,6 +636,20 @@ func TestBuiltinDefinitionsHaveExpectedSchemas(t *testing.T) {
 				"required": []any{"command"},
 			},
 		},
+		{
+			name: BuiltinWriteFile,
+			want: map[string]any{
+				"type":     "object",
+				"required": []any{"path", "content"},
+			},
+		},
+		{
+			name: BuiltinEditFile,
+			want: map[string]any{
+				"type":     "object",
+				"required": []any{"path", "old", "new"},
+			},
+		},
 	}
 
 	for _, tt := range tests {
@@ -388,6 +683,16 @@ func writeTestFile(t *testing.T, path string, content string) {
 	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
 		t.Fatalf("WriteFile(%q) error = %v", path, err)
 	}
+}
+
+func readTestFile(t *testing.T, path string) string {
+	t.Helper()
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile(%q) error = %v", path, err)
+	}
+	return string(data)
 }
 
 func mkdirTestDir(t *testing.T, path string) {
