@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
@@ -34,18 +35,22 @@ const (
 )
 
 func Run(args []string, stdout, stderr io.Writer) int {
-	return RunWithGetwd(args, stdout, stderr, os.Getwd)
+	return RunWithIO(args, os.Stdin, stdout, stderr, os.Getwd)
 }
 
 func RunWithGetwd(args []string, stdout, stderr io.Writer, getwd func() (string, error)) int {
-	if err := execute(args, stdout, stderr, getwd); err != nil {
+	return RunWithIO(args, os.Stdin, stdout, stderr, getwd)
+}
+
+func RunWithIO(args []string, stdin io.Reader, stdout, stderr io.Writer, getwd func() (string, error)) int {
+	if err := execute(args, stdin, stdout, stderr, getwd); err != nil {
 		fmt.Fprintf(stderr, "sai: %v\n", err)
 		return 1
 	}
 	return 0
 }
 
-func execute(args []string, stdout, stderr io.Writer, getwd func() (string, error)) error {
+func execute(args []string, stdin io.Reader, stdout, stderr io.Writer, getwd func() (string, error)) error {
 	flags := flag.NewFlagSet("sai", flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
 	configDir := flags.String("config-dir", "", "configuration directory")
@@ -128,6 +133,8 @@ func execute(args []string, stdout, stderr io.Writer, getwd func() (string, erro
 		return mcpCommand(remaining[1:], *configDir, stdout, getwd)
 	case "run":
 		return runCommand(remaining[1:], *configDir, stdout, stderr, getwd)
+	case "chat":
+		return chatCommand(remaining[1:], *configDir, stdin, stdout, stderr, getwd)
 	default:
 		return usageError(fmt.Sprintf("unknown command %q", remaining[0]), "", "sai help")
 	}
@@ -137,6 +144,7 @@ const rootUsageText = `usage: sai [--config-dir dir] <command> [args]
 
 Commands:
   run "prompt"       Run a single prompt
+  chat               Start a line-oriented chat session
   config show        Print resolved config with secrets redacted
   models list        List configured provider model profiles
   mcp list           List configured MCP servers
@@ -149,6 +157,11 @@ Run "sai help <command>" for command usage.
 const runUsageText = `usage: sai run [--provider name] [--model profile] [--show-reasoning] [--verbose] [--enable-tools names] [--enable-skills ids] [--disable-skills] [--enable-mcp ids] "prompt"
 
 Runs one prompt using the configured provider and model.
+`
+
+const chatUsageText = `usage: sai chat [--provider name] [--model profile] [--show-reasoning] [--verbose] [--enable-tools names] [--enable-skills ids] [--disable-skills] [--enable-mcp ids]
+
+Starts a line-oriented chat session using the configured provider and model.
 `
 
 const versionUsageText = `usage: sai version
@@ -204,6 +217,8 @@ func helpCommand(args []string, stdout io.Writer) error {
 	switch strings.Join(args, " ") {
 	case "run":
 		printRunUsage(stdout)
+	case "chat":
+		printChatUsage(stdout)
 	case "version":
 		printVersionUsage(stdout)
 	case "config":
@@ -230,6 +245,10 @@ func printRootUsage(stdout io.Writer) {
 
 func printRunUsage(stdout io.Writer) {
 	fmt.Fprint(stdout, runUsageText)
+}
+
+func printChatUsage(stdout io.Writer) {
+	fmt.Fprint(stdout, chatUsageText)
 }
 
 func printVersionUsage(stdout io.Writer) {
@@ -332,20 +351,40 @@ func mcpCommand(args []string, configDir string, stdout io.Writer, getwd func() 
 	return nil
 }
 
+type agentCommandFlags struct {
+	providerName  string
+	modelProfile  string
+	showReasoning bool
+	verbose       bool
+	enabledTools  toolNamesFlag
+	enabledSkills skillIDsFlag
+	disableSkills bool
+	enabledMCP    mcpServerIDsFlag
+}
+
+func registerAgentCommandFlags(flags *flag.FlagSet, options *agentCommandFlags) {
+	flags.StringVar(&options.providerName, "provider", "", "provider name")
+	flags.StringVar(&options.modelProfile, "model", "", "model profile")
+	flags.BoolVar(&options.showReasoning, "show-reasoning", false, "show reasoning output")
+	flags.BoolVar(&options.verbose, "verbose", false, "write non-sensitive diagnostics to stderr")
+	flags.Var(&options.enabledTools, "enable-tools", "comma-separated tool names to expose")
+	flags.Var(&options.enabledSkills, "enable-skills", "comma-separated skill ids to enable")
+	flags.BoolVar(&options.disableSkills, "disable-skills", false, "disable all skills for this run")
+	flags.Var(&options.enabledMCP, "enable-mcp", "comma-separated MCP server ids to enable")
+}
+
+func (options agentCommandFlags) validate(helpCommand string) error {
+	if options.enabledSkills.set && options.disableSkills {
+		return usageError("cannot use --enable-skills with --disable-skills", "", helpCommand)
+	}
+	return nil
+}
+
 func runCommand(args []string, configDir string, stdout, stderr io.Writer, getwd func() (string, error)) (runErr error) {
 	flags := flag.NewFlagSet("sai run", flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
-	providerName := flags.String("provider", "", "provider name")
-	modelProfile := flags.String("model", "", "model profile")
-	showReasoning := flags.Bool("show-reasoning", false, "show reasoning output")
-	verbose := flags.Bool("verbose", false, "write non-sensitive diagnostics to stderr")
-	var enabledTools toolNamesFlag
-	flags.Var(&enabledTools, "enable-tools", "comma-separated tool names to expose")
-	var enabledSkills skillIDsFlag
-	flags.Var(&enabledSkills, "enable-skills", "comma-separated skill ids to enable")
-	disableSkills := flags.Bool("disable-skills", false, "disable all skills for this run")
-	var enabledMCP mcpServerIDsFlag
-	flags.Var(&enabledMCP, "enable-mcp", "comma-separated MCP server ids to enable")
+	var options agentCommandFlags
+	registerAgentCommandFlags(flags, &options)
 	if err := flags.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			printRunUsage(stdout)
@@ -353,8 +392,8 @@ func runCommand(args []string, configDir string, stdout, stderr io.Writer, getwd
 		}
 		return usageError(err.Error(), "", "sai help run")
 	}
-	if enabledSkills.set && *disableSkills {
-		return usageError("cannot use --enable-skills with --disable-skills", "", "sai help run")
+	if err := options.validate("sai help run"); err != nil {
+		return err
 	}
 
 	prompts := flags.Args()
@@ -366,69 +405,196 @@ func runCommand(args []string, configDir string, stdout, stderr io.Writer, getwd
 		return usageError(message, runUsageText, "sai help run")
 	}
 
+	runtime, err := prepareAgentRuntime(context.Background(), configDir, options, stderr, getwd)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		runErr = errors.Join(runErr, runtime.Close())
+	}()
+
+	request := model.Request{
+		Model:      runtime.modelID,
+		Messages:   runMessages(runtime.project, runtime.selectedSkills, prompts[0]),
+		Tools:      runtime.toolSchemas,
+		Parameters: runtime.parameters,
+	}
+
+	events, err := agent.Stream(context.Background(), request, agent.Options{
+		Provider:     runtime.provider,
+		ToolExecutor: runtime.toolExecutor,
+		MaxTurns:     runtime.maxTurns,
+	})
+	if err != nil {
+		return err
+	}
+
+	return writeStream(stdout, events, runtime.showReasoning, runtime.logger)
+}
+
+func chatCommand(args []string, configDir string, stdin io.Reader, stdout, stderr io.Writer, getwd func() (string, error)) (chatErr error) {
+	flags := flag.NewFlagSet("sai chat", flag.ContinueOnError)
+	flags.SetOutput(io.Discard)
+	var options agentCommandFlags
+	registerAgentCommandFlags(flags, &options)
+	if err := flags.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			printChatUsage(stdout)
+			return nil
+		}
+		return usageError(err.Error(), "", "sai help chat")
+	}
+	if err := options.validate("sai help chat"); err != nil {
+		return err
+	}
+	if flags.NArg() != 0 {
+		return usageError("usage: sai chat", "", "sai help chat")
+	}
+
+	runtime, err := prepareAgentRuntime(context.Background(), configDir, options, stderr, getwd)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		chatErr = errors.Join(chatErr, runtime.Close())
+	}()
+
+	messages := chatBaseMessages(runtime.project, runtime.selectedSkills)
+	scanner := bufio.NewScanner(stdin)
+	for {
+		if _, err := fmt.Fprint(stderr, "> "); err != nil {
+			return err
+		}
+		if !scanner.Scan() {
+			if err := scanner.Err(); err != nil {
+				return fmt.Errorf("read chat input: %w", err)
+			}
+			return nil
+		}
+
+		line := scanner.Text()
+		command := strings.TrimSpace(line)
+		if command == "" {
+			continue
+		}
+		if command == "/exit" || command == "/quit" {
+			return nil
+		}
+
+		requestMessages := append(copyMessageSlice(messages), model.Message{
+			Role:    model.MessageRoleUser,
+			Content: line,
+		})
+		request := model.Request{
+			Model:      runtime.modelID,
+			Messages:   requestMessages,
+			Tools:      runtime.toolSchemas,
+			Parameters: runtime.parameters,
+		}
+		events, results, err := agent.StreamWithResult(context.Background(), request, agent.Options{
+			Provider:     runtime.provider,
+			ToolExecutor: runtime.toolExecutor,
+			MaxTurns:     runtime.maxTurns,
+		})
+		if err != nil {
+			return err
+		}
+
+		tracker := &chatOutputWriter{w: stdout}
+		if err := writeStream(tracker, events, runtime.showReasoning, runtime.logger); err != nil {
+			return err
+		}
+		result, ok := <-results
+		if !ok {
+			return fmt.Errorf("agent did not return updated messages")
+		}
+		messages = result.Messages
+		if tracker.wrote && tracker.lastByte != '\n' {
+			if _, err := fmt.Fprintln(stdout); err != nil {
+				return err
+			}
+		}
+	}
+}
+
+type agentRuntime struct {
+	cwd            string
+	modelID        string
+	parameters     map[string]any
+	provider       model.Provider
+	toolExecutor   runToolExecutor
+	toolSchemas    []model.Tool
+	maxTurns       int
+	showReasoning  bool
+	logger         *eventlog.Logger
+	mcpSessions    []*mcp.Session
+	project        projectcontext.Project
+	selectedSkills []localskills.Skill
+}
+
+func (r *agentRuntime) Close() error {
+	return errors.Join(r.logger.Close(), closeMCPSessions(r.mcpSessions))
+}
+
+func prepareAgentRuntime(ctx context.Context, configDir string, options agentCommandFlags, stderr io.Writer, getwd func() (string, error)) (runtime *agentRuntime, err error) {
 	cwd, err := getwd()
 	if err != nil {
-		return fmt.Errorf("get current directory: %w", err)
+		return nil, fmt.Errorf("get current directory: %w", err)
 	}
 	cfg, err := loadConfig(configDir, func() (string, error) {
 		return cwd, nil
 	})
 	if err != nil {
-		return err
+		return nil, err
 	}
-	selectedMCPServers, err := cfg.SelectedMCPServers(enabledMCP.ids, enabledMCP.set)
+	selectedMCPServers, err := cfg.SelectedMCPServers(options.enabledMCP.ids, options.enabledMCP.set)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
-	resolved, err := cfg.ResolveModel(*providerName, *modelProfile)
+	resolved, err := cfg.ResolveModel(options.providerName, options.modelProfile)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	provider, err := newProviderForRun(resolved.ProviderName, resolved.Provider)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	enabledToolNames := cfg.Tools.Enabled
-	if enabledTools.set {
-		enabledToolNames = enabledTools.names
+	if options.enabledTools.set {
+		enabledToolNames = options.enabledTools.names
 	}
 	toolRegistry, toolSchemas, err := enabledToolsForRun(cwd, enabledToolNames)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	mcpSessions, mcpSessionsByID, mcpToolSchemas, err := mcpToolsForRun(context.Background(), selectedMCPServers, enabledToolNames)
-	if err != nil {
-		return err
-	}
+	var mcpSessions []*mcp.Session
 	defer func() {
-		if closeErr := closeMCPSessions(mcpSessions); closeErr != nil {
-			runErr = errors.Join(runErr, closeErr)
+		if err != nil {
+			err = errors.Join(err, closeMCPSessions(mcpSessions))
 		}
 	}()
+	mcpSessions, mcpSessionsByID, mcpToolSchemas, err := mcpToolsForRun(ctx, selectedMCPServers, enabledToolNames)
+	if err != nil {
+		return nil, err
+	}
 	toolSchemas = append(toolSchemas, mcpToolSchemas...)
 
-	resolvedShowReasoning := *showReasoning || cfg.Agent.ShowReasoning
-	if *verbose {
+	resolvedShowReasoning := options.showReasoning || cfg.Agent.ShowReasoning
+	if options.verbose {
 		if err := writeVerboseDiagnostics(stderr, cfg, resolved, enabledToolNames, resolvedShowReasoning); err != nil {
-			return err
+			return nil, err
 		}
 	}
-	selectedSkills, err := enabledSkillsForRun(cfg, enabledSkills.ids, enabledSkills.set, *disableSkills)
+	selectedSkills, err := enabledSkillsForRun(cfg, options.enabledSkills.ids, options.enabledSkills.set, options.disableSkills)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	project, err := projectcontext.Load(cwd)
 	if err != nil {
-		return err
-	}
-	request := model.Request{
-		Model:      resolved.ModelID,
-		Messages:   runMessages(project, selectedSkills, prompts[0]),
-		Tools:      toolSchemas,
-		Parameters: resolved.Parameters,
+		return nil, err
 	}
 
 	logger, err := eventlog.Open(cfg.Logging.Path, eventlog.Attributes{
@@ -437,25 +603,42 @@ func runCommand(args []string, configDir string, stdout, stderr io.Writer, getwd
 		Level:    cfg.Logging.Level,
 	})
 	if err != nil {
-		return err
+		return nil, err
 	}
 
-	events, err := agent.Stream(context.Background(), request, agent.Options{
-		Provider:     provider,
-		ToolExecutor: runToolExecutor{builtins: toolRegistry, mcpSessions: mcpSessionsByID},
-		MaxTurns:     cfg.Agent.MaxTurns,
-	})
-	if err != nil {
-		_ = logger.Close()
-		return err
-	}
+	return &agentRuntime{
+		cwd:            cwd,
+		modelID:        resolved.ModelID,
+		parameters:     resolved.Parameters,
+		provider:       provider,
+		toolExecutor:   runToolExecutor{builtins: toolRegistry, mcpSessions: mcpSessionsByID},
+		toolSchemas:    toolSchemas,
+		maxTurns:       cfg.Agent.MaxTurns,
+		showReasoning:  resolvedShowReasoning,
+		logger:         logger,
+		mcpSessions:    mcpSessions,
+		project:        project,
+		selectedSkills: selectedSkills,
+	}, nil
+}
 
-	streamErr := writeStream(stdout, events, resolvedShowReasoning, logger)
-	closeErr := logger.Close()
-	if streamErr != nil {
-		return streamErr
+type chatOutputWriter struct {
+	w        io.Writer
+	wrote    bool
+	lastByte byte
+}
+
+func (w *chatOutputWriter) Write(p []byte) (int, error) {
+	n, err := w.w.Write(p)
+	if n > 0 {
+		w.wrote = true
+		w.lastByte = p[n-1]
 	}
-	return closeErr
+	return n, err
+}
+
+func (w *chatOutputWriter) UnwrapWriter() io.Writer {
+	return w.w
 }
 
 type toolNamesFlag struct {
@@ -759,8 +942,8 @@ func anthropicMessagesProviderConfig(provider config.ProviderConfig) anthropicme
 	}
 }
 
-func runMessages(project projectcontext.Project, enabledSkills []localskills.Skill, prompt string) []model.Message {
-	instructions := projectcontext.ComposeInstructions(builtInBaseInstructions, project, prompt)
+func chatBaseMessages(project projectcontext.Project, enabledSkills []localskills.Skill) []model.Message {
+	instructions := projectcontext.ComposeInstructions(builtInBaseInstructions, project, "")
 	messages := make([]model.Message, 0, len(instructions)+len(enabledSkills))
 	for _, instruction := range instructions {
 		if instruction.Source == projectcontext.InstructionSourceUser {
@@ -770,6 +953,7 @@ func runMessages(project projectcontext.Project, enabledSkills []localskills.Ski
 					Content: formatSkillInstructions(skill),
 				})
 			}
+			continue
 		}
 		messages = append(messages, model.Message{
 			Role:    roleForInstruction(instruction.Source),
@@ -777,6 +961,22 @@ func runMessages(project projectcontext.Project, enabledSkills []localskills.Ski
 		})
 	}
 	return messages
+}
+
+func runMessages(project projectcontext.Project, enabledSkills []localskills.Skill, prompt string) []model.Message {
+	messages := chatBaseMessages(project, enabledSkills)
+	return append(messages, model.Message{
+		Role:    model.MessageRoleUser,
+		Content: prompt,
+	})
+}
+
+func copyMessageSlice(messages []model.Message) []model.Message {
+	copied := append([]model.Message(nil), messages...)
+	for i := range copied {
+		copied[i].ToolCalls = append([]model.ToolCall(nil), messages[i].ToolCalls...)
+	}
+	return copied
 }
 
 func formatSkillInstructions(skill localskills.Skill) string {
@@ -876,6 +1076,17 @@ func writeStreamWithOptions(stdout io.Writer, events <-chan model.Event, showRea
 func shouldColorizeReasoning(stdout io.Writer) bool {
 	if os.Getenv("NO_COLOR") != "" {
 		return false
+	}
+	for {
+		unwrapper, ok := stdout.(interface{ UnwrapWriter() io.Writer })
+		if !ok {
+			break
+		}
+		unwrapped := unwrapper.UnwrapWriter()
+		if unwrapped == nil || unwrapped == stdout {
+			break
+		}
+		stdout = unwrapped
 	}
 	file, ok := stdout.(*os.File)
 	if !ok {

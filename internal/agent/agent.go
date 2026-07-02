@@ -23,9 +23,22 @@ type Options struct {
 	MaxTurns     int
 }
 
+type TurnResult struct {
+	Messages []model.Message
+}
+
 func Stream(ctx context.Context, request model.Request, options Options) (<-chan model.Event, error) {
+	events, _, err := stream(ctx, request, options, false)
+	return events, err
+}
+
+func StreamWithResult(ctx context.Context, request model.Request, options Options) (<-chan model.Event, <-chan TurnResult, error) {
+	return stream(ctx, request, options, true)
+}
+
+func stream(ctx context.Context, request model.Request, options Options, includeResult bool) (<-chan model.Event, <-chan TurnResult, error) {
 	if options.Provider == nil {
-		return nil, fmt.Errorf("agent provider is required")
+		return nil, nil, fmt.Errorf("agent provider is required")
 	}
 
 	maxTurns := options.MaxTurns
@@ -34,12 +47,19 @@ func Stream(ctx context.Context, request model.Request, options Options) (<-chan
 	}
 
 	events := make(chan model.Event)
-	go run(ctx, request, options, maxTurns, events)
-	return events, nil
+	var results chan TurnResult
+	if includeResult {
+		results = make(chan TurnResult, 1)
+	}
+	go run(ctx, request, options, maxTurns, events, results)
+	return events, results, nil
 }
 
-func run(ctx context.Context, request model.Request, options Options, maxTurns int, events chan<- model.Event) {
+func run(ctx context.Context, request model.Request, options Options, maxTurns int, events chan<- model.Event, results chan<- TurnResult) {
 	defer close(events)
+	if results != nil {
+		defer close(results)
+	}
 
 	messages := append([]model.Message(nil), request.Messages...)
 	enabledTools := enabledToolNames(request.Tools)
@@ -48,7 +68,7 @@ func run(ctx context.Context, request model.Request, options Options, maxTurns i
 		request.Messages = messages
 
 		assistantContent, toolCalls, stopped := streamModelTurn(ctx, options.Provider, request, events)
-		if stopped || len(toolCalls) == 0 {
+		if stopped {
 			return
 		}
 
@@ -57,6 +77,11 @@ func run(ctx context.Context, request model.Request, options Options, maxTurns i
 			Content:   assistantContent,
 			ToolCalls: toolCalls,
 		})
+		if len(toolCalls) == 0 {
+			sendResult(results, messages)
+			return
+		}
+
 		for _, toolCall := range toolCalls {
 			result := executeToolCall(ctx, options.ToolExecutor, enabledTools, toolCall)
 			events <- model.ToolResultEvent{Result: result}
@@ -75,6 +100,21 @@ func run(ctx context.Context, request model.Request, options Options, maxTurns i
 			return
 		}
 	}
+}
+
+func sendResult(results chan<- TurnResult, messages []model.Message) {
+	if results == nil {
+		return
+	}
+	results <- TurnResult{Messages: copyMessages(messages)}
+}
+
+func copyMessages(messages []model.Message) []model.Message {
+	copied := append([]model.Message(nil), messages...)
+	for i := range copied {
+		copied[i].ToolCalls = append([]model.ToolCall(nil), messages[i].ToolCalls...)
+	}
+	return copied
 }
 
 func streamModelTurn(ctx context.Context, provider model.Provider, request model.Request, out chan<- model.Event) (string, []model.ToolCall, bool) {

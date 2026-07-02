@@ -186,7 +186,7 @@ func TestRootHelpWritesUsageWithoutConfig(t *testing.T) {
 		{"help"},
 	} {
 		t.Run(strings.Join(args, " "), func(t *testing.T) {
-			assertCLIHelpWithoutConfig(t, args, "usage: sai", "config show", "models list", "Run \"sai help <command>\" for command usage.")
+			assertCLIHelpWithoutConfig(t, args, "usage: sai", "run \"prompt\"", "chat", "config show", "models list", "Run \"sai help <command>\" for command usage.")
 		})
 	}
 }
@@ -198,6 +198,18 @@ func TestRunHelpWritesUsageWithoutConfig(t *testing.T) {
 	} {
 		t.Run(strings.Join(args, " "), func(t *testing.T) {
 			assertCLIHelpWithoutConfig(t, args, "usage: sai run", "--provider name", "--enable-tools names")
+		})
+	}
+}
+
+func TestChatHelpWritesUsageWithoutConfig(t *testing.T) {
+	for _, args := range [][]string{
+		{"chat", "-h"},
+		{"chat", "--help"},
+		{"help", "chat"},
+	} {
+		t.Run(strings.Join(args, " "), func(t *testing.T) {
+			assertCLIHelpWithoutConfig(t, args, "usage: sai chat", "--provider name", "--enable-tools names")
 		})
 	}
 }
@@ -347,6 +359,150 @@ func TestRunMissingPromptIncludesUsageHint(t *testing.T) {
 		t.Fatalf("stdout = %q, want empty", stdout.String())
 	}
 	assertCLIErrorContains(t, stderr.String(), "missing prompt", "usage: sai run", `Run "sai help run" for usage.`)
+}
+
+func TestChatUnknownFlagIncludesHelpHint(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	code := RunWithIO([]string{"chat", "--bad"}, strings.NewReader(""), &stdout, &stderr, func() (string, error) {
+		return "", errors.New("getwd should not be called")
+	})
+
+	if code != 1 {
+		t.Fatalf("RunWithIO() code = %d, want 1", code)
+	}
+	if stdout.String() != "" {
+		t.Fatalf("stdout = %q, want empty", stdout.String())
+	}
+	assertCLIErrorContains(t, stderr.String(), "flag provided but not defined", `Run "sai help chat" for usage.`)
+}
+
+func TestChatExitReturnsWithoutModelRequest(t *testing.T) {
+	server, requests := newCLIRunServer(t,
+		`{"choices":[{"delta":{"content":"unexpected"}}]}`,
+		`[DONE]`,
+	)
+	defer server.Close()
+
+	configDir := t.TempDir()
+	writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
+
+	var stdout, stderr bytes.Buffer
+	code := RunWithIO([]string{"--config-dir", configDir, "chat"}, strings.NewReader("/exit\n"), &stdout, &stderr, func() (string, error) {
+		return t.TempDir(), nil
+	})
+
+	if code != 0 {
+		t.Fatalf("RunWithIO() code = %d, stderr = %s", code, stderr.String())
+	}
+	if stdout.String() != "" {
+		t.Fatalf("stdout = %q, want empty", stdout.String())
+	}
+	if got, want := stderr.String(), "> "; got != want {
+		t.Fatalf("stderr = %q, want %q", got, want)
+	}
+	assertNoAdditionalCLIRunRequest(t, requests)
+}
+
+func TestChatTwoTurnsCarryForwardUserAndAssistantHistory(t *testing.T) {
+	server, requests := newSequentialCLIRunServer(t,
+		[]string{
+			`{"choices":[{"delta":{"content":"one"}}]}`,
+			`[DONE]`,
+		},
+		[]string{
+			`{"choices":[{"delta":{"content":"two"}}]}`,
+			`[DONE]`,
+		},
+	)
+	defer server.Close()
+
+	configDir := t.TempDir()
+	writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
+
+	var stdout, stderr bytes.Buffer
+	code := RunWithIO([]string{"--config-dir", configDir, "chat"}, strings.NewReader("first\n\nsecond\n/quit\n"), &stdout, &stderr, func() (string, error) {
+		return t.TempDir(), nil
+	})
+
+	if code != 0 {
+		t.Fatalf("RunWithIO() code = %d, stderr = %s", code, stderr.String())
+	}
+	if got, want := stdout.String(), "one\ntwo\n"; got != want {
+		t.Fatalf("stdout = %q, want %q", got, want)
+	}
+	if strings.Contains(stdout.String(), "> ") {
+		t.Fatalf("stdout contains prompt: %q", stdout.String())
+	}
+	if got, want := stderr.String(), "> > > > "; got != want {
+		t.Fatalf("stderr = %q, want %q", got, want)
+	}
+
+	firstRequest := <-requests
+	firstMessages := requestMessages(t, firstRequest.Body)
+	assertMessage(t, firstMessages, 0, "system", builtInBaseInstructions)
+	assertMessage(t, firstMessages, 1, "user", "first")
+
+	secondRequest := <-requests
+	secondMessages := requestMessages(t, secondRequest.Body)
+	if len(secondMessages) != 4 {
+		t.Fatalf("len(second request messages) = %d, want 4: %#v", len(secondMessages), secondMessages)
+	}
+	assertMessage(t, secondMessages, 0, "system", builtInBaseInstructions)
+	assertMessage(t, secondMessages, 1, "user", "first")
+	assertMessage(t, secondMessages, 2, "assistant", "one")
+	assertMessage(t, secondMessages, 3, "user", "second")
+	assertNoAdditionalCLIRunRequest(t, requests)
+}
+
+func TestChatToolCallHistoryCarriesIntoNextTurn(t *testing.T) {
+	server, requests := newSequentialCLIRunServer(t,
+		[]string{
+			`{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"read_file","arguments":"{\"path\":\"note.txt\"}"}}]}}]}`,
+			`{"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`,
+			`[DONE]`,
+		},
+		[]string{
+			`{"choices":[{"delta":{"content":"done"}}]}`,
+			`[DONE]`,
+		},
+		[]string{
+			`{"choices":[{"delta":{"content":"next"}}]}`,
+			`[DONE]`,
+		},
+	)
+	defer server.Close()
+
+	projectDir := t.TempDir()
+	writeCLIFile(t, filepath.Join(projectDir, "note.txt"), "tool output")
+	configDir := t.TempDir()
+	writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
+
+	var stdout, stderr bytes.Buffer
+	code := RunWithIO([]string{"--config-dir", configDir, "chat", "--enable-tools", "read_file"}, strings.NewReader("Read note\nNext\n/exit\n"), &stdout, &stderr, func() (string, error) {
+		return projectDir, nil
+	})
+
+	if code != 0 {
+		t.Fatalf("RunWithIO() code = %d, stderr = %s", code, stderr.String())
+	}
+	if got, want := stdout.String(), "done\nnext\n"; got != want {
+		t.Fatalf("stdout = %q, want %q", got, want)
+	}
+
+	<-requests
+	<-requests
+	thirdRequest := <-requests
+	messages := requestMessages(t, thirdRequest.Body)
+	if len(messages) != 6 {
+		t.Fatalf("len(third request messages) = %d, want 6: %#v", len(messages), messages)
+	}
+	assertMessage(t, messages, 0, "system", builtInBaseInstructions)
+	assertMessage(t, messages, 1, "user", "Read note")
+	assertAssistantToolCallMessage(t, messages, 2, "call_1", "read_file", `{"path":"note.txt"}`)
+	assertToolMessage(t, messages, 3, "call_1", "tool output")
+	assertMessage(t, messages, 4, "assistant", "done")
+	assertMessage(t, messages, 5, "user", "Next")
+	assertNoAdditionalCLIRunRequest(t, requests)
 }
 
 func TestRunUsesDefaultProviderModelAndOutputsTextDelta(t *testing.T) {

@@ -142,6 +142,8 @@ sai version -h
 sai help version
 sai run -h
 sai help run
+sai chat -h
+sai help chat
 sai config -h
 sai help config
 sai config show -h
@@ -178,6 +180,30 @@ help 输出写到 stdout，exit code 为 0。help 必须在配置加载前完成
 ```
 
 v0.1 暂不支持 non-streaming fallback，`sai run` 当前强制使用 streaming；后续如要支持再引入 `--no-stream` 或 adapter 非流式路径。
+
+## CLI Chat REPL
+
+M10 后，`sai chat` 是一个克制的逐行 REPL：启动时固定 provider、model、tools、MCP、
+skills 和 reasoning 展示设置；会话进行中不支持模型切换或额外 slash commands。它和
+`sai run` 共享同一套配置选择规则和 flags：
+
+```text
+sai chat --provider paperhub --model glm-5.2
+sai chat --enable-tools list_files,read_file
+sai chat --enable-mcp local --enable-tools mcp.local.some_tool
+```
+
+输入从 stdin 逐行读取，空白行忽略。`/exit`、`/quit` 或 EOF 正常退出。prompt 写到
+stderr（例如 `> `），模型输出继续通过现有 `writeStream` streaming 到 stdout，包括
+reasoning 的隐藏、显示和终端样式规则。chat 成功完成一轮后，如果 assistant 输出没有以
+换行结束，CLI 只为 chat 补一个换行，避免下一个 prompt 和模型输出粘在一起；`sai run`
+的成功输出语义不变。
+
+chat 会话历史只保存在当前进程内。每一轮成功后，agent 返回 updated messages，供下一轮
+请求复用；其中包括原有 messages、当前 user message、assistant tool calls、tool result
+messages 和最终 assistant 文本。model stream error 仍通过 error event 失败，不伪造成功
+assistant 历史，也不继续下一轮。除 JSONL 日志外，chat 不落盘会话历史、上下文快照或
+prompt/response/tool result 正文。MCP stdio server 在 chat 会话开始时启动，退出时关闭。
 
 ## 配置形态
 

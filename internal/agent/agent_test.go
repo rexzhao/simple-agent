@@ -67,6 +67,82 @@ func TestStreamExecutesToolResultAndContinuesUntilFinalText(t *testing.T) {
 	assertAgentMessage(t, secondMessages[2], model.MessageRoleTool, "tool output", "call_1")
 }
 
+func TestStreamWithResultAppendsFinalAssistantMessage(t *testing.T) {
+	provider := &fakeProvider{
+		turns: [][]model.Event{
+			{
+				model.TextDeltaEvent{Text: "hello "},
+				model.TextDeltaEvent{Text: "there"},
+			},
+		},
+	}
+
+	events, results, err := StreamWithResult(context.Background(), model.Request{
+		Model:    "model-test",
+		Messages: []model.Message{{Role: model.MessageRoleUser, Content: "Say hi"}},
+	}, Options{
+		Provider: provider,
+	})
+	if err != nil {
+		t.Fatalf("StreamWithResult() error = %v", err)
+	}
+
+	gotEvents := collectAgentEvents(t, events)
+	if gotText := collectText(gotEvents); gotText != "hello there" {
+		t.Fatalf("text events = %q, want hello there", gotText)
+	}
+	result := collectTurnResult(t, results)
+	if len(result.Messages) != 2 {
+		t.Fatalf("len(result messages) = %d, want 2: %#v", len(result.Messages), result.Messages)
+	}
+	assertAgentMessage(t, result.Messages[0], model.MessageRoleUser, "Say hi", "")
+	assertAgentMessage(t, result.Messages[1], model.MessageRoleAssistant, "hello there", "")
+}
+
+func TestStreamWithResultIncludesToolHistoryAndFinalAssistantText(t *testing.T) {
+	provider := &fakeProvider{
+		turns: [][]model.Event{
+			{
+				model.ToolCallDoneEvent{
+					ToolCall: model.ToolCall{ID: "call_1", Name: "echo", Arguments: `{"text":"hello"}`},
+				},
+			},
+			{
+				model.TextDeltaEvent{Text: "final"},
+			},
+		},
+	}
+	executor := &fakeToolExecutor{
+		result: model.ToolResult{Name: "echo", Content: "tool output"},
+	}
+
+	events, results, err := StreamWithResult(context.Background(), model.Request{
+		Model:    "model-test",
+		Messages: []model.Message{{Role: model.MessageRoleUser, Content: "Use a tool"}},
+		Tools:    []model.Tool{{Name: "echo"}},
+	}, Options{
+		Provider:     provider,
+		ToolExecutor: executor,
+		MaxTurns:     4,
+	})
+	if err != nil {
+		t.Fatalf("StreamWithResult() error = %v", err)
+	}
+
+	gotEvents := collectAgentEvents(t, events)
+	if gotText := collectText(gotEvents); gotText != "final" {
+		t.Fatalf("text events = %q, want final", gotText)
+	}
+	result := collectTurnResult(t, results)
+	if len(result.Messages) != 4 {
+		t.Fatalf("len(result messages) = %d, want 4: %#v", len(result.Messages), result.Messages)
+	}
+	assertAgentMessage(t, result.Messages[0], model.MessageRoleUser, "Use a tool", "")
+	assertAgentMessage(t, result.Messages[1], model.MessageRoleAssistant, "", "call_1")
+	assertAgentMessage(t, result.Messages[2], model.MessageRoleTool, "tool output", "call_1")
+	assertAgentMessage(t, result.Messages[3], model.MessageRoleAssistant, "final", "")
+}
+
 func TestStreamMalformedToolArgumentsAppendsToolErrorAndContinues(t *testing.T) {
 	provider := &fakeProvider{
 		turns: [][]model.Event{
@@ -266,6 +342,28 @@ func firstErrorEvent(t *testing.T, events []model.Event) model.ErrorEvent {
 	return model.ErrorEvent{}
 }
 
+func collectTurnResult(t *testing.T, results <-chan TurnResult) TurnResult {
+	t.Helper()
+
+	select {
+	case result, ok := <-results:
+		if !ok {
+			t.Fatal("result channel closed without TurnResult")
+		}
+		select {
+		case extra, ok := <-results:
+			if ok {
+				t.Fatalf("unexpected extra TurnResult: %#v", extra)
+			}
+		default:
+		}
+		return result
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for TurnResult")
+	}
+	return TurnResult{}
+}
+
 func assertAgentMessage(t *testing.T, message model.Message, role model.MessageRole, content string, toolCallID string) {
 	t.Helper()
 
@@ -277,6 +375,12 @@ func assertAgentMessage(t *testing.T, message model.Message, role model.MessageR
 	}
 	switch role {
 	case model.MessageRoleAssistant:
+		if toolCallID == "" {
+			if len(message.ToolCalls) != 0 {
+				t.Fatalf("assistant tool calls = %#v, want none", message.ToolCalls)
+			}
+			return
+		}
 		if len(message.ToolCalls) != 1 || message.ToolCalls[0].ID != toolCallID {
 			t.Fatalf("assistant tool calls = %#v, want id %q", message.ToolCalls, toolCallID)
 		}

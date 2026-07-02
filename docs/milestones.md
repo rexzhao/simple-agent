@@ -268,3 +268,36 @@ M7 当前实现只覆盖配置目录下的本地 skills：通过 `skills.enabled
 - `gofmt -w internal/cli/cli.go internal/cli/cli_test.go` 通过。
 - `go test ./...` 通过。
 - `git diff --check` 通过。
+
+## M10：CLI Chat REPL
+
+目标：实现克制版 `sai chat`，让多轮命令行会话可用，同时继续保持纯 CLI、无 TUI、
+无长期记忆的边界。
+
+交付物：
+
+- Agent 层新增成功一轮结束后返回 updated messages 的 streaming API，同时保留
+  `agent.Stream` 兼容 `sai run`。
+- updated messages 包含原有 messages、当前 user message、assistant final text、
+  assistant tool calls 和 tool result messages。
+- `sai chat [flags]` 逐行读取 stdin；空白行忽略，`/exit`、`/quit` 或 EOF 正常退出。
+- `sai chat` 会话开始时固定 provider/model/tools/MCP/skills/show-reasoning，复用
+  `sai run` 的配置选择规则和 flags：`--provider`、`--model`、`--show-reasoning`、
+  `--verbose`、`--enable-tools`、`--enable-skills`、`--disable-skills`、`--enable-mcp`。
+- 每轮模型输出继续 streaming 到 stdout；prompt 写到 stderr；chat 成功轮次在输出末尾
+  缺少换行时补一个换行，不改变 `sai run` 输出语义。
+- 会话历史只保存在当前进程内；不落盘 chat history；JSONL 日志继续不记录完整
+  prompt、response 或 tool result 正文。
+- MCP stdio server 在 chat 会话开始时启动，并在退出时关闭。
+- 支持 `sai chat -h`、`sai chat --help`、`sai help chat`，help 在配置加载前完成。
+
+验证：
+
+- Agent 单元测试覆盖无工具单轮追加 assistant final message。
+- Agent 单元测试覆盖 tool call 后 result messages 包含 assistant tool call、tool result
+  和最终 assistant text。
+- CLI 单元测试覆盖 chat help 不加载配置、`/exit` 正常退出、两轮 history、tool call
+  history、prompt 写 stderr 和错误参数 help hint。
+- `gofmt -w internal/agent/agent.go internal/agent/agent_test.go internal/cli/cli.go internal/cli/cli_test.go` 通过。
+- `go test ./...` 通过。
+- `git diff --check` 通过。

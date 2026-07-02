@@ -52,6 +52,16 @@ models:
 sai run --provider paperhub --model glm-5.2 "Hello"
 ```
 
+Start a line-oriented chat session with the same provider/model selection rules:
+
+```sh
+sai chat --provider paperhub --model glm-5.2
+```
+
+In chat, type one message per line. Blank lines are ignored; `/exit`, `/quit`,
+or EOF exits normally. Session history stays in memory for the current process
+and is not written to disk.
+
 Show CLI usage without loading configuration:
 
 ```sh
@@ -59,6 +69,8 @@ sai help
 sai help version
 sai help run
 sai run -h
+sai help chat
+sai chat -h
 sai help config
 sai help config show
 sai help models
@@ -69,6 +81,7 @@ Enable tools for a single run:
 
 ```sh
 sai run --enable-tools list_files,read_file "List this project"
+sai chat --enable-tools list_files,read_file
 ```
 
 Write non-sensitive run diagnostics to stderr without changing streamed stdout:

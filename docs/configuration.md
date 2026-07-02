@@ -336,6 +336,12 @@ sai chat --provider paperhub --model glm-5.2
 v0.1 不支持会话进行中切换模型。`sai chat` 进入会话后，provider/model 固定到会话
 结束。
 
+`sai chat` 和 `sai run` 使用同一套会话启动时配置与命令行覆盖规则。以下 flags 在
+chat 会话开始时解析一次，并固定到会话结束：`--provider`、`--model`、
+`--show-reasoning`、`--verbose`、`--enable-tools`、`--enable-skills`、
+`--disable-skills`、`--enable-mcp`。chat 不支持会话进行中切换模型、工具、MCP 或
+skills。
+
 ## 参数合并
 
 请求参数按以下顺序合并：
@@ -350,7 +356,8 @@ v0.1 不支持会话进行中切换模型。`sai chat` 进入会话后，provide
 
 ## 日志
 
-v0.1 使用 JSONL 日志。除此之外，不保存会话历史、上下文快照或其他运行状态。
+v0.1 使用 JSONL 日志。除此之外，不保存会话历史、上下文快照或其他运行状态。`sai chat`
+的多轮 messages 只保存在当前进程内，用于下一轮请求；退出后不写入磁盘。
 
 ```yaml
 logging:

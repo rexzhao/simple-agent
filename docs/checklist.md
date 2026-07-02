@@ -161,3 +161,28 @@
 - [x] JSONL 日志继续记录原始事件，不包含 ANSI 样式。
 - [x] 不引入 TUI、不引入第三方依赖，不新增 `--no-color` 或改动 help/usage。
 - [x] 添加 reasoning 样式测试并验证 `go test ./...`。
+
+## M10：CLI Chat REPL
+
+- [x] 保留 `agent.Stream` 兼容 `sai run`。
+- [x] 新增 agent streaming result API，成功一轮结束后返回 updated messages。
+- [x] 无工具单轮 result messages 追加 assistant final message。
+- [x] tool call 单轮 result messages 包含 assistant tool call、tool result 和最终 assistant text。
+- [x] model stream error 不伪造成功 assistant 历史，继续通过 error event 失败。
+- [x] 添加 `sai chat [flags]`。
+- [x] `sai chat` 会话开始时固定 provider/model/tools/MCP/skills/show-reasoning。
+- [x] `sai chat` 复用 `sai run` 的 `--provider`、`--model`、`--show-reasoning`、`--verbose`、`--enable-tools`、`--enable-skills`、`--disable-skills`、`--enable-mcp` 语义。
+- [x] stdin 逐行读取用户输入，空白行忽略。
+- [x] `/exit`、`/quit` 和 EOF 正常退出。
+- [x] prompt 写到 stderr，不污染 stdout。
+- [x] 每轮继续用 `writeStream` streaming 到 stdout。
+- [x] chat 成功轮次在 assistant 输出缺少换行时补换行，且不改变 `sai run` 输出。
+- [x] 会话历史只保存在进程内，不落盘 chat history。
+- [x] JSONL 日志继续不记录完整 prompt、response、tool result 正文。
+- [x] MCP server 在 chat 会话开始时启动，退出时关闭。
+- [x] chat 单轮出错后 exit code 1，不继续下一轮。
+- [x] root help 增加 `chat`。
+- [x] 支持 `sai chat -h`、`sai chat --help`、`sai help chat`，help 不加载配置。
+- [x] chat 未知/错误参数包含 `Run "sai help chat" for usage.`。
+- [x] 添加可注入 stdin 的 CLI 测试入口。
+- [x] 添加 chat help、退出、多轮 history、tool history、prompt stderr、错误参数测试。
