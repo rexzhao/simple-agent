@@ -1311,6 +1311,108 @@ func TestRunWithContextCancelReachesProviderRequest(t *testing.T) {
 	assertCLIErrorContains(t, stderr.String(), "context canceled")
 }
 
+func TestRunWithContextCancelFlushesLoggerAfterStreamEvent(t *testing.T) {
+	requestStarted := make(chan capturedCLIRunRequest, 1)
+	requestContextDone := make(chan struct{})
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("ReadAll() error = %v", err)
+		}
+		requestStarted <- capturedCLIRunRequest{
+			Path:          r.URL.Path,
+			Authorization: r.Header.Get("Authorization"),
+			ContentType:   r.Header.Get("Content-Type"),
+			RawBody:       body,
+			Body:          decodeCLIJSON(t, body),
+		}
+
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			t.Error("response writer does not support flush")
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"streamed response secret\"}}]}\n\n")
+		flusher.Flush()
+
+		<-r.Context().Done()
+		close(requestContextDone)
+	}))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	defer server.Close()
+
+	configDir := t.TempDir()
+	writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
+
+	stdout := newSignalingWriter("streamed response secret")
+	var stderr bytes.Buffer
+	done := make(chan int, 1)
+	go func() {
+		done <- RunWithContext(ctx, []string{"--config-dir", configDir, "chat", "--quit", "user prompt secret"}, strings.NewReader(""), stdout, &stderr, func() (string, error) {
+			return t.TempDir(), nil
+		})
+	}()
+
+	var request capturedCLIRunRequest
+	select {
+	case request = <-requestStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for provider request")
+	}
+	assertMessage(t, requestMessages(t, request.Body), 1, "user", "user prompt secret")
+
+	select {
+	case <-stdout.wrote:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for streamed text")
+	}
+	cancel()
+
+	select {
+	case <-requestContextDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for provider request context cancellation")
+	}
+	select {
+	case code := <-done:
+		if code != 1 {
+			t.Fatalf("RunWithContext() code = %d, want 1", code)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for RunWithContext to return")
+	}
+	if got, want := stdout.String(), "streamed response secret"; got != want {
+		t.Fatalf("stdout = %q, want %q", got, want)
+	}
+	assertCLIErrorContains(t, stderr.String(), "context canceled")
+
+	logPaths := sessionLogPaths(t, configDir)
+	if len(logPaths) != 1 {
+		t.Fatalf("session log paths = %#v, want one canceled session log", logPaths)
+	}
+	logData, err := os.ReadFile(logPaths[0])
+	if err != nil {
+		t.Fatalf("ReadFile(%q) error = %v", logPaths[0], err)
+	}
+	logText := string(logData)
+	for _, leaked := range []string{"user prompt secret", "streamed response secret", "direct-secret-value"} {
+		if strings.Contains(logText, leaked) {
+			t.Fatalf("log leaked %q:\n%s", leaked, logText)
+		}
+	}
+	records := readJSONLRecords(t, logData)
+	assertCLILogBaseFields(t, records)
+	if !hasCLILogRecord(records, "text_delta", "event", "text_delta") {
+		t.Fatalf("log records missing flushed text_delta: %#v", records)
+	}
+	if !hasCLILogRecord(records, "error", "message", "read OpenAI chat stream") {
+		t.Fatalf("log records missing cancel error: %#v", records)
+	}
+}
+
 func TestRunUsesDefaultProviderModelAndOutputsTextDelta(t *testing.T) {
 	server, requests := newCLIRunServer(t,
 		`{"choices":[{"delta":{"content":"hello"}}]}`,
@@ -2933,6 +3035,38 @@ type failingWriter struct {
 
 func (w failingWriter) Write(p []byte) (int, error) {
 	return 0, w.err
+}
+
+type signalingWriter struct {
+	mu    sync.Mutex
+	buf   bytes.Buffer
+	want  string
+	wrote chan struct{}
+	once  sync.Once
+}
+
+func newSignalingWriter(want string) *signalingWriter {
+	return &signalingWriter{
+		want:  want,
+		wrote: make(chan struct{}),
+	}
+}
+
+func (w *signalingWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	n, err := w.buf.Write(p)
+	if strings.Contains(w.buf.String(), w.want) {
+		w.once.Do(func() { close(w.wrote) })
+	}
+	return n, err
+}
+
+func (w *signalingWriter) String() string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.buf.String()
 }
 
 func newCLIRunServer(t *testing.T, chunks ...string) (*httptest.Server, <-chan capturedCLIRunRequest) {

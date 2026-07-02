@@ -84,6 +84,102 @@ func TestLogEventLazilyCreatesSessionLog(t *testing.T) {
 	}
 }
 
+func TestCloseIsIdempotentAndFlushesBufferedData(t *testing.T) {
+	parent := t.TempDir()
+	logRoot := filepath.Join(parent, "logs")
+	logger, err := Open(filepath.Join(logRoot, "sai.jsonl"), Attributes{
+		Provider: "fake",
+		Model:    "model-default",
+	})
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	futurePath := logger.Path()
+
+	if err := logger.LogEvent(model.TextDeltaEvent{Text: "hidden response body"}); err != nil {
+		t.Fatalf("LogEvent() error = %v", err)
+	}
+	if err := logger.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	if err := logger.Close(); err != nil {
+		t.Fatalf("second Close() error = %v", err)
+	}
+
+	data, err := os.ReadFile(futurePath)
+	if err != nil {
+		t.Fatalf("ReadFile(%q) error = %v", futurePath, err)
+	}
+	logText := string(data)
+	if !strings.Contains(logText, `"event":"text_delta"`) {
+		t.Fatalf("log = %q, want flushed text_delta record", logText)
+	}
+	if strings.Contains(logText, "hidden response body") {
+		t.Fatalf("log leaked event body: %s", logText)
+	}
+}
+
+func TestCloseStillClosesFileWhenFlushFails(t *testing.T) {
+	parent := t.TempDir()
+	logRoot := filepath.Join(parent, "logs")
+	logger, err := Open(filepath.Join(logRoot, "sai.jsonl"), Attributes{
+		Provider: "fake",
+		Model:    "model-default",
+	})
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	if err := logger.LogEvent(model.TextDeltaEvent{Text: "hidden response body"}); err != nil {
+		t.Fatalf("LogEvent() error = %v", err)
+	}
+	if err := logger.file.Close(); err != nil {
+		t.Fatalf("pre-close file error = %v", err)
+	}
+
+	err = logger.Close()
+	if err == nil {
+		t.Fatal("Close() error = nil, want flush and close errors")
+	}
+	got := err.Error()
+	for _, want := range []string{"flush JSONL log", "close JSONL log"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("Close() error = %q, want contain %q", got, want)
+		}
+	}
+	if err := logger.Close(); err != nil {
+		t.Fatalf("second Close() error = %v", err)
+	}
+}
+
+func TestCloseReturnsFileCloseError(t *testing.T) {
+	parent := t.TempDir()
+	logRoot := filepath.Join(parent, "logs")
+	logger, err := Open(filepath.Join(logRoot, "sai.jsonl"), Attributes{
+		Provider: "fake",
+		Model:    "model-default",
+	})
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	if err := logger.LogEvent(model.TextDeltaEvent{Text: "hidden response body"}); err != nil {
+		t.Fatalf("LogEvent() error = %v", err)
+	}
+	if err := logger.writer.Flush(); err != nil {
+		t.Fatalf("Flush() error = %v", err)
+	}
+	if err := logger.file.Close(); err != nil {
+		t.Fatalf("pre-close file error = %v", err)
+	}
+
+	err = logger.Close()
+	if err == nil {
+		t.Fatal("Close() error = nil, want file close error")
+	}
+	if got := err.Error(); !strings.Contains(got, "close JSONL log") {
+		t.Fatalf("Close() error = %q, want close JSONL log context", got)
+	}
+}
+
 func TestFirstErrorEventLazilyCreatesSessionLog(t *testing.T) {
 	parent := t.TempDir()
 	logRoot := filepath.Join(parent, "logs")

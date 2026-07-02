@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -103,14 +104,21 @@ func (l *Logger) Close() error {
 		return nil
 	}
 
-	if err := l.writer.Flush(); err != nil {
-		_ = l.file.Close()
-		return fmt.Errorf("flush JSONL log %q: %w", l.path, err)
+	file := l.file
+	writer := l.writer
+	l.file = nil
+	l.writer = nil
+
+	var closeErr error
+	if writer != nil {
+		if err := writer.Flush(); err != nil {
+			closeErr = errors.Join(closeErr, fmt.Errorf("flush JSONL log %q: %w", l.path, err))
+		}
 	}
-	if err := l.file.Close(); err != nil {
-		return fmt.Errorf("close JSONL log %q: %w", l.path, err)
+	if err := file.Close(); err != nil {
+		closeErr = errors.Join(closeErr, fmt.Errorf("close JSONL log %q: %w", l.path, err))
 	}
-	return nil
+	return closeErr
 }
 
 func (l *Logger) eventRecord(event model.Event) map[string]any {
