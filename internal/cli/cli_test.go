@@ -562,7 +562,10 @@ func TestChatToolCallHistoryCarriesIntoNextTurn(t *testing.T) {
 	if got, want := stdout.String(), "done\nnext\n"; got != want {
 		t.Fatalf("stdout = %q, want %q", got, want)
 	}
-	assertCLIToolStatus(t, stdout.String(), stderr.String(), "read_file", "note.txt", "tool output")
+	if got, want := stderr.String(), "> \n! tool: read_file note.txt\n> > "; got != want {
+		t.Fatalf("stderr = %q, want %q", got, want)
+	}
+	assertCLIToolStatus(t, stdout.String(), stderr.String(), "read_file note.txt", "tool output")
 
 	<-requests
 	<-requests
@@ -704,7 +707,7 @@ func TestRunOpenAIResponsesExecutesFunctionCallAndContinuesToFinalText(t *testin
 	if got, want := stdout.String(), "done"; got != want {
 		t.Fatalf("stdout = %q, want %q", got, want)
 	}
-	assertCLIToolStatus(t, stdout.String(), stderr.String(), "read_file", "note.txt", "tool output")
+	assertCLIToolStatus(t, stdout.String(), stderr.String(), "read_file note.txt", "tool output")
 
 	firstRequest := <-requests
 	if firstRequest.Path != "/responses" {
@@ -814,7 +817,7 @@ func TestRunAnthropicMessagesProviderExecutesToolUseAndReturnsToolResult(t *test
 	if got, want := stdout.String(), "done"; got != want {
 		t.Fatalf("stdout = %q, want %q", got, want)
 	}
-	assertCLIToolStatus(t, stdout.String(), stderr.String(), "read_file", "note.txt", "tool output")
+	assertCLIToolStatus(t, stdout.String(), stderr.String(), "read_file note.txt", "tool output")
 
 	firstRequest := <-requests
 	if firstRequest.Path != "/messages" {
@@ -1296,7 +1299,7 @@ func TestRunExecutesToolCallAndContinuesToFinalText(t *testing.T) {
 	if got, want := stdout.String(), "done"; got != want {
 		t.Fatalf("stdout = %q, want %q", got, want)
 	}
-	assertCLIToolStatus(t, stdout.String(), stderr.String(), "read_file", "note.txt", "tool output")
+	assertCLIToolStatus(t, stdout.String(), stderr.String(), "read_file note.txt", "tool output")
 
 	firstRequest := <-requests
 	if got := firstRequest.Body["model"]; got != "model-default" {
@@ -1350,7 +1353,7 @@ func TestRunWritesJSONLLogForToolCallWithoutSensitiveContent(t *testing.T) {
 	if got, want := stdout.String(), "final response secret"; got != want {
 		t.Fatalf("stdout = %q, want %q", got, want)
 	}
-	assertCLIToolStatus(t, stdout.String(), stderr.String(), "read_file", "note.txt", "tool output secret")
+	assertCLIToolStatus(t, stdout.String(), stderr.String(), "read_file note.txt", "tool output secret")
 	<-requests
 	<-requests
 	assertNoAdditionalCLIRunRequest(t, requests)
@@ -1610,7 +1613,7 @@ func TestRunReasoningIsHiddenUnlessShowReasoningIsSet(t *testing.T) {
 		if code != 0 {
 			t.Fatalf("RunWithGetwd() code = %d, stderr = %s", code, stderr.String())
 		}
-		if got, want := stdout.String(), "shown\nvisible"; got != want {
+		if got, want := stdout.String(), "? reasoning\nshown\nvisible"; got != want {
 			t.Fatalf("stdout = %q, want %q", got, want)
 		}
 	})
@@ -1634,7 +1637,7 @@ func TestRunReasoningIsHiddenUnlessShowReasoningIsSet(t *testing.T) {
 		if code != 0 {
 			t.Fatalf("RunWithGetwd() code = %d, stderr = %s", code, stderr.String())
 		}
-		if got, want := stdout.String(), "shown\nvisible"; got != want {
+		if got, want := stdout.String(), "? reasoning\nshown\nvisible"; got != want {
 			t.Fatalf("stdout = %q, want %q", got, want)
 		}
 	})
@@ -1674,7 +1677,7 @@ func TestWriteStreamDoesNotColorReasoningForBufferOutput(t *testing.T) {
 	if err != nil {
 		t.Fatalf("writeStream() error = %v", err)
 	}
-	if got, want := stdout.String(), "shown\nvisible"; got != want {
+	if got, want := stdout.String(), "? reasoning\nshown\nvisible"; got != want {
 		t.Fatalf("stdout = %q, want %q", got, want)
 	}
 	if strings.Contains(stdout.String(), "\x1b[") {
@@ -1693,7 +1696,24 @@ func TestWriteStreamWithOptionsColorsReasoningAndResetsBeforeFinalText(t *testin
 	if err != nil {
 		t.Fatalf("writeStreamWithOptions() error = %v", err)
 	}
-	if got, want := stdout.String(), reasoningColorDarkGray+"thinking"+ansiReset+"\nfinal"; got != want {
+	if got, want := stdout.String(), reasoningColorDarkGray+"? reasoning\nthinking"+ansiReset+"\nfinal"; got != want {
+		t.Fatalf("stdout = %q, want %q", got, want)
+	}
+}
+
+func TestWriteStreamStartsReasoningMarkerOnIndependentLine(t *testing.T) {
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	err := writeStream(&stdout, &stderr, cliEventStream(
+		model.TextDeltaEvent{Text: "prefix"},
+		model.ReasoningDeltaEvent{Text: "thinking"},
+		model.TextDeltaEvent{Text: "final"},
+	), true, nil)
+
+	if err != nil {
+		t.Fatalf("writeStream() error = %v", err)
+	}
+	if got, want := stdout.String(), "prefix\n? reasoning\nthinking\nfinal"; got != want {
 		t.Fatalf("stdout = %q, want %q", got, want)
 	}
 }
@@ -1708,9 +1728,57 @@ func TestWriteStreamWithOptionsResetsAfterReasoningOnly(t *testing.T) {
 	if err != nil {
 		t.Fatalf("writeStreamWithOptions() error = %v", err)
 	}
-	if got, want := stdout.String(), reasoningColorDarkGray+"thinking"+ansiReset; got != want {
+	if got, want := stdout.String(), reasoningColorDarkGray+"? reasoning\nthinking"+ansiReset; got != want {
 		t.Fatalf("stdout = %q, want %q", got, want)
 	}
+}
+
+func TestWriteStreamWritesToolStatusWithSafeDetailsOnly(t *testing.T) {
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	err := writeStream(&stdout, &stderr, cliEventStream(
+		model.ToolCallDoneEvent{ToolCall: model.ToolCall{Name: "read_file", Arguments: `{"path":"docs/checklist.md"}`}},
+		model.ToolCallDoneEvent{ToolCall: model.ToolCall{Name: "list_files", Arguments: `{}`}},
+		model.ToolCallDoneEvent{ToolCall: model.ToolCall{Name: "list_files", Arguments: ``}},
+		model.ToolCallDoneEvent{ToolCall: model.ToolCall{Name: "list_files", Arguments: " \n\t "}},
+		model.ToolCallDoneEvent{ToolCall: model.ToolCall{Name: "read_file", Arguments: `[`}},
+		model.ToolCallDoneEvent{ToolCall: model.ToolCall{Name: "list_files", Arguments: `null`}},
+		model.ToolCallDoneEvent{ToolCall: model.ToolCall{Name: "shell", Arguments: `{"command":"echo secret-command"}`}},
+		model.ToolCallDoneEvent{ToolCall: model.ToolCall{Name: "mcp.local.search", Arguments: `{"query":"secret-query"}`}},
+		model.ToolResultEvent{Result: model.ToolResult{Name: "read_file", Content: "secret result body"}},
+	), false, nil)
+
+	if err != nil {
+		t.Fatalf("writeStream() error = %v", err)
+	}
+	if stdout.String() != "" {
+		t.Fatalf("stdout = %q, want empty", stdout.String())
+	}
+	if got, want := stderr.String(), "! tool: read_file docs/checklist.md\n! tool: list_files .\n! tool: list_files .\n! tool: list_files .\n! tool: read_file\n! tool: list_files\n! tool: shell\n! tool: mcp.local.search\n"; got != want {
+		t.Fatalf("stderr = %q, want %q", got, want)
+	}
+	assertCLIErrorOmits(t, stderr.String(), "secret-command", "secret-query", "secret result body")
+}
+
+func TestWriteStreamPutsConsecutiveToolStatusesOnIndependentLinesAfterOutputAndPrompt(t *testing.T) {
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	err := writeStreamWithOptions(&stdout, &stderr, cliEventStream(
+		model.TextDeltaEvent{Text: "partial"},
+		model.ToolCallDoneEvent{ToolCall: model.ToolCall{Name: "shell", Arguments: `{"command":"echo hidden"}`}},
+		model.ToolCallDoneEvent{ToolCall: model.ToolCall{Name: "read_file", Arguments: `{"path":"note.txt"}`}},
+	), false, nil, streamOutputOptions{stderrNeedsLeadingBreak: true})
+
+	if err != nil {
+		t.Fatalf("writeStreamWithOptions() error = %v", err)
+	}
+	if got, want := stdout.String(), "partial"; got != want {
+		t.Fatalf("stdout = %q, want %q", got, want)
+	}
+	if got, want := stderr.String(), "\n! tool: shell\n! tool: read_file note.txt\n"; got != want {
+		t.Fatalf("stderr = %q, want %q", got, want)
+	}
+	assertCLIErrorOmits(t, stderr.String(), "echo hidden")
 }
 
 func TestShouldColorizeReasoningRequiresTerminalAndHonorsNOColor(t *testing.T) {
@@ -2609,14 +2677,14 @@ func sessionLogPaths(t *testing.T, configDir string) []string {
 	return paths
 }
 
-func assertCLIToolStatus(t *testing.T, stdout, stderr, toolName string, hiddenValues ...string) {
+func assertCLIToolStatus(t *testing.T, stdout, stderr, statusDetail string, hiddenValues ...string) {
 	t.Helper()
 
-	if strings.Contains(stdout, "tool:") || strings.Contains(stdout, toolName) {
+	if strings.Contains(stdout, "! tool:") || strings.Contains(stdout, statusDetail) {
 		t.Fatalf("stdout contains tool status: %q", stdout)
 	}
-	if !strings.Contains(stderr, "tool: "+toolName+"\n") {
-		t.Fatalf("stderr = %q, want tool status for %q", stderr, toolName)
+	if !strings.Contains(stderr, "! tool: "+statusDetail+"\n") {
+		t.Fatalf("stderr = %q, want tool status for %q", stderr, statusDetail)
 	}
 	for _, value := range hiddenValues {
 		if strings.Contains(stderr, value) {

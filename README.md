@@ -100,8 +100,10 @@ sai tools list
 ```
 
 When a model calls a tool, `sai run` and `sai chat` print a short status line
-such as `tool: read_file` to stderr. Tool arguments and tool results are not
-printed in that status line, and streamed model output remains on stdout.
+such as `! tool: read_file docs/notes.md` to stderr. `list_files` similarly
+shows the target directory, defaulting to `.`. Other tool arguments and all tool
+results are not printed in that status line, and streamed model output remains
+on stdout.
 
 Write non-sensitive run diagnostics to stderr without changing streamed stdout:
 
@@ -115,10 +117,11 @@ Show reasoning output, which is hidden by default:
 sai run --show-reasoning --provider paperhub --model glm-5.2 "Hello"
 ```
 
-When stdout is an interactive terminal, reasoning is shown in gray/dark ANSI
-style so it is easier to distinguish from the final answer. Pipes, redirected
-output, and tests stay plain text. Set `NO_COLOR` to a non-empty value to
-disable ANSI styling.
+Shown reasoning starts with a `? reasoning` marker line. When stdout is an
+interactive terminal, the marker and reasoning are shown in gray/dark ANSI style
+so they are easier to distinguish from the final answer. Pipes, redirected
+output, and tests stay plain text. Set `NO_COLOR` to a non-empty value to disable
+ANSI styling.
 
 Other useful commands:
 

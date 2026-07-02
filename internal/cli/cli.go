@@ -569,7 +569,10 @@ func chatCommand(args []string, configDir string, stdin io.Reader, stdout, stder
 		}
 
 		tracker := &chatOutputWriter{w: stdout}
-		if err := writeStream(tracker, stderr, events, runtime.showReasoning, runtime.logger); err != nil {
+		if err := writeStreamWithOptions(tracker, stderr, events, runtime.showReasoning, runtime.logger, streamOutputOptions{
+			colorReasoning:          shouldColorizeReasoning(tracker),
+			stderrNeedsLeadingBreak: true,
+		}); err != nil {
 			return err
 		}
 		result, ok := <-results
@@ -1063,7 +1066,8 @@ func roleForInstruction(source projectcontext.InstructionSource) model.MessageRo
 }
 
 type streamOutputOptions struct {
-	colorReasoning bool
+	colorReasoning          bool
+	stderrNeedsLeadingBreak bool
 }
 
 func writeStream(stdout, stderr io.Writer, events <-chan model.Event, showReasoning bool, logger *eventlog.Logger) error {
@@ -1074,8 +1078,12 @@ func writeStream(stdout, stderr io.Writer, events <-chan model.Event, showReason
 
 func writeStreamWithOptions(stdout, stderr io.Writer, events <-chan model.Event, showReasoning bool, logger *eventlog.Logger, options streamOutputOptions) (err error) {
 	needsReasoningBreak := false
+	inReasoningBlock := false
 	reasoningEndedWithNewline := false
 	reasoningColorActive := false
+	stdoutAtLineStart := true
+	stderrStatusSeparated := false
+	stderrNeedsLeadingBreak := options.stderrNeedsLeadingBreak
 
 	startReasoningColor := func() error {
 		if !options.colorReasoning || reasoningColorActive {
@@ -1102,6 +1110,49 @@ func writeStreamWithOptions(stdout, stderr io.Writer, events <-chan model.Event,
 			err = errors.Join(err, resetErr)
 		}
 	}()
+	writeStdout := func(text string) error {
+		if text == "" {
+			return nil
+		}
+		if _, err := fmt.Fprint(stdout, text); err != nil {
+			return err
+		}
+		stdoutAtLineStart = strings.HasSuffix(text, "\n")
+		stderrStatusSeparated = false
+		return nil
+	}
+	startReasoningBlock := func() error {
+		if inReasoningBlock {
+			return nil
+		}
+		if !stdoutAtLineStart {
+			if err := writeStdout("\n"); err != nil {
+				return err
+			}
+		}
+		if err := startReasoningColor(); err != nil {
+			return err
+		}
+		if err := writeStdout("? reasoning\n"); err != nil {
+			return err
+		}
+		inReasoningBlock = true
+		return nil
+	}
+	writeToolStatus := func(toolCall model.ToolCall) error {
+		if stderr == nil || toolCall.Name == "" {
+			return nil
+		}
+		if (!stdoutAtLineStart && !stderrStatusSeparated) || stderrNeedsLeadingBreak {
+			if _, err := fmt.Fprint(stderr, "\n"); err != nil {
+				return err
+			}
+		}
+		stderrNeedsLeadingBreak = false
+		stderrStatusSeparated = true
+		_, err := fmt.Fprintln(stderr, formatToolStatus(toolCall))
+		return err
+	}
 
 	for event := range events {
 		if err := logger.LogEvent(event); err != nil {
@@ -1114,37 +1165,74 @@ func writeStreamWithOptions(stdout, stderr io.Writer, events <-chan model.Event,
 					return err
 				}
 				if !reasoningEndedWithNewline {
-					if _, err := fmt.Fprint(stdout, "\n"); err != nil {
+					if err := writeStdout("\n"); err != nil {
 						return err
 					}
 				}
 				needsReasoningBreak = false
+				inReasoningBlock = false
 			}
-			if _, err := fmt.Fprint(stdout, event.Text); err != nil {
+			if err := writeStdout(event.Text); err != nil {
 				return err
 			}
 		case model.ReasoningDeltaEvent:
 			if showReasoning && event.Text != "" {
-				if err := startReasoningColor(); err != nil {
+				if err := startReasoningBlock(); err != nil {
 					return err
 				}
-				if _, err := fmt.Fprint(stdout, event.Text); err != nil {
+				if err := writeStdout(event.Text); err != nil {
 					return err
 				}
 				needsReasoningBreak = true
 				reasoningEndedWithNewline = strings.HasSuffix(event.Text, "\n")
 			}
 		case model.ToolCallDoneEvent:
-			if stderr != nil && event.ToolCall.Name != "" {
-				if _, err := fmt.Fprintf(stderr, "tool: %s\n", event.ToolCall.Name); err != nil {
-					return err
-				}
+			if err := writeToolStatus(event.ToolCall); err != nil {
+				return err
 			}
 		case model.ErrorEvent:
 			return streamError(event)
 		}
 	}
 	return nil
+}
+
+func formatToolStatus(toolCall model.ToolCall) string {
+	status := "! tool: " + toolCall.Name
+	path, ok := toolStatusPath(toolCall)
+	if ok {
+		status += " " + path
+	}
+	return status
+}
+
+func toolStatusPath(toolCall model.ToolCall) (string, bool) {
+	if toolCall.Name != tools.BuiltinReadFile && toolCall.Name != tools.BuiltinListFiles {
+		return "", false
+	}
+	if toolCall.Name == tools.BuiltinListFiles && strings.TrimSpace(toolCall.Arguments) == "" {
+		return ".", true
+	}
+
+	var arguments map[string]any
+	if err := json.Unmarshal([]byte(toolCall.Arguments), &arguments); err != nil {
+		return "", false
+	}
+	if arguments == nil {
+		return "", false
+	}
+	path, ok := arguments["path"]
+	if !ok {
+		if toolCall.Name == tools.BuiltinListFiles {
+			return ".", true
+		}
+		return "", false
+	}
+	text, ok := path.(string)
+	if !ok {
+		return "", false
+	}
+	return text, true
 }
 
 func shouldColorizeReasoning(stdout io.Writer) bool {

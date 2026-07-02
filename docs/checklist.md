@@ -156,6 +156,10 @@
 
 - [x] 默认继续隐藏 reasoning 输出。
 - [x] `--show-reasoning` 和 `agent.show_reasoning: true` 显示 reasoning 时可使用终端暗灰色样式。
+- [x] 可见 reasoning 块前输出 `? reasoning` 标记行，并保持 reasoning/final 换行边界。
+- [x] tool call 状态以 `! tool: <name>` 独立写到 stderr。
+- [x] `read_file` / `list_files` 状态显示目标路径/目录；`shell` 和 MCP tool 不显示 arguments。
+- [x] tool 状态不打印 tool result 正文，stdout 不包含 tool 状态。
 - [x] stdout 不是终端时不输出 ANSI。
 - [x] `NO_COLOR` 存在且非空时不输出 ANSI。
 - [x] 切换到最终 `text_delta` 前先 reset，最终输出不继承 reasoning 颜色。

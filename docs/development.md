@@ -103,9 +103,11 @@ error
 ```
 
 CLI 默认只打印 `text_delta`。`reasoning_delta` 默认隐藏，后续通过
-`--show-reasoning` 显示。发生 tool call 时，CLI 默认向 stderr 打印简短工具状态
-（例如 `tool: read_file`），不需要 `--verbose`；状态只包含工具名，不包含 arguments
-或 tool result 正文，stdout 仍只承载模型可见输出。
+`--show-reasoning` 显示。发生 tool call 时，CLI 默认向 stderr 打印独立的简短工具状态
+（例如 `! tool: read_file docs/notes.md`），不需要 `--verbose`；`read_file` 和
+`list_files` 状态可以显示目标路径/目录，其中 `list_files` 未提供 path 时显示 `.`。
+`shell` 和 MCP tool 状态只显示工具名，不显示命令参数或任意 arguments，也不打印 tool
+result 正文，stdout 仍只承载模型可见输出。
 
 ## Agent Loop
 
@@ -379,9 +381,10 @@ choices[0].delta.content
 ```
 
 默认只把 `delta.content` 作为用户可见输出。`delta.reasoning_content` 需要解析成
-内部事件，但默认不打印。启用 `--show-reasoning` 时，CLI 可以打印 reasoning 输出；
-当事件流从 reasoning 输出切换到最终消息输出时，必须先补齐一个行尾换行，避免 reasoning
-和最终消息混在同一行。
+内部事件，但默认不打印。启用 `--show-reasoning` 时，CLI 可以打印 reasoning 输出，并在
+每个可见 reasoning 块前输出独立标记行 `? reasoning`；如果前面已有正文且没有换行，
+先补齐换行。当事件流从 reasoning 输出切换到最终消息输出时，也必须保持换行分隔，避免
+reasoning 和最终消息混在同一行。
 
 ## Reasoning 输出样式
 
@@ -390,7 +393,8 @@ JSONL 日志。`reasoning_delta` 仍按原始事件记录；ANSI 控制符不能
 
 只有 reasoning 被显式显示时才考虑上色：命令行 `--show-reasoning` 或配置
 `agent.show_reasoning: true` 生效后，`writeStream` 在支持颜色的终端 stdout 上使用
-ANSI 暗灰色显示 reasoning。当前样式是 `\x1b[90m` 开始、`\x1b[0m` reset。
+ANSI 暗灰色显示 `? reasoning` 标记和 reasoning。当前样式是 `\x1b[90m` 开始、
+`\x1b[0m` reset。
 如果 stdout 不是终端，例如 pipe、redirect 或测试中的 `bytes.Buffer`，不输出 ANSI。
 如果环境变量 `NO_COLOR` 存在且非空，即使 stdout 是终端也不输出 ANSI。
 
