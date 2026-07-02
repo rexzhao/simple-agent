@@ -16,8 +16,8 @@
 `--config-dir` 不改变 `AGENTS.md` 的查找位置。
 
 ```text
-sai run "你好"
-sai --config-dir ./config run "你好"
+sai chat --quit "你好"
+sai --config-dir ./config chat --quit "你好"
 sai --config-dir ./examples/paperhub chat
 ```
 
@@ -122,7 +122,7 @@ models:
 
 - `name`：provider 名称，必须和命令行 `--provider` 可选值一致。
 - `type`：provider adapter 类型。配置层识别 `openai-chat`、`anthropic-messages` 和
-  `openai-responses`。`sai run` 支持 `openai-chat`，也支持 `anthropic-messages`
+  `openai-responses`。`sai chat` 支持 `openai-chat`，也支持 `anthropic-messages`
   的文本 streaming；Anthropic tool use adapter 已接入同一套内部 tool loop。
   `openai-responses` 当前支持文本 streaming 和 function tool calling，并接入同一套内部
   tool loop。
@@ -154,7 +154,7 @@ models:
     max_tokens: 2048
 ```
 
-这类配置可以被加载、列入 `sai models list`，并参与模型解析；`sai run` 可以使用
+这类配置可以被加载、列入 `sai models list`，并参与模型解析；`sai chat` 可以使用
 `anthropic-messages` 做文本 streaming，并支持 tool use / tool result 转换。
 
 OpenAI Responses provider 使用同一套 provider/model profile 配置形态：
@@ -171,7 +171,7 @@ models:
     max_output_tokens: 4096
 ```
 
-这类配置可以被加载、列入 `sai models list`，并参与模型解析；`sai run` 会请求
+这类配置可以被加载、列入 `sai models list`，并参与模型解析；`sai chat` 会请求
 `<base_url>/responses` 并转换 Responses semantic text streaming 事件和 streamed
 function_call 事件。`openai-responses` 支持顶层 function `tools`、assistant 历史里的
 `function_call` input item，以及 tool result 的 `function_call_output` input item。
@@ -221,8 +221,8 @@ skills:
 ```
 
 ```text
-sai run --enable-skills my-skill,other-skill "prompt"
-sai run --disable-skills "prompt"
+sai chat --quit --enable-skills my-skill,other-skill "prompt"
+sai chat --quit --disable-skills "prompt"
 ```
 
 `--enable-skills` 覆盖配置中的 `skills.enabled`，不是追加；`--disable-skills` 本次运行
@@ -267,9 +267,9 @@ MCP tools 会转换成内部 tool schema，但仍然需要出现在 enabled tool
 启用列表完全由命令行决定，忽略各 MCP 文件中的 `enabled` 字段。
 
 ```text
-sai run --enable-mcp local "只启用 local MCP server"
-sai run --enable-mcp local,git "使用多个 MCP 服务"
-sai run --enable-mcp local --enable-tools mcp.local.some_tool "暴露 MCP 工具给模型"
+sai chat --quit --enable-mcp local "只启用 local MCP server"
+sai chat --quit --enable-mcp local,git "使用多个 MCP 服务"
+sai chat --quit --enable-mcp local --enable-tools mcp.local.some_tool "暴露 MCP 工具给模型"
 ```
 
 ## 工具启用
@@ -303,14 +303,14 @@ tools:
 命令行可以覆盖配置中的 enabled tools：
 
 ```text
-sai run --enable-tools list_files,read_file "看看当前目录"
+sai chat --quit --enable-tools list_files,read_file "看看当前目录"
 ```
 
 `--enable-tools` 是覆盖，不是追加。`shell` 不需要额外 flag；只要它被启用，就按普通工具
 暴露给模型。如果后续加入 `write_file`，也遵循同一规则。
 
 `sai tools list` 可以在不加载配置、不解析 provider API key 的情况下列出内置工具。发生
-tool call 时，`sai run` 和 `sai chat` 默认向 stderr 打印 `! tool: <name>` 形式的独立
+tool call 时，`sai chat` 默认向 stderr 打印 `! tool: <name>` 形式的独立
 简短状态；`read_file` 会追加目标文件路径，`list_files` 会追加目标目录且未提供 path 时
 显示 `.`。`shell` 和 MCP tool 状态只显示工具名，不显示命令参数或任意 arguments；状态
 也不包含 tool result 正文，stdout 仍只输出模型文本。
@@ -326,7 +326,7 @@ tool call 时，`sai run` 和 `sai chat` 默认向 stderr 打印 `! tool: <name>
 会话开始时确定 provider 和 model：
 
 ```text
-sai run --provider paperhub --model glm-5.2 "你是谁？"
+sai chat --quit --provider paperhub --model glm-5.2 "你是谁？"
 sai chat --provider paperhub --model glm-5.2
 ```
 
@@ -341,14 +341,23 @@ sai chat --provider paperhub --model glm-5.2
 1. `--config-dir`。
 2. 启动时当前工作目录下的 `.agents`。
 
+根层解析从 argv 左到右扫描，跳过已知 flag 及其 value；第一个真正的非 flag token 是命令。
+带值 flag 的 value 不参与命令识别，因此 `sai --model fast chat "hi" --quit` 中的 `fast`
+不是命令。命令 token 之外的参数交给对应命令解析，命令前后的 flags 都可以和 positional
+参数混排。`--config-dir` 是全局 flag，可以出现在命令前，也可以出现在命令或子命令后，
+例如 `sai --config-dir ./config models list` 和 `sai models list --config-dir ./config`
+等价。`-h` / `--help` 在命令范围内优先显示 help，且不加载配置。`--` 终止 flag
+解析；其后的 token 全部作为 positional，不再被识别为 help、`--config-dir` 或命令参数
+flag。
+
 v0.1 不支持会话进行中切换模型。`sai chat` 进入会话后，provider/model 固定到会话
 结束。
 
-`sai chat` 和 `sai run` 使用同一套会话启动时配置与命令行覆盖规则。以下 flags 在
-chat 会话开始时解析一次，并固定到会话结束：`--provider`、`--model`、
+`sai chat` 使用同一套会话启动时配置与命令行覆盖规则。以下 flags 在 chat 会话开始时
+解析一次，并固定到会话结束：`--provider`、`--model`、
 `--show-reasoning`、`--verbose`、`--enable-tools`、`--enable-skills`、
-`--disable-skills`、`--enable-mcp`。chat 不支持会话进行中切换模型、工具、MCP 或
-skills。
+`--disable-skills`、`--enable-mcp`。`--quit` 只有在提供初始 prompt 时有效，用于完成
+该轮后退出。chat 不支持会话进行中切换模型、工具、MCP 或 skills。
 
 ## 参数合并
 
@@ -375,7 +384,7 @@ logging:
 
 `logging.path` 兼容旧配置，但运行时解释为日志根/基准路径：如果配置为 `logs/sai.jsonl`，
 实际 session root 是配置目录下的 `logs/`；如果配置为空字符串，则禁用日志。每次
-`sai run` 或 `sai chat` 启动 runtime 时会预先确定唯一 session JSONL 路径，供
+`sai chat` 启动 runtime 时会预先确定唯一 session JSONL 路径，供
 `--verbose` 的 `log_path` 显示；但 log root、session 目录和 `sai.jsonl` 只在第一条日志
 事件发生时创建。
 

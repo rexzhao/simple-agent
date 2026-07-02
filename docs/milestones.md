@@ -43,14 +43,14 @@ MCP 放到 MVP 之后。
 - SSE parser，支持 `data:` event 和 `[DONE]`。
 - 处理 `delta.content`。
 - 处理 `delta.reasoning_content`。
-- `sai run "prompt"` 命令。
+- `sai chat --quit "prompt"` 单轮命令形态。
 - 会话开始时根据 `--provider` 和 `--model` 选择模型。
 - 将启动目录的 `AGENTS.md` 内容加入本次会话上下文。
 - `--show-reasoning` 参数，并在 reasoning 输出结束后换行再输出最终消息。
 
 验证：
 
-- `sai run --provider paperhub "你是谁？"` 能流式输出可见文本。
+- `sai chat --quit --provider paperhub "你是谁？"` 能流式输出可见文本。
 - `sai chat --provider paperhub --model glm-5.2` 在会话开始时固定模型。
 - 缺失 `AGENTS.md` 时命令仍可正常运行。
 - reasoning 内容默认隐藏。
@@ -94,14 +94,14 @@ MCP 放到 MVP 之后。
 - version 命令。
 - 可读错误信息。
 - `--verbose` 诊断信息，且不泄露 API key 或其他敏感配置值的实际值。
-- JSONL 日志，每次 `run` / `chat` 预计算独立 session 路径，并在首个日志事件发生时写入
+- JSONL 日志，每次 `chat` 预计算独立 session 路径，并在首个日志事件发生时写入
   独立 session 目录，且不泄露 API key、Authorization header 或其他敏感配置值的实际值。
 - 除 JSONL 日志外，不保存会话历史、上下文快照或其他状态。
 - 最小 README 使用说明。
 
 验证：
 
-- Windows 单文件可执行程序能运行 `sai run`。
+- Windows 单文件可执行程序能运行 `sai chat --quit`。
 - 能产出目标平台构建产物。
 - missing API key、bad base URL、invalid model response 都有可读错误。
 
@@ -191,7 +191,7 @@ function tools / function_call_output，使现有 agent tool loop 能通过 `ope
 - skill 显式启用或选择。
 - instruction composition。
 
-M7 当前实现只覆盖配置目录下的本地 skills：通过 `skills.enabled` 或 `sai run
+M7 当前实现只覆盖配置目录下的本地 skills：通过 `skills.enabled` 或 `sai chat
 --enable-skills` 显式启用，`--enable-skills` 覆盖配置，`--disable-skills` 本次运行禁用
 所有 skills。已启用 skill 的 instructions 作为 developer message 注入在内置 system
 和 `AGENTS.md` 之后、用户 prompt 之前；多个 skill 按 enabled 列表顺序注入。M7 不读取
@@ -223,7 +223,8 @@ M7 当前实现只覆盖配置目录下的本地 skills：通过 `skills.enabled
 - root help：`sai -h`、`sai --help`、`sai help`。
 - simple command help：`sai version -h`、`sai version --help`、
   `sai help version`。
-- command help：`sai run -h`、`sai run --help`、`sai help run`。
+- command help：`sai chat -h`、`sai chat --help`、`sai help chat`，展示可选
+  prompt 和 `--quit`。
 - group help：`sai config -h`、`sai models -h`、`sai tools -h`、`sai mcp -h`，
   以及对应的 `sai help config`、`sai help models`、`sai help tools`、
   `sai help mcp`。
@@ -234,15 +235,16 @@ M7 当前实现只覆盖配置目录下的本地 skills：通过 `skills.enabled
 - help 输出写到 stdout，exit code 为 0。
 - help 在配置加载前完成，不读取 `.agents` 配置、不解析 API key，也不泄露 secrets。
 - 未知命令和错误参数继续 exit code 1，并给出可读错误和 help 提示。
-- `sai run` 缺少 prompt 时继续失败，但错误包含 run usage 或 help 提示。
+- root help 不列 `run`；`sai run ...`、`sai run -h` 和 `sai help run` 不再作为正常入口，
+  返回 unknown command/topic 或不支持错误，且不展示 run 专用 usage。
 
 验证：
 
-- CLI 单元测试覆盖 root help、simple command help、group help、run help、
+- CLI 单元测试覆盖 root help、simple command help、group help、chat help、
   nested command help 和无需配置文件的 help 路径。
 - CLI 单元测试覆盖 `sai tools list` 无需配置文件。
 - CLI 单元测试覆盖未知命令错误提示。
-- CLI 单元测试覆盖 `sai run` 缺 prompt 的错误提示。
+- CLI 单元测试覆盖 `run` 不可用、`chat --quit` 缺 prompt 的错误提示。
 - `go test ./...` 通过。
 - `git diff --check` 通过。
 
@@ -285,15 +287,21 @@ M7 当前实现只覆盖配置目录下的本地 skills：通过 `skills.enabled
 交付物：
 
 - Agent 层新增成功一轮结束后返回 updated messages 的 streaming API，同时保留
-  `agent.Stream` 兼容 `sai run`。
+  `agent.Stream` 兼容内部单轮调用。
 - updated messages 包含原有 messages、当前 user message、assistant final text、
   assistant tool calls 和 tool result messages。
-- `sai chat [flags]` 逐行读取 stdin；空白行忽略，`/exit`、`/quit` 或 EOF 正常退出。
-- `sai chat` 会话开始时固定 provider/model/tools/MCP/skills/show-reasoning，复用
-  `sai run` 的配置选择规则和 flags：`--provider`、`--model`、`--show-reasoning`、
+- `sai chat [flags] [--quit] ["prompt"]` 逐行读取 stdin；空白行忽略，`/exit`、`/quit`
+  或 EOF 正常退出。
+- 有初始 prompt 时先执行完整一轮 agent loop；无 `--quit` 则继续进入 REPL，带
+  `--quit` 则完成后退出；`--quit` 无 prompt 为用法错误。
+- `sai chat` 会话开始时固定 provider/model/tools/MCP/skills/show-reasoning，使用
+  同一套配置选择规则和 flags：`--provider`、`--model`、`--show-reasoning`、
   `--verbose`、`--enable-tools`、`--enable-skills`、`--disable-skills`、`--enable-mcp`。
+- 参数解析使用统一混排规则：跳过已知 flag 及其 value 后的第一个非 flag token 是命令；
+  命令前后 flags 可混排，`--config-dir` 可放在命令后，`--` 后的 token 全部作为
+  positional。
 - 每轮模型输出继续 streaming 到 stdout；prompt 写到 stderr；chat 成功轮次在输出末尾
-  缺少换行时补一个换行，不改变 `sai run` 输出语义。
+  缺少换行时补一个换行，避免下一个 REPL prompt 和模型输出粘在一起。
 - 会话历史只保存在当前进程内；不落盘 chat history；JSONL 日志继续不记录完整
   prompt、response 或 tool result 正文。
 - MCP stdio server 在 chat 会话开始时启动，并在退出时关闭。
@@ -304,8 +312,9 @@ M7 当前实现只覆盖配置目录下的本地 skills：通过 `skills.enabled
 - Agent 单元测试覆盖无工具单轮追加 assistant final message。
 - Agent 单元测试覆盖 tool call 后 result messages 包含 assistant tool call、tool result
   和最终 assistant text。
-- CLI 单元测试覆盖 chat help 不加载配置、`/exit` 正常退出、两轮 history、tool call
-  history、prompt 写 stderr 和错误参数 help hint。
+- CLI 单元测试覆盖 chat help 不加载配置、`/exit` 正常退出、初始 prompt + `--quit`、
+  初始 prompt 后继续 REPL、两轮 history、tool call history、prompt 写 stderr 和错误参数
+  help hint。
 - `gofmt -w internal/agent/agent.go internal/agent/agent_test.go internal/cli/cli.go internal/cli/cli_test.go` 通过。
 - `go test ./...` 通过。
 - `git diff --check` 通过。

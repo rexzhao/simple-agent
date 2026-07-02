@@ -53,6 +53,46 @@ models:
 	}
 }
 
+func TestModelsListAcceptsConfigDirAfterCommand(t *testing.T) {
+	dir := writeCLIFixture(t)
+
+	for _, args := range [][]string{
+		{"models", "list", "--config-dir", dir},
+		{"models", "--config-dir", dir, "list"},
+	} {
+		t.Run(strings.Join(args, " "), func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			code := RunWithGetwd(args, &stdout, &stderr, func() (string, error) {
+				return "", errors.New("getwd should not be called")
+			})
+
+			if code != 0 {
+				t.Fatalf("RunWithGetwd() code = %d, stderr = %s", code, stderr.String())
+			}
+			if !strings.Contains(stdout.String(), "paperhub\tglm-5.2\tglm-5.2") {
+				t.Fatalf("models list output = %s", stdout.String())
+			}
+		})
+	}
+}
+
+func TestModelsListMixedHelpDoesNotLoadConfig(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	code := RunWithGetwd([]string{"--config-dir", filepath.Join(t.TempDir(), "missing"), "models", "-h", "list"}, &stdout, &stderr, func() (string, error) {
+		return "", errors.New("getwd should not be called")
+	})
+
+	if code != 0 {
+		t.Fatalf("RunWithGetwd() code = %d, stderr = %s", code, stderr.String())
+	}
+	if stderr.String() != "" {
+		t.Fatalf("stderr = %q, want empty", stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "usage: sai models list") {
+		t.Fatalf("stdout = %q, want models list usage", stdout.String())
+	}
+}
+
 func TestModelsListDefaultsConfigDirToAgentsUnderCurrentWorkingDirectory(t *testing.T) {
 	projectDir := t.TempDir()
 	writeCLIFixtureInDir(t, filepath.Join(projectDir, ".agents"))
@@ -101,6 +141,7 @@ func TestToolsListWritesBuiltInToolsWithoutConfig(t *testing.T) {
 	for _, args := range [][]string{
 		{"tools", "list"},
 		{"tools", "list", "-h"},
+		{"tools", "list", "extra", "-h", "--bad"},
 		{"help", "tools", "list"},
 	} {
 		t.Run(strings.Join(args, " "), func(t *testing.T) {
@@ -128,6 +169,39 @@ func TestToolsListWritesBuiltInToolsWithoutConfig(t *testing.T) {
 	}
 }
 
+func TestToolsListUnknownFlagAfterExtraArgIncludesHelpHint(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	code := RunWithGetwd([]string{"tools", "list", "extra", "--bad"}, &stdout, &stderr, func() (string, error) {
+		return "", errors.New("getwd should not be called")
+	})
+
+	if code != 1 {
+		t.Fatalf("RunWithGetwd() code = %d, want 1", code)
+	}
+	if stdout.String() != "" {
+		t.Fatalf("stdout = %q, want empty", stdout.String())
+	}
+	assertCLIErrorContains(t, stderr.String(), "flag provided but not defined", `Run "sai help tools list" for usage.`)
+}
+
+func TestToolsListDelimiterTreatsDashArgAsExtraPositional(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	code := RunWithGetwd([]string{"tools", "list", "--", "--bad"}, &stdout, &stderr, func() (string, error) {
+		return "", errors.New("getwd should not be called")
+	})
+
+	if code != 1 {
+		t.Fatalf("RunWithGetwd() code = %d, want 1", code)
+	}
+	if stdout.String() != "" {
+		t.Fatalf("stdout = %q, want empty", stdout.String())
+	}
+	assertCLIErrorContains(t, stderr.String(), "usage: sai tools list", `Run "sai help tools list" for usage.`)
+	if strings.Contains(stderr.String(), "flag provided but not defined") {
+		t.Fatalf("stderr treated delimiter positional as flag: %s", stderr.String())
+	}
+}
+
 func TestMCPListEnableMCPOverridesConfiguredEnabledState(t *testing.T) {
 	dir := writeCLIFixture(t)
 	writeCLIMCPFixture(t, dir)
@@ -152,6 +226,51 @@ func TestMCPListEnableMCPOverridesConfiguredEnabledState(t *testing.T) {
 	if strings.Contains(out, "COMMAND") || strings.Contains(out, "example-mcp-server") || strings.Contains(out, "remote-mcp-server") {
 		t.Fatalf("mcp list override output included command details:\n%s", out)
 	}
+}
+
+func TestMCPListAcceptsConfigDirAfterCommandAndEnableMCP(t *testing.T) {
+	dir := writeCLIFixture(t)
+	writeCLIMCPFixture(t, dir)
+
+	for _, args := range [][]string{
+		{"mcp", "list", "--enable-mcp", "remote", "--config-dir", dir},
+		{"mcp", "--enable-mcp", "remote", "--config-dir", dir, "list"},
+	} {
+		t.Run(strings.Join(args, " "), func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			code := RunWithGetwd(args, &stdout, &stderr, func() (string, error) {
+				return "", errors.New("getwd should not be called")
+			})
+
+			if code != 0 {
+				t.Fatalf("RunWithGetwd() code = %d, stderr = %s", code, stderr.String())
+			}
+			out := stdout.String()
+			for _, want := range []string{
+				"local\tfalse",
+				"remote\ttrue",
+			} {
+				if !strings.Contains(out, want) {
+					t.Fatalf("mcp list output missing %q:\n%s", want, out)
+				}
+			}
+		})
+	}
+}
+
+func TestMCPListMixedFlagWithExtraArgIsUsageError(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	code := RunWithGetwd([]string{"mcp", "list", "remote", "--enable-mcp", "local"}, &stdout, &stderr, func() (string, error) {
+		return "", errors.New("getwd should not be called")
+	})
+
+	if code != 1 {
+		t.Fatalf("RunWithGetwd() code = %d, want 1", code)
+	}
+	if stdout.String() != "" {
+		t.Fatalf("stdout = %q, want empty", stdout.String())
+	}
+	assertCLIErrorContains(t, stderr.String(), "usage: sai mcp list", `Run "sai help mcp list" for usage.`)
 }
 
 func TestMCPListRejectsUnknownEnableMCPServer(t *testing.T) {
@@ -201,6 +320,46 @@ func TestConfigShowDoesNotPrintAPIKeyValue(t *testing.T) {
 	}
 }
 
+func TestConfigShowAcceptsConfigDirAfterCommand(t *testing.T) {
+	dir := writeCLIFixture(t)
+
+	for _, args := range [][]string{
+		{"config", "show", "--config-dir", dir},
+		{"config", "--config-dir", dir, "show"},
+	} {
+		t.Run(strings.Join(args, " "), func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			code := RunWithGetwd(args, &stdout, &stderr, func() (string, error) {
+				return "", errors.New("getwd should not be called")
+			})
+
+			if code != 0 {
+				t.Fatalf("RunWithGetwd() code = %d, stderr = %s", code, stderr.String())
+			}
+			if !strings.Contains(stdout.String(), `"ConfigDir":`) && !strings.Contains(stdout.String(), `"config_dir":`) {
+				t.Fatalf("config show output = %s", stdout.String())
+			}
+		})
+	}
+}
+
+func TestConfigShowMixedHelpDoesNotLoadConfig(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	code := RunWithGetwd([]string{"config", "show", "--config-dir", filepath.Join(t.TempDir(), "missing"), "-h"}, &stdout, &stderr, func() (string, error) {
+		return "", errors.New("getwd should not be called")
+	})
+
+	if code != 0 {
+		t.Fatalf("RunWithGetwd() code = %d, stderr = %s", code, stderr.String())
+	}
+	if stderr.String() != "" {
+		t.Fatalf("stderr = %q, want empty", stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "usage: sai config show") {
+		t.Fatalf("stdout = %q, want config show usage", stdout.String())
+	}
+}
+
 func TestVersionCommand(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	code := RunWithGetwd([]string{"version"}, &stdout, &stderr, func() (string, error) {
@@ -221,18 +380,54 @@ func TestRootHelpWritesUsageWithoutConfig(t *testing.T) {
 		{"help"},
 	} {
 		t.Run(strings.Join(args, " "), func(t *testing.T) {
-			assertCLIHelpWithoutConfig(t, args, "usage: sai", "run \"prompt\"", "chat", "config show", "models list", "tools list", "Run \"sai help <command>\" for command usage.")
+			var stdout, stderr bytes.Buffer
+			code := RunWithGetwd(args, &stdout, &stderr, func() (string, error) {
+				return "", errors.New("getwd should not be called")
+			})
+			if code != 0 {
+				t.Fatalf("RunWithGetwd(%v) code = %d, stderr = %s", args, code, stderr.String())
+			}
+			out := stdout.String()
+			for _, want := range []string{"usage: sai", `chat ["prompt"]`, "config show", "models list", "tools list", `Run "sai help <command>" for command usage.`} {
+				if !strings.Contains(out, want) {
+					t.Fatalf("stdout = %q, want contain %q", out, want)
+				}
+			}
+			if strings.Contains(out, `run "prompt"`) || strings.Contains(out, "sai run") {
+				t.Fatalf("root help still lists run:\n%s", out)
+			}
+			if stderr.String() != "" {
+				t.Fatalf("stderr = %q, want empty", stderr.String())
+			}
 		})
 	}
 }
 
-func TestRunHelpWritesUsageWithoutConfig(t *testing.T) {
-	for _, args := range [][]string{
-		{"run", "-h"},
-		{"help", "run"},
-	} {
-		t.Run(strings.Join(args, " "), func(t *testing.T) {
-			assertCLIHelpWithoutConfig(t, args, "usage: sai run", "--provider name", "--enable-tools names")
+func TestRunHelpIsUnsupportedWithoutConfig(t *testing.T) {
+	tests := []struct {
+		args []string
+		want string
+	}{
+		{args: []string{"run", "-h"}, want: `unknown command "run"`},
+		{args: []string{"help", "run"}, want: `unknown help topic "run"`},
+	}
+
+	for _, tt := range tests {
+		t.Run(strings.Join(tt.args, " "), func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			code := RunWithGetwd(tt.args, &stdout, &stderr, func() (string, error) {
+				return "", errors.New("getwd should not be called")
+			})
+			if code != 1 {
+				t.Fatalf("RunWithGetwd(%v) code = %d, want 1", tt.args, code)
+			}
+			if stdout.String() != "" {
+				t.Fatalf("stdout = %q, want empty", stdout.String())
+			}
+			assertCLIErrorContains(t, stderr.String(), tt.want, `Run "sai help" for usage.`)
+			if strings.Contains(stderr.String(), "usage: sai run") {
+				t.Fatalf("stderr included run usage: %s", stderr.String())
+			}
 		})
 	}
 }
@@ -244,7 +439,7 @@ func TestChatHelpWritesUsageWithoutConfig(t *testing.T) {
 		{"help", "chat"},
 	} {
 		t.Run(strings.Join(args, " "), func(t *testing.T) {
-			assertCLIHelpWithoutConfig(t, args, "usage: sai chat", "--provider name", "--enable-tools names")
+			assertCLIHelpWithoutConfig(t, args, "usage: sai chat", `[--quit] ["prompt"]`, "--provider name", "--enable-tools names")
 		})
 	}
 }
@@ -406,9 +601,9 @@ func TestUnknownCommandIncludesHelpHint(t *testing.T) {
 	assertCLIErrorContains(t, stderr.String(), `unknown command "nope"`, `Run "sai help" for usage.`)
 }
 
-func TestRunMissingPromptIncludesUsageHint(t *testing.T) {
+func TestUnknownRootFlagBeforeCommandIncludesHelpHint(t *testing.T) {
 	var stdout, stderr bytes.Buffer
-	code := RunWithGetwd([]string{"run"}, &stdout, &stderr, func() (string, error) {
+	code := RunWithGetwd([]string{"--bad", "chat"}, &stdout, &stderr, func() (string, error) {
 		return "", errors.New("getwd should not be called")
 	})
 
@@ -418,7 +613,25 @@ func TestRunMissingPromptIncludesUsageHint(t *testing.T) {
 	if stdout.String() != "" {
 		t.Fatalf("stdout = %q, want empty", stdout.String())
 	}
-	assertCLIErrorContains(t, stderr.String(), "missing prompt", "usage: sai run", `Run "sai help run" for usage.`)
+	assertCLIErrorContains(t, stderr.String(), "flag provided but not defined", `Run "sai help" for usage.`)
+}
+
+func TestRunCommandIsUnsupported(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	code := RunWithGetwd([]string{"run", "Say hi"}, &stdout, &stderr, func() (string, error) {
+		return "", errors.New("getwd should not be called")
+	})
+
+	if code != 1 {
+		t.Fatalf("RunWithGetwd() code = %d, want 1", code)
+	}
+	if stdout.String() != "" {
+		t.Fatalf("stdout = %q, want empty", stdout.String())
+	}
+	assertCLIErrorContains(t, stderr.String(), `unknown command "run"`, `Run "sai help" for usage.`)
+	if strings.Contains(stderr.String(), "usage: sai run") {
+		t.Fatalf("stderr included run usage: %s", stderr.String())
+	}
 }
 
 func TestChatUnknownFlagIncludesHelpHint(t *testing.T) {
@@ -434,6 +647,38 @@ func TestChatUnknownFlagIncludesHelpHint(t *testing.T) {
 		t.Fatalf("stdout = %q, want empty", stdout.String())
 	}
 	assertCLIErrorContains(t, stderr.String(), "flag provided but not defined", `Run "sai help chat" for usage.`)
+}
+
+func TestChatMixedHelpDoesNotLoadConfig(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	code := RunWithIO([]string{"chat", "ignored", "-h", "--config-dir", filepath.Join(t.TempDir(), "missing")}, strings.NewReader(""), &stdout, &stderr, func() (string, error) {
+		return "", errors.New("getwd should not be called")
+	})
+
+	if code != 0 {
+		t.Fatalf("RunWithIO() code = %d, stderr = %s", code, stderr.String())
+	}
+	if stderr.String() != "" {
+		t.Fatalf("stderr = %q, want empty", stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "usage: sai chat") {
+		t.Fatalf("stdout = %q, want chat usage", stdout.String())
+	}
+}
+
+func TestChatQuitWithoutPromptIsUsageError(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	code := RunWithIO([]string{"chat", "--quit"}, strings.NewReader(""), &stdout, &stderr, func() (string, error) {
+		return "", errors.New("getwd should not be called")
+	})
+
+	if code != 1 {
+		t.Fatalf("RunWithIO() code = %d, want 1", code)
+	}
+	if stdout.String() != "" {
+		t.Fatalf("stdout = %q, want empty", stdout.String())
+	}
+	assertCLIErrorContains(t, stderr.String(), "--quit requires an initial prompt", "usage: sai chat", `Run "sai help chat" for usage.`)
 }
 
 func TestChatExitReturnsWithoutModelRequest(t *testing.T) {
@@ -463,6 +708,342 @@ func TestChatExitReturnsWithoutModelRequest(t *testing.T) {
 	if logPaths := sessionLogPaths(t, configDir); len(logPaths) != 0 {
 		t.Fatalf("session log paths = %#v, want none", logPaths)
 	}
+	assertNoAdditionalCLIRunRequest(t, requests)
+}
+
+func TestChatInitialPromptWithQuitRunsOneTurnAndExits(t *testing.T) {
+	server, requests := newCLIRunServer(t,
+		`{"choices":[{"delta":{"content":"one"}}]}`,
+		`[DONE]`,
+	)
+	defer server.Close()
+
+	configDir := t.TempDir()
+	writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
+
+	var stdout, stderr bytes.Buffer
+	code := RunWithIO([]string{"--config-dir", configDir, "chat", "--quit", "first"}, strings.NewReader("second\n"), &stdout, &stderr, func() (string, error) {
+		return t.TempDir(), nil
+	})
+
+	if code != 0 {
+		t.Fatalf("RunWithIO() code = %d, stderr = %s", code, stderr.String())
+	}
+	if got, want := stdout.String(), "one"; got != want {
+		t.Fatalf("stdout = %q, want %q", got, want)
+	}
+	if stderr.String() != "" {
+		t.Fatalf("stderr = %q, want empty", stderr.String())
+	}
+	request := <-requests
+	messages := requestMessages(t, request.Body)
+	assertMessage(t, messages, 0, "system", builtInBaseInstructions)
+	assertMessage(t, messages, 1, "user", "first")
+	assertNoAdditionalCLIRunRequest(t, requests)
+}
+
+func TestChatAcceptsConfigDirAfterCommand(t *testing.T) {
+	server, requests := newCLIRunServer(t,
+		`{"choices":[{"delta":{"content":"one"}}]}`,
+		`[DONE]`,
+	)
+	defer server.Close()
+
+	configDir := t.TempDir()
+	writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
+
+	var stdout, stderr bytes.Buffer
+	code := RunWithIO([]string{"chat", "--config-dir", configDir, "--quit", "first"}, strings.NewReader(""), &stdout, &stderr, func() (string, error) {
+		return t.TempDir(), nil
+	})
+
+	if code != 0 {
+		t.Fatalf("RunWithIO() code = %d, stderr = %s", code, stderr.String())
+	}
+	if got, want := stdout.String(), "one"; got != want {
+		t.Fatalf("stdout = %q, want %q", got, want)
+	}
+	assertMessage(t, requestMessages(t, (<-requests).Body), 1, "user", "first")
+	assertNoAdditionalCLIRunRequest(t, requests)
+}
+
+func TestChatDelimiterTreatsHelpAsPrompt(t *testing.T) {
+	server, requests := newCLIRunServer(t,
+		`{"choices":[{"delta":{"content":"one"}}]}`,
+		`[DONE]`,
+	)
+	defer server.Close()
+
+	projectDir := t.TempDir()
+	configDir := filepath.Join(projectDir, ".agents")
+	writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
+
+	var stdout, stderr bytes.Buffer
+	code := RunWithIO([]string{"chat", "--quit", "--", "--help"}, strings.NewReader(""), &stdout, &stderr, func() (string, error) {
+		return projectDir, nil
+	})
+
+	if code != 0 {
+		t.Fatalf("RunWithIO() code = %d, stderr = %s", code, stderr.String())
+	}
+	if got, want := stdout.String(), "one"; got != want {
+		t.Fatalf("stdout = %q, want %q", got, want)
+	}
+	assertMessage(t, requestMessages(t, (<-requests).Body), 1, "user", "--help")
+	assertNoAdditionalCLIRunRequest(t, requests)
+}
+
+func TestChatDelimiterAfterConfigDirTreatsHelpAsPrompt(t *testing.T) {
+	server, requests := newCLIRunServer(t,
+		`{"choices":[{"delta":{"content":"one"}}]}`,
+		`[DONE]`,
+	)
+	defer server.Close()
+
+	configDir := t.TempDir()
+	writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
+
+	var stdout, stderr bytes.Buffer
+	code := RunWithIO([]string{"chat", "--config-dir", configDir, "--quit", "--", "--help"}, strings.NewReader(""), &stdout, &stderr, func() (string, error) {
+		return t.TempDir(), nil
+	})
+
+	if code != 0 {
+		t.Fatalf("RunWithIO() code = %d, stderr = %s", code, stderr.String())
+	}
+	if got, want := stdout.String(), "one"; got != want {
+		t.Fatalf("stdout = %q, want %q", got, want)
+	}
+	assertMessage(t, requestMessages(t, (<-requests).Body), 1, "user", "--help")
+	assertNoAdditionalCLIRunRequest(t, requests)
+}
+
+func TestChatDelimiterTreatsConfigDirAsPrompt(t *testing.T) {
+	server, requests := newCLIRunServer(t,
+		`{"choices":[{"delta":{"content":"one"}}]}`,
+		`[DONE]`,
+	)
+	defer server.Close()
+
+	configDir := t.TempDir()
+	writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
+
+	var stdout, stderr bytes.Buffer
+	code := RunWithIO([]string{"chat", "--config-dir", configDir, "--quit", "--", "--config-dir"}, strings.NewReader(""), &stdout, &stderr, func() (string, error) {
+		return t.TempDir(), nil
+	})
+
+	if code != 0 {
+		t.Fatalf("RunWithIO() code = %d, stderr = %s", code, stderr.String())
+	}
+	if got, want := stdout.String(), "one"; got != want {
+		t.Fatalf("stdout = %q, want %q", got, want)
+	}
+	assertMessage(t, requestMessages(t, (<-requests).Body), 1, "user", "--config-dir")
+	assertNoAdditionalCLIRunRequest(t, requests)
+}
+
+func TestChatInitialPromptAllowsQuitAfterPrompt(t *testing.T) {
+	server, requests := newCLIRunServer(t,
+		`{"choices":[{"delta":{"content":"one"}}]}`,
+		`[DONE]`,
+	)
+	defer server.Close()
+
+	configDir := t.TempDir()
+	writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
+
+	var stdout, stderr bytes.Buffer
+	code := RunWithIO([]string{"--config-dir", configDir, "chat", "first", "--quit"}, strings.NewReader("second\n"), &stdout, &stderr, func() (string, error) {
+		return t.TempDir(), nil
+	})
+
+	if code != 0 {
+		t.Fatalf("RunWithIO() code = %d, stderr = %s", code, stderr.String())
+	}
+	if got, want := stdout.String(), "one"; got != want {
+		t.Fatalf("stdout = %q, want %q", got, want)
+	}
+	if stderr.String() != "" {
+		t.Fatalf("stderr = %q, want empty", stderr.String())
+	}
+	messages := requestMessages(t, (<-requests).Body)
+	assertMessage(t, messages, 0, "system", builtInBaseInstructions)
+	assertMessage(t, messages, 1, "user", "first")
+	assertNoAdditionalCLIRunRequest(t, requests)
+}
+
+func TestChatInitialPromptAllowsModelFlagAfterPrompt(t *testing.T) {
+	server, requests := newCLIRunServer(t,
+		`{"choices":[{"delta":{"content":"ok"}}]}`,
+		`[DONE]`,
+	)
+	defer server.Close()
+
+	configDir := t.TempDir()
+	writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
+
+	var stdout, stderr bytes.Buffer
+	code := RunWithIO([]string{"--config-dir", configDir, "chat", "first", "--model", "fast", "--quit"}, strings.NewReader(""), &stdout, &stderr, func() (string, error) {
+		return t.TempDir(), nil
+	})
+
+	if code != 0 {
+		t.Fatalf("RunWithIO() code = %d, stderr = %s", code, stderr.String())
+	}
+	request := <-requests
+	if got := request.Body["model"]; got != "model-fast" {
+		t.Fatalf("model = %#v, want model-fast", got)
+	}
+	assertMessage(t, requestMessages(t, request.Body), 1, "user", "first")
+	assertNoAdditionalCLIRunRequest(t, requests)
+}
+
+func TestChatAllowsModelFlagBeforeCommand(t *testing.T) {
+	server, requests := newCLIRunServer(t,
+		`{"choices":[{"delta":{"content":"ok"}}]}`,
+		`[DONE]`,
+	)
+	defer server.Close()
+
+	configDir := t.TempDir()
+	writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
+
+	var stdout, stderr bytes.Buffer
+	code := RunWithIO([]string{"--model", "fast", "chat", "--config-dir", configDir, "first", "--quit"}, strings.NewReader(""), &stdout, &stderr, func() (string, error) {
+		return t.TempDir(), nil
+	})
+
+	if code != 0 {
+		t.Fatalf("RunWithIO() code = %d, stderr = %s", code, stderr.String())
+	}
+	request := <-requests
+	if got := request.Body["model"]; got != "model-fast" {
+		t.Fatalf("model = %#v, want model-fast", got)
+	}
+	assertMessage(t, requestMessages(t, request.Body), 1, "user", "first")
+	assertNoAdditionalCLIRunRequest(t, requests)
+}
+
+func TestChatInitialPromptAllowsEnableToolsFlagAfterPrompt(t *testing.T) {
+	server, requests := newCLIRunServer(t,
+		`{"choices":[{"delta":{"content":"ok"}}]}`,
+		`[DONE]`,
+	)
+	defer server.Close()
+
+	configDir := t.TempDir()
+	writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
+
+	var stdout, stderr bytes.Buffer
+	code := RunWithIO([]string{"--config-dir", configDir, "chat", "first", "--enable-tools", "read_file", "--quit"}, strings.NewReader(""), &stdout, &stderr, func() (string, error) {
+		return t.TempDir(), nil
+	})
+
+	if code != 0 {
+		t.Fatalf("RunWithIO() code = %d, stderr = %s", code, stderr.String())
+	}
+	assertCLIToolNames(t, (<-requests).Body, []string{"read_file"})
+	assertNoAdditionalCLIRunRequest(t, requests)
+}
+
+func TestChatAllowsEnableToolsFlagBeforeCommand(t *testing.T) {
+	server, requests := newCLIRunServer(t,
+		`{"choices":[{"delta":{"content":"ok"}}]}`,
+		`[DONE]`,
+	)
+	defer server.Close()
+
+	configDir := t.TempDir()
+	writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
+
+	var stdout, stderr bytes.Buffer
+	code := RunWithIO([]string{"--enable-tools", "read_file", "chat", "--config-dir", configDir, "first", "--quit"}, strings.NewReader(""), &stdout, &stderr, func() (string, error) {
+		return t.TempDir(), nil
+	})
+
+	if code != 0 {
+		t.Fatalf("RunWithIO() code = %d, stderr = %s", code, stderr.String())
+	}
+	assertCLIToolNames(t, (<-requests).Body, []string{"read_file"})
+	assertNoAdditionalCLIRunRequest(t, requests)
+}
+
+func TestChatInterspersedArgsRejectMultiplePrompts(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	code := RunWithIO([]string{"chat", "first", "--quit", "second"}, strings.NewReader(""), &stdout, &stderr, func() (string, error) {
+		return "", errors.New("getwd should not be called")
+	})
+
+	if code != 1 {
+		t.Fatalf("RunWithIO() code = %d, want 1", code)
+	}
+	if stdout.String() != "" {
+		t.Fatalf("stdout = %q, want empty", stdout.String())
+	}
+	assertCLIErrorContains(t, stderr.String(), "expected at most one prompt", "usage: sai chat", `Run "sai help chat" for usage.`)
+}
+
+func TestChatUnknownFlagAfterPromptIncludesHelpHint(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	code := RunWithIO([]string{"chat", "first", "--bad"}, strings.NewReader(""), &stdout, &stderr, func() (string, error) {
+		return "", errors.New("getwd should not be called")
+	})
+
+	if code != 1 {
+		t.Fatalf("RunWithIO() code = %d, want 1", code)
+	}
+	if stdout.String() != "" {
+		t.Fatalf("stdout = %q, want empty", stdout.String())
+	}
+	assertCLIErrorContains(t, stderr.String(), "flag provided but not defined", `Run "sai help chat" for usage.`)
+}
+
+func TestChatInitialPromptContinuesIntoREPLWithHistory(t *testing.T) {
+	server, requests := newSequentialCLIRunServer(t,
+		[]string{
+			`{"choices":[{"delta":{"content":"one"}}]}`,
+			`[DONE]`,
+		},
+		[]string{
+			`{"choices":[{"delta":{"content":"two"}}]}`,
+			`[DONE]`,
+		},
+	)
+	defer server.Close()
+
+	configDir := t.TempDir()
+	writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
+
+	var stdout, stderr bytes.Buffer
+	code := RunWithIO([]string{"--config-dir", configDir, "chat", "first"}, strings.NewReader("second\n/quit\n"), &stdout, &stderr, func() (string, error) {
+		return t.TempDir(), nil
+	})
+
+	if code != 0 {
+		t.Fatalf("RunWithIO() code = %d, stderr = %s", code, stderr.String())
+	}
+	if got, want := stdout.String(), "one\ntwo\n"; got != want {
+		t.Fatalf("stdout = %q, want %q", got, want)
+	}
+	if got, want := stderr.String(), "> > "; got != want {
+		t.Fatalf("stderr = %q, want %q", got, want)
+	}
+
+	firstRequest := <-requests
+	firstMessages := requestMessages(t, firstRequest.Body)
+	assertMessage(t, firstMessages, 0, "system", builtInBaseInstructions)
+	assertMessage(t, firstMessages, 1, "user", "first")
+
+	secondRequest := <-requests
+	secondMessages := requestMessages(t, secondRequest.Body)
+	if len(secondMessages) != 4 {
+		t.Fatalf("len(second request messages) = %d, want 4: %#v", len(secondMessages), secondMessages)
+	}
+	assertMessage(t, secondMessages, 0, "system", builtInBaseInstructions)
+	assertMessage(t, secondMessages, 1, "user", "first")
+	assertMessage(t, secondMessages, 2, "assistant", "one")
+	assertMessage(t, secondMessages, 3, "user", "second")
 	assertNoAdditionalCLIRunRequest(t, requests)
 }
 
@@ -598,7 +1179,7 @@ func TestRunUsesDefaultProviderModelAndOutputsTextDelta(t *testing.T) {
 	t.Setenv("SAI_TEST_API_KEY", "env-secret-value")
 
 	var stdout, stderr bytes.Buffer
-	code := RunWithGetwd([]string{"--config-dir", configDir, "run", "Say hi"}, &stdout, &stderr, func() (string, error) {
+	code := RunWithGetwd([]string{"--config-dir", configDir, "chat", "--quit", "Say hi"}, &stdout, &stderr, func() (string, error) {
 		return t.TempDir(), nil
 	})
 
@@ -641,7 +1222,7 @@ func TestRunOpenAIResponsesProviderOutputsTextDelta(t *testing.T) {
 	writeCLIRunFixtureInDir(t, configDir, server.URL, "responses-secret-value", "openai-responses")
 
 	var stdout, stderr bytes.Buffer
-	code := RunWithGetwd([]string{"--config-dir", configDir, "run", "Say hi"}, &stdout, &stderr, func() (string, error) {
+	code := RunWithGetwd([]string{"--config-dir", configDir, "chat", "--quit", "Say hi"}, &stdout, &stderr, func() (string, error) {
 		return t.TempDir(), nil
 	})
 
@@ -700,7 +1281,7 @@ func TestRunOpenAIResponsesExecutesFunctionCallAndContinuesToFinalText(t *testin
 	writeCLIRunFixtureInDir(t, configDir, server.URL, "responses-secret-value", "openai-responses")
 
 	var stdout, stderr bytes.Buffer
-	code := RunWithGetwd([]string{"--config-dir", configDir, "run", "--enable-tools", "read_file", "Read note"}, &stdout, &stderr, func() (string, error) {
+	code := RunWithGetwd([]string{"--config-dir", configDir, "chat", "--quit", "--enable-tools", "read_file", "Read note"}, &stdout, &stderr, func() (string, error) {
 		return projectDir, nil
 	})
 
@@ -745,7 +1326,7 @@ func TestRunAnthropicMessagesProviderOutputsTextDelta(t *testing.T) {
 	writeCLIRunFixtureInDir(t, configDir, server.URL, "anthropic-secret-value", "anthropic-messages")
 
 	var stdout, stderr bytes.Buffer
-	code := RunWithGetwd([]string{"--config-dir", configDir, "run", "Say hi"}, &stdout, &stderr, func() (string, error) {
+	code := RunWithGetwd([]string{"--config-dir", configDir, "chat", "--quit", "Say hi"}, &stdout, &stderr, func() (string, error) {
 		return t.TempDir(), nil
 	})
 
@@ -810,7 +1391,7 @@ func TestRunAnthropicMessagesProviderExecutesToolUseAndReturnsToolResult(t *test
 	writeCLIRunFixtureInDir(t, configDir, server.URL, "anthropic-secret-value", "anthropic-messages")
 
 	var stdout, stderr bytes.Buffer
-	code := RunWithGetwd([]string{"--config-dir", configDir, "run", "--enable-tools", "read_file", "Read note"}, &stdout, &stderr, func() (string, error) {
+	code := RunWithGetwd([]string{"--config-dir", configDir, "chat", "--quit", "--enable-tools", "read_file", "Read note"}, &stdout, &stderr, func() (string, error) {
 		return projectDir, nil
 	})
 
@@ -853,7 +1434,7 @@ func TestRunExplicitProviderModelSelectsProfileParameters(t *testing.T) {
 	writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
 
 	var stdout, stderr bytes.Buffer
-	code := RunWithGetwd([]string{"--config-dir", configDir, "run", "--provider", "fake", "--model", "fast", "Use fast"}, &stdout, &stderr, func() (string, error) {
+	code := RunWithGetwd([]string{"--config-dir", configDir, "chat", "--quit", "--provider", "fake", "--model", "fast", "Use fast"}, &stdout, &stderr, func() (string, error) {
 		return t.TempDir(), nil
 	})
 
@@ -887,7 +1468,7 @@ func TestRunUsesConfiguredEnabledTools(t *testing.T) {
 	writeCLIRunFixtureInDirWithTools(t, configDir, server.URL, "direct-secret-value", "openai-chat", []string{"read_file", "shell"})
 
 	var stdout, stderr bytes.Buffer
-	code := RunWithGetwd([]string{"--config-dir", configDir, "run", "Use configured tools"}, &stdout, &stderr, func() (string, error) {
+	code := RunWithGetwd([]string{"--config-dir", configDir, "chat", "--quit", "Use configured tools"}, &stdout, &stderr, func() (string, error) {
 		return t.TempDir(), nil
 	})
 
@@ -908,7 +1489,7 @@ func TestRunEnableToolsOverridesConfiguredTools(t *testing.T) {
 	writeCLIRunFixtureInDirWithTools(t, configDir, server.URL, "direct-secret-value", "openai-chat", []string{"read_file", "shell"})
 
 	var stdout, stderr bytes.Buffer
-	code := RunWithGetwd([]string{"--config-dir", configDir, "run", "--enable-tools", "list_files,read_file", "Use CLI tools"}, &stdout, &stderr, func() (string, error) {
+	code := RunWithGetwd([]string{"--config-dir", configDir, "chat", "--quit", "--enable-tools", "list_files,read_file", "Use CLI tools"}, &stdout, &stderr, func() (string, error) {
 		return t.TempDir(), nil
 	})
 
@@ -935,7 +1516,7 @@ func TestRunUsesConfiguredEnabledSkillsInMessageOrder(t *testing.T) {
 	writeCLIFile(t, filepath.Join(projectDir, "AGENTS.md"), "Project instructions\n")
 
 	var stdout, stderr bytes.Buffer
-	code := RunWithGetwd([]string{"--config-dir", configDir, "run", "Use configured skills"}, &stdout, &stderr, func() (string, error) {
+	code := RunWithGetwd([]string{"--config-dir", configDir, "chat", "--quit", "Use configured skills"}, &stdout, &stderr, func() (string, error) {
 		return projectDir, nil
 	})
 
@@ -971,7 +1552,7 @@ func TestRunEnableSkillsOverridesConfiguredSkills(t *testing.T) {
 	writeCLISkill(t, configDir, "beta", "Beta CLI instructions\n")
 
 	var stdout, stderr bytes.Buffer
-	code := RunWithGetwd([]string{"--config-dir", configDir, "run", "--enable-skills", "beta", "Use CLI skills"}, &stdout, &stderr, func() (string, error) {
+	code := RunWithGetwd([]string{"--config-dir", configDir, "chat", "--quit", "--enable-skills", "beta", "Use CLI skills"}, &stdout, &stderr, func() (string, error) {
 		return t.TempDir(), nil
 	})
 
@@ -1001,7 +1582,7 @@ func TestRunConfiguredSkillIgnoresDisabledMalformedSkill(t *testing.T) {
 	writeCLISkill(t, configDir, "bad", "---\nname: [bad\n---\nBad instructions\n")
 
 	var stdout, stderr bytes.Buffer
-	code := RunWithGetwd([]string{"--config-dir", configDir, "run", "Use configured skill"}, &stdout, &stderr, func() (string, error) {
+	code := RunWithGetwd([]string{"--config-dir", configDir, "chat", "--quit", "Use configured skill"}, &stdout, &stderr, func() (string, error) {
 		return t.TempDir(), nil
 	})
 
@@ -1030,7 +1611,7 @@ func TestRunDisableSkillsSkipsConfiguredSkillLoading(t *testing.T) {
 	writeCLISkill(t, configDir, "bad", "---\nname: [bad\n---\nBad instructions\n")
 
 	var stdout, stderr bytes.Buffer
-	code := RunWithGetwd([]string{"--config-dir", configDir, "run", "--disable-skills", "Do not use skills"}, &stdout, &stderr, func() (string, error) {
+	code := RunWithGetwd([]string{"--config-dir", configDir, "chat", "--quit", "--disable-skills", "Do not use skills"}, &stdout, &stderr, func() (string, error) {
 		return t.TempDir(), nil
 	})
 
@@ -1053,7 +1634,7 @@ func TestRunEnableSkillsAndDisableSkillsConflict(t *testing.T) {
 	defer server.Close()
 
 	var stdout, stderr bytes.Buffer
-	code := RunWithGetwd([]string{"run", "--enable-skills", "alpha", "--disable-skills", "Use skills"}, &stdout, &stderr, func() (string, error) {
+	code := RunWithGetwd([]string{"chat", "--quit", "--enable-skills", "alpha", "--disable-skills", "Use skills"}, &stdout, &stderr, func() (string, error) {
 		return t.TempDir(), nil
 	})
 
@@ -1063,7 +1644,7 @@ func TestRunEnableSkillsAndDisableSkillsConflict(t *testing.T) {
 	if stdout.String() != "" {
 		t.Fatalf("stdout = %q, want empty", stdout.String())
 	}
-	assertCLIErrorContains(t, stderr.String(), "cannot use --enable-skills with --disable-skills", `Run "sai help run" for usage.`)
+	assertCLIErrorContains(t, stderr.String(), "cannot use --enable-skills with --disable-skills", `Run "sai help chat" for usage.`)
 	assertNoAdditionalCLIRunRequest(t, requests)
 }
 
@@ -1081,7 +1662,7 @@ func TestRunEnableSkillsRejectsUnknownSkill(t *testing.T) {
 	writeCLISkill(t, configDir, "bad", "---\nname: [bad\n---\nBad instructions\n")
 
 	var stdout, stderr bytes.Buffer
-	code := RunWithGetwd([]string{"--config-dir", configDir, "run", "--enable-skills", "missing", "Use skills"}, &stdout, &stderr, func() (string, error) {
+	code := RunWithGetwd([]string{"--config-dir", configDir, "chat", "--quit", "--enable-skills", "missing", "Use skills"}, &stdout, &stderr, func() (string, error) {
 		return t.TempDir(), nil
 	})
 
@@ -1107,7 +1688,7 @@ func TestRunEnableSkillsReportsMalformedFrontmatter(t *testing.T) {
 	writeCLISkill(t, configDir, "bad", "---\nname: [bad\n---\nBad instructions\n")
 
 	var stdout, stderr bytes.Buffer
-	code := RunWithGetwd([]string{"--config-dir", configDir, "run", "--enable-skills", "bad", "Use skills"}, &stdout, &stderr, func() (string, error) {
+	code := RunWithGetwd([]string{"--config-dir", configDir, "chat", "--quit", "--enable-skills", "bad", "Use skills"}, &stdout, &stderr, func() (string, error) {
 		return t.TempDir(), nil
 	})
 
@@ -1134,7 +1715,7 @@ func TestRunEnableMCPExposesOnlyEnabledMCPSchemas(t *testing.T) {
 	writeCLIRunMCPFixture(t, configDir, exitFile)
 
 	var stdout, stderr bytes.Buffer
-	code := RunWithGetwd([]string{"--config-dir", configDir, "run", "--enable-mcp", "local", "--enable-tools", "list_files,mcp.local.search", "Use mixed tools"}, &stdout, &stderr, func() (string, error) {
+	code := RunWithGetwd([]string{"--config-dir", configDir, "chat", "--quit", "--enable-mcp", "local", "--enable-tools", "list_files,mcp.local.search", "Use mixed tools"}, &stdout, &stderr, func() (string, error) {
 		return t.TempDir(), nil
 	})
 
@@ -1171,7 +1752,7 @@ func TestRunRoutesMCPToolCallAndReturnsResultToModel(t *testing.T) {
 	writeCLIRunMCPFixture(t, configDir, exitFile)
 
 	var stdout, stderr bytes.Buffer
-	code := RunWithGetwd([]string{"--config-dir", configDir, "run", "--enable-mcp", "local", "--enable-tools", "mcp.local.search", "Use MCP search"}, &stdout, &stderr, func() (string, error) {
+	code := RunWithGetwd([]string{"--config-dir", configDir, "chat", "--quit", "--enable-mcp", "local", "--enable-tools", "mcp.local.search", "Use MCP search"}, &stdout, &stderr, func() (string, error) {
 		return t.TempDir(), nil
 	})
 
@@ -1210,7 +1791,7 @@ func TestRunVerboseWritesDiagnosticsWithoutSensitiveContent(t *testing.T) {
 		writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
 
 		var stdout, stderr bytes.Buffer
-		code := RunWithGetwd([]string{"--config-dir", configDir, "run", "--verbose", "--enable-tools", "list_files,read_file", "user prompt secret"}, &stdout, &stderr, func() (string, error) {
+		code := RunWithGetwd([]string{"--config-dir", configDir, "chat", "--quit", "--verbose", "--enable-tools", "list_files,read_file", "user prompt secret"}, &stdout, &stderr, func() (string, error) {
 			return t.TempDir(), nil
 		})
 
@@ -1251,7 +1832,7 @@ func TestRunVerboseWritesDiagnosticsWithoutSensitiveContent(t *testing.T) {
 		t.Setenv("SAI_VERBOSE_API_KEY", "env-secret-value")
 
 		var stdout, stderr bytes.Buffer
-		code := RunWithGetwd([]string{"--config-dir", configDir, "run", "--verbose", "env user prompt secret"}, &stdout, &stderr, func() (string, error) {
+		code := RunWithGetwd([]string{"--config-dir", configDir, "chat", "--quit", "--verbose", "env user prompt secret"}, &stdout, &stderr, func() (string, error) {
 			return t.TempDir(), nil
 		})
 
@@ -1308,7 +1889,7 @@ func TestRunVerboseReportsFutureSessionLogPathBeforeFirstEvent(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	done := make(chan int, 1)
 	go func() {
-		done <- RunWithGetwd([]string{"--config-dir", configDir, "run", "--verbose", "hello"}, &stdout, &stderr, func() (string, error) {
+		done <- RunWithGetwd([]string{"--config-dir", configDir, "chat", "--quit", "--verbose", "hello"}, &stdout, &stderr, func() (string, error) {
 			return t.TempDir(), nil
 		})
 	}()
@@ -1371,7 +1952,7 @@ func TestRunExecutesToolCallAndContinuesToFinalText(t *testing.T) {
 	writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
 
 	var stdout, stderr bytes.Buffer
-	code := RunWithGetwd([]string{"--config-dir", configDir, "run", "--enable-tools", "read_file", "Read note"}, &stdout, &stderr, func() (string, error) {
+	code := RunWithGetwd([]string{"--config-dir", configDir, "chat", "--quit", "--enable-tools", "read_file", "Read note"}, &stdout, &stderr, func() (string, error) {
 		return projectDir, nil
 	})
 
@@ -1425,7 +2006,7 @@ func TestRunWritesJSONLLogForToolCallWithoutSensitiveContent(t *testing.T) {
 	writeCLIRunFixtureInDir(t, configDir, server.URL, "secret-api-key", "openai-chat")
 
 	var stdout, stderr bytes.Buffer
-	code := RunWithGetwd([]string{"--config-dir", configDir, "run", "--enable-tools", "read_file", "user prompt secret"}, &stdout, &stderr, func() (string, error) {
+	code := RunWithGetwd([]string{"--config-dir", configDir, "chat", "--quit", "--enable-tools", "read_file", "user prompt secret"}, &stdout, &stderr, func() (string, error) {
 		return projectDir, nil
 	})
 
@@ -1487,7 +2068,7 @@ func TestRunCreatesSeparateSessionLogs(t *testing.T) {
 
 	for _, prompt := range []string{"first", "second"} {
 		var stdout, stderr bytes.Buffer
-		code := RunWithGetwd([]string{"--config-dir", configDir, "run", prompt}, &stdout, &stderr, func() (string, error) {
+		code := RunWithGetwd([]string{"--config-dir", configDir, "chat", "--quit", prompt}, &stdout, &stderr, func() (string, error) {
 			return t.TempDir(), nil
 		})
 		if code != 0 {
@@ -1533,7 +2114,7 @@ func TestRunWithLoggingDisabledDoesNotCreateSessionLog(t *testing.T) {
 	setCLILoggingPath(t, configDir, `""`)
 
 	var stdout, stderr bytes.Buffer
-	code := RunWithGetwd([]string{"--config-dir", configDir, "run", "--verbose", "hello"}, &stdout, &stderr, func() (string, error) {
+	code := RunWithGetwd([]string{"--config-dir", configDir, "chat", "--quit", "--verbose", "hello"}, &stdout, &stderr, func() (string, error) {
 		return t.TempDir(), nil
 	})
 
@@ -1562,7 +2143,7 @@ func TestRunEnableToolsRejectsUnknownTool(t *testing.T) {
 	writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
 
 	var stdout, stderr bytes.Buffer
-	code := RunWithGetwd([]string{"--config-dir", configDir, "run", "--enable-tools", "missing", "Use tools"}, &stdout, &stderr, func() (string, error) {
+	code := RunWithGetwd([]string{"--config-dir", configDir, "chat", "--quit", "--enable-tools", "missing", "Use tools"}, &stdout, &stderr, func() (string, error) {
 		return t.TempDir(), nil
 	})
 
@@ -1587,7 +2168,7 @@ func TestRunEnableMCPRejectsUnknownServer(t *testing.T) {
 	writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
 
 	var stdout, stderr bytes.Buffer
-	code := RunWithGetwd([]string{"--config-dir", configDir, "run", "--enable-mcp", "missing", "Use MCP"}, &stdout, &stderr, func() (string, error) {
+	code := RunWithGetwd([]string{"--config-dir", configDir, "chat", "--quit", "--enable-mcp", "missing", "Use MCP"}, &stdout, &stderr, func() (string, error) {
 		return t.TempDir(), nil
 	})
 
@@ -1601,19 +2182,33 @@ func TestRunEnableMCPRejectsUnknownServer(t *testing.T) {
 	assertNoAdditionalCLIRunRequest(t, requests)
 }
 
-func TestRunRejectsPostPromptModelFlagInsteadOfSwitching(t *testing.T) {
+func TestChatAllowsPostPromptModelFlag(t *testing.T) {
+	server, requests := newCLIRunServer(t,
+		`{"choices":[{"delta":{"content":"ok"}}]}`,
+		`[DONE]`,
+	)
+	defer server.Close()
+
+	configDir := t.TempDir()
+	writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
+
 	var stdout, stderr bytes.Buffer
-	code := RunWithGetwd([]string{"run", "--model", "fast", "Use fast", "--model", "default"}, &stdout, &stderr, func() (string, error) {
-		return "unused", nil
+	code := RunWithGetwd([]string{"--config-dir", configDir, "chat", "--quit", "--model", "fast", "Use fast", "--model", "default"}, &stdout, &stderr, func() (string, error) {
+		return t.TempDir(), nil
 	})
 
-	if code != 1 {
-		t.Fatalf("RunWithGetwd() code = %d, want 1", code)
+	if code != 0 {
+		t.Fatalf("RunWithGetwd() code = %d, stderr = %s", code, stderr.String())
 	}
-	if stdout.String() != "" {
-		t.Fatalf("stdout = %q, want empty", stdout.String())
+	if got, want := stdout.String(), "ok"; got != want {
+		t.Fatalf("stdout = %q, want %q", got, want)
 	}
-	assertCLIErrorContains(t, stderr.String(), `usage: sai run`)
+	request := <-requests
+	if got := request.Body["model"]; got != "model-default" {
+		t.Fatalf("model = %#v, want model-default", got)
+	}
+	assertMessage(t, requestMessages(t, request.Body), 1, "user", "Use fast")
+	assertNoAdditionalCLIRunRequest(t, requests)
 }
 
 func TestRunIncludesStartupAgentsAndConfigDirDoesNotChangeLookup(t *testing.T) {
@@ -1630,7 +2225,7 @@ func TestRunIncludesStartupAgentsAndConfigDirDoesNotChangeLookup(t *testing.T) {
 	writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
 
 	var stdout, stderr bytes.Buffer
-	code := RunWithGetwd([]string{"--config-dir", configDir, "run", "Hello"}, &stdout, &stderr, func() (string, error) {
+	code := RunWithGetwd([]string{"--config-dir", configDir, "chat", "--quit", "Hello"}, &stdout, &stderr, func() (string, error) {
 		return projectDir, nil
 	})
 
@@ -1664,7 +2259,7 @@ func TestRunReasoningIsHiddenUnlessShowReasoningIsSet(t *testing.T) {
 		writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
 
 		var stdout, stderr bytes.Buffer
-		code := RunWithGetwd([]string{"--config-dir", configDir, "run", "Think"}, &stdout, &stderr, func() (string, error) {
+		code := RunWithGetwd([]string{"--config-dir", configDir, "chat", "--quit", "Think"}, &stdout, &stderr, func() (string, error) {
 			return t.TempDir(), nil
 		})
 
@@ -1688,7 +2283,7 @@ func TestRunReasoningIsHiddenUnlessShowReasoningIsSet(t *testing.T) {
 		writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
 
 		var stdout, stderr bytes.Buffer
-		code := RunWithGetwd([]string{"--config-dir", configDir, "run", "--show-reasoning", "Think"}, &stdout, &stderr, func() (string, error) {
+		code := RunWithGetwd([]string{"--config-dir", configDir, "chat", "--quit", "--show-reasoning", "Think"}, &stdout, &stderr, func() (string, error) {
 			return t.TempDir(), nil
 		})
 
@@ -1712,7 +2307,7 @@ func TestRunReasoningIsHiddenUnlessShowReasoningIsSet(t *testing.T) {
 		writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
 
 		var stdout, stderr bytes.Buffer
-		code := RunWithGetwd([]string{"--config-dir", configDir, "run", "--show-reasoning", "Think"}, &stdout, &stderr, func() (string, error) {
+		code := RunWithGetwd([]string{"--config-dir", configDir, "chat", "--quit", "--show-reasoning", "Think"}, &stdout, &stderr, func() (string, error) {
 			return t.TempDir(), nil
 		})
 
@@ -1735,7 +2330,7 @@ func TestRunReasoningIsHiddenUnlessShowReasoningIsSet(t *testing.T) {
 		writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
 
 		var stdout, stderr bytes.Buffer
-		code := RunWithGetwd([]string{"--config-dir", configDir, "run", "--show-reasoning", "Think"}, &stdout, &stderr, func() (string, error) {
+		code := RunWithGetwd([]string{"--config-dir", configDir, "chat", "--quit", "--show-reasoning", "Think"}, &stdout, &stderr, func() (string, error) {
 			return t.TempDir(), nil
 		})
 
@@ -1895,7 +2490,7 @@ func TestRunErrorsDoNotLeakAPIKeyValues(t *testing.T) {
 		t.Setenv("SAI_MISSING_API_KEY", "")
 
 		var stdout, stderr bytes.Buffer
-		code := RunWithGetwd([]string{"--config-dir", configDir, "run", "Hello"}, &stdout, &stderr, func() (string, error) {
+		code := RunWithGetwd([]string{"--config-dir", configDir, "chat", "--quit", "Hello"}, &stdout, &stderr, func() (string, error) {
 			return t.TempDir(), nil
 		})
 
@@ -1931,7 +2526,7 @@ func TestRunErrorsDoNotLeakAPIKeyValues(t *testing.T) {
 		writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
 
 		var stdout, stderr bytes.Buffer
-		code := RunWithGetwd([]string{"--config-dir", configDir, "run", "Hello"}, &stdout, &stderr, func() (string, error) {
+		code := RunWithGetwd([]string{"--config-dir", configDir, "chat", "--quit", "Hello"}, &stdout, &stderr, func() (string, error) {
 			return t.TempDir(), nil
 		})
 
@@ -1973,7 +2568,7 @@ func TestRunErrorsDoNotLeakAPIKeyValues(t *testing.T) {
 		writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
 
 		var stdout, stderr bytes.Buffer
-		code := RunWithGetwd([]string{"--config-dir", configDir, "run", "Hello"}, &stdout, &stderr, func() (string, error) {
+		code := RunWithGetwd([]string{"--config-dir", configDir, "chat", "--quit", "Hello"}, &stdout, &stderr, func() (string, error) {
 			return t.TempDir(), nil
 		})
 
@@ -1994,7 +2589,7 @@ func TestRunErrorsDoNotLeakAPIKeyValues(t *testing.T) {
 		writeCLIRunFixtureInDir(t, configDir, "http://127.0.0.1:1", "direct-secret-value", "openai-chat")
 
 		var stdout, stderr bytes.Buffer
-		code := RunWithGetwd([]string{"--config-dir", configDir, "run", "--model", "missing", "Hello"}, &stdout, &stderr, func() (string, error) {
+		code := RunWithGetwd([]string{"--config-dir", configDir, "chat", "--quit", "--model", "missing", "Hello"}, &stdout, &stderr, func() (string, error) {
 			return t.TempDir(), nil
 		})
 
@@ -2010,7 +2605,7 @@ func TestRunErrorsDoNotLeakAPIKeyValues(t *testing.T) {
 		writeCLIRunFixtureInDir(t, configDir, "http://127.0.0.1:1", "direct-secret-value", "not-openai")
 
 		var stdout, stderr bytes.Buffer
-		code := RunWithGetwd([]string{"--config-dir", configDir, "run", "Hello"}, &stdout, &stderr, func() (string, error) {
+		code := RunWithGetwd([]string{"--config-dir", configDir, "chat", "--quit", "Hello"}, &stdout, &stderr, func() (string, error) {
 			return t.TempDir(), nil
 		})
 

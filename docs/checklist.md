@@ -88,7 +88,7 @@
 - [x] 添加 Windows、Linux、macOS build 命令。
 - [x] 构建单文件可执行程序。
 - [x] 添加 `--verbose`。
-- [x] 添加 JSONL 日志，每次 `run` / `chat` 预计算独立 session 路径，并在首个日志事件发生时写入独立 session 目录。
+- [x] 添加 JSONL 日志，每次 `chat` 预计算独立 session 路径，并在首个日志事件发生时写入独立 session 目录。
 - [x] 除 JSONL 日志外，不落盘会话历史或上下文快照。
 - [x] v0.1 不记录完整 prompt、response、tool result 正文。
 - [x] missing API key 有可读错误。
@@ -139,7 +139,7 @@
 
 - [x] 添加 root help：`sai -h`、`sai --help`、`sai help`。
 - [x] 添加 simple command help：`sai version -h`、`sai version --help`、`sai help version`。
-- [x] 添加 run help：`sai run -h`、`sai run --help`、`sai help run`。
+- [x] 添加 chat help：`sai chat -h`、`sai chat --help`、`sai help chat`，展示可选 prompt 和 `--quit`。
 - [x] 添加 group help：`sai config -h`、`sai models -h`、`sai mcp -h`。
 - [x] 添加 nested command help：`sai config show -h`、`sai models list -h`、`sai mcp list -h`。
 - [x] 添加对应的 group 和 nested `sai help ...` 入口。
@@ -148,7 +148,9 @@
 - [x] help 输出到 stdout，exit code 为 0。
 - [x] help 不加载配置、不解析敏感配置值。
 - [x] 未知命令和错误参数继续 exit code 1，并包含可读 help 提示。
-- [x] `sai run` 缺 prompt 时包含 run usage 或 help 提示。
+- [x] root help 不再列 `run`。
+- [x] `sai run ...`、`sai run -h` 和 `sai help run` 不再作为正常入口，且不展示 run 专用 usage。
+- [x] `sai chat --quit` 无 prompt 时包含 chat usage 或 help 提示。
 - [x] 不引入 TUI 或第三方 CLI 框架。
 - [x] 添加 CLI help 测试并验证 `go test ./...`。
 
@@ -170,19 +172,22 @@
 
 ## M10：CLI Chat REPL
 
-- [x] 保留 `agent.Stream` 兼容 `sai run`。
+- [x] 保留 `agent.Stream` 兼容内部单轮调用。
 - [x] 新增 agent streaming result API，成功一轮结束后返回 updated messages。
 - [x] 无工具单轮 result messages 追加 assistant final message。
 - [x] tool call 单轮 result messages 包含 assistant tool call、tool result 和最终 assistant text。
 - [x] model stream error 不伪造成功 assistant 历史，继续通过 error event 失败。
-- [x] 添加 `sai chat [flags]`。
+- [x] 添加 `sai chat [flags] [--quit] ["prompt"]`。
 - [x] `sai chat` 会话开始时固定 provider/model/tools/MCP/skills/show-reasoning。
-- [x] `sai chat` 复用 `sai run` 的 `--provider`、`--model`、`--show-reasoning`、`--verbose`、`--enable-tools`、`--enable-skills`、`--disable-skills`、`--enable-mcp` 语义。
+- [x] `sai chat` 支持 `--provider`、`--model`、`--show-reasoning`、`--verbose`、`--enable-tools`、`--enable-skills`、`--disable-skills`、`--enable-mcp` 语义。
+- [x] 有初始 prompt 且无 `--quit` 时，先跑完初始 prompt 再进入 REPL，历史保留首轮 user、assistant 和 tool messages。
+- [x] 有初始 prompt 且有 `--quit` 时，跑完这一轮后退出，不进入 REPL。
+- [x] 根层用“跳过已知 flag 及其 value 后的第一个非 flag token”识别命令；命令前后 flags 可混排，全局 `--config-dir` 可放在命令后，help 混排不加载配置，`--` 后的 token 全部作为 positional。
 - [x] stdin 逐行读取用户输入，空白行忽略。
 - [x] `/exit`、`/quit` 和 EOF 正常退出。
 - [x] prompt 写到 stderr，不污染 stdout。
 - [x] 每轮继续用 `writeStream` streaming 到 stdout。
-- [x] chat 成功轮次在 assistant 输出缺少换行时补换行，且不改变 `sai run` 输出。
+- [x] chat 成功轮次在 assistant 输出缺少换行时补换行，避免下一个 REPL prompt 和模型输出粘在一起。
 - [x] 会话历史只保存在进程内，不落盘 chat history。
 - [x] JSONL 日志继续不记录完整 prompt、response、tool result 正文。
 - [x] MCP server 在 chat 会话开始时启动，退出时关闭。

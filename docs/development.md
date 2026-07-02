@@ -128,8 +128,8 @@ v0.1 不需要并发执行 tool call。等真实场景需要时再加。
 目标命令：
 
 ```text
-sai run "prompt"
-sai chat
+sai chat ["prompt"]
+sai chat --quit "prompt"
 sai tools list
 sai models list
 sai config show
@@ -144,8 +144,6 @@ sai --help
 sai help
 sai version -h
 sai help version
-sai run -h
-sai help run
 sai chat -h
 sai help chat
 sai config -h
@@ -171,6 +169,14 @@ help 输出写到 stdout，exit code 为 0。help 必须在配置加载前完成
 或 secrets。未知命令和错误参数仍以 exit code 1 失败，并给出可读错误和类似
 `Run "sai help" for usage.` 的提示。
 
+根层解析从 argv 左到右扫描，跳过已知 flag 及其 value；第一个真正的非 flag token 是命令。
+带值 flag 的 value 不参与命令识别，因此 `sai --model fast chat "hi" --quit` 中的 `fast`
+不是命令。命令 token 之外的参数交给对应命令解析，命令前后的 flags 都可以和 positional
+参数混排。全局 `--config-dir` 也可以放在命令后，例如 `sai models list --config-dir
+./config` 或 `sai chat "hi" --config-dir ./config --quit`。`-h` / `--help` 在命令范围内
+优先显示 help，且不加载配置。`--` 终止 flag 解析；其后的 token 全部作为 positional，
+不再被识别为 help、`--config-dir` 或命令参数 flag。
+
 常用参数：
 
 ```text
@@ -184,28 +190,33 @@ help 输出写到 stdout，exit code 为 0。help 必须在配置加载前完成
 --enable-skills writing,review
 --disable-skills
 --verbose
+--quit
 --enable-mcp local  # M4
 ```
 
-v0.1 暂不支持 non-streaming fallback，`sai run` 当前强制使用 streaming；后续如要支持再引入 `--no-stream` 或 adapter 非流式路径。
+v0.1 暂不支持 non-streaming fallback，`sai chat` 当前强制使用 streaming；后续如要支持再引入 `--no-stream` 或 adapter 非流式路径。
 
 ## CLI Chat REPL
 
 M10 后，`sai chat` 是一个克制的逐行 REPL：启动时固定 provider、model、tools、MCP、
-skills 和 reasoning 展示设置；会话进行中不支持模型切换或额外 slash commands。它和
-`sai run` 共享同一套配置选择规则和 flags：
+skills 和 reasoning 展示设置；会话进行中不支持模型切换或额外 slash commands。它支持
+可选初始 prompt 和 `--quit`：
 
 ```text
+sai chat "先回答这个问题，然后进入 REPL"
+sai chat --quit "只跑这一轮然后退出"
 sai chat --provider paperhub --model glm-5.2
 sai chat --enable-tools list_files,read_file
 sai chat --enable-mcp local --enable-tools mcp.local.some_tool
 ```
 
-输入从 stdin 逐行读取，空白行忽略。`/exit`、`/quit` 或 EOF 正常退出。prompt 写到
-stderr（例如 `> `），模型输出继续通过现有 `writeStream` streaming 到 stdout，包括
-reasoning 的隐藏、显示和终端样式规则。chat 成功完成一轮后，如果 assistant 输出没有以
-换行结束，CLI 只为 chat 补一个换行，避免下一个 prompt 和模型输出粘在一起；`sai run`
-的成功输出语义不变。
+无初始 prompt 时，输入从 stdin 逐行读取，空白行忽略。`/exit`、`/quit` 或 EOF 正常退出。
+有初始 prompt 且没有 `--quit` 时，先完整执行该 prompt 的一轮 agent loop，成功后补齐
+必要换行并进入同一 REPL，会话历史包含初始 prompt、assistant 消息和 tool messages。
+有初始 prompt 且带 `--quit` 时，只执行这一轮然后退出，不进入 REPL。`--quit` 没有初始
+prompt 时作为用法错误处理。`chat` 命令的 flags 和唯一初始 prompt 可以混排，例如
+`sai chat "hi" --model fast --quit`。REPL prompt 写到 stderr（例如 `> `），模型输出继续
+通过现有 `writeStream` streaming 到 stdout，包括 reasoning 的隐藏、显示和终端样式规则。
 
 chat 会话历史只保存在当前进程内。每一轮成功后，agent 返回 updated messages，供下一轮
 请求复用；其中包括原有 messages、当前 user message、assistant tool calls、tool result
@@ -267,7 +278,7 @@ models:
 ```
 
 配置层识别的 provider type 包括 `openai-chat`、`anthropic-messages` 和
-`openai-responses`。当前 `sai run` 支持 `openai-chat`，也支持
+`openai-responses`。当前 `sai chat` 支持 `openai-chat`，也支持
 `anthropic-messages` 的文本 streaming 和 tool use，并支持 `openai-responses` 的
 文本 streaming 和 function tool calling。
 
@@ -317,7 +328,7 @@ stateful `previous_response_id` 对话续写、reasoning output item passthrough
 `provider_dir` 相对配置根目录解析，除非显式写成绝对路径。
 `skill_dir` 是 M7 后的本地 skill 目录，默认是配置根目录下的 `skills`，同样相对配置
 根目录解析；推荐布局是 `.agents/skills/<skill_id>/SKILL.md`。`skills.enabled`
-保存默认启用的本地 skill id 列表，空列表表示不读取或注入任何 skill。`sai run
+保存默认启用的本地 skill id 列表，空列表表示不读取或注入任何 skill。`sai chat
 --enable-skills id1,id2` 覆盖配置中的 enabled skills，`--disable-skills` 本次运行禁用
 所有 skills；二者不能同时使用。只读取 `skill_dir`，不读取用户目录。
 `logging.path` 相对配置根目录解析，除非显式写成绝对路径。它兼容旧配置形态，但运行时
@@ -327,7 +338,7 @@ stateful `previous_response_id` 对话续写、reasoning output item passthrough
 模型选择发生在会话开始时：
 
 ```text
-sai run --provider paperhub --model glm-5.2 "你是谁？"
+sai chat --quit --provider paperhub --model glm-5.2 "你是谁？"
 sai chat --provider paperhub --model glm-5.2
 ```
 
@@ -470,7 +481,7 @@ tools:
 ```
 
 ```text
-sai run --enable-tools list_files,read_file "列出当前目录"
+sai chat --quit --enable-tools list_files,read_file "列出当前目录"
 ```
 
 `--enable-tools` 覆盖配置文件中的 enabled tools 列表，而不是追加。`shell` 不需要额外
@@ -481,7 +492,7 @@ sai run --enable-tools list_files,read_file "列出当前目录"
 
 ## MCP
 
-MCP 不属于 MVP 必需能力。先完成 `sai run`、streaming、tool call loop、错误处理、
+MCP 不属于 MVP 必需能力。先完成 `sai chat --quit`、streaming、tool call loop、错误处理、
 JSONL 日志和单文件构建，再实现 MCP。
 
 MCP 使用单独目录配置，不放进 provider 配置。每个 MCP server 一个 YAML 文件，和
@@ -512,7 +523,7 @@ MCP tool 名称必须使用 `mcp.<server>.<tool>` 形式，避免和内置工具
 MCP server 启用列表完全由该参数决定，忽略 MCP 文件中的 `enabled` 字段。
 
 ```text
-sai run --enable-mcp local --enable-tools mcp.local.some_tool "使用 MCP 工具"
+sai chat --quit --enable-mcp local --enable-tools mcp.local.some_tool "使用 MCP 工具"
 ```
 
 v0.1 中 MCP server 进程生命周期由当前 agent 进程管理。后台常驻管理后续再做。
@@ -522,7 +533,7 @@ v0.1 中 MCP server 进程生命周期由当前 agent 进程管理。后台常�
 v0.1 只落盘 JSONL 日志，不保存会话历史或上下文快照。日志路径来自
 `logging.path`，相对路径基于配置根目录解析。`logging.path` 解释为日志根/基准路径：
 如果配置为 `logs/sai.jsonl`，实际 session root 是 `logs/`；如果配置为空，禁用日志。
-每次 `sai run` 或 `sai chat` 启动 runtime 时预先确定唯一 session JSONL 路径，供
+每次 `sai chat` 启动 runtime 时预先确定唯一 session JSONL 路径，供
 `--verbose` 显示；但 log root、session 目录和 `sai.jsonl` 只在第一条日志事件发生时
 创建。chat 启动后直接 `/exit`、`/quit` 或 EOF 且没有模型请求时，不产生日志 session。
 
@@ -557,13 +568,13 @@ OpenAI-compatible `tools` / `tool_calls` 的真实兼容性。若服务不支持
 并将 PaperHub 的 tool calling 标记为已知限制。
 
 2026-07-01 已执行 PaperHub tool call smoke test。命令形态为：
-`go run ./cmd/sai --config-dir <temp-config> run --provider paperhub --model glm-5.2 --enable-tools list_files "<prompt>"`。
+`go run ./cmd/sai --config-dir <temp-config> chat --quit --provider paperhub --model glm-5.2 --enable-tools list_files "<prompt>"`。
 结果：PaperHub `glm-5.2` 成功返回 tool call，`sai` 执行 `list_files` 后继续输出最终文本。
 
 手动测试命令：
 
 ```powershell
-sai run --provider paperhub "你是谁？"
+sai chat --quit --provider paperhub "你是谁？"
 ```
 
 预期行为：

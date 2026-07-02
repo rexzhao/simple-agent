@@ -33,8 +33,8 @@ logging:
 ```
 
 `logging.path` is a log root hint, kept compatible with older configs. For
-example, `logs/sai.jsonl` uses `.agents/logs/` as the root; each `sai run` or
-`sai chat` process precomputes a future session path such as
+example, `logs/sai.jsonl` uses `.agents/logs/` as the root; each `sai chat`
+process precomputes a future session path such as
 `.agents/logs/<timestamp>-<random>/sai.jsonl`, which `--verbose` reports as
 `log_path`. The directory and file are created only when the first log event is
 written, so a chat that exits before making a request does not create a log
@@ -59,7 +59,7 @@ models:
 ## Basic Usage
 
 ```sh
-sai run --provider paperhub --model glm-5.2 "Hello"
+sai chat --quit --provider paperhub --model glm-5.2 "Hello"
 ```
 
 Start a line-oriented chat session with the same provider/model selection rules:
@@ -68,17 +68,17 @@ Start a line-oriented chat session with the same provider/model selection rules:
 sai chat --provider paperhub --model glm-5.2
 ```
 
-In chat, type one message per line. Blank lines are ignored; `/exit`, `/quit`,
-or EOF exits normally. Session history stays in memory for the current process
-and is not written to disk.
+`sai chat "Hello"` runs that initial prompt first, then enters the line-oriented
+session. Add `--quit` to exit after the initial prompt turn. In chat, type one
+message per line. Blank lines are ignored; `/exit`, `/quit`, or EOF exits
+normally. Session history stays in memory for the current process and is not
+written to disk.
 
 Show CLI usage without loading configuration:
 
 ```sh
 sai help
 sai help version
-sai help run
-sai run -h
 sai help chat
 sai chat -h
 sai help config
@@ -89,10 +89,10 @@ sai help tools list
 sai help mcp
 ```
 
-Enable tools for a single run:
+Enable tools for one prompt or a chat session:
 
 ```sh
-sai run --enable-tools list_files,read_file "List this project"
+sai chat --quit --enable-tools list_files,read_file "List this project"
 sai chat --enable-tools list_files,read_file
 ```
 
@@ -102,22 +102,22 @@ List built-in tools without loading configuration or provider credentials:
 sai tools list
 ```
 
-When a model calls a tool, `sai run` and `sai chat` print a short status line
-such as `! tool: read_file docs/notes.md` to stderr. `list_files` similarly
-shows the target directory, defaulting to `.`. Other tool arguments and all tool
-results are not printed in that status line, and streamed model output remains
-on stdout.
+When a model calls a tool, `sai chat` prints a short status line such as
+`! tool: read_file docs/notes.md` to stderr. `list_files` similarly shows the
+target directory, defaulting to `.`. Other tool arguments and all tool results
+are not printed in that status line, and streamed model output remains on
+stdout.
 
-Write non-sensitive run diagnostics to stderr without changing streamed stdout:
+Write non-sensitive diagnostics to stderr without changing streamed stdout:
 
 ```sh
-sai run --verbose --provider paperhub --model glm-5.2 "Hello"
+sai chat --quit --verbose --provider paperhub --model glm-5.2 "Hello"
 ```
 
 Show reasoning output, which is hidden by default:
 
 ```sh
-sai run --show-reasoning --provider paperhub --model glm-5.2 "Hello"
+sai chat --quit --show-reasoning --provider paperhub --model glm-5.2 "Hello"
 ```
 
 Shown reasoning starts with a `? reasoning` marker line. When stdout is an

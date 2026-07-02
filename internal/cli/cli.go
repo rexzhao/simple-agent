@@ -51,110 +51,86 @@ func RunWithIO(args []string, stdin io.Reader, stdout, stderr io.Writer, getwd f
 }
 
 func execute(args []string, stdin io.Reader, stdout, stderr io.Writer, getwd func() (string, error)) error {
-	flags := flag.NewFlagSet("sai", flag.ContinueOnError)
-	flags.SetOutput(io.Discard)
-	configDir := flags.String("config-dir", "", "configuration directory")
-	if err := flags.Parse(args); err != nil {
-		if errors.Is(err, flag.ErrHelp) {
+	rootArgs, err := splitRootArgs(args)
+	if err != nil {
+		return err
+	}
+	if rootArgs.command == "" {
+		if rootArgs.hasHelp {
 			printRootUsage(stdout)
 			return nil
 		}
-		return usageError(err.Error(), "", "sai help")
-	}
-
-	remaining := flags.Args()
-	if len(remaining) == 0 {
 		return usageError("missing command", "", "sai help")
 	}
 
-	switch remaining[0] {
+	switch rootArgs.command {
 	case "help":
-		return helpCommand(remaining[1:], stdout)
+		return helpCommand(rootArgs.commandArgs, stdout)
 	case "version":
-		if len(remaining) == 2 && isHelpArg(remaining[1]) {
-			printVersionUsage(stdout)
-			return nil
-		}
-		if len(remaining) != 1 {
-			return usageError("usage: sai version", "", "sai help")
-		}
-		fmt.Fprintf(stdout, "sai %s\n", Version)
-		return nil
+		return versionCommand(rootArgs.commandArgs, stdout)
 	case "config":
-		if len(remaining) == 2 && isHelpArg(remaining[1]) {
+		subcommand, subArgs, groupHelp, err := splitSubcommandArgs(rootArgs.commandArgs, nil, "sai help config")
+		if err != nil {
+			return err
+		}
+		if subcommand == "" && groupHelp {
 			printConfigUsage(stdout)
 			return nil
 		}
-		if isNestedHelp(remaining[1:], "show") {
-			printConfigShowUsage(stdout)
-			return nil
-		}
-		if len(remaining) != 2 || remaining[1] != "show" {
+		if subcommand != "show" {
 			return usageError("usage: sai config show", "", "sai help config show")
 		}
-		cfg, err := loadConfig(*configDir, getwd)
+		return configShowCommand(subArgs, rootArgs.configDir, stdout, getwd)
+	case "models":
+		subcommand, subArgs, groupHelp, err := splitSubcommandArgs(rootArgs.commandArgs, nil, "sai help models")
 		if err != nil {
 			return err
 		}
-		encoder := json.NewEncoder(stdout)
-		encoder.SetIndent("", "  ")
-		encoder.SetEscapeHTML(false)
-		return encoder.Encode(cfg)
-	case "models":
-		if len(remaining) == 2 && isHelpArg(remaining[1]) {
+		if subcommand == "" && groupHelp {
 			printModelsUsage(stdout)
 			return nil
 		}
-		if isNestedHelp(remaining[1:], "list") {
-			printModelsListUsage(stdout)
-			return nil
-		}
-		if len(remaining) != 2 || remaining[1] != "list" {
+		if subcommand != "list" {
 			return usageError("usage: sai models list", "", "sai help models list")
 		}
-		cfg, err := loadConfig(*configDir, getwd)
+		return modelsListCommand(subArgs, rootArgs.configDir, stdout, getwd)
+	case "tools":
+		subcommand, subArgs, groupHelp, err := splitSubcommandArgs(rootArgs.commandArgs, nil, "sai help tools")
 		if err != nil {
 			return err
 		}
-		fmt.Fprintln(stdout, "PROVIDER\tPROFILE\tMODEL ID")
-		for _, model := range cfg.ModelList() {
-			fmt.Fprintf(stdout, "%s\t%s\t%s\n", model.Provider, model.Profile, model.ID)
-		}
-		return nil
-	case "tools":
-		if len(remaining) == 2 && isHelpArg(remaining[1]) {
+		if subcommand == "" && groupHelp {
 			printToolsUsage(stdout)
 			return nil
 		}
-		if isNestedHelp(remaining[1:], "list") {
-			printToolsListUsage(stdout)
-			return nil
+		if subcommand != "list" {
+			return usageError("usage: sai tools list", "", "sai help tools list")
 		}
-		return toolsCommand(remaining[1:], stdout)
+		return toolsListCommand(subArgs, stdout)
 	case "mcp":
-		if len(remaining) == 2 && isHelpArg(remaining[1]) {
+		subcommand, subArgs, groupHelp, err := splitSubcommandArgs(rootArgs.commandArgs, map[string]flagKind{"enable-mcp": flagKindValue}, "sai help mcp")
+		if err != nil {
+			return err
+		}
+		if subcommand == "" && groupHelp {
 			printMCPUsage(stdout)
 			return nil
 		}
-		if isNestedHelp(remaining[1:], "list") {
-			printMCPListUsage(stdout)
-			return nil
+		if subcommand != "list" {
+			return usageError("usage: sai mcp list [--enable-mcp ids]", "", "sai help mcp list")
 		}
-		return mcpCommand(remaining[1:], *configDir, stdout, getwd)
-	case "run":
-		return runCommand(remaining[1:], *configDir, stdout, stderr, getwd)
+		return mcpListCommand(subArgs, rootArgs.configDir, stdout, getwd)
 	case "chat":
-		return chatCommand(remaining[1:], *configDir, stdin, stdout, stderr, getwd)
+		return chatCommand(rootArgs.commandArgs, rootArgs.configDir, stdin, stdout, stderr, getwd)
 	default:
-		return usageError(fmt.Sprintf("unknown command %q", remaining[0]), "", "sai help")
+		return usageError(fmt.Sprintf("unknown command %q", rootArgs.command), "", "sai help")
 	}
 }
 
 const rootUsageText = `usage: sai [--config-dir dir] <command> [args]
 
 Commands:
-  run "prompt"       Run a single prompt
-  chat               Start a line-oriented chat session
+  chat ["prompt"]    Start a chat session, optionally with an initial prompt
   config show        Print resolved config with secrets redacted
   models list        List configured provider model profiles
   tools list         List built-in tools
@@ -165,14 +141,11 @@ Commands:
 Run "sai help <command>" for command usage.
 `
 
-const runUsageText = `usage: sai run [--provider name] [--model profile] [--show-reasoning] [--verbose] [--enable-tools names] [--enable-skills ids] [--disable-skills] [--enable-mcp ids] "prompt"
+const chatUsageText = `usage: sai chat [--provider name] [--model profile] [--show-reasoning] [--verbose] [--enable-tools names] [--enable-skills ids] [--disable-skills] [--enable-mcp ids] [--quit] ["prompt"]
 
-Runs one prompt using the configured provider and model.
-`
-
-const chatUsageText = `usage: sai chat [--provider name] [--model profile] [--show-reasoning] [--verbose] [--enable-tools names] [--enable-skills ids] [--disable-skills] [--enable-mcp ids]
-
-Starts a line-oriented chat session using the configured provider and model.
+Starts a line-oriented chat session using the configured provider and model. When
+an initial prompt is provided, sai runs that turn first; --quit exits after that
+turn instead of entering the REPL.
 `
 
 const versionUsageText = `usage: sai version
@@ -239,8 +212,6 @@ func helpCommand(args []string, stdout io.Writer) error {
 	}
 
 	switch strings.Join(args, " ") {
-	case "run":
-		printRunUsage(stdout)
 	case "chat":
 		printChatUsage(stdout)
 	case "version":
@@ -269,10 +240,6 @@ func helpCommand(args []string, stdout io.Writer) error {
 
 func printRootUsage(stdout io.Writer) {
 	fmt.Fprint(stdout, rootUsageText)
-}
-
-func printRunUsage(stdout io.Writer) {
-	fmt.Fprint(stdout, runUsageText)
 }
 
 func printChatUsage(stdout io.Writer) {
@@ -321,6 +288,9 @@ func isNestedHelp(args []string, command string) bool {
 
 func containsHelpArg(args []string) bool {
 	for _, arg := range args {
+		if arg == "--" {
+			return false
+		}
 		if isHelpArg(arg) {
 			return true
 		}
@@ -347,23 +317,225 @@ func usageError(message, usage, helpCommand string) error {
 	return errors.New(out.String())
 }
 
-func mcpCommand(args []string, configDir string, stdout io.Writer, getwd func() (string, error)) error {
-	if len(args) == 0 || args[0] != "list" {
-		return usageError("usage: sai mcp list [--enable-mcp ids]", "", "sai help mcp list")
+type flagKind int
+
+const (
+	flagKindBool flagKind = iota
+	flagKindValue
+)
+
+type rootArgs struct {
+	configDir   string
+	command     string
+	commandArgs []string
+	hasHelp     bool
+}
+
+func splitRootArgs(args []string) (rootArgs, error) {
+	known := map[string]flagKind{
+		"config-dir":     flagKindValue,
+		"provider":       flagKindValue,
+		"model":          flagKindValue,
+		"enable-tools":   flagKindValue,
+		"enable-skills":  flagKindValue,
+		"enable-mcp":     flagKindValue,
+		"h":              flagKindBool,
+		"help":           flagKindBool,
+		"show-reasoning": flagKindBool,
+		"verbose":        flagKindBool,
+		"disable-skills": flagKindBool,
+		"quit":           flagKindBool,
+	}
+	var out rootArgs
+	prefixArgs := make([]string, 0, len(args))
+
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if arg == "--" {
+			if i+1 >= len(args) {
+				break
+			}
+			out.command = args[i+1]
+			out.commandArgs = append(prefixArgs, "--")
+			out.commandArgs = append(out.commandArgs, args[i+2:]...)
+			return stripGlobalArgs(out)
+		}
+		if !isFlagArg(arg) {
+			out.command = arg
+			out.commandArgs = append(prefixArgs, args[i+1:]...)
+			return stripGlobalArgs(out)
+		}
+
+		name, hasInlineValue := flagName(arg)
+		kind, ok := known[name]
+		if !ok {
+			return rootArgs{}, usageError(fmt.Sprintf("flag provided but not defined: -%s", name), "", "sai help")
+		}
+		if isHelpArg(arg) {
+			out.hasHelp = true
+		}
+		if name == "config-dir" {
+			value, next, err := flagValue(args, i, name, hasInlineValue)
+			if err != nil {
+				return rootArgs{}, usageError(err.Error(), "", "sai help")
+			}
+			out.configDir = value
+			i = next
+			continue
+		}
+
+		prefixArgs = append(prefixArgs, arg)
+		if kind == flagKindValue && !hasInlineValue {
+			value, next, err := flagValue(args, i, name, false)
+			if err != nil {
+				return rootArgs{}, usageError(err.Error(), "", "sai help")
+			}
+			prefixArgs = append(prefixArgs, value)
+			i = next
+		}
 	}
 
+	return out, nil
+}
+
+func stripGlobalArgs(args rootArgs) (rootArgs, error) {
+	stripped := make([]string, 0, len(args.commandArgs))
+	for i := 0; i < len(args.commandArgs); i++ {
+		arg := args.commandArgs[i]
+		if arg == "--" {
+			stripped = append(stripped, args.commandArgs[i:]...)
+			break
+		}
+		name, hasInlineValue := flagName(arg)
+		if isFlagArg(arg) && name == "config-dir" {
+			value, next, err := flagValue(args.commandArgs, i, name, hasInlineValue)
+			if err != nil {
+				return rootArgs{}, usageError(err.Error(), "", "sai help")
+			}
+			args.configDir = value
+			i = next
+			continue
+		}
+		stripped = append(stripped, arg)
+	}
+	args.commandArgs = stripped
+	return args, nil
+}
+
+func splitSubcommandArgs(args []string, known map[string]flagKind, helpCommand string) (string, []string, bool, error) {
+	prefixArgs := make([]string, 0, len(args))
+	hasHelp := false
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if arg == "--" {
+			if i+1 >= len(args) {
+				break
+			}
+			subArgs := append(prefixArgs, "--")
+			subArgs = append(subArgs, args[i+2:]...)
+			return args[i+1], subArgs, hasHelp, nil
+		}
+		if !isFlagArg(arg) {
+			return arg, append(prefixArgs, args[i+1:]...), hasHelp, nil
+		}
+		if isHelpArg(arg) {
+			hasHelp = true
+			prefixArgs = append(prefixArgs, arg)
+			continue
+		}
+
+		name, hasInlineValue := flagName(arg)
+		kind, ok := known[name]
+		if !ok {
+			return "", nil, false, usageError(fmt.Sprintf("flag provided but not defined: -%s", name), "", helpCommand)
+		}
+		prefixArgs = append(prefixArgs, arg)
+		if kind == flagKindValue && !hasInlineValue {
+			value, next, err := flagValue(args, i, name, false)
+			if err != nil {
+				return "", nil, false, usageError(err.Error(), "", helpCommand)
+			}
+			prefixArgs = append(prefixArgs, value)
+			i = next
+		}
+	}
+	return "", prefixArgs, hasHelp, nil
+}
+
+func flagValue(args []string, index int, name string, inline bool) (string, int, error) {
+	if inline {
+		_, value, _ := strings.Cut(args[index], "=")
+		return value, index, nil
+	}
+	if index+1 >= len(args) {
+		return "", index, fmt.Errorf("flag needs an argument: -%s", name)
+	}
+	return args[index+1], index + 1, nil
+}
+
+func versionCommand(args []string, stdout io.Writer) error {
+	flags := flag.NewFlagSet("sai version", flag.ContinueOnError)
+	positionals, done, err := parseCommandFlagArgs(flags, args, stdout, printVersionUsage, "sai help")
+	if done || err != nil {
+		return err
+	}
+	if len(positionals) != 0 {
+		return usageError("usage: sai version", "", "sai help")
+	}
+	fmt.Fprintf(stdout, "sai %s\n", Version)
+	return nil
+}
+
+func configShowCommand(args []string, configDir string, stdout io.Writer, getwd func() (string, error)) error {
+	flags := flag.NewFlagSet("sai config show", flag.ContinueOnError)
+	positionals, done, err := parseCommandFlagArgs(flags, args, stdout, printConfigShowUsage, "sai help config show")
+	if done || err != nil {
+		return err
+	}
+	if len(positionals) != 0 {
+		return usageError("usage: sai config show", "", "sai help config show")
+	}
+
+	cfg, err := loadConfig(configDir, getwd)
+	if err != nil {
+		return err
+	}
+	encoder := json.NewEncoder(stdout)
+	encoder.SetIndent("", "  ")
+	encoder.SetEscapeHTML(false)
+	return encoder.Encode(cfg)
+}
+
+func modelsListCommand(args []string, configDir string, stdout io.Writer, getwd func() (string, error)) error {
+	flags := flag.NewFlagSet("sai models list", flag.ContinueOnError)
+	positionals, done, err := parseCommandFlagArgs(flags, args, stdout, printModelsListUsage, "sai help models list")
+	if done || err != nil {
+		return err
+	}
+	if len(positionals) != 0 {
+		return usageError("usage: sai models list", "", "sai help models list")
+	}
+
+	cfg, err := loadConfig(configDir, getwd)
+	if err != nil {
+		return err
+	}
+	fmt.Fprintln(stdout, "PROVIDER\tPROFILE\tMODEL ID")
+	for _, model := range cfg.ModelList() {
+		fmt.Fprintf(stdout, "%s\t%s\t%s\n", model.Provider, model.Profile, model.ID)
+	}
+	return nil
+}
+
+func mcpListCommand(args []string, configDir string, stdout io.Writer, getwd func() (string, error)) error {
 	flags := flag.NewFlagSet("sai mcp list", flag.ContinueOnError)
-	flags.SetOutput(io.Discard)
 	var enabledMCP mcpServerIDsFlag
 	flags.Var(&enabledMCP, "enable-mcp", "comma-separated MCP server ids to enable")
-	if err := flags.Parse(args[1:]); err != nil {
-		if errors.Is(err, flag.ErrHelp) {
-			printMCPListUsage(stdout)
-			return nil
-		}
-		return usageError(err.Error(), "", "sai help mcp list")
+	positionals, done, err := parseCommandFlagArgs(flags, args, stdout, printMCPListUsage, "sai help mcp list")
+	if done || err != nil {
+		return err
 	}
-	if flags.NArg() != 0 {
+	if len(positionals) != 0 {
 		return usageError("usage: sai mcp list [--enable-mcp ids]", "", "sai help mcp list")
 	}
 
@@ -387,21 +559,13 @@ func mcpCommand(args []string, configDir string, stdout io.Writer, getwd func() 
 	return nil
 }
 
-func toolsCommand(args []string, stdout io.Writer) error {
-	if len(args) == 0 || args[0] != "list" {
-		return usageError("usage: sai tools list", "", "sai help tools list")
-	}
-
+func toolsListCommand(args []string, stdout io.Writer) error {
 	flags := flag.NewFlagSet("sai tools list", flag.ContinueOnError)
-	flags.SetOutput(io.Discard)
-	if err := flags.Parse(args[1:]); err != nil {
-		if errors.Is(err, flag.ErrHelp) {
-			printToolsListUsage(stdout)
-			return nil
-		}
-		return usageError(err.Error(), "", "sai help tools list")
+	positionals, done, err := parseCommandFlagArgs(flags, args, stdout, printToolsListUsage, "sai help tools list")
+	if done || err != nil {
+		return err
 	}
-	if flags.NArg() != 0 {
+	if len(positionals) != 0 {
 		return usageError("usage: sai tools list", "", "sai help tools list")
 	}
 
@@ -409,6 +573,22 @@ func toolsCommand(args []string, stdout io.Writer) error {
 		fmt.Fprintln(stdout, name)
 	}
 	return nil
+}
+
+func parseCommandFlagArgs(flags *flag.FlagSet, args []string, stdout io.Writer, printUsage func(io.Writer), helpCommand string) ([]string, bool, error) {
+	flags.SetOutput(io.Discard)
+	if containsHelpArg(args) {
+		printUsage(stdout)
+		return nil, true, nil
+	}
+	parsedArgs, err := intersperseFlagArgs(flags, args)
+	if err != nil {
+		return nil, false, usageError(err.Error(), "", helpCommand)
+	}
+	if err := flags.Parse(parsedArgs); err != nil {
+		return nil, false, usageError(err.Error(), "", helpCommand)
+	}
+	return flags.Args(), false, nil
 }
 
 func builtInToolNames() []string {
@@ -448,75 +628,23 @@ func (options agentCommandFlags) validate(helpCommand string) error {
 	return nil
 }
 
-func runCommand(args []string, configDir string, stdout, stderr io.Writer, getwd func() (string, error)) (runErr error) {
-	flags := flag.NewFlagSet("sai run", flag.ContinueOnError)
-	flags.SetOutput(io.Discard)
-	var options agentCommandFlags
-	registerAgentCommandFlags(flags, &options)
-	if err := flags.Parse(args); err != nil {
-		if errors.Is(err, flag.ErrHelp) {
-			printRunUsage(stdout)
-			return nil
-		}
-		return usageError(err.Error(), "", "sai help run")
-	}
-	if err := options.validate("sai help run"); err != nil {
-		return err
-	}
-
-	prompts := flags.Args()
-	if len(prompts) != 1 {
-		message := "missing prompt"
-		if len(prompts) > 1 {
-			message = "expected exactly one prompt"
-		}
-		return usageError(message, runUsageText, "sai help run")
-	}
-
-	runtime, err := prepareAgentRuntime(context.Background(), configDir, options, stderr, getwd)
-	if err != nil {
-		return err
-	}
-	defer func() {
-		runErr = errors.Join(runErr, runtime.Close())
-	}()
-
-	request := model.Request{
-		Model:      runtime.modelID,
-		Messages:   runMessages(runtime.project, runtime.selectedSkills, prompts[0]),
-		Tools:      runtime.toolSchemas,
-		Parameters: runtime.parameters,
-	}
-
-	events, err := agent.Stream(context.Background(), request, agent.Options{
-		Provider:     runtime.provider,
-		ToolExecutor: runtime.toolExecutor,
-		MaxTurns:     runtime.maxTurns,
-	})
-	if err != nil {
-		return err
-	}
-
-	return writeStream(stdout, stderr, events, runtime.showReasoning, runtime.logger)
-}
-
 func chatCommand(args []string, configDir string, stdin io.Reader, stdout, stderr io.Writer, getwd func() (string, error)) (chatErr error) {
 	flags := flag.NewFlagSet("sai chat", flag.ContinueOnError)
-	flags.SetOutput(io.Discard)
 	var options agentCommandFlags
 	registerAgentCommandFlags(flags, &options)
-	if err := flags.Parse(args); err != nil {
-		if errors.Is(err, flag.ErrHelp) {
-			printChatUsage(stdout)
-			return nil
-		}
-		return usageError(err.Error(), "", "sai help chat")
+	quit := flags.Bool("quit", false, "exit after the initial prompt turn")
+	prompts, done, err := parseCommandFlagArgs(flags, args, stdout, printChatUsage, "sai help chat")
+	if done || err != nil {
+		return err
 	}
 	if err := options.validate("sai help chat"); err != nil {
 		return err
 	}
-	if flags.NArg() != 0 {
-		return usageError("usage: sai chat", "", "sai help chat")
+	if len(prompts) > 1 {
+		return usageError("expected at most one prompt", chatUsageText, "sai help chat")
+	}
+	if *quit && len(prompts) == 0 {
+		return usageError("--quit requires an initial prompt", chatUsageText, "sai help chat")
 	}
 
 	runtime, err := prepareAgentRuntime(context.Background(), configDir, options, stderr, getwd)
@@ -528,6 +656,16 @@ func chatCommand(args []string, configDir string, stdin io.Reader, stdout, stder
 	}()
 
 	messages := chatBaseMessages(runtime.project, runtime.selectedSkills)
+	if len(prompts) == 1 {
+		messages, err = runChatTurn(context.Background(), runtime, messages, prompts[0], stdout, stderr, !*quit, false)
+		if err != nil {
+			return err
+		}
+		if *quit {
+			return nil
+		}
+	}
+
 	scanner := bufio.NewScanner(stdin)
 	for {
 		if _, err := fmt.Fprint(stderr, "> "); err != nil {
@@ -549,43 +687,105 @@ func chatCommand(args []string, configDir string, stdin io.Reader, stdout, stder
 			return nil
 		}
 
-		requestMessages := append(copyMessageSlice(messages), model.Message{
-			Role:    model.MessageRoleUser,
-			Content: line,
-		})
-		request := model.Request{
-			Model:      runtime.modelID,
-			Messages:   requestMessages,
-			Tools:      runtime.toolSchemas,
-			Parameters: runtime.parameters,
-		}
-		events, results, err := agent.StreamWithResult(context.Background(), request, agent.Options{
-			Provider:     runtime.provider,
-			ToolExecutor: runtime.toolExecutor,
-			MaxTurns:     runtime.maxTurns,
-		})
+		messages, err = runChatTurn(context.Background(), runtime, messages, line, stdout, stderr, true, true)
 		if err != nil {
 			return err
 		}
+	}
+}
 
-		tracker := &chatOutputWriter{w: stdout}
-		if err := writeStreamWithOptions(tracker, stderr, events, runtime.showReasoning, runtime.logger, streamOutputOptions{
-			colorReasoning:          shouldColorizeReasoning(tracker),
-			stderrNeedsLeadingBreak: true,
-		}); err != nil {
-			return err
-		}
-		result, ok := <-results
-		if !ok {
-			return fmt.Errorf("agent did not return updated messages")
-		}
-		messages = result.Messages
-		if tracker.wrote && tracker.lastByte != '\n' {
-			if _, err := fmt.Fprintln(stdout); err != nil {
-				return err
-			}
+func runChatTurn(ctx context.Context, runtime *agentRuntime, messages []model.Message, prompt string, stdout, stderr io.Writer, addTrailingNewline bool, stderrNeedsLeadingBreak bool) ([]model.Message, error) {
+	requestMessages := append(copyMessageSlice(messages), model.Message{
+		Role:    model.MessageRoleUser,
+		Content: prompt,
+	})
+	request := model.Request{
+		Model:      runtime.modelID,
+		Messages:   requestMessages,
+		Tools:      runtime.toolSchemas,
+		Parameters: runtime.parameters,
+	}
+	events, results, err := agent.StreamWithResult(ctx, request, agent.Options{
+		Provider:     runtime.provider,
+		ToolExecutor: runtime.toolExecutor,
+		MaxTurns:     runtime.maxTurns,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	tracker := &chatOutputWriter{w: stdout}
+	if err := writeStreamWithOptions(tracker, stderr, events, runtime.showReasoning, runtime.logger, streamOutputOptions{
+		colorReasoning:          shouldColorizeReasoning(tracker),
+		stderrNeedsLeadingBreak: stderrNeedsLeadingBreak,
+	}); err != nil {
+		return nil, err
+	}
+	result, ok := <-results
+	if !ok {
+		return nil, fmt.Errorf("agent did not return updated messages")
+	}
+	if addTrailingNewline && tracker.wrote && tracker.lastByte != '\n' {
+		if _, err := fmt.Fprintln(stdout); err != nil {
+			return nil, err
 		}
 	}
+	return result.Messages, nil
+}
+
+func intersperseFlagArgs(flags *flag.FlagSet, args []string) ([]string, error) {
+	flagArgs := make([]string, 0, len(args))
+	positionals := make([]string, 0, len(args))
+	hasDelimiter := false
+
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if arg == "--" {
+			hasDelimiter = true
+			positionals = append(positionals, args[i+1:]...)
+			break
+		}
+		if !isFlagArg(arg) {
+			positionals = append(positionals, arg)
+			continue
+		}
+
+		flagArgs = append(flagArgs, arg)
+		name, hasInlineValue := flagName(arg)
+		found := flags.Lookup(name)
+		if found == nil || hasInlineValue || isBoolFlagValue(found.Value) {
+			continue
+		}
+		if i+1 >= len(args) {
+			return nil, fmt.Errorf("flag needs an argument: -%s", name)
+		}
+		i++
+		flagArgs = append(flagArgs, args[i])
+	}
+
+	if hasDelimiter {
+		return append(append(flagArgs, "--"), positionals...), nil
+	}
+	return append(flagArgs, positionals...), nil
+}
+
+func isFlagArg(arg string) bool {
+	return len(arg) > 1 && strings.HasPrefix(arg, "-")
+}
+
+func flagName(arg string) (string, bool) {
+	name := strings.TrimLeft(arg, "-")
+	if before, _, ok := strings.Cut(name, "="); ok {
+		return before, true
+	}
+	return name, false
+}
+
+func isBoolFlagValue(value flag.Value) bool {
+	boolFlag, ok := value.(interface {
+		IsBoolFlag() bool
+	})
+	return ok && boolFlag.IsBoolFlag()
 }
 
 type agentRuntime struct {
@@ -1032,14 +1232,6 @@ func chatBaseMessages(project projectcontext.Project, enabledSkills []localskill
 		})
 	}
 	return messages
-}
-
-func runMessages(project projectcontext.Project, enabledSkills []localskills.Skill, prompt string) []model.Message {
-	messages := chatBaseMessages(project, enabledSkills)
-	return append(messages, model.Message{
-		Role:    model.MessageRoleUser,
-		Content: prompt,
-	})
 }
 
 func copyMessageSlice(messages []model.Message) []model.Message {
