@@ -134,3 +134,18 @@
 - [x] 将 skill instructions 组合进 system/developer messages。
 - [x] 添加 malformed skill 错误处理。
 - [x] 添加 skill selection 和 disablement 测试。
+
+## M8：CLI Help / Discoverability
+
+- [x] 添加 root help：`sai -h`、`sai --help`、`sai help`。
+- [x] 添加 simple command help：`sai version -h`、`sai version --help`、`sai help version`。
+- [x] 添加 run help：`sai run -h`、`sai run --help`、`sai help run`。
+- [x] 添加 group help：`sai config -h`、`sai models -h`、`sai mcp -h`。
+- [x] 添加 nested command help：`sai config show -h`、`sai models list -h`、`sai mcp list -h`。
+- [x] 添加对应的 group 和 nested `sai help ...` 入口。
+- [x] help 输出到 stdout，exit code 为 0。
+- [x] help 不加载配置、不解析敏感配置值。
+- [x] 未知命令和错误参数继续 exit code 1，并包含可读 help 提示。
+- [x] `sai run` 缺 prompt 时包含 run usage 或 help 提示。
+- [x] 不引入 TUI 或第三方 CLI 框架。
+- [x] 添加 CLI help 测试并验证 `go test ./...`。

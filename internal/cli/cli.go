@@ -45,24 +45,42 @@ func execute(args []string, stdout, stderr io.Writer, getwd func() (string, erro
 	flags.SetOutput(io.Discard)
 	configDir := flags.String("config-dir", "", "configuration directory")
 	if err := flags.Parse(args); err != nil {
-		return err
+		if errors.Is(err, flag.ErrHelp) {
+			printRootUsage(stdout)
+			return nil
+		}
+		return usageError(err.Error(), "", "sai help")
 	}
 
 	remaining := flags.Args()
 	if len(remaining) == 0 {
-		return fmt.Errorf("missing command")
+		return usageError("missing command", "", "sai help")
 	}
 
 	switch remaining[0] {
+	case "help":
+		return helpCommand(remaining[1:], stdout)
 	case "version":
+		if len(remaining) == 2 && isHelpArg(remaining[1]) {
+			printVersionUsage(stdout)
+			return nil
+		}
 		if len(remaining) != 1 {
-			return fmt.Errorf("usage: sai version")
+			return usageError("usage: sai version", "", "sai help")
 		}
 		fmt.Fprintf(stdout, "sai %s\n", Version)
 		return nil
 	case "config":
+		if len(remaining) == 2 && isHelpArg(remaining[1]) {
+			printConfigUsage(stdout)
+			return nil
+		}
+		if isNestedHelp(remaining[1:], "show") {
+			printConfigShowUsage(stdout)
+			return nil
+		}
 		if len(remaining) != 2 || remaining[1] != "show" {
-			return fmt.Errorf("usage: sai config show")
+			return usageError("usage: sai config show", "", "sai help config show")
 		}
 		cfg, err := loadConfig(*configDir, getwd)
 		if err != nil {
@@ -73,8 +91,16 @@ func execute(args []string, stdout, stderr io.Writer, getwd func() (string, erro
 		encoder.SetEscapeHTML(false)
 		return encoder.Encode(cfg)
 	case "models":
+		if len(remaining) == 2 && isHelpArg(remaining[1]) {
+			printModelsUsage(stdout)
+			return nil
+		}
+		if isNestedHelp(remaining[1:], "list") {
+			printModelsListUsage(stdout)
+			return nil
+		}
 		if len(remaining) != 2 || remaining[1] != "list" {
-			return fmt.Errorf("usage: sai models list")
+			return usageError("usage: sai models list", "", "sai help models list")
 		}
 		cfg, err := loadConfig(*configDir, getwd)
 		if err != nil {
@@ -86,17 +112,184 @@ func execute(args []string, stdout, stderr io.Writer, getwd func() (string, erro
 		}
 		return nil
 	case "mcp":
+		if len(remaining) == 2 && isHelpArg(remaining[1]) {
+			printMCPUsage(stdout)
+			return nil
+		}
+		if isNestedHelp(remaining[1:], "list") {
+			printMCPListUsage(stdout)
+			return nil
+		}
 		return mcpCommand(remaining[1:], *configDir, stdout, getwd)
 	case "run":
 		return runCommand(remaining[1:], *configDir, stdout, stderr, getwd)
 	default:
-		return fmt.Errorf("unknown command %q", remaining[0])
+		return usageError(fmt.Sprintf("unknown command %q", remaining[0]), "", "sai help")
 	}
+}
+
+const rootUsageText = `usage: sai [--config-dir dir] <command> [args]
+
+Commands:
+  run "prompt"       Run a single prompt
+  config show        Print resolved config with secrets redacted
+  models list        List configured provider model profiles
+  mcp list           List configured MCP servers
+  version            Print version
+  help [command]     Show usage
+
+Run "sai help <command>" for command usage.
+`
+
+const runUsageText = `usage: sai run [--provider name] [--model profile] [--show-reasoning] [--verbose] [--enable-tools names] [--enable-skills ids] [--disable-skills] [--enable-mcp ids] "prompt"
+
+Runs one prompt using the configured provider and model.
+`
+
+const versionUsageText = `usage: sai version
+
+Prints the sai version.
+`
+
+const configUsageText = `usage: sai config <command>
+
+Commands:
+  config show        Print resolved config with secrets redacted
+
+Run "sai help config show" for command usage.
+`
+
+const configShowUsageText = `usage: sai config show
+
+Prints resolved configuration with sensitive values redacted.
+`
+
+const modelsUsageText = `usage: sai models <command>
+
+Commands:
+  models list        List configured provider model profiles
+
+Run "sai help models list" for command usage.
+`
+
+const modelsListUsageText = `usage: sai models list
+
+Lists configured provider model profiles.
+`
+
+const mcpUsageText = `usage: sai mcp <command>
+
+Commands:
+  mcp list           List configured MCP servers
+
+Run "sai help mcp list" for command usage.
+`
+
+const mcpListUsageText = `usage: sai mcp list [--enable-mcp ids]
+
+Lists configured MCP servers and whether each is enabled for this run.
+`
+
+func helpCommand(args []string, stdout io.Writer) error {
+	if len(args) == 0 || len(args) == 1 && isHelpArg(args[0]) {
+		printRootUsage(stdout)
+		return nil
+	}
+
+	switch strings.Join(args, " ") {
+	case "run":
+		printRunUsage(stdout)
+	case "version":
+		printVersionUsage(stdout)
+	case "config":
+		printConfigUsage(stdout)
+	case "config show":
+		printConfigShowUsage(stdout)
+	case "models":
+		printModelsUsage(stdout)
+	case "models list":
+		printModelsListUsage(stdout)
+	case "mcp":
+		printMCPUsage(stdout)
+	case "mcp list":
+		printMCPListUsage(stdout)
+	default:
+		return usageError(fmt.Sprintf("unknown help topic %q", strings.Join(args, " ")), "", "sai help")
+	}
+	return nil
+}
+
+func printRootUsage(stdout io.Writer) {
+	fmt.Fprint(stdout, rootUsageText)
+}
+
+func printRunUsage(stdout io.Writer) {
+	fmt.Fprint(stdout, runUsageText)
+}
+
+func printVersionUsage(stdout io.Writer) {
+	fmt.Fprint(stdout, versionUsageText)
+}
+
+func printConfigUsage(stdout io.Writer) {
+	fmt.Fprint(stdout, configUsageText)
+}
+
+func printConfigShowUsage(stdout io.Writer) {
+	fmt.Fprint(stdout, configShowUsageText)
+}
+
+func printModelsUsage(stdout io.Writer) {
+	fmt.Fprint(stdout, modelsUsageText)
+}
+
+func printModelsListUsage(stdout io.Writer) {
+	fmt.Fprint(stdout, modelsListUsageText)
+}
+
+func printMCPUsage(stdout io.Writer) {
+	fmt.Fprint(stdout, mcpUsageText)
+}
+
+func printMCPListUsage(stdout io.Writer) {
+	fmt.Fprint(stdout, mcpListUsageText)
+}
+
+func isNestedHelp(args []string, command string) bool {
+	return len(args) >= 2 && args[0] == command && containsHelpArg(args[1:])
+}
+
+func containsHelpArg(args []string) bool {
+	for _, arg := range args {
+		if isHelpArg(arg) {
+			return true
+		}
+	}
+	return false
+}
+
+func isHelpArg(arg string) bool {
+	return arg == "-h" || arg == "--help"
+}
+
+func usageError(message, usage, helpCommand string) error {
+	var out strings.Builder
+	out.WriteString(message)
+	if usage != "" {
+		out.WriteString("\n\n")
+		out.WriteString(strings.TrimRight(usage, "\n"))
+	}
+	if helpCommand != "" {
+		out.WriteString("\nRun \"")
+		out.WriteString(helpCommand)
+		out.WriteString("\" for usage.")
+	}
+	return errors.New(out.String())
 }
 
 func mcpCommand(args []string, configDir string, stdout io.Writer, getwd func() (string, error)) error {
 	if len(args) == 0 || args[0] != "list" {
-		return fmt.Errorf("usage: sai mcp list [--enable-mcp ids]")
+		return usageError("usage: sai mcp list [--enable-mcp ids]", "", "sai help mcp list")
 	}
 
 	flags := flag.NewFlagSet("sai mcp list", flag.ContinueOnError)
@@ -104,10 +297,14 @@ func mcpCommand(args []string, configDir string, stdout io.Writer, getwd func() 
 	var enabledMCP mcpServerIDsFlag
 	flags.Var(&enabledMCP, "enable-mcp", "comma-separated MCP server ids to enable")
 	if err := flags.Parse(args[1:]); err != nil {
-		return err
+		if errors.Is(err, flag.ErrHelp) {
+			printMCPListUsage(stdout)
+			return nil
+		}
+		return usageError(err.Error(), "", "sai help mcp list")
 	}
 	if flags.NArg() != 0 {
-		return fmt.Errorf("usage: sai mcp list [--enable-mcp ids]")
+		return usageError("usage: sai mcp list [--enable-mcp ids]", "", "sai help mcp list")
 	}
 
 	cfg, err := loadConfig(configDir, getwd)
@@ -145,15 +342,23 @@ func runCommand(args []string, configDir string, stdout, stderr io.Writer, getwd
 	var enabledMCP mcpServerIDsFlag
 	flags.Var(&enabledMCP, "enable-mcp", "comma-separated MCP server ids to enable")
 	if err := flags.Parse(args); err != nil {
-		return err
+		if errors.Is(err, flag.ErrHelp) {
+			printRunUsage(stdout)
+			return nil
+		}
+		return usageError(err.Error(), "", "sai help run")
 	}
 	if enabledSkills.set && *disableSkills {
-		return fmt.Errorf("cannot use --enable-skills with --disable-skills")
+		return usageError("cannot use --enable-skills with --disable-skills", "", "sai help run")
 	}
 
 	prompts := flags.Args()
 	if len(prompts) != 1 {
-		return fmt.Errorf(`usage: sai run [--provider name] [--model profile] [--show-reasoning] [--verbose] [--enable-tools names] [--enable-skills ids] [--disable-skills] [--enable-mcp ids] "prompt"`)
+		message := "missing prompt"
+		if len(prompts) > 1 {
+			message = "expected exactly one prompt"
+		}
+		return usageError(message, runUsageText, "sai help run")
 	}
 
 	cwd, err := getwd()

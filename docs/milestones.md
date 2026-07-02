@@ -212,3 +212,32 @@ M7 当前实现只覆盖配置目录下的本地 skills：通过 `skills.enabled
 - 缺失或格式错误的 skill 有清晰错误。
 - CLI fake server 测试覆盖 skill 注入顺序、CLI 覆盖配置、disablement、unknown id 和
   malformed frontmatter。
+
+## M8：CLI Help / Discoverability
+
+目标：为常见 CLI 入口提供可发现的 help/usage 行为，同时保持 `sai` 的纯 CLI 形态。
+
+交付物：
+
+- root help：`sai -h`、`sai --help`、`sai help`。
+- simple command help：`sai version -h`、`sai version --help`、
+  `sai help version`。
+- command help：`sai run -h`、`sai run --help`、`sai help run`。
+- group help：`sai config -h`、`sai models -h`、`sai mcp -h`，以及对应的
+  `sai help config`、`sai help models`、`sai help mcp`。
+- nested command help：`sai config show -h`、`sai models list -h`、
+  `sai mcp list -h`，以及对应的 `sai help config show`、
+  `sai help models list`、`sai help mcp list`。
+- help 输出写到 stdout，exit code 为 0。
+- help 在配置加载前完成，不读取 `.agents` 配置、不解析 API key，也不泄露 secrets。
+- 未知命令和错误参数继续 exit code 1，并给出可读错误和 help 提示。
+- `sai run` 缺少 prompt 时继续失败，但错误包含 run usage 或 help 提示。
+
+验证：
+
+- CLI 单元测试覆盖 root help、simple command help、group help、run help、
+  nested command help 和无需配置文件的 help 路径。
+- CLI 单元测试覆盖未知命令错误提示。
+- CLI 单元测试覆盖 `sai run` 缺 prompt 的错误提示。
+- `go test ./...` 通过。
+- `git diff --check` 通过。

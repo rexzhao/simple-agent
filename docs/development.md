@@ -132,6 +132,35 @@ sai config show
 sai mcp list  # M4
 ```
 
+Help/usage 是普通 CLI 行为，不引入 TUI 或第三方 CLI 框架。支持：
+
+```text
+sai -h
+sai --help
+sai help
+sai version -h
+sai help version
+sai run -h
+sai help run
+sai config -h
+sai help config
+sai config show -h
+sai help config show
+sai models -h
+sai help models
+sai models list -h
+sai help models list
+sai mcp -h
+sai help mcp
+sai mcp list -h
+sai help mcp list
+```
+
+help 输出写到 stdout，exit code 为 0。help 必须在配置加载前完成：不读取 `.agents`
+配置、不解析 provider API key、不读取 enabled skills 或 MCP 配置，也不能打印任何配置值
+或 secrets。未知命令和错误参数仍以 exit code 1 失败，并给出可读错误和类似
+`Run "sai help" for usage.` 的提示。
+
 常用参数：
 
 ```text

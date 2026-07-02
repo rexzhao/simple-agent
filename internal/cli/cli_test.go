@@ -178,6 +178,175 @@ func TestVersionCommand(t *testing.T) {
 	}
 }
 
+func TestRootHelpWritesUsageWithoutConfig(t *testing.T) {
+	for _, args := range [][]string{
+		{"-h"},
+		{"help"},
+	} {
+		t.Run(strings.Join(args, " "), func(t *testing.T) {
+			assertCLIHelpWithoutConfig(t, args, "usage: sai", "config show", "models list", "Run \"sai help <command>\" for command usage.")
+		})
+	}
+}
+
+func TestRunHelpWritesUsageWithoutConfig(t *testing.T) {
+	for _, args := range [][]string{
+		{"run", "-h"},
+		{"help", "run"},
+	} {
+		t.Run(strings.Join(args, " "), func(t *testing.T) {
+			assertCLIHelpWithoutConfig(t, args, "usage: sai run", "--provider name", "--enable-tools names")
+		})
+	}
+}
+
+func TestVersionHelpWritesUsageWithoutConfig(t *testing.T) {
+	for _, args := range [][]string{
+		{"version", "-h"},
+		{"version", "--help"},
+		{"help", "version"},
+	} {
+		t.Run(strings.Join(args, " "), func(t *testing.T) {
+			assertCLIHelpWithoutConfig(t, args, "usage: sai version", "Prints the sai version.")
+		})
+	}
+}
+
+func TestGroupHelpWritesUsageWithoutConfig(t *testing.T) {
+	tests := []struct {
+		name  string
+		args  []string
+		wants []string
+	}{
+		{
+			name:  "config flag short",
+			args:  []string{"config", "-h"},
+			wants: []string{"usage: sai config <command>", "config show"},
+		},
+		{
+			name:  "config flag long",
+			args:  []string{"config", "--help"},
+			wants: []string{"usage: sai config <command>", "config show"},
+		},
+		{
+			name:  "config help",
+			args:  []string{"help", "config"},
+			wants: []string{"usage: sai config <command>", "config show"},
+		},
+		{
+			name:  "models flag short",
+			args:  []string{"models", "-h"},
+			wants: []string{"usage: sai models <command>", "models list"},
+		},
+		{
+			name:  "models flag long",
+			args:  []string{"models", "--help"},
+			wants: []string{"usage: sai models <command>", "models list"},
+		},
+		{
+			name:  "models help",
+			args:  []string{"help", "models"},
+			wants: []string{"usage: sai models <command>", "models list"},
+		},
+		{
+			name:  "mcp flag short",
+			args:  []string{"mcp", "-h"},
+			wants: []string{"usage: sai mcp <command>", "mcp list"},
+		},
+		{
+			name:  "mcp flag long",
+			args:  []string{"mcp", "--help"},
+			wants: []string{"usage: sai mcp <command>", "mcp list"},
+		},
+		{
+			name:  "mcp help",
+			args:  []string{"help", "mcp"},
+			wants: []string{"usage: sai mcp <command>", "mcp list"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assertCLIHelpWithoutConfig(t, tt.args, tt.wants...)
+		})
+	}
+}
+
+func TestNestedHelpWritesUsageWithoutConfig(t *testing.T) {
+	tests := []struct {
+		name  string
+		args  []string
+		wants []string
+	}{
+		{
+			name:  "config show flag",
+			args:  []string{"config", "show", "-h"},
+			wants: []string{"usage: sai config show", "sensitive values redacted"},
+		},
+		{
+			name:  "config show help",
+			args:  []string{"help", "config", "show"},
+			wants: []string{"usage: sai config show", "sensitive values redacted"},
+		},
+		{
+			name:  "models list flag",
+			args:  []string{"models", "list", "-h"},
+			wants: []string{"usage: sai models list", "provider model profiles"},
+		},
+		{
+			name:  "models list help",
+			args:  []string{"help", "models", "list"},
+			wants: []string{"usage: sai models list", "provider model profiles"},
+		},
+		{
+			name:  "mcp list flag",
+			args:  []string{"mcp", "list", "-h"},
+			wants: []string{"usage: sai mcp list", "--enable-mcp ids"},
+		},
+		{
+			name:  "mcp list help",
+			args:  []string{"help", "mcp", "list"},
+			wants: []string{"usage: sai mcp list", "--enable-mcp ids"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assertCLIHelpWithoutConfig(t, tt.args, tt.wants...)
+		})
+	}
+}
+
+func TestUnknownCommandIncludesHelpHint(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	code := RunWithGetwd([]string{"nope"}, &stdout, &stderr, func() (string, error) {
+		return "", errors.New("getwd should not be called")
+	})
+
+	if code != 1 {
+		t.Fatalf("RunWithGetwd() code = %d, want 1", code)
+	}
+	if stdout.String() != "" {
+		t.Fatalf("stdout = %q, want empty", stdout.String())
+	}
+	assertCLIErrorContains(t, stderr.String(), `unknown command "nope"`, `Run "sai help" for usage.`)
+}
+
+func TestRunMissingPromptIncludesUsageHint(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	code := RunWithGetwd([]string{"run"}, &stdout, &stderr, func() (string, error) {
+		return "", errors.New("getwd should not be called")
+	})
+
+	if code != 1 {
+		t.Fatalf("RunWithGetwd() code = %d, want 1", code)
+	}
+	if stdout.String() != "" {
+		t.Fatalf("stdout = %q, want empty", stdout.String())
+	}
+	assertCLIErrorContains(t, stderr.String(), "missing prompt", "usage: sai run", `Run "sai help run" for usage.`)
+}
+
 func TestRunUsesDefaultProviderModelAndOutputsTextDelta(t *testing.T) {
 	server, requests := newCLIRunServer(t,
 		`{"choices":[{"delta":{"content":"hello"}}]}`,
@@ -653,7 +822,7 @@ func TestRunEnableSkillsAndDisableSkillsConflict(t *testing.T) {
 	if stdout.String() != "" {
 		t.Fatalf("stdout = %q, want empty", stdout.String())
 	}
-	assertCLIErrorContains(t, stderr.String(), "cannot use --enable-skills with --disable-skills")
+	assertCLIErrorContains(t, stderr.String(), "cannot use --enable-skills with --disable-skills", `Run "sai help run" for usage.`)
 	assertNoAdditionalCLIRunRequest(t, requests)
 }
 
@@ -1956,6 +2125,30 @@ func assertCLIErrorContains(t *testing.T, got string, wants ...string) {
 	for _, want := range wants {
 		if !strings.Contains(got, want) {
 			t.Fatalf("stderr = %q, want contain %q", got, want)
+		}
+	}
+}
+
+func assertCLIHelpWithoutConfig(t *testing.T, args []string, wants ...string) {
+	t.Helper()
+
+	var stdout, stderr bytes.Buffer
+	code := RunWithGetwd(args, &stdout, &stderr, func() (string, error) {
+		return "", errors.New("getwd should not be called")
+	})
+	if code != 0 {
+		t.Fatalf("RunWithGetwd(%v) code = %d, stderr = %s", args, code, stderr.String())
+	}
+	if stderr.String() != "" {
+		t.Fatalf("stderr = %q, want empty", stderr.String())
+	}
+	out := stdout.String()
+	if out == "" {
+		t.Fatal("stdout is empty")
+	}
+	for _, want := range wants {
+		if !strings.Contains(out, want) {
+			t.Fatalf("stdout = %q, want contain %q", out, want)
 		}
 	}
 }

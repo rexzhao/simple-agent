@@ -52,6 +52,19 @@ models:
 sai run --provider paperhub --model glm-5.2 "Hello"
 ```
 
+Show CLI usage without loading configuration:
+
+```sh
+sai help
+sai help version
+sai help run
+sai run -h
+sai help config
+sai help config show
+sai help models
+sai help mcp
+```
+
 Enable tools for a single run:
 
 ```sh
