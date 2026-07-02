@@ -7,8 +7,12 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/rexzhao/simple-agent/internal/model"
 )
 
 func TestRegisterBuiltinsRegistersExpectedTools(t *testing.T) {
@@ -111,6 +115,77 @@ func TestShellNonZeroExitReturnsErrorResult(t *testing.T) {
 	}
 	if !strings.Contains(result.Content, "fail") {
 		t.Fatalf("Execute(shell) content = %q, want fail output", result.Content)
+	}
+}
+
+func TestShellContextCancelReturnsErrorResult(t *testing.T) {
+	root := t.TempDir()
+	registry := registerBuiltinsForTest(t, root)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	defer cleanupChildProcessFromPIDFile(t, filepath.Join(root, "child.pid"))
+
+	type executeResult struct {
+		result model.ToolResult
+		err    error
+	}
+	resultCh := make(chan executeResult, 1)
+	go func() {
+		result, err := registry.Execute(ctx, BuiltinShell, map[string]any{"command": childProcessTreeCommand()})
+		resultCh <- executeResult{result: result, err: err}
+	}()
+
+	waitForFile(t, filepath.Join(root, "started.txt"), 5*time.Second)
+	waitForFileSize(t, filepath.Join(root, "child.txt"), 1, 5*time.Second)
+	cancelAt := time.Now()
+	cancel()
+
+	select {
+	case got := <-resultCh:
+		if elapsed := time.Since(cancelAt); elapsed > 5*time.Second {
+			t.Fatalf("Execute(shell) returned after %v, want under 5s", elapsed)
+		}
+		if got.err != nil {
+			t.Fatalf("Execute(shell) error = %v", got.err)
+		}
+		assertShellContextErrorResult(t, got.result, context.Canceled.Error())
+		assertFileStopsGrowing(t, filepath.Join(root, "child.txt"))
+	case <-time.After(5 * time.Second):
+		t.Fatal("Execute(shell) did not return promptly after context cancellation")
+	}
+}
+
+func TestShellContextDeadlineReturnsErrorResult(t *testing.T) {
+	root := t.TempDir()
+	registry := registerBuiltinsForTest(t, root)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	defer cleanupChildProcessFromPIDFile(t, filepath.Join(root, "child.pid"))
+
+	resultCh := make(chan struct {
+		result model.ToolResult
+		err    error
+	}, 1)
+	go func() {
+		result, err := registry.Execute(ctx, BuiltinShell, map[string]any{"command": childProcessTreeCommand()})
+		resultCh <- struct {
+			result model.ToolResult
+			err    error
+		}{result: result, err: err}
+	}()
+
+	waitForFile(t, filepath.Join(root, "started.txt"), 2*time.Second)
+	waitForFileSize(t, filepath.Join(root, "child.txt"), 1, 2*time.Second)
+
+	select {
+	case got := <-resultCh:
+		if got.err != nil {
+			t.Fatalf("Execute(shell) error = %v", got.err)
+		}
+		assertShellContextErrorResult(t, got.result, context.DeadlineExceeded.Error())
+		assertFileStopsGrowing(t, filepath.Join(root, "child.txt"))
+	case <-time.After(5 * time.Second):
+		t.Fatal("Execute(shell) did not return promptly after context deadline")
 	}
 }
 
@@ -360,4 +435,111 @@ func failingCommand() string {
 		return "Write-Output fail; exit 7"
 	}
 	return "printf fail; exit 7"
+}
+
+func childProcessTreeCommand() string {
+	if runtime.GOOS == "windows" {
+		return "powershell -NoProfile -NonInteractive -Command 'Set-Content -LiteralPath child.pid -Value $PID; Set-Content -LiteralPath started.txt -Value started; while ($true) { Add-Content -LiteralPath child.txt -Value tick; Start-Sleep -Milliseconds 200 }'"
+	}
+	return "sh -c 'printf \"%s\" \"$$\" > child.pid; printf started > started.txt; while :; do printf tick >> child.txt; sleep 0.2; done'"
+}
+
+func waitForFile(t *testing.T, path string, timeout time.Duration) {
+	t.Helper()
+
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(path); err == nil {
+			return
+		} else if !os.IsNotExist(err) {
+			t.Fatalf("Stat(%q) error = %v", path, err)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("file %q did not appear within %v", path, timeout)
+}
+
+func waitForFileSize(t *testing.T, path string, minSize int64, timeout time.Duration) {
+	t.Helper()
+
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		info, err := os.Stat(path)
+		if err == nil && info.Size() >= minSize {
+			return
+		}
+		if err != nil && !os.IsNotExist(err) {
+			t.Fatalf("Stat(%q) error = %v", path, err)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("file %q did not reach size %d within %v", path, minSize, timeout)
+}
+
+func assertFileStopsGrowing(t *testing.T, path string) {
+	t.Helper()
+
+	before := fileSize(t, path)
+	time.Sleep(800 * time.Millisecond)
+	after := fileSize(t, path)
+	if after != before {
+		t.Fatalf("file %q kept growing after shell cancellation: size before = %d, after = %d", path, before, after)
+	}
+}
+
+func fileSize(t *testing.T, path string) int64 {
+	t.Helper()
+
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("Stat(%q) error = %v", path, err)
+	}
+	return info.Size()
+}
+
+func cleanupChildProcessFromPIDFile(t *testing.T, path string) {
+	t.Helper()
+
+	data, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		return
+	}
+	if err != nil {
+		t.Logf("cannot read child pid file %q: %v", path, err)
+		return
+	}
+	pidText := strings.TrimSpace(string(data))
+	if runtime.GOOS == "windows" {
+		_ = exec.Command("taskkill", "/T", "/F", "/PID", pidText).Run()
+		return
+	}
+	pid, err := strconv.Atoi(pidText)
+	if err != nil {
+		t.Logf("cannot parse child pid %q: %v", pidText, err)
+		return
+	}
+	process, err := os.FindProcess(pid)
+	if err != nil {
+		t.Logf("cannot find child pid %d: %v", pid, err)
+		return
+	}
+	_ = process.Kill()
+}
+
+func assertShellContextErrorResult(t *testing.T, result model.ToolResult, wantMessage string) {
+	t.Helper()
+
+	if result.Name != BuiltinShell {
+		t.Fatalf("Execute(shell) result name = %q, want %q", result.Name, BuiltinShell)
+	}
+	if !result.IsError {
+		t.Fatalf("Execute(shell) IsError = false, want true; result = %#v", result)
+	}
+	if strings.TrimSpace(result.Content) == "" {
+		t.Fatal("Execute(shell) content is empty, want context error message")
+	}
+	lower := strings.ToLower(result.Content)
+	if !strings.Contains(lower, wantMessage) {
+		t.Fatalf("Execute(shell) content = %q, want message containing %q", result.Content, wantMessage)
+	}
 }

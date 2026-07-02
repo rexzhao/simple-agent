@@ -2,13 +2,18 @@ package tools
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
+	"syscall"
+	"time"
 
 	"github.com/rexzhao/simple-agent/internal/model"
 )
@@ -18,6 +23,8 @@ const (
 	BuiltinReadFile  = "read_file"
 	BuiltinShell     = "shell"
 )
+
+const shellCancelWaitDelay = 2 * time.Second
 
 func RegisterBuiltins(registry *Registry, rootDir string) error {
 	if registry == nil {
@@ -183,6 +190,7 @@ func newShellExecutor(rootDir string) Executor {
 
 		cmd := shellCommand(ctx, command)
 		cmd.Dir = rootDir
+		configureShellCommandCancel(cmd)
 
 		output, err := cmd.CombinedOutput()
 		result := model.ToolResult{
@@ -191,9 +199,7 @@ func newShellExecutor(rootDir string) Executor {
 		}
 		if err != nil {
 			result.IsError = true
-			if result.Content == "" {
-				result.Content = err.Error()
-			}
+			result.Content = shellErrorContent(ctx, result.Content, err)
 		}
 		return result, nil
 	})
@@ -204,6 +210,85 @@ func shellCommand(ctx context.Context, command string) *exec.Cmd {
 		return exec.CommandContext(ctx, "powershell", "-NoProfile", "-NonInteractive", "-Command", command)
 	}
 	return exec.CommandContext(ctx, "sh", "-c", command)
+}
+
+func configureShellCommandCancel(cmd *exec.Cmd) {
+	cmd.WaitDelay = shellCancelWaitDelay
+
+	killProcessGroup := false
+	if runtime.GOOS != "windows" {
+		attr := &syscall.SysProcAttr{}
+		killProcessGroup = setSysProcAttrBool(attr, "Setpgid", true)
+		if killProcessGroup {
+			cmd.SysProcAttr = attr
+		}
+	}
+
+	cmd.Cancel = func() error {
+		if cmd.Process == nil {
+			return os.ErrProcessDone
+		}
+		if killProcessGroup {
+			if err := killShellProcessGroup(cmd.Process.Pid); err == nil || errors.Is(err, os.ErrProcessDone) {
+				return err
+			}
+		}
+		if runtime.GOOS == "windows" {
+			if err := killWindowsProcessTree(cmd.Process.Pid); err == nil || errors.Is(err, os.ErrProcessDone) {
+				return err
+			}
+		}
+		return cmd.Process.Kill()
+	}
+}
+
+func setSysProcAttrBool(attr *syscall.SysProcAttr, name string, value bool) bool {
+	field := reflect.ValueOf(attr).Elem().FieldByName(name)
+	if !field.IsValid() || !field.CanSet() || field.Kind() != reflect.Bool {
+		return false
+	}
+	field.SetBool(value)
+	return true
+}
+
+func killShellProcessGroup(pid int) error {
+	if pid <= 0 {
+		return os.ErrProcessDone
+	}
+	process, err := os.FindProcess(-pid)
+	if err != nil {
+		return err
+	}
+	return process.Kill()
+}
+
+func killWindowsProcessTree(pid int) error {
+	if pid <= 0 {
+		return os.ErrProcessDone
+	}
+	output, err := exec.Command("taskkill", "/T", "/F", "/PID", strconv.Itoa(pid)).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("taskkill process tree pid %d: %w: %s", pid, err, strings.TrimSpace(string(output)))
+	}
+	return nil
+}
+
+func shellErrorContent(ctx context.Context, output string, err error) string {
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		message := "shell command canceled"
+		if errors.Is(ctxErr, context.DeadlineExceeded) {
+			message = "shell command timed out"
+		}
+		message = fmt.Sprintf("%s: %v", message, ctxErr)
+		if strings.TrimSpace(output) == "" {
+			return message
+		}
+		return message + "\n" + output
+	}
+	if output == "" {
+		return err.Error()
+	}
+	return output
 }
 
 func optionalStringArgument(arguments map[string]any, name string, defaultValue string) (string, error) {
