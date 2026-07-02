@@ -6,10 +6,12 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/rexzhao/simple-agent/internal/model"
+	"github.com/rexzhao/simple-agent/internal/model/httpstream"
 )
 
 func TestProviderStreamPostsResponsesRequestAndEmitsEvents(t *testing.T) {
@@ -131,6 +133,47 @@ func TestProviderStreamReturnsUsefulHTTPError(t *testing.T) {
 		if strings.Contains(message, leaked) {
 			t.Fatalf("error leaked %q: %s", leaked, message)
 		}
+	}
+}
+
+func TestProviderStreamRetries429AndEmitsText(t *testing.T) {
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if requests.Add(1) == 1 {
+			http.Error(w, "rate limited", http.StatusTooManyRequests)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\n")
+		_, _ = io.WriteString(w, "data: {\"type\":\"response.completed\"}\n\n")
+	}))
+	defer server.Close()
+
+	provider, err := NewProvider(ProviderConfig{
+		BaseURL:    server.URL,
+		APIKey:     "test-key",
+		HTTPClient: server.Client(),
+		HTTPOptions: httpstream.Options{
+			RequestTimeout:    time.Second,
+			StreamIdleTimeout: time.Second,
+			MaxRetryAttempts:  3,
+			RetryBackoff:      time.Millisecond,
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewProvider() error = %v", err)
+	}
+
+	events, err := provider.Stream(context.Background(), model.Request{Model: "gpt-5.1"})
+	if err != nil {
+		t.Fatalf("Stream() error = %v", err)
+	}
+	got := collectEvents(t, events)
+	if len(got) != 1 {
+		t.Fatalf("len(events) = %d, want 1: %#v", len(got), got)
+	}
+	if got := requests.Load(); got != 2 {
+		t.Fatalf("requests = %d, want 2", got)
 	}
 }
 

@@ -1,29 +1,32 @@
 package anthropicmessages
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"fmt"
 	"io"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/rexzhao/simple-agent/internal/model"
+	"github.com/rexzhao/simple-agent/internal/model/httpstream"
 )
 
 const anthropicVersion = "2023-06-01"
 
 type ProviderConfig struct {
-	BaseURL    string
-	APIKey     string
-	HTTPClient *http.Client
+	BaseURL     string
+	APIKey      string
+	HTTPClient  *http.Client
+	HTTPOptions httpstream.Options
 }
 
 type Provider struct {
-	baseURL    string
-	apiKey     string
-	httpClient *http.Client
+	baseURL     string
+	apiKey      string
+	httpClient  *http.Client
+	httpOptions httpstream.Options
 }
 
 var _ model.Provider = (*Provider)(nil)
@@ -40,9 +43,10 @@ func NewProvider(config ProviderConfig) (*Provider, error) {
 	}
 
 	return &Provider{
-		baseURL:    baseURL,
-		apiKey:     strings.TrimSpace(config.APIKey),
-		httpClient: httpClient,
+		baseURL:     baseURL,
+		apiKey:      strings.TrimSpace(config.APIKey),
+		httpClient:  httpClient,
+		httpOptions: config.HTTPOptions,
 	}, nil
 }
 
@@ -57,28 +61,30 @@ func (p *Provider) Stream(ctx context.Context, request model.Request) (<-chan mo
 		return nil, fmt.Errorf("build Anthropic Messages request body: %w", err)
 	}
 
-	httpRequest, err := http.NewRequestWithContext(ctx, http.MethodPost, p.baseURL+"/messages", bytes.NewReader(body))
+	response, err := httpstream.DoRequest(ctx, p.httpClient, p.httpOptions, func(requestCtx context.Context) (*http.Request, error) {
+		httpRequest, err := http.NewRequestWithContext(requestCtx, http.MethodPost, p.baseURL+"/messages", bytes.NewReader(body))
+		if err != nil {
+			return nil, fmt.Errorf("create Anthropic Messages request: %w", err)
+		}
+		httpRequest.Header.Set("x-api-key", apiKey)
+		httpRequest.Header.Set("anthropic-version", anthropicVersion)
+		httpRequest.Header.Set("Content-Type", "application/json")
+		return httpRequest, nil
+	}, func(body io.Reader) string {
+		return httpstream.ReadErrorBody(body, apiKey)
+	})
 	if err != nil {
-		return nil, fmt.Errorf("create Anthropic Messages request: %w", err)
-	}
-	httpRequest.Header.Set("x-api-key", apiKey)
-	httpRequest.Header.Set("anthropic-version", anthropicVersion)
-	httpRequest.Header.Set("Content-Type", "application/json")
-
-	response, err := p.httpClient.Do(httpRequest)
-	if err != nil {
+		if _, ok := err.(*httpstream.StatusError); ok {
+			return nil, fmt.Errorf("Anthropic Messages request failed: %w", err)
+		}
 		return nil, fmt.Errorf("send Anthropic Messages request: %w", err)
 	}
-	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
-		defer response.Body.Close()
-		return nil, fmt.Errorf("Anthropic Messages request failed: %s: %s", response.Status, readErrorBody(response.Body, apiKey))
-	}
 
-	events := make(chan model.Event)
+	events := make(chan model.Event, 1)
 	go func() {
 		defer close(events)
 		defer response.Body.Close()
-		streamResponseEvents(response.Body, events, toolNames)
+		streamResponseEvents(ctx, response.Body, p.httpOptions.WithDefaults().StreamIdleTimeout, events, toolNames)
 	}()
 	return events, nil
 }
@@ -90,29 +96,13 @@ func (p *Provider) apiKeyValue() (string, error) {
 	return "", fmt.Errorf("API key is required")
 }
 
-func streamResponseEvents(body io.Reader, events chan<- model.Event, toolNames *toolNameMapper) {
-	scanner := bufio.NewScanner(body)
-	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-
+func streamResponseEvents(ctx context.Context, body io.Reader, idleTimeout time.Duration, events chan<- model.Event, toolNames *toolNameMapper) {
 	decoder := newStreamEventDecoder(toolNames)
-	var frame bytes.Buffer
-	for scanner.Scan() {
-		line := scanner.Text()
-		if line == "" || line == "\r" {
-			if emitSSEFrame(decoder, frame.Bytes(), events) {
-				return
-			}
-			frame.Reset()
-			continue
-		}
-		frame.WriteString(line)
-		frame.WriteByte('\n')
-	}
-	if frame.Len() > 0 {
-		emitSSEFrame(decoder, frame.Bytes(), events)
-	}
-	if err := scanner.Err(); err != nil {
-		events <- model.ErrorEvent{Err: err, Message: "read Anthropic Messages stream"}
+	err := httpstream.ReadSSEFrames(ctx, body, idleTimeout, func(frame []byte) bool {
+		return emitSSEFrame(decoder, frame, events)
+	})
+	if err != nil {
+		sendStreamError(events, err, "Anthropic Messages")
 	}
 }
 
@@ -132,17 +122,10 @@ func emitSSEFrame(decoder *streamEventDecoder, frame []byte, events chan<- model
 	return done
 }
 
-func readErrorBody(body io.Reader, apiKey string) string {
-	data, err := io.ReadAll(io.LimitReader(body, 4096))
-	if err != nil {
-		return "read response body: " + err.Error()
+func sendStreamError(events chan<- model.Event, err error, providerName string) {
+	message := "read " + providerName + " stream"
+	if httpstream.IsStreamIdleTimeout(err) {
+		message = providerName + " stream idle timeout"
 	}
-	message := strings.TrimSpace(string(data))
-	if message == "" {
-		return "empty response body"
-	}
-	if apiKey = strings.TrimSpace(apiKey); apiKey != "" {
-		message = strings.ReplaceAll(message, apiKey, "<redacted>")
-	}
-	return message
+	events <- model.ErrorEvent{Err: err, Message: message}
 }

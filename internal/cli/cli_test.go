@@ -2683,7 +2683,7 @@ func TestRunErrorsDoNotLeakAPIKeyValues(t *testing.T) {
 				RawBody:       body,
 				Body:          decodeCLIJSON(t, body),
 			}
-			http.Error(w, "rate limited for Authorization: Bearer direct-secret-value", http.StatusTooManyRequests)
+			http.Error(w, "bad request for Authorization: Bearer direct-secret-value", http.StatusBadRequest)
 		}))
 		defer server.Close()
 
@@ -2701,7 +2701,7 @@ func TestRunErrorsDoNotLeakAPIKeyValues(t *testing.T) {
 		if stdout.String() != "" {
 			t.Fatalf("stdout = %q, want empty", stdout.String())
 		}
-		assertCLIErrorContains(t, stderr.String(), "request model", "OpenAI chat request failed", "429 Too Many Requests", "rate limited")
+		assertCLIErrorContains(t, stderr.String(), "request model", "OpenAI chat request failed", "400 Bad Request", "bad request")
 		assertCLIErrorOmits(t, stderr.String(), "direct-secret-value", "Bearer direct-secret-value")
 
 		request := <-requests

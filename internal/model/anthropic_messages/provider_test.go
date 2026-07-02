@@ -6,10 +6,12 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/rexzhao/simple-agent/internal/model"
+	"github.com/rexzhao/simple-agent/internal/model/httpstream"
 )
 
 func TestProviderStreamPostsMessagesRequestAndEmitsText(t *testing.T) {
@@ -127,6 +129,47 @@ func TestProviderStreamReturnsUsefulHTTPError(t *testing.T) {
 	}
 	if strings.Contains(message, "http-secret-value") {
 		t.Fatalf("error leaked API key: %s", message)
+	}
+}
+
+func TestProviderStreamRetries5xxAndEmitsText(t *testing.T) {
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if requests.Add(1) == 1 {
+			http.Error(w, "temporary failure", http.StatusBadGateway)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}\n\n")
+		_, _ = io.WriteString(w, "data: {\"type\":\"message_stop\"}\n\n")
+	}))
+	defer server.Close()
+
+	provider, err := NewProvider(ProviderConfig{
+		BaseURL:    server.URL,
+		APIKey:     "test-key",
+		HTTPClient: server.Client(),
+		HTTPOptions: httpstream.Options{
+			RequestTimeout:    time.Second,
+			StreamIdleTimeout: time.Second,
+			MaxRetryAttempts:  3,
+			RetryBackoff:      time.Millisecond,
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewProvider() error = %v", err)
+	}
+
+	events, err := provider.Stream(context.Background(), model.Request{Model: "claude-sonnet-5"})
+	if err != nil {
+		t.Fatalf("Stream() error = %v", err)
+	}
+	got := collectEvents(t, events)
+	if len(got) != 1 {
+		t.Fatalf("len(events) = %d, want 1: %#v", len(got), got)
+	}
+	if got := requests.Load(); got != 2 {
+		t.Fatalf("requests = %d, want 2", got)
 	}
 }
 
