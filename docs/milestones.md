@@ -94,8 +94,8 @@ MCP 放到 MVP 之后。
 - version 命令。
 - 可读错误信息。
 - `--verbose` 诊断信息，且不泄露 API key 或其他敏感配置值的实际值。
-- JSONL 日志，每次 `run` / `chat` 写入独立 session 目录，且不泄露 API key、
-  Authorization header 或其他敏感配置值的实际值。
+- JSONL 日志，每次 `run` / `chat` 预计算独立 session 路径，并在首个日志事件发生时写入
+  独立 session 目录，且不泄露 API key、Authorization header 或其他敏感配置值的实际值。
 - 除 JSONL 日志外，不保存会话历史、上下文快照或其他状态。
 - 最小 README 使用说明。
 

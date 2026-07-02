@@ -460,6 +460,9 @@ func TestChatExitReturnsWithoutModelRequest(t *testing.T) {
 	if got, want := stderr.String(), "> "; got != want {
 		t.Fatalf("stderr = %q, want %q", got, want)
 	}
+	if logPaths := sessionLogPaths(t, configDir); len(logPaths) != 0 {
+		t.Fatalf("session log paths = %#v, want none", logPaths)
+	}
 	assertNoAdditionalCLIRunRequest(t, requests)
 }
 
@@ -1269,6 +1272,85 @@ func TestRunVerboseWritesDiagnosticsWithoutSensitiveContent(t *testing.T) {
 	})
 }
 
+func TestRunVerboseReportsFutureSessionLogPathBeforeFirstEvent(t *testing.T) {
+	releaseResponse := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() {
+		releaseOnce.Do(func() {
+			close(releaseResponse)
+		})
+	}
+
+	requests := make(chan capturedCLIRunRequest, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("ReadAll() error = %v", err)
+		}
+		requests <- capturedCLIRunRequest{
+			Path:          r.URL.Path,
+			Authorization: r.Header.Get("Authorization"),
+			RawBody:       body,
+			Body:          decodeCLIJSON(t, body),
+		}
+
+		<-releaseResponse
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n")
+		_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
+	}))
+	defer server.Close()
+	defer release()
+
+	configDir := t.TempDir()
+	writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
+
+	var stdout, stderr bytes.Buffer
+	done := make(chan int, 1)
+	go func() {
+		done <- RunWithGetwd([]string{"--config-dir", configDir, "run", "--verbose", "hello"}, &stdout, &stderr, func() (string, error) {
+			return t.TempDir(), nil
+		})
+	}()
+
+	select {
+	case <-requests:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for first model request")
+	}
+
+	futurePath := verboseLogPath(t, stderr.String())
+	if futurePath == "(disabled)" {
+		t.Fatalf("verbose log_path = %q, want future session path", futurePath)
+	}
+	if filepath.Base(futurePath) != "sai.jsonl" {
+		t.Fatalf("verbose log_path = %q, want sai.jsonl file", futurePath)
+	}
+	if logPaths := sessionLogPaths(t, configDir); len(logPaths) != 0 {
+		t.Fatalf("session log paths before first event = %#v, want none", logPaths)
+	}
+
+	release()
+	select {
+	case code := <-done:
+		if code != 0 {
+			t.Fatalf("RunWithGetwd() code = %d, stderr = %s", code, stderr.String())
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for run to finish")
+	}
+	if got, want := stdout.String(), "ok"; got != want {
+		t.Fatalf("stdout = %q, want %q", got, want)
+	}
+	logPaths := sessionLogPaths(t, configDir)
+	if len(logPaths) != 1 {
+		t.Fatalf("session log paths = %#v, want one", logPaths)
+	}
+	if logPaths[0] != futurePath {
+		t.Fatalf("session log path = %q, want verbose future path %q", logPaths[0], futurePath)
+	}
+}
+
 func TestRunExecutesToolCallAndContinuesToFinalText(t *testing.T) {
 	server, requests := newSequentialCLIRunServer(t,
 		[]string{
@@ -1865,6 +1947,20 @@ func TestRunErrorsDoNotLeakAPIKeyValues(t *testing.T) {
 		request := <-requests
 		if request.Authorization != "Bearer direct-secret-value" {
 			t.Fatalf("Authorization = %q, want direct API key", request.Authorization)
+		}
+		logPaths := sessionLogPaths(t, configDir)
+		if len(logPaths) != 1 {
+			t.Fatalf("session log paths = %#v, want one error log", logPaths)
+		}
+		data, err := os.ReadFile(logPaths[0])
+		if err != nil {
+			t.Fatalf("ReadFile(%q) error = %v", logPaths[0], err)
+		}
+		records := readJSONLRecords(t, data)
+		assertCLILogBaseFields(t, records)
+		errorRecord := firstCLILogRecord(t, records, "error")
+		if errorRecord["level"] != "error" || errorRecord["message"] != "request model" {
+			t.Fatalf("error log record = %#v, want level error with request model message", errorRecord)
 		}
 		assertNoAdditionalCLIRunRequest(t, requests)
 	})
@@ -2647,6 +2743,18 @@ func assertCLIVerboseContains(t *testing.T, got string, wants ...string) {
 			t.Fatalf("verbose stderr = %q, want contain %q", got, want)
 		}
 	}
+}
+
+func verboseLogPath(t *testing.T, got string) string {
+	t.Helper()
+
+	for _, line := range strings.Split(got, "\n") {
+		if strings.HasPrefix(line, "log_path: ") {
+			return strings.TrimPrefix(line, "log_path: ")
+		}
+	}
+	t.Fatalf("verbose stderr = %q, want log_path line", got)
+	return ""
 }
 
 func sessionLogPaths(t *testing.T, configDir string) []string {

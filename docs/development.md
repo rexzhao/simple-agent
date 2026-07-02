@@ -522,7 +522,9 @@ v0.1 中 MCP server 进程生命周期由当前 agent 进程管理。后台常�
 v0.1 只落盘 JSONL 日志，不保存会话历史或上下文快照。日志路径来自
 `logging.path`，相对路径基于配置根目录解析。`logging.path` 解释为日志根/基准路径：
 如果配置为 `logs/sai.jsonl`，实际 session root 是 `logs/`；如果配置为空，禁用日志。
-每次 `sai run` 或 `sai chat` 启动 runtime 时创建唯一 session 目录，并写入：
+每次 `sai run` 或 `sai chat` 启动 runtime 时预先确定唯一 session JSONL 路径，供
+`--verbose` 显示；但 log root、session 目录和 `sai.jsonl` 只在第一条日志事件发生时
+创建。chat 启动后直接 `/exit`、`/quit` 或 EOF 且没有模型请求时，不产生日志 session。
 
 ```text
 <log-root>/<timestamp>-<short-random>/sai.jsonl

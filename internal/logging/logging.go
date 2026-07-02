@@ -21,14 +21,15 @@ type Attributes struct {
 }
 
 type Logger struct {
-	path     string
-	root     string
-	provider string
-	model    string
-	level    string
-	now      func() time.Time
-	file     *os.File
-	writer   *bufio.Writer
+	path       string
+	root       string
+	sessionDir string
+	provider   string
+	model      string
+	level      string
+	now        func() time.Time
+	file       *os.File
+	writer     *bufio.Writer
 }
 
 func Open(path string, attributes Attributes) (*Logger, error) {
@@ -44,18 +45,8 @@ func Open(path string, attributes Attributes) (*Logger, error) {
 	}
 
 	logger.root = sessionRoot(configuredPath)
-	sessionDir, err := createSessionDir(logger.root, logger.now)
-	if err != nil {
-		return nil, err
-	}
-	logger.path = filepath.Join(sessionDir, "sai.jsonl")
-
-	file, err := os.OpenFile(logger.path, os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0o644)
-	if err != nil {
-		return nil, fmt.Errorf("open JSONL log %q: %w", logger.path, err)
-	}
-	logger.file = file
-	logger.writer = bufio.NewWriter(file)
+	logger.sessionDir = filepath.Join(logger.root, sessionID(logger.now))
+	logger.path = filepath.Join(logger.sessionDir, "sai.jsonl")
 	return logger, nil
 }
 
@@ -67,8 +58,11 @@ func (l *Logger) Path() string {
 }
 
 func (l *Logger) LogEvent(event model.Event) error {
-	if l == nil || l.writer == nil {
+	if l == nil || l.path == "" {
 		return nil
+	}
+	if err := l.ensureOpen(); err != nil {
+		return err
 	}
 
 	record := l.eventRecord(event)
@@ -82,6 +76,25 @@ func (l *Logger) LogEvent(event model.Event) error {
 	if err := l.writer.WriteByte('\n'); err != nil {
 		return fmt.Errorf("write JSONL log %q: %w", l.path, err)
 	}
+	return nil
+}
+
+func (l *Logger) ensureOpen() error {
+	if l.writer != nil {
+		return nil
+	}
+	if err := os.MkdirAll(l.root, 0o755); err != nil {
+		return fmt.Errorf("create JSONL log root %q: %w", l.root, err)
+	}
+	if err := os.Mkdir(l.sessionDir, 0o755); err != nil {
+		return fmt.Errorf("create JSONL log session directory %q: %w", l.sessionDir, err)
+	}
+	file, err := os.OpenFile(l.path, os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0o644)
+	if err != nil {
+		return fmt.Errorf("open JSONL log %q: %w", l.path, err)
+	}
+	l.file = file
+	l.writer = bufio.NewWriter(file)
 	return nil
 }
 
@@ -168,22 +181,6 @@ func sessionRoot(path string) string {
 		return filepath.Dir(path)
 	}
 	return path
-}
-
-func createSessionDir(root string, now func() time.Time) (string, error) {
-	if err := os.MkdirAll(root, 0o755); err != nil {
-		return "", fmt.Errorf("create JSONL log root %q: %w", root, err)
-	}
-
-	for i := 0; i < 16; i++ {
-		sessionDir := filepath.Join(root, sessionID(now))
-		if err := os.Mkdir(sessionDir, 0o755); err == nil {
-			return sessionDir, nil
-		} else if !os.IsExist(err) {
-			return "", fmt.Errorf("create JSONL log session directory %q: %w", sessionDir, err)
-		}
-	}
-	return "", fmt.Errorf("create unique JSONL log session directory under %q: too many collisions", root)
 }
 
 func sessionID(now func() time.Time) string {

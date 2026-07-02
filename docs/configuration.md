@@ -375,15 +375,17 @@ logging:
 
 `logging.path` 兼容旧配置，但运行时解释为日志根/基准路径：如果配置为 `logs/sai.jsonl`，
 实际 session root 是配置目录下的 `logs/`；如果配置为空字符串，则禁用日志。每次
-`sai run` 或 `sai chat` 启动 runtime 时创建唯一 session 目录，并写入：
+`sai run` 或 `sai chat` 启动 runtime 时会预先确定唯一 session JSONL 路径，供
+`--verbose` 的 `log_path` 显示；但 log root、session 目录和 `sai.jsonl` 只在第一条日志
+事件发生时创建。
 
 ```text
 <log-root>/<timestamp>-<short-random>/sai.jsonl
 ```
 
-`sai config show`、help、list 等不启动 runtime 的命令不会创建 session 日志。`--verbose`
-中的 `log_path` 显示本次运行实际使用的 session JSONL 文件路径，禁用日志时显示
-`(disabled)`。
+`sai config show`、help、list 等不启动 runtime 的命令不会创建 session 日志。chat 启动后
+直接 `/exit`、`/quit` 或 EOF 且没有模型请求时，也不创建 session 日志。`--verbose` 中的
+`log_path` 显示本次运行实际使用的 session JSONL 文件路径，禁用日志时显示 `(disabled)`。
 
 每行日志是一个 JSON object。日志可以记录模型请求生命周期、工具调用、usage、HTTP 错误
 和 MCP 错误。API key、Authorization header 和其他敏感配置值的实际值不能进入日志。
