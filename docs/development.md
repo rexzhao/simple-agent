@@ -37,6 +37,7 @@
 ## v0.1 非目标
 
 - TUI 或全屏终端界面。
+- Markdown 渲染。
 - 浏览器自动化。
 - multi-agent 编排。
 - 长期记忆。
@@ -46,6 +47,25 @@
 - MCP stdio。
 - remote MCP over HTTP/SSE。
 - 插件市场或插件生命周期管理。
+
+## 后续路线边界
+
+M11-M15 继续沿用纯 CLI 的产品形态，优先补可靠性、编辑工具、可恢复 session、上下文
+窗口管理、输入体验和配置诊断。后续路线不改变 v0.1 的已完成边界：当前版本仍只落
+JSONL 日志，不保存完整会话上下文、prompt、response 或 tool result 正文。
+
+可恢复 session 是 M13 之后的独立能力，不是 JSONL 日志的增强开关。它默认关闭；只有用户
+通过配置或命令显式启用后，才会保存完整 messages、assistant tool calls 和 tool result
+messages，以及 provider/model/parameters、cwd、enabled tools/MCP/skills/reasoning 和
+注入指令快照或可重建信息。只有保存这些完整上下文，`resume` 才能可靠，而这也意味着
+session 文件会包含敏感数据。
+
+`sai run` 不回归。后续 stdin、file 和 multiline 输入都属于 `sai chat --quit` 或
+`sai chat` 的输入能力，复用同一套 provider 选择、message 构造、工具启用、日志和错误
+处理路径。
+
+Markdown 渲染不是近期目标；如果后续需要，也应作为远期低优先级能力单独设计，不进入
+下一阶段里程碑。
 
 ## 架构
 
@@ -135,6 +155,8 @@ sai models list
 sai config show
 sai mcp list  # M4
 ```
+
+后续 stdin/file 输入也继续收敛到 `sai chat --quit`，不新增或恢复 `sai run` 入口。
 
 Help/usage 是普通 CLI 行为，不引入 TUI 或第三方 CLI 框架。支持：
 
@@ -559,6 +581,17 @@ model
 工具调用、usage、HTTP 错误、MCP 错误可以写入日志。API key、Authorization header
 和其他敏感配置值的实际值不能写入日志。v0.1 不记录完整 prompt、response、
 tool result 正文，也不提供开启正文日志的配置。
+
+M13 后的 resumable sessions 使用独立的 `sessions` 配置和独立存储目录，不复用
+`logging.path`。JSONL session log / transcript 继续服务于诊断和审计，默认仍不记录完整
+正文；resumable session 则服务于可靠恢复，启用后必须保存完整 messages 和 tool result
+messages。二者的用途、默认值和敏感数据风险都应在 CLI 和文档中明确区分。
+
+resumable session 默认关闭。启用后，每个 session 至少保存 provider、model、model
+profile parameters、cwd、配置根目录、启用 tools/MCP/skills/reasoning、注入指令快照或
+可重建信息，以及完整 user messages、assistant final messages、assistant tool calls 和
+tool result messages。缺少这些信息时，只能得到 transcript 或诊断日志，不能承诺可靠
+resume。
 
 ## 测试策略
 

@@ -323,3 +323,153 @@ M7 当前实现只覆盖配置目录下的本地 skills：通过 `skills.enabled
 - `gofmt -w internal/agent/agent.go internal/agent/agent_test.go internal/cli/cli.go internal/cli/cli_test.go` 通过。
 - `go test ./...` 通过。
 - `git diff --check` 通过。
+
+## M11：Reliability
+
+目标：补齐长时间运行和异常路径下的可靠性，使 `sai chat`、provider stream、MCP 和
+本地子进程在取消、超时和可恢复错误后都有清晰边界。
+
+交付物：
+
+- Ctrl+C / interrupt 统一进入 context cancel 流程，当前模型请求、shell 工具和 MCP
+  stdio 子进程都能感知并退出。
+- 明确 chat runtime 的 context lifecycle：会话级 context、单次模型请求 context 和工具
+  执行 context 不互相泄漏。
+- HTTP request timeout，避免连接或首包长期挂起。
+- stream idle timeout，避免 SSE 已建立但长时间没有事件时无限等待。
+- 429 和 5xx 的有界 retry 策略，包含最大次数、退避和可读错误。
+- `sai chat` 在可恢复请求错误后不伪造 assistant 历史，并回到 prompt 允许用户继续输入。
+- MCP stdio server 在正常退出、错误退出、Ctrl+C 和 context cancel 时都关闭子进程。
+- `shell` 工具在取消或超时时关闭子进程并回收资源。
+- JSONL logger 在正常退出、错误退出和 Ctrl+C 时 flush / close；flush 失败有可诊断错误。
+
+验证：
+
+- 单元测试覆盖 context cancel 后 provider request、tool execution 和 logger close 的调用边界。
+- fake HTTP server 测试覆盖 request timeout、stream idle timeout、429 retry 和 5xx retry。
+- CLI 测试覆盖 `sai chat` 单轮可恢复错误后回到 prompt，且错误轮次不追加成功 assistant
+  history。
+- fake MCP server / shell 测试覆盖取消和退出时无遗留子进程。
+- `go test ./...` 通过。
+- `git diff --check` 通过。
+
+## M12：Editing Tools
+
+目标：在读取和 shell 之外，增加受显式启用控制的文件编辑能力，同时保持默认安全边界和
+克制的终端状态输出。
+
+交付物：
+
+- 新增 `write_file` 工具，用于覆盖写入文件。
+- 新增 `edit_file` 或 patch-style 编辑工具，用于局部编辑已有文件。
+- 编辑工具默认不启用，只有出现在 `tools.enabled` 或 `--enable-tools` 中才暴露给模型。
+- `sai tools list` 静态列出新增编辑工具，但不代表默认启用。
+- 编辑工具状态继续写 stderr，保留简短安全状态；不打印完整写入内容、patch 正文或文件
+  内容。
+- 路径解析沿用现有工具的启动目录边界和错误风格；路径错误给出可读错误。
+- 工具结果消息只包含模型继续推理所需的摘要和错误，不向终端泄露完整内容。
+
+验证：
+
+- 单元测试覆盖 `write_file` 覆盖写入。
+- 单元测试覆盖 `edit_file` 或 patch-style 工具的局部编辑。
+- 单元测试覆盖路径不存在、路径非法或目录/文件类型不匹配时的错误。
+- CLI / registry 测试覆盖未启用时不暴露编辑工具。
+- CLI / registry 测试覆盖 `tools.enabled` 和 `--enable-tools` 启用后才暴露编辑工具。
+- 状态输出测试覆盖不打印完整写入内容、patch 正文或 tool result 正文。
+- `go test ./...` 通过。
+- `git diff --check` 通过。
+
+## M13：Resumable Sessions
+
+目标：在现有 JSONL 日志之外，增加显式 opt-in 的完整会话保存和恢复能力；默认继续关闭，
+避免无意保存敏感 prompt、response 和 tool result。
+
+交付物：
+
+- 明确区分 JSONL session log / transcript 和 resumable session：前者用于事件诊断，仍不
+  记录完整 prompt、response 或 tool result 正文；后者用于可靠 resume，必须保存完整上下文。
+- `sessions.enabled: false` 作为默认配置；未显式启用时不保存完整会话上下文。
+- 启用后保存可恢复 session id、创建时间、更新时间和版本信息。
+- 启用后保存 provider、model、model profile parameters、cwd、配置根目录和本次运行的关键
+  runtime 选择。
+- 启用后保存已启用 tools、MCP、skills、reasoning 展示设置，以及对应的 CLI 覆盖来源。
+- 启用后保存注入指令快照，或保存足以重建内置 system、`AGENTS.md` 和 enabled skills 的
+  信息；若使用可重建信息，恢复时必须能检测源文件变化并给出清晰提示。
+- 启用后保存完整 messages：user messages、assistant final messages、assistant tool
+  calls、tool result messages。
+- 启用后保存完整 tool results，除非后续提供明确的不可恢复降级模式。
+- 命令形态建议：`sai chat --save-session`、`sai chat --resume <id>`、
+  `sai chat --continue`。
+- session 管理命令建议：`sai sessions list`、`sai sessions show <id>`、
+  `sai sessions delete <id>`、`sai sessions prune`。
+- CLI、配置文档和错误信息都明确提示 resumable sessions 会保存敏感数据，包含完整
+  prompt、assistant 输出和 tool result。
+
+验证：
+
+- 单元测试覆盖默认配置下不创建 resumable session。
+- 集成测试覆盖 `--save-session` 保存完整 messages 后，`--resume <id>` 能继续同一上下文。
+- 集成测试覆盖 `--continue` 选择最近的可恢复 session。
+- 测试覆盖 provider/model/parameters、cwd、enabled tools/MCP/skills/reasoning 和注入
+  指令信息的保存与恢复。
+- 测试覆盖 tool call history 和 tool result messages 恢复后能被 provider adapter 正确发送。
+- CLI 测试覆盖 `sessions list/show/delete/prune` 的基本行为和敏感数据提示。
+- `go test ./...` 通过。
+- `git diff --check` 通过。
+
+## M14：Context Window Management
+
+目标：在多轮 chat 和可恢复 session 之后，增加上下文窗口管理，先采用保守策略，避免静默
+丢弃关键 system、developer、tool schema 或 tool result 信息。
+
+交付物：
+
+- token budget / usage tracking，优先使用 provider 返回的 usage；缺失时使用保守估算。
+- 会话开始时记录模型 context window 配置或估算值。
+- 接近 context window 时向 stderr 给出清晰警告。
+- 达到预算前拒绝继续或要求用户选择处理方式，不静默截断关键上下文。
+- 初始策略先保守：保留内置 system、`AGENTS.md`、enabled skills、tool/MCP schema、
+  最近 user/assistant 消息和必要 tool result。
+- 设计截断或摘要策略，但摘要进入自动路径前必须有测试覆盖和可解释边界。
+- resumable session 中记录 context management metadata，恢复后能继续判断预算。
+
+验证：
+
+- 单元测试覆盖 usage tracking 和预算计算。
+- fake provider 测试覆盖 provider usage 缺失时的保守估算。
+- CLI 测试覆盖接近窗口时的 stderr 警告。
+- 测试覆盖不会静默丢弃 system/developer/tool schema 信息。
+- 测试覆盖达到预算时给出可读错误或明确下一步提示。
+- `go test ./...` 通过。
+- `git diff --check` 通过。
+
+## M15：Input UX and Doctor
+
+目标：改善输入和配置诊断体验，但继续保持纯 CLI，不恢复 `sai run`，不引入 TUI，也不把
+Markdown 渲染纳入近期目标。
+
+交付物：
+
+- 多行输入支持属于 `sai chat` 能力，和现有 REPL / `--quit` 语义兼容。
+- stdin 输入和 file 输入都走 `sai chat --quit`，不恢复 `sai run`。
+- 明确命令形态，例如 `sai chat --quit --stdin`、`sai chat --quit --file prompt.md`
+  或等价的克制 CLI 设计。
+- stdin/file 输入进入同一套 message 构造、provider 选择、tools/MCP/skills 启用和日志路径。
+- stdin/file 输入不改变 JSONL 日志默认边界；仍不记录完整 prompt、response 或 tool result。
+- 增加配置健康检查命令，命令名可为 `sai doctor` 或 `sai config check`。
+- 健康检查覆盖配置根目录、provider 文件、默认 provider/model、API key 环境变量是否存在、
+  skill_dir、mcp_dir、enabled tools/MCP/skills 和日志目录可写性。
+- 健康检查输出脱敏，不打印 API key 或其他敏感配置值实际值。
+- 不引入 TUI、不做 Markdown 渲染；Markdown 渲染最多作为远期低优先级非目标记录。
+
+验证：
+
+- CLI 测试覆盖多行输入。
+- CLI 测试覆盖 stdin 输入通过 `sai chat --quit` 执行。
+- CLI 测试覆盖 file 输入通过 `sai chat --quit` 执行。
+- CLI 测试覆盖 `sai run` 仍不可用。
+- CLI 测试覆盖 `sai doctor` 或 `sai config check` 的成功、警告和错误输出。
+- 测试覆盖健康检查不泄露敏感配置值。
+- `go test ./...` 通过。
+- `git diff --check` 通过。

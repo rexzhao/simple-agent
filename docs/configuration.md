@@ -40,6 +40,9 @@ AGENTS.md
   logs/
     20260702T030405.000000000Z-a1b2c3d4/
       sai.jsonl
+  sessions/
+    <session-id>/
+      session.json
 ```
 
 `.agents/` 是默认配置根目录；通过 `--config-dir` 指定时，配置根目录改为指定目录。
@@ -77,6 +80,12 @@ logging:
   path: logs/sai.jsonl
   level: info
 
+# M13 后可选启用
+sessions:
+  enabled: false
+  dir: sessions
+  save_tool_results: true
+
 # M4 后启用
 mcp_dir: mcp
 ```
@@ -96,6 +105,10 @@ mcp_dir: mcp
 - `logging.path`：JSONL 日志根/基准路径。相对路径基于配置根目录解析；例如
   `logs/sai.jsonl` 使用 `logs/` 作为 session root。空字符串表示禁用日志。
 - `logging.level`：日志级别。
+- `sessions.enabled`：M13 后的可恢复 session 开关。默认 `false`，不保存完整上下文。
+- `sessions.dir`：M13 后的可恢复 session 存储目录。相对路径基于配置根目录解析。
+- `sessions.save_tool_results`：M13 后启用 session 保存时是否保存完整 tool result messages。
+  可靠 resume 需要保存 tool results；关闭后只能作为降级或诊断模式设计。
 
 ## Provider 配置
 
@@ -400,3 +413,24 @@ logging:
 每行日志是一个 JSON object。日志可以记录模型请求生命周期、工具调用、usage、HTTP 错误
 和 MCP 错误。API key、Authorization header 和其他敏感配置值的实际值不能进入日志。
 v0.1 不记录完整 prompt、response、tool result 正文，也不提供开启正文日志的配置。
+
+## Sessions 配置（M13 后）
+
+M13 后，resumable sessions 是独立于 JSONL 日志的 opt-in 能力。默认关闭：
+
+```yaml
+sessions:
+  enabled: false
+  dir: sessions
+  save_tool_results: true
+```
+
+`sessions.dir` 相对配置根目录解析，除非显式写成绝对路径。它和 `logging.path` 不同：
+`logging.path` 用于 JSONL 事件日志，默认不记录完整 prompt、response 或 tool result；
+`sessions.dir` 用于可恢复会话，启用后保存完整上下文，包含完整 messages、assistant
+tool calls 和 tool result messages。
+
+可恢复 session 文件会包含敏感数据，包括用户输入、assistant 输出、tool result、cwd、
+provider/model/parameters、启用 tools/MCP/skills/reasoning，以及注入指令快照或可重建
+信息。因此 `sessions.enabled` 必须默认是 `false`，CLI 和文档都应提示用户这是显式
+opt-in 的落盘能力。

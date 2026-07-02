@@ -198,3 +198,85 @@
 - [x] chat 未知/错误参数包含 `Run "sai help chat" for usage.`。
 - [x] 添加可注入 stdin 的 CLI 测试入口。
 - [x] 添加 chat help、退出、多轮 history、tool history、prompt stderr、错误参数测试。
+
+## M11：Reliability
+
+- [ ] Ctrl+C / interrupt 统一进入 context cancel 流程。
+- [ ] 明确 chat runtime 的 session/request/tool context lifecycle。
+- [ ] HTTP request 支持 timeout。
+- [ ] streaming SSE 支持 idle timeout。
+- [ ] 429 支持有界 retry 和可读最终错误。
+- [ ] 5xx 支持有界 retry 和可读最终错误。
+- [ ] `sai chat` 可恢复请求错误后不追加成功 assistant history。
+- [ ] `sai chat` 可恢复请求错误后回到 prompt 允许继续输入。
+- [ ] MCP stdio server 在正常退出、错误退出、Ctrl+C 和 cancel 时关闭子进程。
+- [ ] `shell` 工具在取消或超时时关闭子进程并回收资源。
+- [ ] JSONL logger 在正常退出、错误退出和 Ctrl+C 时 flush / close。
+- [ ] 添加 timeout、idle timeout、retry、cancel 和 logger flush 测试。
+
+## M12：Editing Tools
+
+- [ ] 新增 `write_file` 工具。
+- [ ] 新增 `edit_file` 或 patch-style 编辑工具。
+- [ ] 编辑工具默认不启用。
+- [ ] 编辑工具仅通过 `tools.enabled` 或 `--enable-tools` 暴露给模型。
+- [ ] `sai tools list` 静态列出新增编辑工具。
+- [ ] 编辑工具状态写 stderr，不打印完整写入内容、patch 正文或文件内容。
+- [ ] 工具结果消息只包含必要摘要和错误，不向终端泄露完整内容。
+- [ ] 覆盖写入测试通过。
+- [ ] 局部编辑测试通过。
+- [ ] 路径错误测试通过。
+- [ ] 未启用时 registry / request payload 不暴露编辑工具。
+- [ ] 启用后 registry / request payload 暴露对应编辑工具。
+
+## M13：Resumable Sessions
+
+- [ ] 区分 JSONL session log / transcript 和 resumable session。
+- [ ] 默认 `sessions.enabled: false`，不保存完整会话上下文。
+- [ ] 启用后保存可恢复 session id、创建时间、更新时间和版本信息。
+- [ ] 启用后保存 provider、model、model profile parameters、cwd 和配置根目录。
+- [ ] 启用后保存 enabled tools、MCP、skills 和 reasoning 展示设置。
+- [ ] 启用后保存注入指令快照，或保存可重建信息并能检测源文件变化。
+- [ ] 启用后保存完整 user messages。
+- [ ] 启用后保存完整 assistant final messages。
+- [ ] 启用后保存完整 assistant tool calls。
+- [ ] 启用后保存完整 tool result messages。
+- [ ] `sai chat --save-session` 可保存完整可恢复 session。
+- [ ] `sai chat --resume <id>` 可恢复指定 session。
+- [ ] `sai chat --continue` 可继续最近 session。
+- [ ] `sai sessions list` 可列出 sessions。
+- [ ] `sai sessions show <id>` 可展示 session 元数据并提示敏感数据风险。
+- [ ] `sai sessions delete <id>` 可删除指定 session。
+- [ ] `sai sessions prune` 可清理旧 sessions。
+- [ ] 文档和 CLI 输出提示 sessions 保存完整 prompt、assistant 输出和 tool result。
+
+## M14：Context Window Management
+
+- [ ] 增加 token budget / usage tracking。
+- [ ] 优先使用 provider 返回的 usage。
+- [ ] usage 缺失时使用保守估算。
+- [ ] 会话开始时记录模型 context window 配置或估算值。
+- [ ] 接近 context window 时向 stderr 警告。
+- [ ] 达到预算前拒绝继续或要求用户选择处理方式。
+- [ ] 不静默截断 system/developer/tool schema 信息。
+- [ ] 保守保留内置 system、`AGENTS.md`、enabled skills、tool/MCP schema 和必要 tool result。
+- [ ] 设计截断或摘要策略并记录边界。
+- [ ] resumable session 保存 context management metadata。
+- [ ] 添加 usage tracking、预算警告和关键上下文保留测试。
+
+## M15：Input UX and Doctor
+
+- [ ] 多行输入作为 `sai chat` 能力实现。
+- [ ] stdin 输入走 `sai chat --quit`。
+- [ ] file 输入走 `sai chat --quit`。
+- [ ] 不恢复 `sai run`。
+- [ ] stdin/file 输入复用同一套 message 构造、provider 选择、tools/MCP/skills 启用和日志路径。
+- [ ] stdin/file 输入不改变 JSONL 日志默认边界。
+- [ ] 增加 `sai doctor` 或 `sai config check`。
+- [ ] 健康检查覆盖配置根目录和 provider 文件。
+- [ ] 健康检查覆盖默认 provider/model 和 API key 环境变量是否存在。
+- [ ] 健康检查覆盖 skill_dir、mcp_dir、enabled tools/MCP/skills。
+- [ ] 健康检查覆盖日志目录可写性。
+- [ ] 健康检查输出脱敏，不打印 API key 或其他敏感配置值实际值。
+- [ ] 不引入 TUI。
+- [ ] 不做 Markdown 渲染。
