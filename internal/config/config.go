@@ -22,6 +22,7 @@ type Config struct {
 	Tools           ToolsConfig                `json:"tools" yaml:"tools"`
 	Skills          SkillsConfig               `json:"skills" yaml:"skills"`
 	Logging         LoggingConfig              `json:"logging" yaml:"logging"`
+	Sessions        SessionsConfig             `json:"sessions" yaml:"sessions"`
 	MCPDir          string                     `json:"mcp_dir,omitempty" yaml:"mcp_dir,omitempty"`
 	MCPServers      map[string]MCPServerConfig `json:"mcp_servers,omitempty" yaml:"-"`
 	Providers       map[string]ProviderConfig  `json:"providers" yaml:"providers"`
@@ -50,6 +51,12 @@ type SkillsConfig struct {
 type LoggingConfig struct {
 	Path  string `json:"path" yaml:"path"`
 	Level string `json:"level" yaml:"level"`
+}
+
+type SessionsConfig struct {
+	Enabled         bool   `json:"enabled" yaml:"enabled"`
+	Dir             string `json:"dir" yaml:"dir"`
+	SaveToolResults bool   `json:"save_tool_results" yaml:"save_tool_results"`
 }
 
 type ProviderConfig struct {
@@ -130,6 +137,9 @@ func Load(configDir string) (*Config, error) {
 	cfg.SkillDir = resolvePath(absConfigDir, cfg.SkillDir)
 	if cfg.Logging.Path != "" {
 		cfg.Logging.Path = resolvePath(absConfigDir, cfg.Logging.Path)
+	}
+	if cfg.Sessions.Dir != "" {
+		cfg.Sessions.Dir = resolvePath(absConfigDir, cfg.Sessions.Dir)
 	}
 	if cfg.MCPDir != "" {
 		cfg.MCPDir = resolvePath(absConfigDir, cfg.MCPDir)
@@ -330,6 +340,10 @@ func defaultConfig() Config {
 		},
 		Logging: LoggingConfig{
 			Path: "logs/sai.jsonl",
+		},
+		Sessions: SessionsConfig{
+			Dir:             "sessions",
+			SaveToolResults: true,
 		},
 		MCPDir:     "mcp",
 		Providers:  map[string]ProviderConfig{},

@@ -231,8 +231,8 @@
 
 ## M13：Resumable Sessions
 
-- [ ] 区分 JSONL session log / transcript 和 resumable session。
-- [ ] 默认 `sessions.enabled: false`，不保存完整会话上下文。
+- [x] 区分 JSONL session log / transcript 和 resumable session。
+- [x] 默认 `sessions.enabled: false`，不保存完整会话上下文。
 - [ ] 启用后保存可恢复 session id、创建时间、更新时间和版本信息。
 - [ ] 启用后保存 provider、model、model profile parameters、cwd 和配置根目录。
 - [ ] 启用后保存 enabled tools、MCP、skills 和 reasoning 展示设置。

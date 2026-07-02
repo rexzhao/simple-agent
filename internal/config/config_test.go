@@ -43,6 +43,17 @@ func TestLoadResolvesConfigAndProviderModels(t *testing.T) {
 		t.Fatalf("Logging.Path = %q, want %q", cfg.Logging.Path, wantLogPath)
 	}
 
+	wantSessionsDir := filepath.Join(wantConfigDir, "sessions")
+	if cfg.Sessions.Enabled {
+		t.Fatal("Sessions.Enabled = true, want false default")
+	}
+	if cfg.Sessions.Dir != wantSessionsDir {
+		t.Fatalf("Sessions.Dir = %q, want %q", cfg.Sessions.Dir, wantSessionsDir)
+	}
+	if !cfg.Sessions.SaveToolResults {
+		t.Fatal("Sessions.SaveToolResults = false, want true default")
+	}
+
 	wantMCPDir := filepath.Join(wantConfigDir, "mcp")
 	if cfg.MCPDir != wantMCPDir {
 		t.Fatalf("MCPDir = %q, want %q", cfg.MCPDir, wantMCPDir)
@@ -83,6 +94,39 @@ skill_dir: local-skills
 	wantSkillDir := filepath.Join(filepath.Clean(wantConfigDir), "local-skills")
 	if cfg.SkillDir != wantSkillDir {
 		t.Fatalf("SkillDir = %q, want %q", cfg.SkillDir, wantSkillDir)
+	}
+}
+
+func TestLoadResolvesCustomSessionsDir(t *testing.T) {
+	dir := writeConfigFixture(t)
+	writeFile(t, filepath.Join(dir, "sai.yaml"), `default_provider: paperhub
+default_model: glm-5.2
+provider_dir: providers
+
+sessions:
+  enabled: true
+  dir: saved-sessions
+  save_tool_results: false
+`)
+
+	cfg, err := Load(dir)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+
+	wantConfigDir, err := filepath.Abs(dir)
+	if err != nil {
+		t.Fatalf("filepath.Abs() error = %v", err)
+	}
+	wantSessionsDir := filepath.Join(filepath.Clean(wantConfigDir), "saved-sessions")
+	if !cfg.Sessions.Enabled {
+		t.Fatal("Sessions.Enabled = false, want true")
+	}
+	if cfg.Sessions.Dir != wantSessionsDir {
+		t.Fatalf("Sessions.Dir = %q, want %q", cfg.Sessions.Dir, wantSessionsDir)
+	}
+	if cfg.Sessions.SaveToolResults {
+		t.Fatal("Sessions.SaveToolResults = true, want false")
 	}
 }
 
