@@ -3,6 +3,7 @@ package cli
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -1112,6 +1113,85 @@ func TestChatTwoTurnsCarryForwardUserAndAssistantHistory(t *testing.T) {
 	}
 }
 
+func TestChatREPLRecoverableErrorContinuesWithoutFailedHistory(t *testing.T) {
+	server, requests := newSequentialCLIRunServer(t,
+		[]string{
+			`not-json`,
+		},
+		[]string{
+			`{"choices":[{"delta":{"content":"two"}}]}`,
+			`[DONE]`,
+		},
+	)
+	defer server.Close()
+
+	configDir := t.TempDir()
+	writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
+
+	var stdout, stderr bytes.Buffer
+	code := RunWithIO([]string{"--config-dir", configDir, "chat"}, strings.NewReader("failed\nsecond\n/quit\n"), &stdout, &stderr, func() (string, error) {
+		return t.TempDir(), nil
+	})
+
+	if code != 0 {
+		t.Fatalf("RunWithIO() code = %d, stderr = %s", code, stderr.String())
+	}
+	if got, want := stdout.String(), "two\n"; got != want {
+		t.Fatalf("stdout = %q, want %q", got, want)
+	}
+	errOut := stderr.String()
+	if !strings.HasPrefix(errOut, "> sai: ") || !strings.Contains(errOut, "parse OpenAI chat stream") || !strings.HasSuffix(errOut, "\n> > ") {
+		t.Fatalf("stderr = %q, want recoverable error followed by next prompts", errOut)
+	}
+
+	firstRequest := <-requests
+	firstMessages := requestMessages(t, firstRequest.Body)
+	assertMessage(t, firstMessages, 0, "system", builtInBaseInstructions)
+	assertMessage(t, firstMessages, 1, "user", "failed")
+
+	secondRequest := <-requests
+	secondMessages := requestMessages(t, secondRequest.Body)
+	if len(secondMessages) != 2 {
+		t.Fatalf("len(second request messages) = %d, want 2: %#v", len(secondMessages), secondMessages)
+	}
+	assertMessage(t, secondMessages, 0, "system", builtInBaseInstructions)
+	assertMessage(t, secondMessages, 1, "user", "second")
+	assertNoAdditionalCLIRunRequest(t, requests)
+}
+
+func TestChatREPLStdoutWriteErrorExitsWithoutNextTurn(t *testing.T) {
+	server, requests := newSequentialCLIRunServer(t,
+		[]string{
+			`{"choices":[{"delta":{"content":"one"}}]}`,
+			`[DONE]`,
+		},
+		[]string{
+			`{"choices":[{"delta":{"content":"two"}}]}`,
+			`[DONE]`,
+		},
+	)
+	defer server.Close()
+
+	configDir := t.TempDir()
+	writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
+
+	stdoutErr := errors.New("stdout write failed")
+	var stderr bytes.Buffer
+	code := RunWithIO([]string{"--config-dir", configDir, "chat"}, strings.NewReader("first\nsecond\n/quit\n"), failingWriter{err: stdoutErr}, &stderr, func() (string, error) {
+		return t.TempDir(), nil
+	})
+
+	if code != 1 {
+		t.Fatalf("RunWithIO() code = %d, want 1", code)
+	}
+	assertCLIErrorContains(t, stderr.String(), "> sai: stdout write failed")
+	firstRequest := <-requests
+	firstMessages := requestMessages(t, firstRequest.Body)
+	assertMessage(t, firstMessages, 0, "system", builtInBaseInstructions)
+	assertMessage(t, firstMessages, 1, "user", "first")
+	assertNoAdditionalCLIRunRequest(t, requests)
+}
+
 func TestChatToolCallHistoryCarriesIntoNextTurn(t *testing.T) {
 	server, requests := newSequentialCLIRunServer(t,
 		[]string{
@@ -1165,6 +1245,70 @@ func TestChatToolCallHistoryCarriesIntoNextTurn(t *testing.T) {
 	assertMessage(t, messages, 4, "assistant", "done")
 	assertMessage(t, messages, 5, "user", "Next")
 	assertNoAdditionalCLIRunRequest(t, requests)
+}
+
+func TestRunWithContextCancelReachesProviderRequest(t *testing.T) {
+	requestStarted := make(chan capturedCLIRunRequest, 1)
+	requestContextDone := make(chan struct{})
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("ReadAll() error = %v", err)
+		}
+		requestStarted <- capturedCLIRunRequest{
+			Path:          r.URL.Path,
+			Authorization: r.Header.Get("Authorization"),
+			ContentType:   r.Header.Get("Content-Type"),
+			RawBody:       body,
+			Body:          decodeCLIJSON(t, body),
+		}
+
+		<-r.Context().Done()
+		close(requestContextDone)
+	}))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	defer server.Close()
+
+	configDir := t.TempDir()
+	writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
+
+	var stdout, stderr bytes.Buffer
+	done := make(chan int, 1)
+	go func() {
+		done <- RunWithContext(ctx, []string{"--config-dir", configDir, "chat", "--quit", "hello"}, strings.NewReader(""), &stdout, &stderr, func() (string, error) {
+			return t.TempDir(), nil
+		})
+	}()
+
+	var request capturedCLIRunRequest
+	select {
+	case request = <-requestStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for provider request")
+	}
+	assertMessage(t, requestMessages(t, request.Body), 1, "user", "hello")
+
+	cancel()
+	select {
+	case <-requestContextDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for provider request context cancellation")
+	}
+
+	select {
+	case code := <-done:
+		if code != 1 {
+			t.Fatalf("RunWithContext() code = %d, want 1", code)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for RunWithContext to return")
+	}
+	if stdout.String() != "" {
+		t.Fatalf("stdout = %q, want empty", stdout.String())
+	}
+	assertCLIErrorContains(t, stderr.String(), "context canceled")
 }
 
 func TestRunUsesDefaultProviderModelAndOutputsTextDelta(t *testing.T) {
@@ -2781,6 +2925,14 @@ type capturedCLIRunRequest struct {
 	ContentType      string
 	RawBody          []byte
 	Body             map[string]any
+}
+
+type failingWriter struct {
+	err error
+}
+
+func (w failingWriter) Write(p []byte) (int, error) {
+	return 0, w.err
 }
 
 func newCLIRunServer(t *testing.T, chunks ...string) (*httptest.Server, <-chan capturedCLIRunRequest) {

@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
 
@@ -35,7 +36,9 @@ const (
 )
 
 func Run(args []string, stdout, stderr io.Writer) int {
-	return RunWithIO(args, os.Stdin, stdout, stderr, os.Getwd)
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
+	return RunWithContext(ctx, args, os.Stdin, stdout, stderr, os.Getwd)
 }
 
 func RunWithGetwd(args []string, stdout, stderr io.Writer, getwd func() (string, error)) int {
@@ -43,14 +46,21 @@ func RunWithGetwd(args []string, stdout, stderr io.Writer, getwd func() (string,
 }
 
 func RunWithIO(args []string, stdin io.Reader, stdout, stderr io.Writer, getwd func() (string, error)) int {
-	if err := execute(args, stdin, stdout, stderr, getwd); err != nil {
+	return RunWithContext(context.Background(), args, stdin, stdout, stderr, getwd)
+}
+
+func RunWithContext(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer, getwd func() (string, error)) int {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := execute(ctx, args, stdin, stdout, stderr, getwd); err != nil {
 		fmt.Fprintf(stderr, "sai: %v\n", err)
 		return 1
 	}
 	return 0
 }
 
-func execute(args []string, stdin io.Reader, stdout, stderr io.Writer, getwd func() (string, error)) error {
+func execute(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer, getwd func() (string, error)) error {
 	rootArgs, err := splitRootArgs(args)
 	if err != nil {
 		return err
@@ -121,7 +131,7 @@ func execute(args []string, stdin io.Reader, stdout, stderr io.Writer, getwd fun
 		}
 		return mcpListCommand(subArgs, rootArgs.configDir, stdout, getwd)
 	case "chat":
-		return chatCommand(rootArgs.commandArgs, rootArgs.configDir, stdin, stdout, stderr, getwd)
+		return chatCommand(ctx, rootArgs.commandArgs, rootArgs.configDir, stdin, stdout, stderr, getwd)
 	default:
 		return usageError(fmt.Sprintf("unknown command %q", rootArgs.command), "", "sai help")
 	}
@@ -628,7 +638,7 @@ func (options agentCommandFlags) validate(helpCommand string) error {
 	return nil
 }
 
-func chatCommand(args []string, configDir string, stdin io.Reader, stdout, stderr io.Writer, getwd func() (string, error)) (chatErr error) {
+func chatCommand(ctx context.Context, args []string, configDir string, stdin io.Reader, stdout, stderr io.Writer, getwd func() (string, error)) (chatErr error) {
 	flags := flag.NewFlagSet("sai chat", flag.ContinueOnError)
 	var options agentCommandFlags
 	registerAgentCommandFlags(flags, &options)
@@ -647,7 +657,7 @@ func chatCommand(args []string, configDir string, stdin io.Reader, stdout, stder
 		return usageError("--quit requires an initial prompt", chatUsageText, "sai help chat")
 	}
 
-	runtime, err := prepareAgentRuntime(context.Background(), configDir, options, stderr, getwd)
+	runtime, err := prepareAgentRuntime(ctx, configDir, options, stderr, getwd)
 	if err != nil {
 		return err
 	}
@@ -657,10 +667,11 @@ func chatCommand(args []string, configDir string, stdin io.Reader, stdout, stder
 
 	messages := chatBaseMessages(runtime.project, runtime.selectedSkills)
 	if len(prompts) == 1 {
-		messages, err = runChatTurn(context.Background(), runtime, messages, prompts[0], stdout, stderr, !*quit, false)
+		updated, err := runChatTurn(ctx, runtime, messages, prompts[0], stdout, stderr, !*quit, false)
 		if err != nil {
 			return err
 		}
+		messages = updated
 		if *quit {
 			return nil
 		}
@@ -668,6 +679,9 @@ func chatCommand(args []string, configDir string, stdin io.Reader, stdout, stder
 
 	scanner := bufio.NewScanner(stdin)
 	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if _, err := fmt.Fprint(stderr, "> "); err != nil {
 			return err
 		}
@@ -687,14 +701,30 @@ func chatCommand(args []string, configDir string, stdin io.Reader, stdout, stder
 			return nil
 		}
 
-		messages, err = runChatTurn(context.Background(), runtime, messages, line, stdout, stderr, true, true)
+		updated, err := runChatTurn(ctx, runtime, messages, line, stdout, stderr, true, true)
 		if err != nil {
-			return err
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return ctxErr
+			}
+			if !isRecoverableTurnError(err) {
+				return err
+			}
+			if _, printErr := fmt.Fprintf(stderr, "sai: %v\n", err); printErr != nil {
+				return printErr
+			}
+			continue
 		}
+		messages = updated
 	}
 }
 
 func runChatTurn(ctx context.Context, runtime *agentRuntime, messages []model.Message, prompt string, stdout, stderr io.Writer, addTrailingNewline bool, stderrNeedsLeadingBreak bool) ([]model.Message, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	turnCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
 	requestMessages := append(copyMessageSlice(messages), model.Message{
 		Role:    model.MessageRoleUser,
 		Content: prompt,
@@ -705,13 +735,13 @@ func runChatTurn(ctx context.Context, runtime *agentRuntime, messages []model.Me
 		Tools:      runtime.toolSchemas,
 		Parameters: runtime.parameters,
 	}
-	events, results, err := agent.StreamWithResult(ctx, request, agent.Options{
+	events, results, err := agent.StreamWithResult(turnCtx, request, agent.Options{
 		Provider:     runtime.provider,
 		ToolExecutor: runtime.toolExecutor,
 		MaxTurns:     runtime.maxTurns,
 	})
 	if err != nil {
-		return nil, err
+		return nil, newRecoverableTurnError(err)
 	}
 
 	tracker := &chatOutputWriter{w: stdout}
@@ -724,7 +754,10 @@ func runChatTurn(ctx context.Context, runtime *agentRuntime, messages []model.Me
 	}
 	result, ok := <-results
 	if !ok {
-		return nil, fmt.Errorf("agent did not return updated messages")
+		if err := turnCtx.Err(); err != nil {
+			return nil, err
+		}
+		return nil, newRecoverableTurnError(fmt.Errorf("agent did not return updated messages"))
 	}
 	if addTrailingNewline && tracker.wrote && tracker.lastByte != '\n' {
 		if _, err := fmt.Fprintln(stdout); err != nil {
@@ -1476,12 +1509,36 @@ func shouldColorizeWriter(stdout io.Writer) bool {
 func streamError(event model.ErrorEvent) error {
 	if event.Err == nil {
 		if event.Message == "" {
-			return fmt.Errorf("model stream error")
+			return newRecoverableTurnError(fmt.Errorf("model stream error"))
 		}
-		return fmt.Errorf("%s", event.Message)
+		return newRecoverableTurnError(fmt.Errorf("%s", event.Message))
 	}
 	if event.Message == "" {
-		return event.Err
+		return newRecoverableTurnError(event.Err)
 	}
-	return fmt.Errorf("%s: %w", event.Message, event.Err)
+	return newRecoverableTurnError(fmt.Errorf("%s: %w", event.Message, event.Err))
+}
+
+type recoverableTurnError struct {
+	err error
+}
+
+func newRecoverableTurnError(err error) error {
+	if err == nil {
+		return nil
+	}
+	return recoverableTurnError{err: err}
+}
+
+func (e recoverableTurnError) Error() string {
+	return e.err.Error()
+}
+
+func (e recoverableTurnError) Unwrap() error {
+	return e.err
+}
+
+func isRecoverableTurnError(err error) bool {
+	_, ok := err.(recoverableTurnError)
+	return ok
 }

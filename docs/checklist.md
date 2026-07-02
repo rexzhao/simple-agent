@@ -201,14 +201,14 @@
 
 ## M11：Reliability
 
-- [ ] Ctrl+C / interrupt 统一进入 context cancel 流程。
-- [ ] 明确 chat runtime 的 session/request/tool context lifecycle。
+- [x] Ctrl+C / interrupt 统一进入 context cancel 流程。
+- [x] 明确 chat runtime 的 session/request/tool context lifecycle。
 - [ ] HTTP request 支持 timeout。
 - [ ] streaming SSE 支持 idle timeout。
 - [ ] 429 支持有界 retry 和可读最终错误。
 - [ ] 5xx 支持有界 retry 和可读最终错误。
-- [ ] `sai chat` 可恢复请求错误后不追加成功 assistant history。
-- [ ] `sai chat` 可恢复请求错误后回到 prompt 允许继续输入。
+- [x] `sai chat` 可恢复请求错误后不追加成功 assistant history。
+- [x] `sai chat` 可恢复请求错误后回到 prompt 允许继续输入。
 - [ ] MCP stdio server 在正常退出、错误退出、Ctrl+C 和 cancel 时关闭子进程。
 - [ ] `shell` 工具在取消或超时时关闭子进程并回收资源。
 - [ ] JSONL logger 在正常退出、错误退出和 Ctrl+C 时 flush / close。
