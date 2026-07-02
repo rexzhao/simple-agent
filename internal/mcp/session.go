@@ -16,7 +16,10 @@ import (
 	"github.com/rexzhao/simple-agent/internal/config"
 )
 
-const protocolVersion = "2024-11-05"
+const (
+	protocolVersion       = "2024-11-05"
+	stdioCloseGracePeriod = 500 * time.Millisecond
+)
 
 type Session struct {
 	cmd    *exec.Cmd
@@ -28,6 +31,9 @@ type Session struct {
 
 	closeOnce sync.Once
 	closeErr  error
+
+	waitDone chan struct{}
+	waitErr  error
 }
 
 type InitializeResult struct {
@@ -76,11 +82,15 @@ func StartStdioSession(ctx context.Context, server config.MCPServerConfig) (*Ses
 	}
 
 	session := &Session{
-		cmd:    cmd,
-		stdin:  stdin,
-		stdout: bufio.NewReader(stdout),
-		nextID: 1,
+		cmd:      cmd,
+		stdin:    stdin,
+		stdout:   bufio.NewReader(stdout),
+		nextID:   1,
+		waitDone: make(chan struct{}),
 	}
+	go session.waitForExit()
+	session.closeOnContext(ctx)
+
 	result, err := session.initialize(ctx)
 	if err != nil {
 		_ = session.Close()
@@ -95,22 +105,46 @@ func (s *Session) Close() error {
 			_ = s.stdin.Close()
 		}
 
-		done := make(chan error, 1)
-		go func() {
-			done <- s.cmd.Wait()
-		}()
-
+		timer := time.NewTimer(stdioCloseGracePeriod)
+		defer timer.Stop()
 		select {
-		case err := <-done:
-			s.closeErr = err
-		case <-time.After(2 * time.Second):
+		case <-s.waitDone:
+			s.closeErr = s.waitErr
+		case <-timer.C:
 			if s.cmd.Process != nil {
-				_ = s.cmd.Process.Kill()
+				if err := s.cmd.Process.Kill(); err != nil {
+					select {
+					case <-s.waitDone:
+						s.closeErr = s.waitErr
+					default:
+						s.closeErr = fmt.Errorf("kill MCP server process: %w", err)
+					}
+					return
+				}
 			}
-			s.closeErr = <-done
+			<-s.waitDone
+			s.closeErr = nil
 		}
 	})
 	return s.closeErr
+}
+
+func (s *Session) waitForExit() {
+	s.waitErr = s.cmd.Wait()
+	close(s.waitDone)
+}
+
+func (s *Session) closeOnContext(ctx context.Context) {
+	if ctx == nil {
+		return
+	}
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = s.Close()
+		case <-s.waitDone:
+		}
+	}()
 }
 
 func (s *Session) initialize(ctx context.Context) (InitializeResult, error) {

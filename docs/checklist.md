@@ -209,7 +209,7 @@
 - [x] 5xx 支持有界 retry 和可读最终错误。
 - [x] `sai chat` 可恢复请求错误后不追加成功 assistant history。
 - [x] `sai chat` 可恢复请求错误后回到 prompt 允许继续输入。
-- [ ] MCP stdio server 在正常退出、错误退出、Ctrl+C 和 cancel 时关闭子进程。
+- [x] MCP stdio server 在正常退出、错误退出、Ctrl+C 和 cancel 时关闭子进程。
 - [x] `shell` 工具在取消或超时时关闭子进程并回收资源。
 - [x] JSONL logger 在正常退出、错误退出和 Ctrl+C 时 flush / close。
 - [ ] 添加 timeout、idle timeout、retry、cancel 和 logger flush 测试。
