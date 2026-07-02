@@ -158,13 +158,14 @@
 
 - [x] 默认继续隐藏 reasoning 输出。
 - [x] `--show-reasoning` 和 `agent.show_reasoning: true` 显示 reasoning 时可使用终端暗灰色样式。
-- [x] 可见 reasoning 块前输出 `? reasoning` 标记行，并保持 reasoning/final 换行边界。
-- [x] tool call 状态以 `! tool: <name>` 独立写到 stderr。
+- [x] 可见 reasoning 不输出 marker，并保持 reasoning/final 换行边界。
+- [x] tool call 状态以 `tool: <name> [path]` 独立写到 stderr。
 - [x] `read_file` / `list_files` 状态显示目标路径/目录；`shell` 和 MCP tool 不显示 arguments。
 - [x] tool 状态不打印 tool result 正文，stdout 不包含 tool 状态。
 - [x] stdout 不是终端时不输出 ANSI。
 - [x] `NO_COLOR` 存在且非空时不输出 ANSI。
-- [x] 切换到最终 `text_delta` 前先 reset，最终输出不继承 reasoning 颜色。
+- [x] 支持颜色的 stderr tool 状态显式使用 muted 样式并在每行后 reset。
+- [x] 切换到 tool 状态、最终 `text_delta`、error 或 stream end 前先 reset，最终输出不继承 reasoning 颜色。
 - [x] 只有 reasoning、没有最终文本时，stream 结束前 reset。
 - [x] JSONL 日志继续记录原始事件，不包含 ANSI 样式。
 - [x] 不引入 TUI、不引入第三方依赖，不新增 `--no-color` 或改动 help/usage。

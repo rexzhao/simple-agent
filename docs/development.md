@@ -104,7 +104,7 @@ error
 
 CLI 默认只打印 `text_delta`。`reasoning_delta` 默认隐藏，后续通过
 `--show-reasoning` 显示。发生 tool call 时，CLI 默认向 stderr 打印独立的简短工具状态
-（例如 `! tool: read_file docs/notes.md`），不需要 `--verbose`；`read_file` 和
+（例如 `tool: read_file docs/notes.md`），不需要 `--verbose`；`read_file` 和
 `list_files` 状态可以显示目标路径/目录，其中 `list_files` 未提供 path 时显示 `.`。
 `shell` 和 MCP tool 状态只显示工具名，不显示命令参数或任意 arguments，也不打印 tool
 result 正文，stdout 仍只承载模型可见输出。
@@ -392,10 +392,9 @@ choices[0].delta.content
 ```
 
 默认只把 `delta.content` 作为用户可见输出。`delta.reasoning_content` 需要解析成
-内部事件，但默认不打印。启用 `--show-reasoning` 时，CLI 可以打印 reasoning 输出，并在
-每个可见 reasoning 块前输出独立标记行 `? reasoning`；如果前面已有正文且没有换行，
-先补齐换行。当事件流从 reasoning 输出切换到最终消息输出时，也必须保持换行分隔，避免
-reasoning 和最终消息混在同一行。
+内部事件，但默认不打印。启用 `--show-reasoning` 时，CLI 可以直接打印 reasoning 输出，
+不额外输出 marker；如果前面已有正文且没有换行，先补齐换行。当事件流从 reasoning
+输出切换到最终消息输出时，也必须保持换行分隔，避免 reasoning 和最终消息混在同一行。
 
 ## Reasoning 输出样式
 
@@ -404,15 +403,21 @@ JSONL 日志。`reasoning_delta` 仍按原始事件记录；ANSI 控制符不能
 
 只有 reasoning 被显式显示时才考虑上色：命令行 `--show-reasoning` 或配置
 `agent.show_reasoning: true` 生效后，`writeStream` 在支持颜色的终端 stdout 上使用
-ANSI 暗灰色显示 `? reasoning` 标记和 reasoning。当前样式是 `\x1b[90m` 开始、
-`\x1b[0m` reset。
+ANSI 暗灰色显示 reasoning。当前样式是 `\x1b[90m` 开始、`\x1b[0m` reset。
 如果 stdout 不是终端，例如 pipe、redirect 或测试中的 `bytes.Buffer`，不输出 ANSI。
 如果环境变量 `NO_COLOR` 存在且非空，即使 stdout 是终端也不输出 ANSI。
 
-从 reasoning 切换到最终 `text_delta` 前必须先 reset，再沿用原有 reasoning/final
-换行规则，确保最终输出不是灰色。若 stream 只有 reasoning 没有最终文本，函数结束前也
-必须 reset，避免调用方终端颜色泄漏。M9 不引入 TUI、不引入第三方依赖，也不新增
-`--no-color`；若以后需要显式颜色开关，应作为单独里程碑设计。
+从 reasoning 切换到任何非 reasoning 输出或事件前必须先 reset，包括 tool 状态、最终
+`text_delta`、error 和 stream end，再沿用原有 reasoning/final 换行规则，确保最终输出
+不是灰色。若 tool 后又继续 reasoning，reasoning 可以重新进入灰色，但状态必须重新显式
+建立。若 stream 只有 reasoning 没有最终文本，函数结束前也必须 reset，避免调用方终端
+颜色泄漏。M9 不引入 TUI、不引入第三方依赖，也不新增 `--no-color`；若以后需要显式颜色
+开关，应作为单独里程碑设计。
+
+Tool 状态是 stderr 展示层：支持颜色且未设置 `NO_COLOR` 时，状态行本身使用同一 muted
+样式并在每一行后 reset，不能依赖 stdout/reasoning 的颜色状态泄漏。状态格式是
+`tool: <name> [path]`，没有符号前缀；连续 tool status 每个独立成行。JSONL 日志继续记录
+原始事件，不包含 ANSI 控制符。
 
 ## Tool Calling
 

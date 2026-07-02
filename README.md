@@ -103,7 +103,7 @@ sai tools list
 ```
 
 When a model calls a tool, `sai chat` prints a short status line such as
-`! tool: read_file docs/notes.md` to stderr. `list_files` similarly shows the
+`tool: read_file docs/notes.md` to stderr. `list_files` similarly shows the
 target directory, defaulting to `.`. Other tool arguments and all tool results
 are not printed in that status line, and streamed model output remains on
 stdout.
@@ -120,11 +120,12 @@ Show reasoning output, which is hidden by default:
 sai chat --quit --show-reasoning --provider paperhub --model glm-5.2 "Hello"
 ```
 
-Shown reasoning starts with a `? reasoning` marker line. When stdout is an
-interactive terminal, the marker and reasoning are shown in gray/dark ANSI style
-so they are easier to distinguish from the final answer. Pipes, redirected
-output, and tests stay plain text. Set `NO_COLOR` to a non-empty value to disable
-ANSI styling.
+Shown reasoning is printed directly without a marker line. When stdout is an
+interactive terminal, reasoning is shown in gray/dark ANSI style so it is easier
+to distinguish from the final answer. Tool status lines use their own muted
+stderr styling when supported, and every non-reasoning output resets the style
+first so final answers never inherit gray. Pipes, redirected output, and tests
+stay plain text. Set `NO_COLOR` to a non-empty value to disable ANSI styling.
 
 Other useful commands:
 

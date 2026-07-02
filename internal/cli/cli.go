@@ -716,7 +716,8 @@ func runChatTurn(ctx context.Context, runtime *agentRuntime, messages []model.Me
 
 	tracker := &chatOutputWriter{w: stdout}
 	if err := writeStreamWithOptions(tracker, stderr, events, runtime.showReasoning, runtime.logger, streamOutputOptions{
-		colorReasoning:          shouldColorizeReasoning(tracker),
+		colorReasoning:          shouldColorizeWriter(tracker),
+		colorToolStatus:         shouldColorizeWriter(stderr),
 		stderrNeedsLeadingBreak: stderrNeedsLeadingBreak,
 	}); err != nil {
 		return nil, err
@@ -1259,12 +1260,14 @@ func roleForInstruction(source projectcontext.InstructionSource) model.MessageRo
 
 type streamOutputOptions struct {
 	colorReasoning          bool
+	colorToolStatus         bool
 	stderrNeedsLeadingBreak bool
 }
 
 func writeStream(stdout, stderr io.Writer, events <-chan model.Event, showReasoning bool, logger *eventlog.Logger) error {
 	return writeStreamWithOptions(stdout, stderr, events, showReasoning, logger, streamOutputOptions{
-		colorReasoning: shouldColorizeReasoning(stdout),
+		colorReasoning:  shouldColorizeWriter(stdout),
+		colorToolStatus: shouldColorizeWriter(stderr),
 	})
 }
 
@@ -1297,6 +1300,13 @@ func writeStreamWithOptions(stdout, stderr io.Writer, events <-chan model.Event,
 		reasoningColorActive = false
 		return nil
 	}
+	endReasoningForNonReasoningEvent := func() error {
+		if err := resetReasoningColor(); err != nil {
+			return err
+		}
+		inReasoningBlock = false
+		return nil
+	}
 	defer func() {
 		if resetErr := resetReasoningColor(); resetErr != nil {
 			err = errors.Join(err, resetErr)
@@ -1325,9 +1335,6 @@ func writeStreamWithOptions(stdout, stderr io.Writer, events <-chan model.Event,
 		if err := startReasoningColor(); err != nil {
 			return err
 		}
-		if err := writeStdout("? reasoning\n"); err != nil {
-			return err
-		}
 		inReasoningBlock = true
 		return nil
 	}
@@ -1342,6 +1349,10 @@ func writeStreamWithOptions(stdout, stderr io.Writer, events <-chan model.Event,
 		}
 		stderrNeedsLeadingBreak = false
 		stderrStatusSeparated = true
+		if options.colorToolStatus {
+			_, err := fmt.Fprintln(stderr, reasoningColorDarkGray+formatToolStatus(toolCall)+ansiReset)
+			return err
+		}
 		_, err := fmt.Fprintln(stderr, formatToolStatus(toolCall))
 		return err
 	}
@@ -1352,17 +1363,16 @@ func writeStreamWithOptions(stdout, stderr io.Writer, events <-chan model.Event,
 		}
 		switch event := event.(type) {
 		case model.TextDeltaEvent:
+			if err := endReasoningForNonReasoningEvent(); err != nil {
+				return err
+			}
 			if event.Text != "" && needsReasoningBreak {
-				if err := resetReasoningColor(); err != nil {
-					return err
-				}
 				if !reasoningEndedWithNewline {
 					if err := writeStdout("\n"); err != nil {
 						return err
 					}
 				}
 				needsReasoningBreak = false
-				inReasoningBlock = false
 			}
 			if err := writeStdout(event.Text); err != nil {
 				return err
@@ -1379,18 +1389,28 @@ func writeStreamWithOptions(stdout, stderr io.Writer, events <-chan model.Event,
 				reasoningEndedWithNewline = strings.HasSuffix(event.Text, "\n")
 			}
 		case model.ToolCallDoneEvent:
+			if err := endReasoningForNonReasoningEvent(); err != nil {
+				return err
+			}
 			if err := writeToolStatus(event.ToolCall); err != nil {
 				return err
 			}
 		case model.ErrorEvent:
+			if err := endReasoningForNonReasoningEvent(); err != nil {
+				return err
+			}
 			return streamError(event)
+		default:
+			if err := endReasoningForNonReasoningEvent(); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
 }
 
 func formatToolStatus(toolCall model.ToolCall) string {
-	status := "! tool: " + toolCall.Name
+	status := "tool: " + toolCall.Name
 	path, ok := toolStatusPath(toolCall)
 	if ok {
 		status += " " + path
@@ -1427,7 +1447,7 @@ func toolStatusPath(toolCall model.ToolCall) (string, bool) {
 	return text, true
 }
 
-func shouldColorizeReasoning(stdout io.Writer) bool {
+func shouldColorizeWriter(stdout io.Writer) bool {
 	if os.Getenv("NO_COLOR") != "" {
 		return false
 	}
