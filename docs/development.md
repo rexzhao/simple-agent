@@ -318,8 +318,9 @@ stateful `previous_response_id` 对话续写、reasoning output item passthrough
 保存默认启用的本地 skill id 列表，空列表表示不读取或注入任何 skill。`sai run
 --enable-skills id1,id2` 覆盖配置中的 enabled skills，`--disable-skills` 本次运行禁用
 所有 skills；二者不能同时使用。只读取 `skill_dir`，不读取用户目录。
-`logging.path` 相对配置根目录解析，除非显式写成绝对路径。`mcp_dir` 是 M4 后启用的
-MCP 配置目录，同样相对配置根目录解析。
+`logging.path` 相对配置根目录解析，除非显式写成绝对路径。它兼容旧配置形态，但运行时
+解释为日志根/基准路径：例如 `logs/sai.jsonl` 会使用其目录 `logs/` 作为 session root；
+空字符串表示禁用日志。`mcp_dir` 是 M4 后启用的 MCP 配置目录，同样相对配置根目录解析。
 
 模型选择发生在会话开始时：
 
@@ -515,7 +516,13 @@ v0.1 中 MCP server 进程生命周期由当前 agent 进程管理。后台常�
 ## 日志和落盘
 
 v0.1 只落盘 JSONL 日志，不保存会话历史或上下文快照。日志路径来自
-`logging.path`，相对路径基于配置根目录解析。
+`logging.path`，相对路径基于配置根目录解析。`logging.path` 解释为日志根/基准路径：
+如果配置为 `logs/sai.jsonl`，实际 session root 是 `logs/`；如果配置为空，禁用日志。
+每次 `sai run` 或 `sai chat` 启动 runtime 时创建唯一 session 目录，并写入：
+
+```text
+<log-root>/<timestamp>-<short-random>/sai.jsonl
+```
 
 每行日志是一个 JSON object，至少包含：
 

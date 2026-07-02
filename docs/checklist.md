@@ -88,7 +88,7 @@
 - [x] 添加 Windows、Linux、macOS build 命令。
 - [x] 构建单文件可执行程序。
 - [x] 添加 `--verbose`。
-- [x] 添加 JSONL 日志。
+- [x] 添加 JSONL 日志，每次 `run` / `chat` 写入独立 session 目录。
 - [x] 除 JSONL 日志外，不落盘会话历史或上下文快照。
 - [x] v0.1 不记录完整 prompt、response、tool result 正文。
 - [x] missing API key 有可读错误。

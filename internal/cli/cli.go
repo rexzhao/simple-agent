@@ -650,11 +650,6 @@ func prepareAgentRuntime(ctx context.Context, configDir string, options agentCom
 	toolSchemas = append(toolSchemas, mcpToolSchemas...)
 
 	resolvedShowReasoning := options.showReasoning || cfg.Agent.ShowReasoning
-	if options.verbose {
-		if err := writeVerboseDiagnostics(stderr, cfg, resolved, enabledToolNames, resolvedShowReasoning); err != nil {
-			return nil, err
-		}
-	}
 	selectedSkills, err := enabledSkillsForRun(cfg, options.enabledSkills.ids, options.enabledSkills.set, options.disableSkills)
 	if err != nil {
 		return nil, err
@@ -672,6 +667,11 @@ func prepareAgentRuntime(ctx context.Context, configDir string, options agentCom
 	})
 	if err != nil {
 		return nil, err
+	}
+	if options.verbose {
+		if err := writeVerboseDiagnostics(stderr, cfg, resolved, enabledToolNames, resolvedShowReasoning, logger.Path()); err != nil {
+			return nil, errors.Join(err, logger.Close())
+		}
 	}
 
 	return &agentRuntime{
@@ -766,13 +766,13 @@ func (f *skillIDsFlag) String() string {
 	return strings.Join(f.ids, ",")
 }
 
-func writeVerboseDiagnostics(stderr io.Writer, cfg *config.Config, resolved config.ResolvedModel, enabledTools []string, showReasoning bool) error {
+func writeVerboseDiagnostics(stderr io.Writer, cfg *config.Config, resolved config.ResolvedModel, enabledTools []string, showReasoning bool, logPath string) error {
 	_, err := fmt.Fprintf(stderr, "config_dir: %s\nprovider: %s\nmodel_profile: %s\nmodel_id: %s\nlog_path: %s\nmax_turns: %d\nenabled_tools: %s\nshow_reasoning: %t\n",
 		cfg.ConfigDir,
 		resolved.ProviderName,
 		resolved.Profile,
 		resolved.ModelID,
-		verbosePath(cfg.Logging.Path),
+		verbosePath(logPath),
 		effectiveMaxTurns(cfg.Agent.MaxTurns),
 		formatVerboseToolNames(enabledTools),
 		showReasoning,

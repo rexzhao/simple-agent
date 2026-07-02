@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -194,6 +195,9 @@ func TestConfigShowDoesNotPrintAPIKeyValue(t *testing.T) {
 	}
 	if !strings.Contains(out, "<redacted>") {
 		t.Fatalf("config show should include redacted direct API key:\n%s", out)
+	}
+	if logPaths := sessionLogPaths(t, dir); len(logPaths) != 0 {
+		t.Fatalf("config show created session log paths: %#v", logPaths)
 	}
 }
 
@@ -508,6 +512,20 @@ func TestChatTwoTurnsCarryForwardUserAndAssistantHistory(t *testing.T) {
 	assertMessage(t, secondMessages, 2, "assistant", "one")
 	assertMessage(t, secondMessages, 3, "user", "second")
 	assertNoAdditionalCLIRunRequest(t, requests)
+
+	logPaths := sessionLogPaths(t, configDir)
+	if len(logPaths) != 1 {
+		t.Fatalf("session log paths = %#v, want one chat session log", logPaths)
+	}
+	data, err := os.ReadFile(logPaths[0])
+	if err != nil {
+		t.Fatalf("ReadFile(%q) error = %v", logPaths[0], err)
+	}
+	records := readJSONLRecords(t, data)
+	assertCLILogBaseFields(t, records)
+	if !hasCLILogRecord(records, "text_delta", "event", "text_delta") {
+		t.Fatalf("chat log records missing text_delta: %#v", records)
+	}
 }
 
 func TestChatToolCallHistoryCarriesIntoNextTurn(t *testing.T) {
@@ -1201,11 +1219,15 @@ func TestRunVerboseWritesDiagnosticsWithoutSensitiveContent(t *testing.T) {
 			"provider: fake",
 			"model_profile: default",
 			"model_id: model-default",
-			"log_path: "+filepath.Join(configDir, "logs", "sai.jsonl"),
 			"max_turns: 8",
 			"enabled_tools: list_files,read_file",
 			"show_reasoning: false",
 		)
+		logPaths := sessionLogPaths(t, configDir)
+		if len(logPaths) != 1 {
+			t.Fatalf("session log paths = %#v, want one", logPaths)
+		}
+		assertCLIVerboseContains(t, stderr.String(), "log_path: "+logPaths[0])
 		assertCLIErrorOmits(t, stderr.String(), "direct-secret-value", "user prompt secret", "model response secret")
 		<-requests
 		assertNoAdditionalCLIRunRequest(t, requests)
@@ -1333,7 +1355,11 @@ func TestRunWritesJSONLLogForToolCallWithoutSensitiveContent(t *testing.T) {
 	<-requests
 	assertNoAdditionalCLIRunRequest(t, requests)
 
-	logPath := filepath.Join(configDir, "logs", "sai.jsonl")
+	logPaths := sessionLogPaths(t, configDir)
+	if len(logPaths) != 1 {
+		t.Fatalf("session log paths = %#v, want one", logPaths)
+	}
+	logPath := logPaths[0]
 	logData, err := os.ReadFile(logPath)
 	if err != nil {
 		t.Fatalf("ReadFile(%q) error = %v", logPath, err)
@@ -1361,6 +1387,83 @@ func TestRunWritesJSONLLogForToolCallWithoutSensitiveContent(t *testing.T) {
 	assertJSONNumber(t, usageMap["input_tokens"], "11")
 	assertJSONNumber(t, usageMap["output_tokens"], "13")
 	assertJSONNumber(t, usageMap["total_tokens"], "24")
+}
+
+func TestRunCreatesSeparateSessionLogs(t *testing.T) {
+	server, requests := newCLIRunServer(t,
+		`{"choices":[{"delta":{"content":"ok"}}]}`,
+		`{"choices":[],"usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3}}`,
+		`[DONE]`,
+	)
+	defer server.Close()
+
+	configDir := t.TempDir()
+	writeCLIRunFixtureInDir(t, configDir, server.URL, "secret-api-key", "openai-chat")
+
+	for _, prompt := range []string{"first", "second"} {
+		var stdout, stderr bytes.Buffer
+		code := RunWithGetwd([]string{"--config-dir", configDir, "run", prompt}, &stdout, &stderr, func() (string, error) {
+			return t.TempDir(), nil
+		})
+		if code != 0 {
+			t.Fatalf("RunWithGetwd(%q) code = %d, stderr = %s", prompt, code, stderr.String())
+		}
+		if got, want := stdout.String(), "ok"; got != want {
+			t.Fatalf("stdout = %q, want %q", got, want)
+		}
+		<-requests
+	}
+	assertNoAdditionalCLIRunRequest(t, requests)
+
+	logPaths := sessionLogPaths(t, configDir)
+	if len(logPaths) != 2 {
+		t.Fatalf("session log paths = %#v, want two", logPaths)
+	}
+	if logPaths[0] == logPaths[1] {
+		t.Fatalf("two runs wrote the same log path: %q", logPaths[0])
+	}
+	for _, logPath := range logPaths {
+		if filepath.Base(logPath) != "sai.jsonl" {
+			t.Fatalf("session log path = %q, want sai.jsonl file", logPath)
+		}
+		data, err := os.ReadFile(logPath)
+		if err != nil {
+			t.Fatalf("ReadFile(%q) error = %v", logPath, err)
+		}
+		records := readJSONLRecords(t, data)
+		assertCLILogBaseFields(t, records)
+		firstCLILogRecord(t, records, "usage")
+	}
+}
+
+func TestRunWithLoggingDisabledDoesNotCreateSessionLog(t *testing.T) {
+	server, requests := newCLIRunServer(t,
+		`{"choices":[{"delta":{"content":"ok"}}]}`,
+		`[DONE]`,
+	)
+	defer server.Close()
+
+	configDir := t.TempDir()
+	writeCLIRunFixtureInDir(t, configDir, server.URL, "secret-api-key", "openai-chat")
+	setCLILoggingPath(t, configDir, `""`)
+
+	var stdout, stderr bytes.Buffer
+	code := RunWithGetwd([]string{"--config-dir", configDir, "run", "--verbose", "hello"}, &stdout, &stderr, func() (string, error) {
+		return t.TempDir(), nil
+	})
+
+	if code != 0 {
+		t.Fatalf("RunWithGetwd() code = %d, stderr = %s", code, stderr.String())
+	}
+	if got, want := stdout.String(), "ok"; got != want {
+		t.Fatalf("stdout = %q, want %q", got, want)
+	}
+	assertCLIVerboseContains(t, stderr.String(), "log_path: (disabled)")
+	if logPaths := sessionLogPaths(t, configDir); len(logPaths) != 0 {
+		t.Fatalf("session log paths = %#v, want none", logPaths)
+	}
+	<-requests
+	assertNoAdditionalCLIRunRequest(t, requests)
 }
 
 func TestRunEnableToolsRejectsUnknownTool(t *testing.T) {
@@ -1864,6 +1967,21 @@ func writeCLIFile(t *testing.T, path, content string) {
 	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
 		t.Fatalf("WriteFile(%q) error = %v", path, err)
 	}
+}
+
+func setCLILoggingPath(t *testing.T, configDir, path string) {
+	t.Helper()
+
+	configPath := filepath.Join(configDir, "sai.yaml")
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("ReadFile(%q) error = %v", configPath, err)
+	}
+	updated := strings.Replace(string(data), "  path: logs/sai.jsonl", "  path: "+path, 1)
+	if updated == string(data) {
+		t.Fatalf("sai.yaml did not contain logging path to replace:\n%s", data)
+	}
+	writeCLIFile(t, configPath, updated)
 }
 
 func writeCLISkill(t *testing.T, configDir, id, content string) {
@@ -2461,6 +2579,34 @@ func assertCLIVerboseContains(t *testing.T, got string, wants ...string) {
 			t.Fatalf("verbose stderr = %q, want contain %q", got, want)
 		}
 	}
+}
+
+func sessionLogPaths(t *testing.T, configDir string) []string {
+	t.Helper()
+
+	logRoot := filepath.Join(configDir, "logs")
+	entries, err := os.ReadDir(logRoot)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		t.Fatalf("ReadDir(%q) error = %v", logRoot, err)
+	}
+
+	var paths []string
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		path := filepath.Join(logRoot, entry.Name(), "sai.jsonl")
+		if _, err := os.Stat(path); err == nil {
+			paths = append(paths, path)
+		} else if !os.IsNotExist(err) {
+			t.Fatalf("Stat(%q) error = %v", path, err)
+		}
+	}
+	sort.Strings(paths)
+	return paths
 }
 
 func assertCLIToolStatus(t *testing.T, stdout, stderr, toolName string, hiddenValues ...string) {

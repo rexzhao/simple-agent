@@ -32,6 +32,13 @@ logging:
   level: info
 ```
 
+`logging.path` is a log root hint, kept compatible with older configs. For
+example, `logs/sai.jsonl` uses `.agents/logs/` as the root; each `sai run` or
+`sai chat` process writes JSONL metadata to
+`.agents/logs/<timestamp>-<random>/sai.jsonl`. Set `logging.path` to an empty
+string to disable JSONL logging. Logs do not include prompt, response, tool
+result, API key, or authorization header bodies.
+
 ```yaml
 # .agents/providers/paperhub.yaml
 name: paperhub
