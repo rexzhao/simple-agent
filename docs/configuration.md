@@ -102,6 +102,8 @@ mcp_dir: mcp
 - `agent.max_turns`：一次 agent loop 最多请求模型的轮数。
 - `agent.stream`：默认是否启用 streaming。
 - `agent.show_reasoning`：默认是否显示 reasoning stream。
+- 后续待办：`agent.show_reasoning` 和 session 保存默认值需要支持更明确的配置/CLI 覆盖；
+  普通新 chat 可由 CLI 显式覆盖配置，但 resume 必须沿用已保存 session 的关键参数。
 - `tools.enabled`：默认启用的工具列表。空列表表示不向模型暴露工具。
 - `skills.enabled`：默认启用的本地 skill id 列表。空列表表示不读取或注入任何 skill。
 - `logging.path`：JSONL 日志根/基准路径。相对路径基于配置根目录解析；例如
@@ -125,6 +127,7 @@ api_key: $PAPERHUB_API_KEY
 models:
   glm-5.2:
     id: glm-5.2
+    context_window: 128000
     temperature: 0.6
     max_tokens: 4096
   glm-5.2-fast:
@@ -147,10 +150,15 @@ models:
 - `api_key`：provider 的 API key 配置值，遵循敏感配置值的 `$ENV_NAME` 约定。
 - `models`：该 provider 下可选的模型配置。
 - `models.<name>.id`：实际发送给 API 的模型 id。
+- `models.<name>.context_window`：可选的模型上下文窗口 token 数。未配置时，`sai`
+  使用保守估算默认值 `32000`，并把来源记录为 `estimated`；显式配置时来源为
+  `configured`。该字段是 `sai` 的本地元数据，不会透传给 provider。
 - `models.<name>.*`：该 model profile 的请求参数。
 
 model profile 的 key 是 CLI 选择时使用的名字。`id` 是实际传给模型服务的名称。这样可以
 用同一个底层模型创建多个参数不同的 profile。
+请求参数既可以继续写在 profile 顶层，也可以写在 `parameters` map 中；`id` 和
+`context_window` 不属于请求参数。
 
 Anthropic Messages provider 使用同一套 provider/model profile 配置形态：
 
@@ -163,6 +171,7 @@ api_key: $ANTHROPIC_API_KEY
 models:
   claude-sonnet-5:
     id: claude-sonnet-5
+    context_window: 200000
     max_tokens: 4096
   claude-haiku-4-5:
     id: claude-haiku-4-5
@@ -183,6 +192,7 @@ api_key: $OPENAI_API_KEY
 models:
   default:
     id: gpt-5.1
+    context_window: 400000
     max_output_tokens: 4096
 ```
 
@@ -424,6 +434,22 @@ logging:
 和 MCP 错误。API key、Authorization header 和其他敏感配置值的实际值不能进入日志。
 v0.1 不记录完整 prompt、response、tool result 正文，也不提供开启正文日志的配置。
 
+## Context Window（M14 后）
+
+`sai` 在每次 provider 请求前，会基于当前 request messages 和 tool schemas 估算输入
+tokens。估算集中在 context window helper 中，当前采用保守字符数估算；provider stream
+返回 `model.UsageEvent` 时优先使用真实 usage 更新 tracking，若本次 stream 没有 usage
+event，则成功结束后记录 fallback estimate。
+
+当估算输入达到 context window 的 80% 时，CLI 向 stderr 输出一次 warning，只包含 token
+数量和窗口大小，不包含 prompt、assistant output、tool result 或 tool schema 正文。估算
+输入达到或超过窗口时，`sai` 拒绝发起 provider 请求，并给出可读错误。
+
+M14 的第一版不会自动摘要、截断或丢弃 system/developer messages、tool schemas、tool
+results 或历史消息。当前策略是保守保留全部上下文：接近窗口时警告，超预算时拒绝。后续
+若加入摘要或截断策略，需要单独设计可解释边界，并用测试证明不会静默丢弃关键指令、工具
+schema 或必要 tool result。
+
 ## Sessions 配置（M13 后）
 
 M13 后，resumable sessions 是独立于 JSONL 日志的 opt-in 能力。默认关闭：
@@ -468,10 +494,19 @@ parameters、enabled tools、enabled MCP、enabled skills 和 show_reasoning。�
 `--enable-tools` 或冲突的 `--show-reasoning`。`sessions.save_tool_results: false` 当前不
 提供可靠降级模式；只要启用保存或恢复，CLI 会拒绝继续并提示必须设为 `true`。
 
+后续待办：普通新 chat 中，`show_reasoning` 和 save-session 默认值可以放在配置文件中，
+并允许命令行显式覆盖配置。`--resume` 和 `--continue` 不参与这类覆盖：恢复时必须使用
+之前 session 保存的 provider、model、model parameters、enabled tools、enabled MCP、
+enabled skills、show_reasoning、save-session 等关键参数；如果 CLI 传入冲突覆盖，继续
+拒绝。本次 chat 如果会保存完整敏感 session，首次敏感数据提示应在 CLI 启动完成后、读取
+用户输入前输出，而不是等到第一次 provider 请求。
+
 session 管理命令使用解析后的 `sessions.dir`，不要求 `sessions.enabled: true`，因此可以在
 关闭自动保存时查看或清理已有文件。`sai sessions list` 只列出 ID、更新时间、provider 和
 model/profile 等元数据。`sai sessions show <id>` 只展示元数据，并提示 session 文件包含
 完整 prompt、assistant 输出和 tool result 等敏感内容；它不会打印完整 messages、tool
-result 正文、prompt 正文或注入指令正文。`sai sessions delete <id>` 删除指定 session；
+result 正文、prompt 正文或注入指令正文。M14 后，session 文件还保存 context management
+metadata，例如 context window、来源、warning 阈值和最近 usage 统计；`show` 只展示这些
+数字和 source，不展示正文。`sai sessions delete <id>` 删除指定 session；
 不存在时给出可读错误。`sai sessions prune --keep N` 保留 `updated_at` 最新的 N 个
 session，删除更旧的 session；`--keep` 必须显式提供，N 必须大于等于 0。

@@ -426,6 +426,14 @@ M7 当前实现只覆盖配置目录下的本地 skills：通过 `skills.enabled
 目标：在多轮 chat 和可恢复 session 之后，增加上下文窗口管理，先采用保守策略，避免静默
 丢弃关键 system、developer、tool schema 或 tool result 信息。
 
+M14 当前保守第一版支持 model profile `context_window` 元数据；未配置时使用 `32000`
+token 的估算默认窗口并记录来源为 `estimated`，显式配置时来源为 `configured`。每次
+provider 请求前估算 request messages 和 tool schemas 的输入 tokens；达到窗口 80% 时向
+stderr 输出一次只含 token 数/窗口的 warning，达到或超过窗口时拒绝发起 provider 请求。
+provider usage event 优先用于 tracking；缺失时成功 stream 结束后记录 fallback estimate。
+当前不会自动摘要、截断或丢弃任何上下文，后续摘要/截断策略必须单独设计并测试。
+resumable session 保存 context management metadata，恢复后继续用该 metadata 判断预算。
+
 交付物：
 
 - token budget / usage tracking，优先使用 provider 返回的 usage；缺失时使用保守估算。
@@ -433,8 +441,8 @@ M7 当前实现只覆盖配置目录下的本地 skills：通过 `skills.enabled
 - 接近 context window 时向 stderr 给出清晰警告。
 - 达到预算前拒绝继续或要求用户选择处理方式，不静默截断关键上下文。
 - 初始策略先保守：保留内置 system、`AGENTS.md`、enabled skills、tool/MCP schema、
-  最近 user/assistant 消息和必要 tool result。
-- 设计截断或摘要策略，但摘要进入自动路径前必须有测试覆盖和可解释边界。
+  全部 user/assistant 消息和 tool result，不自动摘要或截断。
+- 记录后续截断或摘要策略边界；摘要进入自动路径前必须有测试覆盖和可解释边界。
 - resumable session 中记录 context management metadata，恢复后能继续判断预算。
 
 验证：
@@ -446,6 +454,18 @@ M7 当前实现只覆盖配置目录下的本地 skills：通过 `skills.enabled
 - 测试覆盖达到预算时给出可读错误或明确下一步提示。
 - `go test ./...` 通过。
 - `git diff --check` 通过。
+
+## M14 后续待办：配置覆盖和 session 提示时机
+
+这些需求是 M14 候选实现后的追加记录，尚未进入当前实现范围：
+
+- `show_reasoning` 和 save-session 默认值可以放在配置文件中，普通新 chat 允许命令行显式
+  覆盖配置。
+- `--resume` 和 `--continue` 不允许这类覆盖：恢复时使用之前 session 保存的 provider、
+  model、model parameters、tools、MCP、skills、show_reasoning、save-session 等关键参数；
+  如果 CLI 传入冲突覆盖，继续拒绝。
+- 启用 session 保存时，首次敏感数据提示应在 CLI 启动完成后、读取用户输入前输出，不要等到
+  第一次 provider 请求时才提示。
 
 ## M15：Input UX and Doctor
 

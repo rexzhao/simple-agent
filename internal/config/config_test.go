@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/rexzhao/simple-agent/internal/contextwindow"
 )
 
 func TestLoadResolvesConfigAndProviderModels(t *testing.T) {
@@ -288,6 +290,73 @@ models:
 	}
 	if got := resolved.Parameters["temperature"]; got != 0.2 {
 		t.Fatalf("temperature = %#v, want 0.2", got)
+	}
+}
+
+func TestLoadModelProfileContextWindowAndNestedParameters(t *testing.T) {
+	dir := t.TempDir()
+	providersDir := filepath.Join(dir, "providers")
+	if err := os.MkdirAll(providersDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll() error = %v", err)
+	}
+
+	writeFile(t, filepath.Join(dir, "sai.yaml"), `default_provider: fake
+default_model: default
+provider_dir: providers
+`)
+	writeFile(t, filepath.Join(providersDir, "fake.yaml"), `name: fake
+type: openai-chat
+base_url: http://localhost:8080/v1
+api_key: direct-secret
+
+models:
+  default:
+    id: model-default
+    context_window: 128000
+    parameters:
+      temperature: 0.2
+      max_tokens: 64
+  estimated:
+    id: model-estimated
+    max_tokens: 32
+`)
+
+	cfg, err := Load(dir)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+
+	profile := cfg.Providers["fake"].Models["default"]
+	if profile.ContextWindow != 128000 {
+		t.Fatalf("ContextWindow = %d, want 128000", profile.ContextWindow)
+	}
+	if got := profile.Parameters["temperature"]; got != 0.2 {
+		t.Fatalf("temperature = %#v, want 0.2", got)
+	}
+	if got := profile.Parameters["max_tokens"]; got != 64 {
+		t.Fatalf("max_tokens = %#v, want 64", got)
+	}
+	if _, ok := profile.Parameters["context_window"]; ok {
+		t.Fatal("Parameters unexpectedly contains context_window")
+	}
+	if _, ok := profile.Parameters["parameters"]; ok {
+		t.Fatal("Parameters unexpectedly contains nested parameters field")
+	}
+
+	resolved, err := cfg.ResolveModel("fake", "default")
+	if err != nil {
+		t.Fatalf("ResolveModel(default) error = %v", err)
+	}
+	if resolved.ContextWindow != 128000 || resolved.ContextWindowSource != string(contextwindow.WindowSourceConfigured) {
+		t.Fatalf("resolved context = %d/%q, want 128000/configured", resolved.ContextWindow, resolved.ContextWindowSource)
+	}
+
+	resolved, err = cfg.ResolveModel("fake", "estimated")
+	if err != nil {
+		t.Fatalf("ResolveModel(estimated) error = %v", err)
+	}
+	if resolved.ContextWindow != contextwindow.DefaultContextWindowTokens || resolved.ContextWindowSource != string(contextwindow.WindowSourceEstimated) {
+		t.Fatalf("resolved context = %d/%q, want default estimated", resolved.ContextWindow, resolved.ContextWindowSource)
 	}
 }
 

@@ -57,9 +57,14 @@ api_key: $PAPERHUB_API_KEY
 models:
   glm-5.2:
     id: glm-5.2
+    context_window: 128000
     temperature: 0.6
     max_tokens: 4096
 ```
+
+`context_window` is optional local metadata for budget checks. If it is omitted,
+`sai` uses a conservative estimated default of `32000` tokens and records the
+source as `estimated`; configured values are recorded as `configured`.
 
 ## Basic Usage
 
@@ -84,6 +89,12 @@ ignored; `/exit`, `/quit`, or EOF exits normally. Session history stays in
 memory for the current process and is not written to disk unless resumable
 sessions are enabled.
 
+Before each provider request, `sai` estimates input tokens from the full message
+history and tool schemas. At 80% of the model context window it writes a warning
+to stderr with only token counts and the window size. At or above the window it
+refuses to send the provider request. It does not silently truncate or summarize
+system/developer instructions, tool schemas, tool results, or prior messages.
+
 Resumable sessions are an explicit opt-in feature. They save full prompts,
 assistant output, assistant tool calls, and tool results under `sessions.dir`,
 so treat those files as sensitive:
@@ -101,7 +112,9 @@ sai sessions prune --keep 10
 `sai sessions list` works even when `sessions.enabled` is `false`, so existing
 files can be inspected after automatic saving is disabled. `list` and `show`
 only print metadata and warnings; they do not print full messages, prompt
-text, assistant output, or tool result content.
+text, assistant output, or tool result content. Saved sessions also include
+context window metadata and recent usage tracking, which `show` displays only as
+numbers and source labels.
 
 Show CLI usage without loading configuration:
 

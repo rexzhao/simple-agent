@@ -252,17 +252,23 @@
 
 ## M14：Context Window Management
 
-- [ ] 增加 token budget / usage tracking。
-- [ ] 优先使用 provider 返回的 usage。
-- [ ] usage 缺失时使用保守估算。
-- [ ] 会话开始时记录模型 context window 配置或估算值。
-- [ ] 接近 context window 时向 stderr 警告。
-- [ ] 达到预算前拒绝继续或要求用户选择处理方式。
-- [ ] 不静默截断 system/developer/tool schema 信息。
-- [ ] 保守保留内置 system、`AGENTS.md`、enabled skills、tool/MCP schema 和必要 tool result。
-- [ ] 设计截断或摘要策略并记录边界。
-- [ ] resumable session 保存 context management metadata。
-- [ ] 添加 usage tracking、预算警告和关键上下文保留测试。
+- [x] 增加 token budget / usage tracking。
+- [x] 优先使用 provider 返回的 usage。
+- [x] usage 缺失时使用保守估算。
+- [x] 会话开始时记录模型 context window 配置或估算值。
+- [x] 接近 context window 时向 stderr 警告。
+- [x] 达到预算前拒绝继续或要求用户选择处理方式。
+- [x] 不静默截断 system/developer/tool schema 信息。
+- [x] 保守保留内置 system、`AGENTS.md`、enabled skills、tool/MCP schema、全部消息和 tool result。
+- [x] 设计截断或摘要策略并记录边界。
+- [x] resumable session 保存 context management metadata。
+- [x] 添加 usage tracking、预算警告和关键上下文保留测试。
+
+## M14 后续待办：配置覆盖和 session 提示时机
+
+- [ ] 配置文件支持 `show_reasoning` 和 save-session 默认值，普通新 chat 可由 CLI 显式覆盖。
+- [ ] `--resume` / `--continue` 使用已保存 session 的 provider、model、参数、tools、MCP、skills、show_reasoning、save-session 等关键参数，CLI 冲突覆盖继续拒绝。
+- [ ] 启用 session 保存时，首次敏感数据提示在 CLI 启动完成后、读取用户输入前输出，而不是等到第一次 provider 请求。
 
 ## M15：Input UX and Doctor
 

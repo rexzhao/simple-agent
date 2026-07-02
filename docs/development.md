@@ -291,6 +291,14 @@ messages 却发给不同模型或工具集合”。如果本次命令显式传�
 `--show-reasoning`，命令会失败并给出可读错误。可靠保存和恢复要求
 `sessions.save_tool_results: true`；设为 `false` 时，`sai chat` 会拒绝启用保存或恢复。
 
+后续待办：把 reasoning 展示和 session 保存也纳入更明确的配置/CLI 覆盖模型。普通新
+chat 应允许在配置文件中设置 `show_reasoning` 和 save-session 默认值，并允许命令行显式
+覆盖这些配置；但 resume 例外，恢复时必须使用上一 session 保存的 provider、model、
+model parameters、tools、MCP、skills、show_reasoning、save-session 等关键参数，如果 CLI
+传入冲突覆盖，仍应拒绝而不是覆盖已保存参数。另一个后续 UX 要求是：一旦本次 chat 会
+保存完整敏感 session，首次敏感数据提示应在 CLI 启动完成后、读取用户输入前输出，不要等到
+第一次 provider 请求时才提示。
+
 `sai sessions list`、`sai sessions show <id>`、`sai sessions delete <id>` 和
 `sai sessions prune --keep N` 使用配置解析后的 `sessions.dir`。即使
 `sessions.enabled: false`，这些管理命令也可以查看或清理已有 session 文件。`list` 只输出
@@ -344,6 +352,7 @@ api_key: $PAPERHUB_API_KEY
 models:
   glm-5.2:
     id: glm-5.2
+    context_window: 128000
     temperature: 0.6
     max_tokens: 4096
   glm-5.2-fast:
@@ -400,6 +409,9 @@ stateful `previous_response_id` 对话续写、reasoning output item passthrough
 接收解析后的实际值。除非某个 adapter 明确声明协议特定的默认环境变量，否则 adapter
 不承担通用环境变量解析职责。无论实际值来自环境变量还是直接配置，日志、verbose 输出
 和 resolved config 都不能打印实际值。
+model profile 可选 `context_window` 作为本地上下文窗口元数据，不透传给 provider。未配置
+时使用保守估算默认值 `32000`，来源记录为 `estimated`；显式配置时来源为
+`configured`。请求参数可继续写在 profile 顶层，也可写在 `parameters` map 中。
 `provider_dir` 相对配置根目录解析，除非显式写成绝对路径。
 `skill_dir` 是 M7 后的本地 skill 目录，默认是配置根目录下的 `skills`，同样相对配置
 根目录解析；推荐布局是 `.agents/skills/<skill_id>/SKILL.md`。`skills.enabled`
@@ -654,6 +666,29 @@ resume。
 `sai chat --continue`、`sai sessions list`、`sai sessions show <id>`、
 `sai sessions delete <id>` 和 `sai sessions prune --keep N`。管理命令只展示元数据或删除
 文件，不打印完整 messages、prompt、assistant output 或 tool result 正文。
+
+## Context Window Management
+
+M14 的第一版只做保守上下文窗口管理，不做自动摘要、自动截断或交互式选择。每次 provider
+请求前，运行时基于当前 request messages 和 tool schemas 做输入 token 估算；估算集中在
+`internal/contextwindow`，当前按字符数保守估算，并包含固定 message / tool schema overhead。
+
+模型 profile 可配置 `context_window`。未配置时使用 `32000` token 的保守估算默认值，来源
+记录为 `estimated`；显式配置时来源记录为 `configured`。当估算输入达到窗口的 80% 时，
+CLI 向 stderr 输出一次 warning，只包含 token 数和窗口，不包含 prompt、assistant output、
+tool result、tool schema 或 API key。达到或超过窗口时，运行时拒绝发起 provider 请求，
+并返回可读错误。
+
+usage tracking 优先使用 provider stream 中的 `model.UsageEvent`。如果本次 stream 成功结束
+但没有 usage event，则记录 fallback estimate。启用 resumable sessions 时，session 文件会
+保存 context management metadata，包括窗口、来源、warning 阈值、最近 request estimate 和
+usage source；恢复后继续使用这些 metadata 判断预算。`sai sessions show` 只展示这些数字和
+source，不展示正文。
+
+当前策略保守保留全部上下文：system/developer messages、enabled skill instructions、tool
+/ MCP schemas、assistant tool calls、tool result messages 和历史 user/assistant messages
+都不会被静默丢弃。后续若要加入摘要或截断策略，必须单独设计可解释边界和测试，证明不会
+静默丢弃关键 system/developer/tool schema/tool result 信息。
 
 ## 测试策略
 

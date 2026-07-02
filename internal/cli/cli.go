@@ -17,6 +17,7 @@ import (
 	"github.com/rexzhao/simple-agent/internal/agent"
 	"github.com/rexzhao/simple-agent/internal/config"
 	projectcontext "github.com/rexzhao/simple-agent/internal/context"
+	"github.com/rexzhao/simple-agent/internal/contextwindow"
 	eventlog "github.com/rexzhao/simple-agent/internal/logging"
 	"github.com/rexzhao/simple-agent/internal/mcp"
 	"github.com/rexzhao/simple-agent/internal/model"
@@ -744,6 +745,16 @@ func sessionsShowCommand(args []string, configDir string, stdout io.Writer, getw
 	fmt.Fprintf(stdout, "ENABLED_MCP\t%s\n", formatSessionStringList(session.EnabledMCP))
 	fmt.Fprintf(stdout, "ENABLED_SKILLS\t%s\n", formatSessionStringList(session.EnabledSkills))
 	fmt.Fprintf(stdout, "SHOW_REASONING\t%t\n", session.ShowReasoning)
+	if session.Context.ContextWindow > 0 {
+		fmt.Fprintf(stdout, "CONTEXT_WINDOW\t%d\n", session.Context.ContextWindow)
+		fmt.Fprintf(stdout, "CONTEXT_WINDOW_SOURCE\t%s\n", session.Context.ContextWindowSource)
+		fmt.Fprintf(stdout, "CONTEXT_WARNING_THRESHOLD_PERCENT\t%d\n", session.Context.WarningThresholdPercent)
+		fmt.Fprintf(stdout, "CONTEXT_LAST_REQUEST_TOKENS\t%d\n", session.Context.LastRequestTokens)
+		fmt.Fprintf(stdout, "CONTEXT_LAST_INPUT_TOKENS\t%d\n", session.Context.LastInputTokens)
+		fmt.Fprintf(stdout, "CONTEXT_LAST_OUTPUT_TOKENS\t%d\n", session.Context.LastOutputTokens)
+		fmt.Fprintf(stdout, "CONTEXT_LAST_TOTAL_TOKENS\t%d\n", session.Context.LastTotalTokens)
+		fmt.Fprintf(stdout, "CONTEXT_LAST_USAGE_SOURCE\t%s\n", session.Context.LastUsageSource)
+	}
 	fmt.Fprintf(stdout, "SAVE_TOOL_RESULTS\t%t\n", session.SaveToolResults)
 	fmt.Fprintf(stdout, "INSTRUCTION_COUNT\t%d\n", len(session.InstructionsSnapshot))
 	fmt.Fprintf(stdout, "MESSAGE_COUNT\t%d\n", len(session.Messages))
@@ -1131,6 +1142,7 @@ type agentRuntime struct {
 	resumableSessionStore *sessions.Store
 	saveSessions          bool
 	sessionSaveNoticeDone bool
+	contextTracker        *contextwindow.Tracker
 	logger                *eventlog.Logger
 	mcpSessions           []*mcp.Session
 }
@@ -1185,6 +1197,9 @@ func (r *agentRuntime) saveUpdatedMessages(messages []model.Message) error {
 		session.InstructionsSnapshot = copyMessageSlice(r.baseMessages)
 	}
 	session.Messages = copyMessageSlice(messages)
+	if r.contextTracker != nil {
+		session.Context = r.contextTracker.Metadata()
+	}
 	session.SaveToolResults = true
 
 	saved, err := r.resumableSessionStore.Save(session)
@@ -1247,6 +1262,15 @@ func prepareAgentRuntime(ctx context.Context, configDir string, options agentCom
 	provider, err := newProviderForRun(resolved.ProviderName, resolved.Provider)
 	if err != nil {
 		return nil, err
+	}
+	contextTracker := contextwindow.NewTracker(contextwindow.Window{
+		Tokens: resolved.ContextWindow,
+		Source: contextwindow.ParseWindowSource(resolved.ContextWindowSource),
+	}, resumedSession.Context)
+	provider = contextwindow.TrackingProvider{
+		Inner:         provider,
+		Tracker:       contextTracker,
+		WarningWriter: stderr,
 	}
 
 	enabledToolNames := cfg.Tools.Enabled
@@ -1330,6 +1354,7 @@ func prepareAgentRuntime(ctx context.Context, configDir string, options agentCom
 		resumableSession:      resumedSession,
 		resumableSessionStore: sessionStore,
 		saveSessions:          saveSessions,
+		contextTracker:        contextTracker,
 		logger:                logger,
 		mcpSessions:           mcpSessions,
 	}, nil

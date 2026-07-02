@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/rexzhao/simple-agent/internal/contextwindow"
 	"github.com/rexzhao/simple-agent/internal/model"
 )
 
@@ -48,6 +49,16 @@ func TestStoreSaveLoadFullMessages(t *testing.T) {
 			},
 			{Role: model.MessageRoleTool, ToolCallID: "call_read", Content: "M13 checklist body", IsError: false},
 			{Role: model.MessageRoleAssistant, Content: "Done."},
+		},
+		Context: contextwindow.Metadata{
+			ContextWindow:           128000,
+			ContextWindowSource:     string(contextwindow.WindowSourceConfigured),
+			WarningThresholdPercent: contextwindow.WarningThresholdPercent,
+			LastRequestTokens:       1000,
+			LastInputTokens:         900,
+			LastOutputTokens:        50,
+			LastTotalTokens:         950,
+			LastUsageSource:         string(contextwindow.UsageSourceProvider),
 		},
 		SaveToolResults: true,
 	}
@@ -96,6 +107,9 @@ func TestStoreSaveLoadFullMessages(t *testing.T) {
 	}
 	if !reflect.DeepEqual(loaded.Messages, saved.Messages) {
 		t.Fatalf("Messages = %#v, want %#v", loaded.Messages, saved.Messages)
+	}
+	if !reflect.DeepEqual(loaded.Context, saved.Context) {
+		t.Fatalf("Context = %#v, want %#v", loaded.Context, saved.Context)
 	}
 	if !loaded.SaveToolResults {
 		t.Fatal("SaveToolResults = false, want true")

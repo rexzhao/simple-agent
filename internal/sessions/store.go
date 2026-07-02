@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/rexzhao/simple-agent/internal/contextwindow"
 	"github.com/rexzhao/simple-agent/internal/model"
 )
 
@@ -20,23 +21,24 @@ const CurrentVersion = 1
 var ErrNotFound = errors.New("session not found")
 
 type Session struct {
-	ID                   string          `json:"id"`
-	CreatedAt            time.Time       `json:"created_at"`
-	UpdatedAt            time.Time       `json:"updated_at"`
-	Version              int             `json:"version"`
-	Provider             string          `json:"provider"`
-	ModelProfile         string          `json:"model_profile"`
-	ModelID              string          `json:"model_id"`
-	ModelParameters      map[string]any  `json:"model_parameters,omitempty"`
-	CWD                  string          `json:"cwd"`
-	ConfigDir            string          `json:"config_dir"`
-	EnabledTools         []string        `json:"enabled_tools,omitempty"`
-	EnabledMCP           []string        `json:"enabled_mcp,omitempty"`
-	EnabledSkills        []string        `json:"enabled_skills,omitempty"`
-	ShowReasoning        bool            `json:"show_reasoning"`
-	InstructionsSnapshot []model.Message `json:"instructions_snapshot,omitempty"`
-	Messages             []model.Message `json:"messages"`
-	SaveToolResults      bool            `json:"save_tool_results"`
+	ID                   string                 `json:"id"`
+	CreatedAt            time.Time              `json:"created_at"`
+	UpdatedAt            time.Time              `json:"updated_at"`
+	Version              int                    `json:"version"`
+	Provider             string                 `json:"provider"`
+	ModelProfile         string                 `json:"model_profile"`
+	ModelID              string                 `json:"model_id"`
+	ModelParameters      map[string]any         `json:"model_parameters,omitempty"`
+	CWD                  string                 `json:"cwd"`
+	ConfigDir            string                 `json:"config_dir"`
+	EnabledTools         []string               `json:"enabled_tools,omitempty"`
+	EnabledMCP           []string               `json:"enabled_mcp,omitempty"`
+	EnabledSkills        []string               `json:"enabled_skills,omitempty"`
+	ShowReasoning        bool                   `json:"show_reasoning"`
+	InstructionsSnapshot []model.Message        `json:"instructions_snapshot,omitempty"`
+	Messages             []model.Message        `json:"messages"`
+	Context              contextwindow.Metadata `json:"context,omitempty"`
+	SaveToolResults      bool                   `json:"save_tool_results"`
 }
 
 type Info struct {
@@ -47,6 +49,8 @@ type Info struct {
 	Provider        string    `json:"provider"`
 	ModelProfile    string    `json:"model_profile"`
 	ModelID         string    `json:"model_id"`
+	ContextWindow   int       `json:"context_window,omitempty"`
+	ContextSource   string    `json:"context_window_source,omitempty"`
 	SaveToolResults bool      `json:"save_tool_results"`
 }
 
@@ -242,6 +246,8 @@ func (s Session) info() Info {
 		Provider:        s.Provider,
 		ModelProfile:    s.ModelProfile,
 		ModelID:         s.ModelID,
+		ContextWindow:   s.Context.ContextWindow,
+		ContextSource:   s.Context.ContextWindowSource,
 		SaveToolResults: s.SaveToolResults,
 	}
 }

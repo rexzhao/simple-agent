@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/rexzhao/simple-agent/internal/contextwindow"
 	"gopkg.in/yaml.v3"
 )
 
@@ -69,8 +70,9 @@ type ProviderConfig struct {
 }
 
 type ModelProfile struct {
-	ID         string         `json:"id" yaml:"id"`
-	Parameters map[string]any `json:"parameters,omitempty" yaml:"parameters,omitempty"`
+	ID            string         `json:"id" yaml:"id"`
+	ContextWindow int            `json:"context_window,omitempty" yaml:"context_window,omitempty"`
+	Parameters    map[string]any `json:"parameters,omitempty" yaml:"parameters,omitempty"`
 }
 
 type ModelInfo struct {
@@ -80,11 +82,13 @@ type ModelInfo struct {
 }
 
 type ResolvedModel struct {
-	ProviderName string
-	Provider     ProviderConfig
-	Profile      string
-	ModelID      string
-	Parameters   map[string]any
+	ProviderName        string
+	Provider            ProviderConfig
+	Profile             string
+	ModelID             string
+	Parameters          map[string]any
+	ContextWindow       int
+	ContextWindowSource string
 }
 
 func (p ProviderConfig) MarshalJSON() ([]byte, error) {
@@ -188,6 +192,7 @@ func (c *Config) ResolveModel(providerName, modelName string) (ResolvedModel, er
 	if !ok {
 		return ResolvedModel{}, fmt.Errorf("unknown model %q for provider %q; available models: %s", modelName, providerName, formatProviderModelChoices(provider))
 	}
+	window := contextwindow.ResolveWindow(profile.ContextWindow)
 
 	resolvedProvider := copyProvider(provider)
 	apiKey, err := resolveAPIKey(provider.APIKey)
@@ -197,11 +202,13 @@ func (c *Config) ResolveModel(providerName, modelName string) (ResolvedModel, er
 	resolvedProvider.ResolvedAPIKey = apiKey
 
 	return ResolvedModel{
-		ProviderName: providerName,
-		Provider:     resolvedProvider,
-		Profile:      modelName,
-		ModelID:      profile.ID,
-		Parameters:   copyParameters(profile.Parameters),
+		ProviderName:        providerName,
+		Provider:            resolvedProvider,
+		Profile:             modelName,
+		ModelID:             profile.ID,
+		Parameters:          copyParameters(profile.Parameters),
+		ContextWindow:       window.Tokens,
+		ContextWindowSource: string(window.Source),
 	}, nil
 }
 
@@ -319,9 +326,44 @@ func (m *ModelProfile) UnmarshalYAML(value *yaml.Node) error {
 	}
 	delete(fields, "id")
 
+	if rawContextWindow, ok := fields["context_window"]; ok {
+		contextWindow, err := parseContextWindow(rawContextWindow)
+		if err != nil {
+			return err
+		}
+		m.ContextWindow = contextWindow
+		delete(fields, "context_window")
+	}
+
+	parameters := map[string]any{}
+	if rawParameters, ok := fields["parameters"]; ok {
+		decoded, ok := rawParameters.(map[string]any)
+		if !ok {
+			return fmt.Errorf("model profile parameters must be a map")
+		}
+		for key, value := range decoded {
+			parameters[key] = value
+		}
+		delete(fields, "parameters")
+	}
+	for key, value := range fields {
+		parameters[key] = value
+	}
+
 	m.ID = idString
-	m.Parameters = fields
+	m.Parameters = parameters
 	return nil
+}
+
+func parseContextWindow(value any) (int, error) {
+	tokens, ok := value.(int)
+	if !ok {
+		return 0, fmt.Errorf("model profile context_window must be a positive integer")
+	}
+	if tokens <= 0 {
+		return 0, fmt.Errorf("model profile context_window must be a positive integer")
+	}
+	return tokens, nil
 }
 
 func defaultConfig() Config {

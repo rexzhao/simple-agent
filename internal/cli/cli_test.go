@@ -18,6 +18,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/rexzhao/simple-agent/internal/contextwindow"
 	"github.com/rexzhao/simple-agent/internal/model"
 	"github.com/rexzhao/simple-agent/internal/sessions"
 )
@@ -1406,6 +1407,102 @@ func TestChatToolCallHistoryCarriesIntoNextTurn(t *testing.T) {
 	assertNoAdditionalCLIRunRequest(t, requests)
 }
 
+func TestChatContextWindowWarningDoesNotLeakSensitiveContent(t *testing.T) {
+	server, requests := newCLIRunServer(t,
+		`{"choices":[{"delta":{"content":"assistant secret"}}]}`,
+		`[DONE]`,
+	)
+	defer server.Close()
+
+	configDir := t.TempDir()
+	writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
+	setCLIModelContextWindow(t, configDir, 260)
+
+	var stdout, stderr bytes.Buffer
+	code := RunWithIO([]string{"--config-dir", configDir, "chat", "--quit", "--prompt", "user prompt secret"}, strings.NewReader(""), &stdout, &stderr, func() (string, error) {
+		return t.TempDir(), nil
+	})
+
+	if code != 0 {
+		t.Fatalf("RunWithIO() code = %d, stderr = %s", code, stderr.String())
+	}
+	if got, want := stdout.String(), "assistant secret"; got != want {
+		t.Fatalf("stdout = %q, want %q", got, want)
+	}
+	errOut := stderr.String()
+	if !strings.Contains(errOut, "sai: warning: estimated context usage") || !strings.Contains(errOut, "/260 tokens") || !strings.Contains(errOut, "no context was truncated") {
+		t.Fatalf("stderr = %q, want context window warning", errOut)
+	}
+	assertCLIErrorOmits(t, errOut, "user prompt secret", "assistant secret", "direct-secret-value", builtInBaseInstructions)
+	<-requests
+	assertNoAdditionalCLIRunRequest(t, requests)
+}
+
+func TestChatOverBudgetRejectsBeforeProviderRequestWithoutLeakingContent(t *testing.T) {
+	server, requests := newCLIRunServer(t,
+		`{"choices":[{"delta":{"content":"unexpected assistant secret"}}]}`,
+		`[DONE]`,
+	)
+	defer server.Close()
+
+	projectDir := t.TempDir()
+	writeCLIFile(t, filepath.Join(projectDir, "AGENTS.md"), "project developer secret\n")
+	configDir := t.TempDir()
+	writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
+	setCLIModelContextWindow(t, configDir, 10)
+
+	var stdout, stderr bytes.Buffer
+	code := RunWithIO([]string{"--config-dir", configDir, "chat", "--quit", "--prompt", "user prompt secret"}, strings.NewReader(""), &stdout, &stderr, func() (string, error) {
+		return projectDir, nil
+	})
+
+	if code != 1 {
+		t.Fatalf("RunWithIO() code = %d, want 1", code)
+	}
+	if stdout.String() != "" {
+		t.Fatalf("stdout = %q, want empty", stdout.String())
+	}
+	assertCLIErrorContains(t, stderr.String(), "context window budget exceeded", "refusing to send provider request", "no context was truncated")
+	assertCLIErrorOmits(t, stderr.String(), "user prompt secret", "project developer secret", "unexpected assistant secret", "direct-secret-value", builtInBaseInstructions)
+	assertNoAdditionalCLIRunRequest(t, requests)
+}
+
+func TestChatContextBudgetDoesNotDropSystemDeveloperOrToolSchemas(t *testing.T) {
+	server, requests := newCLIRunServer(t,
+		`{"choices":[{"delta":{"content":"ok"}}]}`,
+		`[DONE]`,
+	)
+	defer server.Close()
+
+	projectDir := t.TempDir()
+	writeCLIFile(t, filepath.Join(projectDir, "AGENTS.md"), "project developer secret\n")
+	configDir := t.TempDir()
+	writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
+	setCLIModelContextWindow(t, configDir, 5000)
+
+	var stdout, stderr bytes.Buffer
+	code := RunWithIO([]string{"--config-dir", configDir, "chat", "--quit", "--enable-tools", "read_file", "--prompt", "user prompt secret"}, strings.NewReader(""), &stdout, &stderr, func() (string, error) {
+		return projectDir, nil
+	})
+
+	if code != 0 {
+		t.Fatalf("RunWithIO() code = %d, stderr = %s", code, stderr.String())
+	}
+	if got, want := stdout.String(), "ok"; got != want {
+		t.Fatalf("stdout = %q, want %q", got, want)
+	}
+	request := <-requests
+	messages := requestMessages(t, request.Body)
+	if len(messages) != 3 {
+		t.Fatalf("len(messages) = %d, want 3: %#v", len(messages), messages)
+	}
+	assertMessage(t, messages, 0, "system", builtInBaseInstructions)
+	assertMessage(t, messages, 1, "developer", "project developer secret\n")
+	assertMessage(t, messages, 2, "user", "user prompt secret")
+	assertCLIToolNames(t, request.Body, []string{"read_file"})
+	assertNoAdditionalCLIRunRequest(t, requests)
+}
+
 func TestChatDefaultConfigDoesNotCreateResumableSession(t *testing.T) {
 	server, requests := newCLIRunServer(t,
 		`{"choices":[{"delta":{"content":"one"}}]}`,
@@ -1520,6 +1617,51 @@ func TestChatConfiguredSessionsSaveFullMessages(t *testing.T) {
 	assertSavedMessage(t, session.Messages, 0, model.MessageRoleSystem, builtInBaseInstructions)
 	assertSavedMessage(t, session.Messages, 1, model.MessageRoleUser, "first")
 	assertSavedMessage(t, session.Messages, 2, model.MessageRoleAssistant, "one")
+	if session.Context.ContextWindow != contextwindow.DefaultContextWindowTokens || session.Context.ContextWindowSource != string(contextwindow.WindowSourceEstimated) {
+		t.Fatalf("session context window = %d/%q, want default estimated", session.Context.ContextWindow, session.Context.ContextWindowSource)
+	}
+	if session.Context.LastUsageSource != string(contextwindow.UsageSourceEstimated) {
+		t.Fatalf("session LastUsageSource = %q, want estimated", session.Context.LastUsageSource)
+	}
+	if session.Context.LastRequestTokens <= 0 || session.Context.LastInputTokens <= 0 || session.Context.LastTotalTokens <= 0 {
+		t.Fatalf("session context metadata missing usage estimates: %#v", session.Context)
+	}
+}
+
+func TestChatSaveSessionRecordsProviderUsageMetadata(t *testing.T) {
+	server, requests := newCLIRunServer(t,
+		`{"choices":[{"delta":{"content":"one"}}]}`,
+		`{"choices":[],"usage":{"prompt_tokens":11,"completion_tokens":13,"total_tokens":24}}`,
+		`[DONE]`,
+	)
+	defer server.Close()
+
+	configDir := t.TempDir()
+	writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
+	setCLIModelContextWindow(t, configDir, 128000)
+
+	var stdout, stderr bytes.Buffer
+	code := RunWithIO([]string{"--config-dir", configDir, "chat", "--save-session", "--quit", "--prompt", "first"}, strings.NewReader(""), &stdout, &stderr, func() (string, error) {
+		return t.TempDir(), nil
+	})
+
+	if code != 0 {
+		t.Fatalf("RunWithIO() code = %d, stderr = %s", code, stderr.String())
+	}
+	<-requests
+	assertNoAdditionalCLIRunRequest(t, requests)
+
+	session := loadOnlyCLISession(t, filepath.Join(configDir, "sessions"))
+	if session.Context.ContextWindow != 128000 || session.Context.ContextWindowSource != string(contextwindow.WindowSourceConfigured) {
+		t.Fatalf("session context window = %d/%q, want 128000/configured", session.Context.ContextWindow, session.Context.ContextWindowSource)
+	}
+	if session.Context.LastUsageSource != string(contextwindow.UsageSourceProvider) {
+		t.Fatalf("session LastUsageSource = %q, want provider", session.Context.LastUsageSource)
+	}
+	if session.Context.LastInputTokens != 11 || session.Context.LastOutputTokens != 13 || session.Context.LastTotalTokens != 24 {
+		t.Fatalf("session usage = input %d output %d total %d, want 11/13/24", session.Context.LastInputTokens, session.Context.LastOutputTokens, session.Context.LastTotalTokens)
+	}
+	assertCLIErrorOmits(t, stderr.String(), "first", "one", "direct-secret-value")
 }
 
 func TestChatConfiguredSessionNoticePrintsOnceWithoutSensitiveContent(t *testing.T) {
@@ -1669,6 +1811,53 @@ func TestChatContinueUsesLatestSession(t *testing.T) {
 	}
 	assertMessage(t, messages, 0, "user", "newer")
 	assertMessage(t, messages, 1, "user", "next")
+	assertNoAdditionalCLIRunRequest(t, requests)
+}
+
+func TestChatResumeUsesSavedContextMetadataForBudget(t *testing.T) {
+	server, requests := newCLIRunServer(t,
+		`{"choices":[{"delta":{"content":"unexpected assistant secret"}}]}`,
+		`[DONE]`,
+	)
+	defer server.Close()
+
+	configDir := t.TempDir()
+	writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
+	setCLIModelContextWindow(t, configDir, 5000)
+	sessionRoot := filepath.Join(configDir, "sessions")
+	writeCLISession(t, sessionRoot, sessions.Session{
+		ID:           "small-context-session",
+		CreatedAt:    time.Date(2026, 7, 2, 3, 4, 5, 0, time.UTC),
+		UpdatedAt:    time.Date(2026, 7, 2, 3, 4, 6, 0, time.UTC),
+		Version:      sessions.CurrentVersion,
+		Provider:     "fake",
+		ModelProfile: "default",
+		ModelID:      "model-default",
+		Context: contextwindow.Metadata{
+			ContextWindow:           10,
+			ContextWindowSource:     string(contextwindow.WindowSourceConfigured),
+			WarningThresholdPercent: contextwindow.WarningThresholdPercent,
+			LastRequestTokens:       9,
+		},
+		Messages: []model.Message{
+			{Role: model.MessageRoleUser, Content: "old prompt secret"},
+		},
+		SaveToolResults: true,
+	})
+
+	var stdout, stderr bytes.Buffer
+	code := RunWithIO([]string{"--config-dir", configDir, "chat", "--resume", "small-context-session", "--quit", "--prompt", "next prompt secret"}, strings.NewReader(""), &stdout, &stderr, func() (string, error) {
+		return t.TempDir(), nil
+	})
+
+	if code != 1 {
+		t.Fatalf("RunWithIO() code = %d, want 1", code)
+	}
+	if stdout.String() != "" {
+		t.Fatalf("stdout = %q, want empty", stdout.String())
+	}
+	assertCLIErrorContains(t, stderr.String(), "context window budget exceeded", "context window 10")
+	assertCLIErrorOmits(t, stderr.String(), "old prompt secret", "next prompt secret", "unexpected assistant secret", "direct-secret-value")
 	assertNoAdditionalCLIRunRequest(t, requests)
 }
 
@@ -1863,6 +2052,16 @@ func TestSessionsShowPrintsMetadataAndSensitiveContentWarning(t *testing.T) {
 			{Role: model.MessageRoleAssistant, Content: "assistant body secret"},
 			{Role: model.MessageRoleTool, ToolCallID: "call_show", Content: "tool body secret"},
 		},
+		Context: contextwindow.Metadata{
+			ContextWindow:           128000,
+			ContextWindowSource:     string(contextwindow.WindowSourceConfigured),
+			WarningThresholdPercent: contextwindow.WarningThresholdPercent,
+			LastRequestTokens:       1000,
+			LastInputTokens:         900,
+			LastOutputTokens:        50,
+			LastTotalTokens:         950,
+			LastUsageSource:         string(contextwindow.UsageSourceProvider),
+		},
 		SaveToolResults: true,
 	})
 
@@ -1886,6 +2085,14 @@ func TestSessionsShowPrintsMetadataAndSensitiveContentWarning(t *testing.T) {
 		"ENABLED_MCP\tlocal",
 		"ENABLED_SKILLS\treview",
 		"SHOW_REASONING\ttrue",
+		"CONTEXT_WINDOW\t128000",
+		"CONTEXT_WINDOW_SOURCE\tconfigured",
+		"CONTEXT_WARNING_THRESHOLD_PERCENT\t80",
+		"CONTEXT_LAST_REQUEST_TOKENS\t1000",
+		"CONTEXT_LAST_INPUT_TOKENS\t900",
+		"CONTEXT_LAST_OUTPUT_TOKENS\t50",
+		"CONTEXT_LAST_TOTAL_TOKENS\t950",
+		"CONTEXT_LAST_USAGE_SOURCE\tprovider",
 		"SAVE_TOOL_RESULTS\ttrue",
 		"INSTRUCTION_COUNT\t1",
 		"MESSAGE_COUNT\t3",
@@ -3861,6 +4068,21 @@ sessions:
   dir: sessions
   save_tool_results: %t
 `, enabled, saveToolResults)
+	writeCLIFile(t, configPath, updated)
+}
+
+func setCLIModelContextWindow(t *testing.T, configDir string, tokens int) {
+	t.Helper()
+
+	configPath := filepath.Join(configDir, "providers", "fake.yaml")
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("ReadFile(%q) error = %v", configPath, err)
+	}
+	updated := strings.Replace(string(data), "  default:\n    id: model-default\n", fmt.Sprintf("  default:\n    id: model-default\n    context_window: %d\n", tokens), 1)
+	if updated == string(data) {
+		t.Fatalf("fake.yaml did not contain default model id to replace:\n%s", data)
+	}
 	writeCLIFile(t, configPath, updated)
 }
 
