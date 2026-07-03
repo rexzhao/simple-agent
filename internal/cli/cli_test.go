@@ -26,13 +26,13 @@ import (
 func TestModelsListUsesGlobalConfigDirFlag(t *testing.T) {
 	dir := writeCLIFixture(t)
 	writeCLIFile(t, filepath.Join(dir, "providers", "responses.yaml"), `name: openai
-type: openai-responses
 base_url: https://api.openai.com/v1
 api_key: $OPENAI_API_KEY
 
 models:
   default:
     id: gpt-5.1
+    type: openai-responses
 `)
 
 	var stdout, stderr bytes.Buffer
@@ -3480,6 +3480,7 @@ func TestRunOpenAIResponsesProviderOutputsTextDelta(t *testing.T) {
 	}
 	assertJSONNumber(t, request.Body["temperature"], "0.6")
 	assertJSONNumber(t, request.Body["max_output_tokens"], "128")
+	assertCLIRequestOmitsKey(t, request.Body, "type")
 	assertCLIRequestOmitsKey(t, request.Body, "max_tokens")
 	input := requestInput(t, request.Body)
 	assertMessage(t, input, 0, "system", builtInBaseInstructions)
@@ -3590,6 +3591,7 @@ func TestRunAnthropicMessagesProviderOutputsTextDelta(t *testing.T) {
 	}
 	assertJSONNumber(t, request.Body["temperature"], "0.6")
 	assertJSONNumber(t, request.Body["max_tokens"], "128")
+	assertCLIRequestOmitsKey(t, request.Body, "type")
 	messages := requestMessages(t, request.Body)
 	if len(messages) != 1 {
 		t.Fatalf("len(messages) = %d, want 1: %#v", len(messages), messages)
@@ -4925,7 +4927,7 @@ func TestRunErrorsDoNotLeakAPIKeyValues(t *testing.T) {
 		assertCLIErrorOmits(t, stderr.String(), "direct-secret-value")
 	})
 
-	t.Run("unsupported provider type", func(t *testing.T) {
+	t.Run("unsupported model type", func(t *testing.T) {
 		configDir := t.TempDir()
 		writeCLIRunFixtureInDir(t, configDir, "http://127.0.0.1:1", "direct-secret-value", "not-openai")
 
@@ -4937,7 +4939,7 @@ func TestRunErrorsDoNotLeakAPIKeyValues(t *testing.T) {
 		if code != 1 {
 			t.Fatalf("RunWithGetwd() code = %d, want 1", code)
 		}
-		assertCLIErrorContains(t, stderr.String(), `unknown provider type "not-openai"`, "supported provider types: anthropic-messages, openai-chat, openai-responses")
+		assertCLIErrorContains(t, stderr.String(), `unknown model type "not-openai"`, "supported provider types: anthropic-messages, openai-chat, openai-responses")
 		assertCLIErrorOmits(t, stderr.String(), "direct-secret-value")
 	})
 }
@@ -4976,7 +4978,6 @@ logging:
 `)
 
 	writeCLIFile(t, filepath.Join(providersDir, "paperhub.yaml"), `name: paperhub
-type: openai-chat
 base_url: https://tc-paperhub.diezhi.net/v1
 api_key: $PAPERHUB_API_KEY
 
@@ -4992,7 +4993,6 @@ models:
 `)
 
 	writeCLIFile(t, filepath.Join(providersDir, "local.yaml"), `name: local
-type: openai-chat
 base_url: http://localhost:8080/v1
 api_key: direct-secret-value
 
@@ -5296,27 +5296,31 @@ func newSequentialCLIRunServer(t *testing.T, responses ...[]string) (*httptest.S
 	return server, requests
 }
 
-func writeCLIRunFixtureInDir(t *testing.T, dir, baseURL, apiKey, providerType string) {
+func writeCLIRunFixtureInDir(t *testing.T, dir, baseURL, apiKey, modelType string) {
 	t.Helper()
-	writeCLIRunFixtureInDirWithTools(t, dir, baseURL, apiKey, providerType, nil)
+	writeCLIRunFixtureInDirWithTools(t, dir, baseURL, apiKey, modelType, nil)
 }
 
-func writeCLIRunFixtureInDirWithTools(t *testing.T, dir, baseURL, apiKey, providerType string, enabledTools []string) {
+func writeCLIRunFixtureInDirWithTools(t *testing.T, dir, baseURL, apiKey, modelType string, enabledTools []string) {
 	t.Helper()
-	writeCLIRunFixtureInDirWithToolsAndSkills(t, dir, baseURL, apiKey, providerType, enabledTools, nil)
+	writeCLIRunFixtureInDirWithToolsAndSkills(t, dir, baseURL, apiKey, modelType, enabledTools, nil)
 }
 
-func writeCLIRunFixtureInDirWithSkills(t *testing.T, dir, baseURL, apiKey, providerType string, enabledSkills []string) {
+func writeCLIRunFixtureInDirWithSkills(t *testing.T, dir, baseURL, apiKey, modelType string, enabledSkills []string) {
 	t.Helper()
-	writeCLIRunFixtureInDirWithToolsAndSkills(t, dir, baseURL, apiKey, providerType, nil, enabledSkills)
+	writeCLIRunFixtureInDirWithToolsAndSkills(t, dir, baseURL, apiKey, modelType, nil, enabledSkills)
 }
 
-func writeCLIRunFixtureInDirWithToolsAndSkills(t *testing.T, dir, baseURL, apiKey, providerType string, enabledTools []string, enabledSkills []string) {
+func writeCLIRunFixtureInDirWithToolsAndSkills(t *testing.T, dir, baseURL, apiKey, modelType string, enabledTools []string, enabledSkills []string) {
 	t.Helper()
 
 	providersDir := filepath.Join(dir, "providers")
 	if err := os.MkdirAll(providersDir, 0o755); err != nil {
 		t.Fatalf("MkdirAll() error = %v", err)
+	}
+	modelTypeYAML := ""
+	if modelType != "openai-chat" {
+		modelTypeYAML = fmt.Sprintf("    type: %s\n", modelType)
 	}
 
 	writeCLIFile(t, filepath.Join(dir, "sai.yaml"), fmt.Sprintf(`default_provider: fake
@@ -5340,20 +5344,19 @@ logging:
 `, formatEnabledToolsYAML(enabledTools), formatEnabledToolsYAML(enabledSkills)))
 
 	writeCLIFile(t, filepath.Join(providersDir, "fake.yaml"), fmt.Sprintf(`name: fake
-type: %s
 base_url: %s
 api_key: %s
 
 models:
   default:
     id: model-default
-    temperature: 0.6
+%s    temperature: 0.6
     max_tokens: 128
   fast:
     id: model-fast
-    temperature: 0.2
+%s    temperature: 0.2
     max_tokens: 64
-`, providerType, baseURL, apiKey))
+`, baseURL, apiKey, modelTypeYAML, modelTypeYAML))
 }
 
 func formatEnabledToolsYAML(enabledTools []string) string {

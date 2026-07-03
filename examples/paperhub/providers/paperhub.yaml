@@ -1,5 +1,4 @@
 name: paperhub
-type: openai-chat
 base_url: https://tc-paperhub.diezhi.net/v1
 api_key: $PAPERHUB_API_KEY
 

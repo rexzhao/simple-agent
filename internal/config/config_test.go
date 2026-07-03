@@ -173,16 +173,17 @@ default_model: claude-sonnet-5
 provider_dir: providers
 `)
 	writeFile(t, filepath.Join(providersDir, "anthropic.yaml"), `name: anthropic
-type: anthropic-messages
 base_url: https://api.anthropic.com/v1
 api_key: $ANTHROPIC_API_KEY
 
 models:
   claude-sonnet-5:
     id: claude-sonnet-5
+    type: anthropic-messages
     max_tokens: 4096
   claude-haiku-4-5:
     id: claude-haiku-4-5
+    type: anthropic-messages
     max_tokens: 2048
 `)
 
@@ -191,9 +192,9 @@ models:
 		t.Fatalf("Load() error = %v", err)
 	}
 
-	provider := cfg.Providers["anthropic"]
-	if provider.Type != ProviderTypeAnthropicMessages {
-		t.Fatalf("provider.Type = %q, want %q", provider.Type, ProviderTypeAnthropicMessages)
+	profile := cfg.Providers["anthropic"].Models["claude-sonnet-5"]
+	if profile.Type != ProviderTypeAnthropicMessages {
+		t.Fatalf("profile.Type = %q, want %q", profile.Type, ProviderTypeAnthropicMessages)
 	}
 
 	gotModels := cfg.ModelList()
@@ -215,8 +216,8 @@ models:
 	if err != nil {
 		t.Fatalf("ResolveModel() error = %v", err)
 	}
-	if resolved.Provider.Type != ProviderTypeAnthropicMessages {
-		t.Fatalf("resolved.Provider.Type = %q, want %q", resolved.Provider.Type, ProviderTypeAnthropicMessages)
+	if resolved.Type != ProviderTypeAnthropicMessages {
+		t.Fatalf("resolved.Type = %q, want %q", resolved.Type, ProviderTypeAnthropicMessages)
 	}
 	if resolved.ModelID != "claude-sonnet-5" {
 		t.Fatalf("resolved.ModelID = %q, want claude-sonnet-5", resolved.ModelID)
@@ -241,13 +242,13 @@ default_model: default
 provider_dir: providers
 `)
 	writeFile(t, filepath.Join(providersDir, "openai.yaml"), `name: openai
-type: openai-responses
 base_url: https://api.openai.com/v1
 api_key: $OPENAI_API_KEY
 
 models:
   default:
     id: gpt-5.1
+    type: openai-responses
     temperature: 0.2
 `)
 
@@ -256,9 +257,9 @@ models:
 		t.Fatalf("Load() error = %v", err)
 	}
 
-	provider := cfg.Providers["openai"]
-	if provider.Type != ProviderTypeOpenAIResponses {
-		t.Fatalf("provider.Type = %q, want %q", provider.Type, ProviderTypeOpenAIResponses)
+	profile := cfg.Providers["openai"].Models["default"]
+	if profile.Type != ProviderTypeOpenAIResponses {
+		t.Fatalf("profile.Type = %q, want %q", profile.Type, ProviderTypeOpenAIResponses)
 	}
 
 	gotModels := cfg.ModelList()
@@ -279,8 +280,8 @@ models:
 	if err != nil {
 		t.Fatalf("ResolveModel() error = %v", err)
 	}
-	if resolved.Provider.Type != ProviderTypeOpenAIResponses {
-		t.Fatalf("resolved.Provider.Type = %q, want %q", resolved.Provider.Type, ProviderTypeOpenAIResponses)
+	if resolved.Type != ProviderTypeOpenAIResponses {
+		t.Fatalf("resolved.Type = %q, want %q", resolved.Type, ProviderTypeOpenAIResponses)
 	}
 	if resolved.ModelID != "gpt-5.1" {
 		t.Fatalf("resolved.ModelID = %q, want gpt-5.1", resolved.ModelID)
@@ -305,13 +306,13 @@ default_model: default
 provider_dir: providers
 `)
 	writeFile(t, filepath.Join(providersDir, "fake.yaml"), `name: fake
-type: openai-chat
 base_url: http://localhost:8080/v1
 api_key: direct-secret
 
 models:
   default:
     id: model-default
+    type: anthropic-messages
     context_window: 128000
     parameters:
       temperature: 0.2
@@ -336,6 +337,12 @@ models:
 	if got := profile.Parameters["max_tokens"]; got != 64 {
 		t.Fatalf("max_tokens = %#v, want 64", got)
 	}
+	if profile.Type != ProviderTypeAnthropicMessages {
+		t.Fatalf("Type = %q, want %q", profile.Type, ProviderTypeAnthropicMessages)
+	}
+	if _, ok := profile.Parameters["type"]; ok {
+		t.Fatal("Parameters unexpectedly contains type")
+	}
 	if _, ok := profile.Parameters["context_window"]; ok {
 		t.Fatal("Parameters unexpectedly contains context_window")
 	}
@@ -350,6 +357,9 @@ models:
 	if resolved.ContextWindow != 128000 || resolved.ContextWindowSource != string(contextwindow.WindowSourceConfigured) {
 		t.Fatalf("resolved context = %d/%q, want 128000/configured", resolved.ContextWindow, resolved.ContextWindowSource)
 	}
+	if resolved.Type != ProviderTypeAnthropicMessages {
+		t.Fatalf("resolved.Type = %q, want %q", resolved.Type, ProviderTypeAnthropicMessages)
+	}
 
 	resolved, err = cfg.ResolveModel("fake", "estimated")
 	if err != nil {
@@ -358,22 +368,25 @@ models:
 	if resolved.ContextWindow != contextwindow.DefaultContextWindowTokens || resolved.ContextWindowSource != string(contextwindow.WindowSourceEstimated) {
 		t.Fatalf("resolved context = %d/%q, want default estimated", resolved.ContextWindow, resolved.ContextWindowSource)
 	}
+	if resolved.Type != ProviderTypeOpenAIChat {
+		t.Fatalf("resolved.Type = %q, want default %q", resolved.Type, ProviderTypeOpenAIChat)
+	}
 }
 
-func TestLoadRejectsUnknownProviderType(t *testing.T) {
+func TestLoadRejectsUnknownModelType(t *testing.T) {
 	dir := writeConfigFixture(t)
 	writeFile(t, filepath.Join(dir, "providers", "unknown.yaml"), `name: unknown
-type: not-openai
 base_url: http://localhost:8080/v1
 api_key: direct-secret
 
 models:
   default:
     id: model-default
+    type: not-openai
 `)
 
 	_, err := Load(dir)
-	assertErrorContains(t, err, `unknown provider type "not-openai"`, "supported provider types: anthropic-messages, openai-chat, openai-responses")
+	assertErrorContains(t, err, `unknown model type "not-openai"`, "supported provider types: anthropic-messages, openai-chat, openai-responses")
 }
 
 func TestLoadReadsMCPServerYAMLFiles(t *testing.T) {
@@ -630,6 +643,9 @@ func TestResolveModelExplicitProviderModel(t *testing.T) {
 	if got.ModelID != "glm-5.2" {
 		t.Fatalf("ModelID = %q, want glm-5.2", got.ModelID)
 	}
+	if got.Type != ProviderTypeOpenAIChat {
+		t.Fatalf("Type = %q, want default %q", got.Type, ProviderTypeOpenAIChat)
+	}
 	if got.Parameters["temperature"] != 0.2 {
 		t.Fatalf("temperature = %#v, want 0.2", got.Parameters["temperature"])
 	}
@@ -660,6 +676,9 @@ func TestResolveModelUsesDefaultProviderAndModel(t *testing.T) {
 	}
 	if got.ModelID != "glm-5.2" {
 		t.Fatalf("ModelID = %q, want glm-5.2", got.ModelID)
+	}
+	if got.Type != ProviderTypeOpenAIChat {
+		t.Fatalf("Type = %q, want default %q", got.Type, ProviderTypeOpenAIChat)
 	}
 	if got.Provider.ResolvedAPIKey != "resolved-paperhub-secret" {
 		t.Fatalf("Provider.ResolvedAPIKey = %q, want resolved API key", got.Provider.ResolvedAPIKey)
@@ -893,7 +912,6 @@ logging:
 `)
 
 	writeFile(t, filepath.Join(providersDir, "paperhub.yaml"), `name: paperhub
-type: openai-chat
 base_url: https://tc-paperhub.diezhi.net/v1
 api_key: $PAPERHUB_API_KEY
 
@@ -909,7 +927,6 @@ models:
 `)
 
 	writeFile(t, filepath.Join(providersDir, "local.yml"), `name: local
-type: openai-chat
 base_url: http://localhost:8080/v1
 api_key: direct-local-secret
 

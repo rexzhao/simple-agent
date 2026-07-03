@@ -1777,7 +1777,7 @@ func prepareAgentRuntime(ctx context.Context, configDir string, options agentCom
 			resolved.Parameters = copyParameterMap(resumedSession.ModelParameters)
 		}
 	}
-	provider, err := newProviderForRun(resolved.ProviderName, resolved.Provider)
+	provider, err := newProviderForRun(resolved.ProviderName, resolved.Type, resolved.Provider)
 	if err != nil {
 		return nil, err
 	}
@@ -2309,8 +2309,8 @@ func loadConfig(configDir string, getwd func() (string, error)) (*config.Config,
 	return config.Load(configDir)
 }
 
-func newProviderForRun(providerName string, provider config.ProviderConfig) (model.Provider, error) {
-	switch provider.Type {
+func newProviderForRun(providerName, modelType string, provider config.ProviderConfig) (model.Provider, error) {
+	switch modelType {
 	case config.ProviderTypeOpenAIChat:
 		return openaichat.NewProvider(openAIChatProviderConfig(provider))
 	case config.ProviderTypeOpenAIResponses:
@@ -2318,7 +2318,7 @@ func newProviderForRun(providerName string, provider config.ProviderConfig) (mod
 	case config.ProviderTypeAnthropicMessages:
 		return anthropicmessages.NewProvider(anthropicMessagesProviderConfig(provider))
 	default:
-		return nil, fmt.Errorf("unsupported provider type %q for provider %q", provider.Type, providerName)
+		return nil, fmt.Errorf("unsupported model type %q for provider %q", modelType, providerName)
 	}
 }
 

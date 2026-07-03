@@ -125,7 +125,6 @@ mcp_dir: mcp
 
 ```yaml
 name: paperhub
-type: openai-chat
 base_url: https://tc-paperhub.diezhi.net/v1
 api_key: $PAPERHUB_API_KEY
 
@@ -144,17 +143,16 @@ models:
 字段说明：
 
 - `name`：provider 名称，必须和命令行 `--provider` 可选值一致。
-- `type`：provider adapter 类型。配置层识别 `openai-chat`、`anthropic-messages` 和
-  `openai-responses`。`sai chat` 支持 `openai-chat`，也支持 `anthropic-messages`
-  的文本 streaming；Anthropic tool use adapter 已接入同一套内部 tool loop。
-  `openai-responses` 当前支持文本 streaming 和 function tool calling，并接入同一套内部
-  tool loop。
 - `base_url`：provider API base URL。`openai-chat` 不包含 `/chat/completions`；
   `anthropic-messages` 使用 Anthropic Messages API base，例如 `https://api.anthropic.com/v1`；
   `openai-responses` 不包含 `/responses`，例如 `https://api.openai.com/v1`。
 - `api_key`：provider 的 API key 配置值，遵循敏感配置值的 `$ENV_NAME` 约定。
 - `models`：该 provider 下可选的模型配置。
 - `models.<name>.id`：实际发送给 API 的模型 id。
+- `models.<name>.type`：可选的模型协议/adapter 类型。未配置时默认 `openai-chat`。
+  配置层识别 `openai-chat`、`anthropic-messages` 和 `openai-responses`。`sai chat`
+  支持 `openai-chat`、`anthropic-messages` 的文本 streaming 和 tool use，以及
+  `openai-responses` 的文本 streaming 和 function tool calling。
 - `models.<name>.context_window`：可选的模型上下文窗口 token 数。未配置时，`sai`
   使用保守估算默认值 `32000`，并把来源记录为 `estimated`；显式配置时来源为
   `configured`。该字段是 `sai` 的本地元数据，不会透传给 provider。
@@ -163,23 +161,26 @@ models:
 model profile 的 key 是 CLI 选择时使用的名字。`id` 是实际传给模型服务的名称。这样可以
 用同一个底层模型创建多个参数不同的 profile。
 请求参数既可以继续写在 profile 顶层，也可以写在 `parameters` map 中；`id` 和
-`context_window` 不属于请求参数。
+`type`、`context_window` 不属于请求参数。
+旧配置中的 provider 顶层 `type` 不再作为运行时协议选择依据；迁移时请把协议 `type`
+写到需要非默认协议的 model profile 下。
 
 Anthropic Messages provider 使用同一套 provider/model profile 配置形态：
 
 ```yaml
 name: anthropic
-type: anthropic-messages
 base_url: https://api.anthropic.com/v1
 api_key: $ANTHROPIC_API_KEY
 
 models:
   claude-sonnet-5:
     id: claude-sonnet-5
+    type: anthropic-messages
     context_window: 200000
     max_tokens: 4096
   claude-haiku-4-5:
     id: claude-haiku-4-5
+    type: anthropic-messages
     max_tokens: 2048
 ```
 
@@ -190,13 +191,13 @@ OpenAI Responses provider 使用同一套 provider/model profile 配置形态：
 
 ```yaml
 name: openai
-type: openai-responses
 base_url: https://api.openai.com/v1
 api_key: $OPENAI_API_KEY
 
 models:
   default:
     id: gpt-5.1
+    type: openai-responses
     context_window: 400000
     max_output_tokens: 4096
 ```

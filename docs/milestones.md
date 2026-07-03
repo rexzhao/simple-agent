@@ -134,7 +134,7 @@ MCP 放到 MVP 之后。
 
 交付物：
 
-- Anthropic provider 配置。
+- Anthropic model profile `type` 配置。
 - Anthropic streaming event 转换。
 - Anthropic tool call 转换。
 - adapter 相关测试。
@@ -152,7 +152,7 @@ function tools / function_call_output，使现有 agent tool loop 能通过 `ope
 
 交付物：
 
-- Responses provider 配置。
+- Responses model profile `type` 配置。
 - Responses 文本 input mapping。
 - semantic text streaming event 转换。
 - function tools request mapping，使用顶层 `{type:"function", name, description, parameters}`。

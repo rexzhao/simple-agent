@@ -25,9 +25,9 @@
 - skills 是后续开发项，v0.1 不作为 MVP 核心。M7 使用配置目录下的本地
   `SKILL.md`，支持显式 activation 和 instruction composition；不读取用户目录，
   不实现 marketplace、递归 skill discovery 或复杂依赖解析。
-- M5 已为 Anthropic Messages 添加 provider type 配置识别、示例、文本 streaming
+- M5 已为 Anthropic Messages 添加 model profile type 配置识别、示例、文本 streaming
   和 tool use runtime adapter。
-- M6 已为 OpenAI Responses 添加 provider type 配置识别、文本 input mapping、
+- M6 已为 OpenAI Responses 添加 model profile type 配置识别、文本 input mapping、
   semantic text streaming adapter，以及 function tools / function_call_output tool loop adapter。
 - MCP 不属于 MVP 核心；后续接入时第一种传输只做 stdio。
 - 配置根目录默认是启动时当前工作目录下的 `.agents`，也可以通过 `--config-dir` 指定。
@@ -377,7 +377,6 @@ mcp_dir: mcp
 ```yaml
 # providers/paperhub.yaml
 name: paperhub
-type: openai-chat
 base_url: https://tc-paperhub.diezhi.net/v1
 api_key: $PAPERHUB_API_KEY
 
@@ -393,37 +392,39 @@ models:
     max_tokens: 2048
 ```
 
-配置层识别的 provider type 包括 `openai-chat`、`anthropic-messages` 和
-`openai-responses`。当前 `sai chat` 支持 `openai-chat`，也支持
-`anthropic-messages` 的文本 streaming 和 tool use，并支持 `openai-responses` 的
-文本 streaming 和 function tool calling。
+model profile 的 `type` 是协议/adapter 类型，未配置时默认 `openai-chat`。配置层识别
+`openai-chat`、`anthropic-messages` 和 `openai-responses`。当前 `sai chat` 支持
+`openai-chat`，也支持 `anthropic-messages` 的文本 streaming 和 tool use，并支持
+`openai-responses` 的文本 streaming 和 function tool calling。`id`、`type` 和
+`context_window` 是本地元数据，不会作为请求参数透传。
 
 ```yaml
 # providers/anthropic.yaml
 name: anthropic
-type: anthropic-messages
 base_url: https://api.anthropic.com/v1
 api_key: $ANTHROPIC_API_KEY
 
 models:
   claude-sonnet-5:
     id: claude-sonnet-5
+    type: anthropic-messages
     max_tokens: 4096
   claude-haiku-4-5:
     id: claude-haiku-4-5
+    type: anthropic-messages
     max_tokens: 2048
 ```
 
 ```yaml
 # providers/openai.yaml
 name: openai
-type: openai-responses
 base_url: https://api.openai.com/v1
 api_key: $OPENAI_API_KEY
 
 models:
   default:
     id: gpt-5.1
+    type: openai-responses
     max_output_tokens: 4096
 ```
 

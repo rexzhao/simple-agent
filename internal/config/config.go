@@ -62,7 +62,6 @@ type SessionsConfig struct {
 
 type ProviderConfig struct {
 	Name           string                  `json:"name" yaml:"name"`
-	Type           string                  `json:"type" yaml:"type"`
 	BaseURL        string                  `json:"base_url" yaml:"base_url"`
 	APIKey         string                  `json:"api_key" yaml:"api_key"`
 	ResolvedAPIKey string                  `json:"-" yaml:"-"`
@@ -71,6 +70,7 @@ type ProviderConfig struct {
 
 type ModelProfile struct {
 	ID            string         `json:"id" yaml:"id"`
+	Type          string         `json:"type,omitempty" yaml:"type,omitempty"`
 	ContextWindow int            `json:"context_window,omitempty" yaml:"context_window,omitempty"`
 	Parameters    map[string]any `json:"parameters,omitempty" yaml:"parameters,omitempty"`
 }
@@ -86,6 +86,7 @@ type ResolvedModel struct {
 	Provider            ProviderConfig
 	Profile             string
 	ModelID             string
+	Type                string
 	Parameters          map[string]any
 	ContextWindow       int
 	ContextWindowSource string
@@ -94,7 +95,6 @@ type ResolvedModel struct {
 func (p ProviderConfig) MarshalJSON() ([]byte, error) {
 	type providerJSON struct {
 		Name    string                  `json:"name"`
-		Type    string                  `json:"type"`
 		BaseURL string                  `json:"base_url"`
 		APIKey  string                  `json:"api_key"`
 		Models  map[string]ModelProfile `json:"models"`
@@ -105,7 +105,6 @@ func (p ProviderConfig) MarshalJSON() ([]byte, error) {
 	encoder.SetEscapeHTML(false)
 	if err := encoder.Encode(providerJSON{
 		Name:    p.Name,
-		Type:    p.Type,
 		BaseURL: p.BaseURL,
 		APIKey:  redactedSecretValue(p.APIKey),
 		Models:  p.Models,
@@ -201,6 +200,10 @@ func (c *Config) ResolveModel(providerName, modelName string) (ResolvedModel, er
 	if !ok {
 		return ResolvedModel{}, fmt.Errorf("unknown model %q for provider %q; available models: %s", modelName, providerName, formatProviderModelChoices(provider))
 	}
+	modelType, err := resolveModelType(providerName, modelName, profile.Type)
+	if err != nil {
+		return ResolvedModel{}, err
+	}
 	window := contextwindow.ResolveWindow(profile.ContextWindow)
 
 	resolvedProvider := copyProvider(provider)
@@ -215,6 +218,7 @@ func (c *Config) ResolveModel(providerName, modelName string) (ResolvedModel, er
 		Provider:            resolvedProvider,
 		Profile:             modelName,
 		ModelID:             profile.ID,
+		Type:                modelType,
 		Parameters:          copyParameters(profile.Parameters),
 		ContextWindow:       window.Tokens,
 		ContextWindowSource: string(window.Source),
@@ -344,6 +348,18 @@ func (m *ModelProfile) UnmarshalYAML(value *yaml.Node) error {
 		delete(fields, "context_window")
 	}
 
+	if rawType, ok := fields["type"]; ok {
+		switch modelType := rawType.(type) {
+		case nil:
+			m.Type = ""
+		case string:
+			m.Type = strings.TrimSpace(modelType)
+		default:
+			return fmt.Errorf("model profile type must be a string")
+		}
+		delete(fields, "type")
+	}
+
 	parameters := map[string]any{}
 	if rawParameters, ok := fields["parameters"]; ok {
 		decoded, ok := rawParameters.(map[string]any)
@@ -434,8 +450,7 @@ func loadProviders(providerDir string) (map[string]ProviderConfig, error) {
 		if err := yaml.Unmarshal(data, &provider); err != nil {
 			return nil, fmt.Errorf("parse provider file %q: %w", path, err)
 		}
-		provider.Name = strings.TrimSpace(provider.Name)
-		provider.Type = strings.TrimSpace(provider.Type)
+		provider = normalizeProvider(provider)
 		if err := validateProvider(path, provider); err != nil {
 			return nil, err
 		}
@@ -451,18 +466,36 @@ func validateProvider(path string, provider ProviderConfig) error {
 	if provider.Name == "" {
 		return fmt.Errorf("provider file %q is missing name", path)
 	}
-	if provider.Type == "" {
-		return fmt.Errorf("provider file %q provider %q is missing type", path, provider.Name)
-	}
-	if !isKnownProviderType(provider.Type) {
-		return fmt.Errorf("provider file %q provider %q has unknown provider type %q; supported provider types: %s", path, provider.Name, provider.Type, formatSupportedProviderTypes())
-	}
 	for profileName, profile := range provider.Models {
 		if profile.ID == "" {
 			return fmt.Errorf("provider file %q model %q is missing id", path, profileName)
 		}
+		if profile.Type != "" && !isKnownProviderType(profile.Type) {
+			return fmt.Errorf("provider file %q model %q has unknown model type %q; supported provider types: %s", path, profileName, profile.Type, formatSupportedProviderTypes())
+		}
 	}
 	return nil
+}
+
+func normalizeProvider(provider ProviderConfig) ProviderConfig {
+	provider.Name = strings.TrimSpace(provider.Name)
+	for profileName, profile := range provider.Models {
+		profile.ID = strings.TrimSpace(profile.ID)
+		profile.Type = strings.TrimSpace(profile.Type)
+		provider.Models[profileName] = profile
+	}
+	return provider
+}
+
+func resolveModelType(providerName, modelName, modelType string) (string, error) {
+	modelType = strings.TrimSpace(modelType)
+	if modelType == "" {
+		return ProviderTypeOpenAIChat, nil
+	}
+	if !isKnownProviderType(modelType) {
+		return "", fmt.Errorf("model %q for provider %q has unknown model type %q; supported provider types: %s", modelName, providerName, modelType, formatSupportedProviderTypes())
+	}
+	return modelType, nil
 }
 
 func isKnownProviderType(providerType string) bool {

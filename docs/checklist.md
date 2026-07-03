@@ -116,7 +116,7 @@
 
 ## 后续协议
 
-- [x] 配置层识别 `anthropic-messages` provider type。
+- [x] 配置层识别 `anthropic-messages` model profile type。
 - [x] 添加 Anthropic Messages provider 配置示例。
 - [x] 实现 Anthropic Messages 文本 streaming runtime adapter。
 - [x] 添加 Anthropic text streaming fixture tests。

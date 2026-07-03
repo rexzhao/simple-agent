@@ -50,7 +50,6 @@ bodies.
 ```yaml
 # .agents/providers/paperhub.yaml
 name: paperhub
-type: openai-chat
 base_url: https://tc-paperhub.diezhi.net/v1
 api_key: $PAPERHUB_API_KEY
 
@@ -65,6 +64,8 @@ models:
 `context_window` is optional local metadata for budget checks. If it is omitted,
 `sai` uses a conservative estimated default of `32000` tokens and records the
 source as `estimated`; configured values are recorded as `configured`.
+Model profile `type` is optional and defaults to `openai-chat`; set it under the
+model profile for protocols such as `anthropic-messages` or `openai-responses`.
 
 ## Basic Usage
 
