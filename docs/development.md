@@ -36,7 +36,8 @@
 - 根配置文件默认是启动时当前工作目录下的 `.agents/${arg[0]}.yaml`，其中 `${arg[0]}`
   是可执行文件 basename；普通 `sai` 二进制默认读取 `.agents/sai.yaml`。也可以通过
   `--config <file>` 显式指定根配置文件。
-- 默认读取启动目录下的 `AGENTS.md` 作为项目指令；文件不存在时继续执行。
+- 项目指令文件计划通过根配置 `agent.instruction_files` 配置；省略时保持当前行为，等价于
+  `["$CWD/AGENTS.md"]`，文件不存在时继续执行。
 - 只落盘 JSONL 日志；会话历史、上下文快照和其他状态暂不落盘。
 
 ## v0.1 非目标
@@ -62,7 +63,8 @@ JSONL 日志，不保存完整会话上下文、prompt、response 或 tool resul
 可恢复 session 是 M13 之后的独立能力，不是 JSONL 日志的增强开关。它默认关闭；只有用户
 通过配置或命令显式启用后，才会保存完整 messages、assistant tool calls 和 tool result
 messages，以及 provider/model/parameters、cwd、enabled tools/MCP、loaded skills、reasoning 和
-注入指令快照或可重建信息。只有保存这些完整上下文，`resume` 才能可靠，而这也意味着
+注入指令快照或可重建信息。M17 后，项目指令文件应按每个成功加载的文件保留独立
+source/message 粒度。只有保存这些完整上下文，`resume` 才能可靠，而这也意味着
 session 文件会包含敏感数据。
 
 `sai run` 不回归。后续 stdin、file 和 multiline 输入都属于 `sai chat --quit` 或
@@ -87,7 +89,7 @@ internal/agent
   对话循环、max turns、tool 执行循环
 
 internal/context
-  项目上下文加载，例如 AGENTS.md
+  项目上下文加载，例如 agent.instruction_files 和兼容默认 AGENTS.md
 
 internal/model
   provider interface 和统一 stream event 类型
@@ -368,6 +370,9 @@ auth_dir: auth
 skill_dirs: [skills]
 
 agent:
+  # 计划字段；省略时等价于 ["$CWD/AGENTS.md"]
+  instruction_files:
+    - $CWD/AGENTS.md
   max_turns: 8
   stream: true
   show_reasoning: false
@@ -520,10 +525,32 @@ provider/model 列表并停止。v0.1 不支持会话进行中切换模型。
 
 ## 项目上下文
 
-`sai` 默认读取启动目录下的 `AGENTS.md`，并把其中的内容作为项目指令加入本次会话的
-system/developer context。`AGENTS.md` 缺失时不报错。
+M17 计划通过根配置 `agent.instruction_files` 配置项目指令文件。省略该字段时保持当前兼容
+行为，等价于：
 
-v0.1 只读取启动目录的 `AGENTS.md`：
+```yaml
+agent:
+  instruction_files:
+    - $CWD/AGENTS.md
+```
+
+条目按列表顺序加载。每个条目可以指向任意文件名，不限于 `AGENTS.md`，并支持以下
+placeholder：
+
+- `$CWD`：启动时当前工作目录。
+- `$CONFIG`：根配置文件所在目录。
+- `$USER`：用户 home 目录。
+- `$REPO`：从 `$CWD` 向上查找得到的 git repository root。
+
+如果某个条目使用 `$REPO` 但无法解析出 git repository root，跳过该条目并输出 warning。
+warning 不进入模型上下文。不存在的非 glob 文件按当前缺失 `AGENTS.md` 的行为跳过，不
+作为错误。
+
+glob 条目支持普通 glob pattern，也支持 `**/*.md` 形式的递归 pattern。同一个 pattern
+匹配到多个文件时，匹配文件在该 pattern 内按稳定 path sort 顺序加载；不同条目之间继续
+保留配置列表顺序。
+
+省略配置时的兼容布局仍然是：
 
 ```text
 AGENTS.md
@@ -533,19 +560,18 @@ AGENTS.md
   mcp/
 ```
 
-`--config` 只影响根配置文件位置以及该文件内相对路径的解析基准，不影响 `AGENTS.md` 位置。
-`sai` 暂时不读取用户目录里的 `AGENTS.md`，也不做多层目录向上/向下查找。
-
 项目指令优先级：
 
 ```text
-sai 内置基础约束 > AGENTS.md > loaded skills > 当前用户 prompt
+sai 内置基础约束 > project instruction files > loaded skills > 当前用户 prompt
 ```
 
-用户 prompt 不应覆盖 `sai` 的基础安全和执行约束，也不应隐式覆盖 `AGENTS.md` 中的项目
+用户 prompt 不应覆盖 `sai` 的基础安全和执行约束，也不应隐式覆盖项目指令文件中的项目
 约定。后续如需临时忽略项目指令，应增加显式参数，而不是通过普通 prompt 实现。
-已加载 skill 的 instructions 作为 developer message 追加在 `AGENTS.md` 之后、用户
-prompt 之前；多个 skill 使用 skill 目录顺序和目录内确定性 discovery 顺序注入。
+成功加载的每个项目指令文件应优先作为独立 developer instruction source/message 注入，并
+保留文件来源，便于 session snapshot 或可重建信息按单个文件记录。已加载 skill 的
+instructions 作为 developer message 追加在全部项目指令文件之后、用户 prompt 之前；多个
+skill 使用 skill 目录顺序和目录内确定性 discovery 顺序注入。
 
 ## OpenAI-Compatible Streaming 注意点
 
@@ -778,6 +804,8 @@ profile parameters、cwd、根配置文件路径、启用 tools/MCP、loaded ski
 可重建信息，以及完整 user messages、assistant final messages、assistant tool calls 和
 tool result messages。缺少这些信息时，只能得到 transcript 或诊断日志，不能承诺可靠
 resume。
+M17 后，项目指令文件快照或可重建信息应按每个成功加载的文件分别记录，而不是合并成一个
+不可追溯的块。
 
 当前 M13 已接入 `sai chat --save-session`、`sai chat --resume <id>`、
 `sai chat --continue`、`sai sessions list`、`sai sessions show <id>`、
@@ -802,8 +830,9 @@ usage tracking 优先使用 provider stream 中的 `model.UsageEvent`。如果�
 usage source；恢复后继续使用这些 metadata 判断预算。`sai sessions show` 只展示这些数字和
 source，不展示正文。
 
-当前策略保守保留全部上下文：system/developer messages、loaded skill instructions、tool
-/ MCP schemas、assistant tool calls、tool result messages 和历史 user/assistant messages
+当前策略保守保留全部上下文：system/developer messages、project instruction files、loaded
+skill instructions、tool / MCP schemas、assistant tool calls、tool result messages 和历史
+user/assistant messages
 都不会被静默丢弃。后续若要加入摘要或截断策略，必须单独设计可解释边界和测试，证明不会
 静默丢弃关键 system/developer/tool schema/tool result 信息。
 

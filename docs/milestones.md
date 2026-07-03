@@ -200,8 +200,9 @@ function tools / function_call_output，使现有 agent tool loop 能通过 `ope
 M7 当前实现只覆盖 `skill_dirs` 中配置的本地 skills：默认等价于 `skill_dirs: [skills]`，
 按配置顺序扫描多个目录，每个目录只发现包含 `SKILL.md` 的直接子目录。同一目录内按确定性
 discovery 顺序加载，跨目录保留配置的目录顺序；重复 skill id 是配置错误。发现到的 skill
-默认将其 instructions 作为 developer message 注入在内置 system 和 `AGENTS.md`
-之后、用户 prompt 之前。若某个 `SKILL.md` frontmatter 设置
+默认将其 instructions 作为 developer message 注入在内置 system 和项目指令之后、用户
+prompt 之前。M7 时项目指令是启动目录 `AGENTS.md`；M17 后，项目指令是
+`agent.instruction_files` 成功加载的文件。若某个 `SKILL.md` frontmatter 设置
 `disable-model-invocation: true`，该 skill 不注入模型上下文；缺失该字段或设置为 `false`
 表示正常加载。M7 不读取用户目录，不实现
 marketplace、递归 skill discovery、plugin lifecycle 或复杂依赖解析。
@@ -405,8 +406,9 @@ marketplace、递归 skill discovery、plugin lifecycle 或复杂依赖解析。
 - 启用后保存 provider、model、model profile parameters、cwd、根配置文件路径和本次运行的关键
   runtime 选择。
 - 启用后保存已启用 tools、MCP、loaded skills、reasoning 展示设置，以及对应的 CLI 覆盖来源。
-- 启用后保存注入指令快照，或保存足以重建内置 system、`AGENTS.md` 和 loaded skills 的
-  信息；若使用可重建信息，恢复时必须能检测源文件变化并给出清晰提示。
+- 启用后保存注入指令快照，或保存足以重建内置 system、项目指令和 loaded skills 的信息；
+  若使用可重建信息，恢复时必须能检测源文件变化并给出清晰提示。M17 后，项目指令文件应按
+  每个成功加载的文件记录独立 source/message 粒度。
 - 启用后保存完整 messages：user messages、assistant final messages、assistant tool
   calls、tool result messages。
 - 启用后保存完整 tool results，除非后续提供明确的不可恢复降级模式。
@@ -450,8 +452,9 @@ resumable session 保存 context management metadata，恢复后继续用该 met
 - 会话开始时记录模型 context window 配置或估算值。
 - 接近 context window 时向 stderr 给出清晰警告。
 - 达到预算前拒绝继续或要求用户选择处理方式，不静默截断关键上下文。
-- 初始策略先保守：保留内置 system、`AGENTS.md`、loaded skills、tool/MCP schema、
-  全部 user/assistant 消息和 tool result，不自动摘要或截断。
+- 初始策略先保守：保留内置 system、项目指令、loaded skills、tool/MCP schema、
+  全部 user/assistant 消息和 tool result，不自动摘要或截断。M17 后，项目指令是
+  `agent.instruction_files` 成功加载的文件列表。
 - 记录后续截断或摘要策略边界；摘要进入自动路径前必须有测试覆盖和可解释边界。
 - resumable session 中记录 context management metadata，恢复后能继续判断预算。
 
@@ -598,5 +601,42 @@ agent 在大工作区内安全定位文本内容，同时不默认启用任何�
   exclude globs、context lines、snippet limits 和截断 metadata。
 - 聚焦单元测试覆盖 `shell` 的 `timeout_ms`、`max_output_bytes`、输出截断 metadata，以及
   status 行不泄露命令参数。
+
+## M18：Project Instruction Files
+
+目标：把项目指令文件从固定启动目录 `AGENTS.md` 扩展为根配置字段
+`agent.instruction_files`，同时保持省略配置时的兼容默认行为。
+
+交付物：
+
+- 根配置新增 `agent.instruction_files` 列表字段。
+- 省略 `agent.instruction_files` 时，行为等价于 `["$CWD/AGENTS.md"]`。
+- 列表条目按配置顺序加载，条目可指向任意文件名，不限于 `AGENTS.md`。
+- 支持 placeholder：`$CWD` 为启动时当前工作目录，`$CONFIG` 为根配置文件所在目录，
+  `$USER` 为用户 home 目录，`$REPO` 为从 `$CWD` 向上发现的 git repository root。
+- 使用 `$REPO` 但无法解析 repository root 时，跳过该条目并输出 warning；warning 不进入
+  模型上下文。
+- 缺失的非 glob 文件按当前缺失 `AGENTS.md` 行为跳过。
+- glob 支持普通 glob pattern 和 `**/*.md` 递归 pattern。
+- 单个 pattern 匹配多个文件时，在该 pattern 内按稳定 path sort 顺序加载；不同 pattern
+  之间保留列表顺序。
+- 成功加载的文件注入在原项目指令位置：`sai` 内置基础约束之后、loaded skills 和当前用户
+  prompt 之前。
+- 每个成功加载的文件优先作为独立 developer instruction source/message 注入；session
+  snapshot 或可重建信息也按单个文件记录来源。
+- `sai config show`、verbose、日志和 warning 不打印项目指令正文。
+
+验证：
+
+- 配置测试覆盖省略 `agent.instruction_files` 时等价于 `$CWD/AGENTS.md`。
+- 配置测试覆盖 `$CWD`、`$CONFIG`、`$USER` 和 `$REPO` placeholder 解析。
+- 测试覆盖 `$REPO` 无法解析时跳过该条目、输出 warning，且 warning 不进入模型 context。
+- 测试覆盖缺失非 glob 文件跳过。
+- 测试覆盖普通 glob 和递归 `**/*.md` glob。
+- 测试覆盖单个 pattern 多文件匹配时按稳定 path sort 加载。
+- CLI / fake server 测试覆盖多个项目指令文件按列表顺序注入，且每个文件是独立 developer
+  message/source。
+- 测试覆盖 loaded skills 仍注入在全部项目指令文件之后、当前用户 prompt 之前。
+- 若启用 resumable session，测试覆盖项目指令文件 snapshot 或可重建信息保留单文件来源。
 - `go test ./...` 通过。
 - `git diff --check` 通过。

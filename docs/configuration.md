@@ -13,8 +13,9 @@
 
 暂时不读取用户目录，也不向用户目录写入默认配置。
 
-`AGENTS.md` 不随根配置文件位置移动。它是项目上下文文件，v0.1 默认只从启动时当前工作目录读取。
-`--config` 不改变 `AGENTS.md` 的查找位置。
+项目指令文件的计划配置入口是根配置里的 `agent.instruction_files`。省略该字段时保持当前
+兼容行为，等价于只读取启动时当前工作目录下的 `$CWD/AGENTS.md`；`--config` 不改变
+`$CWD` 的含义。
 
 ```text
 sai --prompt "你好" --quit
@@ -37,7 +38,7 @@ sai doctor --config ./config/sai.yaml
 推荐布局：
 
 ```text
-AGENTS.md
+AGENTS.md  # 省略 agent.instruction_files 时的兼容默认项目指令文件
 .agents/
   sai.yaml
   providers/
@@ -73,7 +74,8 @@ MCP 是 M4 后能力，不属于 MVP 必需配置。
 `provider_dir`、`auth_dir`、`skill_dirs`、`mcp_dir`、`logging.path` 和
 `sessions.dir`。二级配置文件继续使用同一原则：相对路径基于写出该路径的 YAML 文件所在
 目录解析，例如 provider 的 `auth_file` 相对 provider YAML 文件解析。
-`AGENTS.md` 仍从启动时当前工作目录读取。
+省略 `agent.instruction_files` 时，项目指令文件仍按兼容默认从启动时当前工作目录读取
+`AGENTS.md`。
 
 ## 全局配置
 
@@ -86,6 +88,9 @@ auth_dir: auth
 skill_dirs: [skills]
 
 agent:
+  # 计划字段；省略时等价于 ["$CWD/AGENTS.md"]
+  instruction_files:
+    - $CWD/AGENTS.md
   max_turns: 8
   stream: true
   show_reasoning: false
@@ -119,6 +124,8 @@ mcp_dir: mcp
   顺序，跨目录保留配置顺序。重复 skill id 是配置错误。
 - `mcp_dir`：MCP 配置文件目录。M4 后启用；相对路径基于根配置文件所在目录解析。
 - `agent.max_turns`：一次 agent loop 最多请求模型的轮数。
+- `agent.instruction_files`：计划新增的项目指令文件列表；省略时等价于
+  `["$CWD/AGENTS.md"]`。
 - `agent.stream`：默认是否启用 streaming。
 - `agent.show_reasoning`：默认是否显示 reasoning stream。
   普通新 chat 中可用 `--show-reasoning=true/false` 显式覆盖配置；`--show-reasoning`
@@ -133,6 +140,36 @@ mcp_dir: mcp
 - `sessions.dir`：M13 后的可恢复 session 存储目录。相对路径基于根配置文件所在目录解析。
 - `sessions.save_tool_results`：M13 后启用 session 保存时是否保存完整 tool result messages。
   可靠 resume 需要保存 tool results；关闭后只能作为降级或诊断模式设计。
+
+## 项目指令文件配置（计划）
+
+计划新增根配置字段 `agent.instruction_files`，用于配置项目指令文件列表。省略该字段时保持
+当前行为，等价于：
+
+```yaml
+agent:
+  instruction_files:
+    - $CWD/AGENTS.md
+```
+
+列表条目按配置顺序处理。条目可以指向任意文件名，不限于 `AGENTS.md`；建议使用
+placeholder 明确路径基准：
+
+- `$CWD`：启动时当前工作目录。
+- `$CONFIG`：根配置文件所在目录。
+- `$USER`：用户 home 目录。
+- `$REPO`：从 `$CWD` 向上查找得到的 git repository root。
+
+如果某个条目使用 `$REPO` 但无法从 `$CWD` 解析出 git repository root，该条目会被跳过并
+产生 warning。warning 只进入终端或诊断输出，不进入模型上下文。
+
+不存在的非 glob 文件按当前缺失 `AGENTS.md` 的行为跳过，不作为错误。glob 条目支持普通
+glob pattern，也支持 `**/*.md` 形式的递归 pattern。同一个 pattern 匹配到多个文件时，
+这些匹配文件在该 pattern 内按稳定 path sort 顺序加载；pattern 之间仍保留列表顺序。
+
+成功加载的文件注入在同一个项目指令位置：位于 `sai` 内置基础约束之后、loaded skills
+和当前用户 prompt 之前。多个文件应优先作为多个独立 developer instruction source/message
+注入，并保留各自文件来源，便于后续 session snapshot 或可重建信息记录到单个文件粒度。
 
 ## Provider 配置
 
@@ -332,7 +369,7 @@ frontmatter 决定。
 已加载 skill 的 instructions 会作为 developer message 注入到模型请求中，顺序是：
 
 ```text
-sai 内置基础约束 > AGENTS.md > loaded skills > 当前用户 prompt
+sai 内置基础约束 > project instruction files > loaded skills > 当前用户 prompt
 ```
 
 多个 skill 使用 skill 目录顺序和目录内确定性 discovery 顺序注入。frontmatter 格式错误会让
@@ -597,7 +634,8 @@ tool calls 和 tool result messages。
 
 可恢复 session 文件会包含敏感数据，包括用户输入、assistant 输出、tool result、cwd、
 provider/model/parameters、启用 tools/MCP、loaded skills、reasoning，以及注入指令快照或可重建
-信息。因此 `sessions.enabled` 必须默认是 `false`，CLI 和文档都应提示用户这是显式
+信息。M17 后，如果记录项目指令文件快照或可重建信息，应按每个成功加载的文件保留独立
+source/message 粒度。因此 `sessions.enabled` 必须默认是 `false`，CLI 和文档都应提示用户这是显式
 opt-in 的落盘能力。
 
 命令行也可以显式启用和恢复：

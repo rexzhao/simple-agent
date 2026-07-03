@@ -261,7 +261,8 @@
 - [x] 接近 context window 时向 stderr 警告。
 - [x] 达到预算前拒绝继续或要求用户选择处理方式。
 - [x] 不静默截断 system/developer/tool schema 信息。
-- [x] 保守保留内置 system、`AGENTS.md`、loaded skills、tool/MCP schema、全部消息和 tool result。
+- [x] 保守保留内置 system、项目指令（当前兼容默认为 `AGENTS.md`）、loaded skills、
+  tool/MCP schema、全部消息和 tool result。
 - [x] 设计截断或摘要策略并记录边界。
 - [x] resumable session 保存 context management metadata。
 - [x] 添加 usage tracking、预算警告和关键上下文保留测试。
@@ -342,3 +343,24 @@
 - [x] 聚焦单元测试覆盖 `read_file`、`glob_files`、`grep_files` 和 `shell` 新行为。
 - [x] 验证 `go test ./...`。
 - [x] 验证 `git diff --check`。
+
+## M18：Project Instruction Files（计划）
+
+- [ ] 根配置新增 `agent.instruction_files` 列表字段。
+- [ ] 省略 `agent.instruction_files` 时，行为等价于 `["$CWD/AGENTS.md"]`。
+- [ ] 列表条目按配置顺序加载，条目可指向任意文件名，不限于 `AGENTS.md`。
+- [ ] 支持 `$CWD`、`$CONFIG`、`$USER` 和 `$REPO` placeholder。
+- [ ] `$REPO` 从 `$CWD` 向上发现 git repository root；无法解析时跳过该条目并输出 warning。
+- [ ] `$REPO` 解析 warning 不进入模型上下文。
+- [ ] 缺失的非 glob 文件按当前缺失 `AGENTS.md` 行为跳过。
+- [ ] glob 支持普通 glob pattern 和递归 `**/*.md` pattern。
+- [ ] 单个 pattern 匹配多个文件时，在该 pattern 内按稳定 path sort 顺序加载。
+- [ ] 不同 pattern 之间保留 `agent.instruction_files` 列表顺序。
+- [ ] 成功加载的文件注入在 `sai` 内置基础约束之后、loaded skills 和当前用户 prompt 之前。
+- [ ] 每个成功加载的文件优先作为独立 developer instruction source/message 注入。
+- [ ] resumable session 的项目指令 snapshot 或可重建信息保留单文件来源。
+- [ ] `sai config show`、verbose、日志和 warning 不打印项目指令正文。
+- [ ] 配置测试覆盖默认值、placeholder 解析、缺失文件、glob 和稳定排序。
+- [ ] CLI / fake server 测试覆盖多项目指令文件注入顺序和 skill 注入位置。
+- [ ] 验证 `go test ./...`。
+- [ ] 验证 `git diff --check`。

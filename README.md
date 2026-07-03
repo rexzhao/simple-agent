@@ -1,8 +1,9 @@
 # simple-agent
 
 `sai` is a small local CLI agent runner for OpenAI-compatible Chat
-Completions. It reads project instructions from `AGENTS.md` when present,
-streams model output, and can expose built-in tools when explicitly enabled.
+Completions. It reads project instructions from `AGENTS.md` by default when
+present, streams model output, and can expose built-in tools when explicitly
+enabled.
 
 ## Configuration
 
@@ -16,8 +17,14 @@ Relative paths in the root config file, including `provider_dir`, `auth_dir`,
 `skill_dirs`, `mcp_dir`, `logging.path`, and `sessions.dir`, resolve relative to
 the directory containing that config file. Relative paths in secondary config
 files use the same rule; for example, provider `auth_file` is relative to the
-provider YAML file. `AGENTS.md` is still read from the startup/current working
-directory, not from the selected config file location.
+provider YAML file.
+
+Planned project-instruction configuration uses `agent.instruction_files`. If it
+is omitted, behavior remains compatible with `["$CWD/AGENTS.md"]`. Entries load
+in list order, may name files other than `AGENTS.md`, support `$CWD`, `$CONFIG`,
+`$USER`, and `$REPO`, and glob matches load in stable path sort order within
+one pattern. Successfully loaded files keep the same instruction position:
+after built-in base instructions and before loaded skills and the user prompt.
 
 Minimal provider setup:
 
