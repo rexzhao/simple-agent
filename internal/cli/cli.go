@@ -942,6 +942,10 @@ func serverCommand(ctx context.Context, args []string, configPath string, stdout
 	if err != nil {
 		return err
 	}
+	sessionDefaults, err := serverSessionDefaultsFromConfig(cfg, cwd)
+	if err != nil {
+		return err
+	}
 	identity, err := localserver.NewRegistryIdentity(cwd, cfg.ConfigPath)
 	if err != nil {
 		return err
@@ -955,10 +959,12 @@ func serverCommand(ctx context.Context, args []string, configPath string, stdout
 	}
 
 	process, err := localserver.Start(localserver.Options{
-		CWD:        cwd,
-		ConfigPath: configPath,
-		Listen:     listen,
-		Version:    Version,
+		CWD:             cwd,
+		ConfigPath:      configPath,
+		Listen:          listen,
+		Version:         Version,
+		SessionStore:    sessions.NewV2Store(cfg.Sessions.Dir),
+		SessionDefaults: sessionDefaults,
 	})
 	if err != nil {
 		return err
@@ -1081,6 +1087,44 @@ func serverConfigPath(configPath, cwd string) string {
 		return configPath
 	}
 	return filepath.Join(cwd, configPath)
+}
+
+func serverSessionDefaultsFromConfig(cfg *config.Config, cwd string) (sessions.SessionV2, error) {
+	providerName := strings.TrimSpace(cfg.DefaultProvider)
+	modelProfile := strings.TrimSpace(cfg.DefaultModel)
+	if providerName == "" || modelProfile == "" {
+		return sessions.SessionV2{}, fmt.Errorf("server session defaults require default_provider and default_model")
+	}
+	provider, ok := cfg.Providers[providerName]
+	if !ok {
+		return sessions.SessionV2{}, fmt.Errorf("server session defaults reference unknown provider %q", providerName)
+	}
+	profile, ok := provider.Models[modelProfile]
+	if !ok {
+		return sessions.SessionV2{}, fmt.Errorf("server session defaults reference unknown model %q for provider %q", modelProfile, providerName)
+	}
+	window := contextwindow.ResolveWindow(profile.ContextWindow)
+	selectedMCPServers, err := cfg.SelectedMCPServers(nil, false)
+	if err != nil {
+		return sessions.SessionV2{}, err
+	}
+	return sessions.SessionV2{
+		Version:         sessions.VersionV2,
+		Provider:        providerName,
+		ModelProfile:    modelProfile,
+		ModelID:         profile.ID,
+		ModelParameters: copyParameterMap(profile.Parameters),
+		CWD:             cwd,
+		ConfigPath:      cfg.ConfigPath,
+		EnabledTools:    copyStringSlice(cfg.Tools.Enabled),
+		EnabledMCP:      mcpServerIDs(selectedMCPServers),
+		Context: contextwindow.Metadata{
+			ContextWindow:           window.Tokens,
+			ContextWindowSource:     string(window.Source),
+			WarningThresholdPercent: contextwindow.WarningThresholdPercent,
+		},
+		SaveToolResults: true,
+	}, nil
 }
 
 func statusCommand(ctx context.Context, args []string, stdout io.Writer, getwd func() (string, error)) error {

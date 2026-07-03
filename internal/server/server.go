@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -12,16 +13,23 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/rexzhao/simple-agent/internal/contextwindow"
+	"github.com/rexzhao/simple-agent/internal/model"
+	"github.com/rexzhao/simple-agent/internal/sessions"
 )
 
 const DefaultListenAddress = "127.0.0.1:0"
 
 type Options struct {
-	CWD        string
-	ConfigPath string
-	Listen     string
-	Version    string
-	Now        func() time.Time
+	CWD             string
+	ConfigPath      string
+	Listen          string
+	Version         string
+	Now             func() time.Time
+	SessionStore    *sessions.V2Store
+	SessionRoot     string
+	SessionDefaults sessions.SessionV2
 }
 
 type Process struct {
@@ -33,6 +41,9 @@ type Process struct {
 	shutdownOnce sync.Once
 	shutdownDone chan struct{}
 	shutdownErr  error
+
+	sessionStore    *sessions.V2Store
+	sessionDefaults sessions.SessionV2
 }
 
 type Info struct {
@@ -106,7 +117,18 @@ func Start(options Options) (*Process, error) {
 			Version:    version,
 			StartedAt:  now().UTC(),
 		},
-		shutdownDone: make(chan struct{}),
+		shutdownDone:    make(chan struct{}),
+		sessionStore:    options.SessionStore,
+		sessionDefaults: copySessionMetadata(options.SessionDefaults),
+	}
+	if process.sessionStore == nil && strings.TrimSpace(options.SessionRoot) != "" {
+		process.sessionStore = sessions.NewV2Store(options.SessionRoot)
+	}
+	if strings.TrimSpace(process.sessionDefaults.CWD) == "" {
+		process.sessionDefaults.CWD = options.CWD
+	}
+	if strings.TrimSpace(process.sessionDefaults.ConfigPath) == "" {
+		process.sessionDefaults.ConfigPath = options.ConfigPath
 	}
 	process.httpServer = &http.Server{
 		Handler: process,
@@ -197,7 +219,13 @@ func (p *Process) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		p.handleServer(w, r)
 	case "/server/shutdown":
 		p.handleShutdown(w, r)
+	case "/sessions":
+		p.handleSessions(w, r)
 	default:
+		if strings.HasPrefix(r.URL.Path, "/sessions/") {
+			p.handleSessionPath(w, r)
+			return
+		}
 		writeError(w, http.StatusNotFound, "not_found", "path not found")
 	}
 }
@@ -221,6 +249,11 @@ func (p *Process) handleServer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	info := p.snapshot()
+	sessionCount, err := p.sessionCount()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "session_store_error", "could not list sessions")
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"cwd":            info.CWD,
 		"config_path":    info.ConfigPath,
@@ -229,7 +262,7 @@ func (p *Process) handleServer(w http.ResponseWriter, r *http.Request) {
 		"version":        info.Version,
 		"started_at":     info.StartedAt,
 		"uptime_seconds": int64(time.Since(info.StartedAt).Seconds()),
-		"session_count":  info.SessionCount,
+		"session_count":  sessionCount,
 		"running_turns":  info.RunningTurns,
 	})
 }
@@ -253,14 +286,275 @@ func (p *Process) handleShutdown(w http.ResponseWriter, r *http.Request) {
 	}()
 }
 
+func (p *Process) handleSessions(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		p.handleSessionsList(w, r)
+	case http.MethodPost:
+		p.handleSessionsCreate(w, r)
+	default:
+		writeMethodNotAllowed(w, http.MethodGet, http.MethodPost)
+	}
+}
+
+func (p *Process) handleSessionPath(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimPrefix(r.URL.Path, "/sessions/")
+	if strings.TrimSpace(id) == "" || strings.Contains(id, "/") {
+		writeError(w, http.StatusNotFound, "not_found", "path not found")
+		return
+	}
+	if r.Method != http.MethodGet {
+		writeMethodNotAllowed(w, http.MethodGet)
+		return
+	}
+	p.handleSessionDetail(w, r, id)
+}
+
+func (p *Process) handleSessionsList(w http.ResponseWriter, r *http.Request) {
+	store := p.sessionStore
+	if store == nil {
+		writeError(w, http.StatusServiceUnavailable, "session_store_unavailable", "session store is not configured")
+		return
+	}
+	infos, err := store.List()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "session_store_error", "could not list sessions")
+		return
+	}
+	items := make([]sessionMetadataDTO, 0, len(infos))
+	for _, info := range infos {
+		session, err := store.Load(info.ID)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "session_store_error", "could not load session metadata")
+			return
+		}
+		items = append(items, sessionMetadataDTO{
+			ID:           info.ID,
+			CreatedAt:    info.CreatedAt,
+			UpdatedAt:    info.UpdatedAt,
+			Provider:     info.Provider,
+			ModelProfile: info.ModelProfile,
+			ModelID:      info.ModelID,
+			LastSeq:      session.LastSeq,
+		})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"sessions": items,
+	})
+}
+
+func (p *Process) handleSessionsCreate(w http.ResponseWriter, r *http.Request) {
+	store := p.sessionStore
+	if store == nil {
+		writeError(w, http.StatusServiceUnavailable, "session_store_unavailable", "session store is not configured")
+		return
+	}
+	if err := readEmptySessionCreateRequest(w, r); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_request", err.Error())
+		return
+	}
+
+	session := copySessionMetadata(p.sessionDefaults)
+	session.ID = ""
+	session.Version = sessions.VersionV2
+	session.CreatedAt = time.Time{}
+	session.UpdatedAt = time.Time{}
+	session.Items = nil
+	session.ActiveHistory = nil
+	session.Compactions = nil
+	session.LastSeq = 0
+	session.SaveToolResults = true
+
+	saved, err := store.SaveMetadata(session)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "session_store_error", "could not create session")
+		return
+	}
+	writeJSON(w, http.StatusCreated, sessionDetailDTOFromSession(saved, "idle"))
+}
+
+func (p *Process) handleSessionDetail(w http.ResponseWriter, r *http.Request, id string) {
+	store := p.sessionStore
+	if store == nil {
+		writeError(w, http.StatusServiceUnavailable, "session_store_unavailable", "session store is not configured")
+		return
+	}
+	if !validSessionAPIID(id) {
+		writeError(w, http.StatusBadRequest, "invalid_session_id", "invalid session id")
+		return
+	}
+	session, err := store.Load(id)
+	if err != nil {
+		if errors.Is(err, sessions.ErrNotFound) {
+			writeError(w, http.StatusNotFound, "session_not_found", "session not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "session_store_error", "could not load session metadata")
+		return
+	}
+	writeJSON(w, http.StatusOK, sessionDetailDTOFromSession(session, "idle"))
+}
+
 func (p *Process) snapshot() Info {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.info
 }
 
-func writeMethodNotAllowed(w http.ResponseWriter, method string) {
-	w.Header().Set("Allow", method)
+func (p *Process) sessionCount() (int, error) {
+	if p.sessionStore == nil {
+		info := p.snapshot()
+		return info.SessionCount, nil
+	}
+	infos, err := p.sessionStore.List()
+	if err != nil {
+		return 0, err
+	}
+	return len(infos), nil
+}
+
+type sessionMetadataDTO struct {
+	ID           string    `json:"id"`
+	CreatedAt    time.Time `json:"created_at"`
+	UpdatedAt    time.Time `json:"updated_at"`
+	Provider     string    `json:"provider"`
+	ModelProfile string    `json:"model_profile"`
+	ModelID      string    `json:"model_id"`
+	LastSeq      int64     `json:"last_seq"`
+}
+
+type sessionDetailDTO struct {
+	ID              string                 `json:"id"`
+	CreatedAt       time.Time              `json:"created_at"`
+	UpdatedAt       time.Time              `json:"updated_at"`
+	Provider        string                 `json:"provider"`
+	ModelProfile    string                 `json:"model_profile"`
+	ModelID         string                 `json:"model_id"`
+	Status          string                 `json:"status"`
+	LastSeq         int64                  `json:"last_seq"`
+	CWD             string                 `json:"cwd,omitempty"`
+	ConfigPath      string                 `json:"config_path,omitempty"`
+	ModelParameters map[string]any         `json:"model_parameters,omitempty"`
+	EnabledTools    []string               `json:"enabled_tools,omitempty"`
+	EnabledMCP      []string               `json:"enabled_mcp,omitempty"`
+	EnabledSkills   []string               `json:"enabled_skills,omitempty"`
+	ShowReasoning   bool                   `json:"show_reasoning"`
+	Context         contextwindow.Metadata `json:"context"`
+	SaveToolResults bool                   `json:"save_tool_results"`
+}
+
+func sessionDetailDTOFromSession(session sessions.SessionV2, status string) sessionDetailDTO {
+	return sessionDetailDTO{
+		ID:              session.ID,
+		CreatedAt:       session.CreatedAt,
+		UpdatedAt:       session.UpdatedAt,
+		Provider:        session.Provider,
+		ModelProfile:    session.ModelProfile,
+		ModelID:         session.ModelID,
+		Status:          status,
+		LastSeq:         session.LastSeq,
+		CWD:             session.CWD,
+		ConfigPath:      session.RootConfigPath(),
+		ModelParameters: copyMap(session.ModelParameters),
+		EnabledTools:    copyStrings(session.EnabledTools),
+		EnabledMCP:      copyStrings(session.EnabledMCP),
+		EnabledSkills:   copyStrings(session.EnabledSkills),
+		ShowReasoning:   session.ShowReasoning,
+		Context:         session.Context,
+		SaveToolResults: session.SaveToolResults,
+	}
+}
+
+func readEmptySessionCreateRequest(w http.ResponseWriter, r *http.Request) error {
+	body := http.MaxBytesReader(w, r.Body, 1024)
+	data, err := io.ReadAll(body)
+	if err != nil {
+		return fmt.Errorf("read request body: %w", err)
+	}
+	if len(strings.TrimSpace(string(data))) == 0 {
+		return nil
+	}
+	var value map[string]json.RawMessage
+	if err := json.Unmarshal(data, &value); err != nil {
+		return fmt.Errorf("request body must be empty or an object")
+	}
+	if len(value) != 0 {
+		return fmt.Errorf("request body must be empty or {}")
+	}
+	return nil
+}
+
+func validSessionAPIID(id string) bool {
+	if strings.TrimSpace(id) == "" || id != strings.TrimSpace(id) || id == "." || id == ".." {
+		return false
+	}
+	if strings.EqualFold(strings.TrimRight(id, ". "), "blobs") {
+		return false
+	}
+	for _, r := range id {
+		if r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' {
+			continue
+		}
+		if r == '-' || r == '_' || r == '.' {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func copySessionMetadata(session sessions.SessionV2) sessions.SessionV2 {
+	session.ModelParameters = copyMap(session.ModelParameters)
+	session.EnabledTools = copyStrings(session.EnabledTools)
+	session.EnabledMCP = copyStrings(session.EnabledMCP)
+	session.EnabledSkills = copyStrings(session.EnabledSkills)
+	session.InstructionsSnapshot = copyMessages(session.InstructionsSnapshot)
+	session.InstructionSources = copyInstructionSources(session.InstructionSources)
+	session.Items = nil
+	session.ActiveHistory = nil
+	session.Compactions = nil
+	session.LastSeq = 0
+	return session
+}
+
+func copyMap(values map[string]any) map[string]any {
+	if values == nil {
+		return nil
+	}
+	copied := make(map[string]any, len(values))
+	for key, value := range values {
+		copied[key] = value
+	}
+	return copied
+}
+
+func copyStrings(values []string) []string {
+	if values == nil {
+		return nil
+	}
+	return append([]string(nil), values...)
+}
+
+func copyMessages(messages []model.Message) []model.Message {
+	if messages == nil {
+		return nil
+	}
+	copied := append([]model.Message(nil), messages...)
+	for i := range copied {
+		copied[i].ToolCalls = append([]model.ToolCall(nil), messages[i].ToolCalls...)
+	}
+	return copied
+}
+
+func copyInstructionSources(sources []sessions.InstructionSource) []sessions.InstructionSource {
+	if sources == nil {
+		return nil
+	}
+	return append([]sessions.InstructionSource(nil), sources...)
+}
+
+func writeMethodNotAllowed(w http.ResponseWriter, methods ...string) {
+	w.Header().Set("Allow", strings.Join(methods, ", "))
 	writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")
 }
 

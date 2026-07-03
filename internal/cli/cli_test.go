@@ -1163,6 +1163,86 @@ func TestServerCommandStartsWithDefaultConfigAndShutdown(t *testing.T) {
 	}
 }
 
+func TestServerCommandWiresSessionStoreAndDefaults(t *testing.T) {
+	isolateCLIUserRegistry(t)
+	projectDir := t.TempDir()
+	configDir := filepath.Join(projectDir, ".agents")
+	writeCLIFixtureInDir(t, configDir)
+	configPath := filepath.Join(configDir, "sai.yaml")
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("ReadFile(config) error = %v", err)
+	}
+	updated := strings.Replace(string(data), "default_model: glm-5.2", "default_model: glm-5.2-fast", 1)
+	if updated == string(data) {
+		t.Fatalf("config did not contain default model to replace:\n%s", data)
+	}
+	updated = strings.TrimRight(updated, "\r\n") + `
+
+sessions:
+  dir: custom-sessions
+  save_tool_results: true
+`
+	writeCLIFile(t, configPath, updated)
+
+	addr, done, stderr, cleanup := startCLIServerCommandForTest(t, []string{"server", "--port", "0"}, func() (string, error) {
+		return projectDir, nil
+	})
+	defer cleanup()
+
+	client := http.Client{Timeout: 2 * time.Second}
+	resp, err := client.Post("http://"+addr+"/sessions", "application/json", nil)
+	if err != nil {
+		t.Fatalf("Post(/sessions) error = %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("Post(/sessions) status = %d, want 201", resp.StatusCode)
+	}
+	var body map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("Decode(/sessions) error = %v", err)
+	}
+	id, ok := body["id"].(string)
+	if !ok || id == "" {
+		t.Fatalf("created session response missing id: %#v", body)
+	}
+	if body["model_profile"] != "glm-5.2-fast" || body["model_id"] != "glm-5.2" || body["save_tool_results"] != true {
+		t.Fatalf("created session response = %#v, want configured model defaults", body)
+	}
+
+	status := getCLIServerJSON(t, "http://"+addr+"/server")
+	if got := status["session_count"]; got != float64(1) {
+		t.Fatalf("session_count = %#v, want 1", got)
+	}
+
+	store := sessions.NewV2Store(filepath.Join(configDir, "custom-sessions"))
+	session, err := store.Load(id)
+	if err != nil {
+		t.Fatalf("Load(created session) error = %v", err)
+	}
+	if session.Provider != "paperhub" || session.ModelProfile != "glm-5.2-fast" || session.ModelID != "glm-5.2" {
+		t.Fatalf("stored model metadata = %#v, want paperhub/glm-5.2-fast/glm-5.2", session)
+	}
+	if got := session.ModelParameters["max_tokens"]; fmt.Sprint(got) != "2048" {
+		t.Fatalf("stored max_tokens = %#v, want 2048", got)
+	}
+	if got, want := filepath.Clean(session.CWD), filepath.Clean(projectDir); got != want {
+		t.Fatalf("stored cwd = %q, want %q", got, want)
+	}
+	if got, want := filepath.Clean(session.ConfigPath), configPath; got != want {
+		t.Fatalf("stored config_path = %q, want %q", got, want)
+	}
+	if len(session.Items) != 0 || session.LastSeq != 0 {
+		t.Fatalf("stored session timeline = items %#v last_seq %d, want empty", session.Items, session.LastSeq)
+	}
+
+	postCLIServerShutdown(t, addr)
+	if code := waitForCode(t, done); code != 0 {
+		t.Fatalf("server command code = %d, stderr = %s", code, stderr.String())
+	}
+}
+
 func TestServerCommandResolvesRelativeConfigFromCWD(t *testing.T) {
 	isolateCLIUserRegistry(t)
 	baseDir := t.TempDir()

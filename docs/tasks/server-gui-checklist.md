@@ -41,7 +41,7 @@ future work and should not be required by any slice here.
 - [x] CLI lifecycle commands: implement `sai status`, `sai stop`,
   `sai stop --cwd`, and `sai servers list` through registry discovery and server
   API calls.
-- [ ] Session metadata API: implement `GET /sessions`, `POST /sessions`, and
+- [x] Session metadata API: implement `GET /sessions`, `POST /sessions`, and
   `GET /sessions/{id}` with metadata-only responses and server-owned session
   creation.
 - [ ] Item pagination API: implement `GET /sessions/{id}/items` with
