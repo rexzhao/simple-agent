@@ -4164,6 +4164,60 @@ func TestRunInjectsConfiguredProjectInstructionFilesBeforeSkillsInOrder(t *testi
 	}
 }
 
+func TestRunDeduplicatesConfiguredProjectInstructionFilesSilently(t *testing.T) {
+	server, requests := newCLIRunServer(t,
+		`{"choices":[{"delta":{"content":"ok"}}]}`,
+		`[DONE]`,
+	)
+	defer server.Close()
+
+	configDir := t.TempDir()
+	writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
+	setCLIInstructionFiles(t, configDir, []string{"$CWD/b*.md", "$CWD/*.md"})
+
+	projectDir := t.TempDir()
+	writeCLIFile(t, filepath.Join(projectDir, "b.md"), "B project instructions\n")
+	writeCLIFile(t, filepath.Join(projectDir, "a.md"), "A project instructions\n")
+
+	var stdout, stderr bytes.Buffer
+	code := RunWithGetwd([]string{"--config", cliConfigPath(configDir), "chat", "--save-session", "--quit", "--prompt", "Use deduped project instructions"}, &stdout, &stderr, func() (string, error) {
+		return projectDir, nil
+	})
+
+	if code != 0 {
+		t.Fatalf("RunWithGetwd() code = %d, stderr = %s", code, stderr.String())
+	}
+	if strings.Contains(stderr.String(), "warning") {
+		t.Fatalf("stderr = %q, want no duplicate warning", stderr.String())
+	}
+
+	messages := requestMessages(t, (<-requests).Body)
+	if len(messages) != 4 {
+		t.Fatalf("len(messages) = %d, want 4: %#v", len(messages), messages)
+	}
+	assertMessage(t, messages, 0, "system", builtInBaseInstructions)
+	assertMessage(t, messages, 1, "developer", "B project instructions\n")
+	assertMessage(t, messages, 2, "developer", "A project instructions\n")
+	assertMessage(t, messages, 3, "user", "Use deduped project instructions")
+	assertNoAdditionalCLIRunRequest(t, requests)
+
+	session := loadOnlyCLISession(t, filepath.Join(configDir, "sessions"))
+	if len(session.InstructionsSnapshot) != 3 {
+		t.Fatalf("len(InstructionsSnapshot) = %d, want 3: %#v", len(session.InstructionsSnapshot), session.InstructionsSnapshot)
+	}
+	assertSavedMessage(t, session.InstructionsSnapshot, 0, model.MessageRoleSystem, builtInBaseInstructions)
+	assertSavedMessage(t, session.InstructionsSnapshot, 1, model.MessageRoleDeveloper, "B project instructions\n")
+	assertSavedMessage(t, session.InstructionsSnapshot, 2, model.MessageRoleDeveloper, "A project instructions\n")
+	wantSources := []sessions.InstructionSource{
+		{Role: model.MessageRoleSystem, Source: "sai_builtin"},
+		{Role: model.MessageRoleDeveloper, Source: "agents_md", Path: filepath.Join(projectDir, "b.md")},
+		{Role: model.MessageRoleDeveloper, Source: "agents_md", Path: filepath.Join(projectDir, "a.md")},
+	}
+	if !sameInstructionSourcesForTest(session.InstructionSources, wantSources) {
+		t.Fatalf("InstructionSources = %#v, want %#v", session.InstructionSources, wantSources)
+	}
+}
+
 func TestRunSkipsDisableModelInvocationSkill(t *testing.T) {
 	server, requests := newCLIRunServer(t,
 		`{"choices":[{"delta":{"content":"ok"}}]}`,

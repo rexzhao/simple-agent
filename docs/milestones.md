@@ -614,8 +614,9 @@ M18 当前已实现：根配置支持 `agent.instruction_files`，省略时兼�
 跳过并向 stderr 输出不进入模型上下文的 warning。每个成功加载的项目指令文件作为独立
 developer message 注入在内置基础约束之后、loaded skills 之前；resumable session 的
 `instructions_snapshot` 保留这些独立 message 粒度，`instruction_sources` 保留对应来源。
-后续补充：多个 `agent.instruction_files` 条目或重叠 glob 匹配到同一个实际文件时，应在
-placeholder 展开和 glob 匹配后按 canonical/clean 绝对文件路径去重，只加载第一次出现的文件。
+完成 placeholder 展开和 glob 匹配后，多个 `agent.instruction_files` 条目或重叠 glob
+匹配到同一个实际文件时，会按 canonical/clean 绝对文件路径去重，只加载第一次出现的文件；
+后续重复匹配静默跳过，不输出 warning。
 
 交付物：
 

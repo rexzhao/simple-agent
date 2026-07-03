@@ -180,6 +180,32 @@ func TestLoadWithOptionsWarnsAndSkipsUnresolvedRepo(t *testing.T) {
 	}
 }
 
+func TestLoadWithOptionsDeduplicatesRepoAndCWDInstructionFile(t *testing.T) {
+	projectDir := t.TempDir()
+	writeContextFile(t, filepath.Join(projectDir, ".git"), "gitdir\n")
+	writeContextFile(t, filepath.Join(projectDir, AgentsFileName), "project\n")
+	var warnings bytes.Buffer
+
+	project, err := LoadWithOptions(LoadOptions{
+		Directory: projectDir,
+		InstructionFiles: []string{
+			"$REPO/AGENTS.md",
+			"$CWD/AGENTS.md",
+		},
+		WarningWriter: &warnings,
+	})
+	if err != nil {
+		t.Fatalf("LoadWithOptions() error = %v", err)
+	}
+
+	assertInstructionFiles(t, project.InstructionFiles, []InstructionFile{
+		{Path: filepath.Join(projectDir, AgentsFileName), Content: "project\n"},
+	})
+	if warnings.String() != "" {
+		t.Fatalf("warnings = %q, want none", warnings.String())
+	}
+}
+
 func TestLoadWithOptionsExpandsGlobInStableSortOrder(t *testing.T) {
 	projectDir := t.TempDir()
 	writeContextFile(t, filepath.Join(projectDir, "b.md"), "b\n")
@@ -198,6 +224,34 @@ func TestLoadWithOptionsExpandsGlobInStableSortOrder(t *testing.T) {
 		{Path: filepath.Join(projectDir, "a.md"), Content: "a\n"},
 		{Path: filepath.Join(projectDir, "b.md"), Content: "b\n"},
 	})
+}
+
+func TestLoadWithOptionsDeduplicatesOverlappingGlobMatchesFirstOccurrenceWins(t *testing.T) {
+	projectDir := t.TempDir()
+	writeContextFile(t, filepath.Join(projectDir, "b.md"), "b\n")
+	writeContextFile(t, filepath.Join(projectDir, "a.md"), "a\n")
+	writeContextFile(t, filepath.Join(projectDir, "notes.txt"), "ignored\n")
+	var warnings bytes.Buffer
+
+	project, err := LoadWithOptions(LoadOptions{
+		Directory: projectDir,
+		InstructionFiles: []string{
+			"$CWD/b*.md",
+			"$CWD/*.md",
+		},
+		WarningWriter: &warnings,
+	})
+	if err != nil {
+		t.Fatalf("LoadWithOptions() error = %v", err)
+	}
+
+	assertInstructionFiles(t, project.InstructionFiles, []InstructionFile{
+		{Path: filepath.Join(projectDir, "b.md"), Content: "b\n"},
+		{Path: filepath.Join(projectDir, "a.md"), Content: "a\n"},
+	})
+	if warnings.String() != "" {
+		t.Fatalf("warnings = %q, want none", warnings.String())
+	}
 }
 
 func TestLoadWithOptionsExpandsRecursiveGlob(t *testing.T) {

@@ -120,6 +120,7 @@ type loadEnvironment struct {
 
 func loadInstructionFiles(env loadEnvironment, patterns []string) ([]InstructionFile, error) {
 	files := []InstructionFile{}
+	seen := map[string]struct{}{}
 	for _, entry := range patterns {
 		expanded, skip, err := expandInstructionEntry(&env, entry)
 		if err != nil {
@@ -144,6 +145,14 @@ func loadInstructionFiles(env loadEnvironment, patterns []string) ([]Instruction
 			if info.IsDir() {
 				continue
 			}
+			identity, err := instructionFileIdentity(match)
+			if err != nil {
+				return nil, err
+			}
+			if _, ok := seen[identity]; ok {
+				continue
+			}
+			seen[identity] = struct{}{}
 			data, err := os.ReadFile(match)
 			if err != nil {
 				return nil, fmt.Errorf("read instruction file %q: %w", match, err)
@@ -155,6 +164,23 @@ func loadInstructionFiles(env loadEnvironment, patterns []string) ([]Instruction
 		}
 	}
 	return files, nil
+}
+
+func instructionFileIdentity(filePath string) (string, error) {
+	absPath, err := filepath.Abs(filePath)
+	if err != nil {
+		return "", fmt.Errorf("resolve instruction file %q: %w", filePath, err)
+	}
+	absPath = filepath.Clean(absPath)
+	resolvedPath, err := filepath.EvalSymlinks(absPath)
+	if err != nil {
+		return absPath, nil
+	}
+	resolvedAbsPath, err := filepath.Abs(resolvedPath)
+	if err != nil {
+		return filepath.Clean(resolvedPath), nil
+	}
+	return filepath.Clean(resolvedAbsPath), nil
 }
 
 func expandInstructionEntry(env *loadEnvironment, entry string) (string, bool, error) {
