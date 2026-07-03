@@ -36,7 +36,7 @@
 - 根配置文件默认是启动时当前工作目录下的 `.agents/${arg[0]}.yaml`，其中 `${arg[0]}`
   是可执行文件 basename；普通 `sai` 二进制默认读取 `.agents/sai.yaml`。也可以通过
   `--config <file>` 显式指定根配置文件。
-- 项目指令文件计划通过根配置 `agent.instruction_files` 配置；省略时保持当前行为，等价于
+- 项目指令文件通过根配置 `agent.instruction_files` 配置；省略时保持当前行为，等价于
   `["$CWD/AGENTS.md"]`，文件不存在时继续执行。
 - 只落盘 JSONL 日志；会话历史、上下文快照和其他状态暂不落盘。
 
@@ -370,7 +370,7 @@ auth_dir: auth
 skill_dirs: [skills]
 
 agent:
-  # 计划字段；省略时等价于 ["$CWD/AGENTS.md"]
+  # 省略时等价于 ["$CWD/AGENTS.md"]
   instruction_files:
     - $CWD/AGENTS.md
   max_turns: 8
@@ -525,7 +525,7 @@ provider/model 列表并停止。v0.1 不支持会话进行中切换模型。
 
 ## 项目上下文
 
-M17 计划通过根配置 `agent.instruction_files` 配置项目指令文件。省略该字段时保持当前兼容
+M17 通过根配置 `agent.instruction_files` 配置项目指令文件。省略该字段时保持当前兼容
 行为，等价于：
 
 ```yaml

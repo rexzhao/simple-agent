@@ -37,9 +37,16 @@ type Session struct {
 	EnabledSkills        []string               `json:"enabled_skills,omitempty"`
 	ShowReasoning        bool                   `json:"show_reasoning"`
 	InstructionsSnapshot []model.Message        `json:"instructions_snapshot,omitempty"`
+	InstructionSources   []InstructionSource    `json:"instruction_sources,omitempty"`
 	Messages             []model.Message        `json:"messages"`
 	Context              contextwindow.Metadata `json:"context,omitempty"`
 	SaveToolResults      bool                   `json:"save_tool_results"`
+}
+
+type InstructionSource struct {
+	Role   model.MessageRole `json:"role"`
+	Source string            `json:"source"`
+	Path   string            `json:"path,omitempty"`
 }
 
 func (s Session) RootConfigPath() string {
@@ -116,6 +123,7 @@ func (s *Store) Save(session Session) (Session, error) {
 	session.EnabledMCP = copyStrings(session.EnabledMCP)
 	session.EnabledSkills = copyStrings(session.EnabledSkills)
 	session.InstructionsSnapshot = copyMessages(session.InstructionsSnapshot)
+	session.InstructionSources = copyInstructionSources(session.InstructionSources)
 	session.Messages = copyMessages(session.Messages)
 
 	sessionDir := s.sessionDir(session.ID)
@@ -342,4 +350,11 @@ func copyMessages(messages []model.Message) []model.Message {
 		copied[i].ToolCalls = append([]model.ToolCall(nil), messages[i].ToolCalls...)
 	}
 	return copied
+}
+
+func copyInstructionSources(sources []InstructionSource) []InstructionSource {
+	if sources == nil {
+		return nil
+	}
+	return append([]InstructionSource(nil), sources...)
 }

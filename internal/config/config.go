@@ -37,9 +37,10 @@ const (
 )
 
 type AgentConfig struct {
-	MaxTurns      int  `json:"max_turns" yaml:"max_turns"`
-	Stream        bool `json:"stream" yaml:"stream"`
-	ShowReasoning bool `json:"show_reasoning" yaml:"show_reasoning"`
+	InstructionFiles []string `json:"instruction_files" yaml:"instruction_files"`
+	MaxTurns         int      `json:"max_turns" yaml:"max_turns"`
+	Stream           bool     `json:"stream" yaml:"stream"`
+	ShowReasoning    bool     `json:"show_reasoning" yaml:"show_reasoning"`
 }
 
 type ToolsConfig struct {
@@ -400,8 +401,9 @@ func defaultConfig() Config {
 		AuthDir:     "auth",
 		SkillDirs:   []string{"skills"},
 		Agent: AgentConfig{
-			MaxTurns: defaultAgentMaxTurns,
-			Stream:   true,
+			InstructionFiles: []string{"$CWD/AGENTS.md"},
+			MaxTurns:         defaultAgentMaxTurns,
+			Stream:           true,
 		},
 		Tools: ToolsConfig{
 			Enabled: []string{},

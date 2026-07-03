@@ -4110,6 +4110,60 @@ func TestRunInjectsDiscoveredSkillsInDirectoryOrder(t *testing.T) {
 	assertNoAdditionalCLIRunRequest(t, requests)
 }
 
+func TestRunInjectsConfiguredProjectInstructionFilesBeforeSkillsInOrder(t *testing.T) {
+	server, requests := newCLIRunServer(t,
+		`{"choices":[{"delta":{"content":"ok"}}]}`,
+		`[DONE]`,
+	)
+	defer server.Close()
+
+	configDir := t.TempDir()
+	writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
+	setCLIInstructionFiles(t, configDir, []string{"$CONFIG/project-first.md", "$CWD/local-second.md"})
+	writeCLIFile(t, filepath.Join(configDir, "project-first.md"), "First project instructions\n")
+	writeCLISkill(t, configDir, "alpha", "---\nname: Alpha Skill\n---\nSkill instructions\n")
+
+	projectDir := t.TempDir()
+	writeCLIFile(t, filepath.Join(projectDir, "local-second.md"), "Second project instructions\n")
+
+	var stdout, stderr bytes.Buffer
+	code := RunWithGetwd([]string{"--config", cliConfigPath(configDir), "chat", "--save-session", "--quit", "--prompt", "Use project instructions"}, &stdout, &stderr, func() (string, error) {
+		return projectDir, nil
+	})
+
+	if code != 0 {
+		t.Fatalf("RunWithGetwd() code = %d, stderr = %s", code, stderr.String())
+	}
+	messages := requestMessages(t, (<-requests).Body)
+	if len(messages) != 5 {
+		t.Fatalf("len(messages) = %d, want 5: %#v", len(messages), messages)
+	}
+	assertMessage(t, messages, 0, "system", builtInBaseInstructions)
+	assertMessage(t, messages, 1, "developer", "First project instructions\n")
+	assertMessage(t, messages, 2, "developer", "Second project instructions\n")
+	assertMessage(t, messages, 3, "developer", "Skill alpha (Alpha Skill):\nSkill instructions\n")
+	assertMessage(t, messages, 4, "user", "Use project instructions")
+	assertNoAdditionalCLIRunRequest(t, requests)
+
+	session := loadOnlyCLISession(t, filepath.Join(configDir, "sessions"))
+	if len(session.InstructionsSnapshot) != 4 {
+		t.Fatalf("len(InstructionsSnapshot) = %d, want 4: %#v", len(session.InstructionsSnapshot), session.InstructionsSnapshot)
+	}
+	assertSavedMessage(t, session.InstructionsSnapshot, 0, model.MessageRoleSystem, builtInBaseInstructions)
+	assertSavedMessage(t, session.InstructionsSnapshot, 1, model.MessageRoleDeveloper, "First project instructions\n")
+	assertSavedMessage(t, session.InstructionsSnapshot, 2, model.MessageRoleDeveloper, "Second project instructions\n")
+	assertSavedMessage(t, session.InstructionsSnapshot, 3, model.MessageRoleDeveloper, "Skill alpha (Alpha Skill):\nSkill instructions\n")
+	wantSources := []sessions.InstructionSource{
+		{Role: model.MessageRoleSystem, Source: "sai_builtin"},
+		{Role: model.MessageRoleDeveloper, Source: "agents_md", Path: filepath.Join(configDir, "project-first.md")},
+		{Role: model.MessageRoleDeveloper, Source: "agents_md", Path: filepath.Join(projectDir, "local-second.md")},
+		{Role: model.MessageRoleDeveloper, Source: "skill", Path: filepath.Join(configDir, "skills", "alpha", "SKILL.md")},
+	}
+	if !sameInstructionSourcesForTest(session.InstructionSources, wantSources) {
+		t.Fatalf("InstructionSources = %#v, want %#v", session.InstructionSources, wantSources)
+	}
+}
+
 func TestRunSkipsDisableModelInvocationSkill(t *testing.T) {
 	server, requests := newCLIRunServer(t,
 		`{"choices":[{"delta":{"content":"ok"}}]}`,
@@ -5422,6 +5476,21 @@ func setCLISkillDirs(t *testing.T, configDir string, dirs []string) {
 	writeCLIFile(t, configPath, updated)
 }
 
+func setCLIInstructionFiles(t *testing.T, configDir string, files []string) {
+	t.Helper()
+	configPath := filepath.Join(configDir, "sai.yaml")
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("ReadFile(%q) error = %v", configPath, err)
+	}
+	replacement := "agent:\n  instruction_files:" + formatNestedStringListYAML(files, 4) + "\n  max_turns"
+	updated := strings.Replace(string(data), "agent:\n  max_turns", replacement, 1)
+	if updated == string(data) {
+		t.Fatalf("sai.yaml did not contain agent max_turns to replace:\n%s", data)
+	}
+	writeCLIFile(t, configPath, updated)
+}
+
 func loadOnlyCLISession(t *testing.T, root string) sessions.Session {
 	t.Helper()
 
@@ -5672,6 +5741,19 @@ func formatTopLevelStringListYAML(values []string) string {
 		fmt.Fprintf(&out, "  - %s\n", value)
 	}
 	return strings.TrimRight(out.String(), "\n")
+}
+
+func formatNestedStringListYAML(values []string, indent int) string {
+	if len(values) == 0 {
+		return " []"
+	}
+
+	prefix := strings.Repeat(" ", indent)
+	var out strings.Builder
+	for _, value := range values {
+		fmt.Fprintf(&out, "\n%s- %s", prefix, value)
+	}
+	return out.String()
 }
 
 func decodeCLIJSON(t *testing.T, data []byte) map[string]any {
@@ -6149,6 +6231,18 @@ func sameStringsForTest(a, b []string) bool {
 	}
 	for i := range a {
 		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func sameInstructionSourcesForTest(a, b []sessions.InstructionSource) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i].Role != b[i].Role || a[i].Source != b[i].Source || filepath.Clean(a[i].Path) != filepath.Clean(b[i].Path) {
 			return false
 		}
 	}

@@ -344,23 +344,23 @@
 - [x] 验证 `go test ./...`。
 - [x] 验证 `git diff --check`。
 
-## M18：Project Instruction Files（计划）
+## M18：Project Instruction Files
 
-- [ ] 根配置新增 `agent.instruction_files` 列表字段。
-- [ ] 省略 `agent.instruction_files` 时，行为等价于 `["$CWD/AGENTS.md"]`。
-- [ ] 列表条目按配置顺序加载，条目可指向任意文件名，不限于 `AGENTS.md`。
-- [ ] 支持 `$CWD`、`$CONFIG`、`$USER` 和 `$REPO` placeholder。
-- [ ] `$REPO` 从 `$CWD` 向上发现 git repository root；无法解析时跳过该条目并输出 warning。
-- [ ] `$REPO` 解析 warning 不进入模型上下文。
-- [ ] 缺失的非 glob 文件按当前缺失 `AGENTS.md` 行为跳过。
-- [ ] glob 支持普通 glob pattern 和递归 `**/*.md` pattern。
-- [ ] 单个 pattern 匹配多个文件时，在该 pattern 内按稳定 path sort 顺序加载。
-- [ ] 不同 pattern 之间保留 `agent.instruction_files` 列表顺序。
-- [ ] 成功加载的文件注入在 `sai` 内置基础约束之后、loaded skills 和当前用户 prompt 之前。
-- [ ] 每个成功加载的文件优先作为独立 developer instruction source/message 注入。
-- [ ] resumable session 的项目指令 snapshot 或可重建信息保留单文件来源。
-- [ ] `sai config show`、verbose、日志和 warning 不打印项目指令正文。
-- [ ] 配置测试覆盖默认值、placeholder 解析、缺失文件、glob 和稳定排序。
-- [ ] CLI / fake server 测试覆盖多项目指令文件注入顺序和 skill 注入位置。
-- [ ] 验证 `go test ./...`。
-- [ ] 验证 `git diff --check`。
+- [x] 根配置新增 `agent.instruction_files` 列表字段。
+- [x] 省略 `agent.instruction_files` 时，行为等价于 `["$CWD/AGENTS.md"]`。
+- [x] 列表条目按配置顺序加载，条目可指向任意文件名，不限于 `AGENTS.md`。
+- [x] 支持 `$CWD`、`$CONFIG`、`$USER` 和 `$REPO` placeholder。
+- [x] `$REPO` 从 `$CWD` 向上发现 git repository root；无法解析时跳过该条目并输出 warning。
+- [x] `$REPO` 解析 warning 不进入模型上下文。
+- [x] 缺失的非 glob 文件按当前缺失 `AGENTS.md` 行为跳过。
+- [x] glob 支持普通 glob pattern 和递归 `**/*.md` pattern。
+- [x] 单个 pattern 匹配多个文件时，在该 pattern 内按稳定 path sort 顺序加载。
+- [x] 不同 pattern 之间保留 `agent.instruction_files` 列表顺序。
+- [x] 成功加载的文件注入在 `sai` 内置基础约束之后、loaded skills 和当前用户 prompt 之前。
+- [x] 每个成功加载的文件优先作为独立 developer instruction source/message 注入。
+- [x] resumable session 的项目指令 snapshot 或可重建信息保留单文件来源。
+- [x] `sai config show`、verbose、日志和 warning 不打印项目指令正文。
+- [x] 配置测试覆盖默认值、显式空列表和配置值；context 测试覆盖 placeholder 解析、缺失文件、glob 和稳定排序。
+- [x] CLI / fake server 测试覆盖多项目指令文件注入顺序和 skill 注入位置。
+- [x] 验证 `go test ./...`。
+- [x] 验证 `git diff --check`。

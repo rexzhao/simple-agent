@@ -607,6 +607,14 @@ agent 在大工作区内安全定位文本内容，同时不默认启用任何�
 目标：把项目指令文件从固定启动目录 `AGENTS.md` 扩展为根配置字段
 `agent.instruction_files`，同时保持省略配置时的兼容默认行为。
 
+M17 当前已实现：根配置支持 `agent.instruction_files`，省略时兼容默认
+`["$CWD/AGENTS.md"]`；显式空列表不加载项目指令；条目按列表顺序处理，支持任意文件名、
+`$CWD` / `$CONFIG` / `$USER` / `$REPO` placeholder、普通 glob 和递归 `**/*.md` glob。
+单个 pattern 的多个匹配按稳定 path sort 顺序加载，缺失文件跳过，无法解析 `$REPO` 的条目
+跳过并向 stderr 输出不进入模型上下文的 warning。每个成功加载的项目指令文件作为独立
+developer message 注入在内置基础约束之后、loaded skills 之前；resumable session 的
+`instructions_snapshot` 保留这些独立 message 粒度，`instruction_sources` 保留对应来源。
+
 交付物：
 
 - 根配置新增 `agent.instruction_files` 列表字段。

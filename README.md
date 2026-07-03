@@ -19,12 +19,12 @@ the directory containing that config file. Relative paths in secondary config
 files use the same rule; for example, provider `auth_file` is relative to the
 provider YAML file.
 
-Planned project-instruction configuration uses `agent.instruction_files`. If it
-is omitted, behavior remains compatible with `["$CWD/AGENTS.md"]`. Entries load
-in list order, may name files other than `AGENTS.md`, support `$CWD`, `$CONFIG`,
-`$USER`, and `$REPO`, and glob matches load in stable path sort order within
-one pattern. Successfully loaded files keep the same instruction position:
-after built-in base instructions and before loaded skills and the user prompt.
+Project-instruction configuration uses `agent.instruction_files`. If it is
+omitted, behavior remains compatible with `["$CWD/AGENTS.md"]`. Entries load in
+list order, may name files other than `AGENTS.md`, support `$CWD`, `$CONFIG`,
+`$USER`, and `$REPO`, and glob matches load in stable path sort order within one
+pattern. Successfully loaded files keep the same instruction position: after
+built-in base instructions and before loaded skills and the user prompt.
 
 Minimal provider setup:
 

@@ -59,6 +59,10 @@ func TestLoadResolvesConfigAndProviderModels(t *testing.T) {
 		t.Fatalf("MCPDir = %q, want %q", cfg.MCPDir, wantMCPDir)
 	}
 
+	if !sameStrings(cfg.Agent.InstructionFiles, []string{"$CWD/AGENTS.md"}) {
+		t.Fatalf("Agent.InstructionFiles = %#v, want default $CWD/AGENTS.md", cfg.Agent.InstructionFiles)
+	}
+
 	provider := cfg.Providers["paperhub"]
 	if provider.Name != "paperhub" {
 		t.Fatalf("provider name = %q, want paperhub", provider.Name)
@@ -71,6 +75,63 @@ func TestLoadResolvesConfigAndProviderModels(t *testing.T) {
 	}
 	if got := provider.Models["glm-5.2-fast"].Parameters["max_tokens"]; got != 2048 {
 		t.Fatalf("fast profile max_tokens = %#v, want 2048", got)
+	}
+}
+
+func TestLoadAllowsEmptyInstructionFiles(t *testing.T) {
+	dir := writeConfigFixture(t)
+	writeFile(t, filepath.Join(dir, "sai.yaml"), `default_provider: paperhub
+default_model: glm-5.2
+provider_dir: providers
+
+agent:
+  instruction_files: []
+  max_turns: 8
+  stream: true
+`)
+
+	cfg, err := Load(rootConfigPath(dir))
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+
+	if cfg.Agent.InstructionFiles == nil {
+		t.Fatal("Agent.InstructionFiles = nil, want explicit empty slice")
+	}
+	if len(cfg.Agent.InstructionFiles) != 0 {
+		t.Fatalf("Agent.InstructionFiles = %#v, want empty", cfg.Agent.InstructionFiles)
+	}
+}
+
+func TestLoadReadsConfiguredInstructionFiles(t *testing.T) {
+	dir := writeConfigFixture(t)
+	writeFile(t, filepath.Join(dir, "sai.yaml"), `default_provider: paperhub
+default_model: glm-5.2
+provider_dir: providers
+
+agent:
+  instruction_files:
+    - $CONFIG/team.md
+    - $CWD/AGENTS.local.md
+    - $USER/sai/global.md
+    - $REPO/docs/*.md
+  max_turns: 8
+  stream: true
+`)
+
+	cfg, err := Load(rootConfigPath(dir))
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+
+	want := []string{
+		"$CONFIG/team.md",
+		"$CWD/AGENTS.local.md",
+		"$USER/sai/global.md",
+		"$REPO/docs/*.md",
+	}
+	if !sameStrings(cfg.Agent.InstructionFiles, want) {
+		t.Fatalf("Agent.InstructionFiles = %#v, want %#v", cfg.Agent.InstructionFiles, want)
 	}
 }
 

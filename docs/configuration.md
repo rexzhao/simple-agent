@@ -13,7 +13,7 @@
 
 暂时不读取用户目录，也不向用户目录写入默认配置。
 
-项目指令文件的计划配置入口是根配置里的 `agent.instruction_files`。省略该字段时保持当前
+项目指令文件的配置入口是根配置里的 `agent.instruction_files`。省略该字段时保持当前
 兼容行为，等价于只读取启动时当前工作目录下的 `$CWD/AGENTS.md`；`--config` 不改变
 `$CWD` 的含义。
 
@@ -88,7 +88,7 @@ auth_dir: auth
 skill_dirs: [skills]
 
 agent:
-  # 计划字段；省略时等价于 ["$CWD/AGENTS.md"]
+  # 省略时等价于 ["$CWD/AGENTS.md"]
   instruction_files:
     - $CWD/AGENTS.md
   max_turns: 8
@@ -124,7 +124,7 @@ mcp_dir: mcp
   顺序，跨目录保留配置顺序。重复 skill id 是配置错误。
 - `mcp_dir`：MCP 配置文件目录。M4 后启用；相对路径基于根配置文件所在目录解析。
 - `agent.max_turns`：一次 agent loop 最多请求模型的轮数。
-- `agent.instruction_files`：计划新增的项目指令文件列表；省略时等价于
+- `agent.instruction_files`：项目指令文件列表；省略时等价于
   `["$CWD/AGENTS.md"]`。
 - `agent.stream`：默认是否启用 streaming。
 - `agent.show_reasoning`：默认是否显示 reasoning stream。
@@ -141,9 +141,9 @@ mcp_dir: mcp
 - `sessions.save_tool_results`：M13 后启用 session 保存时是否保存完整 tool result messages。
   可靠 resume 需要保存 tool results；关闭后只能作为降级或诊断模式设计。
 
-## 项目指令文件配置（计划）
+## 项目指令文件配置
 
-计划新增根配置字段 `agent.instruction_files`，用于配置项目指令文件列表。省略该字段时保持
+根配置字段 `agent.instruction_files` 用于配置项目指令文件列表。省略该字段时保持
 当前行为，等价于：
 
 ```yaml

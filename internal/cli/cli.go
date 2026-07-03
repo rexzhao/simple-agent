@@ -1859,6 +1859,7 @@ type agentRuntime struct {
 	enabledMCP            []string
 	enabledSkills         []string
 	baseMessages          []model.Message
+	instructionSources    []sessions.InstructionSource
 	resumed               bool
 	resumableSession      sessions.Session
 	resumableSessionStore *sessions.Store
@@ -1938,6 +1939,9 @@ func (r *agentRuntime) saveUpdatedMessages(messages []model.Message) error {
 	session.ShowReasoning = r.showReasoning
 	if len(session.InstructionsSnapshot) == 0 {
 		session.InstructionsSnapshot = copyMessageSlice(r.baseMessages)
+	}
+	if len(session.InstructionSources) == 0 {
+		session.InstructionSources = copyInstructionSources(r.instructionSources)
 	}
 	session.Messages = copyMessageSlice(messages)
 	if r.contextTracker != nil {
@@ -2055,20 +2059,28 @@ func prepareAgentRuntime(ctx context.Context, configPath string, options agentCo
 	}
 
 	var baseMessages []model.Message
+	var instructionSources []sessions.InstructionSource
 	var enabledSkillIDs []string
 	if resumed {
 		baseMessages = copyMessageSlice(resumedSession.InstructionsSnapshot)
+		instructionSources = copyInstructionSources(resumedSession.InstructionSources)
 		enabledSkillIDs = copyStringSlice(resumedSession.EnabledSkills)
 	} else {
 		selectedSkills, err := enabledSkillsForRun(cfg)
 		if err != nil {
 			return nil, err
 		}
-		project, err := projectcontext.Load(cwd)
+		project, err := projectcontext.LoadWithOptions(projectcontext.LoadOptions{
+			Directory:        cwd,
+			ConfigDir:        filepath.Dir(cfg.ConfigPath),
+			InstructionFiles: cfg.Agent.InstructionFiles,
+			WarningWriter:    stderr,
+		})
 		if err != nil {
 			return nil, err
 		}
 		baseMessages = chatBaseMessages(project, selectedSkills)
+		instructionSources = chatInstructionSources(project, selectedSkills)
 		enabledSkillIDs = skillIDs(selectedSkills)
 	}
 
@@ -2102,6 +2114,7 @@ func prepareAgentRuntime(ctx context.Context, configPath string, options agentCo
 		enabledMCP:            mcpServerIDs(selectedMCPServers),
 		enabledSkills:         enabledSkillIDs,
 		baseMessages:          baseMessages,
+		instructionSources:    instructionSources,
 		resumed:               resumed,
 		resumableSession:      resumedSession,
 		resumableSessionStore: sessionStore,
@@ -2203,6 +2216,13 @@ func copyStringSlice(values []string) []string {
 		return nil
 	}
 	return append([]string(nil), values...)
+}
+
+func copyInstructionSources(values []sessions.InstructionSource) []sessions.InstructionSource {
+	if values == nil {
+		return nil
+	}
+	return append([]sessions.InstructionSource(nil), values...)
 }
 
 func copyParameterMap(values map[string]any) map[string]any {
@@ -2557,6 +2577,37 @@ func chatBaseMessages(project projectcontext.Project, enabledSkills []localskill
 		})
 	}
 	return messages
+}
+
+func chatInstructionSources(project projectcontext.Project, enabledSkills []localskills.Skill) []sessions.InstructionSource {
+	sources := []sessions.InstructionSource{
+		{
+			Role:   model.MessageRoleSystem,
+			Source: string(projectcontext.InstructionSourceBuiltIn),
+		},
+	}
+	for _, file := range project.InstructionFiles {
+		sources = append(sources, sessions.InstructionSource{
+			Role:   model.MessageRoleDeveloper,
+			Source: string(projectcontext.InstructionSourceProject),
+			Path:   file.Path,
+		})
+	}
+	if len(project.InstructionFiles) == 0 && project.HasInstructions {
+		sources = append(sources, sessions.InstructionSource{
+			Role:   model.MessageRoleDeveloper,
+			Source: string(projectcontext.InstructionSourceProject),
+			Path:   project.InstructionsPath,
+		})
+	}
+	for _, skill := range enabledSkills {
+		sources = append(sources, sessions.InstructionSource{
+			Role:   model.MessageRoleDeveloper,
+			Source: "skill",
+			Path:   skill.Path,
+		})
+	}
+	return sources
 }
 
 func copyMessageSlice(messages []model.Message) []model.Message {

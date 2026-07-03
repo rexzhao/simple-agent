@@ -38,6 +38,10 @@ func TestStoreSaveLoadFullMessages(t *testing.T) {
 			{Role: model.MessageRoleSystem, Content: "Be concise."},
 			{Role: model.MessageRoleDeveloper, Content: "Follow project rules."},
 		},
+		InstructionSources: []InstructionSource{
+			{Role: model.MessageRoleSystem, Source: "sai_builtin"},
+			{Role: model.MessageRoleDeveloper, Source: "agents_md", Path: filepath.Join(`F:\work\simple-agent`, "AGENTS.md")},
+		},
 		Messages: []model.Message{
 			{Role: model.MessageRoleUser, Content: "Read docs/checklist.md"},
 			{
@@ -107,6 +111,9 @@ func TestStoreSaveLoadFullMessages(t *testing.T) {
 	}
 	if !reflect.DeepEqual(loaded.InstructionsSnapshot, saved.InstructionsSnapshot) {
 		t.Fatalf("InstructionsSnapshot = %#v, want %#v", loaded.InstructionsSnapshot, saved.InstructionsSnapshot)
+	}
+	if !reflect.DeepEqual(loaded.InstructionSources, saved.InstructionSources) {
+		t.Fatalf("InstructionSources = %#v, want %#v", loaded.InstructionSources, saved.InstructionSources)
 	}
 	if !reflect.DeepEqual(loaded.Messages, saved.Messages) {
 		t.Fatalf("Messages = %#v, want %#v", loaded.Messages, saved.Messages)
