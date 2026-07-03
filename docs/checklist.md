@@ -128,12 +128,13 @@
 
 ## 后续 Skills
 
-- [x] 定义 skill 目录结构。
+- [x] 定义 `skill_dirs` 多目录结构。
 - [x] 读取 `SKILL.md`。
-- [x] 添加直接子目录 skill discovery 和 `disable-model-invocation: true` frontmatter opt-out。
+- [x] 添加 `skill_dirs` 直接子目录 skill discovery、目录顺序保留和
+  `disable-model-invocation: true` frontmatter opt-out。
 - [x] 将 skill instructions 组合进 system/developer messages。
-- [x] 添加 malformed skill 错误处理。
-- [x] 添加 skill discovery 和 frontmatter opt-out 测试。
+- [x] 添加 malformed skill 和重复 skill id 错误处理。
+- [x] 添加 skill discovery、frontmatter opt-out 和重复 skill id 测试。
 
 ## M8：CLI Help / Discoverability
 
@@ -282,7 +283,7 @@
 - [x] 增加 `sai doctor` 或 `sai config check`。
 - [x] 健康检查覆盖配置根目录和 provider 文件。
 - [x] 健康检查覆盖默认 provider/model 和 API key 环境变量是否存在。
-- [x] 健康检查覆盖 skill_dir、mcp_dir、enabled tools/MCP 和 skills discovery。
+- [x] 健康检查覆盖 skill_dirs、mcp_dir、enabled tools/MCP、skills discovery 和重复 skill id。
 - [x] 健康检查覆盖日志目录可写性。
 - [x] 健康检查输出脱敏，不打印 API key 或其他敏感配置值实际值。
 - [x] 不引入 TUI。

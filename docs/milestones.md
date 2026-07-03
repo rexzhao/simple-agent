@@ -184,17 +184,22 @@ function tools / function_call_output，使现有 agent tool loop 能通过 `ope
 
 交付物：
 
-- 配置层定义 `skill_dir`，默认指向配置根目录下的 `skills`。
+- 配置层定义 `skill_dirs`，默认等价于 `skill_dirs: [skills]`；相对路径基于配置根目录解析，
+  绝对路径保持不变。
 - 推荐本地目录布局：`.agents/skills/<skill_id>/SKILL.md`。
-- skill discovery，只发现 `skill_dir` 下包含 `SKILL.md` 的直接子目录。
+- skill discovery，按配置顺序扫描多个目录，每个目录只发现包含 `SKILL.md` 的直接子目录。
+- 同一目录内按确定性 discovery 顺序加载，跨目录保留配置的目录顺序。
+- 重复 skill id 跨配置目录出现时作为配置错误。
 - `SKILL.md` 读取，支持可选 YAML frontmatter 中的 `name`、`description` 和
   `disable-model-invocation`。
 - 通过 `disable-model-invocation: true` 对单个 skill 关闭模型上下文注入；缺失或为
   `false` 时正常加载。
 - instruction composition。
 
-M7 当前实现只覆盖配置目录下的本地 skills：发现 `skill_dir` 下包含 `SKILL.md` 的直接
-子目录，默认将其 instructions 作为 developer message 注入在内置 system 和 `AGENTS.md`
+M7 当前实现只覆盖 `skill_dirs` 中配置的本地 skills：默认等价于 `skill_dirs: [skills]`，
+按配置顺序扫描多个目录，每个目录只发现包含 `SKILL.md` 的直接子目录。同一目录内按确定性
+discovery 顺序加载，跨目录保留配置的目录顺序；重复 skill id 是配置错误。发现到的 skill
+默认将其 instructions 作为 developer message 注入在内置 system 和 `AGENTS.md`
 之后、用户 prompt 之前。若某个 `SKILL.md` frontmatter 设置
 `disable-model-invocation: true`，该 skill 不注入模型上下文；缺失该字段或设置为 `false`
 表示正常加载。M7 不读取用户目录，不实现
@@ -204,17 +209,18 @@ marketplace、递归 skill discovery、plugin lifecycle 或复杂依赖解析。
 
 第一小步验证：
 
-- discovery 单元测试能稳定列出 `skill_dir` 下含 `SKILL.md` 的直接子目录。
+- discovery 单元测试能稳定列出 `skill_dirs` 配置目录下含 `SKILL.md` 的直接子目录，并保留
+  配置目录顺序。
 - `SKILL.md` loader 能读取 frontmatter 中的 `name` / `description` /
   `disable-model-invocation` 和正文。
 - 无 frontmatter 时，loader 使用 skill id 作为名称、description 为空、全文作为 instructions。
-- config test 能证明 `skill_dir` 默认路径和自定义路径都相对配置根目录解析。
+- config test 能证明 `skill_dirs` 默认值、自定义多目录路径和绝对路径解析正确。
 
 最终态验证：
 
 - 本地测试 skill 能改变模型 instructions。
 - skill 可以通过 `disable-model-invocation: true` 关闭模型上下文注入。
-- 缺失或格式错误的 skill 有清晰错误。
+- 缺失、格式错误或重复 id 的 skill 有清晰错误。
 - CLI fake server 测试覆盖 skill 注入顺序、frontmatter opt-out 和 malformed frontmatter。
 
 ## M8：CLI Help / Discoverability
@@ -501,7 +507,7 @@ stdout 上的 `OK` / `WARN` / `ERROR` 行，任何 `ERROR` 都让退出码为 1�
 - REPL `/usage` 展示 context window / usage 元数据，不请求 provider，不记录正文敏感内容。
 - 增加配置健康检查命令 `sai doctor`，不新增别名或 `sai config check`。
 - 健康检查覆盖配置根目录、provider 文件、默认 provider/model、API key 环境变量是否存在、
-  skill_dir、mcp_dir、enabled tools/MCP、skills discovery 和日志目录可写性。
+  skill_dirs、mcp_dir、enabled tools/MCP、skills discovery、重复 skill id 和日志目录可写性。
 - 健康检查输出脱敏，不打印 API key 或其他敏感配置值实际值。
 - 健康检查不发 HTTP 请求、不启动 MCP server、不运行模型。
 - 不引入 TUI、不做 Markdown 渲染；Markdown 渲染最多作为远期低优先级非目标记录。

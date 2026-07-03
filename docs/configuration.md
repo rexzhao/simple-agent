@@ -56,9 +56,10 @@ AGENTS.md
 `.agents/` 是默认配置根目录；通过 `--config-dir` 指定时，配置根目录改为指定目录。
 `sai.yaml` 是全局配置入口，负责默认 provider、默认 model、provider 目录、工具启用和
 agent 通用参数。`providers/*.yaml`
-每个文件描述一个 provider。`skills/<skill_id>/SKILL.md` 是 M7 后的本地 skill 推荐布局；
-直接子目录下存在 `SKILL.md` 的本地 skill 默认会注入运行时，除非该文件的 frontmatter
-设置 `disable-model-invocation: true`。
+每个文件描述一个 provider。默认 `skill_dirs: [skills]` 会扫描
+`skills/<skill_id>/SKILL.md` 这种 M7 后的本地 skill 推荐布局；直接子目录下存在
+`SKILL.md` 的本地 skill 默认会注入运行时，除非该文件的 frontmatter 设置
+`disable-model-invocation: true`。
 `mcp/*.yaml` 每个文件描述一个 MCP server；
 MCP 是 M4 后能力，不属于 MVP 必需配置。
 
@@ -73,7 +74,7 @@ default_provider: paperhub
 default_model: glm-5.2
 provider_dir: providers
 auth_dir: auth
-skill_dir: skills
+skill_dirs: [skills]
 
 agent:
   max_turns: 8
@@ -103,8 +104,10 @@ mcp_dir: mcp
 - `default_model`：未通过命令行指定 model 时使用。
 - `provider_dir`：provider 配置文件目录。相对路径基于配置根目录解析。
 - `auth_dir`：M16 后的 OAuth token 文件目录。默认 `auth`，相对路径基于配置根目录解析。
-- `skill_dir`：本地 skill 目录。默认是配置根目录下的 `skills`；相对路径基于配置根目录解析。
-  只发现其直接子目录中包含 `SKILL.md` 的本地 skills。
+- `skill_dirs`：本地 skill 目录列表。默认等价于 `[skills]`；相对路径基于配置根目录解析，
+  绝对路径保持不变。空列表 `[]` 表示不加载本地 skills。多个目录按配置顺序扫描，每个
+  目录只发现其直接子目录中包含 `SKILL.md` 的本地 skills；目录内使用确定性 discovery
+  顺序，跨目录保留配置顺序。重复 skill id 是配置错误。
 - `mcp_dir`：MCP 配置文件目录。M4 后启用；相对路径基于配置根目录解析。
 - `agent.max_turns`：一次 agent loop 最多请求模型的轮数。
 - `agent.stream`：默认是否启用 streaming。
@@ -270,8 +273,10 @@ Codex 后端请求必须显式发送 `store: false`；这是 `openai-codex` runt
 
 ## Skills 配置（M7 后）
 
-本地 skill 目录由 `skill_dir` 指定，默认是配置根目录下的 `skills`。本项目推荐每个
-skill 使用一个直接子目录，并在子目录下放置 `SKILL.md`：
+本地 skill 目录由 `sai.yaml` 的 `skill_dirs` 指定，默认等价于 `skill_dirs: [skills]`。
+每个条目相对配置根目录解析，除非显式写成绝对路径；如果要关闭全部本地 skill 加载，
+使用 `skill_dirs: []`。本项目推荐每个 skill 使用一个直接子目录，并在子目录下放置
+`SKILL.md`：
 
 ```text
 .agents/
@@ -279,6 +284,16 @@ skill 使用一个直接子目录，并在子目录下放置 `SKILL.md`：
     my-skill/
       SKILL.md
 ```
+
+可以配置多个目录：
+
+```yaml
+skill_dirs: [skills, team-skills, /opt/sai/skills]
+```
+
+`sai` 按配置顺序扫描这些目录。每个目录只发现直接子目录中包含 `SKILL.md` 的 skills，
+不递归读取；同一目录内按确定性 discovery 顺序加载，跨目录保留配置的目录顺序。不同
+配置目录中出现重复 skill id 会作为配置错误处理。
 
 `SKILL.md` 可以使用可选 YAML frontmatter：
 
@@ -302,7 +317,7 @@ disable-model-invocation: true
 
 缺失该字段或设置为 `false` 都表示正常加载并注入。
 
-`sai.yaml` 不再配置 skill 选择列表；是否注入某个本地 skill 由其 `SKILL.md`
+`sai.yaml` 不配置 skill 选择或启用列表；是否注入某个本地 skill 由其 `SKILL.md`
 frontmatter 决定。
 
 已加载 skill 的 instructions 会作为 developer message 注入到模型请求中，顺序是：
@@ -311,8 +326,8 @@ frontmatter 决定。
 sai 内置基础约束 > AGENTS.md > loaded skills > 当前用户 prompt
 ```
 
-多个 skill 使用 discovery 的稳定顺序注入。frontmatter 格式错误会让命令失败并指出对应
-`SKILL.md`。
+多个 skill 使用配置目录顺序和目录内确定性 discovery 顺序注入。frontmatter 格式错误会让
+命令失败并指出对应 `SKILL.md`。
 
 ## MCP 配置（M4 后）
 
@@ -462,7 +477,8 @@ usage 摘要。该命令不请求 provider、不写 JSONL 日志，也不打印 
 - provider 文件是否可加载，默认 provider/model 是否能解析。
 - 默认 provider 的 API key 是否配置可用：`$ENV_NAME` 会按 `ResolveModel` 的同一逻辑检查
   环境变量是否存在且非空，直接配置 API key 也算通过。
-- `skill_dir`、`mcp_dir` 是否可加载，discovered skills 是否可解析，以及默认 enabled MCP 是否存在且可选择。
+- `skill_dirs`、`mcp_dir` 是否可加载，discovered skills 是否可解析，重复 skill id 是否报错，
+  以及默认 enabled MCP 是否存在且可选择。
 - `tools.enabled` 中的内置工具是否注册；MCP 工具名是否指向已配置且本次默认启用的 MCP server。
 - `logging.path` 为空时报告 disabled；非空时检查对应 session root/父目录可创建可写，
   不创建真正的 session log 文件，临时探测文件或目录会清理。
