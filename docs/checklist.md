@@ -287,3 +287,22 @@
 - [x] 健康检查输出脱敏，不打印 API key 或其他敏感配置值实际值。
 - [x] 不引入 TUI。
 - [x] 不做 Markdown 渲染。
+
+## M16：Codex OAuth Multi-Provider Login
+
+- [x] 增加 `auth_dir` 配置默认值和路径解析。
+- [x] 配置层识别 `openai-codex` model profile type。
+- [x] provider 配置支持 `auth_file`，并相对 provider YAML 文件解析。
+- [x] `sai auth codex login --provider <name>` 支持 device flow。
+- [x] `sai auth codex login` 默认 provider 名称为 `codex`。
+- [x] `--force` 才允许覆盖已有生成 provider YAML 或 auth token JSON。
+- [x] login 生成 provider YAML 到 `provider_dir`，生成独立 token JSON 到 `auth_dir`。
+- [x] 多个 Codex provider 可以共存并使用独立 auth 文件。
+- [x] `openai-codex` 运行时复用 OpenAI Responses request / SSE / function tool mapping。
+- [x] `openai-codex` 运行时用 auth file access token 发送 bearer auth，不使用 `api_key`。
+- [x] token 文件中存在 account id 时发送 `ChatGPT-Account-Id`。
+- [x] 过期 access token 使用 refresh token 刷新并写回 token 文件。
+- [x] `config show`、verbose、日志和 HTTP 错误不泄露 OAuth token 或 Authorization header。
+- [x] 不读取、不导入 `~/.codex/auth.json`。
+- [x] CLI 测试使用 fake OAuth endpoints 覆盖命名 provider 文件生成。
+- [x] provider 测试覆盖 bearer auth、account id、HTTP 错误脱敏和刷新写回。

@@ -294,6 +294,64 @@ models:
 	}
 }
 
+func TestLoadRecognizesOpenAICodexProvider(t *testing.T) {
+	dir := t.TempDir()
+	providersDir := filepath.Join(dir, "providers")
+	authDir := filepath.Join(dir, "auth")
+	if err := os.MkdirAll(providersDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll(providers) error = %v", err)
+	}
+	if err := os.MkdirAll(authDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll(auth) error = %v", err)
+	}
+
+	writeFile(t, filepath.Join(dir, "sai.yaml"), `default_provider: codex-work
+default_model: gpt-5.5
+provider_dir: providers
+auth_dir: auth
+`)
+	writeFile(t, filepath.Join(providersDir, "codex-work.yaml"), `name: codex-work
+base_url: https://chatgpt.com/backend-api/codex
+auth_file: ../auth/codex-work.json
+
+models:
+  gpt-5.5:
+    id: gpt-5.5
+    type: openai-codex
+    context_window: 400000
+`)
+
+	cfg, err := Load(dir)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.AuthDir != authDir {
+		t.Fatalf("AuthDir = %q, want %q", cfg.AuthDir, authDir)
+	}
+	provider := cfg.Providers["codex-work"]
+	if provider.AuthFile != filepath.Join(authDir, "codex-work.json") {
+		t.Fatalf("AuthFile = %q, want auth file under auth dir", provider.AuthFile)
+	}
+
+	profile := provider.Models["gpt-5.5"]
+	if profile.Type != ProviderTypeOpenAICodex {
+		t.Fatalf("profile.Type = %q, want %q", profile.Type, ProviderTypeOpenAICodex)
+	}
+	resolved, err := cfg.ResolveModel("", "")
+	if err != nil {
+		t.Fatalf("ResolveModel() error = %v", err)
+	}
+	if resolved.Type != ProviderTypeOpenAICodex {
+		t.Fatalf("resolved.Type = %q, want %q", resolved.Type, ProviderTypeOpenAICodex)
+	}
+	if resolved.Provider.ResolvedAPIKey != "" {
+		t.Fatalf("ResolvedAPIKey = %q, want empty for Codex auth provider", resolved.Provider.ResolvedAPIKey)
+	}
+	if resolved.Provider.AuthFile != filepath.Join(authDir, "codex-work.json") {
+		t.Fatalf("resolved AuthFile = %q, want auth file under auth dir", resolved.Provider.AuthFile)
+	}
+}
+
 func TestLoadModelProfileContextWindowAndNestedParameters(t *testing.T) {
 	dir := t.TempDir()
 	providersDir := filepath.Join(dir, "providers")
@@ -386,7 +444,7 @@ models:
 `)
 
 	_, err := Load(dir)
-	assertErrorContains(t, err, `unknown model type "not-openai"`, "supported provider types: anthropic-messages, openai-chat, openai-responses")
+	assertErrorContains(t, err, `unknown model type "not-openai"`, "supported provider types: anthropic-messages, openai-codex, openai-chat, openai-responses")
 }
 
 func TestLoadReadsMCPServerYAMLFiles(t *testing.T) {

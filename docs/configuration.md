@@ -37,6 +37,9 @@ AGENTS.md
   providers/
     paperhub.yaml
     local.yaml
+    codex-work.yaml
+  auth/
+    codex-work.json
   skills/
     my-skill/
       SKILL.md
@@ -68,6 +71,7 @@ MCP 是 M4 后能力，不属于 MVP 必需配置。
 default_provider: paperhub
 default_model: glm-5.2
 provider_dir: providers
+auth_dir: auth
 skill_dir: skills
 
 agent:
@@ -100,6 +104,7 @@ mcp_dir: mcp
 - `default_provider`：未通过命令行指定 provider 时使用。
 - `default_model`：未通过命令行指定 model 时使用。
 - `provider_dir`：provider 配置文件目录。相对路径基于配置根目录解析。
+- `auth_dir`：M16 后的 OAuth token 文件目录。默认 `auth`，相对路径基于配置根目录解析。
 - `skill_dir`：本地 skill 目录。默认是配置根目录下的 `skills`；相对路径基于配置根目录解析。
 - `mcp_dir`：MCP 配置文件目录。M4 后启用；相对路径基于配置根目录解析。
 - `agent.max_turns`：一次 agent loop 最多请求模型的轮数。
@@ -147,12 +152,14 @@ models:
   `anthropic-messages` 使用 Anthropic Messages API base，例如 `https://api.anthropic.com/v1`；
   `openai-responses` 不包含 `/responses`，例如 `https://api.openai.com/v1`。
 - `api_key`：provider 的 API key 配置值，遵循敏感配置值的 `$ENV_NAME` 约定。
+- `auth_file`：M16 后 `openai-codex` provider 使用的 OAuth token JSON 文件路径。相对路径
+  基于 provider YAML 文件所在目录解析；不和 `api_key` 同时用于同一个 model profile。
 - `models`：该 provider 下可选的模型配置。
 - `models.<name>.id`：实际发送给 API 的模型 id。
 - `models.<name>.type`：可选的模型协议/adapter 类型。未配置时默认 `openai-chat`。
-  配置层识别 `openai-chat`、`anthropic-messages` 和 `openai-responses`。`sai chat`
+  配置层识别 `openai-chat`、`anthropic-messages`、`openai-responses` 和 `openai-codex`。`sai chat`
   支持 `openai-chat`、`anthropic-messages` 的文本 streaming 和 tool use，以及
-  `openai-responses` 的文本 streaming 和 function tool calling。
+  `openai-responses` / `openai-codex` 的文本 streaming 和 function tool calling。
 - `models.<name>.context_window`：可选的模型上下文窗口 token 数。未配置时，`sai`
   使用保守估算默认值 `32000`，并把来源记录为 `estimated`；显式配置时来源为
   `configured`。该字段是 `sai` 的本地元数据，不会透传给 provider。
@@ -212,6 +219,37 @@ function_call 事件。`openai-responses` 支持顶层 function `tools`、assist
 `parallel_tool_calls` 等普通 Responses function tool 参数可以透传。custom tools、
 built-in web/code tools、stateful `previous_response_id` 对话续写、reasoning output item
 passthrough 仍是后续项。
+
+Codex subscription auth provider 使用 OAuth token 文件，而不是 API key：
+
+```yaml
+name: codex-work
+base_url: https://chatgpt.com/backend-api/codex
+auth_file: ../auth/codex-work.json
+
+models:
+  gpt-5.5:
+    id: gpt-5.5
+    type: openai-codex
+    context_window: 400000
+```
+
+`sai auth codex login --provider codex-work` 使用 Codex headless device flow 登录，并生成
+`providers/codex-work.yaml` 与 `auth/codex-work.json`。默认 provider 名称是 `codex`。
+`--force` 可以覆盖已有的生成文件；未传 `--force` 时，只要目标 provider YAML 或 token
+JSON 已存在，命令会在开始登录前失败。多个 provider 使用多个独立 auth 文件，因此
+`codex`、`codex-work` 和 `codex-personal` 可以共存并分别刷新 token。
+默认登录流程会向 issuer 的 `/api/accounts/deviceauth/usercode` 请求用户码，轮询
+`/api/accounts/deviceauth/token` 取得 `authorization_code` 和 `code_verifier`，再向
+`/oauth/token` 交换 access / refresh token；测试或私有部署可通过登录命令的 endpoint flags
+指向 fake issuer。
+
+`openai-codex` 运行时复用 OpenAI Responses adapter 的 request、SSE 和 function tool
+mapping，请求 `<base_url>/responses`。它从 `auth_file` 读取 access token，发送
+`Authorization: Bearer <access>`；token 文件中存在 account id 时，同时发送
+`ChatGPT-Account-Id`。access token 过期时，运行时使用 refresh token 刷新并写回同一
+auth 文件。token 文件内容不会出现在 `sai config show`、verbose、日志或 HTTP 错误中。
+M16 不读取、不迁移、不导入 `~/.codex/auth.json`。
 
 `api_key` 是这次 provider 配置中的具体字段。其他需要脱敏的敏感配置值也可以采用同样
 约定：字符串以 `$` 开头时，`$` 后面的内容作为环境变量名读取实际值；不以 `$` 开头时

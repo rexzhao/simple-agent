@@ -513,3 +513,36 @@ stdout 上的 `OK` / `WARN` / `ERROR` 行，任何 `ERROR` 都让退出码为 1�
 - 测试覆盖健康检查不泄露敏感配置值。
 - `go test ./...` 通过。
 - `git diff --check` 通过。
+
+## M16：Codex OAuth Multi-Provider Login
+
+目标：支持 Codex subscription auth 的多 provider 登录和运行时调用，同时继续保持纯 CLI、
+不读取用户目录里的 Codex 文件、不引入浏览器回调或无关功能。
+
+交付物：
+
+- 增加 `auth_dir` 配置，默认指向配置根目录下的 `auth`。
+- 配置层识别 `openai-codex` model profile type。
+- provider 配置支持 `auth_file`，相对 provider YAML 文件解析。
+- `sai auth codex login --provider <name>` 使用 device flow 创建命名 provider。
+- 默认 provider 名称是 `codex`。
+- `--force` 才允许覆盖已有生成 provider YAML 或 auth token JSON；未传时开始登录前失败。
+- login 生成 provider YAML 到 `provider_dir`，生成独立 token JSON 到 `auth_dir`。
+- `codex`、`codex-work` 和 `codex-personal` 等 provider 可以共存，互不覆盖 token 文件。
+- `openai-codex` 运行时复用 OpenAI Responses request / SSE / function tool mapping。
+- `openai-codex` 运行时用 `auth_file` 中的 access token 发送 bearer auth，不使用 `api_key`。
+- token 文件中存在 account id 时发送 `ChatGPT-Account-Id`。
+- access token 过期时用 refresh token 刷新，并写回同一 token 文件。
+- `config show`、verbose、日志和 HTTP 错误不泄露 access token、refresh token 或
+  Authorization header。
+- 不读取、不导入 `~/.codex/auth.json`。
+
+验证：
+
+- `sai auth codex login -h` 和 `sai help auth codex login` 不加载 provider secrets。
+- CLI 测试使用 fake device/token endpoints，验证命名 provider 的 provider/auth 文件生成。
+- 配置测试覆盖 `openai-codex` type、`auth_dir` 和 provider `auth_file` 解析。
+- provider 测试覆盖 `Authorization: Bearer <access>`、`ChatGPT-Account-Id`、HTTP 错误脱敏
+  和过期 token refresh 写回。
+- 既有 `openai-responses` 测试继续不变。
+- `gofmt`、`go test ./...` 和 `git diff --check` 通过。

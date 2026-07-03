@@ -16,13 +16,24 @@ import (
 type ProviderConfig struct {
 	BaseURL     string
 	APIKey      string
+	TokenSource TokenSource
 	HTTPClient  *http.Client
 	HTTPOptions httpstream.Options
+}
+
+type TokenSource interface {
+	AccessToken(ctx context.Context) (AccessToken, error)
+}
+
+type AccessToken struct {
+	Token     string
+	AccountID string
 }
 
 type Provider struct {
 	baseURL     string
 	apiKey      string
+	tokenSource TokenSource
 	httpClient  *http.Client
 	httpOptions httpstream.Options
 }
@@ -43,13 +54,14 @@ func NewProvider(config ProviderConfig) (*Provider, error) {
 	return &Provider{
 		baseURL:     baseURL,
 		apiKey:      strings.TrimSpace(config.APIKey),
+		tokenSource: config.TokenSource,
 		httpClient:  httpClient,
 		httpOptions: config.HTTPOptions,
 	}, nil
 }
 
 func (p *Provider) Stream(ctx context.Context, request model.Request) (<-chan model.Event, error) {
-	apiKey, err := p.apiKeyValue()
+	token, err := p.authToken(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -64,11 +76,14 @@ func (p *Provider) Stream(ctx context.Context, request model.Request) (<-chan mo
 		if err != nil {
 			return nil, fmt.Errorf("create OpenAI Responses request: %w", err)
 		}
-		httpRequest.Header.Set("Authorization", "Bearer "+apiKey)
+		httpRequest.Header.Set("Authorization", "Bearer "+token.Token)
+		if token.AccountID != "" {
+			httpRequest.Header.Set("ChatGPT-Account-Id", token.AccountID)
+		}
 		httpRequest.Header.Set("Content-Type", "application/json")
 		return httpRequest, nil
 	}, func(body io.Reader) string {
-		return httpstream.ReadErrorBody(body, apiKey)
+		return httpstream.ReadErrorBody(body, token.Token)
 	})
 	if err != nil {
 		if _, ok := err.(*httpstream.StatusError); ok {
@@ -86,11 +101,21 @@ func (p *Provider) Stream(ctx context.Context, request model.Request) (<-chan mo
 	return events, nil
 }
 
-func (p *Provider) apiKeyValue() (string, error) {
-	if p.apiKey != "" {
-		return p.apiKey, nil
+func (p *Provider) authToken(ctx context.Context) (AccessToken, error) {
+	if p.tokenSource != nil {
+		token, err := p.tokenSource.AccessToken(ctx)
+		if err != nil {
+			return AccessToken{}, err
+		}
+		if strings.TrimSpace(token.Token) == "" {
+			return AccessToken{}, fmt.Errorf("access token is required")
+		}
+		return token, nil
 	}
-	return "", fmt.Errorf("API key is required")
+	if p.apiKey != "" {
+		return AccessToken{Token: p.apiKey}, nil
+	}
+	return AccessToken{}, fmt.Errorf("API key is required")
 }
 
 func streamResponseEvents(ctx context.Context, body io.Reader, idleTimeout time.Duration, events chan<- model.Event, toolNames *toolNameMapper) {

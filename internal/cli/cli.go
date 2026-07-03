@@ -11,10 +11,12 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/rexzhao/simple-agent/internal/agent"
+	"github.com/rexzhao/simple-agent/internal/codexauth"
 	"github.com/rexzhao/simple-agent/internal/config"
 	projectcontext "github.com/rexzhao/simple-agent/internal/context"
 	"github.com/rexzhao/simple-agent/internal/contextwindow"
@@ -114,6 +116,8 @@ func execute(ctx context.Context, args []string, stdin io.Reader, stdout, stderr
 		return modelsListCommand(subArgs, rootArgs.configDir, stdout, getwd)
 	case "doctor":
 		return doctorCommand(rootArgs.commandArgs, rootArgs.configDir, stdout, getwd)
+	case "auth":
+		return authCommand(ctx, rootArgs.commandArgs, rootArgs.configDir, stdout, getwd)
 	case "tools":
 		subcommand, subArgs, groupHelp, err := splitSubcommandArgs(rootArgs.commandArgs, nil, "sai help tools")
 		if err != nil {
@@ -174,6 +178,7 @@ Commands:
   chat              Start a chat session
   config show        Print resolved config with secrets redacted
   models list        List configured provider model profiles
+  auth               Manage provider authentication
   doctor            Check local configuration health
   tools list         List built-in tools
   mcp list           List configured MCP servers
@@ -234,6 +239,28 @@ Checks local configuration files, default model selection, enabled local tools,
 skills, MCP server configuration, and JSONL log directory writability without
 sending provider HTTP requests, starting MCP servers, running a model, or
 printing secrets.
+`
+
+const authUsageText = `usage: sai auth <command>
+
+Commands:
+  auth codex login   Create or refresh a Codex OAuth provider
+
+Run "sai help auth codex login" for command usage.
+`
+
+const authCodexUsageText = `usage: sai auth codex <command>
+
+Commands:
+  auth codex login   Create or refresh a Codex OAuth provider
+
+Run "sai help auth codex login" for command usage.
+`
+
+const authCodexLoginUsageText = `usage: sai auth codex login [--provider name] [--force] [--issuer-url url | --user-code-url url --device-token-url url --token-url url] [--base-url url] [--model id] [--context-window tokens]
+
+Uses OAuth device flow to create a Codex provider YAML in provider_dir and an
+independent token JSON in auth_dir. The default provider name is codex.
 `
 
 const toolsUsageText = `usage: sai tools <command>
@@ -317,6 +344,12 @@ func helpCommand(args []string, stdout io.Writer) error {
 		printModelsListUsage(stdout)
 	case "doctor":
 		printDoctorUsage(stdout)
+	case "auth":
+		printAuthUsage(stdout)
+	case "auth codex":
+		printAuthCodexUsage(stdout)
+	case "auth codex login":
+		printAuthCodexLoginUsage(stdout)
 	case "tools":
 		printToolsUsage(stdout)
 	case "tools list":
@@ -371,6 +404,18 @@ func printModelsListUsage(stdout io.Writer) {
 
 func printDoctorUsage(stdout io.Writer) {
 	fmt.Fprint(stdout, doctorUsageText)
+}
+
+func printAuthUsage(stdout io.Writer) {
+	fmt.Fprint(stdout, authUsageText)
+}
+
+func printAuthCodexUsage(stdout io.Writer) {
+	fmt.Fprint(stdout, authCodexUsageText)
+}
+
+func printAuthCodexLoginUsage(stdout io.Writer) {
+	fmt.Fprint(stdout, authCodexLoginUsageText)
 }
 
 func printToolsUsage(stdout io.Writer) {
@@ -688,6 +733,168 @@ func doctorCommand(args []string, configDir string, stdout io.Writer, getwd func
 	return nil
 }
 
+func authCommand(ctx context.Context, args []string, configDir string, stdout io.Writer, getwd func() (string, error)) error {
+	if len(args) == 0 || containsHelpArg(args) && len(args) == 1 {
+		printAuthUsage(stdout)
+		return nil
+	}
+	if args[0] != "codex" {
+		return usageError("usage: sai auth codex login", "", "sai help auth")
+	}
+	return authCodexCommand(ctx, args[1:], configDir, stdout, getwd)
+}
+
+func authCodexCommand(ctx context.Context, args []string, configDir string, stdout io.Writer, getwd func() (string, error)) error {
+	if len(args) == 0 || containsHelpArg(args) && len(args) == 1 {
+		printAuthCodexUsage(stdout)
+		return nil
+	}
+	if args[0] != "login" {
+		return usageError("usage: sai auth codex login", "", "sai help auth codex")
+	}
+	return authCodexLoginCommand(ctx, args[1:], configDir, stdout, getwd)
+}
+
+func authCodexLoginCommand(ctx context.Context, args []string, configDir string, stdout io.Writer, getwd func() (string, error)) error {
+	flags := flag.NewFlagSet("sai auth codex login", flag.ContinueOnError)
+	providerName := flags.String("provider", "codex", "provider name")
+	force := flags.Bool("force", false, "overwrite generated provider and auth files")
+	issuerURL := flags.String("issuer-url", codexauth.DefaultIssuerURL, "OAuth issuer URL")
+	userCodeURL := flags.String("user-code-url", "", "Codex headless auth user code endpoint URL")
+	deviceTokenURL := flags.String("device-token-url", "", "Codex headless auth polling endpoint URL")
+	tokenURL := flags.String("token-url", "", "OAuth token exchange endpoint URL")
+	redirectURI := flags.String("redirect-uri", "", "OAuth authorization-code redirect URI")
+	clientID := flags.String("client-id", codexauth.DefaultClientID, "OAuth client id")
+	scope := flags.String("scope", codexauth.DefaultScope, "OAuth scope")
+	baseURL := flags.String("base-url", codexauth.DefaultBaseURL, "Codex API base URL")
+	modelID := flags.String("model", codexauth.DefaultModelID(), "default Codex model id")
+	contextWindow := flags.Int("context-window", 400000, "model context window")
+	pollInterval := flags.Duration("poll-interval", 0, "device flow polling interval")
+	positionals, done, err := parseCommandFlagArgs(flags, args, stdout, printAuthCodexLoginUsage, "sai help auth codex login")
+	if done || err != nil {
+		return err
+	}
+	if len(positionals) != 0 {
+		return usageError("usage: sai auth codex login", "", "sai help auth codex login")
+	}
+	name := strings.TrimSpace(*providerName)
+	if err := validateGeneratedProviderName(name); err != nil {
+		return err
+	}
+	if *contextWindow <= 0 {
+		return fmt.Errorf("--context-window must be a positive integer")
+	}
+
+	cfg, err := loadBaseConfig(configDir, getwd)
+	if err != nil {
+		return err
+	}
+	providerPath := filepath.Join(cfg.ProviderDir, name+".yaml")
+	authPath := filepath.Join(cfg.AuthDir, name+".json")
+	if !*force {
+		if err := failIfAnyExists(providerPath, authPath); err != nil {
+			return err
+		}
+	}
+
+	resolvedUserCodeURL := strings.TrimSpace(*userCodeURL)
+	resolvedDeviceTokenURL := strings.TrimSpace(*deviceTokenURL)
+	resolvedTokenURL := strings.TrimSpace(*tokenURL)
+	resolvedRedirectURI := strings.TrimSpace(*redirectURI)
+	if resolvedUserCodeURL == "" {
+		resolvedUserCodeURL = codexauth.UserCodeURLForIssuer(*issuerURL)
+	}
+	if resolvedDeviceTokenURL == "" {
+		resolvedDeviceTokenURL = codexauth.DeviceTokenURLForIssuer(*issuerURL)
+	}
+	if resolvedTokenURL == "" {
+		resolvedTokenURL = codexauth.TokenURLForIssuer(*issuerURL)
+	}
+	if resolvedRedirectURI == "" {
+		resolvedRedirectURI = codexauth.RedirectURIForIssuer(*issuerURL)
+	}
+	result, err := codexauth.DeviceLogin(ctx, codexauth.DeviceLoginOptions{
+		UserCodeURL:    resolvedUserCodeURL,
+		DeviceTokenURL: resolvedDeviceTokenURL,
+		TokenURL:       resolvedTokenURL,
+		RedirectURI:    resolvedRedirectURI,
+		ClientID:       *clientID,
+		Scope:          *scope,
+		Output:         stdout,
+		PollInterval:   *pollInterval,
+	})
+	if err != nil {
+		return err
+	}
+	token := result.Token
+	token.TokenURL = resolvedTokenURL
+	token.ClientID = strings.TrimSpace(*clientID)
+	if err := (codexauth.Store{Path: authPath}).Save(token); err != nil {
+		return err
+	}
+	if err := writeCodexProviderFile(providerPath, authPath, name, *baseURL, *modelID, *contextWindow); err != nil {
+		return err
+	}
+	fmt.Fprintf(stdout, "Saved provider %q to %s\n", name, providerPath)
+	fmt.Fprintf(stdout, "Saved Codex auth token to %s\n", authPath)
+	return nil
+}
+
+func loadBaseConfig(configDir string, getwd func() (string, error)) (*config.Config, error) {
+	if configDir == "" {
+		cwd, err := getwd()
+		if err != nil {
+			return nil, fmt.Errorf("get current directory: %w", err)
+		}
+		configDir = filepath.Join(cwd, ".agents")
+	}
+	return config.LoadBase(configDir)
+}
+
+func validateGeneratedProviderName(name string) error {
+	if name == "" {
+		return fmt.Errorf("--provider is required")
+	}
+	for _, char := range name {
+		switch {
+		case char >= 'a' && char <= 'z':
+		case char >= 'A' && char <= 'Z':
+		case char >= '0' && char <= '9':
+		case char == '-' || char == '_':
+		default:
+			return fmt.Errorf("--provider may contain only letters, digits, hyphen, and underscore")
+		}
+	}
+	return nil
+}
+
+func failIfAnyExists(paths ...string) error {
+	for _, path := range paths {
+		if _, err := os.Stat(path); err == nil {
+			return fmt.Errorf("%s already exists; pass --force to overwrite", path)
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("check %s: %w", path, err)
+		}
+	}
+	return nil
+}
+
+func writeCodexProviderFile(providerPath, authPath, providerName, baseURL, modelID string, contextWindow int) error {
+	if err := os.MkdirAll(filepath.Dir(providerPath), 0o755); err != nil {
+		return fmt.Errorf("create provider dir: %w", err)
+	}
+	relAuthPath, err := filepath.Rel(filepath.Dir(providerPath), authPath)
+	if err != nil {
+		relAuthPath = authPath
+	}
+	relAuthPath = filepath.ToSlash(relAuthPath)
+	data := fmt.Sprintf("name: %s\nbase_url: %s\nauth_file: %s\n\nmodels:\n  %s:\n    id: %s\n    type: openai-codex\n    context_window: %s\n", providerName, strings.TrimSpace(baseURL), relAuthPath, modelID, modelID, strconv.Itoa(contextWindow))
+	if err := os.WriteFile(providerPath, []byte(data), 0o600); err != nil {
+		return fmt.Errorf("write provider file %q: %w", providerPath, err)
+	}
+	return nil
+}
+
 type doctorStatus string
 
 const (
@@ -765,6 +972,18 @@ func checkDoctorDefaultModel(cfg *config.Config, add func(doctorStatus, string, 
 		return
 	}
 	add(doctorStatusOK, "default_model", fmt.Sprintf("%s/%s -> %s", resolved.ProviderName, resolved.Profile, resolved.ModelID))
+	if resolved.Type == config.ProviderTypeOpenAICodex {
+		if strings.TrimSpace(resolved.Provider.AuthFile) == "" {
+			add(doctorStatusError, "auth_file", fmt.Sprintf("provider %q has no auth_file configured", resolved.ProviderName))
+			return
+		}
+		if _, err := os.Stat(resolved.Provider.AuthFile); err != nil {
+			add(doctorStatusError, "auth_file", fmt.Sprintf("%s: %v", resolved.Provider.AuthFile, err))
+			return
+		}
+		add(doctorStatusOK, "auth_file", fmt.Sprintf("provider %q configured", resolved.ProviderName))
+		return
+	}
 	if strings.TrimSpace(resolved.Provider.ResolvedAPIKey) == "" {
 		add(doctorStatusError, "api_key", fmt.Sprintf("provider %q has no api_key configured", resolved.ProviderName))
 		return
@@ -2315,6 +2534,8 @@ func newProviderForRun(providerName, modelType string, provider config.ProviderC
 		return openaichat.NewProvider(openAIChatProviderConfig(provider))
 	case config.ProviderTypeOpenAIResponses:
 		return openairesponses.NewProvider(openAIResponsesProviderConfig(provider))
+	case config.ProviderTypeOpenAICodex:
+		return openairesponses.NewProvider(openAICodexProviderConfig(provider))
 	case config.ProviderTypeAnthropicMessages:
 		return anthropicmessages.NewProvider(anthropicMessagesProviderConfig(provider))
 	default:
@@ -2336,11 +2557,34 @@ func openAIResponsesProviderConfig(provider config.ProviderConfig) openairespons
 	}
 }
 
+func openAICodexProviderConfig(provider config.ProviderConfig) openairesponses.ProviderConfig {
+	return openairesponses.ProviderConfig{
+		BaseURL: provider.BaseURL,
+		TokenSource: codexResponsesTokenSource{
+			source: &codexauth.TokenSource{
+				Store: codexauth.Store{Path: provider.AuthFile},
+			},
+		},
+	}
+}
+
 func anthropicMessagesProviderConfig(provider config.ProviderConfig) anthropicmessages.ProviderConfig {
 	return anthropicmessages.ProviderConfig{
 		BaseURL: provider.BaseURL,
 		APIKey:  provider.ResolvedAPIKey,
 	}
+}
+
+type codexResponsesTokenSource struct {
+	source *codexauth.TokenSource
+}
+
+func (s codexResponsesTokenSource) AccessToken(ctx context.Context) (openairesponses.AccessToken, error) {
+	token, err := s.source.AccessToken(ctx)
+	if err != nil {
+		return openairesponses.AccessToken{}, err
+	}
+	return openairesponses.AccessToken{Token: token.Token, AccountID: token.AccountID}, nil
 }
 
 func chatBaseMessages(project projectcontext.Project, enabledSkills []localskills.Skill) []model.Message {

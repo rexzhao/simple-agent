@@ -18,6 +18,7 @@ type Config struct {
 	DefaultProvider string                     `json:"default_provider" yaml:"default_provider"`
 	DefaultModel    string                     `json:"default_model" yaml:"default_model"`
 	ProviderDir     string                     `json:"provider_dir" yaml:"provider_dir"`
+	AuthDir         string                     `json:"auth_dir" yaml:"auth_dir"`
 	SkillDir        string                     `json:"skill_dir" yaml:"skill_dir"`
 	Agent           AgentConfig                `json:"agent" yaml:"agent"`
 	Tools           ToolsConfig                `json:"tools" yaml:"tools"`
@@ -32,6 +33,7 @@ type Config struct {
 const (
 	ProviderTypeOpenAIChat        = "openai-chat"
 	ProviderTypeOpenAIResponses   = "openai-responses"
+	ProviderTypeOpenAICodex       = "openai-codex"
 	ProviderTypeAnthropicMessages = "anthropic-messages"
 )
 
@@ -64,6 +66,7 @@ type ProviderConfig struct {
 	Name           string                  `json:"name" yaml:"name"`
 	BaseURL        string                  `json:"base_url" yaml:"base_url"`
 	APIKey         string                  `json:"api_key" yaml:"api_key"`
+	AuthFile       string                  `json:"auth_file,omitempty" yaml:"auth_file,omitempty"`
 	ResolvedAPIKey string                  `json:"-" yaml:"-"`
 	Models         map[string]ModelProfile `json:"models" yaml:"models"`
 }
@@ -94,20 +97,22 @@ type ResolvedModel struct {
 
 func (p ProviderConfig) MarshalJSON() ([]byte, error) {
 	type providerJSON struct {
-		Name    string                  `json:"name"`
-		BaseURL string                  `json:"base_url"`
-		APIKey  string                  `json:"api_key"`
-		Models  map[string]ModelProfile `json:"models"`
+		Name     string                  `json:"name"`
+		BaseURL  string                  `json:"base_url"`
+		APIKey   string                  `json:"api_key"`
+		AuthFile string                  `json:"auth_file,omitempty"`
+		Models   map[string]ModelProfile `json:"models"`
 	}
 
 	var buf bytes.Buffer
 	encoder := json.NewEncoder(&buf)
 	encoder.SetEscapeHTML(false)
 	if err := encoder.Encode(providerJSON{
-		Name:    p.Name,
-		BaseURL: p.BaseURL,
-		APIKey:  redactedSecretValue(p.APIKey),
-		Models:  p.Models,
+		Name:     p.Name,
+		BaseURL:  p.BaseURL,
+		APIKey:   redactedSecretValue(p.APIKey),
+		AuthFile: p.AuthFile,
+		Models:   p.Models,
 	}); err != nil {
 		return nil, err
 	}
@@ -157,6 +162,7 @@ func LoadBase(configDir string) (*Config, error) {
 
 	cfg.ConfigDir = absConfigDir
 	cfg.ProviderDir = resolvePath(absConfigDir, cfg.ProviderDir)
+	cfg.AuthDir = resolvePath(absConfigDir, cfg.AuthDir)
 	cfg.SkillDir = resolvePath(absConfigDir, cfg.SkillDir)
 	if cfg.Logging.Path != "" {
 		cfg.Logging.Path = resolvePath(absConfigDir, cfg.Logging.Path)
@@ -207,11 +213,13 @@ func (c *Config) ResolveModel(providerName, modelName string) (ResolvedModel, er
 	window := contextwindow.ResolveWindow(profile.ContextWindow)
 
 	resolvedProvider := copyProvider(provider)
-	apiKey, err := resolveAPIKey(provider.APIKey)
-	if err != nil {
-		return ResolvedModel{}, fmt.Errorf("resolve api_key for provider %q: %w", providerName, err)
+	if modelType != ProviderTypeOpenAICodex {
+		apiKey, err := resolveAPIKey(provider.APIKey)
+		if err != nil {
+			return ResolvedModel{}, fmt.Errorf("resolve api_key for provider %q: %w", providerName, err)
+		}
+		resolvedProvider.ResolvedAPIKey = apiKey
 	}
-	resolvedProvider.ResolvedAPIKey = apiKey
 
 	return ResolvedModel{
 		ProviderName:        providerName,
@@ -394,6 +402,7 @@ func parseContextWindow(value any) (int, error) {
 func defaultConfig() Config {
 	return Config{
 		ProviderDir: "providers",
+		AuthDir:     "auth",
 		SkillDir:    "skills",
 		Agent: AgentConfig{
 			MaxTurns: defaultAgentMaxTurns,
@@ -450,7 +459,7 @@ func loadProviders(providerDir string) (map[string]ProviderConfig, error) {
 		if err := yaml.Unmarshal(data, &provider); err != nil {
 			return nil, fmt.Errorf("parse provider file %q: %w", path, err)
 		}
-		provider = normalizeProvider(provider)
+		provider = normalizeProvider(provider, filepath.Dir(path))
 		if err := validateProvider(path, provider); err != nil {
 			return nil, err
 		}
@@ -473,12 +482,19 @@ func validateProvider(path string, provider ProviderConfig) error {
 		if profile.Type != "" && !isKnownProviderType(profile.Type) {
 			return fmt.Errorf("provider file %q model %q has unknown model type %q; supported provider types: %s", path, profileName, profile.Type, formatSupportedProviderTypes())
 		}
+		if strings.TrimSpace(profile.Type) == ProviderTypeOpenAICodex && strings.TrimSpace(provider.AuthFile) == "" {
+			return fmt.Errorf("provider file %q model %q uses %s but auth_file is missing", path, profileName, ProviderTypeOpenAICodex)
+		}
 	}
 	return nil
 }
 
-func normalizeProvider(provider ProviderConfig) ProviderConfig {
+func normalizeProvider(provider ProviderConfig, providerFileDir string) ProviderConfig {
 	provider.Name = strings.TrimSpace(provider.Name)
+	provider.AuthFile = strings.TrimSpace(provider.AuthFile)
+	if provider.AuthFile != "" {
+		provider.AuthFile = resolvePath(providerFileDir, provider.AuthFile)
+	}
 	for profileName, profile := range provider.Models {
 		profile.ID = strings.TrimSpace(profile.ID)
 		profile.Type = strings.TrimSpace(profile.Type)
@@ -500,7 +516,7 @@ func resolveModelType(providerName, modelName, modelType string) (string, error)
 
 func isKnownProviderType(providerType string) bool {
 	switch providerType {
-	case ProviderTypeAnthropicMessages, ProviderTypeOpenAIChat, ProviderTypeOpenAIResponses:
+	case ProviderTypeAnthropicMessages, ProviderTypeOpenAIChat, ProviderTypeOpenAICodex, ProviderTypeOpenAIResponses:
 		return true
 	default:
 		return false
@@ -508,7 +524,7 @@ func isKnownProviderType(providerType string) bool {
 }
 
 func formatSupportedProviderTypes() string {
-	return strings.Join([]string{ProviderTypeAnthropicMessages, ProviderTypeOpenAIChat, ProviderTypeOpenAIResponses}, ", ")
+	return strings.Join([]string{ProviderTypeAnthropicMessages, ProviderTypeOpenAICodex, ProviderTypeOpenAIChat, ProviderTypeOpenAIResponses}, ", ")
 }
 
 func isYAMLFile(name string) bool {

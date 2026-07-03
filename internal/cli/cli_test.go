@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -169,6 +170,122 @@ func TestToolsListWritesBuiltInToolsWithoutConfig(t *testing.T) {
 				t.Fatalf("stdout = %q, want %q", got, want)
 			}
 		})
+	}
+}
+
+func TestAuthCodexLoginHelpDoesNotLoadConfig(t *testing.T) {
+	for _, args := range [][]string{
+		{"auth", "codex", "login", "-h"},
+		{"help", "auth", "codex", "login"},
+	} {
+		t.Run(strings.Join(args, " "), func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			code := RunWithGetwd(args, &stdout, &stderr, func() (string, error) {
+				return "", errors.New("getwd should not be called")
+			})
+			if code != 0 {
+				t.Fatalf("RunWithGetwd() code = %d, stderr = %s", code, stderr.String())
+			}
+			if stderr.String() != "" {
+				t.Fatalf("stderr = %q, want empty", stderr.String())
+			}
+			if !strings.Contains(stdout.String(), "usage: sai auth codex login") {
+				t.Fatalf("stdout = %q, want auth codex login usage", stdout.String())
+			}
+		})
+	}
+}
+
+func TestAuthCodexLoginGeneratesNamedProviderAndAuthFile(t *testing.T) {
+	configDir := t.TempDir()
+	writeCLIFile(t, filepath.Join(configDir, "sai.yaml"), `default_provider: codex-work
+default_model: gpt-5.5
+provider_dir: providers
+auth_dir: auth
+`)
+	tokenRequests := make(chan url.Values, 2)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := r.ParseForm(); err != nil {
+			t.Fatalf("ParseForm() error = %v", err)
+		}
+		switch r.URL.Path {
+		case "/api/accounts/deviceauth/usercode":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"user_code":"USER-123","verification_uri":"https://example.test/device","interval":1,"expires_in":600}`)
+		case "/api/accounts/deviceauth/token":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"authorization_code":"auth-code-123","code_verifier":"verifier-123"}`)
+		case "/oauth/token":
+			tokenRequests <- r.PostForm
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"access_token":"codex-access","refresh_token":"codex-refresh","expires_in":3600,"account_id":"account-123","token_type":"Bearer"}`)
+		default:
+			t.Fatalf("unexpected path %q", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	var stdout, stderr bytes.Buffer
+	code := RunWithGetwd([]string{
+		"--config-dir", configDir,
+		"auth", "codex", "login",
+		"--provider", "codex-work",
+		"--issuer-url", server.URL,
+		"--base-url", "https://codex.example.test/backend",
+		"--poll-interval", "1ms",
+	}, &stdout, &stderr, func() (string, error) {
+		return "unused", nil
+	})
+
+	if code != 0 {
+		t.Fatalf("RunWithGetwd() code = %d, stderr = %s", code, stderr.String())
+	}
+	if stderr.String() != "" {
+		t.Fatalf("stderr = %q, want empty", stderr.String())
+	}
+	for _, want := range []string{"Open https://example.test/device and enter code USER-123", "Saved provider \"codex-work\"", "Saved Codex auth token"} {
+		if !strings.Contains(stdout.String(), want) {
+			t.Fatalf("stdout missing %q:\n%s", want, stdout.String())
+		}
+	}
+
+	providerData, err := os.ReadFile(filepath.Join(configDir, "providers", "codex-work.yaml"))
+	if err != nil {
+		t.Fatalf("ReadFile(provider) error = %v", err)
+	}
+	providerText := string(providerData)
+	for _, want := range []string{
+		"name: codex-work",
+		"base_url: https://codex.example.test/backend",
+		"auth_file: ../auth/codex-work.json",
+		"type: openai-codex",
+		"context_window: 400000",
+	} {
+		if !strings.Contains(providerText, want) {
+			t.Fatalf("provider file missing %q:\n%s", want, providerText)
+		}
+	}
+
+	authData, err := os.ReadFile(filepath.Join(configDir, "auth", "codex-work.json"))
+	if err != nil {
+		t.Fatalf("ReadFile(auth) error = %v", err)
+	}
+	var token map[string]any
+	if err := json.Unmarshal(authData, &token); err != nil {
+		t.Fatalf("Unmarshal(auth) error = %v", err)
+	}
+	if token["access_token"] != "codex-access" || token["refresh_token"] != "codex-refresh" || token["account_id"] != "account-123" {
+		t.Fatalf("auth token = %#v, want generated token values", token)
+	}
+	if token["token_url"] != server.URL+"/oauth/token" {
+		t.Fatalf("token_url = %#v, want fake token URL", token["token_url"])
+	}
+	form := <-tokenRequests
+	if form.Get("grant_type") != "authorization_code" ||
+		form.Get("code") != "auth-code-123" ||
+		form.Get("code_verifier") != "verifier-123" ||
+		form.Get("redirect_uri") != server.URL+"/deviceauth/callback" {
+		t.Fatalf("token request form = %#v", form)
 	}
 }
 
@@ -4939,7 +5056,7 @@ func TestRunErrorsDoNotLeakAPIKeyValues(t *testing.T) {
 		if code != 1 {
 			t.Fatalf("RunWithGetwd() code = %d, want 1", code)
 		}
-		assertCLIErrorContains(t, stderr.String(), `unknown model type "not-openai"`, "supported provider types: anthropic-messages, openai-chat, openai-responses")
+		assertCLIErrorContains(t, stderr.String(), `unknown model type "not-openai"`, "supported provider types: anthropic-messages, openai-codex, openai-chat, openai-responses")
 		assertCLIErrorOmits(t, stderr.String(), "direct-secret-value")
 	})
 }

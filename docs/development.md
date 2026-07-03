@@ -29,6 +29,9 @@
   和 tool use runtime adapter。
 - M6 已为 OpenAI Responses 添加 model profile type 配置识别、文本 input mapping、
   semantic text streaming adapter，以及 function tools / function_call_output tool loop adapter。
+- M16 为 Codex subscription auth 增加独立的 OAuth token 文件和 `openai-codex`
+  model profile type；运行时复用 OpenAI Responses request / SSE / tool-call mapping，
+  但用 provider 的 `auth_file` 读取和刷新 bearer token，而不是读取 `api_key`。
 - MCP 不属于 MVP 核心；后续接入时第一种传输只做 stdio。
 - 配置根目录默认是启动时当前工作目录下的 `.agents`，也可以通过 `--config-dir` 指定。
 - 默认读取启动目录下的 `AGENTS.md` 作为项目指令；文件不存在时继续执行。
@@ -163,6 +166,7 @@ sai sessions list
 sai sessions show <id>
 sai sessions delete <id>
 sai sessions prune --keep 10
+sai auth codex login --provider codex-work
 sai tools list
 sai models list
 sai config show
@@ -353,6 +357,7 @@ ID、更新时间、provider 和 model/profile 等元数据；`show` 只输出 s
 default_provider: paperhub
 default_model: glm-5.2
 provider_dir: providers
+auth_dir: auth
 skill_dir: skills
 
 agent:
@@ -393,9 +398,9 @@ models:
 ```
 
 model profile 的 `type` 是协议/adapter 类型，未配置时默认 `openai-chat`。配置层识别
-`openai-chat`、`anthropic-messages` 和 `openai-responses`。当前 `sai chat` 支持
+`openai-chat`、`anthropic-messages`、`openai-responses` 和 `openai-codex`。当前 `sai chat` 支持
 `openai-chat`，也支持 `anthropic-messages` 的文本 streaming 和 tool use，并支持
-`openai-responses` 的文本 streaming 和 function tool calling。`id`、`type` 和
+`openai-responses` / `openai-codex` 的文本 streaming 和 function tool calling。`id`、`type` 和
 `context_window` 是本地元数据，不会作为请求参数透传。
 
 ```yaml
@@ -436,6 +441,30 @@ adapter 会把 legacy `max_tokens` 请求参数映射为 `max_output_tokens`；�
 Responses function tool 参数可以透传。custom tools、built-in web/code tools、
 stateful `previous_response_id` 对话续写、reasoning output item passthrough 仍是后续项。
 
+`openai-codex` 使用同一套 Responses request / SSE / function tool 转换，但 provider
+配置使用 `auth_file` 而不是 `api_key`：
+
+```yaml
+name: codex-work
+base_url: https://chatgpt.com/backend-api/codex
+auth_file: ../auth/codex-work.json
+
+models:
+  gpt-5.5:
+    id: gpt-5.5
+    type: openai-codex
+    context_window: 400000
+```
+
+`auth_file` 相对 provider YAML 文件解析，推荐指向配置根目录下的 `auth/`。`sai auth
+codex login --provider codex-work` 会生成或更新 `providers/codex-work.yaml` 和独立的
+`auth/codex-work.json`，因此 `codex`、`codex-work` 和 `codex-personal` 可以共存。token
+文件包含 OAuth access / refresh token，属于敏感数据；`sai config show`、verbose 和日志
+不能打印其中的 token。access token 过期时运行时用 refresh token 刷新，并写回同一
+auth 文件。M16 不读取或导入 `~/.codex/auth.json`；首版登录使用 Codex headless device
+flow：`/api/accounts/deviceauth/usercode`、`/api/accounts/deviceauth/token` 和
+`/oauth/token` authorization-code exchange，不实现浏览器 OAuth 回调。
+
 命令行参数覆盖配置文件。`api_key` 是 provider 配置中的具体字段。对需要脱敏的敏感
 配置值，统一使用简单字符串约定：值以 `$` 开头时，`$` 后面的内容作为环境变量名读取
 实际值；不以 `$` 开头时表示直接配置值。这个解析发生在配置读取阶段；provider adapter
@@ -446,6 +475,8 @@ model profile 可选 `context_window` 作为本地上下文窗口元数据，不
 时使用保守估算默认值 `32000`，来源记录为 `estimated`；显式配置时来源为
 `configured`。请求参数可继续写在 profile 顶层，也可写在 `parameters` map 中。
 `provider_dir` 相对配置根目录解析，除非显式写成绝对路径。
+`auth_dir` 是 M16 后的 OAuth token 文件目录，默认是配置根目录下的 `auth`，同样相对配置
+根目录解析；它只保存 `sai auth codex login` 生成的独立 token 文件。
 `skill_dir` 是 M7 后的本地 skill 目录，默认是配置根目录下的 `skills`，同样相对配置
 根目录解析；推荐布局是 `.agents/skills/<skill_id>/SKILL.md`。`skills.enabled`
 保存默认启用的本地 skill id 列表，空列表表示不读取或注入任何 skill。`sai chat
