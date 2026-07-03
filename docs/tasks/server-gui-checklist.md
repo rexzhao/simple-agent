@@ -66,7 +66,7 @@ future work and should not be required by any slice here.
 - [x] CLI query/send commands: implement `sai sessions list`,
   `sai sessions show <id>`, `sai send <session-id> --prompt ...`, and
   `sai send --new --prompt ...` using only server APIs.
-- [ ] Legacy entrypoint cleanup: remove or hide standalone in-process
+- [x] Legacy entrypoint cleanup: remove or hide standalone in-process
   `sai chat` from the recommended product path and help text; keep any temporary
   compatibility path explicitly hidden or legacy.
 - [x] Security and error shape: require registry token for writes, debug reads,

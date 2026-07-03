@@ -278,7 +278,6 @@ const rootUsageText = `usage: sai [--config file] [command] [args]
 
 Commands:
   attach            Attach to a server-owned session
-  chat              Start a legacy in-process chat session
   server            Start a local HTTP server
   status            Show nearest server status
   stop              Stop nearest server
@@ -309,11 +308,13 @@ most recently updated server-owned session. --new creates a session first.
 
 const chatUsageText = `usage: sai chat [--provider name] [--model profile] [--prompt text | --stdin | --file path] [--show-reasoning] [--verbose] [--enable-tools names] [--enable-mcp ids] [--save-session] [--resume id | --continue] [--quit]
 
-Starts a line-oriented chat session using the configured provider and model. When
---prompt is provided, sai runs that turn first; --quit exits after that turn
-instead of entering the REPL. --stdin and --file read one complete prompt and
-must be used with --quit. Resumable sessions save full sensitive content,
-including prompts, assistant output, assistant tool calls, and tool results.
+Legacy compatibility path for an in-process chat session. This is not the
+recommended server-owned session path; use sai server with sai attach or
+sai send for normal use. When --prompt is provided, sai runs that turn first;
+--quit exits after that turn instead of entering the REPL. --stdin and --file
+read one complete prompt and must be used with --quit. Resumable sessions save
+full sensitive content, including prompts, assistant output, assistant tool
+calls, and tool results.
 `
 
 const resumableSessionSaveNoticeText = "sai: resumable sessions enabled; full prompts, assistant output, and tool results will be saved to the session file."

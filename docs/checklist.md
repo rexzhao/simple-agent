@@ -441,7 +441,7 @@
 - [ ] `sai servers list` 列出 registry 中的本地 server 后退出。
 - [ ] `sai sessions list` 和 `sai sessions show <id>` 通过 server API 查询，不直接读取 session 文件。
 - [ ] `sai send <session-id> --prompt ...` 和 `sai send --new --prompt ...` 发起一轮后退出。
-- [ ] 移除或隐藏独立进程内 `sai chat` 产品入口，裸 `sai` 默认 attach。
+- [x] 移除或隐藏独立进程内 `sai chat` 产品入口，裸 `sai` 默认 attach。
 - [ ] server 提供 `GET /health`、`GET /server` 和 `POST /server/shutdown`。
 - [ ] server 提供 `GET /sessions`、`POST /sessions`、`GET /sessions/{id}` 和
   `GET /sessions/{id}/items`。

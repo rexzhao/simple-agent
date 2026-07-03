@@ -987,10 +987,13 @@ func TestRootHelpWritesUsageWithoutConfig(t *testing.T) {
 				t.Fatalf("RunWithGetwd(%v) code = %d, stderr = %s", args, code, stderr.String())
 			}
 			out := stdout.String()
-			for _, want := range []string{"usage: sai", "attach            Attach to a server-owned session", "chat              Start a legacy in-process chat session", "server            Start a local HTTP server", "status            Show nearest server status", "stop              Stop nearest server", "servers list", "send              Send one prompt", "config show", "models list", "doctor", "tools list", "sessions", "With no command, sai defaults to attach.", `Run "sai help <command>" for command usage.`} {
+			for _, want := range []string{"usage: sai", "attach            Attach to a server-owned session", "server            Start a local HTTP server", "status            Show nearest server status", "stop              Stop nearest server", "servers list", "send              Send one prompt", "config show", "models list", "doctor", "tools list", "sessions", "With no command, sai defaults to attach.", `Run "sai help <command>" for command usage.`} {
 				if !strings.Contains(out, want) {
 					t.Fatalf("stdout = %q, want contain %q", out, want)
 				}
+			}
+			if strings.Contains(out, "chat") {
+				t.Fatalf("root help still lists chat:\n%s", out)
 			}
 			if strings.Contains(out, `run "prompt"`) || strings.Contains(out, "sai run") {
 				t.Fatalf("root help still lists run:\n%s", out)
@@ -1038,7 +1041,7 @@ func TestChatHelpWritesUsageWithoutConfig(t *testing.T) {
 		{"help", "chat"},
 	} {
 		t.Run(strings.Join(args, " "), func(t *testing.T) {
-			assertCLIHelpWithoutConfig(t, args, "usage: sai chat", "--prompt text | --stdin | --file path", "--save-session", "--resume id | --continue", "full sensitive content")
+			assertCLIHelpWithoutConfig(t, args, "usage: sai chat", "Legacy compatibility path", "in-process chat session", "recommended server-owned session path", "--prompt text | --stdin | --file path", "--save-session", "--resume id | --continue", "full sensitive content")
 		})
 	}
 
