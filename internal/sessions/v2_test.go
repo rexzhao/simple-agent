@@ -347,6 +347,23 @@ func TestV2StoreRejectsReservedBlobsSessionIDAndPreservesBlobStore(t *testing.T)
 			},
 		},
 		{
+			name: "AppendCompactionCheckpoint",
+			run: func(id string) error {
+				_, err := store.AppendCompactionCheckpoint(id, SessionItem{
+					ID:         "summary-1",
+					Kind:       ItemKindMessage,
+					Visibility: ItemVisibilityHidden,
+					Audience:   ItemAudienceModel,
+					Message:    &model.Message{Role: model.MessageRoleDeveloper, Content: "summary"},
+				}, CompactionCheckpoint{
+					ID:                 "compact-1",
+					SummaryItemID:      "summary-1",
+					ReplacementHistory: []string{"summary-1"},
+				})
+				return err
+			},
+		},
+		{
 			name: "Delete",
 			run: func(id string) error {
 				return store.Delete(id)
@@ -465,6 +482,284 @@ func TestV2StoreAppendItemsAndReplaceActiveHistoryCommitsTransaction(t *testing.
 	}
 }
 
+func TestV2StoreAppendCompactionCheckpointCommitsTransaction(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "sessions")
+	clock := &fakeClock{current: time.Date(2026, 7, 3, 4, 5, 6, 0, time.UTC)}
+	store := newV2StoreWithClock(root, V2StoreOptions{}, clock.Now)
+
+	appendTestItem(t, store, "session-1", "item-1", "one")
+	if _, err := store.ReplaceActiveHistory("session-1", []string{"item-1"}); err != nil {
+		t.Fatalf("ReplaceActiveHistory() error = %v", err)
+	}
+
+	summary := SessionItem{
+		ID:         "summary-1",
+		Kind:       ItemKindMessage,
+		Visibility: ItemVisibilityHidden,
+		Audience:   ItemAudienceModel,
+		Message:    &model.Message{Role: model.MessageRoleDeveloper, Content: "checkpoint"},
+	}
+	checkpoint := CompactionCheckpoint{
+		ID:                    "compact-1",
+		Reason:                "user_requested",
+		Phase:                 "manual",
+		Trigger:               "manual",
+		SummaryItemID:         "summary-1",
+		PreviousActiveHistory: []string{"item-1"},
+		ReplacementHistory:    []string{"item-1", "summary-1"},
+		SummaryProvider:       "paperhub",
+		SummaryModel:          "glm-5.2",
+	}
+
+	replayed, err := store.AppendCompactionCheckpoint("session-1", summary, checkpoint)
+	if err != nil {
+		t.Fatalf("AppendCompactionCheckpoint() error = %v", err)
+	}
+
+	if got := itemIDs(replayed.Items); !reflect.DeepEqual(got, []string{"item-1", "summary-1"}) {
+		t.Fatalf("item IDs = %#v, want visible item plus summary", got)
+	}
+	if replayed.Items[1].Seq != 4 || replayed.Items[1].CreatedAt != clock.current {
+		t.Fatalf("summary seq/created_at = %d/%s, want 4/%s", replayed.Items[1].Seq, replayed.Items[1].CreatedAt, clock.current)
+	}
+	if replayed.Items[1].Visibility != ItemVisibilityHidden || replayed.Items[1].Audience != ItemAudienceModel {
+		t.Fatalf("summary visibility/audience = %q/%q, want hidden/model", replayed.Items[1].Visibility, replayed.Items[1].Audience)
+	}
+	if !reflect.DeepEqual(replayed.ActiveHistory, []string{"item-1", "summary-1"}) {
+		t.Fatalf("ActiveHistory = %#v, want replacement history", replayed.ActiveHistory)
+	}
+
+	checkpoint.CreatedAt = clock.current
+	if !reflect.DeepEqual(replayed.Compactions, []CompactionCheckpoint{checkpoint}) {
+		t.Fatalf("Compactions = %#v, want %#v", replayed.Compactions, []CompactionCheckpoint{checkpoint})
+	}
+	if replayed.LastSeq != 7 {
+		t.Fatalf("LastSeq = %d, want 7", replayed.LastSeq)
+	}
+
+	messages, err := replayed.MaterializeActiveHistory()
+	if err != nil {
+		t.Fatalf("MaterializeActiveHistory() error = %v", err)
+	}
+	if got := messageContents(messages); !reflect.DeepEqual(got, []string{"one", "checkpoint"}) {
+		t.Fatalf("active messages = %#v, want original plus checkpoint", got)
+	}
+}
+
+func TestV2StoreAppendCompactionCheckpointValidatesCheckpointWrite(t *testing.T) {
+	baseSummary := SessionItem{
+		ID:         "summary-1",
+		Kind:       ItemKindMessage,
+		Visibility: ItemVisibilityHidden,
+		Audience:   ItemAudienceModel,
+		Message:    &model.Message{Role: model.MessageRoleDeveloper, Content: "checkpoint"},
+	}
+	baseCheckpoint := CompactionCheckpoint{
+		ID:                 "compact-1",
+		SummaryItemID:      "summary-1",
+		ReplacementHistory: []string{"summary-1"},
+	}
+
+	tests := []struct {
+		name        string
+		edit        func(*SessionItem, *CompactionCheckpoint)
+		wantMessage string
+	}{
+		{
+			name: "missing summary item id",
+			edit: func(summary *SessionItem, checkpoint *CompactionCheckpoint) {
+				summary.ID = ""
+			},
+			wantMessage: "compaction summary item id is required",
+		},
+		{
+			name: "visible summary item",
+			edit: func(summary *SessionItem, checkpoint *CompactionCheckpoint) {
+				summary.Visibility = ItemVisibilityVisible
+			},
+			wantMessage: `compaction summary item visibility must be "hidden"`,
+		},
+		{
+			name: "non-model summary audience",
+			edit: func(summary *SessionItem, checkpoint *CompactionCheckpoint) {
+				summary.Audience = ItemAudienceUser
+			},
+			wantMessage: `compaction summary item audience must be "model"`,
+		},
+		{
+			name: "non-message summary kind",
+			edit: func(summary *SessionItem, checkpoint *CompactionCheckpoint) {
+				summary.Kind = ItemKindCompaction
+			},
+			wantMessage: `compaction summary item kind must be "message"`,
+		},
+		{
+			name: "nil summary message",
+			edit: func(summary *SessionItem, checkpoint *CompactionCheckpoint) {
+				summary.Message = nil
+			},
+			wantMessage: "compaction summary item message is required",
+		},
+		{
+			name: "empty summary message content",
+			edit: func(summary *SessionItem, checkpoint *CompactionCheckpoint) {
+				summary.Message = &model.Message{Role: model.MessageRoleDeveloper, Content: "  "}
+			},
+			wantMessage: "compaction summary message content is required",
+		},
+		{
+			name: "missing checkpoint id",
+			edit: func(summary *SessionItem, checkpoint *CompactionCheckpoint) {
+				checkpoint.ID = ""
+			},
+			wantMessage: "compaction checkpoint id is required",
+		},
+		{
+			name: "missing checkpoint summary item id",
+			edit: func(summary *SessionItem, checkpoint *CompactionCheckpoint) {
+				checkpoint.SummaryItemID = ""
+			},
+			wantMessage: "compaction checkpoint summary item id is required",
+		},
+		{
+			name: "mismatched checkpoint summary item id",
+			edit: func(summary *SessionItem, checkpoint *CompactionCheckpoint) {
+				checkpoint.SummaryItemID = "other-summary"
+			},
+			wantMessage: "does not match summary item id",
+		},
+		{
+			name: "missing replacement history",
+			edit: func(summary *SessionItem, checkpoint *CompactionCheckpoint) {
+				checkpoint.ReplacementHistory = nil
+			},
+			wantMessage: "compaction replacement history is required",
+		},
+		{
+			name: "empty replacement history item id",
+			edit: func(summary *SessionItem, checkpoint *CompactionCheckpoint) {
+				checkpoint.ReplacementHistory = []string{"summary-1", ""}
+			},
+			wantMessage: "compaction replacement history contains empty item id",
+		},
+		{
+			name: "replacement history references missing item",
+			edit: func(summary *SessionItem, checkpoint *CompactionCheckpoint) {
+				checkpoint.ReplacementHistory = []string{"missing-item", "summary-1"}
+			},
+			wantMessage: `compaction replacement history references missing item id "missing-item"`,
+		},
+		{
+			name: "replacement history missing summary",
+			edit: func(summary *SessionItem, checkpoint *CompactionCheckpoint) {
+				checkpoint.ReplacementHistory = []string{"item-1"}
+			},
+			wantMessage: "compaction replacement history must include summary item id",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			root := filepath.Join(t.TempDir(), "sessions")
+			store := NewV2Store(root)
+			summary := baseSummary
+			checkpoint := baseCheckpoint
+			checkpoint.ReplacementHistory = copyStrings(baseCheckpoint.ReplacementHistory)
+			tt.edit(&summary, &checkpoint)
+
+			_, err := store.AppendCompactionCheckpoint("session-1", summary, checkpoint)
+			if err == nil {
+				t.Fatal("AppendCompactionCheckpoint() error = nil, want validation error")
+			}
+			if !strings.Contains(err.Error(), tt.wantMessage) {
+				t.Fatalf("AppendCompactionCheckpoint() error = %q, want %q", err, tt.wantMessage)
+			}
+			segmentsDir := filepath.Join(root, "session-1", "segments")
+			if _, statErr := os.Stat(segmentsDir); !errors.Is(statErr, os.ErrNotExist) {
+				t.Fatalf("segments dir stat error = %v, want not exist", statErr)
+			}
+		})
+	}
+}
+
+func TestV2StoreAppendCompactionCheckpointRejectsDuplicateSummaryItemID(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "sessions")
+	store := NewV2Store(root)
+	appendTestItem(t, store, "session-1", "summary-1", "existing item")
+
+	_, err := store.AppendCompactionCheckpoint("session-1", SessionItem{
+		ID:         "summary-1",
+		Kind:       ItemKindMessage,
+		Visibility: ItemVisibilityHidden,
+		Audience:   ItemAudienceModel,
+		Message:    &model.Message{Role: model.MessageRoleDeveloper, Content: "checkpoint"},
+	}, CompactionCheckpoint{
+		ID:                 "compact-1",
+		SummaryItemID:      "summary-1",
+		ReplacementHistory: []string{"summary-1"},
+	})
+	if err == nil {
+		t.Fatal("AppendCompactionCheckpoint() error = nil, want duplicate summary item error")
+	}
+	if !strings.Contains(err.Error(), `compaction summary item id "summary-1" already exists`) {
+		t.Fatalf("AppendCompactionCheckpoint() error = %q, want duplicate summary detail", err)
+	}
+
+	replayed, err := store.Replay("session-1")
+	if err != nil {
+		t.Fatalf("Replay() error = %v", err)
+	}
+	if got := itemIDs(replayed.Items); !reflect.DeepEqual(got, []string{"summary-1"}) {
+		t.Fatalf("item IDs after rejected duplicate summary = %#v, want existing only", got)
+	}
+	if replayed.LastSeq != 1 {
+		t.Fatalf("LastSeq after rejected duplicate summary = %d, want 1", replayed.LastSeq)
+	}
+}
+
+func TestV2StoreAppendCompactionCheckpointRejectsNonMessageReplacementRef(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "sessions")
+	store := NewV2Store(root)
+	appendTestItem(t, store, "session-1", "item-1", "one")
+	if _, err := store.AppendItem("session-1", SessionItem{
+		ID:         "runtime-1",
+		Kind:       ItemKindRuntimeContext,
+		Visibility: ItemVisibilityHidden,
+		Audience:   ItemAudienceInternal,
+	}); err != nil {
+		t.Fatalf("AppendItem(runtime-1) error = %v", err)
+	}
+
+	_, err := store.AppendCompactionCheckpoint("session-1", SessionItem{
+		ID:         "summary-1",
+		Kind:       ItemKindMessage,
+		Visibility: ItemVisibilityHidden,
+		Audience:   ItemAudienceModel,
+		Message:    &model.Message{Role: model.MessageRoleDeveloper, Content: "checkpoint"},
+	}, CompactionCheckpoint{
+		ID:                 "compact-1",
+		SummaryItemID:      "summary-1",
+		ReplacementHistory: []string{"item-1", "runtime-1", "summary-1"},
+	})
+	if err == nil {
+		t.Fatal("AppendCompactionCheckpoint() error = nil, want non-message replacement ref error")
+	}
+	if !strings.Contains(err.Error(), `compaction replacement history references item id "runtime-1" without a message`) {
+		t.Fatalf("AppendCompactionCheckpoint() error = %q, want non-message ref detail", err)
+	}
+
+	replayed, err := store.Replay("session-1")
+	if err != nil {
+		t.Fatalf("Replay() error = %v", err)
+	}
+	if got := itemIDs(replayed.Items); !reflect.DeepEqual(got, []string{"item-1", "runtime-1"}) {
+		t.Fatalf("item IDs after rejected non-message ref = %#v, want original items only", got)
+	}
+	if replayed.LastSeq != 2 {
+		t.Fatalf("LastSeq after rejected non-message ref = %d, want 2", replayed.LastSeq)
+	}
+}
+
 func TestV2StoreReplayIgnoresUncommittedTransaction(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "sessions")
 	store := NewV2Store(root)
@@ -520,6 +815,58 @@ func TestV2StoreReplayIgnoresUncommittedTransaction(t *testing.T) {
 	}
 	if !reflect.DeepEqual(replayed.ActiveHistory, []string{"item-1", "item-3"}) {
 		t.Fatalf("ActiveHistory after new transaction = %#v, want item-1,item-3", replayed.ActiveHistory)
+	}
+}
+
+func TestV2StoreReplayIgnoresUncommittedCompactionCheckpointTransaction(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "sessions")
+	store := NewV2Store(root)
+	appendTestItem(t, store, "session-1", "item-1", "one")
+	if _, err := store.ReplaceActiveHistory("session-1", []string{"item-1"}); err != nil {
+		t.Fatalf("ReplaceActiveHistory() error = %v", err)
+	}
+
+	segmentPath := filepath.Join(root, "session-1", "segments", "000001.jsonl")
+	appendV2RecordsForTest(t, segmentPath,
+		v2Record{Seq: 3, Type: RecordTypeTransactionBegin, TxID: "tx-abandoned-compact"},
+		v2Record{
+			Seq:  4,
+			Type: RecordTypeItemAppended,
+			TxID: "tx-abandoned-compact",
+			Item: &SessionItem{
+				ID:         "summary-1",
+				Seq:        4,
+				Kind:       ItemKindMessage,
+				Visibility: ItemVisibilityHidden,
+				Audience:   ItemAudienceModel,
+				Message:    &model.Message{Role: model.MessageRoleDeveloper, Content: "ignored checkpoint"},
+			},
+		},
+		v2Record{
+			Seq:  5,
+			Type: RecordTypeCompactionCreated,
+			TxID: "tx-abandoned-compact",
+			Compaction: &CompactionCheckpoint{
+				ID:                 "compact-1",
+				SummaryItemID:      "summary-1",
+				ReplacementHistory: []string{"item-1", "summary-1"},
+			},
+		},
+		v2Record{Seq: 6, Type: RecordTypeActiveHistoryReplaced, TxID: "tx-abandoned-compact", ItemIDs: []string{"item-1", "summary-1"}},
+	)
+
+	replayed, err := store.Replay("session-1")
+	if err != nil {
+		t.Fatalf("Replay() error = %v", err)
+	}
+	if got := itemIDs(replayed.Items); !reflect.DeepEqual(got, []string{"item-1"}) {
+		t.Fatalf("item IDs after abandoned compaction = %#v, want original only", got)
+	}
+	if len(replayed.Compactions) != 0 {
+		t.Fatalf("Compactions after abandoned compaction = %#v, want none", replayed.Compactions)
+	}
+	if !reflect.DeepEqual(replayed.ActiveHistory, []string{"item-1"}) || replayed.LastSeq != 2 {
+		t.Fatalf("state after abandoned compaction = active %#v last %d, want item-1/2", replayed.ActiveHistory, replayed.LastSeq)
 	}
 }
 

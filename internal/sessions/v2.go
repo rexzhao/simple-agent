@@ -366,6 +366,77 @@ func (s *V2Store) AppendCompaction(sessionID string, checkpoint CompactionCheckp
 	return checkpoint, nil
 }
 
+func (s *V2Store) AppendCompactionCheckpoint(sessionID string, summaryItem SessionItem, checkpoint CompactionCheckpoint) (SessionV2, error) {
+	if err := s.requireRoot(); err != nil {
+		return SessionV2{}, err
+	}
+	if err := validateV2SessionID(sessionID); err != nil {
+		return SessionV2{}, err
+	}
+
+	now := s.now().UTC()
+	if summaryItem.CreatedAt.IsZero() {
+		summaryItem.CreatedAt = now
+	}
+	if checkpoint.CreatedAt.IsZero() {
+		checkpoint.CreatedAt = now
+	}
+	state, err := s.Replay(sessionID)
+	if err != nil {
+		return SessionV2{}, err
+	}
+	if err := validateCompactionCheckpointWrite(summaryItem, checkpoint, state); err != nil {
+		return SessionV2{}, err
+	}
+
+	txID := fmt.Sprintf("tx-%06d", state.LastSeq+1)
+	records := make([]v2Record, 0, 5)
+	nextSeq := state.LastSeq + 1
+	records = append(records, v2Record{
+		Seq:  nextSeq,
+		Type: RecordTypeTransactionBegin,
+		TxID: txID,
+	})
+	nextSeq++
+
+	summaryItem.Seq = nextSeq
+	summaryCopy := summaryItem
+	records = append(records, v2Record{
+		Seq:  nextSeq,
+		Type: RecordTypeItemAppended,
+		TxID: txID,
+		Item: &summaryCopy,
+	})
+	nextSeq++
+
+	checkpointCopy := checkpoint
+	records = append(records, v2Record{
+		Seq:        nextSeq,
+		Type:       RecordTypeCompactionCreated,
+		TxID:       txID,
+		Compaction: &checkpointCopy,
+	})
+	nextSeq++
+
+	records = append(records, v2Record{
+		Seq:     nextSeq,
+		Type:    RecordTypeActiveHistoryReplaced,
+		TxID:    txID,
+		ItemIDs: copyStrings(checkpoint.ReplacementHistory),
+	})
+	nextSeq++
+	records = append(records, v2Record{
+		Seq:  nextSeq,
+		Type: RecordTypeTransactionCommit,
+		TxID: txID,
+	})
+
+	if err := s.appendRecords(sessionID, records); err != nil {
+		return SessionV2{}, err
+	}
+	return s.Replay(sessionID)
+}
+
 func (s *V2Store) SaveTurn(session SessionV2, items []SessionItem, activeHistory []string) (SessionV2, error) {
 	if err := s.requireRoot(); err != nil {
 		return SessionV2{}, err
@@ -1058,6 +1129,72 @@ func segmentNumber(name string) int {
 		return 0
 	}
 	return number
+}
+
+func validateCompactionCheckpointWrite(summaryItem SessionItem, checkpoint CompactionCheckpoint, state SessionV2) error {
+	if strings.TrimSpace(summaryItem.ID) == "" {
+		return fmt.Errorf("compaction summary item id is required")
+	}
+	if summaryItem.Kind != ItemKindMessage {
+		return fmt.Errorf("compaction summary item kind must be %q", ItemKindMessage)
+	}
+	if summaryItem.Visibility != ItemVisibilityHidden {
+		return fmt.Errorf("compaction summary item visibility must be %q", ItemVisibilityHidden)
+	}
+	if summaryItem.Audience != ItemAudienceModel {
+		return fmt.Errorf("compaction summary item audience must be %q", ItemAudienceModel)
+	}
+	if summaryItem.Message == nil {
+		return fmt.Errorf("compaction summary item message is required")
+	}
+	if strings.TrimSpace(summaryItem.Message.Content) == "" {
+		return fmt.Errorf("compaction summary message content is required")
+	}
+	if strings.TrimSpace(checkpoint.ID) == "" {
+		return fmt.Errorf("compaction checkpoint id is required")
+	}
+	if strings.TrimSpace(checkpoint.SummaryItemID) == "" {
+		return fmt.Errorf("compaction checkpoint summary item id is required")
+	}
+	if checkpoint.SummaryItemID != summaryItem.ID {
+		return fmt.Errorf("compaction checkpoint summary item id %q does not match summary item id %q", checkpoint.SummaryItemID, summaryItem.ID)
+	}
+	if len(checkpoint.ReplacementHistory) == 0 {
+		return fmt.Errorf("compaction replacement history is required")
+	}
+	itemsByID := make(map[string]SessionItem, len(state.Items))
+	for _, item := range state.Items {
+		if item.ID == summaryItem.ID {
+			return fmt.Errorf("compaction summary item id %q already exists", summaryItem.ID)
+		}
+		itemsByID[item.ID] = item
+	}
+
+	includesSummary := false
+	for i, id := range checkpoint.ReplacementHistory {
+		if strings.TrimSpace(id) == "" {
+			return fmt.Errorf("compaction replacement history contains empty item id at index %d", i)
+		}
+		if id == summaryItem.ID {
+			includesSummary = true
+		}
+	}
+	if !includesSummary {
+		return fmt.Errorf("compaction replacement history must include summary item id %q", summaryItem.ID)
+	}
+	for _, id := range checkpoint.ReplacementHistory {
+		if id == summaryItem.ID {
+			continue
+		}
+		item, ok := itemsByID[id]
+		if !ok {
+			return fmt.Errorf("compaction replacement history references missing item id %q", id)
+		}
+		if item.Message == nil {
+			return fmt.Errorf("compaction replacement history references item id %q without a message", id)
+		}
+	}
+	return nil
 }
 
 func validateBlobRef(ref BlobRef) error {
