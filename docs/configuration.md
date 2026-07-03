@@ -445,6 +445,8 @@ description 计划来自 child config 的 `agent.description`；缺失时实现�
 metadata，不是配置选择器：配置的 subagent id 仍决定使用哪个 child config、权限和工具集合。
 display name 应出现在 status、mailbox 和 observability 输出中，并为未来 GUI label 提供友好
 名称；它不能选择未配置的 agent，也不能覆盖 child config、tools、skills、MCP 或 prompt。
+`subagent_close` 用于释放已经结束且完成通知已被消费的 job 记录；仍在运行的 job 需要先用
+`subagent_cancel` 取消，避免 close 隐式丢弃仍可能回传的结果。
 
 ## Prompt 配置（规划）
 

@@ -134,6 +134,8 @@ func (m *Manager) Execute(ctx context.Context, name string, arguments map[string
 		return m.wait(ctx, name, arguments)
 	case ToolSubagentCancel:
 		return m.cancel(name, arguments)
+	case ToolSubagentClose:
+		return m.closeJob(name, arguments)
 	default:
 		return model.ToolResult{}, fmt.Errorf("unknown subagent tool %q", name)
 	}
@@ -346,6 +348,35 @@ func (m *Manager) cancel(toolName string, arguments map[string]any) (model.ToolR
 	m.mu.Unlock()
 
 	cancel()
+	return result(toolName, snapshot)
+}
+
+func (m *Manager) closeJob(toolName string, arguments map[string]any) (model.ToolResult, error) {
+	jobID, err := requiredStringArgument(arguments, "job_id")
+	if err != nil {
+		return errorResult(toolName, "%v", err)
+	}
+
+	m.mu.Lock()
+	j, ok := m.jobs[jobID]
+	if !ok {
+		m.mu.Unlock()
+		return errorResult(toolName, "unknown subagent job %q", jobID)
+	}
+	if !isTerminalStatus(j.status) {
+		status := j.status
+		m.mu.Unlock()
+		return errorResult(toolName, "subagent job %q is still %s; use subagent_cancel before closing", jobID, status)
+	}
+	if !j.completionConsumed {
+		m.mu.Unlock()
+		return errorResult(toolName, "subagent job %q completion has not been consumed", jobID)
+	}
+
+	snapshot := j.snapshotLocked()
+	m.consumeCompletionLocked(jobID)
+	delete(m.jobs, jobID)
+	m.mu.Unlock()
 	return result(toolName, snapshot)
 }
 

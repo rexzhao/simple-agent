@@ -396,6 +396,7 @@
 - [x] mailbox 和 observability 输出包含 display name。
 - [x] subagent job 支持 wait。
 - [x] subagent job 支持 cancel。
+- [x] subagent job 支持 close 释放已结束且完成通知已消费的 job 记录。
 - [x] child job 运行时 parent 仍可继续接收用户输入。
 - [x] child completion 通过 parent mailbox/runtime event 在 parent turn 后交付。
 - [x] parent idle 时 child completion 可触发 auto wakeup。

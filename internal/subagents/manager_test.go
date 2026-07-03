@@ -36,6 +36,7 @@ func TestDefinitions(t *testing.T) {
 		ToolSubagentStatus,
 		ToolSubagentWait,
 		ToolSubagentCancel,
+		ToolSubagentClose,
 	}
 	if !reflect.DeepEqual(gotNames, wantNames) {
 		t.Fatalf("Definitions() names = %#v, want %#v", gotNames, wantNames)
@@ -43,6 +44,7 @@ func TestDefinitions(t *testing.T) {
 
 	assertDescriptionContains(t, definitions, ToolSubagentStart, "Do not call subagent_wait unless the parent is blocked", "delivered back to the parent automatically")
 	assertDescriptionContains(t, definitions, ToolSubagentWait, "Use only when the parent must block", "completion arrive automatically")
+	assertDescriptionContains(t, definitions, ToolSubagentClose, "Release a completed, failed, or canceled", "Use subagent_cancel for running jobs")
 }
 
 func assertDescriptionContains(t *testing.T, definitions []model.Tool, name string, wants ...string) {
@@ -189,6 +191,88 @@ func TestWaitConsumesCompletionNotification(t *testing.T) {
 	}
 	if completions := manager.PendingCompletions(); len(completions) != 0 {
 		t.Fatalf("PendingCompletions() after wait = %#v, want empty", completions)
+	}
+}
+
+func TestCloseReleasesConsumedTerminalJob(t *testing.T) {
+	runner := runnerFunc(func(ctx context.Context, request RunRequest, inbox <-chan Message) (RunResult, error) {
+		return RunResult{Output: "done"}, nil
+	})
+	manager, err := NewManager(map[string]string{"reviewer": "reviewer.yaml"}, runner, WithMaxJobs(1))
+	if err != nil {
+		t.Fatalf("NewManager() error = %v", err)
+	}
+
+	jobID := startJob(t, manager, "reviewer")
+	waitResult := execute(t, manager, ToolSubagentWait, map[string]any{
+		"job_id":     jobID,
+		"timeout_ms": 1000,
+	})
+	waited := decodeSnapshot(t, waitResult)
+	if waited.Status != StatusCompleted || waited.Output != "done" {
+		t.Fatalf("waited = %#v, want completed output", waited)
+	}
+
+	closeResult := execute(t, manager, ToolSubagentClose, map[string]any{"job_id": jobID})
+	closed := decodeSnapshot(t, closeResult)
+	if closed.JobID != jobID || closed.Status != StatusCompleted || closed.Output != "done" {
+		t.Fatalf("closed = %#v, want released completed job %q", closed, jobID)
+	}
+	if manager.HasJobs() {
+		t.Fatal("manager.HasJobs() = true after close, want false")
+	}
+	statusResult := execute(t, manager, ToolSubagentStatus, map[string]any{"job_id": jobID})
+	assertToolError(t, statusResult, `unknown subagent job "`+jobID+`"`)
+
+	second := execute(t, manager, ToolSubagentStart, map[string]any{"agent_id": "reviewer"})
+	secondSnapshot := decodeSnapshot(t, second)
+	if secondSnapshot.JobID == jobID {
+		t.Fatalf("second job id = %q, want a new job id", secondSnapshot.JobID)
+	}
+}
+
+func TestCloseRejectsUnconsumedCompletion(t *testing.T) {
+	runner := runnerFunc(func(ctx context.Context, request RunRequest, inbox <-chan Message) (RunResult, error) {
+		return RunResult{Output: "done"}, nil
+	})
+	manager := newTestManager(t, runner)
+	jobID := startJob(t, manager, "reviewer")
+
+	select {
+	case <-manager.CompletionSignal():
+	case <-time.After(time.Second):
+		t.Fatal("completion signal was not delivered")
+	}
+
+	closeResult := execute(t, manager, ToolSubagentClose, map[string]any{"job_id": jobID})
+	assertToolError(t, closeResult, "completion has not been consumed")
+	completions := manager.PendingCompletions()
+	if len(completions) != 1 || completions[0].JobID != jobID {
+		t.Fatalf("PendingCompletions() after rejected close = %#v, want job %q", completions, jobID)
+	}
+
+	manager.AckCompletions(completions)
+	closeResult = execute(t, manager, ToolSubagentClose, map[string]any{"job_id": jobID})
+	closed := decodeSnapshot(t, closeResult)
+	if closed.Status != StatusCompleted || closed.Output != "done" {
+		t.Fatalf("closed = %#v, want completed output", closed)
+	}
+}
+
+func TestCloseRejectsRunningJob(t *testing.T) {
+	runner := runnerFunc(func(ctx context.Context, request RunRequest, inbox <-chan Message) (RunResult, error) {
+		<-ctx.Done()
+		return RunResult{}, ctx.Err()
+	})
+	manager := newTestManager(t, runner)
+	jobID := startJob(t, manager, "reviewer")
+
+	closeResult := execute(t, manager, ToolSubagentClose, map[string]any{"job_id": jobID})
+	assertToolError(t, closeResult, "is still running")
+
+	execute(t, manager, ToolSubagentCancel, map[string]any{"job_id": jobID})
+	if err := manager.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
 	}
 }
 
@@ -437,6 +521,7 @@ func TestUnknownAgentAndJobErrors(t *testing.T) {
 		{name: "status", tool: ToolSubagentStatus, arguments: map[string]any{"job_id": "missing"}},
 		{name: "wait", tool: ToolSubagentWait, arguments: map[string]any{"job_id": "missing", "timeout_ms": 1}},
 		{name: "cancel", tool: ToolSubagentCancel, arguments: map[string]any{"job_id": "missing"}},
+		{name: "close", tool: ToolSubagentClose, arguments: map[string]any{"job_id": "missing"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			result := execute(t, manager, tc.tool, tc.arguments)

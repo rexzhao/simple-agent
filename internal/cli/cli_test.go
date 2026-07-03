@@ -4546,6 +4546,7 @@ agent:
 		subagents.ToolSubagentStatus,
 		subagents.ToolSubagentWait,
 		subagents.ToolSubagentCancel,
+		subagents.ToolSubagentClose,
 	})
 	assertNoAdditionalCLIRunRequest(t, requests)
 }
@@ -4674,6 +4675,7 @@ models:
 		subagents.ToolSubagentStatus,
 		subagents.ToolSubagentWait,
 		subagents.ToolSubagentCancel,
+		subagents.ToolSubagentClose,
 	})
 
 	child := receiveCLIRunRequest(t, childRequests)
@@ -4824,6 +4826,7 @@ models:
 		subagents.ToolSubagentStatus,
 		subagents.ToolSubagentWait,
 		subagents.ToolSubagentCancel,
+		subagents.ToolSubagentClose,
 	})
 	parentMessageText := string(firstParent.RawBody)
 	if !strings.Contains(parentMessageText, "Parent skill instructions.") {
@@ -5630,6 +5633,7 @@ models:
 		subagents.ToolSubagentStatus,
 		subagents.ToolSubagentWait,
 		subagents.ToolSubagentCancel,
+		subagents.ToolSubagentClose,
 	})
 	secondParent := <-parentRequests
 	startContent := toolResultContent(secondParent.Body, "call_start")

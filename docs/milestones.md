@@ -681,7 +681,7 @@ orchestration。
 - parent prompt 注入已配置 subagent id 和短 description 列表。
 - child agent 的 provider、model、tools、skills、MCP 和 prompt 来自自己的 config，不继承
   parent tools。
-- subagent job 语义覆盖 `subagent_start`、send、cancel、status 和 wait。
+- subagent job 语义覆盖 `subagent_start`、send、cancel、close、status 和 wait。
 - `subagent_start` 可选接受用户或模型提供的 display name / job name。
 - 配置的 subagent id 仍是权限、配置文件和 runtime 能力选择依据；display name 只是 job
   metadata，不能选择未配置 agent 或改变 config/tools。
@@ -710,7 +710,7 @@ orchestration。
 - runtime 测试覆盖配置 subagents 后 parent 自动获得 subagent tools。
 - prompt composition 测试覆盖 parent prompt 注入 subagent id 和短 description。
 - runtime 测试覆盖 child 不继承 parent tools，而是使用自己的 tools/skills/MCP/prompt。
-- job 测试覆盖 `subagent_start`、send、status、wait、cancel 和错误状态。
+- job 测试覆盖 `subagent_start`、send、status、wait、cancel、close 和错误状态。
 - job 测试覆盖 `subagent_start` 可选 display name、display name 不影响 subagent id/config
   选择，以及不能借 display name 调用未配置 agent。
 - status、mailbox 和 observability 测试覆盖 display name 透出。

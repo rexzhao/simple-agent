@@ -185,6 +185,8 @@ parent-facing subagent tools 的语义需要覆盖：
 - status：查询 job 是否 queued、running、completed、failed 或 canceled。
 - wait：等待 job 完成或超时，返回可被 parent 继续使用的结果摘要。
 - cancel：取消仍在运行或排队的 job。
+- close：释放已经完成、失败或取消且完成通知已被消费的 job 记录，用于释放 output 缓存和
+  job slot；仍在运行的 job 应先 cancel。
 
 `subagent_start` 的 display name 是用户或模型提供的 job metadata，只用于状态展示、mailbox
 消息、observability 事件和未来 GUI label。配置的 subagent id 仍是权限、配置文件和 runtime

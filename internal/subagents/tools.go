@@ -12,6 +12,7 @@ const (
 	ToolSubagentStatus = "subagent_status"
 	ToolSubagentWait   = "subagent_wait"
 	ToolSubagentCancel = "subagent_cancel"
+	ToolSubagentClose  = "subagent_close"
 )
 
 func Definitions() []model.Tool {
@@ -21,12 +22,13 @@ func Definitions() []model.Tool {
 		StatusDefinition(),
 		WaitDefinition(),
 		CancelDefinition(),
+		CloseDefinition(),
 	}
 }
 
 func IsTool(name string) bool {
 	switch name {
-	case ToolSubagentStart, ToolSubagentSend, ToolSubagentStatus, ToolSubagentWait, ToolSubagentCancel:
+	case ToolSubagentStart, ToolSubagentSend, ToolSubagentStatus, ToolSubagentWait, ToolSubagentCancel, ToolSubagentClose:
 		return true
 	default:
 		return false
@@ -131,6 +133,24 @@ func CancelDefinition() model.Tool {
 	return model.Tool{
 		Name:        ToolSubagentCancel,
 		Description: "Cancel a running subagent job.",
+		InputSchema: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"job_id": map[string]any{
+					"type":        "string",
+					"description": "Subagent job id returned by subagent_start.",
+				},
+			},
+			"required":             []any{"job_id"},
+			"additionalProperties": false,
+		},
+	}
+}
+
+func CloseDefinition() model.Tool {
+	return model.Tool{
+		Name:        ToolSubagentClose,
+		Description: "Release a completed, failed, or canceled subagent job after its completion has been consumed. Use subagent_cancel for running jobs.",
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
