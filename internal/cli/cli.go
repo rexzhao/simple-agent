@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -1323,7 +1324,7 @@ func sessionsListCommand(args []string, configPath string, stdout io.Writer, get
 		return usageError("usage: sai sessions list", "", "sai help sessions list")
 	}
 
-	store, err := sessionStoreFromConfig(configPath, getwd, program)
+	store, err := sessionV2StoreFromConfig(configPath, getwd, program)
 	if err != nil {
 		return err
 	}
@@ -1349,7 +1350,7 @@ func sessionsShowCommand(args []string, configPath string, stdout io.Writer, get
 		return usageError("usage: sai sessions show <id>", "", "sai help sessions show")
 	}
 
-	store, err := sessionStoreFromConfig(configPath, getwd, program)
+	store, err := sessionV2StoreFromConfig(configPath, getwd, program)
 	if err != nil {
 		return err
 	}
@@ -1385,7 +1386,8 @@ func sessionsShowCommand(args []string, configPath string, stdout io.Writer, get
 	}
 	fmt.Fprintf(stdout, "SAVE_TOOL_RESULTS\t%t\n", session.SaveToolResults)
 	fmt.Fprintf(stdout, "INSTRUCTION_COUNT\t%d\n", len(session.InstructionsSnapshot))
-	fmt.Fprintf(stdout, "MESSAGE_COUNT\t%d\n", len(session.Messages))
+	fmt.Fprintf(stdout, "MESSAGE_COUNT\t%d\n", countSessionV2MessageItems(session.Items))
+	fmt.Fprintf(stdout, "ACTIVE_HISTORY_COUNT\t%d\n", len(session.ActiveHistory))
 	return nil
 }
 
@@ -1399,7 +1401,7 @@ func sessionsDeleteCommand(args []string, configPath string, stdout io.Writer, g
 		return usageError("usage: sai sessions delete <id>", "", "sai help sessions delete")
 	}
 
-	store, err := sessionStoreFromConfig(configPath, getwd, program)
+	store, err := sessionV2StoreFromConfig(configPath, getwd, program)
 	if err != nil {
 		return err
 	}
@@ -1433,7 +1435,7 @@ func sessionsPruneCommand(args []string, configPath string, stdout io.Writer, ge
 		return usageError("--keep must be 0 or greater", sessionsPruneUsageText, "sai help sessions prune")
 	}
 
-	store, err := sessionStoreFromConfig(configPath, getwd, program)
+	store, err := sessionV2StoreFromConfig(configPath, getwd, program)
 	if err != nil {
 		return err
 	}
@@ -1460,12 +1462,12 @@ func sessionsPruneCommand(args []string, configPath string, stdout io.Writer, ge
 	return nil
 }
 
-func sessionStoreFromConfig(configPath string, getwd func() (string, error), program string) (*sessions.Store, error) {
+func sessionV2StoreFromConfig(configPath string, getwd func() (string, error), program string) (*sessions.V2Store, error) {
 	cfg, err := loadConfig(configPath, getwd, program)
 	if err != nil {
 		return nil, err
 	}
-	return sessions.NewStore(cfg.Sessions.Dir), nil
+	return sessions.NewV2Store(cfg.Sessions.Dir), nil
 }
 
 func readableSessionNotFound(err error, id string) error {
@@ -1487,6 +1489,16 @@ func formatSessionStringList(values []string) string {
 		return "(none)"
 	}
 	return strings.Join(values, ",")
+}
+
+func countSessionV2MessageItems(items []sessions.SessionItem) int {
+	count := 0
+	for _, item := range items {
+		if item.Message != nil {
+			count++
+		}
+	}
+	return count
 }
 
 func parseCommandFlagArgs(flags *flag.FlagSet, args []string, stdout io.Writer, printUsage func(io.Writer), helpCommand string) ([]string, bool, error) {
@@ -1861,8 +1873,9 @@ type agentRuntime struct {
 	baseMessages          []model.Message
 	instructionSources    []sessions.InstructionSource
 	resumed               bool
-	resumableSession      sessions.Session
-	resumableSessionStore *sessions.Store
+	resumableSession      sessions.SessionV2
+	resumableSessionStore *sessions.V2Store
+	activeItemIDs         []string
 	saveSessions          bool
 	sessionSaveNoticeDone bool
 	contextTracker        *contextwindow.Tracker
@@ -1876,7 +1889,11 @@ func (r *agentRuntime) Close() error {
 
 func (r *agentRuntime) initialMessages() []model.Message {
 	if r.resumed {
-		return copyMessageSlice(r.resumableSession.Messages)
+		messages, err := r.resumableSession.MaterializeActiveHistory()
+		if err == nil {
+			return copyMessageSlice(messages)
+		}
+		return nil
 	}
 	return copyMessageSlice(r.baseMessages)
 }
@@ -1943,17 +1960,33 @@ func (r *agentRuntime) saveUpdatedMessages(messages []model.Message) error {
 	if len(session.InstructionSources) == 0 {
 		session.InstructionSources = copyInstructionSources(r.instructionSources)
 	}
-	session.Messages = copyMessageSlice(messages)
 	if r.contextTracker != nil {
 		session.Context = r.contextTracker.Metadata()
 	}
 	session.SaveToolResults = true
 
-	saved, err := r.resumableSessionStore.Save(session)
+	if len(messages) < len(r.activeItemIDs) {
+		return fmt.Errorf("save resumable session: updated message history shorter than active history")
+	}
+
+	existingIDs := sessionItemIDs(session.Items)
+	activeItemIDs := copyStringSlice(r.activeItemIDs)
+	newMessages := messages[len(r.activeItemIDs):]
+	newItems := make([]sessions.SessionItem, 0, len(newMessages))
+	for _, message := range newMessages {
+		itemID := nextSessionItemID(existingIDs, message)
+		item := sessionItemFromMessage(itemID, message)
+		existingIDs[itemID] = struct{}{}
+		newItems = append(newItems, item)
+		activeItemIDs = append(activeItemIDs, itemID)
+	}
+
+	saved, err := r.resumableSessionStore.SaveTurn(session, newItems, activeItemIDs)
 	if err != nil {
 		return fmt.Errorf("save resumable session: %w", err)
 	}
 	r.resumableSession = saved
+	r.activeItemIDs = copyStringSlice(saved.ActiveHistory)
 	return nil
 }
 
@@ -1969,7 +2002,8 @@ func prepareAgentRuntime(ctx context.Context, configPath string, options agentCo
 		return nil, err
 	}
 
-	var resumedSession sessions.Session
+	var resumedSession sessions.SessionV2
+	var resumedMessages []model.Message
 	resumed := false
 	saveSessions := cfg.Sessions.Enabled
 	if options.saveSessionSet {
@@ -1981,17 +2015,24 @@ func prepareAgentRuntime(ctx context.Context, configPath string, options agentCo
 	if saveSessions && !cfg.Sessions.SaveToolResults {
 		return nil, fmt.Errorf("resumable sessions require sessions.save_tool_results: true")
 	}
-	sessionStore := sessions.NewStore(cfg.Sessions.Dir)
+	sessionStore := sessions.NewV2Store(cfg.Sessions.Dir)
 	if options.resumeID != "" || options.continueSession {
 		resumedSession, err = loadResumableSession(sessionStore, options.resumeID, options.continueSession)
 		if err != nil {
 			return nil, err
 		}
-		if resumedSession.Version > sessions.CurrentVersion {
-			return nil, fmt.Errorf("session %q uses unsupported version %d; current version is %d", resumedSession.ID, resumedSession.Version, sessions.CurrentVersion)
+		if resumedSession.Version > sessions.VersionV2 {
+			return nil, fmt.Errorf("session %q uses unsupported version %d; current version is %d", resumedSession.ID, resumedSession.Version, sessions.VersionV2)
 		}
 		if !resumedSession.SaveToolResults {
 			return nil, fmt.Errorf("session %q cannot be reliably resumed because save_tool_results is false", resumedSession.ID)
+		}
+		resumedMessages, err = resumedSession.MaterializeActiveHistory()
+		if err != nil {
+			return nil, err
+		}
+		if err := validateActiveHistoryToolExchanges(resumedSession.ID, resumedMessages); err != nil {
+			return nil, err
 		}
 		if err := validateResumeCLIConflicts(resumedSession, options); err != nil {
 			return nil, err
@@ -2118,6 +2159,7 @@ func prepareAgentRuntime(ctx context.Context, configPath string, options agentCo
 		resumed:               resumed,
 		resumableSession:      resumedSession,
 		resumableSessionStore: sessionStore,
+		activeItemIDs:         copyStringSlice(resumedSession.ActiveHistory),
 		saveSessions:          saveSessions,
 		contextTracker:        contextTracker,
 		logger:                logger,
@@ -2125,14 +2167,14 @@ func prepareAgentRuntime(ctx context.Context, configPath string, options agentCo
 	}, nil
 }
 
-func loadResumableSession(store *sessions.Store, id string, latest bool) (sessions.Session, error) {
+func loadResumableSession(store *sessions.V2Store, id string, latest bool) (sessions.SessionV2, error) {
 	if latest {
 		session, err := store.Latest()
 		if err != nil {
 			if errors.Is(err, sessions.ErrNotFound) {
-				return sessions.Session{}, fmt.Errorf("no resumable sessions found")
+				return sessions.SessionV2{}, fmt.Errorf("no resumable sessions found")
 			}
-			return sessions.Session{}, err
+			return sessions.SessionV2{}, err
 		}
 		return session, nil
 	}
@@ -2140,14 +2182,14 @@ func loadResumableSession(store *sessions.Store, id string, latest bool) (sessio
 	session, err := store.Load(id)
 	if err != nil {
 		if errors.Is(err, sessions.ErrNotFound) {
-			return sessions.Session{}, fmt.Errorf("resumable session %q was not found", id)
+			return sessions.SessionV2{}, fmt.Errorf("resumable session %q was not found", id)
 		}
-		return sessions.Session{}, err
+		return sessions.SessionV2{}, err
 	}
 	return session, nil
 }
 
-func validateResumeCLIConflicts(session sessions.Session, options agentCommandFlags) error {
+func validateResumeCLIConflicts(session sessions.SessionV2, options agentCommandFlags) error {
 	if options.providerName != "" && options.providerName != session.Provider {
 		return fmt.Errorf("cannot resume session %q with --provider %q; session uses provider %q", session.ID, options.providerName, session.Provider)
 	}
@@ -2169,12 +2211,107 @@ func validateResumeCLIConflicts(session sessions.Session, options agentCommandFl
 	return nil
 }
 
-func applyResumeOptions(options *agentCommandFlags, session sessions.Session) {
+func applyResumeOptions(options *agentCommandFlags, session sessions.SessionV2) {
 	options.providerName = session.Provider
 	options.modelProfile = session.ModelProfile
 	options.enabledTools = toolNamesFlag{set: true, names: copyStringSlice(session.EnabledTools)}
 	options.enabledMCP = mcpServerIDsFlag{set: true, ids: copyStringSlice(session.EnabledMCP)}
 	options.showReasoning = session.ShowReasoning
+}
+
+func validateActiveHistoryToolExchanges(sessionID string, messages []model.Message) error {
+	pendingToolCalls := map[string]struct{}{}
+	for index, message := range messages {
+		if message.Role == model.MessageRoleTool {
+			if message.ToolCallID == "" {
+				return corruptedSessionHistoryError(sessionID, "active history tool message at index %d is missing tool_call_id", index)
+			}
+			if _, ok := pendingToolCalls[message.ToolCallID]; !ok {
+				return corruptedSessionHistoryError(sessionID, "active history tool message at index %d references unresolved tool call %q", index, message.ToolCallID)
+			}
+			delete(pendingToolCalls, message.ToolCallID)
+			continue
+		}
+		if len(pendingToolCalls) > 0 {
+			return corruptedSessionHistoryError(sessionID, "active history message at index %d appears before tool results for %s", index, formatPendingToolCallIDs(pendingToolCalls))
+		}
+		if len(message.ToolCalls) == 0 {
+			continue
+		}
+		if message.Role != model.MessageRoleAssistant {
+			return corruptedSessionHistoryError(sessionID, "active history %s message at index %d contains tool calls", message.Role, index)
+		}
+		for _, toolCall := range message.ToolCalls {
+			if toolCall.ID == "" {
+				return corruptedSessionHistoryError(sessionID, "active history assistant message at index %d contains a tool call without id", index)
+			}
+			if _, exists := pendingToolCalls[toolCall.ID]; exists {
+				return corruptedSessionHistoryError(sessionID, "active history assistant message at index %d repeats tool call id %q", index, toolCall.ID)
+			}
+			pendingToolCalls[toolCall.ID] = struct{}{}
+		}
+	}
+	if len(pendingToolCalls) > 0 {
+		return corruptedSessionHistoryError(sessionID, "active history ends before tool results for %s", formatPendingToolCallIDs(pendingToolCalls))
+	}
+	return nil
+}
+
+func corruptedSessionHistoryError(sessionID, format string, args ...any) error {
+	message := fmt.Sprintf(format, args...)
+	if sessionID == "" {
+		return fmt.Errorf("%w: %s", sessions.ErrCorruptedSession, message)
+	}
+	return fmt.Errorf("%w %q: %s", sessions.ErrCorruptedSession, sessionID, message)
+}
+
+func formatPendingToolCallIDs(pending map[string]struct{}) string {
+	ids := make([]string, 0, len(pending))
+	for id := range pending {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	return strings.Join(ids, ",")
+}
+
+func sessionItemIDs(items []sessions.SessionItem) map[string]struct{} {
+	ids := make(map[string]struct{}, len(items))
+	for _, item := range items {
+		ids[item.ID] = struct{}{}
+	}
+	return ids
+}
+
+func nextSessionItemID(existing map[string]struct{}, message model.Message) string {
+	prefix := "msg"
+	if message.Role == model.MessageRoleSystem || message.Role == model.MessageRoleDeveloper {
+		prefix = "runtime"
+	}
+	for i := len(existing) + 1; ; i++ {
+		id := fmt.Sprintf("%s-%06d", prefix, i)
+		if _, ok := existing[id]; !ok {
+			return id
+		}
+	}
+}
+
+func sessionItemFromMessage(id string, message model.Message) sessions.SessionItem {
+	messageCopy := copyMessageSlice([]model.Message{message})[0]
+	item := sessions.SessionItem{
+		ID:         id,
+		Kind:       sessions.ItemKindMessage,
+		Visibility: sessions.ItemVisibilityVisible,
+		Audience:   sessions.ItemAudienceModel,
+		Message:    &messageCopy,
+	}
+	switch message.Role {
+	case model.MessageRoleSystem, model.MessageRoleDeveloper:
+		item.Kind = sessions.ItemKindRuntimeContext
+		item.Visibility = sessions.ItemVisibilityHidden
+	case model.MessageRoleUser:
+		item.Audience = sessions.ItemAudienceUser
+	}
+	return item
 }
 
 func sameStringSlice(a, b []string) bool {

@@ -36,6 +36,8 @@ const (
 	RecordTypeItemAppended          = "item.appended"
 	RecordTypeActiveHistoryReplaced = "active_history.replaced"
 	RecordTypeCompactionCreated     = "compaction.created"
+	RecordTypeTransactionBegin      = "transaction.begin"
+	RecordTypeTransactionCommit     = "transaction.commit"
 )
 
 const (
@@ -364,6 +366,119 @@ func (s *V2Store) AppendCompaction(sessionID string, checkpoint CompactionCheckp
 	return checkpoint, nil
 }
 
+func (s *V2Store) SaveTurn(session SessionV2, items []SessionItem, activeHistory []string) (SessionV2, error) {
+	if err := s.requireRoot(); err != nil {
+		return SessionV2{}, err
+	}
+
+	now := s.now().UTC()
+	isNew := strings.TrimSpace(session.ID) == ""
+	if isNew {
+		id, err := newSessionID(now)
+		if err != nil {
+			return SessionV2{}, err
+		}
+		session.ID = id
+	}
+	if err := validateV2SessionID(session.ID); err != nil {
+		return SessionV2{}, err
+	}
+	if session.Version == 0 {
+		session.Version = VersionV2
+	}
+	if session.CreatedAt.IsZero() {
+		session.CreatedAt = now
+	}
+	session.UpdatedAt = now
+	session = copySessionV2(session)
+
+	if !isNew {
+		if _, err := s.loadMetadata(session.ID); err != nil {
+			if !errors.Is(err, ErrNotFound) {
+				return SessionV2{}, err
+			}
+			isNew = true
+		}
+	}
+	if !isNew {
+		saved, err := s.SaveMetadata(session)
+		if err != nil {
+			return SessionV2{}, err
+		}
+		session = saved
+	}
+
+	if _, err := s.AppendItemsAndReplaceActiveHistory(session.ID, items, activeHistory); err != nil {
+		return SessionV2{}, err
+	}
+	if isNew {
+		if _, err := s.SaveMetadata(session); err != nil {
+			_ = s.Delete(session.ID)
+			return SessionV2{}, err
+		}
+	}
+
+	return s.Load(session.ID)
+}
+
+func (s *V2Store) AppendItemsAndReplaceActiveHistory(sessionID string, items []SessionItem, itemIDs []string) (SessionV2, error) {
+	if err := s.requireRoot(); err != nil {
+		return SessionV2{}, err
+	}
+	if err := validateV2SessionID(sessionID); err != nil {
+		return SessionV2{}, err
+	}
+
+	state, err := s.Replay(sessionID)
+	if err != nil {
+		return SessionV2{}, err
+	}
+	now := s.now().UTC()
+	txID := fmt.Sprintf("tx-%06d", state.LastSeq+1)
+	records := make([]v2Record, 0, len(items)+3)
+	nextSeq := state.LastSeq + 1
+	records = append(records, v2Record{
+		Seq:  nextSeq,
+		Type: RecordTypeTransactionBegin,
+		TxID: txID,
+	})
+	nextSeq++
+	for _, item := range items {
+		if item.CreatedAt.IsZero() {
+			item.CreatedAt = now
+		}
+		if item.ID == "" {
+			return SessionV2{}, fmt.Errorf("session item id is required")
+		}
+		item.Seq = nextSeq
+		itemCopy := item
+		records = append(records, v2Record{
+			Seq:  nextSeq,
+			Type: RecordTypeItemAppended,
+			TxID: txID,
+			Item: &itemCopy,
+		})
+		nextSeq++
+	}
+	records = append(records, v2Record{
+		Seq:     nextSeq,
+		Type:    RecordTypeActiveHistoryReplaced,
+		TxID:    txID,
+		ItemIDs: copyStrings(itemIDs),
+	})
+	nextSeq++
+	records = append(records, v2Record{
+		Seq:  nextSeq,
+		Type: RecordTypeTransactionCommit,
+		TxID: txID,
+	})
+
+	if err := s.appendRecords(sessionID, records); err != nil {
+		return SessionV2{}, err
+	}
+	return s.Replay(sessionID)
+}
+
 func (s *V2Store) Replay(sessionID string) (SessionV2, error) {
 	if err := s.requireRoot(); err != nil {
 		return SessionV2{}, err
@@ -486,34 +601,70 @@ func (s *V2Store) appendRecord(sessionID string, record v2Record) (int64, error)
 		record.Item.Seq = record.Seq
 	}
 
-	line, err := json.Marshal(record)
-	if err != nil {
-		return 0, fmt.Errorf("marshal session record %d: %w", record.Seq, err)
-	}
-	line = append(line, '\n')
-	if len(line) > maxJSONLRecordBytes {
-		return 0, fmt.Errorf("session record %d is too large: %d bytes", record.Seq, len(line))
-	}
-
-	path, err := s.appendSegmentPath(sessionID)
-	if err != nil {
+	if err := s.appendRecords(sessionID, []v2Record{record}); err != nil {
 		return 0, err
-	}
-	file, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
-	if err != nil {
-		return 0, fmt.Errorf("open segment %q: %w", path, err)
-	}
-	if _, err := file.Write(line); err != nil {
-		_ = file.Close()
-		return 0, fmt.Errorf("append segment %q: %w", path, err)
-	}
-	if err := file.Close(); err != nil {
-		return 0, fmt.Errorf("close segment %q: %w", path, err)
 	}
 	return record.Seq, nil
 }
 
+func (s *V2Store) appendRecords(sessionID string, records []v2Record) error {
+	if err := s.requireRoot(); err != nil {
+		return err
+	}
+	if err := validateV2SessionID(sessionID); err != nil {
+		return err
+	}
+	lines := make([][]byte, 0, len(records))
+	for _, record := range records {
+		line, err := marshalV2RecordLine(record)
+		if err != nil {
+			return err
+		}
+		lines = append(lines, line)
+	}
+
+	path, err := s.appendSegmentPathForLines(sessionID, len(lines))
+	if err != nil {
+		return err
+	}
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
+		return fmt.Errorf("open segment %q: %w", path, err)
+	}
+	for _, line := range lines {
+		n, err := file.Write(line)
+		if err != nil {
+			_ = file.Close()
+			return fmt.Errorf("append segment %q: %w", path, err)
+		}
+		if n != len(line) {
+			_ = file.Close()
+			return fmt.Errorf("append segment %q: %w", path, io.ErrShortWrite)
+		}
+	}
+	if err := file.Close(); err != nil {
+		return fmt.Errorf("close segment %q: %w", path, err)
+	}
+	return nil
+}
+
+func marshalV2RecordLine(record v2Record) ([]byte, error) {
+	line, err := json.Marshal(record)
+	if err != nil {
+		return nil, fmt.Errorf("marshal session record %d: %w", record.Seq, err)
+	}
+	line = append(line, '\n')
+	if len(line) > maxJSONLRecordBytes {
+		return nil, fmt.Errorf("session record %d is too large: %d bytes", record.Seq, len(line))
+	}
+	return line, nil
+}
+
 func (s *V2Store) appendSegmentPath(sessionID string) (string, error) {
+	return s.appendSegmentPathForLines(sessionID, 1)
+}
+
+func (s *V2Store) appendSegmentPathForLines(sessionID string, lineCount int) (string, error) {
 	segmentsDir := s.segmentsDir(sessionID)
 	if err := os.MkdirAll(segmentsDir, 0o755); err != nil {
 		return "", fmt.Errorf("create segments directory %q: %w", segmentsDir, err)
@@ -527,11 +678,19 @@ func (s *V2Store) appendSegmentPath(sessionID string) (string, error) {
 		return filepath.Join(segmentsDir, "000001.jsonl"), nil
 	}
 	current := segments[len(segments)-1]
+	complete, err := fileEndsWithNewline(current)
+	if err != nil {
+		return "", err
+	}
+	if !complete {
+		next := segmentNumber(filepath.Base(current)) + 1
+		return filepath.Join(segmentsDir, fmt.Sprintf("%06d.jsonl", next)), nil
+	}
 	lines, err := countLines(current)
 	if err != nil {
 		return "", err
 	}
-	if lines < s.maxSegmentLines {
+	if lines+lineCount <= s.maxSegmentLines {
 		return current, nil
 	}
 	next := segmentNumber(filepath.Base(current)) + 1
@@ -605,6 +764,7 @@ func v2FilesystemAliasName(id string) string {
 type v2Record struct {
 	Seq        int64                 `json:"seq"`
 	Type       string                `json:"type"`
+	TxID       string                `json:"tx_id,omitempty"`
 	Item       *SessionItem          `json:"item,omitempty"`
 	ItemIDs    []string              `json:"item_ids,omitempty"`
 	Compaction *CompactionCheckpoint `json:"compaction,omitempty"`
@@ -714,6 +874,11 @@ func (m sessionV2Metadata) session() SessionV2 {
 	}
 }
 
+type replayTransaction struct {
+	txID    string
+	records []v2Record
+}
+
 func replaySegment(path string, state *SessionV2) error {
 	file, err := os.Open(path)
 	if err != nil {
@@ -723,14 +888,18 @@ func replaySegment(path string, state *SessionV2) error {
 
 	reader := bufio.NewReader(file)
 	lineNumber := 0
+	var pending *replayTransaction
 	for {
 		line, err := reader.ReadBytes('\n')
 		if len(line) > 0 {
+			if errors.Is(err, io.EOF) && line[len(line)-1] != '\n' {
+				break
+			}
 			lineNumber++
 			if len(line) > maxJSONLRecordBytes {
 				return corruptedSessionError(state.ID, "%s:%d record exceeds %d bytes", path, lineNumber, maxJSONLRecordBytes)
 			}
-			if err := replayRecord(path, lineNumber, line, state); err != nil {
+			if err := replayRecord(path, lineNumber, line, state, &pending); err != nil {
 				return err
 			}
 		}
@@ -744,7 +913,7 @@ func replaySegment(path string, state *SessionV2) error {
 	return nil
 }
 
-func replayRecord(path string, lineNumber int, line []byte, state *SessionV2) error {
+func replayRecord(path string, lineNumber int, line []byte, state *SessionV2, pending **replayTransaction) error {
 	line = []byte(strings.TrimSpace(string(line)))
 	if len(line) == 0 {
 		return nil
@@ -753,6 +922,60 @@ func replayRecord(path string, lineNumber int, line []byte, state *SessionV2) er
 	if err := json.Unmarshal(line, &record); err != nil {
 		return corruptedSessionError(state.ID, "%s:%d invalid JSONL record: %v", path, lineNumber, err)
 	}
+	if record.Type == RecordTypeTransactionBegin {
+		if record.TxID == "" {
+			return corruptedSessionError(state.ID, "%s:%d transaction.begin missing tx_id", path, lineNumber)
+		}
+		if record.Seq != state.LastSeq+1 {
+			return corruptedSessionError(state.ID, "%s:%d record seq %d follows seq %d", path, lineNumber, record.Seq, state.LastSeq)
+		}
+		*pending = &replayTransaction{txID: record.TxID, records: []v2Record{record}}
+		return nil
+	}
+	if record.TxID != "" {
+		if *pending == nil || (*pending).txID != record.TxID {
+			*pending = nil
+			return nil
+		}
+		expectedSeq := state.LastSeq + int64(len((*pending).records)) + 1
+		if record.Seq != expectedSeq {
+			*pending = nil
+			return nil
+		}
+		if record.Type == RecordTypeTransactionCommit {
+			if err := replayCommittedTransaction(*pending, record, state); err != nil {
+				return err
+			}
+			*pending = nil
+			return nil
+		}
+		(*pending).records = append((*pending).records, record)
+		return nil
+	}
+	*pending = nil
+	return replayCommittedRecord(path, lineNumber, record, state)
+}
+
+func replayCommittedTransaction(pending *replayTransaction, commit v2Record, state *SessionV2) error {
+	if pending == nil || len(pending.records) == 0 {
+		return nil
+	}
+	temp := copySessionV2(*state)
+	temp.LastSeq = pending.records[0].Seq
+	for _, record := range pending.records[1:] {
+		if err := replayCommittedRecord("", 0, record, &temp); err != nil {
+			return err
+		}
+	}
+	if commit.Seq != temp.LastSeq+1 {
+		return corruptedSessionError(state.ID, "transaction %q commit seq %d follows seq %d", commit.TxID, commit.Seq, temp.LastSeq)
+	}
+	temp.LastSeq = commit.Seq
+	*state = temp
+	return nil
+}
+
+func replayCommittedRecord(path string, lineNumber int, record v2Record, state *SessionV2) error {
 	if record.Seq != state.LastSeq+1 {
 		return corruptedSessionError(state.ID, "%s:%d record seq %d follows seq %d", path, lineNumber, record.Seq, state.LastSeq)
 	}
@@ -800,6 +1023,30 @@ func countLines(path string) (int, error) {
 		}
 		return 0, fmt.Errorf("read segment %q: %w", path, err)
 	}
+}
+
+func fileEndsWithNewline(path string) (bool, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return false, fmt.Errorf("open segment %q: %w", path, err)
+	}
+	defer file.Close()
+
+	info, err := file.Stat()
+	if err != nil {
+		return false, fmt.Errorf("stat segment %q: %w", path, err)
+	}
+	if info.Size() == 0 {
+		return true, nil
+	}
+	if _, err := file.Seek(-1, io.SeekEnd); err != nil {
+		return false, fmt.Errorf("seek segment %q: %w", path, err)
+	}
+	var last [1]byte
+	if _, err := io.ReadFull(file, last[:]); err != nil {
+		return false, fmt.Errorf("read segment %q: %w", path, err)
+	}
+	return last[0] == '\n', nil
 }
 
 func segmentNumber(name string) int {

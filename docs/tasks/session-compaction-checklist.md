@@ -12,10 +12,10 @@ Out of scope: the future session-history query tool.
 
 - [x] Config and CLI plumbing: add `compaction.enabled`, `threshold_percent`,
   `summary_provider`, and `summary_model` with documented defaults and validation.
-- [ ] V2 session runtime: persist successful turns as append-only `Items` plus
+- [x] V2 session runtime: persist successful turns as append-only `Items` plus
   `ActiveHistory`, while keeping `sessions.save_tool_results: true` required for
   reliable save/resume/compaction.
-- [ ] Resume path: materialize model messages only from `ActiveHistory`, use saved
+- [x] Resume path: materialize model messages only from `ActiveHistory`, use saved
   runtime metadata, and report corrupted sessions for invalid refs or illegal tool
   history.
 - [ ] Manual `/compact`: support the command only in normal single-line REPL mode,

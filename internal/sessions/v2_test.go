@@ -429,6 +429,100 @@ func TestV2StoreAppendItemsReplayBySeq(t *testing.T) {
 	}
 }
 
+func TestV2StoreAppendItemsAndReplaceActiveHistoryCommitsTransaction(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "sessions")
+	clock := &fakeClock{current: time.Date(2026, 7, 3, 1, 2, 3, 0, time.UTC)}
+	store := newV2StoreWithClock(root, V2StoreOptions{}, clock.Now)
+
+	replayed, err := store.AppendItemsAndReplaceActiveHistory("session-1", []SessionItem{
+		{
+			ID:         "item-1",
+			Kind:       ItemKindMessage,
+			Visibility: ItemVisibilityVisible,
+			Audience:   ItemAudienceUser,
+			Message:    &model.Message{Role: model.MessageRoleUser, Content: "hello"},
+		},
+		{
+			ID:         "item-2",
+			Kind:       ItemKindMessage,
+			Visibility: ItemVisibilityVisible,
+			Audience:   ItemAudienceModel,
+			Message:    &model.Message{Role: model.MessageRoleAssistant, Content: "hi"},
+		},
+	}, []string{"item-1", "item-2"})
+	if err != nil {
+		t.Fatalf("AppendItemsAndReplaceActiveHistory() error = %v", err)
+	}
+
+	if got := itemIDs(replayed.Items); !reflect.DeepEqual(got, []string{"item-1", "item-2"}) {
+		t.Fatalf("item IDs = %#v, want committed items", got)
+	}
+	if !reflect.DeepEqual(replayed.ActiveHistory, []string{"item-1", "item-2"}) {
+		t.Fatalf("ActiveHistory = %#v, want committed replacement", replayed.ActiveHistory)
+	}
+	if replayed.Items[0].Seq != 2 || replayed.Items[1].Seq != 3 || replayed.LastSeq != 5 {
+		t.Fatalf("seqs = items %d/%d last %d, want 2/3 last 5", replayed.Items[0].Seq, replayed.Items[1].Seq, replayed.LastSeq)
+	}
+}
+
+func TestV2StoreReplayIgnoresUncommittedTransaction(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "sessions")
+	store := NewV2Store(root)
+	appendTestItem(t, store, "session-1", "item-1", "one")
+	if _, err := store.ReplaceActiveHistory("session-1", []string{"item-1"}); err != nil {
+		t.Fatalf("ReplaceActiveHistory() error = %v", err)
+	}
+
+	segmentPath := filepath.Join(root, "session-1", "segments", "000001.jsonl")
+	appendV2RecordsForTest(t, segmentPath,
+		v2Record{Seq: 3, Type: RecordTypeTransactionBegin, TxID: "tx-abandoned"},
+		v2Record{
+			Seq:  4,
+			Type: RecordTypeItemAppended,
+			TxID: "tx-abandoned",
+			Item: &SessionItem{
+				ID:         "item-2",
+				Seq:        4,
+				Kind:       ItemKindMessage,
+				Visibility: ItemVisibilityVisible,
+				Audience:   ItemAudienceUser,
+				Message:    &model.Message{Role: model.MessageRoleUser, Content: "ignored"},
+			},
+		},
+		v2Record{Seq: 5, Type: RecordTypeActiveHistoryReplaced, TxID: "tx-abandoned", ItemIDs: []string{"item-1", "item-2"}},
+	)
+
+	replayed, err := store.Replay("session-1")
+	if err != nil {
+		t.Fatalf("Replay() error = %v", err)
+	}
+	if got := itemIDs(replayed.Items); !reflect.DeepEqual(got, []string{"item-1"}) {
+		t.Fatalf("item IDs after abandoned transaction = %#v, want original only", got)
+	}
+	if !reflect.DeepEqual(replayed.ActiveHistory, []string{"item-1"}) || replayed.LastSeq != 2 {
+		t.Fatalf("state after abandoned transaction = active %#v last %d, want item-1/2", replayed.ActiveHistory, replayed.LastSeq)
+	}
+
+	replayed, err = store.AppendItemsAndReplaceActiveHistory("session-1", []SessionItem{
+		{
+			ID:         "item-3",
+			Kind:       ItemKindMessage,
+			Visibility: ItemVisibilityVisible,
+			Audience:   ItemAudienceUser,
+			Message:    &model.Message{Role: model.MessageRoleUser, Content: "three"},
+		},
+	}, []string{"item-1", "item-3"})
+	if err != nil {
+		t.Fatalf("AppendItemsAndReplaceActiveHistory(after abandoned) error = %v", err)
+	}
+	if got := itemIDs(replayed.Items); !reflect.DeepEqual(got, []string{"item-1", "item-3"}) {
+		t.Fatalf("item IDs after new transaction = %#v, want original plus new committed item", got)
+	}
+	if !reflect.DeepEqual(replayed.ActiveHistory, []string{"item-1", "item-3"}) {
+		t.Fatalf("ActiveHistory after new transaction = %#v, want item-1,item-3", replayed.ActiveHistory)
+	}
+}
+
 func TestV2StoreSegmentRolloverByMaxLineCount(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "sessions")
 	store := NewV2StoreWithOptions(root, V2StoreOptions{MaxSegmentLines: 2})
@@ -719,6 +813,29 @@ func appendTestItem(t *testing.T, store *V2Store, sessionID, itemID, content str
 		Message:    &model.Message{Role: model.MessageRoleUser, Content: content},
 	}); err != nil {
 		t.Fatalf("AppendItem(%q) error = %v", itemID, err)
+	}
+}
+
+func appendV2RecordsForTest(t *testing.T, path string, records ...v2Record) {
+	t.Helper()
+
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
+		t.Fatalf("OpenFile(%q) error = %v", path, err)
+	}
+	for _, record := range records {
+		line, err := marshalV2RecordLine(record)
+		if err != nil {
+			_ = file.Close()
+			t.Fatalf("marshalV2RecordLine() error = %v", err)
+		}
+		if _, err := file.Write(line); err != nil {
+			_ = file.Close()
+			t.Fatalf("Write(%q) error = %v", path, err)
+		}
+	}
+	if err := file.Close(); err != nil {
+		t.Fatalf("Close(%q) error = %v", path, err)
 	}
 }
 

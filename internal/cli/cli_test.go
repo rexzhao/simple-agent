@@ -2525,6 +2525,16 @@ func TestChatSaveSessionFlagWritesFullToolHistory(t *testing.T) {
 	assertNoAdditionalCLIRunRequest(t, requests)
 
 	session := loadOnlyCLISession(t, filepath.Join(configDir, "sessions"))
+	sessionDir := filepath.Join(configDir, "sessions", session.ID)
+	if _, err := os.Stat(filepath.Join(sessionDir, "meta.json")); err != nil {
+		t.Fatalf("meta.json stat error = %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(sessionDir, "segments")); err != nil {
+		t.Fatalf("segments stat error = %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(sessionDir, "session.json")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("session.json stat error = %v, want not exist", err)
+	}
 	if session.Provider != "fake" || session.ModelProfile != "default" || session.ModelID != "model-default" {
 		t.Fatalf("saved model metadata = provider %q profile %q model %q", session.Provider, session.ModelProfile, session.ModelID)
 	}
@@ -2541,14 +2551,59 @@ func TestChatSaveSessionFlagWritesFullToolHistory(t *testing.T) {
 		t.Fatal("SaveToolResults = false, want true")
 	}
 	assertSavedMessage(t, session.InstructionsSnapshot, 0, model.MessageRoleSystem, builtInBaseInstructions)
-	if len(session.Messages) != 5 {
-		t.Fatalf("len(saved messages) = %d, want 5: %#v", len(session.Messages), session.Messages)
+	messages := activeCLIMessages(t, session)
+	if len(messages) != 5 {
+		t.Fatalf("len(saved messages) = %d, want 5: %#v", len(messages), messages)
 	}
-	assertSavedMessage(t, session.Messages, 0, model.MessageRoleSystem, builtInBaseInstructions)
-	assertSavedMessage(t, session.Messages, 1, model.MessageRoleUser, "Read note")
-	assertSavedAssistantToolCallMessage(t, session.Messages, 2, "call_1", "read_file", `{"path":"note.txt"}`)
-	assertSavedToolMessage(t, session.Messages, 3, "call_1", "tool output")
-	assertSavedMessage(t, session.Messages, 4, model.MessageRoleAssistant, "done")
+	assertSavedMessage(t, messages, 0, model.MessageRoleSystem, builtInBaseInstructions)
+	assertSavedMessage(t, messages, 1, model.MessageRoleUser, "Read note")
+	assertSavedAssistantToolCallMessage(t, messages, 2, "call_1", "read_file", `{"path":"note.txt"}`)
+	assertSavedToolMessage(t, messages, 3, "call_1", "tool output")
+	assertSavedMessage(t, messages, 4, model.MessageRoleAssistant, "done")
+}
+
+func TestChatSaveSessionFailureDoesNotExposePartialNewSession(t *testing.T) {
+	requests := make(chan struct{}, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		requests <- struct{}{}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"one\"}}]}\n\n")
+		_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
+	}))
+	defer server.Close()
+
+	configDir := t.TempDir()
+	writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
+	setCLIModelContextWindow(t, configDir, 30000000)
+
+	oversizedPrompt := strings.Repeat("x", 17*1024*1024)
+	var stdout, stderr bytes.Buffer
+	code := RunWithIO([]string{"--config", cliConfigPath(configDir), "chat", "--save-session", "--quit", "--prompt", oversizedPrompt}, strings.NewReader(""), &stdout, &stderr, func() (string, error) {
+		return t.TempDir(), nil
+	})
+
+	if code != 1 {
+		t.Fatalf("RunWithIO() code = %d, want 1", code)
+	}
+	if got := stdout.String(); got != "one" {
+		t.Fatalf("stdout = %q, want streamed provider output before save failure", got)
+	}
+	<-requests
+	assertCLIErrorContains(t, stderr.String(), "save resumable session", "too large")
+	assertCLIErrorOmits(t, stderr.String(), "direct-secret-value")
+
+	store := sessions.NewV2Store(filepath.Join(configDir, "sessions"))
+	infos, err := store.List()
+	if err != nil {
+		t.Fatalf("List() error = %v", err)
+	}
+	if len(infos) != 0 {
+		t.Fatalf("sessions after failed first save = %#v, want none", infos)
+	}
+	if _, err := store.Latest(); !errors.Is(err, sessions.ErrNotFound) {
+		t.Fatalf("Latest() after failed first save error = %v, want ErrNotFound", err)
+	}
 }
 
 func TestChatSaveSessionFlagOverridesDisabledConfigAndPrintsNoticeBeforeProviderRequest(t *testing.T) {
@@ -2596,8 +2651,8 @@ func TestChatSaveSessionFlagOverridesDisabledConfigAndPrintsNoticeBeforeProvider
 	assertNoAdditionalCLIRunRequest(t, requests)
 	assertResumableSessionNoticeOnce(t, stderr.String())
 	session := loadOnlyCLISession(t, filepath.Join(configDir, "sessions"))
-	if len(session.Messages) != 3 {
-		t.Fatalf("len(saved messages) = %d, want 3: %#v", len(session.Messages), session.Messages)
+	if messages := activeCLIMessages(t, session); len(messages) != 3 {
+		t.Fatalf("len(saved messages) = %d, want 3: %#v", len(messages), messages)
 	}
 }
 
@@ -2626,12 +2681,13 @@ func TestChatConfiguredSessionsSaveFullMessages(t *testing.T) {
 	assertNoAdditionalCLIRunRequest(t, requests)
 
 	session := loadOnlyCLISession(t, filepath.Join(configDir, "sessions"))
-	if len(session.Messages) != 3 {
-		t.Fatalf("len(saved messages) = %d, want 3: %#v", len(session.Messages), session.Messages)
+	messages := activeCLIMessages(t, session)
+	if len(messages) != 3 {
+		t.Fatalf("len(saved messages) = %d, want 3: %#v", len(messages), messages)
 	}
-	assertSavedMessage(t, session.Messages, 0, model.MessageRoleSystem, builtInBaseInstructions)
-	assertSavedMessage(t, session.Messages, 1, model.MessageRoleUser, "first")
-	assertSavedMessage(t, session.Messages, 2, model.MessageRoleAssistant, "one")
+	assertSavedMessage(t, messages, 0, model.MessageRoleSystem, builtInBaseInstructions)
+	assertSavedMessage(t, messages, 1, model.MessageRoleUser, "first")
+	assertSavedMessage(t, messages, 2, model.MessageRoleAssistant, "one")
 	if session.Context.ContextWindow != contextwindow.DefaultContextWindowTokens || session.Context.ContextWindowSource != string(contextwindow.WindowSourceEstimated) {
 		t.Fatalf("session context window = %d/%q, want default estimated", session.Context.ContextWindow, session.Context.ContextWindowSource)
 	}
@@ -2748,7 +2804,7 @@ func TestChatConfiguredSessionNoticePrintsOnceWithoutSensitiveContent(t *testing
 	assertCLIErrorOmits(t, errOut, "first prompt secret", "second prompt secret", "first assistant secret", "second assistant secret", "direct-secret-value")
 }
 
-func TestChatResumeSendsRestoredMessagesAndSavesContinuation(t *testing.T) {
+func TestChatResumeSendsOnlyActiveHistoryAndSavesContinuation(t *testing.T) {
 	server, requests := newCLIRunServer(t,
 		`{"choices":[{"delta":{"content":"two"}}]}`,
 		`[DONE]`,
@@ -2758,37 +2814,45 @@ func TestChatResumeSendsRestoredMessagesAndSavesContinuation(t *testing.T) {
 	configDir := t.TempDir()
 	writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
 	sessionRoot := filepath.Join(configDir, "sessions")
-	writeCLISession(t, sessionRoot, sessions.Session{
+	savedInstruction := model.Message{Role: model.MessageRoleSystem, Content: "saved instructions"}
+	oldVisible := model.Message{Role: model.MessageRoleUser, Content: "old visible item secret"}
+	activeUser := model.Message{Role: model.MessageRoleUser, Content: "first"}
+	activeAssistant := model.Message{Role: model.MessageRoleAssistant, Content: "one"}
+	writeCLISessionV2(t, sessionRoot, sessions.SessionV2{
 		ID:              "resume-session",
 		CreatedAt:       time.Date(2026, 7, 2, 3, 4, 5, 0, time.UTC),
 		UpdatedAt:       time.Date(2026, 7, 2, 3, 4, 6, 0, time.UTC),
-		Version:         sessions.CurrentVersion,
+		Version:         sessions.VersionV2,
 		Provider:        "fake",
 		ModelProfile:    "fast",
 		ModelID:         "model-fast",
 		ModelParameters: map[string]any{"temperature": 0.2, "max_tokens": 64},
 		ConfigPath:      cliConfigPath(configDir),
 		InstructionsSnapshot: []model.Message{
-			{Role: model.MessageRoleSystem, Content: "saved instructions"},
+			savedInstruction,
 		},
-		Messages: []model.Message{
-			{Role: model.MessageRoleSystem, Content: "saved instructions"},
-			{Role: model.MessageRoleUser, Content: "first"},
-			{Role: model.MessageRoleAssistant, Content: "one"},
+		Items: []sessions.SessionItem{
+			sessionItemFromMessage("runtime-saved", savedInstruction),
+			sessionItemFromMessage("old-visible", oldVisible),
+			sessionItemFromMessage("active-user", activeUser),
+			sessionItemFromMessage("active-assistant", activeAssistant),
 		},
+		ActiveHistory:   []string{"runtime-saved", "active-user", "active-assistant"},
 		SaveToolResults: true,
 	})
+	projectDir := t.TempDir()
+	writeCLIFile(t, filepath.Join(projectDir, "AGENTS.md"), "current project instruction secret\n")
 
 	var stdout, stderr bytes.Buffer
 	code := RunWithIO([]string{"--config", cliConfigPath(configDir), "chat", "--resume", "resume-session", "--quit", "--prompt", "next"}, strings.NewReader(""), &stdout, &stderr, func() (string, error) {
-		return t.TempDir(), nil
+		return projectDir, nil
 	})
 
 	if code != 0 {
 		t.Fatalf("RunWithIO() code = %d, stderr = %s", code, stderr.String())
 	}
 	assertResumableSessionNoticeOnce(t, stderr.String())
-	assertCLIErrorOmits(t, stderr.String(), "first", "one", "next", "two")
+	assertCLIErrorOmits(t, stderr.String(), "first", "one", "next", "two", "old visible item secret", "current project instruction secret")
 	request := <-requests
 	if got := request.Body["model"]; got != "model-fast" {
 		t.Fatalf("model = %#v, want model-fast", got)
@@ -2801,14 +2865,89 @@ func TestChatResumeSendsRestoredMessagesAndSavesContinuation(t *testing.T) {
 	assertMessage(t, messages, 1, "user", "first")
 	assertMessage(t, messages, 2, "assistant", "one")
 	assertMessage(t, messages, 3, "user", "next")
+	for _, leaked := range []string{"old visible item secret", "current project instruction secret"} {
+		if strings.Contains(string(request.RawBody), leaked) {
+			t.Fatalf("resume request included inactive/current content %q: %s", leaked, request.RawBody)
+		}
+	}
 	assertNoAdditionalCLIRunRequest(t, requests)
 
 	session := loadCLISession(t, sessionRoot, "resume-session")
-	if len(session.Messages) != 5 {
-		t.Fatalf("len(saved messages) = %d, want 5: %#v", len(session.Messages), session.Messages)
+	active := activeCLIMessages(t, session)
+	if len(active) != 5 {
+		t.Fatalf("len(saved messages) = %d, want 5: %#v", len(active), active)
 	}
-	assertSavedMessage(t, session.Messages, 3, model.MessageRoleUser, "next")
-	assertSavedMessage(t, session.Messages, 4, model.MessageRoleAssistant, "two")
+	assertSavedMessage(t, active, 3, model.MessageRoleUser, "next")
+	assertSavedMessage(t, active, 4, model.MessageRoleAssistant, "two")
+	if len(session.Items) != 6 {
+		t.Fatalf("len(session.Items) = %d, want inactive item plus appended active items: %#v", len(session.Items), session.Items)
+	}
+}
+
+func TestChatResumeRejectsCorruptedActiveHistory(t *testing.T) {
+	server, requests := newCLIRunServer(t,
+		`{"choices":[{"delta":{"content":"unexpected assistant secret"}}]}`,
+		`[DONE]`,
+	)
+	defer server.Close()
+
+	tests := []struct {
+		name    string
+		session sessions.SessionV2
+		want    string
+	}{
+		{
+			name: "missing item ref",
+			session: sessions.SessionV2{
+				ID:              "missing-ref-session",
+				Version:         sessions.VersionV2,
+				Provider:        "fake",
+				ModelProfile:    "default",
+				ModelID:         "model-default",
+				ActiveHistory:   []string{"missing"},
+				SaveToolResults: true,
+			},
+			want: `active history references missing item "missing"`,
+		},
+		{
+			name: "orphan tool result",
+			session: sessions.SessionV2{
+				ID:           "orphan-tool-session",
+				Version:      sessions.VersionV2,
+				Provider:     "fake",
+				ModelProfile: "default",
+				ModelID:      "model-default",
+				Items: []sessions.SessionItem{
+					sessionItemFromMessage("tool-only", model.Message{Role: model.MessageRoleTool, ToolCallID: "call_1", Content: "tool result secret"}),
+				},
+				ActiveHistory:   []string{"tool-only"},
+				SaveToolResults: true,
+			},
+			want: `references unresolved tool call "call_1"`,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			configDir := t.TempDir()
+			writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
+			writeCLISessionV2(t, filepath.Join(configDir, "sessions"), tt.session)
+
+			var stdout, stderr bytes.Buffer
+			code := RunWithIO([]string{"--config", cliConfigPath(configDir), "chat", "--resume", tt.session.ID, "--quit", "--prompt", "next prompt secret"}, strings.NewReader(""), &stdout, &stderr, func() (string, error) {
+				return t.TempDir(), nil
+			})
+
+			if code != 1 {
+				t.Fatalf("RunWithIO() code = %d, want 1", code)
+			}
+			if stdout.String() != "" {
+				t.Fatalf("stdout = %q, want empty", stdout.String())
+			}
+			assertCLIErrorContains(t, stderr.String(), "corrupted session", tt.want)
+			assertCLIErrorOmits(t, stderr.String(), "next prompt secret", "tool result secret", "unexpected assistant secret", "direct-secret-value")
+			assertNoAdditionalCLIRunRequest(t, requests)
+		})
+	}
 }
 
 func TestChatContinueUsesLatestSession(t *testing.T) {
@@ -3323,7 +3462,7 @@ func TestSessionsDeleteRemovesSessionAndReportsMissingSession(t *testing.T) {
 	if got, want := stdout.String(), "deleted session delete-session\n"; got != want {
 		t.Fatalf("stdout = %q, want %q", got, want)
 	}
-	if _, err := sessions.NewStore(sessionRoot).Load("delete-session"); !errors.Is(err, sessions.ErrNotFound) {
+	if _, err := sessions.NewV2Store(sessionRoot).Load("delete-session"); !errors.Is(err, sessions.ErrNotFound) {
 		t.Fatalf("Load(deleted) error = %v, want ErrNotFound", err)
 	}
 
@@ -3424,7 +3563,7 @@ func TestSessionsPruneKeepsNewestSessionsWithMixedKeepFlag(t *testing.T) {
 						t.Fatalf("prune output missing %q:\n%s", want, out)
 					}
 				}
-				infos, err := sessions.NewStore(sessionRoot).List()
+				infos, err := sessions.NewV2Store(sessionRoot).List()
 				if err != nil {
 					t.Fatalf("List() after prune error = %v", err)
 				}
@@ -3442,7 +3581,7 @@ func TestSessionsPruneKeepsNewestSessionsWithMixedKeepFlag(t *testing.T) {
 			if strings.Contains(out, "newest-session") {
 				t.Fatalf("prune output included kept session:\n%s", out)
 			}
-			infos, err := sessions.NewStore(sessionRoot).List()
+			infos, err := sessions.NewV2Store(sessionRoot).List()
 			if err != nil {
 				t.Fatalf("List() after prune error = %v", err)
 			}
@@ -5545,10 +5684,10 @@ func setCLIInstructionFiles(t *testing.T, configDir string, files []string) {
 	writeCLIFile(t, configPath, updated)
 }
 
-func loadOnlyCLISession(t *testing.T, root string) sessions.Session {
+func loadOnlyCLISession(t *testing.T, root string) sessions.SessionV2 {
 	t.Helper()
 
-	store := sessions.NewStore(root)
+	store := sessions.NewV2Store(root)
 	infos, err := store.List()
 	if err != nil {
 		t.Fatalf("List() error = %v", err)
@@ -5559,31 +5698,124 @@ func loadOnlyCLISession(t *testing.T, root string) sessions.Session {
 	return loadCLISession(t, root, infos[0].ID)
 }
 
-func loadCLISession(t *testing.T, root, id string) sessions.Session {
+func loadCLISession(t *testing.T, root, id string) sessions.SessionV2 {
 	t.Helper()
 
-	session, err := sessions.NewStore(root).Load(id)
+	session, err := sessions.NewV2Store(root).Load(id)
 	if err != nil {
 		t.Fatalf("Load(%q) error = %v", id, err)
 	}
 	return session
 }
 
+func activeCLIMessages(t *testing.T, session sessions.SessionV2) []model.Message {
+	t.Helper()
+
+	messages, err := session.MaterializeActiveHistory()
+	if err != nil {
+		t.Fatalf("MaterializeActiveHistory(%q) error = %v", session.ID, err)
+	}
+	return messages
+}
+
 func writeCLISession(t *testing.T, root string, session sessions.Session) {
 	t.Helper()
 
-	if err := os.MkdirAll(filepath.Join(root, session.ID), 0o755); err != nil {
+	v2 := sessions.SessionV2{
+		ID:                   session.ID,
+		CreatedAt:            session.CreatedAt,
+		UpdatedAt:            session.UpdatedAt,
+		Version:              sessions.VersionV2,
+		Provider:             session.Provider,
+		ModelProfile:         session.ModelProfile,
+		ModelID:              session.ModelID,
+		ModelParameters:      session.ModelParameters,
+		CWD:                  session.CWD,
+		ConfigPath:           session.ConfigPath,
+		ConfigDir:            session.ConfigDir,
+		EnabledTools:         session.EnabledTools,
+		EnabledMCP:           session.EnabledMCP,
+		EnabledSkills:        session.EnabledSkills,
+		ShowReasoning:        session.ShowReasoning,
+		InstructionsSnapshot: session.InstructionsSnapshot,
+		InstructionSources:   session.InstructionSources,
+		Context:              session.Context,
+		SaveToolResults:      session.SaveToolResults,
+	}
+	for _, message := range session.Messages {
+		id := nextSessionItemID(sessionItemIDs(v2.Items), message)
+		v2.Items = append(v2.Items, sessionItemFromMessage(id, message))
+		v2.ActiveHistory = append(v2.ActiveHistory, id)
+	}
+	writeCLISessionV2(t, root, v2)
+}
+
+func writeCLISessionV2(t *testing.T, root string, session sessions.SessionV2) {
+	t.Helper()
+
+	if session.Version == 0 || session.Version == sessions.CurrentVersion {
+		session.Version = sessions.VersionV2
+	}
+	if err := os.MkdirAll(filepath.Join(root, session.ID, "segments"), 0o755); err != nil {
 		t.Fatalf("MkdirAll(session %q) error = %v", session.ID, err)
 	}
-	data, err := json.MarshalIndent(session, "", "  ")
+	metadata := session
+	metadata.Items = nil
+	metadata.ActiveHistory = nil
+	metadata.Compactions = nil
+	metadata.LastSeq = 0
+	data, err := json.MarshalIndent(metadata, "", "  ")
 	if err != nil {
 		t.Fatalf("MarshalIndent(session %q) error = %v", session.ID, err)
 	}
 	data = append(data, '\n')
-	path := filepath.Join(root, session.ID, "session.json")
+	path := filepath.Join(root, session.ID, "meta.json")
 	if err := os.WriteFile(path, data, 0o600); err != nil {
 		t.Fatalf("WriteFile(%q) error = %v", path, err)
 	}
+
+	segmentPath := filepath.Join(root, session.ID, "segments", "000001.jsonl")
+	segment := &strings.Builder{}
+	seq := int64(0)
+	for _, item := range session.Items {
+		seq++
+		item.Seq = seq
+		if item.CreatedAt.IsZero() {
+			item.CreatedAt = session.CreatedAt
+			if item.CreatedAt.IsZero() {
+				item.CreatedAt = session.UpdatedAt
+			}
+		}
+		writeCLISessionV2Record(t, segment, map[string]any{
+			"seq":  seq,
+			"type": sessions.RecordTypeItemAppended,
+			"item": item,
+		})
+	}
+	if session.ActiveHistory != nil {
+		seq++
+		writeCLISessionV2Record(t, segment, map[string]any{
+			"seq":      seq,
+			"type":     sessions.RecordTypeActiveHistoryReplaced,
+			"item_ids": session.ActiveHistory,
+		})
+	}
+	if segment.Len() > 0 {
+		if err := os.WriteFile(segmentPath, []byte(segment.String()), 0o600); err != nil {
+			t.Fatalf("WriteFile(%q) error = %v", segmentPath, err)
+		}
+	}
+}
+
+func writeCLISessionV2Record(t *testing.T, out *strings.Builder, record map[string]any) {
+	t.Helper()
+
+	data, err := json.Marshal(record)
+	if err != nil {
+		t.Fatalf("Marshal(session record) error = %v", err)
+	}
+	out.Write(data)
+	out.WriteByte('\n')
 }
 
 func writeCLIPruneSession(t *testing.T, root, id string, updatedAt time.Time) {
