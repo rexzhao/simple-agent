@@ -78,6 +78,8 @@ type Manager struct {
 	maxJobs       int
 	nextJobNumber int
 	jobs          map[string]*job
+	completions   []JobSnapshot
+	completionCh  chan struct{}
 	closed        bool
 }
 
@@ -87,11 +89,12 @@ func NewManager(configured map[string]string, runner Runner, opts ...Option) (*M
 	}
 
 	m := &Manager{
-		configured: make(map[string]string, len(configured)),
-		runner:     runner,
-		rootCtx:    context.Background(),
-		maxJobs:    DefaultMaxJobs,
-		jobs:       make(map[string]*job),
+		configured:   make(map[string]string, len(configured)),
+		runner:       runner,
+		rootCtx:      context.Background(),
+		maxJobs:      DefaultMaxJobs,
+		jobs:         make(map[string]*job),
+		completionCh: make(chan struct{}, 1),
 	}
 	for id, configPath := range configured {
 		if strings.TrimSpace(id) == "" {
@@ -287,6 +290,7 @@ func (m *Manager) wait(ctx context.Context, toolName string, arguments map[strin
 	}
 	if isTerminalStatus(j.status) {
 		snapshot := j.snapshotLocked()
+		m.consumeCompletionLocked(jobID)
 		m.mu.Unlock()
 		return result(toolName, snapshot)
 	}
@@ -298,7 +302,7 @@ func (m *Manager) wait(ctx context.Context, toolName string, arguments map[strin
 
 	select {
 	case <-done:
-		snapshot, _ := m.snapshot(jobID)
+		snapshot, _ := m.snapshotAndConsumeCompletion(jobID)
 		return result(toolName, snapshot)
 	case <-timer.C:
 		snapshot, _ := m.snapshot(jobID)
@@ -336,6 +340,7 @@ func (m *Manager) cancel(toolName string, arguments map[string]any) (model.ToolR
 	j.err = "canceled"
 	j.accepting = false
 	j.finish()
+	m.consumeCompletionLocked(jobID)
 	cancel := j.cancel
 	snapshot := j.snapshotLocked()
 	m.mu.Unlock()
@@ -369,12 +374,14 @@ func (m *Manager) runJob(jobID string, ctx context.Context, request RunRequest, 
 			j.err = err.Error()
 		}
 		j.finish()
+		m.enqueueCompletionLocked(j)
 		return
 	}
 
 	j.status = StatusCompleted
 	j.output = runResult.Output
 	j.finish()
+	m.enqueueCompletionLocked(j)
 }
 
 func (m *Manager) nextMessage(jobID string) func() (Message, bool) {
@@ -410,10 +417,12 @@ func (m *Manager) Close() error {
 		j.err = "canceled"
 		j.accepting = false
 		j.finish()
+		j.completionConsumed = true
 		if j.cancel != nil {
 			cancels = append(cancels, j.cancel)
 		}
 	}
+	m.completions = nil
 	m.mu.Unlock()
 
 	for _, cancel := range cancels {
@@ -433,20 +442,100 @@ func (m *Manager) snapshot(jobID string) (JobSnapshot, bool) {
 	return j.snapshotLocked(), true
 }
 
+func (m *Manager) snapshotAndConsumeCompletion(jobID string) (JobSnapshot, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	j, ok := m.jobs[jobID]
+	if !ok {
+		return JobSnapshot{}, false
+	}
+	snapshot := j.snapshotLocked()
+	m.consumeCompletionLocked(jobID)
+	return snapshot, true
+}
+
+func (m *Manager) PendingCompletions() []JobSnapshot {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.drainCompletionSignalLocked()
+	if len(m.completions) == 0 {
+		return nil
+	}
+	return append([]JobSnapshot(nil), m.completions...)
+}
+
+func (m *Manager) AckCompletions(completions []JobSnapshot) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, completion := range completions {
+		m.consumeCompletionLocked(completion.JobID)
+	}
+}
+
+func (m *Manager) CompletionSignal() <-chan struct{} {
+	return m.completionCh
+}
+
+func (m *Manager) HasJobs() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.jobs) > 0
+}
+
+func (m *Manager) enqueueCompletionLocked(j *job) {
+	if j == nil || !isTerminalStatus(j.status) || j.completionConsumed || j.completionQueued {
+		return
+	}
+	m.completions = append(m.completions, j.snapshotLocked())
+	j.completionQueued = true
+	select {
+	case m.completionCh <- struct{}{}:
+	default:
+	}
+}
+
+func (m *Manager) consumeCompletionLocked(jobID string) {
+	j, ok := m.jobs[jobID]
+	if !ok {
+		return
+	}
+	j.completionConsumed = true
+	if !j.completionQueued {
+		return
+	}
+	j.completionQueued = false
+	for i, completion := range m.completions {
+		if completion.JobID == jobID {
+			copy(m.completions[i:], m.completions[i+1:])
+			m.completions = m.completions[:len(m.completions)-1]
+			return
+		}
+	}
+}
+
+func (m *Manager) drainCompletionSignalLocked() {
+	select {
+	case <-m.completionCh:
+	default:
+	}
+}
+
 type job struct {
-	id          string
-	agentID     string
-	configPath  string
-	displayName string
-	jobName     string
-	status      JobStatus
-	accepting   bool
-	output      string
-	err         string
-	inbox       chan Message
-	done        chan struct{}
-	doneOnce    sync.Once
-	cancel      context.CancelFunc
+	id                 string
+	agentID            string
+	configPath         string
+	displayName        string
+	jobName            string
+	status             JobStatus
+	accepting          bool
+	output             string
+	err                string
+	inbox              chan Message
+	done               chan struct{}
+	doneOnce           sync.Once
+	cancel             context.CancelFunc
+	completionQueued   bool
+	completionConsumed bool
 }
 
 func (j *job) finish() {

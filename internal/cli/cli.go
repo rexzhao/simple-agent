@@ -220,6 +220,8 @@ including prompts, assistant output, assistant tool calls, and tool results.
 
 const resumableSessionSaveNoticeText = "sai: resumable sessions enabled; full prompts, assistant output, and tool results will be saved to the session file."
 
+const subagentCompletionExitWait = 250 * time.Millisecond
+
 const versionUsageText = `usage: sai version
 
 Prints the sai version.
@@ -1618,54 +1620,81 @@ func chatCommand(ctx context.Context, args []string, configPath string, stdin io
 		return err
 	}
 	if hasInitialPrompt {
-		updated, err := runChatTurn(ctx, runtime, messages, initialPrompt, stdout, stderr, !*quit, false)
+		updated, err := runChatTurnAndCompletions(ctx, runtime, messages, initialPrompt, stdout, stderr, !*quit, false)
 		if err != nil {
 			return err
 		}
 		messages = updated
 		if *quit {
+			messages, err = runCompletionTurnsWithOptionalWait(ctx, runtime, messages, stdout, stderr, false, false, subagentCompletionExitWait)
+			if err != nil {
+				return err
+			}
 			return nil
 		}
 	}
 
 	scanner := bufio.NewScanner(stdin)
+	var inputCh <-chan chatInputEvent
 	for {
-		line, multiline, ok, err := readChatInput(ctx, scanner, stderr)
-		if err != nil {
-			return err
-		}
-		if !ok {
-			return nil
+		if inputCh == nil {
+			inputCh = startChatInputRead(ctx, scanner, stderr)
 		}
 
-		command := strings.TrimSpace(line)
-		if command == "" {
-			continue
-		}
-		if !multiline && (command == "/exit" || command == "/quit") {
-			return nil
-		}
-		if !multiline && command == "/usage" {
-			if err := runtime.writeUsageSummary(stderr); err != nil {
-				return err
+		select {
+		case input := <-inputCh:
+			inputCh = nil
+			if input.err != nil {
+				return input.err
 			}
-			continue
-		}
+			if !input.ok {
+				return nil
+			}
 
-		updated, err := runChatTurn(ctx, runtime, messages, line, stdout, stderr, true, true)
-		if err != nil {
-			if ctxErr := ctx.Err(); ctxErr != nil {
-				return ctxErr
+			command := strings.TrimSpace(input.line)
+			if command == "" {
+				continue
 			}
-			if !isRecoverableTurnError(err) {
-				return err
+			if !input.multiline && (command == "/exit" || command == "/quit") {
+				return nil
 			}
-			if _, printErr := fmt.Fprintf(stderr, "sai: %v\n", err); printErr != nil {
-				return printErr
+			if !input.multiline && command == "/usage" {
+				if err := runtime.writeUsageSummary(stderr); err != nil {
+					return err
+				}
+				continue
 			}
-			continue
+
+			updated, err := runChatTurnAndCompletions(ctx, runtime, messages, input.line, stdout, stderr, true, true)
+			if err != nil {
+				if ctxErr := ctx.Err(); ctxErr != nil {
+					return ctxErr
+				}
+				if !isRecoverableTurnError(err) {
+					return err
+				}
+				if _, printErr := fmt.Fprintf(stderr, "sai: %v\n", err); printErr != nil {
+					return printErr
+				}
+				continue
+			}
+			messages = updated
+		case <-runtime.subagentCompletionSignal():
+			updated, err := runAvailableCompletionTurns(ctx, runtime, messages, stdout, stderr, true, true)
+			if err != nil {
+				if ctxErr := ctx.Err(); ctxErr != nil {
+					return ctxErr
+				}
+				if !isRecoverableTurnError(err) {
+					return err
+				}
+				if _, printErr := fmt.Fprintf(stderr, "sai: %v\n", err); printErr != nil {
+					return printErr
+				}
+				continue
+			}
+			messages = updated
 		}
-		messages = updated
 	}
 }
 
@@ -1706,6 +1735,23 @@ func readInitialPrompt(options agentCommandFlags, stdin io.Reader) (string, bool
 
 const multilineInputDelimiter = `"""`
 
+type chatInputEvent struct {
+	line      string
+	multiline bool
+	ok        bool
+	err       error
+}
+
+func startChatInputRead(ctx context.Context, scanner *bufio.Scanner, stderr io.Writer) <-chan chatInputEvent {
+	ch := make(chan chatInputEvent, 1)
+	go func() {
+		line, multiline, ok, err := readChatInput(ctx, scanner, stderr)
+		ch <- chatInputEvent{line: line, multiline: multiline, ok: ok, err: err}
+		close(ch)
+	}()
+	return ch
+}
+
 func readChatInput(ctx context.Context, scanner *bufio.Scanner, stderr io.Writer) (string, bool, bool, error) {
 	line, ok, err := scanChatLine(ctx, scanner, stderr)
 	if !ok || err != nil {
@@ -1745,19 +1791,31 @@ func scanChatLine(ctx context.Context, scanner *bufio.Scanner, stderr io.Writer)
 }
 
 func runChatTurn(ctx context.Context, runtime *agentRuntime, messages []model.Message, prompt string, stdout, stderr io.Writer, addTrailingNewline bool, stderrNeedsLeadingBreak bool) ([]model.Message, error) {
+	requestMessages := append(copyMessageSlice(messages), model.Message{
+		Role:    model.MessageRoleUser,
+		Content: prompt,
+	})
+	return runChatMessages(ctx, runtime, requestMessages, stdout, stderr, addTrailingNewline, stderrNeedsLeadingBreak)
+}
+
+func runChatTurnAndCompletions(ctx context.Context, runtime *agentRuntime, messages []model.Message, prompt string, stdout, stderr io.Writer, addTrailingNewline bool, stderrNeedsLeadingBreak bool) ([]model.Message, error) {
+	updated, err := runChatTurn(ctx, runtime, messages, prompt, stdout, stderr, addTrailingNewline, stderrNeedsLeadingBreak)
+	if err != nil {
+		return nil, err
+	}
+	return runAvailableCompletionTurns(ctx, runtime, updated, stdout, stderr, addTrailingNewline, true)
+}
+
+func runChatMessages(ctx context.Context, runtime *agentRuntime, requestMessages []model.Message, stdout, stderr io.Writer, addTrailingNewline bool, stderrNeedsLeadingBreak bool) ([]model.Message, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	turnCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	requestMessages := append(copyMessageSlice(messages), model.Message{
-		Role:    model.MessageRoleUser,
-		Content: prompt,
-	})
 	request := model.Request{
 		Model:      runtime.modelID,
-		Messages:   requestMessages,
+		Messages:   copyMessageSlice(requestMessages),
 		Tools:      runtime.toolSchemas,
 		Parameters: runtime.parameters,
 	}
@@ -1794,6 +1852,94 @@ func runChatTurn(ctx context.Context, runtime *agentRuntime, messages []model.Me
 		}
 	}
 	return result.Messages, nil
+}
+
+func runAvailableCompletionTurns(ctx context.Context, runtime *agentRuntime, messages []model.Message, stdout, stderr io.Writer, addTrailingNewline bool, stderrNeedsLeadingBreak bool) ([]model.Message, error) {
+	if runtime == nil || runtime.subagentManager == nil {
+		return messages, nil
+	}
+
+	for {
+		completions := runtime.subagentManager.PendingCompletions()
+		if len(completions) == 0 {
+			return messages, nil
+		}
+		requestMessages := append(copyMessageSlice(messages), subagentCompletionMessages(completions)...)
+		updated, err := runChatMessages(ctx, runtime, requestMessages, stdout, stderr, addTrailingNewline, stderrNeedsLeadingBreak)
+		if err != nil {
+			return nil, err
+		}
+		runtime.subagentManager.AckCompletions(completions)
+		messages = updated
+		stderrNeedsLeadingBreak = true
+	}
+}
+
+func runCompletionTurnsWithOptionalWait(ctx context.Context, runtime *agentRuntime, messages []model.Message, stdout, stderr io.Writer, addTrailingNewline bool, stderrNeedsLeadingBreak bool, wait time.Duration) ([]model.Message, error) {
+	updated, err := runAvailableCompletionTurns(ctx, runtime, messages, stdout, stderr, addTrailingNewline, stderrNeedsLeadingBreak)
+	if err != nil {
+		return nil, err
+	}
+	messages = updated
+	if runtime == nil || runtime.subagentManager == nil || wait <= 0 || !runtime.subagentManager.HasJobs() {
+		return messages, nil
+	}
+
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+
+	select {
+	case <-runtime.subagentManager.CompletionSignal():
+		return runAvailableCompletionTurns(ctx, runtime, messages, stdout, stderr, addTrailingNewline, true)
+	case <-timer.C:
+		return runAvailableCompletionTurns(ctx, runtime, messages, stdout, stderr, addTrailingNewline, true)
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+func subagentCompletionMessages(completions []subagents.JobSnapshot) []model.Message {
+	messages := make([]model.Message, 0, len(completions))
+	for _, completion := range completions {
+		messages = append(messages, model.Message{
+			Role:    model.MessageRoleUser,
+			Content: formatSubagentCompletionEvent(completion),
+		})
+	}
+	return messages
+}
+
+func formatSubagentCompletionEvent(completion subagents.JobSnapshot) string {
+	var out strings.Builder
+	fmt.Fprintf(&out, "Runtime event: subagent job %s", completion.Status)
+	fmt.Fprintf(&out, "\njob_id: %s", completion.JobID)
+	fmt.Fprintf(&out, "\nagent_id: %s", completion.AgentID)
+	if completion.DisplayName != "" {
+		fmt.Fprintf(&out, "\ndisplay_name: %s", completion.DisplayName)
+	}
+	if completion.JobName != "" {
+		fmt.Fprintf(&out, "\njob_name: %s", completion.JobName)
+	}
+	fmt.Fprintf(&out, "\nstatus: %s", completion.Status)
+	if completion.Status == subagents.StatusCompleted || completion.Output != "" {
+		writeCompletionValue(&out, "output", completion.Output)
+	}
+	if completion.Status == subagents.StatusFailed || completion.Status == subagents.StatusCanceled || completion.Error != "" {
+		writeCompletionValue(&out, "error", completion.Error)
+	}
+	return out.String()
+}
+
+func writeCompletionValue(out *strings.Builder, label, value string) {
+	if value == "" {
+		fmt.Fprintf(out, "\n%s: \"\"", label)
+		return
+	}
+	if strings.Contains(value, "\n") {
+		fmt.Fprintf(out, "\n%s:\n%s", label, value)
+		return
+	}
+	fmt.Fprintf(out, "\n%s: %s", label, value)
 }
 
 func intersperseFlagArgs(flags *flag.FlagSet, args []string) ([]string, error) {
@@ -1889,6 +2035,13 @@ func (r *agentRuntime) Close() error {
 		subagentErr = r.subagentManager.Close()
 	}
 	return errors.Join(subagentErr, r.logger.Close(), closeMCPSessions(r.mcpSessions))
+}
+
+func (r *agentRuntime) subagentCompletionSignal() <-chan struct{} {
+	if r == nil || r.subagentManager == nil {
+		return nil
+	}
+	return r.subagentManager.CompletionSignal()
 }
 
 func (r *agentRuntime) initialMessages() []model.Message {

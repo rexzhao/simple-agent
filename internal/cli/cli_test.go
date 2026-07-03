@@ -4200,6 +4200,300 @@ prompt:
 	assertNoAdditionalCLIRunRequest(t, requests)
 }
 
+func cliToolCallChunk(t *testing.T, id, name, arguments string) string {
+	t.Helper()
+	chunk := map[string]any{
+		"choices": []any{
+			map[string]any{
+				"index": 0,
+				"delta": map[string]any{
+					"tool_calls": []any{
+						map[string]any{
+							"index": 0,
+							"id":    id,
+							"function": map[string]any{
+								"name":      name,
+								"arguments": arguments,
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+	data, err := json.Marshal(chunk)
+	if err != nil {
+		t.Fatalf("json.Marshal(tool call chunk) error = %v", err)
+	}
+	return string(data)
+}
+
+func cliTextChunk(t *testing.T, text string) string {
+	t.Helper()
+	chunk := map[string]any{
+		"choices": []any{
+			map[string]any{
+				"delta": map[string]any{
+					"content": text,
+				},
+			},
+		},
+	}
+	data, err := json.Marshal(chunk)
+	if err != nil {
+		t.Fatalf("json.Marshal(text chunk) error = %v", err)
+	}
+	return string(data)
+}
+
+func writeCLISSEChunks(w http.ResponseWriter, chunks ...string) {
+	w.Header().Set("Content-Type", "text/event-stream")
+	for _, chunk := range chunks {
+		_, _ = fmt.Fprintf(w, "data: %s\n\n", chunk)
+	}
+}
+
+func lastCLIUserMessageContent(t *testing.T, body map[string]any) string {
+	t.Helper()
+	messages := requestMessages(t, body)
+	for i := len(messages) - 1; i >= 0; i-- {
+		message, ok := messages[i].(map[string]any)
+		if !ok {
+			t.Fatalf("message[%d] = %T, want object", i, messages[i])
+		}
+		if message["role"] != "user" {
+			continue
+		}
+		content, ok := message["content"].(string)
+		if !ok {
+			t.Fatalf("message[%d].content = %T, want string", i, message["content"])
+		}
+		return content
+	}
+	t.Fatalf("missing user message in %#v", messages)
+	return ""
+}
+
+func assertCLIOutputEventuallyContains(t *testing.T, output interface{ String() string }, want string) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if strings.Contains(output.String(), want) {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("output did not contain %q before timeout; got %q", want, output.String())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func receiveString(t *testing.T, ch <-chan string) string {
+	t.Helper()
+	select {
+	case value := <-ch:
+		return value
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for string")
+		return ""
+	}
+}
+
+func writeCLIInput(t *testing.T, w io.Writer, text string) {
+	t.Helper()
+	done := make(chan error, 1)
+	go func() {
+		_, err := io.WriteString(w, text)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("write input %q error = %v", text, err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timed out writing input %q", text)
+	}
+}
+
+func writeCLIChildSubagentConfig(t *testing.T, configDir, baseURL string) {
+	t.Helper()
+	subagentDir := filepath.Join(configDir, "subagents")
+	childProvidersDir := filepath.Join(configDir, "child-providers")
+	if err := os.MkdirAll(subagentDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll(subagents) error = %v", err)
+	}
+	if err := os.MkdirAll(childProvidersDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll(child providers) error = %v", err)
+	}
+	writeCLIFile(t, filepath.Join(subagentDir, "reviewer.yaml"), `default_provider: fake
+default_model: default
+provider_dir: ../child-providers
+skill_dirs: []
+
+agent:
+  description: Reviews scoped changes.
+  max_turns: 4
+
+logging:
+  path: ../child-logs/sai.jsonl
+`)
+	writeCLIFile(t, filepath.Join(childProvidersDir, "fake.yaml"), fmt.Sprintf(`name: fake
+base_url: %s
+api_key: child-secret-value
+
+models:
+  default:
+    id: child-model
+    max_tokens: 64
+`, baseURL))
+}
+
+func TestRunAcceptsParentInputWhileSubagentRunningThenDeliversCompletion(t *testing.T) {
+	childRequestStarted := make(chan struct{})
+	releaseChild := make(chan struct{})
+	var childRequestStartedOnce sync.Once
+	childServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		childRequestStartedOnce.Do(func() { close(childRequestStarted) })
+		select {
+		case <-releaseChild:
+		case <-r.Context().Done():
+			return
+		case <-time.After(2 * time.Second):
+			t.Errorf("timed out waiting to release child")
+			return
+		}
+		writeCLISSEChunks(w,
+			cliTextChunk(t, "child finished after parent follow-up"),
+			`[DONE]`,
+		)
+	}))
+	defer childServer.Close()
+
+	parentRequests := make(chan capturedCLIRunRequest, 5)
+	runningParentTurn := make(chan string, 1)
+	completionEvent := make(chan string, 1)
+	var parentMu sync.Mutex
+	parentRequestCount := 0
+	parentServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("ReadAll(parent) error = %v", err)
+		}
+		request := capturedCLIRunRequest{
+			Path:          r.URL.Path,
+			Authorization: r.Header.Get("Authorization"),
+			ContentType:   r.Header.Get("Content-Type"),
+			RawBody:       body,
+			Body:          decodeCLIJSON(t, body),
+		}
+		parentRequests <- request
+
+		parentMu.Lock()
+		index := parentRequestCount
+		parentRequestCount++
+		parentMu.Unlock()
+
+		switch index {
+		case 0:
+			writeCLISSEChunks(w,
+				cliToolCallChunk(t, "call_start", subagents.ToolSubagentStart, `{"agent_id":"reviewer","prompt":"long child task","display_name":"Concurrent Review","job_name":"concurrent-review"}`),
+				`{"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`,
+				`[DONE]`,
+			)
+		case 1:
+			writeCLISSEChunks(w,
+				cliTextChunk(t, "started child"),
+				`[DONE]`,
+			)
+		case 2:
+			runningParentTurn <- lastCLIUserMessageContent(t, request.Body)
+			writeCLISSEChunks(w,
+				cliTextChunk(t, "parent answered while child running"),
+				`[DONE]`,
+			)
+		case 3:
+			completionEvent <- lastCLIUserMessageContent(t, request.Body)
+			writeCLISSEChunks(w,
+				cliTextChunk(t, "parent handled child completion"),
+				`[DONE]`,
+			)
+		default:
+			http.Error(w, "unexpected parent request", http.StatusInternalServerError)
+		}
+	}))
+	defer parentServer.Close()
+
+	configDir := t.TempDir()
+	writeCLIRunFixtureInDir(t, configDir, parentServer.URL+"/v1", "parent-secret-value", "openai-chat")
+	appendCLIConfig(t, configDir, `
+subagents:
+  reviewer: subagents/reviewer.yaml
+`)
+	writeCLIChildSubagentConfig(t, configDir, childServer.URL+"/v1")
+
+	stdinReader, stdinWriter := io.Pipe()
+	defer stdinReader.Close()
+	defer stdinWriter.Close()
+	stdout := newSignalingWriter("unused")
+	var stderr bytes.Buffer
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan int, 1)
+	go func() {
+		done <- RunWithContext(ctx, []string{"--config", cliConfigPath(configDir), "chat", "--prompt", "delegate"}, stdinReader, stdout, &stderr, func() (string, error) {
+			return t.TempDir(), nil
+		})
+	}()
+
+	assertCLIOutputEventuallyContains(t, stdout, "started child\n")
+	select {
+	case <-childRequestStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("child HTTP request did not start")
+	}
+
+	writeCLIInput(t, stdinWriter, "parent follow-up while child runs\n")
+	assertCLIOutputEventuallyContains(t, stdout, "parent answered while child running")
+	if got := receiveString(t, runningParentTurn); got != "parent follow-up while child runs" {
+		t.Fatalf("running parent prompt = %q, want follow-up prompt", got)
+	}
+
+	close(releaseChild)
+	assertCLIOutputEventuallyContains(t, stdout, "parent handled child completion")
+	writeCLIInput(t, stdinWriter, "/exit\n")
+
+	select {
+	case code := <-done:
+		if code != 0 {
+			t.Fatalf("RunWithContext() code = %d, stderr = %s", code, stderr.String())
+		}
+	case <-time.After(2 * time.Second):
+		cancel()
+		t.Fatal("RunWithContext did not exit")
+	}
+
+	receiveCLIRunRequest(t, parentRequests)
+	receiveCLIRunRequest(t, parentRequests)
+	receiveCLIRunRequest(t, parentRequests)
+	receiveCLIRunRequest(t, parentRequests)
+	assertNoAdditionalCLIRunRequest(t, parentRequests)
+
+	event := receiveString(t, completionEvent)
+	for _, want := range []string{
+		"Runtime event: subagent job completed",
+		"agent_id: reviewer",
+		"display_name: Concurrent Review",
+		"job_name: concurrent-review",
+		"status: completed",
+		"output: child finished after parent follow-up",
+	} {
+		if !strings.Contains(event, want) {
+			t.Fatalf("completion event = %q, want substring %q", event, want)
+		}
+	}
+}
+
 func TestRunInjectsConfiguredSubagentListFromChildMetadata(t *testing.T) {
 	server, requests := newCLIRunServer(t,
 		`{"choices":[{"delta":{"content":"ok"}}]}`,
@@ -4253,6 +4547,428 @@ agent:
 		subagents.ToolSubagentWait,
 		subagents.ToolSubagentCancel,
 	})
+	assertNoAdditionalCLIRunRequest(t, requests)
+}
+
+func TestRunDeliversSubagentCompletionAfterParentTurnWithoutWait(t *testing.T) {
+	childRequests := make(chan capturedCLIRunRequest, 1)
+	childDone := make(chan struct{})
+	var childDoneOnce sync.Once
+	childServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("ReadAll(child) error = %v", err)
+		}
+		childRequests <- capturedCLIRunRequest{
+			Path:          r.URL.Path,
+			Authorization: r.Header.Get("Authorization"),
+			ContentType:   r.Header.Get("Content-Type"),
+			RawBody:       body,
+			Body:          decodeCLIJSON(t, body),
+		}
+		writeCLISSEChunks(w,
+			cliTextChunk(t, "child complete"),
+			`[DONE]`,
+		)
+		childDoneOnce.Do(func() { close(childDone) })
+	}))
+	defer childServer.Close()
+
+	parentRequests := make(chan capturedCLIRunRequest, 4)
+	completionEvent := make(chan string, 1)
+	var parentMu sync.Mutex
+	parentRequestCount := 0
+	parentServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("ReadAll(parent) error = %v", err)
+		}
+		request := capturedCLIRunRequest{
+			Path:          r.URL.Path,
+			Authorization: r.Header.Get("Authorization"),
+			ContentType:   r.Header.Get("Content-Type"),
+			RawBody:       body,
+			Body:          decodeCLIJSON(t, body),
+		}
+		parentRequests <- request
+
+		parentMu.Lock()
+		index := parentRequestCount
+		parentRequestCount++
+		parentMu.Unlock()
+
+		switch index {
+		case 0:
+			writeCLISSEChunks(w,
+				cliToolCallChunk(t, "call_start", subagents.ToolSubagentStart, `{"agent_id":"reviewer","prompt":"child task","display_name":"Review UI","job_name":"review-1"}`),
+				`{"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`,
+				`[DONE]`,
+			)
+		case 1:
+			select {
+			case <-childDone:
+			case <-time.After(2 * time.Second):
+				t.Errorf("timed out waiting for child completion")
+			}
+			writeCLISSEChunks(w,
+				cliTextChunk(t, "parent saw start"),
+				`[DONE]`,
+			)
+		case 2:
+			completionEvent <- lastCLIUserMessageContent(t, request.Body)
+			writeCLISSEChunks(w,
+				cliTextChunk(t, "parent handled child"),
+				`[DONE]`,
+			)
+		default:
+			http.Error(w, "unexpected parent request", http.StatusInternalServerError)
+		}
+	}))
+	defer parentServer.Close()
+
+	configDir := t.TempDir()
+	writeCLIRunFixtureInDir(t, configDir, parentServer.URL+"/v1", "parent-secret-value", "openai-chat")
+	appendCLIConfig(t, configDir, `
+subagents:
+  reviewer: subagents/reviewer.yaml
+`)
+	writeCLIChildSubagentConfig(t, configDir, childServer.URL+"/v1")
+
+	var stdout, stderr bytes.Buffer
+	code := RunWithGetwd([]string{"--config", cliConfigPath(configDir), "chat", "--quit", "--prompt", "delegate"}, &stdout, &stderr, func() (string, error) {
+		return t.TempDir(), nil
+	})
+
+	if code != 0 {
+		t.Fatalf("RunWithGetwd() code = %d, stderr = %s", code, stderr.String())
+	}
+	if got := stdout.String(); !strings.Contains(got, "parent saw start") || !strings.Contains(got, "parent handled child") {
+		t.Fatalf("stdout = %q, want parent turn and completion turn output", got)
+	}
+
+	receiveCLIRunRequest(t, parentRequests)
+	receiveCLIRunRequest(t, parentRequests)
+	receiveCLIRunRequest(t, parentRequests)
+	assertNoAdditionalCLIRunRequest(t, parentRequests)
+	receiveCLIRunRequest(t, childRequests)
+	assertNoAdditionalCLIRunRequest(t, childRequests)
+
+	event := receiveString(t, completionEvent)
+	for _, want := range []string{
+		"Runtime event: subagent job completed",
+		"agent_id: reviewer",
+		"display_name: Review UI",
+		"job_name: review-1",
+		"status: completed",
+		"output: child complete",
+	} {
+		if !strings.Contains(event, want) {
+			t.Fatalf("completion event = %q, want substring %q", event, want)
+		}
+	}
+	if strings.Contains(strings.ToLower(event), "tool result") {
+		t.Fatalf("completion event should not claim tool result: %q", event)
+	}
+}
+
+func TestRunIdleAutoWakesParentForSubagentCompletion(t *testing.T) {
+	releaseChild := make(chan struct{})
+	childServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-releaseChild:
+		case <-r.Context().Done():
+			return
+		case <-time.After(2 * time.Second):
+			t.Errorf("timed out waiting to release child")
+			return
+		}
+		writeCLISSEChunks(w,
+			cliTextChunk(t, "idle child done"),
+			`[DONE]`,
+		)
+	}))
+	defer childServer.Close()
+
+	parentRequests := make(chan capturedCLIRunRequest, 4)
+	completionEvent := make(chan string, 1)
+	var parentMu sync.Mutex
+	parentRequestCount := 0
+	parentServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("ReadAll(parent) error = %v", err)
+		}
+		request := capturedCLIRunRequest{
+			Path:          r.URL.Path,
+			Authorization: r.Header.Get("Authorization"),
+			ContentType:   r.Header.Get("Content-Type"),
+			RawBody:       body,
+			Body:          decodeCLIJSON(t, body),
+		}
+		parentRequests <- request
+
+		parentMu.Lock()
+		index := parentRequestCount
+		parentRequestCount++
+		parentMu.Unlock()
+
+		switch index {
+		case 0:
+			writeCLISSEChunks(w,
+				cliToolCallChunk(t, "call_start", subagents.ToolSubagentStart, `{"agent_id":"reviewer","prompt":"idle child","display_name":"Idle Review"}`),
+				`{"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`,
+				`[DONE]`,
+			)
+		case 1:
+			writeCLISSEChunks(w,
+				cliTextChunk(t, "started"),
+				`[DONE]`,
+			)
+		case 2:
+			completionEvent <- lastCLIUserMessageContent(t, request.Body)
+			writeCLISSEChunks(w,
+				cliTextChunk(t, "handled idle"),
+				`[DONE]`,
+			)
+		default:
+			http.Error(w, "unexpected parent request", http.StatusInternalServerError)
+		}
+	}))
+	defer parentServer.Close()
+
+	configDir := t.TempDir()
+	writeCLIRunFixtureInDir(t, configDir, parentServer.URL+"/v1", "parent-secret-value", "openai-chat")
+	appendCLIConfig(t, configDir, `
+subagents:
+  reviewer: subagents/reviewer.yaml
+`)
+	writeCLIChildSubagentConfig(t, configDir, childServer.URL+"/v1")
+
+	stdinReader, stdinWriter := io.Pipe()
+	defer stdinReader.Close()
+	defer stdinWriter.Close()
+	stdout := newSignalingWriter("unused")
+	var stderr bytes.Buffer
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan int, 1)
+	go func() {
+		done <- RunWithContext(ctx, []string{"--config", cliConfigPath(configDir), "chat", "--prompt", "delegate"}, stdinReader, stdout, &stderr, func() (string, error) {
+			return t.TempDir(), nil
+		})
+	}()
+
+	assertCLIOutputEventuallyContains(t, stdout, "started\n")
+	close(releaseChild)
+	assertCLIOutputEventuallyContains(t, stdout, "handled idle")
+	if _, err := stdinWriter.Write([]byte("/exit\n")); err != nil {
+		t.Fatalf("write /exit error = %v", err)
+	}
+
+	select {
+	case code := <-done:
+		if code != 0 {
+			t.Fatalf("RunWithContext() code = %d, stderr = %s", code, stderr.String())
+		}
+	case <-time.After(2 * time.Second):
+		cancel()
+		t.Fatal("RunWithContext did not exit")
+	}
+
+	receiveCLIRunRequest(t, parentRequests)
+	receiveCLIRunRequest(t, parentRequests)
+	receiveCLIRunRequest(t, parentRequests)
+	assertNoAdditionalCLIRunRequest(t, parentRequests)
+
+	event := receiveString(t, completionEvent)
+	for _, want := range []string{
+		"Runtime event: subagent job completed",
+		"display_name: Idle Review",
+		"output: idle child done",
+	} {
+		if !strings.Contains(event, want) {
+			t.Fatalf("completion event = %q, want substring %q", event, want)
+		}
+	}
+}
+
+func TestRunRequeuesSubagentCompletionAfterRecoverableCompletionTurnError(t *testing.T) {
+	childRequestStarted := make(chan struct{})
+	releaseChild := make(chan struct{})
+	var childRequestStartedOnce sync.Once
+	childServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		childRequestStartedOnce.Do(func() { close(childRequestStarted) })
+		select {
+		case <-releaseChild:
+		case <-r.Context().Done():
+			return
+		case <-time.After(2 * time.Second):
+			t.Errorf("timed out waiting to release child")
+			return
+		}
+		writeCLISSEChunks(w,
+			cliTextChunk(t, "child output survives failure"),
+			`[DONE]`,
+		)
+	}))
+	defer childServer.Close()
+
+	parentRequests := make(chan capturedCLIRunRequest, 5)
+	firstCompletionEvent := make(chan string, 1)
+	retryParentTurn := make(chan string, 1)
+	secondCompletionEvent := make(chan string, 1)
+	var parentMu sync.Mutex
+	parentRequestCount := 0
+	parentServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("ReadAll(parent) error = %v", err)
+		}
+		request := capturedCLIRunRequest{
+			Path:          r.URL.Path,
+			Authorization: r.Header.Get("Authorization"),
+			ContentType:   r.Header.Get("Content-Type"),
+			RawBody:       body,
+			Body:          decodeCLIJSON(t, body),
+		}
+		parentRequests <- request
+
+		parentMu.Lock()
+		index := parentRequestCount
+		parentRequestCount++
+		parentMu.Unlock()
+
+		switch index {
+		case 0:
+			writeCLISSEChunks(w,
+				cliToolCallChunk(t, "call_start", subagents.ToolSubagentStart, `{"agent_id":"reviewer","prompt":"retry child","display_name":"Retry Review","job_name":"retry-review"}`),
+				`{"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`,
+				`[DONE]`,
+			)
+		case 1:
+			writeCLISSEChunks(w,
+				cliTextChunk(t, "started retry child"),
+				`[DONE]`,
+			)
+		case 2:
+			firstCompletionEvent <- lastCLIUserMessageContent(t, request.Body)
+			http.Error(w, "temporary completion turn failure", http.StatusBadRequest)
+		case 3:
+			retryParentTurn <- lastCLIUserMessageContent(t, request.Body)
+			writeCLISSEChunks(w,
+				cliTextChunk(t, "parent turn after failure"),
+				`[DONE]`,
+			)
+		case 4:
+			secondCompletionEvent <- lastCLIUserMessageContent(t, request.Body)
+			writeCLISSEChunks(w,
+				cliTextChunk(t, "completion handled after failure"),
+				`[DONE]`,
+			)
+		default:
+			http.Error(w, "unexpected parent request", http.StatusInternalServerError)
+		}
+	}))
+	defer parentServer.Close()
+
+	configDir := t.TempDir()
+	writeCLIRunFixtureInDir(t, configDir, parentServer.URL+"/v1", "parent-secret-value", "openai-chat")
+	appendCLIConfig(t, configDir, `
+subagents:
+  reviewer: subagents/reviewer.yaml
+`)
+	writeCLIChildSubagentConfig(t, configDir, childServer.URL+"/v1")
+
+	stdinReader, stdinWriter := io.Pipe()
+	defer stdinReader.Close()
+	defer stdinWriter.Close()
+	stdout := newSignalingWriter("unused")
+	var stderr bytes.Buffer
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan int, 1)
+	go func() {
+		done <- RunWithContext(ctx, []string{"--config", cliConfigPath(configDir), "chat", "--prompt", "delegate"}, stdinReader, stdout, &stderr, func() (string, error) {
+			return t.TempDir(), nil
+		})
+	}()
+
+	assertCLIOutputEventuallyContains(t, stdout, "started retry child\n")
+	select {
+	case <-childRequestStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("child HTTP request did not start")
+	}
+	close(releaseChild)
+
+	firstEvent := receiveString(t, firstCompletionEvent)
+	if !strings.Contains(firstEvent, "display_name: Retry Review") || !strings.Contains(firstEvent, "job_name: retry-review") {
+		t.Fatalf("first completion event = %q, want job metadata", firstEvent)
+	}
+
+	writeCLIInput(t, stdinWriter, "parent retry trigger\n")
+	assertCLIOutputEventuallyContains(t, stdout, "parent turn after failure")
+	if got := receiveString(t, retryParentTurn); got != "parent retry trigger" {
+		t.Fatalf("retry parent prompt = %q, want user retry trigger", got)
+	}
+	assertCLIOutputEventuallyContains(t, stdout, "completion handled after failure")
+	writeCLIInput(t, stdinWriter, "/exit\n")
+
+	select {
+	case code := <-done:
+		if code != 0 {
+			t.Fatalf("RunWithContext() code = %d, stderr = %s", code, stderr.String())
+		}
+	case <-time.After(2 * time.Second):
+		cancel()
+		t.Fatal("RunWithContext did not exit")
+	}
+
+	receiveCLIRunRequest(t, parentRequests)
+	receiveCLIRunRequest(t, parentRequests)
+	receiveCLIRunRequest(t, parentRequests)
+	receiveCLIRunRequest(t, parentRequests)
+	receiveCLIRunRequest(t, parentRequests)
+	assertNoAdditionalCLIRunRequest(t, parentRequests)
+
+	secondEvent := receiveString(t, secondCompletionEvent)
+	for _, want := range []string{
+		"Runtime event: subagent job completed",
+		"agent_id: reviewer",
+		"display_name: Retry Review",
+		"job_name: retry-review",
+		"status: completed",
+		"output: child output survives failure",
+	} {
+		if !strings.Contains(secondEvent, want) {
+			t.Fatalf("second completion event = %q, want substring %q", secondEvent, want)
+		}
+	}
+	if firstEvent != secondEvent {
+		t.Fatalf("second completion event = %q, want same pending event as first %q", secondEvent, firstEvent)
+	}
+}
+
+func TestRunDoesNotAutoResumeWhenNoSubagentCompletions(t *testing.T) {
+	server, requests := newCLIRunServer(t,
+		`{"choices":[{"delta":{"content":"ok"}}]}`,
+		`[DONE]`,
+	)
+	defer server.Close()
+
+	configDir := t.TempDir()
+	writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
+
+	var stdout, stderr bytes.Buffer
+	code := RunWithIO([]string{"--config", cliConfigPath(configDir), "chat", "--prompt", "hello"}, strings.NewReader("/exit\n"), &stdout, &stderr, func() (string, error) {
+		return t.TempDir(), nil
+	})
+
+	if code != 0 {
+		t.Fatalf("RunWithIO() code = %d, stderr = %s", code, stderr.String())
+	}
+	request := receiveCLIRunRequest(t, requests)
+	assertMessage(t, requestMessages(t, request.Body), 1, "user", "hello")
 	assertNoAdditionalCLIRunRequest(t, requests)
 }
 
@@ -7036,6 +7752,17 @@ func assertNoAdditionalCLIRunRequest(t *testing.T, requests <-chan capturedCLIRu
 	case request := <-requests:
 		t.Fatalf("unexpected additional model request: path=%s body=%s", request.Path, request.RawBody)
 	default:
+	}
+}
+
+func receiveCLIRunRequest(t *testing.T, requests <-chan capturedCLIRunRequest) capturedCLIRunRequest {
+	t.Helper()
+	select {
+	case request := <-requests:
+		return request
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for model request")
+		return capturedCLIRunRequest{}
 	}
 }
 

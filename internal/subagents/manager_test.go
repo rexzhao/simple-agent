@@ -110,6 +110,70 @@ func TestStartStatusAndWaitSuccess(t *testing.T) {
 	}
 }
 
+func TestPendingCompletionsRequiresAck(t *testing.T) {
+	runner := runnerFunc(func(ctx context.Context, request RunRequest, inbox <-chan Message) (RunResult, error) {
+		return RunResult{Output: "review complete"}, nil
+	})
+	manager := newTestManager(t, runner)
+	startResult := execute(t, manager, ToolSubagentStart, map[string]any{
+		"agent_id":     "reviewer",
+		"display_name": "UI Review",
+		"job_name":     "review-1",
+	})
+	start := decodeSnapshot(t, startResult)
+
+	select {
+	case <-manager.CompletionSignal():
+	case <-time.After(time.Second):
+		t.Fatal("completion signal was not delivered")
+	}
+
+	completions := manager.PendingCompletions()
+	if len(completions) != 1 {
+		t.Fatalf("len(completions) = %d, want 1: %#v", len(completions), completions)
+	}
+	completion := completions[0]
+	if completion.JobID != start.JobID || completion.AgentID != "reviewer" || completion.Status != StatusCompleted {
+		t.Fatalf("completion = %#v, want completed reviewer job %q", completion, start.JobID)
+	}
+	if completion.DisplayName != "UI Review" || completion.JobName != "review-1" || completion.Output != "review complete" {
+		t.Fatalf("completion metadata = %#v, want display/job name and output", completion)
+	}
+	if again := manager.PendingCompletions(); len(again) != 1 {
+		t.Fatalf("second PendingCompletions() before ack = %#v, want same completion", again)
+	}
+	manager.AckCompletions(completions)
+	if afterAck := manager.PendingCompletions(); len(afterAck) != 0 {
+		t.Fatalf("PendingCompletions() after ack = %#v, want empty", afterAck)
+	}
+}
+
+func TestWaitConsumesCompletionNotification(t *testing.T) {
+	runner := runnerFunc(func(ctx context.Context, request RunRequest, inbox <-chan Message) (RunResult, error) {
+		return RunResult{Output: "done"}, nil
+	})
+	manager := newTestManager(t, runner)
+	jobID := startJob(t, manager, "reviewer")
+
+	select {
+	case <-manager.CompletionSignal():
+	case <-time.After(time.Second):
+		t.Fatal("completion signal was not delivered")
+	}
+
+	waitResult := execute(t, manager, ToolSubagentWait, map[string]any{
+		"job_id":     jobID,
+		"timeout_ms": 1000,
+	})
+	waited := decodeSnapshot(t, waitResult)
+	if waited.Status != StatusCompleted || waited.Output != "done" {
+		t.Fatalf("waited = %#v, want completed output", waited)
+	}
+	if completions := manager.PendingCompletions(); len(completions) != 0 {
+		t.Fatalf("PendingCompletions() after wait = %#v, want empty", completions)
+	}
+}
+
 func TestSendDeliversMessageToRunner(t *testing.T) {
 	received := make(chan Message, 1)
 	release := make(chan struct{})

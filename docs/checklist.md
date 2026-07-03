@@ -396,9 +396,9 @@
 - [ ] mailbox 和 observability 输出包含 display name。
 - [x] subagent job 支持 wait。
 - [x] subagent job 支持 cancel。
-- [ ] child job 运行时 parent 仍可继续接收用户输入。
-- [ ] child completion 通过 parent mailbox/runtime event 在 parent turn 后交付。
-- [ ] parent idle 时 child completion 可触发 auto wakeup。
+- [x] child job 运行时 parent 仍可继续接收用户输入。
+- [x] child completion 通过 parent mailbox/runtime event 在 parent turn 后交付。
+- [x] parent idle 时 child completion 可触发 auto wakeup。
 - [x] `prompt.system_prompt` 作为未来 schema 追加到内置约束之后，不替换内置约束。
 - [x] prompt placeholders 使用固定白名单，并拒绝未知占位符。
 - [ ] 为未来 DAG/workflow orchestration 保留边界，但 M19 不实现完整编排。
