@@ -344,6 +344,71 @@ auth_dir: auth
 	}
 }
 
+func TestAuthCodexLoginInterruptCancelsPollingWithoutWritingFiles(t *testing.T) {
+	configDir := t.TempDir()
+	writeCLIFile(t, filepath.Join(configDir, "sai.yaml"), "default_provider: codex-work\ndefault_model: gpt-5.5\nprovider_dir: providers\nauth_dir: auth\n")
+	deviceTokenRequested := make(chan struct{})
+	var tokenOnce sync.Once
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/accounts/deviceauth/usercode":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"device_auth_id":"device-auth-123","user_code":"USER-123","verification_uri":"https://example.test/device","interval":"1","expires_in":"600"}`)
+		case "/api/accounts/deviceauth/token":
+			tokenOnce.Do(func() { close(deviceTokenRequested) })
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"error":"authorization_pending"}`)
+		case "/oauth/token":
+			t.Fatalf("unexpected token exchange after interrupt")
+		default:
+			t.Fatalf("unexpected path %q", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	interrupts := make(chan struct{}, 1)
+	var stdout, stderr bytes.Buffer
+	done := make(chan int, 1)
+	go func() {
+		done <- runWithProgramContextAndInterrupts(context.Background(), "sai", []string{
+			"--config", cliConfigPath(configDir),
+			"auth", "codex", "login",
+			"--provider", "codex-work",
+			"--issuer-url", server.URL,
+			"--base-url", "https://codex.example.test/backend",
+			"--poll-interval", "1ms",
+		}, strings.NewReader(""), &stdout, &stderr, func() (string, error) {
+			return "unused", nil
+		}, interrupts)
+	}()
+
+	select {
+	case <-deviceTokenRequested:
+	case code := <-done:
+		t.Fatalf("auth login returned before polling: code = %d, stdout = %q, stderr = %q", code, stdout.String(), stderr.String())
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timed out waiting for device token request; stdout = %q, stderr = %q", stdout.String(), stderr.String())
+	}
+	interrupts <- struct{}{}
+	code := waitForCode(t, done)
+	if code != 1 {
+		t.Fatalf("auth login code = %d, want 1", code)
+	}
+	assertCLIErrorContains(t, stderr.String(), "context canceled")
+	if _, err := os.Stat(filepath.Join(configDir, "providers", "codex-work.yaml")); !os.IsNotExist(err) {
+		t.Fatalf("provider file stat error = %v, want not exist", err)
+	}
+	if _, err := os.Stat(filepath.Join(configDir, "auth", "codex-work.json")); !os.IsNotExist(err) {
+		t.Fatalf("auth file stat error = %v, want not exist", err)
+	}
+	if !strings.Contains(stdout.String(), "Open https://example.test/device and enter code USER-123") {
+		t.Fatalf("stdout = %q, want device flow instruction before cancel", stdout.String())
+	}
+	if strings.Contains(stdout.String(), "Saved provider") || strings.Contains(stdout.String(), "Saved Codex auth token") {
+		t.Fatalf("stdout = %q, want no saved-file messages", stdout.String())
+	}
+}
+
 func TestToolsListUnknownFlagAfterExtraArgIncludesHelpHint(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	code := RunWithGetwd([]string{"tools", "list", "extra", "--bad"}, &stdout, &stderr, func() (string, error) {
@@ -2296,6 +2361,175 @@ func TestChatREPLRecoverableErrorContinuesWithoutFailedHistory(t *testing.T) {
 	}
 	assertMessage(t, secondMessages, 0, "system", builtInBaseInstructions)
 	assertMessage(t, secondMessages, 1, "user", "second")
+	assertNoAdditionalCLIRunRequest(t, requests)
+}
+
+func TestChatActiveTurnInterruptCancelsTurnAndAllowsNextPrompt(t *testing.T) {
+	server, requests := newCancelingFirstThenCLIRunServer(t, []string{
+		`{"choices":[{"delta":{"content":"two"}}]}`,
+		`[DONE]`,
+	})
+	defer server.Close()
+
+	configDir := t.TempDir()
+	writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
+
+	stdinReader, stdinWriter := io.Pipe()
+	defer stdinReader.Close()
+	interrupts := make(chan struct{}, 2)
+	var stdout bytes.Buffer
+	stderr := newSignalingWriter(chatInputPrompt)
+	done := make(chan int, 1)
+	go func() {
+		done <- runWithProgramContextAndInterrupts(context.Background(), "sai", []string{"--config", cliConfigPath(configDir), "chat"}, stdinReader, &stdout, stderr, func() (string, error) {
+			return t.TempDir(), nil
+		}, interrupts)
+	}()
+
+	waitForChannel(t, stderr.wrote, "initial prompt")
+	if _, err := fmt.Fprintln(stdinWriter, "first"); err != nil {
+		t.Fatalf("write first input: %v", err)
+	}
+	firstRequest := <-requests
+	assertMessage(t, requestMessages(t, firstRequest.Body), 1, "user", "first")
+
+	interrupts <- struct{}{}
+	go func() {
+		_, _ = fmt.Fprintln(stdinWriter, "second")
+		_, _ = fmt.Fprintln(stdinWriter, "/quit")
+	}()
+
+	code := waitForCode(t, done)
+	if code != 0 {
+		t.Fatalf("chat code = %d, stderr = %s", code, stderr.String())
+	}
+	if got, want := stdout.String(), "two\n"; got != want {
+		t.Fatalf("stdout = %q, want %q", got, want)
+	}
+	secondRequest := <-requests
+	secondMessages := requestMessages(t, secondRequest.Body)
+	if len(secondMessages) != 2 {
+		t.Fatalf("len(second request messages) = %d, want 2: %#v", len(secondMessages), secondMessages)
+	}
+	assertMessage(t, secondMessages, 0, "system", builtInBaseInstructions)
+	assertMessage(t, secondMessages, 1, "user", "second")
+	assertNoAdditionalCLIRunRequest(t, requests)
+}
+
+func TestChatRepeatedActiveTurnInterruptDoesNotExitSession(t *testing.T) {
+	server, requests := newCancelingFirstThenCLIRunServer(t, []string{
+		`{"choices":[{"delta":{"content":"after"}}]}`,
+		`[DONE]`,
+	})
+	defer server.Close()
+
+	configDir := t.TempDir()
+	writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
+
+	stdinReader, stdinWriter := io.Pipe()
+	defer stdinReader.Close()
+	interrupts := make(chan struct{}, 4)
+	var stdout bytes.Buffer
+	stderr := newSignalingWriter(chatInputPrompt)
+	done := make(chan int, 1)
+	go func() {
+		done <- runWithProgramContextAndInterrupts(context.Background(), "sai", []string{"--config", cliConfigPath(configDir), "chat"}, stdinReader, &stdout, stderr, func() (string, error) {
+			return t.TempDir(), nil
+		}, interrupts)
+	}()
+
+	waitForChannel(t, stderr.wrote, "initial prompt")
+	if _, err := fmt.Fprintln(stdinWriter, "first"); err != nil {
+		t.Fatalf("write first input: %v", err)
+	}
+	<-requests
+
+	interrupts <- struct{}{}
+	interrupts <- struct{}{}
+	go func() {
+		_, _ = fmt.Fprintln(stdinWriter, "second")
+		_, _ = fmt.Fprintln(stdinWriter, "/quit")
+	}()
+
+	code := waitForCode(t, done)
+	if code != 0 {
+		t.Fatalf("chat code = %d, stderr = %s", code, stderr.String())
+	}
+	if got, want := stdout.String(), "after\n"; got != want {
+		t.Fatalf("stdout = %q, want %q", got, want)
+	}
+	secondMessages := requestMessages(t, (<-requests).Body)
+	assertMessage(t, secondMessages, 1, "user", "second")
+	assertNoAdditionalCLIRunRequest(t, requests)
+}
+
+func TestChatIdleInterruptExitsSession(t *testing.T) {
+	server, requests := newCLIRunServer(t,
+		`{"choices":[{"delta":{"content":"unexpected"}}]}`,
+		`[DONE]`,
+	)
+	defer server.Close()
+
+	configDir := t.TempDir()
+	writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
+
+	stdinReader, _ := io.Pipe()
+	defer stdinReader.Close()
+	interrupts := make(chan struct{}, 1)
+	var stdout bytes.Buffer
+	stderr := newSignalingWriter(chatInputPrompt)
+	done := make(chan int, 1)
+	go func() {
+		done <- runWithProgramContextAndInterrupts(context.Background(), "sai", []string{"--config", cliConfigPath(configDir), "chat"}, stdinReader, &stdout, stderr, func() (string, error) {
+			return t.TempDir(), nil
+		}, interrupts)
+	}()
+
+	waitForChannel(t, stderr.wrote, "idle prompt")
+	interrupts <- struct{}{}
+
+	code := waitForCode(t, done)
+	if code != 1 {
+		t.Fatalf("chat code = %d, want 1", code)
+	}
+	if stdout.String() != "" {
+		t.Fatalf("stdout = %q, want empty", stdout.String())
+	}
+	assertCLIErrorContains(t, stderr.String(), "sai: context canceled")
+	assertNoAdditionalCLIRunRequest(t, requests)
+}
+
+func TestChatQuitActiveTurnInterruptEndsWithoutSavedAssistantHistory(t *testing.T) {
+	server, requests := newCancelingFirstThenCLIRunServer(t)
+	defer server.Close()
+
+	configDir := t.TempDir()
+	writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
+
+	interrupts := make(chan struct{}, 1)
+	var stdout, stderr bytes.Buffer
+	done := make(chan int, 1)
+	go func() {
+		done <- runWithProgramContextAndInterrupts(context.Background(), "sai", []string{"--config", cliConfigPath(configDir), "chat", "--save-session", "--quit", "--prompt", "first"}, strings.NewReader(""), &stdout, &stderr, func() (string, error) {
+			return t.TempDir(), nil
+		}, interrupts)
+	}()
+
+	firstRequest := <-requests
+	assertMessage(t, requestMessages(t, firstRequest.Body), 1, "user", "first")
+	interrupts <- struct{}{}
+
+	code := waitForCode(t, done)
+	if code != 1 {
+		t.Fatalf("chat code = %d, want 1", code)
+	}
+	if stdout.String() != "" {
+		t.Fatalf("stdout = %q, want empty", stdout.String())
+	}
+	if sessions := sessionDirs(t, configDir); len(sessions) != 0 {
+		t.Fatalf("session dirs = %#v, want none", sessions)
+	}
+	assertCLIErrorContains(t, stderr.String(), "sai: context canceled")
 	assertNoAdditionalCLIRunRequest(t, requests)
 }
 
@@ -7382,6 +7616,71 @@ func newSequentialCLIRunServer(t *testing.T, responses ...[]string) (*httptest.S
 	return server, requests
 }
 
+func newCancelingFirstThenCLIRunServer(t *testing.T, responses ...[]string) (*httptest.Server, <-chan capturedCLIRunRequest) {
+	t.Helper()
+
+	requests := make(chan capturedCLIRunRequest, len(responses)+1)
+	var mu sync.Mutex
+	requestCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("ReadAll() error = %v", err)
+		}
+		requests <- capturedCLIRunRequest{
+			Path:             r.URL.Path,
+			Authorization:    r.Header.Get("Authorization"),
+			XAPIKey:          r.Header.Get("x-api-key"),
+			AnthropicVersion: r.Header.Get("anthropic-version"),
+			ContentType:      r.Header.Get("Content-Type"),
+			RawBody:          body,
+			Body:             decodeCLIJSON(t, body),
+		}
+
+		mu.Lock()
+		index := requestCount
+		requestCount++
+		mu.Unlock()
+		if index == 0 {
+			<-r.Context().Done()
+			return
+		}
+		responseIndex := index - 1
+		if responseIndex >= len(responses) {
+			http.Error(w, "unexpected request", http.StatusInternalServerError)
+			return
+		}
+
+		w.Header().Set("Content-Type", "text/event-stream")
+		for _, chunk := range responses[responseIndex] {
+			_, _ = fmt.Fprintf(w, "data: %s\n\n", chunk)
+		}
+	}))
+	return server, requests
+}
+
+func waitForChannel(t *testing.T, ch <-chan struct{}, name string) {
+	t.Helper()
+
+	select {
+	case <-ch:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timed out waiting for %s", name)
+	}
+}
+
+func waitForCode(t *testing.T, ch <-chan int) int {
+	t.Helper()
+
+	select {
+	case code := <-ch:
+		return code
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for chat to finish")
+	}
+	return -1
+}
+
 func writeCLIRunFixtureInDir(t *testing.T, dir, baseURL, apiKey, modelType string) {
 	t.Helper()
 	writeCLIRunFixtureInDirWithTools(t, dir, baseURL, apiKey, modelType, nil)
@@ -8081,6 +8380,28 @@ func sessionLogPaths(t *testing.T, configDir string) []string {
 	}
 	sort.Strings(paths)
 	return paths
+}
+
+func sessionDirs(t *testing.T, configDir string) []string {
+	t.Helper()
+
+	sessionRoot := filepath.Join(configDir, "sessions")
+	entries, err := os.ReadDir(sessionRoot)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		t.Fatalf("ReadDir(%q) error = %v", sessionRoot, err)
+	}
+
+	var dirs []string
+	for _, entry := range entries {
+		if entry.IsDir() {
+			dirs = append(dirs, filepath.Join(sessionRoot, entry.Name()))
+		}
+	}
+	sort.Strings(dirs)
+	return dirs
 }
 
 func assertCLIToolStatus(t *testing.T, stdout, stderr, statusDetail string, hiddenValues ...string) {

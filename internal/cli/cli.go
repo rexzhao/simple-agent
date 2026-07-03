@@ -48,9 +48,9 @@ func Run(args []string, stdout, stderr io.Writer) int {
 }
 
 func RunWithProgram(program string, args []string, stdout, stderr io.Writer) int {
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	interrupts, stop := notifyInterrupts()
 	defer stop()
-	return RunWithProgramContext(ctx, program, args, os.Stdin, stdout, stderr, os.Getwd)
+	return runWithProgramContextAndInterrupts(context.Background(), program, args, os.Stdin, stdout, stderr, os.Getwd, interrupts)
 }
 
 func RunWithGetwd(args []string, stdout, stderr io.Writer, getwd func() (string, error)) int {
@@ -74,10 +74,14 @@ func RunWithContext(ctx context.Context, args []string, stdin io.Reader, stdout,
 }
 
 func RunWithProgramContext(ctx context.Context, program string, args []string, stdin io.Reader, stdout, stderr io.Writer, getwd func() (string, error)) int {
+	return runWithProgramContextAndInterrupts(ctx, program, args, stdin, stdout, stderr, getwd, nil)
+}
+
+func runWithProgramContextAndInterrupts(ctx context.Context, program string, args []string, stdin io.Reader, stdout, stderr io.Writer, getwd func() (string, error), interrupts <-chan struct{}) int {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if err := execute(ctx, program, args, stdin, stdout, stderr, getwd); err != nil {
+	if err := execute(ctx, program, args, stdin, stdout, stderr, getwd, interrupts); err != nil {
 		if errors.Is(err, errSilentExit) {
 			return 1
 		}
@@ -89,7 +93,31 @@ func RunWithProgramContext(ctx context.Context, program string, args []string, s
 
 var errSilentExit = errors.New("silent exit")
 
-func execute(ctx context.Context, program string, args []string, stdin io.Reader, stdout, stderr io.Writer, getwd func() (string, error)) error {
+func notifyInterrupts() (<-chan struct{}, func()) {
+	signals := make(chan os.Signal, 1)
+	interrupts := make(chan struct{}, 1)
+	done := make(chan struct{})
+	signal.Notify(signals, os.Interrupt)
+	go func() {
+		for {
+			select {
+			case <-signals:
+				select {
+				case interrupts <- struct{}{}:
+				default:
+				}
+			case <-done:
+				return
+			}
+		}
+	}()
+	return interrupts, func() {
+		signal.Stop(signals)
+		close(done)
+	}
+}
+
+func execute(ctx context.Context, program string, args []string, stdin io.Reader, stdout, stderr io.Writer, getwd func() (string, error), interrupts <-chan struct{}) error {
 	rootArgs, err := splitRootArgs(args)
 	if err != nil {
 		return err
@@ -99,7 +127,12 @@ func execute(ctx context.Context, program string, args []string, stdin io.Reader
 			printRootUsage(stdout)
 			return nil
 		}
-		return chatCommand(ctx, rootArgs.commandArgs, rootArgs.configPath, stdin, stdout, stderr, getwd, program)
+		return chatCommand(ctx, rootArgs.commandArgs, rootArgs.configPath, stdin, stdout, stderr, getwd, program, interrupts)
+	}
+	if rootArgs.command != "chat" {
+		var stop func()
+		ctx, stop = contextWithInterruptCancel(ctx, interrupts)
+		defer stop()
 	}
 
 	switch rootArgs.command {
@@ -185,9 +218,31 @@ func execute(ctx context.Context, program string, args []string, stdin io.Reader
 			return usageError("usage: sai sessions <list|show|delete|prune>", "", "sai help sessions")
 		}
 	case "chat":
-		return chatCommand(ctx, rootArgs.commandArgs, rootArgs.configPath, stdin, stdout, stderr, getwd, program)
+		return chatCommand(ctx, rootArgs.commandArgs, rootArgs.configPath, stdin, stdout, stderr, getwd, program, interrupts)
 	default:
 		return usageError(fmt.Sprintf("unknown command %q", rootArgs.command), "", "sai help")
+	}
+}
+
+func contextWithInterruptCancel(ctx context.Context, interrupts <-chan struct{}) (context.Context, func()) {
+	if interrupts == nil {
+		return ctx, func() {}
+	}
+	cancelCtx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	closed := make(chan struct{})
+	go func() {
+		defer close(closed)
+		select {
+		case <-interrupts:
+			cancel()
+		case <-cancelCtx.Done():
+		case <-done:
+		}
+	}()
+	return cancelCtx, func() {
+		close(done)
+		<-closed
 	}
 }
 
@@ -1567,7 +1622,7 @@ func (options agentCommandFlags) validate(helpCommand string) error {
 	return nil
 }
 
-func chatCommand(ctx context.Context, args []string, configPath string, stdin io.Reader, stdout, stderr io.Writer, getwd func() (string, error), program string) (chatErr error) {
+func chatCommand(ctx context.Context, args []string, configPath string, stdin io.Reader, stdout, stderr io.Writer, getwd func() (string, error), program string, interrupts <-chan struct{}) (chatErr error) {
 	flags := flag.NewFlagSet("sai chat", flag.ContinueOnError)
 	var options agentCommandFlags
 	registerAgentCommandFlags(flags, &options)
@@ -1621,13 +1676,25 @@ func chatCommand(ctx context.Context, args []string, configPath string, stdin io
 		return err
 	}
 	if hasInitialPrompt {
-		updated, err := runChatTurnAndCompletions(ctx, runtime, messages, initialPrompt, stdout, stderr, !*quit, false)
+		updated, err := runChatTurnAndCompletions(ctx, runtime, messages, initialPrompt, stdout, stderr, !*quit, false, interrupts)
 		if err != nil {
-			return err
+			if *quit {
+				return err
+			}
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return ctxErr
+			}
+			if !isRecoverableTurnError(err) {
+				return err
+			}
+			if _, printErr := fmt.Fprintf(stderr, "sai: %v\n", err); printErr != nil {
+				return printErr
+			}
+		} else {
+			messages = updated
 		}
-		messages = updated
 		if *quit {
-			messages, err = runCompletionTurnsWithOptionalWait(ctx, runtime, messages, stdout, stderr, false, false, subagentCompletionExitWait)
+			messages, err = runCompletionTurnsWithOptionalWait(ctx, runtime, messages, stdout, stderr, false, false, subagentCompletionExitWait, interrupts)
 			if err != nil {
 				return err
 			}
@@ -1666,7 +1733,7 @@ func chatCommand(ctx context.Context, args []string, configPath string, stdin io
 				continue
 			}
 
-			updated, err := runChatTurnAndCompletions(ctx, runtime, messages, input.line, stdout, stderr, true, true)
+			updated, err := runChatTurnAndCompletions(ctx, runtime, messages, input.line, stdout, stderr, true, true, interrupts)
 			if err != nil {
 				if ctxErr := ctx.Err(); ctxErr != nil {
 					return ctxErr
@@ -1680,6 +1747,8 @@ func chatCommand(ctx context.Context, args []string, configPath string, stdin io
 				continue
 			}
 			messages = updated
+		case <-interrupts:
+			return context.Canceled
 		case <-runtime.subagentCompletionSignal():
 			redrawPrompt := inputCh != nil
 			if redrawPrompt {
@@ -1687,7 +1756,7 @@ func chatCommand(ctx context.Context, args []string, configPath string, stdin io
 					return err
 				}
 			}
-			updated, err := runAvailableCompletionTurns(ctx, runtime, messages, stdout, stderr, true, true)
+			updated, err := runAvailableCompletionTurns(ctx, runtime, messages, stdout, stderr, true, true, interrupts)
 			if err != nil {
 				if ctxErr := ctx.Err(); ctxErr != nil {
 					return ctxErr
@@ -1807,28 +1876,30 @@ func scanChatLine(ctx context.Context, scanner *bufio.Scanner, stderr io.Writer)
 	return scanner.Text(), true, nil
 }
 
-func runChatTurn(ctx context.Context, runtime *agentRuntime, messages []model.Message, prompt string, stdout, stderr io.Writer, addTrailingNewline bool, stderrNeedsLeadingBreak bool) ([]model.Message, error) {
+func runChatTurn(ctx context.Context, runtime *agentRuntime, messages []model.Message, prompt string, stdout, stderr io.Writer, addTrailingNewline bool, stderrNeedsLeadingBreak bool, interrupts <-chan struct{}) ([]model.Message, error) {
 	requestMessages := append(copyMessageSlice(messages), model.Message{
 		Role:    model.MessageRoleUser,
 		Content: prompt,
 	})
-	return runChatMessages(ctx, runtime, requestMessages, stdout, stderr, addTrailingNewline, stderrNeedsLeadingBreak)
+	return runChatMessages(ctx, runtime, requestMessages, stdout, stderr, addTrailingNewline, stderrNeedsLeadingBreak, interrupts)
 }
 
-func runChatTurnAndCompletions(ctx context.Context, runtime *agentRuntime, messages []model.Message, prompt string, stdout, stderr io.Writer, addTrailingNewline bool, stderrNeedsLeadingBreak bool) ([]model.Message, error) {
-	updated, err := runChatTurn(ctx, runtime, messages, prompt, stdout, stderr, addTrailingNewline, stderrNeedsLeadingBreak)
+func runChatTurnAndCompletions(ctx context.Context, runtime *agentRuntime, messages []model.Message, prompt string, stdout, stderr io.Writer, addTrailingNewline bool, stderrNeedsLeadingBreak bool, interrupts <-chan struct{}) ([]model.Message, error) {
+	updated, err := runChatTurn(ctx, runtime, messages, prompt, stdout, stderr, addTrailingNewline, stderrNeedsLeadingBreak, interrupts)
 	if err != nil {
 		return nil, err
 	}
-	return runAvailableCompletionTurns(ctx, runtime, updated, stdout, stderr, addTrailingNewline, true)
+	return runAvailableCompletionTurns(ctx, runtime, updated, stdout, stderr, addTrailingNewline, true, interrupts)
 }
 
-func runChatMessages(ctx context.Context, runtime *agentRuntime, requestMessages []model.Message, stdout, stderr io.Writer, addTrailingNewline bool, stderrNeedsLeadingBreak bool) ([]model.Message, error) {
+func runChatMessages(ctx context.Context, runtime *agentRuntime, requestMessages []model.Message, stdout, stderr io.Writer, addTrailingNewline bool, stderrNeedsLeadingBreak bool, interrupts <-chan struct{}) ([]model.Message, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	turnCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	doneInterrupts := forwardTurnInterrupts(turnCtx, cancel, interrupts)
+	defer doneInterrupts()
 
 	request := model.Request{
 		Model:      runtime.modelID,
@@ -1851,11 +1922,17 @@ func runChatMessages(ctx context.Context, runtime *agentRuntime, requestMessages
 		colorToolStatus:         shouldColorizeWriter(stderr),
 		stderrNeedsLeadingBreak: stderrNeedsLeadingBreak,
 	}); err != nil {
+		if errors.Is(err, context.Canceled) && ctx.Err() == nil {
+			return nil, newRecoverableTurnError(context.Canceled)
+		}
 		return nil, err
 	}
 	result, ok := <-results
 	if !ok {
 		if err := turnCtx.Err(); err != nil {
+			if errors.Is(err, context.Canceled) && ctx.Err() == nil {
+				return nil, newRecoverableTurnError(context.Canceled)
+			}
 			return nil, err
 		}
 		return nil, newRecoverableTurnError(fmt.Errorf("agent did not return updated messages"))
@@ -1871,7 +1948,39 @@ func runChatMessages(ctx context.Context, runtime *agentRuntime, requestMessages
 	return result.Messages, nil
 }
 
-func runAvailableCompletionTurns(ctx context.Context, runtime *agentRuntime, messages []model.Message, stdout, stderr io.Writer, addTrailingNewline bool, stderrNeedsLeadingBreak bool) ([]model.Message, error) {
+func forwardTurnInterrupts(ctx context.Context, cancel context.CancelFunc, interrupts <-chan struct{}) func() {
+	if interrupts == nil {
+		return func() {}
+	}
+	done := make(chan struct{})
+	closed := make(chan struct{})
+	go func() {
+		defer close(closed)
+		for {
+			select {
+			case <-interrupts:
+				cancel()
+			case <-ctx.Done():
+				return
+			case <-done:
+				return
+			}
+		}
+	}()
+	return func() {
+		close(done)
+		<-closed
+		for {
+			select {
+			case <-interrupts:
+			default:
+				return
+			}
+		}
+	}
+}
+
+func runAvailableCompletionTurns(ctx context.Context, runtime *agentRuntime, messages []model.Message, stdout, stderr io.Writer, addTrailingNewline bool, stderrNeedsLeadingBreak bool, interrupts <-chan struct{}) ([]model.Message, error) {
 	if runtime == nil || runtime.subagentManager == nil {
 		return messages, nil
 	}
@@ -1882,7 +1991,7 @@ func runAvailableCompletionTurns(ctx context.Context, runtime *agentRuntime, mes
 			return messages, nil
 		}
 		requestMessages := append(copyMessageSlice(messages), subagentCompletionMessages(completions)...)
-		updated, err := runChatMessages(ctx, runtime, requestMessages, stdout, stderr, addTrailingNewline, stderrNeedsLeadingBreak)
+		updated, err := runChatMessages(ctx, runtime, requestMessages, stdout, stderr, addTrailingNewline, stderrNeedsLeadingBreak, interrupts)
 		if err != nil {
 			return nil, err
 		}
@@ -1910,8 +2019,8 @@ func logSubagentCompletionEvents(logger *eventlog.Logger, completions []subagent
 	return nil
 }
 
-func runCompletionTurnsWithOptionalWait(ctx context.Context, runtime *agentRuntime, messages []model.Message, stdout, stderr io.Writer, addTrailingNewline bool, stderrNeedsLeadingBreak bool, wait time.Duration) ([]model.Message, error) {
-	updated, err := runAvailableCompletionTurns(ctx, runtime, messages, stdout, stderr, addTrailingNewline, stderrNeedsLeadingBreak)
+func runCompletionTurnsWithOptionalWait(ctx context.Context, runtime *agentRuntime, messages []model.Message, stdout, stderr io.Writer, addTrailingNewline bool, stderrNeedsLeadingBreak bool, wait time.Duration, interrupts <-chan struct{}) ([]model.Message, error) {
+	updated, err := runAvailableCompletionTurns(ctx, runtime, messages, stdout, stderr, addTrailingNewline, stderrNeedsLeadingBreak, interrupts)
 	if err != nil {
 		return nil, err
 	}
@@ -1925,9 +2034,11 @@ func runCompletionTurnsWithOptionalWait(ctx context.Context, runtime *agentRunti
 
 	select {
 	case <-runtime.subagentManager.CompletionSignal():
-		return runAvailableCompletionTurns(ctx, runtime, messages, stdout, stderr, addTrailingNewline, true)
+		return runAvailableCompletionTurns(ctx, runtime, messages, stdout, stderr, addTrailingNewline, true, interrupts)
 	case <-timer.C:
-		return runAvailableCompletionTurns(ctx, runtime, messages, stdout, stderr, addTrailingNewline, true)
+		return runAvailableCompletionTurns(ctx, runtime, messages, stdout, stderr, addTrailingNewline, true, interrupts)
+	case <-interrupts:
+		return nil, context.Canceled
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}

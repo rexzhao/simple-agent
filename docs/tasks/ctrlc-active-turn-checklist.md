@@ -18,26 +18,26 @@ chat session；`--quit` 单轮运行取消 active turn 后可以结束进程，�
 
 ## Implementation
 
-- [ ] 梳理当前 CLI signal handling，明确 active turn、idle input 和 `--quit` 路径的现有边界。
-- [ ] 为交互式 `sai chat` active turn 建立 per-turn cancel 流程，Ctrl+C 取消当前轮次后恢复到
+- [x] 梳理当前 CLI signal handling，明确 active turn、idle input 和 `--quit` 路径的现有边界。
+- [x] 为交互式 `sai chat` active turn 建立 per-turn cancel 流程，Ctrl+C 取消当前轮次后恢复到
   prompt。
-- [ ] 确保同一 active turn 取消完成前，短时间重复 Ctrl+C 不升级为 hard exit 或 session/process
+- [x] 确保同一 active turn 取消完成前，短时间重复 Ctrl+C 不升级为 hard exit 或 session/process
   cancel。
-- [ ] 确保 active turn cancel 不回滚已完成 tool、shell、MCP 或其他外部副作用。
-- [ ] 确保 cancel 后不追加成功 assistant history，也不把 partial assistant 输出伪造成完成轮次。
-- [ ] 确保 idle 输入状态 Ctrl+C 不被误当作 active-turn cancel；保留现有退出行为，除非实现时发现更严格约定。
-- [ ] 确保 `--quit` active turn Ctrl+C 取消当前轮次后可结束进程，并保持可读错误或取消状态。
-- [ ] 确保 logger、provider request、shell 工具和 MCP stdio 子进程仍通过 context cancel / close
+- [x] 确保 active turn cancel 不回滚已完成 tool、shell、MCP 或其他外部副作用。
+- [x] 确保 cancel 后不追加成功 assistant history，也不把 partial assistant 输出伪造成完成轮次。
+- [x] 确保 idle 输入状态 Ctrl+C 不被误当作 active-turn cancel；保留现有退出行为，除非实现时发现更严格约定。
+- [x] 确保 `--quit` active turn Ctrl+C 取消当前轮次后可结束进程，并保持可读错误或取消状态。
+- [x] 确保 logger、provider request、shell 工具和 MCP stdio 子进程仍通过 context cancel / close
   边界收尾。
 
 ## Validation
 
-- [ ] 添加 CLI 测试：交互式 active turn 收到 Ctrl+C 后取消当前轮次、回到 prompt，并允许继续输入下一轮。
-- [ ] 添加 CLI 或集成测试：同一 active turn 取消完成前短时间重复 Ctrl+C 不直接退出 chat session，取消完成后仍回到 prompt。
-- [ ] 添加测试：active turn cancel 后不追加成功 assistant history。
-- [ ] 添加测试：idle 输入状态 Ctrl+C 保持现有退出行为或项目约定行为。
-- [ ] 添加测试：`sai chat --prompt ... --quit` active turn Ctrl+C 取消后可以结束进程，且不伪造成功
+- [x] 添加 CLI 测试：交互式 active turn 收到 Ctrl+C 后取消当前轮次、回到 prompt，并允许继续输入下一轮。
+- [x] 添加 CLI 或集成测试：同一 active turn 取消完成前短时间重复 Ctrl+C 不直接退出 chat session，取消完成后仍回到 prompt。
+- [x] 添加测试：active turn cancel 后不追加成功 assistant history。
+- [x] 添加测试：idle 输入状态 Ctrl+C 保持现有退出行为或项目约定行为。
+- [x] 添加测试：`sai chat --prompt ... --quit` active turn Ctrl+C 取消后可以结束进程，且不伪造成功
   assistant history。
-- [ ] 添加或更新 provider / tool / MCP / logger cancel 测试，覆盖本需求触发的取消路径。
-- [ ] 运行 `go test ./...`。
-- [ ] 运行 `git diff --check`。
+- [x] 添加或更新 provider / tool / MCP / logger cancel 测试，覆盖本需求触发的取消路径。
+- [x] 运行 `go test ./...`。
+- [x] 运行 `git diff --check`。
