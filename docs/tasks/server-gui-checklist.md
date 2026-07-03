@@ -69,7 +69,7 @@ future work and should not be required by any slice here.
 - [ ] Legacy entrypoint cleanup: remove or hide standalone in-process
   `sai chat` from the recommended product path and help text; keep any temporary
   compatibility path explicitly hidden or legacy.
-- [ ] Security and error shape: require registry token for writes, debug reads,
+- [x] Security and error shape: require registry token for writes, debug reads,
   blob content reads, and shutdown; return structured errors such as
   `session_busy`, `server_busy`, `permission_denied`, and `blob_not_found`
   without leaking prompt, response, tool result, blob content, or secrets.

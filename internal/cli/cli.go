@@ -1187,7 +1187,7 @@ func stopCommand(ctx context.Context, args []string, stdout io.Writer, getwd fun
 	}
 
 	record := discovery.Record
-	if err := localserver.ShutdownServer(ctx, record.Addr, serverClientTimeout); err != nil {
+	if err := localserver.ShutdownServerWithToken(ctx, record.Addr, record.Token, serverClientTimeout); err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return ctxErr
 		}

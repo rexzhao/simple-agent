@@ -289,6 +289,9 @@ func (p *Process) handleShutdown(w http.ResponseWriter, r *http.Request) {
 		writeMethodNotAllowed(w, http.MethodPost)
 		return
 	}
+	if !p.requireRegistryToken(w, r) {
+		return
+	}
 	if p.snapshot().RunningTurns > 0 {
 		writeError(w, http.StatusConflict, "server_busy", "server has running turns")
 		return
@@ -384,6 +387,10 @@ func (p *Process) handleSessionsList(w http.ResponseWriter, r *http.Request) {
 }
 
 func (p *Process) handleSessionsCreate(w http.ResponseWriter, r *http.Request) {
+	if !p.requireRegistryToken(w, r) {
+		return
+	}
+
 	store := p.sessionStore
 	if store == nil {
 		writeError(w, http.StatusServiceUnavailable, "session_store_unavailable", "session store is not configured")
@@ -436,11 +443,6 @@ func (p *Process) handleSessionDetail(w http.ResponseWriter, r *http.Request, id
 }
 
 func (p *Process) handleSessionItems(w http.ResponseWriter, r *http.Request, id string) {
-	store := p.sessionStore
-	if store == nil {
-		writeError(w, http.StatusServiceUnavailable, "session_store_unavailable", "session store is not configured")
-		return
-	}
 	if !validSessionAPIID(id) {
 		writeError(w, http.StatusBadRequest, "invalid_session_id", "invalid session id")
 		return
@@ -448,6 +450,14 @@ func (p *Process) handleSessionItems(w http.ResponseWriter, r *http.Request, id 
 	query, err := parseSessionItemsQuery(r)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_query", err.Error())
+		return
+	}
+	if query.View == sessionItemsViewDebug && !p.requireRegistryToken(w, r) {
+		return
+	}
+	store := p.sessionStore
+	if store == nil {
+		writeError(w, http.StatusServiceUnavailable, "session_store_unavailable", "session store is not configured")
 		return
 	}
 	session, err := store.Load(id)
@@ -479,8 +489,7 @@ func (p *Process) handleSessionItemContent(w http.ResponseWriter, r *http.Reques
 		writeError(w, http.StatusBadRequest, "invalid_query", err.Error())
 		return
 	}
-	if query.View == sessionItemsViewDebug && !p.hasRegistryToken(r) {
-		writeError(w, http.StatusForbidden, "permission_denied", "permission denied")
+	if query.View == sessionItemsViewDebug && !p.requireRegistryToken(w, r) {
 		return
 	}
 
@@ -1027,6 +1036,14 @@ func (p *Process) hasRegistryToken(r *http.Request) bool {
 	}
 	provided := strings.TrimSpace(auth[len(prefix):])
 	return subtle.ConstantTimeCompare([]byte(provided), []byte(token)) == 1
+}
+
+func (p *Process) requireRegistryToken(w http.ResponseWriter, r *http.Request) bool {
+	if p.hasRegistryToken(r) {
+		return true
+	}
+	writeError(w, http.StatusForbidden, "permission_denied", "permission denied")
+	return false
 }
 
 func writeMethodNotAllowed(w http.ResponseWriter, methods ...string) {

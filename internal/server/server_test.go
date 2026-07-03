@@ -16,6 +16,7 @@ func TestProcessHealthServerAndShutdown(t *testing.T) {
 		ConfigPath: "config.yaml",
 		Listen:     "127.0.0.1:0",
 		Version:    "test-version",
+		AuthToken:  "registry-token",
 		Now: func() time.Time {
 			return startedAt
 		},
@@ -57,7 +58,12 @@ func TestProcessHealthServerAndShutdown(t *testing.T) {
 		t.Fatalf("uptime_seconds = %T(%#v), want number", info["uptime_seconds"], info["uptime_seconds"])
 	}
 
-	resp, err := http.Post(baseURL+"/server/shutdown", "application/json", nil)
+	req, err := http.NewRequest(http.MethodPost, baseURL+"/server/shutdown", nil)
+	if err != nil {
+		t.Fatalf("NewRequest(shutdown) error = %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer registry-token")
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("Post(shutdown) error = %v", err)
 	}

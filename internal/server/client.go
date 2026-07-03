@@ -92,10 +92,16 @@ func GetServerStatus(ctx context.Context, addr string, timeout time.Duration) (S
 
 // ShutdownServer sends POST /server/shutdown to a discovered server.
 func ShutdownServer(ctx context.Context, addr string, timeout time.Duration) error {
+	return ShutdownServerWithToken(ctx, addr, "", timeout)
+}
+
+// ShutdownServerWithToken sends POST /server/shutdown with the registry bearer token.
+func ShutdownServerWithToken(ctx context.Context, addr, token string, timeout time.Duration) error {
 	req, err := newServerClientRequest(ctx, http.MethodPost, addr, "/server/shutdown")
 	if err != nil {
 		return err
 	}
+	setBearerToken(req, token)
 	client := http.Client{Timeout: clientTimeout(timeout)}
 	resp, err := client.Do(req)
 	if err != nil {
@@ -124,6 +130,13 @@ func clientTimeout(timeout time.Duration) time.Duration {
 		return 500 * time.Millisecond
 	}
 	return timeout
+}
+
+func setBearerToken(req *http.Request, token string) {
+	token = strings.TrimSpace(token)
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
 }
 
 func serverResponseError(resp *http.Response) string {

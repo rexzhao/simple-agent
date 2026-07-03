@@ -139,9 +139,9 @@ func TestSessionCreateUsesDefaultsAndDoesNotPersistItems(t *testing.T) {
 		},
 		SaveToolResults: false,
 	}
-	process := startSessionAPIServer(t, store, defaults)
+	process := startSessionAPIServerWithToken(t, store, defaults, "registry-token")
 
-	createdRaw, created := postRawJSON(t, "http://"+process.Addr()+"/sessions", "")
+	createdRaw, created := postRawJSONWithToken(t, "http://"+process.Addr()+"/sessions", "", "registry-token")
 	assertNoSessionTimelineLeak(t, createdRaw)
 	if created["id"] == "" {
 		t.Fatalf("created response missing id: %#v", created)
@@ -183,9 +183,35 @@ func TestSessionCreateUsesDefaultsAndDoesNotPersistItems(t *testing.T) {
 		t.Fatal("stored SaveToolResults = false, want true")
 	}
 
-	_, second := postRawJSON(t, "http://"+process.Addr()+"/sessions", "{}")
+	_, second := postRawJSONWithToken(t, "http://"+process.Addr()+"/sessions", "{}", "registry-token")
 	if second["id"] == "" || second["id"] == id {
 		t.Fatalf("second create response = %#v, want distinct id", second)
+	}
+}
+
+func TestSessionCreateRequiresRegistryToken(t *testing.T) {
+	process := startSessionAPIServerWithToken(t, sessions.NewV2Store(filepath.Join(t.TempDir(), "sessions")), sessions.SessionV2{}, "registry-token")
+	baseURL := "http://" + process.Addr()
+
+	for _, tt := range []struct {
+		name  string
+		token string
+	}{
+		{name: "missing token"},
+		{name: "wrong token", token: "wrong-token"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			raw, body := postRawJSONStatus(t, baseURL+"/sessions", "", tt.token, http.StatusForbidden)
+			assertErrorCode(t, body, "permission_denied")
+			if bytes.Contains(raw, []byte("registry-token")) {
+				t.Fatalf("permission error leaked registry token: %s", raw)
+			}
+		})
+	}
+
+	_, created := postRawJSONWithToken(t, baseURL+"/sessions", "", "registry-token")
+	if created["id"] == "" {
+		t.Fatalf("created response missing id: %#v", created)
 	}
 }
 
@@ -389,7 +415,7 @@ func TestSessionItemsChatAndDebugFilteringAndNarrowDTO(t *testing.T) {
 		Message:    &model.Message{Role: model.MessageRoleTool, Content: "tool result secret", ToolCallID: "call-secret", IsError: true},
 	})
 
-	process := startSessionAPIServer(t, store, sessions.SessionV2{})
+	process := startSessionAPIServerWithToken(t, store, sessions.SessionV2{}, "registry-token")
 	baseURL := "http://" + process.Addr()
 
 	chatRaw, chat := getRawJSON(t, baseURL+"/sessions/filter-session/items")
@@ -417,7 +443,25 @@ func TestSessionItemsChatAndDebugFilteringAndNarrowDTO(t *testing.T) {
 		t.Fatalf("large message content metadata = %#v, want truncated size", assistantContent)
 	}
 
-	debugRaw, debug := getRawJSON(t, baseURL+"/sessions/filter-session/items?view=debug&limit=20")
+	for _, tt := range []struct {
+		name  string
+		token string
+	}{
+		{name: "missing token"},
+		{name: "wrong token", token: "wrong-token"},
+	} {
+		t.Run("debug "+tt.name, func(t *testing.T) {
+			raw, body := getRawJSONStatus(t, baseURL+"/sessions/filter-session/items?view=debug&limit=20", tt.token, http.StatusForbidden)
+			assertErrorCode(t, body, "permission_denied")
+			for _, forbidden := range []string{"compaction summary secret", "debug secret", "tool result secret", "SECRET-LARGE-TAIL", "SECRET TOOL ARGUMENTS", "registry-token"} {
+				if bytes.Contains(raw, []byte(forbidden)) {
+					t.Fatalf("debug permission error leaked %q: %s", forbidden, raw)
+				}
+			}
+		})
+	}
+
+	debugRaw, debug := getRawJSONStatus(t, baseURL+"/sessions/filter-session/items?view=debug&limit=20", "registry-token", http.StatusOK)
 	assertNoItemDTOLeak(t, debugRaw)
 	if got := responseItemIDs(t, debug); !reflect.DeepEqual(got, []string{"visible-user", "visible-assistant", "summary-1", "debug-item", "tool-result"}) {
 		t.Fatalf("debug item IDs = %#v, want all items", got)
@@ -505,6 +549,33 @@ func TestSessionItemsMissingAndCorruptSessionErrors(t *testing.T) {
 	body = decodeJSON(t, resp)
 	if got := body["error"].(map[string]any)["code"]; got != "session_store_error" {
 		t.Fatalf("corrupt items error = %#v, want session_store_error", body)
+	}
+}
+
+func TestServerShutdownRequiresRegistryToken(t *testing.T) {
+	process := startSessionAPIServerWithToken(t, sessions.NewV2Store(filepath.Join(t.TempDir(), "sessions")), sessions.SessionV2{}, "registry-token")
+	baseURL := "http://" + process.Addr()
+
+	for _, tt := range []struct {
+		name  string
+		token string
+	}{
+		{name: "missing token"},
+		{name: "wrong token", token: "wrong-token"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			raw, body := postRawJSONStatus(t, baseURL+"/server/shutdown", "", tt.token, http.StatusForbidden)
+			assertErrorCode(t, body, "permission_denied")
+			if bytes.Contains(raw, []byte("registry-token")) {
+				t.Fatalf("permission error leaked registry token: %s", raw)
+			}
+			waitForHealthyServer(t, process.Addr())
+		})
+	}
+
+	_, body := postRawJSONStatus(t, baseURL+"/server/shutdown", "", "registry-token", http.StatusOK)
+	if body["status"] != "shutting_down" {
+		t.Fatalf("shutdown response = %#v, want shutting_down", body)
 	}
 }
 
@@ -795,13 +866,34 @@ func assertErrorCode(t *testing.T, body map[string]any, want string) {
 func postRawJSON(t *testing.T, url, body string) ([]byte, map[string]any) {
 	t.Helper()
 
-	resp, err := http.Post(url, "application/json", strings.NewReader(body))
+	return postRawJSONWithToken(t, url, body, "")
+}
+
+func postRawJSONWithToken(t *testing.T, url, body, token string) ([]byte, map[string]any) {
+	t.Helper()
+
+	return postRawJSONStatus(t, url, body, token, http.StatusCreated)
+}
+
+func postRawJSONStatus(t *testing.T, url, body, token string, wantStatus int) ([]byte, map[string]any) {
+	t.Helper()
+
+	req, err := http.NewRequest(http.MethodPost, url, strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("NewRequest(POST %s) error = %v", url, err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	client := http.Client{Timeout: 2 * time.Second}
+	resp, err := client.Do(req)
 	if err != nil {
 		t.Fatalf("Post(%s) error = %v", url, err)
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusCreated {
-		t.Fatalf("Post(%s) status = %d, want 201", url, resp.StatusCode)
+	if resp.StatusCode != wantStatus {
+		t.Fatalf("Post(%s) status = %d, want %d", url, resp.StatusCode, wantStatus)
 	}
 	return readRawJSON(t, resp)
 }
