@@ -22,6 +22,7 @@ import (
 	"github.com/rexzhao/simple-agent/internal/contextwindow"
 	"github.com/rexzhao/simple-agent/internal/model"
 	"github.com/rexzhao/simple-agent/internal/sessions"
+	"github.com/rexzhao/simple-agent/internal/subagents"
 )
 
 func TestModelsListUsesGlobalConfigPathFlag(t *testing.T) {
@@ -709,6 +710,22 @@ func TestDoctorReportsEnabledToolMCPAndSkillErrors(t *testing.T) {
 			t.Fatalf("stderr = %q, want empty", stderr.String())
 		}
 		assertCLIOutputContains(t, stdout.String(), "ERROR enabled_tools", `enabled tool "missing" is not registered`)
+	})
+
+	t.Run("explicit subagent tool", func(t *testing.T) {
+		dir := t.TempDir()
+		writeCLIRunFixtureInDirWithTools(t, dir, "http://127.0.0.1:1", "direct-secret-value", "openai-chat", []string{subagents.ToolSubagentStart})
+		var stdout, stderr bytes.Buffer
+		code := RunWithGetwd([]string{"--config", cliConfigPath(dir), "doctor"}, &stdout, &stderr, func() (string, error) {
+			return t.TempDir(), nil
+		})
+		if code != 1 {
+			t.Fatalf("RunWithGetwd() code = %d, want 1", code)
+		}
+		if stderr.String() != "" {
+			t.Fatalf("stderr = %q, want empty", stderr.String())
+		}
+		assertCLIOutputContains(t, stdout.String(), "ERROR enabled_tools", `enabled tool "subagent_start" is a subagent tool`, "auto-enabled", "subagents")
 	})
 
 	t.Run("malformed skill", func(t *testing.T) {
@@ -4024,6 +4041,53 @@ func TestRunCanExposeDiscoveryTools(t *testing.T) {
 	assertCLIToolNames(t, (<-requests).Body, []string{"glob_files", "grep_files"})
 }
 
+func TestRunDoesNotExposeSubagentToolsWithoutConfig(t *testing.T) {
+	server, requests := newCLIRunServer(t,
+		`{"choices":[{"delta":{"content":"ok"}}]}`,
+		`[DONE]`,
+	)
+	defer server.Close()
+
+	configDir := t.TempDir()
+	writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
+
+	var stdout, stderr bytes.Buffer
+	code := RunWithGetwd([]string{"--config", cliConfigPath(configDir), "chat", "--quit", "--prompt", "No helpers configured"}, &stdout, &stderr, func() (string, error) {
+		return t.TempDir(), nil
+	})
+
+	if code != 0 {
+		t.Fatalf("RunWithGetwd() code = %d, stderr = %s", code, stderr.String())
+	}
+	assertCLIRequestOmitsKey(t, (<-requests).Body, "tools")
+	assertNoAdditionalCLIRunRequest(t, requests)
+}
+
+func TestRunRejectsExplicitSubagentToolInEnabledTools(t *testing.T) {
+	server, requests := newCLIRunServer(t,
+		`{"choices":[{"delta":{"content":"unexpected"}}]}`,
+		`[DONE]`,
+	)
+	defer server.Close()
+
+	configDir := t.TempDir()
+	writeCLIRunFixtureInDirWithTools(t, configDir, server.URL, "direct-secret-value", "openai-chat", []string{subagents.ToolSubagentStart})
+
+	var stdout, stderr bytes.Buffer
+	code := RunWithGetwd([]string{"--config", cliConfigPath(configDir), "chat", "--quit", "--prompt", "Bad tool config"}, &stdout, &stderr, func() (string, error) {
+		return t.TempDir(), nil
+	})
+
+	if code != 1 {
+		t.Fatalf("RunWithGetwd() code = %d, want 1", code)
+	}
+	if stdout.String() != "" {
+		t.Fatalf("stdout = %q, want empty", stdout.String())
+	}
+	assertCLIErrorContains(t, stderr.String(), `enabled tool "subagent_start" is a subagent tool`, "auto-enabled", "subagents", "tools.enabled")
+	assertNoAdditionalCLIRunRequest(t, requests)
+}
+
 func TestRunDoesNotExposeEditingToolsWhenOnlyNonEditingToolsAreEnabled(t *testing.T) {
 	server, requests := newCLIRunServer(t,
 		`{"choices":[{"delta":{"content":"ok"}}]}`,
@@ -4182,10 +4246,360 @@ agent:
 	assertMessage(t, messages, 0, "system", builtInBaseInstructions)
 	assertMessage(t, messages, 1, "developer", "Configured subagents:\n- researcher: Looks up facts.\n- reviewer: Reviews scoped changes.")
 	assertMessage(t, messages, 2, "user", "Choose helper")
-	if _, ok := request.Body["tools"]; ok {
-		t.Fatalf("request tools = %#v, want no subagent tools in this slice", request.Body["tools"])
-	}
+	assertCLIToolNames(t, request.Body, []string{
+		subagents.ToolSubagentStart,
+		subagents.ToolSubagentSend,
+		subagents.ToolSubagentStatus,
+		subagents.ToolSubagentWait,
+		subagents.ToolSubagentCancel,
+	})
 	assertNoAdditionalCLIRunRequest(t, requests)
+}
+
+func TestRunRoutesSubagentStartSendWaitAndChildUsesOwnRuntime(t *testing.T) {
+	toolCallChunk := func(id, name, arguments string) string {
+		t.Helper()
+		chunk := map[string]any{
+			"choices": []any{
+				map[string]any{
+					"index": 0,
+					"delta": map[string]any{
+						"tool_calls": []any{
+							map[string]any{
+								"index": 0,
+								"id":    id,
+								"function": map[string]any{
+									"name":      name,
+									"arguments": arguments,
+								},
+							},
+						},
+					},
+				},
+			},
+		}
+		data, err := json.Marshal(chunk)
+		if err != nil {
+			t.Fatalf("json.Marshal(tool call chunk) error = %v", err)
+		}
+		return string(data)
+	}
+	textChunk := func(text string) string {
+		t.Helper()
+		chunk := map[string]any{
+			"choices": []any{
+				map[string]any{
+					"delta": map[string]any{
+						"content": text,
+					},
+				},
+			},
+		}
+		data, err := json.Marshal(chunk)
+		if err != nil {
+			t.Fatalf("json.Marshal(text chunk) error = %v", err)
+		}
+		return string(data)
+	}
+	writeChunks := func(w http.ResponseWriter, chunks ...string) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		for _, chunk := range chunks {
+			_, _ = fmt.Fprintf(w, "data: %s\n\n", chunk)
+		}
+	}
+
+	releaseFirstChild := make(chan struct{})
+	var releaseFirstChildOnce sync.Once
+	childRequests := make(chan capturedCLIRunRequest, 2)
+	var childMu sync.Mutex
+	childRequestCount := 0
+	childServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("ReadAll() error = %v", err)
+		}
+		childRequests <- capturedCLIRunRequest{
+			Path:          r.URL.Path,
+			Authorization: r.Header.Get("Authorization"),
+			ContentType:   r.Header.Get("Content-Type"),
+			RawBody:       body,
+			Body:          decodeCLIJSON(t, body),
+		}
+
+		childMu.Lock()
+		index := childRequestCount
+		childRequestCount++
+		childMu.Unlock()
+
+		switch index {
+		case 0:
+			select {
+			case <-releaseFirstChild:
+			case <-r.Context().Done():
+				return
+			case <-time.After(5 * time.Second):
+				t.Errorf("timed out waiting for subagent_send before first child response")
+				return
+			}
+			writeChunks(w,
+				textChunk("initial child output"),
+				`[DONE]`,
+			)
+		case 1:
+			writeChunks(w,
+				textChunk("child final after send"),
+				`[DONE]`,
+			)
+		default:
+			http.Error(w, "unexpected child request", http.StatusInternalServerError)
+		}
+	}))
+	defer childServer.Close()
+
+	toolResultContent := func(body map[string]any, callID string) string {
+		t.Helper()
+		for _, raw := range requestMessages(t, body) {
+			message, ok := raw.(map[string]any)
+			if !ok {
+				t.Fatalf("message = %T, want object", raw)
+			}
+			if message["role"] == "tool" && message["tool_call_id"] == callID {
+				content, ok := message["content"].(string)
+				if !ok {
+					t.Fatalf("tool message content = %T, want string", message["content"])
+				}
+				return content
+			}
+		}
+		t.Fatalf("missing tool result for call %q in %#v", callID, body)
+		return ""
+	}
+	decodeSubagentSnapshot := func(content string) struct {
+		OK            bool   `json:"ok"`
+		JobID         string `json:"job_id"`
+		AgentID       string `json:"agent_id"`
+		DisplayName   string `json:"display_name"`
+		JobName       string `json:"job_name"`
+		Status        string `json:"status"`
+		Output        string `json:"output"`
+		MessageQueued bool   `json:"message_queued"`
+	} {
+		t.Helper()
+		var snapshot struct {
+			OK            bool   `json:"ok"`
+			JobID         string `json:"job_id"`
+			AgentID       string `json:"agent_id"`
+			DisplayName   string `json:"display_name"`
+			JobName       string `json:"job_name"`
+			Status        string `json:"status"`
+			Output        string `json:"output"`
+			MessageQueued bool   `json:"message_queued"`
+		}
+		if err := json.Unmarshal([]byte(content), &snapshot); err != nil {
+			t.Fatalf("json.Unmarshal(%q) error = %v", content, err)
+		}
+		return snapshot
+	}
+
+	parentRequests := make(chan capturedCLIRunRequest, 4)
+	var parentMu sync.Mutex
+	parentRequestCount := 0
+	parentServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("ReadAll() error = %v", err)
+		}
+		request := capturedCLIRunRequest{
+			Path:          r.URL.Path,
+			Authorization: r.Header.Get("Authorization"),
+			ContentType:   r.Header.Get("Content-Type"),
+			RawBody:       body,
+			Body:          decodeCLIJSON(t, body),
+		}
+		parentRequests <- request
+
+		parentMu.Lock()
+		index := parentRequestCount
+		parentRequestCount++
+		parentMu.Unlock()
+
+		switch index {
+		case 0:
+			writeChunks(w,
+				toolCallChunk("call_start", subagents.ToolSubagentStart, `{"agent_id":"reviewer","prompt":"child task","display_name":"Review UI","job_name":"review-1"}`),
+				`{"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`,
+				`[DONE]`,
+			)
+		case 1:
+			start := decodeSubagentSnapshot(toolResultContent(request.Body, "call_start"))
+			if !start.OK || start.JobID == "" || start.AgentID != "reviewer" || start.DisplayName != "Review UI" || start.JobName != "review-1" || start.Status == "" {
+				t.Errorf("start snapshot = %#v, want job metadata with display name", start)
+			}
+			sendArgs, err := json.Marshal(map[string]any{
+				"job_id":  start.JobID,
+				"message": "follow-up from parent",
+			})
+			if err != nil {
+				t.Errorf("json.Marshal(send args) error = %v", err)
+			}
+			writeChunks(w,
+				toolCallChunk("call_send", subagents.ToolSubagentSend, string(sendArgs)),
+				`{"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`,
+				`[DONE]`,
+			)
+		case 2:
+			sent := decodeSubagentSnapshot(toolResultContent(request.Body, "call_send"))
+			if !sent.MessageQueued || sent.Status != "running" || sent.DisplayName != "Review UI" || sent.JobName != "review-1" {
+				t.Errorf("send snapshot = %#v, want running queued message with metadata", sent)
+			}
+			releaseFirstChildOnce.Do(func() {
+				close(releaseFirstChild)
+			})
+			waitArgs, err := json.Marshal(map[string]any{
+				"job_id":     sent.JobID,
+				"timeout_ms": 5000,
+			})
+			if err != nil {
+				t.Errorf("json.Marshal(wait args) error = %v", err)
+			}
+			writeChunks(w,
+				toolCallChunk("call_wait", subagents.ToolSubagentWait, string(waitArgs)),
+				`{"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`,
+				`[DONE]`,
+			)
+		case 3:
+			waited := decodeSubagentSnapshot(toolResultContent(request.Body, "call_wait"))
+			if waited.Status != "completed" || waited.Output != "child final after send" || waited.DisplayName != "Review UI" || waited.JobName != "review-1" {
+				t.Errorf("wait snapshot = %#v, want completed second-turn child output with metadata", waited)
+			}
+			writeChunks(w,
+				textChunk("parent done"),
+				`[DONE]`,
+			)
+		default:
+			http.Error(w, "unexpected request", http.StatusInternalServerError)
+		}
+	}))
+	defer parentServer.Close()
+
+	configDir := t.TempDir()
+	writeCLIRunFixtureInDirWithTools(t, configDir, parentServer.URL+"/v1", "parent-secret-value", "openai-chat", []string{"read_file"})
+	appendCLIConfig(t, configDir, `
+subagents:
+  reviewer: subagents/reviewer.yaml
+`)
+	subagentDir := filepath.Join(configDir, "subagents")
+	childProvidersDir := filepath.Join(configDir, "child-providers")
+	if err := os.MkdirAll(subagentDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll(subagents) error = %v", err)
+	}
+	if err := os.MkdirAll(childProvidersDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll(child providers) error = %v", err)
+	}
+	writeCLIFile(t, filepath.Join(subagentDir, "reviewer.yaml"), `default_provider: fake
+default_model: default
+provider_dir: ../child-providers
+skill_dirs: []
+
+agent:
+  description: Reviews scoped changes.
+  max_turns: 4
+
+tools:
+  enabled:
+    - list_files
+
+prompt:
+  system_prompt: Child configured prompt.
+
+logging:
+  path: ../child-logs/sai.jsonl
+`)
+	writeCLIFile(t, filepath.Join(childProvidersDir, "fake.yaml"), fmt.Sprintf(`name: fake
+base_url: %s
+api_key: child-secret-value
+
+models:
+  default:
+    id: child-model
+    max_tokens: 64
+`, childServer.URL+"/v1"))
+
+	var stdout, stderr bytes.Buffer
+	code := RunWithGetwd([]string{"--config", cliConfigPath(configDir), "chat", "--quit", "--prompt", "delegate"}, &stdout, &stderr, func() (string, error) {
+		return t.TempDir(), nil
+	})
+
+	if code != 0 {
+		t.Fatalf("RunWithGetwd() code = %d, stderr = %s", code, stderr.String())
+	}
+	if got, want := stdout.String(), "parent done"; got != want {
+		t.Fatalf("stdout = %q, want %q", got, want)
+	}
+	if strings.Contains(stderr.String(), "initial child output") || strings.Contains(stderr.String(), "child final after send") {
+		t.Fatalf("stderr leaked child output: %s", stderr.String())
+	}
+
+	firstParent := <-parentRequests
+	assertCLIToolNames(t, firstParent.Body, []string{
+		"read_file",
+		subagents.ToolSubagentStart,
+		subagents.ToolSubagentSend,
+		subagents.ToolSubagentStatus,
+		subagents.ToolSubagentWait,
+		subagents.ToolSubagentCancel,
+	})
+	secondParent := <-parentRequests
+	startContent := toolResultContent(secondParent.Body, "call_start")
+	if !strings.Contains(startContent, `"display_name":"Review UI"`) || !strings.Contains(startContent, `"job_name":"review-1"`) {
+		t.Fatalf("start tool result = %s, want display_name and job_name", startContent)
+	}
+	thirdParent := <-parentRequests
+	sendContent := toolResultContent(thirdParent.Body, "call_send")
+	if !strings.Contains(sendContent, `"message_queued":true`) || !strings.Contains(sendContent, `"display_name":"Review UI"`) {
+		t.Fatalf("send tool result = %s, want message_queued and display_name", sendContent)
+	}
+	fourthParent := <-parentRequests
+	waitContent := toolResultContent(fourthParent.Body, "call_wait")
+	if !strings.Contains(waitContent, `"output":"child final after send"`) || !strings.Contains(waitContent, `"display_name":"Review UI"`) {
+		t.Fatalf("wait tool result = %s, want child output and display_name", waitContent)
+	}
+	assertNoAdditionalCLIRunRequest(t, parentRequests)
+
+	firstChild := <-childRequests
+	if firstChild.Authorization != "Bearer child-secret-value" {
+		t.Fatalf("first child Authorization = %q, want child API key", firstChild.Authorization)
+	}
+	if got := firstChild.Body["model"]; got != "child-model" {
+		t.Fatalf("first child model = %#v, want child-model", got)
+	}
+	childMessages := requestMessages(t, firstChild.Body)
+	if len(childMessages) != 3 {
+		t.Fatalf("len(child messages) = %d, want 3: %#v", len(childMessages), childMessages)
+	}
+	assertMessage(t, childMessages, 0, "system", builtInBaseInstructions)
+	assertMessage(t, childMessages, 1, "developer", "Child configured prompt.")
+	assertMessage(t, childMessages, 2, "user", "child task")
+	assertCLIToolNames(t, firstChild.Body, []string{"list_files"})
+
+	secondChild := <-childRequests
+	if secondChild.Authorization != "Bearer child-secret-value" {
+		t.Fatalf("second child Authorization = %q, want child API key", secondChild.Authorization)
+	}
+	if got := secondChild.Body["model"]; got != "child-model" {
+		t.Fatalf("second child model = %#v, want child-model", got)
+	}
+	secondChildMessages := requestMessages(t, secondChild.Body)
+	if len(secondChildMessages) != 5 {
+		t.Fatalf("len(second child messages) = %d, want 5: %#v", len(secondChildMessages), secondChildMessages)
+	}
+	assertMessage(t, secondChildMessages, 0, "system", builtInBaseInstructions)
+	assertMessage(t, secondChildMessages, 1, "developer", "Child configured prompt.")
+	assertMessage(t, secondChildMessages, 2, "user", "child task")
+	assertMessage(t, secondChildMessages, 3, "assistant", "initial child output")
+	assertMessage(t, secondChildMessages, 4, "user", "follow-up from parent")
+	assertCLIToolNames(t, secondChild.Body, []string{"list_files"})
+	assertNoAdditionalCLIRunRequest(t, childRequests)
 }
 
 func TestRunInjectsDiscoveredSkillsInDirectoryOrder(t *testing.T) {

@@ -29,6 +29,7 @@ import (
 	openairesponses "github.com/rexzhao/simple-agent/internal/model/openai_responses"
 	"github.com/rexzhao/simple-agent/internal/sessions"
 	localskills "github.com/rexzhao/simple-agent/internal/skills"
+	"github.com/rexzhao/simple-agent/internal/subagents"
 	"github.com/rexzhao/simple-agent/internal/tools"
 )
 
@@ -1087,11 +1088,17 @@ func checkDoctorTools(cfg *config.Config, selectedMCPServers []config.MCPServerC
 		add(doctorStatusError, "enabled_tools", detail)
 	}
 
+	for _, name := range cfg.Tools.Enabled {
+		if subagents.IsTool(name) {
+			addToolError(explicitSubagentToolError(name).Error())
+		}
+	}
+
 	if hasBuiltinEnabledTool(cfg.Tools.Enabled) {
 		cwd, err := getwd()
 		if err != nil {
 			addToolError(fmt.Sprintf("get current directory: %v", err))
-		} else if _, _, err := enabledToolsForRun(cwd, cfg.Tools.Enabled); err != nil {
+		} else if _, _, err := enabledToolsForRun(cwd, withoutSubagentToolNames(cfg.Tools.Enabled)); err != nil {
 			addToolError(err.Error())
 		}
 	}
@@ -1179,7 +1186,7 @@ func checkExistingDirectory(path string) error {
 
 func hasBuiltinEnabledTool(enabled []string) bool {
 	for _, name := range enabled {
-		if !strings.HasPrefix(name, "mcp.") {
+		if !strings.HasPrefix(name, "mcp.") && !subagents.IsTool(name) {
 			return true
 		}
 	}
@@ -1869,10 +1876,19 @@ type agentRuntime struct {
 	contextTracker        *contextwindow.Tracker
 	logger                *eventlog.Logger
 	mcpSessions           []*mcp.Session
+	subagentManager       *subagents.Manager
+	subagentCancel        context.CancelFunc
 }
 
 func (r *agentRuntime) Close() error {
-	return errors.Join(r.logger.Close(), closeMCPSessions(r.mcpSessions))
+	var subagentErr error
+	if r.subagentCancel != nil {
+		r.subagentCancel()
+	}
+	if r.subagentManager != nil {
+		subagentErr = r.subagentManager.Close()
+	}
+	return errors.Join(subagentErr, r.logger.Close(), closeMCPSessions(r.mcpSessions))
 }
 
 func (r *agentRuntime) initialMessages() []model.Message {
@@ -1958,7 +1974,17 @@ func (r *agentRuntime) saveUpdatedMessages(messages []model.Message) error {
 	return nil
 }
 
+type runtimePreparationOptions struct {
+	enableSubagents bool
+}
+
 func prepareAgentRuntime(ctx context.Context, configPath string, options agentCommandFlags, stderr io.Writer, getwd func() (string, error), program string) (runtime *agentRuntime, err error) {
+	return prepareAgentRuntimeWithOptions(ctx, configPath, options, stderr, getwd, program, runtimePreparationOptions{
+		enableSubagents: true,
+	})
+}
+
+func prepareAgentRuntimeWithOptions(ctx context.Context, configPath string, options agentCommandFlags, stderr io.Writer, getwd func() (string, error), program string, prep runtimePreparationOptions) (runtime *agentRuntime, err error) {
 	cwd, err := getwd()
 	if err != nil {
 		return nil, fmt.Errorf("get current directory: %w", err)
@@ -2051,6 +2077,26 @@ func prepareAgentRuntime(ctx context.Context, configPath string, options agentCo
 	}
 	toolSchemas = append(toolSchemas, mcpToolSchemas...)
 
+	var subagentManager *subagents.Manager
+	var subagentCancel context.CancelFunc
+	defer func() {
+		if err != nil && subagentCancel != nil {
+			subagentCancel()
+		}
+	}()
+	if prep.enableSubagents && len(cfg.Subagents) > 0 {
+		subagentCtx, cancel := context.WithCancel(ctx)
+		subagentCancel = cancel
+		subagentManager, err = subagents.NewManager(cfg.Subagents, cliSubagentRunner{
+			cwd:     cwd,
+			program: program,
+		}, subagents.WithRootContext(subagentCtx))
+		if err != nil {
+			return nil, err
+		}
+		toolSchemas = append(toolSchemas, subagents.Definitions()...)
+	}
+
 	resolvedShowReasoning := cfg.Agent.ShowReasoning
 	if options.showReasoningSet {
 		resolvedShowReasoning = options.showReasoning
@@ -2067,7 +2113,7 @@ func prepareAgentRuntime(ctx context.Context, configPath string, options agentCo
 		instructionSources = copyInstructionSources(resumedSession.InstructionSources)
 		enabledSkillIDs = copyStringSlice(resumedSession.EnabledSkills)
 	} else {
-		configuredDeveloperMessages, err := promptDeveloperMessagesForRun(cfg, cwd)
+		configuredDeveloperMessages, err := promptDeveloperMessagesForRun(cfg, cwd, prep.enableSubagents)
 		if err != nil {
 			return nil, err
 		}
@@ -2111,7 +2157,7 @@ func prepareAgentRuntime(ctx context.Context, configPath string, options agentCo
 		modelID:               resolved.ModelID,
 		parameters:            resolved.Parameters,
 		provider:              provider,
-		toolExecutor:          runToolExecutor{builtins: toolRegistry, mcpSessions: mcpSessionsByID},
+		toolExecutor:          runToolExecutor{builtins: toolRegistry, mcpSessions: mcpSessionsByID, subagentManager: subagentManager},
 		toolSchemas:           toolSchemas,
 		maxTurns:              cfg.Agent.MaxTurns,
 		showReasoning:         resolvedShowReasoning,
@@ -2127,6 +2173,8 @@ func prepareAgentRuntime(ctx context.Context, configPath string, options agentCo
 		contextTracker:        contextTracker,
 		logger:                logger,
 		mcpSessions:           mcpSessions,
+		subagentManager:       subagentManager,
+		subagentCancel:        subagentCancel,
 	}, nil
 }
 
@@ -2383,6 +2431,9 @@ func parseCommaSeparatedNames(value, emptyName, flagName string) ([]string, erro
 func enabledToolsForRun(rootDir string, enabled []string) (*tools.Registry, []model.Tool, error) {
 	builtinEnabled := make([]string, 0, len(enabled))
 	for _, name := range enabled {
+		if subagents.IsTool(name) {
+			return nil, nil, explicitSubagentToolError(name)
+		}
 		if !strings.HasPrefix(name, "mcp.") {
 			builtinEnabled = append(builtinEnabled, name)
 		}
@@ -2402,12 +2453,34 @@ func enabledToolsForRun(rootDir string, enabled []string) (*tools.Registry, []mo
 	return registry, schemas, nil
 }
 
+func explicitSubagentToolError(name string) error {
+	return fmt.Errorf("enabled tool %q is a subagent tool; subagent tools are auto-enabled by configuring subagents and must not be listed in tools.enabled or --enable-tools", name)
+}
+
+func withoutSubagentToolNames(names []string) []string {
+	out := make([]string, 0, len(names))
+	for _, name := range names {
+		if !subagents.IsTool(name) {
+			out = append(out, name)
+		}
+	}
+	return out
+}
+
 type runToolExecutor struct {
-	builtins    *tools.Registry
-	mcpSessions map[string]*mcp.Session
+	builtins        *tools.Registry
+	mcpSessions     map[string]*mcp.Session
+	subagentManager *subagents.Manager
 }
 
 func (e runToolExecutor) Execute(ctx context.Context, name string, arguments map[string]any) (model.ToolResult, error) {
+	if subagents.IsTool(name) {
+		if e.subagentManager == nil {
+			return model.ToolResult{}, fmt.Errorf("subagent tool %q is not registered", name)
+		}
+		return e.subagentManager.Execute(ctx, name, arguments)
+	}
+
 	if strings.HasPrefix(name, "mcp.") {
 		serverID, toolName, err := mcp.ParseToolName(name)
 		if err != nil {
@@ -2428,6 +2501,94 @@ func (e runToolExecutor) Execute(ctx context.Context, name string, arguments map
 		return model.ToolResult{}, fmt.Errorf("tool %q is not registered", name)
 	}
 	return e.builtins.Execute(ctx, name, arguments)
+}
+
+type cliSubagentRunner struct {
+	cwd     string
+	program string
+}
+
+func (r cliSubagentRunner) Run(ctx context.Context, request subagents.RunRequest, _ <-chan subagents.Message) (result subagents.RunResult, err error) {
+	runtime, err := prepareAgentRuntimeWithOptions(ctx, request.ConfigPath, agentCommandFlags{}, io.Discard, func() (string, error) {
+		return r.cwd, nil
+	}, r.program, runtimePreparationOptions{
+		enableSubagents: false,
+	})
+	if err != nil {
+		return subagents.RunResult{}, err
+	}
+	defer func() {
+		err = errors.Join(err, runtime.Close())
+	}()
+
+	messages, err := runSilentAgentTurn(ctx, runtime, runtime.initialMessages(), request.Prompt)
+	if err != nil {
+		return subagents.RunResult{}, err
+	}
+	for {
+		nextMessage := request.NextMessage
+		if nextMessage == nil {
+			return subagents.RunResult{Output: finalAssistantOutput(messages)}, nil
+		}
+		message, ok := nextMessage()
+		if !ok {
+			return subagents.RunResult{Output: finalAssistantOutput(messages)}, nil
+		}
+		messages, err = runSilentAgentTurn(ctx, runtime, messages, message.Content)
+		if err != nil {
+			return subagents.RunResult{}, err
+		}
+	}
+}
+
+func runSilentAgentTurn(ctx context.Context, runtime *agentRuntime, messages []model.Message, prompt string) ([]model.Message, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	turnCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	requestMessages := append(copyMessageSlice(messages), model.Message{
+		Role:    model.MessageRoleUser,
+		Content: prompt,
+	})
+	request := model.Request{
+		Model:      runtime.modelID,
+		Messages:   requestMessages,
+		Tools:      runtime.toolSchemas,
+		Parameters: runtime.parameters,
+	}
+	events, results, err := agent.StreamWithResult(turnCtx, request, agent.Options{
+		Provider:     runtime.provider,
+		ToolExecutor: runtime.toolExecutor,
+		MaxTurns:     runtime.maxTurns,
+	})
+	if err != nil {
+		return nil, err
+	}
+	if err := writeStreamWithOptions(io.Discard, io.Discard, events, runtime.showReasoning, runtime.logger, streamOutputOptions{}); err != nil {
+		return nil, err
+	}
+	result, ok := <-results
+	if !ok {
+		if err := turnCtx.Err(); err != nil {
+			return nil, err
+		}
+		return nil, fmt.Errorf("child agent did not return updated messages")
+	}
+	if err := runtime.saveUpdatedMessages(result.Messages); err != nil {
+		return nil, err
+	}
+	return result.Messages, nil
+}
+
+func finalAssistantOutput(messages []model.Message) string {
+	for i := len(messages) - 1; i >= 0; i-- {
+		if messages[i].Role == model.MessageRoleAssistant && len(messages[i].ToolCalls) == 0 {
+			return messages[i].Content
+		}
+	}
+	return ""
 }
 
 func mcpToolsForRun(ctx context.Context, servers []config.MCPServerConfig, enabled []string) ([]*mcp.Session, map[string]*mcp.Session, []model.Tool, error) {
@@ -2563,7 +2724,7 @@ func (s codexResponsesTokenSource) AccessToken(ctx context.Context) (openairespo
 	return openairesponses.AccessToken{Token: token.Token, AccountID: token.AccountID}, nil
 }
 
-func promptDeveloperMessagesForRun(cfg *config.Config, cwd string) ([]string, error) {
+func promptDeveloperMessagesForRun(cfg *config.Config, cwd string, includeSubagents bool) ([]string, error) {
 	messages := []string{}
 	if strings.TrimSpace(cfg.Prompt.SystemPrompt) != "" {
 		rendered, err := projectcontext.RenderPromptTemplate(cfg.Prompt.SystemPrompt, projectcontext.PromptRenderValues{
@@ -2579,12 +2740,14 @@ func promptDeveloperMessagesForRun(cfg *config.Config, cwd string) ([]string, er
 		}
 	}
 
-	subagentMessage, err := configuredSubagentsPrompt(cfg)
-	if err != nil {
-		return nil, err
-	}
-	if subagentMessage != "" {
-		messages = append(messages, subagentMessage)
+	if includeSubagents {
+		subagentMessage, err := configuredSubagentsPrompt(cfg)
+		if err != nil {
+			return nil, err
+		}
+		if subagentMessage != "" {
+			messages = append(messages, subagentMessage)
+		}
 	}
 	return messages, nil
 }

@@ -42,6 +42,7 @@ type RunRequest struct {
 	Prompt      string
 	DisplayName string
 	JobName     string
+	NextMessage func() (Message, bool)
 }
 
 type RunResult struct {
@@ -70,12 +71,14 @@ func WithRootContext(ctx context.Context) Option {
 
 type Manager struct {
 	mu            sync.Mutex
+	wg            sync.WaitGroup
 	configured    map[string]string
 	runner        Runner
 	rootCtx       context.Context
 	maxJobs       int
 	nextJobNumber int
 	jobs          map[string]*job
+	closed        bool
 }
 
 func NewManager(configured map[string]string, runner Runner, opts ...Option) (*Manager, error) {
@@ -156,6 +159,10 @@ func (m *Manager) start(ctx context.Context, toolName string, arguments map[stri
 	}
 
 	m.mu.Lock()
+	if m.closed {
+		m.mu.Unlock()
+		return errorResult(toolName, "subagent manager is closed")
+	}
 	configPath, ok := m.configured[agentID]
 	if !ok {
 		m.mu.Unlock()
@@ -175,6 +182,7 @@ func (m *Manager) start(ctx context.Context, toolName string, arguments map[stri
 		displayName: displayName,
 		jobName:     jobName,
 		status:      StatusRunning,
+		accepting:   true,
 		inbox:       make(chan Message, inboxBuffer),
 		done:        make(chan struct{}),
 		cancel:      cancel,
@@ -188,12 +196,17 @@ func (m *Manager) start(ctx context.Context, toolName string, arguments map[stri
 		Prompt:      prompt,
 		DisplayName: displayName,
 		JobName:     jobName,
+		NextMessage: m.nextMessage(jobID),
 	}
 	inbox := j.inbox
 	runner := m.runner
+	m.wg.Add(1)
 	m.mu.Unlock()
 
-	go m.runJob(jobID, jobCtx, request, inbox, runner)
+	go func() {
+		defer m.wg.Done()
+		m.runJob(jobID, jobCtx, request, inbox, runner)
+	}()
 	return result(toolName, snapshot)
 }
 
@@ -220,6 +233,10 @@ func (m *Manager) send(ctx context.Context, toolName string, arguments map[strin
 		status := j.status
 		m.mu.Unlock()
 		return errorResult(toolName, "subagent job %q is already %s", jobID, status)
+	}
+	if !j.accepting {
+		m.mu.Unlock()
+		return errorResult(toolName, "subagent job %q is no longer accepting messages", jobID)
 	}
 
 	select {
@@ -317,6 +334,7 @@ func (m *Manager) cancel(toolName string, arguments map[string]any) (model.ToolR
 
 	j.status = StatusCanceled
 	j.err = "canceled"
+	j.accepting = false
 	j.finish()
 	cancel := j.cancel
 	snapshot := j.snapshotLocked()
@@ -336,9 +354,11 @@ func (m *Manager) runJob(jobID string, ctx context.Context, request RunRequest, 
 		return
 	}
 	if j.status == StatusCanceled {
+		j.accepting = false
 		j.finish()
 		return
 	}
+	j.accepting = false
 
 	if err != nil {
 		if errors.Is(err, context.Canceled) && ctx.Err() != nil {
@@ -355,6 +375,52 @@ func (m *Manager) runJob(jobID string, ctx context.Context, request RunRequest, 
 	j.status = StatusCompleted
 	j.output = runResult.Output
 	j.finish()
+}
+
+func (m *Manager) nextMessage(jobID string) func() (Message, bool) {
+	return func() (Message, bool) {
+		m.mu.Lock()
+		defer m.mu.Unlock()
+
+		j, ok := m.jobs[jobID]
+		if !ok || !canReceiveMessage(j.status) || !j.accepting {
+			return Message{}, false
+		}
+
+		select {
+		case message := <-j.inbox:
+			return message, true
+		default:
+			j.accepting = false
+			return Message{}, false
+		}
+	}
+}
+
+func (m *Manager) Close() error {
+	var cancels []context.CancelFunc
+	m.mu.Lock()
+	m.closed = true
+	for _, j := range m.jobs {
+		if isTerminalStatus(j.status) {
+			j.accepting = false
+			continue
+		}
+		j.status = StatusCanceled
+		j.err = "canceled"
+		j.accepting = false
+		j.finish()
+		if j.cancel != nil {
+			cancels = append(cancels, j.cancel)
+		}
+	}
+	m.mu.Unlock()
+
+	for _, cancel := range cancels {
+		cancel()
+	}
+	m.wg.Wait()
+	return nil
 }
 
 func (m *Manager) snapshot(jobID string) (JobSnapshot, bool) {
@@ -374,6 +440,7 @@ type job struct {
 	displayName string
 	jobName     string
 	status      JobStatus
+	accepting   bool
 	output      string
 	err         string
 	inbox       chan Message

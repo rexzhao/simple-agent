@@ -158,6 +158,55 @@ func TestSendDeliversMessageToRunner(t *testing.T) {
 	}
 }
 
+func TestSendRejectsAfterRunnerStopsAcceptingMessages(t *testing.T) {
+	stoppedAccepting := make(chan struct{})
+	release := make(chan struct{})
+	runnerErr := make(chan error, 1)
+	runner := runnerFunc(func(ctx context.Context, request RunRequest, inbox <-chan Message) (RunResult, error) {
+		if request.NextMessage == nil {
+			runnerErr <- errors.New("NextMessage is nil")
+			close(stoppedAccepting)
+			return RunResult{}, errors.New("missing NextMessage")
+		}
+		if _, ok := request.NextMessage(); ok {
+			runnerErr <- errors.New("unexpected queued message")
+		}
+		close(stoppedAccepting)
+		select {
+		case <-release:
+			return RunResult{Output: "done"}, nil
+		case <-ctx.Done():
+			return RunResult{}, ctx.Err()
+		}
+	})
+	manager := newTestManager(t, runner)
+	jobID := startJob(t, manager, "reviewer")
+
+	select {
+	case <-stoppedAccepting:
+	case <-time.After(time.Second):
+		t.Fatal("runner did not stop accepting messages")
+	}
+	select {
+	case err := <-runnerErr:
+		t.Fatal(err)
+	default:
+	}
+
+	result := execute(t, manager, ToolSubagentSend, map[string]any{"job_id": jobID, "message": "late"})
+	assertToolError(t, result, "no longer accepting messages")
+
+	close(release)
+	waitResult := execute(t, manager, ToolSubagentWait, map[string]any{
+		"job_id":     jobID,
+		"timeout_ms": 1000,
+	})
+	waited := decodeSnapshot(t, waitResult)
+	if waited.Status != StatusCompleted {
+		t.Fatalf("wait status = %q, want completed", waited.Status)
+	}
+}
+
 func TestCancelPropagatesToRunnerContext(t *testing.T) {
 	ctxErr := make(chan error, 1)
 	runner := runnerFunc(func(ctx context.Context, request RunRequest, inbox <-chan Message) (RunResult, error) {
@@ -190,6 +239,56 @@ func TestCancelPropagatesToRunnerContext(t *testing.T) {
 	status := decodeSnapshot(t, statusResult)
 	if status.Status != StatusCanceled {
 		t.Fatalf("status after cancel = %q, want canceled", status.Status)
+	}
+}
+
+func TestCloseCancelsAndWaitsForActiveRunnerCleanup(t *testing.T) {
+	started := make(chan struct{})
+	cleanedUp := make(chan struct{})
+	runner := runnerFunc(func(ctx context.Context, request RunRequest, inbox <-chan Message) (RunResult, error) {
+		close(started)
+		defer func() {
+			time.Sleep(25 * time.Millisecond)
+			close(cleanedUp)
+		}()
+		<-ctx.Done()
+		return RunResult{}, ctx.Err()
+	})
+	manager := newTestManager(t, runner)
+	jobID := startJob(t, manager, "reviewer")
+
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("runner did not start")
+	}
+
+	closeErr := make(chan error, 1)
+	go func() {
+		closeErr <- manager.Close()
+	}()
+
+	select {
+	case err := <-closeErr:
+		t.Fatalf("Close returned before runner cleanup, err = %v", err)
+	case <-cleanedUp:
+	case <-time.After(time.Second):
+		t.Fatal("runner cleanup did not finish")
+	}
+
+	select {
+	case err := <-closeErr:
+		if err != nil {
+			t.Fatalf("Close() error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Close did not return after runner cleanup")
+	}
+
+	statusResult := execute(t, manager, ToolSubagentStatus, map[string]any{"job_id": jobID})
+	status := decodeSnapshot(t, statusResult)
+	if status.Status != StatusCanceled {
+		t.Fatalf("status after Close = %q, want canceled", status.Status)
 	}
 }
 

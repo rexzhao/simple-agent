@@ -24,6 +24,15 @@ func Definitions() []model.Tool {
 	}
 }
 
+func IsTool(name string) bool {
+	switch name {
+	case ToolSubagentStart, ToolSubagentSend, ToolSubagentStatus, ToolSubagentWait, ToolSubagentCancel:
+		return true
+	default:
+		return false
+	}
+}
+
 func StartDefinition() model.Tool {
 	return model.Tool{
 		Name:        ToolSubagentStart,
