@@ -53,14 +53,15 @@ type ToolResult struct {
 type EventType string
 
 const (
-	EventTypeTextDelta      EventType = "text_delta"
-	EventTypeReasoningDelta EventType = "reasoning_delta"
-	EventTypeMessageDone    EventType = "message_done"
-	EventTypeToolCallDelta  EventType = "tool_call_delta"
-	EventTypeToolCallDone   EventType = "tool_call_done"
-	EventTypeToolResult     EventType = "tool_result"
-	EventTypeUsage          EventType = "usage"
-	EventTypeError          EventType = "error"
+	EventTypeTextDelta          EventType = "text_delta"
+	EventTypeReasoningDelta     EventType = "reasoning_delta"
+	EventTypeMessageDone        EventType = "message_done"
+	EventTypeToolCallDelta      EventType = "tool_call_delta"
+	EventTypeToolCallDone       EventType = "tool_call_done"
+	EventTypeToolResult         EventType = "tool_result"
+	EventTypeUsage              EventType = "usage"
+	EventTypeSubagentCompletion EventType = "subagent_completion"
+	EventTypeError              EventType = "error"
 )
 
 type Event interface {
@@ -131,6 +132,18 @@ type UsageEvent struct {
 
 func (UsageEvent) Type() EventType {
 	return EventTypeUsage
+}
+
+type SubagentCompletionEvent struct {
+	JobID       string
+	AgentID     string
+	DisplayName string
+	JobName     string
+	Status      string
+}
+
+func (SubagentCompletionEvent) Type() EventType {
+	return EventTypeSubagentCompletion
 }
 
 type ErrorEvent struct {

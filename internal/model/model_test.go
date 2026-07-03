@@ -14,6 +14,7 @@ func TestEventTypeNames(t *testing.T) {
 		{EventTypeToolCallDone, "tool_call_done"},
 		{EventTypeToolResult, "tool_result"},
 		{EventTypeUsage, "usage"},
+		{EventTypeSubagentCompletion, "subagent_completion"},
 		{EventTypeError, "error"},
 	}
 
@@ -37,6 +38,7 @@ func TestEventsReportTheirTypes(t *testing.T) {
 		{"tool call done", ToolCallDoneEvent{}, EventTypeToolCallDone},
 		{"tool result", ToolResultEvent{}, EventTypeToolResult},
 		{"usage", UsageEvent{}, EventTypeUsage},
+		{"subagent completion", SubagentCompletionEvent{}, EventTypeSubagentCompletion},
 		{"error", ErrorEvent{}, EventTypeError},
 	}
 

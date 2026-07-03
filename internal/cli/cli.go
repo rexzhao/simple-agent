@@ -1869,10 +1869,28 @@ func runAvailableCompletionTurns(ctx context.Context, runtime *agentRuntime, mes
 		if err != nil {
 			return nil, err
 		}
+		if err := logSubagentCompletionEvents(runtime.logger, completions); err != nil {
+			return nil, err
+		}
 		runtime.subagentManager.AckCompletions(completions)
 		messages = updated
 		stderrNeedsLeadingBreak = true
 	}
+}
+
+func logSubagentCompletionEvents(logger *eventlog.Logger, completions []subagents.JobSnapshot) error {
+	for _, completion := range completions {
+		if err := logger.LogEvent(model.SubagentCompletionEvent{
+			JobID:       completion.JobID,
+			AgentID:     completion.AgentID,
+			DisplayName: completion.DisplayName,
+			JobName:     completion.JobName,
+			Status:      string(completion.Status),
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func runCompletionTurnsWithOptionalWait(ctx context.Context, runtime *agentRuntime, messages []model.Message, stdout, stderr io.Writer, addTrailingNewline bool, stderrNeedsLeadingBreak bool, wait time.Duration) ([]model.Message, error) {

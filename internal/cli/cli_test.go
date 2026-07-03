@@ -4966,6 +4966,35 @@ subagents:
 	if strings.Contains(strings.ToLower(event), "tool result") {
 		t.Fatalf("completion event should not claim tool result: %q", event)
 	}
+
+	logPaths := sessionLogPaths(t, configDir)
+	if len(logPaths) != 1 {
+		t.Fatalf("session log paths = %#v, want one parent log", logPaths)
+	}
+	logData, err := os.ReadFile(logPaths[0])
+	if err != nil {
+		t.Fatalf("ReadFile(%q) error = %v", logPaths[0], err)
+	}
+	logText := string(logData)
+	if strings.Contains(logText, "child complete") {
+		t.Fatalf("log leaked child output: %s", logText)
+	}
+	records := readJSONLRecords(t, logData)
+	assertCLILogBaseFields(t, records)
+	completionRecord := firstCLILogRecord(t, records, "subagent_completion")
+	for key, want := range map[string]any{
+		"agent_id":     "reviewer",
+		"display_name": "Review UI",
+		"job_name":     "review-1",
+		"status":       "completed",
+	} {
+		if got := completionRecord[key]; got != want {
+			t.Fatalf("subagent_completion[%q] = %#v, want %#v in %#v", key, got, want, completionRecord)
+		}
+	}
+	if got, ok := completionRecord["job_id"].(string); !ok || got == "" {
+		t.Fatalf("subagent_completion job_id = %#v, want non-empty string in %#v", completionRecord["job_id"], completionRecord)
+	}
 }
 
 func TestRunIdleAutoWakesParentForSubagentCompletion(t *testing.T) {
@@ -5243,6 +5272,38 @@ subagents:
 	}
 	if firstEvent != secondEvent {
 		t.Fatalf("second completion event = %q, want same pending event as first %q", secondEvent, firstEvent)
+	}
+
+	logPaths := sessionLogPaths(t, configDir)
+	if len(logPaths) != 1 {
+		t.Fatalf("session log paths = %#v, want one parent log", logPaths)
+	}
+	logData, err := os.ReadFile(logPaths[0])
+	if err != nil {
+		t.Fatalf("ReadFile(%q) error = %v", logPaths[0], err)
+	}
+	if strings.Contains(string(logData), "child output survives failure") {
+		t.Fatalf("log leaked child output: %s", logData)
+	}
+	records := readJSONLRecords(t, logData)
+	completionRecords := 0
+	for _, record := range records {
+		if record["event"] == "subagent_completion" {
+			completionRecords++
+			for key, want := range map[string]any{
+				"agent_id":     "reviewer",
+				"display_name": "Retry Review",
+				"job_name":     "retry-review",
+				"status":       "completed",
+			} {
+				if got := record[key]; got != want {
+					t.Fatalf("subagent_completion[%q] = %#v, want %#v in %#v", key, got, want, record)
+				}
+			}
+		}
+	}
+	if completionRecords != 1 {
+		t.Fatalf("subagent_completion records = %d, want 1 in %#v", completionRecords, records)
 	}
 }
 

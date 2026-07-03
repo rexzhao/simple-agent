@@ -393,7 +393,7 @@
 - [x] subagent job 支持 send。
 - [x] subagent job 支持 status。
 - [x] status / wait tool result JSON 输出包含 display name / job name。
-- [ ] mailbox 和 observability 输出包含 display name。
+- [x] mailbox 和 observability 输出包含 display name。
 - [x] subagent job 支持 wait。
 - [x] subagent job 支持 cancel。
 - [x] child job 运行时 parent 仍可继续接收用户输入。
