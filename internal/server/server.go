@@ -56,6 +56,7 @@ type Options struct {
 	SessionStore    *sessions.V2Store
 	SessionRoot     string
 	SessionDefaults sessions.SessionV2
+	TurnRunner      SessionTurnRunner
 }
 
 type Process struct {
@@ -72,6 +73,30 @@ type Process struct {
 	sessionDefaults sessions.SessionV2
 	authToken       string
 	streams         *sessionStreamHub
+	turnRunner      SessionTurnRunner
+	runningTurns    map[string]string
+}
+
+type SessionTurnRunner interface {
+	RunSessionTurn(ctx context.Context, request SessionTurnRequest) (SessionTurnResult, error)
+}
+
+type SessionTurnRequest struct {
+	Session sessions.SessionV2
+	Content string
+	Emit    func(model.Event)
+}
+
+type SessionTurnResult struct {
+	Session       sessions.SessionV2
+	Compaction    *SessionCompactionPlan
+	Items         []sessions.SessionItem
+	ActiveHistory []string
+}
+
+type SessionCompactionPlan struct {
+	SummaryItem sessions.SessionItem
+	Checkpoint  sessions.CompactionCheckpoint
 }
 
 type Info struct {
@@ -150,6 +175,8 @@ func Start(options Options) (*Process, error) {
 		sessionDefaults: copySessionMetadata(options.SessionDefaults),
 		authToken:       strings.TrimSpace(options.AuthToken),
 		streams:         newSessionStreamHub(),
+		turnRunner:      options.TurnRunner,
+		runningTurns:    make(map[string]string),
 	}
 	if process.sessionStore == nil && strings.TrimSpace(options.SessionRoot) != "" {
 		process.sessionStore = sessions.NewV2Store(options.SessionRoot)
@@ -362,6 +389,12 @@ func (p *Process) handleSessionPath(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		p.handleSessionStream(w, r, id)
+	case len(parts) == 2 && parts[1] == "messages":
+		if r.Method != http.MethodPost {
+			writeMethodNotAllowed(w, http.MethodPost)
+			return
+		}
+		p.handleSessionMessage(w, r, id)
 	case len(parts) == 4 && parts[1] == "items" && parts[3] == "content":
 		if r.Method != http.MethodGet {
 			writeMethodNotAllowed(w, http.MethodGet)
@@ -459,7 +492,7 @@ func (p *Process) handleSessionDetail(w http.ResponseWriter, r *http.Request, id
 		writeError(w, http.StatusInternalServerError, "session_store_error", "could not load session metadata")
 		return
 	}
-	writeJSON(w, http.StatusOK, sessionDetailDTOFromSession(session, "idle"))
+	writeJSON(w, http.StatusOK, sessionDetailDTOFromSession(session, p.sessionStatus(id)))
 }
 
 func (p *Process) handleSessionItems(w http.ResponseWriter, r *http.Request, id string) {
@@ -557,6 +590,111 @@ func (p *Process) handleSessionItemContent(w http.ResponseWriter, r *http.Reques
 	})
 }
 
+func (p *Process) handleSessionMessage(w http.ResponseWriter, r *http.Request, id string) {
+	if !p.requireRegistryToken(w, r) {
+		return
+	}
+	if !validSessionAPIID(id) {
+		writeError(w, http.StatusBadRequest, "invalid_session_id", "invalid session id")
+		return
+	}
+	content, err := readSessionMessageRequest(w, r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_request", err.Error())
+		return
+	}
+	if p.turnRunner == nil {
+		writeError(w, http.StatusServiceUnavailable, "turn_runner_unavailable", "turn runner is not configured")
+		return
+	}
+
+	store := p.sessionStore
+	if store == nil {
+		writeError(w, http.StatusServiceUnavailable, "session_store_unavailable", "session store is not configured")
+		return
+	}
+	session, err := store.Load(id)
+	if err != nil {
+		p.writeSessionLoadError(w, err, "could not load session")
+		return
+	}
+	if strings.TrimSpace(session.CWD) == "" {
+		session.CWD = p.snapshot().CWD
+	}
+	if strings.TrimSpace(session.ConfigPath) == "" && strings.TrimSpace(session.ConfigDir) == "" {
+		session.ConfigPath = p.snapshot().ConfigPath
+	}
+
+	turnID := nextSessionTurnID(session)
+	if !p.beginSessionTurn(id, turnID) {
+		writeError(w, http.StatusConflict, "session_busy", "session is currently running a turn")
+		return
+	}
+	defer p.endSessionTurn(id)
+
+	p.publishSessionEvent(id, NewSessionStreamEvent("turn.started", map[string]any{
+		"turn_id": turnID,
+	}))
+	result, err := p.turnRunner.RunSessionTurn(r.Context(), SessionTurnRequest{
+		Session: session,
+		Content: content,
+		Emit: func(event model.Event) {
+			p.publishModelTurnEvent(id, turnID, event)
+		},
+	})
+	if err != nil {
+		p.publishTurnFailed(id, turnID, err)
+		p.writeTurnError(w, err)
+		return
+	}
+
+	if strings.TrimSpace(result.Session.ID) == "" {
+		result.Session = session
+	} else {
+		result.Session.ID = session.ID
+	}
+	for i := range result.Items {
+		if result.Items[i].TurnID == "" {
+			result.Items[i].TurnID = turnID
+		}
+	}
+	var saved sessions.SessionV2
+	if result.Compaction != nil {
+		saved, err = store.SaveCompactedTurn(result.Session, result.Compaction.SummaryItem, result.Compaction.Checkpoint, result.Items, result.ActiveHistory)
+	} else {
+		saved, err = store.SaveTurn(result.Session, result.Items, result.ActiveHistory)
+	}
+	if err != nil {
+		p.publishTurnFailed(id, turnID, err)
+		writeError(w, http.StatusInternalServerError, "session_store_error", "could not save turn")
+		return
+	}
+	appendedItems := result.Items
+	if result.Compaction != nil {
+		appendedItems = append([]sessions.SessionItem{result.Compaction.SummaryItem}, appendedItems...)
+	}
+	for _, item := range savedSessionItemsByID(saved.Items, appendedItems) {
+		p.publishSessionEvent(id, NewSessionStreamEvent("item.appended", map[string]any{
+			"seq":     item.Seq,
+			"item_id": item.ID,
+		}))
+	}
+	if result.Compaction != nil {
+		p.publishSessionEvent(id, NewSessionStreamEvent("compaction.created", map[string]any{
+			"compaction_id": result.Compaction.Checkpoint.ID,
+		}))
+	}
+	p.publishSessionEvent(id, NewSessionStreamEvent("turn.committed", map[string]any{
+		"turn_id":  turnID,
+		"last_seq": saved.LastSeq,
+	}))
+	writeJSON(w, http.StatusOK, map[string]any{
+		"turn_id":  turnID,
+		"last_seq": saved.LastSeq,
+		"status":   "committed",
+	})
+}
+
 func (p *Process) handleSessionStream(w http.ResponseWriter, r *http.Request, id string) {
 	if !validSessionAPIID(id) {
 		writeError(w, http.StatusBadRequest, "invalid_session_id", "invalid session id")
@@ -594,6 +732,33 @@ func (p *Process) snapshot() Info {
 	return p.info
 }
 
+func (p *Process) beginSessionTurn(sessionID, turnID string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if _, running := p.runningTurns[sessionID]; running {
+		return false
+	}
+	p.runningTurns[sessionID] = turnID
+	p.info.RunningTurns = len(p.runningTurns)
+	return true
+}
+
+func (p *Process) endSessionTurn(sessionID string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	delete(p.runningTurns, sessionID)
+	p.info.RunningTurns = len(p.runningTurns)
+}
+
+func (p *Process) sessionStatus(sessionID string) string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if _, running := p.runningTurns[sessionID]; running {
+		return "running"
+	}
+	return "idle"
+}
+
 func (p *Process) sessionCount() (int, error) {
 	if p.sessionStore == nil {
 		info := p.snapshot()
@@ -613,6 +778,28 @@ func (p *Process) ensureSessionExists(id string) error {
 	}
 	_, err := store.Load(id)
 	return err
+}
+
+func (p *Process) writeSessionLoadError(w http.ResponseWriter, err error, message string) {
+	switch {
+	case errors.Is(err, sessions.ErrNotFound):
+		writeError(w, http.StatusNotFound, "session_not_found", "session not found")
+	case errors.Is(err, sessions.ErrCorruptedSession):
+		writeError(w, http.StatusInternalServerError, "session_corrupted", "session is corrupted")
+	default:
+		writeError(w, http.StatusInternalServerError, "session_store_error", message)
+	}
+}
+
+func (p *Process) writeTurnError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, sessions.ErrCorruptedSession):
+		writeError(w, http.StatusInternalServerError, "session_corrupted", "session is corrupted")
+	case errors.Is(err, context.Canceled):
+		writeError(w, http.StatusInternalServerError, "turn_failed", "turn failed")
+	default:
+		writeError(w, http.StatusInternalServerError, "turn_failed", "turn failed")
+	}
 }
 
 type SessionStreamEvent map[string]any
@@ -639,6 +826,57 @@ func (p *Process) PublishSessionEvent(sessionID string, event SessionStreamEvent
 	}
 	p.streams.publish(sessionID, payload)
 	return nil
+}
+
+func (p *Process) publishSessionEvent(sessionID string, event SessionStreamEvent) {
+	payload, err := marshalSessionStreamEvent(event)
+	if err != nil {
+		return
+	}
+	p.streams.publish(sessionID, payload)
+}
+
+func (p *Process) publishModelTurnEvent(sessionID, turnID string, event model.Event) {
+	switch event := event.(type) {
+	case model.TextDeltaEvent:
+		if event.Text == "" {
+			return
+		}
+		p.publishSessionEvent(sessionID, NewSessionStreamEvent("text.delta", map[string]any{
+			"turn_id": turnID,
+			"text":    event.Text,
+		}))
+	case model.ToolCallDoneEvent:
+		if event.ToolCall.Name == "" {
+			return
+		}
+		p.publishSessionEvent(sessionID, NewSessionStreamEvent("tool.started", map[string]any{
+			"turn_id":      turnID,
+			"tool_call_id": event.ToolCall.ID,
+			"name":         event.ToolCall.Name,
+		}))
+	case model.ToolResultEvent:
+		if event.Result.Name == "" {
+			return
+		}
+		p.publishSessionEvent(sessionID, NewSessionStreamEvent("tool.finished", map[string]any{
+			"turn_id":      turnID,
+			"tool_call_id": event.Result.ToolCallID,
+			"name":         event.Result.Name,
+			"is_error":     event.Result.IsError,
+		}))
+	}
+}
+
+func (p *Process) publishTurnFailed(sessionID, turnID string, err error) {
+	message := "turn failed"
+	if errors.Is(err, sessions.ErrCorruptedSession) {
+		message = "session is corrupted"
+	}
+	p.publishSessionEvent(sessionID, NewSessionStreamEvent("turn.failed", map[string]any{
+		"turn_id": turnID,
+		"message": message,
+	}))
 }
 
 func marshalSessionStreamEvent(event SessionStreamEvent) ([]byte, error) {
@@ -1177,6 +1415,55 @@ func readEmptySessionCreateRequest(w http.ResponseWriter, r *http.Request) error
 		return fmt.Errorf("request body must be empty or {}")
 	}
 	return nil
+}
+
+func readSessionMessageRequest(w http.ResponseWriter, r *http.Request) (string, error) {
+	body := http.MaxBytesReader(w, r.Body, 1024*1024)
+	decoder := json.NewDecoder(body)
+	decoder.UseNumber()
+
+	var raw map[string]json.RawMessage
+	if err := decoder.Decode(&raw); err != nil {
+		return "", fmt.Errorf("request body must be a JSON object")
+	}
+	if raw == nil {
+		return "", fmt.Errorf("request body must be a JSON object")
+	}
+	var extra any
+	if err := decoder.Decode(&extra); err != io.EOF {
+		return "", fmt.Errorf("request body must contain a single JSON object")
+	}
+
+	contentRaw, ok := raw["content"]
+	if !ok {
+		return "", fmt.Errorf("content must be a non-empty string")
+	}
+	var content string
+	if err := json.Unmarshal(contentRaw, &content); err != nil {
+		return "", fmt.Errorf("content must be a non-empty string")
+	}
+	if strings.TrimSpace(content) == "" {
+		return "", fmt.Errorf("content must be a non-empty string")
+	}
+	return content, nil
+}
+
+func nextSessionTurnID(session sessions.SessionV2) string {
+	return fmt.Sprintf("turn-%06d", session.LastSeq+1)
+}
+
+func savedSessionItemsByID(savedItems, requestedItems []sessions.SessionItem) []sessions.SessionItem {
+	byID := make(map[string]sessions.SessionItem, len(savedItems))
+	for _, item := range savedItems {
+		byID[item.ID] = item
+	}
+	items := make([]sessions.SessionItem, 0, len(requestedItems))
+	for _, item := range requestedItems {
+		if saved, ok := byID[item.ID]; ok {
+			items = append(items, saved)
+		}
+	}
+	return items
 }
 
 func validSessionAPIID(id string) bool {

@@ -492,6 +492,61 @@ func (s *V2Store) SaveTurn(session SessionV2, items []SessionItem, activeHistory
 	return s.Load(session.ID)
 }
 
+func (s *V2Store) SaveCompactedTurn(session SessionV2, summaryItem SessionItem, checkpoint CompactionCheckpoint, items []SessionItem, activeHistory []string) (SessionV2, error) {
+	if err := s.requireRoot(); err != nil {
+		return SessionV2{}, err
+	}
+
+	now := s.now().UTC()
+	isNew := strings.TrimSpace(session.ID) == ""
+	if isNew {
+		id, err := newSessionID(now)
+		if err != nil {
+			return SessionV2{}, err
+		}
+		session.ID = id
+	}
+	if err := validateV2SessionID(session.ID); err != nil {
+		return SessionV2{}, err
+	}
+	if session.Version == 0 {
+		session.Version = VersionV2
+	}
+	if session.CreatedAt.IsZero() {
+		session.CreatedAt = now
+	}
+	session.UpdatedAt = now
+	session = copySessionV2(session)
+
+	if !isNew {
+		if _, err := s.loadMetadata(session.ID); err != nil {
+			if !errors.Is(err, ErrNotFound) {
+				return SessionV2{}, err
+			}
+			isNew = true
+		}
+	}
+	if !isNew {
+		saved, err := s.SaveMetadata(session)
+		if err != nil {
+			return SessionV2{}, err
+		}
+		session = saved
+	}
+
+	if _, err := s.appendCompactionAndItemsReplaceActiveHistory(session.ID, summaryItem, checkpoint, items, activeHistory); err != nil {
+		return SessionV2{}, err
+	}
+	if isNew {
+		if _, err := s.SaveMetadata(session); err != nil {
+			_ = s.Delete(session.ID)
+			return SessionV2{}, err
+		}
+	}
+
+	return s.Load(session.ID)
+}
+
 func (s *V2Store) AppendItemsAndReplaceActiveHistory(sessionID string, items []SessionItem, itemIDs []string) (SessionV2, error) {
 	if err := s.requireRoot(); err != nil {
 		return SessionV2{}, err
@@ -514,6 +569,94 @@ func (s *V2Store) AppendItemsAndReplaceActiveHistory(sessionID string, items []S
 		TxID: txID,
 	})
 	nextSeq++
+	for _, item := range items {
+		if item.CreatedAt.IsZero() {
+			item.CreatedAt = now
+		}
+		if item.ID == "" {
+			return SessionV2{}, fmt.Errorf("session item id is required")
+		}
+		item.Seq = nextSeq
+		itemCopy := item
+		records = append(records, v2Record{
+			Seq:  nextSeq,
+			Type: RecordTypeItemAppended,
+			TxID: txID,
+			Item: &itemCopy,
+		})
+		nextSeq++
+	}
+	records = append(records, v2Record{
+		Seq:     nextSeq,
+		Type:    RecordTypeActiveHistoryReplaced,
+		TxID:    txID,
+		ItemIDs: copyStrings(itemIDs),
+	})
+	nextSeq++
+	records = append(records, v2Record{
+		Seq:  nextSeq,
+		Type: RecordTypeTransactionCommit,
+		TxID: txID,
+	})
+
+	if err := s.appendRecords(sessionID, records); err != nil {
+		return SessionV2{}, err
+	}
+	return s.Replay(sessionID)
+}
+
+func (s *V2Store) appendCompactionAndItemsReplaceActiveHistory(sessionID string, summaryItem SessionItem, checkpoint CompactionCheckpoint, items []SessionItem, itemIDs []string) (SessionV2, error) {
+	if err := s.requireRoot(); err != nil {
+		return SessionV2{}, err
+	}
+	if err := validateV2SessionID(sessionID); err != nil {
+		return SessionV2{}, err
+	}
+
+	state, err := s.Replay(sessionID)
+	if err != nil {
+		return SessionV2{}, err
+	}
+	if err := validateCompactionCheckpointWrite(summaryItem, checkpoint, state); err != nil {
+		return SessionV2{}, err
+	}
+
+	now := s.now().UTC()
+	if summaryItem.CreatedAt.IsZero() {
+		summaryItem.CreatedAt = now
+	}
+	if checkpoint.CreatedAt.IsZero() {
+		checkpoint.CreatedAt = now
+	}
+	txID := fmt.Sprintf("tx-%06d", state.LastSeq+1)
+	records := make([]v2Record, 0, len(items)+5)
+	nextSeq := state.LastSeq + 1
+	records = append(records, v2Record{
+		Seq:  nextSeq,
+		Type: RecordTypeTransactionBegin,
+		TxID: txID,
+	})
+	nextSeq++
+
+	summaryItem.Seq = nextSeq
+	summaryCopy := summaryItem
+	records = append(records, v2Record{
+		Seq:  nextSeq,
+		Type: RecordTypeItemAppended,
+		TxID: txID,
+		Item: &summaryCopy,
+	})
+	nextSeq++
+
+	checkpointCopy := checkpoint
+	records = append(records, v2Record{
+		Seq:        nextSeq,
+		Type:       RecordTypeCompactionCreated,
+		TxID:       txID,
+		Compaction: &checkpointCopy,
+	})
+	nextSeq++
+
 	for _, item := range items {
 		if item.CreatedAt.IsZero() {
 			item.CreatedAt = now

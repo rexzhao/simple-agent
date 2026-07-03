@@ -4391,6 +4391,154 @@ func TestChatAutoCompactFailureLeavesTurnUnchangedAndREPLContinues(t *testing.T)
 	}
 }
 
+func TestServerAgentTurnRunnerDisablesSubagentsForSingleRequestRuntime(t *testing.T) {
+	server, requests := newCLIRunServer(t,
+		`{"choices":[{"delta":{"content":"server assistant"}}]}`,
+		`[DONE]`,
+	)
+	defer server.Close()
+
+	configDir := t.TempDir()
+	writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
+	appendCLIConfig(t, configDir, `
+subagents:
+  reviewer: subagents/reviewer.yaml
+`)
+	writeCLIChildSubagentConfig(t, configDir, server.URL)
+	sessionRoot := filepath.Join(configDir, "sessions")
+	projectDir := t.TempDir()
+	store := sessions.NewV2Store(sessionRoot)
+	session, err := store.SaveMetadata(sessions.SessionV2{
+		ID:              "server-subagents-disabled",
+		Version:         sessions.VersionV2,
+		Provider:        "fake",
+		ModelProfile:    "default",
+		ModelID:         "model-default",
+		CWD:             projectDir,
+		ConfigPath:      cliConfigPath(configDir),
+		SaveToolResults: true,
+	})
+	if err != nil {
+		t.Fatalf("SaveMetadata() error = %v", err)
+	}
+
+	result, err := (serverAgentTurnRunner{program: "sai"}).RunSessionTurn(context.Background(), localserver.SessionTurnRequest{
+		Session: session,
+		Content: "server prompt",
+	})
+	if err != nil {
+		t.Fatalf("RunSessionTurn() error = %v", err)
+	}
+
+	request := receiveCLIRunRequest(t, requests)
+	assertCLIRequestOmitsKey(t, request.Body, "tools")
+	messages := requestMessages(t, request.Body)
+	assertMessage(t, messages, 0, "system", builtInBaseInstructions)
+	assertMessage(t, messages, 1, "user", "server prompt")
+	for _, leaked := range []string{"Configured subagents", subagents.ToolSubagentStart} {
+		if strings.Contains(string(request.RawBody), leaked) {
+			t.Fatalf("server runner request exposed subagent runtime %q: %s", leaked, request.RawBody)
+		}
+	}
+	assertNoAdditionalCLIRunRequest(t, requests)
+	if len(result.Items) != 3 {
+		t.Fatalf("len(result.Items) = %d, want runtime+user+assistant save plan: %#v", len(result.Items), result.Items)
+	}
+}
+
+func TestServerAgentTurnRunnerAutoCompactBeforeFailedModelLeavesSessionUnchanged(t *testing.T) {
+	server, requests := newSequentialCLIRunServer(t,
+		[]string{
+			`{"choices":[{"delta":{"content":"# Context Checkpoint\n\n## Goal\nContinue.\n\n## Current Progress\nFirst turn is current.\n\n## Decisions Made\nNone.\n\n## Constraints / User Preferences\nKeep concise.\n\n## Relevant Files / APIs / Commands\nNone.\n\n## Tool State / Environment State\nNo tools.\n\n## Open Questions\nNone.\n\n## Next Steps\nAnswer second."}}]}`,
+			`[DONE]`,
+		},
+		[]string{
+			`{not-json`,
+		},
+	)
+	defer server.Close()
+
+	configDir := t.TempDir()
+	writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
+	setCLICompactionConfigWithThreshold(t, configDir, true, 1, "", "")
+	setCLIModelContextWindow(t, configDir, 10000)
+	sessionRoot := filepath.Join(configDir, "sessions")
+	projectDir := t.TempDir()
+	systemMessage := model.Message{Role: model.MessageRoleSystem, Content: builtInBaseInstructions}
+	userMessage := model.Message{Role: model.MessageRoleUser, Content: "first"}
+	assistantMessage := model.Message{Role: model.MessageRoleAssistant, Content: "one"}
+	session := sessions.SessionV2{
+		ID:                   "server-auto-compact",
+		CreatedAt:            time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC),
+		UpdatedAt:            time.Date(2026, 7, 3, 12, 1, 0, 0, time.UTC),
+		Version:              sessions.VersionV2,
+		Provider:             "fake",
+		ModelProfile:         "default",
+		ModelID:              "model-default",
+		CWD:                  projectDir,
+		ConfigPath:           cliConfigPath(configDir),
+		InstructionsSnapshot: []model.Message{systemMessage},
+		Items: []sessions.SessionItem{
+			sessionItemFromMessage("runtime-000001", systemMessage),
+			sessionItemFromMessage("msg-000002", userMessage),
+			sessionItemFromMessage("msg-000003", assistantMessage),
+		},
+		ActiveHistory:   []string{"runtime-000001", "msg-000002", "msg-000003"},
+		Context:         contextwindow.Metadata{ContextWindow: 10000, ContextWindowSource: string(contextwindow.WindowSourceConfigured)},
+		SaveToolResults: true,
+	}
+	writeCLISessionV2(t, sessionRoot, session)
+	loaded := loadCLISession(t, sessionRoot, session.ID)
+
+	_, err := (serverAgentTurnRunner{program: "sai"}).RunSessionTurn(context.Background(), localserver.SessionTurnRequest{
+		Session: loaded,
+		Content: "second",
+	})
+	if err == nil {
+		t.Fatal("RunSessionTurn() error = nil, want failed model turn")
+	}
+	if !strings.Contains(err.Error(), "parse OpenAI chat stream") {
+		t.Fatalf("RunSessionTurn() error = %v, want model parse failure", err)
+	}
+
+	summaryRequest := receiveCLIRunRequest(t, requests)
+	failedModelRequest := receiveCLIRunRequest(t, requests)
+	assertNoAdditionalCLIRunRequest(t, requests)
+	if strings.Contains(string(summaryRequest.RawBody), "second") {
+		t.Fatalf("summary request included pending user message: %s", summaryRequest.RawBody)
+	}
+	if _, ok := summaryRequest.Body["tools"]; ok {
+		t.Fatalf("summary request included tools: %#v", summaryRequest.Body["tools"])
+	}
+	failedMessages := requestMessages(t, failedModelRequest.Body)
+	if len(failedMessages) != 5 {
+		t.Fatalf("len(failed model messages) = %d, want compacted history plus pending user: %#v", len(failedMessages), failedMessages)
+	}
+	assertMessage(t, failedMessages, 0, "system", builtInBaseInstructions)
+	assertMessage(t, failedMessages, 1, "user", "first")
+	assertMessage(t, failedMessages, 2, "assistant", "one")
+	assertMessageContentContains(t, failedMessages, 3, "developer", "<compaction_summary>")
+	assertMessage(t, failedMessages, 4, "user", "second")
+
+	after := loadCLISession(t, sessionRoot, session.ID)
+	if len(after.Compactions) != 0 {
+		t.Fatalf("len(Compactions) = %d, want none after failed model turn: %#v", len(after.Compactions), after.Compactions)
+	}
+	if sessionContainsExactMessageContent(after, "second") {
+		t.Fatalf("session persisted failed pending user message: %#v", after.Items)
+	}
+	if sessionContainsMessageContent(after, "<compaction_summary>") {
+		t.Fatalf("session persisted planned compaction summary after failed model: %#v", after.Items)
+	}
+	active := activeCLIMessages(t, after)
+	if len(active) != 3 {
+		t.Fatalf("len(active messages) = %d, want original active history after failed model: %#v", len(active), active)
+	}
+	assertSavedMessage(t, active, 0, model.MessageRoleSystem, builtInBaseInstructions)
+	assertSavedMessage(t, active, 1, model.MessageRoleUser, "first")
+	assertSavedMessage(t, active, 2, model.MessageRoleAssistant, "one")
+}
+
 func TestAutoCompactionThresholdUsesStrictExceedsBoundary(t *testing.T) {
 	if autoCompactionThresholdExceeded(80, 100, 80) {
 		t.Fatal("autoCompactionThresholdExceeded(80, 100, 80) = true, want false at threshold")

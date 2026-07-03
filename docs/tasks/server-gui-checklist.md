@@ -54,7 +54,7 @@ future work and should not be required by any slice here.
 - [x] WebSocket stream: implement `WS /sessions/{id}/stream` with multi-client
   fanout for transient text deltas, tool status, persisted item events,
   compaction events, `turn.committed`, and `turn.failed`.
-- [ ] Send message API: implement `POST /sessions/{id}/messages` so the server
+- [x] Send message API: implement `POST /sessions/{id}/messages` so the server
   owns turn execution, rejects busy sessions with conflict, streams transient
   events, persists only successful turns, and leaves failed turns transient.
 - [ ] Compact command API: implement `POST /sessions/{id}/commands/compact` for

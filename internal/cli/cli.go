@@ -970,6 +970,7 @@ func serverCommand(ctx context.Context, args []string, configPath string, stdout
 		AuthToken:       token,
 		SessionStore:    sessions.NewV2Store(cfg.Sessions.Dir),
 		SessionDefaults: sessionDefaults,
+		TurnRunner:      serverAgentTurnRunner{program: program},
 	})
 	if err != nil {
 		return err
@@ -2431,6 +2432,10 @@ func runChatMessages(ctx context.Context, runtime *agentRuntime, requestMessages
 }
 
 func runChatMessagesInTurn(ctx, turnCtx context.Context, runtime *agentRuntime, requestMessages []model.Message, stdout, stderr io.Writer, addTrailingNewline bool, stderrNeedsLeadingBreak bool) ([]model.Message, error) {
+	return runChatMessagesInTurnWithEventHook(ctx, turnCtx, runtime, requestMessages, stdout, stderr, addTrailingNewline, stderrNeedsLeadingBreak, nil)
+}
+
+func runChatMessagesInTurnWithEventHook(ctx, turnCtx context.Context, runtime *agentRuntime, requestMessages []model.Message, stdout, stderr io.Writer, addTrailingNewline bool, stderrNeedsLeadingBreak bool, onEvent func(model.Event)) ([]model.Message, error) {
 	request := model.Request{
 		Model:      runtime.modelID,
 		Messages:   copyMessageSlice(requestMessages),
@@ -2451,6 +2456,7 @@ func runChatMessagesInTurn(ctx, turnCtx context.Context, runtime *agentRuntime, 
 		colorReasoning:          shouldColorizeWriter(tracker),
 		colorToolStatus:         shouldColorizeWriter(stderr),
 		stderrNeedsLeadingBreak: stderrNeedsLeadingBreak,
+		onEvent:                 onEvent,
 	}); err != nil {
 		if errors.Is(err, context.Canceled) && ctx.Err() == nil {
 			return nil, newRecoverableTurnError(context.Canceled)
@@ -2726,6 +2732,9 @@ func (r *agentRuntime) initialMessages() []model.Message {
 	if r.resumed {
 		messages, err := r.resumableSession.MaterializeActiveHistory()
 		if err == nil {
+			if len(messages) == 0 && len(r.activeItemIDs) == 0 && len(r.baseMessages) > 0 {
+				return copyMessageSlice(r.baseMessages)
+			}
 			return copyMessageSlice(messages)
 		}
 		return nil
@@ -2776,6 +2785,12 @@ type compactionCheckpointOptions struct {
 	trigger string
 }
 
+type compactionPlan struct {
+	summaryItem sessions.SessionItem
+	checkpoint  sessions.CompactionCheckpoint
+	messages    []model.Message
+}
+
 func (r *agentRuntime) autoCompactBeforeTurn(ctx context.Context, messages []model.Message, prompt string, stderr io.Writer) ([]model.Message, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -2819,6 +2834,49 @@ func (r *agentRuntime) autoCompactBeforeTurn(ctx context.Context, messages []mod
 	return updated, nil
 }
 
+func (r *agentRuntime) planAutoCompactBeforeTurn(ctx context.Context, messages []model.Message, prompt string) ([]model.Message, *compactionPlan, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
+	}
+	if r == nil || r.config == nil || !r.config.Compaction.Enabled {
+		return messages, nil, nil
+	}
+	if !r.saveSessions || strings.TrimSpace(r.resumableSession.ID) == "" {
+		return messages, nil, nil
+	}
+	contextWindow := 0
+	if r.contextTracker != nil {
+		contextWindow = r.contextTracker.Metadata().ContextWindow
+	}
+	if contextWindow <= 0 {
+		return messages, nil, nil
+	}
+
+	requestMessages := append(copyMessageSlice(messages), model.Message{
+		Role:    model.MessageRoleUser,
+		Content: prompt,
+	})
+	estimated := contextwindow.EstimateRequestTokens(model.Request{
+		Model:      r.modelID,
+		Messages:   requestMessages,
+		Tools:      r.toolSchemas,
+		Parameters: r.parameters,
+	})
+	if !autoCompactionThresholdExceeded(estimated, contextWindow, r.config.Compaction.ThresholdPercent) {
+		return messages, nil, nil
+	}
+
+	plan, err := r.planCompactionCheckpoint(ctx, compactionCheckpointOptions{
+		reason:  "context_limit",
+		phase:   "pre_turn",
+		trigger: "auto",
+	})
+	if err != nil {
+		return nil, nil, fmt.Errorf("auto compact failed: %w", err)
+	}
+	return plan.messages, &plan, nil
+}
+
 func autoCompactionThresholdExceeded(inputTokens, contextWindow, thresholdPercent int) bool {
 	if inputTokens <= 0 || contextWindow <= 0 || thresholdPercent <= 0 {
 		return false
@@ -2840,57 +2898,11 @@ func (r *agentRuntime) compactSessionWithCheckpoint(ctx context.Context, stderr 
 		return nil, fmt.Errorf("compaction requires a saved or resumed session")
 	}
 
-	summaryModel, err := r.resolveSummaryModel()
+	plan, err := r.planCompactionCheckpoint(ctx, checkpointOptions)
 	if err != nil {
 		return nil, err
 	}
-	summaryInput, err := buildCompactionSummaryInput(r.resumableSession, summaryModel)
-	if err != nil {
-		return nil, err
-	}
-	provider, err := newProviderForRun(summaryModel.ProviderName, summaryModel.Type, summaryModel.Provider)
-	if err != nil {
-		return nil, err
-	}
-	summaryText, err := collectCompactionSummary(ctx, provider, summaryModel, summaryInput)
-	if err != nil {
-		return nil, err
-	}
-
-	summaryItemID := nextCompactionSummaryItemID(sessionItemIDs(r.resumableSession.Items))
-	summaryMessage := model.Message{
-		Role:    model.MessageRoleDeveloper,
-		Content: formatCompactionSummary(summaryText),
-	}
-	summaryItem := sessions.SessionItem{
-		ID:         summaryItemID,
-		Kind:       sessions.ItemKindMessage,
-		Visibility: sessions.ItemVisibilityHidden,
-		Audience:   sessions.ItemAudienceModel,
-		Message:    &summaryMessage,
-	}
-	replacementHistory, err := replacementHistoryAfterCompaction(r.resumableSession, summaryItemID)
-	if err != nil {
-		return nil, err
-	}
-	if _, err := validateCompactionReplacementHistory(r.resumableSession, summaryItem, replacementHistory); err != nil {
-		return nil, err
-	}
-	checkpoint := sessions.CompactionCheckpoint{
-		ID:                    nextCompactionCheckpointID(r.resumableSession.Compactions),
-		Reason:                checkpointOptions.reason,
-		Phase:                 checkpointOptions.phase,
-		Trigger:               checkpointOptions.trigger,
-		SummaryItemID:         summaryItemID,
-		FromItemID:            firstString(r.resumableSession.ActiveHistory),
-		ToItemID:              lastString(r.resumableSession.ActiveHistory),
-		PreviousActiveHistory: copyStringSlice(r.resumableSession.ActiveHistory),
-		ReplacementHistory:    replacementHistory,
-		SummaryProvider:       summaryModel.ProviderName,
-		SummaryModel:          summaryModel.Profile,
-	}
-
-	saved, err := r.resumableSessionStore.AppendCompactionCheckpoint(r.resumableSession.ID, summaryItem, checkpoint)
+	saved, err := r.resumableSessionStore.AppendCompactionCheckpoint(r.resumableSession.ID, plan.summaryItem, plan.checkpoint)
 	if err != nil {
 		return nil, fmt.Errorf("write compaction checkpoint: %w", err)
 	}
@@ -2907,6 +2919,77 @@ func (r *agentRuntime) compactSessionWithCheckpoint(ctx context.Context, stderr 
 		return nil, err
 	}
 	return messages, nil
+}
+
+func (r *agentRuntime) planCompactionCheckpoint(ctx context.Context, checkpointOptions compactionCheckpointOptions) (compactionPlan, error) {
+	if err := ctx.Err(); err != nil {
+		return compactionPlan{}, err
+	}
+	if r == nil || r.config == nil {
+		return compactionPlan{}, fmt.Errorf("runtime is not configured")
+	}
+	if !r.config.Compaction.Enabled {
+		return compactionPlan{}, fmt.Errorf("compaction is disabled")
+	}
+	if !r.saveSessions || strings.TrimSpace(r.resumableSession.ID) == "" {
+		return compactionPlan{}, fmt.Errorf("compaction requires a saved or resumed session")
+	}
+
+	summaryModel, err := r.resolveSummaryModel()
+	if err != nil {
+		return compactionPlan{}, err
+	}
+	summaryInput, err := buildCompactionSummaryInput(r.resumableSession, summaryModel)
+	if err != nil {
+		return compactionPlan{}, err
+	}
+	provider, err := newProviderForRun(summaryModel.ProviderName, summaryModel.Type, summaryModel.Provider)
+	if err != nil {
+		return compactionPlan{}, err
+	}
+	summaryText, err := collectCompactionSummary(ctx, provider, summaryModel, summaryInput)
+	if err != nil {
+		return compactionPlan{}, err
+	}
+
+	summaryItemID := nextCompactionSummaryItemID(sessionItemIDs(r.resumableSession.Items))
+	summaryMessage := model.Message{
+		Role:    model.MessageRoleDeveloper,
+		Content: formatCompactionSummary(summaryText),
+	}
+	summaryItem := sessions.SessionItem{
+		ID:         summaryItemID,
+		Kind:       sessions.ItemKindMessage,
+		Visibility: sessions.ItemVisibilityHidden,
+		Audience:   sessions.ItemAudienceModel,
+		Message:    &summaryMessage,
+	}
+	replacementHistory, err := replacementHistoryAfterCompaction(r.resumableSession, summaryItemID)
+	if err != nil {
+		return compactionPlan{}, err
+	}
+	messages, err := validateCompactionReplacementHistory(r.resumableSession, summaryItem, replacementHistory)
+	if err != nil {
+		return compactionPlan{}, err
+	}
+	checkpoint := sessions.CompactionCheckpoint{
+		ID:                    nextCompactionCheckpointID(r.resumableSession.Compactions),
+		Reason:                checkpointOptions.reason,
+		Phase:                 checkpointOptions.phase,
+		Trigger:               checkpointOptions.trigger,
+		SummaryItemID:         summaryItemID,
+		FromItemID:            firstString(r.resumableSession.ActiveHistory),
+		ToItemID:              lastString(r.resumableSession.ActiveHistory),
+		PreviousActiveHistory: copyStringSlice(r.resumableSession.ActiveHistory),
+		ReplacementHistory:    replacementHistory,
+		SummaryProvider:       summaryModel.ProviderName,
+		SummaryModel:          summaryModel.Profile,
+	}
+	return compactionPlan{
+		summaryItem: summaryItem,
+		checkpoint:  checkpoint,
+		messages:    messages,
+	}, nil
 }
 
 func (r *agentRuntime) resolveSummaryModel() (config.ResolvedModel, error) {
@@ -3240,6 +3323,20 @@ func (r *agentRuntime) saveUpdatedMessages(messages []model.Message) error {
 		return fmt.Errorf("session store is not configured")
 	}
 
+	session, newItems, activeItemIDs, err := r.sessionSavePlan(messages)
+	if err != nil {
+		return err
+	}
+	saved, err := r.resumableSessionStore.SaveTurn(session, newItems, activeItemIDs)
+	if err != nil {
+		return fmt.Errorf("save resumable session: %w", err)
+	}
+	r.resumableSession = saved
+	r.activeItemIDs = copyStringSlice(saved.ActiveHistory)
+	return nil
+}
+
+func (r *agentRuntime) sessionSavePlan(messages []model.Message) (sessions.SessionV2, []sessions.SessionItem, []string, error) {
 	session := r.resumableSession
 	session.Provider = r.providerName
 	session.ModelProfile = r.modelProfile
@@ -3264,7 +3361,7 @@ func (r *agentRuntime) saveUpdatedMessages(messages []model.Message) error {
 	session.SaveToolResults = true
 
 	if len(messages) < len(r.activeItemIDs) {
-		return fmt.Errorf("save resumable session: updated message history shorter than active history")
+		return sessions.SessionV2{}, nil, nil, fmt.Errorf("save resumable session: updated message history shorter than active history")
 	}
 
 	existingIDs := sessionItemIDs(session.Items)
@@ -3279,13 +3376,7 @@ func (r *agentRuntime) saveUpdatedMessages(messages []model.Message) error {
 		activeItemIDs = append(activeItemIDs, itemID)
 	}
 
-	saved, err := r.resumableSessionStore.SaveTurn(session, newItems, activeItemIDs)
-	if err != nil {
-		return fmt.Errorf("save resumable session: %w", err)
-	}
-	r.resumableSession = saved
-	r.activeItemIDs = copyStringSlice(saved.ActiveHistory)
-	return nil
+	return session, newItems, activeItemIDs, nil
 }
 
 type runtimePreparationOptions struct {
@@ -3430,7 +3521,7 @@ func prepareAgentRuntimeWithOptions(ctx context.Context, configPath string, opti
 	var baseMessages []model.Message
 	var instructionSources []sessions.InstructionSource
 	var enabledSkillIDs []string
-	if resumed {
+	if resumed && (len(resumedSession.InstructionsSnapshot) > 0 || len(resumedSession.ActiveHistory) > 0) {
 		baseMessages = copyMessageSlice(resumedSession.InstructionsSnapshot)
 		instructionSources = copyInstructionSources(resumedSession.InstructionSources)
 		enabledSkillIDs = copyStringSlice(resumedSession.EnabledSkills)
@@ -3927,6 +4018,92 @@ type cliSubagentRunner struct {
 	program string
 }
 
+type serverAgentTurnRunner struct {
+	program string
+}
+
+func (r serverAgentTurnRunner) RunSessionTurn(ctx context.Context, request localserver.SessionTurnRequest) (result localserver.SessionTurnResult, err error) {
+	session := request.Session
+	cwd := strings.TrimSpace(session.CWD)
+	if cwd == "" {
+		return localserver.SessionTurnResult{}, fmt.Errorf("session cwd is required")
+	}
+	configPath := session.RootConfigPath()
+	if strings.TrimSpace(configPath) == "" {
+		return localserver.SessionTurnResult{}, fmt.Errorf("session config path is required")
+	}
+
+	runtime, err := prepareAgentRuntimeWithOptions(ctx, configPath, agentCommandFlags{
+		resumeID: session.ID,
+	}, io.Discard, func() (string, error) {
+		return cwd, nil
+	}, r.program, runtimePreparationOptions{
+		enableSubagents: false,
+	})
+	if err != nil {
+		return localserver.SessionTurnResult{}, err
+	}
+	defer func() {
+		err = errors.Join(err, runtime.Close())
+	}()
+
+	messages, compaction, err := runServerOwnedSessionTurn(ctx, runtime, runtime.initialMessages(), request.Content, request.Emit)
+	if err != nil {
+		return localserver.SessionTurnResult{}, err
+	}
+	planSession, newItems, activeHistory, err := runtime.sessionSavePlan(messages)
+	if err != nil {
+		return localserver.SessionTurnResult{}, err
+	}
+	result = localserver.SessionTurnResult{
+		Session:       planSession,
+		Items:         newItems,
+		ActiveHistory: activeHistory,
+	}
+	if compaction != nil {
+		result.Compaction = &localserver.SessionCompactionPlan{
+			SummaryItem: compaction.summaryItem,
+			Checkpoint:  compaction.checkpoint,
+		}
+	}
+	return result, nil
+}
+
+func runServerOwnedSessionTurn(ctx context.Context, runtime *agentRuntime, messages []model.Message, prompt string, emit func(model.Event)) ([]model.Message, *compactionPlan, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
+	}
+	turnCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	messages, compaction, err := runtime.planAutoCompactBeforeTurn(turnCtx, messages, prompt)
+	if err != nil {
+		return nil, nil, newRecoverableTurnError(err)
+	}
+	if compaction != nil {
+		runtime.applyCompactionPlan(*compaction)
+	}
+	runtime.saveSessions = false
+	requestMessages := append(copyMessageSlice(messages), model.Message{
+		Role:    model.MessageRoleUser,
+		Content: prompt,
+	})
+	updated, err := runChatMessagesInTurnWithEventHook(ctx, turnCtx, runtime, requestMessages, io.Discard, io.Discard, false, false, emit)
+	if err != nil {
+		return nil, nil, err
+	}
+	return updated, compaction, nil
+}
+
+func (r *agentRuntime) applyCompactionPlan(plan compactionPlan) {
+	session := r.resumableSession
+	session.Items = append(append([]sessions.SessionItem(nil), session.Items...), plan.summaryItem)
+	session.Compactions = append(append([]sessions.CompactionCheckpoint(nil), session.Compactions...), plan.checkpoint)
+	session.ActiveHistory = copyStringSlice(plan.checkpoint.ReplacementHistory)
+	r.resumableSession = session
+	r.activeItemIDs = copyStringSlice(session.ActiveHistory)
+}
+
 func (r cliSubagentRunner) Run(ctx context.Context, request subagents.RunRequest, _ <-chan subagents.Message) (result subagents.RunResult, err error) {
 	runtime, err := prepareAgentRuntimeWithOptions(ctx, request.ConfigPath, agentCommandFlags{}, io.Discard, func() (string, error) {
 		return r.cwd, nil
@@ -4286,6 +4463,7 @@ type streamOutputOptions struct {
 	colorReasoning          bool
 	colorToolStatus         bool
 	stderrNeedsLeadingBreak bool
+	onEvent                 func(model.Event)
 }
 
 func writeStream(stdout, stderr io.Writer, events <-chan model.Event, showReasoning bool, logger *eventlog.Logger) error {
@@ -4382,6 +4560,9 @@ func writeStreamWithOptions(stdout, stderr io.Writer, events <-chan model.Event,
 	}
 
 	for event := range events {
+		if options.onEvent != nil {
+			options.onEvent(event)
+		}
 		if err := logger.LogEvent(event); err != nil {
 			return err
 		}

@@ -546,6 +546,83 @@ func TestV2StoreAppendCompactionCheckpointCommitsTransaction(t *testing.T) {
 	}
 }
 
+func TestV2StoreSaveCompactedTurnCommitsCompactionAndTurnTransaction(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "sessions")
+	clock := &fakeClock{current: time.Date(2026, 7, 3, 4, 5, 6, 0, time.UTC)}
+	store := newV2StoreWithClock(root, V2StoreOptions{}, clock.Now)
+
+	session, err := store.SaveMetadata(SessionV2{
+		ID:              "session-1",
+		Provider:        "fake",
+		ModelProfile:    "default",
+		ModelID:         "model-default",
+		SaveToolResults: true,
+	})
+	if err != nil {
+		t.Fatalf("SaveMetadata() error = %v", err)
+	}
+	appendTestItem(t, store, "session-1", "item-1", "one")
+	if _, err := store.ReplaceActiveHistory("session-1", []string{"item-1"}); err != nil {
+		t.Fatalf("ReplaceActiveHistory() error = %v", err)
+	}
+
+	summary := SessionItem{
+		ID:         "summary-1",
+		Kind:       ItemKindMessage,
+		Visibility: ItemVisibilityHidden,
+		Audience:   ItemAudienceModel,
+		Message:    &model.Message{Role: model.MessageRoleDeveloper, Content: "checkpoint"},
+	}
+	checkpoint := CompactionCheckpoint{
+		ID:                    "compact-1",
+		Reason:                "context_limit",
+		Phase:                 "pre_turn",
+		Trigger:               "auto",
+		SummaryItemID:         "summary-1",
+		PreviousActiveHistory: []string{"item-1"},
+		ReplacementHistory:    []string{"item-1", "summary-1"},
+	}
+	replayed, err := store.SaveCompactedTurn(session, summary, checkpoint, []SessionItem{
+		{
+			ID:         "item-2",
+			Kind:       ItemKindMessage,
+			Visibility: ItemVisibilityVisible,
+			Audience:   ItemAudienceUser,
+			Message:    &model.Message{Role: model.MessageRoleUser, Content: "two"},
+		},
+		{
+			ID:         "item-3",
+			Kind:       ItemKindMessage,
+			Visibility: ItemVisibilityVisible,
+			Audience:   ItemAudienceModel,
+			Message:    &model.Message{Role: model.MessageRoleAssistant, Content: "three"},
+		},
+	}, []string{"item-1", "summary-1", "item-2", "item-3"})
+	if err != nil {
+		t.Fatalf("SaveCompactedTurn() error = %v", err)
+	}
+
+	if got := itemIDs(replayed.Items); !reflect.DeepEqual(got, []string{"item-1", "summary-1", "item-2", "item-3"}) {
+		t.Fatalf("item IDs = %#v, want original summary and turn items", got)
+	}
+	if !reflect.DeepEqual(replayed.ActiveHistory, []string{"item-1", "summary-1", "item-2", "item-3"}) {
+		t.Fatalf("ActiveHistory = %#v, want compacted history plus turn items", replayed.ActiveHistory)
+	}
+	if len(replayed.Compactions) != 1 || replayed.Compactions[0].ID != "compact-1" {
+		t.Fatalf("Compactions = %#v, want compact-1", replayed.Compactions)
+	}
+	if replayed.Items[1].Seq != 4 || replayed.Items[2].Seq != 6 || replayed.Items[3].Seq != 7 || replayed.LastSeq != 9 {
+		t.Fatalf("seqs summary/user/assistant/last = %d/%d/%d/%d, want 4/6/7/9", replayed.Items[1].Seq, replayed.Items[2].Seq, replayed.Items[3].Seq, replayed.LastSeq)
+	}
+	messages, err := replayed.MaterializeActiveHistory()
+	if err != nil {
+		t.Fatalf("MaterializeActiveHistory() error = %v", err)
+	}
+	if got := messageContents(messages); !reflect.DeepEqual(got, []string{"one", "checkpoint", "two", "three"}) {
+		t.Fatalf("active messages = %#v, want compacted history plus successful turn", got)
+	}
+}
+
 func TestV2StoreAppendCompactionCheckpointValidatesCheckpointWrite(t *testing.T) {
 	baseSummary := SessionItem{
 		ID:         "summary-1",

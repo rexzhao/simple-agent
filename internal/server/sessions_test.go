@@ -441,6 +441,388 @@ func TestSessionStreamShutdownClosesConnections(t *testing.T) {
 	}
 }
 
+func TestSessionSendMessagePersistsSuccessfulTurnAndPublishesEvents(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "sessions")
+	store := sessions.NewV2Store(root)
+	saveServerTestSession(t, store, "send-success")
+	runner := fakeSessionTurnRunner{
+		run: func(ctx context.Context, request SessionTurnRequest) (SessionTurnResult, error) {
+			if request.Session.ID != "send-success" {
+				t.Fatalf("runner session id = %q, want send-success", request.Session.ID)
+			}
+			if request.Content != "hello server" {
+				t.Fatalf("runner content = %q, want hello server", request.Content)
+			}
+			request.Emit(model.TextDeltaEvent{Text: "hi "})
+			request.Emit(model.TextDeltaEvent{Text: "there"})
+			request.Emit(model.ToolCallDoneEvent{ToolCall: model.ToolCall{ID: "call-1", Name: "read_file", Arguments: `{"path":"secret.txt"}`}})
+			request.Emit(model.ToolResultEvent{Result: model.ToolResult{ToolCallID: "call-1", Name: "read_file", Content: "tool result secret"}})
+			return serverTestTurnResult(request.Session,
+				model.Message{Role: model.MessageRoleUser, Content: request.Content},
+				model.Message{Role: model.MessageRoleAssistant, Content: "hi there"},
+			), nil
+		},
+	}
+	process := startSessionAPIServerWithTurnRunner(t, store, sessions.SessionV2{}, "registry-token", runner)
+	conn := dialSessionStream(t, process, "send-success")
+	waitForStreamSubscribers(t, process, "send-success", 1)
+
+	_, body := postRawJSONStatus(t, "http://"+process.Addr()+"/sessions/send-success/messages", `{"content":"hello server"}`, "registry-token", http.StatusOK)
+	if body["status"] != "committed" || body["turn_id"] == "" || body["last_seq"] == nil {
+		t.Fatalf("send response = %#v, want committed turn metadata", body)
+	}
+
+	events := []map[string]any{
+		readSessionStreamEvent(t, conn),
+		readSessionStreamEvent(t, conn),
+		readSessionStreamEvent(t, conn),
+		readSessionStreamEvent(t, conn),
+		readSessionStreamEvent(t, conn),
+		readSessionStreamEvent(t, conn),
+		readSessionStreamEvent(t, conn),
+		readSessionStreamEvent(t, conn),
+	}
+	wantTypes := []string{"turn.started", "text.delta", "text.delta", "tool.started", "tool.finished", "item.appended", "item.appended", "turn.committed"}
+	for i, want := range wantTypes {
+		if events[i]["type"] != want {
+			t.Fatalf("event[%d] type = %#v, want %q; events=%#v", i, events[i]["type"], want, events)
+		}
+	}
+	if events[1]["text"] != "hi " || events[2]["text"] != "there" {
+		t.Fatalf("text delta events = %#v/%#v, want streamed text", events[1], events[2])
+	}
+	if events[3]["name"] != "read_file" || events[4]["name"] != "read_file" || events[4]["is_error"] != false {
+		t.Fatalf("tool events = %#v/%#v, want sanitized tool status", events[3], events[4])
+	}
+	if events[4]["content"] != nil || events[4]["arguments"] != nil {
+		t.Fatalf("tool event leaked content or arguments: %#v", events[4])
+	}
+	if events[7]["last_seq"] != body["last_seq"] {
+		t.Fatalf("committed last_seq = %#v, response last_seq = %#v", events[7]["last_seq"], body["last_seq"])
+	}
+
+	session, err := store.Load("send-success")
+	if err != nil {
+		t.Fatalf("Load(send-success) error = %v", err)
+	}
+	if len(session.Items) != 2 {
+		t.Fatalf("len(session.Items) = %d, want persisted user+assistant: %#v", len(session.Items), session.Items)
+	}
+	if session.Items[0].Message == nil || session.Items[0].Message.Role != model.MessageRoleUser || session.Items[0].Message.Content != "hello server" {
+		t.Fatalf("user item = %#v, want persisted user message", session.Items[0])
+	}
+	if session.Items[1].Message == nil || session.Items[1].Message.Role != model.MessageRoleAssistant || session.Items[1].Message.Content != "hi there" {
+		t.Fatalf("assistant item = %#v, want persisted assistant message", session.Items[1])
+	}
+	if session.Items[0].TurnID == "" || session.Items[0].TurnID != session.Items[1].TurnID {
+		t.Fatalf("turn ids = %q/%q, want same non-empty turn id", session.Items[0].TurnID, session.Items[1].TurnID)
+	}
+	if !reflect.DeepEqual(session.ActiveHistory, []string{session.Items[0].ID, session.Items[1].ID}) {
+		t.Fatalf("ActiveHistory = %#v, want new user+assistant item ids", session.ActiveHistory)
+	}
+}
+
+func TestSessionSendMessagePersistsPlannedCompactionAndSuccessfulTurnAtomically(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "sessions")
+	store := sessions.NewV2Store(root)
+	saveServerTestSession(t, store, "send-compact-success")
+	existing := appendServerTestItem(t, store, "send-compact-success", sessions.SessionItem{
+		ID:         "existing-user",
+		Kind:       sessions.ItemKindMessage,
+		Visibility: sessions.ItemVisibilityVisible,
+		Audience:   sessions.ItemAudienceUser,
+		Message:    &model.Message{Role: model.MessageRoleUser, Content: "existing"},
+	})
+	if _, err := store.ReplaceActiveHistory("send-compact-success", []string{existing.ID}); err != nil {
+		t.Fatalf("ReplaceActiveHistory() error = %v", err)
+	}
+	runner := fakeSessionTurnRunner{
+		run: func(ctx context.Context, request SessionTurnRequest) (SessionTurnResult, error) {
+			summaryMessage := model.Message{Role: model.MessageRoleDeveloper, Content: "<compaction_summary>\nplanned\n</compaction_summary>"}
+			summary := sessions.SessionItem{
+				ID:         "summary-1",
+				Kind:       sessions.ItemKindMessage,
+				Visibility: sessions.ItemVisibilityHidden,
+				Audience:   sessions.ItemAudienceModel,
+				Message:    &summaryMessage,
+			}
+			checkpoint := sessions.CompactionCheckpoint{
+				ID:                    "compact-1",
+				Reason:                "context_limit",
+				Phase:                 "pre_turn",
+				Trigger:               "auto",
+				SummaryItemID:         summary.ID,
+				PreviousActiveHistory: []string{existing.ID},
+				ReplacementHistory:    []string{existing.ID, summary.ID},
+			}
+			userItem := serverTestSessionItemFromMessage("msg-000003", model.Message{Role: model.MessageRoleUser, Content: request.Content})
+			assistantItem := serverTestSessionItemFromMessage("msg-000004", model.Message{Role: model.MessageRoleAssistant, Content: "assistant after compact"})
+			return SessionTurnResult{
+				Session: request.Session,
+				Compaction: &SessionCompactionPlan{
+					SummaryItem: summary,
+					Checkpoint:  checkpoint,
+				},
+				Items:         []sessions.SessionItem{userItem, assistantItem},
+				ActiveHistory: []string{existing.ID, summary.ID, userItem.ID, assistantItem.ID},
+			}, nil
+		},
+	}
+	process := startSessionAPIServerWithTurnRunner(t, store, sessions.SessionV2{}, "registry-token", runner)
+
+	_, body := postRawJSONStatus(t, "http://"+process.Addr()+"/sessions/send-compact-success/messages", `{"content":"after compact"}`, "registry-token", http.StatusOK)
+	if body["status"] != "committed" {
+		t.Fatalf("send response = %#v, want committed", body)
+	}
+
+	session, err := store.Load("send-compact-success")
+	if err != nil {
+		t.Fatalf("Load(send-compact-success) error = %v", err)
+	}
+	if got := responseSessionItemIDs(session.Items); !reflect.DeepEqual(got, []string{"existing-user", "summary-1", "msg-000003", "msg-000004"}) {
+		t.Fatalf("item IDs = %#v, want existing summary user assistant", got)
+	}
+	if len(session.Compactions) != 1 || session.Compactions[0].ID != "compact-1" {
+		t.Fatalf("Compactions = %#v, want compact-1", session.Compactions)
+	}
+	if !reflect.DeepEqual(session.ActiveHistory, []string{"existing-user", "summary-1", "msg-000003", "msg-000004"}) {
+		t.Fatalf("ActiveHistory = %#v, want replacement plus successful turn", session.ActiveHistory)
+	}
+	if session.Items[1].Visibility != sessions.ItemVisibilityHidden || session.Items[2].Message.Content != "after compact" || session.Items[3].Message.Content != "assistant after compact" {
+		t.Fatalf("persisted items = %#v, want hidden summary and visible turn", session.Items)
+	}
+	if session.LastSeq != 9 {
+		t.Fatalf("LastSeq = %d, want compact+turn transaction through seq 9", session.LastSeq)
+	}
+}
+
+func TestSessionSendMessageRejectsBusySession(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "sessions")
+	store := sessions.NewV2Store(root)
+	saveServerTestSession(t, store, "busy-session")
+	started := make(chan struct{})
+	release := make(chan struct{})
+	runner := fakeSessionTurnRunner{
+		run: func(ctx context.Context, request SessionTurnRequest) (SessionTurnResult, error) {
+			close(started)
+			<-release
+			return serverTestTurnResult(request.Session,
+				model.Message{Role: model.MessageRoleUser, Content: request.Content},
+				model.Message{Role: model.MessageRoleAssistant, Content: "done"},
+			), nil
+		},
+	}
+	process := startSessionAPIServerWithTurnRunner(t, store, sessions.SessionV2{}, "registry-token", runner)
+	baseURL := "http://" + process.Addr()
+	firstDone := make(chan map[string]any, 1)
+	go func() {
+		_, body := postRawJSONStatus(t, baseURL+"/sessions/busy-session/messages", `{"content":"first"}`, "registry-token", http.StatusOK)
+		firstDone <- body
+	}()
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for first turn to start")
+	}
+
+	_, serverInfo := getRawJSON(t, baseURL+"/server")
+	if serverInfo["running_turns"] != float64(1) {
+		t.Fatalf("/server running_turns = %#v, want 1", serverInfo["running_turns"])
+	}
+	_, detail := getRawJSON(t, baseURL+"/sessions/busy-session")
+	if detail["status"] != "running" {
+		t.Fatalf("session status = %#v, want running", detail["status"])
+	}
+
+	raw, body := postRawJSONStatus(t, baseURL+"/sessions/busy-session/messages", `{"content":"second"}`, "registry-token", http.StatusConflict)
+	assertErrorCode(t, body, "session_busy")
+	if bytes.Contains(raw, []byte("first")) || bytes.Contains(raw, []byte("second")) {
+		t.Fatalf("busy response leaked prompt content: %s", raw)
+	}
+
+	close(release)
+	select {
+	case body := <-firstDone:
+		if body["status"] != "committed" {
+			t.Fatalf("first response = %#v, want committed", body)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for first turn to finish")
+	}
+}
+
+func TestSessionSendMessageFailedTurnStaysTransient(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "sessions")
+	store := sessions.NewV2Store(root)
+	saveServerTestSession(t, store, "failed-turn")
+	existing := appendServerTestItem(t, store, "failed-turn", sessions.SessionItem{
+		ID:         "existing-user",
+		Kind:       sessions.ItemKindMessage,
+		Visibility: sessions.ItemVisibilityVisible,
+		Audience:   sessions.ItemAudienceUser,
+		Message:    &model.Message{Role: model.MessageRoleUser, Content: "existing safe content"},
+	})
+	if _, err := store.ReplaceActiveHistory("failed-turn", []string{existing.ID}); err != nil {
+		t.Fatalf("ReplaceActiveHistory() error = %v", err)
+	}
+	runner := fakeSessionTurnRunner{
+		run: func(ctx context.Context, request SessionTurnRequest) (SessionTurnResult, error) {
+			request.Emit(model.TextDeltaEvent{Text: "partial transient text"})
+			return SessionTurnResult{}, fmt.Errorf("provider secret failure")
+		},
+	}
+	process := startSessionAPIServerWithTurnRunner(t, store, sessions.SessionV2{}, "registry-token", runner)
+	conn := dialSessionStream(t, process, "failed-turn")
+	waitForStreamSubscribers(t, process, "failed-turn", 1)
+
+	raw, body := postRawJSONStatus(t, "http://"+process.Addr()+"/sessions/failed-turn/messages", `{"content":"new prompt secret"}`, "registry-token", http.StatusInternalServerError)
+	assertErrorCode(t, body, "turn_failed")
+	for _, forbidden := range []string{"new prompt secret", "provider secret failure", "partial transient text", "registry-token"} {
+		if bytes.Contains(raw, []byte(forbidden)) {
+			t.Fatalf("failed turn response leaked %q: %s", forbidden, raw)
+		}
+	}
+
+	events := []map[string]any{
+		readSessionStreamEvent(t, conn),
+		readSessionStreamEvent(t, conn),
+		readSessionStreamEvent(t, conn),
+	}
+	if events[0]["type"] != "turn.started" || events[1]["type"] != "text.delta" || events[2]["type"] != "turn.failed" {
+		t.Fatalf("failure events = %#v, want started/delta/failed", events)
+	}
+	if events[2]["message"] != "turn failed" {
+		t.Fatalf("turn.failed message = %#v, want sanitized failure", events[2]["message"])
+	}
+
+	session, err := store.Load("failed-turn")
+	if err != nil {
+		t.Fatalf("Load(failed-turn) error = %v", err)
+	}
+	if len(session.Items) != 1 || session.Items[0].ID != existing.ID {
+		t.Fatalf("session items after failed turn = %#v, want unchanged existing item", session.Items)
+	}
+	if !reflect.DeepEqual(session.ActiveHistory, []string{existing.ID}) {
+		t.Fatalf("ActiveHistory after failed turn = %#v, want unchanged existing item id", session.ActiveHistory)
+	}
+}
+
+func TestSessionSendMessageRequiresTokenAndValidRequest(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "sessions")
+	store := sessions.NewV2Store(root)
+	saveServerTestSession(t, store, "send-validation")
+	process := startSessionAPIServerWithTurnRunner(t, store, sessions.SessionV2{}, "registry-token", fakeSessionTurnRunner{})
+	baseURL := "http://" + process.Addr()
+
+	for _, tt := range []struct {
+		name  string
+		token string
+	}{
+		{name: "missing token"},
+		{name: "wrong token", token: "wrong-token"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			raw, body := postRawJSONStatus(t, baseURL+"/sessions/send-validation/messages", `{"content":"secret prompt"}`, tt.token, http.StatusForbidden)
+			assertErrorCode(t, body, "permission_denied")
+			if bytes.Contains(raw, []byte("secret prompt")) || bytes.Contains(raw, []byte("registry-token")) {
+				t.Fatalf("permission error leaked secret: %s", raw)
+			}
+		})
+	}
+
+	for _, tt := range []struct {
+		name string
+		body string
+	}{
+		{name: "empty body", body: ""},
+		{name: "malformed json", body: "{"},
+		{name: "missing content", body: `{}`},
+		{name: "non-string content", body: `{"content":42}`},
+		{name: "empty content", body: `{"content":""}`},
+		{name: "blank content", body: `{"content":"   "}`},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			raw, body := postRawJSONStatus(t, baseURL+"/sessions/send-validation/messages", tt.body, "registry-token", http.StatusBadRequest)
+			assertErrorCode(t, body, "invalid_request")
+			if bytes.Contains(raw, []byte("registry-token")) {
+				t.Fatalf("invalid request error leaked registry token: %s", raw)
+			}
+		})
+	}
+
+	session, err := store.Load("send-validation")
+	if err != nil {
+		t.Fatalf("Load(send-validation) error = %v", err)
+	}
+	if len(session.Items) != 0 || len(session.ActiveHistory) != 0 {
+		t.Fatalf("invalid/security requests changed session: items=%#v active=%#v", session.Items, session.ActiveHistory)
+	}
+}
+
+func TestSessionSendMessageMissingAndCorruptSessionErrors(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "sessions")
+	store := sessions.NewV2Store(root)
+	saveServerTestSession(t, store, "corrupt-send")
+	segmentsDir := filepath.Join(root, "corrupt-send", "segments")
+	if err := os.MkdirAll(segmentsDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll(segments) error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(segmentsDir, "000001.jsonl"), []byte(`{"seq":1,"type":"item.appended","item":`+"\n"), 0o600); err != nil {
+		t.Fatalf("WriteFile(corrupt segment) error = %v", err)
+	}
+	process := startSessionAPIServerWithTurnRunner(t, store, sessions.SessionV2{}, "registry-token", fakeSessionTurnRunner{})
+	baseURL := "http://" + process.Addr()
+
+	_, body := postRawJSONStatus(t, baseURL+"/sessions/missing-session/messages", `{"content":"hello"}`, "registry-token", http.StatusNotFound)
+	assertErrorCode(t, body, "session_not_found")
+
+	_, body = postRawJSONStatus(t, baseURL+"/sessions/corrupt-send/messages", `{"content":"hello"}`, "registry-token", http.StatusInternalServerError)
+	assertErrorCode(t, body, "session_corrupted")
+}
+
+func TestSessionSendMessageSaveFailureDoesNotAppendItems(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "sessions")
+	store := sessions.NewV2Store(root)
+	saveServerTestSession(t, store, "save-failure")
+	runner := fakeSessionTurnRunner{
+		run: func(ctx context.Context, request SessionTurnRequest) (SessionTurnResult, error) {
+			return SessionTurnResult{
+				Session: request.Session,
+				Items: []sessions.SessionItem{{
+					Kind:       sessions.ItemKindMessage,
+					Visibility: sessions.ItemVisibilityVisible,
+					Audience:   sessions.ItemAudienceUser,
+					Message:    &model.Message{Role: model.MessageRoleUser, Content: "failed save prompt"},
+				}},
+				ActiveHistory: []string{""},
+			}, nil
+		},
+	}
+	process := startSessionAPIServerWithTurnRunner(t, store, sessions.SessionV2{}, "registry-token", runner)
+	conn := dialSessionStream(t, process, "save-failure")
+	waitForStreamSubscribers(t, process, "save-failure", 1)
+
+	raw, body := postRawJSONStatus(t, "http://"+process.Addr()+"/sessions/save-failure/messages", `{"content":"failed save prompt"}`, "registry-token", http.StatusInternalServerError)
+	assertErrorCode(t, body, "session_store_error")
+	if bytes.Contains(raw, []byte("failed save prompt")) {
+		t.Fatalf("save failure response leaked prompt: %s", raw)
+	}
+	if got := readSessionStreamEvent(t, conn); got["type"] != "turn.started" {
+		t.Fatalf("first event = %#v, want turn.started", got)
+	}
+	if got := readSessionStreamEvent(t, conn); got["type"] != "turn.failed" {
+		t.Fatalf("second event = %#v, want turn.failed", got)
+	}
+
+	session, err := store.Load("save-failure")
+	if err != nil {
+		t.Fatalf("Load(save-failure) error = %v", err)
+	}
+	if len(session.Items) != 0 || len(session.ActiveHistory) != 0 {
+		t.Fatalf("save failure changed session: items=%#v active=%#v", session.Items, session.ActiveHistory)
+	}
+}
+
 func TestSessionItemsPaginationBeforeAfter(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "sessions")
 	store := sessions.NewV2Store(root)
@@ -957,6 +1339,12 @@ func startSessionAPIServer(t *testing.T, store *sessions.V2Store, defaults sessi
 func startSessionAPIServerWithToken(t *testing.T, store *sessions.V2Store, defaults sessions.SessionV2, token string) *Process {
 	t.Helper()
 
+	return startSessionAPIServerWithTurnRunner(t, store, defaults, token, nil)
+}
+
+func startSessionAPIServerWithTurnRunner(t *testing.T, store *sessions.V2Store, defaults sessions.SessionV2, token string, runner SessionTurnRunner) *Process {
+	t.Helper()
+
 	process, err := Start(Options{
 		CWD:             t.TempDir(),
 		ConfigPath:      filepath.Join(t.TempDir(), "sai.yaml"),
@@ -965,6 +1353,7 @@ func startSessionAPIServerWithToken(t *testing.T, store *sessions.V2Store, defau
 		AuthToken:       token,
 		SessionStore:    store,
 		SessionDefaults: defaults,
+		TurnRunner:      runner,
 	})
 	if err != nil {
 		t.Fatalf("Start() error = %v", err)
@@ -986,6 +1375,71 @@ func startSessionAPIServerWithToken(t *testing.T, store *sessions.V2Store, defau
 		}
 	})
 	return process
+}
+
+type fakeSessionTurnRunner struct {
+	run func(context.Context, SessionTurnRequest) (SessionTurnResult, error)
+}
+
+func (r fakeSessionTurnRunner) RunSessionTurn(ctx context.Context, request SessionTurnRequest) (SessionTurnResult, error) {
+	if r.run == nil {
+		return SessionTurnResult{}, fmt.Errorf("fake turn runner was called unexpectedly")
+	}
+	return r.run(ctx, request)
+}
+
+func serverTestTurnResult(session sessions.SessionV2, messages ...model.Message) SessionTurnResult {
+	existingIDs := map[string]struct{}{}
+	for _, item := range session.Items {
+		existingIDs[item.ID] = struct{}{}
+	}
+	activeHistory := append([]string(nil), session.ActiveHistory...)
+	items := make([]sessions.SessionItem, 0, len(messages))
+	for _, message := range messages {
+		id := serverTestNextSessionItemID(existingIDs, message)
+		item := serverTestSessionItemFromMessage(id, message)
+		items = append(items, item)
+		activeHistory = append(activeHistory, id)
+		existingIDs[id] = struct{}{}
+	}
+	return SessionTurnResult{
+		Session:       session,
+		Items:         items,
+		ActiveHistory: activeHistory,
+	}
+}
+
+func serverTestNextSessionItemID(existing map[string]struct{}, message model.Message) string {
+	prefix := "msg"
+	if message.Role == model.MessageRoleSystem || message.Role == model.MessageRoleDeveloper {
+		prefix = "runtime"
+	}
+	for i := len(existing) + 1; ; i++ {
+		id := fmt.Sprintf("%s-%06d", prefix, i)
+		if _, ok := existing[id]; !ok {
+			return id
+		}
+	}
+}
+
+func serverTestSessionItemFromMessage(id string, message model.Message) sessions.SessionItem {
+	messageCopy := message
+	messageCopy.ToolCalls = append([]model.ToolCall(nil), message.ToolCalls...)
+	item := sessions.SessionItem{
+		ID:         id,
+		Kind:       sessions.ItemKindMessage,
+		Visibility: sessions.ItemVisibilityVisible,
+		Audience:   sessions.ItemAudienceModel,
+		Message:    &messageCopy,
+	}
+	switch message.Role {
+	case model.MessageRoleSystem, model.MessageRoleDeveloper:
+		item.Kind = sessions.ItemKindRuntimeContext
+		item.Visibility = sessions.ItemVisibilityHidden
+	case model.MessageRoleUser:
+		item.Audience = sessions.ItemAudienceUser
+	}
+	return item
 }
 
 func getRawJSON(t *testing.T, url string) ([]byte, map[string]any) {
@@ -1205,6 +1659,14 @@ func responseItemIDs(t *testing.T, body map[string]any) []string {
 	for _, raw := range items {
 		item := raw.(map[string]any)
 		ids = append(ids, item["id"].(string))
+	}
+	return ids
+}
+
+func responseSessionItemIDs(items []sessions.SessionItem) []string {
+	ids := make([]string, 0, len(items))
+	for _, item := range items {
+		ids = append(ids, item.ID)
 	}
 	return ids
 }
