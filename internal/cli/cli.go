@@ -1766,6 +1766,10 @@ func runChatTurn(ctx context.Context, runtime *agentRuntime, messages []model.Me
 	turnCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
+	messages, err := runtime.autoCompactBeforeTurn(turnCtx, messages, prompt, stderr)
+	if err != nil {
+		return nil, newRecoverableTurnError(err)
+	}
 	requestMessages := append(copyMessageSlice(messages), model.Message{
 		Role:    model.MessageRoleUser,
 		Content: prompt,
@@ -1940,6 +1944,70 @@ func (r *agentRuntime) writeUsageSummary(stderr io.Writer) error {
 }
 
 func (r *agentRuntime) compactSession(ctx context.Context, stderr io.Writer) ([]model.Message, error) {
+	return r.compactSessionWithCheckpoint(ctx, stderr, compactionCheckpointOptions{
+		reason:  "user_requested",
+		phase:   "manual",
+		trigger: "manual",
+	})
+}
+
+type compactionCheckpointOptions struct {
+	reason  string
+	phase   string
+	trigger string
+}
+
+func (r *agentRuntime) autoCompactBeforeTurn(ctx context.Context, messages []model.Message, prompt string, stderr io.Writer) ([]model.Message, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if r == nil || r.config == nil || !r.config.Compaction.Enabled {
+		return messages, nil
+	}
+	if !r.saveSessions || r.resumableSessionStore == nil || strings.TrimSpace(r.resumableSession.ID) == "" {
+		return messages, nil
+	}
+	contextWindow := 0
+	if r.contextTracker != nil {
+		contextWindow = r.contextTracker.Metadata().ContextWindow
+	}
+	if contextWindow <= 0 {
+		return messages, nil
+	}
+
+	requestMessages := append(copyMessageSlice(messages), model.Message{
+		Role:    model.MessageRoleUser,
+		Content: prompt,
+	})
+	estimated := contextwindow.EstimateRequestTokens(model.Request{
+		Model:      r.modelID,
+		Messages:   requestMessages,
+		Tools:      r.toolSchemas,
+		Parameters: r.parameters,
+	})
+	if !autoCompactionThresholdExceeded(estimated, contextWindow, r.config.Compaction.ThresholdPercent) {
+		return messages, nil
+	}
+
+	updated, err := r.compactSessionWithCheckpoint(ctx, stderr, compactionCheckpointOptions{
+		reason:  "context_limit",
+		phase:   "pre_turn",
+		trigger: "auto",
+	})
+	if err != nil {
+		return nil, fmt.Errorf("auto compact failed: %w", err)
+	}
+	return updated, nil
+}
+
+func autoCompactionThresholdExceeded(inputTokens, contextWindow, thresholdPercent int) bool {
+	if inputTokens <= 0 || contextWindow <= 0 || thresholdPercent <= 0 {
+		return false
+	}
+	return int64(inputTokens)*100 > int64(contextWindow)*int64(thresholdPercent)
+}
+
+func (r *agentRuntime) compactSessionWithCheckpoint(ctx context.Context, stderr io.Writer, checkpointOptions compactionCheckpointOptions) ([]model.Message, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -1991,9 +2059,9 @@ func (r *agentRuntime) compactSession(ctx context.Context, stderr io.Writer) ([]
 	}
 	checkpoint := sessions.CompactionCheckpoint{
 		ID:                    nextCompactionCheckpointID(r.resumableSession.Compactions),
-		Reason:                "user_requested",
-		Phase:                 "manual",
-		Trigger:               "manual",
+		Reason:                checkpointOptions.reason,
+		Phase:                 checkpointOptions.phase,
+		Trigger:               checkpointOptions.trigger,
 		SummaryItemID:         summaryItemID,
 		FromItemID:            firstString(r.resumableSession.ActiveHistory),
 		ToItemID:              lastString(r.resumableSession.ActiveHistory),

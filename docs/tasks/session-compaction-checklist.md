@@ -30,7 +30,7 @@ Out of scope: the future session-history query tool.
 - [x] Replacement history selection: keep saved instruction/runtime items, recent
   complete visible turns, and the summary item; never keep half of a tool-call
   exchange.
-- [ ] Pre-turn auto compact: estimate `ActiveHistory + pending user message + tool
+- [x] Pre-turn auto compact: estimate `ActiveHistory + pending user message + tool
   schemas` before saving the pending user message; on compact failure, fail the
   turn without requesting the main model.
 - [ ] Privacy and views: keep old visible `Items` available for future server/GUI
@@ -41,11 +41,11 @@ Out of scope: the future session-history query tool.
 
 - [x] Manual compact preserves visible history and replaces only model-facing
   `ActiveHistory`.
-- [ ] Auto compact inserts the new user message after the summary only after
+- [x] Auto compact inserts the new user message after the summary only after
   compaction succeeds.
 - [ ] Resume after compact sends only materialized `ActiveHistory` to the provider.
 - [x] Compaction failures are atomic: no summary item, checkpoint, pending user
   item, or active history replacement is persisted.
-- [ ] Tests cover config defaults, manual `/compact`, pre-turn auto compact,
+- [x] Tests cover config defaults, manual `/compact`, pre-turn auto compact,
   replacement history legality, resume materialization, and failure paths.
-- [ ] `go test ./...` and `git diff --check` pass for each implementation slice.
+- [x] `go test ./...` and `git diff --check` pass for each implementation slice.

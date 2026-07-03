@@ -3067,6 +3067,222 @@ func TestChatManualCompactSummaryFailureLeavesStateUnchanged(t *testing.T) {
 	assertSavedMessage(t, active, 5, model.MessageRoleUser, "third")
 }
 
+func TestChatAutoCompactTriggersBeforeMainModelWhenThresholdExceeded(t *testing.T) {
+	server, requests := newSequentialCLIRunServer(t,
+		[]string{
+			`{"choices":[{"delta":{"content":"one"}}]}`,
+			`[DONE]`,
+		},
+		[]string{
+			`{"choices":[{"delta":{"content":"# Context Checkpoint\n\n## Goal\nContinue.\n\n## Current Progress\nFirst turn is current.\n\n## Decisions Made\nNone.\n\n## Constraints / User Preferences\nKeep concise.\n\n## Relevant Files / APIs / Commands\nNone.\n\n## Tool State / Environment State\nNo tools.\n\n## Open Questions\nNone.\n\n## Next Steps\nAnswer second."}}]}`,
+			`[DONE]`,
+		},
+		[]string{
+			`{"choices":[{"delta":{"content":"two"}}]}`,
+			`[DONE]`,
+		},
+	)
+	defer server.Close()
+
+	configDir := t.TempDir()
+	writeCLIRunFixtureInDirWithTools(t, configDir, server.URL, "direct-secret-value", "openai-chat", []string{"read_file"})
+	setCLISessionsConfig(t, configDir, true, true)
+	setCLICompactionConfigWithThreshold(t, configDir, true, 1, "", "")
+	setCLIModelContextWindow(t, configDir, 10000)
+
+	var stdout, stderr bytes.Buffer
+	code := RunWithIO([]string{"--config", cliConfigPath(configDir), "chat"}, strings.NewReader("first\nsecond\n/quit\n"), &stdout, &stderr, func() (string, error) {
+		return t.TempDir(), nil
+	})
+
+	if code != 0 {
+		t.Fatalf("RunWithIO() code = %d, stderr = %s", code, stderr.String())
+	}
+	if got, want := stdout.String(), "one\ntwo\n"; got != want {
+		t.Fatalf("stdout = %q, want %q", got, want)
+	}
+
+	firstRequest := <-requests
+	summaryRequest := <-requests
+	secondRequest := <-requests
+	assertNoAdditionalCLIRunRequest(t, requests)
+
+	assertMessage(t, requestMessages(t, firstRequest.Body), 1, "user", "first")
+	if _, ok := summaryRequest.Body["tools"]; ok {
+		t.Fatalf("summary request included tools: %#v", summaryRequest.Body["tools"])
+	}
+	summaryMessages := requestMessages(t, summaryRequest.Body)
+	if len(summaryMessages) != 2 {
+		t.Fatalf("len(summary messages) = %d, want 2: %#v", len(summaryMessages), summaryMessages)
+	}
+	assertMessageContentContains(t, summaryMessages, 0, "system", "Create a concise handoff checkpoint")
+	assertMessageContentContains(t, summaryMessages, 1, "user", "first")
+	if strings.Contains(string(summaryRequest.RawBody), "second") {
+		t.Fatalf("summary request included pending user message: %s", summaryRequest.RawBody)
+	}
+
+	secondMessages := requestMessages(t, secondRequest.Body)
+	if len(secondMessages) != 5 {
+		t.Fatalf("len(second request messages) = %d, want compacted history plus pending user: %#v", len(secondMessages), secondMessages)
+	}
+	assertMessage(t, secondMessages, 0, "system", builtInBaseInstructions)
+	assertMessage(t, secondMessages, 1, "user", "first")
+	assertMessage(t, secondMessages, 2, "assistant", "one")
+	assertMessageContentContains(t, secondMessages, 3, "developer", "<compaction_summary>")
+	assertMessage(t, secondMessages, 4, "user", "second")
+	assertCLIToolNames(t, secondRequest.Body, []string{"read_file"})
+
+	session := loadOnlyCLISession(t, filepath.Join(configDir, "sessions"))
+	if len(session.Compactions) != 1 {
+		t.Fatalf("len(Compactions) = %d, want 1: %#v", len(session.Compactions), session.Compactions)
+	}
+	checkpoint := session.Compactions[0]
+	if checkpoint.Reason != "context_limit" || checkpoint.Phase != "pre_turn" || checkpoint.Trigger != "auto" {
+		t.Fatalf("checkpoint reason/phase/trigger = %q/%q/%q, want auto pre-turn context limit", checkpoint.Reason, checkpoint.Phase, checkpoint.Trigger)
+	}
+	if !sessionContainsExactMessageContent(session, "first") || !sessionContainsExactMessageContent(session, "one") {
+		t.Fatalf("session items dropped old visible messages: %#v", session.Items)
+	}
+	active := activeCLIMessages(t, session)
+	if len(active) != 6 {
+		t.Fatalf("len(active messages) = %d, want compacted history plus second turn: %#v", len(active), active)
+	}
+	assertSavedMessageContentContains(t, active, 3, model.MessageRoleDeveloper, "<compaction_summary>")
+	assertSavedMessage(t, active, 4, model.MessageRoleUser, "second")
+	assertSavedMessage(t, active, 5, model.MessageRoleAssistant, "two")
+}
+
+func TestChatAutoCompactDoesNotTriggerBelowThreshold(t *testing.T) {
+	server, requests := newSequentialCLIRunServer(t,
+		[]string{
+			`{"choices":[{"delta":{"content":"one"}}]}`,
+			`[DONE]`,
+		},
+		[]string{
+			`{"choices":[{"delta":{"content":"two"}}]}`,
+			`[DONE]`,
+		},
+	)
+	defer server.Close()
+
+	configDir := t.TempDir()
+	writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
+	setCLISessionsConfig(t, configDir, true, true)
+	setCLICompactionConfig(t, configDir, true, "", "")
+	setCLIModelContextWindow(t, configDir, 100000)
+
+	var stdout, stderr bytes.Buffer
+	code := RunWithIO([]string{"--config", cliConfigPath(configDir), "chat"}, strings.NewReader("first\nsecond\n/quit\n"), &stdout, &stderr, func() (string, error) {
+		return t.TempDir(), nil
+	})
+
+	if code != 0 {
+		t.Fatalf("RunWithIO() code = %d, stderr = %s", code, stderr.String())
+	}
+	firstRequest := <-requests
+	secondRequest := <-requests
+	assertNoAdditionalCLIRunRequest(t, requests)
+
+	assertMessage(t, requestMessages(t, firstRequest.Body), 1, "user", "first")
+	secondMessages := requestMessages(t, secondRequest.Body)
+	if len(secondMessages) != 4 {
+		t.Fatalf("len(second request messages) = %d, want direct full history: %#v", len(secondMessages), secondMessages)
+	}
+	assertMessage(t, secondMessages, 1, "user", "first")
+	assertMessage(t, secondMessages, 2, "assistant", "one")
+	assertMessage(t, secondMessages, 3, "user", "second")
+	if strings.Contains(string(secondRequest.RawBody), "<compaction_summary>") {
+		t.Fatalf("second request included compaction summary: %s", secondRequest.RawBody)
+	}
+
+	session := loadOnlyCLISession(t, filepath.Join(configDir, "sessions"))
+	if len(session.Compactions) != 0 {
+		t.Fatalf("Compactions = %#v, want none", session.Compactions)
+	}
+}
+
+func TestChatAutoCompactFailureLeavesTurnUnchangedAndREPLContinues(t *testing.T) {
+	server, requests := newSequentialCLIRunServer(t,
+		[]string{
+			`{"choices":[{"delta":{"content":"one"}}]}`,
+			`[DONE]`,
+		},
+		[]string{
+			`{not-json`,
+		},
+		[]string{
+			`{"choices":[{"delta":{"content":"# Context Checkpoint\n\n## Goal\nContinue.\n\n## Current Progress\nFirst turn is current.\n\n## Decisions Made\nNone.\n\n## Constraints / User Preferences\nKeep concise.\n\n## Relevant Files / APIs / Commands\nNone.\n\n## Tool State / Environment State\nNo tools.\n\n## Open Questions\nNone.\n\n## Next Steps\nAnswer third."}}]}`,
+			`[DONE]`,
+		},
+		[]string{
+			`{"choices":[{"delta":{"content":"three"}}]}`,
+			`[DONE]`,
+		},
+	)
+	defer server.Close()
+
+	configDir := t.TempDir()
+	writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
+	setCLISessionsConfig(t, configDir, true, true)
+	setCLICompactionConfigWithThreshold(t, configDir, true, 1, "", "")
+	setCLIModelContextWindow(t, configDir, 10000)
+
+	var stdout, stderr bytes.Buffer
+	code := RunWithIO([]string{"--config", cliConfigPath(configDir), "chat"}, strings.NewReader("first\nsecond\nthird\n/quit\n"), &stdout, &stderr, func() (string, error) {
+		return t.TempDir(), nil
+	})
+
+	if code != 0 {
+		t.Fatalf("RunWithIO() code = %d, stderr = %s", code, stderr.String())
+	}
+	if got, want := stdout.String(), "one\nthree\n"; got != want {
+		t.Fatalf("stdout = %q, want %q", got, want)
+	}
+	assertCLIErrorContains(t, stderr.String(), "sai: auto compact failed", "parse OpenAI chat stream")
+
+	firstRequest := <-requests
+	failedSummaryRequest := <-requests
+	retrySummaryRequest := <-requests
+	thirdRequest := <-requests
+	assertNoAdditionalCLIRunRequest(t, requests)
+	assertMessage(t, requestMessages(t, firstRequest.Body), 1, "user", "first")
+	if _, ok := failedSummaryRequest.Body["tools"]; ok {
+		t.Fatalf("failed summary request included tools: %#v", failedSummaryRequest.Body["tools"])
+	}
+	if strings.Contains(string(failedSummaryRequest.RawBody), "second") {
+		t.Fatalf("failed summary request included pending failed user message: %s", failedSummaryRequest.RawBody)
+	}
+	if strings.Contains(string(retrySummaryRequest.RawBody), "third") {
+		t.Fatalf("retry summary request included pending later user message: %s", retrySummaryRequest.RawBody)
+	}
+	thirdMessages := requestMessages(t, thirdRequest.Body)
+	assertMessageContentContains(t, thirdMessages, 3, "developer", "<compaction_summary>")
+	assertMessage(t, thirdMessages, 4, "user", "third")
+	if requestMessagesContainExactContent(thirdMessages, "second") {
+		t.Fatalf("third request included failed pending user message: %#v", thirdMessages)
+	}
+
+	session := loadOnlyCLISession(t, filepath.Join(configDir, "sessions"))
+	if len(session.Compactions) != 1 {
+		t.Fatalf("len(Compactions) = %d, want only later successful auto compaction: %#v", len(session.Compactions), session.Compactions)
+	}
+	if sessionContainsExactMessageContent(session, "second") {
+		t.Fatalf("session items contain failed pending user message: %#v", session.Items)
+	}
+	if !sessionContainsExactMessageContent(session, "first") || !sessionContainsExactMessageContent(session, "third") {
+		t.Fatalf("session items missing successful turns: %#v", session.Items)
+	}
+}
+
+func TestAutoCompactionThresholdUsesStrictExceedsBoundary(t *testing.T) {
+	if autoCompactionThresholdExceeded(80, 100, 80) {
+		t.Fatal("autoCompactionThresholdExceeded(80, 100, 80) = true, want false at threshold")
+	}
+	if !autoCompactionThresholdExceeded(81, 100, 80) {
+		t.Fatal("autoCompactionThresholdExceeded(81, 100, 80) = false, want true above threshold")
+	}
+}
+
 func TestChatSaveSessionRecordsProviderUsageMetadata(t *testing.T) {
 	server, requests := newCLIRunServer(t,
 		`{"choices":[{"delta":{"content":"one"}}]}`,
@@ -5951,6 +6167,12 @@ sessions:
 func setCLICompactionConfig(t *testing.T, configDir string, enabled bool, summaryProvider, summaryModel string) {
 	t.Helper()
 
+	setCLICompactionConfigWithThreshold(t, configDir, enabled, 80, summaryProvider, summaryModel)
+}
+
+func setCLICompactionConfigWithThreshold(t *testing.T, configDir string, enabled bool, thresholdPercent int, summaryProvider, summaryModel string) {
+	t.Helper()
+
 	configPath := filepath.Join(configDir, "sai.yaml")
 	data, err := os.ReadFile(configPath)
 	if err != nil {
@@ -5960,10 +6182,10 @@ func setCLICompactionConfig(t *testing.T, configDir string, enabled bool, summar
 
 compaction:
   enabled: %t
-  threshold_percent: 80
+  threshold_percent: %d
   summary_provider: %q
   summary_model: %q
-`, enabled, summaryProvider, summaryModel)
+`, enabled, thresholdPercent, summaryProvider, summaryModel)
 	writeCLIFile(t, configPath, updated)
 }
 
