@@ -63,7 +63,7 @@ JSONL 日志，不保存完整会话上下文、prompt、response 或 tool resul
 可恢复 session 是 M13 之后的独立能力，不是 JSONL 日志的增强开关。它默认关闭；只有用户
 通过配置或命令显式启用后，才会保存完整 messages、assistant tool calls 和 tool result
 messages，以及 provider/model/parameters、cwd、enabled tools/MCP、loaded skills、reasoning 和
-注入指令快照或可重建信息。M17 后，项目指令文件应按每个成功加载的文件保留独立
+注入指令快照或可重建信息。M18 后，项目指令文件应按每个成功加载的文件保留独立
 source/message 粒度。只有保存这些完整上下文，`resume` 才能可靠，而这也意味着
 session 文件会包含敏感数据。
 
@@ -525,7 +525,7 @@ provider/model 列表并停止。v0.1 不支持会话进行中切换模型。
 
 ## 项目上下文
 
-M17 通过根配置 `agent.instruction_files` 配置项目指令文件。省略该字段时保持当前兼容
+M18 通过根配置 `agent.instruction_files` 配置项目指令文件。省略该字段时保持当前兼容
 行为，等价于：
 
 ```yaml
@@ -550,6 +550,12 @@ glob 条目支持普通 glob pattern，也支持 `**/*.md` 形式的递归 patte
 匹配到多个文件时，匹配文件在该 pattern 内按稳定 path sort 顺序加载；不同条目之间继续
 保留配置列表顺序。
 
+完成 placeholder 展开和 glob 匹配后，`sai` 以解析后的 canonical/clean 绝对文件路径作为
+同一文件身份去重。如果多个条目或重叠 glob 匹配到同一个实际文件，只加载第一次出现的文件；
+第一次出现按既有加载顺序判断：先看 `agent.instruction_files` 列表顺序，同一个 glob
+pattern 内再按稳定 path sort 顺序。后续重复匹配静默跳过，不输出 warning；这不改变
+`$REPO` 无法解析时跳过条目并输出 warning 的行为。
+
 省略配置时的兼容布局仍然是：
 
 ```text
@@ -568,7 +574,7 @@ sai 内置基础约束 > project instruction files > loaded skills > 当前用�
 
 用户 prompt 不应覆盖 `sai` 的基础安全和执行约束，也不应隐式覆盖项目指令文件中的项目
 约定。后续如需临时忽略项目指令，应增加显式参数，而不是通过普通 prompt 实现。
-成功加载的每个项目指令文件应优先作为独立 developer instruction source/message 注入，并
+成功加载且去重后的每个项目指令文件应优先作为独立 developer instruction source/message 注入，并
 保留文件来源，便于 session snapshot 或可重建信息按单个文件记录。已加载 skill 的
 instructions 作为 developer message 追加在全部项目指令文件之后、用户 prompt 之前；多个
 skill 使用 skill 目录顺序和目录内确定性 discovery 顺序注入。
@@ -804,7 +810,7 @@ profile parameters、cwd、根配置文件路径、启用 tools/MCP、loaded ski
 可重建信息，以及完整 user messages、assistant final messages、assistant tool calls 和
 tool result messages。缺少这些信息时，只能得到 transcript 或诊断日志，不能承诺可靠
 resume。
-M17 后，项目指令文件快照或可重建信息应按每个成功加载的文件分别记录，而不是合并成一个
+M18 后，项目指令文件快照或可重建信息应按每个成功加载的文件分别记录，而不是合并成一个
 不可追溯的块。
 
 当前 M13 已接入 `sai chat --save-session`、`sai chat --resume <id>`、

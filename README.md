@@ -23,8 +23,11 @@ Project-instruction configuration uses `agent.instruction_files`. If it is
 omitted, behavior remains compatible with `["$CWD/AGENTS.md"]`. Entries load in
 list order, may name files other than `AGENTS.md`, support `$CWD`, `$CONFIG`,
 `$USER`, and `$REPO`, and glob matches load in stable path sort order within one
-pattern. Successfully loaded files keep the same instruction position: after
-built-in base instructions and before loaded skills and the user prompt.
+pattern. After expansion and glob matching, duplicate same-file matches are
+deduplicated by canonical/clean absolute path: the first occurrence wins and
+later duplicates are skipped silently. Successfully loaded unique files keep the
+same instruction position: after built-in base instructions and before loaded
+skills and the user prompt.
 
 Minimal provider setup:
 

@@ -356,11 +356,17 @@
 - [x] glob 支持普通 glob pattern 和递归 `**/*.md` pattern。
 - [x] 单个 pattern 匹配多个文件时，在该 pattern 内按稳定 path sort 顺序加载。
 - [x] 不同 pattern 之间保留 `agent.instruction_files` 列表顺序。
+- [ ] 完成 placeholder 展开和 glob 匹配后，以解析后的 canonical/clean 绝对文件路径作为同一文件身份去重。
+- [ ] 重复指向同一实际文件时只加载第一次出现的文件；第一次出现按列表顺序优先，同一个 glob pattern 内按稳定 path sort 顺序判断。
+- [ ] 后续重复匹配静默跳过，不输出 warning；`$REPO` 无法解析时的 warning 行为不变。
 - [x] 成功加载的文件注入在 `sai` 内置基础约束之后、loaded skills 和当前用户 prompt 之前。
 - [x] 每个成功加载的文件优先作为独立 developer instruction source/message 注入。
+- [ ] 去重后每个唯一项目指令文件仍优先作为独立 developer instruction source/message 注入。
 - [x] resumable session 的项目指令 snapshot 或可重建信息保留单文件来源。
 - [x] `sai config show`、verbose、日志和 warning 不打印项目指令正文。
 - [x] 配置测试覆盖默认值、显式空列表和配置值；context 测试覆盖 placeholder 解析、缺失文件、glob 和稳定排序。
+- [ ] context 测试覆盖 `$REPO/AGENTS.md` 与 `$CWD/AGENTS.md` 解析为同一路径时只加载一次，以及重叠 glob 的 first occurrence wins。
+- [ ] CLI / fake server 测试覆盖后续重复项目指令匹配静默跳过且不输出 warning，每个唯一文件仍是独立 developer message/source。
 - [x] CLI / fake server 测试覆盖多项目指令文件注入顺序和 skill 注入位置。
-- [x] 验证 `go test ./...`。
-- [x] 验证 `git diff --check`。
+- [ ] 验证 `go test ./...`。
+- [ ] 验证 `git diff --check`。

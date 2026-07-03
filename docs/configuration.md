@@ -167,7 +167,13 @@ placeholder 明确路径基准：
 glob pattern，也支持 `**/*.md` 形式的递归 pattern。同一个 pattern 匹配到多个文件时，
 这些匹配文件在该 pattern 内按稳定 path sort 顺序加载；pattern 之间仍保留列表顺序。
 
-成功加载的文件注入在同一个项目指令位置：位于 `sai` 内置基础约束之后、loaded skills
+完成 placeholder 展开和 glob 匹配后，`sai` 使用解析后的 canonical/clean 绝对文件路径判断
+是否为同一个实际文件。重复指向同一文件时只保留第一次出现的加载项；第一次出现按列表顺序优先，
+同一个 glob pattern 内按稳定 path sort 顺序判断。例如 cwd 就是 repository root 时，
+`$REPO/AGENTS.md` 和 `$CWD/AGENTS.md` 解析到同一路径，只会加载一次。后续重复匹配静默跳过，
+不产生 warning；`$REPO` 无法解析时跳过条目并输出 warning 的既有行为不变。
+
+成功加载且去重后的文件注入在同一个项目指令位置：位于 `sai` 内置基础约束之后、loaded skills
 和当前用户 prompt 之前。多个文件应优先作为多个独立 developer instruction source/message
 注入，并保留各自文件来源，便于后续 session snapshot 或可重建信息记录到单个文件粒度。
 
@@ -634,7 +640,7 @@ tool calls 和 tool result messages。
 
 可恢复 session 文件会包含敏感数据，包括用户输入、assistant 输出、tool result、cwd、
 provider/model/parameters、启用 tools/MCP、loaded skills、reasoning，以及注入指令快照或可重建
-信息。M17 后，如果记录项目指令文件快照或可重建信息，应按每个成功加载的文件保留独立
+信息。M18 后，如果记录项目指令文件快照或可重建信息，应按每个成功加载的文件保留独立
 source/message 粒度。因此 `sessions.enabled` 必须默认是 `false`，CLI 和文档都应提示用户这是显式
 opt-in 的落盘能力。
 

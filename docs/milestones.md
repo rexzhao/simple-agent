@@ -201,7 +201,7 @@ M7 当前实现只覆盖 `skill_dirs` 中配置的本地 skills：默认等价�
 按配置顺序扫描多个目录，每个目录只发现包含 `SKILL.md` 的直接子目录。同一目录内按确定性
 discovery 顺序加载，跨目录保留配置的目录顺序；重复 skill id 是配置错误。发现到的 skill
 默认将其 instructions 作为 developer message 注入在内置 system 和项目指令之后、用户
-prompt 之前。M7 时项目指令是启动目录 `AGENTS.md`；M17 后，项目指令是
+prompt 之前。M7 时项目指令是启动目录 `AGENTS.md`；M18 后，项目指令是
 `agent.instruction_files` 成功加载的文件。若某个 `SKILL.md` frontmatter 设置
 `disable-model-invocation: true`，该 skill 不注入模型上下文；缺失该字段或设置为 `false`
 表示正常加载。M7 不读取用户目录，不实现
@@ -407,7 +407,7 @@ marketplace、递归 skill discovery、plugin lifecycle 或复杂依赖解析。
   runtime 选择。
 - 启用后保存已启用 tools、MCP、loaded skills、reasoning 展示设置，以及对应的 CLI 覆盖来源。
 - 启用后保存注入指令快照，或保存足以重建内置 system、项目指令和 loaded skills 的信息；
-  若使用可重建信息，恢复时必须能检测源文件变化并给出清晰提示。M17 后，项目指令文件应按
+  若使用可重建信息，恢复时必须能检测源文件变化并给出清晰提示。M18 后，项目指令文件应按
   每个成功加载的文件记录独立 source/message 粒度。
 - 启用后保存完整 messages：user messages、assistant final messages、assistant tool
   calls、tool result messages。
@@ -453,7 +453,7 @@ resumable session 保存 context management metadata，恢复后继续用该 met
 - 接近 context window 时向 stderr 给出清晰警告。
 - 达到预算前拒绝继续或要求用户选择处理方式，不静默截断关键上下文。
 - 初始策略先保守：保留内置 system、项目指令、loaded skills、tool/MCP schema、
-  全部 user/assistant 消息和 tool result，不自动摘要或截断。M17 后，项目指令是
+  全部 user/assistant 消息和 tool result，不自动摘要或截断。M18 后，项目指令是
   `agent.instruction_files` 成功加载的文件列表。
 - 记录后续截断或摘要策略边界；摘要进入自动路径前必须有测试覆盖和可解释边界。
 - resumable session 中记录 context management metadata，恢复后能继续判断预算。
@@ -607,13 +607,15 @@ agent 在大工作区内安全定位文本内容，同时不默认启用任何�
 目标：把项目指令文件从固定启动目录 `AGENTS.md` 扩展为根配置字段
 `agent.instruction_files`，同时保持省略配置时的兼容默认行为。
 
-M17 当前已实现：根配置支持 `agent.instruction_files`，省略时兼容默认
+M18 当前已实现：根配置支持 `agent.instruction_files`，省略时兼容默认
 `["$CWD/AGENTS.md"]`；显式空列表不加载项目指令；条目按列表顺序处理，支持任意文件名、
 `$CWD` / `$CONFIG` / `$USER` / `$REPO` placeholder、普通 glob 和递归 `**/*.md` glob。
 单个 pattern 的多个匹配按稳定 path sort 顺序加载，缺失文件跳过，无法解析 `$REPO` 的条目
 跳过并向 stderr 输出不进入模型上下文的 warning。每个成功加载的项目指令文件作为独立
 developer message 注入在内置基础约束之后、loaded skills 之前；resumable session 的
 `instructions_snapshot` 保留这些独立 message 粒度，`instruction_sources` 保留对应来源。
+后续补充：多个 `agent.instruction_files` 条目或重叠 glob 匹配到同一个实际文件时，应在
+placeholder 展开和 glob 匹配后按 canonical/clean 绝对文件路径去重，只加载第一次出现的文件。
 
 交付物：
 
@@ -628,9 +630,14 @@ developer message 注入在内置基础约束之后、loaded skills 之前；res
 - glob 支持普通 glob pattern 和 `**/*.md` 递归 pattern。
 - 单个 pattern 匹配多个文件时，在该 pattern 内按稳定 path sort 顺序加载；不同 pattern
   之间保留列表顺序。
+- 完成 placeholder 展开和 glob 匹配后，以解析后的 canonical/clean 绝对文件路径作为同一文件
+  身份去重。
+- 重复指向同一实际文件时只加载第一次出现的文件；第一次出现按列表顺序优先，同一个 glob
+  pattern 内按稳定 path sort 顺序判断。
+- 后续重复匹配静默跳过，不输出 warning；`$REPO` 无法解析时的 warning 行为不变。
 - 成功加载的文件注入在原项目指令位置：`sai` 内置基础约束之后、loaded skills 和当前用户
   prompt 之前。
-- 每个成功加载的文件优先作为独立 developer instruction source/message 注入；session
+- 每个成功加载且去重后的唯一文件优先作为独立 developer instruction source/message 注入；session
   snapshot 或可重建信息也按单个文件记录来源。
 - `sai config show`、verbose、日志和 warning 不打印项目指令正文。
 
@@ -642,6 +649,10 @@ developer message 注入在内置基础约束之后、loaded skills 之前；res
 - 测试覆盖缺失非 glob 文件跳过。
 - 测试覆盖普通 glob 和递归 `**/*.md` glob。
 - 测试覆盖单个 pattern 多文件匹配时按稳定 path sort 加载。
+- 测试覆盖 `$REPO/AGENTS.md` 与 `$CWD/AGENTS.md` 解析为同一路径时只加载一次。
+- 测试覆盖重叠 glob 匹配同一实际文件时 first occurrence wins，后续重复匹配静默跳过且不输出
+  warning。
+- 测试覆盖去重后每个唯一项目指令文件仍是独立 developer message/source。
 - CLI / fake server 测试覆盖多个项目指令文件按列表顺序注入，且每个文件是独立 developer
   message/source。
 - 测试覆盖 loaded skills 仍注入在全部项目指令文件之后、当前用户 prompt 之前。
