@@ -5,25 +5,31 @@
 
 ## 配置位置
 
-配置根目录只有两种来源：
+`sai` 通过一个具体的根 YAML 配置文件启动配置解析：
 
-1. 默认使用启动时当前工作目录下的 `.agents`。
-2. 通过 `--config-dir` 显式指定目录。
+1. 如果传入 `--config <file>`，使用该文件作为根配置文件。
+2. 如果省略 `--config`，默认使用启动时当前工作目录下的 `.agents/${arg[0]}.yaml`。
+   `${arg[0]}` 是可执行文件 basename；普通 `sai` 二进制默认读取 `.agents/sai.yaml`。
 
 暂时不读取用户目录，也不向用户目录写入默认配置。
 
-`AGENTS.md` 不属于配置目录。它是项目上下文文件，v0.1 默认只从启动时当前工作目录读取。
-`--config-dir` 不改变 `AGENTS.md` 的查找位置。
+`AGENTS.md` 不随根配置文件位置移动。它是项目上下文文件，v0.1 默认只从启动时当前工作目录读取。
+`--config` 不改变 `AGENTS.md` 的查找位置。
 
 ```text
 sai --prompt "你好" --quit
 sai --stdin --quit
-sai --config-dir ./config --prompt "你好" --quit
+sai --config ./config/sai.yaml --prompt "你好" --quit
 sai chat --prompt "你好" --quit
 sai chat --stdin --quit
 sai chat --file prompt.md --quit
-sai --config-dir ./config chat --prompt "你好" --quit
-sai --config-dir ./examples/paperhub chat
+sai --config ./config/sai.yaml chat --prompt "你好" --quit
+sai --config ./examples/paperhub/sai.yaml chat
+sai config show --config ./config/sai.yaml
+sai models list --config ./config/sai.yaml
+sai mcp list --config ./config/sai.yaml
+sai sessions list --config ./config/sai.yaml
+sai doctor --config ./config/sai.yaml
 ```
 
 ## 文件布局
@@ -53,9 +59,9 @@ AGENTS.md
       session.json
 ```
 
-`.agents/` 是默认配置根目录；通过 `--config-dir` 指定时，配置根目录改为指定目录。
-`sai.yaml` 是全局配置入口，负责默认 provider、默认 model、provider 目录、工具启用和
-agent 通用参数。`providers/*.yaml`
+`.agents/sai.yaml` 是普通 `sai` 二进制的默认根配置文件。通过 `--config` 指定时，
+所选文件本身就是入口，不再在目录下额外拼接固定的 `sai.yaml`。根配置文件负责默认
+provider、默认 model、provider 目录、工具启用和 agent 通用参数。`providers/*.yaml`
 每个文件描述一个 provider。默认 `skill_dirs: [skills]` 会扫描
 `skills/<skill_id>/SKILL.md` 这种 M7 后的本地 skill 推荐布局；直接子目录下存在
 `SKILL.md` 的本地 skill 默认会注入运行时，除非该文件的 frontmatter 设置
@@ -63,7 +69,10 @@ agent 通用参数。`providers/*.yaml`
 `mcp/*.yaml` 每个文件描述一个 MCP server；
 MCP 是 M4 后能力，不属于 MVP 必需配置。
 
-当配置根目录由 `--config-dir` 指定时，`sai.yaml` 和上述配置子目录从该目录读取；
+根配置文件内的相对路径都基于该文件所在目录解析。对根配置文件来说，这包括
+`provider_dir`、`auth_dir`、`skill_dirs`、`mcp_dir`、`logging.path` 和
+`sessions.dir`。二级配置文件继续使用同一原则：相对路径基于写出该路径的 YAML 文件所在
+目录解析，例如 provider 的 `auth_file` 相对 provider YAML 文件解析。
 `AGENTS.md` 仍从启动时当前工作目录读取。
 
 ## 全局配置
@@ -102,26 +111,26 @@ mcp_dir: mcp
 
 - `default_provider`：未通过命令行指定 provider 时使用。
 - `default_model`：未通过命令行指定 model 时使用。
-- `provider_dir`：provider 配置文件目录。相对路径基于配置根目录解析。
-- `auth_dir`：M16 后的 OAuth token 文件目录。默认 `auth`，相对路径基于配置根目录解析。
-- `skill_dirs`：本地 skill 目录列表。默认等价于 `[skills]`；相对路径基于配置根目录解析，
+- `provider_dir`：provider 配置文件目录。相对路径基于根配置文件所在目录解析。
+- `auth_dir`：M16 后的 OAuth token 文件目录。默认 `auth`，相对路径基于根配置文件所在目录解析。
+- `skill_dirs`：本地 skill 目录列表。默认等价于 `[skills]`；相对路径基于根配置文件所在目录解析，
   绝对路径保持不变。空列表 `[]` 表示不加载本地 skills。多个目录按配置顺序扫描，每个
   目录只发现其直接子目录中包含 `SKILL.md` 的本地 skills；目录内使用确定性 discovery
   顺序，跨目录保留配置顺序。重复 skill id 是配置错误。
-- `mcp_dir`：MCP 配置文件目录。M4 后启用；相对路径基于配置根目录解析。
+- `mcp_dir`：MCP 配置文件目录。M4 后启用；相对路径基于根配置文件所在目录解析。
 - `agent.max_turns`：一次 agent loop 最多请求模型的轮数。
 - `agent.stream`：默认是否启用 streaming。
 - `agent.show_reasoning`：默认是否显示 reasoning stream。
   普通新 chat 中可用 `--show-reasoning=true/false` 显式覆盖配置；`--show-reasoning`
   等价于 `--show-reasoning=true`。
 - `tools.enabled`：默认启用的工具列表。空列表表示不向模型暴露工具。
-- `logging.path`：JSONL 日志根/基准路径。相对路径基于配置根目录解析；例如
+- `logging.path`：JSONL 日志根/基准路径。相对路径基于根配置文件所在目录解析；例如
   `logs/sai.jsonl` 使用 `logs/` 作为 session root。空字符串表示禁用日志。
 - `logging.level`：日志级别。
 - `sessions.enabled`：M13 后的可恢复 session 开关。默认 `false`，不保存完整上下文。
   普通新 chat 中可用 `--save-session=true/false` 显式覆盖配置；`--save-session`
   等价于 `--save-session=true`。
-- `sessions.dir`：M13 后的可恢复 session 存储目录。相对路径基于配置根目录解析。
+- `sessions.dir`：M13 后的可恢复 session 存储目录。相对路径基于根配置文件所在目录解析。
 - `sessions.save_tool_results`：M13 后启用 session 保存时是否保存完整 tool result messages。
   可靠 resume 需要保存 tool results；关闭后只能作为降级或诊断模式设计。
 
@@ -273,8 +282,8 @@ Codex 后端请求必须显式发送 `store: false`；这是 `openai-codex` runt
 
 ## Skills 配置（M7 后）
 
-本地 skill 目录由 `sai.yaml` 的 `skill_dirs` 指定，默认等价于 `skill_dirs: [skills]`。
-每个条目相对配置根目录解析，除非显式写成绝对路径；如果要关闭全部本地 skill 加载，
+本地 skill 目录由根配置文件的 `skill_dirs` 指定，默认等价于 `skill_dirs: [skills]`。
+每个条目相对根配置文件所在目录解析，除非显式写成绝对路径；如果要关闭全部本地 skill 加载，
 使用 `skill_dirs: []`。本项目推荐每个 skill 使用一个直接子目录，并在子目录下放置
 `SKILL.md`：
 
@@ -293,7 +302,7 @@ skill_dirs: [skills, team-skills, /opt/sai/skills]
 
 `sai` 按配置顺序扫描这些目录。每个目录只发现直接子目录中包含 `SKILL.md` 的 skills，
 不递归读取；同一目录内按确定性 discovery 顺序加载，跨目录保留配置的目录顺序。不同
-配置目录中出现重复 skill id 会作为配置错误处理。
+skill 目录中出现重复 skill id 会作为配置错误处理。
 
 `SKILL.md` 可以使用可选 YAML frontmatter：
 
@@ -317,7 +326,7 @@ disable-model-invocation: true
 
 缺失该字段或设置为 `false` 都表示正常加载并注入。
 
-`sai.yaml` 不配置 skill 选择或启用列表；是否注入某个本地 skill 由其 `SKILL.md`
+根配置文件不配置 skill 选择或启用列表；是否注入某个本地 skill 由其 `SKILL.md`
 frontmatter 决定。
 
 已加载 skill 的 instructions 会作为 developer message 注入到模型请求中，顺序是：
@@ -326,7 +335,7 @@ frontmatter 决定。
 sai 内置基础约束 > AGENTS.md > loaded skills > 当前用户 prompt
 ```
 
-多个 skill 使用配置目录顺序和目录内确定性 discovery 顺序注入。frontmatter 格式错误会让
+多个 skill 使用 skill 目录顺序和目录内确定性 discovery 顺序注入。frontmatter 格式错误会让
 命令失败并指出对应 `SKILL.md`。
 
 ## MCP 配置（M4 后）
@@ -428,13 +437,13 @@ sai chat --provider paperhub --model glm-5.2
 选择优先级：
 
 1. 命令行参数。
-2. 全局 `sai.yaml` 默认值。
+2. 所选根配置文件默认值。
 3. 如果仍无法确定，打印可选 provider/model 并停止。
 
-配置目录选择优先级：
+根配置文件选择优先级：
 
-1. `--config-dir`。
-2. 启动时当前工作目录下的 `.agents`。
+1. `--config <file>`。
+2. 启动时当前工作目录下的 `.agents/${arg[0]}.yaml`。
 
 根层解析从 argv 左到右扫描，跳过已知 flag 及其 value；第一个真正的非 flag token 是命令。
 没有命令 token 时默认执行 `chat`，并把已扫描到的 chat flags 交给 `chat` 解析，例如
@@ -442,10 +451,10 @@ sai chat --provider paperhub --model glm-5.2
 带值 flag 的 value 不参与命令识别，因此 `sai --model fast chat --prompt "hi" --quit` 中的
 `fast` 不是命令。命令 token 之外的参数交给对应命令解析，命令前后的 flags 可以混排；
 chat 初始 prompt 使用 `--prompt`，不使用 positional 参数；`sai "prompt"` 会把 `prompt`
-识别为未知命令，而不是默认 chat 的初始提示词。`--config-dir` 是全局 flag，
-可以出现在命令前，也可以出现在命令或子命令后，例如 `sai --config-dir ./config models list`
-和 `sai models list --config-dir ./config` 等价。`-h` / `--help` 在命令范围内优先显示 help，且不加载配置。`--` 终止 flag
-解析；其后的 token 全部作为 positional，不再被识别为 help、`--config-dir` 或命令参数
+识别为未知命令，而不是默认 chat 的初始提示词。`--config` 是全局 flag，
+可以出现在命令前，也可以出现在命令或子命令后，例如 `sai --config ./config/sai.yaml models list`
+和 `sai models list --config ./config/sai.yaml` 等价。`-h` / `--help` 在命令范围内优先显示 help，且不加载配置。`--` 终止 flag
+解析；其后的 token 全部作为 positional，不再被识别为 help、`--config` 或命令参数
 flag。
 
 v0.1 不支持会话进行中切换模型。`sai chat` 进入会话后，provider/model 固定到会话
@@ -466,14 +475,14 @@ usage 摘要。该命令不请求 provider、不写 JSONL 日志，也不打印 
 
 ## 配置健康检查
 
-`sai doctor` 用于本地检查配置健康状态，可以和全局 `--config-dir` 混排使用，例如
-`sai --config-dir ./config doctor` 或 `sai doctor --config-dir ./config`。它输出简单的
+`sai doctor` 用于本地检查配置健康状态，可以和全局 `--config` 混排使用，例如
+`sai --config ./config/sai.yaml doctor` 或 `sai doctor --config ./config/sai.yaml`。它输出简单的
 `OK ...`、`WARN ...`、`ERROR ...` 行到 stdout；发现任何 `ERROR` 时退出码为 1，只有
 `OK` / `WARN` 时退出码为 0。
 
 检查范围包括：
 
-- 配置根目录和 `sai.yaml` 是否存在且可读。
+- 所选根配置文件是否存在且可读。
 - provider 文件是否可加载，默认 provider/model 是否能解析。
 - 默认 provider 的 API key 是否配置可用：`$ENV_NAME` 会按 `ResolveModel` 的同一逻辑检查
   环境变量是否存在且非空，直接配置 API key 也算通过。
@@ -510,7 +519,7 @@ logging:
 ```
 
 `logging.path` 兼容旧配置，但运行时解释为日志根/基准路径：如果配置为 `logs/sai.jsonl`，
-实际 session root 是配置目录下的 `logs/`；如果配置为空字符串，则禁用日志。每次
+实际 session root 是根配置文件所在目录下的 `logs/`；如果配置为空字符串，则禁用日志。每次
 `sai chat` 启动 runtime 时会预先确定唯一 session JSONL 路径，供
 `--verbose` 的 `log_path` 显示；但 log root、session 目录和 `sai.jsonl` 只在第一条日志
 事件发生时创建。
@@ -554,7 +563,7 @@ sessions:
   save_tool_results: true
 ```
 
-`sessions.dir` 相对配置根目录解析，除非显式写成绝对路径。它和 `logging.path` 不同：
+`sessions.dir` 相对根配置文件所在目录解析，除非显式写成绝对路径。它和 `logging.path` 不同：
 `logging.path` 用于 JSONL 事件日志，默认不记录完整 prompt、response 或 tool result；
 `sessions.dir` 用于可恢复会话，启用后保存完整上下文，包含完整 messages、assistant
 tool calls 和 tool result messages。

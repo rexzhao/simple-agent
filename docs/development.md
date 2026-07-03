@@ -33,7 +33,9 @@
   model profile type；运行时复用 OpenAI Responses request / SSE / tool-call mapping，
   但用 provider 的 `auth_file` 读取和刷新 bearer token，而不是读取 `api_key`。
 - MCP 不属于 MVP 核心；后续接入时第一种传输只做 stdio。
-- 配置根目录默认是启动时当前工作目录下的 `.agents`，也可以通过 `--config-dir` 指定。
+- 根配置文件默认是启动时当前工作目录下的 `.agents/${arg[0]}.yaml`，其中 `${arg[0]}`
+  是可执行文件 basename；普通 `sai` 二进制默认读取 `.agents/sai.yaml`。也可以通过
+  `--config <file>` 显式指定根配置文件。
 - 默认读取启动目录下的 `AGENTS.md` 作为项目指令；文件不存在时继续执行。
 - 只落盘 JSONL 日志；会话历史、上下文快照和其他状态暂不落盘。
 
@@ -222,8 +224,8 @@ help 输出写到 stdout，exit code 为 0。help 必须在配置加载前完成
 `Run "sai help" for usage.` 的提示。
 
 `sai doctor` 是本地配置健康检查命令。`sai doctor -h`、`sai doctor --help` 和
-`sai help doctor` 只显示 help，不加载配置。真正执行检查时，它读取配置根目录、
-`sai.yaml`、provider 文件、`skill_dirs`、MCP 配置和 enabled tools，用简单的
+`sai help doctor` 只显示 help，不加载配置。真正执行检查时，它读取所选根配置文件、
+provider 文件、`skill_dirs`、MCP 配置和 enabled tools，用简单的
 `OK ...`、`WARN ...`、`ERROR ...` 行写到 stdout；只要出现 `ERROR`，退出码就是 1。
 doctor 不发起 provider HTTP 请求、不启动 MCP server、不运行模型，也不能打印 API key、
 直接 secret 值、环境变量实际值、MCP env 实际值或 Authorization 信息。日志检查只验证
@@ -235,18 +237,18 @@ doctor 不发起 provider HTTP 请求、不启动 MCP server、不运行模型�
 带值 flag 的 value 不参与命令识别，因此 `sai --model fast chat --prompt "hi" --quit` 中的
 `fast` 不是命令。命令 token 之外的参数交给对应命令解析，命令前后的 flags 可以混排；
 chat 初始 prompt 使用 `--prompt`，不使用 positional 参数；`sai "prompt"` 会把 `prompt`
-识别为未知命令，而不是默认 chat 的初始提示词。全局 `--config-dir` 也可以放在
-命令后，例如 `sai models list --config-dir ./config` 或
-`sai chat --prompt "hi" --config-dir ./config --quit`。`-h` / `--help` 在命令范围内
+识别为未知命令，而不是默认 chat 的初始提示词。全局 `--config <file>` 也可以放在
+命令后，例如 `sai models list --config ./config/sai.yaml` 或
+`sai chat --prompt "hi" --config ./config/sai.yaml --quit`。`-h` / `--help` 在命令范围内
 优先显示 help，且不加载配置。`--` 终止 flag 解析；其后的 token 全部作为 positional，
-不再被识别为 help、`--config-dir` 或命令参数 flag。
+不再被识别为 help、`--config` 或命令参数 flag。
 
 常用参数：
 
 ```text
 --provider paperhub
 --model glm-5.2
---config-dir ./config
+--config ./config/sai.yaml
 --base-url https://tc-paperhub.diezhi.net/v1
 --show-reasoning
 --max-turns 8
@@ -343,8 +345,15 @@ ID、更新时间、provider 和 model/profile 等元数据；`show` 只输出 s
 
 ## 配置形态
 
-配置优先使用 YAML。配置根目录默认为启动时当前工作目录下的 `.agents`，也可以通过
-`--config-dir` 指定。暂时不读取或写入用户目录。
+配置优先使用 YAML。根配置文件默认是启动时当前工作目录下的
+`.agents/${arg[0]}.yaml`，其中 `${arg[0]}` 是可执行文件 basename；普通 `sai`
+二进制默认读取 `.agents/sai.yaml`。也可以通过 `--config <file>` 指向一个具体的
+根 YAML 配置文件。所选配置文件本身就是入口，不再在目录下额外拼接固定的 `sai.yaml`；
+暂时不读取或写入用户目录。
+根配置文件内的相对路径都基于该文件所在目录解析，包括 `provider_dir`、`auth_dir`、
+`skill_dirs`、`mcp_dir`、`logging.path` 和 `sessions.dir`。二级配置文件沿用同一原则：
+相对路径基于写出该路径的 YAML 文件所在目录解析，例如 provider 的 `auth_file` 相对
+provider YAML 文件解析。
 
 全局配置只保存默认选择、provider 文件目录和 agent 默认参数。
 每个 provider 使用一个独立 YAML 文件；一个 provider 文件内可以声明多个模型，每个模型
@@ -455,7 +464,7 @@ models:
         effort: high
 ```
 
-`auth_file` 相对 provider YAML 文件解析，推荐指向配置根目录下的 `auth/`。`sai auth
+`auth_file` 相对 provider YAML 文件解析，推荐指向根配置文件所在目录下的 `auth/`。`sai auth
 codex login --provider codex-work` 会生成或更新 `providers/codex-work.yaml` 和独立的
 `auth/codex-work.json`，并在生成的 `openai-codex` model profile `parameters` 中默认写入
 `store: false` 和 `reasoning.effort: high`。这些值通过现有 Responses 参数透传，不新增
@@ -483,21 +492,21 @@ OAuth 回调。
 model profile 可选 `context_window` 作为本地上下文窗口元数据，不透传给 provider。未配置
 时使用保守估算默认值 `32000`，来源记录为 `estimated`；显式配置时来源为
 `configured`。请求参数可继续写在 profile 顶层，也可写在 `parameters` map 中。
-`provider_dir` 相对配置根目录解析，除非显式写成绝对路径。
-`auth_dir` 是 M16 后的 OAuth token 文件目录，默认是配置根目录下的 `auth`，同样相对配置
-根目录解析；它只保存 `sai auth codex login` 生成的独立 token 文件。
+`provider_dir` 相对根配置文件所在目录解析，除非显式写成绝对路径。
+`auth_dir` 是 M16 后的 OAuth token 文件目录，默认是根配置文件所在目录下的 `auth`，同样
+相对根配置文件所在目录解析；它只保存 `sai auth codex login` 生成的独立 token 文件。
 `skill_dirs` 是 M7 后的本地 skill 目录列表，默认等价于 `skill_dirs: [skills]`；每个
-条目相对配置根目录解析，除非显式写成绝对路径。空列表 `skill_dirs: []` 表示不加载本地
+条目相对根配置文件所在目录解析，除非显式写成绝对路径。空列表 `skill_dirs: []` 表示不加载本地
 skills。推荐布局是 `.agents/skills/<skill_id>/SKILL.md`。`sai` 按配置顺序扫描多个
 目录；每个目录只发现包含 `SKILL.md` 的直接子目录，不递归读取，也不读取用户目录。同一
-目录内按确定性 discovery 顺序加载，跨目录保留配置的目录顺序。不同配置目录中出现重复
+目录内按确定性 discovery 顺序加载，跨目录保留配置的目录顺序。不同 skill 目录中出现重复
 skill id 是配置错误。默认情况下，发现到的 skill 会注入模型上下文；如果某个 `SKILL.md`
 的 YAML frontmatter 设置 `disable-model-invocation: true`，该 skill 不注入模型上下文。
 缺失该字段或设置为 `false` 表示正常加载。skill 是否注入模型上下文只由其 `SKILL.md`
 frontmatter 决定。
-`logging.path` 相对配置根目录解析，除非显式写成绝对路径。它兼容旧配置形态，但运行时
+`logging.path` 相对根配置文件所在目录解析，除非显式写成绝对路径。它兼容旧配置形态，但运行时
 解释为日志根/基准路径：例如 `logs/sai.jsonl` 会使用其目录 `logs/` 作为 session root；
-空字符串表示禁用日志。`mcp_dir` 是 M4 后启用的 MCP 配置目录，同样相对配置根目录解析。
+空字符串表示禁用日志。`mcp_dir` 是 M4 后启用的 MCP 配置目录，同样相对根配置文件所在目录解析。
 
 模型选择发生在会话开始时：
 
@@ -524,7 +533,7 @@ AGENTS.md
   mcp/
 ```
 
-`--config-dir` 只影响配置根目录和其中的 `sai.yaml` 位置，不影响 `AGENTS.md` 位置。
+`--config` 只影响根配置文件位置以及该文件内相对路径的解析基准，不影响 `AGENTS.md` 位置。
 `sai` 暂时不读取用户目录里的 `AGENTS.md`，也不做多层目录向上/向下查找。
 
 项目指令优先级：
@@ -536,7 +545,7 @@ sai 内置基础约束 > AGENTS.md > loaded skills > 当前用户 prompt
 用户 prompt 不应覆盖 `sai` 的基础安全和执行约束，也不应隐式覆盖 `AGENTS.md` 中的项目
 约定。后续如需临时忽略项目指令，应增加显式参数，而不是通过普通 prompt 实现。
 已加载 skill 的 instructions 作为 developer message 追加在 `AGENTS.md` 之后、用户
-prompt 之前；多个 skill 使用配置目录顺序和目录内确定性 discovery 顺序注入。
+prompt 之前；多个 skill 使用 skill 目录顺序和目录内确定性 discovery 顺序注入。
 
 ## OpenAI-Compatible Streaming 注意点
 
@@ -704,7 +713,7 @@ v0.1 中 MCP server 进程生命周期由当前 agent 进程管理。后台常�
 ## 日志和落盘
 
 v0.1 只落盘 JSONL 日志，不保存会话历史或上下文快照。日志路径来自
-`logging.path`，相对路径基于配置根目录解析。`logging.path` 解释为日志根/基准路径：
+`logging.path`，相对路径基于根配置文件所在目录解析。`logging.path` 解释为日志根/基准路径：
 如果配置为 `logs/sai.jsonl`，实际 session root 是 `logs/`；如果配置为空，禁用日志。
 每次 `sai chat` 启动 runtime 时预先确定唯一 session JSONL 路径，供
 `--verbose` 显示；但 log root、session 目录和 `sai.jsonl` 只在第一条日志事件发生时
@@ -734,7 +743,7 @@ M13 后的 resumable sessions 使用独立的 `sessions` 配置和独立存储�
 messages。二者的用途、默认值和敏感数据风险都应在 CLI 和文档中明确区分。
 
 resumable session 默认关闭。启用后，每个 session 至少保存 provider、model、model
-profile parameters、cwd、配置根目录、启用 tools/MCP、loaded skills、reasoning、注入指令快照或
+profile parameters、cwd、根配置文件路径、启用 tools/MCP、loaded skills、reasoning、注入指令快照或
 可重建信息，以及完整 user messages、assistant final messages、assistant tool calls 和
 tool result messages。缺少这些信息时，只能得到 transcript 或诊断日志，不能承诺可靠
 resume。
@@ -780,7 +789,7 @@ OpenAI-compatible `tools` / `tool_calls` 的真实兼容性。若服务不支持
 并将 PaperHub 的 tool calling 标记为已知限制。
 
 2026-07-01 已执行 PaperHub tool call smoke test。命令形态为：
-`go run ./cmd/sai --config-dir <temp-config> chat --quit --provider paperhub --model glm-5.2 --enable-tools list_files --prompt "<prompt>"`。
+`go run ./cmd/sai --config <temp-config>/sai.yaml chat --quit --provider paperhub --model glm-5.2 --enable-tools list_files --prompt "<prompt>"`。
 结果：PaperHub `glm-5.2` 成功返回 tool call，`sai` 执行 `list_files` 后继续输出最终文本。
 
 手动测试命令：

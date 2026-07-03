@@ -6,10 +6,18 @@ streams model output, and can expose built-in tools when explicitly enabled.
 
 ## Configuration
 
-By default, `sai` reads configuration from `.agents/sai.yaml` in the current
-working directory. Use `--config-dir` to point at another configuration
-directory. Provider files live under the configured `provider_dir`, usually
-`.agents/providers/`.
+By default, `sai` reads its root YAML config from `.agents/${arg[0]}.yaml` in
+the current working directory, where `${arg[0]}` is the executable basename. For
+the normal `sai` binary, that is `.agents/sai.yaml`. Use `--config <file>` to
+point at a concrete root config file. Provider files live under the configured
+`provider_dir`, usually `.agents/providers/`.
+
+Relative paths in the root config file, including `provider_dir`, `auth_dir`,
+`skill_dirs`, `mcp_dir`, `logging.path`, and `sessions.dir`, resolve relative to
+the directory containing that config file. Relative paths in secondary config
+files use the same rule; for example, provider `auth_file` is relative to the
+provider YAML file. `AGENTS.md` is still read from the startup/current working
+directory, not from the selected config file location.
 
 Minimal provider setup:
 
@@ -114,7 +122,7 @@ Check local configuration health without starting a chat:
 
 ```sh
 sai doctor
-sai --config-dir ./config doctor
+sai --config ./config/sai.yaml doctor
 ```
 
 `sai doctor` checks local config files, provider/default model resolution, API
@@ -218,8 +226,19 @@ Other useful commands:
 sai version
 sai config show
 sai models list
+sai mcp list
 sai tools list
 sai sessions list
+```
+
+The same concrete config file flag can be mixed into diagnostics and list
+commands:
+
+```sh
+sai config show --config ./config/sai.yaml
+sai models list --config ./config/sai.yaml
+sai mcp list --config ./config/sai.yaml
+sai sessions list --config ./config/sai.yaml
 ```
 
 ## Build

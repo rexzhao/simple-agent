@@ -9,7 +9,7 @@
 - [x] MCP 是 MVP 后的 M4 能力。
 - [x] Anthropic Messages 是 M5 能力，在核心 OpenAI-compatible 路径稳定后接入。
 - [x] OpenAI Responses 是 M6 能力，在核心 OpenAI-compatible 路径稳定后接入。
-- [x] Skills 是 M7 能力，当前仅覆盖配置目录下的本地 skills。
+- [x] Skills 是 M7 能力，当前仅覆盖根配置文件配置的本地 skills。
 - [x] 日志、verbose、resolved config 中不打印 API key、Authorization header 或其他敏感配置值的实际值。
 
 ## M0：项目骨架
@@ -19,15 +19,16 @@
 - [x] 添加 version 命令。
 - [x] 添加 config package。
 - [x] 使用 YAML 作为第一配置格式。
-- [x] 默认使用启动时当前工作目录下的 `.agents` 作为配置根目录，并读取 `sai.yaml`。
-- [x] 支持通过 `--config-dir` 指定配置根目录。
+- [x] 默认使用启动时当前工作目录下的 `.agents/${arg[0]}.yaml` 作为根配置文件；普通 `sai`
+  二进制默认读取 `.agents/sai.yaml`。
+- [x] 支持通过 `--config <file>` 指定根配置文件。
 - [x] 暂时不读取或写入用户目录配置。
 - [x] 支持每个 provider 一个独立 YAML 文件。
 - [x] 支持一个 provider 声明多个 model profile。
 - [x] 支持每个 model profile 设置自己的请求参数。
 - [x] 默认读取启动目录下的 `AGENTS.md`。
 - [x] 缺失 `AGENTS.md` 时继续执行。
-- [x] `--config-dir` 不改变 `AGENTS.md` 查找位置。
+- [x] `--config` 不改变 `AGENTS.md` 查找位置。
 - [x] 暂时不读取用户目录中的 `AGENTS.md`。
 - [x] 实现指令优先级：`sai` 内置基础约束 > `AGENTS.md` > 当前用户 prompt。
 - [x] 支持 JSONL 日志配置。
@@ -184,7 +185,7 @@
 - [x] `sai chat` 支持 `--provider`、`--model`、`--show-reasoning`、`--verbose`、`--enable-tools`、`--enable-mcp` 语义。
 - [x] 有 `--prompt` 且无 `--quit` 时，先跑完初始 prompt 再进入 REPL，历史保留首轮 user、assistant 和 tool messages。
 - [x] 有 `--prompt` 且有 `--quit` 时，跑完这一轮后退出，不进入 REPL。
-- [x] 根层用“跳过已知 flag 及其 value 后的第一个非 flag token”识别命令；命令前后 flags 可混排，全局 `--config-dir` 可放在命令后，没有命令 token 时默认执行 chat，help 混排不加载配置，`--` 后的 token 全部作为 positional，chat 初始 prompt 使用 `--prompt`。
+- [x] 根层用“跳过已知 flag 及其 value 后的第一个非 flag token”识别命令；命令前后 flags 可混排，全局 `--config <file>` 可放在命令后，没有命令 token 时默认执行 chat，help 混排不加载配置，`--` 后的 token 全部作为 positional，chat 初始 prompt 使用 `--prompt`。
 - [x] stdin 逐行读取用户输入，空白行忽略。
 - [x] `/exit`、`/quit` 和 EOF 正常退出。
 - [x] prompt 写到 stderr，不污染 stdout。
@@ -235,7 +236,7 @@
 - [x] 区分 JSONL session log / transcript 和 resumable session。
 - [x] 默认 `sessions.enabled: false`，不保存完整会话上下文。
 - [x] 启用后保存可恢复 session id、创建时间、更新时间和版本信息。
-- [x] 启用后保存 provider、model、model profile parameters、cwd 和配置根目录。
+- [x] 启用后保存 provider、model、model profile parameters、cwd 和根配置文件路径。
 - [x] 启用后保存 enabled tools、MCP、skills 和 reasoning 展示设置。
 - [x] 启用后保存注入指令快照，或保存可重建信息并能检测源文件变化。
 - [x] 启用后保存完整 user messages。
@@ -280,8 +281,8 @@
 - [x] stdin/file 输入复用同一套 message 构造、provider 选择、tools/MCP 启用、skills loading 和日志路径。
 - [x] stdin/file 输入不改变 JSONL 日志默认边界。
 - [x] REPL `/usage` 输出 context window / usage 元数据，不请求 provider，不泄露正文敏感内容。
-- [x] 增加 `sai doctor` 或 `sai config check`。
-- [x] 健康检查覆盖配置根目录和 provider 文件。
+- [x] 增加 `sai doctor`。
+- [x] 健康检查覆盖所选根配置文件和 provider 文件。
 - [x] 健康检查覆盖默认 provider/model 和 API key 环境变量是否存在。
 - [x] 健康检查覆盖 skill_dirs、mcp_dir、enabled tools/MCP、skills discovery 和重复 skill id。
 - [x] 健康检查覆盖日志目录可写性。

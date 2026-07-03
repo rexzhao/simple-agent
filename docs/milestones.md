@@ -13,9 +13,10 @@ MCP 放到 MVP 之后。
 - 初始化 Go module。
 - 创建 `sai` CLI 入口。
 - 记录并 stub YAML 配置结构。
-- 支持默认从启动时当前工作目录下的 `.agents` 读取配置。
-- 支持通过 `--config-dir` 显式指定配置根目录。
-- 支持从配置根目录的 `sai.yaml` 读取全局配置。
+- 支持默认从启动时当前工作目录下的 `.agents/${arg[0]}.yaml` 读取根配置文件；普通
+  `sai` 二进制默认读取 `.agents/sai.yaml`。
+- 支持通过 `--config <file>` 显式指定根配置文件。
+- 支持从所选根配置文件读取全局配置。
 - 支持全局配置和每个 provider 一个配置文件的目录布局。
 - 支持 provider 下声明多个 model profile。
 - 支持 `tools.enabled` 配置，默认不启用工具。
@@ -29,7 +30,7 @@ MCP 放到 MVP 之后。
 
 - `go test ./...` 通过。
 - `sai config show` 能输出不含 API key 或其他敏感配置值实际值的解析后配置。
-- `sai config show --config-dir ./example-config` 能从指定配置根目录的 `sai.yaml` 读取配置。
+- `sai config show --config ./example-config/sai.yaml` 能从指定根配置文件读取配置。
 - `sai models list` 能列出配置中的 provider/model。
 - `sai` 在启动目录存在 `AGENTS.md` 时能加载项目指令。
 
@@ -184,12 +185,12 @@ function tools / function_call_output，使现有 agent tool loop 能通过 `ope
 
 交付物：
 
-- 配置层定义 `skill_dirs`，默认等价于 `skill_dirs: [skills]`；相对路径基于配置根目录解析，
+- 配置层定义 `skill_dirs`，默认等价于 `skill_dirs: [skills]`；相对路径基于根配置文件所在目录解析，
   绝对路径保持不变。
 - 推荐本地目录布局：`.agents/skills/<skill_id>/SKILL.md`。
 - skill discovery，按配置顺序扫描多个目录，每个目录只发现包含 `SKILL.md` 的直接子目录。
 - 同一目录内按确定性 discovery 顺序加载，跨目录保留配置的目录顺序。
-- 重复 skill id 跨配置目录出现时作为配置错误。
+- 重复 skill id 跨 `skill_dirs` 目录出现时作为配置错误。
 - `SKILL.md` 读取，支持可选 YAML frontmatter 中的 `name`、`description` 和
   `disable-model-invocation`。
 - 通过 `disable-model-invocation: true` 对单个 skill 关闭模型上下文注入；缺失或为
@@ -209,8 +210,8 @@ marketplace、递归 skill discovery、plugin lifecycle 或复杂依赖解析。
 
 第一小步验证：
 
-- discovery 单元测试能稳定列出 `skill_dirs` 配置目录下含 `SKILL.md` 的直接子目录，并保留
-  配置目录顺序。
+- discovery 单元测试能稳定列出 `skill_dirs` 指向目录下含 `SKILL.md` 的直接子目录，并保留
+  配置的目录顺序。
 - `SKILL.md` loader 能读取 frontmatter 中的 `name` / `description` /
   `disable-model-invocation` 和正文。
 - 无 frontmatter 时，loader 使用 skill id 作为名称、description 为空、全文作为 instructions。
@@ -313,7 +314,7 @@ marketplace、递归 skill discovery、plugin lifecycle 或复杂依赖解析。
   同一套配置选择规则和 flags：`--provider`、`--model`、`--show-reasoning`、
   `--verbose`、`--enable-tools`、`--enable-mcp`。
 - 参数解析使用统一混排规则：跳过已知 flag 及其 value 后的第一个非 flag token 是命令；
-  命令前后 flags 可混排，`--config-dir` 可放在命令后，`--` 后的 token 全部作为
+  命令前后 flags 可混排，`--config <file>` 可放在命令后，`--` 后的 token 全部作为
   positional；没有命令 token 时默认执行 `chat`；chat 不把 positional 参数作为初始 prompt。
 - 每轮模型输出继续 streaming 到 stdout；prompt 写到 stderr；chat 成功轮次在输出末尾
   缺少换行时补一个换行，避免下一个 REPL prompt 和模型输出粘在一起。
@@ -401,7 +402,7 @@ marketplace、递归 skill discovery、plugin lifecycle 或复杂依赖解析。
   记录完整 prompt、response 或 tool result 正文；后者用于可靠 resume，必须保存完整上下文。
 - `sessions.enabled: false` 作为默认配置；未显式启用时不保存完整会话上下文。
 - 启用后保存可恢复 session id、创建时间、更新时间和版本信息。
-- 启用后保存 provider、model、model profile parameters、cwd、配置根目录和本次运行的关键
+- 启用后保存 provider、model、model profile parameters、cwd、根配置文件路径和本次运行的关键
   runtime 选择。
 - 启用后保存已启用 tools、MCP、loaded skills、reasoning 展示设置，以及对应的 CLI 覆盖来源。
 - 启用后保存注入指令快照，或保存足以重建内置 system、`AGENTS.md` 和 loaded skills 的
@@ -506,7 +507,7 @@ stdout 上的 `OK` / `WARN` / `ERROR` 行，任何 `ERROR` 都让退出码为 1�
 - stdin/file 输入不改变 JSONL 日志默认边界；仍不记录完整 prompt、response 或 tool result。
 - REPL `/usage` 展示 context window / usage 元数据，不请求 provider，不记录正文敏感内容。
 - 增加配置健康检查命令 `sai doctor`，不新增别名或 `sai config check`。
-- 健康检查覆盖配置根目录、provider 文件、默认 provider/model、API key 环境变量是否存在、
+- 健康检查覆盖所选根配置文件、provider 文件、默认 provider/model、API key 环境变量是否存在、
   skill_dirs、mcp_dir、enabled tools/MCP、skills discovery、重复 skill id 和日志目录可写性。
 - 健康检查输出脱敏，不打印 API key 或其他敏感配置值实际值。
 - 健康检查不发 HTTP 请求、不启动 MCP server、不运行模型。
@@ -530,7 +531,7 @@ stdout 上的 `OK` / `WARN` / `ERROR` 行，任何 `ERROR` 都让退出码为 1�
 
 交付物：
 
-- 增加 `auth_dir` 配置，默认指向配置根目录下的 `auth`。
+- 增加 `auth_dir` 配置，默认指向根配置文件所在目录下的 `auth`。
 - 配置层识别 `openai-codex` model profile type。
 - provider 配置支持 `auth_file`，相对 provider YAML 文件解析。
 - `sai auth codex login --provider <name>` 使用 device flow 创建命名 provider。
