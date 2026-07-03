@@ -2851,6 +2851,139 @@ func TestChatManualCompactReplacesActiveHistoryWithoutStartingUserTurn(t *testin
 	assertSavedMessage(t, active, 7, model.MessageRoleAssistant, "four")
 }
 
+func TestChatResumeAfterCompletedCompactSendsOnlyMaterializedActiveHistory(t *testing.T) {
+	server, requests := newSequentialCLIRunServer(t,
+		[]string{
+			`{"choices":[{"delta":{"content":"old assistant alpha"}}]}`,
+			`[DONE]`,
+		},
+		[]string{
+			`{"choices":[{"delta":{"content":"middle assistant beta"}}]}`,
+			`[DONE]`,
+		},
+		[]string{
+			`{"choices":[{"delta":{"content":"recent assistant gamma"}}]}`,
+			`[DONE]`,
+		},
+		[]string{
+			`{"choices":[{"delta":{"content":"# Context Checkpoint\n\n## Goal\nContinue the compacted session.\n\n## Current Progress\nRecent gamma is current.\n\n## Decisions Made\nUse the saved compacted active history.\n\n## Constraints / User Preferences\nKeep concise.\n\n## Relevant Files / APIs / Commands\nNone.\n\n## Tool State / Environment State\nNo tools.\n\n## Open Questions\nNone.\n\n## Next Steps\nAnswer delta."}}]}`,
+			`[DONE]`,
+		},
+		[]string{
+			`{"choices":[{"delta":{"content":"next assistant delta"}}]}`,
+			`[DONE]`,
+		},
+	)
+	defer server.Close()
+
+	configDir := t.TempDir()
+	writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
+	setCLISessionsConfig(t, configDir, true, true)
+	setCLICompactionConfig(t, configDir, true, "", "")
+
+	var firstStdout, firstStderr bytes.Buffer
+	code := RunWithIO([]string{"--config", cliConfigPath(configDir), "chat"}, strings.NewReader("old user alpha\nmiddle user beta\nrecent user gamma\n/compact\n/quit\n"), &firstStdout, &firstStderr, func() (string, error) {
+		return t.TempDir(), nil
+	})
+
+	if code != 0 {
+		t.Fatalf("first RunWithIO() code = %d, stderr = %s", code, firstStderr.String())
+	}
+	if got, want := firstStdout.String(), "old assistant alpha\nmiddle assistant beta\nrecent assistant gamma\n"; got != want {
+		t.Fatalf("first stdout = %q, want %q", got, want)
+	}
+	firstRequest := <-requests
+	secondRequest := <-requests
+	thirdRequest := <-requests
+	summaryRequest := <-requests
+	assertMessage(t, requestMessages(t, firstRequest.Body), 1, "user", "old user alpha")
+	assertMessage(t, requestMessages(t, secondRequest.Body), 3, "user", "middle user beta")
+	assertMessage(t, requestMessages(t, thirdRequest.Body), 5, "user", "recent user gamma")
+	if _, ok := summaryRequest.Body["tools"]; ok {
+		t.Fatalf("summary request included tools: %#v", summaryRequest.Body["tools"])
+	}
+
+	sessionRoot := filepath.Join(configDir, "sessions")
+	session := loadOnlyCLISession(t, sessionRoot)
+	for _, persisted := range []string{
+		"old user alpha",
+		"old assistant alpha",
+		"middle user beta",
+		"middle assistant beta",
+		"recent user gamma",
+		"recent assistant gamma",
+	} {
+		if !sessionContainsExactMessageContent(session, persisted) {
+			t.Fatalf("session items dropped pre-compact visible message %q after compact: %#v", persisted, session.Items)
+		}
+	}
+	if len(session.Compactions) != 1 {
+		t.Fatalf("len(Compactions) = %d, want 1: %#v", len(session.Compactions), session.Compactions)
+	}
+	summaryItem := sessionItemByID(t, session, session.Compactions[0].SummaryItemID)
+	if summaryItem.Visibility != sessions.ItemVisibilityHidden || summaryItem.Audience != sessions.ItemAudienceModel {
+		t.Fatalf("summary item visibility/audience = %q/%q, want hidden/model", summaryItem.Visibility, summaryItem.Audience)
+	}
+	if summaryItem.Message == nil || summaryItem.Message.Role != model.MessageRoleDeveloper || !strings.Contains(summaryItem.Message.Content, "<compaction_summary>") {
+		t.Fatalf("summary item message = %#v, want hidden developer summary", summaryItem.Message)
+	}
+
+	var resumeStdout, resumeStderr bytes.Buffer
+	code = RunWithIO([]string{"--config", cliConfigPath(configDir), "chat", "--resume", session.ID, "--quit", "--prompt", "next user delta"}, strings.NewReader(""), &resumeStdout, &resumeStderr, func() (string, error) {
+		return t.TempDir(), nil
+	})
+
+	if code != 0 {
+		t.Fatalf("resume RunWithIO() code = %d, stderr = %s", code, resumeStderr.String())
+	}
+	if got, want := resumeStdout.String(), "next assistant delta"; got != want {
+		t.Fatalf("resume stdout = %q, want %q", got, want)
+	}
+	resumeRequest := <-requests
+	assertNoAdditionalCLIRunRequest(t, requests)
+
+	resumeMessages := requestMessages(t, resumeRequest.Body)
+	if len(resumeMessages) != 7 {
+		t.Fatalf("len(resume messages) = %d, want compacted active history plus new user: %#v", len(resumeMessages), resumeMessages)
+	}
+	assertMessage(t, resumeMessages, 0, "system", builtInBaseInstructions)
+	assertMessage(t, resumeMessages, 1, "user", "middle user beta")
+	assertMessage(t, resumeMessages, 2, "assistant", "middle assistant beta")
+	assertMessage(t, resumeMessages, 3, "user", "recent user gamma")
+	assertMessage(t, resumeMessages, 4, "assistant", "recent assistant gamma")
+	assertMessageContentContains(t, resumeMessages, 5, "developer", "<compaction_summary>")
+	assertMessage(t, resumeMessages, 6, "user", "next user delta")
+	for _, leaked := range []string{"old user alpha", "old assistant alpha"} {
+		if strings.Contains(string(resumeRequest.RawBody), leaked) {
+			t.Fatalf("resume request included inactive content %q: %s", leaked, resumeRequest.RawBody)
+		}
+	}
+	if requestMessagesContainExactContent(resumeMessages, "/compact") {
+		t.Fatalf("resume request included compact slash command as a message: %#v", resumeMessages)
+	}
+
+	session = loadCLISession(t, sessionRoot, session.ID)
+	for _, persisted := range []string{
+		"old user alpha",
+		"old assistant alpha",
+		"middle user beta",
+		"middle assistant beta",
+		"recent user gamma",
+		"recent assistant gamma",
+	} {
+		if !sessionContainsExactMessageContent(session, persisted) {
+			t.Fatalf("session items dropped pre-compact visible message %q after resume: %#v", persisted, session.Items)
+		}
+	}
+	active := activeCLIMessages(t, session)
+	if len(active) != 8 {
+		t.Fatalf("len(active messages) = %d, want resumed compacted history plus continuation: %#v", len(active), active)
+	}
+	assertSavedMessageContentContains(t, active, 5, model.MessageRoleDeveloper, "<compaction_summary>")
+	assertSavedMessage(t, active, 6, model.MessageRoleUser, "next user delta")
+	assertSavedMessage(t, active, 7, model.MessageRoleAssistant, "next assistant delta")
+}
+
 func TestValidateCompactionReplacementHistoryRejectsIllegalToolExchangeBeforeWrite(t *testing.T) {
 	summaryMessage := model.Message{Role: model.MessageRoleDeveloper, Content: "<compaction_summary>\nsummary\n</compaction_summary>"}
 	summaryItem := sessions.SessionItem{
@@ -3986,6 +4119,70 @@ func TestSessionsShowPrintsMetadataAndSensitiveContentWarning(t *testing.T) {
 		}
 	}
 	assertCLIErrorOmits(t, out, "instruction secret", "prompt body secret", "assistant body secret", "tool body secret")
+	if stderr.String() != "" {
+		t.Fatalf("stderr = %q, want empty", stderr.String())
+	}
+}
+
+func TestSessionsShowOmitsV2HiddenSummaryAndInactiveVisibleBodies(t *testing.T) {
+	configDir := writeCLIFixture(t)
+	sessionRoot := filepath.Join(configDir, "sessions")
+	hiddenSummary := model.Message{Role: model.MessageRoleDeveloper, Content: "<compaction_summary>\nhidden summary secret\n</compaction_summary>"}
+	writeCLISessionV2(t, sessionRoot, sessions.SessionV2{
+		ID:              "compacted-show-session",
+		CreatedAt:       time.Date(2026, 7, 2, 3, 0, 0, 0, time.UTC),
+		UpdatedAt:       time.Date(2026, 7, 2, 3, 1, 0, 0, time.UTC),
+		Version:         sessions.VersionV2,
+		Provider:        "paperhub",
+		ModelProfile:    "glm-5.2",
+		ModelID:         "glm-5.2",
+		SaveToolResults: true,
+		Items: []sessions.SessionItem{
+			{
+				ID:         "inactive-visible-user",
+				Kind:       sessions.ItemKindMessage,
+				Visibility: sessions.ItemVisibilityVisible,
+				Audience:   sessions.ItemAudienceUser,
+				Message:    &model.Message{Role: model.MessageRoleUser, Content: "inactive visible prompt secret"},
+			},
+			{
+				ID:         "summary-hidden",
+				Kind:       sessions.ItemKindMessage,
+				Visibility: sessions.ItemVisibilityHidden,
+				Audience:   sessions.ItemAudienceModel,
+				Message:    &hiddenSummary,
+			},
+			{
+				ID:         "active-user",
+				Kind:       sessions.ItemKindMessage,
+				Visibility: sessions.ItemVisibilityVisible,
+				Audience:   sessions.ItemAudienceUser,
+				Message:    &model.Message{Role: model.MessageRoleUser, Content: "active prompt secret"},
+			},
+		},
+		ActiveHistory: []string{"summary-hidden", "active-user"},
+	})
+
+	var stdout, stderr bytes.Buffer
+	code := RunWithGetwd([]string{"--config", cliConfigPath(configDir), "sessions", "show", "compacted-show-session"}, &stdout, &stderr, func() (string, error) {
+		return "", errors.New("getwd should not be called")
+	})
+
+	if code != 0 {
+		t.Fatalf("RunWithGetwd() code = %d, stderr = %s", code, stderr.String())
+	}
+	out := stdout.String()
+	for _, want := range []string{
+		"WARNING: session files contain full sensitive content",
+		"ID\tcompacted-show-session",
+		"MESSAGE_COUNT\t3",
+		"ACTIVE_HISTORY_COUNT\t2",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("sessions show output missing %q:\n%s", want, out)
+		}
+	}
+	assertCLIErrorOmits(t, out, "inactive visible prompt secret", "hidden summary secret", "<compaction_summary>", "active prompt secret")
 	if stderr.String() != "" {
 		t.Fatalf("stderr = %q, want empty", stderr.String())
 	}

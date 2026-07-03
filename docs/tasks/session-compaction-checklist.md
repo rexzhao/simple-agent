@@ -6,7 +6,9 @@ does not advance `docs/checklist.md` or `docs/milestones.md` status.
 
 Known baseline: low-level v2 session store primitives were committed in `1613b4f`.
 
-Out of scope: the future session-history query tool.
+Out of scope for this closure: the future session-history query tool, all
+GUI/server work, and standalone blob reachability acceptance beyond preserving
+existing behavior.
 
 ## Implementation Slices
 
@@ -33,9 +35,10 @@ Out of scope: the future session-history query tool.
 - [x] Pre-turn auto compact: estimate `ActiveHistory + pending user message + tool
   schemas` before saving the pending user message; on compact failure, fail the
   turn without requesting the main model.
-- [ ] Privacy and views: keep old visible `Items` available for future server/GUI
-  pagination, hide compaction summaries from the default chat view, and preserve
-  blob reachability rules.
+- [x] CLI privacy/view closure: keep old visible `Items` available in storage
+  across compact/resume, keep hidden compaction summaries out of default
+  CLI/session metadata views, and avoid printing old visible message bodies by
+  default.
 
 ## Acceptance Points
 
@@ -43,7 +46,9 @@ Out of scope: the future session-history query tool.
   `ActiveHistory`.
 - [x] Auto compact inserts the new user message after the summary only after
   compaction succeeds.
-- [ ] Resume after compact sends only materialized `ActiveHistory` to the provider.
+- [x] Resume after compact sends only materialized `ActiveHistory` to the provider.
+- [x] `sai sessions show <id>` omits hidden compaction summary content and old
+  visible sensitive message bodies by default.
 - [x] Compaction failures are atomic: no summary item, checkpoint, pending user
   item, or active history replacement is persisted.
 - [x] Tests cover config defaults, manual `/compact`, pre-turn auto compact,
