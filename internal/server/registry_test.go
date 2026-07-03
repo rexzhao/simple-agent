@@ -154,6 +154,36 @@ func TestRegistryStoreRemove(t *testing.T) {
 	}
 }
 
+func TestRegistryStoreSaveReplacesExistingFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "servers.json")
+	store := NewRegistryStore(path)
+	root := t.TempDir()
+	project := filepath.Join(root, "project")
+	config := filepath.Join(project, ".agents", "sai.yaml")
+
+	if err := store.Save([]RegistryRecord{
+		testRegistryRecord(project, config, "127.0.0.1:1001", 1001, "token-one"),
+	}); err != nil {
+		t.Fatalf("Save(first) error = %v", err)
+	}
+	if err := store.Save([]RegistryRecord{
+		testRegistryRecord(project, config, "127.0.0.1:2002", 2002, "token-two"),
+	}); err != nil {
+		t.Fatalf("Save(replacement) error = %v", err)
+	}
+
+	records, err := store.Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if len(records) != 1 {
+		t.Fatalf("Load() returned %d records, want 1: %#v", len(records), records)
+	}
+	if records[0].Addr != "127.0.0.1:2002" || records[0].PID != 2002 || records[0].Token != "token-two" {
+		t.Fatalf("record after replacement = %#v, want second Save contents", records[0])
+	}
+}
+
 func TestRegistryPathComparisonUsesWindowsCaseInsensitivity(t *testing.T) {
 	if !sameRegistryPath(filepath.Join("same", "path"), filepath.Join("same", "path")) {
 		t.Fatal("sameRegistryPath() = false for identical paths")

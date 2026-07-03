@@ -384,7 +384,7 @@ func writePrivateFileAtomic(path string, data []byte) error {
 		return fmt.Errorf("chmod temporary server registry file: %w", err)
 	}
 
-	if err := os.Rename(tempPath, path); err != nil {
+	if err := replacePrivateFile(tempPath, path); err != nil {
 		return fmt.Errorf("write server registry %q: %w", path, err)
 	}
 	cleanup = false
@@ -392,4 +392,25 @@ func writePrivateFileAtomic(path string, data []byte) error {
 		return fmt.Errorf("chmod server registry %q: %w", path, err)
 	}
 	return nil
+}
+
+func replacePrivateFile(tempPath, path string) error {
+	if runtime.GOOS != "windows" {
+		return os.Rename(tempPath, path)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	var lastErr error
+	for {
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			lastErr = err
+		} else if err := os.Rename(tempPath, path); err != nil {
+			lastErr = err
+		} else {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return lastErr
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 }

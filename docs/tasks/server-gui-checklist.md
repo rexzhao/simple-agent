@@ -44,7 +44,7 @@ future work and should not be required by any slice here.
 - [x] Session metadata API: implement `GET /sessions`, `POST /sessions`, and
   `GET /sessions/{id}` with metadata-only responses and server-owned session
   creation.
-- [ ] Item pagination API: implement `GET /sessions/{id}/items` with
+- [x] Item pagination API: implement `GET /sessions/{id}/items` with
   `before_seq`, `after_seq`, `limit`, and `view=chat|debug`, including hidden
   compaction summary filtering in chat view.
 - [ ] Item content API: implement

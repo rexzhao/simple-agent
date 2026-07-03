@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
@@ -235,7 +236,7 @@ func TestSessionMetadataStructuredErrors(t *testing.T) {
 		t.Fatalf("POST /sessions/id error = %#v, want method_not_allowed", body)
 	}
 
-	resp, err = http.Get(baseURL + "/sessions/missing-session/items")
+	resp, err = http.Get(baseURL + "/sessions/missing-session/items/extra")
 	if err != nil {
 		t.Fatalf("GET bad path error = %v", err)
 	}
@@ -246,6 +247,264 @@ func TestSessionMetadataStructuredErrors(t *testing.T) {
 	body = decodeJSON(t, resp)
 	if got := body["error"].(map[string]any)["code"]; got != "not_found" {
 		t.Fatalf("bad path error = %#v, want not_found", body)
+	}
+}
+
+func TestSessionItemsPaginationBeforeAfter(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "sessions")
+	store := sessions.NewV2Store(root)
+	saveServerTestSession(t, store, "session-items")
+	for i := 1; i <= 5; i++ {
+		appendServerTestItem(t, store, "session-items", sessions.SessionItem{
+			ID:         fmt.Sprintf("item-%d", i),
+			Kind:       sessions.ItemKindMessage,
+			Visibility: sessions.ItemVisibilityVisible,
+			Audience:   sessions.ItemAudienceUser,
+			Message:    &model.Message{Role: model.MessageRoleUser, Content: fmt.Sprintf("message-%d", i)},
+		})
+	}
+	process := startSessionAPIServer(t, store, sessions.SessionV2{})
+	baseURL := "http://" + process.Addr()
+
+	_, before := getRawJSON(t, baseURL+"/sessions/session-items/items?before_seq=5&limit=2")
+	if got := responseItemSeqs(t, before); !reflect.DeepEqual(got, []int64{3, 4}) {
+		t.Fatalf("before_seq page seqs = %#v, want [3 4]", got)
+	}
+	if before["has_more_before"] != true || before["has_more_after"] != true {
+		t.Fatalf("before_seq booleans = before:%#v after:%#v, want true/true", before["has_more_before"], before["has_more_after"])
+	}
+
+	_, after := getRawJSON(t, baseURL+"/sessions/session-items/items?after_seq=2&limit=2")
+	if got := responseItemSeqs(t, after); !reflect.DeepEqual(got, []int64{3, 4}) {
+		t.Fatalf("after_seq page seqs = %#v, want [3 4]", got)
+	}
+	if after["has_more_before"] != true || after["has_more_after"] != true {
+		t.Fatalf("after_seq booleans = before:%#v after:%#v, want true/true", after["has_more_before"], after["has_more_after"])
+	}
+}
+
+func TestSessionItemsDefaultAndMaxLimits(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "sessions")
+	store := sessions.NewV2Store(root)
+	saveServerTestSession(t, store, "limit-session")
+	total := maxSessionItemsLimit + 1
+	for i := 1; i <= total; i++ {
+		appendServerTestItem(t, store, "limit-session", sessions.SessionItem{
+			ID:         fmt.Sprintf("item-%03d", i),
+			Kind:       sessions.ItemKindMessage,
+			Visibility: sessions.ItemVisibilityVisible,
+			Audience:   sessions.ItemAudienceUser,
+			Message:    &model.Message{Role: model.MessageRoleUser, Content: fmt.Sprintf("message-%d", i)},
+		})
+	}
+	process := startSessionAPIServer(t, store, sessions.SessionV2{})
+	baseURL := "http://" + process.Addr()
+
+	_, defaultPage := getRawJSON(t, baseURL+"/sessions/limit-session/items")
+	defaultSeqs := responseItemSeqs(t, defaultPage)
+	if len(defaultSeqs) != defaultSessionItemsLimit {
+		t.Fatalf("default page len = %d, want %d", len(defaultSeqs), defaultSessionItemsLimit)
+	}
+	if defaultSeqs[0] != int64(total-defaultSessionItemsLimit+1) || defaultSeqs[len(defaultSeqs)-1] != int64(total) {
+		t.Fatalf("default page seqs first/last = %d/%d, want latest %d items through %d", defaultSeqs[0], defaultSeqs[len(defaultSeqs)-1], defaultSessionItemsLimit, total)
+	}
+	if defaultPage["has_more_before"] != true || defaultPage["has_more_after"] != false {
+		t.Fatalf("default booleans = before:%#v after:%#v, want true/false", defaultPage["has_more_before"], defaultPage["has_more_after"])
+	}
+
+	_, maxPage := getRawJSON(t, fmt.Sprintf("%s/sessions/limit-session/items?limit=%d", baseURL, maxSessionItemsLimit+100))
+	maxSeqs := responseItemSeqs(t, maxPage)
+	if len(maxSeqs) != maxSessionItemsLimit {
+		t.Fatalf("max-clamped page len = %d, want %d", len(maxSeqs), maxSessionItemsLimit)
+	}
+	if maxSeqs[0] != 2 || maxSeqs[len(maxSeqs)-1] != int64(total) {
+		t.Fatalf("max-clamped page seqs first/last = %d/%d, want 2/%d", maxSeqs[0], maxSeqs[len(maxSeqs)-1], total)
+	}
+	if maxPage["has_more_before"] != true || maxPage["has_more_after"] != false {
+		t.Fatalf("max booleans = before:%#v after:%#v, want true/false", maxPage["has_more_before"], maxPage["has_more_after"])
+	}
+}
+
+func TestSessionItemsChatAndDebugFilteringAndNarrowDTO(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "sessions")
+	store := sessions.NewV2Store(root)
+	saveServerTestSession(t, store, "filter-session")
+
+	appendServerTestItem(t, store, "filter-session", sessions.SessionItem{
+		ID:         "visible-user",
+		Kind:       sessions.ItemKindMessage,
+		Visibility: sessions.ItemVisibilityVisible,
+		Audience:   sessions.ItemAudienceUser,
+		Message:    &model.Message{Role: model.MessageRoleUser, Content: "hello"},
+	})
+	largeContent := strings.Repeat("L", sessionItemInlineMessageBytes) + "SECRET-LARGE-TAIL"
+	appendServerTestItem(t, store, "filter-session", sessions.SessionItem{
+		ID:         "visible-assistant",
+		Kind:       sessions.ItemKindMessage,
+		Visibility: sessions.ItemVisibilityVisible,
+		Audience:   sessions.ItemAudienceModel,
+		Message: &model.Message{
+			Role:    model.MessageRoleAssistant,
+			Content: largeContent,
+			ToolCalls: []model.ToolCall{{
+				ID:        "call-secret",
+				Name:      "read_file",
+				Arguments: "SECRET TOOL ARGUMENTS",
+			}},
+		},
+	})
+	if _, err := store.ReplaceActiveHistory("filter-session", []string{"visible-user"}); err != nil {
+		t.Fatalf("ReplaceActiveHistory() error = %v", err)
+	}
+	_, err := store.AppendCompactionCheckpoint("filter-session", sessions.SessionItem{
+		ID:         "summary-1",
+		Kind:       sessions.ItemKindMessage,
+		Visibility: sessions.ItemVisibilityHidden,
+		Audience:   sessions.ItemAudienceModel,
+		Message:    &model.Message{Role: model.MessageRoleDeveloper, Content: "compaction summary secret"},
+	}, sessions.CompactionCheckpoint{
+		ID:                    "compact-1",
+		Reason:                "test",
+		Phase:                 "manual",
+		Trigger:               "manual",
+		SummaryItemID:         "summary-1",
+		PreviousActiveHistory: []string{"visible-user"},
+		ReplacementHistory:    []string{"visible-user", "summary-1"},
+	})
+	if err != nil {
+		t.Fatalf("AppendCompactionCheckpoint() error = %v", err)
+	}
+	appendServerTestItem(t, store, "filter-session", sessions.SessionItem{
+		ID:         "debug-item",
+		Kind:       sessions.ItemKindRuntimeContext,
+		Visibility: sessions.ItemVisibilityDebug,
+		Audience:   sessions.ItemAudienceInternal,
+		Message:    &model.Message{Role: model.MessageRoleDeveloper, Content: "debug secret"},
+	})
+	appendServerTestItem(t, store, "filter-session", sessions.SessionItem{
+		ID:         "tool-result",
+		Kind:       sessions.ItemKindMessage,
+		Visibility: sessions.ItemVisibilityVisible,
+		Audience:   sessions.ItemAudienceModel,
+		Message:    &model.Message{Role: model.MessageRoleTool, Content: "tool result secret", ToolCallID: "call-secret", IsError: true},
+	})
+
+	process := startSessionAPIServer(t, store, sessions.SessionV2{})
+	baseURL := "http://" + process.Addr()
+
+	chatRaw, chat := getRawJSON(t, baseURL+"/sessions/filter-session/items")
+	assertNoItemDTOLeak(t, chatRaw)
+	if got := responseItemIDs(t, chat); !reflect.DeepEqual(got, []string{"visible-user", "visible-assistant"}) {
+		t.Fatalf("chat item IDs = %#v, want visible chat-facing items only", got)
+	}
+	for _, forbidden := range []string{"compaction summary secret", "debug secret", "tool result secret", "SECRET-LARGE-TAIL", "SECRET TOOL ARGUMENTS"} {
+		if bytes.Contains(chatRaw, []byte(forbidden)) {
+			t.Fatalf("chat response leaked %q: %s", forbidden, chatRaw)
+		}
+	}
+	items := chat["items"].([]any)
+	userMessage := items[0].(map[string]any)["message"].(map[string]any)
+	userContent := userMessage["content"].(map[string]any)
+	if userContent["inline"] != "hello" {
+		t.Fatalf("small message content = %#v, want inline hello", userContent)
+	}
+	assistantMessage := items[1].(map[string]any)["message"].(map[string]any)
+	assistantContent := assistantMessage["content"].(map[string]any)
+	if _, ok := assistantContent["inline"]; ok {
+		t.Fatalf("large message content unexpectedly included inline: %#v", assistantContent)
+	}
+	if assistantContent["truncated"] != true || assistantContent["size_bytes"] != float64(len(largeContent)) {
+		t.Fatalf("large message content metadata = %#v, want truncated size", assistantContent)
+	}
+
+	debugRaw, debug := getRawJSON(t, baseURL+"/sessions/filter-session/items?view=debug&limit=20")
+	assertNoItemDTOLeak(t, debugRaw)
+	if got := responseItemIDs(t, debug); !reflect.DeepEqual(got, []string{"visible-user", "visible-assistant", "summary-1", "debug-item", "tool-result"}) {
+		t.Fatalf("debug item IDs = %#v, want all items", got)
+	}
+	for _, want := range []string{"compaction summary secret", "debug secret", "tool result secret"} {
+		if !bytes.Contains(debugRaw, []byte(want)) {
+			t.Fatalf("debug response missing %q: %s", want, debugRaw)
+		}
+	}
+	if bytes.Contains(debugRaw, []byte("SECRET TOOL ARGUMENTS")) {
+		t.Fatalf("debug response leaked tool call arguments: %s", debugRaw)
+	}
+}
+
+func TestSessionItemsBadQueryStructuredErrors(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "sessions")
+	store := sessions.NewV2Store(root)
+	saveServerTestSession(t, store, "bad-query-session")
+	process := startSessionAPIServer(t, store, sessions.SessionV2{})
+	baseURL := "http://" + process.Addr()
+
+	for _, tt := range []struct {
+		name  string
+		query string
+	}{
+		{name: "malformed before", query: "before_seq=abc"},
+		{name: "negative after", query: "after_seq=-1"},
+		{name: "malformed limit", query: "limit=abc"},
+		{name: "negative limit", query: "limit=-1"},
+		{name: "bad view", query: "view=all"},
+		{name: "both cursors", query: "before_seq=2&after_seq=1"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			resp, err := http.Get(baseURL + "/sessions/bad-query-session/items?" + tt.query)
+			if err != nil {
+				t.Fatalf("Get(items?%s) error = %v", tt.query, err)
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400", resp.StatusCode)
+			}
+			body := decodeJSON(t, resp)
+			if got := body["error"].(map[string]any)["code"]; got != "invalid_query" {
+				t.Fatalf("error = %#v, want invalid_query", body)
+			}
+		})
+	}
+}
+
+func TestSessionItemsMissingAndCorruptSessionErrors(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "sessions")
+	store := sessions.NewV2Store(root)
+	saveServerTestSession(t, store, "corrupt-session")
+	segmentsDir := filepath.Join(root, "corrupt-session", "segments")
+	if err := os.MkdirAll(segmentsDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll(segments) error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(segmentsDir, "000001.jsonl"), []byte(`{"seq":1,"type":"item.appended","item":`+"\n"), 0o600); err != nil {
+		t.Fatalf("WriteFile(corrupt segment) error = %v", err)
+	}
+	process := startSessionAPIServer(t, store, sessions.SessionV2{})
+	baseURL := "http://" + process.Addr()
+
+	resp, err := http.Get(baseURL + "/sessions/missing-session/items")
+	if err != nil {
+		t.Fatalf("Get(missing items) error = %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("missing items status = %d, want 404", resp.StatusCode)
+	}
+	body := decodeJSON(t, resp)
+	if got := body["error"].(map[string]any)["code"]; got != "session_not_found" {
+		t.Fatalf("missing items error = %#v, want session_not_found", body)
+	}
+
+	resp, err = http.Get(baseURL + "/sessions/corrupt-session/items")
+	if err != nil {
+		t.Fatalf("Get(corrupt items) error = %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("corrupt items status = %d, want 500", resp.StatusCode)
+	}
+	body = decodeJSON(t, resp)
+	if got := body["error"].(map[string]any)["code"]; got != "session_store_error" {
+		t.Fatalf("corrupt items error = %#v, want session_store_error", body)
 	}
 }
 
@@ -359,6 +618,90 @@ func assertNoSessionTimelineLeak(t *testing.T, raw []byte) {
 	} {
 		if bytes.Contains(raw, forbidden) {
 			t.Fatalf("metadata response leaked %s: %s", forbidden, raw)
+		}
+	}
+}
+
+func saveServerTestSession(t *testing.T, store *sessions.V2Store, id string) {
+	t.Helper()
+
+	if _, err := store.SaveMetadata(sessions.SessionV2{
+		ID:              id,
+		Provider:        "codex",
+		ModelProfile:    "default",
+		ModelID:         "gpt-5",
+		ModelParameters: map[string]any{"temperature": 0.2},
+		EnabledTools:    []string{"read_file"},
+		Context: contextwindow.Metadata{
+			ContextWindow: 128000,
+		},
+		SaveToolResults: true,
+	}); err != nil {
+		t.Fatalf("SaveMetadata(%s) error = %v", id, err)
+	}
+}
+
+func appendServerTestItem(t *testing.T, store *sessions.V2Store, sessionID string, item sessions.SessionItem) sessions.SessionItem {
+	t.Helper()
+
+	saved, err := store.AppendItem(sessionID, item)
+	if err != nil {
+		t.Fatalf("AppendItem(%s, %s) error = %v", sessionID, item.ID, err)
+	}
+	return saved
+}
+
+func responseItems(t *testing.T, body map[string]any) []any {
+	t.Helper()
+
+	items, ok := body["items"].([]any)
+	if !ok {
+		t.Fatalf("items = %T(%#v), want array", body["items"], body["items"])
+	}
+	return items
+}
+
+func responseItemSeqs(t *testing.T, body map[string]any) []int64 {
+	t.Helper()
+
+	items := responseItems(t, body)
+	seqs := make([]int64, 0, len(items))
+	for _, raw := range items {
+		item := raw.(map[string]any)
+		seqs = append(seqs, int64(item["seq"].(float64)))
+	}
+	return seqs
+}
+
+func responseItemIDs(t *testing.T, body map[string]any) []string {
+	t.Helper()
+
+	items := responseItems(t, body)
+	ids := make([]string, 0, len(items))
+	for _, raw := range items {
+		item := raw.(map[string]any)
+		ids = append(ids, item["id"].(string))
+	}
+	return ids
+}
+
+func assertNoItemDTOLeak(t *testing.T, raw []byte) {
+	t.Helper()
+
+	for _, forbidden := range [][]byte{
+		[]byte(`"active_history"`),
+		[]byte(`"compactions"`),
+		[]byte(`"context"`),
+		[]byte(`"cwd"`),
+		[]byte(`"enabled_tools"`),
+		[]byte(`"model_parameters"`),
+		[]byte(`"save_tool_results"`),
+		[]byte(`"tool_calls"`),
+		[]byte(`"tool_call_id"`),
+		[]byte(`"is_error"`),
+	} {
+		if bytes.Contains(raw, forbidden) {
+			t.Fatalf("item response leaked %s: %s", forbidden, raw)
 		}
 	}
 }

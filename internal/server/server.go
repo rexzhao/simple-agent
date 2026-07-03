@@ -21,6 +21,16 @@ import (
 
 const DefaultListenAddress = "127.0.0.1:0"
 
+const (
+	defaultSessionItemsLimit       = 50
+	maxSessionItemsLimit           = 200
+	sessionItemInlineMessageBytes  = 4 * 1024
+	sessionItemPreviewMessageBytes = 240
+
+	sessionItemsViewChat  = "chat"
+	sessionItemsViewDebug = "debug"
+)
+
 type Options struct {
 	CWD             string
 	ConfigPath      string
@@ -298,16 +308,33 @@ func (p *Process) handleSessions(w http.ResponseWriter, r *http.Request) {
 }
 
 func (p *Process) handleSessionPath(w http.ResponseWriter, r *http.Request) {
-	id := strings.TrimPrefix(r.URL.Path, "/sessions/")
-	if strings.TrimSpace(id) == "" || strings.Contains(id, "/") {
+	path := strings.TrimPrefix(r.URL.Path, "/sessions/")
+	if strings.TrimSpace(path) == "" {
 		writeError(w, http.StatusNotFound, "not_found", "path not found")
 		return
 	}
-	if r.Method != http.MethodGet {
-		writeMethodNotAllowed(w, http.MethodGet)
+	parts := strings.Split(path, "/")
+	id := parts[0]
+	if strings.TrimSpace(id) == "" {
+		writeError(w, http.StatusNotFound, "not_found", "path not found")
 		return
 	}
-	p.handleSessionDetail(w, r, id)
+	switch {
+	case len(parts) == 1:
+		if r.Method != http.MethodGet {
+			writeMethodNotAllowed(w, http.MethodGet)
+			return
+		}
+		p.handleSessionDetail(w, r, id)
+	case len(parts) == 2 && parts[1] == "items":
+		if r.Method != http.MethodGet {
+			writeMethodNotAllowed(w, http.MethodGet)
+			return
+		}
+		p.handleSessionItems(w, r, id)
+	default:
+		writeError(w, http.StatusNotFound, "not_found", "path not found")
+	}
 }
 
 func (p *Process) handleSessionsList(w http.ResponseWriter, r *http.Request) {
@@ -395,6 +422,44 @@ func (p *Process) handleSessionDetail(w http.ResponseWriter, r *http.Request, id
 	writeJSON(w, http.StatusOK, sessionDetailDTOFromSession(session, "idle"))
 }
 
+func (p *Process) handleSessionItems(w http.ResponseWriter, r *http.Request, id string) {
+	store := p.sessionStore
+	if store == nil {
+		writeError(w, http.StatusServiceUnavailable, "session_store_unavailable", "session store is not configured")
+		return
+	}
+	if !validSessionAPIID(id) {
+		writeError(w, http.StatusBadRequest, "invalid_session_id", "invalid session id")
+		return
+	}
+	query, err := parseSessionItemsQuery(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_query", err.Error())
+		return
+	}
+	session, err := store.Load(id)
+	if err != nil {
+		if errors.Is(err, sessions.ErrNotFound) {
+			writeError(w, http.StatusNotFound, "session_not_found", "session not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "session_store_error", "could not load session items")
+		return
+	}
+
+	filtered := filterSessionItemsForView(session.Items, query.View)
+	page, hasMoreBefore, hasMoreAfter := paginateSessionItems(filtered, query)
+	items := make([]sessionItemDTO, 0, len(page))
+	for _, item := range page {
+		items = append(items, sessionItemDTOFromSessionItem(item))
+	}
+	writeJSON(w, http.StatusOK, sessionItemsResponseDTO{
+		Items:         items,
+		HasMoreBefore: hasMoreBefore,
+		HasMoreAfter:  hasMoreAfter,
+	})
+}
+
 func (p *Process) snapshot() Info {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -443,6 +508,42 @@ type sessionDetailDTO struct {
 	SaveToolResults bool                   `json:"save_tool_results"`
 }
 
+type sessionItemsResponseDTO struct {
+	Items         []sessionItemDTO `json:"items"`
+	HasMoreBefore bool             `json:"has_more_before"`
+	HasMoreAfter  bool             `json:"has_more_after"`
+}
+
+type sessionItemDTO struct {
+	Seq        int64                  `json:"seq"`
+	ID         string                 `json:"id"`
+	TurnID     string                 `json:"turn_id,omitempty"`
+	CreatedAt  time.Time              `json:"created_at"`
+	Kind       string                 `json:"kind"`
+	Visibility string                 `json:"visibility"`
+	Audience   string                 `json:"audience"`
+	Message    *sessionItemMessageDTO `json:"message,omitempty"`
+}
+
+type sessionItemMessageDTO struct {
+	Role    model.MessageRole             `json:"role"`
+	Content *sessionItemMessageContentDTO `json:"content,omitempty"`
+}
+
+type sessionItemMessageContentDTO struct {
+	Inline    string `json:"inline,omitempty"`
+	Preview   string `json:"preview,omitempty"`
+	SizeBytes int    `json:"size_bytes,omitempty"`
+	Truncated bool   `json:"truncated,omitempty"`
+}
+
+type sessionItemsQuery struct {
+	BeforeSeq *int64
+	AfterSeq  *int64
+	Limit     int
+	View      string
+}
+
 func sessionDetailDTOFromSession(session sessions.SessionV2, status string) sessionDetailDTO {
 	return sessionDetailDTO{
 		ID:              session.ID,
@@ -463,6 +564,195 @@ func sessionDetailDTOFromSession(session sessions.SessionV2, status string) sess
 		Context:         session.Context,
 		SaveToolResults: session.SaveToolResults,
 	}
+}
+
+func parseSessionItemsQuery(r *http.Request) (sessionItemsQuery, error) {
+	values := r.URL.Query()
+	query := sessionItemsQuery{
+		Limit: defaultSessionItemsLimit,
+		View:  sessionItemsViewChat,
+	}
+	var err error
+	query.BeforeSeq, err = parseOptionalNonNegativeInt64Query(values, "before_seq")
+	if err != nil {
+		return sessionItemsQuery{}, err
+	}
+	query.AfterSeq, err = parseOptionalNonNegativeInt64Query(values, "after_seq")
+	if err != nil {
+		return sessionItemsQuery{}, err
+	}
+	if query.BeforeSeq != nil && query.AfterSeq != nil {
+		return sessionItemsQuery{}, fmt.Errorf("before_seq and after_seq are mutually exclusive")
+	}
+	if rawLimit, ok, err := singleQueryValue(values, "limit"); err != nil {
+		return sessionItemsQuery{}, err
+	} else if ok {
+		limit, err := strconv.Atoi(rawLimit)
+		if err != nil || limit <= 0 {
+			return sessionItemsQuery{}, fmt.Errorf("limit must be a positive integer")
+		}
+		if limit > maxSessionItemsLimit {
+			limit = maxSessionItemsLimit
+		}
+		query.Limit = limit
+	}
+	if rawView, ok, err := singleQueryValue(values, "view"); err != nil {
+		return sessionItemsQuery{}, err
+	} else if ok {
+		switch rawView {
+		case sessionItemsViewChat, sessionItemsViewDebug:
+			query.View = rawView
+		default:
+			return sessionItemsQuery{}, fmt.Errorf("view must be %q or %q", sessionItemsViewChat, sessionItemsViewDebug)
+		}
+	}
+	return query, nil
+}
+
+func parseOptionalNonNegativeInt64Query(values map[string][]string, name string) (*int64, error) {
+	raw, ok, err := singleQueryValue(values, name)
+	if err != nil || !ok {
+		return nil, err
+	}
+	value, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || value < 0 {
+		return nil, fmt.Errorf("%s must be a non-negative integer", name)
+	}
+	return &value, nil
+}
+
+func singleQueryValue(values map[string][]string, name string) (string, bool, error) {
+	rawValues, ok := values[name]
+	if !ok {
+		return "", false, nil
+	}
+	if len(rawValues) != 1 {
+		return "", true, fmt.Errorf("%s must be specified once", name)
+	}
+	raw := strings.TrimSpace(rawValues[0])
+	if raw == "" {
+		return "", true, fmt.Errorf("%s must not be empty", name)
+	}
+	return raw, true, nil
+}
+
+func filterSessionItemsForView(items []sessions.SessionItem, view string) []sessions.SessionItem {
+	filtered := make([]sessions.SessionItem, 0, len(items))
+	for _, item := range items {
+		if sessionItemVisibleInView(item, view) {
+			filtered = append(filtered, item)
+		}
+	}
+	return filtered
+}
+
+func sessionItemVisibleInView(item sessions.SessionItem, view string) bool {
+	if view == sessionItemsViewDebug {
+		return true
+	}
+	if item.Visibility != sessions.ItemVisibilityVisible {
+		return false
+	}
+	if item.Audience == sessions.ItemAudienceInternal {
+		return false
+	}
+	if item.Message != nil && item.Message.Role == model.MessageRoleTool {
+		return false
+	}
+	return item.Kind != sessions.ItemKindRuntimeContext
+}
+
+func paginateSessionItems(items []sessions.SessionItem, query sessionItemsQuery) ([]sessions.SessionItem, bool, bool) {
+	start := 0
+	end := len(items)
+	if query.AfterSeq != nil {
+		start = firstSessionItemIndexAfterSeq(items, *query.AfterSeq)
+		end = start + query.Limit
+		if end > len(items) {
+			end = len(items)
+		}
+	} else if query.BeforeSeq != nil {
+		end = firstSessionItemIndexAtOrAfterSeq(items, *query.BeforeSeq)
+		start = end - query.Limit
+		if start < 0 {
+			start = 0
+		}
+	} else if len(items) > query.Limit {
+		start = len(items) - query.Limit
+	}
+	return items[start:end], start > 0, end < len(items)
+}
+
+func firstSessionItemIndexAfterSeq(items []sessions.SessionItem, seq int64) int {
+	for i, item := range items {
+		if item.Seq > seq {
+			return i
+		}
+	}
+	return len(items)
+}
+
+func firstSessionItemIndexAtOrAfterSeq(items []sessions.SessionItem, seq int64) int {
+	for i, item := range items {
+		if item.Seq >= seq {
+			return i
+		}
+	}
+	return len(items)
+}
+
+func sessionItemDTOFromSessionItem(item sessions.SessionItem) sessionItemDTO {
+	dto := sessionItemDTO{
+		Seq:        item.Seq,
+		ID:         item.ID,
+		TurnID:     item.TurnID,
+		CreatedAt:  item.CreatedAt,
+		Kind:       item.Kind,
+		Visibility: item.Visibility,
+		Audience:   item.Audience,
+	}
+	if item.Message != nil {
+		dto.Message = &sessionItemMessageDTO{
+			Role: item.Message.Role,
+		}
+		if item.Message.Content != "" {
+			dto.Message.Content = sessionItemMessageContentDTOFromString(item.Message.Content)
+		}
+	}
+	return dto
+}
+
+func sessionItemMessageContentDTOFromString(content string) *sessionItemMessageContentDTO {
+	if len(content) <= sessionItemInlineMessageBytes {
+		return &sessionItemMessageContentDTO{
+			Inline: content,
+		}
+	}
+	return &sessionItemMessageContentDTO{
+		Preview:   truncateStringByBytes(content, sessionItemPreviewMessageBytes),
+		SizeBytes: len(content),
+		Truncated: true,
+	}
+}
+
+func truncateStringByBytes(value string, maxBytes int) string {
+	if maxBytes <= 0 {
+		return ""
+	}
+	if len(value) <= maxBytes {
+		return value
+	}
+	cut := 0
+	for i := range value {
+		if i > maxBytes {
+			break
+		}
+		cut = i
+	}
+	if cut == 0 {
+		return ""
+	}
+	return value[:cut]
 }
 
 func readEmptySessionCreateRequest(w http.ResponseWriter, r *http.Request) error {
