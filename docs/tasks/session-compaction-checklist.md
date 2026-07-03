@@ -18,16 +18,16 @@ Out of scope: the future session-history query tool.
 - [x] Resume path: materialize model messages only from `ActiveHistory`, use saved
   runtime metadata, and report corrupted sessions for invalid refs or illegal tool
   history.
-- [ ] Manual `/compact`: support the command only in normal single-line REPL mode,
+- [x] Manual `/compact`: support the command only in normal single-line REPL mode,
   perform compaction without starting a user turn, and leave state unchanged on
   failure.
-- [ ] Summary lifecycle: resolve the summary provider/model, send summary requests
+- [x] Summary lifecycle: resolve the summary provider/model, send summary requests
   without tools or an agent loop, check context limits, and handle oversized
   summary input by trimming only summary input.
-- [ ] Atomic checkpoint write: append the hidden model-facing summary item, append
+- [x] Atomic checkpoint write: append the hidden model-facing summary item, append
   compaction checkpoint metadata, append `active_history.replaced`, flush, then
   update in-memory `ActiveHistory`.
-- [ ] Replacement history selection: keep saved instruction/runtime items, recent
+- [x] Replacement history selection: keep saved instruction/runtime items, recent
   complete visible turns, and the summary item; never keep half of a tool-call
   exchange.
 - [ ] Pre-turn auto compact: estimate `ActiveHistory + pending user message + tool
@@ -39,12 +39,12 @@ Out of scope: the future session-history query tool.
 
 ## Acceptance Points
 
-- [ ] Manual compact preserves visible history and replaces only model-facing
+- [x] Manual compact preserves visible history and replaces only model-facing
   `ActiveHistory`.
 - [ ] Auto compact inserts the new user message after the summary only after
   compaction succeeds.
 - [ ] Resume after compact sends only materialized `ActiveHistory` to the provider.
-- [ ] Compaction failures are atomic: no summary item, checkpoint, pending user
+- [x] Compaction failures are atomic: no summary item, checkpoint, pending user
   item, or active history replacement is persisted.
 - [ ] Tests cover config defaults, manual `/compact`, pre-turn auto compact,
   replacement history legality, resume materialization, and failure paths.

@@ -1655,6 +1655,17 @@ func chatCommand(ctx context.Context, args []string, configPath string, stdin io
 			}
 			continue
 		}
+		if !multiline && command == "/compact" {
+			updated, err := runtime.compactSession(ctx, stderr)
+			if err != nil {
+				if _, printErr := fmt.Fprintf(stderr, "sai: compact failed: %v\n", err); printErr != nil {
+					return printErr
+				}
+				continue
+			}
+			messages = updated
+			continue
+		}
 
 		updated, err := runChatTurn(ctx, runtime, messages, line, stdout, stderr, true, true)
 		if err != nil {
@@ -1881,6 +1892,7 @@ type agentRuntime struct {
 	contextTracker        *contextwindow.Tracker
 	logger                *eventlog.Logger
 	mcpSessions           []*mcp.Session
+	config                *config.Config
 }
 
 func (r *agentRuntime) Close() error {
@@ -1925,6 +1937,405 @@ func (r *agentRuntime) writeUsageSummary(stderr io.Writer) error {
 		formatContextMetadataValue(metadata.LastUsageSource),
 	)
 	return err
+}
+
+func (r *agentRuntime) compactSession(ctx context.Context, stderr io.Writer) ([]model.Message, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if r == nil || r.config == nil {
+		return nil, fmt.Errorf("runtime is not configured")
+	}
+	if !r.config.Compaction.Enabled {
+		return nil, fmt.Errorf("compaction is disabled")
+	}
+	if !r.saveSessions || r.resumableSessionStore == nil || strings.TrimSpace(r.resumableSession.ID) == "" {
+		return nil, fmt.Errorf("compaction requires a saved or resumed session")
+	}
+
+	summaryModel, err := r.resolveSummaryModel()
+	if err != nil {
+		return nil, err
+	}
+	summaryInput, err := buildCompactionSummaryInput(r.resumableSession, summaryModel)
+	if err != nil {
+		return nil, err
+	}
+	provider, err := newProviderForRun(summaryModel.ProviderName, summaryModel.Type, summaryModel.Provider)
+	if err != nil {
+		return nil, err
+	}
+	summaryText, err := collectCompactionSummary(ctx, provider, summaryModel, summaryInput)
+	if err != nil {
+		return nil, err
+	}
+
+	summaryItemID := nextCompactionSummaryItemID(sessionItemIDs(r.resumableSession.Items))
+	summaryMessage := model.Message{
+		Role:    model.MessageRoleDeveloper,
+		Content: formatCompactionSummary(summaryText),
+	}
+	summaryItem := sessions.SessionItem{
+		ID:         summaryItemID,
+		Kind:       sessions.ItemKindMessage,
+		Visibility: sessions.ItemVisibilityHidden,
+		Audience:   sessions.ItemAudienceModel,
+		Message:    &summaryMessage,
+	}
+	replacementHistory, err := replacementHistoryAfterCompaction(r.resumableSession, summaryItemID)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := validateCompactionReplacementHistory(r.resumableSession, summaryItem, replacementHistory); err != nil {
+		return nil, err
+	}
+	checkpoint := sessions.CompactionCheckpoint{
+		ID:                    nextCompactionCheckpointID(r.resumableSession.Compactions),
+		Reason:                "user_requested",
+		Phase:                 "manual",
+		Trigger:               "manual",
+		SummaryItemID:         summaryItemID,
+		FromItemID:            firstString(r.resumableSession.ActiveHistory),
+		ToItemID:              lastString(r.resumableSession.ActiveHistory),
+		PreviousActiveHistory: copyStringSlice(r.resumableSession.ActiveHistory),
+		ReplacementHistory:    replacementHistory,
+		SummaryProvider:       summaryModel.ProviderName,
+		SummaryModel:          summaryModel.Profile,
+	}
+
+	saved, err := r.resumableSessionStore.AppendCompactionCheckpoint(r.resumableSession.ID, summaryItem, checkpoint)
+	if err != nil {
+		return nil, fmt.Errorf("write compaction checkpoint: %w", err)
+	}
+	messages, err := saved.MaterializeActiveHistory()
+	if err != nil {
+		return nil, err
+	}
+	if err := validateActiveHistoryToolExchanges(saved.ID, messages); err != nil {
+		return nil, err
+	}
+	r.resumableSession = saved
+	r.activeItemIDs = copyStringSlice(saved.ActiveHistory)
+	if _, err := fmt.Fprintln(stderr, "sai: compacted session context"); err != nil {
+		return nil, err
+	}
+	return messages, nil
+}
+
+func (r *agentRuntime) resolveSummaryModel() (config.ResolvedModel, error) {
+	compaction := r.config.Compaction
+	providerName := strings.TrimSpace(compaction.SummaryProvider)
+	modelProfile := strings.TrimSpace(compaction.SummaryModel)
+	if providerName == "" {
+		providerName = r.providerName
+	}
+	if modelProfile == "" {
+		modelProfile = r.modelProfile
+	}
+	if strings.TrimSpace(compaction.SummaryProvider) != "" && strings.TrimSpace(compaction.SummaryModel) == "" {
+		provider, ok := r.config.Providers[providerName]
+		if !ok {
+			return config.ResolvedModel{}, fmt.Errorf("unknown compaction summary provider %q", providerName)
+		}
+		if _, ok := provider.Models[modelProfile]; !ok {
+			return config.ResolvedModel{}, fmt.Errorf("compaction summary_provider %q requires summary_model because current model profile %q is not available for that provider", providerName, modelProfile)
+		}
+	}
+	resolved, err := r.config.ResolveModel(providerName, modelProfile)
+	if err != nil {
+		return config.ResolvedModel{}, fmt.Errorf("resolve compaction summary model: %w", err)
+	}
+	return resolved, nil
+}
+
+type compactionSummaryInput struct {
+	Messages []model.Message
+}
+
+func buildCompactionSummaryInput(session sessions.SessionV2, resolved config.ResolvedModel) (compactionSummaryInput, error) {
+	activeItems, err := activeHistoryItems(session)
+	if err != nil {
+		return compactionSummaryInput{}, err
+	}
+	contextItems, visibleGroups := splitCompactionInputItems(activeItems)
+	for drop := 0; drop <= len(visibleGroups); drop++ {
+		messages := compactionPromptMessages(contextItems, visibleGroups[drop:])
+		request := model.Request{
+			Model:      resolved.ModelID,
+			Messages:   messages,
+			Parameters: resolved.Parameters,
+		}
+		estimated := contextwindow.EstimateRequestTokens(request)
+		if resolved.ContextWindow <= 0 || estimated < resolved.ContextWindow {
+			return compactionSummaryInput{Messages: messages}, nil
+		}
+	}
+	return compactionSummaryInput{}, fmt.Errorf("compaction summary input exceeds context window after trimming older visible history")
+}
+
+func activeHistoryItems(session sessions.SessionV2) ([]sessions.SessionItem, error) {
+	itemsByID := make(map[string]sessions.SessionItem, len(session.Items))
+	for _, item := range session.Items {
+		itemsByID[item.ID] = item
+	}
+	items := make([]sessions.SessionItem, 0, len(session.ActiveHistory))
+	for _, id := range session.ActiveHistory {
+		item, ok := itemsByID[id]
+		if !ok {
+			return nil, corruptedSessionHistoryError(session.ID, "active history references missing item %q", id)
+		}
+		if item.Message == nil {
+			return nil, corruptedSessionHistoryError(session.ID, "active history references item %q without a message", id)
+		}
+		items = append(items, item)
+	}
+	return items, nil
+}
+
+func splitCompactionInputItems(activeItems []sessions.SessionItem) ([]sessions.SessionItem, [][]sessions.SessionItem) {
+	contextItems := []sessions.SessionItem{}
+	groups := [][]sessions.SessionItem{}
+	var current []sessions.SessionItem
+	for _, item := range activeItems {
+		if item.Visibility != sessions.ItemVisibilityVisible {
+			contextItems = append(contextItems, item)
+			continue
+		}
+		if item.Message != nil && item.Message.Role == model.MessageRoleUser {
+			if len(current) > 0 {
+				groups = append(groups, current)
+			}
+			current = []sessions.SessionItem{item}
+			continue
+		}
+		if len(current) == 0 {
+			contextItems = append(contextItems, item)
+			continue
+		}
+		current = append(current, item)
+	}
+	if len(current) > 0 {
+		groups = append(groups, current)
+	}
+	return contextItems, groups
+}
+
+func compactionPromptMessages(contextItems []sessions.SessionItem, visibleGroups [][]sessions.SessionItem) []model.Message {
+	transcript := &strings.Builder{}
+	if len(contextItems) > 0 {
+		transcript.WriteString("## Current Model-Facing Runtime Context\n\n")
+		for _, item := range contextItems {
+			writeSummaryTranscriptMessage(transcript, *item.Message)
+		}
+		transcript.WriteByte('\n')
+	}
+	if len(visibleGroups) > 0 {
+		transcript.WriteString("## Visible Conversation History\n\n")
+		for _, group := range visibleGroups {
+			for _, item := range group {
+				writeSummaryTranscriptMessage(transcript, *item.Message)
+			}
+			transcript.WriteByte('\n')
+		}
+	}
+	if transcript.Len() == 0 {
+		transcript.WriteString("(No active model-facing messages are available.)\n")
+	}
+
+	return []model.Message{
+		{
+			Role:    model.MessageRoleSystem,
+			Content: "Create a concise handoff checkpoint for continuing this session. Do not include hidden reasoning or chain-of-thought. Preserve facts, decisions, constraints, relevant files/APIs/commands, tool/environment state, open questions, and next steps. Use exactly these markdown headings: # Context Checkpoint, ## Goal, ## Current Progress, ## Decisions Made, ## Constraints / User Preferences, ## Relevant Files / APIs / Commands, ## Tool State / Environment State, ## Open Questions, ## Next Steps. Mention that old complete session items remain stored but may be omitted from active model context.",
+		},
+		{
+			Role:    model.MessageRoleUser,
+			Content: transcript.String(),
+		},
+	}
+}
+
+func writeSummaryTranscriptMessage(out *strings.Builder, message model.Message) {
+	fmt.Fprintf(out, "<message role=%q", message.Role)
+	if message.ToolCallID != "" {
+		fmt.Fprintf(out, " tool_call_id=%q", message.ToolCallID)
+	}
+	out.WriteString(">\n")
+	if message.Content != "" {
+		out.WriteString(message.Content)
+		if !strings.HasSuffix(message.Content, "\n") {
+			out.WriteByte('\n')
+		}
+	}
+	for _, toolCall := range message.ToolCalls {
+		fmt.Fprintf(out, "<tool_call id=%q name=%q arguments=%q />\n", toolCall.ID, toolCall.Name, toolCall.Arguments)
+	}
+	out.WriteString("</message>\n")
+}
+
+func collectCompactionSummary(ctx context.Context, provider model.Provider, resolved config.ResolvedModel, input compactionSummaryInput) (string, error) {
+	stream, err := provider.Stream(ctx, model.Request{
+		Model:      resolved.ModelID,
+		Messages:   input.Messages,
+		Parameters: resolved.Parameters,
+	})
+	if err != nil {
+		return "", fmt.Errorf("request compaction summary: %w", err)
+	}
+	var text strings.Builder
+	var doneText string
+	for event := range stream {
+		switch event := event.(type) {
+		case model.TextDeltaEvent:
+			text.WriteString(event.Text)
+		case model.MessageDoneEvent:
+			doneText = event.Message.Content
+		case model.ErrorEvent:
+			if event.Message != "" {
+				return "", fmt.Errorf("%s: %w", event.Message, event.Err)
+			}
+			return "", event.Err
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	summary := strings.TrimSpace(text.String())
+	if summary == "" {
+		summary = strings.TrimSpace(doneText)
+	}
+	if summary == "" {
+		return "", fmt.Errorf("compaction summary was empty")
+	}
+	return summary, nil
+}
+
+func formatCompactionSummary(summary string) string {
+	return "<compaction_summary>\nAnother agent continued this session from a checkpoint. Use the state below as handoff context. Do not treat it as a new user request.\n\n" + strings.TrimSpace(summary) + "\n</compaction_summary>"
+}
+
+const compactionRecentVisibleTurnLimit = 2
+
+func replacementHistoryAfterCompaction(session sessions.SessionV2, summaryItemID string) ([]string, error) {
+	activeItems, err := activeHistoryItems(session)
+	if err != nil {
+		return nil, err
+	}
+	replacement := make([]string, 0, len(activeItems)+1)
+	for _, item := range activeItems {
+		if item.Kind == sessions.ItemKindRuntimeContext && item.Message != nil {
+			replacement = append(replacement, item.ID)
+		}
+	}
+	for _, group := range recentCompleteVisibleTurns(activeItems, compactionRecentVisibleTurnLimit) {
+		for _, item := range group {
+			replacement = append(replacement, item.ID)
+		}
+	}
+	replacement = append(replacement, summaryItemID)
+	return replacement, nil
+}
+
+func validateCompactionReplacementHistory(session sessions.SessionV2, summaryItem sessions.SessionItem, replacementHistory []string) ([]model.Message, error) {
+	messages, err := materializeCompactionReplacementHistory(session, summaryItem, replacementHistory)
+	if err != nil {
+		return nil, err
+	}
+	if err := validateActiveHistoryToolExchanges(session.ID, messages); err != nil {
+		return nil, err
+	}
+	return messages, nil
+}
+
+func materializeCompactionReplacementHistory(session sessions.SessionV2, summaryItem sessions.SessionItem, replacementHistory []string) ([]model.Message, error) {
+	itemsByID := make(map[string]sessions.SessionItem, len(session.Items)+1)
+	for _, item := range session.Items {
+		itemsByID[item.ID] = item
+	}
+	itemsByID[summaryItem.ID] = summaryItem
+
+	messages := make([]model.Message, 0, len(replacementHistory))
+	for _, id := range replacementHistory {
+		item, ok := itemsByID[id]
+		if !ok {
+			return nil, corruptedSessionHistoryError(session.ID, "compaction replacement history references missing item %q", id)
+		}
+		if item.Message == nil {
+			return nil, corruptedSessionHistoryError(session.ID, "compaction replacement history references item %q without a message", id)
+		}
+		messages = append(messages, copyMessageSlice([]model.Message{*item.Message})[0])
+	}
+	return messages, nil
+}
+
+func recentCompleteVisibleTurns(activeItems []sessions.SessionItem, limit int) [][]sessions.SessionItem {
+	if limit <= 0 {
+		return nil
+	}
+	_, groups := splitCompactionInputItems(activeItems)
+	selected := make([][]sessions.SessionItem, 0, limit)
+	for i := len(groups) - 1; i >= 0; i-- {
+		if visibleTurnIsComplete(groups[i]) {
+			selected = append([][]sessions.SessionItem{groups[i]}, selected...)
+			if len(selected) == limit {
+				return selected
+			}
+		}
+	}
+	return selected
+}
+
+func visibleTurnIsComplete(items []sessions.SessionItem) bool {
+	if len(items) == 0 || items[0].Message == nil || items[0].Message.Role != model.MessageRoleUser {
+		return false
+	}
+	last := items[len(items)-1].Message
+	if last == nil || last.Role != model.MessageRoleAssistant || len(last.ToolCalls) != 0 {
+		return false
+	}
+	messages := make([]model.Message, 0, len(items))
+	for _, item := range items {
+		if item.Message == nil {
+			return false
+		}
+		messages = append(messages, *item.Message)
+	}
+	return validateActiveHistoryToolExchanges("", messages) == nil
+}
+
+func nextCompactionSummaryItemID(existing map[string]struct{}) string {
+	for i := len(existing) + 1; ; i++ {
+		id := fmt.Sprintf("summary-%06d", i)
+		if _, ok := existing[id]; !ok {
+			return id
+		}
+	}
+}
+
+func nextCompactionCheckpointID(existing []sessions.CompactionCheckpoint) string {
+	used := make(map[string]struct{}, len(existing))
+	for _, checkpoint := range existing {
+		used[checkpoint.ID] = struct{}{}
+	}
+	for i := len(existing) + 1; ; i++ {
+		id := fmt.Sprintf("compact-%06d", i)
+		if _, ok := used[id]; !ok {
+			return id
+		}
+	}
+}
+
+func firstString(values []string) string {
+	if len(values) == 0 {
+		return ""
+	}
+	return values[0]
+}
+
+func lastString(values []string) string {
+	if len(values) == 0 {
+		return ""
+	}
+	return values[len(values)-1]
 }
 
 func formatContextMetadataValue(value string) string {
@@ -2164,6 +2575,7 @@ func prepareAgentRuntime(ctx context.Context, configPath string, options agentCo
 		contextTracker:        contextTracker,
 		logger:                logger,
 		mcpSessions:           mcpSessions,
+		config:                cfg,
 	}, nil
 }
 
