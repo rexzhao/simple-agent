@@ -378,21 +378,22 @@
 - [x] subagent config 文件复用 main config 的 `sai` schema。
 - [ ] child agent 通过类似 main agent 的 runtime 准备路径启动。
 - [ ] self-referential 或环形 subagent config 有递归深度保护。
-- [ ] subagent runtime 有最大 job 数量、等待时间和取消保护。
+- [x] subagent runtime 有最大 job 数量、等待时间和取消保护。
 - [ ] 未配置 subagents 时不暴露任何 subagent tools。
 - [ ] 配置 subagents 后 parent agent 自动获得 subagent tools。
 - [x] parent prompt 注入已配置 subagent id 和短 description 列表。
 - [ ] child agent 使用自己的 provider、model、tools、skills、MCP 和 prompt。
 - [ ] child agent 不继承 parent tools。
-- [ ] subagent job 支持 `subagent_start`。
-- [ ] `subagent_start` 可选接受用户或模型提供的 display name / job name。
-- [ ] display name 是 job metadata，不影响配置的 subagent id、权限、config 或 tools 选择。
-- [ ] display name 不能选择未配置 agent 或改变 child config/tools。
-- [ ] subagent job 支持 send。
-- [ ] subagent job 支持 status。
+- [x] parent-facing subagent tool schemas 定义在 `internal/subagents`，尚未接入 CLI runtime。
+- [x] subagent job 支持 `subagent_start`。
+- [x] `subagent_start` 可选接受用户或模型提供的 display name / job name。
+- [x] display name 是 job metadata，不影响配置的 subagent id、权限、config 或 tools 选择。
+- [x] display name 不能选择未配置 agent 或改变 child config/tools。
+- [x] subagent job 支持 send。
+- [x] subagent job 支持 status。
 - [ ] status、mailbox 和 observability 输出包含 display name。
-- [ ] subagent job 支持 wait。
-- [ ] subagent job 支持 cancel。
+- [x] subagent job 支持 wait。
+- [x] subagent job 支持 cancel。
 - [ ] child job 运行时 parent 仍可继续接收用户输入。
 - [ ] child completion 通过 parent mailbox/runtime event 在 parent turn 后交付。
 - [ ] parent idle 时 child completion 可触发 auto wakeup。
