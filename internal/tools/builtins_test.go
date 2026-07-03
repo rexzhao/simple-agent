@@ -21,7 +21,7 @@ func TestRegisterBuiltinsRegistersExpectedTools(t *testing.T) {
 		t.Fatalf("RegisterBuiltins() error = %v", err)
 	}
 
-	for _, name := range []string{BuiltinListFiles, BuiltinReadFile, BuiltinWriteFile, BuiltinEditFile, BuiltinShell} {
+	for _, name := range []string{BuiltinListFiles, BuiltinReadFile, BuiltinGlobFiles, BuiltinGrepFiles, BuiltinWriteFile, BuiltinEditFile, BuiltinShell} {
 		entry, ok := registry.Lookup(name)
 		if !ok {
 			t.Fatalf("Lookup(%q) ok = false, want true", name)
@@ -82,6 +82,321 @@ func TestReadFileOutputsFileContent(t *testing.T) {
 	want := "hello\nworld\n"
 	if result.Name != BuiltinReadFile || result.Content != want || result.IsError {
 		t.Fatalf("Execute(read_file) result = %#v, want name %q content %q IsError false", result, BuiltinReadFile, want)
+	}
+}
+
+func TestReadFileLineRanges(t *testing.T) {
+	root := t.TempDir()
+	writeTestFile(t, filepath.Join(root, "notes.txt"), "one\ntwo\nthree\nfour\n")
+
+	registry := registerBuiltinsForTest(t, root)
+	result, err := registry.Execute(context.Background(), BuiltinReadFile, map[string]any{
+		"path":       "notes.txt",
+		"start_line": 2,
+		"line_count": 2,
+	})
+	if err != nil {
+		t.Fatalf("Execute(read_file range) error = %v", err)
+	}
+	for _, want := range []string{"path=notes.txt", "start_line=2", "lines_returned=2", "max_bytes=65536", "truncated=false", "\n\ntwo\nthree\n"} {
+		if !strings.Contains(result.Content, want) {
+			t.Fatalf("Execute(read_file range) content = %q, want contain %q", result.Content, want)
+		}
+	}
+
+	result, err = registry.Execute(context.Background(), BuiltinReadFile, map[string]any{
+		"path":       "notes.txt",
+		"start_line": 3,
+	})
+	if err != nil {
+		t.Fatalf("Execute(read_file start_line) error = %v", err)
+	}
+	for _, want := range []string{"path=notes.txt", "start_line=3", "lines_returned=2", "max_bytes=65536", "truncated=false", "\n\nthree\nfour\n"} {
+		if !strings.Contains(result.Content, want) {
+			t.Fatalf("Execute(read_file start_line) content = %q, want contain %q", result.Content, want)
+		}
+	}
+
+	result, err = registry.Execute(context.Background(), BuiltinReadFile, map[string]any{
+		"path":       "notes.txt",
+		"line_count": 1,
+	})
+	if err != nil {
+		t.Fatalf("Execute(read_file line_count) error = %v", err)
+	}
+	for _, want := range []string{"path=notes.txt", "start_line=1", "lines_returned=1", "max_bytes=65536", "truncated=false", "\n\none\n"} {
+		if !strings.Contains(result.Content, want) {
+			t.Fatalf("Execute(read_file line_count) content = %q, want contain %q", result.Content, want)
+		}
+	}
+}
+
+func TestReadFileMaxBytesTruncatesWithNextStep(t *testing.T) {
+	root := t.TempDir()
+	writeTestFile(t, filepath.Join(root, "notes.txt"), "one\ntwo\nthree\n")
+
+	registry := registerBuiltinsForTest(t, root)
+	result, err := registry.Execute(context.Background(), BuiltinReadFile, map[string]any{
+		"path":      "notes.txt",
+		"max_bytes": 8,
+	})
+	if err != nil {
+		t.Fatalf("Execute(read_file max_bytes) error = %v", err)
+	}
+	for _, want := range []string{"path=notes.txt", "start_line=1", "lines_returned=2", "truncated=true", "max_bytes=8", "next_start_line=3", "next_step=Continue reading with start_line=3.", "\n\none\ntwo\n"} {
+		if !strings.Contains(result.Content, want) {
+			t.Fatalf("Execute(read_file max_bytes) content = %q, want contain %q", result.Content, want)
+		}
+	}
+}
+
+func TestReadFileLongFirstLineMarksLineTruncated(t *testing.T) {
+	root := t.TempDir()
+	writeTestFile(t, filepath.Join(root, "long.txt"), "abcdefghij\nnext\n")
+
+	registry := registerBuiltinsForTest(t, root)
+	result, err := registry.Execute(context.Background(), BuiltinReadFile, map[string]any{
+		"path":       "long.txt",
+		"start_line": 1,
+		"max_bytes":  4,
+	})
+	if err != nil {
+		t.Fatalf("Execute(read_file long line) error = %v", err)
+	}
+	for _, want := range []string{"path=long.txt", "start_line=1", "lines_returned=1", "truncated=true", "line_truncated=true", "retry_from_line=1", "\n\nabcd"} {
+		if !strings.Contains(result.Content, want) {
+			t.Fatalf("Execute(read_file long line) content = %q, want contain %q", result.Content, want)
+		}
+	}
+}
+
+func TestReadFileRejectsBinaryContent(t *testing.T) {
+	root := t.TempDir()
+	writeTestFile(t, filepath.Join(root, "binary.bin"), "abc\x00def\n")
+
+	registry := registerBuiltinsForTest(t, root)
+	tests := []struct {
+		name string
+		args map[string]any
+	}{
+		{
+			name: "default",
+			args: map[string]any{"path": "binary.bin"},
+		},
+		{
+			name: "ranged",
+			args: map[string]any{"path": "binary.bin", "start_line": 1, "line_count": 1},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := registry.Execute(context.Background(), BuiltinReadFile, tt.args)
+			if err == nil {
+				t.Fatal("Execute(read_file binary) error = nil, want error")
+			}
+			if !strings.Contains(err.Error(), `read file "binary.bin": file appears to be binary`) {
+				t.Fatalf("Execute(read_file binary) error = %q, want binary file error", err)
+			}
+		})
+	}
+}
+
+func TestGlobFilesOutputsSortedWorkspaceRelativePaths(t *testing.T) {
+	root := t.TempDir()
+	writeTestFile(t, filepath.Join(root, "z.txt"), "z")
+	writeTestFile(t, filepath.Join(root, "a.txt"), "a")
+	mkdirTestDir(t, filepath.Join(root, "nested"))
+	writeTestFile(t, filepath.Join(root, "nested", "b.txt"), "b")
+	writeTestFile(t, filepath.Join(root, "nested", "ignore.md"), "ignore")
+
+	registry := registerBuiltinsForTest(t, root)
+	result, err := registry.Execute(context.Background(), BuiltinGlobFiles, map[string]any{
+		"pattern": "**/*.txt",
+	})
+	if err != nil {
+		t.Fatalf("Execute(glob_files) error = %v", err)
+	}
+	if got, want := result.Content, "a.txt\nnested/b.txt\nz.txt"; got != want {
+		t.Fatalf("Execute(glob_files) content = %q, want %q", got, want)
+	}
+}
+
+func TestGlobFilesHiddenHandlingAndIncludeDirs(t *testing.T) {
+	root := t.TempDir()
+	writeTestFile(t, filepath.Join(root, "visible.txt"), "visible")
+	writeTestFile(t, filepath.Join(root, ".hidden.txt"), "hidden")
+	mkdirTestDir(t, filepath.Join(root, "dir"))
+	mkdirTestDir(t, filepath.Join(root, ".hidden-dir"))
+	writeTestFile(t, filepath.Join(root, ".hidden-dir", "secret.txt"), "secret")
+
+	registry := registerBuiltinsForTest(t, root)
+	result, err := registry.Execute(context.Background(), BuiltinGlobFiles, map[string]any{
+		"pattern":      "**",
+		"include_dirs": true,
+	})
+	if err != nil {
+		t.Fatalf("Execute(glob_files hidden default) error = %v", err)
+	}
+	if strings.Contains(result.Content, ".hidden") {
+		t.Fatalf("Execute(glob_files hidden default) content = %q, want hidden paths omitted", result.Content)
+	}
+	for _, want := range []string{"dir", "visible.txt"} {
+		if !strings.Contains(result.Content, want) {
+			t.Fatalf("Execute(glob_files hidden default) content = %q, want contain %q", result.Content, want)
+		}
+	}
+
+	result, err = registry.Execute(context.Background(), BuiltinGlobFiles, map[string]any{
+		"pattern":        "**/*.txt",
+		"include_hidden": true,
+	})
+	if err != nil {
+		t.Fatalf("Execute(glob_files include_hidden) error = %v", err)
+	}
+	for _, want := range []string{".hidden-dir/secret.txt", ".hidden.txt", "visible.txt"} {
+		if !strings.Contains(result.Content, want) {
+			t.Fatalf("Execute(glob_files include_hidden) content = %q, want contain %q", result.Content, want)
+		}
+	}
+}
+
+func TestGlobFilesMaxResultsTruncates(t *testing.T) {
+	root := t.TempDir()
+	for _, name := range []string{"a.txt", "b.txt", "c.txt"} {
+		writeTestFile(t, filepath.Join(root, name), name)
+	}
+
+	registry := registerBuiltinsForTest(t, root)
+	result, err := registry.Execute(context.Background(), BuiltinGlobFiles, map[string]any{
+		"pattern":     "*.txt",
+		"max_results": 2,
+	})
+	if err != nil {
+		t.Fatalf("Execute(glob_files max_results) error = %v", err)
+	}
+	for _, want := range []string{"truncated=true", "max_results=2", "returned_results=2", "\n\na.txt\nb.txt"} {
+		if !strings.Contains(result.Content, want) {
+			t.Fatalf("Execute(glob_files max_results) content = %q, want contain %q", result.Content, want)
+		}
+	}
+	if strings.Contains(result.Content, "c.txt") {
+		t.Fatalf("Execute(glob_files max_results) content = %q, want c.txt omitted", result.Content)
+	}
+}
+
+func TestGlobFilesRejectsOutsideSearchPath(t *testing.T) {
+	root := t.TempDir()
+	outside := t.TempDir()
+	writeTestFile(t, filepath.Join(outside, "secret.txt"), "secret")
+
+	registry := registerBuiltinsForTest(t, root)
+	_, err := registry.Execute(context.Background(), BuiltinGlobFiles, map[string]any{
+		"path":    outside,
+		"pattern": "*.txt",
+	})
+	if err == nil {
+		t.Fatal("Execute(glob_files outside) error = nil, want error")
+	}
+	if !strings.Contains(err.Error(), "outside rootDir") {
+		t.Fatalf("Execute(glob_files outside) error = %q, want outside rootDir", err)
+	}
+}
+
+func TestGrepFilesRejectsOutsideSearchPath(t *testing.T) {
+	root := t.TempDir()
+	outside := t.TempDir()
+	writeTestFile(t, filepath.Join(outside, "secret.txt"), "secret")
+
+	registry := registerBuiltinsForTest(t, root)
+	_, err := registry.Execute(context.Background(), BuiltinGrepFiles, map[string]any{
+		"path":  outside,
+		"query": "secret",
+	})
+	if err == nil {
+		t.Fatal("Execute(grep_files outside) error = nil, want error")
+	}
+	if !strings.Contains(err.Error(), "outside rootDir") {
+		t.Fatalf("Execute(grep_files outside) error = %q, want outside rootDir", err)
+	}
+}
+
+func TestGrepFilesLiteralDefaultAndCaseSensitivity(t *testing.T) {
+	root := t.TempDir()
+	writeTestFile(t, filepath.Join(root, "notes.txt"), "Needle here\nneedle there\n")
+
+	registry := registerBuiltinsForTest(t, root)
+	result, err := registry.Execute(context.Background(), BuiltinGrepFiles, map[string]any{
+		"query": "needle",
+	})
+	if err != nil {
+		t.Fatalf("Execute(grep_files literal) error = %v", err)
+	}
+	if got, want := result.Content, "notes.txt:1:Needle here\nnotes.txt:2:needle there"; got != want {
+		t.Fatalf("Execute(grep_files literal) content = %q, want %q", got, want)
+	}
+
+	result, err = registry.Execute(context.Background(), BuiltinGrepFiles, map[string]any{
+		"query":          "needle",
+		"case_sensitive": true,
+	})
+	if err != nil {
+		t.Fatalf("Execute(grep_files case_sensitive) error = %v", err)
+	}
+	if got, want := result.Content, "notes.txt:2:needle there"; got != want {
+		t.Fatalf("Execute(grep_files case_sensitive) content = %q, want %q", got, want)
+	}
+}
+
+func TestGrepFilesRegexIncludeExcludeAndContext(t *testing.T) {
+	root := t.TempDir()
+	writeTestFile(t, filepath.Join(root, "a.txt"), "before\nabc123\nafter\n")
+	writeTestFile(t, filepath.Join(root, "skip.txt"), "abc999\n")
+	writeTestFile(t, filepath.Join(root, "b.log"), "abc456\n")
+
+	registry := registerBuiltinsForTest(t, root)
+	result, err := registry.Execute(context.Background(), BuiltinGrepFiles, map[string]any{
+		"query":          `abc\d+`,
+		"regex":          true,
+		"case_sensitive": true,
+		"include":        []any{"*.txt"},
+		"exclude":        []any{"skip.txt"},
+		"context_lines":  1,
+	})
+	if err != nil {
+		t.Fatalf("Execute(grep_files regex) error = %v", err)
+	}
+	if got, want := result.Content, "a.txt:1:before\na.txt:2:abc123\na.txt:3:after"; got != want {
+		t.Fatalf("Execute(grep_files regex) content = %q, want %q", got, want)
+	}
+}
+
+func TestGrepFilesResultAndSnippetTruncation(t *testing.T) {
+	root := t.TempDir()
+	writeTestFile(t, filepath.Join(root, "notes.txt"), "needle abcdefghij\nneedle second\n")
+
+	registry := registerBuiltinsForTest(t, root)
+	result, err := registry.Execute(context.Background(), BuiltinGrepFiles, map[string]any{
+		"query":             "needle",
+		"max_results":       1,
+		"max_snippet_bytes": 10,
+	})
+	if err != nil {
+		t.Fatalf("Execute(grep_files truncation) error = %v", err)
+	}
+	for _, want := range []string{
+		"truncated=true",
+		"max_results=1",
+		"returned_results=1",
+		"snippet_truncated=true",
+		"max_snippet_bytes=10",
+		"\n\nnotes.txt:1:needle abc",
+	} {
+		if !strings.Contains(result.Content, want) {
+			t.Fatalf("Execute(grep_files truncation) content = %q, want contain %q", result.Content, want)
+		}
+	}
+	if strings.Contains(result.Content, "second") {
+		t.Fatalf("Execute(grep_files truncation) content = %q, want second result omitted", result.Content)
 	}
 }
 
@@ -225,6 +540,47 @@ func TestShellNonZeroExitReturnsErrorResult(t *testing.T) {
 	}
 }
 
+func TestShellTimeoutMSReturnsErrorResult(t *testing.T) {
+	registry := registerBuiltinsForTest(t, t.TempDir())
+	start := time.Now()
+	result, err := registry.Execute(context.Background(), BuiltinShell, map[string]any{
+		"command":    sleepCommand(),
+		"timeout_ms": 100,
+	})
+	if err != nil {
+		t.Fatalf("Execute(shell timeout_ms) error = %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 3*time.Second {
+		t.Fatalf("Execute(shell timeout_ms) elapsed = %v, want under 3s", elapsed)
+	}
+	assertShellContextErrorResult(t, result, context.DeadlineExceeded.Error())
+	if !strings.Contains(strings.ToLower(result.Content), "timed out") {
+		t.Fatalf("Execute(shell timeout_ms) content = %q, want timed out", result.Content)
+	}
+}
+
+func TestShellMaxOutputBytesTruncatesOutput(t *testing.T) {
+	registry := registerBuiltinsForTest(t, t.TempDir())
+	result, err := registry.Execute(context.Background(), BuiltinShell, map[string]any{
+		"command":          printTextCommand("abcdef"),
+		"max_output_bytes": 3,
+	})
+	if err != nil {
+		t.Fatalf("Execute(shell max_output_bytes) error = %v", err)
+	}
+	if result.IsError {
+		t.Fatalf("Execute(shell max_output_bytes) IsError = true, content = %q", result.Content)
+	}
+	for _, want := range []string{"truncated=true", "max_output_bytes=3", "\n\nabc"} {
+		if !strings.Contains(result.Content, want) {
+			t.Fatalf("Execute(shell max_output_bytes) content = %q, want contain %q", result.Content, want)
+		}
+	}
+	if strings.Contains(result.Content, "def") {
+		t.Fatalf("Execute(shell max_output_bytes) content = %q, want output capped", result.Content)
+	}
+}
+
 func TestShellContextCancelReturnsErrorResult(t *testing.T) {
 	root := t.TempDir()
 	registry := registerBuiltinsForTest(t, root)
@@ -330,6 +686,60 @@ func TestBuiltinArgumentErrorsAreReadable(t *testing.T) {
 			wantErr: "path must be a string",
 		},
 		{
+			name:    "read file start line positive",
+			tool:    BuiltinReadFile,
+			args:    map[string]any{"path": "notes.txt", "start_line": 0},
+			wantErr: "start_line must be a positive integer",
+		},
+		{
+			name:    "read file line count positive",
+			tool:    BuiltinReadFile,
+			args:    map[string]any{"path": "notes.txt", "line_count": 0},
+			wantErr: "line_count must be a positive integer",
+		},
+		{
+			name:    "read file max bytes positive",
+			tool:    BuiltinReadFile,
+			args:    map[string]any{"path": "notes.txt", "max_bytes": 0},
+			wantErr: "max_bytes must be a positive integer",
+		},
+		{
+			name:    "glob files missing pattern",
+			tool:    BuiltinGlobFiles,
+			args:    map[string]any{},
+			wantErr: "pattern is required",
+		},
+		{
+			name:    "glob files max results positive",
+			tool:    BuiltinGlobFiles,
+			args:    map[string]any{"pattern": "*", "max_results": 0},
+			wantErr: "max_results must be a positive integer",
+		},
+		{
+			name:    "grep files missing query",
+			tool:    BuiltinGrepFiles,
+			args:    map[string]any{},
+			wantErr: "query is required",
+		},
+		{
+			name:    "grep files regex type",
+			tool:    BuiltinGrepFiles,
+			args:    map[string]any{"query": "needle", "regex": "false"},
+			wantErr: "regex must be a boolean",
+		},
+		{
+			name:    "grep files context non-negative",
+			tool:    BuiltinGrepFiles,
+			args:    map[string]any{"query": "needle", "context_lines": -1},
+			wantErr: "context_lines must be a non-negative integer",
+		},
+		{
+			name:    "grep files snippet bytes positive",
+			tool:    BuiltinGrepFiles,
+			args:    map[string]any{"query": "needle", "max_snippet_bytes": 0},
+			wantErr: "max_snippet_bytes must be a positive integer",
+		},
+		{
 			name:    "write file missing content",
 			tool:    BuiltinWriteFile,
 			args:    map[string]any{"path": "notes.txt"},
@@ -370,6 +780,18 @@ func TestBuiltinArgumentErrorsAreReadable(t *testing.T) {
 			tool:    BuiltinShell,
 			args:    map[string]any{"command": []string{"echo"}},
 			wantErr: "command must be a string",
+		},
+		{
+			name:    "shell timeout positive",
+			tool:    BuiltinShell,
+			args:    map[string]any{"command": "echo ok", "timeout_ms": 0},
+			wantErr: "timeout_ms must be a positive integer",
+		},
+		{
+			name:    "shell max output positive",
+			tool:    BuiltinShell,
+			args:    map[string]any{"command": "echo ok", "max_output_bytes": 0},
+			wantErr: "max_output_bytes must be a positive integer",
 		},
 	}
 
@@ -619,8 +1041,9 @@ func TestBuiltinDefinitionsHaveExpectedSchemas(t *testing.T) {
 	registry := registerBuiltinsForTest(t, t.TempDir())
 
 	tests := []struct {
-		name string
-		want map[string]any
+		name      string
+		want      map[string]any
+		wantProps []string
 	}{
 		{
 			name: BuiltinReadFile,
@@ -628,6 +1051,23 @@ func TestBuiltinDefinitionsHaveExpectedSchemas(t *testing.T) {
 				"type":     "object",
 				"required": []any{"path"},
 			},
+			wantProps: []string{"path", "start_line", "line_count", "max_bytes"},
+		},
+		{
+			name: BuiltinGlobFiles,
+			want: map[string]any{
+				"type":     "object",
+				"required": []any{"pattern"},
+			},
+			wantProps: []string{"path", "pattern", "include_dirs", "include_hidden", "max_results"},
+		},
+		{
+			name: BuiltinGrepFiles,
+			want: map[string]any{
+				"type":     "object",
+				"required": []any{"query"},
+			},
+			wantProps: []string{"path", "query", "include", "exclude", "regex", "case_sensitive", "context_lines", "max_results", "max_snippet_bytes"},
 		},
 		{
 			name: BuiltinShell,
@@ -635,6 +1075,7 @@ func TestBuiltinDefinitionsHaveExpectedSchemas(t *testing.T) {
 				"type":     "object",
 				"required": []any{"command"},
 			},
+			wantProps: []string{"command", "timeout_ms", "max_output_bytes"},
 		},
 		{
 			name: BuiltinWriteFile,
@@ -642,6 +1083,7 @@ func TestBuiltinDefinitionsHaveExpectedSchemas(t *testing.T) {
 				"type":     "object",
 				"required": []any{"path", "content"},
 			},
+			wantProps: []string{"path", "content"},
 		},
 		{
 			name: BuiltinEditFile,
@@ -649,6 +1091,7 @@ func TestBuiltinDefinitionsHaveExpectedSchemas(t *testing.T) {
 				"type":     "object",
 				"required": []any{"path", "old", "new"},
 			},
+			wantProps: []string{"path", "old", "new"},
 		},
 	}
 
@@ -661,6 +1104,15 @@ func TestBuiltinDefinitionsHaveExpectedSchemas(t *testing.T) {
 			for key, want := range tt.want {
 				if got := entry.Definition.InputSchema[key]; !reflect.DeepEqual(got, want) {
 					t.Fatalf("InputSchema[%q] = %#v, want %#v", key, got, want)
+				}
+			}
+			properties, ok := entry.Definition.InputSchema["properties"].(map[string]any)
+			if !ok {
+				t.Fatalf("InputSchema[properties] = %T, want map[string]any", entry.Definition.InputSchema["properties"])
+			}
+			for _, prop := range tt.wantProps {
+				if _, ok := properties[prop]; !ok {
+					t.Fatalf("InputSchema properties missing %q in %#v", prop, properties)
 				}
 			}
 		})
@@ -740,6 +1192,20 @@ func failingCommand() string {
 		return "Write-Output fail; exit 7"
 	}
 	return "printf fail; exit 7"
+}
+
+func sleepCommand() string {
+	if runtime.GOOS == "windows" {
+		return "Start-Sleep -Milliseconds 2000"
+	}
+	return "sleep 2"
+}
+
+func printTextCommand(text string) string {
+	if runtime.GOOS == "windows" {
+		return "[Console]::Out.Write('" + text + "')"
+	}
+	return "printf '" + text + "'"
 }
 
 func childProcessTreeCommand() string {

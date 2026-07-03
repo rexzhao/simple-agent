@@ -194,7 +194,7 @@ func TestToolsListWritesBuiltInToolsWithoutConfig(t *testing.T) {
 				}
 				return
 			}
-			if got, want := out, "list_files\nread_file\nwrite_file\nedit_file\nshell\n"; got != want {
+			if got, want := out, "list_files\nread_file\nglob_files\ngrep_files\nwrite_file\nedit_file\nshell\n"; got != want {
 				t.Fatalf("stdout = %q, want %q", got, want)
 			}
 		})
@@ -4003,6 +4003,27 @@ func TestRunUsesConfiguredEnabledTools(t *testing.T) {
 	assertCLIToolNames(t, (<-requests).Body, []string{"read_file", "write_file", "edit_file", "shell"})
 }
 
+func TestRunCanExposeDiscoveryTools(t *testing.T) {
+	server, requests := newCLIRunServer(t,
+		`{"choices":[{"delta":{"content":"ok"}}]}`,
+		`[DONE]`,
+	)
+	defer server.Close()
+
+	configDir := t.TempDir()
+	writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
+
+	var stdout, stderr bytes.Buffer
+	code := RunWithGetwd([]string{"--config-dir", configDir, "chat", "--quit", "--enable-tools", "glob_files,grep_files", "--prompt", "Use discovery tools"}, &stdout, &stderr, func() (string, error) {
+		return t.TempDir(), nil
+	})
+
+	if code != 0 {
+		t.Fatalf("RunWithGetwd() code = %d, stderr = %s", code, stderr.String())
+	}
+	assertCLIToolNames(t, (<-requests).Body, []string{"glob_files", "grep_files"})
+}
+
 func TestRunDoesNotExposeEditingToolsWhenOnlyNonEditingToolsAreEnabled(t *testing.T) {
 	server, requests := newCLIRunServer(t,
 		`{"choices":[{"delta":{"content":"ok"}}]}`,
@@ -4993,6 +5014,8 @@ func TestWriteStreamWritesToolStatusWithSafeDetailsOnly(t *testing.T) {
 		model.ToolCallDoneEvent{ToolCall: model.ToolCall{Name: "list_files", Arguments: " \n\t "}},
 		model.ToolCallDoneEvent{ToolCall: model.ToolCall{Name: "read_file", Arguments: `[`}},
 		model.ToolCallDoneEvent{ToolCall: model.ToolCall{Name: "list_files", Arguments: `null`}},
+		model.ToolCallDoneEvent{ToolCall: model.ToolCall{Name: "glob_files", Arguments: `{"pattern":"secret-*.txt"}`}},
+		model.ToolCallDoneEvent{ToolCall: model.ToolCall{Name: "grep_files", Arguments: `{"query":"secret-query"}`}},
 		model.ToolCallDoneEvent{ToolCall: model.ToolCall{Name: "write_file", Arguments: `{"path":"draft.txt","content":"secret-write-content"}`}},
 		model.ToolCallDoneEvent{ToolCall: model.ToolCall{Name: "edit_file", Arguments: `{"path":"draft.txt","old":"secret-old","new":"secret-new"}`}},
 		model.ToolCallDoneEvent{ToolCall: model.ToolCall{Name: "shell", Arguments: `{"command":"echo secret-command"}`}},
@@ -5008,10 +5031,10 @@ func TestWriteStreamWritesToolStatusWithSafeDetailsOnly(t *testing.T) {
 	if stdout.String() != "" {
 		t.Fatalf("stdout = %q, want empty", stdout.String())
 	}
-	if got, want := stderr.String(), "tool: read_file docs/checklist.md\ntool: list_files .\ntool: list_files .\ntool: list_files .\ntool: read_file\ntool: list_files\ntool: write_file draft.txt\ntool: edit_file draft.txt\ntool: shell\ntool: mcp.local.search\n"; got != want {
+	if got, want := stderr.String(), "tool: read_file docs/checklist.md\ntool: list_files .\ntool: list_files .\ntool: list_files .\ntool: read_file\ntool: list_files\ntool: glob_files\ntool: grep_files\ntool: write_file draft.txt\ntool: edit_file draft.txt\ntool: shell\ntool: mcp.local.search\n"; got != want {
 		t.Fatalf("stderr = %q, want %q", got, want)
 	}
-	assertCLIErrorOmits(t, stderr.String(), "secret-write-content", "secret-old", "secret-new", "secret-command", "secret-query", "secret result body", "wrote draft.txt", "edited draft.txt")
+	assertCLIErrorOmits(t, stderr.String(), "secret-*.txt", "secret-write-content", "secret-old", "secret-new", "secret-command", "secret-query", "secret result body", "wrote draft.txt", "edited draft.txt")
 }
 
 func TestWriteStreamPutsConsecutiveToolStatusesOnIndependentLinesAfterOutputAndPrompt(t *testing.T) {

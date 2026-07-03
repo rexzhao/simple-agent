@@ -571,9 +571,11 @@ agent 在大工作区内安全定位文本内容，同时不默认启用任何�
 - `max_bytes` 同时适用于默认读取和行范围读取。
 - 默认读取从文件开头开始，返回最多 `max_bytes` 字节。
 - 只提供 `start_line` 时，从该行读取到 `max_bytes` 或 EOF。
+- 只提供 `line_count` 时，从第 1 行开始最多返回指定行数。
 - 同时提供 `start_line` 和 `line_count` 时，最多返回指定行数，同时仍受 `max_bytes` 限制。
-- 因 `max_bytes` 导致内容不完整时，tool result 必须明确包含 `truncated=true`，并告诉
-  agent 下一步如何继续读取。
+- 行范围读取或因 `max_bytes` 导致内容不完整时，tool result 必须在正文前包含简短
+  metadata，至少包含 path、有效 `start_line`、`lines_returned`、`max_bytes` 和
+  `truncated=true/false`；截断时还必须告诉 agent 下一步如何继续读取。
 - 行范围读取应尽量返回完整行；如果单行超过 `max_bytes`，返回该行前缀并标记
   `line_truncated=true`，同时提示 agent 增大 `max_bytes` 并从同一行重试。
 - 小文件、非范围且未截断的完整读取可以继续返回原始文件内容，以保持兼容。

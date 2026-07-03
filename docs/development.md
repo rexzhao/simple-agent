@@ -641,6 +641,8 @@ assistant 历史里的 tool calls 会转换成 `function_call` input item，tool
 ```text
 list_files
 read_file
+glob_files
+grep_files
 write_file
 edit_file
 shell
@@ -657,6 +659,8 @@ tools:
   enabled:
     - list_files
     - read_file
+    - glob_files
+    - grep_files
     - write_file
     - edit_file
     - shell
@@ -676,15 +680,16 @@ M17 计划补齐本地工具易用性和发现能力，但不改变工具默认�
 启动目录工作区内的文本文件；它新增可选参数 `start_line`、`line_count` 和 `max_bytes`：
 `start_line` 是 1-based 行号，`line_count` 必须大于 0，`max_bytes` 必须大于 0。不提供
 byte offset / byte count 模式。默认读取从文件开头开始，并最多返回 `max_bytes` 字节。
-如果只提供 `start_line`，则从该行读取到 `max_bytes` 或 EOF；如果同时提供 `start_line`
-和 `line_count`，则最多返回指定行数，同时仍受 `max_bytes` 限制。`max_bytes` 同时适用于
-默认读取和行范围读取。
+如果只提供 `start_line`，则从该行读取到 `max_bytes` 或 EOF；如果只提供 `line_count`，
+则从第 1 行读取指定行数；如果同时提供 `start_line` 和 `line_count`，则最多返回指定行数，
+同时仍受 `max_bytes` 限制。`max_bytes` 同时适用于默认读取和行范围读取。
 
 `read_file` 的兼容边界是：小文件、非范围且未因 `max_bytes` 截断的读取，可以继续直接返回
-原始文件内容。只要结果因 `max_bytes` 不完整，tool result 必须明确包含 `truncated=true`，
-并告诉 agent 下一步应如何继续读取。行范围读取应尽量返回完整行；如果单行本身超过
-`max_bytes`，返回该行前缀并标记 `line_truncated=true`，同时提示 agent 增大
-`max_bytes` 并从同一行重试。
+原始文件内容。任何行范围读取，或任何因 `max_bytes` 不完整的读取，都必须在正文前添加
+简短 metadata，至少包含 path、有效 `start_line`、`lines_returned`、`max_bytes` 和
+`truncated=true/false`。截断时还必须告诉 agent 下一步应如何继续读取。行范围读取应尽量
+返回完整行；如果单行本身超过 `max_bytes`，返回该行前缀并标记 `line_truncated=true`，
+同时提示 agent 增大 `max_bytes` 并从同一行重试。
 
 M17 还会增加只在工作区内运行的发现/搜索工具：
 

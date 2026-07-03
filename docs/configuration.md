@@ -378,6 +378,8 @@ sai chat --quit --enable-mcp local --enable-tools mcp.local.some_tool --prompt "
 ```text
 list_files
 read_file
+glob_files
+grep_files
 write_file
 edit_file
 shell
@@ -397,6 +399,8 @@ tools:
   enabled:
     - list_files
     - read_file
+    - glob_files
+    - grep_files
     - write_file
     - edit_file
     - shell
@@ -428,12 +432,14 @@ M17 的本地工具易用性任务不新增工具启用配置字段；新增或�
 - `read_file` 继续只允许读取工作区内文本文件。它支持可选 `start_line`（1-based）、
   `line_count`（大于 0）和 `max_bytes`（大于 0），不支持 byte offset / byte count。
   `max_bytes` 同时限制默认全文件读取和行范围读取；默认读取从文件开头开始，最多返回
-  `max_bytes`。只提供 `start_line` 时，从该行读取到 `max_bytes` 或 EOF；同时提供
-  `start_line` 和 `line_count` 时，最多返回指定行数且仍受 `max_bytes` 限制。
-- `read_file` 因 `max_bytes` 返回不完整内容时，tool result 必须显式包含
-  `truncated=true` 和下一步读取建议。行范围读取尽量返回完整行；若单行超过 `max_bytes`，
-  返回该行前缀、标记 `line_truncated=true`，并提示增大 `max_bytes` 后从同一行重试。
-  小的、非范围且未截断的完整读取可以继续返回原始文件内容以保持兼容。
+  `max_bytes`。只提供 `start_line` 时，从该行读取到 `max_bytes` 或 EOF；只提供
+  `line_count` 时，从第 1 行读取指定行数；同时提供 `start_line` 和 `line_count` 时，
+  最多返回指定行数且仍受 `max_bytes` 限制。
+- `read_file` 对任何行范围读取，或任何因 `max_bytes` 返回不完整的读取，都必须在正文前
+  添加简短 metadata，至少包含 path、有效 `start_line`、`lines_returned`、`max_bytes` 和
+  `truncated=true/false`。截断时还必须包含下一步读取建议。行范围读取尽量返回完整行；
+  若单行超过 `max_bytes`，返回该行前缀、标记 `line_truncated=true`，并提示增大
+  `max_bytes` 后从同一行重试。小的、非范围且未截断的完整读取可以继续返回原始文件内容以保持兼容。
 - `glob_files` 在工作区内执行 glob，返回稳定相对路径，并用 `max_results` 与截断
   metadata 控制大结果集。
 - `grep_files` 在工作区内执行文本搜索，支持 include / exclude globs；默认 literal 搜索，

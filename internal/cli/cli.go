@@ -1509,6 +1509,8 @@ func builtInToolNames() []string {
 	return []string{
 		tools.BuiltinListFiles,
 		tools.BuiltinReadFile,
+		tools.BuiltinGlobFiles,
+		tools.BuiltinGrepFiles,
 		tools.BuiltinWriteFile,
 		tools.BuiltinEditFile,
 		tools.BuiltinShell,
