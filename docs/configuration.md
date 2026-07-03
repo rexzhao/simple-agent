@@ -50,6 +50,8 @@ AGENTS.md  # 省略 agent.instruction_files 时的兼容默认项目指令文件
   skills/
     my-skill/
       SKILL.md
+  subagents/
+    reviewer.yaml
   mcp/
     local.yaml
   logs/
@@ -69,6 +71,8 @@ provider、默认 model、provider 目录、工具启用和 agent 通用参数�
 `disable-model-invocation: true`。
 `mcp/*.yaml` 每个文件描述一个 MCP server；
 MCP 是 M4 后能力，不属于 MVP 必需配置。
+M19 规划中的 async subagents 可放在 `subagents/` 目录；该目录只是推荐组织方式，真正入口由
+根配置文件的 `subagents` 映射决定。
 
 根配置文件内的相对路径都基于该文件所在目录解析。对根配置文件来说，这包括
 `provider_dir`、`auth_dir`、`skill_dirs`、`mcp_dir`、`logging.path` 和
@@ -86,6 +90,10 @@ default_model: glm-5.2
 provider_dir: providers
 auth_dir: auth
 skill_dirs: [skills]
+
+# M19 规划，尚未实现
+subagents:
+  reviewer: subagents/reviewer.yaml
 
 agent:
   # 省略时等价于 ["$CWD/AGENTS.md"]
@@ -122,6 +130,9 @@ mcp_dir: mcp
   绝对路径保持不变。空列表 `[]` 表示不加载本地 skills。多个目录按配置顺序扫描，每个
   目录只发现其直接子目录中包含 `SKILL.md` 的本地 skills；目录内使用确定性 discovery
   顺序，跨目录保留配置顺序。重复 skill id 是配置错误。
+- `subagents`：M19 规划的 async subagent 配置映射，尚未实现。key 是 parent agent 可引用的
+  subagent id，value 是该 subagent 的 `sai` config 文件路径；相对路径基于写出该配置项的
+  父配置文件所在目录解析。字段缺失或为空时，不向 parent agent 暴露任何 subagent tools。
 - `mcp_dir`：MCP 配置文件目录。M4 后启用；相对路径基于根配置文件所在目录解析。
 - `agent.max_turns`：一次 agent loop 最多请求模型的轮数。
 - `agent.instruction_files`：项目指令文件列表；省略时等价于
@@ -380,6 +391,78 @@ sai 内置基础约束 > project instruction files > loaded skills > 当前用�
 
 多个 skill 使用 skill 目录顺序和目录内确定性 discovery 顺序注入。frontmatter 格式错误会让
 命令失败并指出对应 `SKILL.md`。
+
+## Async Subagents 配置（M19 规划）
+
+async subagent runtime 尚未实现；本节记录目标配置形态，避免实现阶段引入临时 schema。
+parent config 使用简单映射声明可用 subagents：
+
+```yaml
+subagents:
+  reviewer: subagents/reviewer.yaml
+  researcher: ../shared-agents/researcher.yaml
+```
+
+`reviewer`、`researcher` 是注入 parent prompt 并用于 subagent tools 的 id。右侧路径指向
+完整的 `sai` 配置文件；相对路径基于 parent config 文件所在目录解析，而不是启动目录。配置
+可以指向当前文件本身，也可以间接形成环，但 runtime 必须用最大递归深度、最大并发/累计 job
+数量、job timeout 和取消机制防止无限递归或资源耗尽。
+
+subagent config 文件使用和 main config 相同的 schema，例如：
+
+```yaml
+# subagents/reviewer.yaml
+default_provider: codex-work
+default_model: gpt-5.5
+provider_dir: ../providers
+auth_dir: ../auth
+skill_dirs: [reviewer-skills]
+
+agent:
+  description: Read-only reviewer for scoped code and docs changes.
+  max_turns: 6
+  stream: true
+
+tools:
+  enabled:
+    - read_file
+    - list_files
+
+prompt:
+  system_prompt: |
+    Review only the assigned scope and report findings first.
+```
+
+child agent 的 provider、model、tools、skills、MCP 和 prompt 都由 child config 决定，不继承
+parent 的工具列表。child config 中的相对路径继续基于 child config 文件所在目录解析。
+
+配置了 subagents 后，parent runtime 自动获得 subagent tools；未配置或配置为空时，不暴露
+任何 subagent tools。parent prompt 会注入已配置 subagent 的 id 和短 description。短
+description 计划来自 child config 的 `agent.description`；缺失时实现应使用空描述或清晰的
+默认描述，而不是读取 prompt 正文。
+
+`subagent_start` 还应允许调用方为单个 job 提供可选 display name / job name。这个名称是运行时
+metadata，不是配置选择器：配置的 subagent id 仍决定使用哪个 child config、权限和工具集合。
+display name 应出现在 status、mailbox 和 observability 输出中，并为未来 GUI label 提供友好
+名称；它不能选择未配置的 agent，也不能覆盖 child config、tools、skills、MCP 或 prompt。
+
+## Prompt 配置（规划）
+
+未来 config schema 可以增加 prompt 配置，用于 main agent 和 subagent：
+
+```yaml
+prompt:
+  system_prompt: |
+    Prefer concise answers and mention uncertainty.
+```
+
+`prompt.system_prompt` 是追加内容，不替换 `sai` 内置基础约束，也不能削弱工具、安全、日志或
+权限边界。prompt 注入顺序仍应保持内置约束优先；自定义 system prompt 只是在内置约束之后
+追加本 agent 的额外行为说明。
+
+placeholder 也属于未来 schema，但必须来自固定白名单，例如由实现明确允许的 agent id、cwd、
+config dir 或 subagent 列表等值。placeholder 不支持任意表达式求值、任意环境变量展开、文件
+读取或 shell 执行。
 
 ## MCP 配置（M4 后）
 

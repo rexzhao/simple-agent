@@ -660,3 +660,62 @@ developer message 注入在内置基础约束之后、loaded skills 之前；res
 - 若启用 resumable session，测试覆盖项目指令文件 snapshot 或可重建信息保留单文件来源。
 - `go test ./...` 通过。
 - `git diff --check` 通过。
+
+## M19：Async Subagent-as-Tool Runtime
+
+目标：在保持纯 CLI 和现有单 agent loop 稳定的前提下，把配置好的 child agents 作为 parent
+agent 的异步工具暴露出来。M19 只交付 async subagent runtime，不交付完整 multi-agent
+orchestration。
+
+交付物：
+
+- 根配置文件支持 `subagents` 映射，形态为 `id -> relative config file path`。
+- `subagents` 中的相对路径基于写出该配置项的父配置文件所在目录解析。
+- subagent config 文件使用和 main config 相同的 `sai` schema，并通过类似 main agent 的
+  runtime 准备路径启动。
+- subagent config 可以指向自身或形成环，但 runtime 必须有递归深度、job 数量、等待时间和
+  取消保护。
+- 未配置 subagents 时，不向 parent agent 暴露任何 subagent tools。
+- 配置 subagents 后，parent agent 自动获得 subagent tools，不需要把每个 subagent tool 再写进
+  `tools.enabled`。
+- parent prompt 注入已配置 subagent id 和短 description 列表。
+- child agent 的 provider、model、tools、skills、MCP 和 prompt 来自自己的 config，不继承
+  parent tools。
+- subagent job 语义覆盖 `subagent_start`、send、cancel、status 和 wait。
+- `subagent_start` 可选接受用户或模型提供的 display name / job name。
+- 配置的 subagent id 仍是权限、配置文件和 runtime 能力选择依据；display name 只是 job
+  metadata，不能选择未配置 agent 或改变 config/tools。
+- display name 出现在 status、mailbox 和 observability 输出中，并可用于未来 GUI label。
+- child job 异步运行时，parent 仍可继续接收用户输入并执行自己的 turns。
+- child completion 通过 parent mailbox/runtime event 投递，在 parent turn 结束后交付；parent
+  idle 时可自动 wake up 处理完成事件。
+- 预留 config schema 中的 `prompt.system_prompt` 和 placeholder 能力；自定义 system prompt
+  只能追加到内置约束之后，placeholder 必须来自固定白名单。
+
+后续项：
+
+- 从 async subagent runtime 演进到完整 multi-agent orchestration。
+- DAG/workflow 执行模型。
+- shared state / blackboard。
+- structured result protocol。
+- global budgets 和跨 agent 权限控制。
+- conflict arbitration。
+- observability。
+- persistence/resume。
+
+验证：
+
+- 配置测试覆盖 `subagents` 映射解析、相对路径基准、缺失/空配置时不暴露 subagent tools。
+- 配置测试覆盖 child config 使用同一 schema，并且 child 相对路径基于 child config 文件解析。
+- runtime 测试覆盖配置 subagents 后 parent 自动获得 subagent tools。
+- prompt composition 测试覆盖 parent prompt 注入 subagent id 和短 description。
+- runtime 测试覆盖 child 不继承 parent tools，而是使用自己的 tools/skills/MCP/prompt。
+- job 测试覆盖 `subagent_start`、send、status、wait、cancel 和错误状态。
+- job 测试覆盖 `subagent_start` 可选 display name、display name 不影响 subagent id/config
+  选择，以及不能借 display name 调用未配置 agent。
+- status、mailbox 和 observability 测试覆盖 display name 透出。
+- 并发/REPL 测试覆盖 child running 时 parent 仍能接收输入。
+- mailbox 测试覆盖 child completion 在 parent turn 后交付，以及 idle auto wakeup。
+- safeguard 测试覆盖 self-referential config、递归深度限制、job 数量限制和 wait timeout。
+- prompt 配置测试覆盖 custom system prompt 追加语义和 placeholder 白名单拒绝未知占位符。
+- `go test ./...` 和 `git diff --check` 通过。

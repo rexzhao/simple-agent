@@ -32,6 +32,8 @@
 - M16 为 Codex subscription auth 增加独立的 OAuth token 文件和 `openai-codex`
   model profile type；运行时复用 OpenAI Responses request / SSE / tool-call mapping，
   但用 provider 的 `auth_file` 读取和刷新 bearer token，而不是读取 `api_key`。
+- M19 规划 async subagent-as-tool runtime。它仍是纯 CLI 运行时能力，不等同于完整
+  multi-agent 编排；完整 DAG/workflow、共享状态和跨 agent 冲突处理属于更长期目标。
 - MCP 不属于 MVP 核心；后续接入时第一种传输只做 stdio。
 - 根配置文件默认是启动时当前工作目录下的 `.agents/${arg[0]}.yaml`，其中 `${arg[0]}`
   是可执行文件 basename；普通 `sai` 二进制默认读取 `.agents/sai.yaml`。也可以通过
@@ -106,6 +108,9 @@ internal/model/openai_responses
 internal/tools
   内置工具定义和执行
 
+internal/subagents
+  M17 后的 async subagent job runtime、mailbox/event delivery 和 parent-facing tools
+
 internal/mcp
   MCP stdio client 和 MCP tool adapter，MVP 后实现
 
@@ -149,6 +154,55 @@ CLI 默认只打印 `text_delta`。`reasoning_delta` 默认隐藏，后续通过
 7. 当模型没有继续请求 tool call，或达到 `max_turns` 时结束。
 
 v0.1 不需要并发执行 tool call。等真实场景需要时再加。
+
+## Async Subagent Runtime（M19 规划）
+
+M19 的目标是把 subagent 作为 parent agent 可调用的异步工具暴露出来，而不是一次性实现完整
+multi-agent orchestration。没有配置 subagents 时，不向 parent model 暴露任何 subagent
+tools；只要根配置文件配置了 subagents，parent runtime 就自动注册对应的 subagent tools。
+
+根配置中的 subagents 是 `id -> relative config file path` 的映射。路径相对写出该配置项的
+父配置文件所在目录解析；子 agent 配置文件使用和 main config 相同的 `sai` 配置 schema，不引入单独的
+subagent mini-schema。启动 child agent 时应尽量复用 main agent 的 runtime 准备路径：
+解析 child config、选择 provider/model、加载 child tools/skills/MCP/prompt，然后运行 child
+agent loop。
+
+child agent 的 provider、model、tools、skills、MCP 和 prompt 都来自自己的 config。它们不继承
+parent 的 tools，也不因为 parent 启用了某个 MCP 或本地工具就自动获得同样能力。parent prompt
+会注入一份已配置 subagent 列表，至少包含 subagent id 和短 description，帮助模型选择合适的
+child。
+
+配置允许一个 subagent 指回自己的 config，或间接形成环；这是配置表达能力，不代表运行时可以
+无限递归。runtime 必须在 job 数量、递归深度、单 job turn 数、等待时间和取消路径上有明确
+保护，避免 self-call 或环形 subagent 配置耗尽进程资源。
+
+parent-facing subagent tools 的语义需要覆盖：
+
+- `subagent_start`：启动一个异步 child job，并返回 job id。调用方可以可选提供有意义的
+  display name / job name。
+- send：向已存在的 child job 发送后续输入。
+- status：查询 job 是否 queued、running、completed、failed 或 canceled。
+- wait：等待 job 完成或超时，返回可被 parent 继续使用的结果摘要。
+- cancel：取消仍在运行或排队的 job。
+
+`subagent_start` 的 display name 是用户或模型提供的 job metadata，只用于状态展示、mailbox
+消息、observability 事件和未来 GUI label。配置的 subagent id 仍是权限、配置文件和 runtime
+能力选择的唯一依据；display name 不能选择未配置的 agent，也不能改变 child config、tools、
+skills、MCP 或 prompt。
+
+child job 运行期间，parent 仍可继续接收用户输入和执行自己的 turns。child completion 不应在
+parent streaming 中途强行插入；完成结果通过 parent mailbox/runtime event 投递，在 parent
+一轮结束后交付给 parent。若 parent idle，runtime 可以自动 wake up parent 处理 mailbox 中的
+完成事件。
+
+custom system prompt 和 placeholders 是后续 config schema 的一部分。自定义
+`prompt.system_prompt` 只能追加到 `sai` 内置基础约束之后，不能替换或削弱内置约束。placeholder
+必须来自固定白名单，不支持任意表达式、任意文件读取或任意环境变量展开。
+
+长期目标是从 async subagent runtime 演进到完整 multi-agent orchestration：DAG/workflow、
+shared state / blackboard、structured result protocol、global budgets、permissions、
+conflict arbitration、observability，以及 persistence/resume。M17 只为这些能力保留边界，
+不把它们作为首版 subagent-as-tool 的交付范围。
 
 ## CLI 形态
 
