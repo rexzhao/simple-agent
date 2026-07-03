@@ -13,8 +13,374 @@ import (
 	"testing"
 	"time"
 
+	"github.com/rexzhao/simple-agent/internal/contextwindow"
 	"github.com/rexzhao/simple-agent/internal/model"
 )
+
+func TestV2StoreSaveLoadMetadata(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "sessions")
+	clock := &fakeClock{current: time.Date(2026, 7, 3, 1, 2, 3, 0, time.UTC)}
+	store := newV2StoreWithClock(root, V2StoreOptions{}, clock.Now)
+
+	session := SessionV2{
+		ID:           "session-1",
+		Provider:     "paperhub",
+		ModelProfile: "glm-5.2-fast",
+		ModelID:      "glm-5.2",
+		ModelParameters: map[string]any{
+			"max_tokens":  2048,
+			"temperature": 0.2,
+		},
+		CWD:           `F:\work\simple-agent`,
+		ConfigPath:    filepath.Join(root, "..", "custom.yaml"),
+		EnabledTools:  []string{"read_file"},
+		EnabledMCP:    []string{"local"},
+		EnabledSkills: []string{"review"},
+		ShowReasoning: true,
+		InstructionsSnapshot: []model.Message{
+			{
+				Role:    model.MessageRoleDeveloper,
+				Content: "Follow project rules.",
+				ToolCalls: []model.ToolCall{
+					{ID: "call-1", Name: "ignored", Arguments: "{}"},
+				},
+			},
+		},
+		InstructionSources: []InstructionSource{
+			{Role: model.MessageRoleDeveloper, Source: "agents_md", Path: filepath.Join(`F:\work\simple-agent`, "AGENTS.md")},
+		},
+		Items: []SessionItem{
+			{ID: "stale-item", Kind: ItemKindMessage, Message: &model.Message{Role: model.MessageRoleUser, Content: "do not write to meta"}},
+		},
+		ActiveHistory: []string{"stale-item"},
+		Compactions: []CompactionCheckpoint{
+			{ID: "stale-compaction", SummaryItemID: "summary-1", ReplacementHistory: []string{"summary-1"}},
+		},
+		LastSeq: 99,
+		Context: contextwindow.Metadata{
+			ContextWindow:           128000,
+			ContextWindowSource:     string(contextwindow.WindowSourceConfigured),
+			WarningThresholdPercent: contextwindow.WarningThresholdPercent,
+			LastRequestTokens:       1000,
+			LastInputTokens:         900,
+			LastOutputTokens:        50,
+			LastTotalTokens:         950,
+			LastUsageSource:         string(contextwindow.UsageSourceProvider),
+		},
+		SaveToolResults: true,
+	}
+
+	saved, err := store.SaveMetadata(session)
+	if err != nil {
+		t.Fatalf("SaveMetadata() error = %v", err)
+	}
+	if saved.Version != VersionV2 {
+		t.Fatalf("Version = %d, want %d", saved.Version, VersionV2)
+	}
+	if !saved.CreatedAt.Equal(clock.current) {
+		t.Fatalf("CreatedAt = %s, want %s", saved.CreatedAt, clock.current)
+	}
+	if !saved.UpdatedAt.Equal(clock.current) {
+		t.Fatalf("UpdatedAt = %s, want %s", saved.UpdatedAt, clock.current)
+	}
+
+	metadataPath := filepath.Join(root, "session-1", "meta.json")
+	raw, err := os.ReadFile(metadataPath)
+	if err != nil {
+		t.Fatalf("ReadFile(meta.json) error = %v", err)
+	}
+	var metadata map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &metadata); err != nil {
+		t.Fatalf("Unmarshal(meta.json) error = %v", err)
+	}
+	for _, key := range []string{"items", "active_history", "compactions", "last_seq"} {
+		if _, ok := metadata[key]; ok {
+			t.Fatalf("meta.json contains %q; want metadata only: %s", key, raw)
+		}
+	}
+
+	loaded, err := store.Load("session-1")
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if loaded.ID != saved.ID || loaded.Provider != saved.Provider || loaded.ModelProfile != saved.ModelProfile || loaded.ModelID != saved.ModelID {
+		t.Fatalf("loaded model metadata = %#v, want saved metadata %#v", loaded, saved)
+	}
+	if loaded.CWD != saved.CWD || loaded.ConfigPath != saved.ConfigPath {
+		t.Fatalf("loaded paths = cwd %q config %q, want cwd %q config %q", loaded.CWD, loaded.ConfigPath, saved.CWD, saved.ConfigPath)
+	}
+	if loaded.RootConfigPath() != saved.ConfigPath {
+		t.Fatalf("RootConfigPath() = %q, want %q", loaded.RootConfigPath(), saved.ConfigPath)
+	}
+	if !reflect.DeepEqual(loaded.EnabledTools, saved.EnabledTools) {
+		t.Fatalf("EnabledTools = %#v, want %#v", loaded.EnabledTools, saved.EnabledTools)
+	}
+	if !reflect.DeepEqual(loaded.EnabledMCP, saved.EnabledMCP) {
+		t.Fatalf("EnabledMCP = %#v, want %#v", loaded.EnabledMCP, saved.EnabledMCP)
+	}
+	if !reflect.DeepEqual(loaded.EnabledSkills, saved.EnabledSkills) {
+		t.Fatalf("EnabledSkills = %#v, want %#v", loaded.EnabledSkills, saved.EnabledSkills)
+	}
+	if !loaded.ShowReasoning {
+		t.Fatal("ShowReasoning = false, want true")
+	}
+	if !reflect.DeepEqual(loaded.InstructionsSnapshot, saved.InstructionsSnapshot) {
+		t.Fatalf("InstructionsSnapshot = %#v, want %#v", loaded.InstructionsSnapshot, saved.InstructionsSnapshot)
+	}
+	if !reflect.DeepEqual(loaded.InstructionSources, saved.InstructionSources) {
+		t.Fatalf("InstructionSources = %#v, want %#v", loaded.InstructionSources, saved.InstructionSources)
+	}
+	if !reflect.DeepEqual(loaded.Context, saved.Context) {
+		t.Fatalf("Context = %#v, want %#v", loaded.Context, saved.Context)
+	}
+	if !loaded.SaveToolResults {
+		t.Fatal("SaveToolResults = false, want true")
+	}
+	if got := loaded.ModelParameters["max_tokens"]; jsonNumberString(got) != "2048" {
+		t.Fatalf("max_tokens = %#v, want 2048", got)
+	}
+	if len(loaded.Items) != 0 || len(loaded.ActiveHistory) != 0 || len(loaded.Compactions) != 0 || loaded.LastSeq != 0 {
+		t.Fatalf("loaded replay state = items %#v active %#v compactions %#v last_seq %d, want empty replay state", loaded.Items, loaded.ActiveHistory, loaded.Compactions, loaded.LastSeq)
+	}
+}
+
+func TestV2StoreLoadCombinesMetadataWithReplayedState(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "sessions")
+	clock := &fakeClock{current: time.Date(2026, 7, 3, 1, 2, 3, 0, time.UTC)}
+	store := newV2StoreWithClock(root, V2StoreOptions{}, clock.Now)
+
+	if _, err := store.SaveMetadata(SessionV2{
+		ID:            "session-1",
+		Provider:      "paperhub",
+		ModelProfile:  "glm-5.2-fast",
+		ModelID:       "glm-5.2",
+		Items:         []SessionItem{{ID: "stale-item"}},
+		ActiveHistory: []string{"stale-item"},
+		Compactions:   []CompactionCheckpoint{{ID: "stale-compaction"}},
+		LastSeq:       99,
+	}); err != nil {
+		t.Fatalf("SaveMetadata() error = %v", err)
+	}
+
+	appendTestItem(t, store, "session-1", "item-1", "one")
+	appendTestItem(t, store, "session-1", "item-2", "two")
+	if _, err := store.ReplaceActiveHistory("session-1", []string{"item-2"}); err != nil {
+		t.Fatalf("ReplaceActiveHistory() error = %v", err)
+	}
+	checkpoint, err := store.AppendCompaction("session-1", CompactionCheckpoint{
+		ID:                 "compact-1",
+		Reason:             "user_requested",
+		Phase:              "manual",
+		Trigger:            "manual",
+		SummaryItemID:      "summary-1",
+		ReplacementHistory: []string{"item-2"},
+	})
+	if err != nil {
+		t.Fatalf("AppendCompaction() error = %v", err)
+	}
+
+	loaded, err := store.Load("session-1")
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if loaded.Provider != "paperhub" || loaded.ModelID != "glm-5.2" {
+		t.Fatalf("loaded metadata provider/model = %q/%q, want paperhub/glm-5.2", loaded.Provider, loaded.ModelID)
+	}
+	if got := itemIDs(loaded.Items); !reflect.DeepEqual(got, []string{"item-1", "item-2"}) {
+		t.Fatalf("loaded item IDs = %#v, want replayed items", got)
+	}
+	if !reflect.DeepEqual(loaded.ActiveHistory, []string{"item-2"}) {
+		t.Fatalf("ActiveHistory = %#v, want replayed active history", loaded.ActiveHistory)
+	}
+	if !reflect.DeepEqual(loaded.Compactions, []CompactionCheckpoint{checkpoint}) {
+		t.Fatalf("Compactions = %#v, want %#v", loaded.Compactions, []CompactionCheckpoint{checkpoint})
+	}
+	if loaded.LastSeq != 4 {
+		t.Fatalf("LastSeq = %d, want 4", loaded.LastSeq)
+	}
+
+	messages, err := loaded.MaterializeActiveHistory()
+	if err != nil {
+		t.Fatalf("MaterializeActiveHistory() error = %v", err)
+	}
+	if got := messageContents(messages); !reflect.DeepEqual(got, []string{"two"}) {
+		t.Fatalf("active messages = %#v, want item-2 content only", got)
+	}
+}
+
+func TestV2StoreListLatestAndDeletePreservesBlobs(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "sessions")
+	clock := &fakeClock{current: time.Date(2026, 7, 3, 1, 2, 3, 0, time.UTC)}
+	store := newV2StoreWithClock(root, V2StoreOptions{}, clock.Now)
+
+	blob, err := store.WriteBlob([]byte("shared tool result"), "utf-8", "text/plain")
+	if err != nil {
+		t.Fatalf("WriteBlob() error = %v", err)
+	}
+	if _, err := store.SaveMetadata(SessionV2{ID: "older", Provider: "paperhub", ModelProfile: "glm-5.2", ModelID: "glm-5.2"}); err != nil {
+		t.Fatalf("SaveMetadata(older) error = %v", err)
+	}
+	clock.current = clock.current.Add(time.Minute)
+	if _, err := store.SaveMetadata(SessionV2{ID: "newer", Provider: "openai", ModelProfile: "default", ModelID: "gpt-5.1"}); err != nil {
+		t.Fatalf("SaveMetadata(newer) error = %v", err)
+	}
+	appendTestItem(t, store, "segments-only", "item-1", "not listable without metadata")
+
+	infos, err := store.List()
+	if err != nil {
+		t.Fatalf("List() error = %v", err)
+	}
+	if got, want := len(infos), 2; got != want {
+		t.Fatalf("len(List()) = %d, want %d: %#v", got, want, infos)
+	}
+	if infos[0].ID != "newer" || infos[1].ID != "older" {
+		t.Fatalf("List() order = %#v, want newest first", infos)
+	}
+
+	latest, err := store.Latest()
+	if err != nil {
+		t.Fatalf("Latest() error = %v", err)
+	}
+	if latest.ID != "newer" {
+		t.Fatalf("Latest().ID = %q, want newer", latest.ID)
+	}
+
+	if err := store.Delete("newer"); err != nil {
+		t.Fatalf("Delete(newer) error = %v", err)
+	}
+	if _, err := store.Load("newer"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("Load(deleted) error = %v, want ErrNotFound", err)
+	}
+	if _, err := store.ReadBlob(blob); err != nil {
+		t.Fatalf("ReadBlob() after Delete(newer) error = %v, want blob preserved", err)
+	}
+	latest, err = store.Latest()
+	if err != nil {
+		t.Fatalf("Latest() after delete error = %v", err)
+	}
+	if latest.ID != "older" {
+		t.Fatalf("Latest().ID after delete = %q, want older", latest.ID)
+	}
+}
+
+func TestV2StoreLoadMissingMetadataReturnsNotFound(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "sessions")
+	store := NewV2Store(root)
+
+	appendTestItem(t, store, "session-1", "item-1", "segment without metadata")
+
+	if _, err := store.Load("session-1"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("Load() error = %v, want ErrNotFound", err)
+	}
+}
+
+func TestV2StoreRejectsReservedBlobsSessionIDAndPreservesBlobStore(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "sessions")
+	store := NewV2Store(root)
+
+	blob, err := store.WriteBlob([]byte("shared tool result"), "utf-8", "text/plain")
+	if err != nil {
+		t.Fatalf("WriteBlob() error = %v", err)
+	}
+
+	reservedIDs := []string{
+		v2BlobsDirName,
+		strings.ToUpper(v2BlobsDirName),
+		v2BlobsDirName + ".",
+		strings.ToUpper(v2BlobsDirName) + ".",
+		v2BlobsDirName + "..",
+	}
+	operations := []struct {
+		name string
+		run  func(string) error
+	}{
+		{
+			name: "SaveMetadata",
+			run: func(id string) error {
+				_, err := store.SaveMetadata(SessionV2{ID: id})
+				return err
+			},
+		},
+		{
+			name: "Load",
+			run: func(id string) error {
+				_, err := store.Load(id)
+				return err
+			},
+		},
+		{
+			name: "Replay",
+			run: func(id string) error {
+				_, err := store.Replay(id)
+				return err
+			},
+		},
+		{
+			name: "AppendItem",
+			run: func(id string) error {
+				_, err := store.AppendItem(id, SessionItem{
+					ID:         "item-1",
+					Kind:       ItemKindMessage,
+					Visibility: ItemVisibilityVisible,
+					Audience:   ItemAudienceUser,
+					Message:    &model.Message{Role: model.MessageRoleUser, Content: "blocked"},
+				})
+				return err
+			},
+		},
+		{
+			name: "ReplaceActiveHistory",
+			run: func(id string) error {
+				_, err := store.ReplaceActiveHistory(id, []string{"item-1"})
+				return err
+			},
+		},
+		{
+			name: "AppendCompaction",
+			run: func(id string) error {
+				_, err := store.AppendCompaction(id, CompactionCheckpoint{
+					ID:                 "compact-1",
+					SummaryItemID:      "summary-1",
+					ReplacementHistory: []string{"summary-1"},
+				})
+				return err
+			},
+		},
+		{
+			name: "Delete",
+			run: func(id string) error {
+				return store.Delete(id)
+			},
+		},
+	}
+	for _, id := range reservedIDs {
+		for _, operation := range operations {
+			t.Run(operation.name+"/"+id, func(t *testing.T) {
+				requireReservedV2SessionIDError(t, operation.run(id))
+			})
+		}
+	}
+
+	for _, id := range reservedIDs {
+		if _, err := os.Stat(filepath.Join(root, id, "meta.json")); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("reserved namespace %q meta.json stat error = %v, want not exist", id, err)
+		}
+		if _, err := os.Stat(filepath.Join(root, id, "segments")); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("reserved namespace %q segments stat error = %v, want not exist", id, err)
+		}
+	}
+	if _, err := store.ReadBlob(blob); err != nil {
+		t.Fatalf("ReadBlob() after reserved id operations error = %v", err)
+	}
+
+	anotherBlob, err := store.WriteBlob([]byte("another shared tool result"), "utf-8", "text/plain")
+	if err != nil {
+		t.Fatalf("WriteBlob(second) error = %v", err)
+	}
+	if _, err := store.ReadBlob(anotherBlob); err != nil {
+		t.Fatalf("ReadBlob(second) error = %v", err)
+	}
+}
 
 func TestV2StoreAppendItemsReplayBySeq(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "sessions")
@@ -353,6 +719,33 @@ func appendTestItem(t *testing.T, store *V2Store, sessionID, itemID, content str
 		Message:    &model.Message{Role: model.MessageRoleUser, Content: content},
 	}); err != nil {
 		t.Fatalf("AppendItem(%q) error = %v", itemID, err)
+	}
+}
+
+func itemIDs(items []SessionItem) []string {
+	ids := make([]string, 0, len(items))
+	for _, item := range items {
+		ids = append(ids, item.ID)
+	}
+	return ids
+}
+
+func messageContents(messages []model.Message) []string {
+	contents := make([]string, 0, len(messages))
+	for _, message := range messages {
+		contents = append(contents, message.Content)
+	}
+	return contents
+}
+
+func requireReservedV2SessionIDError(t *testing.T, err error) {
+	t.Helper()
+
+	if err == nil {
+		t.Fatal("error = nil, want reserved v2 session id error")
+	}
+	if !strings.Contains(err.Error(), "reserved v2 session id") {
+		t.Fatalf("error = %q, want reserved v2 session id detail", err)
 	}
 }
 

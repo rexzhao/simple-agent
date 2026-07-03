@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/rexzhao/simple-agent/internal/contextwindow"
 	"github.com/rexzhao/simple-agent/internal/model"
 )
 
@@ -40,6 +41,7 @@ const (
 const (
 	defaultV2MaxSegmentLines = 1000
 	maxJSONLRecordBytes      = 16 * 1024 * 1024
+	v2BlobsDirName           = "blobs"
 )
 
 var ErrCorruptedSession = errors.New("corrupted session")
@@ -84,12 +86,39 @@ type BlobRef struct {
 }
 
 type SessionV2 struct {
-	ID            string                 `json:"id"`
-	Version       int                    `json:"version"`
-	Items         []SessionItem          `json:"items,omitempty"`
-	ActiveHistory []string               `json:"active_history,omitempty"`
-	Compactions   []CompactionCheckpoint `json:"compactions,omitempty"`
-	LastSeq       int64                  `json:"last_seq,omitempty"`
+	ID                   string                 `json:"id"`
+	Version              int                    `json:"version"`
+	CreatedAt            time.Time              `json:"created_at"`
+	UpdatedAt            time.Time              `json:"updated_at"`
+	Provider             string                 `json:"provider"`
+	ModelProfile         string                 `json:"model_profile"`
+	ModelID              string                 `json:"model_id"`
+	ModelParameters      map[string]any         `json:"model_parameters,omitempty"`
+	CWD                  string                 `json:"cwd"`
+	ConfigPath           string                 `json:"config_path,omitempty"`
+	ConfigDir            string                 `json:"config_dir,omitempty"`
+	EnabledTools         []string               `json:"enabled_tools,omitempty"`
+	EnabledMCP           []string               `json:"enabled_mcp,omitempty"`
+	EnabledSkills        []string               `json:"enabled_skills,omitempty"`
+	ShowReasoning        bool                   `json:"show_reasoning"`
+	InstructionsSnapshot []model.Message        `json:"instructions_snapshot,omitempty"`
+	InstructionSources   []InstructionSource    `json:"instruction_sources,omitempty"`
+	Items                []SessionItem          `json:"items,omitempty"`
+	ActiveHistory        []string               `json:"active_history,omitempty"`
+	Compactions          []CompactionCheckpoint `json:"compactions,omitempty"`
+	LastSeq              int64                  `json:"last_seq,omitempty"`
+	Context              contextwindow.Metadata `json:"context,omitempty"`
+	SaveToolResults      bool                   `json:"save_tool_results"`
+}
+
+func (s SessionV2) RootConfigPath() string {
+	if strings.TrimSpace(s.ConfigPath) != "" {
+		return s.ConfigPath
+	}
+	if strings.TrimSpace(s.ConfigDir) != "" {
+		return filepath.Join(s.ConfigDir, "sai.yaml")
+	}
+	return ""
 }
 
 func (s SessionV2) MaterializeActiveHistory() ([]model.Message, error) {
@@ -153,6 +182,146 @@ func newV2StoreWithClock(root string, options V2StoreOptions, now func() time.Ti
 	}
 }
 
+func (s *V2Store) SaveMetadata(session SessionV2) (SessionV2, error) {
+	if err := s.requireRoot(); err != nil {
+		return SessionV2{}, err
+	}
+
+	now := s.now().UTC()
+	if strings.TrimSpace(session.ID) == "" {
+		id, err := newSessionID(now)
+		if err != nil {
+			return SessionV2{}, err
+		}
+		session.ID = id
+	}
+	if err := validateV2SessionID(session.ID); err != nil {
+		return SessionV2{}, err
+	}
+	if session.Version == 0 {
+		session.Version = VersionV2
+	}
+	if session.CreatedAt.IsZero() {
+		session.CreatedAt = now
+	}
+	session.UpdatedAt = now
+	session = copySessionV2(session)
+
+	sessionDir := s.sessionDir(session.ID)
+	if err := os.MkdirAll(sessionDir, 0o755); err != nil {
+		return SessionV2{}, fmt.Errorf("create session directory %q: %w", sessionDir, err)
+	}
+
+	data, err := json.MarshalIndent(metadataFromSessionV2(session), "", "  ")
+	if err != nil {
+		return SessionV2{}, fmt.Errorf("marshal session metadata %q: %w", session.ID, err)
+	}
+	data = append(data, '\n')
+	path := s.metadataPath(session.ID)
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		return SessionV2{}, fmt.Errorf("write session metadata %q: %w", session.ID, err)
+	}
+	return session, nil
+}
+
+func (s *V2Store) Load(id string) (SessionV2, error) {
+	if err := s.requireRoot(); err != nil {
+		return SessionV2{}, err
+	}
+	if err := validateV2SessionID(id); err != nil {
+		return SessionV2{}, err
+	}
+
+	session, err := s.loadMetadata(id)
+	if err != nil {
+		return SessionV2{}, err
+	}
+	replayed, err := s.Replay(id)
+	if err != nil {
+		return SessionV2{}, err
+	}
+	session.Items = copySessionItems(replayed.Items)
+	session.ActiveHistory = copyStrings(replayed.ActiveHistory)
+	session.Compactions = copyCompactionCheckpoints(replayed.Compactions)
+	session.LastSeq = replayed.LastSeq
+	return copySessionV2(session), nil
+}
+
+func (s *V2Store) List() ([]Info, error) {
+	if err := s.requireRoot(); err != nil {
+		return nil, err
+	}
+	entries, err := os.ReadDir(s.root)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return []Info{}, nil
+		}
+		return nil, fmt.Errorf("read session store %q: %w", s.root, err)
+	}
+
+	infos := make([]Info, 0, len(entries))
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		id := entry.Name()
+		if err := validateV2SessionID(id); err != nil {
+			continue
+		}
+		session, err := s.loadMetadata(id)
+		if err != nil {
+			if errors.Is(err, ErrNotFound) {
+				continue
+			}
+			return nil, err
+		}
+		infos = append(infos, session.info())
+	}
+	sort.Slice(infos, func(i, j int) bool {
+		if infos[i].UpdatedAt.Equal(infos[j].UpdatedAt) {
+			return infos[i].ID < infos[j].ID
+		}
+		return infos[i].UpdatedAt.After(infos[j].UpdatedAt)
+	})
+	return infos, nil
+}
+
+func (s *V2Store) Latest() (SessionV2, error) {
+	infos, err := s.List()
+	if err != nil {
+		return SessionV2{}, err
+	}
+	if len(infos) == 0 {
+		return SessionV2{}, ErrNotFound
+	}
+	return s.Load(infos[0].ID)
+}
+
+func (s *V2Store) Delete(id string) error {
+	if err := s.requireRoot(); err != nil {
+		return err
+	}
+	if err := validateV2SessionID(id); err != nil {
+		return err
+	}
+
+	sessionDir := s.sessionDir(id)
+	info, err := os.Stat(sessionDir)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("%w: %s", ErrNotFound, id)
+		}
+		return fmt.Errorf("stat session %q: %w", id, err)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("session %q is not a directory", id)
+	}
+	if err := os.RemoveAll(sessionDir); err != nil {
+		return fmt.Errorf("delete session %q: %w", id, err)
+	}
+	return nil
+}
+
 func (s *V2Store) AppendItem(sessionID string, item SessionItem) (SessionItem, error) {
 	if item.CreatedAt.IsZero() {
 		item.CreatedAt = s.now().UTC()
@@ -199,7 +368,7 @@ func (s *V2Store) Replay(sessionID string) (SessionV2, error) {
 	if err := s.requireRoot(); err != nil {
 		return SessionV2{}, err
 	}
-	if err := validateSessionID(sessionID); err != nil {
+	if err := validateV2SessionID(sessionID); err != nil {
 		return SessionV2{}, err
 	}
 
@@ -305,7 +474,7 @@ func (s *V2Store) appendRecord(sessionID string, record v2Record) (int64, error)
 	if err := s.requireRoot(); err != nil {
 		return 0, err
 	}
-	if err := validateSessionID(sessionID); err != nil {
+	if err := validateV2SessionID(sessionID); err != nil {
 		return 0, err
 	}
 	state, err := s.Replay(sessionID)
@@ -397,11 +566,19 @@ func (s *V2Store) segmentsDir(sessionID string) string {
 	return filepath.Join(s.root, sessionID, "segments")
 }
 
+func (s *V2Store) sessionDir(sessionID string) string {
+	return filepath.Join(s.root, sessionID)
+}
+
+func (s *V2Store) metadataPath(sessionID string) string {
+	return filepath.Join(s.sessionDir(sessionID), "meta.json")
+}
+
 func (s *V2Store) blobPath(ref BlobRef) (string, error) {
 	if err := validateBlobRef(ref); err != nil {
 		return "", err
 	}
-	return filepath.Join(s.root, "blobs", "sha256", ref.Hash[:2], ref.Hash+".data"), nil
+	return filepath.Join(s.root, v2BlobsDirName, "sha256", ref.Hash[:2], ref.Hash+".data"), nil
 }
 
 func (s *V2Store) requireRoot() error {
@@ -411,12 +588,130 @@ func (s *V2Store) requireRoot() error {
 	return nil
 }
 
+func validateV2SessionID(id string) error {
+	if err := validateSessionID(id); err != nil {
+		return err
+	}
+	if strings.EqualFold(v2FilesystemAliasName(id), v2BlobsDirName) {
+		return fmt.Errorf("reserved v2 session id %q", id)
+	}
+	return nil
+}
+
+func v2FilesystemAliasName(id string) string {
+	return strings.TrimRight(id, ". ")
+}
+
 type v2Record struct {
 	Seq        int64                 `json:"seq"`
 	Type       string                `json:"type"`
 	Item       *SessionItem          `json:"item,omitempty"`
 	ItemIDs    []string              `json:"item_ids,omitempty"`
 	Compaction *CompactionCheckpoint `json:"compaction,omitempty"`
+}
+
+type sessionV2Metadata struct {
+	ID                   string                 `json:"id"`
+	Version              int                    `json:"version"`
+	CreatedAt            time.Time              `json:"created_at"`
+	UpdatedAt            time.Time              `json:"updated_at"`
+	Provider             string                 `json:"provider"`
+	ModelProfile         string                 `json:"model_profile"`
+	ModelID              string                 `json:"model_id"`
+	ModelParameters      map[string]any         `json:"model_parameters,omitempty"`
+	CWD                  string                 `json:"cwd"`
+	ConfigPath           string                 `json:"config_path,omitempty"`
+	ConfigDir            string                 `json:"config_dir,omitempty"`
+	EnabledTools         []string               `json:"enabled_tools,omitempty"`
+	EnabledMCP           []string               `json:"enabled_mcp,omitempty"`
+	EnabledSkills        []string               `json:"enabled_skills,omitempty"`
+	ShowReasoning        bool                   `json:"show_reasoning"`
+	InstructionsSnapshot []model.Message        `json:"instructions_snapshot,omitempty"`
+	InstructionSources   []InstructionSource    `json:"instruction_sources,omitempty"`
+	Context              contextwindow.Metadata `json:"context,omitempty"`
+	SaveToolResults      bool                   `json:"save_tool_results"`
+}
+
+func (s *V2Store) loadMetadata(id string) (SessionV2, error) {
+	session, err := readSessionV2MetadataFile(s.metadataPath(id))
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return SessionV2{}, fmt.Errorf("%w: %s", ErrNotFound, id)
+		}
+		return SessionV2{}, err
+	}
+	if session.ID == "" {
+		session.ID = id
+	}
+	if session.ID != id {
+		return SessionV2{}, mismatchedSessionIDError(id, session.ID)
+	}
+	return copySessionV2(session), nil
+}
+
+func readSessionV2MetadataFile(path string) (SessionV2, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return SessionV2{}, err
+	}
+	defer file.Close()
+
+	var metadata sessionV2Metadata
+	decoder := json.NewDecoder(file)
+	decoder.UseNumber()
+	if err := decoder.Decode(&metadata); err != nil {
+		return SessionV2{}, fmt.Errorf("parse session metadata %q: %w", path, err)
+	}
+	return metadata.session(), nil
+}
+
+func metadataFromSessionV2(session SessionV2) sessionV2Metadata {
+	session = copySessionV2(session)
+	return sessionV2Metadata{
+		ID:                   session.ID,
+		Version:              session.Version,
+		CreatedAt:            session.CreatedAt,
+		UpdatedAt:            session.UpdatedAt,
+		Provider:             session.Provider,
+		ModelProfile:         session.ModelProfile,
+		ModelID:              session.ModelID,
+		ModelParameters:      session.ModelParameters,
+		CWD:                  session.CWD,
+		ConfigPath:           session.ConfigPath,
+		ConfigDir:            session.ConfigDir,
+		EnabledTools:         session.EnabledTools,
+		EnabledMCP:           session.EnabledMCP,
+		EnabledSkills:        session.EnabledSkills,
+		ShowReasoning:        session.ShowReasoning,
+		InstructionsSnapshot: session.InstructionsSnapshot,
+		InstructionSources:   session.InstructionSources,
+		Context:              session.Context,
+		SaveToolResults:      session.SaveToolResults,
+	}
+}
+
+func (m sessionV2Metadata) session() SessionV2 {
+	return SessionV2{
+		ID:                   m.ID,
+		Version:              m.Version,
+		CreatedAt:            m.CreatedAt,
+		UpdatedAt:            m.UpdatedAt,
+		Provider:             m.Provider,
+		ModelProfile:         m.ModelProfile,
+		ModelID:              m.ModelID,
+		ModelParameters:      copyMap(m.ModelParameters),
+		CWD:                  m.CWD,
+		ConfigPath:           m.ConfigPath,
+		ConfigDir:            m.ConfigDir,
+		EnabledTools:         copyStrings(m.EnabledTools),
+		EnabledMCP:           copyStrings(m.EnabledMCP),
+		EnabledSkills:        copyStrings(m.EnabledSkills),
+		ShowReasoning:        m.ShowReasoning,
+		InstructionsSnapshot: copyMessages(m.InstructionsSnapshot),
+		InstructionSources:   copyInstructionSources(m.InstructionSources),
+		Context:              m.Context,
+		SaveToolResults:      m.SaveToolResults,
+	}
 }
 
 func replaySegment(path string, state *SessionV2) error {
@@ -561,4 +856,58 @@ func corruptedSessionError(sessionID, format string, args ...any) error {
 func copyMessage(message model.Message) model.Message {
 	message.ToolCalls = append([]model.ToolCall(nil), message.ToolCalls...)
 	return message
+}
+
+func copySessionV2(session SessionV2) SessionV2 {
+	session.ModelParameters = copyMap(session.ModelParameters)
+	session.EnabledTools = copyStrings(session.EnabledTools)
+	session.EnabledMCP = copyStrings(session.EnabledMCP)
+	session.EnabledSkills = copyStrings(session.EnabledSkills)
+	session.InstructionsSnapshot = copyMessages(session.InstructionsSnapshot)
+	session.InstructionSources = copyInstructionSources(session.InstructionSources)
+	session.Items = copySessionItems(session.Items)
+	session.ActiveHistory = copyStrings(session.ActiveHistory)
+	session.Compactions = copyCompactionCheckpoints(session.Compactions)
+	return session
+}
+
+func copySessionItems(items []SessionItem) []SessionItem {
+	if items == nil {
+		return nil
+	}
+	copied := append([]SessionItem(nil), items...)
+	for i := range copied {
+		if items[i].Message != nil {
+			message := copyMessage(*items[i].Message)
+			copied[i].Message = &message
+		}
+	}
+	return copied
+}
+
+func copyCompactionCheckpoints(checkpoints []CompactionCheckpoint) []CompactionCheckpoint {
+	if checkpoints == nil {
+		return nil
+	}
+	copied := append([]CompactionCheckpoint(nil), checkpoints...)
+	for i := range copied {
+		copied[i].PreviousActiveHistory = copyStrings(checkpoints[i].PreviousActiveHistory)
+		copied[i].ReplacementHistory = copyStrings(checkpoints[i].ReplacementHistory)
+	}
+	return copied
+}
+
+func (s SessionV2) info() Info {
+	return Info{
+		ID:              s.ID,
+		CreatedAt:       s.CreatedAt,
+		UpdatedAt:       s.UpdatedAt,
+		Version:         s.Version,
+		Provider:        s.Provider,
+		ModelProfile:    s.ModelProfile,
+		ModelID:         s.ModelID,
+		ContextWindow:   s.Context.ContextWindow,
+		ContextSource:   s.Context.ContextWindowSource,
+		SaveToolResults: s.SaveToolResults,
+	}
 }
