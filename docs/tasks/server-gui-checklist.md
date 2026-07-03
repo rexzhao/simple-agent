@@ -63,7 +63,7 @@ future work and should not be required by any slice here.
 - [ ] CLI attach REPL: make bare `sai` equivalent to `sai attach`, support
   `sai attach`, `sai attach <session-id>`, `sai attach --new`, streaming output,
   and shared-session observation through the server.
-- [ ] CLI query/send commands: implement `sai sessions list`,
+- [x] CLI query/send commands: implement `sai sessions list`,
   `sai sessions show <id>`, `sai send <session-id> --prompt ...`, and
   `sai send --new --prompt ...` using only server APIs.
 - [ ] Legacy entrypoint cleanup: remove or hide standalone in-process

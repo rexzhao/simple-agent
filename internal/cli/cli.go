@@ -188,6 +188,8 @@ func execute(ctx context.Context, program string, args []string, stdin io.Reader
 			return usageError("usage: sai servers list", "", "sai help servers list")
 		}
 		return serversListCommand(ctx, subArgs, stdout)
+	case "send":
+		return sendCommand(ctx, rootArgs.commandArgs, stdout, getwd)
 	case "auth":
 		return authCommand(ctx, rootArgs.commandArgs, rootArgs.configPath, stdout, getwd, program)
 	case "tools":
@@ -217,7 +219,7 @@ func execute(ctx context.Context, program string, args []string, stdin io.Reader
 		}
 		return mcpListCommand(subArgs, rootArgs.configPath, stdout, getwd, program)
 	case "sessions":
-		subcommand, subArgs, groupHelp, err := splitSubcommandArgs(rootArgs.commandArgs, map[string]flagKind{"keep": flagKindValue}, "sai help sessions")
+		subcommand, subArgs, groupHelp, err := splitSubcommandArgs(rootArgs.commandArgs, map[string]flagKind{"keep": flagKindValue, "cwd": flagKindValue}, "sai help sessions")
 		if err != nil {
 			return err
 		}
@@ -227,9 +229,9 @@ func execute(ctx context.Context, program string, args []string, stdin io.Reader
 		}
 		switch subcommand {
 		case "list":
-			return sessionsListCommand(subArgs, rootArgs.configPath, stdout, getwd, program)
+			return sessionsListCommand(ctx, subArgs, stdout, getwd)
 		case "show":
-			return sessionsShowCommand(subArgs, rootArgs.configPath, stdout, getwd, program)
+			return sessionsShowCommand(ctx, subArgs, stdout, getwd)
 		case "delete":
 			return sessionsDeleteCommand(subArgs, rootArgs.configPath, stdout, getwd, program)
 		case "prune":
@@ -274,6 +276,7 @@ Commands:
   status            Show nearest server status
   stop              Stop nearest server
   servers list      List registered local servers
+  send              Send one prompt to a server-owned session
   config show        Print resolved config with secrets redacted
   models list        List configured provider model profiles
   auth               Manage provider authentication
@@ -381,6 +384,14 @@ Lists healthy local server registry records. Stale records are removed while
 listing.
 `
 
+const sendUsageText = `usage: sai send [--cwd path] <session-id> --prompt text
+       sai send [--cwd path] --new --prompt text
+
+Discovers the nearest healthy local server, sends one prompt through the server
+API, and prints committed turn metadata only. --new first creates a server-owned
+session with the registry token, then sends the prompt to that session.
+`
+
 const authUsageText = `usage: sai auth <command>
 
 Commands:
@@ -432,24 +443,28 @@ Lists configured MCP servers and whether each is enabled for this run.
 const sessionsUsageText = `usage: sai sessions <command>
 
 Commands:
-  sessions list              List resumable sessions
-  sessions show <id>         Show resumable session metadata
-  sessions delete <id>       Delete a resumable session
-  sessions prune --keep N    Delete older resumable sessions
+  sessions list              List server-owned sessions
+  sessions show <id>         Show server-owned session metadata
+  sessions delete <id>       Delete a local legacy resumable session
+  sessions prune --keep N    Delete older local legacy resumable sessions
 
 Run "sai help sessions <command>" for command usage.
 `
 
 const sessionsListUsageText = `usage: sai sessions list
+       sai sessions list --cwd path
 
-Lists resumable sessions from the configured sessions.dir without printing
-messages, prompts, assistant output, or tool result content.
+Discovers the nearest healthy local server and lists server-owned session
+metadata without printing messages, prompts, assistant output, or tool result
+content.
 `
 
 const sessionsShowUsageText = `usage: sai sessions show <id>
+       sai sessions show --cwd path <id>
 
-Shows resumable session metadata only. Session files contain full sensitive
-content, including prompts, assistant output, and tool results.
+Discovers the nearest healthy local server and shows server-owned session
+metadata only. Session storage can contain full sensitive content, including
+prompts, assistant output, and tool results.
 `
 
 const sessionsDeleteUsageText = `usage: sai sessions delete <id>
@@ -494,6 +509,8 @@ func helpCommand(args []string, stdout io.Writer) error {
 		printServersUsage(stdout)
 	case "servers list":
 		printServersListUsage(stdout)
+	case "send":
+		printSendUsage(stdout)
 	case "auth":
 		printAuthUsage(stdout)
 	case "auth codex":
@@ -574,6 +591,10 @@ func printServersUsage(stdout io.Writer) {
 
 func printServersListUsage(stdout io.Writer) {
 	fmt.Fprint(stdout, serversListUsageText)
+}
+
+func printSendUsage(stdout io.Writer) {
+	fmt.Fprint(stdout, sendUsageText)
 }
 
 func printAuthUsage(stdout io.Writer) {
@@ -687,6 +708,7 @@ func splitRootArgs(args []string) (rootArgs, error) {
 		"cwd":            flagKindValue,
 		"port":           flagKindValue,
 		"listen":         flagKindValue,
+		"new":            flagKindBool,
 		"h":              flagKindBool,
 		"help":           flagKindBool,
 		"show-reasoning": flagKindBool,
@@ -1256,6 +1278,81 @@ func serversListCommand(ctx context.Context, args []string, stdout io.Writer) er
 		}
 	}
 	return nil
+}
+
+func sendCommand(ctx context.Context, args []string, stdout io.Writer, getwd func() (string, error)) error {
+	flags := flag.NewFlagSet("sai send", flag.ContinueOnError)
+	cwdFlag := flags.String("cwd", "", "discovery working directory")
+	newSession := flags.Bool("new", false, "create a new server-owned session before sending")
+	prompt := flags.String("prompt", "", "prompt text")
+	positionals, done, err := parseCommandFlagArgs(flags, args, stdout, printSendUsage, "sai help send")
+	if done || err != nil {
+		return err
+	}
+	switch {
+	case *newSession && len(positionals) != 0:
+		return usageError("usage: sai send --new --prompt text", "", "sai help send")
+	case !*newSession && len(positionals) != 1:
+		return usageError("usage: sai send <session-id> --prompt text", "", "sai help send")
+	}
+	if strings.TrimSpace(*prompt) == "" {
+		return usageError("--prompt must be a non-empty string", "", "sai help send")
+	}
+
+	record, _, err := discoverClientServer(ctx, *cwdFlag, getwd)
+	if err != nil {
+		return err
+	}
+
+	sessionID := ""
+	if *newSession {
+		detail, err := localserver.CreateSessionWithToken(ctx, record.Addr, record.Token, serverClientTimeout)
+		if err != nil {
+			return err
+		}
+		sessionID = strings.TrimSpace(detail.ID)
+		if sessionID == "" {
+			return fmt.Errorf("create session at %s: response missing session id", record.Addr)
+		}
+	} else {
+		sessionID = positionals[0]
+	}
+
+	result, err := localserver.SendSessionMessageWithToken(ctx, record.Addr, record.Token, sessionID, *prompt, 0)
+	if err != nil {
+		return err
+	}
+	return printSessionSendResult(stdout, sessionID, result)
+}
+
+func discoverClientServer(ctx context.Context, cwdFlag string, getwd func() (string, error)) (localserver.RegistryRecord, string, error) {
+	cwd, err := resolveClientCWD(cwdFlag, getwd)
+	if err != nil {
+		return localserver.RegistryRecord{}, "", err
+	}
+	store := localserver.NewRegistryStore("")
+	discovery, err := localserver.DiscoverHealthy(ctx, store, cwd, serverClientTimeout)
+	if err != nil {
+		return localserver.RegistryRecord{}, "", err
+	}
+	if !discovery.Found {
+		return localserver.RegistryRecord{}, cwd, noServerFoundError(cwd)
+	}
+	return discovery.Record, cwd, nil
+}
+
+func printSessionSendResult(stdout io.Writer, sessionID string, result localserver.SessionMessageResult) error {
+	if _, err := fmt.Fprintf(stdout, "SESSION\t%s\n", sessionID); err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintf(stdout, "STATUS\t%s\n", result.Status); err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintf(stdout, "TURN_ID\t%s\n", result.TurnID); err != nil {
+		return err
+	}
+	_, err := fmt.Fprintf(stdout, "LAST_SEQ\t%d\n", result.LastSeq)
+	return err
 }
 
 func resolveClientCWD(cwdFlag string, getwd func() (string, error)) (string, error) {
@@ -1872,21 +1969,22 @@ func toolsListCommand(args []string, stdout io.Writer) error {
 	return nil
 }
 
-func sessionsListCommand(args []string, configPath string, stdout io.Writer, getwd func() (string, error), program string) error {
+func sessionsListCommand(ctx context.Context, args []string, stdout io.Writer, getwd func() (string, error)) error {
 	flags := flag.NewFlagSet("sai sessions list", flag.ContinueOnError)
+	cwdFlag := flags.String("cwd", "", "discovery working directory")
 	positionals, done, err := parseCommandFlagArgs(flags, args, stdout, printSessionsListUsage, "sai help sessions list")
 	if done || err != nil {
 		return err
 	}
 	if len(positionals) != 0 {
-		return usageError("usage: sai sessions list", "", "sai help sessions list")
+		return usageError("usage: sai sessions list [--cwd path]", "", "sai help sessions list")
 	}
 
-	store, err := sessionV2StoreFromConfig(configPath, getwd, program)
+	record, _, err := discoverClientServer(ctx, *cwdFlag, getwd)
 	if err != nil {
 		return err
 	}
-	infos, err := store.List()
+	infos, err := localserver.ListSessions(ctx, record.Addr, serverClientTimeout)
 	if err != nil {
 		return err
 	}
@@ -1898,36 +1996,41 @@ func sessionsListCommand(args []string, configPath string, stdout io.Writer, get
 	return nil
 }
 
-func sessionsShowCommand(args []string, configPath string, stdout io.Writer, getwd func() (string, error), program string) error {
+func sessionsShowCommand(ctx context.Context, args []string, stdout io.Writer, getwd func() (string, error)) error {
 	flags := flag.NewFlagSet("sai sessions show", flag.ContinueOnError)
+	cwdFlag := flags.String("cwd", "", "discovery working directory")
 	positionals, done, err := parseCommandFlagArgs(flags, args, stdout, printSessionsShowUsage, "sai help sessions show")
 	if done || err != nil {
 		return err
 	}
 	if len(positionals) != 1 {
-		return usageError("usage: sai sessions show <id>", "", "sai help sessions show")
+		return usageError("usage: sai sessions show [--cwd path] <id>", "", "sai help sessions show")
 	}
 
-	store, err := sessionV2StoreFromConfig(configPath, getwd, program)
+	record, _, err := discoverClientServer(ctx, *cwdFlag, getwd)
 	if err != nil {
 		return err
 	}
-	session, err := store.Load(positionals[0])
+	session, err := localserver.GetSessionDetail(ctx, record.Addr, positionals[0], serverClientTimeout)
 	if err != nil {
-		return readableSessionNotFound(err, positionals[0])
+		return err
 	}
+	return printServerSessionDetail(stdout, session)
+}
 
-	fmt.Fprintln(stdout, "WARNING: session files contain full sensitive content, including prompts, assistant output, and tool results.")
+func printServerSessionDetail(stdout io.Writer, session localserver.SessionDetail) error {
+	fmt.Fprintln(stdout, "WARNING: server-owned session storage can contain full sensitive content, including prompts, assistant output, and tool results.")
 	fmt.Fprintln(stdout, "This command prints metadata only; messages and tool result content are not shown.")
 	fmt.Fprintf(stdout, "ID\t%s\n", session.ID)
 	fmt.Fprintf(stdout, "CREATED\t%s\n", formatSessionTimestamp(session.CreatedAt))
 	fmt.Fprintf(stdout, "UPDATED\t%s\n", formatSessionTimestamp(session.UpdatedAt))
-	fmt.Fprintf(stdout, "VERSION\t%d\n", session.Version)
 	fmt.Fprintf(stdout, "PROVIDER\t%s\n", session.Provider)
 	fmt.Fprintf(stdout, "MODEL_PROFILE\t%s\n", session.ModelProfile)
 	fmt.Fprintf(stdout, "MODEL_ID\t%s\n", session.ModelID)
+	fmt.Fprintf(stdout, "STATUS\t%s\n", session.Status)
+	fmt.Fprintf(stdout, "LAST_SEQ\t%d\n", session.LastSeq)
 	fmt.Fprintf(stdout, "CWD\t%s\n", session.CWD)
-	fmt.Fprintf(stdout, "CONFIG_PATH\t%s\n", session.RootConfigPath())
+	fmt.Fprintf(stdout, "CONFIG_PATH\t%s\n", session.ConfigPath)
 	fmt.Fprintf(stdout, "ENABLED_TOOLS\t%s\n", formatSessionStringList(session.EnabledTools))
 	fmt.Fprintf(stdout, "ENABLED_MCP\t%s\n", formatSessionStringList(session.EnabledMCP))
 	fmt.Fprintf(stdout, "ENABLED_SKILLS\t%s\n", formatSessionStringList(session.EnabledSkills))
@@ -1943,9 +2046,6 @@ func sessionsShowCommand(args []string, configPath string, stdout io.Writer, get
 		fmt.Fprintf(stdout, "CONTEXT_LAST_USAGE_SOURCE\t%s\n", session.Context.LastUsageSource)
 	}
 	fmt.Fprintf(stdout, "SAVE_TOOL_RESULTS\t%t\n", session.SaveToolResults)
-	fmt.Fprintf(stdout, "INSTRUCTION_COUNT\t%d\n", len(session.InstructionsSnapshot))
-	fmt.Fprintf(stdout, "MESSAGE_COUNT\t%d\n", countSessionV2MessageItems(session.Items))
-	fmt.Fprintf(stdout, "ACTIVE_HISTORY_COUNT\t%d\n", len(session.ActiveHistory))
 	return nil
 }
 
