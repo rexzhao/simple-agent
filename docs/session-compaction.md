@@ -1,8 +1,8 @@
 # 会话压缩设计
 
-本文记录会话压缩功能的需求、设计决策和验收标准。它是独立设计文档，不修改现有
-`docs/development.md`、`docs/milestones.md`、`docs/checklist.md` 或
-`docs/configuration.md` 的内容。
+本文记录会话压缩功能的需求、设计决策和验收标准。它是详细设计来源；公开配置形态和
+高层运行时说明会同步摘录到 `docs/configuration.md` 和 `docs/development.md`。
+`docs/milestones.md` 与 `docs/checklist.md` 仍只用于里程碑级状态。
 
 目标是保证即使未来在新的会话中继续开发，也能从本文恢复足够上下文并完成实现。
 
@@ -280,7 +280,7 @@ MVP 只实现：
 estimate(ActiveHistory + pending user message + tool schemas)
 ```
 
-如果超过自动压缩阈值：
+如果估算值超过自动压缩阈值：
 
 1. 先 compact。
 2. compact 成功后，再把新用户消息加入 active history 并跑模型。
@@ -303,7 +303,7 @@ provider/model。
 
 ```yaml
 compaction:
-  enabled: true
+  enabled: false
   threshold_percent: 80
   summary_provider: ""
   summary_model: ""
@@ -311,6 +311,7 @@ compaction:
 
 语义：
 
+- `enabled` 默认 `false`；启用后才执行手动 `/compact` 和 pre-turn 自动压缩。
 - `summary_provider` 和 `summary_model` 为空：使用当前 provider/model。
 - 只配置 `summary_model`：默认在当前 provider 下找该 model profile。
 - 同时配置 `summary_provider` 和 `summary_model`：使用指定 provider/profile。
@@ -567,10 +568,10 @@ assistant output、tool result 或 blob content。
 
 ### Pre-turn Auto Compact
 
-- 当 `ActiveHistory + pending user + tools` 预计超阈值时，先 compact 再执行用户 turn。
+- 当 `ActiveHistory + pending user + tools` 预计超过阈值时，先 compact 再执行用户 turn。
 - 新用户消息在 compaction summary 后进入 active history。
 - auto compact 失败时，本轮失败，不请求主模型，不保存 turn。
-- 未超阈值时不 compact。
+- 未超过阈值时不 compact。
 
 ### Replacement History
 

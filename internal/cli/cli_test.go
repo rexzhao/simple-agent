@@ -2776,6 +2776,16 @@ func TestChatSaveSessionFlagWritesFullToolHistory(t *testing.T) {
 	assertNoAdditionalCLIRunRequest(t, requests)
 
 	session := loadOnlyCLISession(t, filepath.Join(configDir, "sessions"))
+	sessionDir := filepath.Join(configDir, "sessions", session.ID)
+	if _, err := os.Stat(filepath.Join(sessionDir, "meta.json")); err != nil {
+		t.Fatalf("meta.json stat error = %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(sessionDir, "segments")); err != nil {
+		t.Fatalf("segments stat error = %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(sessionDir, "session.json")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("session.json stat error = %v, want not exist", err)
+	}
 	if session.Provider != "fake" || session.ModelProfile != "default" || session.ModelID != "model-default" {
 		t.Fatalf("saved model metadata = provider %q profile %q model %q", session.Provider, session.ModelProfile, session.ModelID)
 	}
@@ -2792,14 +2802,59 @@ func TestChatSaveSessionFlagWritesFullToolHistory(t *testing.T) {
 		t.Fatal("SaveToolResults = false, want true")
 	}
 	assertSavedMessage(t, session.InstructionsSnapshot, 0, model.MessageRoleSystem, builtInBaseInstructions)
-	if len(session.Messages) != 5 {
-		t.Fatalf("len(saved messages) = %d, want 5: %#v", len(session.Messages), session.Messages)
+	messages := activeCLIMessages(t, session)
+	if len(messages) != 5 {
+		t.Fatalf("len(saved messages) = %d, want 5: %#v", len(messages), messages)
 	}
-	assertSavedMessage(t, session.Messages, 0, model.MessageRoleSystem, builtInBaseInstructions)
-	assertSavedMessage(t, session.Messages, 1, model.MessageRoleUser, "Read note")
-	assertSavedAssistantToolCallMessage(t, session.Messages, 2, "call_1", "read_file", `{"path":"note.txt"}`)
-	assertSavedToolMessage(t, session.Messages, 3, "call_1", "tool output")
-	assertSavedMessage(t, session.Messages, 4, model.MessageRoleAssistant, "done")
+	assertSavedMessage(t, messages, 0, model.MessageRoleSystem, builtInBaseInstructions)
+	assertSavedMessage(t, messages, 1, model.MessageRoleUser, "Read note")
+	assertSavedAssistantToolCallMessage(t, messages, 2, "call_1", "read_file", `{"path":"note.txt"}`)
+	assertSavedToolMessage(t, messages, 3, "call_1", "tool output")
+	assertSavedMessage(t, messages, 4, model.MessageRoleAssistant, "done")
+}
+
+func TestChatSaveSessionFailureDoesNotExposePartialNewSession(t *testing.T) {
+	requests := make(chan struct{}, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		requests <- struct{}{}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"one\"}}]}\n\n")
+		_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
+	}))
+	defer server.Close()
+
+	configDir := t.TempDir()
+	writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
+	setCLIModelContextWindow(t, configDir, 30000000)
+
+	oversizedPrompt := strings.Repeat("x", 17*1024*1024)
+	var stdout, stderr bytes.Buffer
+	code := RunWithIO([]string{"--config", cliConfigPath(configDir), "chat", "--save-session", "--quit", "--prompt", oversizedPrompt}, strings.NewReader(""), &stdout, &stderr, func() (string, error) {
+		return t.TempDir(), nil
+	})
+
+	if code != 1 {
+		t.Fatalf("RunWithIO() code = %d, want 1", code)
+	}
+	if got := stdout.String(); got != "one" {
+		t.Fatalf("stdout = %q, want streamed provider output before save failure", got)
+	}
+	<-requests
+	assertCLIErrorContains(t, stderr.String(), "save resumable session", "too large")
+	assertCLIErrorOmits(t, stderr.String(), "direct-secret-value")
+
+	store := sessions.NewV2Store(filepath.Join(configDir, "sessions"))
+	infos, err := store.List()
+	if err != nil {
+		t.Fatalf("List() error = %v", err)
+	}
+	if len(infos) != 0 {
+		t.Fatalf("sessions after failed first save = %#v, want none", infos)
+	}
+	if _, err := store.Latest(); !errors.Is(err, sessions.ErrNotFound) {
+		t.Fatalf("Latest() after failed first save error = %v, want ErrNotFound", err)
+	}
 }
 
 func TestChatSaveSessionFlagOverridesDisabledConfigAndPrintsNoticeBeforeProviderRequest(t *testing.T) {
@@ -2847,8 +2902,8 @@ func TestChatSaveSessionFlagOverridesDisabledConfigAndPrintsNoticeBeforeProvider
 	assertNoAdditionalCLIRunRequest(t, requests)
 	assertResumableSessionNoticeOnce(t, stderr.String())
 	session := loadOnlyCLISession(t, filepath.Join(configDir, "sessions"))
-	if len(session.Messages) != 3 {
-		t.Fatalf("len(saved messages) = %d, want 3: %#v", len(session.Messages), session.Messages)
+	if messages := activeCLIMessages(t, session); len(messages) != 3 {
+		t.Fatalf("len(saved messages) = %d, want 3: %#v", len(messages), messages)
 	}
 }
 
@@ -2877,12 +2932,13 @@ func TestChatConfiguredSessionsSaveFullMessages(t *testing.T) {
 	assertNoAdditionalCLIRunRequest(t, requests)
 
 	session := loadOnlyCLISession(t, filepath.Join(configDir, "sessions"))
-	if len(session.Messages) != 3 {
-		t.Fatalf("len(saved messages) = %d, want 3: %#v", len(session.Messages), session.Messages)
+	messages := activeCLIMessages(t, session)
+	if len(messages) != 3 {
+		t.Fatalf("len(saved messages) = %d, want 3: %#v", len(messages), messages)
 	}
-	assertSavedMessage(t, session.Messages, 0, model.MessageRoleSystem, builtInBaseInstructions)
-	assertSavedMessage(t, session.Messages, 1, model.MessageRoleUser, "first")
-	assertSavedMessage(t, session.Messages, 2, model.MessageRoleAssistant, "one")
+	assertSavedMessage(t, messages, 0, model.MessageRoleSystem, builtInBaseInstructions)
+	assertSavedMessage(t, messages, 1, model.MessageRoleUser, "first")
+	assertSavedMessage(t, messages, 2, model.MessageRoleAssistant, "one")
 	if session.Context.ContextWindow != contextwindow.DefaultContextWindowTokens || session.Context.ContextWindowSource != string(contextwindow.WindowSourceEstimated) {
 		t.Fatalf("session context window = %d/%q, want default estimated", session.Context.ContextWindow, session.Context.ContextWindowSource)
 	}
@@ -2921,6 +2977,693 @@ func TestChatConfiguredSessionsCanBeDisabledBySaveSessionFalse(t *testing.T) {
 	assertCLIErrorOmits(t, stderr.String(), "first prompt secret", "one", "direct-secret-value")
 	if _, err := os.Stat(filepath.Join(configDir, "sessions")); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("sessions dir stat error = %v, want not exist", err)
+	}
+}
+
+func TestChatManualCompactReplacesActiveHistoryWithoutStartingUserTurn(t *testing.T) {
+	server, requests := newSequentialCLIRunServer(t,
+		[]string{
+			`{"choices":[{"delta":{"content":"one"}}]}`,
+			`[DONE]`,
+		},
+		[]string{
+			`{"choices":[{"delta":{"content":"two"}}]}`,
+			`[DONE]`,
+		},
+		[]string{
+			`{"choices":[{"delta":{"content":"three"}}]}`,
+			`[DONE]`,
+		},
+		[]string{
+			`{"choices":[{"delta":{"content":"# Context Checkpoint\n\n## Goal\nContinue.\n\n## Current Progress\nThird turn is current.\n\n## Decisions Made\nNone.\n\n## Constraints / User Preferences\nKeep concise.\n\n## Relevant Files / APIs / Commands\nNone.\n\n## Tool State / Environment State\nNo tools.\n\n## Open Questions\nNone.\n\n## Next Steps\nAnswer fourth."}}]}`,
+			`[DONE]`,
+		},
+		[]string{
+			`{"choices":[{"delta":{"content":"four"}}]}`,
+			`[DONE]`,
+		},
+	)
+	defer server.Close()
+
+	configDir := t.TempDir()
+	writeCLIRunFixtureInDirWithTools(t, configDir, server.URL, "direct-secret-value", "openai-chat", []string{"read_file"})
+	setCLISessionsConfig(t, configDir, true, true)
+	setCLICompactionConfig(t, configDir, true, "", "fast")
+
+	var stdout, stderr bytes.Buffer
+	code := RunWithIO([]string{"--config", cliConfigPath(configDir), "chat"}, strings.NewReader("first\nsecond\nthird\n/compact\nfourth\n/quit\n"), &stdout, &stderr, func() (string, error) {
+		return t.TempDir(), nil
+	})
+
+	if code != 0 {
+		t.Fatalf("RunWithIO() code = %d, stderr = %s", code, stderr.String())
+	}
+	if got, want := stdout.String(), "one\ntwo\nthree\nfour\n"; got != want {
+		t.Fatalf("stdout = %q, want %q", got, want)
+	}
+	assertCLIErrorContains(t, stderr.String(), "sai: compacted session context")
+	assertCLIErrorOmits(t, stderr.String(), "first", "second", "third", "fourth", "one", "two", "three", "four", "direct-secret-value")
+
+	firstRequest := <-requests
+	secondRequest := <-requests
+	thirdRequest := <-requests
+	summaryRequest := <-requests
+	nextRequest := <-requests
+	assertNoAdditionalCLIRunRequest(t, requests)
+
+	assertMessage(t, requestMessages(t, firstRequest.Body), 1, "user", "first")
+	assertMessage(t, requestMessages(t, secondRequest.Body), 3, "user", "second")
+	assertMessage(t, requestMessages(t, thirdRequest.Body), 5, "user", "third")
+	if got := summaryRequest.Body["model"]; got != "model-fast" {
+		t.Fatalf("summary model = %#v, want model-fast", got)
+	}
+	if _, ok := summaryRequest.Body["tools"]; ok {
+		t.Fatalf("summary request included tools: %#v", summaryRequest.Body["tools"])
+	}
+	summaryMessages := requestMessages(t, summaryRequest.Body)
+	if len(summaryMessages) != 2 {
+		t.Fatalf("len(summary messages) = %d, want 2: %#v", len(summaryMessages), summaryMessages)
+	}
+	assertMessageContentContains(t, summaryMessages, 0, "system", "Create a concise handoff checkpoint")
+	if strings.Contains(string(summaryRequest.RawBody), "/compact") {
+		t.Fatalf("summary request included slash command as user turn: %s", summaryRequest.RawBody)
+	}
+
+	nextMessages := requestMessages(t, nextRequest.Body)
+	if len(nextMessages) != 7 {
+		t.Fatalf("len(next request messages) = %d, want replacement history plus new user: %#v", len(nextMessages), nextMessages)
+	}
+	assertMessage(t, nextMessages, 0, "system", builtInBaseInstructions)
+	assertMessage(t, nextMessages, 1, "user", "second")
+	assertMessage(t, nextMessages, 2, "assistant", "two")
+	assertMessage(t, nextMessages, 3, "user", "third")
+	assertMessage(t, nextMessages, 4, "assistant", "three")
+	assertMessageContentContains(t, nextMessages, 5, "developer", "<compaction_summary>")
+	assertMessage(t, nextMessages, 6, "user", "fourth")
+	if requestMessagesContainExactContent(nextMessages, "first") || requestMessagesContainExactContent(nextMessages, "one") || requestMessagesContainExactContent(nextMessages, "/compact") {
+		t.Fatalf("next request included old exact message content: %#v", nextMessages)
+	}
+	assertCLIToolNames(t, nextRequest.Body, []string{"read_file"})
+
+	session := loadOnlyCLISession(t, filepath.Join(configDir, "sessions"))
+	if len(session.Compactions) != 1 {
+		t.Fatalf("len(Compactions) = %d, want 1: %#v", len(session.Compactions), session.Compactions)
+	}
+	checkpoint := session.Compactions[0]
+	if checkpoint.Reason != "user_requested" || checkpoint.Phase != "manual" || checkpoint.Trigger != "manual" {
+		t.Fatalf("checkpoint reason/phase/trigger = %q/%q/%q, want manual user request", checkpoint.Reason, checkpoint.Phase, checkpoint.Trigger)
+	}
+	if checkpoint.SummaryProvider != "fake" || checkpoint.SummaryModel != "fast" {
+		t.Fatalf("checkpoint summary model = %q/%q, want fake/fast", checkpoint.SummaryProvider, checkpoint.SummaryModel)
+	}
+	summaryItem := sessionItemByID(t, session, checkpoint.SummaryItemID)
+	if summaryItem.Visibility != sessions.ItemVisibilityHidden || summaryItem.Audience != sessions.ItemAudienceModel {
+		t.Fatalf("summary item visibility/audience = %q/%q, want hidden/model", summaryItem.Visibility, summaryItem.Audience)
+	}
+	if summaryItem.Message == nil || summaryItem.Message.Role != model.MessageRoleDeveloper || !strings.Contains(summaryItem.Message.Content, "<compaction_summary>") {
+		t.Fatalf("summary item message = %#v, want hidden developer summary", summaryItem.Message)
+	}
+	if !sessionContainsMessageContent(session, "first") || !sessionContainsMessageContent(session, "one") {
+		t.Fatalf("session items dropped old visible messages: %#v", session.Items)
+	}
+	if sessionContainsExactMessageContent(session, "/compact") {
+		t.Fatalf("session items included /compact as a user turn: %#v", session.Items)
+	}
+	active := activeCLIMessages(t, session)
+	if len(active) != 8 {
+		t.Fatalf("len(active messages) = %d, want compacted history plus third turn: %#v", len(active), active)
+	}
+	assertSavedMessage(t, active, 1, model.MessageRoleUser, "second")
+	assertSavedMessage(t, active, 2, model.MessageRoleAssistant, "two")
+	assertSavedMessage(t, active, 3, model.MessageRoleUser, "third")
+	assertSavedMessage(t, active, 4, model.MessageRoleAssistant, "three")
+	assertSavedMessageContentContains(t, active, 5, model.MessageRoleDeveloper, "<compaction_summary>")
+	assertSavedMessage(t, active, 6, model.MessageRoleUser, "fourth")
+	assertSavedMessage(t, active, 7, model.MessageRoleAssistant, "four")
+}
+
+func TestChatResumeAfterCompletedCompactSendsOnlyMaterializedActiveHistory(t *testing.T) {
+	server, requests := newSequentialCLIRunServer(t,
+		[]string{
+			`{"choices":[{"delta":{"content":"old assistant alpha"}}]}`,
+			`[DONE]`,
+		},
+		[]string{
+			`{"choices":[{"delta":{"content":"middle assistant beta"}}]}`,
+			`[DONE]`,
+		},
+		[]string{
+			`{"choices":[{"delta":{"content":"recent assistant gamma"}}]}`,
+			`[DONE]`,
+		},
+		[]string{
+			`{"choices":[{"delta":{"content":"# Context Checkpoint\n\n## Goal\nContinue the compacted session.\n\n## Current Progress\nRecent gamma is current.\n\n## Decisions Made\nUse the saved compacted active history.\n\n## Constraints / User Preferences\nKeep concise.\n\n## Relevant Files / APIs / Commands\nNone.\n\n## Tool State / Environment State\nNo tools.\n\n## Open Questions\nNone.\n\n## Next Steps\nAnswer delta."}}]}`,
+			`[DONE]`,
+		},
+		[]string{
+			`{"choices":[{"delta":{"content":"next assistant delta"}}]}`,
+			`[DONE]`,
+		},
+	)
+	defer server.Close()
+
+	configDir := t.TempDir()
+	writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
+	setCLISessionsConfig(t, configDir, true, true)
+	setCLICompactionConfig(t, configDir, true, "", "")
+
+	var firstStdout, firstStderr bytes.Buffer
+	code := RunWithIO([]string{"--config", cliConfigPath(configDir), "chat"}, strings.NewReader("old user alpha\nmiddle user beta\nrecent user gamma\n/compact\n/quit\n"), &firstStdout, &firstStderr, func() (string, error) {
+		return t.TempDir(), nil
+	})
+
+	if code != 0 {
+		t.Fatalf("first RunWithIO() code = %d, stderr = %s", code, firstStderr.String())
+	}
+	if got, want := firstStdout.String(), "old assistant alpha\nmiddle assistant beta\nrecent assistant gamma\n"; got != want {
+		t.Fatalf("first stdout = %q, want %q", got, want)
+	}
+	firstRequest := <-requests
+	secondRequest := <-requests
+	thirdRequest := <-requests
+	summaryRequest := <-requests
+	assertMessage(t, requestMessages(t, firstRequest.Body), 1, "user", "old user alpha")
+	assertMessage(t, requestMessages(t, secondRequest.Body), 3, "user", "middle user beta")
+	assertMessage(t, requestMessages(t, thirdRequest.Body), 5, "user", "recent user gamma")
+	if _, ok := summaryRequest.Body["tools"]; ok {
+		t.Fatalf("summary request included tools: %#v", summaryRequest.Body["tools"])
+	}
+
+	sessionRoot := filepath.Join(configDir, "sessions")
+	session := loadOnlyCLISession(t, sessionRoot)
+	for _, persisted := range []string{
+		"old user alpha",
+		"old assistant alpha",
+		"middle user beta",
+		"middle assistant beta",
+		"recent user gamma",
+		"recent assistant gamma",
+	} {
+		if !sessionContainsExactMessageContent(session, persisted) {
+			t.Fatalf("session items dropped pre-compact visible message %q after compact: %#v", persisted, session.Items)
+		}
+	}
+	if len(session.Compactions) != 1 {
+		t.Fatalf("len(Compactions) = %d, want 1: %#v", len(session.Compactions), session.Compactions)
+	}
+	summaryItem := sessionItemByID(t, session, session.Compactions[0].SummaryItemID)
+	if summaryItem.Visibility != sessions.ItemVisibilityHidden || summaryItem.Audience != sessions.ItemAudienceModel {
+		t.Fatalf("summary item visibility/audience = %q/%q, want hidden/model", summaryItem.Visibility, summaryItem.Audience)
+	}
+	if summaryItem.Message == nil || summaryItem.Message.Role != model.MessageRoleDeveloper || !strings.Contains(summaryItem.Message.Content, "<compaction_summary>") {
+		t.Fatalf("summary item message = %#v, want hidden developer summary", summaryItem.Message)
+	}
+
+	var resumeStdout, resumeStderr bytes.Buffer
+	code = RunWithIO([]string{"--config", cliConfigPath(configDir), "chat", "--resume", session.ID, "--quit", "--prompt", "next user delta"}, strings.NewReader(""), &resumeStdout, &resumeStderr, func() (string, error) {
+		return t.TempDir(), nil
+	})
+
+	if code != 0 {
+		t.Fatalf("resume RunWithIO() code = %d, stderr = %s", code, resumeStderr.String())
+	}
+	if got, want := resumeStdout.String(), "next assistant delta"; got != want {
+		t.Fatalf("resume stdout = %q, want %q", got, want)
+	}
+	resumeRequest := <-requests
+	assertNoAdditionalCLIRunRequest(t, requests)
+
+	resumeMessages := requestMessages(t, resumeRequest.Body)
+	if len(resumeMessages) != 7 {
+		t.Fatalf("len(resume messages) = %d, want compacted active history plus new user: %#v", len(resumeMessages), resumeMessages)
+	}
+	assertMessage(t, resumeMessages, 0, "system", builtInBaseInstructions)
+	assertMessage(t, resumeMessages, 1, "user", "middle user beta")
+	assertMessage(t, resumeMessages, 2, "assistant", "middle assistant beta")
+	assertMessage(t, resumeMessages, 3, "user", "recent user gamma")
+	assertMessage(t, resumeMessages, 4, "assistant", "recent assistant gamma")
+	assertMessageContentContains(t, resumeMessages, 5, "developer", "<compaction_summary>")
+	assertMessage(t, resumeMessages, 6, "user", "next user delta")
+	for _, leaked := range []string{"old user alpha", "old assistant alpha"} {
+		if strings.Contains(string(resumeRequest.RawBody), leaked) {
+			t.Fatalf("resume request included inactive content %q: %s", leaked, resumeRequest.RawBody)
+		}
+	}
+	if requestMessagesContainExactContent(resumeMessages, "/compact") {
+		t.Fatalf("resume request included compact slash command as a message: %#v", resumeMessages)
+	}
+
+	session = loadCLISession(t, sessionRoot, session.ID)
+	for _, persisted := range []string{
+		"old user alpha",
+		"old assistant alpha",
+		"middle user beta",
+		"middle assistant beta",
+		"recent user gamma",
+		"recent assistant gamma",
+	} {
+		if !sessionContainsExactMessageContent(session, persisted) {
+			t.Fatalf("session items dropped pre-compact visible message %q after resume: %#v", persisted, session.Items)
+		}
+	}
+	active := activeCLIMessages(t, session)
+	if len(active) != 8 {
+		t.Fatalf("len(active messages) = %d, want resumed compacted history plus continuation: %#v", len(active), active)
+	}
+	assertSavedMessageContentContains(t, active, 5, model.MessageRoleDeveloper, "<compaction_summary>")
+	assertSavedMessage(t, active, 6, model.MessageRoleUser, "next user delta")
+	assertSavedMessage(t, active, 7, model.MessageRoleAssistant, "next assistant delta")
+}
+
+func TestValidateCompactionReplacementHistoryRejectsIllegalToolExchangeBeforeWrite(t *testing.T) {
+	summaryMessage := model.Message{Role: model.MessageRoleDeveloper, Content: "<compaction_summary>\nsummary\n</compaction_summary>"}
+	summaryItem := sessions.SessionItem{
+		ID:         "summary-1",
+		Kind:       sessions.ItemKindMessage,
+		Visibility: sessions.ItemVisibilityHidden,
+		Audience:   sessions.ItemAudienceModel,
+		Message:    &summaryMessage,
+	}
+	session := sessions.SessionV2{
+		ID: "bad-replacement-session",
+		Items: []sessions.SessionItem{
+			sessionItemFromMessage("runtime-1", model.Message{Role: model.MessageRoleSystem, Content: "runtime"}),
+			sessionItemFromMessage("user-1", model.Message{Role: model.MessageRoleUser, Content: "ask"}),
+			sessionItemFromMessage("assistant-tool-1", model.Message{
+				Role: model.MessageRoleAssistant,
+				ToolCalls: []model.ToolCall{
+					{ID: "call_1", Name: "read_file", Arguments: `{"path":"note.txt"}`},
+				},
+			}),
+		},
+	}
+
+	_, err := validateCompactionReplacementHistory(session, summaryItem, []string{"runtime-1", "user-1", "assistant-tool-1", "summary-1"})
+
+	if err == nil {
+		t.Fatal("validateCompactionReplacementHistory() error = nil, want illegal tool exchange")
+	}
+	if !strings.Contains(err.Error(), "appears before tool results for call_1") {
+		t.Fatalf("validateCompactionReplacementHistory() error = %q, want pending tool result detail", err)
+	}
+}
+
+func TestChatMultilineCompactIsUserText(t *testing.T) {
+	server, requests := newCLIRunServer(t,
+		`{"choices":[{"delta":{"content":"ok"}}]}`,
+		`[DONE]`,
+	)
+	defer server.Close()
+
+	configDir := t.TempDir()
+	writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
+	setCLISessionsConfig(t, configDir, true, true)
+	setCLICompactionConfig(t, configDir, true, "", "")
+
+	var stdout, stderr bytes.Buffer
+	code := RunWithIO([]string{"--config", cliConfigPath(configDir), "chat"}, strings.NewReader("\"\"\"\n/compact\n\"\"\"\n/quit\n"), &stdout, &stderr, func() (string, error) {
+		return t.TempDir(), nil
+	})
+
+	if code != 0 {
+		t.Fatalf("RunWithIO() code = %d, stderr = %s", code, stderr.String())
+	}
+	if strings.Contains(stderr.String(), "compacted session context") {
+		t.Fatalf("stderr = %q, want no compaction status", stderr.String())
+	}
+	messages := requestMessages(t, (<-requests).Body)
+	assertMessage(t, messages, 1, "user", "/compact")
+	assertNoAdditionalCLIRunRequest(t, requests)
+
+	session := loadOnlyCLISession(t, filepath.Join(configDir, "sessions"))
+	if len(session.Compactions) != 0 {
+		t.Fatalf("Compactions = %#v, want none", session.Compactions)
+	}
+	if !sessionContainsMessageContent(session, "/compact") {
+		t.Fatalf("session items do not contain multiline /compact user text: %#v", session.Items)
+	}
+}
+
+func TestChatInitialPromptCompactIsUserText(t *testing.T) {
+	server, requests := newCLIRunServer(t,
+		`{"choices":[{"delta":{"content":"ok"}}]}`,
+		`[DONE]`,
+	)
+	defer server.Close()
+
+	configDir := t.TempDir()
+	writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
+	setCLISessionsConfig(t, configDir, true, true)
+	setCLICompactionConfig(t, configDir, true, "", "")
+
+	var stdout, stderr bytes.Buffer
+	code := RunWithIO([]string{"--config", cliConfigPath(configDir), "chat", "--quit", "--prompt", "/compact"}, strings.NewReader(""), &stdout, &stderr, func() (string, error) {
+		return t.TempDir(), nil
+	})
+
+	if code != 0 {
+		t.Fatalf("RunWithIO() code = %d, stderr = %s", code, stderr.String())
+	}
+	if strings.Contains(stderr.String(), "compacted session context") {
+		t.Fatalf("stderr = %q, want no compaction status", stderr.String())
+	}
+	messages := requestMessages(t, (<-requests).Body)
+	assertMessage(t, messages, 1, "user", "/compact")
+	assertNoAdditionalCLIRunRequest(t, requests)
+
+	session := loadOnlyCLISession(t, filepath.Join(configDir, "sessions"))
+	if len(session.Compactions) != 0 {
+		t.Fatalf("Compactions = %#v, want none", session.Compactions)
+	}
+	if !sessionContainsExactMessageContent(session, "/compact") {
+		t.Fatalf("session items do not contain initial /compact user text: %#v", session.Items)
+	}
+}
+
+func TestChatManualCompactDisabledOrNotSavingDoesNotRequestModel(t *testing.T) {
+	tests := []struct {
+		name              string
+		sessionsEnabled   bool
+		compactionEnabled bool
+		want              string
+	}{
+		{name: "disabled", sessionsEnabled: true, compactionEnabled: false, want: "compaction is disabled"},
+		{name: "not saving", sessionsEnabled: false, compactionEnabled: true, want: "compaction requires a saved or resumed session"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server, requests := newCLIRunServer(t,
+				`{"choices":[{"delta":{"content":"unexpected"}}]}`,
+				`[DONE]`,
+			)
+			defer server.Close()
+
+			configDir := t.TempDir()
+			writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
+			setCLISessionsConfig(t, configDir, tt.sessionsEnabled, true)
+			setCLICompactionConfig(t, configDir, tt.compactionEnabled, "", "")
+
+			var stdout, stderr bytes.Buffer
+			code := RunWithIO([]string{"--config", cliConfigPath(configDir), "chat"}, strings.NewReader("/compact\n/quit\n"), &stdout, &stderr, func() (string, error) {
+				return t.TempDir(), nil
+			})
+
+			if code != 0 {
+				t.Fatalf("RunWithIO() code = %d, stderr = %s", code, stderr.String())
+			}
+			if stdout.String() != "" {
+				t.Fatalf("stdout = %q, want empty", stdout.String())
+			}
+			assertCLIErrorContains(t, stderr.String(), "sai: compact failed", tt.want)
+			assertNoAdditionalCLIRunRequest(t, requests)
+		})
+	}
+}
+
+func TestChatManualCompactSummaryFailureLeavesStateUnchanged(t *testing.T) {
+	server, requests := newSequentialCLIRunServer(t,
+		[]string{
+			`{"choices":[{"delta":{"content":"one"}}]}`,
+			`[DONE]`,
+		},
+		[]string{
+			`{"choices":[{"delta":{"content":"two"}}]}`,
+			`[DONE]`,
+		},
+		[]string{
+			`{not-json`,
+		},
+		[]string{
+			`{"choices":[{"delta":{"content":"three"}}]}`,
+			`[DONE]`,
+		},
+	)
+	defer server.Close()
+
+	configDir := t.TempDir()
+	writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
+	setCLISessionsConfig(t, configDir, true, true)
+	setCLICompactionConfig(t, configDir, true, "", "")
+
+	var stdout, stderr bytes.Buffer
+	code := RunWithIO([]string{"--config", cliConfigPath(configDir), "chat"}, strings.NewReader("first\nsecond\n/compact\nthird\n/quit\n"), &stdout, &stderr, func() (string, error) {
+		return t.TempDir(), nil
+	})
+
+	if code != 0 {
+		t.Fatalf("RunWithIO() code = %d, stderr = %s", code, stderr.String())
+	}
+	if got, want := stdout.String(), "one\ntwo\nthree\n"; got != want {
+		t.Fatalf("stdout = %q, want %q", got, want)
+	}
+	assertCLIErrorContains(t, stderr.String(), "sai: compact failed", "parse OpenAI chat stream")
+	assertCLIErrorOmits(t, stderr.String(), "first", "second", "third", "one", "two", "three", "direct-secret-value")
+
+	<-requests
+	<-requests
+	<-requests
+	nextRequest := <-requests
+	assertNoAdditionalCLIRunRequest(t, requests)
+	nextMessages := requestMessages(t, nextRequest.Body)
+	if len(nextMessages) != 6 {
+		t.Fatalf("len(next request messages) = %d, want unchanged full history plus new user: %#v", len(nextMessages), nextMessages)
+	}
+	assertMessage(t, nextMessages, 1, "user", "first")
+	assertMessage(t, nextMessages, 2, "assistant", "one")
+	assertMessage(t, nextMessages, 3, "user", "second")
+	assertMessage(t, nextMessages, 4, "assistant", "two")
+	assertMessage(t, nextMessages, 5, "user", "third")
+
+	session := loadOnlyCLISession(t, filepath.Join(configDir, "sessions"))
+	if len(session.Compactions) != 0 {
+		t.Fatalf("Compactions = %#v, want none", session.Compactions)
+	}
+	if sessionContainsMessageContent(session, "<compaction_summary>") {
+		t.Fatalf("session contains summary after failed compaction: %#v", session.Items)
+	}
+	active := activeCLIMessages(t, session)
+	if len(active) != 7 {
+		t.Fatalf("len(active messages) = %d, want original history plus third turn: %#v", len(active), active)
+	}
+	assertSavedMessage(t, active, 1, model.MessageRoleUser, "first")
+	assertSavedMessage(t, active, 3, model.MessageRoleUser, "second")
+	assertSavedMessage(t, active, 5, model.MessageRoleUser, "third")
+}
+
+func TestChatAutoCompactTriggersBeforeMainModelWhenThresholdExceeded(t *testing.T) {
+	server, requests := newSequentialCLIRunServer(t,
+		[]string{
+			`{"choices":[{"delta":{"content":"one"}}]}`,
+			`[DONE]`,
+		},
+		[]string{
+			`{"choices":[{"delta":{"content":"# Context Checkpoint\n\n## Goal\nContinue.\n\n## Current Progress\nFirst turn is current.\n\n## Decisions Made\nNone.\n\n## Constraints / User Preferences\nKeep concise.\n\n## Relevant Files / APIs / Commands\nNone.\n\n## Tool State / Environment State\nNo tools.\n\n## Open Questions\nNone.\n\n## Next Steps\nAnswer second."}}]}`,
+			`[DONE]`,
+		},
+		[]string{
+			`{"choices":[{"delta":{"content":"two"}}]}`,
+			`[DONE]`,
+		},
+	)
+	defer server.Close()
+
+	configDir := t.TempDir()
+	writeCLIRunFixtureInDirWithTools(t, configDir, server.URL, "direct-secret-value", "openai-chat", []string{"read_file"})
+	setCLISessionsConfig(t, configDir, true, true)
+	setCLICompactionConfigWithThreshold(t, configDir, true, 1, "", "")
+	setCLIModelContextWindow(t, configDir, 10000)
+
+	var stdout, stderr bytes.Buffer
+	code := RunWithIO([]string{"--config", cliConfigPath(configDir), "chat"}, strings.NewReader("first\nsecond\n/quit\n"), &stdout, &stderr, func() (string, error) {
+		return t.TempDir(), nil
+	})
+
+	if code != 0 {
+		t.Fatalf("RunWithIO() code = %d, stderr = %s", code, stderr.String())
+	}
+	if got, want := stdout.String(), "one\ntwo\n"; got != want {
+		t.Fatalf("stdout = %q, want %q", got, want)
+	}
+
+	firstRequest := <-requests
+	summaryRequest := <-requests
+	secondRequest := <-requests
+	assertNoAdditionalCLIRunRequest(t, requests)
+
+	assertMessage(t, requestMessages(t, firstRequest.Body), 1, "user", "first")
+	if _, ok := summaryRequest.Body["tools"]; ok {
+		t.Fatalf("summary request included tools: %#v", summaryRequest.Body["tools"])
+	}
+	summaryMessages := requestMessages(t, summaryRequest.Body)
+	if len(summaryMessages) != 2 {
+		t.Fatalf("len(summary messages) = %d, want 2: %#v", len(summaryMessages), summaryMessages)
+	}
+	assertMessageContentContains(t, summaryMessages, 0, "system", "Create a concise handoff checkpoint")
+	assertMessageContentContains(t, summaryMessages, 1, "user", "first")
+	if strings.Contains(string(summaryRequest.RawBody), "second") {
+		t.Fatalf("summary request included pending user message: %s", summaryRequest.RawBody)
+	}
+
+	secondMessages := requestMessages(t, secondRequest.Body)
+	if len(secondMessages) != 5 {
+		t.Fatalf("len(second request messages) = %d, want compacted history plus pending user: %#v", len(secondMessages), secondMessages)
+	}
+	assertMessage(t, secondMessages, 0, "system", builtInBaseInstructions)
+	assertMessage(t, secondMessages, 1, "user", "first")
+	assertMessage(t, secondMessages, 2, "assistant", "one")
+	assertMessageContentContains(t, secondMessages, 3, "developer", "<compaction_summary>")
+	assertMessage(t, secondMessages, 4, "user", "second")
+	assertCLIToolNames(t, secondRequest.Body, []string{"read_file"})
+
+	session := loadOnlyCLISession(t, filepath.Join(configDir, "sessions"))
+	if len(session.Compactions) != 1 {
+		t.Fatalf("len(Compactions) = %d, want 1: %#v", len(session.Compactions), session.Compactions)
+	}
+	checkpoint := session.Compactions[0]
+	if checkpoint.Reason != "context_limit" || checkpoint.Phase != "pre_turn" || checkpoint.Trigger != "auto" {
+		t.Fatalf("checkpoint reason/phase/trigger = %q/%q/%q, want auto pre-turn context limit", checkpoint.Reason, checkpoint.Phase, checkpoint.Trigger)
+	}
+	if !sessionContainsExactMessageContent(session, "first") || !sessionContainsExactMessageContent(session, "one") {
+		t.Fatalf("session items dropped old visible messages: %#v", session.Items)
+	}
+	active := activeCLIMessages(t, session)
+	if len(active) != 6 {
+		t.Fatalf("len(active messages) = %d, want compacted history plus second turn: %#v", len(active), active)
+	}
+	assertSavedMessageContentContains(t, active, 3, model.MessageRoleDeveloper, "<compaction_summary>")
+	assertSavedMessage(t, active, 4, model.MessageRoleUser, "second")
+	assertSavedMessage(t, active, 5, model.MessageRoleAssistant, "two")
+}
+
+func TestChatAutoCompactDoesNotTriggerBelowThreshold(t *testing.T) {
+	server, requests := newSequentialCLIRunServer(t,
+		[]string{
+			`{"choices":[{"delta":{"content":"one"}}]}`,
+			`[DONE]`,
+		},
+		[]string{
+			`{"choices":[{"delta":{"content":"two"}}]}`,
+			`[DONE]`,
+		},
+	)
+	defer server.Close()
+
+	configDir := t.TempDir()
+	writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
+	setCLISessionsConfig(t, configDir, true, true)
+	setCLICompactionConfig(t, configDir, true, "", "")
+	setCLIModelContextWindow(t, configDir, 100000)
+
+	var stdout, stderr bytes.Buffer
+	code := RunWithIO([]string{"--config", cliConfigPath(configDir), "chat"}, strings.NewReader("first\nsecond\n/quit\n"), &stdout, &stderr, func() (string, error) {
+		return t.TempDir(), nil
+	})
+
+	if code != 0 {
+		t.Fatalf("RunWithIO() code = %d, stderr = %s", code, stderr.String())
+	}
+	firstRequest := <-requests
+	secondRequest := <-requests
+	assertNoAdditionalCLIRunRequest(t, requests)
+
+	assertMessage(t, requestMessages(t, firstRequest.Body), 1, "user", "first")
+	secondMessages := requestMessages(t, secondRequest.Body)
+	if len(secondMessages) != 4 {
+		t.Fatalf("len(second request messages) = %d, want direct full history: %#v", len(secondMessages), secondMessages)
+	}
+	assertMessage(t, secondMessages, 1, "user", "first")
+	assertMessage(t, secondMessages, 2, "assistant", "one")
+	assertMessage(t, secondMessages, 3, "user", "second")
+	if strings.Contains(string(secondRequest.RawBody), "<compaction_summary>") {
+		t.Fatalf("second request included compaction summary: %s", secondRequest.RawBody)
+	}
+
+	session := loadOnlyCLISession(t, filepath.Join(configDir, "sessions"))
+	if len(session.Compactions) != 0 {
+		t.Fatalf("Compactions = %#v, want none", session.Compactions)
+	}
+}
+
+func TestChatAutoCompactFailureLeavesTurnUnchangedAndREPLContinues(t *testing.T) {
+	server, requests := newSequentialCLIRunServer(t,
+		[]string{
+			`{"choices":[{"delta":{"content":"one"}}]}`,
+			`[DONE]`,
+		},
+		[]string{
+			`{not-json`,
+		},
+		[]string{
+			`{"choices":[{"delta":{"content":"# Context Checkpoint\n\n## Goal\nContinue.\n\n## Current Progress\nFirst turn is current.\n\n## Decisions Made\nNone.\n\n## Constraints / User Preferences\nKeep concise.\n\n## Relevant Files / APIs / Commands\nNone.\n\n## Tool State / Environment State\nNo tools.\n\n## Open Questions\nNone.\n\n## Next Steps\nAnswer third."}}]}`,
+			`[DONE]`,
+		},
+		[]string{
+			`{"choices":[{"delta":{"content":"three"}}]}`,
+			`[DONE]`,
+		},
+	)
+	defer server.Close()
+
+	configDir := t.TempDir()
+	writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
+	setCLISessionsConfig(t, configDir, true, true)
+	setCLICompactionConfigWithThreshold(t, configDir, true, 1, "", "")
+	setCLIModelContextWindow(t, configDir, 10000)
+
+	var stdout, stderr bytes.Buffer
+	code := RunWithIO([]string{"--config", cliConfigPath(configDir), "chat"}, strings.NewReader("first\nsecond\nthird\n/quit\n"), &stdout, &stderr, func() (string, error) {
+		return t.TempDir(), nil
+	})
+
+	if code != 0 {
+		t.Fatalf("RunWithIO() code = %d, stderr = %s", code, stderr.String())
+	}
+	if got, want := stdout.String(), "one\nthree\n"; got != want {
+		t.Fatalf("stdout = %q, want %q", got, want)
+	}
+	assertCLIErrorContains(t, stderr.String(), "sai: auto compact failed", "parse OpenAI chat stream")
+
+	firstRequest := <-requests
+	failedSummaryRequest := <-requests
+	retrySummaryRequest := <-requests
+	thirdRequest := <-requests
+	assertNoAdditionalCLIRunRequest(t, requests)
+	assertMessage(t, requestMessages(t, firstRequest.Body), 1, "user", "first")
+	if _, ok := failedSummaryRequest.Body["tools"]; ok {
+		t.Fatalf("failed summary request included tools: %#v", failedSummaryRequest.Body["tools"])
+	}
+	if strings.Contains(string(failedSummaryRequest.RawBody), "second") {
+		t.Fatalf("failed summary request included pending failed user message: %s", failedSummaryRequest.RawBody)
+	}
+	if strings.Contains(string(retrySummaryRequest.RawBody), "third") {
+		t.Fatalf("retry summary request included pending later user message: %s", retrySummaryRequest.RawBody)
+	}
+	thirdMessages := requestMessages(t, thirdRequest.Body)
+	assertMessageContentContains(t, thirdMessages, 3, "developer", "<compaction_summary>")
+	assertMessage(t, thirdMessages, 4, "user", "third")
+	if requestMessagesContainExactContent(thirdMessages, "second") {
+		t.Fatalf("third request included failed pending user message: %#v", thirdMessages)
+	}
+
+	session := loadOnlyCLISession(t, filepath.Join(configDir, "sessions"))
+	if len(session.Compactions) != 1 {
+		t.Fatalf("len(Compactions) = %d, want only later successful auto compaction: %#v", len(session.Compactions), session.Compactions)
+	}
+	if sessionContainsExactMessageContent(session, "second") {
+		t.Fatalf("session items contain failed pending user message: %#v", session.Items)
+	}
+	if !sessionContainsExactMessageContent(session, "first") || !sessionContainsExactMessageContent(session, "third") {
+		t.Fatalf("session items missing successful turns: %#v", session.Items)
+	}
+}
+
+func TestAutoCompactionThresholdUsesStrictExceedsBoundary(t *testing.T) {
+	if autoCompactionThresholdExceeded(80, 100, 80) {
+		t.Fatal("autoCompactionThresholdExceeded(80, 100, 80) = true, want false at threshold")
+	}
+	if !autoCompactionThresholdExceeded(81, 100, 80) {
+		t.Fatal("autoCompactionThresholdExceeded(81, 100, 80) = false, want true above threshold")
 	}
 }
 
@@ -2999,7 +3742,7 @@ func TestChatConfiguredSessionNoticePrintsOnceWithoutSensitiveContent(t *testing
 	assertCLIErrorOmits(t, errOut, "first prompt secret", "second prompt secret", "first assistant secret", "second assistant secret", "direct-secret-value")
 }
 
-func TestChatResumeSendsRestoredMessagesAndSavesContinuation(t *testing.T) {
+func TestChatResumeSendsOnlyActiveHistoryAndSavesContinuation(t *testing.T) {
 	server, requests := newCLIRunServer(t,
 		`{"choices":[{"delta":{"content":"two"}}]}`,
 		`[DONE]`,
@@ -3009,37 +3752,45 @@ func TestChatResumeSendsRestoredMessagesAndSavesContinuation(t *testing.T) {
 	configDir := t.TempDir()
 	writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
 	sessionRoot := filepath.Join(configDir, "sessions")
-	writeCLISession(t, sessionRoot, sessions.Session{
+	savedInstruction := model.Message{Role: model.MessageRoleSystem, Content: "saved instructions"}
+	oldVisible := model.Message{Role: model.MessageRoleUser, Content: "old visible item secret"}
+	activeUser := model.Message{Role: model.MessageRoleUser, Content: "first"}
+	activeAssistant := model.Message{Role: model.MessageRoleAssistant, Content: "one"}
+	writeCLISessionV2(t, sessionRoot, sessions.SessionV2{
 		ID:              "resume-session",
 		CreatedAt:       time.Date(2026, 7, 2, 3, 4, 5, 0, time.UTC),
 		UpdatedAt:       time.Date(2026, 7, 2, 3, 4, 6, 0, time.UTC),
-		Version:         sessions.CurrentVersion,
+		Version:         sessions.VersionV2,
 		Provider:        "fake",
 		ModelProfile:    "fast",
 		ModelID:         "model-fast",
 		ModelParameters: map[string]any{"temperature": 0.2, "max_tokens": 64},
 		ConfigPath:      cliConfigPath(configDir),
 		InstructionsSnapshot: []model.Message{
-			{Role: model.MessageRoleSystem, Content: "saved instructions"},
+			savedInstruction,
 		},
-		Messages: []model.Message{
-			{Role: model.MessageRoleSystem, Content: "saved instructions"},
-			{Role: model.MessageRoleUser, Content: "first"},
-			{Role: model.MessageRoleAssistant, Content: "one"},
+		Items: []sessions.SessionItem{
+			sessionItemFromMessage("runtime-saved", savedInstruction),
+			sessionItemFromMessage("old-visible", oldVisible),
+			sessionItemFromMessage("active-user", activeUser),
+			sessionItemFromMessage("active-assistant", activeAssistant),
 		},
+		ActiveHistory:   []string{"runtime-saved", "active-user", "active-assistant"},
 		SaveToolResults: true,
 	})
+	projectDir := t.TempDir()
+	writeCLIFile(t, filepath.Join(projectDir, "AGENTS.md"), "current project instruction secret\n")
 
 	var stdout, stderr bytes.Buffer
 	code := RunWithIO([]string{"--config", cliConfigPath(configDir), "chat", "--resume", "resume-session", "--quit", "--prompt", "next"}, strings.NewReader(""), &stdout, &stderr, func() (string, error) {
-		return t.TempDir(), nil
+		return projectDir, nil
 	})
 
 	if code != 0 {
 		t.Fatalf("RunWithIO() code = %d, stderr = %s", code, stderr.String())
 	}
 	assertResumableSessionNoticeOnce(t, stderr.String())
-	assertCLIErrorOmits(t, stderr.String(), "first", "one", "next", "two")
+	assertCLIErrorOmits(t, stderr.String(), "first", "one", "next", "two", "old visible item secret", "current project instruction secret")
 	request := <-requests
 	if got := request.Body["model"]; got != "model-fast" {
 		t.Fatalf("model = %#v, want model-fast", got)
@@ -3052,14 +3803,89 @@ func TestChatResumeSendsRestoredMessagesAndSavesContinuation(t *testing.T) {
 	assertMessage(t, messages, 1, "user", "first")
 	assertMessage(t, messages, 2, "assistant", "one")
 	assertMessage(t, messages, 3, "user", "next")
+	for _, leaked := range []string{"old visible item secret", "current project instruction secret"} {
+		if strings.Contains(string(request.RawBody), leaked) {
+			t.Fatalf("resume request included inactive/current content %q: %s", leaked, request.RawBody)
+		}
+	}
 	assertNoAdditionalCLIRunRequest(t, requests)
 
 	session := loadCLISession(t, sessionRoot, "resume-session")
-	if len(session.Messages) != 5 {
-		t.Fatalf("len(saved messages) = %d, want 5: %#v", len(session.Messages), session.Messages)
+	active := activeCLIMessages(t, session)
+	if len(active) != 5 {
+		t.Fatalf("len(saved messages) = %d, want 5: %#v", len(active), active)
 	}
-	assertSavedMessage(t, session.Messages, 3, model.MessageRoleUser, "next")
-	assertSavedMessage(t, session.Messages, 4, model.MessageRoleAssistant, "two")
+	assertSavedMessage(t, active, 3, model.MessageRoleUser, "next")
+	assertSavedMessage(t, active, 4, model.MessageRoleAssistant, "two")
+	if len(session.Items) != 6 {
+		t.Fatalf("len(session.Items) = %d, want inactive item plus appended active items: %#v", len(session.Items), session.Items)
+	}
+}
+
+func TestChatResumeRejectsCorruptedActiveHistory(t *testing.T) {
+	server, requests := newCLIRunServer(t,
+		`{"choices":[{"delta":{"content":"unexpected assistant secret"}}]}`,
+		`[DONE]`,
+	)
+	defer server.Close()
+
+	tests := []struct {
+		name    string
+		session sessions.SessionV2
+		want    string
+	}{
+		{
+			name: "missing item ref",
+			session: sessions.SessionV2{
+				ID:              "missing-ref-session",
+				Version:         sessions.VersionV2,
+				Provider:        "fake",
+				ModelProfile:    "default",
+				ModelID:         "model-default",
+				ActiveHistory:   []string{"missing"},
+				SaveToolResults: true,
+			},
+			want: `active history references missing item "missing"`,
+		},
+		{
+			name: "orphan tool result",
+			session: sessions.SessionV2{
+				ID:           "orphan-tool-session",
+				Version:      sessions.VersionV2,
+				Provider:     "fake",
+				ModelProfile: "default",
+				ModelID:      "model-default",
+				Items: []sessions.SessionItem{
+					sessionItemFromMessage("tool-only", model.Message{Role: model.MessageRoleTool, ToolCallID: "call_1", Content: "tool result secret"}),
+				},
+				ActiveHistory:   []string{"tool-only"},
+				SaveToolResults: true,
+			},
+			want: `references unresolved tool call "call_1"`,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			configDir := t.TempDir()
+			writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
+			writeCLISessionV2(t, filepath.Join(configDir, "sessions"), tt.session)
+
+			var stdout, stderr bytes.Buffer
+			code := RunWithIO([]string{"--config", cliConfigPath(configDir), "chat", "--resume", tt.session.ID, "--quit", "--prompt", "next prompt secret"}, strings.NewReader(""), &stdout, &stderr, func() (string, error) {
+				return t.TempDir(), nil
+			})
+
+			if code != 1 {
+				t.Fatalf("RunWithIO() code = %d, want 1", code)
+			}
+			if stdout.String() != "" {
+				t.Fatalf("stdout = %q, want empty", stdout.String())
+			}
+			assertCLIErrorContains(t, stderr.String(), "corrupted session", tt.want)
+			assertCLIErrorOmits(t, stderr.String(), "next prompt secret", "tool result secret", "unexpected assistant secret", "direct-secret-value")
+			assertNoAdditionalCLIRunRequest(t, requests)
+		})
+	}
 }
 
 func TestChatContinueUsesLatestSession(t *testing.T) {
@@ -3549,6 +4375,70 @@ func TestSessionsShowPrintsMetadataAndSensitiveContentWarning(t *testing.T) {
 	}
 }
 
+func TestSessionsShowOmitsV2HiddenSummaryAndInactiveVisibleBodies(t *testing.T) {
+	configDir := writeCLIFixture(t)
+	sessionRoot := filepath.Join(configDir, "sessions")
+	hiddenSummary := model.Message{Role: model.MessageRoleDeveloper, Content: "<compaction_summary>\nhidden summary secret\n</compaction_summary>"}
+	writeCLISessionV2(t, sessionRoot, sessions.SessionV2{
+		ID:              "compacted-show-session",
+		CreatedAt:       time.Date(2026, 7, 2, 3, 0, 0, 0, time.UTC),
+		UpdatedAt:       time.Date(2026, 7, 2, 3, 1, 0, 0, time.UTC),
+		Version:         sessions.VersionV2,
+		Provider:        "paperhub",
+		ModelProfile:    "glm-5.2",
+		ModelID:         "glm-5.2",
+		SaveToolResults: true,
+		Items: []sessions.SessionItem{
+			{
+				ID:         "inactive-visible-user",
+				Kind:       sessions.ItemKindMessage,
+				Visibility: sessions.ItemVisibilityVisible,
+				Audience:   sessions.ItemAudienceUser,
+				Message:    &model.Message{Role: model.MessageRoleUser, Content: "inactive visible prompt secret"},
+			},
+			{
+				ID:         "summary-hidden",
+				Kind:       sessions.ItemKindMessage,
+				Visibility: sessions.ItemVisibilityHidden,
+				Audience:   sessions.ItemAudienceModel,
+				Message:    &hiddenSummary,
+			},
+			{
+				ID:         "active-user",
+				Kind:       sessions.ItemKindMessage,
+				Visibility: sessions.ItemVisibilityVisible,
+				Audience:   sessions.ItemAudienceUser,
+				Message:    &model.Message{Role: model.MessageRoleUser, Content: "active prompt secret"},
+			},
+		},
+		ActiveHistory: []string{"summary-hidden", "active-user"},
+	})
+
+	var stdout, stderr bytes.Buffer
+	code := RunWithGetwd([]string{"--config", cliConfigPath(configDir), "sessions", "show", "compacted-show-session"}, &stdout, &stderr, func() (string, error) {
+		return "", errors.New("getwd should not be called")
+	})
+
+	if code != 0 {
+		t.Fatalf("RunWithGetwd() code = %d, stderr = %s", code, stderr.String())
+	}
+	out := stdout.String()
+	for _, want := range []string{
+		"WARNING: session files contain full sensitive content",
+		"ID\tcompacted-show-session",
+		"MESSAGE_COUNT\t3",
+		"ACTIVE_HISTORY_COUNT\t2",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("sessions show output missing %q:\n%s", want, out)
+		}
+	}
+	assertCLIErrorOmits(t, out, "inactive visible prompt secret", "hidden summary secret", "<compaction_summary>", "active prompt secret")
+	if stderr.String() != "" {
+		t.Fatalf("stderr = %q, want empty", stderr.String())
+	}
+}
+
 func TestSessionsDeleteRemovesSessionAndReportsMissingSession(t *testing.T) {
 	configDir := writeCLIFixture(t)
 	sessionRoot := filepath.Join(configDir, "sessions")
@@ -3574,7 +4464,7 @@ func TestSessionsDeleteRemovesSessionAndReportsMissingSession(t *testing.T) {
 	if got, want := stdout.String(), "deleted session delete-session\n"; got != want {
 		t.Fatalf("stdout = %q, want %q", got, want)
 	}
-	if _, err := sessions.NewStore(sessionRoot).Load("delete-session"); !errors.Is(err, sessions.ErrNotFound) {
+	if _, err := sessions.NewV2Store(sessionRoot).Load("delete-session"); !errors.Is(err, sessions.ErrNotFound) {
 		t.Fatalf("Load(deleted) error = %v, want ErrNotFound", err)
 	}
 
@@ -3675,7 +4565,7 @@ func TestSessionsPruneKeepsNewestSessionsWithMixedKeepFlag(t *testing.T) {
 						t.Fatalf("prune output missing %q:\n%s", want, out)
 					}
 				}
-				infos, err := sessions.NewStore(sessionRoot).List()
+				infos, err := sessions.NewV2Store(sessionRoot).List()
 				if err != nil {
 					t.Fatalf("List() after prune error = %v", err)
 				}
@@ -3693,7 +4583,7 @@ func TestSessionsPruneKeepsNewestSessionsWithMixedKeepFlag(t *testing.T) {
 			if strings.Contains(out, "newest-session") {
 				t.Fatalf("prune output included kept session:\n%s", out)
 			}
-			infos, err := sessions.NewStore(sessionRoot).List()
+			infos, err := sessions.NewV2Store(sessionRoot).List()
 			if err != nil {
 				t.Fatalf("List() after prune error = %v", err)
 			}
@@ -7371,6 +8261,31 @@ sessions:
 	writeCLIFile(t, configPath, updated)
 }
 
+func setCLICompactionConfig(t *testing.T, configDir string, enabled bool, summaryProvider, summaryModel string) {
+	t.Helper()
+
+	setCLICompactionConfigWithThreshold(t, configDir, enabled, 80, summaryProvider, summaryModel)
+}
+
+func setCLICompactionConfigWithThreshold(t *testing.T, configDir string, enabled bool, thresholdPercent int, summaryProvider, summaryModel string) {
+	t.Helper()
+
+	configPath := filepath.Join(configDir, "sai.yaml")
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("ReadFile(%q) error = %v", configPath, err)
+	}
+	updated := strings.TrimRight(string(data), "\r\n") + fmt.Sprintf(`
+
+compaction:
+  enabled: %t
+  threshold_percent: %d
+  summary_provider: %q
+  summary_model: %q
+`, enabled, thresholdPercent, summaryProvider, summaryModel)
+	writeCLIFile(t, configPath, updated)
+}
+
 func setCLIAgentShowReasoning(t *testing.T, configDir string, enabled bool) {
 	t.Helper()
 
@@ -7445,10 +8360,10 @@ func setCLIInstructionFiles(t *testing.T, configDir string, files []string) {
 	writeCLIFile(t, configPath, updated)
 }
 
-func loadOnlyCLISession(t *testing.T, root string) sessions.Session {
+func loadOnlyCLISession(t *testing.T, root string) sessions.SessionV2 {
 	t.Helper()
 
-	store := sessions.NewStore(root)
+	store := sessions.NewV2Store(root)
 	infos, err := store.List()
 	if err != nil {
 		t.Fatalf("List() error = %v", err)
@@ -7459,31 +8374,154 @@ func loadOnlyCLISession(t *testing.T, root string) sessions.Session {
 	return loadCLISession(t, root, infos[0].ID)
 }
 
-func loadCLISession(t *testing.T, root, id string) sessions.Session {
+func loadCLISession(t *testing.T, root, id string) sessions.SessionV2 {
 	t.Helper()
 
-	session, err := sessions.NewStore(root).Load(id)
+	session, err := sessions.NewV2Store(root).Load(id)
 	if err != nil {
 		t.Fatalf("Load(%q) error = %v", id, err)
 	}
 	return session
 }
 
+func activeCLIMessages(t *testing.T, session sessions.SessionV2) []model.Message {
+	t.Helper()
+
+	messages, err := session.MaterializeActiveHistory()
+	if err != nil {
+		t.Fatalf("MaterializeActiveHistory(%q) error = %v", session.ID, err)
+	}
+	return messages
+}
+
+func sessionItemByID(t *testing.T, session sessions.SessionV2, id string) sessions.SessionItem {
+	t.Helper()
+
+	for _, item := range session.Items {
+		if item.ID == id {
+			return item
+		}
+	}
+	t.Fatalf("session item %q not found in %#v", id, session.Items)
+	return sessions.SessionItem{}
+}
+
+func sessionContainsMessageContent(session sessions.SessionV2, content string) bool {
+	for _, item := range session.Items {
+		if item.Message != nil && strings.Contains(item.Message.Content, content) {
+			return true
+		}
+	}
+	return false
+}
+
+func sessionContainsExactMessageContent(session sessions.SessionV2, content string) bool {
+	for _, item := range session.Items {
+		if item.Message != nil && item.Message.Content == content {
+			return true
+		}
+	}
+	return false
+}
+
 func writeCLISession(t *testing.T, root string, session sessions.Session) {
 	t.Helper()
 
-	if err := os.MkdirAll(filepath.Join(root, session.ID), 0o755); err != nil {
+	v2 := sessions.SessionV2{
+		ID:                   session.ID,
+		CreatedAt:            session.CreatedAt,
+		UpdatedAt:            session.UpdatedAt,
+		Version:              sessions.VersionV2,
+		Provider:             session.Provider,
+		ModelProfile:         session.ModelProfile,
+		ModelID:              session.ModelID,
+		ModelParameters:      session.ModelParameters,
+		CWD:                  session.CWD,
+		ConfigPath:           session.ConfigPath,
+		ConfigDir:            session.ConfigDir,
+		EnabledTools:         session.EnabledTools,
+		EnabledMCP:           session.EnabledMCP,
+		EnabledSkills:        session.EnabledSkills,
+		ShowReasoning:        session.ShowReasoning,
+		InstructionsSnapshot: session.InstructionsSnapshot,
+		InstructionSources:   session.InstructionSources,
+		Context:              session.Context,
+		SaveToolResults:      session.SaveToolResults,
+	}
+	for _, message := range session.Messages {
+		id := nextSessionItemID(sessionItemIDs(v2.Items), message)
+		v2.Items = append(v2.Items, sessionItemFromMessage(id, message))
+		v2.ActiveHistory = append(v2.ActiveHistory, id)
+	}
+	writeCLISessionV2(t, root, v2)
+}
+
+func writeCLISessionV2(t *testing.T, root string, session sessions.SessionV2) {
+	t.Helper()
+
+	if session.Version == 0 || session.Version == sessions.CurrentVersion {
+		session.Version = sessions.VersionV2
+	}
+	if err := os.MkdirAll(filepath.Join(root, session.ID, "segments"), 0o755); err != nil {
 		t.Fatalf("MkdirAll(session %q) error = %v", session.ID, err)
 	}
-	data, err := json.MarshalIndent(session, "", "  ")
+	metadata := session
+	metadata.Items = nil
+	metadata.ActiveHistory = nil
+	metadata.Compactions = nil
+	metadata.LastSeq = 0
+	data, err := json.MarshalIndent(metadata, "", "  ")
 	if err != nil {
 		t.Fatalf("MarshalIndent(session %q) error = %v", session.ID, err)
 	}
 	data = append(data, '\n')
-	path := filepath.Join(root, session.ID, "session.json")
+	path := filepath.Join(root, session.ID, "meta.json")
 	if err := os.WriteFile(path, data, 0o600); err != nil {
 		t.Fatalf("WriteFile(%q) error = %v", path, err)
 	}
+
+	segmentPath := filepath.Join(root, session.ID, "segments", "000001.jsonl")
+	segment := &strings.Builder{}
+	seq := int64(0)
+	for _, item := range session.Items {
+		seq++
+		item.Seq = seq
+		if item.CreatedAt.IsZero() {
+			item.CreatedAt = session.CreatedAt
+			if item.CreatedAt.IsZero() {
+				item.CreatedAt = session.UpdatedAt
+			}
+		}
+		writeCLISessionV2Record(t, segment, map[string]any{
+			"seq":  seq,
+			"type": sessions.RecordTypeItemAppended,
+			"item": item,
+		})
+	}
+	if session.ActiveHistory != nil {
+		seq++
+		writeCLISessionV2Record(t, segment, map[string]any{
+			"seq":      seq,
+			"type":     sessions.RecordTypeActiveHistoryReplaced,
+			"item_ids": session.ActiveHistory,
+		})
+	}
+	if segment.Len() > 0 {
+		if err := os.WriteFile(segmentPath, []byte(segment.String()), 0o600); err != nil {
+			t.Fatalf("WriteFile(%q) error = %v", segmentPath, err)
+		}
+	}
+}
+
+func writeCLISessionV2Record(t *testing.T, out *strings.Builder, record map[string]any) {
+	t.Helper()
+
+	data, err := json.Marshal(record)
+	if err != nil {
+		t.Fatalf("Marshal(session record) error = %v", err)
+	}
+	out.Write(data)
+	out.WriteByte('\n')
 }
 
 func writeCLIPruneSession(t *testing.T, root, id string, updatedAt time.Time) {
@@ -7857,6 +8895,41 @@ func assertMessage(t *testing.T, messages []any, index int, role, content string
 	}
 }
 
+func assertMessageContentContains(t *testing.T, messages []any, index int, role, content string) {
+	t.Helper()
+
+	if index >= len(messages) {
+		t.Fatalf("missing message %d in %#v", index, messages)
+	}
+	message, ok := messages[index].(map[string]any)
+	if !ok {
+		t.Fatalf("message[%d] = %T, want object", index, messages[index])
+	}
+	if got := message["role"]; got != role {
+		t.Fatalf("message[%d].role = %#v, want %q", index, got, role)
+	}
+	got, ok := message["content"].(string)
+	if !ok {
+		t.Fatalf("message[%d].content = %T, want string", index, message["content"])
+	}
+	if !strings.Contains(got, content) {
+		t.Fatalf("message[%d].content = %q, want to contain %q", index, got, content)
+	}
+}
+
+func requestMessagesContainExactContent(messages []any, content string) bool {
+	for _, message := range messages {
+		item, ok := message.(map[string]any)
+		if !ok {
+			continue
+		}
+		if item["content"] == content {
+			return true
+		}
+	}
+	return false
+}
+
 func assertSavedMessage(t *testing.T, messages []model.Message, index int, role model.MessageRole, content string) {
 	t.Helper()
 
@@ -7869,6 +8942,21 @@ func assertSavedMessage(t *testing.T, messages []model.Message, index int, role 
 	}
 	if message.Content != content {
 		t.Fatalf("saved message[%d].Content = %q, want %q", index, message.Content, content)
+	}
+}
+
+func assertSavedMessageContentContains(t *testing.T, messages []model.Message, index int, role model.MessageRole, content string) {
+	t.Helper()
+
+	if index >= len(messages) {
+		t.Fatalf("missing saved message %d in %#v", index, messages)
+	}
+	message := messages[index]
+	if message.Role != role {
+		t.Fatalf("saved message[%d].Role = %q, want %q", index, message.Role, role)
+	}
+	if !strings.Contains(message.Content, content) {
+		t.Fatalf("saved message[%d].Content = %q, want to contain %q", index, message.Content, content)
 	}
 }
 
