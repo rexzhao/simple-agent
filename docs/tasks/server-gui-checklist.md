@@ -29,7 +29,7 @@ future work and should not be required by any slice here.
 - [x] Background lifecycle: implement `sai server --background` so the parent waits
   for listen, registry write, and `/health` success before exiting 0, while the
   child detaches stdout/stderr from the caller terminal.
-- [ ] Listen configuration: support default `127.0.0.1:0`, `--port N`,
+- [x] Listen configuration: support default `127.0.0.1:0`, `--port N`,
   `--port 0`, and advanced loopback `--listen host:port`, with clear errors for
   occupied ports or unsupported addresses.
 - [ ] Registry model: create the per-user registry with canonical cwd,

@@ -421,7 +421,7 @@
 - [ ] `sai server --background` 启动后台 server，父进程等待 listen、registry 写入和 `/health`
   可用后退出 0。
 - [ ] `--background` 子进程 stdout/stderr 不长期占用调用终端，运行日志走 server 日志或诊断日志路径。
-- [ ] `sai server` 支持 `--cwd`、`--config`、`--port N`、`--port 0` 和高级 `--listen host:port`。
+- [x] `sai server` 支持 `--cwd`、`--config`、`--port N`、`--port 0` 和高级 `--listen host:port`。
 - [ ] server identity 使用 canonical `cwd + config_path`，默认监听 `127.0.0.1:0`。
 - [ ] 启动成功后写入 per-user registry，记录 canonical cwd、config path、addr、pid、token、
   started_at 和 version。
@@ -429,7 +429,7 @@
 - [ ] 写操作、debug 读取和 blob content 读取必须带 registry token。
 - [ ] 重复启动同一 `cwd + config_path` 且监听参数一致时提示 already running 并退出 0。
 - [ ] 重复启动同一 `cwd + config_path` 但监听参数冲突时返回冲突错误并退出非 0。
-- [ ] 指定端口被其他进程占用时启动失败并退出非 0。
+- [x] 指定端口被其他进程占用时启动失败并退出非 0。
 - [ ] client 发现 registry 记录后先调用 `/health`，stale 记录会被忽略或清理。
 - [x] `sai` 默认等价于 `sai attach`，从当前目录向上查找最近健康 server 并进入 attach REPL。
 - [x] `sai --cwd <path>` 从指定 cwd 向上查找最近健康 server。

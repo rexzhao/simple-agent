@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -1651,6 +1652,42 @@ func TestServerCommandDuplicateDifferentListenFailsBeforeBind(t *testing.T) {
 	postCLIServerShutdown(t, addr)
 	if code := waitForCode(t, done); code != 0 {
 		t.Fatalf("server command code = %d, stderr = %s", code, stderr.String())
+	}
+}
+
+func TestServerCommandOccupiedPortFailsBeforeRegistryWrite(t *testing.T) {
+	registryPath := isolateCLIUserRegistry(t)
+	projectDir := t.TempDir()
+	writeCLIFixtureInDir(t, filepath.Join(projectDir, ".agents"))
+
+	occupied, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen(occupied port) error = %v", err)
+	}
+	defer occupied.Close()
+	_, port, err := net.SplitHostPort(occupied.Addr().String())
+	if err != nil {
+		t.Fatalf("SplitHostPort(%q) error = %v", occupied.Addr().String(), err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := RunWithGetwd([]string{"server", "--port", port}, &stdout, &stderr, func() (string, error) {
+		return projectDir, nil
+	})
+	if code != 1 {
+		t.Fatalf("occupied port server code = %d, want 1", code)
+	}
+	if stdout.String() != "" {
+		t.Fatalf("stdout = %q, want empty", stdout.String())
+	}
+	assertCLIErrorContains(t, stderr.String(), "listen", "127.0.0.1:"+port)
+
+	records, err := localserver.NewRegistryStore(registryPath).List()
+	if err != nil {
+		t.Fatalf("registry List() error = %v", err)
+	}
+	if len(records) != 0 {
+		t.Fatalf("registry records after occupied port failure = %#v, want empty", records)
 	}
 }
 
