@@ -128,7 +128,10 @@ func execute(ctx context.Context, program string, args []string, stdin io.Reader
 			printRootUsage(stdout)
 			return nil
 		}
-		return chatCommand(ctx, rootArgs.commandArgs, rootArgs.configPath, stdin, stdout, stderr, getwd, program, interrupts)
+		var stop func()
+		ctx, stop = contextWithInterruptCancel(ctx, interrupts)
+		defer stop()
+		return attachCommand(ctx, rootArgs.commandArgs, stdin, stdout, stderr, getwd)
 	}
 	if rootArgs.command != "chat" {
 		var stop func()
@@ -139,6 +142,8 @@ func execute(ctx context.Context, program string, args []string, stdin io.Reader
 	switch rootArgs.command {
 	case "help":
 		return helpCommand(rootArgs.commandArgs, stdout)
+	case "attach":
+		return attachCommand(ctx, rootArgs.commandArgs, stdin, stdout, stderr, getwd)
 	case "version":
 		return versionCommand(rootArgs.commandArgs, stdout)
 	case "config":
@@ -271,7 +276,8 @@ func contextWithInterruptCancel(ctx context.Context, interrupts <-chan struct{})
 const rootUsageText = `usage: sai [--config file] [command] [args]
 
 Commands:
-  chat              Start a chat session
+  attach            Attach to a server-owned session
+  chat              Start a legacy in-process chat session
   server            Start a local HTTP server
   status            Show nearest server status
   stop              Stop nearest server
@@ -287,9 +293,17 @@ Commands:
   version            Print version
   help [command]     Show usage
 
-With no command, sai defaults to chat.
+With no command, sai defaults to attach.
 
 Run "sai help <command>" for command usage.
+`
+
+const attachUsageText = `usage: sai attach [--cwd path] [session-id]
+       sai attach [--cwd path] --new
+
+Discovers the nearest healthy local server, connects to a server-owned session
+stream, and reads prompts from stdin. Without a session id, sai attaches to the
+most recently updated server-owned session. --new creates a session first.
 `
 
 const chatUsageText = `usage: sai chat [--provider name] [--model profile] [--prompt text | --stdin | --file path] [--show-reasoning] [--verbose] [--enable-tools names] [--enable-mcp ids] [--save-session] [--resume id | --continue] [--quit]
@@ -485,6 +499,8 @@ func helpCommand(args []string, stdout io.Writer) error {
 	}
 
 	switch strings.Join(args, " ") {
+	case "attach":
+		printAttachUsage(stdout)
 	case "chat":
 		printChatUsage(stdout)
 	case "version":
@@ -543,6 +559,10 @@ func helpCommand(args []string, stdout io.Writer) error {
 
 func printRootUsage(stdout io.Writer) {
 	fmt.Fprint(stdout, rootUsageText)
+}
+
+func printAttachUsage(stdout io.Writer) {
+	fmt.Fprint(stdout, attachUsageText)
 }
 
 func printChatUsage(stdout io.Writer) {
@@ -1274,6 +1294,294 @@ func serversListCommand(ctx context.Context, args []string, stdout io.Writer) er
 	}
 	for _, identity := range stale {
 		if _, err := store.RemoveIdentity(identity); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func attachCommand(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer, getwd func() (string, error)) error {
+	flags := flag.NewFlagSet("sai attach", flag.ContinueOnError)
+	cwdFlag := flags.String("cwd", "", "discovery working directory")
+	newSession := flags.Bool("new", false, "create a new server-owned session before attaching")
+	positionals, done, err := parseCommandFlagArgs(flags, args, stdout, printAttachUsage, "sai help attach")
+	if done || err != nil {
+		return err
+	}
+	switch {
+	case *newSession && len(positionals) != 0:
+		return usageError("usage: sai attach --new", "", "sai help attach")
+	case !*newSession && len(positionals) > 1:
+		return usageError("usage: sai attach [session-id]", "", "sai help attach")
+	}
+
+	record, _, err := discoverClientServer(ctx, *cwdFlag, getwd)
+	if err != nil {
+		return err
+	}
+
+	sessionID := ""
+	if *newSession {
+		detail, err := localserver.CreateSessionWithToken(ctx, record.Addr, record.Token, serverClientTimeout)
+		if err != nil {
+			return err
+		}
+		sessionID = strings.TrimSpace(detail.ID)
+		if sessionID == "" {
+			return fmt.Errorf("create session at %s: response missing session id", record.Addr)
+		}
+	} else if len(positionals) == 1 {
+		sessionID = strings.TrimSpace(positionals[0])
+		if sessionID == "" {
+			return usageError("session id must be a non-empty string", "", "sai help attach")
+		}
+	} else {
+		sessionID, err = mostRecentlyUpdatedSessionID(ctx, record.Addr)
+		if err != nil {
+			return err
+		}
+	}
+
+	events, streamErrs, closeStream, err := localserver.StreamSessionEvents(ctx, record.Addr, sessionID, serverClientTimeout)
+	if err != nil {
+		return err
+	}
+	defer closeStream()
+	if _, err := fmt.Fprintf(stderr, "sai: attached to session %s\n", sessionID); err != nil {
+		return err
+	}
+	return runAttachREPL(ctx, record, sessionID, stdin, stdout, stderr, events, streamErrs)
+}
+
+func mostRecentlyUpdatedSessionID(ctx context.Context, addr string) (string, error) {
+	infos, err := localserver.ListSessions(ctx, addr, serverClientTimeout)
+	if err != nil {
+		return "", err
+	}
+	if len(infos) == 0 {
+		return "", fmt.Errorf("no server-owned sessions found; use \"sai attach --new\"")
+	}
+	latest := infos[0]
+	for _, info := range infos[1:] {
+		if info.UpdatedAt.After(latest.UpdatedAt) {
+			latest = info
+		}
+	}
+	if strings.TrimSpace(latest.ID) == "" {
+		return "", fmt.Errorf("most recently updated session response missing session id")
+	}
+	return latest.ID, nil
+}
+
+type attachOutputState struct {
+	stdoutAtLineStart bool
+	wroteText         bool
+}
+
+type attachSendResult struct {
+	result localserver.SessionMessageResult
+	err    error
+}
+
+func runAttachREPL(ctx context.Context, record localserver.RegistryRecord, sessionID string, stdin io.Reader, stdout, stderr io.Writer, events <-chan localserver.SessionStreamEvent, streamErrs <-chan error) error {
+	scanner := bufio.NewScanner(stdin)
+	var inputCh <-chan chatInputEvent
+	var sendDone <-chan attachSendResult
+	output := attachOutputState{stdoutAtLineStart: true}
+	turnInFlight := false
+	turnStarted := false
+	expectedTurnID := ""
+	terminalSeen := false
+	var terminalTurnIDs map[string]bool
+	setExpectedTurnID := func(turnID string) {
+		turnID = strings.TrimSpace(turnID)
+		if turnID == "" || expectedTurnID != "" {
+			return
+		}
+		expectedTurnID = turnID
+		if terminalTurnIDs[turnID] {
+			terminalSeen = true
+		}
+	}
+	finishTurnIfReady := func() error {
+		if !turnInFlight || !terminalSeen || sendDone != nil {
+			return nil
+		}
+		turnInFlight = false
+		turnStarted = false
+		expectedTurnID = ""
+		terminalSeen = false
+		terminalTurnIDs = nil
+		if output.wroteText && !output.stdoutAtLineStart {
+			if _, err := fmt.Fprintln(stdout); err != nil {
+				return err
+			}
+			output.stdoutAtLineStart = true
+		}
+		return nil
+	}
+
+	for {
+		if inputCh == nil && !turnInFlight {
+			inputCh = startChatInputRead(ctx, scanner, stderr)
+		}
+
+		select {
+		case input := <-inputCh:
+			inputCh = nil
+			if input.err != nil {
+				return input.err
+			}
+			if !input.ok {
+				return nil
+			}
+
+			command := strings.TrimSpace(input.line)
+			if command == "" {
+				continue
+			}
+			if !input.multiline && (command == "/exit" || command == "/quit") {
+				return nil
+			}
+			if !input.multiline && command == "/compact" {
+				if _, err := localserver.CompactSessionWithToken(ctx, record.Addr, record.Token, sessionID, 0); err != nil {
+					if _, printErr := fmt.Fprintf(stderr, "sai: compact failed: %v\n", err); printErr != nil {
+						return printErr
+					}
+					continue
+				}
+				if _, err := fmt.Fprintln(stderr, "sai: compacted session context"); err != nil {
+					return err
+				}
+				continue
+			}
+
+			done := make(chan attachSendResult, 1)
+			prompt := input.line
+			sendDone = done
+			turnInFlight = true
+			turnStarted = false
+			expectedTurnID = ""
+			terminalSeen = false
+			terminalTurnIDs = make(map[string]bool)
+			go func() {
+				result, err := localserver.SendSessionMessageWithToken(ctx, record.Addr, record.Token, sessionID, prompt, 0)
+				done <- attachSendResult{result: result, err: err}
+			}()
+		case sendResult := <-sendDone:
+			sendDone = nil
+			if sendResult.err != nil {
+				if turnStarted && expectedTurnID != "" {
+					if err := finishTurnIfReady(); err != nil {
+						return err
+					}
+					continue
+				}
+				turnInFlight = false
+				turnStarted = false
+				expectedTurnID = ""
+				terminalSeen = false
+				terminalTurnIDs = nil
+				if _, printErr := fmt.Fprintf(stderr, "sai: send failed: %v\n", sendResult.err); printErr != nil {
+					return printErr
+				}
+				continue
+			}
+			setExpectedTurnID(sendResult.result.TurnID)
+			if err := finishTurnIfReady(); err != nil {
+				return err
+			}
+		case event, ok := <-events:
+			if !ok {
+				events = nil
+				if turnInFlight {
+					return fmt.Errorf("session stream closed before turn completed")
+				}
+				if streamErrs == nil {
+					return nil
+				}
+				continue
+			}
+			eventType := attachEventType(event)
+			if turnInFlight && eventType == "turn.started" {
+				turnStarted = true
+				setExpectedTurnID(attachEventTurnID(event))
+			}
+			if err := writeAttachStreamEvent(stdout, stderr, event, &output); err != nil {
+				return err
+			}
+			if turnInFlight && isAttachTerminalEvent(event) {
+				turnID := attachEventTurnID(event)
+				if expectedTurnID == "" && turnID != "" {
+					terminalTurnIDs[turnID] = true
+				}
+				if turnID != "" && turnID == expectedTurnID {
+					terminalSeen = true
+				}
+				if err := finishTurnIfReady(); err != nil {
+					return err
+				}
+			}
+		case err, ok := <-streamErrs:
+			if ok && err != nil {
+				return err
+			}
+			streamErrs = nil
+			if turnInFlight {
+				return fmt.Errorf("session stream closed before turn completed")
+			}
+			if events == nil {
+				return nil
+			}
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+}
+
+func attachEventType(event localserver.SessionStreamEvent) string {
+	eventType, _ := event["type"].(string)
+	return eventType
+}
+
+func attachEventTurnID(event localserver.SessionStreamEvent) string {
+	turnID, _ := event["turn_id"].(string)
+	return strings.TrimSpace(turnID)
+}
+
+func isAttachTerminalEvent(event localserver.SessionStreamEvent) bool {
+	eventType := attachEventType(event)
+	return eventType == "turn.committed" || eventType == "turn.failed"
+}
+
+func writeAttachStreamEvent(stdout, stderr io.Writer, event localserver.SessionStreamEvent, output *attachOutputState) error {
+	eventType, _ := event["type"].(string)
+	switch eventType {
+	case "text.delta":
+		text, _ := event["text"].(string)
+		if text == "" {
+			return nil
+		}
+		if _, err := fmt.Fprint(stdout, text); err != nil {
+			return err
+		}
+		output.wroteText = true
+		output.stdoutAtLineStart = strings.HasSuffix(text, "\n")
+	case "tool.started":
+		name, _ := event["name"].(string)
+		name = strings.TrimSpace(name)
+		if name == "" {
+			return nil
+		}
+		if _, err := fmt.Fprintf(stderr, "tool: %s\n", name); err != nil {
+			return err
+		}
+	case "turn.failed":
+		if _, err := fmt.Fprintln(stderr, "sai: turn failed"); err != nil {
+			return err
+		}
+	case "compact.failed":
+		if _, err := fmt.Fprintln(stderr, "sai: compact failed"); err != nil {
 			return err
 		}
 	}

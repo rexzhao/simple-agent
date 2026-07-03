@@ -431,9 +431,9 @@
 - [ ] 重复启动同一 `cwd + config_path` 但监听参数冲突时返回冲突错误并退出非 0。
 - [ ] 指定端口被其他进程占用时启动失败并退出非 0。
 - [ ] client 发现 registry 记录后先调用 `/health`，stale 记录会被忽略或清理。
-- [ ] `sai` 默认等价于 `sai attach`，从当前目录向上查找最近健康 server 并进入 attach REPL。
-- [ ] `sai --cwd <path>` 从指定 cwd 向上查找最近健康 server。
-- [ ] `sai attach <session-id>` 进入指定会话，`sai attach --new` 创建新会话并进入。
+- [x] `sai` 默认等价于 `sai attach`，从当前目录向上查找最近健康 server 并进入 attach REPL。
+- [x] `sai --cwd <path>` 从指定 cwd 向上查找最近健康 server。
+- [x] `sai attach <session-id>` 进入指定会话，`sai attach --new` 创建新会话并进入。
 - [ ] `sai status` 查询最近 server 的 cwd、config、listen、pid、version、uptime、session 数和
   running turn 数后退出。
 - [ ] `sai stop` 和 `sai stop --cwd <path>` 停止最近健康 server，等待退出并移除 registry。
@@ -445,14 +445,14 @@
 - [ ] server 提供 `GET /health`、`GET /server` 和 `POST /server/shutdown`。
 - [ ] server 提供 `GET /sessions`、`POST /sessions`、`GET /sessions/{id}` 和
   `GET /sessions/{id}/items`。
-- [ ] server 提供 `POST /sessions/{id}/messages` 和 `POST /sessions/{id}/commands/compact`。
+- [x] server 提供 `POST /sessions/{id}/messages` 和 `POST /sessions/{id}/commands/compact`。
 - [ ] server 提供 `GET /sessions/{id}/items/{item_id}/content`，不提供裸 blob hash 读取。
 - [ ] server 提供 `WS /sessions/{id}/stream`，支持多个 client 同时观察同一 session。
 - [ ] session metadata API 不返回完整 items，items API 支持 `before_seq`、`after_seq`、`limit`
   和 `view=chat|debug`。
 - [ ] 同一 session 同时只允许一个 running turn，session busy 时再次发送 message 返回 conflict。
 - [ ] shutdown 在 running turn 时返回明确错误或 conflict。
-- [ ] attach REPL 中的 `/compact` 调用 server command API，多行文本中的 `/compact` 仍作为普通文本。
+- [x] attach REPL 中的 `/compact` 调用 server command API，多行文本中的 `/compact` 仍作为普通文本。
 - [ ] CLI client 不直接读取 session 文件、blob 文件或修改 `ActiveHistory`。
 - [ ] M20 不实现浏览器 Web GUI UI；未来 GUI 必须复用同一套 HTTP API / WebSocket stream。
 - [ ] API 测试覆盖 health/status/shutdown、session metadata、item pagination、send message 和 compact command。

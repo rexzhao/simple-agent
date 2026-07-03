@@ -20,6 +20,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gorilla/websocket"
 	"github.com/rexzhao/simple-agent/internal/contextwindow"
 	"github.com/rexzhao/simple-agent/internal/model"
 	localserver "github.com/rexzhao/simple-agent/internal/server"
@@ -986,7 +987,7 @@ func TestRootHelpWritesUsageWithoutConfig(t *testing.T) {
 				t.Fatalf("RunWithGetwd(%v) code = %d, stderr = %s", args, code, stderr.String())
 			}
 			out := stdout.String()
-			for _, want := range []string{"usage: sai", "chat              Start a chat session", "server            Start a local HTTP server", "status            Show nearest server status", "stop              Stop nearest server", "servers list", "send              Send one prompt", "config show", "models list", "doctor", "tools list", "sessions", "With no command, sai defaults to chat.", `Run "sai help <command>" for command usage.`} {
+			for _, want := range []string{"usage: sai", "attach            Attach to a server-owned session", "chat              Start a legacy in-process chat session", "server            Start a local HTTP server", "status            Show nearest server status", "stop              Stop nearest server", "servers list", "send              Send one prompt", "config show", "models list", "doctor", "tools list", "sessions", "With no command, sai defaults to attach.", `Run "sai help <command>" for command usage.`} {
 				if !strings.Contains(out, want) {
 					t.Fatalf("stdout = %q, want contain %q", out, want)
 				}
@@ -2113,6 +2114,18 @@ func TestChatMixedHelpDoesNotLoadConfig(t *testing.T) {
 	}
 }
 
+func TestAttachHelpWritesUsageWithoutConfig(t *testing.T) {
+	for _, args := range [][]string{
+		{"attach", "-h"},
+		{"attach", "--help"},
+		{"help", "attach"},
+	} {
+		t.Run(strings.Join(args, " "), func(t *testing.T) {
+			assertCLIHelpWithoutConfig(t, args, "usage: sai attach", "server-owned session", "--new creates a session")
+		})
+	}
+}
+
 func TestChatQuitWithoutPromptIsUsageError(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	code := RunWithIO([]string{"chat", "--quit"}, strings.NewReader(""), &stdout, &stderr, func() (string, error) {
@@ -2137,12 +2150,6 @@ func TestChatStdinWithQuitRunsOneTurnAndExits(t *testing.T) {
 			name: "chat command",
 			args: func(configDir string) []string {
 				return []string{"--config", cliConfigPath(configDir), "chat", "--quit", "--stdin"}
-			},
-		},
-		{
-			name: "default chat command",
-			args: func(configDir string) []string {
-				return []string{"--config", cliConfigPath(configDir), "--quit", "--stdin"}
 			},
 		},
 	}
@@ -2348,95 +2355,7 @@ func TestChatExitReturnsWithoutModelRequest(t *testing.T) {
 	assertNoAdditionalCLIRunRequest(t, requests)
 }
 
-func TestDefaultChatNoCommandEntersREPL(t *testing.T) {
-	server, requests := newCLIRunServer(t,
-		`{"choices":[{"delta":{"content":"unexpected"}}]}`,
-		`[DONE]`,
-	)
-	defer server.Close()
-
-	projectDir := t.TempDir()
-	configDir := filepath.Join(projectDir, ".agents")
-	writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
-
-	var stdout, stderr bytes.Buffer
-	code := RunWithIO(nil, strings.NewReader("/exit\n"), &stdout, &stderr, func() (string, error) {
-		return projectDir, nil
-	})
-
-	if code != 0 {
-		t.Fatalf("RunWithIO() code = %d, stderr = %s", code, stderr.String())
-	}
-	if stdout.String() != "" {
-		t.Fatalf("stdout = %q, want empty", stdout.String())
-	}
-	if got, want := stderr.String(), "> "; got != want {
-		t.Fatalf("stderr = %q, want %q", got, want)
-	}
-	if logPaths := sessionLogPaths(t, configDir); len(logPaths) != 0 {
-		t.Fatalf("session log paths = %#v, want none", logPaths)
-	}
-	assertNoAdditionalCLIRunRequest(t, requests)
-}
-
-func TestDefaultChatAcceptsConfigPathWithoutCommand(t *testing.T) {
-	server, requests := newCLIRunServer(t,
-		`{"choices":[{"delta":{"content":"unexpected"}}]}`,
-		`[DONE]`,
-	)
-	defer server.Close()
-
-	configDir := t.TempDir()
-	writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
-
-	var stdout, stderr bytes.Buffer
-	code := RunWithIO([]string{"--config", cliConfigPath(configDir)}, strings.NewReader("/exit\n"), &stdout, &stderr, func() (string, error) {
-		return t.TempDir(), nil
-	})
-
-	if code != 0 {
-		t.Fatalf("RunWithIO() code = %d, stderr = %s", code, stderr.String())
-	}
-	if stdout.String() != "" {
-		t.Fatalf("stdout = %q, want empty", stdout.String())
-	}
-	if got, want := stderr.String(), "> "; got != want {
-		t.Fatalf("stderr = %q, want %q", got, want)
-	}
-	assertNoAdditionalCLIRunRequest(t, requests)
-}
-
-func TestDefaultChatInitialPromptWithQuitRunsOneTurnAndExits(t *testing.T) {
-	server, requests := newCLIRunServer(t,
-		`{"choices":[{"delta":{"content":"one"}}]}`,
-		`[DONE]`,
-	)
-	defer server.Close()
-
-	configDir := t.TempDir()
-	writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
-
-	var stdout, stderr bytes.Buffer
-	code := RunWithIO([]string{"--config", cliConfigPath(configDir), "--prompt", "first", "--quit"}, strings.NewReader("second\n"), &stdout, &stderr, func() (string, error) {
-		return t.TempDir(), nil
-	})
-
-	if code != 0 {
-		t.Fatalf("RunWithIO() code = %d, stderr = %s", code, stderr.String())
-	}
-	if got, want := stdout.String(), "one"; got != want {
-		t.Fatalf("stdout = %q, want %q", got, want)
-	}
-	if stderr.String() != "" {
-		t.Fatalf("stderr = %q, want empty", stderr.String())
-	}
-	messages := requestMessages(t, (<-requests).Body)
-	assertMessage(t, messages, 0, "system", builtInBaseInstructions)
-	assertMessage(t, messages, 1, "user", "first")
-	assertNoAdditionalCLIRunRequest(t, requests)
-}
-
-func TestDefaultChatAcceptsModelAndEnableToolsFlags(t *testing.T) {
+func TestChatAcceptsModelAndEnableToolsFlagsBeforeCommand(t *testing.T) {
 	server, requests := newCLIRunServer(t,
 		`{"choices":[{"delta":{"content":"ok"}}]}`,
 		`[DONE]`,
@@ -2447,7 +2366,7 @@ func TestDefaultChatAcceptsModelAndEnableToolsFlags(t *testing.T) {
 	writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
 
 	var stdout, stderr bytes.Buffer
-	code := RunWithIO([]string{"--config", cliConfigPath(configDir), "--model", "fast", "--enable-tools", "read_file", "--prompt", "first", "--quit"}, strings.NewReader(""), &stdout, &stderr, func() (string, error) {
+	code := RunWithIO([]string{"--config", cliConfigPath(configDir), "--model", "fast", "--enable-tools", "read_file", "chat", "--prompt", "first", "--quit"}, strings.NewReader(""), &stdout, &stderr, func() (string, error) {
 		return t.TempDir(), nil
 	})
 
@@ -5621,11 +5540,620 @@ func TestSendErrorDoesNotLeakPromptOrServerMessage(t *testing.T) {
 	assertCLIErrorOmits(t, stderr.String(), prompt, "assistant body secret", "tool body secret", "registry-token")
 }
 
+func TestBareSAIDefaultsToAttachNoServerHint(t *testing.T) {
+	isolateCLIUserRegistry(t)
+	projectDir := t.TempDir()
+
+	var stdout, stderr bytes.Buffer
+	code := RunWithGetwd([]string{}, &stdout, &stderr, func() (string, error) {
+		return projectDir, nil
+	})
+
+	if code != 1 {
+		t.Fatalf("bare sai code = %d, want 1", code)
+	}
+	if stdout.String() != "" {
+		t.Fatalf("stdout = %q, want empty", stdout.String())
+	}
+	assertCLIErrorContains(t, stderr.String(), "no healthy sai server found", "sai server --cwd")
+}
+
+func TestAttachWithoutSessionSelectsMostRecentlyUpdated(t *testing.T) {
+	registryPath := isolateCLIUserRegistry(t)
+	projectDir := t.TempDir()
+	streamPathSeen := make(chan string, 1)
+	upgrader := websocket.Upgrader{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/health":
+			writeCLIJSON(w, http.StatusOK, map[string]any{"status": "ok"})
+		case "/sessions":
+			if r.Method != http.MethodGet {
+				t.Fatalf("sessions method = %s, want GET", r.Method)
+			}
+			writeCLIJSON(w, http.StatusOK, map[string]any{
+				"sessions": []map[string]any{
+					{
+						"id":            "older-session",
+						"created_at":    time.Date(2026, 7, 2, 3, 0, 0, 0, time.UTC),
+						"updated_at":    time.Date(2026, 7, 2, 3, 1, 0, 0, time.UTC),
+						"provider":      "paperhub",
+						"model_profile": "glm-5.2",
+						"model_id":      "glm-5.2",
+					},
+					{
+						"id":            "newer-session",
+						"created_at":    time.Date(2026, 7, 2, 3, 0, 0, 0, time.UTC),
+						"updated_at":    time.Date(2026, 7, 2, 3, 2, 0, 0, time.UTC),
+						"provider":      "openai",
+						"model_profile": "default",
+						"model_id":      "gpt-5.1",
+					},
+				},
+			})
+		case "/sessions/newer-session/stream":
+			conn, err := upgrader.Upgrade(w, r, nil)
+			if err != nil {
+				t.Fatalf("Upgrade(stream) error = %v", err)
+			}
+			defer conn.Close()
+			streamPathSeen <- r.URL.Path
+			for {
+				if _, _, err := conn.NextReader(); err != nil {
+					return
+				}
+			}
+		default:
+			t.Fatalf("unexpected path %q", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+	registerCLIFakeServer(t, registryPath, projectDir, server.URL, "registry-token")
+
+	var stdout, stderr bytes.Buffer
+	code := RunWithIO([]string{"attach", "--cwd", projectDir}, strings.NewReader("/quit\n"), &stdout, &stderr, func() (string, error) {
+		return "", errors.New("getwd should not be called")
+	})
+
+	if code != 0 {
+		t.Fatalf("attach code = %d, stderr = %s", code, stderr.String())
+	}
+	select {
+	case got := <-streamPathSeen:
+		if got != "/sessions/newer-session/stream" {
+			t.Fatalf("stream path = %q, want newer session", got)
+		}
+	default:
+		t.Fatal("session stream was not connected")
+	}
+	if stdout.String() != "" {
+		t.Fatalf("stdout = %q, want empty", stdout.String())
+	}
+	assertCLIOutputContains(t, stderr.String(), "sai: attached to session newer-session")
+	assertCLIErrorOmits(t, stderr.String(), "registry-token")
+}
+
+func TestAttachNewCreatesSessionStreamsAndSendsPrompts(t *testing.T) {
+	registryPath := isolateCLIUserRegistry(t)
+	projectDir := t.TempDir()
+	prompt := "hello attach"
+	createAuthSeen := make(chan string, 1)
+	sendAuthSeen := make(chan string, 1)
+	bodySeen := make(chan map[string]any, 1)
+	streamReady := make(chan struct{})
+	var streamOnce sync.Once
+	var streamMu sync.Mutex
+	var streamConn *websocket.Conn
+	upgrader := websocket.Upgrader{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/health":
+			writeCLIJSON(w, http.StatusOK, map[string]any{"status": "ok"})
+		case "/sessions":
+			if r.Method != http.MethodPost {
+				t.Fatalf("sessions method = %s, want POST", r.Method)
+			}
+			createAuthSeen <- r.Header.Get("Authorization")
+			writeCLIJSON(w, http.StatusCreated, map[string]any{
+				"id":                "new-session",
+				"created_at":        time.Date(2026, 7, 2, 3, 0, 0, 0, time.UTC),
+				"updated_at":        time.Date(2026, 7, 2, 3, 0, 0, 0, time.UTC),
+				"provider":          "paperhub",
+				"model_profile":     "glm-5.2",
+				"model_id":          "glm-5.2",
+				"status":            "idle",
+				"save_tool_results": true,
+			})
+		case "/sessions/new-session/stream":
+			conn, err := upgrader.Upgrade(w, r, nil)
+			if err != nil {
+				t.Fatalf("Upgrade(stream) error = %v", err)
+			}
+			defer conn.Close()
+			streamMu.Lock()
+			streamConn = conn
+			streamMu.Unlock()
+			streamOnce.Do(func() { close(streamReady) })
+			for {
+				if _, _, err := conn.NextReader(); err != nil {
+					return
+				}
+			}
+		case "/sessions/new-session/messages":
+			if r.Method != http.MethodPost {
+				t.Fatalf("messages method = %s, want POST", r.Method)
+			}
+			sendAuthSeen <- r.Header.Get("Authorization")
+			data, err := io.ReadAll(r.Body)
+			if err != nil {
+				t.Fatalf("ReadAll(message body) error = %v", err)
+			}
+			bodySeen <- decodeCLIJSON(t, data)
+			waitForCLIStreamReady(t, streamReady)
+			streamMu.Lock()
+			conn := streamConn
+			streamMu.Unlock()
+			writeCLIStreamEvent(t, conn, map[string]any{"type": "turn.started", "turn_id": "turn-000001"})
+			writeCLIStreamEvent(t, conn, map[string]any{"type": "text.delta", "text": "hello "})
+			writeCLIStreamEvent(t, conn, map[string]any{"type": "text.delta", "text": "world"})
+			writeCLIStreamEvent(t, conn, map[string]any{"type": "turn.committed", "turn_id": "turn-000001", "last_seq": 2})
+			writeCLIJSON(w, http.StatusOK, map[string]any{
+				"status":   "committed",
+				"turn_id":  "turn-000001",
+				"last_seq": 2,
+			})
+		default:
+			t.Fatalf("unexpected path %q", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+	registerCLIFakeServer(t, registryPath, projectDir, server.URL, "registry-token")
+
+	var stdout, stderr bytes.Buffer
+	code := RunWithIO([]string{"attach", "--new", "--cwd", projectDir}, strings.NewReader(prompt+"\n/quit\n"), &stdout, &stderr, func() (string, error) {
+		return "", errors.New("getwd should not be called")
+	})
+
+	if code != 0 {
+		t.Fatalf("attach --new code = %d, stderr = %s", code, stderr.String())
+	}
+	for name, ch := range map[string]<-chan string{
+		"create": createAuthSeen,
+		"send":   sendAuthSeen,
+	} {
+		select {
+		case got := <-ch:
+			if got != "Bearer registry-token" {
+				t.Fatalf("%s Authorization = %q, want bearer registry token", name, got)
+			}
+		default:
+			t.Fatalf("%s request was not called", name)
+		}
+	}
+	select {
+	case got := <-bodySeen:
+		if got["content"] != prompt {
+			t.Fatalf("message body = %#v, want content", got)
+		}
+	default:
+		t.Fatal("message body was not captured")
+	}
+	if got, want := stdout.String(), "hello world\n"; got != want {
+		t.Fatalf("stdout = %q, want %q", got, want)
+	}
+	assertCLIOutputContains(t, stderr.String(), "sai: attached to session new-session")
+	assertCLIErrorOmits(t, stderr.String(), prompt, "registry-token")
+}
+
+func TestAttachWaitsForTerminalStreamEventBeforeQuit(t *testing.T) {
+	registryPath := isolateCLIUserRegistry(t)
+	projectDir := t.TempDir()
+	prompt := "delayed prompt"
+	streamReady := make(chan struct{})
+	var streamOnce sync.Once
+	var streamMu sync.Mutex
+	var streamConn *websocket.Conn
+	upgrader := websocket.Upgrader{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/health":
+			writeCLIJSON(w, http.StatusOK, map[string]any{"status": "ok"})
+		case "/sessions/existing-session/stream":
+			conn, err := upgrader.Upgrade(w, r, nil)
+			if err != nil {
+				t.Fatalf("Upgrade(stream) error = %v", err)
+			}
+			defer conn.Close()
+			streamMu.Lock()
+			streamConn = conn
+			streamMu.Unlock()
+			streamOnce.Do(func() { close(streamReady) })
+			for {
+				if _, _, err := conn.NextReader(); err != nil {
+					return
+				}
+			}
+		case "/sessions/existing-session/messages":
+			if r.Method != http.MethodPost {
+				t.Fatalf("messages method = %s, want POST", r.Method)
+			}
+			data, err := io.ReadAll(r.Body)
+			if err != nil {
+				t.Fatalf("ReadAll(message body) error = %v", err)
+			}
+			if got := decodeCLIJSON(t, data)["content"]; got != prompt {
+				t.Fatalf("message content = %#v, want %q", got, prompt)
+			}
+			waitForCLIStreamReady(t, streamReady)
+			streamMu.Lock()
+			conn := streamConn
+			streamMu.Unlock()
+			writeCLIStreamEvent(t, conn, map[string]any{"type": "turn.started", "turn_id": "turn-delayed"})
+			writeCLIJSON(w, http.StatusOK, map[string]any{
+				"status":   "committed",
+				"turn_id":  "turn-delayed",
+				"last_seq": 5,
+			})
+			go func() {
+				time.Sleep(150 * time.Millisecond)
+				writeCLIStreamEvent(t, conn, map[string]any{"type": "text.delta", "text": "delayed text"})
+				writeCLIStreamEvent(t, conn, map[string]any{"type": "turn.committed", "turn_id": "turn-delayed", "last_seq": 5})
+			}()
+		default:
+			t.Fatalf("unexpected path %q", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+	registerCLIFakeServer(t, registryPath, projectDir, server.URL, "registry-token")
+
+	var stdout, stderr bytes.Buffer
+	code := RunWithIO([]string{"attach", "existing-session", "--cwd", projectDir}, strings.NewReader(prompt+"\n/quit\n"), &stdout, &stderr, func() (string, error) {
+		return "", errors.New("getwd should not be called")
+	})
+
+	if code != 0 {
+		t.Fatalf("attach delayed code = %d, stderr = %s", code, stderr.String())
+	}
+	if got, want := stdout.String(), "delayed text\n"; got != want {
+		t.Fatalf("stdout = %q, want delayed terminal stream text %q", got, want)
+	}
+	assertCLIErrorOmits(t, stderr.String(), prompt, "registry-token")
+}
+
+func TestAttachFailedTurnWaitsForDelayedTurnFailed(t *testing.T) {
+	registryPath := isolateCLIUserRegistry(t)
+	projectDir := t.TempDir()
+	prompt := "prompt before failed turn"
+	streamReady := make(chan struct{})
+	var streamOnce sync.Once
+	var streamMu sync.Mutex
+	var streamConn *websocket.Conn
+	upgrader := websocket.Upgrader{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/health":
+			writeCLIJSON(w, http.StatusOK, map[string]any{"status": "ok"})
+		case "/sessions/existing-session/stream":
+			conn, err := upgrader.Upgrade(w, r, nil)
+			if err != nil {
+				t.Fatalf("Upgrade(stream) error = %v", err)
+			}
+			defer conn.Close()
+			streamMu.Lock()
+			streamConn = conn
+			streamMu.Unlock()
+			streamOnce.Do(func() { close(streamReady) })
+			for {
+				if _, _, err := conn.NextReader(); err != nil {
+					return
+				}
+			}
+		case "/sessions/existing-session/messages":
+			if r.Method != http.MethodPost {
+				t.Fatalf("messages method = %s, want POST", r.Method)
+			}
+			data, err := io.ReadAll(r.Body)
+			if err != nil {
+				t.Fatalf("ReadAll(message body) error = %v", err)
+			}
+			if got := decodeCLIJSON(t, data)["content"]; got != prompt {
+				t.Fatalf("message content = %#v, want %q", got, prompt)
+			}
+			waitForCLIStreamReady(t, streamReady)
+			streamMu.Lock()
+			conn := streamConn
+			streamMu.Unlock()
+			writeCLIStreamEvent(t, conn, map[string]any{"type": "turn.started", "turn_id": "turn-failed"})
+			time.Sleep(75 * time.Millisecond)
+			go func() {
+				time.Sleep(150 * time.Millisecond)
+				writeCLIStreamEvent(t, conn, map[string]any{"type": "turn.failed", "turn_id": "turn-failed", "last_seq": 5})
+			}()
+			writeCLIJSON(w, http.StatusInternalServerError, map[string]any{
+				"error": map[string]any{
+					"code":    "turn_failed",
+					"message": "model request failed",
+				},
+			})
+		default:
+			t.Fatalf("unexpected path %q", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+	registerCLIFakeServer(t, registryPath, projectDir, server.URL, "registry-token")
+
+	var stdout, stderr bytes.Buffer
+	code := RunWithIO([]string{"attach", "existing-session", "--cwd", projectDir}, strings.NewReader(prompt+"\n/quit\n"), &stdout, &stderr, func() (string, error) {
+		return "", errors.New("getwd should not be called")
+	})
+
+	if code != 0 {
+		t.Fatalf("attach failed turn code = %d, stderr = %s", code, stderr.String())
+	}
+	if stdout.String() != "" {
+		t.Fatalf("stdout = %q, want empty", stdout.String())
+	}
+	assertCLIOutputContains(t, stderr.String(), "sai: turn failed")
+	assertCLIErrorOmits(t, stderr.String(), prompt, "registry-token")
+}
+
+func TestAttachIgnoresStaleTerminalDuringSend(t *testing.T) {
+	registryPath := isolateCLIUserRegistry(t)
+	projectDir := t.TempDir()
+	prompt := "prompt with stale terminal"
+	streamReady := make(chan struct{})
+	var streamOnce sync.Once
+	var streamMu sync.Mutex
+	var streamConn *websocket.Conn
+	upgrader := websocket.Upgrader{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/health":
+			writeCLIJSON(w, http.StatusOK, map[string]any{"status": "ok"})
+		case "/sessions/existing-session/stream":
+			conn, err := upgrader.Upgrade(w, r, nil)
+			if err != nil {
+				t.Fatalf("Upgrade(stream) error = %v", err)
+			}
+			defer conn.Close()
+			streamMu.Lock()
+			streamConn = conn
+			streamMu.Unlock()
+			streamOnce.Do(func() { close(streamReady) })
+			for {
+				if _, _, err := conn.NextReader(); err != nil {
+					return
+				}
+			}
+		case "/sessions/existing-session/messages":
+			if r.Method != http.MethodPost {
+				t.Fatalf("messages method = %s, want POST", r.Method)
+			}
+			data, err := io.ReadAll(r.Body)
+			if err != nil {
+				t.Fatalf("ReadAll(message body) error = %v", err)
+			}
+			if got := decodeCLIJSON(t, data)["content"]; got != prompt {
+				t.Fatalf("message content = %#v, want %q", got, prompt)
+			}
+			waitForCLIStreamReady(t, streamReady)
+			streamMu.Lock()
+			conn := streamConn
+			streamMu.Unlock()
+			writeCLIStreamEvent(t, conn, map[string]any{"type": "turn.started", "turn_id": "turn-current"})
+			writeCLIStreamEvent(t, conn, map[string]any{"type": "turn.committed", "turn_id": "turn-stale", "last_seq": 2})
+			writeCLIJSON(w, http.StatusOK, map[string]any{
+				"status":   "committed",
+				"turn_id":  "turn-current",
+				"last_seq": 7,
+			})
+			go func() {
+				time.Sleep(150 * time.Millisecond)
+				writeCLIStreamEvent(t, conn, map[string]any{"type": "text.delta", "text": "current text"})
+				writeCLIStreamEvent(t, conn, map[string]any{"type": "turn.committed", "turn_id": "turn-current", "last_seq": 7})
+			}()
+		default:
+			t.Fatalf("unexpected path %q", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+	registerCLIFakeServer(t, registryPath, projectDir, server.URL, "registry-token")
+
+	var stdout, stderr bytes.Buffer
+	code := RunWithIO([]string{"attach", "existing-session", "--cwd", projectDir}, strings.NewReader(prompt+"\n/quit\n"), &stdout, &stderr, func() (string, error) {
+		return "", errors.New("getwd should not be called")
+	})
+
+	if code != 0 {
+		t.Fatalf("attach stale terminal code = %d, stderr = %s", code, stderr.String())
+	}
+	if got, want := stdout.String(), "current text\n"; got != want {
+		t.Fatalf("stdout = %q, want delayed matching turn stream text %q", got, want)
+	}
+	assertCLIErrorOmits(t, stderr.String(), prompt, "registry-token")
+}
+
+func TestAttachExistingCompactAndNormalMessageContainingCompact(t *testing.T) {
+	registryPath := isolateCLIUserRegistry(t)
+	projectDir := t.TempDir()
+	prompt := "normal /compact text"
+	compactAuthSeen := make(chan string, 1)
+	sendAuthSeen := make(chan string, 1)
+	bodySeen := make(chan map[string]any, 1)
+	streamReady := make(chan struct{})
+	var streamOnce sync.Once
+	var streamMu sync.Mutex
+	var streamConn *websocket.Conn
+	upgrader := websocket.Upgrader{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/health":
+			writeCLIJSON(w, http.StatusOK, map[string]any{"status": "ok"})
+		case "/sessions/existing-session/stream":
+			conn, err := upgrader.Upgrade(w, r, nil)
+			if err != nil {
+				t.Fatalf("Upgrade(stream) error = %v", err)
+			}
+			defer conn.Close()
+			streamMu.Lock()
+			streamConn = conn
+			streamMu.Unlock()
+			streamOnce.Do(func() { close(streamReady) })
+			for {
+				if _, _, err := conn.NextReader(); err != nil {
+					return
+				}
+			}
+		case "/sessions/existing-session/commands/compact":
+			if r.Method != http.MethodPost {
+				t.Fatalf("compact method = %s, want POST", r.Method)
+			}
+			compactAuthSeen <- r.Header.Get("Authorization")
+			data, err := io.ReadAll(r.Body)
+			if err != nil {
+				t.Fatalf("ReadAll(compact body) error = %v", err)
+			}
+			if strings.TrimSpace(string(data)) != "" {
+				t.Fatalf("compact body = %q, want empty", data)
+			}
+			writeCLIJSON(w, http.StatusOK, map[string]any{
+				"status":          "committed",
+				"compaction_id":   "compact-1",
+				"summary_item_id": "summary-1",
+				"last_seq":        3,
+			})
+		case "/sessions/existing-session/messages":
+			if r.Method != http.MethodPost {
+				t.Fatalf("messages method = %s, want POST", r.Method)
+			}
+			sendAuthSeen <- r.Header.Get("Authorization")
+			data, err := io.ReadAll(r.Body)
+			if err != nil {
+				t.Fatalf("ReadAll(message body) error = %v", err)
+			}
+			bodySeen <- decodeCLIJSON(t, data)
+			waitForCLIStreamReady(t, streamReady)
+			streamMu.Lock()
+			conn := streamConn
+			streamMu.Unlock()
+			writeCLIStreamEvent(t, conn, map[string]any{"type": "turn.started", "turn_id": "turn-000001"})
+			writeCLIStreamEvent(t, conn, map[string]any{"type": "text.delta", "text": "sent"})
+			writeCLIStreamEvent(t, conn, map[string]any{"type": "turn.committed", "turn_id": "turn-000001", "last_seq": 4})
+			writeCLIJSON(w, http.StatusOK, map[string]any{
+				"status":   "committed",
+				"turn_id":  "turn-000001",
+				"last_seq": 4,
+			})
+		default:
+			t.Fatalf("unexpected path %q", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+	registerCLIFakeServer(t, registryPath, projectDir, server.URL, "registry-token")
+
+	var stdout, stderr bytes.Buffer
+	code := RunWithIO([]string{"attach", "existing-session", "--cwd", projectDir}, strings.NewReader("/compact\n"+prompt+"\n/quit\n"), &stdout, &stderr, func() (string, error) {
+		return "", errors.New("getwd should not be called")
+	})
+
+	if code != 0 {
+		t.Fatalf("attach existing code = %d, stderr = %s", code, stderr.String())
+	}
+	for name, ch := range map[string]<-chan string{
+		"compact": compactAuthSeen,
+		"send":    sendAuthSeen,
+	} {
+		select {
+		case got := <-ch:
+			if got != "Bearer registry-token" {
+				t.Fatalf("%s Authorization = %q, want bearer registry token", name, got)
+			}
+		default:
+			t.Fatalf("%s request was not called", name)
+		}
+	}
+	select {
+	case got := <-bodySeen:
+		if got["content"] != prompt {
+			t.Fatalf("message body = %#v, want normal /compact text", got)
+		}
+	default:
+		t.Fatal("message body was not captured")
+	}
+	if got, want := stdout.String(), "sent\n"; got != want {
+		t.Fatalf("stdout = %q, want %q", got, want)
+	}
+	assertCLIOutputContains(t, stderr.String(), "sai: compacted session context")
+	assertCLIErrorOmits(t, stderr.String(), prompt, "registry-token")
+}
+
+func TestAttachCompactWaitsWithoutDefaultHTTPTimeout(t *testing.T) {
+	registryPath := isolateCLIUserRegistry(t)
+	projectDir := t.TempDir()
+	compactAuthSeen := make(chan string, 1)
+	upgrader := websocket.Upgrader{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/health":
+			writeCLIJSON(w, http.StatusOK, map[string]any{"status": "ok"})
+		case "/sessions/existing-session/stream":
+			conn, err := upgrader.Upgrade(w, r, nil)
+			if err != nil {
+				t.Fatalf("Upgrade(stream) error = %v", err)
+			}
+			defer conn.Close()
+			for {
+				if _, _, err := conn.NextReader(); err != nil {
+					return
+				}
+			}
+		case "/sessions/existing-session/commands/compact":
+			compactAuthSeen <- r.Header.Get("Authorization")
+			time.Sleep(650 * time.Millisecond)
+			writeCLIJSON(w, http.StatusOK, map[string]any{
+				"status":          "committed",
+				"compaction_id":   "compact-slow",
+				"summary_item_id": "summary-slow",
+				"last_seq":        7,
+			})
+		default:
+			t.Fatalf("unexpected path %q", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+	registerCLIFakeServer(t, registryPath, projectDir, server.URL, "registry-token")
+
+	var stdout, stderr bytes.Buffer
+	code := RunWithIO([]string{"attach", "existing-session", "--cwd", projectDir}, strings.NewReader("/compact\n/quit\n"), &stdout, &stderr, func() (string, error) {
+		return "", errors.New("getwd should not be called")
+	})
+
+	if code != 0 {
+		t.Fatalf("attach slow compact code = %d, stderr = %s", code, stderr.String())
+	}
+	select {
+	case got := <-compactAuthSeen:
+		if got != "Bearer registry-token" {
+			t.Fatalf("compact Authorization = %q, want bearer registry token", got)
+		}
+	default:
+		t.Fatal("compact endpoint was not called")
+	}
+	if stdout.String() != "" {
+		t.Fatalf("stdout = %q, want empty", stdout.String())
+	}
+	assertCLIOutputContains(t, stderr.String(), "sai: compacted session context")
+	assertCLIErrorOmits(t, stderr.String(), "registry-token")
+}
+
 func TestClientCommandsNoServerHint(t *testing.T) {
 	isolateCLIUserRegistry(t)
 	projectDir := t.TempDir()
 
 	tests := [][]string{
+		{"attach", "--cwd", projectDir},
+		{"attach", "missing-session", "--cwd", projectDir},
+		{"attach", "--new", "--cwd", projectDir},
 		{"sessions", "list", "--cwd", projectDir},
 		{"sessions", "show", "missing-session", "--cwd", projectDir},
 		{"send", "missing-session", "--prompt", "hello", "--cwd", projectDir},
@@ -9960,6 +10488,27 @@ func registerCLIFakeServer(t *testing.T, registryPath, projectDir, rawURL, token
 		Version:    "test-version",
 	}); err != nil {
 		t.Fatalf("Upsert(fake registry record) error = %v", err)
+	}
+}
+
+func waitForCLIStreamReady(t *testing.T, ready <-chan struct{}) {
+	t.Helper()
+
+	select {
+	case <-ready:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for attach stream")
+	}
+}
+
+func writeCLIStreamEvent(t *testing.T, conn *websocket.Conn, event map[string]any) {
+	t.Helper()
+
+	if conn == nil {
+		t.Fatal("stream connection is nil")
+	}
+	if err := conn.WriteJSON(event); err != nil {
+		t.Fatalf("WriteJSON(stream event) error = %v", err)
 	}
 }
 

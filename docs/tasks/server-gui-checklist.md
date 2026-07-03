@@ -57,10 +57,10 @@ future work and should not be required by any slice here.
 - [x] Send message API: implement `POST /sessions/{id}/messages` so the server
   owns turn execution, rejects busy sessions with conflict, streams transient
   events, persists only successful turns, and leaves failed turns transient.
-- [ ] Compact command API: implement `POST /sessions/{id}/commands/compact` for
+- [x] Compact command API: implement `POST /sessions/{id}/commands/compact` for
   idle sessions, map attach REPL `/compact` to this endpoint, and keep multiline
   `/compact` as ordinary text.
-- [ ] CLI attach REPL: make bare `sai` equivalent to `sai attach`, support
+- [x] CLI attach REPL: make bare `sai` equivalent to `sai attach`, support
   `sai attach`, `sai attach <session-id>`, `sai attach --new`, streaming output,
   and shared-session observation through the server.
 - [x] CLI query/send commands: implement `sai sessions list`,

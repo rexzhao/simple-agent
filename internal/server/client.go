@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/gorilla/websocket"
 	"github.com/rexzhao/simple-agent/internal/contextwindow"
 )
 
@@ -63,6 +64,14 @@ type SessionMessageResult struct {
 	TurnID  string `json:"turn_id"`
 	LastSeq int64  `json:"last_seq"`
 	Status  string `json:"status"`
+}
+
+// SessionCompactResult is the committed metadata returned by POST /sessions/{id}/commands/compact.
+type SessionCompactResult struct {
+	Status        string `json:"status"`
+	CompactionID  string `json:"compaction_id"`
+	SummaryItemID string `json:"summary_item_id"`
+	LastSeq       int64  `json:"last_seq"`
 }
 
 // DiscoveryResult reports the nearest healthy server, plus stale records removed
@@ -186,7 +195,10 @@ func CreateSessionWithToken(ctx context.Context, addr, token string, timeout tim
 		return SessionDetail{}, err
 	}
 	setBearerToken(req, token)
-	client := http.Client{Timeout: clientTimeout(timeout)}
+	client := http.Client{}
+	if timeout > 0 {
+		client.Timeout = timeout
+	}
 	resp, err := client.Do(req)
 	if err != nil {
 		return SessionDetail{}, fmt.Errorf("create session at %s: %w", strings.TrimSpace(addr), err)
@@ -237,6 +249,89 @@ func SendSessionMessageWithToken(ctx context.Context, addr, token, id, content s
 	return result, nil
 }
 
+// CompactSessionWithToken sends POST /sessions/{id}/commands/compact with the registry bearer token.
+func CompactSessionWithToken(ctx context.Context, addr, token, id string, timeout time.Duration) (SessionCompactResult, error) {
+	req, err := newServerClientRequest(ctx, http.MethodPost, addr, "/sessions/"+url.PathEscape(strings.TrimSpace(id))+"/commands/compact")
+	if err != nil {
+		return SessionCompactResult{}, err
+	}
+	setBearerToken(req, token)
+	client := http.Client{}
+	if timeout > 0 {
+		client.Timeout = timeout
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return SessionCompactResult{}, fmt.Errorf("compact session %s at %s: %w", strings.TrimSpace(id), strings.TrimSpace(addr), err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return SessionCompactResult{}, fmt.Errorf("compact session %s at %s: %s", strings.TrimSpace(id), strings.TrimSpace(addr), serverWriteResponseError(resp))
+	}
+	var result SessionCompactResult
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return SessionCompactResult{}, fmt.Errorf("decode compact result for session %s at %s: %w", strings.TrimSpace(id), strings.TrimSpace(addr), err)
+	}
+	return result, nil
+}
+
+// StreamSessionEvents connects to WS /sessions/{id}/stream and decodes JSON events.
+func StreamSessionEvents(ctx context.Context, addr, id string, timeout time.Duration) (<-chan SessionStreamEvent, <-chan error, func(), error) {
+	target, err := sessionStreamURL(addr, id)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	streamCtx, cancel := context.WithCancel(ctx)
+	dialer := websocket.Dialer{
+		HandshakeTimeout: clientTimeout(timeout),
+	}
+	conn, resp, err := dialer.DialContext(streamCtx, target, nil)
+	if err != nil {
+		if resp != nil {
+			defer resp.Body.Close()
+			return nil, nil, nil, fmt.Errorf("connect session stream %s at %s: %s", strings.TrimSpace(id), strings.TrimSpace(addr), serverWriteResponseError(resp))
+		}
+		cancel()
+		return nil, nil, nil, fmt.Errorf("connect session stream %s at %s: %w", strings.TrimSpace(id), strings.TrimSpace(addr), err)
+	}
+
+	events := make(chan SessionStreamEvent)
+	errs := make(chan error, 1)
+	closeStream := func() {
+		cancel()
+		_ = conn.Close()
+	}
+	go func() {
+		defer close(errs)
+		defer close(events)
+		defer conn.Close()
+		for {
+			_, payload, err := conn.ReadMessage()
+			if err != nil {
+				if streamCtx.Err() != nil || websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
+					return
+				}
+				errs <- fmt.Errorf("read session stream %s at %s: %w", strings.TrimSpace(id), strings.TrimSpace(addr), err)
+				return
+			}
+			var event SessionStreamEvent
+			if err := json.Unmarshal(payload, &event); err != nil {
+				errs <- fmt.Errorf("decode session stream event for session %s at %s: %w", strings.TrimSpace(id), strings.TrimSpace(addr), err)
+				return
+			}
+			select {
+			case events <- event:
+			case <-streamCtx.Done():
+				return
+			}
+		}
+	}()
+	return events, errs, closeStream, nil
+}
+
 // ShutdownServer sends POST /server/shutdown to a discovered server.
 func ShutdownServer(ctx context.Context, addr string, timeout time.Duration) error {
 	return ShutdownServerWithToken(ctx, addr, "", timeout)
@@ -274,6 +369,18 @@ func newServerClientRequestWithBody(ctx context.Context, method, addr, path stri
 		ctx = context.Background()
 	}
 	return http.NewRequestWithContext(ctx, method, "http://"+addr+path, bytes.NewReader(body))
+}
+
+func sessionStreamURL(addr, id string) (string, error) {
+	addr = strings.TrimSpace(addr)
+	if addr == "" {
+		return "", fmt.Errorf("server addr is required")
+	}
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return "", fmt.Errorf("session id is required")
+	}
+	return "ws://" + addr + "/sessions/" + url.PathEscape(id) + "/stream", nil
 }
 
 func clientTimeout(timeout time.Duration) time.Duration {
