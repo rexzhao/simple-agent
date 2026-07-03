@@ -345,6 +345,12 @@ marketplace、递归 skill discovery、plugin lifecycle 或复杂依赖解析。
 
 - Ctrl+C / interrupt 统一进入 context cancel 流程，当前模型请求、shell 工具和 MCP
   stdio 子进程都能感知并退出。
+- `sai chat` / agent 正在执行一轮时，Ctrl+C 只取消当前 active turn；已完成的外部副作用不回滚，
+  取消完成后回到 chat 输入状态，不退出整个 CLI 进程。
+- 同一 active turn 取消完成前，短时间重复 Ctrl+C 仍聚焦于取消当前轮次，不直接退出 chat session；
+  hard exit 或 session/process cancel 应保留给 idle 状态或单独显式行为。
+- idle 输入状态下的 Ctrl+C 可继续沿用现有 CLI / terminal 退出行为，除非实现时发现项目已有更严格约定。
+- `--quit` 单轮运行中 Ctrl+C 仍应取消当前 active turn；因为没有 REPL 输入状态可返回，取消后可以结束进程。
 - 明确 chat runtime 的 context lifecycle：会话级 context、单次模型请求 context 和工具
   执行 context 不互相泄漏。
 - HTTP request timeout，避免连接或首包长期挂起。
@@ -358,6 +364,12 @@ marketplace、递归 skill discovery、plugin lifecycle 或复杂依赖解析。
 验证：
 
 - 单元测试覆盖 context cancel 后 provider request、tool execution 和 logger close 的调用边界。
+- CLI 测试覆盖交互式 `sai chat` active turn 收到 Ctrl+C 后取消当前轮次、回到 prompt，并且不追加成功
+  assistant history。
+- CLI 或集成测试覆盖同一 active turn 取消完成前短时间重复 Ctrl+C 不直接退出 chat session，取消完成后仍回到
+  prompt。
+- CLI 或集成测试覆盖 idle 输入状态 Ctrl+C 不被 active-turn cancel 逻辑误处理。
+- CLI 或集成测试覆盖 `--quit` active turn Ctrl+C 取消后可以结束进程，并且不伪造成功 assistant history。
 - fake HTTP server 测试覆盖 request timeout、stream idle timeout、429 retry 和 5xx retry。
 - CLI 测试覆盖 `sai chat` 单轮可恢复错误后回到 prompt，且错误轮次不追加成功 assistant
   history。

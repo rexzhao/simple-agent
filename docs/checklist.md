@@ -203,7 +203,11 @@
 
 ## M11：Reliability
 
-- [x] Ctrl+C / interrupt 统一进入 context cancel 流程。
+- [x] Ctrl+C / interrupt 已接入现有 context cancel 流程。
+- [ ] 交互式 `sai chat` active turn 中 Ctrl+C 取消当前轮次并回到 prompt，不退出整个 CLI 进程。
+- [ ] 同一 active turn 取消完成前，短时间重复 Ctrl+C 不直接退出 chat session，取消完成后仍回到 prompt。
+- [ ] idle 输入状态 Ctrl+C 保持现有 CLI / terminal 行为，且不被 active-turn cancel 逻辑误处理。
+- [ ] `--quit` active turn 中 Ctrl+C 取消当前轮次后可以结束进程，且不伪造成功 assistant history。
 - [x] 明确 chat runtime 的 session/request/tool context lifecycle。
 - [x] HTTP request 支持 timeout。
 - [x] streaming SSE 支持 idle timeout。
