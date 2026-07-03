@@ -864,21 +864,92 @@ func serverCommand(ctx context.Context, args []string, configPath string, stdout
 	if err != nil {
 		return err
 	}
+	identity, err := localserver.NewRegistryIdentity(cwd, cfg.ConfigPath)
+	if err != nil {
+		return err
+	}
+	cwd = identity.CWD
+	configPath = identity.ConfigPath
+
+	store := localserver.NewRegistryStore("")
+	if done, err := checkExistingServerRecord(ctx, store, identity, listen, stdout); done || err != nil {
+		return err
+	}
 
 	process, err := localserver.Start(localserver.Options{
 		CWD:        cwd,
-		ConfigPath: cfg.ConfigPath,
+		ConfigPath: configPath,
 		Listen:     listen,
 		Version:    Version,
 	})
 	if err != nil {
 		return err
 	}
-	if _, err := fmt.Fprintf(stdout, "SERVER_ADDR\t%s\n", process.Addr()); err != nil {
+	info := process.Info()
+	token, err := localserver.GenerateRegistryToken()
+	if err != nil {
 		_ = process.Shutdown(context.Background())
 		return err
 	}
-	return process.Serve(ctx)
+	record := localserver.RegistryRecord{
+		CWD:             info.CWD,
+		ConfigPath:      info.ConfigPath,
+		Addr:            info.Addr,
+		PID:             info.PID,
+		Token:           token,
+		StartedAt:       info.StartedAt,
+		Version:         info.Version,
+		RequestedListen: listen,
+	}
+	if err := store.Upsert(record); err != nil {
+		_ = process.Shutdown(context.Background())
+		return err
+	}
+	if _, err := fmt.Fprintf(stdout, "SERVER_ADDR\t%s\n", process.Addr()); err != nil {
+		_ = process.Shutdown(context.Background())
+		_, removeErr := store.RemoveIdentity(identity)
+		return errors.Join(err, removeErr)
+	}
+	serveErr := process.Serve(ctx)
+	_, removeErr := store.RemoveIdentity(identity)
+	return errors.Join(serveErr, removeErr)
+}
+
+func checkExistingServerRecord(ctx context.Context, store localserver.RegistryStore, identity localserver.RegistryIdentity, listen string, stdout io.Writer) (bool, error) {
+	records, err := store.Load()
+	if err != nil {
+		return false, err
+	}
+
+	foundStale := false
+	for _, record := range records {
+		normalized, err := localserver.CanonicalizeRegistryRecord(record)
+		if err != nil {
+			return false, err
+		}
+		if !identity.Matches(normalized) {
+			continue
+		}
+		if err := localserver.CheckHealth(ctx, normalized.Addr, 300*time.Millisecond); err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return false, ctxErr
+			}
+			foundStale = true
+			continue
+		}
+		if normalized.RequestedListen == listen {
+			_, err := fmt.Fprintf(stdout, "SERVER_ALREADY_RUNNING\taddr=%s\tpid=%d\n", normalized.Addr, normalized.PID)
+			return true, err
+		}
+		return false, fmt.Errorf("server already running for cwd %q and config %q at %s pid %d with requested listen %q; requested %q", identity.CWD, identity.ConfigPath, normalized.Addr, normalized.PID, normalized.RequestedListen, listen)
+	}
+
+	if foundStale {
+		if _, err := store.RemoveIdentity(identity); err != nil {
+			return false, err
+		}
+	}
+	return false, nil
 }
 
 func serverListenAddress(portSet bool, port int, listen string) (string, error) {

@@ -21,6 +21,7 @@ import (
 
 	"github.com/rexzhao/simple-agent/internal/contextwindow"
 	"github.com/rexzhao/simple-agent/internal/model"
+	localserver "github.com/rexzhao/simple-agent/internal/server"
 	"github.com/rexzhao/simple-agent/internal/sessions"
 	"github.com/rexzhao/simple-agent/internal/subagents"
 )
@@ -1066,6 +1067,7 @@ func TestServerHelpWritesUsageWithoutConfig(t *testing.T) {
 }
 
 func TestServerCommandStartsWithDefaultConfigAndShutdown(t *testing.T) {
+	registryPath := isolateCLIUserRegistry(t)
 	projectDir := t.TempDir()
 	writeCLIFixtureInDir(t, filepath.Join(projectDir, ".agents"))
 
@@ -1091,13 +1093,58 @@ func TestServerCommandStartsWithDefaultConfigAndShutdown(t *testing.T) {
 		t.Fatalf("running_turns = %#v, want 0", got)
 	}
 
+	store := localserver.NewRegistryStore(registryPath)
+	records, err := store.List()
+	if err != nil {
+		t.Fatalf("registry List() error = %v", err)
+	}
+	if len(records) != 1 {
+		t.Fatalf("registry records = %#v, want one running server", records)
+	}
+	record := records[0]
+	if got, want := filepath.Clean(record.CWD), filepath.Clean(projectDir); got != want {
+		t.Fatalf("registry cwd = %q, want %q", got, want)
+	}
+	if got, want := filepath.Clean(record.ConfigPath), filepath.Join(projectDir, ".agents", "sai.yaml"); got != want {
+		t.Fatalf("registry config_path = %q, want %q", got, want)
+	}
+	if record.Addr != addr {
+		t.Fatalf("registry addr = %q, want %q", record.Addr, addr)
+	}
+	if record.PID <= 0 {
+		t.Fatalf("registry pid = %d, want positive", record.PID)
+	}
+	if strings.TrimSpace(record.Token) == "" {
+		t.Fatal("registry token is empty")
+	}
+	if strings.Contains(record.Addr, record.Token) {
+		t.Fatal("registry token unexpectedly appeared in addr")
+	}
+	if record.StartedAt.IsZero() {
+		t.Fatal("registry started_at is zero")
+	}
+	if record.Version != Version {
+		t.Fatalf("registry version = %q, want %q", record.Version, Version)
+	}
+	if record.RequestedListen != "127.0.0.1:0" {
+		t.Fatalf("registry requested_listen = %q, want 127.0.0.1:0", record.RequestedListen)
+	}
+
 	postCLIServerShutdown(t, addr)
 	if code := waitForCode(t, done); code != 0 {
 		t.Fatalf("server command code = %d, stderr = %s", code, stderr.String())
 	}
+	records, err = store.List()
+	if err != nil {
+		t.Fatalf("registry List() after shutdown error = %v", err)
+	}
+	if len(records) != 0 {
+		t.Fatalf("registry records after shutdown = %#v, want empty", records)
+	}
 }
 
 func TestServerCommandResolvesRelativeConfigFromCWD(t *testing.T) {
+	isolateCLIUserRegistry(t)
 	baseDir := t.TempDir()
 	projectDir := filepath.Join(baseDir, "project")
 	writeCLIFixtureInDir(t, filepath.Join(projectDir, "config"))
@@ -1118,6 +1165,177 @@ func TestServerCommandResolvesRelativeConfigFromCWD(t *testing.T) {
 	postCLIServerShutdown(t, addr)
 	if code := waitForCode(t, done); code != 0 {
 		t.Fatalf("server command code = %d, stderr = %s", code, stderr.String())
+	}
+}
+
+func TestServerCommandContextCancelRemovesRegistry(t *testing.T) {
+	registryPath := isolateCLIUserRegistry(t)
+	projectDir := t.TempDir()
+	writeCLIFixtureInDir(t, filepath.Join(projectDir, ".agents"))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	stdoutReader, stdoutWriter := io.Pipe()
+	stderr := &bytes.Buffer{}
+	done := make(chan int, 1)
+	go func() {
+		done <- RunWithContext(ctx, []string{"server", "--port", "0"}, strings.NewReader(""), stdoutWriter, stderr, func() (string, error) {
+			return projectDir, nil
+		})
+		_ = stdoutWriter.Close()
+	}()
+
+	line, err := bufio.NewReader(stdoutReader).ReadString('\n')
+	if err != nil {
+		cancel()
+		t.Fatalf("ReadString(SERVER_ADDR) error = %v, stderr = %s", err, stderr.String())
+	}
+	if !strings.HasPrefix(line, "SERVER_ADDR\t") {
+		cancel()
+		t.Fatalf("server stdout line = %q, want SERVER_ADDR", line)
+	}
+	store := localserver.NewRegistryStore(registryPath)
+	if records, err := store.List(); err != nil || len(records) != 1 {
+		cancel()
+		t.Fatalf("registry records before cancel = %#v, err = %v, want one", records, err)
+	}
+
+	cancel()
+	_ = stdoutReader.Close()
+	if code := waitForCode(t, done); code != 0 {
+		t.Fatalf("server command after cancel code = %d, stderr = %s", code, stderr.String())
+	}
+	records, err := store.List()
+	if err != nil {
+		t.Fatalf("registry List() after cancel error = %v", err)
+	}
+	if len(records) != 0 {
+		t.Fatalf("registry records after cancel = %#v, want empty", records)
+	}
+}
+
+func TestServerCommandDuplicateSameListenExitsAlreadyRunning(t *testing.T) {
+	registryPath := isolateCLIUserRegistry(t)
+	projectDir := t.TempDir()
+	writeCLIFixtureInDir(t, filepath.Join(projectDir, ".agents"))
+
+	addr, done, stderr, cleanup := startCLIServerCommandForTest(t, []string{"server", "--port", "0"}, func() (string, error) {
+		return projectDir, nil
+	})
+	defer cleanup()
+
+	var secondStdout, secondStderr bytes.Buffer
+	code := RunWithGetwd([]string{"server", "--port", "0"}, &secondStdout, &secondStderr, func() (string, error) {
+		return projectDir, nil
+	})
+	if code != 0 {
+		t.Fatalf("duplicate server code = %d, stderr = %s", code, secondStderr.String())
+	}
+	if secondStderr.String() != "" {
+		t.Fatalf("duplicate stderr = %q, want empty", secondStderr.String())
+	}
+	out := secondStdout.String()
+	if !strings.Contains(out, "SERVER_ALREADY_RUNNING") || !strings.Contains(out, "addr="+addr) || !strings.Contains(out, "pid=") {
+		t.Fatalf("duplicate stdout = %q, want already running addr and pid", out)
+	}
+	if strings.Contains(out, "SERVER_ADDR") {
+		t.Fatalf("duplicate stdout = %q, should not print new server addr", out)
+	}
+	records, err := localserver.NewRegistryStore(registryPath).List()
+	if err != nil {
+		t.Fatalf("registry List() error = %v", err)
+	}
+	if len(records) != 1 || records[0].Addr != addr {
+		t.Fatalf("registry after duplicate = %#v, want original server", records)
+	}
+
+	postCLIServerShutdown(t, addr)
+	if code := waitForCode(t, done); code != 0 {
+		t.Fatalf("server command code = %d, stderr = %s", code, stderr.String())
+	}
+}
+
+func TestServerCommandDuplicateDifferentListenFailsBeforeBind(t *testing.T) {
+	registryPath := isolateCLIUserRegistry(t)
+	projectDir := t.TempDir()
+	writeCLIFixtureInDir(t, filepath.Join(projectDir, ".agents"))
+
+	addr, done, stderr, cleanup := startCLIServerCommandForTest(t, []string{"server", "--port", "0"}, func() (string, error) {
+		return projectDir, nil
+	})
+	defer cleanup()
+
+	var secondStdout, secondStderr bytes.Buffer
+	code := RunWithGetwd([]string{"server", "--listen", "127.0.0.1:23456"}, &secondStdout, &secondStderr, func() (string, error) {
+		return projectDir, nil
+	})
+	if code != 1 {
+		t.Fatalf("conflicting server code = %d, want 1", code)
+	}
+	if secondStdout.String() != "" {
+		t.Fatalf("conflicting stdout = %q, want empty", secondStdout.String())
+	}
+	assertCLIErrorContains(t, secondStderr.String(), "server already running", "127.0.0.1:0", "127.0.0.1:23456")
+	records, err := localserver.NewRegistryStore(registryPath).List()
+	if err != nil {
+		t.Fatalf("registry List() error = %v", err)
+	}
+	if len(records) != 1 || records[0].Addr != addr {
+		t.Fatalf("registry after conflict = %#v, want original server", records)
+	}
+
+	postCLIServerShutdown(t, addr)
+	if code := waitForCode(t, done); code != 0 {
+		t.Fatalf("server command code = %d, stderr = %s", code, stderr.String())
+	}
+}
+
+func TestServerCommandStaleRegistryRecordIsReplacedAndCleanedUp(t *testing.T) {
+	registryPath := isolateCLIUserRegistry(t)
+	projectDir := t.TempDir()
+	writeCLIFixtureInDir(t, filepath.Join(projectDir, ".agents"))
+	configPath := filepath.Join(projectDir, ".agents", "sai.yaml")
+	store := localserver.NewRegistryStore(registryPath)
+	stale := localserver.RegistryRecord{
+		CWD:             projectDir,
+		ConfigPath:      configPath,
+		Addr:            "127.0.0.1:0",
+		PID:             999999,
+		Token:           "stale-token",
+		StartedAt:       time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC),
+		Version:         "stale-version",
+		RequestedListen: "127.0.0.1:0",
+	}
+	if err := store.Upsert(stale); err != nil {
+		t.Fatalf("Upsert(stale) error = %v", err)
+	}
+
+	addr, done, stderr, cleanup := startCLIServerCommandForTest(t, []string{"server", "--port", "0"}, func() (string, error) {
+		return projectDir, nil
+	})
+	defer cleanup()
+
+	records, err := store.List()
+	if err != nil {
+		t.Fatalf("registry List() error = %v", err)
+	}
+	if len(records) != 1 {
+		t.Fatalf("registry records = %#v, want replacement only", records)
+	}
+	replacement := records[0]
+	if replacement.Addr != addr || replacement.Token == stale.Token || replacement.PID == stale.PID || replacement.Version == stale.Version {
+		t.Fatalf("replacement record = %#v, stale = %#v", replacement, stale)
+	}
+
+	postCLIServerShutdown(t, addr)
+	if code := waitForCode(t, done); code != 0 {
+		t.Fatalf("server command code = %d, stderr = %s", code, stderr.String())
+	}
+	records, err = store.List()
+	if err != nil {
+		t.Fatalf("registry List() after shutdown error = %v", err)
+	}
+	if len(records) != 0 {
+		t.Fatalf("registry records after shutdown = %#v, want empty", records)
 	}
 }
 
@@ -8815,6 +9033,20 @@ func waitForCode(t *testing.T, ch <-chan int) int {
 		t.Fatal("timed out waiting for chat to finish")
 	}
 	return -1
+}
+
+func isolateCLIUserRegistry(t *testing.T) string {
+	t.Helper()
+
+	root := t.TempDir()
+	t.Setenv("APPDATA", filepath.Join(root, "appdata"))
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(root, "xdg-config"))
+	t.Setenv("HOME", filepath.Join(root, "home"))
+	path, err := localserver.DefaultRegistryPath()
+	if err != nil {
+		t.Fatalf("DefaultRegistryPath() error = %v", err)
+	}
+	return path
 }
 
 func startCLIServerCommandForTest(t *testing.T, args []string, getwd func() (string, error)) (string, <-chan int, *bytes.Buffer, func()) {

@@ -46,6 +46,33 @@ type Info struct {
 	RunningTurns int       `json:"running_turns"`
 }
 
+func CheckHealth(ctx context.Context, addr string, timeout time.Duration) error {
+	addr = strings.TrimSpace(addr)
+	if addr == "" {
+		return fmt.Errorf("server addr is required")
+	}
+	if timeout <= 0 {
+		timeout = 500 * time.Millisecond
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+addr+"/health", nil)
+	if err != nil {
+		return fmt.Errorf("create health request: %w", err)
+	}
+	client := http.Client{Timeout: timeout}
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("check health at %s: %w", addr, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("check health at %s: status %d", addr, resp.StatusCode)
+	}
+	return nil
+}
+
 func Start(options Options) (*Process, error) {
 	listen := strings.TrimSpace(options.Listen)
 	if listen == "" {
@@ -117,6 +144,10 @@ func (p *Process) Addr() string {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.info.Addr
+}
+
+func (p *Process) Info() Info {
+	return p.snapshot()
 }
 
 func (p *Process) Serve(ctx context.Context) error {

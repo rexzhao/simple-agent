@@ -23,7 +23,7 @@ future work and should not be required by any slice here.
 - [x] Server process foundation: add `sai server`, loopback HTTP listener,
   foreground blocking behavior, `GET /health`, `GET /server`, and
   `POST /server/shutdown`.
-- [ ] Foreground lifecycle: handle Ctrl+C by stopping listeners, flushing required
+- [x] Foreground lifecycle: handle Ctrl+C by stopping listeners, flushing required
   metadata, removing registry entries, and exiting 0 when no running turn blocks
   shutdown.
 - [ ] Background lifecycle: implement `sai server --background` so the parent waits
