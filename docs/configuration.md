@@ -547,7 +547,8 @@ tool call 时，`sai chat` 默认向 stderr 打印 `tool: <name>` 形式的独�
 颜色且未设置 `NO_COLOR` 时，状态行使用 muted 样式并在行尾 reset。`read_file`、
 `write_file` 和 `edit_file` 会追加目标文件路径，`list_files` 会追加目标目录且未提供
 path 时显示 `.`。`shell` 和 MCP tool 状态只显示工具名，不显示命令参数或任意
-arguments；状态也不包含 tool result 正文，stdout 仍只输出模型文本。
+arguments；`subagent_start` 状态显示 subagent id 和可选 display/job name，但不显示
+prompt 正文。状态也不包含 tool result 正文，stdout 仍只输出模型文本。
 
 `shell` 工具默认在启动目录执行命令。v0.1 不提供 `--workdir` 配置。
 

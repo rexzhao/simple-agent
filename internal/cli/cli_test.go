@@ -4436,12 +4436,12 @@ subagents:
 	defer stdinReader.Close()
 	defer stdinWriter.Close()
 	stdout := newSignalingWriter("unused")
-	var stderr bytes.Buffer
+	stderr := newSignalingWriter(chatInputPrompt)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	done := make(chan int, 1)
 	go func() {
-		done <- RunWithContext(ctx, []string{"--config", cliConfigPath(configDir), "chat", "--prompt", "delegate"}, stdinReader, stdout, &stderr, func() (string, error) {
+		done <- RunWithContext(ctx, []string{"--config", cliConfigPath(configDir), "chat", "--prompt", "delegate"}, stdinReader, stdout, stderr, func() (string, error) {
 			return t.TempDir(), nil
 		})
 	}()
@@ -5074,17 +5074,22 @@ subagents:
 	defer stdinReader.Close()
 	defer stdinWriter.Close()
 	stdout := newSignalingWriter("unused")
-	var stderr bytes.Buffer
+	stderr := newSignalingWriter(chatInputPrompt)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	done := make(chan int, 1)
 	go func() {
-		done <- RunWithContext(ctx, []string{"--config", cliConfigPath(configDir), "chat", "--prompt", "delegate"}, stdinReader, stdout, &stderr, func() (string, error) {
+		done <- RunWithContext(ctx, []string{"--config", cliConfigPath(configDir), "chat", "--prompt", "delegate"}, stdinReader, stdout, stderr, func() (string, error) {
 			return t.TempDir(), nil
 		})
 	}()
 
 	assertCLIOutputEventuallyContains(t, stdout, "started\n")
+	select {
+	case <-stderr.wrote:
+	case <-time.After(2 * time.Second):
+		t.Fatal("chat prompt did not render before idle completion")
+	}
 	close(releaseChild)
 	assertCLIOutputEventuallyContains(t, stdout, "handled idle")
 	if _, err := stdinWriter.Write([]byte("/exit\n")); err != nil {
@@ -5115,6 +5120,9 @@ subagents:
 		if !strings.Contains(event, want) {
 			t.Fatalf("completion event = %q, want substring %q", event, want)
 		}
+	}
+	if got := stderr.String(); !strings.Contains(got, chatInputPrompt+"\n"+chatInputPrompt) {
+		t.Fatalf("stderr = %q, want idle completion to separate and redraw prompt", got)
 	}
 }
 
@@ -6753,6 +6761,29 @@ func TestWriteStreamWritesToolStatusWithSafeDetailsOnly(t *testing.T) {
 		t.Fatalf("stderr = %q, want %q", got, want)
 	}
 	assertCLIErrorOmits(t, stderr.String(), "secret-*.txt", "secret-write-content", "secret-old", "secret-new", "secret-command", "secret-query", "secret result body", "wrote draft.txt", "edited draft.txt")
+}
+
+func TestWriteStreamWritesSubagentStartStatusWithBriefDetails(t *testing.T) {
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	err := writeStream(&stdout, &stderr, cliEventStream(
+		model.ToolCallDoneEvent{ToolCall: model.ToolCall{Name: subagents.ToolSubagentStart, Arguments: `{"agent_id":"reviewer","prompt":"secret child prompt","display_name":"Review UI","job_name":"review-1"}`}},
+		model.ToolCallDoneEvent{ToolCall: model.ToolCall{Name: subagents.ToolSubagentStart, Arguments: `{"agent_id":"researcher","prompt":"another secret","job_name":"research-1"}`}},
+		model.ToolCallDoneEvent{ToolCall: model.ToolCall{Name: subagents.ToolSubagentStart, Arguments: `{"agent_id":"reviewer","prompt":"line secret","display_name":"  Audit\nPass\tOne  "}`}},
+		model.ToolCallDoneEvent{ToolCall: model.ToolCall{Name: subagents.ToolSubagentStart, Arguments: `{"prompt":"missing agent secret"}`}},
+		model.ToolCallDoneEvent{ToolCall: model.ToolCall{Name: subagents.ToolSubagentStart, Arguments: `[`}},
+	), false, nil)
+
+	if err != nil {
+		t.Fatalf("writeStream() error = %v", err)
+	}
+	if stdout.String() != "" {
+		t.Fatalf("stdout = %q, want empty", stdout.String())
+	}
+	if got, want := stderr.String(), "tool: subagent_start reviewer Review UI\ntool: subagent_start researcher research-1\ntool: subagent_start reviewer Audit Pass One\ntool: subagent_start\ntool: subagent_start\n"; got != want {
+		t.Fatalf("stderr = %q, want %q", got, want)
+	}
+	assertCLIErrorOmits(t, stderr.String(), "secret child prompt", "another secret", "line secret", "missing agent secret", "review-1")
 }
 
 func TestWriteStreamPutsConsecutiveToolStatusesOnIndependentLinesAfterOutputAndPrompt(t *testing.T) {

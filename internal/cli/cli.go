@@ -40,6 +40,7 @@ const builtInBaseInstructions = "You are sai, a local CLI agent runner. Follow t
 const (
 	reasoningColorDarkGray = "\x1b[90m"
 	ansiReset              = "\x1b[0m"
+	chatInputPrompt        = "> "
 )
 
 func Run(args []string, stdout, stderr io.Writer) int {
@@ -1680,6 +1681,12 @@ func chatCommand(ctx context.Context, args []string, configPath string, stdin io
 			}
 			messages = updated
 		case <-runtime.subagentCompletionSignal():
+			redrawPrompt := inputCh != nil
+			if redrawPrompt {
+				if _, err := fmt.Fprint(stderr, "\n"); err != nil {
+					return err
+				}
+			}
 			updated, err := runAvailableCompletionTurns(ctx, runtime, messages, stdout, stderr, true, true)
 			if err != nil {
 				if ctxErr := ctx.Err(); ctxErr != nil {
@@ -1691,9 +1698,19 @@ func chatCommand(ctx context.Context, args []string, configPath string, stdin io
 				if _, printErr := fmt.Fprintf(stderr, "sai: %v\n", err); printErr != nil {
 					return printErr
 				}
+				if redrawPrompt {
+					if _, printErr := fmt.Fprint(stderr, chatInputPrompt); printErr != nil {
+						return printErr
+					}
+				}
 				continue
 			}
 			messages = updated
+			if redrawPrompt {
+				if _, err := fmt.Fprint(stderr, chatInputPrompt); err != nil {
+					return err
+				}
+			}
 		}
 	}
 }
@@ -1778,7 +1795,7 @@ func scanChatLine(ctx context.Context, scanner *bufio.Scanner, stderr io.Writer)
 	if err := ctx.Err(); err != nil {
 		return "", false, err
 	}
-	if _, err := fmt.Fprint(stderr, "> "); err != nil {
+	if _, err := fmt.Fprint(stderr, chatInputPrompt); err != nil {
 		return "", false, err
 	}
 	if !scanner.Scan() {
@@ -3187,11 +3204,18 @@ func writeStreamWithOptions(stdout, stderr io.Writer, events <-chan model.Event,
 
 func formatToolStatus(toolCall model.ToolCall) string {
 	status := "tool: " + toolCall.Name
-	path, ok := toolStatusPath(toolCall)
+	detail, ok := toolStatusDetail(toolCall)
 	if ok {
-		status += " " + path
+		status += " " + detail
 	}
 	return status
+}
+
+func toolStatusDetail(toolCall model.ToolCall) (string, bool) {
+	if toolCall.Name == subagents.ToolSubagentStart {
+		return subagentStartStatusDetail(toolCall)
+	}
+	return toolStatusPath(toolCall)
 }
 
 func toolStatusPath(toolCall model.ToolCall) (string, bool) {
@@ -3221,6 +3245,39 @@ func toolStatusPath(toolCall model.ToolCall) (string, bool) {
 		return "", false
 	}
 	return text, true
+}
+
+func subagentStartStatusDetail(toolCall model.ToolCall) (string, bool) {
+	var arguments map[string]any
+	if err := json.Unmarshal([]byte(toolCall.Arguments), &arguments); err != nil {
+		return "", false
+	}
+	if arguments == nil {
+		return "", false
+	}
+	agentID, ok := compactToolStatusString(arguments["agent_id"])
+	if !ok {
+		return "", false
+	}
+	status := agentID
+	if displayName, ok := compactToolStatusString(arguments["display_name"]); ok {
+		status += " " + displayName
+	} else if jobName, ok := compactToolStatusString(arguments["job_name"]); ok {
+		status += " " + jobName
+	}
+	return status, true
+}
+
+func compactToolStatusString(value any) (string, bool) {
+	text, ok := value.(string)
+	if !ok {
+		return "", false
+	}
+	fields := strings.Fields(text)
+	if len(fields) == 0 {
+		return "", false
+	}
+	return strings.Join(fields, " "), true
 }
 
 func shouldColorizeWriter(stdout io.Writer) bool {

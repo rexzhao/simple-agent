@@ -41,6 +41,24 @@ func TestDefinitions(t *testing.T) {
 		t.Fatalf("Definitions() names = %#v, want %#v", gotNames, wantNames)
 	}
 
+	assertDescriptionContains(t, definitions, ToolSubagentStart, "Do not call subagent_wait unless the parent is blocked", "delivered back to the parent automatically")
+	assertDescriptionContains(t, definitions, ToolSubagentWait, "Use only when the parent must block", "completion arrive automatically")
+}
+
+func assertDescriptionContains(t *testing.T, definitions []model.Tool, name string, wants ...string) {
+	t.Helper()
+	for _, definition := range definitions {
+		if definition.Name != name {
+			continue
+		}
+		for _, want := range wants {
+			if !strings.Contains(definition.Description, want) {
+				t.Fatalf("definition %q description = %q, want contain %q", name, definition.Description, want)
+			}
+		}
+		return
+	}
+	t.Fatalf("definition %q not found", name)
 }
 
 func TestStartStatusAndWaitSuccess(t *testing.T) {

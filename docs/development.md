@@ -139,7 +139,8 @@ CLI 默认只打印 `text_delta`。`reasoning_delta` 默认隐藏，后续通过
 （例如 `tool: read_file docs/notes.md`），不需要 `--verbose`；`read_file`、`write_file`、
 `edit_file` 和 `list_files` 状态可以显示目标路径/目录，其中 `list_files` 未提供 path
 时显示 `.`。`shell` 和 MCP tool 状态只显示工具名，不显示命令参数或任意 arguments，
-也不打印 tool result 正文，stdout 仍只承载模型可见输出。
+也不打印 tool result 正文；`subagent_start` 状态显示 subagent id 和可选 display/job name，
+不显示 prompt 正文。stdout 仍只承载模型可见输出。
 
 ## Agent Loop
 

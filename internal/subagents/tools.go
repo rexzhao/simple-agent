@@ -36,7 +36,7 @@ func IsTool(name string) bool {
 func StartDefinition() model.Tool {
 	return model.Tool{
 		Name:        ToolSubagentStart,
-		Description: "Start a configured subagent job asynchronously.",
+		Description: "Start a configured subagent job asynchronously. Do not call subagent_wait unless the parent is blocked on the result; completed jobs are delivered back to the parent automatically.",
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
@@ -106,7 +106,7 @@ func StatusDefinition() model.Tool {
 func WaitDefinition() model.Tool {
 	return model.Tool{
 		Name:        ToolSubagentWait,
-		Description: "Wait for a subagent job to finish until timeout_ms elapses.",
+		Description: "Wait for a subagent job to finish until timeout_ms elapses. Use only when the parent must block for the result; otherwise let completion arrive automatically.",
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
