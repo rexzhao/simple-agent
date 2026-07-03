@@ -462,8 +462,10 @@ codex login --provider codex-work` 会生成或更新 `providers/codex-work.yaml
 文件包含 OAuth access / refresh token，属于敏感数据；`sai config show`、verbose 和日志
 不能打印其中的 token。access token 过期时运行时用 refresh token 刷新，并写回同一
 auth 文件。M16 不读取或导入 `~/.codex/auth.json`；首版登录使用 Codex headless device
-flow：`/api/accounts/deviceauth/usercode`、`/api/accounts/deviceauth/token` 和
-`/oauth/token` authorization-code exchange，不实现浏览器 OAuth 回调。
+flow：先用 JSON body 调 `/api/accounts/deviceauth/usercode`，成功后打印返回的
+verification URL / user code，再用 JSON body 轮询 `/api/accounts/deviceauth/token`；
+最后的 `/oauth/token` authorization-code exchange 继续使用 form encoding。不实现浏览器
+OAuth 回调。
 
 命令行参数覆盖配置文件。`api_key` 是 provider 配置中的具体字段。对需要脱敏的敏感
 配置值，统一使用简单字符串约定：值以 `$` 开头时，`$` 后面的内容作为环境变量名读取

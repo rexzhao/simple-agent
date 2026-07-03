@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -245,10 +246,11 @@ func Refresh(ctx context.Context, options RefreshOptions) (TokenFile, error) {
 }
 
 type userCodeResponse struct {
-	UserCode        string `json:"user_code"`
-	VerificationURI string `json:"verification_uri"`
-	ExpiresIn       int    `json:"expires_in"`
-	Interval        int    `json:"interval"`
+	DeviceAuthID    string  `json:"device_auth_id"`
+	UserCode        string  `json:"user_code"`
+	VerificationURI string  `json:"verification_uri"`
+	ExpiresIn       jsonInt `json:"expires_in"`
+	Interval        jsonInt `json:"interval"`
 }
 
 type authorizationResponse struct {
@@ -256,11 +258,37 @@ type authorizationResponse struct {
 	CodeVerifier      string `json:"code_verifier"`
 }
 
+type jsonInt int
+
+func (i *jsonInt) UnmarshalJSON(data []byte) error {
+	raw := strings.TrimSpace(string(data))
+	if raw == "" || raw == "null" {
+		return nil
+	}
+	if strings.HasPrefix(raw, `"`) {
+		var value string
+		if err := json.Unmarshal(data, &value); err != nil {
+			return err
+		}
+		raw = strings.TrimSpace(value)
+	}
+	value, err := strconv.Atoi(raw)
+	if err != nil {
+		return fmt.Errorf("invalid integer %q", raw)
+	}
+	*i = jsonInt(value)
+	return nil
+}
+
 func requestUserCode(ctx context.Context, options DeviceLoginOptions) (userCodeResponse, error) {
-	form := url.Values{}
-	form.Set("client_id", clientID(options.ClientID))
-	form.Set("scope", scope(options.Scope))
-	response, err := postForm(ctx, options.HTTPClient, userCodeURL(options.UserCodeURL), form)
+	body := struct {
+		ClientID string `json:"client_id"`
+		Scope    string `json:"scope"`
+	}{
+		ClientID: clientID(options.ClientID),
+		Scope:    scope(options.Scope),
+	}
+	response, err := postJSON(ctx, options.HTTPClient, userCodeURL(options.UserCodeURL), body)
 	if err != nil {
 		return userCodeResponse{}, fmt.Errorf("request Codex user code: %w", err)
 	}
@@ -274,6 +302,9 @@ func requestUserCode(ctx context.Context, options DeviceLoginOptions) (userCodeR
 	}
 	if strings.TrimSpace(userCode.UserCode) == "" {
 		return userCodeResponse{}, fmt.Errorf("Codex user code response is missing user_code")
+	}
+	if strings.TrimSpace(userCode.DeviceAuthID) == "" {
+		return userCodeResponse{}, fmt.Errorf("Codex user code response is missing device_auth_id")
 	}
 	if strings.TrimSpace(userCode.VerificationURI) == "" {
 		userCode.VerificationURI = strings.TrimRight(DefaultIssuerURL, "/") + "/device"
@@ -295,10 +326,14 @@ func pollDeviceAuthorization(ctx context.Context, options DeviceLoginOptions, us
 		if userCode.ExpiresIn > 0 && !nowFunc(options.Now)().Before(expiresAt) {
 			return authorizationResponse{}, fmt.Errorf("Codex device login expired before authorization completed")
 		}
-		form := url.Values{}
-		form.Set("client_id", clientID(options.ClientID))
-		form.Set("user_code", userCode.UserCode)
-		response, err := postForm(ctx, options.HTTPClient, deviceTokenURL(options.DeviceTokenURL), form)
+		body := struct {
+			DeviceAuthID string `json:"device_auth_id"`
+			UserCode     string `json:"user_code"`
+		}{
+			DeviceAuthID: userCode.DeviceAuthID,
+			UserCode:     userCode.UserCode,
+		}
+		response, err := postJSON(ctx, options.HTTPClient, deviceTokenURL(options.DeviceTokenURL), body)
 		if err != nil {
 			return authorizationResponse{}, fmt.Errorf("poll Codex device authorization: %w", err)
 		}
@@ -410,6 +445,22 @@ func postForm(ctx context.Context, client *http.Client, endpoint string, form ur
 		return nil, err
 	}
 	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	return client.Do(request)
+}
+
+func postJSON(ctx context.Context, client *http.Client, endpoint string, body any) (*http.Response, error) {
+	if client == nil {
+		client = http.DefaultClient
+	}
+	data, err := json.Marshal(body)
+	if err != nil {
+		return nil, err
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(data))
+	if err != nil {
+		return nil, err
+	}
+	request.Header.Set("Content-Type", "application/json")
 	return client.Do(request)
 }
 

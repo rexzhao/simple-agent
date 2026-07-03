@@ -205,17 +205,42 @@ auth_dir: auth
 `)
 	tokenRequests := make(chan url.Values, 2)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if err := r.ParseForm(); err != nil {
-			t.Fatalf("ParseForm() error = %v", err)
-		}
 		switch r.URL.Path {
 		case "/api/accounts/deviceauth/usercode":
+			if got := r.Header.Get("Content-Type"); got != "application/json" {
+				t.Fatalf("usercode Content-Type = %q, want application/json", got)
+			}
+			bodyData, err := io.ReadAll(r.Body)
+			if err != nil {
+				t.Fatalf("ReadAll(usercode body) error = %v", err)
+			}
+			body := decodeCLIJSON(t, bodyData)
+			if body["client_id"] == "" {
+				t.Fatalf("usercode body = %#v, want client_id", body)
+			}
 			w.Header().Set("Content-Type", "application/json")
-			_, _ = io.WriteString(w, `{"user_code":"USER-123","verification_uri":"https://example.test/device","interval":1,"expires_in":600}`)
+			_, _ = io.WriteString(w, `{"device_auth_id":"device-auth-123","user_code":"USER-123","verification_uri":"https://example.test/device","interval":"1","expires_in":"600"}`)
 		case "/api/accounts/deviceauth/token":
+			if got := r.Header.Get("Content-Type"); got != "application/json" {
+				t.Fatalf("device token Content-Type = %q, want application/json", got)
+			}
+			bodyData, err := io.ReadAll(r.Body)
+			if err != nil {
+				t.Fatalf("ReadAll(device token body) error = %v", err)
+			}
+			body := decodeCLIJSON(t, bodyData)
+			if body["device_auth_id"] != "device-auth-123" || body["user_code"] != "USER-123" {
+				t.Fatalf("device token body = %#v, want device_auth_id and user_code", body)
+			}
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = io.WriteString(w, `{"authorization_code":"auth-code-123","code_verifier":"verifier-123"}`)
 		case "/oauth/token":
+			if got := r.Header.Get("Content-Type"); got != "application/x-www-form-urlencoded" {
+				t.Fatalf("token Content-Type = %q, want application/x-www-form-urlencoded", got)
+			}
+			if err := r.ParseForm(); err != nil {
+				t.Fatalf("ParseForm() error = %v", err)
+			}
 			tokenRequests <- r.PostForm
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = io.WriteString(w, `{"access_token":"codex-access","refresh_token":"codex-refresh","expires_in":3600,"account_id":"account-123","token_type":"Bearer"}`)

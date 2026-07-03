@@ -21,6 +21,7 @@ func TestTokenSourceRefreshesExpiredTokenAndWritesFile(t *testing.T) {
 		if r.URL.Path != "/oauth/token" {
 			t.Fatalf("path = %q, want /oauth/token", r.URL.Path)
 		}
+		assertRequestContentType(t, r, "application/x-www-form-urlencoded")
 		if err := r.ParseForm(); err != nil {
 			t.Fatalf("ParseForm() error = %v", err)
 		}
@@ -101,6 +102,40 @@ func TestStoreSaveOverwritesWithPrivatePermissions(t *testing.T) {
 	}
 }
 
+func TestUserCodeResponseDecodesNumericFields(t *testing.T) {
+	tests := []struct {
+		name      string
+		response  string
+		interval  int
+		expiresIn int
+	}{
+		{
+			name:      "numbers",
+			response:  `{"device_auth_id":"device-auth-123","user_code":"USER-123","interval":1,"expires_in":600}`,
+			interval:  1,
+			expiresIn: 600,
+		},
+		{
+			name:      "numeric strings",
+			response:  `{"device_auth_id":"device-auth-123","user_code":"USER-123","interval":"1","expires_in":"600"}`,
+			interval:  1,
+			expiresIn: 600,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var got userCodeResponse
+			if err := json.Unmarshal([]byte(tt.response), &got); err != nil {
+				t.Fatalf("Unmarshal() error = %v", err)
+			}
+			if int(got.Interval) != tt.interval || int(got.ExpiresIn) != tt.expiresIn {
+				t.Fatalf("userCodeResponse = %#v, want interval %d expires_in %d", got, tt.interval, tt.expiresIn)
+			}
+		})
+	}
+}
+
 func TestDeviceLoginSlowDownIncreasesPollingInterval(t *testing.T) {
 	now := time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC)
 	var tokenPolls int
@@ -108,9 +143,19 @@ func TestDeviceLoginSlowDownIncreasesPollingInterval(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/api/accounts/deviceauth/usercode":
+			assertRequestContentType(t, r, "application/json")
+			body := readRequestJSON(t, r)
+			if body["client_id"] != DefaultClientID || body["scope"] != DefaultScope {
+				t.Fatalf("usercode body = %#v, want client_id and scope", body)
+			}
 			w.Header().Set("Content-Type", "application/json")
-			_, _ = io.WriteString(w, `{"user_code":"USER-123","verification_uri":"https://example.test/device","interval":1,"expires_in":600}`)
+			_, _ = io.WriteString(w, `{"device_auth_id":"device-auth-123","user_code":"USER-123","verification_uri":"https://example.test/device","interval":"1","expires_in":"600"}`)
 		case "/api/accounts/deviceauth/token":
+			assertRequestContentType(t, r, "application/json")
+			body := readRequestJSON(t, r)
+			if body["device_auth_id"] != "device-auth-123" || body["user_code"] != "USER-123" {
+				t.Fatalf("device token body = %#v, want device_auth_id and user_code", body)
+			}
 			tokenPolls++
 			w.Header().Set("Content-Type", "application/json")
 			switch tokenPolls {
@@ -124,6 +169,7 @@ func TestDeviceLoginSlowDownIncreasesPollingInterval(t *testing.T) {
 				_, _ = io.WriteString(w, `{"authorization_code":"auth-code","code_verifier":"verifier-123"}`)
 			}
 		case "/oauth/token":
+			assertRequestContentType(t, r, "application/x-www-form-urlencoded")
 			if err := r.ParseForm(); err != nil {
 				t.Fatalf("ParseForm() error = %v", err)
 			}
@@ -172,4 +218,22 @@ func TestDeviceLoginSlowDownIncreasesPollingInterval(t *testing.T) {
 		exchangeForm.Get("redirect_uri") != server.URL+"/deviceauth/callback" {
 		t.Fatalf("exchange form = %#v", exchangeForm)
 	}
+}
+
+func assertRequestContentType(t *testing.T, r *http.Request, want string) {
+	t.Helper()
+
+	if got := r.Header.Get("Content-Type"); got != want {
+		t.Fatalf("Content-Type = %q, want %q", got, want)
+	}
+}
+
+func readRequestJSON(t *testing.T, r *http.Request) map[string]any {
+	t.Helper()
+
+	var body map[string]any
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		t.Fatalf("decode request JSON: %v", err)
+	}
+	return body
 }
