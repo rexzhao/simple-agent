@@ -1063,7 +1063,7 @@ func TestServerHelpWritesUsageWithoutConfig(t *testing.T) {
 		{"help", "server"},
 	} {
 		t.Run(strings.Join(args, " "), func(t *testing.T) {
-			assertCLIHelpWithoutConfig(t, args, "usage: sai server", "--cwd path", "--port N | --listen host:port")
+			assertCLIHelpWithoutConfig(t, args, "usage: sai server", "--background", "--cwd path", "--port N | --listen host:port")
 		})
 	}
 }
@@ -1166,6 +1166,256 @@ func TestServerCommandStartsWithDefaultConfigAndShutdown(t *testing.T) {
 	}
 	if len(records) != 0 {
 		t.Fatalf("registry records after shutdown = %#v, want empty", records)
+	}
+}
+
+func TestServerCommandBackgroundWaitsForHealthyDiscoverableServer(t *testing.T) {
+	registryPath := isolateCLIUserRegistry(t)
+	projectDir := t.TempDir()
+	writeCLIFixtureInDir(t, filepath.Join(projectDir, ".agents"))
+
+	oldStart := startBackgroundServerProcess
+	childCtx, cancelChild := context.WithCancel(context.Background())
+	childArgsCh := make(chan []string, 1)
+	childDone := make(chan int, 1)
+	childExited := make(chan struct{})
+	var childWaitOnce sync.Once
+	var childCode int
+	var childStdout, childStderr bytes.Buffer
+	startBackgroundServerProcess = func(ctx context.Context, args []string) (*backgroundServerProcess, error) {
+		childArgsCh <- append([]string(nil), args...)
+		go func() {
+			childDone <- RunWithContext(childCtx, args, strings.NewReader(""), &childStdout, &childStderr, func() (string, error) {
+				return filepath.Join(projectDir, "unused"), nil
+			})
+		}()
+		waitChild := func() error {
+			childWaitOnce.Do(func() {
+				childCode = <-childDone
+				close(childExited)
+			})
+			if childCode != 0 {
+				return fmt.Errorf("background child exited with code %d: %s", childCode, childStderr.String())
+			}
+			return nil
+		}
+		return &backgroundServerProcess{
+			PID:  4321,
+			wait: waitChild,
+			kill: func() error {
+				cancelChild()
+				return nil
+			},
+		}, nil
+	}
+	t.Cleanup(func() {
+		startBackgroundServerProcess = oldStart
+		cancelChild()
+	})
+
+	var stdout, stderr bytes.Buffer
+	code := RunWithContext(context.Background(), []string{"server", "--background", "--port", "0"}, strings.NewReader(""), &stdout, &stderr, func() (string, error) {
+		return projectDir, nil
+	})
+	if code != 0 {
+		t.Fatalf("RunWithContext(server --background) code = %d, stderr = %s", code, stderr.String())
+	}
+	if stderr.String() != "" {
+		t.Fatalf("stderr = %q, want empty", stderr.String())
+	}
+
+	childArgs := <-childArgsCh
+	assertCLIStringSliceContains(t, childArgs, "--background-child")
+	assertCLIFlagValue(t, childArgs, "--config", filepath.Join(projectDir, ".agents", "sai.yaml"))
+	assertCLIFlagValue(t, childArgs, "--cwd", projectDir)
+	assertCLIFlagValue(t, childArgs, "--listen", "127.0.0.1:0")
+
+	line := strings.TrimSpace(stdout.String())
+	addr, ok := strings.CutPrefix(line, "SERVER_ADDR\t")
+	if !ok || addr == "" {
+		t.Fatalf("stdout = %q, want SERVER_ADDR line", stdout.String())
+	}
+	if strings.Count(stdout.String(), "SERVER_ADDR\t") != 1 {
+		t.Fatalf("stdout = %q, want exactly one parent SERVER_ADDR line", stdout.String())
+	}
+
+	store := localserver.NewRegistryStore(registryPath)
+	records, err := store.List()
+	if err != nil {
+		t.Fatalf("registry List() error = %v", err)
+	}
+	if len(records) != 1 {
+		t.Fatalf("registry records = %#v, want one background server", records)
+	}
+	record := records[0]
+	if record.Addr != addr {
+		t.Fatalf("registry addr = %q, parent stdout addr = %q", record.Addr, addr)
+	}
+	if record.RequestedListen != "127.0.0.1:0" {
+		t.Fatalf("registry requested_listen = %q, want 127.0.0.1:0", record.RequestedListen)
+	}
+	if err := localserver.CheckHealth(context.Background(), addr, 2*time.Second); err != nil {
+		t.Fatalf("background server health check error = %v", err)
+	}
+
+	postCLIServerShutdown(t, addr)
+	select {
+	case <-childExited:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for background child to exit after shutdown")
+	}
+	if childCode != 0 {
+		t.Fatalf("background child code = %d, stderr = %s", childCode, childStderr.String())
+	}
+}
+
+func TestBackgroundServerProcessOutlivesParentContextAfterStart(t *testing.T) {
+	t.Setenv("SAI_CLI_BACKGROUND_HELPER", "1")
+	dir := t.TempDir()
+	readyPath := filepath.Join(dir, "ready")
+	exitPath := filepath.Join(dir, "exit")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	child, err := startBackgroundServerProcessDefault(ctx, []string{"-test.run=TestCLIBackgroundHelperProcess", "--", "wait-file", readyPath, exitPath})
+	if err != nil {
+		t.Fatalf("startBackgroundServerProcessDefault() error = %v", err)
+	}
+	defer func() {
+		if child.kill != nil {
+			_ = child.kill()
+		}
+	}()
+
+	waitForFile(t, readyPath)
+	waitCh := make(chan error, 1)
+	go func() {
+		waitCh <- child.wait()
+	}()
+
+	cancel()
+	select {
+	case err := <-waitCh:
+		t.Fatalf("background child exited after parent context cancel: %v", err)
+	case <-time.After(150 * time.Millisecond):
+	}
+
+	writeCLIFile(t, exitPath, "done")
+	select {
+	case err := <-waitCh:
+		if err != nil {
+			t.Fatalf("background child wait error after requested exit = %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for background child to exit")
+	}
+}
+
+func TestBackgroundChildFilesDetachStdoutAndStderr(t *testing.T) {
+	files, err := openBackgroundChildFiles()
+	if err != nil {
+		t.Fatalf("openBackgroundChildFiles() error = %v", err)
+	}
+	defer closeBackgroundChildFiles(files)
+
+	if len(files) != 3 {
+		t.Fatalf("openBackgroundChildFiles() returned %d files, want 3", len(files))
+	}
+	for i, file := range files {
+		if got, want := filepath.Clean(file.Name()), filepath.Clean(os.DevNull); got != want {
+			t.Fatalf("stdio file %d = %q, want %q", i, got, want)
+		}
+	}
+}
+
+func TestBackgroundServerProcessDoesNotInheritCallerStdoutStderr(t *testing.T) {
+	t.Setenv("SAI_CLI_BACKGROUND_HELPER", "1")
+	dir := t.TempDir()
+	stdoutPath := filepath.Join(dir, "caller-stdout.txt")
+	stderrPath := filepath.Join(dir, "caller-stderr.txt")
+	stdoutFile, err := os.Create(stdoutPath)
+	if err != nil {
+		t.Fatalf("Create(stdout capture) error = %v", err)
+	}
+	stderrFile, err := os.Create(stderrPath)
+	if err != nil {
+		_ = stdoutFile.Close()
+		t.Fatalf("Create(stderr capture) error = %v", err)
+	}
+	oldStdout := os.Stdout
+	oldStderr := os.Stderr
+	os.Stdout = stdoutFile
+	os.Stderr = stderrFile
+	defer func() {
+		os.Stdout = oldStdout
+		os.Stderr = oldStderr
+		_ = stdoutFile.Close()
+		_ = stderrFile.Close()
+	}()
+
+	child, err := startBackgroundServerProcessDefault(context.Background(), []string{"-test.run=TestCLIBackgroundHelperProcess", "--", "stdio"})
+	if err != nil {
+		t.Fatalf("startBackgroundServerProcessDefault() error = %v", err)
+	}
+	if err := child.wait(); err != nil {
+		t.Fatalf("background helper wait error = %v", err)
+	}
+	if err := stdoutFile.Sync(); err != nil {
+		t.Fatalf("Sync(stdout capture) error = %v", err)
+	}
+	if err := stderrFile.Sync(); err != nil {
+		t.Fatalf("Sync(stderr capture) error = %v", err)
+	}
+
+	stdoutData, err := os.ReadFile(stdoutPath)
+	if err != nil {
+		t.Fatalf("ReadFile(stdout capture) error = %v", err)
+	}
+	stderrData, err := os.ReadFile(stderrPath)
+	if err != nil {
+		t.Fatalf("ReadFile(stderr capture) error = %v", err)
+	}
+	if len(stdoutData) != 0 || len(stderrData) != 0 {
+		t.Fatalf("background child inherited caller stdio: stdout=%q stderr=%q", stdoutData, stderrData)
+	}
+}
+
+func TestCLIBackgroundHelperProcess(t *testing.T) {
+	if os.Getenv("SAI_CLI_BACKGROUND_HELPER") != "1" {
+		return
+	}
+	args := os.Args
+	for len(args) > 0 && args[0] != "--" {
+		args = args[1:]
+	}
+	if len(args) == 0 {
+		os.Exit(2)
+	}
+	args = args[1:]
+	if len(args) == 0 {
+		os.Exit(2)
+	}
+	switch args[0] {
+	case "stdio":
+		fmt.Fprint(os.Stdout, "background helper stdout")
+		fmt.Fprint(os.Stderr, "background helper stderr")
+		os.Exit(0)
+	case "wait-file":
+		if len(args) != 3 {
+			os.Exit(2)
+		}
+		if err := os.WriteFile(args[1], []byte("ready"), 0o600); err != nil {
+			os.Exit(3)
+		}
+		deadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) {
+			if _, err := os.Stat(args[2]); err == nil {
+				os.Exit(0)
+			}
+			time.Sleep(25 * time.Millisecond)
+		}
+		os.Exit(4)
+	default:
+		os.Exit(2)
 	}
 }
 
@@ -10454,6 +10704,44 @@ func waitForCode(t *testing.T, ch <-chan int) int {
 		t.Fatal("timed out waiting for chat to finish")
 	}
 	return -1
+}
+
+func waitForFile(t *testing.T, path string) {
+	t.Helper()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(path); err == nil {
+			return
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for file %s", path)
+}
+
+func assertCLIStringSliceContains(t *testing.T, values []string, want string) {
+	t.Helper()
+
+	for _, value := range values {
+		if value == want {
+			return
+		}
+	}
+	t.Fatalf("values = %#v, want contain %q", values, want)
+}
+
+func assertCLIFlagValue(t *testing.T, args []string, flagName, want string) {
+	t.Helper()
+
+	for i := 0; i < len(args)-1; i++ {
+		if args[i] == flagName {
+			if got := args[i+1]; got != want {
+				t.Fatalf("%s value = %q in %#v, want %q", flagName, got, args, want)
+			}
+			return
+		}
+	}
+	t.Fatalf("args = %#v, want %s %q", args, flagName, want)
 }
 
 func isolateCLIUserRegistry(t *testing.T) string {

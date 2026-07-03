@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"sort"
@@ -367,8 +368,17 @@ printing secrets.
 
 const serverUsageText = `usage: sai server [--cwd path] [--config file] [--port N | --listen host:port]
 
-Starts a foreground loopback HTTP server and blocks until it shuts down. The
-default listener is 127.0.0.1:0, which asks the OS to choose a free port.
+Starts a loopback HTTP server. By default it runs in the foreground and blocks
+until it shuts down. With --background, the parent exits after the child server
+has written its registry record and /health succeeds. The default listener is
+127.0.0.1:0, which asks the OS to choose a free port.
+
+Options:
+  --background       start a detached child server and exit when it is healthy
+  --cwd path         server working directory
+  --config file      root config file, relative to --cwd when not absolute
+  --port N           listen on 127.0.0.1:N; 0 asks the OS for a free port
+  --listen host:port advanced loopback listen address
 `
 
 const statusUsageText = `usage: sai status [--cwd path]
@@ -948,6 +958,8 @@ func doctorCommand(args []string, configPath string, stdout io.Writer, getwd fun
 
 func serverCommand(ctx context.Context, args []string, configPath string, stdout io.Writer, getwd func() (string, error), program string) error {
 	flags := flag.NewFlagSet("sai server", flag.ContinueOnError)
+	background := flags.Bool("background", false, "start in the background")
+	backgroundChild := flags.Bool("background-child", false, "run as a background child")
 	cwdFlag := flags.String("cwd", "", "server working directory")
 	portFlag := flags.Int("port", -1, "loopback port")
 	listenFlag := flags.String("listen", "", "loopback listen address")
@@ -957,6 +969,9 @@ func serverCommand(ctx context.Context, args []string, configPath string, stdout
 	}
 	if len(positionals) != 0 {
 		return usageError("usage: sai server [--cwd path] [--config file] [--port N | --listen host:port]", "", "sai help server")
+	}
+	if *background && *backgroundChild {
+		return usageError("--background cannot be combined with internal --background-child", "", "sai help server")
 	}
 
 	portSet := false
@@ -973,30 +988,63 @@ func serverCommand(ctx context.Context, args []string, configPath string, stdout
 		return err
 	}
 
-	cwd, err := resolveServerCWD(*cwdFlag, getwd)
+	launch, err := prepareServerLaunch(configPath, *cwdFlag, listen, getwd, program)
 	if err != nil {
 		return err
+	}
+
+	if *background {
+		return runServerBackgroundParent(ctx, launch, stdout)
+	}
+
+	return runServerForeground(ctx, launch, stdout)
+}
+
+type serverLaunch struct {
+	CWD             string
+	ConfigPath      string
+	Listen          string
+	Identity        localserver.RegistryIdentity
+	SessionStore    *sessions.V2Store
+	SessionDefaults sessions.SessionV2
+	Program         string
+}
+
+func prepareServerLaunch(configPath, cwdFlag, listen string, getwd func() (string, error), program string) (serverLaunch, error) {
+	cwd, err := resolveServerCWD(cwdFlag, getwd)
+	if err != nil {
+		return serverLaunch{}, err
 	}
 	serverGetwd := func() (string, error) {
 		return cwd, nil
 	}
 	cfg, err := loadConfig(serverConfigPath(configPath, cwd), serverGetwd, program)
 	if err != nil {
-		return err
+		return serverLaunch{}, err
 	}
 	sessionDefaults, err := serverSessionDefaultsFromConfig(cfg, cwd)
 	if err != nil {
-		return err
+		return serverLaunch{}, err
 	}
 	identity, err := localserver.NewRegistryIdentity(cwd, cfg.ConfigPath)
 	if err != nil {
-		return err
+		return serverLaunch{}, err
 	}
-	cwd = identity.CWD
-	configPath = identity.ConfigPath
 
+	return serverLaunch{
+		CWD:             identity.CWD,
+		ConfigPath:      identity.ConfigPath,
+		Listen:          listen,
+		Identity:        identity,
+		SessionStore:    sessions.NewV2Store(cfg.Sessions.Dir),
+		SessionDefaults: sessionDefaults,
+		Program:         program,
+	}, nil
+}
+
+func runServerForeground(ctx context.Context, launch serverLaunch, stdout io.Writer) error {
 	store := localserver.NewRegistryStore("")
-	if done, err := checkExistingServerRecord(ctx, store, identity, listen, stdout); done || err != nil {
+	if done, err := checkExistingServerRecord(ctx, store, launch.Identity, launch.Listen, stdout); done || err != nil {
 		return err
 	}
 
@@ -1005,14 +1053,14 @@ func serverCommand(ctx context.Context, args []string, configPath string, stdout
 		return err
 	}
 	process, err := localserver.Start(localserver.Options{
-		CWD:             cwd,
-		ConfigPath:      configPath,
-		Listen:          listen,
+		CWD:             launch.CWD,
+		ConfigPath:      launch.ConfigPath,
+		Listen:          launch.Listen,
 		Version:         Version,
 		AuthToken:       token,
-		SessionStore:    sessions.NewV2Store(cfg.Sessions.Dir),
-		SessionDefaults: sessionDefaults,
-		TurnRunner:      serverAgentTurnRunner{program: program},
+		SessionStore:    launch.SessionStore,
+		SessionDefaults: launch.SessionDefaults,
+		TurnRunner:      serverAgentTurnRunner{program: launch.Program},
 	})
 	if err != nil {
 		return err
@@ -1026,7 +1074,7 @@ func serverCommand(ctx context.Context, args []string, configPath string, stdout
 		Token:           token,
 		StartedAt:       info.StartedAt,
 		Version:         info.Version,
-		RequestedListen: listen,
+		RequestedListen: launch.Listen,
 	}
 	if err := store.Upsert(record); err != nil {
 		_ = process.Shutdown(context.Background())
@@ -1034,12 +1082,175 @@ func serverCommand(ctx context.Context, args []string, configPath string, stdout
 	}
 	if _, err := fmt.Fprintf(stdout, "SERVER_ADDR\t%s\n", process.Addr()); err != nil {
 		_ = process.Shutdown(context.Background())
-		_, removeErr := store.RemoveIdentity(identity)
+		_, removeErr := store.RemoveIdentity(launch.Identity)
 		return errors.Join(err, removeErr)
 	}
 	serveErr := process.Serve(ctx)
-	_, removeErr := store.RemoveIdentity(identity)
+	_, removeErr := store.RemoveIdentity(launch.Identity)
 	return errors.Join(serveErr, removeErr)
+}
+
+type backgroundServerProcess struct {
+	PID  int
+	wait func() error
+	kill func() error
+}
+
+var startBackgroundServerProcess = startBackgroundServerProcessDefault
+
+func runServerBackgroundParent(ctx context.Context, launch serverLaunch, stdout io.Writer) error {
+	store := localserver.NewRegistryStore("")
+	if done, err := checkExistingServerRecord(ctx, store, launch.Identity, launch.Listen, stdout); done || err != nil {
+		return err
+	}
+
+	childArgs := backgroundServerChildArgs(launch)
+	child, err := startBackgroundServerProcess(ctx, childArgs)
+	if err != nil {
+		return err
+	}
+
+	ready := false
+	defer func() {
+		if !ready && child.kill != nil {
+			_ = child.kill()
+		}
+	}()
+
+	record, err := waitForBackgroundServerReady(ctx, store, launch.Identity, launch.Listen, child)
+	if err != nil {
+		return err
+	}
+	ready = true
+	_, err = fmt.Fprintf(stdout, "SERVER_ADDR\t%s\n", record.Addr)
+	return err
+}
+
+func backgroundServerChildArgs(launch serverLaunch) []string {
+	return []string{
+		"--config", launch.ConfigPath,
+		"server",
+		"--background-child",
+		"--cwd", launch.CWD,
+		"--listen", launch.Listen,
+	}
+}
+
+func startBackgroundServerProcessDefault(ctx context.Context, args []string) (*backgroundServerProcess, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	executable, err := os.Executable()
+	if err != nil {
+		return nil, fmt.Errorf("resolve current executable: %w", err)
+	}
+	files, err := openBackgroundChildFiles()
+	if err != nil {
+		return nil, err
+	}
+	defer closeBackgroundChildFiles(files)
+
+	cmd := exec.Command(executable, args...)
+	cmd.Stdin = files[0]
+	cmd.Stdout = files[1]
+	cmd.Stderr = files[2]
+	if err := cmd.Start(); err != nil {
+		return nil, fmt.Errorf("start background server child: %w", err)
+	}
+	return &backgroundServerProcess{
+		PID:  cmd.Process.Pid,
+		wait: func() error { return cmd.Wait() },
+		kill: func() error { return cmd.Process.Kill() },
+	}, nil
+}
+
+func openBackgroundChildFiles() ([]*os.File, error) {
+	files := make([]*os.File, 0, 3)
+	for i := 0; i < 3; i++ {
+		file, err := os.OpenFile(os.DevNull, os.O_RDWR, 0)
+		if err != nil {
+			closeBackgroundChildFiles(files)
+			return nil, fmt.Errorf("open %s for background server stdio: %w", os.DevNull, err)
+		}
+		files = append(files, file)
+	}
+	return files, nil
+}
+
+func closeBackgroundChildFiles(files []*os.File) {
+	for _, file := range files {
+		if file != nil {
+			_ = file.Close()
+		}
+	}
+}
+
+func waitForBackgroundServerReady(ctx context.Context, store localserver.RegistryStore, identity localserver.RegistryIdentity, listen string, child *backgroundServerProcess) (localserver.RegistryRecord, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	waitCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	var childDone <-chan error
+	if child != nil && child.wait != nil {
+		ch := make(chan error, 1)
+		go func() {
+			ch <- child.wait()
+		}()
+		childDone = ch
+	}
+
+	ticker := time.NewTicker(25 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		record, ok, err := findBackgroundReadyRecord(waitCtx, store, identity, listen)
+		if err != nil {
+			return localserver.RegistryRecord{}, err
+		}
+		if ok {
+			return record, nil
+		}
+
+		select {
+		case err := <-childDone:
+			if err != nil {
+				return localserver.RegistryRecord{}, fmt.Errorf("background server child exited before becoming healthy: %w", err)
+			}
+			return localserver.RegistryRecord{}, fmt.Errorf("background server child exited before becoming healthy")
+		case <-waitCtx.Done():
+			return localserver.RegistryRecord{}, fmt.Errorf("wait for background server readiness: %w", waitCtx.Err())
+		case <-ticker.C:
+		}
+	}
+}
+
+func findBackgroundReadyRecord(ctx context.Context, store localserver.RegistryStore, identity localserver.RegistryIdentity, listen string) (localserver.RegistryRecord, bool, error) {
+	records, err := store.Load()
+	if err != nil {
+		return localserver.RegistryRecord{}, false, err
+	}
+	for _, record := range records {
+		normalized, err := localserver.CanonicalizeRegistryRecord(record)
+		if err != nil {
+			return localserver.RegistryRecord{}, false, err
+		}
+		if !identity.Matches(normalized) || normalized.RequestedListen != listen {
+			continue
+		}
+		if err := localserver.CheckHealth(ctx, normalized.Addr, 300*time.Millisecond); err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return localserver.RegistryRecord{}, false, ctxErr
+			}
+			continue
+		}
+		return normalized, true, nil
+	}
+	return localserver.RegistryRecord{}, false, nil
 }
 
 func checkExistingServerRecord(ctx context.Context, store localserver.RegistryStore, identity localserver.RegistryIdentity, listen string, stdout io.Writer) (bool, error) {

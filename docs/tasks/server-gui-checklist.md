@@ -26,7 +26,7 @@ future work and should not be required by any slice here.
 - [x] Foreground lifecycle: handle Ctrl+C by stopping listeners, flushing required
   metadata, removing registry entries, and exiting 0 when no running turn blocks
   shutdown.
-- [ ] Background lifecycle: implement `sai server --background` so the parent waits
+- [x] Background lifecycle: implement `sai server --background` so the parent waits
   for listen, registry write, and `/health` success before exiting 0, while the
   child detaches stdout/stderr from the caller terminal.
 - [ ] Listen configuration: support default `127.0.0.1:0`, `--port N`,
