@@ -13,11 +13,12 @@ import (
 const skillFileName = "SKILL.md"
 
 type Skill struct {
-	ID           string
-	Name         string
-	Description  string
-	Path         string
-	Instructions string
+	ID                     string
+	Name                   string
+	Description            string
+	Path                   string
+	Instructions           string
+	DisableModelInvocation bool
 }
 
 type SkillRef struct {
@@ -26,12 +27,30 @@ type SkillRef struct {
 }
 
 type skillFrontmatter struct {
-	Name        string `yaml:"name"`
-	Description string `yaml:"description"`
+	Name                   string `yaml:"name"`
+	Description            string `yaml:"description"`
+	DisableModelInvocation bool   `yaml:"disable-model-invocation"`
 }
 
 func Discover(dir string) ([]Skill, error) {
 	refs, err := DiscoverRefs(dir)
+	if err != nil {
+		return nil, err
+	}
+
+	found := make([]Skill, 0, len(refs))
+	for _, ref := range refs {
+		skill, err := Load(ref.Path)
+		if err != nil {
+			return nil, err
+		}
+		found = append(found, skill)
+	}
+	return found, nil
+}
+
+func DiscoverDirs(dirs []string) ([]Skill, error) {
+	refs, err := DiscoverRefsDirs(dirs)
 	if err != nil {
 		return nil, err
 	}
@@ -57,7 +76,7 @@ func DiscoverRefs(dir string) ([]SkillRef, error) {
 		if os.IsNotExist(err) {
 			return []SkillRef{}, nil
 		}
-		return nil, fmt.Errorf("read skill_dir %q: %w", dir, err)
+		return nil, fmt.Errorf("read skill directory %q: %w", dir, err)
 	}
 
 	found := make([]SkillRef, 0, len(entries))
@@ -87,6 +106,25 @@ func DiscoverRefs(dir string) ([]SkillRef, error) {
 	sort.Slice(found, func(i, j int) bool {
 		return found[i].ID < found[j].ID
 	})
+	return found, nil
+}
+
+func DiscoverRefsDirs(dirs []string) ([]SkillRef, error) {
+	found := []SkillRef{}
+	seen := map[string]SkillRef{}
+	for _, dir := range dirs {
+		refs, err := DiscoverRefs(dir)
+		if err != nil {
+			return nil, err
+		}
+		for _, ref := range refs {
+			if previous, ok := seen[ref.ID]; ok {
+				return nil, fmt.Errorf("duplicate skill id %q in %q (already discovered in %q)", ref.ID, ref.Path, previous.Path)
+			}
+			seen[ref.ID] = ref
+			found = append(found, ref)
+		}
+	}
 	return found, nil
 }
 
@@ -137,6 +175,7 @@ func parseSkill(id, path, text string) (Skill, error) {
 		skill.Name = name
 	}
 	skill.Description = strings.TrimSpace(meta.Description)
+	skill.DisableModelInvocation = meta.DisableModelInvocation
 	skill.Instructions = body
 	return skill, nil
 }

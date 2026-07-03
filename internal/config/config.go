@@ -19,10 +19,9 @@ type Config struct {
 	DefaultModel    string                     `json:"default_model" yaml:"default_model"`
 	ProviderDir     string                     `json:"provider_dir" yaml:"provider_dir"`
 	AuthDir         string                     `json:"auth_dir" yaml:"auth_dir"`
-	SkillDir        string                     `json:"skill_dir" yaml:"skill_dir"`
+	SkillDirs       []string                   `json:"skill_dirs" yaml:"skill_dirs"`
 	Agent           AgentConfig                `json:"agent" yaml:"agent"`
 	Tools           ToolsConfig                `json:"tools" yaml:"tools"`
-	Skills          SkillsConfig               `json:"skills" yaml:"skills"`
 	Logging         LoggingConfig              `json:"logging" yaml:"logging"`
 	Sessions        SessionsConfig             `json:"sessions" yaml:"sessions"`
 	MCPDir          string                     `json:"mcp_dir,omitempty" yaml:"mcp_dir,omitempty"`
@@ -44,10 +43,6 @@ type AgentConfig struct {
 }
 
 type ToolsConfig struct {
-	Enabled []string `json:"enabled" yaml:"enabled"`
-}
-
-type SkillsConfig struct {
 	Enabled []string `json:"enabled" yaml:"enabled"`
 }
 
@@ -163,7 +158,7 @@ func LoadBase(configDir string) (*Config, error) {
 	cfg.ConfigDir = absConfigDir
 	cfg.ProviderDir = resolvePath(absConfigDir, cfg.ProviderDir)
 	cfg.AuthDir = resolvePath(absConfigDir, cfg.AuthDir)
-	cfg.SkillDir = resolvePath(absConfigDir, cfg.SkillDir)
+	cfg.SkillDirs = resolvePaths(absConfigDir, cfg.SkillDirs)
 	if cfg.Logging.Path != "" {
 		cfg.Logging.Path = resolvePath(absConfigDir, cfg.Logging.Path)
 	}
@@ -403,15 +398,12 @@ func defaultConfig() Config {
 	return Config{
 		ProviderDir: "providers",
 		AuthDir:     "auth",
-		SkillDir:    "skills",
+		SkillDirs:   []string{"skills"},
 		Agent: AgentConfig{
 			MaxTurns: defaultAgentMaxTurns,
 			Stream:   true,
 		},
 		Tools: ToolsConfig{
-			Enabled: []string{},
-		},
-		Skills: SkillsConfig{
 			Enabled: []string{},
 		},
 		Logging: LoggingConfig{
@@ -537,6 +529,17 @@ func resolvePath(baseDir, path string) string {
 		return filepath.Clean(path)
 	}
 	return filepath.Clean(filepath.Join(baseDir, path))
+}
+
+func resolvePaths(baseDir string, paths []string) []string {
+	if paths == nil {
+		return nil
+	}
+	resolved := make([]string, 0, len(paths))
+	for _, path := range paths {
+		resolved = append(resolved, resolvePath(baseDir, path))
+	}
+	return resolved
 }
 
 func resolveAPIKey(value string) (string, error) {

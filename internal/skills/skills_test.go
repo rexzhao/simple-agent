@@ -75,6 +75,50 @@ func TestDiscoverRefsDoesNotParseSkillFiles(t *testing.T) {
 	}
 }
 
+func TestDiscoverDirsPreservesDirectoryOrder(t *testing.T) {
+	root := t.TempDir()
+	first := filepath.Join(root, "first")
+	second := filepath.Join(root, "second")
+	writeSkill(t, filepath.Join(first, "zeta"), "Zeta instructions")
+	writeSkill(t, filepath.Join(first, "alpha"), "Alpha instructions")
+	writeSkill(t, filepath.Join(second, "beta"), "Beta instructions")
+	writeSkill(t, filepath.Join(second, "aardvark"), "Aardvark instructions")
+
+	got, err := DiscoverDirs([]string{first, second})
+	if err != nil {
+		t.Fatalf("DiscoverDirs() error = %v", err)
+	}
+
+	wantIDs := []string{"alpha", "zeta", "aardvark", "beta"}
+	if len(got) != len(wantIDs) {
+		t.Fatalf("len(DiscoverDirs()) = %d, want %d: %#v", len(got), len(wantIDs), got)
+	}
+	for i, want := range wantIDs {
+		if got[i].ID != want {
+			t.Fatalf("DiscoverDirs()[%d].ID = %q, want %q", i, got[i].ID, want)
+		}
+	}
+}
+
+func TestDiscoverDirsRejectsDuplicateIDs(t *testing.T) {
+	root := t.TempDir()
+	first := filepath.Join(root, "first")
+	second := filepath.Join(root, "second")
+	writeSkill(t, filepath.Join(first, "shared"), "First instructions")
+	writeSkill(t, filepath.Join(second, "shared"), "Second instructions")
+
+	_, err := DiscoverDirs([]string{first, second})
+	if err == nil {
+		t.Fatal("DiscoverDirs() error = nil, want duplicate id error")
+	}
+	got := err.Error()
+	for _, want := range []string{`duplicate skill id "shared"`, "first", "second"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("DiscoverDirs() error = %q, want contain %q", got, want)
+		}
+	}
+}
+
 func TestLoadReadsFrontmatter(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "sample")
 	writeSkill(t, dir, `---
@@ -99,11 +143,39 @@ body line two
 	if got.Description != "short text" {
 		t.Fatalf("Description = %q, want short text", got.Description)
 	}
+	if got.DisableModelInvocation {
+		t.Fatal("DisableModelInvocation = true, want false")
+	}
 	if want := "body line one\nbody line two\n"; got.Instructions != want {
 		t.Fatalf("Instructions = %q, want %q", got.Instructions, want)
 	}
 	if want := filepath.Join(dir, skillFileName); got.Path != want {
 		t.Fatalf("Path = %q, want %q", got.Path, want)
+	}
+}
+
+func TestLoadReadsDisableModelInvocationFrontmatter(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "sample")
+	writeSkill(t, dir, `---
+name: hidden-skill
+disable-model-invocation: true
+---
+hidden body
+`)
+
+	got, err := Load(dir)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+
+	if !got.DisableModelInvocation {
+		t.Fatal("DisableModelInvocation = false, want true")
+	}
+	if got.Name != "hidden-skill" {
+		t.Fatalf("Name = %q, want hidden-skill", got.Name)
+	}
+	if got.Instructions != "hidden body\n" {
+		t.Fatalf("Instructions = %q, want hidden body", got.Instructions)
 	}
 }
 

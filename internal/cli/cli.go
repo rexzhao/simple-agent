@@ -191,7 +191,7 @@ With no command, sai defaults to chat.
 Run "sai help <command>" for command usage.
 `
 
-const chatUsageText = `usage: sai chat [--provider name] [--model profile] [--prompt text | --stdin | --file path] [--show-reasoning] [--verbose] [--enable-tools names] [--enable-skills ids] [--disable-skills] [--enable-mcp ids] [--save-session] [--resume id | --continue] [--quit]
+const chatUsageText = `usage: sai chat [--provider name] [--model profile] [--prompt text | --stdin | --file path] [--show-reasoning] [--verbose] [--enable-tools names] [--enable-mcp ids] [--save-session] [--resume id | --continue] [--quit]
 
 Starts a line-oriented chat session using the configured provider and model. When
 --prompt is provided, sai runs that turn first; --quit exits after that turn
@@ -511,7 +511,6 @@ func splitRootArgs(args []string) (rootArgs, error) {
 		"prompt":         flagKindValue,
 		"file":           flagKindValue,
 		"enable-tools":   flagKindValue,
-		"enable-skills":  flagKindValue,
 		"enable-mcp":     flagKindValue,
 		"resume":         flagKindValue,
 		"keep":           flagKindValue,
@@ -520,7 +519,6 @@ func splitRootArgs(args []string) (rootArgs, error) {
 		"show-reasoning": flagKindBool,
 		"verbose":        flagKindBool,
 		"stdin":          flagKindBool,
-		"disable-skills": flagKindBool,
 		"save-session":   flagKindBool,
 		"continue":       flagKindBool,
 		"quit":           flagKindBool,
@@ -1032,44 +1030,41 @@ func checkDoctorMCP(cfg *config.Config, add func(doctorStatus, string, string)) 
 }
 
 func checkDoctorSkills(cfg *config.Config, add func(doctorStatus, string, string)) {
-	if strings.TrimSpace(cfg.SkillDir) == "" {
-		if len(cfg.Skills.Enabled) == 0 {
-			add(doctorStatusWarn, "skill_dir", "disabled; no skills enabled")
-		} else {
-			add(doctorStatusError, "skill_dir", "disabled but skills.enabled is not empty")
-		}
+	if len(cfg.SkillDirs) == 0 {
+		add(doctorStatusOK, "skill_dirs", "disabled")
+		add(doctorStatusOK, "loaded_skills", "(none)")
 		return
 	}
 
-	skillDirExists := true
-	if err := checkExistingDirectory(cfg.SkillDir); err != nil {
-		if errors.Is(err, os.ErrNotExist) && len(cfg.Skills.Enabled) == 0 {
-			skillDirExists = false
-			add(doctorStatusWarn, "skill_dir", fmt.Sprintf("%s not found; no skills enabled", cfg.SkillDir))
+	existingDirs := make([]string, 0, len(cfg.SkillDirs))
+	for _, dir := range cfg.SkillDirs {
+		if strings.TrimSpace(dir) == "" {
+			add(doctorStatusError, "skill_dirs", "empty path")
+			continue
+		}
+		if err := checkExistingDirectory(dir); err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				add(doctorStatusWarn, "skill_dirs", fmt.Sprintf("%s not found; no skills loaded from this directory", dir))
+			} else {
+				add(doctorStatusError, "skill_dirs", fmt.Sprintf("%s: %v", dir, err))
+			}
 		} else {
-			add(doctorStatusError, "skill_dir", fmt.Sprintf("%s: %v", cfg.SkillDir, err))
+			existingDirs = append(existingDirs, dir)
 		}
 	}
 
-	if skillDirExists {
-		refs, err := localskills.DiscoverRefs(cfg.SkillDir)
-		if err != nil {
-			add(doctorStatusError, "skill_dir", err.Error())
-		} else {
-			add(doctorStatusOK, "skill_dir", fmt.Sprintf("%d available in %s", len(refs), cfg.SkillDir))
-		}
-	}
-
-	if len(cfg.Skills.Enabled) == 0 {
-		add(doctorStatusOK, "enabled_skills", "(none)")
-		return
-	}
-	selected, err := enabledSkillsForRun(cfg, nil, false, false)
+	discovered, err := localskills.DiscoverDirs(existingDirs)
 	if err != nil {
-		add(doctorStatusError, "enabled_skills", err.Error())
+		add(doctorStatusError, "skill_dirs", err.Error())
 		return
 	}
-	add(doctorStatusOK, "enabled_skills", strings.Join(skillIDs(selected), ","))
+	loaded := modelInvokedSkills(discovered)
+	add(doctorStatusOK, "skill_dirs", fmt.Sprintf("%d configured, %d discovered, %d loaded", len(cfg.SkillDirs), len(discovered), len(loaded)))
+	if len(loaded) == 0 {
+		add(doctorStatusOK, "loaded_skills", "(none)")
+		return
+	}
+	add(doctorStatusOK, "loaded_skills", strings.Join(skillIDs(loaded), ","))
 }
 
 func checkDoctorTools(cfg *config.Config, selectedMCPServers []config.MCPServerConfig, getwd func() (string, error), add func(doctorStatus, string, string)) {
@@ -1509,8 +1504,6 @@ type agentCommandFlags struct {
 	showReasoningSet bool
 	verbose          bool
 	enabledTools     toolNamesFlag
-	enabledSkills    skillIDsFlag
-	disableSkills    bool
 	enabledMCP       mcpServerIDsFlag
 	saveSession      bool
 	saveSessionSet   bool
@@ -1527,8 +1520,6 @@ func registerAgentCommandFlags(flags *flag.FlagSet, options *agentCommandFlags) 
 	flags.BoolVar(&options.showReasoning, "show-reasoning", false, "show reasoning output")
 	flags.BoolVar(&options.verbose, "verbose", false, "write non-sensitive diagnostics to stderr")
 	flags.Var(&options.enabledTools, "enable-tools", "comma-separated tool names to expose")
-	flags.Var(&options.enabledSkills, "enable-skills", "comma-separated skill ids to enable")
-	flags.BoolVar(&options.disableSkills, "disable-skills", false, "disable all skills for this run")
 	flags.Var(&options.enabledMCP, "enable-mcp", "comma-separated MCP server ids to enable")
 	flags.BoolVar(&options.saveSession, "save-session", false, "save a resumable session with full sensitive content")
 	flags.StringVar(&options.resumeID, "resume", "", "resume a saved session id")
@@ -1536,9 +1527,6 @@ func registerAgentCommandFlags(flags *flag.FlagSet, options *agentCommandFlags) 
 }
 
 func (options agentCommandFlags) validate(helpCommand string) error {
-	if options.enabledSkills.set && options.disableSkills {
-		return usageError("cannot use --enable-skills with --disable-skills", "", helpCommand)
-	}
 	if options.resumeID != "" && options.continueSession {
 		return usageError("cannot use --resume with --continue", "", helpCommand)
 	}
@@ -2048,7 +2036,7 @@ func prepareAgentRuntime(ctx context.Context, configDir string, options agentCom
 		baseMessages = copyMessageSlice(resumedSession.InstructionsSnapshot)
 		enabledSkillIDs = copyStringSlice(resumedSession.EnabledSkills)
 	} else {
-		selectedSkills, err := enabledSkillsForRun(cfg, options.enabledSkills.ids, options.enabledSkills.set, options.disableSkills)
+		selectedSkills, err := enabledSkillsForRun(cfg)
 		if err != nil {
 			return nil, err
 		}
@@ -2135,12 +2123,6 @@ func validateResumeCLIConflicts(session sessions.Session, options agentCommandFl
 	if options.enabledMCP.set && !sameStringSlice(options.enabledMCP.ids, session.EnabledMCP) {
 		return fmt.Errorf("cannot resume session %q with --enable-mcp %q; session uses %q", session.ID, strings.Join(options.enabledMCP.ids, ","), strings.Join(session.EnabledMCP, ","))
 	}
-	if options.enabledSkills.set && !sameStringSlice(options.enabledSkills.ids, session.EnabledSkills) {
-		return fmt.Errorf("cannot resume session %q with --enable-skills %q; session uses %q", session.ID, strings.Join(options.enabledSkills.ids, ","), strings.Join(session.EnabledSkills, ","))
-	}
-	if options.disableSkills && len(session.EnabledSkills) != 0 {
-		return fmt.Errorf("cannot resume session %q with --disable-skills; session uses enabled skills %q", session.ID, strings.Join(session.EnabledSkills, ","))
-	}
 	if options.showReasoningSet && options.showReasoning != session.ShowReasoning {
 		return fmt.Errorf("cannot resume session %q with --show-reasoning=%t; session was saved with show_reasoning %t", session.ID, options.showReasoning, session.ShowReasoning)
 	}
@@ -2155,8 +2137,6 @@ func applyResumeOptions(options *agentCommandFlags, session sessions.Session) {
 	options.modelProfile = session.ModelProfile
 	options.enabledTools = toolNamesFlag{set: true, names: copyStringSlice(session.EnabledTools)}
 	options.enabledMCP = mcpServerIDsFlag{set: true, ids: copyStringSlice(session.EnabledMCP)}
-	options.enabledSkills = skillIDsFlag{set: true, ids: copyStringSlice(session.EnabledSkills)}
-	options.disableSkills = false
 	options.showReasoning = session.ShowReasoning
 }
 
@@ -2299,25 +2279,6 @@ func (f *mcpServerIDsFlag) String() string {
 	return strings.Join(f.ids, ",")
 }
 
-type skillIDsFlag struct {
-	set bool
-	ids []string
-}
-
-func (f *skillIDsFlag) Set(value string) error {
-	ids, err := parseCommaSeparatedNames(value, "skill id", "--enable-skills")
-	if err != nil {
-		return err
-	}
-	f.set = true
-	f.ids = ids
-	return nil
-}
-
-func (f *skillIDsFlag) String() string {
-	return strings.Join(f.ids, ",")
-}
-
 func writeVerboseDiagnostics(stderr io.Writer, cfg *config.Config, resolved config.ResolvedModel, enabledTools []string, showReasoning bool, logPath string) error {
 	_, err := fmt.Fprintf(stderr, "config_dir: %s\nprovider: %s\nmodel_profile: %s\nmodel_id: %s\nlog_path: %s\nmax_turns: %d\nenabled_tools: %s\nshow_reasoning: %t\n",
 		cfg.ConfigDir,
@@ -2451,57 +2412,25 @@ func mcpToolsForRun(ctx context.Context, servers []config.MCPServerConfig, enabl
 	return sessions, sessionsByID, schemas, nil
 }
 
-func enabledSkillsForRun(cfg *config.Config, overrideIDs []string, useOverride bool, disabled bool) ([]localskills.Skill, error) {
-	if disabled {
-		return nil, nil
-	}
-
-	enabledIDs := cfg.Skills.Enabled
-	if useOverride {
-		enabledIDs = overrideIDs
-	}
-	if len(enabledIDs) == 0 {
-		return nil, nil
-	}
-
-	available, err := localskills.DiscoverRefs(cfg.SkillDir)
+func enabledSkillsForRun(cfg *config.Config) ([]localskills.Skill, error) {
+	discovered, err := localskills.DiscoverDirs(cfg.SkillDirs)
 	if err != nil {
-		return nil, fmt.Errorf("list skills: %w", err)
+		return nil, fmt.Errorf("load skills: %w", err)
 	}
-	byID := make(map[string]localskills.SkillRef, len(available))
-	for _, ref := range available {
-		byID[ref.ID] = ref
-	}
-
-	selected := make([]localskills.Skill, 0, len(enabledIDs))
-	for _, id := range enabledIDs {
-		id = strings.TrimSpace(id)
-		if id == "" {
-			return nil, fmt.Errorf("empty skill id in enabled skills")
-		}
-		ref, ok := byID[id]
-		if !ok {
-			return nil, fmt.Errorf("unknown skill %q; available skills: %s", id, formatSkillChoices(available))
-		}
-		skill, err := localskills.Load(ref.Path)
-		if err != nil {
-			return nil, fmt.Errorf("load skills: %w", err)
-		}
-		selected = append(selected, skill)
-	}
-	return selected, nil
+	return modelInvokedSkills(discovered), nil
 }
 
-func formatSkillChoices(refs []localskills.SkillRef) string {
-	if len(refs) == 0 {
-		return "(none)"
+func modelInvokedSkills(discovered []localskills.Skill) []localskills.Skill {
+	if len(discovered) == 0 {
+		return nil
 	}
-
-	ids := make([]string, 0, len(refs))
-	for _, ref := range refs {
-		ids = append(ids, ref.ID)
+	loaded := make([]localskills.Skill, 0, len(discovered))
+	for _, skill := range discovered {
+		if !skill.DisableModelInvocation {
+			loaded = append(loaded, skill)
+		}
 	}
-	return strings.Join(ids, ", ")
+	return loaded
 }
 
 func closeMCPSessions(sessions []*mcp.Session) error {
