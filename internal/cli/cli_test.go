@@ -4550,6 +4550,303 @@ agent:
 	assertNoAdditionalCLIRunRequest(t, requests)
 }
 
+func TestRunChildSelfReferentialSubagentConfigDoesNotExposeNestedSubagentRuntime(t *testing.T) {
+	childRequests := make(chan capturedCLIRunRequest, 1)
+	childServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("ReadAll(child) error = %v", err)
+		}
+		childRequests <- capturedCLIRunRequest{
+			Path:          r.URL.Path,
+			Authorization: r.Header.Get("Authorization"),
+			ContentType:   r.Header.Get("Content-Type"),
+			RawBody:       body,
+			Body:          decodeCLIJSON(t, body),
+		}
+		writeCLISSEChunks(w,
+			cliTextChunk(t, "child done"),
+			`[DONE]`,
+		)
+	}))
+	defer childServer.Close()
+
+	parentRequests := make(chan capturedCLIRunRequest, 3)
+	var parentMu sync.Mutex
+	parentRequestCount := 0
+	parentServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("ReadAll(parent) error = %v", err)
+		}
+		parentRequests <- capturedCLIRunRequest{
+			Path:          r.URL.Path,
+			Authorization: r.Header.Get("Authorization"),
+			ContentType:   r.Header.Get("Content-Type"),
+			RawBody:       body,
+			Body:          decodeCLIJSON(t, body),
+		}
+
+		parentMu.Lock()
+		index := parentRequestCount
+		parentRequestCount++
+		parentMu.Unlock()
+
+		switch index {
+		case 0:
+			writeCLISSEChunks(w,
+				cliToolCallChunk(t, "call_start", subagents.ToolSubagentStart, `{"agent_id":"reviewer","prompt":"child task"}`),
+				`{"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`,
+				`[DONE]`,
+			)
+		case 1:
+			writeCLISSEChunks(w,
+				cliTextChunk(t, "parent saw start"),
+				`[DONE]`,
+			)
+		case 2:
+			writeCLISSEChunks(w,
+				cliTextChunk(t, "parent handled completion"),
+				`[DONE]`,
+			)
+		default:
+			http.Error(w, "unexpected parent request", http.StatusInternalServerError)
+		}
+	}))
+	defer parentServer.Close()
+
+	configDir := t.TempDir()
+	writeCLIRunFixtureInDir(t, configDir, parentServer.URL+"/v1", "parent-secret-value", "openai-chat")
+	appendCLIConfig(t, configDir, `
+subagents:
+  reviewer: subagents/reviewer.yaml
+`)
+	subagentDir := filepath.Join(configDir, "subagents")
+	childProvidersDir := filepath.Join(configDir, "child-providers")
+	if err := os.MkdirAll(subagentDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll(subagents) error = %v", err)
+	}
+	if err := os.MkdirAll(childProvidersDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll(child providers) error = %v", err)
+	}
+	writeCLIFile(t, filepath.Join(subagentDir, "reviewer.yaml"), `default_provider: fake
+default_model: default
+provider_dir: ../child-providers
+skill_dirs: []
+
+agent:
+  description: Reviews scoped changes.
+  max_turns: 4
+
+tools:
+  enabled:
+    - list_files
+
+subagents:
+  reviewer: reviewer.yaml
+
+logging:
+  path: ../child-logs/sai.jsonl
+`)
+	writeCLIFile(t, filepath.Join(childProvidersDir, "fake.yaml"), fmt.Sprintf(`name: fake
+base_url: %s
+api_key: child-secret-value
+
+models:
+  default:
+    id: child-model
+    max_tokens: 64
+`, childServer.URL+"/v1"))
+
+	var stdout, stderr bytes.Buffer
+	code := RunWithGetwd([]string{"--config", cliConfigPath(configDir), "chat", "--quit", "--prompt", "delegate"}, &stdout, &stderr, func() (string, error) {
+		return t.TempDir(), nil
+	})
+
+	if code != 0 {
+		t.Fatalf("RunWithGetwd() code = %d, stderr = %s", code, stderr.String())
+	}
+
+	firstParent := receiveCLIRunRequest(t, parentRequests)
+	assertCLIToolNames(t, firstParent.Body, []string{
+		subagents.ToolSubagentStart,
+		subagents.ToolSubagentSend,
+		subagents.ToolSubagentStatus,
+		subagents.ToolSubagentWait,
+		subagents.ToolSubagentCancel,
+	})
+
+	child := receiveCLIRunRequest(t, childRequests)
+	assertCLIToolNames(t, child.Body, []string{"list_files"})
+	for i, raw := range requestMessages(t, child.Body) {
+		message, ok := raw.(map[string]any)
+		if !ok {
+			t.Fatalf("child message[%d] = %T, want object", i, raw)
+		}
+		content, _ := message["content"].(string)
+		if strings.Contains(content, "Configured subagents:") {
+			t.Fatalf("child message[%d] includes nested subagent prompt: %q", i, content)
+		}
+	}
+	assertNoAdditionalCLIRunRequest(t, childRequests)
+}
+
+func TestRunChildUsesChildSkillsAndMCPWithoutInheritingParentCapabilities(t *testing.T) {
+	childRequests := make(chan capturedCLIRunRequest, 1)
+	childServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("ReadAll(child) error = %v", err)
+		}
+		childRequests <- capturedCLIRunRequest{
+			Path:          r.URL.Path,
+			Authorization: r.Header.Get("Authorization"),
+			ContentType:   r.Header.Get("Content-Type"),
+			RawBody:       body,
+			Body:          decodeCLIJSON(t, body),
+		}
+		writeCLISSEChunks(w,
+			cliTextChunk(t, "child done"),
+			`[DONE]`,
+		)
+	}))
+	defer childServer.Close()
+
+	parentRequests := make(chan capturedCLIRunRequest, 3)
+	var parentMu sync.Mutex
+	parentRequestCount := 0
+	parentServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("ReadAll(parent) error = %v", err)
+		}
+		parentRequests <- capturedCLIRunRequest{
+			Path:          r.URL.Path,
+			Authorization: r.Header.Get("Authorization"),
+			ContentType:   r.Header.Get("Content-Type"),
+			RawBody:       body,
+			Body:          decodeCLIJSON(t, body),
+		}
+
+		parentMu.Lock()
+		index := parentRequestCount
+		parentRequestCount++
+		parentMu.Unlock()
+
+		switch index {
+		case 0:
+			writeCLISSEChunks(w,
+				cliToolCallChunk(t, "call_start", subagents.ToolSubagentStart, `{"agent_id":"reviewer","prompt":"child task"}`),
+				`{"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`,
+				`[DONE]`,
+			)
+		case 1:
+			writeCLISSEChunks(w,
+				cliTextChunk(t, "parent saw start"),
+				`[DONE]`,
+			)
+		case 2:
+			writeCLISSEChunks(w,
+				cliTextChunk(t, "parent handled completion"),
+				`[DONE]`,
+			)
+		default:
+			http.Error(w, "unexpected parent request", http.StatusInternalServerError)
+		}
+	}))
+	defer parentServer.Close()
+
+	configDir := t.TempDir()
+	parentMCPExitFile := filepath.Join(t.TempDir(), "parent-mcp-exited")
+	childMCPExitFile := filepath.Join(t.TempDir(), "child-mcp-exited")
+	writeCLIRunFixtureInDirWithTools(t, configDir, parentServer.URL+"/v1", "parent-secret-value", "openai-chat", []string{"mcp.remote.search"})
+	setCLISkillDirs(t, configDir, []string{"skills"})
+	writeCLISkill(t, configDir, "parent-only", "---\nname: Parent Skill\n---\nParent skill instructions.\n")
+	appendCLIConfig(t, configDir, `
+mcp_dir: parent-mcp
+subagents:
+  reviewer: subagents/reviewer.yaml
+`)
+	writeCLIRunMCPServerFixture(t, filepath.Join(configDir, "parent-mcp"), "remote", parentMCPExitFile, true)
+
+	subagentDir := filepath.Join(configDir, "subagents")
+	childProvidersDir := filepath.Join(configDir, "child-providers")
+	if err := os.MkdirAll(subagentDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll(subagents) error = %v", err)
+	}
+	if err := os.MkdirAll(childProvidersDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll(child providers) error = %v", err)
+	}
+	writeCLIFile(t, filepath.Join(subagentDir, "reviewer.yaml"), `default_provider: fake
+default_model: default
+provider_dir: ../child-providers
+skill_dirs:
+  - ../child-skills
+mcp_dir: ../child-mcp
+
+agent:
+  description: Reviews scoped changes.
+  max_turns: 4
+
+tools:
+  enabled:
+    - mcp.local.search
+
+logging:
+  path: ../child-logs/sai.jsonl
+`)
+	writeCLIFile(t, filepath.Join(childProvidersDir, "fake.yaml"), fmt.Sprintf(`name: fake
+base_url: %s
+api_key: child-secret-value
+
+models:
+  default:
+    id: child-model
+    max_tokens: 64
+`, childServer.URL+"/v1"))
+	writeCLISkillInRoot(t, filepath.Join(configDir, "child-skills"), "child-only", "---\nname: Child Skill\n---\nChild skill instructions.\n")
+	writeCLIRunMCPServerFixture(t, filepath.Join(configDir, "child-mcp"), "local", childMCPExitFile, true)
+
+	var stdout, stderr bytes.Buffer
+	code := RunWithGetwd([]string{"--config", cliConfigPath(configDir), "chat", "--quit", "--prompt", "delegate"}, &stdout, &stderr, func() (string, error) {
+		return t.TempDir(), nil
+	})
+
+	if code != 0 {
+		t.Fatalf("RunWithGetwd() code = %d, stderr = %s", code, stderr.String())
+	}
+
+	firstParent := receiveCLIRunRequest(t, parentRequests)
+	assertCLIToolNames(t, firstParent.Body, []string{
+		"mcp.remote.search",
+		subagents.ToolSubagentStart,
+		subagents.ToolSubagentSend,
+		subagents.ToolSubagentStatus,
+		subagents.ToolSubagentWait,
+		subagents.ToolSubagentCancel,
+	})
+	parentMessageText := string(firstParent.RawBody)
+	if !strings.Contains(parentMessageText, "Parent skill instructions.") {
+		t.Fatalf("parent request missing parent skill instructions: %s", firstParent.RawBody)
+	}
+
+	child := receiveCLIRunRequest(t, childRequests)
+	assertCLIToolNames(t, child.Body, []string{"mcp.local.search"})
+	childMessageText := string(child.RawBody)
+	for _, want := range []string{"Child skill instructions.", "Skill child-only (Child Skill):"} {
+		if !strings.Contains(childMessageText, want) {
+			t.Fatalf("child request missing %q: %s", want, child.RawBody)
+		}
+	}
+	for _, forbidden := range []string{"Parent skill instructions.", "mcp.remote.search"} {
+		if strings.Contains(childMessageText, forbidden) {
+			t.Fatalf("child request inherited parent-only capability %q: %s", forbidden, child.RawBody)
+		}
+	}
+	assertNoAdditionalCLIRunRequest(t, childRequests)
+	assertCLIFileEventuallyContains(t, childMCPExitFile, "closed")
+}
+
 func TestRunDeliversSubagentCompletionAfterParentTurnWithoutWait(t *testing.T) {
 	childRequests := make(chan capturedCLIRunRequest, 1)
 	childDone := make(chan struct{})
@@ -6670,8 +6967,17 @@ func writeCLIRunMCPFixture(t *testing.T, dir, exitFile string) {
 		t.Fatalf("MkdirAll() error = %v", err)
 	}
 
-	writeCLIFile(t, filepath.Join(mcpDir, "local.yaml"), fmt.Sprintf(`id: local
-enabled: false
+	writeCLIRunMCPServerFixture(t, mcpDir, "local", exitFile, false)
+}
+
+func writeCLIRunMCPServerFixture(t *testing.T, mcpDir, id, exitFile string, enabled bool) {
+	t.Helper()
+	if err := os.MkdirAll(mcpDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll(%q) error = %v", mcpDir, err)
+	}
+
+	writeCLIFile(t, filepath.Join(mcpDir, id+".yaml"), fmt.Sprintf(`id: %s
+enabled: %t
 command: %q
 args:
   - "-test.run=TestCLIMCPHelperProcess"
@@ -6680,7 +6986,7 @@ args:
 env:
   SAI_CLI_MCP_HELPER_PROCESS: "1"
   SAI_CLI_MCP_EXIT_FILE: %q
-`, os.Args[0], exitFile))
+`, id, enabled, os.Args[0], exitFile))
 }
 
 func writeCLIFile(t *testing.T, path, content string) {

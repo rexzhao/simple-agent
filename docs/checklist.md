@@ -377,13 +377,13 @@
 - [x] `subagents` 相对路径基于写出该配置项的父配置文件所在目录解析。
 - [x] subagent config 文件复用 main config 的 `sai` schema。
 - [x] child agent 通过类似 main agent 的 runtime 准备路径启动。
-- [ ] self-referential 或环形 subagent config 有递归深度保护。
+- [x] self-referential 或环形 subagent config 有递归深度保护。
 - [x] subagent runtime 有最大 job 数量、等待时间和取消保护。
 - [x] 未配置 subagents 时不暴露任何 subagent tools。
 - [x] 配置 subagents 后 parent agent 自动获得 subagent tools。
 - [x] parent prompt 注入已配置 subagent id 和短 description 列表。
 - [x] child agent 使用自己的 provider、model、tools 和 prompt。
-- [ ] child agent 的 skills 和 MCP 仍需 child-specific 测试覆盖。
+- [x] child agent 的 skills 和 MCP 仍需 child-specific 测试覆盖。
 - [x] child agent 不继承 parent tools。
 - [x] parent-facing subagent tool schemas 定义在 `internal/subagents`，并已接入 CLI runtime。
 - [x] subagent job 支持 `subagent_start`。
