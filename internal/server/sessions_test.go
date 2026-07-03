@@ -678,6 +678,76 @@ func TestSessionSendMessageRejectsBusySession(t *testing.T) {
 	}
 }
 
+func TestServerShutdownRejectsRunningTurnAndKeepsServerHealthy(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "sessions")
+	store := sessions.NewV2Store(root)
+	saveServerTestSession(t, store, "shutdown-busy")
+	started := make(chan struct{})
+	release := make(chan struct{})
+	closeRelease := func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+	}
+	defer closeRelease()
+	runner := fakeSessionTurnRunner{
+		run: func(ctx context.Context, request SessionTurnRequest) (SessionTurnResult, error) {
+			close(started)
+			<-release
+			return serverTestTurnResult(request.Session,
+				model.Message{Role: model.MessageRoleUser, Content: request.Content},
+				model.Message{Role: model.MessageRoleAssistant, Content: "done"},
+			), nil
+		},
+	}
+	process := startSessionAPIServerWithTurnRunner(t, store, sessions.SessionV2{}, "registry-token", runner)
+	baseURL := "http://" + process.Addr()
+	firstDone := make(chan map[string]any, 1)
+	go func() {
+		_, body := postRawJSONStatus(t, baseURL+"/sessions/shutdown-busy/messages", `{"content":"SECRET PROMPT TOKEN DETAILS"}`, "registry-token", http.StatusOK)
+		firstDone <- body
+	}()
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for turn to start")
+	}
+
+	raw, body := postRawJSONStatus(t, baseURL+"/server/shutdown", "", "registry-token", http.StatusConflict)
+	assertErrorCode(t, body, "server_busy")
+	for _, forbidden := range [][]byte{
+		[]byte("SECRET PROMPT TOKEN DETAILS"),
+		[]byte("registry-token"),
+	} {
+		if bytes.Contains(raw, forbidden) {
+			t.Fatalf("shutdown busy response leaked %s: %s", forbidden, raw)
+		}
+	}
+
+	waitForHealthyServer(t, process.Addr())
+	_, serverInfo := getRawJSON(t, baseURL+"/server")
+	if serverInfo["running_turns"] != float64(1) {
+		t.Fatalf("/server running_turns after shutdown conflict = %#v, want 1", serverInfo["running_turns"])
+	}
+	_, detail := getRawJSON(t, baseURL+"/sessions/shutdown-busy")
+	if detail["status"] != "running" {
+		t.Fatalf("session status after shutdown conflict = %#v, want running", detail["status"])
+	}
+
+	closeRelease()
+	select {
+	case body := <-firstDone:
+		if body["status"] != "committed" {
+			t.Fatalf("first response = %#v, want committed", body)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for turn to finish")
+	}
+	waitForHealthyServer(t, process.Addr())
+}
+
 func TestSessionSendMessageFailedTurnStaysTransient(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "sessions")
 	store := sessions.NewV2Store(root)

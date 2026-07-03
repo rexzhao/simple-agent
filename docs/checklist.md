@@ -451,11 +451,11 @@
 - [x] session metadata API 不返回完整 items，items API 支持 `before_seq`、`after_seq`、`limit`
   和 `view=chat|debug`。
 - [x] 同一 session 同时只允许一个 running turn，session busy 时再次发送 message 返回 conflict。
-- [ ] shutdown 在 running turn 时返回明确错误或 conflict。
+- [x] shutdown 在 running turn 时返回明确错误或 conflict。
 - [x] attach REPL 中的 `/compact` 调用 server command API，多行文本中的 `/compact` 仍作为普通文本。
 - [x] CLI client 不直接读取 session 文件、blob 文件或修改 `ActiveHistory`。
 - [x] M20 不实现浏览器 Web GUI UI；未来 GUI 必须复用同一套 HTTP API / WebSocket stream。
-- [ ] API 测试覆盖 health/status/shutdown、session metadata、item pagination、send message 和 compact command。
+- [x] API 测试覆盖 health/status/shutdown、session metadata、item pagination、send message 和 compact command。
 - [x] WebSocket 测试覆盖多 client fanout、transient events、persisted events 和 failed turn events。
 - [x] registry/discovery 测试覆盖 foreground/background server、duplicate start、port conflict、upward discovery 和 stale cleanup。
 - [x] CLI 测试覆盖 attach、status、stop、servers list、sessions list/show、send 和无可用 server 提示。

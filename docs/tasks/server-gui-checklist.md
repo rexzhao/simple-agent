@@ -87,7 +87,7 @@ future work and should not be required by any slice here.
   stdout/stderr.
 - [x] Registry duplicate-start, port conflict, upward discovery, stale cleanup,
   token usage, and stop semantics are covered by tests.
-- [ ] Session metadata, paginated items, item content, send message, compact
+- [x] Session metadata, paginated items, item content, send message, compact
   command, shutdown, and WebSocket fanout are covered by focused API tests.
 - [x] CLI tests cover `attach`, `status`, `stop`, `servers list`,
   `sessions list/show`, `send`, and the no-server startup hint.
