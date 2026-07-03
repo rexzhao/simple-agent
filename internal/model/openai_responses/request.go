@@ -14,6 +14,14 @@ func BuildRequestBody(request model.Request, stream bool) ([]byte, error) {
 }
 
 func buildRequestBody(request model.Request, stream bool) ([]byte, *toolNameMapper, error) {
+	return buildRequestBodyWithOptions(request, stream, requestBodyOptions{})
+}
+
+type requestBodyOptions struct {
+	forceStoreFalse bool
+}
+
+func buildRequestBodyWithOptions(request model.Request, stream bool, options requestBodyOptions) ([]byte, *toolNameMapper, error) {
 	toolNames := newToolNameMapper(request.Tools)
 
 	input, err := buildInput(request.Messages, toolNames)
@@ -26,6 +34,9 @@ func buildRequestBody(request model.Request, stream bool) ([]byte, *toolNameMapp
 		return nil, nil, err
 	}
 
+	if options.forceStoreFalse {
+		body["store"] = false
+	}
 	body["model"] = request.Model
 	body["input"] = input
 	body["stream"] = stream

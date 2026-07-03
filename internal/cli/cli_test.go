@@ -285,6 +285,7 @@ auth_dir: auth
 		"auth_file: ../auth/codex-work.json",
 		"type: openai-codex",
 		"context_window: 400000",
+		"parameters:\n      store: false\n      reasoning:\n        effort: high",
 	} {
 		if !strings.Contains(providerText, want) {
 			t.Fatalf("provider file missing %q:\n%s", want, providerText)
@@ -3628,6 +3629,74 @@ func TestRunOpenAIResponsesProviderOutputsTextDelta(t *testing.T) {
 	assertMessage(t, input, 0, "system", builtInBaseInstructions)
 	assertMessage(t, input, 1, "user", "Say hi")
 	assertCLIRequestOmitsKey(t, request.Body, "tools")
+	assertNoAdditionalCLIRunRequest(t, requests)
+}
+
+func TestRunOpenAICodexProviderForcesStoreFalseForExistingConfig(t *testing.T) {
+	server, requests := newCLIRunServer(t,
+		`{"type":"response.output_text.delta","delta":"hello codex"}`,
+		`{"type":"response.completed"}`,
+		`[DONE]`,
+	)
+	defer server.Close()
+
+	configDir := t.TempDir()
+	providersDir := filepath.Join(configDir, "providers")
+	authDir := filepath.Join(configDir, "auth")
+	if err := os.MkdirAll(providersDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll(providers) error = %v", err)
+	}
+	if err := os.MkdirAll(authDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll(auth) error = %v", err)
+	}
+	writeCLIFile(t, filepath.Join(configDir, "sai.yaml"), `default_provider: fake
+default_model: default
+provider_dir: providers
+auth_dir: auth
+`)
+	writeCLIFile(t, filepath.Join(authDir, "fake.json"), fmt.Sprintf(`{
+  "access_token": "codex-access-token",
+  "refresh_token": "codex-refresh-token",
+  "expires_at": %q,
+  "account_id": "account-123"
+}
+`, time.Now().Add(time.Hour).Format(time.RFC3339Nano)))
+	writeCLIFile(t, filepath.Join(providersDir, "fake.yaml"), fmt.Sprintf(`name: fake
+base_url: %s
+auth_file: ../auth/fake.json
+
+models:
+  default:
+    id: model-default
+    type: openai-codex
+    context_window: 400000
+`, server.URL))
+
+	var stdout, stderr bytes.Buffer
+	code := RunWithGetwd([]string{"--config-dir", configDir, "chat", "--quit", "--prompt", "Say hi"}, &stdout, &stderr, func() (string, error) {
+		return t.TempDir(), nil
+	})
+
+	if code != 0 {
+		t.Fatalf("RunWithGetwd() code = %d, stderr = %s", code, stderr.String())
+	}
+	if got, want := stdout.String(), "hello codex"; got != want {
+		t.Fatalf("stdout = %q, want %q", got, want)
+	}
+	if stderr.String() != "" {
+		t.Fatalf("stderr = %q, want empty", stderr.String())
+	}
+
+	request := <-requests
+	if request.Path != "/responses" {
+		t.Fatalf("request path = %q, want /responses", request.Path)
+	}
+	if request.Authorization != "Bearer codex-access-token" {
+		t.Fatalf("Authorization = %q, want Codex bearer token", request.Authorization)
+	}
+	if request.Body["store"] != false {
+		t.Fatalf("store = %#v, want false in Codex request body", request.Body["store"])
+	}
 	assertNoAdditionalCLIRunRequest(t, requests)
 }
 

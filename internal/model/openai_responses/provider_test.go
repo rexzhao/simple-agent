@@ -160,7 +160,8 @@ func TestProviderStreamUsesTokenSourceBearerAndAccountID(t *testing.T) {
 	defer server.Close()
 
 	provider, err := NewProvider(ProviderConfig{
-		BaseURL: server.URL,
+		BaseURL:         server.URL,
+		ForceStoreFalse: true,
 		TokenSource: fakeTokenSource{
 			token: AccessToken{Token: "codex-access-token", AccountID: "account-123"},
 		},
@@ -183,6 +184,12 @@ func TestProviderStreamUsesTokenSourceBearerAndAccountID(t *testing.T) {
 	if gotRequest.AccountID != "account-123" {
 		t.Fatalf("ChatGPT-Account-Id = %q, want account-123", gotRequest.AccountID)
 	}
+	assertJSONEqual(t, gotRequest.Body, `{
+		"model": "gpt-5.5",
+		"input": [],
+		"stream": true,
+		"store": false
+	}`)
 }
 
 func TestProviderStreamRedactsTokenSourceTokenFromHTTPError(t *testing.T) {

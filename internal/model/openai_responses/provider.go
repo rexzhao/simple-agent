@@ -14,11 +14,12 @@ import (
 )
 
 type ProviderConfig struct {
-	BaseURL     string
-	APIKey      string
-	TokenSource TokenSource
-	HTTPClient  *http.Client
-	HTTPOptions httpstream.Options
+	BaseURL         string
+	APIKey          string
+	TokenSource     TokenSource
+	ForceStoreFalse bool
+	HTTPClient      *http.Client
+	HTTPOptions     httpstream.Options
 }
 
 type TokenSource interface {
@@ -31,11 +32,12 @@ type AccessToken struct {
 }
 
 type Provider struct {
-	baseURL     string
-	apiKey      string
-	tokenSource TokenSource
-	httpClient  *http.Client
-	httpOptions httpstream.Options
+	baseURL         string
+	apiKey          string
+	tokenSource     TokenSource
+	forceStoreFalse bool
+	httpClient      *http.Client
+	httpOptions     httpstream.Options
 }
 
 var _ model.Provider = (*Provider)(nil)
@@ -52,11 +54,12 @@ func NewProvider(config ProviderConfig) (*Provider, error) {
 	}
 
 	return &Provider{
-		baseURL:     baseURL,
-		apiKey:      strings.TrimSpace(config.APIKey),
-		tokenSource: config.TokenSource,
-		httpClient:  httpClient,
-		httpOptions: config.HTTPOptions,
+		baseURL:         baseURL,
+		apiKey:          strings.TrimSpace(config.APIKey),
+		tokenSource:     config.TokenSource,
+		forceStoreFalse: config.ForceStoreFalse,
+		httpClient:      httpClient,
+		httpOptions:     config.HTTPOptions,
 	}, nil
 }
 
@@ -66,7 +69,9 @@ func (p *Provider) Stream(ctx context.Context, request model.Request) (<-chan mo
 		return nil, err
 	}
 
-	body, toolNames, err := buildRequestBody(request, true)
+	body, toolNames, err := buildRequestBodyWithOptions(request, true, requestBodyOptions{
+		forceStoreFalse: p.forceStoreFalse,
+	})
 	if err != nil {
 		return nil, fmt.Errorf("build OpenAI Responses request body: %w", err)
 	}

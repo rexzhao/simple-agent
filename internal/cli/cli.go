@@ -888,7 +888,7 @@ func writeCodexProviderFile(providerPath, authPath, providerName, baseURL, model
 		relAuthPath = authPath
 	}
 	relAuthPath = filepath.ToSlash(relAuthPath)
-	data := fmt.Sprintf("name: %s\nbase_url: %s\nauth_file: %s\n\nmodels:\n  %s:\n    id: %s\n    type: openai-codex\n    context_window: %s\n", providerName, strings.TrimSpace(baseURL), relAuthPath, modelID, modelID, strconv.Itoa(contextWindow))
+	data := fmt.Sprintf("name: %s\nbase_url: %s\nauth_file: %s\n\nmodels:\n  %s:\n    id: %s\n    type: openai-codex\n    context_window: %s\n    parameters:\n      store: false\n      reasoning:\n        effort: high\n", providerName, strings.TrimSpace(baseURL), relAuthPath, modelID, modelID, strconv.Itoa(contextWindow))
 	if err := os.WriteFile(providerPath, []byte(data), 0o600); err != nil {
 		return fmt.Errorf("write provider file %q: %w", providerPath, err)
 	}
@@ -2559,7 +2559,8 @@ func openAIResponsesProviderConfig(provider config.ProviderConfig) openairespons
 
 func openAICodexProviderConfig(provider config.ProviderConfig) openairesponses.ProviderConfig {
 	return openairesponses.ProviderConfig{
-		BaseURL: provider.BaseURL,
+		BaseURL:         provider.BaseURL,
+		ForceStoreFalse: true,
 		TokenSource: codexResponsesTokenSource{
 			source: &codexauth.TokenSource{
 				Store: codexauth.Store{Path: provider.AuthFile},

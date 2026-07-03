@@ -69,6 +69,61 @@ func TestBuildRequestBodyPreservesExplicitMaxOutputTokens(t *testing.T) {
 	assertJSONOmitsKey(t, body, "max_tokens")
 }
 
+func TestBuildRequestBodyPassesThroughStoreAndNestedReasoningParameters(t *testing.T) {
+	body, err := BuildRequestBody(model.Request{
+		Model: "gpt-5.5",
+		Messages: []model.Message{
+			{Role: model.MessageRoleUser, Content: "Hello"},
+		},
+		Parameters: map[string]any{
+			"store": false,
+			"reasoning": map[string]any{
+				"effort": "high",
+			},
+		},
+	}, true)
+	if err != nil {
+		t.Fatalf("BuildRequestBody() error = %v", err)
+	}
+
+	assertJSONEqual(t, body, `{
+		"model": "gpt-5.5",
+		"input": [
+			{"role": "user", "content": "Hello"}
+		],
+		"stream": true,
+		"store": false,
+		"reasoning": {
+			"effort": "high"
+		}
+	}`)
+}
+
+func TestBuildRequestBodyOptionsForceStoreFalseOverridesParameter(t *testing.T) {
+	body, _, err := buildRequestBodyWithOptions(model.Request{
+		Model: "gpt-5.5",
+		Parameters: map[string]any{
+			"store": true,
+			"reasoning": map[string]any{
+				"effort": "high",
+			},
+		},
+	}, true, requestBodyOptions{forceStoreFalse: true})
+	if err != nil {
+		t.Fatalf("buildRequestBodyWithOptions() error = %v", err)
+	}
+
+	assertJSONEqual(t, body, `{
+		"model": "gpt-5.5",
+		"input": [],
+		"stream": true,
+		"store": false,
+		"reasoning": {
+			"effort": "high"
+		}
+	}`)
+}
+
 func TestBuildRequestBodyRejectsUnsupportedToolParameters(t *testing.T) {
 	tests := []struct {
 		name      string
