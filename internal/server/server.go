@@ -57,6 +57,7 @@ type Options struct {
 	SessionRoot     string
 	SessionDefaults sessions.SessionV2
 	TurnRunner      SessionTurnRunner
+	CompactPlanner  SessionCompactPlanner
 }
 
 type Process struct {
@@ -74,11 +75,16 @@ type Process struct {
 	authToken       string
 	streams         *sessionStreamHub
 	turnRunner      SessionTurnRunner
+	compactPlanner  SessionCompactPlanner
 	runningTurns    map[string]string
 }
 
 type SessionTurnRunner interface {
 	RunSessionTurn(ctx context.Context, request SessionTurnRequest) (SessionTurnResult, error)
+}
+
+type SessionCompactPlanner interface {
+	PlanSessionCompaction(ctx context.Context, request SessionCompactionRequest) (SessionCompactionResult, error)
 }
 
 type SessionTurnRequest struct {
@@ -87,11 +93,20 @@ type SessionTurnRequest struct {
 	Emit    func(model.Event)
 }
 
+type SessionCompactionRequest struct {
+	Session sessions.SessionV2
+}
+
 type SessionTurnResult struct {
 	Session       sessions.SessionV2
 	Compaction    *SessionCompactionPlan
 	Items         []sessions.SessionItem
 	ActiveHistory []string
+}
+
+type SessionCompactionResult struct {
+	Session    sessions.SessionV2
+	Compaction SessionCompactionPlan
 }
 
 type SessionCompactionPlan struct {
@@ -160,6 +175,13 @@ func Start(options Options) (*Process, error) {
 		now = time.Now
 	}
 
+	compactPlanner := options.CompactPlanner
+	if compactPlanner == nil {
+		if planner, ok := options.TurnRunner.(SessionCompactPlanner); ok {
+			compactPlanner = planner
+		}
+	}
+
 	process := &Process{
 		listener: listener,
 		info: Info{
@@ -176,6 +198,7 @@ func Start(options Options) (*Process, error) {
 		authToken:       strings.TrimSpace(options.AuthToken),
 		streams:         newSessionStreamHub(),
 		turnRunner:      options.TurnRunner,
+		compactPlanner:  compactPlanner,
 		runningTurns:    make(map[string]string),
 	}
 	if process.sessionStore == nil && strings.TrimSpace(options.SessionRoot) != "" {
@@ -395,6 +418,12 @@ func (p *Process) handleSessionPath(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		p.handleSessionMessage(w, r, id)
+	case len(parts) == 3 && parts[1] == "commands" && parts[2] == "compact":
+		if r.Method != http.MethodPost {
+			writeMethodNotAllowed(w, http.MethodPost)
+			return
+		}
+		p.handleSessionCompact(w, r, id)
 	case len(parts) == 4 && parts[1] == "items" && parts[3] == "content":
 		if r.Method != http.MethodGet {
 			writeMethodNotAllowed(w, http.MethodGet)
@@ -695,6 +724,93 @@ func (p *Process) handleSessionMessage(w http.ResponseWriter, r *http.Request, i
 	})
 }
 
+func (p *Process) handleSessionCompact(w http.ResponseWriter, r *http.Request, id string) {
+	if !p.requireRegistryToken(w, r) {
+		return
+	}
+	if !validSessionAPIID(id) {
+		writeError(w, http.StatusBadRequest, "invalid_session_id", "invalid session id")
+		return
+	}
+	if err := readEmptySessionCreateRequest(w, r); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_request", err.Error())
+		return
+	}
+
+	store := p.sessionStore
+	if store == nil {
+		writeError(w, http.StatusServiceUnavailable, "session_store_unavailable", "session store is not configured")
+		return
+	}
+	session, err := store.Load(id)
+	if err != nil {
+		p.writeSessionLoadError(w, err, "could not load session")
+		return
+	}
+	if strings.TrimSpace(session.CWD) == "" {
+		session.CWD = p.snapshot().CWD
+	}
+	if strings.TrimSpace(session.ConfigPath) == "" && strings.TrimSpace(session.ConfigDir) == "" {
+		session.ConfigPath = p.snapshot().ConfigPath
+	}
+
+	operationID := nextSessionCompactOperationID(session)
+	if !p.beginSessionTurn(id, operationID) {
+		writeError(w, http.StatusConflict, "session_busy", "session is currently running a turn")
+		return
+	}
+	defer p.endSessionTurn(id)
+	if p.compactPlanner == nil {
+		writeError(w, http.StatusServiceUnavailable, "compact_planner_unavailable", "compact planner is not configured")
+		return
+	}
+
+	p.publishSessionEvent(id, NewSessionStreamEvent("compact.started", map[string]any{
+		"reason": "user_requested",
+	}))
+	result, err := p.compactPlanner.PlanSessionCompaction(r.Context(), SessionCompactionRequest{
+		Session: session,
+	})
+	if err != nil {
+		p.publishCompactFailed(id, err)
+		p.writeCompactError(w, err)
+		return
+	}
+
+	saved, err := store.AppendCompactionCheckpoint(session.ID, result.Compaction.SummaryItem, result.Compaction.Checkpoint)
+	if err != nil {
+		p.publishCompactFailed(id, err)
+		p.writeCompactionStoreError(w, err)
+		return
+	}
+	savedSummary, _ := findSessionItemByID(saved.Items, result.Compaction.SummaryItem.ID)
+	if savedSummary.ID == "" {
+		savedSummary = result.Compaction.SummaryItem
+	}
+	p.publishSessionEvent(id, NewSessionStreamEvent("item.appended", map[string]any{
+		"seq":     savedSummary.Seq,
+		"item_id": result.Compaction.SummaryItem.ID,
+	}))
+	p.publishSessionEvent(id, NewSessionStreamEvent("compaction.created", map[string]any{
+		"seq":           compactionCreatedSeq(savedSummary.Seq),
+		"compaction_id": result.Compaction.Checkpoint.ID,
+	}))
+	p.publishSessionEvent(id, NewSessionStreamEvent("active_history.replaced", map[string]any{
+		"seq": activeHistoryReplacedSeq(saved.LastSeq),
+	}))
+	p.publishSessionEvent(id, NewSessionStreamEvent("compact.completed", map[string]any{
+		"compaction_id":   result.Compaction.Checkpoint.ID,
+		"summary_item_id": result.Compaction.SummaryItem.ID,
+		"last_seq":        saved.LastSeq,
+	}))
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status":          "committed",
+		"compaction_id":   result.Compaction.Checkpoint.ID,
+		"summary_item_id": result.Compaction.SummaryItem.ID,
+		"last_seq":        saved.LastSeq,
+	})
+}
+
 func (p *Process) handleSessionStream(w http.ResponseWriter, r *http.Request, id string) {
 	if !validSessionAPIID(id) {
 		writeError(w, http.StatusBadRequest, "invalid_session_id", "invalid session id")
@@ -802,6 +918,22 @@ func (p *Process) writeTurnError(w http.ResponseWriter, err error) {
 	}
 }
 
+func (p *Process) writeCompactError(w http.ResponseWriter, err error) {
+	if errors.Is(err, sessions.ErrCorruptedSession) {
+		writeError(w, http.StatusInternalServerError, "session_corrupted", "session is corrupted")
+		return
+	}
+	writeError(w, http.StatusInternalServerError, "compact_failed", "compact failed")
+}
+
+func (p *Process) writeCompactionStoreError(w http.ResponseWriter, err error) {
+	if errors.Is(err, sessions.ErrCorruptedSession) {
+		writeError(w, http.StatusInternalServerError, "session_corrupted", "session is corrupted")
+		return
+	}
+	writeError(w, http.StatusInternalServerError, "session_store_error", "could not save compaction")
+}
+
 type SessionStreamEvent map[string]any
 
 func NewSessionStreamEvent(eventType string, fields map[string]any) SessionStreamEvent {
@@ -875,6 +1007,16 @@ func (p *Process) publishTurnFailed(sessionID, turnID string, err error) {
 	}
 	p.publishSessionEvent(sessionID, NewSessionStreamEvent("turn.failed", map[string]any{
 		"turn_id": turnID,
+		"message": message,
+	}))
+}
+
+func (p *Process) publishCompactFailed(sessionID string, err error) {
+	message := "compact failed"
+	if errors.Is(err, sessions.ErrCorruptedSession) {
+		message = "session is corrupted"
+	}
+	p.publishSessionEvent(sessionID, NewSessionStreamEvent("compact.failed", map[string]any{
 		"message": message,
 	}))
 }
@@ -1411,7 +1553,7 @@ func readEmptySessionCreateRequest(w http.ResponseWriter, r *http.Request) error
 	if err := json.Unmarshal(data, &value); err != nil {
 		return fmt.Errorf("request body must be empty or an object")
 	}
-	if len(value) != 0 {
+	if value == nil || len(value) != 0 {
 		return fmt.Errorf("request body must be empty or {}")
 	}
 	return nil
@@ -1450,6 +1592,24 @@ func readSessionMessageRequest(w http.ResponseWriter, r *http.Request) (string, 
 
 func nextSessionTurnID(session sessions.SessionV2) string {
 	return fmt.Sprintf("turn-%06d", session.LastSeq+1)
+}
+
+func nextSessionCompactOperationID(session sessions.SessionV2) string {
+	return fmt.Sprintf("compact-%06d", session.LastSeq+1)
+}
+
+func compactionCreatedSeq(summaryItemSeq int64) int64 {
+	if summaryItemSeq <= 0 {
+		return 0
+	}
+	return summaryItemSeq + 1
+}
+
+func activeHistoryReplacedSeq(lastSeq int64) int64 {
+	if lastSeq <= 1 {
+		return 0
+	}
+	return lastSeq - 1
 }
 
 func savedSessionItemsByID(savedItems, requestedItems []sessions.SessionItem) []sessions.SessionItem {

@@ -4023,23 +4023,7 @@ type serverAgentTurnRunner struct {
 }
 
 func (r serverAgentTurnRunner) RunSessionTurn(ctx context.Context, request localserver.SessionTurnRequest) (result localserver.SessionTurnResult, err error) {
-	session := request.Session
-	cwd := strings.TrimSpace(session.CWD)
-	if cwd == "" {
-		return localserver.SessionTurnResult{}, fmt.Errorf("session cwd is required")
-	}
-	configPath := session.RootConfigPath()
-	if strings.TrimSpace(configPath) == "" {
-		return localserver.SessionTurnResult{}, fmt.Errorf("session config path is required")
-	}
-
-	runtime, err := prepareAgentRuntimeWithOptions(ctx, configPath, agentCommandFlags{
-		resumeID: session.ID,
-	}, io.Discard, func() (string, error) {
-		return cwd, nil
-	}, r.program, runtimePreparationOptions{
-		enableSubagents: false,
-	})
+	runtime, err := r.prepareServerSessionRuntime(ctx, request.Session)
 	if err != nil {
 		return localserver.SessionTurnResult{}, err
 	}
@@ -4067,6 +4051,50 @@ func (r serverAgentTurnRunner) RunSessionTurn(ctx context.Context, request local
 		}
 	}
 	return result, nil
+}
+
+func (r serverAgentTurnRunner) PlanSessionCompaction(ctx context.Context, request localserver.SessionCompactionRequest) (result localserver.SessionCompactionResult, err error) {
+	runtime, err := r.prepareServerSessionRuntime(ctx, request.Session)
+	if err != nil {
+		return localserver.SessionCompactionResult{}, err
+	}
+	defer func() {
+		err = errors.Join(err, runtime.Close())
+	}()
+
+	plan, err := runtime.planCompactionCheckpoint(ctx, compactionCheckpointOptions{
+		reason:  "user_requested",
+		phase:   "manual",
+		trigger: "manual",
+	})
+	if err != nil {
+		return localserver.SessionCompactionResult{}, err
+	}
+	return localserver.SessionCompactionResult{
+		Session: runtime.resumableSession,
+		Compaction: localserver.SessionCompactionPlan{
+			SummaryItem: plan.summaryItem,
+			Checkpoint:  plan.checkpoint,
+		},
+	}, nil
+}
+
+func (r serverAgentTurnRunner) prepareServerSessionRuntime(ctx context.Context, session sessions.SessionV2) (*agentRuntime, error) {
+	cwd := strings.TrimSpace(session.CWD)
+	if cwd == "" {
+		return nil, fmt.Errorf("session cwd is required")
+	}
+	configPath := session.RootConfigPath()
+	if strings.TrimSpace(configPath) == "" {
+		return nil, fmt.Errorf("session config path is required")
+	}
+	return prepareAgentRuntimeWithOptions(ctx, configPath, agentCommandFlags{
+		resumeID: session.ID,
+	}, io.Discard, func() (string, error) {
+		return cwd, nil
+	}, r.program, runtimePreparationOptions{
+		enableSubagents: false,
+	})
 }
 
 func runServerOwnedSessionTurn(ctx context.Context, runtime *agentRuntime, messages []model.Message, prompt string, emit func(model.Event)) ([]model.Message, *compactionPlan, error) {

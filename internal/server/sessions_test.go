@@ -191,7 +191,8 @@ func TestSessionCreateUsesDefaultsAndDoesNotPersistItems(t *testing.T) {
 }
 
 func TestSessionCreateRequiresRegistryToken(t *testing.T) {
-	process := startSessionAPIServerWithToken(t, sessions.NewV2Store(filepath.Join(t.TempDir(), "sessions")), sessions.SessionV2{}, "registry-token")
+	store := sessions.NewV2Store(filepath.Join(t.TempDir(), "sessions"))
+	process := startSessionAPIServerWithToken(t, store, sessions.SessionV2{}, "registry-token")
 	baseURL := "http://" + process.Addr()
 
 	for _, tt := range []struct {
@@ -213,6 +214,32 @@ func TestSessionCreateRequiresRegistryToken(t *testing.T) {
 	_, created := postRawJSONWithToken(t, baseURL+"/sessions", "", "registry-token")
 	if created["id"] == "" {
 		t.Fatalf("created response missing id: %#v", created)
+	}
+
+	for _, tt := range []struct {
+		name string
+		body string
+	}{
+		{name: "non-empty object", body: `{"content":"secret prompt"}`},
+		{name: "null", body: `null`},
+		{name: "array", body: `[]`},
+		{name: "string", body: `"secret prompt"`},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			raw, body := postRawJSONStatus(t, baseURL+"/sessions", tt.body, "registry-token", http.StatusBadRequest)
+			assertErrorCode(t, body, "invalid_request")
+			if bytes.Contains(raw, []byte("secret prompt")) || bytes.Contains(raw, []byte("registry-token")) {
+				t.Fatalf("invalid create response leaked secret: %s", raw)
+			}
+		})
+	}
+
+	infos, err := store.List()
+	if err != nil {
+		t.Fatalf("List() error = %v", err)
+	}
+	if len(infos) != 1 {
+		t.Fatalf("len(List()) = %d, want only the valid created session after invalid bodies", len(infos))
 	}
 }
 
@@ -823,6 +850,312 @@ func TestSessionSendMessageSaveFailureDoesNotAppendItems(t *testing.T) {
 	}
 }
 
+func TestSessionCompactCommandPersistsCheckpointAndPublishesEvents(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "sessions")
+	store := sessions.NewV2Store(root)
+	saveServerTestSession(t, store, "compact-success")
+	existing := appendServerTestItem(t, store, "compact-success", sessions.SessionItem{
+		ID:         "existing-user",
+		Kind:       sessions.ItemKindMessage,
+		Visibility: sessions.ItemVisibilityVisible,
+		Audience:   sessions.ItemAudienceUser,
+		Message:    &model.Message{Role: model.MessageRoleUser, Content: "existing visible secret"},
+	})
+	if _, err := store.ReplaceActiveHistory("compact-success", []string{existing.ID}); err != nil {
+		t.Fatalf("ReplaceActiveHistory() error = %v", err)
+	}
+	planner := fakeSessionCompactPlanner{
+		plan: func(ctx context.Context, request SessionCompactionRequest) (SessionCompactionResult, error) {
+			if request.Session.ID != "compact-success" {
+				t.Fatalf("planner session id = %q, want compact-success", request.Session.ID)
+			}
+			summaryMessage := model.Message{Role: model.MessageRoleDeveloper, Content: "<compaction_summary>\nsummary secret\n</compaction_summary>"}
+			summary := sessions.SessionItem{
+				ID:         "summary-1",
+				Kind:       sessions.ItemKindMessage,
+				Visibility: sessions.ItemVisibilityHidden,
+				Audience:   sessions.ItemAudienceModel,
+				Message:    &summaryMessage,
+			}
+			return SessionCompactionResult{
+				Session: request.Session,
+				Compaction: SessionCompactionPlan{
+					SummaryItem: summary,
+					Checkpoint: sessions.CompactionCheckpoint{
+						ID:                    "compact-1",
+						Reason:                "user_requested",
+						Phase:                 "manual",
+						Trigger:               "manual",
+						SummaryItemID:         summary.ID,
+						PreviousActiveHistory: []string{existing.ID},
+						ReplacementHistory:    []string{existing.ID, summary.ID},
+					},
+				},
+			}, nil
+		},
+	}
+	process := startSessionAPIServerWithCompactPlanner(t, store, sessions.SessionV2{}, "registry-token", planner)
+	conn := dialSessionStream(t, process, "compact-success")
+	waitForStreamSubscribers(t, process, "compact-success", 1)
+
+	raw, body := postRawJSONStatus(t, "http://"+process.Addr()+"/sessions/compact-success/commands/compact", `{}`, "registry-token", http.StatusOK)
+	if body["status"] != "committed" || body["compaction_id"] != "compact-1" || body["summary_item_id"] != "summary-1" || body["last_seq"] == nil {
+		t.Fatalf("compact response = %#v, want committed metadata", body)
+	}
+	for _, forbidden := range []string{"summary secret", "existing visible secret", "<compaction_summary>", "registry-token"} {
+		if bytes.Contains(raw, []byte(forbidden)) {
+			t.Fatalf("compact response leaked %q: %s", forbidden, raw)
+		}
+	}
+
+	events := []map[string]any{
+		readSessionStreamEvent(t, conn),
+		readSessionStreamEvent(t, conn),
+		readSessionStreamEvent(t, conn),
+		readSessionStreamEvent(t, conn),
+		readSessionStreamEvent(t, conn),
+	}
+	wantTypes := []string{"compact.started", "item.appended", "compaction.created", "active_history.replaced", "compact.completed"}
+	for i, want := range wantTypes {
+		if events[i]["type"] != want {
+			t.Fatalf("event[%d] type = %#v, want %q; events=%#v", i, events[i]["type"], want, events)
+		}
+	}
+	if events[0]["reason"] != "user_requested" || events[1]["item_id"] != "summary-1" || events[2]["compaction_id"] != "compact-1" || events[4]["last_seq"] != body["last_seq"] {
+		t.Fatalf("compact events = %#v, want metadata only", events)
+	}
+	if _, ok := events[3]["item_ids"]; ok {
+		t.Fatalf("active_history.replaced event leaked item_ids: %#v", events[3])
+	}
+	eventPayload, err := json.Marshal(events)
+	if err != nil {
+		t.Fatalf("Marshal(events) error = %v", err)
+	}
+	if bytes.Contains(eventPayload, []byte("summary secret")) || bytes.Contains(eventPayload, []byte("existing visible secret")) || bytes.Contains(eventPayload, []byte("existing-user")) {
+		t.Fatalf("compact events leaked content: %s", eventPayload)
+	}
+
+	session, err := store.Load("compact-success")
+	if err != nil {
+		t.Fatalf("Load(compact-success) error = %v", err)
+	}
+	if got := responseSessionItemIDs(session.Items); !reflect.DeepEqual(got, []string{"existing-user", "summary-1"}) {
+		t.Fatalf("item IDs = %#v, want existing plus summary", got)
+	}
+	if len(session.Compactions) != 1 || session.Compactions[0].ID != "compact-1" {
+		t.Fatalf("Compactions = %#v, want compact-1", session.Compactions)
+	}
+	if !reflect.DeepEqual(session.ActiveHistory, []string{"existing-user", "summary-1"}) {
+		t.Fatalf("ActiveHistory = %#v, want replacement", session.ActiveHistory)
+	}
+	if session.Items[1].Visibility != sessions.ItemVisibilityHidden || session.Items[1].Message.Content != "<compaction_summary>\nsummary secret\n</compaction_summary>" {
+		t.Fatalf("summary item = %#v, want hidden persisted summary", session.Items[1])
+	}
+}
+
+func TestSessionCompactCommandRejectsBusySessionAndReflectsRunningStatus(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "sessions")
+	store := sessions.NewV2Store(root)
+	saveServerTestSession(t, store, "compact-busy")
+	existing := appendServerTestItem(t, store, "compact-busy", sessions.SessionItem{
+		ID:         "existing-user",
+		Kind:       sessions.ItemKindMessage,
+		Visibility: sessions.ItemVisibilityVisible,
+		Audience:   sessions.ItemAudienceUser,
+		Message:    &model.Message{Role: model.MessageRoleUser, Content: "existing"},
+	})
+	if _, err := store.ReplaceActiveHistory("compact-busy", []string{existing.ID}); err != nil {
+		t.Fatalf("ReplaceActiveHistory() error = %v", err)
+	}
+	started := make(chan struct{})
+	release := make(chan struct{})
+	planner := fakeSessionCompactPlanner{
+		plan: func(ctx context.Context, request SessionCompactionRequest) (SessionCompactionResult, error) {
+			close(started)
+			<-release
+			summaryMessage := model.Message{Role: model.MessageRoleDeveloper, Content: "<compaction_summary>\nplanned\n</compaction_summary>"}
+			summary := sessions.SessionItem{
+				ID:         "summary-1",
+				Kind:       sessions.ItemKindMessage,
+				Visibility: sessions.ItemVisibilityHidden,
+				Audience:   sessions.ItemAudienceModel,
+				Message:    &summaryMessage,
+			}
+			return SessionCompactionResult{
+				Session: request.Session,
+				Compaction: SessionCompactionPlan{
+					SummaryItem: summary,
+					Checkpoint: sessions.CompactionCheckpoint{
+						ID:                    "compact-1",
+						Reason:                "user_requested",
+						Phase:                 "manual",
+						Trigger:               "manual",
+						SummaryItemID:         summary.ID,
+						PreviousActiveHistory: []string{existing.ID},
+						ReplacementHistory:    []string{existing.ID, summary.ID},
+					},
+				},
+			}, nil
+		},
+	}
+	runner := fakeSessionTurnRunner{
+		run: func(ctx context.Context, request SessionTurnRequest) (SessionTurnResult, error) {
+			return SessionTurnResult{}, fmt.Errorf("turn runner should not run while compact is busy")
+		},
+	}
+	process := startSessionAPIServerWithRunners(t, store, sessions.SessionV2{}, "registry-token", runner, planner)
+	baseURL := "http://" + process.Addr()
+	firstDone := make(chan map[string]any, 1)
+	go func() {
+		_, body := postRawJSONStatus(t, baseURL+"/sessions/compact-busy/commands/compact", `{}`, "registry-token", http.StatusOK)
+		firstDone <- body
+	}()
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for compact to start")
+	}
+
+	_, serverInfo := getRawJSON(t, baseURL+"/server")
+	if serverInfo["running_turns"] != float64(1) {
+		t.Fatalf("/server running_turns = %#v, want 1", serverInfo["running_turns"])
+	}
+	_, detail := getRawJSON(t, baseURL+"/sessions/compact-busy")
+	if detail["status"] != "running" {
+		t.Fatalf("session status = %#v, want running", detail["status"])
+	}
+
+	raw, body := postRawJSONStatus(t, baseURL+"/sessions/compact-busy/messages", `{"content":"secret prompt"}`, "registry-token", http.StatusConflict)
+	assertErrorCode(t, body, "session_busy")
+	if bytes.Contains(raw, []byte("secret prompt")) {
+		t.Fatalf("busy message response leaked prompt: %s", raw)
+	}
+	_, body = postRawJSONStatus(t, baseURL+"/sessions/compact-busy/commands/compact", `{}`, "registry-token", http.StatusConflict)
+	assertErrorCode(t, body, "session_busy")
+
+	close(release)
+	select {
+	case body := <-firstDone:
+		if body["status"] != "committed" {
+			t.Fatalf("first compact response = %#v, want committed", body)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for first compact to finish")
+	}
+}
+
+func TestSessionCompactCommandFailureLeavesSessionUnchangedAndSanitizesErrors(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "sessions")
+	store := sessions.NewV2Store(root)
+	saveServerTestSession(t, store, "compact-failure")
+	existing := appendServerTestItem(t, store, "compact-failure", sessions.SessionItem{
+		ID:         "existing-user",
+		Kind:       sessions.ItemKindMessage,
+		Visibility: sessions.ItemVisibilityVisible,
+		Audience:   sessions.ItemAudienceUser,
+		Message:    &model.Message{Role: model.MessageRoleUser, Content: "existing secret"},
+	})
+	if _, err := store.ReplaceActiveHistory("compact-failure", []string{existing.ID}); err != nil {
+		t.Fatalf("ReplaceActiveHistory() error = %v", err)
+	}
+	before, err := store.Load("compact-failure")
+	if err != nil {
+		t.Fatalf("Load(before) error = %v", err)
+	}
+	planner := fakeSessionCompactPlanner{
+		plan: func(ctx context.Context, request SessionCompactionRequest) (SessionCompactionResult, error) {
+			return SessionCompactionResult{}, fmt.Errorf("summary provider leaked secret")
+		},
+	}
+	process := startSessionAPIServerWithCompactPlanner(t, store, sessions.SessionV2{}, "registry-token", planner)
+	conn := dialSessionStream(t, process, "compact-failure")
+	waitForStreamSubscribers(t, process, "compact-failure", 1)
+
+	raw, body := postRawJSONStatus(t, "http://"+process.Addr()+"/sessions/compact-failure/commands/compact", `{}`, "registry-token", http.StatusInternalServerError)
+	assertErrorCode(t, body, "compact_failed")
+	for _, forbidden := range []string{"summary provider leaked secret", "existing secret", "registry-token"} {
+		if bytes.Contains(raw, []byte(forbidden)) {
+			t.Fatalf("compact failure response leaked %q: %s", forbidden, raw)
+		}
+	}
+	if got := readSessionStreamEvent(t, conn); got["type"] != "compact.started" {
+		t.Fatalf("first event = %#v, want compact.started", got)
+	}
+	if got := readSessionStreamEvent(t, conn); got["type"] != "compact.failed" || got["message"] != "compact failed" {
+		t.Fatalf("second event = %#v, want sanitized compact.failed", got)
+	}
+
+	after, err := store.Load("compact-failure")
+	if err != nil {
+		t.Fatalf("Load(after) error = %v", err)
+	}
+	if !reflect.DeepEqual(after.Items, before.Items) || !reflect.DeepEqual(after.Compactions, before.Compactions) || !reflect.DeepEqual(after.ActiveHistory, before.ActiveHistory) || after.LastSeq != before.LastSeq {
+		t.Fatalf("session changed after failed compact:\nbefore=%#v\nafter=%#v", before, after)
+	}
+}
+
+func TestSessionCompactCommandRequiresTokenValidRequestAndExistingSession(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "sessions")
+	store := sessions.NewV2Store(root)
+	saveServerTestSession(t, store, "compact-validation")
+	saveServerTestSession(t, store, "compact-corrupt")
+	segmentsDir := filepath.Join(root, "compact-corrupt", "segments")
+	if err := os.MkdirAll(segmentsDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll(segments) error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(segmentsDir, "000001.jsonl"), []byte(`{"seq":1,"type":"item.appended","item":`+"\n"), 0o600); err != nil {
+		t.Fatalf("WriteFile(corrupt segment) error = %v", err)
+	}
+	process := startSessionAPIServerWithCompactPlanner(t, store, sessions.SessionV2{}, "registry-token", fakeSessionCompactPlanner{})
+	baseURL := "http://" + process.Addr()
+
+	for _, tt := range []struct {
+		name  string
+		token string
+	}{
+		{name: "missing token"},
+		{name: "wrong token", token: "wrong-token"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			raw, body := postRawJSONStatus(t, baseURL+"/sessions/compact-validation/commands/compact", `{}`, tt.token, http.StatusForbidden)
+			assertErrorCode(t, body, "permission_denied")
+			if bytes.Contains(raw, []byte("registry-token")) {
+				t.Fatalf("permission error leaked registry token: %s", raw)
+			}
+		})
+	}
+
+	for _, tt := range []struct {
+		name string
+		body string
+	}{
+		{name: "non-empty object", body: `{"content":"secret prompt"}`},
+		{name: "null", body: `null`},
+		{name: "array", body: `[]`},
+		{name: "string", body: `"secret prompt"`},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			raw, body := postRawJSONStatus(t, baseURL+"/sessions/compact-validation/commands/compact", tt.body, "registry-token", http.StatusBadRequest)
+			assertErrorCode(t, body, "invalid_request")
+			if bytes.Contains(raw, []byte("secret prompt")) {
+				t.Fatalf("invalid request leaked request content: %s", raw)
+			}
+		})
+	}
+	_, body := postRawJSONStatus(t, baseURL+"/sessions/missing-session/commands/compact", `{}`, "registry-token", http.StatusNotFound)
+	assertErrorCode(t, body, "session_not_found")
+	_, body = postRawJSONStatus(t, baseURL+"/sessions/compact-corrupt/commands/compact", `{}`, "registry-token", http.StatusInternalServerError)
+	assertErrorCode(t, body, "session_corrupted")
+
+	session, err := store.Load("compact-validation")
+	if err != nil {
+		t.Fatalf("Load(compact-validation) error = %v", err)
+	}
+	if len(session.Items) != 0 || len(session.Compactions) != 0 || len(session.ActiveHistory) != 0 {
+		t.Fatalf("validation/security requests changed session: items=%#v compactions=%#v active=%#v", session.Items, session.Compactions, session.ActiveHistory)
+	}
+}
+
 func TestSessionItemsPaginationBeforeAfter(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "sessions")
 	store := sessions.NewV2Store(root)
@@ -1345,6 +1678,18 @@ func startSessionAPIServerWithToken(t *testing.T, store *sessions.V2Store, defau
 func startSessionAPIServerWithTurnRunner(t *testing.T, store *sessions.V2Store, defaults sessions.SessionV2, token string, runner SessionTurnRunner) *Process {
 	t.Helper()
 
+	return startSessionAPIServerWithRunners(t, store, defaults, token, runner, nil)
+}
+
+func startSessionAPIServerWithCompactPlanner(t *testing.T, store *sessions.V2Store, defaults sessions.SessionV2, token string, planner SessionCompactPlanner) *Process {
+	t.Helper()
+
+	return startSessionAPIServerWithRunners(t, store, defaults, token, nil, planner)
+}
+
+func startSessionAPIServerWithRunners(t *testing.T, store *sessions.V2Store, defaults sessions.SessionV2, token string, runner SessionTurnRunner, planner SessionCompactPlanner) *Process {
+	t.Helper()
+
 	process, err := Start(Options{
 		CWD:             t.TempDir(),
 		ConfigPath:      filepath.Join(t.TempDir(), "sai.yaml"),
@@ -1354,6 +1699,7 @@ func startSessionAPIServerWithTurnRunner(t *testing.T, store *sessions.V2Store, 
 		SessionStore:    store,
 		SessionDefaults: defaults,
 		TurnRunner:      runner,
+		CompactPlanner:  planner,
 	})
 	if err != nil {
 		t.Fatalf("Start() error = %v", err)
@@ -1386,6 +1732,17 @@ func (r fakeSessionTurnRunner) RunSessionTurn(ctx context.Context, request Sessi
 		return SessionTurnResult{}, fmt.Errorf("fake turn runner was called unexpectedly")
 	}
 	return r.run(ctx, request)
+}
+
+type fakeSessionCompactPlanner struct {
+	plan func(context.Context, SessionCompactionRequest) (SessionCompactionResult, error)
+}
+
+func (p fakeSessionCompactPlanner) PlanSessionCompaction(ctx context.Context, request SessionCompactionRequest) (SessionCompactionResult, error) {
+	if p.plan == nil {
+		return SessionCompactionResult{}, fmt.Errorf("fake compact planner was called unexpectedly")
+	}
+	return p.plan(ctx, request)
 }
 
 func serverTestTurnResult(session sessions.SessionV2, messages ...model.Message) SessionTurnResult {
