@@ -130,10 +130,10 @@
 
 - [x] 定义 skill 目录结构。
 - [x] 读取 `SKILL.md`。
-- [x] 添加显式 skill activation。
+- [x] 添加直接子目录 skill discovery 和 `disable-model-invocation: true` frontmatter opt-out。
 - [x] 将 skill instructions 组合进 system/developer messages。
 - [x] 添加 malformed skill 错误处理。
-- [x] 添加 skill selection 和 disablement 测试。
+- [x] 添加 skill discovery 和 frontmatter opt-out 测试。
 
 ## M8：CLI Help / Discoverability
 
@@ -179,8 +179,8 @@
 - [x] tool call 单轮 result messages 包含 assistant tool call、tool result 和最终 assistant text。
 - [x] model stream error 不伪造成功 assistant 历史，继续通过 error event 失败。
 - [x] 添加 `sai [chat] [flags] [--prompt text] [--quit]`，没有命令 token 时默认进入 chat。
-- [x] `sai chat` 会话开始时固定 provider/model/tools/MCP/skills/show-reasoning。
-- [x] `sai chat` 支持 `--provider`、`--model`、`--show-reasoning`、`--verbose`、`--enable-tools`、`--enable-skills`、`--disable-skills`、`--enable-mcp` 语义。
+- [x] `sai chat` 会话开始时固定 provider/model/tools/MCP/loaded skills/show-reasoning。
+- [x] `sai chat` 支持 `--provider`、`--model`、`--show-reasoning`、`--verbose`、`--enable-tools`、`--enable-mcp` 语义。
 - [x] 有 `--prompt` 且无 `--quit` 时，先跑完初始 prompt 再进入 REPL，历史保留首轮 user、assistant 和 tool messages。
 - [x] 有 `--prompt` 且有 `--quit` 时，跑完这一轮后退出，不进入 REPL。
 - [x] 根层用“跳过已知 flag 及其 value 后的第一个非 flag token”识别命令；命令前后 flags 可混排，全局 `--config-dir` 可放在命令后，没有命令 token 时默认执行 chat，help 混排不加载配置，`--` 后的 token 全部作为 positional，chat 初始 prompt 使用 `--prompt`。
@@ -259,7 +259,7 @@
 - [x] 接近 context window 时向 stderr 警告。
 - [x] 达到预算前拒绝继续或要求用户选择处理方式。
 - [x] 不静默截断 system/developer/tool schema 信息。
-- [x] 保守保留内置 system、`AGENTS.md`、enabled skills、tool/MCP schema、全部消息和 tool result。
+- [x] 保守保留内置 system、`AGENTS.md`、loaded skills、tool/MCP schema、全部消息和 tool result。
 - [x] 设计截断或摘要策略并记录边界。
 - [x] resumable session 保存 context management metadata。
 - [x] 添加 usage tracking、预算警告和关键上下文保留测试。
@@ -276,13 +276,13 @@
 - [x] stdin 输入走 `sai chat --quit`。
 - [x] file 输入走 `sai chat --quit`。
 - [x] 不恢复 `sai run`。
-- [x] stdin/file 输入复用同一套 message 构造、provider 选择、tools/MCP/skills 启用和日志路径。
+- [x] stdin/file 输入复用同一套 message 构造、provider 选择、tools/MCP 启用、skills loading 和日志路径。
 - [x] stdin/file 输入不改变 JSONL 日志默认边界。
 - [x] REPL `/usage` 输出 context window / usage 元数据，不请求 provider，不泄露正文敏感内容。
 - [x] 增加 `sai doctor` 或 `sai config check`。
 - [x] 健康检查覆盖配置根目录和 provider 文件。
 - [x] 健康检查覆盖默认 provider/model 和 API key 环境变量是否存在。
-- [x] 健康检查覆盖 skill_dir、mcp_dir、enabled tools/MCP/skills。
+- [x] 健康检查覆盖 skill_dir、mcp_dir、enabled tools/MCP 和 skills discovery。
 - [x] 健康检查覆盖日志目录可写性。
 - [x] 健康检查输出脱敏，不打印 API key 或其他敏感配置值实际值。
 - [x] 不引入 TUI。

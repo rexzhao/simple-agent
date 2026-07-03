@@ -57,7 +57,8 @@ AGENTS.md
 `sai.yaml` 是全局配置入口，负责默认 provider、默认 model、provider 目录、工具启用和
 agent 通用参数。`providers/*.yaml`
 每个文件描述一个 provider。`skills/<skill_id>/SKILL.md` 是 M7 后的本地 skill 推荐布局；
-本地 skill 只有出现在 `skills.enabled` 或 `--enable-skills` 中才会注入运行时。
+直接子目录下存在 `SKILL.md` 的本地 skill 默认会注入运行时，除非该文件的 frontmatter
+设置 `disable-model-invocation: true`。
 `mcp/*.yaml` 每个文件描述一个 MCP server；
 MCP 是 M4 后能力，不属于 MVP 必需配置。
 
@@ -82,9 +83,6 @@ agent:
 tools:
   enabled: []
 
-skills:
-  enabled: []
-
 logging:
   path: logs/sai.jsonl
   level: info
@@ -106,6 +104,7 @@ mcp_dir: mcp
 - `provider_dir`：provider 配置文件目录。相对路径基于配置根目录解析。
 - `auth_dir`：M16 后的 OAuth token 文件目录。默认 `auth`，相对路径基于配置根目录解析。
 - `skill_dir`：本地 skill 目录。默认是配置根目录下的 `skills`；相对路径基于配置根目录解析。
+  只发现其直接子目录中包含 `SKILL.md` 的本地 skills。
 - `mcp_dir`：MCP 配置文件目录。M4 后启用；相对路径基于配置根目录解析。
 - `agent.max_turns`：一次 agent loop 最多请求模型的轮数。
 - `agent.stream`：默认是否启用 streaming。
@@ -113,7 +112,6 @@ mcp_dir: mcp
   普通新 chat 中可用 `--show-reasoning=true/false` 显式覆盖配置；`--show-reasoning`
   等价于 `--show-reasoning=true`。
 - `tools.enabled`：默认启用的工具列表。空列表表示不向模型暴露工具。
-- `skills.enabled`：默认启用的本地 skill id 列表。空列表表示不读取或注入任何 skill。
 - `logging.path`：JSONL 日志根/基准路径。相对路径基于配置根目录解析；例如
   `logs/sai.jsonl` 使用 `logs/` 作为 session root。空字符串表示禁用日志。
 - `logging.level`：日志级别。
@@ -293,31 +291,27 @@ body...
 ```
 
 如果没有 frontmatter，skill 名称默认使用目录名，description 为空，正文全文作为
-instructions。启用方式有两种：
+instructions。`disable-model-invocation: true` 是每个 skill 的模型上下文注入 opt-out：
+设置为 `true` 时，该 skill 会被发现但不会作为 developer message 注入模型上下文。
 
-```yaml
-skills:
-  enabled:
-    - my-skill
+```markdown
+---
+disable-model-invocation: true
+---
 ```
+
+缺失该字段或设置为 `false` 都表示正常加载并注入。
+
+`sai.yaml` 不再配置 skill 选择列表；是否注入某个本地 skill 由其 `SKILL.md`
+frontmatter 决定。
+
+已加载 skill 的 instructions 会作为 developer message 注入到模型请求中，顺序是：
 
 ```text
-sai chat --quit --enable-skills my-skill,other-skill --prompt "prompt"
-sai chat --quit --disable-skills --prompt "prompt"
+sai 内置基础约束 > AGENTS.md > loaded skills > 当前用户 prompt
 ```
 
-`--enable-skills` 覆盖配置中的 `skills.enabled`，不是追加；`--disable-skills` 本次运行
-禁用所有 skills。二者同时出现时命令会失败。空 enabled 列表表示不发现、不读取、不注入
-任何 skill。
-
-已启用 skill 的 instructions 会作为 developer message 注入到模型请求中，顺序是：
-
-```text
-sai 内置基础约束 > AGENTS.md > enabled skills > 当前用户 prompt
-```
-
-多个 skill 按配置或 CLI 中的 enabled 顺序注入。未知 skill id 会报错并列出当前
-`skill_dir` 下可用的 skill id；frontmatter 格式错误会让命令失败并指出对应
+多个 skill 使用 discovery 的稳定顺序注入。frontmatter 格式错误会让命令失败并指出对应
 `SKILL.md`。
 
 ## MCP 配置（M4 后）
@@ -444,8 +438,8 @@ v0.1 不支持会话进行中切换模型。`sai chat` 进入会话后，provide
 
 `sai chat` 使用同一套会话启动时配置与命令行覆盖规则。以下 flags 在 chat 会话开始时
 解析一次，并固定到会话结束：`--provider`、`--model`、
-`--show-reasoning`、`--verbose`、`--enable-tools`、`--enable-skills`、
-`--disable-skills`、`--enable-mcp`、`--save-session`、`--resume` 和
+`--show-reasoning`、`--verbose`、`--enable-tools`、`--enable-mcp`、`--save-session`、
+`--resume` 和
 `--continue`。`--resume` 与 `--continue` 互斥。初始输入来源只能是 `--prompt`、
 `--stdin` 或 `--file` 三者之一；`--stdin` 和 `--file` 必须和 `--quit` 一起使用，读取
 完整 stdin 或文件内容作为一次 prompt，完成该轮后退出。chat 不支持会话进行中切换模型、
@@ -468,7 +462,7 @@ usage 摘要。该命令不请求 provider、不写 JSONL 日志，也不打印 
 - provider 文件是否可加载，默认 provider/model 是否能解析。
 - 默认 provider 的 API key 是否配置可用：`$ENV_NAME` 会按 `ResolveModel` 的同一逻辑检查
   环境变量是否存在且非空，直接配置 API key 也算通过。
-- `skill_dir`、`mcp_dir` 是否可加载，以及 `skills.enabled` / 默认 enabled MCP 是否存在且可选择。
+- `skill_dir`、`mcp_dir` 是否可加载，discovered skills 是否可解析，以及默认 enabled MCP 是否存在且可选择。
 - `tools.enabled` 中的内置工具是否注册；MCP 工具名是否指向已配置且本次默认启用的 MCP server。
 - `logging.path` 为空时报告 disabled；非空时检查对应 session root/父目录可创建可写，
   不创建真正的 session log 文件，临时探测文件或目录会清理。
@@ -550,7 +544,7 @@ sessions:
 tool calls 和 tool result messages。
 
 可恢复 session 文件会包含敏感数据，包括用户输入、assistant 输出、tool result、cwd、
-provider/model/parameters、启用 tools/MCP/skills/reasoning，以及注入指令快照或可重建
+provider/model/parameters、启用 tools/MCP、loaded skills、reasoning，以及注入指令快照或可重建
 信息。因此 `sessions.enabled` 必须默认是 `false`，CLI 和文档都应提示用户这是显式
 opt-in 的落盘能力。
 
@@ -572,7 +566,7 @@ calls 和 tool result messages。`--resume <id>` 会从 `sessions.dir/<id>/sessi
 恢复，`--continue` 会选择 `sessions.dir` 下 `updated_at` 最新的 session。
 
 恢复时，runtime 使用 session 文件中保存的 provider、model profile、model id、model
-parameters、enabled tools、enabled MCP、enabled skills、show_reasoning 和保存行为。显式
+parameters、enabled tools、enabled MCP、loaded skills、show_reasoning 和保存行为。显式
 CLI 覆盖如果和 session 文件冲突会失败，例如恢复时同时传入不同的 `--model`、不同的
 `--enable-tools`、冲突的 `--show-reasoning=true/false`，或试图用 `--save-session=false`
 改变恢复后的保存语义。`sessions.save_tool_results: false` 当前不提供可靠降级模式；只要启用保存或恢复，

@@ -187,32 +187,35 @@ function tools / function_call_output，使现有 agent tool loop 能通过 `ope
 - 配置层定义 `skill_dir`，默认指向配置根目录下的 `skills`。
 - 推荐本地目录布局：`.agents/skills/<skill_id>/SKILL.md`。
 - skill discovery，只发现 `skill_dir` 下包含 `SKILL.md` 的直接子目录。
-- `SKILL.md` 读取，支持可选 YAML frontmatter 中的 `name` 和 `description`。
-- skill 显式启用或选择。
+- `SKILL.md` 读取，支持可选 YAML frontmatter 中的 `name`、`description` 和
+  `disable-model-invocation`。
+- 通过 `disable-model-invocation: true` 对单个 skill 关闭模型上下文注入；缺失或为
+  `false` 时正常加载。
 - instruction composition。
 
-M7 当前实现只覆盖配置目录下的本地 skills：通过 `skills.enabled` 或 `sai chat
---enable-skills` 显式启用，`--enable-skills` 覆盖配置，`--disable-skills` 本次运行禁用
-所有 skills。已启用 skill 的 instructions 作为 developer message 注入在内置 system
-和 `AGENTS.md` 之后、用户 prompt 之前；多个 skill 按 enabled 列表顺序注入。M7 不读取
-用户目录，不实现 marketplace、递归 skill discovery、plugin lifecycle 或复杂依赖解析。
+M7 当前实现只覆盖配置目录下的本地 skills：发现 `skill_dir` 下包含 `SKILL.md` 的直接
+子目录，默认将其 instructions 作为 developer message 注入在内置 system 和 `AGENTS.md`
+之后、用户 prompt 之前。若某个 `SKILL.md` frontmatter 设置
+`disable-model-invocation: true`，该 skill 不注入模型上下文；缺失该字段或设置为 `false`
+表示正常加载。M7 不读取用户目录，不实现
+marketplace、递归 skill discovery、plugin lifecycle 或复杂依赖解析。
 
 验证：
 
 第一小步验证：
 
 - discovery 单元测试能稳定列出 `skill_dir` 下含 `SKILL.md` 的直接子目录。
-- `SKILL.md` loader 能读取 frontmatter 中的 `name` / `description` 和正文。
+- `SKILL.md` loader 能读取 frontmatter 中的 `name` / `description` /
+  `disable-model-invocation` 和正文。
 - 无 frontmatter 时，loader 使用 skill id 作为名称、description 为空、全文作为 instructions。
 - config test 能证明 `skill_dir` 默认路径和自定义路径都相对配置根目录解析。
 
 最终态验证：
 
 - 本地测试 skill 能改变模型 instructions。
-- skill 可以关闭。
+- skill 可以通过 `disable-model-invocation: true` 关闭模型上下文注入。
 - 缺失或格式错误的 skill 有清晰错误。
-- CLI fake server 测试覆盖 skill 注入顺序、CLI 覆盖配置、disablement、unknown id 和
-  malformed frontmatter。
+- CLI fake server 测试覆盖 skill 注入顺序、frontmatter opt-out 和 malformed frontmatter。
 
 ## M8：CLI Help / Discoverability
 
@@ -300,9 +303,9 @@ M7 当前实现只覆盖配置目录下的本地 skills：通过 `skills.enabled
   或 EOF 正常退出。
 - 有 `--prompt` 时先执行完整一轮 agent loop；无 `--quit` 则继续进入 REPL，带
   `--quit` 则完成后退出；`--quit` 无 `--prompt` 为用法错误。
-- `sai chat` 会话开始时固定 provider/model/tools/MCP/skills/show-reasoning，使用
+- `sai chat` 会话开始时固定 provider/model/tools/MCP/loaded skills/show-reasoning，使用
   同一套配置选择规则和 flags：`--provider`、`--model`、`--show-reasoning`、
-  `--verbose`、`--enable-tools`、`--enable-skills`、`--disable-skills`、`--enable-mcp`。
+  `--verbose`、`--enable-tools`、`--enable-mcp`。
 - 参数解析使用统一混排规则：跳过已知 flag 及其 value 后的第一个非 flag token 是命令；
   命令前后 flags 可混排，`--config-dir` 可放在命令后，`--` 后的 token 全部作为
   positional；没有命令 token 时默认执行 `chat`；chat 不把 positional 参数作为初始 prompt。
@@ -394,8 +397,8 @@ M7 当前实现只覆盖配置目录下的本地 skills：通过 `skills.enabled
 - 启用后保存可恢复 session id、创建时间、更新时间和版本信息。
 - 启用后保存 provider、model、model profile parameters、cwd、配置根目录和本次运行的关键
   runtime 选择。
-- 启用后保存已启用 tools、MCP、skills、reasoning 展示设置，以及对应的 CLI 覆盖来源。
-- 启用后保存注入指令快照，或保存足以重建内置 system、`AGENTS.md` 和 enabled skills 的
+- 启用后保存已启用 tools、MCP、loaded skills、reasoning 展示设置，以及对应的 CLI 覆盖来源。
+- 启用后保存注入指令快照，或保存足以重建内置 system、`AGENTS.md` 和 loaded skills 的
   信息；若使用可重建信息，恢复时必须能检测源文件变化并给出清晰提示。
 - 启用后保存完整 messages：user messages、assistant final messages、assistant tool
   calls、tool result messages。
@@ -414,7 +417,7 @@ M7 当前实现只覆盖配置目录下的本地 skills：通过 `skills.enabled
 - 单元测试覆盖默认配置下不创建 resumable session。
 - 集成测试覆盖 `--save-session` 保存完整 messages 后，`--resume <id>` 能继续同一上下文。
 - 集成测试覆盖 `--continue` 选择最近的可恢复 session。
-- 测试覆盖 provider/model/parameters、cwd、enabled tools/MCP/skills/reasoning 和注入
+- 测试覆盖 provider/model/parameters、cwd、enabled tools/MCP、loaded skills、reasoning 和注入
   指令信息的保存与恢复。
 - 测试覆盖 tool call history 和 tool result messages 恢复后能被 provider adapter 正确发送。
 - CLI 测试覆盖 `sessions list/show/delete/prune` 的基本行为和敏感数据提示。
@@ -440,7 +443,7 @@ resumable session 保存 context management metadata，恢复后继续用该 met
 - 会话开始时记录模型 context window 配置或估算值。
 - 接近 context window 时向 stderr 给出清晰警告。
 - 达到预算前拒绝继续或要求用户选择处理方式，不静默截断关键上下文。
-- 初始策略先保守：保留内置 system、`AGENTS.md`、enabled skills、tool/MCP schema、
+- 初始策略先保守：保留内置 system、`AGENTS.md`、loaded skills、tool/MCP schema、
   全部 user/assistant 消息和 tool result，不自动摘要或截断。
 - 记录后续截断或摘要策略边界；摘要进入自动路径前必须有测试覆盖和可解释边界。
 - resumable session 中记录 context management metadata，恢复后能继续判断预算。
@@ -493,12 +496,12 @@ stdout 上的 `OK` / `WARN` / `ERROR` 行，任何 `ERROR` 都让退出码为 1�
 - stdin 输入和 file 输入都走 `sai chat --quit`，不恢复 `sai run`。
 - 明确命令形态，例如 `sai chat --quit --stdin`、`sai chat --quit --file prompt.md`
   或等价的克制 CLI 设计。
-- stdin/file 输入进入同一套 message 构造、provider 选择、tools/MCP/skills 启用和日志路径。
+- stdin/file 输入进入同一套 message 构造、provider 选择、tools/MCP 启用、skills loading 和日志路径。
 - stdin/file 输入不改变 JSONL 日志默认边界；仍不记录完整 prompt、response 或 tool result。
 - REPL `/usage` 展示 context window / usage 元数据，不请求 provider，不记录正文敏感内容。
 - 增加配置健康检查命令 `sai doctor`，不新增别名或 `sai config check`。
 - 健康检查覆盖配置根目录、provider 文件、默认 provider/model、API key 环境变量是否存在、
-  skill_dir、mcp_dir、enabled tools/MCP/skills 和日志目录可写性。
+  skill_dir、mcp_dir、enabled tools/MCP、skills discovery 和日志目录可写性。
 - 健康检查输出脱敏，不打印 API key 或其他敏感配置值实际值。
 - 健康检查不发 HTTP 请求、不启动 MCP server、不运行模型。
 - 不引入 TUI、不做 Markdown 渲染；Markdown 渲染最多作为远期低优先级非目标记录。
