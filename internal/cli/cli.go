@@ -3215,6 +3215,9 @@ func toolStatusDetail(toolCall model.ToolCall) (string, bool) {
 	if toolCall.Name == subagents.ToolSubagentStart {
 		return subagentStartStatusDetail(toolCall)
 	}
+	if toolCall.Name == tools.BuiltinGlobFiles {
+		return toolStatusStringArgument(toolCall, "pattern")
+	}
 	return toolStatusPath(toolCall)
 }
 
@@ -3245,6 +3248,17 @@ func toolStatusPath(toolCall model.ToolCall) (string, bool) {
 		return "", false
 	}
 	return text, true
+}
+
+func toolStatusStringArgument(toolCall model.ToolCall, name string) (string, bool) {
+	var arguments map[string]any
+	if err := json.Unmarshal([]byte(toolCall.Arguments), &arguments); err != nil {
+		return "", false
+	}
+	if arguments == nil {
+		return "", false
+	}
+	return compactToolStatusString(arguments[name])
 }
 
 func subagentStartStatusDetail(toolCall model.ToolCall) (string, bool) {
