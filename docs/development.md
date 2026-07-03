@@ -295,7 +295,9 @@ sai chat --continue --prompt "继续最近会话" --quit
 和最近 usage 摘要：context window、来源、warning threshold、last request/input/output/
 total tokens 和 last usage source；尚未请求模型时 token 显示 0，usage source 显示
 `(none)`。该摘要不包含 prompt、assistant output 或 tool result 正文，也不产生 JSONL
-日志事件。多行内容里的 `/usage` 按普通文本发送。
+日志事件。多行内容里的 `/usage` 按普通文本发送。会话压缩启用且当前 chat 有可恢复
+session 时，普通单行 `/compact` 只执行一次压缩，不发起用户 turn；多行内容里的
+`/compact` 按普通文本发送。
 有 `--prompt` 且没有 `--quit` 时，先完整执行该 prompt 的一轮 agent loop，成功后补齐
 必要换行并进入同一 REPL，会话历史包含初始 prompt、assistant 消息和 tool messages。
 有 `--prompt` 且带 `--quit` 时，只执行这一轮然后退出，不进入 REPL。`--stdin` 和
@@ -313,11 +315,12 @@ assistant 历史，也不继续下一轮。默认除 JSONL 日志外，chat 不�
 prompt/response/tool result 正文。MCP stdio server 在 chat 会话开始时启动，退出时关闭。
 
 M13 后，`sai chat --save-session` 或配置 `sessions.enabled: true` 会在每个成功 turn 后
-把完整 updated messages 保存到 `sessions.dir/<id>/session.json`。这包含完整用户输入、
+保存完整可恢复 session 状态到 `sessions.dir/<id>/session.json`。这包含完整用户输入、
 assistant 输出、assistant tool calls 和 tool result messages，属于显式 opt-in 的敏感
-内容落盘能力。`sai chat --resume <id>` 从指定 session 恢复 messages，`sai chat
---continue` 等价于恢复最近更新的 session；二者互斥。恢复后可以带 `--prompt` 和 `--quit`
-继续一轮，也可以不带 `--prompt` 进入 REPL。
+内容落盘能力。会话压缩实现目标会升级为 v2 session store：完整事实保存为 append-only
+`Items`，并用 `ActiveHistory` item id 列表记录模型可见上下文。`sai chat --resume <id>`
+从指定 session 恢复，`sai chat --continue` 等价于恢复最近更新的 session；二者互斥。
+恢复后可以带 `--prompt` 和 `--quit` 继续一轮，也可以不带 `--prompt` 进入 REPL。
 
 普通新 chat 中，`agent.show_reasoning` 可以从配置启用或关闭 reasoning 展示；命令行 bool
 flag 支持双向覆盖，`--show-reasoning` 等价于 `--show-reasoning=true`，而
@@ -325,9 +328,9 @@ flag 支持双向覆盖，`--show-reasoning` 等价于 `--show-reasoning=true`�
 默认值入口；`--save-session` 等价于 `--save-session=true`，而 `--save-session=false`
 可以关闭本次完整 session 保存，不另设重复配置字段。
 
-恢复时优先使用 session 文件中保存的 provider、model profile、model id、model parameters、
+恢复时优先使用 session metadata 中保存的 provider、model profile、model id、model parameters、
 enabled tools、enabled MCP、loaded skills、show_reasoning 和保存行为来准备 runtime，避免
-“恢复了 messages 却发给不同模型或工具集合”。如果本次命令显式传入了冲突的
+“恢复了 session 却发给不同模型或工具集合”。如果本次命令显式传入了冲突的
 `--provider`、`--model`、`--enable-tools`、`--enable-mcp`、`--show-reasoning=true/false`，
 或试图用 `--save-session=false` 改变
 恢复后的保存语义，命令会失败并给出可读错误。可靠保存和恢复要求
@@ -808,8 +811,9 @@ messages。二者的用途、默认值和敏感数据风险都应在 CLI 和文�
 resumable session 默认关闭。启用后，每个 session 至少保存 provider、model、model
 profile parameters、cwd、根配置文件路径、启用 tools/MCP、loaded skills、reasoning、注入指令快照或
 可重建信息，以及完整 user messages、assistant final messages、assistant tool calls 和
-tool result messages。缺少这些信息时，只能得到 transcript 或诊断日志，不能承诺可靠
-resume。
+tool result messages。会话压缩实现目标中的 v2 store 会将这些事实拆成 append-only
+`Items`，并用 `ActiveHistory` 记录下一次 provider 请求应 materialize 的模型上下文。缺少
+这些信息时，只能得到 transcript 或诊断日志，不能承诺可靠 resume。
 M18 后，项目指令文件快照或可重建信息应按每个成功加载的文件分别记录，而不是合并成一个
 不可追溯的块。
 
@@ -817,6 +821,35 @@ M18 后，项目指令文件快照或可重建信息应按每个成功加载的�
 `sai chat --continue`、`sai sessions list`、`sai sessions show <id>`、
 `sai sessions delete <id>` 和 `sai sessions prune --keep N`。管理命令只展示元数据或删除
 文件，不打印完整 messages、prompt、assistant output 或 tool result 正文。
+
+## Session Compaction Runtime
+
+详细设计来源是 `docs/session-compaction.md`；这里记录目标实现必须保持清晰的运行时顺序。
+
+v2 resumable sessions 目标是使用 append-only `Items` 作为完整事实账本，使用 `ActiveHistory`
+作为发给模型的 ordered projection。每个成功 turn 追加 visible message/tool items，并记录
+新的 active history；失败 turn 不进入 `Items`，也不替换 `ActiveHistory`。可靠保存、恢复和
+压缩仍要求 `sessions.save_tool_results: true`。
+
+`--resume` 和 `--continue` 不从完整 visible history 反推上下文，也不拼接全部 `Items`。
+恢复时只从 `ActiveHistory` 引用的 item materialize `[]model.Message`，并继续使用 session
+metadata 中保存的 provider、model、parameters、tools、MCP、skills、reasoning 和保存行为。
+`ActiveHistory` 引用缺失 item、非 message item 或非法 tool history 时，视为 corrupted
+session 并报错。
+
+手动 `/compact` 只在普通单行 REPL 中作为命令生效。成功 compact 会追加 hidden/model-facing
+summary item、compaction checkpoint 和 `active_history.replaced` record，flush 后再替换
+内存 `ActiveHistory`；它不发起用户 turn。compact 失败时，session 状态和内存
+`ActiveHistory` 都保持不变。
+
+pre-turn 自动压缩发生在 pending user message 加入 `Items` 或 `ActiveHistory` 之前。运行时先估算
+`ActiveHistory + pending user message + tool schemas`；超过配置阈值时先 compact。compact
+成功后，pending user message 追加在 summary 后面，再请求主模型。compact 失败时，本轮直接失败：
+不保存 pending user message，不更新 `ActiveHistory`，也不请求主模型。
+
+summary 请求默认使用当前 session provider/model，也可用 `compaction.summary_provider` 和
+`compaction.summary_model` 指定。summary 请求不传 tool schemas，不允许 tool call，不进入
+agent loop。未来的 session-history 查询工具仍是 out of scope。
 
 ## Context Window Management
 
@@ -839,8 +872,8 @@ source，不展示正文。
 当前策略保守保留全部上下文：system/developer messages、project instruction files、loaded
 skill instructions、tool / MCP schemas、assistant tool calls、tool result messages 和历史
 user/assistant messages
-都不会被静默丢弃。后续若要加入摘要或截断策略，必须单独设计可解释边界和测试，证明不会
-静默丢弃关键 system/developer/tool schema/tool result 信息。
+都不会被静默丢弃。会话压缩是 M14 后的独立能力，必须按 `docs/session-compaction.md`
+的边界和测试证明不会静默丢弃关键 system/developer/tool schema/tool result 信息。
 
 ## 测试策略
 

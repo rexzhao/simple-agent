@@ -108,6 +108,13 @@ sessions:
   dir: sessions
   save_tool_results: true
 
+# 会话压缩；默认关闭
+compaction:
+  enabled: false
+  threshold_percent: 80
+  summary_provider: ""
+  summary_model: ""
+
 # M4 后启用
 mcp_dir: mcp
 ```
@@ -140,6 +147,15 @@ mcp_dir: mcp
 - `sessions.dir`：M13 后的可恢复 session 存储目录。相对路径基于根配置文件所在目录解析。
 - `sessions.save_tool_results`：M13 后启用 session 保存时是否保存完整 tool result messages。
   可靠 resume 需要保存 tool results；关闭后只能作为降级或诊断模式设计。
+- `compaction.enabled`：会话压缩开关。默认 `false`；只有当前 chat 正在保存或恢复可恢复
+  session 时才有意义。关闭时不执行 pre-turn 自动压缩，普通 REPL 中的 `/compact` 应给出
+  可读错误。
+- `compaction.threshold_percent`：pre-turn 自动压缩阈值，默认 `80`，表示估算值超过当前
+  context window 的 80% 时先尝试压缩。
+- `compaction.summary_provider`：summary 请求使用的 provider。空字符串表示使用当前
+  session provider。
+- `compaction.summary_model`：summary 请求使用的 model profile。空字符串表示使用当前
+  session model profile；只配置 `summary_model` 时，在当前 provider 下解析该 profile。
 
 ## 项目指令文件配置
 
@@ -618,9 +634,9 @@ event，则成功结束后记录 fallback estimate。
 输入达到或超过窗口时，`sai` 拒绝发起 provider 请求，并给出可读错误。
 
 M14 的第一版不会自动摘要、截断或丢弃 system/developer messages、tool schemas、tool
-results 或历史消息。当前策略是保守保留全部上下文：接近窗口时警告，超预算时拒绝。后续
-若加入摘要或截断策略，需要单独设计可解释边界，并用测试证明不会静默丢弃关键指令、工具
-schema 或必要 tool result。
+results 或历史消息。当前策略是保守保留全部上下文：接近窗口时警告，超预算时拒绝。会话
+压缩是后续独立能力，按 `compaction` 配置和 `docs/session-compaction.md` 的边界执行，仍
+必须证明不会静默丢弃关键指令、工具 schema 或必要 tool result。
 
 ## Sessions 配置（M13 后）
 
@@ -656,12 +672,15 @@ sai sessions delete <id>
 sai sessions prune --keep 10
 ```
 
-启用保存后，`sai chat` 每个成功 turn 都会写入 `sessions.dir/<id>/session.json`，其中
-包含完整 updated messages：user messages、assistant final messages、assistant tool
-calls 和 tool result messages。`--resume <id>` 会从 `sessions.dir/<id>/session.json`
-恢复，`--continue` 会选择 `sessions.dir` 下 `updated_at` 最新的 session。
+启用保存后，当前 M13 runtime 会在每个成功 turn 后写入
+`sessions.dir/<id>/session.json`，其中包含完整 updated messages：user messages、
+assistant final messages、assistant tool calls 和 tool result messages。`--resume <id>`
+会从该 session 文件恢复，`--continue` 会选择 `sessions.dir` 下 `updated_at` 最新的
+session。会话压缩实现目标会在此基础上使用 v2 session store：完整事实写入 append-only
+`Items`，模型可见上下文由 `ActiveHistory` item id 列表表示，resume 从 `ActiveHistory`
+materialize provider messages。
 
-恢复时，runtime 使用 session 文件中保存的 provider、model profile、model id、model
+恢复时，runtime 使用 session metadata 中保存的 provider、model profile、model id、model
 parameters、enabled tools、enabled MCP、loaded skills、show_reasoning 和保存行为。显式
 CLI 覆盖如果和 session 文件冲突会失败，例如恢复时同时传入不同的 `--model`、不同的
 `--enable-tools`、冲突的 `--show-reasoning=true/false`，或试图用 `--save-session=false`
@@ -681,3 +700,33 @@ metadata，例如 context window、来源、warning 阈值和最近 usage 统计
 数字和 source，不展示正文。`sai sessions delete <id>` 删除指定 session；
 不存在时给出可读错误。`sai sessions prune --keep N` 保留 `updated_at` 最新的 N 个
 session，删除更旧的 session；`--keep` 必须显式提供，N 必须大于等于 0。
+
+## 会话压缩配置
+
+详细设计来源是 `docs/session-compaction.md`；本节只记录公开配置形态和运行时边界。
+
+```yaml
+compaction:
+  enabled: false
+  threshold_percent: 80
+  summary_provider: ""
+  summary_model: ""
+```
+
+`compaction.enabled` 默认关闭。启用后，普通单行 REPL 中的 `/compact` 只执行一次压缩，
+不发起用户 turn；多行输入里的 `/compact` 继续作为普通文本发送。手动压缩不受自动阈值
+限制。成功时追加 hidden/model-facing summary item、compaction checkpoint 和
+`active_history.replaced`，再替换内存中的 `ActiveHistory`；失败时向用户报错，session
+状态和内存 `ActiveHistory` 都不变。
+
+pre-turn 自动压缩在新用户消息真正加入 session 前执行检查，估算
+`ActiveHistory + pending user message + tool schemas`。估算超过
+`compaction.threshold_percent` 时，先执行 compact；compact 成功后才追加 pending user
+message 并请求主模型。compact 失败时，本轮直接失败，不保存 pending user message，不更新
+`ActiveHistory`，也不请求主模型。
+
+summary 请求默认使用当前 session provider/model profile。`summary_provider` 和
+`summary_model` 都为空时使用当前 session 选择；只配置 `summary_model` 时，在当前
+provider 下解析该 profile；二者都配置时使用指定 provider/profile。summary 请求不传 tool
+schemas，不允许 tool call，不进入 agent loop，只执行一次 summarization lifecycle。未来的
+session-history 查询工具仍是 out of scope。
