@@ -27,6 +27,7 @@ import (
 	anthropicmessages "github.com/rexzhao/simple-agent/internal/model/anthropic_messages"
 	openaichat "github.com/rexzhao/simple-agent/internal/model/openai_chat"
 	openairesponses "github.com/rexzhao/simple-agent/internal/model/openai_responses"
+	localserver "github.com/rexzhao/simple-agent/internal/server"
 	"github.com/rexzhao/simple-agent/internal/sessions"
 	localskills "github.com/rexzhao/simple-agent/internal/skills"
 	"github.com/rexzhao/simple-agent/internal/subagents"
@@ -168,6 +169,8 @@ func execute(ctx context.Context, program string, args []string, stdin io.Reader
 		return modelsListCommand(subArgs, rootArgs.configPath, stdout, getwd, program)
 	case "doctor":
 		return doctorCommand(rootArgs.commandArgs, rootArgs.configPath, stdout, getwd, program)
+	case "server":
+		return serverCommand(ctx, rootArgs.commandArgs, rootArgs.configPath, stdout, getwd, program)
 	case "auth":
 		return authCommand(ctx, rootArgs.commandArgs, rootArgs.configPath, stdout, getwd, program)
 	case "tools":
@@ -250,6 +253,7 @@ const rootUsageText = `usage: sai [--config file] [command] [args]
 
 Commands:
   chat              Start a chat session
+  server            Start a local HTTP server
   config show        Print resolved config with secrets redacted
   models list        List configured provider model profiles
   auth               Manage provider authentication
@@ -315,6 +319,12 @@ Checks local configuration files, default model selection, enabled local tools,
 skills, MCP server configuration, and JSONL log directory writability without
 sending provider HTTP requests, starting MCP servers, running a model, or
 printing secrets.
+`
+
+const serverUsageText = `usage: sai server [--cwd path] [--config file] [--port N | --listen host:port]
+
+Starts a foreground loopback HTTP server and blocks until it shuts down. The
+default listener is 127.0.0.1:0, which asks the OS to choose a free port.
 `
 
 const authUsageText = `usage: sai auth <command>
@@ -420,6 +430,8 @@ func helpCommand(args []string, stdout io.Writer) error {
 		printModelsListUsage(stdout)
 	case "doctor":
 		printDoctorUsage(stdout)
+	case "server":
+		printServerUsage(stdout)
 	case "auth":
 		printAuthUsage(stdout)
 	case "auth codex":
@@ -480,6 +492,10 @@ func printModelsListUsage(stdout io.Writer) {
 
 func printDoctorUsage(stdout io.Writer) {
 	fmt.Fprint(stdout, doctorUsageText)
+}
+
+func printServerUsage(stdout io.Writer) {
+	fmt.Fprint(stdout, serverUsageText)
 }
 
 func printAuthUsage(stdout io.Writer) {
@@ -590,6 +606,9 @@ func splitRootArgs(args []string) (rootArgs, error) {
 		"enable-mcp":     flagKindValue,
 		"resume":         flagKindValue,
 		"keep":           flagKindValue,
+		"cwd":            flagKindValue,
+		"port":           flagKindValue,
+		"listen":         flagKindValue,
 		"h":              flagKindBool,
 		"help":           flagKindBool,
 		"show-reasoning": flagKindBool,
@@ -805,6 +824,114 @@ func doctorCommand(args []string, configPath string, stdout io.Writer, getwd fun
 		return errSilentExit
 	}
 	return nil
+}
+
+func serverCommand(ctx context.Context, args []string, configPath string, stdout io.Writer, getwd func() (string, error), program string) error {
+	flags := flag.NewFlagSet("sai server", flag.ContinueOnError)
+	cwdFlag := flags.String("cwd", "", "server working directory")
+	portFlag := flags.Int("port", -1, "loopback port")
+	listenFlag := flags.String("listen", "", "loopback listen address")
+	positionals, done, err := parseCommandFlagArgs(flags, args, stdout, printServerUsage, "sai help server")
+	if done || err != nil {
+		return err
+	}
+	if len(positionals) != 0 {
+		return usageError("usage: sai server [--cwd path] [--config file] [--port N | --listen host:port]", "", "sai help server")
+	}
+
+	portSet := false
+	flags.Visit(func(flag *flag.Flag) {
+		if flag.Name == "port" {
+			portSet = true
+		}
+	})
+	listen, err := serverListenAddress(portSet, *portFlag, *listenFlag)
+	if err != nil {
+		return usageError(err.Error(), "", "sai help server")
+	}
+	if err := localserver.ValidateListenAddress(listen); err != nil {
+		return err
+	}
+
+	cwd, err := resolveServerCWD(*cwdFlag, getwd)
+	if err != nil {
+		return err
+	}
+	serverGetwd := func() (string, error) {
+		return cwd, nil
+	}
+	cfg, err := loadConfig(serverConfigPath(configPath, cwd), serverGetwd, program)
+	if err != nil {
+		return err
+	}
+
+	process, err := localserver.Start(localserver.Options{
+		CWD:        cwd,
+		ConfigPath: cfg.ConfigPath,
+		Listen:     listen,
+		Version:    Version,
+	})
+	if err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintf(stdout, "SERVER_ADDR\t%s\n", process.Addr()); err != nil {
+		_ = process.Shutdown(context.Background())
+		return err
+	}
+	return process.Serve(ctx)
+}
+
+func serverListenAddress(portSet bool, port int, listen string) (string, error) {
+	listen = strings.TrimSpace(listen)
+	if portSet && listen != "" {
+		return "", fmt.Errorf("--port and --listen are mutually exclusive")
+	}
+	if portSet && (port < 0 || port > 65535) {
+		return "", fmt.Errorf("--port must be a number from 0 to 65535")
+	}
+	if listen != "" {
+		return listen, nil
+	}
+	if portSet {
+		return fmt.Sprintf("127.0.0.1:%d", port), nil
+	}
+	return localserver.DefaultListenAddress, nil
+}
+
+func resolveServerCWD(cwdFlag string, getwd func() (string, error)) (string, error) {
+	cwdFlag = strings.TrimSpace(cwdFlag)
+	if cwdFlag == "" {
+		cwd, err := getwd()
+		if err != nil {
+			return "", fmt.Errorf("get current directory: %w", err)
+		}
+		cwd = filepath.Clean(cwd)
+		if err := checkExistingDirectory(cwd); err != nil {
+			return "", fmt.Errorf("cwd %q: %w", cwd, err)
+		}
+		return cwd, nil
+	}
+
+	cwd := cwdFlag
+	if !filepath.IsAbs(cwd) {
+		base, err := getwd()
+		if err != nil {
+			return "", fmt.Errorf("get current directory: %w", err)
+		}
+		cwd = filepath.Join(base, cwd)
+	}
+	cwd = filepath.Clean(cwd)
+	if err := checkExistingDirectory(cwd); err != nil {
+		return "", fmt.Errorf("cwd %q: %w", cwd, err)
+	}
+	return cwd, nil
+}
+
+func serverConfigPath(configPath, cwd string) string {
+	if strings.TrimSpace(configPath) == "" || filepath.IsAbs(configPath) {
+		return configPath
+	}
+	return filepath.Join(cwd, configPath)
 }
 
 func authCommand(ctx context.Context, args []string, configPath string, stdout io.Writer, getwd func() (string, error), program string) error {

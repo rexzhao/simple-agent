@@ -20,7 +20,7 @@ future work and should not be required by any slice here.
 
 ## Implementation Slices
 
-- [ ] Server process foundation: add `sai server`, loopback HTTP listener,
+- [x] Server process foundation: add `sai server`, loopback HTTP listener,
   foreground blocking behavior, `GET /health`, `GET /server`, and
   `POST /server/shutdown`.
 - [ ] Foreground lifecycle: handle Ctrl+C by stopping listeners, flushing required

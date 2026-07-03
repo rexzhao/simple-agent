@@ -984,7 +984,7 @@ func TestRootHelpWritesUsageWithoutConfig(t *testing.T) {
 				t.Fatalf("RunWithGetwd(%v) code = %d, stderr = %s", args, code, stderr.String())
 			}
 			out := stdout.String()
-			for _, want := range []string{"usage: sai", "chat              Start a chat session", "config show", "models list", "doctor", "tools list", "sessions", "With no command, sai defaults to chat.", `Run "sai help <command>" for command usage.`} {
+			for _, want := range []string{"usage: sai", "chat              Start a chat session", "server            Start a local HTTP server", "config show", "models list", "doctor", "tools list", "sessions", "With no command, sai defaults to chat.", `Run "sai help <command>" for command usage.`} {
 				if !strings.Contains(out, want) {
 					t.Fatalf("stdout = %q, want contain %q", out, want)
 				}
@@ -1051,6 +1051,104 @@ func TestChatHelpWritesUsageWithoutConfig(t *testing.T) {
 			t.Fatalf("chat help still includes removed flag %q:\n%s", removed, stdout.String())
 		}
 	}
+}
+
+func TestServerHelpWritesUsageWithoutConfig(t *testing.T) {
+	for _, args := range [][]string{
+		{"server", "-h"},
+		{"server", "--help"},
+		{"help", "server"},
+	} {
+		t.Run(strings.Join(args, " "), func(t *testing.T) {
+			assertCLIHelpWithoutConfig(t, args, "usage: sai server", "--cwd path", "--port N | --listen host:port")
+		})
+	}
+}
+
+func TestServerCommandStartsWithDefaultConfigAndShutdown(t *testing.T) {
+	projectDir := t.TempDir()
+	writeCLIFixtureInDir(t, filepath.Join(projectDir, ".agents"))
+
+	addr, done, stderr, cleanup := startCLIServerCommandForTest(t, []string{"server", "--port", "0"}, func() (string, error) {
+		return projectDir, nil
+	})
+	defer cleanup()
+
+	info := getCLIServerJSON(t, "http://"+addr+"/server")
+	if got, want := filepath.Clean(info["cwd"].(string)), filepath.Clean(projectDir); got != want {
+		t.Fatalf("server cwd = %q, want %q", got, want)
+	}
+	if got, want := filepath.Clean(info["config_path"].(string)), filepath.Join(projectDir, ".agents", "sai.yaml"); got != want {
+		t.Fatalf("server config_path = %q, want %q", got, want)
+	}
+	if got := info["addr"]; got != addr {
+		t.Fatalf("server addr = %#v, want %q", got, addr)
+	}
+	if got := info["session_count"]; got != float64(0) {
+		t.Fatalf("session_count = %#v, want 0", got)
+	}
+	if got := info["running_turns"]; got != float64(0) {
+		t.Fatalf("running_turns = %#v, want 0", got)
+	}
+
+	postCLIServerShutdown(t, addr)
+	if code := waitForCode(t, done); code != 0 {
+		t.Fatalf("server command code = %d, stderr = %s", code, stderr.String())
+	}
+}
+
+func TestServerCommandResolvesRelativeConfigFromCWD(t *testing.T) {
+	baseDir := t.TempDir()
+	projectDir := filepath.Join(baseDir, "project")
+	writeCLIFixtureInDir(t, filepath.Join(projectDir, "config"))
+
+	addr, done, stderr, cleanup := startCLIServerCommandForTest(t, []string{"server", "--cwd", "project", "--config", filepath.Join("config", "sai.yaml"), "--port", "0"}, func() (string, error) {
+		return baseDir, nil
+	})
+	defer cleanup()
+
+	info := getCLIServerJSON(t, "http://"+addr+"/server")
+	if got, want := filepath.Clean(info["cwd"].(string)), filepath.Clean(projectDir); got != want {
+		t.Fatalf("server cwd = %q, want %q", got, want)
+	}
+	if got, want := filepath.Clean(info["config_path"].(string)), filepath.Join(projectDir, "config", "sai.yaml"); got != want {
+		t.Fatalf("server config_path = %q, want %q", got, want)
+	}
+
+	postCLIServerShutdown(t, addr)
+	if code := waitForCode(t, done); code != 0 {
+		t.Fatalf("server command code = %d, stderr = %s", code, stderr.String())
+	}
+}
+
+func TestServerCommandRejectsNonLoopbackListenWithoutLoadingConfig(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	code := RunWithGetwd([]string{"server", "--listen", "0.0.0.0:0"}, &stdout, &stderr, func() (string, error) {
+		return "", errors.New("getwd should not be called")
+	})
+
+	if code != 1 {
+		t.Fatalf("RunWithGetwd() code = %d, want 1", code)
+	}
+	if stdout.String() != "" {
+		t.Fatalf("stdout = %q, want empty", stdout.String())
+	}
+	assertCLIErrorContains(t, stderr.String(), "loopback")
+}
+
+func TestServerCommandRejectsNegativePortWithoutLoadingConfig(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	code := RunWithGetwd([]string{"server", "--port", "-1"}, &stdout, &stderr, func() (string, error) {
+		return "", errors.New("getwd should not be called")
+	})
+
+	if code != 1 {
+		t.Fatalf("RunWithGetwd() code = %d, want 1", code)
+	}
+	if stdout.String() != "" {
+		t.Fatalf("stdout = %q, want empty", stdout.String())
+	}
+	assertCLIErrorContains(t, stderr.String(), "--port must be a number from 0 to 65535")
 }
 
 func TestVersionHelpWritesUsageWithoutConfig(t *testing.T) {
@@ -8717,6 +8815,86 @@ func waitForCode(t *testing.T, ch <-chan int) int {
 		t.Fatal("timed out waiting for chat to finish")
 	}
 	return -1
+}
+
+func startCLIServerCommandForTest(t *testing.T, args []string, getwd func() (string, error)) (string, <-chan int, *bytes.Buffer, func()) {
+	t.Helper()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	stdoutReader, stdoutWriter := io.Pipe()
+	stderr := &bytes.Buffer{}
+	done := make(chan int, 1)
+	go func() {
+		done <- RunWithContext(ctx, args, strings.NewReader(""), stdoutWriter, stderr, getwd)
+		_ = stdoutWriter.Close()
+	}()
+
+	lineCh := make(chan string, 1)
+	go func() {
+		line, err := bufio.NewReader(stdoutReader).ReadString('\n')
+		if err != nil {
+			lineCh <- "ERROR\t" + err.Error()
+			return
+		}
+		lineCh <- strings.TrimRight(line, "\r\n")
+	}()
+
+	var line string
+	select {
+	case line = <-lineCh:
+	case code := <-done:
+		cancel()
+		t.Fatalf("server command exited before printing address: code = %d, stderr = %s", code, stderr.String())
+	case <-time.After(2 * time.Second):
+		cancel()
+		t.Fatalf("timed out waiting for SERVER_ADDR, stderr = %s", stderr.String())
+	}
+	addr, ok := strings.CutPrefix(line, "SERVER_ADDR\t")
+	if !ok || strings.TrimSpace(addr) == "" {
+		cancel()
+		t.Fatalf("server stdout line = %q, want SERVER_ADDR line; stderr = %s", line, stderr.String())
+	}
+
+	cleanup := func() {
+		cancel()
+		_ = stdoutReader.Close()
+		_ = stdoutWriter.Close()
+	}
+	return addr, done, stderr, cleanup
+}
+
+func getCLIServerJSON(t *testing.T, url string) map[string]any {
+	t.Helper()
+
+	client := http.Client{Timeout: 2 * time.Second}
+	resp, err := client.Get(url)
+	if err != nil {
+		t.Fatalf("Get(%s) error = %v", url, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("Get(%s) status = %d, want 200", url, resp.StatusCode)
+	}
+
+	var body map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("Decode(%s) error = %v", url, err)
+	}
+	return body
+}
+
+func postCLIServerShutdown(t *testing.T, addr string) {
+	t.Helper()
+
+	client := http.Client{Timeout: 2 * time.Second}
+	resp, err := client.Post("http://"+addr+"/server/shutdown", "application/json", nil)
+	if err != nil {
+		t.Fatalf("Post(shutdown) error = %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("Post(shutdown) status = %d, want 200", resp.StatusCode)
+	}
 }
 
 func writeCLIRunFixtureInDir(t *testing.T, dir, baseURL, apiKey, modelType string) {
