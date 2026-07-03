@@ -171,6 +171,23 @@ func execute(ctx context.Context, program string, args []string, stdin io.Reader
 		return doctorCommand(rootArgs.commandArgs, rootArgs.configPath, stdout, getwd, program)
 	case "server":
 		return serverCommand(ctx, rootArgs.commandArgs, rootArgs.configPath, stdout, getwd, program)
+	case "status":
+		return statusCommand(ctx, rootArgs.commandArgs, stdout, getwd)
+	case "stop":
+		return stopCommand(ctx, rootArgs.commandArgs, stdout, getwd)
+	case "servers":
+		subcommand, subArgs, groupHelp, err := splitSubcommandArgs(rootArgs.commandArgs, nil, "sai help servers")
+		if err != nil {
+			return err
+		}
+		if subcommand == "" && groupHelp {
+			printServersUsage(stdout)
+			return nil
+		}
+		if subcommand != "list" {
+			return usageError("usage: sai servers list", "", "sai help servers list")
+		}
+		return serversListCommand(ctx, subArgs, stdout)
 	case "auth":
 		return authCommand(ctx, rootArgs.commandArgs, rootArgs.configPath, stdout, getwd, program)
 	case "tools":
@@ -254,6 +271,9 @@ const rootUsageText = `usage: sai [--config file] [command] [args]
 Commands:
   chat              Start a chat session
   server            Start a local HTTP server
+  status            Show nearest server status
+  stop              Stop nearest server
+  servers list      List registered local servers
   config show        Print resolved config with secrets redacted
   models list        List configured provider model profiles
   auth               Manage provider authentication
@@ -281,6 +301,13 @@ including prompts, assistant output, assistant tool calls, and tool results.
 const resumableSessionSaveNoticeText = "sai: resumable sessions enabled; full prompts, assistant output, and tool results will be saved to the session file."
 
 const subagentCompletionExitWait = 250 * time.Millisecond
+
+const (
+	serverClientTimeout     = 500 * time.Millisecond
+	serverStopPollInterval  = 50 * time.Millisecond
+	serverStopWaitTimeout   = 2 * time.Second
+	serverListHealthTimeout = 300 * time.Millisecond
+)
 
 const versionUsageText = `usage: sai version
 
@@ -325,6 +352,33 @@ const serverUsageText = `usage: sai server [--cwd path] [--config file] [--port 
 
 Starts a foreground loopback HTTP server and blocks until it shuts down. The
 default listener is 127.0.0.1:0, which asks the OS to choose a free port.
+`
+
+const statusUsageText = `usage: sai status [--cwd path]
+
+Discovers the nearest healthy local server from the current directory, or from
+--cwd when provided, and prints server status.
+`
+
+const stopUsageText = `usage: sai stop [--cwd path]
+
+Discovers the nearest local server from the current directory, or from --cwd
+when provided, asks it to shut down, and removes its registry record. Sessions,
+logs, and blobs are not deleted.
+`
+
+const serversUsageText = `usage: sai servers <command>
+
+Commands:
+  servers list       List registered local servers
+
+Run "sai help servers list" for command usage.
+`
+
+const serversListUsageText = `usage: sai servers list
+
+Lists healthy local server registry records. Stale records are removed while
+listing.
 `
 
 const authUsageText = `usage: sai auth <command>
@@ -432,6 +486,14 @@ func helpCommand(args []string, stdout io.Writer) error {
 		printDoctorUsage(stdout)
 	case "server":
 		printServerUsage(stdout)
+	case "status":
+		printStatusUsage(stdout)
+	case "stop":
+		printStopUsage(stdout)
+	case "servers":
+		printServersUsage(stdout)
+	case "servers list":
+		printServersListUsage(stdout)
 	case "auth":
 		printAuthUsage(stdout)
 	case "auth codex":
@@ -496,6 +558,22 @@ func printDoctorUsage(stdout io.Writer) {
 
 func printServerUsage(stdout io.Writer) {
 	fmt.Fprint(stdout, serverUsageText)
+}
+
+func printStatusUsage(stdout io.Writer) {
+	fmt.Fprint(stdout, statusUsageText)
+}
+
+func printStopUsage(stdout io.Writer) {
+	fmt.Fprint(stdout, stopUsageText)
+}
+
+func printServersUsage(stdout io.Writer) {
+	fmt.Fprint(stdout, serversUsageText)
+}
+
+func printServersListUsage(stdout io.Writer) {
+	fmt.Fprint(stdout, serversListUsageText)
 }
 
 func printAuthUsage(stdout io.Writer) {
@@ -1003,6 +1081,178 @@ func serverConfigPath(configPath, cwd string) string {
 		return configPath
 	}
 	return filepath.Join(cwd, configPath)
+}
+
+func statusCommand(ctx context.Context, args []string, stdout io.Writer, getwd func() (string, error)) error {
+	flags := flag.NewFlagSet("sai status", flag.ContinueOnError)
+	cwdFlag := flags.String("cwd", "", "discovery working directory")
+	positionals, done, err := parseCommandFlagArgs(flags, args, stdout, printStatusUsage, "sai help status")
+	if done || err != nil {
+		return err
+	}
+	if len(positionals) != 0 {
+		return usageError("usage: sai status [--cwd path]", "", "sai help status")
+	}
+
+	cwd, err := resolveClientCWD(*cwdFlag, getwd)
+	if err != nil {
+		return err
+	}
+	store := localserver.NewRegistryStore("")
+	discovery, err := localserver.DiscoverHealthy(ctx, store, cwd, serverClientTimeout)
+	if err != nil {
+		return err
+	}
+	if !discovery.Found {
+		return noServerFoundError(cwd)
+	}
+
+	status, err := localserver.GetServerStatus(ctx, discovery.Record.Addr, serverClientTimeout)
+	if err != nil {
+		return err
+	}
+	return printServerStatus(stdout, status)
+}
+
+func stopCommand(ctx context.Context, args []string, stdout io.Writer, getwd func() (string, error)) error {
+	flags := flag.NewFlagSet("sai stop", flag.ContinueOnError)
+	cwdFlag := flags.String("cwd", "", "discovery working directory")
+	positionals, done, err := parseCommandFlagArgs(flags, args, stdout, printStopUsage, "sai help stop")
+	if done || err != nil {
+		return err
+	}
+	if len(positionals) != 0 {
+		return usageError("usage: sai stop [--cwd path]", "", "sai help stop")
+	}
+
+	cwd, err := resolveClientCWD(*cwdFlag, getwd)
+	if err != nil {
+		return err
+	}
+	store := localserver.NewRegistryStore("")
+	discovery, err := localserver.DiscoverHealthy(ctx, store, cwd, serverClientTimeout)
+	if err != nil {
+		return err
+	}
+	if !discovery.Found {
+		if discovery.StaleRemoved > 0 {
+			_, err := fmt.Fprintf(stdout, "SERVER_STOPPED\tstale_records_removed=%d\n", discovery.StaleRemoved)
+			return err
+		}
+		return noServerFoundError(cwd)
+	}
+
+	record := discovery.Record
+	if err := localserver.ShutdownServer(ctx, record.Addr, serverClientTimeout); err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
+		if healthErr := localserver.CheckHealth(ctx, record.Addr, serverClientTimeout); healthErr != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return ctxErr
+			}
+			if _, removeErr := store.RemoveIdentity(record.Identity()); removeErr != nil {
+				return removeErr
+			}
+			_, writeErr := fmt.Fprintf(stdout, "SERVER_STOPPED\taddr=%s\tpid=%d\n", record.Addr, record.PID)
+			return writeErr
+		}
+		return err
+	}
+	if err := waitForServerStop(ctx, record.Addr); err != nil {
+		return err
+	}
+	if _, err := store.RemoveIdentity(record.Identity()); err != nil {
+		return err
+	}
+	_, err = fmt.Fprintf(stdout, "SERVER_STOPPED\taddr=%s\tpid=%d\n", record.Addr, record.PID)
+	return err
+}
+
+func serversListCommand(ctx context.Context, args []string, stdout io.Writer) error {
+	flags := flag.NewFlagSet("sai servers list", flag.ContinueOnError)
+	positionals, done, err := parseCommandFlagArgs(flags, args, stdout, printServersListUsage, "sai help servers list")
+	if done || err != nil {
+		return err
+	}
+	if len(positionals) != 0 {
+		return usageError("usage: sai servers list", "", "sai help servers list")
+	}
+
+	store := localserver.NewRegistryStore("")
+	records, err := store.List()
+	if err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintln(stdout, "cwd\tconfig_path\taddr\tpid\tversion\thealth"); err != nil {
+		return err
+	}
+
+	stale := make([]localserver.RegistryIdentity, 0)
+	for i, record := range records {
+		normalized, err := localserver.CanonicalizeRegistryRecord(record)
+		if err != nil {
+			return fmt.Errorf("canonicalize registry record %d: %w", i, err)
+		}
+		if err := localserver.CheckHealth(ctx, normalized.Addr, serverListHealthTimeout); err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return ctxErr
+			}
+			stale = append(stale, normalized.Identity())
+			continue
+		}
+		if _, err := fmt.Fprintf(stdout, "%s\t%s\t%s\t%d\t%s\thealthy\n", normalized.CWD, normalized.ConfigPath, normalized.Addr, normalized.PID, normalized.Version); err != nil {
+			return err
+		}
+	}
+	for _, identity := range stale {
+		if _, err := store.RemoveIdentity(identity); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func resolveClientCWD(cwdFlag string, getwd func() (string, error)) (string, error) {
+	cwd, err := resolveServerCWD(cwdFlag, getwd)
+	if err != nil {
+		return "", err
+	}
+	return localserver.CanonicalPath(cwd)
+}
+
+func noServerFoundError(cwd string) error {
+	return fmt.Errorf("no healthy sai server found from %s; start one with \"sai server --cwd %s\"", cwd, cwd)
+}
+
+func printServerStatus(stdout io.Writer, status localserver.ServerStatus) error {
+	if _, err := fmt.Fprintln(stdout, "cwd\tconfig_path\taddr\tpid\tversion\tsession_count\trunning_turns\tuptime_seconds"); err != nil {
+		return err
+	}
+	_, err := fmt.Fprintf(stdout, "%s\t%s\t%s\t%d\t%s\t%d\t%d\t%d\n", status.CWD, status.ConfigPath, status.Addr, status.PID, status.Version, status.SessionCount, status.RunningTurns, status.UptimeSeconds)
+	return err
+}
+
+func waitForServerStop(ctx context.Context, addr string) error {
+	deadline := time.Now().Add(serverStopWaitTimeout)
+	for {
+		if err := localserver.CheckHealth(ctx, addr, serverClientTimeout); err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return ctxErr
+			}
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("server at %s did not stop within %s", addr, serverStopWaitTimeout)
+		}
+		timer := time.NewTimer(serverStopPollInterval)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
 }
 
 func authCommand(ctx context.Context, args []string, configPath string, stdout io.Writer, getwd func() (string, error), program string) error {

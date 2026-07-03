@@ -985,7 +985,7 @@ func TestRootHelpWritesUsageWithoutConfig(t *testing.T) {
 				t.Fatalf("RunWithGetwd(%v) code = %d, stderr = %s", args, code, stderr.String())
 			}
 			out := stdout.String()
-			for _, want := range []string{"usage: sai", "chat              Start a chat session", "server            Start a local HTTP server", "config show", "models list", "doctor", "tools list", "sessions", "With no command, sai defaults to chat.", `Run "sai help <command>" for command usage.`} {
+			for _, want := range []string{"usage: sai", "chat              Start a chat session", "server            Start a local HTTP server", "status            Show nearest server status", "stop              Stop nearest server", "servers list", "config show", "models list", "doctor", "tools list", "sessions", "With no command, sai defaults to chat.", `Run "sai help <command>" for command usage.`} {
 				if !strings.Contains(out, want) {
 					t.Fatalf("stdout = %q, want contain %q", out, want)
 				}
@@ -1062,6 +1062,26 @@ func TestServerHelpWritesUsageWithoutConfig(t *testing.T) {
 	} {
 		t.Run(strings.Join(args, " "), func(t *testing.T) {
 			assertCLIHelpWithoutConfig(t, args, "usage: sai server", "--cwd path", "--port N | --listen host:port")
+		})
+	}
+}
+
+func TestLifecycleHelpWritesUsageWithoutConfig(t *testing.T) {
+	for _, tt := range []struct {
+		args  []string
+		wants []string
+	}{
+		{args: []string{"status", "-h"}, wants: []string{"usage: sai status", "--cwd path"}},
+		{args: []string{"help", "status"}, wants: []string{"usage: sai status", "--cwd path"}},
+		{args: []string{"stop", "-h"}, wants: []string{"usage: sai stop", "--cwd path", "not deleted"}},
+		{args: []string{"help", "stop"}, wants: []string{"usage: sai stop", "--cwd path", "not deleted"}},
+		{args: []string{"servers", "-h"}, wants: []string{"usage: sai servers <command>", "servers list"}},
+		{args: []string{"help", "servers"}, wants: []string{"usage: sai servers <command>", "servers list"}},
+		{args: []string{"servers", "list", "-h"}, wants: []string{"usage: sai servers list", "Stale records are removed"}},
+		{args: []string{"help", "servers", "list"}, wants: []string{"usage: sai servers list", "Stale records are removed"}},
+	} {
+		t.Run(strings.Join(tt.args, " "), func(t *testing.T) {
+			assertCLIHelpWithoutConfig(t, tt.args, tt.wants...)
 		})
 	}
 }
@@ -1367,6 +1387,232 @@ func TestServerCommandRejectsNegativePortWithoutLoadingConfig(t *testing.T) {
 		t.Fatalf("stdout = %q, want empty", stdout.String())
 	}
 	assertCLIErrorContains(t, stderr.String(), "--port must be a number from 0 to 65535")
+}
+
+func TestStatusDiscoversParentServerFromChildCWD(t *testing.T) {
+	isolateCLIUserRegistry(t)
+	projectDir := t.TempDir()
+	childDir := filepath.Join(projectDir, "internal", "cli")
+	if err := os.MkdirAll(childDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll(child) error = %v", err)
+	}
+	writeCLIFixtureInDir(t, filepath.Join(projectDir, ".agents"))
+
+	addr, done, serverStderr, cleanup := startCLIServerCommandForTest(t, []string{"server", "--port", "0"}, func() (string, error) {
+		return projectDir, nil
+	})
+	defer cleanup()
+
+	var stdout, stderr bytes.Buffer
+	code := RunWithGetwd([]string{"--cwd", childDir, "status"}, &stdout, &stderr, func() (string, error) {
+		return "", errors.New("getwd should not be called")
+	})
+	if code != 0 {
+		t.Fatalf("status code = %d, stderr = %s", code, stderr.String())
+	}
+	if stderr.String() != "" {
+		t.Fatalf("status stderr = %q, want empty", stderr.String())
+	}
+	lines := strings.Split(strings.TrimSpace(stdout.String()), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("status output lines = %#v, want header and one row", lines)
+	}
+	if got, want := lines[0], "cwd\tconfig_path\taddr\tpid\tversion\tsession_count\trunning_turns\tuptime_seconds"; got != want {
+		t.Fatalf("status header = %q, want %q", got, want)
+	}
+	fields := strings.Split(lines[1], "\t")
+	if len(fields) != 8 {
+		t.Fatalf("status row fields = %#v, want 8 fields", fields)
+	}
+	if got, want := filepath.Clean(fields[0]), filepath.Clean(projectDir); got != want {
+		t.Fatalf("status cwd = %q, want %q", got, want)
+	}
+	if got, want := filepath.Clean(fields[1]), filepath.Join(projectDir, ".agents", "sai.yaml"); got != want {
+		t.Fatalf("status config_path = %q, want %q", got, want)
+	}
+	if fields[2] != addr || fields[4] != Version || fields[5] != "0" || fields[6] != "0" {
+		t.Fatalf("status row = %#v, want addr/version/counts", fields)
+	}
+
+	postCLIServerShutdown(t, addr)
+	if code := waitForCode(t, done); code != 0 {
+		t.Fatalf("server command code = %d, stderr = %s", code, serverStderr.String())
+	}
+}
+
+func TestStatusNoServerHint(t *testing.T) {
+	isolateCLIUserRegistry(t)
+	projectDir := t.TempDir()
+
+	var stdout, stderr bytes.Buffer
+	code := RunWithGetwd([]string{"status"}, &stdout, &stderr, func() (string, error) {
+		return projectDir, nil
+	})
+	if code != 1 {
+		t.Fatalf("status code = %d, want 1", code)
+	}
+	if stdout.String() != "" {
+		t.Fatalf("stdout = %q, want empty", stdout.String())
+	}
+	assertCLIErrorContains(t, stderr.String(), "no healthy sai server found", "sai server --cwd")
+}
+
+func TestStopWithCWDStopsServerCleansRegistryAndKeepsData(t *testing.T) {
+	registryPath := isolateCLIUserRegistry(t)
+	projectDir := t.TempDir()
+	childDir := filepath.Join(projectDir, "internal", "cli")
+	if err := os.MkdirAll(childDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll(child) error = %v", err)
+	}
+	writeCLIFixtureInDir(t, filepath.Join(projectDir, ".agents"))
+	dataFiles := []string{
+		filepath.Join(projectDir, ".agents", "sessions", "keep.txt"),
+		filepath.Join(projectDir, ".agents", "logs", "keep.txt"),
+		filepath.Join(projectDir, ".agents", "blobs", "keep.txt"),
+	}
+	for _, path := range dataFiles {
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatalf("MkdirAll(%q) error = %v", filepath.Dir(path), err)
+		}
+		writeCLIFile(t, path, "keep")
+	}
+
+	addr, done, serverStderr, cleanup := startCLIServerCommandForTest(t, []string{"server", "--port", "0"}, func() (string, error) {
+		return projectDir, nil
+	})
+	defer cleanup()
+
+	var stdout, stderr bytes.Buffer
+	code := RunWithGetwd([]string{"stop", "--cwd", childDir}, &stdout, &stderr, func() (string, error) {
+		return "", errors.New("getwd should not be called")
+	})
+	if code != 0 {
+		t.Fatalf("stop code = %d, stderr = %s", code, stderr.String())
+	}
+	if stderr.String() != "" {
+		t.Fatalf("stop stderr = %q, want empty", stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "SERVER_STOPPED") || !strings.Contains(stdout.String(), "addr="+addr) {
+		t.Fatalf("stop stdout = %q, want stopped addr", stdout.String())
+	}
+	if code := waitForCode(t, done); code != 0 {
+		t.Fatalf("server command code = %d, stderr = %s", code, serverStderr.String())
+	}
+	records, err := localserver.NewRegistryStore(registryPath).List()
+	if err != nil {
+		t.Fatalf("registry List() error = %v", err)
+	}
+	if len(records) != 0 {
+		t.Fatalf("registry records after stop = %#v, want empty", records)
+	}
+	for _, path := range dataFiles {
+		if data, err := os.ReadFile(path); err != nil || string(data) != "keep" {
+			t.Fatalf("data file %q after stop = %q, err = %v; want keep", path, data, err)
+		}
+	}
+}
+
+func TestStopCleansStaleRegistryRecord(t *testing.T) {
+	registryPath := isolateCLIUserRegistry(t)
+	projectDir := t.TempDir()
+	store := localserver.NewRegistryStore(registryPath)
+	stale := localserver.RegistryRecord{
+		CWD:             projectDir,
+		ConfigPath:      filepath.Join(projectDir, ".agents", "sai.yaml"),
+		Addr:            "127.0.0.1:0",
+		PID:             999999,
+		Token:           "stale-token",
+		StartedAt:       time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC),
+		Version:         "stale-version",
+		RequestedListen: "127.0.0.1:0",
+	}
+	if err := store.Upsert(stale); err != nil {
+		t.Fatalf("Upsert(stale) error = %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := RunWithGetwd([]string{"stop"}, &stdout, &stderr, func() (string, error) {
+		return projectDir, nil
+	})
+	if code != 0 {
+		t.Fatalf("stop stale code = %d, stderr = %s", code, stderr.String())
+	}
+	if stderr.String() != "" {
+		t.Fatalf("stop stale stderr = %q, want empty", stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "SERVER_STOPPED\tstale_records_removed=1") {
+		t.Fatalf("stop stale stdout = %q, want stale cleanup", stdout.String())
+	}
+	records, err := store.List()
+	if err != nil {
+		t.Fatalf("registry List() error = %v", err)
+	}
+	if len(records) != 0 {
+		t.Fatalf("registry records after stale stop = %#v, want empty", records)
+	}
+}
+
+func TestServersListShowsHealthyAndRemovesStale(t *testing.T) {
+	registryPath := isolateCLIUserRegistry(t)
+	projectDir := t.TempDir()
+	staleDir := filepath.Join(t.TempDir(), "stale")
+	writeCLIFixtureInDir(t, filepath.Join(projectDir, ".agents"))
+
+	addr, done, serverStderr, cleanup := startCLIServerCommandForTest(t, []string{"server", "--port", "0"}, func() (string, error) {
+		return projectDir, nil
+	})
+	defer cleanup()
+
+	store := localserver.NewRegistryStore(registryPath)
+	stale := localserver.RegistryRecord{
+		CWD:             staleDir,
+		ConfigPath:      filepath.Join(staleDir, ".agents", "sai.yaml"),
+		Addr:            "127.0.0.1:0",
+		PID:             999999,
+		Token:           "stale-token",
+		StartedAt:       time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC),
+		Version:         "stale-version",
+		RequestedListen: "127.0.0.1:0",
+	}
+	if err := store.Upsert(stale); err != nil {
+		t.Fatalf("Upsert(stale) error = %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := RunWithGetwd([]string{"servers", "list"}, &stdout, &stderr, func() (string, error) {
+		return "", errors.New("getwd should not be called")
+	})
+	if code != 0 {
+		t.Fatalf("servers list code = %d, stderr = %s", code, stderr.String())
+	}
+	if stderr.String() != "" {
+		t.Fatalf("servers list stderr = %q, want empty", stderr.String())
+	}
+	out := stdout.String()
+	for _, want := range []string{
+		"cwd\tconfig_path\taddr\tpid\tversion\thealth",
+		filepath.Clean(projectDir) + "\t" + filepath.Join(projectDir, ".agents", "sai.yaml") + "\t" + addr,
+		"\thealthy",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("servers list output missing %q:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, staleDir) || strings.Contains(out, "stale-version") {
+		t.Fatalf("servers list output included stale record:\n%s", out)
+	}
+	records, err := store.List()
+	if err != nil {
+		t.Fatalf("registry List() error = %v", err)
+	}
+	if len(records) != 1 || records[0].Addr != addr {
+		t.Fatalf("registry after servers list = %#v, want healthy record only", records)
+	}
+
+	postCLIServerShutdown(t, addr)
+	if code := waitForCode(t, done); code != 0 {
+		t.Fatalf("server command code = %d, stderr = %s", code, serverStderr.String())
+	}
 }
 
 func TestVersionHelpWritesUsageWithoutConfig(t *testing.T) {

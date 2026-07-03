@@ -35,10 +35,10 @@ future work and should not be required by any slice here.
 - [ ] Registry model: create the per-user registry with canonical cwd,
   config path, addr, pid, random token, started_at, version, current-user file
   permissions, duplicate-start handling, and stale-record cleanup.
-- [ ] Discovery model: implement upward discovery from current cwd or `--cwd`,
+- [x] Discovery model: implement upward discovery from current cwd or `--cwd`,
   health-check each candidate, ignore stale entries, and prefer the nearest
   healthy server.
-- [ ] CLI lifecycle commands: implement `sai status`, `sai stop`,
+- [x] CLI lifecycle commands: implement `sai status`, `sai stop`,
   `sai stop --cwd`, and `sai servers list` through registry discovery and server
   API calls.
 - [ ] Session metadata API: implement `GET /sessions`, `POST /sessions`, and

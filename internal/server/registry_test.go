@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -255,6 +256,70 @@ func TestNearestAncestorRecord(t *testing.T) {
 	}
 }
 
+func TestDiscoverHealthyRemovesNearestStaleAndReturnsParent(t *testing.T) {
+	root := t.TempDir()
+	project := filepath.Join(root, "project")
+	child := filepath.Join(project, "internal", "cli")
+	if err := os.MkdirAll(child, 0o755); err != nil {
+		t.Fatalf("MkdirAll(child) error = %v", err)
+	}
+
+	process, err := Start(Options{
+		CWD:        root,
+		ConfigPath: filepath.Join(root, ".agents", "sai.yaml"),
+		Listen:     "127.0.0.1:0",
+		Version:    "test-version",
+	})
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	serveDone := make(chan error, 1)
+	go func() {
+		serveDone <- process.Serve(context.Background())
+	}()
+	defer func() {
+		_ = process.Shutdown(context.Background())
+		select {
+		case err := <-serveDone:
+			if err != nil {
+				t.Fatalf("Serve() error = %v", err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("Serve() did not stop")
+		}
+	}()
+	waitForHealthyServer(t, process.Addr())
+
+	store := NewRegistryStore(filepath.Join(t.TempDir(), "servers.json"))
+	rootRecord := testRegistryRecord(root, filepath.Join(root, ".agents", "sai.yaml"), process.Addr(), os.Getpid(), "root")
+	projectRecord := testRegistryRecord(project, filepath.Join(project, ".agents", "sai.yaml"), "127.0.0.1:0", 999999, "stale")
+	if err := store.Save([]RegistryRecord{rootRecord, projectRecord}); err != nil {
+		t.Fatalf("Save() error = %v", err)
+	}
+
+	result, err := DiscoverHealthy(context.Background(), store, child, 100*time.Millisecond)
+	if err != nil {
+		t.Fatalf("DiscoverHealthy() error = %v", err)
+	}
+	if !result.Found {
+		t.Fatal("DiscoverHealthy() found = false, want true")
+	}
+	if result.Record.Token != "root" {
+		t.Fatalf("DiscoverHealthy() record = %#v, want root server", result.Record)
+	}
+	if result.StaleRemoved != 1 {
+		t.Fatalf("DiscoverHealthy() StaleRemoved = %d, want 1", result.StaleRemoved)
+	}
+
+	records, err := store.List()
+	if err != nil {
+		t.Fatalf("List() error = %v", err)
+	}
+	if len(records) != 1 || records[0].Token != "root" {
+		t.Fatalf("registry records after discovery = %#v, want root only", records)
+	}
+}
+
 func testRegistryRecord(cwd, configPath, addr string, pid int, token string) RegistryRecord {
 	return RegistryRecord{
 		CWD:        cwd,
@@ -264,6 +329,21 @@ func testRegistryRecord(cwd, configPath, addr string, pid int, token string) Reg
 		Token:      token,
 		StartedAt:  time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC),
 		Version:    "test-version",
+	}
+}
+
+func waitForHealthyServer(t *testing.T, addr string) {
+	t.Helper()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if err := CheckHealth(context.Background(), addr, 100*time.Millisecond); err == nil {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("server %s did not become healthy", addr)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 
