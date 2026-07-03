@@ -401,9 +401,9 @@
 - [x] parent idle 时 child completion 可触发 auto wakeup。
 - [x] `prompt.system_prompt` 作为未来 schema 追加到内置约束之后，不替换内置约束。
 - [x] prompt placeholders 使用固定白名单，并拒绝未知占位符。
-- [ ] 为未来 DAG/workflow orchestration 保留边界，但 M19 不实现完整编排。
-- [ ] 为未来 shared state / blackboard 保留边界。
-- [ ] 为未来 structured result protocol 保留边界。
-- [ ] 为未来 global budgets、permissions 和 conflict arbitration 保留边界。
-- [ ] 为未来 observability、persistence/resume 保留边界。
-- [ ] 添加配置解析、prompt 注入、job lifecycle、mailbox delivery 和 safeguard 测试。
+- [x] 为未来 DAG/workflow orchestration 保留边界，但 M19 不实现完整编排。
+- [x] 为未来 shared state / blackboard 保留边界。
+- [x] 为未来 structured result protocol 保留边界。
+- [x] 为未来 global budgets、permissions 和 conflict arbitration 保留边界。
+- [x] 为未来 observability、persistence/resume 保留边界。
+- [x] 添加配置解析、prompt 注入、job lifecycle、mailbox delivery 和 safeguard 测试。
