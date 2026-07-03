@@ -1,0 +1,395 @@
+package server
+
+import (
+	"crypto/rand"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"time"
+)
+
+const (
+	defaultRegistryDirName  = "sai"
+	defaultRegistryFileName = "servers.json"
+	registryTokenBytes      = 32
+)
+
+// RegistryRecord describes one locally running server in the per-user registry.
+type RegistryRecord struct {
+	CWD             string    `json:"cwd"`
+	ConfigPath      string    `json:"config_path"`
+	Addr            string    `json:"addr"`
+	PID             int       `json:"pid"`
+	Token           string    `json:"token"`
+	StartedAt       time.Time `json:"started_at"`
+	Version         string    `json:"version"`
+	RequestedListen string    `json:"requested_listen,omitempty"`
+}
+
+// RegistryIdentity is the canonical cwd + config path pair for one server.
+type RegistryIdentity struct {
+	CWD        string
+	ConfigPath string
+}
+
+// RegistryStore reads and writes the local server registry file.
+type RegistryStore struct {
+	Path string
+}
+
+// NewRegistryStore returns a registry store. An empty path uses DefaultRegistryPath.
+func NewRegistryStore(path string) RegistryStore {
+	return RegistryStore{Path: path}
+}
+
+// DefaultRegistryPath returns the per-user server registry file path.
+func DefaultRegistryPath() (string, error) {
+	dir, err := os.UserConfigDir()
+	if err != nil {
+		return "", fmt.Errorf("find user config dir: %w", err)
+	}
+	return filepath.Join(dir, defaultRegistryDirName, defaultRegistryFileName), nil
+}
+
+// RegistryPath returns the store path, applying the default when Path is empty.
+func (s RegistryStore) RegistryPath() (string, error) {
+	if strings.TrimSpace(s.Path) == "" {
+		return DefaultRegistryPath()
+	}
+	return CanonicalPath(s.Path)
+}
+
+// CanonicalPath returns an absolute, clean path without resolving symlinks.
+func CanonicalPath(path string) (string, error) {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return "", fmt.Errorf("path is required")
+	}
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return "", fmt.Errorf("resolve path %q: %w", path, err)
+	}
+	return filepath.Clean(abs), nil
+}
+
+// NewRegistryIdentity canonicalizes cwd and configPath into a server identity.
+func NewRegistryIdentity(cwd, configPath string) (RegistryIdentity, error) {
+	canonicalCWD, err := CanonicalPath(cwd)
+	if err != nil {
+		return RegistryIdentity{}, fmt.Errorf("canonicalize cwd: %w", err)
+	}
+	canonicalConfig, err := CanonicalPath(configPath)
+	if err != nil {
+		return RegistryIdentity{}, fmt.Errorf("canonicalize config path: %w", err)
+	}
+	return RegistryIdentity{
+		CWD:        canonicalCWD,
+		ConfigPath: canonicalConfig,
+	}, nil
+}
+
+// Identity returns the record's cwd + config path identity.
+func (r RegistryRecord) Identity() RegistryIdentity {
+	return RegistryIdentity{
+		CWD:        r.CWD,
+		ConfigPath: r.ConfigPath,
+	}
+}
+
+// Matches reports whether record has this exact canonical identity.
+func (id RegistryIdentity) Matches(record RegistryRecord) bool {
+	return sameRegistryPath(id.CWD, record.CWD) && sameRegistryPath(id.ConfigPath, record.ConfigPath)
+}
+
+// SameIdentity reports whether two normalized records describe the same server.
+func (r RegistryRecord) SameIdentity(other RegistryRecord) bool {
+	return r.Identity().Matches(other)
+}
+
+// SameRegistryIdentity reports whether two records have the same canonical identity.
+func SameRegistryIdentity(a, b RegistryRecord) (bool, error) {
+	a, err := CanonicalizeRegistryRecord(a)
+	if err != nil {
+		return false, err
+	}
+	b, err = CanonicalizeRegistryRecord(b)
+	if err != nil {
+		return false, err
+	}
+	return a.SameIdentity(b), nil
+}
+
+// CanonicalizeRegistryRecord returns a copy with canonical identity paths.
+func CanonicalizeRegistryRecord(record RegistryRecord) (RegistryRecord, error) {
+	identity, err := NewRegistryIdentity(record.CWD, record.ConfigPath)
+	if err != nil {
+		return RegistryRecord{}, err
+	}
+	record.CWD = identity.CWD
+	record.ConfigPath = identity.ConfigPath
+	record.Addr = strings.TrimSpace(record.Addr)
+	record.Token = strings.TrimSpace(record.Token)
+	record.Version = strings.TrimSpace(record.Version)
+	record.RequestedListen = strings.TrimSpace(record.RequestedListen)
+	if !record.StartedAt.IsZero() {
+		record.StartedAt = record.StartedAt.UTC()
+	}
+	return record, nil
+}
+
+// GenerateRegistryToken creates a random local bearer token for registry clients.
+func GenerateRegistryToken() (string, error) {
+	var raw [registryTokenBytes]byte
+	if _, err := rand.Read(raw[:]); err != nil {
+		return "", fmt.Errorf("generate registry token: %w", err)
+	}
+	return base64.RawURLEncoding.EncodeToString(raw[:]), nil
+}
+
+// Load reads the registry file. A missing file loads as an empty registry.
+func (s RegistryStore) Load() ([]RegistryRecord, error) {
+	path, err := s.RegistryPath()
+	if err != nil {
+		return nil, err
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return []RegistryRecord{}, nil
+		}
+		return nil, fmt.Errorf("read server registry %q: %w", path, err)
+	}
+
+	var records []RegistryRecord
+	if err := json.Unmarshal(data, &records); err != nil {
+		return nil, fmt.Errorf("parse server registry %q: %w", path, err)
+	}
+	if records == nil {
+		return []RegistryRecord{}, nil
+	}
+	return copyRegistryRecords(records), nil
+}
+
+// List returns all records in registry file order.
+func (s RegistryStore) List() ([]RegistryRecord, error) {
+	return s.Load()
+}
+
+// Save writes all records to the registry file using a temp file and rename.
+func (s RegistryStore) Save(records []RegistryRecord) error {
+	path, err := s.RegistryPath()
+	if err != nil {
+		return err
+	}
+	normalized, err := normalizeRegistryRecords(records)
+	if err != nil {
+		return err
+	}
+	if normalized == nil {
+		normalized = []RegistryRecord{}
+	}
+
+	data, err := json.MarshalIndent(normalized, "", "  ")
+	if err != nil {
+		return fmt.Errorf("encode server registry: %w", err)
+	}
+	data = append(data, '\n')
+
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return fmt.Errorf("create server registry dir: %w", err)
+	}
+	return writePrivateFileAtomic(path, data)
+}
+
+// Upsert inserts or replaces a record by canonical cwd + config path identity.
+func (s RegistryStore) Upsert(record RegistryRecord) error {
+	normalized, err := CanonicalizeRegistryRecord(record)
+	if err != nil {
+		return err
+	}
+	records, err := s.Load()
+	if err != nil {
+		return err
+	}
+
+	out := make([]RegistryRecord, 0, len(records)+1)
+	replaced := false
+	for i, existing := range records {
+		existing, err = CanonicalizeRegistryRecord(existing)
+		if err != nil {
+			return fmt.Errorf("canonicalize existing registry record %d: %w", i, err)
+		}
+		if normalized.SameIdentity(existing) {
+			if !replaced {
+				out = append(out, normalized)
+				replaced = true
+			}
+			continue
+		}
+		out = append(out, existing)
+	}
+	if !replaced {
+		out = append(out, normalized)
+	}
+	return s.Save(out)
+}
+
+// Remove deletes all records matching cwd + configPath.
+func (s RegistryStore) Remove(cwd, configPath string) (bool, error) {
+	identity, err := NewRegistryIdentity(cwd, configPath)
+	if err != nil {
+		return false, err
+	}
+	return s.RemoveIdentity(identity)
+}
+
+// RemoveIdentity deletes all records matching identity.
+func (s RegistryStore) RemoveIdentity(identity RegistryIdentity) (bool, error) {
+	records, err := s.Load()
+	if err != nil {
+		return false, err
+	}
+
+	out := make([]RegistryRecord, 0, len(records))
+	removed := false
+	for i, existing := range records {
+		existing, err = CanonicalizeRegistryRecord(existing)
+		if err != nil {
+			return false, fmt.Errorf("canonicalize existing registry record %d: %w", i, err)
+		}
+		if identity.Matches(existing) {
+			removed = true
+			continue
+		}
+		out = append(out, existing)
+	}
+	if !removed {
+		return false, nil
+	}
+	return true, s.Save(out)
+}
+
+// AncestorCWDs returns startCWD followed by each parent directory up to the root.
+func AncestorCWDs(startCWD string) ([]string, error) {
+	current, err := CanonicalPath(startCWD)
+	if err != nil {
+		return nil, err
+	}
+	ancestors := []string{current}
+	for {
+		parent := filepath.Dir(current)
+		if parent == current {
+			return ancestors, nil
+		}
+		current = parent
+		ancestors = append(ancestors, current)
+	}
+}
+
+// AncestorRecords returns records whose cwd is startCWD or one of its parents.
+func AncestorRecords(startCWD string, records []RegistryRecord) ([]RegistryRecord, error) {
+	ancestors, err := AncestorCWDs(startCWD)
+	if err != nil {
+		return nil, err
+	}
+	normalized, err := normalizeRegistryRecords(records)
+	if err != nil {
+		return nil, err
+	}
+
+	out := make([]RegistryRecord, 0, len(normalized))
+	for _, ancestor := range ancestors {
+		for _, record := range normalized {
+			if sameRegistryPath(record.CWD, ancestor) {
+				out = append(out, record)
+			}
+		}
+	}
+	return out, nil
+}
+
+// NearestAncestorRecord returns the closest record by cwd ancestry.
+func NearestAncestorRecord(startCWD string, records []RegistryRecord) (RegistryRecord, bool, error) {
+	matches, err := AncestorRecords(startCWD, records)
+	if err != nil {
+		return RegistryRecord{}, false, err
+	}
+	if len(matches) == 0 {
+		return RegistryRecord{}, false, nil
+	}
+	return matches[0], true, nil
+}
+
+func normalizeRegistryRecords(records []RegistryRecord) ([]RegistryRecord, error) {
+	if records == nil {
+		return nil, nil
+	}
+	out := make([]RegistryRecord, 0, len(records))
+	for i, record := range records {
+		normalized, err := CanonicalizeRegistryRecord(record)
+		if err != nil {
+			return nil, fmt.Errorf("canonicalize registry record %d: %w", i, err)
+		}
+		out = append(out, normalized)
+	}
+	return out, nil
+}
+
+func copyRegistryRecords(records []RegistryRecord) []RegistryRecord {
+	if records == nil {
+		return nil
+	}
+	return append([]RegistryRecord(nil), records...)
+}
+
+func sameRegistryPath(a, b string) bool {
+	if runtime.GOOS == "windows" {
+		return strings.EqualFold(a, b)
+	}
+	return a == b
+}
+
+func writePrivateFileAtomic(path string, data []byte) error {
+	dir := filepath.Dir(path)
+	temp, err := os.CreateTemp(dir, ".servers-*.tmp")
+	if err != nil {
+		return fmt.Errorf("create temporary server registry file: %w", err)
+	}
+	tempPath := temp.Name()
+	cleanup := true
+	defer func() {
+		if cleanup {
+			_ = os.Remove(tempPath)
+		}
+	}()
+
+	if err := temp.Chmod(0o600); err != nil {
+		_ = temp.Close()
+		return fmt.Errorf("chmod temporary server registry file: %w", err)
+	}
+	if _, err := temp.Write(data); err != nil {
+		_ = temp.Close()
+		return fmt.Errorf("write temporary server registry file: %w", err)
+	}
+	if err := temp.Close(); err != nil {
+		return fmt.Errorf("close temporary server registry file: %w", err)
+	}
+	if err := os.Chmod(tempPath, 0o600); err != nil {
+		return fmt.Errorf("chmod temporary server registry file: %w", err)
+	}
+
+	if err := os.Rename(tempPath, path); err != nil {
+		return fmt.Errorf("write server registry %q: %w", path, err)
+	}
+	cleanup = false
+	if err := os.Chmod(path, 0o600); err != nil {
+		return fmt.Errorf("chmod server registry %q: %w", path, err)
+	}
+	return nil
+}
