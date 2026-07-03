@@ -232,10 +232,17 @@ models:
     id: gpt-5.5
     type: openai-codex
     context_window: 400000
+    parameters:
+      store: false
+      reasoning:
+        effort: high
 ```
 
 `sai auth codex login --provider codex-work` 使用 Codex headless device flow 登录，并生成
-`providers/codex-work.yaml` 与 `auth/codex-work.json`。默认 provider 名称是 `codex`。
+`providers/codex-work.yaml` 与 `auth/codex-work.json`。生成的 `openai-codex` model profile
+默认在 `parameters` 中写入 `store: false` 和 `reasoning.effort: high`；这是普通
+Responses 请求参数透传，不新增顶层配置字段，字段名是 `effort` 而不是 `effect`。默认
+provider 名称是 `codex`。
 `--force` 可以覆盖已有的生成文件；未传 `--force` 时，只要目标 provider YAML 或 token
 JSON 已存在，命令会在开始登录前失败。多个 provider 使用多个独立 auth 文件，因此
 `codex`、`codex-work` 和 `codex-personal` 可以共存并分别刷新 token。
@@ -253,7 +260,8 @@ mapping，请求 `<base_url>/responses`。它从 `auth_file` 读取 access token
 `Authorization: Bearer <access>`；token 文件中存在 account id 时，同时发送
 `ChatGPT-Account-Id`。access token 过期时，运行时使用 refresh token 刷新并写回同一
 auth 文件。token 文件内容不会出现在 `sai config show`、verbose、日志或 HTTP 错误中。
-M16 不读取、不迁移、不导入 `~/.codex/auth.json`。
+Codex 后端请求必须显式发送 `store: false`；这是 `openai-codex` runtime/request 层要求，
+不是 API key 或 OAuth token 配置。M16 不读取、不迁移、不导入 `~/.codex/auth.json`。
 
 `api_key` 是这次 provider 配置中的具体字段。其他需要脱敏的敏感配置值也可以采用同样
 约定：字符串以 `$` 开头时，`$` 后面的内容作为环境变量名读取实际值；不以 `$` 开头时

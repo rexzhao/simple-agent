@@ -454,11 +454,18 @@ models:
     id: gpt-5.5
     type: openai-codex
     context_window: 400000
+    parameters:
+      store: false
+      reasoning:
+        effort: high
 ```
 
 `auth_file` 相对 provider YAML 文件解析，推荐指向配置根目录下的 `auth/`。`sai auth
 codex login --provider codex-work` 会生成或更新 `providers/codex-work.yaml` 和独立的
-`auth/codex-work.json`，因此 `codex`、`codex-work` 和 `codex-personal` 可以共存。token
+`auth/codex-work.json`，并在生成的 `openai-codex` model profile `parameters` 中默认写入
+`store: false` 和 `reasoning.effort: high`。这些值通过现有 Responses 参数透传，不新增
+顶层配置字段；reasoning 字段名是 `effort` 而不是 `effect`。因此 `codex`、`codex-work`
+和 `codex-personal` 可以共存。token
 文件包含 OAuth access / refresh token，属于敏感数据；`sai config show`、verbose 和日志
 不能打印其中的 token。access token 过期时运行时用 refresh token 刷新，并写回同一
 auth 文件。M16 不读取或导入 `~/.codex/auth.json`；首版登录使用 Codex headless device
@@ -468,6 +475,9 @@ verification URL / user code；如果服务没有返回 verification URL，则�
 authorization-pending 类错误响应继续按 pending 处理，直到用户批准或设备码过期；
 最后的 `/oauth/token` authorization-code exchange 继续使用 form encoding。不实现浏览器
 OAuth 回调。
+
+`openai-codex` runtime 请求 Codex 后端时必须显式发送 `store: false`。这是 request 层
+要求，不是用户 API key、`auth_file` 或 OAuth token 设置。
 
 命令行参数覆盖配置文件。`api_key` 是 provider 配置中的具体字段。对需要脱敏的敏感
 配置值，统一使用简单字符串约定：值以 `$` 开头时，`$` 后面的内容作为环境变量名读取
