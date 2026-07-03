@@ -1149,6 +1149,10 @@ func TestServerCommandStartsWithDefaultConfigAndShutdown(t *testing.T) {
 	if record.RequestedListen != "127.0.0.1:0" {
 		t.Fatalf("registry requested_listen = %q, want 127.0.0.1:0", record.RequestedListen)
 	}
+	missingDebug := getCLIServerJSONStatus(t, "http://"+addr+"/sessions/missing-session/items/item-1/content?view=debug", record.Token, http.StatusNotFound)
+	if got := missingDebug["error"].(map[string]any)["code"]; got != "session_not_found" {
+		t.Fatalf("debug content with registry token error = %#v, want session_not_found", missingDebug)
+	}
 
 	postCLIServerShutdown(t, addr)
 	if code := waitForCode(t, done); code != 0 {
@@ -9424,14 +9428,27 @@ func startCLIServerCommandForTest(t *testing.T, args []string, getwd func() (str
 func getCLIServerJSON(t *testing.T, url string) map[string]any {
 	t.Helper()
 
+	return getCLIServerJSONStatus(t, url, "", http.StatusOK)
+}
+
+func getCLIServerJSONStatus(t *testing.T, url, token string, wantStatus int) map[string]any {
+	t.Helper()
+
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		t.Fatalf("NewRequest(%s) error = %v", url, err)
+	}
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
 	client := http.Client{Timeout: 2 * time.Second}
-	resp, err := client.Get(url)
+	resp, err := client.Do(req)
 	if err != nil {
 		t.Fatalf("Get(%s) error = %v", url, err)
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("Get(%s) status = %d, want 200", url, resp.StatusCode)
+	if resp.StatusCode != wantStatus {
+		t.Fatalf("Get(%s) status = %d, want %d", url, resp.StatusCode, wantStatus)
 	}
 
 	var body map[string]any

@@ -958,11 +958,16 @@ func serverCommand(ctx context.Context, args []string, configPath string, stdout
 		return err
 	}
 
+	token, err := localserver.GenerateRegistryToken()
+	if err != nil {
+		return err
+	}
 	process, err := localserver.Start(localserver.Options{
 		CWD:             cwd,
 		ConfigPath:      configPath,
 		Listen:          listen,
 		Version:         Version,
+		AuthToken:       token,
 		SessionStore:    sessions.NewV2Store(cfg.Sessions.Dir),
 		SessionDefaults: sessionDefaults,
 	})
@@ -970,11 +975,6 @@ func serverCommand(ctx context.Context, args []string, configPath string, stdout
 		return err
 	}
 	info := process.Info()
-	token, err := localserver.GenerateRegistryToken()
-	if err != nil {
-		_ = process.Shutdown(context.Background())
-		return err
-	}
 	record := localserver.RegistryRecord{
 		CWD:             info.CWD,
 		ConfigPath:      info.ConfigPath,

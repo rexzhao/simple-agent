@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -13,6 +14,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/rexzhao/simple-agent/internal/contextwindow"
 	"github.com/rexzhao/simple-agent/internal/model"
@@ -26,6 +28,8 @@ const (
 	maxSessionItemsLimit           = 200
 	sessionItemInlineMessageBytes  = 4 * 1024
 	sessionItemPreviewMessageBytes = 240
+	defaultSessionItemContentBytes = 64 * 1024
+	maxSessionItemContentBytes     = 1024 * 1024
 
 	sessionItemsViewChat  = "chat"
 	sessionItemsViewDebug = "debug"
@@ -36,6 +40,7 @@ type Options struct {
 	ConfigPath      string
 	Listen          string
 	Version         string
+	AuthToken       string
 	Now             func() time.Time
 	SessionStore    *sessions.V2Store
 	SessionRoot     string
@@ -54,6 +59,7 @@ type Process struct {
 
 	sessionStore    *sessions.V2Store
 	sessionDefaults sessions.SessionV2
+	authToken       string
 }
 
 type Info struct {
@@ -130,6 +136,7 @@ func Start(options Options) (*Process, error) {
 		shutdownDone:    make(chan struct{}),
 		sessionStore:    options.SessionStore,
 		sessionDefaults: copySessionMetadata(options.SessionDefaults),
+		authToken:       strings.TrimSpace(options.AuthToken),
 	}
 	if process.sessionStore == nil && strings.TrimSpace(options.SessionRoot) != "" {
 		process.sessionStore = sessions.NewV2Store(options.SessionRoot)
@@ -332,6 +339,12 @@ func (p *Process) handleSessionPath(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		p.handleSessionItems(w, r, id)
+	case len(parts) == 4 && parts[1] == "items" && parts[3] == "content":
+		if r.Method != http.MethodGet {
+			writeMethodNotAllowed(w, http.MethodGet)
+			return
+		}
+		p.handleSessionItemContent(w, r, id, parts[2])
 	default:
 		writeError(w, http.StatusNotFound, "not_found", "path not found")
 	}
@@ -460,6 +473,61 @@ func (p *Process) handleSessionItems(w http.ResponseWriter, r *http.Request, id 
 	})
 }
 
+func (p *Process) handleSessionItemContent(w http.ResponseWriter, r *http.Request, id, itemID string) {
+	query, err := parseSessionItemContentQuery(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_query", err.Error())
+		return
+	}
+	if query.View == sessionItemsViewDebug && !p.hasRegistryToken(r) {
+		writeError(w, http.StatusForbidden, "permission_denied", "permission denied")
+		return
+	}
+
+	store := p.sessionStore
+	if store == nil {
+		writeError(w, http.StatusServiceUnavailable, "session_store_unavailable", "session store is not configured")
+		return
+	}
+	if !validSessionAPIID(id) {
+		writeError(w, http.StatusBadRequest, "invalid_session_id", "invalid session id")
+		return
+	}
+	if strings.TrimSpace(itemID) == "" || itemID != strings.TrimSpace(itemID) {
+		writeError(w, http.StatusNotFound, "item_not_found", "item not found")
+		return
+	}
+
+	session, err := store.Load(id)
+	if err != nil {
+		if errors.Is(err, sessions.ErrNotFound) {
+			writeError(w, http.StatusNotFound, "session_not_found", "session not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "session_store_error", "could not load session item content")
+		return
+	}
+	item, ok := findSessionItemByID(session.Items, itemID)
+	if !ok {
+		writeError(w, http.StatusNotFound, "item_not_found", "item not found")
+		return
+	}
+	if !sessionItemContentReadableInView(item, query.View) {
+		writeError(w, http.StatusNotFound, "content_unavailable", "item content is not available")
+		return
+	}
+
+	content, offset, sizeBytes, bytesReturned, hasMore := sessionItemContentRange(item.Message.Content, query.Offset, query.MaxBytes)
+	writeJSON(w, http.StatusOK, sessionItemContentResponseDTO{
+		ItemID:        item.ID,
+		Content:       content,
+		Offset:        offset,
+		SizeBytes:     sizeBytes,
+		BytesReturned: bytesReturned,
+		HasMore:       hasMore,
+	})
+}
+
 func (p *Process) snapshot() Info {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -537,11 +605,26 @@ type sessionItemMessageContentDTO struct {
 	Truncated bool   `json:"truncated,omitempty"`
 }
 
+type sessionItemContentResponseDTO struct {
+	ItemID        string `json:"item_id"`
+	Content       string `json:"content"`
+	Offset        int64  `json:"offset"`
+	SizeBytes     int    `json:"size_bytes"`
+	BytesReturned int    `json:"bytes_returned"`
+	HasMore       bool   `json:"has_more"`
+}
+
 type sessionItemsQuery struct {
 	BeforeSeq *int64
 	AfterSeq  *int64
 	Limit     int
 	View      string
+}
+
+type sessionItemContentQuery struct {
+	Offset   int64
+	MaxBytes int
+	View     string
 }
 
 func sessionDetailDTOFromSession(session sessions.SessionV2, status string) sessionDetailDTO {
@@ -609,6 +692,44 @@ func parseSessionItemsQuery(r *http.Request) (sessionItemsQuery, error) {
 	return query, nil
 }
 
+func parseSessionItemContentQuery(r *http.Request) (sessionItemContentQuery, error) {
+	values := r.URL.Query()
+	query := sessionItemContentQuery{
+		MaxBytes: defaultSessionItemContentBytes,
+		View:     sessionItemsViewChat,
+	}
+	offset, err := parseOptionalNonNegativeInt64Query(values, "offset")
+	if err != nil {
+		return sessionItemContentQuery{}, err
+	}
+	if offset != nil {
+		query.Offset = *offset
+	}
+	if rawMaxBytes, ok, err := singleQueryValue(values, "max_bytes"); err != nil {
+		return sessionItemContentQuery{}, err
+	} else if ok {
+		maxBytes, err := strconv.ParseInt(rawMaxBytes, 10, 64)
+		if err != nil || maxBytes <= 0 {
+			return sessionItemContentQuery{}, fmt.Errorf("max_bytes must be a positive integer")
+		}
+		if maxBytes > maxSessionItemContentBytes {
+			maxBytes = maxSessionItemContentBytes
+		}
+		query.MaxBytes = int(maxBytes)
+	}
+	if rawView, ok, err := singleQueryValue(values, "view"); err != nil {
+		return sessionItemContentQuery{}, err
+	} else if ok {
+		switch rawView {
+		case sessionItemsViewChat, sessionItemsViewDebug:
+			query.View = rawView
+		default:
+			return sessionItemContentQuery{}, fmt.Errorf("view must be %q or %q", sessionItemsViewChat, sessionItemsViewDebug)
+		}
+	}
+	return query, nil
+}
+
 func parseOptionalNonNegativeInt64Query(values map[string][]string, name string) (*int64, error) {
 	raw, ok, err := singleQueryValue(values, name)
 	if err != nil || !ok {
@@ -660,6 +781,34 @@ func sessionItemVisibleInView(item sessions.SessionItem, view string) bool {
 		return false
 	}
 	return item.Kind != sessions.ItemKindRuntimeContext
+}
+
+func sessionItemContentReadableInView(item sessions.SessionItem, view string) bool {
+	if item.Message == nil || item.Message.Content == "" {
+		return false
+	}
+	if view == sessionItemsViewDebug {
+		return true
+	}
+	if item.Kind != sessions.ItemKindMessage {
+		return false
+	}
+	if item.Visibility != sessions.ItemVisibilityVisible {
+		return false
+	}
+	if item.Audience != sessions.ItemAudienceUser && item.Audience != sessions.ItemAudienceModel {
+		return false
+	}
+	return item.Message.Role == model.MessageRoleUser || item.Message.Role == model.MessageRoleAssistant
+}
+
+func findSessionItemByID(items []sessions.SessionItem, id string) (sessions.SessionItem, bool) {
+	for _, item := range items {
+		if item.ID == id {
+			return item, true
+		}
+	}
+	return sessions.SessionItem{}, false
 }
 
 func paginateSessionItems(items []sessions.SessionItem, query sessionItemsQuery) ([]sessions.SessionItem, bool, bool) {
@@ -755,6 +904,29 @@ func truncateStringByBytes(value string, maxBytes int) string {
 	return value[:cut]
 }
 
+func sessionItemContentRange(value string, offset int64, maxBytes int) (string, int64, int, int, bool) {
+	sizeBytes := len(value)
+	if offset >= int64(sizeBytes) {
+		return "", int64(sizeBytes), sizeBytes, 0, false
+	}
+	start := int(offset)
+	for start < sizeBytes && !utf8.RuneStart(value[start]) {
+		start++
+	}
+	if start >= sizeBytes {
+		return "", int64(start), sizeBytes, 0, false
+	}
+	end := start + maxBytes
+	if end > sizeBytes {
+		end = sizeBytes
+	}
+	for end > start && end < sizeBytes && !utf8.RuneStart(value[end]) {
+		end--
+	}
+	content := value[start:end]
+	return content, int64(start), sizeBytes, len(content), end < sizeBytes
+}
+
 func readEmptySessionCreateRequest(w http.ResponseWriter, r *http.Request) error {
 	body := http.MaxBytesReader(w, r.Body, 1024)
 	data, err := io.ReadAll(body)
@@ -841,6 +1013,20 @@ func copyInstructionSources(sources []sessions.InstructionSource) []sessions.Ins
 		return nil
 	}
 	return append([]sessions.InstructionSource(nil), sources...)
+}
+
+func (p *Process) hasRegistryToken(r *http.Request) bool {
+	token := strings.TrimSpace(p.authToken)
+	if token == "" {
+		return false
+	}
+	auth := strings.TrimSpace(r.Header.Get("Authorization"))
+	const prefix = "Bearer "
+	if len(auth) <= len(prefix) || !strings.EqualFold(auth[:len(prefix)], prefix) {
+		return false
+	}
+	provided := strings.TrimSpace(auth[len(prefix):])
+	return subtle.ConstantTimeCompare([]byte(provided), []byte(token)) == 1
 }
 
 func writeMethodNotAllowed(w http.ResponseWriter, methods ...string) {

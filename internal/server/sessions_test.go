@@ -508,6 +508,186 @@ func TestSessionItemsMissingAndCorruptSessionErrors(t *testing.T) {
 	}
 }
 
+func TestSessionItemContentChatReadAndByteRanges(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "sessions")
+	store := sessions.NewV2Store(root)
+	saveServerTestSession(t, store, "content-session")
+	appendServerTestItem(t, store, "content-session", sessions.SessionItem{
+		ID:         "visible-user",
+		Kind:       sessions.ItemKindMessage,
+		Visibility: sessions.ItemVisibilityVisible,
+		Audience:   sessions.ItemAudienceUser,
+		Message:    &model.Message{Role: model.MessageRoleUser, Content: "hello chat"},
+	})
+	appendServerTestItem(t, store, "content-session", sessions.SessionItem{
+		ID:         "range-user",
+		Kind:       sessions.ItemKindMessage,
+		Visibility: sessions.ItemVisibilityVisible,
+		Audience:   sessions.ItemAudienceUser,
+		Message:    &model.Message{Role: model.MessageRoleUser, Content: "0123456789"},
+	})
+	largeContent := strings.Repeat("L", maxSessionItemContentBytes+10)
+	appendServerTestItem(t, store, "content-session", sessions.SessionItem{
+		ID:         "large-assistant",
+		Kind:       sessions.ItemKindMessage,
+		Visibility: sessions.ItemVisibilityVisible,
+		Audience:   sessions.ItemAudienceModel,
+		Message:    &model.Message{Role: model.MessageRoleAssistant, Content: largeContent},
+	})
+	process := startSessionAPIServer(t, store, sessions.SessionV2{})
+	baseURL := "http://" + process.Addr()
+
+	raw, body := getRawJSONStatus(t, baseURL+"/sessions/content-session/items/visible-user/content", "", http.StatusOK)
+	assertNoContentDTOLeak(t, raw)
+	if body["item_id"] != "visible-user" || body["content"] != "hello chat" {
+		t.Fatalf("content response = %#v, want visible-user hello chat", body)
+	}
+	if body["offset"] != float64(0) || body["size_bytes"] != float64(len("hello chat")) || body["bytes_returned"] != float64(len("hello chat")) || body["has_more"] != false {
+		t.Fatalf("content metadata = %#v, want full content metadata", body)
+	}
+
+	_, body = getRawJSONStatus(t, baseURL+"/sessions/content-session/items/range-user/content?offset=3&max_bytes=4", "", http.StatusOK)
+	if body["content"] != "3456" || body["offset"] != float64(3) || body["size_bytes"] != float64(10) || body["bytes_returned"] != float64(4) || body["has_more"] != true {
+		t.Fatalf("range content response = %#v, want offset 3 max 4", body)
+	}
+
+	_, body = getRawJSONStatus(t, baseURL+"/sessions/content-session/items/range-user/content?offset=8&max_bytes=100", "", http.StatusOK)
+	if body["content"] != "89" || body["offset"] != float64(8) || body["bytes_returned"] != float64(2) || body["has_more"] != false {
+		t.Fatalf("tail content response = %#v, want final bytes", body)
+	}
+
+	_, body = getRawJSONStatus(t, fmt.Sprintf("%s/sessions/content-session/items/large-assistant/content?max_bytes=%d", baseURL, maxSessionItemContentBytes+100), "", http.StatusOK)
+	if got := len(body["content"].(string)); got != maxSessionItemContentBytes {
+		t.Fatalf("max-clamped content len = %d, want %d", got, maxSessionItemContentBytes)
+	}
+	if body["bytes_returned"] != float64(maxSessionItemContentBytes) || body["size_bytes"] != float64(len(largeContent)) || body["has_more"] != true {
+		t.Fatalf("max-clamped content metadata = %#v, want clamp metadata", body)
+	}
+}
+
+func TestSessionItemContentDebugRequiresTokenAndChatHidesPrivateContent(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "sessions")
+	store := sessions.NewV2Store(root)
+	saveServerTestSession(t, store, "private-content-session")
+	appendServerTestItem(t, store, "private-content-session", sessions.SessionItem{
+		ID:         "hidden-summary",
+		Kind:       sessions.ItemKindMessage,
+		Visibility: sessions.ItemVisibilityHidden,
+		Audience:   sessions.ItemAudienceModel,
+		Message:    &model.Message{Role: model.MessageRoleDeveloper, Content: "hidden summary secret"},
+	})
+	appendServerTestItem(t, store, "private-content-session", sessions.SessionItem{
+		ID:         "runtime-context",
+		Kind:       sessions.ItemKindRuntimeContext,
+		Visibility: sessions.ItemVisibilityDebug,
+		Audience:   sessions.ItemAudienceInternal,
+		Message:    &model.Message{Role: model.MessageRoleDeveloper, Content: "runtime context secret"},
+	})
+	appendServerTestItem(t, store, "private-content-session", sessions.SessionItem{
+		ID:         "tool-result",
+		Kind:       sessions.ItemKindMessage,
+		Visibility: sessions.ItemVisibilityVisible,
+		Audience:   sessions.ItemAudienceModel,
+		Message:    &model.Message{Role: model.MessageRoleTool, Content: "tool result secret", ToolCallID: "call-secret", IsError: true},
+	})
+	process := startSessionAPIServerWithToken(t, store, sessions.SessionV2{}, "registry-token")
+	baseURL := "http://" + process.Addr()
+
+	for _, tt := range []struct {
+		name  string
+		token string
+	}{
+		{name: "missing token"},
+		{name: "wrong token", token: "wrong-token"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			raw, body := getRawJSONStatus(t, baseURL+"/sessions/private-content-session/items/hidden-summary/content?view=debug", tt.token, http.StatusForbidden)
+			assertErrorCode(t, body, "permission_denied")
+			if bytes.Contains(raw, []byte("hidden summary secret")) {
+				t.Fatalf("permission error leaked debug content: %s", raw)
+			}
+		})
+	}
+
+	raw, body := getRawJSONStatus(t, baseURL+"/sessions/private-content-session/items/hidden-summary/content?view=debug", "registry-token", http.StatusOK)
+	assertNoContentDTOLeak(t, raw)
+	if body["content"] != "hidden summary secret" {
+		t.Fatalf("debug hidden content = %#v, want hidden summary secret", body)
+	}
+	raw, body = getRawJSONStatus(t, baseURL+"/sessions/private-content-session/items/runtime-context/content?view=debug", "registry-token", http.StatusOK)
+	assertNoContentDTOLeak(t, raw)
+	if body["content"] != "runtime context secret" {
+		t.Fatalf("debug runtime content = %#v, want runtime context secret", body)
+	}
+	raw, body = getRawJSONStatus(t, baseURL+"/sessions/private-content-session/items/tool-result/content?view=debug", "registry-token", http.StatusOK)
+	assertNoContentDTOLeak(t, raw)
+	if body["content"] != "tool result secret" {
+		t.Fatalf("debug tool content = %#v, want tool result secret", body)
+	}
+
+	for _, itemID := range []string{"hidden-summary", "runtime-context", "tool-result"} {
+		raw, body := getRawJSONStatus(t, baseURL+"/sessions/private-content-session/items/"+itemID+"/content", "", http.StatusNotFound)
+		assertErrorCode(t, body, "content_unavailable")
+		for _, forbidden := range []string{"hidden summary secret", "runtime context secret", "tool result secret", "call-secret"} {
+			if bytes.Contains(raw, []byte(forbidden)) {
+				t.Fatalf("chat content error for %s leaked %q: %s", itemID, forbidden, raw)
+			}
+		}
+	}
+}
+
+func TestSessionItemContentStructuredErrors(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "sessions")
+	store := sessions.NewV2Store(root)
+	saveServerTestSession(t, store, "content-errors")
+	appendServerTestItem(t, store, "content-errors", sessions.SessionItem{
+		ID:         "empty-message",
+		Kind:       sessions.ItemKindMessage,
+		Visibility: sessions.ItemVisibilityVisible,
+		Audience:   sessions.ItemAudienceUser,
+		Message:    &model.Message{Role: model.MessageRoleUser},
+	})
+	saveServerTestSession(t, store, "corrupt-content-session")
+	segmentsDir := filepath.Join(root, "corrupt-content-session", "segments")
+	if err := os.MkdirAll(segmentsDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll(segments) error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(segmentsDir, "000001.jsonl"), []byte(`{"seq":1,"type":"item.appended","item":`+"\n"), 0o600); err != nil {
+		t.Fatalf("WriteFile(corrupt segment) error = %v", err)
+	}
+	process := startSessionAPIServer(t, store, sessions.SessionV2{})
+	baseURL := "http://" + process.Addr()
+
+	_, body := getRawJSONStatus(t, baseURL+"/sessions/missing-session/items/item-1/content", "", http.StatusNotFound)
+	assertErrorCode(t, body, "session_not_found")
+
+	_, body = getRawJSONStatus(t, baseURL+"/sessions/content-errors/items/missing-item/content", "", http.StatusNotFound)
+	assertErrorCode(t, body, "item_not_found")
+
+	_, body = getRawJSONStatus(t, baseURL+"/sessions/content-errors/items/empty-message/content", "", http.StatusNotFound)
+	assertErrorCode(t, body, "content_unavailable")
+
+	_, body = getRawJSONStatus(t, baseURL+"/sessions/corrupt-content-session/items/item-1/content", "", http.StatusInternalServerError)
+	assertErrorCode(t, body, "session_store_error")
+
+	for _, tt := range []struct {
+		name  string
+		query string
+	}{
+		{name: "malformed offset", query: "offset=abc"},
+		{name: "negative offset", query: "offset=-1"},
+		{name: "malformed max bytes", query: "max_bytes=abc"},
+		{name: "zero max bytes", query: "max_bytes=0"},
+		{name: "bad view", query: "view=all"},
+		{name: "duplicate offset", query: "offset=1&offset=2"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			_, body := getRawJSONStatus(t, baseURL+"/sessions/content-errors/items/empty-message/content?"+tt.query, "", http.StatusBadRequest)
+			assertErrorCode(t, body, "invalid_query")
+		})
+	}
+}
+
 func TestSessionDetailCorruptStoreErrorIsStructured5xx(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "sessions")
 	if err := os.MkdirAll(filepath.Join(root, "corrupt-session"), 0o755); err != nil {
@@ -535,11 +715,18 @@ func TestSessionDetailCorruptStoreErrorIsStructured5xx(t *testing.T) {
 func startSessionAPIServer(t *testing.T, store *sessions.V2Store, defaults sessions.SessionV2) *Process {
 	t.Helper()
 
+	return startSessionAPIServerWithToken(t, store, defaults, "")
+}
+
+func startSessionAPIServerWithToken(t *testing.T, store *sessions.V2Store, defaults sessions.SessionV2, token string) *Process {
+	t.Helper()
+
 	process, err := Start(Options{
 		CWD:             t.TempDir(),
 		ConfigPath:      filepath.Join(t.TempDir(), "sai.yaml"),
 		Listen:          "127.0.0.1:0",
 		Version:         "test-version",
+		AuthToken:       token,
 		SessionStore:    store,
 		SessionDefaults: defaults,
 	})
@@ -568,15 +755,41 @@ func startSessionAPIServer(t *testing.T, store *sessions.V2Store, defaults sessi
 func getRawJSON(t *testing.T, url string) ([]byte, map[string]any) {
 	t.Helper()
 
-	resp, err := http.Get(url)
+	return getRawJSONStatus(t, url, "", http.StatusOK)
+}
+
+func getRawJSONStatus(t *testing.T, url, token string, wantStatus int) ([]byte, map[string]any) {
+	t.Helper()
+
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		t.Fatalf("NewRequest(%s) error = %v", url, err)
+	}
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	client := http.Client{Timeout: 2 * time.Second}
+	resp, err := client.Do(req)
 	if err != nil {
 		t.Fatalf("Get(%s) error = %v", url, err)
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("Get(%s) status = %d, want 200", url, resp.StatusCode)
+	if resp.StatusCode != wantStatus {
+		t.Fatalf("Get(%s) status = %d, want %d", url, resp.StatusCode, wantStatus)
 	}
 	return readRawJSON(t, resp)
+}
+
+func assertErrorCode(t *testing.T, body map[string]any, want string) {
+	t.Helper()
+
+	errorBody, ok := body["error"].(map[string]any)
+	if !ok {
+		t.Fatalf("error body = %#v, want error object", body)
+	}
+	if got := errorBody["code"]; got != want {
+		t.Fatalf("error code = %#v, want %q in %#v", got, want, body)
+	}
 }
 
 func postRawJSON(t *testing.T, url, body string) ([]byte, map[string]any) {
@@ -702,6 +915,32 @@ func assertNoItemDTOLeak(t *testing.T, raw []byte) {
 	} {
 		if bytes.Contains(raw, forbidden) {
 			t.Fatalf("item response leaked %s: %s", forbidden, raw)
+		}
+	}
+}
+
+func assertNoContentDTOLeak(t *testing.T, raw []byte) {
+	t.Helper()
+
+	for _, forbidden := range [][]byte{
+		[]byte(`"active_history"`),
+		[]byte(`"audience"`),
+		[]byte(`"compactions"`),
+		[]byte(`"context"`),
+		[]byte(`"created_at"`),
+		[]byte(`"cwd"`),
+		[]byte(`"enabled_tools"`),
+		[]byte(`"is_error"`),
+		[]byte(`"message"`),
+		[]byte(`"model_parameters"`),
+		[]byte(`"role"`),
+		[]byte(`"save_tool_results"`),
+		[]byte(`"tool_calls"`),
+		[]byte(`"tool_call_id"`),
+		[]byte(`"visibility"`),
+	} {
+		if bytes.Contains(raw, forbidden) {
+			t.Fatalf("content response leaked %s: %s", forbidden, raw)
 		}
 	}
 }
