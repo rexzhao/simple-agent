@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -2066,6 +2067,10 @@ func prepareAgentRuntime(ctx context.Context, configPath string, options agentCo
 		instructionSources = copyInstructionSources(resumedSession.InstructionSources)
 		enabledSkillIDs = copyStringSlice(resumedSession.EnabledSkills)
 	} else {
+		configuredDeveloperMessages, err := promptDeveloperMessagesForRun(cfg, cwd)
+		if err != nil {
+			return nil, err
+		}
 		selectedSkills, err := enabledSkillsForRun(cfg)
 		if err != nil {
 			return nil, err
@@ -2079,7 +2084,7 @@ func prepareAgentRuntime(ctx context.Context, configPath string, options agentCo
 		if err != nil {
 			return nil, err
 		}
-		baseMessages = chatBaseMessages(project, selectedSkills)
+		baseMessages = chatBaseMessages(project, selectedSkills, configuredDeveloperMessages)
 		instructionSources = chatInstructionSources(project, selectedSkills)
 		enabledSkillIDs = skillIDs(selectedSkills)
 	}
@@ -2558,9 +2563,63 @@ func (s codexResponsesTokenSource) AccessToken(ctx context.Context) (openairespo
 	return openairesponses.AccessToken{Token: token.Token, AccountID: token.AccountID}, nil
 }
 
-func chatBaseMessages(project projectcontext.Project, enabledSkills []localskills.Skill) []model.Message {
+func promptDeveloperMessagesForRun(cfg *config.Config, cwd string) ([]string, error) {
+	messages := []string{}
+	if strings.TrimSpace(cfg.Prompt.SystemPrompt) != "" {
+		rendered, err := projectcontext.RenderPromptTemplate(cfg.Prompt.SystemPrompt, projectcontext.PromptRenderValues{
+			CWD:       cwd,
+			ConfigDir: filepath.Dir(cfg.ConfigPath),
+			Now:       time.Now().UTC(),
+		})
+		if err != nil {
+			return nil, fmt.Errorf("render prompt.system_prompt: %w", err)
+		}
+		if strings.TrimSpace(rendered) != "" {
+			messages = append(messages, rendered)
+		}
+	}
+
+	subagentMessage, err := configuredSubagentsPrompt(cfg)
+	if err != nil {
+		return nil, err
+	}
+	if subagentMessage != "" {
+		messages = append(messages, subagentMessage)
+	}
+	return messages, nil
+}
+
+func configuredSubagentsPrompt(cfg *config.Config) (string, error) {
+	if len(cfg.Subagents) == 0 {
+		return "", nil
+	}
+
+	ids := make([]string, 0, len(cfg.Subagents))
+	for id := range cfg.Subagents {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+
+	var out strings.Builder
+	out.WriteString("Configured subagents:")
+	for _, id := range ids {
+		path := cfg.Subagents[id]
+		child, err := config.LoadBase(path)
+		if err != nil {
+			return "", fmt.Errorf("load subagent %q config %q: %w", id, path, err)
+		}
+		description := strings.TrimSpace(child.Agent.Description)
+		if description == "" {
+			description = "(no description)"
+		}
+		fmt.Fprintf(&out, "\n- %s: %s", id, description)
+	}
+	return out.String(), nil
+}
+
+func chatBaseMessages(project projectcontext.Project, enabledSkills []localskills.Skill, developerMessages []string) []model.Message {
 	instructions := projectcontext.ComposeInstructions(builtInBaseInstructions, project, "")
-	messages := make([]model.Message, 0, len(instructions)+len(enabledSkills))
+	messages := make([]model.Message, 0, len(instructions)+len(developerMessages)+len(enabledSkills))
 	for _, instruction := range instructions {
 		if instruction.Source == projectcontext.InstructionSourceUser {
 			for _, skill := range enabledSkills {
@@ -2575,6 +2634,14 @@ func chatBaseMessages(project projectcontext.Project, enabledSkills []localskill
 			Role:    roleForInstruction(instruction.Source),
 			Content: instruction.Content,
 		})
+		if instruction.Source == projectcontext.InstructionSourceBuiltIn {
+			for _, content := range developerMessages {
+				messages = append(messages, model.Message{
+					Role:    model.MessageRoleDeveloper,
+					Content: content,
+				})
+			}
+		}
 	}
 	return messages
 }

@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestLoadReadsAgentsFromProjectDirectory(t *testing.T) {
@@ -365,6 +366,34 @@ func assertInstructionFiles(t *testing.T, got, want []InstructionFile) {
 		wantPath := filepath.Clean(want[i].Path)
 		if got[i].Path != wantPath || got[i].Content != want[i].Content {
 			t.Fatalf("InstructionFiles[%d] = %#v, want path %q content %q", i, got[i], wantPath, want[i].Content)
+		}
+	}
+}
+
+func TestRenderPromptTemplateExpandsWhitelistedPlaceholders(t *testing.T) {
+	rendered, err := RenderPromptTemplate("cwd={{cwd}}\nconfig={{ config_dir }}\nnow={{time.now}}", PromptRenderValues{
+		CWD:       `/tmp/project`,
+		ConfigDir: `/tmp/project/.agents`,
+		Now:       time.Date(2026, 7, 3, 8, 9, 10, 0, time.UTC),
+	})
+	if err != nil {
+		t.Fatalf("RenderPromptTemplate() error = %v", err)
+	}
+
+	want := "cwd=/tmp/project\nconfig=/tmp/project/.agents\nnow=2026-07-03T08:09:10Z"
+	if rendered != want {
+		t.Fatalf("RenderPromptTemplate() = %q, want %q", rendered, want)
+	}
+}
+
+func TestRenderPromptTemplateRejectsUnknownPlaceholder(t *testing.T) {
+	_, err := RenderPromptTemplate("secret={{env.HOME}}", PromptRenderValues{})
+	if err == nil {
+		t.Fatal("RenderPromptTemplate() error = nil, want unknown placeholder error")
+	}
+	for _, want := range []string{`unknown prompt placeholder "env.HOME"`, "supported placeholders: config_dir, cwd, time.now"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("RenderPromptTemplate() error = %q, want contain %q", err, want)
 		}
 	}
 }

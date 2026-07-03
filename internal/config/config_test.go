@@ -187,6 +187,112 @@ skill_dirs: []
 	}
 }
 
+func TestLoadBaseResolvesSubagentPathsRelativeToConfig(t *testing.T) {
+	dir := t.TempDir()
+	absSubagent := filepath.Join(t.TempDir(), "absolute-agent.yaml")
+	writeFile(t, filepath.Join(dir, "sai.yaml"), `subagents:
+  reviewer: subagents/reviewer.yaml
+  absolute: `+filepath.ToSlash(absSubagent)+`
+`)
+
+	cfg, err := LoadBase(filepath.Join(dir, "sai.yaml"))
+	if err != nil {
+		t.Fatalf("LoadBase() error = %v", err)
+	}
+
+	wantConfigDir, err := filepath.Abs(dir)
+	if err != nil {
+		t.Fatalf("filepath.Abs() error = %v", err)
+	}
+	wantConfigDir = filepath.Clean(wantConfigDir)
+	wantReviewer := filepath.Join(wantConfigDir, "subagents", "reviewer.yaml")
+	if cfg.Subagents["reviewer"] != wantReviewer {
+		t.Fatalf("Subagents[reviewer] = %q, want %q", cfg.Subagents["reviewer"], wantReviewer)
+	}
+	if cfg.Subagents["absolute"] != filepath.Clean(absSubagent) {
+		t.Fatalf("Subagents[absolute] = %q, want %q", cfg.Subagents["absolute"], filepath.Clean(absSubagent))
+	}
+}
+
+func TestLoadBaseHandlesMissingAndEmptySubagents(t *testing.T) {
+	t.Run("missing", func(t *testing.T) {
+		dir := t.TempDir()
+		writeFile(t, filepath.Join(dir, "sai.yaml"), `default_provider: fake
+`)
+
+		cfg, err := LoadBase(filepath.Join(dir, "sai.yaml"))
+		if err != nil {
+			t.Fatalf("LoadBase() error = %v", err)
+		}
+		if cfg.Subagents != nil {
+			t.Fatalf("Subagents = %#v, want nil for missing config", cfg.Subagents)
+		}
+	})
+
+	t.Run("empty", func(t *testing.T) {
+		dir := t.TempDir()
+		writeFile(t, filepath.Join(dir, "sai.yaml"), `subagents: {}
+`)
+
+		cfg, err := LoadBase(filepath.Join(dir, "sai.yaml"))
+		if err != nil {
+			t.Fatalf("LoadBase() error = %v", err)
+		}
+		if cfg.Subagents == nil {
+			t.Fatal("Subagents = nil, want explicit empty map")
+		}
+		if len(cfg.Subagents) != 0 {
+			t.Fatalf("Subagents = %#v, want empty", cfg.Subagents)
+		}
+	})
+}
+
+func TestLoadBaseChildConfigUsesAgentAndPromptSchema(t *testing.T) {
+	dir := t.TempDir()
+	childDir := filepath.Join(dir, "subagents")
+	if err := os.MkdirAll(childDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll() error = %v", err)
+	}
+	childPath := filepath.Join(childDir, "reviewer.yaml")
+	writeFile(t, childPath, `default_provider: child-provider
+default_model: child-model
+skill_dirs:
+  - child-skills
+agent:
+  name: Reviewer
+  description: Read-only reviewer.
+  timeout: 30s
+  max_turns: 6
+prompt:
+  system_prompt: |
+    Review only the assigned scope.
+`)
+
+	cfg, err := LoadBase(childPath)
+	if err != nil {
+		t.Fatalf("LoadBase() error = %v", err)
+	}
+
+	if cfg.Agent.Name != "Reviewer" {
+		t.Fatalf("Agent.Name = %q, want Reviewer", cfg.Agent.Name)
+	}
+	if cfg.Agent.Description != "Read-only reviewer." {
+		t.Fatalf("Agent.Description = %q, want description", cfg.Agent.Description)
+	}
+	if cfg.Agent.Timeout != "30s" {
+		t.Fatalf("Agent.Timeout = %q, want 30s", cfg.Agent.Timeout)
+	}
+	if cfg.Agent.MaxTurns != 6 {
+		t.Fatalf("Agent.MaxTurns = %d, want 6", cfg.Agent.MaxTurns)
+	}
+	if cfg.Prompt.SystemPrompt != "Review only the assigned scope.\n" {
+		t.Fatalf("Prompt.SystemPrompt = %q, want child prompt", cfg.Prompt.SystemPrompt)
+	}
+	if !sameStrings(cfg.SkillDirs, []string{filepath.Join(childDir, "child-skills")}) {
+		t.Fatalf("SkillDirs = %#v, want child-relative skill dir", cfg.SkillDirs)
+	}
+}
+
 func TestLoadUsesExplicitRootConfigFilePath(t *testing.T) {
 	dir := t.TempDir()
 	rootDir := filepath.Join(dir, "config-root")

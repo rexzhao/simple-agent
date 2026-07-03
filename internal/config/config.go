@@ -20,7 +20,9 @@ type Config struct {
 	ProviderDir     string                     `json:"provider_dir" yaml:"provider_dir"`
 	AuthDir         string                     `json:"auth_dir" yaml:"auth_dir"`
 	SkillDirs       []string                   `json:"skill_dirs" yaml:"skill_dirs"`
+	Subagents       map[string]string          `json:"subagents" yaml:"subagents"`
 	Agent           AgentConfig                `json:"agent" yaml:"agent"`
+	Prompt          PromptConfig               `json:"prompt" yaml:"prompt"`
 	Tools           ToolsConfig                `json:"tools" yaml:"tools"`
 	Logging         LoggingConfig              `json:"logging" yaml:"logging"`
 	Sessions        SessionsConfig             `json:"sessions" yaml:"sessions"`
@@ -38,9 +40,16 @@ const (
 
 type AgentConfig struct {
 	InstructionFiles []string `json:"instruction_files" yaml:"instruction_files"`
+	Name             string   `json:"name,omitempty" yaml:"name,omitempty"`
+	Description      string   `json:"description,omitempty" yaml:"description,omitempty"`
+	Timeout          string   `json:"timeout,omitempty" yaml:"timeout,omitempty"`
 	MaxTurns         int      `json:"max_turns" yaml:"max_turns"`
 	Stream           bool     `json:"stream" yaml:"stream"`
 	ShowReasoning    bool     `json:"show_reasoning" yaml:"show_reasoning"`
+}
+
+type PromptConfig struct {
+	SystemPrompt string `json:"system_prompt,omitempty" yaml:"system_prompt,omitempty"`
 }
 
 type ToolsConfig struct {
@@ -160,6 +169,7 @@ func LoadBase(configPath string) (*Config, error) {
 	cfg.ProviderDir = resolvePath(configDir, cfg.ProviderDir)
 	cfg.AuthDir = resolvePath(configDir, cfg.AuthDir)
 	cfg.SkillDirs = resolvePaths(configDir, cfg.SkillDirs)
+	cfg.Subagents = resolvePathMap(configDir, cfg.Subagents)
 	if cfg.Logging.Path != "" {
 		cfg.Logging.Path = resolvePath(configDir, cfg.Logging.Path)
 	}
@@ -540,6 +550,17 @@ func resolvePaths(baseDir string, paths []string) []string {
 	resolved := make([]string, 0, len(paths))
 	for _, path := range paths {
 		resolved = append(resolved, resolvePath(baseDir, path))
+	}
+	return resolved
+}
+
+func resolvePathMap(baseDir string, paths map[string]string) map[string]string {
+	if paths == nil {
+		return nil
+	}
+	resolved := make(map[string]string, len(paths))
+	for id, path := range paths {
+		resolved[id] = resolvePath(baseDir, path)
 	}
 	return resolved
 }

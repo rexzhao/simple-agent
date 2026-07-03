@@ -4066,6 +4066,128 @@ func TestRunEnableToolsOverridesConfiguredTools(t *testing.T) {
 	assertCLIToolNames(t, (<-requests).Body, []string{"list_files", "write_file", "edit_file"})
 }
 
+func TestRunInjectsConfiguredSystemPromptWithPlaceholders(t *testing.T) {
+	server, requests := newCLIRunServer(t,
+		`{"choices":[{"delta":{"content":"ok"}}]}`,
+		`[DONE]`,
+	)
+	defer server.Close()
+
+	configDir := t.TempDir()
+	projectDir := t.TempDir()
+	writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
+	appendCLIConfig(t, configDir, `
+prompt:
+  system_prompt: |
+    custom cwd={{cwd}}
+    custom config={{config_dir}}
+`)
+	writeCLIFile(t, filepath.Join(projectDir, "AGENTS.md"), "Project instructions\n")
+
+	var stdout, stderr bytes.Buffer
+	code := RunWithGetwd([]string{"--config", cliConfigPath(configDir), "chat", "--quit", "--prompt", "Use configured prompt"}, &stdout, &stderr, func() (string, error) {
+		return projectDir, nil
+	})
+
+	if code != 0 {
+		t.Fatalf("RunWithGetwd() code = %d, stderr = %s", code, stderr.String())
+	}
+	if got, want := stdout.String(), "ok"; got != want {
+		t.Fatalf("stdout = %q, want %q", got, want)
+	}
+
+	messages := requestMessages(t, (<-requests).Body)
+	if len(messages) != 4 {
+		t.Fatalf("len(messages) = %d, want 4: %#v", len(messages), messages)
+	}
+	assertMessage(t, messages, 0, "system", builtInBaseInstructions)
+	assertMessage(t, messages, 1, "developer", "custom cwd="+projectDir+"\ncustom config="+configDir+"\n")
+	assertMessage(t, messages, 2, "developer", "Project instructions\n")
+	assertMessage(t, messages, 3, "user", "Use configured prompt")
+	assertNoAdditionalCLIRunRequest(t, requests)
+}
+
+func TestRunFailsOnUnknownConfiguredPromptPlaceholder(t *testing.T) {
+	server, requests := newCLIRunServer(t,
+		`{"choices":[{"delta":{"content":"unexpected"}}]}`,
+		`[DONE]`,
+	)
+	defer server.Close()
+
+	configDir := t.TempDir()
+	writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
+	appendCLIConfig(t, configDir, `
+prompt:
+  system_prompt: "secret={{env.HOME}}"
+`)
+
+	var stdout, stderr bytes.Buffer
+	code := RunWithGetwd([]string{"--config", cliConfigPath(configDir), "chat", "--quit", "--prompt", "Use bad prompt"}, &stdout, &stderr, func() (string, error) {
+		return t.TempDir(), nil
+	})
+
+	if code != 1 {
+		t.Fatalf("RunWithGetwd() code = %d, want 1", code)
+	}
+	if stdout.String() != "" {
+		t.Fatalf("stdout = %q, want empty", stdout.String())
+	}
+	assertCLIErrorContains(t, stderr.String(), "render prompt.system_prompt", `unknown prompt placeholder "env.HOME"`, "supported placeholders")
+	assertNoAdditionalCLIRunRequest(t, requests)
+}
+
+func TestRunInjectsConfiguredSubagentListFromChildMetadata(t *testing.T) {
+	server, requests := newCLIRunServer(t,
+		`{"choices":[{"delta":{"content":"ok"}}]}`,
+		`[DONE]`,
+	)
+	defer server.Close()
+
+	configDir := t.TempDir()
+	writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
+	appendCLIConfig(t, configDir, `
+subagents:
+  reviewer: subagents/reviewer.yaml
+  researcher: subagents/researcher.yaml
+`)
+	subagentDir := filepath.Join(configDir, "subagents")
+	if err := os.MkdirAll(subagentDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll() error = %v", err)
+	}
+	writeCLIFile(t, filepath.Join(subagentDir, "reviewer.yaml"), `provider_dir: missing-child-providers
+agent:
+  description: Reviews scoped changes.
+prompt:
+  system_prompt: Child prompt is not parent metadata.
+`)
+	writeCLIFile(t, filepath.Join(subagentDir, "researcher.yaml"), `provider_dir: missing-child-providers
+agent:
+  description: Looks up facts.
+`)
+
+	var stdout, stderr bytes.Buffer
+	code := RunWithGetwd([]string{"--config", cliConfigPath(configDir), "chat", "--quit", "--prompt", "Choose helper"}, &stdout, &stderr, func() (string, error) {
+		return t.TempDir(), nil
+	})
+
+	if code != 0 {
+		t.Fatalf("RunWithGetwd() code = %d, stderr = %s", code, stderr.String())
+	}
+
+	request := <-requests
+	messages := requestMessages(t, request.Body)
+	if len(messages) != 3 {
+		t.Fatalf("len(messages) = %d, want 3: %#v", len(messages), messages)
+	}
+	assertMessage(t, messages, 0, "system", builtInBaseInstructions)
+	assertMessage(t, messages, 1, "developer", "Configured subagents:\n- researcher: Looks up facts.\n- reviewer: Reviews scoped changes.")
+	assertMessage(t, messages, 2, "user", "Choose helper")
+	if _, ok := request.Body["tools"]; ok {
+		t.Fatalf("request tools = %#v, want no subagent tools in this slice", request.Body["tools"])
+	}
+	assertNoAdditionalCLIRunRequest(t, requests)
+}
+
 func TestRunInjectsDiscoveredSkillsInDirectoryOrder(t *testing.T) {
 	server, requests := newCLIRunServer(t,
 		`{"choices":[{"delta":{"content":"ok"}}]}`,
@@ -5436,6 +5558,17 @@ func writeCLIFile(t *testing.T, path, content string) {
 	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
 		t.Fatalf("WriteFile(%q) error = %v", path, err)
 	}
+}
+
+func appendCLIConfig(t *testing.T, configDir, content string) {
+	t.Helper()
+	configPath := filepath.Join(configDir, "sai.yaml")
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("ReadFile(%q) error = %v", configPath, err)
+	}
+	updated := strings.TrimRight(string(data), "\r\n") + "\n" + strings.TrimLeft(content, "\r\n")
+	writeCLIFile(t, configPath, updated)
 }
 
 func setCLILoggingPath(t *testing.T, configDir, path string) {

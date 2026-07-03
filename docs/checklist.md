@@ -373,15 +373,15 @@
 
 ## M19：Async Subagent-as-Tool Runtime
 
-- [ ] 根配置文件支持 `subagents` 映射，形态为 `id -> relative config file path`。
-- [ ] `subagents` 相对路径基于写出该配置项的父配置文件所在目录解析。
-- [ ] subagent config 文件复用 main config 的 `sai` schema。
+- [x] 根配置文件支持 `subagents` 映射，形态为 `id -> relative config file path`。
+- [x] `subagents` 相对路径基于写出该配置项的父配置文件所在目录解析。
+- [x] subagent config 文件复用 main config 的 `sai` schema。
 - [ ] child agent 通过类似 main agent 的 runtime 准备路径启动。
 - [ ] self-referential 或环形 subagent config 有递归深度保护。
 - [ ] subagent runtime 有最大 job 数量、等待时间和取消保护。
 - [ ] 未配置 subagents 时不暴露任何 subagent tools。
 - [ ] 配置 subagents 后 parent agent 自动获得 subagent tools。
-- [ ] parent prompt 注入已配置 subagent id 和短 description 列表。
+- [x] parent prompt 注入已配置 subagent id 和短 description 列表。
 - [ ] child agent 使用自己的 provider、model、tools、skills、MCP 和 prompt。
 - [ ] child agent 不继承 parent tools。
 - [ ] subagent job 支持 `subagent_start`。
@@ -396,8 +396,8 @@
 - [ ] child job 运行时 parent 仍可继续接收用户输入。
 - [ ] child completion 通过 parent mailbox/runtime event 在 parent turn 后交付。
 - [ ] parent idle 时 child completion 可触发 auto wakeup。
-- [ ] `prompt.system_prompt` 作为未来 schema 追加到内置约束之后，不替换内置约束。
-- [ ] prompt placeholders 使用固定白名单，并拒绝未知占位符。
+- [x] `prompt.system_prompt` 作为未来 schema 追加到内置约束之后，不替换内置约束。
+- [x] prompt placeholders 使用固定白名单，并拒绝未知占位符。
 - [ ] 为未来 DAG/workflow orchestration 保留边界，但 M19 不实现完整编排。
 - [ ] 为未来 shared state / blackboard 保留边界。
 - [ ] 为未来 structured result protocol 保留边界。

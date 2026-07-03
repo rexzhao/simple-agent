@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 )
 
 const AgentsFileName = "AGENTS.md"
@@ -54,6 +55,12 @@ type Instruction struct {
 	Priority InstructionPriority
 	Content  string
 	Path     string
+}
+
+type PromptRenderValues struct {
+	CWD       string
+	ConfigDir string
+	Now       time.Time
 }
 
 func Load(projectDir string) (Project, error) {
@@ -398,4 +405,46 @@ func ComposeInstructions(builtInBase string, project Project, userPrompt string)
 	})
 
 	return instructions
+}
+
+func RenderPromptTemplate(template string, values PromptRenderValues) (string, error) {
+	if values.Now.IsZero() {
+		values.Now = time.Now().UTC()
+	}
+
+	replacements := map[string]string{
+		"cwd":        values.CWD,
+		"config_dir": values.ConfigDir,
+		"time.now":   values.Now.UTC().Format(time.RFC3339),
+	}
+
+	var rendered strings.Builder
+	offset := 0
+	for {
+		start := strings.Index(template[offset:], "{{")
+		if start < 0 {
+			rendered.WriteString(template[offset:])
+			return rendered.String(), nil
+		}
+		start += offset
+		rendered.WriteString(template[offset:start])
+
+		end := strings.Index(template[start+2:], "}}")
+		if end < 0 {
+			return "", fmt.Errorf("prompt placeholder starting at byte %d is missing closing }}", start)
+		}
+		end += start + 2
+
+		name := strings.TrimSpace(template[start+2 : end])
+		replacement, ok := replacements[name]
+		if !ok {
+			return "", fmt.Errorf("unknown prompt placeholder %q; supported placeholders: %s", name, supportedPromptPlaceholders())
+		}
+		rendered.WriteString(replacement)
+		offset = end + 2
+	}
+}
+
+func supportedPromptPlaceholders() string {
+	return "config_dir, cwd, time.now"
 }
