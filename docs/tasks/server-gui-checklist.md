@@ -51,7 +51,7 @@ future work and should not be required by any slice here.
   `GET /sessions/{id}/items/{item_id}/content` with token-gated non-public
   reads, offset/max byte support, session item reachability checks, and no bare
   blob hash endpoint.
-- [ ] WebSocket stream: implement `WS /sessions/{id}/stream` with multi-client
+- [x] WebSocket stream: implement `WS /sessions/{id}/stream` with multi-client
   fanout for transient text deltas, tool status, persisted item events,
   compaction events, `turn.committed`, and `turn.failed`.
 - [ ] Send message API: implement `POST /sessions/{id}/messages` so the server

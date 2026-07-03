@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gorilla/websocket"
 	"github.com/rexzhao/simple-agent/internal/contextwindow"
 	"github.com/rexzhao/simple-agent/internal/model"
 	"github.com/rexzhao/simple-agent/internal/sessions"
@@ -273,6 +274,170 @@ func TestSessionMetadataStructuredErrors(t *testing.T) {
 	body = decodeJSON(t, resp)
 	if got := body["error"].(map[string]any)["code"]; got != "not_found" {
 		t.Fatalf("bad path error = %#v, want not_found", body)
+	}
+}
+
+func TestSessionStreamConnectsAndPublishesJSONEventShapes(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "sessions")
+	store := sessions.NewV2Store(root)
+	saveServerTestSession(t, store, "stream-session")
+	process := startSessionAPIServer(t, store, sessions.SessionV2{})
+	conn := dialSessionStream(t, process, "stream-session")
+	waitForStreamSubscribers(t, process, "stream-session", 1)
+
+	events := []SessionStreamEvent{
+		NewSessionStreamEvent("turn.started", map[string]any{"turn_id": "turn-1"}),
+		NewSessionStreamEvent("text.delta", map[string]any{"turn_id": "turn-1", "text": "hello"}),
+		NewSessionStreamEvent("tool.started", map[string]any{"turn_id": "turn-1", "name": "read_file", "preview": "docs/server-gui.md"}),
+		NewSessionStreamEvent("tool.finished", map[string]any{"turn_id": "turn-1", "name": "read_file", "is_error": false}),
+		NewSessionStreamEvent("item.appended", map[string]any{"seq": int64(1), "item_id": "item-1"}),
+		NewSessionStreamEvent("turn.committed", map[string]any{"turn_id": "turn-1", "last_seq": int64(1)}),
+		NewSessionStreamEvent("turn.failed", map[string]any{"turn_id": "turn-2", "message": "context window exceeded"}),
+		NewSessionStreamEvent("compact.started", map[string]any{"reason": "user_requested"}),
+		NewSessionStreamEvent("compaction.created", map[string]any{"seq": int64(2), "compaction_id": "compact-1"}),
+	}
+	for _, event := range events {
+		if err := process.PublishSessionEvent("stream-session", event); err != nil {
+			t.Fatalf("PublishSessionEvent(%s) error = %v", event["type"], err)
+		}
+		got := readSessionStreamEvent(t, conn)
+		if got["type"] != event["type"] {
+			t.Fatalf("stream event type = %#v, want %#v in %#v", got["type"], event["type"], got)
+		}
+	}
+}
+
+func TestSessionStreamMissingSessionFailsBeforeUpgrade(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "sessions")
+	store := sessions.NewV2Store(root)
+	saveServerTestSession(t, store, "existing-session")
+	appendServerTestItem(t, store, "existing-session", sessions.SessionItem{
+		ID:         "secret-item",
+		Kind:       sessions.ItemKindMessage,
+		Visibility: sessions.ItemVisibilityVisible,
+		Audience:   sessions.ItemAudienceUser,
+		Message:    &model.Message{Role: model.MessageRoleUser, Content: "SECRET PROMPT TOOL BLOB"},
+	})
+	process := startSessionAPIServer(t, store, sessions.SessionV2{})
+
+	conn, resp, err := websocket.DefaultDialer.Dial("ws://"+process.Addr()+"/sessions/missing-session/stream", nil)
+	if err == nil {
+		_ = conn.Close()
+		t.Fatal("Dial(missing stream) error = nil, want handshake failure")
+	}
+	if resp == nil {
+		t.Fatalf("Dial(missing stream) response = nil, error = %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("missing stream status = %d, want 404", resp.StatusCode)
+	}
+	raw, body := readRawJSON(t, resp)
+	assertErrorCode(t, body, "session_not_found")
+	for _, forbidden := range []string{"SECRET PROMPT TOOL BLOB", "registry-token"} {
+		if bytes.Contains(raw, []byte(forbidden)) {
+			t.Fatalf("missing stream error leaked %q: %s", forbidden, raw)
+		}
+	}
+}
+
+func TestSessionStreamInvalidSessionIDFailsBeforeUpgrade(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "sessions")
+	store := sessions.NewV2Store(root)
+	saveServerTestSession(t, store, "existing-session")
+	appendServerTestItem(t, store, "existing-session", sessions.SessionItem{
+		ID:         "secret-item",
+		Kind:       sessions.ItemKindMessage,
+		Visibility: sessions.ItemVisibilityVisible,
+		Audience:   sessions.ItemAudienceUser,
+		Message:    &model.Message{Role: model.MessageRoleUser, Content: "SECRET INVALID STREAM CONTENT"},
+	})
+	process := startSessionAPIServer(t, store, sessions.SessionV2{})
+
+	conn, resp, err := websocket.DefaultDialer.Dial("ws://"+process.Addr()+"/sessions/bad%20session/stream", nil)
+	if err == nil {
+		_ = conn.Close()
+		t.Fatal("Dial(invalid-id stream) error = nil, want handshake failure")
+	}
+	if resp == nil {
+		t.Fatalf("Dial(invalid-id stream) response = nil, error = %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("invalid-id stream status = %d, want 400", resp.StatusCode)
+	}
+	raw, body := readRawJSON(t, resp)
+	assertErrorCode(t, body, "invalid_session_id")
+	for _, forbidden := range []string{"SECRET INVALID STREAM CONTENT", "registry-token"} {
+		if bytes.Contains(raw, []byte(forbidden)) {
+			t.Fatalf("invalid-id stream error leaked %q: %s", forbidden, raw)
+		}
+	}
+}
+
+func TestSessionStreamFanoutAndSessionIsolation(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "sessions")
+	store := sessions.NewV2Store(root)
+	saveServerTestSession(t, store, "fanout-session")
+	saveServerTestSession(t, store, "other-session")
+	process := startSessionAPIServer(t, store, sessions.SessionV2{})
+
+	first := dialSessionStream(t, process, "fanout-session")
+	second := dialSessionStream(t, process, "fanout-session")
+	other := dialSessionStream(t, process, "other-session")
+	waitForStreamSubscribers(t, process, "fanout-session", 2)
+	waitForStreamSubscribers(t, process, "other-session", 1)
+
+	event := NewSessionStreamEvent("text.delta", map[string]any{"turn_id": "turn-1", "text": "same-session"})
+	if err := process.PublishSessionEvent("fanout-session", event); err != nil {
+		t.Fatalf("PublishSessionEvent(fanout-session) error = %v", err)
+	}
+	for name, conn := range map[string]*websocket.Conn{"first": first, "second": second} {
+		got := readSessionStreamEvent(t, conn)
+		if got["type"] != "text.delta" || got["text"] != "same-session" {
+			t.Fatalf("%s stream event = %#v, want text.delta same-session", name, got)
+		}
+	}
+
+	if err := other.SetReadDeadline(time.Now().Add(150 * time.Millisecond)); err != nil {
+		t.Fatalf("SetReadDeadline(other) error = %v", err)
+	}
+	if _, _, err := other.ReadMessage(); err == nil {
+		t.Fatal("other-session received fanout-session event")
+	} else if !os.IsTimeout(err) {
+		t.Fatalf("other-session ReadMessage() error = %v, want timeout", err)
+	}
+}
+
+func TestSessionStreamShutdownClosesConnections(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "sessions")
+	store := sessions.NewV2Store(root)
+	saveServerTestSession(t, store, "shutdown-stream")
+	process := startSessionAPIServer(t, store, sessions.SessionV2{})
+	conn := dialSessionStream(t, process, "shutdown-stream")
+	waitForStreamSubscribers(t, process, "shutdown-stream", 1)
+
+	shutdownDone := make(chan error, 1)
+	go func() {
+		shutdownDone <- process.Shutdown(context.Background())
+	}()
+	select {
+	case err := <-shutdownDone:
+		if err != nil {
+			t.Fatalf("Shutdown() error = %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Shutdown() did not return")
+	}
+
+	if got := process.streams.subscriberCount("shutdown-stream"); got != 0 {
+		t.Fatalf("subscriberCount after shutdown = %d, want 0", got)
+	}
+	if err := conn.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatalf("SetReadDeadline(shutdown stream) error = %v", err)
+	}
+	if _, _, err := conn.ReadMessage(); err == nil {
+		t.Fatal("ReadMessage() after shutdown error = nil, want closed connection")
 	}
 }
 
@@ -954,6 +1119,60 @@ func appendServerTestItem(t *testing.T, store *sessions.V2Store, sessionID strin
 		t.Fatalf("AppendItem(%s, %s) error = %v", sessionID, item.ID, err)
 	}
 	return saved
+}
+
+func dialSessionStream(t *testing.T, process *Process, sessionID string) *websocket.Conn {
+	t.Helper()
+
+	conn, resp, err := websocket.DefaultDialer.Dial("ws://"+process.Addr()+"/sessions/"+sessionID+"/stream", nil)
+	if err != nil {
+		if resp != nil && resp.Body != nil {
+			raw, _ := io.ReadAll(resp.Body)
+			_ = resp.Body.Close()
+			t.Fatalf("Dial(session stream %s) error = %v; status=%d body=%s", sessionID, err, resp.StatusCode, raw)
+		}
+		t.Fatalf("Dial(session stream %s) error = %v", sessionID, err)
+	}
+	t.Cleanup(func() {
+		_ = conn.Close()
+	})
+	return conn
+}
+
+func waitForStreamSubscribers(t *testing.T, process *Process, sessionID string, want int) {
+	t.Helper()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if got := process.streams.subscriberCount(sessionID); got == want {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("subscriberCount(%s) = %d, want %d", sessionID, process.streams.subscriberCount(sessionID), want)
+}
+
+func readSessionStreamEvent(t *testing.T, conn *websocket.Conn) map[string]any {
+	t.Helper()
+
+	if err := conn.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatalf("SetReadDeadline(stream) error = %v", err)
+	}
+	messageType, payload, err := conn.ReadMessage()
+	if err != nil {
+		t.Fatalf("ReadMessage(stream) error = %v", err)
+	}
+	if messageType != websocket.TextMessage {
+		t.Fatalf("stream message type = %d, want text", messageType)
+	}
+	var event map[string]any
+	if err := json.Unmarshal(payload, &event); err != nil {
+		t.Fatalf("Unmarshal(stream event) error = %v; payload=%s", err, payload)
+	}
+	if event["type"] == "" {
+		t.Fatalf("stream event missing type: %#v", event)
+	}
+	return event
 }
 
 func responseItems(t *testing.T, body map[string]any) []any {

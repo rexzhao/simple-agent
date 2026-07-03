@@ -16,6 +16,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/gorilla/websocket"
 	"github.com/rexzhao/simple-agent/internal/contextwindow"
 	"github.com/rexzhao/simple-agent/internal/model"
 	"github.com/rexzhao/simple-agent/internal/sessions"
@@ -33,7 +34,17 @@ const (
 
 	sessionItemsViewChat  = "chat"
 	sessionItemsViewDebug = "debug"
+
+	sessionStreamClientBuffer = 32
+	sessionStreamWriteTimeout = 5 * time.Second
 )
+
+var sessionStreamUpgrader = websocket.Upgrader{
+	ReadBufferSize:  1024,
+	WriteBufferSize: 4096,
+}
+
+var errSessionStoreUnavailable = errors.New("session store is not configured")
 
 type Options struct {
 	CWD             string
@@ -60,6 +71,7 @@ type Process struct {
 	sessionStore    *sessions.V2Store
 	sessionDefaults sessions.SessionV2
 	authToken       string
+	streams         *sessionStreamHub
 }
 
 type Info struct {
@@ -137,6 +149,7 @@ func Start(options Options) (*Process, error) {
 		sessionStore:    options.SessionStore,
 		sessionDefaults: copySessionMetadata(options.SessionDefaults),
 		authToken:       strings.TrimSpace(options.AuthToken),
+		streams:         newSessionStreamHub(),
 	}
 	if process.sessionStore == nil && strings.TrimSpace(options.SessionRoot) != "" {
 		process.sessionStore = sessions.NewV2Store(options.SessionRoot)
@@ -221,6 +234,7 @@ func (p *Process) Shutdown(ctx context.Context) error {
 		ctx = context.Background()
 	}
 	p.shutdownOnce.Do(func() {
+		p.streams.close()
 		p.shutdownErr = p.httpServer.Shutdown(ctx)
 		close(p.shutdownDone)
 	})
@@ -342,6 +356,12 @@ func (p *Process) handleSessionPath(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		p.handleSessionItems(w, r, id)
+	case len(parts) == 2 && parts[1] == "stream":
+		if r.Method != http.MethodGet {
+			writeMethodNotAllowed(w, http.MethodGet)
+			return
+		}
+		p.handleSessionStream(w, r, id)
 	case len(parts) == 4 && parts[1] == "items" && parts[3] == "content":
 		if r.Method != http.MethodGet {
 			writeMethodNotAllowed(w, http.MethodGet)
@@ -537,6 +557,37 @@ func (p *Process) handleSessionItemContent(w http.ResponseWriter, r *http.Reques
 	})
 }
 
+func (p *Process) handleSessionStream(w http.ResponseWriter, r *http.Request, id string) {
+	if !validSessionAPIID(id) {
+		writeError(w, http.StatusBadRequest, "invalid_session_id", "invalid session id")
+		return
+	}
+	if err := p.ensureSessionExists(id); err != nil {
+		switch {
+		case errors.Is(err, errSessionStoreUnavailable):
+			writeError(w, http.StatusServiceUnavailable, "session_store_unavailable", "session store is not configured")
+		case errors.Is(err, sessions.ErrNotFound):
+			writeError(w, http.StatusNotFound, "session_not_found", "session not found")
+		default:
+			writeError(w, http.StatusInternalServerError, "session_store_error", "could not load session stream")
+		}
+		return
+	}
+
+	conn, err := sessionStreamUpgrader.Upgrade(w, r, nil)
+	if err != nil {
+		return
+	}
+	client, ok := p.streams.subscribe(id, conn)
+	if !ok {
+		_ = conn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseGoingAway, "server shutting down"), time.Now().Add(sessionStreamWriteTimeout))
+		_ = conn.Close()
+		return
+	}
+	go client.writeLoop()
+	client.readLoop()
+}
+
 func (p *Process) snapshot() Info {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -553,6 +604,179 @@ func (p *Process) sessionCount() (int, error) {
 		return 0, err
 	}
 	return len(infos), nil
+}
+
+func (p *Process) ensureSessionExists(id string) error {
+	store := p.sessionStore
+	if store == nil {
+		return errSessionStoreUnavailable
+	}
+	_, err := store.Load(id)
+	return err
+}
+
+type SessionStreamEvent map[string]any
+
+func NewSessionStreamEvent(eventType string, fields map[string]any) SessionStreamEvent {
+	event := make(SessionStreamEvent, len(fields)+1)
+	for key, value := range fields {
+		event[key] = value
+	}
+	event["type"] = eventType
+	return event
+}
+
+func (p *Process) PublishSessionEvent(sessionID string, event SessionStreamEvent) error {
+	if !validSessionAPIID(sessionID) {
+		return fmt.Errorf("invalid session id")
+	}
+	if err := p.ensureSessionExists(sessionID); err != nil {
+		return err
+	}
+	payload, err := marshalSessionStreamEvent(event)
+	if err != nil {
+		return err
+	}
+	p.streams.publish(sessionID, payload)
+	return nil
+}
+
+func marshalSessionStreamEvent(event SessionStreamEvent) ([]byte, error) {
+	eventType, ok := event["type"].(string)
+	if !ok || strings.TrimSpace(eventType) == "" {
+		return nil, fmt.Errorf("stream event type is required")
+	}
+	payload, err := json.Marshal(event)
+	if err != nil {
+		return nil, fmt.Errorf("marshal stream event: %w", err)
+	}
+	return payload, nil
+}
+
+type sessionStreamHub struct {
+	mu       sync.Mutex
+	closed   bool
+	sessions map[string]map[*sessionStreamClient]struct{}
+}
+
+type sessionStreamClient struct {
+	hub       *sessionStreamHub
+	sessionID string
+	conn      *websocket.Conn
+	send      chan []byte
+	closeOnce sync.Once
+}
+
+func newSessionStreamHub() *sessionStreamHub {
+	return &sessionStreamHub{
+		sessions: make(map[string]map[*sessionStreamClient]struct{}),
+	}
+}
+
+func (h *sessionStreamHub) subscribe(sessionID string, conn *websocket.Conn) (*sessionStreamClient, bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.closed {
+		return nil, false
+	}
+	client := &sessionStreamClient{
+		hub:       h,
+		sessionID: sessionID,
+		conn:      conn,
+		send:      make(chan []byte, sessionStreamClientBuffer),
+	}
+	if h.sessions[sessionID] == nil {
+		h.sessions[sessionID] = make(map[*sessionStreamClient]struct{})
+	}
+	h.sessions[sessionID][client] = struct{}{}
+	return client, true
+}
+
+func (h *sessionStreamHub) publish(sessionID string, payload []byte) {
+	var slowClients []*sessionStreamClient
+	h.mu.Lock()
+	if !h.closed {
+		for client := range h.sessions[sessionID] {
+			select {
+			case client.send <- payload:
+			default:
+				slowClients = append(slowClients, client)
+			}
+		}
+	}
+	h.mu.Unlock()
+	for _, client := range slowClients {
+		client.close()
+	}
+}
+
+func (h *sessionStreamHub) close() {
+	h.mu.Lock()
+	if h.closed {
+		h.mu.Unlock()
+		return
+	}
+	h.closed = true
+	clients := make([]*sessionStreamClient, 0)
+	for _, sessionClients := range h.sessions {
+		for client := range sessionClients {
+			clients = append(clients, client)
+		}
+	}
+	h.sessions = make(map[string]map[*sessionStreamClient]struct{})
+	h.mu.Unlock()
+
+	for _, client := range clients {
+		c := client
+		c.closeOnce.Do(func() {
+			close(c.send)
+			_ = c.conn.Close()
+		})
+	}
+}
+
+func (h *sessionStreamHub) subscriberCount(sessionID string) int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return len(h.sessions[sessionID])
+}
+
+func (c *sessionStreamClient) writeLoop() {
+	defer c.close()
+	for payload := range c.send {
+		_ = c.conn.SetWriteDeadline(time.Now().Add(sessionStreamWriteTimeout))
+		if err := c.conn.WriteMessage(websocket.TextMessage, payload); err != nil {
+			return
+		}
+	}
+	_ = c.conn.SetWriteDeadline(time.Now().Add(sessionStreamWriteTimeout))
+	_ = c.conn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""), time.Now().Add(sessionStreamWriteTimeout))
+}
+
+func (c *sessionStreamClient) readLoop() {
+	defer c.close()
+	c.conn.SetReadLimit(1024)
+	for {
+		if _, _, err := c.conn.NextReader(); err != nil {
+			return
+		}
+	}
+}
+
+func (c *sessionStreamClient) close() {
+	c.closeOnce.Do(func() {
+		c.hub.mu.Lock()
+		sessionClients := c.hub.sessions[c.sessionID]
+		if sessionClients != nil {
+			delete(sessionClients, c)
+			if len(sessionClients) == 0 {
+				delete(c.hub.sessions, c.sessionID)
+			}
+		}
+		c.hub.mu.Unlock()
+		close(c.send)
+		_ = c.conn.Close()
+	})
 }
 
 type sessionMetadataDTO struct {
