@@ -22,6 +22,8 @@ const (
 	DefaultClientID  = "app_EMoamEEZ73f0CkXaXp7hrann"
 	DefaultScope     = "openid profile email offline_access"
 	defaultModelID   = "gpt-5.5"
+
+	deviceAuthUserCodePath = "/api/accounts/deviceauth/usercode"
 )
 
 type TokenFile struct {
@@ -307,7 +309,7 @@ func requestUserCode(ctx context.Context, options DeviceLoginOptions) (userCodeR
 		return userCodeResponse{}, fmt.Errorf("Codex user code response is missing device_auth_id")
 	}
 	if strings.TrimSpace(userCode.VerificationURI) == "" {
-		userCode.VerificationURI = strings.TrimRight(DefaultIssuerURL, "/") + "/device"
+		userCode.VerificationURI = fallbackVerificationURI(userCodeURL(options.UserCodeURL))
 	}
 	return userCode, nil
 }
@@ -365,13 +367,9 @@ func decodeAuthorizationPollResponse(response *http.Response, secret string) (au
 		}
 		return authorization, false, false, nil
 	}
-	var oauthErr struct {
-		Error string `json:"error"`
-	}
 	data, _ := io.ReadAll(io.LimitReader(response.Body, 4096))
-	_ = json.Unmarshal(data, &oauthErr)
-	switch oauthErr.Error {
-	case "authorization_pending":
+	switch authorizationPollErrorCode(data) {
+	case "authorization_pending", "deviceauth_authorization_pending":
 		return authorizationResponse{}, true, false, nil
 	case "slow_down":
 		return authorizationResponse{}, true, true, nil
@@ -465,7 +463,7 @@ func postJSON(ctx context.Context, client *http.Client, endpoint string, body an
 }
 
 func UserCodeURLForIssuer(issuer string) string {
-	return strings.TrimRight(strings.TrimSpace(issuer), "/") + "/api/accounts/deviceauth/usercode"
+	return strings.TrimRight(strings.TrimSpace(issuer), "/") + deviceAuthUserCodePath
 }
 
 func DeviceTokenURLForIssuer(issuer string) string {
@@ -482,6 +480,45 @@ func RedirectURIForIssuer(issuer string) string {
 
 func DefaultModelID() string {
 	return defaultModelID
+}
+
+func fallbackVerificationURI(userCodeEndpoint string) string {
+	issuer := strings.TrimRight(DefaultIssuerURL, "/")
+	endpoint := strings.TrimSpace(userCodeEndpoint)
+	if parsed, err := url.Parse(endpoint); err == nil && parsed.Scheme != "" && parsed.Host != "" {
+		path := strings.TrimRight(parsed.Path, "/")
+		if strings.HasSuffix(path, deviceAuthUserCodePath) {
+			parsed.Path = strings.TrimSuffix(path, deviceAuthUserCodePath)
+			parsed.RawPath = ""
+			parsed.RawQuery = ""
+			parsed.Fragment = ""
+			issuer = strings.TrimRight(parsed.String(), "/")
+		}
+	}
+	return issuer + "/codex/device"
+}
+
+func authorizationPollErrorCode(data []byte) string {
+	var body struct {
+		Error json.RawMessage `json:"error"`
+		Code  string          `json:"code"`
+	}
+	if err := json.Unmarshal(data, &body); err != nil {
+		return ""
+	}
+	if len(body.Error) != 0 && string(body.Error) != "null" {
+		var errorCode string
+		if err := json.Unmarshal(body.Error, &errorCode); err == nil && strings.TrimSpace(errorCode) != "" {
+			return strings.TrimSpace(errorCode)
+		}
+		var nested struct {
+			Code string `json:"code"`
+		}
+		if err := json.Unmarshal(body.Error, &nested); err == nil && strings.TrimSpace(nested.Code) != "" {
+			return strings.TrimSpace(nested.Code)
+		}
+	}
+	return strings.TrimSpace(body.Code)
 }
 
 func clientID(value string) string {

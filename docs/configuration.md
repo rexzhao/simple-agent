@@ -242,9 +242,11 @@ JSON 已存在，命令会在开始登录前失败。多个 provider 使用多�
 默认登录流程会向 issuer 的 `/api/accounts/deviceauth/usercode` 请求用户码，轮询
 `/api/accounts/deviceauth/token` 取得 `authorization_code` 和 `code_verifier`，再向
 `/oauth/token` 交换 access / refresh token。usercode 请求成功后，CLI 打印服务返回的
-verification URL / user code；deviceauth usercode/token 请求使用 JSON body，`/oauth/token`
-authorization-code exchange 和 refresh-token exchange 使用 form encoding。测试或私有部署
-可通过登录命令的 endpoint flags 指向 fake issuer。
+verification URL / user code；如果服务没有返回 verification URL，则使用 issuer 的
+`/codex/device` 作为 Codex device page fallback。deviceauth authorization-pending
+错误响应会继续轮询直到批准或过期。deviceauth usercode/token 请求使用 JSON body，
+`/oauth/token` authorization-code exchange 和 refresh-token exchange 使用 form
+encoding。测试或私有部署可通过登录命令的 endpoint flags 指向 fake issuer。
 
 `openai-codex` 运行时复用 OpenAI Responses adapter 的 request、SSE 和 function tool
 mapping，请求 `<base_url>/responses`。它从 `auth_file` 读取 access token，发送

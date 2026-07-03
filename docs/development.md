@@ -463,7 +463,9 @@ codex login --provider codex-work` 会生成或更新 `providers/codex-work.yaml
 不能打印其中的 token。access token 过期时运行时用 refresh token 刷新，并写回同一
 auth 文件。M16 不读取或导入 `~/.codex/auth.json`；首版登录使用 Codex headless device
 flow：先用 JSON body 调 `/api/accounts/deviceauth/usercode`，成功后打印返回的
-verification URL / user code，再用 JSON body 轮询 `/api/accounts/deviceauth/token`；
+verification URL / user code；如果服务没有返回 verification URL，则回退到 issuer 的
+`/codex/device` 页面。再用 JSON body 轮询 `/api/accounts/deviceauth/token`，其中
+authorization-pending 类错误响应继续按 pending 处理，直到用户批准或设备码过期；
 最后的 `/oauth/token` authorization-code exchange 继续使用 form encoding。不实现浏览器
 OAuth 回调。
 

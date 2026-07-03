@@ -1,6 +1,7 @@
 package codexauth
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
@@ -10,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 )
@@ -217,6 +219,74 @@ func TestDeviceLoginSlowDownIncreasesPollingInterval(t *testing.T) {
 		exchangeForm.Get("code_verifier") != "verifier-123" ||
 		exchangeForm.Get("redirect_uri") != server.URL+"/deviceauth/callback" {
 		t.Fatalf("exchange form = %#v", exchangeForm)
+	}
+}
+
+func TestDeviceLoginFallsBackToCodexDeviceURLAndPollsDeviceAuthPending(t *testing.T) {
+	now := time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC)
+	var tokenPolls int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/accounts/deviceauth/usercode":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"device_auth_id":"device-auth-123","user_code":"USER-123","interval":1,"expires_in":600}`)
+		case "/api/accounts/deviceauth/token":
+			tokenPolls++
+			w.Header().Set("Content-Type", "application/json")
+			switch tokenPolls {
+			case 1:
+				w.WriteHeader(http.StatusForbidden)
+				_, _ = io.WriteString(w, `{"code":"deviceauth_authorization_pending","message":"Device authorization is pending. Please try again."}`)
+			case 2:
+				w.WriteHeader(http.StatusForbidden)
+				_, _ = io.WriteString(w, `{"error":{"code":"deviceauth_authorization_pending","message":"Device authorization is pending. Please try again."}}`)
+			default:
+				_, _ = io.WriteString(w, `{"authorization_code":"auth-code","code_verifier":"verifier-123"}`)
+			}
+		case "/oauth/token":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"access_token":"access","refresh_token":"refresh","expires_in":3600}`)
+		default:
+			t.Fatalf("unexpected path %q", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	var output bytes.Buffer
+	var sleeps []time.Duration
+	result, err := DeviceLogin(context.Background(), DeviceLoginOptions{
+		UserCodeURL:    server.URL + "/api/accounts/deviceauth/usercode",
+		DeviceTokenURL: server.URL + "/api/accounts/deviceauth/token",
+		TokenURL:       server.URL + "/oauth/token",
+		RedirectURI:    server.URL + "/deviceauth/callback",
+		HTTPClient:     server.Client(),
+		Now:            func() time.Time { return now },
+		Output:         &output,
+		Sleep: func(ctx context.Context, duration time.Duration) error {
+			sleeps = append(sleeps, duration)
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("DeviceLogin() error = %v", err)
+	}
+	if result.VerificationURI != server.URL+"/codex/device" {
+		t.Fatalf("VerificationURI = %q, want %q", result.VerificationURI, server.URL+"/codex/device")
+	}
+	if !strings.Contains(output.String(), "Open "+server.URL+"/codex/device and enter code USER-123") {
+		t.Fatalf("output = %q, want fallback verification URI", output.String())
+	}
+	if result.Token.AccessToken != "access" || tokenPolls != 3 {
+		t.Fatalf("result token = %#v, tokenPolls = %d; want access token after pending polls", result.Token, tokenPolls)
+	}
+	wantSleeps := []time.Duration{time.Second, time.Second}
+	if len(sleeps) != len(wantSleeps) {
+		t.Fatalf("sleeps = %#v, want %#v", sleeps, wantSleeps)
+	}
+	for i := range wantSleeps {
+		if sleeps[i] != wantSleeps[i] {
+			t.Fatalf("sleeps[%d] = %s, want %s", i, sleeps[i], wantSleeps[i])
+		}
 	}
 }
 
