@@ -9,13 +9,13 @@ future work and should not be required by any slice here.
 
 ## Scope Guardrails
 
-- [ ] Treat `docs/server-gui.md`, `docs/milestones.md`, and `docs/checklist.md`
+- [x] Treat `docs/server-gui.md`, `docs/milestones.md`, and `docs/checklist.md`
   as the behavior source for M20.
-- [ ] Keep browser Web GUI UI, routing, frontend state management, and styling out
+- [x] Keep browser Web GUI UI, routing, frontend state management, and styling out
   of M20 implementation slices.
-- [ ] Preserve API and WebSocket semantics needed by a future GUI without letting
+- [x] Preserve API and WebSocket semantics needed by a future GUI without letting
   the CLI read session files, blob files, or `ActiveHistory` directly.
-- [ ] Keep every slice small enough to validate independently with focused tests
+- [x] Keep every slice small enough to validate independently with focused tests
   plus `git diff --check`.
 
 ## Implementation Slices
@@ -32,7 +32,7 @@ future work and should not be required by any slice here.
 - [x] Listen configuration: support default `127.0.0.1:0`, `--port N`,
   `--port 0`, and advanced loopback `--listen host:port`, with clear errors for
   occupied ports or unsupported addresses.
-- [ ] Registry model: create the per-user registry with canonical cwd,
+- [x] Registry model: create the per-user registry with canonical cwd,
   config path, addr, pid, random token, started_at, version, current-user file
   permissions, duplicate-start handling, and stale-record cleanup.
 - [x] Discovery model: implement upward discovery from current cwd or `--cwd`,
@@ -79,22 +79,22 @@ future work and should not be required by any slice here.
 
 ## Acceptance Criteria
 
-- [ ] A user can run `sai server --cwd X`, discover it from `X` or a child
+- [x] A user can run `sai server --cwd X`, discover it from `X` or a child
   directory, attach with bare `sai`, create or choose a session, send a message,
   receive streaming output, and stop the server cleanly.
-- [ ] `sai server --background` returns only after the server is healthy and
+- [x] `sai server --background` returns only after the server is healthy and
   discoverable, and it does not keep the caller terminal attached to long-lived
   stdout/stderr.
-- [ ] Registry duplicate-start, port conflict, upward discovery, stale cleanup,
+- [x] Registry duplicate-start, port conflict, upward discovery, stale cleanup,
   token usage, and stop semantics are covered by tests.
 - [ ] Session metadata, paginated items, item content, send message, compact
   command, shutdown, and WebSocket fanout are covered by focused API tests.
-- [ ] CLI tests cover `attach`, `status`, `stop`, `servers list`,
+- [x] CLI tests cover `attach`, `status`, `stop`, `servers list`,
   `sessions list/show`, `send`, and the no-server startup hint.
-- [ ] Failed turns remain transient, successful turns are persisted, and multiple
+- [x] Failed turns remain transient, successful turns are persisted, and multiple
   clients observing the same running turn see consistent stream events.
-- [ ] `view=chat` hides hidden compaction summaries, `view=debug` can expose debug
+- [x] `view=chat` hides hidden compaction summaries, `view=debug` can expose debug
   metadata through token-gated server APIs, and bare blob hash reads are rejected.
-- [ ] No implementation slice adds browser Web GUI UI.
-- [ ] `go test ./...` passes before marking M20 complete.
-- [ ] `git diff --check` passes before marking M20 complete.
+- [x] No implementation slice adds browser Web GUI UI.
+- [x] `go test ./...` passes before marking M20 complete.
+- [x] `git diff --check` passes before marking M20 complete.
