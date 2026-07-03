@@ -29,7 +29,7 @@ func TestStoreSaveLoadFullMessages(t *testing.T) {
 			"temperature": 0.2,
 		},
 		CWD:           `F:\work\simple-agent`,
-		ConfigDir:     filepath.Join(root, ".."),
+		ConfigPath:    filepath.Join(root, "..", "custom.yaml"),
 		EnabledTools:  []string{"read_file"},
 		EnabledMCP:    []string{"local"},
 		EnabledSkills: []string{"review"},
@@ -87,8 +87,11 @@ func TestStoreSaveLoadFullMessages(t *testing.T) {
 	if loaded.ID != saved.ID || loaded.Provider != saved.Provider || loaded.ModelProfile != saved.ModelProfile || loaded.ModelID != saved.ModelID {
 		t.Fatalf("loaded model metadata = %#v, want saved metadata %#v", loaded, saved)
 	}
-	if loaded.CWD != saved.CWD || loaded.ConfigDir != saved.ConfigDir {
-		t.Fatalf("loaded paths = cwd %q config %q, want cwd %q config %q", loaded.CWD, loaded.ConfigDir, saved.CWD, saved.ConfigDir)
+	if loaded.CWD != saved.CWD || loaded.ConfigPath != saved.ConfigPath {
+		t.Fatalf("loaded paths = cwd %q config %q, want cwd %q config %q", loaded.CWD, loaded.ConfigPath, saved.CWD, saved.ConfigPath)
+	}
+	if loaded.RootConfigPath() != saved.ConfigPath {
+		t.Fatalf("RootConfigPath() = %q, want %q", loaded.RootConfigPath(), saved.ConfigPath)
 	}
 	if !reflect.DeepEqual(loaded.EnabledTools, saved.EnabledTools) {
 		t.Fatalf("EnabledTools = %#v, want %#v", loaded.EnabledTools, saved.EnabledTools)
@@ -116,6 +119,15 @@ func TestStoreSaveLoadFullMessages(t *testing.T) {
 	}
 	if got := loaded.ModelParameters["max_tokens"]; jsonNumberString(got) != "2048" {
 		t.Fatalf("max_tokens = %#v, want 2048", got)
+	}
+}
+
+func TestSessionRootConfigPathFallsBackToLegacyConfigDir(t *testing.T) {
+	session := Session{ConfigDir: filepath.Join("project", ".agents")}
+
+	want := filepath.Join("project", ".agents", "sai.yaml")
+	if got := session.RootConfigPath(); got != want {
+		t.Fatalf("RootConfigPath() = %q, want %q", got, want)
 	}
 }
 

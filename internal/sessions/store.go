@@ -30,7 +30,8 @@ type Session struct {
 	ModelID              string                 `json:"model_id"`
 	ModelParameters      map[string]any         `json:"model_parameters,omitempty"`
 	CWD                  string                 `json:"cwd"`
-	ConfigDir            string                 `json:"config_dir"`
+	ConfigPath           string                 `json:"config_path,omitempty"`
+	ConfigDir            string                 `json:"config_dir,omitempty"`
 	EnabledTools         []string               `json:"enabled_tools,omitempty"`
 	EnabledMCP           []string               `json:"enabled_mcp,omitempty"`
 	EnabledSkills        []string               `json:"enabled_skills,omitempty"`
@@ -39,6 +40,16 @@ type Session struct {
 	Messages             []model.Message        `json:"messages"`
 	Context              contextwindow.Metadata `json:"context,omitempty"`
 	SaveToolResults      bool                   `json:"save_tool_results"`
+}
+
+func (s Session) RootConfigPath() string {
+	if strings.TrimSpace(s.ConfigPath) != "" {
+		return s.ConfigPath
+	}
+	if strings.TrimSpace(s.ConfigDir) != "" {
+		return filepath.Join(s.ConfigDir, "sai.yaml")
+	}
+	return ""
 }
 
 type Info struct {

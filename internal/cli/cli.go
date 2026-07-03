@@ -41,24 +41,40 @@ const (
 )
 
 func Run(args []string, stdout, stderr io.Writer) int {
+	return RunWithProgram("sai", args, stdout, stderr)
+}
+
+func RunWithProgram(program string, args []string, stdout, stderr io.Writer) int {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
-	return RunWithContext(ctx, args, os.Stdin, stdout, stderr, os.Getwd)
+	return RunWithProgramContext(ctx, program, args, os.Stdin, stdout, stderr, os.Getwd)
 }
 
 func RunWithGetwd(args []string, stdout, stderr io.Writer, getwd func() (string, error)) int {
-	return RunWithIO(args, os.Stdin, stdout, stderr, getwd)
+	return RunWithProgramGetwd("sai", args, stdout, stderr, getwd)
+}
+
+func RunWithProgramGetwd(program string, args []string, stdout, stderr io.Writer, getwd func() (string, error)) int {
+	return RunWithProgramIO(program, args, os.Stdin, stdout, stderr, getwd)
 }
 
 func RunWithIO(args []string, stdin io.Reader, stdout, stderr io.Writer, getwd func() (string, error)) int {
-	return RunWithContext(context.Background(), args, stdin, stdout, stderr, getwd)
+	return RunWithProgramIO("sai", args, stdin, stdout, stderr, getwd)
+}
+
+func RunWithProgramIO(program string, args []string, stdin io.Reader, stdout, stderr io.Writer, getwd func() (string, error)) int {
+	return RunWithProgramContext(context.Background(), program, args, stdin, stdout, stderr, getwd)
 }
 
 func RunWithContext(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer, getwd func() (string, error)) int {
+	return RunWithProgramContext(ctx, "sai", args, stdin, stdout, stderr, getwd)
+}
+
+func RunWithProgramContext(ctx context.Context, program string, args []string, stdin io.Reader, stdout, stderr io.Writer, getwd func() (string, error)) int {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if err := execute(ctx, args, stdin, stdout, stderr, getwd); err != nil {
+	if err := execute(ctx, program, args, stdin, stdout, stderr, getwd); err != nil {
 		if errors.Is(err, errSilentExit) {
 			return 1
 		}
@@ -70,7 +86,7 @@ func RunWithContext(ctx context.Context, args []string, stdin io.Reader, stdout,
 
 var errSilentExit = errors.New("silent exit")
 
-func execute(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer, getwd func() (string, error)) error {
+func execute(ctx context.Context, program string, args []string, stdin io.Reader, stdout, stderr io.Writer, getwd func() (string, error)) error {
 	rootArgs, err := splitRootArgs(args)
 	if err != nil {
 		return err
@@ -80,7 +96,7 @@ func execute(ctx context.Context, args []string, stdin io.Reader, stdout, stderr
 			printRootUsage(stdout)
 			return nil
 		}
-		return chatCommand(ctx, rootArgs.commandArgs, rootArgs.configDir, stdin, stdout, stderr, getwd)
+		return chatCommand(ctx, rootArgs.commandArgs, rootArgs.configPath, stdin, stdout, stderr, getwd, program)
 	}
 
 	switch rootArgs.command {
@@ -100,7 +116,7 @@ func execute(ctx context.Context, args []string, stdin io.Reader, stdout, stderr
 		if subcommand != "show" {
 			return usageError("usage: sai config show", "", "sai help config show")
 		}
-		return configShowCommand(subArgs, rootArgs.configDir, stdout, getwd)
+		return configShowCommand(subArgs, rootArgs.configPath, stdout, getwd, program)
 	case "models":
 		subcommand, subArgs, groupHelp, err := splitSubcommandArgs(rootArgs.commandArgs, nil, "sai help models")
 		if err != nil {
@@ -113,11 +129,11 @@ func execute(ctx context.Context, args []string, stdin io.Reader, stdout, stderr
 		if subcommand != "list" {
 			return usageError("usage: sai models list", "", "sai help models list")
 		}
-		return modelsListCommand(subArgs, rootArgs.configDir, stdout, getwd)
+		return modelsListCommand(subArgs, rootArgs.configPath, stdout, getwd, program)
 	case "doctor":
-		return doctorCommand(rootArgs.commandArgs, rootArgs.configDir, stdout, getwd)
+		return doctorCommand(rootArgs.commandArgs, rootArgs.configPath, stdout, getwd, program)
 	case "auth":
-		return authCommand(ctx, rootArgs.commandArgs, rootArgs.configDir, stdout, getwd)
+		return authCommand(ctx, rootArgs.commandArgs, rootArgs.configPath, stdout, getwd, program)
 	case "tools":
 		subcommand, subArgs, groupHelp, err := splitSubcommandArgs(rootArgs.commandArgs, nil, "sai help tools")
 		if err != nil {
@@ -143,7 +159,7 @@ func execute(ctx context.Context, args []string, stdin io.Reader, stdout, stderr
 		if subcommand != "list" {
 			return usageError("usage: sai mcp list [--enable-mcp ids]", "", "sai help mcp list")
 		}
-		return mcpListCommand(subArgs, rootArgs.configDir, stdout, getwd)
+		return mcpListCommand(subArgs, rootArgs.configPath, stdout, getwd, program)
 	case "sessions":
 		subcommand, subArgs, groupHelp, err := splitSubcommandArgs(rootArgs.commandArgs, map[string]flagKind{"keep": flagKindValue}, "sai help sessions")
 		if err != nil {
@@ -155,24 +171,24 @@ func execute(ctx context.Context, args []string, stdin io.Reader, stdout, stderr
 		}
 		switch subcommand {
 		case "list":
-			return sessionsListCommand(subArgs, rootArgs.configDir, stdout, getwd)
+			return sessionsListCommand(subArgs, rootArgs.configPath, stdout, getwd, program)
 		case "show":
-			return sessionsShowCommand(subArgs, rootArgs.configDir, stdout, getwd)
+			return sessionsShowCommand(subArgs, rootArgs.configPath, stdout, getwd, program)
 		case "delete":
-			return sessionsDeleteCommand(subArgs, rootArgs.configDir, stdout, getwd)
+			return sessionsDeleteCommand(subArgs, rootArgs.configPath, stdout, getwd, program)
 		case "prune":
-			return sessionsPruneCommand(subArgs, rootArgs.configDir, stdout, getwd)
+			return sessionsPruneCommand(subArgs, rootArgs.configPath, stdout, getwd, program)
 		default:
 			return usageError("usage: sai sessions <list|show|delete|prune>", "", "sai help sessions")
 		}
 	case "chat":
-		return chatCommand(ctx, rootArgs.commandArgs, rootArgs.configDir, stdin, stdout, stderr, getwd)
+		return chatCommand(ctx, rootArgs.commandArgs, rootArgs.configPath, stdin, stdout, stderr, getwd, program)
 	default:
 		return usageError(fmt.Sprintf("unknown command %q", rootArgs.command), "", "sai help")
 	}
 }
 
-const rootUsageText = `usage: sai [--config-dir dir] [command] [args]
+const rootUsageText = `usage: sai [--config file] [command] [args]
 
 Commands:
   chat              Start a chat session
@@ -497,7 +513,7 @@ const (
 )
 
 type rootArgs struct {
-	configDir   string
+	configPath  string
 	command     string
 	commandArgs []string
 	hasHelp     bool
@@ -505,7 +521,7 @@ type rootArgs struct {
 
 func splitRootArgs(args []string) (rootArgs, error) {
 	known := map[string]flagKind{
-		"config-dir":     flagKindValue,
+		"config":         flagKindValue,
 		"provider":       flagKindValue,
 		"model":          flagKindValue,
 		"prompt":         flagKindValue,
@@ -551,12 +567,12 @@ func splitRootArgs(args []string) (rootArgs, error) {
 		if isHelpArg(arg) {
 			out.hasHelp = true
 		}
-		if name == "config-dir" {
+		if name == "config" {
 			value, next, err := flagValue(args, i, name, hasInlineValue)
 			if err != nil {
 				return rootArgs{}, usageError(err.Error(), "", "sai help")
 			}
-			out.configDir = value
+			out.configPath = value
 			i = next
 			continue
 		}
@@ -585,12 +601,12 @@ func stripGlobalArgs(args rootArgs) (rootArgs, error) {
 			break
 		}
 		name, hasInlineValue := flagName(arg)
-		if isFlagArg(arg) && name == "config-dir" {
+		if isFlagArg(arg) && name == "config" {
 			value, next, err := flagValue(args.commandArgs, i, name, hasInlineValue)
 			if err != nil {
 				return rootArgs{}, usageError(err.Error(), "", "sai help")
 			}
-			args.configDir = value
+			args.configPath = value
 			i = next
 			continue
 		}
@@ -664,7 +680,7 @@ func versionCommand(args []string, stdout io.Writer) error {
 	return nil
 }
 
-func configShowCommand(args []string, configDir string, stdout io.Writer, getwd func() (string, error)) error {
+func configShowCommand(args []string, configPath string, stdout io.Writer, getwd func() (string, error), program string) error {
 	flags := flag.NewFlagSet("sai config show", flag.ContinueOnError)
 	positionals, done, err := parseCommandFlagArgs(flags, args, stdout, printConfigShowUsage, "sai help config show")
 	if done || err != nil {
@@ -674,7 +690,7 @@ func configShowCommand(args []string, configDir string, stdout io.Writer, getwd 
 		return usageError("usage: sai config show", "", "sai help config show")
 	}
 
-	cfg, err := loadConfig(configDir, getwd)
+	cfg, err := loadConfig(configPath, getwd, program)
 	if err != nil {
 		return err
 	}
@@ -684,7 +700,7 @@ func configShowCommand(args []string, configDir string, stdout io.Writer, getwd 
 	return encoder.Encode(cfg)
 }
 
-func modelsListCommand(args []string, configDir string, stdout io.Writer, getwd func() (string, error)) error {
+func modelsListCommand(args []string, configPath string, stdout io.Writer, getwd func() (string, error), program string) error {
 	flags := flag.NewFlagSet("sai models list", flag.ContinueOnError)
 	positionals, done, err := parseCommandFlagArgs(flags, args, stdout, printModelsListUsage, "sai help models list")
 	if done || err != nil {
@@ -694,7 +710,7 @@ func modelsListCommand(args []string, configDir string, stdout io.Writer, getwd 
 		return usageError("usage: sai models list", "", "sai help models list")
 	}
 
-	cfg, err := loadConfig(configDir, getwd)
+	cfg, err := loadConfig(configPath, getwd, program)
 	if err != nil {
 		return err
 	}
@@ -705,7 +721,7 @@ func modelsListCommand(args []string, configDir string, stdout io.Writer, getwd 
 	return nil
 }
 
-func doctorCommand(args []string, configDir string, stdout io.Writer, getwd func() (string, error)) error {
+func doctorCommand(args []string, configPath string, stdout io.Writer, getwd func() (string, error), program string) error {
 	flags := flag.NewFlagSet("sai doctor", flag.ContinueOnError)
 	positionals, done, err := parseCommandFlagArgs(flags, args, stdout, printDoctorUsage, "sai help doctor")
 	if done || err != nil {
@@ -715,7 +731,7 @@ func doctorCommand(args []string, configDir string, stdout io.Writer, getwd func
 		return usageError("usage: sai doctor", "", "sai help doctor")
 	}
 
-	results := runDoctor(configDir, getwd)
+	results := runDoctor(configPath, getwd, program)
 	hasError := false
 	for _, result := range results {
 		if result.status == doctorStatusError {
@@ -731,7 +747,7 @@ func doctorCommand(args []string, configDir string, stdout io.Writer, getwd func
 	return nil
 }
 
-func authCommand(ctx context.Context, args []string, configDir string, stdout io.Writer, getwd func() (string, error)) error {
+func authCommand(ctx context.Context, args []string, configPath string, stdout io.Writer, getwd func() (string, error), program string) error {
 	if len(args) == 0 || containsHelpArg(args) && len(args) == 1 {
 		printAuthUsage(stdout)
 		return nil
@@ -739,10 +755,10 @@ func authCommand(ctx context.Context, args []string, configDir string, stdout io
 	if args[0] != "codex" {
 		return usageError("usage: sai auth codex login", "", "sai help auth")
 	}
-	return authCodexCommand(ctx, args[1:], configDir, stdout, getwd)
+	return authCodexCommand(ctx, args[1:], configPath, stdout, getwd, program)
 }
 
-func authCodexCommand(ctx context.Context, args []string, configDir string, stdout io.Writer, getwd func() (string, error)) error {
+func authCodexCommand(ctx context.Context, args []string, configPath string, stdout io.Writer, getwd func() (string, error), program string) error {
 	if len(args) == 0 || containsHelpArg(args) && len(args) == 1 {
 		printAuthCodexUsage(stdout)
 		return nil
@@ -750,10 +766,10 @@ func authCodexCommand(ctx context.Context, args []string, configDir string, stdo
 	if args[0] != "login" {
 		return usageError("usage: sai auth codex login", "", "sai help auth codex")
 	}
-	return authCodexLoginCommand(ctx, args[1:], configDir, stdout, getwd)
+	return authCodexLoginCommand(ctx, args[1:], configPath, stdout, getwd, program)
 }
 
-func authCodexLoginCommand(ctx context.Context, args []string, configDir string, stdout io.Writer, getwd func() (string, error)) error {
+func authCodexLoginCommand(ctx context.Context, args []string, configPath string, stdout io.Writer, getwd func() (string, error), program string) error {
 	flags := flag.NewFlagSet("sai auth codex login", flag.ContinueOnError)
 	providerName := flags.String("provider", "codex", "provider name")
 	force := flags.Bool("force", false, "overwrite generated provider and auth files")
@@ -783,7 +799,7 @@ func authCodexLoginCommand(ctx context.Context, args []string, configDir string,
 		return fmt.Errorf("--context-window must be a positive integer")
 	}
 
-	cfg, err := loadBaseConfig(configDir, getwd)
+	cfg, err := loadBaseConfig(configPath, getwd, program)
 	if err != nil {
 		return err
 	}
@@ -838,15 +854,12 @@ func authCodexLoginCommand(ctx context.Context, args []string, configDir string,
 	return nil
 }
 
-func loadBaseConfig(configDir string, getwd func() (string, error)) (*config.Config, error) {
-	if configDir == "" {
-		cwd, err := getwd()
-		if err != nil {
-			return nil, fmt.Errorf("get current directory: %w", err)
-		}
-		configDir = filepath.Join(cwd, ".agents")
+func loadBaseConfig(configPath string, getwd func() (string, error), program string) (*config.Config, error) {
+	resolved, err := resolveConfigPath(configPath, getwd, program)
+	if err != nil {
+		return nil, err
 	}
-	return config.LoadBase(configDir)
+	return config.LoadBase(resolved)
 }
 
 func validateGeneratedProviderName(name string) error {
@@ -907,33 +920,27 @@ type doctorResult struct {
 	detail  string
 }
 
-func runDoctor(configDir string, getwd func() (string, error)) []doctorResult {
+func runDoctor(configPath string, getwd func() (string, error), program string) []doctorResult {
 	var results []doctorResult
 	add := func(status doctorStatus, subject, detail string) {
 		results = append(results, doctorResult{status: status, subject: subject, detail: detail})
 	}
 
-	resolvedConfigDir, err := resolveConfigDir(configDir, getwd)
+	resolvedConfigPath, err := resolveConfigPath(configPath, getwd, program)
 	if err != nil {
-		add(doctorStatusError, "config_dir", err.Error())
+		add(doctorStatusError, "config_path", err.Error())
 		return results
 	}
-	if err := checkExistingDirectory(resolvedConfigDir); err != nil {
-		add(doctorStatusError, "config_dir", fmt.Sprintf("%s: %v", resolvedConfigDir, err))
-	} else {
-		add(doctorStatusOK, "config_dir", resolvedConfigDir)
-	}
-
-	configPath := filepath.Join(resolvedConfigDir, "sai.yaml")
-	if _, err := os.ReadFile(configPath); err != nil {
-		add(doctorStatusError, "sai.yaml", fmt.Sprintf("%s: %v", configPath, err))
+	add(doctorStatusOK, "config_path", resolvedConfigPath)
+	if _, err := os.ReadFile(resolvedConfigPath); err != nil {
+		add(doctorStatusError, "config_file", fmt.Sprintf("%s: %v", resolvedConfigPath, err))
 		return results
 	}
-	add(doctorStatusOK, "sai.yaml", fmt.Sprintf("%s readable", configPath))
+	add(doctorStatusOK, "config_file", fmt.Sprintf("%s readable", resolvedConfigPath))
 
-	cfg, err := config.LoadBase(resolvedConfigDir)
+	cfg, err := config.LoadBase(resolvedConfigPath)
 	if err != nil {
-		add(doctorStatusError, "sai.yaml", err.Error())
+		add(doctorStatusError, "config_file", err.Error())
 		return results
 	}
 
@@ -1129,19 +1136,33 @@ func checkDoctorLogging(cfg *config.Config, add func(doctorStatus, string, strin
 	add(doctorStatusOK, "logging", fmt.Sprintf("%s writable", root))
 }
 
-func resolveConfigDir(configDir string, getwd func() (string, error)) (string, error) {
-	if strings.TrimSpace(configDir) == "" {
+func resolveConfigPath(configPath string, getwd func() (string, error), program string) (string, error) {
+	if strings.TrimSpace(configPath) == "" {
 		cwd, err := getwd()
 		if err != nil {
 			return "", fmt.Errorf("get current directory: %w", err)
 		}
-		configDir = filepath.Join(cwd, ".agents")
+		configPath = filepath.Join(cwd, ".agents", defaultConfigBasename(program)+".yaml")
 	}
-	abs, err := filepath.Abs(configDir)
+	abs, err := filepath.Abs(configPath)
 	if err != nil {
-		return "", fmt.Errorf("resolve config directory: %w", err)
+		return "", fmt.Errorf("resolve config file: %w", err)
 	}
 	return filepath.Clean(abs), nil
+}
+
+func defaultConfigBasename(program string) string {
+	base := strings.TrimSpace(filepath.Base(program))
+	if base == "" || base == "." || base == string(filepath.Separator) {
+		return "sai"
+	}
+	if strings.EqualFold(filepath.Ext(base), ".exe") {
+		base = strings.TrimSuffix(base, filepath.Ext(base))
+	}
+	if base == "" {
+		return "sai"
+	}
+	return base
 }
 
 func checkExistingDirectory(path string) error {
@@ -1244,7 +1265,7 @@ func cleanupCreatedDirectories(paths []string) {
 	}
 }
 
-func mcpListCommand(args []string, configDir string, stdout io.Writer, getwd func() (string, error)) error {
+func mcpListCommand(args []string, configPath string, stdout io.Writer, getwd func() (string, error), program string) error {
 	flags := flag.NewFlagSet("sai mcp list", flag.ContinueOnError)
 	var enabledMCP mcpServerIDsFlag
 	flags.Var(&enabledMCP, "enable-mcp", "comma-separated MCP server ids to enable")
@@ -1256,7 +1277,7 @@ func mcpListCommand(args []string, configDir string, stdout io.Writer, getwd fun
 		return usageError("usage: sai mcp list [--enable-mcp ids]", "", "sai help mcp list")
 	}
 
-	cfg, err := loadConfig(configDir, getwd)
+	cfg, err := loadConfig(configPath, getwd, program)
 	if err != nil {
 		return err
 	}
@@ -1292,7 +1313,7 @@ func toolsListCommand(args []string, stdout io.Writer) error {
 	return nil
 }
 
-func sessionsListCommand(args []string, configDir string, stdout io.Writer, getwd func() (string, error)) error {
+func sessionsListCommand(args []string, configPath string, stdout io.Writer, getwd func() (string, error), program string) error {
 	flags := flag.NewFlagSet("sai sessions list", flag.ContinueOnError)
 	positionals, done, err := parseCommandFlagArgs(flags, args, stdout, printSessionsListUsage, "sai help sessions list")
 	if done || err != nil {
@@ -1302,7 +1323,7 @@ func sessionsListCommand(args []string, configDir string, stdout io.Writer, getw
 		return usageError("usage: sai sessions list", "", "sai help sessions list")
 	}
 
-	store, err := sessionStoreFromConfig(configDir, getwd)
+	store, err := sessionStoreFromConfig(configPath, getwd, program)
 	if err != nil {
 		return err
 	}
@@ -1318,7 +1339,7 @@ func sessionsListCommand(args []string, configDir string, stdout io.Writer, getw
 	return nil
 }
 
-func sessionsShowCommand(args []string, configDir string, stdout io.Writer, getwd func() (string, error)) error {
+func sessionsShowCommand(args []string, configPath string, stdout io.Writer, getwd func() (string, error), program string) error {
 	flags := flag.NewFlagSet("sai sessions show", flag.ContinueOnError)
 	positionals, done, err := parseCommandFlagArgs(flags, args, stdout, printSessionsShowUsage, "sai help sessions show")
 	if done || err != nil {
@@ -1328,7 +1349,7 @@ func sessionsShowCommand(args []string, configDir string, stdout io.Writer, getw
 		return usageError("usage: sai sessions show <id>", "", "sai help sessions show")
 	}
 
-	store, err := sessionStoreFromConfig(configDir, getwd)
+	store, err := sessionStoreFromConfig(configPath, getwd, program)
 	if err != nil {
 		return err
 	}
@@ -1347,7 +1368,7 @@ func sessionsShowCommand(args []string, configDir string, stdout io.Writer, getw
 	fmt.Fprintf(stdout, "MODEL_PROFILE\t%s\n", session.ModelProfile)
 	fmt.Fprintf(stdout, "MODEL_ID\t%s\n", session.ModelID)
 	fmt.Fprintf(stdout, "CWD\t%s\n", session.CWD)
-	fmt.Fprintf(stdout, "CONFIG_DIR\t%s\n", session.ConfigDir)
+	fmt.Fprintf(stdout, "CONFIG_PATH\t%s\n", session.RootConfigPath())
 	fmt.Fprintf(stdout, "ENABLED_TOOLS\t%s\n", formatSessionStringList(session.EnabledTools))
 	fmt.Fprintf(stdout, "ENABLED_MCP\t%s\n", formatSessionStringList(session.EnabledMCP))
 	fmt.Fprintf(stdout, "ENABLED_SKILLS\t%s\n", formatSessionStringList(session.EnabledSkills))
@@ -1368,7 +1389,7 @@ func sessionsShowCommand(args []string, configDir string, stdout io.Writer, getw
 	return nil
 }
 
-func sessionsDeleteCommand(args []string, configDir string, stdout io.Writer, getwd func() (string, error)) error {
+func sessionsDeleteCommand(args []string, configPath string, stdout io.Writer, getwd func() (string, error), program string) error {
 	flags := flag.NewFlagSet("sai sessions delete", flag.ContinueOnError)
 	positionals, done, err := parseCommandFlagArgs(flags, args, stdout, printSessionsDeleteUsage, "sai help sessions delete")
 	if done || err != nil {
@@ -1378,7 +1399,7 @@ func sessionsDeleteCommand(args []string, configDir string, stdout io.Writer, ge
 		return usageError("usage: sai sessions delete <id>", "", "sai help sessions delete")
 	}
 
-	store, err := sessionStoreFromConfig(configDir, getwd)
+	store, err := sessionStoreFromConfig(configPath, getwd, program)
 	if err != nil {
 		return err
 	}
@@ -1389,7 +1410,7 @@ func sessionsDeleteCommand(args []string, configDir string, stdout io.Writer, ge
 	return nil
 }
 
-func sessionsPruneCommand(args []string, configDir string, stdout io.Writer, getwd func() (string, error)) error {
+func sessionsPruneCommand(args []string, configPath string, stdout io.Writer, getwd func() (string, error), program string) error {
 	flags := flag.NewFlagSet("sai sessions prune", flag.ContinueOnError)
 	keep := flags.Int("keep", -1, "number of most recently updated sessions to keep")
 	positionals, done, err := parseCommandFlagArgs(flags, args, stdout, printSessionsPruneUsage, "sai help sessions prune")
@@ -1412,7 +1433,7 @@ func sessionsPruneCommand(args []string, configDir string, stdout io.Writer, get
 		return usageError("--keep must be 0 or greater", sessionsPruneUsageText, "sai help sessions prune")
 	}
 
-	store, err := sessionStoreFromConfig(configDir, getwd)
+	store, err := sessionStoreFromConfig(configPath, getwd, program)
 	if err != nil {
 		return err
 	}
@@ -1439,8 +1460,8 @@ func sessionsPruneCommand(args []string, configDir string, stdout io.Writer, get
 	return nil
 }
 
-func sessionStoreFromConfig(configDir string, getwd func() (string, error)) (*sessions.Store, error) {
-	cfg, err := loadConfig(configDir, getwd)
+func sessionStoreFromConfig(configPath string, getwd func() (string, error), program string) (*sessions.Store, error) {
+	cfg, err := loadConfig(configPath, getwd, program)
 	if err != nil {
 		return nil, err
 	}
@@ -1533,7 +1554,7 @@ func (options agentCommandFlags) validate(helpCommand string) error {
 	return nil
 }
 
-func chatCommand(ctx context.Context, args []string, configDir string, stdin io.Reader, stdout, stderr io.Writer, getwd func() (string, error)) (chatErr error) {
+func chatCommand(ctx context.Context, args []string, configPath string, stdin io.Reader, stdout, stderr io.Writer, getwd func() (string, error), program string) (chatErr error) {
 	flags := flag.NewFlagSet("sai chat", flag.ContinueOnError)
 	var options agentCommandFlags
 	registerAgentCommandFlags(flags, &options)
@@ -1570,7 +1591,7 @@ func chatCommand(ctx context.Context, args []string, configDir string, stdin io.
 		return usageError("--file requires --quit", chatUsageText, "sai help chat")
 	}
 
-	runtime, err := prepareAgentRuntime(ctx, configDir, options, stderr, getwd)
+	runtime, err := prepareAgentRuntime(ctx, configPath, options, stderr, getwd, program)
 	if err != nil {
 		return err
 	}
@@ -1822,7 +1843,7 @@ func isBoolFlagValue(value flag.Value) bool {
 
 type agentRuntime struct {
 	cwd                   string
-	configDir             string
+	configPath            string
 	providerName          string
 	modelProfile          string
 	modelID               string
@@ -1907,7 +1928,8 @@ func (r *agentRuntime) saveUpdatedMessages(messages []model.Message) error {
 	session.ModelID = r.modelID
 	session.ModelParameters = copyParameterMap(r.parameters)
 	session.CWD = r.cwd
-	session.ConfigDir = r.configDir
+	session.ConfigPath = r.configPath
+	session.ConfigDir = ""
 	session.EnabledTools = copyStringSlice(r.enabledTools)
 	session.EnabledMCP = copyStringSlice(r.enabledMCP)
 	session.EnabledSkills = copyStringSlice(r.enabledSkills)
@@ -1929,14 +1951,14 @@ func (r *agentRuntime) saveUpdatedMessages(messages []model.Message) error {
 	return nil
 }
 
-func prepareAgentRuntime(ctx context.Context, configDir string, options agentCommandFlags, stderr io.Writer, getwd func() (string, error)) (runtime *agentRuntime, err error) {
+func prepareAgentRuntime(ctx context.Context, configPath string, options agentCommandFlags, stderr io.Writer, getwd func() (string, error), program string) (runtime *agentRuntime, err error) {
 	cwd, err := getwd()
 	if err != nil {
 		return nil, fmt.Errorf("get current directory: %w", err)
 	}
-	cfg, err := loadConfig(configDir, func() (string, error) {
+	cfg, err := loadConfig(configPath, func() (string, error) {
 		return cwd, nil
-	})
+	}, program)
 	if err != nil {
 		return nil, err
 	}
@@ -2064,7 +2086,7 @@ func prepareAgentRuntime(ctx context.Context, configDir string, options agentCom
 
 	return &agentRuntime{
 		cwd:                   cwd,
-		configDir:             cfg.ConfigDir,
+		configPath:            cfg.ConfigPath,
 		providerName:          resolved.ProviderName,
 		modelProfile:          resolved.Profile,
 		modelID:               resolved.ModelID,
@@ -2280,8 +2302,8 @@ func (f *mcpServerIDsFlag) String() string {
 }
 
 func writeVerboseDiagnostics(stderr io.Writer, cfg *config.Config, resolved config.ResolvedModel, enabledTools []string, showReasoning bool, logPath string) error {
-	_, err := fmt.Fprintf(stderr, "config_dir: %s\nprovider: %s\nmodel_profile: %s\nmodel_id: %s\nlog_path: %s\nmax_turns: %d\nenabled_tools: %s\nshow_reasoning: %t\n",
-		cfg.ConfigDir,
+	_, err := fmt.Fprintf(stderr, "config_path: %s\nprovider: %s\nmodel_profile: %s\nmodel_id: %s\nlog_path: %s\nmax_turns: %d\nenabled_tools: %s\nshow_reasoning: %t\n",
+		cfg.ConfigPath,
 		resolved.ProviderName,
 		resolved.Profile,
 		resolved.ModelID,
@@ -2446,15 +2468,12 @@ func closeMCPSessions(sessions []*mcp.Session) error {
 	return nil
 }
 
-func loadConfig(configDir string, getwd func() (string, error)) (*config.Config, error) {
-	if configDir == "" {
-		cwd, err := getwd()
-		if err != nil {
-			return nil, fmt.Errorf("get current directory: %w", err)
-		}
-		configDir = filepath.Join(cwd, ".agents")
+func loadConfig(configPath string, getwd func() (string, error), program string) (*config.Config, error) {
+	resolved, err := resolveConfigPath(configPath, getwd, program)
+	if err != nil {
+		return nil, err
 	}
-	return config.Load(configDir)
+	return config.Load(resolved)
 }
 
 func newProviderForRun(providerName, modelType string, provider config.ProviderConfig) (model.Provider, error) {

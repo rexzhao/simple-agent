@@ -14,7 +14,7 @@ import (
 )
 
 type Config struct {
-	ConfigDir       string                     `json:"config_dir" yaml:"config_dir"`
+	ConfigPath      string                     `json:"config_path" yaml:"-"`
 	DefaultProvider string                     `json:"default_provider" yaml:"default_provider"`
 	DefaultModel    string                     `json:"default_model" yaml:"default_model"`
 	ProviderDir     string                     `json:"provider_dir" yaml:"provider_dir"`
@@ -114,8 +114,8 @@ func (p ProviderConfig) MarshalJSON() ([]byte, error) {
 	return bytes.TrimSpace(buf.Bytes()), nil
 }
 
-func Load(configDir string) (*Config, error) {
-	cfg, err := LoadBase(configDir)
+func Load(configPath string) (*Config, error) {
+	cfg, err := LoadBase(configPath)
 	if err != nil {
 		return nil, err
 	}
@@ -134,39 +134,39 @@ func Load(configDir string) (*Config, error) {
 	return cfg, nil
 }
 
-func LoadBase(configDir string) (*Config, error) {
-	if strings.TrimSpace(configDir) == "" {
-		return nil, fmt.Errorf("config directory is required")
+func LoadBase(configPath string) (*Config, error) {
+	if strings.TrimSpace(configPath) == "" {
+		return nil, fmt.Errorf("config file is required")
 	}
 
-	absConfigDir, err := filepath.Abs(configDir)
+	absConfigPath, err := filepath.Abs(configPath)
 	if err != nil {
-		return nil, fmt.Errorf("resolve config directory: %w", err)
+		return nil, fmt.Errorf("resolve config file: %w", err)
 	}
-	absConfigDir = filepath.Clean(absConfigDir)
+	absConfigPath = filepath.Clean(absConfigPath)
+	configDir := filepath.Dir(absConfigPath)
 
 	cfg := defaultConfig()
-	configPath := filepath.Join(absConfigDir, "sai.yaml")
-	data, err := os.ReadFile(configPath)
+	data, err := os.ReadFile(absConfigPath)
 	if err != nil {
-		return nil, fmt.Errorf("read sai.yaml: %w", err)
+		return nil, fmt.Errorf("read config file %q: %w", absConfigPath, err)
 	}
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
-		return nil, fmt.Errorf("parse sai.yaml: %w", err)
+		return nil, fmt.Errorf("parse config file %q: %w", absConfigPath, err)
 	}
 
-	cfg.ConfigDir = absConfigDir
-	cfg.ProviderDir = resolvePath(absConfigDir, cfg.ProviderDir)
-	cfg.AuthDir = resolvePath(absConfigDir, cfg.AuthDir)
-	cfg.SkillDirs = resolvePaths(absConfigDir, cfg.SkillDirs)
+	cfg.ConfigPath = absConfigPath
+	cfg.ProviderDir = resolvePath(configDir, cfg.ProviderDir)
+	cfg.AuthDir = resolvePath(configDir, cfg.AuthDir)
+	cfg.SkillDirs = resolvePaths(configDir, cfg.SkillDirs)
 	if cfg.Logging.Path != "" {
-		cfg.Logging.Path = resolvePath(absConfigDir, cfg.Logging.Path)
+		cfg.Logging.Path = resolvePath(configDir, cfg.Logging.Path)
 	}
 	if cfg.Sessions.Dir != "" {
-		cfg.Sessions.Dir = resolvePath(absConfigDir, cfg.Sessions.Dir)
+		cfg.Sessions.Dir = resolvePath(configDir, cfg.Sessions.Dir)
 	}
 	if cfg.MCPDir != "" {
-		cfg.MCPDir = resolvePath(absConfigDir, cfg.MCPDir)
+		cfg.MCPDir = resolvePath(configDir, cfg.MCPDir)
 	}
 
 	return &cfg, nil

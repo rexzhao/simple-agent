@@ -13,19 +13,20 @@ import (
 func TestLoadResolvesConfigAndProviderModels(t *testing.T) {
 	dir := writeConfigFixture(t)
 
-	cfg, err := Load(dir)
+	cfg, err := Load(rootConfigPath(dir))
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
 	}
 
-	wantConfigDir, err := filepath.Abs(dir)
+	wantConfigPath, err := filepath.Abs(rootConfigPath(dir))
 	if err != nil {
 		t.Fatalf("filepath.Abs() error = %v", err)
 	}
-	wantConfigDir = filepath.Clean(wantConfigDir)
-	if cfg.ConfigDir != wantConfigDir {
-		t.Fatalf("ConfigDir = %q, want %q", cfg.ConfigDir, wantConfigDir)
+	wantConfigPath = filepath.Clean(wantConfigPath)
+	if cfg.ConfigPath != wantConfigPath {
+		t.Fatalf("ConfigPath = %q, want %q", cfg.ConfigPath, wantConfigPath)
 	}
+	wantConfigDir := filepath.Dir(wantConfigPath)
 
 	wantProviderDir := filepath.Join(wantConfigDir, "providers")
 	if cfg.ProviderDir != wantProviderDir {
@@ -85,7 +86,7 @@ skill_dirs:
   - `+absSkills+`
 `)
 
-	cfg, err := Load(dir)
+	cfg, err := Load(rootConfigPath(dir))
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
 	}
@@ -112,7 +113,7 @@ provider_dir: providers
 skill_dirs: []
 `)
 
-	cfg, err := Load(dir)
+	cfg, err := Load(rootConfigPath(dir))
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
 	}
@@ -122,6 +123,74 @@ skill_dirs: []
 	}
 	if len(cfg.SkillDirs) != 0 {
 		t.Fatalf("SkillDirs = %#v, want empty", cfg.SkillDirs)
+	}
+}
+
+func TestLoadUsesExplicitRootConfigFilePath(t *testing.T) {
+	dir := t.TempDir()
+	rootDir := filepath.Join(dir, "config-root")
+	providersDir := filepath.Join(rootDir, "provider-files")
+	if err := os.MkdirAll(providersDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll() error = %v", err)
+	}
+
+	configPath := filepath.Join(rootDir, "custom-root.yaml")
+	writeFile(t, configPath, `default_provider: fake
+default_model: default
+provider_dir: provider-files
+auth_dir: auth-files
+skill_dirs:
+  - local-skills
+mcp_dir: mcp-files
+
+logging:
+  path: run-logs/sai.jsonl
+
+sessions:
+  dir: saved-sessions
+`)
+	writeFile(t, filepath.Join(providersDir, "fake.yaml"), `name: fake
+base_url: http://127.0.0.1:1
+api_key: direct-secret
+
+models:
+  default:
+    id: model-default
+`)
+
+	cfg, err := Load(configPath)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+
+	wantConfigPath, err := filepath.Abs(configPath)
+	if err != nil {
+		t.Fatalf("filepath.Abs() error = %v", err)
+	}
+	wantConfigPath = filepath.Clean(wantConfigPath)
+	if cfg.ConfigPath != wantConfigPath {
+		t.Fatalf("ConfigPath = %q, want %q", cfg.ConfigPath, wantConfigPath)
+	}
+	if cfg.ProviderDir != filepath.Join(rootDir, "provider-files") {
+		t.Fatalf("ProviderDir = %q", cfg.ProviderDir)
+	}
+	if cfg.AuthDir != filepath.Join(rootDir, "auth-files") {
+		t.Fatalf("AuthDir = %q", cfg.AuthDir)
+	}
+	if !sameStrings(cfg.SkillDirs, []string{filepath.Join(rootDir, "local-skills")}) {
+		t.Fatalf("SkillDirs = %#v", cfg.SkillDirs)
+	}
+	if cfg.MCPDir != filepath.Join(rootDir, "mcp-files") {
+		t.Fatalf("MCPDir = %q", cfg.MCPDir)
+	}
+	if cfg.Logging.Path != filepath.Join(rootDir, "run-logs", "sai.jsonl") {
+		t.Fatalf("Logging.Path = %q", cfg.Logging.Path)
+	}
+	if cfg.Sessions.Dir != filepath.Join(rootDir, "saved-sessions") {
+		t.Fatalf("Sessions.Dir = %q", cfg.Sessions.Dir)
+	}
+	if _, ok := cfg.Providers["fake"]; !ok {
+		t.Fatalf("Providers = %#v, want fake", cfg.Providers)
 	}
 }
 
@@ -137,7 +206,7 @@ sessions:
   save_tool_results: false
 `)
 
-	cfg, err := Load(dir)
+	cfg, err := Load(rootConfigPath(dir))
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
 	}
@@ -184,7 +253,7 @@ models:
     max_tokens: 2048
 `)
 
-	cfg, err := Load(dir)
+	cfg, err := Load(rootConfigPath(dir))
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
 	}
@@ -249,7 +318,7 @@ models:
     temperature: 0.2
 `)
 
-	cfg, err := Load(dir)
+	cfg, err := Load(rootConfigPath(dir))
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
 	}
@@ -318,7 +387,7 @@ models:
     context_window: 400000
 `)
 
-	cfg, err := Load(dir)
+	cfg, err := Load(rootConfigPath(dir))
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
 	}
@@ -377,7 +446,7 @@ models:
     max_tokens: 32
 `)
 
-	cfg, err := Load(dir)
+	cfg, err := Load(rootConfigPath(dir))
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
 	}
@@ -440,7 +509,7 @@ models:
     type: not-openai
 `)
 
-	_, err := Load(dir)
+	_, err := Load(rootConfigPath(dir))
 	assertErrorContains(t, err, `unknown model type "not-openai"`, "supported provider types: anthropic-messages, openai-codex, openai-chat, openai-responses")
 }
 
@@ -448,7 +517,7 @@ func TestLoadReadsMCPServerYAMLFiles(t *testing.T) {
 	dir := writeConfigFixture(t)
 	writeMCPFixture(t, dir)
 
-	cfg, err := Load(dir)
+	cfg, err := Load(rootConfigPath(dir))
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
 	}
@@ -511,7 +580,7 @@ func TestSelectedMCPServersUsesEnabledByDefault(t *testing.T) {
 	dir := writeConfigFixture(t)
 	writeMCPFixture(t, dir)
 
-	cfg, err := Load(dir)
+	cfg, err := Load(rootConfigPath(dir))
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
 	}
@@ -535,7 +604,7 @@ func TestSelectedMCPServersDefaultsMissingEnabledToTrue(t *testing.T) {
 command: example-mcp-server
 `)
 
-	cfg, err := Load(dir)
+	cfg, err := Load(rootConfigPath(dir))
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
 	}
@@ -556,7 +625,7 @@ func TestSelectedMCPServersOverrideIgnoresEnabledFields(t *testing.T) {
 	dir := writeConfigFixture(t)
 	writeMCPFixture(t, dir)
 
-	cfg, err := Load(dir)
+	cfg, err := Load(rootConfigPath(dir))
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
 	}
@@ -582,7 +651,7 @@ func TestSelectedMCPServersRejectsUnknownID(t *testing.T) {
 	dir := writeConfigFixture(t)
 	writeMCPFixture(t, dir)
 
-	cfg, err := Load(dir)
+	cfg, err := Load(rootConfigPath(dir))
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
 	}
@@ -632,7 +701,7 @@ func TestLoadMCPServerConfigErrors(t *testing.T) {
 				writeFile(t, filepath.Join(mcpDir, name), content)
 			}
 
-			_, err := Load(dir)
+			_, err := Load(rootConfigPath(dir))
 			assertErrorContains(t, err, tt.want)
 		})
 	}
@@ -641,7 +710,7 @@ func TestLoadMCPServerConfigErrors(t *testing.T) {
 func TestModelListIsSortedAndIncludesActualIDs(t *testing.T) {
 	dir := writeConfigFixture(t)
 
-	cfg, err := Load(dir)
+	cfg, err := Load(rootConfigPath(dir))
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
 	}
@@ -666,7 +735,7 @@ func TestModelListIsSortedAndIncludesActualIDs(t *testing.T) {
 func TestResolveModelExplicitProviderModel(t *testing.T) {
 	dir := writeConfigFixture(t)
 
-	cfg, err := Load(dir)
+	cfg, err := Load(rootConfigPath(dir))
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
 	}
@@ -712,7 +781,7 @@ func TestResolveModelExplicitProviderModel(t *testing.T) {
 func TestResolveModelUsesDefaultProviderAndModel(t *testing.T) {
 	dir := writeConfigFixture(t)
 
-	cfg, err := Load(dir)
+	cfg, err := Load(rootConfigPath(dir))
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
 	}
@@ -756,7 +825,7 @@ func TestResolveModelEnvAPIKeyErrorsWhenEnvIsMissingOrEmpty(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			dir := writeConfigFixture(t)
-			cfg, err := Load(dir)
+			cfg, err := Load(rootConfigPath(dir))
 			if err != nil {
 				t.Fatalf("Load() error = %v", err)
 			}
@@ -779,7 +848,7 @@ func TestResolveModelEnvAPIKeyErrorsWhenEnvIsMissingOrEmpty(t *testing.T) {
 func TestResolveModelDirectAPIKeyIsResolvedAndRedactedInJSON(t *testing.T) {
 	dir := writeConfigFixture(t)
 
-	cfg, err := Load(dir)
+	cfg, err := Load(rootConfigPath(dir))
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
 	}
@@ -820,7 +889,7 @@ func TestResolveModelDirectAPIKeyIsResolvedAndRedactedInJSON(t *testing.T) {
 func TestResolveModelUnknownProviderIncludesChoices(t *testing.T) {
 	dir := writeConfigFixture(t)
 
-	cfg, err := Load(dir)
+	cfg, err := Load(rootConfigPath(dir))
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
 	}
@@ -832,7 +901,7 @@ func TestResolveModelUnknownProviderIncludesChoices(t *testing.T) {
 func TestResolveModelUnknownModelIncludesChoices(t *testing.T) {
 	dir := writeConfigFixture(t)
 
-	cfg, err := Load(dir)
+	cfg, err := Load(rootConfigPath(dir))
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
 	}
@@ -844,7 +913,7 @@ func TestResolveModelUnknownModelIncludesChoices(t *testing.T) {
 func TestResolveModelMissingDefaultsIncludesChoices(t *testing.T) {
 	dir := writeConfigFixture(t)
 
-	cfg, err := Load(dir)
+	cfg, err := Load(rootConfigPath(dir))
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
 	}
@@ -858,7 +927,7 @@ func TestResolveModelMissingDefaultsIncludesChoices(t *testing.T) {
 func TestResolveModelInvalidDefaultModelIncludesChoices(t *testing.T) {
 	dir := writeConfigFixture(t)
 
-	cfg, err := Load(dir)
+	cfg, err := Load(rootConfigPath(dir))
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
 	}
@@ -871,7 +940,7 @@ func TestResolveModelInvalidDefaultModelIncludesChoices(t *testing.T) {
 func TestResolveModelCopiesParameters(t *testing.T) {
 	dir := writeConfigFixture(t)
 
-	cfg, err := Load(dir)
+	cfg, err := Load(rootConfigPath(dir))
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
 	}
@@ -899,15 +968,16 @@ func TestResolveModelCopiesParameters(t *testing.T) {
 	}
 }
 
-func TestLoadMissingConfigMentionsSaiYAML(t *testing.T) {
+func TestLoadMissingConfigMentionsSelectedFile(t *testing.T) {
 	dir := t.TempDir()
+	configPath := filepath.Join(dir, "custom-root.yaml")
 
-	_, err := Load(dir)
+	_, err := Load(configPath)
 	if err == nil {
 		t.Fatal("Load() error = nil, want error")
 	}
-	if got := err.Error(); !strings.Contains(got, "sai.yaml") {
-		t.Fatalf("Load() error = %q, want mention sai.yaml", got)
+	if got := err.Error(); !strings.Contains(got, configPath) {
+		t.Fatalf("Load() error = %q, want mention %q", got, configPath)
 	}
 }
 
@@ -1006,6 +1076,10 @@ models:
 `)
 
 	return dir
+}
+
+func rootConfigPath(dir string) string {
+	return filepath.Join(dir, "sai.yaml")
 }
 
 func writeMCPFixture(t *testing.T, dir string) {
