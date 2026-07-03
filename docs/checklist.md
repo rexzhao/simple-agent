@@ -308,3 +308,35 @@
 - [x] 不读取、不导入 `~/.codex/auth.json`。
 - [x] CLI 测试使用 fake OAuth endpoints 覆盖命名 provider 文件生成。
 - [x] provider 测试覆盖 bearer auth、account id、HTTP 错误脱敏和刷新写回。
+
+## M17：Local Tool Ergonomics and Discovery
+
+- [ ] `read_file` 继续只读取工作区内文本文件。
+- [ ] `read_file` 支持可选 `start_line`（1-based）、`line_count`（大于 0）和
+  `max_bytes`（大于 0）。
+- [ ] `read_file` 不支持 byte offset / byte count 模式。
+- [ ] `max_bytes` 同时适用于默认读取和行范围读取。
+- [ ] 默认 `read_file` 从文件开头读取，最多返回 `max_bytes`。
+- [ ] 只提供 `start_line` 时，`read_file` 从该行读取到 `max_bytes` 或 EOF。
+- [ ] 同时提供 `start_line` 和 `line_count` 时，`read_file` 最多返回指定行数且仍受
+  `max_bytes` 限制。
+- [ ] `read_file` 因 `max_bytes` 返回不完整内容时，tool result 明确包含
+  `truncated=true` 和下一步读取建议。
+- [ ] 行范围读取尽量返回完整行。
+- [ ] 单行超过 `max_bytes` 时，`read_file` 返回该行前缀、标记 `line_truncated=true`，
+  并提示增大 `max_bytes` 后从同一行重试。
+- [ ] 小文件、非范围且未截断的完整 `read_file` 读取保持可返回原始文件内容的兼容行为。
+- [ ] 新增 `glob_files`，只在工作区内执行 glob 搜索。
+- [ ] `glob_files` 返回稳定相对路径，支持 `max_results`，并在截断时返回 metadata。
+- [ ] 新增 `grep_files`，只在工作区内执行文本搜索。
+- [ ] `grep_files` 支持 include / exclude globs。
+- [ ] `grep_files` 默认 literal 搜索，可选 regex、大小写敏感和 context lines。
+- [ ] `grep_files` 支持 `max_results` 和 snippet limits，并在结果或 snippet 截断时返回
+  metadata。
+- [ ] `shell` 支持可选 `timeout_ms` 和 `max_output_bytes`。
+- [ ] `shell` 输出截断时，tool result 明确说明截断。
+- [ ] `shell` status 行继续不显示命令参数或任意 arguments。
+- [ ] `sai tools list` 和 tool registry / schema 测试覆盖新增工具和新增参数。
+- [ ] 聚焦单元测试覆盖 `read_file`、`glob_files`、`grep_files` 和 `shell` 新行为。
+- [ ] 验证 `go test ./...`。
+- [ ] 验证 `git diff --check`。

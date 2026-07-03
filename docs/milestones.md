@@ -556,3 +556,45 @@ stdout 上的 `OK` / `WARN` / `ERROR` 行，任何 `ERROR` 都让退出码为 1�
   和过期 token refresh 写回。
 - 既有 `openai-responses` 测试继续不变。
 - `gofmt`、`go test ./...` 和 `git diff --check` 通过。
+
+## M17：Local Tool Ergonomics and Discovery
+
+目标：在现有本地工具边界内补齐更好用的文件读取、发现、搜索和 shell 输出控制能力，帮助
+agent 在大工作区内安全定位文本内容，同时不默认启用任何工具、不扩大工作区边界。
+
+交付物：
+
+- 增强 `read_file`，继续只读取工作区内文本文件。
+- `read_file` 支持可选 `start_line`、`line_count` 和 `max_bytes` 参数：
+  `start_line` 是 1-based 行号，`line_count` 必须大于 0，`max_bytes` 必须大于 0。
+- `read_file` 不提供 byte offset / byte count 模式。
+- `max_bytes` 同时适用于默认读取和行范围读取。
+- 默认读取从文件开头开始，返回最多 `max_bytes` 字节。
+- 只提供 `start_line` 时，从该行读取到 `max_bytes` 或 EOF。
+- 同时提供 `start_line` 和 `line_count` 时，最多返回指定行数，同时仍受 `max_bytes` 限制。
+- 因 `max_bytes` 导致内容不完整时，tool result 必须明确包含 `truncated=true`，并告诉
+  agent 下一步如何继续读取。
+- 行范围读取应尽量返回完整行；如果单行超过 `max_bytes`，返回该行前缀并标记
+  `line_truncated=true`，同时提示 agent 增大 `max_bytes` 并从同一行重试。
+- 小文件、非范围且未截断的完整读取可以继续返回原始文件内容，以保持兼容。
+- 新增 `glob_files`，仅在工作区内执行 glob 搜索，返回稳定相对路径，支持
+  `max_results`，并在结果截断时返回明确 metadata。
+- 新增 `grep_files`，仅在工作区内执行文本搜索，支持 include / exclude globs；默认 literal
+  搜索，可选 regex、大小写敏感和 context lines；支持 `max_results` 和 snippet limits，
+  并在结果或 snippet 截断时返回明确 metadata。
+- 增强 `shell`，支持可选 `timeout_ms` 和 `max_output_bytes`。
+- `shell` 输出被 `max_output_bytes` 截断时，tool result 必须明确说明截断。
+- `shell` 的 CLI tool status 行继续只显示工具名，不显示命令参数或任意 arguments。
+- `sai tools list` 和 tool registry / schema 测试覆盖新增工具和新增参数。
+
+验证：
+
+- 聚焦单元测试覆盖 `read_file` 默认读取、行范围读取、`max_bytes` 截断、
+  `line_truncated=true` 单长行场景和非法参数。
+- 聚焦单元测试覆盖 `glob_files` 的工作区边界、稳定相对路径、`max_results` 和截断 metadata。
+- 聚焦单元测试覆盖 `grep_files` 的 literal 默认行为、可选 regex、大小写敏感、include /
+  exclude globs、context lines、snippet limits 和截断 metadata。
+- 聚焦单元测试覆盖 `shell` 的 `timeout_ms`、`max_output_bytes`、输出截断 metadata，以及
+  status 行不泄露命令参数。
+- `go test ./...` 通过。
+- `git diff --check` 通过。

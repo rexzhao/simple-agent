@@ -421,6 +421,27 @@ arguments；状态也不包含 tool result 正文，stdout 仍只输出模型文
 
 `shell` 工具默认在启动目录执行命令。v0.1 不提供 `--workdir` 配置。
 
+M17 的本地工具易用性任务不新增工具启用配置字段；新增或增强的工具仍通过
+`tools.enabled` 或 `--enable-tools` 暴露给模型，默认关闭。该任务计划增加
+`glob_files` 和 `grep_files`，并增强 `read_file` 与 `shell`：
+
+- `read_file` 继续只允许读取工作区内文本文件。它支持可选 `start_line`（1-based）、
+  `line_count`（大于 0）和 `max_bytes`（大于 0），不支持 byte offset / byte count。
+  `max_bytes` 同时限制默认全文件读取和行范围读取；默认读取从文件开头开始，最多返回
+  `max_bytes`。只提供 `start_line` 时，从该行读取到 `max_bytes` 或 EOF；同时提供
+  `start_line` 和 `line_count` 时，最多返回指定行数且仍受 `max_bytes` 限制。
+- `read_file` 因 `max_bytes` 返回不完整内容时，tool result 必须显式包含
+  `truncated=true` 和下一步读取建议。行范围读取尽量返回完整行；若单行超过 `max_bytes`，
+  返回该行前缀、标记 `line_truncated=true`，并提示增大 `max_bytes` 后从同一行重试。
+  小的、非范围且未截断的完整读取可以继续返回原始文件内容以保持兼容。
+- `glob_files` 在工作区内执行 glob，返回稳定相对路径，并用 `max_results` 与截断
+  metadata 控制大结果集。
+- `grep_files` 在工作区内执行文本搜索，支持 include / exclude globs；默认 literal 搜索，
+  可选 regex、大小写敏感和 context lines；支持 `max_results` 与 snippet limits，并在
+  结果或片段截断时返回明确 metadata。
+- `shell` 支持可选 `timeout_ms` 和 `max_output_bytes`；输出截断必须显式说明，状态行仍不
+  展示命令参数。
+
 注意：`--enable-mcp` 只决定启动哪些 MCP server；`--enable-tools` 决定哪些工具暴露给
 模型。一个 MCP server 被启用后，它的工具仍需要出现在 enabled tools 列表中才会被模型
 看到。

@@ -672,6 +672,32 @@ sai chat --quit --enable-tools list_files,read_file --prompt "列出当前目录
 `shell` 工具默认在启动目录执行命令。v0.1 不提供 `--workdir`，也不做复杂沙箱；后续如需
 改变执行目录，再增加显式参数。
 
+M17 计划补齐本地工具易用性和发现能力，但不改变工具默认关闭的边界。`read_file` 仍只读取
+启动目录工作区内的文本文件；它新增可选参数 `start_line`、`line_count` 和 `max_bytes`：
+`start_line` 是 1-based 行号，`line_count` 必须大于 0，`max_bytes` 必须大于 0。不提供
+byte offset / byte count 模式。默认读取从文件开头开始，并最多返回 `max_bytes` 字节。
+如果只提供 `start_line`，则从该行读取到 `max_bytes` 或 EOF；如果同时提供 `start_line`
+和 `line_count`，则最多返回指定行数，同时仍受 `max_bytes` 限制。`max_bytes` 同时适用于
+默认读取和行范围读取。
+
+`read_file` 的兼容边界是：小文件、非范围且未因 `max_bytes` 截断的读取，可以继续直接返回
+原始文件内容。只要结果因 `max_bytes` 不完整，tool result 必须明确包含 `truncated=true`，
+并告诉 agent 下一步应如何继续读取。行范围读取应尽量返回完整行；如果单行本身超过
+`max_bytes`，返回该行前缀并标记 `line_truncated=true`，同时提示 agent 增大
+`max_bytes` 并从同一行重试。
+
+M17 还会增加只在工作区内运行的发现/搜索工具：
+
+- `glob_files`：使用 workspace-local glob 查找文件，返回稳定的相对路径；支持
+  `max_results`，结果被截断时返回明确的 truncation metadata。
+- `grep_files`：使用 workspace-local 文本搜索，支持 include / exclude globs；默认按
+  literal 搜索，可选 regex、大小写敏感和 context lines；支持 `max_results` 和 snippet
+  limits，命中或片段被截断时返回明确的 truncation metadata。
+
+`shell` 工具在 M17 增加可选 `timeout_ms` 和 `max_output_bytes`。输出被
+`max_output_bytes` 截断时，tool result 必须明确说明截断；CLI 的 tool status 行继续只显示
+`tool: shell`，不显示命令参数或任意 arguments。
+
 ## MCP
 
 MCP 不属于 MVP 必需能力。先完成 `sai chat --quit`、streaming、tool call loop、错误处理、
