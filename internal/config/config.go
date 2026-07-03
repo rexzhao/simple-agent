@@ -24,6 +24,7 @@ type Config struct {
 	Tools           ToolsConfig                `json:"tools" yaml:"tools"`
 	Logging         LoggingConfig              `json:"logging" yaml:"logging"`
 	Sessions        SessionsConfig             `json:"sessions" yaml:"sessions"`
+	Compaction      CompactionConfig           `json:"compaction" yaml:"compaction"`
 	MCPDir          string                     `json:"mcp_dir,omitempty" yaml:"mcp_dir,omitempty"`
 	MCPServers      map[string]MCPServerConfig `json:"mcp_servers,omitempty" yaml:"-"`
 	Providers       map[string]ProviderConfig  `json:"providers" yaml:"providers"`
@@ -56,6 +57,13 @@ type SessionsConfig struct {
 	Enabled         bool   `json:"enabled" yaml:"enabled"`
 	Dir             string `json:"dir" yaml:"dir"`
 	SaveToolResults bool   `json:"save_tool_results" yaml:"save_tool_results"`
+}
+
+type CompactionConfig struct {
+	Enabled          bool   `json:"enabled" yaml:"enabled"`
+	ThresholdPercent int    `json:"threshold_percent" yaml:"threshold_percent"`
+	SummaryProvider  string `json:"summary_provider" yaml:"summary_provider"`
+	SummaryModel     string `json:"summary_model" yaml:"summary_model"`
 }
 
 type ProviderConfig struct {
@@ -154,6 +162,9 @@ func LoadBase(configPath string) (*Config, error) {
 	}
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
 		return nil, fmt.Errorf("parse config file %q: %w", absConfigPath, err)
+	}
+	if err := validateConfig(cfg); err != nil {
+		return nil, fmt.Errorf("validate config file %q: %w", absConfigPath, err)
 	}
 
 	cfg.ConfigPath = absConfigPath
@@ -395,6 +406,13 @@ func parseContextWindow(value any) (int, error) {
 	return tokens, nil
 }
 
+func validateConfig(cfg Config) error {
+	if cfg.Compaction.ThresholdPercent <= 0 {
+		return fmt.Errorf("compaction.threshold_percent must be positive")
+	}
+	return nil
+}
+
 func defaultConfig() Config {
 	return Config{
 		ProviderDir: "providers",
@@ -414,6 +432,9 @@ func defaultConfig() Config {
 		Sessions: SessionsConfig{
 			Dir:             "sessions",
 			SaveToolResults: true,
+		},
+		Compaction: CompactionConfig{
+			ThresholdPercent: 80,
 		},
 		MCPDir:     "mcp",
 		Providers:  map[string]ProviderConfig{},

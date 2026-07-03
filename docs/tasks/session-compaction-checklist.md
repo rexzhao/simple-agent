@@ -10,7 +10,7 @@ Out of scope: the future session-history query tool.
 
 ## Implementation Slices
 
-- [ ] Config and CLI plumbing: add `compaction.enabled`, `threshold_percent`,
+- [x] Config and CLI plumbing: add `compaction.enabled`, `threshold_percent`,
   `summary_provider`, and `summary_model` with documented defaults and validation.
 - [ ] V2 session runtime: persist successful turns as append-only `Items` plus
   `ActiveHistory`, while keeping `sessions.save_tool_results: true` required for

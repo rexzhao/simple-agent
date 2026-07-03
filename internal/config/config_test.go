@@ -78,6 +78,100 @@ func TestLoadResolvesConfigAndProviderModels(t *testing.T) {
 	}
 }
 
+func TestLoadDefaultsCompactionConfig(t *testing.T) {
+	dir := writeConfigFixture(t)
+
+	cfg, err := Load(rootConfigPath(dir))
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+
+	if cfg.Compaction.Enabled {
+		t.Fatal("Compaction.Enabled = true, want false default")
+	}
+	if cfg.Compaction.ThresholdPercent != 80 {
+		t.Fatalf("Compaction.ThresholdPercent = %d, want 80", cfg.Compaction.ThresholdPercent)
+	}
+	if cfg.Compaction.SummaryProvider != "" {
+		t.Fatalf("Compaction.SummaryProvider = %q, want empty default", cfg.Compaction.SummaryProvider)
+	}
+	if cfg.Compaction.SummaryModel != "" {
+		t.Fatalf("Compaction.SummaryModel = %q, want empty default", cfg.Compaction.SummaryModel)
+	}
+
+	cfgJSON, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatalf("Marshal(cfg) error = %v", err)
+	}
+	var got struct {
+		Compaction CompactionConfig `json:"compaction"`
+	}
+	if err := json.Unmarshal(cfgJSON, &got); err != nil {
+		t.Fatalf("Unmarshal(cfg JSON) error = %v", err)
+	}
+	if got.Compaction != cfg.Compaction {
+		t.Fatalf("JSON compaction = %#v, want %#v", got.Compaction, cfg.Compaction)
+	}
+}
+
+func TestLoadReadsCompactionConfig(t *testing.T) {
+	dir := writeConfigFixture(t)
+	writeFile(t, filepath.Join(dir, "sai.yaml"), `default_provider: paperhub
+default_model: glm-5.2
+provider_dir: providers
+
+compaction:
+  enabled: true
+  threshold_percent: 65
+  summary_provider: ../summary-provider
+  summary_model: models/summary
+`)
+
+	cfg, err := Load(rootConfigPath(dir))
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+
+	if !cfg.Compaction.Enabled {
+		t.Fatal("Compaction.Enabled = false, want true")
+	}
+	if cfg.Compaction.ThresholdPercent != 65 {
+		t.Fatalf("Compaction.ThresholdPercent = %d, want 65", cfg.Compaction.ThresholdPercent)
+	}
+	if cfg.Compaction.SummaryProvider != "../summary-provider" {
+		t.Fatalf("Compaction.SummaryProvider = %q, want path-like value unchanged", cfg.Compaction.SummaryProvider)
+	}
+	if cfg.Compaction.SummaryModel != "models/summary" {
+		t.Fatalf("Compaction.SummaryModel = %q, want path-like value unchanged", cfg.Compaction.SummaryModel)
+	}
+}
+
+func TestLoadRejectsInvalidCompactionThreshold(t *testing.T) {
+	tests := []struct {
+		name      string
+		threshold string
+	}{
+		{name: "zero", threshold: "0"},
+		{name: "negative", threshold: "-1"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := writeConfigFixture(t)
+			writeFile(t, filepath.Join(dir, "sai.yaml"), `default_provider: paperhub
+default_model: glm-5.2
+provider_dir: providers
+
+compaction:
+  threshold_percent: `+tt.threshold+`
+`)
+
+			_, err := Load(rootConfigPath(dir))
+			assertErrorContains(t, err, "validate config file", "compaction.threshold_percent must be positive")
+		})
+	}
+}
+
 func TestLoadAllowsEmptyInstructionFiles(t *testing.T) {
 	dir := writeConfigFixture(t)
 	writeFile(t, filepath.Join(dir, "sai.yaml"), `default_provider: paperhub
