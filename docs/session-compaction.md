@@ -265,7 +265,7 @@ MVP 只实现：
 
 要求：
 
-- 只在普通单行 REPL 中生效。GUI command 语义见 `docs/server-gui.md`。
+- 只在 CLI attach REPL 的普通单行输入中生效。GUI command 语义见 `docs/server-gui.md`。
 - 多行输入里的 `/compact` 当普通文本。
 - 执行后不发起用户 turn，只做一次压缩。
 - 成功后通过 CLI stderr 或 server event 通知用户。
@@ -559,7 +559,7 @@ assistant output、tool result 或 blob content。
 
 ### Manual `/compact`
 
-- 普通单行 `/compact` 执行压缩，不发起用户 turn。
+- CLI attach REPL 普通单行 `/compact` 执行压缩，不发起用户 turn。
 - 多行里的 `/compact` 当普通文本。
 - compact 成功后 append hidden summary item、compaction record、`active_history.replaced`。
 - GUI/chat visible items 不减少。

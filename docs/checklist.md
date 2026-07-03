@@ -412,3 +412,53 @@
 - [x] 为未来 global budgets、permissions 和 conflict arbitration 保留边界。
 - [x] 为未来 observability、persistence/resume 保留边界。
 - [x] 添加配置解析、prompt 注入、job lifecycle、mailbox delivery 和 safeguard 测试。
+
+## M20：Server-Owned Sessions and CLI Client
+
+- [ ] 新增 `sai server`，默认以前台进程启动本地 server，提供 HTTP API 和 WebSocket stream。
+- [ ] 前台 `sai server` 阻塞到 server 退出，并支持 Ctrl+C 优雅关闭 listener、flush metadata、
+  移除 registry 后退出 0。
+- [ ] `sai server --background` 启动后台 server，父进程等待 listen、registry 写入和 `/health`
+  可用后退出 0。
+- [ ] `--background` 子进程 stdout/stderr 不长期占用调用终端，运行日志走 server 日志或诊断日志路径。
+- [ ] `sai server` 支持 `--cwd`、`--config`、`--port N`、`--port 0` 和高级 `--listen host:port`。
+- [ ] server identity 使用 canonical `cwd + config_path`，默认监听 `127.0.0.1:0`。
+- [ ] 启动成功后写入 per-user registry，记录 canonical cwd、config path、addr、pid、token、
+  started_at 和 version。
+- [ ] registry 文件权限尽量限制为当前用户可读写，每个 server 生成随机 token。
+- [ ] 写操作、debug 读取和 blob content 读取必须带 registry token。
+- [ ] 重复启动同一 `cwd + config_path` 且监听参数一致时提示 already running 并退出 0。
+- [ ] 重复启动同一 `cwd + config_path` 但监听参数冲突时返回冲突错误并退出非 0。
+- [ ] 指定端口被其他进程占用时启动失败并退出非 0。
+- [ ] client 发现 registry 记录后先调用 `/health`，stale 记录会被忽略或清理。
+- [ ] `sai` 默认等价于 `sai attach`，从当前目录向上查找最近健康 server 并进入 attach REPL。
+- [ ] `sai --cwd <path>` 从指定 cwd 向上查找最近健康 server。
+- [ ] `sai attach <session-id>` 进入指定会话，`sai attach --new` 创建新会话并进入。
+- [ ] `sai status` 查询最近 server 的 cwd、config、listen、pid、version、uptime、session 数和
+  running turn 数后退出。
+- [ ] `sai stop` 和 `sai stop --cwd <path>` 停止最近健康 server，等待退出并移除 registry。
+- [ ] stop 不删除 sessions、logs 或 blobs。
+- [ ] `sai servers list` 列出 registry 中的本地 server 后退出。
+- [ ] `sai sessions list` 和 `sai sessions show <id>` 通过 server API 查询，不直接读取 session 文件。
+- [ ] `sai send <session-id> --prompt ...` 和 `sai send --new --prompt ...` 发起一轮后退出。
+- [ ] 移除或隐藏独立进程内 `sai chat` 产品入口，裸 `sai` 默认 attach。
+- [ ] server 提供 `GET /health`、`GET /server` 和 `POST /server/shutdown`。
+- [ ] server 提供 `GET /sessions`、`POST /sessions`、`GET /sessions/{id}` 和
+  `GET /sessions/{id}/items`。
+- [ ] server 提供 `POST /sessions/{id}/messages` 和 `POST /sessions/{id}/commands/compact`。
+- [ ] server 提供 `GET /sessions/{id}/items/{item_id}/content`，不提供裸 blob hash 读取。
+- [ ] server 提供 `WS /sessions/{id}/stream`，支持多个 client 同时观察同一 session。
+- [ ] session metadata API 不返回完整 items，items API 支持 `before_seq`、`after_seq`、`limit`
+  和 `view=chat|debug`。
+- [ ] 同一 session 同时只允许一个 running turn，session busy 时再次发送 message 返回 conflict。
+- [ ] shutdown 在 running turn 时返回明确错误或 conflict。
+- [ ] attach REPL 中的 `/compact` 调用 server command API，多行文本中的 `/compact` 仍作为普通文本。
+- [ ] CLI client 不直接读取 session 文件、blob 文件或修改 `ActiveHistory`。
+- [ ] M20 不实现浏览器 Web GUI UI；未来 GUI 必须复用同一套 HTTP API / WebSocket stream。
+- [ ] API 测试覆盖 health/status/shutdown、session metadata、item pagination、send message 和 compact command。
+- [ ] WebSocket 测试覆盖多 client fanout、transient events、persisted events 和 failed turn events。
+- [ ] registry/discovery 测试覆盖 foreground/background server、duplicate start、port conflict、upward discovery 和 stale cleanup。
+- [ ] CLI 测试覆盖 attach、status、stop、servers list、sessions list/show、send 和无可用 server 提示。
+- [ ] 安全和 blob access 测试覆盖 token requirement、item content range read 和裸 hash 拒绝。
+- [ ] 验证 `go test ./...`。
+- [ ] 验证 `git diff --check`。

@@ -731,3 +731,88 @@ orchestration。
 - safeguard 测试覆盖 self-referential config、递归深度限制、job 数量限制和 wait timeout。
 - prompt 配置测试覆盖 custom system prompt 追加语义和 placeholder 白名单拒绝未知占位符。
 - `go test ./...` 和 `git diff --check` 通过。
+
+## M20：Server-Owned Sessions and CLI Client
+
+目标：把会话运行形态从本地进程内 `sai chat` 切换为 server-owned sessions。server 是唯一
+session writer，CLI client 通过 HTTP API 和 WebSocket 操作会话。HTTP / WebSocket 语义保留
+未来 Web GUI 需要的 filtered / paginated view，但 M20 不交付浏览器 Web GUI UI。
+
+交付物：
+
+- 新增 `sai server`，默认以前台进程启动本地 server，提供 HTTP API 和 WebSocket stream。
+- 前台 `sai server` 阻塞到 server 退出，并支持 Ctrl+C 优雅关闭 listener、flush 必要 metadata、
+  移除 registry 后退出 0。
+- `sai server --background` 启动本地后台 server；父进程等待子进程完成 listen、写入 registry 且
+  `/health` 可用后退出 0。
+- `--background` 子进程 stdout/stderr 不长期占用调用它的终端，运行日志走 server 日志或诊断日志
+  路径。
+- `sai server` 支持 `--cwd` 指定 server 运行工作目录；省略时使用当前目录。
+- `sai server` 支持 `--config`，相对路径基于 `--cwd` 解析。
+- server identity 使用 canonical `cwd + config_path`。
+- server 默认监听 `127.0.0.1:0`，由 OS 分配随机端口。
+- `sai server` 支持 `--port N` 监听 `127.0.0.1:N`，`--port 0` 表示随机端口。
+- `sai server` 支持高级 `--listen host:port`；MVP 默认只支持或只推荐 loopback 地址。
+- 启动成功后写入 per-user registry，记录 canonical cwd、config path、addr、pid、token、
+  started_at 和 version。
+- registry 文件权限尽量限制为当前用户可读写；每个 server 生成随机 token。
+- 写操作、debug 读取和 blob content 读取必须带 registry token。
+- 重复启动同一 `cwd + config_path` 且监听参数一致时，提示 already running 并退出 0。
+- 重复启动同一 `cwd + config_path` 但监听参数冲突时，返回冲突错误并退出非 0。
+- 指定端口被其他进程占用时启动失败并退出非 0。
+- client 发现 registry 记录后先调用 `/health`；stale 记录会被忽略或清理。
+- `sai` 默认等价于 `sai attach`，从当前目录向上查找最近健康 server 并进入 attach REPL。
+- `sai --cwd <path>` 从指定 cwd 向上查找最近健康 server。
+- `sai attach <session-id>` 进入指定会话。
+- `sai attach --new` 创建新会话并进入。
+- `sai status` 查询最近 server 的 cwd、config、listen、pid、version、uptime、session 数和
+  running turn 数后退出。
+- `sai stop` 从当前目录向上查找最近健康 server，发送 shutdown 请求，等待退出并移除 registry。
+- `sai stop --cwd <path>` 从指定 cwd 向上查找最近健康 server 并停止。
+- stop 不删除 sessions、logs 或 blobs。
+- `sai servers list` 列出 registry 中的本地 server 后退出。
+- `sai sessions list` 和 `sai sessions show <id>` 通过 server API 查询，不直接读取 session 文件。
+- 新增 `sai send <session-id> --prompt ...` 和 `sai send --new --prompt ...`，发起一轮后退出。
+- 移除或隐藏独立进程内 `sai chat` 产品入口；server-owned session 是唯一推荐会话路径。
+- server 提供 `GET /health`、`GET /server`、`POST /server/shutdown`、`GET /sessions`、
+  `POST /sessions`、`GET /sessions/{id}`、`GET /sessions/{id}/items`、
+  `POST /sessions/{id}/messages`、`POST /sessions/{id}/commands/compact`、
+  `GET /sessions/{id}/items/{item_id}/content` 和 `WS /sessions/{id}/stream`。
+- session metadata API 不返回完整 items；items API 支持 `before_seq`、`after_seq`、`limit`
+  和 `view=chat|debug`。
+- item content API 只能读取当前 session 中可达的 item content，不提供裸 blob hash 读取。
+- 多个 client 可以同时连接同一个 session stream，并看到同一 running turn 的 transient events
+  和 persisted events。
+- 同一 session 同时只允许一个 running turn；busy 时再次发送 message 返回 conflict。
+- shutdown 在 running turn 时返回明确错误或 conflict。
+- attach REPL 中的 `/compact` 调用 server command API；多行文本中的 `/compact` 仍作为普通文本。
+- CLI client 不直接读取 session 文件、blob 文件或修改 `ActiveHistory`。
+- Web GUI UI、浏览器 routing、前端状态管理和样式实现属于未来工作，不属于 M20 交付物。
+
+验证：
+
+- API 测试覆盖 `/health`、`/server` 和 session metadata API 不返回完整 items。
+- API 测试覆盖 `POST /server/shutdown` 在无 running turn 时触发优雅退出。
+- API 测试覆盖 running turn 时 shutdown 返回明确错误或 conflict。
+- API 测试覆盖 item pagination 的 `before_seq`、`after_seq`、`limit` 和 `view`。
+- API 测试覆盖 `view=chat` 不返回 hidden compaction summary，`view=debug` 可返回 debug metadata。
+- API 测试覆盖 `POST /sessions/{id}/messages` 在 session busy 时返回 conflict。
+- API 测试覆盖 `POST /sessions/{id}/commands/compact` 只在 idle session 成功。
+- WebSocket 测试覆盖 turn running 时多个 client 都收到 transient text deltas、tool status 和
+  persisted item events。
+- WebSocket 测试覆盖失败 turn 推送 `turn.failed`，且刷新后不出现失败 turn items。
+- registry 测试覆盖 `sai server --cwd X` 写入 canonical cwd、config、addr、pid 和 token。
+- registry 测试覆盖前台 `sai server --cwd X` 收到 Ctrl+C 后优雅退出并移除 registry。
+- registry 测试覆盖 `sai server --cwd X --background` 后父进程返回且后台 server 健康可连接。
+- registry 测试覆盖重复启动同一 server 的 already running 行为和端口冲突行为。
+- discovery 测试覆盖 `sai` 从当前目录向上发现最近 server。
+- discovery 测试覆盖 `sai --cwd X` 从 X 向上发现最近 server。
+- CLI 测试覆盖 `sai attach <session-id>`、`sai attach --new`、`sai status`、
+  `sai stop`、`sai servers list`、`sai sessions list/show` 和 `sai send`。
+- CLI 测试覆盖 `sai stop` 移除 registry 且不删除 sessions、logs 或 blobs。
+- CLI 测试覆盖没有可用 server 时给出启动提示。
+- CLI 测试覆盖 stale registry 记录在 health check 失败后被忽略或清理。
+- 安全测试覆盖非公开内容读取和写操作需要 registry token。
+- Blob access 测试覆盖 item content endpoint 可按大小读取，且裸 hash 不能读取 blob。
+- 不要求浏览器 Web GUI UI 测试；未来 GUI 必须复用 M20 API / WebSocket。
+- `go test ./...` 和 `git diff --check` 通过。
