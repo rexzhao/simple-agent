@@ -73,9 +73,10 @@ future work and should not be required by any slice here.
   blob content reads, and shutdown; return structured errors such as
   `session_busy`, `server_busy`, `permission_denied`, and `blob_not_found`
   without leaking prompt, response, tool result, blob content, or secrets.
-- [ ] Final integration closure: verify CLI attach/send/status/stop flows against
+- [x] Final integration closure: verify CLI attach/send/status/stop flows against
   a local server, confirm stop does not delete sessions/logs/blobs, and keep the
-  future Web GUI out of the implementation diff.
+  future Web GUI out of the implementation diff. Evidence:
+  `docs/tasks/server-gui-smoke.md`.
 
 ## Acceptance Criteria
 
