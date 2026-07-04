@@ -74,6 +74,7 @@ func TestSessionMetadataAPIsListDetailNoItemsAndServerCount(t *testing.T) {
 		"/sessions/session-one",
 		"/sessions/session-one/items",
 		"/sessions/session-one/items/item-1/content",
+		"/sessions/session-one/content/" + strings.Repeat("0", 64),
 	} {
 		raw, body := getRawJSONStatus(t, baseURL+endpoint, "", http.StatusForbidden)
 		assertErrorCode(t, body, "permission_denied")
@@ -2279,6 +2280,112 @@ func TestSessionItemContentChatReadAndByteRanges(t *testing.T) {
 	if body["bytes_returned"] != float64(maxSessionItemContentBytes) || body["size_bytes"] != float64(len(largeContent)) || body["has_more"] != true {
 		t.Fatalf("max-clamped content metadata = %#v, want clamp metadata", body)
 	}
+}
+
+func TestSessionBlobContentEndpointRequiresSessionReachability(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "sessions")
+	store := sessions.NewV2Store(root)
+	saveServerTestSession(t, store, "blob-session")
+	saveServerTestSession(t, store, "other-session")
+
+	largeVisibleContent := strings.Repeat("blob-backed visible content ", 300) + "VISIBLE-BLOB-TAIL"
+	loaded, err := store.Load("blob-session")
+	if err != nil {
+		t.Fatalf("Load(blob-session) error = %v", err)
+	}
+	saved, err := store.SaveTurn(loaded, []sessions.SessionItem{{
+		ID:         "visible-blob",
+		Kind:       sessions.ItemKindMessage,
+		Visibility: sessions.ItemVisibilityVisible,
+		Audience:   sessions.ItemAudienceUser,
+		Message:    &model.Message{Role: model.MessageRoleUser, Content: largeVisibleContent},
+	}}, []string{"visible-blob"})
+	if err != nil {
+		t.Fatalf("SaveTurn(visible blob) error = %v", err)
+	}
+	visibleRef := *saved.Items[0].Content.Blob
+	hiddenRef, err := store.WriteBlob([]byte("hidden blob secret"), "utf-8", "text/plain")
+	if err != nil {
+		t.Fatalf("WriteBlob(hidden) error = %v", err)
+	}
+	orphanRef, err := store.WriteBlob([]byte("orphan blob secret"), "utf-8", "text/plain")
+	if err != nil {
+		t.Fatalf("WriteBlob(orphan) error = %v", err)
+	}
+
+	appendServerTestItem(t, store, "blob-session", sessions.SessionItem{
+		ID:         "hidden-blob",
+		Kind:       sessions.ItemKindMessage,
+		Visibility: sessions.ItemVisibilityHidden,
+		Audience:   sessions.ItemAudienceModel,
+		Message:    &model.Message{Role: model.MessageRoleDeveloper},
+		Content: &sessions.StoredContent{
+			Blob:    &hiddenRef,
+			Preview: "hidden preview",
+		},
+	})
+
+	process := startSessionAPIServerWithToken(t, store, sessions.SessionV2{}, "registry-token")
+	baseURL := "http://" + process.Addr()
+
+	itemsRaw, itemsBody := getRawJSON(t, baseURL+"/sessions/blob-session/items")
+	assertNoItemDTOLeak(t, itemsRaw)
+	if got := responseItemIDs(t, itemsBody); !reflect.DeepEqual(got, []string{"visible-blob"}) {
+		t.Fatalf("chat item IDs = %#v, want visible blob item only", got)
+	}
+	itemContent := responseItems(t, itemsBody)[0].(map[string]any)["message"].(map[string]any)["content"].(map[string]any)
+	blobDTO := itemContent["blob"].(map[string]any)
+	if blobDTO["hash"] != visibleRef.Hash || blobDTO["size_bytes"] != float64(visibleRef.SizeBytes) || itemContent["inline"] != nil {
+		t.Fatalf("blob item DTO content = %#v, want blob ref without inline", itemContent)
+	}
+	if bytes.Contains(itemsRaw, []byte("VISIBLE-BLOB-TAIL")) || bytes.Contains(itemsRaw, []byte("hidden blob secret")) {
+		t.Fatalf("items response leaked blob body: %s", itemsRaw)
+	}
+
+	raw, body := getRawJSONStatus(t, baseURL+"/sessions/blob-session/content/"+visibleRef.Hash, "registry-token", http.StatusOK)
+	assertNoContentDTOLeak(t, raw)
+	if body["blob_hash"] != visibleRef.Hash || body["content"] != largeVisibleContent || body["encoding"] != "utf-8" || body["media_type"] != "text/plain" {
+		t.Fatalf("blob content response = %#v, want visible content and metadata", body)
+	}
+	if body["offset"] != float64(0) || body["size_bytes"] != float64(visibleRef.SizeBytes) || body["bytes_returned"] != float64(visibleRef.SizeBytes) || body["has_more"] != false {
+		t.Fatalf("blob content range metadata = %#v, want full content", body)
+	}
+
+	_, body = getRawJSONStatus(t, baseURL+"/sessions/blob-session/content/"+visibleRef.Hash+"?offset=5&max_bytes=4", "registry-token", http.StatusOK)
+	if body["content"] != "back" || body["offset"] != float64(5) || body["bytes_returned"] != float64(4) || body["has_more"] != true {
+		t.Fatalf("blob content range response = %#v, want offset 5 max 4", body)
+	}
+
+	_, body = getRawJSONStatus(t, baseURL+"/sessions/blob-session/items/visible-blob/content", "registry-token", http.StatusOK)
+	if body["content"] != largeVisibleContent || body["size_bytes"] != float64(len(largeVisibleContent)) {
+		t.Fatalf("item content endpoint for blobified item = %#v, want original visible content", body)
+	}
+
+	raw, body = getRawJSONStatus(t, baseURL+"/sessions/blob-session/content/"+hiddenRef.Hash, "registry-token", http.StatusNotFound)
+	assertErrorCode(t, body, "content_unavailable")
+	if bytes.Contains(raw, []byte("hidden blob secret")) {
+		t.Fatalf("chat blob content error leaked hidden content: %s", raw)
+	}
+	_, body = getRawJSONStatus(t, baseURL+"/sessions/blob-session/content/"+hiddenRef.Hash+"?view=debug", "registry-token", http.StatusOK)
+	if body["content"] != "hidden blob secret" {
+		t.Fatalf("debug blob content response = %#v, want hidden content", body)
+	}
+
+	raw, body = getRawJSONStatus(t, baseURL+"/sessions/other-session/content/"+visibleRef.Hash, "registry-token", http.StatusNotFound)
+	assertErrorCode(t, body, "content_unavailable")
+	if bytes.Contains(raw, []byte("VISIBLE-BLOB-TAIL")) {
+		t.Fatalf("other-session blob content error leaked visible content: %s", raw)
+	}
+	raw, body = getRawJSONStatus(t, baseURL+"/sessions/blob-session/content/"+orphanRef.Hash, "registry-token", http.StatusNotFound)
+	assertErrorCode(t, body, "content_unavailable")
+	if bytes.Contains(raw, []byte("orphan blob secret")) {
+		t.Fatalf("orphan blob content error leaked orphan content: %s", raw)
+	}
+
+	_, body = getRawJSONStatus(t, baseURL+"/sessions/blob-session/content/not-a-hash", "registry-token", http.StatusBadRequest)
+	assertErrorCode(t, body, "invalid_blob_hash")
+	_, body = getRawJSONStatus(t, baseURL+"/content/"+visibleRef.Hash, "registry-token", http.StatusNotFound)
+	assertErrorCode(t, body, "not_found")
 }
 
 func TestSessionItemContentDebugRequiresTokenAndChatHidesPrivateContent(t *testing.T) {

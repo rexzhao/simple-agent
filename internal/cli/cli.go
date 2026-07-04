@@ -4212,7 +4212,7 @@ func (r *agentRuntime) subagentCompletionSignal() <-chan struct{} {
 
 func (r *agentRuntime) initialMessages() []model.Message {
 	if r.resumed {
-		messages, err := r.resumableSession.MaterializeActiveHistory()
+		messages, err := r.materializeActiveHistory(r.resumableSession)
 		if err == nil {
 			if len(messages) == 0 && len(r.activeItemIDs) == 0 && len(r.baseMessages) > 0 {
 				return copyMessageSlice(r.baseMessages)
@@ -4222,6 +4222,13 @@ func (r *agentRuntime) initialMessages() []model.Message {
 		return nil
 	}
 	return copyMessageSlice(r.baseMessages)
+}
+
+func (r *agentRuntime) materializeActiveHistory(session sessions.SessionV2) ([]model.Message, error) {
+	if r != nil && r.resumableSessionStore != nil {
+		return r.resumableSessionStore.MaterializeActiveHistory(session)
+	}
+	return session.MaterializeActiveHistory()
 }
 
 func (r *agentRuntime) writeSessionSaveNotice(stderr io.Writer) error {
@@ -4388,7 +4395,7 @@ func (r *agentRuntime) compactSessionWithCheckpoint(ctx context.Context, stderr 
 	if err != nil {
 		return nil, fmt.Errorf("write compaction checkpoint: %w", err)
 	}
-	messages, err := saved.MaterializeActiveHistory()
+	messages, err := r.materializeActiveHistory(saved)
 	if err != nil {
 		return nil, err
 	}
@@ -4862,8 +4869,9 @@ func (r *agentRuntime) sessionSavePlan(messages []model.Message) (sessions.Sessi
 }
 
 type runtimePreparationOptions struct {
-	enableSubagents        bool
-	resumedSessionOverride *sessions.SessionV2
+	enableSubagents             bool
+	resumedSessionOverride      *sessions.SessionV2
+	resumedSessionStoreOverride *sessions.V2Store
 }
 
 func prepareAgentRuntime(ctx context.Context, configPath string, options agentCommandFlags, stderr io.Writer, getwd func() (string, error), program string) (runtime *agentRuntime, err error) {
@@ -4922,7 +4930,15 @@ func prepareAgentRuntimeWithOptions(ctx context.Context, configPath string, opti
 		if !resumedSession.SaveToolResults {
 			return nil, fmt.Errorf("session %q cannot be reliably resumed because save_tool_results is false", resumedSession.ID)
 		}
-		resumedMessages, err = resumedSession.MaterializeActiveHistory()
+		resumeMaterializer := sessionStore
+		if prep.resumedSessionOverride != nil && prep.resumedSessionStoreOverride != nil {
+			resumeMaterializer = prep.resumedSessionStoreOverride
+		}
+		if resumeMaterializer != nil {
+			resumedMessages, err = resumeMaterializer.MaterializeActiveHistory(resumedSession)
+		} else {
+			resumedMessages, err = resumedSession.MaterializeActiveHistory()
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -4937,7 +4953,7 @@ func prepareAgentRuntimeWithOptions(ctx context.Context, configPath string, opti
 	}
 	resumableSessionStore := sessionStore
 	if prep.resumedSessionOverride != nil {
-		resumableSessionStore = nil
+		resumableSessionStore = prep.resumedSessionStoreOverride
 	}
 
 	resolved, err := cfg.ResolveModel(options.providerName, options.modelProfile)
@@ -5524,7 +5540,7 @@ type serverAgentTurnRunner struct {
 }
 
 func (r serverAgentTurnRunner) RunSessionTurn(ctx context.Context, request localserver.SessionTurnRequest) (result localserver.SessionTurnResult, err error) {
-	runtime, err := r.prepareServerSessionRuntime(ctx, request.Session)
+	runtime, err := r.prepareServerSessionRuntime(ctx, request.Session, request.SessionStore)
 	if err != nil {
 		return localserver.SessionTurnResult{}, err
 	}
@@ -5555,7 +5571,7 @@ func (r serverAgentTurnRunner) RunSessionTurn(ctx context.Context, request local
 }
 
 func (r serverAgentTurnRunner) PlanSessionCompaction(ctx context.Context, request localserver.SessionCompactionRequest) (result localserver.SessionCompactionResult, err error) {
-	runtime, err := r.prepareServerSessionRuntime(ctx, request.Session)
+	runtime, err := r.prepareServerSessionRuntime(ctx, request.Session, request.SessionStore)
 	if err != nil {
 		return localserver.SessionCompactionResult{}, err
 	}
@@ -5580,7 +5596,7 @@ func (r serverAgentTurnRunner) PlanSessionCompaction(ctx context.Context, reques
 	}, nil
 }
 
-func (r serverAgentTurnRunner) prepareServerSessionRuntime(ctx context.Context, session sessions.SessionV2) (*agentRuntime, error) {
+func (r serverAgentTurnRunner) prepareServerSessionRuntime(ctx context.Context, session sessions.SessionV2, store *sessions.V2Store) (*agentRuntime, error) {
 	cwd := strings.TrimSpace(session.CreatedCWD)
 	if cwd == "" {
 		return nil, fmt.Errorf("session created_cwd is required")
@@ -5594,8 +5610,9 @@ func (r serverAgentTurnRunner) prepareServerSessionRuntime(ctx context.Context, 
 	}, io.Discard, func() (string, error) {
 		return cwd, nil
 	}, r.program, runtimePreparationOptions{
-		enableSubagents:        false,
-		resumedSessionOverride: &session,
+		enableSubagents:             false,
+		resumedSessionOverride:      &session,
+		resumedSessionStoreOverride: store,
 	})
 }
 

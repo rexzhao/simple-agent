@@ -1278,6 +1278,97 @@ func TestV2StoreBlobWriteDedupeMetadataAndReadByRef(t *testing.T) {
 	}
 }
 
+func TestV2StoreSaveTurnBlobifiesLargeMessageContent(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "sessions")
+	store := NewV2Store(root)
+	largeContent := strings.Repeat("large blob-only body ", 300) + "SECRET-BLOB-BODY"
+
+	session, err := store.SaveMetadata(SessionV2{
+		ID:              "session-1",
+		Provider:        "codex",
+		ModelProfile:    "default",
+		ModelID:         "gpt-5",
+		SaveToolResults: true,
+	})
+	if err != nil {
+		t.Fatalf("SaveMetadata() error = %v", err)
+	}
+	saved, err := store.SaveTurn(session, []SessionItem{{
+		ID:         "blob-item",
+		Kind:       ItemKindMessage,
+		Visibility: ItemVisibilityVisible,
+		Audience:   ItemAudienceUser,
+		Message:    &model.Message{Role: model.MessageRoleUser, Content: largeContent},
+	}}, []string{"blob-item"})
+	if err != nil {
+		t.Fatalf("SaveTurn() error = %v", err)
+	}
+
+	segmentRaw, err := os.ReadFile(filepath.Join(root, "session-1", "segments", "000001.jsonl"))
+	if err != nil {
+		t.Fatalf("ReadFile(segment) error = %v", err)
+	}
+	if bytes.Contains(segmentRaw, []byte("SECRET-BLOB-BODY")) || bytes.Contains(segmentRaw, []byte(largeContent)) {
+		t.Fatalf("segment stored raw blob body: %s", segmentRaw)
+	}
+
+	item := saved.Items[0]
+	if item.Message == nil || item.Message.Content != "" {
+		t.Fatalf("saved message content = %#v, want blobified empty message content", item.Message)
+	}
+	if item.Content == nil || item.Content.Blob == nil {
+		t.Fatalf("saved item content = %#v, want blob ref", item.Content)
+	}
+	if !strings.HasPrefix(item.Content.Preview, "large blob-only body ") || strings.Contains(item.Content.Preview, "SECRET-BLOB-BODY") {
+		t.Fatalf("saved preview = %q, want short non-secret prefix", item.Content.Preview)
+	}
+	if !bytes.Contains(segmentRaw, []byte(item.Content.Blob.Hash)) {
+		t.Fatalf("segment does not contain blob hash %s: %s", item.Content.Blob.Hash, segmentRaw)
+	}
+
+	messages, err := store.MaterializeActiveHistory(saved)
+	if err != nil {
+		t.Fatalf("store.MaterializeActiveHistory() error = %v", err)
+	}
+	if got := messageContents(messages); !reflect.DeepEqual(got, []string{largeContent}) {
+		t.Fatalf("materialized messages = %#v, want original large content", got)
+	}
+	if _, err := saved.MaterializeActiveHistory(); !errors.Is(err, ErrCorruptedSession) {
+		t.Fatalf("session.MaterializeActiveHistory() error = %v, want ErrCorruptedSession without store", err)
+	}
+
+	other, err := store.SaveMetadata(SessionV2{
+		ID:              "session-2",
+		Provider:        "codex",
+		ModelProfile:    "default",
+		ModelID:         "gpt-5",
+		SaveToolResults: true,
+	})
+	if err != nil {
+		t.Fatalf("SaveMetadata(session-2) error = %v", err)
+	}
+	second, err := store.SaveTurn(other, []SessionItem{{
+		ID:         "blob-item-2",
+		Kind:       ItemKindMessage,
+		Visibility: ItemVisibilityVisible,
+		Audience:   ItemAudienceUser,
+		Message:    &model.Message{Role: model.MessageRoleUser, Content: largeContent},
+	}}, []string{"blob-item-2"})
+	if err != nil {
+		t.Fatalf("SaveTurn(session-2) error = %v", err)
+	}
+	if got := second.Items[0].Content.Blob.Hash; got != item.Content.Blob.Hash {
+		t.Fatalf("deduped blob hash = %s, want %s", got, item.Content.Blob.Hash)
+	}
+	matches, err := filepath.Glob(filepath.Join(root, "blobs", "sha256", item.Content.Blob.Hash[:2], "*.data"))
+	if err != nil {
+		t.Fatalf("Glob(blob files) error = %v", err)
+	}
+	if len(matches) != 1 {
+		t.Fatalf("blob file count = %d, want 1: %#v", len(matches), matches)
+	}
+}
+
 func TestV2StoreWriteBlobRejectsExistingCorruptBlob(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "sessions")
 	store := NewV2Store(root)

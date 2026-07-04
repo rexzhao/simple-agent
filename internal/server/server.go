@@ -3,7 +3,9 @@ package server
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -93,13 +95,15 @@ type SessionCompactPlanner interface {
 }
 
 type SessionTurnRequest struct {
-	Session sessions.SessionV2
-	Content string
-	Emit    func(model.Event)
+	Session      sessions.SessionV2
+	SessionStore *sessions.V2Store
+	Content      string
+	Emit         func(model.Event)
 }
 
 type SessionCompactionRequest struct {
-	Session sessions.SessionV2
+	Session      sessions.SessionV2
+	SessionStore *sessions.V2Store
 }
 
 type SessionTurnResult struct {
@@ -713,6 +717,12 @@ func (p *Process) handleSessionPath(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		p.handleSessionCompact(w, r, id)
+	case len(parts) == 3 && parts[1] == "content":
+		if r.Method != http.MethodGet {
+			writeMethodNotAllowed(w, http.MethodGet)
+			return
+		}
+		p.handleSessionBlobContent(w, r, id, parts[2])
 	case len(parts) == 4 && parts[1] == "items" && parts[3] == "content":
 		if r.Method != http.MethodGet {
 			writeMethodNotAllowed(w, http.MethodGet)
@@ -918,7 +928,16 @@ func (p *Process) handleSessionItemContent(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	content, offset, sizeBytes, bytesReturned, hasMore := sessionItemContentRange(item.Message.Content, query.Offset, query.MaxBytes)
+	rawContent, err := readSessionItemContentBytes(store, item)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "session_store_error", "could not load session item content")
+		return
+	}
+	if len(rawContent) == 0 {
+		writeError(w, http.StatusNotFound, "content_unavailable", "item content is not available")
+		return
+	}
+	content, offset, sizeBytes, bytesReturned, hasMore := sessionContentBytesRange(rawContent, query.Offset, query.MaxBytes)
 	writeJSON(w, http.StatusOK, sessionItemContentResponseDTO{
 		ItemID:        item.ID,
 		Content:       content,
@@ -926,6 +945,65 @@ func (p *Process) handleSessionItemContent(w http.ResponseWriter, r *http.Reques
 		SizeBytes:     sizeBytes,
 		BytesReturned: bytesReturned,
 		HasMore:       hasMore,
+	})
+}
+
+func (p *Process) handleSessionBlobContent(w http.ResponseWriter, r *http.Request, id, hash string) {
+	query, err := parseSessionItemContentQuery(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_query", err.Error())
+		return
+	}
+	if query.View == sessionItemsViewDebug && !p.requireRegistryToken(w, r) {
+		return
+	}
+
+	store := p.sessionStore
+	if store == nil {
+		writeError(w, http.StatusServiceUnavailable, "session_store_unavailable", "session store is not configured")
+		return
+	}
+	if !validSessionAPIID(id) {
+		writeError(w, http.StatusBadRequest, "invalid_session_id", "invalid session id")
+		return
+	}
+	hash = strings.TrimSpace(hash)
+	if !validBlobHash(hash) {
+		writeError(w, http.StatusBadRequest, "invalid_blob_hash", "invalid blob hash")
+		return
+	}
+	hash = strings.ToLower(hash)
+
+	session, err := store.Load(id)
+	if err != nil {
+		if errors.Is(err, sessions.ErrNotFound) {
+			writeError(w, http.StatusNotFound, "session_not_found", "session not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "session_store_error", "could not load session blob content")
+		return
+	}
+	ref, ok := findReachableSessionBlobRef(session.Items, hash, query.View)
+	if !ok {
+		writeError(w, http.StatusNotFound, "content_unavailable", "blob content is not available")
+		return
+	}
+
+	rawContent, err := store.ReadBlob(ref)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "session_store_error", "could not load session blob content")
+		return
+	}
+	content, offset, sizeBytes, bytesReturned, hasMore := sessionContentBytesRange(rawContent, query.Offset, query.MaxBytes)
+	writeJSON(w, http.StatusOK, sessionBlobContentResponseDTO{
+		BlobHash:      ref.Hash,
+		Content:       content,
+		Offset:        offset,
+		SizeBytes:     sizeBytes,
+		BytesReturned: bytesReturned,
+		HasMore:       hasMore,
+		Encoding:      ref.Encoding,
+		MediaType:     ref.MediaType,
 	})
 }
 
@@ -975,8 +1053,9 @@ func (p *Process) handleSessionMessage(w http.ResponseWriter, r *http.Request, i
 		"turn_id": turnID,
 	}))
 	result, err := p.turnRunner.RunSessionTurn(r.Context(), SessionTurnRequest{
-		Session: session,
-		Content: content,
+		Session:      session,
+		SessionStore: store,
+		Content:      content,
 		Emit: func(event model.Event) {
 			p.publishModelTurnEvent(id, turnID, event)
 		},
@@ -1079,7 +1158,8 @@ func (p *Process) handleSessionCompact(w http.ResponseWriter, r *http.Request, i
 		"reason": "user_requested",
 	}))
 	result, err := p.compactPlanner.PlanSessionCompaction(r.Context(), SessionCompactionRequest{
-		Session: session,
+		Session:      session,
+		SessionStore: store,
 	})
 	if err != nil {
 		p.publishCompactFailed(id, err)
@@ -1579,19 +1659,38 @@ type sessionItemMessageDTO struct {
 }
 
 type sessionItemMessageContentDTO struct {
-	Inline    string `json:"inline,omitempty"`
-	Preview   string `json:"preview,omitempty"`
-	SizeBytes int    `json:"size_bytes,omitempty"`
-	Truncated bool   `json:"truncated,omitempty"`
+	Inline    string                 `json:"inline,omitempty"`
+	Preview   string                 `json:"preview,omitempty"`
+	SizeBytes int64                  `json:"size_bytes,omitempty"`
+	Truncated bool                   `json:"truncated,omitempty"`
+	Blob      *sessionItemBlobRefDTO `json:"blob,omitempty"`
+}
+
+type sessionItemBlobRefDTO struct {
+	Hash      string `json:"hash"`
+	SizeBytes int64  `json:"size_bytes"`
+	Encoding  string `json:"encoding"`
+	MediaType string `json:"media_type,omitempty"`
 }
 
 type sessionItemContentResponseDTO struct {
 	ItemID        string `json:"item_id"`
 	Content       string `json:"content"`
 	Offset        int64  `json:"offset"`
-	SizeBytes     int    `json:"size_bytes"`
+	SizeBytes     int64  `json:"size_bytes"`
 	BytesReturned int    `json:"bytes_returned"`
 	HasMore       bool   `json:"has_more"`
+}
+
+type sessionBlobContentResponseDTO struct {
+	BlobHash      string `json:"blob_hash"`
+	Content       string `json:"content"`
+	Offset        int64  `json:"offset"`
+	SizeBytes     int64  `json:"size_bytes"`
+	BytesReturned int    `json:"bytes_returned"`
+	HasMore       bool   `json:"has_more"`
+	Encoding      string `json:"encoding,omitempty"`
+	MediaType     string `json:"media_type,omitempty"`
 }
 
 type sessionItemsQuery struct {
@@ -1811,7 +1910,7 @@ func sessionItemVisibleInView(item sessions.SessionItem, view string) bool {
 }
 
 func sessionItemContentReadableInView(item sessions.SessionItem, view string) bool {
-	if item.Message == nil || item.Message.Content == "" {
+	if item.Message == nil || !sessionItemHasContent(item) {
 		return false
 	}
 	if view == sessionItemsViewDebug {
@@ -1827,6 +1926,19 @@ func sessionItemContentReadableInView(item sessions.SessionItem, view string) bo
 		return false
 	}
 	return item.Message.Role == model.MessageRoleUser || item.Message.Role == model.MessageRoleAssistant
+}
+
+func sessionItemHasContent(item sessions.SessionItem) bool {
+	if item.Message != nil && item.Message.Content != "" {
+		return true
+	}
+	if item.Content == nil {
+		return false
+	}
+	if item.Content.Inline != "" {
+		return true
+	}
+	return item.Content.Blob != nil
 }
 
 func findSessionItemByID(items []sessions.SessionItem, id string) (sessions.SessionItem, bool) {
@@ -1891,11 +2003,21 @@ func sessionItemDTOFromSessionItem(item sessions.SessionItem) sessionItemDTO {
 		dto.Message = &sessionItemMessageDTO{
 			Role: item.Message.Role,
 		}
-		if item.Message.Content != "" {
-			dto.Message.Content = sessionItemMessageContentDTOFromString(item.Message.Content)
-		}
+		dto.Message.Content = sessionItemMessageContentDTOFromSessionItem(item)
 	}
 	return dto
+}
+
+func sessionItemMessageContentDTOFromSessionItem(item sessions.SessionItem) *sessionItemMessageContentDTO {
+	if item.Content != nil {
+		if dto := sessionItemMessageContentDTOFromStoredContent(item.Content); dto != nil {
+			return dto
+		}
+	}
+	if item.Message != nil && item.Message.Content != "" {
+		return sessionItemMessageContentDTOFromString(item.Message.Content)
+	}
+	return nil
 }
 
 func sessionItemMessageContentDTOFromString(content string) *sessionItemMessageContentDTO {
@@ -1906,8 +2028,37 @@ func sessionItemMessageContentDTOFromString(content string) *sessionItemMessageC
 	}
 	return &sessionItemMessageContentDTO{
 		Preview:   truncateStringByBytes(content, sessionItemPreviewMessageBytes),
-		SizeBytes: len(content),
+		SizeBytes: int64(len(content)),
 		Truncated: true,
+	}
+}
+
+func sessionItemMessageContentDTOFromStoredContent(content *sessions.StoredContent) *sessionItemMessageContentDTO {
+	if content == nil {
+		return nil
+	}
+	if content.Inline != "" {
+		return &sessionItemMessageContentDTO{
+			Inline: content.Inline,
+		}
+	}
+	if content.Blob != nil {
+		return &sessionItemMessageContentDTO{
+			Preview:   truncateStringByBytes(content.Preview, sessionItemPreviewMessageBytes),
+			SizeBytes: content.Blob.SizeBytes,
+			Truncated: true,
+			Blob:      sessionItemBlobRefDTOFromBlobRef(*content.Blob),
+		}
+	}
+	return nil
+}
+
+func sessionItemBlobRefDTOFromBlobRef(ref sessions.BlobRef) *sessionItemBlobRefDTO {
+	return &sessionItemBlobRefDTO{
+		Hash:      ref.Hash,
+		SizeBytes: ref.SizeBytes,
+		Encoding:  ref.Encoding,
+		MediaType: ref.MediaType,
 	}
 }
 
@@ -1931,27 +2082,62 @@ func truncateStringByBytes(value string, maxBytes int) string {
 	return value[:cut]
 }
 
-func sessionItemContentRange(value string, offset int64, maxBytes int) (string, int64, int, int, bool) {
-	sizeBytes := len(value)
-	if offset >= int64(sizeBytes) {
-		return "", int64(sizeBytes), sizeBytes, 0, false
+func readSessionItemContentBytes(store *sessions.V2Store, item sessions.SessionItem) ([]byte, error) {
+	if item.Content != nil {
+		if item.Content.Inline != "" {
+			return []byte(item.Content.Inline), nil
+		}
+		if item.Content.Blob != nil {
+			return store.ReadBlob(*item.Content.Blob)
+		}
+	}
+	if item.Message != nil && item.Message.Content != "" {
+		return []byte(item.Message.Content), nil
+	}
+	return nil, nil
+}
+
+func findReachableSessionBlobRef(items []sessions.SessionItem, hash, view string) (sessions.BlobRef, bool) {
+	for _, item := range items {
+		if !sessionItemContentReadableInView(item, view) || item.Content == nil || item.Content.Blob == nil {
+			continue
+		}
+		if strings.EqualFold(item.Content.Blob.Hash, hash) {
+			return *item.Content.Blob, true
+		}
+	}
+	return sessions.BlobRef{}, false
+}
+
+func validBlobHash(hash string) bool {
+	if hash == "" || hash != strings.TrimSpace(hash) || len(hash) != sha256.Size*2 {
+		return false
+	}
+	_, err := hex.DecodeString(hash)
+	return err == nil
+}
+
+func sessionContentBytesRange(value []byte, offset int64, maxBytes int) (string, int64, int64, int, bool) {
+	sizeBytes := int64(len(value))
+	if offset >= sizeBytes {
+		return "", sizeBytes, sizeBytes, 0, false
 	}
 	start := int(offset)
-	for start < sizeBytes && !utf8.RuneStart(value[start]) {
+	for start < len(value) && !utf8.RuneStart(value[start]) {
 		start++
 	}
-	if start >= sizeBytes {
+	if start >= len(value) {
 		return "", int64(start), sizeBytes, 0, false
 	}
 	end := start + maxBytes
-	if end > sizeBytes {
-		end = sizeBytes
+	if end > len(value) {
+		end = len(value)
 	}
-	for end > start && end < sizeBytes && !utf8.RuneStart(value[end]) {
+	for end > start && end < len(value) && !utf8.RuneStart(value[end]) {
 		end--
 	}
-	content := value[start:end]
-	return content, int64(start), sizeBytes, len(content), end < sizeBytes
+	content := string(value[start:end])
+	return content, int64(start), sizeBytes, len(content), int64(end) < sizeBytes
 }
 
 func readEmptySessionCreateRequest(w http.ResponseWriter, r *http.Request) error {

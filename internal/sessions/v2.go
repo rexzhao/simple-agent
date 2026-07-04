@@ -41,9 +41,11 @@ const (
 )
 
 const (
-	defaultV2MaxSegmentLines = 1000
-	maxJSONLRecordBytes      = 16 * 1024 * 1024
-	v2BlobsDirName           = "blobs"
+	defaultV2MaxSegmentLines  = 1000
+	maxJSONLRecordBytes       = 16 * 1024 * 1024
+	largeContentBlobBytes     = 4 * 1024
+	storedContentPreviewBytes = 240
+	v2BlobsDirName            = "blobs"
 )
 
 var ErrCorruptedSession = errors.New("corrupted session")
@@ -57,6 +59,7 @@ type SessionItem struct {
 	Visibility string         `json:"visibility"`
 	Audience   string         `json:"audience"`
 	Message    *model.Message `json:"message,omitempty"`
+	Content    *StoredContent `json:"content,omitempty"`
 }
 
 type CompactionCheckpoint struct {
@@ -129,21 +132,35 @@ func (s SessionV2) RootConfigPath() string {
 }
 
 func (s SessionV2) MaterializeActiveHistory() ([]model.Message, error) {
-	itemsByID := make(map[string]SessionItem, len(s.Items))
-	for _, item := range s.Items {
+	return materializeActiveHistory(s, nil)
+}
+
+func materializeActiveHistory(session SessionV2, readBlob func(BlobRef) ([]byte, error)) ([]model.Message, error) {
+	itemsByID := make(map[string]SessionItem, len(session.Items))
+	for _, item := range session.Items {
 		itemsByID[item.ID] = item
 	}
 
-	messages := make([]model.Message, 0, len(s.ActiveHistory))
-	for _, id := range s.ActiveHistory {
+	messages := make([]model.Message, 0, len(session.ActiveHistory))
+	for _, id := range session.ActiveHistory {
 		item, ok := itemsByID[id]
 		if !ok {
-			return nil, corruptedSessionError(s.ID, "active history references missing item %q", id)
+			return nil, corruptedSessionError(session.ID, "active history references missing item %q", id)
 		}
 		if item.Message == nil {
-			return nil, corruptedSessionError(s.ID, "active history references item %q without a message", id)
+			return nil, corruptedSessionError(session.ID, "active history references item %q without a message", id)
 		}
-		messages = append(messages, copyMessage(*item.Message))
+		message := copyMessage(*item.Message)
+		if message.Content == "" && item.Content != nil {
+			content, ok, err := materializeStoredContent(session.ID, item.ID, item.Content, readBlob)
+			if err != nil {
+				return nil, err
+			}
+			if ok {
+				message.Content = content
+			}
+		}
+		messages = append(messages, message)
 	}
 	return messages, nil
 }
@@ -368,12 +385,20 @@ func (s *V2Store) Delete(id string) error {
 	return nil
 }
 
+func (s *V2Store) MaterializeActiveHistory(session SessionV2) ([]model.Message, error) {
+	return materializeActiveHistory(session, s.ReadBlob)
+}
+
 func (s *V2Store) AppendItem(sessionID string, item SessionItem) (SessionItem, error) {
 	if item.CreatedAt.IsZero() {
 		item.CreatedAt = s.now().UTC()
 	}
 	if item.ID == "" {
 		return SessionItem{}, fmt.Errorf("session item id is required")
+	}
+	item, err := s.blobifySessionItemContent(item)
+	if err != nil {
+		return SessionItem{}, err
 	}
 	seq, err := s.appendRecord(sessionID, v2Record{
 		Type: RecordTypeItemAppended,
@@ -430,6 +455,10 @@ func (s *V2Store) AppendCompactionCheckpoint(sessionID string, summaryItem Sessi
 		return SessionV2{}, err
 	}
 	if err := validateCompactionCheckpointWrite(summaryItem, checkpoint, state); err != nil {
+		return SessionV2{}, err
+	}
+	summaryItem, err = s.blobifySessionItemContent(summaryItem)
+	if err != nil {
 		return SessionV2{}, err
 	}
 
@@ -622,6 +651,10 @@ func (s *V2Store) AppendItemsAndReplaceActiveHistory(sessionID string, items []S
 		if item.ID == "" {
 			return SessionV2{}, fmt.Errorf("session item id is required")
 		}
+		item, err = s.blobifySessionItemContent(item)
+		if err != nil {
+			return SessionV2{}, err
+		}
 		item.Seq = nextSeq
 		itemCopy := item
 		records = append(records, v2Record{
@@ -664,6 +697,10 @@ func (s *V2Store) appendCompactionAndItemsReplaceActiveHistory(sessionID string,
 		return SessionV2{}, err
 	}
 	if err := validateCompactionCheckpointWrite(summaryItem, checkpoint, state); err != nil {
+		return SessionV2{}, err
+	}
+	summaryItem, err = s.blobifySessionItemContent(summaryItem)
+	if err != nil {
 		return SessionV2{}, err
 	}
 
@@ -709,6 +746,10 @@ func (s *V2Store) appendCompactionAndItemsReplaceActiveHistory(sessionID string,
 		}
 		if item.ID == "" {
 			return SessionV2{}, fmt.Errorf("session item id is required")
+		}
+		item, err = s.blobifySessionItemContent(item)
+		if err != nil {
+			return SessionV2{}, err
 		}
 		item.Seq = nextSeq
 		itemCopy := item
@@ -843,6 +884,26 @@ func (s *V2Store) ReadBlob(ref BlobRef) ([]byte, error) {
 		return nil, err
 	}
 	return raw, nil
+}
+
+func (s *V2Store) blobifySessionItemContent(item SessionItem) (SessionItem, error) {
+	if item.Message == nil || len(item.Message.Content) <= largeContentBlobBytes {
+		return item, nil
+	}
+
+	message := copyMessage(*item.Message)
+	raw := []byte(message.Content)
+	ref, err := s.WriteBlob(raw, "utf-8", "text/plain")
+	if err != nil {
+		return SessionItem{}, err
+	}
+	item.Message = &message
+	item.Message.Content = ""
+	item.Content = &StoredContent{
+		Blob:    &ref,
+		Preview: previewStringByBytes(string(raw), storedContentPreviewBytes),
+	}
+	return item, nil
 }
 
 func (s *V2Store) appendRecord(sessionID string, record v2Record) (int64, error) {
@@ -1437,6 +1498,46 @@ func verifyBlobBytes(raw []byte, ref BlobRef) error {
 	return nil
 }
 
+func materializeStoredContent(sessionID, itemID string, content *StoredContent, readBlob func(BlobRef) ([]byte, error)) (string, bool, error) {
+	if content == nil {
+		return "", false, nil
+	}
+	if content.Inline != "" {
+		return content.Inline, true, nil
+	}
+	if content.Blob == nil {
+		return "", false, nil
+	}
+	if readBlob == nil {
+		return "", false, corruptedSessionError(sessionID, "active history references blob-backed item %q without store-backed materialization", itemID)
+	}
+	raw, err := readBlob(*content.Blob)
+	if err != nil {
+		return "", false, corruptedSessionError(sessionID, "active history item %q blob content is unavailable: %v", itemID, err)
+	}
+	return string(raw), true, nil
+}
+
+func previewStringByBytes(value string, maxBytes int) string {
+	if maxBytes <= 0 {
+		return ""
+	}
+	if len(value) <= maxBytes {
+		return value
+	}
+	cut := 0
+	for i := range value {
+		if i > maxBytes {
+			break
+		}
+		cut = i
+	}
+	if cut == 0 {
+		return ""
+	}
+	return value[:cut]
+}
+
 func corruptedSessionError(sessionID, format string, args ...any) error {
 	message := fmt.Sprintf(format, args...)
 	if sessionID == "" {
@@ -1473,8 +1574,21 @@ func copySessionItems(items []SessionItem) []SessionItem {
 			message := copyMessage(*items[i].Message)
 			copied[i].Message = &message
 		}
+		copied[i].Content = copyStoredContent(items[i].Content)
 	}
 	return copied
+}
+
+func copyStoredContent(content *StoredContent) *StoredContent {
+	if content == nil {
+		return nil
+	}
+	copied := *content
+	if content.Blob != nil {
+		blob := *content.Blob
+		copied.Blob = &blob
+	}
+	return &copied
 }
 
 func copyCompactionCheckpoints(checkpoints []CompactionCheckpoint) []CompactionCheckpoint {

@@ -137,27 +137,27 @@ evidence 证明。
 
 ## API
 
-- [ ] 提供 `GET /health`。
-- [ ] 提供 `GET /server`。
-- [ ] 提供 `POST /server/shutdown`。
+- [x] 提供 `GET /health`。
+- [x] 提供 `GET /server`。
+- [x] 提供 `POST /server/shutdown`。
 - [x] 提供 `GET /projects`。
 - [x] 提供 `POST /projects`。
 - [x] 提供 project detail endpoint：`GET /projects/{project_id}`。
 - [x] 提供 project remove endpoint。
 - [x] 提供 `GET /projects/{project_id}/sessions`。
 - [x] 提供 `POST /projects/{project_id}/sessions`。
-- [ ] 提供 `GET /sessions/{session_id}`。
+- [x] 提供 `GET /sessions/{session_id}`。
 - [x] 提供 session rename/archive endpoint。
-- [ ] 提供 `POST /sessions/{session_id}/messages`。
-- [ ] 提供 `GET /sessions/{session_id}/items`。
-- [ ] 提供 `GET /sessions/{session_id}/content/{blob_hash}`。
-- [ ] 提供 `WS /sessions/{session_id}/stream`。
-- [ ] CLI 只负责 cwd 到 project 的映射。
-- [ ] future GUI 可以直接分页 projects/sessions。
-- [ ] blob content endpoint 校验 blob 可由该 session 到达。
-- [ ] 不提供裸全局 blob hash 读取。
-- [ ] items API 支持 session seq pagination。
-- [ ] GUI 可过滤 hidden summary/debug records。
+- [x] 提供 `POST /sessions/{session_id}/messages`。
+- [x] 提供 `GET /sessions/{session_id}/items`。
+- [x] 提供 `GET /sessions/{session_id}/content/{blob_hash}`。
+- [x] 提供 `WS /sessions/{session_id}/stream`。
+- [x] CLI 只负责 cwd 到 project 的映射。
+- [x] future GUI 可以直接分页 projects/sessions。
+- [x] blob content endpoint 校验 blob 可由该 session 到达。
+- [x] 不提供裸全局 blob hash 读取。
+- [x] items API 支持 session seq pagination。
+- [x] GUI 可过滤 hidden summary/debug records。
 
 ## Persistence
 
@@ -166,12 +166,12 @@ evidence 证明。
 - [x] per-project directories 存在 user-level home namespace。
 - [x] per-session directories 存在 user-level home namespace。
 - [x] 默认不写 project repo。
-- [ ] transcript 使用 append-only JSONL。
-- [ ] 大内容存 hash-addressed blobs。
-- [ ] global blob dedupe 可用或被明确实现。
-- [ ] session seq 支持 pagination。
-- [ ] hidden summary records 可被 GUI 过滤。
-- [ ] debug records 可被 GUI 过滤。
+- [x] transcript 使用 append-only JSONL。
+- [x] 大内容存 hash-addressed blobs。
+- [x] global blob dedupe 可用或被明确实现。
+- [x] session seq 支持 pagination。
+- [x] hidden summary records 可被 GUI 过滤。
+- [x] debug records 可被 GUI 过滤。
 
 ## Validation
 
@@ -187,7 +187,7 @@ evidence 证明。
 - [x] 测试覆盖 explicit session API paths。
 - [ ] 测试覆盖 shutdown immediate/wait semantics。
 - [ ] 测试覆盖 interrupted recovery。
-- [ ] 测试覆盖 JSONL/blob pagination。
+- [x] 测试覆盖 JSONL/blob pagination。
 - [x] `go test ./...` 通过。
 - [x] `git diff --check` 通过。
 - [x] 在本文件追加 smoke evidence，包含命令、日期、结果和任何已知限制。
@@ -359,4 +359,14 @@ evidence 证明。
   `status` / `stop` 无健康 registry 时不 auto-start。既有同包测试继续覆盖直接替换/无旧 scoped
   兼容层、home-backed registry/project/session store、foreground/background singleton、默认 loopback、
   registry token home 存储与 private permission，以及 server HTTP/WS 第一版 registry-token-only auth。
-- Known limits: 当前 M21 slices 未实现 GUI server work、shutdown semantics 或 transcript/blob migration。
+- 2026-07-04 M21 API/blob/transcript evidence slice:
+  `go test ./internal/sessions -run "TestV2Store(SaveTurnBlobifiesLargeMessageContent|BlobWriteDedupeMetadataAndReadByRef|WriteBlobRejectsExistingCorruptBlob)|TestV2StoreSegmentRolloverByMaxLineCount"`、
+  `go test ./internal/server -run "TestSession(BlobContentEndpointRequiresSessionReachability|ItemsPaginationBeforeAfter|ItemsChatAndDebugFilteringAndNarrowDTO|ItemContentChatReadAndByteRanges|ItemContentDebugRequiresTokenAndChatHidesPrivateContent|MetadataAPIsListDetailNoItemsAndServerCount)|TestServerShutdownRequiresRegistryToken"`、
+  `go test ./internal/cli -run "TestChatLargePromptSaveSessionStoresBlobBackedContent|TestServerAgentTurnRunner(HydratesBlobBackedActiveHistoryFromProvidedStore|UsesProvidedSessionOutsideConfigStore|ReloadsSessionConfigPathEachTurn)"`、
+  `go test ./internal/server ./internal/sessions`、`go test ./...` 和 `git diff --check` 通过；`git diff --check`
+  仅输出工作区 LF/CRLF normalization warnings。覆盖 endpoint inventory、session-scoped
+  `/sessions/{session_id}/content/{blob_hash}`、reachable-only blob reads、globally existing orphan/other-session
+  blob hash rejection、无裸 global blob hash API、item DTO blob refs、append-only JSONL segment evidence、
+  production save path 自动 blobification、store-backed active history hydration、global blob dedupe、
+  session seq pagination，以及 chat/debug hidden filtering。
+- Known limits: 当前 M21 slices 未实现 GUI server work、file lock 或 shutdown/recovery semantics。

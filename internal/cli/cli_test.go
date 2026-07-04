@@ -5892,7 +5892,7 @@ func TestChatSaveSessionFlagWritesFullToolHistory(t *testing.T) {
 	assertSavedMessage(t, messages, 4, model.MessageRoleAssistant, "done")
 }
 
-func TestChatSaveSessionFailureDoesNotExposePartialNewSession(t *testing.T) {
+func TestChatLargePromptSaveSessionStoresBlobBackedContent(t *testing.T) {
 	requests := make(chan struct{}, 1)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.Copy(io.Discard, r.Body)
@@ -5907,32 +5907,49 @@ func TestChatSaveSessionFailureDoesNotExposePartialNewSession(t *testing.T) {
 	writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
 	setCLIModelContextWindow(t, configDir, 30000000)
 
-	oversizedPrompt := strings.Repeat("x", 17*1024*1024)
+	oversizedPrompt := strings.Repeat("x", 17*1024*1024) + "OVERSIZED-PROMPT-TAIL"
 	var stdout, stderr bytes.Buffer
 	code := runLegacyChatWithIO([]string{"--config", cliConfigPath(configDir), "chat", "--save-session", "--quit", "--prompt", oversizedPrompt}, strings.NewReader(""), &stdout, &stderr, func() (string, error) {
 		return t.TempDir(), nil
 	})
 
-	if code != 1 {
-		t.Fatalf("RunWithIO() code = %d, want 1", code)
+	if code != 0 {
+		t.Fatalf("RunWithIO() code = %d, want 0; stderr:\n%s", code, stderr.String())
 	}
 	if got := stdout.String(); got != "one" {
-		t.Fatalf("stdout = %q, want streamed provider output before save failure", got)
+		t.Fatalf("stdout = %q, want streamed provider output", got)
 	}
 	<-requests
-	assertCLIErrorContains(t, stderr.String(), "save resumable session", "too large")
 	assertCLIErrorOmits(t, stderr.String(), "direct-secret-value")
 
 	store := sessions.NewV2Store(filepath.Join(configDir, "sessions"))
-	infos, err := store.List()
+	session := loadOnlyCLISession(t, filepath.Join(configDir, "sessions"))
+	messages, err := store.MaterializeActiveHistory(session)
 	if err != nil {
-		t.Fatalf("List() error = %v", err)
+		t.Fatalf("MaterializeActiveHistory(%q) error = %v", session.ID, err)
 	}
-	if len(infos) != 0 {
-		t.Fatalf("sessions after failed first save = %#v, want none", infos)
+	if len(messages) != 3 {
+		t.Fatalf("len(saved messages) = %d, want 3", len(messages))
 	}
-	if _, err := store.Latest(); !errors.Is(err, sessions.ErrNotFound) {
-		t.Fatalf("Latest() after failed first save error = %v, want ErrNotFound", err)
+	assertSavedMessage(t, messages, 0, model.MessageRoleSystem, builtInBaseInstructions)
+	if messages[1].Role != model.MessageRoleUser || messages[1].Content != oversizedPrompt {
+		t.Fatalf("saved prompt role/length/tail = %q/%d/%t, want user/%d/true", messages[1].Role, len(messages[1].Content), strings.HasSuffix(messages[1].Content, "OVERSIZED-PROMPT-TAIL"), len(oversizedPrompt))
+	}
+	assertSavedMessage(t, messages, 2, model.MessageRoleAssistant, "one")
+
+	userItem := session.Items[1]
+	if userItem.Message == nil || userItem.Message.Content != "" || userItem.Content == nil || userItem.Content.Blob == nil {
+		t.Fatalf("saved user item = %#v, want blob-backed content", userItem)
+	}
+	segmentRaw, err := os.ReadFile(filepath.Join(configDir, "sessions", session.ID, "segments", "000001.jsonl"))
+	if err != nil {
+		t.Fatalf("ReadFile(segment) error = %v", err)
+	}
+	if bytes.Contains(segmentRaw, []byte("OVERSIZED-PROMPT-TAIL")) {
+		t.Fatalf("segment stored raw prompt tail")
+	}
+	if !bytes.Contains(segmentRaw, []byte(userItem.Content.Blob.Hash)) {
+		t.Fatalf("segment does not contain blob hash %s", userItem.Content.Blob.Hash)
 	}
 }
 
@@ -6933,6 +6950,88 @@ sessions:
 	}
 	if len(result.Items) != 3 {
 		t.Fatalf("len(result.Items) = %d, want runtime+user+assistant save plan: %#v", len(result.Items), result.Items)
+	}
+}
+
+func TestServerAgentTurnRunnerHydratesBlobBackedActiveHistoryFromProvidedStore(t *testing.T) {
+	server, requests := newCLIRunServer(t,
+		`{"choices":[{"delta":{"content":"server assistant"}}]}`,
+		`[DONE]`,
+	)
+	defer server.Close()
+
+	configDir := t.TempDir()
+	writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
+	appendCLIConfig(t, configDir, `
+sessions:
+  dir: config-only-sessions
+  save_tool_results: true
+`)
+	homeRoot, err := sessions.RootForHome(t.TempDir())
+	if err != nil {
+		t.Fatalf("RootForHome() error = %v", err)
+	}
+	createdCWD := t.TempDir()
+	homeStore := sessions.NewV2Store(homeRoot)
+	session, err := homeStore.SaveMetadata(sessions.SessionV2{
+		ID:              "server-home-blob-session",
+		Version:         sessions.VersionV2,
+		Provider:        "fake",
+		ModelProfile:    "default",
+		ModelID:         "model-default",
+		CWD:             createdCWD,
+		CreatedCWD:      createdCWD,
+		ConfigPath:      cliConfigPath(configDir),
+		SaveToolResults: true,
+	})
+	if err != nil {
+		t.Fatalf("SaveMetadata(home session) error = %v", err)
+	}
+	largePrior := strings.Repeat("prior server-owned blob content ", 300) + "PRIOR-BLOB-TAIL"
+	saved, err := homeStore.SaveTurn(session, []sessions.SessionItem{{
+		ID:         "prior-large",
+		Kind:       sessions.ItemKindMessage,
+		Visibility: sessions.ItemVisibilityVisible,
+		Audience:   sessions.ItemAudienceUser,
+		Message:    &model.Message{Role: model.MessageRoleUser, Content: largePrior},
+	}}, []string{"prior-large"})
+	if err != nil {
+		t.Fatalf("SaveTurn(home session) error = %v", err)
+	}
+	if saved.Items[0].Content == nil || saved.Items[0].Content.Blob == nil || saved.Items[0].Message.Content != "" {
+		t.Fatalf("saved prior item = %#v, want blobified active history item", saved.Items[0])
+	}
+	loaded, err := homeStore.Load(saved.ID)
+	if err != nil {
+		t.Fatalf("Load(home session) error = %v", err)
+	}
+	if _, err := loaded.MaterializeActiveHistory(); !errors.Is(err, sessions.ErrCorruptedSession) {
+		t.Fatalf("loaded.MaterializeActiveHistory() error = %v, want store-backed materialization required", err)
+	}
+	configSessionRoot := filepath.Join(configDir, "config-only-sessions")
+	if _, err := sessions.NewV2Store(configSessionRoot).Load(saved.ID); !errors.Is(err, sessions.ErrNotFound) {
+		t.Fatalf("Load(config sessions.dir session) error = %v, want not found", err)
+	}
+
+	result, err := (serverAgentTurnRunner{program: "sai"}).RunSessionTurn(context.Background(), localserver.SessionTurnRequest{
+		Session:      loaded,
+		SessionStore: homeStore,
+		Content:      "server prompt",
+	})
+	if err != nil {
+		t.Fatalf("RunSessionTurn() error = %v", err)
+	}
+
+	request := receiveCLIRunRequest(t, requests)
+	assertNoAdditionalCLIRunRequest(t, requests)
+	messages := requestMessages(t, request.Body)
+	if len(messages) != 2 {
+		t.Fatalf("len(request messages) = %d, want prior active history plus pending prompt: %#v", len(messages), messages)
+	}
+	assertMessage(t, messages, 0, "user", largePrior)
+	assertMessage(t, messages, 1, "user", "server prompt")
+	if result.Session.ID != saved.ID {
+		t.Fatalf("save plan session id = %q, want %q", result.Session.ID, saved.ID)
 	}
 }
 
