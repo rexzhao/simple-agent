@@ -200,6 +200,25 @@ func execute(ctx context.Context, program string, args []string, stdin io.Reader
 		default:
 			return usageError("usage: sai project <create|list|show>", "", "sai help project")
 		}
+	case "session":
+		subcommand, subArgs, groupHelp, err := splitSubcommandArgs(rootArgs.commandArgs, map[string]flagKind{"cwd": flagKindValue, "project": flagKindValue, "all-projects": flagKindBool}, "sai help session")
+		if err != nil {
+			return err
+		}
+		if subcommand == "" && groupHelp {
+			printSessionUsage(stdout)
+			return nil
+		}
+		switch subcommand {
+		case "create":
+			return sessionCreateCommand(ctx, subArgs, rootArgs.configPath, homePath, stdout, getwd, program)
+		case "list":
+			return sessionListCommand(ctx, subArgs, rootArgs.configPath, homePath, stdout, getwd, program)
+		case "show":
+			return sessionShowCommand(ctx, subArgs, rootArgs.configPath, homePath, stdout, getwd, program)
+		default:
+			return usageError("usage: sai session <create|list|show>", "", "sai help session")
+		}
 	case "status":
 		return statusCommand(ctx, rootArgs.commandArgs, homePath, stdout, getwd)
 	case "stop":
@@ -301,6 +320,7 @@ Commands:
   attach            Attach to a server-owned session
   server            Start a local HTTP server
   project           Manage registered projects
+  session           Manage explicit sessions
   status            Show nearest server status
   stop              Stop nearest server
   servers list      List registered local servers
@@ -429,6 +449,35 @@ const projectShowUsageText = `usage: sai project show [--project id]
 
 Shows project metadata. Without --project, the current directory is matched to
 the nearest registered ancestor project.
+`
+
+const sessionUsageText = `usage: sai session <command>
+
+Commands:
+  session create    Create a session in the nearest registered project
+  session list      List explicit sessions
+  session show      Show session metadata
+
+Run "sai help session <command>" for command usage.
+`
+
+const sessionCreateUsageText = `usage: sai session create [--cwd path]
+
+Creates a server-owned session in the nearest registered project. Use --cwd to
+select the creation directory; otherwise the effective current directory is used.
+`
+
+const sessionListUsageText = `usage: sai session list [--project project-id] [--all-projects]
+
+Lists session metadata without printing messages, prompts, assistant output, or
+tool result content. Without flags, the current directory is matched to the
+nearest registered ancestor project.
+`
+
+const sessionShowUsageText = `usage: sai session show <session-id>
+
+Shows metadata for an explicit global session id. Messages, prompts, assistant
+output, and tool result content are not printed.
 `
 
 const statusUsageText = `usage: sai status [--cwd path]
@@ -583,6 +632,14 @@ func helpCommand(args []string, stdout io.Writer) error {
 		printProjectListUsage(stdout)
 	case "project show":
 		printProjectShowUsage(stdout)
+	case "session":
+		printSessionUsage(stdout)
+	case "session create":
+		printSessionCreateUsage(stdout)
+	case "session list":
+		printSessionListUsage(stdout)
+	case "session show":
+		printSessionShowUsage(stdout)
 	case "status":
 		printStatusUsage(stdout)
 	case "stop":
@@ -677,6 +734,22 @@ func printProjectListUsage(stdout io.Writer) {
 
 func printProjectShowUsage(stdout io.Writer) {
 	fmt.Fprint(stdout, projectShowUsageText)
+}
+
+func printSessionUsage(stdout io.Writer) {
+	fmt.Fprint(stdout, sessionUsageText)
+}
+
+func printSessionCreateUsage(stdout io.Writer) {
+	fmt.Fprint(stdout, sessionCreateUsageText)
+}
+
+func printSessionListUsage(stdout io.Writer) {
+	fmt.Fprint(stdout, sessionListUsageText)
+}
+
+func printSessionShowUsage(stdout io.Writer) {
+	fmt.Fprint(stdout, sessionShowUsageText)
 }
 
 func printStatusUsage(stdout io.Writer) {
@@ -800,6 +873,7 @@ type rootArgs struct {
 func splitRootArgs(args []string) (rootArgs, error) {
 	known := map[string]flagKind{
 		"config":         flagKindValue,
+		"all-projects":   flagKindBool,
 		"home":           flagKindValue,
 		"name":           flagKindValue,
 		"project":        flagKindValue,
@@ -1678,6 +1752,10 @@ func serverSessionDefaultsFromConfig(cfg *config.Config, cwd string) (sessions.S
 	if err != nil {
 		return sessions.SessionV2{}, err
 	}
+	selectedSkills, err := enabledSkillsForRun(cfg)
+	if err != nil {
+		return sessions.SessionV2{}, err
+	}
 	return sessions.SessionV2{
 		Version:         sessions.VersionV2,
 		Provider:        providerName,
@@ -1688,6 +1766,8 @@ func serverSessionDefaultsFromConfig(cfg *config.Config, cwd string) (sessions.S
 		ConfigPath:      cfg.ConfigPath,
 		EnabledTools:    copyStringSlice(cfg.Tools.Enabled),
 		EnabledMCP:      mcpServerIDs(selectedMCPServers),
+		EnabledSkills:   skillIDs(selectedSkills),
+		ShowReasoning:   cfg.Agent.ShowReasoning,
 		Context: contextwindow.Metadata{
 			ContextWindow:           window.Tokens,
 			ContextWindowSource:     string(window.Source),
@@ -1695,6 +1775,191 @@ func serverSessionDefaultsFromConfig(cfg *config.Config, cwd string) (sessions.S
 		},
 		SaveToolResults: true,
 	}, nil
+}
+
+func sessionCreateCommand(ctx context.Context, args []string, configPath, homePath string, stdout io.Writer, getwd func() (string, error), program string) error {
+	flags := flag.NewFlagSet("sai session create", flag.ContinueOnError)
+	cwdFlag := flags.String("cwd", "", "session creation working directory")
+	positionals, done, err := parseCommandFlagArgs(flags, args, stdout, printSessionCreateUsage, "sai help session create")
+	if done || err != nil {
+		return err
+	}
+	if len(positionals) != 0 {
+		return usageError("usage: sai session create [--cwd path]", "", "sai help session create")
+	}
+
+	creationCWD, err := resolveClientCWD(*cwdFlag, getwd)
+	if err != nil {
+		return err
+	}
+	record, err := ensureProjectCommandServer(ctx, configPath, homePath, creationCWD, program)
+	if err != nil {
+		return err
+	}
+	project, ok, err := nearestProject(ctx, record, creationCWD)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return fmt.Errorf("no registered project found from %s; run \"sai project create\"", creationCWD)
+	}
+
+	cfg, err := loadConfig(serverConfigPath(configPath, creationCWD), func() (string, error) {
+		return creationCWD, nil
+	}, program)
+	if err != nil {
+		return err
+	}
+	defaults, err := serverSessionDefaultsFromConfig(cfg, creationCWD)
+	if err != nil {
+		return err
+	}
+	defaults.CreatedCWD = creationCWD
+	metadata := sessionCreateMetadataFromDefaults(defaults)
+	session, err := localserver.CreateProjectSessionWithMetadataWithToken(ctx, record.Addr, record.Token, project.ID, metadata, serverClientTimeout)
+	if err != nil {
+		return err
+	}
+	return printServerSessionDetailWithProject(stdout, session)
+}
+
+func sessionListCommand(ctx context.Context, args []string, configPath, homePath string, stdout io.Writer, getwd func() (string, error), program string) error {
+	flags := flag.NewFlagSet("sai session list", flag.ContinueOnError)
+	projectID := flags.String("project", "", "project id")
+	allProjects := flags.Bool("all-projects", false, "list sessions across all projects")
+	positionals, done, err := parseCommandFlagArgs(flags, args, stdout, printSessionListUsage, "sai help session list")
+	if done || err != nil {
+		return err
+	}
+	if len(positionals) != 0 {
+		return usageError("usage: sai session list [--project project-id] [--all-projects]", "", "sai help session list")
+	}
+	if *allProjects && strings.TrimSpace(*projectID) != "" {
+		return usageError("--project cannot be combined with --all-projects", "", "sai help session list")
+	}
+
+	if *allProjects {
+		record, err := ensureSessionCommandServer(ctx, configPath, homePath, program, getwd)
+		if err != nil {
+			return err
+		}
+		infos, err := localserver.ListSessions(ctx, record.Addr, serverClientTimeout)
+		if err != nil {
+			return err
+		}
+		return printServerSessionList(stdout, infos)
+	}
+
+	project := strings.TrimSpace(*projectID)
+	var record localserver.RegistryRecord
+	if project == "" {
+		effectiveCWD, err := resolveClientCWD("", getwd)
+		if err != nil {
+			return err
+		}
+		record, err = ensureProjectCommandServer(ctx, configPath, homePath, effectiveCWD, program)
+		if err != nil {
+			return err
+		}
+		nearest, ok, err := nearestProject(ctx, record, effectiveCWD)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return fmt.Errorf("no registered project found from %s; run \"sai project create\"", effectiveCWD)
+		}
+		project = nearest.ID
+	} else {
+		record, err = ensureSessionCommandServer(ctx, configPath, homePath, program, getwd)
+		if err != nil {
+			return err
+		}
+	}
+
+	infos, err := localserver.ListProjectSessionsWithToken(ctx, record.Addr, record.Token, project, serverClientTimeout)
+	if err != nil {
+		return err
+	}
+	return printServerSessionList(stdout, infos)
+}
+
+func sessionShowCommand(ctx context.Context, args []string, configPath, homePath string, stdout io.Writer, getwd func() (string, error), program string) error {
+	flags := flag.NewFlagSet("sai session show", flag.ContinueOnError)
+	positionals, done, err := parseCommandFlagArgs(flags, args, stdout, printSessionShowUsage, "sai help session show")
+	if done || err != nil {
+		return err
+	}
+	if len(positionals) != 1 {
+		return usageError("usage: sai session show <session-id>", "", "sai help session show")
+	}
+
+	record, err := ensureSessionCommandServer(ctx, configPath, homePath, program, getwd)
+	if err != nil {
+		return err
+	}
+	session, err := localserver.GetSessionDetail(ctx, record.Addr, positionals[0], serverClientTimeout)
+	if err != nil {
+		return err
+	}
+	return printServerSessionDetailWithProject(stdout, session)
+}
+
+func nearestProject(ctx context.Context, record localserver.RegistryRecord, cwd string) (localserver.ProjectInfo, bool, error) {
+	projects, err := localserver.ListProjectsWithToken(ctx, record.Addr, record.Token, serverClientTimeout)
+	if err != nil {
+		return localserver.ProjectInfo{}, false, err
+	}
+	return nearestProjectFromList(projects, cwd)
+}
+
+func ensureSessionCommandServer(ctx context.Context, configPath, homePath, program string, getwd func() (string, error)) (localserver.RegistryRecord, error) {
+	store, err := localserver.NewRegistryStoreForHome(homePath)
+	if err != nil {
+		return localserver.RegistryRecord{}, err
+	}
+	discovery, err := localserver.DiscoverHealthy(ctx, store, "", serverClientTimeout)
+	if err != nil {
+		return localserver.RegistryRecord{}, err
+	}
+	if discovery.Found {
+		return discovery.Record, nil
+	}
+
+	effectiveCWD, err := resolveClientCWD("", getwd)
+	if err != nil {
+		return localserver.RegistryRecord{}, err
+	}
+	launch, err := prepareServerLaunch(configPath, effectiveCWD, localserver.DefaultListenAddress, homePath, store, func() (string, error) {
+		return effectiveCWD, nil
+	}, program)
+	if err != nil {
+		return localserver.RegistryRecord{}, err
+	}
+	return startBackgroundServerAndWait(ctx, launch)
+}
+
+func sessionCreateMetadataFromDefaults(session sessions.SessionV2) localserver.SessionCreateMetadata {
+	showReasoning := session.ShowReasoning
+	saveToolResults := session.SaveToolResults
+	context := session.Context
+	createdCWD := session.CreatedCWD
+	if strings.TrimSpace(createdCWD) == "" {
+		createdCWD = session.CWD
+	}
+	return localserver.SessionCreateMetadata{
+		CreatedCWD:      createdCWD,
+		ConfigPath:      session.ConfigPath,
+		Provider:        session.Provider,
+		ModelProfile:    session.ModelProfile,
+		ModelID:         session.ModelID,
+		ModelParameters: copyParameterMap(session.ModelParameters),
+		EnabledTools:    copyStringSlice(session.EnabledTools),
+		EnabledMCP:      copyStringSlice(session.EnabledMCP),
+		EnabledSkills:   copyStringSlice(session.EnabledSkills),
+		ShowReasoning:   &showReasoning,
+		Context:         &context,
+		SaveToolResults: &saveToolResults,
+	}
 }
 
 func statusCommand(ctx context.Context, args []string, homePath string, stdout io.Writer, getwd func() (string, error)) error {
@@ -2836,11 +3101,7 @@ func sessionsListCommand(ctx context.Context, args []string, homePath string, st
 		return err
 	}
 
-	fmt.Fprintln(stdout, "ID\tUPDATED\tPROVIDER\tMODEL/PROFILE")
-	for _, info := range infos {
-		fmt.Fprintf(stdout, "%s\t%s\t%s\t%s/%s\n", info.ID, formatSessionTimestamp(info.UpdatedAt), info.Provider, info.ModelID, info.ModelProfile)
-	}
-	return nil
+	return printServerSessionList(stdout, infos)
 }
 
 func sessionsShowCommand(ctx context.Context, args []string, homePath string, stdout io.Writer, getwd func() (string, error)) error {
@@ -2866,6 +3127,14 @@ func sessionsShowCommand(ctx context.Context, args []string, homePath string, st
 }
 
 func printServerSessionDetail(stdout io.Writer, session localserver.SessionDetail) error {
+	return printServerSessionDetailFields(stdout, session, false)
+}
+
+func printServerSessionDetailWithProject(stdout io.Writer, session localserver.SessionDetail) error {
+	return printServerSessionDetailFields(stdout, session, true)
+}
+
+func printServerSessionDetailFields(stdout io.Writer, session localserver.SessionDetail, includeProject bool) error {
 	fmt.Fprintln(stdout, "WARNING: server-owned session storage can contain full sensitive content, including prompts, assistant output, and tool results.")
 	fmt.Fprintln(stdout, "This command prints metadata only; messages and tool result content are not shown.")
 	fmt.Fprintf(stdout, "ID\t%s\n", session.ID)
@@ -2876,6 +3145,12 @@ func printServerSessionDetail(stdout io.Writer, session localserver.SessionDetai
 	fmt.Fprintf(stdout, "MODEL_ID\t%s\n", session.ModelID)
 	fmt.Fprintf(stdout, "STATUS\t%s\n", session.Status)
 	fmt.Fprintf(stdout, "LAST_SEQ\t%d\n", session.LastSeq)
+	if includeProject && strings.TrimSpace(session.ProjectID) != "" {
+		fmt.Fprintf(stdout, "PROJECT_ID\t%s\n", session.ProjectID)
+	}
+	if includeProject && strings.TrimSpace(session.CreatedCWD) != "" {
+		fmt.Fprintf(stdout, "CREATED_CWD\t%s\n", session.CreatedCWD)
+	}
 	fmt.Fprintf(stdout, "CWD\t%s\n", session.CWD)
 	fmt.Fprintf(stdout, "CONFIG_PATH\t%s\n", session.ConfigPath)
 	fmt.Fprintf(stdout, "ENABLED_TOOLS\t%s\n", formatSessionStringList(session.EnabledTools))
@@ -2893,6 +3168,18 @@ func printServerSessionDetail(stdout io.Writer, session localserver.SessionDetai
 		fmt.Fprintf(stdout, "CONTEXT_LAST_USAGE_SOURCE\t%s\n", session.Context.LastUsageSource)
 	}
 	fmt.Fprintf(stdout, "SAVE_TOOL_RESULTS\t%t\n", session.SaveToolResults)
+	return nil
+}
+
+func printServerSessionList(stdout io.Writer, infos []localserver.SessionMetadata) error {
+	if _, err := fmt.Fprintln(stdout, "ID\tUPDATED\tPROVIDER\tMODEL/PROFILE"); err != nil {
+		return err
+	}
+	for _, info := range infos {
+		if _, err := fmt.Fprintf(stdout, "%s\t%s\t%s\t%s/%s\n", info.ID, formatSessionTimestamp(info.UpdatedAt), info.Provider, info.ModelID, info.ModelProfile); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 

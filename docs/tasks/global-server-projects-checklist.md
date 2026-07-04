@@ -80,7 +80,7 @@ evidence 证明。
 - [ ] 不隐式创建 project。
 - [ ] 不隐式创建 session。
 - [ ] `--new` 等价于 session create 后 attach。
-- [ ] primary command shape 是 singular `session`。
+- [x] primary command shape 是 singular `session`。
 - [ ] 如果保留旧 `sessions`，仅作为 list alias。
 - [x] `session create` 记录 project id。
 - [x] `session create` 记录 `created_cwd`。
@@ -95,12 +95,12 @@ evidence 证明。
 - [ ] attach existing session 时传 `--cwd` 报错。
 - [ ] send existing session 时传 `--cwd` 报错。
 - [ ] 第一版不提供 session config mutation command。
-- [ ] `session list` 默认当前 project non-archived。
-- [ ] `session list --project` 可列指定 project。
-- [ ] `session list --all-projects` 可跨 project 列出。
+- [x] `session list` 默认当前 project non-archived。
+- [x] `session list --project` 可列指定 project。
+- [x] `session list --all-projects` 可跨 project 列出。
 - [ ] `session list --archived` 可列 archived sessions。
 - [ ] `session list` 按 `last_used_at desc` 再 `created_at desc` 排序。
-- [ ] `session show` 展示 metadata。
+- [x] `session show` 展示 metadata。
 - [ ] `session rename` 更新 display name。
 - [ ] `session archive` 隐藏 session。
 
@@ -228,6 +228,12 @@ evidence 证明。
   持久化/返回，以及 request body 中冲突 `project_id` 被忽略、URL project id 生效。
 - 2026-07-04 M21 slice 6: `go test ./...` 通过。
 - 2026-07-04 M21 slice 6: `git diff --check` 通过。
-- Known limits: 当前 M21 slices 未实现 CLI session lifecycle、attach/send project selection changes、
+- 2026-07-04 M21 slice 7: `go test ./internal/cli` 通过；覆盖 singular `session` help、
+  `session create` project-scoped metadata/no nearest project error、`session list` default nearest
+  project / `--project` / `--all-projects` behavior、`session show` global id、`--cwd` rejection，以及
+  singular session auto-start 不输出 `SERVER_ADDR`。
+- 2026-07-04 M21 slice 7: `go test ./...` 通过。
+- 2026-07-04 M21 slice 7: `git diff --check` 通过。
+- Known limits: 当前 M21 slices 未实现 attach/send project selection changes、
   project remove/archive、GUI server work、session data store home
   migration 或 registry `base_url` schema rename。

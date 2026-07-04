@@ -1139,6 +1139,26 @@ func TestProjectHelpWritesUsageWithoutConfig(t *testing.T) {
 	}
 }
 
+func TestSessionHelpWritesUsageWithoutConfig(t *testing.T) {
+	for _, tt := range []struct {
+		args  []string
+		wants []string
+	}{
+		{args: []string{"session", "-h"}, wants: []string{"usage: sai session <command>", "session create", "session list", "session show"}},
+		{args: []string{"help", "session"}, wants: []string{"usage: sai session <command>", "session create", "session list", "session show"}},
+		{args: []string{"session", "create", "-h"}, wants: []string{"usage: sai session create", "--cwd path"}},
+		{args: []string{"help", "session", "create"}, wants: []string{"usage: sai session create", "--cwd path"}},
+		{args: []string{"session", "list", "-h"}, wants: []string{"usage: sai session list", "--project project-id", "--all-projects"}},
+		{args: []string{"help", "session", "list"}, wants: []string{"usage: sai session list", "--project project-id", "--all-projects"}},
+		{args: []string{"session", "show", "-h"}, wants: []string{"usage: sai session show <session-id>", "explicit global session id"}},
+		{args: []string{"help", "session", "show"}, wants: []string{"usage: sai session show <session-id>", "explicit global session id"}},
+	} {
+		t.Run(strings.Join(tt.args, " "), func(t *testing.T) {
+			assertCLIHelpWithoutConfig(t, tt.args, tt.wants...)
+		})
+	}
+}
+
 func TestProjectCreateUsesEffectiveCWDAndPrintsMetadata(t *testing.T) {
 	registryPath := isolateCLIUserRegistry(t)
 	projectDir := t.TempDir()
@@ -1493,6 +1513,546 @@ func TestProjectListAutoStartsSingletonServerWithoutStartupOutput(t *testing.T) 
 		}
 	default:
 		t.Fatal("GET /projects was not called")
+	}
+}
+
+func TestSessionCreateUsesProjectScopedAPIWithMetadata(t *testing.T) {
+	registryPath := isolateCLIUserRegistry(t)
+	projectDir := t.TempDir()
+	configDir := filepath.Join(projectDir, ".agents")
+	writeCLIRunFixtureInDirWithTools(t, configDir, "http://127.0.0.1:1", "direct-secret-value", "openai-chat", []string{"read_file"})
+	writeCLIMCPFixture(t, configDir)
+	setCLIAgentShowReasoning(t, configDir, true)
+	skillDir := filepath.Join(configDir, "skills", "visible")
+	if err := os.MkdirAll(skillDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll(skillDir) error = %v", err)
+	}
+	writeCLIFile(t, filepath.Join(skillDir, "SKILL.md"), "---\nname: Visible Skill\n---\nVisible skill instructions\n")
+	hiddenSkillDir := filepath.Join(configDir, "skills", "hidden")
+	if err := os.MkdirAll(hiddenSkillDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll(hiddenSkillDir) error = %v", err)
+	}
+	writeCLIFile(t, filepath.Join(hiddenSkillDir, "SKILL.md"), "---\ndisable-model-invocation: true\n---\nHidden skill instructions\n")
+
+	canonicalRoot, err := projectstore.CanonicalRoot(projectDir)
+	if err != nil {
+		t.Fatalf("CanonicalRoot(%q) error = %v", projectDir, err)
+	}
+	createdAt := time.Date(2026, 7, 4, 5, 0, 0, 0, time.UTC)
+	updatedAt := time.Date(2026, 7, 4, 5, 1, 0, 0, time.UTC)
+	configPath := filepath.Join(configDir, "sai.yaml")
+
+	projectAuthSeen := make(chan string, 1)
+	createAuthSeen := make(chan string, 1)
+	bodySeen := make(chan map[string]any, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/health":
+			writeCLIJSON(w, http.StatusOK, map[string]any{"status": "ok"})
+		case r.URL.Path == "/projects" && r.Method == http.MethodGet:
+			projectAuthSeen <- r.Header.Get("Authorization")
+			writeCLIJSON(w, http.StatusOK, map[string]any{
+				"projects": []map[string]any{
+					{
+						"id":           "project-current",
+						"root":         canonicalRoot,
+						"display_name": "Current",
+						"archived":     false,
+						"created_at":   createdAt,
+						"updated_at":   updatedAt,
+					},
+				},
+			})
+		case r.URL.Path == "/projects/project-current/sessions" && r.Method == http.MethodPost:
+			createAuthSeen <- r.Header.Get("Authorization")
+			data, err := io.ReadAll(r.Body)
+			if err != nil {
+				t.Fatalf("ReadAll(session create body) error = %v", err)
+			}
+			bodySeen <- decodeCLIJSON(t, data)
+			writeCLIJSON(w, http.StatusCreated, map[string]any{
+				"id":                "created-session",
+				"created_at":        createdAt,
+				"updated_at":        updatedAt,
+				"provider":          "fake",
+				"model_profile":     "default",
+				"model_id":          "model-default",
+				"status":            "idle",
+				"last_seq":          0,
+				"project_id":        "project-current",
+				"created_cwd":       canonicalRoot,
+				"cwd":               canonicalRoot,
+				"config_path":       configPath,
+				"enabled_tools":     []string{"read_file"},
+				"enabled_mcp":       []string{"local"},
+				"enabled_skills":    []string{"visible"},
+				"show_reasoning":    true,
+				"save_tool_results": true,
+				"context":           contextwindow.Metadata{ContextWindow: 32000, ContextWindowSource: string(contextwindow.WindowSourceEstimated), WarningThresholdPercent: contextwindow.WarningThresholdPercent},
+			})
+		default:
+			t.Fatalf("unexpected path %s %q", r.Method, r.URL.Path)
+		}
+	}))
+	defer server.Close()
+	registerCLIFakeServer(t, registryPath, projectDir, server.URL, "registry-token")
+
+	var stdout, stderr bytes.Buffer
+	code := RunWithGetwd([]string{"session", "create"}, &stdout, &stderr, func() (string, error) {
+		return projectDir, nil
+	})
+
+	if code != 0 {
+		t.Fatalf("session create code = %d, stderr = %s", code, stderr.String())
+	}
+	for name, ch := range map[string]<-chan string{
+		"projects": projectAuthSeen,
+		"create":   createAuthSeen,
+	} {
+		select {
+		case got := <-ch:
+			if got != "Bearer registry-token" {
+				t.Fatalf("%s Authorization = %q, want bearer token", name, got)
+			}
+		default:
+			t.Fatalf("%s request was not called", name)
+		}
+	}
+	body := <-bodySeen
+	for key, want := range map[string]string{
+		"created_cwd":   canonicalRoot,
+		"config_path":   configPath,
+		"provider":      "fake",
+		"model_profile": "default",
+		"model_id":      "model-default",
+	} {
+		if got := body[key]; got != want {
+			t.Fatalf("session create body[%q] = %#v, want %q; body=%#v", key, got, want, body)
+		}
+	}
+	if got := fmt.Sprint(body["model_parameters"].(map[string]any)["max_tokens"]); got != "128" {
+		t.Fatalf("model_parameters.max_tokens = %s, want 128; body=%#v", got, body)
+	}
+	if got := body["enabled_tools"]; !reflect.DeepEqual(got, []any{"read_file"}) {
+		t.Fatalf("enabled_tools = %#v, want read_file; body=%#v", got, body)
+	}
+	if got := body["enabled_mcp"]; !reflect.DeepEqual(got, []any{"local"}) {
+		t.Fatalf("enabled_mcp = %#v, want local; body=%#v", got, body)
+	}
+	if got := body["enabled_skills"]; !reflect.DeepEqual(got, []any{"visible"}) {
+		t.Fatalf("enabled_skills = %#v, want visible; body=%#v", got, body)
+	}
+	if got := body["show_reasoning"]; got != true {
+		t.Fatalf("show_reasoning = %#v, want true; body=%#v", got, body)
+	}
+	if got := body["save_tool_results"]; got != true {
+		t.Fatalf("save_tool_results = %#v, want true; body=%#v", got, body)
+	}
+	contextBody := body["context"].(map[string]any)
+	if got := fmt.Sprint(contextBody["context_window"]); got != "32000" {
+		t.Fatalf("context.context_window = %s, want 32000; body=%#v", got, body)
+	}
+	out := stdout.String()
+	assertCLIOutputContains(t, out,
+		"ID\tcreated-session",
+		"PROJECT_ID\tproject-current",
+		"CREATED_CWD\t"+canonicalRoot,
+		"CWD\t"+canonicalRoot,
+		"CONFIG_PATH\t"+configPath,
+		"ENABLED_TOOLS\tread_file",
+		"ENABLED_MCP\tlocal",
+		"ENABLED_SKILLS\tvisible",
+		"SHOW_REASONING\ttrue",
+		"SAVE_TOOL_RESULTS\ttrue",
+	)
+	if strings.Contains(out, "Hidden skill instructions") || strings.Contains(out, "direct-secret-value") {
+		t.Fatalf("session create output leaked hidden data:\n%s", out)
+	}
+	if stderr.String() != "" {
+		t.Fatalf("stderr = %q, want empty", stderr.String())
+	}
+}
+
+func TestSessionCreateFailsWithoutRegisteredNearestProject(t *testing.T) {
+	registryPath := isolateCLIUserRegistry(t)
+	projectDir := t.TempDir()
+	projectsCalled := make(chan struct{}, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/health":
+			writeCLIJSON(w, http.StatusOK, map[string]any{"status": "ok"})
+		case r.URL.Path == "/projects" && r.Method == http.MethodGet:
+			projectsCalled <- struct{}{}
+			writeCLIJSON(w, http.StatusOK, map[string]any{"projects": []map[string]any{}})
+		case strings.HasPrefix(r.URL.Path, "/projects/"):
+			t.Fatalf("unexpected session create path without nearest project: %s %q", r.Method, r.URL.Path)
+		default:
+			t.Fatalf("unexpected path %s %q", r.Method, r.URL.Path)
+		}
+	}))
+	defer server.Close()
+	registerCLIFakeServer(t, registryPath, projectDir, server.URL, "registry-token")
+
+	var stdout, stderr bytes.Buffer
+	code := RunWithGetwd([]string{"session", "create"}, &stdout, &stderr, func() (string, error) {
+		return projectDir, nil
+	})
+
+	if code != 1 {
+		t.Fatalf("session create code = %d, want 1", code)
+	}
+	if stdout.String() != "" {
+		t.Fatalf("stdout = %q, want empty", stdout.String())
+	}
+	select {
+	case <-projectsCalled:
+	default:
+		t.Fatal("GET /projects was not called")
+	}
+	assertCLIErrorContains(t, stderr.String(), "no registered project found from", `run "sai project create"`)
+}
+
+func TestSessionListDefaultUsesNearestProjectScopedAPI(t *testing.T) {
+	registryPath := isolateCLIUserRegistry(t)
+	parentDir := t.TempDir()
+	childDir := filepath.Join(parentDir, "child")
+	leafDir := filepath.Join(childDir, "leaf")
+	if err := os.MkdirAll(leafDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll(leafDir) error = %v", err)
+	}
+	parentRoot, err := projectstore.CanonicalRoot(parentDir)
+	if err != nil {
+		t.Fatalf("CanonicalRoot(parent) error = %v", err)
+	}
+	childRoot, err := projectstore.CanonicalRoot(childDir)
+	if err != nil {
+		t.Fatalf("CanonicalRoot(child) error = %v", err)
+	}
+	updatedAt := time.Date(2026, 7, 4, 6, 1, 0, 0, time.UTC)
+
+	projectsAuthSeen := make(chan string, 1)
+	sessionsAuthSeen := make(chan string, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/health":
+			writeCLIJSON(w, http.StatusOK, map[string]any{"status": "ok"})
+		case r.URL.Path == "/projects" && r.Method == http.MethodGet:
+			projectsAuthSeen <- r.Header.Get("Authorization")
+			writeCLIJSON(w, http.StatusOK, map[string]any{
+				"projects": []map[string]any{
+					{"id": "project-parent", "root": parentRoot, "archived": false, "created_at": updatedAt, "updated_at": updatedAt},
+					{"id": "project-child", "root": childRoot, "archived": false, "created_at": updatedAt, "updated_at": updatedAt},
+				},
+			})
+		case r.URL.Path == "/projects/project-child/sessions" && r.Method == http.MethodGet:
+			sessionsAuthSeen <- r.Header.Get("Authorization")
+			writeCLIJSON(w, http.StatusOK, map[string]any{
+				"sessions": []map[string]any{
+					{"id": "child-session", "created_at": updatedAt, "updated_at": updatedAt, "provider": "fake", "model_profile": "default", "model_id": "model-default", "project_id": "project-child"},
+				},
+			})
+		default:
+			t.Fatalf("unexpected path %s %q", r.Method, r.URL.Path)
+		}
+	}))
+	defer server.Close()
+	registerCLIFakeServer(t, registryPath, parentDir, server.URL, "registry-token")
+
+	var stdout, stderr bytes.Buffer
+	code := RunWithGetwd([]string{"session", "list"}, &stdout, &stderr, func() (string, error) {
+		return leafDir, nil
+	})
+
+	if code != 0 {
+		t.Fatalf("session list code = %d, stderr = %s", code, stderr.String())
+	}
+	for name, ch := range map[string]<-chan string{
+		"projects":         projectsAuthSeen,
+		"project sessions": sessionsAuthSeen,
+	} {
+		select {
+		case got := <-ch:
+			if got != "Bearer registry-token" {
+				t.Fatalf("%s Authorization = %q, want bearer token", name, got)
+			}
+		default:
+			t.Fatalf("%s request was not called", name)
+		}
+	}
+	assertCLIOutputContains(t, stdout.String(),
+		"ID\tUPDATED\tPROVIDER\tMODEL/PROFILE",
+		"child-session\t2026-07-04T06:01:00Z\tfake\tmodel-default/default",
+	)
+	if stderr.String() != "" {
+		t.Fatalf("stderr = %q, want empty", stderr.String())
+	}
+}
+
+func TestSessionListProjectUsesProjectScopedAPIWithoutCWDDiscovery(t *testing.T) {
+	registryPath := isolateCLIUserRegistry(t)
+	projectDir := t.TempDir()
+	updatedAt := time.Date(2026, 7, 4, 7, 1, 0, 0, time.UTC)
+
+	authSeen := make(chan string, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/health":
+			writeCLIJSON(w, http.StatusOK, map[string]any{"status": "ok"})
+		case r.URL.Path == "/projects/project-direct/sessions" && r.Method == http.MethodGet:
+			authSeen <- r.Header.Get("Authorization")
+			writeCLIJSON(w, http.StatusOK, map[string]any{
+				"sessions": []map[string]any{
+					{"id": "direct-session", "created_at": updatedAt, "updated_at": updatedAt, "provider": "fake", "model_profile": "default", "model_id": "model-default", "project_id": "project-direct"},
+				},
+			})
+		default:
+			t.Fatalf("unexpected path %s %q", r.Method, r.URL.Path)
+		}
+	}))
+	defer server.Close()
+	registerCLIFakeServer(t, registryPath, projectDir, server.URL, "registry-token")
+
+	var stdout, stderr bytes.Buffer
+	code := RunWithGetwd([]string{"session", "list", "--project", "project-direct"}, &stdout, &stderr, func() (string, error) {
+		return "", errors.New("getwd should not be called")
+	})
+
+	if code != 0 {
+		t.Fatalf("session list --project code = %d, stderr = %s", code, stderr.String())
+	}
+	select {
+	case got := <-authSeen:
+		if got != "Bearer registry-token" {
+			t.Fatalf("Authorization = %q, want bearer token", got)
+		}
+	default:
+		t.Fatal("GET /projects/project-direct/sessions was not called")
+	}
+	assertCLIOutputContains(t, stdout.String(), "direct-session\t2026-07-04T07:01:00Z\tfake\tmodel-default/default")
+	if stderr.String() != "" {
+		t.Fatalf("stderr = %q, want empty", stderr.String())
+	}
+}
+
+func TestSessionListAllProjectsUsesGlobalSessionsAPIAndRejectsProjectCombination(t *testing.T) {
+	registryPath := isolateCLIUserRegistry(t)
+	projectDir := t.TempDir()
+	updatedAt := time.Date(2026, 7, 4, 8, 1, 0, 0, time.UTC)
+
+	authSeen := make(chan string, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/health":
+			writeCLIJSON(w, http.StatusOK, map[string]any{"status": "ok"})
+		case r.URL.Path == "/sessions" && r.Method == http.MethodGet:
+			authSeen <- r.Header.Get("Authorization")
+			writeCLIJSON(w, http.StatusOK, map[string]any{
+				"sessions": []map[string]any{
+					{"id": "global-session", "created_at": updatedAt, "updated_at": updatedAt, "provider": "fake", "model_profile": "default", "model_id": "model-default", "project_id": "project-any"},
+				},
+			})
+		default:
+			t.Fatalf("unexpected path %s %q", r.Method, r.URL.Path)
+		}
+	}))
+	defer server.Close()
+	registerCLIFakeServer(t, registryPath, projectDir, server.URL, "registry-token")
+
+	var stdout, stderr bytes.Buffer
+	code := RunWithGetwd([]string{"session", "list", "--all-projects"}, &stdout, &stderr, func() (string, error) {
+		return "", errors.New("getwd should not be called")
+	})
+
+	if code != 0 {
+		t.Fatalf("session list --all-projects code = %d, stderr = %s", code, stderr.String())
+	}
+	select {
+	case got := <-authSeen:
+		if got != "" {
+			t.Fatalf("GET /sessions Authorization = %q, want empty", got)
+		}
+	default:
+		t.Fatal("GET /sessions was not called")
+	}
+	assertCLIOutputContains(t, stdout.String(), "global-session\t2026-07-04T08:01:00Z\tfake\tmodel-default/default")
+	if stderr.String() != "" {
+		t.Fatalf("stderr = %q, want empty", stderr.String())
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	code = RunWithGetwd([]string{"session", "list", "--project", "project-any", "--all-projects"}, &stdout, &stderr, func() (string, error) {
+		return "", errors.New("getwd should not be called")
+	})
+	if code != 1 {
+		t.Fatalf("session list conflicting flags code = %d, want 1", code)
+	}
+	if stdout.String() != "" {
+		t.Fatalf("stdout = %q, want empty", stdout.String())
+	}
+	assertCLIErrorContains(t, stderr.String(), "--project cannot be combined with --all-projects", `Run "sai help session list" for usage.`)
+}
+
+func TestSessionShowUsesGlobalSessionIDAndRejectsCWD(t *testing.T) {
+	registryPath := isolateCLIUserRegistry(t)
+	projectDir := t.TempDir()
+	configPath := filepath.Join(projectDir, ".agents", "sai.yaml")
+	updatedAt := time.Date(2026, 7, 4, 9, 1, 0, 0, time.UTC)
+
+	authSeen := make(chan string, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/health":
+			writeCLIJSON(w, http.StatusOK, map[string]any{"status": "ok"})
+		case r.URL.Path == "/sessions/show-session" && r.Method == http.MethodGet:
+			authSeen <- r.Header.Get("Authorization")
+			writeCLIJSON(w, http.StatusOK, map[string]any{
+				"id":                "show-session",
+				"created_at":        updatedAt,
+				"updated_at":        updatedAt,
+				"provider":          "fake",
+				"model_profile":     "default",
+				"model_id":          "model-default",
+				"status":            "idle",
+				"last_seq":          2,
+				"project_id":        "project-current",
+				"created_cwd":       projectDir,
+				"cwd":               projectDir,
+				"config_path":       configPath,
+				"show_reasoning":    false,
+				"save_tool_results": true,
+			})
+		default:
+			t.Fatalf("unexpected path %s %q", r.Method, r.URL.Path)
+		}
+	}))
+	defer server.Close()
+	registerCLIFakeServer(t, registryPath, projectDir, server.URL, "registry-token")
+
+	var stdout, stderr bytes.Buffer
+	code := RunWithGetwd([]string{"session", "show", "show-session"}, &stdout, &stderr, func() (string, error) {
+		return "", errors.New("getwd should not be called")
+	})
+
+	if code != 0 {
+		t.Fatalf("session show code = %d, stderr = %s", code, stderr.String())
+	}
+	select {
+	case got := <-authSeen:
+		if got != "" {
+			t.Fatalf("GET /sessions/show-session Authorization = %q, want empty", got)
+		}
+	default:
+		t.Fatal("GET /sessions/show-session was not called")
+	}
+	assertCLIOutputContains(t, stdout.String(),
+		"ID\tshow-session",
+		"PROJECT_ID\tproject-current",
+		"CREATED_CWD\t"+projectDir,
+		"CONFIG_PATH\t"+configPath,
+		"SAVE_TOOL_RESULTS\ttrue",
+	)
+	if stderr.String() != "" {
+		t.Fatalf("stderr = %q, want empty", stderr.String())
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	code = RunWithGetwd([]string{"session", "show", "--cwd", projectDir, "show-session"}, &stdout, &stderr, func() (string, error) {
+		return "", errors.New("getwd should not be called")
+	})
+	if code != 1 {
+		t.Fatalf("session show --cwd code = %d, want 1", code)
+	}
+	if stdout.String() != "" {
+		t.Fatalf("stdout = %q, want empty", stdout.String())
+	}
+	assertCLIErrorContains(t, stderr.String(), "flag provided but not defined: -cwd", `Run "sai help session show" for usage.`)
+}
+
+func TestSessionListAutoStartsSingletonServerWithoutStartupOutput(t *testing.T) {
+	registryPath := isolateCLIUserRegistry(t)
+	projectDir := t.TempDir()
+	writeCLIFixtureInDir(t, filepath.Join(projectDir, ".agents"))
+
+	authSeen := make(chan string, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/health":
+			writeCLIJSON(w, http.StatusOK, map[string]any{"status": "ok"})
+		case "/sessions":
+			authSeen <- r.Header.Get("Authorization")
+			writeCLIJSON(w, http.StatusOK, map[string]any{"sessions": []map[string]any{}})
+		default:
+			t.Fatalf("unexpected path %q", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	oldStart := startBackgroundServerProcess
+	childArgsCh := make(chan []string, 1)
+	waitDone := make(chan struct{})
+	var closeWait sync.Once
+	startBackgroundServerProcess = func(ctx context.Context, args []string) (*backgroundServerProcess, error) {
+		childArgsCh <- append([]string(nil), args...)
+		addr := strings.TrimPrefix(server.URL, "http://")
+		if err := localserver.NewRegistryStore(registryPath).Upsert(localserver.RegistryRecord{
+			CWD:             projectDir,
+			ConfigPath:      filepath.Join(projectDir, ".agents", "sai.yaml"),
+			Addr:            addr,
+			PID:             5432,
+			Token:           "auto-token",
+			StartedAt:       time.Date(2026, 7, 4, 10, 0, 0, 0, time.UTC),
+			Version:         "test-version",
+			RequestedListen: localserver.DefaultListenAddress,
+		}); err != nil {
+			return nil, err
+		}
+		return &backgroundServerProcess{
+			PID: 5432,
+			wait: func() error {
+				<-waitDone
+				return nil
+			},
+			kill: func() error {
+				closeWait.Do(func() { close(waitDone) })
+				return nil
+			},
+		}, nil
+	}
+	t.Cleanup(func() {
+		startBackgroundServerProcess = oldStart
+		closeWait.Do(func() { close(waitDone) })
+	})
+
+	var stdout, stderr bytes.Buffer
+	code := RunWithGetwd([]string{"session", "list", "--all-projects"}, &stdout, &stderr, func() (string, error) {
+		return projectDir, nil
+	})
+
+	if code != 0 {
+		t.Fatalf("session list auto-start code = %d, stderr = %s", code, stderr.String())
+	}
+	if stderr.String() != "" {
+		t.Fatalf("stderr = %q, want empty", stderr.String())
+	}
+	if got := stdout.String(); got != "ID\tUPDATED\tPROVIDER\tMODEL/PROFILE\n" {
+		t.Fatalf("stdout = %q, want session list only", got)
+	}
+	if strings.Contains(stdout.String(), "SERVER_ADDR") {
+		t.Fatalf("stdout = %q, want no SERVER_ADDR", stdout.String())
+	}
+	childArgs := <-childArgsCh
+	assertCLIFlagValue(t, childArgs, "--home", mustCLICanonicalPath(t, filepath.Dir(filepath.Dir(registryPath))))
+	assertCLIFlagValue(t, childArgs, "--config", filepath.Join(projectDir, ".agents", "sai.yaml"))
+	assertCLIFlagValue(t, childArgs, "--cwd", projectDir)
+	select {
+	case got := <-authSeen:
+		if got != "" {
+			t.Fatalf("GET /sessions Authorization = %q, want empty", got)
+		}
+	default:
+		t.Fatal("GET /sessions was not called")
 	}
 }
 
