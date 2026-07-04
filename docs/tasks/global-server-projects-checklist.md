@@ -88,12 +88,12 @@ evidence 证明。
 - [x] API-level project session create records provider/model/tools/MCP/skills metadata when provided.
 - [ ] 每个 turn 重新读取 session 的 `config_path`。
 - [ ] `--config` 只允许创建新 session 时使用。
-- [ ] attach existing session 时传 `--config` 报错。
-- [ ] send existing session 时传 `--config` 报错。
+- [x] attach existing session 时传 `--config` 报错。
+- [x] send existing session 时传 `--config` 报错。
 - [ ] existing session cwd 固定为 `created_cwd`。
 - [ ] `--cwd` 只允许 project create、session create 和 `--new`。
-- [ ] attach existing session 时传 `--cwd` 报错。
-- [ ] send existing session 时传 `--cwd` 报错。
+- [x] attach existing session 时传 `--cwd` 报错。
+- [x] send existing session 时传 `--cwd` 报错。
 - [ ] 第一版不提供 session config mutation command。
 - [x] `session list` 默认当前 project non-archived。
 - [x] `session list --project` 可列指定 project。
@@ -180,8 +180,8 @@ evidence 证明。
 - [x] 测试覆盖 explicit project create。
 - [x] 测试覆盖 explicit session create。
 - [x] 测试覆盖 nested discovery。
-- [ ] 测试覆盖 config rejection for existing sessions。
-- [ ] 测试覆盖 cwd rejection for existing sessions。
+- [x] 测试覆盖 config rejection for existing sessions。
+- [x] 测试覆盖 cwd rejection for existing sessions。
 - [x] 测试覆盖 direct replacement/no chat product entry。
 - [x] 测试覆盖 explicit project API paths。
 - [x] 测试覆盖 explicit session API paths。
@@ -234,6 +234,11 @@ evidence 证明。
   singular session auto-start 不输出 `SERVER_ADDR`。
 - 2026-07-04 M21 slice 7: `go test ./...` 通过。
 - 2026-07-04 M21 slice 7: `git diff --check` 通过。
+- 2026-07-04 M21 slice 8: `go test ./internal/cli` 通过；覆盖 existing-session
+  attach/send 拒绝 `--cwd` 和 root `--config` 且在 cwd/server discovery 之前失败，同时确认
+  `attach --new --cwd` 和 `send --new --cwd` 仍到达 discovery/create/send 路径。
+- 2026-07-04 M21 slice 8: `go test ./...` 通过。
+- 2026-07-04 M21 slice 8: `git diff --check` 通过（仅出现工作区 LF/CRLF normalization warnings）。
 - Known limits: 当前 M21 slices 未实现 attach/send project selection changes、
   project remove/archive、GUI server work、session data store home
   migration 或 registry `base_url` schema rename。

@@ -138,7 +138,7 @@ func execute(ctx context.Context, program string, args []string, stdin io.Reader
 		var stop func()
 		ctx, stop = contextWithInterruptCancel(ctx, interrupts)
 		defer stop()
-		return attachCommand(ctx, rootArgs.commandArgs, homePath, stdin, stdout, stderr, getwd)
+		return attachCommand(ctx, rootArgs.commandArgs, rootArgs.configProvided, homePath, stdin, stdout, stderr, getwd)
 	}
 	var stop func()
 	ctx, stop = contextWithInterruptCancel(ctx, interrupts)
@@ -148,7 +148,7 @@ func execute(ctx context.Context, program string, args []string, stdin io.Reader
 	case "help":
 		return helpCommand(rootArgs.commandArgs, stdout)
 	case "attach":
-		return attachCommand(ctx, rootArgs.commandArgs, homePath, stdin, stdout, stderr, getwd)
+		return attachCommand(ctx, rootArgs.commandArgs, rootArgs.configProvided, homePath, stdin, stdout, stderr, getwd)
 	case "version":
 		return versionCommand(rootArgs.commandArgs, stdout)
 	case "config":
@@ -237,7 +237,7 @@ func execute(ctx context.Context, program string, args []string, stdin io.Reader
 		}
 		return serversListCommand(ctx, subArgs, homePath, stdout)
 	case "send":
-		return sendCommand(ctx, rootArgs.commandArgs, homePath, stdout, getwd)
+		return sendCommand(ctx, rootArgs.commandArgs, rootArgs.configProvided, homePath, stdout, getwd)
 	case "auth":
 		return authCommand(ctx, rootArgs.commandArgs, rootArgs.configPath, stdout, getwd, program)
 	case "tools":
@@ -340,12 +340,14 @@ With no command, sai defaults to attach.
 Run "sai help <command>" for command usage.
 `
 
-const attachUsageText = `usage: sai attach [--cwd path] [session-id]
-       sai attach [--cwd path] --new
+const attachUsageText = `usage: sai attach [session-id]
+       sai attach --new [--cwd path]
 
 Discovers the nearest healthy local server, connects to a server-owned session
 stream, and reads prompts from stdin. Without a session id, sai attaches to the
 most recently updated server-owned session. --new creates a session first.
+Existing-session attach rejects --cwd and global --config; existing sessions use
+their stored cwd and config.
 `
 
 const chatUsageText = `usage: sai chat [--provider name] [--model profile] [--prompt text | --stdin | --file path] [--show-reasoning] [--verbose] [--enable-tools names] [--enable-mcp ids] [--save-session] [--resume id | --continue] [--quit]
@@ -507,12 +509,14 @@ Lists healthy local server registry records. Stale records are removed while
 listing.
 `
 
-const sendUsageText = `usage: sai send [--cwd path] <session-id> --prompt text
-       sai send [--cwd path] --new --prompt text
+const sendUsageText = `usage: sai send <session-id> --prompt text
+       sai send --new [--cwd path] --prompt text
 
 Discovers the nearest healthy local server, sends one prompt through the server
 API, and prints committed turn metadata only. --new first creates a server-owned
 session with the registry token, then sends the prompt to that session.
+Existing-session send rejects --cwd and global --config; existing sessions use
+their stored cwd and config.
 `
 
 const authUsageText = `usage: sai auth <command>
@@ -863,11 +867,12 @@ const (
 )
 
 type rootArgs struct {
-	configPath  string
-	homePath    string
-	command     string
-	commandArgs []string
-	hasHelp     bool
+	configPath     string
+	configProvided bool
+	homePath       string
+	command        string
+	commandArgs    []string
+	hasHelp        bool
 }
 
 func splitRootArgs(args []string) (rootArgs, error) {
@@ -933,6 +938,7 @@ func splitRootArgs(args []string) (rootArgs, error) {
 			}
 			if name == "config" {
 				out.configPath = value
+				out.configProvided = true
 			} else {
 				out.homePath = value
 			}
@@ -971,6 +977,7 @@ func stripGlobalArgs(args rootArgs) (rootArgs, error) {
 			}
 			if name == "config" {
 				args.configPath = value
+				args.configProvided = true
 			} else {
 				args.homePath = value
 			}
@@ -2101,7 +2108,7 @@ func serversListCommand(ctx context.Context, args []string, homePath string, std
 	return nil
 }
 
-func attachCommand(ctx context.Context, args []string, homePath string, stdin io.Reader, stdout, stderr io.Writer, getwd func() (string, error)) error {
+func attachCommand(ctx context.Context, args []string, configProvided bool, homePath string, stdin io.Reader, stdout, stderr io.Writer, getwd func() (string, error)) error {
 	flags := flag.NewFlagSet("sai attach", flag.ContinueOnError)
 	cwdFlag := flags.String("cwd", "", "discovery working directory")
 	newSession := flags.Bool("new", false, "create a new server-owned session before attaching")
@@ -2111,9 +2118,12 @@ func attachCommand(ctx context.Context, args []string, homePath string, stdin io
 	}
 	switch {
 	case *newSession && len(positionals) != 0:
-		return usageError("usage: sai attach --new", "", "sai help attach")
+		return usageError("usage: sai attach --new [--cwd path]", "", "sai help attach")
 	case !*newSession && len(positionals) > 1:
 		return usageError("usage: sai attach [session-id]", "", "sai help attach")
+	}
+	if err := rejectExistingSessionOverrides(*newSession, flagWasSet(flags, "cwd"), configProvided, "sai help attach"); err != nil {
+		return err
 	}
 
 	record, _, err := discoverClientServer(ctx, *cwdFlag, homePath, getwd)
@@ -2389,7 +2399,7 @@ func writeAttachStreamEvent(stdout, stderr io.Writer, event localserver.SessionS
 	return nil
 }
 
-func sendCommand(ctx context.Context, args []string, homePath string, stdout io.Writer, getwd func() (string, error)) error {
+func sendCommand(ctx context.Context, args []string, configProvided bool, homePath string, stdout io.Writer, getwd func() (string, error)) error {
 	flags := flag.NewFlagSet("sai send", flag.ContinueOnError)
 	cwdFlag := flags.String("cwd", "", "discovery working directory")
 	newSession := flags.Bool("new", false, "create a new server-owned session before sending")
@@ -2400,12 +2410,15 @@ func sendCommand(ctx context.Context, args []string, homePath string, stdout io.
 	}
 	switch {
 	case *newSession && len(positionals) != 0:
-		return usageError("usage: sai send --new --prompt text", "", "sai help send")
+		return usageError("usage: sai send --new [--cwd path] --prompt text", "", "sai help send")
 	case !*newSession && len(positionals) != 1:
 		return usageError("usage: sai send <session-id> --prompt text", "", "sai help send")
 	}
 	if strings.TrimSpace(*prompt) == "" {
 		return usageError("--prompt must be a non-empty string", "", "sai help send")
+	}
+	if err := rejectExistingSessionOverrides(*newSession, flagWasSet(flags, "cwd"), configProvided, "sai help send"); err != nil {
+		return err
 	}
 
 	record, _, err := discoverClientServer(ctx, *cwdFlag, homePath, getwd)
@@ -2432,6 +2445,19 @@ func sendCommand(ctx context.Context, args []string, homePath string, stdout io.
 		return err
 	}
 	return printSessionSendResult(stdout, sessionID, result)
+}
+
+func rejectExistingSessionOverrides(newSession, cwdProvided, configProvided bool, helpCommand string) error {
+	if newSession {
+		return nil
+	}
+	if cwdProvided {
+		return usageError("--cwd can only be used when creating a new session with --new", "", helpCommand)
+	}
+	if configProvided {
+		return usageError("--config can only be used when creating a new session with --new", "", helpCommand)
+	}
+	return nil
 }
 
 func discoverClientServer(ctx context.Context, cwdFlag, homePath string, getwd func() (string, error)) (localserver.RegistryRecord, string, error) {
@@ -3307,6 +3333,16 @@ func parseCommandFlagArgs(flags *flag.FlagSet, args []string, stdout io.Writer, 
 		return nil, false, usageError(err.Error(), "", helpCommand)
 	}
 	return flags.Args(), false, nil
+}
+
+func flagWasSet(flags *flag.FlagSet, name string) bool {
+	wasSet := false
+	flags.Visit(func(flag *flag.Flag) {
+		if flag.Name == name {
+			wasSet = true
+		}
+	})
+	return wasSet
 }
 
 func builtInToolNames() []string {

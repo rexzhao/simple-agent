@@ -3242,7 +3242,7 @@ func TestSendHelpWritesUsageWithoutConfig(t *testing.T) {
 		{"help", "send"},
 	} {
 		t.Run(strings.Join(args, " "), func(t *testing.T) {
-			assertCLIHelpWithoutConfig(t, args, "usage: sai send", "--new --prompt", "committed turn metadata")
+			assertCLIHelpWithoutConfig(t, args, "usage: sai send", "--new [--cwd path] --prompt", "committed turn metadata")
 		})
 	}
 }
@@ -6759,8 +6759,8 @@ func TestSendExistingUsesServerAPIWithTokenAndMetadata(t *testing.T) {
 	registerCLIFakeServer(t, registryPath, projectDir, server.URL, "registry-token")
 
 	var stdout, stderr bytes.Buffer
-	code := RunWithGetwd([]string{"send", "existing-session", "--cwd", projectDir, "--prompt", prompt}, &stdout, &stderr, func() (string, error) {
-		return "", errors.New("getwd should not be called")
+	code := RunWithGetwd([]string{"send", "existing-session", "--prompt", prompt}, &stdout, &stderr, func() (string, error) {
+		return projectDir, nil
 	})
 
 	if code != 0 {
@@ -6794,6 +6794,49 @@ func TestSendExistingUsesServerAPIWithTokenAndMetadata(t *testing.T) {
 	}
 }
 
+func TestSendExistingRejectsCWDAndConfigBeforeDiscovery(t *testing.T) {
+	projectDir := t.TempDir()
+	missingConfig := filepath.Join(t.TempDir(), "missing.yaml")
+	tests := []struct {
+		name string
+		args []string
+		want string
+	}{
+		{
+			name: "cwd",
+			args: []string{"send", "existing-session", "--cwd", projectDir, "--prompt", "hello"},
+			want: "--cwd can only be used when creating a new session with --new",
+		},
+		{
+			name: "config",
+			args: []string{"--config", missingConfig, "send", "existing-session", "--prompt", "hello"},
+			want: "--config can only be used when creating a new session with --new",
+		},
+		{
+			name: "config after command",
+			args: []string{"send", "existing-session", "--prompt", "hello", "--config", missingConfig},
+			want: "--config can only be used when creating a new session with --new",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			code := RunWithGetwd(tt.args, &stdout, &stderr, func() (string, error) {
+				return "", errors.New("getwd should not be called")
+			})
+			if code != 1 {
+				t.Fatalf("send code = %d, want 1", code)
+			}
+			if stdout.String() != "" {
+				t.Fatalf("stdout = %q, want empty", stdout.String())
+			}
+			assertCLIErrorContains(t, stderr.String(), tt.want, `Run "sai help send" for usage.`)
+			assertCLIErrorOmits(t, stderr.String(), "getwd should not be called", "no healthy sai server found")
+		})
+	}
+}
+
 func TestSendExistingWaitsLongerThanDiscoveryTimeout(t *testing.T) {
 	registryPath := isolateCLIUserRegistry(t)
 	projectDir := t.TempDir()
@@ -6820,8 +6863,8 @@ func TestSendExistingWaitsLongerThanDiscoveryTimeout(t *testing.T) {
 	registerCLIFakeServer(t, registryPath, projectDir, server.URL, "registry-token")
 
 	var stdout, stderr bytes.Buffer
-	code := RunWithGetwd([]string{"send", "slow-session", "--cwd", projectDir, "--prompt", prompt}, &stdout, &stderr, func() (string, error) {
-		return "", errors.New("getwd should not be called")
+	code := RunWithGetwd([]string{"send", "slow-session", "--prompt", prompt}, &stdout, &stderr, func() (string, error) {
+		return projectDir, nil
 	})
 
 	if code != 0 {
@@ -6961,8 +7004,8 @@ func TestSendErrorDoesNotLeakPromptOrServerMessage(t *testing.T) {
 	registerCLIFakeServer(t, registryPath, projectDir, server.URL, "registry-token")
 
 	var stdout, stderr bytes.Buffer
-	code := RunWithGetwd([]string{"send", "existing-session", "--cwd", projectDir, "--prompt", prompt}, &stdout, &stderr, func() (string, error) {
-		return "", errors.New("getwd should not be called")
+	code := RunWithGetwd([]string{"send", "existing-session", "--prompt", prompt}, &stdout, &stderr, func() (string, error) {
+		return projectDir, nil
 	})
 
 	if code != 1 {
@@ -6991,6 +7034,64 @@ func TestBareSAIDefaultsToAttachNoServerHint(t *testing.T) {
 		t.Fatalf("stdout = %q, want empty", stdout.String())
 	}
 	assertCLIErrorContains(t, stderr.String(), "no healthy sai server found", "sai server --cwd")
+}
+
+func TestAttachExistingRejectsCWDAndConfigBeforeDiscovery(t *testing.T) {
+	projectDir := t.TempDir()
+	missingConfig := filepath.Join(t.TempDir(), "missing.yaml")
+	tests := []struct {
+		name string
+		args []string
+		want string
+	}{
+		{
+			name: "explicit id cwd",
+			args: []string{"attach", "existing-session", "--cwd", projectDir},
+			want: "--cwd can only be used when creating a new session with --new",
+		},
+		{
+			name: "bare attach cwd",
+			args: []string{"attach", "--cwd", projectDir},
+			want: "--cwd can only be used when creating a new session with --new",
+		},
+		{
+			name: "bare command cwd",
+			args: []string{"--cwd", projectDir},
+			want: "--cwd can only be used when creating a new session with --new",
+		},
+		{
+			name: "explicit id config",
+			args: []string{"--config", missingConfig, "attach", "existing-session"},
+			want: "--config can only be used when creating a new session with --new",
+		},
+		{
+			name: "explicit id config after command",
+			args: []string{"attach", "existing-session", "--config", missingConfig},
+			want: "--config can only be used when creating a new session with --new",
+		},
+		{
+			name: "bare attach config",
+			args: []string{"--config", missingConfig, "attach"},
+			want: "--config can only be used when creating a new session with --new",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			code := RunWithGetwd(tt.args, &stdout, &stderr, func() (string, error) {
+				return "", errors.New("getwd should not be called")
+			})
+			if code != 1 {
+				t.Fatalf("attach code = %d, want 1", code)
+			}
+			if stdout.String() != "" {
+				t.Fatalf("stdout = %q, want empty", stdout.String())
+			}
+			assertCLIErrorContains(t, stderr.String(), tt.want, `Run "sai help attach" for usage.`)
+			assertCLIErrorOmits(t, stderr.String(), "getwd should not be called", "no healthy sai server found")
+		})
+	}
 }
 
 func TestAttachWithoutSessionSelectsMostRecentlyUpdated(t *testing.T) {
@@ -7046,8 +7147,8 @@ func TestAttachWithoutSessionSelectsMostRecentlyUpdated(t *testing.T) {
 	registerCLIFakeServer(t, registryPath, projectDir, server.URL, "registry-token")
 
 	var stdout, stderr bytes.Buffer
-	code := RunWithIO([]string{"attach", "--cwd", projectDir}, strings.NewReader("/quit\n"), &stdout, &stderr, func() (string, error) {
-		return "", errors.New("getwd should not be called")
+	code := RunWithIO([]string{"attach"}, strings.NewReader("/quit\n"), &stdout, &stderr, func() (string, error) {
+		return projectDir, nil
 	})
 
 	if code != 0 {
@@ -7242,8 +7343,8 @@ func TestAttachWaitsForTerminalStreamEventBeforeQuit(t *testing.T) {
 	registerCLIFakeServer(t, registryPath, projectDir, server.URL, "registry-token")
 
 	var stdout, stderr bytes.Buffer
-	code := RunWithIO([]string{"attach", "existing-session", "--cwd", projectDir}, strings.NewReader(prompt+"\n/quit\n"), &stdout, &stderr, func() (string, error) {
-		return "", errors.New("getwd should not be called")
+	code := RunWithIO([]string{"attach", "existing-session"}, strings.NewReader(prompt+"\n/quit\n"), &stdout, &stderr, func() (string, error) {
+		return projectDir, nil
 	})
 
 	if code != 0 {
@@ -7318,8 +7419,8 @@ func TestAttachFailedTurnWaitsForDelayedTurnFailed(t *testing.T) {
 	registerCLIFakeServer(t, registryPath, projectDir, server.URL, "registry-token")
 
 	var stdout, stderr bytes.Buffer
-	code := RunWithIO([]string{"attach", "existing-session", "--cwd", projectDir}, strings.NewReader(prompt+"\n/quit\n"), &stdout, &stderr, func() (string, error) {
-		return "", errors.New("getwd should not be called")
+	code := RunWithIO([]string{"attach", "existing-session"}, strings.NewReader(prompt+"\n/quit\n"), &stdout, &stderr, func() (string, error) {
+		return projectDir, nil
 	})
 
 	if code != 0 {
@@ -7395,8 +7496,8 @@ func TestAttachIgnoresStaleTerminalDuringSend(t *testing.T) {
 	registerCLIFakeServer(t, registryPath, projectDir, server.URL, "registry-token")
 
 	var stdout, stderr bytes.Buffer
-	code := RunWithIO([]string{"attach", "existing-session", "--cwd", projectDir}, strings.NewReader(prompt+"\n/quit\n"), &stdout, &stderr, func() (string, error) {
-		return "", errors.New("getwd should not be called")
+	code := RunWithIO([]string{"attach", "existing-session"}, strings.NewReader(prompt+"\n/quit\n"), &stdout, &stderr, func() (string, error) {
+		return projectDir, nil
 	})
 
 	if code != 0 {
@@ -7487,8 +7588,8 @@ func TestAttachExistingCompactAndNormalMessageContainingCompact(t *testing.T) {
 	registerCLIFakeServer(t, registryPath, projectDir, server.URL, "registry-token")
 
 	var stdout, stderr bytes.Buffer
-	code := RunWithIO([]string{"attach", "existing-session", "--cwd", projectDir}, strings.NewReader("/compact\n"+prompt+"\n/quit\n"), &stdout, &stderr, func() (string, error) {
-		return "", errors.New("getwd should not be called")
+	code := RunWithIO([]string{"attach", "existing-session"}, strings.NewReader("/compact\n"+prompt+"\n/quit\n"), &stdout, &stderr, func() (string, error) {
+		return projectDir, nil
 	})
 
 	if code != 0 {
@@ -7559,8 +7660,8 @@ func TestAttachCompactWaitsWithoutDefaultHTTPTimeout(t *testing.T) {
 	registerCLIFakeServer(t, registryPath, projectDir, server.URL, "registry-token")
 
 	var stdout, stderr bytes.Buffer
-	code := RunWithIO([]string{"attach", "existing-session", "--cwd", projectDir}, strings.NewReader("/compact\n/quit\n"), &stdout, &stderr, func() (string, error) {
-		return "", errors.New("getwd should not be called")
+	code := RunWithIO([]string{"attach", "existing-session"}, strings.NewReader("/compact\n/quit\n"), &stdout, &stderr, func() (string, error) {
+		return projectDir, nil
 	})
 
 	if code != 0 {
@@ -7585,21 +7686,57 @@ func TestClientCommandsNoServerHint(t *testing.T) {
 	isolateCLIUserRegistry(t)
 	projectDir := t.TempDir()
 
-	tests := [][]string{
-		{"attach", "--cwd", projectDir},
-		{"attach", "missing-session", "--cwd", projectDir},
-		{"attach", "--new", "--cwd", projectDir},
-		{"sessions", "list", "--cwd", projectDir},
-		{"sessions", "show", "missing-session", "--cwd", projectDir},
-		{"send", "missing-session", "--prompt", "hello", "--cwd", projectDir},
-		{"send", "--new", "--prompt", "hello", "--cwd", projectDir},
-	}
-	for _, args := range tests {
-		t.Run(strings.Join(args, " "), func(t *testing.T) {
-			var stdout, stderr bytes.Buffer
-			code := RunWithGetwd(args, &stdout, &stderr, func() (string, error) {
+	tests := []struct {
+		args  []string
+		getwd func() (string, error)
+	}{
+		{
+			args: []string{"attach"},
+			getwd: func() (string, error) {
+				return projectDir, nil
+			},
+		},
+		{
+			args: []string{"attach", "missing-session"},
+			getwd: func() (string, error) {
+				return projectDir, nil
+			},
+		},
+		{
+			args: []string{"attach", "--new", "--cwd", projectDir},
+			getwd: func() (string, error) {
 				return "", errors.New("getwd should not be called")
-			})
+			},
+		},
+		{
+			args: []string{"sessions", "list", "--cwd", projectDir},
+			getwd: func() (string, error) {
+				return "", errors.New("getwd should not be called")
+			},
+		},
+		{
+			args: []string{"sessions", "show", "missing-session", "--cwd", projectDir},
+			getwd: func() (string, error) {
+				return "", errors.New("getwd should not be called")
+			},
+		},
+		{
+			args: []string{"send", "missing-session", "--prompt", "hello"},
+			getwd: func() (string, error) {
+				return projectDir, nil
+			},
+		},
+		{
+			args: []string{"send", "--new", "--prompt", "hello", "--cwd", projectDir},
+			getwd: func() (string, error) {
+				return "", errors.New("getwd should not be called")
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(strings.Join(tt.args, " "), func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			code := RunWithGetwd(tt.args, &stdout, &stderr, tt.getwd)
 			if code != 1 {
 				t.Fatalf("code = %d, want 1", code)
 			}
