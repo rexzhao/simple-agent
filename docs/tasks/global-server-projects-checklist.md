@@ -63,7 +63,7 @@ evidence 证明。
 - [x] 从 effective cwd 向上查找 nearest registered ancestor。
 - [x] nested projects 允许并按 nearest ancestor 选择。
 - [x] 无 project 时 bare attach 失败并提示创建 project。
-- [ ] 无 project 时 send/session create 失败并提示创建 project。
+- [x] 无 project 时 send/session create 失败并提示创建 project。
 - [x] `project list` 可列出 projects。
 - [x] `project show` 可按 current cwd discovery 或 explicit project id 展示 project。
 - [x] `project show` 不接受 `--cwd`。
@@ -114,7 +114,7 @@ evidence 证明。
 - [x] bare attach 选择当前 project 最近 non-archived session。
 - [ ] `<cmd> --new` 创建 session 后 attach。
 - [x] explicit session id 全局有效。
-- [ ] 未指定 session id 时只从当前 project 选最近 non-archived session。
+- [x] 未指定 session id 时只从当前 project 选最近 non-archived session。
 - [ ] 多个 observers 可以 attach 同一 session。
 - [ ] 同一 session 同时只有一个 active turn。
 - [ ] session busy 时 send 返回 `session_busy`。
@@ -220,6 +220,20 @@ evidence 证明。
 - 2026-07-04 M21 send --new slice: `go test ./internal/cli` 通过；覆盖
   `send --new` 无 nearest registered project 时在 create/send 前失败，并提示
   `run "sai project create"`。
+- 2026-07-04 M21 send no-id project selection slice: `go test ./internal/cli` 通过；覆盖
+  `send --prompt` 无显式 session id 时先 `GET /projects` 做 nearest ancestor discovery，再
+  `GET /projects/{project_id}/sessions`，随后只对该 project 最新 session 调用
+  `POST /sessions/{id}/messages`，并确认不使用 global `/sessions` list 或其他 project sessions。
+- 2026-07-04 M21 send no-id project selection slice: `go test ./internal/cli` 通过；覆盖
+  无 nearest registered project 时提示 `run "sai project create"`，且不会访问 global `/sessions`
+  list 或 send。
+- 2026-07-04 M21 send no-id project selection slice: `go test ./internal/cli` 通过；覆盖
+  nearest project 存在但无 sessions 时提示 `session create` / `send --new`，且不会 fallback 到
+  其他 project 或 global session。
+- 2026-07-04 M21 send no-id project selection slice: `go test ./internal/cli` 通过；覆盖
+  `send [session-id] --prompt` help usage、explicit `send <session-id>` 继续直接使用全局
+  `POST /sessions/{id}/messages` 且不要求 project list，以及 no-id send 仍按 existing-session
+  规则拒绝 `--cwd` / `--config`。
 - 2026-07-04 M21 slice 1: `go test ./internal/server` 通过；覆盖 home env var derivation、singleton registry
   upsert/discovery/stale cleanup。
 - 2026-07-04 M21 slice 1: `go test ./internal/cli` 通过；覆盖 `--home`/env priority、different home
@@ -265,6 +279,5 @@ evidence 证明。
   `attach --new --cwd` 和 `send --new --cwd` 仍到达 discovery/create/send 路径。
 - 2026-07-04 M21 slice 8: `go test ./...` 通过。
 - 2026-07-04 M21 slice 8: `git diff --check` 通过（仅出现工作区 LF/CRLF normalization warnings）。
-- Known limits: 当前 M21 slices 未实现 send-side no-id/bare project selection changes、
-  project remove/archive、GUI server work、session data store home
+- Known limits: 当前 M21 slices 未实现 project remove/archive、GUI server work、session data store home
   migration 或 registry `base_url` schema rename。

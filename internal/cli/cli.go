@@ -509,14 +509,15 @@ Lists healthy local server registry records. Stale records are removed while
 listing.
 `
 
-const sendUsageText = `usage: sai send <session-id> --prompt text
+const sendUsageText = `usage: sai send [session-id] --prompt text
        sai send --new [--cwd path] --prompt text
 
 Discovers the nearest healthy local server, sends one prompt through the server
 API, and prints committed turn metadata only. --new first creates a server-owned
-session with the registry token, then sends the prompt to that session.
-Existing-session send rejects --cwd and global --config; existing sessions use
-their stored cwd and config.
+session with the registry token, then sends the prompt to that session. Without
+an explicit session id, send selects the most recent session in the nearest
+registered project. Existing-session send rejects --cwd and global --config;
+existing sessions use their stored cwd and config.
 `
 
 const authUsageText = `usage: sai auth <command>
@@ -2174,7 +2175,7 @@ func attachCommand(ctx context.Context, args []string, configPath string, config
 		}
 	} else if !*newSession {
 		var err error
-		sessionID, err = mostRecentProjectSessionID(ctx, record, *cwdFlag, getwd, program)
+		sessionID, err = mostRecentProjectSessionID(ctx, record, *cwdFlag, getwd, program, program+" attach --new")
 		if err != nil {
 			return err
 		}
@@ -2191,7 +2192,7 @@ func attachCommand(ctx context.Context, args []string, configPath string, config
 	return runAttachREPL(ctx, record, sessionID, stdin, stdout, stderr, events, streamErrs)
 }
 
-func mostRecentProjectSessionID(ctx context.Context, record localserver.RegistryRecord, cwdFlag string, getwd func() (string, error), program string) (string, error) {
+func mostRecentProjectSessionID(ctx context.Context, record localserver.RegistryRecord, cwdFlag string, getwd func() (string, error), program string, newHint string) (string, error) {
 	effectiveCWD, err := resolveClientCWD(cwdFlag, getwd)
 	if err != nil {
 		return "", err
@@ -2208,7 +2209,7 @@ func mostRecentProjectSessionID(ctx context.Context, record localserver.Registry
 		return "", err
 	}
 	if len(infos) == 0 {
-		return "", fmt.Errorf("no sessions found for project %s; create a session with %q or %q", project.ID, program+" session create", program+" attach --new")
+		return "", fmt.Errorf("no sessions found for project %s; create a session with %q or %q", project.ID, program+" session create", newHint)
 	}
 	latest := infos[0]
 	for _, info := range infos[1:] {
@@ -2449,8 +2450,8 @@ func sendCommand(ctx context.Context, args []string, configPath string, configPr
 	switch {
 	case *newSession && len(positionals) != 0:
 		return usageError("usage: sai send --new [--cwd path] --prompt text", "", "sai help send")
-	case !*newSession && len(positionals) != 1:
-		return usageError("usage: sai send <session-id> --prompt text", "", "sai help send")
+	case !*newSession && len(positionals) > 1:
+		return usageError("usage: sai send [session-id] --prompt text", "", "sai help send")
 	}
 	if strings.TrimSpace(*prompt) == "" {
 		return usageError("--prompt must be a non-empty string", "", "sai help send")
@@ -2477,11 +2478,22 @@ func sendCommand(ctx context.Context, args []string, configPath string, configPr
 		}
 	} else {
 		var err error
-		record, _, err = discoverClientServer(ctx, *cwdFlag, homePath, getwd)
-		if err != nil {
-			return err
+		if len(positionals) == 1 {
+			record, _, err = discoverClientServer(ctx, *cwdFlag, homePath, getwd)
+			if err != nil {
+				return err
+			}
+			sessionID = positionals[0]
+		} else {
+			record, err = ensureSessionCommandServer(ctx, configPath, homePath, program, getwd)
+			if err != nil {
+				return err
+			}
+			sessionID, err = mostRecentProjectSessionID(ctx, record, "", getwd, program, program+" send --new")
+			if err != nil {
+				return err
+			}
 		}
-		sessionID = positionals[0]
 	}
 
 	result, err := localserver.SendSessionMessageWithToken(ctx, record.Addr, record.Token, sessionID, *prompt, 0)

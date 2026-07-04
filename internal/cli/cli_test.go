@@ -3242,7 +3242,7 @@ func TestSendHelpWritesUsageWithoutConfig(t *testing.T) {
 		{"help", "send"},
 	} {
 		t.Run(strings.Join(args, " "), func(t *testing.T) {
-			assertCLIHelpWithoutConfig(t, args, "usage: sai send", "--new [--cwd path] --prompt", "committed turn metadata")
+			assertCLIHelpWithoutConfig(t, args, "usage: sai send [session-id] --prompt text", "--new [--cwd path] --prompt", "committed turn metadata")
 		})
 	}
 }
@@ -6817,6 +6817,16 @@ func TestSendExistingRejectsCWDAndConfigBeforeDiscovery(t *testing.T) {
 			args: []string{"send", "existing-session", "--prompt", "hello", "--config", missingConfig},
 			want: "--config can only be used when creating a new session with --new",
 		},
+		{
+			name: "no id cwd",
+			args: []string{"send", "--cwd", projectDir, "--prompt", "hello"},
+			want: "--cwd can only be used when creating a new session with --new",
+		},
+		{
+			name: "no id config",
+			args: []string{"--config", missingConfig, "send", "--prompt", "hello"},
+			want: "--config can only be used when creating a new session with --new",
+		},
 	}
 
 	for _, tt := range tests {
@@ -6888,6 +6898,228 @@ func TestSendExistingWaitsLongerThanDiscoveryTimeout(t *testing.T) {
 	if stderr.String() != "" {
 		t.Fatalf("stderr = %q, want empty", stderr.String())
 	}
+}
+
+func TestSendWithoutSessionUsesNearestProjectSession(t *testing.T) {
+	registryPath := isolateCLIUserRegistry(t)
+	projectDir := t.TempDir()
+	childDir := filepath.Join(projectDir, "child")
+	if err := os.MkdirAll(childDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll(childDir) error = %v", err)
+	}
+	canonicalRoot, err := projectstore.CanonicalRoot(projectDir)
+	if err != nil {
+		t.Fatalf("CanonicalRoot(projectDir) error = %v", err)
+	}
+	canonicalChild, err := projectstore.CanonicalRoot(childDir)
+	if err != nil {
+		t.Fatalf("CanonicalRoot(childDir) error = %v", err)
+	}
+	prompt := "project scoped prompt"
+
+	authSeen := make(chan string, 3)
+	messageBodySeen := make(chan map[string]any, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/health":
+			writeCLIJSON(w, http.StatusOK, map[string]any{"status": "ok"})
+		case r.URL.Path == "/projects" && r.Method == http.MethodGet:
+			authSeen <- r.Header.Get("Authorization")
+			writeCLIJSON(w, http.StatusOK, map[string]any{
+				"projects": []map[string]any{
+					{
+						"id":           "project-parent",
+						"root":         canonicalRoot,
+						"display_name": "Parent",
+						"archived":     false,
+						"created_at":   time.Date(2026, 7, 4, 9, 0, 0, 0, time.UTC),
+						"updated_at":   time.Date(2026, 7, 4, 9, 0, 0, 0, time.UTC),
+					},
+					{
+						"id":           "project-child",
+						"root":         canonicalChild,
+						"display_name": "Child",
+						"archived":     false,
+						"created_at":   time.Date(2026, 7, 4, 9, 1, 0, 0, time.UTC),
+						"updated_at":   time.Date(2026, 7, 4, 9, 1, 0, 0, time.UTC),
+					},
+				},
+			})
+		case r.URL.Path == "/projects/project-child/sessions" && r.Method == http.MethodGet:
+			authSeen <- r.Header.Get("Authorization")
+			writeCLIJSON(w, http.StatusOK, map[string]any{
+				"sessions": []map[string]any{
+					{
+						"id":            "older-session",
+						"created_at":    time.Date(2026, 7, 4, 10, 0, 0, 0, time.UTC),
+						"updated_at":    time.Date(2026, 7, 4, 10, 1, 0, 0, time.UTC),
+						"provider":      "paperhub",
+						"model_profile": "glm-5.2",
+						"model_id":      "glm-5.2",
+					},
+					{
+						"id":            "latest-session",
+						"created_at":    time.Date(2026, 7, 4, 10, 2, 0, 0, time.UTC),
+						"updated_at":    time.Date(2026, 7, 4, 10, 3, 0, 0, time.UTC),
+						"provider":      "openai",
+						"model_profile": "default",
+						"model_id":      "gpt-5.1",
+					},
+				},
+			})
+		case r.URL.Path == "/sessions/latest-session/messages" && r.Method == http.MethodPost:
+			authSeen <- r.Header.Get("Authorization")
+			data, err := io.ReadAll(r.Body)
+			if err != nil {
+				t.Fatalf("ReadAll(message body) error = %v", err)
+			}
+			messageBodySeen <- decodeCLIJSON(t, data)
+			writeCLIJSON(w, http.StatusOK, map[string]any{
+				"status":   "committed",
+				"turn_id":  "turn-project",
+				"last_seq": 7,
+			})
+		case r.URL.Path == "/sessions" || r.URL.Path == "/projects/project-parent/sessions":
+			t.Fatalf("send without id should not use global or parent sessions, got %s %q", r.Method, r.URL.Path)
+		default:
+			t.Fatalf("unexpected path %s %q", r.Method, r.URL.Path)
+		}
+	}))
+	defer server.Close()
+	registerCLIFakeServer(t, registryPath, projectDir, server.URL, "registry-token")
+
+	var stdout, stderr bytes.Buffer
+	code := RunWithGetwd([]string{"send", "--prompt", prompt}, &stdout, &stderr, func() (string, error) {
+		return childDir, nil
+	})
+
+	if code != 0 {
+		t.Fatalf("send code = %d, stderr = %s", code, stderr.String())
+	}
+	for i := 0; i < 3; i++ {
+		select {
+		case got := <-authSeen:
+			if got != "Bearer registry-token" {
+				t.Fatalf("Authorization = %q, want bearer registry token", got)
+			}
+		default:
+			t.Fatal("expected project-scoped send request was not called")
+		}
+	}
+	select {
+	case got := <-messageBodySeen:
+		if got["content"] != prompt {
+			t.Fatalf("message body = %#v, want content", got)
+		}
+	default:
+		t.Fatal("message body was not captured")
+	}
+	out := stdout.String()
+	for _, want := range []string{"SESSION\tlatest-session", "STATUS\tcommitted", "TURN_ID\tturn-project", "LAST_SEQ\t7"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("send output missing %q:\n%s", want, out)
+		}
+	}
+	assertCLIErrorOmits(t, out, prompt, "registry-token")
+	if stderr.String() != "" {
+		t.Fatalf("stderr = %q, want empty", stderr.String())
+	}
+}
+
+func TestSendWithoutSessionFailsWithoutRegisteredNearestProject(t *testing.T) {
+	registryPath := isolateCLIUserRegistry(t)
+	projectDir := t.TempDir()
+	projectsCalled := make(chan struct{}, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/health":
+			writeCLIJSON(w, http.StatusOK, map[string]any{"status": "ok"})
+		case r.URL.Path == "/projects" && r.Method == http.MethodGet:
+			projectsCalled <- struct{}{}
+			writeCLIJSON(w, http.StatusOK, map[string]any{"projects": []map[string]any{}})
+		case strings.HasPrefix(r.URL.Path, "/projects/"), strings.HasPrefix(r.URL.Path, "/sessions"):
+			t.Fatalf("send without id should fail before global list or send, got %s %q", r.Method, r.URL.Path)
+		default:
+			t.Fatalf("unexpected path %s %q", r.Method, r.URL.Path)
+		}
+	}))
+	defer server.Close()
+	registerCLIFakeServer(t, registryPath, projectDir, server.URL, "registry-token")
+
+	var stdout, stderr bytes.Buffer
+	code := RunWithGetwd([]string{"send", "--prompt", "hello"}, &stdout, &stderr, func() (string, error) {
+		return projectDir, nil
+	})
+
+	if code != 1 {
+		t.Fatalf("send code = %d, want 1", code)
+	}
+	if stdout.String() != "" {
+		t.Fatalf("stdout = %q, want empty", stdout.String())
+	}
+	select {
+	case <-projectsCalled:
+	default:
+		t.Fatal("GET /projects was not called")
+	}
+	assertCLIErrorContains(t, stderr.String(), "no registered project found from", `run "sai project create"`)
+}
+
+func TestSendWithoutSessionFailsWhenProjectHasNoSessions(t *testing.T) {
+	registryPath := isolateCLIUserRegistry(t)
+	projectDir := t.TempDir()
+	canonicalRoot, err := projectstore.CanonicalRoot(projectDir)
+	if err != nil {
+		t.Fatalf("CanonicalRoot(projectDir) error = %v", err)
+	}
+	projectSessionsCalled := make(chan struct{}, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/health":
+			writeCLIJSON(w, http.StatusOK, map[string]any{"status": "ok"})
+		case r.URL.Path == "/projects" && r.Method == http.MethodGet:
+			writeCLIJSON(w, http.StatusOK, map[string]any{
+				"projects": []map[string]any{
+					{
+						"id":           "project-current",
+						"root":         canonicalRoot,
+						"display_name": "Current",
+						"archived":     false,
+						"created_at":   time.Date(2026, 7, 4, 9, 0, 0, 0, time.UTC),
+						"updated_at":   time.Date(2026, 7, 4, 9, 0, 0, 0, time.UTC),
+					},
+				},
+			})
+		case r.URL.Path == "/projects/project-current/sessions" && r.Method == http.MethodGet:
+			projectSessionsCalled <- struct{}{}
+			writeCLIJSON(w, http.StatusOK, map[string]any{"sessions": []map[string]any{}})
+		case r.URL.Path == "/sessions", strings.HasPrefix(r.URL.Path, "/sessions/"):
+			t.Fatalf("send without id should not fall back to global sessions, got %s %q", r.Method, r.URL.Path)
+		default:
+			t.Fatalf("unexpected path %s %q", r.Method, r.URL.Path)
+		}
+	}))
+	defer server.Close()
+	registerCLIFakeServer(t, registryPath, projectDir, server.URL, "registry-token")
+
+	var stdout, stderr bytes.Buffer
+	code := RunWithGetwd([]string{"send", "--prompt", "hello"}, &stdout, &stderr, func() (string, error) {
+		return projectDir, nil
+	})
+
+	if code != 1 {
+		t.Fatalf("send code = %d, want 1", code)
+	}
+	if stdout.String() != "" {
+		t.Fatalf("stdout = %q, want empty", stdout.String())
+	}
+	select {
+	case <-projectSessionsCalled:
+	default:
+		t.Fatal("GET /projects/project-current/sessions was not called")
+	}
+	assertCLIErrorContains(t, stderr.String(), "no sessions found for project project-current", "session create", "send --new")
+	assertCLIErrorOmits(t, stderr.String(), "attach --new")
 }
 
 func TestSendNewCreatesSessionThenSendsWithToken(t *testing.T) {
