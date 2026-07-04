@@ -54,19 +54,19 @@ evidence 证明。
 ## Projects
 
 - [x] project identity 只使用 canonical cwd root。
-- [ ] project 必须显式创建。
+- [x] project 必须显式创建。
 - [x] project metadata 存在 user-level registry/data store，不写 project marker 文件。
-- [ ] `project create` 默认使用 effective cwd。
-- [ ] `project create --cwd PATH` 可指定 canonical root。
+- [x] `project create` 默认使用 effective cwd。
+- [x] `project create --cwd PATH` 可指定 canonical root。
 - [x] duplicate exact canonical root 返回已有 project info 并退出 0。
 - [x] project name 只作为 display-only metadata。
 - [x] 从 effective cwd 向上查找 nearest registered ancestor。
 - [x] nested projects 允许并按 nearest ancestor 选择。
 - [ ] 无 project 时 bare attach 失败并提示创建 project。
 - [ ] 无 project 时 send/session create 失败并提示创建 project。
-- [ ] `project list` 可列出 projects。
-- [ ] `project show` 可按 current cwd discovery 或 explicit project id 展示 project。
-- [ ] `project show` 不接受 `--cwd`。
+- [x] `project list` 可列出 projects。
+- [x] `project show` 可按 current cwd discovery 或 explicit project id 展示 project。
+- [x] `project show` 不接受 `--cwd`。
 - [ ] `project remove` 默认 archive/hide。
 - [ ] `project remove` 可按 current cwd discovery 或 explicit project id 选择 project。
 - [ ] `project remove` 不接受 `--cwd`。
@@ -212,6 +212,11 @@ evidence 证明。
   `chat --help`、`chat --bad`、`chat --quit --prompt hi` 均返回 unknown command，`help chat`
   返回 unknown help topic，且不输出 `usage: sai chat`。
 - 2026-07-04 M21 slice 3: `git diff --check` 通过。
-- Known limits: 当前 M21 slices 未实现 project CLI commands、session lifecycle、attach/send project
-  selection changes、project remove/archive、GUI server work、session data store home
+- 2026-07-04 M21 slice 4: `go test ./internal/cli` 通过；覆盖 `project create` effective cwd、
+  `project create --cwd` duplicate 200 existing metadata、`project list`、`project show --project`、
+  `project show` nearest registered ancestor matching、`project show --cwd` rejection、project help
+  不列 unimplemented remove，以及 project command scoped auto-start without startup output。
+- 2026-07-04 M21 slice 4: `git diff --check` 通过。
+- Known limits: 当前 M21 slices 未实现 session lifecycle、attach/send project selection changes、
+  project remove/archive、GUI server work、session data store home
   migration 或 registry `base_url` schema rename。

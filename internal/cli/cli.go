@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -180,6 +181,25 @@ func execute(ctx context.Context, program string, args []string, stdin io.Reader
 		return doctorCommand(rootArgs.commandArgs, rootArgs.configPath, stdout, getwd, program)
 	case "server":
 		return serverCommand(ctx, rootArgs.commandArgs, rootArgs.configPath, homePath, stdout, getwd, program)
+	case "project":
+		subcommand, subArgs, groupHelp, err := splitSubcommandArgs(rootArgs.commandArgs, map[string]flagKind{"cwd": flagKindValue, "name": flagKindValue, "project": flagKindValue}, "sai help project")
+		if err != nil {
+			return err
+		}
+		if subcommand == "" && groupHelp {
+			printProjectUsage(stdout)
+			return nil
+		}
+		switch subcommand {
+		case "create":
+			return projectCreateCommand(ctx, subArgs, rootArgs.configPath, homePath, stdout, getwd, program)
+		case "list":
+			return projectListCommand(ctx, subArgs, rootArgs.configPath, homePath, stdout, getwd, program)
+		case "show":
+			return projectShowCommand(ctx, subArgs, rootArgs.configPath, homePath, stdout, getwd, program)
+		default:
+			return usageError("usage: sai project <create|list|show>", "", "sai help project")
+		}
 	case "status":
 		return statusCommand(ctx, rootArgs.commandArgs, homePath, stdout, getwd)
 	case "stop":
@@ -280,6 +300,7 @@ const rootUsageText = `usage: sai [--home dir] [--config file] [command] [args]
 Commands:
   attach            Attach to a server-owned session
   server            Start a local HTTP server
+  project           Manage registered projects
   status            Show nearest server status
   stop              Stop nearest server
   servers list      List registered local servers
@@ -381,6 +402,33 @@ Options:
   --config file      root config file, relative to --cwd when not absolute
   --port N           listen on 127.0.0.1:N; 0 asks the OS for a free port
   --listen host:port advanced loopback listen address
+`
+
+const projectUsageText = `usage: sai project <command>
+
+Commands:
+  project create    Register a project root
+  project list      List registered projects
+  project show      Show project metadata
+
+Run "sai help project <command>" for command usage.
+`
+
+const projectCreateUsageText = `usage: sai project create [--cwd path] [--name name]
+
+Registers the effective current directory as a project root. Use --cwd to
+register a specific existing directory. --name sets display-only metadata.
+`
+
+const projectListUsageText = `usage: sai project list
+
+Lists registered projects.
+`
+
+const projectShowUsageText = `usage: sai project show [--project id]
+
+Shows project metadata. Without --project, the current directory is matched to
+the nearest registered ancestor project.
 `
 
 const statusUsageText = `usage: sai status [--cwd path]
@@ -527,6 +575,14 @@ func helpCommand(args []string, stdout io.Writer) error {
 		printDoctorUsage(stdout)
 	case "server":
 		printServerUsage(stdout)
+	case "project":
+		printProjectUsage(stdout)
+	case "project create":
+		printProjectCreateUsage(stdout)
+	case "project list":
+		printProjectListUsage(stdout)
+	case "project show":
+		printProjectShowUsage(stdout)
 	case "status":
 		printStatusUsage(stdout)
 	case "stop":
@@ -605,6 +661,22 @@ func printDoctorUsage(stdout io.Writer) {
 
 func printServerUsage(stdout io.Writer) {
 	fmt.Fprint(stdout, serverUsageText)
+}
+
+func printProjectUsage(stdout io.Writer) {
+	fmt.Fprint(stdout, projectUsageText)
+}
+
+func printProjectCreateUsage(stdout io.Writer) {
+	fmt.Fprint(stdout, projectCreateUsageText)
+}
+
+func printProjectListUsage(stdout io.Writer) {
+	fmt.Fprint(stdout, projectListUsageText)
+}
+
+func printProjectShowUsage(stdout io.Writer) {
+	fmt.Fprint(stdout, projectShowUsageText)
 }
 
 func printStatusUsage(stdout io.Writer) {
@@ -729,6 +801,8 @@ func splitRootArgs(args []string) (rootArgs, error) {
 	known := map[string]flagKind{
 		"config":         flagKindValue,
 		"home":           flagKindValue,
+		"name":           flagKindValue,
+		"project":        flagKindValue,
 		"provider":       flagKindValue,
 		"model":          flagKindValue,
 		"prompt":         flagKindValue,
@@ -1133,10 +1207,20 @@ func runServerBackgroundParent(ctx context.Context, launch serverLaunch, stdout 
 		return err
 	}
 
+	record, err := startBackgroundServerAndWait(ctx, launch)
+	if err != nil {
+		return err
+	}
+	_, err = fmt.Fprintf(stdout, "SERVER_ADDR\t%s\n", record.Addr)
+	return err
+}
+
+func startBackgroundServerAndWait(ctx context.Context, launch serverLaunch) (localserver.RegistryRecord, error) {
+	store := launch.RegistryStore
 	childArgs := backgroundServerChildArgs(launch)
 	child, err := startBackgroundServerProcess(ctx, childArgs)
 	if err != nil {
-		return err
+		return localserver.RegistryRecord{}, err
 	}
 
 	ready := false
@@ -1148,11 +1232,10 @@ func runServerBackgroundParent(ctx context.Context, launch serverLaunch, stdout 
 
 	record, err := waitForBackgroundServerReady(ctx, store, launch.Identity, launch.Listen, child)
 	if err != nil {
-		return err
+		return localserver.RegistryRecord{}, err
 	}
 	ready = true
-	_, err = fmt.Fprintf(stdout, "SERVER_ADDR\t%s\n", record.Addr)
-	return err
+	return record, nil
 }
 
 func backgroundServerChildArgs(launch serverLaunch) []string {
@@ -1361,6 +1444,219 @@ func serverConfigPath(configPath, cwd string) string {
 		return configPath
 	}
 	return filepath.Join(cwd, configPath)
+}
+
+func projectCreateCommand(ctx context.Context, args []string, configPath, homePath string, stdout io.Writer, getwd func() (string, error), program string) error {
+	flags := flag.NewFlagSet("sai project create", flag.ContinueOnError)
+	cwdFlag := flags.String("cwd", "", "project root")
+	nameFlag := flags.String("name", "", "project display name")
+	positionals, done, err := parseCommandFlagArgs(flags, args, stdout, printProjectCreateUsage, "sai help project create")
+	if done || err != nil {
+		return err
+	}
+	if len(positionals) != 0 {
+		return usageError("usage: sai project create [--cwd path] [--name name]", "", "sai help project create")
+	}
+
+	effectiveCWD, root, err := resolveProjectCreatePaths(*cwdFlag, getwd)
+	if err != nil {
+		return err
+	}
+	record, err := ensureProjectCommandServer(ctx, configPath, homePath, effectiveCWD, program)
+	if err != nil {
+		return err
+	}
+	result, err := localserver.CreateProjectWithToken(ctx, record.Addr, record.Token, root, *nameFlag, serverClientTimeout)
+	if err != nil {
+		return err
+	}
+	return printProjectInfo(stdout, result.Project)
+}
+
+func projectListCommand(ctx context.Context, args []string, configPath, homePath string, stdout io.Writer, getwd func() (string, error), program string) error {
+	flags := flag.NewFlagSet("sai project list", flag.ContinueOnError)
+	positionals, done, err := parseCommandFlagArgs(flags, args, stdout, printProjectListUsage, "sai help project list")
+	if done || err != nil {
+		return err
+	}
+	if len(positionals) != 0 {
+		return usageError("usage: sai project list", "", "sai help project list")
+	}
+
+	effectiveCWD, err := resolveClientCWD("", getwd)
+	if err != nil {
+		return err
+	}
+	record, err := ensureProjectCommandServer(ctx, configPath, homePath, effectiveCWD, program)
+	if err != nil {
+		return err
+	}
+	projects, err := localserver.ListProjectsWithToken(ctx, record.Addr, record.Token, serverClientTimeout)
+	if err != nil {
+		return err
+	}
+	return printProjectList(stdout, projects)
+}
+
+func projectShowCommand(ctx context.Context, args []string, configPath, homePath string, stdout io.Writer, getwd func() (string, error), program string) error {
+	flags := flag.NewFlagSet("sai project show", flag.ContinueOnError)
+	projectID := flags.String("project", "", "project id")
+	positionals, done, err := parseCommandFlagArgs(flags, args, stdout, printProjectShowUsage, "sai help project show")
+	if done || err != nil {
+		return err
+	}
+	if len(positionals) != 0 {
+		return usageError("usage: sai project show [--project id]", "", "sai help project show")
+	}
+
+	effectiveCWD, err := resolveClientCWD("", getwd)
+	if err != nil {
+		return err
+	}
+	record, err := ensureProjectCommandServer(ctx, configPath, homePath, effectiveCWD, program)
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(*projectID) != "" {
+		project, err := localserver.GetProjectWithToken(ctx, record.Addr, record.Token, *projectID, serverClientTimeout)
+		if err != nil {
+			return err
+		}
+		return printProjectInfo(stdout, project)
+	}
+
+	projects, err := localserver.ListProjectsWithToken(ctx, record.Addr, record.Token, serverClientTimeout)
+	if err != nil {
+		return err
+	}
+	project, ok, err := nearestProjectFromList(projects, effectiveCWD)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return fmt.Errorf("no registered project found from %s; run \"sai project create\"", effectiveCWD)
+	}
+	return printProjectInfo(stdout, project)
+}
+
+func resolveProjectCreatePaths(cwdFlag string, getwd func() (string, error)) (string, string, error) {
+	effectiveCWD, err := resolveClientCWD("", getwd)
+	if err != nil {
+		return "", "", err
+	}
+	root := effectiveCWD
+	if strings.TrimSpace(cwdFlag) != "" {
+		root = cwdFlag
+		if !filepath.IsAbs(root) {
+			root = filepath.Join(effectiveCWD, root)
+		}
+	}
+	canonicalRoot, err := projectstore.CanonicalRoot(root)
+	if err != nil {
+		return "", "", err
+	}
+	return effectiveCWD, canonicalRoot, nil
+}
+
+func ensureProjectCommandServer(ctx context.Context, configPath, homePath, effectiveCWD, program string) (localserver.RegistryRecord, error) {
+	store, err := localserver.NewRegistryStoreForHome(homePath)
+	if err != nil {
+		return localserver.RegistryRecord{}, err
+	}
+	discovery, err := localserver.DiscoverHealthy(ctx, store, effectiveCWD, serverClientTimeout)
+	if err != nil {
+		return localserver.RegistryRecord{}, err
+	}
+	if discovery.Found {
+		return discovery.Record, nil
+	}
+
+	launch, err := prepareServerLaunch(configPath, effectiveCWD, localserver.DefaultListenAddress, homePath, store, func() (string, error) {
+		return effectiveCWD, nil
+	}, program)
+	if err != nil {
+		return localserver.RegistryRecord{}, err
+	}
+	return startBackgroundServerAndWait(ctx, launch)
+}
+
+func nearestProjectFromList(projects []localserver.ProjectInfo, cwd string) (localserver.ProjectInfo, bool, error) {
+	canonicalCWD, err := projectstore.CanonicalRoot(cwd)
+	if err != nil {
+		return localserver.ProjectInfo{}, false, err
+	}
+	var best localserver.ProjectInfo
+	bestLen := -1
+	for _, project := range projects {
+		if strings.TrimSpace(project.Root) == "" || project.Archived {
+			continue
+		}
+		if !isSameOrAncestorProjectPath(project.Root, canonicalCWD) {
+			continue
+		}
+		rootLen := len(projectPathKey(project.Root))
+		if rootLen > bestLen {
+			best = project
+			bestLen = rootLen
+		}
+	}
+	if bestLen < 0 {
+		return localserver.ProjectInfo{}, false, nil
+	}
+	return best, true, nil
+}
+
+func isSameOrAncestorProjectPath(root, cwd string) bool {
+	rootKey := projectPathKey(root)
+	cwdKey := projectPathKey(cwd)
+	if rootKey == cwdKey {
+		return true
+	}
+	rel, err := filepath.Rel(rootKey, cwdKey)
+	if err != nil {
+		return false
+	}
+	return rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+}
+
+func projectPathKey(path string) string {
+	key := filepath.Clean(path)
+	if runtime.GOOS == "windows" {
+		key = strings.ToLower(key)
+	}
+	return key
+}
+
+func printProjectList(stdout io.Writer, projects []localserver.ProjectInfo) error {
+	if _, err := fmt.Fprintln(stdout, "ID\tROOT\tNAME\tARCHIVED\tUPDATED"); err != nil {
+		return err
+	}
+	for _, project := range projects {
+		if _, err := fmt.Fprintf(stdout, "%s\t%s\t%s\t%t\t%s\n", project.ID, project.Root, project.DisplayName, project.Archived, formatSessionTimestamp(project.UpdatedAt)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func printProjectInfo(stdout io.Writer, project localserver.ProjectInfo) error {
+	if _, err := fmt.Fprintf(stdout, "ID\t%s\n", project.ID); err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintf(stdout, "ROOT\t%s\n", project.Root); err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintf(stdout, "NAME\t%s\n", project.DisplayName); err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintf(stdout, "ARCHIVED\t%t\n", project.Archived); err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintf(stdout, "CREATED_AT\t%s\n", formatSessionTimestamp(project.CreatedAt)); err != nil {
+		return err
+	}
+	_, err := fmt.Fprintf(stdout, "UPDATED_AT\t%s\n", formatSessionTimestamp(project.UpdatedAt))
+	return err
 }
 
 func serverSessionDefaultsFromConfig(cfg *config.Config, cwd string) (sessions.SessionV2, error) {

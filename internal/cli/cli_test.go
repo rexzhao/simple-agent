@@ -989,7 +989,7 @@ func TestRootHelpWritesUsageWithoutConfig(t *testing.T) {
 				t.Fatalf("RunWithGetwd(%v) code = %d, stderr = %s", args, code, stderr.String())
 			}
 			out := stdout.String()
-			for _, want := range []string{"usage: sai", "attach            Attach to a server-owned session", "server            Start a local HTTP server", "status            Show nearest server status", "stop              Stop nearest server", "servers list", "send              Send one prompt", "config show", "models list", "doctor", "tools list", "sessions", "With no command, sai defaults to attach.", `Run "sai help <command>" for command usage.`} {
+			for _, want := range []string{"usage: sai", "attach            Attach to a server-owned session", "server            Start a local HTTP server", "project           Manage registered projects", "status            Show nearest server status", "stop              Stop nearest server", "servers list", "send              Send one prompt", "config show", "models list", "doctor", "tools list", "sessions", "With no command, sai defaults to attach.", `Run "sai help <command>" for command usage.`} {
 				if !strings.Contains(out, want) {
 					t.Fatalf("stdout = %q, want contain %q", out, want)
 				}
@@ -1098,6 +1098,401 @@ func TestLifecycleHelpWritesUsageWithoutConfig(t *testing.T) {
 		t.Run(strings.Join(tt.args, " "), func(t *testing.T) {
 			assertCLIHelpWithoutConfig(t, tt.args, tt.wants...)
 		})
+	}
+}
+
+func TestProjectHelpWritesUsageWithoutConfig(t *testing.T) {
+	for _, tt := range []struct {
+		args  []string
+		wants []string
+	}{
+		{args: []string{"project", "-h"}, wants: []string{"usage: sai project <command>", "project create", "project list", "project show"}},
+		{args: []string{"help", "project"}, wants: []string{"usage: sai project <command>", "project create", "project list", "project show"}},
+		{args: []string{"project", "create", "-h"}, wants: []string{"usage: sai project create", "--cwd path", "--name name"}},
+		{args: []string{"help", "project", "create"}, wants: []string{"usage: sai project create", "--cwd path", "--name name"}},
+		{args: []string{"project", "list", "-h"}, wants: []string{"usage: sai project list", "Lists registered projects"}},
+		{args: []string{"help", "project", "list"}, wants: []string{"usage: sai project list", "Lists registered projects"}},
+		{args: []string{"project", "show", "-h"}, wants: []string{"usage: sai project show", "--project id", "nearest registered ancestor"}},
+		{args: []string{"help", "project", "show"}, wants: []string{"usage: sai project show", "--project id", "nearest registered ancestor"}},
+	} {
+		t.Run(strings.Join(tt.args, " "), func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			code := RunWithGetwd(tt.args, &stdout, &stderr, func() (string, error) {
+				return "", errors.New("getwd should not be called")
+			})
+			if code != 0 {
+				t.Fatalf("RunWithGetwd(%v) code = %d, stderr = %s", tt.args, code, stderr.String())
+			}
+			if stderr.String() != "" {
+				t.Fatalf("stderr = %q, want empty", stderr.String())
+			}
+			out := stdout.String()
+			for _, want := range tt.wants {
+				if !strings.Contains(out, want) {
+					t.Fatalf("stdout = %q, want contain %q", out, want)
+				}
+			}
+			if strings.Contains(out, "remove") {
+				t.Fatalf("project help mentioned unimplemented remove:\n%s", out)
+			}
+		})
+	}
+}
+
+func TestProjectCreateUsesEffectiveCWDAndPrintsMetadata(t *testing.T) {
+	registryPath := isolateCLIUserRegistry(t)
+	projectDir := t.TempDir()
+	canonicalRoot, err := projectstore.CanonicalRoot(projectDir)
+	if err != nil {
+		t.Fatalf("CanonicalRoot(%q) error = %v", projectDir, err)
+	}
+	createdAt := time.Date(2026, 7, 4, 1, 2, 3, 0, time.UTC)
+
+	authSeen := make(chan string, 1)
+	bodySeen := make(chan map[string]any, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/health":
+			writeCLIJSON(w, http.StatusOK, map[string]any{"status": "ok"})
+		case r.URL.Path == "/projects" && r.Method == http.MethodPost:
+			authSeen <- r.Header.Get("Authorization")
+			data, err := io.ReadAll(r.Body)
+			if err != nil {
+				t.Fatalf("ReadAll(project create body) error = %v", err)
+			}
+			bodySeen <- decodeCLIJSON(t, data)
+			writeCLIJSON(w, http.StatusCreated, map[string]any{
+				"id":           "project-current",
+				"root":         canonicalRoot,
+				"display_name": "Current Repo",
+				"archived":     false,
+				"created_at":   createdAt,
+				"updated_at":   createdAt,
+			})
+		default:
+			t.Fatalf("unexpected path %s %q", r.Method, r.URL.Path)
+		}
+	}))
+	defer server.Close()
+	registerCLIFakeServer(t, registryPath, projectDir, server.URL, "registry-token")
+
+	var stdout, stderr bytes.Buffer
+	code := RunWithGetwd([]string{"project", "create", "--name", "Current Repo"}, &stdout, &stderr, func() (string, error) {
+		return projectDir, nil
+	})
+
+	if code != 0 {
+		t.Fatalf("RunWithGetwd(project create) code = %d, stderr = %s", code, stderr.String())
+	}
+	if stderr.String() != "" {
+		t.Fatalf("stderr = %q, want empty", stderr.String())
+	}
+	select {
+	case got := <-authSeen:
+		if got != "Bearer registry-token" {
+			t.Fatalf("Authorization = %q, want bearer token", got)
+		}
+	default:
+		t.Fatal("POST /projects was not called")
+	}
+	body := <-bodySeen
+	if body["root"] != canonicalRoot || body["display_name"] != "Current Repo" {
+		t.Fatalf("project create body = %#v, want canonical root and display name", body)
+	}
+	assertCLIOutputContains(t, stdout.String(),
+		"ID\tproject-current\n",
+		"ROOT\t"+canonicalRoot+"\n",
+		"NAME\tCurrent Repo\n",
+		"ARCHIVED\tfalse\n",
+		"CREATED_AT\t2026-07-04T01:02:03Z\n",
+		"UPDATED_AT\t2026-07-04T01:02:03Z\n",
+	)
+}
+
+func TestProjectCreateWithCWDPrintsDuplicateExistingMetadata(t *testing.T) {
+	registryPath := isolateCLIUserRegistry(t)
+	baseDir := t.TempDir()
+	projectDir := filepath.Join(baseDir, "repo")
+	if err := os.MkdirAll(projectDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll(projectDir) error = %v", err)
+	}
+	canonicalRoot, err := projectstore.CanonicalRoot(projectDir)
+	if err != nil {
+		t.Fatalf("CanonicalRoot(%q) error = %v", projectDir, err)
+	}
+	createdAt := time.Date(2026, 7, 4, 2, 0, 0, 0, time.UTC)
+
+	statusSeen := make(chan int, 1)
+	bodySeen := make(chan map[string]any, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/health":
+			writeCLIJSON(w, http.StatusOK, map[string]any{"status": "ok"})
+		case r.URL.Path == "/projects" && r.Method == http.MethodPost:
+			data, err := io.ReadAll(r.Body)
+			if err != nil {
+				t.Fatalf("ReadAll(project create body) error = %v", err)
+			}
+			bodySeen <- decodeCLIJSON(t, data)
+			statusSeen <- http.StatusOK
+			writeCLIJSON(w, http.StatusOK, map[string]any{
+				"id":           "project-existing",
+				"root":         canonicalRoot,
+				"display_name": "Existing Repo",
+				"archived":     false,
+				"created_at":   createdAt,
+				"updated_at":   createdAt,
+			})
+		default:
+			t.Fatalf("unexpected path %s %q", r.Method, r.URL.Path)
+		}
+	}))
+	defer server.Close()
+	registerCLIFakeServer(t, registryPath, baseDir, server.URL, "registry-token")
+
+	var stdout, stderr bytes.Buffer
+	code := RunWithGetwd([]string{"project", "create", "--cwd", "repo", "--name", "Ignored Duplicate Name"}, &stdout, &stderr, func() (string, error) {
+		return baseDir, nil
+	})
+
+	if code != 0 {
+		t.Fatalf("RunWithGetwd(project create duplicate) code = %d, stderr = %s", code, stderr.String())
+	}
+	if got := <-statusSeen; got != http.StatusOK {
+		t.Fatalf("duplicate response status marker = %d, want 200", got)
+	}
+	body := <-bodySeen
+	if body["root"] != canonicalRoot || body["display_name"] != "Ignored Duplicate Name" {
+		t.Fatalf("project create duplicate body = %#v, want canonical root and requested name", body)
+	}
+	assertCLIOutputContains(t, stdout.String(),
+		"ID\tproject-existing\n",
+		"ROOT\t"+canonicalRoot+"\n",
+		"NAME\tExisting Repo\n",
+	)
+	if stderr.String() != "" {
+		t.Fatalf("stderr = %q, want empty", stderr.String())
+	}
+}
+
+func TestProjectListAndShowUseProjectAPI(t *testing.T) {
+	registryPath := isolateCLIUserRegistry(t)
+	parentDir := t.TempDir()
+	childDir := filepath.Join(parentDir, "child")
+	leafDir := filepath.Join(childDir, "leaf")
+	if err := os.MkdirAll(leafDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll(leafDir) error = %v", err)
+	}
+	parentRoot, err := projectstore.CanonicalRoot(parentDir)
+	if err != nil {
+		t.Fatalf("CanonicalRoot(parent) error = %v", err)
+	}
+	childRoot, err := projectstore.CanonicalRoot(childDir)
+	if err != nil {
+		t.Fatalf("CanonicalRoot(child) error = %v", err)
+	}
+	createdAt := time.Date(2026, 7, 4, 3, 0, 0, 0, time.UTC)
+	updatedAt := time.Date(2026, 7, 4, 3, 1, 0, 0, time.UTC)
+
+	listAuthSeen := make(chan string, 3)
+	detailAuthSeen := make(chan string, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/health":
+			writeCLIJSON(w, http.StatusOK, map[string]any{"status": "ok"})
+		case r.URL.Path == "/projects" && r.Method == http.MethodGet:
+			listAuthSeen <- r.Header.Get("Authorization")
+			writeCLIJSON(w, http.StatusOK, map[string]any{
+				"projects": []map[string]any{
+					{
+						"id":           "project-parent",
+						"root":         parentRoot,
+						"display_name": "Parent",
+						"archived":     false,
+						"created_at":   createdAt,
+						"updated_at":   updatedAt,
+					},
+					{
+						"id":           "project-child",
+						"root":         childRoot,
+						"display_name": "Child",
+						"archived":     false,
+						"created_at":   createdAt,
+						"updated_at":   updatedAt,
+					},
+				},
+			})
+		case r.URL.Path == "/projects/project-child" && r.Method == http.MethodGet:
+			detailAuthSeen <- r.Header.Get("Authorization")
+			writeCLIJSON(w, http.StatusOK, map[string]any{
+				"id":           "project-child",
+				"root":         childRoot,
+				"display_name": "Child",
+				"archived":     false,
+				"created_at":   createdAt,
+				"updated_at":   updatedAt,
+			})
+		default:
+			t.Fatalf("unexpected path %s %q", r.Method, r.URL.Path)
+		}
+	}))
+	defer server.Close()
+	registerCLIFakeServer(t, registryPath, parentDir, server.URL, "registry-token")
+
+	var stdout, stderr bytes.Buffer
+	code := RunWithGetwd([]string{"project", "list"}, &stdout, &stderr, func() (string, error) {
+		return leafDir, nil
+	})
+	if code != 0 {
+		t.Fatalf("project list code = %d, stderr = %s", code, stderr.String())
+	}
+	assertCLIOutputContains(t, stdout.String(),
+		"ID\tROOT\tNAME\tARCHIVED\tUPDATED\n",
+		"project-parent\t"+parentRoot+"\tParent\tfalse\t2026-07-04T03:01:00Z\n",
+		"project-child\t"+childRoot+"\tChild\tfalse\t2026-07-04T03:01:00Z\n",
+	)
+
+	stdout.Reset()
+	stderr.Reset()
+	code = RunWithGetwd([]string{"project", "show", "--project", "project-child"}, &stdout, &stderr, func() (string, error) {
+		return leafDir, nil
+	})
+	if code != 0 {
+		t.Fatalf("project show --project code = %d, stderr = %s", code, stderr.String())
+	}
+	assertCLIOutputContains(t, stdout.String(), "ID\tproject-child\n", "ROOT\t"+childRoot+"\n", "NAME\tChild\n")
+
+	stdout.Reset()
+	stderr.Reset()
+	code = RunWithGetwd([]string{"project", "show"}, &stdout, &stderr, func() (string, error) {
+		return leafDir, nil
+	})
+	if code != 0 {
+		t.Fatalf("project show nearest code = %d, stderr = %s", code, stderr.String())
+	}
+	assertCLIOutputContains(t, stdout.String(), "ID\tproject-child\n", "ROOT\t"+childRoot+"\n", "NAME\tChild\n")
+	if strings.Contains(stdout.String(), "project-parent") {
+		t.Fatalf("project show nearest chose parent instead of child:\n%s", stdout.String())
+	}
+
+	for i := 0; i < 2; i++ {
+		select {
+		case got := <-listAuthSeen:
+			if got != "Bearer registry-token" {
+				t.Fatalf("GET /projects Authorization = %q, want bearer token", got)
+			}
+		default:
+			t.Fatalf("GET /projects was called %d times, want at least 2", i)
+		}
+	}
+	select {
+	case got := <-detailAuthSeen:
+		if got != "Bearer registry-token" {
+			t.Fatalf("GET /projects/{id} Authorization = %q, want bearer token", got)
+		}
+	default:
+		t.Fatal("GET /projects/project-child was not called")
+	}
+	if stderr.String() != "" {
+		t.Fatalf("stderr = %q, want empty", stderr.String())
+	}
+}
+
+func TestProjectShowRejectsCWD(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	code := RunWithGetwd([]string{"project", "show", "--cwd", t.TempDir()}, &stdout, &stderr, func() (string, error) {
+		return "", errors.New("getwd should not be called")
+	})
+
+	if code != 1 {
+		t.Fatalf("project show --cwd code = %d, want 1", code)
+	}
+	if stdout.String() != "" {
+		t.Fatalf("stdout = %q, want empty", stdout.String())
+	}
+	assertCLIErrorContains(t, stderr.String(), "flag provided but not defined: -cwd", `Run "sai help project show" for usage.`)
+}
+
+func TestProjectListAutoStartsSingletonServerWithoutStartupOutput(t *testing.T) {
+	registryPath := isolateCLIUserRegistry(t)
+	projectDir := t.TempDir()
+	writeCLIFixtureInDir(t, filepath.Join(projectDir, ".agents"))
+
+	authSeen := make(chan string, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/health":
+			writeCLIJSON(w, http.StatusOK, map[string]any{"status": "ok"})
+		case "/projects":
+			authSeen <- r.Header.Get("Authorization")
+			writeCLIJSON(w, http.StatusOK, map[string]any{"projects": []map[string]any{}})
+		default:
+			t.Fatalf("unexpected path %q", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	oldStart := startBackgroundServerProcess
+	childArgsCh := make(chan []string, 1)
+	waitDone := make(chan struct{})
+	var closeWait sync.Once
+	startBackgroundServerProcess = func(ctx context.Context, args []string) (*backgroundServerProcess, error) {
+		childArgsCh <- append([]string(nil), args...)
+		addr := strings.TrimPrefix(server.URL, "http://")
+		if err := localserver.NewRegistryStore(registryPath).Upsert(localserver.RegistryRecord{
+			CWD:             projectDir,
+			ConfigPath:      filepath.Join(projectDir, ".agents", "sai.yaml"),
+			Addr:            addr,
+			PID:             4321,
+			Token:           "auto-token",
+			StartedAt:       time.Date(2026, 7, 4, 4, 0, 0, 0, time.UTC),
+			Version:         "test-version",
+			RequestedListen: localserver.DefaultListenAddress,
+		}); err != nil {
+			return nil, err
+		}
+		return &backgroundServerProcess{
+			PID: 4321,
+			wait: func() error {
+				<-waitDone
+				return nil
+			},
+			kill: func() error {
+				closeWait.Do(func() { close(waitDone) })
+				return nil
+			},
+		}, nil
+	}
+	t.Cleanup(func() {
+		startBackgroundServerProcess = oldStart
+		closeWait.Do(func() { close(waitDone) })
+	})
+
+	var stdout, stderr bytes.Buffer
+	code := RunWithGetwd([]string{"project", "list"}, &stdout, &stderr, func() (string, error) {
+		return projectDir, nil
+	})
+
+	if code != 0 {
+		t.Fatalf("project list auto-start code = %d, stderr = %s", code, stderr.String())
+	}
+	if stderr.String() != "" {
+		t.Fatalf("stderr = %q, want empty", stderr.String())
+	}
+	if got := stdout.String(); got != "ID\tROOT\tNAME\tARCHIVED\tUPDATED\n" {
+		t.Fatalf("stdout = %q, want project list only", got)
+	}
+	childArgs := <-childArgsCh
+	assertCLIFlagValue(t, childArgs, "--home", mustCLICanonicalPath(t, filepath.Dir(filepath.Dir(registryPath))))
+	assertCLIFlagValue(t, childArgs, "--config", filepath.Join(projectDir, ".agents", "sai.yaml"))
+	assertCLIFlagValue(t, childArgs, "--cwd", projectDir)
+	select {
+	case got := <-authSeen:
+		if got != "Bearer auto-token" {
+			t.Fatalf("GET /projects Authorization = %q, want auto-start token", got)
+		}
+	default:
+		t.Fatal("GET /projects was not called")
 	}
 }
 
