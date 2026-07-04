@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -159,7 +160,7 @@ func TestRegistryStoreUpsertReplacesSingleton(t *testing.T) {
 	if len(records) != 1 {
 		t.Fatalf("List() returned %d records, want 1 singleton: %#v", len(records), records)
 	}
-	if records[0].Addr != replacement.Addr || records[0].PID != replacement.PID || records[0].Token != replacement.Token {
+	if records[0].BaseURL != replacement.BaseURL || records[0].PID != replacement.PID || records[0].Token != replacement.Token {
 		t.Fatalf("first record = %#v, want replacement values", records[0])
 	}
 	if records[0].RequestedListen != "127.0.0.1:8787" {
@@ -242,8 +243,58 @@ func TestRegistryStoreSaveReplacesExistingFile(t *testing.T) {
 	if len(records) != 1 {
 		t.Fatalf("Load() returned %d records, want 1: %#v", len(records), records)
 	}
-	if records[0].Addr != "127.0.0.1:2002" || records[0].PID != 2002 || records[0].Token != "token-two" {
+	if records[0].BaseURL != "127.0.0.1:2002" || records[0].PID != 2002 || records[0].Token != "token-two" {
 		t.Fatalf("record after replacement = %#v, want second Save contents", records[0])
+	}
+}
+
+func TestRegistryStoreSerializesBaseURLField(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "servers.json")
+	store := NewRegistryStore(path)
+	root := t.TempDir()
+	record := testRegistryRecord(root, filepath.Join(root, ".agents", "sai.yaml"), "127.0.0.1:2222", 2222, "token-base-url")
+
+	if err := store.Save([]RegistryRecord{record}); err != nil {
+		t.Fatalf("Save() error = %v", err)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile() error = %v", err)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		t.Fatalf("Unmarshal() error = %v; raw=%s", err, raw)
+	}
+	if got := payload["base_url"]; got != "127.0.0.1:2222" {
+		t.Fatalf("base_url = %#v, want host:port value in %s", got, raw)
+	}
+	if _, ok := payload["addr"]; ok {
+		t.Fatalf("registry JSON contains old addr field: %s", raw)
+	}
+	for _, key := range []string{"pid", "base_url", "token", "version", "started_at"} {
+		if _, ok := payload[key]; !ok {
+			t.Fatalf("registry JSON missing %q field: %s", key, raw)
+		}
+	}
+
+	records, err := store.Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if len(records) != 1 || records[0].BaseURL != "127.0.0.1:2222" {
+		t.Fatalf("Load() records = %#v, want base_url loaded", records)
+	}
+
+	fromJSON := filepath.Join(t.TempDir(), "registry.json")
+	if err := os.WriteFile(fromJSON, raw, 0o600); err != nil {
+		t.Fatalf("WriteFile(base_url registry) error = %v", err)
+	}
+	loaded, err := NewRegistryStore(fromJSON).Load()
+	if err != nil {
+		t.Fatalf("Load(base_url JSON) error = %v", err)
+	}
+	if len(loaded) != 1 || loaded[0].BaseURL != "127.0.0.1:2222" {
+		t.Fatalf("Load(base_url JSON) = %#v, want base_url record", loaded)
 	}
 }
 
@@ -439,7 +490,7 @@ func testRegistryRecord(cwd, configPath, addr string, pid int, token string) Reg
 	return RegistryRecord{
 		CWD:        cwd,
 		ConfigPath: configPath,
-		Addr:       addr,
+		BaseURL:    addr,
 		PID:        pid,
 		Token:      token,
 		StartedAt:  time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC),

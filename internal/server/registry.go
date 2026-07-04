@@ -20,11 +20,13 @@ const (
 	registryTokenBytes      = 32
 )
 
-// RegistryRecord describes one locally running server in the per-user registry.
+// RegistryRecord describes the namespace singleton server in the per-user registry.
+// BaseURL currently stores the existing host:port value used by local clients;
+// only the registry JSON field name is base_url in this slice.
 type RegistryRecord struct {
 	CWD             string    `json:"cwd"`
 	ConfigPath      string    `json:"config_path"`
-	Addr            string    `json:"addr"`
+	BaseURL         string    `json:"base_url"`
 	PID             int       `json:"pid"`
 	Token           string    `json:"token"`
 	StartedAt       time.Time `json:"started_at"`
@@ -202,7 +204,7 @@ func CanonicalizeRegistryRecord(record RegistryRecord) (RegistryRecord, error) {
 	}
 	record.CWD = identity.CWD
 	record.ConfigPath = identity.ConfigPath
-	record.Addr = strings.TrimSpace(record.Addr)
+	record.BaseURL = strings.TrimSpace(record.BaseURL)
 	record.Token = strings.TrimSpace(record.Token)
 	record.Version = strings.TrimSpace(record.Version)
 	record.RequestedListen = strings.TrimSpace(record.RequestedListen)

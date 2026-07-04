@@ -1254,7 +1254,7 @@ func runServerForeground(ctx context.Context, launch serverLaunch, stdout io.Wri
 	record := localserver.RegistryRecord{
 		CWD:             info.CWD,
 		ConfigPath:      info.ConfigPath,
-		Addr:            info.Addr,
+		BaseURL:         info.Addr,
 		PID:             info.PID,
 		Token:           token,
 		StartedAt:       info.StartedAt,
@@ -1293,7 +1293,7 @@ func runServerBackgroundParent(ctx context.Context, launch serverLaunch, stdout 
 	if err != nil {
 		return err
 	}
-	_, err = fmt.Fprintf(stdout, "SERVER_ADDR\t%s\n", record.Addr)
+	_, err = fmt.Fprintf(stdout, "SERVER_ADDR\t%s\n", record.BaseURL)
 	return err
 }
 
@@ -1440,7 +1440,7 @@ func findBackgroundReadyRecord(ctx context.Context, store localserver.RegistrySt
 	if normalized.RequestedListen != listen {
 		return localserver.RegistryRecord{}, false, nil
 	}
-	if err := localserver.CheckHealth(ctx, normalized.Addr, 300*time.Millisecond); err != nil {
+	if err := localserver.CheckHealth(ctx, normalized.BaseURL, 300*time.Millisecond); err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return localserver.RegistryRecord{}, false, ctxErr
 		}
@@ -1462,7 +1462,7 @@ func checkExistingServerRecord(ctx context.Context, store localserver.RegistrySt
 	if err != nil {
 		return false, err
 	}
-	if err := localserver.CheckHealth(ctx, normalized.Addr, 300*time.Millisecond); err != nil {
+	if err := localserver.CheckHealth(ctx, normalized.BaseURL, 300*time.Millisecond); err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return false, ctxErr
 		}
@@ -1471,7 +1471,7 @@ func checkExistingServerRecord(ctx context.Context, store localserver.RegistrySt
 		}
 		return false, nil
 	}
-	_, err = fmt.Fprintf(stdout, "SERVER_ALREADY_RUNNING\taddr=%s\tpid=%d\n", normalized.Addr, normalized.PID)
+	_, err = fmt.Fprintf(stdout, "SERVER_ALREADY_RUNNING\taddr=%s\tpid=%d\n", normalized.BaseURL, normalized.PID)
 	return true, err
 }
 
@@ -1548,7 +1548,7 @@ func projectCreateCommand(ctx context.Context, args []string, configPath, homePa
 	if err != nil {
 		return err
 	}
-	result, err := localserver.CreateProjectWithToken(ctx, record.Addr, record.Token, root, *nameFlag, serverClientTimeout)
+	result, err := localserver.CreateProjectWithToken(ctx, record.BaseURL, record.Token, root, *nameFlag, serverClientTimeout)
 	if err != nil {
 		return err
 	}
@@ -1573,7 +1573,7 @@ func projectListCommand(ctx context.Context, args []string, configPath, homePath
 	if err != nil {
 		return err
 	}
-	projects, err := localserver.ListProjectsWithToken(ctx, record.Addr, record.Token, serverClientTimeout)
+	projects, err := localserver.ListProjectsWithToken(ctx, record.BaseURL, record.Token, serverClientTimeout)
 	if err != nil {
 		return err
 	}
@@ -1600,14 +1600,14 @@ func projectShowCommand(ctx context.Context, args []string, configPath, homePath
 		return err
 	}
 	if strings.TrimSpace(*projectID) != "" {
-		project, err := localserver.GetProjectWithToken(ctx, record.Addr, record.Token, *projectID, serverClientTimeout)
+		project, err := localserver.GetProjectWithToken(ctx, record.BaseURL, record.Token, *projectID, serverClientTimeout)
 		if err != nil {
 			return err
 		}
 		return printProjectInfo(stdout, project)
 	}
 
-	projects, err := localserver.ListProjectsWithToken(ctx, record.Addr, record.Token, serverClientTimeout)
+	projects, err := localserver.ListProjectsWithToken(ctx, record.BaseURL, record.Token, serverClientTimeout)
 	if err != nil {
 		return err
 	}
@@ -1827,7 +1827,7 @@ func sessionListCommand(ctx context.Context, args []string, configPath, homePath
 		if err != nil {
 			return err
 		}
-		infos, err := localserver.ListSessions(ctx, record.Addr, record.Token, serverClientTimeout)
+		infos, err := localserver.ListSessions(ctx, record.BaseURL, record.Token, serverClientTimeout)
 		if err != nil {
 			return err
 		}
@@ -1860,7 +1860,7 @@ func sessionListCommand(ctx context.Context, args []string, configPath, homePath
 		}
 	}
 
-	infos, err := localserver.ListProjectSessionsWithToken(ctx, record.Addr, record.Token, project, serverClientTimeout)
+	infos, err := localserver.ListProjectSessionsWithToken(ctx, record.BaseURL, record.Token, project, serverClientTimeout)
 	if err != nil {
 		return err
 	}
@@ -1881,7 +1881,7 @@ func sessionShowCommand(ctx context.Context, args []string, configPath, homePath
 	if err != nil {
 		return err
 	}
-	session, err := localserver.GetSessionDetail(ctx, record.Addr, record.Token, positionals[0], serverClientTimeout)
+	session, err := localserver.GetSessionDetail(ctx, record.BaseURL, record.Token, positionals[0], serverClientTimeout)
 	if err != nil {
 		return err
 	}
@@ -1889,7 +1889,7 @@ func sessionShowCommand(ctx context.Context, args []string, configPath, homePath
 }
 
 func nearestProject(ctx context.Context, record localserver.RegistryRecord, cwd string) (localserver.ProjectInfo, bool, error) {
-	projects, err := localserver.ListProjectsWithToken(ctx, record.Addr, record.Token, serverClientTimeout)
+	projects, err := localserver.ListProjectsWithToken(ctx, record.BaseURL, record.Token, serverClientTimeout)
 	if err != nil {
 		return localserver.ProjectInfo{}, false, err
 	}
@@ -1921,7 +1921,7 @@ func createProjectSessionForCWD(ctx context.Context, configPath, homePath, creat
 	}
 	defaults.CreatedCWD = creationCWD
 	metadata := sessionCreateMetadataFromDefaults(defaults)
-	session, err := localserver.CreateProjectSessionWithMetadataWithToken(ctx, record.Addr, record.Token, project.ID, metadata, serverClientTimeout)
+	session, err := localserver.CreateProjectSessionWithMetadataWithToken(ctx, record.BaseURL, record.Token, project.ID, metadata, serverClientTimeout)
 	if err != nil {
 		return localserver.RegistryRecord{}, localserver.SessionDetail{}, err
 	}
@@ -2005,7 +2005,7 @@ func statusCommand(ctx context.Context, args []string, homePath string, stdout i
 		return noServerFoundError(cwd)
 	}
 
-	status, err := localserver.GetServerStatus(ctx, discovery.Record.Addr, discovery.Record.Token, serverClientTimeout)
+	status, err := localserver.GetServerStatus(ctx, discovery.Record.BaseURL, discovery.Record.Token, serverClientTimeout)
 	if err != nil {
 		return err
 	}
@@ -2044,29 +2044,29 @@ func stopCommand(ctx context.Context, args []string, homePath string, stdout io.
 	}
 
 	record := discovery.Record
-	if err := localserver.ShutdownServerWithToken(ctx, record.Addr, record.Token, serverClientTimeout); err != nil {
+	if err := localserver.ShutdownServerWithToken(ctx, record.BaseURL, record.Token, serverClientTimeout); err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return ctxErr
 		}
-		if healthErr := localserver.CheckHealth(ctx, record.Addr, serverClientTimeout); healthErr != nil {
+		if healthErr := localserver.CheckHealth(ctx, record.BaseURL, serverClientTimeout); healthErr != nil {
 			if ctxErr := ctx.Err(); ctxErr != nil {
 				return ctxErr
 			}
 			if _, removeErr := store.RemoveIdentity(record.Identity()); removeErr != nil {
 				return removeErr
 			}
-			_, writeErr := fmt.Fprintf(stdout, "SERVER_STOPPED\taddr=%s\tpid=%d\n", record.Addr, record.PID)
+			_, writeErr := fmt.Fprintf(stdout, "SERVER_STOPPED\taddr=%s\tpid=%d\n", record.BaseURL, record.PID)
 			return writeErr
 		}
 		return err
 	}
-	if err := waitForServerStop(ctx, record.Addr); err != nil {
+	if err := waitForServerStop(ctx, record.BaseURL); err != nil {
 		return err
 	}
 	if _, err := store.RemoveIdentity(record.Identity()); err != nil {
 		return err
 	}
-	_, err = fmt.Fprintf(stdout, "SERVER_STOPPED\taddr=%s\tpid=%d\n", record.Addr, record.PID)
+	_, err = fmt.Fprintf(stdout, "SERVER_STOPPED\taddr=%s\tpid=%d\n", record.BaseURL, record.PID)
 	return err
 }
 
@@ -2098,14 +2098,14 @@ func serversListCommand(ctx context.Context, args []string, homePath string, std
 		if err != nil {
 			return fmt.Errorf("canonicalize registry record %d: %w", i, err)
 		}
-		if err := localserver.CheckHealth(ctx, normalized.Addr, serverListHealthTimeout); err != nil {
+		if err := localserver.CheckHealth(ctx, normalized.BaseURL, serverListHealthTimeout); err != nil {
 			if ctxErr := ctx.Err(); ctxErr != nil {
 				return ctxErr
 			}
 			stale = append(stale, normalized.Identity())
 			continue
 		}
-		if _, err := fmt.Fprintf(stdout, "%s\t%s\t%s\t%d\t%s\thealthy\n", normalized.CWD, normalized.ConfigPath, normalized.Addr, normalized.PID, normalized.Version); err != nil {
+		if _, err := fmt.Fprintf(stdout, "%s\t%s\t%s\t%d\t%s\thealthy\n", normalized.CWD, normalized.ConfigPath, normalized.BaseURL, normalized.PID, normalized.Version); err != nil {
 			return err
 		}
 	}
@@ -2149,7 +2149,7 @@ func attachCommand(ctx context.Context, args []string, configPath string, config
 		record = detailRecord
 		sessionID = strings.TrimSpace(detail.ID)
 		if sessionID == "" {
-			return fmt.Errorf("create session at %s: response missing session id", record.Addr)
+			return fmt.Errorf("create session at %s: response missing session id", record.BaseURL)
 		}
 	} else if len(positionals) == 1 {
 		var err error
@@ -2181,7 +2181,7 @@ func attachCommand(ctx context.Context, args []string, configPath string, config
 		}
 	}
 
-	events, streamErrs, closeStream, err := localserver.StreamSessionEvents(ctx, record.Addr, record.Token, sessionID, serverClientTimeout)
+	events, streamErrs, closeStream, err := localserver.StreamSessionEvents(ctx, record.BaseURL, record.Token, sessionID, serverClientTimeout)
 	if err != nil {
 		return err
 	}
@@ -2204,7 +2204,7 @@ func mostRecentProjectSessionID(ctx context.Context, record localserver.Registry
 	if !ok {
 		return "", fmt.Errorf("no registered project found from %s; run %q", effectiveCWD, program+" project create")
 	}
-	infos, err := localserver.ListProjectSessionsWithToken(ctx, record.Addr, record.Token, project.ID, serverClientTimeout)
+	infos, err := localserver.ListProjectSessionsWithToken(ctx, record.BaseURL, record.Token, project.ID, serverClientTimeout)
 	if err != nil {
 		return "", err
 	}
@@ -2294,7 +2294,7 @@ func runAttachREPL(ctx context.Context, record localserver.RegistryRecord, sessi
 				return nil
 			}
 			if !input.multiline && command == "/compact" {
-				if _, err := localserver.CompactSessionWithToken(ctx, record.Addr, record.Token, sessionID, 0); err != nil {
+				if _, err := localserver.CompactSessionWithToken(ctx, record.BaseURL, record.Token, sessionID, 0); err != nil {
 					if _, printErr := fmt.Fprintf(stderr, "sai: compact failed: %v\n", err); printErr != nil {
 						return printErr
 					}
@@ -2315,7 +2315,7 @@ func runAttachREPL(ctx context.Context, record localserver.RegistryRecord, sessi
 			terminalSeen = false
 			terminalTurnIDs = make(map[string]bool)
 			go func() {
-				result, err := localserver.SendSessionMessageWithToken(ctx, record.Addr, record.Token, sessionID, prompt, 0)
+				result, err := localserver.SendSessionMessageWithToken(ctx, record.BaseURL, record.Token, sessionID, prompt, 0)
 				done <- attachSendResult{result: result, err: err}
 			}()
 		case sendResult := <-sendDone:
@@ -2474,7 +2474,7 @@ func sendCommand(ctx context.Context, args []string, configPath string, configPr
 		record = detailRecord
 		sessionID = strings.TrimSpace(detail.ID)
 		if sessionID == "" {
-			return fmt.Errorf("create session at %s: response missing session id", record.Addr)
+			return fmt.Errorf("create session at %s: response missing session id", record.BaseURL)
 		}
 	} else {
 		var err error
@@ -2496,7 +2496,7 @@ func sendCommand(ctx context.Context, args []string, configPath string, configPr
 		}
 	}
 
-	result, err := localserver.SendSessionMessageWithToken(ctx, record.Addr, record.Token, sessionID, *prompt, 0)
+	result, err := localserver.SendSessionMessageWithToken(ctx, record.BaseURL, record.Token, sessionID, *prompt, 0)
 	if err != nil {
 		return err
 	}
@@ -3178,7 +3178,7 @@ func sessionsListCommand(ctx context.Context, args []string, homePath string, st
 	if err != nil {
 		return err
 	}
-	infos, err := localserver.ListSessions(ctx, record.Addr, record.Token, serverClientTimeout)
+	infos, err := localserver.ListSessions(ctx, record.BaseURL, record.Token, serverClientTimeout)
 	if err != nil {
 		return err
 	}
@@ -3201,7 +3201,7 @@ func sessionsShowCommand(ctx context.Context, args []string, homePath string, st
 	if err != nil {
 		return err
 	}
-	session, err := localserver.GetSessionDetail(ctx, record.Addr, record.Token, positionals[0], serverClientTimeout)
+	session, err := localserver.GetSessionDetail(ctx, record.BaseURL, record.Token, positionals[0], serverClientTimeout)
 	if err != nil {
 		return err
 	}

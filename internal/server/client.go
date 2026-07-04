@@ -142,7 +142,7 @@ func DiscoverHealthy(ctx context.Context, store RegistryStore, startCWD string, 
 	if err != nil {
 		return result, err
 	}
-	if err := CheckHealth(ctx, record.Addr, timeout); err != nil {
+	if err := CheckHealth(ctx, record.BaseURL, timeout); err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return result, ctxErr
 		}

@@ -1462,7 +1462,7 @@ func TestProjectListAutoStartsSingletonServerWithoutStartupOutput(t *testing.T) 
 		if err := localserver.NewRegistryStore(registryPath).Upsert(localserver.RegistryRecord{
 			CWD:             projectDir,
 			ConfigPath:      filepath.Join(projectDir, ".agents", "sai.yaml"),
-			Addr:            addr,
+			BaseURL:         addr,
 			PID:             4321,
 			Token:           "auto-token",
 			StartedAt:       time.Date(2026, 7, 4, 4, 0, 0, 0, time.UTC),
@@ -1999,7 +1999,7 @@ func TestSessionListAutoStartsSingletonServerWithoutStartupOutput(t *testing.T) 
 		if err := localserver.NewRegistryStore(registryPath).Upsert(localserver.RegistryRecord{
 			CWD:             projectDir,
 			ConfigPath:      filepath.Join(projectDir, ".agents", "sai.yaml"),
-			Addr:            addr,
+			BaseURL:         addr,
 			PID:             5432,
 			Token:           "auto-token",
 			StartedAt:       time.Date(2026, 7, 4, 10, 0, 0, 0, time.UTC),
@@ -2098,8 +2098,8 @@ func TestServerCommandStartsWithDefaultConfigAndShutdown(t *testing.T) {
 	if got, want := filepath.Clean(record.ConfigPath), filepath.Join(projectDir, ".agents", "sai.yaml"); got != want {
 		t.Fatalf("registry config_path = %q, want %q", got, want)
 	}
-	if record.Addr != addr {
-		t.Fatalf("registry addr = %q, want %q", record.Addr, addr)
+	if record.BaseURL != addr {
+		t.Fatalf("registry addr = %q, want %q", record.BaseURL, addr)
 	}
 	if record.PID <= 0 {
 		t.Fatalf("registry pid = %d, want positive", record.PID)
@@ -2107,7 +2107,7 @@ func TestServerCommandStartsWithDefaultConfigAndShutdown(t *testing.T) {
 	if strings.TrimSpace(record.Token) == "" {
 		t.Fatal("registry token is empty")
 	}
-	if strings.Contains(record.Addr, record.Token) {
+	if strings.Contains(record.BaseURL, record.Token) {
 		t.Fatal("registry token unexpectedly appeared in addr")
 	}
 	if record.StartedAt.IsZero() {
@@ -2217,8 +2217,8 @@ func TestServerCommandBackgroundWaitsForHealthyDiscoverableServer(t *testing.T) 
 		t.Fatalf("registry records = %#v, want one background server", records)
 	}
 	record := records[0]
-	if record.Addr != addr {
-		t.Fatalf("registry addr = %q, parent stdout addr = %q", record.Addr, addr)
+	if record.BaseURL != addr {
+		t.Fatalf("registry addr = %q, parent stdout addr = %q", record.BaseURL, addr)
 	}
 	if record.RequestedListen != "127.0.0.1:0" {
 		t.Fatalf("registry requested_listen = %q, want 127.0.0.1:0", record.RequestedListen)
@@ -2643,7 +2643,7 @@ func TestServerCommandDuplicateSameListenExitsAlreadyRunning(t *testing.T) {
 	if err != nil {
 		t.Fatalf("registry List() error = %v", err)
 	}
-	if len(records) != 1 || records[0].Addr != addr {
+	if len(records) != 1 || records[0].BaseURL != addr {
 		t.Fatalf("registry after duplicate = %#v, want original server", records)
 	}
 
@@ -2747,7 +2747,7 @@ func TestServerCommandDuplicateDifferentListenExitsAlreadyRunning(t *testing.T) 
 	if err != nil {
 		t.Fatalf("registry List() error = %v", err)
 	}
-	if len(records) != 1 || records[0].Addr != addr {
+	if len(records) != 1 || records[0].BaseURL != addr {
 		t.Fatalf("registry after conflict = %#v, want original server", records)
 	}
 
@@ -2802,7 +2802,7 @@ func TestServerCommandStaleRegistryRecordIsReplacedAndCleanedUp(t *testing.T) {
 	stale := localserver.RegistryRecord{
 		CWD:             projectDir,
 		ConfigPath:      configPath,
-		Addr:            "127.0.0.1:0",
+		BaseURL:         "127.0.0.1:0",
 		PID:             999999,
 		Token:           "stale-token",
 		StartedAt:       time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC),
@@ -2826,7 +2826,7 @@ func TestServerCommandStaleRegistryRecordIsReplacedAndCleanedUp(t *testing.T) {
 		t.Fatalf("registry records = %#v, want replacement only", records)
 	}
 	replacement := records[0]
-	if replacement.Addr != addr || replacement.Token == stale.Token || replacement.PID == stale.PID || replacement.Version == stale.Version {
+	if replacement.BaseURL != addr || replacement.Token == stale.Token || replacement.PID == stale.PID || replacement.Version == stale.Version {
 		t.Fatalf("replacement record = %#v, stale = %#v", replacement, stale)
 	}
 
@@ -3098,7 +3098,7 @@ func TestStopSendsRegistryToken(t *testing.T) {
 	if err := store.Upsert(localserver.RegistryRecord{
 		CWD:             projectDir,
 		ConfigPath:      configPath,
-		Addr:            addr,
+		BaseURL:         addr,
 		PID:             1234,
 		Token:           "registry-token",
 		StartedAt:       time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC),
@@ -3145,7 +3145,7 @@ func TestStopCleansStaleRegistryRecord(t *testing.T) {
 	stale := localserver.RegistryRecord{
 		CWD:             projectDir,
 		ConfigPath:      filepath.Join(projectDir, ".agents", "sai.yaml"),
-		Addr:            "127.0.0.1:0",
+		BaseURL:         "127.0.0.1:0",
 		PID:             999999,
 		Token:           "stale-token",
 		StartedAt:       time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC),
@@ -3213,7 +3213,7 @@ func TestServersListShowsHealthySingleton(t *testing.T) {
 	if err != nil {
 		t.Fatalf("registry List() error = %v", err)
 	}
-	if len(records) != 1 || records[0].Addr != addr {
+	if len(records) != 1 || records[0].BaseURL != addr {
 		t.Fatalf("registry after servers list = %#v, want healthy record only", records)
 	}
 
@@ -12723,7 +12723,7 @@ func registerCLIFakeServer(t *testing.T, registryPath, projectDir, rawURL, token
 	if err := store.Upsert(localserver.RegistryRecord{
 		CWD:        projectDir,
 		ConfigPath: filepath.Join(projectDir, ".agents", "sai.yaml"),
-		Addr:       addr,
+		BaseURL:    addr,
 		PID:        1234,
 		Token:      token,
 		StartedAt:  time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC),
@@ -12875,7 +12875,7 @@ func cliServerTokenForAddr(t *testing.T, addr string) string {
 		t.Fatalf("registry List() error = %v", err)
 	}
 	for _, record := range records {
-		if record.Addr == addr {
+		if record.BaseURL == addr {
 			if strings.TrimSpace(record.Token) == "" {
 				t.Fatalf("registry token for %s is empty", addr)
 			}

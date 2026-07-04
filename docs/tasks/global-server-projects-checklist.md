@@ -26,7 +26,7 @@ evidence 证明。
 
 - [x] registry 默认写入 user-level home namespace。
 - [ ] durable data store 默认写入 user-level home namespace。
-- [ ] registry 记录 `pid`、`base_url`、`token`、`version` 和 `started_at`。
+- [x] registry 记录 `pid`、`base_url`、`token`、`version` 和 `started_at`。
 - [x] client 复用 registry 前 health-check。
 - [x] stale registry health-check 失败后可覆盖。
 - [ ] file lock 防止 auto-start / background start 并发双启动。
@@ -288,5 +288,8 @@ evidence 证明。
   token。
 - 2026-07-04 M21 auth hardening slice: `go test ./...` 和 `git diff --check` 通过；`git diff --check`
   仅输出工作区 LF/CRLF normalization warnings。
-- Known limits: 当前 M21 slices 未实现 project remove/archive、GUI server work、session data store home
-  migration 或 registry `base_url` schema rename。
+- 2026-07-04 M21 registry base_url slice: `go test ./internal/server` 通过；覆盖 registry JSON
+  写入 `base_url`、不写旧 `addr`，并确认 `pid`、`base_url`、`token`、`version`、`started_at`
+  字段存在。registry load 使用 `base_url`；`/server` status response 仍保留独立的 `addr` 字段。
+- Known limits: 当前 M21 slices 未实现 project remove/archive、GUI server work 或 session data store home
+  migration。
