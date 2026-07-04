@@ -607,11 +607,13 @@ Discovers the nearest healthy local server from the current directory, or from
 --cwd when provided, and prints server status.
 `
 
-const stopUsageText = `usage: sai stop [--cwd path]
+const stopUsageText = `usage: sai stop [--cwd path] [--wait] [--timeout-ms N]
 
 Discovers the nearest local server from the current directory, or from --cwd
-when provided, asks it to shut down, and removes its registry record. Sessions,
-logs, and blobs are not deleted.
+when provided, asks it to shut down, and removes its registry record. By
+default shutdown is immediate and cancels running turns. --wait drains already
+started turns before shutdown; --timeout-ms bounds that wait before falling
+back to immediate shutdown. Sessions, logs, and blobs are not deleted.
 `
 
 const serversUsageText = `usage: sai servers <command>
@@ -2313,12 +2315,20 @@ func statusCommand(ctx context.Context, args []string, homePath string, stdout i
 func stopCommand(ctx context.Context, args []string, homePath string, stdout io.Writer, getwd func() (string, error), command string) error {
 	flags := flag.NewFlagSet("sai stop", flag.ContinueOnError)
 	cwdFlag := flags.String("cwd", "", "discovery working directory")
+	waitFlag := flags.Bool("wait", false, "wait for running turns to finish")
+	timeoutMSFlag := flags.Int("timeout-ms", 0, "maximum drain wait in milliseconds")
 	positionals, done, err := parseCommandFlagArgs(flags, args, stdout, printStopUsage, command, "sai help stop")
 	if done || err != nil {
 		return err
 	}
 	if len(positionals) != 0 {
-		return usageError("usage: sai stop [--cwd path]", "", "sai help stop")
+		return usageError("usage: sai stop [--cwd path] [--wait] [--timeout-ms N]", "", "sai help stop")
+	}
+	if *timeoutMSFlag < 0 {
+		return usageError("--timeout-ms must be non-negative", "", "sai help stop")
+	}
+	if *timeoutMSFlag > 0 && !*waitFlag {
+		return usageError("--timeout-ms requires --wait", "", "sai help stop")
 	}
 
 	cwd, err := resolveClientCWD(*cwdFlag, getwd)
@@ -2342,7 +2352,18 @@ func stopCommand(ctx context.Context, args []string, homePath string, stdout io.
 	}
 
 	record := discovery.Record
-	if err := localserver.ShutdownServerWithToken(ctx, record.BaseURL, record.Token, serverClientTimeout); err != nil {
+	shutdownOptions := localserver.ShutdownOptions{Wait: *waitFlag}
+	if *timeoutMSFlag > 0 {
+		shutdownOptions.Timeout = time.Duration(*timeoutMSFlag) * time.Millisecond
+	}
+	shutdownClientTimeout := serverClientTimeout
+	if shutdownOptions.Wait {
+		shutdownClientTimeout = 0
+		if shutdownOptions.Timeout > 0 {
+			shutdownClientTimeout = shutdownOptions.Timeout + serverClientTimeout
+		}
+	}
+	if err := localserver.ShutdownServerWithOptions(ctx, record.BaseURL, record.Token, shutdownOptions, shutdownClientTimeout); err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return ctxErr
 		}

@@ -83,7 +83,14 @@ type Process struct {
 	streams         *sessionStreamHub
 	turnRunner      SessionTurnRunner
 	compactPlanner  SessionCompactPlanner
-	runningTurns    map[string]string
+	acceptingTurns  bool
+	runningTurns    map[string]runningTurn
+	turnsChanged    chan struct{}
+}
+
+type runningTurn struct {
+	turnID string
+	cancel context.CancelFunc
 }
 
 type SessionTurnRunner interface {
@@ -209,7 +216,9 @@ func Start(options Options) (*Process, error) {
 		streams:         newSessionStreamHub(),
 		turnRunner:      options.TurnRunner,
 		compactPlanner:  compactPlanner,
-		runningTurns:    make(map[string]string),
+		acceptingTurns:  true,
+		runningTurns:    make(map[string]runningTurn),
+		turnsChanged:    make(chan struct{}),
 	}
 	if process.sessionStore == nil && strings.TrimSpace(options.SessionRoot) != "" {
 		process.sessionStore = sessions.NewV2Store(options.SessionRoot)
@@ -225,6 +234,12 @@ func Start(options Options) (*Process, error) {
 	}
 	process.httpServer = &http.Server{
 		Handler: process,
+	}
+	if process.sessionStore != nil {
+		if _, err := process.sessionStore.MarkRunningTurnsInterrupted(); err != nil {
+			_ = listener.Close()
+			return nil, fmt.Errorf("recover interrupted sessions: %w", err)
+		}
 	}
 	return process, nil
 }
@@ -293,12 +308,25 @@ func (p *Process) Serve(ctx context.Context) error {
 }
 
 func (p *Process) Shutdown(ctx context.Context) error {
+	return p.shutdown(ctx, true)
+}
+
+func (p *Process) shutdown(ctx context.Context, immediate bool) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	p.shutdownOnce.Do(func() {
+		p.stopAcceptingTurns()
+		if immediate {
+			p.cancelRunningTurns()
+		}
 		p.streams.close()
 		p.shutdownErr = p.httpServer.Shutdown(ctx)
+		if p.shutdownErr != nil && immediate {
+			if closeErr := p.httpServer.Close(); closeErr != nil && !errors.Is(closeErr, http.ErrServerClosed) {
+				p.shutdownErr = errors.Join(p.shutdownErr, closeErr)
+			}
+		}
 		close(p.shutdownDone)
 	})
 	<-p.shutdownDone
@@ -379,17 +407,34 @@ func (p *Process) handleShutdown(w http.ResponseWriter, r *http.Request) {
 	if !p.requireRegistryToken(w, r) {
 		return
 	}
-	if p.snapshot().RunningTurns > 0 {
-		writeError(w, http.StatusConflict, "server_busy", "server has running turns")
+	request, err := parseShutdownQuery(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_query", err.Error())
 		return
 	}
+	p.stopAcceptingTurns()
+	timedOut := false
+	if request.Wait {
+		waitCtx := context.Background()
+		cancel := func() {}
+		if request.Timeout > 0 {
+			waitCtx, cancel = context.WithTimeout(waitCtx, request.Timeout)
+		}
+		err := p.waitForRunningTurns(waitCtx)
+		cancel()
+		if err != nil {
+			timedOut = true
+		}
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"status": "shutting_down",
+		"status":    "shutting_down",
+		"wait":      request.Wait,
+		"timed_out": timedOut,
 	})
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		_ = p.Shutdown(ctx)
+		_ = p.shutdown(ctx, !request.Wait || timedOut)
 	}()
 }
 
@@ -808,7 +853,7 @@ func (p *Process) handleSessionDetail(w http.ResponseWriter, r *http.Request, id
 		writeError(w, http.StatusInternalServerError, "session_store_error", "could not load session metadata")
 		return
 	}
-	writeJSON(w, http.StatusOK, sessionDetailDTOFromSession(session, p.sessionStatus(id)))
+	writeJSON(w, http.StatusOK, sessionDetailDTOFromSession(session, p.sessionStatus(session)))
 }
 
 func (p *Process) handleSessionMetadataUpdate(w http.ResponseWriter, r *http.Request, id string) {
@@ -841,7 +886,7 @@ func (p *Process) handleSessionMetadataUpdate(w http.ResponseWriter, r *http.Req
 		writeError(w, http.StatusInternalServerError, "session_store_error", "could not update session metadata")
 		return
 	}
-	writeJSON(w, http.StatusOK, sessionDetailDTOFromSession(saved, p.sessionStatus(id)))
+	writeJSON(w, http.StatusOK, sessionDetailDTOFromSession(saved, p.sessionStatus(saved)))
 }
 
 func (p *Process) handleSessionItems(w http.ResponseWriter, r *http.Request, id string) {
@@ -1043,16 +1088,36 @@ func (p *Process) handleSessionMessage(w http.ResponseWriter, r *http.Request, i
 	}
 
 	turnID := nextSessionTurnID(session)
-	if !p.beginSessionTurn(id, turnID) {
+	turnCtx, cancelTurn := context.WithCancel(r.Context())
+	beginResult := p.beginSessionTurn(id, turnID, cancelTurn)
+	if beginResult == beginTurnBusy {
+		cancelTurn()
 		writeError(w, http.StatusConflict, "session_busy", "session is currently running a turn")
 		return
 	}
-	defer p.endSessionTurn(id)
+	if beginResult == beginTurnShuttingDown {
+		cancelTurn()
+		writeError(w, http.StatusServiceUnavailable, "server_shutting_down", "server is shutting down")
+		return
+	}
+	marked, err := store.MarkTurnRunning(id, turnID)
+	if err != nil {
+		p.endSessionTurn(id)
+		cancelTurn()
+		writeError(w, http.StatusInternalServerError, "session_store_error", "could not mark turn running")
+		return
+	}
+	session.RunningTurnID = marked.RunningTurnID
+	session.RunningStartedAt = marked.RunningStartedAt
+	defer func() {
+		p.endSessionTurn(id)
+		cancelTurn()
+	}()
 
 	p.publishSessionEvent(id, NewSessionStreamEvent("turn.started", map[string]any{
 		"turn_id": turnID,
 	}))
-	result, err := p.turnRunner.RunSessionTurn(r.Context(), SessionTurnRequest{
+	result, err := p.turnRunner.RunSessionTurn(turnCtx, SessionTurnRequest{
 		Session:      session,
 		SessionStore: store,
 		Content:      content,
@@ -1061,6 +1126,7 @@ func (p *Process) handleSessionMessage(w http.ResponseWriter, r *http.Request, i
 		},
 	})
 	if err != nil {
+		p.finishDurableTurn(id, turnID, errors.Is(err, context.Canceled))
 		p.publishTurnFailed(id, turnID, err)
 		p.writeTurnError(w, err)
 		return
@@ -1076,6 +1142,8 @@ func (p *Process) handleSessionMessage(w http.ResponseWriter, r *http.Request, i
 			result.Items[i].TurnID = turnID
 		}
 	}
+	result.Session.RunningTurnID = turnID
+	result.Session.RunningStartedAt = session.RunningStartedAt
 	var saved sessions.SessionV2
 	if result.Compaction != nil {
 		saved, err = store.SaveCompactedTurn(result.Session, result.Compaction.SummaryItem, result.Compaction.Checkpoint, result.Items, result.ActiveHistory)
@@ -1083,8 +1151,13 @@ func (p *Process) handleSessionMessage(w http.ResponseWriter, r *http.Request, i
 		saved, err = store.SaveTurn(result.Session, result.Items, result.ActiveHistory)
 	}
 	if err != nil {
+		p.finishDurableTurn(id, turnID, false)
 		p.publishTurnFailed(id, turnID, err)
 		writeError(w, http.StatusInternalServerError, "session_store_error", "could not save turn")
+		return
+	}
+	if _, err := store.ClearRunningTurn(id, turnID); err != nil {
+		writeError(w, http.StatusInternalServerError, "session_store_error", "could not clear running turn")
 		return
 	}
 	appendedItems := result.Items
@@ -1144,12 +1217,33 @@ func (p *Process) handleSessionCompact(w http.ResponseWriter, r *http.Request, i
 	}
 
 	operationID := nextSessionCompactOperationID(session)
-	if !p.beginSessionTurn(id, operationID) {
+	operationCtx, cancelOperation := context.WithCancel(r.Context())
+	beginResult := p.beginSessionTurn(id, operationID, cancelOperation)
+	if beginResult == beginTurnBusy {
+		cancelOperation()
 		writeError(w, http.StatusConflict, "session_busy", "session is currently running a turn")
 		return
 	}
-	defer p.endSessionTurn(id)
+	if beginResult == beginTurnShuttingDown {
+		cancelOperation()
+		writeError(w, http.StatusServiceUnavailable, "server_shutting_down", "server is shutting down")
+		return
+	}
+	marked, err := store.MarkTurnRunning(id, operationID)
+	if err != nil {
+		p.endSessionTurn(id)
+		cancelOperation()
+		writeError(w, http.StatusInternalServerError, "session_store_error", "could not mark turn running")
+		return
+	}
+	session.RunningTurnID = marked.RunningTurnID
+	session.RunningStartedAt = marked.RunningStartedAt
+	defer func() {
+		p.endSessionTurn(id)
+		cancelOperation()
+	}()
 	if p.compactPlanner == nil {
+		p.finishDurableTurn(id, operationID, false)
 		writeError(w, http.StatusServiceUnavailable, "compact_planner_unavailable", "compact planner is not configured")
 		return
 	}
@@ -1157,11 +1251,12 @@ func (p *Process) handleSessionCompact(w http.ResponseWriter, r *http.Request, i
 	p.publishSessionEvent(id, NewSessionStreamEvent("compact.started", map[string]any{
 		"reason": "user_requested",
 	}))
-	result, err := p.compactPlanner.PlanSessionCompaction(r.Context(), SessionCompactionRequest{
+	result, err := p.compactPlanner.PlanSessionCompaction(operationCtx, SessionCompactionRequest{
 		Session:      session,
 		SessionStore: store,
 	})
 	if err != nil {
+		p.finishDurableTurn(id, operationID, errors.Is(err, context.Canceled))
 		p.publishCompactFailed(id, err)
 		p.writeCompactError(w, err)
 		return
@@ -1169,8 +1264,13 @@ func (p *Process) handleSessionCompact(w http.ResponseWriter, r *http.Request, i
 
 	saved, err := store.AppendCompactionCheckpoint(session.ID, result.Compaction.SummaryItem, result.Compaction.Checkpoint)
 	if err != nil {
+		p.finishDurableTurn(id, operationID, false)
 		p.publishCompactFailed(id, err)
 		p.writeCompactionStoreError(w, err)
+		return
+	}
+	if _, err := store.ClearRunningTurn(id, operationID); err != nil {
+		writeError(w, http.StatusInternalServerError, "session_store_error", "could not clear running turn")
 		return
 	}
 	savedSummary, _ := findSessionItemByID(saved.Items, result.Compaction.SummaryItem.ID)
@@ -1238,29 +1338,50 @@ func (p *Process) snapshot() Info {
 	return p.info
 }
 
-func (p *Process) beginSessionTurn(sessionID, turnID string) bool {
+type beginTurnResult int
+
+const (
+	beginTurnStarted beginTurnResult = iota
+	beginTurnBusy
+	beginTurnShuttingDown
+)
+
+func (p *Process) beginSessionTurn(sessionID, turnID string, cancel context.CancelFunc) beginTurnResult {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if _, running := p.runningTurns[sessionID]; running {
-		return false
+	if !p.acceptingTurns {
+		return beginTurnShuttingDown
 	}
-	p.runningTurns[sessionID] = turnID
+	if _, running := p.runningTurns[sessionID]; running {
+		return beginTurnBusy
+	}
+	p.runningTurns[sessionID] = runningTurn{turnID: turnID, cancel: cancel}
 	p.info.RunningTurns = len(p.runningTurns)
-	return true
+	return beginTurnStarted
 }
 
 func (p *Process) endSessionTurn(sessionID string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if _, running := p.runningTurns[sessionID]; !running {
+		return
+	}
 	delete(p.runningTurns, sessionID)
 	p.info.RunningTurns = len(p.runningTurns)
+	if len(p.runningTurns) == 0 {
+		close(p.turnsChanged)
+		p.turnsChanged = make(chan struct{})
+	}
 }
 
-func (p *Process) sessionStatus(sessionID string) string {
+func (p *Process) sessionStatus(session sessions.SessionV2) string {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if _, running := p.runningTurns[sessionID]; running {
+	if _, running := p.runningTurns[session.ID]; running {
 		return "running"
+	}
+	if !session.InterruptedAt.IsZero() && (session.LastUsedAt.IsZero() || !session.LastUsedAt.After(session.InterruptedAt)) {
+		return "interrupted"
 	}
 	return "idle"
 }
@@ -1270,6 +1391,57 @@ func (p *Process) sessionIsRunning(sessionID string) bool {
 	defer p.mu.Unlock()
 	_, running := p.runningTurns[sessionID]
 	return running
+}
+
+func (p *Process) stopAcceptingTurns() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.acceptingTurns = false
+}
+
+func (p *Process) cancelRunningTurns() {
+	p.mu.Lock()
+	running := make([]runningTurn, 0, len(p.runningTurns))
+	for _, turn := range p.runningTurns {
+		running = append(running, turn)
+	}
+	p.mu.Unlock()
+	for _, turn := range running {
+		if turn.cancel != nil {
+			turn.cancel()
+		}
+	}
+}
+
+func (p *Process) waitForRunningTurns(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	for {
+		p.mu.Lock()
+		if len(p.runningTurns) == 0 {
+			p.mu.Unlock()
+			return nil
+		}
+		changed := p.turnsChanged
+		p.mu.Unlock()
+		select {
+		case <-changed:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+}
+
+func (p *Process) finishDurableTurn(sessionID, turnID string, interrupted bool) {
+	if p.sessionStore == nil {
+		return
+	}
+	if interrupted {
+		_, _ = p.sessionStore.MarkTurnInterrupted(sessionID, turnID)
+		return
+	}
+	_, _ = p.sessionStore.ClearRunningTurn(sessionID, turnID)
 }
 
 func (p *Process) projectHasRunningTurn(projectID string) (bool, error) {
@@ -1583,18 +1755,20 @@ func (c *sessionStreamClient) close() {
 }
 
 type sessionMetadataDTO struct {
-	ID           string    `json:"id"`
-	CreatedAt    time.Time `json:"created_at"`
-	UpdatedAt    time.Time `json:"updated_at"`
-	DisplayName  string    `json:"display_name,omitempty"`
-	Archived     bool      `json:"archived"`
-	LastUsedAt   time.Time `json:"last_used_at"`
-	Provider     string    `json:"provider"`
-	ModelProfile string    `json:"model_profile"`
-	ModelID      string    `json:"model_id"`
-	ProjectID    string    `json:"project_id,omitempty"`
-	CreatedCWD   string    `json:"created_cwd,omitempty"`
-	LastSeq      int64     `json:"last_seq"`
+	ID                string    `json:"id"`
+	CreatedAt         time.Time `json:"created_at"`
+	UpdatedAt         time.Time `json:"updated_at"`
+	DisplayName       string    `json:"display_name,omitempty"`
+	Archived          bool      `json:"archived"`
+	LastUsedAt        time.Time `json:"last_used_at"`
+	InterruptedAt     time.Time `json:"interrupted_at,omitempty"`
+	InterruptedTurnID string    `json:"interrupted_turn_id,omitempty"`
+	Provider          string    `json:"provider"`
+	ModelProfile      string    `json:"model_profile"`
+	ModelID           string    `json:"model_id"`
+	ProjectID         string    `json:"project_id,omitempty"`
+	CreatedCWD        string    `json:"created_cwd,omitempty"`
+	LastSeq           int64     `json:"last_seq"`
 }
 
 type projectDTO struct {
@@ -1612,28 +1786,30 @@ type projectCreateRequest struct {
 }
 
 type sessionDetailDTO struct {
-	ID              string                 `json:"id"`
-	CreatedAt       time.Time              `json:"created_at"`
-	UpdatedAt       time.Time              `json:"updated_at"`
-	DisplayName     string                 `json:"display_name,omitempty"`
-	Archived        bool                   `json:"archived"`
-	LastUsedAt      time.Time              `json:"last_used_at"`
-	Provider        string                 `json:"provider"`
-	ModelProfile    string                 `json:"model_profile"`
-	ModelID         string                 `json:"model_id"`
-	Status          string                 `json:"status"`
-	LastSeq         int64                  `json:"last_seq"`
-	CWD             string                 `json:"cwd,omitempty"`
-	ProjectID       string                 `json:"project_id,omitempty"`
-	CreatedCWD      string                 `json:"created_cwd,omitempty"`
-	ConfigPath      string                 `json:"config_path,omitempty"`
-	ModelParameters map[string]any         `json:"model_parameters,omitempty"`
-	EnabledTools    []string               `json:"enabled_tools,omitempty"`
-	EnabledMCP      []string               `json:"enabled_mcp,omitempty"`
-	EnabledSkills   []string               `json:"enabled_skills,omitempty"`
-	ShowReasoning   bool                   `json:"show_reasoning"`
-	Context         contextwindow.Metadata `json:"context"`
-	SaveToolResults bool                   `json:"save_tool_results"`
+	ID                string                 `json:"id"`
+	CreatedAt         time.Time              `json:"created_at"`
+	UpdatedAt         time.Time              `json:"updated_at"`
+	DisplayName       string                 `json:"display_name,omitempty"`
+	Archived          bool                   `json:"archived"`
+	LastUsedAt        time.Time              `json:"last_used_at"`
+	InterruptedAt     time.Time              `json:"interrupted_at,omitempty"`
+	InterruptedTurnID string                 `json:"interrupted_turn_id,omitempty"`
+	Provider          string                 `json:"provider"`
+	ModelProfile      string                 `json:"model_profile"`
+	ModelID           string                 `json:"model_id"`
+	Status            string                 `json:"status"`
+	LastSeq           int64                  `json:"last_seq"`
+	CWD               string                 `json:"cwd,omitempty"`
+	ProjectID         string                 `json:"project_id,omitempty"`
+	CreatedCWD        string                 `json:"created_cwd,omitempty"`
+	ConfigPath        string                 `json:"config_path,omitempty"`
+	ModelParameters   map[string]any         `json:"model_parameters,omitempty"`
+	EnabledTools      []string               `json:"enabled_tools,omitempty"`
+	EnabledMCP        []string               `json:"enabled_mcp,omitempty"`
+	EnabledSkills     []string               `json:"enabled_skills,omitempty"`
+	ShowReasoning     bool                   `json:"show_reasoning"`
+	Context           contextwindow.Metadata `json:"context"`
+	SaveToolResults   bool                   `json:"save_tool_results"`
 }
 
 type sessionItemsResponseDTO struct {
@@ -1710,30 +1886,37 @@ type sessionItemContentQuery struct {
 	View     string
 }
 
+type shutdownQuery struct {
+	Wait    bool
+	Timeout time.Duration
+}
+
 func sessionDetailDTOFromSession(session sessions.SessionV2, status string) sessionDetailDTO {
 	return sessionDetailDTO{
-		ID:              session.ID,
-		CreatedAt:       session.CreatedAt,
-		UpdatedAt:       session.UpdatedAt,
-		DisplayName:     session.DisplayName,
-		Archived:        session.Archived,
-		LastUsedAt:      session.LastUsedAt,
-		Provider:        session.Provider,
-		ModelProfile:    session.ModelProfile,
-		ModelID:         session.ModelID,
-		Status:          status,
-		LastSeq:         session.LastSeq,
-		CWD:             session.CWD,
-		ProjectID:       session.ProjectID,
-		CreatedCWD:      session.CreatedCWD,
-		ConfigPath:      session.RootConfigPath(),
-		ModelParameters: copyMap(session.ModelParameters),
-		EnabledTools:    copyStrings(session.EnabledTools),
-		EnabledMCP:      copyStrings(session.EnabledMCP),
-		EnabledSkills:   copyStrings(session.EnabledSkills),
-		ShowReasoning:   session.ShowReasoning,
-		Context:         session.Context,
-		SaveToolResults: session.SaveToolResults,
+		ID:                session.ID,
+		CreatedAt:         session.CreatedAt,
+		UpdatedAt:         session.UpdatedAt,
+		DisplayName:       session.DisplayName,
+		Archived:          session.Archived,
+		LastUsedAt:        session.LastUsedAt,
+		InterruptedAt:     session.InterruptedAt,
+		InterruptedTurnID: session.InterruptedTurnID,
+		Provider:          session.Provider,
+		ModelProfile:      session.ModelProfile,
+		ModelID:           session.ModelID,
+		Status:            status,
+		LastSeq:           session.LastSeq,
+		CWD:               session.CWD,
+		ProjectID:         session.ProjectID,
+		CreatedCWD:        session.CreatedCWD,
+		ConfigPath:        session.RootConfigPath(),
+		ModelParameters:   copyMap(session.ModelParameters),
+		EnabledTools:      copyStrings(session.EnabledTools),
+		EnabledMCP:        copyStrings(session.EnabledMCP),
+		EnabledSkills:     copyStrings(session.EnabledSkills),
+		ShowReasoning:     session.ShowReasoning,
+		Context:           session.Context,
+		SaveToolResults:   session.SaveToolResults,
 	}
 }
 
@@ -1881,6 +2064,32 @@ func parseProjectDeleteDataQuery(r *http.Request) (bool, error) {
 		return false, fmt.Errorf("delete_data must be true or false")
 	}
 	return deleteData, nil
+}
+
+func parseShutdownQuery(r *http.Request) (shutdownQuery, error) {
+	var query shutdownQuery
+	rawWait, ok, err := singleQueryValue(r.URL.Query(), "wait")
+	if err != nil {
+		return shutdownQuery{}, err
+	}
+	if ok {
+		query.Wait, err = strconv.ParseBool(rawWait)
+		if err != nil {
+			return shutdownQuery{}, fmt.Errorf("wait must be true or false")
+		}
+	}
+	rawTimeout, ok, err := singleQueryValue(r.URL.Query(), "timeout_ms")
+	if err != nil {
+		return shutdownQuery{}, err
+	}
+	if ok {
+		timeoutMS, err := strconv.Atoi(rawTimeout)
+		if err != nil || timeoutMS < 0 {
+			return shutdownQuery{}, fmt.Errorf("timeout_ms must be a non-negative integer")
+		}
+		query.Timeout = time.Duration(timeoutMS) * time.Millisecond
+	}
+	return query, nil
 }
 
 func filterSessionItemsForView(items []sessions.SessionItem, view string) []sessions.SessionItem {
@@ -2450,24 +2659,30 @@ func (p *Process) newSessionFromDefaults() sessions.SessionV2 {
 	session.ActiveHistory = nil
 	session.Compactions = nil
 	session.LastSeq = 0
+	session.RunningTurnID = ""
+	session.RunningStartedAt = time.Time{}
+	session.InterruptedTurnID = ""
+	session.InterruptedAt = time.Time{}
 	session.SaveToolResults = true
 	return session
 }
 
 func sessionMetadataDTOFromSession(session sessions.SessionV2) sessionMetadataDTO {
 	return sessionMetadataDTO{
-		ID:           session.ID,
-		CreatedAt:    session.CreatedAt,
-		UpdatedAt:    session.UpdatedAt,
-		DisplayName:  session.DisplayName,
-		Archived:     session.Archived,
-		LastUsedAt:   session.LastUsedAt,
-		Provider:     session.Provider,
-		ModelProfile: session.ModelProfile,
-		ModelID:      session.ModelID,
-		ProjectID:    session.ProjectID,
-		CreatedCWD:   session.CreatedCWD,
-		LastSeq:      session.LastSeq,
+		ID:                session.ID,
+		CreatedAt:         session.CreatedAt,
+		UpdatedAt:         session.UpdatedAt,
+		DisplayName:       session.DisplayName,
+		Archived:          session.Archived,
+		LastUsedAt:        session.LastUsedAt,
+		InterruptedAt:     session.InterruptedAt,
+		InterruptedTurnID: session.InterruptedTurnID,
+		Provider:          session.Provider,
+		ModelProfile:      session.ModelProfile,
+		ModelID:           session.ModelID,
+		ProjectID:         session.ProjectID,
+		CreatedCWD:        session.CreatedCWD,
+		LastSeq:           session.LastSeq,
 	}
 }
 

@@ -201,6 +201,55 @@ func TestV2StoreSaveLoadMetadata(t *testing.T) {
 	}
 }
 
+func TestV2StoreRunningTurnMarkersRecoverInterrupted(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "sessions")
+	clock := &fakeClock{current: time.Date(2026, 7, 4, 1, 2, 3, 0, time.UTC)}
+	store := newV2StoreWithClock(root, V2StoreOptions{}, clock.Now)
+	if _, err := store.SaveMetadata(SessionV2{
+		ID:           "session-running",
+		Provider:     "codex",
+		ModelProfile: "default",
+		ModelID:      "gpt-5",
+		CWD:          t.TempDir(),
+	}); err != nil {
+		t.Fatalf("SaveMetadata() error = %v", err)
+	}
+
+	running, err := store.MarkTurnRunning("session-running", "turn-000001")
+	if err != nil {
+		t.Fatalf("MarkTurnRunning() error = %v", err)
+	}
+	if running.RunningTurnID != "turn-000001" || !running.RunningStartedAt.Equal(clock.current) {
+		t.Fatalf("running marker = turn %q at %s, want turn-000001 at %s", running.RunningTurnID, running.RunningStartedAt, clock.current)
+	}
+	infos, err := store.ListWithOptions(V2ListOptions{All: true})
+	if err != nil {
+		t.Fatalf("ListWithOptions() error = %v", err)
+	}
+	if len(infos) != 1 || infos[0].RunningTurnID != "turn-000001" {
+		t.Fatalf("list running marker = %#v, want running turn", infos)
+	}
+
+	clock.current = clock.current.Add(time.Minute)
+	marked, err := store.MarkRunningTurnsInterrupted()
+	if err != nil {
+		t.Fatalf("MarkRunningTurnsInterrupted() error = %v", err)
+	}
+	if len(marked) != 1 || marked[0].InterruptedTurnID != "turn-000001" || !marked[0].InterruptedAt.Equal(clock.current) {
+		t.Fatalf("marked interrupted = %#v, want one interrupted turn at %s", marked, clock.current)
+	}
+	loaded, err := store.Load("session-running")
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if loaded.RunningTurnID != "" || !loaded.RunningStartedAt.IsZero() {
+		t.Fatalf("loaded running marker = turn %q at %s, want cleared", loaded.RunningTurnID, loaded.RunningStartedAt)
+	}
+	if loaded.InterruptedTurnID != "turn-000001" || !loaded.InterruptedAt.Equal(clock.current) {
+		t.Fatalf("loaded interrupted marker = turn %q at %s, want turn-000001 at %s", loaded.InterruptedTurnID, loaded.InterruptedAt, clock.current)
+	}
+}
+
 func TestV2StoreLoadCombinesMetadataWithReplayedState(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "sessions")
 	clock := &fakeClock{current: time.Date(2026, 7, 3, 1, 2, 3, 0, time.UTC)}

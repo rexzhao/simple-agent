@@ -60,18 +60,22 @@ func (s Session) RootConfigPath() string {
 }
 
 type Info struct {
-	ID              string    `json:"id"`
-	CreatedAt       time.Time `json:"created_at"`
-	UpdatedAt       time.Time `json:"updated_at"`
-	Version         int       `json:"version"`
-	Provider        string    `json:"provider"`
-	ModelProfile    string    `json:"model_profile"`
-	ModelID         string    `json:"model_id"`
-	ProjectID       string    `json:"project_id,omitempty"`
-	CreatedCWD      string    `json:"created_cwd,omitempty"`
-	ContextWindow   int       `json:"context_window,omitempty"`
-	ContextSource   string    `json:"context_window_source,omitempty"`
-	SaveToolResults bool      `json:"save_tool_results"`
+	ID                string    `json:"id"`
+	CreatedAt         time.Time `json:"created_at"`
+	UpdatedAt         time.Time `json:"updated_at"`
+	Version           int       `json:"version"`
+	Provider          string    `json:"provider"`
+	ModelProfile      string    `json:"model_profile"`
+	ModelID           string    `json:"model_id"`
+	RunningTurnID     string    `json:"running_turn_id,omitempty"`
+	RunningStartedAt  time.Time `json:"running_started_at,omitempty"`
+	InterruptedTurnID string    `json:"interrupted_turn_id,omitempty"`
+	InterruptedAt     time.Time `json:"interrupted_at,omitempty"`
+	ProjectID         string    `json:"project_id,omitempty"`
+	CreatedCWD        string    `json:"created_cwd,omitempty"`
+	ContextWindow     int       `json:"context_window,omitempty"`
+	ContextSource     string    `json:"context_window_source,omitempty"`
+	SaveToolResults   bool      `json:"save_tool_results"`
 }
 
 type Store struct {

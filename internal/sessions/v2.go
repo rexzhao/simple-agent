@@ -98,6 +98,10 @@ type SessionV2 struct {
 	DisplayName          string                 `json:"display_name,omitempty"`
 	Archived             bool                   `json:"archived"`
 	LastUsedAt           time.Time              `json:"last_used_at"`
+	RunningTurnID        string                 `json:"running_turn_id,omitempty"`
+	RunningStartedAt     time.Time              `json:"running_started_at,omitempty"`
+	InterruptedTurnID    string                 `json:"interrupted_turn_id,omitempty"`
+	InterruptedAt        time.Time              `json:"interrupted_at,omitempty"`
 	Provider             string                 `json:"provider"`
 	ModelProfile         string                 `json:"model_profile"`
 	ModelID              string                 `json:"model_id"`
@@ -269,6 +273,104 @@ func (s *V2Store) SaveMetadata(session SessionV2) (SessionV2, error) {
 		return SessionV2{}, fmt.Errorf("write session metadata %q: %w", session.ID, err)
 	}
 	return session, nil
+}
+
+func (s *V2Store) MarkTurnRunning(sessionID, turnID string) (SessionV2, error) {
+	if err := s.requireRoot(); err != nil {
+		return SessionV2{}, err
+	}
+	turnID = strings.TrimSpace(turnID)
+	if turnID == "" {
+		return SessionV2{}, fmt.Errorf("running turn id is required")
+	}
+	session, err := s.loadMetadata(sessionID)
+	if err != nil {
+		return SessionV2{}, err
+	}
+	session.RunningTurnID = turnID
+	session.RunningStartedAt = s.now().UTC()
+	return s.SaveMetadata(session)
+}
+
+func (s *V2Store) ClearRunningTurn(sessionID, turnID string) (SessionV2, error) {
+	if err := s.requireRoot(); err != nil {
+		return SessionV2{}, err
+	}
+	session, err := s.loadMetadata(sessionID)
+	if err != nil {
+		return SessionV2{}, err
+	}
+	if session.RunningTurnID == "" {
+		return session, nil
+	}
+	if turnID = strings.TrimSpace(turnID); turnID != "" && session.RunningTurnID != turnID {
+		return session, nil
+	}
+	session.RunningTurnID = ""
+	session.RunningStartedAt = time.Time{}
+	return s.SaveMetadata(session)
+}
+
+func (s *V2Store) MarkTurnInterrupted(sessionID, turnID string) (SessionV2, error) {
+	if err := s.requireRoot(); err != nil {
+		return SessionV2{}, err
+	}
+	session, err := s.loadMetadata(sessionID)
+	if err != nil {
+		return SessionV2{}, err
+	}
+	runningTurnID := strings.TrimSpace(session.RunningTurnID)
+	turnID = strings.TrimSpace(turnID)
+	if runningTurnID == "" {
+		runningTurnID = turnID
+	}
+	if runningTurnID == "" {
+		return session, nil
+	}
+	if turnID != "" && session.RunningTurnID != "" && session.RunningTurnID != turnID {
+		return session, nil
+	}
+	session.RunningTurnID = ""
+	session.RunningStartedAt = time.Time{}
+	session.InterruptedTurnID = runningTurnID
+	session.InterruptedAt = s.now().UTC()
+	return s.SaveMetadata(session)
+}
+
+func (s *V2Store) MarkRunningTurnsInterrupted() ([]SessionV2, error) {
+	if err := s.requireRoot(); err != nil {
+		return nil, err
+	}
+	entries, err := os.ReadDir(s.root)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return []SessionV2{}, nil
+		}
+		return nil, fmt.Errorf("read session store %q: %w", s.root, err)
+	}
+	marked := make([]SessionV2, 0)
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		id := entry.Name()
+		if err := validateV2SessionID(id); err != nil {
+			continue
+		}
+		session, err := s.loadMetadata(id)
+		if err != nil {
+			continue
+		}
+		if strings.TrimSpace(session.RunningTurnID) == "" {
+			continue
+		}
+		session, err = s.MarkTurnInterrupted(session.ID, session.RunningTurnID)
+		if err != nil {
+			return nil, err
+		}
+		marked = append(marked, session)
+	}
+	return marked, nil
 }
 
 func (s *V2Store) Load(id string) (SessionV2, error) {
@@ -1099,6 +1201,10 @@ type sessionV2Metadata struct {
 	DisplayName          string                 `json:"display_name,omitempty"`
 	Archived             bool                   `json:"archived"`
 	LastUsedAt           time.Time              `json:"last_used_at"`
+	RunningTurnID        string                 `json:"running_turn_id,omitempty"`
+	RunningStartedAt     time.Time              `json:"running_started_at,omitempty"`
+	InterruptedTurnID    string                 `json:"interrupted_turn_id,omitempty"`
+	InterruptedAt        time.Time              `json:"interrupted_at,omitempty"`
 	Provider             string                 `json:"provider"`
 	ModelProfile         string                 `json:"model_profile"`
 	ModelID              string                 `json:"model_id"`
@@ -1161,6 +1267,10 @@ func metadataFromSessionV2(session SessionV2) sessionV2Metadata {
 		DisplayName:          session.DisplayName,
 		Archived:             session.Archived,
 		LastUsedAt:           session.LastUsedAt,
+		RunningTurnID:        session.RunningTurnID,
+		RunningStartedAt:     session.RunningStartedAt,
+		InterruptedTurnID:    session.InterruptedTurnID,
+		InterruptedAt:        session.InterruptedAt,
 		Provider:             session.Provider,
 		ModelProfile:         session.ModelProfile,
 		ModelID:              session.ModelID,
@@ -1190,6 +1300,10 @@ func (m sessionV2Metadata) session() SessionV2 {
 		DisplayName:          m.DisplayName,
 		Archived:             m.Archived,
 		LastUsedAt:           m.LastUsedAt,
+		RunningTurnID:        m.RunningTurnID,
+		RunningStartedAt:     m.RunningStartedAt,
+		InterruptedTurnID:    m.InterruptedTurnID,
+		InterruptedAt:        m.InterruptedAt,
 		Provider:             m.Provider,
 		ModelProfile:         m.ModelProfile,
 		ModelID:              m.ModelID,
@@ -1605,18 +1719,22 @@ func copyCompactionCheckpoints(checkpoints []CompactionCheckpoint) []CompactionC
 
 func (s SessionV2) info() Info {
 	return Info{
-		ID:              s.ID,
-		CreatedAt:       s.CreatedAt,
-		UpdatedAt:       s.UpdatedAt,
-		Version:         s.Version,
-		Provider:        s.Provider,
-		ModelProfile:    s.ModelProfile,
-		ModelID:         s.ModelID,
-		ProjectID:       s.ProjectID,
-		CreatedCWD:      s.CreatedCWD,
-		ContextWindow:   s.Context.ContextWindow,
-		ContextSource:   s.Context.ContextWindowSource,
-		SaveToolResults: s.SaveToolResults,
+		ID:                s.ID,
+		CreatedAt:         s.CreatedAt,
+		UpdatedAt:         s.UpdatedAt,
+		Version:           s.Version,
+		Provider:          s.Provider,
+		ModelProfile:      s.ModelProfile,
+		ModelID:           s.ModelID,
+		RunningTurnID:     s.RunningTurnID,
+		RunningStartedAt:  s.RunningStartedAt,
+		InterruptedTurnID: s.InterruptedTurnID,
+		InterruptedAt:     s.InterruptedAt,
+		ProjectID:         s.ProjectID,
+		CreatedCWD:        s.CreatedCWD,
+		ContextWindow:     s.Context.ContextWindow,
+		ContextSource:     s.Context.ContextWindowSource,
+		SaveToolResults:   s.SaveToolResults,
 	}
 }
 

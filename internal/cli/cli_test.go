@@ -4259,6 +4259,9 @@ func TestStopSendsRegistryToken(t *testing.T) {
 			}
 			writeCLIJSON(w, http.StatusOK, map[string]any{"status": "ok"})
 		case "/server/shutdown":
+			if r.URL.RawQuery != "" {
+				t.Fatalf("default shutdown query = %q, want empty", r.URL.RawQuery)
+			}
 			tokenSeen <- r.Header.Get("Authorization")
 			setStopped(true)
 			writeCLIJSON(w, http.StatusOK, map[string]any{"status": "shutting_down"})
@@ -4310,6 +4313,184 @@ func TestStopSendsRegistryToken(t *testing.T) {
 	}
 	if len(records) != 0 {
 		t.Fatalf("registry records after stop = %#v, want empty", records)
+	}
+}
+
+func TestStopWaitSendsShutdownWaitQuery(t *testing.T) {
+	registryPath := isolateCLIUserRegistry(t)
+	projectDir := t.TempDir()
+	configPath := filepath.Join(projectDir, ".agents", "sai.yaml")
+	querySeen := make(chan string, 1)
+	var stoppedMu sync.Mutex
+	stopped := false
+	setStopped := func(value bool) {
+		stoppedMu.Lock()
+		defer stoppedMu.Unlock()
+		stopped = value
+	}
+	isStopped := func() bool {
+		stoppedMu.Lock()
+		defer stoppedMu.Unlock()
+		return stopped
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/health":
+			if isStopped() {
+				writeCLIJSON(w, http.StatusServiceUnavailable, map[string]any{"error": map[string]string{"code": "server_stopped"}})
+				return
+			}
+			writeCLIJSON(w, http.StatusOK, map[string]any{"status": "ok"})
+		case "/server/shutdown":
+			querySeen <- r.URL.RawQuery
+			if got := r.Header.Get("Authorization"); got != "Bearer registry-token" {
+				t.Fatalf("shutdown Authorization = %q, want bearer registry token", got)
+			}
+			setStopped(true)
+			writeCLIJSON(w, http.StatusOK, map[string]any{"status": "shutting_down", "wait": true})
+		default:
+			t.Fatalf("unexpected path %q", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	addr := strings.TrimPrefix(server.URL, "http://")
+	store := localserver.NewRegistryStore(registryPath)
+	if err := store.Upsert(localserver.RegistryRecord{
+		CWD:             projectDir,
+		ConfigPath:      configPath,
+		BaseURL:         addr,
+		PID:             1234,
+		Token:           "registry-token",
+		StartedAt:       time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC),
+		Version:         "test-version",
+		RequestedListen: "127.0.0.1:0",
+	}); err != nil {
+		t.Fatalf("Upsert(registry record) error = %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := RunWithGetwd([]string{"stop", "--cwd", projectDir, "--wait", "--timeout-ms", "1500"}, &stdout, &stderr, func() (string, error) {
+		return "", errors.New("getwd should not be called")
+	})
+	if code != 0 {
+		t.Fatalf("stop --wait code = %d, stderr = %s", code, stderr.String())
+	}
+	if stderr.String() != "" {
+		t.Fatalf("stop --wait stderr = %q, want empty", stderr.String())
+	}
+	select {
+	case rawQuery := <-querySeen:
+		values, err := url.ParseQuery(rawQuery)
+		if err != nil {
+			t.Fatalf("ParseQuery(%q) error = %v", rawQuery, err)
+		}
+		if values.Get("wait") != "true" || values.Get("timeout_ms") != "1500" {
+			t.Fatalf("shutdown query = %q, want wait=true&timeout_ms=1500", rawQuery)
+		}
+	default:
+		t.Fatal("shutdown endpoint was not called")
+	}
+	if !strings.Contains(stdout.String(), "SERVER_STOPPED") || !strings.Contains(stdout.String(), "addr="+addr) {
+		t.Fatalf("stop --wait stdout = %q, want stopped addr", stdout.String())
+	}
+	records, err := store.List()
+	if err != nil {
+		t.Fatalf("registry List() error = %v", err)
+	}
+	if len(records) != 0 {
+		t.Fatalf("registry records after stop --wait = %#v, want empty", records)
+	}
+}
+
+func TestStopWaitWithoutTimeoutCanDrainPastDefaultClientTimeout(t *testing.T) {
+	registryPath := isolateCLIUserRegistry(t)
+	projectDir := t.TempDir()
+	configPath := filepath.Join(projectDir, ".agents", "sai.yaml")
+	querySeen := make(chan string, 1)
+	var stoppedMu sync.Mutex
+	stopped := false
+	setStopped := func(value bool) {
+		stoppedMu.Lock()
+		defer stoppedMu.Unlock()
+		stopped = value
+	}
+	isStopped := func() bool {
+		stoppedMu.Lock()
+		defer stoppedMu.Unlock()
+		return stopped
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/health":
+			if isStopped() {
+				writeCLIJSON(w, http.StatusServiceUnavailable, map[string]any{"error": map[string]string{"code": "server_stopped"}})
+				return
+			}
+			writeCLIJSON(w, http.StatusOK, map[string]any{"status": "ok"})
+		case "/server/shutdown":
+			querySeen <- r.URL.RawQuery
+			time.Sleep(serverClientTimeout + 200*time.Millisecond)
+			setStopped(true)
+			writeCLIJSON(w, http.StatusOK, map[string]any{"status": "shutting_down", "wait": true})
+		default:
+			t.Fatalf("unexpected path %q", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	addr := strings.TrimPrefix(server.URL, "http://")
+	store := localserver.NewRegistryStore(registryPath)
+	if err := store.Upsert(localserver.RegistryRecord{
+		CWD:             projectDir,
+		ConfigPath:      configPath,
+		BaseURL:         addr,
+		PID:             1234,
+		Token:           "registry-token",
+		StartedAt:       time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC),
+		Version:         "test-version",
+		RequestedListen: "127.0.0.1:0",
+	}); err != nil {
+		t.Fatalf("Upsert(registry record) error = %v", err)
+	}
+
+	started := time.Now()
+	var stdout, stderr bytes.Buffer
+	code := RunWithGetwd([]string{"stop", "--cwd", projectDir, "--wait"}, &stdout, &stderr, func() (string, error) {
+		return "", errors.New("getwd should not be called")
+	})
+	if code != 0 {
+		t.Fatalf("stop --wait code = %d after %s, stderr = %s", code, time.Since(started), stderr.String())
+	}
+	if elapsed := time.Since(started); elapsed < serverClientTimeout {
+		t.Fatalf("stop --wait returned after %s, want it to wait past default client timeout %s", elapsed, serverClientTimeout)
+	}
+	if stderr.String() != "" {
+		t.Fatalf("stop --wait stderr = %q, want empty", stderr.String())
+	}
+	select {
+	case rawQuery := <-querySeen:
+		values, err := url.ParseQuery(rawQuery)
+		if err != nil {
+			t.Fatalf("ParseQuery(%q) error = %v", rawQuery, err)
+		}
+		if values.Get("wait") != "true" || values.Get("timeout_ms") != "" {
+			t.Fatalf("shutdown query = %q, want wait=true without timeout_ms", rawQuery)
+		}
+	default:
+		t.Fatal("shutdown endpoint was not called")
+	}
+	if !strings.Contains(stdout.String(), "SERVER_STOPPED") || !strings.Contains(stdout.String(), "addr="+addr) {
+		t.Fatalf("stop --wait stdout = %q, want stopped addr", stdout.String())
+	}
+	records, err := store.List()
+	if err != nil {
+		t.Fatalf("registry List() error = %v", err)
+	}
+	if len(records) != 0 {
+		t.Fatalf("registry records after stop --wait = %#v, want empty", records)
 	}
 }
 

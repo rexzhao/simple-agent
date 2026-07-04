@@ -123,17 +123,17 @@ evidence 证明。
 
 ## Shutdown and Recovery
 
-- [ ] default shutdown immediate stop/cancel/cleanup。
-- [ ] immediate shutdown 停止接受新 turns。
-- [ ] immediate shutdown 取消 running turns。
-- [ ] immediate shutdown 清理 registry。
-- [ ] `--wait` drain 已经开始的 calls/turns。
-- [ ] `--wait` 停止接受 new turns。
-- [ ] `--wait` 支持 timeout。
-- [ ] `--wait` timeout 后执行 immediate stop。
-- [ ] OS signals / Ctrl+C 使用 immediate stop 语义。
-- [ ] restart 后 previously running turns/sessions 标记 interrupted。
-- [ ] restart 后不自动 replay running turns。
+- [x] default shutdown immediate stop/cancel/cleanup。
+- [x] immediate shutdown 停止接受新 turns。
+- [x] immediate shutdown 取消 running turns。
+- [x] immediate shutdown 清理 registry。
+- [x] `--wait` drain 已经开始的 calls/turns。
+- [x] `--wait` 停止接受 new turns。
+- [x] `--wait` 支持 timeout。
+- [x] `--wait` timeout 后执行 immediate stop。
+- [x] OS signals / Ctrl+C 使用 immediate stop 语义。
+- [x] restart 后 previously running turns/sessions 标记 interrupted。
+- [x] restart 后不自动 replay running turns。
 
 ## API
 
@@ -185,8 +185,8 @@ evidence 证明。
 - [x] 测试覆盖 direct replacement/no chat product entry。
 - [x] 测试覆盖 explicit project API paths。
 - [x] 测试覆盖 explicit session API paths。
-- [ ] 测试覆盖 shutdown immediate/wait semantics。
-- [ ] 测试覆盖 interrupted recovery。
+- [x] 测试覆盖 shutdown immediate/wait semantics。
+- [x] 测试覆盖 interrupted recovery。
 - [x] 测试覆盖 JSONL/blob pagination。
 - [x] `go test ./...` 通过。
 - [x] `git diff --check` 通过。
@@ -194,6 +194,22 @@ evidence 证明。
 
 ## Smoke Evidence
 
+- 2026-07-04 M21 shutdown/recovery slice:
+  `go test ./internal/server ./internal/cli ./internal/sessions` 通过；覆盖
+  `POST /server/shutdown` 默认 immediate 不再因 running turns 返回 conflict、停止接受 new turns、
+  取消 running turn context、关闭 stream/server，`sai stop` 保持 no-auto-start 且 registry cleanup；
+  `sai stop --wait --timeout-ms N` 发送 `POST /server/shutdown?wait=true&timeout_ms=N`；
+  `sai stop --wait` 不带 timeout 时不会使用默认 500ms HTTP client timeout，可等待超过该默认值的 drain；
+  `wait=true` drain 已开始 turn 并提交后关闭，draining 期间 new turns 返回 `server_shutting_down`；
+  `wait=true&timeout_ms=...` timeout 后取消 outstanding turn 并 immediate shutdown；
+  foreground server context cancellation（Ctrl+C/signal path）使用 immediate semantics。
+- 2026-07-04 M21 shutdown/recovery slice:
+  `go test ./...` 通过；覆盖 session V2 durable `running_turn_id` / `running_started_at` marker、
+  startup recovery 将 stale running marker 转为 `interrupted_turn_id` / `interrupted_at`、
+  recovered session detail `status: "interrupted"`，且只 replay 已提交 JSONL transaction，不自动 replay
+  stale running turn。
+- 2026-07-04 M21 shutdown/recovery slice: `git diff --check` 通过（仅出现工作区 LF/CRLF
+  normalization warnings）。
 - 2026-07-04 M21 session lifecycle/concurrency evidence slice:
   `go test ./internal/cli -run "Test(SessionHelpWritesUsageWithoutConfig|BareNewCreatesSessionThenAttaches|AttachNewCreatesSessionStreamsAndSendsPrompts|SendNewCreatesSessionThenSendsWithToken|SessionCreateFailsWithoutRegisteredNearestProject|SessionMetadataCommandsRejectConfigBeforeDiscovery|SendWithoutSessionFailsWithoutRegisteredNearestProject|SendWithoutSessionFailsWhenProjectHasNoSessions|AttachWithoutSessionFailsWithoutRegisteredNearestProject|AttachWithoutSessionFailsWhenProjectHasNoSessions|SendExistingRejectsCWDAndConfigBeforeDiscovery|AttachExistingRejectsCWDAndConfigBeforeDiscovery)"`,
   `go test ./internal/server -run "Test(SessionStreamFanoutAndSessionIsolation|SessionSendMessageRejectsBusySession|ProjectSessionAPIsCreateListFilterAndClient|ProjectSessionAPIsRequireExistingActiveProject)"`,
@@ -377,4 +393,4 @@ evidence 证明。
   concurrent project-command auto-start 只启动一个 background child 且两个 caller 复用同一 registry token、
   concurrent `server --background` 一个 parent 输出 `SERVER_ADDR`、另一个输出 `SERVER_ALREADY_RUNNING`，
   以及既有 `DiscoverHealthy` stale registry cleanup 继续通过。
-- Known limits: 当前 M21 slices 未实现 GUI server work 或 shutdown/recovery semantics。
+- Known limits: 当前 M21 slices 未实现 GUI server frontend work。

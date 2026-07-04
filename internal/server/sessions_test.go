@@ -356,11 +356,14 @@ func TestSessionMetadataUpdateRenameArchiveAuthBusyAndPreservesTimeline(t *testi
 		t.Fatalf("stored LastUsedAt = %s, want %s", stored.LastUsedAt, lastUsedAt)
 	}
 
-	if !process.beginSessionTurn("update-session", "turn-busy") {
-		t.Fatal("beginSessionTurn(update-session) = false, want true")
+	_, cancelBusy := context.WithCancel(context.Background())
+	if got := process.beginSessionTurn("update-session", "turn-busy", cancelBusy); got != beginTurnStarted {
+		cancelBusy()
+		t.Fatalf("beginSessionTurn(update-session) = %v, want started", got)
 	}
 	raw, body = patchRawJSONStatus(t, baseURL+"/sessions/update-session", `{"display_name":"Busy Rename"}`, "registry-token", http.StatusConflict)
 	process.endSessionTurn("update-session")
+	cancelBusy()
 	assertErrorCode(t, body, "session_busy")
 	if bytes.Contains(raw, []byte("Busy Rename")) || bytes.Contains(raw, []byte("timeline secret")) {
 		t.Fatalf("busy response leaked update or timeline content: %s", raw)
@@ -1359,24 +1362,77 @@ func TestSessionSendMessageRejectsBusySession(t *testing.T) {
 	}
 }
 
-func TestServerShutdownRejectsRunningTurnAndKeepsServerHealthy(t *testing.T) {
+func TestServerShutdownImmediateCancelsRunningTurnAndStopsServer(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "sessions")
 	store := sessions.NewV2Store(root)
 	saveServerTestSession(t, store, "shutdown-busy")
 	started := make(chan struct{})
-	release := make(chan struct{})
-	closeRelease := func() {
-		select {
-		case <-release:
-		default:
-			close(release)
-		}
-	}
-	defer closeRelease()
+	canceled := make(chan struct{})
 	runner := fakeSessionTurnRunner{
 		run: func(ctx context.Context, request SessionTurnRequest) (SessionTurnResult, error) {
 			close(started)
-			<-release
+			<-ctx.Done()
+			close(canceled)
+			return SessionTurnResult{}, ctx.Err()
+		},
+	}
+	process := startSessionAPIServerWithTurnRunner(t, store, sessions.SessionV2{}, "registry-token", runner)
+	baseURL := "http://" + process.Addr()
+	firstDone := make(chan map[string]any, 1)
+	go func() {
+		_, body := postRawJSONStatus(t, baseURL+"/sessions/shutdown-busy/messages", `{"content":"SECRET PROMPT TOKEN DETAILS"}`, "registry-token", http.StatusInternalServerError)
+		firstDone <- body
+	}()
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for turn to start")
+	}
+
+	_, body := postRawJSONStatus(t, baseURL+"/server/shutdown", "", "registry-token", http.StatusOK)
+	if body["status"] != "shutting_down" || body["wait"] != false || body["timed_out"] != false {
+		t.Fatalf("shutdown response = %#v, want immediate shutting_down", body)
+	}
+
+	select {
+	case <-canceled:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for running turn context cancellation")
+	}
+	select {
+	case body := <-firstDone:
+		assertErrorCode(t, body, "turn_failed")
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for canceled turn response")
+	}
+	waitForServerStopped(t, process.Addr())
+
+	session, err := store.Load("shutdown-busy")
+	if err != nil {
+		t.Fatalf("Load(shutdown-busy) error = %v", err)
+	}
+	if session.RunningTurnID != "" || session.InterruptedTurnID != "turn-000001" || session.InterruptedAt.IsZero() {
+		t.Fatalf("shutdown metadata = running %q interrupted %q at %s, want interrupted turn-000001", session.RunningTurnID, session.InterruptedTurnID, session.InterruptedAt)
+	}
+	if session.LastSeq != 0 || len(session.Items) != 0 {
+		t.Fatalf("shutdown session replay = last_seq %d items %#v, want no committed replay", session.LastSeq, session.Items)
+	}
+}
+
+func TestServerShutdownWaitDrainsRunningTurnAndRejectsNewTurns(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "sessions")
+	store := sessions.NewV2Store(root)
+	saveServerTestSession(t, store, "shutdown-wait")
+	started := make(chan struct{})
+	release := make(chan struct{})
+	runner := fakeSessionTurnRunner{
+		run: func(ctx context.Context, request SessionTurnRequest) (SessionTurnResult, error) {
+			close(started)
+			select {
+			case <-release:
+			case <-ctx.Done():
+				return SessionTurnResult{}, ctx.Err()
+			}
 			return serverTestTurnResult(request.Session,
 				model.Message{Role: model.MessageRoleUser, Content: request.Content},
 				model.Message{Role: model.MessageRoleAssistant, Content: "done"},
@@ -1387,7 +1443,7 @@ func TestServerShutdownRejectsRunningTurnAndKeepsServerHealthy(t *testing.T) {
 	baseURL := "http://" + process.Addr()
 	firstDone := make(chan map[string]any, 1)
 	go func() {
-		_, body := postRawJSONStatus(t, baseURL+"/sessions/shutdown-busy/messages", `{"content":"SECRET PROMPT TOKEN DETAILS"}`, "registry-token", http.StatusOK)
+		_, body := postRawJSONStatus(t, baseURL+"/sessions/shutdown-wait/messages", `{"content":"first"}`, "registry-token", http.StatusOK)
 		firstDone <- body
 	}()
 	select {
@@ -1396,37 +1452,226 @@ func TestServerShutdownRejectsRunningTurnAndKeepsServerHealthy(t *testing.T) {
 		t.Fatal("timed out waiting for turn to start")
 	}
 
-	raw, body := postRawJSONStatus(t, baseURL+"/server/shutdown", "", "registry-token", http.StatusConflict)
-	assertErrorCode(t, body, "server_busy")
-	for _, forbidden := range [][]byte{
-		[]byte("SECRET PROMPT TOKEN DETAILS"),
-		[]byte("registry-token"),
-	} {
-		if bytes.Contains(raw, forbidden) {
-			t.Fatalf("shutdown busy response leaked %s: %s", forbidden, raw)
-		}
-	}
+	shutdownDone := make(chan map[string]any, 1)
+	go func() {
+		_, body := postRawJSONStatus(t, baseURL+"/server/shutdown?wait=true&timeout_ms=2000", "", "registry-token", http.StatusOK)
+		shutdownDone <- body
+	}()
+	waitForShutdownRejection(t, baseURL+"/sessions/shutdown-wait/messages")
 
-	waitForHealthyServer(t, process.Addr())
-	_, serverInfo := getRawJSON(t, baseURL+"/server")
-	if serverInfo["running_turns"] != float64(1) {
-		t.Fatalf("/server running_turns after shutdown conflict = %#v, want 1", serverInfo["running_turns"])
-	}
-	_, detail := getRawJSON(t, baseURL+"/sessions/shutdown-busy")
-	if detail["status"] != "running" {
-		t.Fatalf("session status after shutdown conflict = %#v, want running", detail["status"])
-	}
-
-	closeRelease()
+	close(release)
 	select {
 	case body := <-firstDone:
 		if body["status"] != "committed" {
-			t.Fatalf("first response = %#v, want committed", body)
+			t.Fatalf("drained turn response = %#v, want committed", body)
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for turn to finish")
 	}
+	select {
+	case body := <-shutdownDone:
+		if body["status"] != "shutting_down" || body["wait"] != true || body["timed_out"] != false {
+			t.Fatalf("wait shutdown response = %#v, want drained shutdown", body)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for wait shutdown response")
+	}
+	waitForServerStopped(t, process.Addr())
+
+	session, err := store.Load("shutdown-wait")
+	if err != nil {
+		t.Fatalf("Load(shutdown-wait) error = %v", err)
+	}
+	if session.RunningTurnID != "" || session.InterruptedTurnID != "" || !session.InterruptedAt.IsZero() {
+		t.Fatalf("drained metadata = running %q interrupted %q at %s, want cleared without interruption", session.RunningTurnID, session.InterruptedTurnID, session.InterruptedAt)
+	}
+	if session.LastSeq != 5 || len(session.Items) != 2 {
+		t.Fatalf("drained session replay = last_seq %d items %#v, want committed turn", session.LastSeq, session.Items)
+	}
+}
+
+func TestServerShutdownWaitTimeoutCancelsRunningTurnAndStopsServer(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "sessions")
+	store := sessions.NewV2Store(root)
+	saveServerTestSession(t, store, "shutdown-timeout")
+	started := make(chan struct{})
+	canceled := make(chan struct{})
+	runner := fakeSessionTurnRunner{
+		run: func(ctx context.Context, request SessionTurnRequest) (SessionTurnResult, error) {
+			close(started)
+			<-ctx.Done()
+			close(canceled)
+			return SessionTurnResult{}, ctx.Err()
+		},
+	}
+	process := startSessionAPIServerWithTurnRunner(t, store, sessions.SessionV2{}, "registry-token", runner)
+	baseURL := "http://" + process.Addr()
+	firstDone := make(chan map[string]any, 1)
+	go func() {
+		_, body := postRawJSONStatus(t, baseURL+"/sessions/shutdown-timeout/messages", `{"content":"first"}`, "registry-token", http.StatusInternalServerError)
+		firstDone <- body
+	}()
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for turn to start")
+	}
+
+	_, body := postRawJSONStatus(t, baseURL+"/server/shutdown?wait=true&timeout_ms=25", "", "registry-token", http.StatusOK)
+	if body["status"] != "shutting_down" || body["wait"] != true || body["timed_out"] != true {
+		t.Fatalf("timeout shutdown response = %#v, want timed_out shutdown", body)
+	}
+	select {
+	case <-canceled:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for timeout cancellation")
+	}
+	select {
+	case body := <-firstDone:
+		assertErrorCode(t, body, "turn_failed")
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for timeout turn response")
+	}
+	waitForServerStopped(t, process.Addr())
+
+	session, err := store.Load("shutdown-timeout")
+	if err != nil {
+		t.Fatalf("Load(shutdown-timeout) error = %v", err)
+	}
+	if session.RunningTurnID != "" || session.InterruptedTurnID != "turn-000001" || session.InterruptedAt.IsZero() {
+		t.Fatalf("timeout metadata = running %q interrupted %q at %s, want interrupted turn-000001", session.RunningTurnID, session.InterruptedTurnID, session.InterruptedAt)
+	}
+	if session.LastSeq != 0 || len(session.Items) != 0 {
+		t.Fatalf("timeout session replay = last_seq %d items %#v, want no committed replay", session.LastSeq, session.Items)
+	}
+}
+
+func TestServerStartupMarksStaleRunningTurnInterruptedWithoutReplay(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "sessions")
+	store := sessions.NewV2Store(root)
+	if _, err := store.SaveMetadata(sessions.SessionV2{
+		ID:               "recover-running",
+		Provider:         "codex",
+		ModelProfile:     "default",
+		ModelID:          "gpt-5",
+		CWD:              t.TempDir(),
+		RunningTurnID:    "turn-000123",
+		RunningStartedAt: time.Date(2026, 7, 4, 1, 2, 3, 0, time.UTC),
+	}); err != nil {
+		t.Fatalf("SaveMetadata(recover-running) error = %v", err)
+	}
+	existing := appendServerTestItem(t, store, "recover-running", sessions.SessionItem{
+		ID:         "existing-user",
+		Kind:       sessions.ItemKindMessage,
+		Visibility: sessions.ItemVisibilityVisible,
+		Audience:   sessions.ItemAudienceUser,
+		Message:    &model.Message{Role: model.MessageRoleUser, Content: "already committed"},
+	})
+	if _, err := store.ReplaceActiveHistory("recover-running", []string{existing.ID}); err != nil {
+		t.Fatalf("ReplaceActiveHistory(recover-running) error = %v", err)
+	}
+
+	process := startSessionAPIServerWithTurnRunner(t, store, sessions.SessionV2{}, "registry-token", fakeSessionTurnRunner{
+		run: func(ctx context.Context, request SessionTurnRequest) (SessionTurnResult, error) {
+			t.Fatalf("runner was called during startup recovery")
+			return SessionTurnResult{}, nil
+		},
+	})
+
+	session, err := store.Load("recover-running")
+	if err != nil {
+		t.Fatalf("Load(recover-running) error = %v", err)
+	}
+	if session.RunningTurnID != "" || session.InterruptedTurnID != "turn-000123" || session.InterruptedAt.IsZero() {
+		t.Fatalf("recovered metadata = running %q interrupted %q at %s, want interrupted stale turn", session.RunningTurnID, session.InterruptedTurnID, session.InterruptedAt)
+	}
+	if got := responseSessionItemIDs(session.Items); !reflect.DeepEqual(got, []string{"existing-user"}) {
+		t.Fatalf("recovered item IDs = %#v, want only committed history", got)
+	}
+	_, detail := getRawJSON(t, "http://"+process.Addr()+"/sessions/recover-running")
+	if detail["status"] != "interrupted" || detail["interrupted_turn_id"] != "turn-000123" {
+		t.Fatalf("recovered session detail = %#v, want interrupted status and turn id", detail)
+	}
+}
+
+func TestServeContextCancelUsesImmediateStopSemantics(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "sessions")
+	store := sessions.NewV2Store(root)
+	saveServerTestSession(t, store, "signal-stop")
+	started := make(chan struct{})
+	canceled := make(chan struct{})
+	runner := fakeSessionTurnRunner{
+		run: func(ctx context.Context, request SessionTurnRequest) (SessionTurnResult, error) {
+			close(started)
+			<-ctx.Done()
+			close(canceled)
+			return SessionTurnResult{}, ctx.Err()
+		},
+	}
+	process, err := Start(Options{
+		CWD:          t.TempDir(),
+		ConfigPath:   filepath.Join(t.TempDir(), "sai.yaml"),
+		Listen:       "127.0.0.1:0",
+		AuthToken:    "registry-token",
+		SessionStore: store,
+		TurnRunner:   runner,
+	})
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	serveCtx, cancelServe := context.WithCancel(context.Background())
+	serveDone := make(chan error, 1)
+	go func() {
+		serveDone <- process.Serve(serveCtx)
+	}()
 	waitForHealthyServer(t, process.Addr())
+	serveStopped := false
+	t.Cleanup(func() {
+		if serveStopped {
+			return
+		}
+		_ = process.Shutdown(context.Background())
+		select {
+		case <-serveDone:
+		case <-time.After(2 * time.Second):
+			t.Fatal("Serve() did not stop")
+		}
+	})
+
+	baseURL := "http://" + process.Addr()
+	firstDone := make(chan map[string]any, 1)
+	go func() {
+		_, body := postRawJSONStatus(t, baseURL+"/sessions/signal-stop/messages", `{"content":"first"}`, "registry-token", http.StatusInternalServerError)
+		firstDone <- body
+	}()
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for turn to start")
+	}
+
+	cancelServe()
+	select {
+	case <-canceled:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for signal-style cancellation")
+	}
+	select {
+	case body := <-firstDone:
+		assertErrorCode(t, body, "turn_failed")
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for canceled turn response")
+	}
+	select {
+	case err := <-serveDone:
+		serveStopped = true
+		if err != nil {
+			t.Fatalf("Serve() after context cancel error = %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for Serve() to stop")
+	}
+	waitForServerStopped(t, process.Addr())
 }
 
 func TestSessionSendMessageFailedTurnStaysTransient(t *testing.T) {
@@ -2970,6 +3215,48 @@ func waitForStreamSubscribers(t *testing.T, process *Process, sessionID string, 
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatalf("subscriberCount(%s) = %d, want %d", sessionID, process.streams.subscriberCount(sessionID), want)
+}
+
+func waitForShutdownRejection(t *testing.T, url string) {
+	t.Helper()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		req, err := http.NewRequest(http.MethodPost, url, strings.NewReader(`{"content":"second"}`))
+		if err != nil {
+			t.Fatalf("NewRequest(POST %s) error = %v", url, err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer registry-token")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("Post(%s) while waiting for shutdown rejection error = %v", url, err)
+		}
+		body := decodeJSON(t, resp)
+		_ = resp.Body.Close()
+		if resp.StatusCode == http.StatusServiceUnavailable {
+			assertErrorCode(t, body, "server_shutting_down")
+			return
+		}
+		if resp.StatusCode != http.StatusConflict {
+			t.Fatalf("Post(%s) status = %d body=%#v, want eventual 503 or interim 409", url, resp.StatusCode, body)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %s to reject new turns during shutdown", url)
+}
+
+func waitForServerStopped(t *testing.T, addr string) {
+	t.Helper()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if err := CheckHealth(context.Background(), addr, 100*time.Millisecond); err != nil {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("server %s stayed healthy after shutdown", addr)
 }
 
 func readSessionStreamEvent(t *testing.T, conn *websocket.Conn) map[string]any {

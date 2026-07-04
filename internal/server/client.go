@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -57,44 +58,48 @@ type ProjectRemoveResult struct {
 
 // SessionMetadata is the client-facing session summary returned by GET /sessions.
 type SessionMetadata struct {
-	ID           string    `json:"id"`
-	CreatedAt    time.Time `json:"created_at"`
-	UpdatedAt    time.Time `json:"updated_at"`
-	DisplayName  string    `json:"display_name,omitempty"`
-	Archived     bool      `json:"archived"`
-	LastUsedAt   time.Time `json:"last_used_at"`
-	Provider     string    `json:"provider"`
-	ModelProfile string    `json:"model_profile"`
-	ModelID      string    `json:"model_id"`
-	ProjectID    string    `json:"project_id,omitempty"`
-	CreatedCWD   string    `json:"created_cwd,omitempty"`
-	LastSeq      int64     `json:"last_seq"`
+	ID                string    `json:"id"`
+	CreatedAt         time.Time `json:"created_at"`
+	UpdatedAt         time.Time `json:"updated_at"`
+	DisplayName       string    `json:"display_name,omitempty"`
+	Archived          bool      `json:"archived"`
+	LastUsedAt        time.Time `json:"last_used_at"`
+	InterruptedAt     time.Time `json:"interrupted_at,omitempty"`
+	InterruptedTurnID string    `json:"interrupted_turn_id,omitempty"`
+	Provider          string    `json:"provider"`
+	ModelProfile      string    `json:"model_profile"`
+	ModelID           string    `json:"model_id"`
+	ProjectID         string    `json:"project_id,omitempty"`
+	CreatedCWD        string    `json:"created_cwd,omitempty"`
+	LastSeq           int64     `json:"last_seq"`
 }
 
 // SessionDetail is the client-facing metadata shape returned by GET /sessions/{id}.
 type SessionDetail struct {
-	ID              string                 `json:"id"`
-	CreatedAt       time.Time              `json:"created_at"`
-	UpdatedAt       time.Time              `json:"updated_at"`
-	DisplayName     string                 `json:"display_name,omitempty"`
-	Archived        bool                   `json:"archived"`
-	LastUsedAt      time.Time              `json:"last_used_at"`
-	Provider        string                 `json:"provider"`
-	ModelProfile    string                 `json:"model_profile"`
-	ModelID         string                 `json:"model_id"`
-	Status          string                 `json:"status"`
-	LastSeq         int64                  `json:"last_seq"`
-	CWD             string                 `json:"cwd,omitempty"`
-	ProjectID       string                 `json:"project_id,omitempty"`
-	CreatedCWD      string                 `json:"created_cwd,omitempty"`
-	ConfigPath      string                 `json:"config_path,omitempty"`
-	ModelParameters map[string]any         `json:"model_parameters,omitempty"`
-	EnabledTools    []string               `json:"enabled_tools,omitempty"`
-	EnabledMCP      []string               `json:"enabled_mcp,omitempty"`
-	EnabledSkills   []string               `json:"enabled_skills,omitempty"`
-	ShowReasoning   bool                   `json:"show_reasoning"`
-	Context         contextwindow.Metadata `json:"context"`
-	SaveToolResults bool                   `json:"save_tool_results"`
+	ID                string                 `json:"id"`
+	CreatedAt         time.Time              `json:"created_at"`
+	UpdatedAt         time.Time              `json:"updated_at"`
+	DisplayName       string                 `json:"display_name,omitempty"`
+	Archived          bool                   `json:"archived"`
+	LastUsedAt        time.Time              `json:"last_used_at"`
+	InterruptedAt     time.Time              `json:"interrupted_at,omitempty"`
+	InterruptedTurnID string                 `json:"interrupted_turn_id,omitempty"`
+	Provider          string                 `json:"provider"`
+	ModelProfile      string                 `json:"model_profile"`
+	ModelID           string                 `json:"model_id"`
+	Status            string                 `json:"status"`
+	LastSeq           int64                  `json:"last_seq"`
+	CWD               string                 `json:"cwd,omitempty"`
+	ProjectID         string                 `json:"project_id,omitempty"`
+	CreatedCWD        string                 `json:"created_cwd,omitempty"`
+	ConfigPath        string                 `json:"config_path,omitempty"`
+	ModelParameters   map[string]any         `json:"model_parameters,omitempty"`
+	EnabledTools      []string               `json:"enabled_tools,omitempty"`
+	EnabledMCP        []string               `json:"enabled_mcp,omitempty"`
+	EnabledSkills     []string               `json:"enabled_skills,omitempty"`
+	ShowReasoning     bool                   `json:"show_reasoning"`
+	Context           contextwindow.Metadata `json:"context"`
+	SaveToolResults   bool                   `json:"save_tool_results"`
 }
 
 // SessionCreateMetadata is the optional metadata accepted by
@@ -136,6 +141,11 @@ type SessionCompactResult struct {
 	CompactionID  string `json:"compaction_id"`
 	SummaryItemID string `json:"summary_item_id"`
 	LastSeq       int64  `json:"last_seq"`
+}
+
+type ShutdownOptions struct {
+	Wait    bool
+	Timeout time.Duration
 }
 
 // DiscoveryResult reports the active healthy server, plus stale records removed
@@ -736,12 +746,21 @@ func ShutdownServer(ctx context.Context, addr string, timeout time.Duration) err
 
 // ShutdownServerWithToken sends POST /server/shutdown with the registry bearer token.
 func ShutdownServerWithToken(ctx context.Context, addr, token string, timeout time.Duration) error {
-	req, err := newServerClientRequest(ctx, http.MethodPost, addr, "/server/shutdown")
+	return ShutdownServerWithOptions(ctx, addr, token, ShutdownOptions{}, timeout)
+}
+
+// ShutdownServerWithOptions sends POST /server/shutdown with optional drain mode.
+func ShutdownServerWithOptions(ctx context.Context, addr, token string, options ShutdownOptions, timeout time.Duration) error {
+	path := shutdownPath(options)
+	req, err := newServerClientRequest(ctx, http.MethodPost, addr, path)
 	if err != nil {
 		return err
 	}
 	setBearerToken(req, token)
 	client := http.Client{Timeout: clientTimeout(timeout)}
+	if options.Wait && timeout <= 0 {
+		client.Timeout = 0
+	}
 	resp, err := client.Do(req)
 	if err != nil {
 		return fmt.Errorf("shutdown server at %s: %w", strings.TrimSpace(addr), err)
@@ -751,6 +770,18 @@ func ShutdownServerWithToken(ctx context.Context, addr, token string, timeout ti
 		return fmt.Errorf("shutdown server at %s: %s", strings.TrimSpace(addr), serverResponseError(resp))
 	}
 	return nil
+}
+
+func shutdownPath(options ShutdownOptions) string {
+	if !options.Wait {
+		return "/server/shutdown"
+	}
+	values := url.Values{}
+	values.Set("wait", "true")
+	if options.Timeout > 0 {
+		values.Set("timeout_ms", strconv.FormatInt(int64(options.Timeout/time.Millisecond), 10))
+	}
+	return "/server/shutdown?" + values.Encode()
 }
 
 func newServerClientRequest(ctx context.Context, method, addr, path string) (*http.Request, error) {
