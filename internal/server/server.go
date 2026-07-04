@@ -414,15 +414,35 @@ func (p *Process) handleProjectPath(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	path := strings.TrimPrefix(r.URL.Path, "/projects/")
-	if strings.TrimSpace(path) == "" || strings.Contains(path, "/") {
+	if strings.TrimSpace(path) == "" {
 		writeError(w, http.StatusNotFound, "not_found", "path not found")
 		return
 	}
-	if r.Method != http.MethodGet {
-		writeMethodNotAllowed(w, http.MethodGet)
+	parts := strings.Split(path, "/")
+	projectID := parts[0]
+	if strings.TrimSpace(projectID) == "" {
+		writeError(w, http.StatusNotFound, "not_found", "path not found")
 		return
 	}
-	p.handleProjectDetail(w, r, path)
+	switch {
+	case len(parts) == 1:
+		if r.Method != http.MethodGet {
+			writeMethodNotAllowed(w, http.MethodGet)
+			return
+		}
+		p.handleProjectDetail(w, r, projectID)
+	case len(parts) == 2 && parts[1] == "sessions":
+		switch r.Method {
+		case http.MethodGet:
+			p.handleProjectSessionsList(w, r, projectID)
+		case http.MethodPost:
+			p.handleProjectSessionsCreate(w, r, projectID)
+		default:
+			writeMethodNotAllowed(w, http.MethodGet, http.MethodPost)
+		}
+	default:
+		writeError(w, http.StatusNotFound, "not_found", "path not found")
+	}
 }
 
 func (p *Process) handleProjectsList(w http.ResponseWriter, r *http.Request) {
@@ -484,6 +504,89 @@ func (p *Process) handleProjectDetail(w http.ResponseWriter, r *http.Request, id
 		return
 	}
 	writeJSON(w, http.StatusOK, projectDTOFromProject(project))
+}
+
+func (p *Process) handleProjectSessionsList(w http.ResponseWriter, r *http.Request, projectID string) {
+	project, ok := p.loadActiveProjectForSessionPath(w, projectID)
+	if !ok {
+		return
+	}
+	store := p.sessionStore
+	if store == nil {
+		writeError(w, http.StatusServiceUnavailable, "session_store_unavailable", "session store is not configured")
+		return
+	}
+	infos, err := store.List()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "session_store_error", "could not list sessions")
+		return
+	}
+	items := make([]sessionMetadataDTO, 0, len(infos))
+	for _, info := range infos {
+		if info.ProjectID != project.ID {
+			continue
+		}
+		session, err := store.Load(info.ID)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "session_store_error", "could not load session metadata")
+			return
+		}
+		items = append(items, sessionMetadataDTOFromSession(session))
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"sessions": items,
+	})
+}
+
+func (p *Process) handleProjectSessionsCreate(w http.ResponseWriter, r *http.Request, projectID string) {
+	project, ok := p.loadActiveProjectForSessionPath(w, projectID)
+	if !ok {
+		return
+	}
+	store := p.sessionStore
+	if store == nil {
+		writeError(w, http.StatusServiceUnavailable, "session_store_unavailable", "session store is not configured")
+		return
+	}
+	if err := readEmptySessionCreateRequest(w, r); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_request", err.Error())
+		return
+	}
+
+	session := p.newSessionFromDefaults()
+	session.ProjectID = project.ID
+	if strings.TrimSpace(session.CreatedCWD) == "" {
+		session.CreatedCWD = session.CWD
+	}
+
+	saved, err := store.SaveMetadata(session)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "session_store_error", "could not create session")
+		return
+	}
+	writeJSON(w, http.StatusCreated, sessionDetailDTOFromSession(saved, "idle"))
+}
+
+func (p *Process) loadActiveProjectForSessionPath(w http.ResponseWriter, projectID string) (projectstore.Project, bool) {
+	store := p.projectStore
+	if store == nil {
+		writeError(w, http.StatusServiceUnavailable, "project_store_unavailable", "project store is not configured")
+		return projectstore.Project{}, false
+	}
+	project, err := store.Load(projectID)
+	if err != nil {
+		if errors.Is(err, projectstore.ErrNotFound) {
+			writeError(w, http.StatusNotFound, "project_not_found", "project not found")
+			return projectstore.Project{}, false
+		}
+		writeError(w, http.StatusBadRequest, "invalid_project_id", "invalid project id")
+		return projectstore.Project{}, false
+	}
+	if project.Archived {
+		writeError(w, http.StatusConflict, "project_archived", "project is archived")
+		return projectstore.Project{}, false
+	}
+	return project, true
 }
 
 func (p *Process) handleSessionPath(w http.ResponseWriter, r *http.Request) {
@@ -558,15 +661,7 @@ func (p *Process) handleSessionsList(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusInternalServerError, "session_store_error", "could not load session metadata")
 			return
 		}
-		items = append(items, sessionMetadataDTO{
-			ID:           info.ID,
-			CreatedAt:    info.CreatedAt,
-			UpdatedAt:    info.UpdatedAt,
-			Provider:     info.Provider,
-			ModelProfile: info.ModelProfile,
-			ModelID:      info.ModelID,
-			LastSeq:      session.LastSeq,
-		})
+		items = append(items, sessionMetadataDTOFromSession(session))
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"sessions": items,
@@ -588,16 +683,7 @@ func (p *Process) handleSessionsCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	session := copySessionMetadata(p.sessionDefaults)
-	session.ID = ""
-	session.Version = sessions.VersionV2
-	session.CreatedAt = time.Time{}
-	session.UpdatedAt = time.Time{}
-	session.Items = nil
-	session.ActiveHistory = nil
-	session.Compactions = nil
-	session.LastSeq = 0
-	session.SaveToolResults = true
+	session := p.newSessionFromDefaults()
 
 	saved, err := store.SaveMetadata(session)
 	if err != nil {
@@ -1271,6 +1357,8 @@ type sessionMetadataDTO struct {
 	Provider     string    `json:"provider"`
 	ModelProfile string    `json:"model_profile"`
 	ModelID      string    `json:"model_id"`
+	ProjectID    string    `json:"project_id,omitempty"`
+	CreatedCWD   string    `json:"created_cwd,omitempty"`
 	LastSeq      int64     `json:"last_seq"`
 }
 
@@ -1298,6 +1386,8 @@ type sessionDetailDTO struct {
 	Status          string                 `json:"status"`
 	LastSeq         int64                  `json:"last_seq"`
 	CWD             string                 `json:"cwd,omitempty"`
+	ProjectID       string                 `json:"project_id,omitempty"`
+	CreatedCWD      string                 `json:"created_cwd,omitempty"`
 	ConfigPath      string                 `json:"config_path,omitempty"`
 	ModelParameters map[string]any         `json:"model_parameters,omitempty"`
 	EnabledTools    []string               `json:"enabled_tools,omitempty"`
@@ -1370,6 +1460,8 @@ func sessionDetailDTOFromSession(session sessions.SessionV2, status string) sess
 		Status:          status,
 		LastSeq:         session.LastSeq,
 		CWD:             session.CWD,
+		ProjectID:       session.ProjectID,
+		CreatedCWD:      session.CreatedCWD,
 		ConfigPath:      session.RootConfigPath(),
 		ModelParameters: copyMap(session.ModelParameters),
 		EnabledTools:    copyStrings(session.EnabledTools),
@@ -1837,6 +1929,34 @@ func validSessionAPIID(id string) bool {
 		return false
 	}
 	return true
+}
+
+func (p *Process) newSessionFromDefaults() sessions.SessionV2 {
+	session := copySessionMetadata(p.sessionDefaults)
+	session.ID = ""
+	session.Version = sessions.VersionV2
+	session.CreatedAt = time.Time{}
+	session.UpdatedAt = time.Time{}
+	session.Items = nil
+	session.ActiveHistory = nil
+	session.Compactions = nil
+	session.LastSeq = 0
+	session.SaveToolResults = true
+	return session
+}
+
+func sessionMetadataDTOFromSession(session sessions.SessionV2) sessionMetadataDTO {
+	return sessionMetadataDTO{
+		ID:           session.ID,
+		CreatedAt:    session.CreatedAt,
+		UpdatedAt:    session.UpdatedAt,
+		Provider:     session.Provider,
+		ModelProfile: session.ModelProfile,
+		ModelID:      session.ModelID,
+		ProjectID:    session.ProjectID,
+		CreatedCWD:   session.CreatedCWD,
+		LastSeq:      session.LastSeq,
+	}
 }
 
 func copySessionMetadata(session sessions.SessionV2) sessions.SessionV2 {

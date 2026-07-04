@@ -97,6 +97,8 @@ type SessionV2 struct {
 	ModelID              string                 `json:"model_id"`
 	ModelParameters      map[string]any         `json:"model_parameters,omitempty"`
 	CWD                  string                 `json:"cwd"`
+	ProjectID            string                 `json:"project_id,omitempty"`
+	CreatedCWD           string                 `json:"created_cwd,omitempty"`
 	ConfigPath           string                 `json:"config_path,omitempty"`
 	ConfigDir            string                 `json:"config_dir,omitempty"`
 	EnabledTools         []string               `json:"enabled_tools,omitempty"`
@@ -994,6 +996,8 @@ type sessionV2Metadata struct {
 	ModelID              string                 `json:"model_id"`
 	ModelParameters      map[string]any         `json:"model_parameters,omitempty"`
 	CWD                  string                 `json:"cwd"`
+	ProjectID            string                 `json:"project_id,omitempty"`
+	CreatedCWD           string                 `json:"created_cwd,omitempty"`
 	ConfigPath           string                 `json:"config_path,omitempty"`
 	ConfigDir            string                 `json:"config_dir,omitempty"`
 	EnabledTools         []string               `json:"enabled_tools,omitempty"`
@@ -1051,6 +1055,8 @@ func metadataFromSessionV2(session SessionV2) sessionV2Metadata {
 		ModelID:              session.ModelID,
 		ModelParameters:      session.ModelParameters,
 		CWD:                  session.CWD,
+		ProjectID:            session.ProjectID,
+		CreatedCWD:           session.CreatedCWD,
 		ConfigPath:           session.ConfigPath,
 		ConfigDir:            session.ConfigDir,
 		EnabledTools:         session.EnabledTools,
@@ -1075,6 +1081,8 @@ func (m sessionV2Metadata) session() SessionV2 {
 		ModelID:              m.ModelID,
 		ModelParameters:      copyMap(m.ModelParameters),
 		CWD:                  m.CWD,
+		ProjectID:            m.ProjectID,
+		CreatedCWD:           m.CreatedCWD,
 		ConfigPath:           m.ConfigPath,
 		ConfigDir:            m.ConfigDir,
 		EnabledTools:         copyStrings(m.EnabledTools),
@@ -1433,6 +1441,8 @@ func (s SessionV2) info() Info {
 		Provider:        s.Provider,
 		ModelProfile:    s.ModelProfile,
 		ModelID:         s.ModelID,
+		ProjectID:       s.ProjectID,
+		CreatedCWD:      s.CreatedCWD,
 		ContextWindow:   s.Context.ContextWindow,
 		ContextSource:   s.Context.ContextWindowSource,
 		SaveToolResults: s.SaveToolResults,

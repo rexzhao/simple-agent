@@ -17,6 +17,7 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/rexzhao/simple-agent/internal/contextwindow"
 	"github.com/rexzhao/simple-agent/internal/model"
+	projectstore "github.com/rexzhao/simple-agent/internal/projects"
 	"github.com/rexzhao/simple-agent/internal/sessions"
 )
 
@@ -240,6 +241,229 @@ func TestSessionCreateRequiresRegistryToken(t *testing.T) {
 	}
 	if len(infos) != 1 {
 		t.Fatalf("len(List()) = %d, want only the valid created session after invalid bodies", len(infos))
+	}
+}
+
+func TestProjectSessionAPIsCreateListFilterAndClient(t *testing.T) {
+	projectStore := projectstore.NewStore(filepath.Join(t.TempDir(), "projects"))
+	sessionStore := sessions.NewV2Store(filepath.Join(t.TempDir(), "sessions"))
+	projectOne, _, err := projectStore.Create(mkdirServerTestDir(t, "project-one"), "Project One")
+	if err != nil {
+		t.Fatalf("Create(project one) error = %v", err)
+	}
+	projectTwo, _, err := projectStore.Create(mkdirServerTestDir(t, "project-two"), "Project Two")
+	if err != nil {
+		t.Fatalf("Create(project two) error = %v", err)
+	}
+
+	defaults := sessions.SessionV2{
+		Provider:      "codex-work",
+		ModelProfile:  "gpt-5.5",
+		ModelID:       "gpt-5.5-real",
+		CWD:           mkdirServerTestDir(t, "created-cwd"),
+		ConfigPath:    filepath.Join(t.TempDir(), "sai.yaml"),
+		EnabledTools:  []string{"read_file"},
+		EnabledSkills: []string{"reviewer"},
+	}
+	if _, err := sessionStore.SaveMetadata(sessions.SessionV2{
+		ID:              "project-one-old",
+		ProjectID:       projectOne.ID,
+		CreatedCWD:      defaults.CWD,
+		Provider:        "codex-work",
+		ModelProfile:    "gpt-5.5",
+		ModelID:         "gpt-5.5-real",
+		CWD:             defaults.CWD,
+		SaveToolResults: true,
+	}); err != nil {
+		t.Fatalf("SaveMetadata(project-one-old) error = %v", err)
+	}
+	appendServerTestItem(t, sessionStore, "project-one-old", sessions.SessionItem{
+		ID:         "item-1",
+		Kind:       sessions.ItemKindMessage,
+		Visibility: sessions.ItemVisibilityVisible,
+		Audience:   sessions.ItemAudienceUser,
+		Message:    &model.Message{Role: model.MessageRoleUser, Content: "project one"},
+	})
+	if _, err := sessionStore.SaveMetadata(sessions.SessionV2{
+		ID:              "project-two-old",
+		ProjectID:       projectTwo.ID,
+		CreatedCWD:      defaults.CWD,
+		Provider:        "codex-work",
+		ModelProfile:    "gpt-5.5",
+		ModelID:         "gpt-5.5-real",
+		CWD:             defaults.CWD,
+		SaveToolResults: true,
+	}); err != nil {
+		t.Fatalf("SaveMetadata(project-two-old) error = %v", err)
+	}
+	if _, err := sessionStore.SaveMetadata(sessions.SessionV2{
+		ID:              "legacy-without-project",
+		Provider:        "codex-work",
+		ModelProfile:    "gpt-5.5",
+		ModelID:         "gpt-5.5-real",
+		CWD:             defaults.CWD,
+		SaveToolResults: true,
+	}); err != nil {
+		t.Fatalf("SaveMetadata(legacy-without-project) error = %v", err)
+	}
+
+	process := startProjectSessionAPIServer(t, projectStore, sessionStore, defaults, "registry-token")
+	baseURL := "http://" + process.Addr()
+
+	raw, body := getRawJSONStatus(t, baseURL+"/projects/"+projectOne.ID+"/sessions", "", http.StatusForbidden)
+	assertErrorCode(t, body, "permission_denied")
+	if stringContainsAny(raw, "registry-token", projectOne.Root) {
+		t.Fatalf("permission error leaked token or project root: %s", raw)
+	}
+	raw, body = postRawJSONStatus(t, baseURL+"/projects/"+projectOne.ID+"/sessions", "", "", http.StatusForbidden)
+	assertErrorCode(t, body, "permission_denied")
+	if stringContainsAny(raw, "registry-token", projectOne.Root) {
+		t.Fatalf("permission error leaked token or project root: %s", raw)
+	}
+
+	listed, err := ListProjectSessionsWithToken(context.Background(), process.Addr(), "registry-token", projectOne.ID, 2*time.Second)
+	if err != nil {
+		t.Fatalf("ListProjectSessionsWithToken() error = %v", err)
+	}
+	if got := sessionMetadataIDs(listed); !reflect.DeepEqual(got, []string{"project-one-old"}) {
+		t.Fatalf("project one sessions before create = %#v, want project-one-old only", got)
+	}
+	if listed[0].ProjectID != projectOne.ID || listed[0].CreatedCWD != defaults.CWD || listed[0].LastSeq != 1 {
+		t.Fatalf("project one metadata = %#v, want project identity and last_seq", listed[0])
+	}
+
+	created, err := CreateProjectSessionWithToken(context.Background(), process.Addr(), "registry-token", projectOne.ID, 2*time.Second)
+	if err != nil {
+		t.Fatalf("CreateProjectSessionWithToken() error = %v", err)
+	}
+	if created.ID == "" || created.ProjectID != projectOne.ID || created.CreatedCWD != defaults.CWD || created.CWD != defaults.CWD {
+		t.Fatalf("created project session = %#v, want project id and created cwd from defaults", created)
+	}
+	if created.Provider != defaults.Provider || created.ModelProfile != defaults.ModelProfile || created.ModelID != defaults.ModelID {
+		t.Fatalf("created model defaults = %#v, want %#v", created, defaults)
+	}
+
+	stored, err := sessionStore.Load(created.ID)
+	if err != nil {
+		t.Fatalf("Load(created project session) error = %v", err)
+	}
+	if stored.ProjectID != projectOne.ID || stored.CreatedCWD != defaults.CWD || stored.CWD != defaults.CWD {
+		t.Fatalf("stored project session identity = %#v, want project id and created cwd", stored)
+	}
+	if len(stored.Items) != 0 || len(stored.ActiveHistory) != 0 || stored.LastSeq != 0 {
+		t.Fatalf("stored project session has timeline state: items=%#v active=%#v last_seq=%d", stored.Items, stored.ActiveHistory, stored.LastSeq)
+	}
+
+	listed, err = ListProjectSessionsWithToken(context.Background(), process.Addr(), "registry-token", projectOne.ID, 2*time.Second)
+	if err != nil {
+		t.Fatalf("ListProjectSessionsWithToken(after create) error = %v", err)
+	}
+	if got, want := sessionMetadataIDSet(listed), map[string]bool{"project-one-old": true, created.ID: true}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("project one sessions after create = %#v, want %#v", got, want)
+	}
+	for _, item := range listed {
+		if item.ProjectID != projectOne.ID {
+			t.Fatalf("project one list returned session for project %q: %#v", item.ProjectID, item)
+		}
+	}
+}
+
+func TestProjectSessionListSkipsUnrelatedCorruptSessionBeforeReplay(t *testing.T) {
+	projectStore := projectstore.NewStore(filepath.Join(t.TempDir(), "projects"))
+	sessionRoot := filepath.Join(t.TempDir(), "sessions")
+	sessionStore := sessions.NewV2Store(sessionRoot)
+	targetProject, _, err := projectStore.Create(mkdirServerTestDir(t, "target-project"), "Target")
+	if err != nil {
+		t.Fatalf("Create(target project) error = %v", err)
+	}
+	otherProject, _, err := projectStore.Create(mkdirServerTestDir(t, "other-project"), "Other")
+	if err != nil {
+		t.Fatalf("Create(other project) error = %v", err)
+	}
+	if _, err := sessionStore.SaveMetadata(sessions.SessionV2{
+		ID:              "target-session",
+		ProjectID:       targetProject.ID,
+		CreatedCWD:      targetProject.Root,
+		Provider:        "codex-work",
+		ModelProfile:    "gpt-5.5",
+		ModelID:         "gpt-5.5-real",
+		CWD:             targetProject.Root,
+		SaveToolResults: true,
+	}); err != nil {
+		t.Fatalf("SaveMetadata(target-session) error = %v", err)
+	}
+	appendServerTestItem(t, sessionStore, "target-session", sessions.SessionItem{
+		ID:         "target-item",
+		Kind:       sessions.ItemKindMessage,
+		Visibility: sessions.ItemVisibilityVisible,
+		Audience:   sessions.ItemAudienceUser,
+		Message:    &model.Message{Role: model.MessageRoleUser, Content: "target"},
+	})
+	if _, err := sessionStore.SaveMetadata(sessions.SessionV2{
+		ID:              "unrelated-corrupt",
+		ProjectID:       otherProject.ID,
+		CreatedCWD:      otherProject.Root,
+		Provider:        "codex-work",
+		ModelProfile:    "gpt-5.5",
+		ModelID:         "gpt-5.5-real",
+		CWD:             otherProject.Root,
+		SaveToolResults: true,
+	}); err != nil {
+		t.Fatalf("SaveMetadata(unrelated-corrupt) error = %v", err)
+	}
+	writeCorruptSessionSegmentForServerTest(t, sessionRoot, "unrelated-corrupt")
+
+	process := startProjectSessionAPIServer(t, projectStore, sessionStore, sessions.SessionV2{}, "registry-token")
+	listed, err := ListProjectSessionsWithToken(context.Background(), process.Addr(), "registry-token", targetProject.ID, 2*time.Second)
+	if err != nil {
+		t.Fatalf("ListProjectSessionsWithToken() error = %v", err)
+	}
+	if got := sessionMetadataIDs(listed); !reflect.DeepEqual(got, []string{"target-session"}) {
+		t.Fatalf("target project sessions = %#v, want target-session only", got)
+	}
+	if listed[0].LastSeq != 1 || listed[0].ProjectID != targetProject.ID {
+		t.Fatalf("target project session metadata = %#v, want last_seq and project id", listed[0])
+	}
+}
+
+func TestProjectSessionAPIsRequireExistingActiveProject(t *testing.T) {
+	projectStore := projectstore.NewStore(filepath.Join(t.TempDir(), "projects"))
+	sessionStore := sessions.NewV2Store(filepath.Join(t.TempDir(), "sessions"))
+	archived, _, err := projectStore.Create(mkdirServerTestDir(t, "archived-project"), "Archived")
+	if err != nil {
+		t.Fatalf("Create(archived) error = %v", err)
+	}
+	archiveProjectForServerTest(t, projectStore, archived)
+
+	process := startProjectSessionAPIServer(t, projectStore, sessionStore, sessions.SessionV2{}, "registry-token")
+	baseURL := "http://" + process.Addr()
+
+	for _, tt := range []struct {
+		name       string
+		projectID  string
+		wantStatus int
+		wantCode   string
+	}{
+		{name: "missing", projectID: "project-missing", wantStatus: http.StatusNotFound, wantCode: "project_not_found"},
+		{name: "invalid", projectID: "bad%20project", wantStatus: http.StatusBadRequest, wantCode: "invalid_project_id"},
+		{name: "archived", projectID: archived.ID, wantStatus: http.StatusConflict, wantCode: "project_archived"},
+	} {
+		t.Run(tt.name+" list", func(t *testing.T) {
+			_, body := getRawJSONStatus(t, baseURL+"/projects/"+tt.projectID+"/sessions", "registry-token", tt.wantStatus)
+			assertErrorCode(t, body, tt.wantCode)
+		})
+		t.Run(tt.name+" create", func(t *testing.T) {
+			_, body := postRawJSONStatus(t, baseURL+"/projects/"+tt.projectID+"/sessions", "", "registry-token", tt.wantStatus)
+			assertErrorCode(t, body, tt.wantCode)
+		})
+	}
+
+	infos, err := sessionStore.List()
+	if err != nil {
+		t.Fatalf("List() error = %v", err)
+	}
+	if len(infos) != 0 {
+		t.Fatalf("sessions after rejected project session creates = %#v, want none", infos)
 	}
 }
 
@@ -1791,6 +2015,95 @@ func startSessionAPIServerWithRunners(t *testing.T, store *sessions.V2Store, def
 		}
 	})
 	return process
+}
+
+func startProjectSessionAPIServer(t *testing.T, projectStore *projectstore.Store, sessionStore *sessions.V2Store, defaults sessions.SessionV2, token string) *Process {
+	t.Helper()
+
+	process, err := Start(Options{
+		CWD:             defaults.CWD,
+		ConfigPath:      defaults.ConfigPath,
+		Listen:          "127.0.0.1:0",
+		Version:         "test-version",
+		AuthToken:       token,
+		ProjectStore:    projectStore,
+		SessionStore:    sessionStore,
+		SessionDefaults: defaults,
+	})
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	serveDone := make(chan error, 1)
+	go func() {
+		serveDone <- process.Serve(context.Background())
+	}()
+	waitForHealthyServer(t, process.Addr())
+	t.Cleanup(func() {
+		_ = process.Shutdown(context.Background())
+		select {
+		case err := <-serveDone:
+			if err != nil {
+				t.Fatalf("Serve() error = %v", err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("Serve() did not stop")
+		}
+	})
+	return process
+}
+
+func mkdirServerTestDir(t *testing.T, name string) string {
+	t.Helper()
+
+	path := filepath.Join(t.TempDir(), name)
+	if err := os.MkdirAll(path, 0o755); err != nil {
+		t.Fatalf("MkdirAll(%s) error = %v", path, err)
+	}
+	return path
+}
+
+func archiveProjectForServerTest(t *testing.T, store *projectstore.Store, project projectstore.Project) {
+	t.Helper()
+
+	project.Archived = true
+	raw, err := json.MarshalIndent(project, "", "  ")
+	if err != nil {
+		t.Fatalf("MarshalIndent(project) error = %v", err)
+	}
+	raw = append(raw, '\n')
+	path := filepath.Join(store.Root(), project.ID, "project.json")
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		t.Fatalf("WriteFile(%s) error = %v", path, err)
+	}
+}
+
+func writeCorruptSessionSegmentForServerTest(t *testing.T, sessionRoot, sessionID string) {
+	t.Helper()
+
+	segmentsDir := filepath.Join(sessionRoot, sessionID, "segments")
+	if err := os.MkdirAll(segmentsDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll(%s) error = %v", segmentsDir, err)
+	}
+	path := filepath.Join(segmentsDir, "000001.jsonl")
+	if err := os.WriteFile(path, []byte(`{"seq":1,"type":"item.appended","item":`+"\n"), 0o600); err != nil {
+		t.Fatalf("WriteFile(%s) error = %v", path, err)
+	}
+}
+
+func sessionMetadataIDs(items []SessionMetadata) []string {
+	ids := make([]string, 0, len(items))
+	for _, item := range items {
+		ids = append(ids, item.ID)
+	}
+	return ids
+}
+
+func sessionMetadataIDSet(items []SessionMetadata) map[string]bool {
+	ids := make(map[string]bool, len(items))
+	for _, item := range items {
+		ids[item.ID] = true
+	}
+	return ids
 }
 
 type fakeSessionTurnRunner struct {

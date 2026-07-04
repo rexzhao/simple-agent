@@ -53,6 +53,8 @@ type SessionMetadata struct {
 	Provider     string    `json:"provider"`
 	ModelProfile string    `json:"model_profile"`
 	ModelID      string    `json:"model_id"`
+	ProjectID    string    `json:"project_id,omitempty"`
+	CreatedCWD   string    `json:"created_cwd,omitempty"`
 	LastSeq      int64     `json:"last_seq"`
 }
 
@@ -67,6 +69,8 @@ type SessionDetail struct {
 	Status          string                 `json:"status"`
 	LastSeq         int64                  `json:"last_seq"`
 	CWD             string                 `json:"cwd,omitempty"`
+	ProjectID       string                 `json:"project_id,omitempty"`
+	CreatedCWD      string                 `json:"created_cwd,omitempty"`
 	ConfigPath      string                 `json:"config_path,omitempty"`
 	ModelParameters map[string]any         `json:"model_parameters,omitempty"`
 	EnabledTools    []string               `json:"enabled_tools,omitempty"`
@@ -245,6 +249,59 @@ func GetProjectWithToken(ctx context.Context, addr, token, id string, timeout ti
 		return ProjectInfo{}, fmt.Errorf("decode project %s at %s: %w", strings.TrimSpace(id), strings.TrimSpace(addr), err)
 	}
 	return project, nil
+}
+
+// ListProjectSessionsWithToken fetches session metadata from GET /projects/{id}/sessions.
+func ListProjectSessionsWithToken(ctx context.Context, addr, token, projectID string, timeout time.Duration) ([]SessionMetadata, error) {
+	projectID = strings.TrimSpace(projectID)
+	req, err := newServerClientRequest(ctx, http.MethodGet, addr, "/projects/"+url.PathEscape(projectID)+"/sessions")
+	if err != nil {
+		return nil, err
+	}
+	setBearerToken(req, token)
+	client := http.Client{Timeout: clientTimeout(timeout)}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("list project sessions %s at %s: %w", projectID, strings.TrimSpace(addr), err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("list project sessions %s at %s: %s", projectID, strings.TrimSpace(addr), serverResponseError(resp))
+	}
+	var body struct {
+		Sessions []SessionMetadata `json:"sessions"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		return nil, fmt.Errorf("decode project sessions %s at %s: %w", projectID, strings.TrimSpace(addr), err)
+	}
+	return body.Sessions, nil
+}
+
+// CreateProjectSessionWithToken sends POST /projects/{id}/sessions with the registry bearer token.
+func CreateProjectSessionWithToken(ctx context.Context, addr, token, projectID string, timeout time.Duration) (SessionDetail, error) {
+	projectID = strings.TrimSpace(projectID)
+	req, err := newServerClientRequest(ctx, http.MethodPost, addr, "/projects/"+url.PathEscape(projectID)+"/sessions")
+	if err != nil {
+		return SessionDetail{}, err
+	}
+	setBearerToken(req, token)
+	client := http.Client{}
+	if timeout > 0 {
+		client.Timeout = timeout
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return SessionDetail{}, fmt.Errorf("create project session %s at %s: %w", projectID, strings.TrimSpace(addr), err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		return SessionDetail{}, fmt.Errorf("create project session %s at %s: %s", projectID, strings.TrimSpace(addr), serverWriteResponseError(resp))
+	}
+	var detail SessionDetail
+	if err := json.NewDecoder(resp.Body).Decode(&detail); err != nil {
+		return SessionDetail{}, fmt.Errorf("decode created project session %s at %s: %w", projectID, strings.TrimSpace(addr), err)
+	}
+	return detail, nil
 }
 
 // ListSessions fetches public session metadata from GET /sessions.

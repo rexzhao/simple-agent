@@ -32,6 +32,8 @@ func TestV2StoreSaveLoadMetadata(t *testing.T) {
 			"temperature": 0.2,
 		},
 		CWD:           `F:\work\simple-agent`,
+		ProjectID:     "project-123",
+		CreatedCWD:    `F:\work\simple-agent\created`,
 		ConfigPath:    filepath.Join(root, "..", "custom.yaml"),
 		EnabledTools:  []string{"read_file"},
 		EnabledMCP:    []string{"local"},
@@ -98,6 +100,18 @@ func TestV2StoreSaveLoadMetadata(t *testing.T) {
 			t.Fatalf("meta.json contains %q; want metadata only: %s", key, raw)
 		}
 	}
+	for key, want := range map[string]string{
+		"project_id":  saved.ProjectID,
+		"created_cwd": saved.CreatedCWD,
+	} {
+		var got string
+		if err := json.Unmarshal(metadata[key], &got); err != nil {
+			t.Fatalf("Unmarshal(meta.json[%s]) error = %v; raw=%s", key, err, raw)
+		}
+		if got != want {
+			t.Fatalf("meta.json[%s] = %q, want %q", key, got, want)
+		}
+	}
 
 	loaded, err := store.Load("session-1")
 	if err != nil {
@@ -108,6 +122,9 @@ func TestV2StoreSaveLoadMetadata(t *testing.T) {
 	}
 	if loaded.CWD != saved.CWD || loaded.ConfigPath != saved.ConfigPath {
 		t.Fatalf("loaded paths = cwd %q config %q, want cwd %q config %q", loaded.CWD, loaded.ConfigPath, saved.CWD, saved.ConfigPath)
+	}
+	if loaded.ProjectID != saved.ProjectID || loaded.CreatedCWD != saved.CreatedCWD {
+		t.Fatalf("loaded M21 identity = project_id %q created_cwd %q, want %q/%q", loaded.ProjectID, loaded.CreatedCWD, saved.ProjectID, saved.CreatedCWD)
 	}
 	if loaded.RootConfigPath() != saved.ConfigPath {
 		t.Fatalf("RootConfigPath() = %q, want %q", loaded.RootConfigPath(), saved.ConfigPath)

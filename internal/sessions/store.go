@@ -67,6 +67,8 @@ type Info struct {
 	Provider        string    `json:"provider"`
 	ModelProfile    string    `json:"model_profile"`
 	ModelID         string    `json:"model_id"`
+	ProjectID       string    `json:"project_id,omitempty"`
+	CreatedCWD      string    `json:"created_cwd,omitempty"`
 	ContextWindow   int       `json:"context_window,omitempty"`
 	ContextSource   string    `json:"context_window_source,omitempty"`
 	SaveToolResults bool      `json:"save_tool_results"`

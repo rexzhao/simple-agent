@@ -82,8 +82,8 @@ evidence 证明。
 - [ ] `--new` 等价于 session create 后 attach。
 - [ ] primary command shape 是 singular `session`。
 - [ ] 如果保留旧 `sessions`，仅作为 list alias。
-- [ ] `session create` 记录 project id。
-- [ ] `session create` 记录 `created_cwd`。
+- [x] `session create` 记录 project id。
+- [x] `session create` 记录 `created_cwd`。
 - [ ] `session create` 记录 `config_path`。
 - [ ] `session create` 记录 provider/model/tools/MCP/skills 等关键 metadata。
 - [ ] 每个 turn 重新读取 session 的 `config_path`。
@@ -144,8 +144,8 @@ evidence 证明。
 - [x] 提供 `POST /projects`。
 - [x] 提供 project detail endpoint：`GET /projects/{project_id}`。
 - [ ] 提供 project remove endpoint。
-- [ ] 提供 `GET /projects/{project_id}/sessions`。
-- [ ] 提供 `POST /projects/{project_id}/sessions`。
+- [x] 提供 `GET /projects/{project_id}/sessions`。
+- [x] 提供 `POST /projects/{project_id}/sessions`。
 - [ ] 提供 `GET /sessions/{session_id}`。
 - [ ] 提供 session rename/archive endpoint。
 - [ ] 提供 `POST /sessions/{session_id}/messages`。
@@ -178,17 +178,17 @@ evidence 证明。
 - [x] 单元/集成测试覆盖 singleton per home namespace。
 - [x] 测试覆盖 different home dirs independent。
 - [x] 测试覆盖 explicit project create。
-- [ ] 测试覆盖 explicit session create。
+- [x] 测试覆盖 explicit session create。
 - [x] 测试覆盖 nested discovery。
 - [ ] 测试覆盖 config rejection for existing sessions。
 - [ ] 测试覆盖 cwd rejection for existing sessions。
 - [x] 测试覆盖 direct replacement/no chat product entry。
 - [x] 测试覆盖 explicit project API paths。
-- [ ] 测试覆盖 explicit session API paths。
+- [x] 测试覆盖 explicit session API paths。
 - [ ] 测试覆盖 shutdown immediate/wait semantics。
 - [ ] 测试覆盖 interrupted recovery。
 - [ ] 测试覆盖 JSONL/blob pagination。
-- [ ] `go test ./...` 通过。
+- [x] `go test ./...` 通过。
 - [x] `git diff --check` 通过。
 - [x] 在本文件追加 smoke evidence，包含命令、日期、结果和任何已知限制。
 
@@ -217,6 +217,12 @@ evidence 证明。
   `project show` nearest registered ancestor matching、`project show --cwd` rejection、project help
   不列 unimplemented remove，以及 project command scoped auto-start without startup output。
 - 2026-07-04 M21 slice 4: `git diff --check` 通过。
-- Known limits: 当前 M21 slices 未实现 session lifecycle、attach/send project selection changes、
+- 2026-07-04 M21 slice 5: `go test ./internal/sessions ./internal/server` 通过；覆盖 V2
+  `project_id` / `created_cwd` metadata persistence，以及 authenticated
+  `GET /projects/{project_id}/sessions` / `POST /projects/{project_id}/sessions` create/list/filter、
+  missing/invalid/archived project errors 和 project-scoped client helpers。
+- 2026-07-04 M21 slice 5: `go test ./...` 通过。
+- 2026-07-04 M21 slice 5: `git diff --check` 通过。
+- Known limits: 当前 M21 slices 未实现 CLI session lifecycle、attach/send project selection changes、
   project remove/archive、GUI server work、session data store home
   migration 或 registry `base_url` schema rename。
