@@ -85,17 +85,103 @@ func runWithProgramContextAndInterrupts(ctx context.Context, program string, arg
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	displayCommand := displayProgramName(program)
 	if err := execute(ctx, program, args, stdin, stdout, stderr, getwd, interrupts); err != nil {
 		if errors.Is(err, errSilentExit) {
 			return 1
 		}
-		fmt.Fprintf(stderr, "sai: %v\n", err)
+		fmt.Fprintf(stderr, "%s: %s\n", displayCommand, renderCLIError(err, displayCommand))
 		return 1
 	}
 	return 0
 }
 
 var errSilentExit = errors.New("silent exit")
+
+func displayProgramName(program string) string {
+	base := strings.TrimSpace(filepath.Base(program))
+	if base == "" || base == "." || base == string(filepath.Separator) {
+		return "sai"
+	}
+	return base
+}
+
+func renderCommandText(text, command string) string {
+	displayCommand := displayProgramName(command)
+	if displayCommand == "sai" {
+		return text
+	}
+
+	var out strings.Builder
+	out.Grow(len(text))
+	for i := 0; i < len(text); {
+		if strings.HasPrefix(text[i:], "sai") && isCommandBoundary(text, i-1) && isCommandBoundary(text, i+3) {
+			out.WriteString(displayCommand)
+			i += 3
+			continue
+		}
+		out.WriteByte(text[i])
+		i++
+	}
+	return out.String()
+}
+
+func isCommandBoundary(text string, index int) bool {
+	if index < 0 || index >= len(text) {
+		return true
+	}
+	ch := text[index]
+	return !('a' <= ch && ch <= 'z') &&
+		!('A' <= ch && ch <= 'Z') &&
+		!('0' <= ch && ch <= '9') &&
+		ch != '_' &&
+		ch != '-' &&
+		ch != '.'
+}
+
+func renderCLIError(err error, command string) string {
+	var usageErr cliUsageError
+	if errors.As(err, &usageErr) {
+		return usageErr.Render(command)
+	}
+	return err.Error()
+}
+
+type commandWarningWriter struct {
+	inner   io.Writer
+	command string
+}
+
+func newCommandWarningWriter(inner io.Writer, command string) io.Writer {
+	if inner == nil {
+		return nil
+	}
+	return commandWarningWriter{inner: inner, command: displayProgramName(command)}
+}
+
+func (w commandWarningWriter) Write(p []byte) (int, error) {
+	text := renderWarningPrefix(string(p), w.command)
+	if _, err := io.WriteString(w.inner, text); err != nil {
+		return 0, err
+	}
+	return len(p), nil
+}
+
+func renderWarningPrefix(text, command string) string {
+	command = displayProgramName(command)
+	if command == "sai" {
+		return text
+	}
+	const prefix = "sai: warning:"
+	replacement := command + ": warning:"
+	parts := strings.SplitAfter(text, "\n")
+	for i, part := range parts {
+		if strings.HasPrefix(part, prefix) {
+			parts[i] = replacement + strings.TrimPrefix(part, prefix)
+		}
+	}
+	return strings.Join(parts, "")
+}
 
 func notifyInterrupts() (<-chan struct{}, func()) {
 	signals := make(chan os.Signal, 1)
@@ -122,6 +208,7 @@ func notifyInterrupts() (<-chan struct{}, func()) {
 }
 
 func execute(ctx context.Context, program string, args []string, stdin io.Reader, stdout, stderr io.Writer, getwd func() (string, error), interrupts <-chan struct{}) error {
+	displayCommand := displayProgramName(program)
 	rootArgs, err := splitRootArgs(args)
 	if err != nil {
 		return err
@@ -132,7 +219,7 @@ func execute(ctx context.Context, program string, args []string, stdin io.Reader
 	}
 	if rootArgs.command == "" {
 		if rootArgs.hasHelp {
-			printRootUsage(stdout)
+			printRootUsage(stdout, displayCommand)
 			return nil
 		}
 		var stop func()
@@ -146,18 +233,18 @@ func execute(ctx context.Context, program string, args []string, stdin io.Reader
 
 	switch rootArgs.command {
 	case "help":
-		return helpCommand(rootArgs.commandArgs, stdout)
+		return helpCommand(rootArgs.commandArgs, stdout, displayCommand)
 	case "attach":
 		return attachCommand(ctx, rootArgs.commandArgs, rootArgs.configPath, rootArgs.configProvided, homePath, stdin, stdout, stderr, getwd, program)
 	case "version":
-		return versionCommand(rootArgs.commandArgs, stdout)
+		return versionCommand(rootArgs.commandArgs, stdout, displayCommand)
 	case "config":
 		subcommand, subArgs, groupHelp, err := splitSubcommandArgs(rootArgs.commandArgs, nil, "sai help config")
 		if err != nil {
 			return err
 		}
 		if subcommand == "" && groupHelp {
-			printConfigUsage(stdout)
+			printConfigUsage(stdout, displayCommand)
 			return nil
 		}
 		if subcommand != "show" {
@@ -170,7 +257,7 @@ func execute(ctx context.Context, program string, args []string, stdin io.Reader
 			return err
 		}
 		if subcommand == "" && groupHelp {
-			printModelsUsage(stdout)
+			printModelsUsage(stdout, displayCommand)
 			return nil
 		}
 		if subcommand != "list" {
@@ -187,7 +274,7 @@ func execute(ctx context.Context, program string, args []string, stdin io.Reader
 			return err
 		}
 		if subcommand == "" && groupHelp {
-			printProjectUsage(stdout)
+			printProjectUsage(stdout, displayCommand)
 			return nil
 		}
 		switch subcommand {
@@ -208,7 +295,7 @@ func execute(ctx context.Context, program string, args []string, stdin io.Reader
 			return err
 		}
 		if subcommand == "" && groupHelp {
-			printSessionUsage(stdout)
+			printSessionUsage(stdout, displayCommand)
 			return nil
 		}
 		switch subcommand {
@@ -226,22 +313,22 @@ func execute(ctx context.Context, program string, args []string, stdin io.Reader
 			return usageError("usage: sai session <create|list|show|rename|archive>", "", "sai help session")
 		}
 	case "status":
-		return statusCommand(ctx, rootArgs.commandArgs, homePath, stdout, getwd)
+		return statusCommand(ctx, rootArgs.commandArgs, homePath, stdout, getwd, displayCommand)
 	case "stop":
-		return stopCommand(ctx, rootArgs.commandArgs, homePath, stdout, getwd)
+		return stopCommand(ctx, rootArgs.commandArgs, homePath, stdout, getwd, displayCommand)
 	case "servers":
 		subcommand, subArgs, groupHelp, err := splitSubcommandArgs(rootArgs.commandArgs, nil, "sai help servers")
 		if err != nil {
 			return err
 		}
 		if subcommand == "" && groupHelp {
-			printServersUsage(stdout)
+			printServersUsage(stdout, displayCommand)
 			return nil
 		}
 		if subcommand != "list" {
 			return usageError("usage: sai servers list", "", "sai help servers list")
 		}
-		return serversListCommand(ctx, subArgs, homePath, stdout)
+		return serversListCommand(ctx, subArgs, homePath, stdout, displayCommand)
 	case "send":
 		return sendCommand(ctx, rootArgs.commandArgs, rootArgs.configPath, rootArgs.configProvided, homePath, stdout, getwd, program)
 	case "auth":
@@ -252,20 +339,20 @@ func execute(ctx context.Context, program string, args []string, stdin io.Reader
 			return err
 		}
 		if subcommand == "" && groupHelp {
-			printToolsUsage(stdout)
+			printToolsUsage(stdout, displayCommand)
 			return nil
 		}
 		if subcommand != "list" {
 			return usageError("usage: sai tools list", "", "sai help tools list")
 		}
-		return toolsListCommand(subArgs, stdout)
+		return toolsListCommand(subArgs, stdout, displayCommand)
 	case "mcp":
 		subcommand, subArgs, groupHelp, err := splitSubcommandArgs(rootArgs.commandArgs, map[string]flagKind{"enable-mcp": flagKindValue}, "sai help mcp")
 		if err != nil {
 			return err
 		}
 		if subcommand == "" && groupHelp {
-			printMCPUsage(stdout)
+			printMCPUsage(stdout, displayCommand)
 			return nil
 		}
 		if subcommand != "list" {
@@ -278,14 +365,14 @@ func execute(ctx context.Context, program string, args []string, stdin io.Reader
 			return err
 		}
 		if subcommand == "" && groupHelp {
-			printSessionsUsage(stdout)
+			printSessionsUsage(stdout, displayCommand)
 			return nil
 		}
 		switch subcommand {
 		case "list":
-			return sessionsListCommand(ctx, subArgs, homePath, stdout, getwd)
+			return sessionsListCommand(ctx, subArgs, homePath, stdout, getwd, displayCommand)
 		case "show":
-			return sessionsShowCommand(ctx, subArgs, homePath, stdout, getwd)
+			return sessionsShowCommand(ctx, subArgs, homePath, stdout, getwd, displayCommand)
 		case "delete":
 			return sessionsDeleteCommand(subArgs, rootArgs.configPath, stdout, getwd, program)
 		case "prune":
@@ -633,241 +720,241 @@ Keeps the N most recently updated resumable sessions and deletes older ones.
 --keep must be provided explicitly and N must be 0 or greater.
 `
 
-func helpCommand(args []string, stdout io.Writer) error {
+func helpCommand(args []string, stdout io.Writer, command string) error {
 	if len(args) == 0 || len(args) == 1 && isHelpArg(args[0]) {
-		printRootUsage(stdout)
+		printRootUsage(stdout, command)
 		return nil
 	}
 
 	switch strings.Join(args, " ") {
 	case "attach":
-		printAttachUsage(stdout)
+		printAttachUsage(stdout, command)
 	case "version":
-		printVersionUsage(stdout)
+		printVersionUsage(stdout, command)
 	case "config":
-		printConfigUsage(stdout)
+		printConfigUsage(stdout, command)
 	case "config show":
-		printConfigShowUsage(stdout)
+		printConfigShowUsage(stdout, command)
 	case "models":
-		printModelsUsage(stdout)
+		printModelsUsage(stdout, command)
 	case "models list":
-		printModelsListUsage(stdout)
+		printModelsListUsage(stdout, command)
 	case "doctor":
-		printDoctorUsage(stdout)
+		printDoctorUsage(stdout, command)
 	case "server":
-		printServerUsage(stdout)
+		printServerUsage(stdout, command)
 	case "project":
-		printProjectUsage(stdout)
+		printProjectUsage(stdout, command)
 	case "project create":
-		printProjectCreateUsage(stdout)
+		printProjectCreateUsage(stdout, command)
 	case "project list":
-		printProjectListUsage(stdout)
+		printProjectListUsage(stdout, command)
 	case "project show":
-		printProjectShowUsage(stdout)
+		printProjectShowUsage(stdout, command)
 	case "project remove":
-		printProjectRemoveUsage(stdout)
+		printProjectRemoveUsage(stdout, command)
 	case "session":
-		printSessionUsage(stdout)
+		printSessionUsage(stdout, command)
 	case "session create":
-		printSessionCreateUsage(stdout)
+		printSessionCreateUsage(stdout, command)
 	case "session list":
-		printSessionListUsage(stdout)
+		printSessionListUsage(stdout, command)
 	case "session show":
-		printSessionShowUsage(stdout)
+		printSessionShowUsage(stdout, command)
 	case "session rename":
-		printSessionRenameUsage(stdout)
+		printSessionRenameUsage(stdout, command)
 	case "session archive":
-		printSessionArchiveUsage(stdout)
+		printSessionArchiveUsage(stdout, command)
 	case "status":
-		printStatusUsage(stdout)
+		printStatusUsage(stdout, command)
 	case "stop":
-		printStopUsage(stdout)
+		printStopUsage(stdout, command)
 	case "servers":
-		printServersUsage(stdout)
+		printServersUsage(stdout, command)
 	case "servers list":
-		printServersListUsage(stdout)
+		printServersListUsage(stdout, command)
 	case "send":
-		printSendUsage(stdout)
+		printSendUsage(stdout, command)
 	case "auth":
-		printAuthUsage(stdout)
+		printAuthUsage(stdout, command)
 	case "auth codex":
-		printAuthCodexUsage(stdout)
+		printAuthCodexUsage(stdout, command)
 	case "auth codex login":
-		printAuthCodexLoginUsage(stdout)
+		printAuthCodexLoginUsage(stdout, command)
 	case "tools":
-		printToolsUsage(stdout)
+		printToolsUsage(stdout, command)
 	case "tools list":
-		printToolsListUsage(stdout)
+		printToolsListUsage(stdout, command)
 	case "mcp":
-		printMCPUsage(stdout)
+		printMCPUsage(stdout, command)
 	case "mcp list":
-		printMCPListUsage(stdout)
+		printMCPListUsage(stdout, command)
 	case "sessions":
-		printSessionsUsage(stdout)
+		printSessionsUsage(stdout, command)
 	case "sessions list":
-		printSessionsListUsage(stdout)
+		printSessionsListUsage(stdout, command)
 	case "sessions show":
-		printSessionsShowUsage(stdout)
+		printSessionsShowUsage(stdout, command)
 	case "sessions delete":
-		printSessionsDeleteUsage(stdout)
+		printSessionsDeleteUsage(stdout, command)
 	case "sessions prune":
-		printSessionsPruneUsage(stdout)
+		printSessionsPruneUsage(stdout, command)
 	default:
 		return usageError(fmt.Sprintf("unknown help topic %q", strings.Join(args, " ")), "", "sai help")
 	}
 	return nil
 }
 
-func printRootUsage(stdout io.Writer) {
-	fmt.Fprint(stdout, rootUsageText)
+func printRootUsage(stdout io.Writer, command string) {
+	fmt.Fprint(stdout, renderCommandText(rootUsageText, command))
 }
 
-func printAttachUsage(stdout io.Writer) {
-	fmt.Fprint(stdout, attachUsageText)
+func printAttachUsage(stdout io.Writer, command string) {
+	fmt.Fprint(stdout, renderCommandText(attachUsageText, command))
 }
 
-func printChatUsage(stdout io.Writer) {
-	fmt.Fprint(stdout, chatUsageText)
+func printChatUsage(stdout io.Writer, command string) {
+	fmt.Fprint(stdout, renderCommandText(chatUsageText, command))
 }
 
-func printVersionUsage(stdout io.Writer) {
-	fmt.Fprint(stdout, versionUsageText)
+func printVersionUsage(stdout io.Writer, command string) {
+	fmt.Fprint(stdout, renderCommandText(versionUsageText, command))
 }
 
-func printConfigUsage(stdout io.Writer) {
-	fmt.Fprint(stdout, configUsageText)
+func printConfigUsage(stdout io.Writer, command string) {
+	fmt.Fprint(stdout, renderCommandText(configUsageText, command))
 }
 
-func printConfigShowUsage(stdout io.Writer) {
-	fmt.Fprint(stdout, configShowUsageText)
+func printConfigShowUsage(stdout io.Writer, command string) {
+	fmt.Fprint(stdout, renderCommandText(configShowUsageText, command))
 }
 
-func printModelsUsage(stdout io.Writer) {
-	fmt.Fprint(stdout, modelsUsageText)
+func printModelsUsage(stdout io.Writer, command string) {
+	fmt.Fprint(stdout, renderCommandText(modelsUsageText, command))
 }
 
-func printModelsListUsage(stdout io.Writer) {
-	fmt.Fprint(stdout, modelsListUsageText)
+func printModelsListUsage(stdout io.Writer, command string) {
+	fmt.Fprint(stdout, renderCommandText(modelsListUsageText, command))
 }
 
-func printDoctorUsage(stdout io.Writer) {
-	fmt.Fprint(stdout, doctorUsageText)
+func printDoctorUsage(stdout io.Writer, command string) {
+	fmt.Fprint(stdout, renderCommandText(doctorUsageText, command))
 }
 
-func printServerUsage(stdout io.Writer) {
-	fmt.Fprint(stdout, serverUsageText)
+func printServerUsage(stdout io.Writer, command string) {
+	fmt.Fprint(stdout, renderCommandText(serverUsageText, command))
 }
 
-func printProjectUsage(stdout io.Writer) {
-	fmt.Fprint(stdout, projectUsageText)
+func printProjectUsage(stdout io.Writer, command string) {
+	fmt.Fprint(stdout, renderCommandText(projectUsageText, command))
 }
 
-func printProjectCreateUsage(stdout io.Writer) {
-	fmt.Fprint(stdout, projectCreateUsageText)
+func printProjectCreateUsage(stdout io.Writer, command string) {
+	fmt.Fprint(stdout, renderCommandText(projectCreateUsageText, command))
 }
 
-func printProjectListUsage(stdout io.Writer) {
-	fmt.Fprint(stdout, projectListUsageText)
+func printProjectListUsage(stdout io.Writer, command string) {
+	fmt.Fprint(stdout, renderCommandText(projectListUsageText, command))
 }
 
-func printProjectShowUsage(stdout io.Writer) {
-	fmt.Fprint(stdout, projectShowUsageText)
+func printProjectShowUsage(stdout io.Writer, command string) {
+	fmt.Fprint(stdout, renderCommandText(projectShowUsageText, command))
 }
 
-func printProjectRemoveUsage(stdout io.Writer) {
-	fmt.Fprint(stdout, projectRemoveUsageText)
+func printProjectRemoveUsage(stdout io.Writer, command string) {
+	fmt.Fprint(stdout, renderCommandText(projectRemoveUsageText, command))
 }
 
-func printSessionUsage(stdout io.Writer) {
-	fmt.Fprint(stdout, sessionUsageText)
+func printSessionUsage(stdout io.Writer, command string) {
+	fmt.Fprint(stdout, renderCommandText(sessionUsageText, command))
 }
 
-func printSessionCreateUsage(stdout io.Writer) {
-	fmt.Fprint(stdout, sessionCreateUsageText)
+func printSessionCreateUsage(stdout io.Writer, command string) {
+	fmt.Fprint(stdout, renderCommandText(sessionCreateUsageText, command))
 }
 
-func printSessionListUsage(stdout io.Writer) {
-	fmt.Fprint(stdout, sessionListUsageText)
+func printSessionListUsage(stdout io.Writer, command string) {
+	fmt.Fprint(stdout, renderCommandText(sessionListUsageText, command))
 }
 
-func printSessionShowUsage(stdout io.Writer) {
-	fmt.Fprint(stdout, sessionShowUsageText)
+func printSessionShowUsage(stdout io.Writer, command string) {
+	fmt.Fprint(stdout, renderCommandText(sessionShowUsageText, command))
 }
 
-func printSessionRenameUsage(stdout io.Writer) {
-	fmt.Fprint(stdout, sessionRenameUsageText)
+func printSessionRenameUsage(stdout io.Writer, command string) {
+	fmt.Fprint(stdout, renderCommandText(sessionRenameUsageText, command))
 }
 
-func printSessionArchiveUsage(stdout io.Writer) {
-	fmt.Fprint(stdout, sessionArchiveUsageText)
+func printSessionArchiveUsage(stdout io.Writer, command string) {
+	fmt.Fprint(stdout, renderCommandText(sessionArchiveUsageText, command))
 }
 
-func printStatusUsage(stdout io.Writer) {
-	fmt.Fprint(stdout, statusUsageText)
+func printStatusUsage(stdout io.Writer, command string) {
+	fmt.Fprint(stdout, renderCommandText(statusUsageText, command))
 }
 
-func printStopUsage(stdout io.Writer) {
-	fmt.Fprint(stdout, stopUsageText)
+func printStopUsage(stdout io.Writer, command string) {
+	fmt.Fprint(stdout, renderCommandText(stopUsageText, command))
 }
 
-func printServersUsage(stdout io.Writer) {
-	fmt.Fprint(stdout, serversUsageText)
+func printServersUsage(stdout io.Writer, command string) {
+	fmt.Fprint(stdout, renderCommandText(serversUsageText, command))
 }
 
-func printServersListUsage(stdout io.Writer) {
-	fmt.Fprint(stdout, serversListUsageText)
+func printServersListUsage(stdout io.Writer, command string) {
+	fmt.Fprint(stdout, renderCommandText(serversListUsageText, command))
 }
 
-func printSendUsage(stdout io.Writer) {
-	fmt.Fprint(stdout, sendUsageText)
+func printSendUsage(stdout io.Writer, command string) {
+	fmt.Fprint(stdout, renderCommandText(sendUsageText, command))
 }
 
-func printAuthUsage(stdout io.Writer) {
-	fmt.Fprint(stdout, authUsageText)
+func printAuthUsage(stdout io.Writer, command string) {
+	fmt.Fprint(stdout, renderCommandText(authUsageText, command))
 }
 
-func printAuthCodexUsage(stdout io.Writer) {
-	fmt.Fprint(stdout, authCodexUsageText)
+func printAuthCodexUsage(stdout io.Writer, command string) {
+	fmt.Fprint(stdout, renderCommandText(authCodexUsageText, command))
 }
 
-func printAuthCodexLoginUsage(stdout io.Writer) {
-	fmt.Fprint(stdout, authCodexLoginUsageText)
+func printAuthCodexLoginUsage(stdout io.Writer, command string) {
+	fmt.Fprint(stdout, renderCommandText(authCodexLoginUsageText, command))
 }
 
-func printToolsUsage(stdout io.Writer) {
-	fmt.Fprint(stdout, toolsUsageText)
+func printToolsUsage(stdout io.Writer, command string) {
+	fmt.Fprint(stdout, renderCommandText(toolsUsageText, command))
 }
 
-func printToolsListUsage(stdout io.Writer) {
-	fmt.Fprint(stdout, toolsListUsageText)
+func printToolsListUsage(stdout io.Writer, command string) {
+	fmt.Fprint(stdout, renderCommandText(toolsListUsageText, command))
 }
 
-func printMCPUsage(stdout io.Writer) {
-	fmt.Fprint(stdout, mcpUsageText)
+func printMCPUsage(stdout io.Writer, command string) {
+	fmt.Fprint(stdout, renderCommandText(mcpUsageText, command))
 }
 
-func printMCPListUsage(stdout io.Writer) {
-	fmt.Fprint(stdout, mcpListUsageText)
+func printMCPListUsage(stdout io.Writer, command string) {
+	fmt.Fprint(stdout, renderCommandText(mcpListUsageText, command))
 }
 
-func printSessionsUsage(stdout io.Writer) {
-	fmt.Fprint(stdout, sessionsUsageText)
+func printSessionsUsage(stdout io.Writer, command string) {
+	fmt.Fprint(stdout, renderCommandText(sessionsUsageText, command))
 }
 
-func printSessionsListUsage(stdout io.Writer) {
-	fmt.Fprint(stdout, sessionsListUsageText)
+func printSessionsListUsage(stdout io.Writer, command string) {
+	fmt.Fprint(stdout, renderCommandText(sessionsListUsageText, command))
 }
 
-func printSessionsShowUsage(stdout io.Writer) {
-	fmt.Fprint(stdout, sessionsShowUsageText)
+func printSessionsShowUsage(stdout io.Writer, command string) {
+	fmt.Fprint(stdout, renderCommandText(sessionsShowUsageText, command))
 }
 
-func printSessionsDeleteUsage(stdout io.Writer) {
-	fmt.Fprint(stdout, sessionsDeleteUsageText)
+func printSessionsDeleteUsage(stdout io.Writer, command string) {
+	fmt.Fprint(stdout, renderCommandText(sessionsDeleteUsageText, command))
 }
 
-func printSessionsPruneUsage(stdout io.Writer) {
-	fmt.Fprint(stdout, sessionsPruneUsageText)
+func printSessionsPruneUsage(stdout io.Writer, command string) {
+	fmt.Fprint(stdout, renderCommandText(sessionsPruneUsageText, command))
 }
 
 func isNestedHelp(args []string, command string) bool {
@@ -890,19 +977,37 @@ func isHelpArg(arg string) bool {
 	return arg == "-h" || arg == "--help"
 }
 
-func usageError(message, usage, helpCommand string) error {
+type cliUsageError struct {
+	message     string
+	usage       string
+	helpCommand string
+}
+
+func (err cliUsageError) Error() string {
+	return err.Render("sai")
+}
+
+func (err cliUsageError) Render(command string) string {
 	var out strings.Builder
-	out.WriteString(message)
-	if usage != "" {
-		out.WriteString("\n\n")
-		out.WriteString(strings.TrimRight(usage, "\n"))
+	message := err.message
+	if strings.HasPrefix(message, "usage: sai ") {
+		message = renderCommandText(message, command)
 	}
-	if helpCommand != "" {
+	out.WriteString(message)
+	if err.usage != "" {
+		out.WriteString("\n\n")
+		out.WriteString(strings.TrimRight(renderCommandText(err.usage, command), "\n"))
+	}
+	if err.helpCommand != "" {
 		out.WriteString("\nRun \"")
-		out.WriteString(helpCommand)
+		out.WriteString(renderCommandText(err.helpCommand, command))
 		out.WriteString("\" for usage.")
 	}
-	return errors.New(out.String())
+	return out.String()
+}
+
+func usageError(message, usage, helpCommand string) error {
+	return cliUsageError{message: message, usage: usage, helpCommand: helpCommand}
 }
 
 type flagKind int
@@ -1089,22 +1194,23 @@ func flagValue(args []string, index int, name string, inline bool) (string, int,
 	return args[index+1], index + 1, nil
 }
 
-func versionCommand(args []string, stdout io.Writer) error {
+func versionCommand(args []string, stdout io.Writer, command string) error {
 	flags := flag.NewFlagSet("sai version", flag.ContinueOnError)
-	positionals, done, err := parseCommandFlagArgs(flags, args, stdout, printVersionUsage, "sai help")
+	positionals, done, err := parseCommandFlagArgs(flags, args, stdout, printVersionUsage, command, "sai help")
 	if done || err != nil {
 		return err
 	}
 	if len(positionals) != 0 {
 		return usageError("usage: sai version", "", "sai help")
 	}
-	fmt.Fprintf(stdout, "sai %s\n", Version)
+	fmt.Fprintf(stdout, "%s %s\n", command, Version)
 	return nil
 }
 
 func configShowCommand(args []string, configPath string, stdout io.Writer, getwd func() (string, error), program string) error {
+	displayCommand := displayProgramName(program)
 	flags := flag.NewFlagSet("sai config show", flag.ContinueOnError)
-	positionals, done, err := parseCommandFlagArgs(flags, args, stdout, printConfigShowUsage, "sai help config show")
+	positionals, done, err := parseCommandFlagArgs(flags, args, stdout, printConfigShowUsage, displayCommand, "sai help config show")
 	if done || err != nil {
 		return err
 	}
@@ -1123,8 +1229,9 @@ func configShowCommand(args []string, configPath string, stdout io.Writer, getwd
 }
 
 func modelsListCommand(args []string, configPath string, stdout io.Writer, getwd func() (string, error), program string) error {
+	displayCommand := displayProgramName(program)
 	flags := flag.NewFlagSet("sai models list", flag.ContinueOnError)
-	positionals, done, err := parseCommandFlagArgs(flags, args, stdout, printModelsListUsage, "sai help models list")
+	positionals, done, err := parseCommandFlagArgs(flags, args, stdout, printModelsListUsage, displayCommand, "sai help models list")
 	if done || err != nil {
 		return err
 	}
@@ -1144,8 +1251,9 @@ func modelsListCommand(args []string, configPath string, stdout io.Writer, getwd
 }
 
 func doctorCommand(args []string, configPath string, stdout io.Writer, getwd func() (string, error), program string) error {
+	displayCommand := displayProgramName(program)
 	flags := flag.NewFlagSet("sai doctor", flag.ContinueOnError)
-	positionals, done, err := parseCommandFlagArgs(flags, args, stdout, printDoctorUsage, "sai help doctor")
+	positionals, done, err := parseCommandFlagArgs(flags, args, stdout, printDoctorUsage, displayCommand, "sai help doctor")
 	if done || err != nil {
 		return err
 	}
@@ -1170,13 +1278,14 @@ func doctorCommand(args []string, configPath string, stdout io.Writer, getwd fun
 }
 
 func serverCommand(ctx context.Context, args []string, configPath, homePath string, stdout io.Writer, getwd func() (string, error), program string) error {
+	displayCommand := displayProgramName(program)
 	flags := flag.NewFlagSet("sai server", flag.ContinueOnError)
 	background := flags.Bool("background", false, "start in the background")
 	backgroundChild := flags.Bool("background-child", false, "run as a background child")
 	cwdFlag := flags.String("cwd", "", "server working directory")
 	portFlag := flags.Int("port", -1, "loopback port")
 	listenFlag := flags.String("listen", "", "loopback listen address")
-	positionals, done, err := parseCommandFlagArgs(flags, args, stdout, printServerUsage, "sai help server")
+	positionals, done, err := parseCommandFlagArgs(flags, args, stdout, printServerUsage, displayCommand, "sai help server")
 	if done || err != nil {
 		return err
 	}
@@ -1580,10 +1689,11 @@ func serverConfigPath(configPath, cwd string) string {
 }
 
 func projectCreateCommand(ctx context.Context, args []string, configPath, homePath string, stdout io.Writer, getwd func() (string, error), program string) error {
+	displayCommand := displayProgramName(program)
 	flags := flag.NewFlagSet("sai project create", flag.ContinueOnError)
 	cwdFlag := flags.String("cwd", "", "project root")
 	nameFlag := flags.String("name", "", "project display name")
-	positionals, done, err := parseCommandFlagArgs(flags, args, stdout, printProjectCreateUsage, "sai help project create")
+	positionals, done, err := parseCommandFlagArgs(flags, args, stdout, printProjectCreateUsage, displayCommand, "sai help project create")
 	if done || err != nil {
 		return err
 	}
@@ -1607,8 +1717,9 @@ func projectCreateCommand(ctx context.Context, args []string, configPath, homePa
 }
 
 func projectListCommand(ctx context.Context, args []string, configPath, homePath string, stdout io.Writer, getwd func() (string, error), program string) error {
+	displayCommand := displayProgramName(program)
 	flags := flag.NewFlagSet("sai project list", flag.ContinueOnError)
-	positionals, done, err := parseCommandFlagArgs(flags, args, stdout, printProjectListUsage, "sai help project list")
+	positionals, done, err := parseCommandFlagArgs(flags, args, stdout, printProjectListUsage, displayCommand, "sai help project list")
 	if done || err != nil {
 		return err
 	}
@@ -1632,9 +1743,10 @@ func projectListCommand(ctx context.Context, args []string, configPath, homePath
 }
 
 func projectShowCommand(ctx context.Context, args []string, configPath, homePath string, stdout io.Writer, getwd func() (string, error), program string) error {
+	displayCommand := displayProgramName(program)
 	flags := flag.NewFlagSet("sai project show", flag.ContinueOnError)
 	projectID := flags.String("project", "", "project id")
-	positionals, done, err := parseCommandFlagArgs(flags, args, stdout, printProjectShowUsage, "sai help project show")
+	positionals, done, err := parseCommandFlagArgs(flags, args, stdout, printProjectShowUsage, displayCommand, "sai help project show")
 	if done || err != nil {
 		return err
 	}
@@ -1667,16 +1779,17 @@ func projectShowCommand(ctx context.Context, args []string, configPath, homePath
 		return err
 	}
 	if !ok {
-		return fmt.Errorf("no registered project found from %s; run \"sai project create\"", effectiveCWD)
+		return fmt.Errorf("no registered project found from %s; run %q", effectiveCWD, displayCommand+" project create")
 	}
 	return printProjectInfo(stdout, project)
 }
 
 func projectRemoveCommand(ctx context.Context, args []string, configPath, homePath string, stdout io.Writer, getwd func() (string, error), program string) error {
+	displayCommand := displayProgramName(program)
 	flags := flag.NewFlagSet("sai project remove", flag.ContinueOnError)
 	projectID := flags.String("project", "", "project id")
 	deleteData := flags.Bool("delete-data", false, "delete project metadata/data")
-	positionals, done, err := parseCommandFlagArgs(flags, args, stdout, printProjectRemoveUsage, "sai help project remove")
+	positionals, done, err := parseCommandFlagArgs(flags, args, stdout, printProjectRemoveUsage, displayCommand, "sai help project remove")
 	if done || err != nil {
 		return err
 	}
@@ -1703,7 +1816,7 @@ func projectRemoveCommand(ctx context.Context, args []string, configPath, homePa
 			return err
 		}
 		if !ok {
-			return fmt.Errorf("no registered project found from %s; run \"sai project create\"", effectiveCWD)
+			return fmt.Errorf("no registered project found from %s; run %q", effectiveCWD, displayCommand+" project create")
 		}
 		id = project.ID
 	}
@@ -1895,9 +2008,10 @@ func serverSessionDefaultsFromConfig(cfg *config.Config, cwd string) (sessions.S
 }
 
 func sessionCreateCommand(ctx context.Context, args []string, configPath, homePath string, stdout io.Writer, getwd func() (string, error), program string) error {
+	displayCommand := displayProgramName(program)
 	flags := flag.NewFlagSet("sai session create", flag.ContinueOnError)
 	cwdFlag := flags.String("cwd", "", "session creation working directory")
-	positionals, done, err := parseCommandFlagArgs(flags, args, stdout, printSessionCreateUsage, "sai help session create")
+	positionals, done, err := parseCommandFlagArgs(flags, args, stdout, printSessionCreateUsage, displayCommand, "sai help session create")
 	if done || err != nil {
 		return err
 	}
@@ -1917,11 +2031,12 @@ func sessionCreateCommand(ctx context.Context, args []string, configPath, homePa
 }
 
 func sessionListCommand(ctx context.Context, args []string, configPath, homePath string, stdout io.Writer, getwd func() (string, error), program string) error {
+	displayCommand := displayProgramName(program)
 	flags := flag.NewFlagSet("sai session list", flag.ContinueOnError)
 	projectID := flags.String("project", "", "project id")
 	allProjects := flags.Bool("all-projects", false, "list sessions across all projects")
 	archived := flags.Bool("archived", false, "list archived sessions")
-	positionals, done, err := parseCommandFlagArgs(flags, args, stdout, printSessionListUsage, "sai help session list")
+	positionals, done, err := parseCommandFlagArgs(flags, args, stdout, printSessionListUsage, displayCommand, "sai help session list")
 	if done || err != nil {
 		return err
 	}
@@ -1961,7 +2076,7 @@ func sessionListCommand(ctx context.Context, args []string, configPath, homePath
 			return err
 		}
 		if !ok {
-			return fmt.Errorf("no registered project found from %s; run \"sai project create\"", effectiveCWD)
+			return fmt.Errorf("no registered project found from %s; run %q", effectiveCWD, displayCommand+" project create")
 		}
 		project = nearest.ID
 	} else {
@@ -1979,8 +2094,9 @@ func sessionListCommand(ctx context.Context, args []string, configPath, homePath
 }
 
 func sessionShowCommand(ctx context.Context, args []string, configPath, homePath string, stdout io.Writer, getwd func() (string, error), program string) error {
+	displayCommand := displayProgramName(program)
 	flags := flag.NewFlagSet("sai session show", flag.ContinueOnError)
-	positionals, done, err := parseCommandFlagArgs(flags, args, stdout, printSessionShowUsage, "sai help session show")
+	positionals, done, err := parseCommandFlagArgs(flags, args, stdout, printSessionShowUsage, displayCommand, "sai help session show")
 	if done || err != nil {
 		return err
 	}
@@ -2000,8 +2116,9 @@ func sessionShowCommand(ctx context.Context, args []string, configPath, homePath
 }
 
 func sessionRenameCommand(ctx context.Context, args []string, configPath, homePath string, stdout io.Writer, getwd func() (string, error), program string) error {
+	displayCommand := displayProgramName(program)
 	flags := flag.NewFlagSet("sai session rename", flag.ContinueOnError)
-	positionals, done, err := parseCommandFlagArgs(flags, args, stdout, printSessionRenameUsage, "sai help session rename")
+	positionals, done, err := parseCommandFlagArgs(flags, args, stdout, printSessionRenameUsage, displayCommand, "sai help session rename")
 	if done || err != nil {
 		return err
 	}
@@ -2029,8 +2146,9 @@ func sessionRenameCommand(ctx context.Context, args []string, configPath, homePa
 }
 
 func sessionArchiveCommand(ctx context.Context, args []string, configPath, homePath string, stdout io.Writer, getwd func() (string, error), program string) error {
+	displayCommand := displayProgramName(program)
 	flags := flag.NewFlagSet("sai session archive", flag.ContinueOnError)
-	positionals, done, err := parseCommandFlagArgs(flags, args, stdout, printSessionArchiveUsage, "sai help session archive")
+	positionals, done, err := parseCommandFlagArgs(flags, args, stdout, printSessionArchiveUsage, displayCommand, "sai help session archive")
 	if done || err != nil {
 		return err
 	}
@@ -2062,6 +2180,7 @@ func nearestProject(ctx context.Context, record localserver.RegistryRecord, cwd 
 }
 
 func createProjectSessionForCWD(ctx context.Context, configPath, homePath, creationCWD, program string) (localserver.RegistryRecord, localserver.SessionDetail, error) {
+	displayCommand := displayProgramName(program)
 	record, err := ensureProjectCommandServer(ctx, configPath, homePath, creationCWD, program)
 	if err != nil {
 		return localserver.RegistryRecord{}, localserver.SessionDetail{}, err
@@ -2071,7 +2190,7 @@ func createProjectSessionForCWD(ctx context.Context, configPath, homePath, creat
 		return localserver.RegistryRecord{}, localserver.SessionDetail{}, err
 	}
 	if !ok {
-		return localserver.RegistryRecord{}, localserver.SessionDetail{}, fmt.Errorf("no registered project found from %s; run %q", creationCWD, program+" project create")
+		return localserver.RegistryRecord{}, localserver.SessionDetail{}, fmt.Errorf("no registered project found from %s; run %q", creationCWD, displayCommand+" project create")
 	}
 
 	cfg, err := loadConfig(serverConfigPath(configPath, creationCWD), func() (string, error) {
@@ -2143,10 +2262,10 @@ func sessionCreateMetadataFromDefaults(session sessions.SessionV2) localserver.S
 	}
 }
 
-func statusCommand(ctx context.Context, args []string, homePath string, stdout io.Writer, getwd func() (string, error)) error {
+func statusCommand(ctx context.Context, args []string, homePath string, stdout io.Writer, getwd func() (string, error), command string) error {
 	flags := flag.NewFlagSet("sai status", flag.ContinueOnError)
 	cwdFlag := flags.String("cwd", "", "discovery working directory")
-	positionals, done, err := parseCommandFlagArgs(flags, args, stdout, printStatusUsage, "sai help status")
+	positionals, done, err := parseCommandFlagArgs(flags, args, stdout, printStatusUsage, command, "sai help status")
 	if done || err != nil {
 		return err
 	}
@@ -2167,7 +2286,7 @@ func statusCommand(ctx context.Context, args []string, homePath string, stdout i
 		return err
 	}
 	if !discovery.Found {
-		return noServerFoundError(cwd)
+		return noServerFoundError(cwd, command)
 	}
 
 	status, err := localserver.GetServerStatus(ctx, discovery.Record.BaseURL, discovery.Record.Token, serverClientTimeout)
@@ -2177,10 +2296,10 @@ func statusCommand(ctx context.Context, args []string, homePath string, stdout i
 	return printServerStatus(stdout, status)
 }
 
-func stopCommand(ctx context.Context, args []string, homePath string, stdout io.Writer, getwd func() (string, error)) error {
+func stopCommand(ctx context.Context, args []string, homePath string, stdout io.Writer, getwd func() (string, error), command string) error {
 	flags := flag.NewFlagSet("sai stop", flag.ContinueOnError)
 	cwdFlag := flags.String("cwd", "", "discovery working directory")
-	positionals, done, err := parseCommandFlagArgs(flags, args, stdout, printStopUsage, "sai help stop")
+	positionals, done, err := parseCommandFlagArgs(flags, args, stdout, printStopUsage, command, "sai help stop")
 	if done || err != nil {
 		return err
 	}
@@ -2205,7 +2324,7 @@ func stopCommand(ctx context.Context, args []string, homePath string, stdout io.
 			_, err := fmt.Fprintf(stdout, "SERVER_STOPPED\tstale_records_removed=%d\n", discovery.StaleRemoved)
 			return err
 		}
-		return noServerFoundError(cwd)
+		return noServerFoundError(cwd, command)
 	}
 
 	record := discovery.Record
@@ -2235,9 +2354,9 @@ func stopCommand(ctx context.Context, args []string, homePath string, stdout io.
 	return err
 }
 
-func serversListCommand(ctx context.Context, args []string, homePath string, stdout io.Writer) error {
+func serversListCommand(ctx context.Context, args []string, homePath string, stdout io.Writer, command string) error {
 	flags := flag.NewFlagSet("sai servers list", flag.ContinueOnError)
-	positionals, done, err := parseCommandFlagArgs(flags, args, stdout, printServersListUsage, "sai help servers list")
+	positionals, done, err := parseCommandFlagArgs(flags, args, stdout, printServersListUsage, command, "sai help servers list")
 	if done || err != nil {
 		return err
 	}
@@ -2283,10 +2402,11 @@ func serversListCommand(ctx context.Context, args []string, homePath string, std
 }
 
 func attachCommand(ctx context.Context, args []string, configPath string, configProvided bool, homePath string, stdin io.Reader, stdout, stderr io.Writer, getwd func() (string, error), program string) error {
+	displayCommand := displayProgramName(program)
 	flags := flag.NewFlagSet("sai attach", flag.ContinueOnError)
 	cwdFlag := flags.String("cwd", "", "discovery working directory")
 	newSession := flags.Bool("new", false, "create a new server-owned session before attaching")
-	positionals, done, err := parseCommandFlagArgs(flags, args, stdout, printAttachUsage, "sai help attach")
+	positionals, done, err := parseCommandFlagArgs(flags, args, stdout, printAttachUsage, displayCommand, "sai help attach")
 	if done || err != nil {
 		return err
 	}
@@ -2318,7 +2438,7 @@ func attachCommand(ctx context.Context, args []string, configPath string, config
 		}
 	} else if len(positionals) == 1 {
 		var err error
-		record, _, err = discoverClientServer(ctx, *cwdFlag, homePath, getwd)
+		record, _, err = discoverClientServer(ctx, *cwdFlag, homePath, getwd, displayCommand)
 		if err != nil {
 			return err
 		}
@@ -2340,7 +2460,7 @@ func attachCommand(ctx context.Context, args []string, configPath string, config
 		}
 	} else if !*newSession {
 		var err error
-		sessionID, err = mostRecentProjectSessionID(ctx, record, *cwdFlag, getwd, program, program+" attach --new")
+		sessionID, err = mostRecentProjectSessionID(ctx, record, *cwdFlag, getwd, program, displayCommand+" attach --new")
 		if err != nil {
 			return err
 		}
@@ -2351,13 +2471,14 @@ func attachCommand(ctx context.Context, args []string, configPath string, config
 		return err
 	}
 	defer closeStream()
-	if _, err := fmt.Fprintf(stderr, "sai: attached to session %s\n", sessionID); err != nil {
+	if _, err := fmt.Fprintf(stderr, "%s: attached to session %s\n", displayCommand, sessionID); err != nil {
 		return err
 	}
-	return runAttachREPL(ctx, record, sessionID, stdin, stdout, stderr, events, streamErrs)
+	return runAttachREPL(ctx, record, sessionID, stdin, stdout, stderr, events, streamErrs, displayCommand)
 }
 
 func mostRecentProjectSessionID(ctx context.Context, record localserver.RegistryRecord, cwdFlag string, getwd func() (string, error), program string, newHint string) (string, error) {
+	displayCommand := displayProgramName(program)
 	effectiveCWD, err := resolveClientCWD(cwdFlag, getwd)
 	if err != nil {
 		return "", err
@@ -2367,14 +2488,14 @@ func mostRecentProjectSessionID(ctx context.Context, record localserver.Registry
 		return "", err
 	}
 	if !ok {
-		return "", fmt.Errorf("no registered project found from %s; run %q", effectiveCWD, program+" project create")
+		return "", fmt.Errorf("no registered project found from %s; run %q", effectiveCWD, displayCommand+" project create")
 	}
 	infos, err := localserver.ListProjectSessionsWithToken(ctx, record.BaseURL, record.Token, project.ID, serverClientTimeout)
 	if err != nil {
 		return "", err
 	}
 	if len(infos) == 0 {
-		return "", fmt.Errorf("no sessions found for project %s; create a session with %q or %q", project.ID, program+" session create", newHint)
+		return "", fmt.Errorf("no sessions found for project %s; create a session with %q or %q", project.ID, displayCommand+" session create", newHint)
 	}
 	latest := infos[0]
 	for _, info := range infos[1:] {
@@ -2398,7 +2519,7 @@ type attachSendResult struct {
 	err    error
 }
 
-func runAttachREPL(ctx context.Context, record localserver.RegistryRecord, sessionID string, stdin io.Reader, stdout, stderr io.Writer, events <-chan localserver.SessionStreamEvent, streamErrs <-chan error) error {
+func runAttachREPL(ctx context.Context, record localserver.RegistryRecord, sessionID string, stdin io.Reader, stdout, stderr io.Writer, events <-chan localserver.SessionStreamEvent, streamErrs <-chan error, displayCommand string) error {
 	scanner := bufio.NewScanner(stdin)
 	var inputCh <-chan chatInputEvent
 	var sendDone <-chan attachSendResult
@@ -2460,12 +2581,12 @@ func runAttachREPL(ctx context.Context, record localserver.RegistryRecord, sessi
 			}
 			if !input.multiline && command == "/compact" {
 				if _, err := localserver.CompactSessionWithToken(ctx, record.BaseURL, record.Token, sessionID, 0); err != nil {
-					if _, printErr := fmt.Fprintf(stderr, "sai: compact failed: %v\n", err); printErr != nil {
+					if _, printErr := fmt.Fprintf(stderr, "%s: compact failed: %v\n", displayCommand, err); printErr != nil {
 						return printErr
 					}
 					continue
 				}
-				if _, err := fmt.Fprintln(stderr, "sai: compacted session context"); err != nil {
+				if _, err := fmt.Fprintf(stderr, "%s: compacted session context\n", displayCommand); err != nil {
 					return err
 				}
 				continue
@@ -2497,7 +2618,7 @@ func runAttachREPL(ctx context.Context, record localserver.RegistryRecord, sessi
 				expectedTurnID = ""
 				terminalSeen = false
 				terminalTurnIDs = nil
-				if _, printErr := fmt.Fprintf(stderr, "sai: send failed: %v\n", sendResult.err); printErr != nil {
+				if _, printErr := fmt.Fprintf(stderr, "%s: send failed: %v\n", displayCommand, sendResult.err); printErr != nil {
 					return printErr
 				}
 				continue
@@ -2522,7 +2643,7 @@ func runAttachREPL(ctx context.Context, record localserver.RegistryRecord, sessi
 				turnStarted = true
 				setExpectedTurnID(attachEventTurnID(event))
 			}
-			if err := writeAttachStreamEvent(stdout, stderr, event, &output); err != nil {
+			if err := writeAttachStreamEvent(stdout, stderr, event, &output, displayCommand); err != nil {
 				return err
 			}
 			if turnInFlight && isAttachTerminalEvent(event) {
@@ -2569,7 +2690,7 @@ func isAttachTerminalEvent(event localserver.SessionStreamEvent) bool {
 	return eventType == "turn.committed" || eventType == "turn.failed"
 }
 
-func writeAttachStreamEvent(stdout, stderr io.Writer, event localserver.SessionStreamEvent, output *attachOutputState) error {
+func writeAttachStreamEvent(stdout, stderr io.Writer, event localserver.SessionStreamEvent, output *attachOutputState, command string) error {
 	eventType, _ := event["type"].(string)
 	switch eventType {
 	case "text.delta":
@@ -2592,11 +2713,11 @@ func writeAttachStreamEvent(stdout, stderr io.Writer, event localserver.SessionS
 			return err
 		}
 	case "turn.failed":
-		if _, err := fmt.Fprintln(stderr, "sai: turn failed"); err != nil {
+		if _, err := fmt.Fprintf(stderr, "%s: turn failed\n", command); err != nil {
 			return err
 		}
 	case "compact.failed":
-		if _, err := fmt.Fprintln(stderr, "sai: compact failed"); err != nil {
+		if _, err := fmt.Fprintf(stderr, "%s: compact failed\n", command); err != nil {
 			return err
 		}
 	}
@@ -2604,11 +2725,12 @@ func writeAttachStreamEvent(stdout, stderr io.Writer, event localserver.SessionS
 }
 
 func sendCommand(ctx context.Context, args []string, configPath string, configProvided bool, homePath string, stdout io.Writer, getwd func() (string, error), program string) error {
+	displayCommand := displayProgramName(program)
 	flags := flag.NewFlagSet("sai send", flag.ContinueOnError)
 	cwdFlag := flags.String("cwd", "", "discovery working directory")
 	newSession := flags.Bool("new", false, "create a new server-owned session before sending")
 	prompt := flags.String("prompt", "", "prompt text")
-	positionals, done, err := parseCommandFlagArgs(flags, args, stdout, printSendUsage, "sai help send")
+	positionals, done, err := parseCommandFlagArgs(flags, args, stdout, printSendUsage, displayCommand, "sai help send")
 	if done || err != nil {
 		return err
 	}
@@ -2644,7 +2766,7 @@ func sendCommand(ctx context.Context, args []string, configPath string, configPr
 	} else {
 		var err error
 		if len(positionals) == 1 {
-			record, _, err = discoverClientServer(ctx, *cwdFlag, homePath, getwd)
+			record, _, err = discoverClientServer(ctx, *cwdFlag, homePath, getwd, displayCommand)
 			if err != nil {
 				return err
 			}
@@ -2654,7 +2776,7 @@ func sendCommand(ctx context.Context, args []string, configPath string, configPr
 			if err != nil {
 				return err
 			}
-			sessionID, err = mostRecentProjectSessionID(ctx, record, "", getwd, program, program+" send --new")
+			sessionID, err = mostRecentProjectSessionID(ctx, record, "", getwd, program, displayCommand+" send --new")
 			if err != nil {
 				return err
 			}
@@ -2681,7 +2803,7 @@ func rejectExistingSessionOverrides(newSession, cwdProvided, configProvided bool
 	return nil
 }
 
-func discoverClientServer(ctx context.Context, cwdFlag, homePath string, getwd func() (string, error)) (localserver.RegistryRecord, string, error) {
+func discoverClientServer(ctx context.Context, cwdFlag, homePath string, getwd func() (string, error), command string) (localserver.RegistryRecord, string, error) {
 	cwd, err := resolveClientCWD(cwdFlag, getwd)
 	if err != nil {
 		return localserver.RegistryRecord{}, "", err
@@ -2695,7 +2817,7 @@ func discoverClientServer(ctx context.Context, cwdFlag, homePath string, getwd f
 		return localserver.RegistryRecord{}, "", err
 	}
 	if !discovery.Found {
-		return localserver.RegistryRecord{}, cwd, noServerFoundError(cwd)
+		return localserver.RegistryRecord{}, cwd, noServerFoundError(cwd, command)
 	}
 	return discovery.Record, cwd, nil
 }
@@ -2722,8 +2844,9 @@ func resolveClientCWD(cwdFlag string, getwd func() (string, error)) (string, err
 	return localserver.CanonicalPath(cwd)
 }
 
-func noServerFoundError(cwd string) error {
-	return fmt.Errorf("no healthy sai server found from %s; start one with \"sai server --cwd %s\"", cwd, cwd)
+func noServerFoundError(cwd, command string) error {
+	command = displayProgramName(command)
+	return fmt.Errorf("no healthy %s server found from %s; start one with %q", command, cwd, command+" server --cwd "+cwd)
 }
 
 func printServerStatus(stdout io.Writer, status localserver.ServerStatus) error {
@@ -2757,8 +2880,9 @@ func waitForServerStop(ctx context.Context, addr string) error {
 }
 
 func authCommand(ctx context.Context, args []string, configPath string, stdout io.Writer, getwd func() (string, error), program string) error {
+	displayCommand := displayProgramName(program)
 	if len(args) == 0 || containsHelpArg(args) && len(args) == 1 {
-		printAuthUsage(stdout)
+		printAuthUsage(stdout, displayCommand)
 		return nil
 	}
 	if args[0] != "codex" {
@@ -2768,8 +2892,9 @@ func authCommand(ctx context.Context, args []string, configPath string, stdout i
 }
 
 func authCodexCommand(ctx context.Context, args []string, configPath string, stdout io.Writer, getwd func() (string, error), program string) error {
+	displayCommand := displayProgramName(program)
 	if len(args) == 0 || containsHelpArg(args) && len(args) == 1 {
-		printAuthCodexUsage(stdout)
+		printAuthCodexUsage(stdout, displayCommand)
 		return nil
 	}
 	if args[0] != "login" {
@@ -2779,6 +2904,7 @@ func authCodexCommand(ctx context.Context, args []string, configPath string, std
 }
 
 func authCodexLoginCommand(ctx context.Context, args []string, configPath string, stdout io.Writer, getwd func() (string, error), program string) error {
+	displayCommand := displayProgramName(program)
 	flags := flag.NewFlagSet("sai auth codex login", flag.ContinueOnError)
 	providerName := flags.String("provider", "codex", "provider name")
 	force := flags.Bool("force", false, "overwrite generated provider and auth files")
@@ -2793,7 +2919,7 @@ func authCodexLoginCommand(ctx context.Context, args []string, configPath string
 	modelID := flags.String("model", codexauth.DefaultModelID(), "default Codex model id")
 	contextWindow := flags.Int("context-window", 400000, "model context window")
 	pollInterval := flags.Duration("poll-interval", 0, "device flow polling interval")
-	positionals, done, err := parseCommandFlagArgs(flags, args, stdout, printAuthCodexLoginUsage, "sai help auth codex login")
+	positionals, done, err := parseCommandFlagArgs(flags, args, stdout, printAuthCodexLoginUsage, displayCommand, "sai help auth codex login")
 	if done || err != nil {
 		return err
 	}
@@ -3281,10 +3407,11 @@ func cleanupCreatedDirectories(paths []string) {
 }
 
 func mcpListCommand(args []string, configPath string, stdout io.Writer, getwd func() (string, error), program string) error {
+	displayCommand := displayProgramName(program)
 	flags := flag.NewFlagSet("sai mcp list", flag.ContinueOnError)
 	var enabledMCP mcpServerIDsFlag
 	flags.Var(&enabledMCP, "enable-mcp", "comma-separated MCP server ids to enable")
-	positionals, done, err := parseCommandFlagArgs(flags, args, stdout, printMCPListUsage, "sai help mcp list")
+	positionals, done, err := parseCommandFlagArgs(flags, args, stdout, printMCPListUsage, displayCommand, "sai help mcp list")
 	if done || err != nil {
 		return err
 	}
@@ -3312,9 +3439,9 @@ func mcpListCommand(args []string, configPath string, stdout io.Writer, getwd fu
 	return nil
 }
 
-func toolsListCommand(args []string, stdout io.Writer) error {
+func toolsListCommand(args []string, stdout io.Writer, command string) error {
 	flags := flag.NewFlagSet("sai tools list", flag.ContinueOnError)
-	positionals, done, err := parseCommandFlagArgs(flags, args, stdout, printToolsListUsage, "sai help tools list")
+	positionals, done, err := parseCommandFlagArgs(flags, args, stdout, printToolsListUsage, command, "sai help tools list")
 	if done || err != nil {
 		return err
 	}
@@ -3328,10 +3455,10 @@ func toolsListCommand(args []string, stdout io.Writer) error {
 	return nil
 }
 
-func sessionsListCommand(ctx context.Context, args []string, homePath string, stdout io.Writer, getwd func() (string, error)) error {
+func sessionsListCommand(ctx context.Context, args []string, homePath string, stdout io.Writer, getwd func() (string, error), command string) error {
 	flags := flag.NewFlagSet("sai sessions list", flag.ContinueOnError)
 	cwdFlag := flags.String("cwd", "", "discovery working directory")
-	positionals, done, err := parseCommandFlagArgs(flags, args, stdout, printSessionsListUsage, "sai help sessions list")
+	positionals, done, err := parseCommandFlagArgs(flags, args, stdout, printSessionsListUsage, command, "sai help sessions list")
 	if done || err != nil {
 		return err
 	}
@@ -3339,7 +3466,7 @@ func sessionsListCommand(ctx context.Context, args []string, homePath string, st
 		return usageError("usage: sai sessions list [--cwd path]", "", "sai help sessions list")
 	}
 
-	record, _, err := discoverClientServer(ctx, *cwdFlag, homePath, getwd)
+	record, _, err := discoverClientServer(ctx, *cwdFlag, homePath, getwd, command)
 	if err != nil {
 		return err
 	}
@@ -3351,10 +3478,10 @@ func sessionsListCommand(ctx context.Context, args []string, homePath string, st
 	return printServerSessionList(stdout, infos)
 }
 
-func sessionsShowCommand(ctx context.Context, args []string, homePath string, stdout io.Writer, getwd func() (string, error)) error {
+func sessionsShowCommand(ctx context.Context, args []string, homePath string, stdout io.Writer, getwd func() (string, error), command string) error {
 	flags := flag.NewFlagSet("sai sessions show", flag.ContinueOnError)
 	cwdFlag := flags.String("cwd", "", "discovery working directory")
-	positionals, done, err := parseCommandFlagArgs(flags, args, stdout, printSessionsShowUsage, "sai help sessions show")
+	positionals, done, err := parseCommandFlagArgs(flags, args, stdout, printSessionsShowUsage, command, "sai help sessions show")
 	if done || err != nil {
 		return err
 	}
@@ -3362,7 +3489,7 @@ func sessionsShowCommand(ctx context.Context, args []string, homePath string, st
 		return usageError("usage: sai sessions show [--cwd path] <id>", "", "sai help sessions show")
 	}
 
-	record, _, err := discoverClientServer(ctx, *cwdFlag, homePath, getwd)
+	record, _, err := discoverClientServer(ctx, *cwdFlag, homePath, getwd, command)
 	if err != nil {
 		return err
 	}
@@ -3442,8 +3569,9 @@ func printServerSessionList(stdout io.Writer, infos []localserver.SessionMetadat
 }
 
 func sessionsDeleteCommand(args []string, configPath string, stdout io.Writer, getwd func() (string, error), program string) error {
+	displayCommand := displayProgramName(program)
 	flags := flag.NewFlagSet("sai sessions delete", flag.ContinueOnError)
-	positionals, done, err := parseCommandFlagArgs(flags, args, stdout, printSessionsDeleteUsage, "sai help sessions delete")
+	positionals, done, err := parseCommandFlagArgs(flags, args, stdout, printSessionsDeleteUsage, displayCommand, "sai help sessions delete")
 	if done || err != nil {
 		return err
 	}
@@ -3463,9 +3591,10 @@ func sessionsDeleteCommand(args []string, configPath string, stdout io.Writer, g
 }
 
 func sessionsPruneCommand(args []string, configPath string, stdout io.Writer, getwd func() (string, error), program string) error {
+	displayCommand := displayProgramName(program)
 	flags := flag.NewFlagSet("sai sessions prune", flag.ContinueOnError)
 	keep := flags.Int("keep", -1, "number of most recently updated sessions to keep")
-	positionals, done, err := parseCommandFlagArgs(flags, args, stdout, printSessionsPruneUsage, "sai help sessions prune")
+	positionals, done, err := parseCommandFlagArgs(flags, args, stdout, printSessionsPruneUsage, displayCommand, "sai help sessions prune")
 	if done || err != nil {
 		return err
 	}
@@ -3551,10 +3680,10 @@ func countSessionV2MessageItems(items []sessions.SessionItem) int {
 	return count
 }
 
-func parseCommandFlagArgs(flags *flag.FlagSet, args []string, stdout io.Writer, printUsage func(io.Writer), helpCommand string) ([]string, bool, error) {
+func parseCommandFlagArgs(flags *flag.FlagSet, args []string, stdout io.Writer, printUsage func(io.Writer, string), command, helpCommand string) ([]string, bool, error) {
 	flags.SetOutput(io.Discard)
 	if containsHelpArg(args) {
-		printUsage(stdout)
+		printUsage(stdout, command)
 		return nil, true, nil
 	}
 	parsedArgs, err := intersperseFlagArgs(flags, args)
@@ -3629,11 +3758,12 @@ func (options agentCommandFlags) validate(helpCommand string) error {
 }
 
 func chatCommand(ctx context.Context, args []string, configPath string, stdin io.Reader, stdout, stderr io.Writer, getwd func() (string, error), program string, interrupts <-chan struct{}) (chatErr error) {
+	displayCommand := displayProgramName(program)
 	flags := flag.NewFlagSet("sai chat", flag.ContinueOnError)
 	var options agentCommandFlags
 	registerAgentCommandFlags(flags, &options)
 	quit := flags.Bool("quit", false, "exit after the initial prompt turn")
-	positionals, done, err := parseCommandFlagArgs(flags, args, stdout, printChatUsage, "sai help chat")
+	positionals, done, err := parseCommandFlagArgs(flags, args, stdout, printChatUsage, displayCommand, "sai help chat")
 	if done || err != nil {
 		return err
 	}
@@ -3693,7 +3823,7 @@ func chatCommand(ctx context.Context, args []string, configPath string, stdin io
 			if !isRecoverableTurnError(err) {
 				return err
 			}
-			if _, printErr := fmt.Fprintf(stderr, "sai: %v\n", err); printErr != nil {
+			if _, printErr := fmt.Fprintf(stderr, "%s: %v\n", displayCommand, err); printErr != nil {
 				return printErr
 			}
 		} else {
@@ -3741,7 +3871,7 @@ func chatCommand(ctx context.Context, args []string, configPath string, stdin io
 			if !input.multiline && command == "/compact" {
 				updated, err := runtime.compactSession(ctx, stderr)
 				if err != nil {
-					if _, printErr := fmt.Fprintf(stderr, "sai: compact failed: %v\n", err); printErr != nil {
+					if _, printErr := fmt.Fprintf(stderr, "%s: compact failed: %v\n", displayCommand, err); printErr != nil {
 						return printErr
 					}
 					continue
@@ -3758,7 +3888,7 @@ func chatCommand(ctx context.Context, args []string, configPath string, stdin io
 				if !isRecoverableTurnError(err) {
 					return err
 				}
-				if _, printErr := fmt.Fprintf(stderr, "sai: %v\n", err); printErr != nil {
+				if _, printErr := fmt.Fprintf(stderr, "%s: %v\n", displayCommand, err); printErr != nil {
 					return printErr
 				}
 				continue
@@ -3781,7 +3911,7 @@ func chatCommand(ctx context.Context, args []string, configPath string, stdin io
 				if !isRecoverableTurnError(err) {
 					return err
 				}
-				if _, printErr := fmt.Fprintf(stderr, "sai: %v\n", err); printErr != nil {
+				if _, printErr := fmt.Fprintf(stderr, "%s: %v\n", displayCommand, err); printErr != nil {
 					return printErr
 				}
 				if redrawPrompt {
@@ -4184,6 +4314,7 @@ func isBoolFlagValue(value flag.Value) bool {
 type agentRuntime struct {
 	cwd                   string
 	configPath            string
+	displayCommand        string
 	providerName          string
 	modelProfile          string
 	modelID               string
@@ -4248,7 +4379,7 @@ func (r *agentRuntime) writeSessionSaveNotice(stderr io.Writer) error {
 	if !r.saveSessions || r.sessionSaveNoticeDone || stderr == nil {
 		return nil
 	}
-	if _, err := fmt.Fprintln(stderr, resumableSessionSaveNoticeText); err != nil {
+	if _, err := fmt.Fprintln(stderr, renderCommandText(resumableSessionSaveNoticeText, r.displayCommand)); err != nil {
 		return err
 	}
 	r.sessionSaveNoticeDone = true
@@ -4417,7 +4548,7 @@ func (r *agentRuntime) compactSessionWithCheckpoint(ctx context.Context, stderr 
 	}
 	r.resumableSession = saved
 	r.activeItemIDs = copyStringSlice(saved.ActiveHistory)
-	if _, err := fmt.Fprintln(stderr, "sai: compacted session context"); err != nil {
+	if _, err := fmt.Fprintf(stderr, "%s: compacted session context\n", r.displayCommand); err != nil {
 		return nil, err
 	}
 	return messages, nil
@@ -4893,6 +5024,8 @@ func prepareAgentRuntime(ctx context.Context, configPath string, options agentCo
 }
 
 func prepareAgentRuntimeWithOptions(ctx context.Context, configPath string, options agentCommandFlags, stderr io.Writer, getwd func() (string, error), program string, prep runtimePreparationOptions) (runtime *agentRuntime, err error) {
+	displayCommand := displayProgramName(program)
+	warningWriter := newCommandWarningWriter(stderr, displayCommand)
 	cwd, err := getwd()
 	if err != nil {
 		return nil, fmt.Errorf("get current directory: %w", err)
@@ -4981,7 +5114,7 @@ func prepareAgentRuntimeWithOptions(ctx context.Context, configPath string, opti
 	provider = contextwindow.TrackingProvider{
 		Inner:         provider,
 		Tracker:       contextTracker,
-		WarningWriter: stderr,
+		WarningWriter: warningWriter,
 	}
 
 	enabledToolNames := cfg.Tools.Enabled
@@ -5056,7 +5189,7 @@ func prepareAgentRuntimeWithOptions(ctx context.Context, configPath string, opti
 			Directory:        cwd,
 			ConfigDir:        filepath.Dir(cfg.ConfigPath),
 			InstructionFiles: cfg.Agent.InstructionFiles,
-			WarningWriter:    stderr,
+			WarningWriter:    warningWriter,
 		})
 		if err != nil {
 			return nil, err
@@ -5083,6 +5216,7 @@ func prepareAgentRuntimeWithOptions(ctx context.Context, configPath string, opti
 	return &agentRuntime{
 		cwd:                   cwd,
 		configPath:            cfg.ConfigPath,
+		displayCommand:        displayCommand,
 		providerName:          resolved.ProviderName,
 		modelProfile:          resolved.Profile,
 		modelID:               resolved.ModelID,

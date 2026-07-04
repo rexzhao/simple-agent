@@ -7,7 +7,7 @@ evidence 证明。
 
 - [ ] 确认 M21 是直接替换，不保留旧 scoped server behavior 兼容层。
 - [x] 确认本任务不恢复 hardcoded chat product entry，也不把它作为 hidden alias。
-- [ ] 确认用户可见 docs/help/errors 使用 raw `argv[0]` basename，不硬编码具体命令名。
+- [x] 确认用户可见 docs/help/errors 使用 raw `argv[0]` basename，不硬编码具体命令名。
 
 ## Home Namespace and Command Name
 
@@ -329,4 +329,10 @@ evidence 证明。
   且两次 turn 之间重写 session `config_path` 下 provider `base_url` 后，第二个 fake provider server
   收到第二次请求；补充验证 `go test ./...` 通过，`git diff --check` 通过（仅出现工作区 LF/CRLF
   normalization warnings）。
+- 2026-07-04 M21 argv[0] display-name slice: `go test ./internal/cli -run "TestCustomProgramBasename|TestRenderCommandTextPreservesNonCommandSaiIdentifiers"` 和
+  `go test ./internal/cli` 通过；
+  覆盖 `custom-agent.exe` basename 保留 `.exe` 并用于 root/nested help、usage error prefix/help hint、
+  `version` output、project guidance `run "custom-agent.exe project create"`、dynamic unknown command `"sai"`
+  不被改写、context-window 和 instruction-file warning prefixes 使用 custom basename，以及 `sai.yaml` / `sai.jsonl`
+  不被 display renderer 改写。
 - Known limits: 当前 M21 slices 未实现 GUI server work、shutdown semantics 或 transcript/blob migration。

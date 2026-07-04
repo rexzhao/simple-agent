@@ -973,6 +973,150 @@ func TestVersionCommand(t *testing.T) {
 	}
 }
 
+func TestCustomProgramBasenameInHelpVersionAndUsageError(t *testing.T) {
+	program := filepath.Join(t.TempDir(), "custom-agent.exe")
+	home := t.TempDir()
+	getwd := func() (string, error) {
+		return "", errors.New("getwd should not be called")
+	}
+
+	for _, tt := range []struct {
+		name  string
+		args  []string
+		wants []string
+	}{
+		{
+			name: "root help",
+			args: []string{"--home", home, "help"},
+			wants: []string{
+				"usage: custom-agent.exe [--home dir]",
+				"With no command, custom-agent.exe defaults to attach.",
+				`Run "custom-agent.exe help <command>" for command usage.`,
+			},
+		},
+		{
+			name:  "nested help",
+			args:  []string{"--home", home, "help", "project", "create"},
+			wants: []string{"usage: custom-agent.exe project create [--cwd path] [--name name]"},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			code := RunWithProgramGetwd(program, tt.args, &stdout, &stderr, getwd)
+			if code != 0 {
+				t.Fatalf("RunWithProgramGetwd(%v) code = %d, stderr = %s", tt.args, code, stderr.String())
+			}
+			if stderr.String() != "" {
+				t.Fatalf("stderr = %q, want empty", stderr.String())
+			}
+			out := stdout.String()
+			for _, want := range tt.wants {
+				if !strings.Contains(out, want) {
+					t.Fatalf("stdout = %q, want contain %q", out, want)
+				}
+			}
+			assertCLIErrorOmits(t, out, filepath.Dir(program), "usage: sai", `Run "sai help`)
+		})
+	}
+
+	t.Run("version", func(t *testing.T) {
+		var stdout, stderr bytes.Buffer
+		code := RunWithProgramGetwd(program, []string{"--home", home, "version"}, &stdout, &stderr, getwd)
+		if code != 0 {
+			t.Fatalf("RunWithProgramGetwd(version) code = %d, stderr = %s", code, stderr.String())
+		}
+		if got, want := stdout.String(), "custom-agent.exe dev\n"; got != want {
+			t.Fatalf("version output = %q, want %q", got, want)
+		}
+		if stderr.String() != "" {
+			t.Fatalf("stderr = %q, want empty", stderr.String())
+		}
+	})
+
+	t.Run("usage error", func(t *testing.T) {
+		var stdout, stderr bytes.Buffer
+		code := RunWithProgramGetwd(program, []string{"--home", home, "nope"}, &stdout, &stderr, getwd)
+		if code != 1 {
+			t.Fatalf("RunWithProgramGetwd(unknown) code = %d, want 1", code)
+		}
+		if stdout.String() != "" {
+			t.Fatalf("stdout = %q, want empty", stdout.String())
+		}
+		assertCLIErrorContains(t, stderr.String(), `custom-agent.exe: unknown command "nope"`, `Run "custom-agent.exe help" for usage.`)
+		assertCLIErrorOmits(t, stderr.String(), filepath.Dir(program), `Run "sai help"`)
+	})
+
+	t.Run("dynamic command named sai", func(t *testing.T) {
+		var stdout, stderr bytes.Buffer
+		code := RunWithProgramGetwd(program, []string{"--home", home, "sai"}, &stdout, &stderr, getwd)
+		if code != 1 {
+			t.Fatalf("RunWithProgramGetwd(unknown sai) code = %d, want 1", code)
+		}
+		if stdout.String() != "" {
+			t.Fatalf("stdout = %q, want empty", stdout.String())
+		}
+		assertCLIErrorContains(t, stderr.String(), `custom-agent.exe: unknown command "sai"`, `Run "custom-agent.exe help" for usage.`)
+		assertCLIErrorOmits(t, stderr.String(), `unknown command "custom-agent.exe"`, `Run "sai help"`)
+	})
+}
+
+func TestCustomProgramBasenameInProjectGuidanceError(t *testing.T) {
+	program := filepath.Join(t.TempDir(), "custom-agent.exe")
+	home := t.TempDir()
+	projectDir := t.TempDir()
+	projectsCalled := make(chan struct{}, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/health":
+			writeCLIJSON(w, http.StatusOK, map[string]any{"status": "ok"})
+		case r.URL.Path == "/projects" && r.Method == http.MethodGet:
+			projectsCalled <- struct{}{}
+			writeCLIJSON(w, http.StatusOK, map[string]any{"projects": []map[string]any{}})
+		default:
+			t.Fatalf("unexpected path %s %q", r.Method, r.URL.Path)
+		}
+	}))
+	defer server.Close()
+	registerCLIFakeServerInHome(t, home, projectDir, server.URL, "registry-token")
+
+	var stdout, stderr bytes.Buffer
+	code := RunWithProgramGetwd(program, []string{"--home", home, "session", "create"}, &stdout, &stderr, func() (string, error) {
+		return projectDir, nil
+	})
+
+	if code != 1 {
+		t.Fatalf("session create code = %d, want 1", code)
+	}
+	if stdout.String() != "" {
+		t.Fatalf("stdout = %q, want empty", stdout.String())
+	}
+	select {
+	case <-projectsCalled:
+	default:
+		t.Fatal("GET /projects was not called")
+	}
+	assertCLIErrorContains(t, stderr.String(), "custom-agent.exe: no registered project found from", `run "custom-agent.exe project create"`)
+	assertCLIErrorOmits(t, stderr.String(), filepath.Dir(program), `run "sai project create"`)
+}
+
+func TestRenderCommandTextPreservesNonCommandSaiIdentifiers(t *testing.T) {
+	got := renderCommandText(`usage: sai config show
+sai: warning: example
+config=sai.yaml
+log=sai.jsonl
+source=sai_builtin
+`, "custom-agent.exe")
+	want := `usage: custom-agent.exe config show
+custom-agent.exe: warning: example
+config=sai.yaml
+log=sai.jsonl
+source=sai_builtin
+`
+	if got != want {
+		t.Fatalf("renderCommandText() = %q, want %q", got, want)
+	}
+}
+
 func TestRootHelpWritesUsageWithoutConfig(t *testing.T) {
 	for _, args := range [][]string{
 		{"-h"},
@@ -5200,6 +5344,66 @@ func TestChatContextWindowWarningDoesNotLeakSensitiveContent(t *testing.T) {
 		t.Fatalf("stderr = %q, want context window warning", errOut)
 	}
 	assertCLIErrorOmits(t, errOut, "user prompt secret", "assistant secret", "direct-secret-value", builtInBaseInstructions)
+	<-requests
+	assertNoAdditionalCLIRunRequest(t, requests)
+}
+
+func TestCustomProgramBasenameInContextWindowWarning(t *testing.T) {
+	server, requests := newCLIRunServer(t,
+		`{"choices":[{"delta":{"content":"assistant secret"}}]}`,
+		`[DONE]`,
+	)
+	defer server.Close()
+
+	program := filepath.Join(t.TempDir(), "custom-agent.exe")
+	configDir := t.TempDir()
+	writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
+	setCLIModelContextWindow(t, configDir, 260)
+
+	var stdout, stderr bytes.Buffer
+	code := runLegacyChatWithInterrupts(context.Background(), program, []string{"--config", cliConfigPath(configDir), "chat", "--quit", "--prompt", "user prompt secret"}, strings.NewReader(""), &stdout, &stderr, func() (string, error) {
+		return t.TempDir(), nil
+	}, nil)
+
+	if code != 0 {
+		t.Fatalf("RunWithProgram(chat) code = %d, stderr = %s", code, stderr.String())
+	}
+	if got, want := stdout.String(), "assistant secret"; got != want {
+		t.Fatalf("stdout = %q, want %q", got, want)
+	}
+	errOut := stderr.String()
+	assertCLIErrorContains(t, errOut, "custom-agent.exe: warning: estimated context usage", "/260 tokens", "no context was truncated")
+	assertCLIErrorOmits(t, errOut, "sai: warning:", filepath.Dir(program), "user prompt secret", "assistant secret", "direct-secret-value")
+	<-requests
+	assertNoAdditionalCLIRunRequest(t, requests)
+}
+
+func TestCustomProgramBasenameInInstructionFileWarning(t *testing.T) {
+	server, requests := newCLIRunServer(t,
+		`{"choices":[{"delta":{"content":"assistant"}}]}`,
+		`[DONE]`,
+	)
+	defer server.Close()
+
+	program := filepath.Join(t.TempDir(), "custom-agent.exe")
+	configDir := t.TempDir()
+	writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
+	setCLIInstructionFiles(t, configDir, []string{"$REPO/AGENTS.md"})
+
+	var stdout, stderr bytes.Buffer
+	code := runLegacyChatWithInterrupts(context.Background(), program, []string{"--config", cliConfigPath(configDir), "chat", "--quit", "--prompt", "hello"}, strings.NewReader(""), &stdout, &stderr, func() (string, error) {
+		return t.TempDir(), nil
+	}, nil)
+
+	if code != 0 {
+		t.Fatalf("RunWithProgram(chat) code = %d, stderr = %s", code, stderr.String())
+	}
+	if got, want := stdout.String(), "assistant"; got != want {
+		t.Fatalf("stdout = %q, want %q", got, want)
+	}
+	errOut := stderr.String()
+	assertCLIErrorContains(t, errOut, "custom-agent.exe: warning: skipping instruction file entry", "$REPO could not be resolved")
+	assertCLIErrorOmits(t, errOut, "sai: warning:", filepath.Dir(program), "direct-secret-value")
 	<-requests
 	assertNoAdditionalCLIRunRequest(t, requests)
 }
