@@ -138,7 +138,7 @@ func execute(ctx context.Context, program string, args []string, stdin io.Reader
 		var stop func()
 		ctx, stop = contextWithInterruptCancel(ctx, interrupts)
 		defer stop()
-		return attachCommand(ctx, rootArgs.commandArgs, rootArgs.configProvided, homePath, stdin, stdout, stderr, getwd)
+		return attachCommand(ctx, rootArgs.commandArgs, rootArgs.configPath, rootArgs.configProvided, homePath, stdin, stdout, stderr, getwd, program)
 	}
 	var stop func()
 	ctx, stop = contextWithInterruptCancel(ctx, interrupts)
@@ -148,7 +148,7 @@ func execute(ctx context.Context, program string, args []string, stdin io.Reader
 	case "help":
 		return helpCommand(rootArgs.commandArgs, stdout)
 	case "attach":
-		return attachCommand(ctx, rootArgs.commandArgs, rootArgs.configProvided, homePath, stdin, stdout, stderr, getwd)
+		return attachCommand(ctx, rootArgs.commandArgs, rootArgs.configPath, rootArgs.configProvided, homePath, stdin, stdout, stderr, getwd, program)
 	case "version":
 		return versionCommand(rootArgs.commandArgs, stdout)
 	case "config":
@@ -1799,31 +1799,7 @@ func sessionCreateCommand(ctx context.Context, args []string, configPath, homePa
 	if err != nil {
 		return err
 	}
-	record, err := ensureProjectCommandServer(ctx, configPath, homePath, creationCWD, program)
-	if err != nil {
-		return err
-	}
-	project, ok, err := nearestProject(ctx, record, creationCWD)
-	if err != nil {
-		return err
-	}
-	if !ok {
-		return fmt.Errorf("no registered project found from %s; run \"sai project create\"", creationCWD)
-	}
-
-	cfg, err := loadConfig(serverConfigPath(configPath, creationCWD), func() (string, error) {
-		return creationCWD, nil
-	}, program)
-	if err != nil {
-		return err
-	}
-	defaults, err := serverSessionDefaultsFromConfig(cfg, creationCWD)
-	if err != nil {
-		return err
-	}
-	defaults.CreatedCWD = creationCWD
-	metadata := sessionCreateMetadataFromDefaults(defaults)
-	session, err := localserver.CreateProjectSessionWithMetadataWithToken(ctx, record.Addr, record.Token, project.ID, metadata, serverClientTimeout)
+	_, session, err := createProjectSessionForCWD(ctx, configPath, homePath, creationCWD, program)
 	if err != nil {
 		return err
 	}
@@ -1917,6 +1893,38 @@ func nearestProject(ctx context.Context, record localserver.RegistryRecord, cwd 
 		return localserver.ProjectInfo{}, false, err
 	}
 	return nearestProjectFromList(projects, cwd)
+}
+
+func createProjectSessionForCWD(ctx context.Context, configPath, homePath, creationCWD, program string) (localserver.RegistryRecord, localserver.SessionDetail, error) {
+	record, err := ensureProjectCommandServer(ctx, configPath, homePath, creationCWD, program)
+	if err != nil {
+		return localserver.RegistryRecord{}, localserver.SessionDetail{}, err
+	}
+	project, ok, err := nearestProject(ctx, record, creationCWD)
+	if err != nil {
+		return localserver.RegistryRecord{}, localserver.SessionDetail{}, err
+	}
+	if !ok {
+		return localserver.RegistryRecord{}, localserver.SessionDetail{}, fmt.Errorf("no registered project found from %s; run %q", creationCWD, program+" project create")
+	}
+
+	cfg, err := loadConfig(serverConfigPath(configPath, creationCWD), func() (string, error) {
+		return creationCWD, nil
+	}, program)
+	if err != nil {
+		return localserver.RegistryRecord{}, localserver.SessionDetail{}, err
+	}
+	defaults, err := serverSessionDefaultsFromConfig(cfg, creationCWD)
+	if err != nil {
+		return localserver.RegistryRecord{}, localserver.SessionDetail{}, err
+	}
+	defaults.CreatedCWD = creationCWD
+	metadata := sessionCreateMetadataFromDefaults(defaults)
+	session, err := localserver.CreateProjectSessionWithMetadataWithToken(ctx, record.Addr, record.Token, project.ID, metadata, serverClientTimeout)
+	if err != nil {
+		return localserver.RegistryRecord{}, localserver.SessionDetail{}, err
+	}
+	return record, session, nil
 }
 
 func ensureSessionCommandServer(ctx context.Context, configPath, homePath, program string, getwd func() (string, error)) (localserver.RegistryRecord, error) {
@@ -2108,7 +2116,7 @@ func serversListCommand(ctx context.Context, args []string, homePath string, std
 	return nil
 }
 
-func attachCommand(ctx context.Context, args []string, configProvided bool, homePath string, stdin io.Reader, stdout, stderr io.Writer, getwd func() (string, error)) error {
+func attachCommand(ctx context.Context, args []string, configPath string, configProvided bool, homePath string, stdin io.Reader, stdout, stderr io.Writer, getwd func() (string, error), program string) error {
 	flags := flag.NewFlagSet("sai attach", flag.ContinueOnError)
 	cwdFlag := flags.String("cwd", "", "discovery working directory")
 	newSession := flags.Bool("new", false, "create a new server-owned session before attaching")
@@ -2126,27 +2134,37 @@ func attachCommand(ctx context.Context, args []string, configProvided bool, home
 		return err
 	}
 
-	record, _, err := discoverClientServer(ctx, *cwdFlag, homePath, getwd)
-	if err != nil {
-		return err
-	}
-
 	sessionID := ""
+	var record localserver.RegistryRecord
 	if *newSession {
-		detail, err := localserver.CreateSessionWithToken(ctx, record.Addr, record.Token, serverClientTimeout)
+		creationCWD, err := resolveClientCWD(*cwdFlag, getwd)
 		if err != nil {
 			return err
 		}
+		detailRecord, detail, err := createProjectSessionForCWD(ctx, configPath, homePath, creationCWD, program)
+		if err != nil {
+			return err
+		}
+		record = detailRecord
 		sessionID = strings.TrimSpace(detail.ID)
 		if sessionID == "" {
 			return fmt.Errorf("create session at %s: response missing session id", record.Addr)
 		}
-	} else if len(positionals) == 1 {
+	} else {
+		var err error
+		record, _, err = discoverClientServer(ctx, *cwdFlag, homePath, getwd)
+		if err != nil {
+			return err
+		}
+	}
+
+	if !*newSession && len(positionals) == 1 {
 		sessionID = strings.TrimSpace(positionals[0])
 		if sessionID == "" {
 			return usageError("session id must be a non-empty string", "", "sai help attach")
 		}
-	} else {
+	} else if !*newSession {
+		var err error
 		sessionID, err = mostRecentlyUpdatedSessionID(ctx, record.Addr)
 		if err != nil {
 			return err
