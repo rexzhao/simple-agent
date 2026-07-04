@@ -5481,9 +5481,9 @@ func (r serverAgentTurnRunner) PlanSessionCompaction(ctx context.Context, reques
 }
 
 func (r serverAgentTurnRunner) prepareServerSessionRuntime(ctx context.Context, session sessions.SessionV2) (*agentRuntime, error) {
-	cwd := strings.TrimSpace(session.CWD)
+	cwd := strings.TrimSpace(session.CreatedCWD)
 	if cwd == "" {
-		return nil, fmt.Errorf("session cwd is required")
+		return nil, fmt.Errorf("session created_cwd is required")
 	}
 	configPath := session.RootConfigPath()
 	if strings.TrimSpace(configPath) == "" {

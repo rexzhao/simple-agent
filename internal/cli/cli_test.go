@@ -5976,6 +5976,7 @@ subagents:
 		ModelProfile:    "default",
 		ModelID:         "model-default",
 		CWD:             projectDir,
+		CreatedCWD:      projectDir,
 		ConfigPath:      cliConfigPath(configDir),
 		SaveToolResults: true,
 	})
@@ -6004,6 +6005,155 @@ subagents:
 	assertNoAdditionalCLIRunRequest(t, requests)
 	if len(result.Items) != 3 {
 		t.Fatalf("len(result.Items) = %d, want runtime+user+assistant save plan: %#v", len(result.Items), result.Items)
+	}
+}
+
+func TestServerAgentTurnRunnerUsesCreatedCWDForInstructionsAndSavePlan(t *testing.T) {
+	server, requests := newCLIRunServer(t,
+		`{"choices":[{"delta":{"content":"server assistant"}}]}`,
+		`[DONE]`,
+	)
+	defer server.Close()
+
+	configDir := t.TempDir()
+	writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
+	sessionRoot := filepath.Join(configDir, "sessions")
+	createdCWD := t.TempDir()
+	staleCWD := t.TempDir()
+	writeCLIFile(t, filepath.Join(createdCWD, "AGENTS.md"), "created cwd instructions\n")
+	writeCLIFile(t, filepath.Join(staleCWD, "AGENTS.md"), "stale cwd instructions\n")
+	session := sessions.SessionV2{
+		ID:              "server-created-cwd",
+		Version:         sessions.VersionV2,
+		Provider:        "fake",
+		ModelProfile:    "default",
+		ModelID:         "model-default",
+		CWD:             staleCWD,
+		CreatedCWD:      createdCWD,
+		ConfigPath:      cliConfigPath(configDir),
+		SaveToolResults: true,
+	}
+	writeCLISessionV2(t, sessionRoot, session)
+	loaded := loadCLISession(t, sessionRoot, session.ID)
+
+	result, err := (serverAgentTurnRunner{program: "sai"}).RunSessionTurn(context.Background(), localserver.SessionTurnRequest{
+		Session: loaded,
+		Content: "server prompt",
+	})
+	if err != nil {
+		t.Fatalf("RunSessionTurn() error = %v", err)
+	}
+
+	request := receiveCLIRunRequest(t, requests)
+	assertNoAdditionalCLIRunRequest(t, requests)
+	messages := requestMessages(t, request.Body)
+	assertMessage(t, messages, 0, "system", builtInBaseInstructions)
+	assertMessage(t, messages, 1, "developer", "created cwd instructions\n")
+	assertMessage(t, messages, 2, "user", "server prompt")
+	if strings.Contains(string(request.RawBody), "stale cwd instructions") {
+		t.Fatalf("server runner request used stale cwd instructions: %s", request.RawBody)
+	}
+	if got, want := result.Session.CWD, createdCWD; got != want {
+		t.Fatalf("save plan CWD = %q, want created_cwd %q", got, want)
+	}
+	if got, want := result.Session.CreatedCWD, createdCWD; got != want {
+		t.Fatalf("save plan CreatedCWD = %q, want %q", got, want)
+	}
+	if got, want := result.Session.ConfigPath, cliConfigPath(configDir); got != want {
+		t.Fatalf("save plan ConfigPath = %q, want %q", got, want)
+	}
+}
+
+func TestServerAgentTurnRunnerRequiresCreatedCWD(t *testing.T) {
+	_, err := (serverAgentTurnRunner{program: "sai"}).RunSessionTurn(context.Background(), localserver.SessionTurnRequest{
+		Session: sessions.SessionV2{
+			ID:              "server-missing-created-cwd",
+			Version:         sessions.VersionV2,
+			Provider:        "fake",
+			ModelProfile:    "default",
+			ModelID:         "model-default",
+			CWD:             t.TempDir(),
+			ConfigPath:      filepath.Join(t.TempDir(), "sai.yaml"),
+			SaveToolResults: true,
+		},
+		Content: "server prompt",
+	})
+	if err == nil {
+		t.Fatal("RunSessionTurn() error = nil, want missing created_cwd error")
+	}
+	if !strings.Contains(err.Error(), "session created_cwd is required") {
+		t.Fatalf("RunSessionTurn() error = %v, want missing created_cwd error", err)
+	}
+}
+
+func TestServerAgentTurnRunnerReloadsSessionConfigPathEachTurn(t *testing.T) {
+	firstServer, firstRequests := newCLIRunServer(t,
+		`{"choices":[{"delta":{"content":"first assistant"}}]}`,
+		`[DONE]`,
+	)
+	defer firstServer.Close()
+	secondServer, secondRequests := newCLIRunServer(t,
+		`{"choices":[{"delta":{"content":"second assistant"}}]}`,
+		`[DONE]`,
+	)
+	defer secondServer.Close()
+
+	configDir := t.TempDir()
+	writeCLIRunFixtureInDir(t, configDir, firstServer.URL, "direct-secret-value", "openai-chat")
+	sessionRoot := filepath.Join(configDir, "sessions")
+	createdCWD := t.TempDir()
+	session := sessions.SessionV2{
+		ID:              "server-reload-config",
+		Version:         sessions.VersionV2,
+		Provider:        "fake",
+		ModelProfile:    "default",
+		ModelID:         "model-default",
+		CWD:             createdCWD,
+		CreatedCWD:      createdCWD,
+		ConfigPath:      cliConfigPath(configDir),
+		SaveToolResults: true,
+	}
+	writeCLISessionV2(t, sessionRoot, session)
+	loaded := loadCLISession(t, sessionRoot, session.ID)
+	runner := serverAgentTurnRunner{program: "sai"}
+
+	firstResult, err := runner.RunSessionTurn(context.Background(), localserver.SessionTurnRequest{
+		Session: loaded,
+		Content: "first prompt",
+	})
+	if err != nil {
+		t.Fatalf("first RunSessionTurn() error = %v", err)
+	}
+	firstRequest := receiveCLIRunRequest(t, firstRequests)
+	assertNoAdditionalCLIRunRequest(t, secondRequests)
+	assertMessage(t, requestMessages(t, firstRequest.Body), 1, "user", "first prompt")
+	store := sessions.NewV2Store(sessionRoot)
+	saved, err := store.SaveTurn(firstResult.Session, firstResult.Items, firstResult.ActiveHistory)
+	if err != nil {
+		t.Fatalf("SaveTurn(first result) error = %v", err)
+	}
+
+	setCLIProviderBaseURL(t, configDir, secondServer.URL)
+	secondResult, err := runner.RunSessionTurn(context.Background(), localserver.SessionTurnRequest{
+		Session: saved,
+		Content: "second prompt",
+	})
+	if err != nil {
+		t.Fatalf("second RunSessionTurn() error = %v", err)
+	}
+
+	secondRequest := receiveCLIRunRequest(t, secondRequests)
+	assertNoAdditionalCLIRunRequest(t, firstRequests)
+	secondMessages := requestMessages(t, secondRequest.Body)
+	if len(secondMessages) != 4 {
+		t.Fatalf("len(second request messages) = %d, want saved first turn plus pending prompt: %#v", len(secondMessages), secondMessages)
+	}
+	assertMessage(t, secondMessages, 0, "system", builtInBaseInstructions)
+	assertMessage(t, secondMessages, 1, "user", "first prompt")
+	assertMessage(t, secondMessages, 2, "assistant", "first assistant")
+	assertMessage(t, secondMessages, 3, "user", "second prompt")
+	if got, want := secondResult.Session.ConfigPath, cliConfigPath(configDir); got != want {
+		t.Fatalf("second save plan ConfigPath = %q, want %q", got, want)
 	}
 }
 
@@ -6037,6 +6187,7 @@ func TestServerAgentTurnRunnerAutoCompactBeforeFailedModelLeavesSessionUnchanged
 		ModelProfile:         "default",
 		ModelID:              "model-default",
 		CWD:                  projectDir,
+		CreatedCWD:           projectDir,
 		ConfigPath:           cliConfigPath(configDir),
 		InstructionsSnapshot: []model.Message{systemMessage},
 		Items: []sessions.SessionItem{
@@ -6126,6 +6277,7 @@ func TestServerAgentTurnRunnerPlansManualCompactionWithoutPersisting(t *testing.
 		ModelProfile:         "default",
 		ModelID:              "model-default",
 		CWD:                  projectDir,
+		CreatedCWD:           projectDir,
 		ConfigPath:           cliConfigPath(configDir),
 		InstructionsSnapshot: []model.Message{systemMessage},
 		Items: []sessions.SessionItem{
@@ -12439,6 +12591,29 @@ func setCLIModelContextWindow(t *testing.T, configDir string, tokens int) {
 		t.Fatalf("fake.yaml did not contain default model id to replace:\n%s", data)
 	}
 	writeCLIFile(t, configPath, updated)
+}
+
+func setCLIProviderBaseURL(t *testing.T, configDir, baseURL string) {
+	t.Helper()
+
+	configPath := filepath.Join(configDir, "providers", "fake.yaml")
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("ReadFile(%q) error = %v", configPath, err)
+	}
+	lines := strings.Split(string(data), "\n")
+	replaced := false
+	for i, line := range lines {
+		if strings.HasPrefix(line, "base_url: ") {
+			lines[i] = "base_url: " + baseURL
+			replaced = true
+			break
+		}
+	}
+	if !replaced {
+		t.Fatalf("fake.yaml did not contain base_url to replace:\n%s", data)
+	}
+	writeCLIFile(t, configPath, strings.Join(lines, "\n"))
 }
 
 func writeCLISkill(t *testing.T, configDir, id, content string) {

@@ -86,11 +86,11 @@ evidence 证明。
 - [x] `session create` 记录 `created_cwd`。
 - [x] API-level project session create records `config_path` when provided.
 - [x] API-level project session create records provider/model/tools/MCP/skills metadata when provided.
-- [ ] 每个 turn 重新读取 session 的 `config_path`。
+- [x] 每个 turn 重新读取 session 的 `config_path`。
 - [ ] `--config` 只允许创建新 session 时使用。
 - [x] attach existing session 时传 `--config` 报错。
 - [x] send existing session 时传 `--config` 报错。
-- [ ] existing session cwd 固定为 `created_cwd`。
+- [x] existing session cwd 固定为 `created_cwd`。
 - [ ] `--cwd` 只允许 project create、session create 和 `--new`。
 - [x] attach existing session 时传 `--cwd` 报错。
 - [x] send existing session 时传 `--cwd` 报错。
@@ -303,4 +303,10 @@ evidence 证明。
   bearer token usage，以及未新增 `project delete` / `project archive` compatibility aliases。
 - 2026-07-04 M21 project remove/archive slice: `go test ./...` 通过；`git diff --check` 通过（仅出现工作区
   LF/CRLF normalization warnings）。
+- 2026-07-04 M21 existing-session cwd/config runtime semantics: `go test -count=1 ./internal/cli` 通过；
+  覆盖 server-owned existing session runtime 要求 `created_cwd`，用 `created_cwd` 作为有效 `$CWD`
+  加载默认 `AGENTS.md` 而不是 stale `cwd`，save plan 保持 `CWD` 和 `CreatedCWD` 为 `created_cwd`，
+  且两次 turn 之间重写 session `config_path` 下 provider `base_url` 后，第二个 fake provider server
+  收到第二次请求；补充验证 `go test ./...` 通过，`git diff --check` 通过（仅出现工作区 LF/CRLF
+  normalization warnings）。
 - Known limits: 当前 M21 slices 未实现 GUI server work 或 session data store home migration。
