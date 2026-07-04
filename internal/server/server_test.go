@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"strings"
 	"testing"
@@ -32,14 +33,25 @@ func TestProcessHealthServerAndShutdown(t *testing.T) {
 
 	baseURL := "http://" + process.Addr()
 	health := getJSON(t, baseURL+"/health")
-	if health["status"] != "ok" || health["version"] != "test-version" {
-		t.Fatalf("health response = %#v, want ok test-version", health)
+	if health["status"] != "ok" {
+		t.Fatalf("health response = %#v, want ok", health)
 	}
-	if _, ok := health["pid"].(float64); !ok {
-		t.Fatalf("health pid = %T(%#v), want number", health["pid"], health["pid"])
+	if len(health) != 1 {
+		t.Fatalf("health response = %#v, want only status", health)
+	}
+	for _, forbidden := range []string{"token", "auth", "config_path", "cwd", "addr"} {
+		if _, ok := health[forbidden]; ok {
+			t.Fatalf("health response leaked %q: %#v", forbidden, health)
+		}
 	}
 
-	info := getJSON(t, baseURL+"/server")
+	_, body := getJSONStatus(t, baseURL+"/server", "", http.StatusForbidden)
+	errObj := body["error"].(map[string]any)
+	if errObj["code"] != "permission_denied" {
+		t.Fatalf("GET /server without token error = %#v, want permission_denied", body)
+	}
+
+	info := getJSONWithToken(t, baseURL+"/server", "registry-token")
 	for key, want := range map[string]any{
 		"config_path":   "config.yaml",
 		"addr":          process.Addr(),
@@ -71,7 +83,7 @@ func TestProcessHealthServerAndShutdown(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("shutdown status = %d, want 200", resp.StatusCode)
 	}
-	body := decodeJSON(t, resp)
+	body = decodeJSON(t, resp)
 	if body["status"] != "shutting_down" {
 		t.Fatalf("shutdown response = %#v, want shutting_down", body)
 	}
@@ -87,7 +99,7 @@ func TestProcessHealthServerAndShutdown(t *testing.T) {
 }
 
 func TestProcessStructuredErrors(t *testing.T) {
-	process, err := Start(Options{Listen: "127.0.0.1:0"})
+	process, err := Start(Options{Listen: "127.0.0.1:0", AuthToken: "registry-token"})
 	if err != nil {
 		t.Fatalf("Start() error = %v", err)
 	}
@@ -106,7 +118,28 @@ func TestProcessStructuredErrors(t *testing.T) {
 		}
 	}()
 
-	resp, err := http.Post("http://"+process.Addr()+"/server", "application/json", nil)
+	_, body := getJSONStatus(t, "http://"+process.Addr()+"/server", "", http.StatusForbidden)
+	errObj := body["error"].(map[string]any)
+	if errObj["code"] != "permission_denied" {
+		t.Fatalf("GET /server without token error = %#v, want permission_denied", body)
+	}
+	_, body = getJSONStatus(t, "http://"+process.Addr()+"/server/anything", "", http.StatusForbidden)
+	errObj = body["error"].(map[string]any)
+	if errObj["code"] != "permission_denied" {
+		t.Fatalf("GET /server/anything without token error = %#v, want permission_denied", body)
+	}
+	_, body = getJSONStatus(t, "http://"+process.Addr()+"/missing", "", http.StatusForbidden)
+	errObj = body["error"].(map[string]any)
+	if errObj["code"] != "permission_denied" {
+		t.Fatalf("GET /missing without token error = %#v, want permission_denied", body)
+	}
+
+	req, err := http.NewRequest(http.MethodPost, "http://"+process.Addr()+"/server", nil)
+	if err != nil {
+		t.Fatalf("NewRequest(POST /server) error = %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer registry-token")
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("Post(/server) error = %v", err)
 	}
@@ -114,21 +147,13 @@ func TestProcessStructuredErrors(t *testing.T) {
 	if resp.StatusCode != http.StatusMethodNotAllowed {
 		t.Fatalf("POST /server status = %d, want 405", resp.StatusCode)
 	}
-	body := decodeJSON(t, resp)
-	errObj := body["error"].(map[string]any)
+	body = decodeJSON(t, resp)
+	errObj = body["error"].(map[string]any)
 	if errObj["code"] != "method_not_allowed" {
 		t.Fatalf("POST /server error = %#v, want method_not_allowed", body)
 	}
 
-	resp, err = http.Get("http://" + process.Addr() + "/missing")
-	if err != nil {
-		t.Fatalf("Get(/missing) error = %v", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusNotFound {
-		t.Fatalf("GET /missing status = %d, want 404", resp.StatusCode)
-	}
-	body = decodeJSON(t, resp)
+	_, body = getJSONStatus(t, "http://"+process.Addr()+"/missing", "registry-token", http.StatusNotFound)
 	errObj = body["error"].(map[string]any)
 	if errObj["code"] != "not_found" {
 		t.Fatalf("GET /missing error = %#v, want not_found", body)
@@ -162,15 +187,44 @@ func TestValidateListenAddressAcceptsLoopback(t *testing.T) {
 func getJSON(t *testing.T, url string) map[string]any {
 	t.Helper()
 
-	resp, err := http.Get(url)
+	_, body := getJSONStatus(t, url, "", http.StatusOK)
+	return body
+}
+
+func getJSONWithToken(t *testing.T, url, token string) map[string]any {
+	t.Helper()
+
+	_, body := getJSONStatus(t, url, token, http.StatusOK)
+	return body
+}
+
+func getJSONStatus(t *testing.T, url, token string, wantStatus int) ([]byte, map[string]any) {
+	t.Helper()
+
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		t.Fatalf("NewRequest(%s) error = %v", url, err)
+	}
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("Get(%s) error = %v", url, err)
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("Get(%s) status = %d, want 200", url, resp.StatusCode)
+	if resp.StatusCode != wantStatus {
+		t.Fatalf("Get(%s) status = %d, want %d", url, resp.StatusCode, wantStatus)
 	}
-	return decodeJSON(t, resp)
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("ReadAll(%s) error = %v", url, err)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(raw, &body); err != nil {
+		t.Fatalf("Unmarshal(%s) error = %v; body=%s", url, err, raw)
+	}
+	return raw, body
 }
 
 func decodeJSON(t *testing.T, resp *http.Response) map[string]any {

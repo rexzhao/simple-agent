@@ -66,7 +66,20 @@ func TestSessionMetadataAPIsListDetailNoItemsAndServerCount(t *testing.T) {
 	process := startSessionAPIServer(t, store, sessions.SessionV2{})
 	baseURL := "http://" + process.Addr()
 
-	serverInfo := getJSON(t, baseURL+"/server")
+	for _, endpoint := range []string{
+		"/sessions",
+		"/sessions/session-one",
+		"/sessions/session-one/items",
+		"/sessions/session-one/items/item-1/content",
+	} {
+		raw, body := getRawJSONStatus(t, baseURL+endpoint, "", http.StatusForbidden)
+		assertErrorCode(t, body, "permission_denied")
+		if bytes.Contains(raw, []byte("registry-token")) || bytes.Contains(raw, []byte("SECRET ITEM CONTENT")) {
+			t.Fatalf("permission error for %s leaked sensitive content: %s", endpoint, raw)
+		}
+	}
+
+	serverInfo := getJSONWithToken(t, baseURL+"/server", "registry-token")
 	if got := serverInfo["session_count"]; got != float64(2) {
 		t.Fatalf("/server session_count = %#v, want 2", got)
 	}
@@ -606,7 +619,12 @@ func TestSessionMetadataStructuredErrors(t *testing.T) {
 	process := startSessionAPIServer(t, sessions.NewV2Store(filepath.Join(t.TempDir(), "sessions")), sessions.SessionV2{})
 	baseURL := "http://" + process.Addr()
 
-	resp, err := http.Get(baseURL + "/sessions/missing-session")
+	req, err := http.NewRequest(http.MethodGet, baseURL+"/sessions/missing-session", nil)
+	if err != nil {
+		t.Fatalf("NewRequest(missing) error = %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer registry-token")
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("Get(missing) error = %v", err)
 	}
@@ -619,10 +637,11 @@ func TestSessionMetadataStructuredErrors(t *testing.T) {
 		t.Fatalf("missing error = %#v, want session_not_found", body)
 	}
 
-	req, err := http.NewRequest(http.MethodPut, baseURL+"/sessions", nil)
+	req, err = http.NewRequest(http.MethodPut, baseURL+"/sessions", nil)
 	if err != nil {
 		t.Fatalf("NewRequest(PUT /sessions) error = %v", err)
 	}
+	req.Header.Set("Authorization", "Bearer registry-token")
 	resp, err = http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("PUT /sessions error = %v", err)
@@ -636,7 +655,12 @@ func TestSessionMetadataStructuredErrors(t *testing.T) {
 		t.Fatalf("PUT /sessions error = %#v, want method_not_allowed", body)
 	}
 
-	resp, err = http.Post(baseURL+"/sessions/missing-session", "application/json", nil)
+	req, err = http.NewRequest(http.MethodPost, baseURL+"/sessions/missing-session", nil)
+	if err != nil {
+		t.Fatalf("NewRequest(POST /sessions/id) error = %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer registry-token")
+	resp, err = http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("POST /sessions/id error = %v", err)
 	}
@@ -649,7 +673,12 @@ func TestSessionMetadataStructuredErrors(t *testing.T) {
 		t.Fatalf("POST /sessions/id error = %#v, want method_not_allowed", body)
 	}
 
-	resp, err = http.Get(baseURL + "/sessions/missing-session/items/extra")
+	req, err = http.NewRequest(http.MethodGet, baseURL+"/sessions/missing-session/items/extra", nil)
+	if err != nil {
+		t.Fatalf("NewRequest(GET bad path) error = %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer registry-token")
+	resp, err = http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("GET bad path error = %v", err)
 	}
@@ -693,6 +722,54 @@ func TestSessionStreamConnectsAndPublishesJSONEventShapes(t *testing.T) {
 	}
 }
 
+func TestSessionStreamRequiresRegistryToken(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "sessions")
+	store := sessions.NewV2Store(root)
+	saveServerTestSession(t, store, "stream-auth-session")
+	process := startSessionAPIServerWithToken(t, store, sessions.SessionV2{}, "registry-token")
+
+	for _, tt := range []struct {
+		name   string
+		header http.Header
+	}{
+		{name: "missing token"},
+		{name: "wrong token", header: http.Header{"Authorization": []string{"Bearer wrong-token"}}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			conn, resp, err := websocket.DefaultDialer.Dial("ws://"+process.Addr()+"/sessions/stream-auth-session/stream", tt.header)
+			if err == nil {
+				_ = conn.Close()
+				t.Fatal("Dial(stream without valid auth) error = nil, want handshake failure")
+			}
+			if resp == nil {
+				t.Fatalf("Dial(stream without valid auth) response = nil, error = %v", err)
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusForbidden {
+				t.Fatalf("stream auth status = %d, want 403", resp.StatusCode)
+			}
+			raw, body := readRawJSON(t, resp)
+			assertErrorCode(t, body, "permission_denied")
+			if bytes.Contains(raw, []byte("registry-token")) {
+				t.Fatalf("stream auth error leaked registry token: %s", raw)
+			}
+		})
+	}
+
+	header := http.Header{}
+	header.Set("Authorization", "Bearer registry-token")
+	conn, resp, err := websocket.DefaultDialer.Dial("ws://"+process.Addr()+"/sessions/stream-auth-session/stream", header)
+	if err != nil {
+		if resp != nil && resp.Body != nil {
+			raw, _ := io.ReadAll(resp.Body)
+			_ = resp.Body.Close()
+			t.Fatalf("Dial(stream with valid auth) error = %v; status=%d body=%s", err, resp.StatusCode, raw)
+		}
+		t.Fatalf("Dial(stream with valid auth) error = %v", err)
+	}
+	_ = conn.Close()
+}
+
 func TestSessionStreamMissingSessionFailsBeforeUpgrade(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "sessions")
 	store := sessions.NewV2Store(root)
@@ -706,7 +783,9 @@ func TestSessionStreamMissingSessionFailsBeforeUpgrade(t *testing.T) {
 	})
 	process := startSessionAPIServer(t, store, sessions.SessionV2{})
 
-	conn, resp, err := websocket.DefaultDialer.Dial("ws://"+process.Addr()+"/sessions/missing-session/stream", nil)
+	header := http.Header{}
+	header.Set("Authorization", "Bearer registry-token")
+	conn, resp, err := websocket.DefaultDialer.Dial("ws://"+process.Addr()+"/sessions/missing-session/stream", header)
 	if err == nil {
 		_ = conn.Close()
 		t.Fatal("Dial(missing stream) error = nil, want handshake failure")
@@ -740,7 +819,9 @@ func TestSessionStreamInvalidSessionIDFailsBeforeUpgrade(t *testing.T) {
 	})
 	process := startSessionAPIServer(t, store, sessions.SessionV2{})
 
-	conn, resp, err := websocket.DefaultDialer.Dial("ws://"+process.Addr()+"/sessions/bad%20session/stream", nil)
+	header := http.Header{}
+	header.Set("Authorization", "Bearer registry-token")
+	conn, resp, err := websocket.DefaultDialer.Dial("ws://"+process.Addr()+"/sessions/bad%20session/stream", header)
 	if err == nil {
 		_ = conn.Close()
 		t.Fatal("Dial(invalid-id stream) error = nil, want handshake failure")
@@ -1804,7 +1885,12 @@ func TestSessionItemsBadQueryStructuredErrors(t *testing.T) {
 		{name: "both cursors", query: "before_seq=2&after_seq=1"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			resp, err := http.Get(baseURL + "/sessions/bad-query-session/items?" + tt.query)
+			req, err := http.NewRequest(http.MethodGet, baseURL+"/sessions/bad-query-session/items?"+tt.query, nil)
+			if err != nil {
+				t.Fatalf("NewRequest(items?%s) error = %v", tt.query, err)
+			}
+			req.Header.Set("Authorization", "Bearer registry-token")
+			resp, err := http.DefaultClient.Do(req)
 			if err != nil {
 				t.Fatalf("Get(items?%s) error = %v", tt.query, err)
 			}
@@ -1834,7 +1920,12 @@ func TestSessionItemsMissingAndCorruptSessionErrors(t *testing.T) {
 	process := startSessionAPIServer(t, store, sessions.SessionV2{})
 	baseURL := "http://" + process.Addr()
 
-	resp, err := http.Get(baseURL + "/sessions/missing-session/items")
+	req, err := http.NewRequest(http.MethodGet, baseURL+"/sessions/missing-session/items", nil)
+	if err != nil {
+		t.Fatalf("NewRequest(missing items) error = %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer registry-token")
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("Get(missing items) error = %v", err)
 	}
@@ -1847,7 +1938,12 @@ func TestSessionItemsMissingAndCorruptSessionErrors(t *testing.T) {
 		t.Fatalf("missing items error = %#v, want session_not_found", body)
 	}
 
-	resp, err = http.Get(baseURL + "/sessions/corrupt-session/items")
+	req, err = http.NewRequest(http.MethodGet, baseURL+"/sessions/corrupt-session/items", nil)
+	if err != nil {
+		t.Fatalf("NewRequest(corrupt items) error = %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer registry-token")
+	resp, err = http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("Get(corrupt items) error = %v", err)
 	}
@@ -1917,7 +2013,7 @@ func TestSessionItemContentChatReadAndByteRanges(t *testing.T) {
 	process := startSessionAPIServer(t, store, sessions.SessionV2{})
 	baseURL := "http://" + process.Addr()
 
-	raw, body := getRawJSONStatus(t, baseURL+"/sessions/content-session/items/visible-user/content", "", http.StatusOK)
+	raw, body := getRawJSONStatus(t, baseURL+"/sessions/content-session/items/visible-user/content", "registry-token", http.StatusOK)
 	assertNoContentDTOLeak(t, raw)
 	if body["item_id"] != "visible-user" || body["content"] != "hello chat" {
 		t.Fatalf("content response = %#v, want visible-user hello chat", body)
@@ -1926,17 +2022,17 @@ func TestSessionItemContentChatReadAndByteRanges(t *testing.T) {
 		t.Fatalf("content metadata = %#v, want full content metadata", body)
 	}
 
-	_, body = getRawJSONStatus(t, baseURL+"/sessions/content-session/items/range-user/content?offset=3&max_bytes=4", "", http.StatusOK)
+	_, body = getRawJSONStatus(t, baseURL+"/sessions/content-session/items/range-user/content?offset=3&max_bytes=4", "registry-token", http.StatusOK)
 	if body["content"] != "3456" || body["offset"] != float64(3) || body["size_bytes"] != float64(10) || body["bytes_returned"] != float64(4) || body["has_more"] != true {
 		t.Fatalf("range content response = %#v, want offset 3 max 4", body)
 	}
 
-	_, body = getRawJSONStatus(t, baseURL+"/sessions/content-session/items/range-user/content?offset=8&max_bytes=100", "", http.StatusOK)
+	_, body = getRawJSONStatus(t, baseURL+"/sessions/content-session/items/range-user/content?offset=8&max_bytes=100", "registry-token", http.StatusOK)
 	if body["content"] != "89" || body["offset"] != float64(8) || body["bytes_returned"] != float64(2) || body["has_more"] != false {
 		t.Fatalf("tail content response = %#v, want final bytes", body)
 	}
 
-	_, body = getRawJSONStatus(t, fmt.Sprintf("%s/sessions/content-session/items/large-assistant/content?max_bytes=%d", baseURL, maxSessionItemContentBytes+100), "", http.StatusOK)
+	_, body = getRawJSONStatus(t, fmt.Sprintf("%s/sessions/content-session/items/large-assistant/content?max_bytes=%d", baseURL, maxSessionItemContentBytes+100), "registry-token", http.StatusOK)
 	if got := len(body["content"].(string)); got != maxSessionItemContentBytes {
 		t.Fatalf("max-clamped content len = %d, want %d", got, maxSessionItemContentBytes)
 	}
@@ -2006,7 +2102,7 @@ func TestSessionItemContentDebugRequiresTokenAndChatHidesPrivateContent(t *testi
 	}
 
 	for _, itemID := range []string{"hidden-summary", "runtime-context", "tool-result"} {
-		raw, body := getRawJSONStatus(t, baseURL+"/sessions/private-content-session/items/"+itemID+"/content", "", http.StatusNotFound)
+		raw, body := getRawJSONStatus(t, baseURL+"/sessions/private-content-session/items/"+itemID+"/content", "registry-token", http.StatusNotFound)
 		assertErrorCode(t, body, "content_unavailable")
 		for _, forbidden := range []string{"hidden summary secret", "runtime context secret", "tool result secret", "call-secret"} {
 			if bytes.Contains(raw, []byte(forbidden)) {
@@ -2038,16 +2134,16 @@ func TestSessionItemContentStructuredErrors(t *testing.T) {
 	process := startSessionAPIServer(t, store, sessions.SessionV2{})
 	baseURL := "http://" + process.Addr()
 
-	_, body := getRawJSONStatus(t, baseURL+"/sessions/missing-session/items/item-1/content", "", http.StatusNotFound)
+	_, body := getRawJSONStatus(t, baseURL+"/sessions/missing-session/items/item-1/content", "registry-token", http.StatusNotFound)
 	assertErrorCode(t, body, "session_not_found")
 
-	_, body = getRawJSONStatus(t, baseURL+"/sessions/content-errors/items/missing-item/content", "", http.StatusNotFound)
+	_, body = getRawJSONStatus(t, baseURL+"/sessions/content-errors/items/missing-item/content", "registry-token", http.StatusNotFound)
 	assertErrorCode(t, body, "item_not_found")
 
-	_, body = getRawJSONStatus(t, baseURL+"/sessions/content-errors/items/empty-message/content", "", http.StatusNotFound)
+	_, body = getRawJSONStatus(t, baseURL+"/sessions/content-errors/items/empty-message/content", "registry-token", http.StatusNotFound)
 	assertErrorCode(t, body, "content_unavailable")
 
-	_, body = getRawJSONStatus(t, baseURL+"/sessions/corrupt-content-session/items/item-1/content", "", http.StatusInternalServerError)
+	_, body = getRawJSONStatus(t, baseURL+"/sessions/corrupt-content-session/items/item-1/content", "registry-token", http.StatusInternalServerError)
 	assertErrorCode(t, body, "session_store_error")
 
 	for _, tt := range []struct {
@@ -2062,7 +2158,7 @@ func TestSessionItemContentStructuredErrors(t *testing.T) {
 		{name: "duplicate offset", query: "offset=1&offset=2"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			_, body := getRawJSONStatus(t, baseURL+"/sessions/content-errors/items/empty-message/content?"+tt.query, "", http.StatusBadRequest)
+			_, body := getRawJSONStatus(t, baseURL+"/sessions/content-errors/items/empty-message/content?"+tt.query, "registry-token", http.StatusBadRequest)
 			assertErrorCode(t, body, "invalid_query")
 		})
 	}
@@ -2078,7 +2174,12 @@ func TestSessionDetailCorruptStoreErrorIsStructured5xx(t *testing.T) {
 	}
 	process := startSessionAPIServer(t, sessions.NewV2Store(root), sessions.SessionV2{})
 
-	resp, err := http.Get("http://" + process.Addr() + "/sessions/corrupt-session")
+	req, err := http.NewRequest(http.MethodGet, "http://"+process.Addr()+"/sessions/corrupt-session", nil)
+	if err != nil {
+		t.Fatalf("NewRequest(corrupt session) error = %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer registry-token")
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("Get(corrupt session) error = %v", err)
 	}
@@ -2095,7 +2196,7 @@ func TestSessionDetailCorruptStoreErrorIsStructured5xx(t *testing.T) {
 func startSessionAPIServer(t *testing.T, store *sessions.V2Store, defaults sessions.SessionV2) *Process {
 	t.Helper()
 
-	return startSessionAPIServerWithToken(t, store, defaults, "")
+	return startSessionAPIServerWithToken(t, store, defaults, "registry-token")
 }
 
 func startSessionAPIServerWithToken(t *testing.T, store *sessions.V2Store, defaults sessions.SessionV2, token string) *Process {
@@ -2338,7 +2439,7 @@ func serverTestSessionItemFromMessage(id string, message model.Message) sessions
 func getRawJSON(t *testing.T, url string) ([]byte, map[string]any) {
 	t.Helper()
 
-	return getRawJSONStatus(t, url, "", http.StatusOK)
+	return getRawJSONStatus(t, url, "registry-token", http.StatusOK)
 }
 
 func getRawJSONStatus(t *testing.T, url, token string, wantStatus int) ([]byte, map[string]any) {
@@ -2471,7 +2572,9 @@ func appendServerTestItem(t *testing.T, store *sessions.V2Store, sessionID strin
 func dialSessionStream(t *testing.T, process *Process, sessionID string) *websocket.Conn {
 	t.Helper()
 
-	conn, resp, err := websocket.DefaultDialer.Dial("ws://"+process.Addr()+"/sessions/"+sessionID+"/stream", nil)
+	header := http.Header{}
+	header.Set("Authorization", "Bearer registry-token")
+	conn, resp, err := websocket.DefaultDialer.Dial("ws://"+process.Addr()+"/sessions/"+sessionID+"/stream", header)
 	if err != nil {
 		if resp != nil && resp.Body != nil {
 			raw, _ := io.ReadAll(resp.Body)

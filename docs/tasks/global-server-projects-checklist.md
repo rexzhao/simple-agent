@@ -44,10 +44,10 @@ evidence 证明。
 - [ ] 默认 listen 只使用 loopback。
 - [ ] token 存储在 home namespace 下。
 - [ ] token 文件权限尽量限制为当前 OS user 可读写。
-- [ ] `GET /health` 是 public loopback discovery endpoint。
-- [ ] `GET /health` 只返回 minimal non-sensitive liveness。
-- [ ] 除 `GET /health` 外，所有 HTTP 请求要求 bearer token。
-- [ ] 所有 WebSocket 请求要求 bearer token。
+- [x] `GET /health` 是 public loopback discovery endpoint。
+- [x] `GET /health` 只返回 minimal non-sensitive liveness。
+- [x] 除 `GET /health` 外，所有 HTTP 请求要求 bearer token。
+- [x] 所有 WebSocket 请求要求 bearer token。
 - [ ] 第一版不实现多用户 login。
 - [x] 新增 project endpoints 要求 registry bearer token。
 
@@ -279,5 +279,14 @@ evidence 证明。
   `attach --new --cwd` 和 `send --new --cwd` 仍到达 discovery/create/send 路径。
 - 2026-07-04 M21 slice 8: `go test ./...` 通过。
 - 2026-07-04 M21 slice 8: `git diff --check` 通过（仅出现工作区 LF/CRLF normalization warnings）。
+- 2026-07-04 M21 auth hardening slice: `go test ./internal/server` 通过；覆盖 `GET /health`
+  无 token 成功且只返回 minimal liveness，`GET /server` 和 session read/content endpoints
+  无 token 返回 `permission_denied`，带 registry bearer token 成功，`WS /sessions/{id}/stream`
+  无 token / 错 token握手返回 403 且有效 token 可连接。
+- 2026-07-04 M21 auth hardening slice: `go test ./internal/cli` 通过；覆盖 session list/show
+  和 attach stream client helper/call site 发送 registry bearer token，auto-start 后使用新 registry
+  token。
+- 2026-07-04 M21 auth hardening slice: `go test ./...` 和 `git diff --check` 通过；`git diff --check`
+  仅输出工作区 LF/CRLF normalization warnings。
 - Known limits: 当前 M21 slices 未实现 project remove/archive、GUI server work、session data store home
   migration 或 registry `base_url` schema rename。

@@ -160,12 +160,13 @@ func DiscoverHealthy(ctx context.Context, store RegistryStore, startCWD string, 
 	return result, nil
 }
 
-// GetServerStatus fetches GET /server from a discovered server.
-func GetServerStatus(ctx context.Context, addr string, timeout time.Duration) (ServerStatus, error) {
+// GetServerStatus fetches GET /server from a discovered server with the registry bearer token.
+func GetServerStatus(ctx context.Context, addr, token string, timeout time.Duration) (ServerStatus, error) {
 	req, err := newServerClientRequest(ctx, http.MethodGet, addr, "/server")
 	if err != nil {
 		return ServerStatus{}, err
 	}
+	setBearerToken(req, token)
 	client := http.Client{Timeout: clientTimeout(timeout)}
 	resp, err := client.Do(req)
 	if err != nil {
@@ -383,12 +384,13 @@ func marshalSessionCreateMetadata(metadata SessionCreateMetadata) ([]byte, error
 	return data, nil
 }
 
-// ListSessions fetches public session metadata from GET /sessions.
-func ListSessions(ctx context.Context, addr string, timeout time.Duration) ([]SessionMetadata, error) {
+// ListSessions fetches session metadata from GET /sessions with the registry bearer token.
+func ListSessions(ctx context.Context, addr, token string, timeout time.Duration) ([]SessionMetadata, error) {
 	req, err := newServerClientRequest(ctx, http.MethodGet, addr, "/sessions")
 	if err != nil {
 		return nil, err
 	}
+	setBearerToken(req, token)
 	client := http.Client{Timeout: clientTimeout(timeout)}
 	resp, err := client.Do(req)
 	if err != nil {
@@ -407,12 +409,13 @@ func ListSessions(ctx context.Context, addr string, timeout time.Duration) ([]Se
 	return body.Sessions, nil
 }
 
-// GetSessionDetail fetches public session metadata from GET /sessions/{id}.
-func GetSessionDetail(ctx context.Context, addr, id string, timeout time.Duration) (SessionDetail, error) {
+// GetSessionDetail fetches session metadata from GET /sessions/{id} with the registry bearer token.
+func GetSessionDetail(ctx context.Context, addr, token, id string, timeout time.Duration) (SessionDetail, error) {
 	req, err := newServerClientRequest(ctx, http.MethodGet, addr, "/sessions/"+url.PathEscape(strings.TrimSpace(id)))
 	if err != nil {
 		return SessionDetail{}, err
 	}
+	setBearerToken(req, token)
 	client := http.Client{Timeout: clientTimeout(timeout)}
 	resp, err := client.Do(req)
 	if err != nil {
@@ -516,8 +519,8 @@ func CompactSessionWithToken(ctx context.Context, addr, token, id string, timeou
 	return result, nil
 }
 
-// StreamSessionEvents connects to WS /sessions/{id}/stream and decodes JSON events.
-func StreamSessionEvents(ctx context.Context, addr, id string, timeout time.Duration) (<-chan SessionStreamEvent, <-chan error, func(), error) {
+// StreamSessionEvents connects to WS /sessions/{id}/stream with the registry bearer token and decodes JSON events.
+func StreamSessionEvents(ctx context.Context, addr, token, id string, timeout time.Duration) (<-chan SessionStreamEvent, <-chan error, func(), error) {
 	target, err := sessionStreamURL(addr, id)
 	if err != nil {
 		return nil, nil, nil, err
@@ -529,7 +532,11 @@ func StreamSessionEvents(ctx context.Context, addr, id string, timeout time.Dura
 	dialer := websocket.Dialer{
 		HandshakeTimeout: clientTimeout(timeout),
 	}
-	conn, resp, err := dialer.DialContext(streamCtx, target, nil)
+	headers := http.Header{}
+	if strings.TrimSpace(token) != "" {
+		headers.Set("Authorization", "Bearer "+strings.TrimSpace(token))
+	}
+	conn, resp, err := dialer.DialContext(streamCtx, target, headers)
 	if err != nil {
 		if resp != nil {
 			defer resp.Body.Close()

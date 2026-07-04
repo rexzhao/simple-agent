@@ -1827,7 +1827,7 @@ func sessionListCommand(ctx context.Context, args []string, configPath, homePath
 		if err != nil {
 			return err
 		}
-		infos, err := localserver.ListSessions(ctx, record.Addr, serverClientTimeout)
+		infos, err := localserver.ListSessions(ctx, record.Addr, record.Token, serverClientTimeout)
 		if err != nil {
 			return err
 		}
@@ -1881,7 +1881,7 @@ func sessionShowCommand(ctx context.Context, args []string, configPath, homePath
 	if err != nil {
 		return err
 	}
-	session, err := localserver.GetSessionDetail(ctx, record.Addr, positionals[0], serverClientTimeout)
+	session, err := localserver.GetSessionDetail(ctx, record.Addr, record.Token, positionals[0], serverClientTimeout)
 	if err != nil {
 		return err
 	}
@@ -2005,7 +2005,7 @@ func statusCommand(ctx context.Context, args []string, homePath string, stdout i
 		return noServerFoundError(cwd)
 	}
 
-	status, err := localserver.GetServerStatus(ctx, discovery.Record.Addr, serverClientTimeout)
+	status, err := localserver.GetServerStatus(ctx, discovery.Record.Addr, discovery.Record.Token, serverClientTimeout)
 	if err != nil {
 		return err
 	}
@@ -2181,7 +2181,7 @@ func attachCommand(ctx context.Context, args []string, configPath string, config
 		}
 	}
 
-	events, streamErrs, closeStream, err := localserver.StreamSessionEvents(ctx, record.Addr, sessionID, serverClientTimeout)
+	events, streamErrs, closeStream, err := localserver.StreamSessionEvents(ctx, record.Addr, record.Token, sessionID, serverClientTimeout)
 	if err != nil {
 		return err
 	}
@@ -3178,7 +3178,7 @@ func sessionsListCommand(ctx context.Context, args []string, homePath string, st
 	if err != nil {
 		return err
 	}
-	infos, err := localserver.ListSessions(ctx, record.Addr, serverClientTimeout)
+	infos, err := localserver.ListSessions(ctx, record.Addr, record.Token, serverClientTimeout)
 	if err != nil {
 		return err
 	}
@@ -3201,7 +3201,7 @@ func sessionsShowCommand(ctx context.Context, args []string, homePath string, st
 	if err != nil {
 		return err
 	}
-	session, err := localserver.GetSessionDetail(ctx, record.Addr, positionals[0], serverClientTimeout)
+	session, err := localserver.GetSessionDetail(ctx, record.Addr, record.Token, positionals[0], serverClientTimeout)
 	if err != nil {
 		return err
 	}

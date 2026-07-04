@@ -1868,8 +1868,8 @@ func TestSessionListAllProjectsUsesGlobalSessionsAPIAndRejectsProjectCombination
 	}
 	select {
 	case got := <-authSeen:
-		if got != "" {
-			t.Fatalf("GET /sessions Authorization = %q, want empty", got)
+		if got != "Bearer registry-token" {
+			t.Fatalf("GET /sessions Authorization = %q, want bearer registry token", got)
 		}
 	default:
 		t.Fatal("GET /sessions was not called")
@@ -1939,8 +1939,8 @@ func TestSessionShowUsesGlobalSessionIDAndRejectsCWD(t *testing.T) {
 	}
 	select {
 	case got := <-authSeen:
-		if got != "" {
-			t.Fatalf("GET /sessions/show-session Authorization = %q, want empty", got)
+		if got != "Bearer registry-token" {
+			t.Fatalf("GET /sessions/show-session Authorization = %q, want bearer registry token", got)
 		}
 	default:
 		t.Fatal("GET /sessions/show-session was not called")
@@ -2048,8 +2048,8 @@ func TestSessionListAutoStartsSingletonServerWithoutStartupOutput(t *testing.T) 
 	assertCLIFlagValue(t, childArgs, "--cwd", projectDir)
 	select {
 	case got := <-authSeen:
-		if got != "" {
-			t.Fatalf("GET /sessions Authorization = %q, want empty", got)
+		if got != "Bearer auto-token" {
+			t.Fatalf("GET /sessions Authorization = %q, want auto-start bearer token", got)
 		}
 	default:
 		t.Fatal("GET /sessions was not called")
@@ -6611,8 +6611,8 @@ func TestSessionsListUsesServerAPIWithoutLocalSessionFiles(t *testing.T) {
 	}
 	select {
 	case got := <-authSeen:
-		if got != "" {
-			t.Fatalf("GET /sessions Authorization = %q, want empty", got)
+		if got != "Bearer registry-token" {
+			t.Fatalf("GET /sessions Authorization = %q, want bearer registry token", got)
 		}
 	default:
 		t.Fatal("GET /sessions was not called")
@@ -6684,8 +6684,8 @@ func TestSessionsShowUsesServerAPIWithoutLocalSessionFiles(t *testing.T) {
 	}
 	select {
 	case got := <-authSeen:
-		if got != "" {
-			t.Fatalf("GET /sessions/show-session Authorization = %q, want empty", got)
+		if got != "Bearer registry-token" {
+			t.Fatalf("GET /sessions/show-session Authorization = %q, want bearer registry token", got)
 		}
 	default:
 		t.Fatal("GET /sessions/show-session was not called")
@@ -8144,6 +8144,7 @@ func TestAttachExistingCompactAndNormalMessageContainingCompact(t *testing.T) {
 	registryPath := isolateCLIUserRegistry(t)
 	projectDir := t.TempDir()
 	prompt := "normal /compact text"
+	streamAuthSeen := make(chan string, 1)
 	compactAuthSeen := make(chan string, 1)
 	sendAuthSeen := make(chan string, 1)
 	bodySeen := make(chan map[string]any, 1)
@@ -8157,6 +8158,7 @@ func TestAttachExistingCompactAndNormalMessageContainingCompact(t *testing.T) {
 		case "/health":
 			writeCLIJSON(w, http.StatusOK, map[string]any{"status": "ok"})
 		case "/sessions/existing-session/stream":
+			streamAuthSeen <- r.Header.Get("Authorization")
 			conn, err := upgrader.Upgrade(w, r, nil)
 			if err != nil {
 				t.Fatalf("Upgrade(stream) error = %v", err)
@@ -8229,6 +8231,7 @@ func TestAttachExistingCompactAndNormalMessageContainingCompact(t *testing.T) {
 	for name, ch := range map[string]<-chan string{
 		"compact": compactAuthSeen,
 		"send":    sendAuthSeen,
+		"stream":  streamAuthSeen,
 	} {
 		select {
 		case got := <-ch:
@@ -12807,10 +12810,14 @@ func startCLIServerCommandForTest(t *testing.T, args []string, getwd func() (str
 	return addr, done, stderr, cleanup
 }
 
-func getCLIServerJSON(t *testing.T, url string) map[string]any {
+func getCLIServerJSON(t *testing.T, rawURL string) map[string]any {
 	t.Helper()
 
-	return getCLIServerJSONStatus(t, url, "", http.StatusOK)
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		t.Fatalf("Parse(%s) error = %v", rawURL, err)
+	}
+	return getCLIServerJSONStatus(t, rawURL, cliServerTokenForAddr(t, parsed.Host), http.StatusOK)
 }
 
 func getCLIServerJSONStatus(t *testing.T, url, token string, wantStatus int) map[string]any {

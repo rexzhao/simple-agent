@@ -302,6 +302,9 @@ func (p *Process) Shutdown(ctx context.Context) error {
 }
 
 func (p *Process) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if !publicEndpoint(r) && !p.requireRegistryToken(w, r) {
+		return
+	}
 	switch r.URL.Path {
 	case "/health":
 		p.handleHealth(w, r)
@@ -326,16 +329,17 @@ func (p *Process) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func publicEndpoint(r *http.Request) bool {
+	return r.Method == http.MethodGet && r.URL.Path == "/health"
+}
+
 func (p *Process) handleHealth(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		writeMethodNotAllowed(w, http.MethodGet)
 		return
 	}
-	info := p.snapshot()
 	writeJSON(w, http.StatusOK, map[string]any{
-		"status":  "ok",
-		"version": info.Version,
-		"pid":     info.PID,
+		"status": "ok",
 	})
 }
 
