@@ -6,7 +6,7 @@ evidence 证明。
 ## Scope
 
 - [ ] 确认 M21 是直接替换，不保留旧 scoped server behavior 兼容层。
-- [ ] 确认本任务不恢复 hardcoded chat product entry，也不把它作为 hidden alias。
+- [x] 确认本任务不恢复 hardcoded chat product entry，也不把它作为 hidden alias。
 - [ ] 确认用户可见 docs/help/errors 使用 raw `argv[0]` basename，不硬编码具体命令名。
 
 ## Home Namespace and Command Name
@@ -182,7 +182,7 @@ evidence 证明。
 - [x] 测试覆盖 nested discovery。
 - [ ] 测试覆盖 config rejection for existing sessions。
 - [ ] 测试覆盖 cwd rejection for existing sessions。
-- [ ] 测试覆盖 direct replacement/no chat product entry。
+- [x] 测试覆盖 direct replacement/no chat product entry。
 - [x] 测试覆盖 explicit project API paths。
 - [ ] 测试覆盖 explicit session API paths。
 - [ ] 测试覆盖 shutdown immediate/wait semantics。
@@ -208,6 +208,10 @@ evidence 证明。
 - 2026-07-04 M21 slice 2: `go test ./internal/cli` 通过；覆盖实际 `sai server` 启动时 project store
   写入 `<home>/data/projects`，且不写 project repo marker。
 - 2026-07-04 M21 slice 2: `git diff --check` 通过。
+- 2026-07-04 M21 slice 3: `go test ./internal/cli` 通过；覆盖 `chat`、`chat -h`、
+  `chat --help`、`chat --bad`、`chat --quit --prompt hi` 均返回 unknown command，`help chat`
+  返回 unknown help topic，且不输出 `usage: sai chat`。
+- 2026-07-04 M21 slice 3: `git diff --check` 通过。
 - Known limits: 当前 M21 slices 未实现 project CLI commands、session lifecycle、attach/send project
-  selection changes、project remove/archive、GUI server work、`chat` removal、session data store home
+  selection changes、project remove/archive、GUI server work、session data store home
   migration 或 registry `base_url` schema rename。

@@ -139,11 +139,9 @@ func execute(ctx context.Context, program string, args []string, stdin io.Reader
 		defer stop()
 		return attachCommand(ctx, rootArgs.commandArgs, homePath, stdin, stdout, stderr, getwd)
 	}
-	if rootArgs.command != "chat" {
-		var stop func()
-		ctx, stop = contextWithInterruptCancel(ctx, interrupts)
-		defer stop()
-	}
+	var stop func()
+	ctx, stop = contextWithInterruptCancel(ctx, interrupts)
+	defer stop()
 
 	switch rootArgs.command {
 	case "help":
@@ -250,8 +248,6 @@ func execute(ctx context.Context, program string, args []string, stdin io.Reader
 		default:
 			return usageError("usage: sai sessions <list|show|delete|prune>", "", "sai help sessions")
 		}
-	case "chat":
-		return chatCommand(ctx, rootArgs.commandArgs, rootArgs.configPath, stdin, stdout, stderr, getwd, program, interrupts)
 	default:
 		return usageError(fmt.Sprintf("unknown command %q", rootArgs.command), "", "sai help")
 	}
@@ -517,8 +513,6 @@ func helpCommand(args []string, stdout io.Writer) error {
 	switch strings.Join(args, " ") {
 	case "attach":
 		printAttachUsage(stdout)
-	case "chat":
-		printChatUsage(stdout)
 	case "version":
 		printVersionUsage(stdout)
 	case "config":

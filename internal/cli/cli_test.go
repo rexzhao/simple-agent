@@ -1036,28 +1036,36 @@ func TestRunHelpIsUnsupportedWithoutConfig(t *testing.T) {
 	}
 }
 
-func TestChatHelpWritesUsageWithoutConfig(t *testing.T) {
-	for _, args := range [][]string{
-		{"chat", "-h"},
-		{"chat", "--help"},
-		{"help", "chat"},
-	} {
-		t.Run(strings.Join(args, " "), func(t *testing.T) {
-			assertCLIHelpWithoutConfig(t, args, "usage: sai chat", "Legacy compatibility path", "in-process chat session", "recommended server-owned session path", "--prompt text | --stdin | --file path", "--save-session", "--resume id | --continue", "full sensitive content")
-		})
+func TestChatCommandIsUnsupportedWithoutConfig(t *testing.T) {
+	tests := []struct {
+		args []string
+		want string
+	}{
+		{args: []string{"chat"}, want: `unknown command "chat"`},
+		{args: []string{"chat", "-h"}, want: `unknown command "chat"`},
+		{args: []string{"chat", "--help"}, want: `unknown command "chat"`},
+		{args: []string{"chat", "--bad"}, want: `unknown command "chat"`},
+		{args: []string{"chat", "--quit", "--prompt", "hi"}, want: `unknown command "chat"`},
+		{args: []string{"help", "chat"}, want: `unknown help topic "chat"`},
 	}
 
-	var stdout, stderr bytes.Buffer
-	code := RunWithGetwd([]string{"help", "chat"}, &stdout, &stderr, func() (string, error) {
-		return "", errors.New("getwd should not be called")
-	})
-	if code != 0 {
-		t.Fatalf("RunWithGetwd(help chat) code = %d, stderr = %s", code, stderr.String())
-	}
-	for _, removed := range []string{"--enable-skills", "--disable-skills"} {
-		if strings.Contains(stdout.String(), removed) {
-			t.Fatalf("chat help still includes removed flag %q:\n%s", removed, stdout.String())
-		}
+	for _, tt := range tests {
+		t.Run(strings.Join(tt.args, " "), func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			code := RunWithGetwd(tt.args, &stdout, &stderr, func() (string, error) {
+				return "", errors.New("getwd should not be called")
+			})
+			if code != 1 {
+				t.Fatalf("RunWithGetwd(%v) code = %d, want 1", tt.args, code)
+			}
+			if stdout.String() != "" {
+				t.Fatalf("stdout = %q, want empty", stdout.String())
+			}
+			assertCLIErrorContains(t, stderr.String(), tt.want, `Run "sai help" for usage.`)
+			if strings.Contains(stderr.String(), "usage: sai chat") {
+				t.Fatalf("stderr included chat usage: %s", stderr.String())
+			}
+		})
 	}
 }
 
@@ -2556,7 +2564,7 @@ func TestRunCommandIsUnsupported(t *testing.T) {
 
 func TestChatUnknownFlagIncludesHelpHint(t *testing.T) {
 	var stdout, stderr bytes.Buffer
-	code := RunWithIO([]string{"chat", "--bad"}, strings.NewReader(""), &stdout, &stderr, func() (string, error) {
+	code := runLegacyChatWithIO([]string{"chat", "--bad"}, strings.NewReader(""), &stdout, &stderr, func() (string, error) {
 		return "", errors.New("getwd should not be called")
 	})
 
@@ -2571,7 +2579,7 @@ func TestChatUnknownFlagIncludesHelpHint(t *testing.T) {
 
 func TestChatMixedHelpDoesNotLoadConfig(t *testing.T) {
 	var stdout, stderr bytes.Buffer
-	code := RunWithIO([]string{"chat", "ignored", "-h", "--config", filepath.Join(t.TempDir(), "missing")}, strings.NewReader(""), &stdout, &stderr, func() (string, error) {
+	code := runLegacyChatWithIO([]string{"chat", "ignored", "-h", "--config", filepath.Join(t.TempDir(), "missing")}, strings.NewReader(""), &stdout, &stderr, func() (string, error) {
 		return "", errors.New("getwd should not be called")
 	})
 
@@ -2600,7 +2608,7 @@ func TestAttachHelpWritesUsageWithoutConfig(t *testing.T) {
 
 func TestChatQuitWithoutPromptIsUsageError(t *testing.T) {
 	var stdout, stderr bytes.Buffer
-	code := RunWithIO([]string{"chat", "--quit"}, strings.NewReader(""), &stdout, &stderr, func() (string, error) {
+	code := runLegacyChatWithIO([]string{"chat", "--quit"}, strings.NewReader(""), &stdout, &stderr, func() (string, error) {
 		return "", errors.New("getwd should not be called")
 	})
 
@@ -2638,7 +2646,7 @@ func TestChatStdinWithQuitRunsOneTurnAndExits(t *testing.T) {
 			writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
 
 			var stdout, stderr bytes.Buffer
-			code := RunWithIO(tt.args(configDir), strings.NewReader("stdin prompt\nline two\n"), &stdout, &stderr, func() (string, error) {
+			code := runLegacyChatWithIO(tt.args(configDir), strings.NewReader("stdin prompt\nline two\n"), &stdout, &stderr, func() (string, error) {
 				return t.TempDir(), nil
 			})
 
@@ -2672,7 +2680,7 @@ func TestChatFileWithQuitRunsOneTurnAndExits(t *testing.T) {
 	writeCLIFile(t, promptPath, "file prompt\nline two\n")
 
 	var stdout, stderr bytes.Buffer
-	code := RunWithIO([]string{"--config", cliConfigPath(configDir), "chat", "--quit", "--file", promptPath}, strings.NewReader("unused\n"), &stdout, &stderr, func() (string, error) {
+	code := runLegacyChatWithIO([]string{"--config", cliConfigPath(configDir), "chat", "--quit", "--file", promptPath}, strings.NewReader("unused\n"), &stdout, &stderr, func() (string, error) {
 		return t.TempDir(), nil
 	})
 
@@ -2730,7 +2738,7 @@ func TestChatStdinAndFileDoNotExpandJSONLLogContent(t *testing.T) {
 			writeCLIRunFixtureInDir(t, configDir, server.URL, "secret-api-key", "openai-chat")
 
 			var stdout, stderr bytes.Buffer
-			code := RunWithIO(tt.args(configDir), tt.stdin, &stdout, &stderr, func() (string, error) {
+			code := runLegacyChatWithIO(tt.args(configDir), tt.stdin, &stdout, &stderr, func() (string, error) {
 				return t.TempDir(), nil
 			})
 
@@ -2782,7 +2790,7 @@ func TestChatInitialInputSourceValidation(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			var stdout, stderr bytes.Buffer
-			code := RunWithIO(tt.args, strings.NewReader("stdin"), &stdout, &stderr, func() (string, error) {
+			code := runLegacyChatWithIO(tt.args, strings.NewReader("stdin"), &stdout, &stderr, func() (string, error) {
 				return "", errors.New("getwd should not be called")
 			})
 
@@ -2808,7 +2816,7 @@ func TestChatExitReturnsWithoutModelRequest(t *testing.T) {
 	writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
 
 	var stdout, stderr bytes.Buffer
-	code := RunWithIO([]string{"--config", cliConfigPath(configDir), "chat"}, strings.NewReader("/exit\n"), &stdout, &stderr, func() (string, error) {
+	code := runLegacyChatWithIO([]string{"--config", cliConfigPath(configDir), "chat"}, strings.NewReader("/exit\n"), &stdout, &stderr, func() (string, error) {
 		return t.TempDir(), nil
 	})
 
@@ -2838,7 +2846,7 @@ func TestChatAcceptsModelAndEnableToolsFlagsBeforeCommand(t *testing.T) {
 	writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
 
 	var stdout, stderr bytes.Buffer
-	code := RunWithIO([]string{"--config", cliConfigPath(configDir), "--model", "fast", "--enable-tools", "read_file", "chat", "--prompt", "first", "--quit"}, strings.NewReader(""), &stdout, &stderr, func() (string, error) {
+	code := runLegacyChatWithIO([]string{"--config", cliConfigPath(configDir), "--model", "fast", "--enable-tools", "read_file", "chat", "--prompt", "first", "--quit"}, strings.NewReader(""), &stdout, &stderr, func() (string, error) {
 		return t.TempDir(), nil
 	})
 
@@ -2865,7 +2873,7 @@ func TestChatInitialPromptWithQuitRunsOneTurnAndExits(t *testing.T) {
 	writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
 
 	var stdout, stderr bytes.Buffer
-	code := RunWithIO([]string{"--config", cliConfigPath(configDir), "chat", "--quit", "--prompt", "first"}, strings.NewReader("second\n"), &stdout, &stderr, func() (string, error) {
+	code := runLegacyChatWithIO([]string{"--config", cliConfigPath(configDir), "chat", "--quit", "--prompt", "first"}, strings.NewReader("second\n"), &stdout, &stderr, func() (string, error) {
 		return t.TempDir(), nil
 	})
 
@@ -2896,7 +2904,7 @@ func TestChatAcceptsConfigPathAfterCommand(t *testing.T) {
 	writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
 
 	var stdout, stderr bytes.Buffer
-	code := RunWithIO([]string{"chat", "--config", cliConfigPath(configDir), "--quit", "--prompt", "first"}, strings.NewReader(""), &stdout, &stderr, func() (string, error) {
+	code := runLegacyChatWithIO([]string{"chat", "--config", cliConfigPath(configDir), "--quit", "--prompt", "first"}, strings.NewReader(""), &stdout, &stderr, func() (string, error) {
 		return t.TempDir(), nil
 	})
 
@@ -2912,7 +2920,7 @@ func TestChatAcceptsConfigPathAfterCommand(t *testing.T) {
 
 func TestChatDelimiterRejectsHelpAsPositionalPrompt(t *testing.T) {
 	var stdout, stderr bytes.Buffer
-	code := RunWithIO([]string{"chat", "--quit", "--", "--help"}, strings.NewReader(""), &stdout, &stderr, func() (string, error) {
+	code := runLegacyChatWithIO([]string{"chat", "--quit", "--", "--help"}, strings.NewReader(""), &stdout, &stderr, func() (string, error) {
 		return "", errors.New("getwd should not be called")
 	})
 
@@ -2928,7 +2936,7 @@ func TestChatDelimiterRejectsHelpAsPositionalPrompt(t *testing.T) {
 func TestChatDelimiterAfterConfigPathRejectsHelpAsPositionalPrompt(t *testing.T) {
 	configDir := filepath.Join(t.TempDir(), "missing")
 	var stdout, stderr bytes.Buffer
-	code := RunWithIO([]string{"chat", "--config", cliConfigPath(configDir), "--quit", "--", "--help"}, strings.NewReader(""), &stdout, &stderr, func() (string, error) {
+	code := runLegacyChatWithIO([]string{"chat", "--config", cliConfigPath(configDir), "--quit", "--", "--help"}, strings.NewReader(""), &stdout, &stderr, func() (string, error) {
 		return "", errors.New("getwd should not be called")
 	})
 
@@ -2944,7 +2952,7 @@ func TestChatDelimiterAfterConfigPathRejectsHelpAsPositionalPrompt(t *testing.T)
 func TestChatDelimiterRejectsConfigPathAsPositionalPrompt(t *testing.T) {
 	configDir := filepath.Join(t.TempDir(), "missing")
 	var stdout, stderr bytes.Buffer
-	code := RunWithIO([]string{"chat", "--config", cliConfigPath(configDir), "--quit", "--", "--config"}, strings.NewReader(""), &stdout, &stderr, func() (string, error) {
+	code := runLegacyChatWithIO([]string{"chat", "--config", cliConfigPath(configDir), "--quit", "--", "--config"}, strings.NewReader(""), &stdout, &stderr, func() (string, error) {
 		return "", errors.New("getwd should not be called")
 	})
 
@@ -2968,7 +2976,7 @@ func TestChatInitialPromptAllowsQuitAfterPrompt(t *testing.T) {
 	writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
 
 	var stdout, stderr bytes.Buffer
-	code := RunWithIO([]string{"--config", cliConfigPath(configDir), "chat", "--prompt", "first", "--quit"}, strings.NewReader("second\n"), &stdout, &stderr, func() (string, error) {
+	code := runLegacyChatWithIO([]string{"--config", cliConfigPath(configDir), "chat", "--prompt", "first", "--quit"}, strings.NewReader("second\n"), &stdout, &stderr, func() (string, error) {
 		return t.TempDir(), nil
 	})
 
@@ -2998,7 +3006,7 @@ func TestChatInitialPromptAllowsModelFlagAfterPrompt(t *testing.T) {
 	writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
 
 	var stdout, stderr bytes.Buffer
-	code := RunWithIO([]string{"--config", cliConfigPath(configDir), "chat", "--prompt", "first", "--model", "fast", "--quit"}, strings.NewReader(""), &stdout, &stderr, func() (string, error) {
+	code := runLegacyChatWithIO([]string{"--config", cliConfigPath(configDir), "chat", "--prompt", "first", "--model", "fast", "--quit"}, strings.NewReader(""), &stdout, &stderr, func() (string, error) {
 		return t.TempDir(), nil
 	})
 
@@ -3024,7 +3032,7 @@ func TestChatAllowsModelFlagBeforeCommand(t *testing.T) {
 	writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
 
 	var stdout, stderr bytes.Buffer
-	code := RunWithIO([]string{"--model", "fast", "chat", "--config", cliConfigPath(configDir), "--prompt", "first", "--quit"}, strings.NewReader(""), &stdout, &stderr, func() (string, error) {
+	code := runLegacyChatWithIO([]string{"--model", "fast", "chat", "--config", cliConfigPath(configDir), "--prompt", "first", "--quit"}, strings.NewReader(""), &stdout, &stderr, func() (string, error) {
 		return t.TempDir(), nil
 	})
 
@@ -3050,7 +3058,7 @@ func TestChatInitialPromptAllowsEnableToolsFlagAfterPrompt(t *testing.T) {
 	writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
 
 	var stdout, stderr bytes.Buffer
-	code := RunWithIO([]string{"--config", cliConfigPath(configDir), "chat", "--prompt", "first", "--enable-tools", "read_file", "--quit"}, strings.NewReader(""), &stdout, &stderr, func() (string, error) {
+	code := runLegacyChatWithIO([]string{"--config", cliConfigPath(configDir), "chat", "--prompt", "first", "--enable-tools", "read_file", "--quit"}, strings.NewReader(""), &stdout, &stderr, func() (string, error) {
 		return t.TempDir(), nil
 	})
 
@@ -3072,7 +3080,7 @@ func TestChatAllowsEnableToolsFlagBeforeCommand(t *testing.T) {
 	writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
 
 	var stdout, stderr bytes.Buffer
-	code := RunWithIO([]string{"--enable-tools", "read_file", "chat", "--config", cliConfigPath(configDir), "--prompt", "first", "--quit"}, strings.NewReader(""), &stdout, &stderr, func() (string, error) {
+	code := runLegacyChatWithIO([]string{"--enable-tools", "read_file", "chat", "--config", cliConfigPath(configDir), "--prompt", "first", "--quit"}, strings.NewReader(""), &stdout, &stderr, func() (string, error) {
 		return t.TempDir(), nil
 	})
 
@@ -3085,7 +3093,7 @@ func TestChatAllowsEnableToolsFlagBeforeCommand(t *testing.T) {
 
 func TestChatInterspersedArgsRejectPositionalPrompt(t *testing.T) {
 	var stdout, stderr bytes.Buffer
-	code := RunWithIO([]string{"chat", "first", "--quit", "--prompt", "second"}, strings.NewReader(""), &stdout, &stderr, func() (string, error) {
+	code := runLegacyChatWithIO([]string{"chat", "first", "--quit", "--prompt", "second"}, strings.NewReader(""), &stdout, &stderr, func() (string, error) {
 		return "", errors.New("getwd should not be called")
 	})
 
@@ -3100,7 +3108,7 @@ func TestChatInterspersedArgsRejectPositionalPrompt(t *testing.T) {
 
 func TestChatUnknownFlagAfterPromptIncludesHelpHint(t *testing.T) {
 	var stdout, stderr bytes.Buffer
-	code := RunWithIO([]string{"chat", "--prompt", "first", "--bad"}, strings.NewReader(""), &stdout, &stderr, func() (string, error) {
+	code := runLegacyChatWithIO([]string{"chat", "--prompt", "first", "--bad"}, strings.NewReader(""), &stdout, &stderr, func() (string, error) {
 		return "", errors.New("getwd should not be called")
 	})
 
@@ -3130,7 +3138,7 @@ func TestChatInitialPromptContinuesIntoREPLWithHistory(t *testing.T) {
 	writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
 
 	var stdout, stderr bytes.Buffer
-	code := RunWithIO([]string{"--config", cliConfigPath(configDir), "chat", "--prompt", "first"}, strings.NewReader("second\n/quit\n"), &stdout, &stderr, func() (string, error) {
+	code := runLegacyChatWithIO([]string{"--config", cliConfigPath(configDir), "chat", "--prompt", "first"}, strings.NewReader("second\n/quit\n"), &stdout, &stderr, func() (string, error) {
 		return t.TempDir(), nil
 	})
 
@@ -3178,7 +3186,7 @@ func TestChatTwoTurnsCarryForwardUserAndAssistantHistory(t *testing.T) {
 	writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
 
 	var stdout, stderr bytes.Buffer
-	code := RunWithIO([]string{"--config", cliConfigPath(configDir), "chat"}, strings.NewReader("first\n\nsecond\n/quit\n"), &stdout, &stderr, func() (string, error) {
+	code := runLegacyChatWithIO([]string{"--config", cliConfigPath(configDir), "chat"}, strings.NewReader("first\n\nsecond\n/quit\n"), &stdout, &stderr, func() (string, error) {
 		return t.TempDir(), nil
 	})
 
@@ -3238,7 +3246,7 @@ func TestChatUsageCommandPrintsSummaryWithoutModelRequest(t *testing.T) {
 	setCLIModelContextWindow(t, configDir, 1234)
 
 	var stdout, stderr bytes.Buffer
-	code := RunWithIO([]string{"--config", cliConfigPath(configDir), "chat"}, strings.NewReader("/usage\n/quit\n"), &stdout, &stderr, func() (string, error) {
+	code := runLegacyChatWithIO([]string{"--config", cliConfigPath(configDir), "chat"}, strings.NewReader("/usage\n/quit\n"), &stdout, &stderr, func() (string, error) {
 		return t.TempDir(), nil
 	})
 
@@ -3281,7 +3289,7 @@ func TestChatUsageCommandShowsProviderUsageAfterTurn(t *testing.T) {
 	writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
 
 	var stdout, stderr bytes.Buffer
-	code := RunWithIO([]string{"--config", cliConfigPath(configDir), "chat"}, strings.NewReader("first\n/usage\n/quit\n"), &stdout, &stderr, func() (string, error) {
+	code := runLegacyChatWithIO([]string{"--config", cliConfigPath(configDir), "chat"}, strings.NewReader("first\n/usage\n/quit\n"), &stdout, &stderr, func() (string, error) {
 		return t.TempDir(), nil
 	})
 
@@ -3319,7 +3327,7 @@ func TestChatUsageCommandShowsEstimatedUsageAfterTurn(t *testing.T) {
 	writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
 
 	var stdout, stderr bytes.Buffer
-	code := RunWithIO([]string{"--config", cliConfigPath(configDir), "chat"}, strings.NewReader("first\n/usage\n/quit\n"), &stdout, &stderr, func() (string, error) {
+	code := runLegacyChatWithIO([]string{"--config", cliConfigPath(configDir), "chat"}, strings.NewReader("first\n/usage\n/quit\n"), &stdout, &stderr, func() (string, error) {
 		return t.TempDir(), nil
 	})
 
@@ -3366,7 +3374,7 @@ func TestChatUsageCommandDoesNotLeakPromptAssistantOrToolContent(t *testing.T) {
 	writeCLIRunFixtureInDir(t, configDir, server.URL, "secret-api-key", "openai-chat")
 
 	var stdout, stderr bytes.Buffer
-	code := RunWithIO([]string{"--config", cliConfigPath(configDir), "chat", "--enable-tools", "read_file"}, strings.NewReader("user prompt secret\n/usage\n/quit\n"), &stdout, &stderr, func() (string, error) {
+	code := runLegacyChatWithIO([]string{"--config", cliConfigPath(configDir), "chat", "--enable-tools", "read_file"}, strings.NewReader("user prompt secret\n/usage\n/quit\n"), &stdout, &stderr, func() (string, error) {
 		return projectDir, nil
 	})
 
@@ -3406,7 +3414,7 @@ func TestChatMultilineREPLCollectsOneMessagePreservingNewlines(t *testing.T) {
 
 	var stdout, stderr bytes.Buffer
 	input := "\"\"\"\nfirst\n/usage\n/quit\nsecond\n\"\"\"\n/quit\n"
-	code := RunWithIO([]string{"--config", cliConfigPath(configDir), "chat"}, strings.NewReader(input), &stdout, &stderr, func() (string, error) {
+	code := runLegacyChatWithIO([]string{"--config", cliConfigPath(configDir), "chat"}, strings.NewReader(input), &stdout, &stderr, func() (string, error) {
 		return t.TempDir(), nil
 	})
 
@@ -3436,7 +3444,7 @@ func TestChatEmptyMultilineREPLInputIsIgnored(t *testing.T) {
 	writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
 
 	var stdout, stderr bytes.Buffer
-	code := RunWithIO([]string{"--config", cliConfigPath(configDir), "chat"}, strings.NewReader("\"\"\"\n\"\"\"\n/quit\n"), &stdout, &stderr, func() (string, error) {
+	code := runLegacyChatWithIO([]string{"--config", cliConfigPath(configDir), "chat"}, strings.NewReader("\"\"\"\n\"\"\"\n/quit\n"), &stdout, &stderr, func() (string, error) {
 		return t.TempDir(), nil
 	})
 
@@ -3471,7 +3479,7 @@ func TestChatREPLRecoverableErrorContinuesWithoutFailedHistory(t *testing.T) {
 	writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
 
 	var stdout, stderr bytes.Buffer
-	code := RunWithIO([]string{"--config", cliConfigPath(configDir), "chat"}, strings.NewReader("failed\nsecond\n/quit\n"), &stdout, &stderr, func() (string, error) {
+	code := runLegacyChatWithIO([]string{"--config", cliConfigPath(configDir), "chat"}, strings.NewReader("failed\nsecond\n/quit\n"), &stdout, &stderr, func() (string, error) {
 		return t.TempDir(), nil
 	})
 
@@ -3518,7 +3526,7 @@ func TestChatActiveTurnInterruptCancelsTurnAndAllowsNextPrompt(t *testing.T) {
 	stderr := newSignalingWriter(chatInputPrompt)
 	done := make(chan int, 1)
 	go func() {
-		done <- runWithProgramContextAndInterrupts(context.Background(), "sai", []string{"--config", cliConfigPath(configDir), "chat"}, stdinReader, &stdout, stderr, func() (string, error) {
+		done <- runLegacyChatWithInterrupts(context.Background(), "sai", []string{"--config", cliConfigPath(configDir), "chat"}, stdinReader, &stdout, stderr, func() (string, error) {
 			return t.TempDir(), nil
 		}, interrupts)
 	}()
@@ -3570,7 +3578,7 @@ func TestChatRepeatedActiveTurnInterruptDoesNotExitSession(t *testing.T) {
 	stderr := newSignalingWriter(chatInputPrompt)
 	done := make(chan int, 1)
 	go func() {
-		done <- runWithProgramContextAndInterrupts(context.Background(), "sai", []string{"--config", cliConfigPath(configDir), "chat"}, stdinReader, &stdout, stderr, func() (string, error) {
+		done <- runLegacyChatWithInterrupts(context.Background(), "sai", []string{"--config", cliConfigPath(configDir), "chat"}, stdinReader, &stdout, stderr, func() (string, error) {
 			return t.TempDir(), nil
 		}, interrupts)
 	}()
@@ -3617,7 +3625,7 @@ func TestChatIdleInterruptExitsSession(t *testing.T) {
 	stderr := newSignalingWriter(chatInputPrompt)
 	done := make(chan int, 1)
 	go func() {
-		done <- runWithProgramContextAndInterrupts(context.Background(), "sai", []string{"--config", cliConfigPath(configDir), "chat"}, stdinReader, &stdout, stderr, func() (string, error) {
+		done <- runLegacyChatWithInterrupts(context.Background(), "sai", []string{"--config", cliConfigPath(configDir), "chat"}, stdinReader, &stdout, stderr, func() (string, error) {
 			return t.TempDir(), nil
 		}, interrupts)
 	}()
@@ -3647,7 +3655,7 @@ func TestChatQuitActiveTurnInterruptEndsWithoutSavedAssistantHistory(t *testing.
 	var stdout, stderr bytes.Buffer
 	done := make(chan int, 1)
 	go func() {
-		done <- runWithProgramContextAndInterrupts(context.Background(), "sai", []string{"--config", cliConfigPath(configDir), "chat", "--save-session", "--quit", "--prompt", "first"}, strings.NewReader(""), &stdout, &stderr, func() (string, error) {
+		done <- runLegacyChatWithInterrupts(context.Background(), "sai", []string{"--config", cliConfigPath(configDir), "chat", "--save-session", "--quit", "--prompt", "first"}, strings.NewReader(""), &stdout, &stderr, func() (string, error) {
 			return t.TempDir(), nil
 		}, interrupts)
 	}()
@@ -3688,7 +3696,7 @@ func TestChatREPLStdoutWriteErrorExitsWithoutNextTurn(t *testing.T) {
 
 	stdoutErr := errors.New("stdout write failed")
 	var stderr bytes.Buffer
-	code := RunWithIO([]string{"--config", cliConfigPath(configDir), "chat"}, strings.NewReader("first\nsecond\n/quit\n"), failingWriter{err: stdoutErr}, &stderr, func() (string, error) {
+	code := runLegacyChatWithIO([]string{"--config", cliConfigPath(configDir), "chat"}, strings.NewReader("first\nsecond\n/quit\n"), failingWriter{err: stdoutErr}, &stderr, func() (string, error) {
 		return t.TempDir(), nil
 	})
 
@@ -3727,7 +3735,7 @@ func TestChatToolCallHistoryCarriesIntoNextTurn(t *testing.T) {
 	writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
 
 	var stdout, stderr bytes.Buffer
-	code := RunWithIO([]string{"--config", cliConfigPath(configDir), "chat", "--enable-tools", "read_file"}, strings.NewReader("Read note\nNext\n/exit\n"), &stdout, &stderr, func() (string, error) {
+	code := runLegacyChatWithIO([]string{"--config", cliConfigPath(configDir), "chat", "--enable-tools", "read_file"}, strings.NewReader("Read note\nNext\n/exit\n"), &stdout, &stderr, func() (string, error) {
 		return projectDir, nil
 	})
 
@@ -3770,7 +3778,7 @@ func TestChatContextWindowWarningDoesNotLeakSensitiveContent(t *testing.T) {
 	setCLIModelContextWindow(t, configDir, 260)
 
 	var stdout, stderr bytes.Buffer
-	code := RunWithIO([]string{"--config", cliConfigPath(configDir), "chat", "--quit", "--prompt", "user prompt secret"}, strings.NewReader(""), &stdout, &stderr, func() (string, error) {
+	code := runLegacyChatWithIO([]string{"--config", cliConfigPath(configDir), "chat", "--quit", "--prompt", "user prompt secret"}, strings.NewReader(""), &stdout, &stderr, func() (string, error) {
 		return t.TempDir(), nil
 	})
 
@@ -3803,7 +3811,7 @@ func TestChatOverBudgetRejectsBeforeProviderRequestWithoutLeakingContent(t *test
 	setCLIModelContextWindow(t, configDir, 10)
 
 	var stdout, stderr bytes.Buffer
-	code := RunWithIO([]string{"--config", cliConfigPath(configDir), "chat", "--quit", "--prompt", "user prompt secret"}, strings.NewReader(""), &stdout, &stderr, func() (string, error) {
+	code := runLegacyChatWithIO([]string{"--config", cliConfigPath(configDir), "chat", "--quit", "--prompt", "user prompt secret"}, strings.NewReader(""), &stdout, &stderr, func() (string, error) {
 		return projectDir, nil
 	})
 
@@ -3832,7 +3840,7 @@ func TestChatContextBudgetDoesNotDropSystemDeveloperOrToolSchemas(t *testing.T) 
 	setCLIModelContextWindow(t, configDir, 5000)
 
 	var stdout, stderr bytes.Buffer
-	code := RunWithIO([]string{"--config", cliConfigPath(configDir), "chat", "--quit", "--enable-tools", "read_file", "--prompt", "user prompt secret"}, strings.NewReader(""), &stdout, &stderr, func() (string, error) {
+	code := runLegacyChatWithIO([]string{"--config", cliConfigPath(configDir), "chat", "--quit", "--enable-tools", "read_file", "--prompt", "user prompt secret"}, strings.NewReader(""), &stdout, &stderr, func() (string, error) {
 		return projectDir, nil
 	})
 
@@ -3865,7 +3873,7 @@ func TestChatDefaultConfigDoesNotCreateResumableSession(t *testing.T) {
 	writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
 
 	var stdout, stderr bytes.Buffer
-	code := RunWithIO([]string{"--config", cliConfigPath(configDir), "chat", "--quit", "--prompt", "first"}, strings.NewReader(""), &stdout, &stderr, func() (string, error) {
+	code := runLegacyChatWithIO([]string{"--config", cliConfigPath(configDir), "chat", "--quit", "--prompt", "first"}, strings.NewReader(""), &stdout, &stderr, func() (string, error) {
 		return t.TempDir(), nil
 	})
 
@@ -3899,7 +3907,7 @@ func TestChatSaveSessionFlagWritesFullToolHistory(t *testing.T) {
 	writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
 
 	var stdout, stderr bytes.Buffer
-	code := RunWithIO([]string{"--config", cliConfigPath(configDir), "chat", "--save-session", "--quit", "--enable-tools", "read_file", "--prompt", "Read note"}, strings.NewReader(""), &stdout, &stderr, func() (string, error) {
+	code := runLegacyChatWithIO([]string{"--config", cliConfigPath(configDir), "chat", "--save-session", "--quit", "--enable-tools", "read_file", "--prompt", "Read note"}, strings.NewReader(""), &stdout, &stderr, func() (string, error) {
 		return projectDir, nil
 	})
 
@@ -3967,7 +3975,7 @@ func TestChatSaveSessionFailureDoesNotExposePartialNewSession(t *testing.T) {
 
 	oversizedPrompt := strings.Repeat("x", 17*1024*1024)
 	var stdout, stderr bytes.Buffer
-	code := RunWithIO([]string{"--config", cliConfigPath(configDir), "chat", "--save-session", "--quit", "--prompt", oversizedPrompt}, strings.NewReader(""), &stdout, &stderr, func() (string, error) {
+	code := runLegacyChatWithIO([]string{"--config", cliConfigPath(configDir), "chat", "--save-session", "--quit", "--prompt", oversizedPrompt}, strings.NewReader(""), &stdout, &stderr, func() (string, error) {
 		return t.TempDir(), nil
 	})
 
@@ -4023,7 +4031,7 @@ func TestChatSaveSessionFlagOverridesDisabledConfigAndPrintsNoticeBeforeProvider
 	configDir := t.TempDir()
 	writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
 
-	code := RunWithIO([]string{"--config", cliConfigPath(configDir), "chat", "--save-session", "--quit", "--prompt", "first prompt secret"}, strings.NewReader(""), &stdout, stderr, func() (string, error) {
+	code := runLegacyChatWithIO([]string{"--config", cliConfigPath(configDir), "chat", "--save-session", "--quit", "--prompt", "first prompt secret"}, strings.NewReader(""), &stdout, stderr, func() (string, error) {
 		return t.TempDir(), nil
 	})
 
@@ -4056,7 +4064,7 @@ func TestChatConfiguredSessionsSaveFullMessages(t *testing.T) {
 	setCLISessionsConfig(t, configDir, true, true)
 
 	var stdout, stderr bytes.Buffer
-	code := RunWithIO([]string{"--config", cliConfigPath(configDir), "chat", "--quit", "--prompt", "first"}, strings.NewReader(""), &stdout, &stderr, func() (string, error) {
+	code := runLegacyChatWithIO([]string{"--config", cliConfigPath(configDir), "chat", "--quit", "--prompt", "first"}, strings.NewReader(""), &stdout, &stderr, func() (string, error) {
 		return t.TempDir(), nil
 	})
 
@@ -4099,7 +4107,7 @@ func TestChatConfiguredSessionsCanBeDisabledBySaveSessionFalse(t *testing.T) {
 	setCLISessionsConfig(t, configDir, true, true)
 
 	var stdout, stderr bytes.Buffer
-	code := RunWithIO([]string{"--config", cliConfigPath(configDir), "chat", "--save-session=false", "--quit", "--prompt", "first prompt secret"}, strings.NewReader(""), &stdout, &stderr, func() (string, error) {
+	code := runLegacyChatWithIO([]string{"--config", cliConfigPath(configDir), "chat", "--save-session=false", "--quit", "--prompt", "first prompt secret"}, strings.NewReader(""), &stdout, &stderr, func() (string, error) {
 		return t.TempDir(), nil
 	})
 
@@ -4148,7 +4156,7 @@ func TestChatManualCompactReplacesActiveHistoryWithoutStartingUserTurn(t *testin
 	setCLICompactionConfig(t, configDir, true, "", "fast")
 
 	var stdout, stderr bytes.Buffer
-	code := RunWithIO([]string{"--config", cliConfigPath(configDir), "chat"}, strings.NewReader("first\nsecond\nthird\n/compact\nfourth\n/quit\n"), &stdout, &stderr, func() (string, error) {
+	code := runLegacyChatWithIO([]string{"--config", cliConfigPath(configDir), "chat"}, strings.NewReader("first\nsecond\nthird\n/compact\nfourth\n/quit\n"), &stdout, &stderr, func() (string, error) {
 		return t.TempDir(), nil
 	})
 
@@ -4270,7 +4278,7 @@ func TestChatResumeAfterCompletedCompactSendsOnlyMaterializedActiveHistory(t *te
 	setCLICompactionConfig(t, configDir, true, "", "")
 
 	var firstStdout, firstStderr bytes.Buffer
-	code := RunWithIO([]string{"--config", cliConfigPath(configDir), "chat"}, strings.NewReader("old user alpha\nmiddle user beta\nrecent user gamma\n/compact\n/quit\n"), &firstStdout, &firstStderr, func() (string, error) {
+	code := runLegacyChatWithIO([]string{"--config", cliConfigPath(configDir), "chat"}, strings.NewReader("old user alpha\nmiddle user beta\nrecent user gamma\n/compact\n/quit\n"), &firstStdout, &firstStderr, func() (string, error) {
 		return t.TempDir(), nil
 	})
 
@@ -4317,7 +4325,7 @@ func TestChatResumeAfterCompletedCompactSendsOnlyMaterializedActiveHistory(t *te
 	}
 
 	var resumeStdout, resumeStderr bytes.Buffer
-	code = RunWithIO([]string{"--config", cliConfigPath(configDir), "chat", "--resume", session.ID, "--quit", "--prompt", "next user delta"}, strings.NewReader(""), &resumeStdout, &resumeStderr, func() (string, error) {
+	code = runLegacyChatWithIO([]string{"--config", cliConfigPath(configDir), "chat", "--resume", session.ID, "--quit", "--prompt", "next user delta"}, strings.NewReader(""), &resumeStdout, &resumeStderr, func() (string, error) {
 		return t.TempDir(), nil
 	})
 
@@ -4418,7 +4426,7 @@ func TestChatMultilineCompactIsUserText(t *testing.T) {
 	setCLICompactionConfig(t, configDir, true, "", "")
 
 	var stdout, stderr bytes.Buffer
-	code := RunWithIO([]string{"--config", cliConfigPath(configDir), "chat"}, strings.NewReader("\"\"\"\n/compact\n\"\"\"\n/quit\n"), &stdout, &stderr, func() (string, error) {
+	code := runLegacyChatWithIO([]string{"--config", cliConfigPath(configDir), "chat"}, strings.NewReader("\"\"\"\n/compact\n\"\"\"\n/quit\n"), &stdout, &stderr, func() (string, error) {
 		return t.TempDir(), nil
 	})
 
@@ -4454,7 +4462,7 @@ func TestChatInitialPromptCompactIsUserText(t *testing.T) {
 	setCLICompactionConfig(t, configDir, true, "", "")
 
 	var stdout, stderr bytes.Buffer
-	code := RunWithIO([]string{"--config", cliConfigPath(configDir), "chat", "--quit", "--prompt", "/compact"}, strings.NewReader(""), &stdout, &stderr, func() (string, error) {
+	code := runLegacyChatWithIO([]string{"--config", cliConfigPath(configDir), "chat", "--quit", "--prompt", "/compact"}, strings.NewReader(""), &stdout, &stderr, func() (string, error) {
 		return t.TempDir(), nil
 	})
 
@@ -4502,7 +4510,7 @@ func TestChatManualCompactDisabledOrNotSavingDoesNotRequestModel(t *testing.T) {
 			setCLICompactionConfig(t, configDir, tt.compactionEnabled, "", "")
 
 			var stdout, stderr bytes.Buffer
-			code := RunWithIO([]string{"--config", cliConfigPath(configDir), "chat"}, strings.NewReader("/compact\n/quit\n"), &stdout, &stderr, func() (string, error) {
+			code := runLegacyChatWithIO([]string{"--config", cliConfigPath(configDir), "chat"}, strings.NewReader("/compact\n/quit\n"), &stdout, &stderr, func() (string, error) {
 				return t.TempDir(), nil
 			})
 
@@ -4544,7 +4552,7 @@ func TestChatManualCompactSummaryFailureLeavesStateUnchanged(t *testing.T) {
 	setCLICompactionConfig(t, configDir, true, "", "")
 
 	var stdout, stderr bytes.Buffer
-	code := RunWithIO([]string{"--config", cliConfigPath(configDir), "chat"}, strings.NewReader("first\nsecond\n/compact\nthird\n/quit\n"), &stdout, &stderr, func() (string, error) {
+	code := runLegacyChatWithIO([]string{"--config", cliConfigPath(configDir), "chat"}, strings.NewReader("first\nsecond\n/compact\nthird\n/quit\n"), &stdout, &stderr, func() (string, error) {
 		return t.TempDir(), nil
 	})
 
@@ -4612,7 +4620,7 @@ func TestChatAutoCompactTriggersBeforeMainModelWhenThresholdExceeded(t *testing.
 	setCLIModelContextWindow(t, configDir, 10000)
 
 	var stdout, stderr bytes.Buffer
-	code := RunWithIO([]string{"--config", cliConfigPath(configDir), "chat"}, strings.NewReader("first\nsecond\n/quit\n"), &stdout, &stderr, func() (string, error) {
+	code := runLegacyChatWithIO([]string{"--config", cliConfigPath(configDir), "chat"}, strings.NewReader("first\nsecond\n/quit\n"), &stdout, &stderr, func() (string, error) {
 		return t.TempDir(), nil
 	})
 
@@ -4693,7 +4701,7 @@ func TestChatAutoCompactDoesNotTriggerBelowThreshold(t *testing.T) {
 	setCLIModelContextWindow(t, configDir, 100000)
 
 	var stdout, stderr bytes.Buffer
-	code := RunWithIO([]string{"--config", cliConfigPath(configDir), "chat"}, strings.NewReader("first\nsecond\n/quit\n"), &stdout, &stderr, func() (string, error) {
+	code := runLegacyChatWithIO([]string{"--config", cliConfigPath(configDir), "chat"}, strings.NewReader("first\nsecond\n/quit\n"), &stdout, &stderr, func() (string, error) {
 		return t.TempDir(), nil
 	})
 
@@ -4749,7 +4757,7 @@ func TestChatAutoCompactFailureLeavesTurnUnchangedAndREPLContinues(t *testing.T)
 	setCLIModelContextWindow(t, configDir, 10000)
 
 	var stdout, stderr bytes.Buffer
-	code := RunWithIO([]string{"--config", cliConfigPath(configDir), "chat"}, strings.NewReader("first\nsecond\nthird\n/quit\n"), &stdout, &stderr, func() (string, error) {
+	code := runLegacyChatWithIO([]string{"--config", cliConfigPath(configDir), "chat"}, strings.NewReader("first\nsecond\nthird\n/quit\n"), &stdout, &stderr, func() (string, error) {
 		return t.TempDir(), nil
 	})
 
@@ -5042,7 +5050,7 @@ func TestChatSaveSessionRecordsProviderUsageMetadata(t *testing.T) {
 	setCLIModelContextWindow(t, configDir, 128000)
 
 	var stdout, stderr bytes.Buffer
-	code := RunWithIO([]string{"--config", cliConfigPath(configDir), "chat", "--save-session", "--quit", "--prompt", "first"}, strings.NewReader(""), &stdout, &stderr, func() (string, error) {
+	code := runLegacyChatWithIO([]string{"--config", cliConfigPath(configDir), "chat", "--save-session", "--quit", "--prompt", "first"}, strings.NewReader(""), &stdout, &stderr, func() (string, error) {
 		return t.TempDir(), nil
 	})
 
@@ -5083,7 +5091,7 @@ func TestChatConfiguredSessionNoticePrintsOnceWithoutSensitiveContent(t *testing
 	setCLISessionsConfig(t, configDir, true, true)
 
 	var stdout, stderr bytes.Buffer
-	code := RunWithIO([]string{"--config", cliConfigPath(configDir), "chat"}, strings.NewReader("first prompt secret\nsecond prompt secret\n/quit\n"), &stdout, &stderr, func() (string, error) {
+	code := runLegacyChatWithIO([]string{"--config", cliConfigPath(configDir), "chat"}, strings.NewReader("first prompt secret\nsecond prompt secret\n/quit\n"), &stdout, &stderr, func() (string, error) {
 		return t.TempDir(), nil
 	})
 
@@ -5144,7 +5152,7 @@ func TestChatResumeSendsOnlyActiveHistoryAndSavesContinuation(t *testing.T) {
 	writeCLIFile(t, filepath.Join(projectDir, "AGENTS.md"), "current project instruction secret\n")
 
 	var stdout, stderr bytes.Buffer
-	code := RunWithIO([]string{"--config", cliConfigPath(configDir), "chat", "--resume", "resume-session", "--quit", "--prompt", "next"}, strings.NewReader(""), &stdout, &stderr, func() (string, error) {
+	code := runLegacyChatWithIO([]string{"--config", cliConfigPath(configDir), "chat", "--resume", "resume-session", "--quit", "--prompt", "next"}, strings.NewReader(""), &stdout, &stderr, func() (string, error) {
 		return projectDir, nil
 	})
 
@@ -5233,7 +5241,7 @@ func TestChatResumeRejectsCorruptedActiveHistory(t *testing.T) {
 			writeCLISessionV2(t, filepath.Join(configDir, "sessions"), tt.session)
 
 			var stdout, stderr bytes.Buffer
-			code := RunWithIO([]string{"--config", cliConfigPath(configDir), "chat", "--resume", tt.session.ID, "--quit", "--prompt", "next prompt secret"}, strings.NewReader(""), &stdout, &stderr, func() (string, error) {
+			code := runLegacyChatWithIO([]string{"--config", cliConfigPath(configDir), "chat", "--resume", tt.session.ID, "--quit", "--prompt", "next prompt secret"}, strings.NewReader(""), &stdout, &stderr, func() (string, error) {
 				return t.TempDir(), nil
 			})
 
@@ -5284,7 +5292,7 @@ func TestChatContinueUsesLatestSession(t *testing.T) {
 	})
 
 	var stdout, stderr bytes.Buffer
-	code := RunWithIO([]string{"--config", cliConfigPath(configDir), "chat", "--continue", "--quit", "--prompt", "next"}, strings.NewReader(""), &stdout, &stderr, func() (string, error) {
+	code := runLegacyChatWithIO([]string{"--config", cliConfigPath(configDir), "chat", "--continue", "--quit", "--prompt", "next"}, strings.NewReader(""), &stdout, &stderr, func() (string, error) {
 		return t.TempDir(), nil
 	})
 
@@ -5334,7 +5342,7 @@ func TestChatResumeUsesSavedContextMetadataForBudget(t *testing.T) {
 	})
 
 	var stdout, stderr bytes.Buffer
-	code := RunWithIO([]string{"--config", cliConfigPath(configDir), "chat", "--resume", "small-context-session", "--quit", "--prompt", "next prompt secret"}, strings.NewReader(""), &stdout, &stderr, func() (string, error) {
+	code := runLegacyChatWithIO([]string{"--config", cliConfigPath(configDir), "chat", "--resume", "small-context-session", "--quit", "--prompt", "next prompt secret"}, strings.NewReader(""), &stdout, &stderr, func() (string, error) {
 		return t.TempDir(), nil
 	})
 
@@ -5375,7 +5383,7 @@ func TestChatResumeKeepsSavedShowReasoningWhenConfigEnablesIt(t *testing.T) {
 	})
 
 	var stdout, stderr bytes.Buffer
-	code := RunWithIO([]string{"--config", cliConfigPath(configDir), "chat", "--resume", "reasoning-session", "--quit", "--prompt", "next prompt secret"}, strings.NewReader(""), &stdout, &stderr, func() (string, error) {
+	code := runLegacyChatWithIO([]string{"--config", cliConfigPath(configDir), "chat", "--resume", "reasoning-session", "--quit", "--prompt", "next prompt secret"}, strings.NewReader(""), &stdout, &stderr, func() (string, error) {
 		return t.TempDir(), nil
 	})
 
@@ -5430,7 +5438,7 @@ func TestChatResumeRejectsConflictingCLISelections(t *testing.T) {
 			args := []string{"--config", cliConfigPath(configDir), "chat", "--resume", "conflict-session", "--quit", "--prompt", "next"}
 			args = append(args, tt.args...)
 			var stdout, stderr bytes.Buffer
-			code := RunWithIO(args, strings.NewReader(""), &stdout, &stderr, func() (string, error) {
+			code := runLegacyChatWithIO(args, strings.NewReader(""), &stdout, &stderr, func() (string, error) {
 				return t.TempDir(), nil
 			})
 			if code != 1 {
@@ -5456,7 +5464,7 @@ func TestChatResumeRejectsConflictingCLISelections(t *testing.T) {
 		SaveToolResults: true,
 	})
 	var stdout, stderr bytes.Buffer
-	code := RunWithIO([]string{"--config", cliConfigPath(configDir), "chat", "--resume", "reasoning-enabled-session", "--show-reasoning=false", "--quit", "--prompt", "next"}, strings.NewReader(""), &stdout, &stderr, func() (string, error) {
+	code := runLegacyChatWithIO([]string{"--config", cliConfigPath(configDir), "chat", "--resume", "reasoning-enabled-session", "--show-reasoning=false", "--quit", "--prompt", "next"}, strings.NewReader(""), &stdout, &stderr, func() (string, error) {
 		return t.TempDir(), nil
 	})
 	if code != 1 {
@@ -5470,7 +5478,7 @@ func TestChatResumeRejectsConflictingCLISelections(t *testing.T) {
 
 func TestChatResumeAndContinueAreMutuallyExclusiveWithoutConfigLoad(t *testing.T) {
 	var stdout, stderr bytes.Buffer
-	code := RunWithIO([]string{"chat", "--resume", "some-session", "--continue"}, strings.NewReader(""), &stdout, &stderr, func() (string, error) {
+	code := runLegacyChatWithIO([]string{"chat", "--resume", "some-session", "--continue"}, strings.NewReader(""), &stdout, &stderr, func() (string, error) {
 		return "", errors.New("getwd should not be called")
 	})
 
@@ -5512,7 +5520,7 @@ func TestChatContinueRejectsConflictingReasoningAndSaveFlags(t *testing.T) {
 			args := []string{"--config", cliConfigPath(configDir), "chat", "--continue", "--quit", "--prompt", "next prompt secret"}
 			args = append(args, tt.args...)
 			var stdout, stderr bytes.Buffer
-			code := RunWithIO(args, strings.NewReader(""), &stdout, &stderr, func() (string, error) {
+			code := runLegacyChatWithIO(args, strings.NewReader(""), &stdout, &stderr, func() (string, error) {
 				return t.TempDir(), nil
 			})
 			if code != 1 {
@@ -5541,7 +5549,7 @@ func TestChatResumeRejectsSessionSavedWithoutReliableToolResults(t *testing.T) {
 	})
 
 	var stdout, stderr bytes.Buffer
-	code := RunWithIO([]string{"--config", cliConfigPath(configDir), "chat", "--resume", "partial-session", "--quit", "--prompt", "next prompt secret"}, strings.NewReader(""), &stdout, &stderr, func() (string, error) {
+	code := runLegacyChatWithIO([]string{"--config", cliConfigPath(configDir), "chat", "--resume", "partial-session", "--quit", "--prompt", "next prompt secret"}, strings.NewReader(""), &stdout, &stderr, func() (string, error) {
 		return t.TempDir(), nil
 	})
 
@@ -5580,7 +5588,7 @@ func TestChatSaveToolResultsFalseRejectsSaveAndResume(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			args := append([]string{"--config", cliConfigPath(configDir), "chat"}, tt.args...)
 			var stdout, stderr bytes.Buffer
-			code := RunWithIO(args, strings.NewReader(""), &stdout, &stderr, func() (string, error) {
+			code := runLegacyChatWithIO(args, strings.NewReader(""), &stdout, &stderr, func() (string, error) {
 				return t.TempDir(), nil
 			})
 			if code != 1 {
@@ -6836,7 +6844,7 @@ func TestRunWithContextCancelReachesProviderRequest(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	done := make(chan int, 1)
 	go func() {
-		done <- RunWithContext(ctx, []string{"--config", cliConfigPath(configDir), "chat", "--quit", "--prompt", "hello"}, strings.NewReader(""), &stdout, &stderr, func() (string, error) {
+		done <- runLegacyChatWithContext(ctx, []string{"--config", cliConfigPath(configDir), "chat", "--quit", "--prompt", "hello"}, strings.NewReader(""), &stdout, &stderr, func() (string, error) {
 			return t.TempDir(), nil
 		})
 	}()
@@ -6910,7 +6918,7 @@ func TestRunWithContextCancelFlushesLoggerAfterStreamEvent(t *testing.T) {
 	var stderr bytes.Buffer
 	done := make(chan int, 1)
 	go func() {
-		done <- RunWithContext(ctx, []string{"--config", cliConfigPath(configDir), "chat", "--quit", "--prompt", "user prompt secret"}, strings.NewReader(""), stdout, &stderr, func() (string, error) {
+		done <- runLegacyChatWithContext(ctx, []string{"--config", cliConfigPath(configDir), "chat", "--quit", "--prompt", "user prompt secret"}, strings.NewReader(""), stdout, &stderr, func() (string, error) {
 			return t.TempDir(), nil
 		})
 	}()
@@ -6984,7 +6992,7 @@ func TestRunUsesDefaultProviderModelAndOutputsTextDelta(t *testing.T) {
 	t.Setenv("SAI_TEST_API_KEY", "env-secret-value")
 
 	var stdout, stderr bytes.Buffer
-	code := RunWithGetwd([]string{"--config", cliConfigPath(configDir), "chat", "--quit", "--prompt", "Say hi"}, &stdout, &stderr, func() (string, error) {
+	code := runLegacyChatWithGetwd([]string{"--config", cliConfigPath(configDir), "chat", "--quit", "--prompt", "Say hi"}, &stdout, &stderr, func() (string, error) {
 		return t.TempDir(), nil
 	})
 
@@ -7027,7 +7035,7 @@ func TestRunOpenAIResponsesProviderOutputsTextDelta(t *testing.T) {
 	writeCLIRunFixtureInDir(t, configDir, server.URL, "responses-secret-value", "openai-responses")
 
 	var stdout, stderr bytes.Buffer
-	code := RunWithGetwd([]string{"--config", cliConfigPath(configDir), "chat", "--quit", "--prompt", "Say hi"}, &stdout, &stderr, func() (string, error) {
+	code := runLegacyChatWithGetwd([]string{"--config", cliConfigPath(configDir), "chat", "--quit", "--prompt", "Say hi"}, &stdout, &stderr, func() (string, error) {
 		return t.TempDir(), nil
 	})
 
@@ -7106,7 +7114,7 @@ models:
 `, server.URL))
 
 	var stdout, stderr bytes.Buffer
-	code := RunWithGetwd([]string{"--config", cliConfigPath(configDir), "chat", "--quit", "--prompt", "Say hi"}, &stdout, &stderr, func() (string, error) {
+	code := runLegacyChatWithGetwd([]string{"--config", cliConfigPath(configDir), "chat", "--quit", "--prompt", "Say hi"}, &stdout, &stderr, func() (string, error) {
 		return t.TempDir(), nil
 	})
 
@@ -7155,7 +7163,7 @@ func TestRunOpenAIResponsesExecutesFunctionCallAndContinuesToFinalText(t *testin
 	writeCLIRunFixtureInDir(t, configDir, server.URL, "responses-secret-value", "openai-responses")
 
 	var stdout, stderr bytes.Buffer
-	code := RunWithGetwd([]string{"--config", cliConfigPath(configDir), "chat", "--quit", "--enable-tools", "read_file", "--prompt", "Read note"}, &stdout, &stderr, func() (string, error) {
+	code := runLegacyChatWithGetwd([]string{"--config", cliConfigPath(configDir), "chat", "--quit", "--enable-tools", "read_file", "--prompt", "Read note"}, &stdout, &stderr, func() (string, error) {
 		return projectDir, nil
 	})
 
@@ -7200,7 +7208,7 @@ func TestRunAnthropicMessagesProviderOutputsTextDelta(t *testing.T) {
 	writeCLIRunFixtureInDir(t, configDir, server.URL, "anthropic-secret-value", "anthropic-messages")
 
 	var stdout, stderr bytes.Buffer
-	code := RunWithGetwd([]string{"--config", cliConfigPath(configDir), "chat", "--quit", "--prompt", "Say hi"}, &stdout, &stderr, func() (string, error) {
+	code := runLegacyChatWithGetwd([]string{"--config", cliConfigPath(configDir), "chat", "--quit", "--prompt", "Say hi"}, &stdout, &stderr, func() (string, error) {
 		return t.TempDir(), nil
 	})
 
@@ -7266,7 +7274,7 @@ func TestRunAnthropicMessagesProviderExecutesToolUseAndReturnsToolResult(t *test
 	writeCLIRunFixtureInDir(t, configDir, server.URL, "anthropic-secret-value", "anthropic-messages")
 
 	var stdout, stderr bytes.Buffer
-	code := RunWithGetwd([]string{"--config", cliConfigPath(configDir), "chat", "--quit", "--enable-tools", "read_file", "--prompt", "Read note"}, &stdout, &stderr, func() (string, error) {
+	code := runLegacyChatWithGetwd([]string{"--config", cliConfigPath(configDir), "chat", "--quit", "--enable-tools", "read_file", "--prompt", "Read note"}, &stdout, &stderr, func() (string, error) {
 		return projectDir, nil
 	})
 
@@ -7309,7 +7317,7 @@ func TestRunExplicitProviderModelSelectsProfileParameters(t *testing.T) {
 	writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
 
 	var stdout, stderr bytes.Buffer
-	code := RunWithGetwd([]string{"--config", cliConfigPath(configDir), "chat", "--quit", "--provider", "fake", "--model", "fast", "--prompt", "Use fast"}, &stdout, &stderr, func() (string, error) {
+	code := runLegacyChatWithGetwd([]string{"--config", cliConfigPath(configDir), "chat", "--quit", "--provider", "fake", "--model", "fast", "--prompt", "Use fast"}, &stdout, &stderr, func() (string, error) {
 		return t.TempDir(), nil
 	})
 
@@ -7343,7 +7351,7 @@ func TestRunUsesConfiguredEnabledTools(t *testing.T) {
 	writeCLIRunFixtureInDirWithTools(t, configDir, server.URL, "direct-secret-value", "openai-chat", []string{"read_file", "write_file", "edit_file", "shell"})
 
 	var stdout, stderr bytes.Buffer
-	code := RunWithGetwd([]string{"--config", cliConfigPath(configDir), "chat", "--quit", "--prompt", "Use configured tools"}, &stdout, &stderr, func() (string, error) {
+	code := runLegacyChatWithGetwd([]string{"--config", cliConfigPath(configDir), "chat", "--quit", "--prompt", "Use configured tools"}, &stdout, &stderr, func() (string, error) {
 		return t.TempDir(), nil
 	})
 
@@ -7364,7 +7372,7 @@ func TestRunCanExposeDiscoveryTools(t *testing.T) {
 	writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
 
 	var stdout, stderr bytes.Buffer
-	code := RunWithGetwd([]string{"--config", cliConfigPath(configDir), "chat", "--quit", "--enable-tools", "glob_files,grep_files", "--prompt", "Use discovery tools"}, &stdout, &stderr, func() (string, error) {
+	code := runLegacyChatWithGetwd([]string{"--config", cliConfigPath(configDir), "chat", "--quit", "--enable-tools", "glob_files,grep_files", "--prompt", "Use discovery tools"}, &stdout, &stderr, func() (string, error) {
 		return t.TempDir(), nil
 	})
 
@@ -7385,7 +7393,7 @@ func TestRunDoesNotExposeSubagentToolsWithoutConfig(t *testing.T) {
 	writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
 
 	var stdout, stderr bytes.Buffer
-	code := RunWithGetwd([]string{"--config", cliConfigPath(configDir), "chat", "--quit", "--prompt", "No helpers configured"}, &stdout, &stderr, func() (string, error) {
+	code := runLegacyChatWithGetwd([]string{"--config", cliConfigPath(configDir), "chat", "--quit", "--prompt", "No helpers configured"}, &stdout, &stderr, func() (string, error) {
 		return t.TempDir(), nil
 	})
 
@@ -7407,7 +7415,7 @@ func TestRunRejectsExplicitSubagentToolInEnabledTools(t *testing.T) {
 	writeCLIRunFixtureInDirWithTools(t, configDir, server.URL, "direct-secret-value", "openai-chat", []string{subagents.ToolSubagentStart})
 
 	var stdout, stderr bytes.Buffer
-	code := RunWithGetwd([]string{"--config", cliConfigPath(configDir), "chat", "--quit", "--prompt", "Bad tool config"}, &stdout, &stderr, func() (string, error) {
+	code := runLegacyChatWithGetwd([]string{"--config", cliConfigPath(configDir), "chat", "--quit", "--prompt", "Bad tool config"}, &stdout, &stderr, func() (string, error) {
 		return t.TempDir(), nil
 	})
 
@@ -7432,7 +7440,7 @@ func TestRunDoesNotExposeEditingToolsWhenOnlyNonEditingToolsAreEnabled(t *testin
 	writeCLIRunFixtureInDirWithTools(t, configDir, server.URL, "direct-secret-value", "openai-chat", []string{"read_file", "shell"})
 
 	var stdout, stderr bytes.Buffer
-	code := RunWithGetwd([]string{"--config", cliConfigPath(configDir), "chat", "--quit", "--prompt", "Do not expose tools"}, &stdout, &stderr, func() (string, error) {
+	code := runLegacyChatWithGetwd([]string{"--config", cliConfigPath(configDir), "chat", "--quit", "--prompt", "Do not expose tools"}, &stdout, &stderr, func() (string, error) {
 		return t.TempDir(), nil
 	})
 
@@ -7453,7 +7461,7 @@ func TestRunEnableToolsOverridesConfiguredTools(t *testing.T) {
 	writeCLIRunFixtureInDirWithTools(t, configDir, server.URL, "direct-secret-value", "openai-chat", []string{"read_file", "shell"})
 
 	var stdout, stderr bytes.Buffer
-	code := RunWithGetwd([]string{"--config", cliConfigPath(configDir), "chat", "--quit", "--enable-tools", "list_files,write_file,edit_file", "--prompt", "Use CLI tools"}, &stdout, &stderr, func() (string, error) {
+	code := runLegacyChatWithGetwd([]string{"--config", cliConfigPath(configDir), "chat", "--quit", "--enable-tools", "list_files,write_file,edit_file", "--prompt", "Use CLI tools"}, &stdout, &stderr, func() (string, error) {
 		return t.TempDir(), nil
 	})
 
@@ -7482,7 +7490,7 @@ prompt:
 	writeCLIFile(t, filepath.Join(projectDir, "AGENTS.md"), "Project instructions\n")
 
 	var stdout, stderr bytes.Buffer
-	code := RunWithGetwd([]string{"--config", cliConfigPath(configDir), "chat", "--quit", "--prompt", "Use configured prompt"}, &stdout, &stderr, func() (string, error) {
+	code := runLegacyChatWithGetwd([]string{"--config", cliConfigPath(configDir), "chat", "--quit", "--prompt", "Use configured prompt"}, &stdout, &stderr, func() (string, error) {
 		return projectDir, nil
 	})
 
@@ -7519,7 +7527,7 @@ prompt:
 `)
 
 	var stdout, stderr bytes.Buffer
-	code := RunWithGetwd([]string{"--config", cliConfigPath(configDir), "chat", "--quit", "--prompt", "Use bad prompt"}, &stdout, &stderr, func() (string, error) {
+	code := runLegacyChatWithGetwd([]string{"--config", cliConfigPath(configDir), "chat", "--quit", "--prompt", "Use bad prompt"}, &stdout, &stderr, func() (string, error) {
 		return t.TempDir(), nil
 	})
 
@@ -7774,7 +7782,7 @@ subagents:
 	defer cancel()
 	done := make(chan int, 1)
 	go func() {
-		done <- RunWithContext(ctx, []string{"--config", cliConfigPath(configDir), "chat", "--prompt", "delegate"}, stdinReader, stdout, stderr, func() (string, error) {
+		done <- runLegacyChatWithContext(ctx, []string{"--config", cliConfigPath(configDir), "chat", "--prompt", "delegate"}, stdinReader, stdout, stderr, func() (string, error) {
 			return t.TempDir(), nil
 		})
 	}()
@@ -7857,7 +7865,7 @@ agent:
 `)
 
 	var stdout, stderr bytes.Buffer
-	code := RunWithGetwd([]string{"--config", cliConfigPath(configDir), "chat", "--quit", "--prompt", "Choose helper"}, &stdout, &stderr, func() (string, error) {
+	code := runLegacyChatWithGetwd([]string{"--config", cliConfigPath(configDir), "chat", "--quit", "--prompt", "Choose helper"}, &stdout, &stderr, func() (string, error) {
 		return t.TempDir(), nil
 	})
 
@@ -7993,7 +8001,7 @@ models:
 `, childServer.URL+"/v1"))
 
 	var stdout, stderr bytes.Buffer
-	code := RunWithGetwd([]string{"--config", cliConfigPath(configDir), "chat", "--quit", "--prompt", "delegate"}, &stdout, &stderr, func() (string, error) {
+	code := runLegacyChatWithGetwd([]string{"--config", cliConfigPath(configDir), "chat", "--quit", "--prompt", "delegate"}, &stdout, &stderr, func() (string, error) {
 		return t.TempDir(), nil
 	})
 
@@ -8143,7 +8151,7 @@ models:
 	writeCLIRunMCPServerFixture(t, filepath.Join(configDir, "child-mcp"), "local", childMCPExitFile, true)
 
 	var stdout, stderr bytes.Buffer
-	code := RunWithGetwd([]string{"--config", cliConfigPath(configDir), "chat", "--quit", "--prompt", "delegate"}, &stdout, &stderr, func() (string, error) {
+	code := runLegacyChatWithGetwd([]string{"--config", cliConfigPath(configDir), "chat", "--quit", "--prompt", "delegate"}, &stdout, &stderr, func() (string, error) {
 		return t.TempDir(), nil
 	})
 
@@ -8268,7 +8276,7 @@ subagents:
 	writeCLIChildSubagentConfig(t, configDir, childServer.URL+"/v1")
 
 	var stdout, stderr bytes.Buffer
-	code := RunWithGetwd([]string{"--config", cliConfigPath(configDir), "chat", "--quit", "--prompt", "delegate"}, &stdout, &stderr, func() (string, error) {
+	code := runLegacyChatWithGetwd([]string{"--config", cliConfigPath(configDir), "chat", "--quit", "--prompt", "delegate"}, &stdout, &stderr, func() (string, error) {
 		return t.TempDir(), nil
 	})
 
@@ -8415,7 +8423,7 @@ subagents:
 	defer cancel()
 	done := make(chan int, 1)
 	go func() {
-		done <- RunWithContext(ctx, []string{"--config", cliConfigPath(configDir), "chat", "--prompt", "delegate"}, stdinReader, stdout, stderr, func() (string, error) {
+		done <- runLegacyChatWithContext(ctx, []string{"--config", cliConfigPath(configDir), "chat", "--prompt", "delegate"}, stdinReader, stdout, stderr, func() (string, error) {
 			return t.TempDir(), nil
 		})
 	}()
@@ -8558,7 +8566,7 @@ subagents:
 	defer cancel()
 	done := make(chan int, 1)
 	go func() {
-		done <- RunWithContext(ctx, []string{"--config", cliConfigPath(configDir), "chat", "--prompt", "delegate"}, stdinReader, stdout, &stderr, func() (string, error) {
+		done <- runLegacyChatWithContext(ctx, []string{"--config", cliConfigPath(configDir), "chat", "--prompt", "delegate"}, stdinReader, stdout, &stderr, func() (string, error) {
 			return t.TempDir(), nil
 		})
 	}()
@@ -8662,7 +8670,7 @@ func TestRunDoesNotAutoResumeWhenNoSubagentCompletions(t *testing.T) {
 	writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
 
 	var stdout, stderr bytes.Buffer
-	code := RunWithIO([]string{"--config", cliConfigPath(configDir), "chat", "--prompt", "hello"}, strings.NewReader("/exit\n"), &stdout, &stderr, func() (string, error) {
+	code := runLegacyChatWithIO([]string{"--config", cliConfigPath(configDir), "chat", "--prompt", "hello"}, strings.NewReader("/exit\n"), &stdout, &stderr, func() (string, error) {
 		return t.TempDir(), nil
 	})
 
@@ -8944,7 +8952,7 @@ models:
 `, childServer.URL+"/v1"))
 
 	var stdout, stderr bytes.Buffer
-	code := RunWithGetwd([]string{"--config", cliConfigPath(configDir), "chat", "--quit", "--prompt", "delegate"}, &stdout, &stderr, func() (string, error) {
+	code := runLegacyChatWithGetwd([]string{"--config", cliConfigPath(configDir), "chat", "--quit", "--prompt", "delegate"}, &stdout, &stderr, func() (string, error) {
 		return t.TempDir(), nil
 	})
 
@@ -9041,7 +9049,7 @@ func TestRunInjectsDiscoveredSkillsInDirectoryOrder(t *testing.T) {
 	writeCLIFile(t, filepath.Join(projectDir, "AGENTS.md"), "Project instructions\n")
 
 	var stdout, stderr bytes.Buffer
-	code := RunWithGetwd([]string{"--config", cliConfigPath(configDir), "chat", "--quit", "--prompt", "Use discovered skills"}, &stdout, &stderr, func() (string, error) {
+	code := runLegacyChatWithGetwd([]string{"--config", cliConfigPath(configDir), "chat", "--quit", "--prompt", "Use discovered skills"}, &stdout, &stderr, func() (string, error) {
 		return projectDir, nil
 	})
 
@@ -9082,7 +9090,7 @@ func TestRunInjectsConfiguredProjectInstructionFilesBeforeSkillsInOrder(t *testi
 	writeCLIFile(t, filepath.Join(projectDir, "local-second.md"), "Second project instructions\n")
 
 	var stdout, stderr bytes.Buffer
-	code := RunWithGetwd([]string{"--config", cliConfigPath(configDir), "chat", "--save-session", "--quit", "--prompt", "Use project instructions"}, &stdout, &stderr, func() (string, error) {
+	code := runLegacyChatWithGetwd([]string{"--config", cliConfigPath(configDir), "chat", "--save-session", "--quit", "--prompt", "Use project instructions"}, &stdout, &stderr, func() (string, error) {
 		return projectDir, nil
 	})
 
@@ -9135,7 +9143,7 @@ func TestRunDeduplicatesConfiguredProjectInstructionFilesSilently(t *testing.T) 
 	writeCLIFile(t, filepath.Join(projectDir, "a.md"), "A project instructions\n")
 
 	var stdout, stderr bytes.Buffer
-	code := RunWithGetwd([]string{"--config", cliConfigPath(configDir), "chat", "--save-session", "--quit", "--prompt", "Use deduped project instructions"}, &stdout, &stderr, func() (string, error) {
+	code := runLegacyChatWithGetwd([]string{"--config", cliConfigPath(configDir), "chat", "--save-session", "--quit", "--prompt", "Use deduped project instructions"}, &stdout, &stderr, func() (string, error) {
 		return projectDir, nil
 	})
 
@@ -9186,7 +9194,7 @@ func TestRunSkipsDisableModelInvocationSkill(t *testing.T) {
 	writeCLISkill(t, configDir, "visible", "Visible instructions\n")
 
 	var stdout, stderr bytes.Buffer
-	code := RunWithGetwd([]string{"--config", cliConfigPath(configDir), "chat", "--quit", "--save-session", "--prompt", "Use visible skills"}, &stdout, &stderr, func() (string, error) {
+	code := runLegacyChatWithGetwd([]string{"--config", cliConfigPath(configDir), "chat", "--quit", "--save-session", "--prompt", "Use visible skills"}, &stdout, &stderr, func() (string, error) {
 		return t.TempDir(), nil
 	})
 
@@ -9220,7 +9228,7 @@ func TestRunFailsOnMalformedDiscoveredSkillFrontmatter(t *testing.T) {
 	writeCLISkill(t, configDir, "bad", "---\nname: [bad\n---\nBad instructions\n")
 
 	var stdout, stderr bytes.Buffer
-	code := RunWithGetwd([]string{"--config", cliConfigPath(configDir), "chat", "--quit", "--prompt", "Use skills"}, &stdout, &stderr, func() (string, error) {
+	code := runLegacyChatWithGetwd([]string{"--config", cliConfigPath(configDir), "chat", "--quit", "--prompt", "Use skills"}, &stdout, &stderr, func() (string, error) {
 		return t.TempDir(), nil
 	})
 
@@ -9248,7 +9256,7 @@ func TestRunFailsOnDuplicateDiscoveredSkillID(t *testing.T) {
 	writeCLISkillInRoot(t, filepath.Join(configDir, "team-skills"), "shared", "Second instructions\n")
 
 	var stdout, stderr bytes.Buffer
-	code := RunWithGetwd([]string{"--config", cliConfigPath(configDir), "chat", "--quit", "--prompt", "Use skills"}, &stdout, &stderr, func() (string, error) {
+	code := runLegacyChatWithGetwd([]string{"--config", cliConfigPath(configDir), "chat", "--quit", "--prompt", "Use skills"}, &stdout, &stderr, func() (string, error) {
 		return t.TempDir(), nil
 	})
 
@@ -9274,7 +9282,7 @@ func TestRunRemovedSkillFlagsAreUnknown(t *testing.T) {
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			var stdout, stderr bytes.Buffer
-			code := RunWithGetwd(tt.args, &stdout, &stderr, func() (string, error) {
+			code := runLegacyChatWithGetwd(tt.args, &stdout, &stderr, func() (string, error) {
 				return t.TempDir(), nil
 			})
 			if code != 1 {
@@ -9301,7 +9309,7 @@ func TestRunEnableMCPExposesOnlyEnabledMCPSchemas(t *testing.T) {
 	writeCLIRunMCPFixture(t, configDir, exitFile)
 
 	var stdout, stderr bytes.Buffer
-	code := RunWithGetwd([]string{"--config", cliConfigPath(configDir), "chat", "--quit", "--enable-mcp", "local", "--enable-tools", "list_files,mcp.local.search", "--prompt", "Use mixed tools"}, &stdout, &stderr, func() (string, error) {
+	code := runLegacyChatWithGetwd([]string{"--config", cliConfigPath(configDir), "chat", "--quit", "--enable-mcp", "local", "--enable-tools", "list_files,mcp.local.search", "--prompt", "Use mixed tools"}, &stdout, &stderr, func() (string, error) {
 		return t.TempDir(), nil
 	})
 
@@ -9338,7 +9346,7 @@ func TestRunRoutesMCPToolCallAndReturnsResultToModel(t *testing.T) {
 	writeCLIRunMCPFixture(t, configDir, exitFile)
 
 	var stdout, stderr bytes.Buffer
-	code := RunWithGetwd([]string{"--config", cliConfigPath(configDir), "chat", "--quit", "--enable-mcp", "local", "--enable-tools", "mcp.local.search", "--prompt", "Use MCP search"}, &stdout, &stderr, func() (string, error) {
+	code := runLegacyChatWithGetwd([]string{"--config", cliConfigPath(configDir), "chat", "--quit", "--enable-mcp", "local", "--enable-tools", "mcp.local.search", "--prompt", "Use MCP search"}, &stdout, &stderr, func() (string, error) {
 		return t.TempDir(), nil
 	})
 
@@ -9377,7 +9385,7 @@ func TestRunVerboseWritesDiagnosticsWithoutSensitiveContent(t *testing.T) {
 		writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
 
 		var stdout, stderr bytes.Buffer
-		code := RunWithGetwd([]string{"--config", cliConfigPath(configDir), "chat", "--quit", "--verbose", "--enable-tools", "list_files,read_file", "--prompt", "user prompt secret"}, &stdout, &stderr, func() (string, error) {
+		code := runLegacyChatWithGetwd([]string{"--config", cliConfigPath(configDir), "chat", "--quit", "--verbose", "--enable-tools", "list_files,read_file", "--prompt", "user prompt secret"}, &stdout, &stderr, func() (string, error) {
 			return t.TempDir(), nil
 		})
 
@@ -9418,7 +9426,7 @@ func TestRunVerboseWritesDiagnosticsWithoutSensitiveContent(t *testing.T) {
 		t.Setenv("SAI_VERBOSE_API_KEY", "env-secret-value")
 
 		var stdout, stderr bytes.Buffer
-		code := RunWithGetwd([]string{"--config", cliConfigPath(configDir), "chat", "--quit", "--verbose", "--prompt", "env user prompt secret"}, &stdout, &stderr, func() (string, error) {
+		code := runLegacyChatWithGetwd([]string{"--config", cliConfigPath(configDir), "chat", "--quit", "--verbose", "--prompt", "env user prompt secret"}, &stdout, &stderr, func() (string, error) {
 			return t.TempDir(), nil
 		})
 
@@ -9475,7 +9483,7 @@ func TestRunVerboseReportsFutureSessionLogPathBeforeFirstEvent(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	done := make(chan int, 1)
 	go func() {
-		done <- RunWithGetwd([]string{"--config", cliConfigPath(configDir), "chat", "--quit", "--verbose", "--prompt", "hello"}, &stdout, &stderr, func() (string, error) {
+		done <- runLegacyChatWithGetwd([]string{"--config", cliConfigPath(configDir), "chat", "--quit", "--verbose", "--prompt", "hello"}, &stdout, &stderr, func() (string, error) {
 			return t.TempDir(), nil
 		})
 	}()
@@ -9538,7 +9546,7 @@ func TestRunExecutesToolCallAndContinuesToFinalText(t *testing.T) {
 	writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
 
 	var stdout, stderr bytes.Buffer
-	code := RunWithGetwd([]string{"--config", cliConfigPath(configDir), "chat", "--quit", "--enable-tools", "read_file", "--prompt", "Read note"}, &stdout, &stderr, func() (string, error) {
+	code := runLegacyChatWithGetwd([]string{"--config", cliConfigPath(configDir), "chat", "--quit", "--enable-tools", "read_file", "--prompt", "Read note"}, &stdout, &stderr, func() (string, error) {
 		return projectDir, nil
 	})
 
@@ -9592,7 +9600,7 @@ func TestRunWritesJSONLLogForToolCallWithoutSensitiveContent(t *testing.T) {
 	writeCLIRunFixtureInDir(t, configDir, server.URL, "secret-api-key", "openai-chat")
 
 	var stdout, stderr bytes.Buffer
-	code := RunWithGetwd([]string{"--config", cliConfigPath(configDir), "chat", "--quit", "--enable-tools", "read_file", "--prompt", "user prompt secret"}, &stdout, &stderr, func() (string, error) {
+	code := runLegacyChatWithGetwd([]string{"--config", cliConfigPath(configDir), "chat", "--quit", "--enable-tools", "read_file", "--prompt", "user prompt secret"}, &stdout, &stderr, func() (string, error) {
 		return projectDir, nil
 	})
 
@@ -9654,7 +9662,7 @@ func TestRunCreatesSeparateSessionLogs(t *testing.T) {
 
 	for _, prompt := range []string{"first", "second"} {
 		var stdout, stderr bytes.Buffer
-		code := RunWithGetwd([]string{"--config", cliConfigPath(configDir), "chat", "--quit", "--prompt", prompt}, &stdout, &stderr, func() (string, error) {
+		code := runLegacyChatWithGetwd([]string{"--config", cliConfigPath(configDir), "chat", "--quit", "--prompt", prompt}, &stdout, &stderr, func() (string, error) {
 			return t.TempDir(), nil
 		})
 		if code != 0 {
@@ -9700,7 +9708,7 @@ func TestRunWithLoggingDisabledDoesNotCreateSessionLog(t *testing.T) {
 	setCLILoggingPath(t, configDir, `""`)
 
 	var stdout, stderr bytes.Buffer
-	code := RunWithGetwd([]string{"--config", cliConfigPath(configDir), "chat", "--quit", "--verbose", "--prompt", "hello"}, &stdout, &stderr, func() (string, error) {
+	code := runLegacyChatWithGetwd([]string{"--config", cliConfigPath(configDir), "chat", "--quit", "--verbose", "--prompt", "hello"}, &stdout, &stderr, func() (string, error) {
 		return t.TempDir(), nil
 	})
 
@@ -9729,7 +9737,7 @@ func TestRunEnableToolsRejectsUnknownTool(t *testing.T) {
 	writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
 
 	var stdout, stderr bytes.Buffer
-	code := RunWithGetwd([]string{"--config", cliConfigPath(configDir), "chat", "--quit", "--enable-tools", "missing", "--prompt", "Use tools"}, &stdout, &stderr, func() (string, error) {
+	code := runLegacyChatWithGetwd([]string{"--config", cliConfigPath(configDir), "chat", "--quit", "--enable-tools", "missing", "--prompt", "Use tools"}, &stdout, &stderr, func() (string, error) {
 		return t.TempDir(), nil
 	})
 
@@ -9754,7 +9762,7 @@ func TestRunEnableMCPRejectsUnknownServer(t *testing.T) {
 	writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
 
 	var stdout, stderr bytes.Buffer
-	code := RunWithGetwd([]string{"--config", cliConfigPath(configDir), "chat", "--quit", "--enable-mcp", "missing", "--prompt", "Use MCP"}, &stdout, &stderr, func() (string, error) {
+	code := runLegacyChatWithGetwd([]string{"--config", cliConfigPath(configDir), "chat", "--quit", "--enable-mcp", "missing", "--prompt", "Use MCP"}, &stdout, &stderr, func() (string, error) {
 		return t.TempDir(), nil
 	})
 
@@ -9779,7 +9787,7 @@ func TestChatAllowsPostPromptModelFlag(t *testing.T) {
 	writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
 
 	var stdout, stderr bytes.Buffer
-	code := RunWithGetwd([]string{"--config", cliConfigPath(configDir), "chat", "--quit", "--model", "fast", "--prompt", "Use fast", "--model", "default"}, &stdout, &stderr, func() (string, error) {
+	code := runLegacyChatWithGetwd([]string{"--config", cliConfigPath(configDir), "chat", "--quit", "--model", "fast", "--prompt", "Use fast", "--model", "default"}, &stdout, &stderr, func() (string, error) {
 		return t.TempDir(), nil
 	})
 
@@ -9811,7 +9819,7 @@ func TestRunIncludesStartupAgentsAndConfigPathDoesNotChangeLookup(t *testing.T) 
 	writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
 
 	var stdout, stderr bytes.Buffer
-	code := RunWithGetwd([]string{"--config", cliConfigPath(configDir), "chat", "--quit", "--prompt", "Hello"}, &stdout, &stderr, func() (string, error) {
+	code := runLegacyChatWithGetwd([]string{"--config", cliConfigPath(configDir), "chat", "--quit", "--prompt", "Hello"}, &stdout, &stderr, func() (string, error) {
 		return projectDir, nil
 	})
 
@@ -9845,7 +9853,7 @@ func TestRunReasoningIsHiddenUnlessShowReasoningIsSet(t *testing.T) {
 		writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
 
 		var stdout, stderr bytes.Buffer
-		code := RunWithGetwd([]string{"--config", cliConfigPath(configDir), "chat", "--quit", "--prompt", "Think"}, &stdout, &stderr, func() (string, error) {
+		code := runLegacyChatWithGetwd([]string{"--config", cliConfigPath(configDir), "chat", "--quit", "--prompt", "Think"}, &stdout, &stderr, func() (string, error) {
 			return t.TempDir(), nil
 		})
 
@@ -9869,7 +9877,7 @@ func TestRunReasoningIsHiddenUnlessShowReasoningIsSet(t *testing.T) {
 		writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
 
 		var stdout, stderr bytes.Buffer
-		code := RunWithGetwd([]string{"--config", cliConfigPath(configDir), "chat", "--quit", "--show-reasoning", "--prompt", "Think"}, &stdout, &stderr, func() (string, error) {
+		code := runLegacyChatWithGetwd([]string{"--config", cliConfigPath(configDir), "chat", "--quit", "--show-reasoning", "--prompt", "Think"}, &stdout, &stderr, func() (string, error) {
 			return t.TempDir(), nil
 		})
 
@@ -9894,7 +9902,7 @@ func TestRunReasoningIsHiddenUnlessShowReasoningIsSet(t *testing.T) {
 		setCLIAgentShowReasoning(t, configDir, true)
 
 		var stdout, stderr bytes.Buffer
-		code := RunWithGetwd([]string{"--config", cliConfigPath(configDir), "chat", "--quit", "--prompt", "Think"}, &stdout, &stderr, func() (string, error) {
+		code := runLegacyChatWithGetwd([]string{"--config", cliConfigPath(configDir), "chat", "--quit", "--prompt", "Think"}, &stdout, &stderr, func() (string, error) {
 			return t.TempDir(), nil
 		})
 
@@ -9919,7 +9927,7 @@ func TestRunReasoningIsHiddenUnlessShowReasoningIsSet(t *testing.T) {
 		setCLIAgentShowReasoning(t, configDir, true)
 
 		var stdout, stderr bytes.Buffer
-		code := RunWithGetwd([]string{"--config", cliConfigPath(configDir), "chat", "--quit", "--show-reasoning=false", "--prompt", "Think"}, &stdout, &stderr, func() (string, error) {
+		code := runLegacyChatWithGetwd([]string{"--config", cliConfigPath(configDir), "chat", "--quit", "--show-reasoning=false", "--prompt", "Think"}, &stdout, &stderr, func() (string, error) {
 			return t.TempDir(), nil
 		})
 
@@ -9943,7 +9951,7 @@ func TestRunReasoningIsHiddenUnlessShowReasoningIsSet(t *testing.T) {
 		writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
 
 		var stdout, stderr bytes.Buffer
-		code := RunWithGetwd([]string{"--config", cliConfigPath(configDir), "chat", "--quit", "--show-reasoning", "--prompt", "Think"}, &stdout, &stderr, func() (string, error) {
+		code := runLegacyChatWithGetwd([]string{"--config", cliConfigPath(configDir), "chat", "--quit", "--show-reasoning", "--prompt", "Think"}, &stdout, &stderr, func() (string, error) {
 			return t.TempDir(), nil
 		})
 
@@ -9966,7 +9974,7 @@ func TestRunReasoningIsHiddenUnlessShowReasoningIsSet(t *testing.T) {
 		writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
 
 		var stdout, stderr bytes.Buffer
-		code := RunWithGetwd([]string{"--config", cliConfigPath(configDir), "chat", "--quit", "--show-reasoning", "--prompt", "Think"}, &stdout, &stderr, func() (string, error) {
+		code := runLegacyChatWithGetwd([]string{"--config", cliConfigPath(configDir), "chat", "--quit", "--show-reasoning", "--prompt", "Think"}, &stdout, &stderr, func() (string, error) {
 			return t.TempDir(), nil
 		})
 
@@ -10177,7 +10185,7 @@ func TestRunErrorsDoNotLeakAPIKeyValues(t *testing.T) {
 		t.Setenv("SAI_MISSING_API_KEY", "")
 
 		var stdout, stderr bytes.Buffer
-		code := RunWithGetwd([]string{"--config", cliConfigPath(configDir), "chat", "--quit", "--prompt", "Hello"}, &stdout, &stderr, func() (string, error) {
+		code := runLegacyChatWithGetwd([]string{"--config", cliConfigPath(configDir), "chat", "--quit", "--prompt", "Hello"}, &stdout, &stderr, func() (string, error) {
 			return t.TempDir(), nil
 		})
 
@@ -10213,7 +10221,7 @@ func TestRunErrorsDoNotLeakAPIKeyValues(t *testing.T) {
 		writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
 
 		var stdout, stderr bytes.Buffer
-		code := RunWithGetwd([]string{"--config", cliConfigPath(configDir), "chat", "--quit", "--prompt", "Hello"}, &stdout, &stderr, func() (string, error) {
+		code := runLegacyChatWithGetwd([]string{"--config", cliConfigPath(configDir), "chat", "--quit", "--prompt", "Hello"}, &stdout, &stderr, func() (string, error) {
 			return t.TempDir(), nil
 		})
 
@@ -10255,7 +10263,7 @@ func TestRunErrorsDoNotLeakAPIKeyValues(t *testing.T) {
 		writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
 
 		var stdout, stderr bytes.Buffer
-		code := RunWithGetwd([]string{"--config", cliConfigPath(configDir), "chat", "--quit", "--prompt", "Hello"}, &stdout, &stderr, func() (string, error) {
+		code := runLegacyChatWithGetwd([]string{"--config", cliConfigPath(configDir), "chat", "--quit", "--prompt", "Hello"}, &stdout, &stderr, func() (string, error) {
 			return t.TempDir(), nil
 		})
 
@@ -10276,7 +10284,7 @@ func TestRunErrorsDoNotLeakAPIKeyValues(t *testing.T) {
 		writeCLIRunFixtureInDir(t, configDir, "http://127.0.0.1:1", "direct-secret-value", "openai-chat")
 
 		var stdout, stderr bytes.Buffer
-		code := RunWithGetwd([]string{"--config", cliConfigPath(configDir), "chat", "--quit", "--model", "missing", "--prompt", "Hello"}, &stdout, &stderr, func() (string, error) {
+		code := runLegacyChatWithGetwd([]string{"--config", cliConfigPath(configDir), "chat", "--quit", "--model", "missing", "--prompt", "Hello"}, &stdout, &stderr, func() (string, error) {
 			return t.TempDir(), nil
 		})
 
@@ -10292,7 +10300,7 @@ func TestRunErrorsDoNotLeakAPIKeyValues(t *testing.T) {
 		writeCLIRunFixtureInDir(t, configDir, "http://127.0.0.1:1", "direct-secret-value", "not-openai")
 
 		var stdout, stderr bytes.Buffer
-		code := RunWithGetwd([]string{"--config", cliConfigPath(configDir), "chat", "--quit", "--prompt", "Hello"}, &stdout, &stderr, func() (string, error) {
+		code := runLegacyChatWithGetwd([]string{"--config", cliConfigPath(configDir), "chat", "--quit", "--prompt", "Hello"}, &stdout, &stderr, func() (string, error) {
 			return t.TempDir(), nil
 		})
 
@@ -11865,6 +11873,36 @@ func unsetEnvForCLITest(t *testing.T, name string) {
 			_ = os.Unsetenv(name)
 		}
 	})
+}
+
+func runLegacyChatWithIO(args []string, stdin io.Reader, stdout, stderr io.Writer, getwd func() (string, error)) int {
+	return runLegacyChatWithContext(context.Background(), args, stdin, stdout, stderr, getwd)
+}
+
+func runLegacyChatWithGetwd(args []string, stdout, stderr io.Writer, getwd func() (string, error)) int {
+	return runLegacyChatWithContext(context.Background(), args, strings.NewReader(""), stdout, stderr, getwd)
+}
+
+func runLegacyChatWithContext(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer, getwd func() (string, error)) int {
+	return runLegacyChatWithInterrupts(ctx, "sai", args, stdin, stdout, stderr, getwd, nil)
+}
+
+func runLegacyChatWithInterrupts(ctx context.Context, program string, args []string, stdin io.Reader, stdout, stderr io.Writer, getwd func() (string, error), interrupts <-chan struct{}) int {
+	rootArgs, err := splitRootArgs(args)
+	if err == nil && rootArgs.command != "chat" {
+		err = usageError(fmt.Sprintf("legacy chat test helper requires chat command, got %q", rootArgs.command), "", "sai help")
+	}
+	if err == nil {
+		err = chatCommand(ctx, rootArgs.commandArgs, rootArgs.configPath, stdin, stdout, stderr, getwd, program, interrupts)
+	}
+	if err != nil {
+		if errors.Is(err, errSilentExit) {
+			return 1
+		}
+		fmt.Fprintf(stderr, "sai: %v\n", err)
+		return 1
+	}
+	return 0
 }
 
 func assertCLIVerboseContains(t *testing.T, got string, wants ...string) {
