@@ -81,7 +81,7 @@ evidence 证明。
 - [ ] 不隐式创建 session。
 - [ ] `--new` 等价于 session create 后 attach。
 - [x] primary command shape 是 singular `session`。
-- [ ] 如果保留旧 `sessions`，仅作为 list alias。
+- [x] 如果保留旧 `sessions`，仅作为 list alias。
 - [x] `session create` 记录 project id。
 - [x] `session create` 记录 `created_cwd`。
 - [x] API-level project session create records `config_path` when provided.
@@ -91,7 +91,7 @@ evidence 证明。
 - [x] attach existing session 时传 `--config` 报错。
 - [x] send existing session 时传 `--config` 报错。
 - [x] existing session cwd 固定为 `created_cwd`。
-- [ ] `--cwd` 只允许 project create、session create 和 `--new`。
+- [x] `--cwd` 只允许 project create、session create 和 `--new`。
 - [x] attach existing session 时传 `--cwd` 报错。
 - [x] send existing session 时传 `--cwd` 报错。
 - [ ] 第一版不提供 session config mutation command。
@@ -299,6 +299,13 @@ evidence 证明。
   `attach --new --cwd` 和 `send --new --cwd` 仍到达 discovery/create/send 路径。
 - 2026-07-04 M21 slice 8: `go test ./...` 通过。
 - 2026-07-04 M21 slice 8: `git diff --check` 通过（仅出现工作区 LF/CRLF normalization warnings）。
+- 2026-07-04 M21 legacy plural sessions alias slice: `go test ./internal/cli` 和 `git diff --check`
+  通过（仅出现工作区 LF/CRLF normalization warnings）；覆盖 `sessions`
+  和 `sessions list` 仅作为 `session list` alias，使用 nearest project-scoped
+  `/projects/{project_id}/sessions` 而不是 global `/sessions`；`sessions -h`、`help sessions`
+  和 `help sessions list` 只描述 list alias 且不展示 `show/delete/prune`；`sessions show`、
+  `sessions delete`、`sessions prune`、`help sessions show/delete/prune` 和 plural `--cwd`
+  均失败且不打印旧 local-session 用法。
 - 2026-07-04 M21 auth hardening slice: `go test ./internal/server` 通过；覆盖 `GET /health`
   无 token 成功且只返回 minimal liveness，`GET /server` 和 session read/content endpoints
   无 token 返回 `permission_denied`，带 registry bearer token 成功，`WS /sessions/{id}/stream`

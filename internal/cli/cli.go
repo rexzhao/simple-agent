@@ -360,7 +360,7 @@ func execute(ctx context.Context, program string, args []string, stdin io.Reader
 		}
 		return mcpListCommand(subArgs, rootArgs.configPath, stdout, getwd, program)
 	case "sessions":
-		subcommand, subArgs, groupHelp, err := splitSubcommandArgs(rootArgs.commandArgs, map[string]flagKind{"keep": flagKindValue, "cwd": flagKindValue}, "sai help sessions")
+		subcommand, subArgs, groupHelp, err := splitSubcommandArgs(rootArgs.commandArgs, map[string]flagKind{"project": flagKindValue, "all-projects": flagKindBool, "archived": flagKindBool}, "sai help sessions")
 		if err != nil {
 			return err
 		}
@@ -369,16 +369,14 @@ func execute(ctx context.Context, program string, args []string, stdin io.Reader
 			return nil
 		}
 		switch subcommand {
-		case "list":
-			return sessionsListCommand(ctx, subArgs, homePath, stdout, getwd, displayCommand)
-		case "show":
-			return sessionsShowCommand(ctx, subArgs, homePath, stdout, getwd, displayCommand)
-		case "delete":
-			return sessionsDeleteCommand(subArgs, rootArgs.configPath, stdout, getwd, program)
-		case "prune":
-			return sessionsPruneCommand(subArgs, rootArgs.configPath, stdout, getwd, program)
+		case "", "list":
+			if subcommand == "list" && containsHelpArg(subArgs) {
+				printSessionsListUsage(stdout, displayCommand)
+				return nil
+			}
+			return sessionListCommand(ctx, subArgs, rootArgs.configPath, homePath, stdout, getwd, program)
 		default:
-			return usageError("usage: sai sessions <list|show|delete|prune>", "", "sai help sessions")
+			return usageError("usage: sai sessions [list]", "", "sai help sessions")
 		}
 	default:
 		return usageError(fmt.Sprintf("unknown command %q", rootArgs.command), "", "sai help")
@@ -424,7 +422,7 @@ Commands:
   doctor            Check local configuration health
   tools list         List built-in tools
   mcp list           List configured MCP servers
-  sessions           Manage resumable sessions
+  sessions           Alias for session list
   version            Print version
   help [command]     Show usage
 
@@ -682,42 +680,18 @@ const mcpListUsageText = `usage: sai mcp list [--enable-mcp ids]
 Lists configured MCP servers and whether each is enabled for this run.
 `
 
-const sessionsUsageText = `usage: sai sessions <command>
+const sessionsUsageText = `usage: sai sessions [list] [--project project-id] [--all-projects] [--archived]
 
-Commands:
-  sessions list              List server-owned sessions
-  sessions show <id>         Show server-owned session metadata
-  sessions delete <id>       Delete a local legacy resumable session
-  sessions prune --keep N    Delete older local legacy resumable sessions
+Alias for "sai session list". Lists server-owned session metadata without
+printing messages, prompts, assistant output, or tool result content.
 
-Run "sai help sessions <command>" for command usage.
+Run "sai help sessions list" for alias usage.
 `
 
-const sessionsListUsageText = `usage: sai sessions list
-       sai sessions list --cwd path
+const sessionsListUsageText = `usage: sai sessions list [--project project-id] [--all-projects] [--archived]
 
-Discovers the nearest healthy local server and lists server-owned session
-metadata without printing messages, prompts, assistant output, or tool result
-content.
-`
-
-const sessionsShowUsageText = `usage: sai sessions show <id>
-       sai sessions show --cwd path <id>
-
-Discovers the nearest healthy local server and shows server-owned session
-metadata only. Session storage can contain full sensitive content, including
-prompts, assistant output, and tool results.
-`
-
-const sessionsDeleteUsageText = `usage: sai sessions delete <id>
-
-Deletes one resumable session.
-`
-
-const sessionsPruneUsageText = `usage: sai sessions prune --keep N
-
-Keeps the N most recently updated resumable sessions and deletes older ones.
---keep must be provided explicitly and N must be 0 or greater.
+Alias for "sai session list". Lists server-owned session metadata without
+printing messages, prompts, assistant output, or tool result content.
 `
 
 func helpCommand(args []string, stdout io.Writer, command string) error {
@@ -793,12 +767,6 @@ func helpCommand(args []string, stdout io.Writer, command string) error {
 		printSessionsUsage(stdout, command)
 	case "sessions list":
 		printSessionsListUsage(stdout, command)
-	case "sessions show":
-		printSessionsShowUsage(stdout, command)
-	case "sessions delete":
-		printSessionsDeleteUsage(stdout, command)
-	case "sessions prune":
-		printSessionsPruneUsage(stdout, command)
 	default:
 		return usageError(fmt.Sprintf("unknown help topic %q", strings.Join(args, " ")), "", "sai help")
 	}
@@ -943,18 +911,6 @@ func printSessionsUsage(stdout io.Writer, command string) {
 
 func printSessionsListUsage(stdout io.Writer, command string) {
 	fmt.Fprint(stdout, renderCommandText(sessionsListUsageText, command))
-}
-
-func printSessionsShowUsage(stdout io.Writer, command string) {
-	fmt.Fprint(stdout, renderCommandText(sessionsShowUsageText, command))
-}
-
-func printSessionsDeleteUsage(stdout io.Writer, command string) {
-	fmt.Fprint(stdout, renderCommandText(sessionsDeleteUsageText, command))
-}
-
-func printSessionsPruneUsage(stdout io.Writer, command string) {
-	fmt.Fprint(stdout, renderCommandText(sessionsPruneUsageText, command))
 }
 
 func isNestedHelp(args []string, command string) bool {
@@ -3455,51 +3411,6 @@ func toolsListCommand(args []string, stdout io.Writer, command string) error {
 	return nil
 }
 
-func sessionsListCommand(ctx context.Context, args []string, homePath string, stdout io.Writer, getwd func() (string, error), command string) error {
-	flags := flag.NewFlagSet("sai sessions list", flag.ContinueOnError)
-	cwdFlag := flags.String("cwd", "", "discovery working directory")
-	positionals, done, err := parseCommandFlagArgs(flags, args, stdout, printSessionsListUsage, command, "sai help sessions list")
-	if done || err != nil {
-		return err
-	}
-	if len(positionals) != 0 {
-		return usageError("usage: sai sessions list [--cwd path]", "", "sai help sessions list")
-	}
-
-	record, _, err := discoverClientServer(ctx, *cwdFlag, homePath, getwd, command)
-	if err != nil {
-		return err
-	}
-	infos, err := localserver.ListSessions(ctx, record.BaseURL, record.Token, serverClientTimeout)
-	if err != nil {
-		return err
-	}
-
-	return printServerSessionList(stdout, infos)
-}
-
-func sessionsShowCommand(ctx context.Context, args []string, homePath string, stdout io.Writer, getwd func() (string, error), command string) error {
-	flags := flag.NewFlagSet("sai sessions show", flag.ContinueOnError)
-	cwdFlag := flags.String("cwd", "", "discovery working directory")
-	positionals, done, err := parseCommandFlagArgs(flags, args, stdout, printSessionsShowUsage, command, "sai help sessions show")
-	if done || err != nil {
-		return err
-	}
-	if len(positionals) != 1 {
-		return usageError("usage: sai sessions show [--cwd path] <id>", "", "sai help sessions show")
-	}
-
-	record, _, err := discoverClientServer(ctx, *cwdFlag, homePath, getwd, command)
-	if err != nil {
-		return err
-	}
-	session, err := localserver.GetSessionDetail(ctx, record.BaseURL, record.Token, positionals[0], serverClientTimeout)
-	if err != nil {
-		return err
-	}
-	return printServerSessionDetail(stdout, session)
-}
-
 func printServerSessionDetail(stdout io.Writer, session localserver.SessionDetail) error {
 	return printServerSessionDetailFields(stdout, session, false)
 }
@@ -3566,94 +3477,6 @@ func printServerSessionList(stdout io.Writer, infos []localserver.SessionMetadat
 		}
 	}
 	return nil
-}
-
-func sessionsDeleteCommand(args []string, configPath string, stdout io.Writer, getwd func() (string, error), program string) error {
-	displayCommand := displayProgramName(program)
-	flags := flag.NewFlagSet("sai sessions delete", flag.ContinueOnError)
-	positionals, done, err := parseCommandFlagArgs(flags, args, stdout, printSessionsDeleteUsage, displayCommand, "sai help sessions delete")
-	if done || err != nil {
-		return err
-	}
-	if len(positionals) != 1 {
-		return usageError("usage: sai sessions delete <id>", "", "sai help sessions delete")
-	}
-
-	store, err := sessionV2StoreFromConfig(configPath, getwd, program)
-	if err != nil {
-		return err
-	}
-	if err := store.Delete(positionals[0]); err != nil {
-		return readableSessionNotFound(err, positionals[0])
-	}
-	fmt.Fprintf(stdout, "deleted session %s\n", positionals[0])
-	return nil
-}
-
-func sessionsPruneCommand(args []string, configPath string, stdout io.Writer, getwd func() (string, error), program string) error {
-	displayCommand := displayProgramName(program)
-	flags := flag.NewFlagSet("sai sessions prune", flag.ContinueOnError)
-	keep := flags.Int("keep", -1, "number of most recently updated sessions to keep")
-	positionals, done, err := parseCommandFlagArgs(flags, args, stdout, printSessionsPruneUsage, displayCommand, "sai help sessions prune")
-	if done || err != nil {
-		return err
-	}
-	if len(positionals) != 0 {
-		return usageError("usage: sai sessions prune --keep N", "", "sai help sessions prune")
-	}
-	keepSet := false
-	flags.Visit(func(f *flag.Flag) {
-		if f.Name == "keep" {
-			keepSet = true
-		}
-	})
-	if !keepSet {
-		return usageError("--keep must be provided", sessionsPruneUsageText, "sai help sessions prune")
-	}
-	if *keep < 0 {
-		return usageError("--keep must be 0 or greater", sessionsPruneUsageText, "sai help sessions prune")
-	}
-
-	store, err := sessionV2StoreFromConfig(configPath, getwd, program)
-	if err != nil {
-		return err
-	}
-	infos, err := store.List()
-	if err != nil {
-		return err
-	}
-	if *keep > len(infos) {
-		*keep = len(infos)
-	}
-
-	deletedIDs := make([]string, 0, len(infos)-*keep)
-	for _, info := range infos[*keep:] {
-		if err := store.Delete(info.ID); err != nil {
-			return readableSessionNotFound(err, info.ID)
-		}
-		deletedIDs = append(deletedIDs, info.ID)
-	}
-
-	fmt.Fprintf(stdout, "deleted %d sessions\n", len(deletedIDs))
-	for _, id := range deletedIDs {
-		fmt.Fprintln(stdout, id)
-	}
-	return nil
-}
-
-func sessionV2StoreFromConfig(configPath string, getwd func() (string, error), program string) (*sessions.V2Store, error) {
-	cfg, err := loadConfig(configPath, getwd, program)
-	if err != nil {
-		return nil, err
-	}
-	return sessions.NewV2Store(cfg.Sessions.Dir), nil
-}
-
-func readableSessionNotFound(err error, id string) error {
-	if errors.Is(err, sessions.ErrNotFound) {
-		return fmt.Errorf("resumable session %q was not found", id)
-	}
-	return err
 }
 
 func formatSessionTimestamp(value time.Time) string {

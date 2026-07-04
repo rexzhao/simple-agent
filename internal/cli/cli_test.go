@@ -4145,17 +4145,17 @@ func TestGroupHelpWritesUsageWithoutConfig(t *testing.T) {
 		{
 			name:  "sessions flag short",
 			args:  []string{"sessions", "-h"},
-			wants: []string{"usage: sai sessions <command>", "sessions list", "sessions prune --keep N"},
+			wants: []string{"usage: sai sessions [list]", `Alias for "sai session list"`},
 		},
 		{
 			name:  "sessions flag long",
 			args:  []string{"sessions", "--help"},
-			wants: []string{"usage: sai sessions <command>", "sessions list", "sessions prune --keep N"},
+			wants: []string{"usage: sai sessions [list]", `Alias for "sai session list"`},
 		},
 		{
 			name:  "sessions help",
 			args:  []string{"help", "sessions"},
-			wants: []string{"usage: sai sessions <command>", "sessions list", "sessions prune --keep N"},
+			wants: []string{"usage: sai sessions [list]", `Alias for "sai session list"`},
 		},
 	}
 
@@ -4215,48 +4215,48 @@ func TestNestedHelpWritesUsageWithoutConfig(t *testing.T) {
 		{
 			name:  "sessions list flag",
 			args:  []string{"sessions", "list", "-h"},
-			wants: []string{"usage: sai sessions list", "messages, prompts, assistant output"},
+			wants: []string{"usage: sai sessions list", `Alias for "sai session list"`, "messages, prompts, assistant output"},
 		},
 		{
 			name:  "sessions list help",
 			args:  []string{"help", "sessions", "list"},
-			wants: []string{"usage: sai sessions list", "messages, prompts, assistant output"},
-		},
-		{
-			name:  "sessions show flag",
-			args:  []string{"sessions", "show", "-h"},
-			wants: []string{"usage: sai sessions show <id>", "full sensitive"},
-		},
-		{
-			name:  "sessions show help",
-			args:  []string{"help", "sessions", "show"},
-			wants: []string{"usage: sai sessions show <id>", "full sensitive"},
-		},
-		{
-			name:  "sessions delete flag",
-			args:  []string{"sessions", "delete", "-h"},
-			wants: []string{"usage: sai sessions delete <id>"},
-		},
-		{
-			name:  "sessions delete help",
-			args:  []string{"help", "sessions", "delete"},
-			wants: []string{"usage: sai sessions delete <id>"},
-		},
-		{
-			name:  "sessions prune flag",
-			args:  []string{"--keep", "1", "sessions", "prune", "-h"},
-			wants: []string{"usage: sai sessions prune --keep N", "--keep must be provided"},
-		},
-		{
-			name:  "sessions prune help",
-			args:  []string{"help", "sessions", "prune"},
-			wants: []string{"usage: sai sessions prune --keep N", "--keep must be provided"},
+			wants: []string{"usage: sai sessions list", `Alias for "sai session list"`, "messages, prompts, assistant output"},
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			assertCLIHelpWithoutConfig(t, tt.args, tt.wants...)
+		})
+	}
+}
+
+func TestPluralSessionsHelpOnlyAdvertisesListAlias(t *testing.T) {
+	tests := [][]string{
+		{"sessions", "-h"},
+		{"help", "sessions"},
+		{"sessions", "list", "-h"},
+		{"help", "sessions", "list"},
+	}
+	for _, args := range tests {
+		t.Run(strings.Join(args, " "), func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			code := RunWithGetwd(args, &stdout, &stderr, func() (string, error) {
+				return "", errors.New("getwd should not be called")
+			})
+			if code != 0 {
+				t.Fatalf("RunWithGetwd(%v) code = %d, stderr = %s", args, code, stderr.String())
+			}
+			if stderr.String() != "" {
+				t.Fatalf("stderr = %q, want empty", stderr.String())
+			}
+			out := stdout.String()
+			assertCLIOutputContains(t, out, `Alias for "sai session list"`)
+			for _, forbidden := range []string{"sessions show", "sessions delete", "sessions prune", "--cwd path"} {
+				if strings.Contains(out, forbidden) {
+					t.Fatalf("sessions alias help advertised %q:\n%s", forbidden, out)
+				}
+			}
 		})
 	}
 }
@@ -7663,171 +7663,160 @@ func TestChatSaveToolResultsFalseRejectsSaveAndResume(t *testing.T) {
 	}
 }
 
-func TestSessionsListUsesServerAPIWithoutLocalSessionFiles(t *testing.T) {
-	registryPath := isolateCLIUserRegistry(t)
-	projectDir := t.TempDir()
-	childDir := filepath.Join(projectDir, "child")
-	if err := os.MkdirAll(childDir, 0o755); err != nil {
-		t.Fatalf("MkdirAll(child) error = %v", err)
+func TestPluralSessionsAliasesSessionListProjectScoped(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+	}{
+		{name: "bare plural", args: []string{"sessions"}},
+		{name: "plural list", args: []string{"sessions", "list"}},
 	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			registryPath := isolateCLIUserRegistry(t)
+			parentDir := t.TempDir()
+			childDir := filepath.Join(parentDir, "child")
+			leafDir := filepath.Join(childDir, "leaf")
+			if err := os.MkdirAll(leafDir, 0o755); err != nil {
+				t.Fatalf("MkdirAll(leafDir) error = %v", err)
+			}
+			parentRoot, err := projectstore.CanonicalRoot(parentDir)
+			if err != nil {
+				t.Fatalf("CanonicalRoot(parent) error = %v", err)
+			}
+			childRoot, err := projectstore.CanonicalRoot(childDir)
+			if err != nil {
+				t.Fatalf("CanonicalRoot(child) error = %v", err)
+			}
+			updatedAt := time.Date(2026, 7, 4, 6, 1, 0, 0, time.UTC)
 
-	authSeen := make(chan string, 1)
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/health":
-			writeCLIJSON(w, http.StatusOK, map[string]any{"status": "ok"})
-		case "/sessions":
-			authSeen <- r.Header.Get("Authorization")
-			writeCLIJSON(w, http.StatusOK, map[string]any{
-				"sessions": []map[string]any{
-					{
-						"id":            "newer-session",
-						"created_at":    time.Date(2026, 7, 2, 3, 0, 0, 0, time.UTC),
-						"updated_at":    time.Date(2026, 7, 2, 3, 2, 0, 0, time.UTC),
-						"provider":      "openai",
-						"model_profile": "default",
-						"model_id":      "gpt-5.1",
-						"last_seq":      4,
-					},
-					{
-						"id":            "older-session",
-						"created_at":    time.Date(2026, 7, 2, 3, 0, 0, 0, time.UTC),
-						"updated_at":    time.Date(2026, 7, 2, 3, 1, 0, 0, time.UTC),
-						"provider":      "paperhub",
-						"model_profile": "glm-5.2",
-						"model_id":      "glm-5.2",
-						"last_seq":      2,
-					},
-				},
+			projectsAuthSeen := make(chan string, 1)
+			sessionsAuthSeen := make(chan string, 1)
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch {
+				case r.URL.Path == "/health":
+					writeCLIJSON(w, http.StatusOK, map[string]any{"status": "ok"})
+				case r.URL.Path == "/projects" && r.Method == http.MethodGet:
+					projectsAuthSeen <- r.Header.Get("Authorization")
+					writeCLIJSON(w, http.StatusOK, map[string]any{
+						"projects": []map[string]any{
+							{"id": "project-parent", "root": parentRoot, "archived": false, "created_at": updatedAt, "updated_at": updatedAt},
+							{"id": "project-child", "root": childRoot, "archived": false, "created_at": updatedAt, "updated_at": updatedAt},
+						},
+					})
+				case r.URL.Path == "/projects/project-child/sessions" && r.Method == http.MethodGet:
+					sessionsAuthSeen <- r.Header.Get("Authorization")
+					writeCLIJSON(w, http.StatusOK, map[string]any{
+						"sessions": []map[string]any{
+							{"id": "child-session", "created_at": updatedAt, "updated_at": updatedAt, "provider": "fake", "model_profile": "default", "model_id": "model-default", "project_id": "project-child"},
+						},
+					})
+				case r.URL.Path == "/sessions":
+					t.Fatalf("plural sessions alias should not use global sessions list, got %s %q", r.Method, r.URL.Path)
+				default:
+					t.Fatalf("unexpected path %s %q", r.Method, r.URL.Path)
+				}
+			}))
+			defer server.Close()
+			registerCLIFakeServer(t, registryPath, parentDir, server.URL, "registry-token")
+
+			var stdout, stderr bytes.Buffer
+			code := RunWithGetwd(tt.args, &stdout, &stderr, func() (string, error) {
+				return leafDir, nil
 			})
-		default:
-			t.Fatalf("unexpected path %q", r.URL.Path)
-		}
-	}))
-	defer server.Close()
-	registerCLIFakeServer(t, registryPath, projectDir, server.URL, "registry-token")
 
-	var stdout, stderr bytes.Buffer
-	code := RunWithGetwd([]string{"--cwd", childDir, "sessions", "list"}, &stdout, &stderr, func() (string, error) {
-		return "", errors.New("getwd should not be called")
-	})
-
-	if code != 0 {
-		t.Fatalf("RunWithGetwd() code = %d, stderr = %s", code, stderr.String())
-	}
-	select {
-	case got := <-authSeen:
-		if got != "Bearer registry-token" {
-			t.Fatalf("GET /sessions Authorization = %q, want bearer registry token", got)
-		}
-	default:
-		t.Fatal("GET /sessions was not called")
-	}
-	out := stdout.String()
-	for _, want := range []string{
-		"ID\tLAST_USED\tPROVIDER\tMODEL/PROFILE",
-		"newer-session\t2026-07-02T03:02:00Z\topenai\tgpt-5.1/default",
-		"older-session\t2026-07-02T03:01:00Z\tpaperhub\tglm-5.2/glm-5.2",
-	} {
-		if !strings.Contains(out, want) {
-			t.Fatalf("sessions list output missing %q:\n%s", want, out)
-		}
-	}
-	assertCLIErrorOmits(t, out, "prompt secret", "assistant secret", "tool secret", "registry-token")
-	if stderr.String() != "" {
-		t.Fatalf("stderr = %q, want empty", stderr.String())
+			if code != 0 {
+				t.Fatalf("RunWithGetwd() code = %d, stderr = %s", code, stderr.String())
+			}
+			for name, ch := range map[string]<-chan string{
+				"projects":         projectsAuthSeen,
+				"project sessions": sessionsAuthSeen,
+			} {
+				select {
+				case got := <-ch:
+					if got != "Bearer registry-token" {
+						t.Fatalf("%s Authorization = %q, want bearer token", name, got)
+					}
+				default:
+					t.Fatalf("%s request was not called", name)
+				}
+			}
+			assertCLIOutputContains(t, stdout.String(),
+				"ID\tLAST_USED\tPROVIDER\tMODEL/PROFILE",
+				"child-session\t2026-07-04T06:01:00Z\tfake\tmodel-default/default",
+			)
+			assertCLIErrorOmits(t, stdout.String(), "prompt secret", "assistant secret", "tool secret", "registry-token")
+			if stderr.String() != "" {
+				t.Fatalf("stderr = %q, want empty", stderr.String())
+			}
+		})
 	}
 }
 
-func TestSessionsShowUsesServerAPIWithoutLocalSessionFiles(t *testing.T) {
-	registryPath := isolateCLIUserRegistry(t)
-	projectDir := t.TempDir()
-	configPath := filepath.Join(projectDir, ".agents", "sai.yaml")
-
-	authSeen := make(chan string, 1)
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/health":
-			writeCLIJSON(w, http.StatusOK, map[string]any{"status": "ok"})
-		case "/sessions/show-session":
-			authSeen <- r.Header.Get("Authorization")
-			writeCLIJSON(w, http.StatusOK, map[string]any{
-				"id":                  "show-session",
-				"created_at":          time.Date(2026, 7, 2, 3, 0, 0, 0, time.UTC),
-				"updated_at":          time.Date(2026, 7, 2, 3, 1, 0, 0, time.UTC),
-				"provider":            "paperhub",
-				"model_profile":       "glm-5.2-fast",
-				"model_id":            "glm-5.2",
-				"status":              "idle",
-				"last_seq":            42,
-				"cwd":                 projectDir,
-				"config_path":         configPath,
-				"model_parameters":    map[string]any{"ignored": "prompt body secret"},
-				"enabled_tools":       []string{"read_file"},
-				"enabled_mcp":         []string{"local"},
-				"enabled_skills":      []string{"review"},
-				"show_reasoning":      true,
-				"save_tool_results":   true,
-				"context":             contextwindow.Metadata{ContextWindow: 128000, ContextWindowSource: string(contextwindow.WindowSourceConfigured), WarningThresholdPercent: contextwindow.WarningThresholdPercent, LastRequestTokens: 1000, LastInputTokens: 900, LastOutputTokens: 50, LastTotalTokens: 950, LastUsageSource: string(contextwindow.UsageSourceProvider)},
-				"items":               []map[string]any{{"content": "assistant body secret"}},
-				"active_history":      []string{"hidden-summary"},
-				"instructions_secret": "instruction secret",
+func TestPluralSessionsRejectsLegacyCommandsAndCWD(t *testing.T) {
+	tests := []struct {
+		name     string
+		args     []string
+		want     string
+		helpHint string
+	}{
+		{name: "show", args: []string{"sessions", "show", "show-session"}, want: "usage: sai sessions [list]", helpHint: `Run "sai help sessions" for usage.`},
+		{name: "show help flag", args: []string{"sessions", "show", "-h"}, want: "usage: sai sessions [list]", helpHint: `Run "sai help sessions" for usage.`},
+		{name: "delete", args: []string{"sessions", "delete", "delete-session"}, want: "usage: sai sessions [list]", helpHint: `Run "sai help sessions" for usage.`},
+		{name: "prune", args: []string{"sessions", "prune", "--keep", "1"}, want: "usage: sai sessions [list]", helpHint: `Run "sai help sessions" for usage.`},
+		{name: "group cwd", args: []string{"sessions", "--cwd", t.TempDir()}, want: "flag provided but not defined: -cwd", helpHint: `Run "sai help sessions" for usage.`},
+		{name: "list cwd", args: []string{"sessions", "list", "--cwd", t.TempDir()}, want: "flag provided but not defined: -cwd", helpHint: `Run "sai help session list" for usage.`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			code := RunWithGetwd(tt.args, &stdout, &stderr, func() (string, error) {
+				return "", errors.New("getwd should not be called")
 			})
-		default:
-			t.Fatalf("unexpected path %q", r.URL.Path)
-		}
-	}))
-	defer server.Close()
-	registerCLIFakeServer(t, registryPath, projectDir, server.URL, "registry-token")
-
-	var stdout, stderr bytes.Buffer
-	code := RunWithGetwd([]string{"sessions", "show", "show-session", "--cwd", projectDir}, &stdout, &stderr, func() (string, error) {
-		return "", errors.New("getwd should not be called")
-	})
-
-	if code != 0 {
-		t.Fatalf("RunWithGetwd() code = %d, stderr = %s", code, stderr.String())
+			if code != 1 {
+				t.Fatalf("RunWithGetwd(%v) code = %d, want 1", tt.args, code)
+			}
+			if stdout.String() != "" {
+				t.Fatalf("stdout = %q, want empty", stdout.String())
+			}
+			assertCLIErrorContains(t, stderr.String(), tt.want, tt.helpHint)
+			for _, forbidden := range []string{
+				"usage: sai sessions show",
+				"usage: sai sessions delete",
+				"usage: sai sessions prune",
+				"Deletes one resumable session",
+				"--keep must be provided",
+			} {
+				if strings.Contains(stderr.String(), forbidden) {
+					t.Fatalf("sessions legacy rejection printed %q:\n%s", forbidden, stderr.String())
+				}
+			}
+		})
 	}
-	select {
-	case got := <-authSeen:
-		if got != "Bearer registry-token" {
-			t.Fatalf("GET /sessions/show-session Authorization = %q, want bearer registry token", got)
-		}
-	default:
-		t.Fatal("GET /sessions/show-session was not called")
-	}
-	out := stdout.String()
-	for _, want := range []string{
-		"WARNING: server-owned session storage can contain full sensitive content",
-		"ID\tshow-session",
-		"UPDATED\t2026-07-02T03:01:00Z",
-		"PROVIDER\tpaperhub",
-		"MODEL_PROFILE\tglm-5.2-fast",
-		"MODEL_ID\tglm-5.2",
-		"STATUS\tidle",
-		"LAST_SEQ\t42",
-		"CONFIG_PATH\t" + configPath,
-		"ENABLED_TOOLS\tread_file",
-		"ENABLED_MCP\tlocal",
-		"ENABLED_SKILLS\treview",
-		"SHOW_REASONING\ttrue",
-		"CONTEXT_WINDOW\t128000",
-		"CONTEXT_WINDOW_SOURCE\tconfigured",
-		"CONTEXT_WARNING_THRESHOLD_PERCENT\t80",
-		"CONTEXT_LAST_REQUEST_TOKENS\t1000",
-		"CONTEXT_LAST_INPUT_TOKENS\t900",
-		"CONTEXT_LAST_OUTPUT_TOKENS\t50",
-		"CONTEXT_LAST_TOTAL_TOKENS\t950",
-		"CONTEXT_LAST_USAGE_SOURCE\tprovider",
-		"SAVE_TOOL_RESULTS\ttrue",
+
+	for _, args := range [][]string{
+		{"help", "sessions", "show"},
+		{"help", "sessions", "delete"},
+		{"help", "sessions", "prune"},
 	} {
-		if !strings.Contains(out, want) {
-			t.Fatalf("sessions show output missing %q:\n%s", want, out)
-		}
-	}
-	assertCLIErrorOmits(t, out, "instruction secret", "prompt body secret", "assistant body secret", "tool body secret", "registry-token")
-	if stderr.String() != "" {
-		t.Fatalf("stderr = %q, want empty", stderr.String())
+		t.Run(strings.Join(args, " "), func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			code := RunWithGetwd(args, &stdout, &stderr, func() (string, error) {
+				return "", errors.New("getwd should not be called")
+			})
+			if code != 1 {
+				t.Fatalf("RunWithGetwd(%v) code = %d, want 1", args, code)
+			}
+			if stdout.String() != "" {
+				t.Fatalf("stdout = %q, want empty", stdout.String())
+			}
+			assertCLIErrorContains(t, stderr.String(), "unknown help topic", `Run "sai help" for usage.`)
+			if strings.Contains(stderr.String(), "usage: sai sessions show") ||
+				strings.Contains(stderr.String(), "usage: sai sessions delete") ||
+				strings.Contains(stderr.String(), "usage: sai sessions prune") {
+				t.Fatalf("legacy help topic printed old usage:\n%s", stderr.String())
+			}
+		})
 	}
 }
 
@@ -9443,18 +9432,6 @@ func TestClientCommandsNoServerHint(t *testing.T) {
 			},
 		},
 		{
-			args: []string{"sessions", "list", "--cwd", projectDir},
-			getwd: func() (string, error) {
-				return "", errors.New("getwd should not be called")
-			},
-		},
-		{
-			args: []string{"sessions", "show", "missing-session", "--cwd", projectDir},
-			getwd: func() (string, error) {
-				return "", errors.New("getwd should not be called")
-			},
-		},
-		{
 			args: []string{"send", "missing-session", "--prompt", "hello"},
 			getwd: func() (string, error) {
 				return projectDir, nil
@@ -9472,164 +9449,6 @@ func TestClientCommandsNoServerHint(t *testing.T) {
 				t.Fatalf("stdout = %q, want empty", stdout.String())
 			}
 			assertCLIErrorContains(t, stderr.String(), "no healthy sai server found", "sai server --cwd")
-		})
-	}
-}
-
-func TestSessionsDeleteRemovesSessionAndReportsMissingSession(t *testing.T) {
-	configDir := writeCLIFixture(t)
-	sessionRoot := filepath.Join(configDir, "sessions")
-	writeCLISession(t, sessionRoot, sessions.Session{
-		ID:           "delete-session",
-		CreatedAt:    time.Date(2026, 7, 2, 3, 0, 0, 0, time.UTC),
-		UpdatedAt:    time.Date(2026, 7, 2, 3, 1, 0, 0, time.UTC),
-		Version:      sessions.CurrentVersion,
-		Provider:     "paperhub",
-		ModelProfile: "glm-5.2",
-		ModelID:      "glm-5.2",
-		Messages:     []model.Message{{Role: model.MessageRoleUser, Content: "delete prompt secret"}},
-	})
-
-	var stdout, stderr bytes.Buffer
-	code := RunWithGetwd([]string{"--config", cliConfigPath(configDir), "sessions", "delete", "delete-session"}, &stdout, &stderr, func() (string, error) {
-		return "", errors.New("getwd should not be called")
-	})
-
-	if code != 0 {
-		t.Fatalf("RunWithGetwd(delete) code = %d, stderr = %s", code, stderr.String())
-	}
-	if got, want := stdout.String(), "deleted session delete-session\n"; got != want {
-		t.Fatalf("stdout = %q, want %q", got, want)
-	}
-	if _, err := sessions.NewV2Store(sessionRoot).Load("delete-session"); !errors.Is(err, sessions.ErrNotFound) {
-		t.Fatalf("Load(deleted) error = %v, want ErrNotFound", err)
-	}
-
-	stdout.Reset()
-	stderr.Reset()
-	code = RunWithGetwd([]string{"--config", cliConfigPath(configDir), "sessions", "delete", "missing-session"}, &stdout, &stderr, func() (string, error) {
-		return "", errors.New("getwd should not be called")
-	})
-
-	if code != 1 {
-		t.Fatalf("RunWithGetwd(missing) code = %d, want 1", code)
-	}
-	if stdout.String() != "" {
-		t.Fatalf("stdout = %q, want empty", stdout.String())
-	}
-	assertCLIErrorContains(t, stderr.String(), `resumable session "missing-session" was not found`)
-}
-
-func TestSessionsPruneRequiresExplicitKeepWithoutConfigLoad(t *testing.T) {
-	tests := []struct {
-		name string
-		args []string
-		want string
-	}{
-		{name: "missing", args: []string{"sessions", "prune"}, want: "--keep must be provided"},
-		{name: "negative", args: []string{"sessions", "prune", "--keep", "-1"}, want: "--keep must be 0 or greater"},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			var stdout, stderr bytes.Buffer
-			code := RunWithGetwd(tt.args, &stdout, &stderr, func() (string, error) {
-				return "", errors.New("getwd should not be called")
-			})
-
-			if code != 1 {
-				t.Fatalf("RunWithGetwd() code = %d, want 1", code)
-			}
-			if stdout.String() != "" {
-				t.Fatalf("stdout = %q, want empty", stdout.String())
-			}
-			assertCLIErrorContains(t, stderr.String(), tt.want, `Run "sai help sessions prune" for usage.`)
-		})
-	}
-}
-
-func TestSessionsPruneKeepsNewestSessionsWithMixedKeepFlag(t *testing.T) {
-	tests := []struct {
-		name string
-		args func(configDir string) []string
-	}{
-		{
-			name: "root keep",
-			args: func(configDir string) []string {
-				return []string{"--config", cliConfigPath(configDir), "--keep", "1", "sessions", "prune"}
-			},
-		},
-		{
-			name: "group keep",
-			args: func(configDir string) []string {
-				return []string{"sessions", "--keep", "1", "--config", cliConfigPath(configDir), "prune"}
-			},
-		},
-		{
-			name: "command keep",
-			args: func(configDir string) []string {
-				return []string{"sessions", "prune", "--config", cliConfigPath(configDir), "--keep", "1"}
-			},
-		},
-		{
-			name: "keep zero",
-			args: func(configDir string) []string {
-				return []string{"--config", cliConfigPath(configDir), "sessions", "prune", "--keep", "0"}
-			},
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			configDir := writeCLIFixture(t)
-			sessionRoot := filepath.Join(configDir, "sessions")
-			writeCLIPruneSession(t, sessionRoot, "oldest-session", time.Date(2026, 7, 2, 3, 0, 0, 0, time.UTC))
-			writeCLIPruneSession(t, sessionRoot, "older-session", time.Date(2026, 7, 2, 3, 1, 0, 0, time.UTC))
-			writeCLIPruneSession(t, sessionRoot, "newest-session", time.Date(2026, 7, 2, 3, 2, 0, 0, time.UTC))
-
-			var stdout, stderr bytes.Buffer
-			code := RunWithGetwd(tt.args(configDir), &stdout, &stderr, func() (string, error) {
-				return "", errors.New("getwd should not be called")
-			})
-
-			if code != 0 {
-				t.Fatalf("RunWithGetwd() code = %d, stderr = %s", code, stderr.String())
-			}
-			out := stdout.String()
-			if tt.name == "keep zero" {
-				for _, want := range []string{"deleted 3 sessions", "newest-session", "older-session", "oldest-session"} {
-					if !strings.Contains(out, want) {
-						t.Fatalf("prune output missing %q:\n%s", want, out)
-					}
-				}
-				infos, err := sessions.NewV2Store(sessionRoot).List()
-				if err != nil {
-					t.Fatalf("List() after prune error = %v", err)
-				}
-				if len(infos) != 0 {
-					t.Fatalf("remaining sessions = %#v, want none", infos)
-				}
-				return
-			}
-
-			for _, want := range []string{"deleted 2 sessions", "older-session", "oldest-session"} {
-				if !strings.Contains(out, want) {
-					t.Fatalf("prune output missing %q:\n%s", want, out)
-				}
-			}
-			if strings.Contains(out, "newest-session") {
-				t.Fatalf("prune output included kept session:\n%s", out)
-			}
-			infos, err := sessions.NewV2Store(sessionRoot).List()
-			if err != nil {
-				t.Fatalf("List() after prune error = %v", err)
-			}
-			if len(infos) != 1 || infos[0].ID != "newest-session" {
-				t.Fatalf("remaining sessions = %#v, want only newest-session", infos)
-			}
-			if stderr.String() != "" {
-				t.Fatalf("stderr = %q, want empty", stderr.String())
-			}
 		})
 	}
 }
