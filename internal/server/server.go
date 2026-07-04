@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"crypto/subtle"
 	"encoding/json"
@@ -548,15 +549,20 @@ func (p *Process) handleProjectSessionsCreate(w http.ResponseWriter, r *http.Req
 		writeError(w, http.StatusServiceUnavailable, "session_store_unavailable", "session store is not configured")
 		return
 	}
-	if err := readEmptySessionCreateRequest(w, r); err != nil {
+	request, err := readProjectSessionCreateRequest(w, r)
+	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_request", err.Error())
 		return
 	}
 
 	session := p.newSessionFromDefaults()
+	session = applySessionCreateMetadata(session, request)
 	session.ProjectID = project.ID
 	if strings.TrimSpace(session.CreatedCWD) == "" {
 		session.CreatedCWD = session.CWD
+	}
+	if strings.TrimSpace(session.CWD) == "" {
+		session.CWD = session.CreatedCWD
 	}
 
 	saved, err := store.SaveMetadata(session)
@@ -1779,6 +1785,81 @@ func readEmptySessionCreateRequest(w http.ResponseWriter, r *http.Request) error
 		return fmt.Errorf("request body must be empty or {}")
 	}
 	return nil
+}
+
+func readProjectSessionCreateRequest(w http.ResponseWriter, r *http.Request) (SessionCreateMetadata, error) {
+	body := http.MaxBytesReader(w, r.Body, 64*1024)
+	data, err := io.ReadAll(body)
+	if err != nil {
+		return SessionCreateMetadata{}, fmt.Errorf("read request body: %w", err)
+	}
+	if len(strings.TrimSpace(string(data))) == 0 {
+		return SessionCreateMetadata{}, nil
+	}
+
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.UseNumber()
+	var raw map[string]json.RawMessage
+	if err := decoder.Decode(&raw); err != nil {
+		return SessionCreateMetadata{}, fmt.Errorf("request body must be empty or a JSON object")
+	}
+	if raw == nil {
+		return SessionCreateMetadata{}, fmt.Errorf("request body must be empty or a JSON object")
+	}
+	var extra any
+	if err := decoder.Decode(&extra); err != io.EOF {
+		return SessionCreateMetadata{}, fmt.Errorf("request body must contain a single JSON object")
+	}
+
+	decoder = json.NewDecoder(bytes.NewReader(data))
+	decoder.UseNumber()
+	var request SessionCreateMetadata
+	if err := decoder.Decode(&request); err != nil {
+		return SessionCreateMetadata{}, fmt.Errorf("invalid session create metadata")
+	}
+	return request, nil
+}
+
+func applySessionCreateMetadata(session sessions.SessionV2, metadata SessionCreateMetadata) sessions.SessionV2 {
+	if value := strings.TrimSpace(metadata.CreatedCWD); value != "" {
+		session.CreatedCWD = value
+		session.CWD = value
+	}
+	if value := strings.TrimSpace(metadata.ConfigPath); value != "" {
+		session.ConfigPath = value
+		session.ConfigDir = ""
+	}
+	if value := strings.TrimSpace(metadata.Provider); value != "" {
+		session.Provider = value
+	}
+	if value := strings.TrimSpace(metadata.ModelProfile); value != "" {
+		session.ModelProfile = value
+	}
+	if value := strings.TrimSpace(metadata.ModelID); value != "" {
+		session.ModelID = value
+	}
+	if metadata.ModelParameters != nil {
+		session.ModelParameters = copyMap(metadata.ModelParameters)
+	}
+	if metadata.EnabledTools != nil {
+		session.EnabledTools = copyStrings(metadata.EnabledTools)
+	}
+	if metadata.EnabledMCP != nil {
+		session.EnabledMCP = copyStrings(metadata.EnabledMCP)
+	}
+	if metadata.EnabledSkills != nil {
+		session.EnabledSkills = copyStrings(metadata.EnabledSkills)
+	}
+	if metadata.ShowReasoning != nil {
+		session.ShowReasoning = *metadata.ShowReasoning
+	}
+	if metadata.Context != nil {
+		session.Context = *metadata.Context
+	}
+	if metadata.SaveToolResults != nil {
+		session.SaveToolResults = *metadata.SaveToolResults
+	}
+	return session
 }
 
 func readProjectCreateRequest(w http.ResponseWriter, r *http.Request) (projectCreateRequest, error) {

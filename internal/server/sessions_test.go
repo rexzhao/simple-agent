@@ -368,6 +368,141 @@ func TestProjectSessionAPIsCreateListFilterAndClient(t *testing.T) {
 	}
 }
 
+func TestProjectSessionCreatePersistsMetadataBodyAndIgnoresBodyProjectID(t *testing.T) {
+	projectStore := projectstore.NewStore(filepath.Join(t.TempDir(), "projects"))
+	sessionStore := sessions.NewV2Store(filepath.Join(t.TempDir(), "sessions"))
+	projectOne, _, err := projectStore.Create(mkdirServerTestDir(t, "project-one"), "Project One")
+	if err != nil {
+		t.Fatalf("Create(project one) error = %v", err)
+	}
+	projectTwo, _, err := projectStore.Create(mkdirServerTestDir(t, "project-two"), "Project Two")
+	if err != nil {
+		t.Fatalf("Create(project two) error = %v", err)
+	}
+
+	defaults := sessions.SessionV2{
+		Provider:        "default-provider",
+		ModelProfile:    "default-profile",
+		ModelID:         "default-model",
+		ModelParameters: map[string]any{"temperature": 0.1},
+		CWD:             mkdirServerTestDir(t, "default-cwd"),
+		ConfigPath:      filepath.Join(t.TempDir(), "default.yaml"),
+		EnabledTools:    []string{"default_tool"},
+		EnabledMCP:      []string{"default-mcp"},
+		EnabledSkills:   []string{"default-skill"},
+		ShowReasoning:   false,
+		Context: contextwindow.Metadata{
+			ContextWindow:           32000,
+			ContextWindowSource:     string(contextwindow.WindowSourceEstimated),
+			WarningThresholdPercent: contextwindow.WarningThresholdPercent,
+		},
+		SaveToolResults: true,
+	}
+	process := startProjectSessionAPIServer(t, projectStore, sessionStore, defaults, "registry-token")
+
+	createdCWD := mkdirServerTestDir(t, "metadata-cwd")
+	configPath := filepath.Join(t.TempDir(), "metadata.yaml")
+	bodyRaw, err := json.Marshal(map[string]any{
+		"project_id":        projectTwo.ID,
+		"created_cwd":       createdCWD,
+		"config_path":       configPath,
+		"provider":          "codex-work",
+		"model_profile":     "gpt-5.5",
+		"model_id":          "gpt-5.5-real",
+		"model_parameters":  map[string]any{"max_output_tokens": 2048, "store": false},
+		"enabled_tools":     []string{"read_file", "grep_files"},
+		"enabled_mcp":       []string{"local"},
+		"enabled_skills":    []string{"reviewer", "go"},
+		"show_reasoning":    true,
+		"context":           map[string]any{"context_window": 400000, "context_window_source": "configured", "warning_threshold_percent": 70, "last_request_tokens": 1234},
+		"save_tool_results": false,
+	})
+	if err != nil {
+		t.Fatalf("Marshal(project session create body) error = %v", err)
+	}
+
+	createdRaw, created := postRawJSONStatus(t, "http://"+process.Addr()+"/projects/"+projectOne.ID+"/sessions", string(bodyRaw), "registry-token", http.StatusCreated)
+	assertNoSessionTimelineLeak(t, createdRaw)
+	if created["id"] == "" {
+		t.Fatalf("created response missing id: %#v", created)
+	}
+	for key, want := range map[string]any{
+		"project_id":        projectOne.ID,
+		"created_cwd":       createdCWD,
+		"cwd":               createdCWD,
+		"config_path":       configPath,
+		"provider":          "codex-work",
+		"model_profile":     "gpt-5.5",
+		"model_id":          "gpt-5.5-real",
+		"show_reasoning":    true,
+		"save_tool_results": false,
+	} {
+		if got := created[key]; got != want {
+			t.Fatalf("created[%s] = %#v, want %#v in %#v", key, got, want, created)
+		}
+	}
+	if created["project_id"] == projectTwo.ID {
+		t.Fatalf("created response trusted body project_id: %#v", created)
+	}
+	params := created["model_parameters"].(map[string]any)
+	if params["max_output_tokens"] != float64(2048) || params["store"] != false {
+		t.Fatalf("created model_parameters = %#v, want metadata body", params)
+	}
+	if got, want := stringSliceFromJSON(t, created["enabled_tools"]), []string{"read_file", "grep_files"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("created enabled_tools = %#v, want %#v", got, want)
+	}
+	if got, want := stringSliceFromJSON(t, created["enabled_mcp"]), []string{"local"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("created enabled_mcp = %#v, want %#v", got, want)
+	}
+	if got, want := stringSliceFromJSON(t, created["enabled_skills"]), []string{"reviewer", "go"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("created enabled_skills = %#v, want %#v", got, want)
+	}
+	context := created["context"].(map[string]any)
+	if context["context_window"] != float64(400000) || context["warning_threshold_percent"] != float64(70) || context["last_request_tokens"] != float64(1234) {
+		t.Fatalf("created context = %#v, want metadata body", context)
+	}
+
+	stored, err := sessionStore.Load(created["id"].(string))
+	if err != nil {
+		t.Fatalf("Load(created project session) error = %v", err)
+	}
+	if stored.ProjectID != projectOne.ID || stored.ProjectID == projectTwo.ID {
+		t.Fatalf("stored project id = %q, want URL project %q and not body project %q", stored.ProjectID, projectOne.ID, projectTwo.ID)
+	}
+	if stored.CreatedCWD != createdCWD || stored.CWD != createdCWD || stored.ConfigPath != configPath {
+		t.Fatalf("stored paths = cwd %q created_cwd %q config %q, want metadata", stored.CWD, stored.CreatedCWD, stored.ConfigPath)
+	}
+	if stored.Provider != "codex-work" || stored.ModelProfile != "gpt-5.5" || stored.ModelID != "gpt-5.5-real" {
+		t.Fatalf("stored model metadata = %#v, want request metadata", stored)
+	}
+	if fmt.Sprint(stored.ModelParameters["max_output_tokens"]) != "2048" || stored.ModelParameters["store"] != false {
+		t.Fatalf("stored model_parameters = %#v, want request metadata", stored.ModelParameters)
+	}
+	if !reflect.DeepEqual(stored.EnabledTools, []string{"read_file", "grep_files"}) {
+		t.Fatalf("stored enabled_tools = %#v", stored.EnabledTools)
+	}
+	if !reflect.DeepEqual(stored.EnabledMCP, []string{"local"}) {
+		t.Fatalf("stored enabled_mcp = %#v", stored.EnabledMCP)
+	}
+	if !reflect.DeepEqual(stored.EnabledSkills, []string{"reviewer", "go"}) {
+		t.Fatalf("stored enabled_skills = %#v", stored.EnabledSkills)
+	}
+	if !stored.ShowReasoning {
+		t.Fatal("stored show_reasoning = false, want true")
+	}
+	if stored.Context.ContextWindow != 400000 || stored.Context.WarningThresholdPercent != 70 || stored.Context.LastRequestTokens != 1234 {
+		t.Fatalf("stored context = %#v, want request metadata", stored.Context)
+	}
+	if stored.SaveToolResults {
+		t.Fatal("stored save_tool_results = true, want false from request metadata")
+	}
+
+	_, defaultCreated := postRawJSONStatus(t, "http://"+process.Addr()+"/projects/"+projectOne.ID+"/sessions", "{}", "registry-token", http.StatusCreated)
+	if defaultCreated["project_id"] != projectOne.ID || defaultCreated["provider"] != defaults.Provider || defaultCreated["created_cwd"] != defaults.CWD {
+		t.Fatalf("default project session from {} = %#v, want URL project id and server defaults", defaultCreated)
+	}
+}
+
 func TestProjectSessionListSkipsUnrelatedCorruptSessionBeforeReplay(t *testing.T) {
 	projectStore := projectstore.NewStore(filepath.Join(t.TempDir(), "projects"))
 	sessionRoot := filepath.Join(t.TempDir(), "sessions")
@@ -2104,6 +2239,24 @@ func sessionMetadataIDSet(items []SessionMetadata) map[string]bool {
 		ids[item.ID] = true
 	}
 	return ids
+}
+
+func stringSliceFromJSON(t *testing.T, value any) []string {
+	t.Helper()
+
+	raw, ok := value.([]any)
+	if !ok {
+		t.Fatalf("value = %T(%#v), want JSON array", value, value)
+	}
+	items := make([]string, 0, len(raw))
+	for _, item := range raw {
+		text, ok := item.(string)
+		if !ok {
+			t.Fatalf("array item = %T(%#v), want string", item, item)
+		}
+		items = append(items, text)
+	}
+	return items
 }
 
 type fakeSessionTurnRunner struct {

@@ -84,8 +84,8 @@ evidence 证明。
 - [ ] 如果保留旧 `sessions`，仅作为 list alias。
 - [x] `session create` 记录 project id。
 - [x] `session create` 记录 `created_cwd`。
-- [ ] `session create` 记录 `config_path`。
-- [ ] `session create` 记录 provider/model/tools/MCP/skills 等关键 metadata。
+- [x] API-level project session create records `config_path` when provided.
+- [x] API-level project session create records provider/model/tools/MCP/skills metadata when provided.
 - [ ] 每个 turn 重新读取 session 的 `config_path`。
 - [ ] `--config` 只允许创建新 session 时使用。
 - [ ] attach existing session 时传 `--config` 报错。
@@ -223,6 +223,11 @@ evidence 证明。
   missing/invalid/archived project errors 和 project-scoped client helpers。
 - 2026-07-04 M21 slice 5: `go test ./...` 通过。
 - 2026-07-04 M21 slice 5: `git diff --check` 通过。
+- 2026-07-04 M21 slice 6: `go test ./internal/server` 通过；覆盖
+  `POST /projects/{project_id}/sessions` 空 body 兼容、显式 session creation metadata
+  持久化/返回，以及 request body 中冲突 `project_id` 被忽略、URL project id 生效。
+- 2026-07-04 M21 slice 6: `go test ./...` 通过。
+- 2026-07-04 M21 slice 6: `git diff --check` 通过。
 - Known limits: 当前 M21 slices 未实现 CLI session lifecycle、attach/send project selection changes、
   project remove/archive、GUI server work、session data store home
   migration 或 registry `base_url` schema rename。

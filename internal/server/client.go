@@ -81,6 +81,23 @@ type SessionDetail struct {
 	SaveToolResults bool                   `json:"save_tool_results"`
 }
 
+// SessionCreateMetadata is the optional metadata accepted by
+// POST /projects/{project_id}/sessions.
+type SessionCreateMetadata struct {
+	CreatedCWD      string                  `json:"created_cwd,omitempty"`
+	ConfigPath      string                  `json:"config_path,omitempty"`
+	Provider        string                  `json:"provider,omitempty"`
+	ModelProfile    string                  `json:"model_profile,omitempty"`
+	ModelID         string                  `json:"model_id,omitempty"`
+	ModelParameters map[string]any          `json:"model_parameters,omitempty"`
+	EnabledTools    []string                `json:"enabled_tools,omitempty"`
+	EnabledMCP      []string                `json:"enabled_mcp,omitempty"`
+	EnabledSkills   []string                `json:"enabled_skills,omitempty"`
+	ShowReasoning   *bool                   `json:"show_reasoning,omitempty"`
+	Context         *contextwindow.Metadata `json:"context,omitempty"`
+	SaveToolResults *bool                   `json:"save_tool_results,omitempty"`
+}
+
 // SessionMessageResult is the committed metadata returned by POST /sessions/{id}/messages.
 type SessionMessageResult struct {
 	TurnID  string `json:"turn_id"`
@@ -279,10 +296,27 @@ func ListProjectSessionsWithToken(ctx context.Context, addr, token, projectID st
 
 // CreateProjectSessionWithToken sends POST /projects/{id}/sessions with the registry bearer token.
 func CreateProjectSessionWithToken(ctx context.Context, addr, token, projectID string, timeout time.Duration) (SessionDetail, error) {
-	projectID = strings.TrimSpace(projectID)
-	req, err := newServerClientRequest(ctx, http.MethodPost, addr, "/projects/"+url.PathEscape(projectID)+"/sessions")
+	return createProjectSessionWithPayload(ctx, addr, token, projectID, nil, timeout)
+}
+
+// CreateProjectSessionWithMetadataWithToken sends POST /projects/{id}/sessions
+// with optional session creation metadata.
+func CreateProjectSessionWithMetadataWithToken(ctx context.Context, addr, token, projectID string, metadata SessionCreateMetadata, timeout time.Duration) (SessionDetail, error) {
+	payload, err := marshalSessionCreateMetadata(metadata)
 	if err != nil {
 		return SessionDetail{}, err
+	}
+	return createProjectSessionWithPayload(ctx, addr, token, projectID, payload, timeout)
+}
+
+func createProjectSessionWithPayload(ctx context.Context, addr, token, projectID string, payload []byte, timeout time.Duration) (SessionDetail, error) {
+	projectID = strings.TrimSpace(projectID)
+	req, err := newServerClientRequestWithBody(ctx, http.MethodPost, addr, "/projects/"+url.PathEscape(projectID)+"/sessions", payload)
+	if err != nil {
+		return SessionDetail{}, err
+	}
+	if payload != nil {
+		req.Header.Set("Content-Type", "application/json")
 	}
 	setBearerToken(req, token)
 	client := http.Client{}
@@ -302,6 +336,51 @@ func CreateProjectSessionWithToken(ctx context.Context, addr, token, projectID s
 		return SessionDetail{}, fmt.Errorf("decode created project session %s at %s: %w", projectID, strings.TrimSpace(addr), err)
 	}
 	return detail, nil
+}
+
+func marshalSessionCreateMetadata(metadata SessionCreateMetadata) ([]byte, error) {
+	payload := make(map[string]any)
+	if value := strings.TrimSpace(metadata.CreatedCWD); value != "" {
+		payload["created_cwd"] = value
+	}
+	if value := strings.TrimSpace(metadata.ConfigPath); value != "" {
+		payload["config_path"] = value
+	}
+	if value := strings.TrimSpace(metadata.Provider); value != "" {
+		payload["provider"] = value
+	}
+	if value := strings.TrimSpace(metadata.ModelProfile); value != "" {
+		payload["model_profile"] = value
+	}
+	if value := strings.TrimSpace(metadata.ModelID); value != "" {
+		payload["model_id"] = value
+	}
+	if metadata.ModelParameters != nil {
+		payload["model_parameters"] = metadata.ModelParameters
+	}
+	if metadata.EnabledTools != nil {
+		payload["enabled_tools"] = metadata.EnabledTools
+	}
+	if metadata.EnabledMCP != nil {
+		payload["enabled_mcp"] = metadata.EnabledMCP
+	}
+	if metadata.EnabledSkills != nil {
+		payload["enabled_skills"] = metadata.EnabledSkills
+	}
+	if metadata.ShowReasoning != nil {
+		payload["show_reasoning"] = *metadata.ShowReasoning
+	}
+	if metadata.Context != nil {
+		payload["context"] = *metadata.Context
+	}
+	if metadata.SaveToolResults != nil {
+		payload["save_tool_results"] = *metadata.SaveToolResults
+	}
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return nil, fmt.Errorf("encode project session create request")
+	}
+	return data, nil
 }
 
 // ListSessions fetches public session metadata from GET /sessions.
