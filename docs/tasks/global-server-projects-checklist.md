@@ -49,18 +49,19 @@ evidence 证明。
 - [ ] 除 `GET /health` 外，所有 HTTP 请求要求 bearer token。
 - [ ] 所有 WebSocket 请求要求 bearer token。
 - [ ] 第一版不实现多用户 login。
+- [x] 新增 project endpoints 要求 registry bearer token。
 
 ## Projects
 
-- [ ] project identity 只使用 canonical cwd root。
+- [x] project identity 只使用 canonical cwd root。
 - [ ] project 必须显式创建。
-- [ ] project metadata 存在 user-level registry/data store，不写 project marker 文件。
+- [x] project metadata 存在 user-level registry/data store，不写 project marker 文件。
 - [ ] `project create` 默认使用 effective cwd。
 - [ ] `project create --cwd PATH` 可指定 canonical root。
-- [ ] duplicate exact canonical root 返回已有 project info 并退出 0。
-- [ ] project name 只作为 display-only metadata。
-- [ ] 从 effective cwd 向上查找 nearest registered ancestor。
-- [ ] nested projects 允许并按 nearest ancestor 选择。
+- [x] duplicate exact canonical root 返回已有 project info 并退出 0。
+- [x] project name 只作为 display-only metadata。
+- [x] 从 effective cwd 向上查找 nearest registered ancestor。
+- [x] nested projects 允许并按 nearest ancestor 选择。
 - [ ] 无 project 时 bare attach 失败并提示创建 project。
 - [ ] 无 project 时 send/session create 失败并提示创建 project。
 - [ ] `project list` 可列出 projects。
@@ -139,9 +140,10 @@ evidence 证明。
 - [ ] 提供 `GET /health`。
 - [ ] 提供 `GET /server`。
 - [ ] 提供 `POST /server/shutdown`。
-- [ ] 提供 `GET /projects`。
-- [ ] 提供 `POST /projects`。
-- [ ] 提供 project detail/remove endpoint。
+- [x] 提供 `GET /projects`。
+- [x] 提供 `POST /projects`。
+- [x] 提供 project detail endpoint：`GET /projects/{project_id}`。
+- [ ] 提供 project remove endpoint。
 - [ ] 提供 `GET /projects/{project_id}/sessions`。
 - [ ] 提供 `POST /projects/{project_id}/sessions`。
 - [ ] 提供 `GET /sessions/{session_id}`。
@@ -159,10 +161,11 @@ evidence 证明。
 
 ## Persistence
 
-- [ ] durable project/session store 与 server registry 分离。
-- [ ] per-project directories 存在 user-level home namespace。
+- [x] durable project store 与 server registry 分离。
+- [ ] durable session store 与 server registry 分离。
+- [x] per-project directories 存在 user-level home namespace。
 - [ ] per-session directories 存在 user-level home namespace。
-- [ ] 默认不写 project repo。
+- [x] 默认不写 project repo。
 - [ ] transcript 使用 append-only JSONL。
 - [ ] 大内容存 hash-addressed blobs。
 - [ ] global blob dedupe 可用或被明确实现。
@@ -174,13 +177,14 @@ evidence 证明。
 
 - [x] 单元/集成测试覆盖 singleton per home namespace。
 - [x] 测试覆盖 different home dirs independent。
-- [ ] 测试覆盖 explicit project create。
+- [x] 测试覆盖 explicit project create。
 - [ ] 测试覆盖 explicit session create。
-- [ ] 测试覆盖 nested discovery。
+- [x] 测试覆盖 nested discovery。
 - [ ] 测试覆盖 config rejection for existing sessions。
 - [ ] 测试覆盖 cwd rejection for existing sessions。
 - [ ] 测试覆盖 direct replacement/no chat product entry。
-- [ ] 测试覆盖 explicit project/session API paths。
+- [x] 测试覆盖 explicit project API paths。
+- [ ] 测试覆盖 explicit session API paths。
 - [ ] 测试覆盖 shutdown immediate/wait semantics。
 - [ ] 测试覆盖 interrupted recovery。
 - [ ] 测试覆盖 JSONL/blob pagination。
@@ -197,5 +201,13 @@ evidence 证明。
 - 2026-07-04 M21 slice 1 reviewer fix: `go test ./internal/cli` 通过；覆盖 existing singleton 在 cwd
   config missing 和 requested listen 不同时仍返回 `SERVER_ALREADY_RUNNING` 并退出 0。
 - 2026-07-04 M21 slice 1: `git diff --check` 通过。
-- Known limits: 本 slice 未实现 project/session lifecycle、explicit project/session API path rework、`chat`
-  removal、durable data store home migration 或 registry `base_url` schema rename。
+- 2026-07-04 M21 slice 2: `go test ./internal/projects` 通过；覆盖 canonical project root
+  persistence、duplicate root 返回 existing metadata、non-archived list、nested nearest ancestor discovery。
+- 2026-07-04 M21 slice 2: `go test ./internal/server` 通过；覆盖 authenticated `POST /projects`、
+  duplicate 200/new 201、`GET /projects`、`GET /projects/{project_id}` 和 invalid root handling。
+- 2026-07-04 M21 slice 2: `go test ./internal/cli` 通过；覆盖实际 `sai server` 启动时 project store
+  写入 `<home>/data/projects`，且不写 project repo marker。
+- 2026-07-04 M21 slice 2: `git diff --check` 通过。
+- Known limits: 当前 M21 slices 未实现 project CLI commands、session lifecycle、attach/send project
+  selection changes、project remove/archive、GUI server work、`chat` removal、session data store home
+  migration 或 registry `base_url` schema rename。

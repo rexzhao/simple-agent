@@ -19,6 +19,7 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/rexzhao/simple-agent/internal/contextwindow"
 	"github.com/rexzhao/simple-agent/internal/model"
+	projectstore "github.com/rexzhao/simple-agent/internal/projects"
 	"github.com/rexzhao/simple-agent/internal/sessions"
 )
 
@@ -56,6 +57,8 @@ type Options struct {
 	SessionStore    *sessions.V2Store
 	SessionRoot     string
 	SessionDefaults sessions.SessionV2
+	ProjectStore    *projectstore.Store
+	ProjectRoot     string
 	TurnRunner      SessionTurnRunner
 	CompactPlanner  SessionCompactPlanner
 }
@@ -72,6 +75,7 @@ type Process struct {
 
 	sessionStore    *sessions.V2Store
 	sessionDefaults sessions.SessionV2
+	projectStore    *projectstore.Store
 	authToken       string
 	streams         *sessionStreamHub
 	turnRunner      SessionTurnRunner
@@ -195,6 +199,7 @@ func Start(options Options) (*Process, error) {
 		shutdownDone:    make(chan struct{}),
 		sessionStore:    options.SessionStore,
 		sessionDefaults: copySessionMetadata(options.SessionDefaults),
+		projectStore:    options.ProjectStore,
 		authToken:       strings.TrimSpace(options.AuthToken),
 		streams:         newSessionStreamHub(),
 		turnRunner:      options.TurnRunner,
@@ -203,6 +208,9 @@ func Start(options Options) (*Process, error) {
 	}
 	if process.sessionStore == nil && strings.TrimSpace(options.SessionRoot) != "" {
 		process.sessionStore = sessions.NewV2Store(options.SessionRoot)
+	}
+	if process.projectStore == nil && strings.TrimSpace(options.ProjectRoot) != "" {
+		process.projectStore = projectstore.NewStore(options.ProjectRoot)
 	}
 	if strings.TrimSpace(process.sessionDefaults.CWD) == "" {
 		process.sessionDefaults.CWD = options.CWD
@@ -300,9 +308,15 @@ func (p *Process) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		p.handleServer(w, r)
 	case "/server/shutdown":
 		p.handleShutdown(w, r)
+	case "/projects":
+		p.handleProjects(w, r)
 	case "/sessions":
 		p.handleSessions(w, r)
 	default:
+		if strings.HasPrefix(r.URL.Path, "/projects/") {
+			p.handleProjectPath(w, r)
+			return
+		}
 		if strings.HasPrefix(r.URL.Path, "/sessions/") {
 			p.handleSessionPath(w, r)
 			return
@@ -379,6 +393,97 @@ func (p *Process) handleSessions(w http.ResponseWriter, r *http.Request) {
 	default:
 		writeMethodNotAllowed(w, http.MethodGet, http.MethodPost)
 	}
+}
+
+func (p *Process) handleProjects(w http.ResponseWriter, r *http.Request) {
+	if !p.requireRegistryToken(w, r) {
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		p.handleProjectsList(w, r)
+	case http.MethodPost:
+		p.handleProjectsCreate(w, r)
+	default:
+		writeMethodNotAllowed(w, http.MethodGet, http.MethodPost)
+	}
+}
+
+func (p *Process) handleProjectPath(w http.ResponseWriter, r *http.Request) {
+	if !p.requireRegistryToken(w, r) {
+		return
+	}
+	path := strings.TrimPrefix(r.URL.Path, "/projects/")
+	if strings.TrimSpace(path) == "" || strings.Contains(path, "/") {
+		writeError(w, http.StatusNotFound, "not_found", "path not found")
+		return
+	}
+	if r.Method != http.MethodGet {
+		writeMethodNotAllowed(w, http.MethodGet)
+		return
+	}
+	p.handleProjectDetail(w, r, path)
+}
+
+func (p *Process) handleProjectsList(w http.ResponseWriter, r *http.Request) {
+	store := p.projectStore
+	if store == nil {
+		writeError(w, http.StatusServiceUnavailable, "project_store_unavailable", "project store is not configured")
+		return
+	}
+	projects, err := store.List()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "project_store_error", "could not list projects")
+		return
+	}
+	items := make([]projectDTO, 0, len(projects))
+	for _, project := range projects {
+		items = append(items, projectDTOFromProject(project))
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"projects": items,
+	})
+}
+
+func (p *Process) handleProjectsCreate(w http.ResponseWriter, r *http.Request) {
+	store := p.projectStore
+	if store == nil {
+		writeError(w, http.StatusServiceUnavailable, "project_store_unavailable", "project store is not configured")
+		return
+	}
+	request, err := readProjectCreateRequest(w, r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_request", err.Error())
+		return
+	}
+	project, created, err := store.Create(request.Root, request.DisplayName)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_project_root", err.Error())
+		return
+	}
+	status := http.StatusOK
+	if created {
+		status = http.StatusCreated
+	}
+	writeJSON(w, status, projectDTOFromProject(project))
+}
+
+func (p *Process) handleProjectDetail(w http.ResponseWriter, r *http.Request, id string) {
+	store := p.projectStore
+	if store == nil {
+		writeError(w, http.StatusServiceUnavailable, "project_store_unavailable", "project store is not configured")
+		return
+	}
+	project, err := store.Load(id)
+	if err != nil {
+		if errors.Is(err, projectstore.ErrNotFound) {
+			writeError(w, http.StatusNotFound, "project_not_found", "project not found")
+			return
+		}
+		writeError(w, http.StatusBadRequest, "invalid_project_id", "invalid project id")
+		return
+	}
+	writeJSON(w, http.StatusOK, projectDTOFromProject(project))
 }
 
 func (p *Process) handleSessionPath(w http.ResponseWriter, r *http.Request) {
@@ -1169,6 +1274,20 @@ type sessionMetadataDTO struct {
 	LastSeq      int64     `json:"last_seq"`
 }
 
+type projectDTO struct {
+	ID          string    `json:"id"`
+	Root        string    `json:"root"`
+	DisplayName string    `json:"display_name,omitempty"`
+	Archived    bool      `json:"archived"`
+	CreatedAt   time.Time `json:"created_at"`
+	UpdatedAt   time.Time `json:"updated_at"`
+}
+
+type projectCreateRequest struct {
+	Root        string
+	DisplayName string
+}
+
 type sessionDetailDTO struct {
 	ID              string                 `json:"id"`
 	CreatedAt       time.Time              `json:"created_at"`
@@ -1259,6 +1378,17 @@ func sessionDetailDTOFromSession(session sessions.SessionV2, status string) sess
 		ShowReasoning:   session.ShowReasoning,
 		Context:         session.Context,
 		SaveToolResults: session.SaveToolResults,
+	}
+}
+
+func projectDTOFromProject(project projectstore.Project) projectDTO {
+	return projectDTO{
+		ID:          project.ID,
+		Root:        project.Root,
+		DisplayName: project.DisplayName,
+		Archived:    project.Archived,
+		CreatedAt:   project.CreatedAt,
+		UpdatedAt:   project.UpdatedAt,
 	}
 }
 
@@ -1557,6 +1687,70 @@ func readEmptySessionCreateRequest(w http.ResponseWriter, r *http.Request) error
 		return fmt.Errorf("request body must be empty or {}")
 	}
 	return nil
+}
+
+func readProjectCreateRequest(w http.ResponseWriter, r *http.Request) (projectCreateRequest, error) {
+	body := http.MaxBytesReader(w, r.Body, 64*1024)
+	decoder := json.NewDecoder(body)
+	decoder.UseNumber()
+
+	var raw map[string]json.RawMessage
+	if err := decoder.Decode(&raw); err != nil {
+		return projectCreateRequest{}, fmt.Errorf("request body must be a JSON object")
+	}
+	if raw == nil {
+		return projectCreateRequest{}, fmt.Errorf("request body must be a JSON object")
+	}
+	var extra any
+	if err := decoder.Decode(&extra); err != io.EOF {
+		return projectCreateRequest{}, fmt.Errorf("request body must contain a single JSON object")
+	}
+
+	root, err := optionalStringField(raw, "root")
+	if err != nil {
+		return projectCreateRequest{}, err
+	}
+	cwd, err := optionalStringField(raw, "cwd")
+	if err != nil {
+		return projectCreateRequest{}, err
+	}
+	if root != "" && cwd != "" && root != cwd {
+		return projectCreateRequest{}, fmt.Errorf("root and cwd must not conflict")
+	}
+	if root == "" {
+		root = cwd
+	}
+	if strings.TrimSpace(root) == "" {
+		return projectCreateRequest{}, fmt.Errorf("root or cwd must be a non-empty string")
+	}
+
+	displayName, err := optionalStringField(raw, "display_name")
+	if err != nil {
+		return projectCreateRequest{}, err
+	}
+	name, err := optionalStringField(raw, "name")
+	if err != nil {
+		return projectCreateRequest{}, err
+	}
+	if displayName == "" {
+		displayName = name
+	}
+	return projectCreateRequest{
+		Root:        root,
+		DisplayName: displayName,
+	}, nil
+}
+
+func optionalStringField(raw map[string]json.RawMessage, name string) (string, error) {
+	valueRaw, ok := raw[name]
+	if !ok {
+		return "", nil
+	}
+	var value string
+	if err := json.Unmarshal(valueRaw, &value); err != nil {
+		return "", fmt.Errorf("%s must be a string", name)
+	}
+	return strings.TrimSpace(value), nil
 }
 
 func readSessionMessageRequest(w http.ResponseWriter, r *http.Request) (string, error) {

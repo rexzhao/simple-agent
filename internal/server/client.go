@@ -27,6 +27,24 @@ type ServerStatus struct {
 	RunningTurns  int       `json:"running_turns"`
 }
 
+// ProjectInfo is the client-facing metadata shape returned by project APIs.
+type ProjectInfo struct {
+	ID          string    `json:"id"`
+	Root        string    `json:"root"`
+	DisplayName string    `json:"display_name,omitempty"`
+	Archived    bool      `json:"archived"`
+	CreatedAt   time.Time `json:"created_at"`
+	UpdatedAt   time.Time `json:"updated_at"`
+}
+
+// ProjectCreateResult reports whether POST /projects created new metadata or
+// returned an existing duplicate canonical root.
+type ProjectCreateResult struct {
+	Project    ProjectInfo
+	Created    bool
+	StatusCode int
+}
+
 // SessionMetadata is the client-facing session summary returned by GET /sessions.
 type SessionMetadata struct {
 	ID           string    `json:"id"`
@@ -141,6 +159,92 @@ func GetServerStatus(ctx context.Context, addr string, timeout time.Duration) (S
 		return ServerStatus{}, fmt.Errorf("decode server status at %s: %w", strings.TrimSpace(addr), err)
 	}
 	return status, nil
+}
+
+// ListProjectsWithToken fetches non-archived project metadata from GET /projects.
+func ListProjectsWithToken(ctx context.Context, addr, token string, timeout time.Duration) ([]ProjectInfo, error) {
+	req, err := newServerClientRequest(ctx, http.MethodGet, addr, "/projects")
+	if err != nil {
+		return nil, err
+	}
+	setBearerToken(req, token)
+	client := http.Client{Timeout: clientTimeout(timeout)}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("list projects at %s: %w", strings.TrimSpace(addr), err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("list projects at %s: %s", strings.TrimSpace(addr), serverResponseError(resp))
+	}
+	var body struct {
+		Projects []ProjectInfo `json:"projects"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		return nil, fmt.Errorf("decode projects at %s: %w", strings.TrimSpace(addr), err)
+	}
+	return body.Projects, nil
+}
+
+// CreateProjectWithToken sends POST /projects with a root path and optional display name.
+func CreateProjectWithToken(ctx context.Context, addr, token, root, displayName string, timeout time.Duration) (ProjectCreateResult, error) {
+	payload, err := json.Marshal(struct {
+		Root        string `json:"root"`
+		DisplayName string `json:"display_name,omitempty"`
+	}{
+		Root:        root,
+		DisplayName: displayName,
+	})
+	if err != nil {
+		return ProjectCreateResult{}, fmt.Errorf("encode project create request")
+	}
+	req, err := newServerClientRequestWithBody(ctx, http.MethodPost, addr, "/projects", payload)
+	if err != nil {
+		return ProjectCreateResult{}, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	setBearerToken(req, token)
+	client := http.Client{Timeout: clientTimeout(timeout)}
+	resp, err := client.Do(req)
+	if err != nil {
+		return ProjectCreateResult{}, fmt.Errorf("create project at %s: %w", strings.TrimSpace(addr), err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
+		return ProjectCreateResult{}, fmt.Errorf("create project at %s: %s", strings.TrimSpace(addr), serverWriteResponseError(resp))
+	}
+	var project ProjectInfo
+	if err := json.NewDecoder(resp.Body).Decode(&project); err != nil {
+		return ProjectCreateResult{}, fmt.Errorf("decode project create result at %s: %w", strings.TrimSpace(addr), err)
+	}
+	return ProjectCreateResult{
+		Project:    project,
+		Created:    resp.StatusCode == http.StatusCreated,
+		StatusCode: resp.StatusCode,
+	}, nil
+}
+
+// GetProjectWithToken fetches one project from GET /projects/{id}.
+func GetProjectWithToken(ctx context.Context, addr, token, id string, timeout time.Duration) (ProjectInfo, error) {
+	req, err := newServerClientRequest(ctx, http.MethodGet, addr, "/projects/"+url.PathEscape(strings.TrimSpace(id)))
+	if err != nil {
+		return ProjectInfo{}, err
+	}
+	setBearerToken(req, token)
+	client := http.Client{Timeout: clientTimeout(timeout)}
+	resp, err := client.Do(req)
+	if err != nil {
+		return ProjectInfo{}, fmt.Errorf("get project %s at %s: %w", strings.TrimSpace(id), strings.TrimSpace(addr), err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return ProjectInfo{}, fmt.Errorf("get project %s at %s: %s", strings.TrimSpace(id), strings.TrimSpace(addr), serverResponseError(resp))
+	}
+	var project ProjectInfo
+	if err := json.NewDecoder(resp.Body).Decode(&project); err != nil {
+		return ProjectInfo{}, fmt.Errorf("decode project %s at %s: %w", strings.TrimSpace(id), strings.TrimSpace(addr), err)
+	}
+	return project, nil
 }
 
 // ListSessions fetches public session metadata from GET /sessions.

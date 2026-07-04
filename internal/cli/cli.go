@@ -28,6 +28,7 @@ import (
 	anthropicmessages "github.com/rexzhao/simple-agent/internal/model/anthropic_messages"
 	openaichat "github.com/rexzhao/simple-agent/internal/model/openai_chat"
 	openairesponses "github.com/rexzhao/simple-agent/internal/model/openai_responses"
+	projectstore "github.com/rexzhao/simple-agent/internal/projects"
 	localserver "github.com/rexzhao/simple-agent/internal/server"
 	"github.com/rexzhao/simple-agent/internal/sessions"
 	localskills "github.com/rexzhao/simple-agent/internal/skills"
@@ -1030,6 +1031,7 @@ type serverLaunch struct {
 	Identity        localserver.RegistryIdentity
 	SessionStore    *sessions.V2Store
 	SessionDefaults sessions.SessionV2
+	ProjectStore    *projectstore.Store
 	Program         string
 	HomePath        string
 	RegistryStore   localserver.RegistryStore
@@ -1055,6 +1057,10 @@ func prepareServerLaunch(configPath, cwdFlag, listen, homePath string, store loc
 	if err != nil {
 		return serverLaunch{}, err
 	}
+	projectRoot, err := projectstore.RootForHome(homePath)
+	if err != nil {
+		return serverLaunch{}, err
+	}
 
 	return serverLaunch{
 		CWD:             identity.CWD,
@@ -1063,6 +1069,7 @@ func prepareServerLaunch(configPath, cwdFlag, listen, homePath string, store loc
 		Identity:        identity,
 		SessionStore:    sessions.NewV2Store(cfg.Sessions.Dir),
 		SessionDefaults: sessionDefaults,
+		ProjectStore:    projectstore.NewStore(projectRoot),
 		Program:         program,
 		HomePath:        homePath,
 		RegistryStore:   store,
@@ -1087,6 +1094,7 @@ func runServerForeground(ctx context.Context, launch serverLaunch, stdout io.Wri
 		AuthToken:       token,
 		SessionStore:    launch.SessionStore,
 		SessionDefaults: launch.SessionDefaults,
+		ProjectStore:    launch.ProjectStore,
 		TurnRunner:      serverAgentTurnRunner{program: launch.Program},
 	})
 	if err != nil {

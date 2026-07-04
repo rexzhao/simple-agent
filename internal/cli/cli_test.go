@@ -24,6 +24,7 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/rexzhao/simple-agent/internal/contextwindow"
 	"github.com/rexzhao/simple-agent/internal/model"
+	projectstore "github.com/rexzhao/simple-agent/internal/projects"
 	localserver "github.com/rexzhao/simple-agent/internal/server"
 	"github.com/rexzhao/simple-agent/internal/sessions"
 	"github.com/rexzhao/simple-agent/internal/subagents"
@@ -1502,6 +1503,74 @@ sessions:
 	}
 	if len(session.Items) != 0 || session.LastSeq != 0 {
 		t.Fatalf("stored session timeline = items %#v last_seq %d, want empty", session.Items, session.LastSeq)
+	}
+
+	postCLIServerShutdown(t, addr)
+	if code := waitForCode(t, done); code != 0 {
+		t.Fatalf("server command code = %d, stderr = %s", code, stderr.String())
+	}
+}
+
+func TestServerCommandWiresProjectStoreToHomeData(t *testing.T) {
+	registryPath := isolateCLIUserRegistry(t)
+	projectDir := t.TempDir()
+	writeCLIFixtureInDir(t, filepath.Join(projectDir, ".agents"))
+
+	addr, done, stderr, cleanup := startCLIServerCommandForTest(t, []string{"server", "--port", "0"}, func() (string, error) {
+		return projectDir, nil
+	})
+	defer cleanup()
+
+	projectRoot := t.TempDir()
+	token := cliServerTokenForAddr(t, addr)
+	body := fmt.Sprintf(`{"root":%q,"display_name":"CLI Project"}`, projectRoot)
+	req, err := http.NewRequest(http.MethodPost, "http://"+addr+"/projects", strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("NewRequest(POST /projects) error = %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := (&http.Client{Timeout: 2 * time.Second}).Do(req)
+	if err != nil {
+		t.Fatalf("Post(/projects) error = %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		raw, _ := io.ReadAll(resp.Body)
+		t.Fatalf("Post(/projects) status = %d, want 201; body=%s", resp.StatusCode, raw)
+	}
+	var created struct {
+		ID   string `json:"id"`
+		Root string `json:"root"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&created); err != nil {
+		t.Fatalf("Decode(/projects) error = %v", err)
+	}
+	if created.ID == "" {
+		t.Fatalf("created project missing id: %#v", created)
+	}
+
+	homePath := filepath.Dir(filepath.Dir(registryPath))
+	projectStoreRoot, err := projectstore.RootForHome(homePath)
+	if err != nil {
+		t.Fatalf("RootForHome(%q) error = %v", homePath, err)
+	}
+	stored, err := projectstore.NewStore(projectStoreRoot).Load(created.ID)
+	if err != nil {
+		t.Fatalf("Load(created project from home data store) error = %v", err)
+	}
+	canonicalRoot, err := projectstore.CanonicalRoot(projectRoot)
+	if err != nil {
+		t.Fatalf("CanonicalRoot(%q) error = %v", projectRoot, err)
+	}
+	if stored.Root != canonicalRoot || created.Root != canonicalRoot {
+		t.Fatalf("stored/root = %q/%q, want canonical %q", stored.Root, created.Root, canonicalRoot)
+	}
+	if stored.DisplayName != "CLI Project" {
+		t.Fatalf("stored display name = %q, want CLI Project", stored.DisplayName)
+	}
+	if _, err := os.Stat(filepath.Join(projectRoot, "project.json")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("project repo marker stat error = %v, want not exist", err)
 	}
 
 	postCLIServerShutdown(t, addr)
