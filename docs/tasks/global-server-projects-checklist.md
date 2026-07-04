@@ -76,10 +76,10 @@ evidence 证明。
 
 ## Sessions
 
-- [ ] session 必须显式创建。
-- [ ] 不隐式创建 project。
-- [ ] 不隐式创建 session。
-- [ ] `--new` 等价于 session create 后 attach。
+- [x] session 必须显式创建。
+- [x] 不隐式创建 project。
+- [x] 不隐式创建 session。
+- [x] `--new` 等价于 session create 后 attach。
 - [x] primary command shape 是 singular `session`。
 - [x] 如果保留旧 `sessions`，仅作为 list alias。
 - [x] `session create` 记录 project id。
@@ -87,14 +87,14 @@ evidence 证明。
 - [x] API-level project session create records `config_path` when provided.
 - [x] API-level project session create records provider/model/tools/MCP/skills metadata when provided.
 - [x] 每个 turn 重新读取 session 的 `config_path`。
-- [ ] `--config` 只允许创建新 session 时使用。
+- [x] `--config` 只允许创建新 session 时使用。
 - [x] attach existing session 时传 `--config` 报错。
 - [x] send existing session 时传 `--config` 报错。
 - [x] existing session cwd 固定为 `created_cwd`。
 - [x] `--cwd` 只允许 project create、session create 和 `--new`。
 - [x] attach existing session 时传 `--cwd` 报错。
 - [x] send existing session 时传 `--cwd` 报错。
-- [ ] 第一版不提供 session config mutation command。
+- [x] 第一版不提供 session config mutation command。
 - [x] `session list` 默认当前 project non-archived。
 - [x] `session list --project` 可列指定 project。
 - [x] `session list --all-projects` 可跨 project 列出。
@@ -112,14 +112,14 @@ evidence 证明。
 - [x] bare attach 无 project 时失败。
 - [x] bare attach 当前 project 无 session 时失败。
 - [x] bare attach 选择当前 project 最近 non-archived session。
-- [ ] `<cmd> --new` 创建 session 后 attach。
+- [x] `<cmd> --new` 创建 session 后 attach。
 - [x] explicit session id 全局有效。
 - [x] 未指定 session id 时只从当前 project 选最近 non-archived session。
-- [ ] 多个 observers 可以 attach 同一 session。
-- [ ] 同一 session 同时只有一个 active turn。
-- [ ] session busy 时 send 返回 `session_busy`。
-- [ ] session busy 时 send 不选择另一个 session。
-- [ ] 不同 sessions 可以并发运行。
+- [x] 多个 observers 可以 attach 同一 session。
+- [x] 同一 session 同时只有一个 active turn。
+- [x] session busy 时 send 返回 `session_busy`。
+- [x] session busy 时 send 不选择另一个 session。
+- [x] 不同 sessions 可以并发运行。
 
 ## Shutdown and Recovery
 
@@ -194,6 +194,16 @@ evidence 证明。
 
 ## Smoke Evidence
 
+- 2026-07-04 M21 session lifecycle/concurrency evidence slice:
+  `go test ./internal/cli -run "Test(SessionHelpWritesUsageWithoutConfig|BareNewCreatesSessionThenAttaches|AttachNewCreatesSessionStreamsAndSendsPrompts|SendNewCreatesSessionThenSendsWithToken|SessionCreateFailsWithoutRegisteredNearestProject|SessionMetadataCommandsRejectConfigBeforeDiscovery|SendWithoutSessionFailsWithoutRegisteredNearestProject|SendWithoutSessionFailsWhenProjectHasNoSessions|AttachWithoutSessionFailsWithoutRegisteredNearestProject|AttachWithoutSessionFailsWhenProjectHasNoSessions|SendExistingRejectsCWDAndConfigBeforeDiscovery|AttachExistingRejectsCWDAndConfigBeforeDiscovery)"`,
+  `go test ./internal/server -run "Test(SessionStreamFanoutAndSessionIsolation|SessionSendMessageRejectsBusySession|ProjectSessionAPIsCreateListFilterAndClient|ProjectSessionAPIsRequireExistingActiveProject)"`,
+  and `go test ./internal/cli ./internal/server` 通过；`git diff --check` 通过（仅出现工作区
+  LF/CRLF normalization warnings）。覆盖 explicit/no implicit project/session lifecycle、
+  `attach --new` / `send --new` / bare `<cmd> --new` create-then-use、existing-session
+  `--config`/`--cwd` rejection、`session list/show/rename/archive` 和 plural `sessions` /
+  `sessions list` 带 root `--config` 时在 discovery/auto-start/network 前拒绝、无 session
+  config mutation command、同 session 多 observer fanout、same-session busy `session_busy`
+  不 reroute，以及 different-session concurrent turns。
 - 2026-07-04 M21 session metadata lifecycle slice: `go test ./internal/sessions ./internal/server ./internal/cli`
   通过；覆盖 SessionV2 `display_name` / `archived` / `last_used_at` 持久化、默认 non-archived
   list、`--archived` 过滤、`last_used_at desc` + `created_at desc` 排序、legacy missing

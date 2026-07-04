@@ -1291,9 +1291,18 @@ func TestSessionHelpWritesUsageWithoutConfig(t *testing.T) {
 	for _, tt := range []struct {
 		args  []string
 		wants []string
+		omits []string
 	}{
-		{args: []string{"session", "-h"}, wants: []string{"usage: sai session <command>", "session create", "session list", "session show", "session rename", "session archive"}},
-		{args: []string{"help", "session"}, wants: []string{"usage: sai session <command>", "session create", "session list", "session show", "session rename", "session archive"}},
+		{
+			args:  []string{"session", "-h"},
+			wants: []string{"usage: sai session <command>", "session create", "session list", "session show", "session rename", "session archive"},
+			omits: []string{"session config", "session update", "session mutate", "session set"},
+		},
+		{
+			args:  []string{"help", "session"},
+			wants: []string{"usage: sai session <command>", "session create", "session list", "session show", "session rename", "session archive"},
+			omits: []string{"session config", "session update", "session mutate", "session set"},
+		},
 		{args: []string{"session", "create", "-h"}, wants: []string{"usage: sai session create", "--cwd path"}},
 		{args: []string{"help", "session", "create"}, wants: []string{"usage: sai session create", "--cwd path"}},
 		{args: []string{"session", "list", "-h"}, wants: []string{"usage: sai session list", "--project project-id", "--all-projects", "--archived"}},
@@ -1306,7 +1315,12 @@ func TestSessionHelpWritesUsageWithoutConfig(t *testing.T) {
 		{args: []string{"help", "session", "archive"}, wants: []string{"usage: sai session archive <session-id>", "Archives a session"}},
 	} {
 		t.Run(strings.Join(tt.args, " "), func(t *testing.T) {
-			assertCLIHelpWithoutConfig(t, tt.args, tt.wants...)
+			out := assertCLIHelpWithoutConfig(t, tt.args, tt.wants...)
+			for _, omit := range tt.omits {
+				if strings.Contains(out, omit) {
+					t.Fatalf("session help mentioned unexpected config mutation command %q:\n%s", omit, out)
+				}
+			}
 		})
 	}
 }
@@ -2321,6 +2335,82 @@ func TestSessionListAllProjectsUsesGlobalSessionsAPIAndRejectsProjectCombination
 		t.Fatalf("stdout = %q, want empty", stdout.String())
 	}
 	assertCLIErrorContains(t, stderr.String(), "--project cannot be combined with --all-projects", `Run "sai help session list" for usage.`)
+}
+
+func TestSessionMetadataCommandsRejectConfigBeforeDiscovery(t *testing.T) {
+	missingConfig := filepath.Join(t.TempDir(), "missing.yaml")
+	tests := []struct {
+		name     string
+		args     []string
+		helpHint string
+	}{
+		{
+			name:     "session list",
+			args:     []string{"--config", missingConfig, "session", "list"},
+			helpHint: `Run "sai help session list" for usage.`,
+		},
+		{
+			name:     "session show",
+			args:     []string{"--config", missingConfig, "session", "show", "show-session"},
+			helpHint: `Run "sai help session show" for usage.`,
+		},
+		{
+			name:     "session rename",
+			args:     []string{"session", "rename", "rename-session", "New Name", "--config", missingConfig},
+			helpHint: `Run "sai help session rename" for usage.`,
+		},
+		{
+			name:     "session archive",
+			args:     []string{"session", "archive", "archive-session", "--config", missingConfig},
+			helpHint: `Run "sai help session archive" for usage.`,
+		},
+		{
+			name:     "plural sessions",
+			args:     []string{"--config", missingConfig, "sessions"},
+			helpHint: `Run "sai help sessions" for usage.`,
+		},
+		{
+			name:     "plural sessions list",
+			args:     []string{"sessions", "list", "--config", missingConfig},
+			helpHint: `Run "sai help session list" for usage.`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			registryPath := isolateCLIUserRegistry(t)
+			projectDir := t.TempDir()
+			requests := make(chan string, 1)
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				select {
+				case requests <- r.Method + " " + r.URL.RequestURI():
+				default:
+				}
+				writeCLIJSON(w, http.StatusInternalServerError, map[string]any{"error": "unexpected network request"})
+			}))
+			defer server.Close()
+			registerCLIFakeServer(t, registryPath, projectDir, server.URL, "registry-token")
+
+			var stdout, stderr bytes.Buffer
+			code := RunWithGetwd(tt.args, &stdout, &stderr, func() (string, error) {
+				return "", errors.New("getwd should not be called")
+			})
+
+			if code != 1 {
+				t.Fatalf("RunWithGetwd(%v) code = %d, want 1", tt.args, code)
+			}
+			if stdout.String() != "" {
+				t.Fatalf("stdout = %q, want empty", stdout.String())
+			}
+			assertCLIErrorContains(t, stderr.String(), "--config can only be used when creating a new session", tt.helpHint)
+			assertCLIErrorOmits(t, stderr.String(), missingConfig, "getwd should not be called", "unexpected network request", "registry-token")
+			select {
+			case got := <-requests:
+				t.Fatalf("%s used network before rejecting --config: %s", tt.name, got)
+			default:
+			}
+		})
+	}
 }
 
 func TestSessionShowUsesGlobalSessionIDAndRejectsCWD(t *testing.T) {
@@ -8968,6 +9058,130 @@ func TestAttachNewCreatesSessionStreamsAndSendsPrompts(t *testing.T) {
 	assertCLIErrorOmits(t, stderr.String(), prompt, "registry-token")
 }
 
+func TestBareNewCreatesSessionThenAttaches(t *testing.T) {
+	registryPath := isolateCLIUserRegistry(t)
+	projectDir := t.TempDir()
+	configDir := filepath.Join(projectDir, ".agents")
+	writeCLIRunFixtureInDir(t, configDir, "http://127.0.0.1:1", "direct-secret-value", "openai-chat")
+	canonicalRoot, err := projectstore.CanonicalRoot(projectDir)
+	if err != nil {
+		t.Fatalf("CanonicalRoot(%q) error = %v", projectDir, err)
+	}
+	configPath := filepath.Join(configDir, "sai.yaml")
+	createdAt := time.Date(2026, 7, 4, 8, 30, 0, 0, time.UTC)
+
+	projectAuthSeen := make(chan string, 1)
+	createAuthSeen := make(chan string, 1)
+	streamAuthSeen := make(chan string, 1)
+	createBodySeen := make(chan map[string]any, 1)
+	upgrader := websocket.Upgrader{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/health":
+			writeCLIJSON(w, http.StatusOK, map[string]any{"status": "ok"})
+		case r.URL.Path == "/projects" && r.Method == http.MethodGet:
+			projectAuthSeen <- r.Header.Get("Authorization")
+			writeCLIJSON(w, http.StatusOK, map[string]any{
+				"projects": []map[string]any{
+					{
+						"id":           "project-current",
+						"root":         canonicalRoot,
+						"display_name": "Current",
+						"archived":     false,
+						"created_at":   createdAt,
+						"updated_at":   createdAt,
+					},
+				},
+			})
+		case r.URL.Path == "/projects/project-current/sessions" && r.Method == http.MethodPost:
+			createAuthSeen <- r.Header.Get("Authorization")
+			data, err := io.ReadAll(r.Body)
+			if err != nil {
+				t.Fatalf("ReadAll(session create body) error = %v", err)
+			}
+			createBodySeen <- decodeCLIJSON(t, data)
+			writeCLIJSON(w, http.StatusCreated, map[string]any{
+				"id":                "new-session",
+				"created_at":        createdAt,
+				"updated_at":        createdAt,
+				"provider":          "fake",
+				"model_profile":     "default",
+				"model_id":          "model-default",
+				"status":            "idle",
+				"project_id":        "project-current",
+				"created_cwd":       canonicalRoot,
+				"cwd":               canonicalRoot,
+				"config_path":       configPath,
+				"save_tool_results": true,
+			})
+		case r.URL.Path == "/sessions/new-session/stream":
+			streamAuthSeen <- r.Header.Get("Authorization")
+			conn, err := upgrader.Upgrade(w, r, nil)
+			if err != nil {
+				t.Fatalf("Upgrade(stream) error = %v", err)
+			}
+			defer conn.Close()
+			for {
+				if _, _, err := conn.NextReader(); err != nil {
+					return
+				}
+			}
+		case r.URL.Path == "/sessions" && r.Method == http.MethodPost:
+			t.Fatalf("legacy global POST /sessions should not be used by bare --new")
+		case strings.HasPrefix(r.URL.Path, "/sessions/") && strings.HasSuffix(r.URL.Path, "/messages"):
+			t.Fatalf("bare --new should attach without sending a message, got %s %q", r.Method, r.URL.Path)
+		default:
+			t.Fatalf("unexpected path %s %q", r.Method, r.URL.Path)
+		}
+	}))
+	defer server.Close()
+	registerCLIFakeServer(t, registryPath, projectDir, server.URL, "registry-token")
+
+	var stdout, stderr bytes.Buffer
+	code := RunWithIO([]string{"--new", "--cwd", projectDir}, strings.NewReader("/quit\n"), &stdout, &stderr, func() (string, error) {
+		return "", errors.New("getwd should not be called")
+	})
+
+	if code != 0 {
+		t.Fatalf("bare --new code = %d, stderr = %s", code, stderr.String())
+	}
+	for name, ch := range map[string]<-chan string{
+		"projects": projectAuthSeen,
+		"create":   createAuthSeen,
+		"stream":   streamAuthSeen,
+	} {
+		select {
+		case got := <-ch:
+			if got != "Bearer registry-token" {
+				t.Fatalf("%s Authorization = %q, want bearer registry token", name, got)
+			}
+		default:
+			t.Fatalf("%s request was not called", name)
+		}
+	}
+	select {
+	case createBody := <-createBodySeen:
+		for key, want := range map[string]string{
+			"created_cwd":   canonicalRoot,
+			"config_path":   configPath,
+			"provider":      "fake",
+			"model_profile": "default",
+			"model_id":      "model-default",
+		} {
+			if createBody[key] != want {
+				t.Fatalf("session create body[%q] = %#v, want %q; body=%#v", key, createBody[key], want, createBody)
+			}
+		}
+	default:
+		t.Fatal("session create body was not captured")
+	}
+	if stdout.String() != "" {
+		t.Fatalf("stdout = %q, want empty", stdout.String())
+	}
+	assertCLIOutputContains(t, stderr.String(), "sai: attached to session new-session")
+	assertCLIErrorOmits(t, stderr.String(), "direct-secret-value", "registry-token")
+}
+
 func TestAttachNewFailsWithoutRegisteredNearestProject(t *testing.T) {
 	registryPath := isolateCLIUserRegistry(t)
 	projectDir := t.TempDir()
@@ -14521,7 +14735,7 @@ func sameInstructionSourcesForTest(a, b []sessions.InstructionSource) bool {
 	return true
 }
 
-func assertCLIHelpWithoutConfig(t *testing.T, args []string, wants ...string) {
+func assertCLIHelpWithoutConfig(t *testing.T, args []string, wants ...string) string {
 	t.Helper()
 
 	var stdout, stderr bytes.Buffer
@@ -14543,6 +14757,7 @@ func assertCLIHelpWithoutConfig(t *testing.T, args []string, wants ...string) {
 			t.Fatalf("stdout = %q, want contain %q", out, want)
 		}
 	}
+	return out
 }
 
 func assertCLIOutputContains(t *testing.T, got string, wants ...string) {

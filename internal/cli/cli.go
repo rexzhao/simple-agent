@@ -302,13 +302,13 @@ func execute(ctx context.Context, program string, args []string, stdin io.Reader
 		case "create":
 			return sessionCreateCommand(ctx, subArgs, rootArgs.configPath, homePath, stdout, getwd, program)
 		case "list":
-			return sessionListCommand(ctx, subArgs, rootArgs.configPath, homePath, stdout, getwd, program)
+			return sessionListCommand(ctx, subArgs, rootArgs.configPath, rootArgs.configProvided, homePath, stdout, getwd, program)
 		case "show":
-			return sessionShowCommand(ctx, subArgs, rootArgs.configPath, homePath, stdout, getwd, program)
+			return sessionShowCommand(ctx, subArgs, rootArgs.configPath, rootArgs.configProvided, homePath, stdout, getwd, program)
 		case "rename":
-			return sessionRenameCommand(ctx, subArgs, rootArgs.configPath, homePath, stdout, getwd, program)
+			return sessionRenameCommand(ctx, subArgs, rootArgs.configPath, rootArgs.configProvided, homePath, stdout, getwd, program)
 		case "archive":
-			return sessionArchiveCommand(ctx, subArgs, rootArgs.configPath, homePath, stdout, getwd, program)
+			return sessionArchiveCommand(ctx, subArgs, rootArgs.configPath, rootArgs.configProvided, homePath, stdout, getwd, program)
 		default:
 			return usageError("usage: sai session <create|list|show|rename|archive>", "", "sai help session")
 		}
@@ -374,7 +374,14 @@ func execute(ctx context.Context, program string, args []string, stdin io.Reader
 				printSessionsListUsage(stdout, displayCommand)
 				return nil
 			}
-			return sessionListCommand(ctx, subArgs, rootArgs.configPath, homePath, stdout, getwd, program)
+			if rootArgs.configProvided {
+				helpCommand := "sai help sessions"
+				if subcommand == "list" {
+					helpCommand = "sai help session list"
+				}
+				return rejectSessionConfigForExistingCommand(true, helpCommand)
+			}
+			return sessionListCommand(ctx, subArgs, rootArgs.configPath, false, homePath, stdout, getwd, program)
 		default:
 			return usageError("usage: sai sessions [list]", "", "sai help sessions")
 		}
@@ -1986,7 +1993,7 @@ func sessionCreateCommand(ctx context.Context, args []string, configPath, homePa
 	return printServerSessionDetailWithProject(stdout, session)
 }
 
-func sessionListCommand(ctx context.Context, args []string, configPath, homePath string, stdout io.Writer, getwd func() (string, error), program string) error {
+func sessionListCommand(ctx context.Context, args []string, configPath string, configProvided bool, homePath string, stdout io.Writer, getwd func() (string, error), program string) error {
 	displayCommand := displayProgramName(program)
 	flags := flag.NewFlagSet("sai session list", flag.ContinueOnError)
 	projectID := flags.String("project", "", "project id")
@@ -1998,6 +2005,9 @@ func sessionListCommand(ctx context.Context, args []string, configPath, homePath
 	}
 	if len(positionals) != 0 {
 		return usageError("usage: sai session list [--project project-id] [--all-projects] [--archived]", "", "sai help session list")
+	}
+	if err := rejectSessionConfigForExistingCommand(configProvided, "sai help session list"); err != nil {
+		return err
 	}
 	if *allProjects && strings.TrimSpace(*projectID) != "" {
 		return usageError("--project cannot be combined with --all-projects", "", "sai help session list")
@@ -2049,11 +2059,14 @@ func sessionListCommand(ctx context.Context, args []string, configPath, homePath
 	return printServerSessionList(stdout, infos)
 }
 
-func sessionShowCommand(ctx context.Context, args []string, configPath, homePath string, stdout io.Writer, getwd func() (string, error), program string) error {
+func sessionShowCommand(ctx context.Context, args []string, configPath string, configProvided bool, homePath string, stdout io.Writer, getwd func() (string, error), program string) error {
 	displayCommand := displayProgramName(program)
 	flags := flag.NewFlagSet("sai session show", flag.ContinueOnError)
 	positionals, done, err := parseCommandFlagArgs(flags, args, stdout, printSessionShowUsage, displayCommand, "sai help session show")
 	if done || err != nil {
+		return err
+	}
+	if err := rejectSessionConfigForExistingCommand(configProvided, "sai help session show"); err != nil {
 		return err
 	}
 	if len(positionals) != 1 {
@@ -2071,11 +2084,14 @@ func sessionShowCommand(ctx context.Context, args []string, configPath, homePath
 	return printServerSessionDetailWithProject(stdout, session)
 }
 
-func sessionRenameCommand(ctx context.Context, args []string, configPath, homePath string, stdout io.Writer, getwd func() (string, error), program string) error {
+func sessionRenameCommand(ctx context.Context, args []string, configPath string, configProvided bool, homePath string, stdout io.Writer, getwd func() (string, error), program string) error {
 	displayCommand := displayProgramName(program)
 	flags := flag.NewFlagSet("sai session rename", flag.ContinueOnError)
 	positionals, done, err := parseCommandFlagArgs(flags, args, stdout, printSessionRenameUsage, displayCommand, "sai help session rename")
 	if done || err != nil {
+		return err
+	}
+	if err := rejectSessionConfigForExistingCommand(configProvided, "sai help session rename"); err != nil {
 		return err
 	}
 	if len(positionals) != 2 {
@@ -2101,11 +2117,14 @@ func sessionRenameCommand(ctx context.Context, args []string, configPath, homePa
 	return printServerSessionDetailWithProject(stdout, session)
 }
 
-func sessionArchiveCommand(ctx context.Context, args []string, configPath, homePath string, stdout io.Writer, getwd func() (string, error), program string) error {
+func sessionArchiveCommand(ctx context.Context, args []string, configPath string, configProvided bool, homePath string, stdout io.Writer, getwd func() (string, error), program string) error {
 	displayCommand := displayProgramName(program)
 	flags := flag.NewFlagSet("sai session archive", flag.ContinueOnError)
 	positionals, done, err := parseCommandFlagArgs(flags, args, stdout, printSessionArchiveUsage, displayCommand, "sai help session archive")
 	if done || err != nil {
+		return err
+	}
+	if err := rejectSessionConfigForExistingCommand(configProvided, "sai help session archive"); err != nil {
 		return err
 	}
 	if len(positionals) != 1 {
@@ -2755,6 +2774,13 @@ func rejectExistingSessionOverrides(newSession, cwdProvided, configProvided bool
 	}
 	if configProvided {
 		return usageError("--config can only be used when creating a new session with --new", "", helpCommand)
+	}
+	return nil
+}
+
+func rejectSessionConfigForExistingCommand(configProvided bool, helpCommand string) error {
+	if configProvided {
+		return usageError("--config can only be used when creating a new session", "", helpCommand)
 	}
 	return nil
 }

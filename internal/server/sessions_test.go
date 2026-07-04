@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -1262,11 +1263,22 @@ func TestSessionSendMessageRejectsBusySession(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "sessions")
 	store := sessions.NewV2Store(root)
 	saveServerTestSession(t, store, "busy-session")
-	started := make(chan struct{})
+	saveServerTestSession(t, store, "other-session")
+	saveServerTestSession(t, store, "fallback-session")
+	type startedTurn struct {
+		sessionID string
+		content   string
+	}
+	started := make(chan startedTurn, 2)
 	release := make(chan struct{})
+	var releaseOnce sync.Once
+	closeRelease := func() {
+		releaseOnce.Do(func() { close(release) })
+	}
+	defer closeRelease()
 	runner := fakeSessionTurnRunner{
 		run: func(ctx context.Context, request SessionTurnRequest) (SessionTurnResult, error) {
-			close(started)
+			started <- startedTurn{sessionID: request.Session.ID, content: request.Content}
 			<-release
 			return serverTestTurnResult(request.Session,
 				model.Message{Role: model.MessageRoleUser, Content: request.Content},
@@ -1281,35 +1293,68 @@ func TestSessionSendMessageRejectsBusySession(t *testing.T) {
 		_, body := postRawJSONStatus(t, baseURL+"/sessions/busy-session/messages", `{"content":"first"}`, "registry-token", http.StatusOK)
 		firstDone <- body
 	}()
-	select {
-	case <-started:
-	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for first turn to start")
+	waitStarted := func(want startedTurn) {
+		t.Helper()
+		select {
+		case got := <-started:
+			if got != want {
+				t.Fatalf("started turn = %#v, want %#v", got, want)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("timed out waiting for %s turn to start", want.sessionID)
+		}
 	}
+	waitStarted(startedTurn{sessionID: "busy-session", content: "first"})
+
+	otherDone := make(chan map[string]any, 1)
+	go func() {
+		_, body := postRawJSONStatus(t, baseURL+"/sessions/other-session/messages", `{"content":"other"}`, "registry-token", http.StatusOK)
+		otherDone <- body
+	}()
+	waitStarted(startedTurn{sessionID: "other-session", content: "other"})
 
 	_, serverInfo := getRawJSON(t, baseURL+"/server")
-	if serverInfo["running_turns"] != float64(1) {
-		t.Fatalf("/server running_turns = %#v, want 1", serverInfo["running_turns"])
+	if serverInfo["running_turns"] != float64(2) {
+		t.Fatalf("/server running_turns = %#v, want 2", serverInfo["running_turns"])
 	}
+
 	_, detail := getRawJSON(t, baseURL+"/sessions/busy-session")
 	if detail["status"] != "running" {
-		t.Fatalf("session status = %#v, want running", detail["status"])
+		t.Fatalf("busy session status = %#v, want running", detail["status"])
+	}
+	_, detail = getRawJSON(t, baseURL+"/sessions/other-session")
+	if detail["status"] != "running" {
+		t.Fatalf("other session status = %#v, want running", detail["status"])
+	}
+	_, detail = getRawJSON(t, baseURL+"/sessions/fallback-session")
+	if detail["status"] != "idle" {
+		t.Fatalf("fallback session status = %#v, want idle", detail["status"])
 	}
 
 	raw, body := postRawJSONStatus(t, baseURL+"/sessions/busy-session/messages", `{"content":"second"}`, "registry-token", http.StatusConflict)
 	assertErrorCode(t, body, "session_busy")
-	if bytes.Contains(raw, []byte("first")) || bytes.Contains(raw, []byte("second")) {
+	if bytes.Contains(raw, []byte("first")) || bytes.Contains(raw, []byte("second")) || bytes.Contains(raw, []byte("other")) {
 		t.Fatalf("busy response leaked prompt content: %s", raw)
 	}
-
-	close(release)
 	select {
-	case body := <-firstDone:
-		if body["status"] != "committed" {
-			t.Fatalf("first response = %#v, want committed", body)
+	case got := <-started:
+		t.Fatalf("busy request started another turn instead of returning session_busy: %#v", got)
+	default:
+	}
+
+	closeRelease()
+	for name, done := range map[string]<-chan map[string]any{
+		"first": firstDone,
+		"other": otherDone,
+	} {
+		select {
+		case body := <-done:
+			if body["status"] != "committed" {
+				t.Fatalf("%s response = %#v, want committed", name, body)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("timed out waiting for %s turn to finish", name)
 		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for first turn to finish")
 	}
 }
 
