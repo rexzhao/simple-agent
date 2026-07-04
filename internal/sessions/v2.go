@@ -186,6 +186,18 @@ func newV2StoreWithClock(root string, options V2StoreOptions, now func() time.Ti
 	}
 }
 
+func RootForHome(home string) (string, error) {
+	home = strings.TrimSpace(home)
+	if home == "" {
+		return "", fmt.Errorf("home directory is required")
+	}
+	abs, err := filepath.Abs(home)
+	if err != nil {
+		return "", fmt.Errorf("resolve home directory %q: %w", home, err)
+	}
+	return filepath.Join(filepath.Clean(abs), "data", "sessions"), nil
+}
+
 func (s *V2Store) SaveMetadata(session SessionV2) (SessionV2, error) {
 	if err := s.requireRoot(); err != nil {
 		return SessionV2{}, err

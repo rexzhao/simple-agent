@@ -17,6 +17,25 @@ import (
 	"github.com/rexzhao/simple-agent/internal/model"
 )
 
+func TestRootForHome(t *testing.T) {
+	home := filepath.Join(t.TempDir(), "nested", "..", "home")
+	root, err := RootForHome(home)
+	if err != nil {
+		t.Fatalf("RootForHome(%q) error = %v", home, err)
+	}
+	abs, err := filepath.Abs(home)
+	if err != nil {
+		t.Fatalf("Abs(%q) error = %v", home, err)
+	}
+	if got, want := root, filepath.Join(filepath.Clean(abs), "data", "sessions"); got != want {
+		t.Fatalf("RootForHome(%q) = %q, want %q", home, got, want)
+	}
+
+	if _, err := RootForHome(" "); err == nil {
+		t.Fatal("RootForHome(blank) error = nil, want error")
+	}
+}
+
 func TestV2StoreSaveLoadMetadata(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "sessions")
 	clock := &fakeClock{current: time.Date(2026, 7, 3, 1, 2, 3, 0, time.UTC)}

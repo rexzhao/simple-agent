@@ -2582,8 +2582,8 @@ func TestCLIBackgroundHelperProcess(t *testing.T) {
 	}
 }
 
-func TestServerCommandWiresSessionStoreAndDefaults(t *testing.T) {
-	isolateCLIUserRegistry(t)
+func TestServerCommandWiresSessionStoreToHomeDataAndDefaults(t *testing.T) {
+	registryPath := isolateCLIUserRegistry(t)
 	projectDir := t.TempDir()
 	configDir := filepath.Join(projectDir, ".agents")
 	writeCLIFixtureInDir(t, configDir)
@@ -2641,10 +2641,18 @@ sessions:
 		t.Fatalf("session_count = %#v, want 1", got)
 	}
 
-	store := sessions.NewV2Store(filepath.Join(configDir, "custom-sessions"))
+	homePath := filepath.Dir(filepath.Dir(registryPath))
+	sessionRoot, err := sessions.RootForHome(homePath)
+	if err != nil {
+		t.Fatalf("RootForHome(%q) error = %v", homePath, err)
+	}
+	store := sessions.NewV2Store(sessionRoot)
 	session, err := store.Load(id)
 	if err != nil {
-		t.Fatalf("Load(created session) error = %v", err)
+		t.Fatalf("Load(created session from home data store) error = %v", err)
+	}
+	if _, err := sessions.NewV2Store(filepath.Join(configDir, "custom-sessions")).Load(id); !errors.Is(err, sessions.ErrNotFound) {
+		t.Fatalf("Load(created session from config sessions.dir) error = %v, want not found", err)
 	}
 	if session.Provider != "paperhub" || session.ModelProfile != "glm-5.2-fast" || session.ModelID != "glm-5.2" {
 		t.Fatalf("stored model metadata = %#v, want paperhub/glm-5.2-fast/glm-5.2", session)
@@ -6083,6 +6091,71 @@ func TestServerAgentTurnRunnerRequiresCreatedCWD(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "session created_cwd is required") {
 		t.Fatalf("RunSessionTurn() error = %v, want missing created_cwd error", err)
+	}
+}
+
+func TestServerAgentTurnRunnerUsesProvidedSessionOutsideConfigStore(t *testing.T) {
+	server, requests := newCLIRunServer(t,
+		`{"choices":[{"delta":{"content":"server assistant"}}]}`,
+		`[DONE]`,
+	)
+	defer server.Close()
+
+	configDir := t.TempDir()
+	writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
+	appendCLIConfig(t, configDir, `
+sessions:
+  dir: config-only-sessions
+  save_tool_results: true
+`)
+	homeRoot, err := sessions.RootForHome(t.TempDir())
+	if err != nil {
+		t.Fatalf("RootForHome() error = %v", err)
+	}
+	createdCWD := t.TempDir()
+	session := sessions.SessionV2{
+		ID:              "server-home-only-session",
+		Version:         sessions.VersionV2,
+		Provider:        "fake",
+		ModelProfile:    "default",
+		ModelID:         "model-default",
+		CWD:             createdCWD,
+		CreatedCWD:      createdCWD,
+		ConfigPath:      cliConfigPath(configDir),
+		SaveToolResults: true,
+	}
+	homeStore := sessions.NewV2Store(homeRoot)
+	saved, err := homeStore.SaveMetadata(session)
+	if err != nil {
+		t.Fatalf("SaveMetadata(home session) error = %v", err)
+	}
+	loaded, err := homeStore.Load(saved.ID)
+	if err != nil {
+		t.Fatalf("Load(home session) error = %v", err)
+	}
+	configSessionRoot := filepath.Join(configDir, "config-only-sessions")
+	if _, err := sessions.NewV2Store(configSessionRoot).Load(saved.ID); !errors.Is(err, sessions.ErrNotFound) {
+		t.Fatalf("Load(config sessions.dir session) error = %v, want not found", err)
+	}
+
+	result, err := (serverAgentTurnRunner{program: "sai"}).RunSessionTurn(context.Background(), localserver.SessionTurnRequest{
+		Session: loaded,
+		Content: "server prompt",
+	})
+	if err != nil {
+		t.Fatalf("RunSessionTurn() error = %v", err)
+	}
+
+	request := receiveCLIRunRequest(t, requests)
+	assertNoAdditionalCLIRunRequest(t, requests)
+	messages := requestMessages(t, request.Body)
+	assertMessage(t, messages, 0, "system", builtInBaseInstructions)
+	assertMessage(t, messages, 1, "user", "server prompt")
+	if result.Session.ID != saved.ID {
+		t.Fatalf("save plan session id = %q, want %q", result.Session.ID, saved.ID)
+	}
+	if len(result.Items) != 3 {
+		t.Fatalf("len(result.Items) = %d, want runtime+user+assistant save plan: %#v", len(result.Items), result.Items)
 	}
 }
 

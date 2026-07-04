@@ -1228,13 +1228,17 @@ func prepareServerLaunch(configPath, cwdFlag, listen, homePath string, store loc
 	if err != nil {
 		return serverLaunch{}, err
 	}
+	sessionRoot, err := sessions.RootForHome(homePath)
+	if err != nil {
+		return serverLaunch{}, err
+	}
 
 	return serverLaunch{
 		CWD:             identity.CWD,
 		ConfigPath:      identity.ConfigPath,
 		Listen:          listen,
 		Identity:        identity,
-		SessionStore:    sessions.NewV2Store(cfg.Sessions.Dir),
+		SessionStore:    sessions.NewV2Store(sessionRoot),
 		SessionDefaults: sessionDefaults,
 		ProjectStore:    projectstore.NewStore(projectRoot),
 		Program:         program,
@@ -4781,7 +4785,8 @@ func (r *agentRuntime) sessionSavePlan(messages []model.Message) (sessions.Sessi
 }
 
 type runtimePreparationOptions struct {
-	enableSubagents bool
+	enableSubagents        bool
+	resumedSessionOverride *sessions.SessionV2
 }
 
 func prepareAgentRuntime(ctx context.Context, configPath string, options agentCommandFlags, stderr io.Writer, getwd func() (string, error), program string) (runtime *agentRuntime, err error) {
@@ -4809,15 +4814,26 @@ func prepareAgentRuntimeWithOptions(ctx context.Context, configPath string, opti
 	if options.saveSessionSet {
 		saveSessions = options.saveSession
 	}
-	if options.resumeID != "" || options.continueSession {
+	if options.resumeID != "" || options.continueSession || prep.resumedSessionOverride != nil {
 		saveSessions = true
 	}
 	if saveSessions && !cfg.Sessions.SaveToolResults {
 		return nil, fmt.Errorf("resumable sessions require sessions.save_tool_results: true")
 	}
 	sessionStore := sessions.NewV2Store(cfg.Sessions.Dir)
-	if options.resumeID != "" || options.continueSession {
-		resumedSession, err = loadResumableSession(sessionStore, options.resumeID, options.continueSession)
+	resumeRequested := options.resumeID != "" || options.continueSession || prep.resumedSessionOverride != nil
+	if resumeRequested {
+		if prep.resumedSessionOverride != nil {
+			resumedSession = *prep.resumedSessionOverride
+			if strings.TrimSpace(resumedSession.ID) == "" {
+				return nil, fmt.Errorf("resumable session id is required")
+			}
+			if options.resumeID != "" && options.resumeID != resumedSession.ID {
+				return nil, fmt.Errorf("resumable session override id %q does not match requested session %q", resumedSession.ID, options.resumeID)
+			}
+		} else {
+			resumedSession, err = loadResumableSession(sessionStore, options.resumeID, options.continueSession)
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -4839,6 +4855,10 @@ func prepareAgentRuntimeWithOptions(ctx context.Context, configPath string, opti
 		}
 		applyResumeOptions(&options, resumedSession)
 		resumed = true
+	}
+	resumableSessionStore := sessionStore
+	if prep.resumedSessionOverride != nil {
+		resumableSessionStore = nil
 	}
 
 	resolved, err := cfg.ResolveModel(options.providerName, options.modelProfile)
@@ -4982,7 +5002,7 @@ func prepareAgentRuntimeWithOptions(ctx context.Context, configPath string, opti
 		instructionSources:    instructionSources,
 		resumed:               resumed,
 		resumableSession:      resumedSession,
-		resumableSessionStore: sessionStore,
+		resumableSessionStore: resumableSessionStore,
 		activeItemIDs:         copyStringSlice(resumedSession.ActiveHistory),
 		saveSessions:          saveSessions,
 		contextTracker:        contextTracker,
@@ -5494,7 +5514,8 @@ func (r serverAgentTurnRunner) prepareServerSessionRuntime(ctx context.Context, 
 	}, io.Discard, func() (string, error) {
 		return cwd, nil
 	}, r.program, runtimePreparationOptions{
-		enableSubagents: false,
+		enableSubagents:        false,
+		resumedSessionOverride: &session,
 	})
 }
 

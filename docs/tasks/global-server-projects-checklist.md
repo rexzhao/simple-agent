@@ -162,9 +162,9 @@ evidence 证明。
 ## Persistence
 
 - [x] durable project store 与 server registry 分离。
-- [ ] durable session store 与 server registry 分离。
+- [x] durable session store 与 server registry 分离。
 - [x] per-project directories 存在 user-level home namespace。
-- [ ] per-session directories 存在 user-level home namespace。
+- [x] per-session directories 存在 user-level home namespace。
 - [x] 默认不写 project repo。
 - [ ] transcript 使用 append-only JSONL。
 - [ ] 大内容存 hash-addressed blobs。
@@ -194,6 +194,17 @@ evidence 证明。
 
 ## Smoke Evidence
 
+- 2026-07-04 M21 server session home-store slice: `go test ./internal/cli ./internal/sessions` 通过；覆盖
+  `sessions.RootForHome(<home>)` 返回 `<home>/data/sessions`，`sai server` 即使 config 设置
+  `sessions.dir: custom-sessions` 也把 server-owned sessions 写入 `<home>/data/sessions`，并验证
+  config-relative `custom-sessions` 不含该 session；既有 project store 测试继续覆盖
+  `<home>/data/projects`。
+- 2026-07-04 M21 server session home-store slice: `go test ./internal/cli ./internal/sessions` 通过；覆盖
+  server-owned turn 使用请求中已加载的 `SessionV2` 作为 resumed session input，session 只存在于
+  home-backed server store / request session 而不存在于 config `sessions.dir` 时仍可运行；既有测试继续覆盖
+  每个 turn 重新读取 `session.config_path`。
+- 2026-07-04 M21 server session home-store slice: `go test ./...` 通过；`git diff --check` 通过（仅出现
+  工作区 LF/CRLF normalization warnings）。
 - 2026-07-04 M21 attach --new slice: `go test ./internal/cli` 通过；覆盖
   `attach --new --cwd` 先 `GET /projects` 做 nearest project discovery，再带 session metadata
   `POST /projects/{project_id}/sessions`，随后连接 `WS /sessions/{id}/stream`，prompt 继续用 bearer
@@ -309,4 +320,4 @@ evidence 证明。
   且两次 turn 之间重写 session `config_path` 下 provider `base_url` 后，第二个 fake provider server
   收到第二次请求；补充验证 `go test ./...` 通过，`git diff --check` 通过（仅出现工作区 LF/CRLF
   normalization warnings）。
-- Known limits: 当前 M21 slices 未实现 GUI server work 或 session data store home migration。
+- Known limits: 当前 M21 slices 未实现 GUI server work、shutdown semantics 或 transcript/blob migration。
