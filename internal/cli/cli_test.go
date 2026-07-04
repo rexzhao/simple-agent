@@ -7136,17 +7136,17 @@ func TestSendErrorDoesNotLeakPromptOrServerMessage(t *testing.T) {
 	assertCLIErrorOmits(t, stderr.String(), prompt, "assistant body secret", "tool body secret", "registry-token")
 }
 
-func TestBareSAIDefaultsToAttachNoServerHint(t *testing.T) {
+func TestAttachExplicitNoServerHint(t *testing.T) {
 	isolateCLIUserRegistry(t)
 	projectDir := t.TempDir()
 
 	var stdout, stderr bytes.Buffer
-	code := RunWithGetwd([]string{}, &stdout, &stderr, func() (string, error) {
+	code := RunWithGetwd([]string{"attach", "missing-session"}, &stdout, &stderr, func() (string, error) {
 		return projectDir, nil
 	})
 
 	if code != 1 {
-		t.Fatalf("bare sai code = %d, want 1", code)
+		t.Fatalf("attach code = %d, want 1", code)
 	}
 	if stdout.String() != "" {
 		t.Fatalf("stdout = %q, want empty", stdout.String())
@@ -7212,19 +7212,67 @@ func TestAttachExistingRejectsCWDAndConfigBeforeDiscovery(t *testing.T) {
 	}
 }
 
-func TestAttachWithoutSessionSelectsMostRecentlyUpdated(t *testing.T) {
+func TestAttachWithoutSessionSelectsMostRecentProjectSession(t *testing.T) {
+	runProjectScopedAttachSelection(t, []string{"attach"})
+}
+
+func TestBareDefaultAttachSelectsMostRecentProjectSession(t *testing.T) {
+	runProjectScopedAttachSelection(t, nil)
+}
+
+func runProjectScopedAttachSelection(t *testing.T, args []string) {
+	t.Helper()
 	registryPath := isolateCLIUserRegistry(t)
 	projectDir := t.TempDir()
+	childDir := filepath.Join(projectDir, "child")
+	if err := os.MkdirAll(childDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll(childDir) error = %v", err)
+	}
+	canonicalRoot, err := projectstore.CanonicalRoot(projectDir)
+	if err != nil {
+		t.Fatalf("CanonicalRoot(projectDir) error = %v", err)
+	}
+	canonicalChild, err := projectstore.CanonicalRoot(childDir)
+	if err != nil {
+		t.Fatalf("CanonicalRoot(childDir) error = %v", err)
+	}
+	authSeen := make(chan string, 2)
 	streamPathSeen := make(chan string, 1)
 	upgrader := websocket.Upgrader{}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/health":
 			writeCLIJSON(w, http.StatusOK, map[string]any{"status": "ok"})
-		case "/sessions":
+		case "/projects":
 			if r.Method != http.MethodGet {
-				t.Fatalf("sessions method = %s, want GET", r.Method)
+				t.Fatalf("projects method = %s, want GET", r.Method)
 			}
+			authSeen <- r.Header.Get("Authorization")
+			writeCLIJSON(w, http.StatusOK, map[string]any{
+				"projects": []map[string]any{
+					{
+						"id":           "project-parent",
+						"root":         canonicalRoot,
+						"display_name": "Parent",
+						"archived":     false,
+						"created_at":   time.Date(2026, 7, 2, 2, 0, 0, 0, time.UTC),
+						"updated_at":   time.Date(2026, 7, 2, 2, 0, 0, 0, time.UTC),
+					},
+					{
+						"id":           "project-current",
+						"root":         canonicalChild,
+						"display_name": "Current",
+						"archived":     false,
+						"created_at":   time.Date(2026, 7, 2, 2, 1, 0, 0, time.UTC),
+						"updated_at":   time.Date(2026, 7, 2, 2, 1, 0, 0, time.UTC),
+					},
+				},
+			})
+		case "/projects/project-current/sessions":
+			if r.Method != http.MethodGet {
+				t.Fatalf("project sessions method = %s, want GET", r.Method)
+			}
+			authSeen <- r.Header.Get("Authorization")
 			writeCLIJSON(w, http.StatusOK, map[string]any{
 				"sessions": []map[string]any{
 					{
@@ -7243,9 +7291,17 @@ func TestAttachWithoutSessionSelectsMostRecentlyUpdated(t *testing.T) {
 						"model_profile": "default",
 						"model_id":      "gpt-5.1",
 					},
+					{
+						"id":            "newest-created-session",
+						"created_at":    time.Date(2026, 7, 2, 3, 3, 0, 0, time.UTC),
+						"updated_at":    time.Date(2026, 7, 2, 3, 2, 0, 0, time.UTC),
+						"provider":      "openai",
+						"model_profile": "default",
+						"model_id":      "gpt-5.1",
+					},
 				},
 			})
-		case "/sessions/newer-session/stream":
+		case "/sessions/newest-created-session/stream":
 			conn, err := upgrader.Upgrade(w, r, nil)
 			if err != nil {
 				t.Fatalf("Upgrade(stream) error = %v", err)
@@ -7257,8 +7313,63 @@ func TestAttachWithoutSessionSelectsMostRecentlyUpdated(t *testing.T) {
 					return
 				}
 			}
+		case "/sessions":
+			t.Fatalf("bare attach should not use global session list, got %s %q", r.Method, r.URL.Path)
 		default:
 			t.Fatalf("unexpected path %q", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+	registerCLIFakeServer(t, registryPath, projectDir, server.URL, "registry-token")
+
+	var stdout, stderr bytes.Buffer
+	code := RunWithIO(args, strings.NewReader("/quit\n"), &stdout, &stderr, func() (string, error) {
+		return childDir, nil
+	})
+
+	if code != 0 {
+		t.Fatalf("attach code = %d, stderr = %s", code, stderr.String())
+	}
+	select {
+	case got := <-streamPathSeen:
+		if got != "/sessions/newest-created-session/stream" {
+			t.Fatalf("stream path = %q, want newer session", got)
+		}
+	default:
+		t.Fatal("session stream was not connected")
+	}
+	for i := 0; i < 2; i++ {
+		select {
+		case got := <-authSeen:
+			if got != "Bearer registry-token" {
+				t.Fatalf("Authorization = %q, want bearer registry token", got)
+			}
+		default:
+			t.Fatal("expected project-scoped request was not called")
+		}
+	}
+	if stdout.String() != "" {
+		t.Fatalf("stdout = %q, want empty", stdout.String())
+	}
+	assertCLIOutputContains(t, stderr.String(), "sai: attached to session newest-created-session")
+	assertCLIErrorOmits(t, stderr.String(), "registry-token")
+}
+
+func TestAttachWithoutSessionFailsWithoutRegisteredNearestProject(t *testing.T) {
+	registryPath := isolateCLIUserRegistry(t)
+	projectDir := t.TempDir()
+	projectsCalled := make(chan struct{}, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/health":
+			writeCLIJSON(w, http.StatusOK, map[string]any{"status": "ok"})
+		case r.URL.Path == "/projects" && r.Method == http.MethodGet:
+			projectsCalled <- struct{}{}
+			writeCLIJSON(w, http.StatusOK, map[string]any{"projects": []map[string]any{}})
+		case strings.HasPrefix(r.URL.Path, "/projects/"), strings.HasPrefix(r.URL.Path, "/sessions"):
+			t.Fatalf("attach should fail before global list or stream, got %s %q", r.Method, r.URL.Path)
+		default:
+			t.Fatalf("unexpected path %s %q", r.Method, r.URL.Path)
 		}
 	}))
 	defer server.Close()
@@ -7269,22 +7380,74 @@ func TestAttachWithoutSessionSelectsMostRecentlyUpdated(t *testing.T) {
 		return projectDir, nil
 	})
 
-	if code != 0 {
-		t.Fatalf("attach code = %d, stderr = %s", code, stderr.String())
-	}
-	select {
-	case got := <-streamPathSeen:
-		if got != "/sessions/newer-session/stream" {
-			t.Fatalf("stream path = %q, want newer session", got)
-		}
-	default:
-		t.Fatal("session stream was not connected")
+	if code != 1 {
+		t.Fatalf("attach code = %d, want 1", code)
 	}
 	if stdout.String() != "" {
 		t.Fatalf("stdout = %q, want empty", stdout.String())
 	}
-	assertCLIOutputContains(t, stderr.String(), "sai: attached to session newer-session")
-	assertCLIErrorOmits(t, stderr.String(), "registry-token")
+	select {
+	case <-projectsCalled:
+	default:
+		t.Fatal("GET /projects was not called")
+	}
+	assertCLIErrorContains(t, stderr.String(), "no registered project found from", `run "sai project create"`)
+}
+
+func TestAttachWithoutSessionFailsWhenProjectHasNoSessions(t *testing.T) {
+	registryPath := isolateCLIUserRegistry(t)
+	projectDir := t.TempDir()
+	canonicalRoot, err := projectstore.CanonicalRoot(projectDir)
+	if err != nil {
+		t.Fatalf("CanonicalRoot(projectDir) error = %v", err)
+	}
+	projectSessionsCalled := make(chan struct{}, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/health":
+			writeCLIJSON(w, http.StatusOK, map[string]any{"status": "ok"})
+		case r.URL.Path == "/projects" && r.Method == http.MethodGet:
+			writeCLIJSON(w, http.StatusOK, map[string]any{
+				"projects": []map[string]any{
+					{
+						"id":           "project-current",
+						"root":         canonicalRoot,
+						"display_name": "Current",
+						"archived":     false,
+						"created_at":   time.Date(2026, 7, 2, 2, 1, 0, 0, time.UTC),
+						"updated_at":   time.Date(2026, 7, 2, 2, 1, 0, 0, time.UTC),
+					},
+				},
+			})
+		case r.URL.Path == "/projects/project-current/sessions" && r.Method == http.MethodGet:
+			projectSessionsCalled <- struct{}{}
+			writeCLIJSON(w, http.StatusOK, map[string]any{"sessions": []map[string]any{}})
+		case r.URL.Path == "/sessions", strings.HasPrefix(r.URL.Path, "/sessions/"):
+			t.Fatalf("attach should not fall back to global sessions, got %s %q", r.Method, r.URL.Path)
+		default:
+			t.Fatalf("unexpected path %s %q", r.Method, r.URL.Path)
+		}
+	}))
+	defer server.Close()
+	registerCLIFakeServer(t, registryPath, projectDir, server.URL, "registry-token")
+
+	var stdout, stderr bytes.Buffer
+	code := RunWithIO([]string{"attach"}, strings.NewReader("/quit\n"), &stdout, &stderr, func() (string, error) {
+		return projectDir, nil
+	})
+
+	if code != 1 {
+		t.Fatalf("attach code = %d, want 1", code)
+	}
+	if stdout.String() != "" {
+		t.Fatalf("stdout = %q, want empty", stdout.String())
+	}
+	select {
+	case <-projectSessionsCalled:
+	default:
+		t.Fatal("GET /projects/project-current/sessions was not called")
+	}
+	assertCLIErrorContains(t, stderr.String(), "no sessions found for project project-current", "session create", "attach --new")
 }
 
 func TestAttachNewCreatesSessionStreamsAndSendsPrompts(t *testing.T) {
@@ -7927,7 +8090,7 @@ func TestClientCommandsNoServerHint(t *testing.T) {
 		getwd func() (string, error)
 	}{
 		{
-			args: []string{"attach"},
+			args: []string{"attach", "missing-session"},
 			getwd: func() (string, error) {
 				return projectDir, nil
 			},

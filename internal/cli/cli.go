@@ -345,7 +345,7 @@ const attachUsageText = `usage: sai attach [session-id]
 
 Discovers the nearest healthy local server, connects to a server-owned session
 stream, and reads prompts from stdin. Without a session id, sai attaches to the
-most recently updated server-owned session. --new creates a session first.
+most recently updated session in the nearest registered project. --new creates a session first.
 Existing-session attach rejects --cwd and global --config; existing sessions use
 their stored cwd and config.
 `
@@ -2150,9 +2150,18 @@ func attachCommand(ctx context.Context, args []string, configPath string, config
 		if sessionID == "" {
 			return fmt.Errorf("create session at %s: response missing session id", record.Addr)
 		}
-	} else {
+	} else if len(positionals) == 1 {
 		var err error
 		record, _, err = discoverClientServer(ctx, *cwdFlag, homePath, getwd)
+		if err != nil {
+			return err
+		}
+	} else {
+		effectiveCWD, err := resolveClientCWD(*cwdFlag, getwd)
+		if err != nil {
+			return err
+		}
+		record, err = ensureProjectCommandServer(ctx, configPath, homePath, effectiveCWD, program)
 		if err != nil {
 			return err
 		}
@@ -2165,7 +2174,7 @@ func attachCommand(ctx context.Context, args []string, configPath string, config
 		}
 	} else if !*newSession {
 		var err error
-		sessionID, err = mostRecentlyUpdatedSessionID(ctx, record.Addr)
+		sessionID, err = mostRecentProjectSessionID(ctx, record, *cwdFlag, getwd, program)
 		if err != nil {
 			return err
 		}
@@ -2182,22 +2191,33 @@ func attachCommand(ctx context.Context, args []string, configPath string, config
 	return runAttachREPL(ctx, record, sessionID, stdin, stdout, stderr, events, streamErrs)
 }
 
-func mostRecentlyUpdatedSessionID(ctx context.Context, addr string) (string, error) {
-	infos, err := localserver.ListSessions(ctx, addr, serverClientTimeout)
+func mostRecentProjectSessionID(ctx context.Context, record localserver.RegistryRecord, cwdFlag string, getwd func() (string, error), program string) (string, error) {
+	effectiveCWD, err := resolveClientCWD(cwdFlag, getwd)
+	if err != nil {
+		return "", err
+	}
+	project, ok, err := nearestProject(ctx, record, effectiveCWD)
+	if err != nil {
+		return "", err
+	}
+	if !ok {
+		return "", fmt.Errorf("no registered project found from %s; run %q", effectiveCWD, program+" project create")
+	}
+	infos, err := localserver.ListProjectSessionsWithToken(ctx, record.Addr, record.Token, project.ID, serverClientTimeout)
 	if err != nil {
 		return "", err
 	}
 	if len(infos) == 0 {
-		return "", fmt.Errorf("no server-owned sessions found; use \"sai attach --new\"")
+		return "", fmt.Errorf("no sessions found for project %s; create a session with %q or %q", project.ID, program+" session create", program+" attach --new")
 	}
 	latest := infos[0]
 	for _, info := range infos[1:] {
-		if info.UpdatedAt.After(latest.UpdatedAt) {
+		if info.UpdatedAt.After(latest.UpdatedAt) || (info.UpdatedAt.Equal(latest.UpdatedAt) && info.CreatedAt.After(latest.CreatedAt)) {
 			latest = info
 		}
 	}
 	if strings.TrimSpace(latest.ID) == "" {
-		return "", fmt.Errorf("most recently updated session response missing session id")
+		return "", fmt.Errorf("most recent project session response missing session id")
 	}
 	return latest.ID, nil
 }

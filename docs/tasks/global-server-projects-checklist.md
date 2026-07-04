@@ -62,7 +62,7 @@ evidence 证明。
 - [x] project name 只作为 display-only metadata。
 - [x] 从 effective cwd 向上查找 nearest registered ancestor。
 - [x] nested projects 允许并按 nearest ancestor 选择。
-- [ ] 无 project 时 bare attach 失败并提示创建 project。
+- [x] 无 project 时 bare attach 失败并提示创建 project。
 - [ ] 无 project 时 send/session create 失败并提示创建 project。
 - [x] `project list` 可列出 projects。
 - [x] `project show` 可按 current cwd discovery 或 explicit project id 展示 project。
@@ -106,14 +106,14 @@ evidence 证明。
 
 ## Attach and Send
 
-- [ ] bare `<cmd>` 等价 attach。
-- [ ] bare attach auto-start server。
-- [ ] bare attach 从 cwd 向上找到 project。
-- [ ] bare attach 无 project 时失败。
-- [ ] bare attach 当前 project 无 session 时失败。
-- [ ] bare attach 选择当前 project 最近 non-archived session。
+- [x] bare `<cmd>` 等价 attach。
+- [x] bare attach auto-start server。
+- [x] bare attach 从 cwd 向上找到 project。
+- [x] bare attach 无 project 时失败。
+- [x] bare attach 当前 project 无 session 时失败。
+- [x] bare attach 选择当前 project 最近 non-archived session。
 - [ ] `<cmd> --new` 创建 session 后 attach。
-- [ ] explicit session id 全局有效。
+- [x] explicit session id 全局有效。
 - [ ] 未指定 session id 时只从当前 project 选最近 non-archived session。
 - [ ] 多个 observers 可以 attach 同一 session。
 - [ ] 同一 session 同时只有一个 active turn。
@@ -201,6 +201,18 @@ evidence 证明。
 - 2026-07-04 M21 attach --new slice: `go test ./internal/cli` 通过；覆盖
   `attach --new` 无 nearest registered project 时在 create/attach 前失败，并提示
   `run "sai project create"`。
+- 2026-07-04 M21 bare attach project-scoped selection slice: `go test ./internal/cli` 通过；覆盖
+  `attach` 无 session id 和 bare `<cmd>` 默认 attach 都先 `GET /projects` 做 nearest ancestor
+  discovery，再 `GET /projects/{project_id}/sessions`，随后只连接当前 project 最近 session 的
+  `WS /sessions/{id}/stream`，并确认未使用 legacy global `GET /sessions`。
+- 2026-07-04 M21 bare attach project-scoped selection slice: `go test ./internal/cli` 通过；覆盖
+  无 nearest registered project 时失败并提示 `run "sai project create"`，且不会访问 global
+  `/sessions` list 或 stream。
+- 2026-07-04 M21 bare attach project-scoped selection slice: `go test ./internal/cli` 通过；覆盖
+  nearest project 存在但无 sessions 时提示 `session create` / `attach --new`，且不会 fallback 到
+  其他 project 或 global session。
+- 2026-07-04 M21 bare attach project-scoped selection slice: `go test ./...` 和 `git diff --check`
+  通过；`git diff --check` 仅报告工作区 LF/CRLF normalization warnings。
 - 2026-07-04 M21 send --new slice: `go test ./internal/cli` 通过；覆盖
   `send --new --cwd` 先 `GET /projects` 做 nearest project discovery，再带 created cwd/config/provider/model/
   tools/MCP/skills metadata `POST /projects/{project_id}/sessions`，随后用 bearer token
@@ -253,6 +265,6 @@ evidence 证明。
   `attach --new --cwd` 和 `send --new --cwd` 仍到达 discovery/create/send 路径。
 - 2026-07-04 M21 slice 8: `go test ./...` 通过。
 - 2026-07-04 M21 slice 8: `git diff --check` 通过（仅出现工作区 LF/CRLF normalization warnings）。
-- Known limits: 当前 M21 slices 未实现 attach/send project selection changes、
+- Known limits: 当前 M21 slices 未实现 send-side no-id/bare project selection changes、
   project remove/archive、GUI server work、session data store home
   migration 或 registry `base_url` schema rename。
