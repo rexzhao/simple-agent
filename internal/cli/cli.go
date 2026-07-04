@@ -124,6 +124,10 @@ func execute(ctx context.Context, program string, args []string, stdin io.Reader
 	if err != nil {
 		return err
 	}
+	homePath, err := localserver.ResolveHomeDir(program, rootArgs.homePath)
+	if err != nil {
+		return err
+	}
 	if rootArgs.command == "" {
 		if rootArgs.hasHelp {
 			printRootUsage(stdout)
@@ -132,7 +136,7 @@ func execute(ctx context.Context, program string, args []string, stdin io.Reader
 		var stop func()
 		ctx, stop = contextWithInterruptCancel(ctx, interrupts)
 		defer stop()
-		return attachCommand(ctx, rootArgs.commandArgs, stdin, stdout, stderr, getwd)
+		return attachCommand(ctx, rootArgs.commandArgs, homePath, stdin, stdout, stderr, getwd)
 	}
 	if rootArgs.command != "chat" {
 		var stop func()
@@ -144,7 +148,7 @@ func execute(ctx context.Context, program string, args []string, stdin io.Reader
 	case "help":
 		return helpCommand(rootArgs.commandArgs, stdout)
 	case "attach":
-		return attachCommand(ctx, rootArgs.commandArgs, stdin, stdout, stderr, getwd)
+		return attachCommand(ctx, rootArgs.commandArgs, homePath, stdin, stdout, stderr, getwd)
 	case "version":
 		return versionCommand(rootArgs.commandArgs, stdout)
 	case "config":
@@ -176,11 +180,11 @@ func execute(ctx context.Context, program string, args []string, stdin io.Reader
 	case "doctor":
 		return doctorCommand(rootArgs.commandArgs, rootArgs.configPath, stdout, getwd, program)
 	case "server":
-		return serverCommand(ctx, rootArgs.commandArgs, rootArgs.configPath, stdout, getwd, program)
+		return serverCommand(ctx, rootArgs.commandArgs, rootArgs.configPath, homePath, stdout, getwd, program)
 	case "status":
-		return statusCommand(ctx, rootArgs.commandArgs, stdout, getwd)
+		return statusCommand(ctx, rootArgs.commandArgs, homePath, stdout, getwd)
 	case "stop":
-		return stopCommand(ctx, rootArgs.commandArgs, stdout, getwd)
+		return stopCommand(ctx, rootArgs.commandArgs, homePath, stdout, getwd)
 	case "servers":
 		subcommand, subArgs, groupHelp, err := splitSubcommandArgs(rootArgs.commandArgs, nil, "sai help servers")
 		if err != nil {
@@ -193,9 +197,9 @@ func execute(ctx context.Context, program string, args []string, stdin io.Reader
 		if subcommand != "list" {
 			return usageError("usage: sai servers list", "", "sai help servers list")
 		}
-		return serversListCommand(ctx, subArgs, stdout)
+		return serversListCommand(ctx, subArgs, homePath, stdout)
 	case "send":
-		return sendCommand(ctx, rootArgs.commandArgs, stdout, getwd)
+		return sendCommand(ctx, rootArgs.commandArgs, homePath, stdout, getwd)
 	case "auth":
 		return authCommand(ctx, rootArgs.commandArgs, rootArgs.configPath, stdout, getwd, program)
 	case "tools":
@@ -235,9 +239,9 @@ func execute(ctx context.Context, program string, args []string, stdin io.Reader
 		}
 		switch subcommand {
 		case "list":
-			return sessionsListCommand(ctx, subArgs, stdout, getwd)
+			return sessionsListCommand(ctx, subArgs, homePath, stdout, getwd)
 		case "show":
-			return sessionsShowCommand(ctx, subArgs, stdout, getwd)
+			return sessionsShowCommand(ctx, subArgs, homePath, stdout, getwd)
 		case "delete":
 			return sessionsDeleteCommand(subArgs, rootArgs.configPath, stdout, getwd, program)
 		case "prune":
@@ -274,7 +278,7 @@ func contextWithInterruptCancel(ctx context.Context, interrupts <-chan struct{})
 	}
 }
 
-const rootUsageText = `usage: sai [--config file] [command] [args]
+const rootUsageText = `usage: sai [--home dir] [--config file] [command] [args]
 
 Commands:
   attach            Attach to a server-owned session
@@ -720,6 +724,7 @@ const (
 
 type rootArgs struct {
 	configPath  string
+	homePath    string
 	command     string
 	commandArgs []string
 	hasHelp     bool
@@ -728,6 +733,7 @@ type rootArgs struct {
 func splitRootArgs(args []string) (rootArgs, error) {
 	known := map[string]flagKind{
 		"config":         flagKindValue,
+		"home":           flagKindValue,
 		"provider":       flagKindValue,
 		"model":          flagKindValue,
 		"prompt":         flagKindValue,
@@ -777,12 +783,16 @@ func splitRootArgs(args []string) (rootArgs, error) {
 		if isHelpArg(arg) {
 			out.hasHelp = true
 		}
-		if name == "config" {
+		if name == "config" || name == "home" {
 			value, next, err := flagValue(args, i, name, hasInlineValue)
 			if err != nil {
 				return rootArgs{}, usageError(err.Error(), "", "sai help")
 			}
-			out.configPath = value
+			if name == "config" {
+				out.configPath = value
+			} else {
+				out.homePath = value
+			}
 			i = next
 			continue
 		}
@@ -811,12 +821,16 @@ func stripGlobalArgs(args rootArgs) (rootArgs, error) {
 			break
 		}
 		name, hasInlineValue := flagName(arg)
-		if isFlagArg(arg) && name == "config" {
+		if isFlagArg(arg) && (name == "config" || name == "home") {
 			value, next, err := flagValue(args.commandArgs, i, name, hasInlineValue)
 			if err != nil {
 				return rootArgs{}, usageError(err.Error(), "", "sai help")
 			}
-			args.configPath = value
+			if name == "config" {
+				args.configPath = value
+			} else {
+				args.homePath = value
+			}
 			i = next
 			continue
 		}
@@ -957,7 +971,7 @@ func doctorCommand(args []string, configPath string, stdout io.Writer, getwd fun
 	return nil
 }
 
-func serverCommand(ctx context.Context, args []string, configPath string, stdout io.Writer, getwd func() (string, error), program string) error {
+func serverCommand(ctx context.Context, args []string, configPath, homePath string, stdout io.Writer, getwd func() (string, error), program string) error {
 	flags := flag.NewFlagSet("sai server", flag.ContinueOnError)
 	background := flags.Bool("background", false, "start in the background")
 	backgroundChild := flags.Bool("background-child", false, "run as a background child")
@@ -989,7 +1003,15 @@ func serverCommand(ctx context.Context, args []string, configPath string, stdout
 		return err
 	}
 
-	launch, err := prepareServerLaunch(configPath, *cwdFlag, listen, getwd, program)
+	store, err := localserver.NewRegistryStoreForHome(homePath)
+	if err != nil {
+		return err
+	}
+	if done, err := checkExistingServerRecord(ctx, store, stdout); done || err != nil {
+		return err
+	}
+
+	launch, err := prepareServerLaunch(configPath, *cwdFlag, listen, homePath, store, getwd, program)
 	if err != nil {
 		return err
 	}
@@ -1009,9 +1031,11 @@ type serverLaunch struct {
 	SessionStore    *sessions.V2Store
 	SessionDefaults sessions.SessionV2
 	Program         string
+	HomePath        string
+	RegistryStore   localserver.RegistryStore
 }
 
-func prepareServerLaunch(configPath, cwdFlag, listen string, getwd func() (string, error), program string) (serverLaunch, error) {
+func prepareServerLaunch(configPath, cwdFlag, listen, homePath string, store localserver.RegistryStore, getwd func() (string, error), program string) (serverLaunch, error) {
 	cwd, err := resolveServerCWD(cwdFlag, getwd)
 	if err != nil {
 		return serverLaunch{}, err
@@ -1040,12 +1064,14 @@ func prepareServerLaunch(configPath, cwdFlag, listen string, getwd func() (strin
 		SessionStore:    sessions.NewV2Store(cfg.Sessions.Dir),
 		SessionDefaults: sessionDefaults,
 		Program:         program,
+		HomePath:        homePath,
+		RegistryStore:   store,
 	}, nil
 }
 
 func runServerForeground(ctx context.Context, launch serverLaunch, stdout io.Writer) error {
-	store := localserver.NewRegistryStore("")
-	if done, err := checkExistingServerRecord(ctx, store, launch.Identity, launch.Listen, stdout); done || err != nil {
+	store := launch.RegistryStore
+	if done, err := checkExistingServerRecord(ctx, store, stdout); done || err != nil {
 		return err
 	}
 
@@ -1100,8 +1126,8 @@ type backgroundServerProcess struct {
 var startBackgroundServerProcess = startBackgroundServerProcessDefault
 
 func runServerBackgroundParent(ctx context.Context, launch serverLaunch, stdout io.Writer) error {
-	store := localserver.NewRegistryStore("")
-	if done, err := checkExistingServerRecord(ctx, store, launch.Identity, launch.Listen, stdout); done || err != nil {
+	store := launch.RegistryStore
+	if done, err := checkExistingServerRecord(ctx, store, stdout); done || err != nil {
 		return err
 	}
 
@@ -1129,6 +1155,7 @@ func runServerBackgroundParent(ctx context.Context, launch serverLaunch, stdout 
 
 func backgroundServerChildArgs(launch serverLaunch) []string {
 	return []string{
+		"--home", launch.HomePath,
 		"--config", launch.ConfigPath,
 		"server",
 		"--background-child",
@@ -1235,60 +1262,50 @@ func findBackgroundReadyRecord(ctx context.Context, store localserver.RegistrySt
 	if err != nil {
 		return localserver.RegistryRecord{}, false, err
 	}
-	for _, record := range records {
-		normalized, err := localserver.CanonicalizeRegistryRecord(record)
-		if err != nil {
-			return localserver.RegistryRecord{}, false, err
-		}
-		if !identity.Matches(normalized) || normalized.RequestedListen != listen {
-			continue
-		}
-		if err := localserver.CheckHealth(ctx, normalized.Addr, 300*time.Millisecond); err != nil {
-			if ctxErr := ctx.Err(); ctxErr != nil {
-				return localserver.RegistryRecord{}, false, ctxErr
-			}
-			continue
-		}
-		return normalized, true, nil
+	_ = identity
+	if len(records) == 0 {
+		return localserver.RegistryRecord{}, false, nil
 	}
-	return localserver.RegistryRecord{}, false, nil
+	normalized, err := localserver.CanonicalizeRegistryRecord(records[len(records)-1])
+	if err != nil {
+		return localserver.RegistryRecord{}, false, err
+	}
+	if normalized.RequestedListen != listen {
+		return localserver.RegistryRecord{}, false, nil
+	}
+	if err := localserver.CheckHealth(ctx, normalized.Addr, 300*time.Millisecond); err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return localserver.RegistryRecord{}, false, ctxErr
+		}
+		return localserver.RegistryRecord{}, false, nil
+	}
+	return normalized, true, nil
 }
 
-func checkExistingServerRecord(ctx context.Context, store localserver.RegistryStore, identity localserver.RegistryIdentity, listen string, stdout io.Writer) (bool, error) {
+func checkExistingServerRecord(ctx context.Context, store localserver.RegistryStore, stdout io.Writer) (bool, error) {
 	records, err := store.Load()
 	if err != nil {
 		return false, err
 	}
 
-	foundStale := false
-	for _, record := range records {
-		normalized, err := localserver.CanonicalizeRegistryRecord(record)
-		if err != nil {
+	if len(records) == 0 {
+		return false, nil
+	}
+	normalized, err := localserver.CanonicalizeRegistryRecord(records[len(records)-1])
+	if err != nil {
+		return false, err
+	}
+	if err := localserver.CheckHealth(ctx, normalized.Addr, 300*time.Millisecond); err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return false, ctxErr
+		}
+		if _, err := store.RemoveIdentity(normalized.Identity()); err != nil {
 			return false, err
 		}
-		if !identity.Matches(normalized) {
-			continue
-		}
-		if err := localserver.CheckHealth(ctx, normalized.Addr, 300*time.Millisecond); err != nil {
-			if ctxErr := ctx.Err(); ctxErr != nil {
-				return false, ctxErr
-			}
-			foundStale = true
-			continue
-		}
-		if normalized.RequestedListen == listen {
-			_, err := fmt.Fprintf(stdout, "SERVER_ALREADY_RUNNING\taddr=%s\tpid=%d\n", normalized.Addr, normalized.PID)
-			return true, err
-		}
-		return false, fmt.Errorf("server already running for cwd %q and config %q at %s pid %d with requested listen %q; requested %q", identity.CWD, identity.ConfigPath, normalized.Addr, normalized.PID, normalized.RequestedListen, listen)
+		return false, nil
 	}
-
-	if foundStale {
-		if _, err := store.RemoveIdentity(identity); err != nil {
-			return false, err
-		}
-	}
-	return false, nil
+	_, err = fmt.Fprintf(stdout, "SERVER_ALREADY_RUNNING\taddr=%s\tpid=%d\n", normalized.Addr, normalized.PID)
+	return true, err
 }
 
 func serverListenAddress(portSet bool, port int, listen string) (string, error) {
@@ -1382,7 +1399,7 @@ func serverSessionDefaultsFromConfig(cfg *config.Config, cwd string) (sessions.S
 	}, nil
 }
 
-func statusCommand(ctx context.Context, args []string, stdout io.Writer, getwd func() (string, error)) error {
+func statusCommand(ctx context.Context, args []string, homePath string, stdout io.Writer, getwd func() (string, error)) error {
 	flags := flag.NewFlagSet("sai status", flag.ContinueOnError)
 	cwdFlag := flags.String("cwd", "", "discovery working directory")
 	positionals, done, err := parseCommandFlagArgs(flags, args, stdout, printStatusUsage, "sai help status")
@@ -1397,7 +1414,10 @@ func statusCommand(ctx context.Context, args []string, stdout io.Writer, getwd f
 	if err != nil {
 		return err
 	}
-	store := localserver.NewRegistryStore("")
+	store, err := localserver.NewRegistryStoreForHome(homePath)
+	if err != nil {
+		return err
+	}
 	discovery, err := localserver.DiscoverHealthy(ctx, store, cwd, serverClientTimeout)
 	if err != nil {
 		return err
@@ -1413,7 +1433,7 @@ func statusCommand(ctx context.Context, args []string, stdout io.Writer, getwd f
 	return printServerStatus(stdout, status)
 }
 
-func stopCommand(ctx context.Context, args []string, stdout io.Writer, getwd func() (string, error)) error {
+func stopCommand(ctx context.Context, args []string, homePath string, stdout io.Writer, getwd func() (string, error)) error {
 	flags := flag.NewFlagSet("sai stop", flag.ContinueOnError)
 	cwdFlag := flags.String("cwd", "", "discovery working directory")
 	positionals, done, err := parseCommandFlagArgs(flags, args, stdout, printStopUsage, "sai help stop")
@@ -1428,7 +1448,10 @@ func stopCommand(ctx context.Context, args []string, stdout io.Writer, getwd fun
 	if err != nil {
 		return err
 	}
-	store := localserver.NewRegistryStore("")
+	store, err := localserver.NewRegistryStoreForHome(homePath)
+	if err != nil {
+		return err
+	}
 	discovery, err := localserver.DiscoverHealthy(ctx, store, cwd, serverClientTimeout)
 	if err != nil {
 		return err
@@ -1468,7 +1491,7 @@ func stopCommand(ctx context.Context, args []string, stdout io.Writer, getwd fun
 	return err
 }
 
-func serversListCommand(ctx context.Context, args []string, stdout io.Writer) error {
+func serversListCommand(ctx context.Context, args []string, homePath string, stdout io.Writer) error {
 	flags := flag.NewFlagSet("sai servers list", flag.ContinueOnError)
 	positionals, done, err := parseCommandFlagArgs(flags, args, stdout, printServersListUsage, "sai help servers list")
 	if done || err != nil {
@@ -1478,7 +1501,10 @@ func serversListCommand(ctx context.Context, args []string, stdout io.Writer) er
 		return usageError("usage: sai servers list", "", "sai help servers list")
 	}
 
-	store := localserver.NewRegistryStore("")
+	store, err := localserver.NewRegistryStoreForHome(homePath)
+	if err != nil {
+		return err
+	}
 	records, err := store.List()
 	if err != nil {
 		return err
@@ -1512,7 +1538,7 @@ func serversListCommand(ctx context.Context, args []string, stdout io.Writer) er
 	return nil
 }
 
-func attachCommand(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer, getwd func() (string, error)) error {
+func attachCommand(ctx context.Context, args []string, homePath string, stdin io.Reader, stdout, stderr io.Writer, getwd func() (string, error)) error {
 	flags := flag.NewFlagSet("sai attach", flag.ContinueOnError)
 	cwdFlag := flags.String("cwd", "", "discovery working directory")
 	newSession := flags.Bool("new", false, "create a new server-owned session before attaching")
@@ -1527,7 +1553,7 @@ func attachCommand(ctx context.Context, args []string, stdin io.Reader, stdout, 
 		return usageError("usage: sai attach [session-id]", "", "sai help attach")
 	}
 
-	record, _, err := discoverClientServer(ctx, *cwdFlag, getwd)
+	record, _, err := discoverClientServer(ctx, *cwdFlag, homePath, getwd)
 	if err != nil {
 		return err
 	}
@@ -1800,7 +1826,7 @@ func writeAttachStreamEvent(stdout, stderr io.Writer, event localserver.SessionS
 	return nil
 }
 
-func sendCommand(ctx context.Context, args []string, stdout io.Writer, getwd func() (string, error)) error {
+func sendCommand(ctx context.Context, args []string, homePath string, stdout io.Writer, getwd func() (string, error)) error {
 	flags := flag.NewFlagSet("sai send", flag.ContinueOnError)
 	cwdFlag := flags.String("cwd", "", "discovery working directory")
 	newSession := flags.Bool("new", false, "create a new server-owned session before sending")
@@ -1819,7 +1845,7 @@ func sendCommand(ctx context.Context, args []string, stdout io.Writer, getwd fun
 		return usageError("--prompt must be a non-empty string", "", "sai help send")
 	}
 
-	record, _, err := discoverClientServer(ctx, *cwdFlag, getwd)
+	record, _, err := discoverClientServer(ctx, *cwdFlag, homePath, getwd)
 	if err != nil {
 		return err
 	}
@@ -1845,12 +1871,15 @@ func sendCommand(ctx context.Context, args []string, stdout io.Writer, getwd fun
 	return printSessionSendResult(stdout, sessionID, result)
 }
 
-func discoverClientServer(ctx context.Context, cwdFlag string, getwd func() (string, error)) (localserver.RegistryRecord, string, error) {
+func discoverClientServer(ctx context.Context, cwdFlag, homePath string, getwd func() (string, error)) (localserver.RegistryRecord, string, error) {
 	cwd, err := resolveClientCWD(cwdFlag, getwd)
 	if err != nil {
 		return localserver.RegistryRecord{}, "", err
 	}
-	store := localserver.NewRegistryStore("")
+	store, err := localserver.NewRegistryStoreForHome(homePath)
+	if err != nil {
+		return localserver.RegistryRecord{}, "", err
+	}
 	discovery, err := localserver.DiscoverHealthy(ctx, store, cwd, serverClientTimeout)
 	if err != nil {
 		return localserver.RegistryRecord{}, "", err
@@ -2489,7 +2518,7 @@ func toolsListCommand(args []string, stdout io.Writer) error {
 	return nil
 }
 
-func sessionsListCommand(ctx context.Context, args []string, stdout io.Writer, getwd func() (string, error)) error {
+func sessionsListCommand(ctx context.Context, args []string, homePath string, stdout io.Writer, getwd func() (string, error)) error {
 	flags := flag.NewFlagSet("sai sessions list", flag.ContinueOnError)
 	cwdFlag := flags.String("cwd", "", "discovery working directory")
 	positionals, done, err := parseCommandFlagArgs(flags, args, stdout, printSessionsListUsage, "sai help sessions list")
@@ -2500,7 +2529,7 @@ func sessionsListCommand(ctx context.Context, args []string, stdout io.Writer, g
 		return usageError("usage: sai sessions list [--cwd path]", "", "sai help sessions list")
 	}
 
-	record, _, err := discoverClientServer(ctx, *cwdFlag, getwd)
+	record, _, err := discoverClientServer(ctx, *cwdFlag, homePath, getwd)
 	if err != nil {
 		return err
 	}
@@ -2516,7 +2545,7 @@ func sessionsListCommand(ctx context.Context, args []string, stdout io.Writer, g
 	return nil
 }
 
-func sessionsShowCommand(ctx context.Context, args []string, stdout io.Writer, getwd func() (string, error)) error {
+func sessionsShowCommand(ctx context.Context, args []string, homePath string, stdout io.Writer, getwd func() (string, error)) error {
 	flags := flag.NewFlagSet("sai sessions show", flag.ContinueOnError)
 	cwdFlag := flags.String("cwd", "", "discovery working directory")
 	positionals, done, err := parseCommandFlagArgs(flags, args, stdout, printSessionsShowUsage, "sai help sessions show")
@@ -2527,7 +2556,7 @@ func sessionsShowCommand(ctx context.Context, args []string, stdout io.Writer, g
 		return usageError("usage: sai sessions show [--cwd path] <id>", "", "sai help sessions show")
 	}
 
-	record, _, err := discoverClientServer(ctx, *cwdFlag, getwd)
+	record, _, err := discoverClientServer(ctx, *cwdFlag, homePath, getwd)
 	if err != nil {
 		return err
 	}

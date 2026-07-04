@@ -11,27 +11,27 @@ evidence 证明。
 
 ## Home Namespace and Command Name
 
-- [ ] 实现 `--home PATH` 最高优先级。
-- [ ] 从 raw basename 派生环境变量名。
-- [ ] 去除 `.exe` 等平台后缀后再规范化 env var 名。
-- [ ] 将非 `[A-Z0-9]` 字符规范化为 `_`。
-- [ ] 合并连续 `_`，trim 首尾 `_`，追加 `_HOME`。
-- [ ] 覆盖 `sai.exe -> SAI_HOME`。
-- [ ] 覆盖 `simple-agent.exe -> SIMPLE_AGENT_HOME`。
-- [ ] 覆盖 `my.tool -> MY_TOOL_HOME`。
-- [ ] 规范化为空时回退内置默认 user-level directory。
-- [ ] 验证不同 `--home` directories 是独立 singleton namespaces。
+- [x] 实现 `--home PATH` 最高优先级。
+- [x] 从 raw basename 派生环境变量名。
+- [x] 去除 `.exe` 等平台后缀后再规范化 env var 名。
+- [x] 将非 `[A-Z0-9]` 字符规范化为 `_`。
+- [x] 合并连续 `_`，trim 首尾 `_`，追加 `_HOME`。
+- [x] 覆盖 `sai.exe -> SAI_HOME`。
+- [x] 覆盖 `simple-agent.exe -> SIMPLE_AGENT_HOME`。
+- [x] 覆盖 `my.tool -> MY_TOOL_HOME`。
+- [x] 规范化为空时回退内置默认 user-level directory。
+- [x] 验证不同 `--home` directories 是独立 singleton namespaces。
 
 ## Singleton Server and Registry
 
-- [ ] registry 默认写入 user-level home namespace。
+- [x] registry 默认写入 user-level home namespace。
 - [ ] durable data store 默认写入 user-level home namespace。
 - [ ] registry 记录 `pid`、`base_url`、`token`、`version` 和 `started_at`。
-- [ ] client 复用 registry 前 health-check。
-- [ ] stale registry health-check 失败后可覆盖。
+- [x] client 复用 registry 前 health-check。
+- [x] stale registry health-check 失败后可覆盖。
 - [ ] file lock 防止 auto-start / background start 并发双启动。
 - [ ] `<cmd> server` 前台启动 namespace singleton，不绑定 cwd/project。
-- [ ] 已有健康 server 时 `<cmd> server` 提示 already running 并退出 0。
+- [x] 已有健康 server 时 `<cmd> server` 提示 already running 并退出 0。
 - [ ] `<cmd> server --background` 显式后台启动。
 - [ ] `<cmd> server status` 不 auto-start。
 - [ ] `<cmd> server stop` 不 auto-start。
@@ -172,8 +172,8 @@ evidence 证明。
 
 ## Validation
 
-- [ ] 单元/集成测试覆盖 singleton per home namespace。
-- [ ] 测试覆盖 different home dirs independent。
+- [x] 单元/集成测试覆盖 singleton per home namespace。
+- [x] 测试覆盖 different home dirs independent。
 - [ ] 测试覆盖 explicit project create。
 - [ ] 测试覆盖 explicit session create。
 - [ ] 测试覆盖 nested discovery。
@@ -185,5 +185,17 @@ evidence 证明。
 - [ ] 测试覆盖 interrupted recovery。
 - [ ] 测试覆盖 JSONL/blob pagination。
 - [ ] `go test ./...` 通过。
-- [ ] `git diff --check` 通过。
-- [ ] 在本文件追加 smoke evidence，包含命令、日期、结果和任何已知限制。
+- [x] `git diff --check` 通过。
+- [x] 在本文件追加 smoke evidence，包含命令、日期、结果和任何已知限制。
+
+## Smoke Evidence
+
+- 2026-07-04 M21 slice 1: `go test ./internal/server` 通过；覆盖 home env var derivation、singleton registry
+  upsert/discovery/stale cleanup。
+- 2026-07-04 M21 slice 1: `go test ./internal/cli` 通过；覆盖 `--home`/env priority、different home
+  registry independence、background child `--home` preservation、same-home singleton already-running behavior。
+- 2026-07-04 M21 slice 1 reviewer fix: `go test ./internal/cli` 通过；覆盖 existing singleton 在 cwd
+  config missing 和 requested listen 不同时仍返回 `SERVER_ALREADY_RUNNING` 并退出 0。
+- 2026-07-04 M21 slice 1: `git diff --check` 通过。
+- Known limits: 本 slice 未实现 project/session lifecycle、explicit project/session API path rework、`chat`
+  removal、durable data store home migration 或 registry `base_url` schema rename。

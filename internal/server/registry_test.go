@@ -22,8 +22,70 @@ func TestDefaultRegistryPathUsesProjectSpecificFile(t *testing.T) {
 	if got, want := filepath.Base(path), defaultRegistryFileName; got != want {
 		t.Fatalf("DefaultRegistryPath() base = %q, want %q", got, want)
 	}
-	if got, want := filepath.Base(filepath.Dir(path)), defaultRegistryDirName; got != want {
-		t.Fatalf("DefaultRegistryPath() dir = %q, want %q", got, want)
+	if got, want := filepath.Base(filepath.Dir(path)), registrySubdirName; got != want {
+		t.Fatalf("DefaultRegistryPath() registry dir = %q, want %q", got, want)
+	}
+	if got, want := filepath.Base(filepath.Dir(filepath.Dir(path))), defaultRegistryDirName; got != want {
+		t.Fatalf("DefaultRegistryPath() home dir = %q, want %q", got, want)
+	}
+}
+
+func TestHomeEnvVarNameFromProgramBasename(t *testing.T) {
+	tests := []struct {
+		program string
+		want    string
+	}{
+		{program: "sai.exe", want: "SAI_HOME"},
+		{program: filepath.Join("bin", "simple-agent.exe"), want: "SIMPLE_AGENT_HOME"},
+		{program: "my.tool", want: "MY_TOOL_HOME"},
+		{program: "my---tool", want: "MY_TOOL_HOME"},
+		{program: "...", want: ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.program, func(t *testing.T) {
+			if got := HomeEnvVarName(tt.program); got != tt.want {
+				t.Fatalf("HomeEnvVarName(%q) = %q, want %q", tt.program, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestResolveHomeDirPriority(t *testing.T) {
+	root := t.TempDir()
+	defaultRoot := filepath.Join(root, "default")
+	envRoot := filepath.Join(root, "env")
+	flagRoot := filepath.Join(root, "flag")
+	t.Setenv("APPDATA", filepath.Join(defaultRoot, "appdata"))
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(defaultRoot, "xdg-config"))
+	t.Setenv("HOME", filepath.Join(defaultRoot, "home"))
+	t.Setenv("SIMPLE_AGENT_HOME", envRoot)
+
+	got, err := ResolveHomeDir("simple-agent.exe", flagRoot)
+	if err != nil {
+		t.Fatalf("ResolveHomeDir(--home) error = %v", err)
+	}
+	if got != mustCanonicalPath(t, flagRoot) {
+		t.Fatalf("ResolveHomeDir(--home) = %q, want %q", got, mustCanonicalPath(t, flagRoot))
+	}
+
+	got, err = ResolveHomeDir("simple-agent.exe", "")
+	if err != nil {
+		t.Fatalf("ResolveHomeDir(env) error = %v", err)
+	}
+	if got != mustCanonicalPath(t, envRoot) {
+		t.Fatalf("ResolveHomeDir(env) = %q, want %q", got, mustCanonicalPath(t, envRoot))
+	}
+
+	got, err = ResolveHomeDir("...", "")
+	if err != nil {
+		t.Fatalf("ResolveHomeDir(default) error = %v", err)
+	}
+	wantDefault, err := DefaultHomeDir()
+	if err != nil {
+		t.Fatalf("DefaultHomeDir() error = %v", err)
+	}
+	if got != wantDefault {
+		t.Fatalf("ResolveHomeDir(default) = %q, want %q", got, wantDefault)
 	}
 }
 
@@ -61,7 +123,7 @@ func TestRegistryStoreLoadMissingAndCorrupt(t *testing.T) {
 	}
 }
 
-func TestRegistryStoreUpsertReplacesByCanonicalIdentity(t *testing.T) {
+func TestRegistryStoreUpsertReplacesSingleton(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "servers.json")
 	store := NewRegistryStore(path)
 	root := t.TempDir()
@@ -94,8 +156,8 @@ func TestRegistryStoreUpsertReplacesByCanonicalIdentity(t *testing.T) {
 	if err != nil {
 		t.Fatalf("List() error = %v", err)
 	}
-	if len(records) != 2 {
-		t.Fatalf("List() returned %d records, want 2: %#v", len(records), records)
+	if len(records) != 1 {
+		t.Fatalf("List() returned %d records, want 1 singleton: %#v", len(records), records)
 	}
 	if records[0].Addr != replacement.Addr || records[0].PID != replacement.PID || records[0].Token != replacement.Token {
 		t.Fatalf("first record = %#v, want replacement values", records[0])
@@ -110,9 +172,6 @@ func TestRegistryStoreUpsertReplacesByCanonicalIdentity(t *testing.T) {
 	if !wantIdentity.Matches(records[0]) {
 		t.Fatalf("record identity = %#v, want %#v", records[0].Identity(), wantIdentity)
 	}
-	if records[1].ConfigPath != mustCanonicalPath(t, otherConfig) {
-		t.Fatalf("second record config = %q, want other config", records[1].ConfigPath)
-	}
 }
 
 func TestRegistryStoreRemove(t *testing.T) {
@@ -125,7 +184,6 @@ func TestRegistryStoreRemove(t *testing.T) {
 
 	if err := store.Save([]RegistryRecord{
 		testRegistryRecord(project, config, "127.0.0.1:1001", 1001, "token-one"),
-		testRegistryRecord(project, otherConfig, "127.0.0.1:1002", 1002, "token-two"),
 	}); err != nil {
 		t.Fatalf("Save() error = %v", err)
 	}
@@ -141,10 +199,15 @@ func TestRegistryStoreRemove(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
 	}
-	if len(records) != 1 || records[0].ConfigPath != mustCanonicalPath(t, otherConfig) {
-		t.Fatalf("records after remove = %#v, want only other config", records)
+	if len(records) != 0 {
+		t.Fatalf("records after remove = %#v, want empty", records)
 	}
 
+	if err := store.Save([]RegistryRecord{
+		testRegistryRecord(project, otherConfig, "127.0.0.1:1002", 1002, "token-two"),
+	}); err != nil {
+		t.Fatalf("Save(other) error = %v", err)
+	}
 	removed, err = store.Remove(project, config)
 	if err != nil {
 		t.Fatalf("Remove() missing error = %v", err)
@@ -286,7 +349,7 @@ func TestNearestAncestorRecord(t *testing.T) {
 	}
 }
 
-func TestDiscoverHealthyRemovesNearestStaleAndReturnsParent(t *testing.T) {
+func TestDiscoverHealthyChecksSingletonAndRemovesStale(t *testing.T) {
 	root := t.TempDir()
 	project := filepath.Join(root, "project")
 	child := filepath.Join(project, "internal", "cli")
@@ -323,11 +386,33 @@ func TestDiscoverHealthyRemovesNearestStaleAndReturnsParent(t *testing.T) {
 	store := NewRegistryStore(filepath.Join(t.TempDir(), "servers.json"))
 	rootRecord := testRegistryRecord(root, filepath.Join(root, ".agents", "sai.yaml"), process.Addr(), os.Getpid(), "root")
 	projectRecord := testRegistryRecord(project, filepath.Join(project, ".agents", "sai.yaml"), "127.0.0.1:0", 999999, "stale")
-	if err := store.Save([]RegistryRecord{rootRecord, projectRecord}); err != nil {
-		t.Fatalf("Save() error = %v", err)
+	if err := store.Save([]RegistryRecord{projectRecord}); err != nil {
+		t.Fatalf("Save(stale) error = %v", err)
 	}
 
 	result, err := DiscoverHealthy(context.Background(), store, child, 100*time.Millisecond)
+	if err != nil {
+		t.Fatalf("DiscoverHealthy(stale) error = %v", err)
+	}
+	if result.Found {
+		t.Fatal("DiscoverHealthy(stale) found = true, want false")
+	}
+	if result.StaleRemoved != 1 {
+		t.Fatalf("DiscoverHealthy(stale) StaleRemoved = %d, want 1", result.StaleRemoved)
+	}
+	records, err := store.List()
+	if err != nil {
+		t.Fatalf("List() after stale discovery error = %v", err)
+	}
+	if len(records) != 0 {
+		t.Fatalf("registry records after stale discovery = %#v, want empty", records)
+	}
+
+	if err := store.Save([]RegistryRecord{rootRecord}); err != nil {
+		t.Fatalf("Save(root) error = %v", err)
+	}
+
+	result, err = DiscoverHealthy(context.Background(), store, child, 100*time.Millisecond)
 	if err != nil {
 		t.Fatalf("DiscoverHealthy() error = %v", err)
 	}
@@ -337,11 +422,11 @@ func TestDiscoverHealthyRemovesNearestStaleAndReturnsParent(t *testing.T) {
 	if result.Record.Token != "root" {
 		t.Fatalf("DiscoverHealthy() record = %#v, want root server", result.Record)
 	}
-	if result.StaleRemoved != 1 {
-		t.Fatalf("DiscoverHealthy() StaleRemoved = %d, want 1", result.StaleRemoved)
+	if result.StaleRemoved != 0 {
+		t.Fatalf("DiscoverHealthy() StaleRemoved = %d, want 0", result.StaleRemoved)
 	}
 
-	records, err := store.List()
+	records, err = store.List()
 	if err != nil {
 		t.Fatalf("List() error = %v", err)
 	}

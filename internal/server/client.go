@@ -74,16 +74,16 @@ type SessionCompactResult struct {
 	LastSeq       int64  `json:"last_seq"`
 }
 
-// DiscoveryResult reports the nearest healthy server, plus stale records removed
-// while searching from the requested cwd upward.
+// DiscoveryResult reports the active healthy server, plus stale records removed
+// while checking the selected home namespace.
 type DiscoveryResult struct {
 	Record       RegistryRecord
 	Found        bool
 	StaleRemoved int
 }
 
-// DiscoverHealthy loads the registry, checks ancestor records nearest-first, and
-// removes stale ancestor records before continuing the search.
+// DiscoverHealthy loads the registry, checks the singleton record, and removes
+// it when stale. startCWD is kept for caller compatibility.
 func DiscoverHealthy(ctx context.Context, store RegistryStore, startCWD string, timeout time.Duration) (DiscoveryResult, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -93,30 +93,31 @@ func DiscoverHealthy(ctx context.Context, store RegistryStore, startCWD string, 
 	if err != nil {
 		return DiscoveryResult{}, err
 	}
-	matches, err := AncestorRecords(startCWD, records)
-	if err != nil {
-		return DiscoveryResult{}, err
-	}
+	_ = startCWD
 
 	var result DiscoveryResult
-	for _, record := range matches {
-		if err := CheckHealth(ctx, record.Addr, timeout); err != nil {
-			if ctxErr := ctx.Err(); ctxErr != nil {
-				return result, ctxErr
-			}
-			removed, removeErr := store.RemoveIdentity(record.Identity())
-			if removeErr != nil {
-				return result, removeErr
-			}
-			if removed {
-				result.StaleRemoved++
-			}
-			continue
-		}
-		result.Record = record
-		result.Found = true
+	if len(records) == 0 {
 		return result, nil
 	}
+	record, err := CanonicalizeRegistryRecord(records[len(records)-1])
+	if err != nil {
+		return result, err
+	}
+	if err := CheckHealth(ctx, record.Addr, timeout); err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return result, ctxErr
+		}
+		removed, removeErr := store.RemoveIdentity(record.Identity())
+		if removeErr != nil {
+			return result, removeErr
+		}
+		if removed {
+			result.StaleRemoved++
+		}
+		return result, nil
+	}
+	result.Record = record
+	result.Found = true
 	return result, nil
 }
 

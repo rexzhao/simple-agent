@@ -15,7 +15,8 @@ import (
 
 const (
 	defaultRegistryDirName  = "sai"
-	defaultRegistryFileName = "servers.json"
+	registrySubdirName      = "server"
+	defaultRegistryFileName = "registry.json"
 	registryTokenBytes      = 32
 )
 
@@ -49,11 +50,80 @@ func NewRegistryStore(path string) RegistryStore {
 
 // DefaultRegistryPath returns the per-user server registry file path.
 func DefaultRegistryPath() (string, error) {
+	home, err := DefaultHomeDir()
+	if err != nil {
+		return "", err
+	}
+	return RegistryPathForHome(home)
+}
+
+// DefaultHomeDir returns the built-in user-level home namespace directory.
+func DefaultHomeDir() (string, error) {
 	dir, err := os.UserConfigDir()
 	if err != nil {
 		return "", fmt.Errorf("find user config dir: %w", err)
 	}
-	return filepath.Join(dir, defaultRegistryDirName, defaultRegistryFileName), nil
+	return filepath.Join(dir, defaultRegistryDirName), nil
+}
+
+// RegistryPathForHome returns the singleton registry file path for a home namespace.
+func RegistryPathForHome(home string) (string, error) {
+	home, err := CanonicalPath(home)
+	if err != nil {
+		return "", fmt.Errorf("resolve home directory: %w", err)
+	}
+	return filepath.Join(home, registrySubdirName, defaultRegistryFileName), nil
+}
+
+// NewRegistryStoreForHome returns a registry store rooted in a home namespace.
+func NewRegistryStoreForHome(home string) (RegistryStore, error) {
+	path, err := RegistryPathForHome(home)
+	if err != nil {
+		return RegistryStore{}, err
+	}
+	return NewRegistryStore(path), nil
+}
+
+// HomeEnvVarName derives the home override environment variable from raw argv[0].
+func HomeEnvVarName(argv0 string) string {
+	base := filepath.Base(strings.TrimSpace(argv0))
+	if ext := filepath.Ext(base); strings.EqualFold(ext, ".exe") {
+		base = base[:len(base)-len(ext)]
+	}
+	base = strings.ToUpper(base)
+
+	var out strings.Builder
+	previousUnderscore := false
+	for _, r := range base {
+		isASCIIAlnum := r >= 'A' && r <= 'Z' || r >= '0' && r <= '9'
+		if !isASCIIAlnum {
+			if !previousUnderscore {
+				out.WriteByte('_')
+				previousUnderscore = true
+			}
+			continue
+		}
+		out.WriteRune(r)
+		previousUnderscore = false
+	}
+	normalized := strings.Trim(out.String(), "_")
+	if normalized == "" {
+		return ""
+	}
+	return normalized + "_HOME"
+}
+
+// ResolveHomeDir applies --home, derived env var, then the built-in default.
+func ResolveHomeDir(argv0, explicitHome string) (string, error) {
+	if strings.TrimSpace(explicitHome) != "" {
+		return CanonicalPath(explicitHome)
+	}
+	if envName := HomeEnvVarName(argv0); envName != "" {
+		if value := strings.TrimSpace(os.Getenv(envName)); value != "" {
+			return CanonicalPath(value)
+		}
+	}
+	return DefaultHomeDir()
 }
 
 // RegistryPath returns the store path, applying the default when Path is empty.
@@ -166,13 +236,21 @@ func (s RegistryStore) Load() ([]RegistryRecord, error) {
 	}
 
 	var records []RegistryRecord
-	if err := json.Unmarshal(data, &records); err != nil {
+	if err := json.Unmarshal(data, &records); err == nil {
+		if records == nil {
+			return []RegistryRecord{}, nil
+		}
+		return copyRegistryRecords(records), nil
+	}
+
+	var record RegistryRecord
+	if err := json.Unmarshal(data, &record); err != nil {
 		return nil, fmt.Errorf("parse server registry %q: %w", path, err)
 	}
-	if records == nil {
-		return []RegistryRecord{}, nil
+	if record == (RegistryRecord{}) {
+		return nil, fmt.Errorf("parse server registry %q: missing registry record fields", path)
 	}
-	return copyRegistryRecords(records), nil
+	return []RegistryRecord{record}, nil
 }
 
 // List returns all records in registry file order.
@@ -194,7 +272,11 @@ func (s RegistryStore) Save(records []RegistryRecord) error {
 		normalized = []RegistryRecord{}
 	}
 
-	data, err := json.MarshalIndent(normalized, "", "  ")
+	var payload any = []RegistryRecord{}
+	if len(normalized) > 0 {
+		payload = normalized[len(normalized)-1]
+	}
+	data, err := json.MarshalIndent(payload, "", "  ")
 	if err != nil {
 		return fmt.Errorf("encode server registry: %w", err)
 	}
@@ -207,37 +289,13 @@ func (s RegistryStore) Save(records []RegistryRecord) error {
 	return writePrivateFileAtomic(path, data)
 }
 
-// Upsert inserts or replaces a record by canonical cwd + config path identity.
+// Upsert replaces the active singleton record for this store.
 func (s RegistryStore) Upsert(record RegistryRecord) error {
 	normalized, err := CanonicalizeRegistryRecord(record)
 	if err != nil {
 		return err
 	}
-	records, err := s.Load()
-	if err != nil {
-		return err
-	}
-
-	out := make([]RegistryRecord, 0, len(records)+1)
-	replaced := false
-	for i, existing := range records {
-		existing, err = CanonicalizeRegistryRecord(existing)
-		if err != nil {
-			return fmt.Errorf("canonicalize existing registry record %d: %w", i, err)
-		}
-		if normalized.SameIdentity(existing) {
-			if !replaced {
-				out = append(out, normalized)
-				replaced = true
-			}
-			continue
-		}
-		out = append(out, existing)
-	}
-	if !replaced {
-		out = append(out, normalized)
-	}
-	return s.Save(out)
+	return s.Save([]RegistryRecord{normalized})
 }
 
 // Remove deletes all records matching cwd + configPath.

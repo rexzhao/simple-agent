@@ -1230,6 +1230,7 @@ func TestServerCommandBackgroundWaitsForHealthyDiscoverableServer(t *testing.T) 
 
 	childArgs := <-childArgsCh
 	assertCLIStringSliceContains(t, childArgs, "--background-child")
+	assertCLIFlagValue(t, childArgs, "--home", mustCLICanonicalPath(t, filepath.Dir(filepath.Dir(registryPath))))
 	assertCLIFlagValue(t, childArgs, "--config", filepath.Join(projectDir, ".agents", "sai.yaml"))
 	assertCLIFlagValue(t, childArgs, "--cwd", projectDir)
 	assertCLIFlagValue(t, childArgs, "--listen", "127.0.0.1:0")
@@ -1620,7 +1621,70 @@ func TestServerCommandDuplicateSameListenExitsAlreadyRunning(t *testing.T) {
 	}
 }
 
-func TestServerCommandDuplicateDifferentListenFailsBeforeBind(t *testing.T) {
+func TestServerCommandDuplicateDifferentCWDStillUsesSingleton(t *testing.T) {
+	isolateCLIUserRegistry(t)
+	firstProject := t.TempDir()
+	secondProject := t.TempDir()
+	writeCLIFixtureInDir(t, filepath.Join(firstProject, ".agents"))
+	writeCLIFixtureInDir(t, filepath.Join(secondProject, ".agents"))
+
+	addr, done, stderr, cleanup := startCLIServerCommandForTest(t, []string{"server", "--port", "0"}, func() (string, error) {
+		return firstProject, nil
+	})
+	defer cleanup()
+
+	var secondStdout, secondStderr bytes.Buffer
+	code := RunWithGetwd([]string{"server", "--port", "0"}, &secondStdout, &secondStderr, func() (string, error) {
+		return secondProject, nil
+	})
+	if code != 0 {
+		t.Fatalf("duplicate server code = %d, stderr = %s", code, secondStderr.String())
+	}
+	if secondStderr.String() != "" {
+		t.Fatalf("duplicate stderr = %q, want empty", secondStderr.String())
+	}
+	if out := secondStdout.String(); !strings.Contains(out, "SERVER_ALREADY_RUNNING") || !strings.Contains(out, "addr="+addr) {
+		t.Fatalf("duplicate stdout = %q, want already running singleton addr", out)
+	}
+
+	postCLIServerShutdown(t, addr)
+	if code := waitForCode(t, done); code != 0 {
+		t.Fatalf("server command code = %d, stderr = %s", code, stderr.String())
+	}
+}
+
+func TestServerCommandDuplicateMissingConfigStillReportsAlreadyRunning(t *testing.T) {
+	isolateCLIUserRegistry(t)
+	projectDir := t.TempDir()
+	missingConfigDir := t.TempDir()
+	writeCLIFixtureInDir(t, filepath.Join(projectDir, ".agents"))
+
+	addr, done, stderr, cleanup := startCLIServerCommandForTest(t, []string{"server", "--port", "0"}, func() (string, error) {
+		return projectDir, nil
+	})
+	defer cleanup()
+
+	var secondStdout, secondStderr bytes.Buffer
+	code := RunWithGetwd([]string{"server", "--port", "0"}, &secondStdout, &secondStderr, func() (string, error) {
+		return missingConfigDir, nil
+	})
+	if code != 0 {
+		t.Fatalf("duplicate missing-config server code = %d, stderr = %s", code, secondStderr.String())
+	}
+	if secondStderr.String() != "" {
+		t.Fatalf("duplicate missing-config stderr = %q, want empty", secondStderr.String())
+	}
+	if out := secondStdout.String(); !strings.Contains(out, "SERVER_ALREADY_RUNNING") || !strings.Contains(out, "addr="+addr) || strings.Contains(out, "SERVER_ADDR") {
+		t.Fatalf("duplicate missing-config stdout = %q, want already running singleton only", out)
+	}
+
+	postCLIServerShutdown(t, addr)
+	if code := waitForCode(t, done); code != 0 {
+		t.Fatalf("server command code = %d, stderr = %s", code, stderr.String())
+	}
+}
+
+func TestServerCommandDuplicateDifferentListenExitsAlreadyRunning(t *testing.T) {
 	registryPath := isolateCLIUserRegistry(t)
 	projectDir := t.TempDir()
 	writeCLIFixtureInDir(t, filepath.Join(projectDir, ".agents"))
@@ -1634,13 +1698,19 @@ func TestServerCommandDuplicateDifferentListenFailsBeforeBind(t *testing.T) {
 	code := RunWithGetwd([]string{"server", "--listen", "127.0.0.1:23456"}, &secondStdout, &secondStderr, func() (string, error) {
 		return projectDir, nil
 	})
-	if code != 1 {
-		t.Fatalf("conflicting server code = %d, want 1", code)
+	if code != 0 {
+		t.Fatalf("different-listen duplicate server code = %d, stderr = %s", code, secondStderr.String())
 	}
-	if secondStdout.String() != "" {
-		t.Fatalf("conflicting stdout = %q, want empty", secondStdout.String())
+	if secondStderr.String() != "" {
+		t.Fatalf("different-listen duplicate stderr = %q, want empty", secondStderr.String())
 	}
-	assertCLIErrorContains(t, secondStderr.String(), "server already running", "127.0.0.1:0", "127.0.0.1:23456")
+	out := secondStdout.String()
+	if !strings.Contains(out, "SERVER_ALREADY_RUNNING") || !strings.Contains(out, "addr="+addr) || !strings.Contains(out, "pid=") {
+		t.Fatalf("different-listen duplicate stdout = %q, want already running addr and pid", out)
+	}
+	if strings.Contains(out, "SERVER_ADDR") {
+		t.Fatalf("different-listen duplicate stdout = %q, should not print new server addr", out)
+	}
 	records, err := localserver.NewRegistryStore(registryPath).List()
 	if err != nil {
 		t.Fatalf("registry List() error = %v", err)
@@ -1839,6 +1909,67 @@ func TestStatusNoServerHint(t *testing.T) {
 	assertCLIErrorContains(t, stderr.String(), "no healthy sai server found", "sai server --cwd")
 }
 
+func TestHomeNamespaceSelectsIndependentRegistry(t *testing.T) {
+	isolateCLIUserRegistry(t)
+	projectDir := t.TempDir()
+	homeA := filepath.Join(t.TempDir(), "home-a")
+	homeB := filepath.Join(t.TempDir(), "home-b")
+	t.Setenv("MY_TOOL_HOME", homeA)
+
+	fakeServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/health":
+			writeCLIJSON(w, http.StatusOK, map[string]any{"status": "ok"})
+		case "/server":
+			writeCLIJSON(w, http.StatusOK, map[string]any{
+				"cwd":            projectDir,
+				"config_path":    filepath.Join(projectDir, ".agents", "sai.yaml"),
+				"addr":           r.Host,
+				"pid":            1234,
+				"version":        "test-version",
+				"started_at":     time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC),
+				"uptime_seconds": 5,
+				"session_count":  0,
+				"running_turns":  0,
+			})
+		default:
+			t.Fatalf("unexpected path %q", r.URL.Path)
+		}
+	}))
+	defer fakeServer.Close()
+
+	registerCLIFakeServerInHome(t, homeA, projectDir, fakeServer.URL, "token-a")
+	otherProject := filepath.Join(projectDir, "other")
+	registerCLIFakeServerInHome(t, homeB, otherProject, fakeServer.URL, "token-b")
+
+	var stdout, stderr bytes.Buffer
+	code := RunWithProgramGetwd("my.tool", []string{"status", "--cwd", projectDir}, &stdout, &stderr, func() (string, error) {
+		return projectDir, nil
+	})
+	if code != 0 {
+		t.Fatalf("status with env home code = %d, stderr = %s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), projectDir) {
+		t.Fatalf("status with env home stdout = %q, want home A project", stdout.String())
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	code = RunWithProgramGetwd("my.tool", []string{"servers", "--home", homeB, "list"}, &stdout, &stderr, func() (string, error) {
+		return projectDir, nil
+	})
+	if code != 0 {
+		t.Fatalf("servers list with explicit home code = %d, stderr = %s", code, stderr.String())
+	}
+	out := stdout.String()
+	if !strings.Contains(out, otherProject) {
+		t.Fatalf("servers list home B stdout = %q, want home B record", out)
+	}
+	if strings.Contains(out, projectDir+"\t") {
+		t.Fatalf("servers list home B stdout = %q, should not include env home A record", out)
+	}
+}
+
 func TestStopWithCWDStopsServerCleansRegistryAndKeepsData(t *testing.T) {
 	registryPath := isolateCLIUserRegistry(t)
 	projectDir := t.TempDir()
@@ -2015,10 +2146,9 @@ func TestStopCleansStaleRegistryRecord(t *testing.T) {
 	}
 }
 
-func TestServersListShowsHealthyAndRemovesStale(t *testing.T) {
+func TestServersListShowsHealthySingleton(t *testing.T) {
 	registryPath := isolateCLIUserRegistry(t)
 	projectDir := t.TempDir()
-	staleDir := filepath.Join(t.TempDir(), "stale")
 	writeCLIFixtureInDir(t, filepath.Join(projectDir, ".agents"))
 
 	addr, done, serverStderr, cleanup := startCLIServerCommandForTest(t, []string{"server", "--port", "0"}, func() (string, error) {
@@ -2027,20 +2157,6 @@ func TestServersListShowsHealthyAndRemovesStale(t *testing.T) {
 	defer cleanup()
 
 	store := localserver.NewRegistryStore(registryPath)
-	stale := localserver.RegistryRecord{
-		CWD:             staleDir,
-		ConfigPath:      filepath.Join(staleDir, ".agents", "sai.yaml"),
-		Addr:            "127.0.0.1:0",
-		PID:             999999,
-		Token:           "stale-token",
-		StartedAt:       time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC),
-		Version:         "stale-version",
-		RequestedListen: "127.0.0.1:0",
-	}
-	if err := store.Upsert(stale); err != nil {
-		t.Fatalf("Upsert(stale) error = %v", err)
-	}
-
 	var stdout, stderr bytes.Buffer
 	code := RunWithGetwd([]string{"servers", "list"}, &stdout, &stderr, func() (string, error) {
 		return "", errors.New("getwd should not be called")
@@ -2060,9 +2176,6 @@ func TestServersListShowsHealthyAndRemovesStale(t *testing.T) {
 		if !strings.Contains(out, want) {
 			t.Fatalf("servers list output missing %q:\n%s", want, out)
 		}
-	}
-	if strings.Contains(out, staleDir) || strings.Contains(out, "stale-version") {
-		t.Fatalf("servers list output included stale record:\n%s", out)
 	}
 	records, err := store.List()
 	if err != nil {
@@ -10784,6 +10897,16 @@ func assertCLIFlagValue(t *testing.T, args []string, flagName, want string) {
 	t.Fatalf("args = %#v, want %s %q", args, flagName, want)
 }
 
+func mustCLICanonicalPath(t *testing.T, path string) string {
+	t.Helper()
+
+	canonical, err := localserver.CanonicalPath(path)
+	if err != nil {
+		t.Fatalf("CanonicalPath(%q) error = %v", path, err)
+	}
+	return canonical
+}
+
 func isolateCLIUserRegistry(t *testing.T) string {
 	t.Helper()
 
@@ -10817,6 +10940,16 @@ func registerCLIFakeServer(t *testing.T, registryPath, projectDir, rawURL, token
 	}); err != nil {
 		t.Fatalf("Upsert(fake registry record) error = %v", err)
 	}
+}
+
+func registerCLIFakeServerInHome(t *testing.T, home, projectDir, rawURL, token string) {
+	t.Helper()
+
+	path, err := localserver.RegistryPathForHome(home)
+	if err != nil {
+		t.Fatalf("RegistryPathForHome(%q) error = %v", home, err)
+	}
+	registerCLIFakeServer(t, path, projectDir, rawURL, token)
 }
 
 func waitForCLIStreamReady(t *testing.T, ready <-chan struct{}) {
