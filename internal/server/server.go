@@ -431,11 +431,15 @@ func (p *Process) handleProjectPath(w http.ResponseWriter, r *http.Request) {
 	}
 	switch {
 	case len(parts) == 1:
-		if r.Method != http.MethodGet {
-			writeMethodNotAllowed(w, http.MethodGet)
+		switch r.Method {
+		case http.MethodGet:
+			p.handleProjectDetail(w, r, projectID)
+		case http.MethodDelete:
+			p.handleProjectRemove(w, r, projectID)
+		default:
+			writeMethodNotAllowed(w, http.MethodGet, http.MethodDelete)
 			return
 		}
-		p.handleProjectDetail(w, r, projectID)
 	case len(parts) == 2 && parts[1] == "sessions":
 		switch r.Method {
 		case http.MethodGet:
@@ -509,6 +513,64 @@ func (p *Process) handleProjectDetail(w http.ResponseWriter, r *http.Request, id
 		return
 	}
 	writeJSON(w, http.StatusOK, projectDTOFromProject(project))
+}
+
+func (p *Process) handleProjectRemove(w http.ResponseWriter, r *http.Request, id string) {
+	store := p.projectStore
+	if store == nil {
+		writeError(w, http.StatusServiceUnavailable, "project_store_unavailable", "project store is not configured")
+		return
+	}
+	deleteData, err := parseProjectDeleteDataQuery(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_request", err.Error())
+		return
+	}
+	project, err := store.Load(id)
+	if err != nil {
+		if errors.Is(err, projectstore.ErrNotFound) {
+			writeError(w, http.StatusNotFound, "project_not_found", "project not found")
+			return
+		}
+		writeError(w, http.StatusBadRequest, "invalid_project_id", "invalid project id")
+		return
+	}
+	busy, err := p.projectHasRunningTurn(project.ID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "session_store_error", "could not check running sessions")
+		return
+	}
+	if busy {
+		writeError(w, http.StatusConflict, "project_busy", "project has a running turn")
+		return
+	}
+
+	if deleteData {
+		if err := store.Delete(project.ID); err != nil {
+			if errors.Is(err, projectstore.ErrNotFound) {
+				writeError(w, http.StatusNotFound, "project_not_found", "project not found")
+				return
+			}
+			writeError(w, http.StatusInternalServerError, "project_store_error", "could not delete project")
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"status": "deleted",
+			"id":     project.ID,
+		})
+		return
+	}
+
+	archived, err := store.Archive(project.ID)
+	if err != nil {
+		if errors.Is(err, projectstore.ErrNotFound) {
+			writeError(w, http.StatusNotFound, "project_not_found", "project not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "project_store_error", "could not archive project")
+		return
+	}
+	writeJSON(w, http.StatusOK, projectDTOFromProject(archived))
 }
 
 func (p *Process) handleProjectSessionsList(w http.ResponseWriter, r *http.Request, projectID string) {
@@ -1076,6 +1138,32 @@ func (p *Process) sessionStatus(sessionID string) string {
 	return "idle"
 }
 
+func (p *Process) projectHasRunningTurn(projectID string) (bool, error) {
+	projectID = strings.TrimSpace(projectID)
+	if projectID == "" {
+		return false, nil
+	}
+	p.mu.Lock()
+	runningSessionIDs := make(map[string]struct{}, len(p.runningTurns))
+	for sessionID := range p.runningTurns {
+		runningSessionIDs[sessionID] = struct{}{}
+	}
+	p.mu.Unlock()
+	if len(runningSessionIDs) == 0 || p.sessionStore == nil {
+		return false, nil
+	}
+	infos, err := p.sessionStore.List()
+	if err != nil {
+		return false, err
+	}
+	for _, info := range infos {
+		if _, running := runningSessionIDs[info.ID]; running && info.ProjectID == projectID {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 func (p *Process) sessionCount() (int, error) {
 	if p.sessionStore == nil {
 		info := p.snapshot()
@@ -1600,6 +1688,18 @@ func singleQueryValue(values map[string][]string, name string) (string, bool, er
 		return "", true, fmt.Errorf("%s must not be empty", name)
 	}
 	return raw, true, nil
+}
+
+func parseProjectDeleteDataQuery(r *http.Request) (bool, error) {
+	raw, ok, err := singleQueryValue(r.URL.Query(), "delete_data")
+	if err != nil || !ok {
+		return false, err
+	}
+	deleteData, err := strconv.ParseBool(raw)
+	if err != nil {
+		return false, fmt.Errorf("delete_data must be true or false")
+	}
+	return deleteData, nil
 }
 
 func filterSessionItemsForView(items []sessions.SessionItem, view string) []sessions.SessionItem {

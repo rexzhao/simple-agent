@@ -81,6 +81,10 @@ func TestStoreListOmitsArchivedProjects(t *testing.T) {
 	store := newStoreWithClock(filepath.Join(t.TempDir(), "projects"), clock.Now)
 	activeRoot := mkdirProjectDir(t, "active")
 	archivedRoot := mkdirProjectDir(t, "archived")
+	archivedChild := filepath.Join(archivedRoot, "child")
+	if err := os.MkdirAll(archivedChild, 0o755); err != nil {
+		t.Fatalf("MkdirAll(archivedChild) error = %v", err)
+	}
 
 	active, _, err := store.Create(activeRoot, "Active")
 	if err != nil {
@@ -90,9 +94,12 @@ func TestStoreListOmitsArchivedProjects(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Create(archived) error = %v", err)
 	}
-	archived.Archived = true
-	if err := store.saveProject(archived); err != nil {
-		t.Fatalf("saveProject(archived) error = %v", err)
+	archived, err = store.Archive(archived.ID)
+	if err != nil {
+		t.Fatalf("Archive(archived) error = %v", err)
+	}
+	if !archived.Archived {
+		t.Fatalf("Archive() returned archived = false: %#v", archived)
 	}
 
 	projects, err := store.List()
@@ -104,6 +111,40 @@ func TestStoreListOmitsArchivedProjects(t *testing.T) {
 	}
 	if _, err := store.Load(archived.ID); err != nil {
 		t.Fatalf("Load(archived) error = %v; detail should still be available by id", err)
+	}
+	if _, ok, err := store.NearestAncestor(archivedChild); err != nil || ok {
+		t.Fatalf("NearestAncestor(archived child) ok=%t err=%v, want no match", ok, err)
+	}
+}
+
+func TestStoreDeleteRemovesProjectMetadataDirectory(t *testing.T) {
+	storeRoot := filepath.Join(t.TempDir(), "projects")
+	store := NewStore(storeRoot)
+	projectRoot := mkdirProjectDir(t, "delete")
+	project, _, err := store.Create(projectRoot, "Delete")
+	if err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+	extraPath := filepath.Join(storeRoot, project.ID, "data.bin")
+	if err := os.WriteFile(extraPath, []byte("project data"), 0o600); err != nil {
+		t.Fatalf("WriteFile(extra project data) error = %v", err)
+	}
+
+	if err := store.Delete(project.ID); err != nil {
+		t.Fatalf("Delete() error = %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(storeRoot, project.ID)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("project directory stat error = %v, want not exist", err)
+	}
+	if _, err := store.Load(project.ID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("Load(deleted) error = %v, want ErrNotFound", err)
+	}
+	projects, err := store.List()
+	if err != nil {
+		t.Fatalf("List() after delete error = %v", err)
+	}
+	if len(projects) != 0 {
+		t.Fatalf("List() after delete = %#v, want empty", projects)
 	}
 }
 

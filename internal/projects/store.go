@@ -130,6 +130,43 @@ func (s *Store) List() ([]Project, error) {
 	return s.list(false)
 }
 
+func (s *Store) Archive(id string) (Project, error) {
+	project, err := s.Load(id)
+	if err != nil {
+		return Project{}, err
+	}
+	project.Archived = true
+	project.UpdatedAt = s.now().UTC()
+	if err := s.writeProject(project); err != nil {
+		return Project{}, err
+	}
+	return copyProject(project), nil
+}
+
+func (s *Store) Delete(id string) error {
+	if err := s.requireRoot(); err != nil {
+		return err
+	}
+	if err := validateProjectID(id); err != nil {
+		return err
+	}
+	dir := s.projectDir(id)
+	info, err := os.Stat(dir)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("%w: %s", ErrNotFound, id)
+		}
+		return fmt.Errorf("stat project %q: %w", id, err)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("project %q is not a directory", id)
+	}
+	if err := os.RemoveAll(dir); err != nil {
+		return fmt.Errorf("delete project %q: %w", id, err)
+	}
+	return nil
+}
+
 func (s *Store) NearestAncestor(cwd string) (Project, bool, error) {
 	if err := s.requireRoot(); err != nil {
 		return Project{}, false, err
@@ -262,7 +299,10 @@ func (s *Store) saveProject(project Project) error {
 	if project.UpdatedAt.IsZero() {
 		project.UpdatedAt = project.CreatedAt
 	}
+	return s.writeProject(project)
+}
 
+func (s *Store) writeProject(project Project) error {
 	dir := s.projectDir(project.ID)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return fmt.Errorf("create project directory %q: %w", dir, err)

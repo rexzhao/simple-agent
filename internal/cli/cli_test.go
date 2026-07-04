@@ -1106,14 +1106,16 @@ func TestProjectHelpWritesUsageWithoutConfig(t *testing.T) {
 		args  []string
 		wants []string
 	}{
-		{args: []string{"project", "-h"}, wants: []string{"usage: sai project <command>", "project create", "project list", "project show"}},
-		{args: []string{"help", "project"}, wants: []string{"usage: sai project <command>", "project create", "project list", "project show"}},
+		{args: []string{"project", "-h"}, wants: []string{"usage: sai project <command>", "project create", "project list", "project show", "project remove"}},
+		{args: []string{"help", "project"}, wants: []string{"usage: sai project <command>", "project create", "project list", "project show", "project remove"}},
 		{args: []string{"project", "create", "-h"}, wants: []string{"usage: sai project create", "--cwd path", "--name name"}},
 		{args: []string{"help", "project", "create"}, wants: []string{"usage: sai project create", "--cwd path", "--name name"}},
 		{args: []string{"project", "list", "-h"}, wants: []string{"usage: sai project list", "Lists registered projects"}},
 		{args: []string{"help", "project", "list"}, wants: []string{"usage: sai project list", "Lists registered projects"}},
 		{args: []string{"project", "show", "-h"}, wants: []string{"usage: sai project show", "--project id", "nearest registered ancestor"}},
 		{args: []string{"help", "project", "show"}, wants: []string{"usage: sai project show", "--project id", "nearest registered ancestor"}},
+		{args: []string{"project", "remove", "-h"}, wants: []string{"usage: sai project remove", "--project id", "--delete-data"}},
+		{args: []string{"help", "project", "remove"}, wants: []string{"usage: sai project remove", "--project id", "--delete-data"}},
 	} {
 		t.Run(strings.Join(tt.args, " "), func(t *testing.T) {
 			var stdout, stderr bytes.Buffer
@@ -1133,7 +1135,9 @@ func TestProjectHelpWritesUsageWithoutConfig(t *testing.T) {
 				}
 			}
 			if strings.Contains(out, "remove") {
-				t.Fatalf("project help mentioned unimplemented remove:\n%s", out)
+				if !strings.Contains(strings.Join(tt.wants, " "), "remove") {
+					t.Fatalf("project help mentioned unexpected remove:\n%s", out)
+				}
 			}
 		})
 	}
@@ -1431,6 +1435,196 @@ func TestProjectShowRejectsCWD(t *testing.T) {
 		t.Fatalf("stdout = %q, want empty", stdout.String())
 	}
 	assertCLIErrorContains(t, stderr.String(), "flag provided but not defined: -cwd", `Run "sai help project show" for usage.`)
+}
+
+func TestProjectRemoveUsesNearestProjectAPI(t *testing.T) {
+	registryPath := isolateCLIUserRegistry(t)
+	parentDir := t.TempDir()
+	childDir := filepath.Join(parentDir, "child")
+	leafDir := filepath.Join(childDir, "leaf")
+	if err := os.MkdirAll(leafDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll(leafDir) error = %v", err)
+	}
+	parentRoot, err := projectstore.CanonicalRoot(parentDir)
+	if err != nil {
+		t.Fatalf("CanonicalRoot(parent) error = %v", err)
+	}
+	childRoot, err := projectstore.CanonicalRoot(childDir)
+	if err != nil {
+		t.Fatalf("CanonicalRoot(child) error = %v", err)
+	}
+	createdAt := time.Date(2026, 7, 4, 3, 30, 0, 0, time.UTC)
+	updatedAt := time.Date(2026, 7, 4, 3, 31, 0, 0, time.UTC)
+
+	listAuthSeen := make(chan string, 1)
+	deleteAuthSeen := make(chan string, 1)
+	deleteQuerySeen := make(chan string, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/health":
+			writeCLIJSON(w, http.StatusOK, map[string]any{"status": "ok"})
+		case r.URL.Path == "/projects" && r.Method == http.MethodGet:
+			listAuthSeen <- r.Header.Get("Authorization")
+			writeCLIJSON(w, http.StatusOK, map[string]any{
+				"projects": []map[string]any{
+					{
+						"id":           "project-parent",
+						"root":         parentRoot,
+						"display_name": "Parent",
+						"archived":     false,
+						"created_at":   createdAt,
+						"updated_at":   updatedAt,
+					},
+					{
+						"id":           "project-child",
+						"root":         childRoot,
+						"display_name": "Child",
+						"archived":     false,
+						"created_at":   createdAt,
+						"updated_at":   updatedAt,
+					},
+				},
+			})
+		case r.URL.Path == "/projects/project-child" && r.Method == http.MethodDelete:
+			deleteAuthSeen <- r.Header.Get("Authorization")
+			deleteQuerySeen <- r.URL.RawQuery
+			writeCLIJSON(w, http.StatusOK, map[string]any{
+				"id":           "project-child",
+				"root":         childRoot,
+				"display_name": "Child",
+				"archived":     true,
+				"created_at":   createdAt,
+				"updated_at":   updatedAt,
+			})
+		default:
+			t.Fatalf("unexpected path %s %q", r.Method, r.URL.String())
+		}
+	}))
+	defer server.Close()
+	registerCLIFakeServer(t, registryPath, parentDir, server.URL, "registry-token")
+
+	var stdout, stderr bytes.Buffer
+	code := RunWithGetwd([]string{"project", "remove"}, &stdout, &stderr, func() (string, error) {
+		return leafDir, nil
+	})
+	if code != 0 {
+		t.Fatalf("project remove code = %d, stderr = %s", code, stderr.String())
+	}
+	if stderr.String() != "" {
+		t.Fatalf("stderr = %q, want empty", stderr.String())
+	}
+	assertCLIOutputContains(t, stdout.String(),
+		"ID\tproject-child\n",
+		"ROOT\t"+childRoot+"\n",
+		"NAME\tChild\n",
+		"ARCHIVED\ttrue\n",
+	)
+	select {
+	case got := <-listAuthSeen:
+		if got != "Bearer registry-token" {
+			t.Fatalf("GET /projects Authorization = %q, want bearer token", got)
+		}
+	default:
+		t.Fatal("GET /projects was not called")
+	}
+	select {
+	case got := <-deleteAuthSeen:
+		if got != "Bearer registry-token" {
+			t.Fatalf("DELETE /projects/{id} Authorization = %q, want bearer token", got)
+		}
+	default:
+		t.Fatal("DELETE /projects/project-child was not called")
+	}
+	if got := <-deleteQuerySeen; got != "" {
+		t.Fatalf("DELETE query = %q, want empty archive request", got)
+	}
+}
+
+func TestProjectRemoveWithProjectAndDeleteData(t *testing.T) {
+	registryPath := isolateCLIUserRegistry(t)
+	projectDir := t.TempDir()
+
+	authSeen := make(chan string, 1)
+	querySeen := make(chan string, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/health":
+			writeCLIJSON(w, http.StatusOK, map[string]any{"status": "ok"})
+		case r.URL.Path == "/projects/project-explicit" && r.Method == http.MethodDelete:
+			authSeen <- r.Header.Get("Authorization")
+			querySeen <- r.URL.RawQuery
+			writeCLIJSON(w, http.StatusOK, map[string]any{
+				"status": "deleted",
+				"id":     "project-explicit",
+			})
+		default:
+			t.Fatalf("unexpected path %s %q", r.Method, r.URL.String())
+		}
+	}))
+	defer server.Close()
+	registerCLIFakeServer(t, registryPath, projectDir, server.URL, "registry-token")
+
+	var stdout, stderr bytes.Buffer
+	code := RunWithGetwd([]string{"project", "remove", "--project", "project-explicit", "--delete-data"}, &stdout, &stderr, func() (string, error) {
+		return projectDir, nil
+	})
+	if code != 0 {
+		t.Fatalf("project remove --project --delete-data code = %d, stderr = %s", code, stderr.String())
+	}
+	if stderr.String() != "" {
+		t.Fatalf("stderr = %q, want empty", stderr.String())
+	}
+	assertCLIOutputContains(t, stdout.String(),
+		"STATUS\tdeleted\n",
+		"ID\tproject-explicit\n",
+	)
+	select {
+	case got := <-authSeen:
+		if got != "Bearer registry-token" {
+			t.Fatalf("DELETE /projects/{id} Authorization = %q, want bearer token", got)
+		}
+	default:
+		t.Fatal("DELETE /projects/project-explicit was not called")
+	}
+	if got := <-querySeen; got != "delete_data=true" {
+		t.Fatalf("DELETE query = %q, want delete_data=true", got)
+	}
+}
+
+func TestProjectRemoveRejectsCWD(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	code := RunWithGetwd([]string{"project", "remove", "--cwd", t.TempDir()}, &stdout, &stderr, func() (string, error) {
+		return "", errors.New("getwd should not be called")
+	})
+
+	if code != 1 {
+		t.Fatalf("project remove --cwd code = %d, want 1", code)
+	}
+	if stdout.String() != "" {
+		t.Fatalf("stdout = %q, want empty", stdout.String())
+	}
+	assertCLIErrorContains(t, stderr.String(), "flag provided but not defined: -cwd", `Run "sai help project remove" for usage.`)
+}
+
+func TestProjectRemoveDoesNotAddCompatibilityAliases(t *testing.T) {
+	for _, args := range [][]string{
+		{"project", "delete", "--project", "project-one"},
+		{"project", "archive", "--project", "project-one"},
+	} {
+		t.Run(strings.Join(args, " "), func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			code := RunWithGetwd(args, &stdout, &stderr, func() (string, error) {
+				return "", errors.New("getwd should not be called")
+			})
+			if code != 1 {
+				t.Fatalf("RunWithGetwd(%v) code = %d, want 1", args, code)
+			}
+			if stdout.String() != "" {
+				t.Fatalf("stdout = %q, want empty", stdout.String())
+			}
+			assertCLIErrorContains(t, stderr.String(), "usage: sai project <create|list|show|remove>", `Run "sai help project" for usage.`)
+		})
+	}
 }
 
 func TestProjectListAutoStartsSingletonServerWithoutStartupOutput(t *testing.T) {

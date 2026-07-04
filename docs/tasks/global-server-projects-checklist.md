@@ -67,12 +67,12 @@ evidence 证明。
 - [x] `project list` 可列出 projects。
 - [x] `project show` 可按 current cwd discovery 或 explicit project id 展示 project。
 - [x] `project show` 不接受 `--cwd`。
-- [ ] `project remove` 默认 archive/hide。
-- [ ] `project remove` 可按 current cwd discovery 或 explicit project id 选择 project。
-- [ ] `project remove` 不接受 `--cwd`。
-- [ ] `project remove --delete-data` 才执行真实数据删除。
-- [ ] running sessions 阻止 remove。
-- [ ] running sessions 阻止 delete-data。
+- [x] `project remove` 默认 archive/hide。
+- [x] `project remove` 可按 current cwd discovery 或 explicit project id 选择 project。
+- [x] `project remove` 不接受 `--cwd`。
+- [x] `project remove --delete-data` 才执行真实数据删除。
+- [x] running sessions 阻止 remove。
+- [x] running sessions 阻止 delete-data。
 
 ## Sessions
 
@@ -143,7 +143,7 @@ evidence 证明。
 - [x] 提供 `GET /projects`。
 - [x] 提供 `POST /projects`。
 - [x] 提供 project detail endpoint：`GET /projects/{project_id}`。
-- [ ] 提供 project remove endpoint。
+- [x] 提供 project remove endpoint。
 - [x] 提供 `GET /projects/{project_id}/sessions`。
 - [x] 提供 `POST /projects/{project_id}/sessions`。
 - [ ] 提供 `GET /sessions/{session_id}`。
@@ -291,5 +291,16 @@ evidence 证明。
 - 2026-07-04 M21 registry base_url slice: `go test ./internal/server` 通过；覆盖 registry JSON
   写入 `base_url`、不写旧 `addr`，并确认 `pid`、`base_url`、`token`、`version`、`started_at`
   字段存在。registry load 使用 `base_url`；`/server` status response 仍保留独立的 `addr` 字段。
-- Known limits: 当前 M21 slices 未实现 project remove/archive、GUI server work 或 session data store home
-  migration。
+- 2026-07-04 M21 project remove/archive slice: `go test ./internal/projects` 通过；覆盖 store
+  `Archive` 将 project 标记 archived 后从 `List` 和 nearest ancestor discovery 隐藏，但 `Load(id)`
+  仍可读取 archived metadata；`Delete` 删除 project metadata/data directory。
+- 2026-07-04 M21 project remove/archive slice: `go test ./internal/server` 通过；覆盖 authenticated
+  `DELETE /projects/{project_id}` 默认 archive、`?delete_data=true` 删除 project metadata/data、
+  无 token 返回 `permission_denied`，以及当前 running turn 所属 project 在默认 archive 和
+  `?delete_data=true` 时都返回 `project_busy` 且不泄漏 prompt/session/token 内容。
+- 2026-07-04 M21 project remove/archive slice: `go test ./internal/cli` 通过；覆盖 `project remove`
+  help-before-config、nearest cwd discovery、`--project`、`--delete-data`、`--cwd` rejection、registry
+  bearer token usage，以及未新增 `project delete` / `project archive` compatibility aliases。
+- 2026-07-04 M21 project remove/archive slice: `go test ./...` 通过；`git diff --check` 通过（仅出现工作区
+  LF/CRLF normalization warnings）。
+- Known limits: 当前 M21 slices 未实现 GUI server work 或 session data store home migration。

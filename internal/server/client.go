@@ -45,6 +45,16 @@ type ProjectCreateResult struct {
 	StatusCode int
 }
 
+// ProjectRemoveResult reports the project affected by DELETE /projects/{id}.
+// Archive responses include Project; delete-data responses include Status and ID.
+type ProjectRemoveResult struct {
+	Project    ProjectInfo
+	Deleted    bool
+	Status     string
+	ID         string
+	StatusCode int
+}
+
 // SessionMetadata is the client-facing session summary returned by GET /sessions.
 type SessionMetadata struct {
 	ID           string    `json:"id"`
@@ -267,6 +277,53 @@ func GetProjectWithToken(ctx context.Context, addr, token, id string, timeout ti
 		return ProjectInfo{}, fmt.Errorf("decode project %s at %s: %w", strings.TrimSpace(id), strings.TrimSpace(addr), err)
 	}
 	return project, nil
+}
+
+// RemoveProjectWithToken sends DELETE /projects/{id}. By default the server
+// archives the project; deleteData asks it to delete project metadata/data.
+func RemoveProjectWithToken(ctx context.Context, addr, token, id string, deleteData bool, timeout time.Duration) (ProjectRemoveResult, error) {
+	id = strings.TrimSpace(id)
+	path := "/projects/" + url.PathEscape(id)
+	if deleteData {
+		path += "?delete_data=true"
+	}
+	req, err := newServerClientRequest(ctx, http.MethodDelete, addr, path)
+	if err != nil {
+		return ProjectRemoveResult{}, err
+	}
+	setBearerToken(req, token)
+	client := http.Client{Timeout: clientTimeout(timeout)}
+	resp, err := client.Do(req)
+	if err != nil {
+		return ProjectRemoveResult{}, fmt.Errorf("remove project %s at %s: %w", id, strings.TrimSpace(addr), err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return ProjectRemoveResult{}, fmt.Errorf("remove project %s at %s: %s", id, strings.TrimSpace(addr), serverWriteResponseError(resp))
+	}
+	result := ProjectRemoveResult{
+		Deleted:    deleteData,
+		StatusCode: resp.StatusCode,
+	}
+	if deleteData {
+		var body struct {
+			Status string `json:"status"`
+			ID     string `json:"id"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+			return ProjectRemoveResult{}, fmt.Errorf("decode project delete result %s at %s: %w", id, strings.TrimSpace(addr), err)
+		}
+		result.Status = body.Status
+		result.ID = body.ID
+		return result, nil
+	}
+	var project ProjectInfo
+	if err := json.NewDecoder(resp.Body).Decode(&project); err != nil {
+		return ProjectRemoveResult{}, fmt.Errorf("decode project remove result %s at %s: %w", id, strings.TrimSpace(addr), err)
+	}
+	result.Project = project
+	result.ID = project.ID
+	return result, nil
 }
 
 // ListProjectSessionsWithToken fetches session metadata from GET /projects/{id}/sessions.

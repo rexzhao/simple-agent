@@ -182,7 +182,7 @@ func execute(ctx context.Context, program string, args []string, stdin io.Reader
 	case "server":
 		return serverCommand(ctx, rootArgs.commandArgs, rootArgs.configPath, homePath, stdout, getwd, program)
 	case "project":
-		subcommand, subArgs, groupHelp, err := splitSubcommandArgs(rootArgs.commandArgs, map[string]flagKind{"cwd": flagKindValue, "name": flagKindValue, "project": flagKindValue}, "sai help project")
+		subcommand, subArgs, groupHelp, err := splitSubcommandArgs(rootArgs.commandArgs, map[string]flagKind{"cwd": flagKindValue, "name": flagKindValue, "project": flagKindValue, "delete-data": flagKindBool}, "sai help project")
 		if err != nil {
 			return err
 		}
@@ -197,8 +197,10 @@ func execute(ctx context.Context, program string, args []string, stdin io.Reader
 			return projectListCommand(ctx, subArgs, rootArgs.configPath, homePath, stdout, getwd, program)
 		case "show":
 			return projectShowCommand(ctx, subArgs, rootArgs.configPath, homePath, stdout, getwd, program)
+		case "remove":
+			return projectRemoveCommand(ctx, subArgs, rootArgs.configPath, homePath, stdout, getwd, program)
 		default:
-			return usageError("usage: sai project <create|list|show>", "", "sai help project")
+			return usageError("usage: sai project <create|list|show|remove>", "", "sai help project")
 		}
 	case "session":
 		subcommand, subArgs, groupHelp, err := splitSubcommandArgs(rootArgs.commandArgs, map[string]flagKind{"cwd": flagKindValue, "project": flagKindValue, "all-projects": flagKindBool}, "sai help session")
@@ -432,6 +434,7 @@ Commands:
   project create    Register a project root
   project list      List registered projects
   project show      Show project metadata
+  project remove    Archive or delete project metadata
 
 Run "sai help project <command>" for command usage.
 `
@@ -451,6 +454,13 @@ const projectShowUsageText = `usage: sai project show [--project id]
 
 Shows project metadata. Without --project, the current directory is matched to
 the nearest registered ancestor project.
+`
+
+const projectRemoveUsageText = `usage: sai project remove [--project id] [--delete-data]
+
+Archives the selected project by default. Without --project, the current
+directory is matched to the nearest registered ancestor project. --delete-data
+deletes project metadata/data instead of archiving it.
 `
 
 const sessionUsageText = `usage: sai session <command>
@@ -637,6 +647,8 @@ func helpCommand(args []string, stdout io.Writer) error {
 		printProjectListUsage(stdout)
 	case "project show":
 		printProjectShowUsage(stdout)
+	case "project remove":
+		printProjectRemoveUsage(stdout)
 	case "session":
 		printSessionUsage(stdout)
 	case "session create":
@@ -739,6 +751,10 @@ func printProjectListUsage(stdout io.Writer) {
 
 func printProjectShowUsage(stdout io.Writer) {
 	fmt.Fprint(stdout, projectShowUsageText)
+}
+
+func printProjectRemoveUsage(stdout io.Writer) {
+	fmt.Fprint(stdout, projectRemoveUsageText)
 }
 
 func printSessionUsage(stdout io.Writer) {
@@ -894,6 +910,7 @@ func splitRootArgs(args []string) (rootArgs, error) {
 		"cwd":            flagKindValue,
 		"port":           flagKindValue,
 		"listen":         flagKindValue,
+		"delete-data":    flagKindBool,
 		"new":            flagKindBool,
 		"h":              flagKindBool,
 		"help":           flagKindBool,
@@ -1621,6 +1638,52 @@ func projectShowCommand(ctx context.Context, args []string, configPath, homePath
 	return printProjectInfo(stdout, project)
 }
 
+func projectRemoveCommand(ctx context.Context, args []string, configPath, homePath string, stdout io.Writer, getwd func() (string, error), program string) error {
+	flags := flag.NewFlagSet("sai project remove", flag.ContinueOnError)
+	projectID := flags.String("project", "", "project id")
+	deleteData := flags.Bool("delete-data", false, "delete project metadata/data")
+	positionals, done, err := parseCommandFlagArgs(flags, args, stdout, printProjectRemoveUsage, "sai help project remove")
+	if done || err != nil {
+		return err
+	}
+	if len(positionals) != 0 {
+		return usageError("usage: sai project remove [--project id] [--delete-data]", "", "sai help project remove")
+	}
+
+	effectiveCWD, err := resolveClientCWD("", getwd)
+	if err != nil {
+		return err
+	}
+	record, err := ensureProjectCommandServer(ctx, configPath, homePath, effectiveCWD, program)
+	if err != nil {
+		return err
+	}
+	id := strings.TrimSpace(*projectID)
+	if id == "" {
+		projects, err := localserver.ListProjectsWithToken(ctx, record.BaseURL, record.Token, serverClientTimeout)
+		if err != nil {
+			return err
+		}
+		project, ok, err := nearestProjectFromList(projects, effectiveCWD)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return fmt.Errorf("no registered project found from %s; run \"sai project create\"", effectiveCWD)
+		}
+		id = project.ID
+	}
+
+	result, err := localserver.RemoveProjectWithToken(ctx, record.BaseURL, record.Token, id, *deleteData, serverClientTimeout)
+	if err != nil {
+		return err
+	}
+	if result.Deleted {
+		return printProjectRemoveStatus(stdout, result)
+	}
+	return printProjectInfo(stdout, result.Project)
+}
+
 func resolveProjectCreatePaths(cwdFlag string, getwd func() (string, error)) (string, string, error) {
 	effectiveCWD, err := resolveClientCWD("", getwd)
 	if err != nil {
@@ -1738,6 +1801,18 @@ func printProjectInfo(stdout io.Writer, project localserver.ProjectInfo) error {
 		return err
 	}
 	_, err := fmt.Fprintf(stdout, "UPDATED_AT\t%s\n", formatSessionTimestamp(project.UpdatedAt))
+	return err
+}
+
+func printProjectRemoveStatus(stdout io.Writer, result localserver.ProjectRemoveResult) error {
+	status := strings.TrimSpace(result.Status)
+	if status == "" {
+		status = "deleted"
+	}
+	if _, err := fmt.Fprintf(stdout, "STATUS\t%s\n", status); err != nil {
+		return err
+	}
+	_, err := fmt.Fprintf(stdout, "ID\t%s\n", result.ID)
 	return err
 }
 
