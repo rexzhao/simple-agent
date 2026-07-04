@@ -201,6 +201,13 @@ evidence 证明。
 - 2026-07-04 M21 attach --new slice: `go test ./internal/cli` 通过；覆盖
   `attach --new` 无 nearest registered project 时在 create/attach 前失败，并提示
   `run "sai project create"`。
+- 2026-07-04 M21 send --new slice: `go test ./internal/cli` 通过；覆盖
+  `send --new --cwd` 先 `GET /projects` 做 nearest project discovery，再带 created cwd/config/provider/model/
+  tools/MCP/skills metadata `POST /projects/{project_id}/sessions`，随后用 bearer token
+  `POST /sessions/{id}/messages` 发送 prompt，并确认 legacy global `POST /sessions` 未被使用。
+- 2026-07-04 M21 send --new slice: `go test ./internal/cli` 通过；覆盖
+  `send --new` 无 nearest registered project 时在 create/send 前失败，并提示
+  `run "sai project create"`。
 - 2026-07-04 M21 slice 1: `go test ./internal/server` 通过；覆盖 home env var derivation、singleton registry
   upsert/discovery/stale cleanup。
 - 2026-07-04 M21 slice 1: `go test ./internal/cli` 通过；覆盖 `--home`/env priority、different home

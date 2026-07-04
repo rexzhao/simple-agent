@@ -6893,31 +6893,75 @@ func TestSendExistingWaitsLongerThanDiscoveryTimeout(t *testing.T) {
 func TestSendNewCreatesSessionThenSendsWithToken(t *testing.T) {
 	registryPath := isolateCLIUserRegistry(t)
 	projectDir := t.TempDir()
+	configDir := filepath.Join(projectDir, ".agents")
+	writeCLIRunFixtureInDirWithTools(t, configDir, "http://127.0.0.1:1", "direct-secret-value", "openai-chat", []string{"read_file"})
+	writeCLIMCPFixture(t, configDir)
+	setCLIAgentShowReasoning(t, configDir, true)
+	skillDir := filepath.Join(configDir, "skills", "visible")
+	if err := os.MkdirAll(skillDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll(skillDir) error = %v", err)
+	}
+	writeCLIFile(t, filepath.Join(skillDir, "SKILL.md"), "---\nname: Visible Skill\n---\nVisible skill instructions\n")
+	hiddenSkillDir := filepath.Join(configDir, "skills", "hidden")
+	if err := os.MkdirAll(hiddenSkillDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll(hiddenSkillDir) error = %v", err)
+	}
+	writeCLIFile(t, filepath.Join(hiddenSkillDir, "SKILL.md"), "---\ndisable-model-invocation: true\n---\nHidden skill instructions\n")
+	canonicalRoot, err := projectstore.CanonicalRoot(projectDir)
+	if err != nil {
+		t.Fatalf("CanonicalRoot(%q) error = %v", projectDir, err)
+	}
+	configPath := filepath.Join(configDir, "sai.yaml")
+	createdAt := time.Date(2026, 7, 4, 9, 0, 0, 0, time.UTC)
 	prompt := "new prompt body"
 
+	projectAuthSeen := make(chan string, 1)
 	createAuthSeen := make(chan string, 1)
 	sendAuthSeen := make(chan string, 1)
-	bodySeen := make(chan map[string]any, 1)
+	createBodySeen := make(chan map[string]any, 1)
+	messageBodySeen := make(chan map[string]any, 1)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/health":
+		switch {
+		case r.URL.Path == "/health":
 			writeCLIJSON(w, http.StatusOK, map[string]any{"status": "ok"})
-		case "/sessions":
-			if r.Method != http.MethodPost {
-				t.Fatalf("sessions method = %s, want POST", r.Method)
-			}
+		case r.URL.Path == "/projects" && r.Method == http.MethodGet:
+			projectAuthSeen <- r.Header.Get("Authorization")
+			writeCLIJSON(w, http.StatusOK, map[string]any{
+				"projects": []map[string]any{
+					{
+						"id":           "project-current",
+						"root":         canonicalRoot,
+						"display_name": "Current",
+						"archived":     false,
+						"created_at":   createdAt,
+						"updated_at":   createdAt,
+					},
+				},
+			})
+		case r.URL.Path == "/projects/project-current/sessions" && r.Method == http.MethodPost:
 			createAuthSeen <- r.Header.Get("Authorization")
+			data, err := io.ReadAll(r.Body)
+			if err != nil {
+				t.Fatalf("ReadAll(session create body) error = %v", err)
+			}
+			createBodySeen <- decodeCLIJSON(t, data)
 			writeCLIJSON(w, http.StatusCreated, map[string]any{
 				"id":                "new-session",
-				"created_at":        time.Date(2026, 7, 2, 3, 0, 0, 0, time.UTC),
-				"updated_at":        time.Date(2026, 7, 2, 3, 0, 0, 0, time.UTC),
-				"provider":          "paperhub",
-				"model_profile":     "glm-5.2",
-				"model_id":          "glm-5.2",
+				"created_at":        createdAt,
+				"updated_at":        createdAt,
+				"provider":          "fake",
+				"model_profile":     "default",
+				"model_id":          "model-default",
 				"status":            "idle",
+				"project_id":        "project-current",
+				"created_cwd":       canonicalRoot,
+				"cwd":               canonicalRoot,
+				"config_path":       configPath,
 				"save_tool_results": true,
 			})
-		case "/sessions/new-session/messages":
+		case r.URL.Path == "/sessions" && r.Method == http.MethodPost:
+			t.Fatalf("legacy global POST /sessions should not be used by send --new")
+		case r.URL.Path == "/sessions/new-session/messages":
 			if r.Method != http.MethodPost {
 				t.Fatalf("messages method = %s, want POST", r.Method)
 			}
@@ -6926,14 +6970,14 @@ func TestSendNewCreatesSessionThenSendsWithToken(t *testing.T) {
 			if err != nil {
 				t.Fatalf("ReadAll(message body) error = %v", err)
 			}
-			bodySeen <- decodeCLIJSON(t, data)
+			messageBodySeen <- decodeCLIJSON(t, data)
 			writeCLIJSON(w, http.StatusOK, map[string]any{
 				"status":   "committed",
 				"turn_id":  "turn-000001",
 				"last_seq": 1,
 			})
 		default:
-			t.Fatalf("unexpected path %q", r.URL.Path)
+			t.Fatalf("unexpected path %s %q", r.Method, r.URL.Path)
 		}
 	}))
 	defer server.Close()
@@ -6948,8 +6992,9 @@ func TestSendNewCreatesSessionThenSendsWithToken(t *testing.T) {
 		t.Fatalf("send --new code = %d, stderr = %s", code, stderr.String())
 	}
 	for name, ch := range map[string]<-chan string{
-		"create": createAuthSeen,
-		"send":   sendAuthSeen,
+		"projects": projectAuthSeen,
+		"create":   createAuthSeen,
+		"send":     sendAuthSeen,
 	} {
 		select {
 		case got := <-ch:
@@ -6961,7 +7006,41 @@ func TestSendNewCreatesSessionThenSendsWithToken(t *testing.T) {
 		}
 	}
 	select {
-	case got := <-bodySeen:
+	case createBody := <-createBodySeen:
+		for key, want := range map[string]string{
+			"created_cwd":   canonicalRoot,
+			"config_path":   configPath,
+			"provider":      "fake",
+			"model_profile": "default",
+			"model_id":      "model-default",
+		} {
+			if createBody[key] != want {
+				t.Fatalf("session create body[%q] = %#v, want %q; body=%#v", key, createBody[key], want, createBody)
+			}
+		}
+		if got := fmt.Sprint(createBody["model_parameters"].(map[string]any)["max_tokens"]); got != "128" {
+			t.Fatalf("model_parameters.max_tokens = %s, want 128; body=%#v", got, createBody)
+		}
+		if got := createBody["enabled_tools"]; !reflect.DeepEqual(got, []any{"read_file"}) {
+			t.Fatalf("enabled_tools = %#v, want read_file; body=%#v", got, createBody)
+		}
+		if got := createBody["enabled_mcp"]; !reflect.DeepEqual(got, []any{"local"}) {
+			t.Fatalf("enabled_mcp = %#v, want local; body=%#v", got, createBody)
+		}
+		if got := createBody["enabled_skills"]; !reflect.DeepEqual(got, []any{"visible"}) {
+			t.Fatalf("enabled_skills = %#v, want visible; body=%#v", got, createBody)
+		}
+		if got := createBody["show_reasoning"]; got != true {
+			t.Fatalf("show_reasoning = %#v, want true; body=%#v", got, createBody)
+		}
+		if got := createBody["save_tool_results"]; got != true {
+			t.Fatalf("save_tool_results = %#v, want true; body=%#v", got, createBody)
+		}
+	default:
+		t.Fatal("session create body was not captured")
+	}
+	select {
+	case got := <-messageBodySeen:
 		if got["content"] != prompt {
 			t.Fatalf("message body = %#v, want content", got)
 		}
@@ -6978,6 +7057,45 @@ func TestSendNewCreatesSessionThenSendsWithToken(t *testing.T) {
 	if stderr.String() != "" {
 		t.Fatalf("stderr = %q, want empty", stderr.String())
 	}
+}
+
+func TestSendNewFailsWithoutRegisteredNearestProject(t *testing.T) {
+	registryPath := isolateCLIUserRegistry(t)
+	projectDir := t.TempDir()
+	projectsCalled := make(chan struct{}, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/health":
+			writeCLIJSON(w, http.StatusOK, map[string]any{"status": "ok"})
+		case r.URL.Path == "/projects" && r.Method == http.MethodGet:
+			projectsCalled <- struct{}{}
+			writeCLIJSON(w, http.StatusOK, map[string]any{"projects": []map[string]any{}})
+		case strings.HasPrefix(r.URL.Path, "/projects/"), strings.HasPrefix(r.URL.Path, "/sessions"):
+			t.Fatalf("send --new should fail before create or send, got %s %q", r.Method, r.URL.Path)
+		default:
+			t.Fatalf("unexpected path %s %q", r.Method, r.URL.Path)
+		}
+	}))
+	defer server.Close()
+	registerCLIFakeServer(t, registryPath, projectDir, server.URL, "registry-token")
+
+	var stdout, stderr bytes.Buffer
+	code := RunWithGetwd([]string{"send", "--new", "--cwd", projectDir, "--prompt", "hello"}, &stdout, &stderr, func() (string, error) {
+		return "", errors.New("getwd should not be called")
+	})
+
+	if code != 1 {
+		t.Fatalf("send --new code = %d, want 1", code)
+	}
+	if stdout.String() != "" {
+		t.Fatalf("stdout = %q, want empty", stdout.String())
+	}
+	select {
+	case <-projectsCalled:
+	default:
+		t.Fatal("GET /projects was not called")
+	}
+	assertCLIErrorContains(t, stderr.String(), "no registered project found from", `run "sai project create"`)
 }
 
 func TestSendErrorDoesNotLeakPromptOrServerMessage(t *testing.T) {
@@ -7836,12 +7954,6 @@ func TestClientCommandsNoServerHint(t *testing.T) {
 			args: []string{"send", "missing-session", "--prompt", "hello"},
 			getwd: func() (string, error) {
 				return projectDir, nil
-			},
-		},
-		{
-			args: []string{"send", "--new", "--prompt", "hello", "--cwd", projectDir},
-			getwd: func() (string, error) {
-				return "", errors.New("getwd should not be called")
 			},
 		},
 	}

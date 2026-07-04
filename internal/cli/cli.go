@@ -237,7 +237,7 @@ func execute(ctx context.Context, program string, args []string, stdin io.Reader
 		}
 		return serversListCommand(ctx, subArgs, homePath, stdout)
 	case "send":
-		return sendCommand(ctx, rootArgs.commandArgs, rootArgs.configProvided, homePath, stdout, getwd)
+		return sendCommand(ctx, rootArgs.commandArgs, rootArgs.configPath, rootArgs.configProvided, homePath, stdout, getwd, program)
 	case "auth":
 		return authCommand(ctx, rootArgs.commandArgs, rootArgs.configPath, stdout, getwd, program)
 	case "tools":
@@ -2417,7 +2417,7 @@ func writeAttachStreamEvent(stdout, stderr io.Writer, event localserver.SessionS
 	return nil
 }
 
-func sendCommand(ctx context.Context, args []string, configProvided bool, homePath string, stdout io.Writer, getwd func() (string, error)) error {
+func sendCommand(ctx context.Context, args []string, configPath string, configProvided bool, homePath string, stdout io.Writer, getwd func() (string, error), program string) error {
 	flags := flag.NewFlagSet("sai send", flag.ContinueOnError)
 	cwdFlag := flags.String("cwd", "", "discovery working directory")
 	newSession := flags.Bool("new", false, "create a new server-owned session before sending")
@@ -2439,22 +2439,28 @@ func sendCommand(ctx context.Context, args []string, configProvided bool, homePa
 		return err
 	}
 
-	record, _, err := discoverClientServer(ctx, *cwdFlag, homePath, getwd)
-	if err != nil {
-		return err
-	}
-
 	sessionID := ""
+	var record localserver.RegistryRecord
 	if *newSession {
-		detail, err := localserver.CreateSessionWithToken(ctx, record.Addr, record.Token, serverClientTimeout)
+		creationCWD, err := resolveClientCWD(*cwdFlag, getwd)
 		if err != nil {
 			return err
 		}
+		detailRecord, detail, err := createProjectSessionForCWD(ctx, configPath, homePath, creationCWD, program)
+		if err != nil {
+			return err
+		}
+		record = detailRecord
 		sessionID = strings.TrimSpace(detail.ID)
 		if sessionID == "" {
 			return fmt.Errorf("create session at %s: response missing session id", record.Addr)
 		}
 	} else {
+		var err error
+		record, _, err = discoverClientServer(ctx, *cwdFlag, homePath, getwd)
+		if err != nil {
+			return err
+		}
 		sessionID = positionals[0]
 	}
 
