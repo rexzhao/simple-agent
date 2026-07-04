@@ -1281,13 +1281,13 @@ func serverCommand(ctx context.Context, args []string, configPath, homePath stri
 		return err
 	}
 
+	if *background {
+		return runServerBackgroundParentFromFlags(ctx, configPath, *cwdFlag, listen, homePath, store, stdout, getwd, program)
+	}
+
 	launch, err := prepareServerLaunch(configPath, *cwdFlag, listen, homePath, store, getwd, program)
 	if err != nil {
 		return err
-	}
-
-	if *background {
-		return runServerBackgroundParent(ctx, launch, stdout)
 	}
 
 	return runServerForeground(ctx, launch, stdout)
@@ -1347,6 +1347,25 @@ func prepareServerLaunch(configPath, cwdFlag, listen, homePath string, store loc
 		HomePath:        homePath,
 		RegistryStore:   store,
 	}, nil
+}
+
+func runServerBackgroundParentFromFlags(ctx context.Context, configPath, cwdFlag, listen, homePath string, store localserver.RegistryStore, stdout io.Writer, getwd func() (string, error), program string) (err error) {
+	lock, err := localserver.AcquireStartupLock(ctx, homePath)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		err = errors.Join(err, lock.Release())
+	}()
+
+	if done, err := checkExistingServerRecord(ctx, store, stdout); done || err != nil {
+		return err
+	}
+	launch, err := prepareServerLaunch(configPath, cwdFlag, listen, homePath, store, getwd, program)
+	if err != nil {
+		return err
+	}
+	return runServerBackgroundParent(ctx, launch, stdout)
 }
 
 func runServerForeground(ctx context.Context, launch serverLaunch, stdout io.Writer) error {
@@ -1826,9 +1845,31 @@ func ensureProjectCommandServer(ctx context.Context, configPath, homePath, effec
 		return discovery.Record, nil
 	}
 
-	launch, err := prepareServerLaunch(configPath, effectiveCWD, localserver.DefaultListenAddress, homePath, store, func() (string, error) {
-		return effectiveCWD, nil
-	}, program)
+	return startBackgroundServerWithStartupLock(ctx, homePath, store, effectiveCWD, func() (serverLaunch, error) {
+		return prepareServerLaunch(configPath, effectiveCWD, localserver.DefaultListenAddress, homePath, store, func() (string, error) {
+			return effectiveCWD, nil
+		}, program)
+	})
+}
+
+func startBackgroundServerWithStartupLock(ctx context.Context, homePath string, store localserver.RegistryStore, discoveryCWD string, prepare func() (serverLaunch, error)) (record localserver.RegistryRecord, err error) {
+	lock, err := localserver.AcquireStartupLock(ctx, homePath)
+	if err != nil {
+		return localserver.RegistryRecord{}, err
+	}
+	defer func() {
+		err = errors.Join(err, lock.Release())
+	}()
+
+	discovery, err := localserver.DiscoverHealthy(ctx, store, discoveryCWD, serverClientTimeout)
+	if err != nil {
+		return localserver.RegistryRecord{}, err
+	}
+	if discovery.Found {
+		return discovery.Record, nil
+	}
+
+	launch, err := prepare()
 	if err != nil {
 		return localserver.RegistryRecord{}, err
 	}
@@ -2200,17 +2241,15 @@ func ensureSessionCommandServer(ctx context.Context, configPath, homePath, progr
 		return discovery.Record, nil
 	}
 
-	effectiveCWD, err := resolveClientCWD("", getwd)
-	if err != nil {
-		return localserver.RegistryRecord{}, err
-	}
-	launch, err := prepareServerLaunch(configPath, effectiveCWD, localserver.DefaultListenAddress, homePath, store, func() (string, error) {
-		return effectiveCWD, nil
-	}, program)
-	if err != nil {
-		return localserver.RegistryRecord{}, err
-	}
-	return startBackgroundServerAndWait(ctx, launch)
+	return startBackgroundServerWithStartupLock(ctx, homePath, store, "", func() (serverLaunch, error) {
+		effectiveCWD, err := resolveClientCWD("", getwd)
+		if err != nil {
+			return serverLaunch{}, err
+		}
+		return prepareServerLaunch(configPath, effectiveCWD, localserver.DefaultListenAddress, homePath, store, func() (string, error) {
+			return effectiveCWD, nil
+		}, program)
+	})
 }
 
 func sessionCreateMetadataFromDefaults(session sessions.SessionV2) localserver.SessionCreateMetadata {

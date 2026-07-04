@@ -31,6 +31,85 @@ func TestDefaultRegistryPathUsesProjectSpecificFile(t *testing.T) {
 	}
 }
 
+func TestStartupLockPathForHomeUsesServerDir(t *testing.T) {
+	home := t.TempDir()
+	path, err := StartupLockPathForHome(home)
+	if err != nil {
+		t.Fatalf("StartupLockPathForHome() error = %v", err)
+	}
+	if !filepath.IsAbs(path) {
+		t.Fatalf("StartupLockPathForHome() = %q, want absolute path", path)
+	}
+	if got, want := filepath.Base(path), registryStartupLockFileName; got != want {
+		t.Fatalf("StartupLockPathForHome() base = %q, want %q", got, want)
+	}
+	if got, want := filepath.Base(filepath.Dir(path)), registrySubdirName; got != want {
+		t.Fatalf("StartupLockPathForHome() dir = %q, want %q", got, want)
+	}
+}
+
+func TestAcquireStartupLockSerializesAndUsesPrivateFile(t *testing.T) {
+	home := t.TempDir()
+	lock, err := AcquireStartupLock(context.Background(), home)
+	if err != nil {
+		t.Fatalf("AcquireStartupLock() first error = %v", err)
+	}
+	defer lock.Release()
+
+	if runtime.GOOS != "windows" {
+		info, err := os.Stat(lock.Path())
+		if err != nil {
+			t.Fatalf("Stat(lock) error = %v", err)
+		}
+		if got := info.Mode().Perm(); got != 0o600 {
+			t.Fatalf("lock mode = %o, want 0600", got)
+		}
+		dirInfo, err := os.Stat(filepath.Dir(lock.Path()))
+		if err != nil {
+			t.Fatalf("Stat(lock dir) error = %v", err)
+		}
+		if got := dirInfo.Mode().Perm(); got != 0o700 {
+			t.Fatalf("lock dir mode = %o, want 0700", got)
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	acquired := make(chan *StartupLock, 1)
+	errs := make(chan error, 1)
+	go func() {
+		next, err := AcquireStartupLock(ctx, home)
+		if err != nil {
+			errs <- err
+			return
+		}
+		acquired <- next
+	}()
+
+	select {
+	case next := <-acquired:
+		_ = next.Release()
+		t.Fatal("second AcquireStartupLock() completed before first lock was released")
+	case err := <-errs:
+		t.Fatalf("second AcquireStartupLock() error before release = %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	if err := lock.Release(); err != nil {
+		t.Fatalf("Release() first error = %v", err)
+	}
+	select {
+	case next := <-acquired:
+		if err := next.Release(); err != nil {
+			t.Fatalf("Release() second error = %v", err)
+		}
+	case err := <-errs:
+		t.Fatalf("second AcquireStartupLock() error after release = %v", err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("second AcquireStartupLock() did not complete after release")
+	}
+}
+
 func TestHomeEnvVarNameFromProgramBasename(t *testing.T) {
 	tests := []struct {
 		program string

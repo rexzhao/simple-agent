@@ -1872,6 +1872,136 @@ func TestProjectListAutoStartsSingletonServerWithoutStartupOutput(t *testing.T) 
 	}
 }
 
+func TestProjectListConcurrentAutoStartLaunchesOneBackgroundServer(t *testing.T) {
+	registryPath := isolateCLIUserRegistry(t)
+	projectDir := t.TempDir()
+	writeCLIFixtureInDir(t, filepath.Join(projectDir, ".agents"))
+
+	authSeen := make(chan string, 2)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/health":
+			writeCLIJSON(w, http.StatusOK, map[string]any{"status": "ok"})
+		case "/projects":
+			authSeen <- r.Header.Get("Authorization")
+			writeCLIJSON(w, http.StatusOK, map[string]any{"projects": []map[string]any{}})
+		default:
+			t.Fatalf("unexpected path %q", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	oldStart := startBackgroundServerProcess
+	startEntered := make(chan struct{})
+	allowStart := make(chan struct{})
+	childArgsCh := make(chan []string, 2)
+	waitDone := make(chan struct{})
+	var closeStartEntered sync.Once
+	var closeAllow sync.Once
+	var closeWait sync.Once
+	var startMu sync.Mutex
+	startCount := 0
+	startBackgroundServerProcess = func(ctx context.Context, args []string) (*backgroundServerProcess, error) {
+		startMu.Lock()
+		startCount++
+		startMu.Unlock()
+		closeStartEntered.Do(func() { close(startEntered) })
+		<-allowStart
+
+		childArgsCh <- append([]string(nil), args...)
+		addr := strings.TrimPrefix(server.URL, "http://")
+		if err := localserver.NewRegistryStore(registryPath).Upsert(localserver.RegistryRecord{
+			CWD:             projectDir,
+			ConfigPath:      filepath.Join(projectDir, ".agents", "sai.yaml"),
+			BaseURL:         addr,
+			PID:             8765,
+			Token:           "auto-token",
+			StartedAt:       time.Date(2026, 7, 4, 12, 0, 0, 0, time.UTC),
+			Version:         "test-version",
+			RequestedListen: localserver.DefaultListenAddress,
+		}); err != nil {
+			return nil, err
+		}
+		return &backgroundServerProcess{
+			PID: 8765,
+			wait: func() error {
+				<-waitDone
+				return nil
+			},
+			kill: func() error {
+				closeWait.Do(func() { close(waitDone) })
+				return nil
+			},
+		}, nil
+	}
+	t.Cleanup(func() {
+		startBackgroundServerProcess = oldStart
+		closeAllow.Do(func() { close(allowStart) })
+		closeWait.Do(func() { close(waitDone) })
+	})
+
+	getwd := twoCallerGetwd(t, projectDir)
+	startRuns := make(chan struct{})
+	results := make(chan concurrentCLIRunResult, 2)
+	for i := 0; i < 2; i++ {
+		go func() {
+			<-startRuns
+			var stdout, stderr bytes.Buffer
+			code := RunWithGetwd([]string{"project", "list"}, &stdout, &stderr, getwd)
+			results <- concurrentCLIRunResult{stdout: stdout.String(), stderr: stderr.String(), code: code}
+		}()
+	}
+	close(startRuns)
+
+	select {
+	case <-startEntered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for background start")
+	}
+	time.Sleep(100 * time.Millisecond)
+	startMu.Lock()
+	gotStarts := startCount
+	startMu.Unlock()
+	if gotStarts != 1 {
+		t.Fatalf("background starts before releasing first launch = %d, want 1", gotStarts)
+	}
+	closeAllow.Do(func() { close(allowStart) })
+
+	for i := 0; i < 2; i++ {
+		result := receiveConcurrentCLIRunResult(t, results)
+		if result.code != 0 {
+			t.Fatalf("project list auto-start code = %d, stderr = %s", result.code, result.stderr)
+		}
+		if result.stderr != "" {
+			t.Fatalf("stderr = %q, want empty", result.stderr)
+		}
+		if strings.Contains(result.stdout, "SERVER_ADDR") {
+			t.Fatalf("stdout = %q, want no SERVER_ADDR", result.stdout)
+		}
+	}
+
+	childArgs := <-childArgsCh
+	assertCLIFlagValue(t, childArgs, "--home", mustCLICanonicalPath(t, filepath.Dir(filepath.Dir(registryPath))))
+	assertCLIFlagValue(t, childArgs, "--config", filepath.Join(projectDir, ".agents", "sai.yaml"))
+	assertCLIFlagValue(t, childArgs, "--cwd", projectDir)
+	assertCLIFlagValue(t, childArgs, "--listen", localserver.DefaultListenAddress)
+	select {
+	case extra := <-childArgsCh:
+		t.Fatalf("unexpected second background launch args %#v", extra)
+	default:
+	}
+	for i := 0; i < 2; i++ {
+		select {
+		case got := <-authSeen:
+			if got != "Bearer auto-token" {
+				t.Fatalf("GET /projects Authorization = %q, want auto-start bearer token", got)
+			}
+		default:
+			t.Fatal("GET /projects was not called")
+		}
+	}
+}
+
 func TestSessionCreateUsesProjectScopedAPIWithMetadata(t *testing.T) {
 	registryPath := isolateCLIUserRegistry(t)
 	projectDir := t.TempDir()
@@ -3146,6 +3276,132 @@ func TestServerCommandBackgroundWaitsForHealthyDiscoverableServer(t *testing.T) 
 	}
 	if childCode != 0 {
 		t.Fatalf("background child code = %d, stderr = %s", childCode, childStderr.String())
+	}
+}
+
+func TestServerCommandConcurrentBackgroundLaunchesOneChild(t *testing.T) {
+	registryPath := isolateCLIUserRegistry(t)
+	projectDir := t.TempDir()
+	writeCLIFixtureInDir(t, filepath.Join(projectDir, ".agents"))
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/health":
+			writeCLIJSON(w, http.StatusOK, map[string]any{"status": "ok"})
+		default:
+			t.Fatalf("unexpected path %q", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+	addr := strings.TrimPrefix(server.URL, "http://")
+
+	oldStart := startBackgroundServerProcess
+	startEntered := make(chan struct{})
+	allowStart := make(chan struct{})
+	childArgsCh := make(chan []string, 2)
+	waitDone := make(chan struct{})
+	var closeStartEntered sync.Once
+	var closeAllow sync.Once
+	var closeWait sync.Once
+	var startMu sync.Mutex
+	startCount := 0
+	startBackgroundServerProcess = func(ctx context.Context, args []string) (*backgroundServerProcess, error) {
+		startMu.Lock()
+		startCount++
+		startMu.Unlock()
+		closeStartEntered.Do(func() { close(startEntered) })
+		<-allowStart
+
+		childArgsCh <- append([]string(nil), args...)
+		if err := localserver.NewRegistryStore(registryPath).Upsert(localserver.RegistryRecord{
+			CWD:             projectDir,
+			ConfigPath:      filepath.Join(projectDir, ".agents", "sai.yaml"),
+			BaseURL:         addr,
+			PID:             9876,
+			Token:           "background-token",
+			StartedAt:       time.Date(2026, 7, 4, 13, 0, 0, 0, time.UTC),
+			Version:         "test-version",
+			RequestedListen: "127.0.0.1:0",
+		}); err != nil {
+			return nil, err
+		}
+		return &backgroundServerProcess{
+			PID: 9876,
+			wait: func() error {
+				<-waitDone
+				return nil
+			},
+			kill: func() error {
+				closeWait.Do(func() { close(waitDone) })
+				return nil
+			},
+		}, nil
+	}
+	t.Cleanup(func() {
+		startBackgroundServerProcess = oldStart
+		closeAllow.Do(func() { close(allowStart) })
+		closeWait.Do(func() { close(waitDone) })
+	})
+
+	startRuns := make(chan struct{})
+	results := make(chan concurrentCLIRunResult, 2)
+	for i := 0; i < 2; i++ {
+		go func() {
+			<-startRuns
+			var stdout, stderr bytes.Buffer
+			code := RunWithGetwd([]string{"server", "--background", "--port", "0"}, &stdout, &stderr, func() (string, error) {
+				return projectDir, nil
+			})
+			results <- concurrentCLIRunResult{stdout: stdout.String(), stderr: stderr.String(), code: code}
+		}()
+	}
+	close(startRuns)
+
+	select {
+	case <-startEntered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for background start")
+	}
+	time.Sleep(100 * time.Millisecond)
+	startMu.Lock()
+	gotStarts := startCount
+	startMu.Unlock()
+	if gotStarts != 1 {
+		t.Fatalf("background starts before releasing first launch = %d, want 1", gotStarts)
+	}
+	closeAllow.Do(func() { close(allowStart) })
+
+	serverAddrOutputs := 0
+	alreadyRunningOutputs := 0
+	for i := 0; i < 2; i++ {
+		result := receiveConcurrentCLIRunResult(t, results)
+		if result.code != 0 {
+			t.Fatalf("server --background code = %d, stderr = %s", result.code, result.stderr)
+		}
+		if result.stderr != "" {
+			t.Fatalf("stderr = %q, want empty", result.stderr)
+		}
+		if strings.Contains(result.stdout, "SERVER_ADDR\t"+addr) {
+			serverAddrOutputs++
+		}
+		if strings.Contains(result.stdout, "SERVER_ALREADY_RUNNING") && strings.Contains(result.stdout, "addr="+addr) {
+			alreadyRunningOutputs++
+		}
+	}
+	if serverAddrOutputs != 1 || alreadyRunningOutputs != 1 {
+		t.Fatalf("outputs = SERVER_ADDR:%d SERVER_ALREADY_RUNNING:%d, want one each", serverAddrOutputs, alreadyRunningOutputs)
+	}
+
+	childArgs := <-childArgsCh
+	assertCLIStringSliceContains(t, childArgs, "--background-child")
+	assertCLIFlagValue(t, childArgs, "--home", mustCLICanonicalPath(t, filepath.Dir(filepath.Dir(registryPath))))
+	assertCLIFlagValue(t, childArgs, "--config", filepath.Join(projectDir, ".agents", "sai.yaml"))
+	assertCLIFlagValue(t, childArgs, "--cwd", projectDir)
+	assertCLIFlagValue(t, childArgs, "--listen", "127.0.0.1:0")
+	select {
+	case extra := <-childArgsCh:
+		t.Fatalf("unexpected second background launch args %#v", extra)
+	default:
 	}
 }
 
@@ -13909,6 +14165,48 @@ func waitForCode(t *testing.T, ch <-chan int) int {
 		t.Fatal("timed out waiting for chat to finish")
 	}
 	return -1
+}
+
+type concurrentCLIRunResult struct {
+	stdout string
+	stderr string
+	code   int
+}
+
+func receiveConcurrentCLIRunResult(t *testing.T, results <-chan concurrentCLIRunResult) concurrentCLIRunResult {
+	t.Helper()
+
+	select {
+	case result := <-results:
+		return result
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for concurrent CLI run")
+	}
+	return concurrentCLIRunResult{}
+}
+
+func twoCallerGetwd(t *testing.T, dir string) func() (string, error) {
+	t.Helper()
+
+	var mu sync.Mutex
+	calls := 0
+	bothCalled := make(chan struct{})
+	var closeBoth sync.Once
+	return func() (string, error) {
+		mu.Lock()
+		calls++
+		if calls >= 2 {
+			closeBoth.Do(func() { close(bothCalled) })
+		}
+		mu.Unlock()
+
+		select {
+		case <-bothCalled:
+			return dir, nil
+		case <-time.After(2 * time.Second):
+			return "", fmt.Errorf("timed out waiting for concurrent getwd")
+		}
+	}
 }
 
 func waitForFile(t *testing.T, path string) {

@@ -29,7 +29,7 @@ evidence 证明。
 - [x] registry 记录 `pid`、`base_url`、`token`、`version` 和 `started_at`。
 - [x] client 复用 registry 前 health-check。
 - [x] stale registry health-check 失败后可覆盖。
-- [ ] file lock 防止 auto-start / background start 并发双启动。
+- [x] file lock 防止 auto-start / background start 并发双启动。
 - [x] `<cmd> server` 前台启动 namespace singleton，不绑定 cwd/project。
 - [x] 已有健康 server 时 `<cmd> server` 提示 already running 并退出 0。
 - [x] `<cmd> server --background` 显式后台启动。
@@ -369,4 +369,12 @@ evidence 证明。
   blob hash rejection、无裸 global blob hash API、item DTO blob refs、append-only JSONL segment evidence、
   production save path 自动 blobification、store-backed active history hydration、global blob dedupe、
   session seq pagination，以及 chat/debug hidden filtering。
-- Known limits: 当前 M21 slices 未实现 GUI server work、file lock 或 shutdown/recovery semantics。
+- 2026-07-04 M21 file-lock slice:
+  `go test ./internal/server -run "Test(StartupLock|AcquireStartupLock|DiscoverHealthy)"`、
+  `go test ./internal/cli -run "Test(ProjectListConcurrentAutoStartLaunchesOneBackgroundServer|ServerCommandConcurrentBackgroundLaunchesOneChild)"`、
+  `go test ./internal/cli ./internal/server`、`go test ./...` 和 `git diff --check`
+  通过。覆盖 per-home `<home>/server/startup.lock` 私有 lock file、lock release 后第二 caller 继续、
+  concurrent project-command auto-start 只启动一个 background child 且两个 caller 复用同一 registry token、
+  concurrent `server --background` 一个 parent 输出 `SERVER_ADDR`、另一个输出 `SERVER_ALREADY_RUNNING`，
+  以及既有 `DiscoverHealthy` stale registry cleanup 继续通过。
+- Known limits: 当前 M21 slices 未实现 GUI server work 或 shutdown/recovery semantics。
