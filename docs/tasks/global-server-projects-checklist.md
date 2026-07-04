@@ -5,7 +5,7 @@ evidence 证明。
 
 ## Scope
 
-- [ ] 确认 M21 是直接替换，不保留旧 scoped server behavior 兼容层。
+- [x] 确认 M21 是直接替换，不保留旧 scoped server behavior 兼容层。
 - [x] 确认本任务不恢复 hardcoded chat product entry，也不把它作为 hidden alias。
 - [x] 确认用户可见 docs/help/errors 使用 raw `argv[0]` basename，不硬编码具体命令名。
 
@@ -25,30 +25,30 @@ evidence 证明。
 ## Singleton Server and Registry
 
 - [x] registry 默认写入 user-level home namespace。
-- [ ] durable data store 默认写入 user-level home namespace。
+- [x] durable data store 默认写入 user-level home namespace。
 - [x] registry 记录 `pid`、`base_url`、`token`、`version` 和 `started_at`。
 - [x] client 复用 registry 前 health-check。
 - [x] stale registry health-check 失败后可覆盖。
 - [ ] file lock 防止 auto-start / background start 并发双启动。
-- [ ] `<cmd> server` 前台启动 namespace singleton，不绑定 cwd/project。
+- [x] `<cmd> server` 前台启动 namespace singleton，不绑定 cwd/project。
 - [x] 已有健康 server 时 `<cmd> server` 提示 already running 并退出 0。
-- [ ] `<cmd> server --background` 显式后台启动。
-- [ ] `<cmd> server status` 不 auto-start。
-- [ ] `<cmd> server stop` 不 auto-start。
-- [ ] help/version/server foreground/server background/server status/server stop 都不 auto-start。
-- [ ] bare attach/send/project/session commands 需要时 auto-start。
-- [ ] 移除旧 scoped multi-server list 行为。
+- [x] `<cmd> server --background` 显式后台启动。
+- [x] `<cmd> server status` 不 auto-start。
+- [x] `<cmd> server stop` 不 auto-start。
+- [x] help/version/server foreground/server background/server status/server stop 都不 auto-start。
+- [x] bare attach/send/project/session commands 需要时 auto-start。
+- [x] 移除旧 scoped multi-server list 行为。
 
 ## Auth
 
-- [ ] 默认 listen 只使用 loopback。
-- [ ] token 存储在 home namespace 下。
-- [ ] token 文件权限尽量限制为当前 OS user 可读写。
+- [x] 默认 listen 只使用 loopback。
+- [x] token 存储在 home namespace 下。
+- [x] token 文件权限尽量限制为当前 OS user 可读写。
 - [x] `GET /health` 是 public loopback discovery endpoint。
 - [x] `GET /health` 只返回 minimal non-sensitive liveness。
 - [x] 除 `GET /health` 外，所有 HTTP 请求要求 bearer token。
 - [x] 所有 WebSocket 请求要求 bearer token。
-- [ ] 第一版不实现多用户 login。
+- [x] 第一版不实现多用户 login。
 - [x] 新增 project endpoints 要求 registry bearer token。
 
 ## Projects
@@ -335,4 +335,11 @@ evidence 证明。
   `version` output、project guidance `run "custom-agent.exe project create"`、dynamic unknown command `"sai"`
   不被改写、context-window 和 instruction-file warning prefixes 使用 custom basename，以及 `sai.yaml` / `sai.jsonl`
   不被 display renderer 改写。
+- 2026-07-04 M21 singleton/control/auth evidence slice:
+  `go test ./internal/cli -run "Test(SendWithoutSessionAutoStartsSingletonServerWithoutStartupOutput|AttachWithoutSessionAutoStartsSingletonServerWithoutStartupOutput|StatusAndStopDoNotAutoStartSingletonServer)"`
+  通过；`go test ./internal/cli ./internal/server` 通过；覆盖 no-id `send` / `attach`
+  缺 registry 时通过 namespace singleton auto-start 后复用 registry token，且不输出 `SERVER_ADDR`；
+  `status` / `stop` 无健康 registry 时不 auto-start。既有同包测试继续覆盖直接替换/无旧 scoped
+  兼容层、home-backed registry/project/session store、foreground/background singleton、默认 loopback、
+  registry token home 存储与 private permission，以及 server HTTP/WS 第一版 registry-token-only auth。
 - Known limits: 当前 M21 slices 未实现 GUI server work、shutdown semantics 或 transcript/blob migration。

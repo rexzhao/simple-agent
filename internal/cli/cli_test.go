@@ -2644,6 +2644,239 @@ func TestSessionListAutoStartsSingletonServerWithoutStartupOutput(t *testing.T) 
 	}
 }
 
+func TestSendWithoutSessionAutoStartsSingletonServerWithoutStartupOutput(t *testing.T) {
+	registryPath := isolateCLIUserRegistry(t)
+	projectDir := t.TempDir()
+	writeCLIFixtureInDir(t, filepath.Join(projectDir, ".agents"))
+	canonicalRoot, err := projectstore.CanonicalRoot(projectDir)
+	if err != nil {
+		t.Fatalf("CanonicalRoot(%q) error = %v", projectDir, err)
+	}
+
+	authSeen := make(chan string, 3)
+	messageBodySeen := make(chan map[string]any, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/health":
+			writeCLIJSON(w, http.StatusOK, map[string]any{"status": "ok"})
+		case r.URL.Path == "/projects" && r.Method == http.MethodGet:
+			authSeen <- r.Header.Get("Authorization")
+			writeCLIJSON(w, http.StatusOK, map[string]any{
+				"projects": []map[string]any{
+					{
+						"id":           "project-current",
+						"root":         canonicalRoot,
+						"display_name": "Current",
+						"archived":     false,
+						"created_at":   time.Date(2026, 7, 4, 9, 0, 0, 0, time.UTC),
+						"updated_at":   time.Date(2026, 7, 4, 9, 0, 0, 0, time.UTC),
+					},
+				},
+			})
+		case r.URL.Path == "/projects/project-current/sessions" && r.Method == http.MethodGet:
+			authSeen <- r.Header.Get("Authorization")
+			writeCLIJSON(w, http.StatusOK, map[string]any{
+				"sessions": []map[string]any{
+					{
+						"id":            "latest-session",
+						"created_at":    time.Date(2026, 7, 4, 10, 0, 0, 0, time.UTC),
+						"updated_at":    time.Date(2026, 7, 4, 10, 1, 0, 0, time.UTC),
+						"provider":      "fake",
+						"model_profile": "default",
+						"model_id":      "model-default",
+					},
+				},
+			})
+		case r.URL.Path == "/sessions/latest-session/messages" && r.Method == http.MethodPost:
+			authSeen <- r.Header.Get("Authorization")
+			data, err := io.ReadAll(r.Body)
+			if err != nil {
+				t.Fatalf("ReadAll(message body) error = %v", err)
+			}
+			messageBodySeen <- decodeCLIJSON(t, data)
+			writeCLIJSON(w, http.StatusOK, map[string]any{
+				"status":   "committed",
+				"turn_id":  "turn-000001",
+				"last_seq": 1,
+			})
+		default:
+			t.Fatalf("unexpected path %s %q", r.Method, r.URL.Path)
+		}
+	}))
+	defer server.Close()
+	childArgsCh := stubCLIBackgroundStartWithRegistry(t, registryPath, projectDir, server.URL, "auto-token", 6543)
+
+	var stdout, stderr bytes.Buffer
+	code := RunWithGetwd([]string{"send", "--prompt", "hello"}, &stdout, &stderr, func() (string, error) {
+		return projectDir, nil
+	})
+
+	if code != 0 {
+		t.Fatalf("send auto-start code = %d, stderr = %s", code, stderr.String())
+	}
+	if stderr.String() != "" {
+		t.Fatalf("stderr = %q, want empty", stderr.String())
+	}
+	if strings.Contains(stdout.String(), "SERVER_ADDR") {
+		t.Fatalf("stdout = %q, want no SERVER_ADDR", stdout.String())
+	}
+	for _, want := range []string{"SESSION\tlatest-session", "STATUS\tcommitted", "TURN_ID\tturn-000001", "LAST_SEQ\t1"} {
+		if !strings.Contains(stdout.String(), want) {
+			t.Fatalf("send output missing %q:\n%s", want, stdout.String())
+		}
+	}
+	childArgs := <-childArgsCh
+	assertCLIFlagValue(t, childArgs, "--home", mustCLICanonicalPath(t, filepath.Dir(filepath.Dir(registryPath))))
+	assertCLIFlagValue(t, childArgs, "--config", filepath.Join(projectDir, ".agents", "sai.yaml"))
+	assertCLIFlagValue(t, childArgs, "--cwd", projectDir)
+	assertCLIFlagValue(t, childArgs, "--listen", localserver.DefaultListenAddress)
+	for _, name := range []string{"projects", "project sessions", "send"} {
+		select {
+		case got := <-authSeen:
+			if got != "Bearer auto-token" {
+				t.Fatalf("%s Authorization = %q, want bearer auto token", name, got)
+			}
+		default:
+			t.Fatalf("%s request was not called", name)
+		}
+	}
+	select {
+	case got := <-messageBodySeen:
+		if got["content"] != "hello" {
+			t.Fatalf("message body = %#v, want content", got)
+		}
+	default:
+		t.Fatal("message body was not captured")
+	}
+}
+
+func TestAttachWithoutSessionAutoStartsSingletonServerWithoutStartupOutput(t *testing.T) {
+	registryPath := isolateCLIUserRegistry(t)
+	projectDir := t.TempDir()
+	writeCLIFixtureInDir(t, filepath.Join(projectDir, ".agents"))
+	canonicalRoot, err := projectstore.CanonicalRoot(projectDir)
+	if err != nil {
+		t.Fatalf("CanonicalRoot(%q) error = %v", projectDir, err)
+	}
+
+	authSeen := make(chan string, 3)
+	upgrader := websocket.Upgrader{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/health":
+			writeCLIJSON(w, http.StatusOK, map[string]any{"status": "ok"})
+		case r.URL.Path == "/projects" && r.Method == http.MethodGet:
+			authSeen <- r.Header.Get("Authorization")
+			writeCLIJSON(w, http.StatusOK, map[string]any{
+				"projects": []map[string]any{
+					{
+						"id":           "project-current",
+						"root":         canonicalRoot,
+						"display_name": "Current",
+						"archived":     false,
+						"created_at":   time.Date(2026, 7, 4, 9, 0, 0, 0, time.UTC),
+						"updated_at":   time.Date(2026, 7, 4, 9, 0, 0, 0, time.UTC),
+					},
+				},
+			})
+		case r.URL.Path == "/projects/project-current/sessions" && r.Method == http.MethodGet:
+			authSeen <- r.Header.Get("Authorization")
+			writeCLIJSON(w, http.StatusOK, map[string]any{
+				"sessions": []map[string]any{
+					{
+						"id":            "latest-session",
+						"created_at":    time.Date(2026, 7, 4, 10, 0, 0, 0, time.UTC),
+						"updated_at":    time.Date(2026, 7, 4, 10, 1, 0, 0, time.UTC),
+						"provider":      "fake",
+						"model_profile": "default",
+						"model_id":      "model-default",
+					},
+				},
+			})
+		case r.URL.Path == "/sessions/latest-session/stream":
+			authSeen <- r.Header.Get("Authorization")
+			conn, err := upgrader.Upgrade(w, r, nil)
+			if err != nil {
+				t.Fatalf("Upgrade(stream) error = %v", err)
+			}
+			defer conn.Close()
+			for {
+				if _, _, err := conn.NextReader(); err != nil {
+					return
+				}
+			}
+		default:
+			t.Fatalf("unexpected path %s %q", r.Method, r.URL.Path)
+		}
+	}))
+	defer server.Close()
+	childArgsCh := stubCLIBackgroundStartWithRegistry(t, registryPath, projectDir, server.URL, "auto-token", 7654)
+
+	var stdout, stderr bytes.Buffer
+	code := RunWithIO([]string{"attach"}, strings.NewReader("/quit\n"), &stdout, &stderr, func() (string, error) {
+		return projectDir, nil
+	})
+
+	if code != 0 {
+		t.Fatalf("attach auto-start code = %d, stderr = %s", code, stderr.String())
+	}
+	if stdout.String() != "" {
+		t.Fatalf("stdout = %q, want empty", stdout.String())
+	}
+	if strings.Contains(stderr.String(), "SERVER_ADDR") {
+		t.Fatalf("stderr = %q, want no SERVER_ADDR", stderr.String())
+	}
+	assertCLIOutputContains(t, stderr.String(), "sai: attached to session latest-session")
+	childArgs := <-childArgsCh
+	assertCLIFlagValue(t, childArgs, "--home", mustCLICanonicalPath(t, filepath.Dir(filepath.Dir(registryPath))))
+	assertCLIFlagValue(t, childArgs, "--config", filepath.Join(projectDir, ".agents", "sai.yaml"))
+	assertCLIFlagValue(t, childArgs, "--cwd", projectDir)
+	assertCLIFlagValue(t, childArgs, "--listen", localserver.DefaultListenAddress)
+	for _, name := range []string{"projects", "project sessions", "stream"} {
+		select {
+		case got := <-authSeen:
+			if got != "Bearer auto-token" {
+				t.Fatalf("%s Authorization = %q, want bearer auto token", name, got)
+			}
+		default:
+			t.Fatalf("%s request was not called", name)
+		}
+	}
+}
+
+func TestStatusAndStopDoNotAutoStartSingletonServer(t *testing.T) {
+	isolateCLIUserRegistry(t)
+	projectDir := t.TempDir()
+
+	oldStart := startBackgroundServerProcess
+	startBackgroundServerProcess = func(ctx context.Context, args []string) (*backgroundServerProcess, error) {
+		t.Fatalf("unexpected background server auto-start with args %#v", args)
+		return nil, errors.New("unexpected auto-start")
+	}
+	t.Cleanup(func() {
+		startBackgroundServerProcess = oldStart
+	})
+
+	for _, args := range [][]string{
+		{"status"},
+		{"stop"},
+	} {
+		t.Run(strings.Join(args, " "), func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			code := RunWithGetwd(args, &stdout, &stderr, func() (string, error) {
+				return projectDir, nil
+			})
+			if code != 1 {
+				t.Fatalf("RunWithGetwd(%v) code = %d, want 1", args, code)
+			}
+			if stdout.String() != "" {
+				t.Fatalf("stdout = %q, want empty", stdout.String())
+			}
+			assertCLIErrorContains(t, stderr.String(), "no healthy sai server found", "sai server --cwd")
+		})
+	}
+}
+
 func TestServerCommandStartsWithDefaultConfigAndShutdown(t *testing.T) {
 	registryPath := isolateCLIUserRegistry(t)
 	projectDir := t.TempDir()
@@ -13627,6 +13860,50 @@ func registerCLIFakeServer(t *testing.T, registryPath, projectDir, rawURL, token
 	}); err != nil {
 		t.Fatalf("Upsert(fake registry record) error = %v", err)
 	}
+}
+
+func stubCLIBackgroundStartWithRegistry(t *testing.T, registryPath, projectDir, rawURL, token string, pid int) <-chan []string {
+	t.Helper()
+
+	addr := strings.TrimPrefix(rawURL, "http://")
+	if addr == rawURL {
+		t.Fatalf("fake server URL %q does not have http:// prefix", rawURL)
+	}
+	oldStart := startBackgroundServerProcess
+	childArgsCh := make(chan []string, 1)
+	waitDone := make(chan struct{})
+	var closeWait sync.Once
+	startBackgroundServerProcess = func(ctx context.Context, args []string) (*backgroundServerProcess, error) {
+		childArgsCh <- append([]string(nil), args...)
+		if err := localserver.NewRegistryStore(registryPath).Upsert(localserver.RegistryRecord{
+			CWD:             projectDir,
+			ConfigPath:      filepath.Join(projectDir, ".agents", "sai.yaml"),
+			BaseURL:         addr,
+			PID:             pid,
+			Token:           token,
+			StartedAt:       time.Date(2026, 7, 4, 11, 0, 0, 0, time.UTC),
+			Version:         "test-version",
+			RequestedListen: localserver.DefaultListenAddress,
+		}); err != nil {
+			return nil, err
+		}
+		return &backgroundServerProcess{
+			PID: pid,
+			wait: func() error {
+				<-waitDone
+				return nil
+			},
+			kill: func() error {
+				closeWait.Do(func() { close(waitDone) })
+				return nil
+			},
+		}, nil
+	}
+	t.Cleanup(func() {
+		startBackgroundServerProcess = oldStart
+		closeWait.Do(func() { close(waitDone) })
+	})
+	return childArgsCh
 }
 
 func registerCLIFakeServerInHome(t *testing.T, home, projectDir, rawURL, token string) {
