@@ -27,6 +27,8 @@ func TestSessionMetadataAPIsListDetailNoItemsAndServerCount(t *testing.T) {
 	first := sessions.SessionV2{
 		ID:              "session-one",
 		CreatedAt:       time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC),
+		DisplayName:     "Session One",
+		LastUsedAt:      time.Date(2026, 7, 3, 12, 30, 0, 0, time.UTC),
 		Provider:        "paperhub",
 		ModelProfile:    "glm-5.2-fast",
 		ModelID:         "glm-5.2",
@@ -108,6 +110,11 @@ func TestSessionMetadataAPIsListDetailNoItemsAndServerCount(t *testing.T) {
 		if session["id"] == "session-one" && session["last_seq"] != float64(1) {
 			t.Fatalf("session-one last_seq = %#v, want 1", session["last_seq"])
 		}
+		if session["id"] == "session-one" {
+			if session["display_name"] != "Session One" || session["archived"] != false || session["last_used_at"] == nil {
+				t.Fatalf("session-one lifecycle metadata = %#v, want display_name/archived/last_used_at", session)
+			}
+		}
 	}
 	for _, info := range infos {
 		wantIDs = append(wantIDs, info.ID)
@@ -120,6 +127,9 @@ func TestSessionMetadataAPIsListDetailNoItemsAndServerCount(t *testing.T) {
 	assertNoSessionTimelineLeak(t, detailRaw)
 	if detail["id"] != "session-one" || detail["status"] != "idle" || detail["last_seq"] != float64(1) {
 		t.Fatalf("detail = %#v, want idle session-one last_seq 1", detail)
+	}
+	if detail["display_name"] != "Session One" || detail["archived"] != false || detail["last_used_at"] == nil {
+		t.Fatalf("detail lifecycle metadata = %#v, want display_name/archived/last_used_at", detail)
 	}
 	context := detail["context"].(map[string]any)
 	if context["context_window"] != float64(128000) || context["last_request_tokens"] != float64(1000) {
@@ -257,6 +267,104 @@ func TestSessionCreateRequiresRegistryToken(t *testing.T) {
 	}
 }
 
+func TestSessionMetadataUpdateRenameArchiveAuthBusyAndPreservesTimeline(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "sessions")
+	store := sessions.NewV2Store(root)
+	lastUsedAt := time.Date(2026, 7, 4, 11, 1, 0, 0, time.UTC)
+	if _, err := store.SaveMetadata(sessions.SessionV2{
+		ID:           "update-session",
+		LastUsedAt:   lastUsedAt,
+		Provider:     "codex",
+		ModelProfile: "default",
+		ModelID:      "gpt-5",
+	}); err != nil {
+		t.Fatalf("SaveMetadata(update-session) error = %v", err)
+	}
+	item := appendServerTestItem(t, store, "update-session", sessions.SessionItem{
+		ID:         "item-1",
+		Kind:       sessions.ItemKindMessage,
+		Visibility: sessions.ItemVisibilityVisible,
+		Audience:   sessions.ItemAudienceUser,
+		Message:    &model.Message{Role: model.MessageRoleUser, Content: "timeline secret"},
+	})
+	if _, err := store.ReplaceActiveHistory("update-session", []string{item.ID}); err != nil {
+		t.Fatalf("ReplaceActiveHistory(update-session) error = %v", err)
+	}
+	if _, err := store.AppendCompaction("update-session", sessions.CompactionCheckpoint{
+		ID:                 "compact-1",
+		SummaryItemID:      "summary-1",
+		ReplacementHistory: []string{item.ID},
+	}); err != nil {
+		t.Fatalf("AppendCompaction(update-session) error = %v", err)
+	}
+	process := startSessionAPIServerWithToken(t, store, sessions.SessionV2{}, "registry-token")
+	baseURL := "http://" + process.Addr()
+
+	raw, body := patchRawJSONStatus(t, baseURL+"/sessions/update-session", `{"display_name":"No Token"}`, "", http.StatusForbidden)
+	assertErrorCode(t, body, "permission_denied")
+	if bytes.Contains(raw, []byte("registry-token")) || bytes.Contains(raw, []byte("timeline secret")) {
+		t.Fatalf("permission error leaked sensitive content: %s", raw)
+	}
+
+	for _, tt := range []struct {
+		name string
+		body string
+	}{
+		{name: "empty body", body: ""},
+		{name: "empty object", body: "{}"},
+		{name: "blank display name", body: `{"display_name":"   "}`},
+		{name: "invalid archived", body: `{"archived":"true"}`},
+		{name: "unsupported field", body: `{"name":"Wrong"}`},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			raw, body := patchRawJSONStatus(t, baseURL+"/sessions/update-session", tt.body, "registry-token", http.StatusBadRequest)
+			assertErrorCode(t, body, "invalid_request")
+			if bytes.Contains(raw, []byte("registry-token")) || bytes.Contains(raw, []byte("timeline secret")) {
+				t.Fatalf("invalid update response leaked sensitive content: %s", raw)
+			}
+		})
+	}
+
+	renamed, err := RenameSessionWithToken(context.Background(), process.Addr(), "registry-token", "update-session", "Renamed Session", 2*time.Second)
+	if err != nil {
+		t.Fatalf("RenameSessionWithToken() error = %v", err)
+	}
+	if renamed.DisplayName != "Renamed Session" || renamed.Archived || !renamed.LastUsedAt.Equal(lastUsedAt) {
+		t.Fatalf("renamed session = %#v, want display name, non-archived, stable last_used_at", renamed)
+	}
+	archived, err := ArchiveSessionWithToken(context.Background(), process.Addr(), "registry-token", "update-session", 2*time.Second)
+	if err != nil {
+		t.Fatalf("ArchiveSessionWithToken() error = %v", err)
+	}
+	if archived.DisplayName != "Renamed Session" || !archived.Archived || !archived.LastUsedAt.Equal(lastUsedAt) {
+		t.Fatalf("archived session = %#v, want archived with stable metadata", archived)
+	}
+
+	stored, err := store.Load("update-session")
+	if err != nil {
+		t.Fatalf("Load(update-session) error = %v", err)
+	}
+	if got, want := responseSessionItemIDs(stored.Items), []string{"item-1"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("stored item IDs = %#v, want %#v", got, want)
+	}
+	if !reflect.DeepEqual(stored.ActiveHistory, []string{"item-1"}) || len(stored.Compactions) != 1 || stored.Compactions[0].ID != "compact-1" {
+		t.Fatalf("stored timeline state = active %#v compactions %#v, want preserved", stored.ActiveHistory, stored.Compactions)
+	}
+	if !stored.LastUsedAt.Equal(lastUsedAt) {
+		t.Fatalf("stored LastUsedAt = %s, want %s", stored.LastUsedAt, lastUsedAt)
+	}
+
+	if !process.beginSessionTurn("update-session", "turn-busy") {
+		t.Fatal("beginSessionTurn(update-session) = false, want true")
+	}
+	raw, body = patchRawJSONStatus(t, baseURL+"/sessions/update-session", `{"display_name":"Busy Rename"}`, "registry-token", http.StatusConflict)
+	process.endSessionTurn("update-session")
+	assertErrorCode(t, body, "session_busy")
+	if bytes.Contains(raw, []byte("Busy Rename")) || bytes.Contains(raw, []byte("timeline secret")) {
+		t.Fatalf("busy response leaked update or timeline content: %s", raw)
+	}
+}
+
 func TestProjectSessionAPIsCreateListFilterAndClient(t *testing.T) {
 	projectStore := projectstore.NewStore(filepath.Join(t.TempDir(), "projects"))
 	sessionStore := sessions.NewV2Store(filepath.Join(t.TempDir(), "sessions"))
@@ -378,6 +486,93 @@ func TestProjectSessionAPIsCreateListFilterAndClient(t *testing.T) {
 		if item.ProjectID != projectOne.ID {
 			t.Fatalf("project one list returned session for project %q: %#v", item.ProjectID, item)
 		}
+	}
+}
+
+func TestSessionListArchivedFilteringGlobalAndProject(t *testing.T) {
+	projectStore := projectstore.NewStore(filepath.Join(t.TempDir(), "projects"))
+	sessionStore := sessions.NewV2Store(filepath.Join(t.TempDir(), "sessions"))
+	projectOne, _, err := projectStore.Create(mkdirServerTestDir(t, "archive-project-one"), "Project One")
+	if err != nil {
+		t.Fatalf("Create(project one) error = %v", err)
+	}
+	projectTwo, _, err := projectStore.Create(mkdirServerTestDir(t, "archive-project-two"), "Project Two")
+	if err != nil {
+		t.Fatalf("Create(project two) error = %v", err)
+	}
+	lastUsedAt := time.Date(2026, 7, 4, 10, 1, 0, 0, time.UTC)
+	for _, session := range []sessions.SessionV2{
+		{
+			ID:           "project-one-active",
+			ProjectID:    projectOne.ID,
+			CreatedCWD:   projectOne.Root,
+			CWD:          projectOne.Root,
+			LastUsedAt:   lastUsedAt,
+			Provider:     "codex",
+			ModelProfile: "default",
+			ModelID:      "gpt-5",
+		},
+		{
+			ID:           "project-one-archived",
+			DisplayName:  "Archived One",
+			Archived:     true,
+			ProjectID:    projectOne.ID,
+			CreatedCWD:   projectOne.Root,
+			CWD:          projectOne.Root,
+			LastUsedAt:   lastUsedAt.Add(time.Minute),
+			Provider:     "codex",
+			ModelProfile: "default",
+			ModelID:      "gpt-5",
+		},
+		{
+			ID:           "project-two-archived",
+			Archived:     true,
+			ProjectID:    projectTwo.ID,
+			CreatedCWD:   projectTwo.Root,
+			CWD:          projectTwo.Root,
+			LastUsedAt:   lastUsedAt.Add(2 * time.Minute),
+			Provider:     "codex",
+			ModelProfile: "default",
+			ModelID:      "gpt-5",
+		},
+	} {
+		if _, err := sessionStore.SaveMetadata(session); err != nil {
+			t.Fatalf("SaveMetadata(%s) error = %v", session.ID, err)
+		}
+	}
+	process := startProjectSessionAPIServer(t, projectStore, sessionStore, sessions.SessionV2{}, "registry-token")
+
+	globalActive, err := ListSessionsWithOptions(context.Background(), process.Addr(), "registry-token", SessionListOptions{}, 2*time.Second)
+	if err != nil {
+		t.Fatalf("ListSessionsWithOptions(active) error = %v", err)
+	}
+	if got, want := sessionMetadataIDs(globalActive), []string{"project-one-active"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("global active IDs = %#v, want %#v", got, want)
+	}
+	globalArchived, err := ListSessionsWithOptions(context.Background(), process.Addr(), "registry-token", SessionListOptions{Archived: true}, 2*time.Second)
+	if err != nil {
+		t.Fatalf("ListSessionsWithOptions(archived) error = %v", err)
+	}
+	if got, want := sessionMetadataIDs(globalArchived), []string{"project-two-archived", "project-one-archived"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("global archived IDs = %#v, want %#v", got, want)
+	}
+	if !globalArchived[1].Archived || globalArchived[1].DisplayName != "Archived One" || globalArchived[1].LastUsedAt.IsZero() {
+		t.Fatalf("archived metadata = %#v, want lifecycle fields", globalArchived[1])
+	}
+
+	projectActive, err := ListProjectSessionsWithOptions(context.Background(), process.Addr(), "registry-token", projectOne.ID, SessionListOptions{}, 2*time.Second)
+	if err != nil {
+		t.Fatalf("ListProjectSessionsWithOptions(active) error = %v", err)
+	}
+	if got, want := sessionMetadataIDs(projectActive), []string{"project-one-active"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("project active IDs = %#v, want %#v", got, want)
+	}
+	projectArchived, err := ListProjectSessionsWithOptions(context.Background(), process.Addr(), "registry-token", projectOne.ID, SessionListOptions{Archived: true}, 2*time.Second)
+	if err != nil {
+		t.Fatalf("ListProjectSessionsWithOptions(archived) error = %v", err)
+	}
+	if got, want := sessionMetadataIDs(projectArchived), []string{"project-one-archived"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("project archived IDs = %#v, want %#v", got, want)
 	}
 }
 
@@ -665,8 +860,8 @@ func TestSessionMetadataStructuredErrors(t *testing.T) {
 		t.Fatalf("POST /sessions/id error = %v", err)
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusMethodNotAllowed || resp.Header.Get("Allow") != "GET" {
-		t.Fatalf("POST /sessions/id status/allow = %d/%q, want 405 GET", resp.StatusCode, resp.Header.Get("Allow"))
+	if resp.StatusCode != http.StatusMethodNotAllowed || resp.Header.Get("Allow") != "GET, PATCH" {
+		t.Fatalf("POST /sessions/id status/allow = %d/%q, want 405 GET, PATCH", resp.StatusCode, resp.Header.Get("Allow"))
 	}
 	body = decodeJSON(t, resp)
 	if got := body["error"].(map[string]any)["code"]; got != "method_not_allowed" {
@@ -2507,6 +2702,29 @@ func postRawJSONStatus(t *testing.T, url, body, token string, wantStatus int) ([
 	defer resp.Body.Close()
 	if resp.StatusCode != wantStatus {
 		t.Fatalf("Post(%s) status = %d, want %d", url, resp.StatusCode, wantStatus)
+	}
+	return readRawJSON(t, resp)
+}
+
+func patchRawJSONStatus(t *testing.T, url, body, token string, wantStatus int) ([]byte, map[string]any) {
+	t.Helper()
+
+	req, err := http.NewRequest(http.MethodPatch, url, strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("NewRequest(PATCH %s) error = %v", url, err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	client := http.Client{Timeout: 2 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("Patch(%s) error = %v", url, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != wantStatus {
+		t.Fatalf("Patch(%s) status = %d, want %d", url, resp.StatusCode, wantStatus)
 	}
 	return readRawJSON(t, resp)
 }

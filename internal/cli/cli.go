@@ -203,7 +203,7 @@ func execute(ctx context.Context, program string, args []string, stdin io.Reader
 			return usageError("usage: sai project <create|list|show|remove>", "", "sai help project")
 		}
 	case "session":
-		subcommand, subArgs, groupHelp, err := splitSubcommandArgs(rootArgs.commandArgs, map[string]flagKind{"cwd": flagKindValue, "project": flagKindValue, "all-projects": flagKindBool}, "sai help session")
+		subcommand, subArgs, groupHelp, err := splitSubcommandArgs(rootArgs.commandArgs, map[string]flagKind{"cwd": flagKindValue, "project": flagKindValue, "all-projects": flagKindBool, "archived": flagKindBool}, "sai help session")
 		if err != nil {
 			return err
 		}
@@ -218,8 +218,12 @@ func execute(ctx context.Context, program string, args []string, stdin io.Reader
 			return sessionListCommand(ctx, subArgs, rootArgs.configPath, homePath, stdout, getwd, program)
 		case "show":
 			return sessionShowCommand(ctx, subArgs, rootArgs.configPath, homePath, stdout, getwd, program)
+		case "rename":
+			return sessionRenameCommand(ctx, subArgs, rootArgs.configPath, homePath, stdout, getwd, program)
+		case "archive":
+			return sessionArchiveCommand(ctx, subArgs, rootArgs.configPath, homePath, stdout, getwd, program)
 		default:
-			return usageError("usage: sai session <create|list|show>", "", "sai help session")
+			return usageError("usage: sai session <create|list|show|rename|archive>", "", "sai help session")
 		}
 	case "status":
 		return statusCommand(ctx, rootArgs.commandArgs, homePath, stdout, getwd)
@@ -469,6 +473,8 @@ Commands:
   session create    Create a session in the nearest registered project
   session list      List explicit sessions
   session show      Show session metadata
+  session rename    Rename a session
+  session archive   Archive a session
 
 Run "sai help session <command>" for command usage.
 `
@@ -479,17 +485,28 @@ Creates a server-owned session in the nearest registered project. Use --cwd to
 select the creation directory; otherwise the effective current directory is used.
 `
 
-const sessionListUsageText = `usage: sai session list [--project project-id] [--all-projects]
+const sessionListUsageText = `usage: sai session list [--project project-id] [--all-projects] [--archived]
 
 Lists session metadata without printing messages, prompts, assistant output, or
 tool result content. Without flags, the current directory is matched to the
-nearest registered ancestor project.
+nearest registered ancestor project. By default, archived sessions are hidden.
 `
 
 const sessionShowUsageText = `usage: sai session show <session-id>
 
 Shows metadata for an explicit global session id. Messages, prompts, assistant
 output, and tool result content are not printed.
+`
+
+const sessionRenameUsageText = `usage: sai session rename <session-id> <name>
+
+Updates the session display name. The name must be passed as a single shell
+argument.
+`
+
+const sessionArchiveUsageText = `usage: sai session archive <session-id>
+
+Archives a session so default session lists and automatic selection hide it.
 `
 
 const statusUsageText = `usage: sai status [--cwd path]
@@ -657,6 +674,10 @@ func helpCommand(args []string, stdout io.Writer) error {
 		printSessionListUsage(stdout)
 	case "session show":
 		printSessionShowUsage(stdout)
+	case "session rename":
+		printSessionRenameUsage(stdout)
+	case "session archive":
+		printSessionArchiveUsage(stdout)
 	case "status":
 		printStatusUsage(stdout)
 	case "stop":
@@ -771,6 +792,14 @@ func printSessionListUsage(stdout io.Writer) {
 
 func printSessionShowUsage(stdout io.Writer) {
 	fmt.Fprint(stdout, sessionShowUsageText)
+}
+
+func printSessionRenameUsage(stdout io.Writer) {
+	fmt.Fprint(stdout, sessionRenameUsageText)
+}
+
+func printSessionArchiveUsage(stdout io.Writer) {
+	fmt.Fprint(stdout, sessionArchiveUsageText)
 }
 
 func printStatusUsage(stdout io.Writer) {
@@ -896,6 +925,7 @@ func splitRootArgs(args []string) (rootArgs, error) {
 	known := map[string]flagKind{
 		"config":         flagKindValue,
 		"all-projects":   flagKindBool,
+		"archived":       flagKindBool,
 		"home":           flagKindValue,
 		"name":           flagKindValue,
 		"project":        flagKindValue,
@@ -1890,23 +1920,25 @@ func sessionListCommand(ctx context.Context, args []string, configPath, homePath
 	flags := flag.NewFlagSet("sai session list", flag.ContinueOnError)
 	projectID := flags.String("project", "", "project id")
 	allProjects := flags.Bool("all-projects", false, "list sessions across all projects")
+	archived := flags.Bool("archived", false, "list archived sessions")
 	positionals, done, err := parseCommandFlagArgs(flags, args, stdout, printSessionListUsage, "sai help session list")
 	if done || err != nil {
 		return err
 	}
 	if len(positionals) != 0 {
-		return usageError("usage: sai session list [--project project-id] [--all-projects]", "", "sai help session list")
+		return usageError("usage: sai session list [--project project-id] [--all-projects] [--archived]", "", "sai help session list")
 	}
 	if *allProjects && strings.TrimSpace(*projectID) != "" {
 		return usageError("--project cannot be combined with --all-projects", "", "sai help session list")
 	}
 
+	listOptions := localserver.SessionListOptions{Archived: *archived}
 	if *allProjects {
 		record, err := ensureSessionCommandServer(ctx, configPath, homePath, program, getwd)
 		if err != nil {
 			return err
 		}
-		infos, err := localserver.ListSessions(ctx, record.BaseURL, record.Token, serverClientTimeout)
+		infos, err := localserver.ListSessionsWithOptions(ctx, record.BaseURL, record.Token, listOptions, serverClientTimeout)
 		if err != nil {
 			return err
 		}
@@ -1939,7 +1971,7 @@ func sessionListCommand(ctx context.Context, args []string, configPath, homePath
 		}
 	}
 
-	infos, err := localserver.ListProjectSessionsWithToken(ctx, record.BaseURL, record.Token, project, serverClientTimeout)
+	infos, err := localserver.ListProjectSessionsWithOptions(ctx, record.BaseURL, record.Token, project, listOptions, serverClientTimeout)
 	if err != nil {
 		return err
 	}
@@ -1961,6 +1993,60 @@ func sessionShowCommand(ctx context.Context, args []string, configPath, homePath
 		return err
 	}
 	session, err := localserver.GetSessionDetail(ctx, record.BaseURL, record.Token, positionals[0], serverClientTimeout)
+	if err != nil {
+		return err
+	}
+	return printServerSessionDetailWithProject(stdout, session)
+}
+
+func sessionRenameCommand(ctx context.Context, args []string, configPath, homePath string, stdout io.Writer, getwd func() (string, error), program string) error {
+	flags := flag.NewFlagSet("sai session rename", flag.ContinueOnError)
+	positionals, done, err := parseCommandFlagArgs(flags, args, stdout, printSessionRenameUsage, "sai help session rename")
+	if done || err != nil {
+		return err
+	}
+	if len(positionals) != 2 {
+		return usageError("usage: sai session rename <session-id> <name>", "", "sai help session rename")
+	}
+	sessionID := strings.TrimSpace(positionals[0])
+	displayName := strings.TrimSpace(positionals[1])
+	if sessionID == "" {
+		return usageError("session id must be a non-empty string", "", "sai help session rename")
+	}
+	if displayName == "" {
+		return usageError("session display name must be a non-empty string", "", "sai help session rename")
+	}
+
+	record, err := ensureSessionCommandServer(ctx, configPath, homePath, program, getwd)
+	if err != nil {
+		return err
+	}
+	session, err := localserver.RenameSessionWithToken(ctx, record.BaseURL, record.Token, sessionID, displayName, serverClientTimeout)
+	if err != nil {
+		return err
+	}
+	return printServerSessionDetailWithProject(stdout, session)
+}
+
+func sessionArchiveCommand(ctx context.Context, args []string, configPath, homePath string, stdout io.Writer, getwd func() (string, error), program string) error {
+	flags := flag.NewFlagSet("sai session archive", flag.ContinueOnError)
+	positionals, done, err := parseCommandFlagArgs(flags, args, stdout, printSessionArchiveUsage, "sai help session archive")
+	if done || err != nil {
+		return err
+	}
+	if len(positionals) != 1 {
+		return usageError("usage: sai session archive <session-id>", "", "sai help session archive")
+	}
+	sessionID := strings.TrimSpace(positionals[0])
+	if sessionID == "" {
+		return usageError("session id must be a non-empty string", "", "sai help session archive")
+	}
+
+	record, err := ensureSessionCommandServer(ctx, configPath, homePath, program, getwd)
+	if err != nil {
+		return err
+	}
+	session, err := localserver.ArchiveSessionWithToken(ctx, record.BaseURL, record.Token, sessionID, serverClientTimeout)
 	if err != nil {
 		return err
 	}
@@ -3301,6 +3387,13 @@ func printServerSessionDetailFields(stdout io.Writer, session localserver.Sessio
 	fmt.Fprintf(stdout, "ID\t%s\n", session.ID)
 	fmt.Fprintf(stdout, "CREATED\t%s\n", formatSessionTimestamp(session.CreatedAt))
 	fmt.Fprintf(stdout, "UPDATED\t%s\n", formatSessionTimestamp(session.UpdatedAt))
+	lastUsedAt := session.LastUsedAt
+	if lastUsedAt.IsZero() {
+		lastUsedAt = session.UpdatedAt
+	}
+	fmt.Fprintf(stdout, "LAST_USED\t%s\n", formatSessionTimestamp(lastUsedAt))
+	fmt.Fprintf(stdout, "DISPLAY_NAME\t%s\n", session.DisplayName)
+	fmt.Fprintf(stdout, "ARCHIVED\t%t\n", session.Archived)
 	fmt.Fprintf(stdout, "PROVIDER\t%s\n", session.Provider)
 	fmt.Fprintf(stdout, "MODEL_PROFILE\t%s\n", session.ModelProfile)
 	fmt.Fprintf(stdout, "MODEL_ID\t%s\n", session.ModelID)
@@ -3333,11 +3426,15 @@ func printServerSessionDetailFields(stdout io.Writer, session localserver.Sessio
 }
 
 func printServerSessionList(stdout io.Writer, infos []localserver.SessionMetadata) error {
-	if _, err := fmt.Fprintln(stdout, "ID\tUPDATED\tPROVIDER\tMODEL/PROFILE"); err != nil {
+	if _, err := fmt.Fprintln(stdout, "ID\tLAST_USED\tPROVIDER\tMODEL/PROFILE"); err != nil {
 		return err
 	}
 	for _, info := range infos {
-		if _, err := fmt.Fprintf(stdout, "%s\t%s\t%s\t%s/%s\n", info.ID, formatSessionTimestamp(info.UpdatedAt), info.Provider, info.ModelID, info.ModelProfile); err != nil {
+		lastUsedAt := info.LastUsedAt
+		if lastUsedAt.IsZero() {
+			lastUsedAt = info.UpdatedAt
+		}
+		if _, err := fmt.Fprintf(stdout, "%s\t%s\t%s\t%s/%s\n", info.ID, formatSessionTimestamp(lastUsedAt), info.Provider, info.ModelID, info.ModelProfile); err != nil {
 			return err
 		}
 	}

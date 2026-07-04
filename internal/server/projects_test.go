@@ -164,6 +164,7 @@ func TestProjectRemoveRejectsRunningProjectTurn(t *testing.T) {
 	sessionStore := sessions.NewV2Store(filepath.Join(t.TempDir(), "sessions"))
 	if _, err := sessionStore.SaveMetadata(sessions.SessionV2{
 		ID:           "busy-project-session",
+		Archived:     true,
 		Provider:     "codex",
 		ModelProfile: "default",
 		ModelID:      "gpt-5",

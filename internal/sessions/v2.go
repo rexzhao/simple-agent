@@ -92,6 +92,9 @@ type SessionV2 struct {
 	Version              int                    `json:"version"`
 	CreatedAt            time.Time              `json:"created_at"`
 	UpdatedAt            time.Time              `json:"updated_at"`
+	DisplayName          string                 `json:"display_name,omitempty"`
+	Archived             bool                   `json:"archived"`
+	LastUsedAt           time.Time              `json:"last_used_at"`
 	Provider             string                 `json:"provider"`
 	ModelProfile         string                 `json:"model_profile"`
 	ModelID              string                 `json:"model_id"`
@@ -151,6 +154,11 @@ func MaterializeActiveHistory(session SessionV2) ([]model.Message, error) {
 
 type V2StoreOptions struct {
 	MaxSegmentLines int
+}
+
+type V2ListOptions struct {
+	Archived bool
+	All      bool
 }
 
 type V2Store struct {
@@ -220,6 +228,12 @@ func (s *V2Store) SaveMetadata(session SessionV2) (SessionV2, error) {
 	if session.CreatedAt.IsZero() {
 		session.CreatedAt = now
 	}
+	if session.LastUsedAt.IsZero() {
+		session.LastUsedAt = sessionEffectiveLastUsedAt(session)
+		if session.LastUsedAt.IsZero() {
+			session.LastUsedAt = now
+		}
+	}
 	session.UpdatedAt = now
 	session = copySessionV2(session)
 
@@ -264,6 +278,10 @@ func (s *V2Store) Load(id string) (SessionV2, error) {
 }
 
 func (s *V2Store) List() ([]Info, error) {
+	return s.ListWithOptions(V2ListOptions{})
+}
+
+func (s *V2Store) ListWithOptions(options V2ListOptions) ([]Info, error) {
 	if err := s.requireRoot(); err != nil {
 		return nil, err
 	}
@@ -275,7 +293,7 @@ func (s *V2Store) List() ([]Info, error) {
 		return nil, fmt.Errorf("read session store %q: %w", s.root, err)
 	}
 
-	infos := make([]Info, 0, len(entries))
+	sessions := make([]SessionV2, 0, len(entries))
 	for _, entry := range entries {
 		if !entry.IsDir() {
 			continue
@@ -291,14 +309,26 @@ func (s *V2Store) List() ([]Info, error) {
 			}
 			return nil, err
 		}
+		if !options.All && session.Archived != options.Archived {
+			continue
+		}
+		sessions = append(sessions, session)
+	}
+	sort.Slice(sessions, func(i, j int) bool {
+		leftLastUsed := sessionEffectiveLastUsedAt(sessions[i])
+		rightLastUsed := sessionEffectiveLastUsedAt(sessions[j])
+		if !leftLastUsed.Equal(rightLastUsed) {
+			return leftLastUsed.After(rightLastUsed)
+		}
+		if !sessions[i].CreatedAt.Equal(sessions[j].CreatedAt) {
+			return sessions[i].CreatedAt.After(sessions[j].CreatedAt)
+		}
+		return sessions[i].ID < sessions[j].ID
+	})
+	infos := make([]Info, 0, len(sessions))
+	for _, session := range sessions {
 		infos = append(infos, session.info())
 	}
-	sort.Slice(infos, func(i, j int) bool {
-		if infos[i].UpdatedAt.Equal(infos[j].UpdatedAt) {
-			return infos[i].ID < infos[j].ID
-		}
-		return infos[i].UpdatedAt.After(infos[j].UpdatedAt)
-	})
 	return infos, nil
 }
 
@@ -475,6 +505,7 @@ func (s *V2Store) SaveTurn(session SessionV2, items []SessionItem, activeHistory
 		session.CreatedAt = now
 	}
 	session.UpdatedAt = now
+	session.LastUsedAt = now
 	session = copySessionV2(session)
 
 	if !isNew {
@@ -530,6 +561,7 @@ func (s *V2Store) SaveCompactedTurn(session SessionV2, summaryItem SessionItem, 
 		session.CreatedAt = now
 	}
 	session.UpdatedAt = now
+	session.LastUsedAt = now
 	session = copySessionV2(session)
 
 	if !isNew {
@@ -1003,6 +1035,9 @@ type sessionV2Metadata struct {
 	Version              int                    `json:"version"`
 	CreatedAt            time.Time              `json:"created_at"`
 	UpdatedAt            time.Time              `json:"updated_at"`
+	DisplayName          string                 `json:"display_name,omitempty"`
+	Archived             bool                   `json:"archived"`
+	LastUsedAt           time.Time              `json:"last_used_at"`
 	Provider             string                 `json:"provider"`
 	ModelProfile         string                 `json:"model_profile"`
 	ModelID              string                 `json:"model_id"`
@@ -1062,6 +1097,9 @@ func metadataFromSessionV2(session SessionV2) sessionV2Metadata {
 		Version:              session.Version,
 		CreatedAt:            session.CreatedAt,
 		UpdatedAt:            session.UpdatedAt,
+		DisplayName:          session.DisplayName,
+		Archived:             session.Archived,
+		LastUsedAt:           session.LastUsedAt,
 		Provider:             session.Provider,
 		ModelProfile:         session.ModelProfile,
 		ModelID:              session.ModelID,
@@ -1083,11 +1121,14 @@ func metadataFromSessionV2(session SessionV2) sessionV2Metadata {
 }
 
 func (m sessionV2Metadata) session() SessionV2 {
-	return SessionV2{
+	session := SessionV2{
 		ID:                   m.ID,
 		Version:              m.Version,
 		CreatedAt:            m.CreatedAt,
 		UpdatedAt:            m.UpdatedAt,
+		DisplayName:          m.DisplayName,
+		Archived:             m.Archived,
+		LastUsedAt:           m.LastUsedAt,
 		Provider:             m.Provider,
 		ModelProfile:         m.ModelProfile,
 		ModelID:              m.ModelID,
@@ -1106,6 +1147,10 @@ func (m sessionV2Metadata) session() SessionV2 {
 		Context:              m.Context,
 		SaveToolResults:      m.SaveToolResults,
 	}
+	if session.LastUsedAt.IsZero() {
+		session.LastUsedAt = sessionEffectiveLastUsedAt(session)
+	}
+	return session
 }
 
 type replayTransaction struct {
@@ -1459,4 +1504,14 @@ func (s SessionV2) info() Info {
 		ContextSource:   s.Context.ContextWindowSource,
 		SaveToolResults: s.SaveToolResults,
 	}
+}
+
+func sessionEffectiveLastUsedAt(session SessionV2) time.Time {
+	if !session.LastUsedAt.IsZero() {
+		return session.LastUsedAt
+	}
+	if !session.UpdatedAt.IsZero() {
+		return session.UpdatedAt
+	}
+	return session.CreatedAt
 }

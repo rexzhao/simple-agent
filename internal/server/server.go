@@ -578,12 +578,17 @@ func (p *Process) handleProjectSessionsList(w http.ResponseWriter, r *http.Reque
 	if !ok {
 		return
 	}
+	query, err := parseSessionListQuery(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_query", err.Error())
+		return
+	}
 	store := p.sessionStore
 	if store == nil {
 		writeError(w, http.StatusServiceUnavailable, "session_store_unavailable", "session store is not configured")
 		return
 	}
-	infos, err := store.List()
+	infos, err := store.ListWithOptions(sessions.V2ListOptions{Archived: query.Archived})
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "session_store_error", "could not list sessions")
 		return
@@ -675,11 +680,15 @@ func (p *Process) handleSessionPath(w http.ResponseWriter, r *http.Request) {
 	}
 	switch {
 	case len(parts) == 1:
-		if r.Method != http.MethodGet {
-			writeMethodNotAllowed(w, http.MethodGet)
+		switch r.Method {
+		case http.MethodGet:
+			p.handleSessionDetail(w, r, id)
+		case http.MethodPatch:
+			p.handleSessionMetadataUpdate(w, r, id)
+		default:
+			writeMethodNotAllowed(w, http.MethodGet, http.MethodPatch)
 			return
 		}
-		p.handleSessionDetail(w, r, id)
 	case len(parts) == 2 && parts[1] == "items":
 		if r.Method != http.MethodGet {
 			writeMethodNotAllowed(w, http.MethodGet)
@@ -716,12 +725,17 @@ func (p *Process) handleSessionPath(w http.ResponseWriter, r *http.Request) {
 }
 
 func (p *Process) handleSessionsList(w http.ResponseWriter, r *http.Request) {
+	query, err := parseSessionListQuery(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_query", err.Error())
+		return
+	}
 	store := p.sessionStore
 	if store == nil {
 		writeError(w, http.StatusServiceUnavailable, "session_store_unavailable", "session store is not configured")
 		return
 	}
-	infos, err := store.List()
+	infos, err := store.ListWithOptions(sessions.V2ListOptions{Archived: query.Archived})
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "session_store_error", "could not list sessions")
 		return
@@ -785,6 +799,39 @@ func (p *Process) handleSessionDetail(w http.ResponseWriter, r *http.Request, id
 		return
 	}
 	writeJSON(w, http.StatusOK, sessionDetailDTOFromSession(session, p.sessionStatus(id)))
+}
+
+func (p *Process) handleSessionMetadataUpdate(w http.ResponseWriter, r *http.Request, id string) {
+	if !validSessionAPIID(id) {
+		writeError(w, http.StatusBadRequest, "invalid_session_id", "invalid session id")
+		return
+	}
+	request, err := readSessionMetadataUpdateRequest(w, r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_request", err.Error())
+		return
+	}
+	if p.sessionIsRunning(id) {
+		writeError(w, http.StatusConflict, "session_busy", "session is currently running a turn")
+		return
+	}
+	store := p.sessionStore
+	if store == nil {
+		writeError(w, http.StatusServiceUnavailable, "session_store_unavailable", "session store is not configured")
+		return
+	}
+	session, err := store.Load(id)
+	if err != nil {
+		p.writeSessionLoadError(w, err, "could not load session")
+		return
+	}
+	session = applySessionMetadataUpdate(session, request)
+	saved, err := store.SaveMetadata(session)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "session_store_error", "could not update session metadata")
+		return
+	}
+	writeJSON(w, http.StatusOK, sessionDetailDTOFromSession(saved, p.sessionStatus(id)))
 }
 
 func (p *Process) handleSessionItems(w http.ResponseWriter, r *http.Request, id string) {
@@ -1138,6 +1185,13 @@ func (p *Process) sessionStatus(sessionID string) string {
 	return "idle"
 }
 
+func (p *Process) sessionIsRunning(sessionID string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	_, running := p.runningTurns[sessionID]
+	return running
+}
+
 func (p *Process) projectHasRunningTurn(projectID string) (bool, error) {
 	projectID = strings.TrimSpace(projectID)
 	if projectID == "" {
@@ -1152,7 +1206,7 @@ func (p *Process) projectHasRunningTurn(projectID string) (bool, error) {
 	if len(runningSessionIDs) == 0 || p.sessionStore == nil {
 		return false, nil
 	}
-	infos, err := p.sessionStore.List()
+	infos, err := p.sessionStore.ListWithOptions(sessions.V2ListOptions{All: true})
 	if err != nil {
 		return false, err
 	}
@@ -1452,6 +1506,9 @@ type sessionMetadataDTO struct {
 	ID           string    `json:"id"`
 	CreatedAt    time.Time `json:"created_at"`
 	UpdatedAt    time.Time `json:"updated_at"`
+	DisplayName  string    `json:"display_name,omitempty"`
+	Archived     bool      `json:"archived"`
+	LastUsedAt   time.Time `json:"last_used_at"`
 	Provider     string    `json:"provider"`
 	ModelProfile string    `json:"model_profile"`
 	ModelID      string    `json:"model_id"`
@@ -1478,6 +1535,9 @@ type sessionDetailDTO struct {
 	ID              string                 `json:"id"`
 	CreatedAt       time.Time              `json:"created_at"`
 	UpdatedAt       time.Time              `json:"updated_at"`
+	DisplayName     string                 `json:"display_name,omitempty"`
+	Archived        bool                   `json:"archived"`
+	LastUsedAt      time.Time              `json:"last_used_at"`
 	Provider        string                 `json:"provider"`
 	ModelProfile    string                 `json:"model_profile"`
 	ModelID         string                 `json:"model_id"`
@@ -1541,6 +1601,10 @@ type sessionItemsQuery struct {
 	View      string
 }
 
+type sessionListQuery struct {
+	Archived bool
+}
+
 type sessionItemContentQuery struct {
 	Offset   int64
 	MaxBytes int
@@ -1552,6 +1616,9 @@ func sessionDetailDTOFromSession(session sessions.SessionV2, status string) sess
 		ID:              session.ID,
 		CreatedAt:       session.CreatedAt,
 		UpdatedAt:       session.UpdatedAt,
+		DisplayName:     session.DisplayName,
+		Archived:        session.Archived,
+		LastUsedAt:      session.LastUsedAt,
 		Provider:        session.Provider,
 		ModelProfile:    session.ModelProfile,
 		ModelID:         session.ModelID,
@@ -1623,6 +1690,21 @@ func parseSessionItemsQuery(r *http.Request) (sessionItemsQuery, error) {
 		}
 	}
 	return query, nil
+}
+
+func parseSessionListQuery(r *http.Request) (sessionListQuery, error) {
+	rawArchived, ok, err := singleQueryValue(r.URL.Query(), "archived")
+	if err != nil {
+		return sessionListQuery{}, err
+	}
+	if !ok {
+		return sessionListQuery{}, nil
+	}
+	archived, err := strconv.ParseBool(rawArchived)
+	if err != nil {
+		return sessionListQuery{}, fmt.Errorf("archived must be a boolean")
+	}
+	return sessionListQuery{Archived: archived}, nil
 }
 
 func parseSessionItemContentQuery(r *http.Request) (sessionItemContentQuery, error) {
@@ -1924,6 +2006,52 @@ func readProjectSessionCreateRequest(w http.ResponseWriter, r *http.Request) (Se
 	return request, nil
 }
 
+func readSessionMetadataUpdateRequest(w http.ResponseWriter, r *http.Request) (SessionMetadataUpdate, error) {
+	body := http.MaxBytesReader(w, r.Body, 64*1024)
+	decoder := json.NewDecoder(body)
+	decoder.UseNumber()
+
+	var raw map[string]json.RawMessage
+	if err := decoder.Decode(&raw); err != nil {
+		return SessionMetadataUpdate{}, fmt.Errorf("request body must be a JSON object")
+	}
+	if raw == nil || len(raw) == 0 {
+		return SessionMetadataUpdate{}, fmt.Errorf("request body must contain display_name and/or archived")
+	}
+	var extra any
+	if err := decoder.Decode(&extra); err != io.EOF {
+		return SessionMetadataUpdate{}, fmt.Errorf("request body must contain a single JSON object")
+	}
+
+	var request SessionMetadataUpdate
+	for name, rawValue := range raw {
+		switch name {
+		case "display_name":
+			var value string
+			if err := json.Unmarshal(rawValue, &value); err != nil {
+				return SessionMetadataUpdate{}, fmt.Errorf("display_name must be a non-empty string")
+			}
+			value = strings.TrimSpace(value)
+			if value == "" {
+				return SessionMetadataUpdate{}, fmt.Errorf("display_name must be a non-empty string")
+			}
+			request.DisplayName = &value
+		case "archived":
+			var value bool
+			if err := json.Unmarshal(rawValue, &value); err != nil {
+				return SessionMetadataUpdate{}, fmt.Errorf("archived must be a boolean")
+			}
+			request.Archived = &value
+		default:
+			return SessionMetadataUpdate{}, fmt.Errorf("unsupported session metadata field %q", name)
+		}
+	}
+	if request.DisplayName == nil && request.Archived == nil {
+		return SessionMetadataUpdate{}, fmt.Errorf("request body must contain display_name and/or archived")
+	}
+	return request, nil
+}
+
 func applySessionCreateMetadata(session sessions.SessionV2, metadata SessionCreateMetadata) sessions.SessionV2 {
 	if value := strings.TrimSpace(metadata.CreatedCWD); value != "" {
 		session.CreatedCWD = value
@@ -1962,6 +2090,16 @@ func applySessionCreateMetadata(session sessions.SessionV2, metadata SessionCrea
 	}
 	if metadata.SaveToolResults != nil {
 		session.SaveToolResults = *metadata.SaveToolResults
+	}
+	return session
+}
+
+func applySessionMetadataUpdate(session sessions.SessionV2, metadata SessionMetadataUpdate) sessions.SessionV2 {
+	if metadata.DisplayName != nil {
+		session.DisplayName = *metadata.DisplayName
+	}
+	if metadata.Archived != nil {
+		session.Archived = *metadata.Archived
 	}
 	return session
 }
@@ -2135,6 +2273,9 @@ func sessionMetadataDTOFromSession(session sessions.SessionV2) sessionMetadataDT
 		ID:           session.ID,
 		CreatedAt:    session.CreatedAt,
 		UpdatedAt:    session.UpdatedAt,
+		DisplayName:  session.DisplayName,
+		Archived:     session.Archived,
+		LastUsedAt:   session.LastUsedAt,
 		Provider:     session.Provider,
 		ModelProfile: session.ModelProfile,
 		ModelID:      session.ModelID,

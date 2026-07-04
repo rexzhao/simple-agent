@@ -98,11 +98,11 @@ evidence 证明。
 - [x] `session list` 默认当前 project non-archived。
 - [x] `session list --project` 可列指定 project。
 - [x] `session list --all-projects` 可跨 project 列出。
-- [ ] `session list --archived` 可列 archived sessions。
-- [ ] `session list` 按 `last_used_at desc` 再 `created_at desc` 排序。
+- [x] `session list --archived` 可列 archived sessions。
+- [x] `session list` 按 `last_used_at desc` 再 `created_at desc` 排序。
 - [x] `session show` 展示 metadata。
-- [ ] `session rename` 更新 display name。
-- [ ] `session archive` 隐藏 session。
+- [x] `session rename` 更新 display name。
+- [x] `session archive` 隐藏 session。
 
 ## Attach and Send
 
@@ -147,7 +147,7 @@ evidence 证明。
 - [x] 提供 `GET /projects/{project_id}/sessions`。
 - [x] 提供 `POST /projects/{project_id}/sessions`。
 - [ ] 提供 `GET /sessions/{session_id}`。
-- [ ] 提供 session rename/archive endpoint。
+- [x] 提供 session rename/archive endpoint。
 - [ ] 提供 `POST /sessions/{session_id}/messages`。
 - [ ] 提供 `GET /sessions/{session_id}/items`。
 - [ ] 提供 `GET /sessions/{session_id}/content/{blob_hash}`。
@@ -194,6 +194,15 @@ evidence 证明。
 
 ## Smoke Evidence
 
+- 2026-07-04 M21 session metadata lifecycle slice: `go test ./internal/sessions ./internal/server ./internal/cli`
+  通过；覆盖 SessionV2 `display_name` / `archived` / `last_used_at` 持久化、默认 non-archived
+  list、`--archived` 过滤、`last_used_at desc` + `created_at desc` 排序、legacy missing
+  `last_used_at` fallback、successful turn 更新 `last_used_at`、PATCH `/sessions/{id}` rename/archive
+  认证/空 body/invalid body/busy conflict、metadata-only 更新保留 items/active history/compactions、
+  client helper，以及 CLI `session list --archived` / `session rename` / `session archive` bearer
+  token usage 和用法错误。
+- 2026-07-04 M21 session metadata lifecycle slice: `go test ./...` 通过；`git diff --check` 通过
+  （仅出现工作区 LF/CRLF normalization warnings）。
 - 2026-07-04 M21 server session home-store slice: `go test ./internal/cli ./internal/sessions` 通过；覆盖
   `sessions.RootForHome(<home>)` 返回 `<home>/data/sessions`，`sai server` 即使 config 设置
   `sessions.dir: custom-sessions` 也把 server-owned sessions 写入 `<home>/data/sessions`，并验证

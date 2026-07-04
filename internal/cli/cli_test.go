@@ -1148,14 +1148,18 @@ func TestSessionHelpWritesUsageWithoutConfig(t *testing.T) {
 		args  []string
 		wants []string
 	}{
-		{args: []string{"session", "-h"}, wants: []string{"usage: sai session <command>", "session create", "session list", "session show"}},
-		{args: []string{"help", "session"}, wants: []string{"usage: sai session <command>", "session create", "session list", "session show"}},
+		{args: []string{"session", "-h"}, wants: []string{"usage: sai session <command>", "session create", "session list", "session show", "session rename", "session archive"}},
+		{args: []string{"help", "session"}, wants: []string{"usage: sai session <command>", "session create", "session list", "session show", "session rename", "session archive"}},
 		{args: []string{"session", "create", "-h"}, wants: []string{"usage: sai session create", "--cwd path"}},
 		{args: []string{"help", "session", "create"}, wants: []string{"usage: sai session create", "--cwd path"}},
-		{args: []string{"session", "list", "-h"}, wants: []string{"usage: sai session list", "--project project-id", "--all-projects"}},
-		{args: []string{"help", "session", "list"}, wants: []string{"usage: sai session list", "--project project-id", "--all-projects"}},
+		{args: []string{"session", "list", "-h"}, wants: []string{"usage: sai session list", "--project project-id", "--all-projects", "--archived"}},
+		{args: []string{"help", "session", "list"}, wants: []string{"usage: sai session list", "--project project-id", "--all-projects", "--archived"}},
 		{args: []string{"session", "show", "-h"}, wants: []string{"usage: sai session show <session-id>", "explicit global session id"}},
 		{args: []string{"help", "session", "show"}, wants: []string{"usage: sai session show <session-id>", "explicit global session id"}},
+		{args: []string{"session", "rename", "-h"}, wants: []string{"usage: sai session rename <session-id> <name>", "display name"}},
+		{args: []string{"help", "session", "rename"}, wants: []string{"usage: sai session rename <session-id> <name>", "display name"}},
+		{args: []string{"session", "archive", "-h"}, wants: []string{"usage: sai session archive <session-id>", "Archives a session"}},
+		{args: []string{"help", "session", "archive"}, wants: []string{"usage: sai session archive <session-id>", "Archives a session"}},
 	} {
 		t.Run(strings.Join(tt.args, " "), func(t *testing.T) {
 			assertCLIHelpWithoutConfig(t, tt.args, tt.wants...)
@@ -1974,8 +1978,96 @@ func TestSessionListDefaultUsesNearestProjectScopedAPI(t *testing.T) {
 		}
 	}
 	assertCLIOutputContains(t, stdout.String(),
-		"ID\tUPDATED\tPROVIDER\tMODEL/PROFILE",
+		"ID\tLAST_USED\tPROVIDER\tMODEL/PROFILE",
 		"child-session\t2026-07-04T06:01:00Z\tfake\tmodel-default/default",
+	)
+	if stderr.String() != "" {
+		t.Fatalf("stderr = %q, want empty", stderr.String())
+	}
+}
+
+func TestSessionListArchivedUsesProjectScopedFilter(t *testing.T) {
+	registryPath := isolateCLIUserRegistry(t)
+	projectDir := t.TempDir()
+	canonicalRoot, err := projectstore.CanonicalRoot(projectDir)
+	if err != nil {
+		t.Fatalf("CanonicalRoot(project) error = %v", err)
+	}
+	updatedAt := time.Date(2026, 7, 4, 6, 30, 0, 0, time.UTC)
+	lastUsedAt := updatedAt.Add(5 * time.Minute)
+
+	projectsAuthSeen := make(chan string, 1)
+	sessionsAuthSeen := make(chan string, 1)
+	archivedQuerySeen := make(chan string, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/health":
+			writeCLIJSON(w, http.StatusOK, map[string]any{"status": "ok"})
+		case r.URL.Path == "/projects" && r.Method == http.MethodGet:
+			projectsAuthSeen <- r.Header.Get("Authorization")
+			writeCLIJSON(w, http.StatusOK, map[string]any{
+				"projects": []map[string]any{
+					{"id": "project-current", "root": canonicalRoot, "archived": false, "created_at": updatedAt, "updated_at": updatedAt},
+				},
+			})
+		case r.URL.Path == "/projects/project-current/sessions" && r.Method == http.MethodGet:
+			sessionsAuthSeen <- r.Header.Get("Authorization")
+			archivedQuerySeen <- r.URL.Query().Get("archived")
+			writeCLIJSON(w, http.StatusOK, map[string]any{
+				"sessions": []map[string]any{
+					{
+						"id":            "archived-session",
+						"created_at":    updatedAt,
+						"updated_at":    updatedAt,
+						"last_used_at":  lastUsedAt,
+						"display_name":  "Old Thread",
+						"archived":      true,
+						"provider":      "fake",
+						"model_profile": "default",
+						"model_id":      "model-default",
+						"project_id":    "project-current",
+					},
+				},
+			})
+		default:
+			t.Fatalf("unexpected path %s %q raw_query=%q", r.Method, r.URL.Path, r.URL.RawQuery)
+		}
+	}))
+	defer server.Close()
+	registerCLIFakeServer(t, registryPath, projectDir, server.URL, "registry-token")
+
+	var stdout, stderr bytes.Buffer
+	code := RunWithGetwd([]string{"session", "list", "--archived"}, &stdout, &stderr, func() (string, error) {
+		return projectDir, nil
+	})
+
+	if code != 0 {
+		t.Fatalf("session list --archived code = %d, stderr = %s", code, stderr.String())
+	}
+	for name, ch := range map[string]<-chan string{
+		"projects":         projectsAuthSeen,
+		"project sessions": sessionsAuthSeen,
+	} {
+		select {
+		case got := <-ch:
+			if got != "Bearer registry-token" {
+				t.Fatalf("%s Authorization = %q, want bearer token", name, got)
+			}
+		default:
+			t.Fatalf("%s request was not called", name)
+		}
+	}
+	select {
+	case got := <-archivedQuerySeen:
+		if got != "true" {
+			t.Fatalf("archived query = %q, want true", got)
+		}
+	default:
+		t.Fatal("GET project sessions was not called")
+	}
+	assertCLIOutputContains(t, stdout.String(),
+		"ID\tLAST_USED\tPROVIDER\tMODEL/PROFILE",
+		"archived-session\t2026-07-04T06:35:00Z\tfake\tmodel-default/default",
 	)
 	if stderr.String() != "" {
 		t.Fatalf("stderr = %q, want empty", stderr.String())
@@ -2164,6 +2256,164 @@ func TestSessionShowUsesGlobalSessionIDAndRejectsCWD(t *testing.T) {
 	assertCLIErrorContains(t, stderr.String(), "flag provided but not defined: -cwd", `Run "sai help session show" for usage.`)
 }
 
+func TestSessionRenameAndArchiveUsePatchWithBearerToken(t *testing.T) {
+	registryPath := isolateCLIUserRegistry(t)
+	projectDir := t.TempDir()
+	updatedAt := time.Date(2026, 7, 4, 9, 30, 0, 0, time.UTC)
+	lastUsedAt := updatedAt.Add(-10 * time.Minute)
+
+	type seenRequest struct {
+		auth string
+		body map[string]any
+	}
+	renameSeen := make(chan seenRequest, 1)
+	archiveSeen := make(chan seenRequest, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/health":
+			writeCLIJSON(w, http.StatusOK, map[string]any{"status": "ok"})
+		case r.URL.Path == "/sessions/rename-session" && r.Method == http.MethodPatch:
+			data, err := io.ReadAll(r.Body)
+			if err != nil {
+				t.Fatalf("ReadAll(rename body) error = %v", err)
+			}
+			body := decodeCLIJSON(t, data)
+			renameSeen <- seenRequest{auth: r.Header.Get("Authorization"), body: body}
+			writeCLIJSON(w, http.StatusOK, map[string]any{
+				"id":                "rename-session",
+				"created_at":        updatedAt,
+				"updated_at":        updatedAt.Add(time.Minute),
+				"last_used_at":      lastUsedAt,
+				"display_name":      "Renamed Session",
+				"archived":          false,
+				"provider":          "fake",
+				"model_profile":     "default",
+				"model_id":          "model-default",
+				"status":            "idle",
+				"last_seq":          0,
+				"project_id":        "project-current",
+				"show_reasoning":    false,
+				"save_tool_results": true,
+			})
+		case r.URL.Path == "/sessions/archive-session" && r.Method == http.MethodPatch:
+			data, err := io.ReadAll(r.Body)
+			if err != nil {
+				t.Fatalf("ReadAll(archive body) error = %v", err)
+			}
+			body := decodeCLIJSON(t, data)
+			archiveSeen <- seenRequest{auth: r.Header.Get("Authorization"), body: body}
+			writeCLIJSON(w, http.StatusOK, map[string]any{
+				"id":                "archive-session",
+				"created_at":        updatedAt,
+				"updated_at":        updatedAt.Add(time.Minute),
+				"last_used_at":      lastUsedAt,
+				"display_name":      "Old Session",
+				"archived":          true,
+				"provider":          "fake",
+				"model_profile":     "default",
+				"model_id":          "model-default",
+				"status":            "idle",
+				"last_seq":          0,
+				"project_id":        "project-current",
+				"show_reasoning":    false,
+				"save_tool_results": true,
+			})
+		default:
+			t.Fatalf("unexpected path %s %q", r.Method, r.URL.Path)
+		}
+	}))
+	defer server.Close()
+	registerCLIFakeServer(t, registryPath, projectDir, server.URL, "registry-token")
+
+	var stdout, stderr bytes.Buffer
+	code := RunWithGetwd([]string{"session", "rename", "rename-session", "Renamed Session"}, &stdout, &stderr, func() (string, error) {
+		return "", errors.New("getwd should not be called")
+	})
+	if code != 0 {
+		t.Fatalf("session rename code = %d, stderr = %s", code, stderr.String())
+	}
+	select {
+	case got := <-renameSeen:
+		if got.auth != "Bearer registry-token" {
+			t.Fatalf("rename Authorization = %q, want bearer token", got.auth)
+		}
+		if got.body["display_name"] != "Renamed Session" {
+			t.Fatalf("rename body = %#v, want display_name", got.body)
+		}
+		if _, ok := got.body["archived"]; ok {
+			t.Fatalf("rename body unexpectedly included archived: %#v", got.body)
+		}
+	default:
+		t.Fatal("PATCH rename session was not called")
+	}
+	assertCLIOutputContains(t, stdout.String(),
+		"ID\trename-session",
+		"LAST_USED\t2026-07-04T09:20:00Z",
+		"DISPLAY_NAME\tRenamed Session",
+		"ARCHIVED\tfalse",
+	)
+	if stderr.String() != "" {
+		t.Fatalf("rename stderr = %q, want empty", stderr.String())
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	code = RunWithGetwd([]string{"session", "archive", "archive-session"}, &stdout, &stderr, func() (string, error) {
+		return "", errors.New("getwd should not be called")
+	})
+	if code != 0 {
+		t.Fatalf("session archive code = %d, stderr = %s", code, stderr.String())
+	}
+	select {
+	case got := <-archiveSeen:
+		if got.auth != "Bearer registry-token" {
+			t.Fatalf("archive Authorization = %q, want bearer token", got.auth)
+		}
+		if got.body["archived"] != true {
+			t.Fatalf("archive body = %#v, want archived true", got.body)
+		}
+		if _, ok := got.body["display_name"]; ok {
+			t.Fatalf("archive body unexpectedly included display_name: %#v", got.body)
+		}
+	default:
+		t.Fatal("PATCH archive session was not called")
+	}
+	assertCLIOutputContains(t, stdout.String(),
+		"ID\tarchive-session",
+		"DISPLAY_NAME\tOld Session",
+		"ARCHIVED\ttrue",
+	)
+	if stderr.String() != "" {
+		t.Fatalf("archive stderr = %q, want empty", stderr.String())
+	}
+}
+
+func TestSessionRenameAndArchiveUsageErrors(t *testing.T) {
+	for _, tt := range []struct {
+		name  string
+		args  []string
+		wants []string
+	}{
+		{name: "rename missing name", args: []string{"session", "rename", "session-id"}, wants: []string{"usage: sai session rename <session-id> <name>", `Run "sai help session rename" for usage.`}},
+		{name: "rename blank name", args: []string{"session", "rename", "session-id", "   "}, wants: []string{"session display name must be a non-empty string", `Run "sai help session rename" for usage.`}},
+		{name: "archive extra arg", args: []string{"session", "archive", "session-id", "extra"}, wants: []string{"usage: sai session archive <session-id>", `Run "sai help session archive" for usage.`}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			code := RunWithGetwd(tt.args, &stdout, &stderr, func() (string, error) {
+				return "", errors.New("getwd should not be called")
+			})
+			if code != 1 {
+				t.Fatalf("RunWithGetwd(%v) code = %d, want 1", tt.args, code)
+			}
+			if stdout.String() != "" {
+				t.Fatalf("stdout = %q, want empty", stdout.String())
+			}
+			assertCLIErrorContains(t, stderr.String(), tt.wants...)
+		})
+	}
+}
+
 func TestSessionListAutoStartsSingletonServerWithoutStartupOutput(t *testing.T) {
 	registryPath := isolateCLIUserRegistry(t)
 	projectDir := t.TempDir()
@@ -2230,7 +2480,7 @@ func TestSessionListAutoStartsSingletonServerWithoutStartupOutput(t *testing.T) 
 	if stderr.String() != "" {
 		t.Fatalf("stderr = %q, want empty", stderr.String())
 	}
-	if got := stdout.String(); got != "ID\tUPDATED\tPROVIDER\tMODEL/PROFILE\n" {
+	if got := stdout.String(); got != "ID\tLAST_USED\tPROVIDER\tMODEL/PROFILE\n" {
 		t.Fatalf("stdout = %q, want session list only", got)
 	}
 	if strings.Contains(stdout.String(), "SERVER_ADDR") {
@@ -7038,7 +7288,7 @@ func TestSessionsListUsesServerAPIWithoutLocalSessionFiles(t *testing.T) {
 	}
 	out := stdout.String()
 	for _, want := range []string{
-		"ID\tUPDATED\tPROVIDER\tMODEL/PROFILE",
+		"ID\tLAST_USED\tPROVIDER\tMODEL/PROFILE",
 		"newer-session\t2026-07-02T03:02:00Z\topenai\tgpt-5.1/default",
 		"older-session\t2026-07-02T03:01:00Z\tpaperhub\tglm-5.2/glm-5.2",
 	} {

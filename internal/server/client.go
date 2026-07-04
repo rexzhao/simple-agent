@@ -60,6 +60,9 @@ type SessionMetadata struct {
 	ID           string    `json:"id"`
 	CreatedAt    time.Time `json:"created_at"`
 	UpdatedAt    time.Time `json:"updated_at"`
+	DisplayName  string    `json:"display_name,omitempty"`
+	Archived     bool      `json:"archived"`
+	LastUsedAt   time.Time `json:"last_used_at"`
 	Provider     string    `json:"provider"`
 	ModelProfile string    `json:"model_profile"`
 	ModelID      string    `json:"model_id"`
@@ -73,6 +76,9 @@ type SessionDetail struct {
 	ID              string                 `json:"id"`
 	CreatedAt       time.Time              `json:"created_at"`
 	UpdatedAt       time.Time              `json:"updated_at"`
+	DisplayName     string                 `json:"display_name,omitempty"`
+	Archived        bool                   `json:"archived"`
+	LastUsedAt      time.Time              `json:"last_used_at"`
 	Provider        string                 `json:"provider"`
 	ModelProfile    string                 `json:"model_profile"`
 	ModelID         string                 `json:"model_id"`
@@ -106,6 +112,15 @@ type SessionCreateMetadata struct {
 	ShowReasoning   *bool                   `json:"show_reasoning,omitempty"`
 	Context         *contextwindow.Metadata `json:"context,omitempty"`
 	SaveToolResults *bool                   `json:"save_tool_results,omitempty"`
+}
+
+type SessionListOptions struct {
+	Archived bool
+}
+
+type SessionMetadataUpdate struct {
+	DisplayName *string `json:"display_name,omitempty"`
+	Archived    *bool   `json:"archived,omitempty"`
 }
 
 // SessionMessageResult is the committed metadata returned by POST /sessions/{id}/messages.
@@ -328,8 +343,13 @@ func RemoveProjectWithToken(ctx context.Context, addr, token, id string, deleteD
 
 // ListProjectSessionsWithToken fetches session metadata from GET /projects/{id}/sessions.
 func ListProjectSessionsWithToken(ctx context.Context, addr, token, projectID string, timeout time.Duration) ([]SessionMetadata, error) {
+	return ListProjectSessionsWithOptions(ctx, addr, token, projectID, SessionListOptions{}, timeout)
+}
+
+// ListProjectSessionsWithOptions fetches session metadata from GET /projects/{id}/sessions.
+func ListProjectSessionsWithOptions(ctx context.Context, addr, token, projectID string, options SessionListOptions, timeout time.Duration) ([]SessionMetadata, error) {
 	projectID = strings.TrimSpace(projectID)
-	req, err := newServerClientRequest(ctx, http.MethodGet, addr, "/projects/"+url.PathEscape(projectID)+"/sessions")
+	req, err := newServerClientRequest(ctx, http.MethodGet, addr, sessionListPath("/projects/"+url.PathEscape(projectID)+"/sessions", options))
 	if err != nil {
 		return nil, err
 	}
@@ -443,7 +463,12 @@ func marshalSessionCreateMetadata(metadata SessionCreateMetadata) ([]byte, error
 
 // ListSessions fetches session metadata from GET /sessions with the registry bearer token.
 func ListSessions(ctx context.Context, addr, token string, timeout time.Duration) ([]SessionMetadata, error) {
-	req, err := newServerClientRequest(ctx, http.MethodGet, addr, "/sessions")
+	return ListSessionsWithOptions(ctx, addr, token, SessionListOptions{}, timeout)
+}
+
+// ListSessionsWithOptions fetches session metadata from GET /sessions.
+func ListSessionsWithOptions(ctx context.Context, addr, token string, options SessionListOptions, timeout time.Duration) ([]SessionMetadata, error) {
+	req, err := newServerClientRequest(ctx, http.MethodGet, addr, sessionListPath("/sessions", options))
 	if err != nil {
 		return nil, err
 	}
@@ -464,6 +489,15 @@ func ListSessions(ctx context.Context, addr, token string, timeout time.Duration
 		return nil, fmt.Errorf("decode sessions at %s: %w", strings.TrimSpace(addr), err)
 	}
 	return body.Sessions, nil
+}
+
+func sessionListPath(path string, options SessionListOptions) string {
+	if !options.Archived {
+		return path
+	}
+	values := url.Values{}
+	values.Set("archived", "true")
+	return path + "?" + values.Encode()
 }
 
 // GetSessionDetail fetches session metadata from GET /sessions/{id} with the registry bearer token.
@@ -487,6 +521,64 @@ func GetSessionDetail(ctx context.Context, addr, token, id string, timeout time.
 		return SessionDetail{}, fmt.Errorf("decode session %s at %s: %w", strings.TrimSpace(id), strings.TrimSpace(addr), err)
 	}
 	return detail, nil
+}
+
+func RenameSessionWithToken(ctx context.Context, addr, token, id, displayName string, timeout time.Duration) (SessionDetail, error) {
+	displayName = strings.TrimSpace(displayName)
+	return UpdateSessionMetadataWithToken(ctx, addr, token, id, SessionMetadataUpdate{DisplayName: &displayName}, timeout)
+}
+
+func ArchiveSessionWithToken(ctx context.Context, addr, token, id string, timeout time.Duration) (SessionDetail, error) {
+	archived := true
+	return UpdateSessionMetadataWithToken(ctx, addr, token, id, SessionMetadataUpdate{Archived: &archived}, timeout)
+}
+
+func UpdateSessionMetadataWithToken(ctx context.Context, addr, token, id string, update SessionMetadataUpdate, timeout time.Duration) (SessionDetail, error) {
+	payload, err := marshalSessionMetadataUpdate(update)
+	if err != nil {
+		return SessionDetail{}, err
+	}
+	req, err := newServerClientRequestWithBody(ctx, http.MethodPatch, addr, "/sessions/"+url.PathEscape(strings.TrimSpace(id)), payload)
+	if err != nil {
+		return SessionDetail{}, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	setBearerToken(req, token)
+	client := http.Client{}
+	if timeout > 0 {
+		client.Timeout = timeout
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return SessionDetail{}, fmt.Errorf("update session %s at %s: %w", strings.TrimSpace(id), strings.TrimSpace(addr), err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return SessionDetail{}, fmt.Errorf("update session %s at %s: %s", strings.TrimSpace(id), strings.TrimSpace(addr), serverWriteResponseError(resp))
+	}
+	var detail SessionDetail
+	if err := json.NewDecoder(resp.Body).Decode(&detail); err != nil {
+		return SessionDetail{}, fmt.Errorf("decode updated session %s at %s: %w", strings.TrimSpace(id), strings.TrimSpace(addr), err)
+	}
+	return detail, nil
+}
+
+func marshalSessionMetadataUpdate(update SessionMetadataUpdate) ([]byte, error) {
+	payload := make(map[string]any)
+	if update.DisplayName != nil {
+		payload["display_name"] = *update.DisplayName
+	}
+	if update.Archived != nil {
+		payload["archived"] = *update.Archived
+	}
+	if len(payload) == 0 {
+		return nil, fmt.Errorf("session metadata update requires display_name or archived")
+	}
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return nil, fmt.Errorf("encode session metadata update request")
+	}
+	return data, nil
 }
 
 // CreateSessionWithToken sends POST /sessions with the registry bearer token.

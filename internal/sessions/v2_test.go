@@ -43,6 +43,9 @@ func TestV2StoreSaveLoadMetadata(t *testing.T) {
 
 	session := SessionV2{
 		ID:           "session-1",
+		DisplayName:  "Planning Session",
+		Archived:     true,
+		LastUsedAt:   time.Date(2026, 7, 3, 0, 59, 0, 0, time.UTC),
 		Provider:     "paperhub",
 		ModelProfile: "glm-5.2-fast",
 		ModelID:      "glm-5.2",
@@ -120,8 +123,9 @@ func TestV2StoreSaveLoadMetadata(t *testing.T) {
 		}
 	}
 	for key, want := range map[string]string{
-		"project_id":  saved.ProjectID,
-		"created_cwd": saved.CreatedCWD,
+		"display_name": saved.DisplayName,
+		"project_id":   saved.ProjectID,
+		"created_cwd":  saved.CreatedCWD,
 	} {
 		var got string
 		if err := json.Unmarshal(metadata[key], &got); err != nil {
@@ -130,6 +134,20 @@ func TestV2StoreSaveLoadMetadata(t *testing.T) {
 		if got != want {
 			t.Fatalf("meta.json[%s] = %q, want %q", key, got, want)
 		}
+	}
+	var archived bool
+	if err := json.Unmarshal(metadata["archived"], &archived); err != nil {
+		t.Fatalf("Unmarshal(meta.json[archived]) error = %v; raw=%s", err, raw)
+	}
+	if !archived {
+		t.Fatal("meta.json[archived] = false, want true")
+	}
+	var lastUsedAt time.Time
+	if err := json.Unmarshal(metadata["last_used_at"], &lastUsedAt); err != nil {
+		t.Fatalf("Unmarshal(meta.json[last_used_at]) error = %v; raw=%s", err, raw)
+	}
+	if !lastUsedAt.Equal(saved.LastUsedAt) {
+		t.Fatalf("meta.json[last_used_at] = %s, want %s", lastUsedAt, saved.LastUsedAt)
 	}
 
 	loaded, err := store.Load("session-1")
@@ -144,6 +162,9 @@ func TestV2StoreSaveLoadMetadata(t *testing.T) {
 	}
 	if loaded.ProjectID != saved.ProjectID || loaded.CreatedCWD != saved.CreatedCWD {
 		t.Fatalf("loaded M21 identity = project_id %q created_cwd %q, want %q/%q", loaded.ProjectID, loaded.CreatedCWD, saved.ProjectID, saved.CreatedCWD)
+	}
+	if loaded.DisplayName != saved.DisplayName || loaded.Archived != saved.Archived || !loaded.LastUsedAt.Equal(saved.LastUsedAt) {
+		t.Fatalf("loaded lifecycle metadata = display %q archived %t last_used %s, want %q/%t/%s", loaded.DisplayName, loaded.Archived, loaded.LastUsedAt, saved.DisplayName, saved.Archived, saved.LastUsedAt)
 	}
 	if loaded.RootConfigPath() != saved.ConfigPath {
 		t.Fatalf("RootConfigPath() = %q, want %q", loaded.RootConfigPath(), saved.ConfigPath)
@@ -296,6 +317,122 @@ func TestV2StoreListLatestAndDeletePreservesBlobs(t *testing.T) {
 	}
 	if latest.ID != "older" {
 		t.Fatalf("Latest().ID after delete = %q, want older", latest.ID)
+	}
+}
+
+func TestV2StoreListFiltersArchivedAndSortsByLastUsed(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "sessions")
+	clock := &fakeClock{current: time.Date(2026, 7, 3, 1, 2, 3, 0, time.UTC)}
+	store := newV2StoreWithClock(root, V2StoreOptions{}, clock.Now)
+
+	createdAt := time.Date(2026, 7, 3, 0, 0, 0, 0, time.UTC)
+	writeLegacyV2Metadata(t, root, "legacy-fallback", createdAt, createdAt.Add(6*time.Minute))
+	if _, err := store.SaveMetadata(SessionV2{
+		ID:           "last-used-newest",
+		CreatedAt:    createdAt,
+		LastUsedAt:   createdAt.Add(5 * time.Minute),
+		Provider:     "paperhub",
+		ModelProfile: "glm-5.2",
+		ModelID:      "glm-5.2",
+	}); err != nil {
+		t.Fatalf("SaveMetadata(last-used-newest) error = %v", err)
+	}
+	if _, err := store.SaveMetadata(SessionV2{
+		ID:           "created-tie-newer",
+		CreatedAt:    createdAt.Add(2 * time.Minute),
+		LastUsedAt:   createdAt.Add(4 * time.Minute),
+		Provider:     "paperhub",
+		ModelProfile: "glm-5.2",
+		ModelID:      "glm-5.2",
+	}); err != nil {
+		t.Fatalf("SaveMetadata(created-tie-newer) error = %v", err)
+	}
+	if _, err := store.SaveMetadata(SessionV2{
+		ID:           "created-tie-older",
+		CreatedAt:    createdAt.Add(time.Minute),
+		LastUsedAt:   createdAt.Add(4 * time.Minute),
+		Provider:     "paperhub",
+		ModelProfile: "glm-5.2",
+		ModelID:      "glm-5.2",
+	}); err != nil {
+		t.Fatalf("SaveMetadata(created-tie-older) error = %v", err)
+	}
+	if _, err := store.SaveMetadata(SessionV2{
+		ID:           "archived-session",
+		CreatedAt:    createdAt,
+		LastUsedAt:   createdAt.Add(7 * time.Minute),
+		Archived:     true,
+		Provider:     "paperhub",
+		ModelProfile: "glm-5.2",
+		ModelID:      "glm-5.2",
+	}); err != nil {
+		t.Fatalf("SaveMetadata(archived-session) error = %v", err)
+	}
+
+	infos, err := store.List()
+	if err != nil {
+		t.Fatalf("List() error = %v", err)
+	}
+	if got, want := sessionInfoIDs(infos), []string{"legacy-fallback", "last-used-newest", "created-tie-newer", "created-tie-older"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("List() IDs = %#v, want %#v", got, want)
+	}
+
+	archived, err := store.ListWithOptions(V2ListOptions{Archived: true})
+	if err != nil {
+		t.Fatalf("ListWithOptions(archived) error = %v", err)
+	}
+	if got, want := sessionInfoIDs(archived), []string{"archived-session"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("archived List IDs = %#v, want %#v", got, want)
+	}
+
+	legacy, err := store.Load("legacy-fallback")
+	if err != nil {
+		t.Fatalf("Load(legacy-fallback) error = %v", err)
+	}
+	if want := createdAt.Add(6 * time.Minute); !legacy.LastUsedAt.Equal(want) {
+		t.Fatalf("legacy LastUsedAt = %s, want fallback updated_at %s", legacy.LastUsedAt, want)
+	}
+}
+
+func TestV2StoreSaveTurnUpdatesLastUsedAt(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "sessions")
+	clock := &fakeClock{current: time.Date(2026, 7, 3, 1, 2, 3, 0, time.UTC)}
+	store := newV2StoreWithClock(root, V2StoreOptions{}, clock.Now)
+
+	session, err := store.SaveMetadata(SessionV2{
+		ID:           "turn-session",
+		Provider:     "paperhub",
+		ModelProfile: "glm-5.2",
+		ModelID:      "glm-5.2",
+	})
+	if err != nil {
+		t.Fatalf("SaveMetadata() error = %v", err)
+	}
+	if !session.LastUsedAt.Equal(clock.current) {
+		t.Fatalf("initial LastUsedAt = %s, want %s", session.LastUsedAt, clock.current)
+	}
+
+	clock.current = clock.current.Add(5 * time.Minute)
+	userItem := SessionItem{
+		ID:         "msg-000001",
+		Kind:       ItemKindMessage,
+		Visibility: ItemVisibilityVisible,
+		Audience:   ItemAudienceUser,
+		Message:    &model.Message{Role: model.MessageRoleUser, Content: "hello"},
+	}
+	assistantItem := SessionItem{
+		ID:         "msg-000002",
+		Kind:       ItemKindMessage,
+		Visibility: ItemVisibilityVisible,
+		Audience:   ItemAudienceModel,
+		Message:    &model.Message{Role: model.MessageRoleAssistant, Content: "hi"},
+	}
+	saved, err := store.SaveTurn(session, []SessionItem{userItem, assistantItem}, []string{userItem.ID, assistantItem.ID})
+	if err != nil {
+		t.Fatalf("SaveTurn() error = %v", err)
+	}
+	if !saved.LastUsedAt.Equal(clock.current) || !saved.UpdatedAt.Equal(clock.current) {
+		t.Fatalf("turn timestamps = updated %s last_used %s, want %s", saved.UpdatedAt, saved.LastUsedAt, clock.current)
 	}
 }
 
@@ -1274,6 +1411,39 @@ func appendTestItem(t *testing.T, store *V2Store, sessionID, itemID, content str
 	}); err != nil {
 		t.Fatalf("AppendItem(%q) error = %v", itemID, err)
 	}
+}
+
+func writeLegacyV2Metadata(t *testing.T, root, id string, createdAt, updatedAt time.Time) {
+	t.Helper()
+
+	sessionDir := filepath.Join(root, id)
+	if err := os.MkdirAll(sessionDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll(%q) error = %v", sessionDir, err)
+	}
+	data, err := json.MarshalIndent(map[string]any{
+		"id":            id,
+		"version":       VersionV2,
+		"created_at":    createdAt,
+		"updated_at":    updatedAt,
+		"provider":      "paperhub",
+		"model_profile": "glm-5.2",
+		"model_id":      "glm-5.2",
+	}, "", "  ")
+	if err != nil {
+		t.Fatalf("MarshalIndent(legacy metadata) error = %v", err)
+	}
+	data = append(data, '\n')
+	if err := os.WriteFile(filepath.Join(sessionDir, "meta.json"), data, 0o600); err != nil {
+		t.Fatalf("WriteFile(legacy meta.json) error = %v", err)
+	}
+}
+
+func sessionInfoIDs(infos []Info) []string {
+	ids := make([]string, 0, len(infos))
+	for _, info := range infos {
+		ids = append(ids, info.ID)
+	}
+	return ids
 }
 
 func appendV2RecordsForTest(t *testing.T, path string, records ...v2Record) {
