@@ -816,3 +816,76 @@ session writer，CLI client 通过 HTTP API 和 WebSocket 操作会话。HTTP / 
 - Blob access 测试覆盖 item content endpoint 可按大小读取，且裸 hash 不能读取 blob。
 - 不要求浏览器 Web GUI UI 测试；未来 GUI 必须复用 M20 API / WebSocket。
 - `go test ./...` 和 `git diff --check` 通过。
+
+## M21：Global Singleton Server and Explicit Project/Session Lifecycle
+
+目标：直接替换 M20 的 scoped server identity。server 在同一 OS user、raw command basename 和
+home namespace 下全局唯一，可以管理多个 project。project 和 session 都必须显式创建；CLI
+client 需要 server 时 auto-start，并通过 explicit project/session API 操作 durable user-level
+store。详细设计见 `docs/global-server-projects.md`，执行清单见
+`docs/tasks/global-server-projects-checklist.md`。
+
+交付物：
+
+- 移除旧 scoped server behavior，不提供兼容层。
+- 所有用户可见 help/docs/errors 使用 raw `argv[0]` basename；文档示例使用 `<cmd>`。
+- 支持 `--home PATH`，并按 raw basename 派生 env var 后选择 home namespace；不同 home
+  directories 是独立 singleton namespaces。
+- server registry 和 durable data store 默认位于 user-level home namespace。
+- registry 记录 `pid`、`base_url`、`token`、`version` 和 `started_at`；client 复用前
+  health-check，stale registry 可覆盖，file lock 避免并发双启动。
+- `<cmd> server` 前台启动 singleton，不绑定 cwd/project；`<cmd> server --background` 显式
+  后台启动；`server status/stop` 不 auto-start。
+- bare attach、send、project 和 session commands 需要 server 时 auto-start；help/version/server
+  control commands 不 auto-start。
+- project identity 只使用 canonical cwd root；project 必须显式创建，存入 user-level registry /
+  data store，不写 project marker 文件。
+- 从 effective cwd 向上查找 nearest registered ancestor project；nested projects 允许；duplicate
+  exact canonical root 返回已有 project info 并退出 0。
+- project name 只用于展示；project remove 默认 archive/hide，真实删除需要 `--delete-data`；
+  running sessions 阻止 removal/deletion。
+- session 必须显式创建；`--new` 是 create-and-attach shortcut；不隐式创建 project 或 session。
+- config 属于 session，不属于 project；session create 记录 `config_path` 和关键 metadata，每个
+  turn 重新读取该 `config_path`。
+- `--config` 只允许创建新 session；existing session attach/send 传 `--config` 必须报错。
+- existing session cwd 固定为 `created_cwd`；`--cwd` 只允许 project/session create 和 `--new`；
+  existing session attach/send 传 `--cwd` 必须报错。
+- 移除 hardcoded chat product entry，不作为 hidden alias。
+- bare `<cmd>` 等价 attach：auto-start server，按 cwd 找 project，无 project/session 时失败，
+  否则 attach 当前 project 最近 non-archived session；`<cmd> --new` 创建并 attach。
+- primary session command shape 是 singular `session`；旧 `sessions` 最多作为 list alias。
+- `session list` 默认当前 project non-archived，支持 `--project`、`--all-projects` 和
+  `--archived`，按 `last_used_at desc`、`created_at desc` 排序。
+- attach/send 支持 global explicit session id；未指定 id 时只选当前 project 最近 non-archived
+  session；多个 observers 可 attach；同一 session 只有一个 active turn，busy 返回
+  `session_busy` 且不选择其他 session；不同 sessions 可并发。
+- shutdown 默认 immediate stop/cancel/cleanup；`--wait` drain 已开始 calls/turns、停止接受新
+  turns 并支持 timeout；signals/Ctrl+C 使用 immediate stop；restart 后 running turns/sessions
+  标记 interrupted，不自动 replay。
+- API 使用 explicit project/session paths：`/projects`、`/projects/{project_id}/sessions`、
+  `/sessions/{session_id}`、`/sessions/{session_id}/messages`、
+  `/sessions/{session_id}/items`、`/sessions/{session_id}/content/{blob_hash}` 和
+  `WS /sessions/{session_id}/stream`，另有 server-level health/server/shutdown。
+- HTTP/WS 默认 loopback；`GET /health` 是 public loopback discovery endpoint，只返回 minimal
+  non-sensitive liveness；其他 HTTP/WS endpoint 都要求 bearer token；第一版不实现多用户 login。
+- durable store 使用 per-project 和 per-session directories；默认不写项目 repo；transcript 使用
+  append-only JSONL，大内容使用 hash-addressed blobs，global blob dedupe 可接受，session seq
+  支持 pagination，hidden summary/debug records 可被 GUI 过滤。
+- future session-history query tool 仍是低优先级 out of scope。
+
+验证：
+
+- 测试覆盖 singleton per home namespace，以及不同 home directories independent。
+- 测试覆盖 explicit project/session create、duplicate project root、nested discovery 和 missing
+  project/session 失败。
+- 测试覆盖 existing session 下 `--config` / `--cwd` rejection。
+- 测试覆盖 direct replacement/no chat product entry 和 user-facing command basename/env var
+  derivation。
+- API 测试覆盖 explicit project/session paths、public minimal `/health`、其他 HTTP/WS endpoint
+  的 bearer token requirement、session busy 和 concurrent different sessions。
+- registry 测试覆盖 health-check reuse、stale overwrite 和 file lock double-start prevention。
+- shutdown 测试覆盖 immediate、`--wait` drain、timeout、signal semantics 和 interrupted recovery。
+- persistence 测试覆盖 JSONL/blob pagination、blob reachability 和 hidden/debug filtering。
+- `go test ./...` 通过。
+- `git diff --check` 通过。
+- task checklist 中记录 smoke evidence。

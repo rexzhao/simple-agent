@@ -462,3 +462,61 @@
 - [x] 安全和 blob access 测试覆盖 token requirement、item content range read 和裸 hash 拒绝。
 - [x] 验证 `go test ./...`。
 - [x] 验证 `git diff --check`。
+
+## M21：Global Singleton Server and Explicit Project/Session Lifecycle
+
+- [ ] M21 作为直接替换实现，不保留旧 scoped server behavior 兼容层。
+- [ ] 用户可见 help/docs/errors 使用 raw `argv[0]` basename，不硬编码具体命令名。
+- [ ] `--home PATH`、basename-derived env var 和默认 user-level directory 的 namespace 优先级实现并测试。
+- [ ] 不同 home directories 拥有独立 singleton server、registry、token、projects、sessions 和 data store。
+- [ ] registry/data store 默认位于 user-level home namespace。
+- [ ] registry 记录 `pid`、`base_url`、`token`、`version` 和 `started_at`。
+- [ ] client 复用 registry 前 health-check，stale registry 可覆盖。
+- [ ] file lock 避免 auto-start / background start 并发双启动。
+- [ ] `<cmd> server` 前台启动 namespace singleton 且不绑定 cwd/project。
+- [ ] `<cmd> server --background` 显式后台启动。
+- [ ] help/version/server foreground/server background/server status/server stop 不 auto-start。
+- [ ] bare attach/send/project/session commands 需要时 auto-start。
+- [ ] project identity 只使用 canonical cwd root。
+- [ ] project 必须显式创建并存入 user-level registry/data store，不写 project marker 文件。
+- [ ] duplicate exact canonical project root 返回已有 project info 并退出 0。
+- [ ] cwd upward discovery 选择 nearest registered ancestor，nested projects 正确工作。
+- [ ] project show/remove 未传 `--project` 时使用 current cwd discovery，不接受 `--cwd`。
+- [ ] project remove 默认 archive/hide，真实删除必须显式 `--delete-data`。
+- [ ] running sessions 阻止 project removal/deletion。
+- [ ] session 必须显式创建；不隐式创建 project 或 session。
+- [ ] `--new` 等价 explicit session create 后 attach。
+- [ ] config 属于 session；session create 记录 `config_path` 和关键 metadata。
+- [ ] 每个 turn 重新读取 session `config_path`。
+- [ ] `--config` 只允许创建新 session，existing session attach/send 传入时报错。
+- [ ] existing session cwd 固定为 `created_cwd`。
+- [ ] `--cwd` 只允许 project/session create 和 `--new`，existing session attach/send 传入时报错。
+- [ ] 移除 hardcoded chat product entry，不作为 hidden alias。
+- [ ] bare `<cmd>` 等价 attach，按 cwd 找 project，无 project/session 时失败。
+- [ ] `<cmd> --new` 创建 session 并 attach。
+- [ ] primary command shape 使用 singular `session`；旧 `sessions` 最多作为 list alias。
+- [ ] `session list` 默认当前 project non-archived，支持 `--project`、`--all-projects` 和 `--archived`。
+- [ ] `session list` 按 `last_used_at desc` 再 `created_at desc` 排序。
+- [ ] explicit session id 全局有效；未指定 id 时只选当前 project 最近 non-archived session。
+- [ ] 多个 observers 可 attach 同一 session。
+- [ ] 同一 session 同时只有一个 active turn，busy 时 send 返回 `session_busy` 且不选择其他 session。
+- [ ] 不同 sessions 可并发运行。
+- [ ] shutdown 默认 immediate stop/cancel/cleanup。
+- [ ] `--wait` drain 已开始 calls/turns，停止接受 new turns，并支持 timeout。
+- [ ] OS signals/Ctrl+C 使用 immediate stop 语义。
+- [ ] restart 后 previously running turns/sessions 标记 interrupted，且不自动 replay。
+- [ ] API 使用 explicit project/session paths，包括 `/projects`、`/projects/{project_id}/sessions`、
+  `/sessions/{session_id}`、`/sessions/{session_id}/messages`、`/sessions/{session_id}/items`、
+  `/sessions/{session_id}/content/{blob_hash}` 和 `WS /sessions/{session_id}/stream`。
+- [ ] HTTP/WS 默认 loopback。
+- [ ] `GET /health` 是 public loopback discovery endpoint，且只返回 minimal non-sensitive liveness。
+- [ ] 除 `GET /health` 外，所有 HTTP/WS endpoint 要求 bearer token。
+- [ ] 第一版不实现多用户 login。
+- [ ] durable store 使用 per-project 和 per-session directories，默认不写 project repo。
+- [ ] transcript 使用 append-only JSONL，大内容使用 hash-addressed blobs。
+- [ ] global blob dedupe 可用或明确实现。
+- [ ] session seq 支持 pagination，hidden summary/debug records 可被 GUI 过滤。
+- [ ] future session-history query tool 保持低优先级 out of scope。
+- [ ] `docs/tasks/global-server-projects-checklist.md` 记录实现 smoke evidence。
+- [ ] 验证 `go test ./...`。
+- [ ] 验证 `git diff --check`。
