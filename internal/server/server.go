@@ -984,8 +984,11 @@ func (p *Process) handleSessionItems(w http.ResponseWriter, r *http.Request, id 
 	for _, item := range page {
 		items = append(items, sessionItemDTOFromSessionItem(item))
 	}
+	oldestSeq, newestSeq := sessionItemPageSeqBounds(page)
 	writeJSON(w, http.StatusOK, sessionItemsResponseDTO{
 		Items:         items,
+		OldestSeq:     oldestSeq,
+		NewestSeq:     newestSeq,
 		HasMoreBefore: hasMoreBefore,
 		HasMoreAfter:  hasMoreAfter,
 	})
@@ -1298,6 +1301,11 @@ func (p *Process) handleSessionStream(w http.ResponseWriter, r *http.Request, id
 		writeError(w, http.StatusBadRequest, "invalid_session_id", "invalid session id")
 		return
 	}
+	afterSeq, err := parseSessionStreamAfterSeq(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_query", err.Error())
+		return
+	}
 	if err := p.ensureSessionExists(id); err != nil {
 		switch {
 		case errors.Is(err, errSessionStoreUnavailable):
@@ -1309,12 +1317,24 @@ func (p *Process) handleSessionStream(w http.ResponseWriter, r *http.Request, id
 		}
 		return
 	}
-
 	conn, err := sessionStreamUpgrader.Upgrade(w, r, nil)
 	if err != nil {
 		return
 	}
-	client, ok := p.streams.subscribe(id, conn)
+	var client *sessionStreamClient
+	var ok bool
+	if afterSeq != nil {
+		client, ok, err = p.streams.subscribeWithCatchUp(id, conn, func() ([][]byte, error) {
+			return p.sessionStreamCatchUpPayloads(id, *afterSeq)
+		})
+	} else {
+		client, ok = p.streams.subscribe(id, conn)
+	}
+	if err != nil {
+		_ = conn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseInternalServerErr, "could not load session stream"), time.Now().Add(sessionStreamWriteTimeout))
+		_ = conn.Close()
+		return
+	}
 	if !ok {
 		_ = conn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseGoingAway, "server shutting down"), time.Now().Add(sessionStreamWriteTimeout))
 		_ = conn.Close()
@@ -1589,6 +1609,51 @@ func (p *Process) publishSessionEvent(sessionID string, event SessionStreamEvent
 	p.streams.publish(sessionID, payload)
 }
 
+func (p *Process) sessionStreamCatchUpPayloads(sessionID string, afterSeq int64) ([][]byte, error) {
+	store := p.sessionStore
+	if store == nil {
+		return nil, errSessionStoreUnavailable
+	}
+	events, err := store.PersistedEventsAfter(sessionID, afterSeq)
+	if err != nil {
+		return nil, err
+	}
+	payloads := make([][]byte, 0, len(events))
+	for _, event := range events {
+		streamEvent, ok := sessionStreamEventFromPersistedEvent(event)
+		if !ok {
+			continue
+		}
+		payload, err := marshalSessionStreamEvent(streamEvent)
+		if err != nil {
+			return nil, err
+		}
+		payloads = append(payloads, payload)
+	}
+	return payloads, nil
+}
+
+func sessionStreamEventFromPersistedEvent(event sessions.PersistedEvent) (SessionStreamEvent, bool) {
+	switch event.Type {
+	case sessions.RecordTypeItemAppended:
+		return NewSessionStreamEvent("item.appended", map[string]any{
+			"seq":     event.Seq,
+			"item_id": event.ItemID,
+		}), true
+	case sessions.RecordTypeCompactionCreated:
+		return NewSessionStreamEvent("compaction.created", map[string]any{
+			"seq":           event.Seq,
+			"compaction_id": event.CompactionID,
+		}), true
+	case sessions.RecordTypeActiveHistoryReplaced:
+		return NewSessionStreamEvent("active_history.replaced", map[string]any{
+			"seq": event.Seq,
+		}), true
+	default:
+		return nil, false
+	}
+}
+
 func (p *Process) publishModelTurnEvent(sessionID, turnID string, event model.Event) {
 	switch event := event.(type) {
 	case model.TextDeltaEvent:
@@ -1675,6 +1740,13 @@ func newSessionStreamHub() *sessionStreamHub {
 }
 
 func (h *sessionStreamHub) subscribe(sessionID string, conn *websocket.Conn) (*sessionStreamClient, bool) {
+	return h.subscribeWithBuffer(sessionID, conn, sessionStreamClientBuffer)
+}
+
+func (h *sessionStreamHub) subscribeWithBuffer(sessionID string, conn *websocket.Conn, buffer int) (*sessionStreamClient, bool) {
+	if buffer < sessionStreamClientBuffer {
+		buffer = sessionStreamClientBuffer
+	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if h.closed {
@@ -1684,13 +1756,39 @@ func (h *sessionStreamHub) subscribe(sessionID string, conn *websocket.Conn) (*s
 		hub:       h,
 		sessionID: sessionID,
 		conn:      conn,
-		send:      make(chan []byte, sessionStreamClientBuffer),
+		send:      make(chan []byte, buffer),
 	}
 	if h.sessions[sessionID] == nil {
 		h.sessions[sessionID] = make(map[*sessionStreamClient]struct{})
 	}
 	h.sessions[sessionID][client] = struct{}{}
 	return client, true
+}
+
+func (h *sessionStreamHub) subscribeWithCatchUp(sessionID string, conn *websocket.Conn, catchUp func() ([][]byte, error)) (*sessionStreamClient, bool, error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.closed {
+		return nil, false, nil
+	}
+	payloads, err := catchUp()
+	if err != nil {
+		return nil, false, err
+	}
+	client := &sessionStreamClient{
+		hub:       h,
+		sessionID: sessionID,
+		conn:      conn,
+		send:      make(chan []byte, len(payloads)+sessionStreamClientBuffer),
+	}
+	for _, payload := range payloads {
+		client.send <- payload
+	}
+	if h.sessions[sessionID] == nil {
+		h.sessions[sessionID] = make(map[*sessionStreamClient]struct{})
+	}
+	h.sessions[sessionID][client] = struct{}{}
+	return client, true, nil
 }
 
 func (h *sessionStreamHub) publish(sessionID string, payload []byte) {
@@ -1840,6 +1938,8 @@ type sessionDetailDTO struct {
 
 type sessionItemsResponseDTO struct {
 	Items         []sessionItemDTO `json:"items"`
+	OldestSeq     int64            `json:"oldest_seq"`
+	NewestSeq     int64            `json:"newest_seq"`
 	HasMoreBefore bool             `json:"has_more_before"`
 	HasMoreAfter  bool             `json:"has_more_after"`
 }
@@ -2054,6 +2154,10 @@ func parseSessionItemContentQuery(r *http.Request) (sessionItemContentQuery, err
 	return query, nil
 }
 
+func parseSessionStreamAfterSeq(r *http.Request) (*int64, error) {
+	return parseOptionalNonNegativeInt64Query(r.URL.Query(), "after_seq")
+}
+
 func parseOptionalNonNegativeInt64Query(values map[string][]string, name string) (*int64, error) {
 	raw, ok, err := singleQueryValue(values, name)
 	if err != nil || !ok {
@@ -2172,6 +2276,13 @@ func findSessionItemByID(items []sessions.SessionItem, id string) (sessions.Sess
 		}
 	}
 	return sessions.SessionItem{}, false
+}
+
+func sessionItemPageSeqBounds(items []sessions.SessionItem) (int64, int64) {
+	if len(items) == 0 {
+		return 0, 0
+	}
+	return items[0].Seq, items[len(items)-1].Seq
 }
 
 func paginateSessionItems(items []sessions.SessionItem, query sessionItemsQuery) ([]sessions.SessionItem, bool, bool) {

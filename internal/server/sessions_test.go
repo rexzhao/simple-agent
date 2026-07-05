@@ -938,6 +938,252 @@ func TestSessionStreamConnectsAndPublishesJSONEventShapes(t *testing.T) {
 	}
 }
 
+func TestSessionStreamAfterSeqCatchesUpPersistedItemsBeforeLiveEvents(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "sessions")
+	store := sessions.NewV2Store(root)
+	saveServerTestSession(t, store, "catchup-session")
+	for i := 1; i <= 3; i++ {
+		appendServerTestItem(t, store, "catchup-session", sessions.SessionItem{
+			ID:         fmt.Sprintf("item-%d", i),
+			Kind:       sessions.ItemKindMessage,
+			Visibility: sessions.ItemVisibilityVisible,
+			Audience:   sessions.ItemAudienceModel,
+			Message:    &model.Message{Role: model.MessageRoleAssistant, Content: fmt.Sprintf("persisted text %d", i)},
+		})
+	}
+	process := startSessionAPIServer(t, store, sessions.SessionV2{})
+	conn := dialSessionStreamWithQuery(t, process, "catchup-session", "after_seq=1")
+
+	for _, want := range []struct {
+		seq int64
+		id  string
+	}{
+		{seq: 2, id: "item-2"},
+		{seq: 3, id: "item-3"},
+	} {
+		got := readSessionStreamEvent(t, conn)
+		if got["type"] != "item.appended" || int64(got["seq"].(float64)) != want.seq || got["item_id"] != want.id {
+			t.Fatalf("catch-up event = %#v, want item.appended seq %d id %s", got, want.seq, want.id)
+		}
+		if _, ok := got["text"]; ok {
+			t.Fatalf("catch-up event replayed text delta: %#v", got)
+		}
+	}
+
+	if err := process.PublishSessionEvent("catchup-session", NewSessionStreamEvent("text.delta", map[string]any{"turn_id": "turn-live", "text": "live"})); err != nil {
+		t.Fatalf("PublishSessionEvent(live) error = %v", err)
+	}
+	got := readSessionStreamEvent(t, conn)
+	if got["type"] != "text.delta" || got["text"] != "live" {
+		t.Fatalf("live stream event = %#v, want text.delta live after catch-up", got)
+	}
+}
+
+func TestSessionStreamAfterSeqCatchesUpCompactionEventsInSeqOrder(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "sessions")
+	store := sessions.NewV2Store(root)
+	saveServerTestSession(t, store, "catchup-compact")
+	existing := appendServerTestItem(t, store, "catchup-compact", sessions.SessionItem{
+		ID:         "existing-user",
+		Kind:       sessions.ItemKindMessage,
+		Visibility: sessions.ItemVisibilityVisible,
+		Audience:   sessions.ItemAudienceUser,
+		Message:    &model.Message{Role: model.MessageRoleUser, Content: "existing"},
+	})
+	if _, err := store.ReplaceActiveHistory("catchup-compact", []string{existing.ID}); err != nil {
+		t.Fatalf("ReplaceActiveHistory() error = %v", err)
+	}
+	saved, err := store.AppendCompactionCheckpoint("catchup-compact", sessions.SessionItem{
+		ID:         "summary-1",
+		Kind:       sessions.ItemKindMessage,
+		Visibility: sessions.ItemVisibilityHidden,
+		Audience:   sessions.ItemAudienceModel,
+		Message:    &model.Message{Role: model.MessageRoleDeveloper, Content: "summary secret"},
+	}, sessions.CompactionCheckpoint{
+		ID:                    "compact-1",
+		Reason:                "user_requested",
+		Phase:                 "manual",
+		Trigger:               "manual",
+		SummaryItemID:         "summary-1",
+		PreviousActiveHistory: []string{existing.ID},
+		ReplacementHistory:    []string{existing.ID, "summary-1"},
+	})
+	if err != nil {
+		t.Fatalf("AppendCompactionCheckpoint() error = %v", err)
+	}
+	summary, ok := findSessionItemByID(saved.Items, "summary-1")
+	if !ok {
+		t.Fatalf("summary item missing from saved session: %#v", saved.Items)
+	}
+	process := startSessionAPIServer(t, store, sessions.SessionV2{})
+	conn := dialSessionStreamWithQuery(t, process, "catchup-compact", "after_seq=3")
+
+	events := []map[string]any{
+		readSessionStreamEvent(t, conn),
+		readSessionStreamEvent(t, conn),
+		readSessionStreamEvent(t, conn),
+	}
+	want := []struct {
+		eventType string
+		seq       int64
+		idKey     string
+		idValue   string
+	}{
+		{eventType: "item.appended", seq: summary.Seq, idKey: "item_id", idValue: "summary-1"},
+		{eventType: "compaction.created", seq: summary.Seq + 1, idKey: "compaction_id", idValue: "compact-1"},
+		{eventType: "active_history.replaced", seq: summary.Seq + 2},
+	}
+	for i, wantEvent := range want {
+		got := events[i]
+		if got["type"] != wantEvent.eventType || int64(got["seq"].(float64)) != wantEvent.seq {
+			t.Fatalf("catch-up event[%d] = %#v, want %s seq %d", i, got, wantEvent.eventType, wantEvent.seq)
+		}
+		if wantEvent.idKey != "" && got[wantEvent.idKey] != wantEvent.idValue {
+			t.Fatalf("catch-up event[%d] %s = %#v, want %q; event=%#v", i, wantEvent.idKey, got[wantEvent.idKey], wantEvent.idValue, got)
+		}
+	}
+	if _, ok := events[2]["item_ids"]; ok {
+		t.Fatalf("active_history.replaced catch-up leaked item_ids: %#v", events[2])
+	}
+
+	if err := process.PublishSessionEvent("catchup-compact", NewSessionStreamEvent("text.delta", map[string]any{"turn_id": "turn-live", "text": "live"})); err != nil {
+		t.Fatalf("PublishSessionEvent(live) error = %v", err)
+	}
+	got := readSessionStreamEvent(t, conn)
+	if got["type"] != "text.delta" || got["text"] != "live" {
+		t.Fatalf("live stream event = %#v, want text.delta live after catch-up", got)
+	}
+}
+
+func TestSessionStreamAfterSeqCatchesUpCompactedTurnActiveHistoryAtPersistedSeq(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "sessions")
+	store := sessions.NewV2Store(root)
+	session := sessions.SessionV2{
+		ID:              "catchup-compacted-turn",
+		Provider:        "fake",
+		ModelProfile:    "default",
+		ModelID:         "model-default",
+		SaveToolResults: true,
+	}
+	if _, err := store.SaveMetadata(session); err != nil {
+		t.Fatalf("SaveMetadata() error = %v", err)
+	}
+	existing := appendServerTestItem(t, store, "catchup-compacted-turn", sessions.SessionItem{
+		ID:         "existing-user",
+		Kind:       sessions.ItemKindMessage,
+		Visibility: sessions.ItemVisibilityVisible,
+		Audience:   sessions.ItemAudienceUser,
+		Message:    &model.Message{Role: model.MessageRoleUser, Content: "existing"},
+	})
+	if _, err := store.ReplaceActiveHistory("catchup-compacted-turn", []string{existing.ID}); err != nil {
+		t.Fatalf("ReplaceActiveHistory() error = %v", err)
+	}
+	loaded, err := store.Load("catchup-compacted-turn")
+	if err != nil {
+		t.Fatalf("Load(catchup-compacted-turn) error = %v", err)
+	}
+	saved, err := store.SaveCompactedTurn(loaded, sessions.SessionItem{
+		ID:         "summary-1",
+		Kind:       sessions.ItemKindMessage,
+		Visibility: sessions.ItemVisibilityHidden,
+		Audience:   sessions.ItemAudienceModel,
+		Message:    &model.Message{Role: model.MessageRoleDeveloper, Content: "summary secret"},
+	}, sessions.CompactionCheckpoint{
+		ID:                    "compact-1",
+		Reason:                "context_limit",
+		Phase:                 "pre_turn",
+		Trigger:               "auto",
+		SummaryItemID:         "summary-1",
+		PreviousActiveHistory: []string{existing.ID},
+		ReplacementHistory:    []string{existing.ID, "summary-1"},
+	}, []sessions.SessionItem{
+		{
+			ID:         "user-after-compact",
+			Kind:       sessions.ItemKindMessage,
+			Visibility: sessions.ItemVisibilityVisible,
+			Audience:   sessions.ItemAudienceUser,
+			Message:    &model.Message{Role: model.MessageRoleUser, Content: "user after compact"},
+		},
+		{
+			ID:         "assistant-after-compact",
+			Kind:       sessions.ItemKindMessage,
+			Visibility: sessions.ItemVisibilityVisible,
+			Audience:   sessions.ItemAudienceModel,
+			Message:    &model.Message{Role: model.MessageRoleAssistant, Content: "assistant after compact"},
+		},
+	}, []string{"existing-user", "summary-1", "user-after-compact", "assistant-after-compact"})
+	if err != nil {
+		t.Fatalf("SaveCompactedTurn() error = %v", err)
+	}
+	if got := responseSessionItemIDs(saved.Items); !reflect.DeepEqual(got, []string{"existing-user", "summary-1", "user-after-compact", "assistant-after-compact"}) {
+		t.Fatalf("saved item IDs = %#v, want existing summary user assistant", got)
+	}
+	if saved.Items[1].Seq != 4 || saved.Items[2].Seq != 6 || saved.Items[3].Seq != 7 || saved.LastSeq != 9 {
+		t.Fatalf("saved seqs summary/user/assistant/last = %d/%d/%d/%d, want 4/6/7/9", saved.Items[1].Seq, saved.Items[2].Seq, saved.Items[3].Seq, saved.LastSeq)
+	}
+
+	process := startSessionAPIServer(t, store, sessions.SessionV2{})
+	conn := dialSessionStreamWithQuery(t, process, "catchup-compacted-turn", "after_seq=5")
+	events := []map[string]any{
+		readSessionStreamEvent(t, conn),
+		readSessionStreamEvent(t, conn),
+		readSessionStreamEvent(t, conn),
+	}
+	want := []struct {
+		eventType string
+		seq       int64
+		itemID    string
+	}{
+		{eventType: "item.appended", seq: 6, itemID: "user-after-compact"},
+		{eventType: "item.appended", seq: 7, itemID: "assistant-after-compact"},
+		{eventType: "active_history.replaced", seq: 8},
+	}
+	for i, wantEvent := range want {
+		got := events[i]
+		if got["type"] != wantEvent.eventType || int64(got["seq"].(float64)) != wantEvent.seq {
+			t.Fatalf("catch-up event[%d] = %#v, want %s seq %d", i, got, wantEvent.eventType, wantEvent.seq)
+		}
+		if wantEvent.itemID != "" && got["item_id"] != wantEvent.itemID {
+			t.Fatalf("catch-up event[%d] item_id = %#v, want %q; event=%#v", i, got["item_id"], wantEvent.itemID, got)
+		}
+		if _, ok := got["compaction_id"]; ok {
+			t.Fatalf("catch-up event[%d] unexpectedly replayed compaction metadata after cursor: %#v", i, got)
+		}
+	}
+
+	if err := process.PublishSessionEvent("catchup-compacted-turn", NewSessionStreamEvent("text.delta", map[string]any{"turn_id": "turn-live", "text": "live"})); err != nil {
+		t.Fatalf("PublishSessionEvent(live) error = %v", err)
+	}
+	got := readSessionStreamEvent(t, conn)
+	if got["type"] != "text.delta" || got["text"] != "live" {
+		t.Fatalf("live stream event = %#v, want text.delta live after catch-up", got)
+	}
+}
+
+func TestSessionStreamAfterSeqBadQueryFailsBeforeUpgrade(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "sessions")
+	store := sessions.NewV2Store(root)
+	saveServerTestSession(t, store, "catchup-session")
+	process := startSessionAPIServer(t, store, sessions.SessionV2{})
+
+	header := http.Header{}
+	header.Set("Authorization", "Bearer registry-token")
+	conn, resp, err := websocket.DefaultDialer.Dial("ws://"+process.Addr()+"/sessions/catchup-session/stream?after_seq=-1", header)
+	if err == nil {
+		_ = conn.Close()
+		t.Fatal("Dial(stream negative after_seq) error = nil, want handshake failure")
+	}
+	if resp == nil {
+		t.Fatalf("Dial(stream negative after_seq) response = nil, error = %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("negative after_seq stream status = %d, want 400", resp.StatusCode)
+	}
+	body := decodeJSON(t, resp)
+	assertErrorCode(t, body, "invalid_query")
+}
+
 func TestSessionStreamRequiresRegistryToken(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "sessions")
 	store := sessions.NewV2Store(root)
@@ -2187,6 +2433,9 @@ func TestSessionItemsPaginationBeforeAfter(t *testing.T) {
 	if got := responseItemSeqs(t, before); !reflect.DeepEqual(got, []int64{3, 4}) {
 		t.Fatalf("before_seq page seqs = %#v, want [3 4]", got)
 	}
+	if before["oldest_seq"] != float64(3) || before["newest_seq"] != float64(4) {
+		t.Fatalf("before_seq cursors = oldest:%#v newest:%#v, want 3/4", before["oldest_seq"], before["newest_seq"])
+	}
 	if before["has_more_before"] != true || before["has_more_after"] != true {
 		t.Fatalf("before_seq booleans = before:%#v after:%#v, want true/true", before["has_more_before"], before["has_more_after"])
 	}
@@ -2195,8 +2444,30 @@ func TestSessionItemsPaginationBeforeAfter(t *testing.T) {
 	if got := responseItemSeqs(t, after); !reflect.DeepEqual(got, []int64{3, 4}) {
 		t.Fatalf("after_seq page seqs = %#v, want [3 4]", got)
 	}
+	if after["oldest_seq"] != float64(3) || after["newest_seq"] != float64(4) {
+		t.Fatalf("after_seq cursors = oldest:%#v newest:%#v, want 3/4", after["oldest_seq"], after["newest_seq"])
+	}
 	if after["has_more_before"] != true || after["has_more_after"] != true {
 		t.Fatalf("after_seq booleans = before:%#v after:%#v, want true/true", after["has_more_before"], after["has_more_after"])
+	}
+}
+
+func TestSessionItemsEmptyPageCursorFields(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "sessions")
+	store := sessions.NewV2Store(root)
+	saveServerTestSession(t, store, "empty-session")
+	process := startSessionAPIServer(t, store, sessions.SessionV2{})
+	baseURL := "http://" + process.Addr()
+
+	_, body := getRawJSON(t, baseURL+"/sessions/empty-session/items")
+	if got := responseItems(t, body); len(got) != 0 {
+		t.Fatalf("empty page items = %#v, want empty", got)
+	}
+	if body["oldest_seq"] != float64(0) || body["newest_seq"] != float64(0) {
+		t.Fatalf("empty page cursors = oldest:%#v newest:%#v, want 0/0", body["oldest_seq"], body["newest_seq"])
+	}
+	if body["has_more_before"] != false || body["has_more_after"] != false {
+		t.Fatalf("empty page booleans = before:%#v after:%#v, want false/false", body["has_more_before"], body["has_more_after"])
 	}
 }
 
@@ -2224,6 +2495,9 @@ func TestSessionItemsDefaultAndMaxLimits(t *testing.T) {
 	}
 	if defaultSeqs[0] != int64(total-defaultSessionItemsLimit+1) || defaultSeqs[len(defaultSeqs)-1] != int64(total) {
 		t.Fatalf("default page seqs first/last = %d/%d, want latest %d items through %d", defaultSeqs[0], defaultSeqs[len(defaultSeqs)-1], defaultSessionItemsLimit, total)
+	}
+	if defaultPage["oldest_seq"] != float64(total-defaultSessionItemsLimit+1) || defaultPage["newest_seq"] != float64(total) {
+		t.Fatalf("default cursors = oldest:%#v newest:%#v, want latest page bounds", defaultPage["oldest_seq"], defaultPage["newest_seq"])
 	}
 	if defaultPage["has_more_before"] != true || defaultPage["has_more_after"] != false {
 		t.Fatalf("default booleans = before:%#v after:%#v, want true/false", defaultPage["has_more_before"], defaultPage["has_more_after"])
@@ -3114,11 +3388,19 @@ func appendServerTestItem(t *testing.T, store *sessions.V2Store, sessionID strin
 }
 
 func dialSessionStream(t *testing.T, process *Process, sessionID string) *websocket.Conn {
+	return dialSessionStreamWithQuery(t, process, sessionID, "")
+}
+
+func dialSessionStreamWithQuery(t *testing.T, process *Process, sessionID, rawQuery string) *websocket.Conn {
 	t.Helper()
 
 	header := http.Header{}
 	header.Set("Authorization", "Bearer registry-token")
-	conn, resp, err := websocket.DefaultDialer.Dial("ws://"+process.Addr()+"/sessions/"+sessionID+"/stream", header)
+	target := "ws://" + process.Addr() + "/sessions/" + sessionID + "/stream"
+	if rawQuery != "" {
+		target += "?" + rawQuery
+	}
+	conn, resp, err := websocket.DefaultDialer.Dial(target, header)
 	if err != nil {
 		if resp != nil && resp.Body != nil {
 			raw, _ := io.ReadAll(resp.Body)

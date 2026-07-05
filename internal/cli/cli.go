@@ -2628,7 +2628,18 @@ func attachCommand(ctx context.Context, args []string, configPath string, config
 		}
 	}
 
-	events, streamErrs, closeStream, err := localserver.StreamSessionEvents(ctx, record.BaseURL, record.Token, sessionID, serverClientTimeout)
+	streamOptions := localserver.SessionStreamOptions{}
+	if !*newSession {
+		snapshot, err := localserver.GetSessionChatItemsWithToken(ctx, record.BaseURL, record.Token, sessionID, serverClientTimeout)
+		if err != nil {
+			return err
+		}
+		if err := writeAttachSnapshot(stdout, snapshot); err != nil {
+			return err
+		}
+		streamOptions.AfterSeq = &snapshot.NewestSeq
+	}
+	events, streamErrs, closeStream, err := localserver.StreamSessionEventsWithOptions(ctx, record.BaseURL, record.Token, sessionID, streamOptions, serverClientTimeout)
 	if err != nil {
 		return err
 	}
@@ -2637,6 +2648,38 @@ func attachCommand(ctx context.Context, args []string, configPath string, config
 		return err
 	}
 	return runAttachREPL(ctx, record, sessionID, stdin, stdout, stderr, events, streamErrs, displayCommand)
+}
+
+func writeAttachSnapshot(stdout io.Writer, snapshot localserver.SessionItemsPage) error {
+	for _, item := range snapshot.Items {
+		if item.Kind != sessions.ItemKindMessage || item.Visibility != sessions.ItemVisibilityVisible || item.Message == nil || item.Message.Content == nil {
+			continue
+		}
+		role := strings.TrimSpace(item.Message.Role)
+		switch role {
+		case string(model.MessageRoleUser):
+			if item.Audience != sessions.ItemAudienceUser {
+				continue
+			}
+		case string(model.MessageRoleAssistant):
+			if item.Audience != sessions.ItemAudienceModel {
+				continue
+			}
+		default:
+			continue
+		}
+		text := item.Message.Content.Inline
+		if text == "" {
+			text = item.Message.Content.Preview
+		}
+		if text == "" {
+			continue
+		}
+		if _, err := fmt.Fprintf(stdout, "%s: %s\n", role, text); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func mostRecentProjectSessionID(ctx context.Context, record localserver.RegistryRecord, cwdFlag string, getwd func() (string, error), program string, newHint string) (string, error) {

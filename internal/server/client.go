@@ -131,6 +131,49 @@ type SessionMetadataUpdate struct {
 	Archived    *bool   `json:"archived,omitempty"`
 }
 
+type SessionItemsPage struct {
+	Items         []SessionItem `json:"items"`
+	OldestSeq     int64         `json:"oldest_seq"`
+	NewestSeq     int64         `json:"newest_seq"`
+	HasMoreBefore bool          `json:"has_more_before"`
+	HasMoreAfter  bool          `json:"has_more_after"`
+}
+
+type SessionItem struct {
+	Seq        int64               `json:"seq"`
+	ID         string              `json:"id"`
+	TurnID     string              `json:"turn_id,omitempty"`
+	CreatedAt  time.Time           `json:"created_at"`
+	Kind       string              `json:"kind"`
+	Visibility string              `json:"visibility"`
+	Audience   string              `json:"audience"`
+	Message    *SessionItemMessage `json:"message,omitempty"`
+}
+
+type SessionItemMessage struct {
+	Role    string                     `json:"role"`
+	Content *SessionItemMessageContent `json:"content,omitempty"`
+}
+
+type SessionItemMessageContent struct {
+	Inline    string              `json:"inline,omitempty"`
+	Preview   string              `json:"preview,omitempty"`
+	SizeBytes int64               `json:"size_bytes,omitempty"`
+	Truncated bool                `json:"truncated,omitempty"`
+	Blob      *SessionItemBlobRef `json:"blob,omitempty"`
+}
+
+type SessionItemBlobRef struct {
+	Hash      string `json:"hash"`
+	SizeBytes int64  `json:"size_bytes"`
+	Encoding  string `json:"encoding"`
+	MediaType string `json:"media_type,omitempty"`
+}
+
+type SessionStreamOptions struct {
+	AfterSeq *int64
+}
+
 // SessionMessageResult is the committed metadata returned by POST /sessions/{id}/messages.
 type SessionMessageResult struct {
 	TurnID  string `json:"turn_id"`
@@ -568,6 +611,33 @@ func GetSessionDetail(ctx context.Context, addr, token, id string, timeout time.
 	return detail, nil
 }
 
+// GetSessionChatItemsWithToken fetches the recent display transcript page for a session.
+func GetSessionChatItemsWithToken(ctx context.Context, addr, token, id string, timeout time.Duration) (SessionItemsPage, error) {
+	id = strings.TrimSpace(id)
+	values := url.Values{}
+	values.Set("view", "chat")
+	values.Set("limit", "50")
+	req, err := newServerClientRequest(ctx, http.MethodGet, addr, "/sessions/"+url.PathEscape(id)+"/items?"+values.Encode())
+	if err != nil {
+		return SessionItemsPage{}, err
+	}
+	setBearerToken(req, token)
+	client := http.Client{Timeout: clientTimeout(timeout)}
+	resp, err := client.Do(req)
+	if err != nil {
+		return SessionItemsPage{}, fmt.Errorf("get session items %s at %s: %w", id, strings.TrimSpace(addr), err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return SessionItemsPage{}, fmt.Errorf("get session items %s at %s: %s", id, strings.TrimSpace(addr), serverResponseError(resp))
+	}
+	var page SessionItemsPage
+	if err := json.NewDecoder(resp.Body).Decode(&page); err != nil {
+		return SessionItemsPage{}, fmt.Errorf("decode session items %s at %s: %w", id, strings.TrimSpace(addr), err)
+	}
+	return page, nil
+}
+
 func RenameSessionWithToken(ctx context.Context, addr, token, id, displayName string, timeout time.Duration) (SessionDetail, error) {
 	displayName = strings.TrimSpace(displayName)
 	return UpdateSessionMetadataWithToken(ctx, addr, token, id, SessionMetadataUpdate{DisplayName: &displayName}, timeout)
@@ -713,7 +783,12 @@ func CompactSessionWithToken(ctx context.Context, addr, token, id string, timeou
 
 // StreamSessionEvents connects to WS /sessions/{id}/stream with the registry bearer token and decodes JSON events.
 func StreamSessionEvents(ctx context.Context, addr, token, id string, timeout time.Duration) (<-chan SessionStreamEvent, <-chan error, func(), error) {
-	target, err := sessionStreamURL(addr, id)
+	return StreamSessionEventsWithOptions(ctx, addr, token, id, SessionStreamOptions{}, timeout)
+}
+
+// StreamSessionEventsWithOptions connects to WS /sessions/{id}/stream and applies optional catch-up cursors.
+func StreamSessionEventsWithOptions(ctx context.Context, addr, token, id string, options SessionStreamOptions, timeout time.Duration) (<-chan SessionStreamEvent, <-chan error, func(), error) {
+	target, err := sessionStreamURL(addr, id, options)
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -832,7 +907,7 @@ func newServerClientRequestWithBody(ctx context.Context, method, addr, path stri
 	return http.NewRequestWithContext(ctx, method, "http://"+addr+path, bytes.NewReader(body))
 }
 
-func sessionStreamURL(addr, id string) (string, error) {
+func sessionStreamURL(addr, id string, options SessionStreamOptions) (string, error) {
 	addr = strings.TrimSpace(addr)
 	if addr == "" {
 		return "", fmt.Errorf("server addr is required")
@@ -841,7 +916,13 @@ func sessionStreamURL(addr, id string) (string, error) {
 	if id == "" {
 		return "", fmt.Errorf("session id is required")
 	}
-	return "ws://" + addr + "/sessions/" + url.PathEscape(id) + "/stream", nil
+	path := "/sessions/" + url.PathEscape(id) + "/stream"
+	if options.AfterSeq != nil {
+		values := url.Values{}
+		values.Set("after_seq", strconv.FormatInt(*options.AfterSeq, 10))
+		path += "?" + values.Encode()
+	}
+	return "ws://" + addr + path, nil
 }
 
 func clientTimeout(timeout time.Duration) time.Duration {

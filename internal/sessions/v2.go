@@ -920,6 +920,41 @@ func (s *V2Store) Replay(sessionID string) (SessionV2, error) {
 	return state, nil
 }
 
+type PersistedEvent struct {
+	Seq          int64
+	Type         string
+	ItemID       string
+	CompactionID string
+}
+
+func (s *V2Store) PersistedEventsAfter(sessionID string, afterSeq int64) ([]PersistedEvent, error) {
+	if err := s.requireRoot(); err != nil {
+		return nil, err
+	}
+	if err := validateV2SessionID(sessionID); err != nil {
+		return nil, err
+	}
+	if afterSeq < 0 {
+		return nil, fmt.Errorf("after seq must be non-negative")
+	}
+
+	state := SessionV2{
+		ID:      sessionID,
+		Version: VersionV2,
+	}
+	segments, err := s.segmentPaths(sessionID)
+	if err != nil {
+		return nil, err
+	}
+	events := make([]PersistedEvent, 0)
+	for _, path := range segments {
+		if err := replaySegmentPersistedEvents(path, &state, afterSeq, &events); err != nil {
+			return nil, err
+		}
+	}
+	return events, nil
+}
+
 func (s *V2Store) WriteBlob(raw []byte, encoding, mediaType string) (BlobRef, error) {
 	if err := s.requireRoot(); err != nil {
 		return BlobRef{}, err
@@ -1457,6 +1492,91 @@ func replayRecord(path string, lineNumber int, line []byte, state *SessionV2, pe
 	return replayCommittedRecord(path, lineNumber, record, state)
 }
 
+func replaySegmentPersistedEvents(path string, state *SessionV2, afterSeq int64, events *[]PersistedEvent) error {
+	file, err := os.Open(path)
+	if err != nil {
+		return fmt.Errorf("open segment %q: %w", path, err)
+	}
+	defer file.Close()
+
+	reader := bufio.NewReader(file)
+	lineNumber := 0
+	var pending *replayTransaction
+	for {
+		line, err := reader.ReadBytes('\n')
+		if len(line) > 0 {
+			if errors.Is(err, io.EOF) && line[len(line)-1] != '\n' {
+				break
+			}
+			lineNumber++
+			if len(line) > maxJSONLRecordBytes {
+				return corruptedSessionError(state.ID, "%s:%d record exceeds %d bytes", path, lineNumber, maxJSONLRecordBytes)
+			}
+			if err := replayRecordPersistedEvents(path, lineNumber, line, state, &pending, afterSeq, events); err != nil {
+				return err
+			}
+		}
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			return fmt.Errorf("read segment %q: %w", path, err)
+		}
+	}
+	return nil
+}
+
+func replayRecordPersistedEvents(path string, lineNumber int, line []byte, state *SessionV2, pending **replayTransaction, afterSeq int64, events *[]PersistedEvent) error {
+	line = []byte(strings.TrimSpace(string(line)))
+	if len(line) == 0 {
+		return nil
+	}
+	var record v2Record
+	if err := json.Unmarshal(line, &record); err != nil {
+		return corruptedSessionError(state.ID, "%s:%d invalid JSONL record: %v", path, lineNumber, err)
+	}
+	if record.Type == RecordTypeTransactionBegin {
+		if record.TxID == "" {
+			return corruptedSessionError(state.ID, "%s:%d transaction.begin missing tx_id", path, lineNumber)
+		}
+		if record.Seq != state.LastSeq+1 {
+			return corruptedSessionError(state.ID, "%s:%d record seq %d follows seq %d", path, lineNumber, record.Seq, state.LastSeq)
+		}
+		*pending = &replayTransaction{txID: record.TxID, records: []v2Record{record}}
+		return nil
+	}
+	if record.TxID != "" {
+		if *pending == nil || (*pending).txID != record.TxID {
+			*pending = nil
+			return nil
+		}
+		expectedSeq := state.LastSeq + int64(len((*pending).records)) + 1
+		if record.Seq != expectedSeq {
+			*pending = nil
+			return nil
+		}
+		if record.Type == RecordTypeTransactionCommit {
+			if err := replayCommittedTransactionPersistedEvents(*pending, record, state, afterSeq, events); err != nil {
+				return err
+			}
+			*pending = nil
+			return nil
+		}
+		(*pending).records = append((*pending).records, record)
+		return nil
+	}
+	*pending = nil
+	if err := replayCommittedRecord(path, lineNumber, record, state); err != nil {
+		return err
+	}
+	if record.Seq > afterSeq {
+		if event, ok := persistedEventFromRecord(record, false); ok {
+			*events = append(*events, event)
+		}
+	}
+	return nil
+}
+
 func replayCommittedTransaction(pending *replayTransaction, commit v2Record, state *SessionV2) error {
 	if pending == nil || len(pending.records) == 0 {
 		return nil
@@ -1474,6 +1594,73 @@ func replayCommittedTransaction(pending *replayTransaction, commit v2Record, sta
 	temp.LastSeq = commit.Seq
 	*state = temp
 	return nil
+}
+
+func replayCommittedTransactionPersistedEvents(pending *replayTransaction, commit v2Record, state *SessionV2, afterSeq int64, events *[]PersistedEvent) error {
+	if pending == nil || len(pending.records) == 0 {
+		return nil
+	}
+	temp := copySessionV2(*state)
+	temp.LastSeq = pending.records[0].Seq
+	hasCompaction := false
+	for _, record := range pending.records[1:] {
+		if record.Type == RecordTypeCompactionCreated {
+			hasCompaction = true
+			break
+		}
+	}
+	txEvents := make([]PersistedEvent, 0, len(pending.records))
+	for _, record := range pending.records[1:] {
+		if err := replayCommittedRecord("", 0, record, &temp); err != nil {
+			return err
+		}
+		if record.Seq <= afterSeq {
+			continue
+		}
+		if event, ok := persistedEventFromRecord(record, hasCompaction); ok {
+			txEvents = append(txEvents, event)
+		}
+	}
+	if commit.Seq != temp.LastSeq+1 {
+		return corruptedSessionError(state.ID, "transaction %q commit seq %d follows seq %d", commit.TxID, commit.Seq, temp.LastSeq)
+	}
+	temp.LastSeq = commit.Seq
+	*state = temp
+	*events = append(*events, txEvents...)
+	return nil
+}
+
+func persistedEventFromRecord(record v2Record, includeActiveHistory bool) (PersistedEvent, bool) {
+	switch record.Type {
+	case RecordTypeItemAppended:
+		if record.Item == nil {
+			return PersistedEvent{}, false
+		}
+		return PersistedEvent{
+			Seq:    record.Seq,
+			Type:   record.Type,
+			ItemID: record.Item.ID,
+		}, true
+	case RecordTypeCompactionCreated:
+		if record.Compaction == nil {
+			return PersistedEvent{}, false
+		}
+		return PersistedEvent{
+			Seq:          record.Seq,
+			Type:         record.Type,
+			CompactionID: record.Compaction.ID,
+		}, true
+	case RecordTypeActiveHistoryReplaced:
+		if !includeActiveHistory {
+			return PersistedEvent{}, false
+		}
+		return PersistedEvent{
+			Seq:  record.Seq,
+			Type: record.Type,
+		}, true
+	default:
+		return PersistedEvent{}, false
+	}
 }
 
 func replayCommittedRecord(path string, lineNumber int, record v2Record, state *SessionV2) error {

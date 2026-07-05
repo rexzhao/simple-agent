@@ -2012,7 +2012,7 @@ func TestProjectListConcurrentAutoStartLaunchesOneBackgroundServer(t *testing.T)
 	projectDir := t.TempDir()
 	writeCLIFixtureInDir(t, filepath.Join(projectDir, ".agents"))
 
-	authSeen := make(chan string, 2)
+	authSeen := make(chan string, 4)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/health":
@@ -3018,7 +3018,7 @@ func TestSendWithoutSessionAutoStartsSingletonServerWithoutStartupOutput(t *test
 		t.Fatalf("CanonicalRoot(%q) error = %v", projectDir, err)
 	}
 
-	authSeen := make(chan string, 3)
+	authSeen := make(chan string, 4)
 	messageBodySeen := make(chan map[string]any, 1)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
@@ -3123,7 +3123,7 @@ func TestAttachWithoutSessionAutoStartsSingletonServerWithoutStartupOutput(t *te
 		t.Fatalf("CanonicalRoot(%q) error = %v", projectDir, err)
 	}
 
-	authSeen := make(chan string, 3)
+	authSeen := make(chan string, 8)
 	upgrader := websocket.Upgrader{}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
@@ -3157,7 +3157,12 @@ func TestAttachWithoutSessionAutoStartsSingletonServerWithoutStartupOutput(t *te
 					},
 				},
 			})
+		case r.URL.Path == "/sessions/latest-session/items":
+			writeCLIEmptySessionItems(t, w, r, authSeen)
 		case r.URL.Path == "/sessions/latest-session/stream":
+			if got := r.URL.Query().Get("after_seq"); got != "0" {
+				t.Fatalf("stream after_seq = %q, want 0", got)
+			}
 			authSeen <- r.Header.Get("Authorization")
 			conn, err := upgrader.Upgrade(w, r, nil)
 			if err != nil {
@@ -3195,7 +3200,7 @@ func TestAttachWithoutSessionAutoStartsSingletonServerWithoutStartupOutput(t *te
 	assertCLIFlagValue(t, childArgs, "--server-root", mustCLICanonicalPath(t, filepath.Dir(filepath.Dir(registryPath))))
 	assertCLIFlagValue(t, childArgs, "--listen", localserver.DefaultListenAddress)
 	assertCLIStringSliceOmits(t, childArgs, "--config", "--cwd")
-	for _, name := range []string{"projects", "project sessions", "stream"} {
+	for _, name := range []string{"projects", "project sessions", "snapshot", "stream"} {
 		select {
 		case got := <-authSeen:
 			if got != "Bearer auto-token" {
@@ -9205,13 +9210,19 @@ func TestAttachExplicitAutoStartsWithoutCWDDiscovery(t *testing.T) {
 	registryPath := isolateCLIUserRegistry(t)
 	projectDir := t.TempDir()
 
+	itemAuthSeen := make(chan string, 1)
 	streamAuthSeen := make(chan string, 1)
 	upgrader := websocket.Upgrader{}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/health":
 			writeCLIJSON(w, http.StatusOK, map[string]any{"status": "ok"})
+		case "/sessions/missing-session/items":
+			writeCLIEmptySessionItems(t, w, r, itemAuthSeen)
 		case "/sessions/missing-session/stream":
+			if got := r.URL.Query().Get("after_seq"); got != "0" {
+				t.Fatalf("stream after_seq = %q, want 0", got)
+			}
 			streamAuthSeen <- r.Header.Get("Authorization")
 			conn, err := upgrader.Upgrade(w, r, nil)
 			if err != nil {
@@ -9242,6 +9253,14 @@ func TestAttachExplicitAutoStartsWithoutCWDDiscovery(t *testing.T) {
 	assertCLIFlagValue(t, childArgs, "--server-root", mustCLICanonicalPath(t, filepath.Dir(filepath.Dir(registryPath))))
 	assertCLIStringSliceOmits(t, childArgs, "--background-child", "--config", "--cwd")
 	select {
+	case got := <-itemAuthSeen:
+		if got != "Bearer auto-token" {
+			t.Fatalf("items Authorization = %q, want auto-start token", got)
+		}
+	default:
+		t.Fatal("session items were not requested")
+	}
+	select {
 	case got := <-streamAuthSeen:
 		if got != "Bearer auto-token" {
 			t.Fatalf("stream Authorization = %q, want auto-start token", got)
@@ -9260,13 +9279,19 @@ func TestAttachExplicitUsesSelectedServerWithoutCWDDiscovery(t *testing.T) {
 	registryPath := isolateCLIUserRegistry(t)
 	projectDir := t.TempDir()
 
+	itemAuthSeen := make(chan string, 1)
 	streamAuthSeen := make(chan string, 1)
 	upgrader := websocket.Upgrader{}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/health":
 			writeCLIJSON(w, http.StatusOK, map[string]any{"status": "ok"})
+		case "/sessions/existing-session/items":
+			writeCLIEmptySessionItems(t, w, r, itemAuthSeen)
 		case "/sessions/existing-session/stream":
+			if got := r.URL.Query().Get("after_seq"); got != "0" {
+				t.Fatalf("stream after_seq = %q, want 0", got)
+			}
 			streamAuthSeen <- r.Header.Get("Authorization")
 			conn, err := upgrader.Upgrade(w, r, nil)
 			if err != nil {
@@ -9294,6 +9319,14 @@ func TestAttachExplicitUsesSelectedServerWithoutCWDDiscovery(t *testing.T) {
 		t.Fatalf("attach explicit code = %d, stderr = %s", code, stderr.String())
 	}
 	select {
+	case got := <-itemAuthSeen:
+		if got != "Bearer registry-token" {
+			t.Fatalf("items Authorization = %q, want bearer registry token", got)
+		}
+	default:
+		t.Fatal("session items were not requested")
+	}
+	select {
 	case got := <-streamAuthSeen:
 		if got != "Bearer registry-token" {
 			t.Fatalf("stream Authorization = %q, want bearer registry token", got)
@@ -9306,6 +9339,120 @@ func TestAttachExplicitUsesSelectedServerWithoutCWDDiscovery(t *testing.T) {
 	}
 	assertCLIOutputContains(t, stderr.String(), "sai: attached to session existing-session")
 	assertCLIErrorOmits(t, stderr.String(), "registry-token")
+}
+
+func TestAttachExistingRendersSnapshotAndStreamsAfterNewestSeq(t *testing.T) {
+	registryPath := isolateCLIUserRegistry(t)
+	projectDir := t.TempDir()
+
+	streamSeen := make(chan string, 1)
+	upgrader := websocket.Upgrader{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/health":
+			writeCLIJSON(w, http.StatusOK, map[string]any{"status": "ok"})
+		case "/sessions/existing-session/items":
+			if r.Method != http.MethodGet {
+				t.Fatalf("items method = %s, want GET", r.Method)
+			}
+			if got := r.URL.Query().Get("view"); got != "chat" {
+				t.Fatalf("items view = %q, want chat", got)
+			}
+			if got := r.URL.Query().Get("limit"); got != "50" {
+				t.Fatalf("items limit = %q, want 50", got)
+			}
+			writeCLIJSON(w, http.StatusOK, map[string]any{
+				"items": []map[string]any{
+					{
+						"seq":        10,
+						"id":         "user-visible",
+						"kind":       "message",
+						"visibility": "visible",
+						"audience":   "user",
+						"message": map[string]any{
+							"role":    "user",
+							"content": map[string]any{"inline": "hello snapshot"},
+						},
+					},
+					{
+						"seq":        11,
+						"id":         "assistant-visible",
+						"kind":       "message",
+						"visibility": "visible",
+						"audience":   "model",
+						"message": map[string]any{
+							"role":    "assistant",
+							"content": map[string]any{"preview": "assistant preview"},
+						},
+					},
+					{
+						"seq":        12,
+						"id":         "hidden-summary",
+						"kind":       "message",
+						"visibility": "hidden",
+						"audience":   "model",
+						"message": map[string]any{
+							"role":    "assistant",
+							"content": map[string]any{"inline": "hidden summary secret"},
+						},
+					},
+					{
+						"seq":        13,
+						"id":         "debug-record",
+						"kind":       "runtime_context",
+						"visibility": "debug",
+						"audience":   "internal",
+						"message": map[string]any{
+							"role":    "user",
+							"content": map[string]any{"inline": "debug secret"},
+						},
+					},
+				},
+				"oldest_seq":      10,
+				"newest_seq":      13,
+				"has_more_before": true,
+				"has_more_after":  false,
+			})
+		case "/sessions/existing-session/stream":
+			streamSeen <- r.URL.RawQuery
+			conn, err := upgrader.Upgrade(w, r, nil)
+			if err != nil {
+				t.Fatalf("Upgrade(stream) error = %v", err)
+			}
+			defer conn.Close()
+			for {
+				if _, _, err := conn.NextReader(); err != nil {
+					return
+				}
+			}
+		default:
+			t.Fatalf("unexpected path %q", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+	registerCLIFakeServer(t, registryPath, projectDir, server.URL, "registry-token")
+
+	var stdout, stderr bytes.Buffer
+	code := RunWithIO([]string{"attach", "existing-session"}, strings.NewReader("/quit\n"), &stdout, &stderr, func() (string, error) {
+		return "", errors.New("getwd should not be called")
+	})
+
+	if code != 0 {
+		t.Fatalf("attach code = %d, stderr = %s", code, stderr.String())
+	}
+	if got, want := stdout.String(), "user: hello snapshot\nassistant: assistant preview\n"; got != want {
+		t.Fatalf("stdout = %q, want snapshot %q", got, want)
+	}
+	select {
+	case got := <-streamSeen:
+		if got != "after_seq=13" {
+			t.Fatalf("stream query = %q, want after_seq=13", got)
+		}
+	default:
+		t.Fatal("session stream was not connected")
+	}
+	assertCLIOutputContains(t, stderr.String(), "sai: attached to session existing-session")
+	assertCLIErrorOmits(t, stderr.String(), "hidden summary secret", "debug secret", "registry-token")
 }
 
 func TestAttachExistingRejectsCWDAndConfigBeforeDiscovery(t *testing.T) {
@@ -9390,7 +9537,7 @@ func runProjectScopedAttachSelection(t *testing.T, args []string) {
 	if err != nil {
 		t.Fatalf("CanonicalRoot(childDir) error = %v", err)
 	}
-	authSeen := make(chan string, 2)
+	authSeen := make(chan string, 4)
 	streamPathSeen := make(chan string, 1)
 	upgrader := websocket.Upgrader{}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -9455,7 +9602,12 @@ func runProjectScopedAttachSelection(t *testing.T, args []string) {
 					},
 				},
 			})
+		case "/sessions/newest-created-session/items":
+			writeCLIEmptySessionItems(t, w, r, authSeen)
 		case "/sessions/newest-created-session/stream":
+			if got := r.URL.Query().Get("after_seq"); got != "0" {
+				t.Fatalf("stream after_seq = %q, want 0", got)
+			}
 			conn, err := upgrader.Upgrade(w, r, nil)
 			if err != nil {
 				t.Fatalf("Upgrade(stream) error = %v", err)
@@ -9492,7 +9644,7 @@ func runProjectScopedAttachSelection(t *testing.T, args []string) {
 	default:
 		t.Fatal("session stream was not connected")
 	}
-	for i := 0; i < 2; i++ {
+	for i := 0; i < 3; i++ {
 		select {
 		case got := <-authSeen:
 			if got != "Bearer registry-token" {
@@ -9971,7 +10123,12 @@ func TestAttachWaitsForTerminalStreamEventBeforeQuit(t *testing.T) {
 		switch r.URL.Path {
 		case "/health":
 			writeCLIJSON(w, http.StatusOK, map[string]any{"status": "ok"})
+		case "/sessions/existing-session/items":
+			writeCLIEmptySessionItems(t, w, r, nil)
 		case "/sessions/existing-session/stream":
+			if got := r.URL.Query().Get("after_seq"); got != "0" {
+				t.Fatalf("stream after_seq = %q, want 0", got)
+			}
 			conn, err := upgrader.Upgrade(w, r, nil)
 			if err != nil {
 				t.Fatalf("Upgrade(stream) error = %v", err)
@@ -10046,7 +10203,12 @@ func TestAttachFailedTurnWaitsForDelayedTurnFailed(t *testing.T) {
 		switch r.URL.Path {
 		case "/health":
 			writeCLIJSON(w, http.StatusOK, map[string]any{"status": "ok"})
+		case "/sessions/existing-session/items":
+			writeCLIEmptySessionItems(t, w, r, nil)
 		case "/sessions/existing-session/stream":
+			if got := r.URL.Query().Get("after_seq"); got != "0" {
+				t.Fatalf("stream after_seq = %q, want 0", got)
+			}
 			conn, err := upgrader.Upgrade(w, r, nil)
 			if err != nil {
 				t.Fatalf("Upgrade(stream) error = %v", err)
@@ -10123,7 +10285,12 @@ func TestAttachIgnoresStaleTerminalDuringSend(t *testing.T) {
 		switch r.URL.Path {
 		case "/health":
 			writeCLIJSON(w, http.StatusOK, map[string]any{"status": "ok"})
+		case "/sessions/existing-session/items":
+			writeCLIEmptySessionItems(t, w, r, nil)
 		case "/sessions/existing-session/stream":
+			if got := r.URL.Query().Get("after_seq"); got != "0" {
+				t.Fatalf("stream after_seq = %q, want 0", got)
+			}
 			conn, err := upgrader.Upgrade(w, r, nil)
 			if err != nil {
 				t.Fatalf("Upgrade(stream) error = %v", err)
@@ -10203,7 +10370,12 @@ func TestAttachExistingCompactAndNormalMessageContainingCompact(t *testing.T) {
 		switch r.URL.Path {
 		case "/health":
 			writeCLIJSON(w, http.StatusOK, map[string]any{"status": "ok"})
+		case "/sessions/existing-session/items":
+			writeCLIEmptySessionItems(t, w, r, nil)
 		case "/sessions/existing-session/stream":
+			if got := r.URL.Query().Get("after_seq"); got != "0" {
+				t.Fatalf("stream after_seq = %q, want 0", got)
+			}
 			streamAuthSeen <- r.Header.Get("Authorization")
 			conn, err := upgrader.Upgrade(w, r, nil)
 			if err != nil {
@@ -10312,7 +10484,12 @@ func TestAttachCompactWaitsWithoutDefaultHTTPTimeout(t *testing.T) {
 		switch r.URL.Path {
 		case "/health":
 			writeCLIJSON(w, http.StatusOK, map[string]any{"status": "ok"})
+		case "/sessions/existing-session/items":
+			writeCLIEmptySessionItems(t, w, r, nil)
 		case "/sessions/existing-session/stream":
+			if got := r.URL.Query().Get("after_seq"); got != "0" {
+				t.Fatalf("stream after_seq = %q, want 0", got)
+			}
 			conn, err := upgrader.Upgrade(w, r, nil)
 			if err != nil {
 				t.Fatalf("Upgrade(stream) error = %v", err)
@@ -14997,6 +15174,30 @@ func writeCLIJSON(w http.ResponseWriter, status int, value any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(value)
+}
+
+func writeCLIEmptySessionItems(t *testing.T, w http.ResponseWriter, r *http.Request, authSeen chan<- string) {
+	t.Helper()
+
+	if r.Method != http.MethodGet {
+		t.Fatalf("session items method = %s, want GET", r.Method)
+	}
+	if got := r.URL.Query().Get("view"); got != "chat" {
+		t.Fatalf("session items view = %q, want chat", got)
+	}
+	if got := r.URL.Query().Get("limit"); got != "50" {
+		t.Fatalf("session items limit = %q, want 50", got)
+	}
+	if authSeen != nil {
+		authSeen <- r.Header.Get("Authorization")
+	}
+	writeCLIJSON(w, http.StatusOK, map[string]any{
+		"items":           []any{},
+		"oldest_seq":      0,
+		"newest_seq":      0,
+		"has_more_before": false,
+		"has_more_after":  false,
+	})
 }
 
 func readJSONLRecords(t *testing.T, data []byte) []map[string]any {
