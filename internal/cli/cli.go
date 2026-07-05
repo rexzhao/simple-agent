@@ -1316,17 +1316,20 @@ func prepareServerLaunch(configPath, cwdFlag, listen, homePath string, store loc
 	serverGetwd := func() (string, error) {
 		return cwd, nil
 	}
-	cfg, err := loadConfig(serverConfigPath(configPath, cwd), serverGetwd, program)
+	resolvedConfigPath, err := resolveConfigPath(serverConfigPath(configPath, cwd), serverGetwd, program)
 	if err != nil {
 		return serverLaunch{}, err
 	}
-	sessionDefaults, err := serverSessionDefaultsFromConfig(cfg, cwd)
+	identity, err := localserver.NewRegistryIdentity(cwd, resolvedConfigPath)
 	if err != nil {
 		return serverLaunch{}, err
 	}
-	identity, err := localserver.NewRegistryIdentity(cwd, cfg.ConfigPath)
-	if err != nil {
-		return serverLaunch{}, err
+	sessionDefaults := sessions.SessionV2{
+		Version:         sessions.VersionV2,
+		CWD:             identity.CWD,
+		CreatedCWD:      identity.CWD,
+		ConfigPath:      identity.ConfigPath,
+		SaveToolResults: true,
 	}
 	projectRoot, err := projectstore.RootForHome(homePath)
 	if err != nil {

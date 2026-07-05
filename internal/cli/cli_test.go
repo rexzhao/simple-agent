@@ -3178,6 +3178,45 @@ func TestServerCommandStartsWithDefaultConfigAndShutdown(t *testing.T) {
 	}
 }
 
+func TestServerCommandStartsWithoutConfigFile(t *testing.T) {
+	registryPath := isolateCLIUserRegistry(t)
+	projectDir := t.TempDir()
+	missingConfigPath := filepath.Join(projectDir, ".agents", "sai.yaml")
+
+	addr, done, stderr, cleanup := startCLIServerCommandForTest(t, []string{"server", "--port", "0"}, func() (string, error) {
+		return projectDir, nil
+	})
+	defer cleanup()
+
+	info := getCLIServerJSON(t, "http://"+addr+"/server")
+	if got, want := filepath.Clean(info["cwd"].(string)), filepath.Clean(projectDir); got != want {
+		t.Fatalf("server cwd = %q, want %q", got, want)
+	}
+	if got, want := filepath.Clean(info["config_path"].(string)), missingConfigPath; got != want {
+		t.Fatalf("server config_path = %q, want %q", got, want)
+	}
+
+	store := localserver.NewRegistryStore(registryPath)
+	records, err := store.List()
+	if err != nil {
+		t.Fatalf("registry List() error = %v", err)
+	}
+	if len(records) != 1 {
+		t.Fatalf("registry records = %#v, want one running server", records)
+	}
+	if got, want := filepath.Clean(records[0].ConfigPath), missingConfigPath; got != want {
+		t.Fatalf("registry config_path = %q, want %q", got, want)
+	}
+
+	postCLIServerShutdown(t, addr)
+	if code := waitForCode(t, done); code != 0 {
+		t.Fatalf("server command code = %d, stderr = %s", code, stderr.String())
+	}
+	if _, err := os.Stat(missingConfigPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("Stat(%s) error = %v, want not exist", missingConfigPath, err)
+	}
+}
+
 func TestServerCommandBackgroundWaitsForHealthyDiscoverableServer(t *testing.T) {
 	registryPath := isolateCLIUserRegistry(t)
 	projectDir := t.TempDir()
@@ -3555,7 +3594,7 @@ func TestCLIBackgroundHelperProcess(t *testing.T) {
 	}
 }
 
-func TestServerCommandWiresSessionStoreToHomeDataAndDefaults(t *testing.T) {
+func TestServerCommandWiresSessionStoreToHomeDataWithoutLoadingConfig(t *testing.T) {
 	registryPath := isolateCLIUserRegistry(t)
 	projectDir := t.TempDir()
 	configDir := filepath.Join(projectDir, ".agents")
@@ -3605,8 +3644,8 @@ sessions:
 	if !ok || id == "" {
 		t.Fatalf("created session response missing id: %#v", body)
 	}
-	if body["model_profile"] != "glm-5.2-fast" || body["model_id"] != "glm-5.2" || body["save_tool_results"] != true {
-		t.Fatalf("created session response = %#v, want configured model defaults", body)
+	if body["provider"] != "" || body["model_profile"] != "" || body["model_id"] != "" || body["save_tool_results"] != true {
+		t.Fatalf("created session response = %#v, want server metadata defaults without config model defaults", body)
 	}
 
 	status := getCLIServerJSON(t, "http://"+addr+"/server")
@@ -3627,11 +3666,8 @@ sessions:
 	if _, err := sessions.NewV2Store(filepath.Join(configDir, "custom-sessions")).Load(id); !errors.Is(err, sessions.ErrNotFound) {
 		t.Fatalf("Load(created session from config sessions.dir) error = %v, want not found", err)
 	}
-	if session.Provider != "paperhub" || session.ModelProfile != "glm-5.2-fast" || session.ModelID != "glm-5.2" {
-		t.Fatalf("stored model metadata = %#v, want paperhub/glm-5.2-fast/glm-5.2", session)
-	}
-	if got := session.ModelParameters["max_tokens"]; fmt.Sprint(got) != "2048" {
-		t.Fatalf("stored max_tokens = %#v, want 2048", got)
+	if session.Provider != "" || session.ModelProfile != "" || session.ModelID != "" || len(session.ModelParameters) != 0 {
+		t.Fatalf("stored model metadata = %#v, want no config-derived model metadata", session)
 	}
 	if got, want := filepath.Clean(session.CWD), filepath.Clean(projectDir); got != want {
 		t.Fatalf("stored cwd = %q, want %q", got, want)
