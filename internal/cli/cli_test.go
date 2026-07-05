@@ -1817,7 +1817,6 @@ func TestProjectListAutoStartsSingletonServerWithoutStartupOutput(t *testing.T) 
 		addr := strings.TrimPrefix(server.URL, "http://")
 		if err := localserver.NewRegistryStore(registryPath).Upsert(localserver.RegistryRecord{
 			CWD:             projectDir,
-			ConfigPath:      filepath.Join(projectDir, ".agents", "sai.yaml"),
 			BaseURL:         addr,
 			PID:             4321,
 			Token:           "auto-token",
@@ -1860,8 +1859,7 @@ func TestProjectListAutoStartsSingletonServerWithoutStartupOutput(t *testing.T) 
 	}
 	childArgs := <-childArgsCh
 	assertCLIFlagValue(t, childArgs, "--home", mustCLICanonicalPath(t, filepath.Dir(filepath.Dir(registryPath))))
-	assertCLIFlagValue(t, childArgs, "--config", filepath.Join(projectDir, ".agents", "sai.yaml"))
-	assertCLIFlagValue(t, childArgs, "--cwd", projectDir)
+	assertCLIStringSliceOmits(t, childArgs, "--config", "--cwd")
 	select {
 	case got := <-authSeen:
 		if got != "Bearer auto-token" {
@@ -1912,7 +1910,6 @@ func TestProjectListConcurrentAutoStartLaunchesOneBackgroundServer(t *testing.T)
 		addr := strings.TrimPrefix(server.URL, "http://")
 		if err := localserver.NewRegistryStore(registryPath).Upsert(localserver.RegistryRecord{
 			CWD:             projectDir,
-			ConfigPath:      filepath.Join(projectDir, ".agents", "sai.yaml"),
 			BaseURL:         addr,
 			PID:             8765,
 			Token:           "auto-token",
@@ -1982,9 +1979,8 @@ func TestProjectListConcurrentAutoStartLaunchesOneBackgroundServer(t *testing.T)
 
 	childArgs := <-childArgsCh
 	assertCLIFlagValue(t, childArgs, "--home", mustCLICanonicalPath(t, filepath.Dir(filepath.Dir(registryPath))))
-	assertCLIFlagValue(t, childArgs, "--config", filepath.Join(projectDir, ".agents", "sai.yaml"))
-	assertCLIFlagValue(t, childArgs, "--cwd", projectDir)
 	assertCLIFlagValue(t, childArgs, "--listen", localserver.DefaultListenAddress)
+	assertCLIStringSliceOmits(t, childArgs, "--config", "--cwd")
 	select {
 	case extra := <-childArgsCh:
 		t.Fatalf("unexpected second background launch args %#v", extra)
@@ -2806,7 +2802,6 @@ func TestSessionListAutoStartsSingletonServerWithoutStartupOutput(t *testing.T) 
 		addr := strings.TrimPrefix(server.URL, "http://")
 		if err := localserver.NewRegistryStore(registryPath).Upsert(localserver.RegistryRecord{
 			CWD:             projectDir,
-			ConfigPath:      filepath.Join(projectDir, ".agents", "sai.yaml"),
 			BaseURL:         addr,
 			PID:             5432,
 			Token:           "auto-token",
@@ -2852,8 +2847,7 @@ func TestSessionListAutoStartsSingletonServerWithoutStartupOutput(t *testing.T) 
 	}
 	childArgs := <-childArgsCh
 	assertCLIFlagValue(t, childArgs, "--home", mustCLICanonicalPath(t, filepath.Dir(filepath.Dir(registryPath))))
-	assertCLIFlagValue(t, childArgs, "--config", filepath.Join(projectDir, ".agents", "sai.yaml"))
-	assertCLIFlagValue(t, childArgs, "--cwd", projectDir)
+	assertCLIStringSliceOmits(t, childArgs, "--config", "--cwd")
 	select {
 	case got := <-authSeen:
 		if got != "Bearer auto-token" {
@@ -2947,9 +2941,8 @@ func TestSendWithoutSessionAutoStartsSingletonServerWithoutStartupOutput(t *test
 	}
 	childArgs := <-childArgsCh
 	assertCLIFlagValue(t, childArgs, "--home", mustCLICanonicalPath(t, filepath.Dir(filepath.Dir(registryPath))))
-	assertCLIFlagValue(t, childArgs, "--config", filepath.Join(projectDir, ".agents", "sai.yaml"))
-	assertCLIFlagValue(t, childArgs, "--cwd", projectDir)
 	assertCLIFlagValue(t, childArgs, "--listen", localserver.DefaultListenAddress)
+	assertCLIStringSliceOmits(t, childArgs, "--config", "--cwd")
 	for _, name := range []string{"projects", "project sessions", "send"} {
 		select {
 		case got := <-authSeen:
@@ -3049,9 +3042,8 @@ func TestAttachWithoutSessionAutoStartsSingletonServerWithoutStartupOutput(t *te
 	assertCLIOutputContains(t, stderr.String(), "sai: attached to session latest-session")
 	childArgs := <-childArgsCh
 	assertCLIFlagValue(t, childArgs, "--home", mustCLICanonicalPath(t, filepath.Dir(filepath.Dir(registryPath))))
-	assertCLIFlagValue(t, childArgs, "--config", filepath.Join(projectDir, ".agents", "sai.yaml"))
-	assertCLIFlagValue(t, childArgs, "--cwd", projectDir)
 	assertCLIFlagValue(t, childArgs, "--listen", localserver.DefaultListenAddress)
+	assertCLIStringSliceOmits(t, childArgs, "--config", "--cwd")
 	for _, name := range []string{"projects", "project sessions", "stream"} {
 		select {
 		case got := <-authSeen:
@@ -3092,13 +3084,14 @@ func TestStatusAndStopDoNotAutoStartSingletonServer(t *testing.T) {
 			if stdout.String() != "" {
 				t.Fatalf("stdout = %q, want empty", stdout.String())
 			}
-			assertCLIErrorContains(t, stderr.String(), "no healthy sai server found", "sai server --cwd")
+			assertCLIErrorContains(t, stderr.String(), "no healthy sai server found", "sai server")
 		})
 	}
 }
 
 func TestServerCommandStartsWithDefaultConfigAndShutdown(t *testing.T) {
 	registryPath := isolateCLIUserRegistry(t)
+	homePath := mustCLICanonicalPath(t, filepath.Dir(filepath.Dir(registryPath)))
 	projectDir := t.TempDir()
 	writeCLIFixtureInDir(t, filepath.Join(projectDir, ".agents"))
 
@@ -3108,11 +3101,11 @@ func TestServerCommandStartsWithDefaultConfigAndShutdown(t *testing.T) {
 	defer cleanup()
 
 	info := getCLIServerJSON(t, "http://"+addr+"/server")
-	if got, want := filepath.Clean(info["cwd"].(string)), filepath.Clean(projectDir); got != want {
+	if got, want := filepath.Clean(info["cwd"].(string)), homePath; got != want {
 		t.Fatalf("server cwd = %q, want %q", got, want)
 	}
-	if got, want := filepath.Clean(info["config_path"].(string)), filepath.Join(projectDir, ".agents", "sai.yaml"); got != want {
-		t.Fatalf("server config_path = %q, want %q", got, want)
+	if _, ok := info["config_path"]; ok {
+		t.Fatalf("server response leaked config_path: %#v", info)
 	}
 	if got := info["addr"]; got != addr {
 		t.Fatalf("server addr = %#v, want %q", got, addr)
@@ -3133,11 +3126,8 @@ func TestServerCommandStartsWithDefaultConfigAndShutdown(t *testing.T) {
 		t.Fatalf("registry records = %#v, want one running server", records)
 	}
 	record := records[0]
-	if got, want := filepath.Clean(record.CWD), filepath.Clean(projectDir); got != want {
+	if got, want := filepath.Clean(record.CWD), homePath; got != want {
 		t.Fatalf("registry cwd = %q, want %q", got, want)
-	}
-	if got, want := filepath.Clean(record.ConfigPath), filepath.Join(projectDir, ".agents", "sai.yaml"); got != want {
-		t.Fatalf("registry config_path = %q, want %q", got, want)
 	}
 	if record.BaseURL != addr {
 		t.Fatalf("registry addr = %q, want %q", record.BaseURL, addr)
@@ -3180,6 +3170,7 @@ func TestServerCommandStartsWithDefaultConfigAndShutdown(t *testing.T) {
 
 func TestServerCommandStartsWithoutConfigFile(t *testing.T) {
 	registryPath := isolateCLIUserRegistry(t)
+	homePath := mustCLICanonicalPath(t, filepath.Dir(filepath.Dir(registryPath)))
 	projectDir := t.TempDir()
 	missingConfigPath := filepath.Join(projectDir, ".agents", "sai.yaml")
 
@@ -3189,11 +3180,11 @@ func TestServerCommandStartsWithoutConfigFile(t *testing.T) {
 	defer cleanup()
 
 	info := getCLIServerJSON(t, "http://"+addr+"/server")
-	if got, want := filepath.Clean(info["cwd"].(string)), filepath.Clean(projectDir); got != want {
+	if got, want := filepath.Clean(info["cwd"].(string)), homePath; got != want {
 		t.Fatalf("server cwd = %q, want %q", got, want)
 	}
-	if got, want := filepath.Clean(info["config_path"].(string)), missingConfigPath; got != want {
-		t.Fatalf("server config_path = %q, want %q", got, want)
+	if _, ok := info["config_path"]; ok {
+		t.Fatalf("server response leaked config_path: %#v", info)
 	}
 
 	store := localserver.NewRegistryStore(registryPath)
@@ -3204,10 +3195,6 @@ func TestServerCommandStartsWithoutConfigFile(t *testing.T) {
 	if len(records) != 1 {
 		t.Fatalf("registry records = %#v, want one running server", records)
 	}
-	if got, want := filepath.Clean(records[0].ConfigPath), missingConfigPath; got != want {
-		t.Fatalf("registry config_path = %q, want %q", got, want)
-	}
-
 	postCLIServerShutdown(t, addr)
 	if code := waitForCode(t, done); code != 0 {
 		t.Fatalf("server command code = %d, stderr = %s", code, stderr.String())
@@ -3262,7 +3249,7 @@ func TestServerCommandBackgroundWaitsForHealthyDiscoverableServer(t *testing.T) 
 	})
 
 	var stdout, stderr bytes.Buffer
-	code := RunWithContext(context.Background(), []string{"server", "--background", "--port", "0"}, strings.NewReader(""), &stdout, &stderr, func() (string, error) {
+	code := RunWithContext(context.Background(), []string{"server", "--background", "--cwd", projectDir, "--port", "0"}, strings.NewReader(""), &stdout, &stderr, func() (string, error) {
 		return projectDir, nil
 	})
 	if code != 0 {
@@ -3275,9 +3262,9 @@ func TestServerCommandBackgroundWaitsForHealthyDiscoverableServer(t *testing.T) 
 	childArgs := <-childArgsCh
 	assertCLIStringSliceContains(t, childArgs, "--background-child")
 	assertCLIFlagValue(t, childArgs, "--home", mustCLICanonicalPath(t, filepath.Dir(filepath.Dir(registryPath))))
-	assertCLIFlagValue(t, childArgs, "--config", filepath.Join(projectDir, ".agents", "sai.yaml"))
-	assertCLIFlagValue(t, childArgs, "--cwd", projectDir)
 	assertCLIFlagValue(t, childArgs, "--listen", "127.0.0.1:0")
+	assertCLIFlagValue(t, childArgs, "--cwd", projectDir)
+	assertCLIStringSliceOmits(t, childArgs, "--config")
 
 	line := strings.TrimSpace(stdout.String())
 	addr, ok := strings.CutPrefix(line, "SERVER_ADDR\t")
@@ -3302,6 +3289,9 @@ func TestServerCommandBackgroundWaitsForHealthyDiscoverableServer(t *testing.T) 
 	}
 	if record.RequestedListen != "127.0.0.1:0" {
 		t.Fatalf("registry requested_listen = %q, want 127.0.0.1:0", record.RequestedListen)
+	}
+	if got, want := filepath.Clean(record.CWD), filepath.Clean(projectDir); got != want {
+		t.Fatalf("registry cwd = %q, want explicit server cwd %q", got, want)
 	}
 	if err := localserver.CheckHealth(context.Background(), addr, 2*time.Second); err != nil {
 		t.Fatalf("background server health check error = %v", err)
@@ -3354,7 +3344,6 @@ func TestServerCommandConcurrentBackgroundLaunchesOneChild(t *testing.T) {
 		childArgsCh <- append([]string(nil), args...)
 		if err := localserver.NewRegistryStore(registryPath).Upsert(localserver.RegistryRecord{
 			CWD:             projectDir,
-			ConfigPath:      filepath.Join(projectDir, ".agents", "sai.yaml"),
 			BaseURL:         addr,
 			PID:             9876,
 			Token:           "background-token",
@@ -3434,9 +3423,8 @@ func TestServerCommandConcurrentBackgroundLaunchesOneChild(t *testing.T) {
 	childArgs := <-childArgsCh
 	assertCLIStringSliceContains(t, childArgs, "--background-child")
 	assertCLIFlagValue(t, childArgs, "--home", mustCLICanonicalPath(t, filepath.Dir(filepath.Dir(registryPath))))
-	assertCLIFlagValue(t, childArgs, "--config", filepath.Join(projectDir, ".agents", "sai.yaml"))
-	assertCLIFlagValue(t, childArgs, "--cwd", projectDir)
 	assertCLIFlagValue(t, childArgs, "--listen", "127.0.0.1:0")
+	assertCLIStringSliceOmits(t, childArgs, "--config", "--cwd")
 	select {
 	case extra := <-childArgsCh:
 		t.Fatalf("unexpected second background launch args %#v", extra)
@@ -3596,6 +3584,7 @@ func TestCLIBackgroundHelperProcess(t *testing.T) {
 
 func TestServerCommandWiresSessionStoreToHomeDataWithoutLoadingConfig(t *testing.T) {
 	registryPath := isolateCLIUserRegistry(t)
+	homePath := filepath.Dir(filepath.Dir(registryPath))
 	projectDir := t.TempDir()
 	configDir := filepath.Join(projectDir, ".agents")
 	writeCLIFixtureInDir(t, configDir)
@@ -3653,7 +3642,6 @@ sessions:
 		t.Fatalf("session_count = %#v, want 1", got)
 	}
 
-	homePath := filepath.Dir(filepath.Dir(registryPath))
 	sessionRoot, err := sessions.RootForHome(homePath)
 	if err != nil {
 		t.Fatalf("RootForHome(%q) error = %v", homePath, err)
@@ -3669,11 +3657,11 @@ sessions:
 	if session.Provider != "" || session.ModelProfile != "" || session.ModelID != "" || len(session.ModelParameters) != 0 {
 		t.Fatalf("stored model metadata = %#v, want no config-derived model metadata", session)
 	}
-	if got, want := filepath.Clean(session.CWD), filepath.Clean(projectDir); got != want {
+	if got, want := filepath.Clean(session.CWD), mustCLICanonicalPath(t, homePath); got != want {
 		t.Fatalf("stored cwd = %q, want %q", got, want)
 	}
-	if got, want := filepath.Clean(session.ConfigPath), configPath; got != want {
-		t.Fatalf("stored config_path = %q, want %q", got, want)
+	if session.ConfigPath != "" {
+		t.Fatalf("stored config_path = %q, want empty", session.ConfigPath)
 	}
 	if len(session.Items) != 0 || session.LastSeq != 0 {
 		t.Fatalf("stored session timeline = items %#v last_seq %d, want empty", session.Items, session.LastSeq)
@@ -3753,7 +3741,7 @@ func TestServerCommandWiresProjectStoreToHomeData(t *testing.T) {
 	}
 }
 
-func TestServerCommandResolvesRelativeConfigFromCWD(t *testing.T) {
+func TestServerCommandHonorsExplicitCWDAndIgnoresConfigForServerProcess(t *testing.T) {
 	isolateCLIUserRegistry(t)
 	baseDir := t.TempDir()
 	projectDir := filepath.Join(baseDir, "project")
@@ -3768,8 +3756,8 @@ func TestServerCommandResolvesRelativeConfigFromCWD(t *testing.T) {
 	if got, want := filepath.Clean(info["cwd"].(string)), filepath.Clean(projectDir); got != want {
 		t.Fatalf("server cwd = %q, want %q", got, want)
 	}
-	if got, want := filepath.Clean(info["config_path"].(string)), filepath.Join(projectDir, "config", "sai.yaml"); got != want {
-		t.Fatalf("server config_path = %q, want %q", got, want)
+	if _, ok := info["config_path"]; ok {
+		t.Fatalf("server response leaked config_path: %#v", info)
 	}
 
 	postCLIServerShutdown(t, addr)
@@ -4008,11 +3996,9 @@ func TestServerCommandStaleRegistryRecordIsReplacedAndCleanedUp(t *testing.T) {
 	registryPath := isolateCLIUserRegistry(t)
 	projectDir := t.TempDir()
 	writeCLIFixtureInDir(t, filepath.Join(projectDir, ".agents"))
-	configPath := filepath.Join(projectDir, ".agents", "sai.yaml")
 	store := localserver.NewRegistryStore(registryPath)
 	stale := localserver.RegistryRecord{
 		CWD:             projectDir,
-		ConfigPath:      configPath,
 		BaseURL:         "127.0.0.1:0",
 		PID:             999999,
 		Token:           "stale-token",
@@ -4085,7 +4071,7 @@ func TestServerCommandRejectsNegativePortWithoutLoadingConfig(t *testing.T) {
 }
 
 func TestStatusDiscoversParentServerFromChildCWD(t *testing.T) {
-	isolateCLIUserRegistry(t)
+	registryPath := isolateCLIUserRegistry(t)
 	projectDir := t.TempDir()
 	childDir := filepath.Join(projectDir, "internal", "cli")
 	if err := os.MkdirAll(childDir, 0o755); err != nil {
@@ -4112,20 +4098,17 @@ func TestStatusDiscoversParentServerFromChildCWD(t *testing.T) {
 	if len(lines) != 2 {
 		t.Fatalf("status output lines = %#v, want header and one row", lines)
 	}
-	if got, want := lines[0], "cwd\tconfig_path\taddr\tpid\tversion\tsession_count\trunning_turns\tuptime_seconds"; got != want {
+	if got, want := lines[0], "cwd\taddr\tpid\tversion\tsession_count\trunning_turns\tuptime_seconds"; got != want {
 		t.Fatalf("status header = %q, want %q", got, want)
 	}
 	fields := strings.Split(lines[1], "\t")
-	if len(fields) != 8 {
-		t.Fatalf("status row fields = %#v, want 8 fields", fields)
+	if len(fields) != 7 {
+		t.Fatalf("status row fields = %#v, want 7 fields", fields)
 	}
-	if got, want := filepath.Clean(fields[0]), filepath.Clean(projectDir); got != want {
+	if got, want := filepath.Clean(fields[0]), mustCLICanonicalPath(t, filepath.Dir(filepath.Dir(registryPath))); got != want {
 		t.Fatalf("status cwd = %q, want %q", got, want)
 	}
-	if got, want := filepath.Clean(fields[1]), filepath.Join(projectDir, ".agents", "sai.yaml"); got != want {
-		t.Fatalf("status config_path = %q, want %q", got, want)
-	}
-	if fields[2] != addr || fields[4] != Version || fields[5] != "0" || fields[6] != "0" {
+	if fields[1] != addr || fields[3] != Version || fields[4] != "0" || fields[5] != "0" {
 		t.Fatalf("status row = %#v, want addr/version/counts", fields)
 	}
 
@@ -4149,7 +4132,7 @@ func TestStatusNoServerHint(t *testing.T) {
 	if stdout.String() != "" {
 		t.Fatalf("stdout = %q, want empty", stdout.String())
 	}
-	assertCLIErrorContains(t, stderr.String(), "no healthy sai server found", "sai server --cwd")
+	assertCLIErrorContains(t, stderr.String(), "no healthy sai server found", "sai server")
 }
 
 func TestHomeNamespaceSelectsIndependentRegistry(t *testing.T) {
@@ -4166,7 +4149,6 @@ func TestHomeNamespaceSelectsIndependentRegistry(t *testing.T) {
 		case "/server":
 			writeCLIJSON(w, http.StatusOK, map[string]any{
 				"cwd":            projectDir,
-				"config_path":    filepath.Join(projectDir, ".agents", "sai.yaml"),
 				"addr":           r.Host,
 				"pid":            1234,
 				"version":        "test-version",
@@ -4271,7 +4253,6 @@ func TestStopWithCWDStopsServerCleansRegistryAndKeepsData(t *testing.T) {
 func TestStopSendsRegistryToken(t *testing.T) {
 	registryPath := isolateCLIUserRegistry(t)
 	projectDir := t.TempDir()
-	configPath := filepath.Join(projectDir, ".agents", "sai.yaml")
 	tokenSeen := make(chan string, 1)
 	var stoppedMu sync.Mutex
 	stopped := false
@@ -4311,7 +4292,6 @@ func TestStopSendsRegistryToken(t *testing.T) {
 	store := localserver.NewRegistryStore(registryPath)
 	if err := store.Upsert(localserver.RegistryRecord{
 		CWD:             projectDir,
-		ConfigPath:      configPath,
 		BaseURL:         addr,
 		PID:             1234,
 		Token:           "registry-token",
@@ -4355,7 +4335,6 @@ func TestStopSendsRegistryToken(t *testing.T) {
 func TestStopWaitSendsShutdownWaitQuery(t *testing.T) {
 	registryPath := isolateCLIUserRegistry(t)
 	projectDir := t.TempDir()
-	configPath := filepath.Join(projectDir, ".agents", "sai.yaml")
 	querySeen := make(chan string, 1)
 	var stoppedMu sync.Mutex
 	stopped := false
@@ -4395,7 +4374,6 @@ func TestStopWaitSendsShutdownWaitQuery(t *testing.T) {
 	store := localserver.NewRegistryStore(registryPath)
 	if err := store.Upsert(localserver.RegistryRecord{
 		CWD:             projectDir,
-		ConfigPath:      configPath,
 		BaseURL:         addr,
 		PID:             1234,
 		Token:           "registry-token",
@@ -4443,7 +4421,6 @@ func TestStopWaitSendsShutdownWaitQuery(t *testing.T) {
 func TestStopWaitWithoutTimeoutCanDrainPastDefaultClientTimeout(t *testing.T) {
 	registryPath := isolateCLIUserRegistry(t)
 	projectDir := t.TempDir()
-	configPath := filepath.Join(projectDir, ".agents", "sai.yaml")
 	querySeen := make(chan string, 1)
 	var stoppedMu sync.Mutex
 	stopped := false
@@ -4481,7 +4458,6 @@ func TestStopWaitWithoutTimeoutCanDrainPastDefaultClientTimeout(t *testing.T) {
 	store := localserver.NewRegistryStore(registryPath)
 	if err := store.Upsert(localserver.RegistryRecord{
 		CWD:             projectDir,
-		ConfigPath:      configPath,
 		BaseURL:         addr,
 		PID:             1234,
 		Token:           "registry-token",
@@ -4536,7 +4512,6 @@ func TestStopCleansStaleRegistryRecord(t *testing.T) {
 	store := localserver.NewRegistryStore(registryPath)
 	stale := localserver.RegistryRecord{
 		CWD:             projectDir,
-		ConfigPath:      filepath.Join(projectDir, ".agents", "sai.yaml"),
 		BaseURL:         "127.0.0.1:0",
 		PID:             999999,
 		Token:           "stale-token",
@@ -4593,8 +4568,8 @@ func TestServersListShowsHealthySingleton(t *testing.T) {
 	}
 	out := stdout.String()
 	for _, want := range []string{
-		"cwd\tconfig_path\taddr\tpid\tversion\thealth",
-		filepath.Clean(projectDir) + "\t" + filepath.Join(projectDir, ".agents", "sai.yaml") + "\t" + addr,
+		"cwd\taddr\tpid\tversion\thealth",
+		mustCLICanonicalPath(t, filepath.Dir(filepath.Dir(registryPath))) + "\t" + addr,
 		"\thealthy",
 	} {
 		if !strings.Contains(out, want) {
@@ -9140,7 +9115,7 @@ func TestAttachExplicitNoServerHint(t *testing.T) {
 	if stdout.String() != "" {
 		t.Fatalf("stdout = %q, want empty", stdout.String())
 	}
-	assertCLIErrorContains(t, stderr.String(), "no healthy sai server found", "sai server --cwd")
+	assertCLIErrorContains(t, stderr.String(), "no healthy sai server found", "sai server")
 }
 
 func TestAttachExistingRejectsCWDAndConfigBeforeDiscovery(t *testing.T) {
@@ -10234,7 +10209,7 @@ func TestClientCommandsNoServerHint(t *testing.T) {
 			if stdout.String() != "" {
 				t.Fatalf("stdout = %q, want empty", stdout.String())
 			}
-			assertCLIErrorContains(t, stderr.String(), "no healthy sai server found", "sai server --cwd")
+			assertCLIErrorContains(t, stderr.String(), "no healthy sai server found", "sai server")
 		})
 	}
 }
@@ -14450,6 +14425,18 @@ func assertCLIStringSliceContains(t *testing.T, values []string, want string) {
 	t.Fatalf("values = %#v, want contain %q", values, want)
 }
 
+func assertCLIStringSliceOmits(t *testing.T, values []string, omitted ...string) {
+	t.Helper()
+
+	for _, value := range values {
+		for _, omit := range omitted {
+			if value == omit {
+				t.Fatalf("values = %#v, want omit %q", values, omit)
+			}
+		}
+	}
+}
+
 func assertCLIFlagValue(t *testing.T, args []string, flagName, want string) {
 	t.Helper()
 
@@ -14497,13 +14484,12 @@ func registerCLIFakeServer(t *testing.T, registryPath, projectDir, rawURL, token
 	}
 	store := localserver.NewRegistryStore(registryPath)
 	if err := store.Upsert(localserver.RegistryRecord{
-		CWD:        projectDir,
-		ConfigPath: filepath.Join(projectDir, ".agents", "sai.yaml"),
-		BaseURL:    addr,
-		PID:        1234,
-		Token:      token,
-		StartedAt:  time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC),
-		Version:    "test-version",
+		CWD:       projectDir,
+		BaseURL:   addr,
+		PID:       1234,
+		Token:     token,
+		StartedAt: time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC),
+		Version:   "test-version",
 	}); err != nil {
 		t.Fatalf("Upsert(fake registry record) error = %v", err)
 	}
@@ -14524,7 +14510,6 @@ func stubCLIBackgroundStartWithRegistry(t *testing.T, registryPath, projectDir, 
 		childArgsCh <- append([]string(nil), args...)
 		if err := localserver.NewRegistryStore(registryPath).Upsert(localserver.RegistryRecord{
 			CWD:             projectDir,
-			ConfigPath:      filepath.Join(projectDir, ".agents", "sai.yaml"),
 			BaseURL:         addr,
 			PID:             pid,
 			Token:           token,

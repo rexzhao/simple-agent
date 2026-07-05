@@ -1610,7 +1610,6 @@ func TestServeContextCancelUsesImmediateStopSemantics(t *testing.T) {
 	}
 	process, err := Start(Options{
 		CWD:          t.TempDir(),
-		ConfigPath:   filepath.Join(t.TempDir(), "sai.yaml"),
 		Listen:       "127.0.0.1:0",
 		AuthToken:    "registry-token",
 		SessionStore: store,
@@ -2814,7 +2813,6 @@ func startSessionAPIServerWithRunners(t *testing.T, store *sessions.V2Store, def
 
 	process, err := Start(Options{
 		CWD:             t.TempDir(),
-		ConfigPath:      filepath.Join(t.TempDir(), "sai.yaml"),
 		Listen:          "127.0.0.1:0",
 		Version:         "test-version",
 		AuthToken:       token,
@@ -2850,7 +2848,6 @@ func startProjectSessionAPIServer(t *testing.T, projectStore *projectstore.Store
 
 	process, err := Start(Options{
 		CWD:             defaults.CWD,
-		ConfigPath:      defaults.ConfigPath,
 		Listen:          "127.0.0.1:0",
 		Version:         "test-version",
 		AuthToken:       token,

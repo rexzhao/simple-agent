@@ -509,17 +509,17 @@ sending provider HTTP requests, starting MCP servers, running a model, or
 printing secrets.
 `
 
-const serverUsageText = `usage: sai server [--cwd path] [--config file] [--port N | --listen host:port]
+const serverUsageText = `usage: sai server [--cwd path] [--port N | --listen host:port]
 
 Starts a loopback HTTP server. By default it runs in the foreground and blocks
 until it shuts down. With --background, the parent exits after the child server
 has written its registry record and /health succeeds. The default listener is
-127.0.0.1:0, which asks the OS to choose a free port.
+127.0.0.1:0, which asks the OS to choose a free port. Unless --cwd is provided,
+the server process uses the selected home namespace as its working directory.
 
 Options:
   --background       start a detached child server and exit when it is healthy
-  --cwd path         server working directory
-  --config file      root config file, relative to --cwd when not absolute
+  --cwd path         server working directory; defaults to the home namespace
   --port N           listen on 127.0.0.1:N; 0 asks the OS for a free port
   --listen host:port advanced loopback listen address
 `
@@ -1255,7 +1255,7 @@ func serverCommand(ctx context.Context, args []string, configPath, homePath stri
 		return err
 	}
 	if len(positionals) != 0 {
-		return usageError("usage: sai server [--cwd path] [--config file] [--port N | --listen host:port]", "", "sai help server")
+		return usageError("usage: sai server [--cwd path] [--port N | --listen host:port]", "", "sai help server")
 	}
 	if *background && *backgroundChild {
 		return usageError("--background cannot be combined with internal --background-child", "", "sai help server")
@@ -1297,7 +1297,7 @@ func serverCommand(ctx context.Context, args []string, configPath, homePath stri
 
 type serverLaunch struct {
 	CWD             string
-	ConfigPath      string
+	CWDExplicit     bool
 	Listen          string
 	Identity        localserver.RegistryIdentity
 	SessionStore    *sessions.V2Store
@@ -1309,18 +1309,25 @@ type serverLaunch struct {
 }
 
 func prepareServerLaunch(configPath, cwdFlag, listen, homePath string, store localserver.RegistryStore, getwd func() (string, error), program string) (serverLaunch, error) {
-	cwd, err := resolveServerCWD(cwdFlag, getwd)
-	if err != nil {
-		return serverLaunch{}, err
+	cwdExplicit := strings.TrimSpace(cwdFlag) != ""
+	var cwd string
+	var err error
+	if cwdExplicit {
+		cwd, err = resolveServerCWD(cwdFlag, getwd)
+		if err != nil {
+			return serverLaunch{}, err
+		}
+		cwd, err = localserver.CanonicalPath(cwd)
+		if err != nil {
+			return serverLaunch{}, err
+		}
+	} else {
+		cwd, err = localserver.CanonicalPath(homePath)
+		if err != nil {
+			return serverLaunch{}, err
+		}
 	}
-	serverGetwd := func() (string, error) {
-		return cwd, nil
-	}
-	resolvedConfigPath, err := resolveConfigPath(serverConfigPath(configPath, cwd), serverGetwd, program)
-	if err != nil {
-		return serverLaunch{}, err
-	}
-	identity, err := localserver.NewRegistryIdentity(cwd, resolvedConfigPath)
+	identity, err := localserver.NewRegistryIdentity(cwd)
 	if err != nil {
 		return serverLaunch{}, err
 	}
@@ -1328,7 +1335,6 @@ func prepareServerLaunch(configPath, cwdFlag, listen, homePath string, store loc
 		Version:         sessions.VersionV2,
 		CWD:             identity.CWD,
 		CreatedCWD:      identity.CWD,
-		ConfigPath:      identity.ConfigPath,
 		SaveToolResults: true,
 	}
 	projectRoot, err := projectstore.RootForHome(homePath)
@@ -1342,7 +1348,7 @@ func prepareServerLaunch(configPath, cwdFlag, listen, homePath string, store loc
 
 	return serverLaunch{
 		CWD:             identity.CWD,
-		ConfigPath:      identity.ConfigPath,
+		CWDExplicit:     cwdExplicit,
 		Listen:          listen,
 		Identity:        identity,
 		SessionStore:    sessions.NewV2Store(sessionRoot),
@@ -1351,6 +1357,26 @@ func prepareServerLaunch(configPath, cwdFlag, listen, homePath string, store loc
 		Program:         program,
 		HomePath:        homePath,
 		RegistryStore:   store,
+	}, nil
+}
+
+func enterServerHome(homePath string) (func() error, error) {
+	homePath = filepath.Clean(strings.TrimSpace(homePath))
+	if homePath == "" || homePath == "." {
+		return nil, fmt.Errorf("server home directory is required")
+	}
+	previous, err := os.Getwd()
+	if err != nil {
+		return nil, fmt.Errorf("get current directory before entering server home: %w", err)
+	}
+	if err := os.MkdirAll(homePath, 0o700); err != nil {
+		return nil, fmt.Errorf("create server home directory %q: %w", homePath, err)
+	}
+	if err := os.Chdir(homePath); err != nil {
+		return nil, fmt.Errorf("enter server home directory %q: %w", homePath, err)
+	}
+	return func() error {
+		return os.Chdir(previous)
 	}, nil
 }
 
@@ -1385,7 +1411,6 @@ func runServerForeground(ctx context.Context, launch serverLaunch, stdout io.Wri
 	}
 	process, err := localserver.Start(localserver.Options{
 		CWD:             launch.CWD,
-		ConfigPath:      launch.ConfigPath,
 		Listen:          launch.Listen,
 		Version:         Version,
 		AuthToken:       token,
@@ -1397,10 +1422,17 @@ func runServerForeground(ctx context.Context, launch serverLaunch, stdout io.Wri
 	if err != nil {
 		return err
 	}
+	restoreCWD, err := enterServerHome(launch.CWD)
+	if err != nil {
+		_ = process.Shutdown(context.Background())
+		return err
+	}
+	defer func() {
+		err = errors.Join(err, restoreCWD())
+	}()
 	info := process.Info()
 	record := localserver.RegistryRecord{
 		CWD:             info.CWD,
-		ConfigPath:      info.ConfigPath,
 		BaseURL:         info.Addr,
 		PID:             info.PID,
 		Token:           token,
@@ -1468,14 +1500,16 @@ func startBackgroundServerAndWait(ctx context.Context, launch serverLaunch) (loc
 }
 
 func backgroundServerChildArgs(launch serverLaunch) []string {
-	return []string{
+	args := []string{
 		"--home", launch.HomePath,
-		"--config", launch.ConfigPath,
 		"server",
 		"--background-child",
-		"--cwd", launch.CWD,
 		"--listen", launch.Listen,
 	}
+	if launch.CWDExplicit {
+		args = append(args, "--cwd", launch.CWD)
+	}
+	return args
 }
 
 func startBackgroundServerProcessDefault(ctx context.Context, args []string) (*backgroundServerProcess, error) {
@@ -1851,7 +1885,7 @@ func ensureProjectCommandServer(ctx context.Context, configPath, homePath, effec
 	}
 
 	return startBackgroundServerWithStartupLock(ctx, homePath, store, effectiveCWD, func() (serverLaunch, error) {
-		return prepareServerLaunch(configPath, effectiveCWD, localserver.DefaultListenAddress, homePath, store, func() (string, error) {
+		return prepareServerLaunch(configPath, "", localserver.DefaultListenAddress, homePath, store, func() (string, error) {
 			return effectiveCWD, nil
 		}, program)
 	})
@@ -2251,7 +2285,7 @@ func ensureSessionCommandServer(ctx context.Context, configPath, homePath, progr
 		if err != nil {
 			return serverLaunch{}, err
 		}
-		return prepareServerLaunch(configPath, effectiveCWD, localserver.DefaultListenAddress, homePath, store, func() (string, error) {
+		return prepareServerLaunch(configPath, "", localserver.DefaultListenAddress, homePath, store, func() (string, error) {
 			return effectiveCWD, nil
 		}, program)
 	})
@@ -2410,7 +2444,7 @@ func serversListCommand(ctx context.Context, args []string, homePath string, std
 	if err != nil {
 		return err
 	}
-	if _, err := fmt.Fprintln(stdout, "cwd\tconfig_path\taddr\tpid\tversion\thealth"); err != nil {
+	if _, err := fmt.Fprintln(stdout, "cwd\taddr\tpid\tversion\thealth"); err != nil {
 		return err
 	}
 
@@ -2427,7 +2461,7 @@ func serversListCommand(ctx context.Context, args []string, homePath string, std
 			stale = append(stale, normalized.Identity())
 			continue
 		}
-		if _, err := fmt.Fprintf(stdout, "%s\t%s\t%s\t%d\t%s\thealthy\n", normalized.CWD, normalized.ConfigPath, normalized.BaseURL, normalized.PID, normalized.Version); err != nil {
+		if _, err := fmt.Fprintf(stdout, "%s\t%s\t%d\t%s\thealthy\n", normalized.CWD, normalized.BaseURL, normalized.PID, normalized.Version); err != nil {
 			return err
 		}
 	}
@@ -2891,14 +2925,14 @@ func resolveClientCWD(cwdFlag string, getwd func() (string, error)) (string, err
 
 func noServerFoundError(cwd, command string) error {
 	command = displayProgramName(command)
-	return fmt.Errorf("no healthy %s server found from %s; start one with %q", command, cwd, command+" server --cwd "+cwd)
+	return fmt.Errorf("no healthy %s server found from %s; start one with %q", command, cwd, command+" server")
 }
 
 func printServerStatus(stdout io.Writer, status localserver.ServerStatus) error {
-	if _, err := fmt.Fprintln(stdout, "cwd\tconfig_path\taddr\tpid\tversion\tsession_count\trunning_turns\tuptime_seconds"); err != nil {
+	if _, err := fmt.Fprintln(stdout, "cwd\taddr\tpid\tversion\tsession_count\trunning_turns\tuptime_seconds"); err != nil {
 		return err
 	}
-	_, err := fmt.Fprintf(stdout, "%s\t%s\t%s\t%d\t%s\t%d\t%d\t%d\n", status.CWD, status.ConfigPath, status.Addr, status.PID, status.Version, status.SessionCount, status.RunningTurns, status.UptimeSeconds)
+	_, err := fmt.Fprintf(stdout, "%s\t%s\t%d\t%s\t%d\t%d\t%d\n", status.CWD, status.Addr, status.PID, status.Version, status.SessionCount, status.RunningTurns, status.UptimeSeconds)
 	return err
 }
 

@@ -64,11 +64,14 @@ singleton server、registry、token、projects、sessions 和 data store。
 
 server registry 和 durable data store 默认位于 user-level home namespace 下。手动 `--home`
 选择另一个 namespace 时，registry 和 data store 都进入该 namespace。
+server 进程启动后必须主动 `chdir` 到该 home namespace；它不继承调用者所在项目目录作为运行 cwd。
+`--config` 不参与 server 启动和 registry。
 
 registry 记录：
 
 ```json
 {
+  "cwd": "C:\\Users\\rex\\AppData\\Roaming\\sai",
   "pid": 12345,
   "base_url": "http://127.0.0.1:49321",
   "token": "random-local-secret",
@@ -89,8 +92,9 @@ server 命令：
 <cmd> server stop
 ```
 
-`<cmd> server` 以前台启动当前 namespace 的 singleton server，不绑定 cwd 或 project。若已有
-健康 server，应提示 already running 并退出 0。`<cmd> server --background` 显式启动后台
+`<cmd> server` 以前台启动当前 namespace 的 singleton server，不绑定 cwd、project 或 config；
+server 运行 cwd 固定为 home namespace。若已有健康 server，应提示 already running 并退出 0。
+`<cmd> server --background` 显式启动后台
 server。`server status` 和 `server stop` 不因为没有 server 而 auto-start。旧的 scoped
 multi-server list 行为移除。
 
@@ -310,6 +314,7 @@ durable data store 位于 home namespace 下，和 server registry 分离。默�
 - 同一 OS user、raw command basename 和 home namespace 下最多复用一个健康 server。
 - 不同 `--home` directories 形成独立 singleton namespaces。
 - foreground server 和 explicit `server --background` 都可启动；client commands 可按需 auto-start。
+- server 启动后 cwd 为 home namespace，不读取或记录 cwd 下的 config。
 - project 必须显式 create；duplicate canonical root 返回已有 project info 并退出 0。
 - nested projects 通过 nearest registered ancestor discovery 正确选择。
 - session 必须显式 create；`--new` 是 create-and-attach shortcut。

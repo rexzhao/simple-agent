@@ -25,7 +25,6 @@ const (
 // only the registry JSON field name is base_url in this slice.
 type RegistryRecord struct {
 	CWD             string    `json:"cwd"`
-	ConfigPath      string    `json:"config_path"`
 	BaseURL         string    `json:"base_url"`
 	PID             int       `json:"pid"`
 	Token           string    `json:"token"`
@@ -34,10 +33,9 @@ type RegistryRecord struct {
 	RequestedListen string    `json:"requested_listen,omitempty"`
 }
 
-// RegistryIdentity is the canonical cwd + config path pair for one server.
+// RegistryIdentity is the canonical cwd for one registered server.
 type RegistryIdentity struct {
-	CWD        string
-	ConfigPath string
+	CWD string
 }
 
 // RegistryStore reads and writes the local server registry file.
@@ -149,33 +147,27 @@ func CanonicalPath(path string) (string, error) {
 	return filepath.Clean(abs), nil
 }
 
-// NewRegistryIdentity canonicalizes cwd and configPath into a server identity.
-func NewRegistryIdentity(cwd, configPath string) (RegistryIdentity, error) {
+// NewRegistryIdentity canonicalizes cwd into a server identity.
+func NewRegistryIdentity(cwd string) (RegistryIdentity, error) {
 	canonicalCWD, err := CanonicalPath(cwd)
 	if err != nil {
 		return RegistryIdentity{}, fmt.Errorf("canonicalize cwd: %w", err)
 	}
-	canonicalConfig, err := CanonicalPath(configPath)
-	if err != nil {
-		return RegistryIdentity{}, fmt.Errorf("canonicalize config path: %w", err)
-	}
 	return RegistryIdentity{
-		CWD:        canonicalCWD,
-		ConfigPath: canonicalConfig,
+		CWD: canonicalCWD,
 	}, nil
 }
 
-// Identity returns the record's cwd + config path identity.
+// Identity returns the record's cwd identity.
 func (r RegistryRecord) Identity() RegistryIdentity {
 	return RegistryIdentity{
-		CWD:        r.CWD,
-		ConfigPath: r.ConfigPath,
+		CWD: r.CWD,
 	}
 }
 
 // Matches reports whether record has this exact canonical identity.
 func (id RegistryIdentity) Matches(record RegistryRecord) bool {
-	return sameRegistryPath(id.CWD, record.CWD) && sameRegistryPath(id.ConfigPath, record.ConfigPath)
+	return sameRegistryPath(id.CWD, record.CWD)
 }
 
 // SameIdentity reports whether two normalized records describe the same server.
@@ -198,12 +190,11 @@ func SameRegistryIdentity(a, b RegistryRecord) (bool, error) {
 
 // CanonicalizeRegistryRecord returns a copy with canonical identity paths.
 func CanonicalizeRegistryRecord(record RegistryRecord) (RegistryRecord, error) {
-	identity, err := NewRegistryIdentity(record.CWD, record.ConfigPath)
+	identity, err := NewRegistryIdentity(record.CWD)
 	if err != nil {
 		return RegistryRecord{}, err
 	}
 	record.CWD = identity.CWD
-	record.ConfigPath = identity.ConfigPath
 	record.BaseURL = strings.TrimSpace(record.BaseURL)
 	record.Token = strings.TrimSpace(record.Token)
 	record.Version = strings.TrimSpace(record.Version)
@@ -300,9 +291,9 @@ func (s RegistryStore) Upsert(record RegistryRecord) error {
 	return s.Save([]RegistryRecord{normalized})
 }
 
-// Remove deletes all records matching cwd + configPath.
-func (s RegistryStore) Remove(cwd, configPath string) (bool, error) {
-	identity, err := NewRegistryIdentity(cwd, configPath)
+// Remove deletes all records matching cwd.
+func (s RegistryStore) Remove(cwd string) (bool, error) {
+	identity, err := NewRegistryIdentity(cwd)
 	if err != nil {
 		return false, err
 	}

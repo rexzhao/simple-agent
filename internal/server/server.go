@@ -52,7 +52,6 @@ var errSessionStoreUnavailable = errors.New("session store is not configured")
 
 type Options struct {
 	CWD             string
-	ConfigPath      string
 	Listen          string
 	Version         string
 	AuthToken       string
@@ -132,7 +131,6 @@ type SessionCompactionPlan struct {
 
 type Info struct {
 	CWD          string    `json:"cwd"`
-	ConfigPath   string    `json:"config_path"`
 	Addr         string    `json:"addr"`
 	PID          int       `json:"pid"`
 	Version      string    `json:"version"`
@@ -201,12 +199,11 @@ func Start(options Options) (*Process, error) {
 	process := &Process{
 		listener: listener,
 		info: Info{
-			CWD:        options.CWD,
-			ConfigPath: options.ConfigPath,
-			Addr:       listener.Addr().String(),
-			PID:        os.Getpid(),
-			Version:    version,
-			StartedAt:  now().UTC(),
+			CWD:       options.CWD,
+			Addr:      listener.Addr().String(),
+			PID:       os.Getpid(),
+			Version:   version,
+			StartedAt: now().UTC(),
 		},
 		shutdownDone:    make(chan struct{}),
 		sessionStore:    options.SessionStore,
@@ -228,9 +225,6 @@ func Start(options Options) (*Process, error) {
 	}
 	if strings.TrimSpace(process.sessionDefaults.CWD) == "" {
 		process.sessionDefaults.CWD = options.CWD
-	}
-	if strings.TrimSpace(process.sessionDefaults.ConfigPath) == "" {
-		process.sessionDefaults.ConfigPath = options.ConfigPath
 	}
 	process.httpServer = &http.Server{
 		Handler: process,
@@ -388,7 +382,6 @@ func (p *Process) handleServer(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"cwd":            info.CWD,
-		"config_path":    info.ConfigPath,
 		"addr":           info.Addr,
 		"pid":            info.PID,
 		"version":        info.Version,
@@ -1083,9 +1076,6 @@ func (p *Process) handleSessionMessage(w http.ResponseWriter, r *http.Request, i
 	if strings.TrimSpace(session.CWD) == "" {
 		session.CWD = p.snapshot().CWD
 	}
-	if strings.TrimSpace(session.ConfigPath) == "" && strings.TrimSpace(session.ConfigDir) == "" {
-		session.ConfigPath = p.snapshot().ConfigPath
-	}
 
 	turnID := nextSessionTurnID(session)
 	turnCtx, cancelTurn := context.WithCancel(r.Context())
@@ -1211,9 +1201,6 @@ func (p *Process) handleSessionCompact(w http.ResponseWriter, r *http.Request, i
 	}
 	if strings.TrimSpace(session.CWD) == "" {
 		session.CWD = p.snapshot().CWD
-	}
-	if strings.TrimSpace(session.ConfigPath) == "" && strings.TrimSpace(session.ConfigDir) == "" {
-		session.ConfigPath = p.snapshot().ConfigPath
 	}
 
 	operationID := nextSessionCompactOperationID(session)

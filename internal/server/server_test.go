@@ -13,11 +13,10 @@ import (
 func TestProcessHealthServerAndShutdown(t *testing.T) {
 	startedAt := time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC)
 	process, err := Start(Options{
-		CWD:        t.TempDir(),
-		ConfigPath: "config.yaml",
-		Listen:     "127.0.0.1:0",
-		Version:    "test-version",
-		AuthToken:  "registry-token",
+		CWD:       t.TempDir(),
+		Listen:    "127.0.0.1:0",
+		Version:   "test-version",
+		AuthToken: "registry-token",
 		Now: func() time.Time {
 			return startedAt
 		},
@@ -53,7 +52,6 @@ func TestProcessHealthServerAndShutdown(t *testing.T) {
 
 	info := getJSONWithToken(t, baseURL+"/server", "registry-token")
 	for key, want := range map[string]any{
-		"config_path":   "config.yaml",
 		"addr":          process.Addr(),
 		"version":       "test-version",
 		"session_count": float64(0),

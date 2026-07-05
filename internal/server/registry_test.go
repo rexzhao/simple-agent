@@ -245,7 +245,7 @@ func TestRegistryStoreUpsertReplacesSingleton(t *testing.T) {
 	if records[0].RequestedListen != "127.0.0.1:8787" {
 		t.Fatalf("RequestedListen = %q, want replacement requested listen", records[0].RequestedListen)
 	}
-	wantIdentity, err := NewRegistryIdentity(project, config)
+	wantIdentity, err := NewRegistryIdentity(project)
 	if err != nil {
 		t.Fatalf("NewRegistryIdentity() error = %v", err)
 	}
@@ -268,7 +268,7 @@ func TestRegistryStoreRemove(t *testing.T) {
 		t.Fatalf("Save() error = %v", err)
 	}
 
-	removed, err := store.Remove(project, config)
+	removed, err := store.Remove(project)
 	if err != nil {
 		t.Fatalf("Remove() error = %v", err)
 	}
@@ -288,7 +288,7 @@ func TestRegistryStoreRemove(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("Save(other) error = %v", err)
 	}
-	removed, err = store.Remove(project, config)
+	removed, err = store.Remove(filepath.Join(root, "other-project"))
 	if err != nil {
 		t.Fatalf("Remove() missing error = %v", err)
 	}
@@ -389,12 +389,10 @@ func TestRegistryPathComparisonUsesWindowsCaseInsensitivity(t *testing.T) {
 	}
 
 	identity := RegistryIdentity{
-		CWD:        `C:\Work\Project`,
-		ConfigPath: `C:\Work\Project\.agents\sai.yaml`,
+		CWD: `C:\Work\Project`,
 	}
 	record := RegistryRecord{
-		CWD:        `c:\work\project`,
-		ConfigPath: `c:\work\project\.agents\sai.yaml`,
+		CWD: `c:\work\project`,
 	}
 	if got := identity.Matches(record); got != want {
 		t.Fatalf("RegistryIdentity.Matches() = %v for case-only difference, want %v on %s", got, want, runtime.GOOS)
@@ -488,10 +486,9 @@ func TestDiscoverHealthyChecksSingletonAndRemovesStale(t *testing.T) {
 	}
 
 	process, err := Start(Options{
-		CWD:        root,
-		ConfigPath: filepath.Join(root, ".agents", "sai.yaml"),
-		Listen:     "127.0.0.1:0",
-		Version:    "test-version",
+		CWD:     root,
+		Listen:  "127.0.0.1:0",
+		Version: "test-version",
 	})
 	if err != nil {
 		t.Fatalf("Start() error = %v", err)
@@ -566,14 +563,14 @@ func TestDiscoverHealthyChecksSingletonAndRemovesStale(t *testing.T) {
 }
 
 func testRegistryRecord(cwd, configPath, addr string, pid int, token string) RegistryRecord {
+	_ = configPath
 	return RegistryRecord{
-		CWD:        cwd,
-		ConfigPath: configPath,
-		BaseURL:    addr,
-		PID:        pid,
-		Token:      token,
-		StartedAt:  time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC),
-		Version:    "test-version",
+		CWD:       cwd,
+		BaseURL:   addr,
+		PID:       pid,
+		Token:     token,
+		StartedAt: time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC),
+		Version:   "test-version",
 	}
 }
 

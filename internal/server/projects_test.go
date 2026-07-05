@@ -272,7 +272,6 @@ func startProjectAPIServerWithSessions(t *testing.T, projectStore *projectstore.
 
 	process, err := Start(Options{
 		CWD:          t.TempDir(),
-		ConfigPath:   filepath.Join(t.TempDir(), "sai.yaml"),
 		Listen:       "127.0.0.1:0",
 		Version:      "test-version",
 		AuthToken:    token,

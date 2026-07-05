@@ -18,7 +18,6 @@ import (
 // ServerStatus is the client-facing shape returned by GET /server.
 type ServerStatus struct {
 	CWD           string    `json:"cwd"`
-	ConfigPath    string    `json:"config_path"`
 	Addr          string    `json:"addr"`
 	PID           int       `json:"pid"`
 	Version       string    `json:"version"`
