@@ -218,6 +218,38 @@ Existing attach/send behavior remains in scope:
   fallback session.
 - Different sessions may run turns concurrently.
 
+## Session Open Display Snapshot
+
+When attaching or opening an existing session, clients should load a recent page
+of the current session's display transcript before, or as part of, opening. This
+snapshot is for GUI/CLI display only. It must not affect model context; model
+context continues to use ActiveHistory/resume mechanics.
+
+Snapshot scope and filtering:
+
+- Load only the selected current session. No cross-session or cross-project
+  history is inherited.
+- Use chat view by default (`view=chat`), excluding hidden summary, debug, and
+  internal records.
+- Default recent page size is 50 items. An explicit `limit` may adjust that
+  size within the existing item API bounds.
+- Large content remains blob/metadata-first. Item pages return metadata and blob
+  references; bodies are read on demand through the content endpoint.
+- Page responses expose pagination cursors including `oldest_seq`,
+  `newest_seq`, `has_more_before`, and `has_more_after`. `has_more_before`
+  means older items exist before `oldest_seq`; `has_more_after` means newer
+  persisted items exist after `newest_seq`.
+
+Recommended open flow:
+
+1. Fetch `GET /sessions/{session_id}/items?view=chat&limit=50` over HTTP and
+   render it as the initial display state.
+2. Connect `WS /sessions/{session_id}/stream` with `after_seq` set to the HTTP
+   page's `newest_seq`.
+3. The server streams persisted events with `seq > after_seq` before live
+   events, so no persisted events are missed between the snapshot and the live
+   connection.
+
 ## Server Lifecycle
 
 - Commands that need a server first health-check the selected server root's
