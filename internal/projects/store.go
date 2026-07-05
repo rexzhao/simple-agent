@@ -23,17 +23,31 @@ var ErrNotFound = errors.New("project not found")
 
 type Project struct {
 	ID          string    `json:"id"`
-	Version     int       `json:"version"`
+	Version     int       `json:"-"`
 	Root        string    `json:"root"`
 	DisplayName string    `json:"display_name,omitempty"`
-	Archived    bool      `json:"archived"`
+	Archived    bool      `json:"-"`
+	ArchivedAt  time.Time `json:"-"`
 	CreatedAt   time.Time `json:"created_at"`
 	UpdatedAt   time.Time `json:"updated_at"`
+}
+
+type projectFile struct {
+	ID          string     `json:"id"`
+	Root        string     `json:"root"`
+	DisplayName string     `json:"display_name,omitempty"`
+	ArchivedAt  *time.Time `json:"archived_at"`
+	CreatedAt   time.Time  `json:"created_at"`
+	UpdatedAt   time.Time  `json:"updated_at"`
 }
 
 type Store struct {
 	root string
 	now  func() time.Time
+}
+
+type ListOptions struct {
+	Archived bool
 }
 
 func NewStore(root string) *Store {
@@ -66,6 +80,18 @@ func RootForHome(home string) (string, error) {
 	return filepath.Join(filepath.Clean(abs), "data", "projects"), nil
 }
 
+func RootForServerRoot(root string) (string, error) {
+	root = strings.TrimSpace(root)
+	if root == "" {
+		return "", fmt.Errorf("server root is required")
+	}
+	abs, err := filepath.Abs(root)
+	if err != nil {
+		return "", fmt.Errorf("resolve server root %q: %w", root, err)
+	}
+	return filepath.Join(filepath.Clean(abs), "data", "projects"), nil
+}
+
 func (s *Store) Root() string {
 	if s == nil {
 		return ""
@@ -91,12 +117,12 @@ func (s *Store) Create(root, displayName string) (Project, bool, error) {
 	now := s.now().UTC()
 	project := Project{
 		ID:          projectIDForRoot(canonicalRoot),
-		Version:     Version,
 		Root:        canonicalRoot,
 		DisplayName: strings.TrimSpace(displayName),
 		CreatedAt:   now,
 		UpdatedAt:   now,
 	}
+	project = normalizeProjectLifecycle(project)
 	if err := s.saveProject(project); err != nil {
 		return Project{}, false, err
 	}
@@ -127,7 +153,24 @@ func (s *Store) Load(id string) (Project, error) {
 }
 
 func (s *Store) List() ([]Project, error) {
-	return s.list(false)
+	return s.ListWithOptions(ListOptions{})
+}
+
+func (s *Store) ListWithOptions(options ListOptions) ([]Project, error) {
+	return s.list(options)
+}
+
+func (s *Store) Rename(id, displayName string) (Project, error) {
+	project, err := s.Load(id)
+	if err != nil {
+		return Project{}, err
+	}
+	project.DisplayName = strings.TrimSpace(displayName)
+	project.UpdatedAt = s.now().UTC()
+	if err := s.writeProject(project); err != nil {
+		return Project{}, err
+	}
+	return copyProject(project), nil
 }
 
 func (s *Store) Archive(id string) (Project, error) {
@@ -135,8 +178,12 @@ func (s *Store) Archive(id string) (Project, error) {
 	if err != nil {
 		return Project{}, err
 	}
+	now := s.now().UTC()
 	project.Archived = true
-	project.UpdatedAt = s.now().UTC()
+	if project.ArchivedAt.IsZero() {
+		project.ArchivedAt = now
+	}
+	project.UpdatedAt = now
 	if err := s.writeProject(project); err != nil {
 		return Project{}, err
 	}
@@ -217,7 +264,7 @@ func CanonicalRoot(root string) (string, error) {
 	return filepath.Clean(canonical), nil
 }
 
-func (s *Store) list(includeArchived bool) ([]Project, error) {
+func (s *Store) list(options ListOptions) ([]Project, error) {
 	if err := s.requireRoot(); err != nil {
 		return nil, err
 	}
@@ -251,7 +298,7 @@ func (s *Store) list(includeArchived bool) ([]Project, error) {
 		if project.ID != id {
 			return nil, fmt.Errorf("project file %q contains id %q", id, project.ID)
 		}
-		if !includeArchived && project.Archived {
+		if project.Archived != options.Archived {
 			continue
 		}
 		projects = append(projects, copyProject(project))
@@ -266,10 +313,15 @@ func (s *Store) list(includeArchived bool) ([]Project, error) {
 }
 
 func (s *Store) findByRoot(canonicalRoot string) (Project, bool, error) {
-	projects, err := s.list(true)
+	activeProjects, err := s.ListWithOptions(ListOptions{})
 	if err != nil {
 		return Project{}, false, err
 	}
+	archivedProjects, err := s.ListWithOptions(ListOptions{Archived: true})
+	if err != nil {
+		return Project{}, false, err
+	}
+	projects := append(activeProjects, archivedProjects...)
 	for _, project := range projects {
 		if samePath(project.Root, canonicalRoot) {
 			return project, true, nil
@@ -299,15 +351,17 @@ func (s *Store) saveProject(project Project) error {
 	if project.UpdatedAt.IsZero() {
 		project.UpdatedAt = project.CreatedAt
 	}
+	project = normalizeProjectLifecycle(project)
 	return s.writeProject(project)
 }
 
 func (s *Store) writeProject(project Project) error {
+	project = normalizeProjectLifecycle(project)
 	dir := s.projectDir(project.ID)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return fmt.Errorf("create project directory %q: %w", dir, err)
 	}
-	data, err := json.MarshalIndent(project, "", "  ")
+	data, err := json.MarshalIndent(projectFileFromProject(project), "", "  ")
 	if err != nil {
 		return fmt.Errorf("marshal project %q: %w", project.ID, err)
 	}
@@ -340,13 +394,45 @@ func readProjectFile(path string) (Project, error) {
 	}
 	defer file.Close()
 
-	var project Project
+	var record projectFile
 	decoder := json.NewDecoder(file)
 	decoder.UseNumber()
-	if err := decoder.Decode(&project); err != nil {
+	if err := decoder.Decode(&record); err != nil {
 		return Project{}, fmt.Errorf("parse project file %q: %w", path, err)
 	}
-	return project, nil
+	return record.project(), nil
+}
+
+func projectFileFromProject(project Project) projectFile {
+	project = normalizeProjectLifecycle(project)
+	var archivedAt *time.Time
+	if !project.ArchivedAt.IsZero() {
+		value := project.ArchivedAt.UTC()
+		archivedAt = &value
+	}
+	return projectFile{
+		ID:          project.ID,
+		Root:        project.Root,
+		DisplayName: project.DisplayName,
+		ArchivedAt:  archivedAt,
+		CreatedAt:   project.CreatedAt,
+		UpdatedAt:   project.UpdatedAt,
+	}
+}
+
+func (r projectFile) project() Project {
+	project := Project{
+		ID:          r.ID,
+		Version:     Version,
+		Root:        r.Root,
+		DisplayName: r.DisplayName,
+		CreatedAt:   r.CreatedAt,
+		UpdatedAt:   r.UpdatedAt,
+	}
+	if r.ArchivedAt != nil {
+		project.ArchivedAt = r.ArchivedAt.UTC()
+	}
+	return normalizeProjectLifecycle(project)
 }
 
 func projectIDForRoot(root string) string {
@@ -386,6 +472,26 @@ func samePath(a, b string) bool {
 }
 
 func copyProject(project Project) Project {
+	return normalizeProjectLifecycle(project)
+}
+
+func normalizeProjectLifecycle(project Project) Project {
+	if !project.ArchivedAt.IsZero() {
+		project.ArchivedAt = project.ArchivedAt.UTC()
+		project.Archived = true
+	} else if project.Archived {
+		if !project.UpdatedAt.IsZero() {
+			project.ArchivedAt = project.UpdatedAt.UTC()
+		} else if !project.CreatedAt.IsZero() {
+			project.ArchivedAt = project.CreatedAt.UTC()
+		}
+		project.Archived = !project.ArchivedAt.IsZero()
+	} else {
+		project.Archived = false
+	}
+	if project.Version == 0 {
+		project.Version = Version
+	}
 	return project
 }
 

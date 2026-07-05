@@ -47,6 +47,11 @@ const (
 	chatInputPrompt        = "> "
 )
 
+const (
+	backgroundChildTokenEnv = "SAI_INTERNAL_BACKGROUND_CHILD_TOKEN"
+	backgroundChildRootEnv  = "SAI_INTERNAL_BACKGROUND_CHILD_SERVER_ROOT"
+)
+
 func Run(args []string, stdout, stderr io.Writer) int {
 	return RunWithProgram("sai", args, stdout, stderr)
 }
@@ -213,7 +218,7 @@ func execute(ctx context.Context, program string, args []string, stdin io.Reader
 	if err != nil {
 		return err
 	}
-	homePath, err := localserver.ResolveHomeDir(program, rootArgs.homePath)
+	serverRoot, err := localserver.ResolveServerRoot(program, rootArgs.serverRoot)
 	if err != nil {
 		return err
 	}
@@ -225,7 +230,7 @@ func execute(ctx context.Context, program string, args []string, stdin io.Reader
 		var stop func()
 		ctx, stop = contextWithInterruptCancel(ctx, interrupts)
 		defer stop()
-		return attachCommand(ctx, rootArgs.commandArgs, rootArgs.configPath, rootArgs.configProvided, homePath, stdin, stdout, stderr, getwd, program)
+		return attachCommand(ctx, rootArgs.commandArgs, rootArgs.configPath, rootArgs.configProvided, serverRoot, stdin, stdout, stderr, getwd, program)
 	}
 	var stop func()
 	ctx, stop = contextWithInterruptCancel(ctx, interrupts)
@@ -235,7 +240,7 @@ func execute(ctx context.Context, program string, args []string, stdin io.Reader
 	case "help":
 		return helpCommand(rootArgs.commandArgs, stdout, displayCommand)
 	case "attach":
-		return attachCommand(ctx, rootArgs.commandArgs, rootArgs.configPath, rootArgs.configProvided, homePath, stdin, stdout, stderr, getwd, program)
+		return attachCommand(ctx, rootArgs.commandArgs, rootArgs.configPath, rootArgs.configProvided, serverRoot, stdin, stdout, stderr, getwd, program)
 	case "version":
 		return versionCommand(rootArgs.commandArgs, stdout, displayCommand)
 	case "config":
@@ -267,9 +272,26 @@ func execute(ctx context.Context, program string, args []string, stdin io.Reader
 	case "doctor":
 		return doctorCommand(rootArgs.commandArgs, rootArgs.configPath, stdout, getwd, program)
 	case "server":
-		return serverCommand(ctx, rootArgs.commandArgs, rootArgs.configPath, homePath, stdout, getwd, program)
+		subcommand, subArgs, groupHelp, err := splitSubcommandArgs(rootArgs.commandArgs, map[string]flagKind{"background": flagKindBool, "port": flagKindValue, "listen": flagKindValue, "wait": flagKindBool, "timeout-ms": flagKindValue}, "sai help server")
+		if err != nil {
+			return err
+		}
+		if subcommand == "" && groupHelp {
+			printServerUsage(stdout, displayCommand)
+			return nil
+		}
+		switch subcommand {
+		case "start":
+			return serverStartCommand(ctx, subArgs, serverRoot, stdout, program)
+		case "status":
+			return serverStatusCommand(ctx, subArgs, serverRoot, stdout, displayCommand)
+		case "stop":
+			return serverStopCommand(ctx, subArgs, serverRoot, stdout, displayCommand)
+		default:
+			return usageError("usage: sai server <start|status|stop>", "", "sai help server")
+		}
 	case "project":
-		subcommand, subArgs, groupHelp, err := splitSubcommandArgs(rootArgs.commandArgs, map[string]flagKind{"cwd": flagKindValue, "name": flagKindValue, "project": flagKindValue, "delete-data": flagKindBool}, "sai help project")
+		subcommand, subArgs, groupHelp, err := splitSubcommandArgs(rootArgs.commandArgs, map[string]flagKind{"cwd": flagKindValue, "name": flagKindValue, "archived": flagKindBool}, "sai help project")
 		if err != nil {
 			return err
 		}
@@ -279,15 +301,19 @@ func execute(ctx context.Context, program string, args []string, stdin io.Reader
 		}
 		switch subcommand {
 		case "create":
-			return projectCreateCommand(ctx, subArgs, rootArgs.configPath, homePath, stdout, getwd, program)
+			return projectCreateCommand(ctx, subArgs, rootArgs.configPath, serverRoot, stdout, getwd, program)
 		case "list":
-			return projectListCommand(ctx, subArgs, rootArgs.configPath, homePath, stdout, getwd, program)
+			return projectListCommand(ctx, subArgs, rootArgs.configPath, serverRoot, stdout, getwd, program)
 		case "show":
-			return projectShowCommand(ctx, subArgs, rootArgs.configPath, homePath, stdout, getwd, program)
+			return projectShowCommand(ctx, subArgs, rootArgs.configPath, serverRoot, stdout, getwd, program)
+		case "rename":
+			return projectRenameCommand(ctx, subArgs, rootArgs.configPath, serverRoot, stdout, getwd, program)
+		case "archive":
+			return projectArchiveCommand(ctx, subArgs, rootArgs.configPath, serverRoot, stdout, getwd, program)
 		case "remove":
-			return projectRemoveCommand(ctx, subArgs, rootArgs.configPath, homePath, stdout, getwd, program)
+			return projectRemoveCommand(ctx, subArgs, rootArgs.configPath, serverRoot, stdout, getwd, program)
 		default:
-			return usageError("usage: sai project <create|list|show|remove>", "", "sai help project")
+			return usageError("usage: sai project <create|list|show|rename|archive|remove>", "", "sai help project")
 		}
 	case "session":
 		subcommand, subArgs, groupHelp, err := splitSubcommandArgs(rootArgs.commandArgs, map[string]flagKind{"cwd": flagKindValue, "project": flagKindValue, "all-projects": flagKindBool, "archived": flagKindBool}, "sai help session")
@@ -300,37 +326,22 @@ func execute(ctx context.Context, program string, args []string, stdin io.Reader
 		}
 		switch subcommand {
 		case "create":
-			return sessionCreateCommand(ctx, subArgs, rootArgs.configPath, homePath, stdout, getwd, program)
+			return sessionCreateCommand(ctx, subArgs, rootArgs.configPath, serverRoot, stdout, getwd, program)
 		case "list":
-			return sessionListCommand(ctx, subArgs, rootArgs.configPath, rootArgs.configProvided, homePath, stdout, getwd, program)
+			return sessionListCommand(ctx, subArgs, rootArgs.configPath, rootArgs.configProvided, serverRoot, stdout, getwd, program)
 		case "show":
-			return sessionShowCommand(ctx, subArgs, rootArgs.configPath, rootArgs.configProvided, homePath, stdout, getwd, program)
+			return sessionShowCommand(ctx, subArgs, rootArgs.configPath, rootArgs.configProvided, serverRoot, stdout, getwd, program)
 		case "rename":
-			return sessionRenameCommand(ctx, subArgs, rootArgs.configPath, rootArgs.configProvided, homePath, stdout, getwd, program)
+			return sessionRenameCommand(ctx, subArgs, rootArgs.configPath, rootArgs.configProvided, serverRoot, stdout, getwd, program)
 		case "archive":
-			return sessionArchiveCommand(ctx, subArgs, rootArgs.configPath, rootArgs.configProvided, homePath, stdout, getwd, program)
+			return sessionArchiveCommand(ctx, subArgs, rootArgs.configPath, rootArgs.configProvided, serverRoot, stdout, getwd, program)
+		case "remove":
+			return sessionRemoveCommand(ctx, subArgs, rootArgs.configPath, rootArgs.configProvided, serverRoot, stdout, getwd, program)
 		default:
-			return usageError("usage: sai session <create|list|show|rename|archive>", "", "sai help session")
+			return usageError("usage: sai session <create|list|show|rename|archive|remove>", "", "sai help session")
 		}
-	case "status":
-		return statusCommand(ctx, rootArgs.commandArgs, homePath, stdout, getwd, displayCommand)
-	case "stop":
-		return stopCommand(ctx, rootArgs.commandArgs, homePath, stdout, getwd, displayCommand)
-	case "servers":
-		subcommand, subArgs, groupHelp, err := splitSubcommandArgs(rootArgs.commandArgs, nil, "sai help servers")
-		if err != nil {
-			return err
-		}
-		if subcommand == "" && groupHelp {
-			printServersUsage(stdout, displayCommand)
-			return nil
-		}
-		if subcommand != "list" {
-			return usageError("usage: sai servers list", "", "sai help servers list")
-		}
-		return serversListCommand(ctx, subArgs, homePath, stdout, displayCommand)
 	case "send":
-		return sendCommand(ctx, rootArgs.commandArgs, rootArgs.configPath, rootArgs.configProvided, homePath, stdout, getwd, program)
+		return sendCommand(ctx, rootArgs.commandArgs, rootArgs.configPath, rootArgs.configProvided, serverRoot, stdout, getwd, program)
 	case "auth":
 		return authCommand(ctx, rootArgs.commandArgs, rootArgs.configPath, stdout, getwd, program)
 	case "tools":
@@ -359,32 +370,6 @@ func execute(ctx context.Context, program string, args []string, stdin io.Reader
 			return usageError("usage: sai mcp list [--enable-mcp ids]", "", "sai help mcp list")
 		}
 		return mcpListCommand(subArgs, rootArgs.configPath, stdout, getwd, program)
-	case "sessions":
-		subcommand, subArgs, groupHelp, err := splitSubcommandArgs(rootArgs.commandArgs, map[string]flagKind{"project": flagKindValue, "all-projects": flagKindBool, "archived": flagKindBool}, "sai help sessions")
-		if err != nil {
-			return err
-		}
-		if subcommand == "" && groupHelp {
-			printSessionsUsage(stdout, displayCommand)
-			return nil
-		}
-		switch subcommand {
-		case "", "list":
-			if subcommand == "list" && containsHelpArg(subArgs) {
-				printSessionsListUsage(stdout, displayCommand)
-				return nil
-			}
-			if rootArgs.configProvided {
-				helpCommand := "sai help sessions"
-				if subcommand == "list" {
-					helpCommand = "sai help session list"
-				}
-				return rejectSessionConfigForExistingCommand(true, helpCommand)
-			}
-			return sessionListCommand(ctx, subArgs, rootArgs.configPath, false, homePath, stdout, getwd, program)
-		default:
-			return usageError("usage: sai sessions [list]", "", "sai help sessions")
-		}
 	default:
 		return usageError(fmt.Sprintf("unknown command %q", rootArgs.command), "", "sai help")
 	}
@@ -412,16 +397,13 @@ func contextWithInterruptCancel(ctx context.Context, interrupts <-chan struct{})
 	}
 }
 
-const rootUsageText = `usage: sai [--home dir] [--config file] [command] [args]
+const rootUsageText = `usage: sai [--server-root dir] [--config file] [command] [args]
 
 Commands:
   attach            Attach to a server-owned session
-  server            Start a local HTTP server
+  server            Manage the selected local HTTP server
   project           Manage registered projects
   session           Manage explicit sessions
-  status            Show nearest server status
-  stop              Stop nearest server
-  servers list      List registered local servers
   send              Send one prompt to a server-owned session
   config show        Print resolved config with secrets redacted
   models list        List configured provider model profiles
@@ -429,7 +411,6 @@ Commands:
   doctor            Check local configuration health
   tools list         List built-in tools
   mcp list           List configured MCP servers
-  sessions           Alias for session list
   version            Print version
   help [command]     Show usage
 
@@ -509,19 +490,41 @@ sending provider HTTP requests, starting MCP servers, running a model, or
 printing secrets.
 `
 
-const serverUsageText = `usage: sai server [--cwd path] [--port N | --listen host:port]
+const serverUsageText = `usage: sai server <command>
 
-Starts a loopback HTTP server. By default it runs in the foreground and blocks
-until it shuts down. With --background, the parent exits after the child server
-has written its registry record and /health succeeds. The default listener is
-127.0.0.1:0, which asks the OS to choose a free port. Unless --cwd is provided,
-the server process uses the selected home namespace as its working directory.
+Commands:
+  server start      Start the selected local server
+  server status     Show selected server status
+  server stop       Stop the selected local server
+
+Run "sai help server <command>" for command usage.
+`
+
+const serverStartUsageText = `usage: sai server start [--background] [--port N | --listen host:port]
+
+Starts a loopback HTTP server for the selected server root. By default it runs
+in the foreground and blocks until it shuts down. With --background, the parent
+exits after the child server has written its registry record and /health
+succeeds. The default listener is 127.0.0.1:0, which asks the OS to choose a
+free port.
 
 Options:
   --background       start a detached child server and exit when it is healthy
-  --cwd path         server working directory; defaults to the home namespace
   --port N           listen on 127.0.0.1:N; 0 asks the OS for a free port
   --listen host:port advanced loopback listen address
+`
+
+const serverStatusUsageText = `usage: sai server status
+
+Shows status for the selected server root. This command does not auto-start a
+server.
+`
+
+const serverStopUsageText = `usage: sai server stop [--wait] [--timeout-ms N]
+
+Stops the selected server root. By default shutdown is immediate and cancels
+running turns. --wait drains already started turns before shutdown;
+--timeout-ms bounds that wait before falling back to immediate shutdown.
 `
 
 const projectUsageText = `usage: sai project <command>
@@ -530,7 +533,9 @@ Commands:
   project create    Register a project root
   project list      List registered projects
   project show      Show project metadata
-  project remove    Archive or delete project metadata
+  project rename    Rename project metadata
+  project archive   Archive project metadata
+  project remove    Remove archived project metadata
 
 Run "sai help project <command>" for command usage.
 `
@@ -541,22 +546,33 @@ Registers the effective current directory as a project root. Use --cwd to
 register a specific existing directory. --name sets display-only metadata.
 `
 
-const projectListUsageText = `usage: sai project list
+const projectListUsageText = `usage: sai project list [--archived]
 
-Lists registered projects.
+Lists active registered projects. With --archived, lists archived projects only.
 `
 
-const projectShowUsageText = `usage: sai project show [--project id]
+const projectShowUsageText = `usage: sai project show [project-id]
 
-Shows project metadata. Without --project, the current directory is matched to
+Shows project metadata. Without project-id, the current directory is matched to
 the nearest registered ancestor project.
 `
 
-const projectRemoveUsageText = `usage: sai project remove [--project id] [--delete-data]
+const projectRenameUsageText = `usage: sai project rename [project-id] <name>
 
-Archives the selected project by default. Without --project, the current
-directory is matched to the nearest registered ancestor project. --delete-data
-deletes project metadata/data instead of archiving it.
+Renames an active project. Without project-id, the current directory is matched
+to the nearest registered ancestor project.
+`
+
+const projectArchiveUsageText = `usage: sai project archive [project-id]
+
+Archives an active project. Without project-id, the current directory is matched
+to the nearest registered ancestor project.
+`
+
+const projectRemoveUsageText = `usage: sai project remove [project-id]
+
+Removes an archived project and its sessions. Without project-id, the current
+directory is matched to the nearest registered ancestor project.
 `
 
 const sessionUsageText = `usage: sai session <command>
@@ -567,6 +583,7 @@ Commands:
   session show      Show session metadata
   session rename    Rename a session
   session archive   Archive a session
+  session remove    Remove an archived session
 
 Run "sai help session <command>" for command usage.
 `
@@ -601,33 +618,9 @@ const sessionArchiveUsageText = `usage: sai session archive <session-id>
 Archives a session so default session lists and automatic selection hide it.
 `
 
-const statusUsageText = `usage: sai status [--cwd path]
+const sessionRemoveUsageText = `usage: sai session remove <session-id>
 
-Discovers the nearest healthy local server from the current directory, or from
---cwd when provided, and prints server status.
-`
-
-const stopUsageText = `usage: sai stop [--cwd path] [--wait] [--timeout-ms N]
-
-Discovers the nearest local server from the current directory, or from --cwd
-when provided, asks it to shut down, and removes its registry record. By
-default shutdown is immediate and cancels running turns. --wait drains already
-started turns before shutdown; --timeout-ms bounds that wait before falling
-back to immediate shutdown. Sessions, logs, and blobs are not deleted.
-`
-
-const serversUsageText = `usage: sai servers <command>
-
-Commands:
-  servers list       List registered local servers
-
-Run "sai help servers list" for command usage.
-`
-
-const serversListUsageText = `usage: sai servers list
-
-Lists healthy local server registry records. Stale records are removed while
-listing.
+Removes an archived session. Active sessions must be archived first.
 `
 
 const sendUsageText = `usage: sai send [session-id] --prompt text
@@ -689,20 +682,6 @@ const mcpListUsageText = `usage: sai mcp list [--enable-mcp ids]
 Lists configured MCP servers and whether each is enabled for this run.
 `
 
-const sessionsUsageText = `usage: sai sessions [list] [--project project-id] [--all-projects] [--archived]
-
-Alias for "sai session list". Lists server-owned session metadata without
-printing messages, prompts, assistant output, or tool result content.
-
-Run "sai help sessions list" for alias usage.
-`
-
-const sessionsListUsageText = `usage: sai sessions list [--project project-id] [--all-projects] [--archived]
-
-Alias for "sai session list". Lists server-owned session metadata without
-printing messages, prompts, assistant output, or tool result content.
-`
-
 func helpCommand(args []string, stdout io.Writer, command string) error {
 	if len(args) == 0 || len(args) == 1 && isHelpArg(args[0]) {
 		printRootUsage(stdout, command)
@@ -726,6 +705,12 @@ func helpCommand(args []string, stdout io.Writer, command string) error {
 		printDoctorUsage(stdout, command)
 	case "server":
 		printServerUsage(stdout, command)
+	case "server start":
+		printServerStartUsage(stdout, command)
+	case "server status":
+		printServerStatusUsage(stdout, command)
+	case "server stop":
+		printServerStopUsage(stdout, command)
 	case "project":
 		printProjectUsage(stdout, command)
 	case "project create":
@@ -734,6 +719,10 @@ func helpCommand(args []string, stdout io.Writer, command string) error {
 		printProjectListUsage(stdout, command)
 	case "project show":
 		printProjectShowUsage(stdout, command)
+	case "project rename":
+		printProjectRenameUsage(stdout, command)
+	case "project archive":
+		printProjectArchiveUsage(stdout, command)
 	case "project remove":
 		printProjectRemoveUsage(stdout, command)
 	case "session":
@@ -748,14 +737,8 @@ func helpCommand(args []string, stdout io.Writer, command string) error {
 		printSessionRenameUsage(stdout, command)
 	case "session archive":
 		printSessionArchiveUsage(stdout, command)
-	case "status":
-		printStatusUsage(stdout, command)
-	case "stop":
-		printStopUsage(stdout, command)
-	case "servers":
-		printServersUsage(stdout, command)
-	case "servers list":
-		printServersListUsage(stdout, command)
+	case "session remove":
+		printSessionRemoveUsage(stdout, command)
 	case "send":
 		printSendUsage(stdout, command)
 	case "auth":
@@ -772,10 +755,6 @@ func helpCommand(args []string, stdout io.Writer, command string) error {
 		printMCPUsage(stdout, command)
 	case "mcp list":
 		printMCPListUsage(stdout, command)
-	case "sessions":
-		printSessionsUsage(stdout, command)
-	case "sessions list":
-		printSessionsListUsage(stdout, command)
 	default:
 		return usageError(fmt.Sprintf("unknown help topic %q", strings.Join(args, " ")), "", "sai help")
 	}
@@ -822,6 +801,18 @@ func printServerUsage(stdout io.Writer, command string) {
 	fmt.Fprint(stdout, renderCommandText(serverUsageText, command))
 }
 
+func printServerStartUsage(stdout io.Writer, command string) {
+	fmt.Fprint(stdout, renderCommandText(serverStartUsageText, command))
+}
+
+func printServerStatusUsage(stdout io.Writer, command string) {
+	fmt.Fprint(stdout, renderCommandText(serverStatusUsageText, command))
+}
+
+func printServerStopUsage(stdout io.Writer, command string) {
+	fmt.Fprint(stdout, renderCommandText(serverStopUsageText, command))
+}
+
 func printProjectUsage(stdout io.Writer, command string) {
 	fmt.Fprint(stdout, renderCommandText(projectUsageText, command))
 }
@@ -836,6 +827,14 @@ func printProjectListUsage(stdout io.Writer, command string) {
 
 func printProjectShowUsage(stdout io.Writer, command string) {
 	fmt.Fprint(stdout, renderCommandText(projectShowUsageText, command))
+}
+
+func printProjectRenameUsage(stdout io.Writer, command string) {
+	fmt.Fprint(stdout, renderCommandText(projectRenameUsageText, command))
+}
+
+func printProjectArchiveUsage(stdout io.Writer, command string) {
+	fmt.Fprint(stdout, renderCommandText(projectArchiveUsageText, command))
 }
 
 func printProjectRemoveUsage(stdout io.Writer, command string) {
@@ -866,20 +865,8 @@ func printSessionArchiveUsage(stdout io.Writer, command string) {
 	fmt.Fprint(stdout, renderCommandText(sessionArchiveUsageText, command))
 }
 
-func printStatusUsage(stdout io.Writer, command string) {
-	fmt.Fprint(stdout, renderCommandText(statusUsageText, command))
-}
-
-func printStopUsage(stdout io.Writer, command string) {
-	fmt.Fprint(stdout, renderCommandText(stopUsageText, command))
-}
-
-func printServersUsage(stdout io.Writer, command string) {
-	fmt.Fprint(stdout, renderCommandText(serversUsageText, command))
-}
-
-func printServersListUsage(stdout io.Writer, command string) {
-	fmt.Fprint(stdout, renderCommandText(serversListUsageText, command))
+func printSessionRemoveUsage(stdout io.Writer, command string) {
+	fmt.Fprint(stdout, renderCommandText(sessionRemoveUsageText, command))
 }
 
 func printSendUsage(stdout io.Writer, command string) {
@@ -912,14 +899,6 @@ func printMCPUsage(stdout io.Writer, command string) {
 
 func printMCPListUsage(stdout io.Writer, command string) {
 	fmt.Fprint(stdout, renderCommandText(mcpListUsageText, command))
-}
-
-func printSessionsUsage(stdout io.Writer, command string) {
-	fmt.Fprint(stdout, renderCommandText(sessionsUsageText, command))
-}
-
-func printSessionsListUsage(stdout io.Writer, command string) {
-	fmt.Fprint(stdout, renderCommandText(sessionsListUsageText, command))
 }
 
 func isNestedHelp(args []string, command string) bool {
@@ -985,7 +964,7 @@ const (
 type rootArgs struct {
 	configPath     string
 	configProvided bool
-	homePath       string
+	serverRoot     string
 	command        string
 	commandArgs    []string
 	hasHelp        bool
@@ -996,7 +975,7 @@ func splitRootArgs(args []string) (rootArgs, error) {
 		"config":         flagKindValue,
 		"all-projects":   flagKindBool,
 		"archived":       flagKindBool,
-		"home":           flagKindValue,
+		"server-root":    flagKindValue,
 		"name":           flagKindValue,
 		"project":        flagKindValue,
 		"provider":       flagKindValue,
@@ -1010,8 +989,10 @@ func splitRootArgs(args []string) (rootArgs, error) {
 		"cwd":            flagKindValue,
 		"port":           flagKindValue,
 		"listen":         flagKindValue,
-		"delete-data":    flagKindBool,
+		"timeout-ms":     flagKindValue,
 		"new":            flagKindBool,
+		"background":     flagKindBool,
+		"wait":           flagKindBool,
 		"h":              flagKindBool,
 		"help":           flagKindBool,
 		"show-reasoning": flagKindBool,
@@ -1049,7 +1030,7 @@ func splitRootArgs(args []string) (rootArgs, error) {
 		if isHelpArg(arg) {
 			out.hasHelp = true
 		}
-		if name == "config" || name == "home" {
+		if name == "config" || name == "server-root" {
 			value, next, err := flagValue(args, i, name, hasInlineValue)
 			if err != nil {
 				return rootArgs{}, usageError(err.Error(), "", "sai help")
@@ -1058,7 +1039,7 @@ func splitRootArgs(args []string) (rootArgs, error) {
 				out.configPath = value
 				out.configProvided = true
 			} else {
-				out.homePath = value
+				out.serverRoot = value
 			}
 			i = next
 			continue
@@ -1088,7 +1069,7 @@ func stripGlobalArgs(args rootArgs) (rootArgs, error) {
 			break
 		}
 		name, hasInlineValue := flagName(arg)
-		if isFlagArg(arg) && (name == "config" || name == "home") {
+		if isFlagArg(arg) && (name == "config" || name == "server-root") {
 			value, next, err := flagValue(args.commandArgs, i, name, hasInlineValue)
 			if err != nil {
 				return rootArgs{}, usageError(err.Error(), "", "sai help")
@@ -1097,7 +1078,7 @@ func stripGlobalArgs(args rootArgs) (rootArgs, error) {
 				args.configPath = value
 				args.configProvided = true
 			} else {
-				args.homePath = value
+				args.serverRoot = value
 			}
 			i = next
 			continue
@@ -1242,23 +1223,18 @@ func doctorCommand(args []string, configPath string, stdout io.Writer, getwd fun
 	return nil
 }
 
-func serverCommand(ctx context.Context, args []string, configPath, homePath string, stdout io.Writer, getwd func() (string, error), program string) error {
+func serverStartCommand(ctx context.Context, args []string, serverRoot string, stdout io.Writer, program string) error {
 	displayCommand := displayProgramName(program)
-	flags := flag.NewFlagSet("sai server", flag.ContinueOnError)
+	flags := flag.NewFlagSet("sai server start", flag.ContinueOnError)
 	background := flags.Bool("background", false, "start in the background")
-	backgroundChild := flags.Bool("background-child", false, "run as a background child")
-	cwdFlag := flags.String("cwd", "", "server working directory")
 	portFlag := flags.Int("port", -1, "loopback port")
 	listenFlag := flags.String("listen", "", "loopback listen address")
-	positionals, done, err := parseCommandFlagArgs(flags, args, stdout, printServerUsage, displayCommand, "sai help server")
+	positionals, done, err := parseCommandFlagArgs(flags, args, stdout, printServerStartUsage, displayCommand, "sai help server start")
 	if done || err != nil {
 		return err
 	}
 	if len(positionals) != 0 {
-		return usageError("usage: sai server [--cwd path] [--port N | --listen host:port]", "", "sai help server")
-	}
-	if *background && *backgroundChild {
-		return usageError("--background cannot be combined with internal --background-child", "", "sai help server")
+		return usageError("usage: sai server start [--background] [--port N | --listen host:port]", "", "sai help server start")
 	}
 
 	portSet := false
@@ -1269,119 +1245,94 @@ func serverCommand(ctx context.Context, args []string, configPath, homePath stri
 	})
 	listen, err := serverListenAddress(portSet, *portFlag, *listenFlag)
 	if err != nil {
-		return usageError(err.Error(), "", "sai help server")
+		return usageError(err.Error(), "", "sai help server start")
 	}
 	if err := localserver.ValidateListenAddress(listen); err != nil {
 		return err
 	}
 
-	store, err := localserver.NewRegistryStoreForHome(homePath)
+	store, err := localserver.NewRegistryStoreForServerRoot(serverRoot)
 	if err != nil {
-		return err
-	}
-	if done, err := checkExistingServerRecord(ctx, store, stdout); done || err != nil {
 		return err
 	}
 
 	if *background {
-		return runServerBackgroundParentFromFlags(ctx, configPath, *cwdFlag, listen, homePath, store, stdout, getwd, program)
+		return runServerBackgroundParentFromFlags(ctx, listen, serverRoot, store, stdout, program)
 	}
 
-	launch, err := prepareServerLaunch(configPath, *cwdFlag, listen, homePath, store, getwd, program)
+	launch, err := prepareServerLaunch(listen, serverRoot, store, program)
 	if err != nil {
 		return err
 	}
+	launch.SkipStartupLock = backgroundChildStartupAuthorized(launch.ServerRoot)
 
 	return runServerForeground(ctx, launch, stdout)
 }
 
 type serverLaunch struct {
-	CWD             string
-	CWDExplicit     bool
+	ServerRoot      string
 	Listen          string
-	Identity        localserver.RegistryIdentity
 	SessionStore    *sessions.V2Store
 	SessionDefaults sessions.SessionV2
 	ProjectStore    *projectstore.Store
 	Program         string
-	HomePath        string
+	ServerRootPath  string
 	RegistryStore   localserver.RegistryStore
+	SkipStartupLock bool
 }
 
-func prepareServerLaunch(configPath, cwdFlag, listen, homePath string, store localserver.RegistryStore, getwd func() (string, error), program string) (serverLaunch, error) {
-	cwdExplicit := strings.TrimSpace(cwdFlag) != ""
-	var cwd string
-	var err error
-	if cwdExplicit {
-		cwd, err = resolveServerCWD(cwdFlag, getwd)
-		if err != nil {
-			return serverLaunch{}, err
-		}
-		cwd, err = localserver.CanonicalPath(cwd)
-		if err != nil {
-			return serverLaunch{}, err
-		}
-	} else {
-		cwd, err = localserver.CanonicalPath(homePath)
-		if err != nil {
-			return serverLaunch{}, err
-		}
-	}
-	identity, err := localserver.NewRegistryIdentity(cwd)
+func prepareServerLaunch(listen, serverRoot string, store localserver.RegistryStore, program string) (serverLaunch, error) {
+	root, err := localserver.CanonicalPath(serverRoot)
 	if err != nil {
 		return serverLaunch{}, err
 	}
 	sessionDefaults := sessions.SessionV2{
 		Version:         sessions.VersionV2,
-		CWD:             identity.CWD,
-		CreatedCWD:      identity.CWD,
 		SaveToolResults: true,
 	}
-	projectRoot, err := projectstore.RootForHome(homePath)
+	projectRoot, err := projectstore.RootForServerRoot(root)
 	if err != nil {
 		return serverLaunch{}, err
 	}
-	sessionRoot, err := sessions.RootForHome(homePath)
+	sessionRoot, err := sessions.RootForServerRoot(root)
 	if err != nil {
 		return serverLaunch{}, err
 	}
 
 	return serverLaunch{
-		CWD:             identity.CWD,
-		CWDExplicit:     cwdExplicit,
+		ServerRoot:      root,
 		Listen:          listen,
-		Identity:        identity,
 		SessionStore:    sessions.NewV2Store(sessionRoot),
 		SessionDefaults: sessionDefaults,
 		ProjectStore:    projectstore.NewStore(projectRoot),
 		Program:         program,
-		HomePath:        homePath,
+		ServerRootPath:  root,
 		RegistryStore:   store,
 	}, nil
 }
 
-func enterServerHome(homePath string) (func() error, error) {
-	homePath = filepath.Clean(strings.TrimSpace(homePath))
-	if homePath == "" || homePath == "." {
-		return nil, fmt.Errorf("server home directory is required")
+func enterServerRoot(serverRoot string) (func() error, error) {
+	serverRoot = filepath.Clean(strings.TrimSpace(serverRoot))
+	if serverRoot == "" || serverRoot == "." {
+		return nil, fmt.Errorf("server root is required")
 	}
 	previous, err := os.Getwd()
 	if err != nil {
-		return nil, fmt.Errorf("get current directory before entering server home: %w", err)
+		return nil, fmt.Errorf("get current directory before entering server root: %w", err)
 	}
-	if err := os.MkdirAll(homePath, 0o700); err != nil {
-		return nil, fmt.Errorf("create server home directory %q: %w", homePath, err)
+	if err := os.MkdirAll(serverRoot, 0o700); err != nil {
+		return nil, fmt.Errorf("create server root %q: %w", serverRoot, err)
 	}
-	if err := os.Chdir(homePath); err != nil {
-		return nil, fmt.Errorf("enter server home directory %q: %w", homePath, err)
+	if err := os.Chdir(serverRoot); err != nil {
+		return nil, fmt.Errorf("enter server root %q: %w", serverRoot, err)
 	}
 	return func() error {
 		return os.Chdir(previous)
 	}, nil
 }
 
-func runServerBackgroundParentFromFlags(ctx context.Context, configPath, cwdFlag, listen, homePath string, store localserver.RegistryStore, stdout io.Writer, getwd func() (string, error), program string) (err error) {
-	lock, err := localserver.AcquireStartupLock(ctx, homePath)
+func runServerBackgroundParentFromFlags(ctx context.Context, listen, serverRoot string, store localserver.RegistryStore, stdout io.Writer, program string) (err error) {
+	lock, err := localserver.AcquireStartupLock(ctx, serverRoot)
 	if err != nil {
 		return err
 	}
@@ -1392,25 +1343,46 @@ func runServerBackgroundParentFromFlags(ctx context.Context, configPath, cwdFlag
 	if done, err := checkExistingServerRecord(ctx, store, stdout); done || err != nil {
 		return err
 	}
-	launch, err := prepareServerLaunch(configPath, cwdFlag, listen, homePath, store, getwd, program)
+	launch, err := prepareServerLaunch(listen, serverRoot, store, program)
 	if err != nil {
 		return err
 	}
 	return runServerBackgroundParent(ctx, launch, stdout)
 }
 
-func runServerForeground(ctx context.Context, launch serverLaunch, stdout io.Writer) error {
+func runServerForeground(ctx context.Context, launch serverLaunch, stdout io.Writer) (err error) {
 	store := launch.RegistryStore
+	var startupLock *localserver.StartupLock
+	if !launch.SkipStartupLock {
+		startupLock, err = localserver.AcquireStartupLock(ctx, launch.ServerRoot)
+		if err != nil {
+			return err
+		}
+	}
+	releaseStartupLock := func() {
+		if startupLock != nil {
+			err = errors.Join(err, startupLock.Release())
+			startupLock = nil
+		}
+	}
+	defer releaseStartupLock()
+
 	if done, err := checkExistingServerRecord(ctx, store, stdout); done || err != nil {
 		return err
 	}
 
+	restoreCWD, err := enterServerRoot(launch.ServerRoot)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		err = errors.Join(err, restoreCWD())
+	}()
 	token, err := localserver.GenerateRegistryToken()
 	if err != nil {
 		return err
 	}
 	process, err := localserver.Start(localserver.Options{
-		CWD:             launch.CWD,
 		Listen:          launch.Listen,
 		Version:         Version,
 		AuthToken:       token,
@@ -1422,17 +1394,8 @@ func runServerForeground(ctx context.Context, launch serverLaunch, stdout io.Wri
 	if err != nil {
 		return err
 	}
-	restoreCWD, err := enterServerHome(launch.CWD)
-	if err != nil {
-		_ = process.Shutdown(context.Background())
-		return err
-	}
-	defer func() {
-		err = errors.Join(err, restoreCWD())
-	}()
 	info := process.Info()
 	record := localserver.RegistryRecord{
-		CWD:             info.CWD,
 		BaseURL:         info.Addr,
 		PID:             info.PID,
 		Token:           token,
@@ -1444,13 +1407,14 @@ func runServerForeground(ctx context.Context, launch serverLaunch, stdout io.Wri
 		_ = process.Shutdown(context.Background())
 		return err
 	}
-	if _, err := fmt.Fprintf(stdout, "SERVER_ADDR\t%s\n", process.Addr()); err != nil {
+	releaseStartupLock()
+	if err := printServerStartStatus(stdout, "started", record); err != nil {
 		_ = process.Shutdown(context.Background())
-		_, removeErr := store.RemoveIdentity(launch.Identity)
+		_, removeErr := store.Clear()
 		return errors.Join(err, removeErr)
 	}
 	serveErr := process.Serve(ctx)
-	_, removeErr := store.RemoveIdentity(launch.Identity)
+	_, removeErr := store.Clear()
 	return errors.Join(serveErr, removeErr)
 }
 
@@ -1472,14 +1436,18 @@ func runServerBackgroundParent(ctx context.Context, launch serverLaunch, stdout 
 	if err != nil {
 		return err
 	}
-	_, err = fmt.Fprintf(stdout, "SERVER_ADDR\t%s\n", record.BaseURL)
-	return err
+	return printServerStartStatus(stdout, "started", record)
 }
 
 func startBackgroundServerAndWait(ctx context.Context, launch serverLaunch) (localserver.RegistryRecord, error) {
 	store := launch.RegistryStore
 	childArgs := backgroundServerChildArgs(launch)
-	child, err := startBackgroundServerProcess(ctx, childArgs)
+	childEnv, cleanup, err := prepareBackgroundChildAuth(launch.ServerRoot)
+	if err != nil {
+		return localserver.RegistryRecord{}, err
+	}
+	defer cleanup()
+	child, err := startBackgroundServerProcess(ctx, childArgs, childEnv)
 	if err != nil {
 		return localserver.RegistryRecord{}, err
 	}
@@ -1491,7 +1459,7 @@ func startBackgroundServerAndWait(ctx context.Context, launch serverLaunch) (loc
 		}
 	}()
 
-	record, err := waitForBackgroundServerReady(ctx, store, launch.Identity, launch.Listen, child)
+	record, err := waitForBackgroundServerReady(ctx, store, launch.Listen, child)
 	if err != nil {
 		return localserver.RegistryRecord{}, err
 	}
@@ -1501,18 +1469,80 @@ func startBackgroundServerAndWait(ctx context.Context, launch serverLaunch) (loc
 
 func backgroundServerChildArgs(launch serverLaunch) []string {
 	args := []string{
-		"--home", launch.HomePath,
+		"--server-root", launch.ServerRootPath,
 		"server",
-		"--background-child",
+		"start",
 		"--listen", launch.Listen,
-	}
-	if launch.CWDExplicit {
-		args = append(args, "--cwd", launch.CWD)
 	}
 	return args
 }
 
-func startBackgroundServerProcessDefault(ctx context.Context, args []string) (*backgroundServerProcess, error) {
+func prepareBackgroundChildAuth(serverRoot string) ([]string, func(), error) {
+	token, err := localserver.GenerateRegistryToken()
+	if err != nil {
+		return nil, nil, err
+	}
+	path, err := backgroundChildTokenPath(serverRoot)
+	if err != nil {
+		return nil, nil, err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return nil, nil, fmt.Errorf("create background child auth dir: %w", err)
+	}
+	if err := os.WriteFile(path, []byte(token+"\n"), 0o600); err != nil {
+		return nil, nil, fmt.Errorf("write background child auth token: %w", err)
+	}
+	env := []string{
+		backgroundChildTokenEnv + "=" + token,
+		backgroundChildRootEnv + "=" + serverRoot,
+	}
+	cleanup := func() {
+		_ = os.Remove(path)
+	}
+	return env, cleanup, nil
+}
+
+func backgroundChildStartupAuthorized(serverRoot string) bool {
+	token := strings.TrimSpace(os.Getenv(backgroundChildTokenEnv))
+	root := strings.TrimSpace(os.Getenv(backgroundChildRootEnv))
+	if token == "" || root == "" {
+		return false
+	}
+	expectedRoot, err := localserver.CanonicalPath(serverRoot)
+	if err != nil {
+		return false
+	}
+	actualRoot, err := localserver.CanonicalPath(root)
+	if err != nil || !sameCLIPath(expectedRoot, actualRoot) {
+		return false
+	}
+	path, err := backgroundChildTokenPath(expectedRoot)
+	if err != nil {
+		return false
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return false
+	}
+	return strings.TrimSpace(string(raw)) == token
+}
+
+func backgroundChildTokenPath(serverRoot string) (string, error) {
+	root, err := localserver.CanonicalPath(serverRoot)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(root, "server", "background-child.token"), nil
+}
+
+func sameCLIPath(left, right string) bool {
+	if runtime.GOOS == "windows" {
+		return strings.EqualFold(left, right)
+	}
+	return left == right
+}
+
+func startBackgroundServerProcessDefault(ctx context.Context, args []string, env []string) (*backgroundServerProcess, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -1533,6 +1563,9 @@ func startBackgroundServerProcessDefault(ctx context.Context, args []string) (*b
 	cmd.Stdin = files[0]
 	cmd.Stdout = files[1]
 	cmd.Stderr = files[2]
+	if len(env) > 0 {
+		cmd.Env = append(os.Environ(), env...)
+	}
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("start background server child: %w", err)
 	}
@@ -1564,7 +1597,7 @@ func closeBackgroundChildFiles(files []*os.File) {
 	}
 }
 
-func waitForBackgroundServerReady(ctx context.Context, store localserver.RegistryStore, identity localserver.RegistryIdentity, listen string, child *backgroundServerProcess) (localserver.RegistryRecord, error) {
+func waitForBackgroundServerReady(ctx context.Context, store localserver.RegistryStore, listen string, child *backgroundServerProcess) (localserver.RegistryRecord, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -1584,7 +1617,7 @@ func waitForBackgroundServerReady(ctx context.Context, store localserver.Registr
 	defer ticker.Stop()
 
 	for {
-		record, ok, err := findBackgroundReadyRecord(waitCtx, store, identity, listen)
+		record, ok, err := findBackgroundReadyRecord(waitCtx, store, listen)
 		if err != nil {
 			return localserver.RegistryRecord{}, err
 		}
@@ -1605,12 +1638,11 @@ func waitForBackgroundServerReady(ctx context.Context, store localserver.Registr
 	}
 }
 
-func findBackgroundReadyRecord(ctx context.Context, store localserver.RegistryStore, identity localserver.RegistryIdentity, listen string) (localserver.RegistryRecord, bool, error) {
+func findBackgroundReadyRecord(ctx context.Context, store localserver.RegistryStore, listen string) (localserver.RegistryRecord, bool, error) {
 	records, err := store.Load()
 	if err != nil {
 		return localserver.RegistryRecord{}, false, err
 	}
-	_ = identity
 	if len(records) == 0 {
 		return localserver.RegistryRecord{}, false, nil
 	}
@@ -1647,12 +1679,12 @@ func checkExistingServerRecord(ctx context.Context, store localserver.RegistrySt
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return false, ctxErr
 		}
-		if _, err := store.RemoveIdentity(normalized.Identity()); err != nil {
+		if _, err := store.Clear(); err != nil {
 			return false, err
 		}
 		return false, nil
 	}
-	_, err = fmt.Fprintf(stdout, "SERVER_ALREADY_RUNNING\taddr=%s\tpid=%d\n", normalized.BaseURL, normalized.PID)
+	err = printServerStartStatus(stdout, "already_running", normalized)
 	return true, err
 }
 
@@ -1709,7 +1741,7 @@ func serverConfigPath(configPath, cwd string) string {
 	return filepath.Join(cwd, configPath)
 }
 
-func projectCreateCommand(ctx context.Context, args []string, configPath, homePath string, stdout io.Writer, getwd func() (string, error), program string) error {
+func projectCreateCommand(ctx context.Context, args []string, configPath, serverRoot string, stdout io.Writer, getwd func() (string, error), program string) error {
 	displayCommand := displayProgramName(program)
 	flags := flag.NewFlagSet("sai project create", flag.ContinueOnError)
 	cwdFlag := flags.String("cwd", "", "project root")
@@ -1726,7 +1758,7 @@ func projectCreateCommand(ctx context.Context, args []string, configPath, homePa
 	if err != nil {
 		return err
 	}
-	record, err := ensureProjectCommandServer(ctx, configPath, homePath, effectiveCWD, program)
+	record, err := ensureProjectCommandServer(ctx, configPath, serverRoot, effectiveCWD, program)
 	if err != nil {
 		return err
 	}
@@ -1734,68 +1766,72 @@ func projectCreateCommand(ctx context.Context, args []string, configPath, homePa
 	if err != nil {
 		return err
 	}
-	return printProjectInfo(stdout, result.Project)
+	status := "created"
+	if !result.Created {
+		status = "existing"
+	}
+	return printProjectCommandStatus(stdout, status, result.Project)
 }
 
-func projectListCommand(ctx context.Context, args []string, configPath, homePath string, stdout io.Writer, getwd func() (string, error), program string) error {
+func projectListCommand(ctx context.Context, args []string, configPath, serverRoot string, stdout io.Writer, getwd func() (string, error), program string) error {
 	displayCommand := displayProgramName(program)
 	flags := flag.NewFlagSet("sai project list", flag.ContinueOnError)
+	archived := flags.Bool("archived", false, "list archived projects")
 	positionals, done, err := parseCommandFlagArgs(flags, args, stdout, printProjectListUsage, displayCommand, "sai help project list")
 	if done || err != nil {
 		return err
 	}
 	if len(positionals) != 0 {
-		return usageError("usage: sai project list", "", "sai help project list")
+		return usageError("usage: sai project list [--archived]", "", "sai help project list")
 	}
 
-	effectiveCWD, err := resolveClientCWD("", getwd)
+	record, err := ensureSelectedServer(ctx, serverRoot, program)
 	if err != nil {
 		return err
 	}
-	record, err := ensureProjectCommandServer(ctx, configPath, homePath, effectiveCWD, program)
-	if err != nil {
-		return err
-	}
-	projects, err := localserver.ListProjectsWithToken(ctx, record.BaseURL, record.Token, serverClientTimeout)
+	projects, err := localserver.ListProjectsWithOptions(ctx, record.BaseURL, record.Token, *archived, serverClientTimeout)
 	if err != nil {
 		return err
 	}
 	return printProjectList(stdout, projects)
 }
 
-func projectShowCommand(ctx context.Context, args []string, configPath, homePath string, stdout io.Writer, getwd func() (string, error), program string) error {
+func projectShowCommand(ctx context.Context, args []string, configPath, serverRoot string, stdout io.Writer, getwd func() (string, error), program string) error {
 	displayCommand := displayProgramName(program)
 	flags := flag.NewFlagSet("sai project show", flag.ContinueOnError)
-	projectID := flags.String("project", "", "project id")
 	positionals, done, err := parseCommandFlagArgs(flags, args, stdout, printProjectShowUsage, displayCommand, "sai help project show")
 	if done || err != nil {
 		return err
 	}
-	if len(positionals) != 0 {
-		return usageError("usage: sai project show [--project id]", "", "sai help project show")
+	if len(positionals) > 1 {
+		return usageError("usage: sai project show [project-id]", "", "sai help project show")
 	}
 
-	effectiveCWD, err := resolveClientCWD("", getwd)
-	if err != nil {
-		return err
-	}
-	record, err := ensureProjectCommandServer(ctx, configPath, homePath, effectiveCWD, program)
-	if err != nil {
-		return err
-	}
-	if strings.TrimSpace(*projectID) != "" {
-		project, err := localserver.GetProjectWithToken(ctx, record.BaseURL, record.Token, *projectID, serverClientTimeout)
+	if len(positionals) == 1 {
+		record, err := ensureSelectedServer(ctx, serverRoot, program)
+		if err != nil {
+			return err
+		}
+		project, err := localserver.GetProjectWithToken(ctx, record.BaseURL, record.Token, positionals[0], serverClientTimeout)
 		if err != nil {
 			return err
 		}
 		return printProjectInfo(stdout, project)
 	}
 
+	effectiveCWD, err := resolveClientCWD("", getwd)
+	if err != nil {
+		return err
+	}
+	record, err := ensureSelectedServer(ctx, serverRoot, program)
+	if err != nil {
+		return err
+	}
 	projects, err := localserver.ListProjectsWithToken(ctx, record.BaseURL, record.Token, serverClientTimeout)
 	if err != nil {
 		return err
 	}
-	project, ok, err := nearestProjectFromList(projects, effectiveCWD)
+	project, ok, err := nearestProjectFromList(projects, effectiveCWD, false)
 	if err != nil {
 		return err
 	}
@@ -1805,51 +1841,116 @@ func projectShowCommand(ctx context.Context, args []string, configPath, homePath
 	return printProjectInfo(stdout, project)
 }
 
-func projectRemoveCommand(ctx context.Context, args []string, configPath, homePath string, stdout io.Writer, getwd func() (string, error), program string) error {
+func projectRenameCommand(ctx context.Context, args []string, configPath, serverRoot string, stdout io.Writer, getwd func() (string, error), program string) error {
+	displayCommand := displayProgramName(program)
+	flags := flag.NewFlagSet("sai project rename", flag.ContinueOnError)
+	positionals, done, err := parseCommandFlagArgs(flags, args, stdout, printProjectRenameUsage, displayCommand, "sai help project rename")
+	if done || err != nil {
+		return err
+	}
+	if len(positionals) != 1 && len(positionals) != 2 {
+		return usageError("usage: sai project rename [project-id] <name>", "", "sai help project rename")
+	}
+	name := strings.TrimSpace(positionals[len(positionals)-1])
+	if name == "" {
+		return usageError("project display name must be a non-empty string", "", "sai help project rename")
+	}
+
+	id := ""
+	if len(positionals) == 2 {
+		id = strings.TrimSpace(positionals[0])
+	}
+	record, err := ensureSelectedServer(ctx, serverRoot, program)
+	if err != nil {
+		return err
+	}
+	if id == "" {
+		effectiveCWD, err := resolveClientCWD("", getwd)
+		if err != nil {
+			return err
+		}
+		id, err = selectProjectID(ctx, record, id, effectiveCWD, displayCommand, false)
+		if err != nil {
+			return err
+		}
+	}
+	project, err := localserver.RenameProjectWithToken(ctx, record.BaseURL, record.Token, id, name, serverClientTimeout)
+	if err != nil {
+		return err
+	}
+	return printProjectCommandStatus(stdout, "renamed", project)
+}
+
+func projectArchiveCommand(ctx context.Context, args []string, configPath, serverRoot string, stdout io.Writer, getwd func() (string, error), program string) error {
+	displayCommand := displayProgramName(program)
+	flags := flag.NewFlagSet("sai project archive", flag.ContinueOnError)
+	positionals, done, err := parseCommandFlagArgs(flags, args, stdout, printProjectArchiveUsage, displayCommand, "sai help project archive")
+	if done || err != nil {
+		return err
+	}
+	if len(positionals) > 1 {
+		return usageError("usage: sai project archive [project-id]", "", "sai help project archive")
+	}
+	id := ""
+	if len(positionals) == 1 {
+		id = strings.TrimSpace(positionals[0])
+	}
+	record, err := ensureSelectedServer(ctx, serverRoot, program)
+	if err != nil {
+		return err
+	}
+	if id == "" {
+		effectiveCWD, err := resolveClientCWD("", getwd)
+		if err != nil {
+			return err
+		}
+		id, err = selectProjectID(ctx, record, id, effectiveCWD, displayCommand, false)
+		if err != nil {
+			return err
+		}
+	}
+	project, err := localserver.ArchiveProjectWithToken(ctx, record.BaseURL, record.Token, id, serverClientTimeout)
+	if err != nil {
+		return err
+	}
+	return printProjectCommandStatus(stdout, "archived", project)
+}
+
+func projectRemoveCommand(ctx context.Context, args []string, configPath, serverRoot string, stdout io.Writer, getwd func() (string, error), program string) error {
 	displayCommand := displayProgramName(program)
 	flags := flag.NewFlagSet("sai project remove", flag.ContinueOnError)
-	projectID := flags.String("project", "", "project id")
-	deleteData := flags.Bool("delete-data", false, "delete project metadata/data")
 	positionals, done, err := parseCommandFlagArgs(flags, args, stdout, printProjectRemoveUsage, displayCommand, "sai help project remove")
 	if done || err != nil {
 		return err
 	}
-	if len(positionals) != 0 {
-		return usageError("usage: sai project remove [--project id] [--delete-data]", "", "sai help project remove")
+	if len(positionals) > 1 {
+		return usageError("usage: sai project remove [project-id]", "", "sai help project remove")
 	}
 
-	effectiveCWD, err := resolveClientCWD("", getwd)
+	id := ""
+	if len(positionals) == 1 {
+		id = strings.TrimSpace(positionals[0])
+	}
+	record, err := ensureSelectedServer(ctx, serverRoot, program)
 	if err != nil {
 		return err
 	}
-	record, err := ensureProjectCommandServer(ctx, configPath, homePath, effectiveCWD, program)
-	if err != nil {
-		return err
-	}
-	id := strings.TrimSpace(*projectID)
 	if id == "" {
-		projects, err := localserver.ListProjectsWithToken(ctx, record.BaseURL, record.Token, serverClientTimeout)
+		effectiveCWD, err := resolveClientCWD("", getwd)
 		if err != nil {
 			return err
 		}
-		project, ok, err := nearestProjectFromList(projects, effectiveCWD)
+		id, err = selectProjectID(ctx, record, id, effectiveCWD, displayCommand, true)
 		if err != nil {
 			return err
 		}
-		if !ok {
-			return fmt.Errorf("no registered project found from %s; run %q", effectiveCWD, displayCommand+" project create")
-		}
-		id = project.ID
 	}
 
-	result, err := localserver.RemoveProjectWithToken(ctx, record.BaseURL, record.Token, id, *deleteData, serverClientTimeout)
+	result, err := localserver.RemoveProjectWithToken(ctx, record.BaseURL, record.Token, id, serverClientTimeout)
 	if err != nil {
 		return err
 	}
-	if result.Deleted {
-		return printProjectRemoveStatus(stdout, result)
-	}
-	return printProjectInfo(stdout, result.Project)
+	return printProjectRemoveStatus(stdout, result)
 }
 
 func resolveProjectCreatePaths(cwdFlag string, getwd func() (string, error)) (string, string, error) {
@@ -1871,12 +1972,16 @@ func resolveProjectCreatePaths(cwdFlag string, getwd func() (string, error)) (st
 	return effectiveCWD, canonicalRoot, nil
 }
 
-func ensureProjectCommandServer(ctx context.Context, configPath, homePath, effectiveCWD, program string) (localserver.RegistryRecord, error) {
-	store, err := localserver.NewRegistryStoreForHome(homePath)
+func ensureProjectCommandServer(ctx context.Context, _ string, serverRoot, effectiveCWD, program string) (localserver.RegistryRecord, error) {
+	return ensureSelectedServer(ctx, serverRoot, program)
+}
+
+func ensureSelectedServer(ctx context.Context, serverRoot, program string) (localserver.RegistryRecord, error) {
+	store, err := localserver.NewRegistryStoreForServerRoot(serverRoot)
 	if err != nil {
 		return localserver.RegistryRecord{}, err
 	}
-	discovery, err := localserver.DiscoverHealthy(ctx, store, effectiveCWD, serverClientTimeout)
+	discovery, err := localserver.DiscoverHealthy(ctx, store, "", serverClientTimeout)
 	if err != nil {
 		return localserver.RegistryRecord{}, err
 	}
@@ -1884,15 +1989,13 @@ func ensureProjectCommandServer(ctx context.Context, configPath, homePath, effec
 		return discovery.Record, nil
 	}
 
-	return startBackgroundServerWithStartupLock(ctx, homePath, store, effectiveCWD, func() (serverLaunch, error) {
-		return prepareServerLaunch(configPath, "", localserver.DefaultListenAddress, homePath, store, func() (string, error) {
-			return effectiveCWD, nil
-		}, program)
+	return startBackgroundServerWithStartupLock(ctx, serverRoot, store, "", func() (serverLaunch, error) {
+		return prepareServerLaunch(localserver.DefaultListenAddress, serverRoot, store, program)
 	})
 }
 
-func startBackgroundServerWithStartupLock(ctx context.Context, homePath string, store localserver.RegistryStore, discoveryCWD string, prepare func() (serverLaunch, error)) (record localserver.RegistryRecord, err error) {
-	lock, err := localserver.AcquireStartupLock(ctx, homePath)
+func startBackgroundServerWithStartupLock(ctx context.Context, serverRoot string, store localserver.RegistryStore, discoveryCWD string, prepare func() (serverLaunch, error)) (record localserver.RegistryRecord, err error) {
+	lock, err := localserver.AcquireStartupLock(ctx, serverRoot)
 	if err != nil {
 		return localserver.RegistryRecord{}, err
 	}
@@ -1915,7 +2018,7 @@ func startBackgroundServerWithStartupLock(ctx context.Context, homePath string, 
 	return startBackgroundServerAndWait(ctx, launch)
 }
 
-func nearestProjectFromList(projects []localserver.ProjectInfo, cwd string) (localserver.ProjectInfo, bool, error) {
+func nearestProjectFromList(projects []localserver.ProjectInfo, cwd string, includeArchived bool) (localserver.ProjectInfo, bool, error) {
 	canonicalCWD, err := projectstore.CanonicalRoot(cwd)
 	if err != nil {
 		return localserver.ProjectInfo{}, false, err
@@ -1923,7 +2026,7 @@ func nearestProjectFromList(projects []localserver.ProjectInfo, cwd string) (loc
 	var best localserver.ProjectInfo
 	bestLen := -1
 	for _, project := range projects {
-		if strings.TrimSpace(project.Root) == "" || project.Archived {
+		if strings.TrimSpace(project.Root) == "" || (!includeArchived && project.Archived) {
 			continue
 		}
 		if !isSameOrAncestorProjectPath(project.Root, canonicalCWD) {
@@ -1963,25 +2066,32 @@ func projectPathKey(path string) string {
 }
 
 func printProjectList(stdout io.Writer, projects []localserver.ProjectInfo) error {
-	if _, err := fmt.Fprintln(stdout, "ID\tROOT\tNAME\tARCHIVED\tUPDATED"); err != nil {
+	if _, err := fmt.Fprintln(stdout, "ID\tNAME\tROOT\tARCHIVED\tCREATED_AT\tUPDATED_AT"); err != nil {
 		return err
 	}
 	for _, project := range projects {
-		if _, err := fmt.Fprintf(stdout, "%s\t%s\t%s\t%t\t%s\n", project.ID, project.Root, project.DisplayName, project.Archived, formatSessionTimestamp(project.UpdatedAt)); err != nil {
+		if _, err := fmt.Fprintf(stdout, "%s\t%s\t%s\t%t\t%s\t%s\n", project.ID, project.DisplayName, project.Root, project.Archived, formatSessionTimestamp(project.CreatedAt), formatSessionTimestamp(project.UpdatedAt)); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
+func printProjectCommandStatus(stdout io.Writer, status string, project localserver.ProjectInfo) error {
+	if _, err := fmt.Fprintf(stdout, "STATUS\t%s\n", status); err != nil {
+		return err
+	}
+	return printProjectInfo(stdout, project)
+}
+
 func printProjectInfo(stdout io.Writer, project localserver.ProjectInfo) error {
 	if _, err := fmt.Fprintf(stdout, "ID\t%s\n", project.ID); err != nil {
 		return err
 	}
-	if _, err := fmt.Fprintf(stdout, "ROOT\t%s\n", project.Root); err != nil {
+	if _, err := fmt.Fprintf(stdout, "NAME\t%s\n", project.DisplayName); err != nil {
 		return err
 	}
-	if _, err := fmt.Fprintf(stdout, "NAME\t%s\n", project.DisplayName); err != nil {
+	if _, err := fmt.Fprintf(stdout, "ROOT\t%s\n", project.Root); err != nil {
 		return err
 	}
 	if _, err := fmt.Fprintf(stdout, "ARCHIVED\t%t\n", project.Archived); err != nil {
@@ -1995,15 +2105,25 @@ func printProjectInfo(stdout io.Writer, project localserver.ProjectInfo) error {
 }
 
 func printProjectRemoveStatus(stdout io.Writer, result localserver.ProjectRemoveResult) error {
-	status := strings.TrimSpace(result.Status)
+	return printRemoveStatus(stdout, result.Status, result.ID, result.RemovedSessions, true)
+}
+
+func printRemoveStatus(stdout io.Writer, status, id string, removedSessions int, includeRemovedSessions bool) error {
+	status = strings.TrimSpace(status)
 	if status == "" {
-		status = "deleted"
+		status = "removed"
 	}
 	if _, err := fmt.Fprintf(stdout, "STATUS\t%s\n", status); err != nil {
 		return err
 	}
-	_, err := fmt.Fprintf(stdout, "ID\t%s\n", result.ID)
-	return err
+	if _, err := fmt.Fprintf(stdout, "ID\t%s\n", id); err != nil {
+		return err
+	}
+	if includeRemovedSessions {
+		_, err := fmt.Fprintf(stdout, "REMOVED_SESSIONS\t%d\n", removedSessions)
+		return err
+	}
+	return nil
 }
 
 func serverSessionDefaultsFromConfig(cfg *config.Config, cwd string) (sessions.SessionV2, error) {
@@ -2070,7 +2190,7 @@ func sessionCreateCommand(ctx context.Context, args []string, configPath, homePa
 	if err != nil {
 		return err
 	}
-	return printServerSessionDetailWithProject(stdout, session)
+	return printServerSessionCommandStatus(stdout, "created", session)
 }
 
 func sessionListCommand(ctx context.Context, args []string, configPath string, configProvided bool, homePath string, stdout io.Writer, getwd func() (string, error), program string) error {
@@ -2194,7 +2314,7 @@ func sessionRenameCommand(ctx context.Context, args []string, configPath string,
 	if err != nil {
 		return err
 	}
-	return printServerSessionDetailWithProject(stdout, session)
+	return printServerSessionCommandStatus(stdout, "renamed", session)
 }
 
 func sessionArchiveCommand(ctx context.Context, args []string, configPath string, configProvided bool, homePath string, stdout io.Writer, getwd func() (string, error), program string) error {
@@ -2223,7 +2343,36 @@ func sessionArchiveCommand(ctx context.Context, args []string, configPath string
 	if err != nil {
 		return err
 	}
-	return printServerSessionDetailWithProject(stdout, session)
+	return printServerSessionCommandStatus(stdout, "archived", session)
+}
+
+func sessionRemoveCommand(ctx context.Context, args []string, configPath string, configProvided bool, homePath string, stdout io.Writer, getwd func() (string, error), program string) error {
+	displayCommand := displayProgramName(program)
+	flags := flag.NewFlagSet("sai session remove", flag.ContinueOnError)
+	positionals, done, err := parseCommandFlagArgs(flags, args, stdout, printSessionRemoveUsage, displayCommand, "sai help session remove")
+	if done || err != nil {
+		return err
+	}
+	if err := rejectSessionConfigForExistingCommand(configProvided, "sai help session remove"); err != nil {
+		return err
+	}
+	if len(positionals) != 1 {
+		return usageError("usage: sai session remove <session-id>", "", "sai help session remove")
+	}
+	sessionID := strings.TrimSpace(positionals[0])
+	if sessionID == "" {
+		return usageError("session id must be a non-empty string", "", "sai help session remove")
+	}
+
+	record, err := ensureSessionCommandServer(ctx, configPath, homePath, program, getwd)
+	if err != nil {
+		return err
+	}
+	result, err := localserver.RemoveSessionWithToken(ctx, record.BaseURL, record.Token, sessionID, serverClientTimeout)
+	if err != nil {
+		return err
+	}
+	return printRemoveStatus(stdout, result.Status, result.ID, 0, false)
 }
 
 func nearestProject(ctx context.Context, record localserver.RegistryRecord, cwd string) (localserver.ProjectInfo, bool, error) {
@@ -2231,12 +2380,38 @@ func nearestProject(ctx context.Context, record localserver.RegistryRecord, cwd 
 	if err != nil {
 		return localserver.ProjectInfo{}, false, err
 	}
-	return nearestProjectFromList(projects, cwd)
+	return nearestProjectFromList(projects, cwd, false)
 }
 
-func createProjectSessionForCWD(ctx context.Context, configPath, homePath, creationCWD, program string) (localserver.RegistryRecord, localserver.SessionDetail, error) {
+func selectProjectID(ctx context.Context, record localserver.RegistryRecord, id, effectiveCWD, displayCommand string, includeArchived bool) (string, error) {
+	id = strings.TrimSpace(id)
+	if id != "" {
+		return id, nil
+	}
+	projects, err := localserver.ListProjectsWithOptions(ctx, record.BaseURL, record.Token, false, serverClientTimeout)
+	if err != nil {
+		return "", err
+	}
+	if includeArchived {
+		archived, err := localserver.ListProjectsWithOptions(ctx, record.BaseURL, record.Token, true, serverClientTimeout)
+		if err != nil {
+			return "", err
+		}
+		projects = append(projects, archived...)
+	}
+	project, ok, err := nearestProjectFromList(projects, effectiveCWD, includeArchived)
+	if err != nil {
+		return "", err
+	}
+	if !ok {
+		return "", fmt.Errorf("no registered project found from %s; run %q", effectiveCWD, displayCommand+" project create")
+	}
+	return project.ID, nil
+}
+
+func createProjectSessionForCWD(ctx context.Context, configPath, serverRoot, creationCWD, program string) (localserver.RegistryRecord, localserver.SessionDetail, error) {
 	displayCommand := displayProgramName(program)
-	record, err := ensureProjectCommandServer(ctx, configPath, homePath, creationCWD, program)
+	record, err := ensureProjectCommandServer(ctx, configPath, serverRoot, creationCWD, program)
 	if err != nil {
 		return localserver.RegistryRecord{}, localserver.SessionDetail{}, err
 	}
@@ -2267,28 +2442,8 @@ func createProjectSessionForCWD(ctx context.Context, configPath, homePath, creat
 	return record, session, nil
 }
 
-func ensureSessionCommandServer(ctx context.Context, configPath, homePath, program string, getwd func() (string, error)) (localserver.RegistryRecord, error) {
-	store, err := localserver.NewRegistryStoreForHome(homePath)
-	if err != nil {
-		return localserver.RegistryRecord{}, err
-	}
-	discovery, err := localserver.DiscoverHealthy(ctx, store, "", serverClientTimeout)
-	if err != nil {
-		return localserver.RegistryRecord{}, err
-	}
-	if discovery.Found {
-		return discovery.Record, nil
-	}
-
-	return startBackgroundServerWithStartupLock(ctx, homePath, store, "", func() (serverLaunch, error) {
-		effectiveCWD, err := resolveClientCWD("", getwd)
-		if err != nil {
-			return serverLaunch{}, err
-		}
-		return prepareServerLaunch(configPath, "", localserver.DefaultListenAddress, homePath, store, func() (string, error) {
-			return effectiveCWD, nil
-		}, program)
-	})
+func ensureSessionCommandServer(ctx context.Context, _ string, serverRoot, program string, _ func() (string, error)) (localserver.RegistryRecord, error) {
+	return ensureSelectedServer(ctx, serverRoot, program)
 }
 
 func sessionCreateMetadataFromDefaults(session sessions.SessionV2) localserver.SessionCreateMetadata {
@@ -2315,31 +2470,25 @@ func sessionCreateMetadataFromDefaults(session sessions.SessionV2) localserver.S
 	}
 }
 
-func statusCommand(ctx context.Context, args []string, homePath string, stdout io.Writer, getwd func() (string, error), command string) error {
-	flags := flag.NewFlagSet("sai status", flag.ContinueOnError)
-	cwdFlag := flags.String("cwd", "", "discovery working directory")
-	positionals, done, err := parseCommandFlagArgs(flags, args, stdout, printStatusUsage, command, "sai help status")
+func serverStatusCommand(ctx context.Context, args []string, serverRoot string, stdout io.Writer, command string) error {
+	flags := flag.NewFlagSet("sai server status", flag.ContinueOnError)
+	positionals, done, err := parseCommandFlagArgs(flags, args, stdout, printServerStatusUsage, command, "sai help server status")
 	if done || err != nil {
 		return err
 	}
 	if len(positionals) != 0 {
-		return usageError("usage: sai status [--cwd path]", "", "sai help status")
+		return usageError("usage: sai server status", "", "sai help server status")
 	}
-
-	cwd, err := resolveClientCWD(*cwdFlag, getwd)
+	store, err := localserver.NewRegistryStoreForServerRoot(serverRoot)
 	if err != nil {
 		return err
 	}
-	store, err := localserver.NewRegistryStoreForHome(homePath)
-	if err != nil {
-		return err
-	}
-	discovery, err := localserver.DiscoverHealthy(ctx, store, cwd, serverClientTimeout)
+	discovery, err := localserver.DiscoverHealthy(ctx, store, "", serverClientTimeout)
 	if err != nil {
 		return err
 	}
 	if !discovery.Found {
-		return noServerFoundError(cwd, command)
+		return noSelectedServerFoundError(command)
 	}
 
 	status, err := localserver.GetServerStatus(ctx, discovery.Record.BaseURL, discovery.Record.Token, serverClientTimeout)
@@ -2349,43 +2498,33 @@ func statusCommand(ctx context.Context, args []string, homePath string, stdout i
 	return printServerStatus(stdout, status)
 }
 
-func stopCommand(ctx context.Context, args []string, homePath string, stdout io.Writer, getwd func() (string, error), command string) error {
-	flags := flag.NewFlagSet("sai stop", flag.ContinueOnError)
-	cwdFlag := flags.String("cwd", "", "discovery working directory")
+func serverStopCommand(ctx context.Context, args []string, serverRoot string, stdout io.Writer, command string) error {
+	flags := flag.NewFlagSet("sai server stop", flag.ContinueOnError)
 	waitFlag := flags.Bool("wait", false, "wait for running turns to finish")
 	timeoutMSFlag := flags.Int("timeout-ms", 0, "maximum drain wait in milliseconds")
-	positionals, done, err := parseCommandFlagArgs(flags, args, stdout, printStopUsage, command, "sai help stop")
+	positionals, done, err := parseCommandFlagArgs(flags, args, stdout, printServerStopUsage, command, "sai help server stop")
 	if done || err != nil {
 		return err
 	}
 	if len(positionals) != 0 {
-		return usageError("usage: sai stop [--cwd path] [--wait] [--timeout-ms N]", "", "sai help stop")
+		return usageError("usage: sai server stop [--wait] [--timeout-ms N]", "", "sai help server stop")
 	}
 	if *timeoutMSFlag < 0 {
-		return usageError("--timeout-ms must be non-negative", "", "sai help stop")
+		return usageError("--timeout-ms must be non-negative", "", "sai help server stop")
 	}
 	if *timeoutMSFlag > 0 && !*waitFlag {
-		return usageError("--timeout-ms requires --wait", "", "sai help stop")
+		return usageError("--timeout-ms requires --wait", "", "sai help server stop")
 	}
-
-	cwd, err := resolveClientCWD(*cwdFlag, getwd)
+	store, err := localserver.NewRegistryStoreForServerRoot(serverRoot)
 	if err != nil {
 		return err
 	}
-	store, err := localserver.NewRegistryStoreForHome(homePath)
-	if err != nil {
-		return err
-	}
-	discovery, err := localserver.DiscoverHealthy(ctx, store, cwd, serverClientTimeout)
+	discovery, err := localserver.DiscoverHealthy(ctx, store, "", serverClientTimeout)
 	if err != nil {
 		return err
 	}
 	if !discovery.Found {
-		if discovery.StaleRemoved > 0 {
-			_, err := fmt.Fprintf(stdout, "SERVER_STOPPED\tstale_records_removed=%d\n", discovery.StaleRemoved)
-			return err
-		}
-		return noServerFoundError(cwd, command)
+		return noSelectedServerFoundError(command)
 	}
 
 	record := discovery.Record
@@ -2408,69 +2547,20 @@ func stopCommand(ctx context.Context, args []string, homePath string, stdout io.
 			if ctxErr := ctx.Err(); ctxErr != nil {
 				return ctxErr
 			}
-			if _, removeErr := store.RemoveIdentity(record.Identity()); removeErr != nil {
+			if _, removeErr := store.Clear(); removeErr != nil {
 				return removeErr
 			}
-			_, writeErr := fmt.Fprintf(stdout, "SERVER_STOPPED\taddr=%s\tpid=%d\n", record.BaseURL, record.PID)
-			return writeErr
+			return printServerStopStatus(stdout, record)
 		}
 		return err
 	}
 	if err := waitForServerStop(ctx, record.BaseURL); err != nil {
 		return err
 	}
-	if _, err := store.RemoveIdentity(record.Identity()); err != nil {
+	if _, err := store.Clear(); err != nil {
 		return err
 	}
-	_, err = fmt.Fprintf(stdout, "SERVER_STOPPED\taddr=%s\tpid=%d\n", record.BaseURL, record.PID)
-	return err
-}
-
-func serversListCommand(ctx context.Context, args []string, homePath string, stdout io.Writer, command string) error {
-	flags := flag.NewFlagSet("sai servers list", flag.ContinueOnError)
-	positionals, done, err := parseCommandFlagArgs(flags, args, stdout, printServersListUsage, command, "sai help servers list")
-	if done || err != nil {
-		return err
-	}
-	if len(positionals) != 0 {
-		return usageError("usage: sai servers list", "", "sai help servers list")
-	}
-
-	store, err := localserver.NewRegistryStoreForHome(homePath)
-	if err != nil {
-		return err
-	}
-	records, err := store.List()
-	if err != nil {
-		return err
-	}
-	if _, err := fmt.Fprintln(stdout, "cwd\taddr\tpid\tversion\thealth"); err != nil {
-		return err
-	}
-
-	stale := make([]localserver.RegistryIdentity, 0)
-	for i, record := range records {
-		normalized, err := localserver.CanonicalizeRegistryRecord(record)
-		if err != nil {
-			return fmt.Errorf("canonicalize registry record %d: %w", i, err)
-		}
-		if err := localserver.CheckHealth(ctx, normalized.BaseURL, serverListHealthTimeout); err != nil {
-			if ctxErr := ctx.Err(); ctxErr != nil {
-				return ctxErr
-			}
-			stale = append(stale, normalized.Identity())
-			continue
-		}
-		if _, err := fmt.Fprintf(stdout, "%s\t%s\t%d\t%s\thealthy\n", normalized.CWD, normalized.BaseURL, normalized.PID, normalized.Version); err != nil {
-			return err
-		}
-	}
-	for _, identity := range stale {
-		if _, err := store.RemoveIdentity(identity); err != nil {
-			return err
-		}
-	}
-	return nil
+	return printServerStopStatus(stdout, record)
 }
 
 func attachCommand(ctx context.Context, args []string, configPath string, configProvided bool, homePath string, stdin io.Reader, stdout, stderr io.Writer, getwd func() (string, error), program string) error {
@@ -2510,7 +2600,7 @@ func attachCommand(ctx context.Context, args []string, configPath string, config
 		}
 	} else if len(positionals) == 1 {
 		var err error
-		record, _, err = discoverClientServer(ctx, *cwdFlag, homePath, getwd, displayCommand)
+		record, err = ensureSelectedServer(ctx, homePath, program)
 		if err != nil {
 			return err
 		}
@@ -2838,7 +2928,7 @@ func sendCommand(ctx context.Context, args []string, configPath string, configPr
 	} else {
 		var err error
 		if len(positionals) == 1 {
-			record, _, err = discoverClientServer(ctx, *cwdFlag, homePath, getwd, displayCommand)
+			record, err = ensureSelectedServer(ctx, homePath, program)
 			if err != nil {
 				return err
 			}
@@ -2887,7 +2977,7 @@ func discoverClientServer(ctx context.Context, cwdFlag, homePath string, getwd f
 	if err != nil {
 		return localserver.RegistryRecord{}, "", err
 	}
-	store, err := localserver.NewRegistryStoreForHome(homePath)
+	store, err := localserver.NewRegistryStoreForServerRoot(homePath)
 	if err != nil {
 		return localserver.RegistryRecord{}, "", err
 	}
@@ -2925,14 +3015,52 @@ func resolveClientCWD(cwdFlag string, getwd func() (string, error)) (string, err
 
 func noServerFoundError(cwd, command string) error {
 	command = displayProgramName(command)
-	return fmt.Errorf("no healthy %s server found from %s; start one with %q", command, cwd, command+" server")
+	return fmt.Errorf("no healthy %s server found from %s; start one with %q", command, cwd, command+" server start")
+}
+
+func noSelectedServerFoundError(command string) error {
+	command = displayProgramName(command)
+	return fmt.Errorf("no healthy %s server found; start one with %q", command, command+" server start")
+}
+
+func printServerStartStatus(stdout io.Writer, status string, record localserver.RegistryRecord) error {
+	var out strings.Builder
+	fmt.Fprintf(&out, "STATUS\t%s\n", status)
+	fmt.Fprintf(&out, "ADDR\t%s\n", record.BaseURL)
+	fmt.Fprintf(&out, "PID\t%d\n", record.PID)
+	_, err := io.WriteString(stdout, out.String())
+	return err
+}
+
+func printServerStopStatus(stdout io.Writer, record localserver.RegistryRecord) error {
+	var out strings.Builder
+	fmt.Fprintln(&out, "STATUS\tstopped")
+	fmt.Fprintf(&out, "ADDR\t%s\n", record.BaseURL)
+	fmt.Fprintf(&out, "PID\t%d\n", record.PID)
+	_, err := io.WriteString(stdout, out.String())
+	return err
 }
 
 func printServerStatus(stdout io.Writer, status localserver.ServerStatus) error {
-	if _, err := fmt.Fprintln(stdout, "cwd\taddr\tpid\tversion\tsession_count\trunning_turns\tuptime_seconds"); err != nil {
+	if _, err := fmt.Fprintln(stdout, "STATUS\trunning"); err != nil {
 		return err
 	}
-	_, err := fmt.Fprintf(stdout, "%s\t%s\t%d\t%s\t%d\t%d\t%d\n", status.CWD, status.Addr, status.PID, status.Version, status.SessionCount, status.RunningTurns, status.UptimeSeconds)
+	if _, err := fmt.Fprintf(stdout, "ADDR\t%s\n", status.Addr); err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintf(stdout, "PID\t%d\n", status.PID); err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintf(stdout, "VERSION\t%s\n", status.Version); err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintf(stdout, "SESSION_COUNT\t%d\n", status.SessionCount); err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintf(stdout, "RUNNING_TURNS\t%d\n", status.RunningTurns); err != nil {
+		return err
+	}
+	_, err := fmt.Fprintf(stdout, "UPTIME_SECONDS\t%d\n", status.UptimeSeconds)
 	return err
 }
 
@@ -3542,18 +3670,47 @@ func printServerSessionDetailWithProject(stdout io.Writer, session localserver.S
 	return printServerSessionDetailFields(stdout, session, true)
 }
 
-func printServerSessionDetailFields(stdout io.Writer, session localserver.SessionDetail, includeProject bool) error {
-	fmt.Fprintln(stdout, "WARNING: server-owned session storage can contain full sensitive content, including prompts, assistant output, and tool results.")
-	fmt.Fprintln(stdout, "This command prints metadata only; messages and tool result content are not shown.")
-	fmt.Fprintf(stdout, "ID\t%s\n", session.ID)
-	fmt.Fprintf(stdout, "CREATED\t%s\n", formatSessionTimestamp(session.CreatedAt))
-	fmt.Fprintf(stdout, "UPDATED\t%s\n", formatSessionTimestamp(session.UpdatedAt))
+func printServerSessionCommandStatus(stdout io.Writer, status string, session localserver.SessionDetail) error {
+	if _, err := fmt.Fprintf(stdout, "STATUS\t%s\n", status); err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintf(stdout, "ID\t%s\n", session.ID); err != nil {
+		return err
+	}
+	if strings.TrimSpace(session.ProjectID) != "" {
+		if _, err := fmt.Fprintf(stdout, "PROJECT_ID\t%s\n", session.ProjectID); err != nil {
+			return err
+		}
+	}
+	if _, err := fmt.Fprintf(stdout, "NAME\t%s\n", session.DisplayName); err != nil {
+		return err
+	}
+	if strings.TrimSpace(session.CreatedCWD) != "" {
+		if _, err := fmt.Fprintf(stdout, "CREATED_CWD\t%s\n", session.CreatedCWD); err != nil {
+			return err
+		}
+	}
+	if _, err := fmt.Fprintf(stdout, "ARCHIVED\t%t\n", session.Archived); err != nil {
+		return err
+	}
 	lastUsedAt := session.LastUsedAt
 	if lastUsedAt.IsZero() {
 		lastUsedAt = session.UpdatedAt
 	}
-	fmt.Fprintf(stdout, "LAST_USED\t%s\n", formatSessionTimestamp(lastUsedAt))
-	fmt.Fprintf(stdout, "DISPLAY_NAME\t%s\n", session.DisplayName)
+	_, err := fmt.Fprintf(stdout, "LAST_USED_AT\t%s\n", formatSessionTimestamp(lastUsedAt))
+	return err
+}
+
+func printServerSessionDetailFields(stdout io.Writer, session localserver.SessionDetail, includeProject bool) error {
+	fmt.Fprintf(stdout, "ID\t%s\n", session.ID)
+	fmt.Fprintf(stdout, "CREATED_AT\t%s\n", formatSessionTimestamp(session.CreatedAt))
+	fmt.Fprintf(stdout, "UPDATED_AT\t%s\n", formatSessionTimestamp(session.UpdatedAt))
+	lastUsedAt := session.LastUsedAt
+	if lastUsedAt.IsZero() {
+		lastUsedAt = session.UpdatedAt
+	}
+	fmt.Fprintf(stdout, "LAST_USED_AT\t%s\n", formatSessionTimestamp(lastUsedAt))
+	fmt.Fprintf(stdout, "NAME\t%s\n", session.DisplayName)
 	fmt.Fprintf(stdout, "ARCHIVED\t%t\n", session.Archived)
 	fmt.Fprintf(stdout, "PROVIDER\t%s\n", session.Provider)
 	fmt.Fprintf(stdout, "MODEL_PROFILE\t%s\n", session.ModelProfile)
@@ -3566,7 +3723,6 @@ func printServerSessionDetailFields(stdout io.Writer, session localserver.Sessio
 	if includeProject && strings.TrimSpace(session.CreatedCWD) != "" {
 		fmt.Fprintf(stdout, "CREATED_CWD\t%s\n", session.CreatedCWD)
 	}
-	fmt.Fprintf(stdout, "CWD\t%s\n", session.CWD)
 	fmt.Fprintf(stdout, "CONFIG_PATH\t%s\n", session.ConfigPath)
 	fmt.Fprintf(stdout, "ENABLED_TOOLS\t%s\n", formatSessionStringList(session.EnabledTools))
 	fmt.Fprintf(stdout, "ENABLED_MCP\t%s\n", formatSessionStringList(session.EnabledMCP))
@@ -3587,7 +3743,7 @@ func printServerSessionDetailFields(stdout io.Writer, session localserver.Sessio
 }
 
 func printServerSessionList(stdout io.Writer, infos []localserver.SessionMetadata) error {
-	if _, err := fmt.Fprintln(stdout, "ID\tLAST_USED\tPROVIDER\tMODEL/PROFILE"); err != nil {
+	if _, err := fmt.Fprintln(stdout, "ID\tPROJECT_ID\tNAME\tCREATED_CWD\tARCHIVED\tLAST_USED_AT"); err != nil {
 		return err
 	}
 	for _, info := range infos {
@@ -3595,7 +3751,7 @@ func printServerSessionList(stdout io.Writer, infos []localserver.SessionMetadat
 		if lastUsedAt.IsZero() {
 			lastUsedAt = info.UpdatedAt
 		}
-		if _, err := fmt.Fprintf(stdout, "%s\t%s\t%s\t%s/%s\n", info.ID, formatSessionTimestamp(lastUsedAt), info.Provider, info.ModelID, info.ModelProfile); err != nil {
+		if _, err := fmt.Fprintf(stdout, "%s\t%s\t%s\t%s\t%t\t%s\n", info.ID, info.ProjectID, info.DisplayName, info.CreatedCWD, info.Archived, formatSessionTimestamp(lastUsedAt)); err != nil {
 			return err
 		}
 	}

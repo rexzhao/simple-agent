@@ -975,7 +975,7 @@ func TestVersionCommand(t *testing.T) {
 
 func TestCustomProgramBasenameInHelpVersionAndUsageError(t *testing.T) {
 	program := filepath.Join(t.TempDir(), "custom-agent.exe")
-	home := t.TempDir()
+	serverRoot := t.TempDir()
 	getwd := func() (string, error) {
 		return "", errors.New("getwd should not be called")
 	}
@@ -987,16 +987,16 @@ func TestCustomProgramBasenameInHelpVersionAndUsageError(t *testing.T) {
 	}{
 		{
 			name: "root help",
-			args: []string{"--home", home, "help"},
+			args: []string{"--server-root", serverRoot, "help"},
 			wants: []string{
-				"usage: custom-agent.exe [--home dir]",
+				"usage: custom-agent.exe [--server-root dir]",
 				"With no command, custom-agent.exe defaults to attach.",
 				`Run "custom-agent.exe help <command>" for command usage.`,
 			},
 		},
 		{
 			name:  "nested help",
-			args:  []string{"--home", home, "help", "project", "create"},
+			args:  []string{"--server-root", serverRoot, "help", "project", "create"},
 			wants: []string{"usage: custom-agent.exe project create [--cwd path] [--name name]"},
 		},
 	} {
@@ -1021,7 +1021,7 @@ func TestCustomProgramBasenameInHelpVersionAndUsageError(t *testing.T) {
 
 	t.Run("version", func(t *testing.T) {
 		var stdout, stderr bytes.Buffer
-		code := RunWithProgramGetwd(program, []string{"--home", home, "version"}, &stdout, &stderr, getwd)
+		code := RunWithProgramGetwd(program, []string{"--server-root", serverRoot, "version"}, &stdout, &stderr, getwd)
 		if code != 0 {
 			t.Fatalf("RunWithProgramGetwd(version) code = %d, stderr = %s", code, stderr.String())
 		}
@@ -1035,7 +1035,7 @@ func TestCustomProgramBasenameInHelpVersionAndUsageError(t *testing.T) {
 
 	t.Run("usage error", func(t *testing.T) {
 		var stdout, stderr bytes.Buffer
-		code := RunWithProgramGetwd(program, []string{"--home", home, "nope"}, &stdout, &stderr, getwd)
+		code := RunWithProgramGetwd(program, []string{"--server-root", serverRoot, "nope"}, &stdout, &stderr, getwd)
 		if code != 1 {
 			t.Fatalf("RunWithProgramGetwd(unknown) code = %d, want 1", code)
 		}
@@ -1048,7 +1048,7 @@ func TestCustomProgramBasenameInHelpVersionAndUsageError(t *testing.T) {
 
 	t.Run("dynamic command named sai", func(t *testing.T) {
 		var stdout, stderr bytes.Buffer
-		code := RunWithProgramGetwd(program, []string{"--home", home, "sai"}, &stdout, &stderr, getwd)
+		code := RunWithProgramGetwd(program, []string{"--server-root", serverRoot, "sai"}, &stdout, &stderr, getwd)
 		if code != 1 {
 			t.Fatalf("RunWithProgramGetwd(unknown sai) code = %d, want 1", code)
 		}
@@ -1062,7 +1062,7 @@ func TestCustomProgramBasenameInHelpVersionAndUsageError(t *testing.T) {
 
 func TestCustomProgramBasenameInProjectGuidanceError(t *testing.T) {
 	program := filepath.Join(t.TempDir(), "custom-agent.exe")
-	home := t.TempDir()
+	serverRoot := t.TempDir()
 	projectDir := t.TempDir()
 	projectsCalled := make(chan struct{}, 1)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1077,10 +1077,10 @@ func TestCustomProgramBasenameInProjectGuidanceError(t *testing.T) {
 		}
 	}))
 	defer server.Close()
-	registerCLIFakeServerInHome(t, home, projectDir, server.URL, "registry-token")
+	registerCLIFakeServerInHome(t, serverRoot, projectDir, server.URL, "registry-token")
 
 	var stdout, stderr bytes.Buffer
-	code := RunWithProgramGetwd(program, []string{"--home", home, "session", "create"}, &stdout, &stderr, func() (string, error) {
+	code := RunWithProgramGetwd(program, []string{"--server-root", serverRoot, "session", "create"}, &stdout, &stderr, func() (string, error) {
 		return projectDir, nil
 	})
 
@@ -1133,9 +1133,14 @@ func TestRootHelpWritesUsageWithoutConfig(t *testing.T) {
 				t.Fatalf("RunWithGetwd(%v) code = %d, stderr = %s", args, code, stderr.String())
 			}
 			out := stdout.String()
-			for _, want := range []string{"usage: sai", "attach            Attach to a server-owned session", "server            Start a local HTTP server", "project           Manage registered projects", "status            Show nearest server status", "stop              Stop nearest server", "servers list", "send              Send one prompt", "config show", "models list", "doctor", "tools list", "sessions", "With no command, sai defaults to attach.", `Run "sai help <command>" for command usage.`} {
+			for _, want := range []string{"usage: sai", "attach            Attach to a server-owned session", "server            Manage the selected local HTTP server", "project           Manage registered projects", "session           Manage explicit sessions", "send              Send one prompt", "config show", "models list", "doctor", "tools list", "With no command, sai defaults to attach.", `Run "sai help <command>" for command usage.`} {
 				if !strings.Contains(out, want) {
 					t.Fatalf("stdout = %q, want contain %q", out, want)
+				}
+			}
+			for _, omit := range []string{"status            Show nearest server status", "stop              Stop nearest server", "servers list", "sessions           Alias"} {
+				if strings.Contains(out, omit) {
+					t.Fatalf("root help still lists removed command %q:\n%s", omit, out)
 				}
 			}
 			if strings.Contains(out, "chat") {
@@ -1220,24 +1225,22 @@ func TestServerHelpWritesUsageWithoutConfig(t *testing.T) {
 		{"help", "server"},
 	} {
 		t.Run(strings.Join(args, " "), func(t *testing.T) {
-			assertCLIHelpWithoutConfig(t, args, "usage: sai server", "--background", "--cwd path", "--port N | --listen host:port")
+			assertCLIHelpWithoutConfig(t, args, "usage: sai server <command>", "server start", "server status", "server stop")
 		})
 	}
 }
 
-func TestLifecycleHelpWritesUsageWithoutConfig(t *testing.T) {
+func TestServerLifecycleHelpWritesUsageWithoutConfig(t *testing.T) {
 	for _, tt := range []struct {
 		args  []string
 		wants []string
 	}{
-		{args: []string{"status", "-h"}, wants: []string{"usage: sai status", "--cwd path"}},
-		{args: []string{"help", "status"}, wants: []string{"usage: sai status", "--cwd path"}},
-		{args: []string{"stop", "-h"}, wants: []string{"usage: sai stop", "--cwd path", "not deleted"}},
-		{args: []string{"help", "stop"}, wants: []string{"usage: sai stop", "--cwd path", "not deleted"}},
-		{args: []string{"servers", "-h"}, wants: []string{"usage: sai servers <command>", "servers list"}},
-		{args: []string{"help", "servers"}, wants: []string{"usage: sai servers <command>", "servers list"}},
-		{args: []string{"servers", "list", "-h"}, wants: []string{"usage: sai servers list", "Stale records are removed"}},
-		{args: []string{"help", "servers", "list"}, wants: []string{"usage: sai servers list", "Stale records are removed"}},
+		{args: []string{"server", "start", "-h"}, wants: []string{"usage: sai server start", "--background", "--port N", "--listen host:port"}},
+		{args: []string{"help", "server", "start"}, wants: []string{"usage: sai server start", "--background", "--port N", "--listen host:port"}},
+		{args: []string{"server", "status", "-h"}, wants: []string{"usage: sai server status", "does not auto-start"}},
+		{args: []string{"help", "server", "status"}, wants: []string{"usage: sai server status", "does not auto-start"}},
+		{args: []string{"server", "stop", "-h"}, wants: []string{"usage: sai server stop", "--wait", "--timeout-ms N"}},
+		{args: []string{"help", "server", "stop"}, wants: []string{"usage: sai server stop", "--wait", "--timeout-ms N"}},
 	} {
 		t.Run(strings.Join(tt.args, " "), func(t *testing.T) {
 			assertCLIHelpWithoutConfig(t, tt.args, tt.wants...)
@@ -1250,16 +1253,20 @@ func TestProjectHelpWritesUsageWithoutConfig(t *testing.T) {
 		args  []string
 		wants []string
 	}{
-		{args: []string{"project", "-h"}, wants: []string{"usage: sai project <command>", "project create", "project list", "project show", "project remove"}},
-		{args: []string{"help", "project"}, wants: []string{"usage: sai project <command>", "project create", "project list", "project show", "project remove"}},
+		{args: []string{"project", "-h"}, wants: []string{"usage: sai project <command>", "project create", "project list", "project show", "project rename", "project archive", "project remove"}},
+		{args: []string{"help", "project"}, wants: []string{"usage: sai project <command>", "project create", "project list", "project show", "project rename", "project archive", "project remove"}},
 		{args: []string{"project", "create", "-h"}, wants: []string{"usage: sai project create", "--cwd path", "--name name"}},
 		{args: []string{"help", "project", "create"}, wants: []string{"usage: sai project create", "--cwd path", "--name name"}},
-		{args: []string{"project", "list", "-h"}, wants: []string{"usage: sai project list", "Lists registered projects"}},
-		{args: []string{"help", "project", "list"}, wants: []string{"usage: sai project list", "Lists registered projects"}},
-		{args: []string{"project", "show", "-h"}, wants: []string{"usage: sai project show", "--project id", "nearest registered ancestor"}},
-		{args: []string{"help", "project", "show"}, wants: []string{"usage: sai project show", "--project id", "nearest registered ancestor"}},
-		{args: []string{"project", "remove", "-h"}, wants: []string{"usage: sai project remove", "--project id", "--delete-data"}},
-		{args: []string{"help", "project", "remove"}, wants: []string{"usage: sai project remove", "--project id", "--delete-data"}},
+		{args: []string{"project", "list", "-h"}, wants: []string{"usage: sai project list [--archived]", "Lists active registered projects"}},
+		{args: []string{"help", "project", "list"}, wants: []string{"usage: sai project list [--archived]", "Lists active registered projects"}},
+		{args: []string{"project", "show", "-h"}, wants: []string{"usage: sai project show [project-id]", "nearest registered ancestor"}},
+		{args: []string{"help", "project", "show"}, wants: []string{"usage: sai project show [project-id]", "nearest registered ancestor"}},
+		{args: []string{"project", "rename", "-h"}, wants: []string{"usage: sai project rename [project-id] <name>", "Renames an active project"}},
+		{args: []string{"help", "project", "rename"}, wants: []string{"usage: sai project rename [project-id] <name>", "Renames an active project"}},
+		{args: []string{"project", "archive", "-h"}, wants: []string{"usage: sai project archive [project-id]", "Archives an active project"}},
+		{args: []string{"help", "project", "archive"}, wants: []string{"usage: sai project archive [project-id]", "Archives an active project"}},
+		{args: []string{"project", "remove", "-h"}, wants: []string{"usage: sai project remove [project-id]", "Removes an archived project"}},
+		{args: []string{"help", "project", "remove"}, wants: []string{"usage: sai project remove [project-id]", "Removes an archived project"}},
 	} {
 		t.Run(strings.Join(tt.args, " "), func(t *testing.T) {
 			var stdout, stderr bytes.Buffer
@@ -1278,11 +1285,6 @@ func TestProjectHelpWritesUsageWithoutConfig(t *testing.T) {
 					t.Fatalf("stdout = %q, want contain %q", out, want)
 				}
 			}
-			if strings.Contains(out, "remove") {
-				if !strings.Contains(strings.Join(tt.wants, " "), "remove") {
-					t.Fatalf("project help mentioned unexpected remove:\n%s", out)
-				}
-			}
 		})
 	}
 }
@@ -1295,12 +1297,12 @@ func TestSessionHelpWritesUsageWithoutConfig(t *testing.T) {
 	}{
 		{
 			args:  []string{"session", "-h"},
-			wants: []string{"usage: sai session <command>", "session create", "session list", "session show", "session rename", "session archive"},
+			wants: []string{"usage: sai session <command>", "session create", "session list", "session show", "session rename", "session archive", "session remove"},
 			omits: []string{"session config", "session update", "session mutate", "session set"},
 		},
 		{
 			args:  []string{"help", "session"},
-			wants: []string{"usage: sai session <command>", "session create", "session list", "session show", "session rename", "session archive"},
+			wants: []string{"usage: sai session <command>", "session create", "session list", "session show", "session rename", "session archive", "session remove"},
 			omits: []string{"session config", "session update", "session mutate", "session set"},
 		},
 		{args: []string{"session", "create", "-h"}, wants: []string{"usage: sai session create", "--cwd path"}},
@@ -1313,6 +1315,8 @@ func TestSessionHelpWritesUsageWithoutConfig(t *testing.T) {
 		{args: []string{"help", "session", "rename"}, wants: []string{"usage: sai session rename <session-id> <name>", "display name"}},
 		{args: []string{"session", "archive", "-h"}, wants: []string{"usage: sai session archive <session-id>", "Archives a session"}},
 		{args: []string{"help", "session", "archive"}, wants: []string{"usage: sai session archive <session-id>", "Archives a session"}},
+		{args: []string{"session", "remove", "-h"}, wants: []string{"usage: sai session remove <session-id>", "Removes an archived session"}},
+		{args: []string{"help", "session", "remove"}, wants: []string{"usage: sai session remove <session-id>", "Removes an archived session"}},
 	} {
 		t.Run(strings.Join(tt.args, " "), func(t *testing.T) {
 			out := assertCLIHelpWithoutConfig(t, tt.args, tt.wants...)
@@ -1533,18 +1537,18 @@ func TestProjectListAndShowUseProjectAPI(t *testing.T) {
 		t.Fatalf("project list code = %d, stderr = %s", code, stderr.String())
 	}
 	assertCLIOutputContains(t, stdout.String(),
-		"ID\tROOT\tNAME\tARCHIVED\tUPDATED\n",
-		"project-parent\t"+parentRoot+"\tParent\tfalse\t2026-07-04T03:01:00Z\n",
-		"project-child\t"+childRoot+"\tChild\tfalse\t2026-07-04T03:01:00Z\n",
+		"ID\tNAME\tROOT\tARCHIVED\tCREATED_AT\tUPDATED_AT\n",
+		"project-parent\tParent\t"+parentRoot+"\tfalse\t2026-07-04T03:00:00Z\t2026-07-04T03:01:00Z\n",
+		"project-child\tChild\t"+childRoot+"\tfalse\t2026-07-04T03:00:00Z\t2026-07-04T03:01:00Z\n",
 	)
 
 	stdout.Reset()
 	stderr.Reset()
-	code = RunWithGetwd([]string{"project", "show", "--project", "project-child"}, &stdout, &stderr, func() (string, error) {
+	code = RunWithGetwd([]string{"project", "show", "project-child"}, &stdout, &stderr, func() (string, error) {
 		return leafDir, nil
 	})
 	if code != 0 {
-		t.Fatalf("project show --project code = %d, stderr = %s", code, stderr.String())
+		t.Fatalf("project show project-child code = %d, stderr = %s", code, stderr.String())
 	}
 	assertCLIOutputContains(t, stdout.String(), "ID\tproject-child\n", "ROOT\t"+childRoot+"\n", "NAME\tChild\n")
 
@@ -1584,6 +1588,132 @@ func TestProjectListAndShowUseProjectAPI(t *testing.T) {
 	}
 }
 
+func TestProjectExplicitSelectorsDoNotRequireCWDDiscovery(t *testing.T) {
+	registryPath := isolateCLIUserRegistry(t)
+	projectDir := t.TempDir()
+	root, err := projectstore.CanonicalRoot(projectDir)
+	if err != nil {
+		t.Fatalf("CanonicalRoot(projectDir) error = %v", err)
+	}
+	createdAt := time.Date(2026, 7, 4, 3, 10, 0, 0, time.UTC)
+	updatedAt := time.Date(2026, 7, 4, 3, 11, 0, 0, time.UTC)
+
+	calls := make(chan string, 5)
+	projectBody := func(displayName string, archived bool) map[string]any {
+		return map[string]any{
+			"id":           "project-explicit",
+			"root":         root,
+			"display_name": displayName,
+			"archived":     archived,
+			"created_at":   createdAt,
+			"updated_at":   updatedAt,
+		}
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/health":
+			writeCLIJSON(w, http.StatusOK, map[string]any{"status": "ok"})
+		case r.URL.Path == "/projects" && r.Method == http.MethodGet:
+			calls <- "list"
+			writeCLIJSON(w, http.StatusOK, map[string]any{
+				"projects": []map[string]any{projectBody("Explicit Project", false)},
+			})
+		case r.URL.Path == "/projects/project-explicit" && r.Method == http.MethodGet:
+			calls <- "show"
+			writeCLIJSON(w, http.StatusOK, projectBody("Explicit Project", false))
+		case r.URL.Path == "/projects/project-explicit" && r.Method == http.MethodPatch:
+			data, err := io.ReadAll(r.Body)
+			if err != nil {
+				t.Fatalf("ReadAll(project patch body) error = %v", err)
+			}
+			body := decodeCLIJSON(t, data)
+			if body["display_name"] == "Renamed Project" {
+				calls <- "rename"
+				writeCLIJSON(w, http.StatusOK, projectBody("Renamed Project", false))
+				return
+			}
+			if body["archived"] == true {
+				calls <- "archive"
+				writeCLIJSON(w, http.StatusOK, projectBody("Explicit Project", true))
+				return
+			}
+			t.Fatalf("unexpected project patch body %#v", body)
+		case r.URL.Path == "/projects/project-explicit" && r.Method == http.MethodDelete:
+			calls <- "remove"
+			writeCLIJSON(w, http.StatusOK, map[string]any{
+				"status":           "removed",
+				"id":               "project-explicit",
+				"removed_sessions": 4,
+			})
+		default:
+			t.Fatalf("unexpected path %s %q", r.Method, r.URL.String())
+		}
+	}))
+	defer server.Close()
+	registerCLIFakeServer(t, registryPath, projectDir, server.URL, "registry-token")
+
+	tests := []struct {
+		name     string
+		args     []string
+		wantCall string
+		wants    []string
+	}{
+		{
+			name:     "list",
+			args:     []string{"project", "list"},
+			wantCall: "list",
+			wants:    []string{"ID\tNAME\tROOT\tARCHIVED\tCREATED_AT\tUPDATED_AT", "project-explicit\tExplicit Project\t" + root},
+		},
+		{
+			name:     "show",
+			args:     []string{"project", "show", "project-explicit"},
+			wantCall: "show",
+			wants:    []string{"ID\tproject-explicit", "NAME\tExplicit Project", "ROOT\t" + root},
+		},
+		{
+			name:     "rename",
+			args:     []string{"project", "rename", "project-explicit", "Renamed Project"},
+			wantCall: "rename",
+			wants:    []string{"STATUS\trenamed", "ID\tproject-explicit", "NAME\tRenamed Project"},
+		},
+		{
+			name:     "archive",
+			args:     []string{"project", "archive", "project-explicit"},
+			wantCall: "archive",
+			wants:    []string{"STATUS\tarchived", "ID\tproject-explicit"},
+		},
+		{
+			name:     "remove",
+			args:     []string{"project", "remove", "project-explicit"},
+			wantCall: "remove",
+			wants:    []string{"STATUS\tremoved", "ID\tproject-explicit", "REMOVED_SESSIONS\t4"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			code := RunWithGetwd(tt.args, &stdout, &stderr, func() (string, error) {
+				return "", errors.New("getwd should not be called")
+			})
+			if code != 0 {
+				t.Fatalf("RunWithGetwd(%v) code = %d, stderr = %s", tt.args, code, stderr.String())
+			}
+			select {
+			case got := <-calls:
+				if got != tt.wantCall {
+					t.Fatalf("server call = %q, want %q", got, tt.wantCall)
+				}
+			default:
+				t.Fatalf("server call %q was not made", tt.wantCall)
+			}
+			assertCLIOutputContains(t, stdout.String(), tt.wants...)
+			if stderr.String() != "" {
+				t.Fatalf("stderr = %q, want empty", stderr.String())
+			}
+		})
+	}
+}
+
 func TestProjectShowRejectsCWD(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	code := RunWithGetwd([]string{"project", "show", "--cwd", t.TempDir()}, &stdout, &stderr, func() (string, error) {
@@ -1618,7 +1748,7 @@ func TestProjectRemoveUsesNearestProjectAPI(t *testing.T) {
 	createdAt := time.Date(2026, 7, 4, 3, 30, 0, 0, time.UTC)
 	updatedAt := time.Date(2026, 7, 4, 3, 31, 0, 0, time.UTC)
 
-	listAuthSeen := make(chan string, 1)
+	listAuthSeen := make(chan string, 2)
 	deleteAuthSeen := make(chan string, 1)
 	deleteQuerySeen := make(chan string, 1)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1651,12 +1781,9 @@ func TestProjectRemoveUsesNearestProjectAPI(t *testing.T) {
 			deleteAuthSeen <- r.Header.Get("Authorization")
 			deleteQuerySeen <- r.URL.RawQuery
 			writeCLIJSON(w, http.StatusOK, map[string]any{
-				"id":           "project-child",
-				"root":         childRoot,
-				"display_name": "Child",
-				"archived":     true,
-				"created_at":   createdAt,
-				"updated_at":   updatedAt,
+				"status":           "removed",
+				"id":               "project-child",
+				"removed_sessions": 2,
 			})
 		default:
 			t.Fatalf("unexpected path %s %q", r.Method, r.URL.String())
@@ -1676,10 +1803,9 @@ func TestProjectRemoveUsesNearestProjectAPI(t *testing.T) {
 		t.Fatalf("stderr = %q, want empty", stderr.String())
 	}
 	assertCLIOutputContains(t, stdout.String(),
+		"STATUS\tremoved\n",
 		"ID\tproject-child\n",
-		"ROOT\t"+childRoot+"\n",
-		"NAME\tChild\n",
-		"ARCHIVED\ttrue\n",
+		"REMOVED_SESSIONS\t2\n",
 	)
 	select {
 	case got := <-listAuthSeen:
@@ -1702,7 +1828,7 @@ func TestProjectRemoveUsesNearestProjectAPI(t *testing.T) {
 	}
 }
 
-func TestProjectRemoveWithProjectAndDeleteData(t *testing.T) {
+func TestProjectRemoveWithExplicitProjectID(t *testing.T) {
 	registryPath := isolateCLIUserRegistry(t)
 	projectDir := t.TempDir()
 
@@ -1716,8 +1842,9 @@ func TestProjectRemoveWithProjectAndDeleteData(t *testing.T) {
 			authSeen <- r.Header.Get("Authorization")
 			querySeen <- r.URL.RawQuery
 			writeCLIJSON(w, http.StatusOK, map[string]any{
-				"status": "deleted",
-				"id":     "project-explicit",
+				"status":           "removed",
+				"id":               "project-explicit",
+				"removed_sessions": 3,
 			})
 		default:
 			t.Fatalf("unexpected path %s %q", r.Method, r.URL.String())
@@ -1727,18 +1854,19 @@ func TestProjectRemoveWithProjectAndDeleteData(t *testing.T) {
 	registerCLIFakeServer(t, registryPath, projectDir, server.URL, "registry-token")
 
 	var stdout, stderr bytes.Buffer
-	code := RunWithGetwd([]string{"project", "remove", "--project", "project-explicit", "--delete-data"}, &stdout, &stderr, func() (string, error) {
+	code := RunWithGetwd([]string{"project", "remove", "project-explicit"}, &stdout, &stderr, func() (string, error) {
 		return projectDir, nil
 	})
 	if code != 0 {
-		t.Fatalf("project remove --project --delete-data code = %d, stderr = %s", code, stderr.String())
+		t.Fatalf("project remove project-explicit code = %d, stderr = %s", code, stderr.String())
 	}
 	if stderr.String() != "" {
 		t.Fatalf("stderr = %q, want empty", stderr.String())
 	}
 	assertCLIOutputContains(t, stdout.String(),
-		"STATUS\tdeleted\n",
+		"STATUS\tremoved\n",
 		"ID\tproject-explicit\n",
+		"REMOVED_SESSIONS\t3\n",
 	)
 	select {
 	case got := <-authSeen:
@@ -1748,8 +1876,8 @@ func TestProjectRemoveWithProjectAndDeleteData(t *testing.T) {
 	default:
 		t.Fatal("DELETE /projects/project-explicit was not called")
 	}
-	if got := <-querySeen; got != "delete_data=true" {
-		t.Fatalf("DELETE query = %q, want delete_data=true", got)
+	if got := <-querySeen; got != "" {
+		t.Fatalf("DELETE query = %q, want empty remove request", got)
 	}
 }
 
@@ -1769,22 +1897,31 @@ func TestProjectRemoveRejectsCWD(t *testing.T) {
 }
 
 func TestProjectRemoveDoesNotAddCompatibilityAliases(t *testing.T) {
-	for _, args := range [][]string{
-		{"project", "delete", "--project", "project-one"},
-		{"project", "archive", "--project", "project-one"},
+	for _, tt := range []struct {
+		args  []string
+		wants []string
+	}{
+		{
+			args:  []string{"project", "delete", "project-one"},
+			wants: []string{"usage: sai project <create|list|show|rename|archive|remove>", `Run "sai help project" for usage.`},
+		},
+		{
+			args:  []string{"project", "remove", "--delete-data", "project-one"},
+			wants: []string{"flag provided but not defined: -delete-data", `Run "sai help project remove" for usage.`},
+		},
 	} {
-		t.Run(strings.Join(args, " "), func(t *testing.T) {
+		t.Run(strings.Join(tt.args, " "), func(t *testing.T) {
 			var stdout, stderr bytes.Buffer
-			code := RunWithGetwd(args, &stdout, &stderr, func() (string, error) {
+			code := RunWithGetwd(tt.args, &stdout, &stderr, func() (string, error) {
 				return "", errors.New("getwd should not be called")
 			})
 			if code != 1 {
-				t.Fatalf("RunWithGetwd(%v) code = %d, want 1", args, code)
+				t.Fatalf("RunWithGetwd(%v) code = %d, want 1", tt.args, code)
 			}
 			if stdout.String() != "" {
 				t.Fatalf("stdout = %q, want empty", stdout.String())
 			}
-			assertCLIErrorContains(t, stderr.String(), "usage: sai project <create|list|show|remove>", `Run "sai help project" for usage.`)
+			assertCLIErrorContains(t, stderr.String(), tt.wants...)
 		})
 	}
 }
@@ -1812,7 +1949,7 @@ func TestProjectListAutoStartsSingletonServerWithoutStartupOutput(t *testing.T) 
 	childArgsCh := make(chan []string, 1)
 	waitDone := make(chan struct{})
 	var closeWait sync.Once
-	startBackgroundServerProcess = func(ctx context.Context, args []string) (*backgroundServerProcess, error) {
+	startBackgroundServerProcess = func(ctx context.Context, args []string, env []string) (*backgroundServerProcess, error) {
 		childArgsCh <- append([]string(nil), args...)
 		addr := strings.TrimPrefix(server.URL, "http://")
 		if err := localserver.NewRegistryStore(registryPath).Upsert(localserver.RegistryRecord{
@@ -1854,11 +1991,11 @@ func TestProjectListAutoStartsSingletonServerWithoutStartupOutput(t *testing.T) 
 	if stderr.String() != "" {
 		t.Fatalf("stderr = %q, want empty", stderr.String())
 	}
-	if got := stdout.String(); got != "ID\tROOT\tNAME\tARCHIVED\tUPDATED\n" {
+	if got := stdout.String(); got != "ID\tNAME\tROOT\tARCHIVED\tCREATED_AT\tUPDATED_AT\n" {
 		t.Fatalf("stdout = %q, want project list only", got)
 	}
 	childArgs := <-childArgsCh
-	assertCLIFlagValue(t, childArgs, "--home", mustCLICanonicalPath(t, filepath.Dir(filepath.Dir(registryPath))))
+	assertCLIFlagValue(t, childArgs, "--server-root", mustCLICanonicalPath(t, filepath.Dir(filepath.Dir(registryPath))))
 	assertCLIStringSliceOmits(t, childArgs, "--config", "--cwd")
 	select {
 	case got := <-authSeen:
@@ -1899,7 +2036,7 @@ func TestProjectListConcurrentAutoStartLaunchesOneBackgroundServer(t *testing.T)
 	var closeWait sync.Once
 	var startMu sync.Mutex
 	startCount := 0
-	startBackgroundServerProcess = func(ctx context.Context, args []string) (*backgroundServerProcess, error) {
+	startBackgroundServerProcess = func(ctx context.Context, args []string, env []string) (*backgroundServerProcess, error) {
 		startMu.Lock()
 		startCount++
 		startMu.Unlock()
@@ -1978,7 +2115,7 @@ func TestProjectListConcurrentAutoStartLaunchesOneBackgroundServer(t *testing.T)
 	}
 
 	childArgs := <-childArgsCh
-	assertCLIFlagValue(t, childArgs, "--home", mustCLICanonicalPath(t, filepath.Dir(filepath.Dir(registryPath))))
+	assertCLIFlagValue(t, childArgs, "--server-root", mustCLICanonicalPath(t, filepath.Dir(filepath.Dir(registryPath))))
 	assertCLIFlagValue(t, childArgs, "--listen", localserver.DefaultListenAddress)
 	assertCLIStringSliceOmits(t, childArgs, "--config", "--cwd")
 	select {
@@ -2136,16 +2273,12 @@ func TestSessionCreateUsesProjectScopedAPIWithMetadata(t *testing.T) {
 	}
 	out := stdout.String()
 	assertCLIOutputContains(t, out,
+		"STATUS\tcreated",
 		"ID\tcreated-session",
 		"PROJECT_ID\tproject-current",
 		"CREATED_CWD\t"+canonicalRoot,
-		"CWD\t"+canonicalRoot,
-		"CONFIG_PATH\t"+configPath,
-		"ENABLED_TOOLS\tread_file",
-		"ENABLED_MCP\tlocal",
-		"ENABLED_SKILLS\tvisible",
-		"SHOW_REASONING\ttrue",
-		"SAVE_TOOL_RESULTS\ttrue",
+		"ARCHIVED\tfalse",
+		"LAST_USED_AT\t2026-07-04T05:01:00Z",
 	)
 	if strings.Contains(out, "Hidden skill instructions") || strings.Contains(out, "direct-secret-value") {
 		t.Fatalf("session create output leaked hidden data:\n%s", out)
@@ -2262,8 +2395,8 @@ func TestSessionListDefaultUsesNearestProjectScopedAPI(t *testing.T) {
 		}
 	}
 	assertCLIOutputContains(t, stdout.String(),
-		"ID\tLAST_USED\tPROVIDER\tMODEL/PROFILE",
-		"child-session\t2026-07-04T06:01:00Z\tfake\tmodel-default/default",
+		"ID\tPROJECT_ID\tNAME\tCREATED_CWD\tARCHIVED\tLAST_USED_AT",
+		"child-session\tproject-child\t\t\tfalse\t2026-07-04T06:01:00Z",
 	)
 	if stderr.String() != "" {
 		t.Fatalf("stderr = %q, want empty", stderr.String())
@@ -2350,8 +2483,8 @@ func TestSessionListArchivedUsesProjectScopedFilter(t *testing.T) {
 		t.Fatal("GET project sessions was not called")
 	}
 	assertCLIOutputContains(t, stdout.String(),
-		"ID\tLAST_USED\tPROVIDER\tMODEL/PROFILE",
-		"archived-session\t2026-07-04T06:35:00Z\tfake\tmodel-default/default",
+		"ID\tPROJECT_ID\tNAME\tCREATED_CWD\tARCHIVED\tLAST_USED_AT",
+		"archived-session\tproject-current\tOld Thread\t\ttrue\t2026-07-04T06:35:00Z",
 	)
 	if stderr.String() != "" {
 		t.Fatalf("stderr = %q, want empty", stderr.String())
@@ -2398,7 +2531,10 @@ func TestSessionListProjectUsesProjectScopedAPIWithoutCWDDiscovery(t *testing.T)
 	default:
 		t.Fatal("GET /projects/project-direct/sessions was not called")
 	}
-	assertCLIOutputContains(t, stdout.String(), "direct-session\t2026-07-04T07:01:00Z\tfake\tmodel-default/default")
+	assertCLIOutputContains(t, stdout.String(),
+		"ID\tPROJECT_ID\tNAME\tCREATED_CWD\tARCHIVED\tLAST_USED_AT",
+		"direct-session\tproject-direct\t\t\tfalse\t2026-07-04T07:01:00Z",
+	)
 	if stderr.String() != "" {
 		t.Fatalf("stderr = %q, want empty", stderr.String())
 	}
@@ -2410,12 +2546,14 @@ func TestSessionListAllProjectsUsesGlobalSessionsAPIAndRejectsProjectCombination
 	updatedAt := time.Date(2026, 7, 4, 8, 1, 0, 0, time.UTC)
 
 	authSeen := make(chan string, 1)
+	allProjectsSeen := make(chan string, 1)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.URL.Path == "/health":
 			writeCLIJSON(w, http.StatusOK, map[string]any{"status": "ok"})
 		case r.URL.Path == "/sessions" && r.Method == http.MethodGet:
 			authSeen <- r.Header.Get("Authorization")
+			allProjectsSeen <- r.URL.Query().Get("all_projects")
 			writeCLIJSON(w, http.StatusOK, map[string]any{
 				"sessions": []map[string]any{
 					{"id": "global-session", "created_at": updatedAt, "updated_at": updatedAt, "provider": "fake", "model_profile": "default", "model_id": "model-default", "project_id": "project-any"},
@@ -2444,7 +2582,18 @@ func TestSessionListAllProjectsUsesGlobalSessionsAPIAndRejectsProjectCombination
 	default:
 		t.Fatal("GET /sessions was not called")
 	}
-	assertCLIOutputContains(t, stdout.String(), "global-session\t2026-07-04T08:01:00Z\tfake\tmodel-default/default")
+	select {
+	case got := <-allProjectsSeen:
+		if got != "true" {
+			t.Fatalf("GET /sessions all_projects = %q, want true", got)
+		}
+	default:
+		t.Fatal("GET /sessions query was not captured")
+	}
+	assertCLIOutputContains(t, stdout.String(),
+		"ID\tPROJECT_ID\tNAME\tCREATED_CWD\tARCHIVED\tLAST_USED_AT",
+		"global-session\tproject-any\t\t\tfalse\t2026-07-04T08:01:00Z",
+	)
 	if stderr.String() != "" {
 		t.Fatalf("stderr = %q, want empty", stderr.String())
 	}
@@ -2489,16 +2638,6 @@ func TestSessionMetadataCommandsRejectConfigBeforeDiscovery(t *testing.T) {
 			name:     "session archive",
 			args:     []string{"session", "archive", "archive-session", "--config", missingConfig},
 			helpHint: `Run "sai help session archive" for usage.`,
-		},
-		{
-			name:     "plural sessions",
-			args:     []string{"--config", missingConfig, "sessions"},
-			helpHint: `Run "sai help sessions" for usage.`,
-		},
-		{
-			name:     "plural sessions list",
-			args:     []string{"sessions", "list", "--config", missingConfig},
-			helpHint: `Run "sai help session list" for usage.`,
 		},
 	}
 
@@ -2707,9 +2846,10 @@ func TestSessionRenameAndArchiveUsePatchWithBearerToken(t *testing.T) {
 		t.Fatal("PATCH rename session was not called")
 	}
 	assertCLIOutputContains(t, stdout.String(),
+		"STATUS\trenamed",
 		"ID\trename-session",
-		"LAST_USED\t2026-07-04T09:20:00Z",
-		"DISPLAY_NAME\tRenamed Session",
+		"LAST_USED_AT\t2026-07-04T09:20:00Z",
+		"NAME\tRenamed Session",
 		"ARCHIVED\tfalse",
 	)
 	if stderr.String() != "" {
@@ -2739,8 +2879,9 @@ func TestSessionRenameAndArchiveUsePatchWithBearerToken(t *testing.T) {
 		t.Fatal("PATCH archive session was not called")
 	}
 	assertCLIOutputContains(t, stdout.String(),
+		"STATUS\tarchived",
 		"ID\tarchive-session",
-		"DISPLAY_NAME\tOld Session",
+		"NAME\tOld Session",
 		"ARCHIVED\ttrue",
 	)
 	if stderr.String() != "" {
@@ -2780,12 +2921,14 @@ func TestSessionListAutoStartsSingletonServerWithoutStartupOutput(t *testing.T) 
 	writeCLIFixtureInDir(t, filepath.Join(projectDir, ".agents"))
 
 	authSeen := make(chan string, 1)
+	allProjectsSeen := make(chan string, 1)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/health":
 			writeCLIJSON(w, http.StatusOK, map[string]any{"status": "ok"})
 		case "/sessions":
 			authSeen <- r.Header.Get("Authorization")
+			allProjectsSeen <- r.URL.Query().Get("all_projects")
 			writeCLIJSON(w, http.StatusOK, map[string]any{"sessions": []map[string]any{}})
 		default:
 			t.Fatalf("unexpected path %q", r.URL.Path)
@@ -2797,7 +2940,7 @@ func TestSessionListAutoStartsSingletonServerWithoutStartupOutput(t *testing.T) 
 	childArgsCh := make(chan []string, 1)
 	waitDone := make(chan struct{})
 	var closeWait sync.Once
-	startBackgroundServerProcess = func(ctx context.Context, args []string) (*backgroundServerProcess, error) {
+	startBackgroundServerProcess = func(ctx context.Context, args []string, env []string) (*backgroundServerProcess, error) {
 		childArgsCh <- append([]string(nil), args...)
 		addr := strings.TrimPrefix(server.URL, "http://")
 		if err := localserver.NewRegistryStore(registryPath).Upsert(localserver.RegistryRecord{
@@ -2839,14 +2982,14 @@ func TestSessionListAutoStartsSingletonServerWithoutStartupOutput(t *testing.T) 
 	if stderr.String() != "" {
 		t.Fatalf("stderr = %q, want empty", stderr.String())
 	}
-	if got := stdout.String(); got != "ID\tLAST_USED\tPROVIDER\tMODEL/PROFILE\n" {
+	if got := stdout.String(); got != "ID\tPROJECT_ID\tNAME\tCREATED_CWD\tARCHIVED\tLAST_USED_AT\n" {
 		t.Fatalf("stdout = %q, want session list only", got)
 	}
 	if strings.Contains(stdout.String(), "SERVER_ADDR") {
 		t.Fatalf("stdout = %q, want no SERVER_ADDR", stdout.String())
 	}
 	childArgs := <-childArgsCh
-	assertCLIFlagValue(t, childArgs, "--home", mustCLICanonicalPath(t, filepath.Dir(filepath.Dir(registryPath))))
+	assertCLIFlagValue(t, childArgs, "--server-root", mustCLICanonicalPath(t, filepath.Dir(filepath.Dir(registryPath))))
 	assertCLIStringSliceOmits(t, childArgs, "--config", "--cwd")
 	select {
 	case got := <-authSeen:
@@ -2855,6 +2998,14 @@ func TestSessionListAutoStartsSingletonServerWithoutStartupOutput(t *testing.T) 
 		}
 	default:
 		t.Fatal("GET /sessions was not called")
+	}
+	select {
+	case got := <-allProjectsSeen:
+		if got != "true" {
+			t.Fatalf("GET /sessions all_projects = %q, want true", got)
+		}
+	default:
+		t.Fatal("GET /sessions query was not captured")
 	}
 }
 
@@ -2940,7 +3091,7 @@ func TestSendWithoutSessionAutoStartsSingletonServerWithoutStartupOutput(t *test
 		}
 	}
 	childArgs := <-childArgsCh
-	assertCLIFlagValue(t, childArgs, "--home", mustCLICanonicalPath(t, filepath.Dir(filepath.Dir(registryPath))))
+	assertCLIFlagValue(t, childArgs, "--server-root", mustCLICanonicalPath(t, filepath.Dir(filepath.Dir(registryPath))))
 	assertCLIFlagValue(t, childArgs, "--listen", localserver.DefaultListenAddress)
 	assertCLIStringSliceOmits(t, childArgs, "--config", "--cwd")
 	for _, name := range []string{"projects", "project sessions", "send"} {
@@ -3041,7 +3192,7 @@ func TestAttachWithoutSessionAutoStartsSingletonServerWithoutStartupOutput(t *te
 	}
 	assertCLIOutputContains(t, stderr.String(), "sai: attached to session latest-session")
 	childArgs := <-childArgsCh
-	assertCLIFlagValue(t, childArgs, "--home", mustCLICanonicalPath(t, filepath.Dir(filepath.Dir(registryPath))))
+	assertCLIFlagValue(t, childArgs, "--server-root", mustCLICanonicalPath(t, filepath.Dir(filepath.Dir(registryPath))))
 	assertCLIFlagValue(t, childArgs, "--listen", localserver.DefaultListenAddress)
 	assertCLIStringSliceOmits(t, childArgs, "--config", "--cwd")
 	for _, name := range []string{"projects", "project sessions", "stream"} {
@@ -3061,7 +3212,7 @@ func TestStatusAndStopDoNotAutoStartSingletonServer(t *testing.T) {
 	projectDir := t.TempDir()
 
 	oldStart := startBackgroundServerProcess
-	startBackgroundServerProcess = func(ctx context.Context, args []string) (*backgroundServerProcess, error) {
+	startBackgroundServerProcess = func(ctx context.Context, args []string, env []string) (*backgroundServerProcess, error) {
 		t.Fatalf("unexpected background server auto-start with args %#v", args)
 		return nil, errors.New("unexpected auto-start")
 	}
@@ -3070,8 +3221,8 @@ func TestStatusAndStopDoNotAutoStartSingletonServer(t *testing.T) {
 	})
 
 	for _, args := range [][]string{
-		{"status"},
-		{"stop"},
+		{"server", "status"},
+		{"server", "stop"},
 	} {
 		t.Run(strings.Join(args, " "), func(t *testing.T) {
 			var stdout, stderr bytes.Buffer
@@ -3091,24 +3242,22 @@ func TestStatusAndStopDoNotAutoStartSingletonServer(t *testing.T) {
 
 func TestServerCommandStartsWithDefaultConfigAndShutdown(t *testing.T) {
 	registryPath := isolateCLIUserRegistry(t)
-	homePath := mustCLICanonicalPath(t, filepath.Dir(filepath.Dir(registryPath)))
 	projectDir := t.TempDir()
 	writeCLIFixtureInDir(t, filepath.Join(projectDir, ".agents"))
 
-	addr, done, stderr, cleanup := startCLIServerCommandForTest(t, []string{"server", "--port", "0"}, func() (string, error) {
+	addr, done, stderr, cleanup := startCLIServerCommandForTest(t, []string{"server", "start", "--port", "0"}, func() (string, error) {
 		return projectDir, nil
 	})
 	defer cleanup()
 
 	info := getCLIServerJSON(t, "http://"+addr+"/server")
-	if got, want := filepath.Clean(info["cwd"].(string)), homePath; got != want {
-		t.Fatalf("server cwd = %q, want %q", got, want)
+	for _, key := range []string{"cwd", "server_root", "config_path"} {
+		if _, ok := info[key]; ok {
+			t.Fatalf("server response leaked %s: %#v", key, info)
+		}
 	}
-	if _, ok := info["config_path"]; ok {
-		t.Fatalf("server response leaked config_path: %#v", info)
-	}
-	if got := info["addr"]; got != addr {
-		t.Fatalf("server addr = %#v, want %q", got, addr)
+	if got := info["base_url"]; got != addr {
+		t.Fatalf("server base_url = %#v, want %q", got, addr)
 	}
 	if got := info["session_count"]; got != float64(0) {
 		t.Fatalf("session_count = %#v, want 0", got)
@@ -3126,9 +3275,6 @@ func TestServerCommandStartsWithDefaultConfigAndShutdown(t *testing.T) {
 		t.Fatalf("registry records = %#v, want one running server", records)
 	}
 	record := records[0]
-	if got, want := filepath.Clean(record.CWD), homePath; got != want {
-		t.Fatalf("registry cwd = %q, want %q", got, want)
-	}
 	if record.BaseURL != addr {
 		t.Fatalf("registry addr = %q, want %q", record.BaseURL, addr)
 	}
@@ -3151,8 +3297,8 @@ func TestServerCommandStartsWithDefaultConfigAndShutdown(t *testing.T) {
 		t.Fatalf("registry requested_listen = %q, want 127.0.0.1:0", record.RequestedListen)
 	}
 	missingDebug := getCLIServerJSONStatus(t, "http://"+addr+"/sessions/missing-session/items/item-1/content?view=debug", record.Token, http.StatusNotFound)
-	if got := missingDebug["error"].(map[string]any)["code"]; got != "session_not_found" {
-		t.Fatalf("debug content with registry token error = %#v, want session_not_found", missingDebug)
+	if got := missingDebug["error"].(map[string]any)["code"]; got != "not_found" {
+		t.Fatalf("debug content with registry token error = %#v, want not_found", missingDebug)
 	}
 
 	postCLIServerShutdown(t, addr)
@@ -3170,21 +3316,19 @@ func TestServerCommandStartsWithDefaultConfigAndShutdown(t *testing.T) {
 
 func TestServerCommandStartsWithoutConfigFile(t *testing.T) {
 	registryPath := isolateCLIUserRegistry(t)
-	homePath := mustCLICanonicalPath(t, filepath.Dir(filepath.Dir(registryPath)))
 	projectDir := t.TempDir()
 	missingConfigPath := filepath.Join(projectDir, ".agents", "sai.yaml")
 
-	addr, done, stderr, cleanup := startCLIServerCommandForTest(t, []string{"server", "--port", "0"}, func() (string, error) {
+	addr, done, stderr, cleanup := startCLIServerCommandForTest(t, []string{"server", "start", "--port", "0"}, func() (string, error) {
 		return projectDir, nil
 	})
 	defer cleanup()
 
 	info := getCLIServerJSON(t, "http://"+addr+"/server")
-	if got, want := filepath.Clean(info["cwd"].(string)), homePath; got != want {
-		t.Fatalf("server cwd = %q, want %q", got, want)
-	}
-	if _, ok := info["config_path"]; ok {
-		t.Fatalf("server response leaked config_path: %#v", info)
+	for _, key := range []string{"cwd", "server_root", "config_path"} {
+		if _, ok := info[key]; ok {
+			t.Fatalf("server response leaked %s: %#v", key, info)
+		}
 	}
 
 	store := localserver.NewRegistryStore(registryPath)
@@ -3217,9 +3361,11 @@ func TestServerCommandBackgroundWaitsForHealthyDiscoverableServer(t *testing.T) 
 	var childWaitOnce sync.Once
 	var childCode int
 	var childStdout, childStderr bytes.Buffer
-	startBackgroundServerProcess = func(ctx context.Context, args []string) (*backgroundServerProcess, error) {
+	startBackgroundServerProcess = func(ctx context.Context, args []string, env []string) (*backgroundServerProcess, error) {
 		childArgsCh <- append([]string(nil), args...)
 		go func() {
+			restoreEnv := applyCLIEnv(env)
+			defer restoreEnv()
 			childDone <- RunWithContext(childCtx, args, strings.NewReader(""), &childStdout, &childStderr, func() (string, error) {
 				return filepath.Join(projectDir, "unused"), nil
 			})
@@ -3249,7 +3395,7 @@ func TestServerCommandBackgroundWaitsForHealthyDiscoverableServer(t *testing.T) 
 	})
 
 	var stdout, stderr bytes.Buffer
-	code := RunWithContext(context.Background(), []string{"server", "--background", "--cwd", projectDir, "--port", "0"}, strings.NewReader(""), &stdout, &stderr, func() (string, error) {
+	code := RunWithContext(context.Background(), []string{"server", "start", "--background", "--port", "0"}, strings.NewReader(""), &stdout, &stderr, func() (string, error) {
 		return projectDir, nil
 	})
 	if code != 0 {
@@ -3260,19 +3406,16 @@ func TestServerCommandBackgroundWaitsForHealthyDiscoverableServer(t *testing.T) 
 	}
 
 	childArgs := <-childArgsCh
-	assertCLIStringSliceContains(t, childArgs, "--background-child")
-	assertCLIFlagValue(t, childArgs, "--home", mustCLICanonicalPath(t, filepath.Dir(filepath.Dir(registryPath))))
+	assertCLIFlagValue(t, childArgs, "--server-root", mustCLICanonicalPath(t, filepath.Dir(filepath.Dir(registryPath))))
 	assertCLIFlagValue(t, childArgs, "--listen", "127.0.0.1:0")
-	assertCLIFlagValue(t, childArgs, "--cwd", projectDir)
-	assertCLIStringSliceOmits(t, childArgs, "--config")
+	assertCLIStringSliceOmits(t, childArgs, "--background-child", "--config")
 
-	line := strings.TrimSpace(stdout.String())
-	addr, ok := strings.CutPrefix(line, "SERVER_ADDR\t")
-	if !ok || addr == "" {
-		t.Fatalf("stdout = %q, want SERVER_ADDR line", stdout.String())
+	addr := valueFromCLIKeyValueOutput(t, stdout.String(), "ADDR")
+	if addr == "" {
+		t.Fatalf("stdout = %q, want ADDR line", stdout.String())
 	}
-	if strings.Count(stdout.String(), "SERVER_ADDR\t") != 1 {
-		t.Fatalf("stdout = %q, want exactly one parent SERVER_ADDR line", stdout.String())
+	if strings.Count(stdout.String(), "ADDR\t") != 1 {
+		t.Fatalf("stdout = %q, want exactly one parent ADDR line", stdout.String())
 	}
 
 	store := localserver.NewRegistryStore(registryPath)
@@ -3289,9 +3432,6 @@ func TestServerCommandBackgroundWaitsForHealthyDiscoverableServer(t *testing.T) 
 	}
 	if record.RequestedListen != "127.0.0.1:0" {
 		t.Fatalf("registry requested_listen = %q, want 127.0.0.1:0", record.RequestedListen)
-	}
-	if got, want := filepath.Clean(record.CWD), filepath.Clean(projectDir); got != want {
-		t.Fatalf("registry cwd = %q, want explicit server cwd %q", got, want)
 	}
 	if err := localserver.CheckHealth(context.Background(), addr, 2*time.Second); err != nil {
 		t.Fatalf("background server health check error = %v", err)
@@ -3334,7 +3474,7 @@ func TestServerCommandConcurrentBackgroundLaunchesOneChild(t *testing.T) {
 	var closeWait sync.Once
 	var startMu sync.Mutex
 	startCount := 0
-	startBackgroundServerProcess = func(ctx context.Context, args []string) (*backgroundServerProcess, error) {
+	startBackgroundServerProcess = func(ctx context.Context, args []string, env []string) (*backgroundServerProcess, error) {
 		startMu.Lock()
 		startCount++
 		startMu.Unlock()
@@ -3377,7 +3517,7 @@ func TestServerCommandConcurrentBackgroundLaunchesOneChild(t *testing.T) {
 		go func() {
 			<-startRuns
 			var stdout, stderr bytes.Buffer
-			code := RunWithGetwd([]string{"server", "--background", "--port", "0"}, &stdout, &stderr, func() (string, error) {
+			code := RunWithGetwd([]string{"server", "start", "--background", "--port", "0"}, &stdout, &stderr, func() (string, error) {
 				return projectDir, nil
 			})
 			results <- concurrentCLIRunResult{stdout: stdout.String(), stderr: stderr.String(), code: code}
@@ -3409,26 +3549,110 @@ func TestServerCommandConcurrentBackgroundLaunchesOneChild(t *testing.T) {
 		if result.stderr != "" {
 			t.Fatalf("stderr = %q, want empty", result.stderr)
 		}
-		if strings.Contains(result.stdout, "SERVER_ADDR\t"+addr) {
+		if strings.Contains(result.stdout, "STATUS\tstarted") && strings.Contains(result.stdout, "ADDR\t"+addr) {
 			serverAddrOutputs++
 		}
-		if strings.Contains(result.stdout, "SERVER_ALREADY_RUNNING") && strings.Contains(result.stdout, "addr="+addr) {
+		if strings.Contains(result.stdout, "STATUS\talready_running") && strings.Contains(result.stdout, "ADDR\t"+addr) {
 			alreadyRunningOutputs++
 		}
 	}
 	if serverAddrOutputs != 1 || alreadyRunningOutputs != 1 {
-		t.Fatalf("outputs = SERVER_ADDR:%d SERVER_ALREADY_RUNNING:%d, want one each", serverAddrOutputs, alreadyRunningOutputs)
+		t.Fatalf("outputs = started:%d already_running:%d, want one each", serverAddrOutputs, alreadyRunningOutputs)
 	}
 
 	childArgs := <-childArgsCh
-	assertCLIStringSliceContains(t, childArgs, "--background-child")
-	assertCLIFlagValue(t, childArgs, "--home", mustCLICanonicalPath(t, filepath.Dir(filepath.Dir(registryPath))))
+	assertCLIFlagValue(t, childArgs, "--server-root", mustCLICanonicalPath(t, filepath.Dir(filepath.Dir(registryPath))))
 	assertCLIFlagValue(t, childArgs, "--listen", "127.0.0.1:0")
-	assertCLIStringSliceOmits(t, childArgs, "--config", "--cwd")
+	assertCLIStringSliceOmits(t, childArgs, "--background-child", "--config", "--cwd")
 	select {
 	case extra := <-childArgsCh:
 		t.Fatalf("unexpected second background launch args %#v", extra)
 	default:
+	}
+}
+
+func TestServerCommandForegroundWaitsForStartupLock(t *testing.T) {
+	registryPath := isolateCLIUserRegistry(t)
+	serverRoot := filepath.Dir(filepath.Dir(registryPath))
+	projectDir := t.TempDir()
+
+	lock, err := localserver.AcquireStartupLock(context.Background(), serverRoot)
+	if err != nil {
+		t.Fatalf("AcquireStartupLock() error = %v", err)
+	}
+	lockReleased := false
+	releaseLock := func() {
+		if !lockReleased {
+			lockReleased = true
+			if err := lock.Release(); err != nil {
+				t.Fatalf("Release() error = %v", err)
+			}
+		}
+	}
+	defer releaseLock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	stdoutReader, stdoutWriter := io.Pipe()
+	stderr := &bytes.Buffer{}
+	done := make(chan int, 1)
+	go func() {
+		done <- RunWithContext(ctx, []string{"server", "start", "--port", "0"}, strings.NewReader(""), stdoutWriter, stderr, func() (string, error) {
+			return projectDir, nil
+		})
+		_ = stdoutWriter.Close()
+	}()
+	defer func() {
+		_ = stdoutReader.Close()
+		_ = stdoutWriter.Close()
+	}()
+
+	lines := make(chan string, 4)
+	go func() {
+		reader := bufio.NewReader(stdoutReader)
+		for {
+			line, err := reader.ReadString('\n')
+			if err != nil {
+				close(lines)
+				return
+			}
+			lines <- strings.TrimRight(line, "\r\n")
+		}
+	}()
+
+	select {
+	case line := <-lines:
+		t.Fatalf("server start printed %q while startup lock was still held", line)
+	case code := <-done:
+		t.Fatalf("server start exited while startup lock was still held: code=%d stderr=%s", code, stderr.String())
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	releaseLock()
+
+	addr := ""
+	timeout := time.After(2 * time.Second)
+	for addr == "" {
+		select {
+		case line, ok := <-lines:
+			if !ok {
+				t.Fatalf("server stdout closed before ADDR; stderr=%s", stderr.String())
+			}
+			if value, ok := strings.CutPrefix(line, "ADDR\t"); ok {
+				addr = strings.TrimSpace(value)
+			}
+		case code := <-done:
+			t.Fatalf("server start exited before ADDR after releasing lock: code=%d stderr=%s", code, stderr.String())
+		case <-timeout:
+			t.Fatalf("timed out waiting for ADDR after releasing lock; stderr=%s", stderr.String())
+		}
+	}
+	if err := localserver.CheckHealth(context.Background(), addr, 2*time.Second); err != nil {
+		t.Fatalf("server at %s did not become healthy: %v; stderr=%s", addr, err, stderr.String())
+	}
+	postCLIServerShutdown(t, addr)
+	if code := waitForCode(t, done); code != 0 {
+		t.Fatalf("server command code = %d, stderr = %s", code, stderr.String())
 	}
 }
 
@@ -3439,7 +3663,7 @@ func TestBackgroundServerProcessOutlivesParentContextAfterStart(t *testing.T) {
 	exitPath := filepath.Join(dir, "exit")
 
 	ctx, cancel := context.WithCancel(context.Background())
-	child, err := startBackgroundServerProcessDefault(ctx, []string{"-test.run=TestCLIBackgroundHelperProcess", "--", "wait-file", readyPath, exitPath})
+	child, err := startBackgroundServerProcessDefault(ctx, []string{"-test.run=TestCLIBackgroundHelperProcess", "--", "wait-file", readyPath, exitPath}, nil)
 	if err != nil {
 		t.Fatalf("startBackgroundServerProcessDefault() error = %v", err)
 	}
@@ -3515,7 +3739,7 @@ func TestBackgroundServerProcessDoesNotInheritCallerStdoutStderr(t *testing.T) {
 		_ = stderrFile.Close()
 	}()
 
-	child, err := startBackgroundServerProcessDefault(context.Background(), []string{"-test.run=TestCLIBackgroundHelperProcess", "--", "stdio"})
+	child, err := startBackgroundServerProcessDefault(context.Background(), []string{"-test.run=TestCLIBackgroundHelperProcess", "--", "stdio"}, nil)
 	if err != nil {
 		t.Fatalf("startBackgroundServerProcessDefault() error = %v", err)
 	}
@@ -3582,9 +3806,9 @@ func TestCLIBackgroundHelperProcess(t *testing.T) {
 	}
 }
 
-func TestServerCommandWiresSessionStoreToHomeDataWithoutLoadingConfig(t *testing.T) {
+func TestServerCommandWiresSessionStoreToServerRootDataWithoutLoadingConfig(t *testing.T) {
 	registryPath := isolateCLIUserRegistry(t)
-	homePath := filepath.Dir(filepath.Dir(registryPath))
+	serverRoot := filepath.Dir(filepath.Dir(registryPath))
 	projectDir := t.TempDir()
 	configDir := filepath.Join(projectDir, ".agents")
 	writeCLIFixtureInDir(t, configDir)
@@ -3605,29 +3829,55 @@ sessions:
 `
 	writeCLIFile(t, configPath, updated)
 
-	addr, done, stderr, cleanup := startCLIServerCommandForTest(t, []string{"server", "--port", "0"}, func() (string, error) {
+	addr, done, stderr, cleanup := startCLIServerCommandForTest(t, []string{"server", "start", "--port", "0"}, func() (string, error) {
 		return projectDir, nil
 	})
 	defer cleanup()
 
 	client := http.Client{Timeout: 2 * time.Second}
-	req, err := http.NewRequest(http.MethodPost, "http://"+addr+"/sessions", nil)
+	projectRoot := t.TempDir()
+	projectBody := fmt.Sprintf(`{"root":%q,"display_name":"CLI Project"}`, projectRoot)
+	req, err := http.NewRequest(http.MethodPost, "http://"+addr+"/projects", strings.NewReader(projectBody))
 	if err != nil {
-		t.Fatalf("NewRequest(POST /sessions) error = %v", err)
+		t.Fatalf("NewRequest(POST /projects) error = %v", err)
 	}
 	req.Header.Set("Authorization", "Bearer "+cliServerTokenForAddr(t, addr))
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := client.Do(req)
 	if err != nil {
-		t.Fatalf("Post(/sessions) error = %v", err)
+		t.Fatalf("Post(/projects) error = %v", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusCreated {
-		t.Fatalf("Post(/sessions) status = %d, want 201", resp.StatusCode)
+		raw, _ := io.ReadAll(resp.Body)
+		t.Fatalf("Post(/projects) status = %d, want 201; body=%s", resp.StatusCode, raw)
+	}
+	var projectBodyResp map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&projectBodyResp); err != nil {
+		t.Fatalf("Decode(/projects) error = %v", err)
+	}
+	projectID, ok := projectBodyResp["id"].(string)
+	if !ok || projectID == "" {
+		t.Fatalf("created project response missing id: %#v", projectBodyResp)
+	}
+
+	req, err = http.NewRequest(http.MethodPost, "http://"+addr+"/projects/"+projectID+"/sessions", nil)
+	if err != nil {
+		t.Fatalf("NewRequest(POST project sessions) error = %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+cliServerTokenForAddr(t, addr))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err = client.Do(req)
+	if err != nil {
+		t.Fatalf("Post(project sessions) error = %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("Post(project sessions) status = %d, want 201", resp.StatusCode)
 	}
 	var body map[string]any
 	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
-		t.Fatalf("Decode(/sessions) error = %v", err)
+		t.Fatalf("Decode(project sessions) error = %v", err)
 	}
 	id, ok := body["id"].(string)
 	if !ok || id == "" {
@@ -3642,9 +3892,9 @@ sessions:
 		t.Fatalf("session_count = %#v, want 1", got)
 	}
 
-	sessionRoot, err := sessions.RootForHome(homePath)
+	sessionRoot, err := sessions.RootForServerRoot(serverRoot)
 	if err != nil {
-		t.Fatalf("RootForHome(%q) error = %v", homePath, err)
+		t.Fatalf("RootForServerRoot(%q) error = %v", serverRoot, err)
 	}
 	store := sessions.NewV2Store(sessionRoot)
 	session, err := store.Load(id)
@@ -3657,8 +3907,8 @@ sessions:
 	if session.Provider != "" || session.ModelProfile != "" || session.ModelID != "" || len(session.ModelParameters) != 0 {
 		t.Fatalf("stored model metadata = %#v, want no config-derived model metadata", session)
 	}
-	if got, want := filepath.Clean(session.CWD), mustCLICanonicalPath(t, homePath); got != want {
-		t.Fatalf("stored cwd = %q, want %q", got, want)
+	if session.CWD != "" || session.CreatedCWD != "" {
+		t.Fatalf("stored cwd metadata = cwd %q created_cwd %q, want empty", session.CWD, session.CreatedCWD)
 	}
 	if session.ConfigPath != "" {
 		t.Fatalf("stored config_path = %q, want empty", session.ConfigPath)
@@ -3673,12 +3923,12 @@ sessions:
 	}
 }
 
-func TestServerCommandWiresProjectStoreToHomeData(t *testing.T) {
+func TestServerCommandWiresProjectStoreToServerRootData(t *testing.T) {
 	registryPath := isolateCLIUserRegistry(t)
 	projectDir := t.TempDir()
 	writeCLIFixtureInDir(t, filepath.Join(projectDir, ".agents"))
 
-	addr, done, stderr, cleanup := startCLIServerCommandForTest(t, []string{"server", "--port", "0"}, func() (string, error) {
+	addr, done, stderr, cleanup := startCLIServerCommandForTest(t, []string{"server", "start", "--port", "0"}, func() (string, error) {
 		return projectDir, nil
 	})
 	defer cleanup()
@@ -3712,10 +3962,10 @@ func TestServerCommandWiresProjectStoreToHomeData(t *testing.T) {
 		t.Fatalf("created project missing id: %#v", created)
 	}
 
-	homePath := filepath.Dir(filepath.Dir(registryPath))
-	projectStoreRoot, err := projectstore.RootForHome(homePath)
+	serverRoot := filepath.Dir(filepath.Dir(registryPath))
+	projectStoreRoot, err := projectstore.RootForServerRoot(serverRoot)
 	if err != nil {
-		t.Fatalf("RootForHome(%q) error = %v", homePath, err)
+		t.Fatalf("RootForServerRoot(%q) error = %v", serverRoot, err)
 	}
 	stored, err := projectstore.NewStore(projectStoreRoot).Load(created.ID)
 	if err != nil {
@@ -3741,29 +3991,39 @@ func TestServerCommandWiresProjectStoreToHomeData(t *testing.T) {
 	}
 }
 
-func TestServerCommandHonorsExplicitCWDAndIgnoresConfigForServerProcess(t *testing.T) {
+func TestServerCommandRejectsCWDWithoutLoadingConfig(t *testing.T) {
 	isolateCLIUserRegistry(t)
 	baseDir := t.TempDir()
 	projectDir := filepath.Join(baseDir, "project")
 	writeCLIFixtureInDir(t, filepath.Join(projectDir, "config"))
 
-	addr, done, stderr, cleanup := startCLIServerCommandForTest(t, []string{"server", "--cwd", "project", "--config", filepath.Join("config", "sai.yaml"), "--port", "0"}, func() (string, error) {
+	var stdout, stderr bytes.Buffer
+	code := RunWithGetwd([]string{"server", "start", "--cwd", "project", "--config", filepath.Join("config", "sai.yaml"), "--port", "0"}, &stdout, &stderr, func() (string, error) {
 		return baseDir, nil
 	})
-	defer cleanup()
+	if code != 1 {
+		t.Fatalf("server start --cwd code = %d, want 1", code)
+	}
+	if stdout.String() != "" {
+		t.Fatalf("stdout = %q, want empty", stdout.String())
+	}
+	assertCLIErrorContains(t, stderr.String(), "flag provided but not defined: -cwd", `Run "sai help server start" for usage.`)
+}
 
-	info := getCLIServerJSON(t, "http://"+addr+"/server")
-	if got, want := filepath.Clean(info["cwd"].(string)), filepath.Clean(projectDir); got != want {
-		t.Fatalf("server cwd = %q, want %q", got, want)
-	}
-	if _, ok := info["config_path"]; ok {
-		t.Fatalf("server response leaked config_path: %#v", info)
-	}
+func TestServerCommandRejectsBackgroundChildFlag(t *testing.T) {
+	isolateCLIUserRegistry(t)
 
-	postCLIServerShutdown(t, addr)
-	if code := waitForCode(t, done); code != 0 {
-		t.Fatalf("server command code = %d, stderr = %s", code, stderr.String())
+	var stdout, stderr bytes.Buffer
+	code := RunWithGetwd([]string{"server", "start", "--background-child"}, &stdout, &stderr, func() (string, error) {
+		return "", errors.New("getwd should not be called")
+	})
+	if code != 1 {
+		t.Fatalf("server start --background-child code = %d, want 1", code)
 	}
+	if stdout.String() != "" {
+		t.Fatalf("stdout = %q, want empty", stdout.String())
+	}
+	assertCLIErrorContains(t, stderr.String(), "flag provided but not defined: -background-child", `Run "sai help server start" for usage.`)
 }
 
 func TestServerCommandContextCancelRemovesRegistry(t *testing.T) {
@@ -3776,20 +4036,28 @@ func TestServerCommandContextCancelRemovesRegistry(t *testing.T) {
 	stderr := &bytes.Buffer{}
 	done := make(chan int, 1)
 	go func() {
-		done <- RunWithContext(ctx, []string{"server", "--port", "0"}, strings.NewReader(""), stdoutWriter, stderr, func() (string, error) {
+		done <- RunWithContext(ctx, []string{"server", "start", "--port", "0"}, strings.NewReader(""), stdoutWriter, stderr, func() (string, error) {
 			return projectDir, nil
 		})
 		_ = stdoutWriter.Close()
 	}()
 
-	line, err := bufio.NewReader(stdoutReader).ReadString('\n')
-	if err != nil {
-		cancel()
-		t.Fatalf("ReadString(SERVER_ADDR) error = %v, stderr = %s", err, stderr.String())
+	reader := bufio.NewReader(stdoutReader)
+	foundAddr := false
+	for i := 0; i < 3; i++ {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			cancel()
+			t.Fatalf("ReadString(ADDR) error = %v, stderr = %s", err, stderr.String())
+		}
+		if strings.HasPrefix(line, "ADDR\t") {
+			foundAddr = true
+			break
+		}
 	}
-	if !strings.HasPrefix(line, "SERVER_ADDR\t") {
+	if !foundAddr {
 		cancel()
-		t.Fatalf("server stdout line = %q, want SERVER_ADDR", line)
+		t.Fatalf("server stdout did not include ADDR; stderr = %s", stderr.String())
 	}
 	store := localserver.NewRegistryStore(registryPath)
 	if records, err := store.List(); err != nil || len(records) != 1 {
@@ -3816,13 +4084,13 @@ func TestServerCommandDuplicateSameListenExitsAlreadyRunning(t *testing.T) {
 	projectDir := t.TempDir()
 	writeCLIFixtureInDir(t, filepath.Join(projectDir, ".agents"))
 
-	addr, done, stderr, cleanup := startCLIServerCommandForTest(t, []string{"server", "--port", "0"}, func() (string, error) {
+	addr, done, stderr, cleanup := startCLIServerCommandForTest(t, []string{"server", "start", "--port", "0"}, func() (string, error) {
 		return projectDir, nil
 	})
 	defer cleanup()
 
 	var secondStdout, secondStderr bytes.Buffer
-	code := RunWithGetwd([]string{"server", "--port", "0"}, &secondStdout, &secondStderr, func() (string, error) {
+	code := RunWithGetwd([]string{"server", "start", "--port", "0"}, &secondStdout, &secondStderr, func() (string, error) {
 		return projectDir, nil
 	})
 	if code != 0 {
@@ -3832,10 +4100,10 @@ func TestServerCommandDuplicateSameListenExitsAlreadyRunning(t *testing.T) {
 		t.Fatalf("duplicate stderr = %q, want empty", secondStderr.String())
 	}
 	out := secondStdout.String()
-	if !strings.Contains(out, "SERVER_ALREADY_RUNNING") || !strings.Contains(out, "addr="+addr) || !strings.Contains(out, "pid=") {
+	if !strings.Contains(out, "STATUS\talready_running") || !strings.Contains(out, "ADDR\t"+addr) || !strings.Contains(out, "PID\t") {
 		t.Fatalf("duplicate stdout = %q, want already running addr and pid", out)
 	}
-	if strings.Contains(out, "SERVER_ADDR") {
+	if strings.Contains(out, "STATUS\tstarted") {
 		t.Fatalf("duplicate stdout = %q, should not print new server addr", out)
 	}
 	records, err := localserver.NewRegistryStore(registryPath).List()
@@ -3859,13 +4127,13 @@ func TestServerCommandDuplicateDifferentCWDStillUsesSingleton(t *testing.T) {
 	writeCLIFixtureInDir(t, filepath.Join(firstProject, ".agents"))
 	writeCLIFixtureInDir(t, filepath.Join(secondProject, ".agents"))
 
-	addr, done, stderr, cleanup := startCLIServerCommandForTest(t, []string{"server", "--port", "0"}, func() (string, error) {
+	addr, done, stderr, cleanup := startCLIServerCommandForTest(t, []string{"server", "start", "--port", "0"}, func() (string, error) {
 		return firstProject, nil
 	})
 	defer cleanup()
 
 	var secondStdout, secondStderr bytes.Buffer
-	code := RunWithGetwd([]string{"server", "--port", "0"}, &secondStdout, &secondStderr, func() (string, error) {
+	code := RunWithGetwd([]string{"server", "start", "--port", "0"}, &secondStdout, &secondStderr, func() (string, error) {
 		return secondProject, nil
 	})
 	if code != 0 {
@@ -3874,7 +4142,7 @@ func TestServerCommandDuplicateDifferentCWDStillUsesSingleton(t *testing.T) {
 	if secondStderr.String() != "" {
 		t.Fatalf("duplicate stderr = %q, want empty", secondStderr.String())
 	}
-	if out := secondStdout.String(); !strings.Contains(out, "SERVER_ALREADY_RUNNING") || !strings.Contains(out, "addr="+addr) {
+	if out := secondStdout.String(); !strings.Contains(out, "STATUS\talready_running") || !strings.Contains(out, "ADDR\t"+addr) {
 		t.Fatalf("duplicate stdout = %q, want already running singleton addr", out)
 	}
 
@@ -3890,13 +4158,13 @@ func TestServerCommandDuplicateMissingConfigStillReportsAlreadyRunning(t *testin
 	missingConfigDir := t.TempDir()
 	writeCLIFixtureInDir(t, filepath.Join(projectDir, ".agents"))
 
-	addr, done, stderr, cleanup := startCLIServerCommandForTest(t, []string{"server", "--port", "0"}, func() (string, error) {
+	addr, done, stderr, cleanup := startCLIServerCommandForTest(t, []string{"server", "start", "--port", "0"}, func() (string, error) {
 		return projectDir, nil
 	})
 	defer cleanup()
 
 	var secondStdout, secondStderr bytes.Buffer
-	code := RunWithGetwd([]string{"server", "--port", "0"}, &secondStdout, &secondStderr, func() (string, error) {
+	code := RunWithGetwd([]string{"server", "start", "--port", "0"}, &secondStdout, &secondStderr, func() (string, error) {
 		return missingConfigDir, nil
 	})
 	if code != 0 {
@@ -3905,7 +4173,7 @@ func TestServerCommandDuplicateMissingConfigStillReportsAlreadyRunning(t *testin
 	if secondStderr.String() != "" {
 		t.Fatalf("duplicate missing-config stderr = %q, want empty", secondStderr.String())
 	}
-	if out := secondStdout.String(); !strings.Contains(out, "SERVER_ALREADY_RUNNING") || !strings.Contains(out, "addr="+addr) || strings.Contains(out, "SERVER_ADDR") {
+	if out := secondStdout.String(); !strings.Contains(out, "STATUS\talready_running") || !strings.Contains(out, "ADDR\t"+addr) || strings.Contains(out, "STATUS\tstarted") {
 		t.Fatalf("duplicate missing-config stdout = %q, want already running singleton only", out)
 	}
 
@@ -3920,13 +4188,13 @@ func TestServerCommandDuplicateDifferentListenExitsAlreadyRunning(t *testing.T) 
 	projectDir := t.TempDir()
 	writeCLIFixtureInDir(t, filepath.Join(projectDir, ".agents"))
 
-	addr, done, stderr, cleanup := startCLIServerCommandForTest(t, []string{"server", "--port", "0"}, func() (string, error) {
+	addr, done, stderr, cleanup := startCLIServerCommandForTest(t, []string{"server", "start", "--port", "0"}, func() (string, error) {
 		return projectDir, nil
 	})
 	defer cleanup()
 
 	var secondStdout, secondStderr bytes.Buffer
-	code := RunWithGetwd([]string{"server", "--listen", "127.0.0.1:23456"}, &secondStdout, &secondStderr, func() (string, error) {
+	code := RunWithGetwd([]string{"server", "start", "--listen", "127.0.0.1:23456"}, &secondStdout, &secondStderr, func() (string, error) {
 		return projectDir, nil
 	})
 	if code != 0 {
@@ -3936,10 +4204,10 @@ func TestServerCommandDuplicateDifferentListenExitsAlreadyRunning(t *testing.T) 
 		t.Fatalf("different-listen duplicate stderr = %q, want empty", secondStderr.String())
 	}
 	out := secondStdout.String()
-	if !strings.Contains(out, "SERVER_ALREADY_RUNNING") || !strings.Contains(out, "addr="+addr) || !strings.Contains(out, "pid=") {
+	if !strings.Contains(out, "STATUS\talready_running") || !strings.Contains(out, "ADDR\t"+addr) || !strings.Contains(out, "PID\t") {
 		t.Fatalf("different-listen duplicate stdout = %q, want already running addr and pid", out)
 	}
-	if strings.Contains(out, "SERVER_ADDR") {
+	if strings.Contains(out, "STATUS\tstarted") {
 		t.Fatalf("different-listen duplicate stdout = %q, should not print new server addr", out)
 	}
 	records, err := localserver.NewRegistryStore(registryPath).List()
@@ -3972,7 +4240,7 @@ func TestServerCommandOccupiedPortFailsBeforeRegistryWrite(t *testing.T) {
 	}
 
 	var stdout, stderr bytes.Buffer
-	code := RunWithGetwd([]string{"server", "--port", port}, &stdout, &stderr, func() (string, error) {
+	code := RunWithGetwd([]string{"server", "start", "--port", port}, &stdout, &stderr, func() (string, error) {
 		return projectDir, nil
 	})
 	if code != 1 {
@@ -4010,7 +4278,7 @@ func TestServerCommandStaleRegistryRecordIsReplacedAndCleanedUp(t *testing.T) {
 		t.Fatalf("Upsert(stale) error = %v", err)
 	}
 
-	addr, done, stderr, cleanup := startCLIServerCommandForTest(t, []string{"server", "--port", "0"}, func() (string, error) {
+	addr, done, stderr, cleanup := startCLIServerCommandForTest(t, []string{"server", "start", "--port", "0"}, func() (string, error) {
 		return projectDir, nil
 	})
 	defer cleanup()
@@ -4042,7 +4310,7 @@ func TestServerCommandStaleRegistryRecordIsReplacedAndCleanedUp(t *testing.T) {
 
 func TestServerCommandRejectsNonLoopbackListenWithoutLoadingConfig(t *testing.T) {
 	var stdout, stderr bytes.Buffer
-	code := RunWithGetwd([]string{"server", "--listen", "0.0.0.0:0"}, &stdout, &stderr, func() (string, error) {
+	code := RunWithGetwd([]string{"server", "start", "--listen", "0.0.0.0:0"}, &stdout, &stderr, func() (string, error) {
 		return "", errors.New("getwd should not be called")
 	})
 
@@ -4057,7 +4325,7 @@ func TestServerCommandRejectsNonLoopbackListenWithoutLoadingConfig(t *testing.T)
 
 func TestServerCommandRejectsNegativePortWithoutLoadingConfig(t *testing.T) {
 	var stdout, stderr bytes.Buffer
-	code := RunWithGetwd([]string{"server", "--port", "-1"}, &stdout, &stderr, func() (string, error) {
+	code := RunWithGetwd([]string{"server", "start", "--port", "-1"}, &stdout, &stderr, func() (string, error) {
 		return "", errors.New("getwd should not be called")
 	})
 
@@ -4070,47 +4338,33 @@ func TestServerCommandRejectsNegativePortWithoutLoadingConfig(t *testing.T) {
 	assertCLIErrorContains(t, stderr.String(), "--port must be a number from 0 to 65535")
 }
 
-func TestStatusDiscoversParentServerFromChildCWD(t *testing.T) {
-	registryPath := isolateCLIUserRegistry(t)
+func TestServerStatusUsesSelectedServerRoot(t *testing.T) {
+	isolateCLIUserRegistry(t)
 	projectDir := t.TempDir()
-	childDir := filepath.Join(projectDir, "internal", "cli")
-	if err := os.MkdirAll(childDir, 0o755); err != nil {
-		t.Fatalf("MkdirAll(child) error = %v", err)
-	}
 	writeCLIFixtureInDir(t, filepath.Join(projectDir, ".agents"))
 
-	addr, done, serverStderr, cleanup := startCLIServerCommandForTest(t, []string{"server", "--port", "0"}, func() (string, error) {
+	addr, done, serverStderr, cleanup := startCLIServerCommandForTest(t, []string{"server", "start", "--port", "0"}, func() (string, error) {
 		return projectDir, nil
 	})
 	defer cleanup()
 
 	var stdout, stderr bytes.Buffer
-	code := RunWithGetwd([]string{"--cwd", childDir, "status"}, &stdout, &stderr, func() (string, error) {
+	code := RunWithGetwd([]string{"server", "status"}, &stdout, &stderr, func() (string, error) {
 		return "", errors.New("getwd should not be called")
 	})
 	if code != 0 {
-		t.Fatalf("status code = %d, stderr = %s", code, stderr.String())
+		t.Fatalf("server status code = %d, stderr = %s", code, stderr.String())
 	}
 	if stderr.String() != "" {
 		t.Fatalf("status stderr = %q, want empty", stderr.String())
 	}
-	lines := strings.Split(strings.TrimSpace(stdout.String()), "\n")
-	if len(lines) != 2 {
-		t.Fatalf("status output lines = %#v, want header and one row", lines)
-	}
-	if got, want := lines[0], "cwd\taddr\tpid\tversion\tsession_count\trunning_turns\tuptime_seconds"; got != want {
-		t.Fatalf("status header = %q, want %q", got, want)
-	}
-	fields := strings.Split(lines[1], "\t")
-	if len(fields) != 7 {
-		t.Fatalf("status row fields = %#v, want 7 fields", fields)
-	}
-	if got, want := filepath.Clean(fields[0]), mustCLICanonicalPath(t, filepath.Dir(filepath.Dir(registryPath))); got != want {
-		t.Fatalf("status cwd = %q, want %q", got, want)
-	}
-	if fields[1] != addr || fields[3] != Version || fields[4] != "0" || fields[5] != "0" {
-		t.Fatalf("status row = %#v, want addr/version/counts", fields)
-	}
+	assertCLIOutputContains(t, stdout.String(),
+		"STATUS\trunning\n",
+		"ADDR\t"+addr+"\n",
+		"VERSION\t"+Version+"\n",
+		"SESSION_COUNT\t0\n",
+		"RUNNING_TURNS\t0\n",
+	)
 
 	postCLIServerShutdown(t, addr)
 	if code := waitForCode(t, done); code != 0 {
@@ -4123,7 +4377,7 @@ func TestStatusNoServerHint(t *testing.T) {
 	projectDir := t.TempDir()
 
 	var stdout, stderr bytes.Buffer
-	code := RunWithGetwd([]string{"status"}, &stdout, &stderr, func() (string, error) {
+	code := RunWithGetwd([]string{"server", "status"}, &stdout, &stderr, func() (string, error) {
 		return projectDir, nil
 	})
 	if code != 1 {
@@ -4135,12 +4389,12 @@ func TestStatusNoServerHint(t *testing.T) {
 	assertCLIErrorContains(t, stderr.String(), "no healthy sai server found", "sai server")
 }
 
-func TestHomeNamespaceSelectsIndependentRegistry(t *testing.T) {
+func TestServerRootNamespaceSelectsIndependentRegistry(t *testing.T) {
 	isolateCLIUserRegistry(t)
 	projectDir := t.TempDir()
-	homeA := filepath.Join(t.TempDir(), "home-a")
-	homeB := filepath.Join(t.TempDir(), "home-b")
-	t.Setenv("MY_TOOL_HOME", homeA)
+	rootA := filepath.Join(t.TempDir(), "root-a")
+	rootB := filepath.Join(t.TempDir(), "root-b")
+	t.Setenv("MY_TOOL_SERVER_ROOT", rootA)
 
 	fakeServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
@@ -4148,8 +4402,7 @@ func TestHomeNamespaceSelectsIndependentRegistry(t *testing.T) {
 			writeCLIJSON(w, http.StatusOK, map[string]any{"status": "ok"})
 		case "/server":
 			writeCLIJSON(w, http.StatusOK, map[string]any{
-				"cwd":            projectDir,
-				"addr":           r.Host,
+				"base_url":       r.Host,
 				"pid":            1234,
 				"version":        "test-version",
 				"started_at":     time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC),
@@ -4163,45 +4416,34 @@ func TestHomeNamespaceSelectsIndependentRegistry(t *testing.T) {
 	}))
 	defer fakeServer.Close()
 
-	registerCLIFakeServerInHome(t, homeA, projectDir, fakeServer.URL, "token-a")
+	registerCLIFakeServerInHome(t, rootA, projectDir, fakeServer.URL, "token-a")
 	otherProject := filepath.Join(projectDir, "other")
-	registerCLIFakeServerInHome(t, homeB, otherProject, fakeServer.URL, "token-b")
+	registerCLIFakeServerInHome(t, rootB, otherProject, fakeServer.URL, "token-b")
 
 	var stdout, stderr bytes.Buffer
-	code := RunWithProgramGetwd("my.tool", []string{"status", "--cwd", projectDir}, &stdout, &stderr, func() (string, error) {
+	code := RunWithProgramGetwd("my.tool", []string{"server", "status"}, &stdout, &stderr, func() (string, error) {
 		return projectDir, nil
 	})
 	if code != 0 {
-		t.Fatalf("status with env home code = %d, stderr = %s", code, stderr.String())
+		t.Fatalf("status with env server root code = %d, stderr = %s", code, stderr.String())
 	}
-	if !strings.Contains(stdout.String(), projectDir) {
-		t.Fatalf("status with env home stdout = %q, want home A project", stdout.String())
+	if !strings.Contains(stdout.String(), "ADDR\t"+strings.TrimPrefix(fakeServer.URL, "http://")) {
+		t.Fatalf("status with env server root stdout = %q, want root A server", stdout.String())
 	}
 
 	stdout.Reset()
 	stderr.Reset()
-	code = RunWithProgramGetwd("my.tool", []string{"servers", "--home", homeB, "list"}, &stdout, &stderr, func() (string, error) {
+	code = RunWithProgramGetwd("my.tool", []string{"--server-root", rootB, "server", "status"}, &stdout, &stderr, func() (string, error) {
 		return projectDir, nil
 	})
 	if code != 0 {
-		t.Fatalf("servers list with explicit home code = %d, stderr = %s", code, stderr.String())
-	}
-	out := stdout.String()
-	if !strings.Contains(out, otherProject) {
-		t.Fatalf("servers list home B stdout = %q, want home B record", out)
-	}
-	if strings.Contains(out, projectDir+"\t") {
-		t.Fatalf("servers list home B stdout = %q, should not include env home A record", out)
+		t.Fatalf("status with explicit server root code = %d, stderr = %s", code, stderr.String())
 	}
 }
 
-func TestStopWithCWDStopsServerCleansRegistryAndKeepsData(t *testing.T) {
+func TestServerStopStopsSelectedServerCleansRegistryAndKeepsData(t *testing.T) {
 	registryPath := isolateCLIUserRegistry(t)
 	projectDir := t.TempDir()
-	childDir := filepath.Join(projectDir, "internal", "cli")
-	if err := os.MkdirAll(childDir, 0o755); err != nil {
-		t.Fatalf("MkdirAll(child) error = %v", err)
-	}
 	writeCLIFixtureInDir(t, filepath.Join(projectDir, ".agents"))
 	dataFiles := []string{
 		filepath.Join(projectDir, ".agents", "sessions", "keep.txt"),
@@ -4215,13 +4457,13 @@ func TestStopWithCWDStopsServerCleansRegistryAndKeepsData(t *testing.T) {
 		writeCLIFile(t, path, "keep")
 	}
 
-	addr, done, serverStderr, cleanup := startCLIServerCommandForTest(t, []string{"server", "--port", "0"}, func() (string, error) {
+	addr, done, serverStderr, cleanup := startCLIServerCommandForTest(t, []string{"server", "start", "--port", "0"}, func() (string, error) {
 		return projectDir, nil
 	})
 	defer cleanup()
 
 	var stdout, stderr bytes.Buffer
-	code := RunWithGetwd([]string{"stop", "--cwd", childDir}, &stdout, &stderr, func() (string, error) {
+	code := RunWithGetwd([]string{"server", "stop"}, &stdout, &stderr, func() (string, error) {
 		return "", errors.New("getwd should not be called")
 	})
 	if code != 0 {
@@ -4230,7 +4472,7 @@ func TestStopWithCWDStopsServerCleansRegistryAndKeepsData(t *testing.T) {
 	if stderr.String() != "" {
 		t.Fatalf("stop stderr = %q, want empty", stderr.String())
 	}
-	if !strings.Contains(stdout.String(), "SERVER_STOPPED") || !strings.Contains(stdout.String(), "addr="+addr) {
+	if !strings.Contains(stdout.String(), "STATUS\tstopped") || !strings.Contains(stdout.String(), "ADDR\t"+addr) {
 		t.Fatalf("stop stdout = %q, want stopped addr", stdout.String())
 	}
 	if code := waitForCode(t, done); code != 0 {
@@ -4303,7 +4545,7 @@ func TestStopSendsRegistryToken(t *testing.T) {
 	}
 
 	var stdout, stderr bytes.Buffer
-	code := RunWithGetwd([]string{"stop", "--cwd", projectDir}, &stdout, &stderr, func() (string, error) {
+	code := RunWithGetwd([]string{"server", "stop"}, &stdout, &stderr, func() (string, error) {
 		return "", errors.New("getwd should not be called")
 	})
 	if code != 0 {
@@ -4320,7 +4562,7 @@ func TestStopSendsRegistryToken(t *testing.T) {
 	default:
 		t.Fatal("shutdown endpoint was not called")
 	}
-	if !strings.Contains(stdout.String(), "SERVER_STOPPED") || !strings.Contains(stdout.String(), "addr="+addr) {
+	if !strings.Contains(stdout.String(), "STATUS\tstopped") || !strings.Contains(stdout.String(), "ADDR\t"+addr) {
 		t.Fatalf("stop stdout = %q, want stopped addr", stdout.String())
 	}
 	records, err := store.List()
@@ -4385,7 +4627,7 @@ func TestStopWaitSendsShutdownWaitQuery(t *testing.T) {
 	}
 
 	var stdout, stderr bytes.Buffer
-	code := RunWithGetwd([]string{"stop", "--cwd", projectDir, "--wait", "--timeout-ms", "1500"}, &stdout, &stderr, func() (string, error) {
+	code := RunWithGetwd([]string{"server", "stop", "--wait", "--timeout-ms", "1500"}, &stdout, &stderr, func() (string, error) {
 		return "", errors.New("getwd should not be called")
 	})
 	if code != 0 {
@@ -4406,7 +4648,7 @@ func TestStopWaitSendsShutdownWaitQuery(t *testing.T) {
 	default:
 		t.Fatal("shutdown endpoint was not called")
 	}
-	if !strings.Contains(stdout.String(), "SERVER_STOPPED") || !strings.Contains(stdout.String(), "addr="+addr) {
+	if !strings.Contains(stdout.String(), "STATUS\tstopped") || !strings.Contains(stdout.String(), "ADDR\t"+addr) {
 		t.Fatalf("stop --wait stdout = %q, want stopped addr", stdout.String())
 	}
 	records, err := store.List()
@@ -4470,7 +4712,7 @@ func TestStopWaitWithoutTimeoutCanDrainPastDefaultClientTimeout(t *testing.T) {
 
 	started := time.Now()
 	var stdout, stderr bytes.Buffer
-	code := RunWithGetwd([]string{"stop", "--cwd", projectDir, "--wait"}, &stdout, &stderr, func() (string, error) {
+	code := RunWithGetwd([]string{"server", "stop", "--wait"}, &stdout, &stderr, func() (string, error) {
 		return "", errors.New("getwd should not be called")
 	})
 	if code != 0 {
@@ -4494,7 +4736,7 @@ func TestStopWaitWithoutTimeoutCanDrainPastDefaultClientTimeout(t *testing.T) {
 	default:
 		t.Fatal("shutdown endpoint was not called")
 	}
-	if !strings.Contains(stdout.String(), "SERVER_STOPPED") || !strings.Contains(stdout.String(), "addr="+addr) {
+	if !strings.Contains(stdout.String(), "STATUS\tstopped") || !strings.Contains(stdout.String(), "ADDR\t"+addr) {
 		t.Fatalf("stop --wait stdout = %q, want stopped addr", stdout.String())
 	}
 	records, err := store.List()
@@ -4524,18 +4766,16 @@ func TestStopCleansStaleRegistryRecord(t *testing.T) {
 	}
 
 	var stdout, stderr bytes.Buffer
-	code := RunWithGetwd([]string{"stop"}, &stdout, &stderr, func() (string, error) {
+	code := RunWithGetwd([]string{"server", "stop"}, &stdout, &stderr, func() (string, error) {
 		return projectDir, nil
 	})
-	if code != 0 {
-		t.Fatalf("stop stale code = %d, stderr = %s", code, stderr.String())
+	if code != 1 {
+		t.Fatalf("stop stale code = %d, want 1", code)
 	}
-	if stderr.String() != "" {
-		t.Fatalf("stop stale stderr = %q, want empty", stderr.String())
+	if stdout.String() != "" {
+		t.Fatalf("stop stale stdout = %q, want empty", stdout.String())
 	}
-	if !strings.Contains(stdout.String(), "SERVER_STOPPED\tstale_records_removed=1") {
-		t.Fatalf("stop stale stdout = %q, want stale cleanup", stdout.String())
-	}
+	assertCLIErrorContains(t, stderr.String(), "no healthy sai server found", "sai server start")
 	records, err := store.List()
 	if err != nil {
 		t.Fatalf("registry List() error = %v", err)
@@ -4545,49 +4785,18 @@ func TestStopCleansStaleRegistryRecord(t *testing.T) {
 	}
 }
 
-func TestServersListShowsHealthySingleton(t *testing.T) {
-	registryPath := isolateCLIUserRegistry(t)
-	projectDir := t.TempDir()
-	writeCLIFixtureInDir(t, filepath.Join(projectDir, ".agents"))
-
-	addr, done, serverStderr, cleanup := startCLIServerCommandForTest(t, []string{"server", "--port", "0"}, func() (string, error) {
-		return projectDir, nil
-	})
-	defer cleanup()
-
-	store := localserver.NewRegistryStore(registryPath)
+func TestServersCommandRemoved(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	code := RunWithGetwd([]string{"servers", "list"}, &stdout, &stderr, func() (string, error) {
 		return "", errors.New("getwd should not be called")
 	})
-	if code != 0 {
-		t.Fatalf("servers list code = %d, stderr = %s", code, stderr.String())
+	if code != 1 {
+		t.Fatalf("servers list code = %d, want 1", code)
 	}
-	if stderr.String() != "" {
-		t.Fatalf("servers list stderr = %q, want empty", stderr.String())
+	if stdout.String() != "" {
+		t.Fatalf("stdout = %q, want empty", stdout.String())
 	}
-	out := stdout.String()
-	for _, want := range []string{
-		"cwd\taddr\tpid\tversion\thealth",
-		mustCLICanonicalPath(t, filepath.Dir(filepath.Dir(registryPath))) + "\t" + addr,
-		"\thealthy",
-	} {
-		if !strings.Contains(out, want) {
-			t.Fatalf("servers list output missing %q:\n%s", want, out)
-		}
-	}
-	records, err := store.List()
-	if err != nil {
-		t.Fatalf("registry List() error = %v", err)
-	}
-	if len(records) != 1 || records[0].BaseURL != addr {
-		t.Fatalf("registry after servers list = %#v, want healthy record only", records)
-	}
-
-	postCLIServerShutdown(t, addr)
-	if code := waitForCode(t, done); code != 0 {
-		t.Fatalf("server command code = %d, stderr = %s", code, serverStderr.String())
-	}
+	assertCLIErrorContains(t, stderr.String(), `unknown command "servers"`, `Run "sai help" for usage.`)
 }
 
 func TestVersionHelpWritesUsageWithoutConfig(t *testing.T) {
@@ -4680,21 +4889,6 @@ func TestGroupHelpWritesUsageWithoutConfig(t *testing.T) {
 			args:  []string{"help", "mcp"},
 			wants: []string{"usage: sai mcp <command>", "mcp list"},
 		},
-		{
-			name:  "sessions flag short",
-			args:  []string{"sessions", "-h"},
-			wants: []string{"usage: sai sessions [list]", `Alias for "sai session list"`},
-		},
-		{
-			name:  "sessions flag long",
-			args:  []string{"sessions", "--help"},
-			wants: []string{"usage: sai sessions [list]", `Alias for "sai session list"`},
-		},
-		{
-			name:  "sessions help",
-			args:  []string{"help", "sessions"},
-			wants: []string{"usage: sai sessions [list]", `Alias for "sai session list"`},
-		},
 	}
 
 	for _, tt := range tests {
@@ -4750,16 +4944,6 @@ func TestNestedHelpWritesUsageWithoutConfig(t *testing.T) {
 			args:  []string{"help", "mcp", "list"},
 			wants: []string{"usage: sai mcp list", "--enable-mcp ids"},
 		},
-		{
-			name:  "sessions list flag",
-			args:  []string{"sessions", "list", "-h"},
-			wants: []string{"usage: sai sessions list", `Alias for "sai session list"`, "messages, prompts, assistant output"},
-		},
-		{
-			name:  "sessions list help",
-			args:  []string{"help", "sessions", "list"},
-			wants: []string{"usage: sai sessions list", `Alias for "sai session list"`, "messages, prompts, assistant output"},
-		},
 	}
 
 	for _, tt := range tests {
@@ -4769,30 +4953,35 @@ func TestNestedHelpWritesUsageWithoutConfig(t *testing.T) {
 	}
 }
 
-func TestPluralSessionsHelpOnlyAdvertisesListAlias(t *testing.T) {
-	tests := [][]string{
-		{"sessions", "-h"},
-		{"help", "sessions"},
-		{"sessions", "list", "-h"},
-		{"help", "sessions", "list"},
+func TestPluralSessionsCommandIsRemoved(t *testing.T) {
+	tests := []struct {
+		args []string
+		want string
+		hint string
+	}{
+		{args: []string{"sessions"}, want: `unknown command "sessions"`, hint: `Run "sai help" for usage.`},
+		{args: []string{"sessions", "-h"}, want: `unknown command "sessions"`, hint: `Run "sai help" for usage.`},
+		{args: []string{"sessions", "list"}, want: `unknown command "sessions"`, hint: `Run "sai help" for usage.`},
+		{args: []string{"sessions", "list", "-h"}, want: `unknown command "sessions"`, hint: `Run "sai help" for usage.`},
+		{args: []string{"help", "sessions"}, want: `unknown help topic "sessions"`, hint: `Run "sai help" for usage.`},
+		{args: []string{"help", "sessions", "list"}, want: `unknown help topic "sessions list"`, hint: `Run "sai help" for usage.`},
 	}
-	for _, args := range tests {
-		t.Run(strings.Join(args, " "), func(t *testing.T) {
+	for _, tt := range tests {
+		t.Run(strings.Join(tt.args, " "), func(t *testing.T) {
 			var stdout, stderr bytes.Buffer
-			code := RunWithGetwd(args, &stdout, &stderr, func() (string, error) {
+			code := RunWithGetwd(tt.args, &stdout, &stderr, func() (string, error) {
 				return "", errors.New("getwd should not be called")
 			})
-			if code != 0 {
-				t.Fatalf("RunWithGetwd(%v) code = %d, stderr = %s", args, code, stderr.String())
+			if code != 1 {
+				t.Fatalf("RunWithGetwd(%v) code = %d, want 1", tt.args, code)
 			}
-			if stderr.String() != "" {
-				t.Fatalf("stderr = %q, want empty", stderr.String())
+			if stdout.String() != "" {
+				t.Fatalf("stdout = %q, want empty", stdout.String())
 			}
-			out := stdout.String()
-			assertCLIOutputContains(t, out, `Alias for "sai session list"`)
-			for _, forbidden := range []string{"sessions show", "sessions delete", "sessions prune", "--cwd path"} {
-				if strings.Contains(out, forbidden) {
-					t.Fatalf("sessions alias help advertised %q:\n%s", forbidden, out)
+			assertCLIErrorContains(t, stderr.String(), tt.want, tt.hint)
+			for _, forbidden := range []string{"usage: sai sessions", `Alias for "sai session list"`} {
+				if strings.Contains(stderr.String(), forbidden) {
+					t.Fatalf("removed sessions command printed %q:\n%s", forbidden, stderr.String())
 				}
 			}
 		})
@@ -8300,109 +8489,17 @@ func TestChatSaveToolResultsFalseRejectsSaveAndResume(t *testing.T) {
 	}
 }
 
-func TestPluralSessionsAliasesSessionListProjectScoped(t *testing.T) {
+func TestPluralSessionsRejectsLegacyCommandsAndCWD(t *testing.T) {
 	tests := []struct {
 		name string
 		args []string
 	}{
-		{name: "bare plural", args: []string{"sessions"}},
-		{name: "plural list", args: []string{"sessions", "list"}},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			registryPath := isolateCLIUserRegistry(t)
-			parentDir := t.TempDir()
-			childDir := filepath.Join(parentDir, "child")
-			leafDir := filepath.Join(childDir, "leaf")
-			if err := os.MkdirAll(leafDir, 0o755); err != nil {
-				t.Fatalf("MkdirAll(leafDir) error = %v", err)
-			}
-			parentRoot, err := projectstore.CanonicalRoot(parentDir)
-			if err != nil {
-				t.Fatalf("CanonicalRoot(parent) error = %v", err)
-			}
-			childRoot, err := projectstore.CanonicalRoot(childDir)
-			if err != nil {
-				t.Fatalf("CanonicalRoot(child) error = %v", err)
-			}
-			updatedAt := time.Date(2026, 7, 4, 6, 1, 0, 0, time.UTC)
-
-			projectsAuthSeen := make(chan string, 1)
-			sessionsAuthSeen := make(chan string, 1)
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				switch {
-				case r.URL.Path == "/health":
-					writeCLIJSON(w, http.StatusOK, map[string]any{"status": "ok"})
-				case r.URL.Path == "/projects" && r.Method == http.MethodGet:
-					projectsAuthSeen <- r.Header.Get("Authorization")
-					writeCLIJSON(w, http.StatusOK, map[string]any{
-						"projects": []map[string]any{
-							{"id": "project-parent", "root": parentRoot, "archived": false, "created_at": updatedAt, "updated_at": updatedAt},
-							{"id": "project-child", "root": childRoot, "archived": false, "created_at": updatedAt, "updated_at": updatedAt},
-						},
-					})
-				case r.URL.Path == "/projects/project-child/sessions" && r.Method == http.MethodGet:
-					sessionsAuthSeen <- r.Header.Get("Authorization")
-					writeCLIJSON(w, http.StatusOK, map[string]any{
-						"sessions": []map[string]any{
-							{"id": "child-session", "created_at": updatedAt, "updated_at": updatedAt, "provider": "fake", "model_profile": "default", "model_id": "model-default", "project_id": "project-child"},
-						},
-					})
-				case r.URL.Path == "/sessions":
-					t.Fatalf("plural sessions alias should not use global sessions list, got %s %q", r.Method, r.URL.Path)
-				default:
-					t.Fatalf("unexpected path %s %q", r.Method, r.URL.Path)
-				}
-			}))
-			defer server.Close()
-			registerCLIFakeServer(t, registryPath, parentDir, server.URL, "registry-token")
-
-			var stdout, stderr bytes.Buffer
-			code := RunWithGetwd(tt.args, &stdout, &stderr, func() (string, error) {
-				return leafDir, nil
-			})
-
-			if code != 0 {
-				t.Fatalf("RunWithGetwd() code = %d, stderr = %s", code, stderr.String())
-			}
-			for name, ch := range map[string]<-chan string{
-				"projects":         projectsAuthSeen,
-				"project sessions": sessionsAuthSeen,
-			} {
-				select {
-				case got := <-ch:
-					if got != "Bearer registry-token" {
-						t.Fatalf("%s Authorization = %q, want bearer token", name, got)
-					}
-				default:
-					t.Fatalf("%s request was not called", name)
-				}
-			}
-			assertCLIOutputContains(t, stdout.String(),
-				"ID\tLAST_USED\tPROVIDER\tMODEL/PROFILE",
-				"child-session\t2026-07-04T06:01:00Z\tfake\tmodel-default/default",
-			)
-			assertCLIErrorOmits(t, stdout.String(), "prompt secret", "assistant secret", "tool secret", "registry-token")
-			if stderr.String() != "" {
-				t.Fatalf("stderr = %q, want empty", stderr.String())
-			}
-		})
-	}
-}
-
-func TestPluralSessionsRejectsLegacyCommandsAndCWD(t *testing.T) {
-	tests := []struct {
-		name     string
-		args     []string
-		want     string
-		helpHint string
-	}{
-		{name: "show", args: []string{"sessions", "show", "show-session"}, want: "usage: sai sessions [list]", helpHint: `Run "sai help sessions" for usage.`},
-		{name: "show help flag", args: []string{"sessions", "show", "-h"}, want: "usage: sai sessions [list]", helpHint: `Run "sai help sessions" for usage.`},
-		{name: "delete", args: []string{"sessions", "delete", "delete-session"}, want: "usage: sai sessions [list]", helpHint: `Run "sai help sessions" for usage.`},
-		{name: "prune", args: []string{"sessions", "prune", "--keep", "1"}, want: "usage: sai sessions [list]", helpHint: `Run "sai help sessions" for usage.`},
-		{name: "group cwd", args: []string{"sessions", "--cwd", t.TempDir()}, want: "flag provided but not defined: -cwd", helpHint: `Run "sai help sessions" for usage.`},
-		{name: "list cwd", args: []string{"sessions", "list", "--cwd", t.TempDir()}, want: "flag provided but not defined: -cwd", helpHint: `Run "sai help session list" for usage.`},
+		{name: "show", args: []string{"sessions", "show", "show-session"}},
+		{name: "show help flag", args: []string{"sessions", "show", "-h"}},
+		{name: "delete", args: []string{"sessions", "delete", "delete-session"}},
+		{name: "prune", args: []string{"sessions", "prune", "--keep", "1"}},
+		{name: "group cwd", args: []string{"sessions", "--cwd", t.TempDir()}},
+		{name: "list cwd", args: []string{"sessions", "list", "--cwd", t.TempDir()}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -8416,11 +8513,13 @@ func TestPluralSessionsRejectsLegacyCommandsAndCWD(t *testing.T) {
 			if stdout.String() != "" {
 				t.Fatalf("stdout = %q, want empty", stdout.String())
 			}
-			assertCLIErrorContains(t, stderr.String(), tt.want, tt.helpHint)
+			assertCLIErrorContains(t, stderr.String(), `unknown command "sessions"`, `Run "sai help" for usage.`)
 			for _, forbidden := range []string{
+				"usage: sai sessions",
 				"usage: sai sessions show",
 				"usage: sai sessions delete",
 				"usage: sai sessions prune",
+				`Alias for "sai session list"`,
 				"Deletes one resumable session",
 				"--keep must be provided",
 			} {
@@ -8432,6 +8531,8 @@ func TestPluralSessionsRejectsLegacyCommandsAndCWD(t *testing.T) {
 	}
 
 	for _, args := range [][]string{
+		{"help", "sessions"},
+		{"help", "sessions", "list"},
 		{"help", "sessions", "show"},
 		{"help", "sessions", "delete"},
 		{"help", "sessions", "prune"},
@@ -8492,7 +8593,7 @@ func TestSendExistingUsesServerAPIWithTokenAndMetadata(t *testing.T) {
 
 	var stdout, stderr bytes.Buffer
 	code := RunWithGetwd([]string{"send", "existing-session", "--prompt", prompt}, &stdout, &stderr, func() (string, error) {
-		return projectDir, nil
+		return "", errors.New("getwd should not be called")
 	})
 
 	if code != 0 {
@@ -9100,22 +9201,111 @@ func TestSendErrorDoesNotLeakPromptOrServerMessage(t *testing.T) {
 	assertCLIErrorOmits(t, stderr.String(), prompt, "assistant body secret", "tool body secret", "registry-token")
 }
 
-func TestAttachExplicitNoServerHint(t *testing.T) {
-	isolateCLIUserRegistry(t)
+func TestAttachExplicitAutoStartsWithoutCWDDiscovery(t *testing.T) {
+	registryPath := isolateCLIUserRegistry(t)
 	projectDir := t.TempDir()
 
+	streamAuthSeen := make(chan string, 1)
+	upgrader := websocket.Upgrader{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/health":
+			writeCLIJSON(w, http.StatusOK, map[string]any{"status": "ok"})
+		case "/sessions/missing-session/stream":
+			streamAuthSeen <- r.Header.Get("Authorization")
+			conn, err := upgrader.Upgrade(w, r, nil)
+			if err != nil {
+				t.Fatalf("Upgrade(stream) error = %v", err)
+			}
+			defer conn.Close()
+			for {
+				if _, _, err := conn.NextReader(); err != nil {
+					return
+				}
+			}
+		default:
+			t.Fatalf("unexpected path %q", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+	childArgsCh := stubCLIBackgroundStartWithRegistry(t, registryPath, projectDir, server.URL, "auto-token", 5432)
+
 	var stdout, stderr bytes.Buffer
-	code := RunWithGetwd([]string{"attach", "missing-session"}, &stdout, &stderr, func() (string, error) {
-		return projectDir, nil
+	code := RunWithIO([]string{"attach", "missing-session"}, strings.NewReader("/quit\n"), &stdout, &stderr, func() (string, error) {
+		return "", errors.New("getwd should not be called")
 	})
 
-	if code != 1 {
-		t.Fatalf("attach code = %d, want 1", code)
+	if code != 0 {
+		t.Fatalf("attach code = %d, stderr = %s", code, stderr.String())
+	}
+	childArgs := <-childArgsCh
+	assertCLIFlagValue(t, childArgs, "--server-root", mustCLICanonicalPath(t, filepath.Dir(filepath.Dir(registryPath))))
+	assertCLIStringSliceOmits(t, childArgs, "--background-child", "--config", "--cwd")
+	select {
+	case got := <-streamAuthSeen:
+		if got != "Bearer auto-token" {
+			t.Fatalf("stream Authorization = %q, want auto-start token", got)
+		}
+	default:
+		t.Fatal("session stream was not connected")
 	}
 	if stdout.String() != "" {
 		t.Fatalf("stdout = %q, want empty", stdout.String())
 	}
-	assertCLIErrorContains(t, stderr.String(), "no healthy sai server found", "sai server")
+	assertCLIOutputContains(t, stderr.String(), "sai: attached to session missing-session")
+	assertCLIErrorOmits(t, stderr.String(), "auto-token")
+}
+
+func TestAttachExplicitUsesSelectedServerWithoutCWDDiscovery(t *testing.T) {
+	registryPath := isolateCLIUserRegistry(t)
+	projectDir := t.TempDir()
+
+	streamAuthSeen := make(chan string, 1)
+	upgrader := websocket.Upgrader{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/health":
+			writeCLIJSON(w, http.StatusOK, map[string]any{"status": "ok"})
+		case "/sessions/existing-session/stream":
+			streamAuthSeen <- r.Header.Get("Authorization")
+			conn, err := upgrader.Upgrade(w, r, nil)
+			if err != nil {
+				t.Fatalf("Upgrade(stream) error = %v", err)
+			}
+			defer conn.Close()
+			for {
+				if _, _, err := conn.NextReader(); err != nil {
+					return
+				}
+			}
+		default:
+			t.Fatalf("unexpected path %q", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+	registerCLIFakeServer(t, registryPath, projectDir, server.URL, "registry-token")
+
+	var stdout, stderr bytes.Buffer
+	code := RunWithIO([]string{"attach", "existing-session"}, strings.NewReader("/quit\n"), &stdout, &stderr, func() (string, error) {
+		return "", errors.New("getwd should not be called")
+	})
+
+	if code != 0 {
+		t.Fatalf("attach explicit code = %d, stderr = %s", code, stderr.String())
+	}
+	select {
+	case got := <-streamAuthSeen:
+		if got != "Bearer registry-token" {
+			t.Fatalf("stream Authorization = %q, want bearer registry token", got)
+		}
+	default:
+		t.Fatal("session stream was not connected")
+	}
+	if stdout.String() != "" {
+		t.Fatalf("stdout = %q, want empty", stdout.String())
+	}
+	assertCLIOutputContains(t, stderr.String(), "sai: attached to session existing-session")
+	assertCLIErrorOmits(t, stderr.String(), "registry-token")
 }
 
 func TestAttachExistingRejectsCWDAndConfigBeforeDiscovery(t *testing.T) {
@@ -10172,30 +10362,23 @@ func TestAttachCompactWaitsWithoutDefaultHTTPTimeout(t *testing.T) {
 	assertCLIErrorOmits(t, stderr.String(), "registry-token")
 }
 
-func TestClientCommandsNoServerHint(t *testing.T) {
+func TestServerControlCommandsNoServerHint(t *testing.T) {
 	isolateCLIUserRegistry(t)
-	projectDir := t.TempDir()
 
 	tests := []struct {
 		args  []string
 		getwd func() (string, error)
 	}{
 		{
-			args: []string{"attach", "missing-session"},
+			args: []string{"server", "status"},
 			getwd: func() (string, error) {
-				return projectDir, nil
+				return "", errors.New("getwd should not be called")
 			},
 		},
 		{
-			args: []string{"attach", "missing-session"},
+			args: []string{"server", "stop"},
 			getwd: func() (string, error) {
-				return projectDir, nil
-			},
-		},
-		{
-			args: []string{"send", "missing-session", "--prompt", "hello"},
-			getwd: func() (string, error) {
-				return projectDir, nil
+				return "", errors.New("getwd should not be called")
 			},
 		},
 	}
@@ -14506,7 +14689,7 @@ func stubCLIBackgroundStartWithRegistry(t *testing.T, registryPath, projectDir, 
 	childArgsCh := make(chan []string, 1)
 	waitDone := make(chan struct{})
 	var closeWait sync.Once
-	startBackgroundServerProcess = func(ctx context.Context, args []string) (*backgroundServerProcess, error) {
+	startBackgroundServerProcess = func(ctx context.Context, args []string, env []string) (*backgroundServerProcess, error) {
 		childArgsCh <- append([]string(nil), args...)
 		if err := localserver.NewRegistryStore(registryPath).Upsert(localserver.RegistryRecord{
 			CWD:             projectDir,
@@ -14541,9 +14724,9 @@ func stubCLIBackgroundStartWithRegistry(t *testing.T, registryPath, projectDir, 
 func registerCLIFakeServerInHome(t *testing.T, home, projectDir, rawURL, token string) {
 	t.Helper()
 
-	path, err := localserver.RegistryPathForHome(home)
+	path, err := localserver.RegistryPathForServerRoot(home)
 	if err != nil {
-		t.Fatalf("RegistryPathForHome(%q) error = %v", home, err)
+		t.Fatalf("RegistryPathForServerRoot(%q) error = %v", home, err)
 	}
 	registerCLIFakeServer(t, path, projectDir, rawURL, token)
 }
@@ -14581,30 +14764,43 @@ func startCLIServerCommandForTest(t *testing.T, args []string, getwd func() (str
 		_ = stdoutWriter.Close()
 	}()
 
-	lineCh := make(chan string, 1)
+	addrCh := make(chan string, 1)
 	go func() {
-		line, err := bufio.NewReader(stdoutReader).ReadString('\n')
-		if err != nil {
-			lineCh <- "ERROR\t" + err.Error()
-			return
+		reader := bufio.NewReader(stdoutReader)
+		sentAddr := false
+		for {
+			line, err := reader.ReadString('\n')
+			if err != nil {
+				if !sentAddr {
+					addrCh <- ""
+				}
+				return
+			}
+			line = strings.TrimRight(line, "\r\n")
+			if addr, ok := strings.CutPrefix(line, "ADDR\t"); ok && !sentAddr {
+				addrCh <- strings.TrimSpace(addr)
+				sentAddr = true
+			}
 		}
-		lineCh <- strings.TrimRight(line, "\r\n")
 	}()
 
-	var line string
+	var addr string
 	select {
-	case line = <-lineCh:
+	case addr = <-addrCh:
 	case code := <-done:
 		cancel()
 		t.Fatalf("server command exited before printing address: code = %d, stderr = %s", code, stderr.String())
 	case <-time.After(2 * time.Second):
 		cancel()
-		t.Fatalf("timed out waiting for SERVER_ADDR, stderr = %s", stderr.String())
+		t.Fatalf("timed out waiting for ADDR, stderr = %s", stderr.String())
 	}
-	addr, ok := strings.CutPrefix(line, "SERVER_ADDR\t")
-	if !ok || strings.TrimSpace(addr) == "" {
+	if strings.TrimSpace(addr) == "" {
 		cancel()
-		t.Fatalf("server stdout line = %q, want SERVER_ADDR line; stderr = %s", line, stderr.String())
+		t.Fatalf("server stdout missing ADDR line; stderr = %s", stderr.String())
+	}
+	if err := localserver.CheckHealth(context.Background(), addr, 2*time.Second); err != nil {
+		cancel()
+		t.Fatalf("server at %s did not become healthy: %v; stderr = %s", addr, err, stderr.String())
 	}
 
 	cleanup := func() {
@@ -15369,6 +15565,19 @@ func assertCLIOutputContains(t *testing.T, got string, wants ...string) {
 	}
 }
 
+func valueFromCLIKeyValueOutput(t *testing.T, got, key string) string {
+	t.Helper()
+
+	prefix := key + "\t"
+	for _, line := range strings.Split(strings.TrimSpace(got), "\n") {
+		if value, ok := strings.CutPrefix(strings.TrimRight(line, "\r"), prefix); ok {
+			return value
+		}
+	}
+	t.Fatalf("output = %q, want key %q", got, key)
+	return ""
+}
+
 func replaceCLIFileText(t *testing.T, path, old, new string) {
 	t.Helper()
 
@@ -15397,6 +15606,34 @@ func unsetEnvForCLITest(t *testing.T, name string) {
 			_ = os.Unsetenv(name)
 		}
 	})
+}
+
+func applyCLIEnv(env []string) func() {
+	type previousValue struct {
+		value string
+		ok    bool
+	}
+	previous := make(map[string]previousValue, len(env))
+	for _, assignment := range env {
+		key, value, ok := strings.Cut(assignment, "=")
+		if !ok || key == "" {
+			continue
+		}
+		if _, seen := previous[key]; !seen {
+			oldValue, hadValue := os.LookupEnv(key)
+			previous[key] = previousValue{value: oldValue, ok: hadValue}
+		}
+		_ = os.Setenv(key, value)
+	}
+	return func() {
+		for key, value := range previous {
+			if value.ok {
+				_ = os.Setenv(key, value.value)
+			} else {
+				_ = os.Unsetenv(key)
+			}
+		}
+	}
 }
 
 func runLegacyChatWithIO(args []string, stdin io.Reader, stdout, stderr io.Writer, getwd func() (string, error)) int {

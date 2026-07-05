@@ -91,20 +91,15 @@ func TestProjectCreateValidationAndUnavailableStore(t *testing.T) {
 	assertErrorCode(t, body, "project_store_unavailable")
 }
 
-func TestProjectRemoveArchivesAndDeleteDataDeletes(t *testing.T) {
+func TestProjectArchiveAndRemoveDeletesArchivedProject(t *testing.T) {
 	storeRoot := filepath.Join(t.TempDir(), "projects")
 	store := projectstore.NewStore(storeRoot)
 	archiveRoot := t.TempDir()
-	deleteRoot := t.TempDir()
 	archiveProject, _, err := store.Create(archiveRoot, "Archive")
 	if err != nil {
 		t.Fatalf("Create(archive) error = %v", err)
 	}
-	deleteProject, _, err := store.Create(deleteRoot, "Delete")
-	if err != nil {
-		t.Fatalf("Create(delete) error = %v", err)
-	}
-	extraProjectData := filepath.Join(storeRoot, deleteProject.ID, "data.bin")
+	extraProjectData := filepath.Join(storeRoot, archiveProject.ID, "data.bin")
 	if err := os.WriteFile(extraProjectData, []byte("project data"), 0o600); err != nil {
 		t.Fatalf("WriteFile(extraProjectData) error = %v", err)
 	}
@@ -117,19 +112,22 @@ func TestProjectRemoveArchivesAndDeleteDataDeletes(t *testing.T) {
 		t.Fatalf("permission error leaked token or path: %s", raw)
 	}
 
-	removed, err := RemoveProjectWithToken(context.Background(), process.Addr(), "registry-token", archiveProject.ID, false, 2*time.Second)
+	_, body = deleteRawJSONStatus(t, baseURL+"/projects/"+archiveProject.ID, "registry-token", http.StatusConflict)
+	assertErrorCode(t, body, "project_active")
+
+	archived, err := ArchiveProjectWithToken(context.Background(), process.Addr(), "registry-token", archiveProject.ID, 2*time.Second)
 	if err != nil {
-		t.Fatalf("RemoveProjectWithToken(archive) error = %v", err)
+		t.Fatalf("ArchiveProjectWithToken() error = %v", err)
 	}
-	if removed.Deleted || removed.Project.ID != archiveProject.ID || !removed.Project.Archived {
-		t.Fatalf("archive result = %#v, want archived project metadata", removed)
+	if archived.ID != archiveProject.ID || !archived.Archived {
+		t.Fatalf("archive result = %#v, want archived project metadata", archived)
 	}
 	listed, err := store.List()
 	if err != nil {
 		t.Fatalf("List() after archive error = %v", err)
 	}
-	if len(listed) != 1 || listed[0].ID != deleteProject.ID {
-		t.Fatalf("List() after archive = %#v, want only delete project", listed)
+	if len(listed) != 0 {
+		t.Fatalf("List() after archive = %#v, want no active projects", listed)
 	}
 	loadedArchive, err := store.Load(archiveProject.ID)
 	if err != nil {
@@ -139,18 +137,18 @@ func TestProjectRemoveArchivesAndDeleteDataDeletes(t *testing.T) {
 		t.Fatalf("Load(archived).Archived = false, want true")
 	}
 
-	deleted, err := RemoveProjectWithToken(context.Background(), process.Addr(), "registry-token", deleteProject.ID, true, 2*time.Second)
+	deleted, err := RemoveProjectWithToken(context.Background(), process.Addr(), "registry-token", archiveProject.ID, 2*time.Second)
 	if err != nil {
-		t.Fatalf("RemoveProjectWithToken(delete-data) error = %v", err)
+		t.Fatalf("RemoveProjectWithToken() error = %v", err)
 	}
-	if !deleted.Deleted || deleted.Status != "deleted" || deleted.ID != deleteProject.ID {
-		t.Fatalf("delete result = %#v, want deleted status and id", deleted)
+	if deleted.Status != "removed" || deleted.ID != archiveProject.ID {
+		t.Fatalf("remove result = %#v, want removed status and id", deleted)
 	}
-	if _, err := store.Load(deleteProject.ID); !errors.Is(err, projectstore.ErrNotFound) {
-		t.Fatalf("Load(deleted) error = %v, want ErrNotFound", err)
+	if _, err := store.Load(archiveProject.ID); !errors.Is(err, projectstore.ErrNotFound) {
+		t.Fatalf("Load(removed) error = %v, want ErrNotFound", err)
 	}
-	if _, err := os.Stat(filepath.Join(storeRoot, deleteProject.ID)); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("deleted project directory stat error = %v, want not exist", err)
+	if _, err := os.Stat(filepath.Join(storeRoot, archiveProject.ID)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("removed project directory stat error = %v, want not exist", err)
 	}
 }
 
@@ -208,17 +206,6 @@ func TestProjectRemoveRejectsRunningProjectTurn(t *testing.T) {
 	} {
 		if bytes.Contains(raw, forbidden) {
 			t.Fatalf("project_busy response leaked %s: %s", forbidden, raw)
-		}
-	}
-	raw, body = deleteRawJSONStatus(t, baseURL+"/projects/"+project.ID+"?delete_data=true", "registry-token", http.StatusConflict)
-	assertErrorCode(t, body, "project_busy")
-	for _, forbidden := range [][]byte{
-		[]byte("SECRET PROJECT PROMPT"),
-		[]byte("registry-token"),
-		[]byte("busy-project-session"),
-	} {
-		if bytes.Contains(raw, forbidden) {
-			t.Fatalf("project_busy delete-data response leaked %s: %s", forbidden, raw)
 		}
 	}
 	if loaded, err := projectStore.Load(project.ID); err != nil || loaded.Archived {

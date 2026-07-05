@@ -20,11 +20,11 @@ const (
 	registryTokenBytes      = 32
 )
 
-// RegistryRecord describes the namespace singleton server in the per-user registry.
+// RegistryRecord describes the singleton server in one server-root registry.
 // BaseURL currently stores the existing host:port value used by local clients;
 // only the registry JSON field name is base_url in this slice.
 type RegistryRecord struct {
-	CWD             string    `json:"cwd"`
+	CWD             string    `json:"-"`
 	BaseURL         string    `json:"base_url"`
 	PID             int       `json:"pid"`
 	Token           string    `json:"token"`
@@ -48,48 +48,45 @@ func NewRegistryStore(path string) RegistryStore {
 	return RegistryStore{Path: path}
 }
 
-// DefaultRegistryPath returns the per-user server registry file path.
+// DefaultRegistryPath returns the default server registry file path.
 func DefaultRegistryPath() (string, error) {
-	home, err := DefaultHomeDir()
+	root, err := DefaultServerRootDir(defaultRegistryDirName)
 	if err != nil {
 		return "", err
 	}
-	return RegistryPathForHome(home)
+	return RegistryPathForServerRoot(root)
 }
 
-// DefaultHomeDir returns the built-in user-level home namespace directory.
-func DefaultHomeDir() (string, error) {
+// DefaultServerRootDir returns the built-in user-level server-root directory.
+func DefaultServerRootDir(argv0 string) (string, error) {
 	dir, err := os.UserConfigDir()
 	if err != nil {
 		return "", fmt.Errorf("find user config dir: %w", err)
 	}
-	return filepath.Join(dir, defaultRegistryDirName), nil
+	return filepath.Join(dir, programServerRootDirName(argv0)), nil
 }
 
-// RegistryPathForHome returns the singleton registry file path for a home namespace.
-func RegistryPathForHome(home string) (string, error) {
-	home, err := CanonicalPath(home)
+// RegistryPathForServerRoot returns the singleton registry file path for a server root.
+func RegistryPathForServerRoot(root string) (string, error) {
+	root, err := CanonicalPath(root)
 	if err != nil {
-		return "", fmt.Errorf("resolve home directory: %w", err)
+		return "", fmt.Errorf("resolve server root: %w", err)
 	}
-	return filepath.Join(home, registrySubdirName, defaultRegistryFileName), nil
+	return filepath.Join(root, registrySubdirName, defaultRegistryFileName), nil
 }
 
-// NewRegistryStoreForHome returns a registry store rooted in a home namespace.
-func NewRegistryStoreForHome(home string) (RegistryStore, error) {
-	path, err := RegistryPathForHome(home)
+// NewRegistryStoreForServerRoot returns a registry store rooted in a server root.
+func NewRegistryStoreForServerRoot(root string) (RegistryStore, error) {
+	path, err := RegistryPathForServerRoot(root)
 	if err != nil {
 		return RegistryStore{}, err
 	}
 	return NewRegistryStore(path), nil
 }
 
-// HomeEnvVarName derives the home override environment variable from raw argv[0].
-func HomeEnvVarName(argv0 string) string {
-	base := filepath.Base(strings.TrimSpace(argv0))
-	if ext := filepath.Ext(base); strings.EqualFold(ext, ".exe") {
-		base = base[:len(base)-len(ext)]
-	}
+// ServerRootEnvVarName derives the server-root override environment variable from raw argv[0].
+func ServerRootEnvVarName(argv0 string) string {
+	base := programServerRootDirName(argv0)
 	base = strings.ToUpper(base)
 
 	var out strings.Builder
@@ -110,20 +107,20 @@ func HomeEnvVarName(argv0 string) string {
 	if normalized == "" {
 		return ""
 	}
-	return normalized + "_HOME"
+	return normalized + "_SERVER_ROOT"
 }
 
-// ResolveHomeDir applies --home, derived env var, then the built-in default.
-func ResolveHomeDir(argv0, explicitHome string) (string, error) {
-	if strings.TrimSpace(explicitHome) != "" {
-		return CanonicalPath(explicitHome)
+// ResolveServerRoot applies --server-root, derived env var, then the built-in default.
+func ResolveServerRoot(argv0, explicitRoot string) (string, error) {
+	if strings.TrimSpace(explicitRoot) != "" {
+		return CanonicalPath(explicitRoot)
 	}
-	if envName := HomeEnvVarName(argv0); envName != "" {
+	if envName := ServerRootEnvVarName(argv0); envName != "" {
 		if value := strings.TrimSpace(os.Getenv(envName)); value != "" {
 			return CanonicalPath(value)
 		}
 	}
-	return DefaultHomeDir()
+	return DefaultServerRootDir(argv0)
 }
 
 // RegistryPath returns the store path, applying the default when Path is empty.
@@ -149,6 +146,9 @@ func CanonicalPath(path string) (string, error) {
 
 // NewRegistryIdentity canonicalizes cwd into a server identity.
 func NewRegistryIdentity(cwd string) (RegistryIdentity, error) {
+	if strings.TrimSpace(cwd) == "" {
+		return RegistryIdentity{}, nil
+	}
 	canonicalCWD, err := CanonicalPath(cwd)
 	if err != nil {
 		return RegistryIdentity{}, fmt.Errorf("canonicalize cwd: %w", err)
@@ -167,6 +167,12 @@ func (r RegistryRecord) Identity() RegistryIdentity {
 
 // Matches reports whether record has this exact canonical identity.
 func (id RegistryIdentity) Matches(record RegistryRecord) bool {
+	if strings.TrimSpace(id.CWD) == "" {
+		return true
+	}
+	if strings.TrimSpace(record.CWD) == "" {
+		return false
+	}
 	return sameRegistryPath(id.CWD, record.CWD)
 }
 
@@ -188,13 +194,15 @@ func SameRegistryIdentity(a, b RegistryRecord) (bool, error) {
 	return a.SameIdentity(b), nil
 }
 
-// CanonicalizeRegistryRecord returns a copy with canonical identity paths.
+// CanonicalizeRegistryRecord returns a normalized copy.
 func CanonicalizeRegistryRecord(record RegistryRecord) (RegistryRecord, error) {
-	identity, err := NewRegistryIdentity(record.CWD)
-	if err != nil {
-		return RegistryRecord{}, err
+	if strings.TrimSpace(record.CWD) != "" {
+		identity, err := NewRegistryIdentity(record.CWD)
+		if err != nil {
+			return RegistryRecord{}, err
+		}
+		record.CWD = identity.CWD
 	}
-	record.CWD = identity.CWD
 	record.BaseURL = strings.TrimSpace(record.BaseURL)
 	record.Token = strings.TrimSpace(record.Token)
 	record.Version = strings.TrimSpace(record.Version)
@@ -261,10 +269,6 @@ func (s RegistryStore) Save(records []RegistryRecord) error {
 	if err != nil {
 		return err
 	}
-	if normalized == nil {
-		normalized = []RegistryRecord{}
-	}
-
 	var payload any = []RegistryRecord{}
 	if len(normalized) > 0 {
 		payload = normalized[len(normalized)-1]
@@ -289,6 +293,18 @@ func (s RegistryStore) Upsert(record RegistryRecord) error {
 		return err
 	}
 	return s.Save([]RegistryRecord{normalized})
+}
+
+// Clear removes the selected server-root singleton record.
+func (s RegistryStore) Clear() (bool, error) {
+	records, err := s.Load()
+	if err != nil {
+		return false, err
+	}
+	if len(records) == 0 {
+		return false, nil
+	}
+	return true, s.Save(nil)
 }
 
 // Remove deletes all records matching cwd.
@@ -324,6 +340,18 @@ func (s RegistryStore) RemoveIdentity(identity RegistryIdentity) (bool, error) {
 		return false, nil
 	}
 	return true, s.Save(out)
+}
+
+func programServerRootDirName(argv0 string) string {
+	base := filepath.Base(strings.TrimSpace(argv0))
+	if ext := filepath.Ext(base); strings.EqualFold(ext, ".exe") {
+		base = base[:len(base)-len(ext)]
+	}
+	base = strings.TrimSpace(base)
+	if base == "" || base == "." || base == string(filepath.Separator) {
+		return defaultRegistryDirName
+	}
+	return base
 }
 
 // AncestorCWDs returns startCWD followed by each parent directory up to the root.

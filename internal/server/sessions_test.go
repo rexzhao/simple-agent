@@ -87,11 +87,17 @@ func TestSessionMetadataAPIsListDetailNoItemsAndServerCount(t *testing.T) {
 	if got := serverInfo["session_count"]; got != float64(2) {
 		t.Fatalf("/server session_count = %#v, want 2", got)
 	}
+	if got := serverInfo["project_count"]; got != float64(0) {
+		t.Fatalf("/server project_count = %#v, want 0", got)
+	}
 	if got := serverInfo["running_turns"]; got != float64(0) {
 		t.Fatalf("/server running_turns = %#v, want 0", got)
 	}
 
-	listRaw, listBody := getRawJSON(t, baseURL+"/sessions")
+	_, bareListBody := getRawJSONStatus(t, baseURL+"/sessions", "registry-token", http.StatusBadRequest)
+	assertErrorCode(t, bareListBody, "invalid_query")
+
+	listRaw, listBody := getRawJSON(t, baseURL+"/sessions?all_projects=true")
 	assertNoSessionTimelineLeak(t, listRaw)
 	listSessions := listBody["sessions"].([]any)
 	infos, err := store.List()
@@ -148,6 +154,12 @@ func TestSessionMetadataAPIsListDetailNoItemsAndServerCount(t *testing.T) {
 func TestSessionCreateUsesDefaultsAndDoesNotPersistItems(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "sessions")
 	store := sessions.NewV2Store(root)
+	projectStore := projectstore.NewStore(filepath.Join(t.TempDir(), "projects"))
+	projectRoot := t.TempDir()
+	project, _, err := projectStore.Create(projectRoot, "Repo")
+	if err != nil {
+		t.Fatalf("Create(project) error = %v", err)
+	}
 	defaults := sessions.SessionV2{
 		Provider:        "codex-work",
 		ModelProfile:    "gpt-5.5",
@@ -166,9 +178,11 @@ func TestSessionCreateUsesDefaultsAndDoesNotPersistItems(t *testing.T) {
 		},
 		SaveToolResults: false,
 	}
-	process := startSessionAPIServerWithToken(t, store, defaults, "registry-token")
+	process := startProjectAPIServerWithSessions(t, projectStore, store, "registry-token", nil)
+	process.sessionDefaults = defaults
+	createURL := "http://" + process.Addr() + "/projects/" + project.ID + "/sessions"
 
-	createdRaw, created := postRawJSONWithToken(t, "http://"+process.Addr()+"/sessions", "", "registry-token")
+	createdRaw, created := postRawJSONWithToken(t, createURL, "", "registry-token")
 	assertNoSessionTimelineLeak(t, createdRaw)
 	if created["id"] == "" {
 		t.Fatalf("created response missing id: %#v", created)
@@ -210,7 +224,7 @@ func TestSessionCreateUsesDefaultsAndDoesNotPersistItems(t *testing.T) {
 		t.Fatal("stored SaveToolResults = false, want true")
 	}
 
-	_, second := postRawJSONWithToken(t, "http://"+process.Addr()+"/sessions", "{}", "registry-token")
+	_, second := postRawJSONWithToken(t, createURL, "{}", "registry-token")
 	if second["id"] == "" || second["id"] == id {
 		t.Fatalf("second create response = %#v, want distinct id", second)
 	}
@@ -218,8 +232,15 @@ func TestSessionCreateUsesDefaultsAndDoesNotPersistItems(t *testing.T) {
 
 func TestSessionCreateRequiresRegistryToken(t *testing.T) {
 	store := sessions.NewV2Store(filepath.Join(t.TempDir(), "sessions"))
-	process := startSessionAPIServerWithToken(t, store, sessions.SessionV2{}, "registry-token")
+	projectStore := projectstore.NewStore(filepath.Join(t.TempDir(), "projects"))
+	projectRoot := t.TempDir()
+	project, _, err := projectStore.Create(projectRoot, "Repo")
+	if err != nil {
+		t.Fatalf("Create(project) error = %v", err)
+	}
+	process := startProjectAPIServerWithSessions(t, projectStore, store, "registry-token", nil)
 	baseURL := "http://" + process.Addr()
+	createURL := baseURL + "/projects/" + project.ID + "/sessions"
 
 	for _, tt := range []struct {
 		name  string
@@ -229,7 +250,7 @@ func TestSessionCreateRequiresRegistryToken(t *testing.T) {
 		{name: "wrong token", token: "wrong-token"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			raw, body := postRawJSONStatus(t, baseURL+"/sessions", "", tt.token, http.StatusForbidden)
+			raw, body := postRawJSONStatus(t, createURL, "", tt.token, http.StatusForbidden)
 			assertErrorCode(t, body, "permission_denied")
 			if bytes.Contains(raw, []byte("registry-token")) {
 				t.Fatalf("permission error leaked registry token: %s", raw)
@@ -237,7 +258,7 @@ func TestSessionCreateRequiresRegistryToken(t *testing.T) {
 		})
 	}
 
-	_, created := postRawJSONWithToken(t, baseURL+"/sessions", "", "registry-token")
+	_, created := postRawJSONWithToken(t, createURL, "", "registry-token")
 	if created["id"] == "" {
 		t.Fatalf("created response missing id: %#v", created)
 	}
@@ -252,7 +273,7 @@ func TestSessionCreateRequiresRegistryToken(t *testing.T) {
 		{name: "string", body: `"secret prompt"`},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			raw, body := postRawJSONStatus(t, baseURL+"/sessions", tt.body, "registry-token", http.StatusBadRequest)
+			raw, body := postRawJSONStatus(t, createURL, tt.body, "registry-token", http.StatusBadRequest)
 			assertErrorCode(t, body, "invalid_request")
 			if bytes.Contains(raw, []byte("secret prompt")) || bytes.Contains(raw, []byte("registry-token")) {
 				t.Fatalf("invalid create response leaked secret: %s", raw)
@@ -381,7 +402,6 @@ func TestProjectSessionAPIsCreateListFilterAndClient(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Create(project two) error = %v", err)
 	}
-
 	defaults := sessions.SessionV2{
 		Provider:      "codex-work",
 		ModelProfile:  "gpt-5.5",
@@ -581,7 +601,7 @@ func TestSessionListArchivedFilteringGlobalAndProject(t *testing.T) {
 	}
 }
 
-func TestProjectSessionCreatePersistsMetadataBodyAndIgnoresBodyProjectID(t *testing.T) {
+func TestProjectSessionCreatePersistsMetadataBody(t *testing.T) {
 	projectStore := projectstore.NewStore(filepath.Join(t.TempDir(), "projects"))
 	sessionStore := sessions.NewV2Store(filepath.Join(t.TempDir(), "sessions"))
 	projectOne, _, err := projectStore.Create(mkdirServerTestDir(t, "project-one"), "Project One")
@@ -616,7 +636,6 @@ func TestProjectSessionCreatePersistsMetadataBodyAndIgnoresBodyProjectID(t *test
 	createdCWD := mkdirServerTestDir(t, "metadata-cwd")
 	configPath := filepath.Join(t.TempDir(), "metadata.yaml")
 	bodyRaw, err := json.Marshal(map[string]any{
-		"project_id":        projectTwo.ID,
 		"created_cwd":       createdCWD,
 		"config_path":       configPath,
 		"provider":          "codex-work",
@@ -653,9 +672,6 @@ func TestProjectSessionCreatePersistsMetadataBodyAndIgnoresBodyProjectID(t *test
 		if got := created[key]; got != want {
 			t.Fatalf("created[%s] = %#v, want %#v in %#v", key, got, want, created)
 		}
-	}
-	if created["project_id"] == projectTwo.ID {
-		t.Fatalf("created response trusted body project_id: %#v", created)
 	}
 	params := created["model_parameters"].(map[string]any)
 	if params["max_output_tokens"] != float64(2048) || params["store"] != false {
@@ -847,8 +863,8 @@ func TestSessionMetadataStructuredErrors(t *testing.T) {
 		t.Fatalf("PUT /sessions error = %v", err)
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusMethodNotAllowed || resp.Header.Get("Allow") != "GET, POST" {
-		t.Fatalf("PUT /sessions status/allow = %d/%q, want 405 GET, POST", resp.StatusCode, resp.Header.Get("Allow"))
+	if resp.StatusCode != http.StatusMethodNotAllowed || resp.Header.Get("Allow") != "GET" {
+		t.Fatalf("PUT /sessions status/allow = %d/%q, want 405 GET", resp.StatusCode, resp.Header.Get("Allow"))
 	}
 	body = decodeJSON(t, resp)
 	if got := body["error"].(map[string]any)["code"]; got != "method_not_allowed" {
@@ -865,8 +881,8 @@ func TestSessionMetadataStructuredErrors(t *testing.T) {
 		t.Fatalf("POST /sessions/id error = %v", err)
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusMethodNotAllowed || resp.Header.Get("Allow") != "GET, PATCH" {
-		t.Fatalf("POST /sessions/id status/allow = %d/%q, want 405 GET, PATCH", resp.StatusCode, resp.Header.Get("Allow"))
+	if resp.StatusCode != http.StatusMethodNotAllowed || resp.Header.Get("Allow") != "GET, PATCH, DELETE" {
+		t.Fatalf("POST /sessions/id status/allow = %d/%q, want 405 GET, PATCH, DELETE", resp.StatusCode, resp.Header.Get("Allow"))
 	}
 	body = decodeJSON(t, resp)
 	if got := body["error"].(map[string]any)["code"]; got != "method_not_allowed" {
@@ -2469,7 +2485,7 @@ func TestServerShutdownRequiresRegistryToken(t *testing.T) {
 	}
 }
 
-func TestSessionItemContentChatReadAndByteRanges(t *testing.T) {
+func TestLegacySessionItemContentRouteIsRemoved(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "sessions")
 	store := sessions.NewV2Store(root)
 	saveServerTestSession(t, store, "content-session")
@@ -2480,49 +2496,13 @@ func TestSessionItemContentChatReadAndByteRanges(t *testing.T) {
 		Audience:   sessions.ItemAudienceUser,
 		Message:    &model.Message{Role: model.MessageRoleUser, Content: "hello chat"},
 	})
-	appendServerTestItem(t, store, "content-session", sessions.SessionItem{
-		ID:         "range-user",
-		Kind:       sessions.ItemKindMessage,
-		Visibility: sessions.ItemVisibilityVisible,
-		Audience:   sessions.ItemAudienceUser,
-		Message:    &model.Message{Role: model.MessageRoleUser, Content: "0123456789"},
-	})
-	largeContent := strings.Repeat("L", maxSessionItemContentBytes+10)
-	appendServerTestItem(t, store, "content-session", sessions.SessionItem{
-		ID:         "large-assistant",
-		Kind:       sessions.ItemKindMessage,
-		Visibility: sessions.ItemVisibilityVisible,
-		Audience:   sessions.ItemAudienceModel,
-		Message:    &model.Message{Role: model.MessageRoleAssistant, Content: largeContent},
-	})
 	process := startSessionAPIServer(t, store, sessions.SessionV2{})
 	baseURL := "http://" + process.Addr()
 
-	raw, body := getRawJSONStatus(t, baseURL+"/sessions/content-session/items/visible-user/content", "registry-token", http.StatusOK)
-	assertNoContentDTOLeak(t, raw)
-	if body["item_id"] != "visible-user" || body["content"] != "hello chat" {
-		t.Fatalf("content response = %#v, want visible-user hello chat", body)
-	}
-	if body["offset"] != float64(0) || body["size_bytes"] != float64(len("hello chat")) || body["bytes_returned"] != float64(len("hello chat")) || body["has_more"] != false {
-		t.Fatalf("content metadata = %#v, want full content metadata", body)
-	}
-
-	_, body = getRawJSONStatus(t, baseURL+"/sessions/content-session/items/range-user/content?offset=3&max_bytes=4", "registry-token", http.StatusOK)
-	if body["content"] != "3456" || body["offset"] != float64(3) || body["size_bytes"] != float64(10) || body["bytes_returned"] != float64(4) || body["has_more"] != true {
-		t.Fatalf("range content response = %#v, want offset 3 max 4", body)
-	}
-
-	_, body = getRawJSONStatus(t, baseURL+"/sessions/content-session/items/range-user/content?offset=8&max_bytes=100", "registry-token", http.StatusOK)
-	if body["content"] != "89" || body["offset"] != float64(8) || body["bytes_returned"] != float64(2) || body["has_more"] != false {
-		t.Fatalf("tail content response = %#v, want final bytes", body)
-	}
-
-	_, body = getRawJSONStatus(t, fmt.Sprintf("%s/sessions/content-session/items/large-assistant/content?max_bytes=%d", baseURL, maxSessionItemContentBytes+100), "registry-token", http.StatusOK)
-	if got := len(body["content"].(string)); got != maxSessionItemContentBytes {
-		t.Fatalf("max-clamped content len = %d, want %d", got, maxSessionItemContentBytes)
-	}
-	if body["bytes_returned"] != float64(maxSessionItemContentBytes) || body["size_bytes"] != float64(len(largeContent)) || body["has_more"] != true {
-		t.Fatalf("max-clamped content metadata = %#v, want clamp metadata", body)
+	raw, body := getRawJSONStatus(t, baseURL+"/sessions/content-session/items/visible-user/content", "registry-token", http.StatusNotFound)
+	assertErrorCode(t, body, "not_found")
+	if bytes.Contains(raw, []byte("hello chat")) {
+		t.Fatalf("removed item content route leaked item content: %s", raw)
 	}
 }
 
@@ -2600,9 +2580,10 @@ func TestSessionBlobContentEndpointRequiresSessionReachability(t *testing.T) {
 		t.Fatalf("blob content range response = %#v, want offset 5 max 4", body)
 	}
 
-	_, body = getRawJSONStatus(t, baseURL+"/sessions/blob-session/items/visible-blob/content", "registry-token", http.StatusOK)
-	if body["content"] != largeVisibleContent || body["size_bytes"] != float64(len(largeVisibleContent)) {
-		t.Fatalf("item content endpoint for blobified item = %#v, want original visible content", body)
+	raw, body = getRawJSONStatus(t, baseURL+"/sessions/blob-session/items/visible-blob/content", "registry-token", http.StatusNotFound)
+	assertErrorCode(t, body, "not_found")
+	if bytes.Contains(raw, []byte("VISIBLE-BLOB-TAIL")) {
+		t.Fatalf("removed item content route leaked visible blob content: %s", raw)
 	}
 
 	raw, body = getRawJSONStatus(t, baseURL+"/sessions/blob-session/content/"+hiddenRef.Hash, "registry-token", http.StatusNotFound)
@@ -2632,7 +2613,7 @@ func TestSessionBlobContentEndpointRequiresSessionReachability(t *testing.T) {
 	assertErrorCode(t, body, "not_found")
 }
 
-func TestSessionItemContentDebugRequiresTokenAndChatHidesPrivateContent(t *testing.T) {
+func TestLegacySessionItemContentRouteRemovedAndDoesNotLeakPrivateContent(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "sessions")
 	store := sessions.NewV2Store(root)
 	saveServerTestSession(t, store, "private-content-session")
@@ -2676,34 +2657,18 @@ func TestSessionItemContentDebugRequiresTokenAndChatHidesPrivateContent(t *testi
 		})
 	}
 
-	raw, body := getRawJSONStatus(t, baseURL+"/sessions/private-content-session/items/hidden-summary/content?view=debug", "registry-token", http.StatusOK)
-	assertNoContentDTOLeak(t, raw)
-	if body["content"] != "hidden summary secret" {
-		t.Fatalf("debug hidden content = %#v, want hidden summary secret", body)
-	}
-	raw, body = getRawJSONStatus(t, baseURL+"/sessions/private-content-session/items/runtime-context/content?view=debug", "registry-token", http.StatusOK)
-	assertNoContentDTOLeak(t, raw)
-	if body["content"] != "runtime context secret" {
-		t.Fatalf("debug runtime content = %#v, want runtime context secret", body)
-	}
-	raw, body = getRawJSONStatus(t, baseURL+"/sessions/private-content-session/items/tool-result/content?view=debug", "registry-token", http.StatusOK)
-	assertNoContentDTOLeak(t, raw)
-	if body["content"] != "tool result secret" {
-		t.Fatalf("debug tool content = %#v, want tool result secret", body)
-	}
-
 	for _, itemID := range []string{"hidden-summary", "runtime-context", "tool-result"} {
-		raw, body := getRawJSONStatus(t, baseURL+"/sessions/private-content-session/items/"+itemID+"/content", "registry-token", http.StatusNotFound)
-		assertErrorCode(t, body, "content_unavailable")
+		raw, body := getRawJSONStatus(t, baseURL+"/sessions/private-content-session/items/"+itemID+"/content?view=debug", "registry-token", http.StatusNotFound)
+		assertErrorCode(t, body, "not_found")
 		for _, forbidden := range []string{"hidden summary secret", "runtime context secret", "tool result secret", "call-secret"} {
 			if bytes.Contains(raw, []byte(forbidden)) {
-				t.Fatalf("chat content error for %s leaked %q: %s", itemID, forbidden, raw)
+				t.Fatalf("removed item content route for %s leaked %q: %s", itemID, forbidden, raw)
 			}
 		}
 	}
 }
 
-func TestSessionItemContentStructuredErrors(t *testing.T) {
+func TestLegacySessionItemContentRouteRemovedForAllVariants(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "sessions")
 	store := sessions.NewV2Store(root)
 	saveServerTestSession(t, store, "content-errors")
@@ -2714,44 +2679,18 @@ func TestSessionItemContentStructuredErrors(t *testing.T) {
 		Audience:   sessions.ItemAudienceUser,
 		Message:    &model.Message{Role: model.MessageRoleUser},
 	})
-	saveServerTestSession(t, store, "corrupt-content-session")
-	segmentsDir := filepath.Join(root, "corrupt-content-session", "segments")
-	if err := os.MkdirAll(segmentsDir, 0o755); err != nil {
-		t.Fatalf("MkdirAll(segments) error = %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(segmentsDir, "000001.jsonl"), []byte(`{"seq":1,"type":"item.appended","item":`+"\n"), 0o600); err != nil {
-		t.Fatalf("WriteFile(corrupt segment) error = %v", err)
-	}
 	process := startSessionAPIServer(t, store, sessions.SessionV2{})
 	baseURL := "http://" + process.Addr()
 
-	_, body := getRawJSONStatus(t, baseURL+"/sessions/missing-session/items/item-1/content", "registry-token", http.StatusNotFound)
-	assertErrorCode(t, body, "session_not_found")
-
-	_, body = getRawJSONStatus(t, baseURL+"/sessions/content-errors/items/missing-item/content", "registry-token", http.StatusNotFound)
-	assertErrorCode(t, body, "item_not_found")
-
-	_, body = getRawJSONStatus(t, baseURL+"/sessions/content-errors/items/empty-message/content", "registry-token", http.StatusNotFound)
-	assertErrorCode(t, body, "content_unavailable")
-
-	_, body = getRawJSONStatus(t, baseURL+"/sessions/corrupt-content-session/items/item-1/content", "registry-token", http.StatusInternalServerError)
-	assertErrorCode(t, body, "session_store_error")
-
-	for _, tt := range []struct {
-		name  string
-		query string
-	}{
-		{name: "malformed offset", query: "offset=abc"},
-		{name: "negative offset", query: "offset=-1"},
-		{name: "malformed max bytes", query: "max_bytes=abc"},
-		{name: "zero max bytes", query: "max_bytes=0"},
-		{name: "bad view", query: "view=all"},
-		{name: "duplicate offset", query: "offset=1&offset=2"},
+	for _, endpoint := range []string{
+		"/sessions/missing-session/items/item-1/content",
+		"/sessions/content-errors/items/missing-item/content",
+		"/sessions/content-errors/items/empty-message/content",
+		"/sessions/content-errors/items/empty-message/content?offset=abc",
+		"/sessions/content-errors/items/empty-message/content?view=all",
 	} {
-		t.Run(tt.name, func(t *testing.T) {
-			_, body := getRawJSONStatus(t, baseURL+"/sessions/content-errors/items/empty-message/content?"+tt.query, "registry-token", http.StatusBadRequest)
-			assertErrorCode(t, body, "invalid_query")
-		})
+		_, body := getRawJSONStatus(t, baseURL+endpoint, "registry-token", http.StatusNotFound)
+		assertErrorCode(t, body, "not_found")
 	}
 }
 
@@ -2890,15 +2829,8 @@ func mkdirServerTestDir(t *testing.T, name string) string {
 func archiveProjectForServerTest(t *testing.T, store *projectstore.Store, project projectstore.Project) {
 	t.Helper()
 
-	project.Archived = true
-	raw, err := json.MarshalIndent(project, "", "  ")
-	if err != nil {
-		t.Fatalf("MarshalIndent(project) error = %v", err)
-	}
-	raw = append(raw, '\n')
-	path := filepath.Join(store.Root(), project.ID, "project.json")
-	if err := os.WriteFile(path, raw, 0o600); err != nil {
-		t.Fatalf("WriteFile(%s) error = %v", path, err)
+	if _, err := store.Archive(project.ID); err != nil {
+		t.Fatalf("Archive(%s) error = %v", project.ID, err)
 	}
 }
 

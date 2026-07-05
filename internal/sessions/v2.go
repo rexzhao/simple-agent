@@ -96,7 +96,8 @@ type SessionV2 struct {
 	CreatedAt            time.Time              `json:"created_at"`
 	UpdatedAt            time.Time              `json:"updated_at"`
 	DisplayName          string                 `json:"display_name,omitempty"`
-	Archived             bool                   `json:"archived"`
+	Archived             bool                   `json:"-"`
+	ArchivedAt           time.Time              `json:"-"`
 	LastUsedAt           time.Time              `json:"last_used_at"`
 	RunningTurnID        string                 `json:"running_turn_id,omitempty"`
 	RunningStartedAt     time.Time              `json:"running_started_at,omitempty"`
@@ -227,6 +228,18 @@ func RootForHome(home string) (string, error) {
 	return filepath.Join(filepath.Clean(abs), "data", "sessions"), nil
 }
 
+func RootForServerRoot(root string) (string, error) {
+	root = strings.TrimSpace(root)
+	if root == "" {
+		return "", fmt.Errorf("server root is required")
+	}
+	abs, err := filepath.Abs(root)
+	if err != nil {
+		return "", fmt.Errorf("resolve server root %q: %w", root, err)
+	}
+	return filepath.Join(filepath.Clean(abs), "data", "sessions"), nil
+}
+
 func (s *V2Store) SaveMetadata(session SessionV2) (SessionV2, error) {
 	if err := s.requireRoot(); err != nil {
 		return SessionV2{}, err
@@ -256,6 +269,7 @@ func (s *V2Store) SaveMetadata(session SessionV2) (SessionV2, error) {
 		}
 	}
 	session.UpdatedAt = now
+	session = normalizeSessionLifecycle(session, now)
 	session = copySessionV2(session)
 
 	sessionDir := s.sessionDir(session.ID)
@@ -1199,7 +1213,7 @@ type sessionV2Metadata struct {
 	CreatedAt            time.Time              `json:"created_at"`
 	UpdatedAt            time.Time              `json:"updated_at"`
 	DisplayName          string                 `json:"display_name,omitempty"`
-	Archived             bool                   `json:"archived"`
+	ArchivedAt           *time.Time             `json:"archived_at"`
 	LastUsedAt           time.Time              `json:"last_used_at"`
 	RunningTurnID        string                 `json:"running_turn_id,omitempty"`
 	RunningStartedAt     time.Time              `json:"running_started_at,omitempty"`
@@ -1265,7 +1279,7 @@ func metadataFromSessionV2(session SessionV2) sessionV2Metadata {
 		CreatedAt:            session.CreatedAt,
 		UpdatedAt:            session.UpdatedAt,
 		DisplayName:          session.DisplayName,
-		Archived:             session.Archived,
+		ArchivedAt:           sessionArchivedAtPtr(session),
 		LastUsedAt:           session.LastUsedAt,
 		RunningTurnID:        session.RunningTurnID,
 		RunningStartedAt:     session.RunningStartedAt,
@@ -1298,7 +1312,6 @@ func (m sessionV2Metadata) session() SessionV2 {
 		CreatedAt:            m.CreatedAt,
 		UpdatedAt:            m.UpdatedAt,
 		DisplayName:          m.DisplayName,
-		Archived:             m.Archived,
 		LastUsedAt:           m.LastUsedAt,
 		RunningTurnID:        m.RunningTurnID,
 		RunningStartedAt:     m.RunningStartedAt,
@@ -1325,6 +1338,40 @@ func (m sessionV2Metadata) session() SessionV2 {
 	if session.LastUsedAt.IsZero() {
 		session.LastUsedAt = sessionEffectiveLastUsedAt(session)
 	}
+	if m.ArchivedAt != nil {
+		session.ArchivedAt = m.ArchivedAt.UTC()
+	}
+	session = normalizeSessionLifecycle(session, session.UpdatedAt)
+	return session
+}
+
+func sessionArchivedAtPtr(session SessionV2) *time.Time {
+	session = normalizeSessionLifecycle(session, time.Time{})
+	if session.ArchivedAt.IsZero() {
+		return nil
+	}
+	value := session.ArchivedAt.UTC()
+	return &value
+}
+
+func normalizeSessionLifecycle(session SessionV2, fallback time.Time) SessionV2 {
+	if !session.ArchivedAt.IsZero() {
+		session.ArchivedAt = session.ArchivedAt.UTC()
+		session.Archived = true
+		return session
+	}
+	if session.Archived {
+		if !fallback.IsZero() {
+			session.ArchivedAt = fallback.UTC()
+		} else if !session.UpdatedAt.IsZero() {
+			session.ArchivedAt = session.UpdatedAt.UTC()
+		} else if !session.CreatedAt.IsZero() {
+			session.ArchivedAt = session.CreatedAt.UTC()
+		}
+		session.Archived = !session.ArchivedAt.IsZero()
+		return session
+	}
+	session.Archived = false
 	return session
 }
 
@@ -1666,6 +1713,7 @@ func copyMessage(message model.Message) model.Message {
 }
 
 func copySessionV2(session SessionV2) SessionV2 {
+	session = normalizeSessionLifecycle(session, time.Time{})
 	session.ModelParameters = copyMap(session.ModelParameters)
 	session.EnabledTools = copyStrings(session.EnabledTools)
 	session.EnabledMCP = copyStrings(session.EnabledMCP)

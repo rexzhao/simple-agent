@@ -17,12 +17,12 @@ import (
 
 // ServerStatus is the client-facing shape returned by GET /server.
 type ServerStatus struct {
-	CWD           string    `json:"cwd"`
-	Addr          string    `json:"addr"`
+	Addr          string    `json:"base_url"`
 	PID           int       `json:"pid"`
 	Version       string    `json:"version"`
 	StartedAt     time.Time `json:"started_at"`
 	UptimeSeconds int64     `json:"uptime_seconds"`
+	ProjectCount  int       `json:"project_count"`
 	SessionCount  int       `json:"session_count"`
 	RunningTurns  int       `json:"running_turns"`
 }
@@ -46,13 +46,16 @@ type ProjectCreateResult struct {
 }
 
 // ProjectRemoveResult reports the project affected by DELETE /projects/{id}.
-// Archive responses include Project; delete-data responses include Status and ID.
 type ProjectRemoveResult struct {
-	Project    ProjectInfo
-	Deleted    bool
-	Status     string
-	ID         string
-	StatusCode int
+	Status          string `json:"status"`
+	ID              string `json:"id"`
+	RemovedSessions int    `json:"removed_sessions"`
+	StatusCode      int    `json:"-"`
+}
+
+type ProjectMetadataUpdate struct {
+	DisplayName *string `json:"display_name,omitempty"`
+	Archived    *bool   `json:"archived,omitempty"`
 }
 
 // SessionMetadata is the client-facing session summary returned by GET /sessions.
@@ -119,7 +122,8 @@ type SessionCreateMetadata struct {
 }
 
 type SessionListOptions struct {
-	Archived bool
+	Archived    bool
+	AllProjects bool
 }
 
 type SessionMetadataUpdate struct {
@@ -148,7 +152,7 @@ type ShutdownOptions struct {
 }
 
 // DiscoveryResult reports the active healthy server, plus stale records removed
-// while checking the selected home namespace.
+// while checking the selected server root.
 type DiscoveryResult struct {
 	Record       RegistryRecord
 	Found        bool
@@ -156,7 +160,7 @@ type DiscoveryResult struct {
 }
 
 // DiscoverHealthy loads the registry, checks the singleton record, and removes
-// it when stale. startCWD is kept for caller compatibility.
+// it when stale. startCWD is ignored.
 func DiscoverHealthy(ctx context.Context, store RegistryStore, startCWD string, timeout time.Duration) (DiscoveryResult, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -180,7 +184,7 @@ func DiscoverHealthy(ctx context.Context, store RegistryStore, startCWD string, 
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return result, ctxErr
 		}
-		removed, removeErr := store.RemoveIdentity(record.Identity())
+		removed, removeErr := store.Clear()
 		if removeErr != nil {
 			return result, removeErr
 		}
@@ -219,7 +223,17 @@ func GetServerStatus(ctx context.Context, addr, token string, timeout time.Durat
 
 // ListProjectsWithToken fetches non-archived project metadata from GET /projects.
 func ListProjectsWithToken(ctx context.Context, addr, token string, timeout time.Duration) ([]ProjectInfo, error) {
-	req, err := newServerClientRequest(ctx, http.MethodGet, addr, "/projects")
+	return ListProjectsWithOptions(ctx, addr, token, false, timeout)
+}
+
+func ListProjectsWithOptions(ctx context.Context, addr, token string, archived bool, timeout time.Duration) ([]ProjectInfo, error) {
+	path := "/projects"
+	if archived {
+		values := url.Values{}
+		values.Set("archived", "true")
+		path += "?" + values.Encode()
+	}
+	req, err := newServerClientRequest(ctx, http.MethodGet, addr, path)
 	if err != nil {
 		return nil, err
 	}
@@ -303,15 +317,48 @@ func GetProjectWithToken(ctx context.Context, addr, token, id string, timeout ti
 	return project, nil
 }
 
-// RemoveProjectWithToken sends DELETE /projects/{id}. By default the server
-// archives the project; deleteData asks it to delete project metadata/data.
-func RemoveProjectWithToken(ctx context.Context, addr, token, id string, deleteData bool, timeout time.Duration) (ProjectRemoveResult, error) {
-	id = strings.TrimSpace(id)
-	path := "/projects/" + url.PathEscape(id)
-	if deleteData {
-		path += "?delete_data=true"
+func RenameProjectWithToken(ctx context.Context, addr, token, id, displayName string, timeout time.Duration) (ProjectInfo, error) {
+	displayName = strings.TrimSpace(displayName)
+	return UpdateProjectMetadataWithToken(ctx, addr, token, id, ProjectMetadataUpdate{DisplayName: &displayName}, timeout)
+}
+
+func ArchiveProjectWithToken(ctx context.Context, addr, token, id string, timeout time.Duration) (ProjectInfo, error) {
+	archived := true
+	return UpdateProjectMetadataWithToken(ctx, addr, token, id, ProjectMetadataUpdate{Archived: &archived}, timeout)
+}
+
+func UpdateProjectMetadataWithToken(ctx context.Context, addr, token, id string, update ProjectMetadataUpdate, timeout time.Duration) (ProjectInfo, error) {
+	payload, err := marshalMetadataUpdate(update.DisplayName, update.Archived, "project")
+	if err != nil {
+		return ProjectInfo{}, err
 	}
-	req, err := newServerClientRequest(ctx, http.MethodDelete, addr, path)
+	id = strings.TrimSpace(id)
+	req, err := newServerClientRequestWithBody(ctx, http.MethodPatch, addr, "/projects/"+url.PathEscape(id), payload)
+	if err != nil {
+		return ProjectInfo{}, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	setBearerToken(req, token)
+	client := http.Client{Timeout: clientTimeout(timeout)}
+	resp, err := client.Do(req)
+	if err != nil {
+		return ProjectInfo{}, fmt.Errorf("update project %s at %s: %w", id, strings.TrimSpace(addr), err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return ProjectInfo{}, fmt.Errorf("update project %s at %s: %s", id, strings.TrimSpace(addr), serverWriteResponseError(resp))
+	}
+	var project ProjectInfo
+	if err := json.NewDecoder(resp.Body).Decode(&project); err != nil {
+		return ProjectInfo{}, fmt.Errorf("decode updated project %s at %s: %w", id, strings.TrimSpace(addr), err)
+	}
+	return project, nil
+}
+
+// RemoveProjectWithToken sends DELETE /projects/{id}.
+func RemoveProjectWithToken(ctx context.Context, addr, token, id string, timeout time.Duration) (ProjectRemoveResult, error) {
+	id = strings.TrimSpace(id)
+	req, err := newServerClientRequest(ctx, http.MethodDelete, addr, "/projects/"+url.PathEscape(id))
 	if err != nil {
 		return ProjectRemoveResult{}, err
 	}
@@ -325,28 +372,11 @@ func RemoveProjectWithToken(ctx context.Context, addr, token, id string, deleteD
 	if resp.StatusCode != http.StatusOK {
 		return ProjectRemoveResult{}, fmt.Errorf("remove project %s at %s: %s", id, strings.TrimSpace(addr), serverWriteResponseError(resp))
 	}
-	result := ProjectRemoveResult{
-		Deleted:    deleteData,
-		StatusCode: resp.StatusCode,
-	}
-	if deleteData {
-		var body struct {
-			Status string `json:"status"`
-			ID     string `json:"id"`
-		}
-		if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
-			return ProjectRemoveResult{}, fmt.Errorf("decode project delete result %s at %s: %w", id, strings.TrimSpace(addr), err)
-		}
-		result.Status = body.Status
-		result.ID = body.ID
-		return result, nil
-	}
-	var project ProjectInfo
-	if err := json.NewDecoder(resp.Body).Decode(&project); err != nil {
+	var result ProjectRemoveResult
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		return ProjectRemoveResult{}, fmt.Errorf("decode project remove result %s at %s: %w", id, strings.TrimSpace(addr), err)
 	}
-	result.Project = project
-	result.ID = project.ID
+	result.StatusCode = resp.StatusCode
 	return result, nil
 }
 
@@ -472,11 +502,12 @@ func marshalSessionCreateMetadata(metadata SessionCreateMetadata) ([]byte, error
 
 // ListSessions fetches session metadata from GET /sessions with the registry bearer token.
 func ListSessions(ctx context.Context, addr, token string, timeout time.Duration) ([]SessionMetadata, error) {
-	return ListSessionsWithOptions(ctx, addr, token, SessionListOptions{}, timeout)
+	return ListSessionsWithOptions(ctx, addr, token, SessionListOptions{AllProjects: true}, timeout)
 }
 
 // ListSessionsWithOptions fetches session metadata from GET /sessions.
 func ListSessionsWithOptions(ctx context.Context, addr, token string, options SessionListOptions, timeout time.Duration) ([]SessionMetadata, error) {
+	options.AllProjects = true
 	req, err := newServerClientRequest(ctx, http.MethodGet, addr, sessionListPath("/sessions", options))
 	if err != nil {
 		return nil, err
@@ -501,11 +532,16 @@ func ListSessionsWithOptions(ctx context.Context, addr, token string, options Se
 }
 
 func sessionListPath(path string, options SessionListOptions) string {
-	if !options.Archived {
+	values := url.Values{}
+	if options.AllProjects {
+		values.Set("all_projects", "true")
+	}
+	if options.Archived {
+		values.Set("archived", "true")
+	}
+	if len(values) == 0 {
 		return path
 	}
-	values := url.Values{}
-	values.Set("archived", "true")
 	return path + "?" + values.Encode()
 }
 
@@ -543,7 +579,7 @@ func ArchiveSessionWithToken(ctx context.Context, addr, token, id string, timeou
 }
 
 func UpdateSessionMetadataWithToken(ctx context.Context, addr, token, id string, update SessionMetadataUpdate, timeout time.Duration) (SessionDetail, error) {
-	payload, err := marshalSessionMetadataUpdate(update)
+	payload, err := marshalMetadataUpdate(update.DisplayName, update.Archived, "session")
 	if err != nil {
 		return SessionDetail{}, err
 	}
@@ -572,48 +608,46 @@ func UpdateSessionMetadataWithToken(ctx context.Context, addr, token, id string,
 	return detail, nil
 }
 
-func marshalSessionMetadataUpdate(update SessionMetadataUpdate) ([]byte, error) {
+func marshalMetadataUpdate(displayName *string, archived *bool, resource string) ([]byte, error) {
 	payload := make(map[string]any)
-	if update.DisplayName != nil {
-		payload["display_name"] = *update.DisplayName
+	if displayName != nil {
+		payload["display_name"] = *displayName
 	}
-	if update.Archived != nil {
-		payload["archived"] = *update.Archived
+	if archived != nil {
+		payload["archived"] = *archived
 	}
 	if len(payload) == 0 {
-		return nil, fmt.Errorf("session metadata update requires display_name or archived")
+		return nil, fmt.Errorf("%s metadata update requires display_name or archived", resource)
 	}
 	data, err := json.Marshal(payload)
 	if err != nil {
-		return nil, fmt.Errorf("encode session metadata update request")
+		return nil, fmt.Errorf("encode %s metadata update request", resource)
 	}
 	return data, nil
 }
 
-// CreateSessionWithToken sends POST /sessions with the registry bearer token.
-func CreateSessionWithToken(ctx context.Context, addr, token string, timeout time.Duration) (SessionDetail, error) {
-	req, err := newServerClientRequest(ctx, http.MethodPost, addr, "/sessions")
+func RemoveSessionWithToken(ctx context.Context, addr, token, id string, timeout time.Duration) (ProjectRemoveResult, error) {
+	id = strings.TrimSpace(id)
+	req, err := newServerClientRequest(ctx, http.MethodDelete, addr, "/sessions/"+url.PathEscape(id))
 	if err != nil {
-		return SessionDetail{}, err
+		return ProjectRemoveResult{}, err
 	}
 	setBearerToken(req, token)
-	client := http.Client{}
-	if timeout > 0 {
-		client.Timeout = timeout
-	}
+	client := http.Client{Timeout: clientTimeout(timeout)}
 	resp, err := client.Do(req)
 	if err != nil {
-		return SessionDetail{}, fmt.Errorf("create session at %s: %w", strings.TrimSpace(addr), err)
+		return ProjectRemoveResult{}, fmt.Errorf("remove session %s at %s: %w", id, strings.TrimSpace(addr), err)
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusCreated {
-		return SessionDetail{}, fmt.Errorf("create session at %s: %s", strings.TrimSpace(addr), serverWriteResponseError(resp))
+	if resp.StatusCode != http.StatusOK {
+		return ProjectRemoveResult{}, fmt.Errorf("remove session %s at %s: %s", id, strings.TrimSpace(addr), serverWriteResponseError(resp))
 	}
-	var detail SessionDetail
-	if err := json.NewDecoder(resp.Body).Decode(&detail); err != nil {
-		return SessionDetail{}, fmt.Errorf("decode created session at %s: %w", strings.TrimSpace(addr), err)
+	var result ProjectRemoveResult
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return ProjectRemoveResult{}, fmt.Errorf("decode session remove result %s at %s: %w", id, strings.TrimSpace(addr), err)
 	}
-	return detail, nil
+	result.StatusCode = resp.StatusCode
+	return result, nil
 }
 
 // SendSessionMessageWithToken sends POST /sessions/{id}/messages with the registry bearer token.

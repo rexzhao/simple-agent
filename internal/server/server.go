@@ -130,11 +130,12 @@ type SessionCompactionPlan struct {
 }
 
 type Info struct {
-	CWD          string    `json:"cwd"`
-	Addr         string    `json:"addr"`
+	CWD          string    `json:"-"`
+	Addr         string    `json:"base_url"`
 	PID          int       `json:"pid"`
 	Version      string    `json:"version"`
 	StartedAt    time.Time `json:"started_at"`
+	ProjectCount int       `json:"project_count"`
 	SessionCount int       `json:"session_count"`
 	RunningTurns int       `json:"running_turns"`
 }
@@ -222,9 +223,6 @@ func Start(options Options) (*Process, error) {
 	}
 	if process.projectStore == nil && strings.TrimSpace(options.ProjectRoot) != "" {
 		process.projectStore = projectstore.NewStore(options.ProjectRoot)
-	}
-	if strings.TrimSpace(process.sessionDefaults.CWD) == "" {
-		process.sessionDefaults.CWD = options.CWD
 	}
 	process.httpServer = &http.Server{
 		Handler: process,
@@ -380,13 +378,18 @@ func (p *Process) handleServer(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "session_store_error", "could not list sessions")
 		return
 	}
+	projectCount, err := p.projectCount()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "project_store_error", "could not list projects")
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"cwd":            info.CWD,
-		"addr":           info.Addr,
+		"base_url":       info.Addr,
 		"pid":            info.PID,
 		"version":        info.Version,
 		"started_at":     info.StartedAt,
 		"uptime_seconds": int64(time.Since(info.StartedAt).Seconds()),
+		"project_count":  projectCount,
 		"session_count":  sessionCount,
 		"running_turns":  info.RunningTurns,
 	})
@@ -435,10 +438,8 @@ func (p *Process) handleSessions(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
 		p.handleSessionsList(w, r)
-	case http.MethodPost:
-		p.handleSessionsCreate(w, r)
 	default:
-		writeMethodNotAllowed(w, http.MethodGet, http.MethodPost)
+		writeMethodNotAllowed(w, http.MethodGet)
 	}
 }
 
@@ -476,10 +477,12 @@ func (p *Process) handleProjectPath(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodGet:
 			p.handleProjectDetail(w, r, projectID)
+		case http.MethodPatch:
+			p.handleProjectMetadataUpdate(w, r, projectID)
 		case http.MethodDelete:
 			p.handleProjectRemove(w, r, projectID)
 		default:
-			writeMethodNotAllowed(w, http.MethodGet, http.MethodDelete)
+			writeMethodNotAllowed(w, http.MethodGet, http.MethodPatch, http.MethodDelete)
 			return
 		}
 	case len(parts) == 2 && parts[1] == "sessions":
@@ -502,7 +505,12 @@ func (p *Process) handleProjectsList(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "project_store_unavailable", "project store is not configured")
 		return
 	}
-	projects, err := store.List()
+	query, err := parseSessionListQuery(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_query", err.Error())
+		return
+	}
+	projects, err := store.ListWithOptions(projectstore.ListOptions{Archived: query.Archived})
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "project_store_error", "could not list projects")
 		return
@@ -557,15 +565,64 @@ func (p *Process) handleProjectDetail(w http.ResponseWriter, r *http.Request, id
 	writeJSON(w, http.StatusOK, projectDTOFromProject(project))
 }
 
-func (p *Process) handleProjectRemove(w http.ResponseWriter, r *http.Request, id string) {
+func (p *Process) handleProjectMetadataUpdate(w http.ResponseWriter, r *http.Request, id string) {
 	store := p.projectStore
 	if store == nil {
 		writeError(w, http.StatusServiceUnavailable, "project_store_unavailable", "project store is not configured")
 		return
 	}
-	deleteData, err := parseProjectDeleteDataQuery(r)
+	request, err := readProjectMetadataUpdateRequest(w, r)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_request", err.Error())
+		return
+	}
+	project, err := store.Load(id)
+	if err != nil {
+		if errors.Is(err, projectstore.ErrNotFound) {
+			writeError(w, http.StatusNotFound, "project_not_found", "project not found")
+			return
+		}
+		writeError(w, http.StatusBadRequest, "invalid_project_id", "invalid project id")
+		return
+	}
+	if request.DisplayName != nil && project.Archived {
+		writeError(w, http.StatusConflict, "project_archived", "archived project cannot be renamed")
+		return
+	}
+	if request.Archived != nil && !*request.Archived {
+		writeError(w, http.StatusBadRequest, "restore_not_supported", "project restore is not supported")
+		return
+	}
+	if request.Archived != nil && *request.Archived {
+		busy, err := p.projectHasRunningTurn(project.ID)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "session_store_error", "could not check running sessions")
+			return
+		}
+		if busy {
+			writeError(w, http.StatusConflict, "project_busy", "project has a running turn")
+			return
+		}
+		project, err = store.Archive(project.ID)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "project_store_error", "could not archive project")
+			return
+		}
+	}
+	if request.DisplayName != nil {
+		project, err = store.Rename(project.ID, *request.DisplayName)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "project_store_error", "could not rename project")
+			return
+		}
+	}
+	writeJSON(w, http.StatusOK, projectDTOFromProject(project))
+}
+
+func (p *Process) handleProjectRemove(w http.ResponseWriter, r *http.Request, id string) {
+	store := p.projectStore
+	if store == nil {
+		writeError(w, http.StatusServiceUnavailable, "project_store_unavailable", "project store is not configured")
 		return
 	}
 	project, err := store.Load(id)
@@ -586,33 +643,28 @@ func (p *Process) handleProjectRemove(w http.ResponseWriter, r *http.Request, id
 		writeError(w, http.StatusConflict, "project_busy", "project has a running turn")
 		return
 	}
-
-	if deleteData {
-		if err := store.Delete(project.ID); err != nil {
-			if errors.Is(err, projectstore.ErrNotFound) {
-				writeError(w, http.StatusNotFound, "project_not_found", "project not found")
-				return
-			}
-			writeError(w, http.StatusInternalServerError, "project_store_error", "could not delete project")
-			return
-		}
-		writeJSON(w, http.StatusOK, map[string]any{
-			"status": "deleted",
-			"id":     project.ID,
-		})
+	if !project.Archived {
+		writeError(w, http.StatusConflict, "project_active", "archive project before removing it")
 		return
 	}
-
-	archived, err := store.Archive(project.ID)
+	removedSessions, err := p.removeProjectSessions(project.ID)
 	if err != nil {
+		writeError(w, http.StatusInternalServerError, "session_store_error", "could not remove project sessions")
+		return
+	}
+	if err := store.Delete(project.ID); err != nil {
 		if errors.Is(err, projectstore.ErrNotFound) {
 			writeError(w, http.StatusNotFound, "project_not_found", "project not found")
 			return
 		}
-		writeError(w, http.StatusInternalServerError, "project_store_error", "could not archive project")
+		writeError(w, http.StatusInternalServerError, "project_store_error", "could not remove project")
 		return
 	}
-	writeJSON(w, http.StatusOK, projectDTOFromProject(archived))
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status":           "removed",
+		"id":               project.ID,
+		"removed_sessions": removedSessions,
+	})
 }
 
 func (p *Process) handleProjectSessionsList(w http.ResponseWriter, r *http.Request, projectID string) {
@@ -727,8 +779,10 @@ func (p *Process) handleSessionPath(w http.ResponseWriter, r *http.Request) {
 			p.handleSessionDetail(w, r, id)
 		case http.MethodPatch:
 			p.handleSessionMetadataUpdate(w, r, id)
+		case http.MethodDelete:
+			p.handleSessionRemove(w, r, id)
 		default:
-			writeMethodNotAllowed(w, http.MethodGet, http.MethodPatch)
+			writeMethodNotAllowed(w, http.MethodGet, http.MethodPatch, http.MethodDelete)
 			return
 		}
 	case len(parts) == 2 && parts[1] == "items":
@@ -761,12 +815,6 @@ func (p *Process) handleSessionPath(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		p.handleSessionBlobContent(w, r, id, parts[2])
-	case len(parts) == 4 && parts[1] == "items" && parts[3] == "content":
-		if r.Method != http.MethodGet {
-			writeMethodNotAllowed(w, http.MethodGet)
-			return
-		}
-		p.handleSessionItemContent(w, r, id, parts[2])
 	default:
 		writeError(w, http.StatusNotFound, "not_found", "path not found")
 	}
@@ -776,6 +824,10 @@ func (p *Process) handleSessionsList(w http.ResponseWriter, r *http.Request) {
 	query, err := parseSessionListQuery(r)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_query", err.Error())
+		return
+	}
+	if !query.AllProjects {
+		writeError(w, http.StatusBadRequest, "invalid_query", "all_projects=true is required")
 		return
 	}
 	store := p.sessionStore
@@ -800,31 +852,6 @@ func (p *Process) handleSessionsList(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"sessions": items,
 	})
-}
-
-func (p *Process) handleSessionsCreate(w http.ResponseWriter, r *http.Request) {
-	if !p.requireRegistryToken(w, r) {
-		return
-	}
-
-	store := p.sessionStore
-	if store == nil {
-		writeError(w, http.StatusServiceUnavailable, "session_store_unavailable", "session store is not configured")
-		return
-	}
-	if err := readEmptySessionCreateRequest(w, r); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_request", err.Error())
-		return
-	}
-
-	session := p.newSessionFromDefaults()
-
-	saved, err := store.SaveMetadata(session)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "session_store_error", "could not create session")
-		return
-	}
-	writeJSON(w, http.StatusCreated, sessionDetailDTOFromSession(saved, "idle"))
 }
 
 func (p *Process) handleSessionDetail(w http.ResponseWriter, r *http.Request, id string) {
@@ -873,6 +900,14 @@ func (p *Process) handleSessionMetadataUpdate(w http.ResponseWriter, r *http.Req
 		p.writeSessionLoadError(w, err, "could not load session")
 		return
 	}
+	if request.DisplayName != nil && session.Archived {
+		writeError(w, http.StatusConflict, "session_archived", "archived session cannot be renamed")
+		return
+	}
+	if request.Archived != nil && !*request.Archived {
+		writeError(w, http.StatusBadRequest, "restore_not_supported", "session restore is not supported")
+		return
+	}
 	session = applySessionMetadataUpdate(session, request)
 	saved, err := store.SaveMetadata(session)
 	if err != nil {
@@ -880,6 +915,39 @@ func (p *Process) handleSessionMetadataUpdate(w http.ResponseWriter, r *http.Req
 		return
 	}
 	writeJSON(w, http.StatusOK, sessionDetailDTOFromSession(saved, p.sessionStatus(saved)))
+}
+
+func (p *Process) handleSessionRemove(w http.ResponseWriter, r *http.Request, id string) {
+	if !validSessionAPIID(id) {
+		writeError(w, http.StatusBadRequest, "invalid_session_id", "invalid session id")
+		return
+	}
+	if p.sessionIsRunning(id) {
+		writeError(w, http.StatusConflict, "session_busy", "session is currently running a turn")
+		return
+	}
+	store := p.sessionStore
+	if store == nil {
+		writeError(w, http.StatusServiceUnavailable, "session_store_unavailable", "session store is not configured")
+		return
+	}
+	session, err := store.Load(id)
+	if err != nil {
+		p.writeSessionLoadError(w, err, "could not load session")
+		return
+	}
+	if !session.Archived {
+		writeError(w, http.StatusConflict, "session_active", "archive session before removing it")
+		return
+	}
+	if err := store.Delete(id); err != nil {
+		p.writeSessionLoadError(w, err, "could not remove session")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status": "removed",
+		"id":     id,
+	})
 }
 
 func (p *Process) handleSessionItems(w http.ResponseWriter, r *http.Request, id string) {
@@ -920,69 +988,6 @@ func (p *Process) handleSessionItems(w http.ResponseWriter, r *http.Request, id 
 		Items:         items,
 		HasMoreBefore: hasMoreBefore,
 		HasMoreAfter:  hasMoreAfter,
-	})
-}
-
-func (p *Process) handleSessionItemContent(w http.ResponseWriter, r *http.Request, id, itemID string) {
-	query, err := parseSessionItemContentQuery(r)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_query", err.Error())
-		return
-	}
-	if query.View == sessionItemsViewDebug && !p.requireRegistryToken(w, r) {
-		return
-	}
-
-	store := p.sessionStore
-	if store == nil {
-		writeError(w, http.StatusServiceUnavailable, "session_store_unavailable", "session store is not configured")
-		return
-	}
-	if !validSessionAPIID(id) {
-		writeError(w, http.StatusBadRequest, "invalid_session_id", "invalid session id")
-		return
-	}
-	if strings.TrimSpace(itemID) == "" || itemID != strings.TrimSpace(itemID) {
-		writeError(w, http.StatusNotFound, "item_not_found", "item not found")
-		return
-	}
-
-	session, err := store.Load(id)
-	if err != nil {
-		if errors.Is(err, sessions.ErrNotFound) {
-			writeError(w, http.StatusNotFound, "session_not_found", "session not found")
-			return
-		}
-		writeError(w, http.StatusInternalServerError, "session_store_error", "could not load session item content")
-		return
-	}
-	item, ok := findSessionItemByID(session.Items, itemID)
-	if !ok {
-		writeError(w, http.StatusNotFound, "item_not_found", "item not found")
-		return
-	}
-	if !sessionItemContentReadableInView(item, query.View) {
-		writeError(w, http.StatusNotFound, "content_unavailable", "item content is not available")
-		return
-	}
-
-	rawContent, err := readSessionItemContentBytes(store, item)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "session_store_error", "could not load session item content")
-		return
-	}
-	if len(rawContent) == 0 {
-		writeError(w, http.StatusNotFound, "content_unavailable", "item content is not available")
-		return
-	}
-	content, offset, sizeBytes, bytesReturned, hasMore := sessionContentBytesRange(rawContent, query.Offset, query.MaxBytes)
-	writeJSON(w, http.StatusOK, sessionItemContentResponseDTO{
-		ItemID:        item.ID,
-		Content:       content,
-		Offset:        offset,
-		SizeBytes:     sizeBytes,
-		BytesReturned: bytesReturned,
-		HasMore:       hasMore,
 	})
 }
 
@@ -1184,7 +1189,7 @@ func (p *Process) handleSessionCompact(w http.ResponseWriter, r *http.Request, i
 		writeError(w, http.StatusBadRequest, "invalid_session_id", "invalid session id")
 		return
 	}
-	if err := readEmptySessionCreateRequest(w, r); err != nil {
+	if err := readEmptyObjectRequest(w, r); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_request", err.Error())
 		return
 	}
@@ -1457,6 +1462,28 @@ func (p *Process) projectHasRunningTurn(projectID string) (bool, error) {
 	return false, nil
 }
 
+func (p *Process) removeProjectSessions(projectID string) (int, error) {
+	projectID = strings.TrimSpace(projectID)
+	if projectID == "" || p.sessionStore == nil {
+		return 0, nil
+	}
+	infos, err := p.sessionStore.ListWithOptions(sessions.V2ListOptions{All: true})
+	if err != nil {
+		return 0, err
+	}
+	removed := 0
+	for _, info := range infos {
+		if info.ProjectID != projectID {
+			continue
+		}
+		if err := p.sessionStore.Delete(info.ID); err != nil {
+			return removed, err
+		}
+		removed++
+	}
+	return removed, nil
+}
+
 func (p *Process) sessionCount() (int, error) {
 	if p.sessionStore == nil {
 		info := p.snapshot()
@@ -1467,6 +1494,18 @@ func (p *Process) sessionCount() (int, error) {
 		return 0, err
 	}
 	return len(infos), nil
+}
+
+func (p *Process) projectCount() (int, error) {
+	if p.projectStore == nil {
+		info := p.snapshot()
+		return info.ProjectCount, nil
+	}
+	projects, err := p.projectStore.List()
+	if err != nil {
+		return 0, err
+	}
+	return len(projects), nil
 }
 
 func (p *Process) ensureSessionExists(id string) error {
@@ -1836,15 +1875,6 @@ type sessionItemBlobRefDTO struct {
 	MediaType string `json:"media_type,omitempty"`
 }
 
-type sessionItemContentResponseDTO struct {
-	ItemID        string `json:"item_id"`
-	Content       string `json:"content"`
-	Offset        int64  `json:"offset"`
-	SizeBytes     int64  `json:"size_bytes"`
-	BytesReturned int    `json:"bytes_returned"`
-	HasMore       bool   `json:"has_more"`
-}
-
 type sessionBlobContentResponseDTO struct {
 	BlobHash      string `json:"blob_hash"`
 	Content       string `json:"content"`
@@ -1864,7 +1894,8 @@ type sessionItemsQuery struct {
 }
 
 type sessionListQuery struct {
-	Archived bool
+	Archived    bool
+	AllProjects bool
 }
 
 type sessionItemContentQuery struct {
@@ -1962,18 +1993,27 @@ func parseSessionItemsQuery(r *http.Request) (sessionItemsQuery, error) {
 }
 
 func parseSessionListQuery(r *http.Request) (sessionListQuery, error) {
-	rawArchived, ok, err := singleQueryValue(r.URL.Query(), "archived")
-	if err != nil {
+	values := r.URL.Query()
+	query := sessionListQuery{}
+	if rawArchived, ok, err := singleQueryValue(values, "archived"); err != nil {
 		return sessionListQuery{}, err
+	} else if ok {
+		archived, err := strconv.ParseBool(rawArchived)
+		if err != nil {
+			return sessionListQuery{}, fmt.Errorf("archived must be a boolean")
+		}
+		query.Archived = archived
 	}
-	if !ok {
-		return sessionListQuery{}, nil
+	if rawAllProjects, ok, err := singleQueryValue(values, "all_projects"); err != nil {
+		return sessionListQuery{}, err
+	} else if ok {
+		allProjects, err := strconv.ParseBool(rawAllProjects)
+		if err != nil {
+			return sessionListQuery{}, fmt.Errorf("all_projects must be a boolean")
+		}
+		query.AllProjects = allProjects
 	}
-	archived, err := strconv.ParseBool(rawArchived)
-	if err != nil {
-		return sessionListQuery{}, fmt.Errorf("archived must be a boolean")
-	}
-	return sessionListQuery{Archived: archived}, nil
+	return query, nil
 }
 
 func parseSessionItemContentQuery(r *http.Request) (sessionItemContentQuery, error) {
@@ -2039,18 +2079,6 @@ func singleQueryValue(values map[string][]string, name string) (string, bool, er
 		return "", true, fmt.Errorf("%s must not be empty", name)
 	}
 	return raw, true, nil
-}
-
-func parseProjectDeleteDataQuery(r *http.Request) (bool, error) {
-	raw, ok, err := singleQueryValue(r.URL.Query(), "delete_data")
-	if err != nil || !ok {
-		return false, err
-	}
-	deleteData, err := strconv.ParseBool(raw)
-	if err != nil {
-		return false, fmt.Errorf("delete_data must be true or false")
-	}
-	return deleteData, nil
 }
 
 func parseShutdownQuery(r *http.Request) (shutdownQuery, error) {
@@ -2278,21 +2306,6 @@ func truncateStringByBytes(value string, maxBytes int) string {
 	return value[:cut]
 }
 
-func readSessionItemContentBytes(store *sessions.V2Store, item sessions.SessionItem) ([]byte, error) {
-	if item.Content != nil {
-		if item.Content.Inline != "" {
-			return []byte(item.Content.Inline), nil
-		}
-		if item.Content.Blob != nil {
-			return store.ReadBlob(*item.Content.Blob)
-		}
-	}
-	if item.Message != nil && item.Message.Content != "" {
-		return []byte(item.Message.Content), nil
-	}
-	return nil, nil
-}
-
 func findReachableSessionBlobRef(items []sessions.SessionItem, hash, view string) (sessions.BlobRef, bool) {
 	for _, item := range items {
 		if !sessionItemContentReadableInView(item, view) || item.Content == nil || item.Content.Blob == nil {
@@ -2336,25 +2349,6 @@ func sessionContentBytesRange(value []byte, offset int64, maxBytes int) (string,
 	return content, int64(start), sizeBytes, len(content), int64(end) < sizeBytes
 }
 
-func readEmptySessionCreateRequest(w http.ResponseWriter, r *http.Request) error {
-	body := http.MaxBytesReader(w, r.Body, 1024)
-	data, err := io.ReadAll(body)
-	if err != nil {
-		return fmt.Errorf("read request body: %w", err)
-	}
-	if len(strings.TrimSpace(string(data))) == 0 {
-		return nil
-	}
-	var value map[string]json.RawMessage
-	if err := json.Unmarshal(data, &value); err != nil {
-		return fmt.Errorf("request body must be empty or an object")
-	}
-	if value == nil || len(value) != 0 {
-		return fmt.Errorf("request body must be empty or {}")
-	}
-	return nil
-}
-
 func readProjectSessionCreateRequest(w http.ResponseWriter, r *http.Request) (SessionCreateMetadata, error) {
 	body := http.MaxBytesReader(w, r.Body, 64*1024)
 	data, err := io.ReadAll(body)
@@ -2378,6 +2372,25 @@ func readProjectSessionCreateRequest(w http.ResponseWriter, r *http.Request) (Se
 	if err := decoder.Decode(&extra); err != io.EOF {
 		return SessionCreateMetadata{}, fmt.Errorf("request body must contain a single JSON object")
 	}
+	allowed := map[string]bool{
+		"created_cwd":       true,
+		"config_path":       true,
+		"provider":          true,
+		"model_profile":     true,
+		"model_id":          true,
+		"model_parameters":  true,
+		"enabled_tools":     true,
+		"enabled_mcp":       true,
+		"enabled_skills":    true,
+		"show_reasoning":    true,
+		"context":           true,
+		"save_tool_results": true,
+	}
+	for name := range raw {
+		if !allowed[name] {
+			return SessionCreateMetadata{}, fmt.Errorf("unsupported session create metadata field %q", name)
+		}
+	}
 
 	decoder = json.NewDecoder(bytes.NewReader(data))
 	decoder.UseNumber()
@@ -2388,7 +2401,34 @@ func readProjectSessionCreateRequest(w http.ResponseWriter, r *http.Request) (Se
 	return request, nil
 }
 
+func readEmptyObjectRequest(w http.ResponseWriter, r *http.Request) error {
+	body := http.MaxBytesReader(w, r.Body, 1024)
+	data, err := io.ReadAll(body)
+	if err != nil {
+		return fmt.Errorf("read request body: %w", err)
+	}
+	if len(strings.TrimSpace(string(data))) == 0 {
+		return nil
+	}
+	var value map[string]json.RawMessage
+	if err := json.Unmarshal(data, &value); err != nil {
+		return fmt.Errorf("request body must be empty or an object")
+	}
+	if value == nil || len(value) != 0 {
+		return fmt.Errorf("request body must be empty or {}")
+	}
+	return nil
+}
+
 func readSessionMetadataUpdateRequest(w http.ResponseWriter, r *http.Request) (SessionMetadataUpdate, error) {
+	return readMetadataUpdateRequest(w, r, "session")
+}
+
+func readProjectMetadataUpdateRequest(w http.ResponseWriter, r *http.Request) (SessionMetadataUpdate, error) {
+	return readMetadataUpdateRequest(w, r, "project")
+}
+
+func readMetadataUpdateRequest(w http.ResponseWriter, r *http.Request, resource string) (SessionMetadataUpdate, error) {
 	body := http.MaxBytesReader(w, r.Body, 64*1024)
 	decoder := json.NewDecoder(body)
 	decoder.UseNumber()
@@ -2425,7 +2465,7 @@ func readSessionMetadataUpdateRequest(w http.ResponseWriter, r *http.Request) (S
 			}
 			request.Archived = &value
 		default:
-			return SessionMetadataUpdate{}, fmt.Errorf("unsupported session metadata field %q", name)
+			return SessionMetadataUpdate{}, fmt.Errorf("unsupported %s metadata field %q", resource, name)
 		}
 	}
 	if request.DisplayName == nil && request.Archived == nil {

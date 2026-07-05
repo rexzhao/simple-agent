@@ -52,8 +52,9 @@ func TestProcessHealthServerAndShutdown(t *testing.T) {
 
 	info := getJSONWithToken(t, baseURL+"/server", "registry-token")
 	for key, want := range map[string]any{
-		"addr":          process.Addr(),
+		"base_url":      process.Addr(),
 		"version":       "test-version",
+		"project_count": float64(0),
 		"session_count": float64(0),
 		"running_turns": float64(0),
 	} {

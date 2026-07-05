@@ -135,12 +135,15 @@ func TestV2StoreSaveLoadMetadata(t *testing.T) {
 			t.Fatalf("meta.json[%s] = %q, want %q", key, got, want)
 		}
 	}
-	var archived bool
-	if err := json.Unmarshal(metadata["archived"], &archived); err != nil {
-		t.Fatalf("Unmarshal(meta.json[archived]) error = %v; raw=%s", err, raw)
+	if _, ok := metadata["archived"]; ok {
+		t.Fatalf("meta.json contains legacy archived boolean: %s", raw)
 	}
-	if !archived {
-		t.Fatal("meta.json[archived] = false, want true")
+	var archivedAt time.Time
+	if err := json.Unmarshal(metadata["archived_at"], &archivedAt); err != nil {
+		t.Fatalf("Unmarshal(meta.json[archived_at]) error = %v; raw=%s", err, raw)
+	}
+	if !archivedAt.Equal(saved.ArchivedAt) {
+		t.Fatalf("meta.json[archived_at] = %s, want %s", archivedAt, saved.ArchivedAt)
 	}
 	var lastUsedAt time.Time
 	if err := json.Unmarshal(metadata["last_used_at"], &lastUsedAt); err != nil {

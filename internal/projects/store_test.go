@@ -1,6 +1,7 @@
 package projects
 
 import (
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -41,6 +42,19 @@ func TestStoreCreateCanonicalizesPersistsAndDuplicatesByRootOnly(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(storeRoot, project.ID, projectFileName)); err != nil {
 		t.Fatalf("project metadata was not written under store root: %v", err)
 	}
+	metadata := readProjectMetadataFile(t, storeRoot, project.ID)
+	for _, key := range []string{"version", "archived"} {
+		if _, ok := metadata[key]; ok {
+			t.Fatalf("project metadata contains legacy %q key: %#v", key, metadata)
+		}
+	}
+	var archivedAt *time.Time
+	if err := json.Unmarshal(metadata["archived_at"], &archivedAt); err != nil {
+		t.Fatalf("Unmarshal(project archived_at) error = %v", err)
+	}
+	if archivedAt != nil {
+		t.Fatalf("project archived_at = %s, want null for active project", archivedAt)
+	}
 	if entries, err := os.ReadDir(projectRoot); err != nil || len(entries) != 0 {
 		t.Fatalf("project repo entries = %#v, err = %v, want no marker files", entries, err)
 	}
@@ -78,7 +92,8 @@ func TestStoreCreateRequiresExistingDirectory(t *testing.T) {
 
 func TestStoreListOmitsArchivedProjects(t *testing.T) {
 	clock := fakeClock{current: time.Date(2026, 7, 4, 10, 0, 0, 0, time.UTC)}
-	store := newStoreWithClock(filepath.Join(t.TempDir(), "projects"), clock.Now)
+	storeRoot := filepath.Join(t.TempDir(), "projects")
+	store := newStoreWithClock(storeRoot, clock.Now)
 	activeRoot := mkdirProjectDir(t, "active")
 	archivedRoot := mkdirProjectDir(t, "archived")
 	archivedChild := filepath.Join(archivedRoot, "child")
@@ -100,6 +115,19 @@ func TestStoreListOmitsArchivedProjects(t *testing.T) {
 	}
 	if !archived.Archived {
 		t.Fatalf("Archive() returned archived = false: %#v", archived)
+	}
+	metadata := readProjectMetadataFile(t, storeRoot, archived.ID)
+	for _, key := range []string{"version", "archived"} {
+		if _, ok := metadata[key]; ok {
+			t.Fatalf("archived project metadata contains legacy %q key: %#v", key, metadata)
+		}
+	}
+	var archivedAt time.Time
+	if err := json.Unmarshal(metadata["archived_at"], &archivedAt); err != nil {
+		t.Fatalf("Unmarshal(archived project archived_at) error = %v", err)
+	}
+	if !archivedAt.Equal(archived.ArchivedAt) {
+		t.Fatalf("archived_at = %s, want %s", archivedAt, archived.ArchivedAt)
 	}
 
 	projects, err := store.List()
@@ -210,6 +238,19 @@ func projectIDs(projects []Project) []string {
 		ids = append(ids, project.ID)
 	}
 	return ids
+}
+
+func readProjectMetadataFile(t *testing.T, storeRoot, id string) map[string]json.RawMessage {
+	t.Helper()
+	raw, err := os.ReadFile(filepath.Join(storeRoot, id, projectFileName))
+	if err != nil {
+		t.Fatalf("ReadFile(project.json) error = %v", err)
+	}
+	var metadata map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &metadata); err != nil {
+		t.Fatalf("Unmarshal(project.json) error = %v; raw=%s", err, raw)
+	}
+	return metadata
 }
 
 type fakeClock struct {

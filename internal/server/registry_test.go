@@ -27,7 +27,7 @@ func TestDefaultRegistryPathUsesProjectSpecificFile(t *testing.T) {
 		t.Fatalf("DefaultRegistryPath() registry dir = %q, want %q", got, want)
 	}
 	if got, want := filepath.Base(filepath.Dir(filepath.Dir(path))), defaultRegistryDirName; got != want {
-		t.Fatalf("DefaultRegistryPath() home dir = %q, want %q", got, want)
+		t.Fatalf("DefaultRegistryPath() server root dir = %q, want %q", got, want)
 	}
 }
 
@@ -110,27 +110,27 @@ func TestAcquireStartupLockSerializesAndUsesPrivateFile(t *testing.T) {
 	}
 }
 
-func TestHomeEnvVarNameFromProgramBasename(t *testing.T) {
+func TestServerRootEnvVarNameFromProgramBasename(t *testing.T) {
 	tests := []struct {
 		program string
 		want    string
 	}{
-		{program: "sai.exe", want: "SAI_HOME"},
-		{program: filepath.Join("bin", "simple-agent.exe"), want: "SIMPLE_AGENT_HOME"},
-		{program: "my.tool", want: "MY_TOOL_HOME"},
-		{program: "my---tool", want: "MY_TOOL_HOME"},
+		{program: "sai.exe", want: "SAI_SERVER_ROOT"},
+		{program: filepath.Join("bin", "simple-agent.exe"), want: "SIMPLE_AGENT_SERVER_ROOT"},
+		{program: "my.tool", want: "MY_TOOL_SERVER_ROOT"},
+		{program: "my---tool", want: "MY_TOOL_SERVER_ROOT"},
 		{program: "...", want: ""},
 	}
 	for _, tt := range tests {
 		t.Run(tt.program, func(t *testing.T) {
-			if got := HomeEnvVarName(tt.program); got != tt.want {
-				t.Fatalf("HomeEnvVarName(%q) = %q, want %q", tt.program, got, tt.want)
+			if got := ServerRootEnvVarName(tt.program); got != tt.want {
+				t.Fatalf("ServerRootEnvVarName(%q) = %q, want %q", tt.program, got, tt.want)
 			}
 		})
 	}
 }
 
-func TestResolveHomeDirPriority(t *testing.T) {
+func TestResolveServerRootPriority(t *testing.T) {
 	root := t.TempDir()
 	defaultRoot := filepath.Join(root, "default")
 	envRoot := filepath.Join(root, "env")
@@ -138,34 +138,35 @@ func TestResolveHomeDirPriority(t *testing.T) {
 	t.Setenv("APPDATA", filepath.Join(defaultRoot, "appdata"))
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(defaultRoot, "xdg-config"))
 	t.Setenv("HOME", filepath.Join(defaultRoot, "home"))
-	t.Setenv("SIMPLE_AGENT_HOME", envRoot)
+	t.Setenv("SIMPLE_AGENT_SERVER_ROOT", envRoot)
+	t.Setenv("OTHER_TOOL_SERVER_ROOT", "")
 
-	got, err := ResolveHomeDir("simple-agent.exe", flagRoot)
+	got, err := ResolveServerRoot("simple-agent.exe", flagRoot)
 	if err != nil {
-		t.Fatalf("ResolveHomeDir(--home) error = %v", err)
+		t.Fatalf("ResolveServerRoot(--server-root) error = %v", err)
 	}
 	if got != mustCanonicalPath(t, flagRoot) {
-		t.Fatalf("ResolveHomeDir(--home) = %q, want %q", got, mustCanonicalPath(t, flagRoot))
+		t.Fatalf("ResolveServerRoot(--server-root) = %q, want %q", got, mustCanonicalPath(t, flagRoot))
 	}
 
-	got, err = ResolveHomeDir("simple-agent.exe", "")
+	got, err = ResolveServerRoot("simple-agent.exe", "")
 	if err != nil {
-		t.Fatalf("ResolveHomeDir(env) error = %v", err)
+		t.Fatalf("ResolveServerRoot(env) error = %v", err)
 	}
 	if got != mustCanonicalPath(t, envRoot) {
-		t.Fatalf("ResolveHomeDir(env) = %q, want %q", got, mustCanonicalPath(t, envRoot))
+		t.Fatalf("ResolveServerRoot(env) = %q, want %q", got, mustCanonicalPath(t, envRoot))
 	}
 
-	got, err = ResolveHomeDir("...", "")
+	got, err = ResolveServerRoot("other.tool.exe", "")
 	if err != nil {
-		t.Fatalf("ResolveHomeDir(default) error = %v", err)
+		t.Fatalf("ResolveServerRoot(default) error = %v", err)
 	}
-	wantDefault, err := DefaultHomeDir()
+	wantDefault, err := DefaultServerRootDir("other.tool.exe")
 	if err != nil {
-		t.Fatalf("DefaultHomeDir() error = %v", err)
+		t.Fatalf("DefaultServerRootDir() error = %v", err)
 	}
 	if got != wantDefault {
-		t.Fatalf("ResolveHomeDir(default) = %q, want %q", got, wantDefault)
+		t.Fatalf("ResolveServerRoot(default) = %q, want %q", got, wantDefault)
 	}
 }
 
@@ -245,22 +246,17 @@ func TestRegistryStoreUpsertReplacesSingleton(t *testing.T) {
 	if records[0].RequestedListen != "127.0.0.1:8787" {
 		t.Fatalf("RequestedListen = %q, want replacement requested listen", records[0].RequestedListen)
 	}
-	wantIdentity, err := NewRegistryIdentity(project)
-	if err != nil {
-		t.Fatalf("NewRegistryIdentity() error = %v", err)
-	}
-	if !wantIdentity.Matches(records[0]) {
-		t.Fatalf("record identity = %#v, want %#v", records[0].Identity(), wantIdentity)
+	if records[0].CWD != "" {
+		t.Fatalf("record CWD = %q, want omitted after reload", records[0].CWD)
 	}
 }
 
-func TestRegistryStoreRemove(t *testing.T) {
+func TestRegistryStoreClear(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "servers.json")
 	store := NewRegistryStore(path)
 	root := t.TempDir()
 	project := filepath.Join(root, "project")
 	config := filepath.Join(project, ".agents", "sai.yaml")
-	otherConfig := filepath.Join(project, ".agents", "other.yaml")
 
 	if err := store.Save([]RegistryRecord{
 		testRegistryRecord(project, config, "127.0.0.1:1001", 1001, "token-one"),
@@ -268,12 +264,12 @@ func TestRegistryStoreRemove(t *testing.T) {
 		t.Fatalf("Save() error = %v", err)
 	}
 
-	removed, err := store.Remove(project)
+	removed, err := store.Clear()
 	if err != nil {
-		t.Fatalf("Remove() error = %v", err)
+		t.Fatalf("Clear() error = %v", err)
 	}
 	if !removed {
-		t.Fatal("Remove() removed = false, want true")
+		t.Fatal("Clear() removed = false, want true")
 	}
 	records, err := store.Load()
 	if err != nil {
@@ -283,17 +279,12 @@ func TestRegistryStoreRemove(t *testing.T) {
 		t.Fatalf("records after remove = %#v, want empty", records)
 	}
 
-	if err := store.Save([]RegistryRecord{
-		testRegistryRecord(project, otherConfig, "127.0.0.1:1002", 1002, "token-two"),
-	}); err != nil {
-		t.Fatalf("Save(other) error = %v", err)
-	}
-	removed, err = store.Remove(filepath.Join(root, "other-project"))
+	removed, err = store.Clear()
 	if err != nil {
-		t.Fatalf("Remove() missing error = %v", err)
+		t.Fatalf("Clear() missing error = %v", err)
 	}
 	if removed {
-		t.Fatal("Remove() missing removed = true, want false")
+		t.Fatal("Clear() missing removed = true, want false")
 	}
 }
 
@@ -349,6 +340,11 @@ func TestRegistryStoreSerializesBaseURLField(t *testing.T) {
 	}
 	if _, ok := payload["addr"]; ok {
 		t.Fatalf("registry JSON contains old addr field: %s", raw)
+	}
+	for _, key := range []string{"cwd", "server_root", "config_path"} {
+		if _, ok := payload[key]; ok {
+			t.Fatalf("registry JSON contains %q field: %s", key, raw)
+		}
 	}
 	for _, key := range []string{"pid", "base_url", "token", "version", "started_at"} {
 		if _, ok := payload[key]; !ok {
@@ -406,7 +402,7 @@ func TestRegistryStoreSaveUsesPrivatePermissions(t *testing.T) {
 
 	path := filepath.Join(t.TempDir(), "registry", "servers.json")
 	store := NewRegistryStore(path)
-	if err := store.Save([]RegistryRecord{}); err != nil {
+	if err := store.Save([]RegistryRecord{testRegistryRecord(t.TempDir(), "", "127.0.0.1:2222", 2222, "token")}); err != nil {
 		t.Fatalf("Save() error = %v", err)
 	}
 
