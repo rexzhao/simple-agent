@@ -6610,6 +6610,134 @@ func TestChatSaveSessionFlagWritesFullToolHistory(t *testing.T) {
 	}
 }
 
+func TestChatSaveSessionFlagWritesMultiToolHistoryIncrementally(t *testing.T) {
+	firstCommand := blockingShellCommandForCLIReleaseFile("release-one.txt", "first tool output")
+	secondCommand := blockingShellCommandForCLIReleaseFile("release-two.txt", "second tool output")
+	firstArgs, err := json.Marshal(map[string]any{
+		"command":    firstCommand,
+		"timeout_ms": 5000,
+	})
+	if err != nil {
+		t.Fatalf("Marshal(first shell args) error = %v", err)
+	}
+	secondArgs, err := json.Marshal(map[string]any{
+		"command":    secondCommand,
+		"timeout_ms": 5000,
+	})
+	if err != nil {
+		t.Fatalf("Marshal(second shell args) error = %v", err)
+	}
+	toolChunk := fmt.Sprintf(
+		`{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"shell","arguments":%q}},{"index":1,"id":"call_2","function":{"name":"shell","arguments":%q}}]}}]}`,
+		string(firstArgs),
+		string(secondArgs),
+	)
+	server, requests := newSequentialCLIRunServer(t,
+		[]string{
+			toolChunk,
+			`{"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`,
+			`[DONE]`,
+		},
+		[]string{
+			`{"choices":[{"delta":{"content":"done"}}]}`,
+			`[DONE]`,
+		},
+	)
+	defer server.Close()
+
+	projectDir := t.TempDir()
+	configDir := t.TempDir()
+	writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
+
+	type runOutcome struct {
+		code   int
+		stdout string
+		stderr string
+	}
+	done := make(chan runOutcome, 1)
+	go func() {
+		var stdout, stderr bytes.Buffer
+		code := runLegacyChatWithIO([]string{"--config", cliConfigPath(configDir), "chat", "--save-session", "--quit", "--enable-tools", "shell", "--prompt", "Run both tools"}, strings.NewReader(""), &stdout, &stderr, func() (string, error) {
+			return projectDir, nil
+		})
+		done <- runOutcome{code: code, stdout: stdout.String(), stderr: stderr.String()}
+	}()
+
+	firstRequest := receiveCLIRunRequest(t, requests)
+	assertCLIToolNames(t, firstRequest.Body, []string{"shell"})
+	sessionRoot := filepath.Join(configDir, "sessions")
+	session := waitForOnlyCLISession(t, sessionRoot)
+	store := sessions.NewV2Store(sessionRoot)
+	pendingTools := waitForCLISessionToolStatusCount(t, store, session.ID, sessions.ItemStatusPending, 2)
+	if got := toolCallIDsForSessionItems(pendingTools); !reflect.DeepEqual(got, []string{"call_1", "call_2"}) {
+		t.Fatalf("pending tool call IDs = %#v, want call_1/call_2", got)
+	}
+
+	writeCLIFile(t, filepath.Join(projectDir, "release-one.txt"), "go")
+	writeCLIFile(t, filepath.Join(projectDir, "release-two.txt"), "go")
+	secondRequest := receiveCLIRunRequest(t, requests)
+	messages := requestMessages(t, secondRequest.Body)
+	if got := toolMessagesByCallID(messages); !strings.Contains(got["call_1"], "first tool output") || !strings.Contains(got["call_2"], "second tool output") {
+		t.Fatalf("second request tool messages = %#v, want both tool outputs", got)
+	}
+
+	var outcome runOutcome
+	select {
+	case outcome = <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for CLI run")
+	}
+	if outcome.code != 0 {
+		t.Fatalf("RunWithIO() code = %d, stderr = %s", outcome.code, outcome.stderr)
+	}
+	if got, want := outcome.stdout, "done"; got != want {
+		t.Fatalf("stdout = %q, want %q", got, want)
+	}
+	assertNoAdditionalCLIRunRequest(t, requests)
+
+	loaded := loadCLISession(t, sessionRoot, session.ID)
+	if loaded.RunningTurnID != "" {
+		t.Fatalf("RunningTurnID = %q, want cleared", loaded.RunningTurnID)
+	}
+	completedTools := toolItemsByCallID(loaded.Items)
+	for callID, wantContent := range map[string]string{
+		"call_1": "first tool output",
+		"call_2": "second tool output",
+	} {
+		item, ok := completedTools[callID]
+		if !ok || item.Status != sessions.ItemStatusCompleted || item.Message == nil || !strings.Contains(item.Message.Content, wantContent) {
+			t.Fatalf("%s completed item = %#v, ok %v, want completed content %q", callID, item, ok, wantContent)
+		}
+	}
+	materialized, err := store.MaterializeActiveHistory(loaded)
+	if err != nil {
+		t.Fatalf("MaterializeActiveHistory() error = %v", err)
+	}
+	if err := validateActiveHistoryToolExchanges(loaded.ID, materialized); err != nil {
+		t.Fatalf("active history validation error = %v; messages=%#v", err, materialized)
+	}
+	events, err := store.PersistedEventsAfter(loaded.ID, 0)
+	if err != nil {
+		t.Fatalf("PersistedEventsAfter() error = %v", err)
+	}
+	updatedItemIDs := make(map[string]struct{}, 2)
+	for _, item := range completedTools {
+		updatedItemIDs[item.ID] = struct{}{}
+	}
+	var updatedEvents int
+	for _, event := range events {
+		if event.Type != sessions.RecordTypeItemUpdated {
+			continue
+		}
+		if _, ok := updatedItemIDs[event.ItemID]; ok {
+			updatedEvents++
+		}
+	}
+	if updatedEvents != 2 {
+		t.Fatalf("tool item.updated events = %d, want 2: %#v", updatedEvents, events)
+	}
+}
+
 func TestChatSaveSessionWithCompactionEnabledUsesProjectorPath(t *testing.T) {
 	server, requests := newSequentialCLIRunServer(t,
 		[]string{
@@ -8106,10 +8234,37 @@ func TestServerAgentTurnRunnerPublishesIncrementalEventsToPublisher(t *testing.T
 }
 
 func blockingShellCommandForCLIIncrementalTest() string {
+	return blockingShellCommandForCLIReleaseFile("release.txt", "blocked tool output")
+}
+
+func blockingShellCommandForCLIReleaseFile(filename, output string) string {
 	if runtime.GOOS == "windows" {
-		return "while (!(Test-Path -LiteralPath 'release.txt')) { Start-Sleep -Milliseconds 50 }; Write-Output 'blocked tool output'"
+		return fmt.Sprintf("while (!(Test-Path -LiteralPath '%s')) { Start-Sleep -Milliseconds 50 }; Write-Output '%s'", filename, output)
 	}
-	return "while [ ! -f release.txt ]; do sleep 0.05; done; printf '%s\\n' 'blocked tool output'"
+	return fmt.Sprintf("while [ ! -f '%s' ]; do sleep 0.05; done; printf '%%s\\n' '%s'", filename, output)
+}
+
+func waitForOnlyCLISession(t *testing.T, root string) sessions.SessionV2 {
+	t.Helper()
+
+	store := sessions.NewV2Store(root)
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		infos, err := store.List()
+		if err != nil {
+			t.Fatalf("List() error = %v", err)
+		}
+		if len(infos) == 1 {
+			return loadCLISession(t, root, infos[0].ID)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	infos, err := store.List()
+	if err != nil {
+		t.Fatalf("List() after timeout error = %v", err)
+	}
+	t.Fatalf("timed out waiting for one CLI session; sessions=%#v", infos)
+	return sessions.SessionV2{}
 }
 
 func waitForCLISessionToolStatus(t *testing.T, store *sessions.V2Store, sessionID, status string) sessions.SessionItem {
@@ -8134,6 +8289,59 @@ func waitForCLISessionToolStatus(t *testing.T, store *sessions.V2Store, sessionI
 	}
 	t.Fatalf("timed out waiting for tool status %q; items=%#v", status, session.Items)
 	return sessions.SessionItem{}
+}
+
+func waitForCLISessionToolStatusCount(t *testing.T, store *sessions.V2Store, sessionID, status string, count int) []sessions.SessionItem {
+	t.Helper()
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		session, err := store.Load(sessionID)
+		if err != nil {
+			t.Fatalf("Load(%s) error = %v", sessionID, err)
+		}
+		items := sessionToolItemsWithStatus(session.Items, status)
+		if len(items) == count {
+			return items
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	session, err := store.Load(sessionID)
+	if err != nil {
+		t.Fatalf("Load(%s) after timeout error = %v", sessionID, err)
+	}
+	t.Fatalf("timed out waiting for %d tool items with status %q; items=%#v", count, status, session.Items)
+	return nil
+}
+
+func sessionToolItemsWithStatus(items []sessions.SessionItem, status string) []sessions.SessionItem {
+	var matches []sessions.SessionItem
+	for _, item := range items {
+		if item.Message != nil && item.Message.Role == model.MessageRoleTool && item.Status == status {
+			matches = append(matches, item)
+		}
+	}
+	return matches
+}
+
+func toolCallIDsForSessionItems(items []sessions.SessionItem) []string {
+	ids := make([]string, 0, len(items))
+	for _, item := range items {
+		if item.Message != nil {
+			ids = append(ids, item.Message.ToolCallID)
+		}
+	}
+	return ids
+}
+
+func toolItemsByCallID(items []sessions.SessionItem) map[string]sessions.SessionItem {
+	byCallID := make(map[string]sessions.SessionItem)
+	for _, item := range items {
+		if item.Message != nil && item.Message.Role == model.MessageRoleTool {
+			byCallID[item.Message.ToolCallID] = item
+		}
+	}
+	return byCallID
 }
 
 func TestServerAgentTurnRunnerUsesProvidedSessionOutsideConfigStore(t *testing.T) {
@@ -16209,6 +16417,19 @@ func requestMessages(t *testing.T, body map[string]any) []any {
 		t.Fatalf("messages = %T, want []any", body["messages"])
 	}
 	return messages
+}
+
+func toolMessagesByCallID(messages []any) map[string]string {
+	byCallID := make(map[string]string)
+	for _, raw := range messages {
+		message, ok := raw.(map[string]any)
+		if !ok || message["role"] != "tool" {
+			continue
+		}
+		toolCallID, _ := message["tool_call_id"].(string)
+		byCallID[toolCallID] = fmt.Sprint(message["content"])
+	}
+	return byCallID
 }
 
 func requestInput(t *testing.T, body map[string]any) []any {
