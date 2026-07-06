@@ -106,6 +106,10 @@ type SessionCompactPlanner interface {
 	PlanSessionCompaction(ctx context.Context, request SessionCompactionRequest) (SessionCompactionResult, error)
 }
 
+type SessionTurnCompactionPlanner interface {
+	PlanSessionTurnCompaction(ctx context.Context, request SessionTurnRequest) (SessionCompactionResult, error)
+}
+
 type SessionTurnRequest struct {
 	Session      sessions.SessionV2
 	SessionStore *sessions.V2Store
@@ -1270,6 +1274,14 @@ func (p *Process) supportsIncrementalSessionTurn(ctx context.Context, request Se
 	return supporter.SupportsIncrementalSessionTurn(ctx, request)
 }
 
+func (p *Process) planSessionTurnCompaction(ctx context.Context, request SessionTurnRequest) (SessionCompactionResult, error) {
+	planner, ok := p.turnRunner.(SessionTurnCompactionPlanner)
+	if !ok {
+		return SessionCompactionResult{}, nil
+	}
+	return planner.PlanSessionTurnCompaction(ctx, request)
+}
+
 func (p *Process) handleIncrementalSessionMessage(w http.ResponseWriter, id, turnID string, turnCtx context.Context, session sessions.SessionV2, store *sessions.V2Store, content string) {
 	projector, err := sessionprojector.New(store, session)
 	if err != nil {
@@ -1312,6 +1324,40 @@ func (p *Process) handleIncrementalSessionMessage(w http.ResponseWriter, id, tur
 	p.publishSessionEvent(id, NewSessionStreamEvent("turn.started", map[string]any{
 		"turn_id": turnID,
 	}))
+	compactionResult, err := p.planSessionTurnCompaction(turnCtx, SessionTurnRequest{
+		Session:      session,
+		SessionStore: store,
+		TurnID:       turnID,
+		Content:      content,
+	})
+	if err != nil {
+		interruptTurn()
+		closeBridge()
+		p.publishTurnFailed(id, turnID, err)
+		p.writeTurnError(w, err)
+		return
+	}
+	if sessionCompactionPlanPresent(compactionResult.Compaction) {
+		if err := bus.Publish(eventbus.CompactionRequested{
+			TurnID:     turnID,
+			Summary:    compactionResult.Compaction.SummaryItem,
+			Checkpoint: compactionResult.Compaction.Checkpoint,
+		}); err != nil {
+			interruptTurn()
+			closeBridge()
+			p.publishTurnFailed(id, turnID, err)
+			writeError(w, http.StatusInternalServerError, "session_store_error", "could not compact session")
+			return
+		}
+		session, err = store.Load(id)
+		if err != nil {
+			interruptTurn()
+			closeBridge()
+			p.publishTurnFailed(id, turnID, err)
+			p.writeSessionLoadError(w, err, "could not load compacted session")
+			return
+		}
+	}
 	if err := bus.Publish(eventbus.TurnInputReady{TurnID: turnID, Message: model.Message{Role: model.MessageRoleUser, Content: content}}); err != nil {
 		interruptTurn()
 		closeBridge()
@@ -1371,6 +1417,10 @@ func (p *Process) handleIncrementalSessionMessage(w http.ResponseWriter, id, tur
 		"last_seq": saved.LastSeq,
 		"status":   "committed",
 	})
+}
+
+func sessionCompactionPlanPresent(plan SessionCompactionPlan) bool {
+	return strings.TrimSpace(plan.SummaryItem.ID) != "" || strings.TrimSpace(plan.Checkpoint.ID) != ""
 }
 
 func (p *Process) handleSessionCompact(w http.ResponseWriter, r *http.Request, id string) {

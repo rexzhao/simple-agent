@@ -6146,9 +6146,6 @@ func (r serverAgentTurnRunner) RunSessionTurn(ctx context.Context, request local
 	defer func() {
 		err = errors.Join(err, runtime.Close())
 	}()
-	if incremental && runtime.config != nil && runtime.config.Compaction.Enabled {
-		return localserver.SessionTurnResult{}, fmt.Errorf("incremental server publisher does not support compaction yet")
-	}
 
 	messages, compaction, err := runServerOwnedSessionTurn(ctx, runtime, runtime.initialMessages(), request.Content, serverOwnedSessionTurnOptions{
 		emit:            request.Emit,
@@ -6194,7 +6191,34 @@ func (r serverAgentTurnRunner) SupportsIncrementalSessionTurn(ctx context.Contex
 	defer func() {
 		err = errors.Join(err, runtime.Close())
 	}()
-	return runtime.config == nil || !runtime.config.Compaction.Enabled, nil
+	return true, nil
+}
+
+func (r serverAgentTurnRunner) PlanSessionTurnCompaction(ctx context.Context, request localserver.SessionTurnRequest) (result localserver.SessionCompactionResult, err error) {
+	runtime, err := r.prepareServerSessionRuntime(ctx, request.Session, request.SessionStore)
+	if err != nil {
+		return localserver.SessionCompactionResult{}, err
+	}
+	defer func() {
+		err = errors.Join(err, runtime.Close())
+	}()
+
+	_, compaction, err := runtime.planAutoCompactBeforeTurn(ctx, runtime.initialMessages(), request.Content)
+	if err != nil {
+		return localserver.SessionCompactionResult{}, err
+	}
+	if compaction == nil {
+		return localserver.SessionCompactionResult{
+			Session: runtime.resumableSession,
+		}, nil
+	}
+	return localserver.SessionCompactionResult{
+		Session: runtime.resumableSession,
+		Compaction: localserver.SessionCompactionPlan{
+			SummaryItem: compaction.summaryItem,
+			Checkpoint:  compaction.checkpoint,
+		},
+	}, nil
 }
 
 func (r serverAgentTurnRunner) PlanSessionCompaction(ctx context.Context, request localserver.SessionCompactionRequest) (result localserver.SessionCompactionResult, err error) {

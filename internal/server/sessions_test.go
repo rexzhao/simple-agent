@@ -1746,6 +1746,155 @@ func TestSessionSendMessageIncrementalPersistsAndPublishesViaBus(t *testing.T) {
 	}
 }
 
+func TestSessionSendMessageIncrementalCompactsBeforeTurnViaProjector(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "sessions")
+	store := sessions.NewV2Store(root)
+	saveServerTestSession(t, store, "send-incremental-compact")
+	existingUser := appendServerTestItem(t, store, "send-incremental-compact", sessions.SessionItem{
+		ID:         "existing-user",
+		Kind:       sessions.ItemKindMessage,
+		Visibility: sessions.ItemVisibilityVisible,
+		Audience:   sessions.ItemAudienceUser,
+		Message:    &model.Message{Role: model.MessageRoleUser, Content: "existing prompt"},
+	})
+	existingAssistant := appendServerTestItem(t, store, "send-incremental-compact", sessions.SessionItem{
+		ID:         "existing-assistant",
+		Kind:       sessions.ItemKindMessage,
+		Visibility: sessions.ItemVisibilityVisible,
+		Audience:   sessions.ItemAudienceModel,
+		Message:    &model.Message{Role: model.MessageRoleAssistant, Content: "existing answer"},
+	})
+	if _, err := store.ReplaceActiveHistory("send-incremental-compact", []string{existingUser.ID, existingAssistant.ID}); err != nil {
+		t.Fatalf("ReplaceActiveHistory() error = %v", err)
+	}
+
+	summaryMessage := model.Message{Role: model.MessageRoleDeveloper, Content: "<compaction_summary>\nserver incremental compact\n</compaction_summary>"}
+	summary := sessions.SessionItem{
+		ID:         "summary-1",
+		Kind:       sessions.ItemKindMessage,
+		Visibility: sessions.ItemVisibilityHidden,
+		Audience:   sessions.ItemAudienceModel,
+		Message:    &summaryMessage,
+	}
+	checkpoint := sessions.CompactionCheckpoint{
+		ID:                    "compact-1",
+		Reason:                "context_limit",
+		Phase:                 "pre_turn",
+		Trigger:               "auto",
+		SummaryItemID:         summary.ID,
+		PreviousActiveHistory: []string{existingUser.ID, existingAssistant.ID},
+		ReplacementHistory:    []string{summary.ID},
+	}
+	runnerSawCompactedSession := false
+	runner := fakeIncrementalSessionTurnRunner{
+		plan: func(ctx context.Context, request SessionTurnRequest) (SessionCompactionResult, error) {
+			if request.TurnID == "" || request.Content != "after compact" {
+				t.Fatalf("planner request turn/content = %q/%q, want turn and prompt", request.TurnID, request.Content)
+			}
+			if !reflect.DeepEqual(request.Session.ActiveHistory, []string{existingUser.ID, existingAssistant.ID}) {
+				t.Fatalf("planner ActiveHistory = %#v, want existing active history", request.Session.ActiveHistory)
+			}
+			return SessionCompactionResult{
+				Session: request.Session,
+				Compaction: SessionCompactionPlan{
+					SummaryItem: summary,
+					Checkpoint:  checkpoint,
+				},
+			}, nil
+		},
+		run: func(ctx context.Context, request SessionTurnRequest) (SessionTurnResult, error) {
+			runnerSawCompactedSession = true
+			if !reflect.DeepEqual(request.Session.ActiveHistory, []string{summary.ID}) {
+				t.Fatalf("runner ActiveHistory = %#v, want compacted history before user prompt", request.Session.ActiveHistory)
+			}
+			if request.Session.RunningTurnID != request.TurnID {
+				t.Fatalf("runner RunningTurnID = %q, want %q", request.Session.RunningTurnID, request.TurnID)
+			}
+			if len(request.Session.Items) != 3 || request.Session.Items[2].ID != summary.ID {
+				t.Fatalf("runner session items = %#v, want existing items plus summary only", request.Session.Items)
+			}
+			if err := request.Publisher.Publish(eventbus.AssistantReady{TurnID: request.TurnID, Message: model.Message{
+				Role:    model.MessageRoleAssistant,
+				Content: "assistant after compact",
+			}}); err != nil {
+				return SessionTurnResult{}, err
+			}
+			return SessionTurnResult{Incremental: true}, nil
+		},
+	}
+	process := startSessionAPIServerWithTurnRunner(t, store, sessions.SessionV2{}, "registry-token", runner)
+	conn := dialSessionStream(t, process, "send-incremental-compact")
+	waitForStreamSubscribers(t, process, "send-incremental-compact", 1)
+
+	_, body := postRawJSONStatus(t, "http://"+process.Addr()+"/sessions/send-incremental-compact/messages", `{"content":"after compact"}`, "registry-token", http.StatusOK)
+	if body["status"] != "committed" || body["turn_id"] == "" || body["last_seq"] == nil {
+		t.Fatalf("send response = %#v, want committed turn metadata", body)
+	}
+	if !runnerSawCompactedSession {
+		t.Fatal("runner was not called with compacted session")
+	}
+
+	events := make([]map[string]any, 0, 7)
+	for len(events) < 7 {
+		events = append(events, readSessionStreamEvent(t, conn))
+	}
+	wantTypes := []string{
+		"turn.started",
+		"item.appended",
+		"compaction.created",
+		"active_history.replaced",
+		"item.appended",
+		"item.appended",
+		"turn.committed",
+	}
+	for i, want := range wantTypes {
+		if events[i]["type"] != want {
+			t.Fatalf("event[%d] type = %#v, want %q; events=%#v", i, events[i]["type"], want, events)
+		}
+	}
+	if events[1]["item_id"] != summary.ID {
+		t.Fatalf("summary event = %#v, want summary item appended", events[1])
+	}
+	if events[2]["compaction_id"] != checkpoint.ID {
+		t.Fatalf("compaction event = %#v, want compact-1", events[2])
+	}
+
+	session, err := store.Load("send-incremental-compact")
+	if err != nil {
+		t.Fatalf("Load(send-incremental-compact) error = %v", err)
+	}
+	if session.RunningTurnID != "" || session.InterruptedTurnID != "" || !session.InterruptedAt.IsZero() {
+		t.Fatalf("turn metadata = running %q interrupted %q at %s, want cleared successful turn", session.RunningTurnID, session.InterruptedTurnID, session.InterruptedAt)
+	}
+	if len(session.Items) != 5 {
+		t.Fatalf("len(session.Items) = %d, want existing+summary+user+assistant without duplicate legacy save: %#v", len(session.Items), session.Items)
+	}
+	if len(session.Compactions) != 1 || session.Compactions[0].ID != checkpoint.ID {
+		t.Fatalf("Compactions = %#v, want compact-1", session.Compactions)
+	}
+	userItem := session.Items[3]
+	assistantItem := session.Items[4]
+	if userItem.Message == nil || userItem.Message.Role != model.MessageRoleUser || userItem.Message.Content != "after compact" {
+		t.Fatalf("user item = %#v, want persisted prompt after compaction", userItem)
+	}
+	if assistantItem.Message == nil || assistantItem.Message.Role != model.MessageRoleAssistant || assistantItem.Message.Content != "assistant after compact" {
+		t.Fatalf("assistant item = %#v, want incremental assistant response", assistantItem)
+	}
+	if !reflect.DeepEqual(session.ActiveHistory, []string{summary.ID, userItem.ID, assistantItem.ID}) {
+		t.Fatalf("ActiveHistory = %#v, want compacted history plus incremental turn", session.ActiveHistory)
+	}
+	if session.LastSeq != int64(body["last_seq"].(float64)) {
+		t.Fatalf("LastSeq = %d, response last_seq = %#v", session.LastSeq, body["last_seq"])
+	}
+	messages, err := session.MaterializeActiveHistory()
+	if err != nil {
+		t.Fatalf("MaterializeActiveHistory() error = %v", err)
+	}
+	if len(messages) != 3 || messages[0].Role != model.MessageRoleDeveloper || messages[1].Role != model.MessageRoleUser || messages[2].Role != model.MessageRoleAssistant {
+		t.Fatalf("materialized messages = %#v, want legal compacted user/assistant history", messages)
+	}
+}
+
 func TestSessionSendMessagePersistsPlannedCompactionAndSuccessfulTurnAtomically(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "sessions")
 	store := sessions.NewV2Store(root)
@@ -3574,6 +3723,7 @@ func (r fakeSessionTurnRunner) RunSessionTurn(ctx context.Context, request Sessi
 type fakeIncrementalSessionTurnRunner struct {
 	run     func(context.Context, SessionTurnRequest) (SessionTurnResult, error)
 	support func(context.Context, SessionTurnRequest) (bool, error)
+	plan    func(context.Context, SessionTurnRequest) (SessionCompactionResult, error)
 }
 
 func (r fakeIncrementalSessionTurnRunner) RunSessionTurn(ctx context.Context, request SessionTurnRequest) (SessionTurnResult, error) {
@@ -3588,6 +3738,13 @@ func (r fakeIncrementalSessionTurnRunner) SupportsIncrementalSessionTurn(ctx con
 		return r.support(ctx, request)
 	}
 	return true, nil
+}
+
+func (r fakeIncrementalSessionTurnRunner) PlanSessionTurnCompaction(ctx context.Context, request SessionTurnRequest) (SessionCompactionResult, error) {
+	if r.plan != nil {
+		return r.plan(ctx, request)
+	}
+	return SessionCompactionResult{}, nil
 }
 
 type fakeSessionCompactPlanner struct {

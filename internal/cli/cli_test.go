@@ -7891,7 +7891,7 @@ func TestServerAgentTurnRunnerPublisherRequiresTurnID(t *testing.T) {
 	}
 }
 
-func TestServerAgentTurnRunnerSupportsIncrementalSessionTurnHonorsCompaction(t *testing.T) {
+func TestServerAgentTurnRunnerSupportsIncrementalSessionTurnWithCompaction(t *testing.T) {
 	t.Run("compaction disabled", func(t *testing.T) {
 		configDir := t.TempDir()
 		writeCLIRunFixtureInDir(t, configDir, "http://127.0.0.1:1", "direct-secret-value", "openai-chat")
@@ -7936,7 +7936,7 @@ compaction:
 		store := sessions.NewV2Store(filepath.Join(configDir, "sessions"))
 		projectDir := t.TempDir()
 		session, err := store.SaveMetadata(sessions.SessionV2{
-			ID:              "incremental-unsupported-compaction",
+			ID:              "incremental-supported-compaction",
 			Version:         sessions.VersionV2,
 			Provider:        "fake",
 			ModelProfile:    "default",
@@ -7958,8 +7958,8 @@ compaction:
 		if err != nil {
 			t.Fatalf("SupportsIncrementalSessionTurn() error = %v", err)
 		}
-		if supported {
-			t.Fatal("SupportsIncrementalSessionTurn() = true, want false for compaction-enabled runtime")
+		if !supported {
+			t.Fatal("SupportsIncrementalSessionTurn() = false, want true for compaction-enabled runtime")
 		}
 	})
 }
@@ -8517,6 +8517,94 @@ func TestServerAgentTurnRunnerPlansManualCompactionWithoutPersisting(t *testing.
 	after := loadCLISession(t, sessionRoot, session.ID)
 	if len(after.Compactions) != 0 {
 		t.Fatalf("len(Compactions) = %d, want no runner persistence: %#v", len(after.Compactions), after.Compactions)
+	}
+	if sessionContainsMessageContent(after, "<compaction_summary>") {
+		t.Fatalf("session persisted planned compaction summary: %#v", after.Items)
+	}
+	if !reflect.DeepEqual(after.ActiveHistory, session.ActiveHistory) {
+		t.Fatalf("ActiveHistory = %#v, want unchanged %#v", after.ActiveHistory, session.ActiveHistory)
+	}
+}
+
+func TestServerAgentTurnRunnerPlansAutoCompactionWithoutPersisting(t *testing.T) {
+	server, requests := newSequentialCLIRunServer(t,
+		[]string{
+			`{"choices":[{"delta":{"content":"# Context Checkpoint\n\n## Goal\nContinue.\n\n## Current Progress\nServer auto compact is current.\n\n## Decisions Made\nThe HTTP handler owns persistence.\n\n## Constraints / User Preferences\nDo not leak pending prompt.\n\n## Relevant Files / APIs / Commands\nPOST /sessions/{id}/messages.\n\n## Tool State / Environment State\nNo tools.\n\n## Open Questions\nNone.\n\n## Next Steps\nCommit the checkpoint."}}]}`,
+			`[DONE]`,
+		},
+	)
+	defer server.Close()
+
+	configDir := t.TempDir()
+	writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
+	setCLICompactionConfigWithThreshold(t, configDir, true, 1, "", "")
+	setCLIModelContextWindow(t, configDir, 10000)
+	sessionRoot := filepath.Join(configDir, "sessions")
+	store := sessions.NewV2Store(sessionRoot)
+	projectDir := t.TempDir()
+	systemMessage := model.Message{Role: model.MessageRoleSystem, Content: builtInBaseInstructions}
+	userMessage := model.Message{Role: model.MessageRoleUser, Content: "first"}
+	assistantMessage := model.Message{Role: model.MessageRoleAssistant, Content: "one"}
+	session := sessions.SessionV2{
+		ID:                   "server-auto-compact-plan",
+		CreatedAt:            time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC),
+		UpdatedAt:            time.Date(2026, 7, 3, 12, 1, 0, 0, time.UTC),
+		Version:              sessions.VersionV2,
+		Provider:             "fake",
+		ModelProfile:         "default",
+		ModelID:              "model-default",
+		CWD:                  projectDir,
+		CreatedCWD:           projectDir,
+		ConfigPath:           cliConfigPath(configDir),
+		InstructionsSnapshot: []model.Message{systemMessage},
+		Items: []sessions.SessionItem{
+			sessions.SessionItemFromMessage("runtime-000001", systemMessage),
+			sessions.SessionItemFromMessage("msg-000002", userMessage),
+			sessions.SessionItemFromMessage("msg-000003", assistantMessage),
+		},
+		ActiveHistory:   []string{"runtime-000001", "msg-000002", "msg-000003"},
+		Context:         contextwindow.Metadata{ContextWindow: 10000, ContextWindowSource: string(contextwindow.WindowSourceConfigured)},
+		SaveToolResults: true,
+	}
+	writeCLISessionV2(t, sessionRoot, session)
+	loaded := loadCLISession(t, sessionRoot, session.ID)
+
+	result, err := (serverAgentTurnRunner{program: "sai"}).PlanSessionTurnCompaction(context.Background(), localserver.SessionTurnRequest{
+		Session:      loaded,
+		SessionStore: store,
+		Content:      "second",
+	})
+	if err != nil {
+		t.Fatalf("PlanSessionTurnCompaction() error = %v", err)
+	}
+
+	summaryRequest := receiveCLIRunRequest(t, requests)
+	assertNoAdditionalCLIRunRequest(t, requests)
+	if strings.Contains(string(summaryRequest.RawBody), "second") {
+		t.Fatalf("summary request included pending user message: %s", summaryRequest.RawBody)
+	}
+	if _, ok := summaryRequest.Body["tools"]; ok {
+		t.Fatalf("summary request included tools: %#v", summaryRequest.Body["tools"])
+	}
+	messages := requestMessages(t, summaryRequest.Body)
+	assertMessageContentContains(t, messages, 0, "system", "Create a concise handoff checkpoint")
+	assertMessageContentContains(t, messages, 1, "user", "first")
+	if result.Compaction.SummaryItem.ID == "" || result.Compaction.Checkpoint.ID == "" {
+		t.Fatalf("compaction IDs missing: %#v", result.Compaction)
+	}
+	if result.Compaction.Checkpoint.Trigger != "auto" || result.Compaction.Checkpoint.Phase != "pre_turn" || result.Compaction.Checkpoint.Reason != "context_limit" {
+		t.Fatalf("checkpoint trigger metadata = %#v, want auto pre_turn context_limit", result.Compaction.Checkpoint)
+	}
+	if result.Compaction.SummaryItem.Message == nil || !strings.Contains(result.Compaction.SummaryItem.Message.Content, "<compaction_summary>") {
+		t.Fatalf("summary item = %#v, want hidden compaction summary", result.Compaction.SummaryItem)
+	}
+
+	after := loadCLISession(t, sessionRoot, session.ID)
+	if len(after.Compactions) != 0 {
+		t.Fatalf("len(Compactions) = %d, want no runner persistence: %#v", len(after.Compactions), after.Compactions)
+	}
+	if sessionContainsExactMessageContent(after, "second") {
+		t.Fatalf("session persisted pending user prompt: %#v", after.Items)
 	}
 	if sessionContainsMessageContent(after, "<compaction_summary>") {
 		t.Fatalf("session persisted planned compaction summary: %#v", after.Items)
