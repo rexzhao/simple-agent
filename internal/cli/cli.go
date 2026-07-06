@@ -5172,13 +5172,13 @@ func (r *agentRuntime) saveUpdatedMessages(messages []model.Message) error {
 	return nil
 }
 
-func (r *agentRuntime) sessionSavePlan(messages []model.Message) (sessions.SessionV2, []sessions.SessionItem, []string, error) {
+func (r *agentRuntime) refreshedSessionMetadata() sessions.SessionV2 {
 	var contextMetadata *contextwindow.Metadata
 	if r.contextTracker != nil {
 		metadata := r.contextTracker.Metadata()
 		contextMetadata = &metadata
 	}
-	session := sessions.RefreshRuntimeMetadata(r.resumableSession, sessions.RuntimeMetadataUpdate{
+	return sessions.RefreshRuntimeMetadata(r.resumableSession, sessions.RuntimeMetadataUpdate{
 		Provider:             r.providerName,
 		ModelProfile:         r.modelProfile,
 		ModelID:              r.modelID,
@@ -5194,6 +5194,32 @@ func (r *agentRuntime) sessionSavePlan(messages []model.Message) (sessions.Sessi
 		Context:              contextMetadata,
 		SaveToolResults:      true,
 	})
+}
+
+func (r *agentRuntime) prepareSessionProjectorMetadata() (sessions.SessionV2, error) {
+	if !r.saveSessions {
+		return sessions.SessionV2{}, fmt.Errorf("resumable session saving is not enabled")
+	}
+	if r.resumableSessionStore == nil {
+		return sessions.SessionV2{}, fmt.Errorf("session store is not configured")
+	}
+
+	session := r.refreshedSessionMetadata()
+	saved, err := r.resumableSessionStore.SaveMetadata(session)
+	if err != nil {
+		return sessions.SessionV2{}, fmt.Errorf("save resumable session metadata: %w", err)
+	}
+	loaded, err := r.resumableSessionStore.Load(saved.ID)
+	if err != nil {
+		return sessions.SessionV2{}, fmt.Errorf("load resumable session metadata: %w", err)
+	}
+	r.resumableSession = loaded
+	r.activeItemIDs = copyStringSlice(loaded.ActiveHistory)
+	return loaded, nil
+}
+
+func (r *agentRuntime) sessionSavePlan(messages []model.Message) (sessions.SessionV2, []sessions.SessionItem, []string, error) {
+	session := r.refreshedSessionMetadata()
 
 	newItems, activeItemIDs, err := sessions.AppendMessagesToActiveHistory(session.Items, r.activeItemIDs, messages)
 	if err != nil {

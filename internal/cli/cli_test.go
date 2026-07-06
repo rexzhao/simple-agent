@@ -6720,6 +6720,191 @@ func TestChatConfiguredSessionsSaveFullMessages(t *testing.T) {
 	}
 }
 
+func TestPrepareSessionProjectorMetadataCreatesMetadataForNewSession(t *testing.T) {
+	store := sessions.NewV2Store(t.TempDir())
+	cwd := t.TempDir()
+	configPath := filepath.Join(t.TempDir(), "sai.yaml")
+	systemMessage := model.Message{Role: model.MessageRoleSystem, Content: "system instructions"}
+	developerMessage := model.Message{Role: model.MessageRoleDeveloper, Content: "developer instructions"}
+	runtime := &agentRuntime{
+		cwd:                   cwd,
+		configPath:            configPath,
+		providerName:          "fake",
+		modelProfile:          "fast",
+		modelID:               "model-fast",
+		parameters:            map[string]any{"temperature": 0.2},
+		enabledTools:          []string{"read_file"},
+		enabledMCP:            []string{"local"},
+		enabledSkills:         []string{"skill-a"},
+		showReasoning:         true,
+		baseMessages:          []model.Message{systemMessage, developerMessage},
+		instructionSources:    []sessions.InstructionSource{{Role: model.MessageRoleSystem, Source: "builtin"}, {Role: model.MessageRoleDeveloper, Source: "file", Path: filepath.Join(cwd, "AGENTS.md")}},
+		resumableSessionStore: store,
+		saveSessions:          true,
+		contextTracker:        contextwindow.NewTracker(contextwindow.Window{Tokens: 12345, Source: contextwindow.WindowSourceConfigured}, contextwindow.Metadata{}),
+	}
+
+	session, err := runtime.prepareSessionProjectorMetadata()
+	if err != nil {
+		t.Fatalf("prepareSessionProjectorMetadata() error = %v", err)
+	}
+	if strings.TrimSpace(session.ID) == "" {
+		t.Fatal("session.ID is empty, want generated id")
+	}
+	if runtime.resumableSession.ID != session.ID {
+		t.Fatalf("runtime session ID = %q, want %q", runtime.resumableSession.ID, session.ID)
+	}
+	if len(runtime.activeItemIDs) != 0 {
+		t.Fatalf("runtime activeItemIDs = %#v, want empty", runtime.activeItemIDs)
+	}
+	if len(session.Items) != 0 || len(session.ActiveHistory) != 0 || session.LastSeq != 0 {
+		t.Fatalf("session replay state = items %#v active %#v lastSeq %d, want empty", session.Items, session.ActiveHistory, session.LastSeq)
+	}
+	if session.Provider != "fake" || session.ModelProfile != "fast" || session.ModelID != "model-fast" {
+		t.Fatalf("session model metadata = provider %q profile %q id %q", session.Provider, session.ModelProfile, session.ModelID)
+	}
+	if got := session.ModelParameters["temperature"]; fmt.Sprint(got) != "0.2" {
+		t.Fatalf("temperature = %#v, want 0.2", got)
+	}
+	if session.CWD != cwd || session.ConfigPath != configPath {
+		t.Fatalf("session paths = cwd %q config %q, want %q/%q", session.CWD, session.ConfigPath, cwd, configPath)
+	}
+	if !reflect.DeepEqual(session.EnabledTools, []string{"read_file"}) || !reflect.DeepEqual(session.EnabledMCP, []string{"local"}) || !reflect.DeepEqual(session.EnabledSkills, []string{"skill-a"}) {
+		t.Fatalf("enabled metadata = tools %#v mcp %#v skills %#v", session.EnabledTools, session.EnabledMCP, session.EnabledSkills)
+	}
+	if !session.ShowReasoning || !session.SaveToolResults {
+		t.Fatalf("session flags = showReasoning %t saveToolResults %t, want true/true", session.ShowReasoning, session.SaveToolResults)
+	}
+	if !reflect.DeepEqual(session.InstructionsSnapshot, []model.Message{systemMessage, developerMessage}) {
+		t.Fatalf("InstructionsSnapshot = %#v, want base messages", session.InstructionsSnapshot)
+	}
+	if len(session.InstructionSources) != 2 || session.InstructionSources[1].Path != filepath.Join(cwd, "AGENTS.md") {
+		t.Fatalf("InstructionSources = %#v, want copied sources", session.InstructionSources)
+	}
+	if session.Context.ContextWindow != 12345 || session.Context.ContextWindowSource != string(contextwindow.WindowSourceConfigured) {
+		t.Fatalf("session context = %#v, want configured 12345", session.Context)
+	}
+
+	loaded, err := store.Load(session.ID)
+	if err != nil {
+		t.Fatalf("Load(%q) error = %v", session.ID, err)
+	}
+	if loaded.ID != session.ID || len(loaded.Items) != 0 || len(loaded.ActiveHistory) != 0 || loaded.LastSeq != 0 {
+		t.Fatalf("loaded session = %#v, want metadata-only replay state", loaded)
+	}
+}
+
+func TestPrepareSessionProjectorMetadataPreservesReplayedState(t *testing.T) {
+	store := sessions.NewV2Store(t.TempDir())
+	oldSystemMessage := model.Message{Role: model.MessageRoleSystem, Content: "saved instructions"}
+	userMessage := model.Message{Role: model.MessageRoleUser, Content: "first"}
+	initial := sessions.SessionV2{
+		ID:                   "projector-existing",
+		Version:              sessions.VersionV2,
+		Provider:             "old",
+		ModelProfile:         "old-profile",
+		ModelID:              "old-model",
+		CWD:                  t.TempDir(),
+		ConfigPath:           filepath.Join(t.TempDir(), "old.yaml"),
+		InstructionsSnapshot: []model.Message{oldSystemMessage},
+		SaveToolResults:      true,
+	}
+	saved, err := store.SaveTurn(initial, []sessions.SessionItem{
+		sessions.SessionItemFromMessage("runtime-000001", oldSystemMessage),
+		sessions.SessionItemFromMessage("msg-000002", userMessage),
+	}, []string{"runtime-000001", "msg-000002"})
+	if err != nil {
+		t.Fatalf("SaveTurn() error = %v", err)
+	}
+	runtime := &agentRuntime{
+		cwd:                   t.TempDir(),
+		configPath:            filepath.Join(t.TempDir(), "sai.yaml"),
+		providerName:          "new",
+		modelProfile:          "default",
+		modelID:               "model-default",
+		parameters:            map[string]any{"max_tokens": float64(64)},
+		baseMessages:          []model.Message{{Role: model.MessageRoleSystem, Content: "current instructions"}},
+		resumableSession:      saved,
+		resumableSessionStore: store,
+		activeItemIDs:         copyStringSlice(saved.ActiveHistory),
+		saveSessions:          true,
+	}
+
+	session, err := runtime.prepareSessionProjectorMetadata()
+	if err != nil {
+		t.Fatalf("prepareSessionProjectorMetadata() error = %v", err)
+	}
+	if session.ID != saved.ID {
+		t.Fatalf("session.ID = %q, want %q", session.ID, saved.ID)
+	}
+	if len(session.Items) != len(saved.Items) || session.LastSeq != saved.LastSeq {
+		t.Fatalf("session replay = len(items) %d lastSeq %d, want %d/%d", len(session.Items), session.LastSeq, len(saved.Items), saved.LastSeq)
+	}
+	if !reflect.DeepEqual(session.ActiveHistory, saved.ActiveHistory) || !reflect.DeepEqual(runtime.activeItemIDs, saved.ActiveHistory) {
+		t.Fatalf("active history = session %#v runtime %#v, want %#v", session.ActiveHistory, runtime.activeItemIDs, saved.ActiveHistory)
+	}
+	if session.Provider != "new" || session.ModelProfile != "default" || session.ModelID != "model-default" {
+		t.Fatalf("session model metadata = provider %q profile %q id %q", session.Provider, session.ModelProfile, session.ModelID)
+	}
+	if got := session.ModelParameters["max_tokens"]; fmt.Sprint(got) != "64" {
+		t.Fatalf("max_tokens = %#v, want 64", got)
+	}
+	if !reflect.DeepEqual(session.InstructionsSnapshot, []model.Message{oldSystemMessage}) {
+		t.Fatalf("InstructionsSnapshot = %#v, want existing snapshot preserved", session.InstructionsSnapshot)
+	}
+}
+
+func TestPrepareSessionProjectorMetadataRequiresSaveSessionStore(t *testing.T) {
+	runtime := &agentRuntime{}
+	if _, err := runtime.prepareSessionProjectorMetadata(); err == nil || !strings.Contains(err.Error(), "resumable session saving is not enabled") {
+		t.Fatalf("prepareSessionProjectorMetadata() error = %v, want save-session disabled error", err)
+	}
+
+	runtime.saveSessions = true
+	if _, err := runtime.prepareSessionProjectorMetadata(); err == nil || !strings.Contains(err.Error(), "session store is not configured") {
+		t.Fatalf("prepareSessionProjectorMetadata() error = %v, want missing store error", err)
+	}
+}
+
+func TestSessionSavePlanUsesRefreshedRuntimeMetadata(t *testing.T) {
+	cwd := t.TempDir()
+	configPath := filepath.Join(t.TempDir(), "sai.yaml")
+	systemMessage := model.Message{Role: model.MessageRoleSystem, Content: "system instructions"}
+	userMessage := model.Message{Role: model.MessageRoleUser, Content: "hello"}
+	runtime := &agentRuntime{
+		cwd:                cwd,
+		configPath:         configPath,
+		providerName:       "fake",
+		modelProfile:       "default",
+		modelID:            "model-default",
+		parameters:         map[string]any{"temperature": 0.1},
+		enabledTools:       []string{"read_file"},
+		baseMessages:       []model.Message{systemMessage},
+		instructionSources: []sessions.InstructionSource{{Role: model.MessageRoleSystem, Source: "builtin"}},
+		contextTracker:     contextwindow.NewTracker(contextwindow.Window{Tokens: 8000, Source: contextwindow.WindowSourceConfigured}, contextwindow.Metadata{}),
+	}
+
+	session, newItems, activeItemIDs, err := runtime.sessionSavePlan([]model.Message{systemMessage, userMessage})
+	if err != nil {
+		t.Fatalf("sessionSavePlan() error = %v", err)
+	}
+	if session.Provider != "fake" || session.ModelProfile != "default" || session.ModelID != "model-default" {
+		t.Fatalf("session model metadata = provider %q profile %q id %q", session.Provider, session.ModelProfile, session.ModelID)
+	}
+	if session.CWD != cwd || session.ConfigPath != configPath {
+		t.Fatalf("session paths = cwd %q config %q, want %q/%q", session.CWD, session.ConfigPath, cwd, configPath)
+	}
+	if !session.SaveToolResults || session.Context.ContextWindow != 8000 {
+		t.Fatalf("session flags/context = saveToolResults %t context %#v", session.SaveToolResults, session.Context)
+	}
+	if len(newItems) != 2 || len(activeItemIDs) != 2 {
+		t.Fatalf("save plan items = %#v active = %#v, want two appended messages", newItems, activeItemIDs)
+	}
+	if newItems[0].Message == nil || newItems[0].Message.Role != model.MessageRoleSystem || newItems[1].Message == nil || newItems[1].Message.Role != model.MessageRoleUser {
+		t.Fatalf("newItems = %#v, want system then user", newItems)
+	}
+}
+
 func TestChatConfiguredSessionsCanBeDisabledBySaveSessionFalse(t *testing.T) {
 	server, requests := newCLIRunServer(t,
 		`{"choices":[{"delta":{"content":"one"}}]}`,
