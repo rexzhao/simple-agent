@@ -276,7 +276,7 @@ GC, and auto-rerunning interrupted tools.
   lock (server `beginSessionTurn`); two concurrent turns on the same session never spawn
   two writers. Multi-process same-session is backstopped by a per-session store write
   lock. `MarkTurnRunning` is a crash-recovery marker, not a concurrency mutex.
-- [ ] Projector cached state is refreshed after `CompactionRequested` before
+- [x] Projector cached state is refreshed after `CompactionRequested` before
   `TurnInputReady` (no stale-`LastSeq`/`ActiveHistory` writes post-compaction).
 - [ ] After `MarkTurnRunning`, every failure/Esc/error exit publishes `TurnInterrupted`
   and persists it — no running turn left; crash is covered by the
