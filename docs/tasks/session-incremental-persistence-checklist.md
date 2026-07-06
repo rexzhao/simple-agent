@@ -167,7 +167,7 @@ GC, and auto-rerunning interrupted tools.
   semantics only); a still-running tool item shows as `pending`.
 - [ ] Remove end-of-turn `SaveTurn`/`SaveCompactedTurn` (`server.go:1145-1150`) and
   post-commit batch `item.appended` publish (`server.go:1161-1179`).
-- [ ] **Compaction/projector coexistence (explicit)**: compaction is dispatched
+- [x] **Compaction/projector coexistence (explicit)**: compaction is dispatched
   **through** the projector as a `CompactionRequested` domain event → projector calls
   `SaveCompactedTurn` (one atomic tx). This keeps the projector the sole writer (no
   second writer racing the incremental stream). **Only pre-turn compaction exists**
