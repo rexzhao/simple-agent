@@ -1895,6 +1895,91 @@ func TestSessionSendMessageIncrementalCompactsBeforeTurnViaProjector(t *testing.
 	}
 }
 
+func TestSessionSendMessageIncrementalCancelAfterInputPersistsUserPrompt(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "sessions")
+	store := sessions.NewV2Store(root)
+	saveServerTestSession(t, store, "send-incremental-cancel")
+	runner := fakeIncrementalSessionTurnRunner{
+		run: func(ctx context.Context, request SessionTurnRequest) (SessionTurnResult, error) {
+			if request.TurnID == "" || request.Publisher == nil {
+				t.Fatalf("runner turn id/publisher = %q/%T, want incremental request", request.TurnID, request.Publisher)
+			}
+			return SessionTurnResult{}, context.Canceled
+		},
+	}
+	process := startSessionAPIServerWithTurnRunner(t, store, sessions.SessionV2{}, "registry-token", runner)
+	conn := dialSessionStream(t, process, "send-incremental-cancel")
+	waitForStreamSubscribers(t, process, "send-incremental-cancel", 1)
+
+	raw, body := postRawJSONStatus(t, "http://"+process.Addr()+"/sessions/send-incremental-cancel/messages", `{"content":"cancel after input secret"}`, "registry-token", http.StatusInternalServerError)
+	assertErrorCode(t, body, "turn_failed")
+	for _, forbidden := range []string{"cancel after input secret", "registry-token"} {
+		if bytes.Contains(raw, []byte(forbidden)) {
+			t.Fatalf("cancel response leaked %q: %s", forbidden, raw)
+		}
+	}
+
+	events := []map[string]any{
+		readSessionStreamEvent(t, conn),
+		readSessionStreamEvent(t, conn),
+		readSessionStreamEvent(t, conn),
+	}
+	wantTypes := []string{"turn.started", "item.appended", "turn.failed"}
+	for i, want := range wantTypes {
+		if events[i]["type"] != want {
+			t.Fatalf("event[%d] type = %#v, want %q; events=%#v", i, events[i]["type"], want, events)
+		}
+	}
+	if events[2]["message"] != "turn failed" {
+		t.Fatalf("turn.failed message = %#v, want sanitized failure", events[2]["message"])
+	}
+
+	session, err := store.Load("send-incremental-cancel")
+	if err != nil {
+		t.Fatalf("Load(send-incremental-cancel) error = %v", err)
+	}
+	if session.RunningTurnID != "" || session.InterruptedTurnID != "turn-000001" || session.InterruptedAt.IsZero() {
+		t.Fatalf("turn metadata = running %q interrupted %q at %s, want interrupted turn-000001", session.RunningTurnID, session.InterruptedTurnID, session.InterruptedAt)
+	}
+	if len(session.Items) != 1 {
+		t.Fatalf("len(session.Items) = %d, want only persisted user prompt: %#v", len(session.Items), session.Items)
+	}
+	userItem := session.Items[0]
+	if userItem.Message == nil || userItem.Message.Role != model.MessageRoleUser || userItem.Message.Content != "cancel after input secret" {
+		t.Fatalf("user item = %#v, want persisted prompt", userItem)
+	}
+	if events[1]["item_id"] != userItem.ID {
+		t.Fatalf("item.appended event = %#v, want user item id %q", events[1], userItem.ID)
+	}
+	if !reflect.DeepEqual(session.ActiveHistory, []string{userItem.ID}) {
+		t.Fatalf("ActiveHistory = %#v, want persisted user prompt only", session.ActiveHistory)
+	}
+	for _, item := range session.Items {
+		if item.Message != nil && item.Message.Role == model.MessageRoleTool {
+			t.Fatalf("unexpected tool item after pre-assistant cancel: %#v", item)
+		}
+		if item.Status == sessions.ItemStatusPending {
+			t.Fatalf("unexpected pending item after pre-assistant cancel: %#v", item)
+		}
+	}
+	messages, err := session.MaterializeActiveHistory()
+	if err != nil {
+		t.Fatalf("MaterializeActiveHistory() error = %v", err)
+	}
+	if len(messages) != 1 || messages[0].Role != model.MessageRoleUser || messages[0].Content != "cancel after input secret" {
+		t.Fatalf("materialized messages = %#v, want persisted user prompt", messages)
+	}
+	persisted, err := store.PersistedEventsAfter("send-incremental-cancel", 0)
+	if err != nil {
+		t.Fatalf("PersistedEventsAfter() error = %v", err)
+	}
+	for _, event := range persisted {
+		if event.Type == sessions.RecordTypeItemUpdated {
+			t.Fatalf("unexpected item.updated event without pending tools: %#v", persisted)
+		}
+	}
+}
+
 func TestSessionSendMessagePersistsPlannedCompactionAndSuccessfulTurnAtomically(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "sessions")
 	store := sessions.NewV2Store(root)

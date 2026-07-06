@@ -226,7 +226,7 @@ GC, and auto-rerunning interrupted tools.
   just in-memory synthesis; persistence-failure abort discards in-memory `messages` and
   leaves disk authoritative; crash after round-commit before results → resume succeeds,
   history legal, new turn continuable, pending items surface as interrupted.
-- [ ] **Test the user-cancel window explicitly**: `TurnInputReady` has persisted the
+- [x] **Test the user-cancel window explicitly**: `TurnInputReady` has persisted the
   user prompt, then Esc / `ctx` cancel before the first `AssistantReady`. Assert: user
   item is on disk, no pending tool items exist (none created yet), active_history ends
   with the user message (legal), `TurnInterrupted` fires via the defer, no running turn
@@ -302,7 +302,7 @@ GC, and auto-rerunning interrupted tools.
   the sole bridge subscriber of the per-turn bus. Reconnect catch-up includes
   `item.appended` and `item.updated` (`PersistedEvent.Seq` = record seq); `item.updated`
   is refetched via `GET /sessions/{id}/items/{itemID}` (not `after_seq` paging).
-- [ ] Test covers the user-cancel window: Esc after `TurnInputReady` persisted but
+- [x] Test covers the user-cancel window: Esc after `TurnInputReady` persisted but
   before the first `AssistantReady` → user prompt on disk, no pending tools, legal
   history, no running turn, resume continuable.
 - [ ] Legacy sessions (no `Status`, no `item.updated`) load/resume/compact correctly
