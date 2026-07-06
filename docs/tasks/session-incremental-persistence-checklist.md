@@ -51,7 +51,7 @@ GC, and auto-rerunning interrupted tools.
   API — its positional `messages[len(activeItemIDs):]` diff is the old turn-end model; the
   projector creates/updates specific items per event, not by diffing the full message
   slice. Let `sessionSavePlan` be progressively deprecated rather than reused.
-- [ ] New package `internal/eventbus`: `Event` interface; durable domain events
+- [x] New package `internal/eventbus`: `Event` interface; durable domain events
   (`TurnStarted{TurnID}`, `CompactionRequested{TurnID, ...}`,
   `TurnInputReady{TurnID, Message}`, `AssistantReady{TurnID, Message}`,
   `ToolResultReady{TurnID, Result}`, `TurnCompleted{TurnID}`, `TurnInterrupted{TurnID}`);
