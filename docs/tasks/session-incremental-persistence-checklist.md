@@ -44,7 +44,7 @@ GC, and auto-rerunning interrupted tools.
 
 ## Phase 2 — Event bus + SessionProjector
 
-- [ ] Extract **small** planning helpers into a shared package (`internal/sessionplan`
+- [x] Extract **small** planning helpers into a shared package (`internal/sessionplan`
   or `sessions`) for CLI + server reuse: ID allocator (`nextSessionItemID`, `cli.go:5575`),
   `sessionItemFromMessage` (`cli.go:5588`), metadata refresh, and active-history
   append/replace helpers. **Do NOT** promote `sessionSavePlan` (`cli.go:5175`) as a shared

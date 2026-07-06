@@ -5173,43 +5173,31 @@ func (r *agentRuntime) saveUpdatedMessages(messages []model.Message) error {
 }
 
 func (r *agentRuntime) sessionSavePlan(messages []model.Message) (sessions.SessionV2, []sessions.SessionItem, []string, error) {
-	session := r.resumableSession
-	session.Provider = r.providerName
-	session.ModelProfile = r.modelProfile
-	session.ModelID = r.modelID
-	session.ModelParameters = copyParameterMap(r.parameters)
-	session.CWD = r.cwd
-	session.ConfigPath = r.configPath
-	session.ConfigDir = ""
-	session.EnabledTools = copyStringSlice(r.enabledTools)
-	session.EnabledMCP = copyStringSlice(r.enabledMCP)
-	session.EnabledSkills = copyStringSlice(r.enabledSkills)
-	session.ShowReasoning = r.showReasoning
-	if len(session.InstructionsSnapshot) == 0 {
-		session.InstructionsSnapshot = copyMessageSlice(r.baseMessages)
-	}
-	if len(session.InstructionSources) == 0 {
-		session.InstructionSources = copyInstructionSources(r.instructionSources)
-	}
+	var contextMetadata *contextwindow.Metadata
 	if r.contextTracker != nil {
-		session.Context = r.contextTracker.Metadata()
+		metadata := r.contextTracker.Metadata()
+		contextMetadata = &metadata
 	}
-	session.SaveToolResults = true
+	session := sessions.RefreshRuntimeMetadata(r.resumableSession, sessions.RuntimeMetadataUpdate{
+		Provider:             r.providerName,
+		ModelProfile:         r.modelProfile,
+		ModelID:              r.modelID,
+		ModelParameters:      r.parameters,
+		CWD:                  r.cwd,
+		ConfigPath:           r.configPath,
+		EnabledTools:         r.enabledTools,
+		EnabledMCP:           r.enabledMCP,
+		EnabledSkills:        r.enabledSkills,
+		ShowReasoning:        r.showReasoning,
+		InstructionsSnapshot: r.baseMessages,
+		InstructionSources:   r.instructionSources,
+		Context:              contextMetadata,
+		SaveToolResults:      true,
+	})
 
-	if len(messages) < len(r.activeItemIDs) {
-		return sessions.SessionV2{}, nil, nil, fmt.Errorf("save resumable session: updated message history shorter than active history")
-	}
-
-	existingIDs := sessions.SessionItemIDs(session.Items)
-	activeItemIDs := copyStringSlice(r.activeItemIDs)
-	newMessages := messages[len(r.activeItemIDs):]
-	newItems := make([]sessions.SessionItem, 0, len(newMessages))
-	for _, message := range newMessages {
-		itemID := sessions.NextSessionItemID(existingIDs, message)
-		item := sessions.SessionItemFromMessage(itemID, message)
-		existingIDs[itemID] = struct{}{}
-		newItems = append(newItems, item)
-		activeItemIDs = append(activeItemIDs, itemID)
+	newItems, activeItemIDs, err := sessions.AppendMessagesToActiveHistory(session.Items, r.activeItemIDs, messages)
+	if err != nil {
+		return sessions.SessionV2{}, nil, nil, fmt.Errorf("save resumable session: %w", err)
 	}
 
 	return session, newItems, activeItemIDs, nil
