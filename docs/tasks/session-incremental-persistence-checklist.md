@@ -148,12 +148,12 @@ GC, and auto-rerunning interrupted tools.
 - [ ] Server assembly: `serverAgentTurnRunner` (`cli.go:5889`) injects publisher;
   projector writes storage (replaces `runtime.saveSessions=false` + end-of-turn
   `SaveTurn`).
-- [ ] WebSocket: clients subscribe to the **existing process-level stream hub** (by
+- [x] WebSocket: clients subscribe to the **existing process-level stream hub** (by
   session ID, unchanged); the hub is the **sole bridge subscriber** of the per-turn bus,
   forwarding `text.delta`/`tool.started`/`tool.finished` and durable
   `item.appended`/`item.updated` to clients (replaces `publishModelTurnEvent`,
   `server.go:1657`). Per-turn bus is not subscribed by WebSocket clients directly.
-- [ ] Catch-up: add `item.updated` mapping in `sessionStreamEventFromPersistedEvent`
+- [x] Catch-up: add `item.updated` mapping in `sessionStreamEventFromPersistedEvent`
   (`server.go:1636`) emitting `{Seq, Type:"item.updated", ItemID}`.
 - [ ] **`item.updated` client refetch (explicit)**: since `item.Seq` is the immutable
   birth seq and `PersistedEvent.Seq` is the update-record seq, clients **cannot**
