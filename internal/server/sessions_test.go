@@ -2132,6 +2132,145 @@ func TestSessionSendMessageIncrementalInterruptsPendingToolsOnCancel(t *testing.
 	}
 }
 
+func TestSessionSendMessageIncrementalInterruptsPendingToolsAfterToolResultPublishFailure(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "sessions")
+	store := sessions.NewV2Store(root)
+	saveServerTestSession(t, store, "send-incremental-tool-result-publish-failure")
+	runner := fakeIncrementalSessionTurnRunner{
+		run: func(ctx context.Context, request SessionTurnRequest) (SessionTurnResult, error) {
+			if request.TurnID == "" || request.Publisher == nil {
+				t.Fatalf("runner turn id/publisher = %q/%T, want incremental request", request.TurnID, request.Publisher)
+			}
+			assistant := model.Message{
+				Role:    model.MessageRoleAssistant,
+				Content: "assistant needs a tool",
+				ToolCalls: []model.ToolCall{{
+					ID:        "call-a",
+					Name:      "read_file",
+					Arguments: `{"path":"SECRET ARG"}`,
+				}},
+			}
+			if err := request.Publisher.Publish(eventbus.AssistantReady{TurnID: request.TurnID, Message: assistant}); err != nil {
+				return SessionTurnResult{}, err
+			}
+			err := request.Publisher.Publish(eventbus.ToolResultReady{
+				TurnID: request.TurnID,
+				Result: model.ToolResult{
+					ToolCallID: "call-missing",
+					Name:       "read_file",
+					Content:    "SECRET TOOL RESULT",
+				},
+			})
+			if err == nil {
+				return SessionTurnResult{}, fmt.Errorf("ToolResultReady publish unexpectedly succeeded")
+			}
+			return SessionTurnResult{}, err
+		},
+	}
+	process := startSessionAPIServerWithTurnRunner(t, store, sessions.SessionV2{}, "registry-token", runner)
+	conn := dialSessionStream(t, process, "send-incremental-tool-result-publish-failure")
+	waitForStreamSubscribers(t, process, "send-incremental-tool-result-publish-failure", 1)
+
+	raw, body := postRawJSONStatus(t, "http://"+process.Addr()+"/sessions/send-incremental-tool-result-publish-failure/messages", `{"content":"publish failure prompt secret"}`, "registry-token", http.StatusInternalServerError)
+	assertErrorCode(t, body, "turn_failed")
+	for _, forbidden := range []string{"publish failure prompt secret", "SECRET ARG", "SECRET TOOL RESULT", "registry-token"} {
+		if bytes.Contains(raw, []byte(forbidden)) {
+			t.Fatalf("publish failure response leaked %q: %s", forbidden, raw)
+		}
+	}
+
+	events := make([]map[string]any, 0, 6)
+	for len(events) < 6 {
+		events = append(events, readSessionStreamEvent(t, conn))
+	}
+	wantTypes := []string{
+		"turn.started",
+		"item.appended",
+		"item.appended",
+		"item.appended",
+		"item.updated",
+		"turn.failed",
+	}
+	for i, want := range wantTypes {
+		if events[i]["type"] != want {
+			t.Fatalf("event[%d] type = %#v, want %q; events=%#v", i, events[i]["type"], want, events)
+		}
+	}
+	if events[5]["message"] != "turn failed" {
+		t.Fatalf("turn.failed message = %#v, want sanitized failure", events[5]["message"])
+	}
+	for i, event := range events {
+		raw, err := json.Marshal(event)
+		if err != nil {
+			t.Fatalf("Marshal(event[%d]) error = %v", i, err)
+		}
+		for _, forbidden := range []string{"publish failure prompt secret", "SECRET ARG", "SECRET TOOL RESULT"} {
+			if bytes.Contains(raw, []byte(forbidden)) {
+				t.Fatalf("event[%d] leaked %q: %s", i, forbidden, raw)
+			}
+		}
+	}
+
+	session, err := store.Load("send-incremental-tool-result-publish-failure")
+	if err != nil {
+		t.Fatalf("Load(send-incremental-tool-result-publish-failure) error = %v", err)
+	}
+	if session.RunningTurnID != "" || session.InterruptedTurnID != "turn-000001" || session.InterruptedAt.IsZero() {
+		t.Fatalf("turn metadata = running %q interrupted %q at %s, want interrupted turn-000001", session.RunningTurnID, session.InterruptedTurnID, session.InterruptedAt)
+	}
+	if len(session.Items) != 3 {
+		t.Fatalf("len(session.Items) = %d, want user+assistant+interrupted tool: %#v", len(session.Items), session.Items)
+	}
+	userItem := session.Items[0]
+	assistantItem := session.Items[1]
+	toolItem := session.Items[2]
+	if userItem.Message == nil || userItem.Message.Role != model.MessageRoleUser || userItem.Message.Content != "publish failure prompt secret" {
+		t.Fatalf("user item = %#v, want persisted prompt", userItem)
+	}
+	if assistantItem.Message == nil || assistantItem.Message.Role != model.MessageRoleAssistant || len(assistantItem.Message.ToolCalls) != 1 {
+		t.Fatalf("assistant item = %#v, want assistant with one tool call", assistantItem)
+	}
+	if toolItem.Message == nil || toolItem.Message.Role != model.MessageRoleTool || toolItem.Message.ToolCallID != "call-a" || toolItem.Status != sessions.ItemStatusInterrupted {
+		t.Fatalf("tool item = %#v, want original pending tool marked interrupted", toolItem)
+	}
+	if !reflect.DeepEqual(session.ActiveHistory, []string{userItem.ID, assistantItem.ID, toolItem.ID}) {
+		t.Fatalf("ActiveHistory = %#v, want user+assistant+interrupted tool", session.ActiveHistory)
+	}
+	if events[1]["item_id"] != userItem.ID || events[2]["item_id"] != assistantItem.ID || events[3]["item_id"] != toolItem.ID {
+		t.Fatalf("item.appended events = %#v, want user/assistant/tool ids", events[:4])
+	}
+	if events[4]["item_id"] != toolItem.ID {
+		t.Fatalf("item.updated event = %#v, want tool item id %q", events[4], toolItem.ID)
+	}
+	if int64(events[4]["seq"].(float64)) <= toolItem.Seq {
+		t.Fatalf("item.updated seq = %#v, want greater than birth seq %d", events[4]["seq"], toolItem.Seq)
+	}
+	messages, err := session.MaterializeActiveHistory()
+	if err != nil {
+		t.Fatalf("MaterializeActiveHistory() error = %v", err)
+	}
+	if len(messages) != 3 || messages[1].Role != model.MessageRoleAssistant || len(messages[1].ToolCalls) != 1 {
+		t.Fatalf("materialized messages = %#v, want assistant with one tool call", messages)
+	}
+	if messages[2].Role != model.MessageRoleTool || messages[2].ToolCallID != "call-a" || !messages[2].IsError || messages[2].Content != "[tool execution interrupted]" {
+		t.Fatalf("materialized tool message = %#v, want interrupted error for call-a", messages[2])
+	}
+
+	persisted, err := store.PersistedEventsAfter("send-incremental-tool-result-publish-failure", 0)
+	if err != nil {
+		t.Fatalf("PersistedEventsAfter() error = %v", err)
+	}
+	updated := make([]sessions.PersistedEvent, 0, 1)
+	for _, event := range persisted {
+		if event.Type == sessions.RecordTypeItemUpdated {
+			updated = append(updated, event)
+		}
+	}
+	if len(updated) != 1 || updated[0].ItemID != toolItem.ID {
+		t.Fatalf("item.updated events = %#v, want exactly one persisted update for %q", updated, toolItem.ID)
+	}
+}
+
 func TestSessionSendMessagePersistsPlannedCompactionAndSuccessfulTurnAtomically(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "sessions")
 	store := sessions.NewV2Store(root)
