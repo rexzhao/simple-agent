@@ -566,27 +566,53 @@ func (s *V2Store) UpdateItem(sessionID string, item SessionItem) (SessionItem, e
 	if err != nil {
 		return SessionItem{}, err
 	}
+	updated, _, err := s.UpdateItemFromState(sessionID, state, item)
+	return updated, err
+}
+
+// UpdateItemFromState appends an item.updated record using the caller's cached
+// session state and returns both the updated item and the advanced state.
+// The caller must provide the latest state for this session and must be the
+// session's single writer; stale state can write duplicate seqs and corrupt the
+// log.
+func (s *V2Store) UpdateItemFromState(sessionID string, state SessionV2, item SessionItem) (SessionItem, SessionV2, error) {
+	if err := s.requireRoot(); err != nil {
+		return SessionItem{}, SessionV2{}, err
+	}
+	if err := validateCachedWriteState(sessionID, state); err != nil {
+		return SessionItem{}, SessionV2{}, err
+	}
+	if item.ID == "" {
+		return SessionItem{}, SessionV2{}, fmt.Errorf("session item id is required")
+	}
+
 	existing, ok := findSessionItemByID(state.Items, item.ID)
 	if !ok {
-		return SessionItem{}, corruptedSessionError(sessionID, "item.updated references missing item %q", item.ID)
+		return SessionItem{}, SessionV2{}, corruptedSessionError(sessionID, "item.updated references missing item %q", item.ID)
 	}
 
 	updated := existing
 	updated.Message = copyMessagePtr(item.Message)
 	updated.Content = copyStoredContent(item.Content)
 	updated.Status = item.Status
-	updated, err = s.blobifySessionItemContent(updated)
+	updated, err := s.blobifySessionItemContent(updated)
 	if err != nil {
-		return SessionItem{}, err
+		return SessionItem{}, SessionV2{}, err
 	}
 
-	if _, err := s.appendRecord(sessionID, v2Record{
+	record := v2Record{
+		Seq:  state.LastSeq + 1,
 		Type: RecordTypeItemUpdated,
 		Item: &updated,
-	}); err != nil {
-		return SessionItem{}, err
 	}
-	return updated, nil
+	nextState, err := replayRecordOnState(state, record)
+	if err != nil {
+		return SessionItem{}, SessionV2{}, err
+	}
+	if err := s.appendRecords(sessionID, []v2Record{record}); err != nil {
+		return SessionItem{}, SessionV2{}, err
+	}
+	return updated, nextState, nil
 }
 
 func (s *V2Store) ReplaceActiveHistory(sessionID string, itemIDs []string) (int64, error) {
@@ -812,6 +838,22 @@ func (s *V2Store) AppendItemsAndReplaceActiveHistory(sessionID string, items []S
 	if err != nil {
 		return SessionV2{}, err
 	}
+	return s.AppendItemsAndReplaceActiveHistoryFromState(sessionID, state, items, itemIDs)
+}
+
+// AppendItemsAndReplaceActiveHistoryFromState appends a transaction using the
+// caller's cached session state and returns the advanced state without replaying
+// from disk. The caller must provide the latest state for this session and must
+// be the session's single writer; stale state can write duplicate seqs and
+// corrupt the log.
+func (s *V2Store) AppendItemsAndReplaceActiveHistoryFromState(sessionID string, state SessionV2, items []SessionItem, itemIDs []string) (SessionV2, error) {
+	if err := s.requireRoot(); err != nil {
+		return SessionV2{}, err
+	}
+	if err := validateCachedWriteState(sessionID, state); err != nil {
+		return SessionV2{}, err
+	}
+
 	now := s.now().UTC()
 	txID := fmt.Sprintf("tx-%06d", state.LastSeq+1)
 	records := make([]v2Record, 0, len(items)+3)
@@ -829,7 +871,7 @@ func (s *V2Store) AppendItemsAndReplaceActiveHistory(sessionID string, items []S
 		if item.ID == "" {
 			return SessionV2{}, fmt.Errorf("session item id is required")
 		}
-		item, err = s.blobifySessionItemContent(item)
+		item, err := s.blobifySessionItemContent(item)
 		if err != nil {
 			return SessionV2{}, err
 		}
@@ -856,10 +898,14 @@ func (s *V2Store) AppendItemsAndReplaceActiveHistory(sessionID string, items []S
 		TxID: txID,
 	})
 
+	nextState, err := replayTransactionOnState(state, records)
+	if err != nil {
+		return SessionV2{}, err
+	}
 	if err := s.appendRecords(sessionID, records); err != nil {
 		return SessionV2{}, err
 	}
-	return s.Replay(sessionID)
+	return nextState, nil
 }
 
 func (s *V2Store) appendCompactionAndItemsReplaceActiveHistory(sessionID string, summaryItem SessionItem, checkpoint CompactionCheckpoint, items []SessionItem, itemIDs []string) (SessionV2, error) {
@@ -1291,6 +1337,19 @@ func validateV2SessionID(id string) error {
 	return nil
 }
 
+func validateCachedWriteState(sessionID string, state SessionV2) error {
+	if err := validateV2SessionID(sessionID); err != nil {
+		return err
+	}
+	if strings.TrimSpace(state.ID) == "" {
+		return fmt.Errorf("cached session state id is required")
+	}
+	if state.ID != sessionID {
+		return fmt.Errorf("cached session state id %q does not match session id %q", state.ID, sessionID)
+	}
+	return nil
+}
+
 func findSessionItemByID(items []SessionItem, id string) (SessionItem, bool) {
 	for _, item := range items {
 		if item.ID == id {
@@ -1665,6 +1724,40 @@ func replayCommittedTransaction(pending *replayTransaction, commit v2Record, sta
 	temp.LastSeq = commit.Seq
 	*state = temp
 	return nil
+}
+
+func replayTransactionOnState(state SessionV2, records []v2Record) (SessionV2, error) {
+	if len(records) < 2 {
+		return SessionV2{}, fmt.Errorf("transaction records are required")
+	}
+	begin := records[0]
+	commit := records[len(records)-1]
+	if begin.Type != RecordTypeTransactionBegin {
+		return SessionV2{}, fmt.Errorf("transaction must start with %s", RecordTypeTransactionBegin)
+	}
+	if commit.Type != RecordTypeTransactionCommit {
+		return SessionV2{}, fmt.Errorf("transaction must end with %s", RecordTypeTransactionCommit)
+	}
+	if begin.TxID == "" || begin.TxID != commit.TxID {
+		return SessionV2{}, fmt.Errorf("transaction tx_id mismatch")
+	}
+	next := copySessionV2(state)
+	pending := &replayTransaction{
+		txID:    begin.TxID,
+		records: append([]v2Record(nil), records[:len(records)-1]...),
+	}
+	if err := replayCommittedTransaction(pending, commit, &next); err != nil {
+		return SessionV2{}, err
+	}
+	return next, nil
+}
+
+func replayRecordOnState(state SessionV2, record v2Record) (SessionV2, error) {
+	next := copySessionV2(state)
+	if err := replayCommittedRecord("", 0, record, &next); err != nil {
+		return SessionV2{}, err
+	}
+	return next, nil
 }
 
 func replayCommittedTransactionPersistedEvents(pending *replayTransaction, commit v2Record, state *SessionV2, afterSeq int64, events *[]PersistedEvent) error {

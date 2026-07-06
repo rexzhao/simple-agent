@@ -707,6 +707,75 @@ func TestV2StoreAppendItemsAndReplaceActiveHistoryCommitsTransaction(t *testing.
 	}
 }
 
+func TestV2StoreAppendItemsAndReplaceActiveHistoryFromStateAdvancesCachedState(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "sessions")
+	clock := &fakeClock{current: time.Date(2026, 7, 5, 1, 2, 3, 0, time.UTC)}
+	store := newV2StoreWithClock(root, V2StoreOptions{}, clock.Now)
+
+	state, err := store.Replay("session-1")
+	if err != nil {
+		t.Fatalf("Replay() error = %v", err)
+	}
+	state, err = store.AppendItemsAndReplaceActiveHistoryFromState("session-1", state, []SessionItem{
+		{
+			ID:         "user-1",
+			Kind:       ItemKindMessage,
+			Visibility: ItemVisibilityVisible,
+			Audience:   ItemAudienceUser,
+			Message:    &model.Message{Role: model.MessageRoleUser, Content: "hello"},
+		},
+	}, []string{"user-1"})
+	if err != nil {
+		t.Fatalf("AppendItemsAndReplaceActiveHistoryFromState(first) error = %v", err)
+	}
+	state, err = store.AppendItemsAndReplaceActiveHistoryFromState("session-1", state, []SessionItem{
+		{
+			ID:         "assistant-1",
+			Kind:       ItemKindMessage,
+			Visibility: ItemVisibilityVisible,
+			Audience:   ItemAudienceModel,
+			Message: &model.Message{
+				Role: model.MessageRoleAssistant,
+				ToolCalls: []model.ToolCall{
+					{ID: "call-1", Name: "read", Arguments: "{}"},
+				},
+			},
+		},
+		{
+			ID:         "tool-1",
+			Kind:       ItemKindMessage,
+			Visibility: ItemVisibilityVisible,
+			Audience:   ItemAudienceModel,
+			Status:     ItemStatusPending,
+			Message:    &model.Message{Role: model.MessageRoleTool, ToolCallID: "call-1"},
+		},
+	}, []string{"user-1", "assistant-1", "tool-1"})
+	if err != nil {
+		t.Fatalf("AppendItemsAndReplaceActiveHistoryFromState(second) error = %v", err)
+	}
+
+	if got := itemIDs(state.Items); !reflect.DeepEqual(got, []string{"user-1", "assistant-1", "tool-1"}) {
+		t.Fatalf("cached item IDs = %#v, want appended items", got)
+	}
+	if !reflect.DeepEqual(state.ActiveHistory, []string{"user-1", "assistant-1", "tool-1"}) {
+		t.Fatalf("cached ActiveHistory = %#v, want latest replacement", state.ActiveHistory)
+	}
+	if state.Items[0].Seq != 2 || state.Items[1].Seq != 6 || state.Items[2].Seq != 7 || state.LastSeq != 9 {
+		t.Fatalf("cached seqs user/assistant/tool/last = %d/%d/%d/%d, want 2/6/7/9", state.Items[0].Seq, state.Items[1].Seq, state.Items[2].Seq, state.LastSeq)
+	}
+
+	replayed, err := store.Replay("session-1")
+	if err != nil {
+		t.Fatalf("Replay() after cached writes error = %v", err)
+	}
+	if !reflect.DeepEqual(replayed.Items, state.Items) {
+		t.Fatalf("replayed items = %#v, want cached %#v", replayed.Items, state.Items)
+	}
+	if !reflect.DeepEqual(replayed.ActiveHistory, state.ActiveHistory) || replayed.LastSeq != state.LastSeq {
+		t.Fatalf("replayed state = active %#v last %d, want active %#v last %d", replayed.ActiveHistory, replayed.LastSeq, state.ActiveHistory, state.LastSeq)
+	}
+}
+
 func TestV2StoreUpdateItemReplaysAndPreservesBirthSeq(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "sessions")
 	clock := &fakeClock{current: time.Date(2026, 7, 4, 1, 2, 3, 0, time.UTC)}
@@ -767,6 +836,57 @@ func TestV2StoreUpdateItemReplaysAndPreservesBirthSeq(t *testing.T) {
 	}
 }
 
+func TestV2StoreUpdateItemFromStateAdvancesCachedState(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "sessions")
+	store := NewV2Store(root)
+
+	toolItem, err := store.AppendItem("session-1", SessionItem{
+		ID:         "tool-1",
+		TurnID:     "turn-1",
+		Kind:       ItemKindMessage,
+		Visibility: ItemVisibilityVisible,
+		Audience:   ItemAudienceModel,
+		Status:     ItemStatusPending,
+		Message:    &model.Message{Role: model.MessageRoleTool, ToolCallID: "call-1"},
+	})
+	if err != nil {
+		t.Fatalf("AppendItem() error = %v", err)
+	}
+	state, err := store.Replay("session-1")
+	if err != nil {
+		t.Fatalf("Replay() error = %v", err)
+	}
+
+	updated, state, err := store.UpdateItemFromState("session-1", state, SessionItem{
+		ID:      "tool-1",
+		Status:  ItemStatusCompleted,
+		Message: &model.Message{Role: model.MessageRoleTool, ToolCallID: "call-1", Content: "done"},
+	})
+	if err != nil {
+		t.Fatalf("UpdateItemFromState() error = %v", err)
+	}
+	if updated.Seq != toolItem.Seq || updated.CreatedAt != toolItem.CreatedAt {
+		t.Fatalf("updated seq/created_at = %d/%s, want %d/%s", updated.Seq, updated.CreatedAt, toolItem.Seq, toolItem.CreatedAt)
+	}
+	if state.LastSeq != 2 {
+		t.Fatalf("cached LastSeq = %d, want update record seq 2", state.LastSeq)
+	}
+	if len(state.Items) != 1 || state.Items[0].Seq != toolItem.Seq || state.Items[0].Status != ItemStatusCompleted {
+		t.Fatalf("cached items = %#v, want updated tool preserving birth seq", state.Items)
+	}
+	if state.Items[0].Message == nil || state.Items[0].Message.Content != "done" {
+		t.Fatalf("cached message = %#v, want updated content", state.Items[0].Message)
+	}
+
+	replayed, err := store.Replay("session-1")
+	if err != nil {
+		t.Fatalf("Replay() after update error = %v", err)
+	}
+	if !reflect.DeepEqual(replayed.Items, state.Items) || replayed.LastSeq != state.LastSeq {
+		t.Fatalf("replayed state = items %#v last %d, want cached %#v last %d", replayed.Items, replayed.LastSeq, state.Items, state.LastSeq)
+	}
+}
+
 func TestV2StoreUpdateItemRejectsUnknownItem(t *testing.T) {
 	store := NewV2Store(filepath.Join(t.TempDir(), "sessions"))
 
@@ -779,6 +899,52 @@ func TestV2StoreUpdateItemRejectsUnknownItem(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), `item.updated references missing item "missing"`) {
 		t.Fatalf("UpdateItem(missing) error = %q, want missing item detail", err)
+	}
+}
+
+func TestV2StoreFromStateSessionMismatchDoesNotWrite(t *testing.T) {
+	store := NewV2Store(filepath.Join(t.TempDir(), "sessions"))
+	if _, err := store.AppendItem("session-1", SessionItem{
+		ID:         "item-1",
+		Kind:       ItemKindMessage,
+		Visibility: ItemVisibilityVisible,
+		Audience:   ItemAudienceUser,
+		Message:    &model.Message{Role: model.MessageRoleUser, Content: "hello"},
+	}); err != nil {
+		t.Fatalf("AppendItem() error = %v", err)
+	}
+
+	state, err := store.Replay("session-1")
+	if err != nil {
+		t.Fatalf("Replay() error = %v", err)
+	}
+	state.ID = "other-session"
+
+	if _, err := store.AppendItemsAndReplaceActiveHistoryFromState("session-1", state, []SessionItem{{
+		ID:         "item-2",
+		Kind:       ItemKindMessage,
+		Visibility: ItemVisibilityVisible,
+		Audience:   ItemAudienceModel,
+		Message:    &model.Message{Role: model.MessageRoleAssistant, Content: "ignored"},
+	}}, []string{"item-1", "item-2"}); err == nil {
+		t.Fatal("AppendItemsAndReplaceActiveHistoryFromState(mismatch) error = nil, want error")
+	}
+	if _, _, err := store.UpdateItemFromState("session-1", state, SessionItem{
+		ID:      "item-1",
+		Message: &model.Message{Role: model.MessageRoleUser, Content: "ignored"},
+	}); err == nil {
+		t.Fatal("UpdateItemFromState(mismatch) error = nil, want error")
+	}
+
+	replayed, err := store.Replay("session-1")
+	if err != nil {
+		t.Fatalf("Replay() after mismatch errors = %v", err)
+	}
+	if got := itemIDs(replayed.Items); !reflect.DeepEqual(got, []string{"item-1"}) {
+		t.Fatalf("items after mismatch errors = %#v, want only original item", got)
+	}
+	if replayed.LastSeq != 1 {
+		t.Fatalf("LastSeq after mismatch errors = %d, want 1", replayed.LastSeq)
 	}
 }
 
