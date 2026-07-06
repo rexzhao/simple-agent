@@ -7017,9 +7017,9 @@ func TestValidateCompactionReplacementHistoryRejectsIllegalToolExchangeBeforeWri
 	session := sessions.SessionV2{
 		ID: "bad-replacement-session",
 		Items: []sessions.SessionItem{
-			sessionItemFromMessage("runtime-1", model.Message{Role: model.MessageRoleSystem, Content: "runtime"}),
-			sessionItemFromMessage("user-1", model.Message{Role: model.MessageRoleUser, Content: "ask"}),
-			sessionItemFromMessage("assistant-tool-1", model.Message{
+			sessions.SessionItemFromMessage("runtime-1", model.Message{Role: model.MessageRoleSystem, Content: "runtime"}),
+			sessions.SessionItemFromMessage("user-1", model.Message{Role: model.MessageRoleUser, Content: "ask"}),
+			sessions.SessionItemFromMessage("assistant-tool-1", model.Message{
 				Role: model.MessageRoleAssistant,
 				ToolCalls: []model.ToolCall{
 					{ID: "call_1", Name: "read_file", Arguments: `{"path":"note.txt"}`},
@@ -7814,9 +7814,9 @@ func TestServerAgentTurnRunnerAutoCompactBeforeFailedModelLeavesSessionUnchanged
 		ConfigPath:           cliConfigPath(configDir),
 		InstructionsSnapshot: []model.Message{systemMessage},
 		Items: []sessions.SessionItem{
-			sessionItemFromMessage("runtime-000001", systemMessage),
-			sessionItemFromMessage("msg-000002", userMessage),
-			sessionItemFromMessage("msg-000003", assistantMessage),
+			sessions.SessionItemFromMessage("runtime-000001", systemMessage),
+			sessions.SessionItemFromMessage("msg-000002", userMessage),
+			sessions.SessionItemFromMessage("msg-000003", assistantMessage),
 		},
 		ActiveHistory:   []string{"runtime-000001", "msg-000002", "msg-000003"},
 		Context:         contextwindow.Metadata{ContextWindow: 10000, ContextWindowSource: string(contextwindow.WindowSourceConfigured)},
@@ -7904,9 +7904,9 @@ func TestServerAgentTurnRunnerPlansManualCompactionWithoutPersisting(t *testing.
 		ConfigPath:           cliConfigPath(configDir),
 		InstructionsSnapshot: []model.Message{systemMessage},
 		Items: []sessions.SessionItem{
-			sessionItemFromMessage("runtime-000001", systemMessage),
-			sessionItemFromMessage("msg-000002", userMessage),
-			sessionItemFromMessage("msg-000003", assistantMessage),
+			sessions.SessionItemFromMessage("runtime-000001", systemMessage),
+			sessions.SessionItemFromMessage("msg-000002", userMessage),
+			sessions.SessionItemFromMessage("msg-000003", assistantMessage),
 		},
 		ActiveHistory:   []string{"runtime-000001", "msg-000002", "msg-000003"},
 		Context:         contextwindow.Metadata{ContextWindow: 10000, ContextWindowSource: string(contextwindow.WindowSourceConfigured)},
@@ -8064,10 +8064,10 @@ func TestChatResumeSendsOnlyActiveHistoryAndSavesContinuation(t *testing.T) {
 			savedInstruction,
 		},
 		Items: []sessions.SessionItem{
-			sessionItemFromMessage("runtime-saved", savedInstruction),
-			sessionItemFromMessage("old-visible", oldVisible),
-			sessionItemFromMessage("active-user", activeUser),
-			sessionItemFromMessage("active-assistant", activeAssistant),
+			sessions.SessionItemFromMessage("runtime-saved", savedInstruction),
+			sessions.SessionItemFromMessage("old-visible", oldVisible),
+			sessions.SessionItemFromMessage("active-user", activeUser),
+			sessions.SessionItemFromMessage("active-assistant", activeAssistant),
 		},
 		ActiveHistory:   []string{"runtime-saved", "active-user", "active-assistant"},
 		SaveToolResults: true,
@@ -8150,7 +8150,7 @@ func TestChatResumeRejectsCorruptedActiveHistory(t *testing.T) {
 				ModelProfile: "default",
 				ModelID:      "model-default",
 				Items: []sessions.SessionItem{
-					sessionItemFromMessage("tool-only", model.Message{Role: model.MessageRoleTool, ToolCallID: "call_1", Content: "tool result secret"}),
+					sessions.SessionItemFromMessage("tool-only", model.Message{Role: model.MessageRoleTool, ToolCallID: "call_1", Content: "tool result secret"}),
 				},
 				ActiveHistory:   []string{"tool-only"},
 				SaveToolResults: true,
@@ -14679,8 +14679,8 @@ func writeCLISession(t *testing.T, root string, session sessions.Session) {
 		SaveToolResults:      session.SaveToolResults,
 	}
 	for _, message := range session.Messages {
-		id := nextSessionItemID(sessionItemIDs(v2.Items), message)
-		v2.Items = append(v2.Items, sessionItemFromMessage(id, message))
+		id := sessions.NextSessionItemID(sessions.SessionItemIDs(v2.Items), message)
+		v2.Items = append(v2.Items, sessions.SessionItemFromMessage(id, message))
 		v2.ActiveHistory = append(v2.ActiveHistory, id)
 	}
 	writeCLISessionV2(t, root, v2)

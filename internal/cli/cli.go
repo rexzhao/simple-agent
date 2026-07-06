@@ -4788,7 +4788,7 @@ func (r *agentRuntime) planCompactionCheckpoint(ctx context.Context, checkpointO
 		return compactionPlan{}, err
 	}
 
-	summaryItemID := nextCompactionSummaryItemID(sessionItemIDs(r.resumableSession.Items))
+	summaryItemID := nextCompactionSummaryItemID(sessions.SessionItemIDs(r.resumableSession.Items))
 	summaryMessage := model.Message{
 		Role:    model.MessageRoleDeveloper,
 		Content: formatCompactionSummary(summaryText),
@@ -5200,13 +5200,13 @@ func (r *agentRuntime) sessionSavePlan(messages []model.Message) (sessions.Sessi
 		return sessions.SessionV2{}, nil, nil, fmt.Errorf("save resumable session: updated message history shorter than active history")
 	}
 
-	existingIDs := sessionItemIDs(session.Items)
+	existingIDs := sessions.SessionItemIDs(session.Items)
 	activeItemIDs := copyStringSlice(r.activeItemIDs)
 	newMessages := messages[len(r.activeItemIDs):]
 	newItems := make([]sessions.SessionItem, 0, len(newMessages))
 	for _, message := range newMessages {
-		itemID := nextSessionItemID(existingIDs, message)
-		item := sessionItemFromMessage(itemID, message)
+		itemID := sessions.NextSessionItemID(existingIDs, message)
+		item := sessions.SessionItemFromMessage(itemID, message)
 		existingIDs[itemID] = struct{}{}
 		newItems = append(newItems, item)
 		activeItemIDs = append(activeItemIDs, itemID)
@@ -5562,46 +5562,6 @@ func formatPendingToolCallIDs(pending map[string]struct{}) string {
 	}
 	sort.Strings(ids)
 	return strings.Join(ids, ",")
-}
-
-func sessionItemIDs(items []sessions.SessionItem) map[string]struct{} {
-	ids := make(map[string]struct{}, len(items))
-	for _, item := range items {
-		ids[item.ID] = struct{}{}
-	}
-	return ids
-}
-
-func nextSessionItemID(existing map[string]struct{}, message model.Message) string {
-	prefix := "msg"
-	if message.Role == model.MessageRoleSystem || message.Role == model.MessageRoleDeveloper {
-		prefix = "runtime"
-	}
-	for i := len(existing) + 1; ; i++ {
-		id := fmt.Sprintf("%s-%06d", prefix, i)
-		if _, ok := existing[id]; !ok {
-			return id
-		}
-	}
-}
-
-func sessionItemFromMessage(id string, message model.Message) sessions.SessionItem {
-	messageCopy := copyMessageSlice([]model.Message{message})[0]
-	item := sessions.SessionItem{
-		ID:         id,
-		Kind:       sessions.ItemKindMessage,
-		Visibility: sessions.ItemVisibilityVisible,
-		Audience:   sessions.ItemAudienceModel,
-		Message:    &messageCopy,
-	}
-	switch message.Role {
-	case model.MessageRoleSystem, model.MessageRoleDeveloper:
-		item.Kind = sessions.ItemKindRuntimeContext
-		item.Visibility = sessions.ItemVisibilityHidden
-	case model.MessageRoleUser:
-		item.Audience = sessions.ItemAudienceUser
-	}
-	return item
 }
 
 func sameStringSlice(a, b []string) bool {
