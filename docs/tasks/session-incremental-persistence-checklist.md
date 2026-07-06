@@ -264,7 +264,7 @@ GC, and auto-rerunning interrupted tools.
   before turn end, on both CLI and server paths. Persistence points = round boundary
   `AssistantReady` + per-result `ToolResultReady`; **not** per-delta, **not** per
   `ToolCallDoneEvent`.
-- [ ] `item.updated` does not overwrite `item.Seq` (birth seq immutable); after update
+- [x] `item.updated` does not overwrite `item.Seq` (birth seq immutable); after update
   `state.Items` stays monotonic by birth seq — `paginateSessionItems`
   `AfterSeq`/`BeforeSeq` and `sessionItemPageSeqBounds` remain correct.
 - [ ] `active_history` passes `validateActiveHistoryToolExchanges` at all times; a

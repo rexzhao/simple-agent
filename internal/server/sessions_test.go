@@ -4151,6 +4151,97 @@ func TestSessionItemsPaginationBeforeAfter(t *testing.T) {
 	}
 }
 
+func TestSessionItemsPaginationAfterItemUpdateUsesBirthSeq(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "sessions")
+	store := sessions.NewV2Store(root)
+	saveServerTestSession(t, store, "pagination-update")
+	appendServerTestItem(t, store, "pagination-update", sessions.SessionItem{
+		ID:         "user-before",
+		TurnID:     "turn-1",
+		Kind:       sessions.ItemKindMessage,
+		Visibility: sessions.ItemVisibilityVisible,
+		Audience:   sessions.ItemAudienceUser,
+		Message:    &model.Message{Role: model.MessageRoleUser, Content: "before"},
+	})
+	toolA := appendServerTestItem(t, store, "pagination-update", sessions.SessionItem{
+		ID:         "tool-a",
+		TurnID:     "turn-1",
+		Kind:       sessions.ItemKindMessage,
+		Visibility: sessions.ItemVisibilityVisible,
+		Audience:   sessions.ItemAudienceModel,
+		Status:     sessions.ItemStatusPending,
+		Message:    &model.Message{Role: model.MessageRoleTool, ToolCallID: "call-a"},
+	})
+	appendServerTestItem(t, store, "pagination-update", sessions.SessionItem{
+		ID:         "tool-b",
+		TurnID:     "turn-1",
+		Kind:       sessions.ItemKindMessage,
+		Visibility: sessions.ItemVisibilityVisible,
+		Audience:   sessions.ItemAudienceModel,
+		Status:     sessions.ItemStatusPending,
+		Message:    &model.Message{Role: model.MessageRoleTool, ToolCallID: "call-b"},
+	})
+	appendServerTestItem(t, store, "pagination-update", sessions.SessionItem{
+		ID:         "user-after",
+		TurnID:     "turn-1",
+		Kind:       sessions.ItemKindMessage,
+		Visibility: sessions.ItemVisibilityVisible,
+		Audience:   sessions.ItemAudienceUser,
+		Message:    &model.Message{Role: model.MessageRoleUser, Content: "after"},
+	})
+	if _, err := store.UpdateItem("pagination-update", sessions.SessionItem{
+		ID:      "tool-a",
+		Status:  sessions.ItemStatusCompleted,
+		Message: &model.Message{Role: model.MessageRoleTool, ToolCallID: "call-a", Content: "done"},
+	}); err != nil {
+		t.Fatalf("UpdateItem(tool-a) error = %v", err)
+	}
+
+	replayed, err := store.Replay("pagination-update")
+	if err != nil {
+		t.Fatalf("Replay(pagination-update) error = %v", err)
+	}
+	if got := responseSessionItemIDs(replayed.Items); !reflect.DeepEqual(got, []string{"user-before", "tool-a", "tool-b", "user-after"}) {
+		t.Fatalf("replayed item order = %#v, want birth order", got)
+	}
+	if got := []int64{replayed.Items[0].Seq, replayed.Items[1].Seq, replayed.Items[2].Seq, replayed.Items[3].Seq}; !reflect.DeepEqual(got, []int64{1, 2, 3, 4}) {
+		t.Fatalf("replayed item seqs = %#v, want birth seqs [1 2 3 4]", got)
+	}
+	if replayed.LastSeq != 5 {
+		t.Fatalf("LastSeq = %d, want update record seq 5", replayed.LastSeq)
+	}
+
+	process := startSessionAPIServer(t, store, sessions.SessionV2{})
+	baseURL := "http://" + process.Addr()
+
+	_, after := getRawJSONStatus(t, baseURL+"/sessions/pagination-update/items?view=debug&after_seq=2&limit=2", "registry-token", http.StatusOK)
+	if got := responseItemIDs(t, after); !reflect.DeepEqual(got, []string{"tool-b", "user-after"}) {
+		t.Fatalf("after_seq page IDs = %#v, want [tool-b user-after]", got)
+	}
+	if got := responseItemSeqs(t, after); !reflect.DeepEqual(got, []int64{3, 4}) {
+		t.Fatalf("after_seq page seqs = %#v, want [3 4]", got)
+	}
+	if after["oldest_seq"] != float64(3) || after["newest_seq"] != float64(4) {
+		t.Fatalf("after_seq cursors = oldest:%#v newest:%#v, want 3/4", after["oldest_seq"], after["newest_seq"])
+	}
+
+	_, before := getRawJSONStatus(t, baseURL+"/sessions/pagination-update/items?view=debug&before_seq=5&limit=2", "registry-token", http.StatusOK)
+	if got := responseItemIDs(t, before); !reflect.DeepEqual(got, []string{"tool-b", "user-after"}) {
+		t.Fatalf("before_seq page IDs = %#v, want [tool-b user-after]", got)
+	}
+	if got := responseItemSeqs(t, before); !reflect.DeepEqual(got, []int64{3, 4}) {
+		t.Fatalf("before_seq page seqs = %#v, want [3 4]", got)
+	}
+	if before["oldest_seq"] != float64(3) || before["newest_seq"] != float64(4) {
+		t.Fatalf("before_seq cursors = oldest:%#v newest:%#v, want 3/4", before["oldest_seq"], before["newest_seq"])
+	}
+
+	_, item := getRawJSONStatus(t, baseURL+"/sessions/pagination-update/items/tool-a?view=debug", "registry-token", http.StatusOK)
+	if item["seq"] != float64(toolA.Seq) || item["status"] != sessions.ItemStatusCompleted {
+		t.Fatalf("refetched updated item seq/status = %#v/%#v, want %d/%q", item["seq"], item["status"], toolA.Seq, sessions.ItemStatusCompleted)
+	}
+}
+
 func TestSessionItemsEmptyPageCursorFields(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "sessions")
 	store := sessions.NewV2Store(root)
