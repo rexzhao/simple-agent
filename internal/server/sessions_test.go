@@ -17,8 +17,10 @@ import (
 
 	"github.com/gorilla/websocket"
 	"github.com/rexzhao/simple-agent/internal/contextwindow"
+	"github.com/rexzhao/simple-agent/internal/eventbus"
 	"github.com/rexzhao/simple-agent/internal/model"
 	projectstore "github.com/rexzhao/simple-agent/internal/projects"
+	"github.com/rexzhao/simple-agent/internal/sessionprojector"
 	"github.com/rexzhao/simple-agent/internal/sessions"
 )
 
@@ -1197,6 +1199,123 @@ func TestSessionStreamAfterSeqCatchesUpCompactedTurnActiveHistoryAtPersistedSeq(
 	if got["type"] != "text.delta" || got["text"] != "live" {
 		t.Fatalf("live stream event = %#v, want text.delta live after catch-up", got)
 	}
+}
+
+func TestSessionEventBusBridgePublishesTransientAndPersistedEvents(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "sessions")
+	store := sessions.NewV2Store(root)
+	saveServerTestSession(t, store, "bridge-session")
+	session, err := store.Load("bridge-session")
+	if err != nil {
+		t.Fatalf("Load(bridge-session) error = %v", err)
+	}
+	projector, err := sessionprojector.New(store, session)
+	if err != nil {
+		t.Fatalf("sessionprojector.New() error = %v", err)
+	}
+	defer projector.Close()
+	bus := eventbus.NewBusWithCheckpoint(projector.CheckpointHandler())
+	process := startSessionAPIServer(t, store, sessions.SessionV2{})
+	conn := dialSessionStream(t, process, "bridge-session")
+	waitForStreamSubscribers(t, process, "bridge-session", 1)
+	waitBridge := process.startSessionEventBusBridge("bridge-session", "turn-bridge", bus, session.LastSeq)
+	defer waitBridge()
+	defer bus.Close()
+
+	if err := bus.Publish(eventbus.TurnStarted{TurnID: "turn-bridge"}); err != nil {
+		t.Fatalf("Publish(TurnStarted) error = %v", err)
+	}
+	if err := bus.Publish(eventbus.ModelEvent{Event: model.TextDeltaEvent{Text: "live text"}}); err != nil {
+		t.Fatalf("Publish(ModelEvent text) error = %v", err)
+	}
+	if err := bus.Publish(eventbus.ModelEvent{Event: model.ToolCallDoneEvent{ToolCall: model.ToolCall{
+		ID:        "call-1",
+		Name:      "read_file",
+		Arguments: `{"path":"SECRET ARGUMENTS"}`,
+	}}}); err != nil {
+		t.Fatalf("Publish(ModelEvent tool call) error = %v", err)
+	}
+	if err := bus.Publish(eventbus.TurnInputReady{TurnID: "turn-bridge", Message: model.Message{Role: model.MessageRoleUser, Content: "hello bridge"}}); err != nil {
+		t.Fatalf("Publish(TurnInputReady) error = %v", err)
+	}
+	assistant := model.Message{
+		Role:    model.MessageRoleAssistant,
+		Content: "assistant needs tool",
+		ToolCalls: []model.ToolCall{{
+			ID:        "call-1",
+			Name:      "read_file",
+			Arguments: `{"path":"SECRET ARGUMENTS"}`,
+		}},
+	}
+	if err := bus.Publish(eventbus.AssistantReady{TurnID: "turn-bridge", Message: assistant}); err != nil {
+		t.Fatalf("Publish(AssistantReady) error = %v", err)
+	}
+	if err := bus.Publish(eventbus.ToolResultReady{TurnID: "turn-bridge", Result: model.ToolResult{
+		ToolCallID: "call-1",
+		Name:       "read_file",
+		Content:    "SECRET TOOL RESULT",
+	}}); err != nil {
+		t.Fatalf("Publish(ToolResultReady) error = %v", err)
+	}
+	if err := bus.Publish(eventbus.TurnCompleted{TurnID: "turn-bridge"}); err != nil {
+		t.Fatalf("Publish(TurnCompleted) error = %v", err)
+	}
+
+	events := make([]map[string]any, 0, 6)
+	for len(events) < 6 {
+		events = append(events, readSessionStreamEvent(t, conn))
+	}
+	wantTypes := []string{
+		"text.delta",
+		"tool.started",
+		"item.appended",
+		"item.appended",
+		"item.appended",
+		"item.updated",
+	}
+	for i, want := range wantTypes {
+		if events[i]["type"] != want {
+			t.Fatalf("event[%d] type = %#v, want %q; events=%#v", i, events[i]["type"], want, events)
+		}
+	}
+	if events[0]["text"] != "live text" {
+		t.Fatalf("text event = %#v, want live text", events[0])
+	}
+	if events[1]["name"] != "read_file" || events[1]["arguments"] != nil {
+		t.Fatalf("tool.started event = %#v, want sanitized read_file", events[1])
+	}
+	for i, event := range events {
+		raw, err := json.Marshal(event)
+		if err != nil {
+			t.Fatalf("Marshal(event[%d]) error = %v", i, err)
+		}
+		if bytes.Contains(raw, []byte("SECRET TOOL RESULT")) || bytes.Contains(raw, []byte("SECRET ARGUMENTS")) {
+			t.Fatalf("event[%d] leaked sensitive content: %s", i, raw)
+		}
+	}
+
+	loaded, err := store.Load("bridge-session")
+	if err != nil {
+		t.Fatalf("Load(bridge-session) after bridge events error = %v", err)
+	}
+	var toolItem sessions.SessionItem
+	for _, item := range loaded.Items {
+		if item.Message != nil && item.Message.Role == model.MessageRoleTool {
+			toolItem = item
+		}
+	}
+	if toolItem.ID == "" || toolItem.Status != sessions.ItemStatusCompleted {
+		t.Fatalf("tool item = %#v, want completed persisted tool item", toolItem)
+	}
+	if events[5]["item_id"] != toolItem.ID {
+		t.Fatalf("item.updated item_id = %#v, want %q", events[5]["item_id"], toolItem.ID)
+	}
+	if int64(events[5]["seq"].(float64)) <= toolItem.Seq {
+		t.Fatalf("item.updated seq = %#v, want update record seq greater than item birth seq %d", events[5]["seq"], toolItem.Seq)
+	}
+
+	bus.Close()
+	waitBridge()
 }
 
 func TestSessionStreamAfterSeqBadQueryFailsBeforeUpgrade(t *testing.T) {

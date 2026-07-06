@@ -44,10 +44,25 @@ type Publisher interface {
 
 type DurableHandler func(Event) error
 
+type DurableCheckpointHandler func(Event) (int64, error)
+
+type DurableCommitted struct {
+	Event Event
+	Seq   int64
+}
+
+func (e DurableCommitted) Kind() string {
+	if e.Event == nil {
+		return "durable.committed"
+	}
+	return e.Event.Kind()
+}
+
 // Bus serializes durable events within a single bus. It does not provide
 // cross-bus or cross-session locking; callers still need a session-level turn lock.
 type Bus struct {
-	handler DurableHandler
+	handler           DurableHandler
+	checkpointHandler DurableCheckpointHandler
 
 	durableMu sync.Mutex
 	closeOnce sync.Once
@@ -66,6 +81,14 @@ func NewBus(handler DurableHandler) *Bus {
 		handler: handler,
 		done:    make(chan struct{}),
 		subs:    make(map[chan Event]subscriber),
+	}
+}
+
+func NewBusWithCheckpoint(handler DurableCheckpointHandler) *Bus {
+	return &Bus{
+		checkpointHandler: handler,
+		done:              make(chan struct{}),
+		subs:              make(map[chan Event]subscriber),
 	}
 }
 
@@ -140,7 +163,17 @@ func (b *Bus) publishDurable(event Event) error {
 		return err
 	}
 	if b.handler == nil {
-		return fmt.Errorf("durable event handler is required")
+		if b.checkpointHandler == nil {
+			return fmt.Errorf("durable event handler is required")
+		}
+		committedSeq, err := b.checkpointHandler(event)
+		if err != nil {
+			return err
+		}
+		if committedSeq > 0 {
+			return b.fanout(DurableCommitted{Event: event, Seq: committedSeq})
+		}
+		return b.fanout(event)
 	}
 	if err := b.handler(event); err != nil {
 		return err

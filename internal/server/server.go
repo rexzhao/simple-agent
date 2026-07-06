@@ -21,6 +21,7 @@ import (
 
 	"github.com/gorilla/websocket"
 	"github.com/rexzhao/simple-agent/internal/contextwindow"
+	"github.com/rexzhao/simple-agent/internal/eventbus"
 	"github.com/rexzhao/simple-agent/internal/model"
 	projectstore "github.com/rexzhao/simple-agent/internal/projects"
 	"github.com/rexzhao/simple-agent/internal/sessions"
@@ -1657,6 +1658,62 @@ func (p *Process) publishSessionEvent(sessionID string, event SessionStreamEvent
 		return
 	}
 	p.streams.publish(sessionID, payload)
+}
+
+// startSessionEventBusBridge drains a turn-local bus into the process session
+// stream. The returned function only waits for the bridge goroutine; callers
+// must close bus first so the lossless subscription terminates.
+func (p *Process) startSessionEventBusBridge(sessionID, turnID string, bus *eventbus.Bus, afterSeq int64) func() {
+	done := make(chan struct{})
+	if p == nil || bus == nil {
+		close(done)
+		return func() {}
+	}
+	events := bus.SubscribeLossless(sessionStreamClientBuffer)
+	go func() {
+		defer close(done)
+		lastSeq := afterSeq
+		for event := range events {
+			switch event := event.(type) {
+			case eventbus.ModelEvent:
+				if event.Event != nil {
+					p.publishModelTurnEvent(sessionID, turnID, event.Event)
+				}
+			case eventbus.DurableCommitted:
+				nextSeq := p.publishPersistedSessionEventsThrough(sessionID, lastSeq, event.Seq)
+				if nextSeq > lastSeq {
+					lastSeq = nextSeq
+				}
+			}
+		}
+	}()
+	return func() {
+		<-done
+	}
+}
+
+func (p *Process) publishPersistedSessionEventsThrough(sessionID string, afterSeq, throughSeq int64) int64 {
+	if p == nil || p.sessionStore == nil {
+		return afterSeq
+	}
+	if throughSeq <= afterSeq {
+		return afterSeq
+	}
+	events, err := p.sessionStore.PersistedEventsAfter(sessionID, afterSeq)
+	if err != nil {
+		return afterSeq
+	}
+	for _, event := range events {
+		if event.Seq > throughSeq {
+			break
+		}
+		streamEvent, ok := sessionStreamEventFromPersistedEvent(event)
+		if !ok {
+			continue
+		}
+		p.publishSessionEvent(sessionID, streamEvent)
+	}
+	return throughSeq
 }
 
 func (p *Process) sessionStreamCatchUpPayloads(sessionID string, afterSeq int64) ([][]byte, error) {

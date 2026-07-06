@@ -30,6 +30,37 @@ func TestBusPublishDurableInvokesHandlerAndFansOut(t *testing.T) {
 	assertReceived(t, sub, event)
 }
 
+func TestBusPublishDurableWithCheckpointFansOutCommittedEvent(t *testing.T) {
+	var handled []string
+	bus := NewBusWithCheckpoint(func(event Event) (int64, error) {
+		handled = append(handled, event.Kind())
+		return 42, nil
+	})
+	defer bus.Close()
+
+	sub := bus.Subscribe()
+	event := TurnStarted{TurnID: "turn-1"}
+	if err := bus.Publish(event); err != nil {
+		t.Fatalf("Publish() error = %v", err)
+	}
+	if got, want := handled, []string{KindTurnStarted}; !equalStrings(got, want) {
+		t.Fatalf("handled = %#v, want %#v", got, want)
+	}
+
+	select {
+	case got := <-sub:
+		committed, ok := got.(DurableCommitted)
+		if !ok {
+			t.Fatalf("received %T, want DurableCommitted", got)
+		}
+		if committed.Event != event || committed.Seq != 42 {
+			t.Fatalf("received committed event %#v, want event %#v seq 42", committed, event)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for DurableCommitted")
+	}
+}
+
 func TestBusPublishDurableErrorDoesNotFanOutAndReleasesSerialization(t *testing.T) {
 	handlerErr := errors.New("write failed")
 	bus := NewBus(func(event Event) error {

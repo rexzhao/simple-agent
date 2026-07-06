@@ -34,7 +34,12 @@ type Projector struct {
 
 type projectorRequest struct {
 	event eventbus.Event
-	ack   chan error
+	ack   chan projectorResult
+}
+
+type projectorResult struct {
+	seq int64
+	err error
 }
 
 func New(store *sessions.V2Store, session sessions.SessionV2) (*Projector, error) {
@@ -65,25 +70,35 @@ func (p *Projector) Handler() eventbus.DurableHandler {
 }
 
 func (p *Projector) Handle(event eventbus.Event) error {
+	_, err := p.HandleWithCheckpoint(event)
+	return err
+}
+
+func (p *Projector) CheckpointHandler() eventbus.DurableCheckpointHandler {
+	return p.HandleWithCheckpoint
+}
+
+func (p *Projector) HandleWithCheckpoint(event eventbus.Event) (int64, error) {
 	if p == nil {
-		return fmt.Errorf("session projector is required")
+		return 0, fmt.Errorf("session projector is required")
 	}
 	if event == nil {
-		return fmt.Errorf("event is required")
+		return 0, fmt.Errorf("event is required")
 	}
 	if _, ok := event.(eventbus.DurableEvent); !ok {
-		return fmt.Errorf("session projector only handles durable events: %T", event)
+		return 0, fmt.Errorf("session projector only handles durable events: %T", event)
 	}
 
-	ack := make(chan error, 1)
+	ack := make(chan projectorResult, 1)
 	p.mu.Lock()
 	if p.closed {
 		p.mu.Unlock()
-		return eventbus.ErrClosed
+		return 0, eventbus.ErrClosed
 	}
 	p.requests <- projectorRequest{event: event, ack: ack}
 	p.mu.Unlock()
-	return <-ack
+	result := <-ack
+	return result.seq, result.err
 }
 
 func (p *Projector) Close() error {
@@ -105,35 +120,41 @@ func (p *Projector) run() {
 	for {
 		select {
 		case request := <-p.requests:
-			request.ack <- p.handle(request.event)
+			seq, err := p.handle(request.event)
+			request.ack <- projectorResult{seq: seq, err: err}
 		case <-p.done:
 			return
 		}
 	}
 }
 
-func (p *Projector) handle(event eventbus.Event) error {
+func (p *Projector) handle(event eventbus.Event) (int64, error) {
 	if p.finished {
-		return fmt.Errorf("turn %q already finished", p.turnID)
+		return 0, fmt.Errorf("turn %q already finished", p.turnID)
 	}
+	var err error
 	switch event := event.(type) {
 	case eventbus.TurnStarted:
-		return p.handleTurnStarted(event)
+		err = p.handleTurnStarted(event)
 	case eventbus.CompactionRequested:
-		return p.handleCompactionRequested(event)
+		err = p.handleCompactionRequested(event)
 	case eventbus.TurnInputReady:
-		return p.handleTurnInputReady(event)
+		err = p.handleTurnInputReady(event)
 	case eventbus.AssistantReady:
-		return p.handleAssistantReady(event)
+		err = p.handleAssistantReady(event)
 	case eventbus.ToolResultReady:
-		return p.handleToolResultReady(event)
+		err = p.handleToolResultReady(event)
 	case eventbus.TurnCompleted:
-		return p.handleTurnCompleted(event)
+		err = p.handleTurnCompleted(event)
 	case eventbus.TurnInterrupted:
-		return p.handleTurnInterrupted(event)
+		err = p.handleTurnInterrupted(event)
 	default:
-		return fmt.Errorf("unsupported projector event %T", event)
+		err = fmt.Errorf("unsupported projector event %T", event)
 	}
+	if err != nil {
+		return 0, err
+	}
+	return p.session.LastSeq, nil
 }
 
 func (p *Projector) handleTurnStarted(event eventbus.TurnStarted) error {
