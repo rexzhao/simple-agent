@@ -403,6 +403,24 @@ func TestProjectorSerializesConcurrentToolResults(t *testing.T) {
 			t.Fatalf("persisted events not increasing at %d: %#v", i, events)
 		}
 	}
+	if len(events) < toolCount {
+		t.Fatalf("persisted events count = %d, want at least %d", len(events), toolCount)
+	}
+	updated := events[len(events)-toolCount:]
+	seenUpdatedItems := make(map[string]struct{}, toolCount)
+	firstUpdateSeq := replayed.LastSeq - toolCount + 1
+	for i, event := range updated {
+		if event.Type != sessions.RecordTypeItemUpdated {
+			t.Fatalf("persisted event tail[%d] type = %q, want %q: %#v", i, event.Type, sessions.RecordTypeItemUpdated, updated)
+		}
+		if want := firstUpdateSeq + int64(i); event.Seq != want {
+			t.Fatalf("persisted item.updated seq at tail[%d] = %d, want %d: %#v", i, event.Seq, want, updated)
+		}
+		if _, ok := seenUpdatedItems[event.ItemID]; ok {
+			t.Fatalf("duplicate item.updated event for item %q: %#v", event.ItemID, updated)
+		}
+		seenUpdatedItems[event.ItemID] = struct{}{}
+	}
 }
 
 func TestProjectorValidationAndClose(t *testing.T) {
