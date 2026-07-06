@@ -155,7 +155,7 @@ GC, and auto-rerunning interrupted tools.
   `server.go:1657`). Per-turn bus is not subscribed by WebSocket clients directly.
 - [x] Catch-up: add `item.updated` mapping in `sessionStreamEventFromPersistedEvent`
   (`server.go:1636`) emitting `{Seq, Type:"item.updated", ItemID}`.
-- [ ] **`item.updated` client refetch (explicit)**: since `item.Seq` is the immutable
+- [x] **`item.updated` client refetch (explicit)**: since `item.Seq` is the immutable
   birth seq and `PersistedEvent.Seq` is the update-record seq, clients **cannot**
   re-fetch the mutated item via `/items?after_seq=...`. Add a **`GET
   /sessions/{id}/items/{itemID}`** endpoint returning the **blob-resolved item** (real

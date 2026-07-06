@@ -4037,6 +4037,14 @@ func TestSessionItemEndpointRefetchesUpdatedToolItemAndKeepsChatViewNarrow(t *te
 	if _, err := store.UpdateItem("item-detail", updated); err != nil {
 		t.Fatalf("UpdateItem(tool-result) error = %v", err)
 	}
+	appendServerTestItem(t, store, "item-detail", sessions.SessionItem{
+		ID:         "tool-pending",
+		Kind:       sessions.ItemKindMessage,
+		Visibility: sessions.ItemVisibilityVisible,
+		Audience:   sessions.ItemAudienceModel,
+		Status:     sessions.ItemStatusPending,
+		Message:    &model.Message{Role: model.MessageRoleTool, ToolCallID: "call-pending"},
+	})
 
 	process := startSessionAPIServerWithToken(t, store, sessions.SessionV2{}, "registry-token")
 	baseURL := "http://" + process.Addr()
@@ -4096,6 +4104,21 @@ func TestSessionItemEndpointRefetchesUpdatedToolItemAndKeepsChatViewNarrow(t *te
 	}
 	if !bytes.Contains(debugRaw, []byte("TOOL-RESULT-TAIL")) {
 		t.Fatalf("debug tool item missing blob-resolved tail: %s", debugRaw)
+	}
+
+	pendingRaw, pendingDebug := getRawJSONStatus(t, baseURL+"/sessions/item-detail/items/tool-pending?view=debug", "registry-token", http.StatusOK)
+	if pendingDebug["status"] != sessions.ItemStatusPending {
+		t.Fatalf("debug pending tool status = %#v, want pending; body=%#v", pendingDebug["status"], pendingDebug)
+	}
+	pendingMessage := pendingDebug["message"].(map[string]any)
+	if pendingMessage["role"] != string(model.MessageRoleTool) || pendingMessage["tool_call_id"] != "call-pending" {
+		t.Fatalf("debug pending tool message = %#v, want role/tool_call_id", pendingMessage)
+	}
+	if _, ok := pendingMessage["is_error"]; ok {
+		t.Fatalf("debug pending tool unexpectedly included is_error: %#v", pendingMessage)
+	}
+	if _, ok := pendingMessage["content"]; ok || bytes.Contains(pendingRaw, []byte("[tool execution interrupted]")) {
+		t.Fatalf("debug pending tool synthesized content: %s", pendingRaw)
 	}
 
 	raw, body = getRawJSONStatus(t, baseURL+"/sessions/item-detail/items/tool-result/content?view=debug", "registry-token", http.StatusNotFound)
