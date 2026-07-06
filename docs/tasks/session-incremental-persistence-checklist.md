@@ -293,7 +293,7 @@ GC, and auto-rerunning interrupted tools.
   sole writer; **only pre-turn compaction** exists (between `TurnStarted` and
   `TurnInputReady`, before the first `AssistantReady`); `TurnCompleted` does no
   compaction. Turn failing after compaction leaves a legal resumable compacted history.
-- [ ] `TurnInterrupted{TurnID}` carries only `TurnID`; the projector derives the pending
+- [x] `TurnInterrupted{TurnID}` carries only `TurnID`; the projector derives the pending
   set from its own state (no under-marking).
 - [ ] The projector caches the session replayed state per turn so `UpdateItem` **and**
   `AppendItemsAndReplaceActiveHistory` reuse `LastSeq+1` without re-replaying per
