@@ -3467,6 +3467,106 @@ func TestServerStartupMarksStaleRunningTurnInterruptedWithoutReplay(t *testing.T
 	}
 }
 
+func TestServerStartupMaterializesPendingToolAfterCrash(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "sessions")
+	store := sessions.NewV2Store(root)
+	if _, err := store.SaveMetadata(sessions.SessionV2{
+		ID:               "recover-pending-tool",
+		Provider:         "codex",
+		ModelProfile:     "default",
+		ModelID:          "gpt-5",
+		CWD:              t.TempDir(),
+		RunningTurnID:    "turn-000123",
+		RunningStartedAt: time.Date(2026, 7, 4, 1, 2, 3, 0, time.UTC),
+	}); err != nil {
+		t.Fatalf("SaveMetadata(recover-pending-tool) error = %v", err)
+	}
+	user := appendServerTestItem(t, store, "recover-pending-tool", sessions.SessionItem{
+		ID:         "user-1",
+		Kind:       sessions.ItemKindMessage,
+		Visibility: sessions.ItemVisibilityVisible,
+		Audience:   sessions.ItemAudienceUser,
+		Message:    &model.Message{Role: model.MessageRoleUser, Content: "already committed"},
+	})
+	assistant := appendServerTestItem(t, store, "recover-pending-tool", sessions.SessionItem{
+		ID:         "assistant-1",
+		Kind:       sessions.ItemKindMessage,
+		Visibility: sessions.ItemVisibilityVisible,
+		Audience:   sessions.ItemAudienceModel,
+		Message: &model.Message{
+			Role:    model.MessageRoleAssistant,
+			Content: "need a tool",
+			ToolCalls: []model.ToolCall{{
+				ID:        "call-crash",
+				Name:      "read_file",
+				Arguments: `{"path":"SECRET ARG"}`,
+			}},
+		},
+	})
+	tool := appendServerTestItem(t, store, "recover-pending-tool", sessions.SessionItem{
+		ID:         "tool-1",
+		Kind:       sessions.ItemKindMessage,
+		Visibility: sessions.ItemVisibilityVisible,
+		Audience:   sessions.ItemAudienceModel,
+		Status:     sessions.ItemStatusPending,
+		Message:    &model.Message{Role: model.MessageRoleTool, ToolCallID: "call-crash"},
+	})
+	if _, err := store.ReplaceActiveHistory("recover-pending-tool", []string{user.ID, assistant.ID, tool.ID}); err != nil {
+		t.Fatalf("ReplaceActiveHistory(recover-pending-tool) error = %v", err)
+	}
+
+	process := startSessionAPIServerWithTurnRunner(t, store, sessions.SessionV2{}, "registry-token", fakeSessionTurnRunner{
+		run: func(ctx context.Context, request SessionTurnRequest) (SessionTurnResult, error) {
+			t.Fatalf("runner was called during startup recovery")
+			return SessionTurnResult{}, nil
+		},
+	})
+
+	session, err := store.Load("recover-pending-tool")
+	if err != nil {
+		t.Fatalf("Load(recover-pending-tool) error = %v", err)
+	}
+	if session.RunningTurnID != "" || session.InterruptedTurnID != "turn-000123" || session.InterruptedAt.IsZero() {
+		t.Fatalf("recovered metadata = running %q interrupted %q at %s, want interrupted stale turn", session.RunningTurnID, session.InterruptedTurnID, session.InterruptedAt)
+	}
+	if len(session.Items) != 3 || session.Items[2].ID != tool.ID || session.Items[2].Status != sessions.ItemStatusPending || session.Items[2].Message == nil || session.Items[2].Message.Content != "" {
+		t.Fatalf("persisted pending tool item = %#v, want unchanged pending item after startup sweep", session.Items)
+	}
+	persisted, err := store.PersistedEventsAfter("recover-pending-tool", 0)
+	if err != nil {
+		t.Fatalf("PersistedEventsAfter(recover-pending-tool) error = %v", err)
+	}
+	for _, event := range persisted {
+		if event.Type == sessions.RecordTypeItemUpdated {
+			t.Fatalf("startup crash recovery wrote item.updated event unexpectedly: %#v", persisted)
+		}
+	}
+
+	messages, err := session.MaterializeActiveHistory()
+	if err != nil {
+		t.Fatalf("MaterializeActiveHistory() error = %v", err)
+	}
+	if len(messages) != 3 {
+		t.Fatalf("materialized messages = %#v, want user+assistant+tool", messages)
+	}
+	if messages[0].Role != model.MessageRoleUser || messages[1].Role != model.MessageRoleAssistant || messages[2].Role != model.MessageRoleTool {
+		t.Fatalf("materialized roles = %#v, want user/assistant/tool", messages)
+	}
+	if len(messages[1].ToolCalls) != 1 || messages[1].ToolCalls[0].ID != "call-crash" {
+		t.Fatalf("assistant message = %#v, want one crash tool call", messages[1])
+	}
+	if messages[2].ToolCallID != "call-crash" || !messages[2].IsError || messages[2].Content != "[tool execution interrupted]" {
+		t.Fatalf("materialized tool message = %#v, want synthesized interrupted result", messages[2])
+	}
+	if err := assertProviderValidToolHistory(messages); err != nil {
+		t.Fatalf("materialized active history is not provider-valid: %v; messages=%#v", err, messages)
+	}
+	_, detail := getRawJSON(t, "http://"+process.Addr()+"/sessions/recover-pending-tool")
+	if detail["status"] != "interrupted" || detail["interrupted_turn_id"] != "turn-000123" {
+		t.Fatalf("recovered session detail = %#v, want interrupted status and turn id", detail)
+	}
+}
+
 func TestServeContextCancelUsesImmediateStopSemantics(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "sessions")
 	store := sessions.NewV2Store(root)
@@ -4936,6 +5036,39 @@ func publishServerTestAssistant(request SessionTurnRequest, content string) erro
 			Content: content,
 		},
 	})
+}
+
+func assertProviderValidToolHistory(messages []model.Message) error {
+	pending := map[string]struct{}{}
+	for _, message := range messages {
+		if message.Role != model.MessageRoleTool && len(pending) > 0 {
+			return fmt.Errorf("message role %q appeared before tool results for %v", message.Role, pending)
+		}
+		switch message.Role {
+		case model.MessageRoleAssistant:
+			for _, toolCall := range message.ToolCalls {
+				if strings.TrimSpace(toolCall.ID) == "" {
+					return fmt.Errorf("assistant tool call has empty id")
+				}
+				if _, exists := pending[toolCall.ID]; exists {
+					return fmt.Errorf("assistant tool call %q is duplicated before result", toolCall.ID)
+				}
+				pending[toolCall.ID] = struct{}{}
+			}
+		case model.MessageRoleTool:
+			if strings.TrimSpace(message.ToolCallID) == "" {
+				return fmt.Errorf("tool result has empty tool call id")
+			}
+			if _, exists := pending[message.ToolCallID]; !exists {
+				return fmt.Errorf("tool result %q has no pending assistant tool call", message.ToolCallID)
+			}
+			delete(pending, message.ToolCallID)
+		}
+	}
+	if len(pending) > 0 {
+		return fmt.Errorf("missing tool results for %v", pending)
+	}
+	return nil
 }
 
 type fakeSessionCompactPlanner struct {

@@ -217,7 +217,7 @@ GC, and auto-rerunning interrupted tools.
   `ToolResultReady(IsError=true)`, item → `error`, turn continues, NOT a cleanup case);
   user Esc / `ctx` cancel; server handler error (handler defer publishes
   `TurnInterrupted`).
-- [ ] Verify materializer synthesis (Phase 1) is the safety net: crash →
+- [x] Verify materializer synthesis (Phase 1) is the safety net: crash →
   `MarkRunningTurnsInterrupted` (meta.json only) → resume `MaterializeActiveHistory`
   synthesizes interrupted for pending → `validateActiveHistoryToolExchanges`
   (`cli.go:5511`) passes → provider request is valid.
