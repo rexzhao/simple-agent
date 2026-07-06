@@ -1746,6 +1746,145 @@ func TestSessionSendMessageIncrementalPersistsAndPublishesViaBus(t *testing.T) {
 	}
 }
 
+func TestSessionSendMessageIncrementalReconnectCatchUpAfterMidTurnDisconnect(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "sessions")
+	store := sessions.NewV2Store(root)
+	saveServerTestSession(t, store, "send-incremental-reconnect")
+	releaseRunner := make(chan struct{})
+	runner := fakeIncrementalSessionTurnRunner{
+		run: func(ctx context.Context, request SessionTurnRequest) (SessionTurnResult, error) {
+			select {
+			case <-releaseRunner:
+			case <-ctx.Done():
+				return SessionTurnResult{}, ctx.Err()
+			}
+			assistant := model.Message{
+				Role:    model.MessageRoleAssistant,
+				Content: "assistant needs tool",
+				ToolCalls: []model.ToolCall{{
+					ID:        "call-reconnect",
+					Name:      "read_file",
+					Arguments: `{"path":"SECRET ARGUMENTS"}`,
+				}},
+			}
+			if err := request.Publisher.Publish(eventbus.AssistantReady{TurnID: request.TurnID, Message: assistant}); err != nil {
+				return SessionTurnResult{}, err
+			}
+			if err := request.Publisher.Publish(eventbus.ToolResultReady{TurnID: request.TurnID, Result: model.ToolResult{
+				ToolCallID: "call-reconnect",
+				Name:       "read_file",
+				Content:    "SECRET TOOL RESULT",
+			}}); err != nil {
+				return SessionTurnResult{}, err
+			}
+			return SessionTurnResult{Incremental: true}, nil
+		},
+	}
+	process := startSessionAPIServerWithTurnRunner(t, store, sessions.SessionV2{}, "registry-token", runner)
+	conn := dialSessionStream(t, process, "send-incremental-reconnect")
+	waitForStreamSubscribers(t, process, "send-incremental-reconnect", 1)
+
+	done := make(chan map[string]any, 1)
+	go func() {
+		_, body := postRawJSONStatus(t, "http://"+process.Addr()+"/sessions/send-incremental-reconnect/messages", `{"content":"hello reconnect"}`, "registry-token", http.StatusOK)
+		done <- body
+	}()
+	started := readSessionStreamEvent(t, conn)
+	if started["type"] != "turn.started" {
+		t.Fatalf("first live event = %#v, want turn.started", started)
+	}
+	userAppended := readSessionStreamEvent(t, conn)
+	if userAppended["type"] != "item.appended" {
+		t.Fatalf("second live event = %#v, want persisted input item.appended", userAppended)
+	}
+	afterSeq := int64(userAppended["seq"].(float64))
+	_ = conn.Close()
+	waitForStreamSubscribers(t, process, "send-incremental-reconnect", 0)
+
+	close(releaseRunner)
+	select {
+	case body := <-done:
+		if body["status"] != "committed" || body["last_seq"] == nil {
+			t.Fatalf("send response = %#v, want committed", body)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for reconnect turn to commit")
+	}
+
+	persisted, err := store.PersistedEventsAfter("send-incremental-reconnect", afterSeq)
+	if err != nil {
+		t.Fatalf("PersistedEventsAfter() error = %v", err)
+	}
+	var appended []sessions.PersistedEvent
+	var updated []sessions.PersistedEvent
+	for _, event := range persisted {
+		switch event.Type {
+		case sessions.RecordTypeItemAppended:
+			appended = append(appended, event)
+		case sessions.RecordTypeItemUpdated:
+			updated = append(updated, event)
+		}
+	}
+	if len(appended) != 2 || len(updated) != 1 {
+		t.Fatalf("persisted catch-up events = %#v, want assistant/tool appended and tool updated", persisted)
+	}
+
+	session, err := store.Load("send-incremental-reconnect")
+	if err != nil {
+		t.Fatalf("Load(send-incremental-reconnect) error = %v", err)
+	}
+	if len(session.Items) != 3 {
+		t.Fatalf("len(session.Items) = %d, want user+assistant+tool: %#v", len(session.Items), session.Items)
+	}
+	assistantItem := session.Items[1]
+	toolItem := session.Items[2]
+	if appended[0].ItemID != assistantItem.ID || appended[1].ItemID != toolItem.ID || updated[0].ItemID != toolItem.ID {
+		t.Fatalf("persisted event item ids = appended %#v updated %#v, want assistant %q tool %q", appended, updated, assistantItem.ID, toolItem.ID)
+	}
+	if updated[0].Seq <= toolItem.Seq {
+		t.Fatalf("item.updated seq = %d, want greater than tool birth seq %d", updated[0].Seq, toolItem.Seq)
+	}
+	if toolItem.Status != sessions.ItemStatusCompleted || toolItem.Message == nil || toolItem.Message.Content != "SECRET TOOL RESULT" {
+		t.Fatalf("tool item = %#v, want completed persisted result", toolItem)
+	}
+
+	reconnected := dialSessionStreamWithQuery(t, process, "send-incremental-reconnect", fmt.Sprintf("after_seq=%d", afterSeq))
+	catchUpEvents := []map[string]any{
+		readSessionStreamEvent(t, reconnected),
+		readSessionStreamEvent(t, reconnected),
+		readSessionStreamEvent(t, reconnected),
+	}
+	wantTypes := []string{"item.appended", "item.appended", "item.updated"}
+	wantSeqs := []int64{appended[0].Seq, appended[1].Seq, updated[0].Seq}
+	wantItemIDs := []string{assistantItem.ID, toolItem.ID, toolItem.ID}
+	for i, event := range catchUpEvents {
+		if event["type"] != wantTypes[i] || int64(event["seq"].(float64)) != wantSeqs[i] || event["item_id"] != wantItemIDs[i] {
+			t.Fatalf("catch-up event[%d] = %#v, want %s seq %d item %s", i, event, wantTypes[i], wantSeqs[i], wantItemIDs[i])
+		}
+		raw, err := json.Marshal(event)
+		if err != nil {
+			t.Fatalf("Marshal(catch-up event[%d]) error = %v", i, err)
+		}
+		if bytes.Contains(raw, []byte("SECRET TOOL RESULT")) || bytes.Contains(raw, []byte("SECRET ARGUMENTS")) || bytes.Contains(raw, []byte("text.delta")) {
+			t.Fatalf("catch-up event[%d] leaked transient or sensitive content: %s", i, raw)
+		}
+	}
+	if err := process.PublishSessionEvent("send-incremental-reconnect", NewSessionStreamEvent("text.delta", map[string]any{"turn_id": "turn-live", "text": "live after catch-up"})); err != nil {
+		t.Fatalf("PublishSessionEvent(live sentinel) error = %v", err)
+	}
+	next := readSessionStreamEvent(t, reconnected)
+	if next["type"] != "text.delta" || next["text"] != "live after catch-up" {
+		t.Fatalf("next stream event after catch-up = %#v, want live sentinel with no extra catch-up events queued", next)
+	}
+	messages, err := session.MaterializeActiveHistory()
+	if err != nil {
+		t.Fatalf("MaterializeActiveHistory() error = %v", err)
+	}
+	if len(messages) != 3 || messages[1].Role != model.MessageRoleAssistant || len(messages[1].ToolCalls) != 1 || messages[2].Role != model.MessageRoleTool || messages[2].ToolCallID != "call-reconnect" {
+		t.Fatalf("materialized messages = %#v, want legal reconnected assistant/tool history", messages)
+	}
+}
+
 func TestSessionSendMessageIncrementalPersistsToolErrorAndContinues(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "sessions")
 	store := sessions.NewV2Store(root)
