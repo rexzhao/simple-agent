@@ -260,7 +260,7 @@ GC, and auto-rerunning interrupted tools.
 
 ## Acceptance Points
 
-- [ ] A tool result is on disk with `Status=completed` the instant its tool finishes,
+- [x] A tool result is on disk with `Status=completed` the instant its tool finishes,
   before turn end, on both CLI and server paths. Persistence points = round boundary
   `AssistantReady` + per-result `ToolResultReady`; **not** per-delta, **not** per
   `ToolCallDoneEvent`.
