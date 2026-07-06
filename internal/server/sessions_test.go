@@ -2047,6 +2047,179 @@ func TestSessionSendMessageIncrementalCompactsBeforeTurnViaProjector(t *testing.
 	}
 }
 
+func TestSessionSendMessageIncrementalFailureAfterCompactionKeepsCompactedHistory(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "sessions")
+	store := sessions.NewV2Store(root)
+	saveServerTestSession(t, store, "send-incremental-compact-fail")
+	existingUser := appendServerTestItem(t, store, "send-incremental-compact-fail", sessions.SessionItem{
+		ID:         "existing-user",
+		Kind:       sessions.ItemKindMessage,
+		Visibility: sessions.ItemVisibilityVisible,
+		Audience:   sessions.ItemAudienceUser,
+		Message:    &model.Message{Role: model.MessageRoleUser, Content: "existing prompt secret"},
+	})
+	existingAssistant := appendServerTestItem(t, store, "send-incremental-compact-fail", sessions.SessionItem{
+		ID:         "existing-assistant",
+		Kind:       sessions.ItemKindMessage,
+		Visibility: sessions.ItemVisibilityVisible,
+		Audience:   sessions.ItemAudienceModel,
+		Message:    &model.Message{Role: model.MessageRoleAssistant, Content: "existing answer secret"},
+	})
+	if _, err := store.ReplaceActiveHistory("send-incremental-compact-fail", []string{existingUser.ID, existingAssistant.ID}); err != nil {
+		t.Fatalf("ReplaceActiveHistory() error = %v", err)
+	}
+
+	summaryMessage := model.Message{Role: model.MessageRoleDeveloper, Content: "<compaction_summary>\npost compaction failure summary secret\n</compaction_summary>"}
+	summary := sessions.SessionItem{
+		ID:         "summary-1",
+		Kind:       sessions.ItemKindMessage,
+		Visibility: sessions.ItemVisibilityHidden,
+		Audience:   sessions.ItemAudienceModel,
+		Message:    &summaryMessage,
+	}
+	checkpoint := sessions.CompactionCheckpoint{
+		ID:                    "compact-1",
+		Reason:                "context_limit",
+		Phase:                 "pre_turn",
+		Trigger:               "auto",
+		SummaryItemID:         summary.ID,
+		PreviousActiveHistory: []string{existingUser.ID, existingAssistant.ID},
+		ReplacementHistory:    []string{summary.ID},
+	}
+	runnerCalled := false
+	runner := fakeIncrementalSessionTurnRunner{
+		plan: func(ctx context.Context, request SessionTurnRequest) (SessionCompactionResult, error) {
+			if request.TurnID == "" || request.Content != "after compact failure secret" {
+				t.Fatalf("planner request turn/content = %q/%q, want turn and prompt", request.TurnID, request.Content)
+			}
+			if !reflect.DeepEqual(request.Session.ActiveHistory, []string{existingUser.ID, existingAssistant.ID}) {
+				t.Fatalf("planner ActiveHistory = %#v, want existing active history", request.Session.ActiveHistory)
+			}
+			return SessionCompactionResult{
+				Session: request.Session,
+				Compaction: SessionCompactionPlan{
+					SummaryItem: summary,
+					Checkpoint:  checkpoint,
+				},
+			}, nil
+		},
+		run: func(ctx context.Context, request SessionTurnRequest) (SessionTurnResult, error) {
+			runnerCalled = true
+			if !reflect.DeepEqual(request.Session.ActiveHistory, []string{summary.ID}) {
+				t.Fatalf("runner ActiveHistory = %#v, want compacted history before user prompt snapshot", request.Session.ActiveHistory)
+			}
+			return SessionTurnResult{}, context.Canceled
+		},
+	}
+	process := startSessionAPIServerWithTurnRunner(t, store, sessions.SessionV2{}, "registry-token", runner)
+	conn := dialSessionStream(t, process, "send-incremental-compact-fail")
+	waitForStreamSubscribers(t, process, "send-incremental-compact-fail", 1)
+
+	raw, body := postRawJSONStatus(t, "http://"+process.Addr()+"/sessions/send-incremental-compact-fail/messages", `{"content":"after compact failure secret"}`, "registry-token", http.StatusInternalServerError)
+	assertErrorCode(t, body, "turn_failed")
+	if !runnerCalled {
+		t.Fatal("runner was not called after compaction and turn input")
+	}
+	for _, forbidden := range []string{"after compact failure secret", "post compaction failure summary secret", "existing prompt secret", "existing answer secret", "registry-token"} {
+		if bytes.Contains(raw, []byte(forbidden)) {
+			t.Fatalf("post-compaction failure response leaked %q: %s", forbidden, raw)
+		}
+	}
+
+	events := make([]map[string]any, 0, 6)
+	for len(events) < 6 {
+		events = append(events, readSessionStreamEvent(t, conn))
+	}
+	wantTypes := []string{
+		"turn.started",
+		"item.appended",
+		"compaction.created",
+		"active_history.replaced",
+		"item.appended",
+		"turn.failed",
+	}
+	for i, want := range wantTypes {
+		if events[i]["type"] != want {
+			t.Fatalf("event[%d] type = %#v, want %q; events=%#v", i, events[i]["type"], want, events)
+		}
+	}
+	if events[1]["item_id"] != summary.ID {
+		t.Fatalf("summary event = %#v, want summary item appended", events[1])
+	}
+	if events[2]["compaction_id"] != checkpoint.ID {
+		t.Fatalf("compaction event = %#v, want compact-1", events[2])
+	}
+	if events[5]["message"] != "turn failed" {
+		t.Fatalf("turn.failed message = %#v, want sanitized failure", events[5]["message"])
+	}
+	turnID, ok := events[0]["turn_id"].(string)
+	if !ok || turnID == "" {
+		t.Fatalf("turn.started event = %#v, want turn id", events[0])
+	}
+	for i, event := range events {
+		raw, err := json.Marshal(event)
+		if err != nil {
+			t.Fatalf("Marshal(event[%d]) error = %v", i, err)
+		}
+		for _, forbidden := range []string{"after compact failure secret", "post compaction failure summary secret", "existing prompt secret", "existing answer secret"} {
+			if bytes.Contains(raw, []byte(forbidden)) {
+				t.Fatalf("event[%d] leaked %q: %s", i, forbidden, raw)
+			}
+		}
+	}
+
+	session, err := store.Load("send-incremental-compact-fail")
+	if err != nil {
+		t.Fatalf("Load(send-incremental-compact-fail) error = %v", err)
+	}
+	if session.RunningTurnID != "" || session.InterruptedTurnID != turnID || session.InterruptedAt.IsZero() {
+		t.Fatalf("turn metadata = running %q interrupted %q at %s, want interrupted %s", session.RunningTurnID, session.InterruptedTurnID, session.InterruptedAt, turnID)
+	}
+	if len(session.Compactions) != 1 || session.Compactions[0].ID != checkpoint.ID {
+		t.Fatalf("Compactions = %#v, want compact-1", session.Compactions)
+	}
+	if len(session.Items) != 4 {
+		t.Fatalf("len(session.Items) = %d, want existing+summary+user without assistant/tool turn items: %#v", len(session.Items), session.Items)
+	}
+	if session.Items[0].ID != existingUser.ID || session.Items[1].ID != existingAssistant.ID || session.Items[2].ID != summary.ID {
+		t.Fatalf("ledger prefix = %#v, want existing items plus summary", session.Items[:3])
+	}
+	userItem := session.Items[3]
+	if userItem.Message == nil || userItem.Message.Role != model.MessageRoleUser || userItem.Message.Content != "after compact failure secret" {
+		t.Fatalf("user item = %#v, want persisted post-compaction prompt", userItem)
+	}
+	if events[4]["item_id"] != userItem.ID {
+		t.Fatalf("user item.appended event = %#v, want user item id %q", events[4], userItem.ID)
+	}
+	for _, item := range session.Items {
+		if item.TurnID == turnID && item.Message != nil && item.Message.Role != model.MessageRoleUser {
+			t.Fatalf("unexpected non-user turn item after post-compaction failure: %#v", item)
+		}
+		if item.Status == sessions.ItemStatusPending {
+			t.Fatalf("unexpected pending item after post-compaction failure: %#v", item)
+		}
+	}
+	if !reflect.DeepEqual(session.ActiveHistory, []string{summary.ID, userItem.ID}) {
+		t.Fatalf("ActiveHistory = %#v, want compacted summary plus user prompt", session.ActiveHistory)
+	}
+	messages, err := session.MaterializeActiveHistory()
+	if err != nil {
+		t.Fatalf("MaterializeActiveHistory() error = %v", err)
+	}
+	if len(messages) != 2 || messages[0].Role != model.MessageRoleDeveloper || messages[0].Content != summaryMessage.Content || messages[1].Role != model.MessageRoleUser || messages[1].Content != "after compact failure secret" {
+		t.Fatalf("materialized messages = %#v, want compacted summary plus user prompt", messages)
+	}
+	persisted, err := store.PersistedEventsAfter("send-incremental-compact-fail", 0)
+	if err != nil {
+		t.Fatalf("PersistedEventsAfter() error = %v", err)
+	}
+	for _, event := range persisted {
+		if event.Type == sessions.RecordTypeItemUpdated {
+			t.Fatalf("unexpected item.updated event without pending tools: %#v", persisted)
+		}
+	}
+}
+
 func TestSessionSendMessageIncrementalCancelAfterInputPersistsUserPrompt(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "sessions")
 	store := sessions.NewV2Store(root)
