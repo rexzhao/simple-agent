@@ -72,6 +72,75 @@ func TestBusPublishTransientBypassesHandler(t *testing.T) {
 	assertReceived(t, sub, event)
 }
 
+func TestBusLosslessSubscriptionDoesNotDropTransientEvents(t *testing.T) {
+	const eventCount = defaultSubscriberBuffer + 32
+
+	bus := NewBus(nil)
+	defer bus.Close()
+
+	sub := bus.SubscribeLossless(1)
+	published := make(chan error, 1)
+	go func() {
+		for i := 0; i < eventCount; i++ {
+			if err := bus.Publish(ModelEvent{Event: model.TextDeltaEvent{Text: "x"}}); err != nil {
+				published <- err
+				return
+			}
+		}
+		published <- nil
+	}()
+
+	for i := 0; i < eventCount; i++ {
+		select {
+		case got := <-sub:
+			if _, ok := got.(ModelEvent); !ok {
+				t.Fatalf("event %d = %T, want ModelEvent", i, got)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("timed out waiting for event %d", i)
+		}
+	}
+	if err := <-published; err != nil {
+		t.Fatalf("Publish() error = %v", err)
+	}
+}
+
+func TestBusCloseUnblocksLosslessPublish(t *testing.T) {
+	bus := NewBus(nil)
+	sub := bus.SubscribeLossless(1)
+	if err := bus.Publish(ModelEvent{Event: model.TextDeltaEvent{Text: "first"}}); err != nil {
+		t.Fatalf("Publish(first) error = %v", err)
+	}
+
+	attempting := make(chan struct{})
+	published := make(chan error, 1)
+	go func() {
+		close(attempting)
+		published <- bus.Publish(ModelEvent{Event: model.TextDeltaEvent{Text: "blocked"}})
+	}()
+	<-attempting
+	select {
+	case err := <-published:
+		t.Fatalf("Publish(blocked) returned before Close with error %v", err)
+	default:
+	}
+
+	bus.Close()
+	select {
+	case err := <-published:
+		if !errors.Is(err, ErrClosed) {
+			t.Fatalf("Publish(blocked) error = %v, want %v", err, ErrClosed)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Publish(blocked) did not unblock after Close")
+	}
+
+	<-sub
+	if _, ok := <-sub; ok {
+		t.Fatal("subscription remained open after Close")
+	}
+}
+
 func TestBusClose(t *testing.T) {
 	bus := NewBus(func(Event) error { return nil })
 	sub := bus.Subscribe()

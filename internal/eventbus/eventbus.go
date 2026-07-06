@@ -50,15 +50,22 @@ type Bus struct {
 	handler DurableHandler
 
 	durableMu sync.Mutex
+	closeOnce sync.Once
 	mu        sync.RWMutex
 	closed    bool
-	subs      map[chan Event]struct{}
+	done      chan struct{}
+	subs      map[chan Event]subscriber
+}
+
+type subscriber struct {
+	lossless bool
 }
 
 func NewBus(handler DurableHandler) *Bus {
 	return &Bus{
 		handler: handler,
-		subs:    make(map[chan Event]struct{}),
+		done:    make(chan struct{}),
+		subs:    make(map[chan Event]subscriber),
 	}
 }
 
@@ -76,31 +83,53 @@ func (b *Bus) Publish(event Event) error {
 }
 
 func (b *Bus) Subscribe() <-chan Event {
-	ch := make(chan Event, defaultSubscriberBuffer)
+	return b.subscribe(defaultSubscriberBuffer, false)
+}
+
+func (b *Bus) SubscribeLossless(buffer int) <-chan Event {
+	if buffer <= 0 {
+		buffer = defaultSubscriberBuffer
+	}
+	return b.subscribe(buffer, true)
+}
+
+func (b *Bus) subscribe(buffer int, lossless bool) <-chan Event {
+	if buffer < 0 {
+		buffer = 0
+	}
+	ch := make(chan Event, buffer)
+	if b.isDone() {
+		close(ch)
+		return ch
+	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if b.closed {
 		close(ch)
 		return ch
 	}
-	b.subs[ch] = struct{}{}
+	b.subs[ch] = subscriber{lossless: lossless}
 	return ch
 }
 
 func (b *Bus) Close() {
-	b.durableMu.Lock()
-	defer b.durableMu.Unlock()
+	b.closeOnce.Do(func() {
+		close(b.done)
 
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	if b.closed {
-		return
-	}
-	b.closed = true
-	for ch := range b.subs {
-		close(ch)
-		delete(b.subs, ch)
-	}
+		b.durableMu.Lock()
+		defer b.durableMu.Unlock()
+
+		b.mu.Lock()
+		defer b.mu.Unlock()
+		if b.closed {
+			return
+		}
+		b.closed = true
+		for ch := range b.subs {
+			close(ch)
+			delete(b.subs, ch)
+		}
+	})
 }
 
 func (b *Bus) publishDurable(event Event) error {
@@ -120,14 +149,27 @@ func (b *Bus) publishDurable(event Event) error {
 }
 
 func (b *Bus) fanout(event Event) error {
+	if b.isDone() {
+		return ErrClosed
+	}
 	b.mu.RLock()
 	defer b.mu.RUnlock()
 	if b.closed {
 		return ErrClosed
 	}
-	for ch := range b.subs {
+	for ch, sub := range b.subs {
+		if sub.lossless {
+			select {
+			case ch <- event:
+			case <-b.done:
+				return ErrClosed
+			}
+			continue
+		}
 		select {
 		case ch <- event:
+		case <-b.done:
+			return ErrClosed
 		default:
 		}
 	}
@@ -135,12 +177,24 @@ func (b *Bus) fanout(event Event) error {
 }
 
 func (b *Bus) ensureOpen() error {
+	if b.isDone() {
+		return ErrClosed
+	}
 	b.mu.RLock()
 	defer b.mu.RUnlock()
 	if b.closed {
 		return ErrClosed
 	}
 	return nil
+}
+
+func (b *Bus) isDone() bool {
+	select {
+	case <-b.done:
+		return true
+	default:
+		return false
+	}
 }
 
 type TurnStarted struct {

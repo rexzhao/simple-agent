@@ -23,6 +23,7 @@ import (
 	"github.com/rexzhao/simple-agent/internal/config"
 	projectcontext "github.com/rexzhao/simple-agent/internal/context"
 	"github.com/rexzhao/simple-agent/internal/contextwindow"
+	"github.com/rexzhao/simple-agent/internal/eventbus"
 	eventlog "github.com/rexzhao/simple-agent/internal/logging"
 	"github.com/rexzhao/simple-agent/internal/mcp"
 	"github.com/rexzhao/simple-agent/internal/model"
@@ -4270,7 +4271,7 @@ func runChatMessagesInTurnWithEventHook(ctx, turnCtx context.Context, runtime *a
 		Tools:      runtime.toolSchemas,
 		Parameters: runtime.parameters,
 	}
-	events, results, err := agent.StreamWithResult(turnCtx, request, agent.Options{
+	agentEvents, results, err := agent.StreamWithResult(turnCtx, request, agent.Options{
 		Provider:     runtime.provider,
 		ToolExecutor: runtime.toolExecutor,
 		MaxTurns:     runtime.maxTurns,
@@ -4278,6 +4279,11 @@ func runChatMessagesInTurnWithEventHook(ctx, turnCtx context.Context, runtime *a
 	if err != nil {
 		return nil, newRecoverableTurnError(err)
 	}
+	renderBus := eventbus.NewBus(nil)
+	defer renderBus.Close()
+	bridgeCtx := context.Background()
+	events := modelEventsFromBus(bridgeCtx, renderBus.SubscribeLossless(0))
+	_ = publishModelEventsToBus(bridgeCtx, renderBus, agentEvents, renderBus.Close)
 
 	tracker := &chatOutputWriter{w: stdout}
 	if err := writeStreamWithOptions(tracker, stderr, events, runtime.showReasoning, runtime.logger, streamOutputOptions{
@@ -4310,6 +4316,60 @@ func runChatMessagesInTurnWithEventHook(ctx, turnCtx context.Context, runtime *a
 		}
 	}
 	return result.Messages, nil
+}
+
+func publishModelEventsToBus(ctx context.Context, publisher eventbus.Publisher, events <-chan model.Event, closeFn func()) <-chan struct{} {
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		if closeFn != nil {
+			defer closeFn()
+		}
+		if publisher == nil {
+			return
+		}
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case event, ok := <-events:
+				if !ok {
+					return
+				}
+				if err := publisher.Publish(eventbus.ModelEvent{Event: event}); err != nil {
+					return
+				}
+			}
+		}
+	}()
+	return done
+}
+
+func modelEventsFromBus(ctx context.Context, events <-chan eventbus.Event) <-chan model.Event {
+	out := make(chan model.Event)
+	go func() {
+		defer close(out)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case event, ok := <-events:
+				if !ok {
+					return
+				}
+				modelEvent, ok := event.(eventbus.ModelEvent)
+				if !ok || modelEvent.Event == nil {
+					continue
+				}
+				select {
+				case out <- modelEvent.Event:
+				case <-ctx.Done():
+					return
+				}
+			}
+		}
+	}()
+	return out
 }
 
 func forwardTurnInterrupts(ctx context.Context, cancel context.CancelFunc, interrupts <-chan struct{}) func() {

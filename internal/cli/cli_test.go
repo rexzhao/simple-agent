@@ -23,6 +23,7 @@ import (
 
 	"github.com/gorilla/websocket"
 	"github.com/rexzhao/simple-agent/internal/contextwindow"
+	"github.com/rexzhao/simple-agent/internal/eventbus"
 	"github.com/rexzhao/simple-agent/internal/model"
 	projectstore "github.com/rexzhao/simple-agent/internal/projects"
 	localserver "github.com/rexzhao/simple-agent/internal/server"
@@ -14160,6 +14161,71 @@ func TestRunReasoningIsHiddenUnlessShowReasoningIsSet(t *testing.T) {
 			t.Fatalf("stdout = %q, want %q", got, want)
 		}
 	})
+}
+
+func TestModelEventsFromBusForwardsOnlyModelEvents(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	bus := eventbus.NewBus(func(eventbus.Event) error { return nil })
+	sub := bus.SubscribeLossless(4)
+	if err := bus.Publish(eventbus.TurnStarted{TurnID: "turn-1"}); err != nil {
+		t.Fatalf("Publish(TurnStarted) error = %v", err)
+	}
+	if err := bus.Publish(eventbus.ModelEvent{Event: model.TextDeltaEvent{Text: "hello"}}); err != nil {
+		t.Fatalf("Publish(ModelEvent) error = %v", err)
+	}
+	bus.Close()
+
+	var got []model.Event
+	for event := range modelEventsFromBus(ctx, sub) {
+		got = append(got, event)
+	}
+	if len(got) != 1 {
+		t.Fatalf("len(model events) = %d, want 1: %#v", len(got), got)
+	}
+	text, ok := got[0].(model.TextDeltaEvent)
+	if !ok || text.Text != "hello" {
+		t.Fatalf("model event = %#v, want text delta hello", got[0])
+	}
+}
+
+func TestModelEventBusBridgeRendersAllEventsAndCloses(t *testing.T) {
+	const eventCount = 96
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	bus := eventbus.NewBus(nil)
+	defer bus.Close()
+	source := make(chan model.Event)
+	pumpDone := publishModelEventsToBus(ctx, bus, source, bus.Close)
+	events := modelEventsFromBus(ctx, bus.SubscribeLossless(1))
+	go func() {
+		defer close(source)
+		for i := 0; i < eventCount; i++ {
+			source <- model.TextDeltaEvent{Text: fmt.Sprintf("%02d,", i)}
+		}
+	}()
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	if err := writeStreamWithOptions(&stdout, &stderr, events, false, nil, streamOutputOptions{}); err != nil {
+		t.Fatalf("writeStreamWithOptions() error = %v", err)
+	}
+	select {
+	case <-pumpDone:
+	case <-time.After(time.Second):
+		t.Fatal("event pump did not stop after source close")
+	}
+	var want strings.Builder
+	for i := 0; i < eventCount; i++ {
+		fmt.Fprintf(&want, "%02d,", i)
+	}
+	if got := stdout.String(); got != want.String() {
+		t.Fatalf("stdout = %q, want %q", got, want.String())
+	}
+	if stderr.String() != "" {
+		t.Fatalf("stderr = %q, want empty", stderr.String())
+	}
 }
 
 func TestWriteStreamDoesNotColorReasoningForBufferOutput(t *testing.T) {
