@@ -145,7 +145,7 @@ GC, and auto-rerunning interrupted tools.
 
 ## Phase 4 — Server path + catch-up
 
-- [ ] Server assembly: `serverAgentTurnRunner` (`cli.go:5889`) injects publisher;
+- [x] Server assembly: `serverAgentTurnRunner` (`cli.go:5889`) injects publisher;
   projector writes storage (replaces `runtime.saveSessions=false` + end-of-turn
   `SaveTurn`).
 - [x] WebSocket: clients subscribe to the **existing process-level stream hub** (by
