@@ -6610,7 +6610,7 @@ func TestChatSaveSessionFlagWritesFullToolHistory(t *testing.T) {
 	}
 }
 
-func TestChatSaveSessionWithCompactionEnabledKeepsOldTurnSavePath(t *testing.T) {
+func TestChatSaveSessionWithCompactionEnabledUsesProjectorPath(t *testing.T) {
 	server, requests := newSequentialCLIRunServer(t,
 		[]string{
 			`{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"read_file","arguments":"{\"path\":\"note.txt\"}"}}]}}]}`,
@@ -6657,17 +6657,21 @@ func TestChatSaveSessionWithCompactionEnabledKeepsOldTurnSavePath(t *testing.T) 
 	if len(toolItems) != 1 {
 		t.Fatalf("tool item count = %d, want 1: %#v", len(toolItems), session.Items)
 	}
-	if toolItems[0].Status != "" {
-		t.Fatalf("tool item status = %q, want old path empty status", toolItems[0].Status)
+	if toolItems[0].Status != sessions.ItemStatusCompleted {
+		t.Fatalf("tool item status = %q, want completed projector status", toolItems[0].Status)
 	}
 	events, err := sessions.NewV2Store(root).PersistedEventsAfter(session.ID, 0)
 	if err != nil {
 		t.Fatalf("PersistedEventsAfter() error = %v", err)
 	}
+	var updatedEvents int
 	for _, event := range events {
-		if event.Type == sessions.RecordTypeItemUpdated {
-			t.Fatalf("unexpected item.updated event on compaction-enabled old path: %#v", events)
+		if event.Type == sessions.RecordTypeItemUpdated && event.ItemID == toolItems[0].ID {
+			updatedEvents++
 		}
+	}
+	if updatedEvents != 1 {
+		t.Fatalf("tool item.updated events = %d, want 1: %#v", updatedEvents, events)
 	}
 }
 
@@ -7576,7 +7580,8 @@ func TestChatAutoCompactTriggersBeforeMainModelWhenThresholdExceeded(t *testing.
 	assertMessage(t, secondMessages, 4, "user", "second")
 	assertCLIToolNames(t, secondRequest.Body, []string{"read_file"})
 
-	session := loadOnlyCLISession(t, filepath.Join(configDir, "sessions"))
+	sessionRoot := filepath.Join(configDir, "sessions")
+	session := loadOnlyCLISession(t, sessionRoot)
 	if len(session.Compactions) != 1 {
 		t.Fatalf("len(Compactions) = %d, want 1: %#v", len(session.Compactions), session.Compactions)
 	}
@@ -7594,6 +7599,25 @@ func TestChatAutoCompactTriggersBeforeMainModelWhenThresholdExceeded(t *testing.
 	assertSavedMessageContentContains(t, active, 3, model.MessageRoleDeveloper, "<compaction_summary>")
 	assertSavedMessage(t, active, 4, model.MessageRoleUser, "second")
 	assertSavedMessage(t, active, 5, model.MessageRoleAssistant, "two")
+
+	events, err := sessions.NewV2Store(sessionRoot).PersistedEventsAfter(session.ID, 0)
+	if err != nil {
+		t.Fatalf("PersistedEventsAfter() error = %v", err)
+	}
+	var compactionSeq int64
+	for _, event := range events {
+		if event.Type == sessions.RecordTypeCompactionCreated && event.CompactionID == checkpoint.ID {
+			compactionSeq = event.Seq
+			break
+		}
+	}
+	if compactionSeq == 0 {
+		t.Fatalf("compaction.created event for %q not found: %#v", checkpoint.ID, events)
+	}
+	secondItem := sessionItemWithExactContent(t, session, "second")
+	if secondItem.Seq <= compactionSeq {
+		t.Fatalf("second user item seq = %d, want after compaction seq %d", secondItem.Seq, compactionSeq)
+	}
 }
 
 func TestChatAutoCompactDoesNotTriggerBelowThreshold(t *testing.T) {
@@ -15267,6 +15291,18 @@ func sessionContainsExactMessageContent(session sessions.SessionV2, content stri
 		}
 	}
 	return false
+}
+
+func sessionItemWithExactContent(t *testing.T, session sessions.SessionV2, content string) sessions.SessionItem {
+	t.Helper()
+
+	for _, item := range session.Items {
+		if item.Message != nil && item.Message.Content == content {
+			return item
+		}
+	}
+	t.Fatalf("session item with content %q not found in %#v", content, session.Items)
+	return sessions.SessionItem{}
 }
 
 func writeCLISession(t *testing.T, root string, session sessions.Session) {

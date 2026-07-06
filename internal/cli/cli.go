@@ -4353,7 +4353,7 @@ func shouldRunChatTurnWithSessionProjector(runtime *agentRuntime) bool {
 	if runtime == nil || !runtime.saveSessions || runtime.resumableSessionStore == nil {
 		return false
 	}
-	return runtime.config == nil || !runtime.config.Compaction.Enabled
+	return true
 }
 
 func runChatTurnWithSessionProjector(ctx, turnCtx context.Context, runtime *agentRuntime, messages []model.Message, prompt string, stdout, stderr io.Writer, addTrailingNewline bool, stderrNeedsLeadingBreak bool) ([]model.Message, error) {
@@ -4384,6 +4384,21 @@ func runChatTurnWithSessionProjector(ctx, turnCtx context.Context, runtime *agen
 		return nil, err
 	}
 	turnStarted = true
+
+	plannedMessages, compaction, err := runtime.planAutoCompactBeforeTurn(turnCtx, messages, prompt)
+	if err != nil {
+		return nil, newRecoverableTurnError(err)
+	}
+	if compaction != nil {
+		if err := bus.Publish(eventbus.CompactionRequested{
+			TurnID:     turnID,
+			Summary:    compaction.summaryItem,
+			Checkpoint: compaction.checkpoint,
+		}); err != nil {
+			return nil, newRecoverableTurnError(err)
+		}
+		messages = plannedMessages
+	}
 
 	userMessage := model.Message{
 		Role:    model.MessageRoleUser,
@@ -4847,6 +4862,13 @@ func (r *agentRuntime) autoCompactBeforeTurn(ctx context.Context, messages []mod
 	if !r.saveSessions || r.resumableSessionStore == nil || strings.TrimSpace(r.resumableSession.ID) == "" {
 		return messages, nil
 	}
+	compactable, err := hasCompleteVisibleTurn(r.resumableSession)
+	if err != nil {
+		return nil, err
+	}
+	if !compactable {
+		return messages, nil
+	}
 	contextWindow := 0
 	if r.contextTracker != nil {
 		contextWindow = r.contextTracker.Metadata().ContextWindow
@@ -4888,6 +4910,13 @@ func (r *agentRuntime) planAutoCompactBeforeTurn(ctx context.Context, messages [
 		return messages, nil, nil
 	}
 	if !r.saveSessions || strings.TrimSpace(r.resumableSession.ID) == "" {
+		return messages, nil, nil
+	}
+	compactable, err := hasCompleteVisibleTurn(r.resumableSession)
+	if err != nil {
+		return nil, nil, err
+	}
+	if !compactable {
 		return messages, nil, nil
 	}
 	contextWindow := 0
@@ -5298,6 +5327,20 @@ func recentCompleteVisibleTurns(activeItems []sessions.SessionItem, limit int) [
 		}
 	}
 	return selected
+}
+
+func hasCompleteVisibleTurn(session sessions.SessionV2) (bool, error) {
+	activeItems, err := activeHistoryItems(session)
+	if err != nil {
+		return false, err
+	}
+	_, groups := splitCompactionInputItems(activeItems)
+	for _, group := range groups {
+		if visibleTurnIsComplete(group) {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func visibleTurnIsComplete(items []sessions.SessionItem) bool {
