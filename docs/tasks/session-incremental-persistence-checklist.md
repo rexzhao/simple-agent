@@ -107,7 +107,7 @@ GC, and auto-rerunning interrupted tools.
   state (`LastSeq`/`Items`/`ActiveHistory`) is refreshed before `TurnInputReady`** (a
   following write does not collide on `LastSeq` or target the pre-compaction
   `ActiveHistory`).
-- [ ] **Session-level single-writer test**: two concurrent turns on the **same**
+- [x] **Session-level single-writer test**: two concurrent turns on the **same**
   session → the second is rejected/serialized by the session turn lock (server:
   `beginSessionTurn` returns `beginTurnBusy`), never two projectors writing
   concurrently. (Distinct from the within-one-bus concurrency test above, which does
