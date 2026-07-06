@@ -1269,6 +1269,139 @@ func TestV2StoreSaveCompactedTurnCommitsCompactionAndTurnTransaction(t *testing.
 	}
 }
 
+func TestV2StoreLegacyNoStatusSessionLoadsMaterializesAndCompacts(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "sessions")
+	store := NewV2Store(root)
+
+	session, err := store.SaveMetadata(SessionV2{
+		ID:              "legacy-no-status",
+		Provider:        "fake",
+		ModelProfile:    "default",
+		ModelID:         "model-default",
+		SaveToolResults: true,
+	})
+	if err != nil {
+		t.Fatalf("SaveMetadata() error = %v", err)
+	}
+	legacyIDs := []string{"legacy-user", "legacy-assistant-tool", "legacy-tool", "legacy-final"}
+	if _, err := store.AppendItemsAndReplaceActiveHistory(session.ID, []SessionItem{
+		{
+			ID:         "legacy-user",
+			Kind:       ItemKindMessage,
+			Visibility: ItemVisibilityVisible,
+			Audience:   ItemAudienceUser,
+			Message:    &model.Message{Role: model.MessageRoleUser, Content: "legacy prompt"},
+		},
+		{
+			ID:         "legacy-assistant-tool",
+			Kind:       ItemKindMessage,
+			Visibility: ItemVisibilityVisible,
+			Audience:   ItemAudienceModel,
+			Message: &model.Message{
+				Role:    model.MessageRoleAssistant,
+				Content: "legacy assistant needs tool",
+				ToolCalls: []model.ToolCall{{
+					ID:        "call-legacy",
+					Name:      "read_file",
+					Arguments: `{"path":"legacy.txt"}`,
+				}},
+			},
+		},
+		{
+			ID:         "legacy-tool",
+			Kind:       ItemKindMessage,
+			Visibility: ItemVisibilityVisible,
+			Audience:   ItemAudienceModel,
+			Message:    &model.Message{Role: model.MessageRoleTool, ToolCallID: "call-legacy", Content: "legacy tool output"},
+		},
+		{
+			ID:         "legacy-final",
+			Kind:       ItemKindMessage,
+			Visibility: ItemVisibilityVisible,
+			Audience:   ItemAudienceModel,
+			Message:    &model.Message{Role: model.MessageRoleAssistant, Content: "legacy final"},
+		},
+	}, legacyIDs); err != nil {
+		t.Fatalf("AppendItemsAndReplaceActiveHistory() error = %v", err)
+	}
+
+	raw, err := os.ReadFile(filepath.Join(root, "legacy-no-status", "segments", "000001.jsonl"))
+	if err != nil {
+		t.Fatalf("ReadFile(legacy segment) error = %v", err)
+	}
+	if bytes.Contains(raw, []byte(`"status"`)) || bytes.Contains(raw, []byte(RecordTypeItemUpdated)) {
+		t.Fatalf("legacy segment contains new status/update records: %s", raw)
+	}
+
+	loaded, err := store.Load("legacy-no-status")
+	if err != nil {
+		t.Fatalf("Load(legacy-no-status) error = %v", err)
+	}
+	messages, err := loaded.MaterializeActiveHistory()
+	if err != nil {
+		t.Fatalf("MaterializeActiveHistory(legacy) error = %v", err)
+	}
+	if got := messageContents(messages); !reflect.DeepEqual(got, []string{"legacy prompt", "legacy assistant needs tool", "legacy tool output", "legacy final"}) {
+		t.Fatalf("legacy materialized messages = %#v, want original active history", got)
+	}
+	if len(messages) != 4 || messages[2].Role != model.MessageRoleTool || messages[2].ToolCallID != "call-legacy" || messages[2].IsError {
+		t.Fatalf("legacy tool materialized as %#v, want completed non-error tool result", messages)
+	}
+
+	summary := SessionItem{
+		ID:         "summary-legacy",
+		Kind:       ItemKindMessage,
+		Visibility: ItemVisibilityHidden,
+		Audience:   ItemAudienceModel,
+		Message:    &model.Message{Role: model.MessageRoleDeveloper, Content: "legacy summary"},
+	}
+	checkpoint := CompactionCheckpoint{
+		ID:                    "compact-legacy",
+		Reason:                "context_limit",
+		Phase:                 "pre_turn",
+		Trigger:               "auto",
+		SummaryItemID:         "summary-legacy",
+		PreviousActiveHistory: legacyIDs,
+		ReplacementHistory:    []string{"summary-legacy", "legacy-final"},
+	}
+	compacted, err := store.SaveCompactedTurn(loaded, summary, checkpoint, nil, []string{"summary-legacy", "legacy-final"})
+	if err != nil {
+		t.Fatalf("SaveCompactedTurn(legacy) error = %v", err)
+	}
+	if got := itemIDs(compacted.Items); !reflect.DeepEqual(got, []string{"legacy-user", "legacy-assistant-tool", "legacy-tool", "legacy-final", "summary-legacy"}) {
+		t.Fatalf("compacted item IDs = %#v, want original legacy items plus summary", got)
+	}
+	var legacyTool SessionItem
+	for _, item := range compacted.Items {
+		if item.ID == "legacy-tool" {
+			legacyTool = item
+			break
+		}
+	}
+	if legacyTool.ID == "" {
+		t.Fatal("legacy tool item missing after compaction")
+	}
+	if legacyTool.Status != "" {
+		t.Fatalf("legacy tool status = %q, want empty legacy status preserved", legacyTool.Status)
+	}
+	events, err := store.PersistedEventsAfter("legacy-no-status", 0)
+	if err != nil {
+		t.Fatalf("PersistedEventsAfter(legacy) error = %v", err)
+	}
+	for _, event := range events {
+		if event.Type == RecordTypeItemUpdated {
+			t.Fatalf("legacy compaction wrote unexpected item.updated event: %#v", events)
+		}
+	}
+	compactedMessages, err := compacted.MaterializeActiveHistory()
+	if err != nil {
+		t.Fatalf("MaterializeActiveHistory(compacted legacy) error = %v", err)
+	}
+	if got := messageContents(compactedMessages); !reflect.DeepEqual(got, []string{"legacy summary", "legacy final"}) {
+		t.Fatalf("compacted legacy messages = %#v, want summary plus retained final", got)
+	}
+}
+
 func TestV2StoreAppendCompactionCheckpointValidatesCheckpointWrite(t *testing.T) {
 	baseSummary := SessionItem{
 		ID:         "summary-1",

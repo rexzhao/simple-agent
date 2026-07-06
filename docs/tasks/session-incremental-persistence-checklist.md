@@ -240,7 +240,7 @@ GC, and auto-rerunning interrupted tools.
   status; mid-turn kill verifies resume.
 - [ ] active_history legality: `validateActiveHistoryToolExchanges` passes after every
   hook point.
-- [ ] Regression: legacy sessions (no Status / no updated records) load/resume/compact
+- [x] Regression: legacy sessions (no Status / no updated records) load/resume/compact
   unchanged; `SaveCompactedTurn` path still works.
 - [ ] Performance: durable `Publish` serializes disk IO into the tool-execution path
   (each tool result waits on `UpdateItem`). Since `UpdateItem`/`AppendItemsAndReplaceActiveHistory`
@@ -305,7 +305,7 @@ GC, and auto-rerunning interrupted tools.
 - [x] Test covers the user-cancel window: Esc after `TurnInputReady` persisted but
   before the first `AssistantReady` → user prompt on disk, no pending tools, legal
   history, no running turn, resume continuable.
-- [ ] Legacy sessions (no `Status`, no `item.updated`) load/resume/compact correctly
+- [x] Legacy sessions (no `Status`, no `item.updated`) load/resume/compact correctly
   under the new code.
 - [ ] Persistence has a single path (projector); CLI and server no longer maintain
   separate `sessionSavePlan` write branches.
