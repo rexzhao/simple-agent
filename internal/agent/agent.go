@@ -8,6 +8,7 @@ import (
 	"io"
 	"strings"
 
+	"github.com/rexzhao/simple-agent/internal/eventbus"
 	"github.com/rexzhao/simple-agent/internal/model"
 )
 
@@ -21,6 +22,8 @@ type Options struct {
 	Provider     model.Provider
 	ToolExecutor ToolExecutor
 	MaxTurns     int
+	TurnID       string
+	Publisher    eventbus.Publisher
 }
 
 type TurnResult struct {
@@ -61,6 +64,12 @@ func run(ctx context.Context, request model.Request, options Options, maxTurns i
 		defer close(results)
 	}
 
+	turnID := strings.TrimSpace(options.TurnID)
+	if options.Publisher != nil && turnID == "" {
+		events <- model.ErrorEvent{Err: fmt.Errorf("agent turn id is required when publisher is configured"), Message: "persist turn"}
+		return
+	}
+
 	messages := append([]model.Message(nil), request.Messages...)
 	enabledTools := enabledToolNames(request.Tools)
 
@@ -72,11 +81,15 @@ func run(ctx context.Context, request model.Request, options Options, maxTurns i
 			return
 		}
 
-		messages = append(messages, model.Message{
+		assistantMessage := model.Message{
 			Role:      model.MessageRoleAssistant,
 			Content:   assistantContent,
 			ToolCalls: toolCalls,
-		})
+		}
+		if !publishDurable(events, options.Publisher, eventbus.AssistantReady{TurnID: turnID, Message: assistantMessage}, "persist assistant") {
+			return
+		}
+		messages = append(messages, assistantMessage)
 		if len(toolCalls) == 0 {
 			sendResult(results, messages)
 			return
@@ -84,6 +97,9 @@ func run(ctx context.Context, request model.Request, options Options, maxTurns i
 
 		for _, toolCall := range toolCalls {
 			result := executeToolCall(ctx, options.ToolExecutor, enabledTools, toolCall)
+			if !publishDurable(events, options.Publisher, eventbus.ToolResultReady{TurnID: turnID, Result: result}, "persist tool result") {
+				return
+			}
 			events <- model.ToolResultEvent{Result: result}
 			messages = append(messages, model.Message{
 				Role:       model.MessageRoleTool,
@@ -100,6 +116,17 @@ func run(ctx context.Context, request model.Request, options Options, maxTurns i
 			return
 		}
 	}
+}
+
+func publishDurable(out chan<- model.Event, publisher eventbus.Publisher, event eventbus.Event, message string) bool {
+	if publisher == nil {
+		return true
+	}
+	if err := publisher.Publish(event); err != nil {
+		out <- model.ErrorEvent{Err: err, Message: message}
+		return false
+	}
+	return true
 }
 
 func sendResult(results chan<- TurnResult, messages []model.Message) {

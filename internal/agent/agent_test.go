@@ -2,12 +2,14 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"reflect"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/rexzhao/simple-agent/internal/eventbus"
 	"github.com/rexzhao/simple-agent/internal/model"
 )
 
@@ -143,6 +145,253 @@ func TestStreamWithResultIncludesToolHistoryAndFinalAssistantText(t *testing.T) 
 	assertAgentMessage(t, result.Messages[3], model.MessageRoleAssistant, "final", "")
 }
 
+func TestStreamWithPublisherPublishesDurableEventsInOrder(t *testing.T) {
+	provider := &fakeProvider{
+		turns: [][]model.Event{
+			{
+				model.ToolCallDoneEvent{
+					ToolCall: model.ToolCall{ID: "call_1", Name: "echo", Arguments: `{"text":"hello"}`},
+				},
+			},
+			{
+				model.TextDeltaEvent{Text: "final"},
+			},
+		},
+	}
+	publisher := &fakePublisher{}
+	var executeCheckErr error
+	executor := &fakeToolExecutor{
+		result: model.ToolResult{Name: "echo", Content: "tool output"},
+		onExecute: func() {
+			if len(publisher.events) != 1 {
+				executeCheckErr = fmt.Errorf("publisher events before tool execution = %d, want 1", len(publisher.events))
+				return
+			}
+			if _, ok := publisher.events[0].(eventbus.AssistantReady); !ok {
+				executeCheckErr = fmt.Errorf("first publisher event = %T, want AssistantReady", publisher.events[0])
+			}
+		},
+	}
+
+	events, results, err := StreamWithResult(context.Background(), model.Request{
+		Model:    "model-test",
+		Messages: []model.Message{{Role: model.MessageRoleUser, Content: "Use a tool"}},
+		Tools:    []model.Tool{{Name: "echo"}},
+	}, Options{
+		Provider:     provider,
+		ToolExecutor: executor,
+		MaxTurns:     4,
+		TurnID:       "turn-1",
+		Publisher:    publisher,
+	})
+	if err != nil {
+		t.Fatalf("StreamWithResult() error = %v", err)
+	}
+
+	gotEvents := collectAgentEvents(t, events)
+	if executeCheckErr != nil {
+		t.Fatal(executeCheckErr)
+	}
+	if gotText := collectText(gotEvents); gotText != "final" {
+		t.Fatalf("text events = %q, want final", gotText)
+	}
+	if result := firstToolResult(t, gotEvents); result.ToolCallID != "call_1" || result.Content != "tool output" {
+		t.Fatalf("tool result event = %#v, want call_1/tool output", result)
+	}
+	turnResult := collectTurnResult(t, results)
+	if len(turnResult.Messages) != 4 {
+		t.Fatalf("len(result messages) = %d, want 4", len(turnResult.Messages))
+	}
+
+	if len(publisher.events) != 3 {
+		t.Fatalf("publisher events = %#v, want 3 events", publisher.events)
+	}
+	firstAssistant, ok := publisher.events[0].(eventbus.AssistantReady)
+	if !ok {
+		t.Fatalf("publisher event[0] = %T, want AssistantReady", publisher.events[0])
+	}
+	if firstAssistant.TurnID != "turn-1" || firstAssistant.Message.Role != model.MessageRoleAssistant || len(firstAssistant.Message.ToolCalls) != 1 || firstAssistant.Message.ToolCalls[0].ID != "call_1" {
+		t.Fatalf("first AssistantReady = %#v, want turn-1 assistant call_1", firstAssistant)
+	}
+	toolResult, ok := publisher.events[1].(eventbus.ToolResultReady)
+	if !ok {
+		t.Fatalf("publisher event[1] = %T, want ToolResultReady", publisher.events[1])
+	}
+	if toolResult.TurnID != "turn-1" || toolResult.Result.ToolCallID != "call_1" || toolResult.Result.Content != "tool output" {
+		t.Fatalf("ToolResultReady = %#v, want call_1/tool output", toolResult)
+	}
+	finalAssistant, ok := publisher.events[2].(eventbus.AssistantReady)
+	if !ok {
+		t.Fatalf("publisher event[2] = %T, want AssistantReady", publisher.events[2])
+	}
+	if finalAssistant.TurnID != "turn-1" || finalAssistant.Message.Content != "final" || len(finalAssistant.Message.ToolCalls) != 0 {
+		t.Fatalf("final AssistantReady = %#v, want final no-tool assistant", finalAssistant)
+	}
+}
+
+func TestStreamWithPublisherAssistantReadyFailureAborts(t *testing.T) {
+	publishErr := errors.New("persist assistant failed")
+
+	t.Run("final response", func(t *testing.T) {
+		provider := &fakeProvider{
+			turns: [][]model.Event{
+				{model.TextDeltaEvent{Text: "final"}},
+			},
+		}
+		publisher := &fakePublisher{errKind: eventbus.KindAssistantReady, err: publishErr}
+
+		events, results, err := StreamWithResult(context.Background(), model.Request{
+			Model:    "model-test",
+			Messages: []model.Message{{Role: model.MessageRoleUser, Content: "Say hi"}},
+		}, Options{
+			Provider:  provider,
+			TurnID:    "turn-1",
+			Publisher: publisher,
+		})
+		if err != nil {
+			t.Fatalf("StreamWithResult() error = %v", err)
+		}
+
+		gotEvents := collectAgentEvents(t, events)
+		errorEvent := firstErrorEvent(t, gotEvents)
+		if !errors.Is(errorEvent.Err, publishErr) || errorEvent.Message != "persist assistant" {
+			t.Fatalf("error event = %#v, want persist assistant error", errorEvent)
+		}
+		assertNoTurnResult(t, results)
+		if len(provider.requests) != 1 {
+			t.Fatalf("len(provider.requests) = %d, want 1", len(provider.requests))
+		}
+	})
+
+	t.Run("tool round", func(t *testing.T) {
+		provider := &fakeProvider{
+			turns: [][]model.Event{
+				{
+					model.ToolCallDoneEvent{
+						ToolCall: model.ToolCall{ID: "call_1", Name: "echo", Arguments: `{}`},
+					},
+				},
+			},
+		}
+		executor := &fakeToolExecutor{result: model.ToolResult{Name: "echo", Content: "tool output"}}
+		publisher := &fakePublisher{errKind: eventbus.KindAssistantReady, err: publishErr}
+
+		events, results, err := StreamWithResult(context.Background(), model.Request{
+			Model:    "model-test",
+			Messages: []model.Message{{Role: model.MessageRoleUser, Content: "Use a tool"}},
+			Tools:    []model.Tool{{Name: "echo"}},
+		}, Options{
+			Provider:     provider,
+			ToolExecutor: executor,
+			TurnID:       "turn-1",
+			Publisher:    publisher,
+		})
+		if err != nil {
+			t.Fatalf("StreamWithResult() error = %v", err)
+		}
+
+		gotEvents := collectAgentEvents(t, events)
+		errorEvent := firstErrorEvent(t, gotEvents)
+		if !errors.Is(errorEvent.Err, publishErr) || errorEvent.Message != "persist assistant" {
+			t.Fatalf("error event = %#v, want persist assistant error", errorEvent)
+		}
+		if executor.called {
+			t.Fatal("executor ran after AssistantReady publish failed")
+		}
+		if hasToolResultEvent(gotEvents) {
+			t.Fatalf("events = %#v, want no ToolResultEvent", gotEvents)
+		}
+		assertNoTurnResult(t, results)
+		if len(provider.requests) != 1 {
+			t.Fatalf("len(provider.requests) = %d, want 1", len(provider.requests))
+		}
+	})
+}
+
+func TestStreamWithPublisherToolResultReadyFailureAborts(t *testing.T) {
+	publishErr := errors.New("persist tool result failed")
+	provider := &fakeProvider{
+		turns: [][]model.Event{
+			{
+				model.ToolCallDoneEvent{
+					ToolCall: model.ToolCall{ID: "call_1", Name: "echo", Arguments: `{}`},
+				},
+			},
+			{
+				model.TextDeltaEvent{Text: "should not request"},
+			},
+		},
+	}
+	executor := &fakeToolExecutor{result: model.ToolResult{Name: "echo", Content: "tool output"}}
+	publisher := &fakePublisher{errKind: eventbus.KindToolResultReady, err: publishErr}
+
+	events, results, err := StreamWithResult(context.Background(), model.Request{
+		Model:    "model-test",
+		Messages: []model.Message{{Role: model.MessageRoleUser, Content: "Use a tool"}},
+		Tools:    []model.Tool{{Name: "echo"}},
+	}, Options{
+		Provider:     provider,
+		ToolExecutor: executor,
+		TurnID:       "turn-1",
+		Publisher:    publisher,
+	})
+	if err != nil {
+		t.Fatalf("StreamWithResult() error = %v", err)
+	}
+
+	gotEvents := collectAgentEvents(t, events)
+	errorEvent := firstErrorEvent(t, gotEvents)
+	if !errors.Is(errorEvent.Err, publishErr) || errorEvent.Message != "persist tool result" {
+		t.Fatalf("error event = %#v, want persist tool result error", errorEvent)
+	}
+	if !executor.called {
+		t.Fatal("executor was not called before ToolResultReady publish")
+	}
+	if hasToolResultEvent(gotEvents) {
+		t.Fatalf("events = %#v, want no ToolResultEvent", gotEvents)
+	}
+	assertNoTurnResult(t, results)
+	if len(provider.requests) != 1 {
+		t.Fatalf("len(provider.requests) = %d, want no second model request", len(provider.requests))
+	}
+	if len(publisher.events) != 2 {
+		t.Fatalf("publisher events = %#v, want AssistantReady and ToolResultReady", publisher.events)
+	}
+}
+
+func TestStreamWithPublisherRequiresTurnID(t *testing.T) {
+	provider := &fakeProvider{
+		turns: [][]model.Event{
+			{model.TextDeltaEvent{Text: "unused"}},
+		},
+	}
+	publisher := &fakePublisher{}
+
+	events, results, err := StreamWithResult(context.Background(), model.Request{
+		Model:    "model-test",
+		Messages: []model.Message{{Role: model.MessageRoleUser, Content: "Say hi"}},
+	}, Options{
+		Provider:  provider,
+		Publisher: publisher,
+	})
+	if err != nil {
+		t.Fatalf("StreamWithResult() error = %v", err)
+	}
+
+	gotEvents := collectAgentEvents(t, events)
+	errorEvent := firstErrorEvent(t, gotEvents)
+	if errorEvent.Message != "persist turn" || !strings.Contains(errorEvent.Err.Error(), "turn id is required") {
+		t.Fatalf("error event = %#v, want missing turn id error", errorEvent)
+	}
+	assertNoTurnResult(t, results)
+	if len(provider.requests) != 0 {
+		t.Fatalf("len(provider.requests) = %d, want 0", len(provider.requests))
+	}
+	if len(publisher.events) != 0 {
+		t.Fatalf("publisher events = %#v, want none", publisher.events)
+	}
+}
+
 func TestStreamMalformedToolArgumentsAppendsToolErrorAndContinues(t *testing.T) {
 	provider := &fakeProvider{
 		turns: [][]model.Event{
@@ -265,13 +514,31 @@ type fakeToolExecutor struct {
 	arguments map[string]any
 	result    model.ToolResult
 	err       error
+	onExecute func()
 }
 
 func (e *fakeToolExecutor) Execute(ctx context.Context, name string, arguments map[string]any) (model.ToolResult, error) {
 	e.called = true
 	e.name = name
 	e.arguments = arguments
+	if e.onExecute != nil {
+		e.onExecute()
+	}
 	return e.result, e.err
+}
+
+type fakePublisher struct {
+	events  []eventbus.Event
+	errKind string
+	err     error
+}
+
+func (p *fakePublisher) Publish(event eventbus.Event) error {
+	p.events = append(p.events, event)
+	if p.errKind != "" && event.Kind() == p.errKind {
+		return p.err
+	}
+	return nil
 }
 
 func copyAgentRequest(request model.Request) model.Request {
@@ -342,6 +609,15 @@ func firstErrorEvent(t *testing.T, events []model.Event) model.ErrorEvent {
 	return model.ErrorEvent{}
 }
 
+func hasToolResultEvent(events []model.Event) bool {
+	for _, event := range events {
+		if _, ok := event.(model.ToolResultEvent); ok {
+			return true
+		}
+	}
+	return false
+}
+
 func collectTurnResult(t *testing.T, results <-chan TurnResult) TurnResult {
 	t.Helper()
 
@@ -362,6 +638,19 @@ func collectTurnResult(t *testing.T, results <-chan TurnResult) TurnResult {
 		t.Fatal("timed out waiting for TurnResult")
 	}
 	return TurnResult{}
+}
+
+func assertNoTurnResult(t *testing.T, results <-chan TurnResult) {
+	t.Helper()
+
+	select {
+	case result, ok := <-results:
+		if ok {
+			t.Fatalf("unexpected TurnResult: %#v", result)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for result channel to close")
+	}
 }
 
 func assertAgentMessage(t *testing.T, message model.Message, role model.MessageRole, content string, toolCallID string) {

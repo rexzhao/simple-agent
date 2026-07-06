@@ -115,9 +115,10 @@ GC, and auto-rerunning interrupted tools.
 
 ## Phase 3 — Agent bus integration + CLI path
 
-- [ ] Add optional `Publisher eventbus.Publisher` to `agent.Options` (`agent.go:20`);
-  nil preserves current buffer-and-return behavior.
-- [ ] **Event split — `agent.run` only emits `AssistantReady` (model-round end, ~line
+- [x] Add optional `Publisher eventbus.Publisher` + `TurnID string` to
+  `agent.Options` (`agent.go:20`); nil publisher preserves current buffer-and-return
+  behavior, and `TurnID` is required only when a publisher is configured.
+- [x] **Event split — `agent.run` only emits `AssistantReady` (model-round end, ~line
   75-79, **not per `ToolCallDoneEvent`**, before tool execution) and `ToolResultReady`
   (after each `executeToolCall` ~line 87). Publisher error → emit `ErrorEvent` and
   return. `TurnStarted`/`TurnCompleted`/`TurnInterrupted` are **not** in `agent.run`.
