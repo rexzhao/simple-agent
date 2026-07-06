@@ -6117,6 +6117,9 @@ func (r serverAgentTurnRunner) RunSessionTurn(ctx context.Context, request local
 		return localserver.SessionTurnResult{}, err
 	}
 	if incremental {
+		if err := runtime.saveRuntimeMetadataForSession(request.Session.ID); err != nil {
+			return localserver.SessionTurnResult{}, err
+		}
 		return localserver.SessionTurnResult{
 			Session:     runtime.resumableSession,
 			Incremental: true,
@@ -6138,6 +6141,17 @@ func (r serverAgentTurnRunner) RunSessionTurn(ctx context.Context, request local
 		}
 	}
 	return result, nil
+}
+
+func (r serverAgentTurnRunner) SupportsIncrementalSessionTurn(ctx context.Context, request localserver.SessionTurnRequest) (supported bool, err error) {
+	runtime, err := r.prepareServerSessionRuntime(ctx, request.Session, request.SessionStore)
+	if err != nil {
+		return false, err
+	}
+	defer func() {
+		err = errors.Join(err, runtime.Close())
+	}()
+	return runtime.config == nil || !runtime.config.Compaction.Enabled, nil
 }
 
 func (r serverAgentTurnRunner) PlanSessionCompaction(ctx context.Context, request localserver.SessionCompactionRequest) (result localserver.SessionCompactionResult, err error) {

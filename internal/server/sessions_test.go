@@ -1540,6 +1540,9 @@ func TestSessionSendMessagePersistsSuccessfulTurnAndPublishesEvents(t *testing.T
 			if request.Content != "hello server" {
 				t.Fatalf("runner content = %q, want hello server", request.Content)
 			}
+			if request.Publisher != nil || request.TurnID != "" {
+				t.Fatalf("legacy runner request got publisher=%T turn_id=%q, want legacy path", request.Publisher, request.TurnID)
+			}
 			request.Emit(model.TextDeltaEvent{Text: "hi "})
 			request.Emit(model.TextDeltaEvent{Text: "there"})
 			request.Emit(model.ToolCallDoneEvent{ToolCall: model.ToolCall{ID: "call-1", Name: "read_file", Arguments: `{"path":"secret.txt"}`}})
@@ -1606,6 +1609,140 @@ func TestSessionSendMessagePersistsSuccessfulTurnAndPublishesEvents(t *testing.T
 	}
 	if !reflect.DeepEqual(session.ActiveHistory, []string{session.Items[0].ID, session.Items[1].ID}) {
 		t.Fatalf("ActiveHistory = %#v, want new user+assistant item ids", session.ActiveHistory)
+	}
+}
+
+func TestSessionSendMessageIncrementalPersistsAndPublishesViaBus(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "sessions")
+	store := sessions.NewV2Store(root)
+	saveServerTestSession(t, store, "send-incremental")
+	runner := fakeIncrementalSessionTurnRunner{
+		run: func(ctx context.Context, request SessionTurnRequest) (SessionTurnResult, error) {
+			if request.Session.ID != "send-incremental" {
+				t.Fatalf("runner session id = %q, want send-incremental", request.Session.ID)
+			}
+			if request.TurnID == "" || request.Publisher == nil {
+				t.Fatalf("runner turn id/publisher = %q/%T, want incremental request", request.TurnID, request.Publisher)
+			}
+			request.Emit(model.TextDeltaEvent{Text: "live text"})
+			request.Emit(model.ToolCallDoneEvent{ToolCall: model.ToolCall{
+				ID:        "call-1",
+				Name:      "read_file",
+				Arguments: `{"path":"SECRET ARGUMENTS"}`,
+			}})
+			assistant := model.Message{
+				Role:    model.MessageRoleAssistant,
+				Content: "assistant needs tool",
+				ToolCalls: []model.ToolCall{{
+					ID:        "call-1",
+					Name:      "read_file",
+					Arguments: `{"path":"SECRET ARGUMENTS"}`,
+				}},
+			}
+			if err := request.Publisher.Publish(eventbus.AssistantReady{TurnID: request.TurnID, Message: assistant}); err != nil {
+				return SessionTurnResult{}, err
+			}
+			result := model.ToolResult{
+				ToolCallID: "call-1",
+				Name:       "read_file",
+				Content:    "SECRET TOOL RESULT",
+			}
+			if err := request.Publisher.Publish(eventbus.ToolResultReady{TurnID: request.TurnID, Result: result}); err != nil {
+				return SessionTurnResult{}, err
+			}
+			request.Emit(model.ToolResultEvent{Result: result})
+			if err := request.Publisher.Publish(eventbus.AssistantReady{TurnID: request.TurnID, Message: model.Message{
+				Role:    model.MessageRoleAssistant,
+				Content: "final answer",
+			}}); err != nil {
+				return SessionTurnResult{}, err
+			}
+			return SessionTurnResult{Incremental: true}, nil
+		},
+	}
+	process := startSessionAPIServerWithTurnRunner(t, store, sessions.SessionV2{}, "registry-token", runner)
+	conn := dialSessionStream(t, process, "send-incremental")
+	waitForStreamSubscribers(t, process, "send-incremental", 1)
+
+	_, body := postRawJSONStatus(t, "http://"+process.Addr()+"/sessions/send-incremental/messages", `{"content":"hello incremental"}`, "registry-token", http.StatusOK)
+	if body["status"] != "committed" || body["turn_id"] == "" || body["last_seq"] == nil {
+		t.Fatalf("send response = %#v, want committed turn metadata", body)
+	}
+
+	events := make([]map[string]any, 0, 10)
+	for len(events) < 10 {
+		events = append(events, readSessionStreamEvent(t, conn))
+	}
+	wantTypes := []string{
+		"turn.started",
+		"item.appended",
+		"text.delta",
+		"tool.started",
+		"item.appended",
+		"item.appended",
+		"item.updated",
+		"tool.finished",
+		"item.appended",
+		"turn.committed",
+	}
+	for i, want := range wantTypes {
+		if events[i]["type"] != want {
+			t.Fatalf("event[%d] type = %#v, want %q; events=%#v", i, events[i]["type"], want, events)
+		}
+	}
+	if events[2]["text"] != "live text" {
+		t.Fatalf("text event = %#v, want live text", events[2])
+	}
+	if events[3]["name"] != "read_file" || events[3]["arguments"] != nil {
+		t.Fatalf("tool.started event = %#v, want sanitized read_file", events[3])
+	}
+	if events[7]["content"] != nil || events[7]["arguments"] != nil {
+		t.Fatalf("tool.finished event leaked content or arguments: %#v", events[7])
+	}
+	for i, event := range events {
+		raw, err := json.Marshal(event)
+		if err != nil {
+			t.Fatalf("Marshal(event[%d]) error = %v", i, err)
+		}
+		if bytes.Contains(raw, []byte("SECRET TOOL RESULT")) || bytes.Contains(raw, []byte("SECRET ARGUMENTS")) {
+			t.Fatalf("event[%d] leaked sensitive content: %s", i, raw)
+		}
+	}
+
+	session, err := store.Load("send-incremental")
+	if err != nil {
+		t.Fatalf("Load(send-incremental) error = %v", err)
+	}
+	if session.RunningTurnID != "" || session.InterruptedTurnID != "" || !session.InterruptedAt.IsZero() {
+		t.Fatalf("turn metadata = running %q interrupted %q at %s, want cleared successful turn", session.RunningTurnID, session.InterruptedTurnID, session.InterruptedAt)
+	}
+	if len(session.Items) != 4 {
+		t.Fatalf("len(session.Items) = %d, want user+assistant+tool+final: %#v", len(session.Items), session.Items)
+	}
+	if session.Items[0].Message == nil || session.Items[0].Message.Role != model.MessageRoleUser || session.Items[0].Message.Content != "hello incremental" {
+		t.Fatalf("user item = %#v, want persisted prompt", session.Items[0])
+	}
+	if session.Items[1].Message == nil || session.Items[1].Message.Role != model.MessageRoleAssistant || len(session.Items[1].Message.ToolCalls) != 1 {
+		t.Fatalf("assistant tool-call item = %#v, want assistant with tool call", session.Items[1])
+	}
+	if session.Items[2].Message == nil || session.Items[2].Message.Role != model.MessageRoleTool || session.Items[2].Status != sessions.ItemStatusCompleted || session.Items[2].Message.Content != "SECRET TOOL RESULT" {
+		t.Fatalf("tool item = %#v, want completed persisted tool result", session.Items[2])
+	}
+	if session.Items[3].Message == nil || session.Items[3].Message.Role != model.MessageRoleAssistant || session.Items[3].Message.Content != "final answer" {
+		t.Fatalf("final assistant item = %#v, want final answer", session.Items[3])
+	}
+	if !reflect.DeepEqual(session.ActiveHistory, []string{session.Items[0].ID, session.Items[1].ID, session.Items[2].ID, session.Items[3].ID}) {
+		t.Fatalf("ActiveHistory = %#v, want all incremental item ids", session.ActiveHistory)
+	}
+	if session.LastSeq != int64(body["last_seq"].(float64)) {
+		t.Fatalf("LastSeq = %d, response last_seq = %#v", session.LastSeq, body["last_seq"])
+	}
+	messages, err := session.MaterializeActiveHistory()
+	if err != nil {
+		t.Fatalf("MaterializeActiveHistory() error = %v", err)
+	}
+	if len(messages) != 4 || messages[1].Role != model.MessageRoleAssistant || len(messages[1].ToolCalls) != 1 || messages[2].Role != model.MessageRoleTool || messages[2].ToolCallID != "call-1" {
+		t.Fatalf("materialized messages = %#v, want legal assistant/tool exchange", messages)
 	}
 }
 
@@ -3432,6 +3569,25 @@ func (r fakeSessionTurnRunner) RunSessionTurn(ctx context.Context, request Sessi
 		return SessionTurnResult{}, fmt.Errorf("fake turn runner was called unexpectedly")
 	}
 	return r.run(ctx, request)
+}
+
+type fakeIncrementalSessionTurnRunner struct {
+	run     func(context.Context, SessionTurnRequest) (SessionTurnResult, error)
+	support func(context.Context, SessionTurnRequest) (bool, error)
+}
+
+func (r fakeIncrementalSessionTurnRunner) RunSessionTurn(ctx context.Context, request SessionTurnRequest) (SessionTurnResult, error) {
+	if r.run == nil {
+		return SessionTurnResult{}, fmt.Errorf("fake incremental turn runner was called unexpectedly")
+	}
+	return r.run(ctx, request)
+}
+
+func (r fakeIncrementalSessionTurnRunner) SupportsIncrementalSessionTurn(ctx context.Context, request SessionTurnRequest) (bool, error) {
+	if r.support != nil {
+		return r.support(ctx, request)
+	}
+	return true, nil
 }
 
 type fakeSessionCompactPlanner struct {

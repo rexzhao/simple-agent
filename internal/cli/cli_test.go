@@ -7867,6 +7867,79 @@ func TestServerAgentTurnRunnerPublisherRequiresTurnID(t *testing.T) {
 	}
 }
 
+func TestServerAgentTurnRunnerSupportsIncrementalSessionTurnHonorsCompaction(t *testing.T) {
+	t.Run("compaction disabled", func(t *testing.T) {
+		configDir := t.TempDir()
+		writeCLIRunFixtureInDir(t, configDir, "http://127.0.0.1:1", "direct-secret-value", "openai-chat")
+		store := sessions.NewV2Store(filepath.Join(configDir, "sessions"))
+		projectDir := t.TempDir()
+		session, err := store.SaveMetadata(sessions.SessionV2{
+			ID:              "incremental-supported",
+			Version:         sessions.VersionV2,
+			Provider:        "fake",
+			ModelProfile:    "default",
+			ModelID:         "model-default",
+			CWD:             projectDir,
+			CreatedCWD:      projectDir,
+			ConfigPath:      cliConfigPath(configDir),
+			SaveToolResults: true,
+		})
+		if err != nil {
+			t.Fatalf("SaveMetadata() error = %v", err)
+		}
+
+		supported, err := (serverAgentTurnRunner{program: "sai"}).SupportsIncrementalSessionTurn(context.Background(), localserver.SessionTurnRequest{
+			Session:      session,
+			SessionStore: store,
+			Content:      "hello",
+		})
+		if err != nil {
+			t.Fatalf("SupportsIncrementalSessionTurn() error = %v", err)
+		}
+		if !supported {
+			t.Fatal("SupportsIncrementalSessionTurn() = false, want true")
+		}
+	})
+
+	t.Run("compaction enabled", func(t *testing.T) {
+		configDir := t.TempDir()
+		writeCLIRunFixtureInDir(t, configDir, "http://127.0.0.1:1", "direct-secret-value", "openai-chat")
+		appendCLIConfig(t, configDir, `
+compaction:
+  enabled: true
+  threshold_percent: 80
+`)
+		store := sessions.NewV2Store(filepath.Join(configDir, "sessions"))
+		projectDir := t.TempDir()
+		session, err := store.SaveMetadata(sessions.SessionV2{
+			ID:              "incremental-unsupported-compaction",
+			Version:         sessions.VersionV2,
+			Provider:        "fake",
+			ModelProfile:    "default",
+			ModelID:         "model-default",
+			CWD:             projectDir,
+			CreatedCWD:      projectDir,
+			ConfigPath:      cliConfigPath(configDir),
+			SaveToolResults: true,
+		})
+		if err != nil {
+			t.Fatalf("SaveMetadata() error = %v", err)
+		}
+
+		supported, err := (serverAgentTurnRunner{program: "sai"}).SupportsIncrementalSessionTurn(context.Background(), localserver.SessionTurnRequest{
+			Session:      session,
+			SessionStore: store,
+			Content:      "hello",
+		})
+		if err != nil {
+			t.Fatalf("SupportsIncrementalSessionTurn() error = %v", err)
+		}
+		if supported {
+			t.Fatal("SupportsIncrementalSessionTurn() = true, want false for compaction-enabled runtime")
+		}
+	})
+}
+
 func TestServerAgentTurnRunnerPublishesIncrementalEventsToPublisher(t *testing.T) {
 	shellCommand := blockingShellCommandForCLIIncrementalTest()
 	args, err := json.Marshal(map[string]any{

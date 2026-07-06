@@ -24,6 +24,7 @@ import (
 	"github.com/rexzhao/simple-agent/internal/eventbus"
 	"github.com/rexzhao/simple-agent/internal/model"
 	projectstore "github.com/rexzhao/simple-agent/internal/projects"
+	"github.com/rexzhao/simple-agent/internal/sessionprojector"
 	"github.com/rexzhao/simple-agent/internal/sessions"
 )
 
@@ -95,6 +96,10 @@ type runningTurn struct {
 
 type SessionTurnRunner interface {
 	RunSessionTurn(ctx context.Context, request SessionTurnRequest) (SessionTurnResult, error)
+}
+
+type SessionIncrementalSupporter interface {
+	SupportsIncrementalSessionTurn(ctx context.Context, request SessionTurnRequest) (bool, error)
 }
 
 type SessionCompactPlanner interface {
@@ -1152,6 +1157,25 @@ func (p *Process) handleSessionMessage(w http.ResponseWriter, r *http.Request, i
 		writeError(w, http.StatusServiceUnavailable, "server_shutting_down", "server is shutting down")
 		return
 	}
+	incremental, err := p.supportsIncrementalSessionTurn(turnCtx, SessionTurnRequest{
+		Session:      session,
+		SessionStore: store,
+		Content:      content,
+	})
+	if err != nil {
+		p.endSessionTurn(id)
+		cancelTurn()
+		p.writeTurnError(w, err)
+		return
+	}
+	if incremental {
+		defer func() {
+			p.endSessionTurn(id)
+			cancelTurn()
+		}()
+		p.handleIncrementalSessionMessage(w, id, turnID, turnCtx, session, store, content)
+		return
+	}
 	marked, err := store.MarkTurnRunning(id, turnID)
 	if err != nil {
 		p.endSessionTurn(id)
@@ -1226,6 +1250,117 @@ func (p *Process) handleSessionMessage(w http.ResponseWriter, r *http.Request, i
 		p.publishSessionEvent(id, NewSessionStreamEvent("compaction.created", map[string]any{
 			"compaction_id": result.Compaction.Checkpoint.ID,
 		}))
+	}
+	p.publishSessionEvent(id, NewSessionStreamEvent("turn.committed", map[string]any{
+		"turn_id":  turnID,
+		"last_seq": saved.LastSeq,
+	}))
+	writeJSON(w, http.StatusOK, map[string]any{
+		"turn_id":  turnID,
+		"last_seq": saved.LastSeq,
+		"status":   "committed",
+	})
+}
+
+func (p *Process) supportsIncrementalSessionTurn(ctx context.Context, request SessionTurnRequest) (bool, error) {
+	supporter, ok := p.turnRunner.(SessionIncrementalSupporter)
+	if !ok {
+		return false, nil
+	}
+	return supporter.SupportsIncrementalSessionTurn(ctx, request)
+}
+
+func (p *Process) handleIncrementalSessionMessage(w http.ResponseWriter, id, turnID string, turnCtx context.Context, session sessions.SessionV2, store *sessions.V2Store, content string) {
+	projector, err := sessionprojector.New(store, session)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "session_store_error", "could not start session projector")
+		return
+	}
+	defer projector.Close()
+
+	bus := eventbus.NewBusWithCheckpoint(projector.CheckpointHandler())
+	waitBridge := p.startSessionEventBusBridge(id, turnID, bus, session.LastSeq)
+	bridgeClosed := false
+	closeBridge := func() {
+		if bridgeClosed {
+			return
+		}
+		bus.Close()
+		waitBridge()
+		bridgeClosed = true
+	}
+	defer closeBridge()
+
+	turnStarted := false
+	turnClosed := false
+	interruptTurn := func() {
+		if !turnStarted || turnClosed {
+			return
+		}
+		if err := bus.Publish(eventbus.TurnInterrupted{TurnID: turnID}); err != nil {
+			_, _ = store.MarkTurnInterrupted(id, turnID)
+		}
+		turnClosed = true
+	}
+	defer interruptTurn()
+
+	if err := bus.Publish(eventbus.TurnStarted{TurnID: turnID}); err != nil {
+		writeError(w, http.StatusInternalServerError, "session_store_error", "could not mark turn running")
+		return
+	}
+	turnStarted = true
+	p.publishSessionEvent(id, NewSessionStreamEvent("turn.started", map[string]any{
+		"turn_id": turnID,
+	}))
+	if err := bus.Publish(eventbus.TurnInputReady{TurnID: turnID, Message: model.Message{Role: model.MessageRoleUser, Content: content}}); err != nil {
+		interruptTurn()
+		closeBridge()
+		p.publishTurnFailed(id, turnID, err)
+		writeError(w, http.StatusInternalServerError, "session_store_error", "could not save turn input")
+		return
+	}
+
+	result, err := p.turnRunner.RunSessionTurn(turnCtx, SessionTurnRequest{
+		Session:      session,
+		SessionStore: store,
+		TurnID:       turnID,
+		Content:      content,
+		Emit: func(event model.Event) {
+			if event != nil {
+				_ = bus.Publish(eventbus.ModelEvent{Event: event})
+			}
+		},
+		Publisher: bus,
+	})
+	if err != nil {
+		interruptTurn()
+		closeBridge()
+		p.publishTurnFailed(id, turnID, err)
+		p.writeTurnError(w, err)
+		return
+	}
+	if !result.Incremental {
+		err := fmt.Errorf("turn runner did not use incremental persistence")
+		interruptTurn()
+		closeBridge()
+		p.publishTurnFailed(id, turnID, err)
+		writeError(w, http.StatusInternalServerError, "turn_runner_error", "turn runner did not use incremental persistence")
+		return
+	}
+	if err := bus.Publish(eventbus.TurnCompleted{TurnID: turnID}); err != nil {
+		interruptTurn()
+		closeBridge()
+		p.publishTurnFailed(id, turnID, err)
+		writeError(w, http.StatusInternalServerError, "session_store_error", "could not clear running turn")
+		return
+	}
+	turnClosed = true
+	closeBridge()
+
+	saved, err := store.Load(id)
+	if err != nil {
+		p.writeSessionLoadError(w, err, "could not load committed session")
+		return
 	}
 	p.publishSessionEvent(id, NewSessionStreamEvent("turn.committed", map[string]any{
 		"turn_id":  turnID,
