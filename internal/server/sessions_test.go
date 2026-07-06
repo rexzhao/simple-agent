@@ -1980,6 +1980,158 @@ func TestSessionSendMessageIncrementalCancelAfterInputPersistsUserPrompt(t *test
 	}
 }
 
+func TestSessionSendMessageIncrementalInterruptsPendingToolsOnCancel(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "sessions")
+	store := sessions.NewV2Store(root)
+	saveServerTestSession(t, store, "send-incremental-pending-cancel")
+	runner := fakeIncrementalSessionTurnRunner{
+		run: func(ctx context.Context, request SessionTurnRequest) (SessionTurnResult, error) {
+			if request.TurnID == "" || request.Publisher == nil {
+				t.Fatalf("runner turn id/publisher = %q/%T, want incremental request", request.TurnID, request.Publisher)
+			}
+			assistant := model.Message{
+				Role:    model.MessageRoleAssistant,
+				Content: "assistant needs multiple tools",
+				ToolCalls: []model.ToolCall{
+					{
+						ID:        "call-a",
+						Name:      "read_file",
+						Arguments: `{"path":"SECRET ARG A"}`,
+					},
+					{
+						ID:        "call-b",
+						Name:      "read_file",
+						Arguments: `{"path":"SECRET ARG B"}`,
+					},
+				},
+			}
+			if err := request.Publisher.Publish(eventbus.AssistantReady{TurnID: request.TurnID, Message: assistant}); err != nil {
+				return SessionTurnResult{}, err
+			}
+			return SessionTurnResult{}, context.Canceled
+		},
+	}
+	process := startSessionAPIServerWithTurnRunner(t, store, sessions.SessionV2{}, "registry-token", runner)
+	conn := dialSessionStream(t, process, "send-incremental-pending-cancel")
+	waitForStreamSubscribers(t, process, "send-incremental-pending-cancel", 1)
+
+	raw, body := postRawJSONStatus(t, "http://"+process.Addr()+"/sessions/send-incremental-pending-cancel/messages", `{"content":"cancel after assistant secret"}`, "registry-token", http.StatusInternalServerError)
+	assertErrorCode(t, body, "turn_failed")
+	for _, forbidden := range []string{"cancel after assistant secret", "SECRET ARG A", "SECRET ARG B", "registry-token"} {
+		if bytes.Contains(raw, []byte(forbidden)) {
+			t.Fatalf("pending cancel response leaked %q: %s", forbidden, raw)
+		}
+	}
+
+	events := make([]map[string]any, 0, 8)
+	for len(events) < 8 {
+		events = append(events, readSessionStreamEvent(t, conn))
+	}
+	wantTypes := []string{
+		"turn.started",
+		"item.appended",
+		"item.appended",
+		"item.appended",
+		"item.appended",
+		"item.updated",
+		"item.updated",
+		"turn.failed",
+	}
+	for i, want := range wantTypes {
+		if events[i]["type"] != want {
+			t.Fatalf("event[%d] type = %#v, want %q; events=%#v", i, events[i]["type"], want, events)
+		}
+	}
+	if events[7]["message"] != "turn failed" {
+		t.Fatalf("turn.failed message = %#v, want sanitized failure", events[7]["message"])
+	}
+	for i, event := range events {
+		raw, err := json.Marshal(event)
+		if err != nil {
+			t.Fatalf("Marshal(event[%d]) error = %v", i, err)
+		}
+		if bytes.Contains(raw, []byte("SECRET ARG A")) || bytes.Contains(raw, []byte("SECRET ARG B")) {
+			t.Fatalf("event[%d] leaked sensitive arguments: %s", i, raw)
+		}
+	}
+
+	session, err := store.Load("send-incremental-pending-cancel")
+	if err != nil {
+		t.Fatalf("Load(send-incremental-pending-cancel) error = %v", err)
+	}
+	if session.RunningTurnID != "" || session.InterruptedTurnID != "turn-000001" || session.InterruptedAt.IsZero() {
+		t.Fatalf("turn metadata = running %q interrupted %q at %s, want interrupted turn-000001", session.RunningTurnID, session.InterruptedTurnID, session.InterruptedAt)
+	}
+	if len(session.Items) != 4 {
+		t.Fatalf("len(session.Items) = %d, want user+assistant+two interrupted tools: %#v", len(session.Items), session.Items)
+	}
+	userItem := session.Items[0]
+	assistantItem := session.Items[1]
+	toolA := session.Items[2]
+	toolB := session.Items[3]
+	if userItem.Message == nil || userItem.Message.Role != model.MessageRoleUser || userItem.Message.Content != "cancel after assistant secret" {
+		t.Fatalf("user item = %#v, want persisted prompt", userItem)
+	}
+	if assistantItem.Message == nil || assistantItem.Message.Role != model.MessageRoleAssistant || len(assistantItem.Message.ToolCalls) != 2 {
+		t.Fatalf("assistant item = %#v, want assistant with two tool calls", assistantItem)
+	}
+	wantTools := []struct {
+		item       sessions.SessionItem
+		toolCallID string
+	}{
+		{item: toolA, toolCallID: "call-a"},
+		{item: toolB, toolCallID: "call-b"},
+	}
+	for _, want := range wantTools {
+		item := want.item
+		if item.Message == nil || item.Message.Role != model.MessageRoleTool || item.Message.ToolCallID != want.toolCallID || item.Status != sessions.ItemStatusInterrupted {
+			t.Fatalf("tool item = %#v, want interrupted tool response for %s", item, want.toolCallID)
+		}
+	}
+	if !reflect.DeepEqual(session.ActiveHistory, []string{userItem.ID, assistantItem.ID, toolA.ID, toolB.ID}) {
+		t.Fatalf("ActiveHistory = %#v, want user+assistant+interrupted tools", session.ActiveHistory)
+	}
+	if events[1]["item_id"] != userItem.ID || events[2]["item_id"] != assistantItem.ID || events[3]["item_id"] != toolA.ID || events[4]["item_id"] != toolB.ID {
+		t.Fatalf("item.appended events = %#v, want user/assistant/tool/tool ids", events[:5])
+	}
+	if events[5]["item_id"] != toolA.ID || events[6]["item_id"] != toolB.ID {
+		t.Fatalf("item.updated events = %#v/%#v, want tool item ids %q/%q", events[5], events[6], toolA.ID, toolB.ID)
+	}
+	if int64(events[5]["seq"].(float64)) <= toolA.Seq || int64(events[6]["seq"].(float64)) <= toolB.Seq {
+		t.Fatalf("item.updated seqs = %#v/%#v, want greater than birth seqs %d/%d", events[5]["seq"], events[6]["seq"], toolA.Seq, toolB.Seq)
+	}
+	messages, err := session.MaterializeActiveHistory()
+	if err != nil {
+		t.Fatalf("MaterializeActiveHistory() error = %v", err)
+	}
+	if len(messages) != 4 || messages[1].Role != model.MessageRoleAssistant || len(messages[1].ToolCalls) != 2 {
+		t.Fatalf("materialized messages = %#v, want assistant with two tool calls", messages)
+	}
+	for i, wantToolCallID := range []string{"call-a", "call-b"} {
+		message := messages[i+2]
+		if message.Role != model.MessageRoleTool || message.ToolCallID != wantToolCallID || !message.IsError || message.Content != "[tool execution interrupted]" {
+			t.Fatalf("materialized tool message[%d] = %#v, want interrupted error for %s", i, message, wantToolCallID)
+		}
+	}
+
+	persisted, err := store.PersistedEventsAfter("send-incremental-pending-cancel", 0)
+	if err != nil {
+		t.Fatalf("PersistedEventsAfter() error = %v", err)
+	}
+	updated := make([]sessions.PersistedEvent, 0, 2)
+	for _, event := range persisted {
+		if event.Type == sessions.RecordTypeItemUpdated {
+			updated = append(updated, event)
+		}
+	}
+	if len(updated) != 2 {
+		t.Fatalf("item.updated events = %#v, want exactly two persisted tool updates in %#v", updated, persisted)
+	}
+	if updated[0].ItemID != toolA.ID || updated[1].ItemID != toolB.ID {
+		t.Fatalf("persisted item.updated = %#v, want tool ids %q/%q", updated, toolA.ID, toolB.ID)
+	}
+}
+
 func TestSessionSendMessagePersistsPlannedCompactionAndSuccessfulTurnAtomically(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "sessions")
 	store := sessions.NewV2Store(root)

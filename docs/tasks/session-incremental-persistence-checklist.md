@@ -201,7 +201,7 @@ GC, and auto-rerunning interrupted tools.
   running turn" acceptance is **not provable** under storage failure and relies on the
   next-startup `MarkRunningTurnsInterrupted` sweep. State this as an explicit residual
   risk, do not paper over it.
-- [ ] Projector `TurnInterrupted` handler: **write `item.updated`** setting all
+- [x] Projector `TurnInterrupted` handler: **write `item.updated`** setting all
   current-turn `Status=pending` tool items to `interrupted` (required, not optional —
   on-disk honesty; materializer synthesis is only the SIGKILL fallback for when the
   handler never ran), then `MarkTurnInterrupted`.
