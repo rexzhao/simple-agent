@@ -174,12 +174,25 @@ func (p *Projector) handleTurnInputReady(event eventbus.TurnInputReady) error {
 		return fmt.Errorf("turn input message role must be %q", model.MessageRoleUser)
 	}
 	existing := sessions.SessionItemIDs(p.session.Items)
+	items := make([]sessions.SessionItem, 0, len(p.session.InstructionsSnapshot)+1)
+	activeHistory := copyStrings(p.session.ActiveHistory)
+	if len(activeHistory) == 0 {
+		for _, message := range p.session.InstructionsSnapshot {
+			itemID := sessions.NextSessionItemID(existing, message)
+			item := sessions.SessionItemFromMessage(itemID, message)
+			existing[itemID] = struct{}{}
+			items = append(items, item)
+			activeHistory = append(activeHistory, itemID)
+		}
+	}
+
 	itemID := sessions.NextSessionItemID(existing, event.Message)
 	item := sessions.SessionItemFromMessage(itemID, event.Message)
 	item.TurnID = turnID
-	activeHistory := append(copyStrings(p.session.ActiveHistory), itemID)
+	items = append(items, item)
+	activeHistory = append(activeHistory, itemID)
 
-	next, err := p.store.AppendItemsAndReplaceActiveHistoryFromState(p.session.ID, p.session, []sessions.SessionItem{item}, activeHistory)
+	next, err := p.store.AppendItemsAndReplaceActiveHistoryFromState(p.session.ID, p.session, items, activeHistory)
 	if err != nil {
 		return err
 	}

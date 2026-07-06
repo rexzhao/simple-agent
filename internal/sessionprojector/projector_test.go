@@ -142,6 +142,105 @@ func TestProjectorMaintainsToolMapAcrossRounds(t *testing.T) {
 	}
 }
 
+func TestProjectorBootstrapsRuntimeContextOnFirstInput(t *testing.T) {
+	store := sessions.NewV2Store(t.TempDir())
+	session, err := store.SaveMetadata(sessions.SessionV2{
+		ID:           "session-1",
+		Provider:     "test",
+		ModelProfile: "test",
+		ModelID:      "test",
+		InstructionsSnapshot: []model.Message{
+			{Role: model.MessageRoleSystem, Content: "system rules"},
+			{Role: model.MessageRoleDeveloper, Content: "developer rules"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("SaveMetadata() error = %v", err)
+	}
+	projector, err := New(store, session)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	defer projector.Close()
+	bus := eventbus.NewBus(projector.Handler())
+	defer bus.Close()
+
+	publish(t, bus, eventbus.TurnStarted{TurnID: "turn-1"})
+	publish(t, bus, eventbus.TurnInputReady{TurnID: "turn-1", Message: model.Message{Role: model.MessageRoleUser, Content: "hello"}})
+
+	loaded, err := store.Load("session-1")
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if got, want := itemIDs(loaded.Items), []string{"runtime-000001", "runtime-000002", "msg-000003"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("item IDs = %#v, want %#v", got, want)
+	}
+	if !reflect.DeepEqual(loaded.ActiveHistory, []string{"runtime-000001", "runtime-000002", "msg-000003"}) {
+		t.Fatalf("ActiveHistory = %#v, want runtime items then user", loaded.ActiveHistory)
+	}
+	for i, item := range loaded.Items[:2] {
+		if item.TurnID != "" || item.Kind != sessions.ItemKindRuntimeContext || item.Visibility != sessions.ItemVisibilityHidden {
+			t.Fatalf("runtime item[%d] = %#v, want hidden runtime context without TurnID", i, item)
+		}
+	}
+	if loaded.Items[2].TurnID != "turn-1" {
+		t.Fatalf("user item TurnID = %q, want turn-1", loaded.Items[2].TurnID)
+	}
+	messages, err := store.MaterializeActiveHistory(loaded)
+	if err != nil {
+		t.Fatalf("MaterializeActiveHistory() error = %v", err)
+	}
+	if got := messageContents(messages); !reflect.DeepEqual(got, []string{"system rules", "developer rules", "hello"}) {
+		t.Fatalf("materialized messages = %#v, want snapshot then user", got)
+	}
+}
+
+func TestProjectorDoesNotDuplicateRuntimeContextWhenActiveHistoryExists(t *testing.T) {
+	store := sessions.NewV2Store(t.TempDir())
+	_, err := store.SaveMetadata(sessions.SessionV2{
+		ID:           "session-1",
+		Provider:     "test",
+		ModelProfile: "test",
+		ModelID:      "test",
+		InstructionsSnapshot: []model.Message{
+			{Role: model.MessageRoleSystem, Content: "system rules"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("SaveMetadata() error = %v", err)
+	}
+	if _, err := store.AppendItemsAndReplaceActiveHistory("session-1", []sessions.SessionItem{
+		sessions.SessionItemFromMessage("runtime-000001", model.Message{Role: model.MessageRoleSystem, Content: "system rules"}),
+	}, []string{"runtime-000001"}); err != nil {
+		t.Fatalf("AppendItemsAndReplaceActiveHistory(seed) error = %v", err)
+	}
+	loaded, err := store.Load("session-1")
+	if err != nil {
+		t.Fatalf("Load(seed) error = %v", err)
+	}
+	projector, err := New(store, loaded)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	defer projector.Close()
+	bus := eventbus.NewBus(projector.Handler())
+	defer bus.Close()
+
+	publish(t, bus, eventbus.TurnStarted{TurnID: "turn-1"})
+	publish(t, bus, eventbus.TurnInputReady{TurnID: "turn-1", Message: model.Message{Role: model.MessageRoleUser, Content: "hello"}})
+
+	replayed, err := store.Replay("session-1")
+	if err != nil {
+		t.Fatalf("Replay() error = %v", err)
+	}
+	if got := countRuntimeContextItems(replayed.Items); got != 1 {
+		t.Fatalf("runtime context item count = %d, want 1", got)
+	}
+	if got, want := replayed.ActiveHistory, []string{"runtime-000001", "msg-000002"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("ActiveHistory = %#v, want %#v", got, want)
+	}
+}
+
 func TestProjectorRefreshesCachedStateAfterCompaction(t *testing.T) {
 	root := t.TempDir()
 	store := sessions.NewV2Store(root)
@@ -424,4 +523,30 @@ func toolItemContent(items []sessions.SessionItem, toolCallID string) string {
 		}
 	}
 	return ""
+}
+
+func itemIDs(items []sessions.SessionItem) []string {
+	ids := make([]string, 0, len(items))
+	for _, item := range items {
+		ids = append(ids, item.ID)
+	}
+	return ids
+}
+
+func messageContents(messages []model.Message) []string {
+	contents := make([]string, 0, len(messages))
+	for _, message := range messages {
+		contents = append(contents, message.Content)
+	}
+	return contents
+}
+
+func countRuntimeContextItems(items []sessions.SessionItem) int {
+	count := 0
+	for _, item := range items {
+		if item.Kind == sessions.ItemKindRuntimeContext {
+			count++
+		}
+	}
+	return count
 }
