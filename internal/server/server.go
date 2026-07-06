@@ -791,6 +791,12 @@ func (p *Process) handleSessionPath(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		p.handleSessionItems(w, r, id)
+	case len(parts) == 3 && parts[1] == "items":
+		if r.Method != http.MethodGet {
+			writeMethodNotAllowed(w, http.MethodGet)
+			return
+		}
+		p.handleSessionItem(w, r, id, parts[2])
 	case len(parts) == 2 && parts[1] == "stream":
 		if r.Method != http.MethodGet {
 			writeMethodNotAllowed(w, http.MethodGet)
@@ -992,6 +998,50 @@ func (p *Process) handleSessionItems(w http.ResponseWriter, r *http.Request, id 
 		HasMoreBefore: hasMoreBefore,
 		HasMoreAfter:  hasMoreAfter,
 	})
+}
+
+func (p *Process) handleSessionItem(w http.ResponseWriter, r *http.Request, id, itemID string) {
+	if !validSessionAPIID(id) {
+		writeError(w, http.StatusBadRequest, "invalid_session_id", "invalid session id")
+		return
+	}
+	if !validSessionItemAPIID(itemID) {
+		writeError(w, http.StatusBadRequest, "invalid_item_id", "invalid item id")
+		return
+	}
+	query, err := parseSessionItemQuery(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_query", err.Error())
+		return
+	}
+	if query.View == sessionItemsViewDebug && !p.requireRegistryToken(w, r) {
+		return
+	}
+	store := p.sessionStore
+	if store == nil {
+		writeError(w, http.StatusServiceUnavailable, "session_store_unavailable", "session store is not configured")
+		return
+	}
+	session, err := store.Load(id)
+	if err != nil {
+		if errors.Is(err, sessions.ErrNotFound) {
+			writeError(w, http.StatusNotFound, "session_not_found", "session not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "session_store_error", "could not load session item")
+		return
+	}
+	item, ok := findSessionItemByID(session.Items, itemID)
+	if !ok || !sessionItemVisibleInView(item, query.View) {
+		writeError(w, http.StatusNotFound, "item_not_found", "session item not found")
+		return
+	}
+	item, err = resolveSessionItemInlineContent(store, item)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "session_store_error", "could not load session item")
+		return
+	}
+	writeJSON(w, http.StatusOK, sessionItemRefetchDTOFromSessionItem(item, query.View == sessionItemsViewDebug))
 }
 
 func (p *Process) handleSessionBlobContent(w http.ResponseWriter, r *http.Request, id, hash string) {
@@ -1640,6 +1690,11 @@ func sessionStreamEventFromPersistedEvent(event sessions.PersistedEvent) (Sessio
 			"seq":     event.Seq,
 			"item_id": event.ItemID,
 		}), true
+	case sessions.RecordTypeItemUpdated:
+		return NewSessionStreamEvent("item.updated", map[string]any{
+			"seq":     event.Seq,
+			"item_id": event.ItemID,
+		}), true
 	case sessions.RecordTypeCompactionCreated:
 		return NewSessionStreamEvent("compaction.created", map[string]any{
 			"seq":           event.Seq,
@@ -1952,12 +2007,22 @@ type sessionItemDTO struct {
 	Kind       string                 `json:"kind"`
 	Visibility string                 `json:"visibility"`
 	Audience   string                 `json:"audience"`
+	Status     string                 `json:"status,omitempty"`
 	Message    *sessionItemMessageDTO `json:"message,omitempty"`
 }
 
 type sessionItemMessageDTO struct {
-	Role    model.MessageRole             `json:"role"`
-	Content *sessionItemMessageContentDTO `json:"content,omitempty"`
+	Role       model.MessageRole             `json:"role"`
+	Content    *sessionItemMessageContentDTO `json:"content,omitempty"`
+	ToolCallID string                        `json:"tool_call_id,omitempty"`
+	ToolCalls  []sessionItemToolCallDTO      `json:"tool_calls,omitempty"`
+	IsError    bool                          `json:"is_error,omitempty"`
+}
+
+type sessionItemToolCallDTO struct {
+	ID        string `json:"id"`
+	Name      string `json:"name"`
+	Arguments string `json:"arguments,omitempty"`
 }
 
 type sessionItemMessageContentDTO struct {
@@ -1991,6 +2056,10 @@ type sessionItemsQuery struct {
 	AfterSeq  *int64
 	Limit     int
 	View      string
+}
+
+type sessionItemQuery struct {
+	View string
 }
 
 type sessionListQuery struct {
@@ -2087,6 +2156,24 @@ func parseSessionItemsQuery(r *http.Request) (sessionItemsQuery, error) {
 			query.View = rawView
 		default:
 			return sessionItemsQuery{}, fmt.Errorf("view must be %q or %q", sessionItemsViewChat, sessionItemsViewDebug)
+		}
+	}
+	return query, nil
+}
+
+func parseSessionItemQuery(r *http.Request) (sessionItemQuery, error) {
+	values := r.URL.Query()
+	query := sessionItemQuery{
+		View: sessionItemsViewChat,
+	}
+	if rawView, ok, err := singleQueryValue(values, "view"); err != nil {
+		return sessionItemQuery{}, err
+	} else if ok {
+		switch rawView {
+		case sessionItemsViewChat, sessionItemsViewDebug:
+			query.View = rawView
+		default:
+			return sessionItemQuery{}, fmt.Errorf("view must be %q or %q", sessionItemsViewChat, sessionItemsViewDebug)
 		}
 	}
 	return query, nil
@@ -2333,6 +2420,7 @@ func sessionItemDTOFromSessionItem(item sessions.SessionItem) sessionItemDTO {
 		Kind:       item.Kind,
 		Visibility: item.Visibility,
 		Audience:   item.Audience,
+		Status:     item.Status,
 	}
 	if item.Message != nil {
 		dto.Message = &sessionItemMessageDTO{
@@ -2341,6 +2429,68 @@ func sessionItemDTOFromSessionItem(item sessions.SessionItem) sessionItemDTO {
 		dto.Message.Content = sessionItemMessageContentDTOFromSessionItem(item)
 	}
 	return dto
+}
+
+func sessionItemRefetchDTOFromSessionItem(item sessions.SessionItem, includeDebugFields bool) sessionItemDTO {
+	dto := sessionItemDTO{
+		Seq:        item.Seq,
+		ID:         item.ID,
+		TurnID:     item.TurnID,
+		CreatedAt:  item.CreatedAt,
+		Kind:       item.Kind,
+		Visibility: item.Visibility,
+		Audience:   item.Audience,
+		Status:     item.Status,
+	}
+	if item.Message == nil {
+		return dto
+	}
+	message := &sessionItemMessageDTO{Role: item.Message.Role}
+	if item.Message.Content != "" {
+		message.Content = &sessionItemMessageContentDTO{Inline: item.Message.Content}
+	} else {
+		message.Content = sessionItemMessageContentDTOFromSessionItem(item)
+	}
+	if includeDebugFields {
+		message.ToolCallID = item.Message.ToolCallID
+		message.IsError = item.Message.IsError
+		if len(item.Message.ToolCalls) > 0 {
+			message.ToolCalls = make([]sessionItemToolCallDTO, 0, len(item.Message.ToolCalls))
+			for _, toolCall := range item.Message.ToolCalls {
+				message.ToolCalls = append(message.ToolCalls, sessionItemToolCallDTO{
+					ID:        toolCall.ID,
+					Name:      toolCall.Name,
+					Arguments: toolCall.Arguments,
+				})
+			}
+		}
+	}
+	dto.Message = message
+	return dto
+}
+
+func resolveSessionItemInlineContent(store *sessions.V2Store, item sessions.SessionItem) (sessions.SessionItem, error) {
+	if store == nil || item.Message == nil || item.Content == nil {
+		return item, nil
+	}
+	var content string
+	switch {
+	case item.Content.Inline != "":
+		content = item.Content.Inline
+	case item.Content.Blob != nil:
+		raw, err := store.ReadBlob(*item.Content.Blob)
+		if err != nil {
+			return sessions.SessionItem{}, err
+		}
+		content = string(raw)
+	default:
+		return item, nil
+	}
+	message := *item.Message
+	message.Content = content
+	item.Message = &message
+	item.Content = nil
+	return item, nil
 }
 
 func sessionItemMessageContentDTOFromSessionItem(item sessions.SessionItem) *sessionItemMessageContentDTO {
@@ -2785,6 +2935,10 @@ func validSessionAPIID(id string) bool {
 		return false
 	}
 	return true
+}
+
+func validSessionItemAPIID(id string) bool {
+	return validSessionAPIID(id)
 }
 
 func (p *Process) newSessionFromDefaults() sessions.SessionV2 {

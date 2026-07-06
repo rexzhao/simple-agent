@@ -889,7 +889,7 @@ func TestSessionMetadataStructuredErrors(t *testing.T) {
 		t.Fatalf("POST /sessions/id error = %#v, want method_not_allowed", body)
 	}
 
-	req, err = http.NewRequest(http.MethodGet, baseURL+"/sessions/missing-session/items/extra", nil)
+	req, err = http.NewRequest(http.MethodGet, baseURL+"/sessions/missing-session/items/extra/path", nil)
 	if err != nil {
 		t.Fatalf("NewRequest(GET bad path) error = %v", err)
 	}
@@ -974,6 +974,45 @@ func TestSessionStreamAfterSeqCatchesUpPersistedItemsBeforeLiveEvents(t *testing
 		t.Fatalf("PublishSessionEvent(live) error = %v", err)
 	}
 	got := readSessionStreamEvent(t, conn)
+	if got["type"] != "text.delta" || got["text"] != "live" {
+		t.Fatalf("live stream event = %#v, want text.delta live after catch-up", got)
+	}
+}
+
+func TestSessionStreamAfterSeqCatchesUpItemUpdatedBeforeLiveEvents(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "sessions")
+	store := sessions.NewV2Store(root)
+	saveServerTestSession(t, store, "catchup-updated")
+	pending := appendServerTestItem(t, store, "catchup-updated", sessions.SessionItem{
+		ID:         "tool-1",
+		Kind:       sessions.ItemKindMessage,
+		Visibility: sessions.ItemVisibilityVisible,
+		Audience:   sessions.ItemAudienceModel,
+		Status:     sessions.ItemStatusPending,
+		Message:    &model.Message{Role: model.MessageRoleTool, ToolCallID: "call-1"},
+	})
+	updated := pending
+	updated.Status = sessions.ItemStatusCompleted
+	updated.Message = &model.Message{Role: model.MessageRoleTool, Content: "tool result", ToolCallID: "call-1"}
+	if _, err := store.UpdateItem("catchup-updated", updated); err != nil {
+		t.Fatalf("UpdateItem(tool-1) error = %v", err)
+	}
+
+	process := startSessionAPIServer(t, store, sessions.SessionV2{})
+	conn := dialSessionStreamWithQuery(t, process, "catchup-updated", fmt.Sprintf("after_seq=%d", pending.Seq))
+
+	got := readSessionStreamEvent(t, conn)
+	if got["type"] != "item.updated" || int64(got["seq"].(float64)) != pending.Seq+1 || got["item_id"] != "tool-1" {
+		t.Fatalf("catch-up event = %#v, want item.updated seq %d id tool-1", got, pending.Seq+1)
+	}
+	if _, ok := got["content"]; ok {
+		t.Fatalf("catch-up event included item content: %#v", got)
+	}
+
+	if err := process.PublishSessionEvent("catchup-updated", NewSessionStreamEvent("text.delta", map[string]any{"turn_id": "turn-live", "text": "live"})); err != nil {
+		t.Fatalf("PublishSessionEvent(live) error = %v", err)
+	}
+	got = readSessionStreamEvent(t, conn)
 	if got["type"] != "text.delta" || got["text"] != "live" {
 		t.Fatalf("live stream event = %#v, want text.delta live after catch-up", got)
 	}
@@ -2638,6 +2677,116 @@ func TestSessionItemsChatAndDebugFilteringAndNarrowDTO(t *testing.T) {
 	}
 	if bytes.Contains(debugRaw, []byte("SECRET TOOL ARGUMENTS")) {
 		t.Fatalf("debug response leaked tool call arguments: %s", debugRaw)
+	}
+}
+
+func TestSessionItemEndpointRefetchesUpdatedToolItemAndKeepsChatViewNarrow(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "sessions")
+	store := sessions.NewV2Store(root)
+	saveServerTestSession(t, store, "item-detail")
+
+	appendServerTestItem(t, store, "item-detail", sessions.SessionItem{
+		ID:         "visible-assistant",
+		Kind:       sessions.ItemKindMessage,
+		Visibility: sessions.ItemVisibilityVisible,
+		Audience:   sessions.ItemAudienceModel,
+		Message: &model.Message{
+			Role:    model.MessageRoleAssistant,
+			Content: "assistant safe content",
+			ToolCalls: []model.ToolCall{{
+				ID:        "call-secret",
+				Name:      "read_file",
+				Arguments: "SECRET TOOL ARGUMENTS",
+			}},
+		},
+	})
+	appendServerTestItem(t, store, "item-detail", sessions.SessionItem{
+		ID:         "hidden-summary",
+		Kind:       sessions.ItemKindMessage,
+		Visibility: sessions.ItemVisibilityHidden,
+		Audience:   sessions.ItemAudienceModel,
+		Message:    &model.Message{Role: model.MessageRoleDeveloper, Content: "hidden summary secret"},
+	})
+	pending := appendServerTestItem(t, store, "item-detail", sessions.SessionItem{
+		ID:         "tool-result",
+		Kind:       sessions.ItemKindMessage,
+		Visibility: sessions.ItemVisibilityVisible,
+		Audience:   sessions.ItemAudienceModel,
+		Status:     sessions.ItemStatusPending,
+		Message:    &model.Message{Role: model.MessageRoleTool, ToolCallID: "call-secret"},
+	})
+	largeToolContent := strings.Repeat("tool output ", 500) + "TOOL-RESULT-TAIL"
+	updated := pending
+	updated.Status = sessions.ItemStatusError
+	updated.Message = &model.Message{Role: model.MessageRoleTool, Content: largeToolContent, ToolCallID: "call-secret", IsError: true}
+	if _, err := store.UpdateItem("item-detail", updated); err != nil {
+		t.Fatalf("UpdateItem(tool-result) error = %v", err)
+	}
+
+	process := startSessionAPIServerWithToken(t, store, sessions.SessionV2{}, "registry-token")
+	baseURL := "http://" + process.Addr()
+
+	assistantRaw, assistant := getRawJSONStatus(t, baseURL+"/sessions/item-detail/items/visible-assistant", "registry-token", http.StatusOK)
+	assertNoItemDTOLeak(t, assistantRaw)
+	if assistant["id"] != "visible-assistant" {
+		t.Fatalf("assistant item id = %#v, want visible-assistant", assistant["id"])
+	}
+	if !bytes.Contains(assistantRaw, []byte("assistant safe content")) {
+		t.Fatalf("assistant chat item missing visible content: %s", assistantRaw)
+	}
+	if bytes.Contains(assistantRaw, []byte("SECRET TOOL ARGUMENTS")) {
+		t.Fatalf("assistant chat item leaked tool call arguments: %s", assistantRaw)
+	}
+
+	for _, tt := range []struct {
+		name  string
+		token string
+	}{
+		{name: "missing token"},
+		{name: "wrong token", token: "wrong-token"},
+	} {
+		t.Run("debug "+tt.name, func(t *testing.T) {
+			raw, body := getRawJSONStatus(t, baseURL+"/sessions/item-detail/items/tool-result?view=debug", tt.token, http.StatusForbidden)
+			assertErrorCode(t, body, "permission_denied")
+			for _, forbidden := range []string{"TOOL-RESULT-TAIL", "SECRET TOOL ARGUMENTS", "registry-token"} {
+				if bytes.Contains(raw, []byte(forbidden)) {
+					t.Fatalf("debug permission error leaked %q: %s", forbidden, raw)
+				}
+			}
+		})
+	}
+
+	raw, body := getRawJSONStatus(t, baseURL+"/sessions/item-detail/items/tool-result", "registry-token", http.StatusNotFound)
+	assertErrorCode(t, body, "item_not_found")
+	if bytes.Contains(raw, []byte("TOOL-RESULT-TAIL")) {
+		t.Fatalf("chat tool item error leaked tool result: %s", raw)
+	}
+	raw, body = getRawJSONStatus(t, baseURL+"/sessions/item-detail/items/hidden-summary", "registry-token", http.StatusNotFound)
+	assertErrorCode(t, body, "item_not_found")
+	if bytes.Contains(raw, []byte("hidden summary secret")) {
+		t.Fatalf("chat hidden item error leaked hidden content: %s", raw)
+	}
+
+	debugRaw, debug := getRawJSONStatus(t, baseURL+"/sessions/item-detail/items/tool-result?view=debug", "registry-token", http.StatusOK)
+	if debug["status"] != sessions.ItemStatusError {
+		t.Fatalf("debug tool status = %#v, want error; body=%#v", debug["status"], debug)
+	}
+	message := debug["message"].(map[string]any)
+	if message["role"] != string(model.MessageRoleTool) || message["tool_call_id"] != "call-secret" || message["is_error"] != true {
+		t.Fatalf("debug tool message = %#v, want role/tool_call_id/is_error", message)
+	}
+	content := message["content"].(map[string]any)
+	if content["inline"] != largeToolContent {
+		t.Fatalf("debug tool content = %#v, want full inline blob-resolved content", content)
+	}
+	if !bytes.Contains(debugRaw, []byte("TOOL-RESULT-TAIL")) {
+		t.Fatalf("debug tool item missing blob-resolved tail: %s", debugRaw)
+	}
+
+	raw, body = getRawJSONStatus(t, baseURL+"/sessions/item-detail/items/tool-result/content?view=debug", "registry-token", http.StatusNotFound)
+	assertErrorCode(t, body, "not_found")
+	if bytes.Contains(raw, []byte("TOOL-RESULT-TAIL")) {
+		t.Fatalf("legacy item content route leaked tool result: %s", raw)
 	}
 }
 
