@@ -1172,98 +1172,17 @@ func (p *Process) handleSessionMessage(w http.ResponseWriter, r *http.Request, i
 		p.writeTurnError(w, err)
 		return
 	}
-	if incremental {
-		defer func() {
-			p.endSessionTurn(id)
-			cancelTurn()
-		}()
-		p.handleIncrementalSessionMessage(w, id, turnID, turnCtx, session, store, content)
-		return
-	}
-	marked, err := store.MarkTurnRunning(id, turnID)
-	if err != nil {
+	if !incremental {
 		p.endSessionTurn(id)
 		cancelTurn()
-		writeError(w, http.StatusInternalServerError, "session_store_error", "could not mark turn running")
+		writeError(w, http.StatusInternalServerError, "turn_runner_error", "turn runner does not support incremental persistence")
 		return
 	}
-	session.RunningTurnID = marked.RunningTurnID
-	session.RunningStartedAt = marked.RunningStartedAt
 	defer func() {
 		p.endSessionTurn(id)
 		cancelTurn()
 	}()
-
-	p.publishSessionEvent(id, NewSessionStreamEvent("turn.started", map[string]any{
-		"turn_id": turnID,
-	}))
-	result, err := p.turnRunner.RunSessionTurn(turnCtx, SessionTurnRequest{
-		Session:      session,
-		SessionStore: store,
-		Content:      content,
-		Emit: func(event model.Event) {
-			p.publishModelTurnEvent(id, turnID, event)
-		},
-	})
-	if err != nil {
-		p.finishDurableTurn(id, turnID, errors.Is(err, context.Canceled))
-		p.publishTurnFailed(id, turnID, err)
-		p.writeTurnError(w, err)
-		return
-	}
-
-	if strings.TrimSpace(result.Session.ID) == "" {
-		result.Session = session
-	} else {
-		result.Session.ID = session.ID
-	}
-	for i := range result.Items {
-		if result.Items[i].TurnID == "" {
-			result.Items[i].TurnID = turnID
-		}
-	}
-	result.Session.RunningTurnID = turnID
-	result.Session.RunningStartedAt = session.RunningStartedAt
-	var saved sessions.SessionV2
-	if result.Compaction != nil {
-		saved, err = store.SaveCompactedTurn(result.Session, result.Compaction.SummaryItem, result.Compaction.Checkpoint, result.Items, result.ActiveHistory)
-	} else {
-		saved, err = store.SaveTurn(result.Session, result.Items, result.ActiveHistory)
-	}
-	if err != nil {
-		p.finishDurableTurn(id, turnID, false)
-		p.publishTurnFailed(id, turnID, err)
-		writeError(w, http.StatusInternalServerError, "session_store_error", "could not save turn")
-		return
-	}
-	if _, err := store.ClearRunningTurn(id, turnID); err != nil {
-		writeError(w, http.StatusInternalServerError, "session_store_error", "could not clear running turn")
-		return
-	}
-	appendedItems := result.Items
-	if result.Compaction != nil {
-		appendedItems = append([]sessions.SessionItem{result.Compaction.SummaryItem}, appendedItems...)
-	}
-	for _, item := range savedSessionItemsByID(saved.Items, appendedItems) {
-		p.publishSessionEvent(id, NewSessionStreamEvent("item.appended", map[string]any{
-			"seq":     item.Seq,
-			"item_id": item.ID,
-		}))
-	}
-	if result.Compaction != nil {
-		p.publishSessionEvent(id, NewSessionStreamEvent("compaction.created", map[string]any{
-			"compaction_id": result.Compaction.Checkpoint.ID,
-		}))
-	}
-	p.publishSessionEvent(id, NewSessionStreamEvent("turn.committed", map[string]any{
-		"turn_id":  turnID,
-		"last_seq": saved.LastSeq,
-	}))
-	writeJSON(w, http.StatusOK, map[string]any{
-		"turn_id":  turnID,
-		"last_seq": saved.LastSeq,
-		"status":   "committed",
-	})
+	p.handleIncrementalSessionMessage(w, id, turnID, turnCtx, session, store, content)
 }
 
 func (p *Process) supportsIncrementalSessionTurn(ctx context.Context, request SessionTurnRequest) (bool, error) {
@@ -3147,20 +3066,6 @@ func activeHistoryReplacedSeq(lastSeq int64) int64 {
 		return 0
 	}
 	return lastSeq - 1
-}
-
-func savedSessionItemsByID(savedItems, requestedItems []sessions.SessionItem) []sessions.SessionItem {
-	byID := make(map[string]sessions.SessionItem, len(savedItems))
-	for _, item := range savedItems {
-		byID[item.ID] = item
-	}
-	items := make([]sessions.SessionItem, 0, len(requestedItems))
-	for _, item := range requestedItems {
-		if saved, ok := byID[item.ID]; ok {
-			items = append(items, saved)
-		}
-	}
-	return items
 }
 
 func validSessionAPIID(id string) bool {

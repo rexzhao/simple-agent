@@ -1532,7 +1532,7 @@ func TestSessionSendMessagePersistsSuccessfulTurnAndPublishesEvents(t *testing.T
 	root := filepath.Join(t.TempDir(), "sessions")
 	store := sessions.NewV2Store(root)
 	saveServerTestSession(t, store, "send-success")
-	runner := fakeSessionTurnRunner{
+	runner := fakeIncrementalSessionTurnRunner{
 		run: func(ctx context.Context, request SessionTurnRequest) (SessionTurnResult, error) {
 			if request.Session.ID != "send-success" {
 				t.Fatalf("runner session id = %q, want send-success", request.Session.ID)
@@ -1540,17 +1540,17 @@ func TestSessionSendMessagePersistsSuccessfulTurnAndPublishesEvents(t *testing.T
 			if request.Content != "hello server" {
 				t.Fatalf("runner content = %q, want hello server", request.Content)
 			}
-			if request.Publisher != nil || request.TurnID != "" {
-				t.Fatalf("legacy runner request got publisher=%T turn_id=%q, want legacy path", request.Publisher, request.TurnID)
+			if request.Publisher == nil || request.TurnID == "" {
+				t.Fatalf("runner request got publisher=%T turn_id=%q, want incremental path", request.Publisher, request.TurnID)
 			}
 			request.Emit(model.TextDeltaEvent{Text: "hi "})
 			request.Emit(model.TextDeltaEvent{Text: "there"})
 			request.Emit(model.ToolCallDoneEvent{ToolCall: model.ToolCall{ID: "call-1", Name: "read_file", Arguments: `{"path":"secret.txt"}`}})
 			request.Emit(model.ToolResultEvent{Result: model.ToolResult{ToolCallID: "call-1", Name: "read_file", Content: "tool result secret"}})
-			return serverTestTurnResult(request.Session,
-				model.Message{Role: model.MessageRoleUser, Content: request.Content},
-				model.Message{Role: model.MessageRoleAssistant, Content: "hi there"},
-			), nil
+			if err := publishServerTestAssistant(request, "hi there"); err != nil {
+				return SessionTurnResult{}, err
+			}
+			return SessionTurnResult{Incremental: true}, nil
 		},
 	}
 	process := startSessionAPIServerWithTurnRunner(t, store, sessions.SessionV2{}, "registry-token", runner)
@@ -1572,20 +1572,20 @@ func TestSessionSendMessagePersistsSuccessfulTurnAndPublishesEvents(t *testing.T
 		readSessionStreamEvent(t, conn),
 		readSessionStreamEvent(t, conn),
 	}
-	wantTypes := []string{"turn.started", "text.delta", "text.delta", "tool.started", "tool.finished", "item.appended", "item.appended", "turn.committed"}
+	wantTypes := []string{"turn.started", "item.appended", "text.delta", "text.delta", "tool.started", "tool.finished", "item.appended", "turn.committed"}
 	for i, want := range wantTypes {
 		if events[i]["type"] != want {
 			t.Fatalf("event[%d] type = %#v, want %q; events=%#v", i, events[i]["type"], want, events)
 		}
 	}
-	if events[1]["text"] != "hi " || events[2]["text"] != "there" {
-		t.Fatalf("text delta events = %#v/%#v, want streamed text", events[1], events[2])
+	if events[2]["text"] != "hi " || events[3]["text"] != "there" {
+		t.Fatalf("text delta events = %#v/%#v, want streamed text", events[2], events[3])
 	}
-	if events[3]["name"] != "read_file" || events[4]["name"] != "read_file" || events[4]["is_error"] != false {
-		t.Fatalf("tool events = %#v/%#v, want sanitized tool status", events[3], events[4])
+	if events[4]["name"] != "read_file" || events[5]["name"] != "read_file" || events[5]["is_error"] != false {
+		t.Fatalf("tool events = %#v/%#v, want sanitized tool status", events[4], events[5])
 	}
-	if events[4]["content"] != nil || events[4]["arguments"] != nil {
-		t.Fatalf("tool event leaked content or arguments: %#v", events[4])
+	if events[5]["content"] != nil || events[5]["arguments"] != nil {
+		t.Fatalf("tool event leaked content or arguments: %#v", events[5])
 	}
 	if events[7]["last_seq"] != body["last_seq"] {
 		t.Fatalf("committed last_seq = %#v, response last_seq = %#v", events[7]["last_seq"], body["last_seq"])
@@ -2912,7 +2912,7 @@ func TestSessionSendMessageIncrementalInterruptsPendingToolsAfterToolResultPubli
 	}
 }
 
-func TestSessionSendMessagePersistsPlannedCompactionAndSuccessfulTurnAtomically(t *testing.T) {
+func TestSessionSendMessagePersistsPlannedCompactionBeforeIncrementalTurn(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "sessions")
 	store := sessions.NewV2Store(root)
 	saveServerTestSession(t, store, "send-compact-success")
@@ -2926,8 +2926,11 @@ func TestSessionSendMessagePersistsPlannedCompactionAndSuccessfulTurnAtomically(
 	if _, err := store.ReplaceActiveHistory("send-compact-success", []string{existing.ID}); err != nil {
 		t.Fatalf("ReplaceActiveHistory() error = %v", err)
 	}
-	runner := fakeSessionTurnRunner{
-		run: func(ctx context.Context, request SessionTurnRequest) (SessionTurnResult, error) {
+	runner := fakeIncrementalSessionTurnRunner{
+		plan: func(ctx context.Context, request SessionTurnRequest) (SessionCompactionResult, error) {
+			if request.TurnID == "" {
+				t.Fatalf("plan turn id = empty, want incremental turn id")
+			}
 			summaryMessage := model.Message{Role: model.MessageRoleDeveloper, Content: "<compaction_summary>\nplanned\n</compaction_summary>"}
 			summary := sessions.SessionItem{
 				ID:         "summary-1",
@@ -2945,17 +2948,25 @@ func TestSessionSendMessagePersistsPlannedCompactionAndSuccessfulTurnAtomically(
 				PreviousActiveHistory: []string{existing.ID},
 				ReplacementHistory:    []string{existing.ID, summary.ID},
 			}
-			userItem := serverTestSessionItemFromMessage("msg-000003", model.Message{Role: model.MessageRoleUser, Content: request.Content})
-			assistantItem := serverTestSessionItemFromMessage("msg-000004", model.Message{Role: model.MessageRoleAssistant, Content: "assistant after compact"})
-			return SessionTurnResult{
+			return SessionCompactionResult{
 				Session: request.Session,
-				Compaction: &SessionCompactionPlan{
+				Compaction: SessionCompactionPlan{
 					SummaryItem: summary,
 					Checkpoint:  checkpoint,
 				},
-				Items:         []sessions.SessionItem{userItem, assistantItem},
-				ActiveHistory: []string{existing.ID, summary.ID, userItem.ID, assistantItem.ID},
 			}, nil
+		},
+		run: func(ctx context.Context, request SessionTurnRequest) (SessionTurnResult, error) {
+			if request.Publisher == nil || request.TurnID == "" {
+				t.Fatalf("runner request got publisher=%T turn_id=%q, want incremental path", request.Publisher, request.TurnID)
+			}
+			if got := responseSessionItemIDs(request.Session.Items); !reflect.DeepEqual(got, []string{"existing-user", "summary-1"}) {
+				t.Fatalf("runner session items = %#v, want compacted state before agent run", got)
+			}
+			if err := publishServerTestAssistant(request, "assistant after compact"); err != nil {
+				return SessionTurnResult{}, err
+			}
+			return SessionTurnResult{Incremental: true}, nil
 		},
 	}
 	process := startSessionAPIServerWithTurnRunner(t, store, sessions.SessionV2{}, "registry-token", runner)
@@ -2981,8 +2992,8 @@ func TestSessionSendMessagePersistsPlannedCompactionAndSuccessfulTurnAtomically(
 	if session.Items[1].Visibility != sessions.ItemVisibilityHidden || session.Items[2].Message.Content != "after compact" || session.Items[3].Message.Content != "assistant after compact" {
 		t.Fatalf("persisted items = %#v, want hidden summary and visible turn", session.Items)
 	}
-	if session.LastSeq != 9 {
-		t.Fatalf("LastSeq = %d, want compact+turn transaction through seq 9", session.LastSeq)
+	if session.LastSeq != 15 {
+		t.Fatalf("LastSeq = %d, want pre-turn compaction then incremental user+assistant writes through seq 15", session.LastSeq)
 	}
 }
 
@@ -3003,14 +3014,14 @@ func TestSessionSendMessageRejectsBusySession(t *testing.T) {
 		releaseOnce.Do(func() { close(release) })
 	}
 	defer closeRelease()
-	runner := fakeSessionTurnRunner{
+	runner := fakeIncrementalSessionTurnRunner{
 		run: func(ctx context.Context, request SessionTurnRequest) (SessionTurnResult, error) {
 			started <- startedTurn{sessionID: request.Session.ID, content: request.Content}
 			<-release
-			return serverTestTurnResult(request.Session,
-				model.Message{Role: model.MessageRoleUser, Content: request.Content},
-				model.Message{Role: model.MessageRoleAssistant, Content: "done"},
-			), nil
+			if err := publishServerTestAssistant(request, "done"); err != nil {
+				return SessionTurnResult{}, err
+			}
+			return SessionTurnResult{Incremental: true}, nil
 		},
 	}
 	process := startSessionAPIServerWithTurnRunner(t, store, sessions.SessionV2{}, "registry-token", runner)
@@ -3091,7 +3102,7 @@ func TestServerShutdownImmediateCancelsRunningTurnAndStopsServer(t *testing.T) {
 	saveServerTestSession(t, store, "shutdown-busy")
 	started := make(chan struct{})
 	canceled := make(chan struct{})
-	runner := fakeSessionTurnRunner{
+	runner := fakeIncrementalSessionTurnRunner{
 		run: func(ctx context.Context, request SessionTurnRequest) (SessionTurnResult, error) {
 			close(started)
 			<-ctx.Done()
@@ -3137,8 +3148,8 @@ func TestServerShutdownImmediateCancelsRunningTurnAndStopsServer(t *testing.T) {
 	if session.RunningTurnID != "" || session.InterruptedTurnID != "turn-000001" || session.InterruptedAt.IsZero() {
 		t.Fatalf("shutdown metadata = running %q interrupted %q at %s, want interrupted turn-000001", session.RunningTurnID, session.InterruptedTurnID, session.InterruptedAt)
 	}
-	if session.LastSeq != 0 || len(session.Items) != 0 {
-		t.Fatalf("shutdown session replay = last_seq %d items %#v, want no committed replay", session.LastSeq, session.Items)
+	if len(session.Items) != 1 || session.Items[0].Message == nil || session.Items[0].Message.Role != model.MessageRoleUser {
+		t.Fatalf("shutdown session replay = last_seq %d items %#v, want persisted input only", session.LastSeq, session.Items)
 	}
 }
 
@@ -3148,7 +3159,7 @@ func TestServerShutdownWaitDrainsRunningTurnAndRejectsNewTurns(t *testing.T) {
 	saveServerTestSession(t, store, "shutdown-wait")
 	started := make(chan struct{})
 	release := make(chan struct{})
-	runner := fakeSessionTurnRunner{
+	runner := fakeIncrementalSessionTurnRunner{
 		run: func(ctx context.Context, request SessionTurnRequest) (SessionTurnResult, error) {
 			close(started)
 			select {
@@ -3156,10 +3167,10 @@ func TestServerShutdownWaitDrainsRunningTurnAndRejectsNewTurns(t *testing.T) {
 			case <-ctx.Done():
 				return SessionTurnResult{}, ctx.Err()
 			}
-			return serverTestTurnResult(request.Session,
-				model.Message{Role: model.MessageRoleUser, Content: request.Content},
-				model.Message{Role: model.MessageRoleAssistant, Content: "done"},
-			), nil
+			if err := publishServerTestAssistant(request, "done"); err != nil {
+				return SessionTurnResult{}, err
+			}
+			return SessionTurnResult{Incremental: true}, nil
 		},
 	}
 	process := startSessionAPIServerWithTurnRunner(t, store, sessions.SessionV2{}, "registry-token", runner)
@@ -3208,8 +3219,8 @@ func TestServerShutdownWaitDrainsRunningTurnAndRejectsNewTurns(t *testing.T) {
 	if session.RunningTurnID != "" || session.InterruptedTurnID != "" || !session.InterruptedAt.IsZero() {
 		t.Fatalf("drained metadata = running %q interrupted %q at %s, want cleared without interruption", session.RunningTurnID, session.InterruptedTurnID, session.InterruptedAt)
 	}
-	if session.LastSeq != 5 || len(session.Items) != 2 {
-		t.Fatalf("drained session replay = last_seq %d items %#v, want committed turn", session.LastSeq, session.Items)
+	if len(session.Items) != 2 || session.Items[0].Message == nil || session.Items[0].Message.Role != model.MessageRoleUser || session.Items[1].Message == nil || session.Items[1].Message.Content != "done" {
+		t.Fatalf("drained session replay = last_seq %d items %#v, want committed incremental turn", session.LastSeq, session.Items)
 	}
 }
 
@@ -3219,7 +3230,7 @@ func TestServerShutdownWaitTimeoutCancelsRunningTurnAndStopsServer(t *testing.T)
 	saveServerTestSession(t, store, "shutdown-timeout")
 	started := make(chan struct{})
 	canceled := make(chan struct{})
-	runner := fakeSessionTurnRunner{
+	runner := fakeIncrementalSessionTurnRunner{
 		run: func(ctx context.Context, request SessionTurnRequest) (SessionTurnResult, error) {
 			close(started)
 			<-ctx.Done()
@@ -3264,8 +3275,8 @@ func TestServerShutdownWaitTimeoutCancelsRunningTurnAndStopsServer(t *testing.T)
 	if session.RunningTurnID != "" || session.InterruptedTurnID != "turn-000001" || session.InterruptedAt.IsZero() {
 		t.Fatalf("timeout metadata = running %q interrupted %q at %s, want interrupted turn-000001", session.RunningTurnID, session.InterruptedTurnID, session.InterruptedAt)
 	}
-	if session.LastSeq != 0 || len(session.Items) != 0 {
-		t.Fatalf("timeout session replay = last_seq %d items %#v, want no committed replay", session.LastSeq, session.Items)
+	if len(session.Items) != 1 || session.Items[0].Message == nil || session.Items[0].Message.Role != model.MessageRoleUser {
+		t.Fatalf("timeout session replay = last_seq %d items %#v, want persisted input only", session.LastSeq, session.Items)
 	}
 }
 
@@ -3323,7 +3334,7 @@ func TestServeContextCancelUsesImmediateStopSemantics(t *testing.T) {
 	saveServerTestSession(t, store, "signal-stop")
 	started := make(chan struct{})
 	canceled := make(chan struct{})
-	runner := fakeSessionTurnRunner{
+	runner := fakeIncrementalSessionTurnRunner{
 		run: func(ctx context.Context, request SessionTurnRequest) (SessionTurnResult, error) {
 			close(started)
 			<-ctx.Done()
@@ -3396,7 +3407,7 @@ func TestServeContextCancelUsesImmediateStopSemantics(t *testing.T) {
 	waitForServerStopped(t, process.Addr())
 }
 
-func TestSessionSendMessageFailedTurnStaysTransient(t *testing.T) {
+func TestSessionSendMessageFailedTurnPersistsInputAndSanitizesErrors(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "sessions")
 	store := sessions.NewV2Store(root)
 	saveServerTestSession(t, store, "failed-turn")
@@ -3410,7 +3421,7 @@ func TestSessionSendMessageFailedTurnStaysTransient(t *testing.T) {
 	if _, err := store.ReplaceActiveHistory("failed-turn", []string{existing.ID}); err != nil {
 		t.Fatalf("ReplaceActiveHistory() error = %v", err)
 	}
-	runner := fakeSessionTurnRunner{
+	runner := fakeIncrementalSessionTurnRunner{
 		run: func(ctx context.Context, request SessionTurnRequest) (SessionTurnResult, error) {
 			request.Emit(model.TextDeltaEvent{Text: "partial transient text"})
 			return SessionTurnResult{}, fmt.Errorf("provider secret failure")
@@ -3432,23 +3443,27 @@ func TestSessionSendMessageFailedTurnStaysTransient(t *testing.T) {
 		readSessionStreamEvent(t, conn),
 		readSessionStreamEvent(t, conn),
 		readSessionStreamEvent(t, conn),
+		readSessionStreamEvent(t, conn),
 	}
-	if events[0]["type"] != "turn.started" || events[1]["type"] != "text.delta" || events[2]["type"] != "turn.failed" {
-		t.Fatalf("failure events = %#v, want started/delta/failed", events)
+	if events[0]["type"] != "turn.started" || events[1]["type"] != "item.appended" || events[2]["type"] != "text.delta" || events[3]["type"] != "turn.failed" {
+		t.Fatalf("failure events = %#v, want started/input/delta/failed", events)
 	}
-	if events[2]["message"] != "turn failed" {
-		t.Fatalf("turn.failed message = %#v, want sanitized failure", events[2]["message"])
+	if events[3]["message"] != "turn failed" {
+		t.Fatalf("turn.failed message = %#v, want sanitized failure", events[3]["message"])
 	}
 
 	session, err := store.Load("failed-turn")
 	if err != nil {
 		t.Fatalf("Load(failed-turn) error = %v", err)
 	}
-	if len(session.Items) != 1 || session.Items[0].ID != existing.ID {
-		t.Fatalf("session items after failed turn = %#v, want unchanged existing item", session.Items)
+	if len(session.Items) != 2 || session.Items[0].ID != existing.ID || session.Items[1].Message == nil || session.Items[1].Message.Role != model.MessageRoleUser || session.Items[1].Message.Content != "new prompt secret" {
+		t.Fatalf("session items after failed turn = %#v, want existing plus persisted input", session.Items)
 	}
-	if !reflect.DeepEqual(session.ActiveHistory, []string{existing.ID}) {
-		t.Fatalf("ActiveHistory after failed turn = %#v, want unchanged existing item id", session.ActiveHistory)
+	if !reflect.DeepEqual(session.ActiveHistory, []string{existing.ID, session.Items[1].ID}) {
+		t.Fatalf("ActiveHistory after failed turn = %#v, want existing plus persisted input id", session.ActiveHistory)
+	}
+	if session.RunningTurnID != "" || session.InterruptedTurnID != "turn-000003" || session.InterruptedAt.IsZero() {
+		t.Fatalf("turn metadata after failed turn = running %q interrupted %q at %s, want interrupted turn", session.RunningTurnID, session.InterruptedTurnID, session.InterruptedAt)
 	}
 }
 
@@ -3525,46 +3540,30 @@ func TestSessionSendMessageMissingAndCorruptSessionErrors(t *testing.T) {
 	assertErrorCode(t, body, "session_corrupted")
 }
 
-func TestSessionSendMessageSaveFailureDoesNotAppendItems(t *testing.T) {
+func TestSessionSendMessageRejectsRunnerWithoutIncrementalSupport(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "sessions")
 	store := sessions.NewV2Store(root)
-	saveServerTestSession(t, store, "save-failure")
+	saveServerTestSession(t, store, "unsupported-runner")
 	runner := fakeSessionTurnRunner{
 		run: func(ctx context.Context, request SessionTurnRequest) (SessionTurnResult, error) {
-			return SessionTurnResult{
-				Session: request.Session,
-				Items: []sessions.SessionItem{{
-					Kind:       sessions.ItemKindMessage,
-					Visibility: sessions.ItemVisibilityVisible,
-					Audience:   sessions.ItemAudienceUser,
-					Message:    &model.Message{Role: model.MessageRoleUser, Content: "failed save prompt"},
-				}},
-				ActiveHistory: []string{""},
-			}, nil
+			t.Fatalf("non-incremental runner should be rejected before RunSessionTurn")
+			return SessionTurnResult{}, nil
 		},
 	}
 	process := startSessionAPIServerWithTurnRunner(t, store, sessions.SessionV2{}, "registry-token", runner)
-	conn := dialSessionStream(t, process, "save-failure")
-	waitForStreamSubscribers(t, process, "save-failure", 1)
 
-	raw, body := postRawJSONStatus(t, "http://"+process.Addr()+"/sessions/save-failure/messages", `{"content":"failed save prompt"}`, "registry-token", http.StatusInternalServerError)
-	assertErrorCode(t, body, "session_store_error")
-	if bytes.Contains(raw, []byte("failed save prompt")) {
-		t.Fatalf("save failure response leaked prompt: %s", raw)
-	}
-	if got := readSessionStreamEvent(t, conn); got["type"] != "turn.started" {
-		t.Fatalf("first event = %#v, want turn.started", got)
-	}
-	if got := readSessionStreamEvent(t, conn); got["type"] != "turn.failed" {
-		t.Fatalf("second event = %#v, want turn.failed", got)
+	raw, body := postRawJSONStatus(t, "http://"+process.Addr()+"/sessions/unsupported-runner/messages", `{"content":"secret prompt"}`, "registry-token", http.StatusInternalServerError)
+	assertErrorCode(t, body, "turn_runner_error")
+	if bytes.Contains(raw, []byte("secret prompt")) {
+		t.Fatalf("unsupported runner response leaked prompt: %s", raw)
 	}
 
-	session, err := store.Load("save-failure")
+	session, err := store.Load("unsupported-runner")
 	if err != nil {
-		t.Fatalf("Load(save-failure) error = %v", err)
+		t.Fatalf("Load(unsupported-runner) error = %v", err)
 	}
-	if len(session.Items) != 0 || len(session.ActiveHistory) != 0 {
-		t.Fatalf("save failure changed session: items=%#v active=%#v", session.Items, session.ActiveHistory)
+	if session.RunningTurnID != "" || len(session.Items) != 0 || len(session.ActiveHistory) != 0 {
+		t.Fatalf("unsupported runner changed session: running=%q items=%#v active=%#v", session.RunningTurnID, session.Items, session.ActiveHistory)
 	}
 }
 
@@ -4785,6 +4784,19 @@ func (r fakeIncrementalSessionTurnRunner) PlanSessionTurnCompaction(ctx context.
 		return r.plan(ctx, request)
 	}
 	return SessionCompactionResult{}, nil
+}
+
+func publishServerTestAssistant(request SessionTurnRequest, content string) error {
+	if request.Publisher == nil || request.TurnID == "" {
+		return fmt.Errorf("incremental publisher and turn id are required")
+	}
+	return request.Publisher.Publish(eventbus.AssistantReady{
+		TurnID: request.TurnID,
+		Message: model.Message{
+			Role:    model.MessageRoleAssistant,
+			Content: content,
+		},
+	})
 }
 
 type fakeSessionCompactPlanner struct {

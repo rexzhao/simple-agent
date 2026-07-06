@@ -165,7 +165,7 @@ GC, and auto-rerunning interrupted tools.
   valid). **The endpoint returns the real `Status` — it does NOT synthesize
   pending→interrupted** (that synthesis is `MaterializeActiveHistory`'s provider/resume
   semantics only); a still-running tool item shows as `pending`.
-- [ ] Remove end-of-turn `SaveTurn`/`SaveCompactedTurn` (`server.go:1145-1150`) and
+- [x] Remove end-of-turn `SaveTurn`/`SaveCompactedTurn` (`server.go:1145-1150`) and
   post-commit batch `item.appended` publish (`server.go:1161-1179`).
 - [x] **Compaction/projector coexistence (explicit)**: compaction is dispatched
   **through** the projector as a `CompactionRequested` domain event → projector calls

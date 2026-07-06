@@ -12,7 +12,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/rexzhao/simple-agent/internal/model"
 	projectstore "github.com/rexzhao/simple-agent/internal/projects"
 	"github.com/rexzhao/simple-agent/internal/sessions"
 )
@@ -174,14 +173,14 @@ func TestProjectRemoveRejectsRunningProjectTurn(t *testing.T) {
 
 	started := make(chan struct{})
 	release := make(chan struct{})
-	runner := fakeSessionTurnRunner{
+	runner := fakeIncrementalSessionTurnRunner{
 		run: func(ctx context.Context, request SessionTurnRequest) (SessionTurnResult, error) {
 			close(started)
 			<-release
-			return serverTestTurnResult(request.Session,
-				model.Message{Role: model.MessageRoleUser, Content: request.Content},
-				model.Message{Role: model.MessageRoleAssistant, Content: "done"},
-			), nil
+			if err := publishServerTestAssistant(request, "done"); err != nil {
+				return SessionTurnResult{}, err
+			}
+			return SessionTurnResult{Incremental: true}, nil
 		},
 	}
 	process := startProjectAPIServerWithSessions(t, projectStore, sessionStore, "registry-token", runner)
