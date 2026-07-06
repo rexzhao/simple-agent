@@ -34,10 +34,18 @@ const (
 	ItemAudienceInternal = "internal"
 
 	RecordTypeItemAppended          = "item.appended"
+	RecordTypeItemUpdated           = "item.updated"
 	RecordTypeActiveHistoryReplaced = "active_history.replaced"
 	RecordTypeCompactionCreated     = "compaction.created"
 	RecordTypeTransactionBegin      = "transaction.begin"
 	RecordTypeTransactionCommit     = "transaction.commit"
+)
+
+const (
+	ItemStatusPending     = "pending"
+	ItemStatusCompleted   = "completed"
+	ItemStatusError       = "error"
+	ItemStatusInterrupted = "interrupted"
 )
 
 const (
@@ -50,6 +58,8 @@ const (
 
 var ErrCorruptedSession = errors.New("corrupted session")
 
+const interruptedToolResultContent = "[tool execution interrupted]"
+
 type SessionItem struct {
 	ID         string         `json:"id"`
 	TurnID     string         `json:"turn_id,omitempty"`
@@ -58,6 +68,7 @@ type SessionItem struct {
 	Kind       string         `json:"kind"`
 	Visibility string         `json:"visibility"`
 	Audience   string         `json:"audience"`
+	Status     string         `json:"status,omitempty"`
 	Message    *model.Message `json:"message,omitempty"`
 	Content    *StoredContent `json:"content,omitempty"`
 }
@@ -156,6 +167,12 @@ func materializeActiveHistory(session SessionV2, readBlob func(BlobRef) ([]byte,
 			return nil, corruptedSessionError(session.ID, "active history references item %q without a message", id)
 		}
 		message := copyMessage(*item.Message)
+		if shouldSynthesizeInterruptedToolResult(item, message) {
+			message.Content = interruptedToolResultContent
+			message.IsError = true
+			messages = append(messages, message)
+			continue
+		}
 		if message.Content == "" && item.Content != nil {
 			content, ok, err := materializeStoredContent(session.ID, item.ID, item.Content, readBlob)
 			if err != nil {
@@ -168,6 +185,13 @@ func materializeActiveHistory(session SessionV2, readBlob func(BlobRef) ([]byte,
 		messages = append(messages, message)
 	}
 	return messages, nil
+}
+
+func shouldSynthesizeInterruptedToolResult(item SessionItem, message model.Message) bool {
+	if message.Role != model.MessageRoleTool {
+		return false
+	}
+	return item.Status == ItemStatusPending || item.Status == ItemStatusInterrupted
 }
 
 func MaterializeActiveHistory(session SessionV2) ([]model.Message, error) {
@@ -525,6 +549,44 @@ func (s *V2Store) AppendItem(sessionID string, item SessionItem) (SessionItem, e
 	}
 	item.Seq = seq
 	return item, nil
+}
+
+func (s *V2Store) UpdateItem(sessionID string, item SessionItem) (SessionItem, error) {
+	if err := s.requireRoot(); err != nil {
+		return SessionItem{}, err
+	}
+	if err := validateV2SessionID(sessionID); err != nil {
+		return SessionItem{}, err
+	}
+	if item.ID == "" {
+		return SessionItem{}, fmt.Errorf("session item id is required")
+	}
+
+	state, err := s.Replay(sessionID)
+	if err != nil {
+		return SessionItem{}, err
+	}
+	existing, ok := findSessionItemByID(state.Items, item.ID)
+	if !ok {
+		return SessionItem{}, corruptedSessionError(sessionID, "item.updated references missing item %q", item.ID)
+	}
+
+	updated := existing
+	updated.Message = copyMessagePtr(item.Message)
+	updated.Content = copyStoredContent(item.Content)
+	updated.Status = item.Status
+	updated, err = s.blobifySessionItemContent(updated)
+	if err != nil {
+		return SessionItem{}, err
+	}
+
+	if _, err := s.appendRecord(sessionID, v2Record{
+		Type: RecordTypeItemUpdated,
+		Item: &updated,
+	}); err != nil {
+		return SessionItem{}, err
+	}
+	return updated, nil
 }
 
 func (s *V2Store) ReplaceActiveHistory(sessionID string, itemIDs []string) (int64, error) {
@@ -1229,6 +1291,15 @@ func validateV2SessionID(id string) error {
 	return nil
 }
 
+func findSessionItemByID(items []SessionItem, id string) (SessionItem, bool) {
+	for _, item := range items {
+		if item.ID == id {
+			return item, true
+		}
+	}
+	return SessionItem{}, false
+}
+
 func v2FilesystemAliasName(id string) string {
 	return strings.TrimRight(id, ". ")
 }
@@ -1641,6 +1712,15 @@ func persistedEventFromRecord(record v2Record, includeActiveHistory bool) (Persi
 			Type:   record.Type,
 			ItemID: record.Item.ID,
 		}, true
+	case RecordTypeItemUpdated:
+		if record.Item == nil {
+			return PersistedEvent{}, false
+		}
+		return PersistedEvent{
+			Seq:    record.Seq,
+			Type:   record.Type,
+			ItemID: record.Item.ID,
+		}, true
 	case RecordTypeCompactionCreated:
 		if record.Compaction == nil {
 			return PersistedEvent{}, false
@@ -1677,6 +1757,26 @@ func replayCommittedRecord(path string, lineNumber int, record v2Record, state *
 		}
 		record.Item.Seq = record.Seq
 		state.Items = append(state.Items, *record.Item)
+	case RecordTypeItemUpdated:
+		if record.Item == nil {
+			return corruptedSessionError(state.ID, "%s:%d item.updated missing item", path, lineNumber)
+		}
+		updated := false
+		for i := range state.Items {
+			if state.Items[i].ID != record.Item.ID {
+				continue
+			}
+			existing := state.Items[i]
+			existing.Message = copyMessagePtr(record.Item.Message)
+			existing.Content = copyStoredContent(record.Item.Content)
+			existing.Status = record.Item.Status
+			state.Items[i] = existing
+			updated = true
+			break
+		}
+		if !updated {
+			return corruptedSessionError(state.ID, "%s:%d item.updated references missing item %q", path, lineNumber, record.Item.ID)
+		}
 	case RecordTypeActiveHistoryReplaced:
 		state.ActiveHistory = copyStrings(record.ItemIDs)
 	case RecordTypeCompactionCreated:
@@ -1897,6 +1997,14 @@ func corruptedSessionError(sessionID, format string, args ...any) error {
 func copyMessage(message model.Message) model.Message {
 	message.ToolCalls = append([]model.ToolCall(nil), message.ToolCalls...)
 	return message
+}
+
+func copyMessagePtr(message *model.Message) *model.Message {
+	if message == nil {
+		return nil
+	}
+	copied := copyMessage(*message)
+	return &copied
 }
 
 func copySessionV2(session SessionV2) SessionV2 {

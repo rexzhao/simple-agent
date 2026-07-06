@@ -16,25 +16,25 @@ GC, and auto-rerunning interrupted tools.
 
 ## Phase 1 — Storage foundation
 
-- [ ] Add `Status string` field to `SessionItem` (`internal/sessions/v2.go:53`) with
+- [x] Add `Status string` field to `SessionItem` (`internal/sessions/v2.go:53`) with
   constants `ItemStatusPending/Completed/Error/Interrupted`. Empty = legacy/completed.
-- [ ] Add `RecordTypeItemUpdated = "item.updated"` constant.
-- [ ] Add `item.updated` case to `replayCommittedRecord` (`v2.go:1670`): replace the
+- [x] Add `RecordTypeItemUpdated = "item.updated"` constant.
+- [x] Add `item.updated` case to `replayCommittedRecord` (`v2.go:1670`): replace the
   matching-`ID` item's **mutable fields only** (`Message`/`Content`/`Status` — `SessionItem`
   has no `UpdatedAt` today) in place (preserve slice order); **explicitly keep
   `existing.Seq`, `existing.ID`, `existing.CreatedAt`** (birth seq immutable); unknown ID →
   `corrupted`.
-- [ ] Add `V2Store.UpdateItem(sessionID, item)` method (mirror `AppendItem`,
+- [x] Add `V2Store.UpdateItem(sessionID, item)` method (mirror `AppendItem`,
   `v2.go:508`): replay for `LastSeq` → `blobifySessionItemContent` → write a single
   non-transactional `item.updated` record with `record.Seq = LastSeq+1`, but **do NOT
   overwrite `item.Seq`** (it stays the birth seq) → return updated item.
-- [ ] Materializer synthesis in `materializeActiveHistory` (`v2.go:143`) and store
+- [x] Materializer synthesis in `materializeActiveHistory` (`v2.go:143`) and store
   variant (`v2.go:504`): for `role:tool` items with `Status` pending/interrupted,
   synthesize `Content="[tool execution interrupted]"`, `IsError=true` in-memory (do
   not mutate persisted item).
-- [ ] Catch-up: add `item.updated` case to `persistedEventFromRecord` (`v2.go:1633`)
+- [x] Catch-up: add `item.updated` case to `persistedEventFromRecord` (`v2.go:1633`)
   emitting `{Seq=record.Seq, Type:"item.updated", ItemID}`.
-- [ ] Tests: append→UpdateItem→replay **and `item.Seq` stays the birth seq**; update
+- [x] Tests: append→UpdateItem→replay **and `item.Seq` stays the birth seq**; update
   unknown ID→corrupted; update inside and outside a transaction; blobified update (new
   content >4KB writes a new blob, `ReadBlob` resolves); materializer synthesis for
   pending/interrupted; **`item.Seq` monotonicity after update** (slice still ordered by

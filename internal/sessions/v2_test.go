@@ -707,6 +707,261 @@ func TestV2StoreAppendItemsAndReplaceActiveHistoryCommitsTransaction(t *testing.
 	}
 }
 
+func TestV2StoreUpdateItemReplaysAndPreservesBirthSeq(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "sessions")
+	clock := &fakeClock{current: time.Date(2026, 7, 4, 1, 2, 3, 0, time.UTC)}
+	store := newV2StoreWithClock(root, V2StoreOptions{}, clock.Now)
+
+	toolItem, err := store.AppendItem("session-1", SessionItem{
+		ID:         "tool-1",
+		TurnID:     "turn-1",
+		Kind:       ItemKindMessage,
+		Visibility: ItemVisibilityVisible,
+		Audience:   ItemAudienceModel,
+		Status:     ItemStatusPending,
+		Message:    &model.Message{Role: model.MessageRoleTool, ToolCallID: "call-1"},
+	})
+	if err != nil {
+		t.Fatalf("AppendItem(tool) error = %v", err)
+	}
+	if _, err := store.AppendItem("session-1", SessionItem{
+		ID:         "user-1",
+		Kind:       ItemKindMessage,
+		Visibility: ItemVisibilityVisible,
+		Audience:   ItemAudienceUser,
+		Message:    &model.Message{Role: model.MessageRoleUser, Content: "next"},
+	}); err != nil {
+		t.Fatalf("AppendItem(user) error = %v", err)
+	}
+
+	updated, err := store.UpdateItem("session-1", SessionItem{
+		ID:      "tool-1",
+		Status:  ItemStatusCompleted,
+		Message: &model.Message{Role: model.MessageRoleTool, ToolCallID: "call-1", Content: "tool output"},
+	})
+	if err != nil {
+		t.Fatalf("UpdateItem() error = %v", err)
+	}
+	if updated.Seq != toolItem.Seq || updated.CreatedAt != toolItem.CreatedAt {
+		t.Fatalf("updated seq/created_at = %d/%s, want %d/%s", updated.Seq, updated.CreatedAt, toolItem.Seq, toolItem.CreatedAt)
+	}
+	if updated.TurnID != "turn-1" || updated.Kind != ItemKindMessage || updated.Visibility != ItemVisibilityVisible || updated.Audience != ItemAudienceModel {
+		t.Fatalf("updated immutable metadata = turn %q kind %q visibility %q audience %q", updated.TurnID, updated.Kind, updated.Visibility, updated.Audience)
+	}
+
+	replayed, err := store.Replay("session-1")
+	if err != nil {
+		t.Fatalf("Replay() error = %v", err)
+	}
+	if got := itemIDs(replayed.Items); !reflect.DeepEqual(got, []string{"tool-1", "user-1"}) {
+		t.Fatalf("item order = %#v, want unchanged order", got)
+	}
+	if replayed.Items[0].Seq != 1 || replayed.Items[1].Seq != 2 || replayed.LastSeq != 3 {
+		t.Fatalf("seqs tool/user/last = %d/%d/%d, want 1/2/3", replayed.Items[0].Seq, replayed.Items[1].Seq, replayed.LastSeq)
+	}
+	if got := replayed.Items[0].Message.Content; got != "tool output" {
+		t.Fatalf("updated content = %q, want tool output", got)
+	}
+	if got := replayed.Items[0].Status; got != ItemStatusCompleted {
+		t.Fatalf("updated status = %q, want completed", got)
+	}
+}
+
+func TestV2StoreUpdateItemRejectsUnknownItem(t *testing.T) {
+	store := NewV2Store(filepath.Join(t.TempDir(), "sessions"))
+
+	_, err := store.UpdateItem("session-1", SessionItem{
+		ID:      "missing",
+		Message: &model.Message{Role: model.MessageRoleTool, ToolCallID: "call-1", Content: "ignored"},
+	})
+	if !errors.Is(err, ErrCorruptedSession) {
+		t.Fatalf("UpdateItem(missing) error = %v, want ErrCorruptedSession", err)
+	}
+	if !strings.Contains(err.Error(), `item.updated references missing item "missing"`) {
+		t.Fatalf("UpdateItem(missing) error = %q, want missing item detail", err)
+	}
+}
+
+func TestV2StoreReplayCommittedTransactionWithItemUpdated(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "sessions")
+	store := NewV2Store(root)
+
+	original, err := store.AppendItem("session-1", SessionItem{
+		ID:         "tool-1",
+		Kind:       ItemKindMessage,
+		Visibility: ItemVisibilityVisible,
+		Audience:   ItemAudienceModel,
+		Status:     ItemStatusPending,
+		Message:    &model.Message{Role: model.MessageRoleTool, ToolCallID: "call-1"},
+	})
+	if err != nil {
+		t.Fatalf("AppendItem() error = %v", err)
+	}
+
+	segmentPath := filepath.Join(root, "session-1", "segments", "000001.jsonl")
+	appendV2RecordsForTest(t, segmentPath,
+		v2Record{Seq: 2, Type: RecordTypeTransactionBegin, TxID: "tx-update"},
+		v2Record{
+			Seq:  3,
+			Type: RecordTypeItemUpdated,
+			TxID: "tx-update",
+			Item: &SessionItem{
+				ID:        "tool-1",
+				Seq:       99,
+				CreatedAt: time.Date(2099, 1, 1, 0, 0, 0, 0, time.UTC),
+				Status:    ItemStatusError,
+				Message:   &model.Message{Role: model.MessageRoleTool, ToolCallID: "call-1", Content: "failed", IsError: true},
+			},
+		},
+		v2Record{Seq: 4, Type: RecordTypeTransactionCommit, TxID: "tx-update"},
+	)
+
+	replayed, err := store.Replay("session-1")
+	if err != nil {
+		t.Fatalf("Replay() error = %v", err)
+	}
+	if len(replayed.Items) != 1 {
+		t.Fatalf("len(Items) = %d, want 1", len(replayed.Items))
+	}
+	item := replayed.Items[0]
+	if item.Seq != original.Seq || item.CreatedAt != original.CreatedAt {
+		t.Fatalf("updated seq/created_at = %d/%s, want original %d/%s", item.Seq, item.CreatedAt, original.Seq, original.CreatedAt)
+	}
+	if item.Kind != ItemKindMessage || item.Visibility != ItemVisibilityVisible || item.Audience != ItemAudienceModel {
+		t.Fatalf("immutable metadata = kind %q visibility %q audience %q", item.Kind, item.Visibility, item.Audience)
+	}
+	if item.Status != ItemStatusError || item.Message == nil || item.Message.Content != "failed" || !item.Message.IsError {
+		t.Fatalf("updated item = %#v, want error tool result", item)
+	}
+	if replayed.LastSeq != 4 {
+		t.Fatalf("LastSeq = %d, want 4", replayed.LastSeq)
+	}
+}
+
+func TestV2StoreReplayItemUpdatedUnknownIDIsCorrupted(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "sessions")
+	store := NewV2Store(root)
+	appendTestItem(t, store, "session-1", "item-1", "one")
+
+	segmentPath := filepath.Join(root, "session-1", "segments", "000001.jsonl")
+	appendV2RecordsForTest(t, segmentPath, v2Record{
+		Seq:  2,
+		Type: RecordTypeItemUpdated,
+		Item: &SessionItem{
+			ID:      "missing",
+			Message: &model.Message{Role: model.MessageRoleUser, Content: "ignored"},
+		},
+	})
+
+	_, err := store.Replay("session-1")
+	if !errors.Is(err, ErrCorruptedSession) {
+		t.Fatalf("Replay() error = %v, want ErrCorruptedSession", err)
+	}
+	if !strings.Contains(err.Error(), `item.updated references missing item "missing"`) {
+		t.Fatalf("Replay() error = %q, want missing item detail", err)
+	}
+}
+
+func TestV2StoreUpdateItemBlobifiesLargeMessageContent(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "sessions")
+	store := NewV2Store(root)
+
+	if _, err := store.AppendItem("session-1", SessionItem{
+		ID:         "tool-1",
+		Kind:       ItemKindMessage,
+		Visibility: ItemVisibilityVisible,
+		Audience:   ItemAudienceModel,
+		Status:     ItemStatusPending,
+		Message:    &model.Message{Role: model.MessageRoleTool, ToolCallID: "call-1"},
+	}); err != nil {
+		t.Fatalf("AppendItem() error = %v", err)
+	}
+	if _, err := store.ReplaceActiveHistory("session-1", []string{"tool-1"}); err != nil {
+		t.Fatalf("ReplaceActiveHistory() error = %v", err)
+	}
+
+	largeContent := strings.Repeat("updated blob body ", 300) + "SECRET-UPDATED-BLOB"
+	updated, err := store.UpdateItem("session-1", SessionItem{
+		ID:      "tool-1",
+		Status:  ItemStatusCompleted,
+		Message: &model.Message{Role: model.MessageRoleTool, ToolCallID: "call-1", Content: largeContent},
+	})
+	if err != nil {
+		t.Fatalf("UpdateItem() error = %v", err)
+	}
+	if updated.Message == nil || updated.Message.Content != "" {
+		t.Fatalf("updated message content = %#v, want blobified empty content", updated.Message)
+	}
+	if updated.Content == nil || updated.Content.Blob == nil {
+		t.Fatalf("updated item content = %#v, want blob ref", updated.Content)
+	}
+
+	segmentRaw, err := os.ReadFile(filepath.Join(root, "session-1", "segments", "000001.jsonl"))
+	if err != nil {
+		t.Fatalf("ReadFile(segment) error = %v", err)
+	}
+	if bytes.Contains(segmentRaw, []byte("SECRET-UPDATED-BLOB")) || bytes.Contains(segmentRaw, []byte(largeContent)) {
+		t.Fatalf("segment stored raw updated blob body: %s", segmentRaw)
+	}
+
+	replayed, err := store.Replay("session-1")
+	if err != nil {
+		t.Fatalf("Replay() error = %v", err)
+	}
+	messages, err := store.MaterializeActiveHistory(replayed)
+	if err != nil {
+		t.Fatalf("MaterializeActiveHistory() error = %v", err)
+	}
+	if got := messageContents(messages); !reflect.DeepEqual(got, []string{largeContent}) {
+		t.Fatalf("materialized messages = %#v, want updated large content", got)
+	}
+}
+
+func TestV2StorePersistedEventsAfterIncludesItemUpdated(t *testing.T) {
+	store := NewV2Store(filepath.Join(t.TempDir(), "sessions"))
+
+	if _, err := store.AppendItem("session-1", SessionItem{
+		ID:         "tool-1",
+		Kind:       ItemKindMessage,
+		Visibility: ItemVisibilityVisible,
+		Audience:   ItemAudienceModel,
+		Status:     ItemStatusPending,
+		Message:    &model.Message{Role: model.MessageRoleTool, ToolCallID: "call-1"},
+	}); err != nil {
+		t.Fatalf("AppendItem() error = %v", err)
+	}
+	if _, err := store.ReplaceActiveHistory("session-1", []string{"tool-1"}); err != nil {
+		t.Fatalf("ReplaceActiveHistory() error = %v", err)
+	}
+	if _, err := store.UpdateItem("session-1", SessionItem{
+		ID:      "tool-1",
+		Status:  ItemStatusCompleted,
+		Message: &model.Message{Role: model.MessageRoleTool, ToolCallID: "call-1", Content: "done"},
+	}); err != nil {
+		t.Fatalf("UpdateItem() error = %v", err)
+	}
+
+	events, err := store.PersistedEventsAfter("session-1", 0)
+	if err != nil {
+		t.Fatalf("PersistedEventsAfter() error = %v", err)
+	}
+	want := []PersistedEvent{
+		{Seq: 1, Type: RecordTypeItemAppended, ItemID: "tool-1"},
+		{Seq: 3, Type: RecordTypeItemUpdated, ItemID: "tool-1"},
+	}
+	if !reflect.DeepEqual(events, want) {
+		t.Fatalf("events = %#v, want %#v", events, want)
+	}
+
+	events, err = store.PersistedEventsAfter("session-1", 1)
+	if err != nil {
+		t.Fatalf("PersistedEventsAfter(after append) error = %v", err)
+	}
+	if !reflect.DeepEqual(events, want[1:]) {
+		t.Fatalf("events after append = %#v, want update only", events)
+	}
+}
+
 func TestV2StoreAppendCompactionCheckpointCommitsTransaction(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "sessions")
 	clock := &fakeClock{current: time.Date(2026, 7, 3, 4, 5, 6, 0, time.UTC)}
@@ -1506,6 +1761,95 @@ func TestV2SessionMaterializeActiveHistory(t *testing.T) {
 	messages[1].ToolCalls[0].Name = "mutated"
 	if session.Items[2].Message.ToolCalls[0].Name != "read_file" {
 		t.Fatalf("MaterializeActiveHistory returned aliased ToolCalls: %#v", session.Items[2].Message.ToolCalls)
+	}
+}
+
+func TestV2SessionMaterializeActiveHistorySynthesizesPendingToolResults(t *testing.T) {
+	session := SessionV2{
+		ID: "session-1",
+		Items: []SessionItem{
+			{
+				ID:     "pending-tool",
+				Kind:   ItemKindMessage,
+				Status: ItemStatusPending,
+				Message: &model.Message{
+					Role:       model.MessageRoleTool,
+					ToolCallID: "call-pending",
+				},
+			},
+			{
+				ID:     "interrupted-tool",
+				Kind:   ItemKindMessage,
+				Status: ItemStatusInterrupted,
+				Message: &model.Message{
+					Role:       model.MessageRoleTool,
+					ToolCallID: "call-interrupted",
+					Content:    "persisted empty placeholder",
+				},
+			},
+			{
+				ID:     "completed-tool",
+				Kind:   ItemKindMessage,
+				Status: ItemStatusCompleted,
+				Message: &model.Message{
+					Role:       model.MessageRoleTool,
+					ToolCallID: "call-completed",
+					Content:    "done",
+				},
+			},
+		},
+		ActiveHistory: []string{"pending-tool", "interrupted-tool", "completed-tool"},
+	}
+
+	messages, err := session.MaterializeActiveHistory()
+	if err != nil {
+		t.Fatalf("MaterializeActiveHistory() error = %v", err)
+	}
+	if got := messageContents(messages); !reflect.DeepEqual(got, []string{interruptedToolResultContent, interruptedToolResultContent, "done"}) {
+		t.Fatalf("materialized messages = %#v, want synthesized pending/interrupted plus completed", got)
+	}
+	if !messages[0].IsError || !messages[1].IsError || messages[2].IsError {
+		t.Fatalf("materialized IsError flags = %v/%v/%v, want true/true/false", messages[0].IsError, messages[1].IsError, messages[2].IsError)
+	}
+	if session.Items[0].Message.Content != "" || session.Items[0].Message.IsError {
+		t.Fatalf("pending persisted message mutated: %#v", session.Items[0].Message)
+	}
+
+	storeMessages, err := NewV2Store(filepath.Join(t.TempDir(), "sessions")).MaterializeActiveHistory(session)
+	if err != nil {
+		t.Fatalf("store.MaterializeActiveHistory() error = %v", err)
+	}
+	if !reflect.DeepEqual(storeMessages, messages) {
+		t.Fatalf("store materialized messages = %#v, want %#v", storeMessages, messages)
+	}
+}
+
+func TestV2SessionMaterializeActiveHistoryTreatsEmptyStatusAsCompleted(t *testing.T) {
+	session := SessionV2{
+		ID: "session-1",
+		Items: []SessionItem{
+			{
+				ID:   "legacy-tool",
+				Kind: ItemKindMessage,
+				Message: &model.Message{
+					Role:       model.MessageRoleTool,
+					ToolCallID: "call-legacy",
+					Content:    "legacy result",
+				},
+			},
+		},
+		ActiveHistory: []string{"legacy-tool"},
+	}
+
+	messages, err := session.MaterializeActiveHistory()
+	if err != nil {
+		t.Fatalf("MaterializeActiveHistory() error = %v", err)
+	}
+	if got := messageContents(messages); !reflect.DeepEqual(got, []string{"legacy result"}) {
+		t.Fatalf("materialized legacy messages = %#v, want original content", got)
+	}
+	if messages[0].IsError {
+		t.Fatalf("legacy tool result IsError = true, want false")
 	}
 }
 
