@@ -198,18 +198,31 @@ commands where global flags are accepted:
 
 ## Attach and Send
 
-Existing attach/send behavior remains in scope:
+Attach/send behavior:
 
-- Bare `<cmd>` defaults to attach: it auto-starts the selected server-root
-  server if needed, discovers the current project from the effective cwd, and
-  attaches the most recent non-archived session for that project.
-- `<cmd> attach <SESSION_ID>` attaches an explicit global session id.
-- `<cmd> attach --new` creates a session for the current project and attaches
-  it.
+- Bare `<cmd>` with no arguments starts a new pending session REPL for the
+  current project. It does not attach the most recent existing session.
+- Pending session startup auto-starts the selected server-root server if
+  needed, discovers the current project from the effective cwd, and requires an
+  existing explicit project record. It must not implicitly create a project.
+- A pending session is display/session lifecycle state only. It has no durable
+  session id, must not write session metadata or items, and must not appear in
+  `session list` before the first ordinary user message.
+- If the user exits immediately with `/quit`, `/exit`, or EOF, no session
+  record is created.
+- On the first ordinary user message, the client/server creates the real
+  session for the current project, fixes `created_cwd`, `config_path`, and
+  `project_id` metadata, then sends that message as the first turn.
+- If the first turn is attempted and fails after session creation, the session
+  record may remain. Failed turns continue to follow existing item persistence
+  rules.
+- `<cmd> attach --new` uses the same pending session semantics as bare
+  `<cmd>`.
+- `<cmd> attach <SESSION_ID>` attaches an explicit global durable session id.
 - `<cmd> send <SESSION_ID> --prompt ...` sends one turn to an explicit global
-  session id and exits.
-- `<cmd> send --new --prompt ...` creates a session for the current project,
-  sends one turn, and exits.
+  durable session id and exits.
+- `<cmd> send --new --prompt ...` has a prompt immediately, so it creates the
+  real session for the current project, sends one turn, and exits.
 - Existing session attach/send reject `--cwd` and `--config`; those options are
   only valid when creating a new project or session.
 - Multiple observers may attach to the same session stream.
@@ -217,6 +230,8 @@ Existing attach/send behavior remains in scope:
   would start another turn returns `session_busy` and does not select a
   fallback session.
 - Different sessions may run turns concurrently.
+- Pending session behavior must not change model context semantics beyond the
+  normal first turn once the durable session is created.
 
 ## Session Open Display Snapshot
 
