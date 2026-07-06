@@ -6092,6 +6092,10 @@ type serverAgentTurnRunner struct {
 }
 
 func (r serverAgentTurnRunner) RunSessionTurn(ctx context.Context, request localserver.SessionTurnRequest) (result localserver.SessionTurnResult, err error) {
+	incremental := request.Publisher != nil
+	if incremental && strings.TrimSpace(request.TurnID) == "" {
+		return localserver.SessionTurnResult{}, fmt.Errorf("session turn id is required when publisher is configured")
+	}
 	runtime, err := r.prepareServerSessionRuntime(ctx, request.Session, request.SessionStore)
 	if err != nil {
 		return localserver.SessionTurnResult{}, err
@@ -6099,10 +6103,24 @@ func (r serverAgentTurnRunner) RunSessionTurn(ctx context.Context, request local
 	defer func() {
 		err = errors.Join(err, runtime.Close())
 	}()
+	if incremental && runtime.config != nil && runtime.config.Compaction.Enabled {
+		return localserver.SessionTurnResult{}, fmt.Errorf("incremental server publisher does not support compaction yet")
+	}
 
-	messages, compaction, err := runServerOwnedSessionTurn(ctx, runtime, runtime.initialMessages(), request.Content, request.Emit)
+	messages, compaction, err := runServerOwnedSessionTurn(ctx, runtime, runtime.initialMessages(), request.Content, serverOwnedSessionTurnOptions{
+		emit:            request.Emit,
+		publisher:       request.Publisher,
+		turnID:          request.TurnID,
+		skipAutoCompact: incremental,
+	})
 	if err != nil {
 		return localserver.SessionTurnResult{}, err
+	}
+	if incremental {
+		return localserver.SessionTurnResult{
+			Session:     runtime.resumableSession,
+			Incremental: true,
+		}, nil
 	}
 	planSession, newItems, activeHistory, err := runtime.sessionSavePlan(messages)
 	if err != nil {
@@ -6168,26 +6186,42 @@ func (r serverAgentTurnRunner) prepareServerSessionRuntime(ctx context.Context, 
 	})
 }
 
-func runServerOwnedSessionTurn(ctx context.Context, runtime *agentRuntime, messages []model.Message, prompt string, emit func(model.Event)) ([]model.Message, *compactionPlan, error) {
+type serverOwnedSessionTurnOptions struct {
+	emit            func(model.Event)
+	publisher       eventbus.Publisher
+	turnID          string
+	skipAutoCompact bool
+}
+
+func runServerOwnedSessionTurn(ctx context.Context, runtime *agentRuntime, messages []model.Message, prompt string, options serverOwnedSessionTurnOptions) ([]model.Message, *compactionPlan, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, nil, err
 	}
 	turnCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	messages, compaction, err := runtime.planAutoCompactBeforeTurn(turnCtx, messages, prompt)
-	if err != nil {
-		return nil, nil, newRecoverableTurnError(err)
-	}
-	if compaction != nil {
-		runtime.applyCompactionPlan(*compaction)
+	var compaction *compactionPlan
+	if !options.skipAutoCompact {
+		var err error
+		messages, compaction, err = runtime.planAutoCompactBeforeTurn(turnCtx, messages, prompt)
+		if err != nil {
+			return nil, nil, newRecoverableTurnError(err)
+		}
+		if compaction != nil {
+			runtime.applyCompactionPlan(*compaction)
+		}
 	}
 	runtime.saveSessions = false
 	requestMessages := append(copyMessageSlice(messages), model.Message{
 		Role:    model.MessageRoleUser,
 		Content: prompt,
 	})
-	updated, err := runChatMessagesInTurnWithEventHook(ctx, turnCtx, runtime, requestMessages, io.Discard, io.Discard, false, false, emit)
+	updated, err := runChatMessagesInTurnWithOptions(ctx, turnCtx, runtime, requestMessages, io.Discard, io.Discard, false, false, chatMessagesInTurnOptions{
+		onEvent:         options.emit,
+		publisher:       options.publisher,
+		turnID:          options.turnID,
+		skipSessionSave: options.publisher != nil,
+	})
 	if err != nil {
 		return nil, nil, err
 	}

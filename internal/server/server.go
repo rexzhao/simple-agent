@@ -104,8 +104,10 @@ type SessionCompactPlanner interface {
 type SessionTurnRequest struct {
 	Session      sessions.SessionV2
 	SessionStore *sessions.V2Store
+	TurnID       string
 	Content      string
 	Emit         func(model.Event)
+	Publisher    eventbus.Publisher
 }
 
 type SessionCompactionRequest struct {
@@ -118,6 +120,7 @@ type SessionTurnResult struct {
 	Compaction    *SessionCompactionPlan
 	Items         []sessions.SessionItem
 	ActiveHistory []string
+	Incremental   bool
 }
 
 type SessionCompactionResult struct {

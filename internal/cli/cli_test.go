@@ -15,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -27,6 +28,7 @@ import (
 	"github.com/rexzhao/simple-agent/internal/model"
 	projectstore "github.com/rexzhao/simple-agent/internal/projects"
 	localserver "github.com/rexzhao/simple-agent/internal/server"
+	"github.com/rexzhao/simple-agent/internal/sessionprojector"
 	"github.com/rexzhao/simple-agent/internal/sessions"
 	"github.com/rexzhao/simple-agent/internal/subagents"
 )
@@ -7848,6 +7850,193 @@ func TestServerAgentTurnRunnerRequiresCreatedCWD(t *testing.T) {
 	if !strings.Contains(err.Error(), "session created_cwd is required") {
 		t.Fatalf("RunSessionTurn() error = %v, want missing created_cwd error", err)
 	}
+}
+
+func TestServerAgentTurnRunnerPublisherRequiresTurnID(t *testing.T) {
+	bus := eventbus.NewBus(func(eventbus.Event) error { return nil })
+	defer bus.Close()
+
+	_, err := (serverAgentTurnRunner{program: "sai"}).RunSessionTurn(context.Background(), localserver.SessionTurnRequest{
+		Publisher: bus,
+	})
+	if err == nil {
+		t.Fatal("RunSessionTurn() error = nil, want missing turn id error")
+	}
+	if !strings.Contains(err.Error(), "session turn id is required") {
+		t.Fatalf("RunSessionTurn() error = %v, want missing turn id error", err)
+	}
+}
+
+func TestServerAgentTurnRunnerPublishesIncrementalEventsToPublisher(t *testing.T) {
+	shellCommand := blockingShellCommandForCLIIncrementalTest()
+	args, err := json.Marshal(map[string]any{
+		"command":    shellCommand,
+		"timeout_ms": 5000,
+	})
+	if err != nil {
+		t.Fatalf("Marshal(shell args) error = %v", err)
+	}
+	toolChunk := fmt.Sprintf(`{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"shell","arguments":%q}}]}}]}`, string(args))
+	server, requests := newSequentialCLIRunServer(t,
+		[]string{
+			toolChunk,
+			`{"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`,
+			`[DONE]`,
+		},
+		[]string{
+			`{"choices":[{"delta":{"content":"server final"}}]}`,
+			`[DONE]`,
+		},
+	)
+	defer server.Close()
+
+	configDir := t.TempDir()
+	writeCLIRunFixtureInDirWithTools(t, configDir, server.URL, "direct-secret-value", "openai-chat", []string{"shell"})
+	sessionRoot := filepath.Join(configDir, "sessions")
+	projectDir := t.TempDir()
+	store := sessions.NewV2Store(sessionRoot)
+	session, err := store.SaveMetadata(sessions.SessionV2{
+		ID:              "server-incremental-runner",
+		Version:         sessions.VersionV2,
+		Provider:        "fake",
+		ModelProfile:    "default",
+		ModelID:         "model-default",
+		CWD:             projectDir,
+		CreatedCWD:      projectDir,
+		ConfigPath:      cliConfigPath(configDir),
+		EnabledTools:    []string{"shell"},
+		SaveToolResults: true,
+	})
+	if err != nil {
+		t.Fatalf("SaveMetadata() error = %v", err)
+	}
+	projector, err := sessionprojector.New(store, session)
+	if err != nil {
+		t.Fatalf("sessionprojector.New() error = %v", err)
+	}
+	defer projector.Close()
+	bus := eventbus.NewBus(projector.Handler())
+	defer bus.Close()
+	turnID := "turn-incremental"
+	if err := bus.Publish(eventbus.TurnStarted{TurnID: turnID}); err != nil {
+		t.Fatalf("Publish(TurnStarted) error = %v", err)
+	}
+	if err := bus.Publish(eventbus.TurnInputReady{TurnID: turnID, Message: model.Message{Role: model.MessageRoleUser, Content: "server prompt"}}); err != nil {
+		t.Fatalf("Publish(TurnInputReady) error = %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	type runResult struct {
+		result localserver.SessionTurnResult
+		err    error
+	}
+	done := make(chan runResult, 1)
+	go func() {
+		result, err := (serverAgentTurnRunner{program: "sai"}).RunSessionTurn(ctx, localserver.SessionTurnRequest{
+			Session:      session,
+			SessionStore: store,
+			TurnID:       turnID,
+			Content:      "server prompt",
+			Publisher:    bus,
+		})
+		done <- runResult{result: result, err: err}
+	}()
+
+	firstRequest := receiveCLIRunRequest(t, requests)
+	assertCLIToolNames(t, firstRequest.Body, []string{"shell"})
+	pendingTool := waitForCLISessionToolStatus(t, store, session.ID, sessions.ItemStatusPending)
+	if pendingTool.Message == nil || pendingTool.Message.ToolCallID != "call_1" {
+		t.Fatalf("pending tool item = %#v, want call_1", pendingTool)
+	}
+	writeCLIFile(t, filepath.Join(projectDir, "release.txt"), "go")
+
+	var outcome runResult
+	select {
+	case outcome = <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for incremental runner")
+	}
+	if outcome.err != nil {
+		_ = bus.Publish(eventbus.TurnInterrupted{TurnID: turnID})
+		t.Fatalf("RunSessionTurn() error = %v", outcome.err)
+	}
+	if !outcome.result.Incremental {
+		t.Fatalf("RunSessionTurn() Incremental = false, want true")
+	}
+	if len(outcome.result.Items) != 0 || len(outcome.result.ActiveHistory) != 0 || outcome.result.Compaction != nil {
+		t.Fatalf("incremental result returned legacy save plan: %#v", outcome.result)
+	}
+	if err := bus.Publish(eventbus.TurnCompleted{TurnID: turnID}); err != nil {
+		t.Fatalf("Publish(TurnCompleted) error = %v", err)
+	}
+
+	secondRequest := receiveCLIRunRequest(t, requests)
+	messages := requestMessages(t, secondRequest.Body)
+	toolMessage, ok := messages[len(messages)-1].(map[string]any)
+	if !ok {
+		t.Fatalf("last request message = %T(%#v), want object", messages[len(messages)-1], messages[len(messages)-1])
+	}
+	if toolMessage["role"] != "tool" || toolMessage["tool_call_id"] != "call_1" || !strings.Contains(fmt.Sprint(toolMessage["content"]), "blocked tool output") {
+		t.Fatalf("last request message = %#v, want shell tool output", toolMessage)
+	}
+	assertNoAdditionalCLIRunRequest(t, requests)
+
+	loaded, err := store.Load(session.ID)
+	if err != nil {
+		t.Fatalf("Load(%s) error = %v", session.ID, err)
+	}
+	if loaded.RunningTurnID != "" {
+		t.Fatalf("RunningTurnID = %q, want cleared", loaded.RunningTurnID)
+	}
+	var completedTool sessions.SessionItem
+	for _, item := range loaded.Items {
+		if item.Message != nil && item.Message.ToolCallID == "call_1" {
+			completedTool = item
+			break
+		}
+	}
+	if completedTool.ID == "" || completedTool.Status != sessions.ItemStatusCompleted || !strings.Contains(completedTool.Message.Content, "blocked tool output") {
+		t.Fatalf("completed tool item = %#v, want completed shell output", completedTool)
+	}
+	materialized, err := store.MaterializeActiveHistory(loaded)
+	if err != nil {
+		t.Fatalf("MaterializeActiveHistory() error = %v", err)
+	}
+	if err := validateActiveHistoryToolExchanges(loaded.ID, materialized); err != nil {
+		t.Fatalf("active history validation error = %v; messages=%#v", err, materialized)
+	}
+}
+
+func blockingShellCommandForCLIIncrementalTest() string {
+	if runtime.GOOS == "windows" {
+		return "while (!(Test-Path -LiteralPath 'release.txt')) { Start-Sleep -Milliseconds 50 }; Write-Output 'blocked tool output'"
+	}
+	return "while [ ! -f release.txt ]; do sleep 0.05; done; printf '%s\\n' 'blocked tool output'"
+}
+
+func waitForCLISessionToolStatus(t *testing.T, store *sessions.V2Store, sessionID, status string) sessions.SessionItem {
+	t.Helper()
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		session, err := store.Load(sessionID)
+		if err != nil {
+			t.Fatalf("Load(%s) error = %v", sessionID, err)
+		}
+		for _, item := range session.Items {
+			if item.Message != nil && item.Message.Role == model.MessageRoleTool && item.Status == status {
+				return item
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	session, err := store.Load(sessionID)
+	if err != nil {
+		t.Fatalf("Load(%s) after timeout error = %v", sessionID, err)
+	}
+	t.Fatalf("timed out waiting for tool status %q; items=%#v", status, session.Items)
+	return sessions.SessionItem{}
 }
 
 func TestServerAgentTurnRunnerUsesProvidedSessionOutsideConfigStore(t *testing.T) {
