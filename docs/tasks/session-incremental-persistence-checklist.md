@@ -298,7 +298,7 @@ GC, and auto-rerunning interrupted tools.
 - [ ] The projector caches the session replayed state per turn so `UpdateItem` **and**
   `AppendItemsAndReplaceActiveHistory` reuse `LastSeq+1` without re-replaying per
   tool/round.
-- [ ] WebSocket clients subscribe to the existing process-level stream hub; the hub is
+- [x] WebSocket clients subscribe to the existing process-level stream hub; the hub is
   the sole bridge subscriber of the per-turn bus. Reconnect catch-up includes
   `item.appended` and `item.updated` (`PersistedEvent.Seq` = record seq); `item.updated`
   is refetched via `GET /sessions/{id}/items/{itemID}` (not `after_seq` paging).
