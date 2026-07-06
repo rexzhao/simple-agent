@@ -32,6 +32,7 @@ import (
 	openairesponses "github.com/rexzhao/simple-agent/internal/model/openai_responses"
 	projectstore "github.com/rexzhao/simple-agent/internal/projects"
 	localserver "github.com/rexzhao/simple-agent/internal/server"
+	"github.com/rexzhao/simple-agent/internal/sessionprojector"
 	"github.com/rexzhao/simple-agent/internal/sessions"
 	localskills "github.com/rexzhao/simple-agent/internal/skills"
 	"github.com/rexzhao/simple-agent/internal/subagents"
@@ -4229,6 +4230,10 @@ func runChatTurn(ctx context.Context, runtime *agentRuntime, messages []model.Me
 	doneInterrupts := forwardTurnInterrupts(turnCtx, cancel, interrupts)
 	defer doneInterrupts()
 
+	if shouldRunChatTurnWithSessionProjector(runtime) {
+		return runChatTurnWithSessionProjector(ctx, turnCtx, runtime, messages, prompt, stdout, stderr, addTrailingNewline, stderrNeedsLeadingBreak)
+	}
+
 	messages, err := runtime.autoCompactBeforeTurn(turnCtx, messages, prompt, stderr)
 	if err != nil {
 		return nil, newRecoverableTurnError(err)
@@ -4265,32 +4270,56 @@ func runChatMessagesInTurn(ctx, turnCtx context.Context, runtime *agentRuntime, 
 }
 
 func runChatMessagesInTurnWithEventHook(ctx, turnCtx context.Context, runtime *agentRuntime, requestMessages []model.Message, stdout, stderr io.Writer, addTrailingNewline bool, stderrNeedsLeadingBreak bool, onEvent func(model.Event)) ([]model.Message, error) {
+	return runChatMessagesInTurnWithOptions(ctx, turnCtx, runtime, requestMessages, stdout, stderr, addTrailingNewline, stderrNeedsLeadingBreak, chatMessagesInTurnOptions{
+		onEvent: onEvent,
+	})
+}
+
+type chatMessagesInTurnOptions struct {
+	onEvent         func(model.Event)
+	bus             *eventbus.Bus
+	publisher       eventbus.Publisher
+	turnID          string
+	skipSessionSave bool
+}
+
+func runChatMessagesInTurnWithOptions(ctx, turnCtx context.Context, runtime *agentRuntime, requestMessages []model.Message, stdout, stderr io.Writer, addTrailingNewline bool, stderrNeedsLeadingBreak bool, options chatMessagesInTurnOptions) ([]model.Message, error) {
 	request := model.Request{
 		Model:      runtime.modelID,
 		Messages:   copyMessageSlice(requestMessages),
 		Tools:      runtime.toolSchemas,
 		Parameters: runtime.parameters,
 	}
+	renderBus := options.bus
+	closeRenderBus := false
+	if renderBus == nil {
+		renderBus = eventbus.NewBus(nil)
+		closeRenderBus = true
+	}
+	if closeRenderBus {
+		defer renderBus.Close()
+	}
+	busEvents := renderBus.SubscribeLossless(0)
 	agentEvents, results, err := agent.StreamWithResult(turnCtx, request, agent.Options{
 		Provider:     runtime.provider,
 		ToolExecutor: runtime.toolExecutor,
 		MaxTurns:     runtime.maxTurns,
+		TurnID:       options.turnID,
+		Publisher:    options.publisher,
 	})
 	if err != nil {
 		return nil, newRecoverableTurnError(err)
 	}
-	renderBus := eventbus.NewBus(nil)
-	defer renderBus.Close()
 	bridgeCtx := context.Background()
-	events := modelEventsFromBus(bridgeCtx, renderBus.SubscribeLossless(0))
-	_ = publishModelEventsToBus(bridgeCtx, renderBus, agentEvents, renderBus.Close)
+	pumpDone := publishModelEventsToBus(bridgeCtx, renderBus, agentEvents)
+	events := modelEventsFromBusUntil(bridgeCtx, busEvents, pumpDone)
 
 	tracker := &chatOutputWriter{w: stdout}
 	if err := writeStreamWithOptions(tracker, stderr, events, runtime.showReasoning, runtime.logger, streamOutputOptions{
 		colorReasoning:          shouldColorizeWriter(tracker),
 		colorToolStatus:         shouldColorizeWriter(stderr),
 		stderrNeedsLeadingBreak: stderrNeedsLeadingBreak,
-		onEvent:                 onEvent,
+		onEvent:                 options.onEvent,
 	}); err != nil {
 		if errors.Is(err, context.Canceled) && ctx.Err() == nil {
 			return nil, newRecoverableTurnError(context.Canceled)
@@ -4307,8 +4336,10 @@ func runChatMessagesInTurnWithEventHook(ctx, turnCtx context.Context, runtime *a
 		}
 		return nil, newRecoverableTurnError(fmt.Errorf("agent did not return updated messages"))
 	}
-	if err := runtime.saveUpdatedMessages(result.Messages); err != nil {
-		return nil, err
+	if !options.skipSessionSave {
+		if err := runtime.saveUpdatedMessages(result.Messages); err != nil {
+			return nil, err
+		}
 	}
 	if addTrailingNewline && tracker.wrote && tracker.lastByte != '\n' {
 		if _, err := fmt.Fprintln(stdout); err != nil {
@@ -4318,13 +4349,90 @@ func runChatMessagesInTurnWithEventHook(ctx, turnCtx context.Context, runtime *a
 	return result.Messages, nil
 }
 
-func publishModelEventsToBus(ctx context.Context, publisher eventbus.Publisher, events <-chan model.Event, closeFn func()) <-chan struct{} {
+func shouldRunChatTurnWithSessionProjector(runtime *agentRuntime) bool {
+	if runtime == nil || !runtime.saveSessions || runtime.resumableSessionStore == nil {
+		return false
+	}
+	return runtime.config == nil || !runtime.config.Compaction.Enabled
+}
+
+func runChatTurnWithSessionProjector(ctx, turnCtx context.Context, runtime *agentRuntime, messages []model.Message, prompt string, stdout, stderr io.Writer, addTrailingNewline bool, stderrNeedsLeadingBreak bool) ([]model.Message, error) {
+	session, err := runtime.prepareSessionProjectorMetadata()
+	if err != nil {
+		return nil, err
+	}
+	turnID := nextCLISessionTurnID(session)
+	projector, err := sessionprojector.New(runtime.resumableSessionStore, session)
+	if err != nil {
+		return nil, err
+	}
+	defer projector.Close()
+	bus := eventbus.NewBus(projector.Handler())
+	defer bus.Close()
+
+	turnStarted := false
+	turnFinished := false
+	defer func() {
+		if !turnStarted || turnFinished {
+			return
+		}
+		_ = bus.Publish(eventbus.TurnInterrupted{TurnID: turnID})
+		_ = runtime.reloadResumableSession(session.ID)
+	}()
+
+	if err := bus.Publish(eventbus.TurnStarted{TurnID: turnID}); err != nil {
+		return nil, err
+	}
+	turnStarted = true
+
+	userMessage := model.Message{
+		Role:    model.MessageRoleUser,
+		Content: prompt,
+	}
+	if err := bus.Publish(eventbus.TurnInputReady{TurnID: turnID, Message: userMessage}); err != nil {
+		return nil, err
+	}
+	requestMessages := append(copyMessageSlice(messages), userMessage)
+	updated, err := runChatMessagesInTurnWithOptions(ctx, turnCtx, runtime, requestMessages, stdout, stderr, addTrailingNewline, stderrNeedsLeadingBreak, chatMessagesInTurnOptions{
+		bus:             bus,
+		publisher:       bus,
+		turnID:          turnID,
+		skipSessionSave: true,
+	})
+	if err != nil {
+		return nil, err
+	}
+	if err := bus.Publish(eventbus.TurnCompleted{TurnID: turnID}); err != nil {
+		return nil, err
+	}
+	turnFinished = true
+	if err := runtime.saveRuntimeMetadataForSession(session.ID); err != nil {
+		return nil, err
+	}
+	return updated, nil
+}
+
+func nextCLISessionTurnID(session sessions.SessionV2) string {
+	return fmt.Sprintf("turn-%06d", session.LastSeq+1)
+}
+
+func (r *agentRuntime) reloadResumableSession(sessionID string) error {
+	if r == nil || r.resumableSessionStore == nil || strings.TrimSpace(sessionID) == "" {
+		return nil
+	}
+	loaded, err := r.resumableSessionStore.Load(sessionID)
+	if err != nil {
+		return err
+	}
+	r.resumableSession = loaded
+	r.activeItemIDs = copyStringSlice(loaded.ActiveHistory)
+	return nil
+}
+
+func publishModelEventsToBus(ctx context.Context, publisher eventbus.Publisher, events <-chan model.Event) <-chan struct{} {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		if closeFn != nil {
-			defer closeFn()
-		}
 		if publisher == nil {
 			return
 		}
@@ -4345,6 +4453,54 @@ func publishModelEventsToBus(ctx context.Context, publisher eventbus.Publisher, 
 	return done
 }
 
+func modelEventsFromBusUntil(ctx context.Context, events <-chan eventbus.Event, done <-chan struct{}) <-chan model.Event {
+	out := make(chan model.Event)
+	go func() {
+		defer close(out)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case event, ok := <-events:
+				if !ok {
+					return
+				}
+				if !sendModelEventFromBus(ctx, out, event) {
+					return
+				}
+			case <-done:
+				for {
+					select {
+					case event, ok := <-events:
+						if !ok {
+							return
+						}
+						if !sendModelEventFromBus(ctx, out, event) {
+							return
+						}
+					default:
+						return
+					}
+				}
+			}
+		}
+	}()
+	return out
+}
+
+func sendModelEventFromBus(ctx context.Context, out chan<- model.Event, event eventbus.Event) bool {
+	modelEvent, ok := event.(eventbus.ModelEvent)
+	if !ok || modelEvent.Event == nil {
+		return true
+	}
+	select {
+	case out <- modelEvent.Event:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
 func modelEventsFromBus(ctx context.Context, events <-chan eventbus.Event) <-chan model.Event {
 	out := make(chan model.Event)
 	go func() {
@@ -4357,13 +4513,7 @@ func modelEventsFromBus(ctx context.Context, events <-chan eventbus.Event) <-cha
 				if !ok {
 					return
 				}
-				modelEvent, ok := event.(eventbus.ModelEvent)
-				if !ok || modelEvent.Event == nil {
-					continue
-				}
-				select {
-				case out <- modelEvent.Event:
-				case <-ctx.Done():
+				if !sendModelEventFromBus(ctx, out, event) {
 					return
 				}
 			}
@@ -5233,12 +5383,16 @@ func (r *agentRuntime) saveUpdatedMessages(messages []model.Message) error {
 }
 
 func (r *agentRuntime) refreshedSessionMetadata() sessions.SessionV2 {
+	return r.refreshSessionRuntimeMetadata(r.resumableSession)
+}
+
+func (r *agentRuntime) refreshSessionRuntimeMetadata(session sessions.SessionV2) sessions.SessionV2 {
 	var contextMetadata *contextwindow.Metadata
 	if r.contextTracker != nil {
 		metadata := r.contextTracker.Metadata()
 		contextMetadata = &metadata
 	}
-	return sessions.RefreshRuntimeMetadata(r.resumableSession, sessions.RuntimeMetadataUpdate{
+	return sessions.RefreshRuntimeMetadata(session, sessions.RuntimeMetadataUpdate{
 		Provider:             r.providerName,
 		ModelProfile:         r.modelProfile,
 		ModelID:              r.modelID,
@@ -5254,6 +5408,23 @@ func (r *agentRuntime) refreshedSessionMetadata() sessions.SessionV2 {
 		Context:              contextMetadata,
 		SaveToolResults:      true,
 	})
+}
+
+func (r *agentRuntime) saveRuntimeMetadataForSession(sessionID string) error {
+	if r == nil || r.resumableSessionStore == nil || strings.TrimSpace(sessionID) == "" {
+		return nil
+	}
+	loaded, err := r.resumableSessionStore.Load(sessionID)
+	if err != nil {
+		return err
+	}
+	saved, err := r.resumableSessionStore.SaveMetadata(r.refreshSessionRuntimeMetadata(loaded))
+	if err != nil {
+		return fmt.Errorf("save resumable session metadata: %w", err)
+	}
+	r.resumableSession = saved
+	r.activeItemIDs = copyStringSlice(saved.ActiveHistory)
+	return nil
 }
 
 func (r *agentRuntime) prepareSessionProjectorMetadata() (sessions.SessionV2, error) {

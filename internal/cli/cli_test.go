@@ -6220,9 +6220,22 @@ func TestChatQuitActiveTurnInterruptEndsWithoutSavedAssistantHistory(t *testing.
 	if stdout.String() != "" {
 		t.Fatalf("stdout = %q, want empty", stdout.String())
 	}
-	if sessions := sessionDirs(t, configDir); len(sessions) != 0 {
-		t.Fatalf("session dirs = %#v, want none", sessions)
+	session := loadOnlyCLISession(t, filepath.Join(configDir, "sessions"))
+	if session.RunningTurnID != "" {
+		t.Fatalf("RunningTurnID = %q, want cleared after interrupt", session.RunningTurnID)
 	}
+	if session.InterruptedTurnID == "" {
+		t.Fatalf("InterruptedTurnID is empty, want interrupted turn metadata: %#v", session)
+	}
+	if len(session.Items) != 2 {
+		t.Fatalf("len(session.Items) = %d, want runtime context plus user prompt: %#v", len(session.Items), session.Items)
+	}
+	active := activeCLIMessages(t, session)
+	if len(active) != 2 {
+		t.Fatalf("len(active messages) = %d, want runtime context plus user prompt: %#v", len(active), active)
+	}
+	assertSavedMessage(t, active, 0, model.MessageRoleSystem, builtInBaseInstructions)
+	assertSavedMessage(t, active, 1, model.MessageRoleUser, "first")
 	assertCLIErrorContains(t, stderr.String(), "sai: context canceled")
 	assertNoAdditionalCLIRunRequest(t, requests)
 }
@@ -6565,6 +6578,95 @@ func TestChatSaveSessionFlagWritesFullToolHistory(t *testing.T) {
 	assertSavedAssistantToolCallMessage(t, messages, 2, "call_1", "read_file", `{"path":"note.txt"}`)
 	assertSavedToolMessage(t, messages, 3, "call_1", "tool output")
 	assertSavedMessage(t, messages, 4, model.MessageRoleAssistant, "done")
+	var toolItems []sessions.SessionItem
+	for _, item := range session.Items {
+		if item.Message != nil && item.Message.Role == model.MessageRoleTool {
+			toolItems = append(toolItems, item)
+		}
+	}
+	if len(toolItems) != 1 {
+		t.Fatalf("tool item count = %d, want 1: %#v", len(toolItems), session.Items)
+	}
+	if toolItems[0].Status != sessions.ItemStatusCompleted {
+		t.Fatalf("tool item status = %q, want completed: %#v", toolItems[0].Status, toolItems[0])
+	}
+	if session.RunningTurnID != "" {
+		t.Fatalf("RunningTurnID = %q, want cleared", session.RunningTurnID)
+	}
+	events, err := sessions.NewV2Store(filepath.Join(configDir, "sessions")).PersistedEventsAfter(session.ID, 0)
+	if err != nil {
+		t.Fatalf("PersistedEventsAfter() error = %v", err)
+	}
+	var updatedEvents int
+	for _, event := range events {
+		if event.Type == sessions.RecordTypeItemUpdated && event.ItemID == toolItems[0].ID {
+			updatedEvents++
+		}
+	}
+	if updatedEvents != 1 {
+		t.Fatalf("tool item.updated events = %d, want 1: %#v", updatedEvents, events)
+	}
+}
+
+func TestChatSaveSessionWithCompactionEnabledKeepsOldTurnSavePath(t *testing.T) {
+	server, requests := newSequentialCLIRunServer(t,
+		[]string{
+			`{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"read_file","arguments":"{\"path\":\"note.txt\"}"}}]}}]}`,
+			`{"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`,
+			`[DONE]`,
+		},
+		[]string{
+			`{"choices":[{"delta":{"content":"done"}}]}`,
+			`[DONE]`,
+		},
+	)
+	defer server.Close()
+
+	projectDir := t.TempDir()
+	writeCLIFile(t, filepath.Join(projectDir, "note.txt"), "tool output")
+	configDir := t.TempDir()
+	writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
+	setCLICompactionConfig(t, configDir, true, "", "")
+
+	var stdout, stderr bytes.Buffer
+	code := runLegacyChatWithIO([]string{"--config", cliConfigPath(configDir), "chat", "--save-session", "--quit", "--enable-tools", "read_file", "--prompt", "Read note"}, strings.NewReader(""), &stdout, &stderr, func() (string, error) {
+		return projectDir, nil
+	})
+
+	if code != 0 {
+		t.Fatalf("RunWithIO() code = %d, stderr = %s", code, stderr.String())
+	}
+	<-requests
+	<-requests
+	assertNoAdditionalCLIRunRequest(t, requests)
+
+	root := filepath.Join(configDir, "sessions")
+	session := loadOnlyCLISession(t, root)
+	messages := activeCLIMessages(t, session)
+	if len(messages) != 5 {
+		t.Fatalf("len(saved messages) = %d, want 5: %#v", len(messages), messages)
+	}
+	var toolItems []sessions.SessionItem
+	for _, item := range session.Items {
+		if item.Message != nil && item.Message.Role == model.MessageRoleTool {
+			toolItems = append(toolItems, item)
+		}
+	}
+	if len(toolItems) != 1 {
+		t.Fatalf("tool item count = %d, want 1: %#v", len(toolItems), session.Items)
+	}
+	if toolItems[0].Status != "" {
+		t.Fatalf("tool item status = %q, want old path empty status", toolItems[0].Status)
+	}
+	events, err := sessions.NewV2Store(root).PersistedEventsAfter(session.ID, 0)
+	if err != nil {
+		t.Fatalf("PersistedEventsAfter() error = %v", err)
+	}
+	for _, event := range events {
+		if event.Type == sessions.RecordTypeItemUpdated {
+			t.Fatalf("unexpected item.updated event on compaction-enabled old path: %#v", events)
+		}
+	}
 }
 
 func TestChatLargePromptSaveSessionStoresBlobBackedContent(t *testing.T) {
@@ -14197,8 +14299,8 @@ func TestModelEventBusBridgeRendersAllEventsAndCloses(t *testing.T) {
 	bus := eventbus.NewBus(nil)
 	defer bus.Close()
 	source := make(chan model.Event)
-	pumpDone := publishModelEventsToBus(ctx, bus, source, bus.Close)
-	events := modelEventsFromBus(ctx, bus.SubscribeLossless(1))
+	pumpDone := publishModelEventsToBus(ctx, bus, source)
+	events := modelEventsFromBusUntil(ctx, bus.SubscribeLossless(1), pumpDone)
 	go func() {
 		defer close(source)
 		for i := 0; i < eventCount; i++ {
