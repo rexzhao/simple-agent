@@ -414,7 +414,7 @@ Commands:
   version            Print version
   help [command]     Show usage
 
-With no command, sai defaults to attach.
+With no command, sai starts a pending session for the current project.
 
 Run "sai help <command>" for command usage.
 `
@@ -422,10 +422,11 @@ Run "sai help <command>" for command usage.
 const attachUsageText = `usage: sai attach [session-id]
        sai attach --new [--cwd path]
 
-Discovers the nearest healthy local server, connects to a server-owned session
-stream, and reads prompts from stdin. Without a session id, sai attaches to the
-most recently updated session in the nearest registered project. --new creates a session first.
-Existing-session attach rejects --cwd and global --config; existing sessions use
+Discovers the selected healthy local server and reads prompts from stdin.
+Without a session id, or with --new, sai starts a pending session in the nearest
+registered project. It creates the durable session only after the first ordinary
+user message. Existing-session attach fetches a display snapshot, connects to
+the session stream, and rejects --cwd and global --config; existing sessions use
 their stored cwd and config.
 `
 
@@ -2578,67 +2579,41 @@ func attachCommand(ctx context.Context, args []string, configPath string, config
 	case !*newSession && len(positionals) > 1:
 		return usageError("usage: sai attach [session-id]", "", "sai help attach")
 	}
-	if err := rejectExistingSessionOverrides(*newSession, flagWasSet(flags, "cwd"), configProvided, "sai help attach"); err != nil {
+	createMode := *newSession || len(positionals) == 0
+	if err := rejectExistingSessionOverrides(createMode, flagWasSet(flags, "cwd"), configProvided, "sai help attach"); err != nil {
 		return err
 	}
 
 	sessionID := ""
 	var record localserver.RegistryRecord
-	if *newSession {
+	if createMode {
 		creationCWD, err := resolveClientCWD(*cwdFlag, getwd)
 		if err != nil {
 			return err
 		}
-		detailRecord, detail, err := createProjectSessionForCWD(ctx, configPath, homePath, creationCWD, program)
-		if err != nil {
-			return err
-		}
-		record = detailRecord
-		sessionID = strings.TrimSpace(detail.ID)
-		if sessionID == "" {
-			return fmt.Errorf("create session at %s: response missing session id", record.BaseURL)
-		}
-	} else if len(positionals) == 1 {
+		return runPendingAttachREPL(ctx, configPath, homePath, creationCWD, stdin, stdout, stderr, program)
+	} else {
 		var err error
 		record, err = ensureSelectedServer(ctx, homePath, program)
 		if err != nil {
 			return err
 		}
-	} else {
-		effectiveCWD, err := resolveClientCWD(*cwdFlag, getwd)
-		if err != nil {
-			return err
-		}
-		record, err = ensureProjectCommandServer(ctx, configPath, homePath, effectiveCWD, program)
-		if err != nil {
-			return err
-		}
 	}
 
-	if !*newSession && len(positionals) == 1 {
-		sessionID = strings.TrimSpace(positionals[0])
-		if sessionID == "" {
-			return usageError("session id must be a non-empty string", "", "sai help attach")
-		}
-	} else if !*newSession {
-		var err error
-		sessionID, err = mostRecentProjectSessionID(ctx, record, *cwdFlag, getwd, program, displayCommand+" attach --new")
-		if err != nil {
-			return err
-		}
+	sessionID = strings.TrimSpace(positionals[0])
+	if sessionID == "" {
+		return usageError("session id must be a non-empty string", "", "sai help attach")
 	}
 
 	streamOptions := localserver.SessionStreamOptions{}
-	if !*newSession {
-		snapshot, err := localserver.GetSessionChatItemsWithToken(ctx, record.BaseURL, record.Token, sessionID, serverClientTimeout)
-		if err != nil {
-			return err
-		}
-		if err := writeAttachSnapshot(stdout, snapshot); err != nil {
-			return err
-		}
-		streamOptions.AfterSeq = &snapshot.NewestSeq
+	snapshot, err := localserver.GetSessionChatItemsWithToken(ctx, record.BaseURL, record.Token, sessionID, serverClientTimeout)
+	if err != nil {
+		return err
 	}
+	if err := writeAttachSnapshot(stdout, snapshot); err != nil {
+		return err
+	}
+	streamOptions.AfterSeq = &snapshot.NewestSeq
 	events, streamErrs, closeStream, err := localserver.StreamSessionEventsWithOptions(ctx, record.BaseURL, record.Token, sessionID, streamOptions, serverClientTimeout)
 	if err != nil {
 		return err
@@ -2648,6 +2623,71 @@ func attachCommand(ctx context.Context, args []string, configPath string, config
 		return err
 	}
 	return runAttachREPL(ctx, record, sessionID, stdin, stdout, stderr, events, streamErrs, displayCommand)
+}
+
+func runPendingAttachREPL(ctx context.Context, configPath, serverRoot, creationCWD string, stdin io.Reader, stdout, stderr io.Writer, program string) error {
+	displayCommand := displayProgramName(program)
+	if _, err := ensurePendingAttachProject(ctx, configPath, serverRoot, creationCWD, program); err != nil {
+		return err
+	}
+
+	scanner := bufio.NewScanner(stdin)
+	for {
+		line, multiline, ok, err := readChatInput(ctx, scanner, stderr)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return nil
+		}
+
+		command := strings.TrimSpace(line)
+		if command == "" {
+			continue
+		}
+		if !multiline && (command == "/exit" || command == "/quit") {
+			return nil
+		}
+		if !multiline && command == "/compact" {
+			if _, err := fmt.Fprintf(stderr, "%s: compact requires a session; send a message first to create one\n", displayCommand); err != nil {
+				return err
+			}
+			continue
+		}
+
+		record, detail, err := createProjectSessionForCWD(ctx, configPath, serverRoot, creationCWD, program)
+		if err != nil {
+			return err
+		}
+		sessionID := strings.TrimSpace(detail.ID)
+		if sessionID == "" {
+			return fmt.Errorf("create session at %s: response missing session id", record.BaseURL)
+		}
+		events, streamErrs, closeStream, err := localserver.StreamSessionEventsWithOptions(ctx, record.BaseURL, record.Token, sessionID, localserver.SessionStreamOptions{}, serverClientTimeout)
+		if err != nil {
+			return err
+		}
+		defer closeStream()
+		if _, err := fmt.Fprintf(stderr, "%s: attached to session %s\n", displayCommand, sessionID); err != nil {
+			return err
+		}
+		initialInput := chatInputEvent{line: line, multiline: multiline, ok: true}
+		return runAttachREPLWithScanner(ctx, record, sessionID, scanner, stdout, stderr, events, streamErrs, displayCommand, &initialInput)
+	}
+}
+
+func ensurePendingAttachProject(ctx context.Context, configPath, serverRoot, creationCWD, program string) (localserver.RegistryRecord, error) {
+	displayCommand := displayProgramName(program)
+	record, err := ensureProjectCommandServer(ctx, configPath, serverRoot, creationCWD, program)
+	if err != nil {
+		return localserver.RegistryRecord{}, err
+	}
+	if _, ok, err := nearestProject(ctx, record, creationCWD); err != nil {
+		return localserver.RegistryRecord{}, err
+	} else if !ok {
+		return localserver.RegistryRecord{}, fmt.Errorf("no registered project found from %s; run %q", creationCWD, displayCommand+" project create")
+	}
+	return record, nil
 }
 
 func writeAttachSnapshot(stdout io.Writer, snapshot localserver.SessionItemsPage) error {
@@ -2726,6 +2766,10 @@ type attachSendResult struct {
 
 func runAttachREPL(ctx context.Context, record localserver.RegistryRecord, sessionID string, stdin io.Reader, stdout, stderr io.Writer, events <-chan localserver.SessionStreamEvent, streamErrs <-chan error, displayCommand string) error {
 	scanner := bufio.NewScanner(stdin)
+	return runAttachREPLWithScanner(ctx, record, sessionID, scanner, stdout, stderr, events, streamErrs, displayCommand, nil)
+}
+
+func runAttachREPLWithScanner(ctx context.Context, record localserver.RegistryRecord, sessionID string, scanner *bufio.Scanner, stdout, stderr io.Writer, events <-chan localserver.SessionStreamEvent, streamErrs <-chan error, displayCommand string, initialInput *chatInputEvent) error {
 	var inputCh <-chan chatInputEvent
 	var sendDone <-chan attachSendResult
 	output := attachOutputState{stdoutAtLineStart: true}
@@ -2760,6 +2804,13 @@ func runAttachREPL(ctx context.Context, record localserver.RegistryRecord, sessi
 			output.stdoutAtLineStart = true
 		}
 		return nil
+	}
+
+	if initialInput != nil {
+		ch := make(chan chatInputEvent, 1)
+		ch <- *initialInput
+		close(ch)
+		inputCh = ch
 	}
 
 	for {
