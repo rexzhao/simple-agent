@@ -6738,6 +6738,139 @@ func TestChatSaveSessionFlagWritesMultiToolHistoryIncrementally(t *testing.T) {
 	}
 }
 
+func TestChatSaveSessionCancelAfterCompletedToolKeepsCompletedResult(t *testing.T) {
+	firstCommand := shellOutputCommandForCLI("first tool output")
+	secondReleaseFile := "release-cancel-second.txt"
+	secondCommand := blockingShellCommandForCLIReleaseFile(secondReleaseFile, "second tool output")
+	firstArgs, err := json.Marshal(map[string]any{
+		"command":    firstCommand,
+		"timeout_ms": 5000,
+	})
+	if err != nil {
+		t.Fatalf("Marshal(first shell args) error = %v", err)
+	}
+	secondArgs, err := json.Marshal(map[string]any{
+		"command":    secondCommand,
+		"timeout_ms": 10000,
+	})
+	if err != nil {
+		t.Fatalf("Marshal(second shell args) error = %v", err)
+	}
+	toolChunk := fmt.Sprintf(
+		`{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"shell","arguments":%q}},{"index":1,"id":"call_2","function":{"name":"shell","arguments":%q}}]}}]}`,
+		string(firstArgs),
+		string(secondArgs),
+	)
+	server, requests := newSequentialCLIRunServer(t,
+		[]string{
+			toolChunk,
+			`{"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`,
+			`[DONE]`,
+		},
+		[]string{
+			`{"choices":[{"delta":{"content":"unexpected final"}}]}`,
+			`[DONE]`,
+		},
+	)
+	defer server.Close()
+
+	projectDir := t.TempDir()
+	configDir := t.TempDir()
+	writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
+	interrupts := make(chan struct{}, 1)
+	type runOutcome struct {
+		code   int
+		stdout string
+		stderr string
+	}
+	done := make(chan runOutcome, 1)
+	runFinished := make(chan struct{})
+	go func() {
+		defer close(runFinished)
+		var stdout, stderr bytes.Buffer
+		code := runLegacyChatWithInterrupts(context.Background(), "sai", []string{"--config", cliConfigPath(configDir), "chat", "--save-session", "--quit", "--enable-tools", "shell", "--prompt", "Run until cancel"}, strings.NewReader(""), &stdout, &stderr, func() (string, error) {
+			return projectDir, nil
+		}, interrupts)
+		done <- runOutcome{code: code, stdout: stdout.String(), stderr: stderr.String()}
+	}()
+	t.Cleanup(func() {
+		select {
+		case <-runFinished:
+			return
+		default:
+		}
+		select {
+		case interrupts <- struct{}{}:
+		default:
+		}
+		_ = os.WriteFile(filepath.Join(projectDir, secondReleaseFile), []byte("go"), 0o600)
+		select {
+		case <-runFinished:
+		case <-time.After(10 * time.Second):
+			t.Fatalf("timed out waiting for canceled CLI run cleanup")
+		}
+	})
+
+	firstRequest := receiveCLIRunRequest(t, requests)
+	assertCLIToolNames(t, firstRequest.Body, []string{"shell"})
+	sessionRoot := filepath.Join(configDir, "sessions")
+	session := waitForOnlyCLISession(t, sessionRoot)
+	store := sessions.NewV2Store(sessionRoot)
+	completed := waitForCLISessionToolCallStatus(t, store, session.ID, "call_1", sessions.ItemStatusCompleted)
+	if completed.Message == nil || !strings.Contains(completed.Message.Content, "first tool output") {
+		t.Fatalf("completed call_1 item = %#v, want first tool output", completed)
+	}
+
+	interrupts <- struct{}{}
+	var outcome runOutcome
+	select {
+	case outcome = <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for canceled CLI run")
+	}
+	if outcome.code == 0 {
+		t.Fatalf("RunWithInterrupts() code = 0, want cancellation failure; stdout=%q stderr=%q", outcome.stdout, outcome.stderr)
+	}
+	assertCLIErrorContains(t, outcome.stderr, "context canceled")
+	assertNoAdditionalCLIRunRequest(t, requests)
+
+	loaded := loadCLISession(t, sessionRoot, session.ID)
+	if loaded.RunningTurnID != "" {
+		t.Fatalf("RunningTurnID = %q, want cleared", loaded.RunningTurnID)
+	}
+	if loaded.InterruptedTurnID == "" {
+		t.Fatal("InterruptedTurnID = empty, want canceled turn recorded")
+	}
+	toolsByCallID := toolItemsByCallID(loaded.Items)
+	call1, ok := toolsByCallID["call_1"]
+	if !ok || call1.Status != sessions.ItemStatusCompleted || call1.Message == nil || !strings.Contains(call1.Message.Content, "first tool output") {
+		t.Fatalf("call_1 item after cancel = %#v, ok %v, want completed first output", call1, ok)
+	}
+	materialized, err := store.MaterializeActiveHistory(loaded)
+	if err != nil {
+		t.Fatalf("MaterializeActiveHistory() error = %v", err)
+	}
+	if err := validateActiveHistoryToolExchanges(loaded.ID, materialized); err != nil {
+		t.Fatalf("active history validation error = %v; messages=%#v", err, materialized)
+	}
+	if !materializedToolMessageContains(materialized, "call_1", "first tool output") {
+		t.Fatalf("materialized active history missing completed call_1 output: %#v", materialized)
+	}
+	events, err := store.PersistedEventsAfter(loaded.ID, 0)
+	if err != nil {
+		t.Fatalf("PersistedEventsAfter() error = %v", err)
+	}
+	var call1Updates int
+	for _, event := range events {
+		if event.Type == sessions.RecordTypeItemUpdated && event.ItemID == call1.ID {
+			call1Updates++
+		}
+	}
+	if call1Updates != 1 {
+		t.Fatalf("call_1 item.updated events = %d, want 1: %#v", call1Updates, events)
+	}
+}
+
 func TestChatSaveSessionWithCompactionEnabledUsesProjectorPath(t *testing.T) {
 	server, requests := newSequentialCLIRunServer(t,
 		[]string{
@@ -8237,6 +8370,13 @@ func blockingShellCommandForCLIIncrementalTest() string {
 	return blockingShellCommandForCLIReleaseFile("release.txt", "blocked tool output")
 }
 
+func shellOutputCommandForCLI(output string) string {
+	if runtime.GOOS == "windows" {
+		return fmt.Sprintf("Write-Output '%s'", output)
+	}
+	return fmt.Sprintf("printf '%%s\\n' '%s'", output)
+}
+
 func blockingShellCommandForCLIReleaseFile(filename, output string) string {
 	if runtime.GOOS == "windows" {
 		return fmt.Sprintf("while (!(Test-Path -LiteralPath '%s')) { Start-Sleep -Milliseconds 50 }; Write-Output '%s'", filename, output)
@@ -8314,6 +8454,30 @@ func waitForCLISessionToolStatusCount(t *testing.T, store *sessions.V2Store, ses
 	return nil
 }
 
+func waitForCLISessionToolCallStatus(t *testing.T, store *sessions.V2Store, sessionID, toolCallID, status string) sessions.SessionItem {
+	t.Helper()
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		session, err := store.Load(sessionID)
+		if err != nil {
+			t.Fatalf("Load(%s) error = %v", sessionID, err)
+		}
+		for _, item := range session.Items {
+			if item.Message != nil && item.Message.Role == model.MessageRoleTool && item.Message.ToolCallID == toolCallID && item.Status == status {
+				return item
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	session, err := store.Load(sessionID)
+	if err != nil {
+		t.Fatalf("Load(%s) after timeout error = %v", sessionID, err)
+	}
+	t.Fatalf("timed out waiting for tool call %q with status %q; items=%#v", toolCallID, status, session.Items)
+	return sessions.SessionItem{}
+}
+
 func sessionToolItemsWithStatus(items []sessions.SessionItem, status string) []sessions.SessionItem {
 	var matches []sessions.SessionItem
 	for _, item := range items {
@@ -8342,6 +8506,15 @@ func toolItemsByCallID(items []sessions.SessionItem) map[string]sessions.Session
 		}
 	}
 	return byCallID
+}
+
+func materializedToolMessageContains(messages []model.Message, toolCallID, content string) bool {
+	for _, message := range messages {
+		if message.Role == model.MessageRoleTool && message.ToolCallID == toolCallID && strings.Contains(message.Content, content) {
+			return true
+		}
+	}
+	return false
 }
 
 func TestServerAgentTurnRunnerUsesProvidedSessionOutsideConfigStore(t *testing.T) {
