@@ -221,11 +221,23 @@ GC, and auto-rerunning interrupted tools.
   `MarkRunningTurnsInterrupted` (meta.json only) → resume `MaterializeActiveHistory`
   synthesizes interrupted for pending → `validateActiveHistoryToolExchanges`
   (`cli.go:5511`) passes → provider request is valid.
-- [ ] Tests: each failure branch leaves no running turn and a legal resumable history;
+- [x] Tests: each failure branch leaves no running turn and a legal resumable history;
   `TurnInterrupted` handler writes `item.updated` (pending → interrupted) on disk, not
   just in-memory synthesis; persistence-failure abort discards in-memory `messages` and
   leaves disk authoritative; crash after round-commit before results → resume succeeds,
-  history legal, new turn continuable, pending items surface as interrupted.
+  history legal, new turn continuable, pending items surface as interrupted. Evidence:
+  `TestChatSaveSessionAssistantReadyPublishFailureAborts`,
+  `TestCrashResumeKeepsCompletedToolsAndSynthesizesPendingTools`,
+  `TestChatSaveSessionProcessKillKeepsCompletedToolResult`,
+  `TestChatSaveSessionCancelAfterCompletedToolKeepsCompletedResult`,
+  `TestSessionSendMessageIncrementalCompactionPlanFailureInterruptsBeforeInput`,
+  `TestSessionSendMessageIncrementalCancelAfterInputPersistsUserPrompt`,
+  `TestSessionSendMessageIncrementalInterruptsAfterAssistantReadyPublishFailure`,
+  `TestSessionSendMessageIncrementalInterruptsWhenRunnerSkipsIncrementalPersistence`,
+  `TestSessionSendMessageIncrementalInterruptsPendingToolsOnCancel`,
+  `TestSessionSendMessageIncrementalInterruptsPendingToolsAfterToolResultPublishFailure`,
+  `TestSessionSendMessageIncrementalPersistsToolErrorAndContinues`, and
+  `TestServerStartupMaterializesPendingToolAfterCrash`.
 - [x] **Test the user-cancel window explicitly**: `TurnInputReady` has persisted the
   user prompt, then Esc / `ctx` cancel before the first `AssistantReady`. Assert: user
   item is on disk, no pending tool items exist (none created yet), active_history ends
