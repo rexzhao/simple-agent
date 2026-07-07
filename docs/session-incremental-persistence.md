@@ -218,7 +218,7 @@ turn 内单 goroutine 写盘」，**不**保证「同 session 同时只有一个
 - 持久事件 seq = projector 写出的 v2 记录 seq；catch-up 仍走 `PersistedEventsAfter`，无需独立
   EventTable。
 
-### SessionProjector（新，`internal/sessionprojector` 或迁入 `internal/sessionplan`）
+### SessionProjector（`internal/sessionprojector`）
 
 订阅总线，翻译领域事件 → v2 记录，是**唯一**写存储者（含 JSONL 日志与 meta.json 生命周期）。事件
 顺序由编排层 + `agent.run` 共同保证：
@@ -278,11 +278,10 @@ agent.run: AssistantReady → ToolResultReady ×N → (下一 round) AssistantRe
    写单条非事务 `item.updated` 记录（`record.Seq = LastSeq+1`，但**不覆盖 `item.Seq`**）→
    返回更新后 item。**API 边界（与 Phase 6 projector 缓存配套）**：`UpdateItem` 内部 replay 取
    `LastSeq` 是默认实现；projector 为避免每个 tool result 全量 replay 需复用缓存的 `LastSeq`，故需
-   二选一明确：(a) store 暴露一个带缓存状态的写入 API（如 `UpdateItemAtSeq(sessionID, item, seq)`
-   或 `AppendRecords` 级别的受控入口，调用方提供 seq）；或 (b) 把 projector 与 store 同包
-   （`internal/sessions` 或 `internal/sessionplan`），让 projector 直接复用内部 `appendRecords` +
-   缓存 `LastSeq`。实现时定其一，**不能让外部 projector 自行 replay 后又调 `UpdateItem` 再 replay
-   一次**——那既无收益又放大竞态面。该 cached-state 写路径**同时覆盖 `UpdateItem` 与
+   明确使用方案 (a)：`internal/sessions` 暴露带缓存状态的写入 API（如
+   `AppendItemsAndReplaceActiveHistoryFromState`、`UpdateItemFromState`），由
+   `internal/sessionprojector` 调用并提供 cached state；**不能让外部 projector 自行 replay 后又调
+   `UpdateItem` 再 replay 一次**——那既无收益又放大竞态面。该 cached-state 写路径**同时覆盖 `UpdateItem` 与
    `AppendItemsAndReplaceActiveHistory`**（两者底层都是 `appendRecords`），即多 round turn 里
    `AssistantReady` 的 append+replace 也复用缓存 seq，不只优化 `UpdateItem`。
 5. materializer 合成（`materializeActiveHistory` 与 store 变体）：`role:tool` 且

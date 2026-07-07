@@ -44,8 +44,8 @@ GC, and auto-rerunning interrupted tools.
 
 ## Phase 2 — Event bus + SessionProjector
 
-- [x] Extract **small** planning helpers into a shared package (`internal/sessionplan`
-  or `sessions`) for CLI + server reuse: ID allocator (`nextSessionItemID`, `cli.go:5575`),
+- [x] Extract **small** planning helpers into shared `internal/sessions` helpers for
+  CLI + server reuse: ID allocator (`nextSessionItemID`, `cli.go:5575`),
   `sessionItemFromMessage` (`cli.go:5588`), metadata refresh, and active-history
   append/replace helpers. **Do NOT** promote `sessionSavePlan` (`cli.go:5175`) as a shared
   API — its positional `messages[len(activeItemIDs):]` diff is the old turn-end model; the
@@ -273,13 +273,12 @@ GC, and auto-rerunning interrupted tools.
   reduce to `appendRecords`; cached-state write path covers append + replace, not just
   `UpdateItem`) — replay once at turn start, not per tool / per round. (This cached
   state is the projector's private state, reinforcing the
-  single-writer constraint.) **API seam (decide in Phase 1)**: this requires either (a)
-  a store API that accepts a caller-provided seq / cached state
-  (`UpdateItemAtSeq` / exposed `AppendRecords`), or (b) co-locating the projector with
-  the store (`internal/sessions` or `internal/sessionplan`) so it reuses internal
-  `appendRecords` + cached `LastSeq` directly. Do **not** have an external projector
-  replay then call `UpdateItem` (which replays again) — no gain and widens the race
-  surface. Add a seq→segment index only if extreme sessions still suffer (not in scope).
+  single-writer constraint.) **API seam (selected in Phase 1)**: `internal/sessions`
+  exposes cached-state write APIs (for example
+  `AppendItemsAndReplaceActiveHistoryFromState` and `UpdateItemFromState`) that accept
+  the projector's cached state directly. Do **not** have an external projector replay
+  then call `UpdateItem` (which replays again) — no gain and widens the race surface. Add
+  a seq→segment index only if extreme sessions still suffer (not in scope).
 
 ## Acceptance Points
 
