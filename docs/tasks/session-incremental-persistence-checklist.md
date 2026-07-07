@@ -122,21 +122,21 @@ GC, and auto-rerunning interrupted tools.
   75-79, **not per `ToolCallDoneEvent`**, before tool execution) and `ToolResultReady`
   (after each `executeToolCall` ~line 87). Publisher error → emit `ErrorEvent` and
   return. `TurnStarted`/`TurnCompleted`/`TurnInterrupted` are **not** in `agent.run`.
-- [ ] **Orchestration layer** (CLI `runChatTurn` ~`cli.go:4231`, server
+- [x] **Orchestration layer** (CLI `runChatTurn` ~`cli.go:4231`, server
   `runServerOwnedSessionTurn` ~`cli.go:5973`) emits turn lifecycle: `TurnStarted`
   **before** pre-turn compaction → `CompactionRequested` (if `autoCompactBeforeTurn`/
   `planAutoCompactBeforeTurn` decides to) → `TurnInputReady` (after compaction, before
   starting `agent.run`, carrying the user prompt) → run agent → `TurnCompleted` (success)
   or defer `TurnInterrupted` (any non-success exit). This matches existing code order
   (compaction → append user message → agent turn).
-- [ ] Rendering adapter: `writeStreamWithOptions` (`cli.go:6456`) subscribes to bus
+- [x] Rendering adapter: `writeStreamWithOptions` (`cli.go:6456`) subscribes to bus
   transient events via a **bus→channel bridge** feeding the existing `events` channel
   (decided — not "dual-fan-out", to keep a single event path per 建议 3).
-- [ ] **Bus scope**: bus is **per-session/per-turn** (events carry `TurnID` only, no
+- [x] **Bus scope**: bus is **per-session/per-turn** (events carry `TurnID` only, no
   `SessionID`). UI/renderer subscribes directly. Server's process-level WebSocket
   stream hub (existing, routes by session ID) subscribes to the per-turn bus as a
   bridge for process-wide live fan-out; catch-up still via `PersistedEventsAfter`.
-- [ ] CLI assembly in `runChatMessagesInTurnWithEventHook` (`cli.go:4266`): construct
+- [x] CLI assembly in `runChatMessagesInTurnWithEventHook` (`cli.go:4266`): construct
   bus + projector, pass publisher to agent, subscribe renderer. Remove end-of-turn
   `saveUpdatedMessages`/`SaveTurn` (`cli.go:4304/5166`); `TurnResult` still updates
   in-memory state.
