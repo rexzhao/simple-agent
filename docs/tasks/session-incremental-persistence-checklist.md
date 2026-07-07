@@ -66,7 +66,7 @@ GC, and auto-rerunning interrupted tools.
   `internal/sessions` has zero `sync.Mutex`/`Lock`; `appendRecord` is replay-then-write.
   Serialization must come from the single-consumer projector, optionally plus a
   per-session store write lock as defense.)
-- [ ] **Session-level single-writer boundary (hard precondition — per-turn projector is
+- [x] **Session-level single-writer boundary (hard precondition — per-turn projector is
   not sufficient)**: creating a bus/projector **must** be gated by acquiring a
   session-level turn lock first, so at most one active projector exists per session at
   a time. Server path reuses `beginSessionTurn` (`server.go:1361`, `p.mu` +
@@ -272,7 +272,7 @@ GC, and auto-rerunning interrupted tools.
   is legal before results arrive.
 - [x] Same-session concurrent/sequential durable events are strictly serialized; seqs
   are contiguous (no gaps/duplicates); replay is correct (single-writer hard constraint).
-- [ ] **Session-level single-writer**: bus/projector creation is gated by a session turn
+- [x] **Session-level single-writer**: bus/projector creation is gated by a session turn
   lock (server `beginSessionTurn`); two concurrent turns on the same session never spawn
   two writers. Multi-process same-session is backstopped by a per-session store write
   lock. `MarkTurnRunning` is a crash-recovery marker, not a concurrency mutex.

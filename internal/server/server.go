@@ -1148,9 +1148,8 @@ func (p *Process) handleSessionMessage(w http.ResponseWriter, r *http.Request, i
 		session.CWD = p.snapshot().CWD
 	}
 
-	turnID := nextSessionTurnID(session)
 	turnCtx, cancelTurn := context.WithCancel(r.Context())
-	beginResult := p.beginSessionTurn(id, turnID, cancelTurn)
+	beginResult := p.beginSessionTurn(id, "pending", cancelTurn)
 	if beginResult == beginTurnBusy {
 		cancelTurn()
 		writeError(w, http.StatusConflict, "session_busy", "session is currently running a turn")
@@ -1182,7 +1181,7 @@ func (p *Process) handleSessionMessage(w http.ResponseWriter, r *http.Request, i
 		p.endSessionTurn(id)
 		cancelTurn()
 	}()
-	p.handleIncrementalSessionMessage(w, id, turnID, turnCtx, session, store, content)
+	p.handleIncrementalSessionMessage(w, id, turnCtx, store, content)
 }
 
 func (p *Process) supportsIncrementalSessionTurn(ctx context.Context, request SessionTurnRequest) (bool, error) {
@@ -1201,7 +1200,25 @@ func (p *Process) planSessionTurnCompaction(ctx context.Context, request Session
 	return planner.PlanSessionTurnCompaction(ctx, request)
 }
 
-func (p *Process) handleIncrementalSessionMessage(w http.ResponseWriter, id, turnID string, turnCtx context.Context, session sessions.SessionV2, store *sessions.V2Store, content string) {
+func (p *Process) handleIncrementalSessionMessage(w http.ResponseWriter, id string, turnCtx context.Context, store *sessions.V2Store, content string) {
+	writeLock, err := store.AcquireSessionWriteLock(turnCtx, id)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "session_store_error", "could not acquire session write lock")
+		return
+	}
+	defer func() {
+		_ = writeLock.Release()
+	}()
+
+	session, err := store.Load(id)
+	if err != nil {
+		p.writeSessionLoadError(w, err, "could not load session")
+		return
+	}
+	if strings.TrimSpace(session.CWD) == "" {
+		session.CWD = p.snapshot().CWD
+	}
+	turnID := nextSessionTurnID(session)
 	projector, err := sessionprojector.New(store, session)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "session_store_error", "could not start session projector")
@@ -1275,6 +1292,9 @@ func (p *Process) handleIncrementalSessionMessage(w http.ResponseWriter, id, tur
 			p.publishTurnFailed(id, turnID, err)
 			p.writeSessionLoadError(w, err, "could not load compacted session")
 			return
+		}
+		if strings.TrimSpace(session.CWD) == "" {
+			session.CWD = p.snapshot().CWD
 		}
 	}
 	if err := bus.Publish(eventbus.TurnInputReady{TurnID: turnID, Message: model.Message{Role: model.MessageRoleUser, Content: content}}); err != nil {
@@ -1369,9 +1389,8 @@ func (p *Process) handleSessionCompact(w http.ResponseWriter, r *http.Request, i
 		session.CWD = p.snapshot().CWD
 	}
 
-	operationID := nextSessionCompactOperationID(session)
 	operationCtx, cancelOperation := context.WithCancel(r.Context())
-	beginResult := p.beginSessionTurn(id, operationID, cancelOperation)
+	beginResult := p.beginSessionTurn(id, "compact-pending", cancelOperation)
 	if beginResult == beginTurnBusy {
 		cancelOperation()
 		writeError(w, http.StatusConflict, "session_busy", "session is currently running a turn")
@@ -1382,6 +1401,27 @@ func (p *Process) handleSessionCompact(w http.ResponseWriter, r *http.Request, i
 		writeError(w, http.StatusServiceUnavailable, "server_shutting_down", "server is shutting down")
 		return
 	}
+	writeLock, err := store.AcquireSessionWriteLock(operationCtx, id)
+	if err != nil {
+		p.endSessionTurn(id)
+		cancelOperation()
+		writeError(w, http.StatusInternalServerError, "session_store_error", "could not acquire session write lock")
+		return
+	}
+	defer func() {
+		_ = writeLock.Release()
+	}()
+	session, err = store.Load(id)
+	if err != nil {
+		p.endSessionTurn(id)
+		cancelOperation()
+		p.writeSessionLoadError(w, err, "could not load session")
+		return
+	}
+	if strings.TrimSpace(session.CWD) == "" {
+		session.CWD = p.snapshot().CWD
+	}
+	operationID := nextSessionCompactOperationID(session)
 	marked, err := store.MarkTurnRunning(id, operationID)
 	if err != nil {
 		p.endSessionTurn(id)

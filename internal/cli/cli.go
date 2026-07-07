@@ -4357,7 +4357,14 @@ func shouldRunChatTurnWithSessionProjector(runtime *agentRuntime) bool {
 }
 
 func runChatTurnWithSessionProjector(ctx, turnCtx context.Context, runtime *agentRuntime, messages []model.Message, prompt string, stdout, stderr io.Writer, addTrailingNewline bool, stderrNeedsLeadingBreak bool) ([]model.Message, error) {
-	session, err := runtime.prepareSessionProjectorMetadata()
+	session, writeLock, err := runtime.prepareSessionProjectorMetadataLocked(turnCtx)
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		_ = writeLock.Release()
+	}()
+	messages, err = runtime.materializeMessagesForSessionTurn(session)
 	if err != nil {
 		return nil, err
 	}
@@ -4407,7 +4414,19 @@ func runChatTurnWithSessionProjector(ctx, turnCtx context.Context, runtime *agen
 	if err := bus.Publish(eventbus.TurnInputReady{TurnID: turnID, Message: userMessage}); err != nil {
 		return nil, err
 	}
-	requestMessages := append(copyMessageSlice(messages), userMessage)
+	requestSession, err := runtime.resumableSessionStore.Load(session.ID)
+	if err != nil {
+		return nil, fmt.Errorf("load persisted turn input: %w", err)
+	}
+	requestMessages, err := runtime.materializeActiveHistory(requestSession)
+	if err != nil {
+		return nil, err
+	}
+	if err := validateActiveHistoryToolExchanges(requestSession.ID, requestMessages); err != nil {
+		return nil, err
+	}
+	runtime.resumableSession = requestSession
+	runtime.activeItemIDs = copyStringSlice(requestSession.ActiveHistory)
 	updated, err := runChatMessagesInTurnWithOptions(ctx, turnCtx, runtime, requestMessages, stdout, stderr, addTrailingNewline, stderrNeedsLeadingBreak, chatMessagesInTurnOptions{
 		bus:             bus,
 		publisher:       bus,
@@ -5471,25 +5490,68 @@ func (r *agentRuntime) saveRuntimeMetadataForSession(sessionID string) error {
 }
 
 func (r *agentRuntime) prepareSessionProjectorMetadata() (sessions.SessionV2, error) {
+	session, lock, err := r.prepareSessionProjectorMetadataLocked(context.Background())
+	if lock != nil {
+		_ = lock.Release()
+	}
+	return session, err
+}
+
+func (r *agentRuntime) prepareSessionProjectorMetadataLocked(ctx context.Context) (sessions.SessionV2, *sessions.SessionWriteLock, error) {
 	if !r.saveSessions {
-		return sessions.SessionV2{}, fmt.Errorf("resumable session saving is not enabled")
+		return sessions.SessionV2{}, nil, fmt.Errorf("resumable session saving is not enabled")
 	}
 	if r.resumableSessionStore == nil {
-		return sessions.SessionV2{}, fmt.Errorf("session store is not configured")
+		return sessions.SessionV2{}, nil, fmt.Errorf("session store is not configured")
 	}
 
 	session := r.refreshedSessionMetadata()
-	saved, err := r.resumableSessionStore.SaveMetadata(session)
-	if err != nil {
-		return sessions.SessionV2{}, fmt.Errorf("save resumable session metadata: %w", err)
+	sessionID := strings.TrimSpace(session.ID)
+	if sessionID == "" {
+		saved, err := r.resumableSessionStore.SaveMetadata(session)
+		if err != nil {
+			return sessions.SessionV2{}, nil, fmt.Errorf("save resumable session metadata: %w", err)
+		}
+		sessionID = saved.ID
 	}
-	loaded, err := r.resumableSessionStore.Load(saved.ID)
+	writeLock, err := r.resumableSessionStore.AcquireSessionWriteLock(ctx, sessionID)
 	if err != nil {
-		return sessions.SessionV2{}, fmt.Errorf("load resumable session metadata: %w", err)
+		return sessions.SessionV2{}, nil, err
+	}
+	releaseOnError := true
+	defer func() {
+		if releaseOnError {
+			_ = writeLock.Release()
+		}
+	}()
+
+	loaded, err := r.resumableSessionStore.Load(sessionID)
+	if err != nil {
+		return sessions.SessionV2{}, nil, fmt.Errorf("load resumable session metadata: %w", err)
+	}
+	saved, err := r.resumableSessionStore.SaveMetadata(r.refreshSessionRuntimeMetadata(loaded))
+	if err != nil {
+		return sessions.SessionV2{}, nil, fmt.Errorf("save resumable session metadata: %w", err)
+	}
+	loaded, err = r.resumableSessionStore.Load(saved.ID)
+	if err != nil {
+		return sessions.SessionV2{}, nil, fmt.Errorf("load resumable session metadata: %w", err)
 	}
 	r.resumableSession = loaded
 	r.activeItemIDs = copyStringSlice(loaded.ActiveHistory)
-	return loaded, nil
+	releaseOnError = false
+	return loaded, writeLock, nil
+}
+
+func (r *agentRuntime) materializeMessagesForSessionTurn(session sessions.SessionV2) ([]model.Message, error) {
+	messages, err := r.materializeActiveHistory(session)
+	if err != nil {
+		return nil, err
+	}
+	if len(messages) == 0 && len(session.ActiveHistory) == 0 && len(r.baseMessages) > 0 {
+		return copyMessageSlice(r.baseMessages), nil
+	}
+	return copyMessageSlice(messages), nil
 }
 
 func (r *agentRuntime) sessionSavePlan(messages []model.Message) (sessions.SessionV2, []sessions.SessionItem, []string, error) {

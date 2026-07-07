@@ -2,11 +2,13 @@ package sessions
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -33,6 +35,88 @@ func TestRootForHome(t *testing.T) {
 
 	if _, err := RootForHome(" "); err == nil {
 		t.Fatal("RootForHome(blank) error = nil, want error")
+	}
+}
+
+func TestV2StoreSessionWriteLockBlocksOtherProcesses(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "sessions")
+	store := NewV2Store(root)
+	if _, err := store.SaveMetadata(SessionV2{
+		ID:              "session-1",
+		Provider:        "test",
+		ModelProfile:    "default",
+		ModelID:         "model",
+		SaveToolResults: true,
+	}); err != nil {
+		t.Fatalf("SaveMetadata() error = %v", err)
+	}
+
+	lock, err := store.AcquireSessionWriteLock(context.Background(), "session-1")
+	if err != nil {
+		t.Fatalf("AcquireSessionWriteLock(parent) error = %v", err)
+	}
+	if lock.Path() == "" || filepath.Base(lock.Path()) != sessionWriteLockFileName {
+		t.Fatalf("lock path = %q, want %s", lock.Path(), sessionWriteLockFileName)
+	}
+
+	runSessionWriteLockChild(t, root, "session-1", "blocked")
+
+	if err := lock.Release(); err != nil {
+		t.Fatalf("Release() error = %v", err)
+	}
+	runSessionWriteLockChild(t, root, "session-1", "acquire")
+
+	if err := lock.Release(); err != nil {
+		t.Fatalf("second Release() error = %v", err)
+	}
+}
+
+func TestV2StoreSessionWriteLockChildProcess(t *testing.T) {
+	mode := os.Getenv("SAI_SESSION_WRITE_LOCK_CHILD")
+	if mode == "" {
+		return
+	}
+	root := os.Getenv("SAI_SESSION_WRITE_LOCK_ROOT")
+	sessionID := os.Getenv("SAI_SESSION_WRITE_LOCK_SESSION")
+	store := NewV2Store(root)
+	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+	defer cancel()
+	lock, err := store.AcquireSessionWriteLock(ctx, sessionID)
+	switch mode {
+	case "blocked":
+		if !errors.Is(err, context.DeadlineExceeded) {
+			if lock != nil {
+				_ = lock.Release()
+			}
+			t.Fatalf("AcquireSessionWriteLock(blocked) error = %v, want deadline exceeded", err)
+		}
+	case "acquire":
+		if err != nil {
+			t.Fatalf("AcquireSessionWriteLock(acquire) error = %v", err)
+		}
+		if err := lock.Release(); err != nil {
+			t.Fatalf("Release(child) error = %v", err)
+		}
+	default:
+		t.Fatalf("unknown lock child mode %q", mode)
+	}
+}
+
+func runSessionWriteLockChild(t *testing.T, root, sessionID, mode string) {
+	t.Helper()
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable() error = %v", err)
+	}
+	cmd := exec.Command(exe, "-test.run=^TestV2StoreSessionWriteLockChildProcess$", "-test.v")
+	cmd.Env = append(os.Environ(),
+		"SAI_SESSION_WRITE_LOCK_CHILD="+mode,
+		"SAI_SESSION_WRITE_LOCK_ROOT="+root,
+		"SAI_SESSION_WRITE_LOCK_SESSION="+sessionID,
+	)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("session write lock child mode %s failed: %v\n%s", mode, err, output)
 	}
 }
 
