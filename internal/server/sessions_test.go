@@ -1746,6 +1746,186 @@ func TestSessionSendMessageIncrementalPersistsAndPublishesViaBus(t *testing.T) {
 	}
 }
 
+func TestSessionSendMessageIncrementalPersistsMultiToolResults(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "sessions")
+	store := sessions.NewV2Store(root)
+	saveServerTestSession(t, store, "send-incremental-multi-tool")
+	runner := fakeIncrementalSessionTurnRunner{
+		run: func(ctx context.Context, request SessionTurnRequest) (SessionTurnResult, error) {
+			if request.Session.ID != "send-incremental-multi-tool" {
+				t.Fatalf("runner session id = %q, want send-incremental-multi-tool", request.Session.ID)
+			}
+			if request.TurnID == "" || request.Publisher == nil {
+				t.Fatalf("runner turn id/publisher = %q/%T, want incremental request", request.TurnID, request.Publisher)
+			}
+			assistant := model.Message{
+				Role:    model.MessageRoleAssistant,
+				Content: "assistant needs multiple tools",
+				ToolCalls: []model.ToolCall{
+					{
+						ID:        "call-a",
+						Name:      "read_file",
+						Arguments: `{"path":"SECRET ARG A"}`,
+					},
+					{
+						ID:        "call-b",
+						Name:      "read_file",
+						Arguments: `{"path":"SECRET ARG B"}`,
+					},
+				},
+			}
+			if err := request.Publisher.Publish(eventbus.AssistantReady{TurnID: request.TurnID, Message: assistant}); err != nil {
+				return SessionTurnResult{}, err
+			}
+			results := []model.ToolResult{
+				{
+					ToolCallID: "call-a",
+					Name:       "read_file",
+					Content:    "SECRET TOOL RESULT A",
+				},
+				{
+					ToolCallID: "call-b",
+					Name:       "read_file",
+					Content:    "SECRET TOOL RESULT B",
+				},
+			}
+			for _, result := range results {
+				if err := request.Publisher.Publish(eventbus.ToolResultReady{TurnID: request.TurnID, Result: result}); err != nil {
+					return SessionTurnResult{}, err
+				}
+			}
+			if err := request.Publisher.Publish(eventbus.AssistantReady{TurnID: request.TurnID, Message: model.Message{
+				Role:    model.MessageRoleAssistant,
+				Content: "final multi-tool answer",
+			}}); err != nil {
+				return SessionTurnResult{}, err
+			}
+			return SessionTurnResult{Incremental: true}, nil
+		},
+	}
+	process := startSessionAPIServerWithTurnRunner(t, store, sessions.SessionV2{}, "registry-token", runner)
+	conn := dialSessionStream(t, process, "send-incremental-multi-tool")
+	waitForStreamSubscribers(t, process, "send-incremental-multi-tool", 1)
+
+	_, body := postRawJSONStatus(t, "http://"+process.Addr()+"/sessions/send-incremental-multi-tool/messages", `{"content":"hello multi tool"}`, "registry-token", http.StatusOK)
+	if body["status"] != "committed" || body["turn_id"] == "" || body["last_seq"] == nil {
+		t.Fatalf("send response = %#v, want committed turn metadata", body)
+	}
+
+	events := make([]map[string]any, 0, 9)
+	for len(events) < 9 {
+		events = append(events, readSessionStreamEvent(t, conn))
+	}
+	wantTypes := []string{
+		"turn.started",
+		"item.appended",
+		"item.appended",
+		"item.appended",
+		"item.appended",
+		"item.updated",
+		"item.updated",
+		"item.appended",
+		"turn.committed",
+	}
+	for i, want := range wantTypes {
+		if events[i]["type"] != want {
+			t.Fatalf("event[%d] type = %#v, want %q; events=%#v", i, events[i]["type"], want, events)
+		}
+	}
+	for i, event := range events {
+		raw, err := json.Marshal(event)
+		if err != nil {
+			t.Fatalf("Marshal(event[%d]) error = %v", i, err)
+		}
+		for _, forbidden := range []string{"SECRET ARG A", "SECRET ARG B", "SECRET TOOL RESULT A", "SECRET TOOL RESULT B"} {
+			if bytes.Contains(raw, []byte(forbidden)) {
+				t.Fatalf("event[%d] leaked sensitive content %q: %s", i, forbidden, raw)
+			}
+		}
+	}
+
+	session, err := store.Load("send-incremental-multi-tool")
+	if err != nil {
+		t.Fatalf("Load(send-incremental-multi-tool) error = %v", err)
+	}
+	if session.RunningTurnID != "" || session.InterruptedTurnID != "" || !session.InterruptedAt.IsZero() {
+		t.Fatalf("turn metadata = running %q interrupted %q at %s, want cleared successful turn", session.RunningTurnID, session.InterruptedTurnID, session.InterruptedAt)
+	}
+	if len(session.Items) != 5 {
+		t.Fatalf("len(session.Items) = %d, want user+assistant+two tools+final: %#v", len(session.Items), session.Items)
+	}
+	userItem := session.Items[0]
+	assistantItem := session.Items[1]
+	toolA := session.Items[2]
+	toolB := session.Items[3]
+	finalItem := session.Items[4]
+	if userItem.Message == nil || userItem.Message.Role != model.MessageRoleUser || userItem.Message.Content != "hello multi tool" {
+		t.Fatalf("user item = %#v, want persisted prompt", userItem)
+	}
+	if assistantItem.Message == nil || assistantItem.Message.Role != model.MessageRoleAssistant || len(assistantItem.Message.ToolCalls) != 2 {
+		t.Fatalf("assistant item = %#v, want assistant with two tool calls", assistantItem)
+	}
+	wantTools := []struct {
+		item       sessions.SessionItem
+		toolCallID string
+		content    string
+	}{
+		{item: toolA, toolCallID: "call-a", content: "SECRET TOOL RESULT A"},
+		{item: toolB, toolCallID: "call-b", content: "SECRET TOOL RESULT B"},
+	}
+	for _, want := range wantTools {
+		item := want.item
+		if item.Message == nil || item.Message.Role != model.MessageRoleTool || item.Message.ToolCallID != want.toolCallID || item.Status != sessions.ItemStatusCompleted || item.Message.Content != want.content {
+			t.Fatalf("tool item = %#v, want completed tool response for %s", item, want.toolCallID)
+		}
+	}
+	if finalItem.Message == nil || finalItem.Message.Role != model.MessageRoleAssistant || finalItem.Message.Content != "final multi-tool answer" {
+		t.Fatalf("final assistant item = %#v, want final answer", finalItem)
+	}
+	if !reflect.DeepEqual(session.ActiveHistory, []string{userItem.ID, assistantItem.ID, toolA.ID, toolB.ID, finalItem.ID}) {
+		t.Fatalf("ActiveHistory = %#v, want all incremental item ids", session.ActiveHistory)
+	}
+	if events[1]["item_id"] != userItem.ID || events[2]["item_id"] != assistantItem.ID || events[3]["item_id"] != toolA.ID || events[4]["item_id"] != toolB.ID || events[7]["item_id"] != finalItem.ID {
+		t.Fatalf("item.appended events = %#v, want persisted item ids", events)
+	}
+	if events[5]["item_id"] != toolA.ID || events[6]["item_id"] != toolB.ID {
+		t.Fatalf("item.updated events = %#v/%#v, want tool item ids %q/%q", events[5], events[6], toolA.ID, toolB.ID)
+	}
+	if session.LastSeq != int64(body["last_seq"].(float64)) {
+		t.Fatalf("LastSeq = %d, response last_seq = %#v", session.LastSeq, body["last_seq"])
+	}
+	messages, err := session.MaterializeActiveHistory()
+	if err != nil {
+		t.Fatalf("MaterializeActiveHistory() error = %v", err)
+	}
+	if len(messages) != 5 || messages[1].Role != model.MessageRoleAssistant || len(messages[1].ToolCalls) != 2 {
+		t.Fatalf("materialized messages = %#v, want legal assistant with two tool calls", messages)
+	}
+	for i, wantToolCallID := range []string{"call-a", "call-b"} {
+		message := messages[i+2]
+		if message.Role != model.MessageRoleTool || message.ToolCallID != wantToolCallID || message.IsError {
+			t.Fatalf("materialized tool message[%d] = %#v, want completed result for %s", i, message, wantToolCallID)
+		}
+	}
+
+	persisted, err := store.PersistedEventsAfter("send-incremental-multi-tool", 0)
+	if err != nil {
+		t.Fatalf("PersistedEventsAfter() error = %v", err)
+	}
+	updated := make([]sessions.PersistedEvent, 0, 2)
+	for _, event := range persisted {
+		if event.Type == sessions.RecordTypeItemUpdated {
+			updated = append(updated, event)
+		}
+	}
+	if len(updated) != 2 {
+		t.Fatalf("item.updated events = %#v, want exactly two persisted tool updates in %#v", updated, persisted)
+	}
+	if updated[0].ItemID != toolA.ID || updated[1].ItemID != toolB.ID {
+		t.Fatalf("persisted item.updated = %#v, want tool ids %q/%q", updated, toolA.ID, toolB.ID)
+	}
+}
+
 func TestSessionSendMessageIncrementalReconnectCatchUpAfterMidTurnDisconnect(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "sessions")
 	store := sessions.NewV2Store(root)

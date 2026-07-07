@@ -77,7 +77,7 @@ GC, and auto-rerunning interrupted tools.
   a backstop. `MarkTurnRunning` (meta.json `running_turn_id`) is the persistent running
   marker for crash recovery, **not** a concurrency mutex (meta.json read-then-write is
   non-atomic).
-- [ ] New `SessionProjector` subscribing to the bus — the **sole** writer to both the
+- [x] New `SessionProjector` subscribing to the bus — the **sole** writer to both the
   JSONL log and meta.json lifecycle. Event order: orchestration emits `TurnStarted` →
   `CompactionRequested`? → `TurnInputReady`, then `agent.run` emits `AssistantReady` →
   `ToolResultReady` ×N → (next round) …, then orchestration emits `TurnCompleted` (or
@@ -98,7 +98,10 @@ GC, and auto-rerunning interrupted tools.
   projector's, not carried in the event). The server handler no longer calls
   `MarkTurnRunning`/
   `ClearRunningTurn`/`MarkTurnInterrupted` directly — all lifecycle writes go through
-  the projector.
+  the projector. Evidence: `internal/sessionprojector/projector.go` owns the normal
+  lifecycle/store writes; CLI/server normal paths publish bus events, and production
+  direct `MarkTurnInterrupted` calls remain only the documented storage-failure
+  best-effort fallback.
 - [x] Tests: fake bus + fake store; per round `AssistantReady` precedes that round's
   `ToolResultReady`s; single `TurnCompleted`; multi-round map + active_history growth;
   durable `Publish` is synchronous (record on disk before return); **same session
@@ -189,10 +192,15 @@ GC, and auto-rerunning interrupted tools.
 
 ## Phase 5 — Interruption & failure cleanup
 
-- [ ] **Hard rule**: after `MarkTurnRunning`, every non-success exit path publishes
+- [x] **Hard rule**: after `MarkTurnRunning`, every non-success exit path publishes
   `TurnInterrupted` and persists it — never leave a running turn. Enforce via a
   defer/finally around the agent turn (the `MarkRunningTurnsInterrupted` startup sweep,
   `v2.go:354`, is the crash last-resort only; normal failures must not rely on it).
+  Evidence: CLI projector turns use a defer around the started turn; server message and
+  compact command handlers use `interruptTurn`/`interruptOperation` defers plus explicit
+  error-path calls before returning; branch tests below assert no running turn and legal
+  resumable history for cancel, publish failure, compaction failure, skipped
+  incremental persistence, tool-result publish failure, and crash fallback.
 - [x] **Storage-failure last resort (honest)**: if the failure is the projector/store
   itself being unavailable, `TurnInterrupted` publish may also fail. Then: (a) the defer
   best-effort calls `store.MarkTurnInterrupted` directly (bypassing the bus — meta.json
@@ -248,8 +256,11 @@ GC, and auto-rerunning interrupted tools.
 
 ## Phase 6 — Integration and regression
 
-- [ ] End-to-end: CLI and server each run a multi-tool turn; verify per-tool on-disk
-  status; mid-turn kill verifies resume.
+- [x] End-to-end: CLI and server each run a multi-tool turn; verify per-tool on-disk
+  status; mid-turn kill verifies resume. Evidence:
+  `TestChatSaveSessionFlagWritesMultiToolHistoryIncrementally`,
+  `TestChatSaveSessionProcessKillKeepsCompletedToolResult`, and
+  `TestSessionSendMessageIncrementalPersistsMultiToolResults`.
 - [x] active_history legality: `validateActiveHistoryToolExchanges` passes after every
   hook point.
 - [x] Regression: legacy sessions (no Status / no updated records) load/resume/compact
@@ -290,10 +301,13 @@ GC, and auto-rerunning interrupted tools.
   lock. `MarkTurnRunning` is a crash-recovery marker, not a concurrency mutex.
 - [x] Projector cached state is refreshed after `CompactionRequested` before
   `TurnInputReady` (no stale-`LastSeq`/`ActiveHistory` writes post-compaction).
-- [ ] After `MarkTurnRunning`, every failure/Esc/error exit publishes `TurnInterrupted`
+- [x] After `MarkTurnRunning`, every failure/Esc/error exit publishes `TurnInterrupted`
   and persists it — no running turn left; crash is covered by the
   `MarkRunningTurnsInterrupted` sweep. `TurnInterrupted` handler **writes `item.updated`**
   (pending → interrupted) on disk; materializer synthesis is SIGKILL fallback only.
+  Evidence: normal CLI/server paths use turn-interrupt defers after the started marker,
+  projector tests cover pending→interrupted updates, and the Phase 5 branch tests cover
+  no-running-turn cleanup plus SIGKILL resume fallback.
 - [x] On durable `Publish` failure the turn aborts immediately: in-memory `messages`
   discarded, disk authoritative, no rollback/continue. (Tool-execution error result is a
   normal path, not this case.)
