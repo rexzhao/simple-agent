@@ -211,7 +211,7 @@ GC, and auto-rerunning interrupted tools.
   **discarded** (not rolled back, not advanced); disk (via projector) is authoritative;
   next resume reads from disk. Tool-execution error result is **not** this case (normal
   path, `ToolResultReady(IsError=true)` persists and the turn continues).
-- [ ] Cover each failure branch: `AssistantReady` publish failure (atomic write — either
+- [x] Cover each failure branch: `AssistantReady` publish failure (atomic write — either
   all or nothing; pending items left if written); `ToolResultReady` publish failure
   (tool item left pending); tool-execution error result (**normal path** — publish
   `ToolResultReady(IsError=true)`, item → `error`, turn continues, NOT a cleanup case);
