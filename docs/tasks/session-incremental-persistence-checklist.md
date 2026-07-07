@@ -242,7 +242,7 @@ GC, and auto-rerunning interrupted tools.
   hook point.
 - [x] Regression: legacy sessions (no Status / no updated records) load/resume/compact
   unchanged; `SaveCompactedTurn` path still works.
-- [ ] Performance: durable `Publish` serializes disk IO into the tool-execution path
+- [x] Performance: durable `Publish` serializes disk IO into the tool-execution path
   (each tool result waits on `UpdateItem`). Since `UpdateItem`/`AppendItemsAndReplaceActiveHistory`
   replay the full session per call today, the **projector must cache the session's
   replayed state (`LastSeq` + `Items` + `ActiveHistory`) for the turn** and reuse
@@ -295,7 +295,7 @@ GC, and auto-rerunning interrupted tools.
   compaction. Turn failing after compaction leaves a legal resumable compacted history.
 - [x] `TurnInterrupted{TurnID}` carries only `TurnID`; the projector derives the pending
   set from its own state (no under-marking).
-- [ ] The projector caches the session replayed state per turn so `UpdateItem` **and**
+- [x] The projector caches the session replayed state per turn so `UpdateItem` **and**
   `AppendItemsAndReplaceActiveHistory` reuse `LastSeq+1` without re-replaying per
   tool/round.
 - [x] WebSocket clients subscribe to the existing process-level stream hub; the hub is
