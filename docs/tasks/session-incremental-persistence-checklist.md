@@ -205,7 +205,7 @@ GC, and auto-rerunning interrupted tools.
   current-turn `Status=pending` tool items to `interrupted` (required, not optional —
   on-disk honesty; materializer synthesis is only the SIGKILL fallback for when the
   handler never ran), then `MarkTurnInterrupted`.
-- [ ] **Persistence-failure reconciliation (explicit)**: on durable `Publish` failure,
+- [x] **Persistence-failure reconciliation (explicit)**: on durable `Publish` failure,
   the turn **aborts immediately** — agent emits `ErrorEvent`, the outer defer publishes
   `TurnInterrupted`, no further tool/model round runs. In-memory `messages` is
   **discarded** (not rolled back, not advanced); disk (via projector) is authoritative;
@@ -282,7 +282,7 @@ GC, and auto-rerunning interrupted tools.
   and persists it — no running turn left; crash is covered by the
   `MarkRunningTurnsInterrupted` sweep. `TurnInterrupted` handler **writes `item.updated`**
   (pending → interrupted) on disk; materializer synthesis is SIGKILL fallback only.
-- [ ] On durable `Publish` failure the turn aborts immediately: in-memory `messages`
+- [x] On durable `Publish` failure the turn aborts immediately: in-memory `messages`
   discarded, disk authoritative, no rollback/continue. (Tool-execution error result is a
   normal path, not this case.)
 - [ ] Resume after crash shows completed tool results; unfinished tool items surface as

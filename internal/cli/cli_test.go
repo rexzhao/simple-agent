@@ -6738,6 +6738,79 @@ func TestChatSaveSessionFlagWritesMultiToolHistoryIncrementally(t *testing.T) {
 	}
 }
 
+func TestChatSaveSessionAssistantReadyPublishFailureAborts(t *testing.T) {
+	argumentSecret := "publish failure argument secret"
+	args, err := json.Marshal(map[string]any{
+		"command":    "echo " + argumentSecret,
+		"timeout_ms": 1000,
+	})
+	if err != nil {
+		t.Fatalf("Marshal(shell args) error = %v", err)
+	}
+	toolChunk := fmt.Sprintf(
+		`{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_dup","function":{"name":"shell","arguments":%q}},{"index":1,"id":"call_dup","function":{"name":"shell","arguments":%q}}]}}]}`,
+		string(args),
+		string(args),
+	)
+	server, requests := newSequentialCLIRunServer(t, []string{
+		toolChunk,
+		`{"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`,
+		`[DONE]`,
+	})
+	defer server.Close()
+
+	projectDir := t.TempDir()
+	configDir := t.TempDir()
+	writeCLIRunFixtureInDirWithTools(t, configDir, server.URL, "direct-secret-value", "openai-chat", []string{"shell"})
+
+	var stdout, stderr bytes.Buffer
+	code := runLegacyChatWithIO([]string{"--config", cliConfigPath(configDir), "chat", "--save-session", "--quit", "--enable-tools", "shell", "--prompt", "publish failure prompt secret"}, strings.NewReader(""), &stdout, &stderr, func() (string, error) {
+		return projectDir, nil
+	})
+
+	if code == 0 {
+		t.Fatalf("RunWithIO() code = 0, want publish failure; stdout=%q stderr=%q", stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "persist assistant") {
+		t.Fatalf("stderr = %q, want generic persist assistant failure", stderr.String())
+	}
+	assertCLIErrorOmits(t, stderr.String(), "publish failure prompt secret", argumentSecret, "direct-secret-value", builtInBaseInstructions)
+	<-requests
+	assertNoAdditionalCLIRunRequest(t, requests)
+
+	sessionRoot := filepath.Join(configDir, "sessions")
+	session := loadOnlyCLISession(t, sessionRoot)
+	if session.RunningTurnID != "" || session.InterruptedTurnID == "" || session.InterruptedAt.IsZero() {
+		t.Fatalf("turn metadata = running %q interrupted %q at %s, want interrupted turn", session.RunningTurnID, session.InterruptedTurnID, session.InterruptedAt)
+	}
+	messages := activeCLIMessages(t, session)
+	if len(messages) != 2 {
+		t.Fatalf("materialized messages = %#v, want instructions plus user prompt", messages)
+	}
+	assertSavedMessage(t, messages, 0, model.MessageRoleSystem, builtInBaseInstructions)
+	assertSavedMessage(t, messages, 1, model.MessageRoleUser, "publish failure prompt secret")
+	for _, item := range session.Items {
+		if item.Message != nil && item.Message.Role == model.MessageRoleAssistant {
+			t.Fatalf("unexpected assistant item after AssistantReady publish failure: %#v", item)
+		}
+		if item.Message != nil && item.Message.Role == model.MessageRoleTool {
+			t.Fatalf("unexpected tool item after AssistantReady publish failure: %#v", item)
+		}
+		if item.Status == sessions.ItemStatusPending {
+			t.Fatalf("unexpected pending item after AssistantReady publish failure: %#v", item)
+		}
+	}
+	events, err := sessions.NewV2Store(sessionRoot).PersistedEventsAfter(session.ID, 0)
+	if err != nil {
+		t.Fatalf("PersistedEventsAfter() error = %v", err)
+	}
+	for _, event := range events {
+		if event.Type == sessions.RecordTypeItemUpdated {
+			t.Fatalf("unexpected item.updated event without pending tools: %#v", events)
+		}
+	}
+}
+
 func TestChatSaveSessionCancelAfterCompletedToolKeepsCompletedResult(t *testing.T) {
 	firstCommand := shellOutputCommandForCLI("first tool output")
 	secondReleaseFile := "release-cancel-second.txt"
