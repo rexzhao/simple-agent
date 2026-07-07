@@ -1,6 +1,7 @@
 package execution
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"path/filepath"
@@ -9,13 +10,18 @@ import (
 	"time"
 
 	"github.com/rexzhao/simple-agent/internal/contextwindow"
+	"github.com/rexzhao/simple-agent/internal/eventbus"
+	"github.com/rexzhao/simple-agent/internal/model"
 	projectstore "github.com/rexzhao/simple-agent/internal/projects"
+	"github.com/rexzhao/simple-agent/internal/sessionprojector"
 	"github.com/rexzhao/simple-agent/internal/sessions"
 )
 
 type Service struct {
-	projectStore *projectstore.Store
-	sessionStore *sessions.V2Store
+	projectStore            *projectstore.Store
+	sessionStore            *sessions.V2Store
+	turnRunner              SessionTurnRunner
+	sessionWriteLockTimeout time.Duration
 }
 
 type Project struct {
@@ -116,7 +122,78 @@ type SessionRemoveResult struct {
 	ID     string
 }
 
+type SessionMessageResult struct {
+	Status  string
+	TurnID  string
+	LastSeq int64
+}
+
+type ServiceOptions struct {
+	TurnRunner              SessionTurnRunner
+	SessionWriteLockTimeout time.Duration
+}
+
+type SessionTurnRunner interface {
+	RunSessionTurn(ctx context.Context, request SessionTurnRequest) (SessionTurnResult, error)
+}
+
+type SessionIncrementalSupporter interface {
+	SupportsIncrementalSessionTurn(ctx context.Context, request SessionTurnRequest) (bool, error)
+}
+
+type SessionCompactPlanner interface {
+	PlanSessionCompaction(ctx context.Context, request SessionCompactionRequest) (SessionCompactionResult, error)
+}
+
+type SessionTurnCompactionPlanner interface {
+	PlanSessionTurnCompaction(ctx context.Context, request SessionTurnRequest) (SessionCompactionResult, error)
+}
+
+type SessionTurnRequest struct {
+	Session      sessions.SessionV2
+	SessionStore *sessions.V2Store
+	TurnID       string
+	Content      string
+	Emit         func(model.Event)
+	Publisher    eventbus.Publisher
+}
+
+type SessionCompactionRequest struct {
+	Session      sessions.SessionV2
+	SessionStore *sessions.V2Store
+}
+
+type SessionTurnResult struct {
+	Session       sessions.SessionV2
+	Compaction    *SessionCompactionPlan
+	Items         []sessions.SessionItem
+	ActiveHistory []string
+	Incremental   bool
+}
+
+type SessionCompactionResult struct {
+	Session    sessions.SessionV2
+	Compaction SessionCompactionPlan
+}
+
+type SessionCompactionPlan struct {
+	SummaryItem sessions.SessionItem
+	Checkpoint  sessions.CompactionCheckpoint
+}
+
+var (
+	ErrSessionBusy           = errors.New("session is currently running a turn")
+	ErrTurnRunnerUnavailable = errors.New("turn runner is not configured")
+	ErrTurnFailed            = errors.New("turn failed")
+)
+
+const defaultSessionWriteLockTimeout = 2 * time.Second
+
 func NewService(home string) (*Service, error) {
+	return NewServiceWithOptions(home, ServiceOptions{})
+}
+
+func NewServiceWithOptions(home string, options ServiceOptions) (*Service, error) {
 	projectRoot, err := projectstore.RootForHome(home)
 	if err != nil {
 		return nil, err
@@ -125,9 +202,15 @@ func NewService(home string) (*Service, error) {
 	if err != nil {
 		return nil, err
 	}
+	lockTimeout := options.SessionWriteLockTimeout
+	if lockTimeout <= 0 {
+		lockTimeout = defaultSessionWriteLockTimeout
+	}
 	return &Service{
-		projectStore: projectstore.NewStore(projectRoot),
-		sessionStore: sessions.NewV2Store(sessionRoot),
+		projectStore:            projectstore.NewStore(projectRoot),
+		sessionStore:            sessions.NewV2Store(sessionRoot),
+		turnRunner:              options.TurnRunner,
+		sessionWriteLockTimeout: lockTimeout,
 	}, nil
 }
 
@@ -390,6 +473,174 @@ func (s *Service) RemoveSession(id string) (SessionRemoveResult, error) {
 	return SessionRemoveResult{Status: "removed", ID: session.ID}, nil
 }
 
+func (s *Service) SendSessionMessage(ctx context.Context, id, content string) (SessionMessageResult, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if s == nil || s.sessionStore == nil {
+		return SessionMessageResult{}, fmt.Errorf("execution session store is not configured")
+	}
+	if strings.TrimSpace(content) == "" {
+		return SessionMessageResult{}, fmt.Errorf("content must be a non-empty string")
+	}
+	if s.turnRunner == nil {
+		return SessionMessageResult{}, ErrTurnRunnerUnavailable
+	}
+	if _, err := s.sessionStore.Load(id); err != nil {
+		return SessionMessageResult{}, err
+	}
+
+	lockCtx := ctx
+	cancelLock := func() {}
+	if s.sessionWriteLockTimeout > 0 {
+		lockCtx, cancelLock = context.WithTimeout(ctx, s.sessionWriteLockTimeout)
+	}
+	writeLock, err := s.sessionStore.AcquireSessionWriteLock(lockCtx, id)
+	cancelLock()
+	if err != nil {
+		if errors.Is(err, context.DeadlineExceeded) {
+			return SessionMessageResult{}, ErrSessionBusy
+		}
+		return SessionMessageResult{}, err
+	}
+	defer func() {
+		_ = writeLock.Release()
+	}()
+
+	session, err := s.sessionStore.Load(id)
+	if err != nil {
+		return SessionMessageResult{}, err
+	}
+	if strings.TrimSpace(session.CWD) == "" {
+		session.CWD = session.CreatedCWD
+	}
+	if err := s.requireIncrementalSessionTurn(ctx, session, content); err != nil {
+		return SessionMessageResult{}, err
+	}
+
+	turnID := nextSessionTurnID(session)
+	projector, err := sessionprojector.New(s.sessionStore, session)
+	if err != nil {
+		return SessionMessageResult{}, fmt.Errorf("could not start session projector")
+	}
+	defer projector.Close()
+
+	bus := eventbus.NewBusWithCheckpoint(projector.CheckpointHandler())
+	defer bus.Close()
+
+	turnStarted := false
+	turnClosed := false
+	interruptTurn := func() {
+		if !turnStarted || turnClosed {
+			return
+		}
+		if err := bus.Publish(eventbus.TurnInterrupted{TurnID: turnID}); err != nil {
+			_, _ = s.sessionStore.MarkTurnInterrupted(id, turnID)
+		}
+		turnClosed = true
+	}
+
+	if err := bus.Publish(eventbus.TurnStarted{TurnID: turnID}); err != nil {
+		return SessionMessageResult{}, fmt.Errorf("could not mark turn running")
+	}
+	turnStarted = true
+
+	session, err = s.planAutoCompaction(ctx, bus, session, turnID, content)
+	if err != nil {
+		interruptTurn()
+		return SessionMessageResult{}, err
+	}
+	if err := bus.Publish(eventbus.TurnInputReady{TurnID: turnID, Message: model.Message{Role: model.MessageRoleUser, Content: content}}); err != nil {
+		interruptTurn()
+		return SessionMessageResult{}, fmt.Errorf("could not save turn input")
+	}
+
+	result, err := s.turnRunner.RunSessionTurn(ctx, SessionTurnRequest{
+		Session:      session,
+		SessionStore: s.sessionStore,
+		TurnID:       turnID,
+		Content:      content,
+		Emit: func(event model.Event) {
+			if event != nil {
+				_ = bus.Publish(eventbus.ModelEvent{Event: event})
+			}
+		},
+		Publisher: bus,
+	})
+	if err != nil {
+		interruptTurn()
+		return SessionMessageResult{}, ErrTurnFailed
+	}
+	if !result.Incremental {
+		interruptTurn()
+		return SessionMessageResult{}, fmt.Errorf("turn runner did not use incremental persistence")
+	}
+	if err := bus.Publish(eventbus.TurnCompleted{TurnID: turnID}); err != nil {
+		interruptTurn()
+		return SessionMessageResult{}, fmt.Errorf("could not clear running turn")
+	}
+	turnClosed = true
+
+	saved, err := s.sessionStore.Load(id)
+	if err != nil {
+		return SessionMessageResult{}, err
+	}
+	return SessionMessageResult{Status: "committed", TurnID: turnID, LastSeq: saved.LastSeq}, nil
+}
+
+func (s *Service) requireIncrementalSessionTurn(ctx context.Context, session sessions.SessionV2, content string) error {
+	supporter, ok := s.turnRunner.(SessionIncrementalSupporter)
+	if !ok {
+		return fmt.Errorf("turn runner does not support incremental persistence")
+	}
+	supported, err := supporter.SupportsIncrementalSessionTurn(ctx, SessionTurnRequest{
+		Session:      session,
+		SessionStore: s.sessionStore,
+		Content:      content,
+	})
+	if err != nil {
+		return ErrTurnFailed
+	}
+	if !supported {
+		return fmt.Errorf("turn runner does not support incremental persistence")
+	}
+	return nil
+}
+
+func (s *Service) planAutoCompaction(ctx context.Context, bus eventbus.Publisher, session sessions.SessionV2, turnID, content string) (sessions.SessionV2, error) {
+	planner, ok := s.turnRunner.(SessionTurnCompactionPlanner)
+	if !ok {
+		return session, nil
+	}
+	result, err := planner.PlanSessionTurnCompaction(ctx, SessionTurnRequest{
+		Session:      session,
+		SessionStore: s.sessionStore,
+		TurnID:       turnID,
+		Content:      content,
+	})
+	if err != nil {
+		return sessions.SessionV2{}, ErrTurnFailed
+	}
+	if !sessionCompactionPlanPresent(result.Compaction) {
+		return session, nil
+	}
+	if err := bus.Publish(eventbus.CompactionRequested{
+		TurnID:     turnID,
+		Summary:    result.Compaction.SummaryItem,
+		Checkpoint: result.Compaction.Checkpoint,
+	}); err != nil {
+		return sessions.SessionV2{}, fmt.Errorf("could not compact session")
+	}
+	compacted, err := s.sessionStore.Load(session.ID)
+	if err != nil {
+		return sessions.SessionV2{}, err
+	}
+	if strings.TrimSpace(compacted.CWD) == "" {
+		compacted.CWD = compacted.CreatedCWD
+	}
+	return compacted, nil
+}
+
 func (s *Service) loadActiveProject(id string) (projectstore.Project, error) {
 	if s == nil || s.projectStore == nil {
 		return projectstore.Project{}, fmt.Errorf("execution project store is not configured")
@@ -540,6 +791,14 @@ func sessionStatus(session sessions.SessionV2) string {
 		return "interrupted"
 	}
 	return "idle"
+}
+
+func nextSessionTurnID(session sessions.SessionV2) string {
+	return fmt.Sprintf("turn-%06d", session.LastSeq+1)
+}
+
+func sessionCompactionPlanPresent(plan SessionCompactionPlan) bool {
+	return strings.TrimSpace(plan.SummaryItem.ID) != "" || strings.TrimSpace(plan.Checkpoint.ID) != ""
 }
 
 func copyMap(values map[string]any) map[string]any {

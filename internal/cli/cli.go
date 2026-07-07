@@ -407,7 +407,7 @@ Commands:
   server            Manage the selected local HTTP server
   project           Manage registered projects
   session           Manage explicit sessions
-  send              Send one prompt to a server-owned session
+  send              Send one prompt to a session
   config show        Print resolved config with secrets redacted
   models list        List configured provider model profiles
   auth               Manage provider authentication
@@ -583,7 +583,7 @@ Run "sai help session <command>" for command usage.
 
 const sessionCreateUsageText = `usage: sai session create [--cwd path]
 
-Creates a server-owned session in the nearest registered project. Use --cwd to
+Creates a session in the nearest registered project. Use --cwd to
 select the creation directory; otherwise the effective current directory is used.
 `
 
@@ -619,12 +619,11 @@ Removes an archived session. Active sessions must be archived first.
 const sendUsageText = `usage: sai send [session-id] --prompt text
        sai send --new [--cwd path] --prompt text
 
-Discovers the nearest healthy local server, sends one prompt through the server
-API, and prints committed turn metadata only. --new first creates a server-owned
-session with the registry token, then sends the prompt to that session. Without
-an explicit session id, send selects the most recent session in the nearest
-registered project. Existing-session send rejects --cwd and global --config;
-existing sessions use their stored cwd and config.
+Sends one prompt through the execution library and prints committed turn metadata
+only. --new first creates a session in the nearest registered project, then sends
+the prompt to that session. Without an explicit session id, send selects the most
+recent session in the nearest registered project. Existing-session send rejects
+--cwd and global --config; existing sessions use their stored cwd and config.
 `
 
 const authUsageText = `usage: sai auth <command>
@@ -2798,6 +2797,38 @@ func mostRecentProjectSessionID(ctx context.Context, record localserver.Registry
 	return latest.ID, nil
 }
 
+func mostRecentExecutionProjectSessionID(service *execution.Service, cwdFlag string, getwd func() (string, error), program string, newHint string) (string, error) {
+	displayCommand := displayProgramName(program)
+	effectiveCWD, err := resolveClientCWD(cwdFlag, getwd)
+	if err != nil {
+		return "", err
+	}
+	project, ok, err := service.NearestProject(effectiveCWD, execution.NearestProjectOptions{})
+	if err != nil {
+		return "", err
+	}
+	if !ok {
+		return "", fmt.Errorf("no registered project found from %s; run %q", effectiveCWD, displayCommand+" project create")
+	}
+	infos, err := service.ListSessions(execution.SessionListOptions{ProjectID: project.ID})
+	if err != nil {
+		return "", err
+	}
+	if len(infos) == 0 {
+		return "", fmt.Errorf("no sessions found for project %s; create a session with %q or %q", project.ID, displayCommand+" session create", newHint)
+	}
+	latest := infos[0]
+	for _, info := range infos[1:] {
+		if info.UpdatedAt.After(latest.UpdatedAt) || (info.UpdatedAt.Equal(latest.UpdatedAt) && info.CreatedAt.After(latest.CreatedAt)) {
+			latest = info
+		}
+	}
+	if strings.TrimSpace(latest.ID) == "" {
+		return "", fmt.Errorf("most recent project session response missing session id")
+	}
+	return latest.ID, nil
+}
+
 type attachOutputState struct {
 	stdoutAtLineStart bool
 	wroteText         bool
@@ -3028,7 +3059,7 @@ func sendCommand(ctx context.Context, args []string, configPath string, configPr
 	displayCommand := displayProgramName(program)
 	flags := flag.NewFlagSet("sai send", flag.ContinueOnError)
 	cwdFlag := flags.String("cwd", "", "discovery working directory")
-	newSession := flags.Bool("new", false, "create a new server-owned session before sending")
+	newSession := flags.Bool("new", false, "create a new session before sending")
 	prompt := flags.String("prompt", "", "prompt text")
 	positionals, done, err := parseCommandFlagArgs(flags, args, stdout, printSendUsage, displayCommand, "sai help send")
 	if done || err != nil {
@@ -3047,47 +3078,46 @@ func sendCommand(ctx context.Context, args []string, configPath string, configPr
 		return err
 	}
 
+	service, err := newCLISendExecutionService(homePath, program)
+	if err != nil {
+		return err
+	}
 	sessionID := ""
-	var record localserver.RegistryRecord
 	if *newSession {
 		creationCWD, err := resolveClientCWD(*cwdFlag, getwd)
 		if err != nil {
 			return err
 		}
-		detailRecord, detail, err := createProjectSessionForCWD(ctx, configPath, homePath, creationCWD, program)
+		detail, err := createExecutionSessionForCWD(configPath, homePath, creationCWD, program)
 		if err != nil {
 			return err
 		}
-		record = detailRecord
 		sessionID = strings.TrimSpace(detail.ID)
 		if sessionID == "" {
-			return fmt.Errorf("create session at %s: response missing session id", record.BaseURL)
+			return fmt.Errorf("create session: missing session id")
 		}
 	} else {
-		var err error
 		if len(positionals) == 1 {
-			record, err = ensureSelectedServer(ctx, homePath, program)
-			if err != nil {
-				return err
-			}
 			sessionID = positionals[0]
 		} else {
-			record, err = ensureSessionCommandServer(ctx, configPath, homePath, program, getwd)
-			if err != nil {
-				return err
-			}
-			sessionID, err = mostRecentProjectSessionID(ctx, record, "", getwd, program, displayCommand+" send --new")
+			sessionID, err = mostRecentExecutionProjectSessionID(service, "", getwd, program, displayCommand+" send --new")
 			if err != nil {
 				return err
 			}
 		}
 	}
 
-	result, err := localserver.SendSessionMessageWithToken(ctx, record.BaseURL, record.Token, sessionID, *prompt, 0)
+	result, err := service.SendSessionMessage(ctx, sessionID, *prompt)
 	if err != nil {
 		return err
 	}
 	return printSessionSendResult(stdout, sessionID, result)
+}
+
+func newCLISendExecutionService(homePath, program string) (*execution.Service, error) {
+	return execution.NewServiceWithOptions(homePath, execution.ServiceOptions{
+		TurnRunner: serverAgentTurnRunner{program: program},
+	})
 }
 
 func rejectExistingSessionOverrides(newSession, cwdProvided, configProvided bool, helpCommand string) error {
@@ -3129,7 +3159,7 @@ func discoverClientServer(ctx context.Context, cwdFlag, homePath string, getwd f
 	return discovery.Record, cwd, nil
 }
 
-func printSessionSendResult(stdout io.Writer, sessionID string, result localserver.SessionMessageResult) error {
+func printSessionSendResult(stdout io.Writer, sessionID string, result execution.SessionMessageResult) error {
 	if _, err := fmt.Fprintf(stdout, "SESSION\t%s\n", sessionID); err != nil {
 		return err
 	}

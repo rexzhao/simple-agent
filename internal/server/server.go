@@ -22,6 +22,7 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/rexzhao/simple-agent/internal/contextwindow"
 	"github.com/rexzhao/simple-agent/internal/eventbus"
+	"github.com/rexzhao/simple-agent/internal/execution"
 	"github.com/rexzhao/simple-agent/internal/model"
 	projectstore "github.com/rexzhao/simple-agent/internal/projects"
 	"github.com/rexzhao/simple-agent/internal/sessionprojector"
@@ -94,53 +95,15 @@ type runningTurn struct {
 	cancel context.CancelFunc
 }
 
-type SessionTurnRunner interface {
-	RunSessionTurn(ctx context.Context, request SessionTurnRequest) (SessionTurnResult, error)
-}
-
-type SessionIncrementalSupporter interface {
-	SupportsIncrementalSessionTurn(ctx context.Context, request SessionTurnRequest) (bool, error)
-}
-
-type SessionCompactPlanner interface {
-	PlanSessionCompaction(ctx context.Context, request SessionCompactionRequest) (SessionCompactionResult, error)
-}
-
-type SessionTurnCompactionPlanner interface {
-	PlanSessionTurnCompaction(ctx context.Context, request SessionTurnRequest) (SessionCompactionResult, error)
-}
-
-type SessionTurnRequest struct {
-	Session      sessions.SessionV2
-	SessionStore *sessions.V2Store
-	TurnID       string
-	Content      string
-	Emit         func(model.Event)
-	Publisher    eventbus.Publisher
-}
-
-type SessionCompactionRequest struct {
-	Session      sessions.SessionV2
-	SessionStore *sessions.V2Store
-}
-
-type SessionTurnResult struct {
-	Session       sessions.SessionV2
-	Compaction    *SessionCompactionPlan
-	Items         []sessions.SessionItem
-	ActiveHistory []string
-	Incremental   bool
-}
-
-type SessionCompactionResult struct {
-	Session    sessions.SessionV2
-	Compaction SessionCompactionPlan
-}
-
-type SessionCompactionPlan struct {
-	SummaryItem sessions.SessionItem
-	Checkpoint  sessions.CompactionCheckpoint
-}
+type SessionTurnRunner = execution.SessionTurnRunner
+type SessionIncrementalSupporter = execution.SessionIncrementalSupporter
+type SessionCompactPlanner = execution.SessionCompactPlanner
+type SessionTurnCompactionPlanner = execution.SessionTurnCompactionPlanner
+type SessionTurnRequest = execution.SessionTurnRequest
+type SessionCompactionRequest = execution.SessionCompactionRequest
+type SessionTurnResult = execution.SessionTurnResult
+type SessionCompactionResult = execution.SessionCompactionResult
+type SessionCompactionPlan = execution.SessionCompactionPlan
 
 type Info struct {
 	CWD          string    `json:"-"`

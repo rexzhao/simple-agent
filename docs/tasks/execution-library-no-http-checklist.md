@@ -24,7 +24,9 @@ management 和 turn execution 收敛为进程内 execution library。M21 global-
 - [ ] 抽出 execution service/library facade，并保持现有 runtime/session 行为不变。
 - [x] 将 project create/list/show/rename/archive/remove 路径迁移为直接调用 execution library。
 - [x] 将 session create/list/show/rename/archive/remove 路径迁移为直接调用 execution library。
-- [ ] 将 attach/send/new/compact 路径迁移为直接调用 execution library events。
+- [x] 将 send --new/existing/latest session turn 路径迁移为直接调用 execution library events。
+- [ ] 将 attach --new/existing 交互事件路径迁移为直接调用 execution library events。
+- [ ] 将 manual compact 路径迁移为直接调用 execution library events。
 - [ ] 删除 CLI 的 server auto-start、registry discovery、HTTP client 和 WebSocket client product path。
 - [ ] 删除 `server` foreground/background/status/stop 产品命令。
 - [ ] 删除当前 HTTP handlers、registry 和 startup lock 代码；未来 adapter 需要时另建薄适配层。
@@ -61,3 +63,11 @@ management 和 turn execution 收敛为进程内 execution library。M21 global-
   client、registry discovery 或 background server startup；execution service 覆盖 session
   lifecycle、project scoped/all-project listing、archived filtering、missing/archived project
   rejection，以及 stale running turn metadata 不再被当作 live active turn。
+- 2026-07-07 send command execution-library slice:
+  `go test ./internal/execution`、`go test ./internal/cli -run "TestSend|TestCustomProgramBasenameInProjectGuidanceError"`、
+  `go test ./internal/cli`、`go test ./internal/server`、`go test ./...` 和 `git diff --check`
+  通过。覆盖 send existing/latest/--new 直接使用 home-backed execution service 的 session
+  turn events，不再通过 CLI HTTP client、registry discovery 或 background server startup；
+  execution service 覆盖 bounded write lock busy rejection、auto compaction before turn、
+  incremental event persistence、committed LastSeq 与存储一致，以及 runner/provider failure
+  不泄露 prompt、assistant/tool/provider secret。

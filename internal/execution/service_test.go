@@ -1,6 +1,7 @@
 package execution
 
 import (
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
@@ -9,6 +10,8 @@ import (
 	"time"
 
 	"github.com/rexzhao/simple-agent/internal/contextwindow"
+	"github.com/rexzhao/simple-agent/internal/eventbus"
+	"github.com/rexzhao/simple-agent/internal/model"
 	projectstore "github.com/rexzhao/simple-agent/internal/projects"
 	"github.com/rexzhao/simple-agent/internal/sessions"
 )
@@ -349,6 +352,188 @@ func TestServiceSessionStatusUsesInterruptedMetadataOnly(t *testing.T) {
 	}
 }
 
+func TestServiceSendSessionMessagePersistsSuccessfulTurn(t *testing.T) {
+	home := t.TempDir()
+	runner := fakeExecutionTurnRunner{
+		supports: true,
+		run: func(ctx context.Context, request SessionTurnRequest) (SessionTurnResult, error) {
+			if request.Session.ID == "" || request.SessionStore == nil || request.TurnID != "turn-000001" {
+				t.Fatalf("RunSessionTurn request = %#v, want session/store/turn", request)
+			}
+			if request.Content != "hello execution" {
+				t.Fatalf("RunSessionTurn content = %q, want hello execution", request.Content)
+			}
+			if request.Publisher == nil {
+				t.Fatal("RunSessionTurn Publisher = nil, want bus")
+			}
+			if err := request.Publisher.Publish(eventAssistant(request.TurnID, "execution answer")); err != nil {
+				return SessionTurnResult{}, err
+			}
+			return SessionTurnResult{Incremental: true}, nil
+		},
+	}
+	service, project, session := newExecutionServiceWithSession(t, home, runner)
+
+	result, err := service.SendSessionMessage(context.Background(), session.ID, "hello execution")
+	if err != nil {
+		t.Fatalf("SendSessionMessage() error = %v", err)
+	}
+	if result.Status != "committed" || result.TurnID != "turn-000001" || result.LastSeq == 0 {
+		t.Fatalf("SendSessionMessage() = %#v, want committed turn with last seq", result)
+	}
+	loaded, err := service.sessionStore.Load(session.ID)
+	if err != nil {
+		t.Fatalf("Load(session) error = %v", err)
+	}
+	if result.LastSeq != loaded.LastSeq {
+		t.Fatalf("SendSessionMessage() LastSeq = %d, stored LastSeq = %d", result.LastSeq, loaded.LastSeq)
+	}
+	if loaded.ProjectID != project.Project.ID || loaded.RunningTurnID != "" {
+		t.Fatalf("loaded session metadata = %#v, want project and no running turn", loaded)
+	}
+	messages, err := loaded.MaterializeActiveHistory()
+	if err != nil {
+		t.Fatalf("MaterializeActiveHistory() error = %v", err)
+	}
+	if got := messageContents(messages); !sameStringSlice(got, []string{"hello execution", "execution answer"}) {
+		t.Fatalf("active messages = %#v, want prompt and answer", got)
+	}
+}
+
+func TestServiceSendSessionMessageRunsAutoCompactionBeforeTurn(t *testing.T) {
+	home := t.TempDir()
+	var planned bool
+	runner := fakeExecutionTurnRunner{
+		supports: true,
+		plan: func(ctx context.Context, request SessionTurnRequest) (SessionCompactionResult, error) {
+			planned = true
+			if strings.TrimSpace(request.TurnID) == "" {
+				t.Fatal("PlanSessionTurnCompaction TurnID is empty")
+			}
+			return SessionCompactionResult{Compaction: SessionCompactionPlan{
+				SummaryItem: sessions.SessionItem{
+					ID:         "summary-1",
+					Kind:       sessions.ItemKindMessage,
+					Visibility: sessions.ItemVisibilityHidden,
+					Audience:   sessions.ItemAudienceModel,
+					Message:    &model.Message{Role: model.MessageRoleDeveloper, Content: "summary"},
+				},
+				Checkpoint: sessions.CompactionCheckpoint{
+					ID:                    "checkpoint-1",
+					Reason:                "context_limit",
+					Phase:                 "pre_turn",
+					Trigger:               "auto",
+					SummaryItemID:         "summary-1",
+					PreviousActiveHistory: request.Session.ActiveHistory,
+					ReplacementHistory:    []string{"summary-1"},
+				},
+			}}, nil
+		},
+		run: func(ctx context.Context, request SessionTurnRequest) (SessionTurnResult, error) {
+			if got := sessionItemIDs(request.Session.Items); !sameStringSet(got, []string{"seed-user", "seed-assistant", "summary-1"}) {
+				t.Fatalf("RunSessionTurn session items = %#v, want compacted summary before turn", got)
+			}
+			if err := request.Publisher.Publish(eventAssistant(request.TurnID, "after compaction")); err != nil {
+				return SessionTurnResult{}, err
+			}
+			return SessionTurnResult{Incremental: true}, nil
+		},
+	}
+	service, _, session := newExecutionServiceWithSession(t, home, runner)
+	if _, err := service.sessionStore.AppendItemsAndReplaceActiveHistory(session.ID, []sessions.SessionItem{
+		{
+			ID:         "seed-user",
+			Kind:       sessions.ItemKindMessage,
+			Visibility: sessions.ItemVisibilityVisible,
+			Audience:   sessions.ItemAudienceUser,
+			Message:    &model.Message{Role: model.MessageRoleUser, Content: "old prompt"},
+		},
+		{
+			ID:         "seed-assistant",
+			Kind:       sessions.ItemKindMessage,
+			Visibility: sessions.ItemVisibilityVisible,
+			Audience:   sessions.ItemAudienceModel,
+			Message:    &model.Message{Role: model.MessageRoleAssistant, Content: "old answer"},
+		},
+	}, []string{"seed-user", "seed-assistant"}); err != nil {
+		t.Fatalf("AppendItemsAndReplaceActiveHistory(seed) error = %v", err)
+	}
+
+	result, err := service.SendSessionMessage(context.Background(), session.ID, "new prompt")
+	if err != nil {
+		t.Fatalf("SendSessionMessage() error = %v", err)
+	}
+	if !planned {
+		t.Fatal("PlanSessionTurnCompaction was not called")
+	}
+	if !strings.HasPrefix(result.TurnID, "turn-") || result.LastSeq == 0 {
+		t.Fatalf("SendSessionMessage() = %#v, want compacted turn result", result)
+	}
+	loaded, err := service.sessionStore.Load(session.ID)
+	if err != nil {
+		t.Fatalf("Load(session) error = %v", err)
+	}
+	if len(loaded.Compactions) != 1 || loaded.Compactions[0].ID != "checkpoint-1" {
+		t.Fatalf("Compactions = %#v, want checkpoint-1", loaded.Compactions)
+	}
+	messages, err := loaded.MaterializeActiveHistory()
+	if err != nil {
+		t.Fatalf("MaterializeActiveHistory() error = %v", err)
+	}
+	if got := messageContents(messages); !sameStringSlice(got, []string{"summary", "new prompt", "after compaction"}) {
+		t.Fatalf("active messages = %#v, want summary plus new turn", got)
+	}
+}
+
+func TestServiceSendSessionMessageSanitizesRunnerErrorAndMarksInterrupted(t *testing.T) {
+	home := t.TempDir()
+	runner := fakeExecutionTurnRunner{
+		supports: true,
+		run: func(ctx context.Context, request SessionTurnRequest) (SessionTurnResult, error) {
+			return SessionTurnResult{}, errors.New("provider leaked prompt secret")
+		},
+	}
+	service, _, session := newExecutionServiceWithSession(t, home, runner)
+
+	_, err := service.SendSessionMessage(context.Background(), session.ID, "prompt secret")
+	if !errors.Is(err, ErrTurnFailed) {
+		t.Fatalf("SendSessionMessage() error = %v, want ErrTurnFailed", err)
+	}
+	if strings.Contains(err.Error(), "prompt secret") || strings.Contains(err.Error(), "provider leaked") {
+		t.Fatalf("SendSessionMessage() leaked runner error: %v", err)
+	}
+	loaded, err := service.sessionStore.Load(session.ID)
+	if err != nil {
+		t.Fatalf("Load(session) error = %v", err)
+	}
+	if loaded.RunningTurnID != "" || loaded.InterruptedTurnID != "turn-000001" || loaded.InterruptedAt.IsZero() {
+		t.Fatalf("turn metadata after failure = running %q interrupted %q at %s", loaded.RunningTurnID, loaded.InterruptedTurnID, loaded.InterruptedAt)
+	}
+}
+
+func TestServiceSendSessionMessageReturnsBusyForHeldWriteLock(t *testing.T) {
+	home := t.TempDir()
+	runner := fakeExecutionTurnRunner{
+		supports: true,
+		run: func(ctx context.Context, request SessionTurnRequest) (SessionTurnResult, error) {
+			t.Fatal("RunSessionTurn should not be called while write lock is held")
+			return SessionTurnResult{}, nil
+		},
+	}
+	service, _, session := newExecutionServiceWithSession(t, home, runner)
+	service.sessionWriteLockTimeout = 20 * time.Millisecond
+	lock, err := service.sessionStore.AcquireSessionWriteLock(context.Background(), session.ID)
+	if err != nil {
+		t.Fatalf("AcquireSessionWriteLock() error = %v", err)
+	}
+	defer lock.Release()
+
+	_, err = service.SendSessionMessage(context.Background(), session.ID, "busy")
+	if !errors.Is(err, ErrSessionBusy) {
+		t.Fatalf("SendSessionMessage(locked) error = %v, want ErrSessionBusy", err)
+	}
+}
+
 func mkdirProjectRoot(t *testing.T, name string) string {
 	t.Helper()
 	root := filepath.Join(t.TempDir(), name)
@@ -356,6 +541,64 @@ func mkdirProjectRoot(t *testing.T, name string) string {
 		t.Fatalf("MkdirAll(%q) error = %v", root, err)
 	}
 	return root
+}
+
+type fakeExecutionTurnRunner struct {
+	supports bool
+	run      func(context.Context, SessionTurnRequest) (SessionTurnResult, error)
+	plan     func(context.Context, SessionTurnRequest) (SessionCompactionResult, error)
+}
+
+func (r fakeExecutionTurnRunner) SupportsIncrementalSessionTurn(ctx context.Context, request SessionTurnRequest) (bool, error) {
+	return r.supports, nil
+}
+
+func (r fakeExecutionTurnRunner) RunSessionTurn(ctx context.Context, request SessionTurnRequest) (SessionTurnResult, error) {
+	if r.run == nil {
+		return SessionTurnResult{Incremental: true}, nil
+	}
+	return r.run(ctx, request)
+}
+
+func (r fakeExecutionTurnRunner) PlanSessionTurnCompaction(ctx context.Context, request SessionTurnRequest) (SessionCompactionResult, error) {
+	if r.plan == nil {
+		return SessionCompactionResult{}, nil
+	}
+	return r.plan(ctx, request)
+}
+
+func newExecutionServiceWithSession(t *testing.T, home string, runner SessionTurnRunner) (*Service, ProjectCreateResult, SessionDetail) {
+	t.Helper()
+
+	service, err := NewServiceWithOptions(home, ServiceOptions{TurnRunner: runner})
+	if err != nil {
+		t.Fatalf("NewServiceWithOptions() error = %v", err)
+	}
+	projectRoot := mkdirProjectRoot(t, "send-repo")
+	project, err := service.CreateProject(projectRoot, "Send Repo")
+	if err != nil {
+		t.Fatalf("CreateProject() error = %v", err)
+	}
+	saveToolResults := true
+	session, err := service.CreateSession(project.Project.ID, SessionCreateMetadata{
+		CreatedCWD:      project.Project.Root,
+		ConfigPath:      filepath.Join(project.Project.Root, ".agents", "sai.yaml"),
+		Provider:        "fake",
+		ModelProfile:    "default",
+		ModelID:         "model-default",
+		SaveToolResults: &saveToolResults,
+	})
+	if err != nil {
+		t.Fatalf("CreateSession() error = %v", err)
+	}
+	return service, project, session
+}
+
+func eventAssistant(turnID, content string) eventbus.AssistantReady {
+	return eventbus.AssistantReady{
+		TurnID:  turnID,
+		Message: model.Message{Role: model.MessageRoleAssistant, Content: content},
+	}
 }
 
 func sessionMetadataIDs(items []SessionMetadata) []string {
@@ -393,4 +636,20 @@ func sameStringSet(left, right []string) bool {
 		}
 	}
 	return true
+}
+
+func messageContents(messages []model.Message) []string {
+	contents := make([]string, 0, len(messages))
+	for _, message := range messages {
+		contents = append(contents, message.Content)
+	}
+	return contents
+}
+
+func sessionItemIDs(items []sessions.SessionItem) []string {
+	ids := make([]string, 0, len(items))
+	for _, item := range items {
+		ids = append(ids, item.ID)
+	}
+	return ids
 }
