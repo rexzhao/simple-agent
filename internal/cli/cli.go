@@ -24,6 +24,7 @@ import (
 	projectcontext "github.com/rexzhao/simple-agent/internal/context"
 	"github.com/rexzhao/simple-agent/internal/contextwindow"
 	"github.com/rexzhao/simple-agent/internal/eventbus"
+	"github.com/rexzhao/simple-agent/internal/execution"
 	eventlog "github.com/rexzhao/simple-agent/internal/logging"
 	"github.com/rexzhao/simple-agent/internal/mcp"
 	"github.com/rexzhao/simple-agent/internal/model"
@@ -1742,15 +1743,15 @@ func projectCreateCommand(ctx context.Context, args []string, configPath, server
 		return usageError("usage: sai project create [--cwd path] [--name name]", "", "sai help project create")
 	}
 
-	effectiveCWD, root, err := resolveProjectCreatePaths(*cwdFlag, getwd)
+	_, root, err := resolveProjectCreatePaths(*cwdFlag, getwd)
 	if err != nil {
 		return err
 	}
-	record, err := ensureProjectCommandServer(ctx, configPath, serverRoot, effectiveCWD, program)
+	service, err := execution.NewService(serverRoot)
 	if err != nil {
 		return err
 	}
-	result, err := localserver.CreateProjectWithToken(ctx, record.BaseURL, record.Token, root, *nameFlag, serverClientTimeout)
+	result, err := service.CreateProject(root, *nameFlag)
 	if err != nil {
 		return err
 	}
@@ -1773,11 +1774,11 @@ func projectListCommand(ctx context.Context, args []string, configPath, serverRo
 		return usageError("usage: sai project list [--archived]", "", "sai help project list")
 	}
 
-	record, err := ensureSelectedServer(ctx, serverRoot, program)
+	service, err := execution.NewService(serverRoot)
 	if err != nil {
 		return err
 	}
-	projects, err := localserver.ListProjectsWithOptions(ctx, record.BaseURL, record.Token, *archived, serverClientTimeout)
+	projects, err := service.ListProjects(execution.ProjectListOptions{Archived: *archived})
 	if err != nil {
 		return err
 	}
@@ -1796,11 +1797,11 @@ func projectShowCommand(ctx context.Context, args []string, configPath, serverRo
 	}
 
 	if len(positionals) == 1 {
-		record, err := ensureSelectedServer(ctx, serverRoot, program)
+		service, err := execution.NewService(serverRoot)
 		if err != nil {
 			return err
 		}
-		project, err := localserver.GetProjectWithToken(ctx, record.BaseURL, record.Token, positionals[0], serverClientTimeout)
+		project, err := service.GetProject(positionals[0])
 		if err != nil {
 			return err
 		}
@@ -1811,15 +1812,11 @@ func projectShowCommand(ctx context.Context, args []string, configPath, serverRo
 	if err != nil {
 		return err
 	}
-	record, err := ensureSelectedServer(ctx, serverRoot, program)
+	service, err := execution.NewService(serverRoot)
 	if err != nil {
 		return err
 	}
-	projects, err := localserver.ListProjectsWithToken(ctx, record.BaseURL, record.Token, serverClientTimeout)
-	if err != nil {
-		return err
-	}
-	project, ok, err := nearestProjectFromList(projects, effectiveCWD, false)
+	project, ok, err := service.NearestProject(effectiveCWD, execution.NearestProjectOptions{})
 	if err != nil {
 		return err
 	}
@@ -1848,7 +1845,7 @@ func projectRenameCommand(ctx context.Context, args []string, configPath, server
 	if len(positionals) == 2 {
 		id = strings.TrimSpace(positionals[0])
 	}
-	record, err := ensureSelectedServer(ctx, serverRoot, program)
+	service, err := execution.NewService(serverRoot)
 	if err != nil {
 		return err
 	}
@@ -1857,12 +1854,12 @@ func projectRenameCommand(ctx context.Context, args []string, configPath, server
 		if err != nil {
 			return err
 		}
-		id, err = selectProjectID(ctx, record, id, effectiveCWD, displayCommand, false)
+		id, err = selectExecutionProjectID(service, id, effectiveCWD, displayCommand, false)
 		if err != nil {
 			return err
 		}
 	}
-	project, err := localserver.RenameProjectWithToken(ctx, record.BaseURL, record.Token, id, name, serverClientTimeout)
+	project, err := service.RenameProject(id, name)
 	if err != nil {
 		return err
 	}
@@ -1883,7 +1880,7 @@ func projectArchiveCommand(ctx context.Context, args []string, configPath, serve
 	if len(positionals) == 1 {
 		id = strings.TrimSpace(positionals[0])
 	}
-	record, err := ensureSelectedServer(ctx, serverRoot, program)
+	service, err := execution.NewService(serverRoot)
 	if err != nil {
 		return err
 	}
@@ -1892,12 +1889,12 @@ func projectArchiveCommand(ctx context.Context, args []string, configPath, serve
 		if err != nil {
 			return err
 		}
-		id, err = selectProjectID(ctx, record, id, effectiveCWD, displayCommand, false)
+		id, err = selectExecutionProjectID(service, id, effectiveCWD, displayCommand, false)
 		if err != nil {
 			return err
 		}
 	}
-	project, err := localserver.ArchiveProjectWithToken(ctx, record.BaseURL, record.Token, id, serverClientTimeout)
+	project, err := service.ArchiveProject(id)
 	if err != nil {
 		return err
 	}
@@ -1919,7 +1916,7 @@ func projectRemoveCommand(ctx context.Context, args []string, configPath, server
 	if len(positionals) == 1 {
 		id = strings.TrimSpace(positionals[0])
 	}
-	record, err := ensureSelectedServer(ctx, serverRoot, program)
+	service, err := execution.NewService(serverRoot)
 	if err != nil {
 		return err
 	}
@@ -1928,13 +1925,13 @@ func projectRemoveCommand(ctx context.Context, args []string, configPath, server
 		if err != nil {
 			return err
 		}
-		id, err = selectProjectID(ctx, record, id, effectiveCWD, displayCommand, true)
+		id, err = selectExecutionProjectID(service, id, effectiveCWD, displayCommand, true)
 		if err != nil {
 			return err
 		}
 	}
 
-	result, err := localserver.RemoveProjectWithToken(ctx, record.BaseURL, record.Token, id, serverClientTimeout)
+	result, err := service.RemoveProject(id)
 	if err != nil {
 		return err
 	}
@@ -2053,7 +2050,7 @@ func projectPathKey(path string) string {
 	return key
 }
 
-func printProjectList(stdout io.Writer, projects []localserver.ProjectInfo) error {
+func printProjectList(stdout io.Writer, projects []execution.Project) error {
 	if _, err := fmt.Fprintln(stdout, "ID\tNAME\tROOT\tARCHIVED\tCREATED_AT\tUPDATED_AT"); err != nil {
 		return err
 	}
@@ -2065,14 +2062,14 @@ func printProjectList(stdout io.Writer, projects []localserver.ProjectInfo) erro
 	return nil
 }
 
-func printProjectCommandStatus(stdout io.Writer, status string, project localserver.ProjectInfo) error {
+func printProjectCommandStatus(stdout io.Writer, status string, project execution.Project) error {
 	if _, err := fmt.Fprintf(stdout, "STATUS\t%s\n", status); err != nil {
 		return err
 	}
 	return printProjectInfo(stdout, project)
 }
 
-func printProjectInfo(stdout io.Writer, project localserver.ProjectInfo) error {
+func printProjectInfo(stdout io.Writer, project execution.Project) error {
 	if _, err := fmt.Fprintf(stdout, "ID\t%s\n", project.ID); err != nil {
 		return err
 	}
@@ -2092,7 +2089,7 @@ func printProjectInfo(stdout io.Writer, project localserver.ProjectInfo) error {
 	return err
 }
 
-func printProjectRemoveStatus(stdout io.Writer, result localserver.ProjectRemoveResult) error {
+func printProjectRemoveStatus(stdout io.Writer, result execution.ProjectRemoveResult) error {
 	return printRemoveStatus(stdout, result.Status, result.ID, result.RemovedSessions, true)
 }
 
@@ -2388,6 +2385,21 @@ func selectProjectID(ctx context.Context, record localserver.RegistryRecord, id,
 		projects = append(projects, archived...)
 	}
 	project, ok, err := nearestProjectFromList(projects, effectiveCWD, includeArchived)
+	if err != nil {
+		return "", err
+	}
+	if !ok {
+		return "", fmt.Errorf("no registered project found from %s; run %q", effectiveCWD, displayCommand+" project create")
+	}
+	return project.ID, nil
+}
+
+func selectExecutionProjectID(service *execution.Service, id, effectiveCWD, displayCommand string, includeArchived bool) (string, error) {
+	id = strings.TrimSpace(id)
+	if id != "" {
+		return id, nil
+	}
+	project, ok, err := service.NearestProject(effectiveCWD, execution.NearestProjectOptions{IncludeArchived: includeArchived})
 	if err != nil {
 		return "", err
 	}

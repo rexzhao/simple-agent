@@ -22,7 +22,7 @@ management 和 turn execution 收敛为进程内 execution library。M21 global-
 ## Implementation Slices
 
 - [ ] 抽出 execution service/library facade，并保持现有 runtime/session 行为不变。
-- [ ] 将 project create/list/show/remove 路径迁移为直接调用 execution library。
+- [x] 将 project create/list/show/rename/archive/remove 路径迁移为直接调用 execution library。
 - [ ] 将 session create/list/show/remove 路径迁移为直接调用 execution library。
 - [ ] 将 attach/send/new/compact 路径迁移为直接调用 execution library events。
 - [ ] 删除 CLI 的 server auto-start、registry discovery、HTTP client 和 WebSocket client product path。
@@ -45,3 +45,12 @@ management 和 turn execution 收敛为进程内 execution library。M21 global-
 ## Smoke Evidence
 
 在每个实现切片完成后记录命令、测试范围和关键行为证据。
+
+- 2026-07-07 project command execution-library slice:
+  `go test ./internal/execution`、`go test ./internal/cli -run "TestProject|TestCustomProgramBasenameInProjectGuidanceError"`、
+  `go test ./internal/cli`、`go test ./internal/execution ./internal/projects ./internal/sessions`、
+  `go test ./...` 和 `git diff --check` 通过。覆盖 project create/list/show/rename/archive/remove
+  直接使用 home-backed execution service，不再通过 CLI HTTP client、registry discovery 或
+  background server startup；execution service 覆盖 nearest active/archived project selection、
+  archived project rename rejection、remove 前必须 archive，以及 remove archived project 时删除同
+  project sessions。
