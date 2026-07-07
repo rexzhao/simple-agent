@@ -491,7 +491,7 @@
 - [ ] `--config` 只允许创建新 session，existing session attach/send 传入时报错。
 - [ ] existing session cwd 固定为 `created_cwd`。
 - [ ] `--cwd` 只允许 project/session create 和 `--new`，existing session attach/send 传入时报错。
-- [ ] 移除 hardcoded chat product entry，不作为 hidden alias。
+- [x] 移除 hardcoded chat product entry，不作为 hidden alias。
 - [ ] bare `<cmd>` 等价 attach，按 cwd 找 project，无 project/session 时失败。
 - [ ] `<cmd> --new` 创建 session 并 attach。
 - [ ] primary command shape 使用 singular `session`；旧 `sessions` 最多作为 list alias。

@@ -393,4 +393,8 @@ evidence 证明。
   concurrent project-command auto-start 只启动一个 background child 且两个 caller 复用同一 registry token、
   concurrent `server --background` 一个 parent 输出 `SERVER_ADDR`、另一个输出 `SERVER_ALREADY_RUNNING`，
   以及既有 `DiscoverHealthy` stale registry cleanup 继续通过。
+- 2026-07-07 M21 no-chat cleanup slice: `rg "chatCommand|chatUsageText|printChatUsage|runLegacyChat" internal/cli`
+  无匹配；`go test ./internal/cli` 通过。覆盖生产代码移除旧 in-process `chat` 入口和 chat usage，
+  现有测试继续覆盖 `chat` / `help chat` 为 unknown command/topic，测试专用 in-process runtime harness
+  仅用于保留 server-owned turn 仍依赖的 runtime 覆盖。
 - Known limits: 当前 M21 slices 未实现 GUI server frontend work。

@@ -432,17 +432,6 @@ the session stream, and rejects --cwd and global --config; existing sessions use
 their stored cwd and config.
 `
 
-const chatUsageText = `usage: sai chat [--provider name] [--model profile] [--prompt text | --stdin | --file path] [--show-reasoning] [--verbose] [--enable-tools names] [--enable-mcp ids] [--save-session] [--resume id | --continue] [--quit]
-
-Legacy compatibility path for an in-process chat session. This is not the
-recommended server-owned session path; use sai server with sai attach or
-sai send for normal use. When --prompt is provided, sai runs that turn first;
---quit exits after that turn instead of entering the REPL. --stdin and --file
-read one complete prompt and must be used with --quit. Resumable sessions save
-full sensitive content, including prompts, assistant output, assistant tool
-calls, and tool results.
-`
-
 const resumableSessionSaveNoticeText = "sai: resumable sessions enabled; full prompts, assistant output, and tool results will be saved to the session file."
 
 const subagentCompletionExitWait = 250 * time.Millisecond
@@ -770,10 +759,6 @@ func printRootUsage(stdout io.Writer, command string) {
 
 func printAttachUsage(stdout io.Writer, command string) {
 	fmt.Fprint(stdout, renderCommandText(attachUsageText, command))
-}
-
-func printChatUsage(stdout io.Writer, command string) {
-	fmt.Fprint(stdout, renderCommandText(chatUsageText, command))
 }
 
 func printVersionUsage(stdout io.Writer, command string) {
@@ -3955,215 +3940,6 @@ func (options agentCommandFlags) validate(helpCommand string) error {
 	return nil
 }
 
-func chatCommand(ctx context.Context, args []string, configPath string, stdin io.Reader, stdout, stderr io.Writer, getwd func() (string, error), program string, interrupts <-chan struct{}) (chatErr error) {
-	displayCommand := displayProgramName(program)
-	flags := flag.NewFlagSet("sai chat", flag.ContinueOnError)
-	var options agentCommandFlags
-	registerAgentCommandFlags(flags, &options)
-	quit := flags.Bool("quit", false, "exit after the initial prompt turn")
-	positionals, done, err := parseCommandFlagArgs(flags, args, stdout, printChatUsage, displayCommand, "sai help chat")
-	if done || err != nil {
-		return err
-	}
-	flags.Visit(func(flag *flag.Flag) {
-		switch flag.Name {
-		case "show-reasoning":
-			options.showReasoningSet = true
-		case "save-session":
-			options.saveSessionSet = true
-		}
-	})
-	if err := options.validate("sai help chat"); err != nil {
-		return err
-	}
-	if len(positionals) != 0 {
-		return usageError("unexpected positional argument; use --prompt for the initial prompt", chatUsageText, "sai help chat")
-	}
-	initialSources := options.initialInputSourceCount()
-	if initialSources > 1 {
-		return usageError("--prompt, --stdin, and --file are mutually exclusive", chatUsageText, "sai help chat")
-	}
-	if *quit && initialSources == 0 {
-		return usageError("--quit requires --prompt, --stdin, or --file", chatUsageText, "sai help chat")
-	}
-	if !*quit && options.stdin {
-		return usageError("--stdin requires --quit", chatUsageText, "sai help chat")
-	}
-	if !*quit && options.file.set {
-		return usageError("--file requires --quit", chatUsageText, "sai help chat")
-	}
-
-	runtime, err := prepareAgentRuntime(ctx, configPath, options, stderr, getwd, program)
-	if err != nil {
-		return err
-	}
-	defer func() {
-		chatErr = errors.Join(chatErr, runtime.Close())
-	}()
-	if err := runtime.writeSessionSaveNotice(stderr); err != nil {
-		return err
-	}
-
-	messages := runtime.initialMessages()
-	initialPrompt, hasInitialPrompt, err := readInitialPrompt(options, stdin)
-	if err != nil {
-		return err
-	}
-	if hasInitialPrompt {
-		updated, err := runChatTurnAndCompletions(ctx, runtime, messages, initialPrompt, stdout, stderr, !*quit, false, interrupts)
-		if err != nil {
-			if *quit {
-				return err
-			}
-			if ctxErr := ctx.Err(); ctxErr != nil {
-				return ctxErr
-			}
-			if !isRecoverableTurnError(err) {
-				return err
-			}
-			if _, printErr := fmt.Fprintf(stderr, "%s: %v\n", displayCommand, err); printErr != nil {
-				return printErr
-			}
-		} else {
-			messages = updated
-		}
-		if *quit {
-			messages, err = runCompletionTurnsWithOptionalWait(ctx, runtime, messages, stdout, stderr, false, false, subagentCompletionExitWait, interrupts)
-			if err != nil {
-				return err
-			}
-			return nil
-		}
-	}
-
-	scanner := bufio.NewScanner(stdin)
-	var inputCh <-chan chatInputEvent
-	for {
-		if inputCh == nil {
-			inputCh = startChatInputRead(ctx, scanner, stderr)
-		}
-
-		select {
-		case input := <-inputCh:
-			inputCh = nil
-			if input.err != nil {
-				return input.err
-			}
-			if !input.ok {
-				return nil
-			}
-
-			command := strings.TrimSpace(input.line)
-			if command == "" {
-				continue
-			}
-			if !input.multiline && (command == "/exit" || command == "/quit") {
-				return nil
-			}
-			if !input.multiline && command == "/usage" {
-				if err := runtime.writeUsageSummary(stderr); err != nil {
-					return err
-				}
-				continue
-			}
-			if !input.multiline && command == "/compact" {
-				updated, err := runtime.compactSession(ctx, stderr)
-				if err != nil {
-					if _, printErr := fmt.Fprintf(stderr, "%s: compact failed: %v\n", displayCommand, err); printErr != nil {
-						return printErr
-					}
-					continue
-				}
-				messages = updated
-				continue
-			}
-
-			updated, err := runChatTurnAndCompletions(ctx, runtime, messages, input.line, stdout, stderr, true, true, interrupts)
-			if err != nil {
-				if ctxErr := ctx.Err(); ctxErr != nil {
-					return ctxErr
-				}
-				if !isRecoverableTurnError(err) {
-					return err
-				}
-				if _, printErr := fmt.Fprintf(stderr, "%s: %v\n", displayCommand, err); printErr != nil {
-					return printErr
-				}
-				continue
-			}
-			messages = updated
-		case <-interrupts:
-			return context.Canceled
-		case <-runtime.subagentCompletionSignal():
-			redrawPrompt := inputCh != nil
-			if redrawPrompt {
-				if _, err := fmt.Fprint(stderr, "\n"); err != nil {
-					return err
-				}
-			}
-			updated, err := runAvailableCompletionTurns(ctx, runtime, messages, stdout, stderr, true, true, interrupts)
-			if err != nil {
-				if ctxErr := ctx.Err(); ctxErr != nil {
-					return ctxErr
-				}
-				if !isRecoverableTurnError(err) {
-					return err
-				}
-				if _, printErr := fmt.Fprintf(stderr, "%s: %v\n", displayCommand, err); printErr != nil {
-					return printErr
-				}
-				if redrawPrompt {
-					if _, printErr := fmt.Fprint(stderr, chatInputPrompt); printErr != nil {
-						return printErr
-					}
-				}
-				continue
-			}
-			messages = updated
-			if redrawPrompt {
-				if _, err := fmt.Fprint(stderr, chatInputPrompt); err != nil {
-					return err
-				}
-			}
-		}
-	}
-}
-
-func (options agentCommandFlags) initialInputSourceCount() int {
-	count := 0
-	if options.prompt.set {
-		count++
-	}
-	if options.stdin {
-		count++
-	}
-	if options.file.set {
-		count++
-	}
-	return count
-}
-
-func readInitialPrompt(options agentCommandFlags, stdin io.Reader) (string, bool, error) {
-	switch {
-	case options.prompt.set:
-		return options.prompt.text, true, nil
-	case options.stdin:
-		data, err := io.ReadAll(stdin)
-		if err != nil {
-			return "", false, fmt.Errorf("read stdin prompt: %w", err)
-		}
-		return string(data), true, nil
-	case options.file.set:
-		data, err := os.ReadFile(options.file.path)
-		if err != nil {
-			return "", false, fmt.Errorf("read prompt file %q: %w", options.file.path, err)
-		}
-		return string(data), true, nil
-	default:
-		return "", false, nil
-	}
-}
-
 const multilineInputDelimiter = `"""`
 
 type chatInputEvent struct {
@@ -5535,12 +5311,6 @@ type runtimePreparationOptions struct {
 	enableSubagents             bool
 	resumedSessionOverride      *sessions.SessionV2
 	resumedSessionStoreOverride *sessions.V2Store
-}
-
-func prepareAgentRuntime(ctx context.Context, configPath string, options agentCommandFlags, stderr io.Writer, getwd func() (string, error), program string) (runtime *agentRuntime, err error) {
-	return prepareAgentRuntimeWithOptions(ctx, configPath, options, stderr, getwd, program, runtimePreparationOptions{
-		enableSubagents: true,
-	})
 }
 
 func prepareAgentRuntimeWithOptions(ctx context.Context, configPath string, options agentCommandFlags, stderr io.Writer, getwd func() (string, error), program string, prep runtimePreparationOptions) (runtime *agentRuntime, err error) {
