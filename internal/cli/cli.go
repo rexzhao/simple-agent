@@ -4276,11 +4276,10 @@ func runChatMessagesInTurnWithEventHook(ctx, turnCtx context.Context, runtime *a
 }
 
 type chatMessagesInTurnOptions struct {
-	onEvent         func(model.Event)
-	bus             *eventbus.Bus
-	publisher       eventbus.Publisher
-	turnID          string
-	skipSessionSave bool
+	onEvent   func(model.Event)
+	bus       *eventbus.Bus
+	publisher eventbus.Publisher
+	turnID    string
 }
 
 func runChatMessagesInTurnWithOptions(ctx, turnCtx context.Context, runtime *agentRuntime, requestMessages []model.Message, stdout, stderr io.Writer, addTrailingNewline bool, stderrNeedsLeadingBreak bool, options chatMessagesInTurnOptions) ([]model.Message, error) {
@@ -4335,11 +4334,6 @@ func runChatMessagesInTurnWithOptions(ctx, turnCtx context.Context, runtime *age
 			return nil, err
 		}
 		return nil, newRecoverableTurnError(fmt.Errorf("agent did not return updated messages"))
-	}
-	if !options.skipSessionSave {
-		if err := runtime.saveUpdatedMessages(result.Messages); err != nil {
-			return nil, err
-		}
 	}
 	if addTrailingNewline && tracker.wrote && tracker.lastByte != '\n' {
 		if _, err := fmt.Fprintln(stdout); err != nil {
@@ -4437,10 +4431,9 @@ func runChatTurnWithSessionProjector(ctx, turnCtx context.Context, runtime *agen
 	runtime.resumableSession = requestSession
 	runtime.activeItemIDs = copyStringSlice(requestSession.ActiveHistory)
 	updated, err := runChatMessagesInTurnWithOptions(ctx, turnCtx, runtime, requestMessages, stdout, stderr, addTrailingNewline, stderrNeedsLeadingBreak, chatMessagesInTurnOptions{
-		bus:             bus,
-		publisher:       bus,
-		turnID:          turnID,
-		skipSessionSave: true,
+		bus:       bus,
+		publisher: bus,
+		turnID:    turnID,
 	})
 	if err != nil {
 		return nil, err
@@ -4607,8 +4600,7 @@ func runAvailableCompletionTurns(ctx context.Context, runtime *agentRuntime, mes
 		if len(completions) == 0 {
 			return messages, nil
 		}
-		requestMessages := append(copyMessageSlice(messages), subagentCompletionMessages(completions)...)
-		updated, err := runChatMessages(ctx, runtime, requestMessages, stdout, stderr, addTrailingNewline, stderrNeedsLeadingBreak, interrupts)
+		updated, err := runChatTurn(ctx, runtime, messages, subagentCompletionPrompt(completions), stdout, stderr, addTrailingNewline, stderrNeedsLeadingBreak, interrupts)
 		if err != nil {
 			return nil, err
 		}
@@ -4661,15 +4653,12 @@ func runCompletionTurnsWithOptionalWait(ctx context.Context, runtime *agentRunti
 	}
 }
 
-func subagentCompletionMessages(completions []subagents.JobSnapshot) []model.Message {
-	messages := make([]model.Message, 0, len(completions))
+func subagentCompletionPrompt(completions []subagents.JobSnapshot) string {
+	parts := make([]string, 0, len(completions))
 	for _, completion := range completions {
-		messages = append(messages, model.Message{
-			Role:    model.MessageRoleUser,
-			Content: formatSubagentCompletionEvent(completion),
-		})
+		parts = append(parts, formatSubagentCompletionEvent(completion))
 	}
-	return messages
+	return strings.Join(parts, "\n\n")
 }
 
 func formatSubagentCompletionEvent(completion subagents.JobSnapshot) string {
@@ -5430,27 +5419,6 @@ func formatContextMetadataValue(value string) string {
 		return "(none)"
 	}
 	return value
-}
-
-func (r *agentRuntime) saveUpdatedMessages(messages []model.Message) error {
-	if !r.saveSessions {
-		return nil
-	}
-	if r.resumableSessionStore == nil {
-		return fmt.Errorf("session store is not configured")
-	}
-
-	session, newItems, activeItemIDs, err := r.sessionSavePlan(messages)
-	if err != nil {
-		return err
-	}
-	saved, err := r.resumableSessionStore.SaveTurn(session, newItems, activeItemIDs)
-	if err != nil {
-		return fmt.Errorf("save resumable session: %w", err)
-	}
-	r.resumableSession = saved
-	r.activeItemIDs = copyStringSlice(saved.ActiveHistory)
-	return nil
 }
 
 func (r *agentRuntime) refreshedSessionMetadata() sessions.SessionV2 {
@@ -6369,10 +6337,9 @@ func runServerOwnedSessionTurn(ctx context.Context, runtime *agentRuntime, messa
 		Content: prompt,
 	})
 	updated, err := runChatMessagesInTurnWithOptions(ctx, turnCtx, runtime, requestMessages, io.Discard, io.Discard, false, false, chatMessagesInTurnOptions{
-		onEvent:         options.emit,
-		publisher:       options.publisher,
-		turnID:          options.turnID,
-		skipSessionSave: options.publisher != nil,
+		onEvent:   options.emit,
+		publisher: options.publisher,
+		turnID:    options.turnID,
 	})
 	if err != nil {
 		return nil, nil, err
@@ -6456,9 +6423,6 @@ func runSilentAgentTurn(ctx context.Context, runtime *agentRuntime, messages []m
 			return nil, err
 		}
 		return nil, fmt.Errorf("child agent did not return updated messages")
-	}
-	if err := runtime.saveUpdatedMessages(result.Messages); err != nil {
-		return nil, err
 	}
 	return result.Messages, nil
 }

@@ -13971,6 +13971,164 @@ subagents:
 	}
 }
 
+func TestSubagentCompletionPromptFormatsSingleAndMultipleCompletions(t *testing.T) {
+	first := subagents.JobSnapshot{
+		JobID:       "job-1",
+		AgentID:     "reviewer",
+		DisplayName: "Review UI",
+		JobName:     "review-1",
+		Status:      subagents.StatusCompleted,
+		Output:      "first output",
+	}
+	second := subagents.JobSnapshot{
+		JobID:   "job-2",
+		AgentID: "researcher",
+		Status:  subagents.StatusFailed,
+		Error:   "second error",
+	}
+
+	if got, want := subagentCompletionPrompt([]subagents.JobSnapshot{first}), formatSubagentCompletionEvent(first); got != want {
+		t.Fatalf("single completion prompt = %q, want exact event %q", got, want)
+	}
+
+	got := subagentCompletionPrompt([]subagents.JobSnapshot{first, second})
+	want := formatSubagentCompletionEvent(first) + "\n\n" + formatSubagentCompletionEvent(second)
+	if got != want {
+		t.Fatalf("multi completion prompt = %q, want %q", got, want)
+	}
+}
+
+func TestRunPersistsSubagentCompletionWithSessionProjector(t *testing.T) {
+	childDone := make(chan struct{})
+	var childDoneOnce sync.Once
+	childServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		writeCLISSEChunks(w,
+			cliTextChunk(t, "child complete"),
+			`[DONE]`,
+		)
+		childDoneOnce.Do(func() { close(childDone) })
+	}))
+	defer childServer.Close()
+
+	parentRequests := make(chan capturedCLIRunRequest, 4)
+	completionEvent := make(chan string, 1)
+	var parentMu sync.Mutex
+	parentRequestCount := 0
+	parentServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("ReadAll(parent) error = %v", err)
+		}
+		request := capturedCLIRunRequest{
+			Path:          r.URL.Path,
+			Authorization: r.Header.Get("Authorization"),
+			ContentType:   r.Header.Get("Content-Type"),
+			RawBody:       body,
+			Body:          decodeCLIJSON(t, body),
+		}
+		parentRequests <- request
+
+		parentMu.Lock()
+		index := parentRequestCount
+		parentRequestCount++
+		parentMu.Unlock()
+
+		switch index {
+		case 0:
+			writeCLISSEChunks(w,
+				cliToolCallChunk(t, "call_start", subagents.ToolSubagentStart, `{"agent_id":"reviewer","prompt":"child task","display_name":"Review UI","job_name":"review-1"}`),
+				`{"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`,
+				`[DONE]`,
+			)
+		case 1:
+			select {
+			case <-childDone:
+			case <-time.After(2 * time.Second):
+				t.Errorf("timed out waiting for child completion")
+			}
+			writeCLISSEChunks(w,
+				cliTextChunk(t, "parent saw start"),
+				`[DONE]`,
+			)
+		case 2:
+			completionEvent <- lastCLIUserMessageContent(t, request.Body)
+			writeCLISSEChunks(w,
+				cliTextChunk(t, "parent handled child"),
+				`[DONE]`,
+			)
+		default:
+			http.Error(w, "unexpected parent request", http.StatusInternalServerError)
+		}
+	}))
+	defer parentServer.Close()
+
+	configDir := t.TempDir()
+	writeCLIRunFixtureInDir(t, configDir, parentServer.URL+"/v1", "parent-secret-value", "openai-chat")
+	setCLISessionsConfig(t, configDir, true, true)
+	appendCLIConfig(t, configDir, `
+subagents:
+  reviewer: subagents/reviewer.yaml
+`)
+	writeCLIChildSubagentConfig(t, configDir, childServer.URL+"/v1")
+
+	var stdout, stderr bytes.Buffer
+	code := runLegacyChatWithGetwd([]string{"--config", cliConfigPath(configDir), "chat", "--quit", "--prompt", "delegate"}, &stdout, &stderr, func() (string, error) {
+		return t.TempDir(), nil
+	})
+
+	if code != 0 {
+		t.Fatalf("RunWithGetwd() code = %d, stderr = %s", code, stderr.String())
+	}
+	if got := stdout.String(); !strings.Contains(got, "parent saw start") || !strings.Contains(got, "parent handled child") {
+		t.Fatalf("stdout = %q, want parent turn and completion turn output", got)
+	}
+	receiveCLIRunRequest(t, parentRequests)
+	receiveCLIRunRequest(t, parentRequests)
+	receiveCLIRunRequest(t, parentRequests)
+	assertNoAdditionalCLIRunRequest(t, parentRequests)
+
+	event := receiveString(t, completionEvent)
+	for _, want := range []string{
+		"Runtime event: subagent job completed",
+		"agent_id: reviewer",
+		"display_name: Review UI",
+		"job_name: review-1",
+		"status: completed",
+		"output: child complete",
+	} {
+		if !strings.Contains(event, want) {
+			t.Fatalf("completion event = %q, want substring %q", event, want)
+		}
+	}
+
+	sessionRoot := filepath.Join(configDir, "sessions")
+	store := sessions.NewV2Store(sessionRoot)
+	session := loadOnlyCLISession(t, sessionRoot)
+	messages, err := store.MaterializeActiveHistory(session)
+	if err != nil {
+		t.Fatalf("MaterializeActiveHistory(%q) error = %v", session.ID, err)
+	}
+	if !messagesContainRoleContent(messages, model.MessageRoleUser, "Runtime event: subagent job completed") {
+		t.Fatalf("saved messages missing completion user event: %#v", messages)
+	}
+	if !messagesContainRoleContent(messages, model.MessageRoleAssistant, "parent handled child") {
+		t.Fatalf("saved messages missing completion assistant response: %#v", messages)
+	}
+
+	completionUserID := sessionItemIDWithRoleContent(t, session.Items, model.MessageRoleUser, "Runtime event: subagent job completed")
+	completionAssistantID := sessionItemIDWithRoleContent(t, session.Items, model.MessageRoleAssistant, "parent handled child")
+	records := readCLISessionJSONLRecords(t, sessionRoot, session.ID)
+	userTxID := appendedSessionItemTxID(t, records, completionUserID)
+	assistantTxID := appendedSessionItemTxID(t, records, completionAssistantID)
+	if userTxID == "" || assistantTxID == "" {
+		t.Fatalf("completion item tx ids = user %q assistant %q, want transaction ids", userTxID, assistantTxID)
+	}
+	if userTxID == assistantTxID {
+		t.Fatalf("completion user item and assistant item were born in same transaction %q, want projector turn-input and assistant transactions", userTxID)
+	}
+}
+
 func TestRunIdleAutoWakesParentForSubagentCompletion(t *testing.T) {
 	releaseChild := make(chan struct{})
 	childServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -16329,6 +16487,29 @@ func activeCLIMessages(t *testing.T, session sessions.SessionV2) []model.Message
 	return messages
 }
 
+func messagesContainRoleContent(messages []model.Message, role model.MessageRole, content string) bool {
+	for _, message := range messages {
+		if message.Role == role && strings.Contains(message.Content, content) {
+			return true
+		}
+	}
+	return false
+}
+
+func sessionItemIDWithRoleContent(t *testing.T, items []sessions.SessionItem, role model.MessageRole, content string) string {
+	t.Helper()
+	for _, item := range items {
+		if item.Message == nil {
+			continue
+		}
+		if item.Message.Role == role && strings.Contains(item.Message.Content, content) {
+			return item.ID
+		}
+	}
+	t.Fatalf("missing session item role %q containing %q in %#v", role, content, items)
+	return ""
+}
+
 func sessionItemByID(t *testing.T, session sessions.SessionV2, id string) sessions.SessionItem {
 	t.Helper()
 
@@ -17168,6 +17349,47 @@ func readJSONLRecords(t *testing.T, data []byte) []map[string]any {
 		t.Fatal("JSONL log has no records")
 	}
 	return records
+}
+
+func readCLISessionJSONLRecords(t *testing.T, root, sessionID string) []map[string]any {
+	t.Helper()
+	paths, err := filepath.Glob(filepath.Join(root, sessionID, "segments", "*.jsonl"))
+	if err != nil {
+		t.Fatalf("Glob(session segments) error = %v", err)
+	}
+	sort.Strings(paths)
+	if len(paths) == 0 {
+		t.Fatalf("session %q has no segment records under %s", sessionID, root)
+	}
+	records := make([]map[string]any, 0)
+	for _, path := range paths {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("ReadFile(%q) error = %v", path, err)
+		}
+		records = append(records, readJSONLRecords(t, data)...)
+	}
+	return records
+}
+
+func appendedSessionItemTxID(t *testing.T, records []map[string]any, itemID string) string {
+	t.Helper()
+	for _, record := range records {
+		if record["type"] != sessions.RecordTypeItemAppended {
+			continue
+		}
+		item, ok := record["item"].(map[string]any)
+		if !ok {
+			t.Fatalf("item.appended record item = %T, want object in %#v", record["item"], record)
+		}
+		if item["id"] != itemID {
+			continue
+		}
+		txID, _ := record["tx_id"].(string)
+		return txID
+	}
+	t.Fatalf("missing item.appended record for item %q in %#v", itemID, records)
+	return ""
 }
 
 func cliEventStream(events ...model.Event) <-chan model.Event {
