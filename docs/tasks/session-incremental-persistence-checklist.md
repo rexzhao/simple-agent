@@ -238,7 +238,7 @@ GC, and auto-rerunning interrupted tools.
 
 - [ ] End-to-end: CLI and server each run a multi-tool turn; verify per-tool on-disk
   status; mid-turn kill verifies resume.
-- [ ] active_history legality: `validateActiveHistoryToolExchanges` passes after every
+- [x] active_history legality: `validateActiveHistoryToolExchanges` passes after every
   hook point.
 - [x] Regression: legacy sessions (no Status / no updated records) load/resume/compact
   unchanged; `SaveCompactedTurn` path still works.
@@ -267,7 +267,7 @@ GC, and auto-rerunning interrupted tools.
 - [x] `item.updated` does not overwrite `item.Seq` (birth seq immutable); after update
   `state.Items` stays monotonic by birth seq — `paginateSessionItems`
   `AfterSeq`/`BeforeSeq` and `sessionItemPageSeqBounds` remain correct.
-- [ ] `active_history` passes `validateActiveHistoryToolExchanges` at all times; a
+- [x] `active_history` passes `validateActiveHistoryToolExchanges` at all times; a
   multi-tool assistant message's pending tool items are in the prefix and the prefix
   is legal before results arrive.
 - [x] Same-session concurrent/sequential durable events are strictly serialized; seqs

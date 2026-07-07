@@ -8152,6 +8152,115 @@ func TestServerAgentTurnRunnerPublisherRequiresTurnID(t *testing.T) {
 	}
 }
 
+func TestSessionProjectorKeepsActiveHistoryValidAfterEachHook(t *testing.T) {
+	store := sessions.NewV2Store(t.TempDir())
+	session, err := store.SaveMetadata(sessions.SessionV2{
+		ID:              "active-history-hooks",
+		Version:         sessions.VersionV2,
+		Provider:        "fake",
+		ModelProfile:    "default",
+		ModelID:         "model-default",
+		SaveToolResults: true,
+	})
+	if err != nil {
+		t.Fatalf("SaveMetadata() error = %v", err)
+	}
+	projector, err := sessionprojector.New(store, session)
+	if err != nil {
+		t.Fatalf("sessionprojector.New() error = %v", err)
+	}
+	defer projector.Close()
+	bus := eventbus.NewBus(projector.Handler())
+	defer bus.Close()
+
+	publish := func(event eventbus.Event) {
+		t.Helper()
+		if err := bus.Publish(event); err != nil {
+			t.Fatalf("Publish(%T) error = %v", event, err)
+		}
+	}
+	assertValid := func(label string) sessions.SessionV2 {
+		t.Helper()
+		loaded, err := store.Load(session.ID)
+		if err != nil {
+			t.Fatalf("%s: Load() error = %v", label, err)
+		}
+		messages, err := store.MaterializeActiveHistory(loaded)
+		if err != nil {
+			t.Fatalf("%s: MaterializeActiveHistory() error = %v", label, err)
+		}
+		if err := validateActiveHistoryToolExchanges(loaded.ID, messages); err != nil {
+			t.Fatalf("%s: active history validation error = %v; messages=%#v", label, err, messages)
+		}
+		return loaded
+	}
+	activeToolStatuses := func(session sessions.SessionV2) map[string]string {
+		itemsByID := make(map[string]sessions.SessionItem, len(session.Items))
+		for _, item := range session.Items {
+			itemsByID[item.ID] = item
+		}
+		statuses := map[string]string{}
+		for _, id := range session.ActiveHistory {
+			item := itemsByID[id]
+			if item.Message == nil || item.Message.Role != model.MessageRoleTool {
+				continue
+			}
+			statuses[item.Message.ToolCallID] = item.Status
+		}
+		return statuses
+	}
+
+	assertValid("initial")
+	publish(eventbus.TurnStarted{TurnID: "turn-1"})
+	assertValid("after TurnStarted")
+	publish(eventbus.TurnInputReady{TurnID: "turn-1", Message: model.Message{Role: model.MessageRoleUser, Content: "use tools"}})
+	assertValid("after TurnInputReady")
+
+	publish(eventbus.AssistantReady{
+		TurnID: "turn-1",
+		Message: model.Message{
+			Role: model.MessageRoleAssistant,
+			ToolCalls: []model.ToolCall{
+				{ID: "call-a", Name: "read", Arguments: "{}"},
+				{ID: "call-b", Name: "write", Arguments: "{}"},
+			},
+		},
+	})
+	afterAssistant := assertValid("after AssistantReady")
+	if got, want := activeToolStatuses(afterAssistant), map[string]string{
+		"call-a": sessions.ItemStatusPending,
+		"call-b": sessions.ItemStatusPending,
+	}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("active tool statuses after AssistantReady = %#v, want %#v", got, want)
+	}
+
+	publish(eventbus.ToolResultReady{TurnID: "turn-1", Result: model.ToolResult{ToolCallID: "call-a", Content: "alpha"}})
+	afterFirstResult := assertValid("after first ToolResultReady")
+	if got, want := activeToolStatuses(afterFirstResult), map[string]string{
+		"call-a": sessions.ItemStatusCompleted,
+		"call-b": sessions.ItemStatusPending,
+	}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("active tool statuses after first ToolResultReady = %#v, want %#v", got, want)
+	}
+
+	publish(eventbus.ToolResultReady{TurnID: "turn-1", Result: model.ToolResult{ToolCallID: "call-b", Content: "bravo"}})
+	afterSecondResult := assertValid("after second ToolResultReady")
+	if got, want := activeToolStatuses(afterSecondResult), map[string]string{
+		"call-a": sessions.ItemStatusCompleted,
+		"call-b": sessions.ItemStatusCompleted,
+	}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("active tool statuses after second ToolResultReady = %#v, want %#v", got, want)
+	}
+
+	publish(eventbus.AssistantReady{
+		TurnID:  "turn-1",
+		Message: model.Message{Role: model.MessageRoleAssistant, Content: "done"},
+	})
+	assertValid("after final AssistantReady")
+	publish(eventbus.TurnCompleted{TurnID: "turn-1"})
+	assertValid("after TurnCompleted")
+}
+
 func TestServerAgentTurnRunnerSupportsIncrementalSessionTurnWithCompaction(t *testing.T) {
 	t.Run("compaction disabled", func(t *testing.T) {
 		configDir := t.TempDir()
