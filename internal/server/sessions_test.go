@@ -2186,6 +2186,199 @@ func TestSessionSendMessageIncrementalCompactsBeforeTurnViaProjector(t *testing.
 	}
 }
 
+func TestSessionSendMessageIncrementalUpdatesToolAfterCompaction(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "sessions")
+	store := sessions.NewV2Store(root)
+	saveServerTestSession(t, store, "send-incremental-compact-tool")
+	existingUser := appendServerTestItem(t, store, "send-incremental-compact-tool", sessions.SessionItem{
+		ID:         "existing-user",
+		Kind:       sessions.ItemKindMessage,
+		Visibility: sessions.ItemVisibilityVisible,
+		Audience:   sessions.ItemAudienceUser,
+		Message:    &model.Message{Role: model.MessageRoleUser, Content: "existing prompt"},
+	})
+	existingAssistant := appendServerTestItem(t, store, "send-incremental-compact-tool", sessions.SessionItem{
+		ID:         "existing-assistant",
+		Kind:       sessions.ItemKindMessage,
+		Visibility: sessions.ItemVisibilityVisible,
+		Audience:   sessions.ItemAudienceModel,
+		Message:    &model.Message{Role: model.MessageRoleAssistant, Content: "existing answer"},
+	})
+	if _, err := store.ReplaceActiveHistory("send-incremental-compact-tool", []string{existingUser.ID, existingAssistant.ID}); err != nil {
+		t.Fatalf("ReplaceActiveHistory() error = %v", err)
+	}
+
+	summaryMessage := model.Message{Role: model.MessageRoleDeveloper, Content: "<compaction_summary>\nserver incremental compact tool\n</compaction_summary>"}
+	summary := sessions.SessionItem{
+		ID:         "summary-1",
+		Kind:       sessions.ItemKindMessage,
+		Visibility: sessions.ItemVisibilityHidden,
+		Audience:   sessions.ItemAudienceModel,
+		Message:    &summaryMessage,
+	}
+	checkpoint := sessions.CompactionCheckpoint{
+		ID:                    "compact-1",
+		Reason:                "context_limit",
+		Phase:                 "pre_turn",
+		Trigger:               "auto",
+		SummaryItemID:         summary.ID,
+		PreviousActiveHistory: []string{existingUser.ID, existingAssistant.ID},
+		ReplacementHistory:    []string{summary.ID},
+	}
+	runnerSawCompactedSession := false
+	runner := fakeIncrementalSessionTurnRunner{
+		plan: func(ctx context.Context, request SessionTurnRequest) (SessionCompactionResult, error) {
+			if request.TurnID == "" || request.Content != "after compact tool" {
+				t.Fatalf("planner request turn/content = %q/%q, want turn and prompt", request.TurnID, request.Content)
+			}
+			if !reflect.DeepEqual(request.Session.ActiveHistory, []string{existingUser.ID, existingAssistant.ID}) {
+				t.Fatalf("planner ActiveHistory = %#v, want existing active history", request.Session.ActiveHistory)
+			}
+			return SessionCompactionResult{
+				Session: request.Session,
+				Compaction: SessionCompactionPlan{
+					SummaryItem: summary,
+					Checkpoint:  checkpoint,
+				},
+			}, nil
+		},
+		run: func(ctx context.Context, request SessionTurnRequest) (SessionTurnResult, error) {
+			runnerSawCompactedSession = true
+			if !reflect.DeepEqual(request.Session.ActiveHistory, []string{summary.ID}) {
+				t.Fatalf("runner ActiveHistory = %#v, want compacted history before user prompt", request.Session.ActiveHistory)
+			}
+			if len(request.Session.Items) != 3 || request.Session.Items[2].ID != summary.ID {
+				t.Fatalf("runner session items = %#v, want existing items plus summary only", request.Session.Items)
+			}
+			assistant := model.Message{
+				Role:    model.MessageRoleAssistant,
+				Content: "assistant after compact needs tool",
+				ToolCalls: []model.ToolCall{{
+					ID:        "call-compact-tool",
+					Name:      "read_file",
+					Arguments: `{"path":"docs/development.md"}`,
+				}},
+			}
+			if err := request.Publisher.Publish(eventbus.AssistantReady{TurnID: request.TurnID, Message: assistant}); err != nil {
+				return SessionTurnResult{}, err
+			}
+			if err := request.Publisher.Publish(eventbus.ToolResultReady{TurnID: request.TurnID, Result: model.ToolResult{
+				ToolCallID: "call-compact-tool",
+				Name:       "read_file",
+				Content:    "tool result after compact",
+			}}); err != nil {
+				return SessionTurnResult{}, err
+			}
+			if err := request.Publisher.Publish(eventbus.AssistantReady{TurnID: request.TurnID, Message: model.Message{
+				Role:    model.MessageRoleAssistant,
+				Content: "final after compact tool",
+			}}); err != nil {
+				return SessionTurnResult{}, err
+			}
+			return SessionTurnResult{Incremental: true}, nil
+		},
+	}
+	process := startSessionAPIServerWithTurnRunner(t, store, sessions.SessionV2{}, "registry-token", runner)
+	conn := dialSessionStream(t, process, "send-incremental-compact-tool")
+	waitForStreamSubscribers(t, process, "send-incremental-compact-tool", 1)
+
+	_, body := postRawJSONStatus(t, "http://"+process.Addr()+"/sessions/send-incremental-compact-tool/messages", `{"content":"after compact tool"}`, "registry-token", http.StatusOK)
+	if body["status"] != "committed" || body["turn_id"] == "" || body["last_seq"] == nil {
+		t.Fatalf("send response = %#v, want committed turn metadata", body)
+	}
+	if !runnerSawCompactedSession {
+		t.Fatal("runner was not called with compacted session")
+	}
+
+	events := make([]map[string]any, 0, 10)
+	for len(events) < 10 {
+		events = append(events, readSessionStreamEvent(t, conn))
+	}
+	wantTypes := []string{
+		"turn.started",
+		"item.appended",
+		"compaction.created",
+		"active_history.replaced",
+		"item.appended",
+		"item.appended",
+		"item.appended",
+		"item.updated",
+		"item.appended",
+		"turn.committed",
+	}
+	for i, want := range wantTypes {
+		if events[i]["type"] != want {
+			t.Fatalf("event[%d] type = %#v, want %q; events=%#v", i, events[i]["type"], want, events)
+		}
+	}
+	if events[1]["item_id"] != summary.ID || events[2]["compaction_id"] != checkpoint.ID {
+		t.Fatalf("compaction events = %#v/%#v, want summary %q and compaction %q", events[1], events[2], summary.ID, checkpoint.ID)
+	}
+
+	session, err := store.Load("send-incremental-compact-tool")
+	if err != nil {
+		t.Fatalf("Load(send-incremental-compact-tool) error = %v", err)
+	}
+	if session.RunningTurnID != "" || session.InterruptedTurnID != "" || !session.InterruptedAt.IsZero() {
+		t.Fatalf("turn metadata = running %q interrupted %q at %s, want cleared successful turn", session.RunningTurnID, session.InterruptedTurnID, session.InterruptedAt)
+	}
+	if len(session.Items) != 7 {
+		t.Fatalf("len(session.Items) = %d, want existing+summary+user+assistant+tool+final: %#v", len(session.Items), session.Items)
+	}
+	userItem := session.Items[3]
+	assistantItem := session.Items[4]
+	toolItem := session.Items[5]
+	finalItem := session.Items[6]
+	if userItem.Message == nil || userItem.Message.Role != model.MessageRoleUser || userItem.Message.Content != "after compact tool" {
+		t.Fatalf("user item = %#v, want persisted prompt after compaction", userItem)
+	}
+	if assistantItem.Message == nil || assistantItem.Message.Role != model.MessageRoleAssistant || len(assistantItem.Message.ToolCalls) != 1 || assistantItem.Message.ToolCalls[0].ID != "call-compact-tool" {
+		t.Fatalf("assistant item = %#v, want assistant with compacted tool call", assistantItem)
+	}
+	if toolItem.Message == nil || toolItem.Message.Role != model.MessageRoleTool || toolItem.Message.ToolCallID != "call-compact-tool" || toolItem.Status != sessions.ItemStatusCompleted || toolItem.Message.Content != "tool result after compact" {
+		t.Fatalf("tool item = %#v, want completed persisted result after compaction", toolItem)
+	}
+	if finalItem.Message == nil || finalItem.Message.Role != model.MessageRoleAssistant || finalItem.Message.Content != "final after compact tool" {
+		t.Fatalf("final assistant item = %#v, want final answer after tool result", finalItem)
+	}
+	if !reflect.DeepEqual(session.ActiveHistory, []string{summary.ID, userItem.ID, assistantItem.ID, toolItem.ID, finalItem.ID}) {
+		t.Fatalf("ActiveHistory = %#v, want compacted history plus full tool exchange", session.ActiveHistory)
+	}
+	if session.LastSeq != int64(body["last_seq"].(float64)) {
+		t.Fatalf("LastSeq = %d, response last_seq = %#v", session.LastSeq, body["last_seq"])
+	}
+	if events[4]["item_id"] != userItem.ID || events[5]["item_id"] != assistantItem.ID || events[6]["item_id"] != toolItem.ID || events[8]["item_id"] != finalItem.ID {
+		t.Fatalf("item.appended events = %#v, want user/assistant/tool/final ids", events)
+	}
+	if events[7]["item_id"] != toolItem.ID {
+		t.Fatalf("item.updated event = %#v, want tool item id %q", events[7], toolItem.ID)
+	}
+	if int64(events[7]["seq"].(float64)) <= toolItem.Seq {
+		t.Fatalf("item.updated seq = %#v, want greater than birth seq %d", events[7]["seq"], toolItem.Seq)
+	}
+
+	persisted, err := store.PersistedEventsAfter("send-incremental-compact-tool", 0)
+	if err != nil {
+		t.Fatalf("PersistedEventsAfter() error = %v", err)
+	}
+	var updated []sessions.PersistedEvent
+	for _, event := range persisted {
+		if event.Type == sessions.RecordTypeItemUpdated {
+			updated = append(updated, event)
+		}
+	}
+	if len(updated) != 1 || updated[0].ItemID != toolItem.ID || updated[0].Seq <= toolItem.Seq {
+		t.Fatalf("item.updated persisted events = %#v, want exactly one update after tool birth seq %d for %q", updated, toolItem.Seq, toolItem.ID)
+	}
+	messages, err := session.MaterializeActiveHistory()
+	if err != nil {
+		t.Fatalf("MaterializeActiveHistory() error = %v", err)
+	}
+	if len(messages) != 5 || messages[0].Role != model.MessageRoleDeveloper || messages[1].Role != model.MessageRoleUser || messages[2].Role != model.MessageRoleAssistant || len(messages[2].ToolCalls) != 1 || messages[3].Role != model.MessageRoleTool || messages[3].ToolCallID != "call-compact-tool" || messages[4].Content != "final after compact tool" {
+		t.Fatalf("materialized messages = %#v, want legal compacted tool exchange", messages)
+	}
+}
+
 func TestSessionSendMessageIncrementalFailureAfterCompactionKeepsCompactedHistory(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "sessions")
 	store := sessions.NewV2Store(root)

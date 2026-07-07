@@ -181,7 +181,7 @@ GC, and auto-rerunning interrupted tools.
   retained in the ledger, no data loss; resume sees [compacted history, user prompt]
   which is legal). Compaction failure fails the turn before `agent.run` (`TurnInterrupted`),
   same as today.
-- [ ] Tests: mid-turn disconnect/reconnect → catch-up contains `item.appended` +
+- [x] Tests: mid-turn disconnect/reconnect → catch-up contains `item.appended` +
   `item.updated`; no duplicate end-of-turn SaveTurn; pre-turn compaction and the
   subsequent incremental stream do not interleave; compaction and `UpdateItem` never
   race (single writer); turn failing after compaction leaves a legal resumable
