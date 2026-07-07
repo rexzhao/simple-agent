@@ -4088,6 +4088,9 @@ func TestSessionCompactCommandPersistsCheckpointAndPublishesEvents(t *testing.T)
 	if err != nil {
 		t.Fatalf("Load(compact-success) error = %v", err)
 	}
+	if session.RunningTurnID != "" || session.InterruptedTurnID != "" || !session.InterruptedAt.IsZero() {
+		t.Fatalf("compact metadata = running %q interrupted %q at %s, want cleared successful operation", session.RunningTurnID, session.InterruptedTurnID, session.InterruptedAt)
+	}
 	if got := responseSessionItemIDs(session.Items); !reflect.DeepEqual(got, []string{"existing-user", "summary-1"}) {
 		t.Fatalf("item IDs = %#v, want existing plus summary", got)
 	}
@@ -4240,6 +4243,9 @@ func TestSessionCompactCommandFailureLeavesSessionUnchangedAndSanitizesErrors(t 
 	}
 	if !reflect.DeepEqual(after.Items, before.Items) || !reflect.DeepEqual(after.Compactions, before.Compactions) || !reflect.DeepEqual(after.ActiveHistory, before.ActiveHistory) || after.LastSeq != before.LastSeq {
 		t.Fatalf("session changed after failed compact:\nbefore=%#v\nafter=%#v", before, after)
+	}
+	if after.RunningTurnID != "" || after.InterruptedTurnID != "compact-000003" || after.InterruptedAt.IsZero() {
+		t.Fatalf("compact failure metadata = running %q interrupted %q at %s, want interrupted compact-000003", after.RunningTurnID, after.InterruptedTurnID, after.InterruptedAt)
 	}
 }
 

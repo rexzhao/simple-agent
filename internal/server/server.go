@@ -1422,21 +1422,61 @@ func (p *Process) handleSessionCompact(w http.ResponseWriter, r *http.Request, i
 		session.CWD = p.snapshot().CWD
 	}
 	operationID := nextSessionCompactOperationID(session)
-	marked, err := store.MarkTurnRunning(id, operationID)
+	projector, err := sessionprojector.New(store, session)
 	if err != nil {
 		p.endSessionTurn(id)
 		cancelOperation()
-		writeError(w, http.StatusInternalServerError, "session_store_error", "could not mark turn running")
+		writeError(w, http.StatusInternalServerError, "session_store_error", "could not start session projector")
 		return
 	}
-	session.RunningTurnID = marked.RunningTurnID
-	session.RunningStartedAt = marked.RunningStartedAt
+	defer projector.Close()
+	bus := eventbus.NewBusWithCheckpoint(projector.CheckpointHandler())
+	waitBridge := p.startSessionEventBusBridge(id, operationID, bus, session.LastSeq)
+	bridgeClosed := false
+	closeBridge := func() {
+		if bridgeClosed {
+			return
+		}
+		bus.Close()
+		waitBridge()
+		bridgeClosed = true
+	}
+	defer closeBridge()
+
+	operationStarted := false
+	operationClosed := false
+	interruptOperation := func() {
+		if !operationStarted || operationClosed {
+			return
+		}
+		if err := bus.Publish(eventbus.TurnInterrupted{TurnID: operationID}); err != nil {
+			_, _ = store.MarkTurnInterrupted(id, operationID)
+		}
+		operationClosed = true
+	}
 	defer func() {
 		p.endSessionTurn(id)
 		cancelOperation()
 	}()
+
+	if err := bus.Publish(eventbus.TurnStarted{TurnID: operationID}); err != nil {
+		writeError(w, http.StatusInternalServerError, "session_store_error", "could not mark turn running")
+		return
+	}
+	operationStarted = true
+	session, err = store.Load(id)
+	if err != nil {
+		interruptOperation()
+		closeBridge()
+		p.writeSessionLoadError(w, err, "could not load running session")
+		return
+	}
+	if strings.TrimSpace(session.CWD) == "" {
+		session.CWD = p.snapshot().CWD
+	}
 	if p.compactPlanner == nil {
-		p.finishDurableTurn(id, operationID, false)
+		interruptOperation()
+		closeBridge()
 		writeError(w, http.StatusServiceUnavailable, "compact_planner_unavailable", "compact planner is not configured")
 		return
 	}
@@ -1449,38 +1489,38 @@ func (p *Process) handleSessionCompact(w http.ResponseWriter, r *http.Request, i
 		SessionStore: store,
 	})
 	if err != nil {
-		p.finishDurableTurn(id, operationID, errors.Is(err, context.Canceled))
+		interruptOperation()
+		closeBridge()
 		p.publishCompactFailed(id, err)
 		p.writeCompactError(w, err)
 		return
 	}
 
-	saved, err := store.AppendCompactionCheckpoint(session.ID, result.Compaction.SummaryItem, result.Compaction.Checkpoint)
-	if err != nil {
-		p.finishDurableTurn(id, operationID, false)
+	if err := bus.Publish(eventbus.CompactionRequested{
+		TurnID:     operationID,
+		Summary:    result.Compaction.SummaryItem,
+		Checkpoint: result.Compaction.Checkpoint,
+	}); err != nil {
+		interruptOperation()
+		closeBridge()
 		p.publishCompactFailed(id, err)
 		p.writeCompactionStoreError(w, err)
 		return
 	}
-	if _, err := store.ClearRunningTurn(id, operationID); err != nil {
+	if err := bus.Publish(eventbus.TurnCompleted{TurnID: operationID}); err != nil {
+		interruptOperation()
+		closeBridge()
 		writeError(w, http.StatusInternalServerError, "session_store_error", "could not clear running turn")
 		return
 	}
-	savedSummary, _ := findSessionItemByID(saved.Items, result.Compaction.SummaryItem.ID)
-	if savedSummary.ID == "" {
-		savedSummary = result.Compaction.SummaryItem
+	operationClosed = true
+	closeBridge()
+
+	saved, err := store.Load(id)
+	if err != nil {
+		p.writeSessionLoadError(w, err, "could not load committed compaction")
+		return
 	}
-	p.publishSessionEvent(id, NewSessionStreamEvent("item.appended", map[string]any{
-		"seq":     savedSummary.Seq,
-		"item_id": result.Compaction.SummaryItem.ID,
-	}))
-	p.publishSessionEvent(id, NewSessionStreamEvent("compaction.created", map[string]any{
-		"seq":           compactionCreatedSeq(savedSummary.Seq),
-		"compaction_id": result.Compaction.Checkpoint.ID,
-	}))
-	p.publishSessionEvent(id, NewSessionStreamEvent("active_history.replaced", map[string]any{
-		"seq": activeHistoryReplacedSeq(saved.LastSeq),
-	}))
 	p.publishSessionEvent(id, NewSessionStreamEvent("compact.completed", map[string]any{
 		"compaction_id":   result.Compaction.Checkpoint.ID,
 		"summary_item_id": result.Compaction.SummaryItem.ID,
@@ -1641,17 +1681,6 @@ func (p *Process) waitForRunningTurns(ctx context.Context) error {
 			return ctx.Err()
 		}
 	}
-}
-
-func (p *Process) finishDurableTurn(sessionID, turnID string, interrupted bool) {
-	if p.sessionStore == nil {
-		return
-	}
-	if interrupted {
-		_, _ = p.sessionStore.MarkTurnInterrupted(sessionID, turnID)
-		return
-	}
-	_, _ = p.sessionStore.ClearRunningTurn(sessionID, turnID)
 }
 
 func (p *Process) projectHasRunningTurn(projectID string) (bool, error) {
