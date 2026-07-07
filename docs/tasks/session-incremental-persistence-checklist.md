@@ -99,7 +99,7 @@ GC, and auto-rerunning interrupted tools.
   `MarkTurnRunning`/
   `ClearRunningTurn`/`MarkTurnInterrupted` directly — all lifecycle writes go through
   the projector.
-- [ ] Tests: fake bus + fake store; per round `AssistantReady` precedes that round's
+- [x] Tests: fake bus + fake store; per round `AssistantReady` precedes that round's
   `ToolResultReady`s; single `TurnCompleted`; multi-round map + active_history growth;
   durable `Publish` is synchronous (record on disk before return); **same session
   concurrent/sequential durable events → final seqs are contiguous (no gaps, no

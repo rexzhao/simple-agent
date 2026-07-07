@@ -314,6 +314,143 @@ func TestProjectorRefreshesCachedStateAfterCompaction(t *testing.T) {
 	}
 }
 
+func TestProjectorWithFakeBusAndStoreRecordsOrderedLifecycle(t *testing.T) {
+	initial := sessions.SessionV2{
+		ID:           "session-1",
+		Provider:     "test",
+		ModelProfile: "test",
+		ModelID:      "test",
+		LastSeq:      1,
+		Items: []sessions.SessionItem{{
+			ID:         "old-user",
+			Seq:        1,
+			Kind:       sessions.ItemKindMessage,
+			Visibility: sessions.ItemVisibilityVisible,
+			Audience:   sessions.ItemAudienceUser,
+			Message:    &model.Message{Role: model.MessageRoleUser, Content: "old"},
+		}},
+		ActiveHistory: []string{"old-user"},
+	}
+	store := newFakeProjectorStore(initial)
+	projector, err := New(store, initial)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	defer projector.Close()
+	bus := fakeProjectorBus{handler: projector.HandleWithCheckpoint}
+
+	publishFake(t, &bus, store, eventbus.TurnStarted{TurnID: "turn-1"}, 1)
+	if store.session.RunningTurnID != "turn-1" {
+		t.Fatalf("RunningTurnID = %q, want turn-1 after synchronous TurnStarted", store.session.RunningTurnID)
+	}
+
+	summary := sessions.SessionItem{
+		ID:         "summary-1",
+		Kind:       sessions.ItemKindMessage,
+		Visibility: sessions.ItemVisibilityHidden,
+		Audience:   sessions.ItemAudienceModel,
+		Message:    &model.Message{Role: model.MessageRoleDeveloper, Content: "summary"},
+	}
+	checkpoint := sessions.CompactionCheckpoint{
+		ID:                    "checkpoint-1",
+		SummaryItemID:         summary.ID,
+		PreviousActiveHistory: []string{"old-user"},
+		ReplacementHistory:    []string{summary.ID},
+	}
+	publishFake(t, &bus, store, eventbus.CompactionRequested{TurnID: "turn-1", Summary: summary, Checkpoint: checkpoint}, 2)
+	if !reflect.DeepEqual(store.session.ActiveHistory, []string{summary.ID}) {
+		t.Fatalf("ActiveHistory after compaction = %#v, want summary replacement", store.session.ActiveHistory)
+	}
+
+	publishFake(t, &bus, store, eventbus.TurnInputReady{
+		TurnID:  "turn-1",
+		Message: model.Message{Role: model.MessageRoleUser, Content: "new"},
+	}, 3)
+	userID := store.calls[2].itemIDs[0]
+	if !reflect.DeepEqual(store.calls[2].activeHistory, []string{summary.ID, userID}) {
+		t.Fatalf("TurnInputReady active history = %#v, want post-compaction summary then user %q", store.calls[2].activeHistory, userID)
+	}
+
+	publishFake(t, &bus, store, eventbus.AssistantReady{
+		TurnID: "turn-1",
+		Message: model.Message{
+			Role:      model.MessageRoleAssistant,
+			Content:   "round one",
+			ToolCalls: []model.ToolCall{{ID: "call-1", Name: "tool", Arguments: "{}"}},
+		},
+	}, 4)
+	roundOneAssistantID := store.calls[3].itemIDs[0]
+	roundOneToolID := store.calls[3].itemIDs[1]
+	if !reflect.DeepEqual(store.calls[3].activeHistory, []string{summary.ID, userID, roundOneAssistantID, roundOneToolID}) {
+		t.Fatalf("round one active history = %#v, want user plus assistant/tool", store.calls[3].activeHistory)
+	}
+
+	publishFake(t, &bus, store, eventbus.ToolResultReady{
+		TurnID: "turn-1",
+		Result: model.ToolResult{ToolCallID: "call-1", Content: "one"},
+	}, 5)
+	if store.calls[4].name != "update_item" || store.calls[4].itemIDs[0] != roundOneToolID {
+		t.Fatalf("round one update call = %#v, want update of %q after AssistantReady append", store.calls[4], roundOneToolID)
+	}
+
+	publishFake(t, &bus, store, eventbus.AssistantReady{
+		TurnID: "turn-1",
+		Message: model.Message{
+			Role:      model.MessageRoleAssistant,
+			Content:   "round two",
+			ToolCalls: []model.ToolCall{{ID: "call-2", Name: "tool", Arguments: "{}"}},
+		},
+	}, 6)
+	roundTwoAssistantID := store.calls[5].itemIDs[0]
+	roundTwoToolID := store.calls[5].itemIDs[1]
+	wantRoundTwoActive := []string{summary.ID, userID, roundOneAssistantID, roundOneToolID, roundTwoAssistantID, roundTwoToolID}
+	if !reflect.DeepEqual(store.calls[5].activeHistory, wantRoundTwoActive) {
+		t.Fatalf("round two active history = %#v, want %#v", store.calls[5].activeHistory, wantRoundTwoActive)
+	}
+
+	publishFake(t, &bus, store, eventbus.ToolResultReady{
+		TurnID: "turn-1",
+		Result: model.ToolResult{ToolCallID: "call-2", Content: "two"},
+	}, 7)
+	if store.calls[6].name != "update_item" || store.calls[6].itemIDs[0] != roundTwoToolID {
+		t.Fatalf("round two update call = %#v, want update of %q after second AssistantReady append", store.calls[6], roundTwoToolID)
+	}
+
+	publishFake(t, &bus, store, eventbus.TurnCompleted{TurnID: "turn-1"}, 8)
+	gotCallNames := store.callNames()
+	wantCallNames := []string{
+		"mark_running",
+		"save_compacted_turn",
+		"append_items",
+		"append_items",
+		"update_item",
+		"append_items",
+		"update_item",
+		"clear_running",
+	}
+	if !reflect.DeepEqual(gotCallNames, wantCallNames) {
+		t.Fatalf("store call order = %#v, want %#v", gotCallNames, wantCallNames)
+	}
+	if got := countString(gotCallNames, "clear_running"); got != 1 {
+		t.Fatalf("clear_running calls = %d, want 1", got)
+	}
+	if store.session.RunningTurnID != "" {
+		t.Fatalf("RunningTurnID after completion = %q, want cleared", store.session.RunningTurnID)
+	}
+	if got := itemStatusesByToolCall(store.session.Items); !reflect.DeepEqual(got, map[string]string{
+		"call-1": sessions.ItemStatusCompleted,
+		"call-2": sessions.ItemStatusCompleted,
+	}) {
+		t.Fatalf("tool statuses = %#v, want both completed", got)
+	}
+	assertContiguousSeqs(t, store.recordSeqs, 2, store.session.LastSeq)
+	for i, checkpointSeq := range bus.checkpoints {
+		if checkpointSeq < initial.LastSeq || checkpointSeq > store.session.LastSeq {
+			t.Fatalf("checkpoint[%d] = %d, want within durable seq range [%d,%d]", i, checkpointSeq, initial.LastSeq, store.session.LastSeq)
+		}
+	}
+}
+
 func TestProjectorInterruptsPendingTools(t *testing.T) {
 	store, projector, bus := newProjectorFixture(t, "session-1")
 	defer projector.Close()
@@ -567,4 +704,256 @@ func countRuntimeContextItems(items []sessions.SessionItem) int {
 		}
 	}
 	return count
+}
+
+type fakeProjectorBus struct {
+	handler     eventbus.DurableCheckpointHandler
+	checkpoints []int64
+}
+
+func publishFake(t *testing.T, bus *fakeProjectorBus, store *fakeProjectorStore, event eventbus.Event, wantCalls int) {
+	t.Helper()
+
+	seq, err := bus.handler(event)
+	if err != nil {
+		t.Fatalf("fake publish %T error = %v", event, err)
+	}
+	bus.checkpoints = append(bus.checkpoints, seq)
+	if len(store.calls) != wantCalls {
+		t.Fatalf("fake publish %T returned after %d store calls, want %d: %#v", event, len(store.calls), wantCalls, store.calls)
+	}
+	if seq != store.session.LastSeq {
+		t.Fatalf("fake publish %T checkpoint = %d, store LastSeq = %d", event, seq, store.session.LastSeq)
+	}
+}
+
+type fakeProjectorStore struct {
+	session    sessions.SessionV2
+	calls      []fakeProjectorStoreCall
+	recordSeqs []int64
+}
+
+type fakeProjectorStoreCall struct {
+	name          string
+	seq           int64
+	itemIDs       []string
+	activeHistory []string
+}
+
+func newFakeProjectorStore(session sessions.SessionV2) *fakeProjectorStore {
+	return &fakeProjectorStore{session: cloneProjectorTestSession(session)}
+}
+
+func (s *fakeProjectorStore) MarkTurnRunning(sessionID, turnID string) (sessions.SessionV2, error) {
+	if err := s.requireSession(sessionID); err != nil {
+		return sessions.SessionV2{}, err
+	}
+	s.session.RunningTurnID = turnID
+	s.calls = append(s.calls, fakeProjectorStoreCall{name: "mark_running", seq: s.session.LastSeq})
+	return cloneProjectorTestSession(s.session), nil
+}
+
+func (s *fakeProjectorStore) SaveCompactedTurn(session sessions.SessionV2, summaryItem sessions.SessionItem, checkpoint sessions.CompactionCheckpoint, items []sessions.SessionItem, activeHistory []string) (sessions.SessionV2, error) {
+	if err := s.requireCachedState(session); err != nil {
+		return sessions.SessionV2{}, err
+	}
+	s.nextRecordSeq()
+	summaryItem.Seq = s.nextRecordSeq()
+	s.session.Items = append(s.session.Items, cloneProjectorTestItem(summaryItem))
+	s.nextRecordSeq()
+	s.session.Compactions = append(s.session.Compactions, checkpoint)
+	for _, item := range items {
+		item.Seq = s.nextRecordSeq()
+		s.session.Items = append(s.session.Items, cloneProjectorTestItem(item))
+	}
+	s.nextRecordSeq()
+	s.session.ActiveHistory = copyStrings(activeHistory)
+	s.nextRecordSeq()
+	s.calls = append(s.calls, fakeProjectorStoreCall{
+		name:          "save_compacted_turn",
+		seq:           s.session.LastSeq,
+		itemIDs:       []string{summaryItem.ID},
+		activeHistory: copyStrings(s.session.ActiveHistory),
+	})
+	return cloneProjectorTestSession(s.session), nil
+}
+
+func (s *fakeProjectorStore) AppendItemsAndReplaceActiveHistoryFromState(sessionID string, state sessions.SessionV2, items []sessions.SessionItem, itemIDs []string) (sessions.SessionV2, error) {
+	if err := s.requireSession(sessionID); err != nil {
+		return sessions.SessionV2{}, err
+	}
+	if err := s.requireCachedState(state); err != nil {
+		return sessions.SessionV2{}, err
+	}
+	s.nextRecordSeq()
+	added := make([]string, 0, len(items))
+	for _, item := range items {
+		item.Seq = s.nextRecordSeq()
+		s.session.Items = append(s.session.Items, cloneProjectorTestItem(item))
+		added = append(added, item.ID)
+	}
+	s.nextRecordSeq()
+	s.session.ActiveHistory = copyStrings(itemIDs)
+	s.nextRecordSeq()
+	s.calls = append(s.calls, fakeProjectorStoreCall{
+		name:          "append_items",
+		seq:           s.session.LastSeq,
+		itemIDs:       added,
+		activeHistory: copyStrings(s.session.ActiveHistory),
+	})
+	return cloneProjectorTestSession(s.session), nil
+}
+
+func (s *fakeProjectorStore) UpdateItemFromState(sessionID string, state sessions.SessionV2, item sessions.SessionItem) (sessions.SessionItem, sessions.SessionV2, error) {
+	if err := s.requireSession(sessionID); err != nil {
+		return sessions.SessionItem{}, sessions.SessionV2{}, err
+	}
+	if err := s.requireCachedState(state); err != nil {
+		return sessions.SessionItem{}, sessions.SessionV2{}, err
+	}
+	index := -1
+	for i, existing := range s.session.Items {
+		if existing.ID == item.ID {
+			index = i
+			break
+		}
+	}
+	if index < 0 {
+		return sessions.SessionItem{}, sessions.SessionV2{}, fmt.Errorf("fake item %q not found", item.ID)
+	}
+	updated := s.session.Items[index]
+	updated.Message = cloneProjectorTestMessagePtr(item.Message)
+	updated.Content = cloneProjectorTestContentPtr(item.Content)
+	updated.Status = item.Status
+	s.nextRecordSeq()
+	s.session.Items[index] = updated
+	s.calls = append(s.calls, fakeProjectorStoreCall{
+		name:    "update_item",
+		seq:     s.session.LastSeq,
+		itemIDs: []string{item.ID},
+	})
+	return cloneProjectorTestItem(updated), cloneProjectorTestSession(s.session), nil
+}
+
+func (s *fakeProjectorStore) ClearRunningTurn(sessionID, turnID string) (sessions.SessionV2, error) {
+	if err := s.requireSession(sessionID); err != nil {
+		return sessions.SessionV2{}, err
+	}
+	if s.session.RunningTurnID != turnID {
+		return sessions.SessionV2{}, fmt.Errorf("fake running turn = %q, want %q", s.session.RunningTurnID, turnID)
+	}
+	s.session.RunningTurnID = ""
+	s.calls = append(s.calls, fakeProjectorStoreCall{name: "clear_running", seq: s.session.LastSeq})
+	return cloneProjectorTestSession(s.session), nil
+}
+
+func (s *fakeProjectorStore) MarkTurnInterrupted(sessionID, turnID string) (sessions.SessionV2, error) {
+	if err := s.requireSession(sessionID); err != nil {
+		return sessions.SessionV2{}, err
+	}
+	s.session.RunningTurnID = ""
+	s.session.InterruptedTurnID = turnID
+	s.calls = append(s.calls, fakeProjectorStoreCall{name: "mark_interrupted", seq: s.session.LastSeq})
+	return cloneProjectorTestSession(s.session), nil
+}
+
+func (s *fakeProjectorStore) nextRecordSeq() int64 {
+	s.session.LastSeq++
+	s.recordSeqs = append(s.recordSeqs, s.session.LastSeq)
+	return s.session.LastSeq
+}
+
+func (s *fakeProjectorStore) requireSession(sessionID string) error {
+	if sessionID != s.session.ID {
+		return fmt.Errorf("fake session id = %q, want %q", sessionID, s.session.ID)
+	}
+	return nil
+}
+
+func (s *fakeProjectorStore) requireCachedState(state sessions.SessionV2) error {
+	if state.ID != s.session.ID {
+		return fmt.Errorf("fake cached state session id = %q, want %q", state.ID, s.session.ID)
+	}
+	if state.LastSeq != s.session.LastSeq {
+		return fmt.Errorf("fake cached state LastSeq = %d, want %d", state.LastSeq, s.session.LastSeq)
+	}
+	if !reflect.DeepEqual(state.ActiveHistory, s.session.ActiveHistory) {
+		return fmt.Errorf("fake cached state ActiveHistory = %#v, want %#v", state.ActiveHistory, s.session.ActiveHistory)
+	}
+	return nil
+}
+
+func (s *fakeProjectorStore) callNames() []string {
+	names := make([]string, 0, len(s.calls))
+	for _, call := range s.calls {
+		names = append(names, call.name)
+	}
+	return names
+}
+
+func assertContiguousSeqs(t *testing.T, seqs []int64, first, last int64) {
+	t.Helper()
+	if len(seqs) == 0 {
+		t.Fatal("record seqs empty, want durable records")
+	}
+	if seqs[0] != first || seqs[len(seqs)-1] != last {
+		t.Fatalf("record seq range = [%d,%d], want [%d,%d]: %#v", seqs[0], seqs[len(seqs)-1], first, last, seqs)
+	}
+	for i := 1; i < len(seqs); i++ {
+		if seqs[i] != seqs[i-1]+1 {
+			t.Fatalf("record seqs not contiguous at %d: %#v", i, seqs)
+		}
+	}
+}
+
+func countString(values []string, want string) int {
+	count := 0
+	for _, value := range values {
+		if value == want {
+			count++
+		}
+	}
+	return count
+}
+
+func cloneProjectorTestSession(session sessions.SessionV2) sessions.SessionV2 {
+	session.Items = cloneProjectorTestItems(session.Items)
+	session.ActiveHistory = copyStrings(session.ActiveHistory)
+	session.Compactions = append([]sessions.CompactionCheckpoint(nil), session.Compactions...)
+	return session
+}
+
+func cloneProjectorTestItems(items []sessions.SessionItem) []sessions.SessionItem {
+	out := make([]sessions.SessionItem, 0, len(items))
+	for _, item := range items {
+		out = append(out, cloneProjectorTestItem(item))
+	}
+	return out
+}
+
+func cloneProjectorTestItem(item sessions.SessionItem) sessions.SessionItem {
+	item.Message = cloneProjectorTestMessagePtr(item.Message)
+	item.Content = cloneProjectorTestContentPtr(item.Content)
+	return item
+}
+
+func cloneProjectorTestMessagePtr(message *model.Message) *model.Message {
+	if message == nil {
+		return nil
+	}
+	clone := *message
+	clone.ToolCalls = append([]model.ToolCall(nil), message.ToolCalls...)
+	return &clone
+}
+
+func cloneProjectorTestContentPtr(content *sessions.StoredContent) *sessions.StoredContent {
+	if content == nil {
+		return nil
+	}
+	clone := *content
+	if content.Blob != nil {
+		blob := *content.Blob
+		clone.Blob = &blob
+	}
+	return &clone
 }

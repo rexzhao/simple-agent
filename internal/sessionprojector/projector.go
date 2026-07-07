@@ -17,7 +17,7 @@ import (
 )
 
 type Projector struct {
-	store *sessions.V2Store
+	store projectorStore
 
 	mu       sync.Mutex
 	closed   bool
@@ -32,6 +32,15 @@ type Projector struct {
 	pendingItemIDs map[string]struct{}
 }
 
+type projectorStore interface {
+	MarkTurnRunning(sessionID, turnID string) (sessions.SessionV2, error)
+	SaveCompactedTurn(session sessions.SessionV2, summaryItem sessions.SessionItem, checkpoint sessions.CompactionCheckpoint, items []sessions.SessionItem, activeHistory []string) (sessions.SessionV2, error)
+	AppendItemsAndReplaceActiveHistoryFromState(sessionID string, state sessions.SessionV2, items []sessions.SessionItem, itemIDs []string) (sessions.SessionV2, error)
+	UpdateItemFromState(sessionID string, state sessions.SessionV2, item sessions.SessionItem) (sessions.SessionItem, sessions.SessionV2, error)
+	ClearRunningTurn(sessionID, turnID string) (sessions.SessionV2, error)
+	MarkTurnInterrupted(sessionID, turnID string) (sessions.SessionV2, error)
+}
+
 type projectorRequest struct {
 	event eventbus.Event
 	ack   chan projectorResult
@@ -42,7 +51,7 @@ type projectorResult struct {
 	err error
 }
 
-func New(store *sessions.V2Store, session sessions.SessionV2) (*Projector, error) {
+func New(store projectorStore, session sessions.SessionV2) (*Projector, error) {
 	if store == nil {
 		return nil, fmt.Errorf("session store is required")
 	}
