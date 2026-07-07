@@ -288,7 +288,7 @@ func execute(ctx context.Context, program string, args []string, stdin io.Reader
 		var stop func()
 		ctx, stop = contextWithInterruptCancel(ctx, interrupts)
 		defer stop()
-		return attachCommand(ctx, rootArgs.commandArgs, rootArgs.configPath, rootArgs.configProvided, serverRoot, stdin, stdout, stderr, getwd, program)
+		return defaultSessionCommand(ctx, rootArgs.commandArgs, rootArgs.configPath, serverRoot, stdin, stdout, stderr, getwd, program)
 	}
 	var stop func()
 	ctx, stop = contextWithInterruptCancel(ctx, interrupts)
@@ -297,8 +297,6 @@ func execute(ctx context.Context, program string, args []string, stdin io.Reader
 	switch rootArgs.command {
 	case "help":
 		return helpCommand(rootArgs.commandArgs, stdout, displayCommand)
-	case "attach":
-		return attachCommand(ctx, rootArgs.commandArgs, rootArgs.configPath, rootArgs.configProvided, serverRoot, stdin, stdout, stderr, getwd, program)
 	case "version":
 		return versionCommand(rootArgs.commandArgs, stdout, displayCommand)
 	case "config":
@@ -366,6 +364,8 @@ func execute(ctx context.Context, program string, args []string, stdin io.Reader
 		switch subcommand {
 		case "create":
 			return sessionCreateCommand(ctx, subArgs, rootArgs.configPath, serverRoot, stdout, getwd, program)
+		case "resume":
+			return sessionResumeCommand(ctx, subArgs, rootArgs.configProvided, serverRoot, stdin, stdout, stderr, program)
 		case "list":
 			return sessionListCommand(ctx, subArgs, rootArgs.configPath, rootArgs.configProvided, serverRoot, stdout, getwd, program)
 		case "show":
@@ -377,10 +377,8 @@ func execute(ctx context.Context, program string, args []string, stdin io.Reader
 		case "remove":
 			return sessionRemoveCommand(ctx, subArgs, rootArgs.configPath, rootArgs.configProvided, serverRoot, stdout, getwd, program)
 		default:
-			return usageError("usage: sai session <create|list|show|rename|archive|remove>", "", "sai help session")
+			return usageError("usage: sai session <create|resume|list|show|rename|archive|remove>", "", "sai help session")
 		}
-	case "send":
-		return sendCommand(ctx, rootArgs.commandArgs, rootArgs.configPath, rootArgs.configProvided, serverRoot, stdout, getwd, program)
 	case "auth":
 		return authCommand(ctx, rootArgs.commandArgs, rootArgs.configPath, stdout, getwd, program)
 	case "tools":
@@ -439,10 +437,8 @@ func contextWithInterruptCancel(ctx context.Context, interrupts <-chan struct{})
 const rootUsageText = `usage: sai [--server-root dir] [--config file] [command] [args]
 
 Commands:
-  attach            Attach to a session
   project           Manage registered projects
   session           Manage explicit sessions
-  send              Send one prompt to a session
   config show        Print resolved config with secrets redacted
   models list        List configured provider model profiles
   auth               Manage provider authentication
@@ -452,19 +448,10 @@ Commands:
   version            Print version
   help [command]     Show usage
 
-With no command, sai starts a pending session for the current project.
+With no command, sai auto-creates a project for the current directory when
+needed, then starts a pending session.
 
 Run "sai help <command>" for command usage.
-`
-
-const attachUsageText = `usage: sai attach [session-id]
-       sai attach --new [--cwd path]
-
-Reads prompts from stdin and sends turns through the execution library. Without
-a session id, or with --new, sai starts a pending session in the nearest
-registered project. It creates the durable session only after the first ordinary
-user message. Existing-session attach renders a display snapshot and rejects
---cwd and global --config; existing sessions use their stored cwd and config.
 `
 
 const resumableSessionSaveNoticeText = "sai: resumable sessions enabled; full prompts, assistant output, and tool results will be saved to the session file."
@@ -562,6 +549,7 @@ const sessionUsageText = `usage: sai session <command>
 
 Commands:
   session create    Create a session in the nearest registered project
+  session resume    Resume a session interactively
   session list      List explicit sessions
   session show      Show session metadata
   session rename    Rename a session
@@ -575,6 +563,13 @@ const sessionCreateUsageText = `usage: sai session create [--cwd path]
 
 Creates a session in the nearest registered project. Use --cwd to
 select the creation directory; otherwise the effective current directory is used.
+`
+
+const sessionResumeUsageText = `usage: sai session resume <session-id>
+
+Renders the visible session snapshot, then resumes the session interactively.
+Existing sessions use their stored cwd and config; --cwd and global --config are
+rejected.
 `
 
 const sessionListUsageText = `usage: sai session list [--project project-id] [--all-projects] [--archived]
@@ -604,16 +599,6 @@ Archives a session so default session lists and automatic selection hide it.
 const sessionRemoveUsageText = `usage: sai session remove <session-id>
 
 Removes an archived session. Active sessions must be archived first.
-`
-
-const sendUsageText = `usage: sai send [session-id] --prompt text
-       sai send --new [--cwd path] --prompt text
-
-Sends one prompt through the execution library and prints committed turn metadata
-only. --new first creates a session in the nearest registered project, then sends
-the prompt to that session. Without an explicit session id, send selects the most
-recent session in the nearest registered project. Existing-session send rejects
---cwd and global --config; existing sessions use their stored cwd and config.
 `
 
 const authUsageText = `usage: sai auth <command>
@@ -671,8 +656,6 @@ func helpCommand(args []string, stdout io.Writer, command string) error {
 	}
 
 	switch strings.Join(args, " ") {
-	case "attach":
-		printAttachUsage(stdout, command)
 	case "version":
 		printVersionUsage(stdout, command)
 	case "config":
@@ -703,6 +686,8 @@ func helpCommand(args []string, stdout io.Writer, command string) error {
 		printSessionUsage(stdout, command)
 	case "session create":
 		printSessionCreateUsage(stdout, command)
+	case "session resume":
+		printSessionResumeUsage(stdout, command)
 	case "session list":
 		printSessionListUsage(stdout, command)
 	case "session show":
@@ -713,8 +698,6 @@ func helpCommand(args []string, stdout io.Writer, command string) error {
 		printSessionArchiveUsage(stdout, command)
 	case "session remove":
 		printSessionRemoveUsage(stdout, command)
-	case "send":
-		printSendUsage(stdout, command)
 	case "auth":
 		printAuthUsage(stdout, command)
 	case "auth codex":
@@ -737,10 +720,6 @@ func helpCommand(args []string, stdout io.Writer, command string) error {
 
 func printRootUsage(stdout io.Writer, command string) {
 	fmt.Fprint(stdout, renderCommandText(rootUsageText, command))
-}
-
-func printAttachUsage(stdout io.Writer, command string) {
-	fmt.Fprint(stdout, renderCommandText(attachUsageText, command))
 }
 
 func printVersionUsage(stdout io.Writer, command string) {
@@ -803,6 +782,10 @@ func printSessionCreateUsage(stdout io.Writer, command string) {
 	fmt.Fprint(stdout, renderCommandText(sessionCreateUsageText, command))
 }
 
+func printSessionResumeUsage(stdout io.Writer, command string) {
+	fmt.Fprint(stdout, renderCommandText(sessionResumeUsageText, command))
+}
+
 func printSessionListUsage(stdout io.Writer, command string) {
 	fmt.Fprint(stdout, renderCommandText(sessionListUsageText, command))
 }
@@ -821,10 +804,6 @@ func printSessionArchiveUsage(stdout io.Writer, command string) {
 
 func printSessionRemoveUsage(stdout io.Writer, command string) {
 	fmt.Fprint(stdout, renderCommandText(sessionRemoveUsageText, command))
-}
-
-func printSendUsage(stdout io.Writer, command string) {
-	fmt.Fprint(stdout, renderCommandText(sendUsageText, command))
 }
 
 func printAuthUsage(stdout io.Writer, command string) {
@@ -1810,44 +1789,55 @@ func executionSessionCreateMetadataFromDefaults(session sessions.SessionV2) exec
 	}
 }
 
-func attachCommand(ctx context.Context, args []string, configPath string, configProvided bool, homePath string, stdin io.Reader, stdout, stderr io.Writer, getwd func() (string, error), program string) error {
+func sessionResumeCommand(ctx context.Context, args []string, configProvided bool, homePath string, stdin io.Reader, stdout, stderr io.Writer, program string) error {
 	displayCommand := displayProgramName(program)
-	flags := flag.NewFlagSet("sai attach", flag.ContinueOnError)
-	cwdFlag := flags.String("cwd", "", "discovery working directory")
-	newSession := flags.Bool("new", false, "create a new session before attaching")
-	positionals, done, err := parseCommandFlagArgs(flags, args, stdout, printAttachUsage, displayCommand, "sai help attach")
+	flags := flag.NewFlagSet("sai session resume", flag.ContinueOnError)
+	flags.String("cwd", "", "discovery working directory")
+	positionals, done, err := parseCommandFlagArgs(flags, args, stdout, printSessionResumeUsage, displayCommand, "sai help session resume")
 	if done || err != nil {
 		return err
 	}
-	switch {
-	case *newSession && len(positionals) != 0:
-		return usageError("usage: sai attach --new [--cwd path]", "", "sai help attach")
-	case !*newSession && len(positionals) > 1:
-		return usageError("usage: sai attach [session-id]", "", "sai help attach")
+	if len(positionals) != 1 {
+		return usageError("usage: sai session resume <session-id>", "", "sai help session resume")
 	}
-	createMode := *newSession || len(positionals) == 0
-	if err := rejectExistingSessionOverrides(createMode, flagWasSet(flags, "cwd"), configProvided, "sai help attach"); err != nil {
+	if err := rejectSessionResumeOverrides(flagWasSet(flags, "cwd"), configProvided, "sai help session resume"); err != nil {
 		return err
 	}
-
-	sessionID := ""
 	service, err := newCLIAttachExecutionService(homePath, program)
 	if err != nil {
 		return err
 	}
-	if createMode {
-		creationCWD, err := resolveClientCWD(*cwdFlag, getwd)
-		if err != nil {
-			return err
-		}
-		return runPendingAttachREPL(ctx, service, configPath, homePath, creationCWD, stdin, stdout, stderr, program)
+	return resumeExecutionSessionREPL(ctx, service, positionals[0], stdin, stdout, stderr, displayCommand, "sai help session resume")
+}
+
+func defaultSessionCommand(ctx context.Context, args []string, configPath string, homePath string, stdin io.Reader, stdout, stderr io.Writer, getwd func() (string, error), program string) error {
+	displayCommand := displayProgramName(program)
+	flags := flag.NewFlagSet("sai", flag.ContinueOnError)
+	cwdFlag := flags.String("cwd", "", "discovery working directory")
+	positionals, done, err := parseCommandFlagArgs(flags, args, stdout, printRootUsage, displayCommand, "sai help")
+	if done || err != nil {
+		return err
+	}
+	if len(positionals) != 0 {
+		return usageError("usage: sai [--cwd path]", "", "sai help")
 	}
 
-	sessionID = strings.TrimSpace(positionals[0])
+	service, err := newCLIAttachExecutionService(homePath, program)
+	if err != nil {
+		return err
+	}
+	creationCWD, err := resolveClientCWD(*cwdFlag, getwd)
+	if err != nil {
+		return err
+	}
+	return runPendingAttachREPL(ctx, service, configPath, homePath, creationCWD, stdin, stdout, stderr, program)
+}
+
+func resumeExecutionSessionREPL(ctx context.Context, service *execution.Service, sessionID string, stdin io.Reader, stdout, stderr io.Writer, displayCommand, helpCommand string) error {
+	sessionID = strings.TrimSpace(sessionID)
 	if sessionID == "" {
-		return usageError("session id must be a non-empty string", "", "sai help attach")
+		return usageError("session id must be a non-empty string", "", helpCommand)
 	}
-
 	snapshot, err := service.GetSessionChatItems(sessionID)
 	if err != nil {
 		return err
@@ -1908,13 +1898,19 @@ func runPendingAttachREPL(ctx context.Context, service *execution.Service, confi
 }
 
 func ensurePendingAttachProject(service *execution.Service, creationCWD, program string) error {
-	displayCommand := displayProgramName(program)
 	project, ok, err := service.NearestProject(creationCWD, execution.NearestProjectOptions{})
 	if err != nil {
 		return err
 	}
-	if !ok || strings.TrimSpace(project.ID) == "" {
-		return fmt.Errorf("no registered project found from %s; run %q", creationCWD, displayCommand+" project create")
+	if ok && strings.TrimSpace(project.ID) != "" {
+		return nil
+	}
+	result, err := service.CreateProject(creationCWD, "")
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(result.Project.ID) == "" {
+		return fmt.Errorf("create project: response missing project id")
 	}
 	return nil
 }
@@ -1949,38 +1945,6 @@ func writeAttachSnapshot(stdout io.Writer, snapshot execution.SessionItemsPage) 
 		}
 	}
 	return nil
-}
-
-func mostRecentExecutionProjectSessionID(service *execution.Service, cwdFlag string, getwd func() (string, error), program string, newHint string) (string, error) {
-	displayCommand := displayProgramName(program)
-	effectiveCWD, err := resolveClientCWD(cwdFlag, getwd)
-	if err != nil {
-		return "", err
-	}
-	project, ok, err := service.NearestProject(effectiveCWD, execution.NearestProjectOptions{})
-	if err != nil {
-		return "", err
-	}
-	if !ok {
-		return "", fmt.Errorf("no registered project found from %s; run %q", effectiveCWD, displayCommand+" project create")
-	}
-	infos, err := service.ListSessions(execution.SessionListOptions{ProjectID: project.ID})
-	if err != nil {
-		return "", err
-	}
-	if len(infos) == 0 {
-		return "", fmt.Errorf("no sessions found for project %s; create a session with %q or %q", project.ID, displayCommand+" session create", newHint)
-	}
-	latest := infos[0]
-	for _, info := range infos[1:] {
-		if info.UpdatedAt.After(latest.UpdatedAt) || (info.UpdatedAt.Equal(latest.UpdatedAt) && info.CreatedAt.After(latest.CreatedAt)) {
-			latest = info
-		}
-	}
-	if strings.TrimSpace(latest.ID) == "" {
-		return "", fmt.Errorf("most recent project session response missing session id")
-	}
-	return latest.ID, nil
 }
 
 type attachOutputState struct {
@@ -2221,73 +2185,6 @@ func writeAttachStreamEvent(stdout, stderr io.Writer, event execution.SessionStr
 	return nil
 }
 
-func sendCommand(ctx context.Context, args []string, configPath string, configProvided bool, homePath string, stdout io.Writer, getwd func() (string, error), program string) error {
-	displayCommand := displayProgramName(program)
-	flags := flag.NewFlagSet("sai send", flag.ContinueOnError)
-	cwdFlag := flags.String("cwd", "", "discovery working directory")
-	newSession := flags.Bool("new", false, "create a new session before sending")
-	prompt := flags.String("prompt", "", "prompt text")
-	positionals, done, err := parseCommandFlagArgs(flags, args, stdout, printSendUsage, displayCommand, "sai help send")
-	if done || err != nil {
-		return err
-	}
-	switch {
-	case *newSession && len(positionals) != 0:
-		return usageError("usage: sai send --new [--cwd path] --prompt text", "", "sai help send")
-	case !*newSession && len(positionals) > 1:
-		return usageError("usage: sai send [session-id] --prompt text", "", "sai help send")
-	}
-	if strings.TrimSpace(*prompt) == "" {
-		return usageError("--prompt must be a non-empty string", "", "sai help send")
-	}
-	if err := rejectExistingSessionOverrides(*newSession, flagWasSet(flags, "cwd"), configProvided, "sai help send"); err != nil {
-		return err
-	}
-
-	service, err := newCLISendExecutionService(homePath, program)
-	if err != nil {
-		return err
-	}
-	sessionID := ""
-	if *newSession {
-		creationCWD, err := resolveClientCWD(*cwdFlag, getwd)
-		if err != nil {
-			return err
-		}
-		detail, err := createExecutionSessionForCWD(configPath, homePath, creationCWD, program)
-		if err != nil {
-			return err
-		}
-		sessionID = strings.TrimSpace(detail.ID)
-		if sessionID == "" {
-			return fmt.Errorf("create session: missing session id")
-		}
-	} else {
-		if len(positionals) == 1 {
-			sessionID = positionals[0]
-		} else {
-			sessionID, err = mostRecentExecutionProjectSessionID(service, "", getwd, program, displayCommand+" send --new")
-			if err != nil {
-				return err
-			}
-		}
-	}
-
-	result, err := service.SendSessionMessage(ctx, sessionID, *prompt)
-	if err != nil {
-		return err
-	}
-	return printSessionSendResult(stdout, sessionID, result)
-}
-
-func newCLISendExecutionService(homePath, program string) (*execution.Service, error) {
-	runner := executionAgentTurnRunner{program: program}
-	return execution.NewServiceWithOptions(homePath, execution.ServiceOptions{
-		TurnRunner:     runner,
-		CompactPlanner: runner,
-	})
-}
-
 func newCLIAttachExecutionService(homePath, program string) (*execution.Service, error) {
 	runner := executionAgentTurnRunner{program: program}
 	return execution.NewServiceWithOptions(homePath, execution.ServiceOptions{
@@ -2296,15 +2193,12 @@ func newCLIAttachExecutionService(homePath, program string) (*execution.Service,
 	})
 }
 
-func rejectExistingSessionOverrides(newSession, cwdProvided, configProvided bool, helpCommand string) error {
-	if newSession {
-		return nil
-	}
+func rejectSessionResumeOverrides(cwdProvided, configProvided bool, helpCommand string) error {
 	if cwdProvided {
-		return usageError("--cwd can only be used when creating a new session with --new", "", helpCommand)
+		return usageError("--cwd cannot be used when resuming an existing session", "", helpCommand)
 	}
 	if configProvided {
-		return usageError("--config can only be used when creating a new session with --new", "", helpCommand)
+		return usageError("--config cannot be used when resuming an existing session", "", helpCommand)
 	}
 	return nil
 }
@@ -2314,20 +2208,6 @@ func rejectSessionConfigForExistingCommand(configProvided bool, helpCommand stri
 		return usageError("--config can only be used when creating a new session", "", helpCommand)
 	}
 	return nil
-}
-
-func printSessionSendResult(stdout io.Writer, sessionID string, result execution.SessionMessageResult) error {
-	if _, err := fmt.Fprintf(stdout, "SESSION\t%s\n", sessionID); err != nil {
-		return err
-	}
-	if _, err := fmt.Fprintf(stdout, "STATUS\t%s\n", result.Status); err != nil {
-		return err
-	}
-	if _, err := fmt.Fprintf(stdout, "TURN_ID\t%s\n", result.TurnID); err != nil {
-		return err
-	}
-	_, err := fmt.Fprintf(stdout, "LAST_SEQ\t%d\n", result.LastSeq)
-	return err
 }
 
 func resolveClientCWD(cwdFlag string, getwd func() (string, error)) (string, error) {

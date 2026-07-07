@@ -541,14 +541,14 @@
   event projector。
 - [x] 删除当前产品路径中的 `server` 前台/后台命令、auto-start、registry、bearer token、HTTP client
   helpers、HTTP handlers 和 WebSocket stream。
-- [x] attach/send/new/project/session 命令复用同一套 execution library API。
-- [ ] 裸 `sai` 在缺少当前 project 时自动创建 project，并进入 pending 新 session。
-- [ ] 裸 `sai` 复用当前 cwd 的 nearest registered project，并进入 pending 新 session。
-- [ ] `sai session resume <id>` 作为已有 session 的交互恢复入口。
-- [ ] 当前产品 help/docs 不再展示 top-level `attach` 或 `send` 入口。
+- [x] 默认入口、project/session/resume/compact 命令复用同一套 execution library API。
+- [x] 裸 `sai` 在缺少当前 project 时自动创建 project，并进入 pending 新 session。
+- [x] 裸 `sai` 复用当前 cwd 的 nearest registered project，并进入 pending 新 session。
+- [x] `sai session resume <id>` 作为已有 session 的交互恢复入口。
+- [x] 当前产品 help/docs 不再展示 top-level `attach` 或 `send` 入口。
 - [x] 不恢复 hardcoded chat product entry，也不保留 hidden chat alias。
 - [x] future HTTP adapter、GUI 和跨终端共享能力保持 out of scope。
-- [x] CLI 测试覆盖 project/session lifecycle、attach/send/new/compact，且不启动 server。
+- [x] CLI 测试覆盖 project/session lifecycle、默认入口、session resume/compact，且不启动 server。
 - [x] 测试覆盖 CLI product path 不访问 registry、HTTP client、HTTP handlers 或 WebSocket stream。
 - [x] execution library 测试覆盖 storage root 初始化、project/session lifecycle、selection、busy
   turn rejection、event streaming/persistence、compaction 和 interrupted recovery。

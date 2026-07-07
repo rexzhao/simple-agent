@@ -209,7 +209,7 @@ conflict arbitration、observability，以及 persistence/resume。M17 只为这
 
 ## CLI 形态
 
-下一实现切片的目标命令：
+当前产品命令：
 
 ```text
 sai
@@ -234,14 +234,14 @@ sai doctor
 sai mcp list  # M4
 ```
 
-M22 后，当前产品入口不再包含 `sai chat`，也不保留 hidden chat alias。下一实现切片的目标是：
+M22 后，当前产品入口不再包含 `sai chat`，也不保留 hidden chat alias。当前行为是：
 裸 `sai` 从当前目录查找最近注册项目；如果没有项目，CLI 自动为当前目录创建 project，然后
 开启一个 pending 新 session 并进入交互。durable session 在第一条普通用户消息时创建。
-已有 session 通过 `sai session resume <id>` 继续。`send` 将不再作为当前产品入口；
+已有 session 通过 `sai session resume <id>` 继续。`send` 不再作为当前产品入口；
 stdin/file 单次输入如果后续需要，应作为新的 session 能力设计，不恢复 `sai run`，
 也不重新引入独立 chat 产品入口。
 
-Help/usage 是普通 CLI 行为，不引入 TUI 或第三方 CLI 框架。下一实现切片的目标 help surface 支持：
+Help/usage 是普通 CLI 行为，不引入 TUI 或第三方 CLI 框架。当前 help surface 支持：
 
 ```text
 sai -h
@@ -287,7 +287,7 @@ doctor 不发起 provider HTTP 请求、不启动 MCP server、不运行模型�
 `logging.path` 对应的 session root/父目录可创建可写，不创建真正的 session log 文件。
 
 根层解析从 argv 左到右扫描，跳过已知 flag 及其 value；第一个真正的非 flag token 是命令。
-下一实现切片中，没有命令 token 时默认进入当前 project 的 pending 新 session；若当前目录
+当前实现中，没有命令 token 时默认进入当前 project 的 pending 新 session；若当前目录
 没有注册项目，先自动创建 project。
 带值 flag 的 value 不参与命令识别。命令 token 之外的参数交给对应命令解析，命令前后的
 flags 可以混排；`sai "prompt"` 会把 `prompt` 识别为未知命令，而不是 prompt 输入。
@@ -314,7 +314,7 @@ v0.1 暂不支持 non-streaming fallback；当前 execution turn runtime 仍使�
 ## CLI Chat REPL（历史）
 
 本节记录 M10-M19 的旧 `sai chat` 设计，作为历史实现背景保留。M22 后当前产品入口不再提供
-`sai chat` 命令或 hidden alias；下一实现切片的目标入口是裸 `sai` pending session、
+`sai chat` 命令或 hidden alias；当前入口是裸 `sai` pending session、
 `project` 和 `session` 命令。
 
 M10 后，`sai chat` 是一个克制的逐行 REPL：启动时固定 provider、model、tools、MCP、
@@ -575,7 +575,7 @@ sai session create --config ./config/sai.yaml
 sai --config ./config/sai.yaml
 ```
 
-目标行为中，session 创建时从根配置文件的默认 provider/model 解析并保存到 session metadata。若默认值
+当前实现中，session 创建时从根配置文件的默认 provider/model 解析并保存到 session metadata。若默认值
 缺失或无效，CLI 应给出可选 provider/model 列表并停止。M22 不支持会话进行中切换模型；
 `session resume` 使用已保存的 provider/model/config。
 
@@ -871,7 +871,7 @@ tool result messages。会话压缩实现目标中的 v2 store 会将这些事�
 M18 后，项目指令文件快照或可重建信息应按每个成功加载的文件分别记录，而不是合并成一个
 不可追溯的块。
 
-下一实现切片的目标产品路径通过 `sai`、`sai session create`、`sai session resume <id>`、
+当前产品路径通过 `sai`、`sai session create`、`sai session resume <id>`、
 `sai session list`、`sai session show <id>`、`sai session archive <id>` 和
 `sai session remove <id>` 管理可恢复 session。管理命令只展示元数据或删除文件，不打印完整
 messages、prompt、assistant output 或 tool result 正文。

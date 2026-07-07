@@ -17,7 +17,7 @@
 兼容行为，等价于只读取启动时当前工作目录下的 `$CWD/AGENTS.md`；`--config` 不改变
 `$CWD` 的含义。
 
-下一实现切片的目标命令示例：
+当前命令示例：
 
 ```text
 sai --config ./config/sai.yaml
@@ -605,7 +605,7 @@ sai session create --config ./config/sai.yaml
 sai --config ./config/sai.yaml
 ```
 
-下一实现切片的目标产品路径中，provider 和 model 在创建 session 时从所选根配置文件的
+当前产品路径中，provider 和 model 在创建 session 时从所选根配置文件的
 `default_provider` / `default_model` 解析并保存到 session metadata；后续 `session resume`
 existing session 使用 session 中保存的 provider/model/config，不允许用新的 `--config`
 改写已有 session。若默认值仍无法确定，命令会打印可选 provider/model 并停止。
@@ -616,7 +616,7 @@ existing session 使用 session 中保存的 provider/model/config，不允许�
 2. 启动时当前工作目录下的 `.agents/${arg[0]}.yaml`。
 
 根层解析从 argv 左到右扫描，跳过已知 flag 及其 value；第一个真正的非 flag token 是命令。
-下一实现切片中，没有命令 token 时默认进入当前 project 的 pending 新 session；若当前目录
+当前实现中，没有命令 token 时默认进入当前 project 的 pending 新 session；若当前目录
 没有注册 project，CLI 先自动为当前目录创建 project。
 带值 flag 的 value 不参与命令识别。命令 token 之外的参数交给对应命令解析，命令前后的
 flags 可以混排；`sai "prompt"` 会把 `prompt` 识别为未知命令，而不是 prompt 输入。
@@ -626,7 +626,7 @@ flags 可以混排；`sai "prompt"` 会把 `prompt` 识别为未知命令，而�
 解析；其后的 token 全部作为 positional，不再被识别为 help、`--config` 或命令参数
 flag。
 
-M22 不支持会话进行中切换模型。下一实现切片的默认入口和 `session resume` 使用 session 创建时保存的
+M22 不支持会话进行中切换模型。当前默认入口和 `session resume` 使用 session 创建时保存的
 provider/model/tools/MCP/skills/reasoning 等 metadata；已有 session 的 resume
 传入 `--config` 或 `--cwd` 会报错。交互式 session 的普通单行模式支持 `/compact`；
 多行输入块里的 `/compact` 按普通文本发送。
@@ -731,7 +731,7 @@ provider/model/parameters、启用 tools/MCP、loaded skills、reasoning，以�
 source/message 粒度。因此 `sessions.enabled` 必须默认是 `false`，CLI 和文档都应提示用户这是显式
 opt-in 的落盘能力。
 
-下一实现切片的目标命令行通过 explicit session lifecycle 管理可恢复 session：
+当前命令行通过 explicit session lifecycle 管理可恢复 session：
 
 ```text
 sai project create
@@ -745,14 +745,14 @@ sai session remove <id>
 
 启用保存后，runtime 会在每个成功 turn 后写入
 `sessions.dir/<id>/session.json`，其中包含完整 updated messages：user messages、
-assistant final messages、assistant tool calls 和 tool result messages。目标行为中，`session resume`
+assistant final messages、assistant tool calls 和 tool result messages。当前行为中，`session resume`
 会从该 session 文件恢复；裸 `sai` 会在当前 project 中开启 pending 新 session。会话压缩实现目标会在此基础上使用 v2 session store：完整事实写入 append-only
 `Items`，模型可见上下文由 `ActiveHistory` item id 列表表示，resume 从 `ActiveHistory`
 materialize provider messages。
 
 恢复时，runtime 使用 session metadata 中保存的 provider、model profile、model id、model
 parameters、enabled tools、enabled MCP、loaded skills、show_reasoning 和保存行为。显式
-CLI 覆盖如果和 session 文件冲突会失败；下一实现切片中，例如 `session resume` 传入新的
+CLI 覆盖如果和 session 文件冲突会失败；当前实现中，例如 `session resume` 传入新的
 `--config` 或 `--cwd`。`sessions.save_tool_results: false` 当前不提供可靠降级模式；只要启用保存或恢复，
 CLI 会拒绝继续并提示必须设为 `true`。
 

@@ -993,7 +993,8 @@ func TestCustomProgramBasenameInHelpVersionAndUsageError(t *testing.T) {
 			args: []string{"--server-root", serverRoot, "help"},
 			wants: []string{
 				"usage: custom-agent.exe [--server-root dir]",
-				"With no command, custom-agent.exe starts a pending session for the current project.",
+				"With no command, custom-agent.exe auto-creates a project for the current directory",
+				"needed, then starts a pending session.",
 				`Run "custom-agent.exe help <command>" for command usage.`,
 			},
 		},
@@ -1118,12 +1119,12 @@ func TestRootHelpWritesUsageWithoutConfig(t *testing.T) {
 				t.Fatalf("RunWithGetwd(%v) code = %d, stderr = %s", args, code, stderr.String())
 			}
 			out := stdout.String()
-			for _, want := range []string{"usage: sai", "attach            Attach to a session", "project           Manage registered projects", "session           Manage explicit sessions", "send              Send one prompt to a session", "config show", "models list", "doctor", "tools list", "With no command, sai starts a pending session for the current project.", `Run "sai help <command>" for command usage.`} {
+			for _, want := range []string{"usage: sai", "project           Manage registered projects", "session           Manage explicit sessions", "config show", "models list", "doctor", "tools list", "With no command, sai auto-creates a project for the current directory", "then starts a pending session.", `Run "sai help <command>" for command usage.`} {
 				if !strings.Contains(out, want) {
 					t.Fatalf("stdout = %q, want contain %q", out, want)
 				}
 			}
-			for _, omit := range []string{"server            Manage the selected local HTTP server", "status            Show nearest server status", "stop              Stop nearest server", "servers list", "sessions           Alias", "send              Send one prompt to a server-owned session"} {
+			for _, omit := range []string{"attach            Attach to a session", "send              Send one prompt to a session", "server            Manage the selected local HTTP server", "status            Show nearest server status", "stop              Stop nearest server", "servers list", "sessions           Alias", "send              Send one prompt to a server-owned session"} {
 				if strings.Contains(out, omit) {
 					t.Fatalf("root help still lists removed command %q:\n%s", omit, out)
 				}
@@ -1284,16 +1285,18 @@ func TestSessionHelpWritesUsageWithoutConfig(t *testing.T) {
 	}{
 		{
 			args:  []string{"session", "-h"},
-			wants: []string{"usage: sai session <command>", "session create", "session list", "session show", "session rename", "session archive", "session remove"},
+			wants: []string{"usage: sai session <command>", "session create", "session resume", "session list", "session show", "session rename", "session archive", "session remove"},
 			omits: []string{"session config", "session update", "session mutate", "session set"},
 		},
 		{
 			args:  []string{"help", "session"},
-			wants: []string{"usage: sai session <command>", "session create", "session list", "session show", "session rename", "session archive", "session remove"},
+			wants: []string{"usage: sai session <command>", "session create", "session resume", "session list", "session show", "session rename", "session archive", "session remove"},
 			omits: []string{"session config", "session update", "session mutate", "session set"},
 		},
 		{args: []string{"session", "create", "-h"}, wants: []string{"usage: sai session create", "--cwd path"}},
 		{args: []string{"help", "session", "create"}, wants: []string{"usage: sai session create", "--cwd path"}},
+		{args: []string{"session", "resume", "-h"}, wants: []string{"usage: sai session resume <session-id>", "resumes the session interactively"}},
+		{args: []string{"help", "session", "resume"}, wants: []string{"usage: sai session resume <session-id>", "resumes the session interactively"}},
 		{args: []string{"session", "list", "-h"}, wants: []string{"usage: sai session list", "--project project-id", "--all-projects", "--archived"}},
 		{args: []string{"help", "session", "list"}, wants: []string{"usage: sai session list", "--project project-id", "--all-projects", "--archived"}},
 		{args: []string{"session", "show", "-h"}, wants: []string{"usage: sai session show <session-id>", "explicit global session id"}},
@@ -2433,60 +2436,6 @@ func TestSessionCommandsDoNotStartBackgroundServer(t *testing.T) {
 	assertCLIOutputContains(t, stdout.String(), "ID\tPROJECT_ID\tNAME\tCREATED_CWD\tARCHIVED\tLAST_USED_AT")
 }
 
-func TestSendWithoutSessionUsesExecutionServiceWithoutStartupOutput(t *testing.T) {
-	home := t.TempDir()
-	projectDir := t.TempDir()
-	configDir := filepath.Join(projectDir, ".agents")
-	modelServer, requests := newCLIRunServer(t,
-		`{"choices":[{"delta":{"content":"send reply"}}]}`,
-		`[DONE]`,
-	)
-	defer modelServer.Close()
-	writeCLIRunFixtureInDir(t, configDir, modelServer.URL, "direct-secret-value", "openai-chat")
-	project, _, err := cliProjectStore(t, home).Create(projectDir, "Current")
-	if err != nil {
-		t.Fatalf("Create(project) error = %v", err)
-	}
-	if _, err := cliSessionStore(t, home).SaveMetadata(sessions.SessionV2{
-		ID:              "latest-session",
-		ProjectID:       project.ID,
-		CreatedCWD:      project.Root,
-		CWD:             project.Root,
-		ConfigPath:      filepath.Join(configDir, "sai.yaml"),
-		Provider:        "fake",
-		ModelProfile:    "default",
-		ModelID:         "model-default",
-		SaveToolResults: true,
-	}); err != nil {
-		t.Fatalf("SaveMetadata(session) error = %v", err)
-	}
-	forbidCLIBackgroundStart(t)
-
-	var stdout, stderr bytes.Buffer
-	code := RunWithGetwd([]string{"--server-root", home, "send", "--prompt", "hello"}, &stdout, &stderr, func() (string, error) {
-		return projectDir, nil
-	})
-
-	if code != 0 {
-		t.Fatalf("send code = %d, stderr = %s", code, stderr.String())
-	}
-	if stderr.String() != "" {
-		t.Fatalf("stderr = %q, want empty", stderr.String())
-	}
-	if strings.Contains(stdout.String(), "SERVER_ADDR") {
-		t.Fatalf("stdout = %q, want no SERVER_ADDR", stdout.String())
-	}
-	for _, want := range []string{"SESSION\tlatest-session", "STATUS\tcommitted", "TURN_ID\tturn-000001"} {
-		if !strings.Contains(stdout.String(), want) {
-			t.Fatalf("send output missing %q:\n%s", want, stdout.String())
-		}
-	}
-	assertCLILastSeqPresent(t, stdout.String())
-	request := receiveCLIRunRequest(t, requests)
-	assertMessage(t, requestMessages(t, request.Body), 1, "user", "hello")
-	assertNoAdditionalCLIRunRequest(t, requests)
-}
-
 func TestBareDefaultAttachPendingSessionWithoutDurableRequests(t *testing.T) {
 	isolateCLIUserRegistry(t)
 	home := cliDefaultServerRoot(t)
@@ -2583,15 +2532,30 @@ func TestVersionHelpWritesUsageWithoutConfig(t *testing.T) {
 	}
 }
 
-func TestSendHelpWritesUsageWithoutConfig(t *testing.T) {
-	for _, args := range [][]string{
-		{"send", "-h"},
-		{"send", "--help"},
-		{"help", "send"},
-	} {
-		t.Run(strings.Join(args, " "), func(t *testing.T) {
-			out := assertCLIHelpWithoutConfig(t, args, "usage: sai send [session-id] --prompt text", "--new [--cwd path] --prompt", "execution library", "committed turn metadata")
-			assertCLIErrorOmits(t, out, "server API", "registry token", "nearest healthy local server", "server-owned session")
+func TestSendCommandIsUnsupported(t *testing.T) {
+	tests := []struct {
+		args []string
+		want string
+	}{
+		{args: []string{"send", "-h"}, want: `unknown command "send"`},
+		{args: []string{"send", "--help"}, want: `unknown command "send"`},
+		{args: []string{"send", "--prompt", "hello"}, want: `unknown command "send"`},
+		{args: []string{"help", "send"}, want: `unknown help topic "send"`},
+	}
+	for _, tt := range tests {
+		t.Run(strings.Join(tt.args, " "), func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			code := RunWithGetwd(tt.args, &stdout, &stderr, func() (string, error) {
+				return "", errors.New("getwd should not be called")
+			})
+			if code != 1 {
+				t.Fatalf("RunWithGetwd(%v) code = %d, want 1", tt.args, code)
+			}
+			if stdout.String() != "" {
+				t.Fatalf("stdout = %q, want empty", stdout.String())
+			}
+			assertCLIErrorContains(t, stderr.String(), tt.want, `Run "sai help" for usage.`)
+			assertCLIErrorOmits(t, stderr.String(), "usage: sai send", "server-owned session")
 		})
 	}
 }
@@ -2878,17 +2842,47 @@ func TestChatMixedHelpDoesNotLoadConfig(t *testing.T) {
 	}
 }
 
-func TestAttachHelpWritesUsageWithoutConfig(t *testing.T) {
-	for _, args := range [][]string{
-		{"attach", "-h"},
-		{"attach", "--help"},
-		{"help", "attach"},
-	} {
-		t.Run(strings.Join(args, " "), func(t *testing.T) {
-			out := assertCLIHelpWithoutConfig(t, args, "usage: sai attach", "pending session", "first ordinary", "execution library")
-			assertCLIErrorOmits(t, out, "healthy local server", "session stream", "server-owned session")
+func TestAttachCommandIsUnsupported(t *testing.T) {
+	tests := []struct {
+		args []string
+		want string
+	}{
+		{args: []string{"attach", "-h"}, want: `unknown command "attach"`},
+		{args: []string{"attach", "--help"}, want: `unknown command "attach"`},
+		{args: []string{"attach", "existing-session"}, want: `unknown command "attach"`},
+		{args: []string{"help", "attach"}, want: `unknown help topic "attach"`},
+	}
+	for _, tt := range tests {
+		t.Run(strings.Join(tt.args, " "), func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			code := RunWithGetwd(tt.args, &stdout, &stderr, func() (string, error) {
+				return "", errors.New("getwd should not be called")
+			})
+			if code != 1 {
+				t.Fatalf("RunWithGetwd(%v) code = %d, want 1", tt.args, code)
+			}
+			if stdout.String() != "" {
+				t.Fatalf("stdout = %q, want empty", stdout.String())
+			}
+			assertCLIErrorContains(t, stderr.String(), tt.want, `Run "sai help" for usage.`)
+			assertCLIErrorOmits(t, stderr.String(), "usage: sai attach", "server-owned session")
 		})
 	}
+}
+
+func TestBareNewFlagIsUnsupported(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	code := RunWithGetwd([]string{"--new"}, &stdout, &stderr, func() (string, error) {
+		return "", errors.New("getwd should not be called")
+	})
+
+	if code != 1 {
+		t.Fatalf("RunWithGetwd(--new) code = %d, want 1", code)
+	}
+	if stdout.String() != "" {
+		t.Fatalf("stdout = %q, want empty", stdout.String())
+	}
+	assertCLIErrorContains(t, stderr.String(), "flag provided but not defined: -new", `Run "sai help" for usage.`)
 }
 
 func TestChatQuitWithoutPromptIsUsageError(t *testing.T) {
@@ -7883,415 +7877,7 @@ func TestPluralSessionsRejectsLegacyCommandsAndCWD(t *testing.T) {
 	}
 }
 
-func TestSendExistingUsesExecutionServiceWithSessionMetadata(t *testing.T) {
-	home := t.TempDir()
-	projectDir := t.TempDir()
-	configDir := filepath.Join(projectDir, ".agents")
-	modelServer, requests := newCLIRunServer(t,
-		`{"choices":[{"delta":{"content":"existing reply"}}]}`,
-		`[DONE]`,
-	)
-	defer modelServer.Close()
-	writeCLIRunFixtureInDir(t, configDir, modelServer.URL, "direct-secret-value", "openai-chat")
-	if _, err := cliSessionStore(t, home).SaveMetadata(sessions.SessionV2{
-		ID:              "existing-session",
-		CreatedCWD:      projectDir,
-		CWD:             projectDir,
-		ConfigPath:      filepath.Join(configDir, "sai.yaml"),
-		Provider:        "fake",
-		ModelProfile:    "default",
-		ModelID:         "model-default",
-		SaveToolResults: true,
-	}); err != nil {
-		t.Fatalf("SaveMetadata(existing session) error = %v", err)
-	}
-	forbidCLIBackgroundStart(t)
-	prompt := "SECRET prompt body"
-
-	var stdout, stderr bytes.Buffer
-	code := RunWithGetwd([]string{"--server-root", home, "send", "existing-session", "--prompt", prompt}, &stdout, &stderr, func() (string, error) {
-		return "", errors.New("getwd should not be called")
-	})
-
-	if code != 0 {
-		t.Fatalf("send code = %d, stderr = %s", code, stderr.String())
-	}
-	request := receiveCLIRunRequest(t, requests)
-	if got := countCLIRequestMessagesWithContent(t, requestMessages(t, request.Body), "user", prompt); got != 1 {
-		t.Fatalf("request user prompt count = %d, want 1", got)
-	}
-	assertNoAdditionalCLIRunRequest(t, requests)
-	out := stdout.String()
-	for _, want := range []string{"SESSION\texisting-session", "STATUS\tcommitted", "TURN_ID\tturn-000001"} {
-		if !strings.Contains(out, want) {
-			t.Fatalf("send output missing %q:\n%s", want, out)
-		}
-	}
-	assertCLILastSeqPresent(t, out)
-	assertCLIErrorOmits(t, out, prompt, "direct-secret-value")
-	if stderr.String() != "" {
-		t.Fatalf("stderr = %q, want empty", stderr.String())
-	}
-}
-
-func TestSendExistingRejectsCWDAndConfigBeforeDiscovery(t *testing.T) {
-	projectDir := t.TempDir()
-	missingConfig := filepath.Join(t.TempDir(), "missing.yaml")
-	tests := []struct {
-		name string
-		args []string
-		want string
-	}{
-		{
-			name: "cwd",
-			args: []string{"send", "existing-session", "--cwd", projectDir, "--prompt", "hello"},
-			want: "--cwd can only be used when creating a new session with --new",
-		},
-		{
-			name: "config",
-			args: []string{"--config", missingConfig, "send", "existing-session", "--prompt", "hello"},
-			want: "--config can only be used when creating a new session with --new",
-		},
-		{
-			name: "config after command",
-			args: []string{"send", "existing-session", "--prompt", "hello", "--config", missingConfig},
-			want: "--config can only be used when creating a new session with --new",
-		},
-		{
-			name: "no id cwd",
-			args: []string{"send", "--cwd", projectDir, "--prompt", "hello"},
-			want: "--cwd can only be used when creating a new session with --new",
-		},
-		{
-			name: "no id config",
-			args: []string{"--config", missingConfig, "send", "--prompt", "hello"},
-			want: "--config can only be used when creating a new session with --new",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			var stdout, stderr bytes.Buffer
-			code := RunWithGetwd(tt.args, &stdout, &stderr, func() (string, error) {
-				return "", errors.New("getwd should not be called")
-			})
-			if code != 1 {
-				t.Fatalf("send code = %d, want 1", code)
-			}
-			if stdout.String() != "" {
-				t.Fatalf("stdout = %q, want empty", stdout.String())
-			}
-			assertCLIErrorContains(t, stderr.String(), tt.want, `Run "sai help send" for usage.`)
-			assertCLIErrorOmits(t, stderr.String(), "getwd should not be called", "no healthy sai server found")
-		})
-	}
-}
-
-func TestSendExistingWaitsForModelTurn(t *testing.T) {
-	home := t.TempDir()
-	projectDir := t.TempDir()
-	configDir := filepath.Join(projectDir, ".agents")
-	requests := make(chan capturedCLIRunRequest, 1)
-	modelServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		body, err := io.ReadAll(r.Body)
-		if err != nil {
-			t.Errorf("ReadAll() error = %v", err)
-		}
-		requests <- capturedCLIRunRequest{Path: r.URL.Path, RawBody: body, Body: decodeCLIJSON(t, body)}
-		time.Sleep(750 * time.Millisecond)
-		w.Header().Set("Content-Type", "text/event-stream")
-		_, _ = fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"slow reply\"}}]}\n\n")
-		_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
-	}))
-	defer modelServer.Close()
-	writeCLIRunFixtureInDir(t, configDir, modelServer.URL, "direct-secret-value", "openai-chat")
-	if _, err := cliSessionStore(t, home).SaveMetadata(sessions.SessionV2{
-		ID:              "slow-session",
-		CreatedCWD:      projectDir,
-		CWD:             projectDir,
-		ConfigPath:      filepath.Join(configDir, "sai.yaml"),
-		Provider:        "fake",
-		ModelProfile:    "default",
-		ModelID:         "model-default",
-		SaveToolResults: true,
-	}); err != nil {
-		t.Fatalf("SaveMetadata(slow session) error = %v", err)
-	}
-	forbidCLIBackgroundStart(t)
-
-	var stdout, stderr bytes.Buffer
-	code := RunWithGetwd([]string{"--server-root", home, "send", "slow-session", "--prompt", "slow prompt"}, &stdout, &stderr, func() (string, error) {
-		return "", errors.New("getwd should not be called")
-	})
-
-	if code != 0 {
-		t.Fatalf("send code = %d, stderr = %s", code, stderr.String())
-	}
-	request := receiveCLIRunRequest(t, requests)
-	assertMessage(t, requestMessages(t, request.Body), 1, "user", "slow prompt")
-	out := stdout.String()
-	for _, want := range []string{"SESSION\tslow-session", "STATUS\tcommitted", "TURN_ID\tturn-000001"} {
-		if !strings.Contains(out, want) {
-			t.Fatalf("send output missing %q:\n%s", want, out)
-		}
-	}
-	assertCLILastSeqPresent(t, out)
-	if stderr.String() != "" {
-		t.Fatalf("stderr = %q, want empty", stderr.String())
-	}
-}
-
-func TestSendWithoutSessionUsesNearestProjectSession(t *testing.T) {
-	home := t.TempDir()
-	projectDir := t.TempDir()
-	childDir := filepath.Join(projectDir, "child")
-	if err := os.MkdirAll(childDir, 0o755); err != nil {
-		t.Fatalf("MkdirAll(childDir) error = %v", err)
-	}
-	configDir := filepath.Join(childDir, ".agents")
-	modelServer, requests := newCLIRunServer(t,
-		`{"choices":[{"delta":{"content":"nearest reply"}}]}`,
-		`[DONE]`,
-	)
-	defer modelServer.Close()
-	writeCLIRunFixtureInDir(t, configDir, modelServer.URL, "direct-secret-value", "openai-chat")
-	projectStore := cliProjectStore(t, home)
-	parent, _, err := projectStore.Create(projectDir, "Parent")
-	if err != nil {
-		t.Fatalf("Create(parent) error = %v", err)
-	}
-	child, _, err := projectStore.Create(childDir, "Child")
-	if err != nil {
-		t.Fatalf("Create(child) error = %v", err)
-	}
-	sessionStore := cliSessionStore(t, home)
-	sessionConfig := filepath.Join(configDir, "sai.yaml")
-	if _, err := sessionStore.SaveMetadata(sessions.SessionV2{ID: "parent-session", ProjectID: parent.ID, CreatedCWD: parent.Root, CWD: parent.Root, ConfigPath: sessionConfig, Provider: "fake", ModelProfile: "default", ModelID: "model-default", SaveToolResults: true}); err != nil {
-		t.Fatalf("SaveMetadata(parent session) error = %v", err)
-	}
-	if _, err := sessionStore.SaveMetadata(sessions.SessionV2{ID: "older-session", ProjectID: child.ID, CreatedCWD: child.Root, CWD: child.Root, ConfigPath: sessionConfig, Provider: "fake", ModelProfile: "default", ModelID: "model-default", SaveToolResults: true}); err != nil {
-		t.Fatalf("SaveMetadata(older session) error = %v", err)
-	}
-	if _, err := sessionStore.SaveMetadata(sessions.SessionV2{ID: "latest-session", ProjectID: child.ID, CreatedCWD: child.Root, CWD: child.Root, ConfigPath: sessionConfig, Provider: "fake", ModelProfile: "default", ModelID: "model-default", SaveToolResults: true}); err != nil {
-		t.Fatalf("SaveMetadata(latest session) error = %v", err)
-	}
-	forbidCLIBackgroundStart(t)
-	prompt := "project scoped prompt"
-
-	var stdout, stderr bytes.Buffer
-	code := RunWithGetwd([]string{"--server-root", home, "send", "--prompt", prompt}, &stdout, &stderr, func() (string, error) {
-		return childDir, nil
-	})
-
-	if code != 0 {
-		t.Fatalf("send code = %d, stderr = %s", code, stderr.String())
-	}
-	request := receiveCLIRunRequest(t, requests)
-	assertMessage(t, requestMessages(t, request.Body), 1, "user", prompt)
-	assertNoAdditionalCLIRunRequest(t, requests)
-	out := stdout.String()
-	for _, want := range []string{"SESSION\tlatest-session", "STATUS\tcommitted", "TURN_ID\tturn-000001"} {
-		if !strings.Contains(out, want) {
-			t.Fatalf("send output missing %q:\n%s", want, out)
-		}
-	}
-	assertCLILastSeqPresent(t, out)
-	assertCLIErrorOmits(t, out, prompt, "direct-secret-value", "parent-session", "older-session")
-	if stderr.String() != "" {
-		t.Fatalf("stderr = %q, want empty", stderr.String())
-	}
-}
-
-func TestSendWithoutSessionFailsWithoutRegisteredNearestProject(t *testing.T) {
-	home := t.TempDir()
-	projectDir := t.TempDir()
-	forbidCLIBackgroundStart(t)
-
-	var stdout, stderr bytes.Buffer
-	code := RunWithGetwd([]string{"--server-root", home, "send", "--prompt", "hello"}, &stdout, &stderr, func() (string, error) {
-		return projectDir, nil
-	})
-
-	if code != 1 {
-		t.Fatalf("send code = %d, want 1", code)
-	}
-	if stdout.String() != "" {
-		t.Fatalf("stdout = %q, want empty", stdout.String())
-	}
-	assertCLIErrorContains(t, stderr.String(), "no registered project found from", `run "sai project create"`)
-}
-
-func TestSendWithoutSessionFailsWhenProjectHasNoSessions(t *testing.T) {
-	home := t.TempDir()
-	projectDir := t.TempDir()
-	project, _, err := cliProjectStore(t, home).Create(projectDir, "Current")
-	if err != nil {
-		t.Fatalf("Create(project) error = %v", err)
-	}
-	forbidCLIBackgroundStart(t)
-
-	var stdout, stderr bytes.Buffer
-	code := RunWithGetwd([]string{"--server-root", home, "send", "--prompt", "hello"}, &stdout, &stderr, func() (string, error) {
-		return projectDir, nil
-	})
-
-	if code != 1 {
-		t.Fatalf("send code = %d, want 1", code)
-	}
-	if stdout.String() != "" {
-		t.Fatalf("stdout = %q, want empty", stdout.String())
-	}
-	assertCLIErrorContains(t, stderr.String(), "no sessions found for project "+project.ID, "session create", "send --new")
-	assertCLIErrorOmits(t, stderr.String(), "attach --new")
-}
-
-func TestSendNewCreatesSessionThenSendsWithExecutionService(t *testing.T) {
-	home := t.TempDir()
-	projectDir := t.TempDir()
-	configDir := filepath.Join(projectDir, ".agents")
-	modelServer, requests := newCLIRunServer(t,
-		`{"choices":[{"delta":{"content":"new reply"}}]}`,
-		`[DONE]`,
-	)
-	defer modelServer.Close()
-	writeCLIRunFixtureInDirWithTools(t, configDir, modelServer.URL, "direct-secret-value", "openai-chat", []string{"read_file"})
-	mcpExitFile := filepath.Join(t.TempDir(), "mcp-exited")
-	writeCLIRunMCPServerFixture(t, filepath.Join(configDir, "mcp"), "local", mcpExitFile, true)
-	setCLIAgentShowReasoning(t, configDir, true)
-	skillDir := filepath.Join(configDir, "skills", "visible")
-	if err := os.MkdirAll(skillDir, 0o755); err != nil {
-		t.Fatalf("MkdirAll(skillDir) error = %v", err)
-	}
-	writeCLIFile(t, filepath.Join(skillDir, "SKILL.md"), "---\nname: Visible Skill\n---\nVisible skill instructions\n")
-	hiddenSkillDir := filepath.Join(configDir, "skills", "hidden")
-	if err := os.MkdirAll(hiddenSkillDir, 0o755); err != nil {
-		t.Fatalf("MkdirAll(hiddenSkillDir) error = %v", err)
-	}
-	writeCLIFile(t, filepath.Join(hiddenSkillDir, "SKILL.md"), "---\ndisable-model-invocation: true\n---\nHidden skill instructions\n")
-	canonicalRoot, err := projectstore.CanonicalRoot(projectDir)
-	if err != nil {
-		t.Fatalf("CanonicalRoot(%q) error = %v", projectDir, err)
-	}
-	configPath := filepath.Join(configDir, "sai.yaml")
-	project, _, err := cliProjectStore(t, home).Create(projectDir, "Current")
-	if err != nil {
-		t.Fatalf("Create(project) error = %v", err)
-	}
-	forbidCLIBackgroundStart(t)
-	prompt := "new prompt body"
-
-	var stdout, stderr bytes.Buffer
-	code := RunWithGetwd([]string{"--server-root", home, "send", "--new", "--cwd", projectDir, "--prompt", prompt}, &stdout, &stderr, func() (string, error) {
-		return "", errors.New("getwd should not be called")
-	})
-
-	if code != 0 {
-		t.Fatalf("send --new code = %d, stderr = %s", code, stderr.String())
-	}
-	infos, err := cliSessionStore(t, home).ListWithOptions(sessions.V2ListOptions{})
-	if err != nil {
-		t.Fatalf("ListWithOptions() error = %v", err)
-	}
-	if len(infos) != 1 {
-		t.Fatalf("stored sessions = %#v, want one session", infos)
-	}
-	session, err := cliSessionStore(t, home).Load(infos[0].ID)
-	if err != nil {
-		t.Fatalf("Load(created session) error = %v", err)
-	}
-	if session.ProjectID != project.ID || session.CreatedCWD != canonicalRoot || session.RootConfigPath() != configPath {
-		t.Fatalf("created session metadata = %#v, want project/cwd/config", session)
-	}
-	if session.Provider != "fake" || session.ModelProfile != "default" || session.ModelID != "model-default" {
-		t.Fatalf("created session model metadata = %#v", session)
-	}
-	if got := fmt.Sprint(session.ModelParameters["max_tokens"]); got != "128" {
-		t.Fatalf("model_parameters.max_tokens = %s, want 128", got)
-	}
-	if !reflect.DeepEqual(session.EnabledTools, []string{"read_file"}) || !reflect.DeepEqual(session.EnabledMCP, []string{"local"}) || !reflect.DeepEqual(session.EnabledSkills, []string{"visible"}) {
-		t.Fatalf("created session enabled metadata = tools %#v mcp %#v skills %#v", session.EnabledTools, session.EnabledMCP, session.EnabledSkills)
-	}
-	if !session.ShowReasoning || !session.SaveToolResults {
-		t.Fatalf("created session booleans = show %v save %v, want true/true", session.ShowReasoning, session.SaveToolResults)
-	}
-	request := receiveCLIRunRequest(t, requests)
-	if got := countCLIRequestMessagesWithContent(t, requestMessages(t, request.Body), "user", prompt); got != 1 {
-		t.Fatalf("request user prompt count = %d, want 1", got)
-	}
-	assertNoAdditionalCLIRunRequest(t, requests)
-	out := stdout.String()
-	for _, want := range []string{"SESSION\t" + session.ID, "STATUS\tcommitted", "TURN_ID\tturn-000001"} {
-		if !strings.Contains(out, want) {
-			t.Fatalf("send --new output missing %q:\n%s", want, out)
-		}
-	}
-	assertCLILastSeqPresent(t, out)
-	assertCLIErrorOmits(t, out, prompt, "direct-secret-value", "Hidden skill instructions")
-	if stderr.String() != "" {
-		t.Fatalf("stderr = %q, want empty", stderr.String())
-	}
-	assertCLIFileEventuallyContains(t, mcpExitFile, "closed")
-}
-
-func TestSendNewFailsWithoutRegisteredNearestProject(t *testing.T) {
-	home := t.TempDir()
-	projectDir := t.TempDir()
-	forbidCLIBackgroundStart(t)
-
-	var stdout, stderr bytes.Buffer
-	code := RunWithGetwd([]string{"--server-root", home, "send", "--new", "--cwd", projectDir, "--prompt", "hello"}, &stdout, &stderr, func() (string, error) {
-		return "", errors.New("getwd should not be called")
-	})
-
-	if code != 1 {
-		t.Fatalf("send --new code = %d, want 1", code)
-	}
-	if stdout.String() != "" {
-		t.Fatalf("stdout = %q, want empty", stdout.String())
-	}
-	assertCLIErrorContains(t, stderr.String(), "no registered project found from", `run "sai project create"`)
-}
-
-func TestSendErrorDoesNotLeakPromptOrProviderMessage(t *testing.T) {
-	home := t.TempDir()
-	projectDir := t.TempDir()
-	configDir := filepath.Join(projectDir, ".agents")
-	prompt := "SECRET prompt body"
-	modelServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		http.Error(w, "SECRET prompt body assistant body secret tool body secret", http.StatusInternalServerError)
-	}))
-	defer modelServer.Close()
-	writeCLIRunFixtureInDir(t, configDir, modelServer.URL, "direct-secret-value", "openai-chat")
-	if _, err := cliSessionStore(t, home).SaveMetadata(sessions.SessionV2{
-		ID:              "existing-session",
-		CreatedCWD:      projectDir,
-		CWD:             projectDir,
-		ConfigPath:      filepath.Join(configDir, "sai.yaml"),
-		Provider:        "fake",
-		ModelProfile:    "default",
-		ModelID:         "model-default",
-		SaveToolResults: true,
-	}); err != nil {
-		t.Fatalf("SaveMetadata(existing session) error = %v", err)
-	}
-	forbidCLIBackgroundStart(t)
-
-	var stdout, stderr bytes.Buffer
-	code := RunWithGetwd([]string{"--server-root", home, "send", "existing-session", "--prompt", prompt}, &stdout, &stderr, func() (string, error) {
-		return "", errors.New("getwd should not be called")
-	})
-
-	if code != 1 {
-		t.Fatalf("send code = %d, want 1", code)
-	}
-	if stdout.String() != "" {
-		t.Fatalf("stdout = %q, want empty", stdout.String())
-	}
-	assertCLIErrorContains(t, stderr.String(), "turn failed")
-	assertCLIErrorOmits(t, stderr.String(), prompt, "assistant body secret", "tool body secret", "direct-secret-value")
-}
-
-func TestAttachExplicitUsesExecutionServiceWithoutCWDDiscovery(t *testing.T) {
+func TestSessionResumeUsesExecutionServiceWithoutCWDDiscovery(t *testing.T) {
 	home := t.TempDir()
 	projectDir := t.TempDir()
 	configDir := filepath.Join(projectDir, ".agents")
@@ -8300,12 +7886,12 @@ func TestAttachExplicitUsesExecutionServiceWithoutCWDDiscovery(t *testing.T) {
 	forbidCLIBackgroundStart(t)
 
 	var stdout, stderr bytes.Buffer
-	code := RunWithIO([]string{"--server-root", home, "attach", "existing-session"}, strings.NewReader("/quit\n"), &stdout, &stderr, func() (string, error) {
+	code := RunWithIO([]string{"--server-root", home, "session", "resume", "existing-session"}, strings.NewReader("/quit\n"), &stdout, &stderr, func() (string, error) {
 		return "", errors.New("getwd should not be called")
 	})
 
 	if code != 0 {
-		t.Fatalf("attach code = %d, stderr = %s", code, stderr.String())
+		t.Fatalf("session resume code = %d, stderr = %s", code, stderr.String())
 	}
 	if stdout.String() != "" {
 		t.Fatalf("stdout = %q, want empty", stdout.String())
@@ -8314,7 +7900,7 @@ func TestAttachExplicitUsesExecutionServiceWithoutCWDDiscovery(t *testing.T) {
 	assertCLIErrorOmits(t, stderr.String(), "direct-secret-value")
 }
 
-func TestAttachExplicitOmitsCWDDiscovery(t *testing.T) {
+func TestSessionResumeOmitsCWDDiscovery(t *testing.T) {
 	home := t.TempDir()
 	projectDir := t.TempDir()
 	configDir := filepath.Join(projectDir, ".agents")
@@ -8323,12 +7909,12 @@ func TestAttachExplicitOmitsCWDDiscovery(t *testing.T) {
 	forbidCLIBackgroundStart(t)
 
 	var stdout, stderr bytes.Buffer
-	code := RunWithIO([]string{"--server-root", home, "attach", "existing-session"}, strings.NewReader("/quit\n"), &stdout, &stderr, func() (string, error) {
+	code := RunWithIO([]string{"--server-root", home, "session", "resume", "existing-session"}, strings.NewReader("/quit\n"), &stdout, &stderr, func() (string, error) {
 		return "", errors.New("getwd should not be called")
 	})
 
 	if code != 0 {
-		t.Fatalf("attach explicit code = %d, stderr = %s", code, stderr.String())
+		t.Fatalf("session resume code = %d, stderr = %s", code, stderr.String())
 	}
 	if stdout.String() != "" {
 		t.Fatalf("stdout = %q, want empty", stdout.String())
@@ -8337,7 +7923,7 @@ func TestAttachExplicitOmitsCWDDiscovery(t *testing.T) {
 	assertCLIErrorOmits(t, stderr.String(), "direct-secret-value")
 }
 
-func TestAttachExistingRendersSnapshotAndStreamsAfterNewestSeq(t *testing.T) {
+func TestSessionResumeRendersSnapshotAndStreamsAfterNewestSeq(t *testing.T) {
 	home := t.TempDir()
 	projectDir := t.TempDir()
 	configDir := filepath.Join(projectDir, ".agents")
@@ -8379,12 +7965,12 @@ func TestAttachExistingRendersSnapshotAndStreamsAfterNewestSeq(t *testing.T) {
 	forbidCLIBackgroundStart(t)
 
 	var stdout, stderr bytes.Buffer
-	code := RunWithIO([]string{"--server-root", home, "attach", "existing-session"}, strings.NewReader("/quit\n"), &stdout, &stderr, func() (string, error) {
+	code := RunWithIO([]string{"--server-root", home, "session", "resume", "existing-session"}, strings.NewReader("/quit\n"), &stdout, &stderr, func() (string, error) {
 		return "", errors.New("getwd should not be called")
 	})
 
 	if code != 0 {
-		t.Fatalf("attach code = %d, stderr = %s", code, stderr.String())
+		t.Fatalf("session resume code = %d, stderr = %s", code, stderr.String())
 	}
 	if got, want := stdout.String(), "user: hello snapshot\nassistant: assistant preview\n"; got != want {
 		t.Fatalf("stdout = %q, want snapshot %q", got, want)
@@ -8393,7 +7979,7 @@ func TestAttachExistingRendersSnapshotAndStreamsAfterNewestSeq(t *testing.T) {
 	assertCLIErrorOmits(t, stderr.String(), "hidden summary secret", "debug secret", "direct-secret-value")
 }
 
-func TestAttachExistingRejectsCWDAndConfigBeforeDiscovery(t *testing.T) {
+func TestSessionResumeRejectsCWDAndConfigBeforeDiscovery(t *testing.T) {
 	projectDir := t.TempDir()
 	missingConfig := filepath.Join(t.TempDir(), "missing.yaml")
 	tests := []struct {
@@ -8403,18 +7989,18 @@ func TestAttachExistingRejectsCWDAndConfigBeforeDiscovery(t *testing.T) {
 	}{
 		{
 			name: "explicit id cwd",
-			args: []string{"attach", "existing-session", "--cwd", projectDir},
-			want: "--cwd can only be used when creating a new session with --new",
+			args: []string{"session", "resume", "existing-session", "--cwd", projectDir},
+			want: "--cwd cannot be used when resuming an existing session",
 		},
 		{
 			name: "explicit id config",
-			args: []string{"--config", missingConfig, "attach", "existing-session"},
-			want: "--config can only be used when creating a new session with --new",
+			args: []string{"--config", missingConfig, "session", "resume", "existing-session"},
+			want: "--config cannot be used when resuming an existing session",
 		},
 		{
 			name: "explicit id config after command",
-			args: []string{"attach", "existing-session", "--config", missingConfig},
-			want: "--config can only be used when creating a new session with --new",
+			args: []string{"session", "resume", "existing-session", "--config", missingConfig},
+			want: "--config cannot be used when resuming an existing session",
 		},
 	}
 
@@ -8425,19 +8011,15 @@ func TestAttachExistingRejectsCWDAndConfigBeforeDiscovery(t *testing.T) {
 				return "", errors.New("getwd should not be called")
 			})
 			if code != 1 {
-				t.Fatalf("attach code = %d, want 1", code)
+				t.Fatalf("session resume code = %d, want 1", code)
 			}
 			if stdout.String() != "" {
 				t.Fatalf("stdout = %q, want empty", stdout.String())
 			}
-			assertCLIErrorContains(t, stderr.String(), tt.want, `Run "sai help attach" for usage.`)
+			assertCLIErrorContains(t, stderr.String(), tt.want, `Run "sai help session resume" for usage.`)
 			assertCLIErrorOmits(t, stderr.String(), "getwd should not be called", "no healthy sai server found")
 		})
 	}
-}
-
-func TestAttachWithoutSessionPendingFirstPromptCreatesStreamsAndSends(t *testing.T) {
-	runPendingAttachFirstPrompt(t, []string{"attach"})
 }
 
 func TestBareDefaultAttachPendingFirstPromptCreatesStreamsAndSends(t *testing.T) {
@@ -8540,7 +8122,7 @@ func TestPendingAttachNoIDUsesConfigAndCWDOverridesOnFirstPrompt(t *testing.T) {
 	forbidCLIBackgroundStart(t)
 
 	var stdout, stderr bytes.Buffer
-	code := RunWithIO([]string{"--server-root", home, "attach", "--config", configPath, "--cwd", childDir}, strings.NewReader(prompt+"\n/quit\n"), &stdout, &stderr, func() (string, error) {
+	code := RunWithIO([]string{"--server-root", home, "--config", configPath, "--cwd", childDir}, strings.NewReader(prompt+"\n/quit\n"), &stdout, &stderr, func() (string, error) {
 		return "", errors.New("getwd should not be called")
 	})
 
@@ -8573,26 +8155,47 @@ func TestPendingAttachNoIDUsesConfigAndCWDOverridesOnFirstPrompt(t *testing.T) {
 	assertCLIErrorOmits(t, stderr.String(), prompt, "direct-secret-value")
 }
 
-func TestAttachWithoutSessionFailsWithoutRegisteredNearestProject(t *testing.T) {
+func TestBareDefaultAttachAutoCreatesProjectBeforeFirstPrompt(t *testing.T) {
 	home := t.TempDir()
 	projectDir := t.TempDir()
 	forbidCLIBackgroundStart(t)
 
 	var stdout, stderr bytes.Buffer
-	code := RunWithIO([]string{"--server-root", home, "attach"}, strings.NewReader("/quit\n"), &stdout, &stderr, func() (string, error) {
+	code := RunWithIO([]string{"--server-root", home}, strings.NewReader("/quit\n"), &stdout, &stderr, func() (string, error) {
 		return projectDir, nil
 	})
 
-	if code != 1 {
-		t.Fatalf("attach code = %d, want 1", code)
+	if code != 0 {
+		t.Fatalf("bare attach code = %d, stderr = %s", code, stderr.String())
 	}
 	if stdout.String() != "" {
 		t.Fatalf("stdout = %q, want empty", stdout.String())
 	}
-	assertCLIErrorContains(t, stderr.String(), "no registered project found from", `run "sai project create"`)
+	assertCLIErrorOmits(t, stderr.String(), "attached to session", "no registered project found")
+	projects, err := cliProjectStore(t, home).ListWithOptions(projectstore.ListOptions{})
+	if err != nil {
+		t.Fatalf("ListWithOptions(projects) error = %v", err)
+	}
+	if len(projects) != 1 {
+		t.Fatalf("projects = %#v, want one auto-created project", projects)
+	}
+	canonicalRoot, err := projectstore.CanonicalRoot(projectDir)
+	if err != nil {
+		t.Fatalf("CanonicalRoot(%q) error = %v", projectDir, err)
+	}
+	if projects[0].Root != canonicalRoot {
+		t.Fatalf("auto-created project root = %q, want %q", projects[0].Root, canonicalRoot)
+	}
+	infos, err := cliSessionStore(t, home).ListWithOptions(sessions.V2ListOptions{All: true})
+	if err != nil {
+		t.Fatalf("ListWithOptions(sessions) error = %v", err)
+	}
+	if len(infos) != 0 {
+		t.Fatalf("sessions = %#v, want none before first prompt", infos)
+	}
 }
 
-func TestAttachWithoutSessionImmediateQuitIgnoresExistingProjectSessions(t *testing.T) {
+func TestBareDefaultAttachImmediateQuitIgnoresExistingProjectSessions(t *testing.T) {
 	home := t.TempDir()
 	projectDir := t.TempDir()
 	project, _, err := cliProjectStore(t, home).Create(projectDir, "Current")
@@ -8605,7 +8208,7 @@ func TestAttachWithoutSessionImmediateQuitIgnoresExistingProjectSessions(t *test
 	forbidCLIBackgroundStart(t)
 
 	var stdout, stderr bytes.Buffer
-	code := RunWithIO([]string{"--server-root", home, "attach"}, strings.NewReader("/quit\n"), &stdout, &stderr, func() (string, error) {
+	code := RunWithIO([]string{"--server-root", home}, strings.NewReader("/quit\n"), &stdout, &stderr, func() (string, error) {
 		return projectDir, nil
 	})
 
@@ -8620,7 +8223,7 @@ func TestAttachWithoutSessionImmediateQuitIgnoresExistingProjectSessions(t *test
 	}
 }
 
-func TestAttachNewCreatesSessionStreamsAndSendsPrompts(t *testing.T) {
+func TestBareDefaultAttachCreatesSessionStreamsAndSendsPrompts(t *testing.T) {
 	home := t.TempDir()
 	projectDir := t.TempDir()
 	configDir := filepath.Join(projectDir, ".agents")
@@ -8657,12 +8260,12 @@ func TestAttachNewCreatesSessionStreamsAndSendsPrompts(t *testing.T) {
 	forbidCLIBackgroundStart(t)
 
 	var stdout, stderr bytes.Buffer
-	code := RunWithIO([]string{"--server-root", home, "attach", "--new", "--cwd", projectDir}, strings.NewReader(prompt+"\n/quit\n"), &stdout, &stderr, func() (string, error) {
+	code := RunWithIO([]string{"--server-root", home, "--cwd", projectDir}, strings.NewReader(prompt+"\n/quit\n"), &stdout, &stderr, func() (string, error) {
 		return "", errors.New("getwd should not be called")
 	})
 
 	if code != 0 {
-		t.Fatalf("attach --new code = %d, stderr = %s", code, stderr.String())
+		t.Fatalf("bare attach code = %d, stderr = %s", code, stderr.String())
 	}
 	request := receiveCLIRunRequest(t, requests)
 	if got := countCLIRequestMessagesWithContent(t, requestMessages(t, request.Body), "user", prompt); got != 1 {
@@ -8697,7 +8300,7 @@ func TestAttachNewCreatesSessionStreamsAndSendsPrompts(t *testing.T) {
 	assertCLIFileEventuallyContains(t, mcpExitFile, "closed")
 }
 
-func TestAttachNewPendingImmediateQuitCreatesNoSession(t *testing.T) {
+func TestBareDefaultAttachPendingImmediateQuitCreatesNoSession(t *testing.T) {
 	home := t.TempDir()
 	projectDir := t.TempDir()
 	if _, _, err := cliProjectStore(t, home).Create(projectDir, "Current"); err != nil {
@@ -8706,12 +8309,12 @@ func TestAttachNewPendingImmediateQuitCreatesNoSession(t *testing.T) {
 	forbidCLIBackgroundStart(t)
 
 	var stdout, stderr bytes.Buffer
-	code := RunWithIO([]string{"--server-root", home, "attach", "--new", "--cwd", projectDir}, strings.NewReader("/quit\n"), &stdout, &stderr, func() (string, error) {
+	code := RunWithIO([]string{"--server-root", home, "--cwd", projectDir}, strings.NewReader("/quit\n"), &stdout, &stderr, func() (string, error) {
 		return "", errors.New("getwd should not be called")
 	})
 
 	if code != 0 {
-		t.Fatalf("attach --new code = %d, stderr = %s", code, stderr.String())
+		t.Fatalf("bare attach code = %d, stderr = %s", code, stderr.String())
 	}
 	if stdout.String() != "" {
 		t.Fatalf("stdout = %q, want empty", stdout.String())
@@ -8757,26 +8360,7 @@ func TestPendingAttachCompactBeforeFirstMessageDoesNotCreateSession(t *testing.T
 	}
 }
 
-func TestAttachNewFailsWithoutRegisteredNearestProject(t *testing.T) {
-	home := t.TempDir()
-	projectDir := t.TempDir()
-	forbidCLIBackgroundStart(t)
-
-	var stdout, stderr bytes.Buffer
-	code := RunWithIO([]string{"--server-root", home, "attach", "--new", "--cwd", projectDir}, strings.NewReader("/quit\n"), &stdout, &stderr, func() (string, error) {
-		return "", errors.New("getwd should not be called")
-	})
-
-	if code != 1 {
-		t.Fatalf("attach --new code = %d, want 1", code)
-	}
-	if stdout.String() != "" {
-		t.Fatalf("stdout = %q, want empty", stdout.String())
-	}
-	assertCLIErrorContains(t, stderr.String(), "no registered project found from", `run "sai project create"`)
-}
-
-func TestAttachWaitsForTerminalStreamEventBeforeQuit(t *testing.T) {
+func TestSessionResumeWaitsForTerminalStreamEventBeforeQuit(t *testing.T) {
 	home := t.TempDir()
 	projectDir := t.TempDir()
 	configDir := filepath.Join(projectDir, ".agents")
@@ -8800,12 +8384,12 @@ func TestAttachWaitsForTerminalStreamEventBeforeQuit(t *testing.T) {
 	forbidCLIBackgroundStart(t)
 
 	var stdout, stderr bytes.Buffer
-	code := RunWithIO([]string{"--server-root", home, "attach", "existing-session"}, strings.NewReader(prompt+"\n/quit\n"), &stdout, &stderr, func() (string, error) {
+	code := RunWithIO([]string{"--server-root", home, "session", "resume", "existing-session"}, strings.NewReader(prompt+"\n/quit\n"), &stdout, &stderr, func() (string, error) {
 		return "", errors.New("getwd should not be called")
 	})
 
 	if code != 0 {
-		t.Fatalf("attach delayed code = %d, stderr = %s", code, stderr.String())
+		t.Fatalf("session resume delayed code = %d, stderr = %s", code, stderr.String())
 	}
 	if got, want := stdout.String(), "delayed text\n"; got != want {
 		t.Fatalf("stdout = %q, want delayed terminal stream text %q", got, want)
@@ -8813,7 +8397,7 @@ func TestAttachWaitsForTerminalStreamEventBeforeQuit(t *testing.T) {
 	assertCLIErrorOmits(t, stderr.String(), prompt, "direct-secret-value")
 }
 
-func TestAttachFailedTurnWaitsForDelayedTurnFailed(t *testing.T) {
+func TestSessionResumeFailedTurnWaitsForDelayedTurnFailed(t *testing.T) {
 	home := t.TempDir()
 	projectDir := t.TempDir()
 	configDir := filepath.Join(projectDir, ".agents")
@@ -8827,12 +8411,12 @@ func TestAttachFailedTurnWaitsForDelayedTurnFailed(t *testing.T) {
 	forbidCLIBackgroundStart(t)
 
 	var stdout, stderr bytes.Buffer
-	code := RunWithIO([]string{"--server-root", home, "attach", "existing-session"}, strings.NewReader(prompt+"\n/quit\n"), &stdout, &stderr, func() (string, error) {
+	code := RunWithIO([]string{"--server-root", home, "session", "resume", "existing-session"}, strings.NewReader(prompt+"\n/quit\n"), &stdout, &stderr, func() (string, error) {
 		return "", errors.New("getwd should not be called")
 	})
 
 	if code != 0 {
-		t.Fatalf("attach failed turn code = %d, stderr = %s", code, stderr.String())
+		t.Fatalf("session resume failed turn code = %d, stderr = %s", code, stderr.String())
 	}
 	if stdout.String() != "" {
 		t.Fatalf("stdout = %q, want empty", stdout.String())
@@ -8841,7 +8425,7 @@ func TestAttachFailedTurnWaitsForDelayedTurnFailed(t *testing.T) {
 	assertCLIErrorOmits(t, stderr.String(), "send failed", prompt, "assistant secret", "direct-secret-value")
 }
 
-func TestAttachMultilineCompactIsSentAsPrompt(t *testing.T) {
+func TestSessionResumeMultilineCompactIsSentAsPrompt(t *testing.T) {
 	home := t.TempDir()
 	projectDir := t.TempDir()
 	configDir := filepath.Join(projectDir, ".agents")
@@ -8855,12 +8439,12 @@ func TestAttachMultilineCompactIsSentAsPrompt(t *testing.T) {
 	forbidCLIBackgroundStart(t)
 
 	var stdout, stderr bytes.Buffer
-	code := RunWithIO([]string{"--server-root", home, "attach", "existing-session"}, strings.NewReader("\"\"\"\n/compact\n\"\"\"\n/quit\n"), &stdout, &stderr, func() (string, error) {
+	code := RunWithIO([]string{"--server-root", home, "session", "resume", "existing-session"}, strings.NewReader("\"\"\"\n/compact\n\"\"\"\n/quit\n"), &stdout, &stderr, func() (string, error) {
 		return "", errors.New("getwd should not be called")
 	})
 
 	if code != 0 {
-		t.Fatalf("attach multiline compact code = %d, stderr = %s", code, stderr.String())
+		t.Fatalf("session resume multiline compact code = %d, stderr = %s", code, stderr.String())
 	}
 	request := receiveCLIRunRequest(t, requests)
 	assertMessage(t, requestMessages(t, request.Body), 1, "user", "/compact")
@@ -8873,7 +8457,7 @@ func TestAttachMultilineCompactIsSentAsPrompt(t *testing.T) {
 	}
 }
 
-func TestAttachExistingCompactAndNormalMessageContainingCompact(t *testing.T) {
+func TestSessionResumeCompactAndNormalMessageContainingCompact(t *testing.T) {
 	home := t.TempDir()
 	projectDir := t.TempDir()
 	configDir := filepath.Join(projectDir, ".agents")
@@ -8896,12 +8480,12 @@ func TestAttachExistingCompactAndNormalMessageContainingCompact(t *testing.T) {
 	forbidCLIBackgroundStart(t)
 
 	var stdout, stderr bytes.Buffer
-	code := RunWithIO([]string{"--server-root", home, "attach", "existing-session"}, strings.NewReader("/compact\n"+prompt+"\n/quit\n"), &stdout, &stderr, func() (string, error) {
+	code := RunWithIO([]string{"--server-root", home, "session", "resume", "existing-session"}, strings.NewReader("/compact\n"+prompt+"\n/quit\n"), &stdout, &stderr, func() (string, error) {
 		return "", errors.New("getwd should not be called")
 	})
 
 	if code != 0 {
-		t.Fatalf("attach existing code = %d, stderr = %s", code, stderr.String())
+		t.Fatalf("session resume code = %d, stderr = %s", code, stderr.String())
 	}
 	summaryRequest := receiveCLIRunRequest(t, requests)
 	assertMessageContentContains(t, requestMessages(t, summaryRequest.Body), 0, "system", "Create a concise handoff checkpoint")
@@ -8924,7 +8508,7 @@ func TestAttachExistingCompactAndNormalMessageContainingCompact(t *testing.T) {
 	}
 }
 
-func TestAttachCompactWaitsWithoutDefaultHTTPTimeout(t *testing.T) {
+func TestSessionResumeCompactWaitsWithoutDefaultHTTPTimeout(t *testing.T) {
 	home := t.TempDir()
 	projectDir := t.TempDir()
 	configDir := filepath.Join(projectDir, ".agents")
@@ -8954,12 +8538,12 @@ func TestAttachCompactWaitsWithoutDefaultHTTPTimeout(t *testing.T) {
 	forbidCLIBackgroundStart(t)
 
 	var stdout, stderr bytes.Buffer
-	code := RunWithIO([]string{"--server-root", home, "attach", "existing-session"}, strings.NewReader("/compact\n/quit\n"), &stdout, &stderr, func() (string, error) {
+	code := RunWithIO([]string{"--server-root", home, "session", "resume", "existing-session"}, strings.NewReader("/compact\n/quit\n"), &stdout, &stderr, func() (string, error) {
 		return "", errors.New("getwd should not be called")
 	})
 
 	if code != 0 {
-		t.Fatalf("attach slow compact code = %d, stderr = %s", code, stderr.String())
+		t.Fatalf("session resume slow compact code = %d, stderr = %s", code, stderr.String())
 	}
 	_ = receiveCLIRunRequest(t, requests)
 	assertNoAdditionalCLIRunRequest(t, requests)

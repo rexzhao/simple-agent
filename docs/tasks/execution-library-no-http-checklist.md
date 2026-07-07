@@ -30,19 +30,19 @@ management 和 turn execution 收敛为进程内 execution library。M21 global-
 - [x] 删除 CLI 的 server auto-start、registry discovery、HTTP client 和 WebSocket client product path。
 - [x] 删除 `server` foreground/background/status/stop 产品命令。
 - [x] 删除当前 HTTP handlers、registry 和 startup lock 代码；未来 adapter 需要时另建薄适配层。
-- [ ] 裸 `sai` 在当前 cwd 无已注册 project 时自动创建 project，然后进入 pending 新 session。
-- [ ] 裸 `sai` 在当前 cwd 有已注册 ancestor project 时复用 nearest project 并进入 pending 新 session。
-- [ ] 新增 `session resume <id>` 作为已有 session 的交互恢复入口。
-- [ ] 从当前产品 help/docs 中移除 top-level `attach` 入口；实现可保留 hidden compatibility。
-- [ ] 删除或隐藏 `send` 产品命令和 help 入口。
+- [x] 裸 `sai` 在当前 cwd 无已注册 project 时自动创建 project，然后进入 pending 新 session。
+- [x] 裸 `sai` 在当前 cwd 有已注册 ancestor project 时复用 nearest project 并进入 pending 新 session。
+- [x] 新增 `session resume <id>` 作为已有 session 的交互恢复入口。
+- [x] 从当前产品 help/docs 中移除 top-level `attach` 入口；实现可保留 hidden compatibility。
+- [x] 删除或隐藏 `send` 产品命令和 help 入口。
 - [ ] 清理 docs/help/errors 中把 HTTP server 作为当前产品路径的描述。
 
 ## Acceptance Criteria
 
 - [x] CLI project/session commands 在没有 server、registry、HTTP client 或 WebSocket stream 的情况下工作。
 - [x] CLI attach/send/new/compact 只通过 execution library DTO/events 渲染输出。
-- [ ] CLI 默认入口自动发现或创建 project，并创建新 session 进入交互。
-- [ ] CLI 测试覆盖 `session resume <id>`、保留 project commands、隐藏/删除 send 产品入口。
+- [x] CLI 默认入口自动发现或创建 project，并创建新 session 进入交互。
+- [x] CLI 测试覆盖 `session resume <id>`、保留 project commands、隐藏/删除 send 产品入口。
 - [x] execution library 测试覆盖 storage root 初始化、project/session lifecycle、nearest project
   discovery、session selection、busy turn rejection、event streaming/persistence、compaction 和
   interrupted recovery。
@@ -88,3 +88,9 @@ management 和 turn execution 收敛为进程内 execution library。M21 global-
   前台/后台/status/stop 产品命令、registry/HTTP client/WebSocket product path 和 HTTP
   handlers。当前仍有一个后续分层项未收敛：agent runtime/provider/tool runner 仍作为
   execution runner adapter 留在 CLI 包中，后续若要更严格的库边界，应迁入 execution 层。
+- 2026-07-07 session-first CLI surface slice:
+  `go test ./internal/cli -run "Test(RootHelpWritesUsageWithoutConfig|SessionHelpWritesUsageWithoutConfig|SendCommandIsUnsupported|AttachCommandIsUnsupported|BareNewFlagIsUnsupported|BareDefaultAttach|SessionResume|PendingAttachNoIDUsesConfigAndCWDOverridesOnFirstPrompt)"`、
+  `go test ./internal/cli`、`go test ./...` 和 `git diff --check` 通过。覆盖裸
+  `sai` 自动创建缺失 project、复用 nearest registered project 进入 pending 新 session、
+  `sai session resume <id>` 恢复已有 session 的交互 REPL、top-level `attach`/`send`
+  产品命令与 help topic 被移除，以及 `sai --new` 不再作为兼容入口。
