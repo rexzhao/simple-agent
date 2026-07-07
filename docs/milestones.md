@@ -819,6 +819,9 @@ session writer，CLI client 通过 HTTP API 和 WebSocket 操作会话。HTTP / 
 
 ## M21：Global Singleton Server and Explicit Project/Session Lifecycle
 
+状态说明（2026-07-07）：后续实现不再继续推进 M21 的 HTTP/WS global server 产品路径。
+本节作为历史设计和已完成切片记录保留；当前目标见 M22。
+
 目标：直接替换 M20 的 scoped server identity。server 在同一 OS user、raw command basename 和
 home namespace 下全局唯一，可以管理多个 project。project 和 session 都必须显式创建；CLI
 client 需要 server 时 auto-start，并通过 explicit project/session API 操作 durable user-level
@@ -886,6 +889,39 @@ store。详细设计见 `docs/global-server-projects.md`，执行清单见
 - registry 测试覆盖 health-check reuse、stale overwrite 和 file lock double-start prevention。
 - shutdown 测试覆盖 immediate、`--wait` drain、timeout、signal semantics 和 interrupted recovery。
 - persistence 测试覆盖 JSONL/blob pagination、blob reachability 和 hidden/debug filtering。
+- `go test ./...` 通过。
+- `git diff --check` 通过。
+- task checklist 中记录 smoke evidence。
+
+## M22：Execution Library and Direct CLI (No HTTP Product Layer)
+
+目标：删除当前产品路径里的 HTTP/WS client-server 层，将 project/session lifecycle 和 turn
+execution 收敛为进程内 execution library。CLI 是展示层，直接调用 execution library；未来若需要跨
+终端访问，可以另做薄 HTTP adapter，但该 adapter 必须复用同一个 execution library，且不属于本阶段。
+
+交付物：
+
+- execution library 以记录存储位置（home/storage root）作为唯一必需初始化参数。
+- execution library 拥有 project store、session store、nearest project discovery、session
+  selection、turn lock、event persistence、compaction、runtime metadata 和 interrupted recovery。
+- CLI 只负责参数解析、交互输入和渲染，调用 execution library 的 DTO/event 接口。
+- CLI 不直接操作 provider adapters、tool execution、project/session stores、blob store 或
+  event projector；这些都由 execution library 拥有。
+- 删除当前产品路径中的 `server` 前台/后台命令、auto-start、registry、bearer token、HTTP client
+  helper、HTTP handlers 和 WebSocket stream。
+- 保留展示/执行边界所需的 session event DTO；attach/send/new/project/session 命令使用同一套
+  execution library API。
+- 不恢复 hardcoded chat product entry，也不保留 hidden chat alias。
+- future HTTP adapter、GUI 和跨终端共享能力均为 out of scope。
+
+验证：
+
+- CLI 测试覆盖 project/session create/list/show/remove、attach/send/new/compact，且不启动 server。
+- 测试覆盖 CLI product path 不访问 registry、HTTP client、HTTP handlers 或 WebSocket stream。
+- execution library 测试覆盖 storage root 初始化、project/session lifecycle、nearest project
+  discovery、session selection、busy turn rejection、event streaming/persistence、compaction 和
+  interrupted recovery。
+- `rg` 检查确认产品入口没有 `server` command、registry discovery、HTTP client 和 WebSocket attach。
 - `go test ./...` 通过。
 - `git diff --check` 通过。
 - task checklist 中记录 smoke evidence。

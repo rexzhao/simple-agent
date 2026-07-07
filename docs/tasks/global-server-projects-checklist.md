@@ -1,5 +1,9 @@
 # Global Singleton Server Projects Checklist
 
+状态说明（2026-07-07）：本清单作为 M21 global-server 方向的历史实现记录保留。后续不再继续推进
+HTTP/WS global server 产品路径；当前执行目标改由
+`docs/tasks/execution-library-no-http-checklist.md` 跟踪。
+
 这份清单用于 M21 实现阶段逐项执行。所有项目前保持未勾选，直到对应行为有代码、测试或 smoke
 evidence 证明。
 
