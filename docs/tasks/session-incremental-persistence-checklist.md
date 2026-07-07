@@ -60,7 +60,7 @@ GC, and auto-rerunning interrupted tools.
   `TurnInterrupted` carries **only `TurnID`** — the pending-tool set is the projector's
   own state (it created those items), not passed by orchestration (avoids under-marking
   when orchestration lacks the full pending set).
-- [ ] **Single-writer hard constraint**: projector is a single goroutine consuming a
+- [x] **Single-writer hard constraint**: projector is a single goroutine consuming a
   channel; durable `Publish` synchronously enqueues and waits for ack, so same-session
   durable events are strictly serialized. (Current store has no locks —
   `internal/sessions` has zero `sync.Mutex`/`Lock`; `appendRecord` is replay-then-write.
@@ -270,7 +270,7 @@ GC, and auto-rerunning interrupted tools.
 - [ ] `active_history` passes `validateActiveHistoryToolExchanges` at all times; a
   multi-tool assistant message's pending tool items are in the prefix and the prefix
   is legal before results arrive.
-- [ ] Same-session concurrent/sequential durable events are strictly serialized; seqs
+- [x] Same-session concurrent/sequential durable events are strictly serialized; seqs
   are contiguous (no gaps/duplicates); replay is correct (single-writer hard constraint).
 - [ ] **Session-level single-writer**: bus/projector creation is gated by a session turn
   lock (server `beginSessionTurn`); two concurrent turns on the same session never spawn
