@@ -140,7 +140,7 @@ GC, and auto-rerunning interrupted tools.
   bus + projector, pass publisher to agent, subscribe renderer. Remove end-of-turn
   `saveUpdatedMessages`/`SaveTurn` (`cli.go:4304/5166`); `TurnResult` still updates
   in-memory state.
-- [ ] Tests: CLI multi-tool turn, per-tool on-disk item status pending→completed;
+- [x] Tests: CLI multi-tool turn, per-tool on-disk item status pending→completed;
   mid-turn kill leaves completed results on disk.
 
 ## Phase 4 — Server path + catch-up

@@ -13,6 +13,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"runtime"
@@ -3846,6 +3847,28 @@ func TestCLIBackgroundHelperProcess(t *testing.T) {
 	}
 }
 
+func TestCLIChatSaveSessionHelperProcess(t *testing.T) {
+	if os.Getenv("SAI_CLI_CHAT_HELPER_PROCESS") != "1" {
+		return
+	}
+	args := os.Args
+	for len(args) > 0 && args[0] != "--" {
+		args = args[1:]
+	}
+	if len(args) == 0 {
+		os.Exit(2)
+	}
+	args = args[1:]
+	cwd := os.Getenv("SAI_CLI_CHAT_HELPER_CWD")
+	if len(args) == 0 || strings.TrimSpace(cwd) == "" {
+		os.Exit(2)
+	}
+	code := runLegacyChatWithIO(args, strings.NewReader(""), os.Stdout, os.Stderr, func() (string, error) {
+		return cwd, nil
+	})
+	os.Exit(code)
+}
+
 func TestServerCommandWiresSessionStoreToServerRootDataWithoutLoadingConfig(t *testing.T) {
 	registryPath := isolateCLIUserRegistry(t)
 	serverRoot := filepath.Dir(filepath.Dir(registryPath))
@@ -7117,6 +7140,167 @@ func TestChatSaveSessionCancelAfterCompletedToolKeepsCompletedResult(t *testing.
 	}
 }
 
+func TestChatSaveSessionProcessKillKeepsCompletedToolResult(t *testing.T) {
+	firstCommand := shellOutputCommandForCLI("first tool output")
+	secondStartedFile := "started-kill-second.txt"
+	secondReleaseFile := "release-kill-second.txt"
+	secondDoneFile := "done-kill-second.txt"
+	secondCommand := blockingShellCommandForCLIStartedReleaseDoneFiles(secondStartedFile, secondReleaseFile, secondDoneFile)
+	firstArgs, err := json.Marshal(map[string]any{
+		"command":    firstCommand,
+		"timeout_ms": 5000,
+	})
+	if err != nil {
+		t.Fatalf("Marshal(first shell args) error = %v", err)
+	}
+	secondArgs, err := json.Marshal(map[string]any{
+		"command":    secondCommand,
+		"timeout_ms": 10000,
+	})
+	if err != nil {
+		t.Fatalf("Marshal(second shell args) error = %v", err)
+	}
+	toolChunk := fmt.Sprintf(
+		`{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"shell","arguments":%q}},{"index":1,"id":"call_2","function":{"name":"shell","arguments":%q}}]}}]}`,
+		string(firstArgs),
+		string(secondArgs),
+	)
+	server, requests := newSequentialCLIRunServer(t,
+		[]string{
+			toolChunk,
+			`{"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`,
+			`[DONE]`,
+		},
+		[]string{
+			`{"choices":[{"delta":{"content":"unexpected final"}}]}`,
+			`[DONE]`,
+		},
+	)
+	defer server.Close()
+
+	projectDir := t.TempDir()
+	configDir := t.TempDir()
+	writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
+
+	args := []string{
+		"-test.run=TestCLIChatSaveSessionHelperProcess",
+		"--",
+		"--config", cliConfigPath(configDir),
+		"chat",
+		"--save-session",
+		"--quit",
+		"--enable-tools", "shell",
+		"--prompt", "Run until killed",
+	}
+	cmd := exec.Command(os.Args[0], args...)
+	cmd.Env = append(os.Environ(),
+		"SAI_CLI_CHAT_HELPER_PROCESS=1",
+		"SAI_CLI_CHAT_HELPER_CWD="+projectDir,
+	)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("Start(helper CLI) error = %v", err)
+	}
+	waitCh := make(chan error, 1)
+	go func() {
+		waitCh <- cmd.Wait()
+	}()
+	childDone := false
+	secondShellStarted := false
+	t.Cleanup(func() {
+		_ = os.WriteFile(filepath.Join(projectDir, secondReleaseFile), []byte("go"), 0o600)
+		if secondShellStarted {
+			waitForFile(t, filepath.Join(projectDir, secondDoneFile))
+		}
+		if childDone {
+			return
+		}
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+		}
+		select {
+		case <-waitCh:
+		case <-time.After(10 * time.Second):
+			t.Fatalf("timed out waiting for helper CLI cleanup; stdout=%q stderr=%q", stdout.String(), stderr.String())
+		}
+	})
+
+	firstRequest := receiveCLIRunRequest(t, requests)
+	assertCLIToolNames(t, firstRequest.Body, []string{"shell"})
+	sessionRoot := filepath.Join(configDir, "sessions")
+	session := waitForOnlyCLISession(t, sessionRoot)
+	store := sessions.NewV2Store(sessionRoot)
+	completed := waitForCLISessionToolCallStatus(t, store, session.ID, "call_1", sessions.ItemStatusCompleted)
+	if completed.Message == nil || !strings.Contains(completed.Message.Content, "first tool output") {
+		t.Fatalf("completed call_1 item = %#v, want first tool output before process kill", completed)
+	}
+	waitForFile(t, filepath.Join(projectDir, secondStartedFile))
+	secondShellStarted = true
+
+	if err := cmd.Process.Kill(); err != nil {
+		t.Fatalf("Kill(helper CLI) error = %v", err)
+	}
+	_ = os.WriteFile(filepath.Join(projectDir, secondReleaseFile), []byte("go"), 0o600)
+	waitForFile(t, filepath.Join(projectDir, secondDoneFile))
+	select {
+	case <-waitCh:
+		childDone = true
+	case <-time.After(10 * time.Second):
+		t.Fatalf("timed out waiting for killed helper CLI; stdout=%q stderr=%q", stdout.String(), stderr.String())
+	}
+	assertNoAdditionalCLIRunRequest(t, requests)
+
+	killed := loadCLISession(t, sessionRoot, session.ID)
+	toolsByCallID := toolItemsByCallID(killed.Items)
+	call1, ok := toolsByCallID["call_1"]
+	if !ok || call1.Status != sessions.ItemStatusCompleted || call1.Message == nil || !strings.Contains(call1.Message.Content, "first tool output") {
+		t.Fatalf("call_1 item after process kill = %#v, ok %v, want completed first output", call1, ok)
+	}
+	call2, ok := toolsByCallID["call_2"]
+	if !ok || call2.Status != sessions.ItemStatusPending {
+		t.Fatalf("call_2 item after process kill = %#v, ok %v, want pending crash fallback", call2, ok)
+	}
+
+	if marked, err := store.MarkRunningTurnsInterrupted(); err != nil {
+		t.Fatalf("MarkRunningTurnsInterrupted() error = %v", err)
+	} else if len(marked) != 1 || marked[0].ID != session.ID {
+		t.Fatalf("MarkRunningTurnsInterrupted() = %#v, want killed session", marked)
+	}
+	recovered := loadCLISession(t, sessionRoot, session.ID)
+	materialized, err := store.MaterializeActiveHistory(recovered)
+	if err != nil {
+		t.Fatalf("MaterializeActiveHistory() error = %v", err)
+	}
+	if err := validateActiveHistoryToolExchanges(recovered.ID, materialized); err != nil {
+		t.Fatalf("active history validation error = %v; messages=%#v", err, materialized)
+	}
+	if !materializedToolMessageContains(materialized, "call_1", "first tool output") {
+		t.Fatalf("materialized active history missing completed call_1 output: %#v", materialized)
+	}
+	if !materializedToolMessageContains(materialized, "call_2", "[tool execution interrupted]") {
+		t.Fatalf("materialized active history missing synthesized interrupted call_2: %#v", materialized)
+	}
+
+	events, err := store.PersistedEventsAfter(session.ID, 0)
+	if err != nil {
+		t.Fatalf("PersistedEventsAfter() error = %v", err)
+	}
+	var call1Updates, call2Updates int
+	for _, event := range events {
+		switch {
+		case event.Type == sessions.RecordTypeItemUpdated && event.ItemID == call1.ID:
+			call1Updates++
+		case event.Type == sessions.RecordTypeItemUpdated && event.ItemID == call2.ID:
+			call2Updates++
+		}
+	}
+	if call1Updates != 1 || call2Updates != 0 {
+		t.Fatalf("item.updated counts after process kill = call1:%d call2:%d, want 1/0: %#v", call1Updates, call2Updates, events)
+	}
+}
+
 func TestChatSaveSessionWithCompactionEnabledUsesProjectorPath(t *testing.T) {
 	server, requests := newSequentialCLIRunServer(t,
 		[]string{
@@ -8788,6 +8972,13 @@ func blockingShellCommandForCLIReleaseFile(filename, output string) string {
 		return fmt.Sprintf("while (!(Test-Path -LiteralPath '%s')) { Start-Sleep -Milliseconds 50 }; Write-Output '%s'", filename, output)
 	}
 	return fmt.Sprintf("while [ ! -f '%s' ]; do sleep 0.05; done; printf '%%s\\n' '%s'", filename, output)
+}
+
+func blockingShellCommandForCLIStartedReleaseDoneFiles(startedFilename, releaseFilename, doneFilename string) string {
+	if runtime.GOOS == "windows" {
+		return fmt.Sprintf("Set-Content -LiteralPath '%s' -Value 'started'; while (!(Test-Path -LiteralPath '%s')) { Start-Sleep -Milliseconds 50 }; Set-Content -LiteralPath '%s' -Value 'done'", startedFilename, releaseFilename, doneFilename)
+	}
+	return fmt.Sprintf(": > '%s'; while [ ! -f '%s' ]; do sleep 0.05; done; : > '%s'", startedFilename, releaseFilename, doneFilename)
 }
 
 func waitForOnlyCLISession(t *testing.T, root string) sessions.SessionV2 {
