@@ -288,7 +288,7 @@ GC, and auto-rerunning interrupted tools.
 - [x] Resume after crash shows completed tool results; unfinished tool items surface as
   interrupted error results; history is legal and a new turn can continue; no tool is
   auto-rerun.
-- [ ] Compaction is dispatched through the projector (`CompactionRequested` →
+- [x] Compaction is dispatched through the projector (`CompactionRequested` →
   `SaveCompactedTurn`, single atomic tx, **no turn items**), keeping the projector the
   sole writer; **only pre-turn compaction** exists (between `TurnStarted` and
   `TurnInputReady`, before the first `AssistantReady`); `TurnCompleted` does no
