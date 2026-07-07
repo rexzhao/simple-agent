@@ -558,19 +558,19 @@
 
 ## M23：Mailbox MCP Input Adapter
 
-- [ ] `sai --mailbox-mcp 127.0.0.1:PORT` 在前台 CLI 进程内启动本地 MCP mailbox server。
-- [ ] mailbox MCP 作为外部 agent 输入适配器，不提供 project/session 管理 API，不恢复旧
+- [x] `sai --mailbox-mcp 127.0.0.1:PORT` 在前台 CLI 进程内启动本地 MCP mailbox server。
+- [x] mailbox MCP 作为外部 agent 输入适配器，不提供 project/session 管理 API，不恢复旧
   HTTP/WS product layer。
-- [ ] CLI 是 mailbox 的唯一 worker；CLI idle 时从 mailbox 取 queued task 并通过 execution
+- [x] CLI 是 mailbox 的唯一 worker；CLI idle 时从 mailbox 取 queued task 并通过 execution
   library 执行。
-- [ ] stdin 行为保持现状，不新增纯 CLI turn 运行中的应用层输入队列或队列 UI。
-- [ ] MCP tools 覆盖 `mailbox_post`、`mailbox_get`、`mailbox_wait` 和 `mailbox_cancel`。
-- [ ] mailbox task result 只暴露最终 assistant output、状态和错误，不暴露中间过程、raw events、
+- [x] stdin 行为保持现状，不新增纯 CLI turn 运行中的应用层输入队列或队列 UI。
+- [x] MCP tools 覆盖 `mailbox_post`、`mailbox_get`、`mailbox_wait` 和 `mailbox_cancel`。
+- [x] mailbox task result 只暴露最终 assistant output、状态和错误，不暴露中间过程、raw events、
   hidden/debug item 或 tool result 正文。
-- [ ] `mailbox_wait` 支持 timeout，超时不取消任务。
-- [ ] `mailbox_cancel` 支持 queued 和 running mailbox task；running cancel 只取消当前 task/turn，
+- [x] `mailbox_wait` 支持 timeout，超时不取消任务。
+- [x] `mailbox_cancel` 支持 queued 和 running mailbox task；running cancel 只取消当前 task/turn，
   不退出 CLI。
-- [ ] mailbox MCP 默认只允许 localhost/127.0.0.1/[::1]，并实现本地连接保护。
-- [ ] `docs/tasks/mailbox-mcp-checklist.md` 记录实现 smoke evidence。
-- [ ] 验证 `go test ./...`。
-- [ ] 验证 `git diff --check`。
+- [x] mailbox MCP 默认只允许 localhost/127.0.0.1/[::1]，并实现本地连接保护。
+- [x] `docs/tasks/mailbox-mcp-checklist.md` 记录实现 smoke evidence。
+- [x] 验证 `go test ./...`。
+- [x] 验证 `git diff --check`。

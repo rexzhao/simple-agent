@@ -288,11 +288,14 @@ func execute(ctx context.Context, program string, args []string, stdin io.Reader
 		var stop func()
 		ctx, stop = contextWithInterruptCancel(ctx, interrupts)
 		defer stop()
-		return defaultSessionCommand(ctx, rootArgs.commandArgs, rootArgs.configPath, serverRoot, stdin, stdout, stderr, getwd, program)
+		return defaultSessionCommand(ctx, rootArgs.commandArgs, rootArgs.configPath, serverRoot, rootArgs.mailboxMCP, stdin, stdout, stderr, getwd, program)
 	}
 	var stop func()
 	ctx, stop = contextWithInterruptCancel(ctx, interrupts)
 	defer stop()
+	if rootArgs.mailboxMCP != "" && rootArgs.command != "help" && rootArgs.command != "session" {
+		return usageError("--mailbox-mcp can only be used with the default session or session resume", "", "sai help")
+	}
 
 	switch rootArgs.command {
 	case "help":
@@ -361,11 +364,14 @@ func execute(ctx context.Context, program string, args []string, stdin io.Reader
 			printSessionUsage(stdout, displayCommand)
 			return nil
 		}
+		if rootArgs.mailboxMCP != "" && subcommand != "resume" {
+			return usageError("--mailbox-mcp can only be used with the default session or session resume", "", "sai help session resume")
+		}
 		switch subcommand {
 		case "create":
 			return sessionCreateCommand(ctx, subArgs, rootArgs.configPath, serverRoot, stdout, getwd, program)
 		case "resume":
-			return sessionResumeCommand(ctx, subArgs, rootArgs.configProvided, serverRoot, stdin, stdout, stderr, program)
+			return sessionResumeCommand(ctx, subArgs, rootArgs.configProvided, serverRoot, rootArgs.mailboxMCP, stdin, stdout, stderr, program)
 		case "list":
 			return sessionListCommand(ctx, subArgs, rootArgs.configPath, rootArgs.configProvided, serverRoot, stdout, getwd, program)
 		case "show":
@@ -434,7 +440,7 @@ func contextWithInterruptCancel(ctx context.Context, interrupts <-chan struct{})
 	}
 }
 
-const rootUsageText = `usage: sai [--server-root dir] [--config file] [command] [args]
+const rootUsageText = `usage: sai [--server-root dir] [--config file] [--mailbox-mcp host:port] [command] [args]
 
 Commands:
   project           Manage registered projects
@@ -450,6 +456,9 @@ Commands:
 
 With no command, sai auto-creates a project for the current directory when
 needed, then starts a pending session.
+
+Use --mailbox-mcp host:port with the default session or session resume to
+accept MCP mailbox tasks while the foreground CLI is idle.
 
 Run "sai help <command>" for command usage.
 `
@@ -898,6 +907,7 @@ type rootArgs struct {
 	configPath     string
 	configProvided bool
 	serverRoot     string
+	mailboxMCP     string
 	command        string
 	commandArgs    []string
 	hasHelp        bool
@@ -906,6 +916,7 @@ type rootArgs struct {
 func splitRootArgs(args []string) (rootArgs, error) {
 	known := map[string]flagKind{
 		"config":         flagKindValue,
+		"mailbox-mcp":    flagKindValue,
 		"all-projects":   flagKindBool,
 		"archived":       flagKindBool,
 		"server-root":    flagKindValue,
@@ -963,7 +974,7 @@ func splitRootArgs(args []string) (rootArgs, error) {
 		if isHelpArg(arg) {
 			out.hasHelp = true
 		}
-		if name == "config" || name == "server-root" {
+		if name == "config" || name == "server-root" || name == "mailbox-mcp" {
 			value, next, err := flagValue(args, i, name, hasInlineValue)
 			if err != nil {
 				return rootArgs{}, usageError(err.Error(), "", "sai help")
@@ -971,8 +982,10 @@ func splitRootArgs(args []string) (rootArgs, error) {
 			if name == "config" {
 				out.configPath = value
 				out.configProvided = true
-			} else {
+			} else if name == "server-root" {
 				out.serverRoot = value
+			} else {
+				out.mailboxMCP = value
 			}
 			i = next
 			continue
@@ -1002,7 +1015,7 @@ func stripGlobalArgs(args rootArgs) (rootArgs, error) {
 			break
 		}
 		name, hasInlineValue := flagName(arg)
-		if isFlagArg(arg) && (name == "config" || name == "server-root") {
+		if isFlagArg(arg) && (name == "config" || name == "server-root" || name == "mailbox-mcp") {
 			value, next, err := flagValue(args.commandArgs, i, name, hasInlineValue)
 			if err != nil {
 				return rootArgs{}, usageError(err.Error(), "", "sai help")
@@ -1010,8 +1023,10 @@ func stripGlobalArgs(args rootArgs) (rootArgs, error) {
 			if name == "config" {
 				args.configPath = value
 				args.configProvided = true
-			} else {
+			} else if name == "server-root" {
 				args.serverRoot = value
+			} else {
+				args.mailboxMCP = value
 			}
 			i = next
 			continue
@@ -1789,7 +1804,7 @@ func executionSessionCreateMetadataFromDefaults(session sessions.SessionV2) exec
 	}
 }
 
-func sessionResumeCommand(ctx context.Context, args []string, configProvided bool, homePath string, stdin io.Reader, stdout, stderr io.Writer, program string) error {
+func sessionResumeCommand(ctx context.Context, args []string, configProvided bool, homePath string, mailboxAddr string, stdin io.Reader, stdout, stderr io.Writer, program string) error {
 	displayCommand := displayProgramName(program)
 	flags := flag.NewFlagSet("sai session resume", flag.ContinueOnError)
 	flags.String("cwd", "", "discovery working directory")
@@ -1807,10 +1822,28 @@ func sessionResumeCommand(ctx context.Context, args []string, configProvided boo
 	if err != nil {
 		return err
 	}
-	return resumeExecutionSessionREPL(ctx, service, positionals[0], stdin, stdout, stderr, displayCommand, "sai help session resume")
+	replCtx := ctx
+	var cancelMailbox context.CancelFunc
+	if mailboxAddr != "" {
+		replCtx, cancelMailbox = context.WithCancel(ctx)
+	}
+	mailbox, stopMailbox, err := startMailboxForREPL(replCtx, mailboxAddr, stderr, displayCommand)
+	if err != nil {
+		if cancelMailbox != nil {
+			cancelMailbox()
+		}
+		return err
+	}
+	defer func() {
+		if cancelMailbox != nil {
+			cancelMailbox()
+		}
+		stopMailbox()
+	}()
+	return resumeExecutionSessionREPL(replCtx, service, positionals[0], stdin, stdout, stderr, displayCommand, "sai help session resume", mailbox)
 }
 
-func defaultSessionCommand(ctx context.Context, args []string, configPath string, homePath string, stdin io.Reader, stdout, stderr io.Writer, getwd func() (string, error), program string) error {
+func defaultSessionCommand(ctx context.Context, args []string, configPath string, homePath string, mailboxAddr string, stdin io.Reader, stdout, stderr io.Writer, getwd func() (string, error), program string) error {
 	displayCommand := displayProgramName(program)
 	flags := flag.NewFlagSet("sai", flag.ContinueOnError)
 	cwdFlag := flags.String("cwd", "", "discovery working directory")
@@ -1830,10 +1863,28 @@ func defaultSessionCommand(ctx context.Context, args []string, configPath string
 	if err != nil {
 		return err
 	}
-	return runPendingAttachREPL(ctx, service, configPath, homePath, creationCWD, stdin, stdout, stderr, program)
+	replCtx := ctx
+	var cancelMailbox context.CancelFunc
+	if mailboxAddr != "" {
+		replCtx, cancelMailbox = context.WithCancel(ctx)
+	}
+	mailbox, stopMailbox, err := startMailboxForREPL(replCtx, mailboxAddr, stderr, displayCommand)
+	if err != nil {
+		if cancelMailbox != nil {
+			cancelMailbox()
+		}
+		return err
+	}
+	defer func() {
+		if cancelMailbox != nil {
+			cancelMailbox()
+		}
+		stopMailbox()
+	}()
+	return runPendingAttachREPL(replCtx, service, configPath, homePath, creationCWD, stdin, stdout, stderr, program, mailbox)
 }
 
-func resumeExecutionSessionREPL(ctx context.Context, service *execution.Service, sessionID string, stdin io.Reader, stdout, stderr io.Writer, displayCommand, helpCommand string) error {
+func resumeExecutionSessionREPL(ctx context.Context, service *execution.Service, sessionID string, stdin io.Reader, stdout, stderr io.Writer, displayCommand, helpCommand string, mailbox *mailboxQueue) error {
 	sessionID = strings.TrimSpace(sessionID)
 	if sessionID == "" {
 		return usageError("session id must be a non-empty string", "", helpCommand)
@@ -1848,33 +1899,64 @@ func resumeExecutionSessionREPL(ctx context.Context, service *execution.Service,
 	if _, err := fmt.Fprintf(stderr, "%s: attached to session %s\n", displayCommand, sessionID); err != nil {
 		return err
 	}
-	return runAttachREPL(ctx, service, sessionID, stdin, stdout, stderr, displayCommand)
+	return runAttachREPL(ctx, service, sessionID, stdin, stdout, stderr, displayCommand, mailbox)
 }
 
-func runPendingAttachREPL(ctx context.Context, service *execution.Service, configPath, serverRoot, creationCWD string, stdin io.Reader, stdout, stderr io.Writer, program string) error {
+func runPendingAttachREPL(ctx context.Context, service *execution.Service, configPath, serverRoot, creationCWD string, stdin io.Reader, stdout, stderr io.Writer, program string, mailbox *mailboxQueue) error {
 	displayCommand := displayProgramName(program)
 	if err := ensurePendingAttachProject(service, creationCWD, program); err != nil {
 		return err
 	}
 
 	scanner := bufio.NewScanner(stdin)
+	var inputCh <-chan chatInputEvent
+	var mailboxCh <-chan mailboxTaskRead
 	for {
-		line, multiline, ok, err := readChatInput(ctx, scanner, stderr)
-		if err != nil {
-			return err
+		if scanner != nil && inputCh == nil {
+			inputCh = startChatInputRead(ctx, scanner, stderr)
 		}
-		if !ok {
+		if mailbox != nil && mailboxCh == nil {
+			mailboxCh = startMailboxTaskRead(ctx, mailbox)
+		}
+		if inputCh == nil && mailboxCh == nil {
 			return nil
 		}
 
-		command := strings.TrimSpace(line)
+		var input chatInputEvent
+		select {
+		case input = <-inputCh:
+			inputCh = nil
+			if input.err != nil {
+				return input.err
+			}
+			if !input.ok {
+				scanner = nil
+				if mailbox == nil {
+					return nil
+				}
+				continue
+			}
+		case mailboxRead := <-mailboxCh:
+			mailboxCh = nil
+			if mailboxRead.err != nil {
+				return mailboxRead.err
+			}
+			if mailboxRead.task == nil {
+				continue
+			}
+			input = chatInputEvent{line: mailboxRead.task.Prompt, ok: true, mailboxTask: mailboxRead.task}
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+
+		command := strings.TrimSpace(input.line)
 		if command == "" {
 			continue
 		}
-		if !multiline && (command == "/exit" || command == "/quit") {
+		if input.mailboxTask == nil && !input.multiline && (command == "/exit" || command == "/quit") {
 			return nil
 		}
-		if !multiline && command == "/compact" {
+		if input.mailboxTask == nil && !input.multiline && command == "/compact" {
 			if _, err := fmt.Fprintf(stderr, "%s: compact requires a session; send a message first to create one\n", displayCommand); err != nil {
 				return err
 			}
@@ -1892,8 +1974,13 @@ func runPendingAttachREPL(ctx context.Context, service *execution.Service, confi
 		if _, err := fmt.Fprintf(stderr, "%s: attached to session %s\n", displayCommand, sessionID); err != nil {
 			return err
 		}
-		initialInput := chatInputEvent{line: line, multiline: multiline, ok: true}
-		return runAttachREPLWithScanner(ctx, service, sessionID, scanner, stdout, stderr, displayCommand, &initialInput)
+		initialInput := input
+		return runAttachREPLWithScanner(ctx, service, sessionID, scanner, stdout, stderr, displayCommand, attachREPLSources{
+			initialInput: &initialInput,
+			inputCh:      inputCh,
+			mailbox:      mailbox,
+			mailboxCh:    mailboxCh,
+		})
 	}
 }
 
@@ -1953,17 +2040,29 @@ type attachOutputState struct {
 }
 
 type attachSendResult struct {
-	result execution.SessionMessageResult
-	err    error
+	result        execution.SessionMessageResult
+	err           error
+	mailboxTask   *mailboxTask
+	mailboxOutput string
 }
 
-func runAttachREPL(ctx context.Context, service *execution.Service, sessionID string, stdin io.Reader, stdout, stderr io.Writer, displayCommand string) error {
+type attachREPLSources struct {
+	initialInput *chatInputEvent
+	inputCh      <-chan chatInputEvent
+	mailbox      *mailboxQueue
+	mailboxCh    <-chan mailboxTaskRead
+}
+
+func runAttachREPL(ctx context.Context, service *execution.Service, sessionID string, stdin io.Reader, stdout, stderr io.Writer, displayCommand string, mailbox *mailboxQueue) error {
 	scanner := bufio.NewScanner(stdin)
-	return runAttachREPLWithScanner(ctx, service, sessionID, scanner, stdout, stderr, displayCommand, nil)
+	return runAttachREPLWithScanner(ctx, service, sessionID, scanner, stdout, stderr, displayCommand, attachREPLSources{mailbox: mailbox})
 }
 
-func runAttachREPLWithScanner(ctx context.Context, service *execution.Service, sessionID string, scanner *bufio.Scanner, stdout, stderr io.Writer, displayCommand string, initialInput *chatInputEvent) error {
-	var inputCh <-chan chatInputEvent
+func runAttachREPLWithScanner(ctx context.Context, service *execution.Service, sessionID string, scanner *bufio.Scanner, stdout, stderr io.Writer, displayCommand string, sources attachREPLSources) error {
+	inheritedInputCh := sources.inputCh
+	inputCh := inheritedInputCh
+	mailbox := sources.mailbox
+	mailboxCh := sources.mailboxCh
 	var sendDone <-chan attachSendResult
 	var events <-chan execution.SessionStreamEvent
 	output := attachOutputState{stdoutAtLineStart: true}
@@ -2002,71 +2101,143 @@ func runAttachREPLWithScanner(ctx context.Context, service *execution.Service, s
 		return nil
 	}
 
-	if initialInput != nil {
+	var initialInputCh <-chan chatInputEvent
+	if sources.initialInput != nil {
 		ch := make(chan chatInputEvent, 1)
-		ch <- *initialInput
+		ch <- *sources.initialInput
 		close(ch)
+		initialInputCh = ch
 		inputCh = ch
 	}
 
+	handleInput := func(input chatInputEvent) (bool, error) {
+		command := strings.TrimSpace(input.line)
+		if command == "" {
+			return false, nil
+		}
+		if input.mailboxTask == nil && !input.multiline && (command == "/exit" || command == "/quit") {
+			return true, nil
+		}
+		if input.mailboxTask == nil && !input.multiline && command == "/compact" {
+			if _, err := service.CompactSession(ctx, sessionID); err != nil {
+				if _, printErr := fmt.Fprintf(stderr, "%s: compact failed: %v\n", displayCommand, err); printErr != nil {
+					return false, printErr
+				}
+				return false, nil
+			}
+			if _, err := fmt.Fprintf(stderr, "%s: compacted session context\n", displayCommand); err != nil {
+				return false, err
+			}
+			return false, nil
+		}
+
+		sendCtx := ctx
+		var taskCancel context.CancelFunc
+		if input.mailboxTask != nil {
+			sendCtx, taskCancel = context.WithCancel(ctx)
+			if !mailbox.startTask(input.mailboxTask, taskCancel) {
+				taskCancel()
+				return false, nil
+			}
+		}
+
+		done := make(chan attachSendResult, 1)
+		eventCh := make(chan execution.SessionStreamEvent, 64)
+		prompt := input.line
+		task := input.mailboxTask
+		sendDone = done
+		events = eventCh
+		turnInFlight = true
+		turnStarted = false
+		expectedTurnID = ""
+		terminalSeen = false
+		pendingSendErr = nil
+		terminalTurnIDs = make(map[string]bool)
+		go func() {
+			defer close(eventCh)
+			if taskCancel != nil {
+				defer taskCancel()
+			}
+			var mailboxOutput strings.Builder
+			result, err := service.SendSessionMessageWithEvents(sendCtx, sessionID, prompt, func(event execution.SessionStreamEvent) {
+				if task != nil && attachEventType(event) == "text.delta" {
+					text, _ := event["text"].(string)
+					mailboxOutput.WriteString(text)
+				}
+				select {
+				case eventCh <- event:
+				case <-sendCtx.Done():
+				}
+			})
+			done <- attachSendResult{result: result, err: err, mailboxTask: task, mailboxOutput: mailboxOutput.String()}
+		}()
+		return false, nil
+	}
+
 	for {
-		if inputCh == nil && !turnInFlight {
+		if scanner != nil && inputCh == nil && !turnInFlight {
 			inputCh = startChatInputRead(ctx, scanner, stderr)
+		}
+		if mailbox != nil && mailboxCh == nil && !turnInFlight {
+			mailboxCh = startMailboxTaskRead(ctx, mailbox)
+		}
+
+		activeInputCh := inputCh
+		activeMailboxCh := mailboxCh
+		if turnInFlight {
+			activeInputCh = nil
+			activeMailboxCh = nil
+		}
+		if activeInputCh == nil && activeMailboxCh == nil && sendDone == nil && events == nil && !turnInFlight {
+			return nil
 		}
 
 		select {
-		case input := <-inputCh:
+		case input := <-activeInputCh:
+			wasInitialInput := initialInputCh != nil && activeInputCh == initialInputCh
 			inputCh = nil
+			if wasInitialInput {
+				initialInputCh = nil
+				if inheritedInputCh != nil {
+					inputCh = inheritedInputCh
+					inheritedInputCh = nil
+				}
+			}
 			if input.err != nil {
 				return input.err
 			}
 			if !input.ok {
-				return nil
-			}
-
-			command := strings.TrimSpace(input.line)
-			if command == "" {
-				continue
-			}
-			if !input.multiline && (command == "/exit" || command == "/quit") {
-				return nil
-			}
-			if !input.multiline && command == "/compact" {
-				if _, err := service.CompactSession(ctx, sessionID); err != nil {
-					if _, printErr := fmt.Fprintf(stderr, "%s: compact failed: %v\n", displayCommand, err); printErr != nil {
-						return printErr
-					}
-					continue
-				}
-				if _, err := fmt.Fprintf(stderr, "%s: compacted session context\n", displayCommand); err != nil {
-					return err
+				scanner = nil
+				if mailbox == nil {
+					return nil
 				}
 				continue
 			}
-
-			done := make(chan attachSendResult, 1)
-			eventCh := make(chan execution.SessionStreamEvent, 64)
-			prompt := input.line
-			sendDone = done
-			events = eventCh
-			turnInFlight = true
-			turnStarted = false
-			expectedTurnID = ""
-			terminalSeen = false
-			pendingSendErr = nil
-			terminalTurnIDs = make(map[string]bool)
-			go func() {
-				defer close(eventCh)
-				result, err := service.SendSessionMessageWithEvents(ctx, sessionID, prompt, func(event execution.SessionStreamEvent) {
-					select {
-					case eventCh <- event:
-					case <-ctx.Done():
-					}
-				})
-				done <- attachSendResult{result: result, err: err}
-			}()
+			done, err := handleInput(input)
+			if done || err != nil {
+				return err
+			}
+		case mailboxRead := <-activeMailboxCh:
+			mailboxCh = nil
+			if mailboxRead.err != nil {
+				return mailboxRead.err
+			}
+			if mailboxRead.task == nil {
+				continue
+			}
+			done, err := handleInput(chatInputEvent{line: mailboxRead.task.Prompt, ok: true, mailboxTask: mailboxRead.task})
+			if done || err != nil {
+				return err
+			}
 		case sendResult := <-sendDone:
 			sendDone = nil
+			if sendResult.mailboxTask != nil {
+				if sendResult.err != nil {
+					mailbox.failTask(sendResult.mailboxTask, sendResult.err)
+				} else {
+					mailbox.completeTask(sendResult.mailboxTask, sendResult.mailboxOutput)
+				}
+			}
 			if sendResult.err != nil {
 				pendingSendErr = sendResult.err
 				if turnStarted || events != nil {
@@ -2994,10 +3165,11 @@ func (options agentCommandFlags) validate(helpCommand string) error {
 const multilineInputDelimiter = `"""`
 
 type chatInputEvent struct {
-	line      string
-	multiline bool
-	ok        bool
-	err       error
+	line        string
+	multiline   bool
+	ok          bool
+	err         error
+	mailboxTask *mailboxTask
 }
 
 func startChatInputRead(ctx context.Context, scanner *bufio.Scanner, stderr io.Writer) <-chan chatInputEvent {
