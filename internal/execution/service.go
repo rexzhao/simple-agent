@@ -21,6 +21,7 @@ type Service struct {
 	projectStore            *projectstore.Store
 	sessionStore            *sessions.V2Store
 	turnRunner              SessionTurnRunner
+	compactPlanner          SessionCompactPlanner
 	sessionWriteLockTimeout time.Duration
 }
 
@@ -128,8 +129,16 @@ type SessionMessageResult struct {
 	LastSeq int64
 }
 
+type SessionCompactResult struct {
+	Status        string
+	CompactionID  string
+	SummaryItemID string
+	LastSeq       int64
+}
+
 type ServiceOptions struct {
 	TurnRunner              SessionTurnRunner
+	CompactPlanner          SessionCompactPlanner
 	SessionWriteLockTimeout time.Duration
 }
 
@@ -202,6 +211,12 @@ func NewServiceWithOptions(home string, options ServiceOptions) (*Service, error
 	if err != nil {
 		return nil, err
 	}
+	compactPlanner := options.CompactPlanner
+	if compactPlanner == nil {
+		if planner, ok := options.TurnRunner.(SessionCompactPlanner); ok {
+			compactPlanner = planner
+		}
+	}
 	lockTimeout := options.SessionWriteLockTimeout
 	if lockTimeout <= 0 {
 		lockTimeout = defaultSessionWriteLockTimeout
@@ -210,6 +225,7 @@ func NewServiceWithOptions(home string, options ServiceOptions) (*Service, error
 		projectStore:            projectstore.NewStore(projectRoot),
 		sessionStore:            sessions.NewV2Store(sessionRoot),
 		turnRunner:              options.TurnRunner,
+		compactPlanner:          compactPlanner,
 		sessionWriteLockTimeout: lockTimeout,
 	}, nil
 }
@@ -474,6 +490,10 @@ func (s *Service) RemoveSession(id string) (SessionRemoveResult, error) {
 }
 
 func (s *Service) SendSessionMessage(ctx context.Context, id, content string) (SessionMessageResult, error) {
+	return s.SendSessionMessageWithEvents(ctx, id, content, nil)
+}
+
+func (s *Service) SendSessionMessageWithEvents(ctx context.Context, id, content string, emit func(SessionStreamEvent)) (SessionMessageResult, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -526,7 +546,17 @@ func (s *Service) SendSessionMessage(ctx context.Context, id, content string) (S
 	defer projector.Close()
 
 	bus := eventbus.NewBusWithCheckpoint(projector.CheckpointHandler())
-	defer bus.Close()
+	waitBridge := s.startSessionEventBridge(id, turnID, bus, session.LastSeq, emit)
+	bridgeClosed := false
+	closeBridge := func() {
+		if bridgeClosed {
+			return
+		}
+		bus.Close()
+		waitBridge()
+		bridgeClosed = true
+	}
+	defer closeBridge()
 
 	turnStarted := false
 	turnClosed := false
@@ -539,19 +569,29 @@ func (s *Service) SendSessionMessage(ctx context.Context, id, content string) (S
 		}
 		turnClosed = true
 	}
+	failTurn := func() {
+		interruptTurn()
+		emitSessionStreamEvent(emit, NewSessionStreamEvent("turn.failed", map[string]any{
+			"turn_id": turnID,
+			"message": "turn failed",
+		}))
+	}
 
 	if err := bus.Publish(eventbus.TurnStarted{TurnID: turnID}); err != nil {
 		return SessionMessageResult{}, fmt.Errorf("could not mark turn running")
 	}
 	turnStarted = true
+	emitSessionStreamEvent(emit, NewSessionStreamEvent("turn.started", map[string]any{
+		"turn_id": turnID,
+	}))
 
 	session, err = s.planAutoCompaction(ctx, bus, session, turnID, content)
 	if err != nil {
-		interruptTurn()
+		failTurn()
 		return SessionMessageResult{}, err
 	}
 	if err := bus.Publish(eventbus.TurnInputReady{TurnID: turnID, Message: model.Message{Role: model.MessageRoleUser, Content: content}}); err != nil {
-		interruptTurn()
+		failTurn()
 		return SessionMessageResult{}, fmt.Errorf("could not save turn input")
 	}
 
@@ -568,23 +608,28 @@ func (s *Service) SendSessionMessage(ctx context.Context, id, content string) (S
 		Publisher: bus,
 	})
 	if err != nil {
-		interruptTurn()
+		failTurn()
 		return SessionMessageResult{}, ErrTurnFailed
 	}
 	if !result.Incremental {
-		interruptTurn()
+		failTurn()
 		return SessionMessageResult{}, fmt.Errorf("turn runner did not use incremental persistence")
 	}
 	if err := bus.Publish(eventbus.TurnCompleted{TurnID: turnID}); err != nil {
-		interruptTurn()
+		failTurn()
 		return SessionMessageResult{}, fmt.Errorf("could not clear running turn")
 	}
 	turnClosed = true
+	closeBridge()
 
 	saved, err := s.sessionStore.Load(id)
 	if err != nil {
 		return SessionMessageResult{}, err
 	}
+	emitSessionStreamEvent(emit, NewSessionStreamEvent("turn.committed", map[string]any{
+		"turn_id":  turnID,
+		"last_seq": saved.LastSeq,
+	}))
 	return SessionMessageResult{Status: "committed", TurnID: turnID, LastSeq: saved.LastSeq}, nil
 }
 
@@ -795,6 +840,10 @@ func sessionStatus(session sessions.SessionV2) string {
 
 func nextSessionTurnID(session sessions.SessionV2) string {
 	return fmt.Sprintf("turn-%06d", session.LastSeq+1)
+}
+
+func nextSessionCompactID(session sessions.SessionV2) string {
+	return fmt.Sprintf("compact-%06d", session.LastSeq+1)
 }
 
 func sessionCompactionPlanPresent(plan SessionCompactionPlan) bool {

@@ -9,10 +9,8 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	"os/signal"
 	"path/filepath"
-	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -32,7 +30,6 @@ import (
 	openaichat "github.com/rexzhao/simple-agent/internal/model/openai_chat"
 	openairesponses "github.com/rexzhao/simple-agent/internal/model/openai_responses"
 	projectstore "github.com/rexzhao/simple-agent/internal/projects"
-	localserver "github.com/rexzhao/simple-agent/internal/server"
 	"github.com/rexzhao/simple-agent/internal/sessionprojector"
 	"github.com/rexzhao/simple-agent/internal/sessions"
 	localskills "github.com/rexzhao/simple-agent/internal/skills"
@@ -48,11 +45,6 @@ const (
 	reasoningColorDarkGray = "\x1b[90m"
 	ansiReset              = "\x1b[0m"
 	chatInputPrompt        = "> "
-)
-
-const (
-	backgroundChildTokenEnv = "SAI_INTERNAL_BACKGROUND_CHILD_TOKEN"
-	backgroundChildRootEnv  = "SAI_INTERNAL_BACKGROUND_CHILD_SERVER_ROOT"
 )
 
 func Run(args []string, stdout, stderr io.Writer) int {
@@ -112,6 +104,69 @@ func displayProgramName(program string) string {
 		return "sai"
 	}
 	return base
+}
+
+func resolveStorageRoot(argv0, explicitRoot string) (string, error) {
+	if strings.TrimSpace(explicitRoot) != "" {
+		return canonicalPath(explicitRoot)
+	}
+	if envName := storageRootEnvVarName(argv0); envName != "" {
+		if value := strings.TrimSpace(os.Getenv(envName)); value != "" {
+			return canonicalPath(value)
+		}
+	}
+	dir, err := os.UserConfigDir()
+	if err != nil {
+		return "", fmt.Errorf("find user config dir: %w", err)
+	}
+	return filepath.Join(dir, storageRootDirName(argv0)), nil
+}
+
+func storageRootEnvVarName(argv0 string) string {
+	base := strings.ToUpper(storageRootDirName(argv0))
+	var out strings.Builder
+	previousUnderscore := false
+	for _, r := range base {
+		isASCIIAlnum := r >= 'A' && r <= 'Z' || r >= '0' && r <= '9'
+		if !isASCIIAlnum {
+			if !previousUnderscore {
+				out.WriteByte('_')
+				previousUnderscore = true
+			}
+			continue
+		}
+		out.WriteRune(r)
+		previousUnderscore = false
+	}
+	normalized := strings.Trim(out.String(), "_")
+	if normalized == "" {
+		return ""
+	}
+	return normalized + "_SERVER_ROOT"
+}
+
+func storageRootDirName(argv0 string) string {
+	base := filepath.Base(strings.TrimSpace(argv0))
+	if ext := filepath.Ext(base); strings.EqualFold(ext, ".exe") {
+		base = base[:len(base)-len(ext)]
+	}
+	base = strings.TrimSpace(base)
+	if base == "" || base == "." || base == string(filepath.Separator) {
+		return "sai"
+	}
+	return base
+}
+
+func canonicalPath(path string) (string, error) {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return "", fmt.Errorf("path is required")
+	}
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return "", fmt.Errorf("resolve path %q: %w", path, err)
+	}
+	return filepath.Clean(abs), nil
 }
 
 func renderCommandText(text, command string) string {
@@ -221,7 +276,7 @@ func execute(ctx context.Context, program string, args []string, stdin io.Reader
 	if err != nil {
 		return err
 	}
-	serverRoot, err := localserver.ResolveServerRoot(program, rootArgs.serverRoot)
+	serverRoot, err := resolveStorageRoot(program, rootArgs.serverRoot)
 	if err != nil {
 		return err
 	}
@@ -274,25 +329,6 @@ func execute(ctx context.Context, program string, args []string, stdin io.Reader
 		return modelsListCommand(subArgs, rootArgs.configPath, stdout, getwd, program)
 	case "doctor":
 		return doctorCommand(rootArgs.commandArgs, rootArgs.configPath, stdout, getwd, program)
-	case "server":
-		subcommand, subArgs, groupHelp, err := splitSubcommandArgs(rootArgs.commandArgs, map[string]flagKind{"background": flagKindBool, "port": flagKindValue, "listen": flagKindValue, "wait": flagKindBool, "timeout-ms": flagKindValue}, "sai help server")
-		if err != nil {
-			return err
-		}
-		if subcommand == "" && groupHelp {
-			printServerUsage(stdout, displayCommand)
-			return nil
-		}
-		switch subcommand {
-		case "start":
-			return serverStartCommand(ctx, subArgs, serverRoot, stdout, program)
-		case "status":
-			return serverStatusCommand(ctx, subArgs, serverRoot, stdout, displayCommand)
-		case "stop":
-			return serverStopCommand(ctx, subArgs, serverRoot, stdout, displayCommand)
-		default:
-			return usageError("usage: sai server <start|status|stop>", "", "sai help server")
-		}
 	case "project":
 		subcommand, subArgs, groupHelp, err := splitSubcommandArgs(rootArgs.commandArgs, map[string]flagKind{"cwd": flagKindValue, "name": flagKindValue, "archived": flagKindBool}, "sai help project")
 		if err != nil {
@@ -403,8 +439,7 @@ func contextWithInterruptCancel(ctx context.Context, interrupts <-chan struct{})
 const rootUsageText = `usage: sai [--server-root dir] [--config file] [command] [args]
 
 Commands:
-  attach            Attach to a server-owned session
-  server            Manage the selected local HTTP server
+  attach            Attach to a session
   project           Manage registered projects
   session           Manage explicit sessions
   send              Send one prompt to a session
@@ -425,24 +460,16 @@ Run "sai help <command>" for command usage.
 const attachUsageText = `usage: sai attach [session-id]
        sai attach --new [--cwd path]
 
-Discovers the selected healthy local server and reads prompts from stdin.
-Without a session id, or with --new, sai starts a pending session in the nearest
+Reads prompts from stdin and sends turns through the execution library. Without
+a session id, or with --new, sai starts a pending session in the nearest
 registered project. It creates the durable session only after the first ordinary
-user message. Existing-session attach fetches a display snapshot, connects to
-the session stream, and rejects --cwd and global --config; existing sessions use
-their stored cwd and config.
+user message. Existing-session attach renders a display snapshot and rejects
+--cwd and global --config; existing sessions use their stored cwd and config.
 `
 
 const resumableSessionSaveNoticeText = "sai: resumable sessions enabled; full prompts, assistant output, and tool results will be saved to the session file."
 
 const subagentCompletionExitWait = 250 * time.Millisecond
-
-const (
-	serverClientTimeout     = 500 * time.Millisecond
-	serverStopPollInterval  = 50 * time.Millisecond
-	serverStopWaitTimeout   = 2 * time.Second
-	serverListHealthTimeout = 300 * time.Millisecond
-)
 
 const versionUsageText = `usage: sai version
 
@@ -481,43 +508,6 @@ Checks local configuration files, default model selection, enabled local tools,
 skills, MCP server configuration, and JSONL log directory writability without
 sending provider HTTP requests, starting MCP servers, running a model, or
 printing secrets.
-`
-
-const serverUsageText = `usage: sai server <command>
-
-Commands:
-  server start      Start the selected local server
-  server status     Show selected server status
-  server stop       Stop the selected local server
-
-Run "sai help server <command>" for command usage.
-`
-
-const serverStartUsageText = `usage: sai server start [--background] [--port N | --listen host:port]
-
-Starts a loopback HTTP server for the selected server root. By default it runs
-in the foreground and blocks until it shuts down. With --background, the parent
-exits after the child server has written its registry record and /health
-succeeds. The default listener is 127.0.0.1:0, which asks the OS to choose a
-free port.
-
-Options:
-  --background       start a detached child server and exit when it is healthy
-  --port N           listen on 127.0.0.1:N; 0 asks the OS for a free port
-  --listen host:port advanced loopback listen address
-`
-
-const serverStatusUsageText = `usage: sai server status
-
-Shows status for the selected server root. This command does not auto-start a
-server.
-`
-
-const serverStopUsageText = `usage: sai server stop [--wait] [--timeout-ms N]
-
-Stops the selected server root. By default shutdown is immediate and cancels
-running turns. --wait drains already started turns before shutdown;
---timeout-ms bounds that wait before falling back to immediate shutdown.
 `
 
 const projectUsageText = `usage: sai project <command>
@@ -695,14 +685,6 @@ func helpCommand(args []string, stdout io.Writer, command string) error {
 		printModelsListUsage(stdout, command)
 	case "doctor":
 		printDoctorUsage(stdout, command)
-	case "server":
-		printServerUsage(stdout, command)
-	case "server start":
-		printServerStartUsage(stdout, command)
-	case "server status":
-		printServerStatusUsage(stdout, command)
-	case "server stop":
-		printServerStopUsage(stdout, command)
 	case "project":
 		printProjectUsage(stdout, command)
 	case "project create":
@@ -783,22 +765,6 @@ func printModelsListUsage(stdout io.Writer, command string) {
 
 func printDoctorUsage(stdout io.Writer, command string) {
 	fmt.Fprint(stdout, renderCommandText(doctorUsageText, command))
-}
-
-func printServerUsage(stdout io.Writer, command string) {
-	fmt.Fprint(stdout, renderCommandText(serverUsageText, command))
-}
-
-func printServerStartUsage(stdout io.Writer, command string) {
-	fmt.Fprint(stdout, renderCommandText(serverStartUsageText, command))
-}
-
-func printServerStatusUsage(stdout io.Writer, command string) {
-	fmt.Fprint(stdout, renderCommandText(serverStatusUsageText, command))
-}
-
-func printServerStopUsage(stdout io.Writer, command string) {
-	fmt.Fprint(stdout, renderCommandText(serverStopUsageText, command))
 }
 
 func printProjectUsage(stdout io.Writer, command string) {
@@ -1211,488 +1177,6 @@ func doctorCommand(args []string, configPath string, stdout io.Writer, getwd fun
 	return nil
 }
 
-func serverStartCommand(ctx context.Context, args []string, serverRoot string, stdout io.Writer, program string) error {
-	displayCommand := displayProgramName(program)
-	flags := flag.NewFlagSet("sai server start", flag.ContinueOnError)
-	background := flags.Bool("background", false, "start in the background")
-	portFlag := flags.Int("port", -1, "loopback port")
-	listenFlag := flags.String("listen", "", "loopback listen address")
-	positionals, done, err := parseCommandFlagArgs(flags, args, stdout, printServerStartUsage, displayCommand, "sai help server start")
-	if done || err != nil {
-		return err
-	}
-	if len(positionals) != 0 {
-		return usageError("usage: sai server start [--background] [--port N | --listen host:port]", "", "sai help server start")
-	}
-
-	portSet := false
-	flags.Visit(func(flag *flag.Flag) {
-		if flag.Name == "port" {
-			portSet = true
-		}
-	})
-	listen, err := serverListenAddress(portSet, *portFlag, *listenFlag)
-	if err != nil {
-		return usageError(err.Error(), "", "sai help server start")
-	}
-	if err := localserver.ValidateListenAddress(listen); err != nil {
-		return err
-	}
-
-	store, err := localserver.NewRegistryStoreForServerRoot(serverRoot)
-	if err != nil {
-		return err
-	}
-
-	if *background {
-		return runServerBackgroundParentFromFlags(ctx, listen, serverRoot, store, stdout, program)
-	}
-
-	launch, err := prepareServerLaunch(listen, serverRoot, store, program)
-	if err != nil {
-		return err
-	}
-	launch.SkipStartupLock = backgroundChildStartupAuthorized(launch.ServerRoot)
-
-	return runServerForeground(ctx, launch, stdout)
-}
-
-type serverLaunch struct {
-	ServerRoot      string
-	Listen          string
-	SessionStore    *sessions.V2Store
-	SessionDefaults sessions.SessionV2
-	ProjectStore    *projectstore.Store
-	Program         string
-	ServerRootPath  string
-	RegistryStore   localserver.RegistryStore
-	SkipStartupLock bool
-}
-
-func prepareServerLaunch(listen, serverRoot string, store localserver.RegistryStore, program string) (serverLaunch, error) {
-	root, err := localserver.CanonicalPath(serverRoot)
-	if err != nil {
-		return serverLaunch{}, err
-	}
-	sessionDefaults := sessions.SessionV2{
-		Version:         sessions.VersionV2,
-		SaveToolResults: true,
-	}
-	projectRoot, err := projectstore.RootForServerRoot(root)
-	if err != nil {
-		return serverLaunch{}, err
-	}
-	sessionRoot, err := sessions.RootForServerRoot(root)
-	if err != nil {
-		return serverLaunch{}, err
-	}
-
-	return serverLaunch{
-		ServerRoot:      root,
-		Listen:          listen,
-		SessionStore:    sessions.NewV2Store(sessionRoot),
-		SessionDefaults: sessionDefaults,
-		ProjectStore:    projectstore.NewStore(projectRoot),
-		Program:         program,
-		ServerRootPath:  root,
-		RegistryStore:   store,
-	}, nil
-}
-
-func enterServerRoot(serverRoot string) (func() error, error) {
-	serverRoot = filepath.Clean(strings.TrimSpace(serverRoot))
-	if serverRoot == "" || serverRoot == "." {
-		return nil, fmt.Errorf("server root is required")
-	}
-	previous, err := os.Getwd()
-	if err != nil {
-		return nil, fmt.Errorf("get current directory before entering server root: %w", err)
-	}
-	if err := os.MkdirAll(serverRoot, 0o700); err != nil {
-		return nil, fmt.Errorf("create server root %q: %w", serverRoot, err)
-	}
-	if err := os.Chdir(serverRoot); err != nil {
-		return nil, fmt.Errorf("enter server root %q: %w", serverRoot, err)
-	}
-	return func() error {
-		return os.Chdir(previous)
-	}, nil
-}
-
-func runServerBackgroundParentFromFlags(ctx context.Context, listen, serverRoot string, store localserver.RegistryStore, stdout io.Writer, program string) (err error) {
-	lock, err := localserver.AcquireStartupLock(ctx, serverRoot)
-	if err != nil {
-		return err
-	}
-	defer func() {
-		err = errors.Join(err, lock.Release())
-	}()
-
-	if done, err := checkExistingServerRecord(ctx, store, stdout); done || err != nil {
-		return err
-	}
-	launch, err := prepareServerLaunch(listen, serverRoot, store, program)
-	if err != nil {
-		return err
-	}
-	return runServerBackgroundParent(ctx, launch, stdout)
-}
-
-func runServerForeground(ctx context.Context, launch serverLaunch, stdout io.Writer) (err error) {
-	store := launch.RegistryStore
-	var startupLock *localserver.StartupLock
-	if !launch.SkipStartupLock {
-		startupLock, err = localserver.AcquireStartupLock(ctx, launch.ServerRoot)
-		if err != nil {
-			return err
-		}
-	}
-	releaseStartupLock := func() {
-		if startupLock != nil {
-			err = errors.Join(err, startupLock.Release())
-			startupLock = nil
-		}
-	}
-	defer releaseStartupLock()
-
-	if done, err := checkExistingServerRecord(ctx, store, stdout); done || err != nil {
-		return err
-	}
-
-	restoreCWD, err := enterServerRoot(launch.ServerRoot)
-	if err != nil {
-		return err
-	}
-	defer func() {
-		err = errors.Join(err, restoreCWD())
-	}()
-	token, err := localserver.GenerateRegistryToken()
-	if err != nil {
-		return err
-	}
-	process, err := localserver.Start(localserver.Options{
-		Listen:          launch.Listen,
-		Version:         Version,
-		AuthToken:       token,
-		SessionStore:    launch.SessionStore,
-		SessionDefaults: launch.SessionDefaults,
-		ProjectStore:    launch.ProjectStore,
-		TurnRunner:      serverAgentTurnRunner{program: launch.Program},
-	})
-	if err != nil {
-		return err
-	}
-	info := process.Info()
-	record := localserver.RegistryRecord{
-		BaseURL:         info.Addr,
-		PID:             info.PID,
-		Token:           token,
-		StartedAt:       info.StartedAt,
-		Version:         info.Version,
-		RequestedListen: launch.Listen,
-	}
-	if err := store.Upsert(record); err != nil {
-		_ = process.Shutdown(context.Background())
-		return err
-	}
-	releaseStartupLock()
-	if err := printServerStartStatus(stdout, "started", record); err != nil {
-		_ = process.Shutdown(context.Background())
-		_, removeErr := store.Clear()
-		return errors.Join(err, removeErr)
-	}
-	serveErr := process.Serve(ctx)
-	_, removeErr := store.Clear()
-	return errors.Join(serveErr, removeErr)
-}
-
-type backgroundServerProcess struct {
-	PID  int
-	wait func() error
-	kill func() error
-}
-
-var startBackgroundServerProcess = startBackgroundServerProcessDefault
-
-func runServerBackgroundParent(ctx context.Context, launch serverLaunch, stdout io.Writer) error {
-	store := launch.RegistryStore
-	if done, err := checkExistingServerRecord(ctx, store, stdout); done || err != nil {
-		return err
-	}
-
-	record, err := startBackgroundServerAndWait(ctx, launch)
-	if err != nil {
-		return err
-	}
-	return printServerStartStatus(stdout, "started", record)
-}
-
-func startBackgroundServerAndWait(ctx context.Context, launch serverLaunch) (localserver.RegistryRecord, error) {
-	store := launch.RegistryStore
-	childArgs := backgroundServerChildArgs(launch)
-	childEnv, cleanup, err := prepareBackgroundChildAuth(launch.ServerRoot)
-	if err != nil {
-		return localserver.RegistryRecord{}, err
-	}
-	defer cleanup()
-	child, err := startBackgroundServerProcess(ctx, childArgs, childEnv)
-	if err != nil {
-		return localserver.RegistryRecord{}, err
-	}
-
-	ready := false
-	defer func() {
-		if !ready && child.kill != nil {
-			_ = child.kill()
-		}
-	}()
-
-	record, err := waitForBackgroundServerReady(ctx, store, launch.Listen, child)
-	if err != nil {
-		return localserver.RegistryRecord{}, err
-	}
-	ready = true
-	return record, nil
-}
-
-func backgroundServerChildArgs(launch serverLaunch) []string {
-	args := []string{
-		"--server-root", launch.ServerRootPath,
-		"server",
-		"start",
-		"--listen", launch.Listen,
-	}
-	return args
-}
-
-func prepareBackgroundChildAuth(serverRoot string) ([]string, func(), error) {
-	token, err := localserver.GenerateRegistryToken()
-	if err != nil {
-		return nil, nil, err
-	}
-	path, err := backgroundChildTokenPath(serverRoot)
-	if err != nil {
-		return nil, nil, err
-	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return nil, nil, fmt.Errorf("create background child auth dir: %w", err)
-	}
-	if err := os.WriteFile(path, []byte(token+"\n"), 0o600); err != nil {
-		return nil, nil, fmt.Errorf("write background child auth token: %w", err)
-	}
-	env := []string{
-		backgroundChildTokenEnv + "=" + token,
-		backgroundChildRootEnv + "=" + serverRoot,
-	}
-	cleanup := func() {
-		_ = os.Remove(path)
-	}
-	return env, cleanup, nil
-}
-
-func backgroundChildStartupAuthorized(serverRoot string) bool {
-	token := strings.TrimSpace(os.Getenv(backgroundChildTokenEnv))
-	root := strings.TrimSpace(os.Getenv(backgroundChildRootEnv))
-	if token == "" || root == "" {
-		return false
-	}
-	expectedRoot, err := localserver.CanonicalPath(serverRoot)
-	if err != nil {
-		return false
-	}
-	actualRoot, err := localserver.CanonicalPath(root)
-	if err != nil || !sameCLIPath(expectedRoot, actualRoot) {
-		return false
-	}
-	path, err := backgroundChildTokenPath(expectedRoot)
-	if err != nil {
-		return false
-	}
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		return false
-	}
-	return strings.TrimSpace(string(raw)) == token
-}
-
-func backgroundChildTokenPath(serverRoot string) (string, error) {
-	root, err := localserver.CanonicalPath(serverRoot)
-	if err != nil {
-		return "", err
-	}
-	return filepath.Join(root, "server", "background-child.token"), nil
-}
-
-func sameCLIPath(left, right string) bool {
-	if runtime.GOOS == "windows" {
-		return strings.EqualFold(left, right)
-	}
-	return left == right
-}
-
-func startBackgroundServerProcessDefault(ctx context.Context, args []string, env []string) (*backgroundServerProcess, error) {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	executable, err := os.Executable()
-	if err != nil {
-		return nil, fmt.Errorf("resolve current executable: %w", err)
-	}
-	files, err := openBackgroundChildFiles()
-	if err != nil {
-		return nil, err
-	}
-	defer closeBackgroundChildFiles(files)
-
-	cmd := exec.Command(executable, args...)
-	cmd.Stdin = files[0]
-	cmd.Stdout = files[1]
-	cmd.Stderr = files[2]
-	if len(env) > 0 {
-		cmd.Env = append(os.Environ(), env...)
-	}
-	if err := cmd.Start(); err != nil {
-		return nil, fmt.Errorf("start background server child: %w", err)
-	}
-	return &backgroundServerProcess{
-		PID:  cmd.Process.Pid,
-		wait: func() error { return cmd.Wait() },
-		kill: func() error { return cmd.Process.Kill() },
-	}, nil
-}
-
-func openBackgroundChildFiles() ([]*os.File, error) {
-	files := make([]*os.File, 0, 3)
-	for i := 0; i < 3; i++ {
-		file, err := os.OpenFile(os.DevNull, os.O_RDWR, 0)
-		if err != nil {
-			closeBackgroundChildFiles(files)
-			return nil, fmt.Errorf("open %s for background server stdio: %w", os.DevNull, err)
-		}
-		files = append(files, file)
-	}
-	return files, nil
-}
-
-func closeBackgroundChildFiles(files []*os.File) {
-	for _, file := range files {
-		if file != nil {
-			_ = file.Close()
-		}
-	}
-}
-
-func waitForBackgroundServerReady(ctx context.Context, store localserver.RegistryStore, listen string, child *backgroundServerProcess) (localserver.RegistryRecord, error) {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	waitCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	defer cancel()
-
-	var childDone <-chan error
-	if child != nil && child.wait != nil {
-		ch := make(chan error, 1)
-		go func() {
-			ch <- child.wait()
-		}()
-		childDone = ch
-	}
-
-	ticker := time.NewTicker(25 * time.Millisecond)
-	defer ticker.Stop()
-
-	for {
-		record, ok, err := findBackgroundReadyRecord(waitCtx, store, listen)
-		if err != nil {
-			return localserver.RegistryRecord{}, err
-		}
-		if ok {
-			return record, nil
-		}
-
-		select {
-		case err := <-childDone:
-			if err != nil {
-				return localserver.RegistryRecord{}, fmt.Errorf("background server child exited before becoming healthy: %w", err)
-			}
-			return localserver.RegistryRecord{}, fmt.Errorf("background server child exited before becoming healthy")
-		case <-waitCtx.Done():
-			return localserver.RegistryRecord{}, fmt.Errorf("wait for background server readiness: %w", waitCtx.Err())
-		case <-ticker.C:
-		}
-	}
-}
-
-func findBackgroundReadyRecord(ctx context.Context, store localserver.RegistryStore, listen string) (localserver.RegistryRecord, bool, error) {
-	records, err := store.Load()
-	if err != nil {
-		return localserver.RegistryRecord{}, false, err
-	}
-	if len(records) == 0 {
-		return localserver.RegistryRecord{}, false, nil
-	}
-	normalized, err := localserver.CanonicalizeRegistryRecord(records[len(records)-1])
-	if err != nil {
-		return localserver.RegistryRecord{}, false, err
-	}
-	if normalized.RequestedListen != listen {
-		return localserver.RegistryRecord{}, false, nil
-	}
-	if err := localserver.CheckHealth(ctx, normalized.BaseURL, 300*time.Millisecond); err != nil {
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			return localserver.RegistryRecord{}, false, ctxErr
-		}
-		return localserver.RegistryRecord{}, false, nil
-	}
-	return normalized, true, nil
-}
-
-func checkExistingServerRecord(ctx context.Context, store localserver.RegistryStore, stdout io.Writer) (bool, error) {
-	records, err := store.Load()
-	if err != nil {
-		return false, err
-	}
-
-	if len(records) == 0 {
-		return false, nil
-	}
-	normalized, err := localserver.CanonicalizeRegistryRecord(records[len(records)-1])
-	if err != nil {
-		return false, err
-	}
-	if err := localserver.CheckHealth(ctx, normalized.BaseURL, 300*time.Millisecond); err != nil {
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			return false, ctxErr
-		}
-		if _, err := store.Clear(); err != nil {
-			return false, err
-		}
-		return false, nil
-	}
-	err = printServerStartStatus(stdout, "already_running", normalized)
-	return true, err
-}
-
-func serverListenAddress(portSet bool, port int, listen string) (string, error) {
-	listen = strings.TrimSpace(listen)
-	if portSet && listen != "" {
-		return "", fmt.Errorf("--port and --listen are mutually exclusive")
-	}
-	if portSet && (port < 0 || port > 65535) {
-		return "", fmt.Errorf("--port must be a number from 0 to 65535")
-	}
-	if listen != "" {
-		return listen, nil
-	}
-	if portSet {
-		return fmt.Sprintf("127.0.0.1:%d", port), nil
-	}
-	return localserver.DefaultListenAddress, nil
-}
-
 func resolveServerCWD(cwdFlag string, getwd func() (string, error)) (string, error) {
 	cwdFlag = strings.TrimSpace(cwdFlag)
 	if cwdFlag == "" {
@@ -1956,99 +1440,6 @@ func resolveProjectCreatePaths(cwdFlag string, getwd func() (string, error)) (st
 	return effectiveCWD, canonicalRoot, nil
 }
 
-func ensureProjectCommandServer(ctx context.Context, _ string, serverRoot, effectiveCWD, program string) (localserver.RegistryRecord, error) {
-	return ensureSelectedServer(ctx, serverRoot, program)
-}
-
-func ensureSelectedServer(ctx context.Context, serverRoot, program string) (localserver.RegistryRecord, error) {
-	store, err := localserver.NewRegistryStoreForServerRoot(serverRoot)
-	if err != nil {
-		return localserver.RegistryRecord{}, err
-	}
-	discovery, err := localserver.DiscoverHealthy(ctx, store, "", serverClientTimeout)
-	if err != nil {
-		return localserver.RegistryRecord{}, err
-	}
-	if discovery.Found {
-		return discovery.Record, nil
-	}
-
-	return startBackgroundServerWithStartupLock(ctx, serverRoot, store, "", func() (serverLaunch, error) {
-		return prepareServerLaunch(localserver.DefaultListenAddress, serverRoot, store, program)
-	})
-}
-
-func startBackgroundServerWithStartupLock(ctx context.Context, serverRoot string, store localserver.RegistryStore, discoveryCWD string, prepare func() (serverLaunch, error)) (record localserver.RegistryRecord, err error) {
-	lock, err := localserver.AcquireStartupLock(ctx, serverRoot)
-	if err != nil {
-		return localserver.RegistryRecord{}, err
-	}
-	defer func() {
-		err = errors.Join(err, lock.Release())
-	}()
-
-	discovery, err := localserver.DiscoverHealthy(ctx, store, discoveryCWD, serverClientTimeout)
-	if err != nil {
-		return localserver.RegistryRecord{}, err
-	}
-	if discovery.Found {
-		return discovery.Record, nil
-	}
-
-	launch, err := prepare()
-	if err != nil {
-		return localserver.RegistryRecord{}, err
-	}
-	return startBackgroundServerAndWait(ctx, launch)
-}
-
-func nearestProjectFromList(projects []localserver.ProjectInfo, cwd string, includeArchived bool) (localserver.ProjectInfo, bool, error) {
-	canonicalCWD, err := projectstore.CanonicalRoot(cwd)
-	if err != nil {
-		return localserver.ProjectInfo{}, false, err
-	}
-	var best localserver.ProjectInfo
-	bestLen := -1
-	for _, project := range projects {
-		if strings.TrimSpace(project.Root) == "" || (!includeArchived && project.Archived) {
-			continue
-		}
-		if !isSameOrAncestorProjectPath(project.Root, canonicalCWD) {
-			continue
-		}
-		rootLen := len(projectPathKey(project.Root))
-		if rootLen > bestLen {
-			best = project
-			bestLen = rootLen
-		}
-	}
-	if bestLen < 0 {
-		return localserver.ProjectInfo{}, false, nil
-	}
-	return best, true, nil
-}
-
-func isSameOrAncestorProjectPath(root, cwd string) bool {
-	rootKey := projectPathKey(root)
-	cwdKey := projectPathKey(cwd)
-	if rootKey == cwdKey {
-		return true
-	}
-	rel, err := filepath.Rel(rootKey, cwdKey)
-	if err != nil {
-		return false
-	}
-	return rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
-}
-
-func projectPathKey(path string) string {
-	key := filepath.Clean(path)
-	if runtime.GOOS == "windows" {
-		key = strings.ToLower(key)
-	}
-	return key
-}
-
 func printProjectList(stdout io.Writer, projects []execution.Project) error {
 	if _, err := fmt.Fprintln(stdout, "ID\tNAME\tROOT\tARCHIVED\tCREATED_AT\tUPDATED_AT"); err != nil {
 		return err
@@ -2110,19 +1501,19 @@ func printRemoveStatus(stdout io.Writer, status, id string, removedSessions int,
 	return nil
 }
 
-func serverSessionDefaultsFromConfig(cfg *config.Config, cwd string) (sessions.SessionV2, error) {
+func executionSessionDefaultsFromConfig(cfg *config.Config, cwd string) (sessions.SessionV2, error) {
 	providerName := strings.TrimSpace(cfg.DefaultProvider)
 	modelProfile := strings.TrimSpace(cfg.DefaultModel)
 	if providerName == "" || modelProfile == "" {
-		return sessions.SessionV2{}, fmt.Errorf("server session defaults require default_provider and default_model")
+		return sessions.SessionV2{}, fmt.Errorf("execution session defaults require default_provider and default_model")
 	}
 	provider, ok := cfg.Providers[providerName]
 	if !ok {
-		return sessions.SessionV2{}, fmt.Errorf("server session defaults reference unknown provider %q", providerName)
+		return sessions.SessionV2{}, fmt.Errorf("execution session defaults reference unknown provider %q", providerName)
 	}
 	profile, ok := provider.Models[modelProfile]
 	if !ok {
-		return sessions.SessionV2{}, fmt.Errorf("server session defaults reference unknown model %q for provider %q", modelProfile, providerName)
+		return sessions.SessionV2{}, fmt.Errorf("execution session defaults reference unknown model %q for provider %q", modelProfile, providerName)
 	}
 	window := contextwindow.ResolveWindow(profile.ContextWindow)
 	selectedMCPServers, err := cfg.SelectedMCPServers(nil, false)
@@ -2174,7 +1565,7 @@ func sessionCreateCommand(ctx context.Context, args []string, configPath, homePa
 	if err != nil {
 		return err
 	}
-	return printServerSessionCommandStatus(stdout, "created", session)
+	return printSessionCommandStatus(stdout, "created", session)
 }
 
 func sessionListCommand(ctx context.Context, args []string, configPath string, configProvided bool, homePath string, stdout io.Writer, getwd func() (string, error), program string) error {
@@ -2208,7 +1599,7 @@ func sessionListCommand(ctx context.Context, args []string, configPath string, c
 		if err != nil {
 			return err
 		}
-		return printServerSessionList(stdout, infos)
+		return printSessionList(stdout, infos)
 	}
 
 	project := strings.TrimSpace(*projectID)
@@ -2232,7 +1623,7 @@ func sessionListCommand(ctx context.Context, args []string, configPath string, c
 	if err != nil {
 		return err
 	}
-	return printServerSessionList(stdout, infos)
+	return printSessionList(stdout, infos)
 }
 
 func sessionShowCommand(ctx context.Context, args []string, configPath string, configProvided bool, homePath string, stdout io.Writer, getwd func() (string, error), program string) error {
@@ -2257,7 +1648,7 @@ func sessionShowCommand(ctx context.Context, args []string, configPath string, c
 	if err != nil {
 		return err
 	}
-	return printServerSessionDetailWithProject(stdout, session)
+	return printSessionDetailWithProject(stdout, session)
 }
 
 func sessionRenameCommand(ctx context.Context, args []string, configPath string, configProvided bool, homePath string, stdout io.Writer, getwd func() (string, error), program string) error {
@@ -2290,7 +1681,7 @@ func sessionRenameCommand(ctx context.Context, args []string, configPath string,
 	if err != nil {
 		return err
 	}
-	return printServerSessionCommandStatus(stdout, "renamed", session)
+	return printSessionCommandStatus(stdout, "renamed", session)
 }
 
 func sessionArchiveCommand(ctx context.Context, args []string, configPath string, configProvided bool, homePath string, stdout io.Writer, getwd func() (string, error), program string) error {
@@ -2319,7 +1710,7 @@ func sessionArchiveCommand(ctx context.Context, args []string, configPath string
 	if err != nil {
 		return err
 	}
-	return printServerSessionCommandStatus(stdout, "archived", session)
+	return printSessionCommandStatus(stdout, "archived", session)
 }
 
 func sessionRemoveCommand(ctx context.Context, args []string, configPath string, configProvided bool, homePath string, stdout io.Writer, getwd func() (string, error), program string) error {
@@ -2349,40 +1740,6 @@ func sessionRemoveCommand(ctx context.Context, args []string, configPath string,
 		return err
 	}
 	return printRemoveStatus(stdout, result.Status, result.ID, 0, false)
-}
-
-func nearestProject(ctx context.Context, record localserver.RegistryRecord, cwd string) (localserver.ProjectInfo, bool, error) {
-	projects, err := localserver.ListProjectsWithToken(ctx, record.BaseURL, record.Token, serverClientTimeout)
-	if err != nil {
-		return localserver.ProjectInfo{}, false, err
-	}
-	return nearestProjectFromList(projects, cwd, false)
-}
-
-func selectProjectID(ctx context.Context, record localserver.RegistryRecord, id, effectiveCWD, displayCommand string, includeArchived bool) (string, error) {
-	id = strings.TrimSpace(id)
-	if id != "" {
-		return id, nil
-	}
-	projects, err := localserver.ListProjectsWithOptions(ctx, record.BaseURL, record.Token, false, serverClientTimeout)
-	if err != nil {
-		return "", err
-	}
-	if includeArchived {
-		archived, err := localserver.ListProjectsWithOptions(ctx, record.BaseURL, record.Token, true, serverClientTimeout)
-		if err != nil {
-			return "", err
-		}
-		projects = append(projects, archived...)
-	}
-	project, ok, err := nearestProjectFromList(projects, effectiveCWD, includeArchived)
-	if err != nil {
-		return "", err
-	}
-	if !ok {
-		return "", fmt.Errorf("no registered project found from %s; run %q", effectiveCWD, displayCommand+" project create")
-	}
-	return project.ID, nil
 }
 
 func selectExecutionProjectID(service *execution.Service, id, effectiveCWD, displayCommand string, includeArchived bool) (string, error) {
@@ -2420,50 +1777,13 @@ func createExecutionSessionForCWD(configPath, homePath, creationCWD, program str
 	if err != nil {
 		return execution.SessionDetail{}, err
 	}
-	defaults, err := serverSessionDefaultsFromConfig(cfg, creationCWD)
+	defaults, err := executionSessionDefaultsFromConfig(cfg, creationCWD)
 	if err != nil {
 		return execution.SessionDetail{}, err
 	}
 	defaults.CreatedCWD = creationCWD
 	metadata := executionSessionCreateMetadataFromDefaults(defaults)
 	return service.CreateSession(project.ID, metadata)
-}
-
-func createProjectSessionForCWD(ctx context.Context, configPath, serverRoot, creationCWD, program string) (localserver.RegistryRecord, localserver.SessionDetail, error) {
-	displayCommand := displayProgramName(program)
-	record, err := ensureProjectCommandServer(ctx, configPath, serverRoot, creationCWD, program)
-	if err != nil {
-		return localserver.RegistryRecord{}, localserver.SessionDetail{}, err
-	}
-	project, ok, err := nearestProject(ctx, record, creationCWD)
-	if err != nil {
-		return localserver.RegistryRecord{}, localserver.SessionDetail{}, err
-	}
-	if !ok {
-		return localserver.RegistryRecord{}, localserver.SessionDetail{}, fmt.Errorf("no registered project found from %s; run %q", creationCWD, displayCommand+" project create")
-	}
-
-	cfg, err := loadConfig(serverConfigPath(configPath, creationCWD), func() (string, error) {
-		return creationCWD, nil
-	}, program)
-	if err != nil {
-		return localserver.RegistryRecord{}, localserver.SessionDetail{}, err
-	}
-	defaults, err := serverSessionDefaultsFromConfig(cfg, creationCWD)
-	if err != nil {
-		return localserver.RegistryRecord{}, localserver.SessionDetail{}, err
-	}
-	defaults.CreatedCWD = creationCWD
-	metadata := sessionCreateMetadataFromDefaults(defaults)
-	session, err := localserver.CreateProjectSessionWithMetadataWithToken(ctx, record.BaseURL, record.Token, project.ID, metadata, serverClientTimeout)
-	if err != nil {
-		return localserver.RegistryRecord{}, localserver.SessionDetail{}, err
-	}
-	return record, session, nil
-}
-
-func ensureSessionCommandServer(ctx context.Context, _ string, serverRoot, program string, _ func() (string, error)) (localserver.RegistryRecord, error) {
-	return ensureSelectedServer(ctx, serverRoot, program)
 }
 
 func executionSessionCreateMetadataFromDefaults(session sessions.SessionV2) execution.SessionCreateMetadata {
@@ -2490,128 +1810,11 @@ func executionSessionCreateMetadataFromDefaults(session sessions.SessionV2) exec
 	}
 }
 
-func sessionCreateMetadataFromDefaults(session sessions.SessionV2) localserver.SessionCreateMetadata {
-	showReasoning := session.ShowReasoning
-	saveToolResults := session.SaveToolResults
-	context := session.Context
-	createdCWD := session.CreatedCWD
-	if strings.TrimSpace(createdCWD) == "" {
-		createdCWD = session.CWD
-	}
-	return localserver.SessionCreateMetadata{
-		CreatedCWD:      createdCWD,
-		ConfigPath:      session.ConfigPath,
-		Provider:        session.Provider,
-		ModelProfile:    session.ModelProfile,
-		ModelID:         session.ModelID,
-		ModelParameters: copyParameterMap(session.ModelParameters),
-		EnabledTools:    copyStringSlice(session.EnabledTools),
-		EnabledMCP:      copyStringSlice(session.EnabledMCP),
-		EnabledSkills:   copyStringSlice(session.EnabledSkills),
-		ShowReasoning:   &showReasoning,
-		Context:         &context,
-		SaveToolResults: &saveToolResults,
-	}
-}
-
-func serverStatusCommand(ctx context.Context, args []string, serverRoot string, stdout io.Writer, command string) error {
-	flags := flag.NewFlagSet("sai server status", flag.ContinueOnError)
-	positionals, done, err := parseCommandFlagArgs(flags, args, stdout, printServerStatusUsage, command, "sai help server status")
-	if done || err != nil {
-		return err
-	}
-	if len(positionals) != 0 {
-		return usageError("usage: sai server status", "", "sai help server status")
-	}
-	store, err := localserver.NewRegistryStoreForServerRoot(serverRoot)
-	if err != nil {
-		return err
-	}
-	discovery, err := localserver.DiscoverHealthy(ctx, store, "", serverClientTimeout)
-	if err != nil {
-		return err
-	}
-	if !discovery.Found {
-		return noSelectedServerFoundError(command)
-	}
-
-	status, err := localserver.GetServerStatus(ctx, discovery.Record.BaseURL, discovery.Record.Token, serverClientTimeout)
-	if err != nil {
-		return err
-	}
-	return printServerStatus(stdout, status)
-}
-
-func serverStopCommand(ctx context.Context, args []string, serverRoot string, stdout io.Writer, command string) error {
-	flags := flag.NewFlagSet("sai server stop", flag.ContinueOnError)
-	waitFlag := flags.Bool("wait", false, "wait for running turns to finish")
-	timeoutMSFlag := flags.Int("timeout-ms", 0, "maximum drain wait in milliseconds")
-	positionals, done, err := parseCommandFlagArgs(flags, args, stdout, printServerStopUsage, command, "sai help server stop")
-	if done || err != nil {
-		return err
-	}
-	if len(positionals) != 0 {
-		return usageError("usage: sai server stop [--wait] [--timeout-ms N]", "", "sai help server stop")
-	}
-	if *timeoutMSFlag < 0 {
-		return usageError("--timeout-ms must be non-negative", "", "sai help server stop")
-	}
-	if *timeoutMSFlag > 0 && !*waitFlag {
-		return usageError("--timeout-ms requires --wait", "", "sai help server stop")
-	}
-	store, err := localserver.NewRegistryStoreForServerRoot(serverRoot)
-	if err != nil {
-		return err
-	}
-	discovery, err := localserver.DiscoverHealthy(ctx, store, "", serverClientTimeout)
-	if err != nil {
-		return err
-	}
-	if !discovery.Found {
-		return noSelectedServerFoundError(command)
-	}
-
-	record := discovery.Record
-	shutdownOptions := localserver.ShutdownOptions{Wait: *waitFlag}
-	if *timeoutMSFlag > 0 {
-		shutdownOptions.Timeout = time.Duration(*timeoutMSFlag) * time.Millisecond
-	}
-	shutdownClientTimeout := serverClientTimeout
-	if shutdownOptions.Wait {
-		shutdownClientTimeout = 0
-		if shutdownOptions.Timeout > 0 {
-			shutdownClientTimeout = shutdownOptions.Timeout + serverClientTimeout
-		}
-	}
-	if err := localserver.ShutdownServerWithOptions(ctx, record.BaseURL, record.Token, shutdownOptions, shutdownClientTimeout); err != nil {
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			return ctxErr
-		}
-		if healthErr := localserver.CheckHealth(ctx, record.BaseURL, serverClientTimeout); healthErr != nil {
-			if ctxErr := ctx.Err(); ctxErr != nil {
-				return ctxErr
-			}
-			if _, removeErr := store.Clear(); removeErr != nil {
-				return removeErr
-			}
-			return printServerStopStatus(stdout, record)
-		}
-		return err
-	}
-	if err := waitForServerStop(ctx, record.BaseURL); err != nil {
-		return err
-	}
-	if _, err := store.Clear(); err != nil {
-		return err
-	}
-	return printServerStopStatus(stdout, record)
-}
-
 func attachCommand(ctx context.Context, args []string, configPath string, configProvided bool, homePath string, stdin io.Reader, stdout, stderr io.Writer, getwd func() (string, error), program string) error {
 	displayCommand := displayProgramName(program)
 	flags := flag.NewFlagSet("sai attach", flag.ContinueOnError)
 	cwdFlag := flags.String("cwd", "", "discovery working directory")
-	newSession := flags.Bool("new", false, "create a new server-owned session before attaching")
+	newSession := flags.Bool("new", false, "create a new session before attaching")
 	positionals, done, err := parseCommandFlagArgs(flags, args, stdout, printAttachUsage, displayCommand, "sai help attach")
 	if done || err != nil {
 		return err
@@ -2628,19 +1831,16 @@ func attachCommand(ctx context.Context, args []string, configPath string, config
 	}
 
 	sessionID := ""
-	var record localserver.RegistryRecord
+	service, err := newCLIAttachExecutionService(homePath, program)
+	if err != nil {
+		return err
+	}
 	if createMode {
 		creationCWD, err := resolveClientCWD(*cwdFlag, getwd)
 		if err != nil {
 			return err
 		}
-		return runPendingAttachREPL(ctx, configPath, homePath, creationCWD, stdin, stdout, stderr, program)
-	} else {
-		var err error
-		record, err = ensureSelectedServer(ctx, homePath, program)
-		if err != nil {
-			return err
-		}
+		return runPendingAttachREPL(ctx, service, configPath, homePath, creationCWD, stdin, stdout, stderr, program)
 	}
 
 	sessionID = strings.TrimSpace(positionals[0])
@@ -2648,29 +1848,22 @@ func attachCommand(ctx context.Context, args []string, configPath string, config
 		return usageError("session id must be a non-empty string", "", "sai help attach")
 	}
 
-	streamOptions := localserver.SessionStreamOptions{}
-	snapshot, err := localserver.GetSessionChatItemsWithToken(ctx, record.BaseURL, record.Token, sessionID, serverClientTimeout)
+	snapshot, err := service.GetSessionChatItems(sessionID)
 	if err != nil {
 		return err
 	}
 	if err := writeAttachSnapshot(stdout, snapshot); err != nil {
 		return err
 	}
-	streamOptions.AfterSeq = &snapshot.NewestSeq
-	events, streamErrs, closeStream, err := localserver.StreamSessionEventsWithOptions(ctx, record.BaseURL, record.Token, sessionID, streamOptions, serverClientTimeout)
-	if err != nil {
-		return err
-	}
-	defer closeStream()
 	if _, err := fmt.Fprintf(stderr, "%s: attached to session %s\n", displayCommand, sessionID); err != nil {
 		return err
 	}
-	return runAttachREPL(ctx, record, sessionID, stdin, stdout, stderr, events, streamErrs, displayCommand)
+	return runAttachREPL(ctx, service, sessionID, stdin, stdout, stderr, displayCommand)
 }
 
-func runPendingAttachREPL(ctx context.Context, configPath, serverRoot, creationCWD string, stdin io.Reader, stdout, stderr io.Writer, program string) error {
+func runPendingAttachREPL(ctx context.Context, service *execution.Service, configPath, serverRoot, creationCWD string, stdin io.Reader, stdout, stderr io.Writer, program string) error {
 	displayCommand := displayProgramName(program)
-	if _, err := ensurePendingAttachProject(ctx, configPath, serverRoot, creationCWD, program); err != nil {
+	if err := ensurePendingAttachProject(service, creationCWD, program); err != nil {
 		return err
 	}
 
@@ -2698,42 +1891,35 @@ func runPendingAttachREPL(ctx context.Context, configPath, serverRoot, creationC
 			continue
 		}
 
-		record, detail, err := createProjectSessionForCWD(ctx, configPath, serverRoot, creationCWD, program)
+		detail, err := createExecutionSessionForCWD(configPath, serverRoot, creationCWD, program)
 		if err != nil {
 			return err
 		}
 		sessionID := strings.TrimSpace(detail.ID)
 		if sessionID == "" {
-			return fmt.Errorf("create session at %s: response missing session id", record.BaseURL)
+			return fmt.Errorf("create session: response missing session id")
 		}
-		events, streamErrs, closeStream, err := localserver.StreamSessionEventsWithOptions(ctx, record.BaseURL, record.Token, sessionID, localserver.SessionStreamOptions{}, serverClientTimeout)
-		if err != nil {
-			return err
-		}
-		defer closeStream()
 		if _, err := fmt.Fprintf(stderr, "%s: attached to session %s\n", displayCommand, sessionID); err != nil {
 			return err
 		}
 		initialInput := chatInputEvent{line: line, multiline: multiline, ok: true}
-		return runAttachREPLWithScanner(ctx, record, sessionID, scanner, stdout, stderr, events, streamErrs, displayCommand, &initialInput)
+		return runAttachREPLWithScanner(ctx, service, sessionID, scanner, stdout, stderr, displayCommand, &initialInput)
 	}
 }
 
-func ensurePendingAttachProject(ctx context.Context, configPath, serverRoot, creationCWD, program string) (localserver.RegistryRecord, error) {
+func ensurePendingAttachProject(service *execution.Service, creationCWD, program string) error {
 	displayCommand := displayProgramName(program)
-	record, err := ensureProjectCommandServer(ctx, configPath, serverRoot, creationCWD, program)
+	project, ok, err := service.NearestProject(creationCWD, execution.NearestProjectOptions{})
 	if err != nil {
-		return localserver.RegistryRecord{}, err
+		return err
 	}
-	if _, ok, err := nearestProject(ctx, record, creationCWD); err != nil {
-		return localserver.RegistryRecord{}, err
-	} else if !ok {
-		return localserver.RegistryRecord{}, fmt.Errorf("no registered project found from %s; run %q", creationCWD, displayCommand+" project create")
+	if !ok || strings.TrimSpace(project.ID) == "" {
+		return fmt.Errorf("no registered project found from %s; run %q", creationCWD, displayCommand+" project create")
 	}
-	return record, nil
+	return nil
 }
 
-func writeAttachSnapshot(stdout io.Writer, snapshot localserver.SessionItemsPage) error {
+func writeAttachSnapshot(stdout io.Writer, snapshot execution.SessionItemsPage) error {
 	for _, item := range snapshot.Items {
 		if item.Kind != sessions.ItemKindMessage || item.Visibility != sessions.ItemVisibilityVisible || item.Message == nil || item.Message.Content == nil {
 			continue
@@ -2763,38 +1949,6 @@ func writeAttachSnapshot(stdout io.Writer, snapshot localserver.SessionItemsPage
 		}
 	}
 	return nil
-}
-
-func mostRecentProjectSessionID(ctx context.Context, record localserver.RegistryRecord, cwdFlag string, getwd func() (string, error), program string, newHint string) (string, error) {
-	displayCommand := displayProgramName(program)
-	effectiveCWD, err := resolveClientCWD(cwdFlag, getwd)
-	if err != nil {
-		return "", err
-	}
-	project, ok, err := nearestProject(ctx, record, effectiveCWD)
-	if err != nil {
-		return "", err
-	}
-	if !ok {
-		return "", fmt.Errorf("no registered project found from %s; run %q", effectiveCWD, displayCommand+" project create")
-	}
-	infos, err := localserver.ListProjectSessionsWithToken(ctx, record.BaseURL, record.Token, project.ID, serverClientTimeout)
-	if err != nil {
-		return "", err
-	}
-	if len(infos) == 0 {
-		return "", fmt.Errorf("no sessions found for project %s; create a session with %q or %q", project.ID, displayCommand+" session create", newHint)
-	}
-	latest := infos[0]
-	for _, info := range infos[1:] {
-		if info.UpdatedAt.After(latest.UpdatedAt) || (info.UpdatedAt.Equal(latest.UpdatedAt) && info.CreatedAt.After(latest.CreatedAt)) {
-			latest = info
-		}
-	}
-	if strings.TrimSpace(latest.ID) == "" {
-		return "", fmt.Errorf("most recent project session response missing session id")
-	}
-	return latest.ID, nil
 }
 
 func mostRecentExecutionProjectSessionID(service *execution.Service, cwdFlag string, getwd func() (string, error), program string, newHint string) (string, error) {
@@ -2835,23 +1989,25 @@ type attachOutputState struct {
 }
 
 type attachSendResult struct {
-	result localserver.SessionMessageResult
+	result execution.SessionMessageResult
 	err    error
 }
 
-func runAttachREPL(ctx context.Context, record localserver.RegistryRecord, sessionID string, stdin io.Reader, stdout, stderr io.Writer, events <-chan localserver.SessionStreamEvent, streamErrs <-chan error, displayCommand string) error {
+func runAttachREPL(ctx context.Context, service *execution.Service, sessionID string, stdin io.Reader, stdout, stderr io.Writer, displayCommand string) error {
 	scanner := bufio.NewScanner(stdin)
-	return runAttachREPLWithScanner(ctx, record, sessionID, scanner, stdout, stderr, events, streamErrs, displayCommand, nil)
+	return runAttachREPLWithScanner(ctx, service, sessionID, scanner, stdout, stderr, displayCommand, nil)
 }
 
-func runAttachREPLWithScanner(ctx context.Context, record localserver.RegistryRecord, sessionID string, scanner *bufio.Scanner, stdout, stderr io.Writer, events <-chan localserver.SessionStreamEvent, streamErrs <-chan error, displayCommand string, initialInput *chatInputEvent) error {
+func runAttachREPLWithScanner(ctx context.Context, service *execution.Service, sessionID string, scanner *bufio.Scanner, stdout, stderr io.Writer, displayCommand string, initialInput *chatInputEvent) error {
 	var inputCh <-chan chatInputEvent
 	var sendDone <-chan attachSendResult
+	var events <-chan execution.SessionStreamEvent
 	output := attachOutputState{stdoutAtLineStart: true}
 	turnInFlight := false
 	turnStarted := false
 	expectedTurnID := ""
 	terminalSeen := false
+	var pendingSendErr error
 	var terminalTurnIDs map[string]bool
 	setExpectedTurnID := func(turnID string) {
 		turnID = strings.TrimSpace(turnID)
@@ -2871,6 +2027,7 @@ func runAttachREPLWithScanner(ctx context.Context, record localserver.RegistryRe
 		turnStarted = false
 		expectedTurnID = ""
 		terminalSeen = false
+		pendingSendErr = nil
 		terminalTurnIDs = nil
 		if output.wroteText && !output.stdoutAtLineStart {
 			if _, err := fmt.Fprintln(stdout); err != nil {
@@ -2911,7 +2068,7 @@ func runAttachREPLWithScanner(ctx context.Context, record localserver.RegistryRe
 				return nil
 			}
 			if !input.multiline && command == "/compact" {
-				if _, err := localserver.CompactSessionWithToken(ctx, record.BaseURL, record.Token, sessionID, 0); err != nil {
+				if _, err := service.CompactSession(ctx, sessionID); err != nil {
 					if _, printErr := fmt.Fprintf(stderr, "%s: compact failed: %v\n", displayCommand, err); printErr != nil {
 						return printErr
 					}
@@ -2924,21 +2081,31 @@ func runAttachREPLWithScanner(ctx context.Context, record localserver.RegistryRe
 			}
 
 			done := make(chan attachSendResult, 1)
+			eventCh := make(chan execution.SessionStreamEvent, 64)
 			prompt := input.line
 			sendDone = done
+			events = eventCh
 			turnInFlight = true
 			turnStarted = false
 			expectedTurnID = ""
 			terminalSeen = false
+			pendingSendErr = nil
 			terminalTurnIDs = make(map[string]bool)
 			go func() {
-				result, err := localserver.SendSessionMessageWithToken(ctx, record.BaseURL, record.Token, sessionID, prompt, 0)
+				defer close(eventCh)
+				result, err := service.SendSessionMessageWithEvents(ctx, sessionID, prompt, func(event execution.SessionStreamEvent) {
+					select {
+					case eventCh <- event:
+					case <-ctx.Done():
+					}
+				})
 				done <- attachSendResult{result: result, err: err}
 			}()
 		case sendResult := <-sendDone:
 			sendDone = nil
 			if sendResult.err != nil {
-				if turnStarted && expectedTurnID != "" {
+				pendingSendErr = sendResult.err
+				if turnStarted || events != nil {
 					if err := finishTurnIfReady(); err != nil {
 						return err
 					}
@@ -2948,6 +2115,7 @@ func runAttachREPLWithScanner(ctx context.Context, record localserver.RegistryRe
 				turnStarted = false
 				expectedTurnID = ""
 				terminalSeen = false
+				pendingSendErr = nil
 				terminalTurnIDs = nil
 				if _, printErr := fmt.Fprintf(stderr, "%s: send failed: %v\n", displayCommand, sendResult.err); printErr != nil {
 					return printErr
@@ -2961,11 +2129,20 @@ func runAttachREPLWithScanner(ctx context.Context, record localserver.RegistryRe
 		case event, ok := <-events:
 			if !ok {
 				events = nil
-				if turnInFlight {
-					return fmt.Errorf("session stream closed before turn completed")
+				if turnInFlight && sendDone == nil && pendingSendErr != nil && !turnStarted {
+					turnInFlight = false
+					turnStarted = false
+					expectedTurnID = ""
+					terminalSeen = false
+					err := pendingSendErr
+					pendingSendErr = nil
+					terminalTurnIDs = nil
+					if _, printErr := fmt.Fprintf(stderr, "%s: send failed: %v\n", displayCommand, err); printErr != nil {
+						return printErr
+					}
 				}
-				if streamErrs == nil {
-					return nil
+				if err := finishTurnIfReady(); err != nil {
+					return err
 				}
 				continue
 			}
@@ -2989,39 +2166,28 @@ func runAttachREPLWithScanner(ctx context.Context, record localserver.RegistryRe
 					return err
 				}
 			}
-		case err, ok := <-streamErrs:
-			if ok && err != nil {
-				return err
-			}
-			streamErrs = nil
-			if turnInFlight {
-				return fmt.Errorf("session stream closed before turn completed")
-			}
-			if events == nil {
-				return nil
-			}
 		case <-ctx.Done():
 			return ctx.Err()
 		}
 	}
 }
 
-func attachEventType(event localserver.SessionStreamEvent) string {
+func attachEventType(event execution.SessionStreamEvent) string {
 	eventType, _ := event["type"].(string)
 	return eventType
 }
 
-func attachEventTurnID(event localserver.SessionStreamEvent) string {
+func attachEventTurnID(event execution.SessionStreamEvent) string {
 	turnID, _ := event["turn_id"].(string)
 	return strings.TrimSpace(turnID)
 }
 
-func isAttachTerminalEvent(event localserver.SessionStreamEvent) bool {
+func isAttachTerminalEvent(event execution.SessionStreamEvent) bool {
 	eventType := attachEventType(event)
 	return eventType == "turn.committed" || eventType == "turn.failed"
 }
 
-func writeAttachStreamEvent(stdout, stderr io.Writer, event localserver.SessionStreamEvent, output *attachOutputState, command string) error {
+func writeAttachStreamEvent(stdout, stderr io.Writer, event execution.SessionStreamEvent, output *attachOutputState, command string) error {
 	eventType, _ := event["type"].(string)
 	switch eventType {
 	case "text.delta":
@@ -3115,8 +2281,18 @@ func sendCommand(ctx context.Context, args []string, configPath string, configPr
 }
 
 func newCLISendExecutionService(homePath, program string) (*execution.Service, error) {
+	runner := executionAgentTurnRunner{program: program}
 	return execution.NewServiceWithOptions(homePath, execution.ServiceOptions{
-		TurnRunner: serverAgentTurnRunner{program: program},
+		TurnRunner:     runner,
+		CompactPlanner: runner,
+	})
+}
+
+func newCLIAttachExecutionService(homePath, program string) (*execution.Service, error) {
+	runner := executionAgentTurnRunner{program: program}
+	return execution.NewServiceWithOptions(homePath, execution.ServiceOptions{
+		TurnRunner:     runner,
+		CompactPlanner: runner,
 	})
 }
 
@@ -3140,25 +2316,6 @@ func rejectSessionConfigForExistingCommand(configProvided bool, helpCommand stri
 	return nil
 }
 
-func discoverClientServer(ctx context.Context, cwdFlag, homePath string, getwd func() (string, error), command string) (localserver.RegistryRecord, string, error) {
-	cwd, err := resolveClientCWD(cwdFlag, getwd)
-	if err != nil {
-		return localserver.RegistryRecord{}, "", err
-	}
-	store, err := localserver.NewRegistryStoreForServerRoot(homePath)
-	if err != nil {
-		return localserver.RegistryRecord{}, "", err
-	}
-	discovery, err := localserver.DiscoverHealthy(ctx, store, cwd, serverClientTimeout)
-	if err != nil {
-		return localserver.RegistryRecord{}, "", err
-	}
-	if !discovery.Found {
-		return localserver.RegistryRecord{}, cwd, noServerFoundError(cwd, command)
-	}
-	return discovery.Record, cwd, nil
-}
-
 func printSessionSendResult(stdout io.Writer, sessionID string, result execution.SessionMessageResult) error {
 	if _, err := fmt.Fprintf(stdout, "SESSION\t%s\n", sessionID); err != nil {
 		return err
@@ -3178,80 +2335,7 @@ func resolveClientCWD(cwdFlag string, getwd func() (string, error)) (string, err
 	if err != nil {
 		return "", err
 	}
-	return localserver.CanonicalPath(cwd)
-}
-
-func noServerFoundError(cwd, command string) error {
-	command = displayProgramName(command)
-	return fmt.Errorf("no healthy %s server found from %s; start one with %q", command, cwd, command+" server start")
-}
-
-func noSelectedServerFoundError(command string) error {
-	command = displayProgramName(command)
-	return fmt.Errorf("no healthy %s server found; start one with %q", command, command+" server start")
-}
-
-func printServerStartStatus(stdout io.Writer, status string, record localserver.RegistryRecord) error {
-	var out strings.Builder
-	fmt.Fprintf(&out, "STATUS\t%s\n", status)
-	fmt.Fprintf(&out, "ADDR\t%s\n", record.BaseURL)
-	fmt.Fprintf(&out, "PID\t%d\n", record.PID)
-	_, err := io.WriteString(stdout, out.String())
-	return err
-}
-
-func printServerStopStatus(stdout io.Writer, record localserver.RegistryRecord) error {
-	var out strings.Builder
-	fmt.Fprintln(&out, "STATUS\tstopped")
-	fmt.Fprintf(&out, "ADDR\t%s\n", record.BaseURL)
-	fmt.Fprintf(&out, "PID\t%d\n", record.PID)
-	_, err := io.WriteString(stdout, out.String())
-	return err
-}
-
-func printServerStatus(stdout io.Writer, status localserver.ServerStatus) error {
-	if _, err := fmt.Fprintln(stdout, "STATUS\trunning"); err != nil {
-		return err
-	}
-	if _, err := fmt.Fprintf(stdout, "ADDR\t%s\n", status.Addr); err != nil {
-		return err
-	}
-	if _, err := fmt.Fprintf(stdout, "PID\t%d\n", status.PID); err != nil {
-		return err
-	}
-	if _, err := fmt.Fprintf(stdout, "VERSION\t%s\n", status.Version); err != nil {
-		return err
-	}
-	if _, err := fmt.Fprintf(stdout, "SESSION_COUNT\t%d\n", status.SessionCount); err != nil {
-		return err
-	}
-	if _, err := fmt.Fprintf(stdout, "RUNNING_TURNS\t%d\n", status.RunningTurns); err != nil {
-		return err
-	}
-	_, err := fmt.Fprintf(stdout, "UPTIME_SECONDS\t%d\n", status.UptimeSeconds)
-	return err
-}
-
-func waitForServerStop(ctx context.Context, addr string) error {
-	deadline := time.Now().Add(serverStopWaitTimeout)
-	for {
-		if err := localserver.CheckHealth(ctx, addr, serverClientTimeout); err != nil {
-			if ctxErr := ctx.Err(); ctxErr != nil {
-				return ctxErr
-			}
-			return nil
-		}
-		if time.Now().After(deadline) {
-			return fmt.Errorf("server at %s did not stop within %s", addr, serverStopWaitTimeout)
-		}
-		timer := time.NewTimer(serverStopPollInterval)
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-			return ctx.Err()
-		case <-timer.C:
-		}
-	}
+	return canonicalPath(cwd)
 }
 
 func authCommand(ctx context.Context, args []string, configPath string, stdout io.Writer, getwd func() (string, error), program string) error {
@@ -3830,15 +2914,15 @@ func toolsListCommand(args []string, stdout io.Writer, command string) error {
 	return nil
 }
 
-func printServerSessionDetail(stdout io.Writer, session execution.SessionDetail) error {
-	return printServerSessionDetailFields(stdout, session, false)
+func printSessionDetail(stdout io.Writer, session execution.SessionDetail) error {
+	return printSessionDetailFields(stdout, session, false)
 }
 
-func printServerSessionDetailWithProject(stdout io.Writer, session execution.SessionDetail) error {
-	return printServerSessionDetailFields(stdout, session, true)
+func printSessionDetailWithProject(stdout io.Writer, session execution.SessionDetail) error {
+	return printSessionDetailFields(stdout, session, true)
 }
 
-func printServerSessionCommandStatus(stdout io.Writer, status string, session execution.SessionDetail) error {
+func printSessionCommandStatus(stdout io.Writer, status string, session execution.SessionDetail) error {
 	if _, err := fmt.Fprintf(stdout, "STATUS\t%s\n", status); err != nil {
 		return err
 	}
@@ -3869,7 +2953,7 @@ func printServerSessionCommandStatus(stdout io.Writer, status string, session ex
 	return err
 }
 
-func printServerSessionDetailFields(stdout io.Writer, session execution.SessionDetail, includeProject bool) error {
+func printSessionDetailFields(stdout io.Writer, session execution.SessionDetail, includeProject bool) error {
 	fmt.Fprintf(stdout, "ID\t%s\n", session.ID)
 	fmt.Fprintf(stdout, "CREATED_AT\t%s\n", formatSessionTimestamp(session.CreatedAt))
 	fmt.Fprintf(stdout, "UPDATED_AT\t%s\n", formatSessionTimestamp(session.UpdatedAt))
@@ -3910,7 +2994,7 @@ func printServerSessionDetailFields(stdout io.Writer, session execution.SessionD
 	return nil
 }
 
-func printServerSessionList(stdout io.Writer, infos []execution.SessionMetadata) error {
+func printSessionList(stdout io.Writer, infos []execution.SessionMetadata) error {
 	if _, err := fmt.Fprintln(stdout, "ID\tPROJECT_ID\tNAME\tCREATED_CWD\tARCHIVED\tLAST_USED_AT"); err != nil {
 		return err
 	}
@@ -6015,44 +5099,44 @@ type cliSubagentRunner struct {
 	program string
 }
 
-type serverAgentTurnRunner struct {
+type executionAgentTurnRunner struct {
 	program string
 }
 
-func (r serverAgentTurnRunner) RunSessionTurn(ctx context.Context, request localserver.SessionTurnRequest) (result localserver.SessionTurnResult, err error) {
+func (r executionAgentTurnRunner) RunSessionTurn(ctx context.Context, request execution.SessionTurnRequest) (result execution.SessionTurnResult, err error) {
 	if request.Publisher == nil {
-		return localserver.SessionTurnResult{}, fmt.Errorf("session turn publisher is required")
+		return execution.SessionTurnResult{}, fmt.Errorf("session turn publisher is required")
 	}
 	if strings.TrimSpace(request.TurnID) == "" {
-		return localserver.SessionTurnResult{}, fmt.Errorf("session turn id is required when publisher is configured")
+		return execution.SessionTurnResult{}, fmt.Errorf("session turn id is required when publisher is configured")
 	}
-	runtime, err := r.prepareServerSessionRuntime(ctx, request.Session, request.SessionStore)
+	runtime, err := r.prepareExecutionSessionRuntime(ctx, request.Session, request.SessionStore)
 	if err != nil {
-		return localserver.SessionTurnResult{}, err
+		return execution.SessionTurnResult{}, err
 	}
 	defer func() {
 		err = errors.Join(err, runtime.Close())
 	}()
 
-	if _, _, err := runServerOwnedSessionTurn(ctx, runtime, runtime.initialMessages(), request.Content, serverOwnedSessionTurnOptions{
+	if _, _, err := runExecutionSessionTurn(ctx, runtime, runtime.initialMessages(), request.Content, executionSessionTurnOptions{
 		emit:            request.Emit,
 		publisher:       request.Publisher,
 		turnID:          request.TurnID,
 		skipAutoCompact: true,
 	}); err != nil {
-		return localserver.SessionTurnResult{}, err
+		return execution.SessionTurnResult{}, err
 	}
 	if err := runtime.saveRuntimeMetadataForSession(request.Session.ID); err != nil {
-		return localserver.SessionTurnResult{}, err
+		return execution.SessionTurnResult{}, err
 	}
-	return localserver.SessionTurnResult{
+	return execution.SessionTurnResult{
 		Session:     runtime.resumableSession,
 		Incremental: true,
 	}, nil
 }
 
-func (r serverAgentTurnRunner) SupportsIncrementalSessionTurn(ctx context.Context, request localserver.SessionTurnRequest) (supported bool, err error) {
-	runtime, err := r.prepareServerSessionRuntime(ctx, request.Session, request.SessionStore)
+func (r executionAgentTurnRunner) SupportsIncrementalSessionTurn(ctx context.Context, request execution.SessionTurnRequest) (supported bool, err error) {
+	runtime, err := r.prepareExecutionSessionRuntime(ctx, request.Session, request.SessionStore)
 	if err != nil {
 		return false, err
 	}
@@ -6062,10 +5146,10 @@ func (r serverAgentTurnRunner) SupportsIncrementalSessionTurn(ctx context.Contex
 	return true, nil
 }
 
-func (r serverAgentTurnRunner) PlanSessionTurnCompaction(ctx context.Context, request localserver.SessionTurnRequest) (result localserver.SessionCompactionResult, err error) {
-	runtime, err := r.prepareServerSessionRuntime(ctx, request.Session, request.SessionStore)
+func (r executionAgentTurnRunner) PlanSessionTurnCompaction(ctx context.Context, request execution.SessionTurnRequest) (result execution.SessionCompactionResult, err error) {
+	runtime, err := r.prepareExecutionSessionRuntime(ctx, request.Session, request.SessionStore)
 	if err != nil {
-		return localserver.SessionCompactionResult{}, err
+		return execution.SessionCompactionResult{}, err
 	}
 	defer func() {
 		err = errors.Join(err, runtime.Close())
@@ -6073,26 +5157,26 @@ func (r serverAgentTurnRunner) PlanSessionTurnCompaction(ctx context.Context, re
 
 	_, compaction, err := runtime.planAutoCompactBeforeTurn(ctx, runtime.initialMessages(), request.Content)
 	if err != nil {
-		return localserver.SessionCompactionResult{}, err
+		return execution.SessionCompactionResult{}, err
 	}
 	if compaction == nil {
-		return localserver.SessionCompactionResult{
+		return execution.SessionCompactionResult{
 			Session: runtime.resumableSession,
 		}, nil
 	}
-	return localserver.SessionCompactionResult{
+	return execution.SessionCompactionResult{
 		Session: runtime.resumableSession,
-		Compaction: localserver.SessionCompactionPlan{
+		Compaction: execution.SessionCompactionPlan{
 			SummaryItem: compaction.summaryItem,
 			Checkpoint:  compaction.checkpoint,
 		},
 	}, nil
 }
 
-func (r serverAgentTurnRunner) PlanSessionCompaction(ctx context.Context, request localserver.SessionCompactionRequest) (result localserver.SessionCompactionResult, err error) {
-	runtime, err := r.prepareServerSessionRuntime(ctx, request.Session, request.SessionStore)
+func (r executionAgentTurnRunner) PlanSessionCompaction(ctx context.Context, request execution.SessionCompactionRequest) (result execution.SessionCompactionResult, err error) {
+	runtime, err := r.prepareExecutionSessionRuntime(ctx, request.Session, request.SessionStore)
 	if err != nil {
-		return localserver.SessionCompactionResult{}, err
+		return execution.SessionCompactionResult{}, err
 	}
 	defer func() {
 		err = errors.Join(err, runtime.Close())
@@ -6104,18 +5188,18 @@ func (r serverAgentTurnRunner) PlanSessionCompaction(ctx context.Context, reques
 		trigger: "manual",
 	})
 	if err != nil {
-		return localserver.SessionCompactionResult{}, err
+		return execution.SessionCompactionResult{}, err
 	}
-	return localserver.SessionCompactionResult{
+	return execution.SessionCompactionResult{
 		Session: runtime.resumableSession,
-		Compaction: localserver.SessionCompactionPlan{
+		Compaction: execution.SessionCompactionPlan{
 			SummaryItem: plan.summaryItem,
 			Checkpoint:  plan.checkpoint,
 		},
 	}, nil
 }
 
-func (r serverAgentTurnRunner) prepareServerSessionRuntime(ctx context.Context, session sessions.SessionV2, store *sessions.V2Store) (*agentRuntime, error) {
+func (r executionAgentTurnRunner) prepareExecutionSessionRuntime(ctx context.Context, session sessions.SessionV2, store *sessions.V2Store) (*agentRuntime, error) {
 	cwd := strings.TrimSpace(session.CreatedCWD)
 	if cwd == "" {
 		return nil, fmt.Errorf("session created_cwd is required")
@@ -6135,14 +5219,14 @@ func (r serverAgentTurnRunner) prepareServerSessionRuntime(ctx context.Context, 
 	})
 }
 
-type serverOwnedSessionTurnOptions struct {
+type executionSessionTurnOptions struct {
 	emit            func(model.Event)
 	publisher       eventbus.Publisher
 	turnID          string
 	skipAutoCompact bool
 }
 
-func runServerOwnedSessionTurn(ctx context.Context, runtime *agentRuntime, messages []model.Message, prompt string, options serverOwnedSessionTurnOptions) ([]model.Message, *compactionPlan, error) {
+func runExecutionSessionTurn(ctx context.Context, runtime *agentRuntime, messages []model.Message, prompt string, options executionSessionTurnOptions) ([]model.Message, *compactionPlan, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, nil, err
 	}

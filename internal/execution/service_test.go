@@ -400,6 +400,220 @@ func TestServiceSendSessionMessagePersistsSuccessfulTurn(t *testing.T) {
 	}
 }
 
+func TestServiceGetSessionChatItemsFiltersItemBackedVisibleMessages(t *testing.T) {
+	home := t.TempDir()
+	service, _, session := newExecutionServiceWithSession(t, home, fakeExecutionTurnRunner{supports: true})
+	blob, err := service.sessionStore.WriteBlob([]byte("full blob-backed assistant response that must not be printed in attach snapshots"), "utf-8", "text/plain")
+	if err != nil {
+		t.Fatalf("WriteBlob() error = %v", err)
+	}
+	_, err = service.sessionStore.AppendItemsAndReplaceActiveHistory(session.ID, []sessions.SessionItem{
+		{
+			ID:         "visible-user",
+			Kind:       sessions.ItemKindMessage,
+			Visibility: sessions.ItemVisibilityVisible,
+			Audience:   sessions.ItemAudienceUser,
+			Message:    &model.Message{Role: model.MessageRoleUser, Content: "hello"},
+		},
+		{
+			ID:         "visible-assistant-preview",
+			Kind:       sessions.ItemKindMessage,
+			Visibility: sessions.ItemVisibilityVisible,
+			Audience:   sessions.ItemAudienceModel,
+			Message:    &model.Message{Role: model.MessageRoleAssistant},
+			Content:    &sessions.StoredContent{Preview: "long answer preview"},
+		},
+		{
+			ID:         "visible-assistant-blob",
+			Kind:       sessions.ItemKindMessage,
+			Visibility: sessions.ItemVisibilityVisible,
+			Audience:   sessions.ItemAudienceModel,
+			Message:    &model.Message{Role: model.MessageRoleAssistant},
+			Content:    &sessions.StoredContent{Blob: &blob},
+		},
+		{
+			ID:         "hidden-summary",
+			Kind:       sessions.ItemKindMessage,
+			Visibility: sessions.ItemVisibilityHidden,
+			Audience:   sessions.ItemAudienceModel,
+			Message:    &model.Message{Role: model.MessageRoleAssistant, Content: "hidden secret"},
+		},
+		{
+			ID:         "debug-user",
+			Kind:       sessions.ItemKindMessage,
+			Visibility: sessions.ItemVisibilityDebug,
+			Audience:   sessions.ItemAudienceInternal,
+			Message:    &model.Message{Role: model.MessageRoleUser, Content: "debug secret"},
+		},
+		{
+			ID:         "tool-result",
+			Kind:       sessions.ItemKindMessage,
+			Visibility: sessions.ItemVisibilityVisible,
+			Audience:   sessions.ItemAudienceModel,
+			Message:    &model.Message{Role: model.MessageRoleTool, ToolCallID: "call-1", Content: "tool secret"},
+		},
+	}, []string{"visible-user", "visible-assistant-preview", "visible-assistant-blob", "hidden-summary", "debug-user", "tool-result"})
+	if err != nil {
+		t.Fatalf("AppendItemsAndReplaceActiveHistory() error = %v", err)
+	}
+
+	page, err := service.GetSessionChatItems(session.ID)
+	if err != nil {
+		t.Fatalf("GetSessionChatItems() error = %v", err)
+	}
+	if got := executionSessionItemIDs(page.Items); !sameStringSlice(got, []string{"visible-user", "visible-assistant-preview", "visible-assistant-blob"}) {
+		t.Fatalf("chat item IDs = %#v, want visible user/assistant items", got)
+	}
+	if page.Items[0].Message == nil || page.Items[0].Message.Content == nil || page.Items[0].Message.Content.Inline != "hello" {
+		t.Fatalf("user item DTO = %#v, want inline content", page.Items[0])
+	}
+	if page.Items[1].Message == nil || page.Items[1].Message.Content == nil || page.Items[1].Message.Content.Preview != "long answer preview" {
+		t.Fatalf("assistant item DTO = %#v, want preview content", page.Items[1])
+	}
+	if page.Items[2].Message == nil {
+		t.Fatalf("blob-backed assistant item DTO = %#v, want message metadata", page.Items[2])
+	}
+	if content := page.Items[2].Message.Content; content != nil && (content.Inline != "" || content.Preview != "") {
+		t.Fatalf("blob-backed assistant content = %#v, want no full blob materialized", content)
+	}
+	if page.OldestSeq == 0 || page.NewestSeq <= page.OldestSeq || page.HasMoreBefore || page.HasMoreAfter {
+		t.Fatalf("page bounds = %#v, want bounded recent page without more flags", page)
+	}
+}
+
+func TestServiceSendSessionMessageWithEventsEmitsDirectStreamEvents(t *testing.T) {
+	home := t.TempDir()
+	runner := fakeExecutionTurnRunner{
+		supports: true,
+		run: func(ctx context.Context, request SessionTurnRequest) (SessionTurnResult, error) {
+			request.Emit(model.TextDeltaEvent{Text: "streamed"})
+			request.Emit(model.ToolCallDoneEvent{ToolCall: model.ToolCall{ID: "call-1", Name: "read_file"}})
+			request.Emit(model.ToolResultEvent{Result: model.ToolResult{ToolCallID: "call-1", Name: "read_file"}})
+			if err := request.Publisher.Publish(eventAssistant(request.TurnID, "answer")); err != nil {
+				return SessionTurnResult{}, err
+			}
+			return SessionTurnResult{Incremental: true}, nil
+		},
+	}
+	service, _, session := newExecutionServiceWithSession(t, home, runner)
+	var events []SessionStreamEvent
+
+	result, err := service.SendSessionMessageWithEvents(context.Background(), session.ID, "hello", func(event SessionStreamEvent) {
+		events = append(events, event)
+	})
+	if err != nil {
+		t.Fatalf("SendSessionMessageWithEvents() error = %v", err)
+	}
+	if result.Status != "committed" || result.TurnID != "turn-000001" || result.LastSeq == 0 {
+		t.Fatalf("SendSessionMessageWithEvents() = %#v, want committed result", result)
+	}
+	types := sessionStreamEventTypes(events)
+	if len(types) < 7 || types[0] != "turn.started" || types[len(types)-1] != "turn.committed" {
+		t.Fatalf("event types = %#v, want turn.started first and turn.committed last", types)
+	}
+	for _, want := range []string{"item.appended", "text.delta", "tool.started", "tool.finished"} {
+		if !stringSliceContains(types, want) {
+			t.Fatalf("event types = %#v, want contain %q", types, want)
+		}
+	}
+	if got := countString(types, "item.appended"); got != 2 {
+		t.Fatalf("item.appended count = %d, want user and assistant items", got)
+	}
+	if !sessionStreamEventsContain(events, "text.delta", "text", "streamed") {
+		t.Fatalf("events = %#v, want streamed text delta", events)
+	}
+}
+
+func TestServiceCompactSessionUsesConfiguredPlanner(t *testing.T) {
+	home := t.TempDir()
+	called := false
+	planner := fakeExecutionCompactPlanner{
+		plan: func(ctx context.Context, request SessionCompactionRequest) (SessionCompactionResult, error) {
+			called = true
+			if request.SessionStore == nil || !sameStringSlice(request.Session.ActiveHistory, []string{"old-user", "old-assistant"}) {
+				t.Fatalf("PlanSessionCompaction request = %#v, want active history and store", request)
+			}
+			return SessionCompactionResult{Compaction: SessionCompactionPlan{
+				SummaryItem: sessions.SessionItem{
+					ID:         "manual-summary",
+					Kind:       sessions.ItemKindMessage,
+					Visibility: sessions.ItemVisibilityHidden,
+					Audience:   sessions.ItemAudienceModel,
+					Message:    &model.Message{Role: model.MessageRoleDeveloper, Content: "manual summary"},
+				},
+				Checkpoint: sessions.CompactionCheckpoint{
+					ID:                    "manual-checkpoint",
+					Reason:                "manual",
+					Phase:                 "manual",
+					Trigger:               "manual",
+					SummaryItemID:         "manual-summary",
+					PreviousActiveHistory: request.Session.ActiveHistory,
+					ReplacementHistory:    []string{"manual-summary"},
+				},
+			}}, nil
+		},
+	}
+	service, err := NewServiceWithOptions(home, ServiceOptions{
+		TurnRunner:     fakeExecutionTurnRunner{supports: true},
+		CompactPlanner: planner,
+	})
+	if err != nil {
+		t.Fatalf("NewServiceWithOptions() error = %v", err)
+	}
+	projectRoot := mkdirProjectRoot(t, "compact-repo")
+	project, err := service.CreateProject(projectRoot, "Compact Repo")
+	if err != nil {
+		t.Fatalf("CreateProject() error = %v", err)
+	}
+	session, err := service.CreateSession(project.Project.ID, SessionCreateMetadata{CreatedCWD: project.Project.Root, Provider: "fake", ModelProfile: "default", ModelID: "model-default"})
+	if err != nil {
+		t.Fatalf("CreateSession() error = %v", err)
+	}
+	if _, err := service.sessionStore.AppendItemsAndReplaceActiveHistory(session.ID, []sessions.SessionItem{
+		{
+			ID:         "old-user",
+			Kind:       sessions.ItemKindMessage,
+			Visibility: sessions.ItemVisibilityVisible,
+			Audience:   sessions.ItemAudienceUser,
+			Message:    &model.Message{Role: model.MessageRoleUser, Content: "old prompt"},
+		},
+		{
+			ID:         "old-assistant",
+			Kind:       sessions.ItemKindMessage,
+			Visibility: sessions.ItemVisibilityVisible,
+			Audience:   sessions.ItemAudienceModel,
+			Message:    &model.Message{Role: model.MessageRoleAssistant, Content: "old answer"},
+		},
+	}, []string{"old-user", "old-assistant"}); err != nil {
+		t.Fatalf("AppendItemsAndReplaceActiveHistory(seed) error = %v", err)
+	}
+
+	result, err := service.CompactSession(context.Background(), session.ID)
+	if err != nil {
+		t.Fatalf("CompactSession() error = %v", err)
+	}
+	if !called {
+		t.Fatal("PlanSessionCompaction was not called")
+	}
+	if result.Status != "committed" || result.CompactionID != "manual-checkpoint" || result.SummaryItemID != "manual-summary" || result.LastSeq == 0 {
+		t.Fatalf("CompactSession() = %#v, want manual compaction result", result)
+	}
+	loaded, err := service.sessionStore.Load(session.ID)
+	if err != nil {
+		t.Fatalf("Load(session) error = %v", err)
+	}
+	if len(loaded.Compactions) != 1 || loaded.Compactions[0].ID != "manual-checkpoint" {
+		t.Fatalf("Compactions = %#v, want manual checkpoint", loaded.Compactions)
+	}
+	messages, err := loaded.MaterializeActiveHistory()
+	if err != nil {
+		t.Fatalf("MaterializeActiveHistory() error = %v", err)
+	}
+	if got := messageContents(messages); !sameStringSlice(got, []string{"manual summary"}) {
+		t.Fatalf("active messages = %#v, want compacted summary", got)
+	}
+}
+
 func TestServiceSendSessionMessageRunsAutoCompactionBeforeTurn(t *testing.T) {
 	home := t.TempDir()
 	var planned bool
@@ -567,6 +781,17 @@ func (r fakeExecutionTurnRunner) PlanSessionTurnCompaction(ctx context.Context, 
 	return r.plan(ctx, request)
 }
 
+type fakeExecutionCompactPlanner struct {
+	plan func(context.Context, SessionCompactionRequest) (SessionCompactionResult, error)
+}
+
+func (p fakeExecutionCompactPlanner) PlanSessionCompaction(ctx context.Context, request SessionCompactionRequest) (SessionCompactionResult, error) {
+	if p.plan == nil {
+		return SessionCompactionResult{}, nil
+	}
+	return p.plan(ctx, request)
+}
+
 func newExecutionServiceWithSession(t *testing.T, home string, runner SessionTurnRunner) (*Service, ProjectCreateResult, SessionDetail) {
 	t.Helper()
 
@@ -652,4 +877,49 @@ func sessionItemIDs(items []sessions.SessionItem) []string {
 		ids = append(ids, item.ID)
 	}
 	return ids
+}
+
+func executionSessionItemIDs(items []SessionItem) []string {
+	ids := make([]string, 0, len(items))
+	for _, item := range items {
+		ids = append(ids, item.ID)
+	}
+	return ids
+}
+
+func sessionStreamEventTypes(events []SessionStreamEvent) []string {
+	types := make([]string, 0, len(events))
+	for _, event := range events {
+		eventType, _ := event["type"].(string)
+		types = append(types, eventType)
+	}
+	return types
+}
+
+func sessionStreamEventsContain(events []SessionStreamEvent, eventType, key string, value any) bool {
+	for _, event := range events {
+		if event["type"] == eventType && event[key] == value {
+			return true
+		}
+	}
+	return false
+}
+
+func stringSliceContains(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
+}
+
+func countString(values []string, want string) int {
+	count := 0
+	for _, value := range values {
+		if value == want {
+			count++
+		}
+	}
+	return count
 }

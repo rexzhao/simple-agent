@@ -527,23 +527,23 @@
 
 ## M22：Execution Library and Direct CLI (No HTTP Product Layer)
 
-- [ ] execution library 以记录存储位置（home/storage root）作为唯一必需初始化参数。
-- [ ] execution library 拥有 project/session store、nearest project discovery、session selection、
+- [x] execution library 以记录存储位置（home/storage root）作为唯一必需初始化参数。
+- [x] execution library 拥有 project/session store、nearest project discovery、session selection、
   turn lock、event persistence、compaction、runtime metadata 和 interrupted recovery。
-- [ ] CLI 直接调用 execution library，不通过 HTTP client、WebSocket client、registry 或 background
+- [x] CLI 直接调用 execution library，不通过 HTTP client、WebSocket client、registry 或 background
   server。
 - [ ] CLI 只负责参数解析、交互输入和渲染 DTO/events。
 - [ ] CLI 不直接操作 provider adapters、tool execution、project/session stores、blob store 或
   event projector。
-- [ ] 删除当前产品路径中的 `server` 前台/后台命令、auto-start、registry、bearer token、HTTP client
+- [x] 删除当前产品路径中的 `server` 前台/后台命令、auto-start、registry、bearer token、HTTP client
   helpers、HTTP handlers 和 WebSocket stream。
-- [ ] attach/send/new/project/session 命令复用同一套 execution library API。
-- [ ] 不恢复 hardcoded chat product entry，也不保留 hidden chat alias。
-- [ ] future HTTP adapter、GUI 和跨终端共享能力保持 out of scope。
-- [ ] CLI 测试覆盖 project/session lifecycle、attach/send/new/compact，且不启动 server。
-- [ ] 测试覆盖 CLI product path 不访问 registry、HTTP client、HTTP handlers 或 WebSocket stream。
-- [ ] execution library 测试覆盖 storage root 初始化、project/session lifecycle、selection、busy
+- [x] attach/send/new/project/session 命令复用同一套 execution library API。
+- [x] 不恢复 hardcoded chat product entry，也不保留 hidden chat alias。
+- [x] future HTTP adapter、GUI 和跨终端共享能力保持 out of scope。
+- [x] CLI 测试覆盖 project/session lifecycle、attach/send/new/compact，且不启动 server。
+- [x] 测试覆盖 CLI product path 不访问 registry、HTTP client、HTTP handlers 或 WebSocket stream。
+- [x] execution library 测试覆盖 storage root 初始化、project/session lifecycle、selection、busy
   turn rejection、event streaming/persistence、compaction 和 interrupted recovery。
-- [ ] `docs/tasks/execution-library-no-http-checklist.md` 记录实现 smoke evidence。
-- [ ] 验证 `go test ./...`。
-- [ ] 验证 `git diff --check`。
+- [x] `docs/tasks/execution-library-no-http-checklist.md` 记录实现 smoke evidence。
+- [x] 验证 `go test ./...`。
+- [x] 验证 `git diff --check`。
