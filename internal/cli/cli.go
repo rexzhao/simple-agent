@@ -2171,7 +2171,7 @@ func sessionCreateCommand(ctx context.Context, args []string, configPath, homePa
 	if err != nil {
 		return err
 	}
-	_, session, err := createProjectSessionForCWD(ctx, configPath, homePath, creationCWD, program)
+	session, err := createExecutionSessionForCWD(configPath, homePath, creationCWD, program)
 	if err != nil {
 		return err
 	}
@@ -2198,13 +2198,14 @@ func sessionListCommand(ctx context.Context, args []string, configPath string, c
 		return usageError("--project cannot be combined with --all-projects", "", "sai help session list")
 	}
 
-	listOptions := localserver.SessionListOptions{Archived: *archived}
+	service, err := execution.NewService(homePath)
+	if err != nil {
+		return err
+	}
+	listOptions := execution.SessionListOptions{Archived: *archived}
 	if *allProjects {
-		record, err := ensureSessionCommandServer(ctx, configPath, homePath, program, getwd)
-		if err != nil {
-			return err
-		}
-		infos, err := localserver.ListSessionsWithOptions(ctx, record.BaseURL, record.Token, listOptions, serverClientTimeout)
+		listOptions.AllProjects = true
+		infos, err := service.ListSessions(listOptions)
 		if err != nil {
 			return err
 		}
@@ -2212,17 +2213,12 @@ func sessionListCommand(ctx context.Context, args []string, configPath string, c
 	}
 
 	project := strings.TrimSpace(*projectID)
-	var record localserver.RegistryRecord
 	if project == "" {
 		effectiveCWD, err := resolveClientCWD("", getwd)
 		if err != nil {
 			return err
 		}
-		record, err = ensureProjectCommandServer(ctx, configPath, homePath, effectiveCWD, program)
-		if err != nil {
-			return err
-		}
-		nearest, ok, err := nearestProject(ctx, record, effectiveCWD)
+		nearest, ok, err := service.NearestProject(effectiveCWD, execution.NearestProjectOptions{})
 		if err != nil {
 			return err
 		}
@@ -2230,14 +2226,10 @@ func sessionListCommand(ctx context.Context, args []string, configPath string, c
 			return fmt.Errorf("no registered project found from %s; run %q", effectiveCWD, displayCommand+" project create")
 		}
 		project = nearest.ID
-	} else {
-		record, err = ensureSessionCommandServer(ctx, configPath, homePath, program, getwd)
-		if err != nil {
-			return err
-		}
 	}
 
-	infos, err := localserver.ListProjectSessionsWithOptions(ctx, record.BaseURL, record.Token, project, listOptions, serverClientTimeout)
+	listOptions.ProjectID = project
+	infos, err := service.ListSessions(listOptions)
 	if err != nil {
 		return err
 	}
@@ -2258,11 +2250,11 @@ func sessionShowCommand(ctx context.Context, args []string, configPath string, c
 		return usageError("usage: sai session show <session-id>", "", "sai help session show")
 	}
 
-	record, err := ensureSessionCommandServer(ctx, configPath, homePath, program, getwd)
+	service, err := execution.NewService(homePath)
 	if err != nil {
 		return err
 	}
-	session, err := localserver.GetSessionDetail(ctx, record.BaseURL, record.Token, positionals[0], serverClientTimeout)
+	session, err := service.GetSession(positionals[0])
 	if err != nil {
 		return err
 	}
@@ -2291,11 +2283,11 @@ func sessionRenameCommand(ctx context.Context, args []string, configPath string,
 		return usageError("session display name must be a non-empty string", "", "sai help session rename")
 	}
 
-	record, err := ensureSessionCommandServer(ctx, configPath, homePath, program, getwd)
+	service, err := execution.NewService(homePath)
 	if err != nil {
 		return err
 	}
-	session, err := localserver.RenameSessionWithToken(ctx, record.BaseURL, record.Token, sessionID, displayName, serverClientTimeout)
+	session, err := service.RenameSession(sessionID, displayName)
 	if err != nil {
 		return err
 	}
@@ -2320,11 +2312,11 @@ func sessionArchiveCommand(ctx context.Context, args []string, configPath string
 		return usageError("session id must be a non-empty string", "", "sai help session archive")
 	}
 
-	record, err := ensureSessionCommandServer(ctx, configPath, homePath, program, getwd)
+	service, err := execution.NewService(homePath)
 	if err != nil {
 		return err
 	}
-	session, err := localserver.ArchiveSessionWithToken(ctx, record.BaseURL, record.Token, sessionID, serverClientTimeout)
+	session, err := service.ArchiveSession(sessionID)
 	if err != nil {
 		return err
 	}
@@ -2349,11 +2341,11 @@ func sessionRemoveCommand(ctx context.Context, args []string, configPath string,
 		return usageError("session id must be a non-empty string", "", "sai help session remove")
 	}
 
-	record, err := ensureSessionCommandServer(ctx, configPath, homePath, program, getwd)
+	service, err := execution.NewService(homePath)
 	if err != nil {
 		return err
 	}
-	result, err := localserver.RemoveSessionWithToken(ctx, record.BaseURL, record.Token, sessionID, serverClientTimeout)
+	result, err := service.RemoveSession(sessionID)
 	if err != nil {
 		return err
 	}
@@ -2409,6 +2401,35 @@ func selectExecutionProjectID(service *execution.Service, id, effectiveCWD, disp
 	return project.ID, nil
 }
 
+func createExecutionSessionForCWD(configPath, homePath, creationCWD, program string) (execution.SessionDetail, error) {
+	displayCommand := displayProgramName(program)
+	service, err := execution.NewService(homePath)
+	if err != nil {
+		return execution.SessionDetail{}, err
+	}
+	project, ok, err := service.NearestProject(creationCWD, execution.NearestProjectOptions{})
+	if err != nil {
+		return execution.SessionDetail{}, err
+	}
+	if !ok {
+		return execution.SessionDetail{}, fmt.Errorf("no registered project found from %s; run %q", creationCWD, displayCommand+" project create")
+	}
+
+	cfg, err := loadConfig(serverConfigPath(configPath, creationCWD), func() (string, error) {
+		return creationCWD, nil
+	}, program)
+	if err != nil {
+		return execution.SessionDetail{}, err
+	}
+	defaults, err := serverSessionDefaultsFromConfig(cfg, creationCWD)
+	if err != nil {
+		return execution.SessionDetail{}, err
+	}
+	defaults.CreatedCWD = creationCWD
+	metadata := executionSessionCreateMetadataFromDefaults(defaults)
+	return service.CreateSession(project.ID, metadata)
+}
+
 func createProjectSessionForCWD(ctx context.Context, configPath, serverRoot, creationCWD, program string) (localserver.RegistryRecord, localserver.SessionDetail, error) {
 	displayCommand := displayProgramName(program)
 	record, err := ensureProjectCommandServer(ctx, configPath, serverRoot, creationCWD, program)
@@ -2444,6 +2465,30 @@ func createProjectSessionForCWD(ctx context.Context, configPath, serverRoot, cre
 
 func ensureSessionCommandServer(ctx context.Context, _ string, serverRoot, program string, _ func() (string, error)) (localserver.RegistryRecord, error) {
 	return ensureSelectedServer(ctx, serverRoot, program)
+}
+
+func executionSessionCreateMetadataFromDefaults(session sessions.SessionV2) execution.SessionCreateMetadata {
+	showReasoning := session.ShowReasoning
+	saveToolResults := session.SaveToolResults
+	context := session.Context
+	createdCWD := session.CreatedCWD
+	if strings.TrimSpace(createdCWD) == "" {
+		createdCWD = session.CWD
+	}
+	return execution.SessionCreateMetadata{
+		CreatedCWD:      createdCWD,
+		ConfigPath:      session.ConfigPath,
+		Provider:        session.Provider,
+		ModelProfile:    session.ModelProfile,
+		ModelID:         session.ModelID,
+		ModelParameters: copyParameterMap(session.ModelParameters),
+		EnabledTools:    copyStringSlice(session.EnabledTools),
+		EnabledMCP:      copyStringSlice(session.EnabledMCP),
+		EnabledSkills:   copyStringSlice(session.EnabledSkills),
+		ShowReasoning:   &showReasoning,
+		Context:         &context,
+		SaveToolResults: &saveToolResults,
+	}
 }
 
 func sessionCreateMetadataFromDefaults(session sessions.SessionV2) localserver.SessionCreateMetadata {
@@ -3755,15 +3800,15 @@ func toolsListCommand(args []string, stdout io.Writer, command string) error {
 	return nil
 }
 
-func printServerSessionDetail(stdout io.Writer, session localserver.SessionDetail) error {
+func printServerSessionDetail(stdout io.Writer, session execution.SessionDetail) error {
 	return printServerSessionDetailFields(stdout, session, false)
 }
 
-func printServerSessionDetailWithProject(stdout io.Writer, session localserver.SessionDetail) error {
+func printServerSessionDetailWithProject(stdout io.Writer, session execution.SessionDetail) error {
 	return printServerSessionDetailFields(stdout, session, true)
 }
 
-func printServerSessionCommandStatus(stdout io.Writer, status string, session localserver.SessionDetail) error {
+func printServerSessionCommandStatus(stdout io.Writer, status string, session execution.SessionDetail) error {
 	if _, err := fmt.Fprintf(stdout, "STATUS\t%s\n", status); err != nil {
 		return err
 	}
@@ -3794,7 +3839,7 @@ func printServerSessionCommandStatus(stdout io.Writer, status string, session lo
 	return err
 }
 
-func printServerSessionDetailFields(stdout io.Writer, session localserver.SessionDetail, includeProject bool) error {
+func printServerSessionDetailFields(stdout io.Writer, session execution.SessionDetail, includeProject bool) error {
 	fmt.Fprintf(stdout, "ID\t%s\n", session.ID)
 	fmt.Fprintf(stdout, "CREATED_AT\t%s\n", formatSessionTimestamp(session.CreatedAt))
 	fmt.Fprintf(stdout, "UPDATED_AT\t%s\n", formatSessionTimestamp(session.UpdatedAt))
@@ -3835,7 +3880,7 @@ func printServerSessionDetailFields(stdout io.Writer, session localserver.Sessio
 	return nil
 }
 
-func printServerSessionList(stdout io.Writer, infos []localserver.SessionMetadata) error {
+func printServerSessionList(stdout io.Writer, infos []execution.SessionMetadata) error {
 	if _, err := fmt.Fprintln(stdout, "ID\tPROJECT_ID\tNAME\tCREATED_CWD\tARCHIVED\tLAST_USED_AT"); err != nil {
 		return err
 	}

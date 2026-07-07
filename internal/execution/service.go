@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/rexzhao/simple-agent/internal/contextwindow"
 	projectstore "github.com/rexzhao/simple-agent/internal/projects"
 	"github.com/rexzhao/simple-agent/internal/sessions"
 )
@@ -43,6 +44,76 @@ type ProjectListOptions struct {
 
 type NearestProjectOptions struct {
 	IncludeArchived bool
+}
+
+type SessionMetadata struct {
+	ID                string
+	CreatedAt         time.Time
+	UpdatedAt         time.Time
+	DisplayName       string
+	Archived          bool
+	LastUsedAt        time.Time
+	InterruptedAt     time.Time
+	InterruptedTurnID string
+	Provider          string
+	ModelProfile      string
+	ModelID           string
+	ProjectID         string
+	CreatedCWD        string
+	LastSeq           int64
+}
+
+type SessionDetail struct {
+	ID                string
+	CreatedAt         time.Time
+	UpdatedAt         time.Time
+	DisplayName       string
+	Archived          bool
+	LastUsedAt        time.Time
+	InterruptedAt     time.Time
+	InterruptedTurnID string
+	Provider          string
+	ModelProfile      string
+	ModelID           string
+	Status            string
+	LastSeq           int64
+	CWD               string
+	ProjectID         string
+	CreatedCWD        string
+	ConfigPath        string
+	ModelParameters   map[string]any
+	EnabledTools      []string
+	EnabledMCP        []string
+	EnabledSkills     []string
+	ShowReasoning     bool
+	Context           contextwindow.Metadata
+	SaveToolResults   bool
+}
+
+type SessionCreateMetadata struct {
+	CreatedCWD      string
+	ConfigPath      string
+	Provider        string
+	ModelProfile    string
+	ModelID         string
+	ModelParameters map[string]any
+	EnabledTools    []string
+	EnabledMCP      []string
+	EnabledSkills   []string
+	ShowReasoning   *bool
+	Context         *contextwindow.Metadata
+	SaveToolResults *bool
+}
+
+type SessionListOptions struct {
+	ProjectID   string
+	AllProjects bool
+	Archived    bool
+}
+
+type SessionRemoveResult struct {
+	Status string
+	ID     string
 }
 
 func NewService(home string) (*Service, error) {
@@ -193,6 +264,146 @@ func (s *Service) RemoveProject(id string) (ProjectRemoveResult, error) {
 	return ProjectRemoveResult{Status: "removed", ID: project.ID, RemovedSessions: removedSessions}, nil
 }
 
+func (s *Service) CreateSession(projectID string, metadata SessionCreateMetadata) (SessionDetail, error) {
+	project, err := s.loadActiveProject(projectID)
+	if err != nil {
+		return SessionDetail{}, err
+	}
+	if s == nil || s.sessionStore == nil {
+		return SessionDetail{}, fmt.Errorf("execution session store is not configured")
+	}
+	session := applySessionCreateMetadata(sessions.SessionV2{}, metadata)
+	session.ProjectID = project.ID
+	if strings.TrimSpace(session.CreatedCWD) == "" {
+		session.CreatedCWD = session.CWD
+	}
+	if strings.TrimSpace(session.CWD) == "" {
+		session.CWD = session.CreatedCWD
+	}
+	saved, err := s.sessionStore.SaveMetadata(session)
+	if err != nil {
+		return SessionDetail{}, err
+	}
+	return sessionDetailFromStore(saved), nil
+}
+
+func (s *Service) ListSessions(options SessionListOptions) ([]SessionMetadata, error) {
+	if s == nil || s.sessionStore == nil {
+		return nil, fmt.Errorf("execution session store is not configured")
+	}
+	projectID := strings.TrimSpace(options.ProjectID)
+	if projectID != "" {
+		project, err := s.loadActiveProject(projectID)
+		if err != nil {
+			return nil, err
+		}
+		projectID = project.ID
+	} else if !options.AllProjects {
+		return nil, fmt.Errorf("project id is required")
+	}
+	infos, err := s.sessionStore.ListWithOptions(sessions.V2ListOptions{Archived: options.Archived})
+	if err != nil {
+		return nil, err
+	}
+	items := make([]SessionMetadata, 0, len(infos))
+	for _, info := range infos {
+		if projectID != "" && info.ProjectID != projectID {
+			continue
+		}
+		session, err := s.sessionStore.Load(info.ID)
+		if err != nil {
+			return nil, err
+		}
+		items = append(items, sessionMetadataFromStore(session))
+	}
+	return items, nil
+}
+
+func (s *Service) GetSession(id string) (SessionDetail, error) {
+	if s == nil || s.sessionStore == nil {
+		return SessionDetail{}, fmt.Errorf("execution session store is not configured")
+	}
+	session, err := s.sessionStore.Load(id)
+	if err != nil {
+		return SessionDetail{}, err
+	}
+	return sessionDetailFromStore(session), nil
+}
+
+func (s *Service) RenameSession(id, displayName string) (SessionDetail, error) {
+	if s == nil || s.sessionStore == nil {
+		return SessionDetail{}, fmt.Errorf("execution session store is not configured")
+	}
+	displayName = strings.TrimSpace(displayName)
+	if displayName == "" {
+		return SessionDetail{}, fmt.Errorf("session display name must be a non-empty string")
+	}
+	session, err := s.sessionStore.Load(id)
+	if err != nil {
+		return SessionDetail{}, err
+	}
+	if session.Archived {
+		return SessionDetail{}, fmt.Errorf("archived session cannot be renamed")
+	}
+	session.DisplayName = displayName
+	saved, err := s.sessionStore.SaveMetadata(session)
+	if err != nil {
+		return SessionDetail{}, err
+	}
+	return sessionDetailFromStore(saved), nil
+}
+
+func (s *Service) ArchiveSession(id string) (SessionDetail, error) {
+	if s == nil || s.sessionStore == nil {
+		return SessionDetail{}, fmt.Errorf("execution session store is not configured")
+	}
+	session, err := s.sessionStore.Load(id)
+	if err != nil {
+		return SessionDetail{}, err
+	}
+	if !session.Archived {
+		session.Archived = true
+		var saved sessions.SessionV2
+		saved, err = s.sessionStore.SaveMetadata(session)
+		if err != nil {
+			return SessionDetail{}, err
+		}
+		session = saved
+	}
+	return sessionDetailFromStore(session), nil
+}
+
+func (s *Service) RemoveSession(id string) (SessionRemoveResult, error) {
+	if s == nil || s.sessionStore == nil {
+		return SessionRemoveResult{}, fmt.Errorf("execution session store is not configured")
+	}
+	session, err := s.sessionStore.Load(id)
+	if err != nil {
+		return SessionRemoveResult{}, err
+	}
+	if !session.Archived {
+		return SessionRemoveResult{}, fmt.Errorf("archive session before removing it")
+	}
+	if err := s.sessionStore.Delete(session.ID); err != nil {
+		return SessionRemoveResult{}, err
+	}
+	return SessionRemoveResult{Status: "removed", ID: session.ID}, nil
+}
+
+func (s *Service) loadActiveProject(id string) (projectstore.Project, error) {
+	if s == nil || s.projectStore == nil {
+		return projectstore.Project{}, fmt.Errorf("execution project store is not configured")
+	}
+	project, err := s.projectStore.Load(id)
+	if err != nil {
+		return projectstore.Project{}, err
+	}
+	if project.Archived {
+		return projectstore.Project{}, fmt.Errorf("project is archived")
+	}
+	return project, nil
+}
+
 func (s *Service) removeProjectSessions(projectID string) (int, error) {
 	projectID = strings.TrimSpace(projectID)
 	if projectID == "" || s == nil || s.sessionStore == nil {
@@ -215,6 +426,48 @@ func (s *Service) removeProjectSessions(projectID string) (int, error) {
 	return removed, nil
 }
 
+func applySessionCreateMetadata(session sessions.SessionV2, metadata SessionCreateMetadata) sessions.SessionV2 {
+	if value := strings.TrimSpace(metadata.CreatedCWD); value != "" {
+		session.CreatedCWD = value
+		session.CWD = value
+	}
+	if value := strings.TrimSpace(metadata.ConfigPath); value != "" {
+		session.ConfigPath = value
+		session.ConfigDir = ""
+	}
+	if value := strings.TrimSpace(metadata.Provider); value != "" {
+		session.Provider = value
+	}
+	if value := strings.TrimSpace(metadata.ModelProfile); value != "" {
+		session.ModelProfile = value
+	}
+	if value := strings.TrimSpace(metadata.ModelID); value != "" {
+		session.ModelID = value
+	}
+	if metadata.ModelParameters != nil {
+		session.ModelParameters = copyMap(metadata.ModelParameters)
+	}
+	if metadata.EnabledTools != nil {
+		session.EnabledTools = copyStrings(metadata.EnabledTools)
+	}
+	if metadata.EnabledMCP != nil {
+		session.EnabledMCP = copyStrings(metadata.EnabledMCP)
+	}
+	if metadata.EnabledSkills != nil {
+		session.EnabledSkills = copyStrings(metadata.EnabledSkills)
+	}
+	if metadata.ShowReasoning != nil {
+		session.ShowReasoning = *metadata.ShowReasoning
+	}
+	if metadata.Context != nil {
+		session.Context = *metadata.Context
+	}
+	if metadata.SaveToolResults != nil {
+		session.SaveToolResults = *metadata.SaveToolResults
+	}
+	return session
+}
+
 func projectFromStore(project projectstore.Project) Project {
 	return Project{
 		ID:          project.ID,
@@ -232,6 +485,81 @@ func projectsFromStore(projects []projectstore.Project) []Project {
 		items = append(items, projectFromStore(project))
 	}
 	return items
+}
+
+func sessionMetadataFromStore(session sessions.SessionV2) SessionMetadata {
+	return SessionMetadata{
+		ID:                session.ID,
+		CreatedAt:         session.CreatedAt,
+		UpdatedAt:         session.UpdatedAt,
+		DisplayName:       session.DisplayName,
+		Archived:          session.Archived,
+		LastUsedAt:        session.LastUsedAt,
+		InterruptedAt:     session.InterruptedAt,
+		InterruptedTurnID: session.InterruptedTurnID,
+		Provider:          session.Provider,
+		ModelProfile:      session.ModelProfile,
+		ModelID:           session.ModelID,
+		ProjectID:         session.ProjectID,
+		CreatedCWD:        session.CreatedCWD,
+		LastSeq:           session.LastSeq,
+	}
+}
+
+func sessionDetailFromStore(session sessions.SessionV2) SessionDetail {
+	return SessionDetail{
+		ID:                session.ID,
+		CreatedAt:         session.CreatedAt,
+		UpdatedAt:         session.UpdatedAt,
+		DisplayName:       session.DisplayName,
+		Archived:          session.Archived,
+		LastUsedAt:        session.LastUsedAt,
+		InterruptedAt:     session.InterruptedAt,
+		InterruptedTurnID: session.InterruptedTurnID,
+		Provider:          session.Provider,
+		ModelProfile:      session.ModelProfile,
+		ModelID:           session.ModelID,
+		Status:            sessionStatus(session),
+		LastSeq:           session.LastSeq,
+		CWD:               session.CWD,
+		ProjectID:         session.ProjectID,
+		CreatedCWD:        session.CreatedCWD,
+		ConfigPath:        session.RootConfigPath(),
+		ModelParameters:   copyMap(session.ModelParameters),
+		EnabledTools:      copyStrings(session.EnabledTools),
+		EnabledMCP:        copyStrings(session.EnabledMCP),
+		EnabledSkills:     copyStrings(session.EnabledSkills),
+		ShowReasoning:     session.ShowReasoning,
+		Context:           session.Context,
+		SaveToolResults:   session.SaveToolResults,
+	}
+}
+
+func sessionStatus(session sessions.SessionV2) string {
+	if !session.InterruptedAt.IsZero() && (session.LastUsedAt.IsZero() || !session.LastUsedAt.After(session.InterruptedAt)) {
+		return "interrupted"
+	}
+	return "idle"
+}
+
+func copyMap(values map[string]any) map[string]any {
+	if values == nil {
+		return nil
+	}
+	copied := make(map[string]any, len(values))
+	for key, value := range values {
+		copied[key] = value
+	}
+	return copied
+}
+
+func copyStrings(values []string) []string {
+	if values == nil {
+		return nil
+	}
+	copied := make([]string, len(values))
+	copy(copied, values)
+	return copied
 }
 
 func isSameOrAncestorProjectPath(root, cwd string) bool {

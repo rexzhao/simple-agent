@@ -6,7 +6,9 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/rexzhao/simple-agent/internal/contextwindow"
 	projectstore "github.com/rexzhao/simple-agent/internal/projects"
 	"github.com/rexzhao/simple-agent/internal/sessions"
 )
@@ -148,6 +150,205 @@ func TestServiceRemoveProjectDeletesProjectSessions(t *testing.T) {
 	}
 }
 
+func TestServiceSessionLifecycle(t *testing.T) {
+	home := t.TempDir()
+	service, err := NewService(home)
+	if err != nil {
+		t.Fatalf("NewService() error = %v", err)
+	}
+	projectRoot := mkdirProjectRoot(t, "repo")
+	project, err := service.CreateProject(projectRoot, "Repo")
+	if err != nil {
+		t.Fatalf("CreateProject() error = %v", err)
+	}
+	showReasoning := true
+	saveToolResults := true
+	contextMeta := contextwindow.Metadata{
+		ContextWindow:           32000,
+		ContextWindowSource:     string(contextwindow.WindowSourceEstimated),
+		WarningThresholdPercent: contextwindow.WarningThresholdPercent,
+	}
+
+	session, err := service.CreateSession(project.Project.ID, SessionCreateMetadata{
+		CreatedCWD:      project.Project.Root,
+		ConfigPath:      filepath.Join(project.Project.Root, ".agents", "sai.yaml"),
+		Provider:        "fake",
+		ModelProfile:    "default",
+		ModelID:         "model-default",
+		ModelParameters: map[string]any{"max_tokens": float64(128)},
+		EnabledTools:    []string{"read_file"},
+		EnabledMCP:      []string{"local"},
+		EnabledSkills:   []string{"visible"},
+		ShowReasoning:   &showReasoning,
+		Context:         &contextMeta,
+		SaveToolResults: &saveToolResults,
+	})
+	if err != nil {
+		t.Fatalf("CreateSession() error = %v", err)
+	}
+	if session.ID == "" || session.ProjectID != project.Project.ID || session.CreatedCWD != project.Project.Root {
+		t.Fatalf("CreateSession() = %#v, want project metadata", session)
+	}
+	if session.Provider != "fake" || session.ModelProfile != "default" || session.ModelID != "model-default" {
+		t.Fatalf("CreateSession() model metadata = %#v", session)
+	}
+	if got := session.ModelParameters["max_tokens"]; got != float64(128) {
+		t.Fatalf("CreateSession() model max_tokens = %#v, want 128", got)
+	}
+	if !session.ShowReasoning || !session.SaveToolResults || session.Context.ContextWindow != 32000 {
+		t.Fatalf("CreateSession() runtime metadata = %#v", session)
+	}
+
+	renamed, err := service.RenameSession(session.ID, "Renamed Session")
+	if err != nil {
+		t.Fatalf("RenameSession() error = %v", err)
+	}
+	if renamed.DisplayName != "Renamed Session" {
+		t.Fatalf("RenameSession() DisplayName = %q, want Renamed Session", renamed.DisplayName)
+	}
+	archived, err := service.ArchiveSession(session.ID)
+	if err != nil {
+		t.Fatalf("ArchiveSession() error = %v", err)
+	}
+	if !archived.Archived {
+		t.Fatalf("ArchiveSession() archived = false: %#v", archived)
+	}
+	if _, err := service.RenameSession(session.ID, "Nope"); err == nil || !strings.Contains(err.Error(), "archived session cannot be renamed") {
+		t.Fatalf("RenameSession(archived) error = %v, want archived rejection", err)
+	}
+	result, err := service.RemoveSession(session.ID)
+	if err != nil {
+		t.Fatalf("RemoveSession() error = %v", err)
+	}
+	if result.Status != "removed" || result.ID != session.ID {
+		t.Fatalf("RemoveSession() = %#v, want removed id", result)
+	}
+	if _, err := service.GetSession(session.ID); !errors.Is(err, sessions.ErrNotFound) {
+		t.Fatalf("GetSession(removed) error = %v, want ErrNotFound", err)
+	}
+}
+
+func TestServiceSessionListScopesAndArchivedFilter(t *testing.T) {
+	home := t.TempDir()
+	service, err := NewService(home)
+	if err != nil {
+		t.Fatalf("NewService() error = %v", err)
+	}
+	firstRoot := mkdirProjectRoot(t, "first")
+	secondRoot := mkdirProjectRoot(t, "second")
+	first, err := service.CreateProject(firstRoot, "First")
+	if err != nil {
+		t.Fatalf("CreateProject(first) error = %v", err)
+	}
+	second, err := service.CreateProject(secondRoot, "Second")
+	if err != nil {
+		t.Fatalf("CreateProject(second) error = %v", err)
+	}
+	activeFirst, err := service.CreateSession(first.Project.ID, SessionCreateMetadata{CreatedCWD: first.Project.Root, Provider: "fake", ModelProfile: "default", ModelID: "model"})
+	if err != nil {
+		t.Fatalf("CreateSession(active first) error = %v", err)
+	}
+	archivedFirst, err := service.CreateSession(first.Project.ID, SessionCreateMetadata{CreatedCWD: first.Project.Root, Provider: "fake", ModelProfile: "default", ModelID: "model"})
+	if err != nil {
+		t.Fatalf("CreateSession(archived first) error = %v", err)
+	}
+	if _, err := service.ArchiveSession(archivedFirst.ID); err != nil {
+		t.Fatalf("ArchiveSession(first) error = %v", err)
+	}
+	activeSecond, err := service.CreateSession(second.Project.ID, SessionCreateMetadata{CreatedCWD: second.Project.Root, Provider: "fake", ModelProfile: "default", ModelID: "model"})
+	if err != nil {
+		t.Fatalf("CreateSession(active second) error = %v", err)
+	}
+
+	firstActive, err := service.ListSessions(SessionListOptions{ProjectID: first.Project.ID})
+	if err != nil {
+		t.Fatalf("ListSessions(first active) error = %v", err)
+	}
+	if got := sessionMetadataIDs(firstActive); !sameStringSlice(got, []string{activeFirst.ID}) {
+		t.Fatalf("ListSessions(first active) = %#v, want active first", got)
+	}
+	firstArchived, err := service.ListSessions(SessionListOptions{ProjectID: first.Project.ID, Archived: true})
+	if err != nil {
+		t.Fatalf("ListSessions(first archived) error = %v", err)
+	}
+	if got := sessionMetadataIDs(firstArchived); !sameStringSlice(got, []string{archivedFirst.ID}) {
+		t.Fatalf("ListSessions(first archived) = %#v, want archived first", got)
+	}
+	allActive, err := service.ListSessions(SessionListOptions{AllProjects: true})
+	if err != nil {
+		t.Fatalf("ListSessions(all active) error = %v", err)
+	}
+	if got := sessionMetadataIDs(allActive); !sameStringSet(got, []string{activeFirst.ID, activeSecond.ID}) {
+		t.Fatalf("ListSessions(all active) = %#v, want both active sessions", got)
+	}
+	allArchived, err := service.ListSessions(SessionListOptions{AllProjects: true, Archived: true})
+	if err != nil {
+		t.Fatalf("ListSessions(all archived) error = %v", err)
+	}
+	if got := sessionMetadataIDs(allArchived); !sameStringSlice(got, []string{archivedFirst.ID}) {
+		t.Fatalf("ListSessions(all archived) = %#v, want only archived sessions", got)
+	}
+}
+
+func TestServiceSessionListRejectsMissingOrArchivedProject(t *testing.T) {
+	home := t.TempDir()
+	service, err := NewService(home)
+	if err != nil {
+		t.Fatalf("NewService() error = %v", err)
+	}
+	projectRoot := mkdirProjectRoot(t, "repo")
+	project, err := service.CreateProject(projectRoot, "Repo")
+	if err != nil {
+		t.Fatalf("CreateProject() error = %v", err)
+	}
+	if _, err := service.ArchiveProject(project.Project.ID); err != nil {
+		t.Fatalf("ArchiveProject() error = %v", err)
+	}
+	if _, err := service.ListSessions(SessionListOptions{ProjectID: project.Project.ID}); err == nil || !strings.Contains(err.Error(), "project is archived") {
+		t.Fatalf("ListSessions(archived project) error = %v, want archived rejection", err)
+	}
+	if _, err := service.ListSessions(SessionListOptions{ProjectID: "project-missing"}); !errors.Is(err, projectstore.ErrNotFound) {
+		t.Fatalf("ListSessions(missing project) error = %v, want ErrNotFound", err)
+	}
+}
+
+func TestServiceSessionStatusUsesInterruptedMetadataOnly(t *testing.T) {
+	home := t.TempDir()
+	service, err := NewService(home)
+	if err != nil {
+		t.Fatalf("NewService() error = %v", err)
+	}
+	projectRoot := mkdirProjectRoot(t, "repo")
+	project, err := service.CreateProject(projectRoot, "Repo")
+	if err != nil {
+		t.Fatalf("CreateProject() error = %v", err)
+	}
+	sessionStoreRoot, err := sessions.RootForHome(home)
+	if err != nil {
+		t.Fatalf("RootForHome(session) error = %v", err)
+	}
+	now := time.Date(2026, 7, 7, 12, 0, 0, 0, time.UTC)
+	sessionStore := sessions.NewV2Store(sessionStoreRoot)
+	saved, err := sessionStore.SaveMetadata(sessions.SessionV2{
+		ID:                "status-session",
+		ProjectID:         project.Project.ID,
+		RunningTurnID:     "stale-running-turn",
+		InterruptedTurnID: "interrupted-turn",
+		InterruptedAt:     now,
+		LastUsedAt:        now.Add(-time.Minute),
+	})
+	if err != nil {
+		t.Fatalf("SaveMetadata(status session) error = %v", err)
+	}
+	detail, err := service.GetSession(saved.ID)
+	if err != nil {
+		t.Fatalf("GetSession() error = %v", err)
+	}
+	if detail.Status != "interrupted" {
+		t.Fatalf("GetSession() Status = %q, want interrupted", detail.Status)
+	}
+}
+
 func mkdirProjectRoot(t *testing.T, name string) string {
 	t.Helper()
 	root := filepath.Join(t.TempDir(), name)
@@ -155,4 +356,41 @@ func mkdirProjectRoot(t *testing.T, name string) string {
 		t.Fatalf("MkdirAll(%q) error = %v", root, err)
 	}
 	return root
+}
+
+func sessionMetadataIDs(items []SessionMetadata) []string {
+	ids := make([]string, 0, len(items))
+	for _, item := range items {
+		ids = append(ids, item.ID)
+	}
+	return ids
+}
+
+func sameStringSlice(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for i := range left {
+		if left[i] != right[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func sameStringSet(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	counts := make(map[string]int, len(left))
+	for _, value := range left {
+		counts[value]++
+	}
+	for _, value := range right {
+		counts[value]--
+		if counts[value] < 0 {
+			return false
+		}
+	}
+	return true
 }
