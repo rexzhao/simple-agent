@@ -8152,6 +8152,57 @@ func TestServerAgentTurnRunnerPublisherRequiresTurnID(t *testing.T) {
 	}
 }
 
+func TestPublishCLIInterruptedTurnFallsBackToStore(t *testing.T) {
+	store := sessions.NewV2Store(t.TempDir())
+	session, err := store.SaveMetadata(sessions.SessionV2{
+		ID:              "cli-interrupt-fallback",
+		Version:         sessions.VersionV2,
+		Provider:        "fake",
+		ModelProfile:    "default",
+		ModelID:         "model-default",
+		SaveToolResults: true,
+	})
+	if err != nil {
+		t.Fatalf("SaveMetadata() error = %v", err)
+	}
+	if _, err := store.MarkTurnRunning(session.ID, "turn-1"); err != nil {
+		t.Fatalf("MarkTurnRunning() error = %v", err)
+	}
+	publisher := &failingCLIInterruptPublisher{err: errors.New("publish failed")}
+
+	publishCLIInterruptedTurn(publisher, store, session.ID, "turn-1")
+
+	if len(publisher.events) != 1 {
+		t.Fatalf("publisher events = %d, want 1", len(publisher.events))
+	}
+	if event, ok := publisher.events[0].(eventbus.TurnInterrupted); !ok || event.TurnID != "turn-1" {
+		t.Fatalf("publisher event = %#v, want TurnInterrupted turn-1", publisher.events[0])
+	}
+	loaded, err := store.Load(session.ID)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if loaded.RunningTurnID != "" {
+		t.Fatalf("RunningTurnID = %q, want cleared", loaded.RunningTurnID)
+	}
+	if loaded.InterruptedTurnID != "turn-1" {
+		t.Fatalf("InterruptedTurnID = %q, want turn-1", loaded.InterruptedTurnID)
+	}
+	if loaded.InterruptedAt.IsZero() {
+		t.Fatal("InterruptedAt is zero, want timestamp")
+	}
+}
+
+type failingCLIInterruptPublisher struct {
+	err    error
+	events []eventbus.Event
+}
+
+func (p *failingCLIInterruptPublisher) Publish(event eventbus.Event) error {
+	p.events = append(p.events, event)
+	return p.err
+}
+
 func TestSessionProjectorKeepsActiveHistoryValidAfterEachHook(t *testing.T) {
 	store := sessions.NewV2Store(t.TempDir())
 	session, err := store.SaveMetadata(sessions.SessionV2{

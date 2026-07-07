@@ -193,7 +193,7 @@ GC, and auto-rerunning interrupted tools.
   `TurnInterrupted` and persists it — never leave a running turn. Enforce via a
   defer/finally around the agent turn (the `MarkRunningTurnsInterrupted` startup sweep,
   `v2.go:354`, is the crash last-resort only; normal failures must not rely on it).
-- [ ] **Storage-failure last resort (honest)**: if the failure is the projector/store
+- [x] **Storage-failure last resort (honest)**: if the failure is the projector/store
   itself being unavailable, `TurnInterrupted` publish may also fail. Then: (a) the defer
   best-effort calls `store.MarkTurnInterrupted` directly (bypassing the bus — meta.json
   is a single-file rewrite, no `LastSeq` race, more likely to succeed); (b) if even

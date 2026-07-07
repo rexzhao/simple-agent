@@ -4356,6 +4356,15 @@ func shouldRunChatTurnWithSessionProjector(runtime *agentRuntime) bool {
 	return true
 }
 
+func publishCLIInterruptedTurn(publisher eventbus.Publisher, store *sessions.V2Store, sessionID, turnID string) {
+	if publisher == nil {
+		return
+	}
+	if err := publisher.Publish(eventbus.TurnInterrupted{TurnID: turnID}); err != nil && store != nil && sessionID != "" {
+		_, _ = store.MarkTurnInterrupted(sessionID, turnID)
+	}
+}
+
 func runChatTurnWithSessionProjector(ctx, turnCtx context.Context, runtime *agentRuntime, messages []model.Message, prompt string, stdout, stderr io.Writer, addTrailingNewline bool, stderrNeedsLeadingBreak bool) ([]model.Message, error) {
 	session, writeLock, err := runtime.prepareSessionProjectorMetadataLocked(turnCtx)
 	if err != nil {
@@ -4383,7 +4392,7 @@ func runChatTurnWithSessionProjector(ctx, turnCtx context.Context, runtime *agen
 		if !turnStarted || turnFinished {
 			return
 		}
-		_ = bus.Publish(eventbus.TurnInterrupted{TurnID: turnID})
+		publishCLIInterruptedTurn(bus, runtime.resumableSessionStore, session.ID, turnID)
 		_ = runtime.reloadResumableSession(session.ID)
 	}()
 
