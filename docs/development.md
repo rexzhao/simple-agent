@@ -11,7 +11,8 @@
 - 第一优先级支持 OpenAI-compatible Chat Completions。
 - 支持 streaming 输出。
 - 支持模型发起 tool call。
-- MVP 后支持通过 MCP stdio server 暴露工具。
+- MVP 后支持通过 MCP stdio server 作为 tool source；M23 另行引入本地 mailbox MCP
+  server 作为外部 agent 输入适配器。
 - 发布形态尽量保持为单文件可执行程序。
 
 ## 第一阶段假设
@@ -34,7 +35,9 @@
   但用 provider 的 `auth_file` 读取和刷新 bearer token，而不是读取 `api_key`。
 - M19 规划 async subagent-as-tool runtime。它仍是纯 CLI 运行时能力，不等同于完整
   multi-agent 编排；完整 DAG/workflow、共享状态和跨 agent 冲突处理属于更长期目标。
-- MCP 不属于 MVP 核心；后续接入时第一种传输只做 stdio。
+- MCP 不属于 MVP 核心；作为 tool source 的 MCP client 角色第一种传输只做 stdio。
+  M23 的 mailbox MCP 是 `sai` 前台进程内的本地 server 角色，和 MCP client/tool source
+  边界分开。
 - 根配置文件默认是启动时当前工作目录下的 `.agents/${arg[0]}.yaml`，其中 `${arg[0]}`
   是可执行文件 basename；普通 `sai` 二进制默认读取 `.agents/sai.yaml`。也可以通过
   `--config <file>` 显式指定根配置文件。
@@ -52,8 +55,9 @@
 - skill 加载。
 - OpenAI Responses custom tools、built-in web/code tools、stateful `previous_response_id`
   对话续写，以及 reasoning output item passthrough。
-- MCP stdio。
-- remote MCP over HTTP/SSE。
+- MCP stdio tool source。
+- remote/general-purpose MCP over HTTP/SSE。M23 mailbox MCP 只允许本地前台 CLI 进程内的
+  localhost server 作为输入适配器，不作为远程产品服务。
 - 插件市场或插件生命周期管理。
 
 ## 后续路线边界
@@ -232,6 +236,7 @@ sai models list
 sai config show
 sai doctor
 sai mcp list  # M4
+sai --mailbox-mcp 127.0.0.1:39123  # M23
 ```
 
 M22 后，当前产品入口不再包含 `sai chat`，也不保留 hidden chat alias。当前行为是：
@@ -240,6 +245,34 @@ M22 后，当前产品入口不再包含 `sai chat`，也不保留 hidden chat a
 已有 session 通过 `sai session resume <id>` 继续。`send` 不再作为当前产品入口；
 stdin/file 单次输入如果后续需要，应作为新的 session 能力设计，不恢复 `sai run`，
 也不重新引入独立 chat 产品入口。
+
+M23 mailbox MCP 在同一个前台 CLI 进程内启动本地 MCP server。`sai --mailbox-mcp
+127.0.0.1:39123` 仍然进入普通交互式 session；stdin 行为保持现状，不新增纯 CLI turn
+运行中的应用层输入队列或队列 UI。其他 agent 可以通过 MCP tools 把 prompt 投递到
+mailbox；CLI 是唯一 worker，只有在当前 session idle 时才从 mailbox 取一个 queued task，
+通过 execution library 执行，并把执行流正常打印到控制台。
+
+mailbox MCP 是输入适配器，不恢复 M20 的 HTTP/WS product layer，不提供 project/session
+管理 API，不做 registry、background daemon、多 worker 或持久队列。它和 M19 subagent
+runtime mailbox 是不同概念：M19 mailbox 服务 parent/child agent runtime event delivery；
+M23 mailbox MCP 服务外部 MCP clients 给当前 CLI session 投递任务。
+
+mailbox MCP 只暴露最终 task 结果。`mailbox_get` 和 `mailbox_wait` 返回 task status、
+最终 assistant output 或错误；不得返回 text delta、tool event、raw execution event、
+hidden/debug item、tool result 正文或其他中间过程。第一版 MCP tools：
+
+```text
+mailbox_post(prompt: string) -> { task_id, status }
+mailbox_get(task_id: string) -> { task_id, status, result?, error? }
+mailbox_wait(task_id: string, timeout_ms?: number) -> { task_id, status, timed_out, result?, error? }
+mailbox_cancel(task_id: string) -> { task_id, status }
+```
+
+`mailbox_wait` 等待 task 进入 terminal state 或超时；超时只返回当前状态和
+`timed_out: true`，不取消任务。`mailbox_cancel` 对 queued task 直接标记
+`cancelled`；对 running mailbox task 取消该 task 的 turn context，相当于只停止当前
+mailbox turn，不退出 CLI、不关闭 MCP server。已完成、失败或已取消的 task 再次 cancel
+幂等返回当前状态。
 
 Help/usage 是普通 CLI 行为，不引入 TUI 或第三方 CLI 框架。当前 help surface 支持：
 
@@ -271,6 +304,7 @@ sai mcp -h
 sai help mcp
 sai mcp list -h
 sai help mcp list
+sai --mailbox-mcp 127.0.0.1:39123 -h
 ```
 
 help 输出写到 stdout，exit code 为 0。help 必须在配置加载前完成：不读取 `.agents`
@@ -301,6 +335,7 @@ help、`--config` 或命令参数 flag。
 
 ```text
 --config ./config/sai.yaml
+--mailbox-mcp 127.0.0.1:39123
 --cwd path
 --name name
 --project project-id
@@ -797,6 +832,10 @@ M17 还会增加只在工作区内运行的发现/搜索工具：
 MCP 不属于 MVP 必需能力。先完成 session turn streaming、tool call loop、错误处理、
 JSONL 日志和单文件构建，再实现 MCP。
 
+本节描述 `sai` 作为 MCP client/tool source 的角色。M23 mailbox MCP 是 `sai` 作为本地
+MCP server 的角色，用于外部 agent 向当前前台 CLI session 投递 prompt；它不改变下面的
+MCP tool source 配置格式。
+
 MCP 使用单独目录配置，不放进 provider 配置。每个 MCP server 一个 YAML 文件，和
 `providers/` 的组织方式保持一致。
 
@@ -829,6 +868,10 @@ sai --config ./config/sai.yaml
 ```
 
 v0.1 中 MCP server 进程生命周期由当前 agent 进程管理。后台常驻管理后续再做。
+
+M23 mailbox MCP 使用 MCP Streamable HTTP 形态的本地 server，但只作为当前 CLI 进程内
+mailbox 输入适配器。它默认只允许 localhost/127.0.0.1 绑定，并应校验 Origin 或使用
+本地 capability token 等保护；不作为远程 MCP service 或通用 HTTP API。
 
 ## 日志和落盘
 

@@ -21,6 +21,7 @@
 
 ```text
 sai --config ./config/sai.yaml
+sai --mailbox-mcp 127.0.0.1:39123
 sai session resume <session-id>
 sai project create --config ./config/sai.yaml
 sai session create --config ./config/sai.yaml
@@ -512,6 +513,45 @@ MCP tools 会转换成内部 tool schema，但仍然需要出现在 enabled tool
 sai session create --config ./config/sai.yaml
 sai --config ./config/sai.yaml
 ```
+
+## Mailbox MCP（M23）
+
+`--mailbox-mcp host:port` 在当前前台 CLI 进程内启动本地 MCP mailbox server。例如：
+
+```text
+sai --mailbox-mcp 127.0.0.1:39123
+```
+
+它和本节上方的 MCP 配置角色不同：`mcp/*.yaml` 描述 `sai` 作为 MCP client 启动外部
+stdio MCP server 并把外部 tools 暴露给模型；`--mailbox-mcp` 描述 `sai` 作为本地
+MCP server，供其他 agent 通过 MCP tools 向当前 CLI session 投递 prompt。
+
+mailbox MCP 是输入适配器，不是 project/session 管理 API，也不恢复旧 HTTP/WS product
+layer。CLI 仍然是唯一 worker：stdin 行为保持现状；当当前 session idle 时，CLI 从
+mailbox 取 queued task，使用 execution library 执行，并在控制台正常输出。mailbox
+第一版使用进程内内存队列，不持久化，不跨 CLI 进程共享。
+
+Mailbox MCP tools：
+
+```text
+mailbox_post(prompt)
+mailbox_get(task_id)
+mailbox_wait(task_id, timeout_ms)
+mailbox_cancel(task_id)
+```
+
+`mailbox_get` 和 `mailbox_wait` 只返回最终 assistant output、状态和错误；不返回
+streaming delta、tool status、raw execution events、hidden/debug records 或中间过程。
+`mailbox_wait` 超时不取消 task。`mailbox_cancel` 对 queued task 直接标记 cancelled；对
+running mailbox task 只取消当前 task 的 turn context，不退出 CLI。
+
+安全边界：
+
+- 默认只允许 `localhost`、`127.0.0.1` 或 `[::1]`。
+- 不默认监听 `0.0.0.0` 或远程地址。
+- HTTP-based MCP mailbox 应校验 Origin，或使用本地 capability token 等保护，避免本机网页
+  通过 DNS rebinding 调用 mailbox。
+- mailbox result 不得暴露 prompt 以外的隐藏上下文、tool result 正文或 provider raw error。
 
 ## 工具启用
 
