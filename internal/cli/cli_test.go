@@ -6811,6 +6811,179 @@ func TestChatSaveSessionAssistantReadyPublishFailureAborts(t *testing.T) {
 	}
 }
 
+func TestCrashResumeKeepsCompletedToolsAndSynthesizesPendingTools(t *testing.T) {
+	server, requests := newCLIRunServer(t,
+		`{"choices":[{"delta":{"content":"resumed final"}}]}`,
+		`[DONE]`,
+	)
+	defer server.Close()
+
+	projectDir := t.TempDir()
+	configDir := t.TempDir()
+	writeCLIRunFixtureInDirWithTools(t, configDir, server.URL, "direct-secret-value", "openai-chat", []string{"shell"})
+	sessionRoot := filepath.Join(configDir, "sessions")
+	store := sessions.NewV2Store(sessionRoot)
+	session, err := store.SaveMetadata(sessions.SessionV2{
+		ID:                   "crash-resume-tools",
+		Version:              sessions.VersionV2,
+		Provider:             "fake",
+		ModelProfile:         "default",
+		ModelID:              "model-default",
+		CWD:                  projectDir,
+		CreatedCWD:           projectDir,
+		ConfigPath:           cliConfigPath(configDir),
+		EnabledTools:         []string{"shell"},
+		InstructionsSnapshot: []model.Message{{Role: model.MessageRoleSystem, Content: builtInBaseInstructions}},
+		SaveToolResults:      true,
+	})
+	if err != nil {
+		t.Fatalf("SaveMetadata() error = %v", err)
+	}
+	projector, err := sessionprojector.New(store, session)
+	if err != nil {
+		t.Fatalf("sessionprojector.New() error = %v", err)
+	}
+	bus := eventbus.NewBus(projector.Handler())
+	publish := func(event eventbus.Event) {
+		t.Helper()
+		if err := bus.Publish(event); err != nil {
+			t.Fatalf("Publish(%T) error = %v", event, err)
+		}
+	}
+	publish(eventbus.TurnStarted{TurnID: "turn-crash"})
+	publish(eventbus.TurnInputReady{TurnID: "turn-crash", Message: model.Message{Role: model.MessageRoleUser, Content: "run two tools"}})
+	publish(eventbus.AssistantReady{
+		TurnID: "turn-crash",
+		Message: model.Message{
+			Role: model.MessageRoleAssistant,
+			ToolCalls: []model.ToolCall{
+				{ID: "call-a", Name: "shell", Arguments: `{"command":"echo a"}`},
+				{ID: "call-b", Name: "shell", Arguments: `{"command":"echo b"}`},
+			},
+		},
+	})
+	publish(eventbus.ToolResultReady{TurnID: "turn-crash", Result: model.ToolResult{ToolCallID: "call-a", Name: "shell", Content: "completed output"}})
+	bus.Close()
+	if err := projector.Close(); err != nil {
+		t.Fatalf("Projector.Close() error = %v", err)
+	}
+
+	if marked, err := store.MarkRunningTurnsInterrupted(); err != nil {
+		t.Fatalf("MarkRunningTurnsInterrupted() error = %v", err)
+	} else if len(marked) != 1 || marked[0].ID != session.ID {
+		t.Fatalf("MarkRunningTurnsInterrupted() = %#v, want recovered session", marked)
+	}
+	recovered, err := store.Load(session.ID)
+	if err != nil {
+		t.Fatalf("Load(recovered) error = %v", err)
+	}
+	if recovered.RunningTurnID != "" || recovered.InterruptedTurnID != "turn-crash" {
+		t.Fatalf("turn metadata = running %q interrupted %q, want interrupted turn-crash", recovered.RunningTurnID, recovered.InterruptedTurnID)
+	}
+	toolsByCallID := toolItemsByCallID(recovered.Items)
+	callA := toolsByCallID["call-a"]
+	callB := toolsByCallID["call-b"]
+	if callA.Message == nil || callA.Status != sessions.ItemStatusCompleted || callA.Message.Content != "completed output" {
+		t.Fatalf("call-a item = %#v, want completed real output", callA)
+	}
+	if callB.Message == nil || callB.Status != sessions.ItemStatusPending {
+		t.Fatalf("call-b item = %#v, want pending disk fallback", callB)
+	}
+	materialized, err := store.MaterializeActiveHistory(recovered)
+	if err != nil {
+		t.Fatalf("MaterializeActiveHistory() error = %v", err)
+	}
+	if err := validateActiveHistoryToolExchanges(recovered.ID, materialized); err != nil {
+		t.Fatalf("active history validation error = %v; messages=%#v", err, materialized)
+	}
+	if !materializedToolMessageContains(materialized, "call-a", "completed output") {
+		t.Fatalf("materialized messages missing completed call-a output: %#v", materialized)
+	}
+	var synthesizedCallB bool
+	for _, message := range materialized {
+		if message.Role == model.MessageRoleTool && message.ToolCallID == "call-b" && message.Content == "[tool execution interrupted]" && message.IsError {
+			synthesizedCallB = true
+		}
+	}
+	if !synthesizedCallB {
+		t.Fatalf("materialized messages missing synthesized interrupted call-b: %#v", materialized)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := runLegacyChatWithIO([]string{"--config", cliConfigPath(configDir), "chat", "--resume", session.ID, "--quit", "--prompt", "continue after crash"}, strings.NewReader(""), &stdout, &stderr, func() (string, error) {
+		return projectDir, nil
+	})
+	if code != 0 {
+		t.Fatalf("resume RunWithIO() code = %d, stderr = %s", code, stderr.String())
+	}
+	if got, want := stdout.String(), "resumed final"; got != want {
+		t.Fatalf("resume stdout = %q, want %q", got, want)
+	}
+	resumeRequest := <-requests
+	assertNoAdditionalCLIRunRequest(t, requests)
+	resumeMessages := requestMessages(t, resumeRequest.Body)
+	if len(resumeMessages) != 6 {
+		t.Fatalf("len(resume messages) = %d, want recovered history plus new user: %#v", len(resumeMessages), resumeMessages)
+	}
+	assertMessage(t, resumeMessages, 0, "system", builtInBaseInstructions)
+	assertMessage(t, resumeMessages, 1, "user", "run two tools")
+	assistant, ok := resumeMessages[2].(map[string]any)
+	if !ok || assistant["role"] != "assistant" {
+		t.Fatalf("resume message[2] = %#v, want assistant", resumeMessages[2])
+	}
+	toolCalls, ok := assistant["tool_calls"].([]any)
+	if !ok || len(toolCalls) != 2 {
+		t.Fatalf("resume assistant tool_calls = %#v, want call-a/call-b", assistant["tool_calls"])
+	}
+	for i, want := range []struct {
+		id        string
+		arguments string
+	}{
+		{id: "call-a", arguments: `{"command":"echo a"}`},
+		{id: "call-b", arguments: `{"command":"echo b"}`},
+	} {
+		toolCall, ok := toolCalls[i].(map[string]any)
+		if !ok {
+			t.Fatalf("tool_calls[%d] = %#v, want object", i, toolCalls[i])
+		}
+		function, ok := toolCall["function"].(map[string]any)
+		if !ok {
+			t.Fatalf("tool_calls[%d].function = %#v, want object", i, toolCall["function"])
+		}
+		if toolCall["id"] != want.id || function["name"] != "shell" || function["arguments"] != want.arguments {
+			t.Fatalf("tool_calls[%d] = %#v, want id %q shell args %q", i, toolCall, want.id, want.arguments)
+		}
+	}
+	assertToolMessage(t, resumeMessages, 3, "call-a", "completed output")
+	assertToolMessage(t, resumeMessages, 4, "call-b", "[tool execution interrupted]")
+	assertMessage(t, resumeMessages, 5, "user", "continue after crash")
+
+	afterResume := loadCLISession(t, sessionRoot, session.ID)
+	if afterResume.RunningTurnID != "" {
+		t.Fatalf("RunningTurnID after resume = %q, want cleared", afterResume.RunningTurnID)
+	}
+	afterToolsByCallID := toolItemsByCallID(afterResume.Items)
+	if len(afterToolsByCallID) != 2 {
+		t.Fatalf("tool items after resume = %#v, want only original call-a/call-b", afterToolsByCallID)
+	}
+	if afterToolsByCallID["call-b"].Status != sessions.ItemStatusPending {
+		t.Fatalf("call-b after resume = %#v, want still pending on disk", afterToolsByCallID["call-b"])
+	}
+	persisted, err := store.PersistedEventsAfter(session.ID, 0)
+	if err != nil {
+		t.Fatalf("PersistedEventsAfter() error = %v", err)
+	}
+	var callBUpdates int
+	for _, event := range persisted {
+		if event.Type == sessions.RecordTypeItemUpdated && event.ItemID == callB.ID {
+			callBUpdates++
+		}
+	}
+	if callBUpdates != 0 {
+		t.Fatalf("call-b item.updated events = %d, want 0: %#v", callBUpdates, persisted)
+	}
+}
+
 func TestChatSaveSessionCancelAfterCompletedToolKeepsCompletedResult(t *testing.T) {
 	firstCommand := shellOutputCommandForCLI("first tool output")
 	secondReleaseFile := "release-cancel-second.txt"

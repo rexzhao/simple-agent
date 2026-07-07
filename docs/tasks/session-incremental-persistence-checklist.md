@@ -285,7 +285,7 @@ GC, and auto-rerunning interrupted tools.
 - [x] On durable `Publish` failure the turn aborts immediately: in-memory `messages`
   discarded, disk authoritative, no rollback/continue. (Tool-execution error result is a
   normal path, not this case.)
-- [ ] Resume after crash shows completed tool results; unfinished tool items surface as
+- [x] Resume after crash shows completed tool results; unfinished tool items surface as
   interrupted error results; history is legal and a new turn can continue; no tool is
   auto-rerun.
 - [ ] Compaction is dispatched through the projector (`CompactionRequested` →
