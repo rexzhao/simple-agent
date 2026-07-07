@@ -1,5 +1,10 @@
 # Server 和 Web GUI 设计
 
+> 历史说明：本文记录 M20 时期的 HTTP/WS server-owned session 与未来 Web GUI 设计背景。
+> M22 已从当前产品路径删除 HTTP/WS server、registry、WebSocket stream 和 server 命令。
+> 本文不再是当前 CLI/execution-library 行为规范；当前规范见 `docs/development.md`、
+> `docs/configuration.md` 和 `docs/tasks/execution-library-no-http-checklist.md`。
+
 本文记录未来 server + Web GUI 的独立功能设计。会话压缩和 session 存储的底层设计见
 `docs/session-compaction.md`，本文只描述 server ownership、HTTP API、WebSocket 事件、
 GUI 展示和交互语义。

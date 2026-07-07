@@ -30,12 +30,19 @@ management 和 turn execution 收敛为进程内 execution library。M21 global-
 - [x] 删除 CLI 的 server auto-start、registry discovery、HTTP client 和 WebSocket client product path。
 - [x] 删除 `server` foreground/background/status/stop 产品命令。
 - [x] 删除当前 HTTP handlers、registry 和 startup lock 代码；未来 adapter 需要时另建薄适配层。
+- [ ] 裸 `sai` 在当前 cwd 无已注册 project 时自动创建 project，然后进入 pending 新 session。
+- [ ] 裸 `sai` 在当前 cwd 有已注册 ancestor project 时复用 nearest project 并进入 pending 新 session。
+- [ ] 新增 `session resume <id>` 作为已有 session 的交互恢复入口。
+- [ ] 从当前产品 help/docs 中移除 top-level `attach` 入口；实现可保留 hidden compatibility。
+- [ ] 删除或隐藏 `send` 产品命令和 help 入口。
 - [ ] 清理 docs/help/errors 中把 HTTP server 作为当前产品路径的描述。
 
 ## Acceptance Criteria
 
 - [x] CLI project/session commands 在没有 server、registry、HTTP client 或 WebSocket stream 的情况下工作。
 - [x] CLI attach/send/new/compact 只通过 execution library DTO/events 渲染输出。
+- [ ] CLI 默认入口自动发现或创建 project，并创建新 session 进入交互。
+- [ ] CLI 测试覆盖 `session resume <id>`、保留 project commands、隐藏/删除 send 产品入口。
 - [x] execution library 测试覆盖 storage root 初始化、project/session lifecycle、nearest project
   discovery、session selection、busy turn rejection、event streaming/persistence、compaction 和
   interrupted recovery。

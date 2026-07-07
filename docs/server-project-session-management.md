@@ -1,5 +1,14 @@
 # Server, Project, and Session Management
 
+> Legacy note: this document was written for the pre-M22 server management path.
+> The HTTP/WS server process, server command lifecycle, registry token, auto-start,
+> and server API sections are superseded by the no-HTTP execution-library product
+> path. The storage-root resolution notes reflect the legacy/current global
+> execution home mechanism and remain useful background until that code is
+> migrated, but this file is no longer the active source of truth for current CLI
+> behavior. Current behavior is documented in `docs/development.md`,
+> `docs/configuration.md`, and `docs/tasks/execution-library-no-http-checklist.md`.
+
 This document defines the unified management command model for server, project,
 and session resources. It directly replaces the previous `--home`, top-level
 `status` / `stop`, `servers`, scoped server cwd, and `project remove
@@ -7,11 +16,12 @@ and session resources. It directly replaces the previous `--home`, top-level
 
 ## Source of Truth
 
-This document is the active implementation specification for this task. It
-intentionally supersedes conflicting older M21 notes in `docs/milestones.md`,
-`docs/checklist.md`, `docs/global-server-projects.md`, or older task checklists.
-Those older documents are not modified by this docs-only change, and their
-checklist status is not advanced here.
+This document is no longer the active implementation specification for current
+CLI behavior. It remains a legacy design record for the old server-root
+management model and for storage-root terminology that still appears in code.
+Current no-HTTP execution-library behavior is tracked by `docs/development.md`,
+`docs/configuration.md`, `docs/checklist.md`, and
+`docs/tasks/execution-library-no-http-checklist.md`.
 
 This is a backend and CLI management contract. Browser GUI, server-rendered web
 UI, frontend routing, frontend state management, and styling are future work and

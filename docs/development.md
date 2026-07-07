@@ -70,7 +70,7 @@ source/message 粒度。只有保存这些完整上下文，`resume` 才能可�
 session 文件会包含敏感数据。
 
 `sai run` 不回归。M22 后当前产品入口不再包含 `sai chat`；后续如果需要 stdin、file
-和 multiline 单次输入，应收敛到 `attach` / `send` 能力，并复用 execution library 的
+和 multiline 单次输入，应收敛到 session 能力，并复用 execution library 的
 provider 选择、message 构造、工具启用、日志和错误处理路径。
 
 Markdown 渲染不是近期目标；如果后续需要，也应作为远期低优先级能力单独设计，不进入
@@ -209,13 +209,10 @@ conflict arbitration、observability，以及 persistence/resume。M17 只为这
 
 ## CLI 形态
 
-目标命令：
+下一实现切片的目标命令：
 
 ```text
 sai
-sai attach
-sai attach <session-id>
-sai attach --new [--cwd path]
 sai project create [--cwd path] [--name name]
 sai project list
 sai project show [project-id]
@@ -223,13 +220,12 @@ sai project rename <project-id> <name>
 sai project archive <project-id>
 sai project remove <project-id>
 sai session create [--cwd path]
+sai session resume <id>
 sai session list [--project project-id] [--all-projects] [--archived]
 sai session show <id>
 sai session rename <id> <name>
 sai session archive <id>
 sai session remove <id>
-sai send [session-id] --prompt "prompt"
-sai send --new [--cwd path] --prompt "prompt"
 sai auth codex login --provider codex-work
 sai tools list
 sai models list
@@ -238,12 +234,14 @@ sai doctor
 sai mcp list  # M4
 ```
 
-M22 后，当前产品入口不再包含 `sai chat`，也不保留 hidden chat alias。裸 `sai`
-等价于 `sai attach`，从当前目录查找最近注册项目和最近会话；`sai send --prompt`
-提供单次 prompt 入口。stdin/file 单次输入如果后续需要，应作为新的 attach/send 能力设计，
-不恢复 `sai run`，也不重新引入独立 chat 产品入口。
+M22 后，当前产品入口不再包含 `sai chat`，也不保留 hidden chat alias。下一实现切片的目标是：
+裸 `sai` 从当前目录查找最近注册项目；如果没有项目，CLI 自动为当前目录创建 project，然后
+开启一个 pending 新 session 并进入交互。durable session 在第一条普通用户消息时创建。
+已有 session 通过 `sai session resume <id>` 继续。`send` 将不再作为当前产品入口；
+stdin/file 单次输入如果后续需要，应作为新的 session 能力设计，不恢复 `sai run`，
+也不重新引入独立 chat 产品入口。
 
-Help/usage 是普通 CLI 行为，不引入 TUI 或第三方 CLI 框架。支持：
+Help/usage 是普通 CLI 行为，不引入 TUI 或第三方 CLI 框架。下一实现切片的目标 help surface 支持：
 
 ```text
 sai -h
@@ -251,14 +249,10 @@ sai --help
 sai help
 sai version -h
 sai help version
-sai attach -h
-sai help attach
 sai project -h
 sai help project
 sai session -h
 sai help session
-sai send -h
-sai help send
 sai config -h
 sai help config
 sai config show -h
@@ -293,27 +287,25 @@ doctor 不发起 provider HTTP 请求、不启动 MCP server、不运行模型�
 `logging.path` 对应的 session root/父目录可创建可写，不创建真正的 session log 文件。
 
 根层解析从 argv 左到右扫描，跳过已知 flag 及其 value；第一个真正的非 flag token 是命令。
-没有命令 token 时默认执行 `attach`，并把已扫描到的 attach flags 交给 `attach` 解析。
+下一实现切片中，没有命令 token 时默认进入当前 project 的 pending 新 session；若当前目录
+没有注册项目，先自动创建 project。
 带值 flag 的 value 不参与命令识别。命令 token 之外的参数交给对应命令解析，命令前后的
 flags 可以混排；`sai "prompt"` 会把 `prompt` 识别为未知命令，而不是 prompt 输入。
 全局 `--config <file>` 可以放在命令前，也可以放在命令或子命令后，例如
 `sai models list --config ./config/sai.yaml` 和
-`sai attach --new --config ./config/sai.yaml`。`-h` / `--help` 在命令范围内优先显示 help，
+`sai session create --config ./config/sai.yaml`。`-h` / `--help` 在命令范围内优先显示 help，
 且不加载配置。`--` 终止 flag 解析；其后的 token 全部作为 positional，不再被识别为
 help、`--config` 或命令参数 flag。
 
 常用参数：
 
 ```text
---provider paperhub
---model glm-5.2
 --config ./config/sai.yaml
---base-url https://tc-paperhub.diezhi.net/v1
---show-reasoning
---max-turns 8
---enable-tools read_file,list_files,shell
---verbose
---enable-mcp local  # M4
+--cwd path
+--name name
+--project project-id
+--all-projects
+--archived
 ```
 
 v0.1 暂不支持 non-streaming fallback；当前 execution turn runtime 仍使用 streaming provider
@@ -321,8 +313,9 @@ v0.1 暂不支持 non-streaming fallback；当前 execution turn runtime 仍使�
 
 ## CLI Chat REPL（历史）
 
-本节记录 M10-M19 的旧 `sai chat` 设计，作为历史实现背景保留。M22 后当前产品入口已切换到
-`attach` / `send` / `project` / `session`，不再提供 `sai chat` 命令或 hidden alias。
+本节记录 M10-M19 的旧 `sai chat` 设计，作为历史实现背景保留。M22 后当前产品入口不再提供
+`sai chat` 命令或 hidden alias；下一实现切片的目标入口是裸 `sai` pending session、
+`project` 和 `session` 命令。
 
 M10 后，`sai chat` 是一个克制的逐行 REPL：启动时固定 provider、model、tools、MCP、
 skills 和 reasoning 展示设置；会话进行中不支持模型切换或额外 slash commands。它支持
@@ -579,12 +572,12 @@ frontmatter 决定。
 
 ```text
 sai session create --config ./config/sai.yaml
-sai send --new --config ./config/sai.yaml --prompt "你是谁？"
+sai --config ./config/sai.yaml
 ```
 
-session 创建时从根配置文件的默认 provider/model 解析并保存到 session metadata。若默认值
+目标行为中，session 创建时从根配置文件的默认 provider/model 解析并保存到 session metadata。若默认值
 缺失或无效，CLI 应给出可选 provider/model 列表并停止。M22 不支持会话进行中切换模型；
-existing session attach/send 使用已保存的 provider/model/config。
+`session resume` 使用已保存的 provider/model/config。
 
 ## 项目上下文
 
@@ -762,10 +755,10 @@ tools:
 ```
 
 ```text
-sai send --new --config ./config/sai.yaml --prompt "列出当前目录"
+sai --config ./config/sai.yaml
 ```
 
-当前 M22 attach/send 产品路径不提供 per-turn enabled tools 覆盖；通过配置文件
+当前 M22 session 产品路径不提供 per-turn enabled tools 覆盖；通过配置文件
 `tools.enabled` 启用工具。`shell`、`write_file` 和 `edit_file` 不需要额外审核 flag；
 只要它被启用，就按普通工具处理。
 
@@ -828,11 +821,11 @@ MCP 在第一阶段作为一种 tool source：
 MCP tool 名称必须使用 `mcp.<server>.<tool>` 形式，避免和内置工具冲突。实现中应固定该
 命名规则，而不是把 MCP 原始 tool name 直接暴露给模型。
 
-默认启用 `enabled: true` 的 MCP server。M22 attach/send 产品路径不提供 per-turn
+默认启用 `enabled: true` 的 MCP server。M22 session 产品路径不提供 per-turn
 `--enable-mcp` 覆盖；需要切换 MCP server 时应通过配置创建新的 session。
 
 ```text
-sai send --new --config ./config/sai.yaml --prompt "使用 MCP 工具"
+sai --config ./config/sai.yaml
 ```
 
 v0.1 中 MCP server 进程生命周期由当前 agent 进程管理。后台常驻管理后续再做。
@@ -878,7 +871,7 @@ tool result messages。会话压缩实现目标中的 v2 store 会将这些事�
 M18 后，项目指令文件快照或可重建信息应按每个成功加载的文件分别记录，而不是合并成一个
 不可追溯的块。
 
-M22 后当前产品路径通过 `sai session create`、`sai attach <id>`、`sai send <id>`、
+下一实现切片的目标产品路径通过 `sai`、`sai session create`、`sai session resume <id>`、
 `sai session list`、`sai session show <id>`、`sai session archive <id>` 和
 `sai session remove <id>` 管理可恢复 session。管理命令只展示元数据或删除文件，不打印完整
 messages、prompt、assistant output 或 tool result 正文。
@@ -955,7 +948,7 @@ OpenAI-compatible `tools` / `tool_calls` 的真实兼容性。若服务不支持
 手动测试命令：
 
 ```powershell
-sai send --new --config ./config/sai.yaml --prompt "你是谁？"
+sai --config ./config/sai.yaml
 ```
 
 预期行为：

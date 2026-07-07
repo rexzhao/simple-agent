@@ -734,6 +734,9 @@ orchestration。
 
 ## M20：Server-Owned Sessions and CLI Client
 
+状态说明（2026-07-07）：M20 的 HTTP/WS server-owned session 产品路径已由 M22 删除。此节作为
+历史设计和已完成切片记录保留；当前目标见 M22。
+
 目标：把会话运行形态从本地进程内 `sai chat` 切换为 server-owned sessions。server 是唯一
 session writer，CLI client 通过 HTTP API 和 WebSocket 操作会话。HTTP / WebSocket 语义保留
 未来 Web GUI 需要的 filtered / paginated view，但 M20 不交付浏览器 Web GUI UI。

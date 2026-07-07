@@ -415,6 +415,10 @@
 
 ## M20：Server-Owned Sessions and CLI Client
 
+状态说明（2026-07-07）：M20 的 HTTP/WS server-owned session 产品路径已由 M22 删除。此清单作为
+历史完成记录保留；当前执行目标见 M22 和
+`docs/tasks/execution-library-no-http-checklist.md`。
+
 - [x] 新增 `sai server`，默认以前台进程启动本地 server，提供 HTTP API 和 WebSocket stream。
 - [x] 前台 `sai server` 阻塞到 server 退出，并支持 Ctrl+C 优雅关闭 listener、flush metadata、
   移除 registry 后退出 0。
@@ -538,6 +542,10 @@
 - [x] 删除当前产品路径中的 `server` 前台/后台命令、auto-start、registry、bearer token、HTTP client
   helpers、HTTP handlers 和 WebSocket stream。
 - [x] attach/send/new/project/session 命令复用同一套 execution library API。
+- [ ] 裸 `sai` 在缺少当前 project 时自动创建 project，并进入 pending 新 session。
+- [ ] 裸 `sai` 复用当前 cwd 的 nearest registered project，并进入 pending 新 session。
+- [ ] `sai session resume <id>` 作为已有 session 的交互恢复入口。
+- [ ] 当前产品 help/docs 不再展示 top-level `attach` 或 `send` 入口。
 - [x] 不恢复 hardcoded chat product entry，也不保留 hidden chat alias。
 - [x] future HTTP adapter、GUI 和跨终端共享能力保持 out of scope。
 - [x] CLI 测试覆盖 project/session lifecycle、attach/send/new/compact，且不启动 server。

@@ -1,5 +1,9 @@
 # Global Singleton Server, Projects, and Sessions
 
+> 历史说明：本文记录 M21 时期的 HTTP/WS global singleton server 设计。M22 已停止推进该
+> server 产品路径，并删除当前产品中的 HTTP/WS server、registry、bearer token 和
+> auto-start 行为。本文保留作历史设计背景，不是当前 CLI/execution-library 行为规范。
+
 本文定义 M21 的直接替换设计：server 不再按目录或配置文件 scoped 启动多个实例，而是在同一
 OS user 的同一 home namespace 下保持一个全局 singleton server。server 可以管理多个项目目录，
 project 和 session 都必须显式创建。本文是独立功能文档，旧 scoped server 行为不提供兼容层。
