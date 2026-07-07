@@ -5531,17 +5531,6 @@ func (r *agentRuntime) materializeMessagesForSessionTurn(session sessions.Sessio
 	return copyMessageSlice(messages), nil
 }
 
-func (r *agentRuntime) sessionSavePlan(messages []model.Message) (sessions.SessionV2, []sessions.SessionItem, []string, error) {
-	session := r.refreshedSessionMetadata()
-
-	newItems, activeItemIDs, err := sessions.AppendMessagesToActiveHistory(session.Items, r.activeItemIDs, messages)
-	if err != nil {
-		return sessions.SessionV2{}, nil, nil, fmt.Errorf("save resumable session: %w", err)
-	}
-
-	return session, newItems, activeItemIDs, nil
-}
-
 type runtimePreparationOptions struct {
 	enableSubagents             bool
 	resumedSessionOverride      *sessions.SessionV2
@@ -6174,8 +6163,10 @@ type serverAgentTurnRunner struct {
 }
 
 func (r serverAgentTurnRunner) RunSessionTurn(ctx context.Context, request localserver.SessionTurnRequest) (result localserver.SessionTurnResult, err error) {
-	incremental := request.Publisher != nil
-	if incremental && strings.TrimSpace(request.TurnID) == "" {
+	if request.Publisher == nil {
+		return localserver.SessionTurnResult{}, fmt.Errorf("session turn publisher is required")
+	}
+	if strings.TrimSpace(request.TurnID) == "" {
 		return localserver.SessionTurnResult{}, fmt.Errorf("session turn id is required when publisher is configured")
 	}
 	runtime, err := r.prepareServerSessionRuntime(ctx, request.Session, request.SessionStore)
@@ -6186,40 +6177,21 @@ func (r serverAgentTurnRunner) RunSessionTurn(ctx context.Context, request local
 		err = errors.Join(err, runtime.Close())
 	}()
 
-	messages, compaction, err := runServerOwnedSessionTurn(ctx, runtime, runtime.initialMessages(), request.Content, serverOwnedSessionTurnOptions{
+	if _, _, err := runServerOwnedSessionTurn(ctx, runtime, runtime.initialMessages(), request.Content, serverOwnedSessionTurnOptions{
 		emit:            request.Emit,
 		publisher:       request.Publisher,
 		turnID:          request.TurnID,
-		skipAutoCompact: incremental,
-	})
-	if err != nil {
+		skipAutoCompact: true,
+	}); err != nil {
 		return localserver.SessionTurnResult{}, err
 	}
-	if incremental {
-		if err := runtime.saveRuntimeMetadataForSession(request.Session.ID); err != nil {
-			return localserver.SessionTurnResult{}, err
-		}
-		return localserver.SessionTurnResult{
-			Session:     runtime.resumableSession,
-			Incremental: true,
-		}, nil
-	}
-	planSession, newItems, activeHistory, err := runtime.sessionSavePlan(messages)
-	if err != nil {
+	if err := runtime.saveRuntimeMetadataForSession(request.Session.ID); err != nil {
 		return localserver.SessionTurnResult{}, err
 	}
-	result = localserver.SessionTurnResult{
-		Session:       planSession,
-		Items:         newItems,
-		ActiveHistory: activeHistory,
-	}
-	if compaction != nil {
-		result.Compaction = &localserver.SessionCompactionPlan{
-			SummaryItem: compaction.summaryItem,
-			Checkpoint:  compaction.checkpoint,
-		}
-	}
-	return result, nil
+	return localserver.SessionTurnResult{
+		Session:     runtime.resumableSession,
+		Incremental: true,
+	}, nil
 }
 
 func (r serverAgentTurnRunner) SupportsIncrementalSessionTurn(ctx context.Context, request localserver.SessionTurnRequest) (supported bool, err error) {

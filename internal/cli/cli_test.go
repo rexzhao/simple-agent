@@ -7666,45 +7666,6 @@ func TestPrepareSessionProjectorMetadataRequiresSaveSessionStore(t *testing.T) {
 	}
 }
 
-func TestSessionSavePlanUsesRefreshedRuntimeMetadata(t *testing.T) {
-	cwd := t.TempDir()
-	configPath := filepath.Join(t.TempDir(), "sai.yaml")
-	systemMessage := model.Message{Role: model.MessageRoleSystem, Content: "system instructions"}
-	userMessage := model.Message{Role: model.MessageRoleUser, Content: "hello"}
-	runtime := &agentRuntime{
-		cwd:                cwd,
-		configPath:         configPath,
-		providerName:       "fake",
-		modelProfile:       "default",
-		modelID:            "model-default",
-		parameters:         map[string]any{"temperature": 0.1},
-		enabledTools:       []string{"read_file"},
-		baseMessages:       []model.Message{systemMessage},
-		instructionSources: []sessions.InstructionSource{{Role: model.MessageRoleSystem, Source: "builtin"}},
-		contextTracker:     contextwindow.NewTracker(contextwindow.Window{Tokens: 8000, Source: contextwindow.WindowSourceConfigured}, contextwindow.Metadata{}),
-	}
-
-	session, newItems, activeItemIDs, err := runtime.sessionSavePlan([]model.Message{systemMessage, userMessage})
-	if err != nil {
-		t.Fatalf("sessionSavePlan() error = %v", err)
-	}
-	if session.Provider != "fake" || session.ModelProfile != "default" || session.ModelID != "model-default" {
-		t.Fatalf("session model metadata = provider %q profile %q id %q", session.Provider, session.ModelProfile, session.ModelID)
-	}
-	if session.CWD != cwd || session.ConfigPath != configPath {
-		t.Fatalf("session paths = cwd %q config %q, want %q/%q", session.CWD, session.ConfigPath, cwd, configPath)
-	}
-	if !session.SaveToolResults || session.Context.ContextWindow != 8000 {
-		t.Fatalf("session flags/context = saveToolResults %t context %#v", session.SaveToolResults, session.Context)
-	}
-	if len(newItems) != 2 || len(activeItemIDs) != 2 {
-		t.Fatalf("save plan items = %#v active = %#v, want two appended messages", newItems, activeItemIDs)
-	}
-	if newItems[0].Message == nil || newItems[0].Message.Role != model.MessageRoleSystem || newItems[1].Message == nil || newItems[1].Message.Role != model.MessageRoleUser {
-		t.Fatalf("newItems = %#v, want system then user", newItems)
-	}
-}
-
 func TestChatConfiguredSessionsCanBeDisabledBySaveSessionFalse(t *testing.T) {
 	server, requests := newCLIRunServer(t,
 		`{"choices":[{"delta":{"content":"one"}}]}`,
@@ -8465,31 +8426,36 @@ subagents:
 		t.Fatalf("SaveMetadata() error = %v", err)
 	}
 
-	result, err := (serverAgentTurnRunner{program: "sai"}).RunSessionTurn(context.Background(), localserver.SessionTurnRequest{
-		Session: session,
-		Content: "server prompt",
-	})
+	result, err := runServerAgentTurnWithProjectorForTest(t, context.Background(), store, session, "turn-subagents-disabled", "server prompt")
 	if err != nil {
 		t.Fatalf("RunSessionTurn() error = %v", err)
 	}
+	assertIncrementalSessionTurnResult(t, result)
 
 	request := receiveCLIRunRequest(t, requests)
 	assertCLIRequestOmitsKey(t, request.Body, "tools")
 	messages := requestMessages(t, request.Body)
 	assertMessage(t, messages, 0, "system", builtInBaseInstructions)
 	assertMessage(t, messages, 1, "user", "server prompt")
+	if got := countCLIRequestMessagesWithContent(t, messages, "user", "server prompt"); got != 1 {
+		t.Fatalf("provider request prompt count = %d, want one; messages=%#v", got, messages)
+	}
 	for _, leaked := range []string{"Configured subagents", subagents.ToolSubagentStart} {
 		if strings.Contains(string(request.RawBody), leaked) {
 			t.Fatalf("server runner request exposed subagent runtime %q: %s", leaked, request.RawBody)
 		}
 	}
 	assertNoAdditionalCLIRunRequest(t, requests)
-	if len(result.Items) != 3 {
-		t.Fatalf("len(result.Items) = %d, want runtime+user+assistant save plan: %#v", len(result.Items), result.Items)
+	persisted, err := store.Load(session.ID)
+	if err != nil {
+		t.Fatalf("Load(%q) error = %v", session.ID, err)
+	}
+	if got := countSessionItemsWithExactContent(persisted, "server prompt"); got != 1 {
+		t.Fatalf("persisted prompt count = %d, want one; items=%#v", got, persisted.Items)
 	}
 }
 
-func TestServerAgentTurnRunnerUsesCreatedCWDForInstructionsAndSavePlan(t *testing.T) {
+func TestServerAgentTurnRunnerUsesCreatedCWDForInstructions(t *testing.T) {
 	server, requests := newCLIRunServer(t,
 		`{"choices":[{"delta":{"content":"server assistant"}}]}`,
 		`[DONE]`,
@@ -8517,13 +8483,12 @@ func TestServerAgentTurnRunnerUsesCreatedCWDForInstructionsAndSavePlan(t *testin
 	writeCLISessionV2(t, sessionRoot, session)
 	loaded := loadCLISession(t, sessionRoot, session.ID)
 
-	result, err := (serverAgentTurnRunner{program: "sai"}).RunSessionTurn(context.Background(), localserver.SessionTurnRequest{
-		Session: loaded,
-		Content: "server prompt",
-	})
+	store := sessions.NewV2Store(sessionRoot)
+	result, err := runServerAgentTurnWithProjectorForTest(t, context.Background(), store, loaded, "turn-created-cwd", "server prompt")
 	if err != nil {
 		t.Fatalf("RunSessionTurn() error = %v", err)
 	}
+	assertIncrementalSessionTurnResult(t, result)
 
 	request := receiveCLIRunRequest(t, requests)
 	assertNoAdditionalCLIRunRequest(t, requests)
@@ -8535,17 +8500,20 @@ func TestServerAgentTurnRunnerUsesCreatedCWDForInstructionsAndSavePlan(t *testin
 		t.Fatalf("server runner request used stale cwd instructions: %s", request.RawBody)
 	}
 	if got, want := result.Session.CWD, createdCWD; got != want {
-		t.Fatalf("save plan CWD = %q, want created_cwd %q", got, want)
+		t.Fatalf("result session CWD = %q, want created_cwd %q", got, want)
 	}
 	if got, want := result.Session.CreatedCWD, createdCWD; got != want {
-		t.Fatalf("save plan CreatedCWD = %q, want %q", got, want)
+		t.Fatalf("result session CreatedCWD = %q, want %q", got, want)
 	}
 	if got, want := result.Session.ConfigPath, cliConfigPath(configDir); got != want {
-		t.Fatalf("save plan ConfigPath = %q, want %q", got, want)
+		t.Fatalf("result session ConfigPath = %q, want %q", got, want)
 	}
 }
 
 func TestServerAgentTurnRunnerRequiresCreatedCWD(t *testing.T) {
+	bus := eventbus.NewBus(func(eventbus.Event) error { return nil })
+	defer bus.Close()
+
 	_, err := (serverAgentTurnRunner{program: "sai"}).RunSessionTurn(context.Background(), localserver.SessionTurnRequest{
 		Session: sessions.SessionV2{
 			ID:              "server-missing-created-cwd",
@@ -8557,7 +8525,9 @@ func TestServerAgentTurnRunnerRequiresCreatedCWD(t *testing.T) {
 			ConfigPath:      filepath.Join(t.TempDir(), "sai.yaml"),
 			SaveToolResults: true,
 		},
-		Content: "server prompt",
+		TurnID:    "turn-missing-created-cwd",
+		Content:   "server prompt",
+		Publisher: bus,
 	})
 	if err == nil {
 		t.Fatal("RunSessionTurn() error = nil, want missing created_cwd error")
@@ -8567,11 +8537,19 @@ func TestServerAgentTurnRunnerRequiresCreatedCWD(t *testing.T) {
 	}
 }
 
-func TestServerAgentTurnRunnerPublisherRequiresTurnID(t *testing.T) {
+func TestServerAgentTurnRunnerRequiresIncrementalPublisherAndTurnID(t *testing.T) {
+	_, err := (serverAgentTurnRunner{program: "sai"}).RunSessionTurn(context.Background(), localserver.SessionTurnRequest{})
+	if err == nil {
+		t.Fatal("RunSessionTurn() error = nil, want missing publisher error")
+	}
+	if !strings.Contains(err.Error(), "session turn publisher is required") {
+		t.Fatalf("RunSessionTurn() error = %v, want missing publisher error", err)
+	}
+
 	bus := eventbus.NewBus(func(eventbus.Event) error { return nil })
 	defer bus.Close()
 
-	_, err := (serverAgentTurnRunner{program: "sai"}).RunSessionTurn(context.Background(), localserver.SessionTurnRequest{
+	_, err = (serverAgentTurnRunner{program: "sai"}).RunSessionTurn(context.Background(), localserver.SessionTurnRequest{
 		Publisher: bus,
 	})
 	if err == nil {
@@ -8579,6 +8557,51 @@ func TestServerAgentTurnRunnerPublisherRequiresTurnID(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "session turn id is required") {
 		t.Fatalf("RunSessionTurn() error = %v, want missing turn id error", err)
+	}
+}
+
+func runServerAgentTurnWithProjectorForTest(t *testing.T, ctx context.Context, store *sessions.V2Store, session sessions.SessionV2, turnID, prompt string) (localserver.SessionTurnResult, error) {
+	t.Helper()
+
+	projector, err := sessionprojector.New(store, session)
+	if err != nil {
+		t.Fatalf("sessionprojector.New() error = %v", err)
+	}
+	defer projector.Close()
+	bus := eventbus.NewBus(projector.Handler())
+	defer bus.Close()
+
+	if err := bus.Publish(eventbus.TurnStarted{TurnID: turnID}); err != nil {
+		t.Fatalf("Publish(TurnStarted) error = %v", err)
+	}
+	if err := bus.Publish(eventbus.TurnInputReady{TurnID: turnID, Message: model.Message{Role: model.MessageRoleUser, Content: prompt}}); err != nil {
+		t.Fatalf("Publish(TurnInputReady) error = %v", err)
+	}
+
+	result, err := (serverAgentTurnRunner{program: "sai"}).RunSessionTurn(ctx, localserver.SessionTurnRequest{
+		Session:      session,
+		SessionStore: store,
+		TurnID:       turnID,
+		Content:      prompt,
+		Publisher:    bus,
+	})
+	if err != nil {
+		_ = bus.Publish(eventbus.TurnInterrupted{TurnID: turnID})
+		return result, err
+	}
+	if err := bus.Publish(eventbus.TurnCompleted{TurnID: turnID}); err != nil {
+		return result, err
+	}
+	return result, nil
+}
+
+func assertIncrementalSessionTurnResult(t *testing.T, result localserver.SessionTurnResult) {
+	t.Helper()
+	if !result.Incremental {
+		t.Fatalf("RunSessionTurn() Incremental = false, want true")
+	}
+	if len(result.Items) != 0 || len(result.ActiveHistory) != 0 || result.Compaction != nil {
+		t.Fatalf("incremental result returned legacy save plan: %#v", result)
 	}
 }
 
@@ -9158,13 +9181,11 @@ sessions:
 		t.Fatalf("Load(config sessions.dir session) error = %v, want not found", err)
 	}
 
-	result, err := (serverAgentTurnRunner{program: "sai"}).RunSessionTurn(context.Background(), localserver.SessionTurnRequest{
-		Session: loaded,
-		Content: "server prompt",
-	})
+	result, err := runServerAgentTurnWithProjectorForTest(t, context.Background(), homeStore, loaded, "turn-home-only", "server prompt")
 	if err != nil {
 		t.Fatalf("RunSessionTurn() error = %v", err)
 	}
+	assertIncrementalSessionTurnResult(t, result)
 
 	request := receiveCLIRunRequest(t, requests)
 	assertNoAdditionalCLIRunRequest(t, requests)
@@ -9172,10 +9193,7 @@ sessions:
 	assertMessage(t, messages, 0, "system", builtInBaseInstructions)
 	assertMessage(t, messages, 1, "user", "server prompt")
 	if result.Session.ID != saved.ID {
-		t.Fatalf("save plan session id = %q, want %q", result.Session.ID, saved.ID)
-	}
-	if len(result.Items) != 3 {
-		t.Fatalf("len(result.Items) = %d, want runtime+user+assistant save plan: %#v", len(result.Items), result.Items)
+		t.Fatalf("result session id = %q, want %q", result.Session.ID, saved.ID)
 	}
 }
 
@@ -9239,14 +9257,11 @@ sessions:
 		t.Fatalf("Load(config sessions.dir session) error = %v, want not found", err)
 	}
 
-	result, err := (serverAgentTurnRunner{program: "sai"}).RunSessionTurn(context.Background(), localserver.SessionTurnRequest{
-		Session:      loaded,
-		SessionStore: homeStore,
-		Content:      "server prompt",
-	})
+	result, err := runServerAgentTurnWithProjectorForTest(t, context.Background(), homeStore, loaded, "turn-home-blob", "server prompt")
 	if err != nil {
 		t.Fatalf("RunSessionTurn() error = %v", err)
 	}
+	assertIncrementalSessionTurnResult(t, result)
 
 	request := receiveCLIRunRequest(t, requests)
 	assertNoAdditionalCLIRunRequest(t, requests)
@@ -9257,7 +9272,7 @@ sessions:
 	assertMessage(t, messages, 0, "user", largePrior)
 	assertMessage(t, messages, 1, "user", "server prompt")
 	if result.Session.ID != saved.ID {
-		t.Fatalf("save plan session id = %q, want %q", result.Session.ID, saved.ID)
+		t.Fatalf("result session id = %q, want %q", result.Session.ID, saved.ID)
 	}
 }
 
@@ -9290,140 +9305,40 @@ func TestServerAgentTurnRunnerReloadsSessionConfigPathEachTurn(t *testing.T) {
 	}
 	writeCLISessionV2(t, sessionRoot, session)
 	loaded := loadCLISession(t, sessionRoot, session.ID)
-	runner := serverAgentTurnRunner{program: "sai"}
 
-	firstResult, err := runner.RunSessionTurn(context.Background(), localserver.SessionTurnRequest{
-		Session: loaded,
-		Content: "first prompt",
-	})
+	store := sessions.NewV2Store(sessionRoot)
+	firstResult, err := runServerAgentTurnWithProjectorForTest(t, context.Background(), store, loaded, "turn-reload-first", "first prompt")
 	if err != nil {
 		t.Fatalf("first RunSessionTurn() error = %v", err)
 	}
+	assertIncrementalSessionTurnResult(t, firstResult)
 	firstRequest := receiveCLIRunRequest(t, firstRequests)
 	assertNoAdditionalCLIRunRequest(t, secondRequests)
 	assertMessage(t, requestMessages(t, firstRequest.Body), 1, "user", "first prompt")
-	store := sessions.NewV2Store(sessionRoot)
-	saved, err := store.SaveTurn(firstResult.Session, firstResult.Items, firstResult.ActiveHistory)
+	saved, err := store.Load(loaded.ID)
 	if err != nil {
-		t.Fatalf("SaveTurn(first result) error = %v", err)
+		t.Fatalf("Load(first result) error = %v", err)
 	}
 
 	setCLIProviderBaseURL(t, configDir, secondServer.URL)
-	secondResult, err := runner.RunSessionTurn(context.Background(), localserver.SessionTurnRequest{
-		Session: saved,
-		Content: "second prompt",
-	})
+	secondResult, err := runServerAgentTurnWithProjectorForTest(t, context.Background(), store, saved, "turn-reload-second", "second prompt")
 	if err != nil {
 		t.Fatalf("second RunSessionTurn() error = %v", err)
 	}
+	assertIncrementalSessionTurnResult(t, secondResult)
 
 	secondRequest := receiveCLIRunRequest(t, secondRequests)
 	assertNoAdditionalCLIRunRequest(t, firstRequests)
 	secondMessages := requestMessages(t, secondRequest.Body)
-	if len(secondMessages) != 4 {
+	if len(secondMessages) != 3 {
 		t.Fatalf("len(second request messages) = %d, want saved first turn plus pending prompt: %#v", len(secondMessages), secondMessages)
 	}
-	assertMessage(t, secondMessages, 0, "system", builtInBaseInstructions)
-	assertMessage(t, secondMessages, 1, "user", "first prompt")
-	assertMessage(t, secondMessages, 2, "assistant", "first assistant")
-	assertMessage(t, secondMessages, 3, "user", "second prompt")
+	assertMessage(t, secondMessages, 0, "user", "first prompt")
+	assertMessage(t, secondMessages, 1, "assistant", "first assistant")
+	assertMessage(t, secondMessages, 2, "user", "second prompt")
 	if got, want := secondResult.Session.ConfigPath, cliConfigPath(configDir); got != want {
-		t.Fatalf("second save plan ConfigPath = %q, want %q", got, want)
+		t.Fatalf("second result ConfigPath = %q, want %q", got, want)
 	}
-}
-
-func TestServerAgentTurnRunnerAutoCompactBeforeFailedModelLeavesSessionUnchanged(t *testing.T) {
-	server, requests := newSequentialCLIRunServer(t,
-		[]string{
-			`{"choices":[{"delta":{"content":"# Context Checkpoint\n\n## Goal\nContinue.\n\n## Current Progress\nFirst turn is current.\n\n## Decisions Made\nNone.\n\n## Constraints / User Preferences\nKeep concise.\n\n## Relevant Files / APIs / Commands\nNone.\n\n## Tool State / Environment State\nNo tools.\n\n## Open Questions\nNone.\n\n## Next Steps\nAnswer second."}}]}`,
-			`[DONE]`,
-		},
-		[]string{
-			`{not-json`,
-		},
-	)
-	defer server.Close()
-
-	configDir := t.TempDir()
-	writeCLIRunFixtureInDir(t, configDir, server.URL, "direct-secret-value", "openai-chat")
-	setCLICompactionConfigWithThreshold(t, configDir, true, 1, "", "")
-	setCLIModelContextWindow(t, configDir, 10000)
-	sessionRoot := filepath.Join(configDir, "sessions")
-	projectDir := t.TempDir()
-	systemMessage := model.Message{Role: model.MessageRoleSystem, Content: builtInBaseInstructions}
-	userMessage := model.Message{Role: model.MessageRoleUser, Content: "first"}
-	assistantMessage := model.Message{Role: model.MessageRoleAssistant, Content: "one"}
-	session := sessions.SessionV2{
-		ID:                   "server-auto-compact",
-		CreatedAt:            time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC),
-		UpdatedAt:            time.Date(2026, 7, 3, 12, 1, 0, 0, time.UTC),
-		Version:              sessions.VersionV2,
-		Provider:             "fake",
-		ModelProfile:         "default",
-		ModelID:              "model-default",
-		CWD:                  projectDir,
-		CreatedCWD:           projectDir,
-		ConfigPath:           cliConfigPath(configDir),
-		InstructionsSnapshot: []model.Message{systemMessage},
-		Items: []sessions.SessionItem{
-			sessions.SessionItemFromMessage("runtime-000001", systemMessage),
-			sessions.SessionItemFromMessage("msg-000002", userMessage),
-			sessions.SessionItemFromMessage("msg-000003", assistantMessage),
-		},
-		ActiveHistory:   []string{"runtime-000001", "msg-000002", "msg-000003"},
-		Context:         contextwindow.Metadata{ContextWindow: 10000, ContextWindowSource: string(contextwindow.WindowSourceConfigured)},
-		SaveToolResults: true,
-	}
-	writeCLISessionV2(t, sessionRoot, session)
-	loaded := loadCLISession(t, sessionRoot, session.ID)
-
-	_, err := (serverAgentTurnRunner{program: "sai"}).RunSessionTurn(context.Background(), localserver.SessionTurnRequest{
-		Session: loaded,
-		Content: "second",
-	})
-	if err == nil {
-		t.Fatal("RunSessionTurn() error = nil, want failed model turn")
-	}
-	if !strings.Contains(err.Error(), "parse OpenAI chat stream") {
-		t.Fatalf("RunSessionTurn() error = %v, want model parse failure", err)
-	}
-
-	summaryRequest := receiveCLIRunRequest(t, requests)
-	failedModelRequest := receiveCLIRunRequest(t, requests)
-	assertNoAdditionalCLIRunRequest(t, requests)
-	if strings.Contains(string(summaryRequest.RawBody), "second") {
-		t.Fatalf("summary request included pending user message: %s", summaryRequest.RawBody)
-	}
-	if _, ok := summaryRequest.Body["tools"]; ok {
-		t.Fatalf("summary request included tools: %#v", summaryRequest.Body["tools"])
-	}
-	failedMessages := requestMessages(t, failedModelRequest.Body)
-	if len(failedMessages) != 5 {
-		t.Fatalf("len(failed model messages) = %d, want compacted history plus pending user: %#v", len(failedMessages), failedMessages)
-	}
-	assertMessage(t, failedMessages, 0, "system", builtInBaseInstructions)
-	assertMessage(t, failedMessages, 1, "user", "first")
-	assertMessage(t, failedMessages, 2, "assistant", "one")
-	assertMessageContentContains(t, failedMessages, 3, "developer", "<compaction_summary>")
-	assertMessage(t, failedMessages, 4, "user", "second")
-
-	after := loadCLISession(t, sessionRoot, session.ID)
-	if len(after.Compactions) != 0 {
-		t.Fatalf("len(Compactions) = %d, want none after failed model turn: %#v", len(after.Compactions), after.Compactions)
-	}
-	if sessionContainsExactMessageContent(after, "second") {
-		t.Fatalf("session persisted failed pending user message: %#v", after.Items)
-	}
-	if sessionContainsMessageContent(after, "<compaction_summary>") {
-		t.Fatalf("session persisted planned compaction summary after failed model: %#v", after.Items)
-	}
-	active := activeCLIMessages(t, after)
-	if len(active) != 3 {
-		t.Fatalf("len(active messages) = %d, want original active history after failed model: %#v", len(active), active)
-	}
-	assertSavedMessage(t, active, 0, model.MessageRoleSystem, builtInBaseInstructions)
-	assertSavedMessage(t, active, 1, model.MessageRoleUser, "first")
-	assertSavedMessage(t, active, 2, model.MessageRoleAssistant, "one")
 }
 
 func TestServerAgentTurnRunnerPlansManualCompactionWithoutPersisting(t *testing.T) {
@@ -16531,6 +16446,16 @@ func sessionContainsMessageContent(session sessions.SessionV2, content string) b
 	return false
 }
 
+func countSessionItemsWithExactContent(session sessions.SessionV2, content string) int {
+	count := 0
+	for _, item := range session.Items {
+		if item.Message != nil && item.Message.Content == content {
+			count++
+		}
+	}
+	return count
+}
+
 func sessionContainsExactMessageContent(session sessions.SessionV2, content string) bool {
 	for _, item := range session.Items {
 		if item.Message != nil && item.Message.Content == content {
@@ -17409,6 +17334,21 @@ func requestMessages(t *testing.T, body map[string]any) []any {
 		t.Fatalf("messages = %T, want []any", body["messages"])
 	}
 	return messages
+}
+
+func countCLIRequestMessagesWithContent(t *testing.T, messages []any, role, content string) int {
+	t.Helper()
+	count := 0
+	for i, raw := range messages {
+		message, ok := raw.(map[string]any)
+		if !ok {
+			t.Fatalf("message[%d] = %T, want object", i, raw)
+		}
+		if message["role"] == role && message["content"] == content {
+			count++
+		}
+	}
+	return count
 }
 
 func toolMessagesByCallID(messages []any) map[string]string {

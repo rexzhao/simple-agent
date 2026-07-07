@@ -319,5 +319,7 @@ GC, and auto-rerunning interrupted tools.
   history, no running turn, resume continuable.
 - [x] Legacy sessions (no `Status`, no `item.updated`) load/resume/compact correctly
   under the new code.
-- [ ] Persistence has a single path (projector); CLI and server no longer maintain
-  separate `sessionSavePlan` write branches.
+- [x] Persistence has a single path (projector); CLI and server no longer maintain
+  separate `sessionSavePlan` write branches. The CLI completion fallback and server
+  runner non-incremental fallback were removed; production `sessionSavePlan` no longer
+  exists.
