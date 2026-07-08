@@ -87,6 +87,36 @@ func (s *Service) GetSessionChatItems(id string) (SessionItemsPage, error) {
 	}, nil
 }
 
+func (s *Service) GetSessionTurnFinalAssistantOutput(id, turnID string) (string, error) {
+	if s == nil || s.sessionStore == nil {
+		return "", fmt.Errorf("execution session store is not configured")
+	}
+	turnID = strings.TrimSpace(turnID)
+	if turnID == "" {
+		return "", fmt.Errorf("turn id is required")
+	}
+	session, err := s.sessionStore.Load(id)
+	if err != nil {
+		return "", err
+	}
+
+	var output string
+	for _, item := range session.Items {
+		if item.TurnID != turnID || !sessionItemVisibleInChat(item) {
+			continue
+		}
+		if item.Message == nil || item.Message.Role != model.MessageRoleAssistant || item.Audience != sessions.ItemAudienceModel {
+			continue
+		}
+		text, err := s.sessionItemFullContent(item)
+		if err != nil {
+			return "", err
+		}
+		output = text
+	}
+	return output, nil
+}
+
 func (s *Service) CompactSession(ctx context.Context, id string) (SessionCompactResult, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -353,6 +383,29 @@ func (s *Service) sessionItemDisplayContent(item sessions.SessionItem) (string, 
 		return "", item.Content.Preview, nil
 	}
 	return "", "", nil
+}
+
+func (s *Service) sessionItemFullContent(item sessions.SessionItem) (string, error) {
+	if item.Message != nil && item.Message.Content != "" {
+		return item.Message.Content, nil
+	}
+	if item.Content == nil {
+		return "", nil
+	}
+	if item.Content.Inline != "" {
+		return item.Content.Inline, nil
+	}
+	if item.Content.Blob != nil {
+		raw, err := s.sessionStore.ReadBlob(*item.Content.Blob)
+		if err != nil {
+			return "", err
+		}
+		return string(raw), nil
+	}
+	if item.Content.Preview != "" {
+		return item.Content.Preview, nil
+	}
+	return "", nil
 }
 
 func sessionItemVisibleInChat(item sessions.SessionItem) bool {

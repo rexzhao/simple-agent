@@ -481,6 +481,78 @@ func TestServiceGetSessionChatItemsFiltersItemBackedVisibleMessages(t *testing.T
 	}
 }
 
+func TestServiceGetSessionTurnFinalAssistantOutputMaterializesLastVisibleAssistant(t *testing.T) {
+	home := t.TempDir()
+	service, _, session := newExecutionServiceWithSession(t, home, fakeExecutionTurnRunner{supports: true})
+	fullAnswer := strings.Repeat("final answer body ", 400) + "FINAL-SUFFIX"
+	blob, err := service.sessionStore.WriteBlob([]byte(fullAnswer), "utf-8", "text/plain")
+	if err != nil {
+		t.Fatalf("WriteBlob() error = %v", err)
+	}
+	_, err = service.sessionStore.AppendItemsAndReplaceActiveHistory(session.ID, []sessions.SessionItem{
+		{
+			ID:         "turn-user",
+			TurnID:     "turn-1",
+			Kind:       sessions.ItemKindMessage,
+			Visibility: sessions.ItemVisibilityVisible,
+			Audience:   sessions.ItemAudienceUser,
+			Message:    &model.Message{Role: model.MessageRoleUser, Content: "review this"},
+		},
+		{
+			ID:         "turn-prelude",
+			TurnID:     "turn-1",
+			Kind:       sessions.ItemKindMessage,
+			Visibility: sessions.ItemVisibilityVisible,
+			Audience:   sessions.ItemAudienceModel,
+			Message:    &model.Message{Role: model.MessageRoleAssistant, Content: "checking the diff first"},
+		},
+		{
+			ID:         "turn-tool",
+			TurnID:     "turn-1",
+			Kind:       sessions.ItemKindMessage,
+			Visibility: sessions.ItemVisibilityVisible,
+			Audience:   sessions.ItemAudienceModel,
+			Message:    &model.Message{Role: model.MessageRoleTool, ToolCallID: "call-1", Content: "tool result secret"},
+		},
+		{
+			ID:         "turn-final",
+			TurnID:     "turn-1",
+			Kind:       sessions.ItemKindMessage,
+			Visibility: sessions.ItemVisibilityVisible,
+			Audience:   sessions.ItemAudienceModel,
+			Message:    &model.Message{Role: model.MessageRoleAssistant},
+			Content:    &sessions.StoredContent{Blob: &blob, Preview: "truncated preview"},
+		},
+		{
+			ID:         "turn-hidden",
+			TurnID:     "turn-1",
+			Kind:       sessions.ItemKindMessage,
+			Visibility: sessions.ItemVisibilityHidden,
+			Audience:   sessions.ItemAudienceModel,
+			Message:    &model.Message{Role: model.MessageRoleAssistant, Content: "hidden assistant"},
+		},
+		{
+			ID:         "other-turn",
+			TurnID:     "turn-2",
+			Kind:       sessions.ItemKindMessage,
+			Visibility: sessions.ItemVisibilityVisible,
+			Audience:   sessions.ItemAudienceModel,
+			Message:    &model.Message{Role: model.MessageRoleAssistant, Content: "other turn"},
+		},
+	}, []string{"turn-user", "turn-prelude", "turn-tool", "turn-final", "turn-hidden", "other-turn"})
+	if err != nil {
+		t.Fatalf("AppendItemsAndReplaceActiveHistory() error = %v", err)
+	}
+
+	got, err := service.GetSessionTurnFinalAssistantOutput(session.ID, "turn-1")
+	if err != nil {
+		t.Fatalf("GetSessionTurnFinalAssistantOutput() error = %v", err)
+	}
+	if got != fullAnswer {
+		t.Fatalf("final assistant output = %q, want full blob-backed answer", got)
+	}
+}
+
 func TestServiceSendSessionMessageWithEventsEmitsDirectStreamEvents(t *testing.T) {
 	home := t.TempDir()
 	runner := fakeExecutionTurnRunner{

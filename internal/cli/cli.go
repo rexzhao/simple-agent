@@ -2040,10 +2040,9 @@ type attachOutputState struct {
 }
 
 type attachSendResult struct {
-	result        execution.SessionMessageResult
-	err           error
-	mailboxTask   *mailboxTask
-	mailboxOutput string
+	result      execution.SessionMessageResult
+	err         error
+	mailboxTask *mailboxTask
 }
 
 type attachREPLSources struct {
@@ -2139,6 +2138,11 @@ func runAttachREPLWithScanner(ctx context.Context, service *execution.Service, s
 				taskCancel()
 				return false, nil
 			}
+			if err := writeMailboxTaskStart(stderr, displayCommand, input.mailboxTask, input.line); err != nil {
+				taskCancel()
+				mailbox.failTask(input.mailboxTask, err)
+				return false, err
+			}
 		}
 
 		done := make(chan attachSendResult, 1)
@@ -2158,18 +2162,13 @@ func runAttachREPLWithScanner(ctx context.Context, service *execution.Service, s
 			if taskCancel != nil {
 				defer taskCancel()
 			}
-			var mailboxOutput strings.Builder
 			result, err := service.SendSessionMessageWithEvents(sendCtx, sessionID, prompt, func(event execution.SessionStreamEvent) {
-				if task != nil && attachEventType(event) == "text.delta" {
-					text, _ := event["text"].(string)
-					mailboxOutput.WriteString(text)
-				}
 				select {
 				case eventCh <- event:
 				case <-sendCtx.Done():
 				}
 			})
-			done <- attachSendResult{result: result, err: err, mailboxTask: task, mailboxOutput: mailboxOutput.String()}
+			done <- attachSendResult{result: result, err: err, mailboxTask: task}
 		}()
 		return false, nil
 	}
@@ -2235,7 +2234,12 @@ func runAttachREPLWithScanner(ctx context.Context, service *execution.Service, s
 				if sendResult.err != nil {
 					mailbox.failTask(sendResult.mailboxTask, sendResult.err)
 				} else {
-					mailbox.completeTask(sendResult.mailboxTask, sendResult.mailboxOutput)
+					result, err := mailboxFinalAssistantOutput(service, sessionID, sendResult.result.TurnID)
+					if err != nil {
+						mailbox.failTask(sendResult.mailboxTask, err)
+					} else {
+						mailbox.completeTask(sendResult.mailboxTask, result)
+					}
 				}
 			}
 			if sendResult.err != nil {
@@ -2305,6 +2309,34 @@ func runAttachREPLWithScanner(ctx context.Context, service *execution.Service, s
 			return ctx.Err()
 		}
 	}
+}
+
+func mailboxFinalAssistantOutput(service *execution.Service, sessionID, turnID string) (string, error) {
+	turnID = strings.TrimSpace(turnID)
+	if turnID == "" {
+		return "", fmt.Errorf("mailbox result missing turn id")
+	}
+	return service.GetSessionTurnFinalAssistantOutput(sessionID, turnID)
+}
+
+func writeMailboxTaskStart(stderr io.Writer, command string, task *mailboxTask, prompt string) error {
+	taskID := ""
+	if task != nil {
+		taskID = strings.TrimSpace(task.ID)
+	}
+	if taskID == "" {
+		taskID = "(unknown)"
+	}
+	if _, err := fmt.Fprintf(stderr, "\n%s: mailbox task %s\n", command, taskID); err != nil {
+		return err
+	}
+	prompt = strings.TrimRight(prompt, "\r\n")
+	if strings.ContainsAny(prompt, "\r\n") {
+		_, err := fmt.Fprintf(stderr, "user:\n%s\n", prompt)
+		return err
+	}
+	_, err := fmt.Fprintf(stderr, "user: %s\n", prompt)
+	return err
 }
 
 func attachEventType(event execution.SessionStreamEvent) string {
