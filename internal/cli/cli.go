@@ -288,13 +288,13 @@ func execute(ctx context.Context, program string, args []string, stdin io.Reader
 		var stop func()
 		ctx, stop = contextWithInterruptCancel(ctx, interrupts)
 		defer stop()
-		return defaultSessionCommand(ctx, rootArgs.commandArgs, rootArgs.configPath, serverRoot, rootArgs.mailboxMCP, stdin, stdout, stderr, getwd, program)
+		return defaultSessionCommand(ctx, rootArgs.commandArgs, rootArgs.configPath, serverRoot, rootArgs.mailbox, stdin, stdout, stderr, getwd, program)
 	}
 	var stop func()
 	ctx, stop = contextWithInterruptCancel(ctx, interrupts)
 	defer stop()
-	if rootArgs.mailboxMCP != "" && rootArgs.command != "help" && rootArgs.command != "session" {
-		return usageError("--mailbox-mcp can only be used with the default session or session resume", "", "sai help")
+	if rootArgs.mailbox.Enabled && rootArgs.command != "help" && rootArgs.command != "session" {
+		return usageError("--mailbox can only be used with the default session or session resume", "", "sai help")
 	}
 
 	switch rootArgs.command {
@@ -364,14 +364,14 @@ func execute(ctx context.Context, program string, args []string, stdin io.Reader
 			printSessionUsage(stdout, displayCommand)
 			return nil
 		}
-		if rootArgs.mailboxMCP != "" && subcommand != "resume" {
-			return usageError("--mailbox-mcp can only be used with the default session or session resume", "", "sai help session resume")
+		if rootArgs.mailbox.Enabled && subcommand != "resume" {
+			return usageError("--mailbox can only be used with the default session or session resume", "", "sai help session resume")
 		}
 		switch subcommand {
 		case "create":
 			return sessionCreateCommand(ctx, subArgs, rootArgs.configPath, serverRoot, stdout, getwd, program)
 		case "resume":
-			return sessionResumeCommand(ctx, subArgs, rootArgs.configProvided, serverRoot, rootArgs.mailboxMCP, stdin, stdout, stderr, program)
+			return sessionResumeCommand(ctx, subArgs, rootArgs.configProvided, serverRoot, rootArgs.mailbox, stdin, stdout, stderr, getwd, program)
 		case "list":
 			return sessionListCommand(ctx, subArgs, rootArgs.configPath, rootArgs.configProvided, serverRoot, stdout, getwd, program)
 		case "show":
@@ -440,7 +440,7 @@ func contextWithInterruptCancel(ctx context.Context, interrupts <-chan struct{})
 	}
 }
 
-const rootUsageText = `usage: sai [--server-root dir] [--config file] [--mailbox-mcp host:port] [command] [args]
+const rootUsageText = `usage: sai [--server-root dir] [--config file] [--mailbox [host:port]] [command] [args]
 
 Commands:
   project           Manage registered projects
@@ -457,8 +457,9 @@ Commands:
 With no command, sai auto-creates a project for the current directory when
 needed, then starts a pending session.
 
-Use --mailbox-mcp host:port with the default session or session resume to
-accept MCP mailbox tasks while the foreground CLI is idle.
+Use --mailbox [host:port] with the default session or session resume to accept
+MCP mailbox tasks while the foreground CLI is idle. Without host:port, sai
+listens on 127.0.0.1 with an OS-assigned port.
 
 Run "sai help <command>" for command usage.
 `
@@ -907,16 +908,21 @@ type rootArgs struct {
 	configPath     string
 	configProvided bool
 	serverRoot     string
-	mailboxMCP     string
+	mailbox        mailboxRootFlag
 	command        string
 	commandArgs    []string
 	hasHelp        bool
 }
 
+type mailboxRootFlag struct {
+	Enabled bool
+	Addr    string
+}
+
 func splitRootArgs(args []string) (rootArgs, error) {
 	known := map[string]flagKind{
 		"config":         flagKindValue,
-		"mailbox-mcp":    flagKindValue,
+		"mailbox":        flagKindBool,
 		"all-projects":   flagKindBool,
 		"archived":       flagKindBool,
 		"server-root":    flagKindValue,
@@ -974,7 +980,16 @@ func splitRootArgs(args []string) (rootArgs, error) {
 		if isHelpArg(arg) {
 			out.hasHelp = true
 		}
-		if name == "config" || name == "server-root" || name == "mailbox-mcp" {
+		if name == "mailbox" {
+			mailbox, next, err := mailboxFlagValue(args, i, hasInlineValue)
+			if err != nil {
+				return rootArgs{}, usageError(err.Error(), "", "sai help")
+			}
+			out.mailbox = mailbox
+			i = next
+			continue
+		}
+		if name == "config" || name == "server-root" {
 			value, next, err := flagValue(args, i, name, hasInlineValue)
 			if err != nil {
 				return rootArgs{}, usageError(err.Error(), "", "sai help")
@@ -982,10 +997,8 @@ func splitRootArgs(args []string) (rootArgs, error) {
 			if name == "config" {
 				out.configPath = value
 				out.configProvided = true
-			} else if name == "server-root" {
-				out.serverRoot = value
 			} else {
-				out.mailboxMCP = value
+				out.serverRoot = value
 			}
 			i = next
 			continue
@@ -1015,7 +1028,16 @@ func stripGlobalArgs(args rootArgs) (rootArgs, error) {
 			break
 		}
 		name, hasInlineValue := flagName(arg)
-		if isFlagArg(arg) && (name == "config" || name == "server-root" || name == "mailbox-mcp") {
+		if isFlagArg(arg) && name == "mailbox" {
+			mailbox, next, err := mailboxFlagValue(args.commandArgs, i, hasInlineValue)
+			if err != nil {
+				return rootArgs{}, usageError(err.Error(), "", "sai help")
+			}
+			args.mailbox = mailbox
+			i = next
+			continue
+		}
+		if isFlagArg(arg) && (name == "config" || name == "server-root") {
 			value, next, err := flagValue(args.commandArgs, i, name, hasInlineValue)
 			if err != nil {
 				return rootArgs{}, usageError(err.Error(), "", "sai help")
@@ -1023,10 +1045,8 @@ func stripGlobalArgs(args rootArgs) (rootArgs, error) {
 			if name == "config" {
 				args.configPath = value
 				args.configProvided = true
-			} else if name == "server-root" {
-				args.serverRoot = value
 			} else {
-				args.mailboxMCP = value
+				args.serverRoot = value
 			}
 			i = next
 			continue
@@ -1086,6 +1106,34 @@ func flagValue(args []string, index int, name string, inline bool) (string, int,
 		return "", index, fmt.Errorf("flag needs an argument: -%s", name)
 	}
 	return args[index+1], index + 1, nil
+}
+
+func mailboxFlagValue(args []string, index int, inline bool) (mailboxRootFlag, int, error) {
+	if inline {
+		_, value, _ := strings.Cut(args[index], "=")
+		value = strings.TrimSpace(value)
+		if value == "" {
+			return mailboxRootFlag{Enabled: true}, index, nil
+		}
+		addr, err := normalizeMailboxListenAddr(value)
+		if err != nil {
+			return mailboxRootFlag{}, index, err
+		}
+		return mailboxRootFlag{Enabled: true, Addr: addr}, index, nil
+	}
+
+	if index+1 >= len(args) {
+		return mailboxRootFlag{Enabled: true}, index, nil
+	}
+	next := strings.TrimSpace(args[index+1])
+	if next == "" || isFlagArg(next) || !strings.Contains(next, ":") {
+		return mailboxRootFlag{Enabled: true}, index, nil
+	}
+	addr, err := normalizeMailboxListenAddr(next)
+	if err != nil {
+		return mailboxRootFlag{}, index, err
+	}
+	return mailboxRootFlag{Enabled: true, Addr: addr}, index + 1, nil
 }
 
 func versionCommand(args []string, stdout io.Writer, command string) error {
@@ -1804,7 +1852,7 @@ func executionSessionCreateMetadataFromDefaults(session sessions.SessionV2) exec
 	}
 }
 
-func sessionResumeCommand(ctx context.Context, args []string, configProvided bool, homePath string, mailboxAddr string, stdin io.Reader, stdout, stderr io.Writer, program string) error {
+func sessionResumeCommand(ctx context.Context, args []string, configProvided bool, homePath string, mailbox mailboxRootFlag, stdin io.Reader, stdout, stderr io.Writer, getwd func() (string, error), program string) error {
 	displayCommand := displayProgramName(program)
 	flags := flag.NewFlagSet("sai session resume", flag.ContinueOnError)
 	flags.String("cwd", "", "discovery working directory")
@@ -1822,12 +1870,19 @@ func sessionResumeCommand(ctx context.Context, args []string, configProvided boo
 	if err != nil {
 		return err
 	}
+	startupCWD := ""
+	if mailbox.Enabled {
+		startupCWD, err = resolveClientCWD("", getwd)
+		if err != nil {
+			return err
+		}
+	}
 	replCtx := ctx
 	var cancelMailbox context.CancelFunc
-	if mailboxAddr != "" {
+	if mailbox.Enabled {
 		replCtx, cancelMailbox = context.WithCancel(ctx)
 	}
-	mailbox, stopMailbox, err := startMailboxForREPL(replCtx, mailboxAddr, stderr, displayCommand)
+	mailboxQueue, stopMailbox, err := startMailboxForREPL(replCtx, mailbox, startupCWD, stderr, displayCommand, program)
 	if err != nil {
 		if cancelMailbox != nil {
 			cancelMailbox()
@@ -1840,10 +1895,10 @@ func sessionResumeCommand(ctx context.Context, args []string, configProvided boo
 		}
 		stopMailbox()
 	}()
-	return resumeExecutionSessionREPL(replCtx, service, positionals[0], stdin, stdout, stderr, displayCommand, "sai help session resume", mailbox)
+	return resumeExecutionSessionREPL(replCtx, service, positionals[0], stdin, stdout, stderr, displayCommand, "sai help session resume", mailboxQueue)
 }
 
-func defaultSessionCommand(ctx context.Context, args []string, configPath string, homePath string, mailboxAddr string, stdin io.Reader, stdout, stderr io.Writer, getwd func() (string, error), program string) error {
+func defaultSessionCommand(ctx context.Context, args []string, configPath string, homePath string, mailbox mailboxRootFlag, stdin io.Reader, stdout, stderr io.Writer, getwd func() (string, error), program string) error {
 	displayCommand := displayProgramName(program)
 	flags := flag.NewFlagSet("sai", flag.ContinueOnError)
 	cwdFlag := flags.String("cwd", "", "discovery working directory")
@@ -1859,16 +1914,27 @@ func defaultSessionCommand(ctx context.Context, args []string, configPath string
 	if err != nil {
 		return err
 	}
-	creationCWD, err := resolveClientCWD(*cwdFlag, getwd)
+	startupCWD := ""
+	creationGetwd := getwd
+	if mailbox.Enabled {
+		startupCWD, err = resolveClientCWD("", getwd)
+		if err != nil {
+			return err
+		}
+		creationGetwd = func() (string, error) {
+			return startupCWD, nil
+		}
+	}
+	creationCWD, err := resolveClientCWD(*cwdFlag, creationGetwd)
 	if err != nil {
 		return err
 	}
 	replCtx := ctx
 	var cancelMailbox context.CancelFunc
-	if mailboxAddr != "" {
+	if mailbox.Enabled {
 		replCtx, cancelMailbox = context.WithCancel(ctx)
 	}
-	mailbox, stopMailbox, err := startMailboxForREPL(replCtx, mailboxAddr, stderr, displayCommand)
+	mailboxQueue, stopMailbox, err := startMailboxForREPL(replCtx, mailbox, startupCWD, stderr, displayCommand, program)
 	if err != nil {
 		if cancelMailbox != nil {
 			cancelMailbox()
@@ -1881,7 +1947,7 @@ func defaultSessionCommand(ctx context.Context, args []string, configPath string
 		}
 		stopMailbox()
 	}()
-	return runPendingAttachREPL(replCtx, service, configPath, homePath, creationCWD, stdin, stdout, stderr, program, mailbox)
+	return runPendingAttachREPL(replCtx, service, configPath, homePath, creationCWD, stdin, stdout, stderr, program, mailboxQueue)
 }
 
 func resumeExecutionSessionREPL(ctx context.Context, service *execution.Service, sessionID string, stdin io.Reader, stdout, stderr io.Writer, displayCommand, helpCommand string, mailbox *mailboxQueue) error {

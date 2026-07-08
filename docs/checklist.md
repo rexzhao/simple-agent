@@ -558,14 +558,13 @@
 
 ## M23：Mailbox MCP Input Adapter
 
-- [x] `sai --mailbox-mcp 127.0.0.1:PORT` 在前台 CLI 进程内启动本地 MCP mailbox server。
-- [ ] 用户可见入口改为 `sai --mailbox [127.0.0.1:PORT]`，并移除 `--mailbox-mcp`。
-- [ ] `sai --mailbox` 省略地址时自动监听 `127.0.0.1:0` 并使用 OS 分配端口。
-- [ ] mailbox 启动成功后向 stderr 打印实际 MCP URL。
-- [ ] mailbox 启动成功后写入 `.agents/${basename argv[0]}-mailbox.json` discovery 文件。
-- [ ] discovery 文件包含 endpoint URL、host、port、token、pid、命令 basename、started_at
+- [x] 用户可见入口改为 `sai --mailbox [127.0.0.1:PORT]`，并移除 `--mailbox-mcp`。
+- [x] `sai --mailbox` 省略地址时自动监听 `127.0.0.1:0` 并使用 OS 分配端口。
+- [x] mailbox 启动成功后向 stderr 打印实际 MCP URL。
+- [x] mailbox 启动成功后写入 `.agents/${basename argv[0]}-mailbox.json` discovery 文件。
+- [x] discovery 文件包含 endpoint URL、host、port、token、pid、命令 basename、started_at
   和 protocol 信息。
-- [ ] mailbox MCP 请求使用 discovery token 鉴权。
+- [x] mailbox MCP 请求使用 discovery token 鉴权。
 - [x] mailbox MCP 作为外部 agent 输入适配器，不提供 project/session 管理 API，不恢复旧
   HTTP/WS product layer。
 - [x] CLI 是 mailbox 的唯一 worker；CLI idle 时从 mailbox 取 queued task 并通过 execution

@@ -2,6 +2,9 @@ package cli
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/subtle"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -9,12 +12,16 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 )
 
 const mailboxMCPProtocolVersion = "2025-06-18"
+const defaultMailboxListenAddr = "127.0.0.1:0"
 
 const (
 	mailboxTaskQueued    = "queued"
@@ -60,8 +67,12 @@ type mailboxTaskRead struct {
 }
 
 type mailboxMCPServer struct {
-	server *http.Server
-	url    string
+	server        *http.Server
+	url           string
+	host          string
+	port          int
+	token         string
+	discoveryPath string
 }
 
 func newMailboxQueue() *mailboxQueue {
@@ -290,16 +301,10 @@ func startMailboxTaskRead(ctx context.Context, queue *mailboxQueue) <-chan mailb
 	return ch
 }
 
-func startMailboxMCPServer(ctx context.Context, addr string, queue *mailboxQueue) (*mailboxMCPServer, error) {
-	if strings.TrimSpace(addr) == "" {
-		return nil, errors.New("mailbox MCP address is required")
-	}
-	host, _, err := net.SplitHostPort(addr)
+func startMailboxMCPServer(ctx context.Context, addr string, queue *mailboxQueue, token string) (*mailboxMCPServer, error) {
+	addr, err := normalizeMailboxListenAddr(addr)
 	if err != nil {
-		return nil, fmt.Errorf("invalid mailbox MCP address: %w", err)
-	}
-	if !isLocalMailboxHost(host) {
-		return nil, fmt.Errorf("mailbox MCP address must bind to localhost, 127.0.0.1, or ::1")
+		return nil, err
 	}
 
 	listener, err := net.Listen("tcp", addr)
@@ -308,12 +313,16 @@ func startMailboxMCPServer(ctx context.Context, addr string, queue *mailboxQueue
 	}
 
 	mux := http.NewServeMux()
-	handler := &mailboxMCPHandler{queue: queue}
+	handler := &mailboxMCPHandler{queue: queue, token: token}
 	mux.Handle("/mcp", handler)
 	server := &http.Server{Handler: mux}
+	host, port := mailboxHTTPAddrParts(listener.Addr())
 	mcp := &mailboxMCPServer{
 		server: server,
-		url:    "http://" + mailboxHTTPHost(listener.Addr()) + "/mcp",
+		url:    "http://" + net.JoinHostPort(host, strconv.Itoa(port)) + "/mcp",
+		host:   host,
+		port:   port,
+		token:  token,
 	}
 
 	go func() {
@@ -332,6 +341,25 @@ func startMailboxMCPServer(ctx context.Context, addr string, queue *mailboxQueue
 	return mcp, nil
 }
 
+func normalizeMailboxListenAddr(addr string) (string, error) {
+	addr = strings.TrimSpace(addr)
+	if addr == "" {
+		return "", errors.New("mailbox address is required")
+	}
+	host, portText, err := net.SplitHostPort(addr)
+	if err != nil {
+		return "", fmt.Errorf("invalid mailbox address: %w", err)
+	}
+	if !isLocalMailboxHost(host) {
+		return "", fmt.Errorf("mailbox address must bind to localhost, 127.0.0.1, or ::1")
+	}
+	port, err := strconv.Atoi(portText)
+	if err != nil || port < 0 || port > 65535 {
+		return "", fmt.Errorf("mailbox address port must be between 0 and 65535")
+	}
+	return net.JoinHostPort(host, strconv.Itoa(port)), nil
+}
+
 func (s *mailboxMCPServer) Close(ctx context.Context) error {
 	if s == nil || s.server == nil {
 		return nil
@@ -339,12 +367,16 @@ func (s *mailboxMCPServer) Close(ctx context.Context) error {
 	return s.server.Shutdown(ctx)
 }
 
-func mailboxHTTPHost(addr net.Addr) string {
+func mailboxHTTPAddrParts(addr net.Addr) (string, int) {
 	host, port, err := net.SplitHostPort(addr.String())
 	if err != nil {
-		return addr.String()
+		return addr.String(), 0
 	}
-	return net.JoinHostPort(host, port)
+	parsedPort, err := strconv.Atoi(port)
+	if err != nil {
+		return host, 0
+	}
+	return host, parsedPort
 }
 
 func isLocalMailboxHost(host string) bool {
@@ -359,6 +391,7 @@ func isLocalMailboxHost(host string) bool {
 
 type mailboxMCPHandler struct {
 	queue *mailboxQueue
+	token string
 }
 
 func (h *mailboxMCPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -376,6 +409,10 @@ func (h *mailboxMCPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if !mailboxOriginAllowed(r.Header.Get("Origin")) {
 		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+	if !mailboxTokenAllowed(h.token, r) {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
 
@@ -615,6 +652,29 @@ func mailboxOriginAllowed(origin string) bool {
 	return isLocalMailboxHost(parsed.Hostname())
 }
 
+func mailboxTokenAllowed(expected string, r *http.Request) bool {
+	expected = strings.TrimSpace(expected)
+	if expected == "" {
+		return true
+	}
+	if mailboxTokenEqual(r.Header.Get("X-Sai-Mailbox-Token"), expected) {
+		return true
+	}
+	auth := strings.TrimSpace(r.Header.Get("Authorization"))
+	if len(auth) > len("Bearer ") && strings.EqualFold(auth[:len("Bearer ")], "Bearer ") {
+		return mailboxTokenEqual(strings.TrimSpace(auth[len("Bearer "):]), expected)
+	}
+	return false
+}
+
+func mailboxTokenEqual(got, expected string) bool {
+	got = strings.TrimSpace(got)
+	if got == "" || expected == "" {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(got), []byte(expected)) == 1
+}
+
 func writeMailboxMCPResponse(w http.ResponseWriter, response any) {
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(response)
@@ -676,25 +736,106 @@ type mailboxMCPTool struct {
 	InputSchema map[string]any `json:"inputSchema"`
 }
 
-func startMailboxForREPL(ctx context.Context, addr string, stderr io.Writer, displayCommand string) (*mailboxQueue, func(), error) {
-	if strings.TrimSpace(addr) == "" {
+type mailboxDiscoveryFile struct {
+	SchemaVersion   int    `json:"schema_version"`
+	URL             string `json:"url"`
+	Host            string `json:"host"`
+	Port            int    `json:"port"`
+	Token           string `json:"token"`
+	PID             int    `json:"pid"`
+	Command         string `json:"command"`
+	Protocol        string `json:"protocol"`
+	ProtocolVersion string `json:"protocol_version"`
+	StartedAt       string `json:"started_at"`
+}
+
+func startMailboxForREPL(ctx context.Context, mailbox mailboxRootFlag, discoveryRoot string, stderr io.Writer, displayCommand, program string) (*mailboxQueue, func(), error) {
+	if !mailbox.Enabled {
 		return nil, func() {}, nil
 	}
-	queue := newMailboxQueue()
-	server, err := startMailboxMCPServer(ctx, addr, queue)
+	addr := strings.TrimSpace(mailbox.Addr)
+	if addr == "" {
+		addr = defaultMailboxListenAddr
+	}
+	token, err := generateMailboxToken()
 	if err != nil {
 		return nil, func() {}, err
 	}
+	queue := newMailboxQueue()
+	server, err := startMailboxMCPServer(ctx, addr, queue, token)
+	if err != nil {
+		return nil, func() {}, err
+	}
+	discoveryPath, err := writeMailboxDiscovery(discoveryRoot, program, server)
+	if err != nil {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = server.Close(shutdownCtx)
+		return nil, func() {}, err
+	}
+	server.discoveryPath = discoveryPath
 	if _, err := fmt.Fprintf(stderr, "%s: mailbox MCP listening on %s\n", displayCommand, server.url); err != nil {
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
 		_ = server.Close(shutdownCtx)
+		removeMailboxDiscovery(server.discoveryPath)
 		return nil, func() {}, err
 	}
 	stop := func() {
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
 		_ = server.Close(shutdownCtx)
+		removeMailboxDiscovery(server.discoveryPath)
 	}
 	return queue, stop, nil
+}
+
+func generateMailboxToken() (string, error) {
+	var raw [32]byte
+	if _, err := rand.Read(raw[:]); err != nil {
+		return "", fmt.Errorf("generate mailbox token: %w", err)
+	}
+	return base64.RawURLEncoding.EncodeToString(raw[:]), nil
+}
+
+func writeMailboxDiscovery(root, program string, server *mailboxMCPServer) (string, error) {
+	root = strings.TrimSpace(root)
+	if root == "" {
+		return "", errors.New("mailbox discovery root is required")
+	}
+	dir := filepath.Join(root, ".agents")
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return "", fmt.Errorf("create mailbox discovery directory: %w", err)
+	}
+	path := filepath.Join(dir, defaultConfigBasename(program)+"-mailbox.json")
+	discovery := mailboxDiscoveryFile{
+		SchemaVersion:   1,
+		URL:             server.url,
+		Host:            server.host,
+		Port:            server.port,
+		Token:           server.token,
+		PID:             os.Getpid(),
+		Command:         defaultConfigBasename(program),
+		Protocol:        "mcp-streamable-http",
+		ProtocolVersion: mailboxMCPProtocolVersion,
+		StartedAt:       time.Now().UTC().Format(time.RFC3339Nano),
+	}
+	raw, err := json.MarshalIndent(discovery, "", "  ")
+	if err != nil {
+		return "", fmt.Errorf("encode mailbox discovery: %w", err)
+	}
+	raw = append(raw, '\n')
+	if err := os.WriteFile(path, raw, 0600); err != nil {
+		return "", fmt.Errorf("write mailbox discovery: %w", err)
+	}
+	return path, nil
+}
+
+func removeMailboxDiscovery(path string) {
+	if strings.TrimSpace(path) == "" {
+		return
+	}
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return
+	}
 }

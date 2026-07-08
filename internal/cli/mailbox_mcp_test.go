@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -19,21 +20,80 @@ import (
 	"github.com/rexzhao/simple-agent/internal/model"
 )
 
-func TestSplitRootArgsExtractsMailboxMCPForSessionResume(t *testing.T) {
-	args, err := splitRootArgs([]string{"session", "resume", "sess-1", "--mailbox-mcp", "127.0.0.1:39123"})
-	if err != nil {
-		t.Fatalf("splitRootArgs() error = %v", err)
+func TestSplitRootArgsExtractsMailboxForSessionResume(t *testing.T) {
+	tests := []struct {
+		name        string
+		args        []string
+		wantCommand string
+		wantArgs    []string
+		wantAddr    string
+	}{
+		{
+			name:        "after session resume",
+			args:        []string{"session", "resume", "sess-1", "--mailbox", "127.0.0.1:39123"},
+			wantCommand: "session",
+			wantArgs:    []string{"resume", "sess-1"},
+			wantAddr:    "127.0.0.1:39123",
+		},
+		{
+			name:        "before command without address",
+			args:        []string{"--mailbox", "session", "resume", "sess-1"},
+			wantCommand: "session",
+			wantArgs:    []string{"resume", "sess-1"},
+		},
+		{
+			name:        "inside session group without address",
+			args:        []string{"session", "--mailbox", "resume", "sess-1"},
+			wantCommand: "session",
+			wantArgs:    []string{"resume", "sess-1"},
+		},
+		{
+			name:        "trailing without address",
+			args:        []string{"session", "resume", "sess-1", "--mailbox"},
+			wantCommand: "session",
+			wantArgs:    []string{"resume", "sess-1"},
+		},
+		{
+			name:        "inline address",
+			args:        []string{"--mailbox=127.0.0.1:39123", "session", "resume", "sess-1"},
+			wantCommand: "session",
+			wantArgs:    []string{"resume", "sess-1"},
+			wantAddr:    "127.0.0.1:39123",
+		},
 	}
-	if args.mailboxMCP != "127.0.0.1:39123" {
-		t.Fatalf("mailboxMCP = %q, want address", args.mailboxMCP)
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			args, err := splitRootArgs(tt.args)
+			if err != nil {
+				t.Fatalf("splitRootArgs() error = %v", err)
+			}
+			if !args.mailbox.Enabled {
+				t.Fatalf("mailbox.Enabled = false, want true")
+			}
+			if args.mailbox.Addr != tt.wantAddr {
+				t.Fatalf("mailbox.Addr = %q, want %q", args.mailbox.Addr, tt.wantAddr)
+			}
+			if args.command != tt.wantCommand {
+				t.Fatalf("command = %q, want %q", args.command, tt.wantCommand)
+			}
+			if strings.Join(args.commandArgs, "\x00") != strings.Join(tt.wantArgs, "\x00") {
+				t.Fatalf("commandArgs = %#v, want %#v", args.commandArgs, tt.wantArgs)
+			}
+		})
 	}
-	want := []string{"resume", "sess-1"}
-	if len(args.commandArgs) != len(want) {
-		t.Fatalf("commandArgs = %#v, want %#v", args.commandArgs, want)
+}
+
+func TestSplitRootArgsRejectsOldAndInvalidMailboxFlags(t *testing.T) {
+	tests := [][]string{
+		{"--mailbox-mcp", "127.0.0.1:39123"},
+		{"--mailbox=0.0.0.0:39123"},
+		{"--mailbox", "0.0.0.0:39123"},
+		{"--mailbox=127.0.0.1:not-a-port"},
 	}
-	for i := range want {
-		if args.commandArgs[i] != want[i] {
-			t.Fatalf("commandArgs = %#v, want %#v", args.commandArgs, want)
+	for _, tt := range tests {
+		if _, err := splitRootArgs(tt); err == nil {
+			t.Fatalf("splitRootArgs(%#v) error = nil, want error", tt)
 		}
 	}
 }
@@ -70,6 +130,96 @@ func TestMailboxMCPInitializeAndToolsList(t *testing.T) {
 		if !names[want] {
 			t.Fatalf("tools/list names = %#v, missing %q", names, want)
 		}
+	}
+}
+
+func TestStartMailboxForREPLWritesDiscoveryAndRequiresToken(t *testing.T) {
+	root := t.TempDir()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var stderr bytes.Buffer
+	queue, stop, err := startMailboxForREPL(ctx, mailboxRootFlag{Enabled: true}, root, &stderr, "sai", "sai.exe")
+	if err != nil {
+		t.Fatalf("startMailboxForREPL() error = %v", err)
+	}
+	if queue == nil {
+		t.Fatalf("queue = nil, want mailbox queue")
+	}
+	discoveryPath := filepath.Join(root, ".agents", "sai-mailbox.json")
+	raw, err := os.ReadFile(discoveryPath)
+	if err != nil {
+		t.Fatalf("ReadFile(discovery) error = %v", err)
+	}
+	var discovery mailboxDiscoveryFile
+	if err := json.Unmarshal(raw, &discovery); err != nil {
+		t.Fatalf("unmarshal discovery: %v", err)
+	}
+	if discovery.URL == "" || discovery.Host != "127.0.0.1" || discovery.Port == 0 || discovery.Token == "" {
+		t.Fatalf("discovery = %#v, want url, 127.0.0.1 host, port, and token", discovery)
+	}
+	if discovery.Command != "sai" || discovery.Protocol != "mcp-streamable-http" || discovery.ProtocolVersion != mailboxMCPProtocolVersion {
+		t.Fatalf("discovery metadata = %#v", discovery)
+	}
+	if !strings.Contains(stderr.String(), discovery.URL) {
+		t.Fatalf("stderr = %q, want URL %q", stderr.String(), discovery.URL)
+	}
+	if status := mailboxMCPPostStatus(t, discovery.URL, "", mailboxMCPMethodBody(t, "initialize", map[string]any{})); status != http.StatusUnauthorized {
+		t.Fatalf("unauthorized status = %d, want %d", status, http.StatusUnauthorized)
+	}
+	if status := mailboxMCPPostStatus(t, discovery.URL, "wrong", mailboxMCPMethodBody(t, "initialize", map[string]any{})); status != http.StatusUnauthorized {
+		t.Fatalf("wrong token status = %d, want %d", status, http.StatusUnauthorized)
+	}
+	initialized := mailboxMCPCallMethodWithToken(t, discovery.URL, discovery.Token, "initialize", map[string]any{})
+	if initialized["protocolVersion"] != mailboxMCPProtocolVersion {
+		t.Fatalf("protocolVersion = %#v, want %q", initialized["protocolVersion"], mailboxMCPProtocolVersion)
+	}
+	listed := mailboxMCPCallMethodWithToken(t, discovery.URL, discovery.Token, "tools/list", map[string]any{})
+	if _, ok := listed["tools"].([]any); !ok {
+		t.Fatalf("tools/list result = %#v, want tools array", listed)
+	}
+	posted := mailboxMCPCallToolWithToken(t, discovery.URL, discovery.Token, "mailbox_post", map[string]any{"prompt": "hello"})
+	if posted.StructuredContent["status"] != mailboxTaskQueued {
+		t.Fatalf("mailbox_post status = %#v, want queued", posted.StructuredContent["status"])
+	}
+
+	stop()
+	if _, err := os.Stat(discoveryPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("discovery stat after stop error = %v, want not exist", err)
+	}
+}
+
+func TestDefaultSessionMailboxDiscoveryUsesStartupCWD(t *testing.T) {
+	home := t.TempDir()
+	startupCWD := t.TempDir()
+	sessionCWD := t.TempDir()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var stdout, stderr bytes.Buffer
+	done := make(chan int, 1)
+	go func() {
+		done <- RunWithProgramContext(ctx, "sai.exe", []string{"--server-root", home, "--mailbox", "--cwd", sessionCWD}, strings.NewReader(""), &stdout, &stderr, func() (string, error) {
+			return startupCWD, nil
+		})
+	}()
+
+	discoveryPath := filepath.Join(startupCWD, ".agents", "sai-mailbox.json")
+	raw := waitForMailboxFile(t, discoveryPath)
+	var discovery mailboxDiscoveryFile
+	if err := json.Unmarshal(raw, &discovery); err != nil {
+		t.Fatalf("unmarshal discovery: %v", err)
+	}
+	if discovery.URL == "" || discovery.Token == "" {
+		t.Fatalf("discovery = %#v, want URL and token", discovery)
+	}
+	if _, err := os.Stat(filepath.Join(sessionCWD, ".agents", "sai-mailbox.json")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("session cwd discovery stat error = %v, want not exist", err)
+	}
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("RunWithProgramContext did not stop after context cancel")
 	}
 }
 
@@ -294,6 +444,10 @@ type mailboxMCPToolResponse struct {
 }
 
 func mailboxMCPCallTool(t *testing.T, endpoint, name string, arguments map[string]any) mailboxMCPToolResponse {
+	return mailboxMCPCallToolWithToken(t, endpoint, "", name, arguments)
+}
+
+func mailboxMCPCallToolWithToken(t *testing.T, endpoint, token, name string, arguments map[string]any) mailboxMCPToolResponse {
 	t.Helper()
 
 	body, err := json.Marshal(map[string]any{
@@ -308,10 +462,7 @@ func mailboxMCPCallTool(t *testing.T, endpoint, name string, arguments map[strin
 	if err != nil {
 		t.Fatalf("marshal request: %v", err)
 	}
-	resp, err := http.Post(endpoint, "application/json", bytes.NewReader(body))
-	if err != nil {
-		t.Fatalf("post %s: %v", name, err)
-	}
+	resp := mailboxMCPPost(t, endpoint, token, body)
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("post %s status = %d", name, resp.StatusCode)
@@ -333,21 +484,14 @@ func mailboxMCPCallTool(t *testing.T, endpoint, name string, arguments map[strin
 }
 
 func mailboxMCPCallMethod(t *testing.T, endpoint, method string, params map[string]any) map[string]any {
+	return mailboxMCPCallMethodWithToken(t, endpoint, "", method, params)
+}
+
+func mailboxMCPCallMethodWithToken(t *testing.T, endpoint, token, method string, params map[string]any) map[string]any {
 	t.Helper()
 
-	body, err := json.Marshal(map[string]any{
-		"jsonrpc": "2.0",
-		"id":      1,
-		"method":  method,
-		"params":  params,
-	})
-	if err != nil {
-		t.Fatalf("marshal request: %v", err)
-	}
-	resp, err := http.Post(endpoint, "application/json", bytes.NewReader(body))
-	if err != nil {
-		t.Fatalf("post %s: %v", method, err)
-	}
+	body := mailboxMCPMethodBody(t, method, params)
+	resp := mailboxMCPPost(t, endpoint, token, body)
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("post %s status = %d", method, resp.StatusCode)
@@ -366,4 +510,62 @@ func mailboxMCPCallMethod(t *testing.T, endpoint, method string, params map[stri
 		t.Fatalf("method %s JSON-RPC error = %d %s", method, decoded.Error.Code, decoded.Error.Message)
 	}
 	return decoded.Result
+}
+
+func mailboxMCPMethodBody(t *testing.T, method string, params map[string]any) []byte {
+	t.Helper()
+
+	body, err := json.Marshal(map[string]any{
+		"jsonrpc": "2.0",
+		"id":      1,
+		"method":  method,
+		"params":  params,
+	})
+	if err != nil {
+		t.Fatalf("marshal request: %v", err)
+	}
+	return body
+}
+
+func mailboxMCPPostStatus(t *testing.T, endpoint, token string, body []byte) int {
+	t.Helper()
+
+	resp := mailboxMCPPost(t, endpoint, token, body)
+	defer resp.Body.Close()
+	return resp.StatusCode
+}
+
+func mailboxMCPPost(t *testing.T, endpoint, token string, body []byte) *http.Response {
+	t.Helper()
+
+	req, err := http.NewRequest(http.MethodPost, endpoint, bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("post %s: %v", endpoint, err)
+	}
+	return resp
+}
+
+func waitForMailboxFile(t *testing.T, path string) []byte {
+	t.Helper()
+
+	deadline := time.Now().Add(2 * time.Second)
+	var lastErr error
+	for time.Now().Before(deadline) {
+		raw, err := os.ReadFile(path)
+		if err == nil {
+			return raw
+		}
+		lastErr = err
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("file %s was not written: %v", path, lastErr)
+	return nil
 }
