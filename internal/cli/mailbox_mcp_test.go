@@ -313,8 +313,58 @@ func TestMailboxTaskRunCompletesWithFullFinalAssistantOutput(t *testing.T) {
 	if strings.Contains(fmt.Sprint(waited.StructuredContent["result"]), "checking the diff first") {
 		t.Fatalf("result includes process text: %q", waited.StructuredContent["result"])
 	}
-	if got := stderr.String(); !strings.Contains(got, "sai: mailbox task "+taskID) || !strings.Contains(got, "user: review mailbox result") {
+	if got := stderr.String(); !strings.Contains(got, "sai: ----- mailbox task "+taskID+" started -----") ||
+		!strings.Contains(got, "sai: ----- mailbox task "+taskID+" completed -----") ||
+		!strings.Contains(got, "user: review mailbox result") {
 		t.Fatalf("stderr = %q, want mailbox task id and prompt", got)
+	}
+
+	cancel()
+	select {
+	case err := <-runErr:
+		if err != nil && !errors.Is(err, context.Canceled) {
+			t.Fatalf("runAttachREPLWithScanner() error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("runAttachREPLWithScanner() did not stop after context cancel")
+	}
+}
+
+func TestMailboxTaskRunFailsWhenFinalAssistantOutputMissing(t *testing.T) {
+	service, sessionID := newMailboxExecutionService(t, cliMailboxTurnRunner{
+		run: func(ctx context.Context, request execution.SessionTurnRequest) (execution.SessionTurnResult, error) {
+			if request.Content != "review without final output" {
+				t.Fatalf("RunSessionTurn content = %q, want review without final output", request.Content)
+			}
+			return execution.SessionTurnResult{Incremental: true}, nil
+		},
+	})
+	queue := newMailboxQueue()
+	server := httptest.NewServer(&mailboxMCPHandler{queue: queue})
+	defer server.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var stdout, stderr bytes.Buffer
+	runErr := make(chan error, 1)
+	go func() {
+		runErr <- runAttachREPLWithScanner(ctx, service, sessionID, bufio.NewScanner(strings.NewReader("")), &stdout, &stderr, "sai", attachREPLSources{mailbox: queue})
+	}()
+
+	posted := mailboxMCPCallTool(t, server.URL+"/mcp", "mailbox_post", map[string]any{"prompt": "review without final output"})
+	taskID, _ := posted.StructuredContent["task_id"].(string)
+	waited := mailboxMCPCallTool(t, server.URL+"/mcp", "mailbox_wait", map[string]any{"task_id": taskID, "timeout_ms": 5000})
+	if waited.StructuredContent["status"] != mailboxTaskFailed {
+		t.Fatalf("status = %#v, want failed", waited.StructuredContent["status"])
+	}
+	if !strings.Contains(fmt.Sprint(waited.StructuredContent["error"]), "missing final assistant output") {
+		t.Fatalf("error = %#v, want missing final assistant output", waited.StructuredContent["error"])
+	}
+	if _, ok := waited.StructuredContent["result"]; ok {
+		t.Fatalf("structuredContent result = %#v, want no result on missing final output", waited.StructuredContent["result"])
+	}
+	if got := stderr.String(); !strings.Contains(got, "sai: ----- mailbox task "+taskID+" started -----") ||
+		!strings.Contains(got, "sai: ----- mailbox task "+taskID+" failed -----") {
+		t.Fatalf("stderr = %q, want started and failed mailbox separators", got)
 	}
 
 	cancel()
@@ -334,9 +384,164 @@ func TestWriteMailboxTaskStartWritesPrompt(t *testing.T) {
 	if err != nil {
 		t.Fatalf("writeMailboxTaskStart() error = %v", err)
 	}
-	want := "\nsai: mailbox task task_000123\nuser:\nfirst line\nsecond line\n"
+	want := "\nsai: ----- mailbox task task_000123 started -----\nuser:\nfirst line\nsecond line\n"
 	if stderr.String() != want {
 		t.Fatalf("stderr = %q, want %q", stderr.String(), want)
+	}
+}
+
+func TestWriteMailboxTaskEndWritesSeparator(t *testing.T) {
+	var stderr bytes.Buffer
+	err := writeMailboxTaskEnd(&stderr, "sai", &mailboxTask{ID: "task_000123"}, mailboxTaskCompleted)
+	if err != nil {
+		t.Fatalf("writeMailboxTaskEnd() error = %v", err)
+	}
+	want := "sai: ----- mailbox task task_000123 completed -----\n"
+	if stderr.String() != want {
+		t.Fatalf("stderr = %q, want %q", stderr.String(), want)
+	}
+}
+
+func TestMailboxTaskPostedDuringActiveTurnWaitsForIdle(t *testing.T) {
+	firstStarted := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	started := make(chan string, 2)
+	service, sessionID := newMailboxExecutionService(t, cliMailboxTurnRunner{
+		run: func(ctx context.Context, request execution.SessionTurnRequest) (execution.SessionTurnResult, error) {
+			started <- request.Content
+			if request.Content == "stdin prompt" {
+				close(firstStarted)
+				select {
+				case <-releaseFirst:
+				case <-ctx.Done():
+					return execution.SessionTurnResult{}, ctx.Err()
+				}
+			}
+			if err := request.Publisher.Publish(eventbus.AssistantReady{
+				TurnID:  request.TurnID,
+				Message: model.Message{Role: model.MessageRoleAssistant, Content: "final " + request.Content},
+			}); err != nil {
+				return execution.SessionTurnResult{}, err
+			}
+			return execution.SessionTurnResult{Incremental: true}, nil
+		},
+	})
+	queue := newMailboxQueue()
+	server := httptest.NewServer(&mailboxMCPHandler{queue: queue})
+	defer server.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var stdout, stderr bytes.Buffer
+	runErr := make(chan error, 1)
+	go func() {
+		runErr <- runAttachREPLWithScanner(ctx, service, sessionID, bufio.NewScanner(strings.NewReader("stdin prompt\n")), &stdout, &stderr, "sai", attachREPLSources{mailbox: queue})
+	}()
+
+	select {
+	case got := <-started:
+		if got != "stdin prompt" {
+			t.Fatalf("first turn = %q, want stdin prompt", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("stdin turn did not start")
+	}
+	select {
+	case <-firstStarted:
+	case <-time.After(time.Second):
+		t.Fatal("stdin turn did not reach blocking point")
+	}
+
+	posted := mailboxMCPCallTool(t, server.URL+"/mcp", "mailbox_post", map[string]any{"prompt": "mailbox prompt"})
+	taskID, _ := posted.StructuredContent["task_id"].(string)
+	waitedQueued := mailboxMCPCallTool(t, server.URL+"/mcp", "mailbox_wait", map[string]any{"task_id": taskID, "timeout_ms": 25})
+	if waitedQueued.StructuredContent["status"] != mailboxTaskQueued {
+		t.Fatalf("status while stdin turn active = %#v, want queued", waitedQueued.StructuredContent["status"])
+	}
+	if waitedQueued.StructuredContent["timed_out"] != true {
+		t.Fatalf("timed_out while stdin turn active = %#v, want true", waitedQueued.StructuredContent["timed_out"])
+	}
+	select {
+	case got := <-started:
+		t.Fatalf("mailbox turn started before stdin turn completed: %q", got)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(releaseFirst)
+	waitedDone := mailboxMCPCallTool(t, server.URL+"/mcp", "mailbox_wait", map[string]any{"task_id": taskID, "timeout_ms": 5000})
+	if waitedDone.StructuredContent["status"] != mailboxTaskCompleted {
+		t.Fatalf("status after stdin turn released = %#v, want completed", waitedDone.StructuredContent["status"])
+	}
+	if waitedDone.StructuredContent["result"] != "final mailbox prompt" {
+		t.Fatalf("result = %#v, want final mailbox prompt", waitedDone.StructuredContent["result"])
+	}
+
+	cancel()
+	select {
+	case err := <-runErr:
+		if err != nil && !errors.Is(err, context.Canceled) {
+			t.Fatalf("runAttachREPLWithScanner() error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("runAttachREPLWithScanner() did not stop after context cancel")
+	}
+}
+
+func TestMailboxTaskRunEndSeparatorUsesCancelledStatus(t *testing.T) {
+	taskStarted := make(chan struct{})
+	service, sessionID := newMailboxExecutionService(t, cliMailboxTurnRunner{
+		run: func(ctx context.Context, request execution.SessionTurnRequest) (execution.SessionTurnResult, error) {
+			if request.Content != "cancel me" {
+				t.Fatalf("RunSessionTurn content = %q, want cancel me", request.Content)
+			}
+			close(taskStarted)
+			<-ctx.Done()
+			return execution.SessionTurnResult{}, ctx.Err()
+		},
+	})
+	queue := newMailboxQueue()
+	server := httptest.NewServer(&mailboxMCPHandler{queue: queue})
+	defer server.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var stdout, stderr bytes.Buffer
+	runErr := make(chan error, 1)
+	go func() {
+		runErr <- runAttachREPLWithScanner(ctx, service, sessionID, bufio.NewScanner(strings.NewReader("")), &stdout, &stderr, "sai", attachREPLSources{mailbox: queue})
+	}()
+
+	posted := mailboxMCPCallTool(t, server.URL+"/mcp", "mailbox_post", map[string]any{"prompt": "cancel me"})
+	taskID, _ := posted.StructuredContent["task_id"].(string)
+	select {
+	case <-taskStarted:
+	case <-time.After(time.Second):
+		t.Fatal("mailbox task did not start")
+	}
+	cancelled := mailboxMCPCallTool(t, server.URL+"/mcp", "mailbox_cancel", map[string]any{"task_id": taskID})
+	if cancelled.StructuredContent["status"] != mailboxTaskCancelled {
+		t.Fatalf("cancel status = %#v, want cancelled", cancelled.StructuredContent["status"])
+	}
+
+	want := "sai: ----- mailbox task " + taskID + " cancelled -----"
+	deadline := time.After(time.Second)
+	for !strings.Contains(stderr.String(), want) {
+		select {
+		case <-deadline:
+			t.Fatalf("stderr = %q, want %q", stderr.String(), want)
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+	if strings.Contains(stderr.String(), "mailbox task "+taskID+" failed") {
+		t.Fatalf("stderr = %q, want cancelled separator without failed separator", stderr.String())
+	}
+
+	cancel()
+	select {
+	case err := <-runErr:
+		if err != nil && !errors.Is(err, context.Canceled) {
+			t.Fatalf("runAttachREPLWithScanner() error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("runAttachREPLWithScanner() did not stop after context cancel")
 	}
 }
 

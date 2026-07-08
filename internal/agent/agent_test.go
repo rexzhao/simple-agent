@@ -145,6 +145,49 @@ func TestStreamWithResultIncludesToolHistoryAndFinalAssistantText(t *testing.T) 
 	assertAgentMessage(t, result.Messages[3], model.MessageRoleAssistant, "final", "")
 }
 
+func TestStreamWithResultFailsWhenFinalResponseHasNoVisibleOutput(t *testing.T) {
+	provider := &fakeProvider{
+		turns: [][]model.Event{
+			{
+				model.ToolCallDoneEvent{
+					ToolCall: model.ToolCall{ID: "call_1", Name: "echo", Arguments: `{}`},
+				},
+			},
+			{
+				model.ReasoningDeltaEvent{Text: "thinking only"},
+			},
+		},
+	}
+	executor := &fakeToolExecutor{
+		result: model.ToolResult{Name: "echo", Content: "tool output"},
+	}
+
+	events, results, err := StreamWithResult(context.Background(), model.Request{
+		Model:    "model-test",
+		Messages: []model.Message{{Role: model.MessageRoleUser, Content: "Use a tool"}},
+		Tools:    []model.Tool{{Name: "echo"}},
+	}, Options{
+		Provider:     provider,
+		ToolExecutor: executor,
+		MaxTurns:     4,
+	})
+	if err != nil {
+		t.Fatalf("StreamWithResult() error = %v", err)
+	}
+
+	gotEvents := collectAgentEvents(t, events)
+	errorEvent := firstErrorEvent(t, gotEvents)
+	if errorEvent.Err == nil || !strings.Contains(errorEvent.Err.Error(), "empty final response") {
+		t.Fatalf("error event = %#v, want empty final response", errorEvent)
+	}
+	if _, ok := <-results; ok {
+		t.Fatal("results produced for empty final response")
+	}
+	if len(provider.requests) != 2 {
+		t.Fatalf("len(requests) = %d, want 2", len(provider.requests))
+	}
+}
+
 func TestStreamWithPublisherPublishesDurableEventsInOrder(t *testing.T) {
 	provider := &fakeProvider{
 		turns: [][]model.Event{

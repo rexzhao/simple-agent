@@ -2137,6 +2137,8 @@ func runAttachREPLWithScanner(ctx context.Context, service *execution.Service, s
 	terminalSeen := false
 	var pendingSendErr error
 	var terminalTurnIDs map[string]bool
+	var pendingMailboxEndTask *mailboxTask
+	pendingMailboxEndStatus := ""
 	setExpectedTurnID := func(turnID string) {
 		turnID = strings.TrimSpace(turnID)
 		if turnID == "" || expectedTurnID != "" {
@@ -2147,22 +2149,63 @@ func runAttachREPLWithScanner(ctx context.Context, service *execution.Service, s
 			terminalSeen = true
 		}
 	}
-	finishTurnIfReady := func() error {
-		if !turnInFlight || !terminalSeen || sendDone != nil {
+	mailboxTerminalStatus := func(task *mailboxTask, fallback string) string {
+		status := strings.TrimSpace(fallback)
+		if task != nil && mailbox != nil {
+			if snapshot, ok := mailbox.get(task.ID); ok && strings.TrimSpace(snapshot.Status) != "" {
+				status = snapshot.Status
+			}
+		}
+		if status == "" {
+			status = "finished"
+		}
+		return status
+	}
+	writePendingMailboxEnd := func() error {
+		if pendingMailboxEndTask == nil {
 			return nil
 		}
+		task := pendingMailboxEndTask
+		status := pendingMailboxEndStatus
+		pendingMailboxEndTask = nil
+		pendingMailboxEndStatus = ""
+		return writeMailboxTaskEnd(stderr, displayCommand, task, status)
+	}
+	resetTurnState := func() {
 		turnInFlight = false
 		turnStarted = false
 		expectedTurnID = ""
 		terminalSeen = false
 		pendingSendErr = nil
 		terminalTurnIDs = nil
+	}
+	finishTurnWithSendError := func(err error) error {
+		if output.wroteText && !output.stdoutAtLineStart {
+			if _, newlineErr := fmt.Fprintln(stdout); newlineErr != nil {
+				return newlineErr
+			}
+			output.stdoutAtLineStart = true
+		}
+		resetTurnState()
+		if _, printErr := fmt.Fprintf(stderr, "%s: send failed: %v\n", displayCommand, err); printErr != nil {
+			return printErr
+		}
+		return writePendingMailboxEnd()
+	}
+	finishTurnIfReady := func() error {
+		if !turnInFlight || !terminalSeen || sendDone != nil {
+			return nil
+		}
 		if output.wroteText && !output.stdoutAtLineStart {
 			if _, err := fmt.Fprintln(stdout); err != nil {
 				return err
 			}
 			output.stdoutAtLineStart = true
 		}
+		if err := writePendingMailboxEnd(); err != nil {
+			return err
+		}
+		resetTurnState()
 		return nil
 	}
 
@@ -2297,16 +2340,21 @@ func runAttachREPLWithScanner(ctx context.Context, service *execution.Service, s
 		case sendResult := <-sendDone:
 			sendDone = nil
 			if sendResult.mailboxTask != nil {
+				status := mailboxTaskCompleted
 				if sendResult.err != nil {
 					mailbox.failTask(sendResult.mailboxTask, sendResult.err)
+					status = mailboxTaskFailed
 				} else {
 					result, err := mailboxFinalAssistantOutput(service, sessionID, sendResult.result.TurnID)
 					if err != nil {
 						mailbox.failTask(sendResult.mailboxTask, err)
+						status = mailboxTaskFailed
 					} else {
 						mailbox.completeTask(sendResult.mailboxTask, result)
 					}
 				}
+				pendingMailboxEndTask = sendResult.mailboxTask
+				pendingMailboxEndStatus = mailboxTerminalStatus(sendResult.mailboxTask, status)
 			}
 			if sendResult.err != nil {
 				pendingSendErr = sendResult.err
@@ -2316,14 +2364,8 @@ func runAttachREPLWithScanner(ctx context.Context, service *execution.Service, s
 					}
 					continue
 				}
-				turnInFlight = false
-				turnStarted = false
-				expectedTurnID = ""
-				terminalSeen = false
-				pendingSendErr = nil
-				terminalTurnIDs = nil
-				if _, printErr := fmt.Fprintf(stderr, "%s: send failed: %v\n", displayCommand, sendResult.err); printErr != nil {
-					return printErr
+				if err := finishTurnWithSendError(sendResult.err); err != nil {
+					return err
 				}
 				continue
 			}
@@ -2334,17 +2376,12 @@ func runAttachREPLWithScanner(ctx context.Context, service *execution.Service, s
 		case event, ok := <-events:
 			if !ok {
 				events = nil
-				if turnInFlight && sendDone == nil && pendingSendErr != nil && !turnStarted {
-					turnInFlight = false
-					turnStarted = false
-					expectedTurnID = ""
-					terminalSeen = false
+				if turnInFlight && sendDone == nil && pendingSendErr != nil && !terminalSeen {
 					err := pendingSendErr
-					pendingSendErr = nil
-					terminalTurnIDs = nil
-					if _, printErr := fmt.Fprintf(stderr, "%s: send failed: %v\n", displayCommand, err); printErr != nil {
-						return printErr
+					if err := finishTurnWithSendError(err); err != nil {
+						return err
 					}
+					continue
 				}
 				if err := finishTurnIfReady(); err != nil {
 					return err
@@ -2382,10 +2419,17 @@ func mailboxFinalAssistantOutput(service *execution.Service, sessionID, turnID s
 	if turnID == "" {
 		return "", fmt.Errorf("mailbox result missing turn id")
 	}
-	return service.GetSessionTurnFinalAssistantOutput(sessionID, turnID)
+	output, err := service.GetSessionTurnFinalAssistantOutput(sessionID, turnID)
+	if err != nil {
+		return "", err
+	}
+	if strings.TrimSpace(output) == "" {
+		return "", fmt.Errorf("mailbox result missing final assistant output")
+	}
+	return output, nil
 }
 
-func writeMailboxTaskStart(stderr io.Writer, command string, task *mailboxTask, prompt string) error {
+func mailboxTaskDisplayID(task *mailboxTask) string {
 	taskID := ""
 	if task != nil {
 		taskID = strings.TrimSpace(task.ID)
@@ -2393,7 +2437,11 @@ func writeMailboxTaskStart(stderr io.Writer, command string, task *mailboxTask, 
 	if taskID == "" {
 		taskID = "(unknown)"
 	}
-	if _, err := fmt.Fprintf(stderr, "\n%s: mailbox task %s\n", command, taskID); err != nil {
+	return taskID
+}
+
+func writeMailboxTaskStart(stderr io.Writer, command string, task *mailboxTask, prompt string) error {
+	if _, err := fmt.Fprintf(stderr, "\n%s: ----- mailbox task %s started -----\n", command, mailboxTaskDisplayID(task)); err != nil {
 		return err
 	}
 	prompt = strings.TrimRight(prompt, "\r\n")
@@ -2402,6 +2450,15 @@ func writeMailboxTaskStart(stderr io.Writer, command string, task *mailboxTask, 
 		return err
 	}
 	_, err := fmt.Fprintf(stderr, "user: %s\n", prompt)
+	return err
+}
+
+func writeMailboxTaskEnd(stderr io.Writer, command string, task *mailboxTask, status string) error {
+	status = strings.TrimSpace(status)
+	if status == "" {
+		status = "finished"
+	}
+	_, err := fmt.Fprintf(stderr, "%s: ----- mailbox task %s %s -----\n", command, mailboxTaskDisplayID(task), status)
 	return err
 }
 

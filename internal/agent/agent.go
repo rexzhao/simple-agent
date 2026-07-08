@@ -86,6 +86,10 @@ func run(ctx context.Context, request model.Request, options Options, maxTurns i
 			Content:   assistantContent,
 			ToolCalls: toolCalls,
 		}
+		if len(toolCalls) == 0 && strings.TrimSpace(assistantContent) == "" {
+			events <- model.ErrorEvent{Err: fmt.Errorf("agent returned empty final response")}
+			return
+		}
 		if !publishDurable(events, options.Publisher, eventbus.AssistantReady{TurnID: turnID, Message: assistantMessage}, "persist assistant") {
 			return
 		}

@@ -17,7 +17,7 @@
   管理 API。
 - [x] CLI 保持唯一 worker；mailbox 只负责任务投递、状态、最终结果和取消。
 - [x] stdin 行为保持现状：纯 CLI 不新增 turn 运行中的应用层输入队列或队列 UI。
-- [ ] CLI 开始/结束处理 mailbox task 时，在 stderr 打印包含 task id 的分隔符；结束
+- [x] CLI 开始/结束处理 mailbox task 时，在 stderr 打印包含 task id 的分隔符；结束
   分隔符包含 `completed`、`failed` 或 `cancelled`，且 MCP tool result 不包含这些分隔符。
 - [x] mailbox task result 只暴露最终 assistant 输出、状态和错误；不暴露 text deltas、tool
   events、raw execution events、hidden/debug item 或中间过程。
