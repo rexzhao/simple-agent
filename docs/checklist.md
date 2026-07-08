@@ -536,8 +536,8 @@
   turn lock、event persistence、compaction、runtime metadata 和 interrupted recovery。
 - [x] CLI 直接调用 execution library，不通过 HTTP client、WebSocket client、registry 或 background
   server。
-- [ ] CLI 只负责参数解析、交互输入和渲染 DTO/events。
-- [ ] CLI 不直接操作 provider adapters、tool execution、project/session stores、blob store 或
+- [x] 当前产品路径 CLI 只负责参数解析、交互输入和渲染 DTO/events。
+- [x] 当前产品路径 CLI 不直接操作 provider adapters、tool execution、project/session stores、blob store 或
   event projector。
 - [x] 删除当前产品路径中的 `server` 前台/后台命令、auto-start、registry、bearer token、HTTP client
   helpers、HTTP handlers 和 WebSocket stream。

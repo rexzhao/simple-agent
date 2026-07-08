@@ -6241,7 +6241,7 @@ func TestServerAgentTurnRunnerRequiresCreatedCWD(t *testing.T) {
 	bus := eventbus.NewBus(func(eventbus.Event) error { return nil })
 	defer bus.Close()
 
-	_, err := (executionAgentTurnRunner{program: "sai"}).RunSessionTurn(context.Background(), execution.SessionTurnRequest{
+	_, err := execution.NewAgentTurnRunner().RunSessionTurn(context.Background(), execution.SessionTurnRequest{
 		Session: sessions.SessionV2{
 			ID:              "server-missing-created-cwd",
 			Version:         sessions.VersionV2,
@@ -6265,7 +6265,7 @@ func TestServerAgentTurnRunnerRequiresCreatedCWD(t *testing.T) {
 }
 
 func TestServerAgentTurnRunnerRequiresIncrementalPublisherAndTurnID(t *testing.T) {
-	_, err := (executionAgentTurnRunner{program: "sai"}).RunSessionTurn(context.Background(), execution.SessionTurnRequest{})
+	_, err := execution.NewAgentTurnRunner().RunSessionTurn(context.Background(), execution.SessionTurnRequest{})
 	if err == nil {
 		t.Fatal("RunSessionTurn() error = nil, want missing publisher error")
 	}
@@ -6276,7 +6276,7 @@ func TestServerAgentTurnRunnerRequiresIncrementalPublisherAndTurnID(t *testing.T
 	bus := eventbus.NewBus(func(eventbus.Event) error { return nil })
 	defer bus.Close()
 
-	_, err = (executionAgentTurnRunner{program: "sai"}).RunSessionTurn(context.Background(), execution.SessionTurnRequest{
+	_, err = execution.NewAgentTurnRunner().RunSessionTurn(context.Background(), execution.SessionTurnRequest{
 		Publisher: bus,
 	})
 	if err == nil {
@@ -6305,7 +6305,7 @@ func runServerAgentTurnWithProjectorForTest(t *testing.T, ctx context.Context, s
 		t.Fatalf("Publish(TurnInputReady) error = %v", err)
 	}
 
-	result, err := (executionAgentTurnRunner{program: "sai"}).RunSessionTurn(ctx, execution.SessionTurnRequest{
+	result, err := execution.NewAgentTurnRunner().RunSessionTurn(ctx, execution.SessionTurnRequest{
 		Session:      session,
 		SessionStore: store,
 		TurnID:       turnID,
@@ -6513,7 +6513,7 @@ func TestServerAgentTurnRunnerSupportsIncrementalSessionTurnWithCompaction(t *te
 			t.Fatalf("SaveMetadata() error = %v", err)
 		}
 
-		supported, err := (executionAgentTurnRunner{program: "sai"}).SupportsIncrementalSessionTurn(context.Background(), execution.SessionTurnRequest{
+		supported, err := execution.NewAgentTurnRunner().SupportsIncrementalSessionTurn(context.Background(), execution.SessionTurnRequest{
 			Session:      session,
 			SessionStore: store,
 			Content:      "hello",
@@ -6551,7 +6551,7 @@ compaction:
 			t.Fatalf("SaveMetadata() error = %v", err)
 		}
 
-		supported, err := (executionAgentTurnRunner{program: "sai"}).SupportsIncrementalSessionTurn(context.Background(), execution.SessionTurnRequest{
+		supported, err := execution.NewAgentTurnRunner().SupportsIncrementalSessionTurn(context.Background(), execution.SessionTurnRequest{
 			Session:      session,
 			SessionStore: store,
 			Content:      "hello",
@@ -6631,7 +6631,7 @@ func TestServerAgentTurnRunnerPublishesIncrementalEventsToPublisher(t *testing.T
 	}
 	done := make(chan runResult, 1)
 	go func() {
-		result, err := (executionAgentTurnRunner{program: "sai"}).RunSessionTurn(ctx, execution.SessionTurnRequest{
+		result, err := execution.NewAgentTurnRunner().RunSessionTurn(ctx, execution.SessionTurnRequest{
 			Session:      session,
 			SessionStore: store,
 			TurnID:       turnID,
@@ -7109,7 +7109,7 @@ func TestServerAgentTurnRunnerPlansManualCompactionWithoutPersisting(t *testing.
 	writeCLISessionV2(t, sessionRoot, session)
 	loaded := loadCLISession(t, sessionRoot, session.ID)
 
-	result, err := (executionAgentTurnRunner{program: "sai"}).PlanSessionCompaction(context.Background(), execution.SessionCompactionRequest{
+	result, err := execution.NewAgentTurnRunner().PlanSessionCompaction(context.Background(), execution.SessionCompactionRequest{
 		Session: loaded,
 	})
 	if err != nil {
@@ -7189,7 +7189,7 @@ func TestServerAgentTurnRunnerPlansAutoCompactionWithoutPersisting(t *testing.T)
 	writeCLISessionV2(t, sessionRoot, session)
 	loaded := loadCLISession(t, sessionRoot, session.ID)
 
-	result, err := (executionAgentTurnRunner{program: "sai"}).PlanSessionTurnCompaction(context.Background(), execution.SessionTurnRequest{
+	result, err := execution.NewAgentTurnRunner().PlanSessionTurnCompaction(context.Background(), execution.SessionTurnRequest{
 		Session:      loaded,
 		SessionStore: store,
 		Content:      "second",

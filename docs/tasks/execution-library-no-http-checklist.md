@@ -12,8 +12,8 @@ management 和 turn execution 收敛为进程内 execution library。M21 global-
 - [x] execution library 以记录存储位置（home/storage root）作为唯一必需初始化参数。
 - [x] execution library 拥有 project/session stores、nearest project discovery、session selection、
   turn lock、event persistence、compaction、runtime metadata 和 interrupted recovery。
-- [ ] presentation layer 与 execution layer 严格分离：CLI 只解析输入并渲染 DTO/events。
-- [ ] CLI 不直接操作 provider adapters、tool execution、project/session stores、blob store 或
+- [x] 当前产品路径 presentation layer 与 execution layer 严格分离：CLI 只解析输入并渲染 DTO/events。
+- [x] 当前产品路径 CLI 不直接操作 provider adapters、tool execution、project/session stores、blob store 或
   event projector。
 - [x] 不恢复 hardcoded chat product entry，也不保留 hidden chat alias。
 - [x] future HTTP adapter、GUI 和跨终端共享能力均为 out of scope；未来 HTTP 只能作为 thin adapter
@@ -99,3 +99,8 @@ management 和 turn execution 收敛为进程内 execution library。M21 global-
   只剩明确标注为 M22 后删除当前入口、M10-M19 历史背景或旧 smoke evidence 的命中；
   `git diff --check` 通过。覆盖 README 当前用法、配置/开发日志说明、reasoning 展示说明和
   本清单状态，不修改旧 M20/M21 历史记录。
+- 2026-07-08 execution runner boundary slice:
+  `go test ./internal/execution`、`go test ./internal/cli`、`go test ./...` 和
+  `git diff --check` 通过。覆盖 CLI attach/session turn product path 通过
+  execution-owned agent runner 组装 provider、tools、MCP、skills、compaction 和 event persistence；
+  CLI 删除旧 execution runner adapter，仅保留普通 chat/子 agent harness 的历史 runtime 代码。
