@@ -2770,6 +2770,56 @@ func TestUnknownRootFlagBeforeCommandIncludesHelpHint(t *testing.T) {
 	assertCLIErrorContains(t, stderr.String(), "flag provided but not defined", `Run "sai help" for usage.`)
 }
 
+func TestTUIFlagScope(t *testing.T) {
+	t.Run("help allowed", func(t *testing.T) {
+		for _, args := range [][]string{
+			{"--tui", "-h"},
+			{"--tui", "help"},
+		} {
+			var stdout, stderr bytes.Buffer
+			code := RunWithGetwd(args, &stdout, &stderr, func() (string, error) {
+				return "", errors.New("getwd should not be called")
+			})
+			if code != 0 {
+				t.Fatalf("RunWithGetwd(%v) code = %d, stderr = %s", args, code, stderr.String())
+			}
+			if !strings.Contains(stdout.String(), "Bubble Tea block renderer") {
+				t.Fatalf("stdout = %q, want --tui help text", stdout.String())
+			}
+		}
+	})
+
+	t.Run("non session commands rejected", func(t *testing.T) {
+		for _, args := range [][]string{
+			{"--tui", "models", "list"},
+			{"project", "list", "--tui"},
+			{"session", "create", "--tui"},
+		} {
+			var stdout, stderr bytes.Buffer
+			code := RunWithGetwd(args, &stdout, &stderr, func() (string, error) {
+				return "", errors.New("getwd should not be called")
+			})
+			if code != 1 {
+				t.Fatalf("RunWithGetwd(%v) code = %d, want 1", args, code)
+			}
+			if stdout.String() != "" {
+				t.Fatalf("stdout = %q, want empty", stdout.String())
+			}
+			assertCLIErrorContains(t, stderr.String(), "--tui can only be used with the default session or session resume")
+		}
+	})
+
+	t.Run("session resume mixed placement allowed", func(t *testing.T) {
+		root, err := splitRootArgs([]string{"session", "resume", "session-1", "--tui"})
+		if err != nil {
+			t.Fatalf("splitRootArgs() error = %v", err)
+		}
+		if !root.tui || root.command != "session" || !sameStringSlice(root.commandArgs, []string{"resume", "session-1"}) {
+			t.Fatalf("splitRootArgs() = %#v, want tui session resume args", root)
+		}
+	})
+}
+
 func TestOldConfigDirFlagIsRejected(t *testing.T) {
 	for _, args := range [][]string{
 		{"--config-dir", t.TempDir(), "models", "list"},
@@ -8024,6 +8074,10 @@ func TestSessionResumeRejectsCWDAndConfigBeforeDiscovery(t *testing.T) {
 
 func TestBareDefaultAttachPendingFirstPromptCreatesStreamsAndSends(t *testing.T) {
 	runPendingAttachFirstPrompt(t, nil)
+}
+
+func TestBareDefaultAttachTUIFallsBackToPlainForBufferOutput(t *testing.T) {
+	runPendingAttachFirstPrompt(t, []string{"--tui"})
 }
 
 func runPendingAttachFirstPrompt(t *testing.T, args []string) {

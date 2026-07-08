@@ -969,8 +969,9 @@ MCP 向当前 session 投递 queued prompt，同时不恢复 HTTP/WS 产品层�
 
 ## M24：Optional TUI Block Renderer and PromptEvent Input
 
-状态说明（首版实现边界已定稿，代码尚未实现）：M24 是后续可选 TUI / PromptEvent
-方向的稳定文档边界；当前版本还没有 `--tui` 模式，也没有纯 CLI active turn 输入队列。
+状态说明（首版 renderer 已实现，append_active 尚未实现）：M24 是后续可选 TUI /
+PromptEvent 方向的稳定文档边界；当前版本已有显式 `--tui` 模式，但还没有纯 CLI
+active turn 输入队列。
 
 目标：在不恢复 HTTP layer、不改变 execution library 边界的前提下，为 CLI 增加一个
 显式 opt-in 的 TUI block renderer，并把 stdin、TUI 输入和 mailbox 输入统一为

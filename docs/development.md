@@ -3,9 +3,8 @@
 这个项目是一个简易的纯命令行 agent runner，命令名为 `sai`
 （Simple Agent Interface）。MVP 优先把核心闭环做稳：
 命令行输入、OpenAI-compatible streaming、tool call、打包和基础可用性。v0.1/MVP
-不要引入 TUI，也不要提前实现还没有进入第一阶段的扩展能力。后续 M24 已进入首版
-显式 opt-in TUI 的实现准备；当前代码仍然是普通 CLI，下一实现 slice 才会加入
-Bubble Tea `--tui`。
+不要把 TUI 作为默认行为，也不要提前实现还没有进入第一阶段的扩展能力。M24 已加入
+首版显式 opt-in Bubble Tea `--tui`；默认和非 TTY 路径仍然是普通 CLI。
 
 ## 目标
 
@@ -291,7 +290,7 @@ mailbox_cancel(task_id: string) -> { task_id, status }
 mailbox turn，不退出 CLI、不关闭 MCP server。已完成、失败或已取消的 task 再次 cancel
 幂等返回当前状态。
 
-## M24：TUI / PromptEvent 边界（首版已定稿，代码尚未实现）
+## M24：TUI / PromptEvent 边界（首版 renderer 已实现）
 
 M24 仍以 execution library 作为执行层边界。CLI 展示层可以在 execution session stream
 之外增加 Turn Block Aggregator，把 text delta、reasoning delta、tool start/finish、
@@ -300,9 +299,9 @@ terminal layout。
 
 首版 TUI 的库选择已收敛为 Bubble Tea。这个决定只 supersede v0.1/M9 中“不引入 TUI /
 第三方 CLI 框架”的历史约束在 M24 显式 `--tui` 模式下的适用范围；默认 plain CLI、
-非 TTY、脚本和单文件发布目标不改变。当前代码尚未提供 `--tui`，后续实现必须先补齐
-`usage.updated`、Turn Block Aggregator、显式 `--tui`、plain fallback、block 列表、
-输入区、状态栏、Ctrl+C cancel/quit 语义和 mailbox start/end block。
+非 TTY、脚本和单文件发布目标不改变。当前 `--tui` 已支持 `usage.updated`、Turn Block
+Aggregator、plain fallback、block 列表、输入区、状态栏、Ctrl+C cancel/quit 语义和
+mailbox start/end block。
 
 PromptEvent 用于统一输入源和输入语义。stdin、未来 TUI 输入和 mailbox 输入都可以映射为
 PromptEvent，但模式需要明确区分：`enqueue_turn` 表示排队为下一个 turn，`append_active`
@@ -315,7 +314,7 @@ mailbox task start/end 可以作为特殊 system block 展示；task 执行后�
 和 tool event 仍按普通 session stream 处理。MCP 侧 `mailbox_get` / `mailbox_wait` 继续只暴露
 最终 assistant output、状态和错误，不返回 TUI block、streaming delta 或 tool result 正文。
 
-`--tui` 必须是显式 opt-in；非 TTY、脚本使用和默认交互式 CLI 继续走 plain renderer。
+`--tui` 是显式 opt-in；非 TTY、脚本使用和默认交互式 CLI 继续走 plain renderer。
 M24 不恢复 HTTP/WS product layer、daemon、registry、多 worker 或后台任务发布者进程。
 
 Help/usage 是普通 CLI 行为。M24 引入的 Bubble Tea 只服务显式 `--tui`，不改变当前

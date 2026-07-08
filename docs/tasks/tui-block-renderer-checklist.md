@@ -1,13 +1,13 @@
 # TUI Block Renderer Checklist
 
 这份文档记录将 CLI 展示升级为可选 TUI block renderer 的后续开发方案。
-它现在是 M24 首版 TUI renderer 的执行 checklist，但当前代码仍尚未实现 `--tui`。
+它现在是 M24 首版 TUI renderer 的执行 checklist；首版显式 `--tui` 已实现。
 
 当前稳定文档仍然将 v0.1/MVP 定义为纯 CLI：不引入 TUI、不引入第三方 CLI/TUI 框架；
 M24 以显式 opt-in `--tui` 收窄这些历史边界。首版 TUI renderer 的库选择已定为
 Bubble Tea，这是用户明确指定后的 M24 决策，只适用于 TUI 展示层；默认 plain CLI、
-非 TTY、脚本路径和单文件发布目标不改变。任何代码实现仍必须从 Phase 3+ 开始逐项完成，
-并保持 `--tui` 显式 opt-in。
+非 TTY、脚本路径和单文件发布目标不改变。后续代码实现仍必须从未完成的 Phase 4+
+项目继续，并保持 `--tui` 显式 opt-in。
 
 ## Assumptions
 
@@ -24,7 +24,7 @@ Bubble Tea，这是用户明确指定后的 M24 决策，只适用于 TUI 展示
 
 ## First Implementation Slice
 
-首个代码 slice 应完成：
+首个代码 slice 已完成：
 
 - `model.UsageEvent` -> execution `usage.updated`。
 - CLI 展示侧 Turn Block Aggregator。
@@ -35,7 +35,7 @@ Bubble Tea，这是用户明确指定后的 M24 决策，只适用于 TUI 展示
 - 对 event contract、block aggregator 和 renderer fallback 的自动化测试。
 
 `append_active` 和真正的 active-turn checkpoint 注入不属于首个 Bubble Tea renderer slice。
-当前 serial stdin/TUI/mailbox idle 队列可以作为首版 `enqueue_turn` 语义。
+当前 serial stdin/TUI/mailbox idle 队列作为首版 `enqueue_turn` 语义。
 
 ## Current Stream Baseline
 
@@ -216,8 +216,8 @@ block 更新规则：
 
 ### Phase 3 - Event Contract Gaps
 
-- [ ] 将 `model.UsageEvent` 映射为 execution session stream 事件，例如 `usage.updated`。
-- [ ] 为状态栏确定是否需要 `status.updated`，避免 renderer 推断过多 runtime 状态。
+- [x] 将 `model.UsageEvent` 映射为 execution session stream 事件，例如 `usage.updated`。
+- [x] 为状态栏确定是否需要 `status.updated`，避免 renderer 推断过多 runtime 状态；首版不新增该事件。
 - [ ] 确定 tool duration 是否作为事件字段提供。
 - [ ] 明确 tool preview 的脱敏、长度和 opt-in/默认隐藏规则。
 - [ ] 添加 execution 层测试覆盖新增 stream event。
@@ -235,24 +235,24 @@ block 更新规则：
 
 ### Phase 5 - Turn Block Aggregator
 
-- [ ] 新增 CLI 展示侧纯逻辑包，例如 `internal/cli/turnview`。
-- [ ] 定义 TurnViewState、Block、BlockKind 和 StatusBarState。
-- [ ] 实现 `Apply(SessionStreamEvent)`。
-- [ ] 实现 input/system/mailbox block 的非 execution 事件适配。
-- [ ] 单元测试覆盖 reasoning/text/tool/error/mailbox/status bar 更新。
-- [ ] 单元测试覆盖 block 更新不泄露 tool result body。
-- [ ] 单元测试覆盖 show_reasoning false 时 reasoning block 隐藏或折叠策略。
+- [x] 新增 CLI 展示侧纯逻辑包，例如 `internal/cli/turnview`。
+- [x] 定义 TurnViewState、Block、BlockKind 和 StatusBarState。
+- [x] 实现 `Apply(SessionStreamEvent)`。
+- [x] 实现 input/system/mailbox block 的非 execution 事件适配。
+- [x] 单元测试覆盖 reasoning/text/tool/error/mailbox/status bar 更新。
+- [x] 单元测试覆盖 block 更新不泄露 tool result body。
+- [x] 单元测试覆盖 show_reasoning false 时 reasoning block 隐藏或折叠策略；首版依赖 execution 不发送 hidden reasoning 事件。
 
 ### Phase 6 - Explicit TUI Renderer
 
 - [x] 选择 TUI 库：首版使用 Bubble Tea；若引入第三方库，更新 go.mod 并记录理由。
-- [ ] 新增显式 `--tui` 开关。
-- [ ] 非 TTY、管道和脚本场景继续 plain renderer。
-- [ ] TUI 显示 block 列表、输入区和状态栏。
-- [ ] Ctrl+C 语义与当前 CLI 保持一致：取消 active turn 或退出。
-- [ ] mailbox start/end 作为 system/mailbox block 展示。
-- [ ] MCP mailbox result 不包含 TUI block 或 separators。
-- [ ] 添加最小端到端测试或可自动化的 renderer 状态测试。
+- [x] 新增显式 `--tui` 开关。
+- [x] 非 TTY、管道和脚本场景继续 plain renderer。
+- [x] TUI 显示 block 列表、输入区和状态栏。
+- [x] Ctrl+C 语义与当前 CLI 保持一致：取消 active turn 或退出。
+- [x] mailbox start/end 作为 system/mailbox block 展示。
+- [x] MCP mailbox result 不包含 TUI block 或 separators。
+- [x] 添加最小端到端测试或可自动化的 renderer 状态测试。
 
 ### Phase 7 - Optional Plain Renderer Unification
 

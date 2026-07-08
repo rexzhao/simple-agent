@@ -561,6 +561,7 @@ func TestServiceSendSessionMessageWithEventsEmitsDirectStreamEvents(t *testing.T
 			request.Emit(model.TextDeltaEvent{Text: "streamed"})
 			request.Emit(model.ToolCallDoneEvent{ToolCall: model.ToolCall{ID: "call-1", Name: "read_file"}})
 			request.Emit(model.ToolResultEvent{Result: model.ToolResult{ToolCallID: "call-1", Name: "read_file"}})
+			request.Emit(model.UsageEvent{Usage: model.Usage{InputTokens: 11, OutputTokens: 7, TotalTokens: 18}})
 			if err := request.Publisher.Publish(eventAssistant(request.TurnID, "answer")); err != nil {
 				return SessionTurnResult{}, err
 			}
@@ -583,7 +584,7 @@ func TestServiceSendSessionMessageWithEventsEmitsDirectStreamEvents(t *testing.T
 	if len(types) < 7 || types[0] != "turn.started" || types[len(types)-1] != "turn.committed" {
 		t.Fatalf("event types = %#v, want turn.started first and turn.committed last", types)
 	}
-	for _, want := range []string{"item.appended", "text.delta", "tool.started", "tool.finished"} {
+	for _, want := range []string{"item.appended", "text.delta", "tool.started", "tool.finished", "usage.updated"} {
 		if !stringSliceContains(types, want) {
 			t.Fatalf("event types = %#v, want contain %q", types, want)
 		}
@@ -593,6 +594,9 @@ func TestServiceSendSessionMessageWithEventsEmitsDirectStreamEvents(t *testing.T
 	}
 	if !sessionStreamEventsContain(events, "text.delta", "text", "streamed") {
 		t.Fatalf("events = %#v, want streamed text delta", events)
+	}
+	if !sessionStreamEventsContain(events, "usage.updated", "total_tokens", 18) {
+		t.Fatalf("events = %#v, want usage.updated total_tokens", events)
 	}
 }
 

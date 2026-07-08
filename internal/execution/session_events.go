@@ -344,6 +344,13 @@ func sessionStreamEventFromModelEvent(turnID string, event model.Event, showReas
 			"name":         event.Result.Name,
 			"is_error":     event.Result.IsError,
 		}), true
+	case model.UsageEvent:
+		return NewSessionStreamEvent("usage.updated", map[string]any{
+			"turn_id":       turnID,
+			"input_tokens":  event.Usage.InputTokens,
+			"output_tokens": event.Usage.OutputTokens,
+			"total_tokens":  event.Usage.TotalTokens,
+		}), true
 	default:
 		return nil, false
 	}
