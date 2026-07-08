@@ -14,6 +14,19 @@ $Targets = @(
     @{ GOOS = "darwin"; GOARCH = "arm64"; Name = "sai-darwin-arm64" }
 )
 
+function Ensure-WindowsConvenienceLink {
+    $Target = Join-Path $Dist "sai-windows-amd64.exe"
+    $Link = Join-Path $Dist "sai.exe"
+    if (-not (Test-Path -LiteralPath $Target -PathType Leaf)) {
+        return
+    }
+    if ($null -ne (Get-Item -LiteralPath $Link -Force -ErrorAction SilentlyContinue)) {
+        return
+    }
+    New-Item -ItemType SymbolicLink -Path $Link -Target "sai-windows-amd64.exe" | Out-Null
+    Write-Host "linked dist/sai.exe -> sai-windows-amd64.exe"
+}
+
 $OldCGOEnabled = $env:CGO_ENABLED
 $OldGOOS = $env:GOOS
 $OldGOARCH = $env:GOARCH
@@ -31,6 +44,7 @@ try {
         go build -trimpath -ldflags $Ldflags -o $Output ./cmd/sai
         Write-Host "built dist/$($Target.Name)"
     }
+    Ensure-WindowsConvenienceLink
 } finally {
     Pop-Location
 

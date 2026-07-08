@@ -270,3 +270,7 @@ Both scripts build single-file CLI binaries into `dist/`:
 - `sai-windows-amd64.exe`
 - `sai-linux-amd64`
 - `sai-darwin-arm64`
+
+If the convenience link does not already exist, the build scripts also create a
+symbolic link for the current host: `dist/sai.exe` on Windows, or `dist/sai` on
+Linux and macOS.

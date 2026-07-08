@@ -17,9 +17,41 @@ build() {
     echo "built dist/$output_name"
 }
 
+ensure_host_convenience_link() {
+    case "$(uname -s)" in
+        Linux*)
+            target_name="sai-linux-amd64"
+            link_name="sai"
+            ;;
+        Darwin*)
+            target_name="sai-darwin-arm64"
+            link_name="sai"
+            ;;
+        MINGW*|MSYS*|CYGWIN*)
+            target_name="sai-windows-amd64.exe"
+            link_name="sai.exe"
+            ;;
+        *)
+            return
+            ;;
+    esac
+
+    target="$DIST_DIR/$target_name"
+    link="$DIST_DIR/$link_name"
+    if [ ! -f "$target" ]; then
+        return
+    fi
+    if [ -e "$link" ] || [ -L "$link" ]; then
+        return
+    fi
+    ln -s "$target_name" "$link"
+    echo "linked dist/$link_name -> $target_name"
+}
+
 mkdir -p "$DIST_DIR"
 cd "$ROOT_DIR"
 
 build windows amd64 sai-windows-amd64.exe
 build linux amd64 sai-linux-amd64
 build darwin arm64 sai-darwin-arm64
+ensure_host_convenience_link
