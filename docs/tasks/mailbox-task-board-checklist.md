@@ -20,6 +20,8 @@
 
 - mailbox 可以作为任务看板的当前状态层，而不仅是原始消息列表。
 - agent 执行非终态任务时，可以更新任务状态和进度。
+- agent 执行非终态任务时，可以主动报告任务相关进度，让看板表达当前阶段、已完成动作、
+  下一步计划或阻塞原因。
 - 用户对非终态任务追加或修改需求时，变更进入该任务的事件流，并在 agent 的下一个 checkpoint
   通知 agent。
 - 所有任务变更都在命令执行间隙处理；已经开始的 provider request、tool call 或 shell command
@@ -81,6 +83,42 @@ Checkpoint 至少应出现在：
 实现时需要确认这些 checkpoint 如何接入 M22 execution library 的 turn lock、event persistence
 和 M23 mailbox 单 worker 机制。
 
+## Agent Progress Reports
+
+agent progress report 是 agent 主动写入的任务进度事件，用于让看板像执行日志摘要一样反映当前工作状态。
+它是 append-only task event，不改写历史，也不替代最终 result。
+
+候选事件类型：
+
+```text
+agent_progress_reported
+```
+
+推荐规则：
+
+- 只允许写入非终态任务。
+- terminal task 之后不能再写 progress report，即使只是更新时间或补充说明也不允许。
+- progress report 应在 checkpoint 或有意义的阶段边界写入，而不是每个内部小动作都写。
+- progress report 内容应短、用户可见且安全；可以包含当前阶段、已完成动作、下一步计划或阻塞原因。
+- progress report 不得包含 hidden context、raw provider payload、tool result body、secrets、
+  过长命令输出或其他中间执行细节。
+- progress report 可以附带更新 board-facing snapshot 字段，例如 `progress_summary` 或
+  `last_activity_at`，但这些字段只是当前看板视图；event stream 仍是审计来源。
+- `progress_summary`、`last_activity_at` 等 snapshot 字段更新也是 mutation，必须受同一套
+  非终态限制约束；任务进入 `completed`、`failed` 或 `cancelled` 后不再更新。
+- snapshot 字段只能作为向后兼容的可选扩展；不得改变现有 M23 `mailbox_get` / `mailbox_wait`
+  的必填返回字段、terminal result 语义或最终结果脱敏边界。
+- 具体发射入口属于后续 MCP surface 定稿内容，可以复用 `mailbox_task_update`，也可以定义专门工具；
+  本文档不把某个新工具名视为已承诺 API。
+
+示例进度摘要：
+
+```text
+已完成需求解析，准备更新任务文档。
+已完成本地验证，等待 final diff review。
+遇到配置缺失，等待用户补充 API key。
+```
+
 ## MCP Surface
 
 兼容性规则：
@@ -127,27 +165,36 @@ mailbox_task_cancel(task_id, expected_revision?)
 - [ ] 定义 task snapshot 数据结构。
 - [ ] 定义 task event 数据结构和 revision 递增规则。
 - [ ] 定义 terminal immutability guard，并确保它由系统层强制，而不是只靠 agent 自觉。
+- [ ] 定义 agent progress report 的事件类型、内容边界和 snapshot 更新规则。
 - [ ] 定义 running task 的 cooperative cancel flow。
 - [ ] 在 agent / execution loop 中加入 command-boundary checkpoint。
 - [ ] 确保 checkpoint 能读取并处理用户新增需求。
 - [ ] 确保 checkpoint 能读取并处理取消请求。
+- [ ] 确保 agent 只在 checkpoint 或有意义阶段边界写入 progress report。
+- [ ] 确保 progress report 不泄露 hidden context、raw provider payload、tool result body 或 secrets。
 - [ ] 确保取消请求生效后打印 `任务已取消`。
 - [ ] 确保取消后不再写 task comment、progress 或 metadata。
 - [ ] 为新任务 relation 定义只写新任务、不改旧 terminal task 的规则。
 - [ ] 添加 MCP tool tests 覆盖非终态更新、revision conflict 和 terminal update rejection。
+- [ ] 添加 MCP tool tests 覆盖 progress report 的非终态写入、terminal 拒绝和可选 snapshot 更新。
 - [ ] 添加执行测试覆盖命令运行期间的更新只在下一 checkpoint 生效。
 - [ ] 添加执行测试覆盖 running task 取消不会中途 kill 命令，而是在命令结束后的 checkpoint 生效。
 - [ ] 添加执行测试覆盖 cancellation output 为 `任务已取消`。
+- [ ] 添加执行测试覆盖 agent 主动进度汇报只在 checkpoint 或阶段边界出现。
 - [ ] 添加兼容性测试覆盖现有 M23 mailbox tools 行为不变。
 
 ## Acceptance Criteria
 
 - 用户能通过 mailbox 查询任务列表或当前任务状态。
 - agent 能在非终态任务执行过程中更新看板状态。
+- agent 能在非终态任务执行过程中主动写入简短、安全的 progress report，让用户理解当前阶段、
+  已完成动作、下一步计划或阻塞原因。
 - 用户对非终态任务的需求变更能被 agent 在 checkpoint 看到并纳入后续执行。
 - 用户取消 running task 后，agent 不抢占中断当前命令；当前命令结束后的 checkpoint 使任务进入
   `cancelled`，并输出 `任务已取消`。
 - `completed`、`failed`、`cancelled` 任务完全只读，所有后续 mutation 请求都会失败。
+- terminal task 不再接受 progress report，也不再更新 `progress_summary`、`last_activity_at`
+  或其他 metadata。
 - terminal task 的后续需求只能创建新任务，不能 reopen 或修改旧任务。
 - 现有 M23 mailbox MCP tools 的兼容行为不回退。
 
