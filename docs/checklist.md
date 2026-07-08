@@ -12,9 +12,10 @@
 - [x] Skills 是 M7 能力，当前仅覆盖根配置文件配置的本地 skills。
 - [x] 日志、verbose、resolved config 中不打印 API key、Authorization header 或其他敏感配置值的实际值。
 
-说明：以上 no-TUI 约束和后续 M8/M9/M15/M23 的已勾选 no-TUI 项记录 v0.1/MVP
-以及已完成里程碑的历史边界。M24 可以在后续以显式 opt-in `--tui` 和 PromptEvent
-运行中输入模型收窄该边界；这不表示 TUI 已实现，也不改变既有完成项。
+说明：以上 no-TUI 约束和后续 M8/M9/M15/M23 的已勾选 no-TUI / no-third-party CLI
+framework 项记录 v0.1/MVP 以及已完成里程碑的历史边界。M24 可以在后续以显式 opt-in
+Bubble Tea `--tui` 和 PromptEvent 运行中输入模型收窄该边界；这不表示当前代码已实现
+TUI，也不改变既有完成项的历史含义。
 
 ## M0：项目骨架
 
@@ -587,25 +588,26 @@
 
 ## M24：Optional TUI Block Renderer and PromptEvent Input
 
-- [ ] M24 明确为未来可选 TUI / PromptEvent 边界，不改变 v0.1/MVP 和已完成里程碑的
-  no-TUI 历史约束。
-- [ ] `docs/tasks/tui-block-renderer-checklist.md` 作为 M24 的执行清单。
+- [x] M24 明确为可选 TUI / PromptEvent 边界，只在显式 opt-in `--tui` 下收窄
+  v0.1/MVP 和已完成里程碑的 no-TUI / no-third-party CLI framework 历史约束。
+- [x] `docs/tasks/tui-block-renderer-checklist.md` 作为 M24 的执行清单。
+- [x] 首版 TUI renderer 选用 Bubble Tea，并明确当前代码尚未提供 `--tui`。
 - [ ] execution session stream 补齐 TUI 所需事件缺口，例如 `usage.updated`。
-- [ ] 定义 PromptEvent 数据结构，包含 source、mode、content、关联 mailbox task id 或
-  input id。
-- [ ] 支持 PromptEvent `enqueue_turn` 队列语义。
-- [ ] 支持 PromptEvent `append_active`，且只在 provider request、tool call 和 shell command
-  之外的安全 checkpoint 生效。
-- [ ] 追加输入落盘为同一 `turn_id` 下的独立 user item。
+- [ ] 定义展示侧 input event / PromptEvent 适配数据，包含 source、mode、content、关联
+  mailbox task id 或 input id。
+- [ ] 支持首版 `enqueue_turn` 串行 idle 队列语义。
 - [ ] mailbox 新任务在 active stdin/mailbox turn 期间保持 queued，不打断当前 turn。
 - [ ] mailbox task start/end 作为展示侧 system block，执行过程使用普通事件流。
 - [ ] mailbox MCP result 继续只返回最终 assistant output、状态和错误。
 - [ ] 新增展示侧 Turn Block Aggregator，将 session stream 规整为 reasoning、tool、
   assistant output、system notice 和 status bar 等 block。
 - [ ] plain renderer 继续支持非 TTY 和脚本场景。
-- [ ] TUI renderer 只在显式 `--tui` 模式启用，不作为默认行为。
+- [ ] Bubble Tea TUI renderer 只在显式 `--tui` 模式启用，不作为默认行为。
 - [ ] 不恢复 HTTP/WS product layer、daemon、registry 或多 worker。
 - [ ] 不把 Markdown renderer、raw logs、tool result 正文或 hidden/debug item 暴露为 TUI
   默认内容。
+- [ ] 支持 PromptEvent `append_active`，且只在 provider request、tool call 和 shell command
+  之外的安全 checkpoint 生效。
+- [ ] 追加输入落盘为同一 `turn_id` 下的独立 user item。
 - [ ] 验证 `go test ./...`。
 - [ ] 验证 `git diff --check`。

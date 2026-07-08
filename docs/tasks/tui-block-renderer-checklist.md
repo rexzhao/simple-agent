@@ -1,12 +1,13 @@
 # TUI Block Renderer Checklist
 
 这份文档记录将 CLI 展示升级为可选 TUI block renderer 的后续开发方案。
-它是一个 future implementation checklist，不代表本次已经开始实现，也不代表当前
-`--tui` 可用。
+它现在是 M24 首版 TUI renderer 的执行 checklist，但当前代码仍尚未实现 `--tui`。
 
 当前稳定文档仍然将 v0.1/MVP 定义为纯 CLI：不引入 TUI、不引入第三方 CLI/TUI 框架；
-M24 已作为未来可选 TUI / PromptEvent 方向记录，用于收窄后续实现边界。任何代码实现
-仍必须从 Phase 3+ 开始逐项完成，并保持 `--tui` 显式 opt-in。
+M24 以显式 opt-in `--tui` 收窄这些历史边界。首版 TUI renderer 的库选择已定为
+Bubble Tea，这是用户明确指定后的 M24 决策，只适用于 TUI 展示层；默认 plain CLI、
+非 TTY、脚本路径和单文件发布目标不改变。任何代码实现仍必须从 Phase 3+ 开始逐项完成，
+并保持 `--tui` 显式 opt-in。
 
 ## Assumptions
 
@@ -15,10 +16,26 @@ M24 已作为未来可选 TUI / PromptEvent 方向记录，用于收窄后续实
   键盘交互、block 折叠状态或 TUI 组件状态。
 - 展示层只消费结构化事件，不解析 provider raw stream，不读取 raw JSONL log。
 - 第一版 TUI 必须显式启用，例如 `--tui`；非 TTY、脚本、管道和 CI 仍使用 plain renderer。
+- 第一版 TUI 使用 Bubble Tea；plain renderer 不依赖 Bubble Tea 状态模型。
 - 创建本文档不改变现有 mailbox MCP 行为：mailbox 任务仍串行执行，新 mailbox 任务不打断
   active turn，MCP 结果仍只暴露最终 assistant output 或错误。
 - `append_active` 是 M24 的未来实现项。它改变当前 CLI/mailbox 不支持运行中应用层输入队列的约束，
   必须按 Phase 4 的 checkpoint 规则实现。
+
+## First Implementation Slice
+
+首个代码 slice 应完成：
+
+- `model.UsageEvent` -> execution `usage.updated`。
+- CLI 展示侧 Turn Block Aggregator。
+- 显式 `--tui`，并在非 TTY、pipe、script、测试 writer 下回退 plain renderer。
+- Bubble Tea block list、输入区和状态栏。
+- Ctrl+C 语义：active turn 中取消当前 turn，idle 时退出。
+- mailbox task start/end 在 TUI 中作为 mailbox/system block；MCP result 仍 final-output-only。
+- 对 event contract、block aggregator 和 renderer fallback 的自动化测试。
+
+`append_active` 和真正的 active-turn checkpoint 注入不属于首个 Bubble Tea renderer slice。
+当前 serial stdin/TUI/mailbox idle 队列可以作为首版 `enqueue_turn` 语义。
 
 ## Current Stream Baseline
 
@@ -228,7 +245,7 @@ block 更新规则：
 
 ### Phase 6 - Explicit TUI Renderer
 
-- [ ] 选择 TUI 库或确认自实现方案；若引入第三方库，更新 go.mod 并记录理由。
+- [x] 选择 TUI 库：首版使用 Bubble Tea；若引入第三方库，更新 go.mod 并记录理由。
 - [ ] 新增显式 `--tui` 开关。
 - [ ] 非 TTY、管道和脚本场景继续 plain renderer。
 - [ ] TUI 显示 block 列表、输入区和状态栏。
