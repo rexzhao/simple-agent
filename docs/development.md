@@ -138,9 +138,9 @@ usage
 error
 ```
 
-CLI 默认只打印 `text_delta`。`reasoning_delta` 默认隐藏，后续通过
-`--show-reasoning` 显示。发生 tool call 时，CLI 默认向 stderr 打印独立的简短工具状态
-（例如 `tool: read_file docs/notes.md`），不需要 `--verbose`；`read_file`、`write_file`、
+CLI 默认只打印 `text_delta`。`reasoning_delta` 默认隐藏；配置
+`agent.show_reasoning: true` 后可显示。发生 tool call 时，CLI 默认向 stderr 打印独立的简短工具状态
+（例如 `tool: read_file docs/notes.md`），不需要额外开关；`read_file`、`write_file`、
 `edit_file` 和 `list_files` 状态可以显示目标路径/目录，其中 `list_files` 未提供 path
 时显示 `.`。`shell` 和 MCP tool 状态只显示工具名，不显示命令参数或任意 arguments，
 也不打印 tool result 正文；`subagent_start` 状态显示 subagent id 和可选 display/job name，
@@ -700,7 +700,7 @@ choices[0].delta.content
 ```
 
 默认只把 `delta.content` 作为用户可见输出。`delta.reasoning_content` 需要解析成
-内部事件，但默认不打印。启用 `--show-reasoning` 时，CLI 可以直接打印 reasoning 输出，
+内部事件，但默认不打印。配置 `agent.show_reasoning: true` 后，CLI 可以直接打印 reasoning 输出，
 不额外输出 marker；如果前面已有正文且没有换行，先补齐换行。当事件流从 reasoning
 输出切换到最终消息输出时，也必须保持换行分隔，避免 reasoning 和最终消息混在同一行。
 
@@ -709,8 +709,8 @@ choices[0].delta.content
 M9 后，reasoning 样式只属于 CLI stdout 展示层，不改变内部 stream event，也不改变
 JSONL 日志。`reasoning_delta` 仍按原始事件记录；ANSI 控制符不能写入日志。
 
-只有 reasoning 被显式显示时才考虑上色：命令行 `--show-reasoning` 或配置
-`agent.show_reasoning: true` 生效后，`writeStream` 在支持颜色的终端 stdout 上使用
+只有 reasoning 被显式显示时才考虑上色：配置 `agent.show_reasoning: true`
+生效后，`writeStream` 在支持颜色的终端 stdout 上使用
 ANSI 暗灰色显示 reasoning。当前样式是 `\x1b[90m` 开始、`\x1b[0m` reset。
 如果 stdout 不是终端，例如 pipe、redirect 或测试中的 `bytes.Buffer`，不输出 ANSI。
 如果环境变量 `NO_COLOR` 存在且非空，即使 stdout 是终端也不输出 ANSI。
@@ -890,9 +890,9 @@ capability token；不作为远程 MCP service 或通用 HTTP API。
 v0.1 只落盘 JSONL 日志，不保存会话历史或上下文快照。日志路径来自
 `logging.path`，相对路径基于根配置文件所在目录解析。`logging.path` 解释为日志根/基准路径：
 如果配置为 `logs/sai.jsonl`，实际 session root 是 `logs/`；如果配置为空，禁用日志。
-每次 session turn 启动 runtime 时预先确定唯一 session JSONL 路径，供
-`--verbose` 显示；但 log root、session 目录和 `sai.jsonl` 只在第一条日志事件发生时
-创建。chat 启动后直接 `/exit`、`/quit` 或 EOF 且没有模型请求时，不产生日志 session。
+每次 session turn 启动 runtime 时预先确定唯一 session JSONL 路径，供诊断使用；但 log root、
+session 目录和 `sai.jsonl` 只在第一条日志事件发生时创建。默认交互或 `session resume`
+启动后直接 `/exit`、`/quit` 或 EOF 且没有模型请求时，不产生日志 session。
 
 ```text
 <log-root>/<timestamp>-<short-random>/sai.jsonl

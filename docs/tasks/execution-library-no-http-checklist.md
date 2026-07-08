@@ -35,7 +35,7 @@ management 和 turn execution 收敛为进程内 execution library。M21 global-
 - [x] 新增 `session resume <id>` 作为已有 session 的交互恢复入口。
 - [x] 从当前产品 help/docs 中移除 top-level `attach` 入口；实现可保留 hidden compatibility。
 - [x] 删除或隐藏 `send` 产品命令和 help 入口。
-- [ ] 清理 docs/help/errors 中把 HTTP server 作为当前产品路径的描述。
+- [x] 清理 docs/help/errors 中把 HTTP server 作为当前产品路径的描述。
 
 ## Acceptance Criteria
 
@@ -94,3 +94,8 @@ management 和 turn execution 收敛为进程内 execution library。M21 global-
   `sai` 自动创建缺失 project、复用 nearest registered project 进入 pending 新 session、
   `sai session resume <id>` 恢复已有 session 的交互 REPL、top-level `attach`/`send`
   产品命令与 help topic 被移除，以及 `sai --new` 不再作为兼容入口。
+- 2026-07-08 docs/help/errors cleanup slice:
+  `rg -n "sai sessions|sai chat|--show-reasoning|--prompt|--stdin|--file|--verbose|without starting a chat|chat 启动|sai send|sai attach|server status|server stop|local HTTP server|nearest healthy local server" README.md docs\development.md docs\configuration.md docs\tasks\execution-library-no-http-checklist.md`
+  只剩明确标注为 M22 后删除当前入口、M10-M19 历史背景或旧 smoke evidence 的命中；
+  `git diff --check` 通过。覆盖 README 当前用法、配置/开发日志说明、reasoning 展示说明和
+  本清单状态，不修改旧 M20/M21 历史记录。

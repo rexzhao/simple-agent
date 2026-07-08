@@ -56,11 +56,10 @@ sessions:
 ```
 
 `logging.path` is a log root hint, kept compatible with older configs. For
-example, `logs/sai.jsonl` uses `.agents/logs/` as the root; each `sai chat`
-process precomputes a future session path such as
-`.agents/logs/<timestamp>-<random>/sai.jsonl`, which `--verbose` reports as
-`log_path`. The directory and file are created only when the first log event is
-written, so a chat that exits before making a request does not create a log
+example, `logs/sai.jsonl` uses `.agents/logs/` as the root; each runtime session
+precomputes a future log path such as
+`.agents/logs/<timestamp>-<random>/sai.jsonl`. The directory and file are created only when the first log event is
+written, so a session that exits before making a request does not create a log
 session. Set `logging.path` to an empty string to disable JSONL logging. Logs do
 not include prompt, response, tool result, API key, or authorization header
 bodies.
@@ -88,39 +87,26 @@ model profile for protocols such as `anthropic-messages` or `openai-responses`.
 ## Basic Usage
 
 ```sh
-sai --prompt "Hello" --quit
-sai chat --quit --provider paperhub --model glm-5.2 --prompt "Hello"
-sai --quit --stdin < prompt.md
-sai chat --quit --file prompt.md
+sai
+sai --config ./config/sai.yaml
+sai session resume <session-id>
+sai --mailbox
 ```
 
-Start a line-oriented chat session with the same provider/model selection rules:
+When no command is provided, `sai` starts an interactive session for the current
+directory. It finds the nearest registered project; if none exists, it registers
+the current directory automatically. A durable session is created when the first
+ordinary user message is sent.
 
-```sh
-sai --provider paperhub --model glm-5.2
-sai chat --provider paperhub --model glm-5.2
-```
+Type one message per line. Blank lines are ignored; `/exit`, `/quit`, or EOF
+exits normally. To enter a multiline message, type a line containing only `"""`,
+then the message body, then another line containing only `"""`; newlines inside
+the body are preserved and slash commands inside the body are sent as text.
+Empty multiline messages are ignored.
 
-When no command is provided, `sai` defaults to `chat`. `sai --prompt "Hello"`
-and `sai chat --prompt "Hello"` both run that initial prompt first, then enter
-the line-oriented session. Add `--quit` to exit after the initial prompt turn.
-Initial prompts must use `--prompt`; `sai "Hello"` is treated as an unknown
-command instead of a prompt. In chat, type one message per line. Blank lines are
-ignored; `/exit`, `/quit`, or EOF exits normally. To enter a multiline message,
-type a line containing only `"""`, then the message body, then another line
-containing only `"""`; newlines inside the body are preserved and slash commands
-inside the body are sent as text. Empty multiline messages are ignored.
-
-In normal single-line chat mode, `/usage` prints the current context window and
-latest usage summary to stderr without sending anything to the model. It shows
-window size/source, warning threshold, last request/input/output/total tokens,
-and the last usage source. It does not print prompt, assistant output, or tool
-result content, and `/usage` inside a multiline block is sent as regular text.
-
-Use `--stdin` or `--file` with `--quit` to run one complete prompt from stdin or
-a file. `--prompt`, `--stdin`, and `--file` are mutually exclusive. Session
-history stays in memory for the current process and is not written to disk
-unless resumable sessions are enabled.
+Use `sai session resume <session-id>` to continue an existing session. It renders
+the visible session snapshot and then resumes the interactive prompt using the
+session's stored cwd, config, provider, model, tools, MCP, and skill metadata.
 
 Before each provider request, `sai` estimates input tokens from the full message
 history and tool schemas. At 80% of the model context window it writes a warning
@@ -128,7 +114,7 @@ to stderr with only token counts and the window size. At or above the window it
 refuses to send the provider request. It does not silently truncate or summarize
 system/developer instructions, tool schemas, tool results, or prior messages.
 
-Check local configuration health without starting a chat:
+Check local configuration health without starting a runtime session:
 
 ```sh
 sai doctor
@@ -146,54 +132,37 @@ assistant output, assistant tool calls, and tool results under `sessions.dir`,
 so treat those files as sensitive:
 
 ```sh
-sai chat --save-session --prompt "Save this turn" --quit
-sai chat --resume <id> --prompt "Continue" --quit
-sai chat --continue --prompt "Continue the latest session" --quit
-sai sessions list
-sai sessions show <id>
-sai sessions delete <id>
-sai sessions prune --keep 10
+sai project create
+sai session create
+sai session resume <id>
+sai session list
+sai session show <id>
+sai session archive <id>
+sai session remove <id>
 ```
 
-Set `sessions.enabled: true` to make saving the default for new chats. Use
-`--save-session` or `--save-session=true` to enable it for one run, and
-`--save-session=false` to disable it for one new chat when the config default is
-true. When session saving is enabled, `sai chat` prints the sensitive-data
-notice after startup and before the first REPL prompt or provider request, and
-only prints it once.
-
-`sai sessions list` works even when `sessions.enabled` is `false`, so existing
-files can be inspected after automatic saving is disabled. `list` and `show`
-only print metadata and warnings; they do not print full messages, prompt
+Session management commands work even when `sessions.enabled` is `false`, so
+existing files can be inspected after automatic saving is disabled. `list` and
+`show` only print metadata and warnings; they do not print full messages, prompt
 text, assistant output, or tool result content. Saved sessions also include
 context window metadata and recent usage tracking, which `show` displays only as
-numbers and source labels.
+numbers and source labels. `remove` only deletes archived sessions.
 
 Show CLI usage without loading configuration:
 
 ```sh
 sai help
 sai help version
-sai help chat
-sai chat -h
+sai help project
+sai help project create
+sai help session
+sai help session resume
 sai help config
 sai help config show
 sai help models
 sai help tools
 sai help tools list
 sai help mcp
-sai help sessions
-sai help sessions list
-sai help sessions show
-sai help sessions delete
-sai help sessions prune
-```
-
-Enable tools for one prompt or a chat session:
-
-```sh
-sai chat --quit --enable-tools list_files,read_file --prompt "List this project"
-sai chat --enable-tools list_files,read_file
 ```
 
 List built-in tools without loading configuration or provider credentials:
@@ -202,28 +171,27 @@ List built-in tools without loading configuration or provider credentials:
 sai tools list
 ```
 
-When a model calls a tool, `sai chat` prints a short status line such as
+When a model calls a tool, `sai` prints a short status line such as
 `tool: read_file docs/notes.md` to stderr. `list_files` similarly shows the
 target directory, defaulting to `.`. Other tool arguments and all tool results
 are not printed in that status line, and streamed model output remains on
 stdout.
 
-Write non-sensitive diagnostics to stderr without changing streamed stdout:
+Accept local MCP mailbox tasks from another agent while the foreground CLI is
+idle:
 
 ```sh
-sai chat --quit --verbose --provider paperhub --model glm-5.2 --prompt "Hello"
+sai --mailbox
+sai --mailbox 127.0.0.1:39123
 ```
 
-Show reasoning output, which is hidden by default:
+Without an explicit address, `sai` listens on `127.0.0.1` with an OS-assigned
+port and writes discovery details to `.agents/${basename argv[0]}-mailbox.json`.
+The mailbox is only an input adapter for the current foreground CLI process; it
+does not provide project/session management APIs.
 
-```sh
-sai chat --quit --show-reasoning --provider paperhub --model glm-5.2 --prompt "Hello"
-```
-
-You can also set `agent.show_reasoning: true` in config. `--show-reasoning` or
-`--show-reasoning=true` enables reasoning for one run, and
-`--show-reasoning=false` disables it for one new chat when the config default is
-true. Shown reasoning is printed directly without a marker line. When stdout is an
+Set `agent.show_reasoning: true` in config to show reasoning output. Shown
+reasoning is printed directly without a marker line. When stdout is an
 interactive terminal, reasoning is shown in gray/dark ANSI style so it is easier
 to distinguish from the final answer. Tool status lines use their own muted
 stderr styling when supported, and every non-reasoning output resets the style
@@ -238,7 +206,8 @@ sai config show
 sai models list
 sai mcp list
 sai tools list
-sai sessions list
+sai project list
+sai session list
 ```
 
 The same concrete config file flag can be mixed into diagnostics and list
@@ -248,7 +217,7 @@ commands:
 sai config show --config ./config/sai.yaml
 sai models list --config ./config/sai.yaml
 sai mcp list --config ./config/sai.yaml
-sai sessions list --config ./config/sai.yaml
+sai session list --config ./config/sai.yaml
 ```
 
 ## Build

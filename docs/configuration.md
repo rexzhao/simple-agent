@@ -744,8 +744,8 @@ session 目录和 `sai.jsonl` 只在第一条日志事件发生时创建。
 <log-root>/<timestamp>-<short-random>/sai.jsonl
 ```
 
-`sai config show`、help、list 等不启动 runtime 的命令不会创建 session 日志。attach 启动后
-直接 `/exit`、`/quit` 或 EOF 且没有模型请求时，也不创建 session 日志。
+`sai config show`、help、list 等不启动 runtime 的命令不会创建 session 日志。默认交互或
+`session resume` 启动后直接 `/exit`、`/quit` 或 EOF 且没有模型请求时，也不创建 session 日志。
 
 每行日志是一个 JSON object。日志可以记录模型请求生命周期、工具调用、usage、HTTP 错误
 和 MCP 错误。错误事件的 `message` 是失败阶段/分类；如果有可诊断失败原因，日志会记录
