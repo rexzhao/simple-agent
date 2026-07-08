@@ -2101,8 +2101,11 @@ func writeAttachSnapshot(stdout io.Writer, snapshot execution.SessionItemsPage) 
 }
 
 type attachOutputState struct {
-	stdoutAtLineStart bool
-	wroteText         bool
+	stdoutAtLineStart         bool
+	wroteText                 bool
+	inReasoningBlock          bool
+	needsReasoningBreak       bool
+	reasoningEndedWithNewline bool
 }
 
 type attachSendResult struct {
@@ -2479,9 +2482,7 @@ func isAttachTerminalEvent(event execution.SessionStreamEvent) bool {
 
 func writeAttachStreamEvent(stdout, stderr io.Writer, event execution.SessionStreamEvent, output *attachOutputState, command string) error {
 	eventType, _ := event["type"].(string)
-	switch eventType {
-	case "text.delta":
-		text, _ := event["text"].(string)
+	writeStdout := func(text string) error {
 		if text == "" {
 			return nil
 		}
@@ -2490,20 +2491,87 @@ func writeAttachStreamEvent(stdout, stderr io.Writer, event execution.SessionStr
 		}
 		output.wroteText = true
 		output.stdoutAtLineStart = strings.HasSuffix(text, "\n")
+		return nil
+	}
+	endReasoningForText := func(text string) error {
+		if output.needsReasoningBreak && text != "" {
+			if !output.reasoningEndedWithNewline {
+				if err := writeStdout("\n"); err != nil {
+					return err
+				}
+			}
+			output.needsReasoningBreak = false
+			output.reasoningEndedWithNewline = false
+		}
+		output.inReasoningBlock = false
+		return nil
+	}
+	endReasoningBeforeStatus := func() error {
+		if output.inReasoningBlock && !output.stdoutAtLineStart {
+			if err := writeStdout("\n"); err != nil {
+				return err
+			}
+		}
+		output.inReasoningBlock = false
+		output.needsReasoningBreak = false
+		output.reasoningEndedWithNewline = false
+		return nil
+	}
+	switch eventType {
+	case "text.delta":
+		text, _ := event["text"].(string)
+		if text == "" {
+			return nil
+		}
+		if err := endReasoningForText(text); err != nil {
+			return err
+		}
+		if err := writeStdout(text); err != nil {
+			return err
+		}
+	case "reasoning.delta":
+		text, _ := event["text"].(string)
+		if text == "" {
+			return nil
+		}
+		if !output.inReasoningBlock && !output.stdoutAtLineStart {
+			if err := writeStdout("\n"); err != nil {
+				return err
+			}
+		}
+		if err := writeStdout(text); err != nil {
+			return err
+		}
+		output.inReasoningBlock = true
+		output.needsReasoningBreak = true
+		output.reasoningEndedWithNewline = strings.HasSuffix(text, "\n")
 	case "tool.started":
 		name, _ := event["name"].(string)
 		name = strings.TrimSpace(name)
 		if name == "" {
 			return nil
 		}
+		if err := endReasoningBeforeStatus(); err != nil {
+			return err
+		}
 		if _, err := fmt.Fprintf(stderr, "tool: %s\n", name); err != nil {
 			return err
 		}
 	case "turn.failed":
+		if err := endReasoningBeforeStatus(); err != nil {
+			return err
+		}
 		if _, err := fmt.Fprintf(stderr, "%s: turn failed\n", command); err != nil {
 			return err
 		}
+	case "turn.committed":
+		if err := endReasoningBeforeStatus(); err != nil {
+			return err
+		}
 	case "compact.failed":
+		if err := endReasoningBeforeStatus(); err != nil {
+			return err
+		}
 		if _, err := fmt.Fprintf(stderr, "%s: compact failed\n", command); err != nil {
 			return err
 		}

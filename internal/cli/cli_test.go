@@ -11989,6 +11989,68 @@ func TestWriteStreamDoesNotColorReasoningForBufferOutput(t *testing.T) {
 	}
 }
 
+func TestWriteAttachStreamEventWritesReasoningDelta(t *testing.T) {
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	output := attachOutputState{stdoutAtLineStart: true}
+	for _, event := range []execution.SessionStreamEvent{
+		execution.NewSessionStreamEvent("reasoning.delta", map[string]any{"text": "thinking"}),
+		execution.NewSessionStreamEvent("text.delta", map[string]any{"text": "final"}),
+	} {
+		if err := writeAttachStreamEvent(&stdout, &stderr, event, &output, "sai"); err != nil {
+			t.Fatalf("writeAttachStreamEvent() error = %v", err)
+		}
+	}
+	if got, want := stdout.String(), "thinking\nfinal"; got != want {
+		t.Fatalf("stdout = %q, want %q", got, want)
+	}
+	if stderr.String() != "" {
+		t.Fatalf("stderr = %q, want empty", stderr.String())
+	}
+}
+
+func TestWriteAttachStreamEventStartsReasoningOnIndependentLine(t *testing.T) {
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	output := attachOutputState{stdoutAtLineStart: true}
+	for _, event := range []execution.SessionStreamEvent{
+		execution.NewSessionStreamEvent("text.delta", map[string]any{"text": "prefix"}),
+		execution.NewSessionStreamEvent("reasoning.delta", map[string]any{"text": "thinking"}),
+		execution.NewSessionStreamEvent("text.delta", map[string]any{"text": "final"}),
+	} {
+		if err := writeAttachStreamEvent(&stdout, &stderr, event, &output, "sai"); err != nil {
+			t.Fatalf("writeAttachStreamEvent() error = %v", err)
+		}
+	}
+	if got, want := stdout.String(), "prefix\nthinking\nfinal"; got != want {
+		t.Fatalf("stdout = %q, want %q", got, want)
+	}
+	if stderr.String() != "" {
+		t.Fatalf("stderr = %q, want empty", stderr.String())
+	}
+}
+
+func TestWriteAttachStreamEventClearsReasoningAtTurnCommit(t *testing.T) {
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	output := attachOutputState{stdoutAtLineStart: true}
+	for _, event := range []execution.SessionStreamEvent{
+		execution.NewSessionStreamEvent("reasoning.delta", map[string]any{"text": "thinking"}),
+		execution.NewSessionStreamEvent("turn.committed", map[string]any{"turn_id": "turn-1"}),
+		execution.NewSessionStreamEvent("text.delta", map[string]any{"text": "next"}),
+	} {
+		if err := writeAttachStreamEvent(&stdout, &stderr, event, &output, "sai"); err != nil {
+			t.Fatalf("writeAttachStreamEvent() error = %v", err)
+		}
+	}
+	if got, want := stdout.String(), "thinking\nnext"; got != want {
+		t.Fatalf("stdout = %q, want %q", got, want)
+	}
+	if stderr.String() != "" {
+		t.Fatalf("stderr = %q, want empty", stderr.String())
+	}
+}
+
 func TestWriteStreamWithOptionsColorsReasoningAndResetsBeforeFinalText(t *testing.T) {
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer

@@ -596,6 +596,65 @@ func TestServiceSendSessionMessageWithEventsEmitsDirectStreamEvents(t *testing.T
 	}
 }
 
+func TestServiceSendSessionMessageWithEventsReasoningFollowsSessionSetting(t *testing.T) {
+	for _, tt := range []struct {
+		name          string
+		showReasoning bool
+		wantReasoning bool
+	}{
+		{name: "hidden by default", showReasoning: false, wantReasoning: false},
+		{name: "shown when enabled", showReasoning: true, wantReasoning: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			home := t.TempDir()
+			runner := fakeExecutionTurnRunner{
+				supports: true,
+				run: func(ctx context.Context, request SessionTurnRequest) (SessionTurnResult, error) {
+					request.Emit(model.ReasoningDeltaEvent{Text: "thinking"})
+					if err := request.Publisher.Publish(eventAssistant(request.TurnID, "answer")); err != nil {
+						return SessionTurnResult{}, err
+					}
+					return SessionTurnResult{Incremental: true}, nil
+				},
+			}
+			service, err := NewServiceWithOptions(home, ServiceOptions{TurnRunner: runner})
+			if err != nil {
+				t.Fatalf("NewServiceWithOptions() error = %v", err)
+			}
+			projectRoot := mkdirProjectRoot(t, "reasoning-repo")
+			project, err := service.CreateProject(projectRoot, "Reasoning Repo")
+			if err != nil {
+				t.Fatalf("CreateProject() error = %v", err)
+			}
+			saveToolResults := true
+			session, err := service.CreateSession(project.Project.ID, SessionCreateMetadata{
+				CreatedCWD:      project.Project.Root,
+				ConfigPath:      filepath.Join(project.Project.Root, ".agents", "sai.yaml"),
+				Provider:        "fake",
+				ModelProfile:    "default",
+				ModelID:         "model-default",
+				ShowReasoning:   &tt.showReasoning,
+				SaveToolResults: &saveToolResults,
+			})
+			if err != nil {
+				t.Fatalf("CreateSession() error = %v", err)
+			}
+
+			var events []SessionStreamEvent
+			_, err = service.SendSessionMessageWithEvents(context.Background(), session.ID, "hello", func(event SessionStreamEvent) {
+				events = append(events, event)
+			})
+			if err != nil {
+				t.Fatalf("SendSessionMessageWithEvents() error = %v", err)
+			}
+			gotReasoning := sessionStreamEventsContain(events, "reasoning.delta", "text", "thinking")
+			if gotReasoning != tt.wantReasoning {
+				t.Fatalf("reasoning.delta present = %t, want %t; events = %#v", gotReasoning, tt.wantReasoning, events)
+			}
+		})
+	}
+}
+
 func TestServiceCompactSessionUsesConfiguredPlanner(t *testing.T) {
 	home := t.TempDir()
 	called := false

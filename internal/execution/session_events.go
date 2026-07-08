@@ -224,7 +224,7 @@ func (s *Service) CompactSession(ctx context.Context, id string) (SessionCompact
 	}, nil
 }
 
-func (s *Service) startSessionEventBridge(sessionID, turnID string, bus *eventbus.Bus, afterSeq int64, emit func(SessionStreamEvent)) func() {
+func (s *Service) startSessionEventBridge(sessionID, turnID string, bus *eventbus.Bus, afterSeq int64, showReasoning bool, emit func(SessionStreamEvent)) func() {
 	done := make(chan struct{})
 	if s == nil || s.sessionStore == nil || bus == nil || emit == nil {
 		close(done)
@@ -237,7 +237,7 @@ func (s *Service) startSessionEventBridge(sessionID, turnID string, bus *eventbu
 		for event := range events {
 			switch event := event.(type) {
 			case eventbus.ModelEvent:
-				if streamEvent, ok := sessionStreamEventFromModelEvent(turnID, event.Event); ok {
+				if streamEvent, ok := sessionStreamEventFromModelEvent(turnID, event.Event, showReasoning); ok {
 					emitSessionStreamEvent(emit, streamEvent)
 				}
 			case eventbus.DurableCommitted:
@@ -307,13 +307,21 @@ func sessionStreamEventFromPersistedEvent(event sessions.PersistedEvent) (Sessio
 	}
 }
 
-func sessionStreamEventFromModelEvent(turnID string, event model.Event) (SessionStreamEvent, bool) {
+func sessionStreamEventFromModelEvent(turnID string, event model.Event, showReasoning bool) (SessionStreamEvent, bool) {
 	switch event := event.(type) {
 	case model.TextDeltaEvent:
 		if event.Text == "" {
 			return nil, false
 		}
 		return NewSessionStreamEvent("text.delta", map[string]any{
+			"turn_id": turnID,
+			"text":    event.Text,
+		}), true
+	case model.ReasoningDeltaEvent:
+		if !showReasoning || event.Text == "" {
+			return nil, false
+		}
+		return NewSessionStreamEvent("reasoning.delta", map[string]any{
 			"turn_id": turnID,
 			"text":    event.Text,
 		}), true

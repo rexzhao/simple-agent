@@ -546,7 +546,7 @@ func (s *Service) SendSessionMessageWithEvents(ctx context.Context, id, content 
 	defer projector.Close()
 
 	bus := eventbus.NewBusWithCheckpoint(projector.CheckpointHandler())
-	waitBridge := s.startSessionEventBridge(id, turnID, bus, session.LastSeq, emit)
+	waitBridge := s.startSessionEventBridge(id, turnID, bus, session.LastSeq, session.ShowReasoning, emit)
 	bridgeClosed := false
 	closeBridge := func() {
 		if bridgeClosed {
