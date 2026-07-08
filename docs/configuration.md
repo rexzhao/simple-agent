@@ -21,7 +21,8 @@
 
 ```text
 sai --config ./config/sai.yaml
-sai --mailbox-mcp 127.0.0.1:39123
+sai --mailbox
+sai --mailbox 127.0.0.1:39123
 sai session resume <session-id>
 sai project create --config ./config/sai.yaml
 sai session create --config ./config/sai.yaml
@@ -516,15 +517,26 @@ sai --config ./config/sai.yaml
 
 ## Mailbox MCP（M23）
 
-`--mailbox-mcp host:port` 在当前前台 CLI 进程内启动本地 MCP mailbox server。例如：
+`--mailbox [host:port]` 在当前前台 CLI 进程内启动本地 MCP mailbox server。例如：
 
 ```text
-sai --mailbox-mcp 127.0.0.1:39123
+sai --mailbox
+sai --mailbox 127.0.0.1:39123
 ```
 
 它和本节上方的 MCP 配置角色不同：`mcp/*.yaml` 描述 `sai` 作为 MCP client 启动外部
-stdio MCP server 并把外部 tools 暴露给模型；`--mailbox-mcp` 描述 `sai` 作为本地
+stdio MCP server 并把外部 tools 暴露给模型；`--mailbox` 描述 `sai` 作为本地
 MCP server，供其他 agent 通过 MCP tools 向当前 CLI session 投递 prompt。
+
+如果省略地址，CLI 自动监听 `127.0.0.1:0`，由 OS 选择可用端口。启动成功后 CLI 向
+stderr 打印实际 MCP URL，并将发现信息写入启动目录的
+`.agents/${basename argv[0]}-mailbox.json`。该文件只描述当前前台 CLI 进程内的本地
+mailbox endpoint，供其他本地 agent 自动发现；它不是后台 server registry，也不提供
+project/session 管理能力。
+
+discovery JSON 至少包含 schema/version、MCP endpoint URL、host、port、随机 capability
+token、pid、命令 basename、started_at 和 protocol 信息。客户端发现后应使用 token 调用
+mailbox MCP；CLI 退出时应尽力删除该文件，启动时可以覆盖同一命令 basename 的 stale 文件。
 
 mailbox MCP 是输入适配器，不是 project/session 管理 API，也不恢复旧 HTTP/WS product
 layer。CLI 仍然是唯一 worker：stdin 行为保持现状；当当前 session idle 时，CLI 从
@@ -549,7 +561,7 @@ running mailbox task 只取消当前 task 的 turn context，不退出 CLI。
 
 - 默认只允许 `localhost`、`127.0.0.1` 或 `[::1]`。
 - 不默认监听 `0.0.0.0` 或远程地址。
-- HTTP-based MCP mailbox 应校验 Origin，或使用本地 capability token 等保护，避免本机网页
+- HTTP-based MCP mailbox 应校验 Origin 并使用本地 capability token，避免本机网页
   通过 DNS rebinding 调用 mailbox。
 - mailbox result 不得暴露 prompt 以外的隐藏上下文、tool result 正文或 provider raw error。
 

@@ -236,7 +236,7 @@ sai models list
 sai config show
 sai doctor
 sai mcp list  # M4
-sai --mailbox-mcp 127.0.0.1:39123  # M23
+sai --mailbox [127.0.0.1:39123]  # M23
 ```
 
 M22 后，当前产品入口不再包含 `sai chat`，也不保留 hidden chat alias。当前行为是：
@@ -246,8 +246,13 @@ M22 后，当前产品入口不再包含 `sai chat`，也不保留 hidden chat a
 stdin/file 单次输入如果后续需要，应作为新的 session 能力设计，不恢复 `sai run`，
 也不重新引入独立 chat 产品入口。
 
-M23 mailbox MCP 在同一个前台 CLI 进程内启动本地 MCP server。`sai --mailbox-mcp
-127.0.0.1:39123` 仍然进入普通交互式 session；stdin 行为保持现状，不新增纯 CLI turn
+M23 mailbox MCP 在同一个前台 CLI 进程内启动本地 MCP server。目标命令形态是
+`sai --mailbox [127.0.0.1:39123]`：显式传地址时监听该本地地址；只传 `--mailbox`
+时自动监听 `127.0.0.1:0`，由 OS 分配端口。启动成功后 CLI 必须向 stderr 打印实际
+MCP URL，并把发现信息写入启动目录的 `.agents/${basename argv[0]}-mailbox.json`，便于
+其他本地 agent 自动发现。
+
+`sai --mailbox` 仍然进入普通交互式 session；stdin 行为保持现状，不新增纯 CLI turn
 运行中的应用层输入队列或队列 UI。其他 agent 可以通过 MCP tools 把 prompt 投递到
 mailbox；CLI 是唯一 worker，只有在当前 session idle 时才从 mailbox 取一个 queued task，
 通过 execution library 执行，并把执行流正常打印到控制台。
@@ -256,6 +261,11 @@ mailbox MCP 是输入适配器，不恢复 M20 的 HTTP/WS product layer，不�
 管理 API，不做 registry、background daemon、多 worker 或持久队列。它和 M19 subagent
 runtime mailbox 是不同概念：M19 mailbox 服务 parent/child agent runtime event delivery；
 M23 mailbox MCP 服务外部 MCP clients 给当前 CLI session 投递任务。
+
+mailbox discovery 文件只描述当前前台 CLI 进程内的本地 MCP endpoint，不是持久 server
+registry。文件至少包含 schema/version、MCP endpoint URL、host、port、随机 capability
+token、pid、command basename、started_at 和 protocol 信息。token 用于本机发现后的
+客户端鉴权；进程退出时应尽力删除该文件，启动时可覆盖同一命令 basename 的 stale 文件。
 
 mailbox MCP 只暴露最终 task 结果。`mailbox_get` 和 `mailbox_wait` 返回 task status、
 最终 assistant output 或错误；不得返回 text delta、tool event、raw execution event、
@@ -304,7 +314,8 @@ sai mcp -h
 sai help mcp
 sai mcp list -h
 sai help mcp list
-sai --mailbox-mcp 127.0.0.1:39123 -h
+sai --mailbox -h
+sai --mailbox 127.0.0.1:39123 -h
 ```
 
 help 输出写到 stdout，exit code 为 0。help 必须在配置加载前完成：不读取 `.agents`
@@ -335,7 +346,8 @@ help、`--config` 或命令参数 flag。
 
 ```text
 --config ./config/sai.yaml
---mailbox-mcp 127.0.0.1:39123
+--mailbox
+--mailbox 127.0.0.1:39123
 --cwd path
 --name name
 --project project-id
@@ -870,8 +882,8 @@ sai --config ./config/sai.yaml
 v0.1 中 MCP server 进程生命周期由当前 agent 进程管理。后台常驻管理后续再做。
 
 M23 mailbox MCP 使用 MCP Streamable HTTP 形态的本地 server，但只作为当前 CLI 进程内
-mailbox 输入适配器。它默认只允许 localhost/127.0.0.1 绑定，并应校验 Origin 或使用
-本地 capability token 等保护；不作为远程 MCP service 或通用 HTTP API。
+mailbox 输入适配器。它默认只允许 localhost/127.0.0.1 绑定，并应校验 Origin 和本地
+capability token；不作为远程 MCP service 或通用 HTTP API。
 
 ## 日志和落盘
 

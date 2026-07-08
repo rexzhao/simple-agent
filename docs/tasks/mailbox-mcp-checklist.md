@@ -5,7 +5,15 @@
 
 ## Scope
 
-- [x] `sai --mailbox-mcp 127.0.0.1:PORT` 在当前 CLI 进程内启动本地 MCP mailbox server。
+- [x] 当前显式地址形态 `sai --mailbox-mcp 127.0.0.1:PORT` 可在当前 CLI 进程内启动本地
+  MCP mailbox server。
+- [ ] 目标命令形态改为 `sai --mailbox [127.0.0.1:PORT]`，并移除用户可见
+  `--mailbox-mcp` 入口。
+- [ ] `sai --mailbox` 省略地址时自动监听 `127.0.0.1:0`，由 OS 分配可用端口。
+- [ ] 启动成功后向控制台打印实际 mailbox MCP URL。
+- [ ] 启动成功后写入 `.agents/${basename argv[0]}-mailbox.json` discovery 文件，包含
+  endpoint URL、host、port、token、pid、命令 basename、started_at 和 protocol 信息。
+- [ ] mailbox MCP 请求使用 discovery 文件中的本地 capability token 进行鉴权。
 - [x] mailbox MCP 只绑定 localhost / 127.0.0.1；不默认监听 `0.0.0.0` 或远程地址。
 - [x] mailbox MCP 是本地输入适配器，不恢复旧 HTTP/WS product layer，不提供 project/session
   管理 API。
@@ -29,6 +37,12 @@
 ## Acceptance Criteria
 
 - [x] 其他 MCP client 可以 initialize、list tools、call mailbox tools。
+- [ ] `sai --mailbox` 不带地址可启动 mailbox MCP，并在 stderr 打印实际监听 URL。
+- [ ] `sai --mailbox 127.0.0.1:PORT` 可启动指定本地地址。
+- [ ] `sai --mailbox` 启动后写入 `.agents/${basename argv[0]}-mailbox.json`，其他本地
+  agent 可据此读取 endpoint 和 token。
+- [ ] 缺少或错误 token 的 mailbox MCP 请求被拒绝；正确 token 可正常 initialize/list/call。
+- [ ] CLI 正常退出时尽力删除 discovery 文件；启动时可覆盖同一 command basename 的 stale 文件。
 - [x] CLI idle 时从 mailbox 取 queued task 执行，并在控制台正常输出该 turn 的流式内容。
 - [x] CLI 正在处理 stdin turn 或 mailbox turn 时，新的 mailbox task 保持 queued。
 - [x] `mailbox_wait` completed/failed/cancelled 时返回 terminal state；timeout 时返回当前状态和
@@ -46,7 +60,10 @@
 
 - `internal/cli/mailbox_mcp.go` 新增进程内 memory queue 和 Streamable HTTP MCP endpoint，
   支持 initialize、ping、tools/list、tools/call。
-- CLI default session 和 `session resume` 支持 `--mailbox-mcp host:port`；其他命令拒绝该 flag。
+- CLI default session 和 `session resume` 支持当前显式地址 `--mailbox-mcp host:port`；
+  其他命令拒绝该 flag。
+- 待实现：CLI default session 和 `session resume` 支持 `--mailbox [host:port]`，省略地址时
+  自动选择 `127.0.0.1` 和可用端口，并写入 mailbox discovery JSON。
 - `mailbox_post` 只入队 prompt；CLI idle 时 dequeue 并用 execution service 执行，同步输出到控制台。
 - `mailbox_get` / `mailbox_wait` 返回 task status、error 和最终 assistant output，不返回 stream events、
   tool status、hidden/debug item 或 tool result body。
