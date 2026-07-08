@@ -2,8 +2,9 @@
 
 这个项目是一个简易的纯命令行 agent runner，命令名为 `sai`
 （Simple Agent Interface）。MVP 优先把核心闭环做稳：
-命令行输入、OpenAI-compatible streaming、tool call、打包和基础可用性。不要引入 TUI，
-也不要提前实现还没有进入第一阶段的扩展能力。
+命令行输入、OpenAI-compatible streaming、tool call、打包和基础可用性。v0.1/MVP
+不要引入 TUI，也不要提前实现还没有进入第一阶段的扩展能力。后续 M24 已作为未来
+可选 TUI / PromptEvent 方向记录，但当前版本仍然是普通 CLI。
 
 ## 目标
 
@@ -47,7 +48,7 @@
 
 ## v0.1 非目标
 
-- TUI 或全屏终端界面。
+- TUI 或全屏终端界面（v0.1/MVP 非目标；后续 M24 另行规划显式 opt-in TUI）。
 - Markdown 渲染。
 - 浏览器自动化。
 - multi-agent 编排。
@@ -79,6 +80,9 @@ provider 选择、message 构造、工具启用、日志和错误处理路径。
 
 Markdown 渲染不是近期目标；如果后续需要，也应作为远期低优先级能力单独设计，不进入
 下一阶段里程碑。
+
+M24 的 block renderer 不等同于 Markdown renderer；它只负责把 execution session stream
+规整成可由 plain renderer 或未来 TUI renderer 展示的块。
 
 ## 架构
 
@@ -256,6 +260,8 @@ MCP URL，并把发现信息写入启动目录的 `.agents/${basename argv[0]}-m
 运行中的应用层输入队列或队列 UI。其他 agent 可以通过 MCP tools 把 prompt 投递到
 mailbox；CLI 是唯一 worker，只有在当前 session idle 时才从 mailbox 取一个 queued task，
 通过 execution library 执行，并把执行流正常打印到控制台。
+M24 后续实现时可引入 PromptEvent / `append_active`，但 mailbox 新任务默认仍应在
+active turn 期间保持 queued，不抢占当前 stdin 或 mailbox turn。
 
 mailbox MCP 是输入适配器，不恢复 M20 的 HTTP/WS product layer，不提供 project/session
 管理 API，不做 registry、background daemon、多 worker 或持久队列。它和 M19 subagent
@@ -284,7 +290,27 @@ mailbox_cancel(task_id: string) -> { task_id, status }
 mailbox turn，不退出 CLI、不关闭 MCP server。已完成、失败或已取消的 task 再次 cancel
 幂等返回当前状态。
 
-Help/usage 是普通 CLI 行为，不引入 TUI 或第三方 CLI 框架。当前 help surface 支持：
+## M24：未来 TUI / PromptEvent 边界（未实现）
+
+M24 仍以 execution library 作为执行层边界。CLI 展示层可以在 execution session stream
+之外增加 Turn Block Aggregator，把 text delta、reasoning delta、tool start/finish、
+mailbox task notice 和 usage/status 信息规整为展示 block；execution library 不承担
+terminal layout。
+
+PromptEvent 用于统一输入源和输入语义。stdin、未来 TUI 输入和 mailbox 输入都可以映射为
+PromptEvent，但模式需要明确区分：`enqueue_turn` 表示排队为下一个 turn，`append_active`
+表示在当前 turn 的安全 checkpoint 追加用户输入。`append_active` 不得中断 provider
+request、tool call 或 shell command；追加内容应落盘为同一 `turn_id` 下的独立 user item。
+
+mailbox task start/end 可以作为特殊 system block 展示；task 执行后的模型输出、reasoning
+和 tool event 仍按普通 session stream 处理。MCP 侧 `mailbox_get` / `mailbox_wait` 继续只暴露
+最终 assistant output、状态和错误，不返回 TUI block、streaming delta 或 tool result 正文。
+
+`--tui` 如实现，必须是显式 opt-in；非 TTY、脚本使用和默认交互式 CLI 继续走 plain renderer。
+M24 不恢复 HTTP/WS product layer、daemon、registry、多 worker 或后台任务发布者进程。
+
+Help/usage 是普通 CLI 行为，不引入 TUI 或第三方 CLI 框架。未来 M24 的 `--tui` 如实现，
+应作为显式模式，不改变当前 help/usage 路径。当前 help surface 支持：
 
 ```text
 sai -h

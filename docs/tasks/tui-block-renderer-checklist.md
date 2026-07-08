@@ -1,13 +1,12 @@
 # TUI Block Renderer Checklist
 
 这份文档记录将 CLI 展示升级为可选 TUI block renderer 的后续开发方案。
-它是一个 boundary-change proposal / checklist，不代表本次已经开始实现，也不代表
-`--tui` 已经被稳定产品文档批准。
+它是一个 future implementation checklist，不代表本次已经开始实现，也不代表当前
+`--tui` 可用。
 
-当前稳定文档仍然将 v0.1/MVP 定义为纯 CLI：不引入 TUI、不引入第三方 CLI/TUI 框架。
-因此，任何 TUI 或运行中应用层输入队列的实现开始前，必须先创建或确认后续里程碑
-（例如 M24+），并更新 `docs/milestones.md`、`docs/checklist.md` 或其他稳定产品文档，
-明确 supersede 或收窄既有 no-TUI 边界。
+当前稳定文档仍然将 v0.1/MVP 定义为纯 CLI：不引入 TUI、不引入第三方 CLI/TUI 框架；
+M24 已作为未来可选 TUI / PromptEvent 方向记录，用于收窄后续实现边界。任何代码实现
+仍必须从 Phase 3+ 开始逐项完成，并保持 `--tui` 显式 opt-in。
 
 ## Assumptions
 
@@ -18,8 +17,8 @@
 - 第一版 TUI 必须显式启用，例如 `--tui`；非 TTY、脚本、管道和 CI 仍使用 plain renderer。
 - 创建本文档不改变现有 mailbox MCP 行为：mailbox 任务仍串行执行，新 mailbox 任务不打断
   active turn，MCP 结果仍只暴露最终 assistant output 或错误。
-- `append_active` 是未来边界变更提案。它改变当前 CLI/mailbox 不支持运行中应用层输入队列的约束，
-  稳定文档批准前不得实现。
+- `append_active` 是 M24 的未来实现项。它改变当前 CLI/mailbox 不支持运行中应用层输入队列的约束，
+  必须按 Phase 4 的 checkpoint 规则实现。
 
 ## Current Stream Baseline
 
@@ -107,8 +106,8 @@ append_active
 - `enqueue_turn` 表示作为下一轮独立输入排队。
 - `append_active` 表示在当前 turn 的安全 checkpoint 追加到上下文。
 - mailbox 新任务默认使用 `enqueue_turn`，不得打断 active turn。
-- TUI/interactive 用户输入在 active turn 期间可以使用 `append_active`，但该能力必须等稳定文档批准
-  运行中应用层输入队列后再实现。
+- TUI/interactive 用户输入在 active turn 期间可以使用 `append_active`，但必须按 M24 Phase 4
+  的 checkpoint 规则实现。
 - 多个追加 prompt 应保存为同一 `turn_id` 下的多个独立 user item，不能静默合并成一段文本。
 - 追加输入不应抢占正在进行的 provider request、tool call 或 shell command。
 
@@ -192,11 +191,11 @@ block 更新规则：
 
 ### Phase 2 - Stable Docs Reconciliation
 
-- [ ] 创建或确认后续里程碑，例如 M24+。
-- [ ] 更新 `docs/milestones.md` 或等效稳定 roadmap，明确 TUI / running input queue 的目标和边界。
-- [ ] 更新 `docs/checklist.md` 或等效稳定 checklist，明确 no-TUI invariant 如何被 supersede 或收窄。
-- [ ] 更新用户可见配置/命令文档，说明 `--tui`、plain fallback 和非 TTY 行为。
-- [ ] 在稳定 docs 合并前，不开始代码实现。
+- [x] 创建或确认后续里程碑，例如 M24+。
+- [x] 更新 `docs/milestones.md` 或等效稳定 roadmap，明确 TUI / running input queue 的目标和边界。
+- [x] 更新 `docs/checklist.md` 或等效稳定 checklist，明确 no-TUI invariant 如何被 supersede 或收窄。
+- [x] 更新用户可见配置/命令文档，说明 `--tui`、plain fallback 和非 TTY 行为。
+- [x] 在稳定 docs 合并前，不开始代码实现。
 
 ### Phase 3 - Event Contract Gaps
 
@@ -262,7 +261,7 @@ block 更新规则：
 - TUI 能按 block 展示 input、reasoning、tool、assistant、error 和 mailbox/system 信息。
 - 流式输出时，已有 block 被增量更新，而不是反复追加不可关联的纯文本行。
 - 状态栏显示模型、session、turn、运行状态、耗时和 usage/context 摘要。
-- `append_active` 获稳定文档批准后，运行中用户输入能在安全 checkpoint 追加到当前 turn。
+- `append_active` 按 M24 checkpoint 规则实现后，运行中用户输入能在安全 checkpoint 追加到当前 turn。
 - mailbox 任务继续串行执行；新 mailbox task 不打断 active turn。
 - mailbox MCP 结果仍只有最终 assistant output 或错误。
 - plain renderer 行为不回退。

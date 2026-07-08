@@ -928,3 +928,83 @@ execution 收敛为进程内 execution library。CLI 是展示层，直接调用
 - `go test ./...` 通过。
 - `git diff --check` 通过。
 - task checklist 中记录 smoke evidence。
+
+## M23：Mailbox MCP Input Adapter
+
+状态说明（2026-07-08）：M23 已实现；详细执行清单见
+`docs/tasks/mailbox-mcp-checklist.md`。
+
+目标：在当前前台 CLI 进程内启动本地 MCP mailbox server，让其他本地 agent 可以通过
+MCP 向当前 session 投递 queued prompt，同时不恢复 HTTP/WS 产品层。
+
+交付物：
+
+- 用户可见入口为 `sai --mailbox [127.0.0.1:PORT]`，省略地址时监听
+  `127.0.0.1:0` 并由 OS 分配端口。
+- 启动成功后向 stderr 打印实际 MCP URL，并写入
+  `.agents/${basename argv[0]}-mailbox.json` discovery 文件。
+- discovery 文件包含 endpoint URL、host、port、token、pid、命令 basename、
+  started_at 和 protocol 信息。
+- mailbox MCP 使用 discovery token 鉴权，并默认只允许 localhost / loopback。
+- mailbox MCP 作为外部 agent 输入适配器，不提供 project/session 管理 API，不恢复旧
+  HTTP/WS product layer。
+- CLI 是唯一 worker；只有当前 session idle 时才从 mailbox 取 queued task 并通过
+  execution library 执行。
+- stdin 行为保持现状，不新增纯 CLI turn 运行中的应用层输入队列或队列 UI。
+- MCP tools 覆盖 `mailbox_post`、`mailbox_get`、`mailbox_wait` 和
+  `mailbox_cancel`。
+- mailbox result 只暴露最终 assistant output、状态和错误，不暴露中间过程、raw
+  events、hidden/debug item 或 tool result 正文。
+- `mailbox_wait` 支持 timeout，超时不取消任务。
+- `mailbox_cancel` 支持 queued 和 running mailbox task；running cancel 只取消当前
+  mailbox turn，不退出 CLI。
+- CLI 开始和结束处理 mailbox task 时在 stderr 打印包含 task id 的分隔符；分隔符不出现在
+  MCP tool result 中。
+
+验证：
+
+- `docs/tasks/mailbox-mcp-checklist.md` 记录实现 smoke evidence。
+- `go test ./...` 通过。
+- `git diff --check` 通过。
+
+## M24：Optional TUI Block Renderer and PromptEvent Input
+
+状态说明（未来，未实现）：M24 是后续可选 TUI / PromptEvent 方向的稳定文档边界；
+当前版本没有 `--tui` 模式，也没有纯 CLI active turn 输入队列。
+
+目标：在不恢复 HTTP layer、不改变 execution library 边界的前提下，为 CLI 增加一个
+显式 opt-in 的 TUI block renderer，并把 stdin、TUI 输入和 mailbox 输入统一为
+PromptEvent。
+
+交付物：
+
+- `docs/tasks/tui-block-renderer-checklist.md` 作为 M24 的执行清单。
+- execution session stream 补齐 TUI 所需事件缺口，例如 `usage.updated`。
+- 新增展示侧 Turn Block Aggregator，将 `SessionStreamEvent` 规整为 reasoning、tool、
+  assistant output、system notice 和 status bar 等 block。
+- plain renderer 继续使用同一事件流，保持脚本和非 TTY 场景的普通 CLI 输出。
+- TUI renderer 只在显式 `--tui` 模式启用，不作为默认行为。
+- PromptEvent 抽象输入源和模式，至少覆盖 `enqueue_turn` 与 `append_active`。
+- `append_active` 只在 provider request、tool call 和 shell command 之外的安全 checkpoint
+  生效；追加输入落盘为同一 `turn_id` 下的独立 user item。
+- mailbox task start/end 是展示侧 system block；mailbox task 执行过程和普通输入输出使用
+  同一事件流。
+- mailbox MCP result 继续只返回最终 assistant output、状态和错误，不暴露 TUI block、
+  streaming delta 或 tool result 正文。
+
+非目标：
+
+- 不把 TUI 设为默认模式。
+- 不恢复 HTTP/WS product layer、daemon、registry 或多 worker。
+- 不引入 Markdown renderer 作为本阶段目标。
+- 不在稳定文档和测试通过前开始代码实现。
+
+验证：
+
+- 测试覆盖新增 session stream event contract。
+- 测试覆盖 PromptEvent `enqueue_turn` / `append_active` 队列与安全 checkpoint。
+- 测试覆盖 mailbox task 在 active turn 期间保持 queued，不打断当前 turn。
+- 测试覆盖 mailbox MCP result 仍然是 final-output-only。
+- TUI 和 plain renderer 均有快照或等效输出验证。
+- `go test ./...` 通过。
+- `git diff --check` 通过。

@@ -571,6 +571,21 @@ running mailbox task 只取消当前 task 的 turn context，不退出 CLI。
   通过 DNS rebinding 调用 mailbox。
 - mailbox result 不得暴露 prompt 以外的隐藏上下文、tool result 正文或 provider raw error。
 
+## 未来 TUI / PromptEvent（M24，未实现）
+
+当前版本没有 `--tui` 配置或命令模式；上面的命令示例均为现有普通 CLI 行为。M24 规划的
+TUI 必须是显式 opt-in，例如未来的 `--tui` 模式，不应改变默认交互式 CLI、非 TTY 或脚本
+调用路径。
+
+M24 还规划将 stdin、未来 TUI 输入和 mailbox 输入抽象为 PromptEvent。当前 mailbox 行为
+保持 M23 语义：正在处理 stdin turn 或 mailbox turn 时，新 mailbox task 只能 queued，
+不会插入或打断 active turn。后续如实现 `append_active`，也必须只在安全 checkpoint 生效，
+不得中断 provider request、tool call 或 shell command。
+
+即使未来启用 TUI block renderer，`mailbox_get` 和 `mailbox_wait` 的 MCP tool result 仍只返回
+最终 assistant output、状态和错误；不得返回 TUI block、streaming delta、tool status、
+raw execution event、hidden/debug record 或 tool result 正文。
+
 ## 工具启用
 
 当前内置工具：
