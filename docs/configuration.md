@@ -540,8 +540,14 @@ mailbox MCP；CLI 退出时应尽力删除该文件，启动时可以覆盖同�
 
 mailbox MCP 是输入适配器，不是 project/session 管理 API，也不恢复旧 HTTP/WS product
 layer。CLI 仍然是唯一 worker：stdin 行为保持现状；当当前 session idle 时，CLI 从
-mailbox 取 queued task，使用 execution library 执行，并在控制台正常输出。mailbox
-第一版使用进程内内存队列，不持久化，不跨 CLI 进程共享。
+mailbox 取 queued task，使用 execution library 执行，并在控制台正常输出。正在处理
+stdin turn 或 mailbox turn 时，新 mailbox task 只能保持 queued，不抢占当前 turn。
+mailbox 第一版使用进程内内存队列，不持久化，不跨 CLI 进程共享。
+
+CLI 开始处理 mailbox task 时向 stderr 打印一行分隔符，包含 task id；处理结束时再向
+stderr 打印一行分隔符，包含同一个 task id 和 terminal outcome（`completed`、`failed`
+或 `cancelled`）。这些分隔符只用于本地控制台可观察性，不出现在 `mailbox_get` 或
+`mailbox_wait` 的 MCP tool result 中。
 
 Mailbox MCP tools：
 
