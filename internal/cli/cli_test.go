@@ -8423,6 +8423,26 @@ func TestSessionResumeFailedTurnWaitsForDelayedTurnFailed(t *testing.T) {
 	}
 	assertCLIOutputContains(t, stderr.String(), "sai: turn failed")
 	assertCLIErrorOmits(t, stderr.String(), "send failed", prompt, "assistant secret", "direct-secret-value")
+
+	logPaths := sessionLogPaths(t, configDir)
+	if len(logPaths) != 1 {
+		t.Fatalf("session log paths = %#v, want one failed turn log", logPaths)
+	}
+	data, err := os.ReadFile(logPaths[0])
+	if err != nil {
+		t.Fatalf("ReadFile(%q) error = %v", logPaths[0], err)
+	}
+	records := readJSONLRecords(t, data)
+	errorRecord := firstCLILogRecord(t, records, "error")
+	errorDetail, ok := errorRecord["error"].(string)
+	if errorRecord["message"] != "request model" || !ok || !strings.Contains(errorDetail, "500 Internal Server Error") {
+		t.Fatalf("error log record = %#v, want failed provider status detail", errorRecord)
+	}
+	for _, leaked := range []string{prompt, "assistant secret", "direct-secret-value", "Bearer direct-secret-value"} {
+		if strings.Contains(string(data), leaked) {
+			t.Fatalf("error log leaked %q: %s", leaked, string(data))
+		}
+	}
 }
 
 func TestSessionResumeMultilineCompactIsSentAsPrompt(t *testing.T) {
@@ -12214,6 +12234,15 @@ func TestRunErrorsDoNotLeakAPIKeyValues(t *testing.T) {
 		errorRecord := firstCLILogRecord(t, records, "error")
 		if errorRecord["level"] != "error" || errorRecord["message"] != "request model" {
 			t.Fatalf("error log record = %#v, want level error with request model message", errorRecord)
+		}
+		errorDetail, ok := errorRecord["error"].(string)
+		if !ok || !strings.Contains(errorDetail, "400 Bad Request") {
+			t.Fatalf("error log record = %#v, want HTTP status error detail", errorRecord)
+		}
+		for _, leaked := range []string{"direct-secret-value", "Bearer direct-secret-value"} {
+			if strings.Contains(string(data), leaked) {
+				t.Fatalf("error log leaked %q: %s", leaked, string(data))
+			}
 		}
 		assertNoAdditionalCLIRunRequest(t, requests)
 	})

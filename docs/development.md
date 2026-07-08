@@ -908,9 +908,10 @@ provider
 model
 ```
 
-工具调用、usage、HTTP 错误、MCP 错误可以写入日志。API key、Authorization header
-和其他敏感配置值的实际值不能写入日志。v0.1 不记录完整 prompt、response、
-tool result 正文，也不提供开启正文日志的配置。
+工具调用、usage、HTTP 错误、MCP 错误可以写入日志。错误事件的 `message` 字段记录失败
+阶段/分类；如果有可诊断失败原因，日志可记录脱敏后的 `error` 字段。API key、
+Authorization header 和其他敏感配置值的实际值不能写入日志。v0.1 不记录完整 prompt、
+response、tool result 正文，也不提供开启正文日志的配置。
 
 M13 后的 resumable sessions 使用独立的 `sessions` 配置和独立存储目录，不复用
 `logging.path`。JSONL session log / transcript 继续服务于诊断和审计，默认仍不记录完整

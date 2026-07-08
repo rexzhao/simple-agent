@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/rexzhao/simple-agent/internal/model"
+	"github.com/rexzhao/simple-agent/internal/model/httpstream"
 )
 
 type Attributes struct {
@@ -173,6 +174,9 @@ func (l *Logger) eventRecord(event model.Event) map[string]any {
 	case model.ErrorEvent:
 		record["is_error"] = true
 		record["message"] = safeErrorMessage(event)
+		if detail := safeErrorDetail(event.Err); detail != "" {
+			record["error"] = detail
+		}
 	}
 
 	return record
@@ -218,4 +222,31 @@ func safeErrorMessage(event model.ErrorEvent) string {
 		return event.Message
 	}
 	return "error"
+}
+
+func safeErrorDetail(err error) string {
+	if err == nil {
+		return ""
+	}
+	var statusErr *httpstream.StatusError
+	if errors.As(err, &statusErr) {
+		status := strings.TrimSpace(statusErr.Status)
+		if status == "" && statusErr.StatusCode != 0 {
+			status = fmt.Sprintf("HTTP %d", statusErr.StatusCode)
+		}
+		if status == "" {
+			status = "HTTP request failed"
+		}
+		if statusErr.Attempts > 1 {
+			return fmt.Sprintf("%s after %d attempts", status, statusErr.Attempts)
+		}
+		return status
+	}
+	detail := strings.Join(strings.Fields(err.Error()), " ")
+	const maxDetailRunes = 512
+	runes := []rune(detail)
+	if len(runes) > maxDetailRunes {
+		detail = string(runes[:maxDetailRunes]) + "..."
+	}
+	return detail
 }

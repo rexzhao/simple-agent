@@ -748,8 +748,9 @@ session 目录和 `sai.jsonl` 只在第一条日志事件发生时创建。
 直接 `/exit`、`/quit` 或 EOF 且没有模型请求时，也不创建 session 日志。
 
 每行日志是一个 JSON object。日志可以记录模型请求生命周期、工具调用、usage、HTTP 错误
-和 MCP 错误。API key、Authorization header 和其他敏感配置值的实际值不能进入日志。
-v0.1 不记录完整 prompt、response、tool result 正文，也不提供开启正文日志的配置。
+和 MCP 错误。错误事件的 `message` 是失败阶段/分类；如果有可诊断失败原因，日志会记录
+脱敏后的 `error` 字段。API key、Authorization header 和其他敏感配置值的实际值不能进入
+日志。v0.1 不记录完整 prompt、response、tool result 正文，也不提供开启正文日志的配置。
 
 ## Context Window（M14 后）
 

@@ -2,12 +2,14 @@ package logging
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/rexzhao/simple-agent/internal/model"
+	"github.com/rexzhao/simple-agent/internal/model/httpstream"
 )
 
 func TestOpenPrecomputesPathWithoutCreatingLogFiles(t *testing.T) {
@@ -204,9 +206,49 @@ func TestFirstErrorEventLazilyCreatesSessionLog(t *testing.T) {
 		t.Fatalf("ReadFile(%q) error = %v", futurePath, err)
 	}
 	logText := string(data)
-	for _, want := range []string{`"event":"error"`, `"level":"error"`, `"message":"request model"`} {
+	for _, want := range []string{`"event":"error"`, `"level":"error"`, `"message":"request model"`, `"error":"boom"`} {
 		if !strings.Contains(logText, want) {
 			t.Fatalf("log = %q, want contain %q", logText, want)
+		}
+	}
+}
+
+func TestErrorEventHTTPStatusErrorLogsStatusWithoutResponseBody(t *testing.T) {
+	parent := t.TempDir()
+	logRoot := filepath.Join(parent, "logs")
+	logger, err := Open(filepath.Join(logRoot, "sai.jsonl"), Attributes{
+		Provider: "fake",
+		Model:    "model-default",
+	})
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	futurePath := logger.Path()
+
+	statusErr := &httpstream.StatusError{
+		StatusCode: 429,
+		Status:     "429 Too Many Requests",
+		Body:       "prompt secret body with Authorization: Bearer direct-secret-value",
+		Attempts:   2,
+	}
+	if err := logger.LogEvent(model.ErrorEvent{Err: fmt.Errorf("request failed: %w", statusErr), Message: "request model"}); err != nil {
+		t.Fatalf("LogEvent() error = %v", err)
+	}
+	if err := logger.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+
+	data, err := os.ReadFile(futurePath)
+	if err != nil {
+		t.Fatalf("ReadFile(%q) error = %v", futurePath, err)
+	}
+	logText := string(data)
+	if !strings.Contains(logText, `"error":"429 Too Many Requests after 2 attempts"`) {
+		t.Fatalf("log = %q, want status-only error detail", logText)
+	}
+	for _, leaked := range []string{"prompt secret body", "direct-secret-value", "Bearer direct-secret-value"} {
+		if strings.Contains(logText, leaked) {
+			t.Fatalf("log = %q, leaked %q", logText, leaked)
 		}
 	}
 }
