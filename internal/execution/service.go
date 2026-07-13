@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/rexzhao/simple-agent/internal/contextwindow"
@@ -513,6 +514,109 @@ func (s *Service) SendSessionMessage(ctx context.Context, id, content string) (S
 }
 
 func (s *Service) SendSessionMessageWithEvents(ctx context.Context, id, content string, emit func(SessionStreamEvent)) (SessionMessageResult, error) {
+	run := s.StartSessionRun(ctx, id, content, emit)
+	return run.Wait()
+}
+
+// SessionRunStatus is the lifecycle status of a SessionRun.
+type SessionRunStatus string
+
+const (
+	SessionRunRunning   SessionRunStatus = "running"
+	SessionRunCommitted SessionRunStatus = "committed"
+	SessionRunFailed    SessionRunStatus = "failed"
+	SessionRunCancelled SessionRunStatus = "cancelled"
+)
+
+// SessionRun is the lifecycle handle for an asynchronous session message turn
+// started by StartSessionRun. It is safe for concurrent use.
+type SessionRun struct {
+	cancel context.CancelFunc
+	done   chan struct{}
+
+	mu     sync.Mutex
+	status SessionRunStatus
+	result SessionMessageResult
+	err    error
+}
+
+// StartSessionRun begins running the session message orchestration for id in a
+// background goroutine under a child context derived from ctx and returns
+// immediately. The returned SessionRun lets the caller Wait for completion,
+// query Status, or Cancel the run.
+//
+// Cancel is run-local and idempotent: it cancels only the child context created
+// for this run, never the caller's ctx. Wait is repeatable: every call returns
+// the same final result and error. Status is thread-safe: a nil error settles
+// as committed, context.Canceled as cancelled, and any other error as failed.
+// Cancelling after the run has settled does not change its status.
+func (s *Service) StartSessionRun(ctx context.Context, id, content string, emit func(SessionStreamEvent)) *SessionRun {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	runCtx, cancel := context.WithCancel(ctx)
+	run := &SessionRun{
+		cancel: cancel,
+		done:   make(chan struct{}),
+		status: SessionRunRunning,
+	}
+	go func() {
+		defer cancel()
+		defer close(run.done)
+		result, err := s.runSessionMessage(runCtx, id, content, emit)
+		run.settle(result, err, runCtx)
+	}()
+	return run
+}
+
+// Wait blocks until the run completes and returns its result and error. It is
+// safe to call concurrently and repeatedly; every call returns the same values.
+func (r *SessionRun) Wait() (SessionMessageResult, error) {
+	<-r.done
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.result, r.err
+}
+
+// Status returns the current lifecycle status of the run.
+func (r *SessionRun) Status() SessionRunStatus {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.status
+}
+
+// Cancel requests cancellation of the run. It is idempotent and run-local: it
+// cancels only the child context created for this run, never the caller's ctx.
+// Cancelling after the run has settled has no effect on its status.
+func (r *SessionRun) Cancel() {
+	if r == nil || r.cancel == nil {
+		return
+	}
+	r.cancel()
+}
+
+// settle records the terminal result and derives the run status from the
+// returned error and the child context. It is called exactly once, from the
+// run goroutine, after the orchestration returns.
+func (r *SessionRun) settle(result SessionMessageResult, err error, runCtx context.Context) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.result = result
+	if err == nil {
+		r.status = SessionRunCommitted
+		r.err = nil
+		return
+	}
+	if errors.Is(err, context.Canceled) || runCtx.Err() == context.Canceled {
+		r.status = SessionRunCancelled
+		r.err = context.Canceled
+		return
+	}
+	r.status = SessionRunFailed
+	r.err = err
+}
+
+func (s *Service) runSessionMessage(ctx context.Context, id, content string, emit func(SessionStreamEvent)) (SessionMessageResult, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
