@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	"github.com/rexzhao/simple-agent/internal/model"
+	"github.com/rexzhao/simple-agent/internal/sessions"
 )
 
 // TestSessionStreamBlockedCallbackDoesNotBlockRunner verifies that a slow
@@ -440,5 +442,236 @@ func TestSessionEventSinkCoalescesAtSubmitTime(t *testing.T) {
 	}
 	if got, _ := delivered[2]["turn_id"].(string); got != "turn-2" {
 		t.Fatalf("delivered other-turn delta turn_id = %q, want turn-2", got)
+	}
+}
+
+// turnFailedSecret is injected into the prompt and, where a runner/planner error
+// is simulated, into that error's text. It must never appear in any
+// SessionStreamEvent: turn.failed carries only a stable code and canned message.
+const turnFailedSecret = "LEAKED-TURN-SECRET-7c9f"
+
+// TestSessionStreamTurnFailedSafePayloadByStage verifies that every reachable
+// failure stage after turn.started emits exactly one terminal turn.failed event
+// (last, unique) carrying a stable code and short canned message, and that no
+// stream event leaks the underlying error text, prompt, or other secret.
+func TestSessionStreamTurnFailedSafePayloadByStage(t *testing.T) {
+	prompt := "prompt " + turnFailedSecret
+
+	t.Run("compaction_failed", func(t *testing.T) {
+		home := t.TempDir()
+		runner := fakeExecutionTurnRunner{
+			supports: true,
+			plan: func(ctx context.Context, request SessionTurnRequest) (SessionCompactionResult, error) {
+				return SessionCompactionResult{}, fmt.Errorf("compaction planner leaked %s", turnFailedSecret)
+			},
+		}
+		service, _, session := newExecutionServiceWithSession(t, home, runner)
+		var events []SessionStreamEvent
+		_, err := service.SendSessionMessageWithEvents(context.Background(), session.ID, prompt, func(event SessionStreamEvent) {
+			events = append(events, event)
+		})
+		if !errors.Is(err, ErrTurnFailed) {
+			t.Fatalf("error = %v, want ErrTurnFailed", err)
+		}
+		if strings.Contains(err.Error(), turnFailedSecret) {
+			t.Fatalf("returned error leaks secret: %v", err)
+		}
+		assertSafeTurnFailedTerminal(t, events, "compaction_failed", "compaction planning failed", turnFailedSecret)
+	})
+
+	t.Run("turn_input_failed", func(t *testing.T) {
+		home := t.TempDir()
+		runner := fakeExecutionTurnRunner{
+			supports: true,
+			plan: func(ctx context.Context, request SessionTurnRequest) (SessionCompactionResult, error) {
+				blockSessionSegmentsDir(t, home, request.Session.ID)
+				return SessionCompactionResult{}, nil
+			},
+		}
+		service, _, session := newExecutionServiceWithSession(t, home, runner)
+		var events []SessionStreamEvent
+		_, err := service.SendSessionMessageWithEvents(context.Background(), session.ID, prompt, func(event SessionStreamEvent) {
+			events = append(events, event)
+		})
+		if err == nil || !strings.Contains(err.Error(), "could not save turn input") {
+			t.Fatalf("error = %v, want could not save turn input", err)
+		}
+		if strings.Contains(err.Error(), turnFailedSecret) {
+			t.Fatalf("returned error leaks secret: %v", err)
+		}
+		assertSafeTurnFailedTerminal(t, events, "turn_input_failed", "could not save turn input", turnFailedSecret)
+	})
+
+	t.Run("runner_failed", func(t *testing.T) {
+		home := t.TempDir()
+		runner := fakeExecutionTurnRunner{
+			supports: true,
+			run: func(ctx context.Context, request SessionTurnRequest) (SessionTurnResult, error) {
+				request.Emit(model.TextDeltaEvent{Text: "partial output"})
+				return SessionTurnResult{}, fmt.Errorf("runner leaked %s", turnFailedSecret)
+			},
+		}
+		service, _, session := newExecutionServiceWithSession(t, home, runner)
+		var events []SessionStreamEvent
+		_, err := service.SendSessionMessageWithEvents(context.Background(), session.ID, prompt, func(event SessionStreamEvent) {
+			events = append(events, event)
+		})
+		if !errors.Is(err, ErrTurnFailed) {
+			t.Fatalf("error = %v, want ErrTurnFailed", err)
+		}
+		if strings.Contains(err.Error(), turnFailedSecret) {
+			t.Fatalf("returned error leaks secret: %v", err)
+		}
+		assertSafeTurnFailedTerminal(t, events, "runner_failed", "turn runner failed", turnFailedSecret)
+	})
+
+	t.Run("runner_not_incremental", func(t *testing.T) {
+		home := t.TempDir()
+		runner := fakeExecutionTurnRunner{
+			supports: true,
+			run: func(ctx context.Context, request SessionTurnRequest) (SessionTurnResult, error) {
+				if err := request.Publisher.Publish(eventAssistant(request.TurnID, "answer")); err != nil {
+					return SessionTurnResult{}, err
+				}
+				return SessionTurnResult{Incremental: false}, nil
+			},
+		}
+		service, _, session := newExecutionServiceWithSession(t, home, runner)
+		var events []SessionStreamEvent
+		_, err := service.SendSessionMessageWithEvents(context.Background(), session.ID, prompt, func(event SessionStreamEvent) {
+			events = append(events, event)
+		})
+		if err == nil || !strings.Contains(err.Error(), "turn runner did not use incremental persistence") {
+			t.Fatalf("error = %v, want not-incremental", err)
+		}
+		if strings.Contains(err.Error(), turnFailedSecret) {
+			t.Fatalf("returned error leaks secret: %v", err)
+		}
+		assertSafeTurnFailedTerminal(t, events, "runner_not_incremental", "turn runner did not persist incrementally", turnFailedSecret)
+	})
+
+	t.Run("turn_completion_failed", func(t *testing.T) {
+		home := t.TempDir()
+		runner := fakeExecutionTurnRunner{
+			supports: true,
+			run: func(ctx context.Context, request SessionTurnRequest) (SessionTurnResult, error) {
+				if err := request.Publisher.Publish(eventAssistant(request.TurnID, "answer")); err != nil {
+					return SessionTurnResult{}, err
+				}
+				removeSessionMetadata(t, home, request.Session.ID)
+				return SessionTurnResult{Incremental: true}, nil
+			},
+		}
+		service, _, session := newExecutionServiceWithSession(t, home, runner)
+		var events []SessionStreamEvent
+		_, err := service.SendSessionMessageWithEvents(context.Background(), session.ID, prompt, func(event SessionStreamEvent) {
+			events = append(events, event)
+		})
+		if err == nil || !strings.Contains(err.Error(), "could not clear running turn") {
+			t.Fatalf("error = %v, want could not clear running turn", err)
+		}
+		if strings.Contains(err.Error(), turnFailedSecret) {
+			t.Fatalf("returned error leaks secret: %v", err)
+		}
+		assertSafeTurnFailedTerminal(t, events, "turn_completion_failed", "could not complete turn", turnFailedSecret)
+	})
+
+	t.Run("session_reload_failed", func(t *testing.T) {
+		home := t.TempDir()
+		runner := fakeExecutionTurnRunner{
+			supports: true,
+			run: func(ctx context.Context, request SessionTurnRequest) (SessionTurnResult, error) {
+				if err := request.Publisher.Publish(eventAssistant(request.TurnID, "answer")); err != nil {
+					return SessionTurnResult{}, err
+				}
+				corruptSessionSegments(t, home, request.Session.ID)
+				return SessionTurnResult{Incremental: true}, nil
+			},
+		}
+		service, _, session := newExecutionServiceWithSession(t, home, runner)
+		var events []SessionStreamEvent
+		_, err := service.SendSessionMessageWithEvents(context.Background(), session.ID, prompt, func(event SessionStreamEvent) {
+			events = append(events, event)
+		})
+		if err == nil {
+			t.Fatalf("error = nil, want session reload error")
+		}
+		if strings.Contains(err.Error(), turnFailedSecret) {
+			t.Fatalf("returned error leaks secret: %v", err)
+		}
+		assertSafeTurnFailedTerminal(t, events, "session_reload_failed", "could not reload session", turnFailedSecret)
+	})
+}
+
+func assertSafeTurnFailedTerminal(t *testing.T, events []SessionStreamEvent, wantCode, wantMessage, secret string) {
+	t.Helper()
+	types := sessionStreamEventTypes(events)
+	if len(types) == 0 || types[0] != "turn.started" {
+		t.Fatalf("first event = %#v, want turn.started", types)
+	}
+	if got := countString(types, "turn.failed"); got != 1 {
+		t.Fatalf("turn.failed count = %d, want 1; events = %#v", got, types)
+	}
+	failedIdx := indexOfString(types, "turn.failed")
+	if failedIdx != len(types)-1 {
+		t.Fatalf("turn.failed index = %d, want last; events = %#v", failedIdx, types)
+	}
+	failed := events[failedIdx]
+	if got, _ := failed["code"].(string); got != wantCode {
+		t.Fatalf("turn.failed code = %q, want %q", got, wantCode)
+	}
+	if got, _ := failed["message"].(string); got != wantMessage {
+		t.Fatalf("turn.failed message = %q, want %q", got, wantMessage)
+	}
+	if got, _ := failed["turn_id"].(string); got == "" {
+		t.Fatalf("turn.failed missing turn_id: %#v", failed)
+	}
+	for i, event := range events {
+		if strings.Contains(fmt.Sprintf("%v", event), secret) {
+			t.Fatalf("event %d leaks secret %q: %v", i, secret, event)
+		}
+	}
+}
+
+func blockSessionSegmentsDir(t *testing.T, home, sessionID string) {
+	t.Helper()
+	root, err := sessions.RootForHome(home)
+	if err != nil {
+		t.Fatalf("RootForHome error = %v", err)
+	}
+	segPath := filepath.Join(root, sessionID, "segments")
+	if err := os.WriteFile(segPath, []byte("block"), 0o600); err != nil {
+		t.Fatalf("block segments dir error = %v", err)
+	}
+}
+
+func removeSessionMetadata(t *testing.T, home, sessionID string) {
+	t.Helper()
+	root, err := sessions.RootForHome(home)
+	if err != nil {
+		t.Fatalf("RootForHome error = %v", err)
+	}
+	if err := os.Remove(filepath.Join(root, sessionID, "meta.json")); err != nil {
+		t.Fatalf("remove metadata error = %v", err)
+	}
+}
+
+func corruptSessionSegments(t *testing.T, home, sessionID string) {
+	t.Helper()
+	root, err := sessions.RootForHome(home)
+	if err != nil {
+		t.Fatalf("RootForHome error = %v", err)
+	}
+	matches, err := filepath.Glob(filepath.Join(root, sessionID, "segments", "*.jsonl"))
+	if err != nil {
+		t.Fatalf("glob segments error = %v", err)
+	}
+	if len(matches) == 0 {
+		t.Fatalf("no session segments found to corrupt for %s", sessionID)
+	}
+	for _, p := range matches {
+		if err := os.WriteFile(p, []byte("not-valid-json\n"), 0o600); err != nil {
+			t.Fatalf("corrupt segment %q error = %v", p, err)
+		}
 	}
 }

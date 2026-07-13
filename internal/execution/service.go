@@ -196,6 +196,25 @@ var (
 	ErrTurnFailed            = errors.New("turn failed")
 )
 
+// turnFailure is the safe, stable payload for a turn.failed session stream
+// event. It carries only a stable code and a short canned message selected by
+// the failing stage; the underlying error text, provider body, auth data, the
+// prompt and tool results stay in logs and returned errors and are never placed
+// in a SessionStreamEvent.
+type turnFailure struct {
+	code    string
+	message string
+}
+
+var (
+	turnFailureCompaction     = turnFailure{code: "compaction_failed", message: "compaction planning failed"}
+	turnFailureTurnInput      = turnFailure{code: "turn_input_failed", message: "could not save turn input"}
+	turnFailureRunner         = turnFailure{code: "runner_failed", message: "turn runner failed"}
+	turnFailureNotIncremental = turnFailure{code: "runner_not_incremental", message: "turn runner did not persist incrementally"}
+	turnFailureCompletion     = turnFailure{code: "turn_completion_failed", message: "could not complete turn"}
+	turnFailureSessionReload  = turnFailure{code: "session_reload_failed", message: "could not reload session"}
+)
+
 const defaultSessionWriteLockTimeout = 2 * time.Second
 
 func NewService(home string) (*Service, error) {
@@ -565,7 +584,7 @@ func (s *Service) SendSessionMessageWithEvents(ctx context.Context, id, content 
 
 	turnStarted := false
 	turnClosed := false
-	turnFailed := false
+	var failure *turnFailure
 	committed := false
 	committedLastSeq := int64(0)
 	interruptTurn := func() {
@@ -577,20 +596,27 @@ func (s *Service) SendSessionMessageWithEvents(ctx context.Context, id, content 
 		}
 		turnClosed = true
 	}
-	markFailed := func() {
+	markFailed := func(f turnFailure) {
 		interruptTurn()
-		turnFailed = true
+		if failure == nil {
+			f0 := f
+			failure = &f0
+		}
 	}
 	// finalize is the single drain point: the durable bridge is closed and joined
 	// first so all mapped model/persisted events are submitted, then the terminal
 	// event (turn.failed or turn.committed) is submitted last, and the sink is
-	// flushed and joined before returning so no callback fires after return.
+	// flushed and joined before returning so no callback fires after return. The
+	// turn.failed payload carries only a stable code and a short canned message
+	// selected by the failing stage; it never includes the underlying error text,
+	// provider body, auth data, the prompt, or tool results.
 	finalize := func() {
 		closeBridge()
-		if turnFailed {
+		if failure != nil {
 			submitSessionStreamEvent(submit, NewSessionStreamEvent("turn.failed", map[string]any{
 				"turn_id": turnID,
-				"message": "turn failed",
+				"code":    failure.code,
+				"message": failure.message,
 			}))
 		} else if committed {
 			submitSessionStreamEvent(submit, NewSessionStreamEvent("turn.committed", map[string]any{
@@ -615,11 +641,11 @@ func (s *Service) SendSessionMessageWithEvents(ctx context.Context, id, content 
 
 	session, err = s.planAutoCompaction(ctx, bus, session, turnID, content)
 	if err != nil {
-		markFailed()
+		markFailed(turnFailureCompaction)
 		return SessionMessageResult{}, err
 	}
 	if err := bus.Publish(eventbus.TurnInputReady{TurnID: turnID, Message: model.Message{Role: model.MessageRoleUser, Content: content}}); err != nil {
-		markFailed()
+		markFailed(turnFailureTurnInput)
 		return SessionMessageResult{}, fmt.Errorf("could not save turn input")
 	}
 
@@ -636,21 +662,25 @@ func (s *Service) SendSessionMessageWithEvents(ctx context.Context, id, content 
 		Publisher: bus,
 	})
 	if err != nil {
-		markFailed()
+		markFailed(turnFailureRunner)
 		return SessionMessageResult{}, ErrTurnFailed
 	}
 	if !result.Incremental {
-		markFailed()
+		markFailed(turnFailureNotIncremental)
 		return SessionMessageResult{}, fmt.Errorf("turn runner did not use incremental persistence")
 	}
 	if err := bus.Publish(eventbus.TurnCompleted{TurnID: turnID}); err != nil {
-		markFailed()
+		markFailed(turnFailureCompletion)
 		return SessionMessageResult{}, fmt.Errorf("could not clear running turn")
 	}
 	turnClosed = true
 
 	saved, err := s.sessionStore.Load(id)
 	if err != nil {
+		// TurnCompleted already cleared the running turn durably, so only the
+		// terminal stream event bookkeeping is needed here: emit exactly one
+		// turn.failed last and preserve the returned public error.
+		markFailed(turnFailureSessionReload)
 		return SessionMessageResult{}, err
 	}
 	committed = true

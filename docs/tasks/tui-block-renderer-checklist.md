@@ -276,7 +276,7 @@ block 更新规则：
 - [x] 为状态栏确定是否需要 `status.updated`，避免 renderer 推断过多 runtime 状态；首版不新增该事件。
 - [x] 将当前 model tool-call 完成语义从 `tool.started` 收紧为 `tool.requested`。
 - [x] 在 executor 实际开始/更新/结束处提供 `tool.started`、可选 `tool.progress` 和 `tool.finished`。
-- [ ] 为 `turn.failed` 定义稳定、安全的 error code 和简短 message，并保持详细诊断只进入日志。
+- [x] 为 `turn.failed` 定义稳定、安全的 error code 和简短 message，并保持详细诊断只进入日志。
 - [x] 将 durability barrier 与 presentation observer 分开，验证慢 renderer 不阻塞 provider/tool 执行。
 - [x] 为连续 text/reasoning delta 定义不丢文本的展示侧合并规则。
 - [ ] 为新增 execution 内部事件使用有类型 payload，并在现有 map stream 边界做适配。
