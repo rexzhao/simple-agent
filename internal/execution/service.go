@@ -546,7 +546,13 @@ func (s *Service) SendSessionMessageWithEvents(ctx context.Context, id, content 
 	defer projector.Close()
 
 	bus := eventbus.NewBusWithCheckpoint(projector.CheckpointHandler())
-	waitBridge := s.startSessionEventBridge(id, turnID, bus, session.LastSeq, session.ShowReasoning, emit)
+	var sink *sessionEventSink
+	var submit func(SessionStreamEvent)
+	if emit != nil {
+		sink = newSessionEventSink(emit)
+		submit = sink.submit
+	}
+	waitBridge := s.startSessionEventBridge(id, turnID, bus, session.LastSeq, session.ShowReasoning, submit)
 	bridgeClosed := false
 	closeBridge := func() {
 		if bridgeClosed {
@@ -556,10 +562,12 @@ func (s *Service) SendSessionMessageWithEvents(ctx context.Context, id, content 
 		waitBridge()
 		bridgeClosed = true
 	}
-	defer closeBridge()
 
 	turnStarted := false
 	turnClosed := false
+	turnFailed := false
+	committed := false
+	committedLastSeq := int64(0)
 	interruptTurn := func() {
 		if !turnStarted || turnClosed {
 			return
@@ -569,29 +577,49 @@ func (s *Service) SendSessionMessageWithEvents(ctx context.Context, id, content 
 		}
 		turnClosed = true
 	}
-	failTurn := func() {
+	markFailed := func() {
 		interruptTurn()
-		emitSessionStreamEvent(emit, NewSessionStreamEvent("turn.failed", map[string]any{
-			"turn_id": turnID,
-			"message": "turn failed",
-		}))
+		turnFailed = true
 	}
+	// finalize is the single drain point: the durable bridge is closed and joined
+	// first so all mapped model/persisted events are submitted, then the terminal
+	// event (turn.failed or turn.committed) is submitted last, and the sink is
+	// flushed and joined before returning so no callback fires after return.
+	finalize := func() {
+		closeBridge()
+		if turnFailed {
+			submitSessionStreamEvent(submit, NewSessionStreamEvent("turn.failed", map[string]any{
+				"turn_id": turnID,
+				"message": "turn failed",
+			}))
+		} else if committed {
+			submitSessionStreamEvent(submit, NewSessionStreamEvent("turn.committed", map[string]any{
+				"turn_id":  turnID,
+				"last_seq": committedLastSeq,
+			}))
+		}
+		if sink != nil {
+			sink.close()
+			sink.wait()
+		}
+	}
+	defer finalize()
 
 	if err := bus.Publish(eventbus.TurnStarted{TurnID: turnID}); err != nil {
 		return SessionMessageResult{}, fmt.Errorf("could not mark turn running")
 	}
 	turnStarted = true
-	emitSessionStreamEvent(emit, NewSessionStreamEvent("turn.started", map[string]any{
+	submitSessionStreamEvent(submit, NewSessionStreamEvent("turn.started", map[string]any{
 		"turn_id": turnID,
 	}))
 
 	session, err = s.planAutoCompaction(ctx, bus, session, turnID, content)
 	if err != nil {
-		failTurn()
+		markFailed()
 		return SessionMessageResult{}, err
 	}
 	if err := bus.Publish(eventbus.TurnInputReady{TurnID: turnID, Message: model.Message{Role: model.MessageRoleUser, Content: content}}); err != nil {
-		failTurn()
+		markFailed()
 		return SessionMessageResult{}, fmt.Errorf("could not save turn input")
 	}
 
@@ -608,28 +636,25 @@ func (s *Service) SendSessionMessageWithEvents(ctx context.Context, id, content 
 		Publisher: bus,
 	})
 	if err != nil {
-		failTurn()
+		markFailed()
 		return SessionMessageResult{}, ErrTurnFailed
 	}
 	if !result.Incremental {
-		failTurn()
+		markFailed()
 		return SessionMessageResult{}, fmt.Errorf("turn runner did not use incremental persistence")
 	}
 	if err := bus.Publish(eventbus.TurnCompleted{TurnID: turnID}); err != nil {
-		failTurn()
+		markFailed()
 		return SessionMessageResult{}, fmt.Errorf("could not clear running turn")
 	}
 	turnClosed = true
-	closeBridge()
 
 	saved, err := s.sessionStore.Load(id)
 	if err != nil {
 		return SessionMessageResult{}, err
 	}
-	emitSessionStreamEvent(emit, NewSessionStreamEvent("turn.committed", map[string]any{
-		"turn_id":  turnID,
-		"last_seq": saved.LastSeq,
-	}))
+	committed = true
+	committedLastSeq = saved.LastSeq
 	return SessionMessageResult{Status: "committed", TurnID: turnID, LastSeq: saved.LastSeq}, nil
 }
 

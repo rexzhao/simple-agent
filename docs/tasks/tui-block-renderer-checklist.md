@@ -277,8 +277,8 @@ block 更新规则：
 - [x] 将当前 model tool-call 完成语义从 `tool.started` 收紧为 `tool.requested`。
 - [x] 在 executor 实际开始/更新/结束处提供 `tool.started`、可选 `tool.progress` 和 `tool.finished`。
 - [ ] 为 `turn.failed` 定义稳定、安全的 error code 和简短 message，并保持详细诊断只进入日志。
-- [ ] 将 durability barrier 与 presentation observer 分开，验证慢 renderer 不阻塞 provider/tool 执行。
-- [ ] 为连续 text/reasoning delta 定义不丢文本的展示侧合并规则。
+- [x] 将 durability barrier 与 presentation observer 分开，验证慢 renderer 不阻塞 provider/tool 执行。
+- [x] 为连续 text/reasoning delta 定义不丢文本的展示侧合并规则。
 - [ ] 为新增 execution 内部事件使用有类型 payload，并在现有 map stream 边界做适配。
 - [ ] 确定 tool duration 是否作为事件字段提供。
 - [ ] 明确 tool preview 的脱敏、长度和 opt-in/默认隐藏规则。

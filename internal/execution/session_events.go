@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 
 	"github.com/rexzhao/simple-agent/internal/eventbus"
 	"github.com/rexzhao/simple-agent/internal/model"
@@ -51,6 +52,137 @@ func NewSessionStreamEvent(eventType string, fields map[string]any) SessionStrea
 	}
 	event["type"] = eventType
 	return event
+}
+
+// sessionEventSink is the single ordering boundary for presentation of session
+// stream events. It decouples the durable bus (which stays synchronous) from a
+// potentially slow emit callback: bus events are submitted here without blocking
+// on emit, and a dedicated goroutine drains the queue serially.
+//
+// Coalescing happens at submit time under the queue mutex: a queued, consecutive
+// text.delta / reasoning.delta with the same turn_id and type is folded into the
+// trailing queued delta via exact concatenation, so a blocked emit cannot grow
+// the queue by one map per delta. Caller-owned event maps are never mutated; a
+// merged delta is rebuilt from its accumulator when drained. Every other event
+// is delivered verbatim, in submission order, with no drops or reordering. The
+// terminal event (turn.committed / turn.failed) is submitted last and flushed
+// before close+wait returns, so no callback fires after the caller returns.
+type sessionEventSink struct {
+	emit func(SessionStreamEvent)
+
+	mu     sync.Mutex
+	cond   *sync.Cond
+	ops    []sinkOp
+	closed bool
+	done   chan struct{}
+}
+
+type sinkOp struct {
+	event     SessionStreamEvent // verbatim event for non-delta ops
+	isDelta   bool
+	eventType string
+	turnID    string
+	text      *strings.Builder // accumulator for delta ops
+}
+
+func newSessionEventSink(emit func(SessionStreamEvent)) *sessionEventSink {
+	s := &sessionEventSink{
+		emit: emit,
+		done: make(chan struct{}),
+	}
+	s.cond = sync.NewCond(&s.mu)
+	go s.run()
+	return s
+}
+
+func (s *sessionEventSink) submit(event SessionStreamEvent) {
+	if s == nil || event == nil {
+		return
+	}
+	eventType, _ := event["type"].(string)
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return
+	}
+	if eventType == "text.delta" || eventType == "reasoning.delta" {
+		text, _ := event["text"].(string)
+		turnID, _ := event["turn_id"].(string)
+		if n := len(s.ops); n > 0 {
+			last := &s.ops[n-1]
+			if last.isDelta && last.eventType == eventType && last.turnID == turnID {
+				last.text.WriteString(text)
+				s.mu.Unlock()
+				return
+			}
+		}
+		builder := &strings.Builder{}
+		builder.WriteString(text)
+		s.ops = append(s.ops, sinkOp{
+			isDelta:   true,
+			eventType: eventType,
+			turnID:    turnID,
+			text:      builder,
+		})
+	} else {
+		s.ops = append(s.ops, sinkOp{event: event})
+	}
+	s.cond.Signal()
+	s.mu.Unlock()
+}
+
+func (s *sessionEventSink) close() {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	s.closed = true
+	s.cond.Signal()
+	s.mu.Unlock()
+}
+
+func (s *sessionEventSink) wait() {
+	if s == nil {
+		return
+	}
+	<-s.done
+}
+
+func (s *sessionEventSink) run() {
+	defer close(s.done)
+	for {
+		s.mu.Lock()
+		for len(s.ops) == 0 && !s.closed {
+			s.cond.Wait()
+		}
+		ops := s.ops
+		s.ops = nil
+		s.mu.Unlock()
+
+		for _, op := range ops {
+			if op.isDelta {
+				s.emit(NewSessionStreamEvent(op.eventType, map[string]any{
+					"turn_id": op.turnID,
+					"text":    op.text.String(),
+				}))
+			} else {
+				s.emit(op.event)
+			}
+		}
+
+		s.mu.Lock()
+		empty := len(s.ops) == 0 && s.closed
+		s.mu.Unlock()
+		if empty {
+			return
+		}
+	}
+}
+
+func submitSessionStreamEvent(submit func(SessionStreamEvent), event SessionStreamEvent) {
+	if submit != nil && event != nil {
+		submit(event)
+	}
 }
 
 func (s *Service) GetSessionChatItems(id string) (SessionItemsPage, error) {
@@ -224,9 +356,9 @@ func (s *Service) CompactSession(ctx context.Context, id string) (SessionCompact
 	}, nil
 }
 
-func (s *Service) startSessionEventBridge(sessionID, turnID string, bus *eventbus.Bus, afterSeq int64, showReasoning bool, emit func(SessionStreamEvent)) func() {
+func (s *Service) startSessionEventBridge(sessionID, turnID string, bus *eventbus.Bus, afterSeq int64, showReasoning bool, submit func(SessionStreamEvent)) func() {
 	done := make(chan struct{})
-	if s == nil || s.sessionStore == nil || bus == nil || emit == nil {
+	if s == nil || s.sessionStore == nil || bus == nil || submit == nil {
 		close(done)
 		return func() {}
 	}
@@ -238,10 +370,10 @@ func (s *Service) startSessionEventBridge(sessionID, turnID string, bus *eventbu
 			switch event := event.(type) {
 			case eventbus.ModelEvent:
 				if streamEvent, ok := sessionStreamEventFromModelEvent(turnID, event.Event, showReasoning); ok {
-					emitSessionStreamEvent(emit, streamEvent)
+					submit(streamEvent)
 				}
 			case eventbus.DurableCommitted:
-				nextSeq := s.emitPersistedSessionEventsThrough(sessionID, lastSeq, event.Seq, emit)
+				nextSeq := s.emitPersistedSessionEventsThrough(sessionID, lastSeq, event.Seq, submit)
 				if nextSeq > lastSeq {
 					lastSeq = nextSeq
 				}
@@ -253,8 +385,8 @@ func (s *Service) startSessionEventBridge(sessionID, turnID string, bus *eventbu
 	}
 }
 
-func (s *Service) emitPersistedSessionEventsThrough(sessionID string, afterSeq, throughSeq int64, emit func(SessionStreamEvent)) int64 {
-	if s == nil || s.sessionStore == nil || emit == nil || throughSeq <= afterSeq {
+func (s *Service) emitPersistedSessionEventsThrough(sessionID string, afterSeq, throughSeq int64, submit func(SessionStreamEvent)) int64 {
+	if s == nil || s.sessionStore == nil || submit == nil || throughSeq <= afterSeq {
 		return afterSeq
 	}
 	events, err := s.sessionStore.PersistedEventsAfter(sessionID, afterSeq)
@@ -269,16 +401,9 @@ func (s *Service) emitPersistedSessionEventsThrough(sessionID string, afterSeq, 
 		if !ok {
 			continue
 		}
-		emitSessionStreamEvent(emit, streamEvent)
+		submit(streamEvent)
 	}
 	return throughSeq
-}
-
-func emitSessionStreamEvent(emit func(SessionStreamEvent), event SessionStreamEvent) {
-	if emit == nil || event == nil {
-		return
-	}
-	emit(event)
 }
 
 func sessionStreamEventFromPersistedEvent(event sessions.PersistedEvent) (SessionStreamEvent, bool) {
