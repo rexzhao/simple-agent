@@ -180,6 +180,17 @@ func (s *State) Apply(event execution.SessionStreamEvent) {
 		block := s.ensureBlock("assistant:"+turnID, BlockAssistant, turnID, "assistant")
 		block.Text += text
 		block.Status = "running"
+	case "tool.requested":
+		name := eventString(event, "name")
+		if name == "" {
+			return
+		}
+		id := toolBlockID(eventString(event, "tool_call_id"), turnID, name)
+		block := s.ensureBlock(id, BlockTool, turnID, name)
+		if block.Status == "" {
+			s.Status.ToolCount++
+		}
+		block.Status = "requested"
 	case "tool.started":
 		name := eventString(event, "name")
 		if name == "" {

@@ -13,6 +13,124 @@ import (
 	"github.com/rexzhao/simple-agent/internal/model"
 )
 
+func TestStreamEmitsToolRequestedStartedFinishedInOrder(t *testing.T) {
+	provider := &fakeProvider{
+		turns: [][]model.Event{
+			{
+				model.ToolCallDoneEvent{
+					ToolCall: model.ToolCall{ID: "call_1", Name: "echo", Arguments: `{}`},
+				},
+			},
+			{
+				model.TextDeltaEvent{Text: "final"},
+			},
+		},
+	}
+	executor := &fakeToolExecutor{result: model.ToolResult{Name: "echo", Content: "tool output"}}
+
+	events, err := Stream(context.Background(), model.Request{
+		Model:    "model-test",
+		Messages: []model.Message{{Role: model.MessageRoleUser, Content: "Use a tool"}},
+		Tools:    []model.Tool{{Name: "echo"}},
+	}, Options{
+		Provider:     provider,
+		ToolExecutor: executor,
+		MaxTurns:     4,
+	})
+	if err != nil {
+		t.Fatalf("Stream() error = %v", err)
+	}
+
+	gotEvents := collectAgentEvents(t, events)
+	var lifecycle []string
+	for _, event := range gotEvents {
+		switch event.(type) {
+		case model.ToolCallDoneEvent:
+			lifecycle = append(lifecycle, "requested")
+		case model.ToolStartedEvent:
+			lifecycle = append(lifecycle, "started")
+		case model.ToolResultEvent:
+			lifecycle = append(lifecycle, "finished")
+		}
+	}
+	if want := []string{"requested", "started", "finished"}; !reflect.DeepEqual(lifecycle, want) {
+		t.Fatalf("tool lifecycle = %#v, want %#v", lifecycle, want)
+	}
+}
+
+func TestStreamOmitsToolStartedForValidationFailures(t *testing.T) {
+	tests := []struct {
+		name    string
+		tools   []model.Tool
+		args    string
+		wantMsg string
+	}{
+		{
+			name:    "invalid arguments",
+			tools:   []model.Tool{{Name: "echo"}},
+			args:    `{"text":`,
+			wantMsg: "invalid tool arguments",
+		},
+		{
+			name:    "disabled tool",
+			tools:   nil,
+			args:    `{}`,
+			wantMsg: "is not enabled",
+		},
+		{
+			name:    "missing executor",
+			tools:   []model.Tool{{Name: "echo"}},
+			args:    `{}`,
+			wantMsg: "tool executor is not configured",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			provider := &fakeProvider{
+				turns: [][]model.Event{
+					{
+						model.ToolCallDoneEvent{
+							ToolCall: model.ToolCall{ID: "call_1", Name: "echo", Arguments: tt.args},
+						},
+					},
+					{
+						model.TextDeltaEvent{Text: "recovered"},
+					},
+				},
+			}
+			var executor ToolExecutor
+			if tt.name != "missing executor" {
+				executor = &fakeToolExecutor{result: model.ToolResult{Name: "echo", Content: "should not run"}}
+			}
+
+			events, err := Stream(context.Background(), model.Request{
+				Model:    "model-test",
+				Messages: []model.Message{{Role: model.MessageRoleUser, Content: "Use a tool"}},
+				Tools:    tt.tools,
+			}, Options{
+				Provider:     provider,
+				ToolExecutor: executor,
+				MaxTurns:     4,
+			})
+			if err != nil {
+				t.Fatalf("Stream() error = %v", err)
+			}
+
+			gotEvents := collectAgentEvents(t, events)
+			if hasToolStartedEvent(gotEvents) {
+				t.Fatalf("events = %#v, want no ToolStartedEvent for validation failure", gotEvents)
+			}
+			result := firstToolResult(t, gotEvents)
+			if !result.IsError || !strings.Contains(result.Content, tt.wantMsg) {
+				t.Fatalf("tool result = %#v, want error containing %q", result, tt.wantMsg)
+			}
+			if fake, ok := executor.(*fakeToolExecutor); ok && fake.called {
+				t.Fatal("executor was called for validation failure")
+			}
+		})
+	}
+}
+
 func TestStreamExecutesToolResultAndContinuesUntilFinalText(t *testing.T) {
 	provider := &fakeProvider{
 		turns: [][]model.Event{
@@ -655,6 +773,15 @@ func firstErrorEvent(t *testing.T, events []model.Event) model.ErrorEvent {
 func hasToolResultEvent(events []model.Event) bool {
 	for _, event := range events {
 		if _, ok := event.(model.ToolResultEvent); ok {
+			return true
+		}
+	}
+	return false
+}
+
+func hasToolStartedEvent(events []model.Event) bool {
+	for _, event := range events {
+		if _, ok := event.(model.ToolStartedEvent); ok {
 			return true
 		}
 	}

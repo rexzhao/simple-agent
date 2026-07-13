@@ -329,6 +329,15 @@ func sessionStreamEventFromModelEvent(turnID string, event model.Event, showReas
 		if event.ToolCall.Name == "" {
 			return nil, false
 		}
+		return NewSessionStreamEvent("tool.requested", map[string]any{
+			"turn_id":      turnID,
+			"tool_call_id": event.ToolCall.ID,
+			"name":         event.ToolCall.Name,
+		}), true
+	case model.ToolStartedEvent:
+		if event.ToolCall.Name == "" {
+			return nil, false
+		}
 		return NewSessionStreamEvent("tool.started", map[string]any{
 			"turn_id":      turnID,
 			"tool_call_id": event.ToolCall.ID,

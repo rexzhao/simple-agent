@@ -48,6 +48,7 @@ turn.failed
 text.delta
 reasoning.delta
 usage.updated
+tool.requested
 tool.started
 tool.finished
 item.appended
@@ -58,12 +59,16 @@ active_history.replaced
 
 说明：
 
-- `text.delta`、`reasoning.delta`、`tool.started` 和 `tool.finished` 来自 model/runtime 事件映射。
+- `text.delta`、`reasoning.delta`、`tool.requested`、`tool.started` 和 `tool.finished` 来自 model/runtime 事件映射。
 - `item.appended`、`item.updated`、`compaction.created` 和 `active_history.replaced` 来自持久化事件。
 - `turn.started`、`turn.committed` 和 `turn.failed` 由 session message orchestration 发出。
 - `compact.failed` 目前是 CLI renderer 可处理的展示事件名，不是
   `internal/execution/session_events.go` 发出的 execution session stream 事件。
 - `model.UsageEvent` 已映射为 execution `usage.updated`；状态栏可以直接消费该事件。
+- `model.ToolCallDoneEvent` 映射为 `tool.requested`，只表示调用参数已生成；`model.ToolStartedEvent`
+  在参数校验、enabled-tool 检查和 executor 检查通过后、Execute 之前发出，映射为 `tool.started`；
+  `model.ToolResultEvent` 映射为 `tool.finished`。校验失败时只发 `tool.requested` + `tool.finished(error)`，
+  不发 `tool.started`，也不伪造 `tool.progress`。
 
 后续需要收紧的事件或字段：
 
@@ -80,9 +85,10 @@ turn.failed.message
 ```
 
 `tool.finished.preview` 必须是短、安全、可省略的展示摘要；第一版默认不展示 tool result body。
-当前 `tool.started` 由完成的 model tool call 映射而来，只表示调用参数已生成，不表示工具已经通过
-参数校验并开始执行。后续 contract 必须将它收紧为 `tool.requested`，并仅在 executor 实际开始时
-发出 `tool.started`。`tool.progress` 是可选 transient event；没有增量能力的工具不需要伪造 progress。
+`tool.requested` 现由 `model.ToolCallDoneEvent` 映射而来，只表示调用参数已生成；`tool.started`
+仅由 `model.ToolStartedEvent` 在 executor 实际开始时发出（参数校验、enabled-tool 检查和 executor 检查
+均通过后、Execute 之前），校验失败不发 `tool.started`。`tool.progress` 是可选 transient event；
+没有增量能力的工具不需要伪造 progress。
 
 ## Target Architecture
 
@@ -241,7 +247,7 @@ block 更新规则：
 - `reasoning.delta` 追加到当前 reasoning block；可见性遵循 session 保存的 `show_reasoning`，
   TUI 可以提供折叠/展开状态。
 - `text.delta` 追加到 assistant block。
-- `tool.requested` 创建 tool block；只有 `tool.started` 才更新为 running。
+- `tool.requested` 创建 tool block；只有 `tool.started` 才更新为 running；`tool.requested` 创建时即计数，`tool.started` 不重复计数。
 - `tool.progress` 原地更新同一个 tool block，不创建重复 block。
 - `tool.finished` 更新 tool block 为 completed 或 failed。
 - `turn.failed` 创建 error block 并更新状态栏。
@@ -268,8 +274,8 @@ block 更新规则：
 
 - [x] 将 `model.UsageEvent` 映射为 execution session stream 事件，例如 `usage.updated`。
 - [x] 为状态栏确定是否需要 `status.updated`，避免 renderer 推断过多 runtime 状态；首版不新增该事件。
-- [ ] 将当前 model tool-call 完成语义从 `tool.started` 收紧为 `tool.requested`。
-- [ ] 在 executor 实际开始/更新/结束处提供 `tool.started`、可选 `tool.progress` 和 `tool.finished`。
+- [x] 将当前 model tool-call 完成语义从 `tool.started` 收紧为 `tool.requested`。
+- [x] 在 executor 实际开始/更新/结束处提供 `tool.started`、可选 `tool.progress` 和 `tool.finished`。
 - [ ] 为 `turn.failed` 定义稳定、安全的 error code 和简短 message，并保持详细诊断只进入日志。
 - [ ] 将 durability barrier 与 presentation observer 分开，验证慢 renderer 不阻塞 provider/tool 执行。
 - [ ] 为连续 text/reasoning delta 定义不丢文本的展示侧合并规则。

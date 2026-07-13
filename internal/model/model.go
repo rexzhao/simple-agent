@@ -58,6 +58,7 @@ const (
 	EventTypeMessageDone        EventType = "message_done"
 	EventTypeToolCallDelta      EventType = "tool_call_delta"
 	EventTypeToolCallDone       EventType = "tool_call_done"
+	EventTypeToolStarted        EventType = "tool_started"
 	EventTypeToolResult         EventType = "tool_result"
 	EventTypeUsage              EventType = "usage"
 	EventTypeSubagentCompletion EventType = "subagent_completion"
@@ -110,6 +111,17 @@ type ToolCallDoneEvent struct {
 
 func (ToolCallDoneEvent) Type() EventType {
 	return EventTypeToolCallDone
+}
+
+// ToolStartedEvent is emitted after a tool call has passed argument
+// validation, the enabled-tool check, and the executor check, immediately
+// before the executor runs. It maps to the runtime tool.started lifecycle.
+type ToolStartedEvent struct {
+	ToolCall ToolCall
+}
+
+func (ToolStartedEvent) Type() EventType {
+	return EventTypeToolStarted
 }
 
 type ToolResultEvent struct {

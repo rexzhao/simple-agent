@@ -12159,6 +12159,7 @@ func TestWriteStreamWithOptionsResetsReasoningBeforeToolAndReentersCleanly(t *te
 	err := writeStreamWithOptions(&stdout, &stderr, cliEventStream(
 		model.ReasoningDeltaEvent{Text: "thinking"},
 		model.ToolCallDoneEvent{ToolCall: model.ToolCall{Name: "read_file", Arguments: `{"path":"note.txt"}`}},
+		model.ToolStartedEvent{ToolCall: model.ToolCall{Name: "read_file", Arguments: `{"path":"note.txt"}`}},
 		model.ReasoningDeltaEvent{Text: "again"},
 		model.TextDeltaEvent{Text: "final"},
 	), true, nil, streamOutputOptions{colorReasoning: true, colorToolStatus: true})
@@ -12179,18 +12180,31 @@ func TestWriteStreamWritesToolStatusWithSafeDetailsOnly(t *testing.T) {
 	var stderr bytes.Buffer
 	err := writeStream(&stdout, &stderr, cliEventStream(
 		model.ToolCallDoneEvent{ToolCall: model.ToolCall{Name: "read_file", Arguments: `{"path":"docs/checklist.md"}`}},
+		model.ToolStartedEvent{ToolCall: model.ToolCall{Name: "read_file", Arguments: `{"path":"docs/checklist.md"}`}},
 		model.ToolCallDoneEvent{ToolCall: model.ToolCall{Name: "list_files", Arguments: `{}`}},
+		model.ToolStartedEvent{ToolCall: model.ToolCall{Name: "list_files", Arguments: `{}`}},
 		model.ToolCallDoneEvent{ToolCall: model.ToolCall{Name: "list_files", Arguments: ``}},
+		model.ToolStartedEvent{ToolCall: model.ToolCall{Name: "list_files", Arguments: ``}},
 		model.ToolCallDoneEvent{ToolCall: model.ToolCall{Name: "list_files", Arguments: " \n\t "}},
+		model.ToolStartedEvent{ToolCall: model.ToolCall{Name: "list_files", Arguments: " \n\t "}},
 		model.ToolCallDoneEvent{ToolCall: model.ToolCall{Name: "read_file", Arguments: `[`}},
+		model.ToolStartedEvent{ToolCall: model.ToolCall{Name: "read_file", Arguments: `[`}},
 		model.ToolCallDoneEvent{ToolCall: model.ToolCall{Name: "list_files", Arguments: `null`}},
+		model.ToolStartedEvent{ToolCall: model.ToolCall{Name: "list_files", Arguments: `null`}},
 		model.ToolCallDoneEvent{ToolCall: model.ToolCall{Name: "glob_files", Arguments: `{"pattern":"src/**/*.go","path":"secret-dir","include_hidden":true}`}},
+		model.ToolStartedEvent{ToolCall: model.ToolCall{Name: "glob_files", Arguments: `{"pattern":"src/**/*.go","path":"secret-dir","include_hidden":true}`}},
 		model.ToolCallDoneEvent{ToolCall: model.ToolCall{Name: "glob_files", Arguments: `{}`}},
+		model.ToolStartedEvent{ToolCall: model.ToolCall{Name: "glob_files", Arguments: `{}`}},
 		model.ToolCallDoneEvent{ToolCall: model.ToolCall{Name: "grep_files", Arguments: `{"query":"secret-query"}`}},
+		model.ToolStartedEvent{ToolCall: model.ToolCall{Name: "grep_files", Arguments: `{"query":"secret-query"}`}},
 		model.ToolCallDoneEvent{ToolCall: model.ToolCall{Name: "write_file", Arguments: `{"path":"draft.txt","content":"secret-write-content"}`}},
+		model.ToolStartedEvent{ToolCall: model.ToolCall{Name: "write_file", Arguments: `{"path":"draft.txt","content":"secret-write-content"}`}},
 		model.ToolCallDoneEvent{ToolCall: model.ToolCall{Name: "edit_file", Arguments: `{"path":"draft.txt","old":"secret-old","new":"secret-new"}`}},
+		model.ToolStartedEvent{ToolCall: model.ToolCall{Name: "edit_file", Arguments: `{"path":"draft.txt","old":"secret-old","new":"secret-new"}`}},
 		model.ToolCallDoneEvent{ToolCall: model.ToolCall{Name: "shell", Arguments: `{"command":"echo secret-command"}`}},
+		model.ToolStartedEvent{ToolCall: model.ToolCall{Name: "shell", Arguments: `{"command":"echo secret-command"}`}},
 		model.ToolCallDoneEvent{ToolCall: model.ToolCall{Name: "mcp.local.search", Arguments: `{"query":"secret-query"}`}},
+		model.ToolStartedEvent{ToolCall: model.ToolCall{Name: "mcp.local.search", Arguments: `{"query":"secret-query"}`}},
 		model.ToolResultEvent{Result: model.ToolResult{Name: "read_file", Content: "secret result body"}},
 		model.ToolResultEvent{Result: model.ToolResult{Name: "write_file", Content: "wrote draft.txt (20 bytes)"}},
 		model.ToolResultEvent{Result: model.ToolResult{Name: "edit_file", Content: "edited draft.txt (1 replacement)"}},
@@ -12213,10 +12227,15 @@ func TestWriteStreamWritesSubagentStartStatusWithBriefDetails(t *testing.T) {
 	var stderr bytes.Buffer
 	err := writeStream(&stdout, &stderr, cliEventStream(
 		model.ToolCallDoneEvent{ToolCall: model.ToolCall{Name: subagents.ToolSubagentStart, Arguments: `{"agent_id":"reviewer","prompt":"secret child prompt","display_name":"Review UI","job_name":"review-1"}`}},
+		model.ToolStartedEvent{ToolCall: model.ToolCall{Name: subagents.ToolSubagentStart, Arguments: `{"agent_id":"reviewer","prompt":"secret child prompt","display_name":"Review UI","job_name":"review-1"}`}},
 		model.ToolCallDoneEvent{ToolCall: model.ToolCall{Name: subagents.ToolSubagentStart, Arguments: `{"agent_id":"researcher","prompt":"another secret","job_name":"research-1"}`}},
+		model.ToolStartedEvent{ToolCall: model.ToolCall{Name: subagents.ToolSubagentStart, Arguments: `{"agent_id":"researcher","prompt":"another secret","job_name":"research-1"}`}},
 		model.ToolCallDoneEvent{ToolCall: model.ToolCall{Name: subagents.ToolSubagentStart, Arguments: `{"agent_id":"reviewer","prompt":"line secret","display_name":"  Audit\nPass\tOne  "}`}},
+		model.ToolStartedEvent{ToolCall: model.ToolCall{Name: subagents.ToolSubagentStart, Arguments: `{"agent_id":"reviewer","prompt":"line secret","display_name":"  Audit\nPass\tOne  "}`}},
 		model.ToolCallDoneEvent{ToolCall: model.ToolCall{Name: subagents.ToolSubagentStart, Arguments: `{"prompt":"missing agent secret"}`}},
+		model.ToolStartedEvent{ToolCall: model.ToolCall{Name: subagents.ToolSubagentStart, Arguments: `{"prompt":"missing agent secret"}`}},
 		model.ToolCallDoneEvent{ToolCall: model.ToolCall{Name: subagents.ToolSubagentStart, Arguments: `[`}},
+		model.ToolStartedEvent{ToolCall: model.ToolCall{Name: subagents.ToolSubagentStart, Arguments: `[`}},
 	), false, nil)
 
 	if err != nil {
@@ -12237,7 +12256,9 @@ func TestWriteStreamPutsConsecutiveToolStatusesOnIndependentLinesAfterOutputAndP
 	err := writeStreamWithOptions(&stdout, &stderr, cliEventStream(
 		model.TextDeltaEvent{Text: "partial"},
 		model.ToolCallDoneEvent{ToolCall: model.ToolCall{Name: "shell", Arguments: `{"command":"echo hidden"}`}},
+		model.ToolStartedEvent{ToolCall: model.ToolCall{Name: "shell", Arguments: `{"command":"echo hidden"}`}},
 		model.ToolCallDoneEvent{ToolCall: model.ToolCall{Name: "read_file", Arguments: `{"path":"note.txt"}`}},
+		model.ToolStartedEvent{ToolCall: model.ToolCall{Name: "read_file", Arguments: `{"path":"note.txt"}`}},
 	), false, nil, streamOutputOptions{stderrNeedsLeadingBreak: true})
 
 	if err != nil {

@@ -17,6 +17,7 @@ func TestStateApplyAggregatesBlocksAndStatus(t *testing.T) {
 		execution.NewSessionStreamEvent("reasoning.delta", map[string]any{"turn_id": "turn-1", "text": "think"}),
 		execution.NewSessionStreamEvent("reasoning.delta", map[string]any{"turn_id": "turn-1", "text": " more"}),
 		execution.NewSessionStreamEvent("text.delta", map[string]any{"turn_id": "turn-1", "text": "final"}),
+		execution.NewSessionStreamEvent("tool.requested", map[string]any{"turn_id": "turn-1", "tool_call_id": "call-1", "name": "read_file"}),
 		execution.NewSessionStreamEvent("tool.started", map[string]any{"turn_id": "turn-1", "tool_call_id": "call-1", "name": "read_file"}),
 		execution.NewSessionStreamEvent("tool.finished", map[string]any{"turn_id": "turn-1", "tool_call_id": "call-1", "name": "read_file"}),
 		execution.NewSessionStreamEvent("usage.updated", map[string]any{"turn_id": "turn-1", "input_tokens": 11, "output_tokens": 7, "total_tokens": 18}),
@@ -40,6 +41,11 @@ func TestStateApplyAggregatesBlocksAndStatus(t *testing.T) {
 func TestStateDoesNotLeakToolResultBody(t *testing.T) {
 	state := New()
 	state.Apply(execution.NewSessionStreamEvent("turn.started", map[string]any{"turn_id": "turn-1"}))
+	state.Apply(execution.NewSessionStreamEvent("tool.requested", map[string]any{
+		"turn_id":      "turn-1",
+		"tool_call_id": "call-1",
+		"name":         "shell",
+	}))
 	state.Apply(execution.NewSessionStreamEvent("tool.started", map[string]any{
 		"turn_id":      "turn-1",
 		"tool_call_id": "call-1",
@@ -76,6 +82,36 @@ func TestStateMailboxAndFailureBlocks(t *testing.T) {
 	assertBlock(t, state, BlockMailbox, "", "running")
 	assertBlock(t, state, BlockError, "turn failed", "failed")
 	assertBlock(t, state, BlockMailbox, "", "cancelled")
+}
+
+func TestStateToolRequestedWithoutStartedStaysOneBlock(t *testing.T) {
+	state := New()
+	state.Apply(execution.NewSessionStreamEvent("turn.started", map[string]any{"turn_id": "turn-1"}))
+	state.Apply(execution.NewSessionStreamEvent("tool.requested", map[string]any{
+		"turn_id":      "turn-1",
+		"tool_call_id": "call-1",
+		"name":         "shell",
+	}))
+	state.Apply(execution.NewSessionStreamEvent("tool.finished", map[string]any{
+		"turn_id":      "turn-1",
+		"tool_call_id": "call-1",
+		"name":         "shell",
+		"is_error":     true,
+	}))
+
+	if state.Status.ToolCount != 1 {
+		t.Fatalf("ToolCount = %d, want 1 (no double count)", state.Status.ToolCount)
+	}
+	toolBlocks := 0
+	for _, block := range state.Blocks {
+		if block.Kind == BlockTool {
+			toolBlocks++
+		}
+	}
+	if toolBlocks != 1 {
+		t.Fatalf("tool blocks = %d, want 1", toolBlocks)
+	}
+	assertBlock(t, state, BlockTool, "", "failed")
 }
 
 func assertBlock(t *testing.T, state *State, kind BlockKind, text, status string) {

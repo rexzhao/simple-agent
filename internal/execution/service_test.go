@@ -560,6 +560,7 @@ func TestServiceSendSessionMessageWithEventsEmitsDirectStreamEvents(t *testing.T
 		run: func(ctx context.Context, request SessionTurnRequest) (SessionTurnResult, error) {
 			request.Emit(model.TextDeltaEvent{Text: "streamed"})
 			request.Emit(model.ToolCallDoneEvent{ToolCall: model.ToolCall{ID: "call-1", Name: "read_file"}})
+			request.Emit(model.ToolStartedEvent{ToolCall: model.ToolCall{ID: "call-1", Name: "read_file"}})
 			request.Emit(model.ToolResultEvent{Result: model.ToolResult{ToolCallID: "call-1", Name: "read_file"}})
 			request.Emit(model.UsageEvent{Usage: model.Usage{InputTokens: 11, OutputTokens: 7, TotalTokens: 18}})
 			if err := request.Publisher.Publish(eventAssistant(request.TurnID, "answer")); err != nil {
@@ -584,7 +585,7 @@ func TestServiceSendSessionMessageWithEventsEmitsDirectStreamEvents(t *testing.T
 	if len(types) < 7 || types[0] != "turn.started" || types[len(types)-1] != "turn.committed" {
 		t.Fatalf("event types = %#v, want turn.started first and turn.committed last", types)
 	}
-	for _, want := range []string{"item.appended", "text.delta", "tool.started", "tool.finished", "usage.updated"} {
+	for _, want := range []string{"item.appended", "text.delta", "tool.requested", "tool.started", "tool.finished", "usage.updated"} {
 		if !stringSliceContains(types, want) {
 			t.Fatalf("event types = %#v, want contain %q", types, want)
 		}

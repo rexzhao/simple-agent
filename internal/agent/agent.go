@@ -100,7 +100,7 @@ func run(ctx context.Context, request model.Request, options Options, maxTurns i
 		}
 
 		for _, toolCall := range toolCalls {
-			result := executeToolCall(ctx, options.ToolExecutor, enabledTools, toolCall)
+			result := executeToolCall(ctx, options.ToolExecutor, enabledTools, toolCall, events)
 			if !publishDurable(events, options.Publisher, eventbus.ToolResultReady{TurnID: turnID, Result: result}, "persist tool result") {
 				return
 			}
@@ -172,7 +172,7 @@ func streamModelTurn(ctx context.Context, provider model.Provider, request model
 	return assistantContent.String(), toolCalls, false
 }
 
-func executeToolCall(ctx context.Context, executor ToolExecutor, enabledTools map[string]struct{}, toolCall model.ToolCall) model.ToolResult {
+func executeToolCall(ctx context.Context, executor ToolExecutor, enabledTools map[string]struct{}, toolCall model.ToolCall, out chan<- model.Event) model.ToolResult {
 	arguments, err := parseToolArguments(toolCall.Arguments)
 	if err != nil {
 		return toolErrorResult(toolCall, "invalid tool arguments: %v", err)
@@ -184,6 +184,7 @@ func executeToolCall(ctx context.Context, executor ToolExecutor, enabledTools ma
 		return toolErrorResult(toolCall, "tool executor is not configured")
 	}
 
+	out <- model.ToolStartedEvent{ToolCall: toolCall}
 	result, err := executor.Execute(ctx, toolCall.Name, arguments)
 	if err != nil {
 		return toolErrorResult(toolCall, "%v", err)

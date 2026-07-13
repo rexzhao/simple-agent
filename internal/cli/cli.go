@@ -5890,6 +5890,10 @@ func writeStreamWithOptions(stdout, stderr io.Writer, events <-chan model.Event,
 			if err := endReasoningForNonReasoningEvent(); err != nil {
 				return err
 			}
+		case model.ToolStartedEvent:
+			if err := endReasoningForNonReasoningEvent(); err != nil {
+				return err
+			}
 			if err := writeToolStatus(event.ToolCall); err != nil {
 				return err
 			}
