@@ -18,12 +18,20 @@ type ToolExecutor interface {
 	Execute(ctx context.Context, name string, arguments map[string]any) (model.ToolResult, error)
 }
 
+// ActivePromptDrain is an optional callback polled at safe checkpoints during an
+// active agent turn. It returns queued user messages to append to the active
+// turn history within the same TurnID. The agent loop never invokes it during a
+// provider request or a tool call, and never between assistant tool calls and
+// their tool results. A nil callback preserves the existing turn behavior.
+type ActivePromptDrain func() []model.Message
+
 type Options struct {
-	Provider     model.Provider
-	ToolExecutor ToolExecutor
-	MaxTurns     int
-	TurnID       string
-	Publisher    eventbus.Publisher
+	Provider          model.Provider
+	ToolExecutor      ToolExecutor
+	MaxTurns          int
+	TurnID            string
+	Publisher         eventbus.Publisher
+	ActivePromptDrain ActivePromptDrain
 }
 
 type TurnResult struct {
@@ -74,6 +82,16 @@ func run(ctx context.Context, request model.Request, options Options, maxTurns i
 	enabledTools := enabledToolNames(request.Tools)
 
 	for turn := 1; turn <= maxTurns; turn++ {
+		// Checkpoint: drain queued active prompts before the first provider
+		// request so appended user input is part of the initial turn history.
+		if turn == 1 {
+			var ok bool
+			messages, _, ok = drainActivePrompts(events, options.Publisher, options.ActivePromptDrain, turnID, messages)
+			if !ok {
+				return
+			}
+		}
+
 		request.Messages = messages
 
 		assistantContent, toolCalls, stopped := streamModelTurn(ctx, options.Provider, request, events)
@@ -95,6 +113,25 @@ func run(ctx context.Context, request model.Request, options Options, maxTurns i
 		}
 		messages = append(messages, assistantMessage)
 		if len(toolCalls) == 0 {
+			// Checkpoint: after a no-tool assistant response, drain queued active
+			// prompts before terminal return. Queued input extends the active
+			// turn when turns remain; at the limit it is still published (never
+			// silently dropped) and the run stops with a max_turns error.
+			var appended int
+			var ok bool
+			messages, appended, ok = drainActivePrompts(events, options.Publisher, options.ActivePromptDrain, turnID, messages)
+			if !ok {
+				return
+			}
+			if appended > 0 {
+				if turn == maxTurns {
+					events <- model.ErrorEvent{
+						Err: fmt.Errorf("agent reached max_turns %d with queued input after final response", maxTurns),
+					}
+					return
+				}
+				continue
+			}
 			sendResult(results, messages)
 			return
 		}
@@ -111,6 +148,16 @@ func run(ctx context.Context, request model.Request, options Options, maxTurns i
 				ToolCallID: result.ToolCallID,
 				IsError:    result.IsError,
 			})
+		}
+
+		// Checkpoint: after a complete assistant tool-call batch with every tool
+		// result durably published, drain queued active prompts before the next
+		// provider request. Drained user input is never inserted between
+		// assistant tool calls and their tool results.
+		var ok bool
+		messages, _, ok = drainActivePrompts(events, options.Publisher, options.ActivePromptDrain, turnID, messages)
+		if !ok {
+			return
 		}
 
 		if turn == maxTurns {
@@ -131,6 +178,32 @@ func publishDurable(out chan<- model.Event, publisher eventbus.Publisher, event 
 		return false
 	}
 	return true
+}
+
+// drainActivePrompts polls the active prompt drain callback at a safe
+// checkpoint. For every returned message it requires role user, durably
+// publishes a separate eventbus.TurnInputReady with the shared turnID, and only
+// then appends it to messages. It returns the updated messages slice, the
+// number of messages appended, and ok=false if the run must stop because a
+// drained message had a non-user role or a durable publish failed. A nil drain
+// is a no-op.
+func drainActivePrompts(out chan<- model.Event, publisher eventbus.Publisher, drain ActivePromptDrain, turnID string, messages []model.Message) ([]model.Message, int, bool) {
+	if drain == nil {
+		return messages, 0, true
+	}
+	appended := 0
+	for _, msg := range drain() {
+		if msg.Role != model.MessageRoleUser {
+			out <- model.ErrorEvent{Err: fmt.Errorf("drained prompt must have role user, got %q", msg.Role), Message: "persist turn input"}
+			return messages, appended, false
+		}
+		if !publishDurable(out, publisher, eventbus.TurnInputReady{TurnID: turnID, Message: msg}, "persist turn input") {
+			return messages, appended, false
+		}
+		messages = append(messages, msg)
+		appended++
+	}
+	return messages, appended, true
 }
 
 func sendResult(results chan<- TurnResult, messages []model.Message) {
