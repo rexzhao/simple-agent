@@ -47,6 +47,7 @@ turn.committed
 turn.failed
 text.delta
 reasoning.delta
+usage.updated
 tool.started
 tool.finished
 item.appended
@@ -62,20 +63,26 @@ active_history.replaced
 - `turn.started`、`turn.committed` 和 `turn.failed` 由 session message orchestration 发出。
 - `compact.failed` 目前是 CLI renderer 可处理的展示事件名，不是
   `internal/execution/session_events.go` 发出的 execution session stream 事件。
-- `model.UsageEvent` 当前存在，但还没有映射为 execution `SessionStreamEvent`，因此状态栏需要的
-  usage 事件属于后续 event contract gap。
+- `model.UsageEvent` 已映射为 execution `usage.updated`；状态栏可以直接消费该事件。
 
-候选新增事件或字段：
+后续需要收紧的事件或字段：
 
 ```text
-usage.updated
 status.updated
+tool.requested
+tool.started
+tool.progress
 tool.started.started_at
 tool.finished.duration_ms
 tool.finished.preview
+turn.failed.code
+turn.failed.message
 ```
 
 `tool.finished.preview` 必须是短、安全、可省略的展示摘要；第一版默认不展示 tool result body。
+当前 `tool.started` 由完成的 model tool call 映射而来，只表示调用参数已生成，不表示工具已经通过
+参数校验并开始执行。后续 contract 必须将它收紧为 `tool.requested`，并仅在 executor 实际开始时
+发出 `tool.started`。`tool.progress` 是可选 transient event；没有增量能力的工具不需要伪造 progress。
 
 ## Target Architecture
 
@@ -83,20 +90,59 @@ tool.finished.preview
 
 ```text
 execution.Service
-  -> SessionStreamEvent
-    -> Turn Block Aggregator
-      -> Plain Renderer
-      -> TUI Renderer
+  -> SessionRun / TurnController
+    -> PromptEvent queue + safe checkpoints
+    -> durable projector
+    -> execution events
+      -> Turn Block Aggregator
+        -> Plain Renderer
+        -> TUI Renderer
+      -> mailbox result adapter
 ```
 
 边界规则：
 
 - execution 只发出结构化事件并维护 session 状态。
+- `SessionRun`（最终名称可按代码风格确定）是 execution 层的一次 active run handle，统一拥有
+  append/enqueue、cancel、wait、状态和事件生命周期；CLI、TUI 和 mailbox 不各自实现运行队列。
 - Turn Block Aggregator 是 CLI 展示侧的纯逻辑层，将 stream events 和输入事件折叠成可渲染 block
   state。
 - Plain Renderer 和 TUI Renderer 都只消费 block state 或同一事件流，不重新实现 agent loop。
 - 后续可以让 plain renderer 复用 block aggregator，但第一版可以先保持现有 plain renderer，
   避免为了 TUI 重写稳定路径。
+
+## Execution Runtime Direction
+
+后续实现应参考通用 agent runtime 的 active-run、steering 和 follow-up 语义，但保留当前 execution
+library 的 project/session ownership、append-only persistence、session write lock、projector 和
+interrupted recovery。不得用只存在于进程内的 transcript 取代 durable session state。
+
+`SessionRun` / `TurnController` 的最小职责：
+
+- 表示某个 session 当前唯一的 active run，并暴露明确的 running/settled 状态。
+- 接收 `PromptEvent`，按 mode 进入 active append queue 或 next-turn queue。
+- 提供 `Cancel()`、`Wait()` 和只读 event stream；Ctrl+C 与 mailbox cancel 复用同一个 cancel 边界。
+- 在安全 checkpoint 读取 append queue；renderer 和 mailbox adapter 不直接修改 agent context。
+- durable projector 继续作为 session 真相来源；presentation observer 不参与持久化决定。
+
+事件交付需要分开 durability barrier 与 presentation observer：
+
+- assistant/tool/user item 的 durable commit 仍是同步 barrier，后续工具或 provider 请求不能越过失败的
+  持久化步骤。
+- TUI/plain renderer 是 presentation observer，不得因为终端刷新速度反向阻塞 provider stream 或
+  tool execution。
+- 连续 `text.delta` / `reasoning.delta` 可以按 turn/block 合并刷新，但不能丢失文本；tool terminal、
+  turn terminal 和失败事件必须可靠送达。
+- 内部新增事件优先使用有类型的 Go payload；现有 `SessionStreamEvent map[string]any` 可以保留为
+  renderer/兼容适配边界，不继续承担所有 execution 内部状态转换。
+
+工具执行保持串行为默认值。shell、write、edit 和多数 MCP 调用可能产生副作用，本阶段不照搬
+全局 parallel tool execution。未来若需要并发，只允许按明确的 per-tool capability 对只读工具启用，
+并另立任务定义顺序、取消和持久化规则。
+
+失败事件必须包含可安全展示的稳定分类和简短原因。日志可以保留更详细的诊断，但 execution 不应只
+发出固定的 `turn failed`，也不得把 provider response body、Authorization 或 tool result 正文泄露给
+renderer。
 
 ## Prompt Event Model
 
@@ -121,12 +167,15 @@ append_active
 推荐规则：
 
 - `enqueue_turn` 表示作为下一轮独立输入排队。
-- `append_active` 表示在当前 turn 的安全 checkpoint 追加到上下文。
+- `append_active` 表示在当前 agent run 的安全 checkpoint 追加到上下文；它不取消 provider 或工具，
+  语义等价于安全 steering，而不是抢占式 interrupt。
 - mailbox 新任务默认使用 `enqueue_turn`，不得打断 active turn。
 - TUI/interactive 用户输入在 active turn 期间可以使用 `append_active`，但必须按 M24 Phase 4
   的 checkpoint 规则实现。
 - 多个追加 prompt 应保存为同一 `turn_id` 下的多个独立 user item，不能静默合并成一段文本。
 - 追加输入不应抢占正在进行的 provider request、tool call 或 shell command。
+- active run 已进入 terminal barrier 后到达的 `append_active` 必须稳定降级为 `enqueue_turn` 或返回
+  明确状态，不能因竞态静默丢失；具体选择由首个 `SessionRun` API slice 固定并测试。
 
 `append_active` checkpoint 应与 `docs/tasks/mailbox-task-board-checklist.md` 的 checkpoint 模型对齐：
 
@@ -192,7 +241,8 @@ block 更新规则：
 - `reasoning.delta` 追加到当前 reasoning block；可见性遵循 session 保存的 `show_reasoning`，
   TUI 可以提供折叠/展开状态。
 - `text.delta` 追加到 assistant block。
-- `tool.started` 创建或更新 tool block 为 running。
+- `tool.requested` 创建 tool block；只有 `tool.started` 才更新为 running。
+- `tool.progress` 原地更新同一个 tool block，不创建重复 block。
 - `tool.finished` 更新 tool block 为 completed 或 failed。
 - `turn.failed` 创建 error block 并更新状态栏。
 - `item.appended` / `item.updated` 可用于后续补全持久化状态；第一版不要求展示完整 item body。
@@ -218,12 +268,20 @@ block 更新规则：
 
 - [x] 将 `model.UsageEvent` 映射为 execution session stream 事件，例如 `usage.updated`。
 - [x] 为状态栏确定是否需要 `status.updated`，避免 renderer 推断过多 runtime 状态；首版不新增该事件。
+- [ ] 将当前 model tool-call 完成语义从 `tool.started` 收紧为 `tool.requested`。
+- [ ] 在 executor 实际开始/更新/结束处提供 `tool.started`、可选 `tool.progress` 和 `tool.finished`。
+- [ ] 为 `turn.failed` 定义稳定、安全的 error code 和简短 message，并保持详细诊断只进入日志。
+- [ ] 将 durability barrier 与 presentation observer 分开，验证慢 renderer 不阻塞 provider/tool 执行。
+- [ ] 为连续 text/reasoning delta 定义不丢文本的展示侧合并规则。
+- [ ] 为新增 execution 内部事件使用有类型 payload，并在现有 map stream 边界做适配。
 - [ ] 确定 tool duration 是否作为事件字段提供。
 - [ ] 明确 tool preview 的脱敏、长度和 opt-in/默认隐藏规则。
 - [ ] 添加 execution 层测试覆盖新增 stream event。
 
 ### Phase 4 - PromptEvent Controller
 
+- [ ] 在 execution 层定义 `SessionRun` / `TurnController` active-run handle，拥有 cancel、wait、
+  status、event stream 和 prompt queues。
 - [ ] 定义 PromptEvent 数据结构，包括 source、mode、content、关联 mailbox task id 或输入 id。
 - [ ] 支持 `enqueue_turn` 队列语义。
 - [ ] 设计 `append_active` checkpoint 读取流程。
@@ -232,6 +290,18 @@ block 更新规则：
 - [ ] 确保 mailbox 新任务默认 queued，不打断 active turn。
 - [ ] 添加测试覆盖 active tool/shell 完成后追加输入被下一个 provider request 看到。
 - [ ] 添加测试覆盖 running final provider response 期间输入不会强插，只在安全边界处理。
+- [ ] 添加测试覆盖 terminal race 下 prompt 不丢失，并验证降级/拒绝语义。
+- [ ] CLI、TUI 和 mailbox 迁移到同一个 controller；adapter 不保留第二套 active-run 队列。
+
+Phase 3/4 必须按最小独立 slice、依赖顺序提交：
+
+1. typed execution lifecycle 与真实 tool requested/started/finished 语义。
+2. durability/presentation observer 解耦和 delta 合并，不改变用户输入行为。
+3. `SessionRun` foundation：cancel/wait/status/events，并通过现有 send API 的兼容适配保持行为不变。
+4. `PromptEvent` enqueue/append checkpoint 与独立 user item persistence。
+5. CLI/TUI/mailbox 迁移和后续 renderer usability（viewport、active input queue、状态栏）。
+
+每个 slice 必须独立通过格式化和测试，不能在同一提交中混合 foundation、调用方迁移和 TUI 样式。
 
 ### Phase 5 - Turn Block Aggregator
 
@@ -271,6 +341,9 @@ block 更新规则：
 - 第一版不默认展示 tool result body。
 - 第一版不把 TUI 设为默认。
 - 不改变现有 mailbox MCP final-output-only 结果边界。
+- 不把工具执行改为全局并行。
+- 不把 transient text/reasoning delta 逐条写入 durable session；完整 assistant/tool/user item 仍在既有
+  durable barrier 落盘，调试 delta 继续由日志承担。
 
 ## Future Acceptance Criteria
 
@@ -279,6 +352,8 @@ block 更新规则：
 - 流式输出时，已有 block 被增量更新，而不是反复追加不可关联的纯文本行。
 - 状态栏显示模型、session、turn、运行状态、耗时和 usage/context 摘要。
 - `append_active` 按 M24 checkpoint 规则实现后，运行中用户输入能在安全 checkpoint 追加到当前 turn。
+- 慢 renderer 不阻塞 provider stream 或 tool execution，且 delta 合并后文本完整。
+- tool block 区分 requested、running 和 terminal 状态，失败 turn 显示安全且可诊断的原因。
 - mailbox 任务继续串行执行；新 mailbox task 不打断 active turn。
 - mailbox MCP 结果仍只有最终 assistant output 或错误。
 - plain renderer 行为不回退。
