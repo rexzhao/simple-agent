@@ -1,8 +1,15 @@
 package execution
 
 import (
+	"errors"
 	"fmt"
 	"strings"
+)
+
+// Stable exported errors for prompt event acceptance.
+var (
+	ErrPromptEventInvalid     = errors.New("prompt event is invalid")
+	ErrPromptModeNotSupported = errors.New("prompt mode is not supported")
 )
 
 // PromptSource identifies the origin of a user prompt submitted to a session.

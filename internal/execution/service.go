@@ -195,6 +195,7 @@ var (
 	ErrSessionBusy           = errors.New("session is currently running a turn")
 	ErrTurnRunnerUnavailable = errors.New("turn runner is not configured")
 	ErrTurnFailed            = errors.New("turn failed")
+	ErrSessionRunSettled     = errors.New("session run is no longer accepting prompts")
 )
 
 // turnFailure is the safe, stable payload for a turn.failed session stream
@@ -534,10 +535,12 @@ type SessionRun struct {
 	cancel context.CancelFunc
 	done   chan struct{}
 
-	mu     sync.Mutex
-	status SessionRunStatus
-	result SessionMessageResult
-	err    error
+	mu        sync.Mutex
+	status    SessionRunStatus
+	result    SessionMessageResult
+	err       error
+	accepting bool
+	queue     []*PromptReceipt
 }
 
 // StartSessionRun begins running the session message orchestration for id in a
@@ -556,14 +559,35 @@ func (s *Service) StartSessionRun(ctx context.Context, id, content string, emit 
 	}
 	runCtx, cancel := context.WithCancel(ctx)
 	run := &SessionRun{
-		cancel: cancel,
-		done:   make(chan struct{}),
-		status: SessionRunRunning,
+		cancel:    cancel,
+		done:      make(chan struct{}),
+		status:    SessionRunRunning,
+		accepting: true,
 	}
 	go func() {
 		defer cancel()
 		defer close(run.done)
 		result, err := s.runSessionMessage(runCtx, id, content, emit)
+		if err == nil {
+			for {
+				receipt, ok := run.nextReceiptOrStop()
+				if !ok {
+					break
+				}
+				turnResult, turnErr := s.runSessionMessage(runCtx, id, receipt.event.Content, emit)
+				if turnErr != nil {
+					effErr := run.effectiveError(turnErr, runCtx)
+					receipt.settle(turnResult, effErr)
+					run.failRemaining(effErr)
+					run.settle(turnResult, turnErr, runCtx)
+					return
+				}
+				receipt.settle(turnResult, nil)
+				result = turnResult
+			}
+		} else {
+			run.failRemaining(run.effectiveError(err, runCtx))
+		}
 		run.settle(result, err, runCtx)
 	}()
 	return run
@@ -614,6 +638,114 @@ func (r *SessionRun) settle(result SessionMessageResult, err error, runCtx conte
 	}
 	r.status = SessionRunFailed
 	r.err = err
+}
+
+// Enqueue submits a validated enqueue_turn prompt to be processed as an
+// independent durable session turn after the current turn completes, using the
+// same emit path. It returns a per-event receipt whose Wait reports that turn's
+// result or error.
+//
+// Events are accepted only while the run is still running and accepting. A
+// structurally invalid event is rejected with ErrPromptEventInvalid. An
+// append_active (or any non-enqueue_turn) mode is rejected with
+// ErrPromptModeNotSupported. Once the run has drained its queue and begun
+// settling, further enqueues are rejected with ErrSessionRunSettled. Accepted
+// events are processed FIFO; if a turn fails or is cancelled, every
+// already-accepted but unstarted receipt is settled with the same effective
+// error and never silently dropped. The empty-queue terminal transition and
+// Enqueue are coordinated under the run lock, so a racing enqueue is either
+// accepted and processed or explicitly rejected.
+func (r *SessionRun) Enqueue(event PromptEvent) (*PromptReceipt, error) {
+	if r == nil {
+		return nil, ErrSessionRunSettled
+	}
+	if err := event.Validate(); err != nil {
+		return nil, fmt.Errorf("%w: %s", ErrPromptEventInvalid, err)
+	}
+	if event.Mode != PromptModeEnqueueTurn {
+		return nil, ErrPromptModeNotSupported
+	}
+	r.mu.Lock()
+	if !r.accepting {
+		r.mu.Unlock()
+		return nil, ErrSessionRunSettled
+	}
+	receipt := &PromptReceipt{event: event, done: make(chan struct{})}
+	r.queue = append(r.queue, receipt)
+	r.mu.Unlock()
+	return receipt, nil
+}
+
+// nextReceiptOrStop returns the next accepted receipt to process. If the queue
+// is empty it marks the run no-longer-accepting and returns ok=false so the run
+// goroutine can settle. The accept/terminal decision is made under the run
+// lock, so a racing Enqueue is either accepted before this call (and returned
+// here) or rejected after this call marks the run terminal.
+func (r *SessionRun) nextReceiptOrStop() (*PromptReceipt, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if len(r.queue) > 0 {
+		receipt := r.queue[0]
+		r.queue = r.queue[1:]
+		return receipt, true
+	}
+	r.accepting = false
+	return nil, false
+}
+
+// failRemaining settles every still-queued (unstarted) receipt with err and
+// marks the run no-longer-accepting. It is called from the run goroutine when a
+// turn fails or is cancelled, so already-accepted prompts are never silently
+// dropped.
+func (r *SessionRun) failRemaining(err error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.accepting = false
+	for _, receipt := range r.queue {
+		receipt.settle(SessionMessageResult{}, err)
+	}
+	r.queue = nil
+}
+
+// effectiveError collapses a turn error to context.Canceled when the run's child
+// context was cancelled, mirroring the status derivation in settle.
+func (r *SessionRun) effectiveError(err error, runCtx context.Context) error {
+	if errors.Is(err, context.Canceled) || runCtx.Err() == context.Canceled {
+		return context.Canceled
+	}
+	return err
+}
+
+// PromptReceipt is the per-event handle returned by SessionRun.Enqueue. Wait
+// blocks until the enqueued prompt's turn completes and returns that turn's
+// result and error. It is safe to call concurrently and repeatedly.
+type PromptReceipt struct {
+	event PromptEvent
+	done  chan struct{}
+
+	mu     sync.Mutex
+	result SessionMessageResult
+	err    error
+}
+
+// Wait blocks until the enqueued prompt's turn completes and returns its result
+// and error. Every call returns the same values.
+func (r *PromptReceipt) Wait() (SessionMessageResult, error) {
+	<-r.done
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.result, r.err
+}
+
+// settle records the terminal result/error for the receipt and unblocks Wait.
+// It is called exactly once per receipt, either after its turn completes or via
+// failRemaining when an earlier turn failed.
+func (r *PromptReceipt) settle(result SessionMessageResult, err error) {
+	r.mu.Lock()
+	r.result = result
+	r.err = err
+	r.mu.Unlock()
+	close(r.done)
 }
 
 func (s *Service) runSessionMessage(ctx context.Context, id, content string, emit func(SessionStreamEvent)) (SessionMessageResult, error) {
