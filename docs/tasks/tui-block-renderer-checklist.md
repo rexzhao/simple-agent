@@ -288,7 +288,7 @@ block 更新规则：
 
 - [ ] 在 execution 层定义 `SessionRun` / `TurnController` active-run handle，拥有 cancel、wait、
   status、event stream 和 prompt queues。
-- [ ] 定义 PromptEvent 数据结构，包括 source、mode、content、关联 mailbox task id 或输入 id。
+- [x] 定义 PromptEvent 数据结构，包括 source、mode、content、关联 mailbox task id 或输入 id。
 - [ ] 支持 `enqueue_turn` 队列语义。
 - [ ] 设计 `append_active` checkpoint 读取流程。
 - [ ] 确保 provider request、tool call 和 shell command 不被抢占中断。
