@@ -59,9 +59,10 @@ func (r AgentTurnRunner) RunSessionTurn(ctx context.Context, request SessionTurn
 	}()
 
 	if _, err := runtime.runSessionTurn(ctx, request.Content, sessionTurnRunOptions{
-		emit:      request.Emit,
-		publisher: request.Publisher,
-		turnID:    request.TurnID,
+		emit:              request.Emit,
+		publisher:         request.Publisher,
+		turnID:            request.TurnID,
+		activePromptDrain: request.ActivePromptDrain,
 	}); err != nil {
 		return SessionTurnResult{}, err
 	}
@@ -368,9 +369,37 @@ func (r *agentRunnerRuntime) refreshSessionRuntimeMetadata(session sessions.Sess
 }
 
 type sessionTurnRunOptions struct {
-	emit      func(model.Event)
-	publisher eventbus.Publisher
-	turnID    string
+	emit              func(model.Event)
+	publisher         eventbus.Publisher
+	turnID            string
+	activePromptDrain SessionActivePromptDrain
+}
+
+// adaptActivePromptDrain adapts an execution-domain active prompt drain into
+// the agent-loop callback. A nil drain adapts to nil so the agent loop treats it
+// as a no-op. Each agent checkpoint is mapped explicitly to the matching
+// execution checkpoint; an unrecognized agent checkpoint is a programmer error
+// and fails loudly rather than silently mis-mapping.
+func adaptActivePromptDrain(drain SessionActivePromptDrain) agent.ActivePromptDrain {
+	if drain == nil {
+		return nil
+	}
+	return func(checkpoint agent.ActivePromptCheckpoint) []model.Message {
+		return drain(toSessionActivePromptCheckpoint(checkpoint))
+	}
+}
+
+func toSessionActivePromptCheckpoint(checkpoint agent.ActivePromptCheckpoint) SessionActivePromptCheckpoint {
+	switch checkpoint {
+	case agent.ActivePromptCheckpointBeforeProvider:
+		return SessionActivePromptCheckpointBeforeProvider
+	case agent.ActivePromptCheckpointAfterToolBatch:
+		return SessionActivePromptCheckpointAfterToolBatch
+	case agent.ActivePromptCheckpointBeforeTerminal:
+		return SessionActivePromptCheckpointBeforeTerminal
+	default:
+		panic(fmt.Sprintf("execution: unknown agent active prompt checkpoint %d", checkpoint))
+	}
 }
 
 func (r *agentRunnerRuntime) runSessionTurn(ctx context.Context, prompt string, options sessionTurnRunOptions) ([]model.Message, error) {
@@ -395,11 +424,12 @@ func (r *agentRunnerRuntime) runSessionTurn(ctx context.Context, prompt string, 
 		Parameters: r.parameters,
 	}
 	events, results, err := agent.StreamWithResult(turnCtx, request, agent.Options{
-		Provider:     r.provider,
-		ToolExecutor: r.toolExecutor,
-		MaxTurns:     r.maxTurns,
-		TurnID:       options.turnID,
-		Publisher:    options.publisher,
+		Provider:          r.provider,
+		ToolExecutor:      r.toolExecutor,
+		MaxTurns:          r.maxTurns,
+		TurnID:            options.turnID,
+		Publisher:         options.publisher,
+		ActivePromptDrain: adaptActivePromptDrain(options.activePromptDrain),
 	})
 	if err != nil {
 		return nil, err

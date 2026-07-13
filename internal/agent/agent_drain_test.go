@@ -11,17 +11,20 @@ import (
 )
 
 // drainSequence returns a drain callback that returns the given batches in
-// order, one per call, then nil thereafter.
-func drainSequence(batches ...[]model.Message) (ActivePromptDrain, *int) {
+// order, one per call, then nil thereafter. It also records the checkpoint
+// passed to each call so tests can assert checkpoint order.
+func drainSequence(batches ...[]model.Message) (ActivePromptDrain, *[]ActivePromptCheckpoint) {
 	calls := 0
-	drain := ActivePromptDrain(func() []model.Message {
+	var checkpoints []ActivePromptCheckpoint
+	drain := ActivePromptDrain(func(cp ActivePromptCheckpoint) []model.Message {
 		calls++
+		checkpoints = append(checkpoints, cp)
 		if calls <= len(batches) {
 			return batches[calls-1]
 		}
 		return nil
 	})
-	return drain, &calls
+	return drain, &checkpoints
 }
 
 func publisherKinds(publisher *fakePublisher) []string {
@@ -42,6 +45,18 @@ func publisherTurnInputReady(publisher *fakePublisher) []model.Message {
 	return msgs
 }
 
+func equalCheckpoints(got []ActivePromptCheckpoint, want ...ActivePromptCheckpoint) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	for i := range got {
+		if got[i] != want[i] {
+			return false
+		}
+	}
+	return true
+}
+
 func TestStreamDrainsActivePromptsBeforeFirstProviderRequest(t *testing.T) {
 	provider := &fakeProvider{
 		turns: [][]model.Event{
@@ -50,7 +65,7 @@ func TestStreamDrainsActivePromptsBeforeFirstProviderRequest(t *testing.T) {
 	}
 	publisher := &fakePublisher{}
 	// First drain call (checkpoint 1) returns queued input; later calls nil.
-	drain, calls := drainSequence([]model.Message{
+	drain, checkpoints := drainSequence([]model.Message{
 		{Role: model.MessageRoleUser, Content: "pre-queued"},
 	})
 
@@ -82,9 +97,9 @@ func TestStreamDrainsActivePromptsBeforeFirstProviderRequest(t *testing.T) {
 	if first[0].Role != model.MessageRoleUser || first[1].Role != model.MessageRoleUser {
 		t.Fatalf("first request roles = %q/%q, want both user", first[0].Role, first[1].Role)
 	}
-	// Drain is polled again at checkpoint 3 (no-tool terminal), so 2 calls total.
-	if *calls != 2 {
-		t.Fatalf("drain calls = %d, want 2", *calls)
+	// Drained at BeforeProvider (turn 1) then BeforeTerminal (no-tool terminal).
+	if !equalCheckpoints(*checkpoints, ActivePromptCheckpointBeforeProvider, ActivePromptCheckpointBeforeTerminal) {
+		t.Fatalf("checkpoints = %#v, want BeforeProvider then BeforeTerminal", *checkpoints)
 	}
 	if got := publisherKinds(publisher); !equalStrings(got, []string{eventbus.KindTurnInputReady, eventbus.KindAssistantReady}) {
 		t.Fatalf("publisher kinds = %#v, want TurnInputReady then AssistantReady", got)
@@ -113,7 +128,7 @@ func TestStreamDrainsActivePromptsAfterToolBatchAsSeparateUserItems(t *testing.T
 	publisher := &fakePublisher{}
 	// Checkpoint 1 (turn 1) nil; checkpoint 2 (after tool batch) returns two
 	// queued user messages; checkpoint 3 (turn 2 terminal) nil.
-	drain, _ := drainSequence(
+	drain, checkpoints := drainSequence(
 		nil,
 		[]model.Message{
 			{Role: model.MessageRoleUser, Content: "more1"},
@@ -160,6 +175,11 @@ func TestStreamDrainsActivePromptsAfterToolBatchAsSeparateUserItems(t *testing.T
 	assertAgentMessage(t, second[4], model.MessageRoleUser, "more1", "")
 	assertAgentMessage(t, second[5], model.MessageRoleUser, "more2", "")
 
+	// BeforeProvider (turn 1) -> AfterToolBatch (turn 1) -> BeforeTerminal (turn 2).
+	if !equalCheckpoints(*checkpoints, ActivePromptCheckpointBeforeProvider, ActivePromptCheckpointAfterToolBatch, ActivePromptCheckpointBeforeTerminal) {
+		t.Fatalf("checkpoints = %#v, want BeforeProvider, AfterToolBatch, BeforeTerminal", *checkpoints)
+	}
+
 	wantKinds := []string{
 		eventbus.KindAssistantReady,
 		eventbus.KindToolResultReady,
@@ -187,7 +207,7 @@ func TestStreamDrainsActivePromptsAfterNoToolResponseExtendsTurn(t *testing.T) {
 	publisher := &fakePublisher{}
 	// Checkpoint 1 nil; checkpoint 3 after "first" returns a followup; checkpoint
 	// 3 after "second" nil (terminal).
-	drain, _ := drainSequence(
+	drain, checkpoints := drainSequence(
 		nil,
 		[]model.Message{{Role: model.MessageRoleUser, Content: "followup"}},
 	)
@@ -227,6 +247,12 @@ func TestStreamDrainsActivePromptsAfterNoToolResponseExtendsTurn(t *testing.T) {
 	}
 	assertAgentMessage(t, turnResult.Messages[3], model.MessageRoleAssistant, "second", "")
 
+	// BeforeProvider (turn 1) -> BeforeTerminal after "first" (extends) ->
+	// BeforeTerminal after "second" (terminal).
+	if !equalCheckpoints(*checkpoints, ActivePromptCheckpointBeforeProvider, ActivePromptCheckpointBeforeTerminal, ActivePromptCheckpointBeforeTerminal) {
+		t.Fatalf("checkpoints = %#v, want BeforeProvider, BeforeTerminal, BeforeTerminal", *checkpoints)
+	}
+
 	wantKinds := []string{
 		eventbus.KindAssistantReady,
 		eventbus.KindTurnInputReady,
@@ -244,7 +270,7 @@ func TestStreamDrainRejectsNonUserRoleAndStops(t *testing.T) {
 		},
 	}
 	publisher := &fakePublisher{}
-	drain, _ := drainSequence([]model.Message{
+	drain, checkpoints := drainSequence([]model.Message{
 		{Role: model.MessageRoleAssistant, Content: "bad role"},
 	})
 
@@ -272,6 +298,10 @@ func TestStreamDrainRejectsNonUserRoleAndStops(t *testing.T) {
 	if len(publisher.events) != 0 {
 		t.Fatalf("publisher events = %#v, want none before role validation", publisher.events)
 	}
+	// Rejected at BeforeProvider (turn 1), before any provider request.
+	if !equalCheckpoints(*checkpoints, ActivePromptCheckpointBeforeProvider) {
+		t.Fatalf("checkpoints = %#v, want BeforeProvider", *checkpoints)
+	}
 }
 
 func TestStreamDrainPublishFailureStopsRun(t *testing.T) {
@@ -288,7 +318,7 @@ func TestStreamDrainPublishFailureStopsRun(t *testing.T) {
 	}
 	executor := &fakeToolExecutor{result: model.ToolResult{Name: "echo", Content: "tool output"}}
 	publisher := &fakePublisher{errKind: eventbus.KindTurnInputReady, err: publishErr}
-	drain, _ := drainSequence(
+	drain, checkpoints := drainSequence(
 		nil,
 		[]model.Message{{Role: model.MessageRoleUser, Content: "queued"}},
 	)
@@ -321,6 +351,10 @@ func TestStreamDrainPublishFailureStopsRun(t *testing.T) {
 	// TurnInputReady; the failed event is also recorded by the fake publisher.
 	if got := publisherKinds(publisher); !equalStrings(got, []string{eventbus.KindAssistantReady, eventbus.KindToolResultReady, eventbus.KindTurnInputReady}) {
 		t.Fatalf("publisher kinds = %#v, want AssistantReady, ToolResultReady, TurnInputReady", got)
+	}
+	// BeforeProvider (turn 1) -> AfterToolBatch (publish failure stops run).
+	if !equalCheckpoints(*checkpoints, ActivePromptCheckpointBeforeProvider, ActivePromptCheckpointAfterToolBatch) {
+		t.Fatalf("checkpoints = %#v, want BeforeProvider, AfterToolBatch", *checkpoints)
 	}
 }
 
@@ -380,7 +414,7 @@ func TestStreamDrainAtMaxTurnsWithQueuedInputStopsExplicitly(t *testing.T) {
 	publisher := &fakePublisher{}
 	// Checkpoint 1 nil; checkpoint 3 after the final response returns queued
 	// input, but the run is already at the turn limit.
-	drain, _ := drainSequence(
+	drain, checkpoints := drainSequence(
 		nil,
 		[]model.Message{{Role: model.MessageRoleUser, Content: "late"}},
 	)
@@ -412,6 +446,10 @@ func TestStreamDrainAtMaxTurnsWithQueuedInputStopsExplicitly(t *testing.T) {
 	wantKinds := []string{eventbus.KindAssistantReady, eventbus.KindTurnInputReady}
 	if got := publisherKinds(publisher); !equalStrings(got, wantKinds) {
 		t.Fatalf("publisher kinds = %#v, want AssistantReady then TurnInputReady", got)
+	}
+	// BeforeProvider (turn 1) -> BeforeTerminal (queued input at the limit).
+	if !equalCheckpoints(*checkpoints, ActivePromptCheckpointBeforeProvider, ActivePromptCheckpointBeforeTerminal) {
+		t.Fatalf("checkpoints = %#v, want BeforeProvider, BeforeTerminal", *checkpoints)
 	}
 }
 

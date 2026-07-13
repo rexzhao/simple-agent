@@ -166,7 +166,36 @@ type SessionTurnRequest struct {
 	Content      string
 	Emit         func(model.Event)
 	Publisher    eventbus.Publisher
+	// ActivePromptDrain is an optional callback polled at safe checkpoints
+	// during the active turn. When set, AgentTurnRunner adapts it into the
+	// agent-loop active prompt drain so queued user messages are appended to the
+	// active turn history within the same TurnID. A nil drain is a no-op.
+	ActivePromptDrain SessionActivePromptDrain
 }
+
+// SessionActivePromptCheckpoint identifies a safe point in an active session
+// turn where queued active prompts may be drained. It mirrors
+// agent.ActivePromptCheckpoint in the execution domain; AgentTurnRunner adapts
+// between the two.
+type SessionActivePromptCheckpoint int
+
+const (
+	// SessionActivePromptCheckpointBeforeProvider is the checkpoint before the
+	// first provider request of the turn.
+	SessionActivePromptCheckpointBeforeProvider SessionActivePromptCheckpoint = iota
+	// SessionActivePromptCheckpointAfterToolBatch is the checkpoint after a
+	// complete assistant tool-call batch with every tool result durably
+	// published.
+	SessionActivePromptCheckpointAfterToolBatch
+	// SessionActivePromptCheckpointBeforeTerminal is the checkpoint after a
+	// no-tool assistant response, before terminal return.
+	SessionActivePromptCheckpointBeforeTerminal
+)
+
+// SessionActivePromptDrain returns queued user messages to append to the active
+// turn history at the given checkpoint. It is the execution-domain counterpart
+// of agent.ActivePromptDrain.
+type SessionActivePromptDrain func(SessionActivePromptCheckpoint) []model.Message
 
 type SessionCompactionRequest struct {
 	Session      sessions.SessionV2
