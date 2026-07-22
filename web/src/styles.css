@@ -30,21 +30,19 @@ svg { width: 1.1em; height: 1.1em; fill: none; stroke: currentColor; stroke-widt
 
 .app-shell {
   display: grid;
-  grid-template-columns: 228px 292px minmax(0, 1fr);
+  grid-template-columns: 310px minmax(0, 1fr);
   height: 100%;
   background: var(--bg);
 }
 
-.project-rail, .session-rail {
+.project-rail {
   min-width: 0;
   display: flex;
   flex-direction: column;
   background: #0e1117;
   border-right: 1px solid var(--border-soft);
+  padding: 20px 12px 14px;
 }
-
-.project-rail { padding: 20px 12px 14px; }
-.session-rail { background: #11141b; }
 
 .brand {
   display: flex;
@@ -75,19 +73,29 @@ svg { width: 1.1em; height: 1.1em; fill: none; stroke: currentColor; stroke-widt
   text-transform: uppercase;
 }
 
-.project-list, .session-list {
+.project-tree {
+  flex: 1;
   min-height: 0;
   overflow: auto;
   display: flex;
   flex-direction: column;
-  gap: 4px;
+  gap: 8px;
+  padding-right: 3px;
+  scrollbar-color: #282e39 transparent;
 }
 
-.project-list { flex: 1; }
-.session-list { padding: 0 10px 16px; }
+.project-tree-group { min-width: 0; }
+.project-tree-header {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  border-radius: 9px;
+  transition: background .15s ease;
+}
+.project-tree-header:hover { background: var(--panel-hover); }
+.project-tree-header.selected { background: rgba(124, 109, 242, .09); }
 
-.project-button, .session-button {
-  width: 100%;
+.project-node, .session-tree-button {
   border: 0;
   background: transparent;
   display: flex;
@@ -98,9 +106,8 @@ svg { width: 1.1em; height: 1.1em; fill: none; stroke: currentColor; stroke-widt
   transition: background .15s ease, color .15s ease;
 }
 
-.project-button { gap: 9px; padding: 9px; border-radius: 9px; }
-.project-button:hover, .session-button:hover { background: var(--panel-hover); color: var(--text); }
-.project-button.selected, .session-button.selected { background: var(--accent-soft); color: var(--text); }
+.project-node { flex: 1; min-width: 0; gap: 9px; padding: 9px 5px 9px 9px; border-radius: 9px; }
+.project-node:hover, .session-tree-button:hover { color: var(--text); }
 
 .project-avatar {
   width: 29px;
@@ -116,46 +123,99 @@ svg { width: 1.1em; height: 1.1em; fill: none; stroke: currentColor; stroke-widt
   font-weight: 750;
 }
 
-.project-button-copy, .session-copy { min-width: 0; display: flex; flex-direction: column; gap: 3px; }
+.project-button-copy, .session-copy { min-width: 0; display: flex; flex: 1; flex-direction: column; gap: 3px; }
 .project-button-copy strong, .session-copy strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; font-weight: 600; }
 .project-button-copy small, .session-copy small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--faint); font-size: 10.5px; }
+.project-session-count { min-width: 20px; padding: 2px 6px; border-radius: 9px; color: #707887; background: #171b22; text-align: center; font-size: 9.5px; }
+
+.tree-icon-button {
+  width: 27px;
+  height: 27px;
+  flex: 0 0 auto;
+  display: grid;
+  place-items: center;
+  margin-right: 5px;
+  border: 0;
+  border-radius: 7px;
+  color: #8e85e8;
+  background: transparent;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity .15s ease, background .15s ease;
+}
+.project-tree-header:hover .tree-icon-button, .tree-icon-button:focus-visible { opacity: 1; }
+.tree-icon-button:hover { color: white; background: var(--accent); }
+.tree-icon-button:disabled { cursor: default; opacity: 0; }
+
+.session-tree {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin: 2px 0 3px 23px;
+  padding: 2px 0 2px 12px;
+  border-left: 1px solid #252b36;
+}
+
+.session-tree-row { position: relative; display: flex; align-items: center; min-width: 0; border-radius: 8px; }
+.session-tree-row:hover { background: var(--panel-hover); }
+.session-tree-row.selected { background: var(--accent-soft); }
+.session-tree-button { flex: 1; min-width: 0; gap: 8px; padding: 8px 5px 8px 7px; border-radius: 8px; }
+.session-tree-button:disabled { opacity: .5; cursor: default; }
+.session-tree-row.selected .session-tree-button { color: var(--text); }
+
+.session-icon { width: 25px; height: 25px; display: grid; place-items: center; flex: 0 0 auto; border-radius: 7px; background: #191d25; color: #747e8e; }
+.session-icon svg { width: 14px; height: 14px; }
+.session-tree-row.selected .session-icon { color: #b0a7ff; background: #272241; }
+.live-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--success); box-shadow: 0 0 0 3px rgba(85,199,149,.12); margin-left: auto; }
+
+.session-tree-actions {
+  display: flex;
+  gap: 1px;
+  padding-right: 4px;
+  opacity: 0;
+  transition: opacity .15s ease;
+}
+.session-tree-row:hover .session-tree-actions, .session-tree-row:focus-within .session-tree-actions { opacity: 1; }
+.session-tree-actions button {
+  width: 25px;
+  height: 25px;
+  display: grid;
+  place-items: center;
+  border: 0;
+  border-radius: 6px;
+  color: #7e8795;
+  background: transparent;
+  cursor: pointer;
+}
+.session-tree-actions button:hover { color: #c4c9d2; background: #262c36; }
+.session-tree-actions button.danger:hover { color: #ff9299; background: rgba(239, 106, 114, .11); }
+.session-tree-actions button:disabled { opacity: .35; cursor: default; }
+.session-tree-actions svg { width: 13px; height: 13px; }
+
+.tree-expand-button {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  width: fit-content;
+  margin: 3px 0 1px 7px;
+  padding: 4px 7px;
+  border: 0;
+  border-radius: 6px;
+  color: #747d8b;
+  background: transparent;
+  cursor: pointer;
+  font-size: 10.5px;
+}
+.tree-expand-button:hover { color: #b8bec8; background: #171b22; }
+.tree-expand-button svg { width: 13px; height: 13px; transition: transform .15s ease; }
+.tree-expand-button svg.expanded { transform: rotate(180deg); }
+.tree-empty { margin: 5px 0 4px 8px; color: #505866; font-size: 10.5px; }
 
 .project-rail-footer { display: flex; flex-direction: column; gap: 11px; padding: 10px 7px 0; }
 .version { color: #4f5662; font-size: 10px; text-align: center; }
 
-.session-header {
-  min-height: 84px;
-  padding: 17px 18px 14px;
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  border-bottom: 1px solid var(--border-soft);
-}
-
 .eyebrow { display: block; color: var(--faint); font-size: 10px; font-weight: 750; letter-spacing: .12em; text-transform: uppercase; }
-.session-header h2 { max-width: 205px; margin: 5px 0 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 15px; font-weight: 650; }
-
-.icon-button {
-  width: 31px;
-  height: 31px;
-  display: grid;
-  place-items: center;
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  background: var(--panel-soft);
-  cursor: pointer;
-}
-
-.icon-button.accent { border-color: transparent; background: var(--accent); color: white; }
-.icon-button:disabled { opacity: .4; cursor: default; }
-
-.session-button { position: relative; gap: 10px; padding: 10px; border-radius: 9px; }
-.session-button:disabled { opacity: .5; cursor: default; }
-.session-icon { width: 27px; height: 27px; display: grid; place-items: center; flex: 0 0 auto; border-radius: 7px; background: #191d25; color: #747e8e; }
-.session-icon svg { width: 15px; height: 15px; }
-.session-button.selected .session-icon { color: #b0a7ff; background: #272241; }
-.live-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--success); box-shadow: 0 0 0 3px rgba(85,199,149,.12); margin-left: auto; }
-.rail-empty { color: var(--faint); text-align: center; font-size: 12px; padding: 36px 10px; }
 
 .conversation-panel { position: relative; min-width: 0; min-height: 0; background: #0b0d12; }
 .conversation { display: grid; grid-template-rows: auto minmax(0, 1fr) auto; height: 100%; }
@@ -303,16 +363,16 @@ svg { width: 1.1em; height: 1.1em; fill: none; stroke: currentColor; stroke-widt
 @keyframes shimmer { 50% { background: #1e232c; } }
 
 @media (max-width: 980px) {
-  .app-shell { grid-template-columns: 72px 260px minmax(0, 1fr); }
-  .project-rail { padding-inline: 9px; }
-  .brand { justify-content: center; padding: 0; }
-  .brand span, .project-rail .rail-label, .project-button-copy, .project-rail-footer .secondary-button { display: none; }
-  .project-button { justify-content: center; padding: 8px; }
+  .app-shell { grid-template-columns: 270px minmax(0, 1fr); }
+  .project-rail { padding-inline: 10px; }
 }
 
 @media (max-width: 700px) {
-  .app-shell { grid-template-columns: 58px minmax(0, 1fr); }
-  .session-rail { display: none; }
+  .app-shell { grid-template-columns: 230px minmax(0, 1fr); }
+  .project-rail { padding-inline: 8px; }
+  .project-button-copy small, .session-copy small { display: none; }
+  .session-tree { margin-left: 16px; padding-left: 8px; }
+  .session-tree-actions { opacity: 1; }
   .conversation-header { padding-inline: 17px; }
   .conversation-header .secondary-button { display: none; }
   .messages, .composer-wrap { padding-left: 18px; padding-right: 18px; }

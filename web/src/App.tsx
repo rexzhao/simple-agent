@@ -5,7 +5,7 @@ import type { ActiveRun, Bootstrap, ItemsPage, Project, RunEvent, Session, Sessi
 function App() {
   const [bootstrap, setBootstrap] = useState<Bootstrap | null>(null)
   const [projects, setProjects] = useState<Project[]>([])
-  const [sessions, setSessions] = useState<Session[]>([])
+  const [sessionsByProject, setSessionsByProject] = useState<Record<string, Session[]>>({})
   const [selectedProjectID, setSelectedProjectID] = useState('')
   const [selectedSessionID, setSelectedSessionID] = useState('')
   const [sessionDetail, setSessionDetail] = useState<Session | null>(null)
@@ -14,27 +14,41 @@ function App() {
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
   const [showProjectForm, setShowProjectForm] = useState(false)
+  const selectedProjectRef = useRef('')
   const selectedSessionRef = useRef('')
 
+  selectedProjectRef.current = selectedProjectID
   selectedSessionRef.current = selectedSessionID
 
   const loadProjects = useCallback(async () => {
     const payload = await api.projects()
     setProjects(payload.projects)
+    setSessionsByProject((current) => Object.fromEntries(
+      payload.projects.map((project) => [project.id, current[project.id] ?? []]),
+    ))
     setSelectedProjectID((current) => {
       if (current && payload.projects.some((project) => project.id === current)) return current
       return payload.projects[0]?.id ?? ''
     })
+    return payload.projects
   }, [])
 
   useEffect(() => {
     let cancelled = false
     void Promise.all([api.bootstrap(), api.projects()])
-      .then(([bootstrapPayload, projectsPayload]) => {
+      .then(async ([bootstrapPayload, projectsPayload]) => {
+        const sessionEntries = await Promise.all(projectsPayload.projects.map(async (project) => {
+          const payload = await api.sessions(project.id)
+          return [project.id, orderSessions(payload.sessions)] as const
+        }))
         if (cancelled) return
+        const sessionMap = Object.fromEntries(sessionEntries)
+        const firstProjectID = projectsPayload.projects[0]?.id ?? ''
         setBootstrap(bootstrapPayload)
         setProjects(projectsPayload.projects)
-        setSelectedProjectID(projectsPayload.projects[0]?.id ?? '')
+        setSessionsByProject(sessionMap)
+        setSelectedProjectID(firstProjectID)
+        setSelectedSessionID(sessionMap[firstProjectID]?.[0]?.id ?? '')
         setShowProjectForm(projectsPayload.projects.length === 0)
       })
       .catch((reason: unknown) => setError(errorMessage(reason)))
@@ -44,30 +58,21 @@ function App() {
 
   const loadSessions = useCallback(async (projectID: string, preferredSessionID = '') => {
     if (!projectID) {
-      setSessions([])
       setSelectedSessionID('')
-      return
+      return []
     }
     const payload = await api.sessions(projectID)
-    const ordered = [...payload.sessions].sort((a, b) => sessionTimestamp(b) - sessionTimestamp(a))
-    setSessions(ordered)
-    setSelectedSessionID((current) => {
-      const preferred = preferredSessionID || current
-      if (preferred && ordered.some((session) => session.id === preferred)) return preferred
-      return ordered[0]?.id ?? ''
-    })
-  }, [])
-
-  useEffect(() => {
-    setSelectedSessionID('')
-    setSessionDetail(null)
-    setItemsPage(null)
-    if (!selectedProjectID) {
-      setSessions([])
-      return
+    const ordered = orderSessions(payload.sessions)
+    setSessionsByProject((current) => ({ ...current, [projectID]: ordered }))
+    if (selectedProjectRef.current === projectID) {
+      setSelectedSessionID((current) => {
+        const preferred = preferredSessionID || current
+        if (preferred && ordered.some((session) => session.id === preferred)) return preferred
+        return ordered[0]?.id ?? ''
+      })
     }
-    void loadSessions(selectedProjectID).catch((reason: unknown) => setError(errorMessage(reason)))
-  }, [selectedProjectID, loadSessions])
+    return ordered
+  }, [])
 
   const refreshSession = useCallback(async (sessionID: string) => {
     if (!sessionID) return
@@ -94,19 +99,74 @@ function App() {
       const result = await api.createProject(root, displayName)
       await loadProjects()
       setSelectedProjectID(result.project.id)
+      setSelectedSessionID('')
+      await loadSessions(result.project.id)
       setShowProjectForm(false)
     } catch (reason) {
       setError(errorMessage(reason))
     }
   }
 
-  const createSession = async () => {
-    if (!selectedProjectID) return
+  const createSession = async (projectID = selectedProjectID) => {
+    if (!projectID) return
     try {
-      const session = await api.createSession(selectedProjectID)
-      await loadSessions(selectedProjectID, session.id)
+      const session = await api.createSession(projectID)
+      setSelectedProjectID(projectID)
+      await loadSessions(projectID, session.id)
       setSelectedSessionID(session.id)
+      setShowProjectForm(false)
     } catch (reason) {
+      setError(errorMessage(reason))
+    }
+  }
+
+  const selectProject = (projectID: string) => {
+    if (activeRun) return
+    setSelectedProjectID(projectID)
+    setSelectedSessionID(sessionsByProject[projectID]?.[0]?.id ?? '')
+    setShowProjectForm(false)
+  }
+
+  const selectSession = (projectID: string, sessionID: string) => {
+    if (activeRun && sessionID !== selectedSessionID) return
+    setSelectedProjectID(projectID)
+    setSelectedSessionID(sessionID)
+    setShowProjectForm(false)
+  }
+
+  const removeSessionFromTree = (session: Session) => {
+    const remaining = (sessionsByProject[session.project_id] ?? []).filter((item) => item.id !== session.id)
+    setSessionsByProject((current) => ({ ...current, [session.project_id]: remaining }))
+    if (selectedSessionID === session.id) {
+      setSelectedProjectID(session.project_id)
+      setSelectedSessionID(remaining[0]?.id ?? '')
+      setSessionDetail(null)
+      setItemsPage(null)
+    }
+  }
+
+  const archiveSession = async (session: Session) => {
+    if (activeRun || !window.confirm(`归档“${sessionName(session)}”？归档后会从当前列表隐藏。`)) return
+    try {
+      await api.archiveSession(session.id)
+      removeSessionFromTree(session)
+    } catch (reason) {
+      setError(errorMessage(reason))
+    }
+  }
+
+  const deleteSession = async (session: Session) => {
+    if (activeRun || !window.confirm(`永久删除“${sessionName(session)}”？此操作无法撤销。`)) return
+    try {
+      await api.archiveSession(session.id)
+      await api.deleteSession(session.id)
+      removeSessionFromTree(session)
+    } catch (reason) {
+      try {
+        await loadSessions(session.project_id)
+      } catch {
+        // Preserve the original operation error.
+      }
       setError(errorMessage(reason))
     }
   }
@@ -209,20 +269,19 @@ function App() {
 
   return (
     <div className="app-shell">
-      <ProjectRail
+      <WorkspaceTree
         projects={projects}
-        selectedID={selectedProjectID}
-        onSelect={setSelectedProjectID}
+        sessionsByProject={sessionsByProject}
+        selectedProjectID={selectedProjectID}
+        selectedSessionID={selectedSessionID}
+        disabled={Boolean(activeRun)}
+        onSelectProject={selectProject}
+        onSelectSession={selectSession}
+        onCreateSession={(projectID) => void createSession(projectID)}
+        onArchiveSession={(session) => void archiveSession(session)}
+        onDeleteSession={(session) => void deleteSession(session)}
         onAdd={() => setShowProjectForm(true)}
         version={bootstrap?.version ?? ''}
-      />
-      <SessionRail
-        project={selectedProject}
-        sessions={sessions}
-        selectedID={selectedSessionID}
-        disabled={Boolean(activeRun)}
-        onSelect={setSelectedSessionID}
-        onCreate={() => void createSession()}
       />
       <main className="conversation-panel">
         {error && <ErrorBanner message={error} onDismiss={() => setError('')} />}
@@ -258,77 +317,95 @@ function App() {
   )
 }
 
-function ProjectRail(props: {
+function WorkspaceTree(props: {
   projects: Project[]
-  selectedID: string
+  sessionsByProject: Record<string, Session[]>
+  selectedProjectID: string
+  selectedSessionID: string
+  disabled: boolean
   version: string
-  onSelect: (id: string) => void
+  onSelectProject: (id: string) => void
+  onSelectSession: (projectID: string, sessionID: string) => void
+  onCreateSession: (projectID: string) => void
+  onArchiveSession: (session: Session) => void
+  onDeleteSession: (session: Session) => void
   onAdd: () => void
 }) {
+  const [expandedProjects, setExpandedProjects] = useState<Set<string>>(new Set())
+  const toggleProject = (projectID: string) => {
+    setExpandedProjects((current) => {
+      const next = new Set(current)
+      if (next.has(projectID)) next.delete(projectID)
+      else next.add(projectID)
+      return next
+    })
+  }
+
   return (
     <aside className="project-rail">
       <div className="brand"><LogoIcon /><span>SAI</span></div>
-      <div className="rail-label">项目</div>
-      <nav className="project-list" aria-label="项目列表">
-        {props.projects.map((project) => (
-          <button
-            key={project.id}
-            className={`project-button ${project.id === props.selectedID ? 'selected' : ''}`}
-            onClick={() => props.onSelect(project.id)}
-            title={project.root}
-          >
-            <span className="project-avatar">{projectName(project).slice(0, 1).toUpperCase()}</span>
-            <span className="project-button-copy">
-              <strong>{projectName(project)}</strong>
-              <small>{project.root}</small>
-            </span>
-          </button>
-        ))}
+      <div className="rail-label">项目与会话</div>
+      <nav className="project-tree" aria-label="项目和会话树">
+        {props.projects.map((project) => {
+          const sessions = props.sessionsByProject[project.id] ?? []
+          const expanded = expandedProjects.has(project.id)
+          const visibleSessions = expanded ? sessions : sessions.slice(0, 3)
+          return (
+            <section className="project-tree-group" key={project.id}>
+              <div className={`project-tree-header ${project.id === props.selectedProjectID ? 'selected' : ''}`}>
+                <button className="project-node" onClick={() => props.onSelectProject(project.id)} title={project.root}>
+                  <span className="project-avatar">{projectName(project).slice(0, 1).toUpperCase()}</span>
+                  <span className="project-button-copy">
+                    <strong>{projectName(project)}</strong>
+                    <small>{project.root}</small>
+                  </span>
+                  <span className="project-session-count">{sessions.length}</span>
+                </button>
+                <button
+                  className="tree-icon-button"
+                  disabled={props.disabled}
+                  onClick={() => props.onCreateSession(project.id)}
+                  aria-label={`在 ${projectName(project)} 中新建会话`}
+                  title="新建会话"
+                ><PlusIcon /></button>
+              </div>
+              <div className="session-tree" role="group" aria-label={`${projectName(project)} 的会话`}>
+                {visibleSessions.map((session) => (
+                  <div className={`session-tree-row ${session.id === props.selectedSessionID ? 'selected' : ''}`} key={session.id}>
+                    <button
+                      className="session-tree-button"
+                      disabled={props.disabled && session.id !== props.selectedSessionID}
+                      onClick={() => props.onSelectSession(project.id, session.id)}
+                    >
+                      <span className="session-icon"><ChatIcon /></span>
+                      <span className="session-copy">
+                        <strong>{sessionName(session)}</strong>
+                        <small>{relativeTime(session.last_used_at || session.updated_at)} · {session.model_id || session.model_profile}</small>
+                      </span>
+                      {session.status === 'running' && <span className="live-dot" />}
+                    </button>
+                    <div className="session-tree-actions">
+                      <button disabled={props.disabled} onClick={() => props.onArchiveSession(session)} aria-label={`归档 ${sessionName(session)}`} title="归档"><ArchiveIcon /></button>
+                      <button className="danger" disabled={props.disabled} onClick={() => props.onDeleteSession(session)} aria-label={`删除 ${sessionName(session)}`} title="删除"><TrashIcon /></button>
+                    </div>
+                  </div>
+                ))}
+                {sessions.length === 0 && <p className="tree-empty">暂无会话</p>}
+                {sessions.length > 3 && (
+                  <button className="tree-expand-button" onClick={() => toggleProject(project.id)}>
+                    <ChevronIcon expanded={expanded} />
+                    {expanded ? '收起' : `展开另外 ${sessions.length - 3} 个会话`}
+                  </button>
+                )}
+              </div>
+            </section>
+          )
+        })}
       </nav>
       <div className="project-rail-footer">
         <button className="secondary-button full" onClick={props.onAdd}><PlusIcon /> 添加项目</button>
         <span className="version">v{props.version || 'dev'} · local</span>
       </div>
-    </aside>
-  )
-}
-
-function SessionRail(props: {
-  project: Project | null
-  sessions: Session[]
-  selectedID: string
-  disabled: boolean
-  onSelect: (id: string) => void
-  onCreate: () => void
-}) {
-  return (
-    <aside className="session-rail">
-      <header className="session-header">
-        <div>
-          <span className="eyebrow">当前项目</span>
-          <h2>{props.project ? projectName(props.project) : '未选择项目'}</h2>
-        </div>
-        <button className="icon-button accent" disabled={!props.project || props.disabled} onClick={props.onCreate} aria-label="新建会话"><PlusIcon /></button>
-      </header>
-      <div className="rail-label">最近会话</div>
-      <nav className="session-list" aria-label="会话列表">
-        {props.sessions.map((session) => (
-          <button
-            key={session.id}
-            disabled={props.disabled && session.id !== props.selectedID}
-            className={`session-button ${session.id === props.selectedID ? 'selected' : ''}`}
-            onClick={() => props.onSelect(session.id)}
-          >
-            <span className="session-icon"><ChatIcon /></span>
-            <span className="session-copy">
-              <strong>{sessionName(session)}</strong>
-              <small>{relativeTime(session.last_used_at || session.updated_at)} · {session.model_id || session.model_profile}</small>
-            </span>
-            {session.status === 'running' && <span className="live-dot" />}
-          </button>
-        ))}
-        {props.project && props.sessions.length === 0 && <p className="rail-empty">还没有会话</p>}
-      </nav>
     </aside>
   )
 }
@@ -512,6 +589,10 @@ function sessionTimestamp(session: Session): number {
   return new Date(session.last_used_at || session.updated_at || session.created_at).getTime()
 }
 
+function orderSessions(sessions: Session[]): Session[] {
+  return [...sessions].sort((a, b) => sessionTimestamp(b) - sessionTimestamp(a))
+}
+
 function relativeTime(value: string): string {
   const timestamp = new Date(value).getTime()
   if (!Number.isFinite(timestamp)) return '刚刚'
@@ -539,6 +620,9 @@ function errorMessage(reason: unknown): string {
 const LogoIcon = () => <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7.2 4.4 12 2l4.8 2.4 3 4.4-.2 5.2-3.2 4.2L12 22l-4.4-3.8L4.4 14l-.2-5.2 3-4.4Z"/><path d="m8 9 4-2 4 2v5l-4 3-4-3V9Z"/></svg>
 const PlusIcon = () => <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14" /></svg>
 const ChatIcon = () => <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 5h14v11H9l-4 3V5Z" /></svg>
+const ArchiveIcon = () => <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16v13H4V7Zm-1-4h18v4H3V3Zm6 8h6" /></svg>
+const TrashIcon = () => <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M9 7V4h6v3m3 0-1 14H7L6 7m4 4v6m4-6v6" /></svg>
+const ChevronIcon = ({ expanded }: { expanded: boolean }) => <svg className={expanded ? 'expanded' : ''} viewBox="0 0 24 24" aria-hidden="true"><path d="m8 10 4 4 4-4" /></svg>
 const SendIcon = () => <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m4 4 17 8-17 8 3-8-3-8Zm3 8h14" /></svg>
 const StopIcon = () => <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="7" y="7" width="10" height="10" rx="1" /></svg>
 const ToolIcon = () => <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m14 6 4-4 4 4-4 4m-6 4L4 22l-2-2 8-8m8-2-8 8" /></svg>

@@ -60,6 +60,13 @@ export const api = {
     body: '{}',
   }),
   session: (sessionID: string) => request<Session>(`/api/sessions/${encodeURIComponent(sessionID)}`),
+  archiveSession: (sessionID: string) => request<Session>(`/api/sessions/${encodeURIComponent(sessionID)}/archive`, {
+    method: 'POST',
+    body: '{}',
+  }),
+  deleteSession: (sessionID: string) => request<{ status: string; id: string }>(`/api/sessions/${encodeURIComponent(sessionID)}`, {
+    method: 'DELETE',
+  }),
   items: (sessionID: string, beforeSeq = 0) => {
     const query = new URLSearchParams({ limit: '50' })
     if (beforeSeq > 0) query.set('before_seq', String(beforeSeq))
