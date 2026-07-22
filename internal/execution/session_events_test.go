@@ -160,6 +160,26 @@ func TestGetSessionChatItemsPageSupportsBeforeAndAfterCursors(t *testing.T) {
 	}
 }
 
+func TestSessionToolDisplayArgumentsKeepsOnlyUsefulPresentationFields(t *testing.T) {
+	tests := []struct {
+		name      string
+		toolName  string
+		arguments string
+		want      string
+	}{
+		{name: "file path without content", toolName: "write_file", arguments: `{"path":"notes.txt","content":"secret body"}`, want: `{"path":"notes.txt"}`},
+		{name: "shell command", toolName: "shell", arguments: `{"command":"go test ./...","timeout_ms":1000}`, want: `{"command":"go test ./..."}`},
+		{name: "invalid json", toolName: "read_file", arguments: `{`, want: ""},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := sessionToolDisplayArguments(test.toolName, test.arguments); got != test.want {
+				t.Fatalf("sessionToolDisplayArguments() = %q, want %q", got, test.want)
+			}
+		})
+	}
+}
+
 func sessionItemContents(items []SessionItem) []string {
 	contents := make([]string, 0, len(items))
 	for _, item := range items {

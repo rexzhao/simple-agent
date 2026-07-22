@@ -2,6 +2,7 @@ package execution
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -15,6 +16,8 @@ import (
 )
 
 const defaultSessionChatItemsLimit = 50
+
+const maxSessionStreamToolContentRunes = 4096
 
 type SessionItemsPage struct {
 	Items         []SessionItem `json:"items"`
@@ -43,8 +46,17 @@ type SessionItem struct {
 }
 
 type SessionItemMessage struct {
-	Role    string                     `json:"role"`
-	Content *SessionItemMessageContent `json:"content,omitempty"`
+	Role       string                     `json:"role"`
+	Content    *SessionItemMessageContent `json:"content,omitempty"`
+	ToolCallID string                     `json:"tool_call_id,omitempty"`
+	ToolCalls  []SessionItemToolCall      `json:"tool_calls,omitempty"`
+	IsError    bool                       `json:"is_error,omitempty"`
+}
+
+type SessionItemToolCall struct {
+	ID        string `json:"id"`
+	Name      string `json:"name"`
+	Arguments string `json:"arguments,omitempty"`
 }
 
 type SessionItemMessageContent struct {
@@ -484,6 +496,7 @@ func sessionStreamEventFromModelEvent(turnID string, event model.Event, showReas
 			"turn_id":      turnID,
 			"tool_call_id": event.ToolCall.ID,
 			"name":         event.ToolCall.Name,
+			"arguments":    sessionToolDisplayArguments(event.ToolCall.Name, event.ToolCall.Arguments),
 		}), true
 	case model.ToolStartedEvent:
 		if event.ToolCall.Name == "" {
@@ -493,6 +506,7 @@ func sessionStreamEventFromModelEvent(turnID string, event model.Event, showReas
 			"turn_id":      turnID,
 			"tool_call_id": event.ToolCall.ID,
 			"name":         event.ToolCall.Name,
+			"arguments":    sessionToolDisplayArguments(event.ToolCall.Name, event.ToolCall.Arguments),
 		}), true
 	case model.ToolResultEvent:
 		if event.Result.Name == "" {
@@ -503,6 +517,7 @@ func sessionStreamEventFromModelEvent(turnID string, event model.Event, showReas
 			"tool_call_id": event.Result.ToolCallID,
 			"name":         event.Result.Name,
 			"is_error":     event.Result.IsError,
+			"content":      sessionStreamToolContent(event.Result.Content),
 		}), true
 	case model.UsageEvent:
 		return NewSessionStreamEvent("usage.updated", map[string]any{
@@ -531,7 +546,19 @@ func (s *Service) sessionItemDTO(item sessions.SessionItem) (SessionItem, error)
 		return dto, nil
 	}
 	dto.Message = &SessionItemMessage{
-		Role: string(item.Message.Role),
+		Role:       string(item.Message.Role),
+		ToolCallID: item.Message.ToolCallID,
+		IsError:    item.Message.IsError,
+	}
+	if len(item.Message.ToolCalls) > 0 {
+		dto.Message.ToolCalls = make([]SessionItemToolCall, 0, len(item.Message.ToolCalls))
+		for _, toolCall := range item.Message.ToolCalls {
+			dto.Message.ToolCalls = append(dto.Message.ToolCalls, SessionItemToolCall{
+				ID:        toolCall.ID,
+				Name:      toolCall.Name,
+				Arguments: sessionToolDisplayArguments(toolCall.Name, toolCall.Arguments),
+			})
+		}
 	}
 	content, preview, err := s.sessionItemDisplayContent(item)
 	if err != nil {
@@ -586,7 +613,10 @@ func (s *Service) sessionItemFullContent(item sessions.SessionItem) (string, err
 }
 
 func sessionItemVisibleInChat(item sessions.SessionItem) bool {
-	if item.Kind != sessions.ItemKindMessage || item.Visibility != sessions.ItemVisibilityVisible || item.Message == nil {
+	if item.Visibility != sessions.ItemVisibilityVisible || item.Message == nil {
+		return false
+	}
+	if item.Kind != sessions.ItemKindMessage {
 		return false
 	}
 	switch item.Message.Role {
@@ -594,9 +624,44 @@ func sessionItemVisibleInChat(item sessions.SessionItem) bool {
 		return item.Audience == sessions.ItemAudienceUser
 	case model.MessageRoleAssistant:
 		return item.Audience == sessions.ItemAudienceModel
+	case model.MessageRoleTool:
+		return item.Audience == sessions.ItemAudienceModel
 	default:
 		return false
 	}
+}
+
+func sessionStreamToolContent(content string) string {
+	runes := []rune(content)
+	if len(runes) <= maxSessionStreamToolContentRunes {
+		return content
+	}
+	return string(runes[:maxSessionStreamToolContentRunes]) + "\n…"
+}
+
+func sessionToolDisplayArguments(name, arguments string) string {
+	var parsed map[string]any
+	if json.Unmarshal([]byte(arguments), &parsed) != nil {
+		return ""
+	}
+	displayed := make(map[string]any)
+	keys := []string{"path", "pattern", "query", "start_line", "line_count"}
+	if name == "shell" {
+		keys = []string{"command"}
+	}
+	for _, key := range keys {
+		if value, ok := parsed[key]; ok {
+			displayed[key] = value
+		}
+	}
+	if len(displayed) == 0 {
+		return ""
+	}
+	raw, err := json.Marshal(displayed)
+	if err != nil {
+		return ""
+	}
+	return string(raw)
 }
 
 func recentSessionItems(items []sessions.SessionItem, limit int) ([]sessions.SessionItem, bool) {

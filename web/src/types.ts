@@ -47,7 +47,16 @@ export interface SessionItem {
   message?: {
     role: 'user' | 'assistant' | string
     content?: MessageContent
+		tool_call_id?: string
+		tool_calls?: SessionToolCall[]
+		is_error?: boolean
   }
+}
+
+export interface SessionToolCall {
+	id: string
+	name: string
+	arguments?: string
 }
 
 export interface ItemsPage {
@@ -62,8 +71,8 @@ export type RunEvent =
   | { type: 'turn.started'; turn_id: string }
   | { type: 'text.delta'; turn_id: string; text: string }
   | { type: 'reasoning.delta'; turn_id: string; text: string }
-  | { type: 'tool.requested' | 'tool.started'; turn_id: string; tool_call_id: string; name: string }
-  | { type: 'tool.finished'; turn_id: string; tool_call_id: string; name: string; is_error: boolean }
+  | { type: 'tool.requested' | 'tool.started'; turn_id: string; tool_call_id: string; name: string; arguments?: string }
+  | { type: 'tool.finished'; turn_id: string; tool_call_id: string; name: string; is_error: boolean; content?: string }
   | { type: 'usage.updated'; turn_id: string; input_tokens: number; output_tokens: number; total_tokens: number }
   | { type: 'turn.committed'; turn_id: string; last_seq: number }
   | { type: 'turn.failed'; turn_id: string; code: string; message: string }
@@ -71,17 +80,29 @@ export type RunEvent =
   | { type: string; [key: string]: unknown }
 
 export interface ToolActivity {
+	kind: 'tool'
   id: string
   name: string
+	arguments?: string
+	result?: string
   status: 'requested' | 'running' | 'finished' | 'error'
 }
 
+export interface ReasoningActivity {
+	kind: 'reasoning'
+	id: string
+	text: string
+	label?: string
+}
+
+export type RunStep = ReasoningActivity | ToolActivity
+
 export interface ActiveRun {
   id: string
+	turnID?: string
   userText: string
   assistantText: string
-  reasoningText: string
-  tools: ToolActivity[]
+	steps: RunStep[]
   totalTokens?: number
   status: 'running' | 'failed' | 'cancelled'
   error?: string

@@ -301,17 +301,34 @@ svg { width: 1.1em; height: 1.1em; fill: none; stroke: currentColor; stroke-widt
 .cursor { display: inline-block; width: 7px; height: 15px; border-radius: 1px; background: var(--accent-bright); animation: blink .8s steps(2) infinite; vertical-align: -2px; }
 .token-note { margin-top: 9px; color: var(--faint); font-size: 10px; }
 
-.reasoning { margin: 2px 0 12px; border-left: 2px solid #343044; padding: 3px 0 3px 11px; }
-.reasoning summary { color: var(--muted); cursor: pointer; font-size: 11px; }
-.reasoning pre { margin: 9px 0 0; color: #858d9c; font: 11px/1.6 ui-monospace, SFMono-Regular, Consolas, monospace; white-space: pre-wrap; }
+.process-message { margin-bottom: 18px; }
+.process-card { width: min(650px, 100%); border: 1px solid #252a35; border-radius: 8px; background: #101319; }
+.process-card > summary { display: flex; align-items: center; gap: 9px; padding: 8px 11px; color: #9ba2ae; cursor: pointer; list-style: none; font-size: 11px; }
+.process-card > summary::-webkit-details-marker { display: none; }
+.process-card > summary::before { content: '›'; color: #6f7785; font-size: 16px; line-height: 1; transition: transform .15s ease; }
+.process-card[open] > summary::before { transform: rotate(90deg); }
+.process-card > summary small { color: var(--faint); }
+.process-card > summary time { margin-left: auto; color: #505764; font-size: 10px; }
+.process-card > .process-timeline { margin: 0 10px 10px; padding-top: 8px; border-top: 1px solid #202530; }
+.process-timeline { display: flex; flex-direction: column; gap: 7px; margin: 2px 0 13px; }
+.reasoning-step { border-left: 2px solid #343044; padding: 3px 0 3px 11px; }
+.reasoning-step > span { color: var(--muted); font-size: 10px; }
+.reasoning-step pre { max-height: 280px; margin: 6px 0 0; overflow: auto; color: #858d9c; font: 11px/1.6 ui-monospace, SFMono-Regular, Consolas, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
 
-.tool-stack { display: flex; flex-direction: column; gap: 5px; margin: 3px 0 13px; }
-.tool-row { display: flex; align-items: center; gap: 8px; width: fit-content; min-width: 210px; padding: 7px 10px; border: 1px solid #252b36; border-radius: 7px; color: #abb1bd; background: #11151b; font-size: 11px; }
-.tool-row svg { color: #7d8491; }
-.tool-row small { margin-left: auto; color: var(--faint); }
-.tool-row.running svg { color: #efb258; animation: spin 1.3s linear infinite; }
-.tool-row.finished svg { color: var(--success); }
-.tool-row.error svg, .tool-row.error small { color: var(--danger); }
+.tool-row { width: min(620px, 100%); border: 1px solid #252b36; border-radius: 7px; color: #abb1bd; background: #11151b; font-size: 11px; }
+.tool-row-header { min-height: 32px; display: flex; align-items: center; gap: 8px; padding: 6px 9px; }
+.tool-row-header svg { flex: 0 0 auto; width: 15px; height: 15px; color: #7d8491; }
+.tool-row-header strong { flex: 0 0 auto; font-weight: 550; }
+.tool-row-header code { min-width: 0; overflow: hidden; color: #858d9b; font: 10.5px ui-monospace, SFMono-Regular, Consolas, monospace; text-overflow: ellipsis; white-space: nowrap; }
+.tool-row-header small { flex: 0 0 auto; margin-left: auto; color: var(--faint); }
+.tool-row.running .tool-row-header svg { color: #efb258; animation: spin 1.3s linear infinite; }
+.tool-row.finished .tool-row-header svg { color: var(--success); }
+.tool-row.error .tool-row-header svg, .tool-row.error .tool-row-header small { color: var(--danger); }
+.tool-details { border-top: 1px solid #202630; }
+.tool-details > summary { padding: 6px 9px; color: #737b88; cursor: pointer; font-size: 10px; }
+.tool-details > div { padding: 0 9px 9px; }
+.tool-details > div > span { display: block; margin: 3px 0 5px; color: #686f7c; font-size: 9.5px; }
+.tool-details pre { max-height: 260px; margin: 0; padding: 8px 9px; overflow: auto; border-radius: 5px; color: #aeb4bf; background: #0b0e13; font: 10.5px/1.55 ui-monospace, SFMono-Regular, Consolas, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
 
 .load-older { display: block; margin: 0 auto 30px; padding: 7px 12px; border: 1px solid var(--border); border-radius: 8px; color: var(--muted); background: transparent; cursor: pointer; font-size: 11px; }
 .conversation-empty { display: flex; min-height: 60%; flex-direction: column; align-items: center; justify-content: center; color: var(--faint); text-align: center; }

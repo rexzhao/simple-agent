@@ -498,8 +498,11 @@ func TestServiceGetSessionChatItemsFiltersItemBackedVisibleMessages(t *testing.T
 			Kind:       sessions.ItemKindMessage,
 			Visibility: sessions.ItemVisibilityVisible,
 			Audience:   sessions.ItemAudienceModel,
-			Message:    &model.Message{Role: model.MessageRoleAssistant},
-			Content:    &sessions.StoredContent{Preview: "long answer preview"},
+			Message: &model.Message{
+				Role:      model.MessageRoleAssistant,
+				ToolCalls: []model.ToolCall{{ID: "call-1", Name: "read_file", Arguments: `{"path":"notes.txt"}`}},
+			},
+			Content: &sessions.StoredContent{Preview: "long answer preview"},
 		},
 		{
 			ID:         "visible-assistant-blob",
@@ -539,8 +542,8 @@ func TestServiceGetSessionChatItemsFiltersItemBackedVisibleMessages(t *testing.T
 	if err != nil {
 		t.Fatalf("GetSessionChatItems() error = %v", err)
 	}
-	if got := executionSessionItemIDs(page.Items); !sameStringSlice(got, []string{"visible-user", "visible-assistant-preview", "visible-assistant-blob"}) {
-		t.Fatalf("chat item IDs = %#v, want visible user/assistant items", got)
+	if got := executionSessionItemIDs(page.Items); !sameStringSlice(got, []string{"visible-user", "visible-assistant-preview", "visible-assistant-blob", "tool-result"}) {
+		t.Fatalf("chat item IDs = %#v, want visible conversation and process items", got)
 	}
 	if page.Items[0].Message == nil || page.Items[0].Message.Content == nil || page.Items[0].Message.Content.Inline != "hello" {
 		t.Fatalf("user item DTO = %#v, want inline content", page.Items[0])
@@ -553,6 +556,12 @@ func TestServiceGetSessionChatItemsFiltersItemBackedVisibleMessages(t *testing.T
 	}
 	if content := page.Items[2].Message.Content; content != nil && (content.Inline != "" || content.Preview != "") {
 		t.Fatalf("blob-backed assistant content = %#v, want no full blob materialized", content)
+	}
+	if calls := page.Items[1].Message.ToolCalls; len(calls) != 1 || calls[0].Name != "read_file" || calls[0].Arguments != `{"path":"notes.txt"}` {
+		t.Fatalf("assistant tool calls = %#v, want read_file arguments", calls)
+	}
+	if tool := page.Items[3]; tool.Message == nil || tool.Message.ToolCallID != "call-1" || tool.Message.Content == nil || tool.Message.Content.Inline != "tool secret" {
+		t.Fatalf("tool result DTO = %#v, want call id and content", tool)
 	}
 	if page.OldestSeq == 0 || page.NewestSeq <= page.OldestSeq || page.HasMoreBefore || page.HasMoreAfter {
 		t.Fatalf("page bounds = %#v, want bounded recent page without more flags", page)
@@ -637,9 +646,9 @@ func TestServiceSendSessionMessageWithEventsEmitsDirectStreamEvents(t *testing.T
 		supports: true,
 		run: func(ctx context.Context, request SessionTurnRequest) (SessionTurnResult, error) {
 			request.Emit(model.TextDeltaEvent{Text: "streamed"})
-			request.Emit(model.ToolCallDoneEvent{ToolCall: model.ToolCall{ID: "call-1", Name: "read_file"}})
-			request.Emit(model.ToolStartedEvent{ToolCall: model.ToolCall{ID: "call-1", Name: "read_file"}})
-			request.Emit(model.ToolResultEvent{Result: model.ToolResult{ToolCallID: "call-1", Name: "read_file"}})
+			request.Emit(model.ToolCallDoneEvent{ToolCall: model.ToolCall{ID: "call-1", Name: "read_file", Arguments: `{"path":"notes.txt"}`}})
+			request.Emit(model.ToolStartedEvent{ToolCall: model.ToolCall{ID: "call-1", Name: "read_file", Arguments: `{"path":"notes.txt"}`}})
+			request.Emit(model.ToolResultEvent{Result: model.ToolResult{ToolCallID: "call-1", Name: "read_file", Content: "file contents"}})
 			request.Emit(model.UsageEvent{Usage: model.Usage{InputTokens: 11, OutputTokens: 7, TotalTokens: 18}})
 			if err := request.Publisher.Publish(eventAssistant(request.TurnID, "answer")); err != nil {
 				return SessionTurnResult{}, err
@@ -676,6 +685,12 @@ func TestServiceSendSessionMessageWithEventsEmitsDirectStreamEvents(t *testing.T
 	}
 	if !sessionStreamEventsContain(events, "usage.updated", "total_tokens", 18) {
 		t.Fatalf("events = %#v, want usage.updated total_tokens", events)
+	}
+	if !sessionStreamEventsContain(events, "tool.requested", "arguments", `{"path":"notes.txt"}`) {
+		t.Fatalf("events = %#v, want tool arguments", events)
+	}
+	if !sessionStreamEventsContain(events, "tool.finished", "content", "file contents") {
+		t.Fatalf("events = %#v, want tool result content", events)
 	}
 }
 

@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { api, streamRun } from './api'
-import type { ActiveRun, Bootstrap, ItemsPage, Project, RunEvent, Session, SessionItem, ToolActivity } from './types'
+import type { ActiveRun, Bootstrap, ItemsPage, Project, RunEvent, RunStep, Session, SessionItem, ToolActivity } from './types'
 
 function App() {
   const [bootstrap, setBootstrap] = useState<Bootstrap | null>(null)
@@ -11,11 +11,18 @@ function App() {
   const [sessionDetail, setSessionDetail] = useState<Session | null>(null)
   const [itemsPage, setItemsPage] = useState<ItemsPage | null>(null)
   const [activeRun, setActiveRun] = useState<ActiveRun | null>(null)
+	const [recentStepsByTurn, setRecentStepsByTurn] = useState<Record<string, RunStep[]>>({})
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
   const [showProjectForm, setShowProjectForm] = useState(false)
   const selectedProjectRef = useRef('')
   const selectedSessionRef = useRef('')
+	const activeRunRef = useRef<ActiveRun | null>(null)
+	const updateActiveRun = useCallback((updater: (run: ActiveRun | null) => ActiveRun | null) => {
+		const next = updater(activeRunRef.current)
+		activeRunRef.current = next
+		setActiveRun(next)
+	}, [])
 
   selectedProjectRef.current = selectedProjectID
   selectedSessionRef.current = selectedSessionID
@@ -189,29 +196,37 @@ function App() {
 
   const handleRunEvent = useCallback(async (event: RunEvent) => {
     switch (event.type) {
+			case 'turn.started':
+				updateActiveRun((run) => run ? { ...run, turnID: String(event.turn_id ?? '') } : run)
+				break
       case 'text.delta':
-        setActiveRun((run) => run ? { ...run, assistantText: run.assistantText + String(event.text ?? '') } : run)
+				updateActiveRun((run) => run ? { ...run, assistantText: run.assistantText + String(event.text ?? '') } : run)
         break
       case 'reasoning.delta':
-        setActiveRun((run) => run ? { ...run, reasoningText: run.reasoningText + String(event.text ?? '') } : run)
+				updateActiveRun((run) => run ? { ...run, steps: appendReasoning(run.steps, String(event.text ?? '')) } : run)
         break
       case 'tool.requested':
       case 'tool.started':
       case 'tool.finished':
-        setActiveRun((run) => run ? { ...run, tools: updateTools(run.tools, event) } : run)
+				updateActiveRun((run) => run ? { ...run, steps: updateToolStep(run.steps, event) } : run)
         break
       case 'usage.updated':
-        setActiveRun((run) => run ? { ...run, totalTokens: Number(event.total_tokens ?? 0) } : run)
+				updateActiveRun((run) => run ? { ...run, totalTokens: Number(event.total_tokens ?? 0) } : run)
         break
       case 'turn.failed':
-        setActiveRun((run) => run ? { ...run, status: 'failed', error: String(event.message ?? '运行失败') } : run)
+				updateActiveRun((run) => run ? { ...run, status: 'failed', error: String(event.message ?? '运行失败') } : run)
         setError(String(event.message ?? '运行失败'))
         break
       case 'run.settled': {
         const sessionID = selectedSessionRef.current
         if (String(event.status) === 'cancelled') {
-          setActiveRun((run) => run ? { ...run, status: 'cancelled' } : run)
+					updateActiveRun((run) => run ? { ...run, status: 'cancelled' } : run)
         }
+				const settledRun = activeRunRef.current
+				const turnID = String(event.turn_id ?? settledRun?.turnID ?? '')
+				if (sessionID && turnID && settledRun && settledRun.steps.length > 0) {
+					setRecentStepsByTurn((current) => ({ ...current, [processKey(sessionID, turnID)]: settledRun.steps }))
+				}
         if (sessionID) {
           try {
             await refreshSession(sessionID)
@@ -219,27 +234,26 @@ function App() {
             setError(errorMessage(reason))
           }
         }
-        setActiveRun(null)
+				updateActiveRun(() => null)
         break
       }
     }
-  }, [refreshSession])
+	}, [refreshSession, updateActiveRun])
 
   const sendMessage = async (content: string) => {
     if (!selectedSessionID || activeRun || !content.trim()) return
     try {
       const started = await api.startRun(selectedSessionID, content)
-      setActiveRun({
+			updateActiveRun(() => ({
         id: started.run_id,
         userText: content,
         assistantText: '',
-        reasoningText: '',
-        tools: [],
+				steps: [],
         status: 'running',
-      })
+			}))
       await streamRun(started.run_id, handleRunEvent)
     } catch (reason) {
-      setActiveRun(null)
+			updateActiveRun(() => null)
       setError(errorMessage(reason))
     }
   }
@@ -297,6 +311,7 @@ function App() {
             detail={sessionDetail}
             page={itemsPage}
             activeRun={activeRun}
+					recentStepsByTurn={recentStepsByTurn}
             onLoadOlder={() => void loadOlder()}
             onSend={(content) => void sendMessage(content)}
             onCancel={() => void cancelRun()}
@@ -414,6 +429,7 @@ function Conversation(props: {
   detail: Session | null
   page: ItemsPage | null
   activeRun: ActiveRun | null
+	recentStepsByTurn: Record<string, RunStep[]>
   onLoadOlder: () => void
   onSend: (content: string) => void
   onCancel: () => void
@@ -422,7 +438,7 @@ function Conversation(props: {
   const bottomRef = useRef<HTMLDivElement>(null)
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: props.activeRun ? 'smooth' : 'auto' })
-  }, [props.activeRun?.assistantText, props.activeRun?.tools.length, props.page?.newest_seq])
+	}, [props.activeRun?.assistantText, props.activeRun?.steps, props.page?.newest_seq])
 
   return (
     <div className="conversation">
@@ -439,7 +455,9 @@ function Conversation(props: {
       <section className="messages" aria-live="polite">
         {props.page?.has_more_before && <button className="load-older" onClick={props.onLoadOlder}>加载更早消息</button>}
         {!props.page && <MessageSkeleton />}
-        {props.page?.items.map((item) => <Message key={item.id} item={item} />)}
+				{buildConversationEntries(props.page?.items ?? [], props.detail?.id ?? '', props.recentStepsByTurn).map((entry) => entry.kind === 'message'
+					? <Message key={entry.item.id} item={entry.item} />
+					: <HistoricalProcess key={entry.id} entry={entry} />)}
         {props.activeRun && <ActiveRunView run={props.activeRun} />}
         {props.page && props.page.items.length === 0 && !props.activeRun && (
           <div className="conversation-empty"><SparkIcon /><h3>开始一个新任务</h3><p>描述目标、问题或需要修改的代码。</p></div>
@@ -477,8 +495,7 @@ function ActiveRunView({ run }: { run: ActiveRun }) {
         <div className="message-avatar"><LogoIcon /></div>
         <div className="message-content">
           <div className="message-meta"><strong>SAI</strong><span className="streaming-label"><i />生成中</span></div>
-          {run.reasoningText && <details className="reasoning"><summary>思考过程</summary><pre>{run.reasoningText}</pre></details>}
-          {run.tools.length > 0 && <div className="tool-stack">{run.tools.map((tool) => <ToolRow key={tool.id} tool={tool} />)}</div>}
+					{run.steps.length > 0 && <ProcessTimeline steps={run.steps} />}
           <div className="message-text assistant-stream">{run.assistantText || <span className="cursor" />}</div>
           {run.totalTokens !== undefined && <div className="token-note">本轮 {run.totalTokens.toLocaleString()} tokens</div>}
         </div>
@@ -487,8 +504,120 @@ function ActiveRunView({ run }: { run: ActiveRun }) {
   )
 }
 
+type ConversationEntry =
+	| { kind: 'message'; item: SessionItem }
+	| { kind: 'process'; id: string; createdAt: string; steps: RunStep[] }
+
+function buildConversationEntries(items: SessionItem[], sessionID: string, recentStepsByTurn: Record<string, RunStep[]>): ConversationEntry[] {
+	const entries: ConversationEntry[] = []
+	let steps: RunStep[] = []
+	let processCreatedAt = ''
+	let processTurnID = ''
+	const emittedRecentTurns = new Set<string>()
+
+	const flushProcess = (turnID = processTurnID) => {
+		const recentKey = turnID ? processKey(sessionID, turnID) : ''
+		const recentSteps = recentKey && !emittedRecentTurns.has(recentKey) ? recentStepsByTurn[recentKey] : undefined
+		const displayedSteps = recentSteps?.length ? recentSteps : steps
+		if (displayedSteps.length > 0) {
+			entries.push({ kind: 'process', id: `process-${sessionID}-${turnID || displayedSteps[0].id}`, createdAt: processCreatedAt, steps: displayedSteps })
+		}
+		if (recentKey && recentSteps?.length) emittedRecentTurns.add(recentKey)
+		steps = []
+		processCreatedAt = ''
+		processTurnID = ''
+	}
+
+	for (const item of items) {
+		const role = item.message?.role
+		const text = itemText(item)
+		if (role === 'user') {
+			flushProcess(processTurnID)
+			processTurnID = item.turn_id || ''
+			entries.push({ kind: 'message', item })
+			continue
+		}
+		if (role === 'assistant' && (item.message?.tool_calls?.length ?? 0) > 0) {
+			if (!processCreatedAt) processCreatedAt = item.created_at
+			if (!processTurnID) processTurnID = item.turn_id || ''
+			if (text) steps.push({ kind: 'reasoning', id: `${item.id}-output`, text, label: '模型输出' })
+			for (const toolCall of item.message?.tool_calls ?? []) {
+				steps.push({
+					kind: 'tool',
+					id: toolCall.id,
+					name: toolCall.name,
+					arguments: toolCall.arguments,
+					status: 'requested',
+				})
+			}
+			continue
+		}
+		if (role === 'tool') {
+			if (!processCreatedAt) processCreatedAt = item.created_at
+			if (!processTurnID) processTurnID = item.turn_id || ''
+			const toolCallID = item.message?.tool_call_id || item.id
+			const index = steps.findIndex((step) => step.kind === 'tool' && step.id === toolCallID)
+			const status: ToolActivity['status'] = item.message?.is_error || item.status === 'error' ? 'error' : item.status === 'pending' ? 'requested' : 'finished'
+			if (index >= 0) {
+				const tool = steps[index] as ToolActivity
+				steps[index] = { ...tool, result: text, status }
+			} else {
+				steps.push({ kind: 'tool', id: toolCallID, name: 'tool', result: text, status })
+			}
+			continue
+		}
+		if (!processCreatedAt) processCreatedAt = item.created_at
+		flushProcess(item.turn_id || processTurnID)
+		if (text) entries.push({ kind: 'message', item })
+	}
+	flushProcess(processTurnID)
+	return entries
+}
+
+function HistoricalProcess({ entry }: { entry: Extract<ConversationEntry, { kind: 'process' }> }) {
+	const reasoningCount = entry.steps.filter((step) => step.kind === 'reasoning').length
+	const toolCount = entry.steps.length - reasoningCount
+	const summary = [reasoningCount > 0 ? `${reasoningCount} 段思考` : '', toolCount > 0 ? `${toolCount} 次工具调用` : ''].filter(Boolean).join(' · ')
+	return (
+		<article className="message assistant process-message">
+			<div className="message-avatar"><LogoIcon /></div>
+			<div className="message-content">
+				<details className="process-card">
+					<summary><span>执行过程</span><small>{summary}</small><time>{formatTime(entry.createdAt)}</time></summary>
+					<ProcessTimeline steps={entry.steps} />
+				</details>
+			</div>
+		</article>
+	)
+}
+
+function ProcessTimeline({ steps }: { steps: RunStep[] }) {
+	return (
+		<div className="process-timeline">
+			{steps.map((step) => step.kind === 'reasoning'
+				? <div className="reasoning-step" key={step.id}><span>{step.label || '思考过程'}</span><pre>{step.text}</pre></div>
+				: <ToolRow key={step.id} tool={step} />)}
+		</div>
+	)
+}
+
 function ToolRow({ tool }: { tool: ToolActivity }) {
-  return <div className={`tool-row ${tool.status}`}><ToolIcon /><span>{tool.name}</span><small>{toolStatus(tool.status)}</small></div>
+	const argumentsObject = parseToolArguments(tool.arguments)
+	const target = toolTarget(tool.name, argumentsObject)
+	const command = tool.name === 'shell' ? stringField(argumentsObject, 'command') : ''
+	const showDetails = Boolean(command || tool.result)
+	return (
+		<div className={`tool-row ${tool.status}`}>
+			<div className="tool-row-header"><ToolIcon /><strong>{toolDisplayName(tool.name)}</strong>{target && <code title={target}>{target}</code>}<small>{toolStatus(tool.status)}</small></div>
+			{showDetails && (
+				<details className="tool-details">
+					<summary>{command ? '查看命令与输出' : '查看输出'}</summary>
+					{command && <div><span>命令</span><pre>{command}</pre></div>}
+					{tool.result && <div><span>输出</span><pre>{tool.result}</pre></div>}
+				</details>
+			)}
+		</div>
+  )
 }
 
 function Composer(props: { running: boolean; onSend: (content: string) => void; onCancel: () => void }) {
@@ -562,18 +691,80 @@ function MessageSkeleton() {
   return <div className="skeleton"><i /><i /><i /></div>
 }
 
-function updateTools(tools: ToolActivity[], event: RunEvent): ToolActivity[] {
+function appendReasoning(steps: RunStep[], text: string): RunStep[] {
+	if (!text) return steps
+	const last = steps[steps.length - 1]
+	if (last?.kind === 'reasoning') {
+		return [...steps.slice(0, -1), { ...last, text: last.text + text }]
+	}
+	return [...steps, { kind: 'reasoning', id: `reasoning-${steps.length}`, text }]
+}
+
+function updateToolStep(steps: RunStep[], event: RunEvent): RunStep[] {
 	const fields = event as Record<string, unknown>
 	const id = String(fields.tool_call_id ?? '')
 	const name = String(fields.name ?? 'tool')
-  const current = tools.find((tool) => tool.id === id)
-  const status: ToolActivity['status'] = event.type === 'tool.requested'
-    ? 'requested'
-    : event.type === 'tool.started'
-      ? 'running'
+	const status: ToolActivity['status'] = event.type === 'tool.requested'
+		? 'requested'
+		: event.type === 'tool.started'
+			? 'running'
 			: Boolean(fields.is_error) ? 'error' : 'finished'
-  if (!current) return [...tools, { id: id || `${name}-${tools.length}`, name, status }]
-  return tools.map((tool) => tool.id === id ? { ...tool, name, status } : tool)
+	const index = steps.findIndex((step) => step.kind === 'tool' && step.id === id)
+	const current = index >= 0 ? steps[index] as ToolActivity : null
+	const tool: ToolActivity = {
+		kind: 'tool',
+		id: id || `${name}-${steps.length}`,
+		name,
+		arguments: String(fields.arguments ?? current?.arguments ?? '') || undefined,
+		result: String(fields.content ?? current?.result ?? '') || undefined,
+		status,
+	}
+	if (index < 0) return [...steps, tool]
+	return steps.map((step, stepIndex) => stepIndex === index ? tool : step)
+}
+
+function itemText(item: SessionItem): string {
+	return item.message?.content?.inline || item.message?.content?.preview || ''
+}
+
+function processKey(sessionID: string, turnID: string): string {
+	return `${sessionID}:${turnID}`
+}
+
+function parseToolArguments(value?: string): Record<string, unknown> {
+	if (!value) return {}
+	try {
+		const parsed: unknown = JSON.parse(value)
+		return parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed as Record<string, unknown> : {}
+	} catch {
+		return {}
+	}
+}
+
+function stringField(value: Record<string, unknown>, key: string): string {
+	return typeof value[key] === 'string' ? value[key] : ''
+}
+
+function toolTarget(name: string, argumentsObject: Record<string, unknown>): string {
+	const path = stringField(argumentsObject, 'path')
+	if (path) return path
+	if (name === 'shell') {
+		const command = stringField(argumentsObject, 'command').replace(/\s+/g, ' ').trim()
+		return command.length > 100 ? `${command.slice(0, 100)}…` : command
+	}
+	return stringField(argumentsObject, 'pattern') || stringField(argumentsObject, 'query')
+}
+
+function toolDisplayName(name: string): string {
+	return {
+		read_file: '读取文件',
+		write_file: '写入文件',
+		edit_file: '编辑文件',
+		list_files: '列出文件',
+		glob_files: '查找文件',
+		grep_files: '搜索文件',
+		shell: 'Shell',
+	}[name] || name
 }
 
 function projectName(project: Project): string {
