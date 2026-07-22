@@ -1,9 +1,16 @@
 name: paperhub
 base_url: https://tc-paperhub.diezhi.net/v1
 api_key: $PAPERHUB_API_KEY
+request_timeout: 60s
 
 models:
   glm-5.2:
     id: glm-5.2
     temperature: 0.6
     max_tokens: 4096
+    reasoning_config:
+      parameter: reasoning_effort
+      default: high
+      levels:
+        high: high
+        max: max

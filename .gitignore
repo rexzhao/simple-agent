@@ -3,5 +3,10 @@
 /dist/
 /web/node_modules/
 /web/dist/
+/web/.vite/
+*.test
+*.out
+*.prof
+/coverage/
 __pycache__/
 /.mcp_cli_discovery.py

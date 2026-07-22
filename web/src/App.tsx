@@ -1,6 +1,27 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
+import Markdown from 'react-markdown'
+import type { Components } from 'react-markdown'
+import remarkGfm from 'remark-gfm'
 import { api, streamRun } from './api'
-import type { ActiveRun, Bootstrap, ItemsPage, Project, RunEvent, RunStep, Session, SessionItem, ToolActivity } from './types'
+import type { ActiveRun, Bootstrap, CodexAuthStatus, ItemsPage, Project, ProviderModelSettings, ProviderSettings, ProviderSettingsDocument, ProviderSettingsInput, RunEvent, RunStep, Session, SessionItem, SessionModelOption, ToolActivity } from './types'
+
+interface SessionCreatorState {
+  projectID: string
+  models: SessionModelOption[]
+  selectedKey: string
+  defaultProvider: string
+  defaultModel: string
+  reasoningLevel: string
+  loading: boolean
+}
+
+interface ProviderManagerState {
+  projectID: string
+  document: ProviderSettingsDocument | null
+  loading: boolean
+}
+
+const autoScrollThresholdPX = 160
 
 function App() {
   const [bootstrap, setBootstrap] = useState<Bootstrap | null>(null)
@@ -15,6 +36,9 @@ function App() {
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
   const [showProjectForm, setShowProjectForm] = useState(false)
+  const [sessionCreator, setSessionCreator] = useState<SessionCreatorState | null>(null)
+  const [providerManager, setProviderManager] = useState<ProviderManagerState | null>(null)
+  const [creatingSession, setCreatingSession] = useState(false)
   const selectedProjectRef = useRef('')
   const selectedSessionRef = useRef('')
 	const activeRunRef = useRef<ActiveRun | null>(null)
@@ -114,28 +138,63 @@ function App() {
     }
   }
 
-  const createSession = async (projectID = selectedProjectID) => {
-    if (!projectID) return
+  const openSessionCreator = async (projectID = selectedProjectID) => {
+    if (!projectID || activeRunRef.current) return
+    setSessionCreator({ projectID, models: [], selectedKey: '', defaultProvider: '', defaultModel: '', reasoningLevel: '', loading: true })
     try {
-      const session = await api.createSession(projectID)
+      const options = await api.sessionModels(projectID)
+      const defaultModel = options.models.find((model) => model.provider === options.default_provider && model.model_profile === options.default_model)
+      setSessionCreator((current) => current?.projectID === projectID ? {
+        projectID,
+        models: options.models,
+        selectedKey: modelKey(defaultModel ?? options.models[0]),
+        defaultProvider: options.default_provider,
+        defaultModel: options.default_model,
+        reasoningLevel: defaultModel?.default_reasoning_level ?? options.models[0]?.default_reasoning_level ?? '',
+        loading: false,
+      } : current)
+    } catch (reason) {
+      setSessionCreator(null)
+      setError(errorMessage(reason))
+    }
+  }
+
+  const createSession = async (projectID: string, model: SessionModelOption) => {
+    if (!projectID || creatingSession) return
+    setCreatingSession(true)
+    try {
+      const session = await api.createSession(projectID, model.provider, model.model_profile, sessionCreator?.reasoningLevel ?? model.default_reasoning_level ?? '')
       setSelectedProjectID(projectID)
       await loadSessions(projectID, session.id)
       setSelectedSessionID(session.id)
       setShowProjectForm(false)
+      setSessionCreator(null)
     } catch (reason) {
+      setError(errorMessage(reason))
+    } finally {
+      setCreatingSession(false)
+    }
+  }
+
+  const openProviderManager = async (projectID: string) => {
+    if (!projectID) return
+    setProviderManager({ projectID, document: null, loading: true })
+    try {
+      const document = await api.providerSettings(projectID)
+      setProviderManager((current) => current?.projectID === projectID ? { projectID, document, loading: false } : current)
+    } catch (reason) {
+      setProviderManager(null)
       setError(errorMessage(reason))
     }
   }
 
   const selectProject = (projectID: string) => {
-    if (activeRun) return
     setSelectedProjectID(projectID)
     setSelectedSessionID(sessionsByProject[projectID]?.[0]?.id ?? '')
     setShowProjectForm(false)
   }
 
   const selectSession = (projectID: string, sessionID: string) => {
-    if (activeRun && sessionID !== selectedSessionID) return
     setSelectedProjectID(projectID)
     setSelectedSessionID(sessionID)
     setShowProjectForm(false)
@@ -199,30 +258,53 @@ function App() {
 			case 'turn.started':
 				updateActiveRun((run) => run ? { ...run, turnID: String(event.turn_id ?? '') } : run)
 				break
+			case 'agent.iteration.started':
+				updateActiveRun((run) => {
+					if (!run) return run
+					const agentIteration = Number(event.agent_iteration ?? 0)
+					if (agentIteration <= 0) return run
+					return {
+						...run,
+						agentIteration,
+						assistantText: '',
+						steps: appendModelOutput(run.steps, run.assistantText, run.agentIteration),
+					}
+				})
+				break
       case 'text.delta':
 				updateActiveRun((run) => run ? { ...run, assistantText: run.assistantText + String(event.text ?? '') } : run)
         break
       case 'reasoning.delta':
-				updateActiveRun((run) => run ? { ...run, steps: appendReasoning(run.steps, String(event.text ?? '')) } : run)
+				updateActiveRun((run) => run ? { ...run, steps: appendReasoning(run.steps, String(event.text ?? ''), Number(event.agent_iteration ?? run.agentIteration)) } : run)
         break
       case 'tool.requested':
+				updateActiveRun((run) => run ? {
+					...run,
+					assistantText: '',
+					steps: updateToolStep(appendModelOutput(run.steps, run.assistantText, Number(event.agent_iteration ?? run.agentIteration)), event, Number(event.agent_iteration ?? run.agentIteration)),
+				} : run)
+				break
       case 'tool.started':
       case 'tool.finished':
-				updateActiveRun((run) => run ? { ...run, steps: updateToolStep(run.steps, event) } : run)
+				updateActiveRun((run) => run ? { ...run, steps: updateToolStep(run.steps, event, Number(event.agent_iteration ?? run.agentIteration)) } : run)
         break
       case 'usage.updated':
-				updateActiveRun((run) => run ? { ...run, totalTokens: Number(event.total_tokens ?? 0) } : run)
+				updateActiveRun((run) => run ? {
+					...run,
+					inputTokens: Number(event.input_tokens ?? 0),
+					totalTokens: Number(event.total_tokens ?? 0),
+				} : run)
         break
       case 'turn.failed':
 				updateActiveRun((run) => run ? { ...run, status: 'failed', error: String(event.message ?? '运行失败') } : run)
         setError(String(event.message ?? '运行失败'))
         break
       case 'run.settled': {
-        const sessionID = selectedSessionRef.current
         if (String(event.status) === 'cancelled') {
 					updateActiveRun((run) => run ? { ...run, status: 'cancelled' } : run)
         }
 				const settledRun = activeRunRef.current
+				const sessionID = settledRun?.sessionID ?? ''
 				const turnID = String(event.turn_id ?? settledRun?.turnID ?? '')
 				if (sessionID && turnID && settledRun && settledRun.steps.length > 0) {
 					setRecentStepsByTurn((current) => ({ ...current, [processKey(sessionID, turnID)]: settledRun.steps }))
@@ -242,13 +324,16 @@ function App() {
 
   const sendMessage = async (content: string) => {
     if (!selectedSessionID || activeRun || !content.trim()) return
+		const sessionID = selectedSessionID
     try {
-      const started = await api.startRun(selectedSessionID, content)
+			const started = await api.startRun(sessionID, content)
 			updateActiveRun(() => ({
         id: started.run_id,
+			sessionID,
         userText: content,
         assistantText: '',
 				steps: [],
+				agentIteration: 0,
         status: 'running',
 			}))
       await streamRun(started.run_id, handleRunEvent)
@@ -289,9 +374,11 @@ function App() {
         selectedProjectID={selectedProjectID}
         selectedSessionID={selectedSessionID}
         disabled={Boolean(activeRun)}
+		runningSessionID={activeRun?.sessionID ?? ''}
         onSelectProject={selectProject}
         onSelectSession={selectSession}
-        onCreateSession={(projectID) => void createSession(projectID)}
+        onCreateSession={(projectID) => void openSessionCreator(projectID)}
+        onManageProviders={(projectID) => void openProviderManager(projectID)}
         onArchiveSession={(session) => void archiveSession(session)}
         onDeleteSession={(session) => void deleteSession(session)}
         onAdd={() => setShowProjectForm(true)}
@@ -310,7 +397,8 @@ function App() {
           <Conversation
             detail={sessionDetail}
             page={itemsPage}
-            activeRun={activeRun}
+			activeRun={activeRun?.sessionID === selectedSessionID ? activeRun : null}
+			busy={Boolean(activeRun)}
 					recentStepsByTurn={recentStepsByTurn}
             onLoadOlder={() => void loadOlder()}
             onSend={(content) => void sendMessage(content)}
@@ -318,7 +406,7 @@ function App() {
             onCompact={() => void compactSession()}
           />
         ) : selectedProject ? (
-          <EmptySession onCreate={() => void createSession()} />
+		  <EmptySession disabled={Boolean(activeRun)} onCreate={() => void openSessionCreator()} />
         ) : (
           <ProjectSetup
             suggestedRoot={bootstrap?.cwd ?? ''}
@@ -328,6 +416,30 @@ function App() {
           />
         )}
       </main>
+      {sessionCreator && (
+        <SessionModelDialog
+          project={projects.find((project) => project.id === sessionCreator.projectID)}
+          state={sessionCreator}
+          creating={creatingSession}
+          onSelect={(selectedKey) => setSessionCreator((current) => {
+            if (!current) return current
+            const model = current.models.find((item) => modelKey(item) === selectedKey)
+            return { ...current, selectedKey, reasoningLevel: model?.default_reasoning_level ?? '' }
+          })}
+          onReasoningLevel={(reasoningLevel) => setSessionCreator((current) => current ? { ...current, reasoningLevel } : current)}
+          onCancel={() => { if (!creatingSession) setSessionCreator(null) }}
+          onCreate={(model) => void createSession(sessionCreator.projectID, model)}
+        />
+      )}
+      {providerManager && (
+        <ProviderManagerDialog
+          project={projects.find((project) => project.id === providerManager.projectID)}
+          state={providerManager}
+          onDocument={(document) => setProviderManager((current) => current ? { ...current, document, loading: false } : current)}
+          onClose={() => setProviderManager(null)}
+          onError={(message) => setError(message)}
+        />
+      )}
     </div>
   )
 }
@@ -338,10 +450,12 @@ function WorkspaceTree(props: {
   selectedProjectID: string
   selectedSessionID: string
   disabled: boolean
+  runningSessionID: string
   version: string
   onSelectProject: (id: string) => void
   onSelectSession: (projectID: string, sessionID: string) => void
   onCreateSession: (projectID: string) => void
+  onManageProviders: (projectID: string) => void
   onArchiveSession: (session: Session) => void
   onDeleteSession: (session: Session) => void
   onAdd: () => void
@@ -364,7 +478,11 @@ function WorkspaceTree(props: {
         {props.projects.map((project) => {
           const sessions = props.sessionsByProject[project.id] ?? []
           const expanded = expandedProjects.has(project.id)
-          const visibleSessions = expanded ? sessions : sessions.slice(0, 3)
+		  const collapsedSessions = sessions.slice(0, 3)
+		  const runningSession = sessions.find((session) => session.id === props.runningSessionID)
+		  const visibleSessions = expanded || !runningSession || collapsedSessions.some((session) => session.id === runningSession.id)
+			? (expanded ? sessions : collapsedSessions)
+			: [...collapsedSessions, runningSession]
           return (
             <section className="project-tree-group" key={project.id}>
               <div className={`project-tree-header ${project.id === props.selectedProjectID ? 'selected' : ''}`}>
@@ -378,6 +496,12 @@ function WorkspaceTree(props: {
                 </button>
                 <button
                   className="tree-icon-button"
+                  onClick={() => props.onManageProviders(project.id)}
+                  aria-label={`管理 ${projectName(project)} 的 Provider`}
+                  title="Provider 与模型设置"
+                ><SettingsIcon /></button>
+                <button
+                  className="tree-icon-button"
                   disabled={props.disabled}
                   onClick={() => props.onCreateSession(project.id)}
                   aria-label={`在 ${projectName(project)} 中新建会话`}
@@ -389,7 +513,6 @@ function WorkspaceTree(props: {
                   <div className={`session-tree-row ${session.id === props.selectedSessionID ? 'selected' : ''}`} key={session.id}>
                     <button
                       className="session-tree-button"
-                      disabled={props.disabled && session.id !== props.selectedSessionID}
                       onClick={() => props.onSelectSession(project.id, session.id)}
                     >
                       <span className="session-icon"><ChatIcon /></span>
@@ -397,7 +520,7 @@ function WorkspaceTree(props: {
                         <strong>{sessionName(session)}</strong>
                         <small>{relativeTime(session.last_used_at || session.updated_at)} · {session.model_id || session.model_profile}</small>
                       </span>
-                      {session.status === 'running' && <span className="live-dot" />}
+					  {(session.status === 'running' || session.id === props.runningSessionID) && <span className="live-dot" />}
                     </button>
                     <div className="session-tree-actions">
                       <button disabled={props.disabled} onClick={() => props.onArchiveSession(session)} aria-label={`归档 ${sessionName(session)}`} title="归档"><ArchiveIcon /></button>
@@ -406,10 +529,10 @@ function WorkspaceTree(props: {
                   </div>
                 ))}
                 {sessions.length === 0 && <p className="tree-empty">暂无会话</p>}
-                {sessions.length > 3 && (
+                {(expanded ? sessions.length > 3 : sessions.length > visibleSessions.length) && (
                   <button className="tree-expand-button" onClick={() => toggleProject(project.id)}>
                     <ChevronIcon expanded={expanded} />
-                    {expanded ? '收起' : `展开另外 ${sessions.length - 3} 个会话`}
+					{expanded ? '收起' : `展开另外 ${sessions.length - visibleSessions.length} 个会话`}
                   </button>
                 )}
               </div>
@@ -418,7 +541,7 @@ function WorkspaceTree(props: {
         })}
       </nav>
       <div className="project-rail-footer">
-        <button className="secondary-button full" onClick={props.onAdd}><PlusIcon /> 添加项目</button>
+		<button className="secondary-button full" disabled={props.disabled} onClick={props.onAdd}><PlusIcon /> 添加项目</button>
         <span className="version">v{props.version || 'dev'} · local</span>
       </div>
     </aside>
@@ -429,6 +552,7 @@ function Conversation(props: {
   detail: Session | null
   page: ItemsPage | null
   activeRun: ActiveRun | null
+	busy: boolean
 	recentStepsByTurn: Record<string, RunStep[]>
   onLoadOlder: () => void
   onSend: (content: string) => void
@@ -436,49 +560,126 @@ function Conversation(props: {
   onCompact: () => void
 }) {
   const bottomRef = useRef<HTMLDivElement>(null)
+	const messagesRef = useRef<HTMLElement>(null)
+	const followOutputRef = useRef(true)
+	useEffect(() => {
+		followOutputRef.current = true
+		bottomRef.current?.scrollIntoView({ behavior: 'auto' })
+	}, [props.detail?.id])
   useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: props.activeRun ? 'smooth' : 'auto' })
+		if (followOutputRef.current) bottomRef.current?.scrollIntoView({ behavior: 'auto' })
 	}, [props.activeRun?.assistantText, props.activeRun?.steps, props.page?.newest_seq])
+	const updateFollowOutput = () => {
+		const messages = messagesRef.current
+		if (!messages) return
+		followOutputRef.current = messages.scrollHeight - messages.scrollTop - messages.clientHeight <= autoScrollThresholdPX
+	}
+	const visibleItems = props.activeRun?.turnID
+		? (props.page?.items ?? []).filter((item) => item.turn_id !== props.activeRun?.turnID)
+		: (props.page?.items ?? [])
 
   return (
     <div className="conversation">
       <header className="conversation-header">
-        <div>
+        <div className="conversation-heading">
           <h1>{props.detail ? sessionName(props.detail) : '加载中…'}</h1>
-          {props.detail && <p>{props.detail.provider} / {props.detail.model_id}</p>}
+		  {props.detail && (
+			<div className="conversation-meta">
+			  <p>{props.detail.provider} / {props.detail.model_id}</p>
+			  <ContextUsage context={props.detail.context} activeInputTokens={props.activeRun?.inputTokens} />
+			</div>
+		  )}
         </div>
         <div className="header-actions">
-          <span className={`status-pill ${props.activeRun ? 'running' : ''}`}><span />{props.activeRun ? '运行中' : '就绪'}</span>
-          <button className="secondary-button" disabled={!props.detail || Boolean(props.activeRun)} onClick={props.onCompact}>压缩上下文</button>
+		  <span className={`status-pill ${props.busy ? 'running' : ''}`}><span />{props.activeRun ? '运行中' : props.busy ? '其他会话运行中' : '就绪'}</span>
+		  <button className="secondary-button" disabled={!props.detail || props.busy} onClick={props.onCompact}>压缩上下文</button>
         </div>
       </header>
-      <section className="messages" aria-live="polite">
+      <section ref={messagesRef} className="messages" aria-live="polite" onScroll={updateFollowOutput}>
         {props.page?.has_more_before && <button className="load-older" onClick={props.onLoadOlder}>加载更早消息</button>}
         {!props.page && <MessageSkeleton />}
-				{buildConversationEntries(props.page?.items ?? [], props.detail?.id ?? '', props.recentStepsByTurn).map((entry) => entry.kind === 'message'
+				{buildConversationEntries(visibleItems, props.detail?.id ?? '', props.recentStepsByTurn).map((entry) => entry.kind === 'message'
 					? <Message key={entry.item.id} item={entry.item} />
 					: <HistoricalProcess key={entry.id} entry={entry} />)}
         {props.activeRun && <ActiveRunView run={props.activeRun} />}
-        {props.page && props.page.items.length === 0 && !props.activeRun && (
+		{props.page && visibleItems.length === 0 && !props.activeRun && (
           <div className="conversation-empty"><SparkIcon /><h3>开始一个新任务</h3><p>描述目标、问题或需要修改的代码。</p></div>
         )}
         <div ref={bottomRef} />
       </section>
-      <Composer running={Boolean(props.activeRun)} onSend={props.onSend} onCancel={props.onCancel} />
+	  <Composer running={Boolean(props.activeRun)} blocked={props.busy && !props.activeRun} onSend={props.onSend} onCancel={props.onCancel} />
     </div>
   )
+}
+
+function ContextUsage(props: { context: Session['context']; activeInputTokens?: number }) {
+	const context = props.context
+	const contextWindow = Number(context?.context_window ?? 0)
+	if (contextWindow <= 0) return null
+
+	const liveInputTokens = Number(props.activeInputTokens ?? 0)
+	const recordedInputTokens = Number(context?.last_input_tokens ?? 0)
+	const requestEstimate = Number(context?.last_request_tokens ?? 0)
+	const usedTokens = liveInputTokens > 0 ? liveInputTokens : recordedInputTokens > 0 ? recordedInputTokens : requestEstimate
+	const usageEstimated = liveInputTokens <= 0 && (recordedInputTokens <= 0 || context?.last_usage_source !== 'provider')
+	const percent = usedTokens > 0 ? usedTokens / contextWindow * 100 : 0
+	const warningThreshold = Number(context?.warning_threshold_percent ?? 80)
+	const tone = percent >= 100 ? 'critical' : percent >= warningThreshold ? 'warning' : ''
+	const progress = Math.min(100, Math.max(0, percent))
+	const percentLabel = `${usageEstimated && usedTokens > 0 ? '约 ' : ''}${Math.round(percent)}%`
+	const usageSource = usedTokens <= 0 ? '尚无使用数据' : usageEstimated ? '使用量为本地估算' : '使用量来自模型返回值'
+	const windowSource = context?.context_window_source === 'configured' ? '窗口来自模型配置' : '窗口为默认估算值'
+	const title = `上下文：${usedTokens.toLocaleString()} / ${contextWindow.toLocaleString()} tokens（${percent.toFixed(1)}%）\n${usageSource}；${windowSource}`
+
+	return (
+		<div className={`context-usage ${tone}`} title={title}>
+			<div className="context-usage-copy">
+				<span>Context</span>
+				<strong>{formatTokenCount(usedTokens)} / {formatTokenCount(contextWindow)}</strong>
+				<small>{percentLabel}</small>
+			</div>
+			<div
+				className="context-progress"
+				role="progressbar"
+				aria-label="上下文使用量"
+				aria-valuemin={0}
+				aria-valuemax={contextWindow}
+				aria-valuenow={Math.min(usedTokens, contextWindow)}
+			>
+				<i style={{ width: `${progress}%` }} />
+			</div>
+		</div>
+	)
 }
 
 function Message({ item }: { item: SessionItem }) {
   const role = item.message?.role
   const text = item.message?.content?.inline || item.message?.content?.preview || ''
+	const [copyStatus, setCopyStatus] = useState<'idle' | 'copied' | 'error'>('idle')
   if (!text) return null
+	const copyMessage = async () => {
+		try {
+			await copyText(text)
+			setCopyStatus('copied')
+			window.setTimeout(() => setCopyStatus('idle'), 1600)
+		} catch {
+			setCopyStatus('error')
+			window.setTimeout(() => setCopyStatus('idle'), 2200)
+		}
+	}
   return (
     <article className={`message ${role === 'user' ? 'user' : 'assistant'}`}>
       <div className="message-avatar">{role === 'user' ? '你' : <LogoIcon />}</div>
       <div className="message-content">
         <div className="message-meta"><strong>{role === 'user' ? '你' : 'SAI'}</strong><time>{formatTime(item.created_at)}</time></div>
-        <div className="message-text">{text}</div>
+        {role === 'user' ? <div className="message-text">{text}</div> : <MarkdownMessage text={text} />}
+		{role === 'assistant' && (
+			<div className="message-tools" aria-label="消息操作">
+				<button className="message-tool-button" onClick={() => void copyMessage()} title="复制完整输出">
+					<CopyIcon />{copyStatus === 'copied' ? '已复制' : copyStatus === 'error' ? '复制失败' : '复制'}
+				</button>
+			</div>
+		)}
       </div>
     </article>
   )
@@ -496,11 +697,23 @@ function ActiveRunView({ run }: { run: ActiveRun }) {
         <div className="message-content">
           <div className="message-meta"><strong>SAI</strong><span className="streaming-label"><i />生成中</span></div>
 					{run.steps.length > 0 && <ProcessTimeline steps={run.steps} />}
-          <div className="message-text assistant-stream">{run.assistantText || <span className="cursor" />}</div>
+          {run.assistantText ? <MarkdownMessage text={run.assistantText} streaming /> : <div className="message-text assistant-stream"><span className="cursor" /></div>}
           {run.totalTokens !== undefined && <div className="token-note">本轮 {run.totalTokens.toLocaleString()} tokens</div>}
         </div>
       </article>
     </>
+  )
+}
+
+const markdownComponents: Components = {
+  a: ({ node: _node, ...props }) => <a {...props} target="_blank" rel="noreferrer noopener" />,
+}
+
+function MarkdownMessage({ text, streaming = false }: { text: string; streaming?: boolean }) {
+  return (
+    <div className={`message-text markdown-body ${streaming ? 'assistant-stream' : ''}`}>
+      <Markdown remarkPlugins={[remarkGfm]} components={markdownComponents} skipHtml>{text}</Markdown>
+    </div>
   )
 }
 
@@ -513,6 +726,7 @@ function buildConversationEntries(items: SessionItem[], sessionID: string, recen
 	let steps: RunStep[] = []
 	let processCreatedAt = ''
 	let processTurnID = ''
+	let agentIteration = 0
 	const emittedRecentTurns = new Set<string>()
 
 	const flushProcess = (turnID = processTurnID) => {
@@ -534,18 +748,21 @@ function buildConversationEntries(items: SessionItem[], sessionID: string, recen
 		if (role === 'user') {
 			flushProcess(processTurnID)
 			processTurnID = item.turn_id || ''
+			agentIteration = 0
 			entries.push({ kind: 'message', item })
 			continue
 		}
 		if (role === 'assistant' && (item.message?.tool_calls?.length ?? 0) > 0) {
+			agentIteration = item.agent_iteration || agentIteration + 1
 			if (!processCreatedAt) processCreatedAt = item.created_at
 			if (!processTurnID) processTurnID = item.turn_id || ''
-			if (text) steps.push({ kind: 'reasoning', id: `${item.id}-output`, text, label: '模型输出' })
+			if (text) steps.push({ kind: 'output', id: `${item.id}-output`, text, iteration: agentIteration })
 			for (const toolCall of item.message?.tool_calls ?? []) {
 				steps.push({
 					kind: 'tool',
 					id: toolCall.id,
 					name: toolCall.name,
+					iteration: agentIteration,
 					arguments: toolCall.arguments,
 					status: 'requested',
 				})
@@ -553,6 +770,7 @@ function buildConversationEntries(items: SessionItem[], sessionID: string, recen
 			continue
 		}
 		if (role === 'tool') {
+			agentIteration = item.agent_iteration || agentIteration || 1
 			if (!processCreatedAt) processCreatedAt = item.created_at
 			if (!processTurnID) processTurnID = item.turn_id || ''
 			const toolCallID = item.message?.tool_call_id || item.id
@@ -562,7 +780,7 @@ function buildConversationEntries(items: SessionItem[], sessionID: string, recen
 				const tool = steps[index] as ToolActivity
 				steps[index] = { ...tool, result: text, status }
 			} else {
-				steps.push({ kind: 'tool', id: toolCallID, name: 'tool', result: text, status })
+				steps.push({ kind: 'tool', id: toolCallID, name: 'tool', iteration: agentIteration, result: text, status })
 			}
 			continue
 		}
@@ -576,8 +794,10 @@ function buildConversationEntries(items: SessionItem[], sessionID: string, recen
 
 function HistoricalProcess({ entry }: { entry: Extract<ConversationEntry, { kind: 'process' }> }) {
 	const reasoningCount = entry.steps.filter((step) => step.kind === 'reasoning').length
-	const toolCount = entry.steps.length - reasoningCount
-	const summary = [reasoningCount > 0 ? `${reasoningCount} 段思考` : '', toolCount > 0 ? `${toolCount} 次工具调用` : ''].filter(Boolean).join(' · ')
+	const outputCount = entry.steps.filter((step) => step.kind === 'output').length
+	const toolCount = entry.steps.filter((step) => step.kind === 'tool').length
+	const iterationCount = new Set(entry.steps.map((step) => step.iteration)).size
+	const summary = [`${iterationCount} 轮`, reasoningCount > 0 ? `${reasoningCount} 段思考` : '', outputCount > 0 ? `${outputCount} 段中间输出` : '', toolCount > 0 ? `${toolCount} 次工具调用` : ''].filter(Boolean).join(' · ')
 	return (
 		<article className="message assistant process-message">
 			<div className="message-avatar"><LogoIcon /></div>
@@ -592,11 +812,21 @@ function HistoricalProcess({ entry }: { entry: Extract<ConversationEntry, { kind
 }
 
 function ProcessTimeline({ steps }: { steps: RunStep[] }) {
+	const iterations = groupProcessSteps(steps)
 	return (
-		<div className="process-timeline">
-			{steps.map((step) => step.kind === 'reasoning'
-				? <div className="reasoning-step" key={step.id}><span>{step.label || '思考过程'}</span><pre>{step.text}</pre></div>
-				: <ToolRow key={step.id} tool={step} />)}
+		<div className="process-iterations">
+			{iterations.map((iteration) => (
+				<section className="process-iteration" key={iteration.number}>
+					<div className="process-iteration-title">第 {iteration.number} 轮</div>
+					<div className="process-timeline">
+						{iteration.steps.map((step) => step.kind === 'reasoning'
+							? <div className="reasoning-step" key={step.id}><span>{step.label || '思考过程'}</span><pre>{step.text}</pre></div>
+							: step.kind === 'output'
+								? <div className="model-output-step" key={step.id}><span>Agent 中间输出</span><pre>{step.text}</pre></div>
+								: <ToolRow key={step.id} tool={step} />)}
+					</div>
+				</section>
+			))}
 		</div>
 	)
 }
@@ -620,10 +850,10 @@ function ToolRow({ tool }: { tool: ToolActivity }) {
   )
 }
 
-function Composer(props: { running: boolean; onSend: (content: string) => void; onCancel: () => void }) {
+function Composer(props: { running: boolean; blocked: boolean; onSend: (content: string) => void; onCancel: () => void }) {
   const [content, setContent] = useState('')
   const submit = () => {
-    if (!content.trim() || props.running) return
+	if (!content.trim() || props.running || props.blocked) return
     props.onSend(content.trim())
     setContent('')
   }
@@ -632,9 +862,9 @@ function Composer(props: { running: boolean; onSend: (content: string) => void; 
       <div className="composer">
         <textarea
           value={content}
-          disabled={props.running}
+		  disabled={props.running || props.blocked}
           rows={1}
-          placeholder={props.running ? 'SAI 正在执行…' : '给 SAI 发送消息'}
+		  placeholder={props.running ? 'SAI 正在执行…' : props.blocked ? '另一个会话正在执行，可切回查看进度' : '给 SAI 发送消息'}
           onChange={(event) => setContent(event.target.value)}
           onKeyDown={(event) => {
             if (event.key === 'Enter' && !event.shiftKey) {
@@ -646,12 +876,399 @@ function Composer(props: { running: boolean; onSend: (content: string) => void; 
         {props.running ? (
           <button className="stop-button" onClick={props.onCancel}><StopIcon /> 停止</button>
         ) : (
-          <button className="send-button" disabled={!content.trim()} onClick={submit} aria-label="发送"><SendIcon /></button>
+		  <button className="send-button" disabled={!content.trim() || props.blocked} onClick={submit} aria-label="发送"><SendIcon /></button>
         )}
       </div>
       <div className="composer-hint"><span>Enter 发送 · Shift+Enter 换行</span><span>本地运行</span></div>
     </div>
   )
+}
+
+function SessionModelDialog(props: {
+  project?: Project
+  state: SessionCreatorState
+  creating: boolean
+  onSelect: (key: string) => void
+  onReasoningLevel: (level: string) => void
+  onCancel: () => void
+  onCreate: (model: SessionModelOption) => void
+}) {
+  const selected = props.state.models.find((model) => modelKey(model) === props.state.selectedKey)
+  return (
+    <div className="model-dialog-backdrop">
+      <section className="model-dialog" role="dialog" aria-modal="true" aria-labelledby="model-dialog-title">
+        <div className="model-dialog-header">
+          <div className="model-dialog-icon"><ChatIcon /></div>
+          <div>
+            <span className="eyebrow">新建会话</span>
+            <h2 id="model-dialog-title">选择模型</h2>
+            <p>{props.project ? `${projectName(props.project)} · ${props.project.root}` : '加载项目配置'}</p>
+          </div>
+          <button className="model-dialog-close" disabled={props.creating} onClick={props.onCancel} aria-label="关闭">×</button>
+        </div>
+        <div className="model-choice-list">
+          {props.state.loading ? (
+            <div className="model-choice-loading"><i /><i /><i /></div>
+          ) : props.state.models.length > 0 ? props.state.models.map((model) => {
+            const selectedModel = modelKey(model) === props.state.selectedKey
+            const isDefault = model.provider === props.state.defaultProvider && model.model_profile === props.state.defaultModel
+            return (
+              <button
+                type="button"
+                className={`model-choice ${selectedModel ? 'selected' : ''}`}
+                disabled={props.creating}
+                aria-pressed={selectedModel}
+                onClick={() => props.onSelect(modelKey(model))}
+                key={modelKey(model)}
+              >
+                <span className="model-choice-mark">{selectedModel ? '✓' : ''}</span>
+                <span className="model-choice-copy">
+                  <span><strong>{model.model_profile}</strong>{isDefault && <small>默认</small>}</span>
+                  <code>{model.provider} / {model.model_id}</code>
+                </span>
+              </button>
+            )
+          }) : (
+            <p className="model-choice-empty">项目配置中没有可用模型。</p>
+          )}
+        </div>
+        {selected && (selected.reasoning_levels?.length ?? 0) > 0 && (
+          <label className="reasoning-choice">
+            <span>推理强度</span>
+            <select value={props.state.reasoningLevel || selected.default_reasoning_level || ''} disabled={props.creating} onChange={(event) => props.onReasoningLevel(event.target.value)}>
+              {selected.reasoning_levels?.map((level) => <option value={level} key={level}>{reasoningLevelLabel(level)}</option>)}
+            </select>
+            <small>界面使用统一等级，实际请求值由该模型的 reasoning config 映射。</small>
+          </label>
+        )}
+        <div className="model-dialog-actions">
+          <button className="secondary-button" disabled={props.creating} onClick={props.onCancel}>取消</button>
+          <button className="primary-button" disabled={!selected || props.creating} onClick={() => selected && props.onCreate(selected)}>
+            {props.creating ? '创建中…' : '创建会话'}
+          </button>
+        </div>
+      </section>
+    </div>
+  )
+}
+
+interface EditableProviderModel {
+  profile: string
+  id: string
+  type: string
+  contextWindow: string
+  parametersJSON: string
+  reasoningParameter: string
+  reasoningDefault: string
+  reasoningLevelsJSON: string
+}
+
+interface ProviderDraft {
+  existingName: string
+  name: string
+  baseURL: string
+  apiKey: string
+  keepAPIKey: boolean
+  apiKeyConfigured: boolean
+  authFile: string
+  requestTimeout: string
+  models: EditableProviderModel[]
+}
+
+function ProviderManagerDialog(props: {
+  project?: Project
+  state: ProviderManagerState
+  onDocument: (document: ProviderSettingsDocument) => void
+  onClose: () => void
+  onError: (message: string) => void
+}) {
+  const [draft, setDraft] = useState<ProviderDraft | null>(null)
+  const [saving, setSaving] = useState(false)
+  const [discovering, setDiscovering] = useState(false)
+  const [discoveredModels, setDiscoveredModels] = useState<string[]>([])
+  const [codexAuth, setCodexAuth] = useState<CodexAuthStatus | null>(null)
+  const document = props.state.document
+
+  const selectProvider = useCallback((provider: ProviderSettings) => {
+    setDraft(providerDraft(provider))
+    setCodexAuth(provider.codex_auth ?? null)
+    setDiscoveredModels([])
+  }, [])
+
+  useEffect(() => {
+    if (!document || draft) return
+    const provider = document.providers.find((item) => item.name === document.default_provider) ?? document.providers[0]
+    if (provider) selectProvider(provider)
+    else setDraft(emptyProviderDraft())
+  }, [document, draft, selectProvider])
+
+  useEffect(() => {
+    if (codexAuth?.status !== 'pending' || !draft?.existingName) return
+    const timer = window.setInterval(() => {
+      void api.codexLoginStatus(props.state.projectID, draft.existingName)
+        .then(setCodexAuth)
+        .catch((reason: unknown) => props.onError(errorMessage(reason)))
+    }, 1500)
+    return () => window.clearInterval(timer)
+  }, [codexAuth?.status, draft?.existingName, props.state.projectID, props.onError])
+
+  const save = async () => {
+    if (!draft || saving) return
+    setSaving(true)
+    try {
+      const input = providerInput(draft)
+      const updated = draft.existingName
+        ? await api.updateProvider(props.state.projectID, draft.existingName, input)
+        : await api.createProvider(props.state.projectID, input)
+      props.onDocument(updated)
+      const saved = updated.providers.find((provider) => provider.name === input.name)
+      if (saved) selectProvider(saved)
+    } catch (reason) {
+      props.onError(errorMessage(reason))
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  const discoverModels = async () => {
+    if (!draft?.existingName || discovering) return
+    setDiscovering(true)
+    try {
+      const result = await api.discoverProviderModels(props.state.projectID, draft.existingName)
+      setDiscoveredModels(result.models)
+    } catch (reason) {
+      props.onError(errorMessage(reason))
+    } finally {
+      setDiscovering(false)
+    }
+  }
+
+  const setDefault = async (profile: string) => {
+    if (!draft?.existingName) return
+    try {
+      props.onDocument(await api.updateProviderDefault(props.state.projectID, draft.existingName, profile))
+    } catch (reason) {
+      props.onError(errorMessage(reason))
+    }
+  }
+
+  const startCodexLogin = async () => {
+    if (!draft?.existingName) return
+    try {
+      setCodexAuth(await api.startCodexLogin(props.state.projectID, draft.existingName))
+    } catch (reason) {
+      props.onError(errorMessage(reason))
+    }
+  }
+
+  const clearCodexLogin = async () => {
+    if (!draft?.existingName || !window.confirm('退出该项目的 Codex 登录？')) return
+    try {
+      await api.clearCodexLogin(props.state.projectID, draft.existingName)
+      setCodexAuth({ status: 'signed_out' })
+    } catch (reason) {
+      props.onError(errorMessage(reason))
+    }
+  }
+
+  const updateModel = (index: number, patch: Partial<EditableProviderModel>) => {
+    setDraft((current) => current ? { ...current, models: current.models.map((model, modelIndex) => modelIndex === index ? { ...model, ...patch } : model) } : current)
+  }
+
+  const usesCodex = draft?.models.some((model) => model.type === 'openai-codex') ?? false
+  const savedCodexProvider = document?.providers.find((provider) => provider.name === draft?.existingName)?.models.some((model) => model.type === 'openai-codex') ?? false
+
+  return (
+    <div className="model-dialog-backdrop provider-dialog-backdrop">
+      <section className="provider-dialog" role="dialog" aria-modal="true" aria-labelledby="provider-dialog-title">
+        <header className="provider-dialog-header">
+          <div>
+            <span className="eyebrow">项目配置</span>
+            <h2 id="provider-dialog-title">Provider 与模型</h2>
+            <p>{props.project ? `${projectName(props.project)} · ${props.project.root}` : props.state.projectID}</p>
+          </div>
+          <button className="model-dialog-close" disabled={saving} onClick={props.onClose} aria-label="关闭">×</button>
+        </header>
+        {props.state.loading || !document || !draft ? (
+          <div className="provider-loading">读取项目配置…</div>
+        ) : (
+          <div className="provider-dialog-body">
+            <aside className="provider-list">
+              {document.providers.map((provider) => (
+                <button className={draft.existingName === provider.name ? 'selected' : ''} onClick={() => selectProvider(provider)} key={provider.name}>
+                  <strong>{provider.name}</strong>
+                  <small>{provider.models.length} 个模型</small>
+                </button>
+              ))}
+              <button className={!draft.existingName ? 'selected add-provider' : 'add-provider'} onClick={() => { setDraft(emptyProviderDraft()); setCodexAuth(null); setDiscoveredModels([]) }}><PlusIcon /> 新增 Provider</button>
+            </aside>
+            <div className="provider-editor">
+              <section className="settings-section">
+                <div className="settings-section-title"><h3>连接配置</h3>{draft.existingName && <code>{draft.existingName}.yaml</code>}</div>
+                <div className="settings-grid">
+                  <label>名称<input value={draft.name} disabled={Boolean(draft.existingName)} onChange={(event) => setDraft({ ...draft, name: event.target.value })} placeholder="openai" /></label>
+                  <label>请求超时<input value={draft.requestTimeout} onChange={(event) => setDraft({ ...draft, requestTimeout: event.target.value })} placeholder="60s" /></label>
+                  <label className="wide">Base URL<input value={draft.baseURL} onChange={(event) => setDraft({ ...draft, baseURL: event.target.value })} placeholder="https://api.openai.com/v1" /></label>
+                  <label className="wide">API Key / 环境变量<input value={draft.apiKey} onChange={(event) => setDraft({ ...draft, apiKey: event.target.value, keepAPIKey: false })} placeholder={draft.apiKeyConfigured ? '已配置；留空并保留下方选项不会修改' : '$OPENAI_API_KEY'} /></label>
+                  {draft.apiKeyConfigured && <label className="checkbox-field wide"><input type="checkbox" checked={draft.keepAPIKey} onChange={(event) => setDraft({ ...draft, keepAPIKey: event.target.checked })} /> 保留当前 API Key</label>}
+                </div>
+              </section>
+
+              {usesCodex && (
+                <section className="settings-section codex-auth-card">
+                  <div className="settings-section-title"><h3>Codex 登录态</h3><span className={`auth-status ${codexAuth?.status ?? 'signed_out'}`}>{codexAuthLabel(codexAuth?.status)}</span></div>
+                  {codexAuth?.account_id && <p>账户：<code>{codexAuth.account_id}</code></p>}
+                  {codexAuth?.expires_at && <p>过期时间：{new Date(codexAuth.expires_at).toLocaleString('zh-CN')}</p>}
+                  {codexAuth?.status === 'pending' && <div className="device-login"><strong>{codexAuth.user_code}</strong><button className="secondary-button" onClick={() => void copyText(codexAuth.user_code ?? '')}>复制验证码</button>{codexAuth.verification_url && <a href={codexAuth.verification_url} target="_blank" rel="noreferrer">打开登录页面</a>}</div>}
+                  {codexAuth?.message && <p className="settings-error">{codexAuth.message}</p>}
+                  <div className="inline-actions">
+                    {codexAuth?.status !== 'pending' && codexAuth?.status !== 'signed_in' && <button className="primary-button" disabled={!savedCodexProvider} onClick={() => void startCodexLogin()}>登录 Codex</button>}
+                    {(codexAuth?.status === 'signed_in' || codexAuth?.status === 'expired') && <button className="secondary-button" onClick={() => void clearCodexLogin()}>退出登录</button>}
+                    {!savedCodexProvider && <small>请先保存 Codex Provider，再开始登录。</small>}
+                  </div>
+                </section>
+              )}
+
+              <section className="settings-section">
+                <div className="settings-section-title">
+                  <div><h3>模型列表</h3><p>推理等级使用统一显示名，映射值可以是字符串、数字、布尔值或对象。</p></div>
+                  <div className="inline-actions">
+                    <button className="secondary-button compact" disabled={!draft.existingName || discovering} onClick={() => void discoverModels()}>{discovering ? '获取中…' : '从 Provider 获取'}</button>
+                    <button className="secondary-button compact" onClick={() => setDraft({ ...draft, models: [...draft.models, emptyProviderModel()] })}><PlusIcon /> 添加模型</button>
+                  </div>
+                </div>
+                <div className="provider-models">
+                  {draft.models.map((model, index) => {
+                    const isDefault = draft.existingName === document.default_provider && model.profile === document.default_model
+                    const reasoningLevels = reasoningLevelOptions(model.reasoningLevelsJSON)
+                    return <article className="provider-model-card" key={`${index}-${model.profile}`}>
+                      <div className="provider-model-heading"><strong>{model.profile || `模型 ${index + 1}`}</strong><div className="inline-actions">{isDefault ? <span className="default-badge">默认</span> : <button className="plain-button" disabled={!draft.existingName || !model.profile} onClick={() => void setDefault(model.profile)}>设为默认</button>}<button className="plain-button danger" disabled={draft.models.length === 1} onClick={() => setDraft({ ...draft, models: draft.models.filter((_, modelIndex) => modelIndex !== index) })}>移除</button></div></div>
+                      <div className="settings-grid model-grid">
+                        {discoveredModels.length > 0 && <label className="wide model-catalog-select">从模型列表选择<select value={discoveredModels.includes(model.id) ? model.id : ''} onChange={(event) => {
+                          const selectedID = event.target.value
+                          if (selectedID) updateModel(index, { id: selectedID, profile: !model.profile || model.profile === model.id ? selectedID : model.profile })
+                        }}><option value="">请选择模型（已获取 {discoveredModels.length} 个）</option>{discoveredModels.map((modelID) => <option value={modelID} key={modelID}>{modelID}</option>)}</select></label>}
+                        <label>配置名<input value={model.profile} onChange={(event) => updateModel(index, { profile: event.target.value })} placeholder="gpt-5.5" /></label>
+                        <label>模型 ID<input value={model.id} onChange={(event) => updateModel(index, { id: event.target.value })} placeholder="也可以手动输入" /></label>
+                        <label>API 类型<select value={model.type || 'openai-chat'} onChange={(event) => updateModel(index, { type: event.target.value })}><option value="openai-chat">OpenAI Chat</option><option value="openai-responses">OpenAI Responses</option><option value="openai-codex">OpenAI Codex</option><option value="anthropic-messages">Anthropic Messages</option></select></label>
+                        <label>Context Window<input type="number" min="0" value={model.contextWindow} onChange={(event) => updateModel(index, { contextWindow: event.target.value })} placeholder="400000" /></label>
+                        <label className="wide">其他请求参数（JSON）<textarea value={model.parametersJSON} onChange={(event) => updateModel(index, { parametersJSON: event.target.value })} rows={3} spellCheck={false} /></label>
+                      </div>
+                      <details className="reasoning-config" open={Boolean(model.reasoningParameter)}>
+                        <summary>Reasoning config {model.reasoningParameter ? <code>{model.reasoningParameter}</code> : <small>留空会写入 Pi 推荐默认</small>}</summary>
+                        <div className="settings-grid model-grid">
+                          <label>参数路径<input value={model.reasoningParameter} onChange={(event) => updateModel(index, { reasoningParameter: event.target.value })} placeholder="reasoning.effort" /></label>
+                          <label>默认等级<select value={reasoningLevels.includes(model.reasoningDefault) ? model.reasoningDefault : ''} disabled={reasoningLevels.length === 0} onChange={(event) => updateModel(index, { reasoningDefault: event.target.value })}><option value="">{reasoningLevels.length === 0 ? '请先填写等级映射' : '不设置默认等级'}</option>{reasoningLevels.map((level) => <option value={level} key={level}>{reasoningLevelLabel(level)} ({level})</option>)}</select></label>
+                          <label className="wide">等级映射（JSON）<textarea value={model.reasoningLevelsJSON} onChange={(event) => updateModel(index, { reasoningLevelsJSON: event.target.value })} rows={4} spellCheck={false} placeholder={'{"low":"low","high":"high"}'} /></label>
+                        </div>
+                      </details>
+                    </article>
+                  })}
+                </div>
+              </section>
+            </div>
+          </div>
+        )}
+        <footer className="model-dialog-actions"><button className="secondary-button" disabled={saving} onClick={props.onClose}>取消</button><button className="primary-button" disabled={!draft || saving} onClick={() => void save()}>{saving ? '保存中…' : '保存配置'}</button></footer>
+      </section>
+    </div>
+  )
+}
+
+function providerDraft(provider: ProviderSettings): ProviderDraft {
+  return {
+    existingName: provider.name,
+    name: provider.name,
+    baseURL: provider.base_url,
+    apiKey: provider.api_key ?? '',
+    keepAPIKey: provider.api_key_configured,
+    apiKeyConfigured: provider.api_key_configured,
+    authFile: provider.auth_file ?? '',
+    requestTimeout: provider.request_timeout ?? '',
+    models: provider.models.map(editableProviderModel),
+  }
+}
+
+function emptyProviderDraft(): ProviderDraft {
+  return { existingName: '', name: '', baseURL: '', apiKey: '', keepAPIKey: false, apiKeyConfigured: false, authFile: '', requestTimeout: '60s', models: [emptyProviderModel()] }
+}
+
+function editableProviderModel(model: ProviderModelSettings): EditableProviderModel {
+  return {
+    profile: model.profile,
+    id: model.id,
+    type: model.type || 'openai-chat',
+    contextWindow: model.context_window ? String(model.context_window) : '',
+    parametersJSON: prettyJSON(model.parameters ?? {}),
+    reasoningParameter: model.reasoning_config?.parameter ?? '',
+    reasoningDefault: model.reasoning_config?.default ?? '',
+    reasoningLevelsJSON: prettyJSON(model.reasoning_config?.levels ?? {}),
+  }
+}
+
+function emptyProviderModel(): EditableProviderModel {
+  return { profile: '', id: '', type: 'openai-chat', contextWindow: '', parametersJSON: '{}', reasoningParameter: '', reasoningDefault: '', reasoningLevelsJSON: '{}' }
+}
+
+function providerInput(draft: ProviderDraft): ProviderSettingsInput {
+  if (!draft.name.trim()) throw new Error('Provider 名称不能为空')
+  if (!draft.baseURL.trim()) throw new Error('Base URL 不能为空')
+  if (draft.models.length === 0) throw new Error('至少需要一个模型')
+  return {
+    name: draft.name.trim(),
+    base_url: draft.baseURL.trim(),
+    api_key: draft.apiKey.trim(),
+    keep_api_key: draft.keepAPIKey,
+    auth_file: draft.authFile.trim(),
+    request_timeout: draft.requestTimeout.trim(),
+    models: draft.models.map((model, index) => {
+      if (!model.profile.trim() || !model.id.trim()) throw new Error(`模型 ${index + 1} 的配置名和模型 ID 不能为空`)
+      const reasoningLevels = parseJSONRecord(model.reasoningLevelsJSON, `模型 ${model.profile} 的等级映射`)
+      if (model.reasoningDefault.trim() && !(model.reasoningDefault.trim() in reasoningLevels)) throw new Error(`模型 ${model.profile} 的默认等级不在等级映射中`)
+      return {
+        profile: model.profile.trim(),
+        id: model.id.trim(),
+        type: model.type,
+        context_window: model.contextWindow ? Number(model.contextWindow) : 0,
+        parameters: parseJSONRecord(model.parametersJSON, `模型 ${model.profile} 的请求参数`),
+        reasoning_config: {
+          parameter: model.reasoningParameter.trim(),
+          default: model.reasoningDefault.trim(),
+          levels: reasoningLevels,
+        },
+      }
+    }),
+  }
+}
+
+function parseJSONRecord(value: string, label: string): Record<string, unknown> {
+  try {
+    const parsed: unknown = JSON.parse(value || '{}')
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('必须是 JSON 对象')
+    return parsed as Record<string, unknown>
+  } catch (reason) {
+    throw new Error(`${label}格式错误：${errorMessage(reason)}`)
+  }
+}
+
+function prettyJSON(value: Record<string, unknown>): string {
+  return JSON.stringify(value, null, 2)
+}
+
+function reasoningLevelOptions(value: string): string[] {
+  try {
+    const parsed: unknown = JSON.parse(value || '{}')
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return []
+    const keys = Object.keys(parsed)
+    const canonical = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max']
+    return [...canonical.filter((level) => keys.includes(level)), ...keys.filter((level) => !canonical.includes(level)).sort()]
+  } catch {
+    return []
+  }
+}
+
+function codexAuthLabel(status?: string): string {
+  return { signed_out: '未登录', pending: '等待授权', signed_in: '已登录', expired: '已过期', error: '认证异常' }[status ?? 'signed_out'] ?? status ?? '未登录'
 }
 
 function ProjectSetup(props: { suggestedRoot: string; hasProjects: boolean; onCancel: () => void; onSubmit: (root: string, name: string) => void }) {
@@ -675,8 +1292,8 @@ function ProjectSetup(props: { suggestedRoot: string; hasProjects: boolean; onCa
   )
 }
 
-function EmptySession({ onCreate }: { onCreate: () => void }) {
-  return <div className="setup-screen"><div className="empty-session"><ChatIcon /><h1>还没有会话</h1><p>创建会话后即可开始与项目中的 Agent 协作。</p><button className="primary-button" onClick={onCreate}><PlusIcon /> 新建会话</button></div></div>
+function EmptySession({ disabled, onCreate }: { disabled: boolean; onCreate: () => void }) {
+  return <div className="setup-screen"><div className="empty-session"><ChatIcon /><h1>还没有会话</h1><p>创建会话后即可开始与项目中的 Agent 协作。</p><button className="primary-button" disabled={disabled} onClick={onCreate}><PlusIcon /> 新建会话</button></div></div>
 }
 
 function ErrorBanner({ message, onDismiss }: { message: string; onDismiss: () => void }) {
@@ -691,16 +1308,23 @@ function MessageSkeleton() {
   return <div className="skeleton"><i /><i /><i /></div>
 }
 
-function appendReasoning(steps: RunStep[], text: string): RunStep[] {
+function appendReasoning(steps: RunStep[], text: string, iteration: number): RunStep[] {
 	if (!text) return steps
+	const normalizedIteration = normalizedAgentIteration(iteration)
 	const last = steps[steps.length - 1]
-	if (last?.kind === 'reasoning') {
+	if (last?.kind === 'reasoning' && last.iteration === normalizedIteration) {
 		return [...steps.slice(0, -1), { ...last, text: last.text + text }]
 	}
-	return [...steps, { kind: 'reasoning', id: `reasoning-${steps.length}`, text }]
+	return [...steps, { kind: 'reasoning', id: `reasoning-${normalizedIteration}-${steps.length}`, text, iteration: normalizedIteration }]
 }
 
-function updateToolStep(steps: RunStep[], event: RunEvent): RunStep[] {
+function appendModelOutput(steps: RunStep[], text: string, iteration: number): RunStep[] {
+	if (!text) return steps
+	const normalizedIteration = normalizedAgentIteration(iteration)
+	return [...steps, { kind: 'output', id: `output-${normalizedIteration}-${steps.length}`, text, iteration: normalizedIteration }]
+}
+
+function updateToolStep(steps: RunStep[], event: RunEvent, iteration: number): RunStep[] {
 	const fields = event as Record<string, unknown>
 	const id = String(fields.tool_call_id ?? '')
 	const name = String(fields.name ?? 'tool')
@@ -715,12 +1339,29 @@ function updateToolStep(steps: RunStep[], event: RunEvent): RunStep[] {
 		kind: 'tool',
 		id: id || `${name}-${steps.length}`,
 		name,
+		iteration: current?.iteration ?? normalizedAgentIteration(iteration),
 		arguments: String(fields.arguments ?? current?.arguments ?? '') || undefined,
 		result: String(fields.content ?? current?.result ?? '') || undefined,
 		status,
 	}
 	if (index < 0) return [...steps, tool]
 	return steps.map((step, stepIndex) => stepIndex === index ? tool : step)
+}
+
+function groupProcessSteps(steps: RunStep[]): Array<{ number: number; steps: RunStep[] }> {
+	const groups = new Map<number, RunStep[]>()
+	for (const step of steps) {
+		const iteration = normalizedAgentIteration(step.iteration)
+		groups.set(iteration, [...(groups.get(iteration) ?? []), step])
+	}
+	const rank = (step: RunStep) => step.kind === 'reasoning' ? 0 : step.kind === 'output' ? 1 : 2
+	return [...groups.entries()]
+		.sort(([left], [right]) => left - right)
+		.map(([number, turnSteps]) => ({ number, steps: [...turnSteps].sort((left, right) => rank(left) - rank(right)) }))
+}
+
+function normalizedAgentIteration(iteration: number): number {
+	return Number.isFinite(iteration) && iteration > 0 ? iteration : 1
 }
 
 function itemText(item: SessionItem): string {
@@ -767,6 +1408,14 @@ function toolDisplayName(name: string): string {
 	}[name] || name
 }
 
+function modelKey(model?: SessionModelOption): string {
+  return model ? `${model.provider}\u0000${model.model_profile}` : ''
+}
+
+function reasoningLevelLabel(level: string): string {
+  return { off: '关闭', minimal: '最少', low: '低', medium: '中', high: '高', xhigh: '超高', max: '最大' }[level] ?? level
+}
+
 function projectName(project: Project): string {
   if (project.display_name) return project.display_name
   return project.root.split(/[\\/]/).filter(Boolean).pop() || project.root
@@ -795,6 +1444,12 @@ function relativeTime(value: string): string {
   return new Date(value).toLocaleDateString('zh-CN')
 }
 
+function formatTokenCount(tokens: number): string {
+	if (tokens >= 1_000_000) return `${(tokens / 1_000_000).toFixed(1).replace(/\.0$/, '')}M`
+	if (tokens >= 1_000) return `${(tokens / 1_000).toFixed(1).replace(/\.0$/, '')}K`
+	return Math.max(0, tokens).toLocaleString()
+}
+
 function formatTime(value: string): string {
   const date = new Date(value)
   return Number.isFinite(date.getTime()) ? date.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' }) : ''
@@ -808,16 +1463,36 @@ function errorMessage(reason: unknown): string {
   return reason instanceof Error ? reason.message : '发生未知错误'
 }
 
+async function copyText(text: string): Promise<void> {
+	if (navigator.clipboard?.writeText) {
+		await navigator.clipboard.writeText(text)
+		return
+	}
+	const textarea = document.createElement('textarea')
+	textarea.value = text
+	textarea.style.position = 'fixed'
+	textarea.style.opacity = '0'
+	document.body.appendChild(textarea)
+	textarea.select()
+	try {
+		if (!document.execCommand('copy')) throw new Error('copy command was rejected')
+	} finally {
+		textarea.remove()
+	}
+}
+
 const LogoIcon = () => <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7.2 4.4 12 2l4.8 2.4 3 4.4-.2 5.2-3.2 4.2L12 22l-4.4-3.8L4.4 14l-.2-5.2 3-4.4Z"/><path d="m8 9 4-2 4 2v5l-4 3-4-3V9Z"/></svg>
 const PlusIcon = () => <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14" /></svg>
 const ChatIcon = () => <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 5h14v11H9l-4 3V5Z" /></svg>
 const ArchiveIcon = () => <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16v13H4V7Zm-1-4h18v4H3V3Zm6 8h6" /></svg>
 const TrashIcon = () => <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M9 7V4h6v3m3 0-1 14H7L6 7m4 4v6m4-6v6" /></svg>
+const CopyIcon = () => <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="8" y="8" width="11" height="11" /><path d="M16 8V5H5v11h3" /></svg>
 const ChevronIcon = ({ expanded }: { expanded: boolean }) => <svg className={expanded ? 'expanded' : ''} viewBox="0 0 24 24" aria-hidden="true"><path d="m8 10 4 4 4-4" /></svg>
 const SendIcon = () => <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m4 4 17 8-17 8 3-8-3-8Zm3 8h14" /></svg>
 const StopIcon = () => <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="7" y="7" width="10" height="10" rx="1" /></svg>
 const ToolIcon = () => <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m14 6 4-4 4 4-4 4m-6 4L4 22l-2-2 8-8m8-2-8 8" /></svg>
 const FolderIcon = () => <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 6h7l2 2h9v11H3V6Z" /></svg>
 const SparkIcon = () => <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m12 2 1.6 6.4L20 10l-6.4 1.6L12 18l-1.6-6.4L4 10l6.4-1.6L12 2Z" /></svg>
+const SettingsIcon = () => <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3" /><path d="M19 13.5v-3l-2-.7-.7-1.7.9-1.9-2.1-2.1-1.9.9-1.7-.7-.7-2h-3l-.7 2-1.7.7-1.9-.9-2.1 2.1.9 1.9-.7 1.7-2 .7v3l2 .7.7 1.7-.9 1.9 2.1 2.1 1.9-.9 1.7.7.7 2h3l.7-2 1.7-.7 1.9.9 2.1-2.1-.9-1.9.7-1.7 2-.7Z" /></svg>
 
 export default App

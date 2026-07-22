@@ -88,6 +88,7 @@ See [docs/configuration.md](docs/configuration.md) for the supported schema.
 The first release provides:
 
 - Registered project navigation.
+- Project-level Provider/model configuration and Codex device login.
 - Durable session creation and history.
 - Streaming assistant and reasoning output.
 - Tool requested/running/finished status.
