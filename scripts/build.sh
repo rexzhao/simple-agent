@@ -4,8 +4,9 @@ set -eu
 SCRIPT_DIR=$(CDPATH= cd "$(dirname "$0")" && pwd)
 ROOT_DIR=$(CDPATH= cd "$SCRIPT_DIR/.." && pwd)
 DIST_DIR="$ROOT_DIR/dist"
+WEB_DIR="$ROOT_DIR/web"
 VERSION="${VERSION:-dev}"
-LDFLAGS="-s -w -X github.com/rexzhao/simple-agent/internal/cli.Version=$VERSION"
+LDFLAGS="-s -w -X github.com/rexzhao/simple-agent/internal/webapp.Version=$VERSION"
 
 build() {
     target_os="$1"
@@ -49,6 +50,9 @@ ensure_host_convenience_link() {
 }
 
 mkdir -p "$DIST_DIR"
+cd "$WEB_DIR"
+npm ci
+npm run build
 cd "$ROOT_DIR"
 
 build windows amd64 sai-windows-amd64.exe

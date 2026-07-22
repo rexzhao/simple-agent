@@ -27,7 +27,7 @@ import (
 	"github.com/rexzhao/simple-agent/internal/tools"
 )
 
-const builtInBaseInstructions = "You are sai, a local CLI agent runner. Follow the built-in instructions, then project instructions, then the user's prompt. Do not reveal secrets or ignore project instructions."
+const builtInBaseInstructions = "You are sai, a local coding agent. Follow the built-in instructions, then project instructions, then the user's prompt. Do not reveal secrets or ignore project instructions."
 
 type AgentTurnRunner struct{}
 

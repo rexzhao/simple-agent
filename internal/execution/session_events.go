@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/rexzhao/simple-agent/internal/eventbus"
 	"github.com/rexzhao/simple-agent/internal/model"
@@ -16,31 +17,39 @@ import (
 const defaultSessionChatItemsLimit = 50
 
 type SessionItemsPage struct {
-	Items         []SessionItem
-	OldestSeq     int64
-	NewestSeq     int64
-	HasMoreBefore bool
-	HasMoreAfter  bool
+	Items         []SessionItem `json:"items"`
+	OldestSeq     int64         `json:"oldest_seq"`
+	NewestSeq     int64         `json:"newest_seq"`
+	HasMoreBefore bool          `json:"has_more_before"`
+	HasMoreAfter  bool          `json:"has_more_after"`
+}
+
+type SessionItemsOptions struct {
+	BeforeSeq int64
+	AfterSeq  int64
+	Limit     int
 }
 
 type SessionItem struct {
-	Seq        int64
-	ID         string
-	TurnID     string
-	Kind       string
-	Visibility string
-	Audience   string
-	Message    *SessionItemMessage
+	Seq        int64               `json:"seq"`
+	ID         string              `json:"id"`
+	TurnID     string              `json:"turn_id,omitempty"`
+	CreatedAt  time.Time           `json:"created_at"`
+	Kind       string              `json:"kind"`
+	Visibility string              `json:"visibility"`
+	Audience   string              `json:"audience"`
+	Status     string              `json:"status,omitempty"`
+	Message    *SessionItemMessage `json:"message,omitempty"`
 }
 
 type SessionItemMessage struct {
-	Role    string
-	Content *SessionItemMessageContent
+	Role    string                     `json:"role"`
+	Content *SessionItemMessageContent `json:"content,omitempty"`
 }
 
 type SessionItemMessageContent struct {
-	Inline  string
-	Preview string
+	Inline  string `json:"inline,omitempty"`
+	Preview string `json:"preview,omitempty"`
 }
 
 type SessionStreamEvent map[string]any
@@ -186,8 +195,25 @@ func submitSessionStreamEvent(submit func(SessionStreamEvent), event SessionStre
 }
 
 func (s *Service) GetSessionChatItems(id string) (SessionItemsPage, error) {
+	return s.GetSessionChatItemsPage(id, SessionItemsOptions{})
+}
+
+func (s *Service) GetSessionChatItemsPage(id string, options SessionItemsOptions) (SessionItemsPage, error) {
 	if s == nil || s.sessionStore == nil {
 		return SessionItemsPage{}, fmt.Errorf("execution session store is not configured")
+	}
+	if options.BeforeSeq < 0 || options.AfterSeq < 0 {
+		return SessionItemsPage{}, fmt.Errorf("session item cursors must be non-negative")
+	}
+	if options.BeforeSeq > 0 && options.AfterSeq > 0 {
+		return SessionItemsPage{}, fmt.Errorf("before_seq and after_seq cannot be combined")
+	}
+	limit := options.Limit
+	if limit <= 0 {
+		limit = defaultSessionChatItemsLimit
+	}
+	if limit > 200 {
+		return SessionItemsPage{}, fmt.Errorf("session item limit cannot exceed 200")
 	}
 	session, err := s.sessionStore.Load(id)
 	if err != nil {
@@ -200,7 +226,7 @@ func (s *Service) GetSessionChatItems(id string) (SessionItemsPage, error) {
 			filtered = append(filtered, item)
 		}
 	}
-	page, hasMoreBefore := recentSessionItems(filtered, defaultSessionChatItemsLimit)
+	page, hasMoreBefore, hasMoreAfter := pagedSessionItems(filtered, options.BeforeSeq, options.AfterSeq, limit)
 	items := make([]SessionItem, 0, len(page))
 	for _, item := range page {
 		dto, err := s.sessionItemDTO(item)
@@ -215,7 +241,7 @@ func (s *Service) GetSessionChatItems(id string) (SessionItemsPage, error) {
 		OldestSeq:     oldestSeq,
 		NewestSeq:     newestSeq,
 		HasMoreBefore: hasMoreBefore,
-		HasMoreAfter:  false,
+		HasMoreAfter:  hasMoreAfter,
 	}, nil
 }
 
@@ -495,9 +521,11 @@ func (s *Service) sessionItemDTO(item sessions.SessionItem) (SessionItem, error)
 		Seq:        item.Seq,
 		ID:         item.ID,
 		TurnID:     item.TurnID,
+		CreatedAt:  item.CreatedAt,
 		Kind:       item.Kind,
 		Visibility: item.Visibility,
 		Audience:   item.Audience,
+		Status:     item.Status,
 	}
 	if item.Message == nil {
 		return dto, nil
@@ -576,6 +604,33 @@ func recentSessionItems(items []sessions.SessionItem, limit int) ([]sessions.Ses
 		return items, false
 	}
 	return items[len(items)-limit:], true
+}
+
+func pagedSessionItems(items []sessions.SessionItem, beforeSeq, afterSeq int64, limit int) ([]sessions.SessionItem, bool, bool) {
+	start := 0
+	end := len(items)
+	if beforeSeq > 0 {
+		for end > 0 && items[end-1].Seq >= beforeSeq {
+			end--
+		}
+	} else if afterSeq > 0 {
+		for start < len(items) && items[start].Seq <= afterSeq {
+			start++
+		}
+	}
+
+	if afterSeq > 0 {
+		pageEnd := end
+		if pageEnd-start > limit {
+			pageEnd = start + limit
+		}
+		return items[start:pageEnd], start > 0, pageEnd < len(items)
+	}
+	pageStart := start
+	if end-pageStart > limit {
+		pageStart = end - limit
+	}
+	return items[pageStart:end], pageStart > 0, end < len(items)
 }
 
 func sessionItemSeqBounds(items []sessions.SessionItem) (int64, int64) {

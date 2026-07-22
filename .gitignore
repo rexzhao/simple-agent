@@ -1,5 +1,7 @@
 /.sai/
 /.agents/
 /dist/
+/web/node_modules/
+/web/dist/
 __pycache__/
 /.mcp_cli_discovery.py

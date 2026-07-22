@@ -3,9 +3,9 @@ package main
 import (
 	"os"
 
-	"github.com/rexzhao/simple-agent/internal/cli"
+	"github.com/rexzhao/simple-agent/internal/webapp"
 )
 
 func main() {
-	os.Exit(cli.RunWithProgram(os.Args[0], os.Args[1:], os.Stdout, os.Stderr))
+	os.Exit(webapp.Run(os.Args[1:], os.Stdout, os.Stderr))
 }

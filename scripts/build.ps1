@@ -6,7 +6,8 @@ $ErrorActionPreference = "Stop"
 
 $Root = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $Dist = Join-Path $Root "dist"
-$Ldflags = "-s -w -X github.com/rexzhao/simple-agent/internal/cli.Version=$Version"
+$Web = Join-Path $Root "web"
+$Ldflags = "-s -w -X github.com/rexzhao/simple-agent/internal/webapp.Version=$Version"
 
 $Targets = @(
     @{ GOOS = "windows"; GOARCH = "amd64"; Name = "sai-windows-amd64.exe" },
@@ -35,6 +36,14 @@ New-Item -ItemType Directory -Force -Path $Dist | Out-Null
 
 Push-Location $Root
 try {
+    Push-Location $Web
+    try {
+        npm ci
+        npm run build
+    } finally {
+        Pop-Location
+    }
+
     foreach ($Target in $Targets) {
         $env:CGO_ENABLED = "0"
         $env:GOOS = $Target.GOOS

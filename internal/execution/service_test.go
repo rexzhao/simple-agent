@@ -231,6 +231,84 @@ func TestServiceSessionLifecycle(t *testing.T) {
 	}
 }
 
+func TestServiceCreateConfiguredSessionResolvesProjectConfig(t *testing.T) {
+	home := t.TempDir()
+	service, err := NewService(home)
+	if err != nil {
+		t.Fatalf("NewService() error = %v", err)
+	}
+	root := mkdirProjectRoot(t, "configured")
+	agentsDir := filepath.Join(root, ".agents")
+	providersDir := filepath.Join(agentsDir, "providers")
+	if err := os.MkdirAll(providersDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll(providers) error = %v", err)
+	}
+	rootConfig := `default_provider: fake
+default_model: fast
+provider_dir: providers
+agent:
+  show_reasoning: true
+tools:
+  enabled: [read_file]
+`
+	providerConfig := `name: fake
+base_url: http://127.0.0.1:1/v1
+api_key: test-key
+models:
+  fast:
+    id: fake-model
+    context_window: 64000
+    temperature: 0.2
+`
+	if err := os.WriteFile(filepath.Join(agentsDir, "sai.yaml"), []byte(rootConfig), 0o600); err != nil {
+		t.Fatalf("WriteFile(root config) error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(providersDir, "fake.yaml"), []byte(providerConfig), 0o600); err != nil {
+		t.Fatalf("WriteFile(provider config) error = %v", err)
+	}
+	project, err := service.CreateProject(root, "Configured")
+	if err != nil {
+		t.Fatalf("CreateProject() error = %v", err)
+	}
+
+	session, err := service.CreateConfiguredSession(project.Project.ID, ConfiguredSessionOptions{})
+	if err != nil {
+		t.Fatalf("CreateConfiguredSession() error = %v", err)
+	}
+	if session.ProjectID != project.Project.ID || session.CreatedCWD != project.Project.Root {
+		t.Fatalf("session project/cwd = %q/%q, want %q/%q", session.ProjectID, session.CreatedCWD, project.Project.ID, project.Project.Root)
+	}
+	if session.Provider != "fake" || session.ModelProfile != "fast" || session.ModelID != "fake-model" {
+		t.Fatalf("session model = %q/%q/%q", session.Provider, session.ModelProfile, session.ModelID)
+	}
+	if !session.ShowReasoning || !session.SaveToolResults {
+		t.Fatalf("session flags = reasoning %t save tools %t", session.ShowReasoning, session.SaveToolResults)
+	}
+	if len(session.EnabledTools) != 1 || session.EnabledTools[0] != "read_file" {
+		t.Fatalf("EnabledTools = %#v", session.EnabledTools)
+	}
+	if session.Context.ContextWindow != 64000 || session.Context.ContextWindowSource != string(contextwindow.WindowSourceConfigured) {
+		t.Fatalf("context metadata = %#v", session.Context)
+	}
+}
+
+func TestServiceCreateConfiguredSessionRejectsOutsideProjectCWD(t *testing.T) {
+	home := t.TempDir()
+	service, err := NewService(home)
+	if err != nil {
+		t.Fatalf("NewService() error = %v", err)
+	}
+	root := mkdirProjectRoot(t, "configured-boundary")
+	project, err := service.CreateProject(root, "Configured")
+	if err != nil {
+		t.Fatalf("CreateProject() error = %v", err)
+	}
+	_, err = service.CreateConfiguredSession(project.Project.ID, ConfiguredSessionOptions{CWD: t.TempDir()})
+	if err == nil || !strings.Contains(err.Error(), "outside project root") {
+		t.Fatalf("CreateConfiguredSession(outside) error = %v", err)
+	}
+}
+
 func TestServiceSessionListScopesAndArchivedFilter(t *testing.T) {
 	home := t.TempDir()
 	service, err := NewService(home)

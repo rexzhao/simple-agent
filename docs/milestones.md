@@ -894,7 +894,6 @@ store。详细设计见 `docs/global-server-projects.md`，执行清单见
 - persistence 测试覆盖 JSONL/blob pagination、blob reachability 和 hidden/debug filtering。
 - `go test ./...` 通过。
 - `git diff --check` 通过。
-- task checklist 中记录 smoke evidence。
 
 ## M22：Execution Library and Direct CLI (No HTTP Product Layer)
 
@@ -927,7 +926,6 @@ execution 收敛为进程内 execution library。CLI 是展示层，直接调用
 - `rg` 检查确认产品入口没有 `server` command、registry discovery、HTTP client 和 WebSocket attach。
 - `go test ./...` 通过。
 - `git diff --check` 通过。
-- task checklist 中记录 smoke evidence。
 
 ## M23：Mailbox MCP Input Adapter
 
@@ -998,3 +996,28 @@ MCP 向当前 session 投递 queued prompt，同时不恢复 HTTP/WS 产品层�
 - 测试覆盖 mailbox MCP result 仍然是 final-output-only。
 - `go test ./...` 通过。
 - `git diff --check` 通过。
+
+## M25：Single-Executable Web Application
+
+状态说明：M25 取代当前 CLI 产品入口。M20-M24 的 CLI/server/mailbox 描述仅作为历史记录。
+
+目标：将 React Web UI、loopback HTTP adapter 和 execution library 打包为单一可执行文件；
+无参数启动直接打开 Web 应用，不再维护 CLI 或 TUI 聊天产品。
+
+交付物：
+
+- `cmd/sai` 默认启动 loopback Web 应用并打开浏览器。
+- React + TypeScript + Vite 产物通过 `go:embed` 进入二进制。
+- Web API 直接调用 execution library，覆盖 project/session lifecycle、分页历史、run stream、
+  cancel 和 compact。
+- 每次启动生成 capability token；API 校验 bearer token、Host 和 Origin，不启用 CORS。
+- 删除 `internal/cli`、TUI 和 mailbox CLI 产品实现。
+- 发布脚本先构建 Web assets，再输出 Windows/Linux/macOS 单文件程序。
+
+验证：
+
+- `npm run build` 通过。
+- `go test ./...` 通过。
+- 浏览器 smoke 覆盖项目注册、session 创建、流式 run、持久历史和 cancel。
+- Windows amd64 EXE 可独立启动并包含全部静态资源。
+- task checklist 中记录 smoke evidence。

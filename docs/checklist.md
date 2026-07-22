@@ -594,3 +594,19 @@
 - [ ] 追加输入落盘为同一 `turn_id` 下的独立 user item。
 - [x] 验证 `go test ./...`。
 - [x] 验证 `git diff --check`。
+
+## M25：Single-Executable Web Application
+
+- [x] 无参数启动默认进入 Web 应用。
+- [x] 删除旧 CLI/TUI/mailbox 产品实现。
+- [x] 增加配置化 session 创建 execution API。
+- [x] 增加 session chat items 前后游标分页。
+- [x] 增加 project/session Web API。
+- [x] 增加 run registry、SSE events 和 cancel API。
+- [x] 增加 loopback、capability token、Host/Origin 和 CSP 防护。
+- [x] 实现 React/TypeScript 三栏 UI、流式输出、工具状态和停止操作。
+- [x] Vite 产物通过 `go:embed` 嵌入。
+- [x] 构建脚本自动执行前端 production build。
+- [x] 浏览器 smoke 通过。
+- [x] Windows amd64 单文件 EXE 构建通过。
+- [x] `go test ./...`、`npm run build` 和 `git diff --check` 通过。

@@ -27,23 +27,23 @@ type Service struct {
 }
 
 type Project struct {
-	ID          string
-	Root        string
-	DisplayName string
-	Archived    bool
-	CreatedAt   time.Time
-	UpdatedAt   time.Time
+	ID          string    `json:"id"`
+	Root        string    `json:"root"`
+	DisplayName string    `json:"display_name"`
+	Archived    bool      `json:"archived"`
+	CreatedAt   time.Time `json:"created_at"`
+	UpdatedAt   time.Time `json:"updated_at"`
 }
 
 type ProjectCreateResult struct {
-	Project Project
-	Created bool
+	Project Project `json:"project"`
+	Created bool    `json:"created"`
 }
 
 type ProjectRemoveResult struct {
-	Status          string
-	ID              string
-	RemovedSessions int
+	Status          string `json:"status"`
+	ID              string `json:"id"`
+	RemovedSessions int    `json:"removed_sessions"`
 }
 
 type ProjectListOptions struct {
@@ -55,47 +55,47 @@ type NearestProjectOptions struct {
 }
 
 type SessionMetadata struct {
-	ID                string
-	CreatedAt         time.Time
-	UpdatedAt         time.Time
-	DisplayName       string
-	Archived          bool
-	LastUsedAt        time.Time
-	InterruptedAt     time.Time
-	InterruptedTurnID string
-	Provider          string
-	ModelProfile      string
-	ModelID           string
-	ProjectID         string
-	CreatedCWD        string
-	LastSeq           int64
+	ID                string    `json:"id"`
+	CreatedAt         time.Time `json:"created_at"`
+	UpdatedAt         time.Time `json:"updated_at"`
+	DisplayName       string    `json:"display_name"`
+	Archived          bool      `json:"archived"`
+	LastUsedAt        time.Time `json:"last_used_at"`
+	InterruptedAt     time.Time `json:"interrupted_at,omitempty"`
+	InterruptedTurnID string    `json:"interrupted_turn_id,omitempty"`
+	Provider          string    `json:"provider"`
+	ModelProfile      string    `json:"model_profile"`
+	ModelID           string    `json:"model_id"`
+	ProjectID         string    `json:"project_id"`
+	CreatedCWD        string    `json:"created_cwd"`
+	LastSeq           int64     `json:"last_seq"`
 }
 
 type SessionDetail struct {
-	ID                string
-	CreatedAt         time.Time
-	UpdatedAt         time.Time
-	DisplayName       string
-	Archived          bool
-	LastUsedAt        time.Time
-	InterruptedAt     time.Time
-	InterruptedTurnID string
-	Provider          string
-	ModelProfile      string
-	ModelID           string
-	Status            string
-	LastSeq           int64
-	CWD               string
-	ProjectID         string
-	CreatedCWD        string
-	ConfigPath        string
-	ModelParameters   map[string]any
-	EnabledTools      []string
-	EnabledMCP        []string
-	EnabledSkills     []string
-	ShowReasoning     bool
-	Context           contextwindow.Metadata
-	SaveToolResults   bool
+	ID                string                 `json:"id"`
+	CreatedAt         time.Time              `json:"created_at"`
+	UpdatedAt         time.Time              `json:"updated_at"`
+	DisplayName       string                 `json:"display_name"`
+	Archived          bool                   `json:"archived"`
+	LastUsedAt        time.Time              `json:"last_used_at"`
+	InterruptedAt     time.Time              `json:"interrupted_at,omitempty"`
+	InterruptedTurnID string                 `json:"interrupted_turn_id,omitempty"`
+	Provider          string                 `json:"provider"`
+	ModelProfile      string                 `json:"model_profile"`
+	ModelID           string                 `json:"model_id"`
+	Status            string                 `json:"status"`
+	LastSeq           int64                  `json:"last_seq"`
+	CWD               string                 `json:"cwd"`
+	ProjectID         string                 `json:"project_id"`
+	CreatedCWD        string                 `json:"created_cwd"`
+	ConfigPath        string                 `json:"config_path"`
+	ModelParameters   map[string]any         `json:"model_parameters,omitempty"`
+	EnabledTools      []string               `json:"enabled_tools,omitempty"`
+	EnabledMCP        []string               `json:"enabled_mcp,omitempty"`
+	EnabledSkills     []string               `json:"enabled_skills,omitempty"`
+	ShowReasoning     bool                   `json:"show_reasoning"`
+	Context           contextwindow.Metadata `json:"context"`
+	SaveToolResults   bool                   `json:"save_tool_results"`
 }
 
 type SessionCreateMetadata struct {
@@ -120,21 +120,21 @@ type SessionListOptions struct {
 }
 
 type SessionRemoveResult struct {
-	Status string
-	ID     string
+	Status string `json:"status"`
+	ID     string `json:"id"`
 }
 
 type SessionMessageResult struct {
-	Status  string
-	TurnID  string
-	LastSeq int64
+	Status  string `json:"status"`
+	TurnID  string `json:"turn_id"`
+	LastSeq int64  `json:"last_seq"`
 }
 
 type SessionCompactResult struct {
-	Status        string
-	CompactionID  string
-	SummaryItemID string
-	LastSeq       int64
+	Status        string `json:"status"`
+	CompactionID  string `json:"compaction_id"`
+	SummaryItemID string `json:"summary_item_id"`
+	LastSeq       int64  `json:"last_seq"`
 }
 
 type ServiceOptions struct {

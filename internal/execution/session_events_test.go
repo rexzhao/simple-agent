@@ -116,6 +116,60 @@ func TestSessionStreamBlockedCallbackDoesNotBlockRunner(t *testing.T) {
 	}
 }
 
+func TestGetSessionChatItemsPageSupportsBeforeAndAfterCursors(t *testing.T) {
+	home := t.TempDir()
+	service, _, session := newExecutionServiceWithSession(t, home, fakeExecutionTurnRunner{supports: true})
+	for i := 1; i <= 6; i++ {
+		message := model.Message{Role: model.MessageRoleUser, Content: fmt.Sprintf("message-%d", i)}
+		if _, err := service.sessionStore.AppendItem(session.ID, sessions.SessionItemFromMessage(fmt.Sprintf("msg-%d", i), message)); err != nil {
+			t.Fatalf("AppendItem(%d) error = %v", i, err)
+		}
+	}
+
+	latest, err := service.GetSessionChatItemsPage(session.ID, SessionItemsOptions{Limit: 2})
+	if err != nil {
+		t.Fatalf("GetSessionChatItemsPage(latest) error = %v", err)
+	}
+	if got := sessionItemContents(latest.Items); !sameStringSlice(got, []string{"message-5", "message-6"}) {
+		t.Fatalf("latest contents = %#v", got)
+	}
+	if !latest.HasMoreBefore || latest.HasMoreAfter {
+		t.Fatalf("latest page flags = before %t after %t", latest.HasMoreBefore, latest.HasMoreAfter)
+	}
+
+	before, err := service.GetSessionChatItemsPage(session.ID, SessionItemsOptions{BeforeSeq: latest.OldestSeq, Limit: 2})
+	if err != nil {
+		t.Fatalf("GetSessionChatItemsPage(before) error = %v", err)
+	}
+	if got := sessionItemContents(before.Items); !sameStringSlice(got, []string{"message-3", "message-4"}) {
+		t.Fatalf("before contents = %#v", got)
+	}
+	if !before.HasMoreBefore || !before.HasMoreAfter {
+		t.Fatalf("before page flags = before %t after %t", before.HasMoreBefore, before.HasMoreAfter)
+	}
+
+	after, err := service.GetSessionChatItemsPage(session.ID, SessionItemsOptions{AfterSeq: before.NewestSeq, Limit: 1})
+	if err != nil {
+		t.Fatalf("GetSessionChatItemsPage(after) error = %v", err)
+	}
+	if got := sessionItemContents(after.Items); !sameStringSlice(got, []string{"message-5"}) {
+		t.Fatalf("after contents = %#v", got)
+	}
+	if !after.HasMoreBefore || !after.HasMoreAfter {
+		t.Fatalf("after page flags = before %t after %t", after.HasMoreBefore, after.HasMoreAfter)
+	}
+}
+
+func sessionItemContents(items []SessionItem) []string {
+	contents := make([]string, 0, len(items))
+	for _, item := range items {
+		if item.Message != nil && item.Message.Content != nil {
+			contents = append(contents, item.Message.Content.Inline)
+		}
+	}
+	return contents
+}
+
 // TestSessionStreamFailureOrdersTurnFailedAfterPriorEvents verifies that on
 // failure, turn.failed is emitted after all prior mapped events and is last.
 func TestSessionStreamFailureOrdersTurnFailedAfterPriorEvents(t *testing.T) {
