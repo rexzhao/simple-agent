@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/rexzhao/simple-agent/internal/model"
+	"github.com/rexzhao/simple-agent/internal/model/httpstream"
 	"github.com/rexzhao/simple-agent/internal/sessions"
 )
 
@@ -247,6 +248,7 @@ func TestSessionStreamCoalescesOnlyConsecutiveSameTypeDeltas(t *testing.T) {
 	runner := fakeExecutionTurnRunner{
 		supports: true,
 		run: func(ctx context.Context, request SessionTurnRequest) (SessionTurnResult, error) {
+			request.Emit(model.AgentIterationStartedEvent{Iteration: 2})
 			request.Emit(model.TextDeltaEvent{Text: "a"})
 			request.Emit(model.TextDeltaEvent{Text: "b"})
 			request.Emit(model.ReasoningDeltaEvent{Text: "r1"})
@@ -353,6 +355,18 @@ func TestSessionStreamCoalescesOnlyConsecutiveSameTypeDeltas(t *testing.T) {
 	}
 	if got := countString(gotTypes, "tool.requested"); got != 1 {
 		t.Fatalf("tool.requested count = %d, want 1", got)
+	}
+	if got := countString(gotTypes, "agent.iteration.started"); got != 1 {
+		t.Fatalf("agent.iteration.started count = %d, want 1", got)
+	}
+	for _, event := range events {
+		eventType, _ := event["type"].(string)
+		switch eventType {
+		case "agent.iteration.started", "text.delta", "reasoning.delta", "tool.requested":
+			if got, _ := event["agent_iteration"].(int); got != 2 {
+				t.Fatalf("%s agent_iteration = %#v, want 2", eventType, event["agent_iteration"])
+			}
+		}
 	}
 	if got := countString(gotTypes, "item.appended"); got != 2 {
 		t.Fatalf("item.appended count = %d, want 2", got)
@@ -599,6 +613,47 @@ func TestSessionStreamTurnFailedSafePayloadByStage(t *testing.T) {
 		assertSafeTurnFailedTerminal(t, events, "runner_failed", "turn runner failed", turnFailedSecret)
 	})
 
+	t.Run("model_request_timeout", func(t *testing.T) {
+		home := t.TempDir()
+		runner := fakeExecutionTurnRunner{
+			supports: true,
+			run: func(ctx context.Context, request SessionTurnRequest) (SessionTurnResult, error) {
+				return SessionTurnResult{}, fmt.Errorf("request model: %w", &httpstream.RequestTimeoutError{
+					Timeout:  60 * time.Second,
+					Attempts: 2,
+				})
+			},
+		}
+		service, _, session := newExecutionServiceWithSession(t, home, runner)
+		var events []SessionStreamEvent
+		_, err := service.SendSessionMessageWithEvents(context.Background(), session.ID, prompt, func(event SessionStreamEvent) {
+			events = append(events, event)
+		})
+		if !errors.Is(err, ErrTurnFailed) {
+			t.Fatalf("error = %v, want ErrTurnFailed", err)
+		}
+		assertSafeTurnFailedTerminal(t, events, "model_request_timeout", "model service did not return response headers after 2 attempts (1m0s each)", turnFailedSecret)
+	})
+
+	t.Run("model_stream_idle_timeout", func(t *testing.T) {
+		home := t.TempDir()
+		runner := fakeExecutionTurnRunner{
+			supports: true,
+			run: func(ctx context.Context, request SessionTurnRequest) (SessionTurnResult, error) {
+				return SessionTurnResult{}, fmt.Errorf("request model: %w", &httpstream.StreamIdleTimeoutError{Timeout: 2 * time.Minute})
+			},
+		}
+		service, _, session := newExecutionServiceWithSession(t, home, runner)
+		var events []SessionStreamEvent
+		_, err := service.SendSessionMessageWithEvents(context.Background(), session.ID, prompt, func(event SessionStreamEvent) {
+			events = append(events, event)
+		})
+		if !errors.Is(err, ErrTurnFailed) {
+			t.Fatalf("error = %v, want ErrTurnFailed", err)
+		}
+		assertSafeTurnFailedTerminal(t, events, "model_stream_idle_timeout", "model response stream produced no data for 2m0s", turnFailedSecret)
+	})
+
 	t.Run("runner_not_incremental", func(t *testing.T) {
 		home := t.TempDir()
 		runner := fakeExecutionTurnRunner{
@@ -643,6 +698,9 @@ func TestSessionStreamTurnFailedSafePayloadByStage(t *testing.T) {
 		})
 		if err == nil || !strings.Contains(err.Error(), "could not clear running turn") {
 			t.Fatalf("error = %v, want could not clear running turn", err)
+		}
+		if !strings.Contains(err.Error(), "session not found") {
+			t.Fatalf("error = %v, want underlying metadata error", err)
 		}
 		if strings.Contains(err.Error(), turnFailedSecret) {
 			t.Fatalf("returned error leaks secret: %v", err)

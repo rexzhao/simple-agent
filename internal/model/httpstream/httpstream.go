@@ -19,6 +19,7 @@ const (
 	DefaultStreamIdleTimeout = 2 * time.Minute
 	DefaultMaxRetryAttempts  = 3
 	DefaultRetryBackoff      = 200 * time.Millisecond
+	DefaultTimeoutRetries    = 1
 )
 
 type Options struct {
@@ -59,10 +60,14 @@ func (e *StatusError) Error() string {
 }
 
 type RequestTimeoutError struct {
-	Timeout time.Duration
+	Timeout  time.Duration
+	Attempts int
 }
 
 func (e *RequestTimeoutError) Error() string {
+	if e.Attempts > 1 {
+		return fmt.Sprintf("request timeout waiting for response headers after %d attempts of %s each", e.Attempts, e.Timeout)
+	}
 	return fmt.Sprintf("request timeout waiting for response headers after %s", e.Timeout)
 }
 
@@ -88,7 +93,7 @@ func DoRequest(ctx context.Context, client *http.Client, options Options, newReq
 
 	var lastStatusErr *StatusError
 	for attempt := 1; attempt <= options.MaxRetryAttempts; attempt++ {
-		response, err := doRequestOnce(ctx, client, options.RequestTimeout, newRequest)
+		response, err := doRequestWithTimeoutRetry(ctx, client, options, newRequest)
 		if err != nil {
 			return nil, err
 		}
@@ -113,6 +118,24 @@ func DoRequest(ctx context.Context, client *http.Client, options Options, newReq
 		}
 	}
 	return nil, lastStatusErr
+}
+
+func doRequestWithTimeoutRetry(ctx context.Context, client *http.Client, options Options, newRequest func(context.Context) (*http.Request, error)) (*http.Response, error) {
+	for attempt := 1; attempt <= DefaultTimeoutRetries+1; attempt++ {
+		response, err := doRequestOnce(ctx, client, options.RequestTimeout, newRequest)
+		var timeoutErr *RequestTimeoutError
+		if !errors.As(err, &timeoutErr) {
+			return response, err
+		}
+		timeoutErr.Attempts = attempt
+		if attempt > DefaultTimeoutRetries {
+			return nil, timeoutErr
+		}
+		if err := sleep(ctx, options.RetryBackoff); err != nil {
+			return nil, err
+		}
+	}
+	panic("unreachable")
 }
 
 func ReadSSEFrames(ctx context.Context, body io.Reader, idleTimeout time.Duration, handle func([]byte) bool) error {

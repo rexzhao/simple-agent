@@ -37,7 +37,7 @@ const (
 const shellCancelWaitDelay = 2 * time.Second
 
 const (
-	defaultReadFileMaxBytes    = 64 * 1024
+	defaultReadFileMaxBytes    = 50 * 1024
 	defaultGlobFilesMaxResults = 200
 	defaultGrepFilesMaxResults = 100
 	defaultGrepSnippetMaxBytes = 200

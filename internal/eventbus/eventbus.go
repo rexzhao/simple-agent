@@ -255,16 +255,18 @@ func (TurnInputReady) Kind() string  { return KindTurnInputReady }
 func (TurnInputReady) durableEvent() {}
 
 type AssistantReady struct {
-	TurnID  string
-	Message model.Message
+	TurnID         string
+	AgentIteration int
+	Message        model.Message
 }
 
 func (AssistantReady) Kind() string  { return KindAssistantReady }
 func (AssistantReady) durableEvent() {}
 
 type ToolResultReady struct {
-	TurnID string
-	Result model.ToolResult
+	TurnID         string
+	AgentIteration int
+	Result         model.ToolResult
 }
 
 func (ToolResultReady) Kind() string  { return KindToolResultReady }

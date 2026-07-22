@@ -43,8 +43,11 @@ func TestStreamEmitsToolRequestedStartedFinishedInOrder(t *testing.T) {
 
 	gotEvents := collectAgentEvents(t, events)
 	var lifecycle []string
+	var iterations []int
 	for _, event := range gotEvents {
-		switch event.(type) {
+		switch event := event.(type) {
+		case model.AgentIterationStartedEvent:
+			iterations = append(iterations, event.Iteration)
 		case model.ToolCallDoneEvent:
 			lifecycle = append(lifecycle, "requested")
 		case model.ToolStartedEvent:
@@ -55,6 +58,9 @@ func TestStreamEmitsToolRequestedStartedFinishedInOrder(t *testing.T) {
 	}
 	if want := []string{"requested", "started", "finished"}; !reflect.DeepEqual(lifecycle, want) {
 		t.Fatalf("tool lifecycle = %#v, want %#v", lifecycle, want)
+	}
+	if want := []int{1, 2}; !reflect.DeepEqual(iterations, want) {
+		t.Fatalf("agent iterations = %#v, want %#v", iterations, want)
 	}
 }
 

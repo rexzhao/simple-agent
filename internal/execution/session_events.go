@@ -34,15 +34,16 @@ type SessionItemsOptions struct {
 }
 
 type SessionItem struct {
-	Seq        int64               `json:"seq"`
-	ID         string              `json:"id"`
-	TurnID     string              `json:"turn_id,omitempty"`
-	CreatedAt  time.Time           `json:"created_at"`
-	Kind       string              `json:"kind"`
-	Visibility string              `json:"visibility"`
-	Audience   string              `json:"audience"`
-	Status     string              `json:"status,omitempty"`
-	Message    *SessionItemMessage `json:"message,omitempty"`
+	Seq            int64               `json:"seq"`
+	ID             string              `json:"id"`
+	TurnID         string              `json:"turn_id,omitempty"`
+	AgentIteration int                 `json:"agent_iteration,omitempty"`
+	CreatedAt      time.Time           `json:"created_at"`
+	Kind           string              `json:"kind"`
+	Visibility     string              `json:"visibility"`
+	Audience       string              `json:"audience"`
+	Status         string              `json:"status,omitempty"`
+	Message        *SessionItemMessage `json:"message,omitempty"`
 }
 
 type SessionItemMessage struct {
@@ -99,11 +100,12 @@ type sessionEventSink struct {
 }
 
 type sinkOp struct {
-	event     SessionStreamEvent // verbatim event for non-delta ops
-	isDelta   bool
-	eventType string
-	turnID    string
-	text      *strings.Builder // accumulator for delta ops
+	event          SessionStreamEvent // verbatim event for non-delta ops
+	isDelta        bool
+	eventType      string
+	turnID         string
+	agentIteration int
+	text           *strings.Builder // accumulator for delta ops
 }
 
 func newSessionEventSink(emit func(SessionStreamEvent)) *sessionEventSink {
@@ -129,9 +131,10 @@ func (s *sessionEventSink) submit(event SessionStreamEvent) {
 	if eventType == "text.delta" || eventType == "reasoning.delta" {
 		text, _ := event["text"].(string)
 		turnID, _ := event["turn_id"].(string)
+		agentIteration, _ := event["agent_iteration"].(int)
 		if n := len(s.ops); n > 0 {
 			last := &s.ops[n-1]
-			if last.isDelta && last.eventType == eventType && last.turnID == turnID {
+			if last.isDelta && last.eventType == eventType && last.turnID == turnID && last.agentIteration == agentIteration {
 				last.text.WriteString(text)
 				s.mu.Unlock()
 				return
@@ -140,10 +143,11 @@ func (s *sessionEventSink) submit(event SessionStreamEvent) {
 		builder := &strings.Builder{}
 		builder.WriteString(text)
 		s.ops = append(s.ops, sinkOp{
-			isDelta:   true,
-			eventType: eventType,
-			turnID:    turnID,
-			text:      builder,
+			isDelta:        true,
+			eventType:      eventType,
+			turnID:         turnID,
+			agentIteration: agentIteration,
+			text:           builder,
 		})
 	} else {
 		s.ops = append(s.ops, sinkOp{event: event})
@@ -182,10 +186,11 @@ func (s *sessionEventSink) run() {
 
 		for _, op := range ops {
 			if op.isDelta {
-				s.emit(NewSessionStreamEvent(op.eventType, map[string]any{
-					"turn_id": op.turnID,
-					"text":    op.text.String(),
-				}))
+				fields := map[string]any{"turn_id": op.turnID, "text": op.text.String()}
+				if op.agentIteration > 0 {
+					fields["agent_iteration"] = op.agentIteration
+				}
+				s.emit(NewSessionStreamEvent(op.eventType, fields))
 			} else {
 				s.emit(op.event)
 			}
@@ -404,10 +409,14 @@ func (s *Service) startSessionEventBridge(sessionID, turnID string, bus *eventbu
 	go func() {
 		defer close(done)
 		lastSeq := afterSeq
+		agentIteration := 0
 		for event := range events {
 			switch event := event.(type) {
 			case eventbus.ModelEvent:
-				if streamEvent, ok := sessionStreamEventFromModelEvent(turnID, event.Event, showReasoning); ok {
+				if started, ok := event.Event.(model.AgentIterationStartedEvent); ok {
+					agentIteration = started.Iteration
+				}
+				if streamEvent, ok := sessionStreamEventFromModelEvent(turnID, agentIteration, event.Event, showReasoning); ok {
 					submit(streamEvent)
 				}
 			case eventbus.DurableCommitted:
@@ -470,30 +479,32 @@ func sessionStreamEventFromPersistedEvent(event sessions.PersistedEvent) (Sessio
 	}
 }
 
-func sessionStreamEventFromModelEvent(turnID string, event model.Event, showReasoning bool) (SessionStreamEvent, bool) {
+func sessionStreamEventFromModelEvent(turnID string, agentIteration int, event model.Event, showReasoning bool) (SessionStreamEvent, bool) {
 	switch event := event.(type) {
+	case model.AgentIterationStartedEvent:
+		if event.Iteration <= 0 {
+			return nil, false
+		}
+		return modelSessionStreamEvent("agent.iteration.started", turnID, event.Iteration, nil), true
 	case model.TextDeltaEvent:
 		if event.Text == "" {
 			return nil, false
 		}
-		return NewSessionStreamEvent("text.delta", map[string]any{
-			"turn_id": turnID,
-			"text":    event.Text,
+		return modelSessionStreamEvent("text.delta", turnID, agentIteration, map[string]any{
+			"text": event.Text,
 		}), true
 	case model.ReasoningDeltaEvent:
 		if !showReasoning || event.Text == "" {
 			return nil, false
 		}
-		return NewSessionStreamEvent("reasoning.delta", map[string]any{
-			"turn_id": turnID,
-			"text":    event.Text,
+		return modelSessionStreamEvent("reasoning.delta", turnID, agentIteration, map[string]any{
+			"text": event.Text,
 		}), true
 	case model.ToolCallDoneEvent:
 		if event.ToolCall.Name == "" {
 			return nil, false
 		}
-		return NewSessionStreamEvent("tool.requested", map[string]any{
-			"turn_id":      turnID,
+		return modelSessionStreamEvent("tool.requested", turnID, agentIteration, map[string]any{
 			"tool_call_id": event.ToolCall.ID,
 			"name":         event.ToolCall.Name,
 			"arguments":    sessionToolDisplayArguments(event.ToolCall.Name, event.ToolCall.Arguments),
@@ -502,8 +513,7 @@ func sessionStreamEventFromModelEvent(turnID string, event model.Event, showReas
 		if event.ToolCall.Name == "" {
 			return nil, false
 		}
-		return NewSessionStreamEvent("tool.started", map[string]any{
-			"turn_id":      turnID,
+		return modelSessionStreamEvent("tool.started", turnID, agentIteration, map[string]any{
 			"tool_call_id": event.ToolCall.ID,
 			"name":         event.ToolCall.Name,
 			"arguments":    sessionToolDisplayArguments(event.ToolCall.Name, event.ToolCall.Arguments),
@@ -512,16 +522,14 @@ func sessionStreamEventFromModelEvent(turnID string, event model.Event, showReas
 		if event.Result.Name == "" {
 			return nil, false
 		}
-		return NewSessionStreamEvent("tool.finished", map[string]any{
-			"turn_id":      turnID,
+		return modelSessionStreamEvent("tool.finished", turnID, agentIteration, map[string]any{
 			"tool_call_id": event.Result.ToolCallID,
 			"name":         event.Result.Name,
 			"is_error":     event.Result.IsError,
 			"content":      sessionStreamToolContent(event.Result.Content),
 		}), true
 	case model.UsageEvent:
-		return NewSessionStreamEvent("usage.updated", map[string]any{
-			"turn_id":       turnID,
+		return modelSessionStreamEvent("usage.updated", turnID, agentIteration, map[string]any{
 			"input_tokens":  event.Usage.InputTokens,
 			"output_tokens": event.Usage.OutputTokens,
 			"total_tokens":  event.Usage.TotalTokens,
@@ -531,16 +539,28 @@ func sessionStreamEventFromModelEvent(turnID string, event model.Event, showReas
 	}
 }
 
+func modelSessionStreamEvent(eventType, turnID string, agentIteration int, fields map[string]any) SessionStreamEvent {
+	if fields == nil {
+		fields = map[string]any{}
+	}
+	fields["turn_id"] = turnID
+	if agentIteration > 0 {
+		fields["agent_iteration"] = agentIteration
+	}
+	return NewSessionStreamEvent(eventType, fields)
+}
+
 func (s *Service) sessionItemDTO(item sessions.SessionItem) (SessionItem, error) {
 	dto := SessionItem{
-		Seq:        item.Seq,
-		ID:         item.ID,
-		TurnID:     item.TurnID,
-		CreatedAt:  item.CreatedAt,
-		Kind:       item.Kind,
-		Visibility: item.Visibility,
-		Audience:   item.Audience,
-		Status:     item.Status,
+		Seq:            item.Seq,
+		ID:             item.ID,
+		TurnID:         item.TurnID,
+		AgentIteration: item.AgentIteration,
+		CreatedAt:      item.CreatedAt,
+		Kind:           item.Kind,
+		Visibility:     item.Visibility,
+		Audience:       item.Audience,
+		Status:         item.Status,
 	}
 	if item.Message == nil {
 		return dto, nil
@@ -582,6 +602,13 @@ func (s *Service) sessionItemDisplayContent(item sessions.SessionItem) (string, 
 	}
 	if item.Content.Inline != "" {
 		return item.Content.Inline, "", nil
+	}
+	if item.Content.Blob != nil && item.Message != nil && (item.Message.Role == model.MessageRoleUser || item.Message.Role == model.MessageRoleAssistant) {
+		content, err := s.sessionItemFullContent(item)
+		if err != nil {
+			return "", "", err
+		}
+		return content, "", nil
 	}
 	if item.Content.Preview != "" {
 		return "", item.Content.Preview, nil

@@ -191,28 +191,53 @@ type DeviceLoginResult struct {
 	UserCode        string
 }
 
-func DeviceLogin(ctx context.Context, options DeviceLoginOptions) (DeviceLoginResult, error) {
+type PendingDeviceLogin struct {
+	options  DeviceLoginOptions
+	userCode userCodeResponse
+}
+
+func StartDeviceLogin(ctx context.Context, options DeviceLoginOptions) (PendingDeviceLogin, error) {
 	userCode, err := requestUserCode(ctx, options)
 	if err != nil {
-		return DeviceLoginResult{}, err
+		return PendingDeviceLogin{}, err
 	}
 	verificationURI := userCode.VerificationURI
 	if options.Output != nil {
 		fmt.Fprintf(options.Output, "Open %s and enter code %s\n", verificationURI, userCode.UserCode)
 	}
-	authorization, err := pollDeviceAuthorization(ctx, options, userCode)
+	return PendingDeviceLogin{options: options, userCode: userCode}, nil
+}
+
+func (p PendingDeviceLogin) VerificationURI() string {
+	return p.userCode.VerificationURI
+}
+
+func (p PendingDeviceLogin) UserCode() string {
+	return p.userCode.UserCode
+}
+
+func (p PendingDeviceLogin) Complete(ctx context.Context) (DeviceLoginResult, error) {
+	authorization, err := pollDeviceAuthorization(ctx, p.options, p.userCode)
 	if err != nil {
 		return DeviceLoginResult{}, err
 	}
-	token, err := exchangeAuthorizationCode(ctx, options, authorization)
+	token, err := exchangeAuthorizationCode(ctx, p.options, authorization)
 	if err != nil {
 		return DeviceLoginResult{}, err
 	}
 	return DeviceLoginResult{
 		Token:           token,
-		VerificationURI: verificationURI,
-		UserCode:        userCode.UserCode,
+		VerificationURI: p.userCode.VerificationURI,
+		UserCode:        p.userCode.UserCode,
 	}, nil
+}
+
+func DeviceLogin(ctx context.Context, options DeviceLoginOptions) (DeviceLoginResult, error) {
+	pending, err := StartDeviceLogin(ctx, options)
+	if err != nil {
+		return DeviceLoginResult{}, err
+	}
+	return pending.Complete(ctx)
 }
 
 type RefreshOptions struct {

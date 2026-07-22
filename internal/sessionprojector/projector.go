@@ -250,6 +250,7 @@ func (p *Projector) handleAssistantReady(event eventbus.AssistantReady) error {
 	existing[assistantID] = struct{}{}
 	assistantItem := sessions.SessionItemFromMessage(assistantID, event.Message)
 	assistantItem.TurnID = turnID
+	assistantItem.AgentIteration = event.AgentIteration
 	items = append(items, assistantItem)
 	activeHistory = append(activeHistory, assistantID)
 
@@ -272,6 +273,7 @@ func (p *Projector) handleAssistantReady(event eventbus.AssistantReady) error {
 		existing[itemID] = struct{}{}
 		item := sessions.SessionItemFromMessage(itemID, message)
 		item.TurnID = turnID
+		item.AgentIteration = event.AgentIteration
 		item.Status = sessions.ItemStatusPending
 		items = append(items, item)
 		activeHistory = append(activeHistory, itemID)

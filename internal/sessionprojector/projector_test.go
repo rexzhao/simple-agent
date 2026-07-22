@@ -38,7 +38,8 @@ func TestProjectorWritesTurnEventsSynchronously(t *testing.T) {
 	}
 
 	publish(t, bus, eventbus.AssistantReady{
-		TurnID: "turn-1",
+		TurnID:         "turn-1",
+		AgentIteration: 1,
 		Message: model.Message{
 			Role: model.MessageRoleAssistant,
 			ToolCalls: []model.ToolCall{
@@ -48,12 +49,14 @@ func TestProjectorWritesTurnEventsSynchronously(t *testing.T) {
 		},
 	})
 	publish(t, bus, eventbus.ToolResultReady{
-		TurnID: "turn-1",
-		Result: model.ToolResult{ToolCallID: "call-a", Content: "alpha"},
+		TurnID:         "turn-1",
+		AgentIteration: 1,
+		Result:         model.ToolResult{ToolCallID: "call-a", Content: "alpha"},
 	})
 	publish(t, bus, eventbus.ToolResultReady{
-		TurnID: "turn-1",
-		Result: model.ToolResult{ToolCallID: "call-b", Content: "bravo failed", IsError: true},
+		TurnID:         "turn-1",
+		AgentIteration: 1,
+		Result:         model.ToolResult{ToolCallID: "call-b", Content: "bravo failed", IsError: true},
 	})
 	publish(t, bus, eventbus.TurnCompleted{TurnID: "turn-1"})
 
@@ -79,6 +82,14 @@ func TestProjectorWritesTurnEventsSynchronously(t *testing.T) {
 	}
 	if content := toolItemContent(loaded.Items, "call-b"); content != "bravo failed" {
 		t.Fatalf("call-b content = %q, want bravo failed", content)
+	}
+	for _, item := range loaded.Items {
+		if item.Message == nil || (item.Message.Role != model.MessageRoleAssistant && item.Message.Role != model.MessageRoleTool) {
+			continue
+		}
+		if item.AgentIteration != 1 {
+			t.Fatalf("item %q AgentIteration = %d, want 1", item.ID, item.AgentIteration)
+		}
 	}
 
 	if err := projector.Close(); err != nil {

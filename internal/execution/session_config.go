@@ -13,8 +13,56 @@ import (
 // to create a durable session. Empty values use the project root and
 // <cwd>/.agents/sai.yaml respectively.
 type ConfiguredSessionOptions struct {
-	CWD        string
-	ConfigPath string
+	CWD            string
+	ConfigPath     string
+	Provider       string
+	ModelProfile   string
+	ReasoningLevel string
+}
+
+type SessionModelOption struct {
+	Provider              string   `json:"provider"`
+	ModelProfile          string   `json:"model_profile"`
+	ModelID               string   `json:"model_id"`
+	ReasoningLevels       []string `json:"reasoning_levels,omitempty"`
+	DefaultReasoningLevel string   `json:"default_reasoning_level,omitempty"`
+}
+
+type SessionModelOptions struct {
+	Models          []SessionModelOption `json:"models"`
+	DefaultProvider string               `json:"default_provider"`
+	DefaultModel    string               `json:"default_model"`
+}
+
+// ConfiguredSessionModels returns the models available to new sessions for a
+// project without exposing provider credentials or the rest of its config.
+func (s *Service) ConfiguredSessionModels(projectID string) (SessionModelOptions, error) {
+	project, err := s.loadActiveProject(projectID)
+	if err != nil {
+		return SessionModelOptions{}, err
+	}
+	cfg, err := config.Load(filepath.Join(project.Root, ".agents", "sai.yaml"))
+	if err != nil {
+		return SessionModelOptions{}, err
+	}
+	models := cfg.ModelList()
+	options := SessionModelOptions{
+		Models:          make([]SessionModelOption, 0, len(models)),
+		DefaultProvider: strings.TrimSpace(cfg.DefaultProvider),
+		DefaultModel:    strings.TrimSpace(cfg.DefaultModel),
+	}
+	for _, model := range models {
+		profile := cfg.Providers[model.Provider].Models[model.Profile]
+		reasoningLevels := config.ReasoningLevelNames(profile.ReasoningConfig.Levels)
+		options.Models = append(options.Models, SessionModelOption{
+			Provider:              model.Provider,
+			ModelProfile:          model.Profile,
+			ModelID:               model.ID,
+			ReasoningLevels:       reasoningLevels,
+			DefaultReasoningLevel: profile.ReasoningConfig.Default,
+		})
+	}
+	return options, nil
 }
 
 // CreateConfiguredSession creates a session from the project's resolved sai
@@ -49,7 +97,11 @@ func (s *Service) CreateConfiguredSession(projectID string, options ConfiguredSe
 	if err != nil {
 		return SessionDetail{}, err
 	}
-	resolved, err := cfg.ResolveModel("", "")
+	resolved, err := cfg.ResolveModel(options.Provider, options.ModelProfile)
+	if err != nil {
+		return SessionDetail{}, err
+	}
+	parameters, err := config.ApplyReasoningLevel(resolved.Parameters, resolved.ReasoningConfig, options.ReasoningLevel)
 	if err != nil {
 		return SessionDetail{}, err
 	}
@@ -76,7 +128,7 @@ func (s *Service) CreateConfiguredSession(projectID string, options ConfiguredSe
 		Provider:        resolved.ProviderName,
 		ModelProfile:    resolved.Profile,
 		ModelID:         resolved.ModelID,
-		ModelParameters: copyParameterMap(resolved.Parameters),
+		ModelParameters: copyParameterMap(parameters),
 		EnabledTools:    copyStringSlice(cfg.Tools.Enabled),
 		EnabledMCP:      mcpServerIDs(selectedMCP),
 		EnabledSkills:   skillIDs(selectedSkills),

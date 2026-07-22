@@ -7,6 +7,7 @@ func TestEventTypeNames(t *testing.T) {
 		eventType EventType
 		want      string
 	}{
+		{EventTypeAgentIterationStarted, "agent_iteration_started"},
 		{EventTypeTextDelta, "text_delta"},
 		{EventTypeReasoningDelta, "reasoning_delta"},
 		{EventTypeMessageDone, "message_done"},
@@ -32,6 +33,7 @@ func TestEventsReportTheirTypes(t *testing.T) {
 		event Event
 		want  EventType
 	}{
+		{"agent iteration started", AgentIterationStartedEvent{}, EventTypeAgentIterationStarted},
 		{"text delta", TextDeltaEvent{}, EventTypeTextDelta},
 		{"reasoning delta", ReasoningDeltaEvent{}, EventTypeReasoningDelta},
 		{"message done", MessageDoneEvent{}, EventTypeMessageDone},

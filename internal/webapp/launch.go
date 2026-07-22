@@ -91,7 +91,7 @@ func Run(args []string, stdout, stderr io.Writer) int {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	app, err := NewServer(ServerOptions{Context: ctx, Service: service, Token: token, CWD: initialCWD})
+	app, err := NewServer(ServerOptions{Context: ctx, Service: service, Token: token, CWD: initialCWD, LogWriter: stderr})
 	if err != nil {
 		fmt.Fprintf(stderr, "sai: %v\n", err)
 		return 1
@@ -107,21 +107,33 @@ func Run(args []string, stdout, stderr io.Writer) int {
 	}()
 
 	url := "http://" + listener.Addr().String() + "/#token=" + token
+	publicURL := "http://" + listener.Addr().String() + "/"
+	fmt.Fprintf(stderr, "sai: starting %s\n", Version)
+	fmt.Fprintf(stderr, "sai: storage root: %s\n", root)
+	fmt.Fprintf(stderr, "sai: initial workspace: %s\n", initialCWD)
+	fmt.Fprintf(stderr, "sai: web server listening on %s\n", publicURL)
 	fmt.Fprintf(stdout, "SAI_WEB_URL\t%s\n", url)
 	if !*noOpen {
 		if err := openBrowser(url); err != nil {
 			fmt.Fprintf(stderr, "sai: open browser: %v\n", err)
+		} else {
+			fmt.Fprintln(stderr, "sai: browser opened")
 		}
+	} else {
+		fmt.Fprintln(stderr, "sai: browser auto-open disabled")
 	}
+	fmt.Fprintln(stderr, "sai: ready; press Ctrl+C to stop")
 
 	select {
 	case <-ctx.Done():
+		fmt.Fprintln(stderr, "sai: shutdown requested")
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		if err := httpServer.Shutdown(shutdownCtx); err != nil {
 			fmt.Fprintf(stderr, "sai: shutdown: %v\n", err)
 			return 1
 		}
+		fmt.Fprintln(stderr, "sai: stopped")
 		return 0
 	case err := <-serveDone:
 		if err != nil && !errors.Is(err, http.ErrServerClosed) {

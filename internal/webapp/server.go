@@ -22,18 +22,20 @@ import (
 var Version = "dev"
 
 type ServerOptions struct {
-	Context context.Context
-	Service *execution.Service
-	Token   string
-	CWD     string
+	Context   context.Context
+	Service   *execution.Service
+	Token     string
+	CWD       string
+	LogWriter io.Writer
 }
 
 type Server struct {
-	service *execution.Service
-	token   string
-	cwd     string
-	mux     *http.ServeMux
-	runs    *runRegistry
+	service     *execution.Service
+	token       string
+	cwd         string
+	mux         *http.ServeMux
+	runs        *runRegistry
+	codexLogins *codexLoginRegistry
 }
 
 func NewServer(options ServerOptions) (*Server, error) {
@@ -53,7 +55,8 @@ func NewServer(options ServerOptions) (*Server, error) {
 		cwd:     options.CWD,
 		mux:     http.NewServeMux(),
 	}
-	server.runs = newRunRegistry(ctx, options.Service)
+	server.runs = newRunRegistry(ctx, options.Service, options.LogWriter)
+	server.codexLogins = newCodexLoginRegistry(ctx, options.Service)
 	server.routes()
 	return server, nil
 }
@@ -86,6 +89,15 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("PATCH /api/projects/{projectID}", s.handleRenameProject)
 	s.mux.HandleFunc("POST /api/projects/{projectID}/archive", s.handleArchiveProject)
 	s.mux.HandleFunc("DELETE /api/projects/{projectID}", s.handleRemoveProject)
+	s.mux.HandleFunc("GET /api/projects/{projectID}/models", s.handleSessionModels)
+	s.mux.HandleFunc("GET /api/projects/{projectID}/provider-settings", s.handleProviderSettings)
+	s.mux.HandleFunc("POST /api/projects/{projectID}/providers", s.handleCreateProvider)
+	s.mux.HandleFunc("PUT /api/projects/{projectID}/providers/{providerName}", s.handleUpdateProvider)
+	s.mux.HandleFunc("PATCH /api/projects/{projectID}/provider-default", s.handleUpdateDefaultProviderModel)
+	s.mux.HandleFunc("GET /api/projects/{projectID}/providers/{providerName}/models", s.handleDiscoverProviderModels)
+	s.mux.HandleFunc("POST /api/projects/{projectID}/providers/{providerName}/codex-login", s.handleStartCodexLogin)
+	s.mux.HandleFunc("GET /api/projects/{projectID}/providers/{providerName}/codex-login", s.handleCodexLoginStatus)
+	s.mux.HandleFunc("DELETE /api/projects/{projectID}/providers/{providerName}/codex-login", s.handleClearCodexLogin)
 	s.mux.HandleFunc("GET /api/projects/{projectID}/sessions", s.handleListSessions)
 	s.mux.HandleFunc("POST /api/projects/{projectID}/sessions", s.handleCreateSession)
 	s.mux.HandleFunc("GET /api/sessions/{sessionID}", s.handleGetSession)
@@ -213,17 +225,32 @@ func (s *Server) handleListSessions(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"sessions": items})
 }
 
+func (s *Server) handleSessionModels(w http.ResponseWriter, r *http.Request) {
+	options, err := s.service.ConfiguredSessionModels(r.PathValue("projectID"))
+	if err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, options)
+}
+
 func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		CWD        string `json:"cwd"`
-		ConfigPath string `json:"config_path"`
+		CWD            string `json:"cwd"`
+		ConfigPath     string `json:"config_path"`
+		Provider       string `json:"provider"`
+		ModelProfile   string `json:"model_profile"`
+		ReasoningLevel string `json:"reasoning_level"`
 	}
 	if !decodeOptionalJSON(w, r, &body) {
 		return
 	}
 	session, err := s.service.CreateConfiguredSession(r.PathValue("projectID"), execution.ConfiguredSessionOptions{
-		CWD:        body.CWD,
-		ConfigPath: body.ConfigPath,
+		CWD:            body.CWD,
+		ConfigPath:     body.ConfigPath,
+		Provider:       body.Provider,
+		ModelProfile:   body.ModelProfile,
+		ReasoningLevel: body.ReasoningLevel,
 	})
 	if err != nil {
 		writeServiceError(w, err)

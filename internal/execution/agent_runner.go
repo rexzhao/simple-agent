@@ -19,6 +19,7 @@ import (
 	"github.com/rexzhao/simple-agent/internal/mcp"
 	"github.com/rexzhao/simple-agent/internal/model"
 	anthropicmessages "github.com/rexzhao/simple-agent/internal/model/anthropic_messages"
+	"github.com/rexzhao/simple-agent/internal/model/httpstream"
 	openaichat "github.com/rexzhao/simple-agent/internal/model/openai_chat"
 	openairesponses "github.com/rexzhao/simple-agent/internal/model/openai_responses"
 	"github.com/rexzhao/simple-agent/internal/sessions"
@@ -1062,38 +1063,56 @@ func closeMCPSessions(sessions []*mcp.Session) error {
 }
 
 func newProviderForRun(providerName, modelType string, provider config.ProviderConfig) (model.Provider, error) {
+	httpOptions, err := providerHTTPOptions(provider)
+	if err != nil {
+		return nil, fmt.Errorf("provider %q: %w", providerName, err)
+	}
 	switch modelType {
 	case config.ProviderTypeOpenAIChat:
-		return openaichat.NewProvider(openAIChatProviderConfig(provider))
+		return openaichat.NewProvider(openAIChatProviderConfig(provider, httpOptions))
 	case config.ProviderTypeOpenAIResponses:
-		return openairesponses.NewProvider(openAIResponsesProviderConfig(provider))
+		return openairesponses.NewProvider(openAIResponsesProviderConfig(provider, httpOptions))
 	case config.ProviderTypeOpenAICodex:
-		return openairesponses.NewProvider(openAICodexProviderConfig(provider))
+		return openairesponses.NewProvider(openAICodexProviderConfig(provider, httpOptions))
 	case config.ProviderTypeAnthropicMessages:
-		return anthropicmessages.NewProvider(anthropicMessagesProviderConfig(provider))
+		return anthropicmessages.NewProvider(anthropicMessagesProviderConfig(provider, httpOptions))
 	default:
 		return nil, fmt.Errorf("unsupported model type %q for provider %q", modelType, providerName)
 	}
 }
 
-func openAIChatProviderConfig(provider config.ProviderConfig) openaichat.ProviderConfig {
+func providerHTTPOptions(provider config.ProviderConfig) (httpstream.Options, error) {
+	if provider.RequestTimeout == "" {
+		return httpstream.Options{}, nil
+	}
+	requestTimeout, err := time.ParseDuration(provider.RequestTimeout)
+	if err != nil || requestTimeout <= 0 {
+		return httpstream.Options{}, fmt.Errorf("request_timeout must be a positive duration")
+	}
+	return httpstream.Options{RequestTimeout: requestTimeout}, nil
+}
+
+func openAIChatProviderConfig(provider config.ProviderConfig, httpOptions httpstream.Options) openaichat.ProviderConfig {
 	return openaichat.ProviderConfig{
-		BaseURL: provider.BaseURL,
-		APIKey:  provider.ResolvedAPIKey,
+		BaseURL:     provider.BaseURL,
+		APIKey:      provider.ResolvedAPIKey,
+		HTTPOptions: httpOptions,
 	}
 }
 
-func openAIResponsesProviderConfig(provider config.ProviderConfig) openairesponses.ProviderConfig {
+func openAIResponsesProviderConfig(provider config.ProviderConfig, httpOptions httpstream.Options) openairesponses.ProviderConfig {
 	return openairesponses.ProviderConfig{
-		BaseURL: provider.BaseURL,
-		APIKey:  provider.ResolvedAPIKey,
+		BaseURL:     provider.BaseURL,
+		APIKey:      provider.ResolvedAPIKey,
+		HTTPOptions: httpOptions,
 	}
 }
 
-func openAICodexProviderConfig(provider config.ProviderConfig) openairesponses.ProviderConfig {
+func openAICodexProviderConfig(provider config.ProviderConfig, httpOptions httpstream.Options) openairesponses.ProviderConfig {
 	return openairesponses.ProviderConfig{
 		BaseURL:         provider.BaseURL,
 		ForceStoreFalse: true,
+		HTTPOptions:     httpOptions,
 		TokenSource: codexResponsesTokenSource{
 			source: &codexauth.TokenSource{
 				Store: codexauth.Store{Path: provider.AuthFile},
@@ -1102,10 +1121,11 @@ func openAICodexProviderConfig(provider config.ProviderConfig) openairesponses.P
 	}
 }
 
-func anthropicMessagesProviderConfig(provider config.ProviderConfig) anthropicmessages.ProviderConfig {
+func anthropicMessagesProviderConfig(provider config.ProviderConfig, httpOptions httpstream.Options) anthropicmessages.ProviderConfig {
 	return anthropicmessages.ProviderConfig{
-		BaseURL: provider.BaseURL,
-		APIKey:  provider.ResolvedAPIKey,
+		BaseURL:     provider.BaseURL,
+		APIKey:      provider.ResolvedAPIKey,
+		HTTPOptions: httpOptions,
 	}
 }
 

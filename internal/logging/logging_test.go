@@ -86,6 +86,37 @@ func TestLogEventLazilyCreatesSessionLog(t *testing.T) {
 	}
 }
 
+func TestLogEventAnnotatesRecordsWithAgentIteration(t *testing.T) {
+	logRoot := filepath.Join(t.TempDir(), "logs")
+	logger, err := Open(filepath.Join(logRoot, "sai.jsonl"), Attributes{Provider: "fake", Model: "model-default"})
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	if err := logger.LogEvent(model.AgentIterationStartedEvent{Iteration: 3}); err != nil {
+		t.Fatalf("LogEvent(iteration) error = %v", err)
+	}
+	if err := logger.LogEvent(model.ToolCallDoneEvent{ToolCall: model.ToolCall{ID: "call-1", Name: "read_file"}}); err != nil {
+		t.Fatalf("LogEvent(tool) error = %v", err)
+	}
+	if err := logger.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+
+	data, err := os.ReadFile(logger.Path())
+	if err != nil {
+		t.Fatalf("ReadFile(%q) error = %v", logger.Path(), err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("log lines = %d, want 2", len(lines))
+	}
+	for _, line := range lines {
+		if !strings.Contains(line, `"agent_iteration":3`) {
+			t.Fatalf("log line = %q, want agent_iteration 3", line)
+		}
+	}
+}
+
 func TestCloseIsIdempotentAndFlushesBufferedData(t *testing.T) {
 	parent := t.TempDir()
 	logRoot := filepath.Join(parent, "logs")

@@ -23,15 +23,16 @@ type Attributes struct {
 }
 
 type Logger struct {
-	path       string
-	root       string
-	sessionDir string
-	provider   string
-	model      string
-	level      string
-	now        func() time.Time
-	file       *os.File
-	writer     *bufio.Writer
+	path           string
+	root           string
+	sessionDir     string
+	provider       string
+	model          string
+	level          string
+	agentIteration int
+	now            func() time.Time
+	file           *os.File
+	writer         *bufio.Writer
 }
 
 func Open(path string, attributes Attributes) (*Logger, error) {
@@ -65,6 +66,9 @@ func (l *Logger) LogEvent(event model.Event) error {
 	}
 	if err := l.ensureOpen(); err != nil {
 		return err
+	}
+	if started, ok := event.(model.AgentIterationStartedEvent); ok {
+		l.agentIteration = started.Iteration
 	}
 
 	record := l.eventRecord(event)
@@ -129,6 +133,9 @@ func (l *Logger) eventRecord(event model.Event) map[string]any {
 		"event":    string(event.Type()),
 		"provider": l.provider,
 		"model":    l.model,
+	}
+	if l.agentIteration > 0 {
+		record["agent_iteration"] = l.agentIteration
 	}
 
 	switch event := event.(type) {

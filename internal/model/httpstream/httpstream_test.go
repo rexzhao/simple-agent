@@ -7,9 +7,84 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
+
+func TestDoRequestRetriesRequestTimeoutOnce(t *testing.T) {
+	var requests atomic.Int32
+	release := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if requests.Add(1) == 1 {
+			select {
+			case <-r.Context().Done():
+			case <-release:
+			}
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+	defer close(release)
+
+	response, err := DoRequest(context.Background(), server.Client(), Options{
+		RequestTimeout:    20 * time.Millisecond,
+		StreamIdleTimeout: time.Second,
+		MaxRetryAttempts:  1,
+		RetryBackoff:      time.Millisecond,
+	}, func(requestCtx context.Context) (*http.Request, error) {
+		return http.NewRequestWithContext(requestCtx, http.MethodPost, server.URL, strings.NewReader("body"))
+	}, func(body io.Reader) string {
+		return ReadErrorBody(body, "")
+	})
+	if err != nil {
+		t.Fatalf("DoRequest() error = %v", err)
+	}
+	defer response.Body.Close()
+	if got := requests.Load(); got != 2 {
+		t.Fatalf("requests = %d, want initial request plus one retry", got)
+	}
+}
+
+func TestDoRequestReportsBothRequestTimeoutAttempts(t *testing.T) {
+	var requests atomic.Int32
+	release := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		select {
+		case <-r.Context().Done():
+		case <-release:
+		}
+	}))
+	defer server.Close()
+	defer close(release)
+
+	response, err := DoRequest(context.Background(), server.Client(), Options{
+		RequestTimeout:    20 * time.Millisecond,
+		StreamIdleTimeout: time.Second,
+		MaxRetryAttempts:  1,
+		RetryBackoff:      time.Millisecond,
+	}, func(requestCtx context.Context) (*http.Request, error) {
+		return http.NewRequestWithContext(requestCtx, http.MethodPost, server.URL, strings.NewReader("body"))
+	}, func(body io.Reader) string {
+		return ReadErrorBody(body, "")
+	})
+	if response != nil {
+		_ = response.Body.Close()
+		t.Fatalf("response = %#v, want nil", response)
+	}
+	var timeoutErr *RequestTimeoutError
+	if !errors.As(err, &timeoutErr) {
+		t.Fatalf("DoRequest() error = %T(%v), want *RequestTimeoutError", err, err)
+	}
+	if timeoutErr.Attempts != 2 {
+		t.Fatalf("RequestTimeoutError.Attempts = %d, want 2", timeoutErr.Attempts)
+	}
+	if got := requests.Load(); got != 2 {
+		t.Fatalf("requests = %d, want 2", got)
+	}
+}
 
 func TestDoRequestStopsRetryBackoffOnContextCancel(t *testing.T) {
 	requests := make(chan struct{}, 3)

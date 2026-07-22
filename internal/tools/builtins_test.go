@@ -98,7 +98,7 @@ func TestReadFileLineRanges(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Execute(read_file range) error = %v", err)
 	}
-	for _, want := range []string{"path=notes.txt", "start_line=2", "lines_returned=2", "max_bytes=65536", "truncated=false", "\n\ntwo\nthree\n"} {
+	for _, want := range []string{"path=notes.txt", "start_line=2", "lines_returned=2", "max_bytes=51200", "truncated=false", "\n\ntwo\nthree\n"} {
 		if !strings.Contains(result.Content, want) {
 			t.Fatalf("Execute(read_file range) content = %q, want contain %q", result.Content, want)
 		}
@@ -111,7 +111,7 @@ func TestReadFileLineRanges(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Execute(read_file start_line) error = %v", err)
 	}
-	for _, want := range []string{"path=notes.txt", "start_line=3", "lines_returned=2", "max_bytes=65536", "truncated=false", "\n\nthree\nfour\n"} {
+	for _, want := range []string{"path=notes.txt", "start_line=3", "lines_returned=2", "max_bytes=51200", "truncated=false", "\n\nthree\nfour\n"} {
 		if !strings.Contains(result.Content, want) {
 			t.Fatalf("Execute(read_file start_line) content = %q, want contain %q", result.Content, want)
 		}
@@ -124,7 +124,7 @@ func TestReadFileLineRanges(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Execute(read_file line_count) error = %v", err)
 	}
-	for _, want := range []string{"path=notes.txt", "start_line=1", "lines_returned=1", "max_bytes=65536", "truncated=false", "\n\none\n"} {
+	for _, want := range []string{"path=notes.txt", "start_line=1", "lines_returned=1", "max_bytes=51200", "truncated=false", "\n\none\n"} {
 		if !strings.Contains(result.Content, want) {
 			t.Fatalf("Execute(read_file line_count) content = %q, want contain %q", result.Content, want)
 		}

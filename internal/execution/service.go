@@ -13,6 +13,7 @@ import (
 	"github.com/rexzhao/simple-agent/internal/contextwindow"
 	"github.com/rexzhao/simple-agent/internal/eventbus"
 	"github.com/rexzhao/simple-agent/internal/model"
+	"github.com/rexzhao/simple-agent/internal/model/httpstream"
 	projectstore "github.com/rexzhao/simple-agent/internal/projects"
 	"github.com/rexzhao/simple-agent/internal/sessionprojector"
 	"github.com/rexzhao/simple-agent/internal/sessions"
@@ -897,7 +898,7 @@ func (s *Service) runSessionMessage(ctx context.Context, id, content string, emi
 	defer finalize()
 
 	if err := bus.Publish(eventbus.TurnStarted{TurnID: turnID}); err != nil {
-		return SessionMessageResult{}, fmt.Errorf("could not mark turn running")
+		return SessionMessageResult{}, fmt.Errorf("could not mark turn running: %w", err)
 	}
 	turnStarted = true
 	submitSessionStreamEvent(submit, NewSessionStreamEvent("turn.started", map[string]any{
@@ -927,7 +928,7 @@ func (s *Service) runSessionMessage(ctx context.Context, id, content string, emi
 		Publisher: bus,
 	})
 	if err != nil {
-		markFailed(turnFailureRunner)
+		markFailed(turnFailureForRunnerError(err))
 		return SessionMessageResult{}, ErrTurnFailed
 	}
 	if !result.Incremental {
@@ -936,7 +937,7 @@ func (s *Service) runSessionMessage(ctx context.Context, id, content string, emi
 	}
 	if err := bus.Publish(eventbus.TurnCompleted{TurnID: turnID}); err != nil {
 		markFailed(turnFailureCompletion)
-		return SessionMessageResult{}, fmt.Errorf("could not clear running turn")
+		return SessionMessageResult{}, fmt.Errorf("could not clear running turn: %w", err)
 	}
 	turnClosed = true
 
@@ -951,6 +952,31 @@ func (s *Service) runSessionMessage(ctx context.Context, id, content string, emi
 	committed = true
 	committedLastSeq = saved.LastSeq
 	return SessionMessageResult{Status: "committed", TurnID: turnID, LastSeq: saved.LastSeq}, nil
+}
+
+func turnFailureForRunnerError(err error) turnFailure {
+	var requestTimeout *httpstream.RequestTimeoutError
+	if errors.As(err, &requestTimeout) {
+		if requestTimeout.Attempts > 1 {
+			return turnFailure{
+				code:    "model_request_timeout",
+				message: fmt.Sprintf("model service did not return response headers after %d attempts (%s each)", requestTimeout.Attempts, requestTimeout.Timeout),
+			}
+		}
+		return turnFailure{
+			code:    "model_request_timeout",
+			message: fmt.Sprintf("model service did not return response headers within %s", requestTimeout.Timeout),
+		}
+	}
+
+	var streamIdleTimeout *httpstream.StreamIdleTimeoutError
+	if errors.As(err, &streamIdleTimeout) {
+		return turnFailure{
+			code:    "model_stream_idle_timeout",
+			message: fmt.Sprintf("model response stream produced no data for %s", streamIdleTimeout.Timeout),
+		}
+	}
+	return turnFailureRunner
 }
 
 func (s *Service) requireIncrementalSessionTurn(ctx context.Context, session sessions.SessionV2, content string) error {

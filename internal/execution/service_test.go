@@ -259,6 +259,9 @@ models:
     id: fake-model
     context_window: 64000
     temperature: 0.2
+  precise:
+    id: fake-precise
+    context_window: 128000
 `
 	if err := os.WriteFile(filepath.Join(agentsDir, "sai.yaml"), []byte(rootConfig), 0o600); err != nil {
 		t.Fatalf("WriteFile(root config) error = %v", err)
@@ -269,6 +272,16 @@ models:
 	project, err := service.CreateProject(root, "Configured")
 	if err != nil {
 		t.Fatalf("CreateProject() error = %v", err)
+	}
+	modelOptions, err := service.ConfiguredSessionModels(project.Project.ID)
+	if err != nil {
+		t.Fatalf("ConfiguredSessionModels() error = %v", err)
+	}
+	if modelOptions.DefaultProvider != "fake" || modelOptions.DefaultModel != "fast" || len(modelOptions.Models) != 2 {
+		t.Fatalf("ConfiguredSessionModels() = %#v", modelOptions)
+	}
+	if modelOptions.Models[1].Provider != "fake" || modelOptions.Models[1].ModelProfile != "precise" || modelOptions.Models[1].ModelID != "fake-precise" {
+		t.Fatalf("ConfiguredSessionModels()[1] = %#v", modelOptions.Models[1])
 	}
 
 	session, err := service.CreateConfiguredSession(project.Project.ID, ConfiguredSessionOptions{})
@@ -289,6 +302,13 @@ models:
 	}
 	if session.Context.ContextWindow != 64000 || session.Context.ContextWindowSource != string(contextwindow.WindowSourceConfigured) {
 		t.Fatalf("context metadata = %#v", session.Context)
+	}
+	selected, err := service.CreateConfiguredSession(project.Project.ID, ConfiguredSessionOptions{Provider: "fake", ModelProfile: "precise"})
+	if err != nil {
+		t.Fatalf("CreateConfiguredSession(selected model) error = %v", err)
+	}
+	if selected.Provider != "fake" || selected.ModelProfile != "precise" || selected.ModelID != "fake-precise" || selected.Context.ContextWindow != 128000 {
+		t.Fatalf("selected session model = %#v", selected)
 	}
 }
 
@@ -481,7 +501,7 @@ func TestServiceSendSessionMessagePersistsSuccessfulTurn(t *testing.T) {
 func TestServiceGetSessionChatItemsFiltersItemBackedVisibleMessages(t *testing.T) {
 	home := t.TempDir()
 	service, _, session := newExecutionServiceWithSession(t, home, fakeExecutionTurnRunner{supports: true})
-	blob, err := service.sessionStore.WriteBlob([]byte("full blob-backed assistant response that must not be printed in attach snapshots"), "utf-8", "text/plain")
+	blob, err := service.sessionStore.WriteBlob([]byte("full blob-backed assistant response"), "utf-8", "text/plain")
 	if err != nil {
 		t.Fatalf("WriteBlob() error = %v", err)
 	}
@@ -494,10 +514,11 @@ func TestServiceGetSessionChatItemsFiltersItemBackedVisibleMessages(t *testing.T
 			Message:    &model.Message{Role: model.MessageRoleUser, Content: "hello"},
 		},
 		{
-			ID:         "visible-assistant-preview",
-			Kind:       sessions.ItemKindMessage,
-			Visibility: sessions.ItemVisibilityVisible,
-			Audience:   sessions.ItemAudienceModel,
+			ID:             "visible-assistant-preview",
+			AgentIteration: 2,
+			Kind:           sessions.ItemKindMessage,
+			Visibility:     sessions.ItemVisibilityVisible,
+			Audience:       sessions.ItemAudienceModel,
 			Message: &model.Message{
 				Role:      model.MessageRoleAssistant,
 				ToolCalls: []model.ToolCall{{ID: "call-1", Name: "read_file", Arguments: `{"path":"notes.txt"}`}},
@@ -527,11 +548,12 @@ func TestServiceGetSessionChatItemsFiltersItemBackedVisibleMessages(t *testing.T
 			Message:    &model.Message{Role: model.MessageRoleUser, Content: "debug secret"},
 		},
 		{
-			ID:         "tool-result",
-			Kind:       sessions.ItemKindMessage,
-			Visibility: sessions.ItemVisibilityVisible,
-			Audience:   sessions.ItemAudienceModel,
-			Message:    &model.Message{Role: model.MessageRoleTool, ToolCallID: "call-1", Content: "tool secret"},
+			ID:             "tool-result",
+			AgentIteration: 2,
+			Kind:           sessions.ItemKindMessage,
+			Visibility:     sessions.ItemVisibilityVisible,
+			Audience:       sessions.ItemAudienceModel,
+			Message:        &model.Message{Role: model.MessageRoleTool, ToolCallID: "call-1", Content: "tool secret"},
 		},
 	}, []string{"visible-user", "visible-assistant-preview", "visible-assistant-blob", "hidden-summary", "debug-user", "tool-result"})
 	if err != nil {
@@ -551,14 +573,14 @@ func TestServiceGetSessionChatItemsFiltersItemBackedVisibleMessages(t *testing.T
 	if page.Items[1].Message == nil || page.Items[1].Message.Content == nil || page.Items[1].Message.Content.Preview != "long answer preview" {
 		t.Fatalf("assistant item DTO = %#v, want preview content", page.Items[1])
 	}
-	if page.Items[2].Message == nil {
-		t.Fatalf("blob-backed assistant item DTO = %#v, want message metadata", page.Items[2])
-	}
-	if content := page.Items[2].Message.Content; content != nil && (content.Inline != "" || content.Preview != "") {
-		t.Fatalf("blob-backed assistant content = %#v, want no full blob materialized", content)
+	if page.Items[2].Message == nil || page.Items[2].Message.Content == nil || page.Items[2].Message.Content.Inline != "full blob-backed assistant response" {
+		t.Fatalf("blob-backed assistant item DTO = %#v, want full content for the authenticated chat view", page.Items[2])
 	}
 	if calls := page.Items[1].Message.ToolCalls; len(calls) != 1 || calls[0].Name != "read_file" || calls[0].Arguments != `{"path":"notes.txt"}` {
 		t.Fatalf("assistant tool calls = %#v, want read_file arguments", calls)
+	}
+	if page.Items[1].AgentIteration != 2 || page.Items[3].AgentIteration != 2 {
+		t.Fatalf("agent iterations = assistant %d tool %d, want 2", page.Items[1].AgentIteration, page.Items[3].AgentIteration)
 	}
 	if tool := page.Items[3]; tool.Message == nil || tool.Message.ToolCallID != "call-1" || tool.Message.Content == nil || tool.Message.Content.Inline != "tool secret" {
 		t.Fatalf("tool result DTO = %#v, want call id and content", tool)

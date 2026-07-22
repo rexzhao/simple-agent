@@ -53,20 +53,29 @@ type ToolResult struct {
 type EventType string
 
 const (
-	EventTypeTextDelta          EventType = "text_delta"
-	EventTypeReasoningDelta     EventType = "reasoning_delta"
-	EventTypeMessageDone        EventType = "message_done"
-	EventTypeToolCallDelta      EventType = "tool_call_delta"
-	EventTypeToolCallDone       EventType = "tool_call_done"
-	EventTypeToolStarted        EventType = "tool_started"
-	EventTypeToolResult         EventType = "tool_result"
-	EventTypeUsage              EventType = "usage"
-	EventTypeSubagentCompletion EventType = "subagent_completion"
-	EventTypeError              EventType = "error"
+	EventTypeAgentIterationStarted EventType = "agent_iteration_started"
+	EventTypeTextDelta             EventType = "text_delta"
+	EventTypeReasoningDelta        EventType = "reasoning_delta"
+	EventTypeMessageDone           EventType = "message_done"
+	EventTypeToolCallDelta         EventType = "tool_call_delta"
+	EventTypeToolCallDone          EventType = "tool_call_done"
+	EventTypeToolStarted           EventType = "tool_started"
+	EventTypeToolResult            EventType = "tool_result"
+	EventTypeUsage                 EventType = "usage"
+	EventTypeSubagentCompletion    EventType = "subagent_completion"
+	EventTypeError                 EventType = "error"
 )
 
 type Event interface {
 	Type() EventType
+}
+
+type AgentIterationStartedEvent struct {
+	Iteration int
+}
+
+func (AgentIterationStartedEvent) Type() EventType {
+	return EventTypeAgentIterationStarted
 }
 
 type TextDeltaEvent struct {

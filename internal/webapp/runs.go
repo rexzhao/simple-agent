@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"strconv"
 	"strings"
@@ -19,6 +20,8 @@ import (
 type runRegistry struct {
 	ctx     context.Context
 	service *execution.Service
+	log     io.Writer
+	logMu   sync.Mutex
 
 	mu              sync.Mutex
 	byID            map[string]*managedRun
@@ -42,10 +45,11 @@ type runEvent struct {
 	Event execution.SessionStreamEvent
 }
 
-func newRunRegistry(ctx context.Context, service *execution.Service) *runRegistry {
+func newRunRegistry(ctx context.Context, service *execution.Service, logWriter io.Writer) *runRegistry {
 	return &runRegistry{
 		ctx:             ctx,
 		service:         service,
+		log:             logWriter,
 		byID:            make(map[string]*managedRun),
 		activeBySession: make(map[string]*managedRun),
 	}
@@ -97,6 +101,7 @@ func (r *runRegistry) await(managed *managedRun) {
 			fields["message"] = "run cancelled"
 		} else {
 			fields["message"] = "run failed"
+			r.logRunFailure(managed, err)
 		}
 	}
 	managed.append(execution.NewSessionStreamEvent("run.settled", fields))
@@ -107,6 +112,15 @@ func (r *runRegistry) await(managed *managedRun) {
 		delete(r.activeBySession, managed.sessionID)
 	}
 	r.mu.Unlock()
+}
+
+func (r *runRegistry) logRunFailure(managed *managedRun, err error) {
+	if r == nil || r.log == nil || managed == nil || err == nil {
+		return
+	}
+	r.logMu.Lock()
+	defer r.logMu.Unlock()
+	fmt.Fprintf(r.log, "sai: run %s for session %s failed: %v\n", managed.id, managed.sessionID, err)
 }
 
 func (r *runRegistry) get(id string) (*managedRun, bool) {

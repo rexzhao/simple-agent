@@ -99,10 +99,10 @@ func run(ctx context.Context, request model.Request, options Options, maxTurns i
 	messages := append([]model.Message(nil), request.Messages...)
 	enabledTools := enabledToolNames(request.Tools)
 
-	for turn := 1; turn <= maxTurns; turn++ {
+	for iteration := 1; iteration <= maxTurns; iteration++ {
 		// Checkpoint: drain queued active prompts before the first provider
 		// request so appended user input is part of the initial turn history.
-		if turn == 1 {
+		if iteration == 1 {
 			var ok bool
 			messages, _, ok = drainActivePrompts(events, options.Publisher, options.ActivePromptDrain, ActivePromptCheckpointBeforeProvider, turnID, messages)
 			if !ok {
@@ -111,6 +111,7 @@ func run(ctx context.Context, request model.Request, options Options, maxTurns i
 		}
 
 		request.Messages = messages
+		events <- model.AgentIterationStartedEvent{Iteration: iteration}
 
 		assistantContent, toolCalls, stopped := streamModelTurn(ctx, options.Provider, request, events)
 		if stopped {
@@ -126,7 +127,7 @@ func run(ctx context.Context, request model.Request, options Options, maxTurns i
 			events <- model.ErrorEvent{Err: fmt.Errorf("agent returned empty final response")}
 			return
 		}
-		if !publishDurable(events, options.Publisher, eventbus.AssistantReady{TurnID: turnID, Message: assistantMessage}, "persist assistant") {
+		if !publishDurable(events, options.Publisher, eventbus.AssistantReady{TurnID: turnID, AgentIteration: iteration, Message: assistantMessage}, "persist assistant") {
 			return
 		}
 		messages = append(messages, assistantMessage)
@@ -142,7 +143,7 @@ func run(ctx context.Context, request model.Request, options Options, maxTurns i
 				return
 			}
 			if appended > 0 {
-				if turn == maxTurns {
+				if iteration == maxTurns {
 					events <- model.ErrorEvent{
 						Err: fmt.Errorf("agent reached max_turns %d with queued input after final response", maxTurns),
 					}
@@ -156,7 +157,7 @@ func run(ctx context.Context, request model.Request, options Options, maxTurns i
 
 		for _, toolCall := range toolCalls {
 			result := executeToolCall(ctx, options.ToolExecutor, enabledTools, toolCall, events)
-			if !publishDurable(events, options.Publisher, eventbus.ToolResultReady{TurnID: turnID, Result: result}, "persist tool result") {
+			if !publishDurable(events, options.Publisher, eventbus.ToolResultReady{TurnID: turnID, AgentIteration: iteration, Result: result}, "persist tool result") {
 				return
 			}
 			events <- model.ToolResultEvent{Result: result}
@@ -178,7 +179,7 @@ func run(ctx context.Context, request model.Request, options Options, maxTurns i
 			return
 		}
 
-		if turn == maxTurns {
+		if iteration == maxTurns {
 			events <- model.ErrorEvent{
 				Err: fmt.Errorf("agent reached max_turns %d before the model returned a final response", maxTurns),
 			}
@@ -286,7 +287,7 @@ func executeToolCall(ctx context.Context, executor ToolExecutor, enabledTools ma
 	if result.Name == "" {
 		result.Name = toolCall.Name
 	}
-	return result
+	return limitToolResultOutput(result)
 }
 
 func parseToolArguments(raw string) (map[string]any, error) {
@@ -313,12 +314,12 @@ func parseToolArguments(raw string) (map[string]any, error) {
 }
 
 func toolErrorResult(toolCall model.ToolCall, format string, args ...any) model.ToolResult {
-	return model.ToolResult{
+	return limitToolResultOutput(model.ToolResult{
 		ToolCallID: toolCall.ID,
 		Name:       toolCall.Name,
 		Content:    fmt.Sprintf(format, args...),
 		IsError:    true,
-	}
+	})
 }
 
 func enabledToolNames(toolSchemas []model.Tool) map[string]struct{} {

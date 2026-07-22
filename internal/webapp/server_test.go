@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 
 	"github.com/rexzhao/simple-agent/internal/eventbus"
@@ -89,8 +90,20 @@ func TestServerProjectSessionAndRunFlow(t *testing.T) {
 	if projectResult.Project.ID == "" {
 		t.Fatal("created project id is empty")
 	}
+	modelsResponse := doJSONRequest(t, http.MethodGet, server.URL+"/api/projects/"+projectResult.Project.ID+"/models", nil)
+	if modelsResponse.StatusCode != http.StatusOK {
+		t.Fatalf("GET models status = %d body=%s", modelsResponse.StatusCode, readBody(modelsResponse))
+	}
+	var modelOptions execution.SessionModelOptions
+	decodeResponse(t, modelsResponse, &modelOptions)
+	if modelOptions.DefaultProvider != "fake" || modelOptions.DefaultModel != "fast" || len(modelOptions.Models) != 2 {
+		t.Fatalf("GET models = %#v", modelOptions)
+	}
 
-	created = doJSONRequest(t, http.MethodPost, server.URL+"/api/projects/"+projectResult.Project.ID+"/sessions", map[string]string{})
+	created = doJSONRequest(t, http.MethodPost, server.URL+"/api/projects/"+projectResult.Project.ID+"/sessions", map[string]string{
+		"provider":      "fake",
+		"model_profile": "precise",
+	})
 	if created.StatusCode != http.StatusCreated {
 		t.Fatalf("POST session status = %d body=%s", created.StatusCode, readBody(created))
 	}
@@ -98,6 +111,9 @@ func TestServerProjectSessionAndRunFlow(t *testing.T) {
 	decodeResponse(t, created, &session)
 	if session.ID == "" {
 		t.Fatal("created session id is empty")
+	}
+	if session.Provider != "fake" || session.ModelProfile != "precise" || session.ModelID != "fake-precise" {
+		t.Fatalf("created session model = %q/%q/%q", session.Provider, session.ModelProfile, session.ModelID)
 	}
 
 	created = doJSONRequest(t, http.MethodPost, server.URL+"/api/sessions/"+session.ID+"/runs", map[string]string{"content": "hi"})
@@ -183,6 +199,64 @@ func TestServerCancelsRun(t *testing.T) {
 	}
 }
 
+func TestServerProviderSettingsPreserveSecretsAndWriteReasoningDefaults(t *testing.T) {
+	server, _ := newWebTestServer(t)
+	root := t.TempDir()
+	writeWebTestConfig(t, root)
+
+	created := doJSONRequest(t, http.MethodPost, server.URL+"/api/projects", map[string]string{"root": root})
+	var projectResult execution.ProjectCreateResult
+	decodeResponse(t, created, &projectResult)
+	baseURL := server.URL + "/api/projects/" + projectResult.Project.ID
+
+	response := doJSONRequest(t, http.MethodGet, baseURL+"/provider-settings", nil)
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("GET provider settings status = %d body=%s", response.StatusCode, readBody(response))
+	}
+	var document execution.ProviderSettingsDocument
+	decodeResponse(t, response, &document)
+	if len(document.Providers) != 1 || document.Providers[0].APIKey != "" || !document.Providers[0].APIKeyConfigured {
+		t.Fatalf("provider settings exposed or lost API key state: %#v", document.Providers)
+	}
+
+	input := execution.ProviderSettingsInput{
+		Name:       "fake",
+		BaseURL:    "http://127.0.0.1:1/v1",
+		KeepAPIKey: true,
+		Models: []execution.ProviderModelSettings{{
+			Profile:       "gpt",
+			ID:            "gpt-5.5",
+			Type:          "openai-responses",
+			ContextWindow: 400000,
+		}},
+	}
+	response = doJSONRequest(t, http.MethodPut, baseURL+"/providers/fake", input)
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("PUT provider status = %d body=%s", response.StatusCode, readBody(response))
+	}
+	decodeResponse(t, response, &document)
+	model := document.Providers[0].Models[0]
+	if model.ReasoningConfig.Parameter != "reasoning.effort" || model.ReasoningConfig.Default != "xhigh" {
+		t.Fatalf("reasoning default = %#v", model.ReasoningConfig)
+	}
+
+	response = doJSONRequest(t, http.MethodGet, baseURL+"/models", nil)
+	var options execution.SessionModelOptions
+	decodeResponse(t, response, &options)
+	wantLevels := []string{"minimal", "low", "medium", "high", "xhigh"}
+	if len(options.Models) != 1 || !reflect.DeepEqual(options.Models[0].ReasoningLevels, wantLevels) {
+		t.Fatalf("session model reasoning levels = %#v, want %#v", options.Models, wantLevels)
+	}
+
+	providerData, err := os.ReadFile(filepath.Join(root, ".agents", "providers", "fake.yaml"))
+	if err != nil {
+		t.Fatalf("ReadFile(provider) error = %v", err)
+	}
+	if !bytes.Contains(providerData, []byte("api_key: test-key")) || !bytes.Contains(providerData, []byte("reasoning_config:")) {
+		t.Fatalf("persisted provider = %s", providerData)
+	}
+}
+
 func newWebTestServer(t *testing.T) (*httptest.Server, *execution.Service) {
 	return newWebTestServerWithRunner(t, webTestRunner{})
 }
@@ -254,6 +328,9 @@ models:
   fast:
     id: fake-model
     context_window: 32000
+  precise:
+    id: fake-precise
+    context_window: 64000
 `
 	if err := os.WriteFile(filepath.Join(agentsDir, "sai.yaml"), []byte(rootConfig), 0o600); err != nil {
 		t.Fatalf("WriteFile(root config) error = %v", err)

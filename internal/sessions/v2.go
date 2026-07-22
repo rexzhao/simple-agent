@@ -61,16 +61,17 @@ var ErrCorruptedSession = errors.New("corrupted session")
 const interruptedToolResultContent = "[tool execution interrupted]"
 
 type SessionItem struct {
-	ID         string         `json:"id"`
-	TurnID     string         `json:"turn_id,omitempty"`
-	Seq        int64          `json:"seq,omitempty"`
-	CreatedAt  time.Time      `json:"created_at"`
-	Kind       string         `json:"kind"`
-	Visibility string         `json:"visibility"`
-	Audience   string         `json:"audience"`
-	Status     string         `json:"status,omitempty"`
-	Message    *model.Message `json:"message,omitempty"`
-	Content    *StoredContent `json:"content,omitempty"`
+	ID             string         `json:"id"`
+	TurnID         string         `json:"turn_id,omitempty"`
+	AgentIteration int            `json:"agent_iteration,omitempty"`
+	Seq            int64          `json:"seq,omitempty"`
+	CreatedAt      time.Time      `json:"created_at"`
+	Kind           string         `json:"kind"`
+	Visibility     string         `json:"visibility"`
+	Audience       string         `json:"audience"`
+	Status         string         `json:"status,omitempty"`
+	Message        *model.Message `json:"message,omitempty"`
+	Content        *StoredContent `json:"content,omitempty"`
 }
 
 type CompactionCheckpoint struct {
@@ -1464,7 +1465,7 @@ func writeSessionMetadataAtomic(path string, data []byte) error {
 	if err := temp.Close(); err != nil {
 		return fmt.Errorf("close temporary file: %w", err)
 	}
-	if err := os.Rename(tempPath, path); err != nil {
+	if err := replaceFileAtomic(tempPath, path); err != nil {
 		return fmt.Errorf("replace file: %w", err)
 	}
 	cleanup = false

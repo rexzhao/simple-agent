@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/rexzhao/simple-agent/internal/contextwindow"
 	"gopkg.in/yaml.v3"
@@ -80,15 +81,23 @@ type ProviderConfig struct {
 	BaseURL        string                  `json:"base_url" yaml:"base_url"`
 	APIKey         string                  `json:"api_key" yaml:"api_key"`
 	AuthFile       string                  `json:"auth_file,omitempty" yaml:"auth_file,omitempty"`
+	RequestTimeout string                  `json:"request_timeout,omitempty" yaml:"request_timeout,omitempty"`
 	ResolvedAPIKey string                  `json:"-" yaml:"-"`
 	Models         map[string]ModelProfile `json:"models" yaml:"models"`
 }
 
 type ModelProfile struct {
-	ID            string         `json:"id" yaml:"id"`
-	Type          string         `json:"type,omitempty" yaml:"type,omitempty"`
-	ContextWindow int            `json:"context_window,omitempty" yaml:"context_window,omitempty"`
-	Parameters    map[string]any `json:"parameters,omitempty" yaml:"parameters,omitempty"`
+	ID              string          `json:"id" yaml:"id"`
+	Type            string          `json:"type,omitempty" yaml:"type,omitempty"`
+	ContextWindow   int             `json:"context_window,omitempty" yaml:"context_window,omitempty"`
+	Parameters      map[string]any  `json:"parameters,omitempty" yaml:"parameters,omitempty"`
+	ReasoningConfig ReasoningConfig `json:"reasoning_config,omitempty" yaml:"reasoning_config,omitempty"`
+}
+
+type ReasoningConfig struct {
+	Parameter string         `json:"parameter,omitempty" yaml:"parameter,omitempty"`
+	Default   string         `json:"default,omitempty" yaml:"default,omitempty"`
+	Levels    map[string]any `json:"levels,omitempty" yaml:"levels,omitempty"`
 }
 
 type ModelInfo struct {
@@ -106,26 +115,29 @@ type ResolvedModel struct {
 	Parameters          map[string]any
 	ContextWindow       int
 	ContextWindowSource string
+	ReasoningConfig     ReasoningConfig
 }
 
 func (p ProviderConfig) MarshalJSON() ([]byte, error) {
 	type providerJSON struct {
-		Name     string                  `json:"name"`
-		BaseURL  string                  `json:"base_url"`
-		APIKey   string                  `json:"api_key"`
-		AuthFile string                  `json:"auth_file,omitempty"`
-		Models   map[string]ModelProfile `json:"models"`
+		Name           string                  `json:"name"`
+		BaseURL        string                  `json:"base_url"`
+		APIKey         string                  `json:"api_key"`
+		AuthFile       string                  `json:"auth_file,omitempty"`
+		RequestTimeout string                  `json:"request_timeout,omitempty"`
+		Models         map[string]ModelProfile `json:"models"`
 	}
 
 	var buf bytes.Buffer
 	encoder := json.NewEncoder(&buf)
 	encoder.SetEscapeHTML(false)
 	if err := encoder.Encode(providerJSON{
-		Name:     p.Name,
-		BaseURL:  p.BaseURL,
-		APIKey:   redactedSecretValue(p.APIKey),
-		AuthFile: p.AuthFile,
-		Models:   p.Models,
+		Name:           p.Name,
+		BaseURL:        p.BaseURL,
+		APIKey:         redactedSecretValue(p.APIKey),
+		AuthFile:       p.AuthFile,
+		RequestTimeout: p.RequestTimeout,
+		Models:         p.Models,
 	}); err != nil {
 		return nil, err
 	}
@@ -247,6 +259,7 @@ func (c *Config) ResolveModel(providerName, modelName string) (ResolvedModel, er
 		Parameters:          copyParameters(profile.Parameters),
 		ContextWindow:       window.Tokens,
 		ContextWindowSource: string(window.Source),
+		ReasoningConfig:     copyReasoningConfig(profile.ReasoningConfig),
 	}, nil
 }
 
@@ -331,6 +344,7 @@ func copyModels(models map[string]ModelProfile) map[string]ModelProfile {
 	copied := make(map[string]ModelProfile, len(models))
 	for name, profile := range models {
 		profile.Parameters = copyParameters(profile.Parameters)
+		profile.ReasoningConfig = copyReasoningConfig(profile.ReasoningConfig)
 		copied[name] = profile
 	}
 	return copied
@@ -348,6 +362,11 @@ func copyParameters(parameters map[string]any) map[string]any {
 	return copied
 }
 
+func copyReasoningConfig(reasoning ReasoningConfig) ReasoningConfig {
+	reasoning.Levels = copyParameters(reasoning.Levels)
+	return reasoning
+}
+
 func (m *ModelProfile) UnmarshalYAML(value *yaml.Node) error {
 	var fields map[string]any
 	if err := value.Decode(&fields); err != nil {
@@ -363,6 +382,14 @@ func (m *ModelProfile) UnmarshalYAML(value *yaml.Node) error {
 		return fmt.Errorf("model profile id must be a non-empty string")
 	}
 	delete(fields, "id")
+	var structured struct {
+		ReasoningConfig ReasoningConfig `yaml:"reasoning_config"`
+	}
+	if err := value.Decode(&structured); err != nil {
+		return err
+	}
+	m.ReasoningConfig = structured.ReasoningConfig
+	delete(fields, "reasoning_config")
 
 	if rawContextWindow, ok := fields["context_window"]; ok {
 		contextWindow, err := parseContextWindow(rawContextWindow)
@@ -500,6 +527,12 @@ func validateProvider(path string, provider ProviderConfig) error {
 	if provider.Name == "" {
 		return fmt.Errorf("provider file %q is missing name", path)
 	}
+	if provider.RequestTimeout != "" {
+		requestTimeout, err := time.ParseDuration(provider.RequestTimeout)
+		if err != nil || requestTimeout <= 0 {
+			return fmt.Errorf("provider file %q request_timeout must be a positive duration", path)
+		}
+	}
 	for profileName, profile := range provider.Models {
 		if profile.ID == "" {
 			return fmt.Errorf("provider file %q model %q is missing id", path, profileName)
@@ -510,6 +543,14 @@ func validateProvider(path string, provider ProviderConfig) error {
 		if strings.TrimSpace(profile.Type) == ProviderTypeOpenAICodex && strings.TrimSpace(provider.AuthFile) == "" {
 			return fmt.Errorf("provider file %q model %q uses %s but auth_file is missing", path, profileName, ProviderTypeOpenAICodex)
 		}
+		if len(profile.ReasoningConfig.Levels) > 0 && strings.TrimSpace(profile.ReasoningConfig.Parameter) == "" {
+			return fmt.Errorf("provider file %q model %q reasoning_config.parameter is required when levels are configured", path, profileName)
+		}
+		if defaultLevel := strings.TrimSpace(profile.ReasoningConfig.Default); defaultLevel != "" {
+			if _, ok := profile.ReasoningConfig.Levels[defaultLevel]; !ok {
+				return fmt.Errorf("provider file %q model %q reasoning_config.default %q is not present in levels", path, profileName, defaultLevel)
+			}
+		}
 	}
 	return nil
 }
@@ -517,6 +558,7 @@ func validateProvider(path string, provider ProviderConfig) error {
 func normalizeProvider(provider ProviderConfig, providerFileDir string) ProviderConfig {
 	provider.Name = strings.TrimSpace(provider.Name)
 	provider.AuthFile = strings.TrimSpace(provider.AuthFile)
+	provider.RequestTimeout = strings.TrimSpace(provider.RequestTimeout)
 	if provider.AuthFile != "" {
 		provider.AuthFile = resolvePath(providerFileDir, provider.AuthFile)
 	}

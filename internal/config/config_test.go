@@ -774,6 +774,21 @@ models:
 	assertErrorContains(t, err, `unknown model type "not-openai"`, "supported provider types: anthropic-messages, openai-codex, openai-chat, openai-responses")
 }
 
+func TestLoadRejectsInvalidProviderRequestTimeout(t *testing.T) {
+	dir := writeConfigFixture(t)
+	writeFile(t, filepath.Join(dir, "providers", "invalid-timeout.yaml"), `name: invalid-timeout
+base_url: http://localhost:8080/v1
+request_timeout: immediately
+
+models:
+  default:
+    id: model-default
+`)
+
+	_, err := Load(rootConfigPath(dir))
+	assertErrorContains(t, err, "request_timeout must be a positive duration")
+}
+
 func TestLoadReadsMCPServerYAMLFiles(t *testing.T) {
 	dir := writeConfigFixture(t)
 	writeMCPFixture(t, dir)
@@ -1015,6 +1030,9 @@ func TestResolveModelExplicitProviderModel(t *testing.T) {
 	}
 	if got.Provider.BaseURL != "https://tc-paperhub.diezhi.net/v1" {
 		t.Fatalf("Provider.BaseURL = %q, want PaperHub base URL", got.Provider.BaseURL)
+	}
+	if got.Provider.RequestTimeout != "45s" {
+		t.Fatalf("Provider.RequestTimeout = %q, want 45s", got.Provider.RequestTimeout)
 	}
 	if got.Provider.APIKey != "$PAPERHUB_API_KEY" {
 		t.Fatalf("Provider.APIKey = %q, want $PAPERHUB_API_KEY", got.Provider.APIKey)
@@ -1312,6 +1330,7 @@ logging:
 	writeFile(t, filepath.Join(providersDir, "paperhub.yaml"), `name: paperhub
 base_url: https://tc-paperhub.diezhi.net/v1
 api_key: $PAPERHUB_API_KEY
+request_timeout: 45s
 
 models:
   glm-5.2:
