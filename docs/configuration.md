@@ -23,9 +23,7 @@
 sai --config ./config/sai.yaml
 sai --mailbox
 sai --mailbox 127.0.0.1:39123
-sai --tui
 sai session resume <session-id>
-sai session resume <session-id> --tui
 sai project create --config ./config/sai.yaml
 sai session create --config ./config/sai.yaml
 sai config show --config ./config/sai.yaml
@@ -573,27 +571,18 @@ running mailbox task 只取消当前 task 的 turn context，不退出 CLI。
   通过 DNS rebinding 调用 mailbox。
 - mailbox result 不得暴露 prompt 以外的隐藏上下文、tool result 正文或 provider raw error。
 
-## TUI / PromptEvent（M24 首版 renderer 已实现）
+## PromptEvent（M24）
 
-当前版本提供显式 opt-in 的 `--tui` 命令模式。M24 首版 TUI renderer 使用 Bubble Tea；
-非 TTY、管道、脚本调用和未传 `--tui` 的默认交互式 CLI 继续使用 plain renderer。`--tui`
-只适用于默认 session 和 `session resume`，其他非交互式管理命令会拒绝该 flag。
-
-Bubble Tea 只用于 M24 的显式 TUI 展示层。它收窄的是 v0.1/M9 no-TUI / no-third-party
-CLI framework 的历史约束，不改变 execution library 边界、配置加载规则、默认 plain CLI
-行为或单文件发布目标。
-
-M24 还规划将 stdin、未来 TUI 输入和 mailbox 输入抽象为 PromptEvent。当前 mailbox 行为
+M24 将 stdin 和 mailbox 输入抽象为 PromptEvent。当前 mailbox 行为
 保持 M23 语义：正在处理 stdin turn 或 mailbox turn 时，新 mailbox task 只能 queued，
 不会插入或打断 active turn。后续如实现 `append_active`，也必须只在安全 checkpoint 生效，
 不得中断 provider request、tool call 或 shell command。
 
-首版 Bubble Tea TUI 复用当前 stdin/TUI/mailbox 的串行 idle 队列作为 `enqueue_turn`
-语义；真正的 active-turn `append_active` checkpoint 注入是后续 M24 子任务。
+当前 stdin/mailbox 使用串行 idle 队列作为 `enqueue_turn` 语义；真正的 active-turn
+`append_active` checkpoint 注入是后续 M24 子任务。
 
-即使启用 TUI block renderer，`mailbox_get` 和 `mailbox_wait` 的 MCP tool result 仍只返回
-最终 assistant output、状态和错误；不得返回 TUI block、streaming delta、tool status、
-raw execution event、hidden/debug record 或 tool result 正文。
+`mailbox_get` 和 `mailbox_wait` 的 MCP tool result 只返回最终 assistant output、状态和错误；
+不得返回 streaming delta、tool status、raw execution event、hidden/debug record 或 tool result 正文。
 
 ## 工具启用
 

@@ -17,7 +17,6 @@ type PromptSource string
 
 const (
 	PromptSourceStdin         PromptSource = "stdin"
-	PromptSourceTUI           PromptSource = "tui"
 	PromptSourceMailbox       PromptSource = "mailbox"
 	PromptSourceMCPTaskUpdate PromptSource = "mcp_task_update"
 )
@@ -47,7 +46,7 @@ type PromptEvent struct {
 // rewrites Content. MailboxTaskID and InputID are optional and not validated.
 func (e PromptEvent) Validate() error {
 	switch e.Source {
-	case PromptSourceStdin, PromptSourceTUI, PromptSourceMailbox, PromptSourceMCPTaskUpdate:
+	case PromptSourceStdin, PromptSourceMailbox, PromptSourceMCPTaskUpdate:
 	default:
 		return fmt.Errorf("prompt event source %q is unknown or empty", e.Source)
 	}

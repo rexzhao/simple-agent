@@ -288,7 +288,7 @@ func execute(ctx context.Context, program string, args []string, stdin io.Reader
 		var stop func()
 		ctx, stop = contextWithInterruptCancel(ctx, interrupts)
 		defer stop()
-		return defaultSessionCommand(ctx, rootArgs.commandArgs, rootArgs.configPath, serverRoot, rootArgs.mailbox, rootArgs.tui, stdin, stdout, stderr, getwd, program)
+		return defaultSessionCommand(ctx, rootArgs.commandArgs, rootArgs.configPath, serverRoot, rootArgs.mailbox, stdin, stdout, stderr, getwd, program)
 	}
 	var stop func()
 	ctx, stop = contextWithInterruptCancel(ctx, interrupts)
@@ -296,10 +296,6 @@ func execute(ctx context.Context, program string, args []string, stdin io.Reader
 	if rootArgs.mailbox.Enabled && rootArgs.command != "help" && rootArgs.command != "session" {
 		return usageError("--mailbox can only be used with the default session or session resume", "", "sai help")
 	}
-	if rootArgs.tui && rootArgs.command != "help" && rootArgs.command != "session" {
-		return usageError("--tui can only be used with the default session or session resume", "", "sai help")
-	}
-
 	switch rootArgs.command {
 	case "help":
 		return helpCommand(rootArgs.commandArgs, stdout, displayCommand)
@@ -370,14 +366,11 @@ func execute(ctx context.Context, program string, args []string, stdin io.Reader
 		if rootArgs.mailbox.Enabled && subcommand != "resume" {
 			return usageError("--mailbox can only be used with the default session or session resume", "", "sai help session resume")
 		}
-		if rootArgs.tui && subcommand != "resume" {
-			return usageError("--tui can only be used with the default session or session resume", "", "sai help session resume")
-		}
 		switch subcommand {
 		case "create":
 			return sessionCreateCommand(ctx, subArgs, rootArgs.configPath, serverRoot, stdout, getwd, program)
 		case "resume":
-			return sessionResumeCommand(ctx, subArgs, rootArgs.configProvided, serverRoot, rootArgs.mailbox, rootArgs.tui, stdin, stdout, stderr, getwd, program)
+			return sessionResumeCommand(ctx, subArgs, rootArgs.configProvided, serverRoot, rootArgs.mailbox, stdin, stdout, stderr, getwd, program)
 		case "list":
 			return sessionListCommand(ctx, subArgs, rootArgs.configPath, rootArgs.configProvided, serverRoot, stdout, getwd, program)
 		case "show":
@@ -446,7 +439,7 @@ func contextWithInterruptCancel(ctx context.Context, interrupts <-chan struct{})
 	}
 }
 
-const rootUsageText = `usage: sai [--server-root dir] [--config file] [--mailbox [host:port]] [--tui] [command] [args]
+const rootUsageText = `usage: sai [--server-root dir] [--config file] [--mailbox [host:port]] [command] [args]
 
 Commands:
   project           Manage registered projects
@@ -466,10 +459,6 @@ needed, then starts a pending session.
 Use --mailbox [host:port] with the default session or session resume to accept
 MCP mailbox tasks while the foreground CLI is idle. Without host:port, sai
 listens on 127.0.0.1 with an OS-assigned port.
-
-Use --tui with the default session or session resume to start the explicit
-Bubble Tea block renderer. Non-interactive stdin/stdout falls back to plain
-output.
 
 Run "sai help <command>" for command usage.
 `
@@ -919,7 +908,6 @@ type rootArgs struct {
 	configProvided bool
 	serverRoot     string
 	mailbox        mailboxRootFlag
-	tui            bool
 	command        string
 	commandArgs    []string
 	hasHelp        bool
@@ -934,7 +922,6 @@ func splitRootArgs(args []string) (rootArgs, error) {
 	known := map[string]flagKind{
 		"config":         flagKindValue,
 		"mailbox":        flagKindBool,
-		"tui":            flagKindBool,
 		"all-projects":   flagKindBool,
 		"archived":       flagKindBool,
 		"server-root":    flagKindValue,
@@ -1001,10 +988,6 @@ func splitRootArgs(args []string) (rootArgs, error) {
 			i = next
 			continue
 		}
-		if name == "tui" {
-			out.tui = true
-			continue
-		}
 		if name == "config" || name == "server-root" {
 			value, next, err := flagValue(args, i, name, hasInlineValue)
 			if err != nil {
@@ -1051,10 +1034,6 @@ func stripGlobalArgs(args rootArgs) (rootArgs, error) {
 			}
 			args.mailbox = mailbox
 			i = next
-			continue
-		}
-		if isFlagArg(arg) && name == "tui" {
-			args.tui = true
 			continue
 		}
 		if isFlagArg(arg) && (name == "config" || name == "server-root") {
@@ -1872,7 +1851,7 @@ func executionSessionCreateMetadataFromDefaults(session sessions.SessionV2) exec
 	}
 }
 
-func sessionResumeCommand(ctx context.Context, args []string, configProvided bool, homePath string, mailbox mailboxRootFlag, tui bool, stdin io.Reader, stdout, stderr io.Writer, getwd func() (string, error), program string) error {
+func sessionResumeCommand(ctx context.Context, args []string, configProvided bool, homePath string, mailbox mailboxRootFlag, stdin io.Reader, stdout, stderr io.Writer, getwd func() (string, error), program string) error {
 	displayCommand := displayProgramName(program)
 	flags := flag.NewFlagSet("sai session resume", flag.ContinueOnError)
 	flags.String("cwd", "", "discovery working directory")
@@ -1915,10 +1894,10 @@ func sessionResumeCommand(ctx context.Context, args []string, configProvided boo
 		}
 		stopMailbox()
 	}()
-	return resumeExecutionSessionREPL(replCtx, service, positionals[0], stdin, stdout, stderr, displayCommand, "sai help session resume", mailboxQueue, tui)
+	return resumeExecutionSessionREPL(replCtx, service, positionals[0], stdin, stdout, stderr, displayCommand, "sai help session resume", mailboxQueue)
 }
 
-func defaultSessionCommand(ctx context.Context, args []string, configPath string, homePath string, mailbox mailboxRootFlag, tui bool, stdin io.Reader, stdout, stderr io.Writer, getwd func() (string, error), program string) error {
+func defaultSessionCommand(ctx context.Context, args []string, configPath string, homePath string, mailbox mailboxRootFlag, stdin io.Reader, stdout, stderr io.Writer, getwd func() (string, error), program string) error {
 	displayCommand := displayProgramName(program)
 	flags := flag.NewFlagSet("sai", flag.ContinueOnError)
 	cwdFlag := flags.String("cwd", "", "discovery working directory")
@@ -1967,27 +1946,20 @@ func defaultSessionCommand(ctx context.Context, args []string, configPath string
 		}
 		stopMailbox()
 	}()
-	if tui {
-		return runPendingAttachTUI(replCtx, service, configPath, homePath, creationCWD, stdin, stdout, stderr, program, mailboxQueue)
-	}
 	return runPendingAttachREPL(replCtx, service, configPath, homePath, creationCWD, stdin, stdout, stderr, program, mailboxQueue)
 }
 
-func resumeExecutionSessionREPL(ctx context.Context, service *execution.Service, sessionID string, stdin io.Reader, stdout, stderr io.Writer, displayCommand, helpCommand string, mailbox *mailboxQueue, tui bool) error {
+func resumeExecutionSessionREPL(ctx context.Context, service *execution.Service, sessionID string, stdin io.Reader, stdout, stderr io.Writer, displayCommand, helpCommand string, mailbox *mailboxQueue) error {
 	sessionID = strings.TrimSpace(sessionID)
 	if sessionID == "" {
 		return usageError("session id must be a non-empty string", "", helpCommand)
 	}
-	detail, err := service.GetSession(sessionID)
-	if err != nil {
+	if _, err := service.GetSession(sessionID); err != nil {
 		return err
 	}
 	snapshot, err := service.GetSessionChatItems(sessionID)
 	if err != nil {
 		return err
-	}
-	if tui {
-		return runResumeAttachTUI(ctx, service, detail, snapshot, stdin, stdout, stderr, displayCommand, mailbox)
 	}
 	if err := writeAttachSnapshot(stdout, snapshot); err != nil {
 		return err

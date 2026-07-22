@@ -108,7 +108,7 @@ func TestSessionRunEnqueueReceiptWaitIsRepeatable(t *testing.T) {
 	service, _, session := newExecutionServiceWithSession(t, home, recordingBlockingRunner(release, &seen))
 
 	run := service.StartSessionRun(context.Background(), session.ID, "init", nil)
-	receipt, err := run.Enqueue(PromptEvent{Source: PromptSourceTUI, Mode: PromptModeEnqueueTurn, Content: "again", InputID: "in-1"})
+	receipt, err := run.Enqueue(PromptEvent{Source: PromptSourceStdin, Mode: PromptModeEnqueueTurn, Content: "again", InputID: "in-1"})
 	if err != nil {
 		t.Fatalf("Enqueue() error = %v", err)
 	}

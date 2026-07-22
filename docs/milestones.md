@@ -967,42 +967,25 @@ MCP 向当前 session 投递 queued prompt，同时不恢复 HTTP/WS 产品层�
 - `go test ./...` 通过。
 - `git diff --check` 通过。
 
-## M24：Optional TUI Block Renderer and PromptEvent Input
+## M24：PromptEvent Input
 
-状态说明（首版 renderer 已实现，append_active 尚未实现）：M24 是后续可选 TUI /
-PromptEvent 方向的稳定文档边界；当前版本已有显式 `--tui` 模式，但还没有纯 CLI
-active turn 输入队列。
+状态说明：`enqueue_turn` 已实现，`append_active` 尚未实现；当前版本没有 active turn 输入队列。
 
-目标：在不恢复 HTTP layer、不改变 execution library 边界的前提下，为 CLI 增加一个
-显式 opt-in 的 TUI block renderer，并把 stdin、TUI 输入和 mailbox 输入统一为
-PromptEvent。
-
-首版 TUI renderer 使用 Bubble Tea。这个决定只 supersede v0.1/M9 中 no-TUI /
-no-third-party CLI framework 历史约束在 M24 显式 `--tui` 模式下的适用范围；默认 plain CLI、
-非 TTY、脚本路径和单文件发布目标不改变。
+目标：在不恢复 HTTP layer、不改变 execution library 边界的前提下，把 stdin 和 mailbox
+输入统一为 PromptEvent。
 
 交付物：
 
-- `docs/tasks/tui-block-renderer-checklist.md` 作为 M24 的执行清单。
-- execution session stream 补齐 TUI 所需事件缺口，例如 `usage.updated`。
-- 新增展示侧 Turn Block Aggregator，将 `SessionStreamEvent` 规整为 reasoning、tool、
-  assistant output、system notice 和 status bar 等 block。
-- plain renderer 继续使用同一事件流，保持脚本和非 TTY 场景的普通 CLI 输出。
-- Bubble Tea TUI renderer 只在显式 `--tui` 模式启用，不作为默认行为。
 - PromptEvent 抽象输入源和模式，至少覆盖 `enqueue_turn` 与 `append_active`。
-- 首版 `enqueue_turn` 可复用当前 stdin/TUI/mailbox 串行 idle 队列；新输入不得打断
+- 首版 `enqueue_turn` 可复用当前 stdin/mailbox 串行 idle 队列；新输入不得打断
   active turn。
 - `append_active` 只在 provider request、tool call 和 shell command 之外的安全 checkpoint
-  生效；追加输入落盘为同一 `turn_id` 下的独立 user item。该能力是首版 TUI 后续子任务，
-  不随 Bubble Tea renderer 首个代码 slice 一起完成。
-- mailbox task start/end 是展示侧 system block；mailbox task 执行过程和普通输入输出使用
-  同一事件流。
-- mailbox MCP result 继续只返回最终 assistant output、状态和错误，不暴露 TUI block、
-  streaming delta 或 tool result 正文。
+  生效；追加输入落盘为同一 `turn_id` 下的独立 user item。
+- mailbox MCP result 继续只返回最终 assistant output、状态和错误，不暴露 streaming delta
+  或 tool result 正文。
 
 非目标：
 
-- 不把 TUI 设为默认模式。
 - 不恢复 HTTP/WS product layer、daemon、registry 或多 worker。
 - 不引入 Markdown renderer 作为本阶段目标。
 - 不在稳定文档和测试通过前开始代码实现。
@@ -1013,6 +996,5 @@ no-third-party CLI framework 历史约束在 M24 显式 `--tui` 模式下的适�
 - 测试覆盖 PromptEvent `enqueue_turn` / `append_active` 队列与安全 checkpoint。
 - 测试覆盖 mailbox task 在 active turn 期间保持 queued，不打断当前 turn。
 - 测试覆盖 mailbox MCP result 仍然是 final-output-only。
-- Bubble Tea TUI 和 plain renderer 均有快照或等效输出验证。
 - `go test ./...` 通过。
 - `git diff --check` 通过。

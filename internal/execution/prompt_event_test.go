@@ -21,11 +21,6 @@ func TestPromptEventValidate(t *testing.T) {
 			wantErr: false,
 		},
 		{
-			name:    "tui append_active valid",
-			event:   PromptEvent{Source: PromptSourceTUI, Mode: PromptModeAppendActive, Content: validContent},
-			wantErr: false,
-		},
-		{
 			name:    "mailbox enqueue_turn valid with task id",
 			event:   PromptEvent{Source: PromptSourceMailbox, Mode: PromptModeEnqueueTurn, Content: validContent, MailboxTaskID: "task-1"},
 			wantErr: false,
