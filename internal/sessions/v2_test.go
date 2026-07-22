@@ -456,6 +456,58 @@ func TestV2StoreListLatestAndDeletePreservesBlobs(t *testing.T) {
 	}
 }
 
+func TestV2StoreListSkipsCorruptMetadata(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "sessions")
+	store := NewV2Store(root)
+	if _, err := store.SaveMetadata(SessionV2{ID: "valid", Provider: "test", ModelID: "model"}); err != nil {
+		t.Fatalf("SaveMetadata(valid) error = %v", err)
+	}
+	corruptDir := filepath.Join(root, "corrupt")
+	if err := os.MkdirAll(corruptDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll(corrupt) error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(corruptDir, "meta.json"), nil, 0o600); err != nil {
+		t.Fatalf("WriteFile(corrupt metadata) error = %v", err)
+	}
+
+	infos, err := store.List()
+	if err != nil {
+		t.Fatalf("List() error = %v", err)
+	}
+	if got, want := sessionInfoIDs(infos), []string{"valid"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("List() IDs = %#v, want %#v", got, want)
+	}
+	if _, err := store.Load("corrupt"); !errors.Is(err, ErrCorruptedSession) {
+		t.Fatalf("Load(corrupt) error = %v, want ErrCorruptedSession", err)
+	}
+}
+
+func TestV2StoreSaveMetadataUsesCleanReplacement(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "sessions")
+	store := NewV2Store(root)
+	if _, err := store.SaveMetadata(SessionV2{ID: "session-1", DisplayName: "before"}); err != nil {
+		t.Fatalf("SaveMetadata(before) error = %v", err)
+	}
+	if _, err := store.SaveMetadata(SessionV2{ID: "session-1", DisplayName: "after"}); err != nil {
+		t.Fatalf("SaveMetadata(after) error = %v", err)
+	}
+
+	loaded, err := store.Load("session-1")
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if loaded.DisplayName != "after" {
+		t.Fatalf("DisplayName = %q, want after", loaded.DisplayName)
+	}
+	temps, err := filepath.Glob(filepath.Join(root, "session-1", ".meta-*.tmp"))
+	if err != nil {
+		t.Fatalf("Glob(metadata temp files) error = %v", err)
+	}
+	if len(temps) != 0 {
+		t.Fatalf("metadata temp files = %#v, want none", temps)
+	}
+}
+
 func TestV2StoreListFiltersArchivedAndSortsByLastUsed(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "sessions")
 	clock := &fakeClock{current: time.Date(2026, 7, 3, 1, 2, 3, 0, time.UTC)}

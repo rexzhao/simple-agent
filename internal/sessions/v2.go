@@ -307,7 +307,7 @@ func (s *V2Store) SaveMetadata(session SessionV2) (SessionV2, error) {
 	}
 	data = append(data, '\n')
 	path := s.metadataPath(session.ID)
-	if err := os.WriteFile(path, data, 0o600); err != nil {
+	if err := writeSessionMetadataAtomic(path, data); err != nil {
 		return SessionV2{}, fmt.Errorf("write session metadata %q: %w", session.ID, err)
 	}
 	return session, nil
@@ -461,7 +461,7 @@ func (s *V2Store) ListWithOptions(options V2ListOptions) ([]Info, error) {
 		}
 		session, err := s.loadMetadata(id)
 		if err != nil {
-			if errors.Is(err, ErrNotFound) {
+			if errors.Is(err, ErrNotFound) || errors.Is(err, ErrCorruptedSession) {
 				continue
 			}
 			return nil, err
@@ -1431,9 +1431,44 @@ func readSessionV2MetadataFile(path string) (SessionV2, error) {
 	decoder := json.NewDecoder(file)
 	decoder.UseNumber()
 	if err := decoder.Decode(&metadata); err != nil {
-		return SessionV2{}, fmt.Errorf("parse session metadata %q: %w", path, err)
+		return SessionV2{}, fmt.Errorf("%w: parse session metadata %q: %v", ErrCorruptedSession, path, err)
 	}
 	return metadata.session(), nil
+}
+
+func writeSessionMetadataAtomic(path string, data []byte) error {
+	temp, err := os.CreateTemp(filepath.Dir(path), ".meta-*.tmp")
+	if err != nil {
+		return fmt.Errorf("create temporary file: %w", err)
+	}
+	tempPath := temp.Name()
+	cleanup := true
+	defer func() {
+		if cleanup {
+			_ = os.Remove(tempPath)
+		}
+	}()
+
+	if err := temp.Chmod(0o600); err != nil {
+		_ = temp.Close()
+		return fmt.Errorf("chmod temporary file: %w", err)
+	}
+	if _, err := temp.Write(data); err != nil {
+		_ = temp.Close()
+		return fmt.Errorf("write temporary file: %w", err)
+	}
+	if err := temp.Sync(); err != nil {
+		_ = temp.Close()
+		return fmt.Errorf("sync temporary file: %w", err)
+	}
+	if err := temp.Close(); err != nil {
+		return fmt.Errorf("close temporary file: %w", err)
+	}
+	if err := os.Rename(tempPath, path); err != nil {
+		return fmt.Errorf("replace file: %w", err)
+	}
+	cleanup = false
+	return nil
 }
 
 func metadataFromSessionV2(session SessionV2) sessionV2Metadata {
