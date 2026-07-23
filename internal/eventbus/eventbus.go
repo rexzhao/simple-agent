@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"sync"
 
+	"github.com/rexzhao/simple-agent/internal/contextwindow"
 	"github.com/rexzhao/simple-agent/internal/model"
 	"github.com/rexzhao/simple-agent/internal/sessions"
 )
@@ -241,6 +242,7 @@ type CompactionRequested struct {
 	TurnID     string
 	Summary    sessions.SessionItem
 	Checkpoint sessions.CompactionCheckpoint
+	Context    *contextwindow.Metadata
 }
 
 func (CompactionRequested) Kind() string  { return KindCompactionRequested }

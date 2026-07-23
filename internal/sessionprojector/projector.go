@@ -187,6 +187,9 @@ func (p *Projector) handleCompactionRequested(event eventbus.CompactionRequested
 	if err := p.requireActiveTurn(event.TurnID); err != nil {
 		return err
 	}
+	if event.Context != nil {
+		p.session.Context = *event.Context
+	}
 	next, err := p.store.SaveCompactedTurn(p.session, event.Summary, event.Checkpoint, nil, event.Checkpoint.ReplacementHistory)
 	if err != nil {
 		return err

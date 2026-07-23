@@ -184,6 +184,10 @@ models:
     id: gpt-5.3-codex
     type: openai-codex
     context_window: 200000
+    parameters:
+      responses:
+        compaction:
+          mode: responses-compact
     reasoning_config:
       parameter: reasoning.effort
       default: xhigh
@@ -299,3 +303,21 @@ this diagnostic logging switch.
 conservative estimated default. The Web UI shows usage events and exposes manual
 compaction. Automatic compaction follows the `compaction` configuration when
 enabled.
+
+Compaction defaults to the provider-neutral local summary implementation. An
+OpenAI Responses or Codex model profile can explicitly opt into the public
+stateless `POST /responses/compact` endpoint:
+
+```yaml
+parameters:
+  responses:
+    compaction:
+      mode: responses-compact
+```
+
+SAI stores the returned canonical output as opaque provider items and replays it
+only to the same base URL and model. If the standalone compact request fails,
+SAI rebuilds the complete history from the append-only session ledger and falls
+back to the configured local summary model. Compatible third-party endpoints
+are never assumed to support remote compaction. `context_management` and the
+Codex-specific `compaction_trigger` protocol are not enabled by this option.

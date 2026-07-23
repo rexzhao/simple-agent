@@ -18,6 +18,8 @@ func NextSessionItemID(existing map[string]struct{}, message model.Message) stri
 	prefix := "msg"
 	if message.Role == model.MessageRoleSystem || message.Role == model.MessageRoleDeveloper {
 		prefix = "runtime"
+	} else if message.Role == model.MessageRoleProvider {
+		prefix = "compaction"
 	}
 	for i := len(existing) + 1; ; i++ {
 		id := fmt.Sprintf("%s-%06d", prefix, i)

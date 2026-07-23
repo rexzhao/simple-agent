@@ -223,6 +223,8 @@ type SessionCompactionResult struct {
 type SessionCompactionPlan struct {
 	SummaryItem sessions.SessionItem
 	Checkpoint  sessions.CompactionCheckpoint
+	Usage       *model.Usage
+	Context     *contextwindow.Metadata
 }
 
 var (
@@ -1111,10 +1113,14 @@ func (s *Service) planAutoCompaction(ctx context.Context, bus eventbus.Publisher
 	if !sessionCompactionPlanPresent(result.Compaction) {
 		return session, nil
 	}
+	if err := publishCompactionUsage(bus, result.Compaction.Usage); err != nil {
+		return sessions.SessionV2{}, fmt.Errorf("could not publish compaction usage")
+	}
 	if err := bus.Publish(eventbus.CompactionRequested{
 		TurnID:     turnID,
 		Summary:    result.Compaction.SummaryItem,
 		Checkpoint: result.Compaction.Checkpoint,
+		Context:    result.Compaction.Context,
 	}); err != nil {
 		return sessions.SessionV2{}, fmt.Errorf("could not compact session")
 	}
@@ -1126,6 +1132,13 @@ func (s *Service) planAutoCompaction(ctx context.Context, bus eventbus.Publisher
 		compacted.CWD = compacted.CreatedCWD
 	}
 	return compacted, nil
+}
+
+func publishCompactionUsage(publisher eventbus.Publisher, usage *model.Usage) error {
+	if publisher == nil || usage == nil {
+		return nil
+	}
+	return publisher.Publish(eventbus.ModelEvent{Event: model.UsageEvent{Usage: *usage}})
 }
 
 func (s *Service) loadActiveProject(id string) (projectstore.Project, error) {

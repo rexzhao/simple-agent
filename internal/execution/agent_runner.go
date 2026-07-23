@@ -119,6 +119,8 @@ func (r AgentTurnRunner) PlanSessionTurnCompaction(ctx context.Context, request 
 		Compaction: SessionCompactionPlan{
 			SummaryItem: compaction.summaryItem,
 			Checkpoint:  compaction.checkpoint,
+			Usage:       compaction.usage,
+			Context:     compaction.context,
 		},
 	}, nil
 }
@@ -145,6 +147,8 @@ func (r AgentTurnRunner) PlanSessionCompaction(ctx context.Context, request Sess
 		Compaction: SessionCompactionPlan{
 			SummaryItem: plan.summaryItem,
 			Checkpoint:  plan.checkpoint,
+			Usage:       plan.usage,
+			Context:     plan.context,
 		},
 	}, nil
 }
@@ -487,6 +491,8 @@ type compactionPlan struct {
 	summaryItem sessions.SessionItem
 	checkpoint  sessions.CompactionCheckpoint
 	messages    []model.Message
+	usage       *model.Usage
+	context     *contextwindow.Metadata
 }
 
 func (r *agentRunnerRuntime) planAutoCompactBeforeTurn(ctx context.Context, messages []model.Message, prompt string) ([]model.Message, *compactionPlan, error) {
@@ -560,11 +566,37 @@ func (r *agentRunnerRuntime) planCompactionCheckpoint(ctx context.Context, check
 		return compactionPlan{}, fmt.Errorf("compaction requires a saved or resumed session")
 	}
 
+	remote, err := openairesponses.UsesStandaloneCompaction(r.parameters)
+	if err != nil {
+		return compactionPlan{}, err
+	}
+	if remote {
+		plan, remoteErr := r.planRemoteCompactionCheckpoint(ctx, checkpointOptions)
+		if remoteErr == nil {
+			return plan, nil
+		}
+		plan, fallbackErr := r.planSummaryCompactionCheckpoint(ctx, checkpointOptions)
+		if fallbackErr == nil {
+			return plan, nil
+		}
+		return compactionPlan{}, errors.Join(
+			fmt.Errorf("remote Responses compaction failed: %w", remoteErr),
+			fmt.Errorf("local summary fallback failed: %w", fallbackErr),
+		)
+	}
+	return r.planSummaryCompactionCheckpoint(ctx, checkpointOptions)
+}
+
+func (r *agentRunnerRuntime) planSummaryCompactionCheckpoint(ctx context.Context, checkpointOptions compactionCheckpointOptions) (compactionPlan, error) {
 	summaryModel, err := r.resolveSummaryModel()
 	if err != nil {
 		return compactionPlan{}, err
 	}
-	summaryInput, err := buildCompactionSummaryInput(r.session, summaryModel)
+	summarySession, err := expandRemoteCompactionHistory(r.session)
+	if err != nil {
+		return compactionPlan{}, err
+	}
+	summaryInput, err := buildCompactionSummaryInput(summarySession, summaryModel)
 	if err != nil {
 		return compactionPlan{}, err
 	}
@@ -589,7 +621,7 @@ func (r *agentRunnerRuntime) planCompactionCheckpoint(ctx context.Context, check
 		Audience:   sessions.ItemAudienceModel,
 		Message:    &summaryMessage,
 	}
-	replacementHistory, err := replacementHistoryAfterCompaction(r.session, summaryItemID)
+	replacementHistory, err := replacementHistoryAfterCompaction(summarySession, summaryItemID)
 	if err != nil {
 		return compactionPlan{}, err
 	}
@@ -615,6 +647,154 @@ func (r *agentRunnerRuntime) planCompactionCheckpoint(ctx context.Context, check
 		checkpoint:  checkpoint,
 		messages:    messages,
 	}, nil
+}
+
+func (r *agentRunnerRuntime) planRemoteCompactionCheckpoint(ctx context.Context, checkpointOptions compactionCheckpointOptions) (compactionPlan, error) {
+	resolved, err := r.config.ResolveModel(r.providerName, r.modelProfile)
+	if err != nil {
+		return compactionPlan{}, err
+	}
+	if resolved.Type != config.ProviderTypeOpenAIResponses && resolved.Type != config.ProviderTypeOpenAICodex {
+		return compactionPlan{}, fmt.Errorf("responses.compaction.mode requires an OpenAI Responses or Codex model")
+	}
+	resolved.ModelID = r.modelID
+	resolved.Parameters = copyParameterMap(r.parameters)
+
+	messages, err := r.materializeActiveHistory(r.session)
+	if err != nil {
+		return compactionPlan{}, err
+	}
+	provider, err := newProviderForRun(resolved.ProviderName, resolved.Type, resolved.Provider)
+	if err != nil {
+		return compactionPlan{}, err
+	}
+	compactor, ok := provider.(model.CompactionProvider)
+	if !ok {
+		return compactionPlan{}, fmt.Errorf("provider %q does not support standalone compaction", resolved.ProviderName)
+	}
+	compacted, err := compactor.Compact(ctx, model.Request{
+		Model:      resolved.ModelID,
+		Messages:   messages,
+		Tools:      r.toolSchemas,
+		Parameters: resolved.Parameters,
+		SessionID:  r.session.ID,
+	})
+	if err != nil {
+		return compactionPlan{}, err
+	}
+	usage, contextMetadata, err := r.recordRemoteCompactionUsage(compacted.Usage)
+	if err != nil {
+		return compactionPlan{}, err
+	}
+
+	compactionMessage := model.Message{
+		Role:          model.MessageRoleProvider,
+		ProviderItems: copyProviderItemSlice(compacted.Items),
+	}
+	itemID := sessions.NextSessionItemID(sessions.SessionItemIDs(r.session.Items), compactionMessage)
+	compactionItem := sessions.SessionItem{
+		ID:         itemID,
+		Kind:       sessions.ItemKindCompaction,
+		Visibility: sessions.ItemVisibilityHidden,
+		Audience:   sessions.ItemAudienceModel,
+		Message:    &compactionMessage,
+	}
+	replacementHistory := []string{itemID}
+	messages, err = validateCompactionReplacementHistory(r.session, compactionItem, replacementHistory)
+	if err != nil {
+		return compactionPlan{}, err
+	}
+	checkpoint := sessions.CompactionCheckpoint{
+		ID:                    nextCompactionCheckpointID(r.session.Compactions),
+		Reason:                checkpointOptions.reason,
+		Phase:                 checkpointOptions.phase,
+		Trigger:               checkpointOptions.trigger,
+		SummaryItemID:         itemID,
+		FromItemID:            firstString(r.session.ActiveHistory),
+		ToItemID:              lastString(r.session.ActiveHistory),
+		PreviousActiveHistory: copyStringSlice(r.session.ActiveHistory),
+		ReplacementHistory:    replacementHistory,
+		SummaryProvider:       resolved.ProviderName,
+		SummaryModel:          resolved.Profile,
+	}
+	return compactionPlan{
+		summaryItem: compactionItem,
+		checkpoint:  checkpoint,
+		messages:    messages,
+		usage:       usage,
+		context:     contextMetadata,
+	}, nil
+}
+
+func (r *agentRunnerRuntime) recordRemoteCompactionUsage(usage model.Usage) (*model.Usage, *contextwindow.Metadata, error) {
+	if usage == (model.Usage{}) {
+		return nil, nil, nil
+	}
+	event := model.UsageEvent{Usage: usage}
+	if r.logger != nil {
+		if err := r.logger.LogEvent(event); err != nil {
+			return nil, nil, err
+		}
+	}
+
+	usageCopy := usage
+	if r.contextTracker == nil {
+		return &usageCopy, nil, nil
+	}
+	r.contextTracker.RecordProviderUsage(usage)
+	metadata := r.contextTracker.Metadata()
+	return &usageCopy, &metadata, nil
+}
+
+func expandRemoteCompactionHistory(session sessions.SessionV2) (sessions.SessionV2, error) {
+	itemsByID := make(map[string]sessions.SessionItem, len(session.Items))
+	for _, item := range session.Items {
+		itemsByID[item.ID] = item
+	}
+	checkpointsByItemID := make(map[string]sessions.CompactionCheckpoint, len(session.Compactions))
+	for _, checkpoint := range session.Compactions {
+		checkpointsByItemID[checkpoint.SummaryItemID] = checkpoint
+	}
+
+	var expand func([]string, map[string]struct{}) ([]string, error)
+	expand = func(ids []string, visiting map[string]struct{}) ([]string, error) {
+		result := make([]string, 0, len(ids))
+		for _, id := range ids {
+			item, ok := itemsByID[id]
+			if !ok {
+				return nil, corruptedSessionHistoryError(session.ID, "active history references missing item %q", id)
+			}
+			if item.Kind != sessions.ItemKindCompaction || item.Message == nil || item.Message.Role != model.MessageRoleProvider {
+				result = append(result, id)
+				continue
+			}
+			if _, cycle := visiting[id]; cycle {
+				return nil, corruptedSessionHistoryError(session.ID, "remote compaction history contains a cycle at item %q", id)
+			}
+			checkpoint, ok := checkpointsByItemID[id]
+			if !ok || len(checkpoint.PreviousActiveHistory) == 0 {
+				return nil, corruptedSessionHistoryError(session.ID, "remote compaction item %q has no previous history checkpoint", id)
+			}
+			nextVisiting := make(map[string]struct{}, len(visiting)+1)
+			for key := range visiting {
+				nextVisiting[key] = struct{}{}
+			}
+			nextVisiting[id] = struct{}{}
+			expanded, err := expand(checkpoint.PreviousActiveHistory, nextVisiting)
+			if err != nil {
+				return nil, err
+			}
+			result = append(result, expanded...)
+		}
+		return result, nil
+	}
+
+	activeHistory, err := expand(session.ActiveHistory, map[string]struct{}{})
+	if err != nil {
+		return sessions.SessionV2{}, err
+	}
+	session.ActiveHistory = activeHistory
+	return session, nil
 }
 
 func (r *agentRunnerRuntime) resolveSummaryModel() (config.ResolvedModel, error) {
@@ -1354,14 +1534,29 @@ func copyMessageSlice(messages []model.Message) []model.Message {
 	for i := range copied {
 		copied[i].ContentBlocks = append([]model.InputContentBlock(nil), messages[i].ContentBlocks...)
 		copied[i].ToolCalls = append([]model.ToolCall(nil), messages[i].ToolCalls...)
+		copied[i].ProviderItems = copyProviderItemSlice(messages[i].ProviderItems)
 		if messages[i].ResponseState != nil {
 			state := *messages[i].ResponseState
 			state.ReasoningItems = make([]json.RawMessage, len(messages[i].ResponseState.ReasoningItems))
 			for index, item := range messages[i].ResponseState.ReasoningItems {
 				state.ReasoningItems[index] = append(json.RawMessage(nil), item...)
 			}
+			if messages[i].ResponseState.OutputItems != nil {
+				state.OutputItems = make([]json.RawMessage, len(messages[i].ResponseState.OutputItems))
+				for index, item := range messages[i].ResponseState.OutputItems {
+					state.OutputItems[index] = append(json.RawMessage(nil), item...)
+				}
+			}
 			copied[i].ResponseState = &state
 		}
+	}
+	return copied
+}
+
+func copyProviderItemSlice(items []model.ProviderItem) []model.ProviderItem {
+	copied := append([]model.ProviderItem(nil), items...)
+	for index := range copied {
+		copied[index].Data = append(json.RawMessage(nil), items[index].Data...)
 	}
 	return copied
 }

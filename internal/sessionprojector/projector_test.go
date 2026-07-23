@@ -8,6 +8,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/rexzhao/simple-agent/internal/contextwindow"
 	"github.com/rexzhao/simple-agent/internal/eventbus"
 	"github.com/rexzhao/simple-agent/internal/model"
 	"github.com/rexzhao/simple-agent/internal/sessions"
@@ -301,9 +302,21 @@ func TestProjectorRefreshesCachedStateAfterCompaction(t *testing.T) {
 		PreviousActiveHistory: loaded.ActiveHistory,
 		ReplacementHistory:    []string{"summary-1"},
 	}
+	compactionContext := contextwindow.Metadata{
+		ContextWindow:        400000,
+		LastInputTokens:      1200,
+		LastCachedTokens:     900,
+		LastCacheWriteTokens: 200,
+		LastUsageSource:      string(contextwindow.UsageSourceProvider),
+	}
 
 	publish(t, bus, eventbus.TurnStarted{TurnID: "turn-1"})
-	publish(t, bus, eventbus.CompactionRequested{TurnID: "turn-1", Summary: summary, Checkpoint: checkpoint})
+	publish(t, bus, eventbus.CompactionRequested{
+		TurnID:     "turn-1",
+		Summary:    summary,
+		Checkpoint: checkpoint,
+		Context:    &compactionContext,
+	})
 	publish(t, bus, eventbus.TurnInputReady{TurnID: "turn-1", Message: model.Message{Role: model.MessageRoleUser, Content: "new"}})
 
 	replayed, err := store.Replay("session-1")
@@ -322,6 +335,13 @@ func TestProjectorRefreshesCachedStateAfterCompaction(t *testing.T) {
 	user, ok := sessionItemByID(replayed.Items, replayed.ActiveHistory[1])
 	if !ok || user.Message == nil || user.Message.Role != model.MessageRoleUser || user.Message.Content != "new" {
 		t.Fatalf("new active user item = %#v, ok %v", user, ok)
+	}
+	stored, err := store.Load("session-1")
+	if err != nil {
+		t.Fatalf("Load(compacted) error = %v", err)
+	}
+	if !reflect.DeepEqual(stored.Context, compactionContext) {
+		t.Fatalf("Context = %#v, want compact usage context %#v", stored.Context, compactionContext)
 	}
 }
 

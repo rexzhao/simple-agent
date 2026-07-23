@@ -121,6 +121,26 @@ ${serverRoot}/
 - [x] compaction、resume、provider/model 切换或无法解析旧 response ID 时有明确降级规则，必要时回到
   full input replay，且不伪造 continuation 成功。
 
+### Responses Standalone Compaction
+
+- [x] `ResponseState` 保存正常 `/responses` 返回的完整、有序 `output` items；manual 模式优先原样
+  回放，旧 session 没有完整 output 时继续使用原有 reasoning/message/function 重建路径。
+- [x] 增加 provider-owned opaque item 表达，记录 origin、model 和 raw JSON；session 可以把
+  `/responses/compact` 的完整 canonical output 作为 hidden compaction item 持久化并恢复。
+- [x] 通过 model profile 的 `parameters.responses.compaction.mode: responses-compact` 显式声明
+  endpoint capability，不根据模型 slug 或兼容端点名称猜测。
+- [x] 实现公开 `POST /responses/compact`，只发送该端点支持的参数，验证响应至少包含一个
+  `type=compaction` item，并通过 `json.RawMessage` 直通完整 output，避免 opaque 字段发生数值精度
+  转换。
+- [x] standalone compact 响应的 usage 写入 context tracker 和诊断日志；自动压缩时同时发布
+  `usage.updated` session event，包含 `cached_tokens`、`cache_write_tokens` 和 reasoning usage。
+- [x] 远端 compact 失败时，从 append-only ledger 和 checkpoint 的 `PreviousActiveHistory` 恢复完整
+  未压缩历史，再回退到原有本地 summary。
+- [x] 普通 Responses 请求暂时拒绝 `context_management`，避免在 mid-turn checkpoint 持久化尚未
+  实现时产生无法收敛的 active history。
+- [ ] 后续实现 mid-turn 安全边界后，再评估 `context_management` 自动压缩。
+- [ ] Codex 私有 `compaction_trigger` 只有在专用后端 capability 和集成测试都明确后才考虑接入。
+
 ## Implementation Slices
 
 - [x] Slice 1：扩展现有 server-root resolver，补齐 basename 规范化、派生环境变量和默认
@@ -133,6 +153,8 @@ ${serverRoot}/
 - [x] Slice 6：cache key/options capability 和 request serialization。
 - [x] Slice 7：content blocks、显式 cache breakpoint 和校验。
 - [x] Slice 8：response ID、stateful continuation、manual full-output replay 和降级。
+- [x] Slice 9：opaque provider items、standalone `/responses/compact`、session checkpoint 和本地摘要
+  fallback。
 
 ## Acceptance Criteria
 

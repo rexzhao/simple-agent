@@ -1981,9 +1981,6 @@ func validateCompactionCheckpointWrite(summaryItem SessionItem, checkpoint Compa
 	if strings.TrimSpace(summaryItem.ID) == "" {
 		return fmt.Errorf("compaction summary item id is required")
 	}
-	if summaryItem.Kind != ItemKindMessage {
-		return fmt.Errorf("compaction summary item kind must be %q", ItemKindMessage)
-	}
 	if summaryItem.Visibility != ItemVisibilityHidden {
 		return fmt.Errorf("compaction summary item visibility must be %q", ItemVisibilityHidden)
 	}
@@ -1993,8 +1990,31 @@ func validateCompactionCheckpointWrite(summaryItem SessionItem, checkpoint Compa
 	if summaryItem.Message == nil {
 		return fmt.Errorf("compaction summary item message is required")
 	}
-	if strings.TrimSpace(summaryItem.Message.Content) == "" {
-		return fmt.Errorf("compaction summary message content is required")
+	switch summaryItem.Kind {
+	case ItemKindMessage:
+		if strings.TrimSpace(summaryItem.Message.Content) == "" {
+			return fmt.Errorf("compaction summary message content is required")
+		}
+	case ItemKindCompaction:
+		if summaryItem.Message.Role != model.MessageRoleProvider {
+			return fmt.Errorf("compaction summary item kind must be %q", ItemKindMessage)
+		}
+		if len(summaryItem.Message.ProviderItems) == 0 {
+			return fmt.Errorf("remote compaction provider items are required")
+		}
+		for index, item := range summaryItem.Message.ProviderItems {
+			if strings.TrimSpace(item.Origin) == "" || strings.TrimSpace(item.Model) == "" {
+				return fmt.Errorf("remote compaction provider item %d origin and model are required", index)
+			}
+			var decoded struct {
+				Type string `json:"type"`
+			}
+			if json.Unmarshal(item.Data, &decoded) != nil || strings.TrimSpace(decoded.Type) == "" {
+				return fmt.Errorf("remote compaction provider item %d is invalid", index)
+			}
+		}
+	default:
+		return fmt.Errorf("compaction summary item kind must be %q or %q", ItemKindMessage, ItemKindCompaction)
 	}
 	if strings.TrimSpace(checkpoint.ID) == "" {
 		return fmt.Errorf("compaction checkpoint id is required")
@@ -2126,15 +2146,30 @@ func corruptedSessionError(sessionID, format string, args ...any) error {
 func copyMessage(message model.Message) model.Message {
 	message.ContentBlocks = append([]model.InputContentBlock(nil), message.ContentBlocks...)
 	message.ToolCalls = append([]model.ToolCall(nil), message.ToolCalls...)
+	message.ProviderItems = copyProviderItems(message.ProviderItems)
 	if message.ResponseState != nil {
 		state := *message.ResponseState
 		state.ReasoningItems = make([]json.RawMessage, len(message.ResponseState.ReasoningItems))
 		for index, item := range message.ResponseState.ReasoningItems {
 			state.ReasoningItems[index] = append(json.RawMessage(nil), item...)
 		}
+		if message.ResponseState.OutputItems != nil {
+			state.OutputItems = make([]json.RawMessage, len(message.ResponseState.OutputItems))
+			for index, item := range message.ResponseState.OutputItems {
+				state.OutputItems[index] = append(json.RawMessage(nil), item...)
+			}
+		}
 		message.ResponseState = &state
 	}
 	return message
+}
+
+func copyProviderItems(items []model.ProviderItem) []model.ProviderItem {
+	copied := append([]model.ProviderItem(nil), items...)
+	for index := range copied {
+		copied[index].Data = append(json.RawMessage(nil), items[index].Data...)
+	}
+	return copied
 }
 
 func copyMessagePtr(message *model.Message) *model.Message {

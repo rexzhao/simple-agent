@@ -270,6 +270,16 @@ func TestStreamDecoderPreservesResponseOutputStateForManualReplay(t *testing.T) 
 	if reasoning["encrypted_content"] != "cipher" {
 		t.Fatalf("reasoning item = %#v, want terminal encrypted content", reasoning)
 	}
+	if len(state.OutputItems) != 2 {
+		t.Fatalf("len(OutputItems) = %d, want 2", len(state.OutputItems))
+	}
+	var outputMessage map[string]any
+	if err := json.Unmarshal(state.OutputItems[1], &outputMessage); err != nil {
+		t.Fatalf("unmarshal exact output message: %v", err)
+	}
+	if outputMessage["id"] != "msg_1" {
+		t.Fatalf("output item = %#v, want exact terminal message", outputMessage)
+	}
 }
 
 func TestEventsFromChunkTreatsIncompleteAsTerminal(t *testing.T) {

@@ -24,7 +24,7 @@ MVP 不实现：
 
 - mid-turn 自动压缩。
 - 模型切换兼容性检测，例如 compaction compatibility hash。
-- 远端 compaction provider 分派。
+- Responses `context_management` 自动压缩和 Codex 私有 `compaction_trigger` 协议。
 - session-history 查询工具。
 - 旧 session 格式兼容或迁移。
 - GUI 直接读取 session 文件。
@@ -42,7 +42,8 @@ session-history 查询工具可以作为低优先级后续项记录：未来可�
 4. 压缩只替换 `ActiveHistory`，不删除旧 `Items`。
 5. 只持久化成功 turn。
 6. compact 是原子状态变更。
-7. summary 不保存隐藏推理链，只保存事实、状态、决策、约束和下一步。
+7. 本地 summary 不保存隐藏推理链，只保存事实、状态、决策、约束和下一步。
+8. 远端 Responses compaction 只保存 provider 签发的 opaque item，不解析或伪造密文。
 
 ## Session 数据模型
 
@@ -327,6 +328,29 @@ summary 请求也要走 context window 检查。如果 summary 输入本身太�
 重试。
 
 summary model 请求失败时，compact 失败，状态不变。
+
+## Responses standalone compaction
+
+OpenAI Responses / Codex profile 可以显式配置：
+
+```yaml
+parameters:
+  responses:
+    compaction:
+      mode: responses-compact
+```
+
+该模式调用公开的 `POST /responses/compact`，并把响应的完整 `output` 作为一个 hidden、
+model-facing compaction session item 持久化。`output` 是下一轮的 canonical context window，
+其中所有 item 保持原顺序；后续只允许向相同 base URL 和 model 回放。
+
+远端请求失败时，从 append-only `Items` 和各 checkpoint 的
+`PreviousActiveHistory` 递归恢复未压缩历史，再走现有本地 summary 流程。未显式配置此模式、
+非 Responses provider 或兼容端点不支持该接口时，继续使用本地 summary。
+
+当前不启用普通 `/responses` 请求的 `context_management`，也不实现 Codex harness 私有的
+`compaction_trigger`。前者需要 mid-turn 持久化与 active-history 安全替换，后者不是公开
+Responses API 合约。
 
 ## Summary 内容格式
 

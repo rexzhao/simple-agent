@@ -3,6 +3,7 @@ package openairesponses
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -42,6 +43,7 @@ type Provider struct {
 }
 
 var _ model.Provider = (*Provider)(nil)
+var _ model.CompactionProvider = (*Provider)(nil)
 
 func NewProvider(config ProviderConfig) (*Provider, error) {
 	baseURL := strings.TrimRight(strings.TrimSpace(config.BaseURL), "/")
@@ -109,9 +111,71 @@ func (p *Provider) Stream(ctx context.Context, request model.Request) (<-chan mo
 	return events, nil
 }
 
+func (p *Provider) Compact(ctx context.Context, request model.Request) (model.CompactionResult, error) {
+	token, err := p.authToken(ctx)
+	if err != nil {
+		return model.CompactionResult{}, err
+	}
+	body, metadata, err := buildCompactionRequestBody(request, requestBodyOptions{origin: p.baseURL})
+	if err != nil {
+		return model.CompactionResult{}, fmt.Errorf("build OpenAI Responses compact request body: %w", err)
+	}
+	response, err := p.doRequestTo(ctx, token, body, metadata, "/responses/compact")
+	if err != nil {
+		if _, ok := err.(*httpstream.StatusError); ok {
+			return model.CompactionResult{}, fmt.Errorf("OpenAI Responses compact request failed: %w", err)
+		}
+		return model.CompactionResult{}, fmt.Errorf("send OpenAI Responses compact request: %w", err)
+	}
+	defer response.Body.Close()
+
+	var compacted struct {
+		Object string            `json:"object"`
+		Output []json.RawMessage `json:"output"`
+		Usage  *responseUsage    `json:"usage"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&compacted); err != nil {
+		return model.CompactionResult{}, fmt.Errorf("decode OpenAI Responses compact response: %w", err)
+	}
+	if compacted.Object != "" && compacted.Object != "response.compaction" {
+		return model.CompactionResult{}, fmt.Errorf("OpenAI Responses compact response object is %q", compacted.Object)
+	}
+	if len(compacted.Output) == 0 {
+		return model.CompactionResult{}, fmt.Errorf("OpenAI Responses compact response output is empty")
+	}
+
+	result := model.CompactionResult{Items: make([]model.ProviderItem, 0, len(compacted.Output))}
+	hasCompaction := false
+	for index, raw := range compacted.Output {
+		var item struct {
+			Type string `json:"type"`
+		}
+		if err := json.Unmarshal(raw, &item); err != nil || strings.TrimSpace(item.Type) == "" {
+			return model.CompactionResult{}, fmt.Errorf("OpenAI Responses compact output item %d is invalid", index)
+		}
+		hasCompaction = hasCompaction || item.Type == "compaction"
+		result.Items = append(result.Items, model.ProviderItem{
+			Origin: p.baseURL,
+			Model:  request.Model,
+			Data:   append(json.RawMessage(nil), raw...),
+		})
+	}
+	if !hasCompaction {
+		return model.CompactionResult{}, fmt.Errorf("OpenAI Responses compact response has no compaction item")
+	}
+	if compacted.Usage != nil {
+		result.Usage = usageFromResponse(compacted.Usage)
+	}
+	return result, nil
+}
+
 func (p *Provider) doRequest(ctx context.Context, token AccessToken, body []byte, metadata providerRequestMetadata) (*http.Response, error) {
+	return p.doRequestTo(ctx, token, body, metadata, "/responses")
+}
+
+func (p *Provider) doRequestTo(ctx context.Context, token AccessToken, body []byte, metadata providerRequestMetadata, path string) (*http.Response, error) {
 	return httpstream.DoRequest(ctx, p.httpClient, p.httpOptions, func(requestCtx context.Context) (*http.Request, error) {
-		httpRequest, err := http.NewRequestWithContext(requestCtx, http.MethodPost, p.baseURL+"/responses", bytes.NewReader(body))
+		httpRequest, err := http.NewRequestWithContext(requestCtx, http.MethodPost, p.baseURL+path, bytes.NewReader(body))
 		if err != nil {
 			return nil, fmt.Errorf("create OpenAI Responses request: %w", err)
 		}

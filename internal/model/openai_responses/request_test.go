@@ -134,6 +134,7 @@ func TestBuildRequestBodyRejectsUnsupportedToolParameters(t *testing.T) {
 		value     any
 	}{
 		{name: "tools", parameter: "tools", value: []any{map[string]any{"type": "function"}}},
+		{name: "context management", parameter: "context_management", value: []any{map[string]any{"type": "compaction"}}},
 		{name: "web search options", parameter: "web_search_options", value: map[string]any{"search_context_size": "low"}},
 		{name: "tool resources", parameter: "tool_resources", value: map[string]any{}},
 		{name: "legacy functions", parameter: "functions", value: []any{map[string]any{"name": "read_file"}}},
@@ -588,6 +589,110 @@ func TestBuildProviderRequestReplaysResponsesOutputItemsWhenStoreFalse(t *testin
 		"store": false,
 		"tools": [{"type": "function", "name": "lookup", "description": "", "parameters": {"type": "object", "properties": {}}}]
 	}`)
+}
+
+func TestBuildProviderRequestReplaysExactResponsesOutputItems(t *testing.T) {
+	body, _, _, err := buildProviderRequest(model.Request{
+		Model: "gpt-5.6",
+		Messages: []model.Message{
+			{Role: model.MessageRoleUser, Content: "Do work"},
+			{
+				Role:    model.MessageRoleAssistant,
+				Content: "reconstructed text must not be used",
+				ResponseState: &model.ResponseState{
+					Origin: "https://api.openai.com/v1",
+					Model:  "gpt-5.6",
+					OutputItems: []json.RawMessage{
+						json.RawMessage(`{"type":"reasoning","id":"rs_exact","encrypted_content":"cipher"}`),
+						json.RawMessage(`{"type":"message","id":"msg_exact","role":"assistant","status":"completed","content":[{"type":"output_text","text":"Exact"}]}`),
+					},
+				},
+			},
+		},
+	}, true, requestBodyOptions{origin: "https://api.openai.com/v1"})
+	if err != nil {
+		t.Fatalf("buildProviderRequest() error = %v", err)
+	}
+	assertJSONEqual(t, body, `{
+		"model": "gpt-5.6",
+		"input": [
+			{"role": "user", "content": "Do work"},
+			{"type": "reasoning", "id": "rs_exact", "encrypted_content": "cipher"},
+			{"type": "message", "id": "msg_exact", "role": "assistant", "status": "completed", "content": [
+				{"type": "output_text", "text": "Exact"}
+			]}
+		],
+		"stream": true,
+		"store": false
+	}`)
+}
+
+func TestBuildProviderRequestReplaysOpaqueProviderItemsInOrder(t *testing.T) {
+	body, _, _, err := buildProviderRequest(model.Request{
+		Model: "gpt-5.6",
+		Messages: []model.Message{
+			{
+				Role: model.MessageRoleProvider,
+				ProviderItems: []model.ProviderItem{
+					{Origin: "https://api.openai.com/v1", Model: "gpt-5.6", Data: json.RawMessage(`{"type":"message","role":"developer","content":"retained"}`)},
+					{Origin: "https://api.openai.com/v1", Model: "gpt-5.6", Data: json.RawMessage(`{"type":"compaction","id":"cmp_1","encrypted_content":"sealed","future_counter":9007199254740993}`)},
+				},
+			},
+			{Role: model.MessageRoleUser, Content: "Continue"},
+		},
+	}, true, requestBodyOptions{origin: "https://api.openai.com/v1"})
+	if err != nil {
+		t.Fatalf("buildProviderRequest() error = %v", err)
+	}
+	assertJSONEqual(t, body, `{
+		"model": "gpt-5.6",
+		"input": [
+			{"type":"message","role":"developer","content":"retained"},
+			{"type":"compaction","id":"cmp_1","encrypted_content":"sealed","future_counter":9007199254740993},
+			{"role":"user","content":"Continue"}
+		],
+		"stream": true,
+		"store": false
+	}`)
+	if !bytes.Contains(body, []byte(`"future_counter":9007199254740993`)) {
+		t.Fatalf("provider item was not replayed without numeric coercion: %s", body)
+	}
+
+	_, _, _, err = buildProviderRequest(model.Request{
+		Model: "gpt-5.6",
+		Messages: []model.Message{{
+			Role: model.MessageRoleProvider,
+			ProviderItems: []model.ProviderItem{{
+				Origin: "https://other.example/v1",
+				Model:  "gpt-5.6",
+				Data:   json.RawMessage(`{"type":"compaction","encrypted_content":"sealed"}`),
+			}},
+		}},
+	}, true, requestBodyOptions{origin: "https://api.openai.com/v1"})
+	if err == nil || !strings.Contains(err.Error(), "belongs to origin") {
+		t.Fatalf("buildProviderRequest(mismatched origin) error = %v, want scoped provider item error", err)
+	}
+}
+
+func TestUsesStandaloneCompactionRequiresExplicitSupportedMode(t *testing.T) {
+	enabled, err := UsesStandaloneCompaction(map[string]any{
+		"responses": map[string]any{"compaction": map[string]any{"mode": "responses-compact"}},
+	})
+	if err != nil || !enabled {
+		t.Fatalf("UsesStandaloneCompaction() = %v, %v, want true, nil", enabled, err)
+	}
+
+	enabled, err = UsesStandaloneCompaction(nil)
+	if err != nil || enabled {
+		t.Fatalf("UsesStandaloneCompaction(nil) = %v, %v, want false, nil", enabled, err)
+	}
+
+	_, err = UsesStandaloneCompaction(map[string]any{
+		"responses": map[string]any{"compaction": map[string]any{"mode": "auto"}},
+	})
+	if err == nil || !strings.Contains(err.Error(), "responses.compaction.mode") {
+		t.Fatalf("UsesStandaloneCompaction(invalid) error = %v, want mode validation error", err)
+	}
 }
 
 func TestBuildProviderRequestUsesPreviousResponseIDOnlyForMatchingStoredState(t *testing.T) {

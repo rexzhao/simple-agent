@@ -230,7 +230,7 @@ func (d *streamEventDecoder) outputItemDoneEvents(event responseStreamEvent) []m
 	if item == nil {
 		return nil
 	}
-	d.captureOutputItem(event.Item, item)
+	d.captureOutputItem(event.OutputIndex, event.Item, item)
 	if item.Type == "message" {
 		finalText := item.outputText()
 		seen := d.textAccumulator(event.OutputIndex).String()
@@ -340,17 +340,23 @@ func (d *streamEventDecoder) applyResponseState(response *responseObject) {
 	if response.ID != "" {
 		d.state.ID = response.ID
 	}
-	for _, raw := range response.Output {
+	for index, raw := range response.Output {
 		var item responseOutputItem
 		if json.Unmarshal(raw, &item) == nil {
-			d.captureOutputItem(raw, &item)
+			d.captureOutputItem(index, raw, &item)
 		}
 	}
 }
 
-func (d *streamEventDecoder) captureOutputItem(raw json.RawMessage, item *responseOutputItem) {
+func (d *streamEventDecoder) captureOutputItem(outputIndex int, raw json.RawMessage, item *responseOutputItem) {
 	if item == nil {
 		return
+	}
+	if outputIndex >= 0 && len(raw) > 0 {
+		for len(d.state.OutputItems) <= outputIndex {
+			d.state.OutputItems = append(d.state.OutputItems, nil)
+		}
+		d.state.OutputItems[outputIndex] = append(json.RawMessage(nil), raw...)
 	}
 	switch item.Type {
 	case "reasoning":
@@ -372,7 +378,7 @@ func (d *streamEventDecoder) captureOutputItem(raw json.RawMessage, item *respon
 }
 
 func (d *streamEventDecoder) hasResponseState() bool {
-	return d.state.ID != "" || d.state.MessageID != "" || len(d.state.ReasoningItems) > 0
+	return d.state.ID != "" || d.state.MessageID != "" || len(d.state.ReasoningItems) > 0 || hasRawOutputItems(d.state.OutputItems)
 }
 
 func (d *streamEventDecoder) copyResponseState() model.ResponseState {
@@ -381,7 +387,22 @@ func (d *streamEventDecoder) copyResponseState() model.ResponseState {
 	for index, item := range d.state.ReasoningItems {
 		state.ReasoningItems[index] = append(json.RawMessage(nil), item...)
 	}
+	state.OutputItems = make([]json.RawMessage, 0, len(d.state.OutputItems))
+	for _, item := range d.state.OutputItems {
+		if len(item) > 0 {
+			state.OutputItems = append(state.OutputItems, append(json.RawMessage(nil), item...))
+		}
+	}
 	return state
+}
+
+func hasRawOutputItems(items []json.RawMessage) bool {
+	for _, item := range items {
+		if len(item) > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 func isReasoningDeltaEvent(eventType string) bool {

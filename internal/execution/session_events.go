@@ -374,10 +374,15 @@ func (s *Service) CompactSession(ctx context.Context, id string) (SessionCompact
 		interruptOperation()
 		return SessionCompactResult{}, ErrTurnFailed
 	}
+	if err := publishCompactionUsage(bus, result.Compaction.Usage); err != nil {
+		interruptOperation()
+		return SessionCompactResult{}, fmt.Errorf("could not publish compaction usage")
+	}
 	if err := bus.Publish(eventbus.CompactionRequested{
 		TurnID:     operationID,
 		Summary:    result.Compaction.SummaryItem,
 		Checkpoint: result.Compaction.Checkpoint,
+		Context:    result.Compaction.Context,
 	}); err != nil {
 		interruptOperation()
 		return SessionCompactResult{}, fmt.Errorf("could not compact session")

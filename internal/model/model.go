@@ -9,6 +9,18 @@ type Provider interface {
 	Stream(ctx context.Context, request Request) (<-chan Event, error)
 }
 
+// CompactionProvider is implemented by providers that expose a stateless
+// compaction endpoint. The returned items are provider-owned and must be
+// persisted and replayed without interpreting their payload.
+type CompactionProvider interface {
+	Compact(ctx context.Context, request Request) (CompactionResult, error)
+}
+
+type CompactionResult struct {
+	Items []ProviderItem
+	Usage Usage
+}
+
 type Request struct {
 	Model      string
 	Messages   []Message
@@ -25,6 +37,7 @@ const (
 	MessageRoleUser      MessageRole = "user"
 	MessageRoleAssistant MessageRole = "assistant"
 	MessageRoleTool      MessageRole = "tool"
+	MessageRoleProvider  MessageRole = "provider"
 )
 
 type Message struct {
@@ -35,6 +48,16 @@ type Message struct {
 	ToolCalls     []ToolCall
 	IsError       bool
 	ResponseState *ResponseState
+	ProviderItems []ProviderItem
+}
+
+// ProviderItem is an opaque provider input/output item. Origin and Model scope
+// the payload so an encrypted checkpoint is never replayed to a different
+// endpoint or model by accident.
+type ProviderItem struct {
+	Origin string
+	Model  string
+	Data   json.RawMessage
 }
 
 // InputContentBlock represents a Responses API input content block. Other
@@ -61,6 +84,7 @@ type ResponseState struct {
 	MessageID      string
 	MessagePhase   string
 	ReasoningItems []json.RawMessage
+	OutputItems    []json.RawMessage
 }
 
 type Tool struct {

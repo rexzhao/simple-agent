@@ -1367,6 +1367,55 @@ func TestV2StoreAppendCompactionCheckpointCommitsTransaction(t *testing.T) {
 	}
 }
 
+func TestV2StorePersistsRemoteCompactionProviderItems(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "sessions")
+	store := NewV2Store(root)
+
+	appendTestItem(t, store, "session-1", "item-1", "one")
+	if _, err := store.ReplaceActiveHistory("session-1", []string{"item-1"}); err != nil {
+		t.Fatalf("ReplaceActiveHistory() error = %v", err)
+	}
+	compaction := SessionItem{
+		ID:         "compaction-1",
+		Kind:       ItemKindCompaction,
+		Visibility: ItemVisibilityHidden,
+		Audience:   ItemAudienceModel,
+		Message: &model.Message{
+			Role: model.MessageRoleProvider,
+			ProviderItems: []model.ProviderItem{
+				{Origin: "https://api.openai.com/v1", Model: "gpt-5.6", Data: json.RawMessage(`{"type":"message","role":"developer","content":"retained"}`)},
+				{Origin: "https://api.openai.com/v1", Model: "gpt-5.6", Data: json.RawMessage(`{"type":"compaction","id":"cmp_1","encrypted_content":"sealed"}`)},
+			},
+		},
+	}
+	checkpoint := CompactionCheckpoint{
+		ID:                    "compact-1",
+		Reason:                "user_requested",
+		Phase:                 "manual",
+		Trigger:               "manual",
+		SummaryItemID:         compaction.ID,
+		PreviousActiveHistory: []string{"item-1"},
+		ReplacementHistory:    []string{compaction.ID},
+		SummaryProvider:       "openai",
+		SummaryModel:          "gpt-5.6",
+	}
+	replayed, err := store.AppendCompactionCheckpoint("session-1", compaction, checkpoint)
+	if err != nil {
+		t.Fatalf("AppendCompactionCheckpoint() error = %v", err)
+	}
+
+	messages, err := replayed.MaterializeActiveHistory()
+	if err != nil {
+		t.Fatalf("MaterializeActiveHistory() error = %v", err)
+	}
+	if len(messages) != 1 || messages[0].Role != model.MessageRoleProvider || len(messages[0].ProviderItems) != 2 {
+		t.Fatalf("active messages = %#v, want remote compaction provider message", messages)
+	}
+	if string(messages[0].ProviderItems[1].Data) != `{"type":"compaction","id":"cmp_1","encrypted_content":"sealed"}` {
+		t.Fatalf("compaction payload = %s", messages[0].ProviderItems[1].Data)
+	}
+}
+
 func TestV2StoreSaveCompactedTurnCommitsCompactionAndTurnTransaction(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "sessions")
 	clock := &fakeClock{current: time.Date(2026, 7, 3, 4, 5, 6, 0, time.UTC)}

@@ -238,6 +238,7 @@ func copyMessages(messages []model.Message) []model.Message {
 	for i := range copied {
 		copied[i].ContentBlocks = append([]model.InputContentBlock(nil), messages[i].ContentBlocks...)
 		copied[i].ToolCalls = append([]model.ToolCall(nil), messages[i].ToolCalls...)
+		copied[i].ProviderItems = copyProviderItems(messages[i].ProviderItems)
 		if messages[i].ResponseState != nil {
 			state := copyResponseState(*messages[i].ResponseState)
 			copied[i].ResponseState = &state
@@ -280,7 +281,21 @@ func copyResponseState(state model.ResponseState) model.ResponseState {
 	for index := range state.ReasoningItems {
 		state.ReasoningItems[index] = append(json.RawMessage(nil), state.ReasoningItems[index]...)
 	}
+	if state.OutputItems != nil {
+		state.OutputItems = append([]json.RawMessage(nil), state.OutputItems...)
+		for index := range state.OutputItems {
+			state.OutputItems[index] = append(json.RawMessage(nil), state.OutputItems[index]...)
+		}
+	}
 	return state
+}
+
+func copyProviderItems(items []model.ProviderItem) []model.ProviderItem {
+	copied := append([]model.ProviderItem(nil), items...)
+	for index := range copied {
+		copied[index].Data = append(json.RawMessage(nil), items[index].Data...)
+	}
+	return copied
 }
 
 func executeToolCall(ctx context.Context, executor ToolExecutor, enabledTools map[string]struct{}, toolCall model.ToolCall, out chan<- model.Event) model.ToolResult {

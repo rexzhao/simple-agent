@@ -72,6 +72,29 @@ func TestServiceProjectLifecycleAndNearest(t *testing.T) {
 	}
 }
 
+func TestPublishCompactionUsagePublishesModelUsageEvent(t *testing.T) {
+	bus := eventbus.NewBus(nil)
+	defer bus.Close()
+	events := bus.SubscribeLossless(1)
+	usage := model.Usage{
+		InputTokens: 1200, OutputTokens: 80, TotalTokens: 1280,
+		CachedTokens: 900, CacheWriteTokens: 200, ReasoningTokens: 64,
+	}
+
+	if err := publishCompactionUsage(bus, &usage); err != nil {
+		t.Fatalf("publishCompactionUsage() error = %v", err)
+	}
+	event := <-events
+	modelEvent, ok := event.(eventbus.ModelEvent)
+	if !ok {
+		t.Fatalf("event = %T, want eventbus.ModelEvent", event)
+	}
+	usageEvent, ok := modelEvent.Event.(model.UsageEvent)
+	if !ok || usageEvent.Usage != usage {
+		t.Fatalf("model event = %#v, want usage %#v", modelEvent.Event, usage)
+	}
+}
+
 func TestServiceProjectLifecycleRules(t *testing.T) {
 	home := t.TempDir()
 	service, err := NewService(home)

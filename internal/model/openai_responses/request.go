@@ -29,6 +29,41 @@ func buildRequestBodyWithOptions(request model.Request, stream bool, options req
 	return body, toolNames, err
 }
 
+func buildCompactionRequestBody(request model.Request, options requestBodyOptions) ([]byte, providerRequestMetadata, error) {
+	body, _, metadata, err := buildProviderRequest(request, false, requestBodyOptions{
+		origin:              options.origin,
+		disableContinuation: true,
+	})
+	if err != nil {
+		return nil, providerRequestMetadata{}, err
+	}
+	var expanded map[string]json.RawMessage
+	if err := json.Unmarshal(body, &expanded); err != nil {
+		return nil, providerRequestMetadata{}, err
+	}
+
+	compact := map[string]json.RawMessage{
+		"model": expanded["model"],
+		"input": expanded["input"],
+	}
+	for _, key := range []string{
+		"instructions",
+		"prompt_cache_key",
+		"prompt_cache_options",
+		"prompt_cache_retention",
+		"service_tier",
+	} {
+		if value, ok := expanded[key]; ok {
+			compact[key] = value
+		}
+	}
+	data, err := json.Marshal(compact)
+	if err != nil {
+		return nil, providerRequestMetadata{}, err
+	}
+	return data, metadata, nil
+}
+
 type providerRequestMetadata struct {
 	Store            bool
 	CacheKey         string
@@ -37,9 +72,10 @@ type providerRequestMetadata struct {
 }
 
 type responsesParameterOptions struct {
-	Store *bool                       `json:"store"`
-	State string                      `json:"state"`
-	Cache responsesPromptCacheOptions `json:"cache"`
+	Store      *bool                       `json:"store"`
+	State      string                      `json:"state"`
+	Cache      responsesPromptCacheOptions `json:"cache"`
+	Compaction responsesCompactionOptions  `json:"compaction"`
 }
 
 type responsesPromptCacheOptions struct {
@@ -51,6 +87,10 @@ type responsesPromptCacheOptions struct {
 	Retention       string `json:"retention"`
 	Breakpoint      string `json:"breakpoint"`
 	SessionAffinity string `json:"session_affinity"`
+}
+
+type responsesCompactionOptions struct {
+	Mode string `json:"mode"`
 }
 
 type responseInputOptions struct {
@@ -66,6 +106,9 @@ func buildProviderRequest(request model.Request, stream bool, options requestBod
 	toolNames := newToolNameMapper(request.Tools)
 	responsesOptions, err := parseResponsesParameterOptions(request.Parameters)
 	if err != nil {
+		return nil, nil, providerRequestMetadata{}, err
+	}
+	if _, err := UsesStandaloneCompaction(request.Parameters); err != nil {
 		return nil, nil, providerRequestMetadata{}, err
 	}
 	body, err := buildParameters(request.Parameters, toolNames)
@@ -172,6 +215,7 @@ func isUnsupportedParameter(key string) bool {
 	case "tools",
 		"tool_resources",
 		"tool_outputs",
+		"context_management",
 		"functions",
 		"function_call",
 		"function_call_output",
@@ -239,8 +283,8 @@ func copyMap(in map[string]any) map[string]any {
 	return out
 }
 
-func buildInput(messages []model.Message, toolNames *toolNameMapper, options responseInputOptions) ([]map[string]any, int, error) {
-	out := make([]map[string]any, 0, len(messages))
+func buildInput(messages []model.Message, toolNames *toolNameMapper, options responseInputOptions) ([]any, int, error) {
+	out := make([]any, 0, len(messages))
 	breakpointCount := 0
 	markIndex := -1
 	if options.markInstructionBreakpoint {
@@ -262,13 +306,23 @@ func buildInput(messages []model.Message, toolNames *toolNameMapper, options res
 				"content": content,
 			})
 		case model.MessageRoleAssistant:
-			out = append(out, buildAssistantInput(message, toolNames, options)...)
+			items, err := buildAssistantInput(message, toolNames, options)
+			if err != nil {
+				return nil, 0, err
+			}
+			out = append(out, items...)
 		case model.MessageRoleTool:
 			out = append(out, map[string]any{
 				"type":    "function_call_output",
 				"call_id": message.ToolCallID,
 				"output":  message.Content,
 			})
+		case model.MessageRoleProvider:
+			items, err := buildProviderItems(message.ProviderItems, options.origin, options.model)
+			if err != nil {
+				return nil, 0, err
+			}
+			out = append(out, items...)
 		default:
 			return nil, 0, fmt.Errorf("unsupported OpenAI Responses role %q", message.Role)
 		}
@@ -276,14 +330,28 @@ func buildInput(messages []model.Message, toolNames *toolNameMapper, options res
 	return out, breakpointCount, nil
 }
 
-func buildAssistantInput(message model.Message, toolNames *toolNameMapper, options responseInputOptions) []map[string]any {
+func buildAssistantInput(message model.Message, toolNames *toolNameMapper, options responseInputOptions) ([]any, error) {
 	stateMatches := responseStateMatches(message.ResponseState, options.origin, options.model)
-	out := make([]map[string]any, 0, len(message.ToolCalls)+2)
+	if stateMatches && len(message.ResponseState.OutputItems) > 0 {
+		items := make([]model.ProviderItem, 0, len(message.ResponseState.OutputItems))
+		for _, raw := range message.ResponseState.OutputItems {
+			items = append(items, model.ProviderItem{
+				Origin: message.ResponseState.Origin,
+				Model:  message.ResponseState.Model,
+				Data:   raw,
+			})
+		}
+		return buildProviderItems(items, options.origin, options.model)
+	}
+
+	out := make([]any, 0, len(message.ToolCalls)+2)
 	if stateMatches {
 		for _, reasoning := range message.ResponseState.ReasoningItems {
-			var item map[string]any
-			if json.Unmarshal(reasoning, &item) == nil && len(item) > 0 {
-				out = append(out, item)
+			var item struct {
+				Type string `json:"type"`
+			}
+			if json.Unmarshal(reasoning, &item) == nil && strings.TrimSpace(item.Type) != "" {
+				out = append(out, append(json.RawMessage(nil), reasoning...))
 			}
 		}
 	}
@@ -314,7 +382,30 @@ func buildAssistantInput(message model.Message, toolNames *toolNameMapper, optio
 	for _, toolCall := range message.ToolCalls {
 		out = append(out, buildFunctionCallInput(toolCall, toolNames, stateMatches))
 	}
-	return out
+	return out, nil
+}
+
+func buildProviderItems(items []model.ProviderItem, origin, modelID string) ([]any, error) {
+	if len(items) == 0 {
+		return nil, fmt.Errorf("OpenAI Responses provider message has no items")
+	}
+	out := make([]any, 0, len(items))
+	for index, item := range items {
+		if item.Origin != origin || item.Model != modelID {
+			return nil, fmt.Errorf("OpenAI Responses provider item %d belongs to origin %q model %q, not origin %q model %q", index, item.Origin, item.Model, origin, modelID)
+		}
+		var envelope struct {
+			Type string `json:"type"`
+		}
+		if err := json.Unmarshal(item.Data, &envelope); err != nil {
+			return nil, fmt.Errorf("OpenAI Responses provider item %d is not a JSON object", index)
+		}
+		if strings.TrimSpace(envelope.Type) == "" {
+			return nil, fmt.Errorf("OpenAI Responses provider item %d has no type", index)
+		}
+		out = append(out, append(json.RawMessage(nil), item.Data...))
+	}
+	return out, nil
 }
 
 func buildFunctionCallInput(toolCall model.ToolCall, toolNames *toolNameMapper, includeProviderID bool) map[string]any {
@@ -353,6 +444,27 @@ func parseResponsesParameterOptions(parameters map[string]any) (responsesParamet
 		return responsesParameterOptions{}, fmt.Errorf("parse OpenAI Responses responses options: %w", err)
 	}
 	return options, nil
+}
+
+const standaloneCompactionMode = "responses-compact"
+
+// UsesStandaloneCompaction reports whether this model profile explicitly opts
+// into POST /responses/compact. Capability is configuration-driven so a
+// third-party Responses-compatible endpoint is never assumed to support it.
+func UsesStandaloneCompaction(parameters map[string]any) (bool, error) {
+	options, err := parseResponsesParameterOptions(parameters)
+	if err != nil {
+		return false, err
+	}
+	mode := strings.ToLower(strings.TrimSpace(options.Compaction.Mode))
+	switch mode {
+	case "", "local":
+		return false, nil
+	case standaloneCompactionMode:
+		return true, nil
+	default:
+		return false, fmt.Errorf("OpenAI Responses responses.compaction.mode must be local or %s", standaloneCompactionMode)
+	}
 }
 
 func effectiveStore(body map[string]any, options responsesParameterOptions, forceStoreFalse bool) (bool, error) {

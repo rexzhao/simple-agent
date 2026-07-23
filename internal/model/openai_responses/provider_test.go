@@ -3,6 +3,7 @@ package openairesponses
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -104,6 +105,104 @@ func TestProviderStreamPostsResponsesRequestAndEmitsEvents(t *testing.T) {
 		"store": false,
 		"temperature": 0.6
 	}`)
+}
+
+func TestProviderCompactPostsCanonicalInputAndReturnsOpaqueItems(t *testing.T) {
+	requests := make(chan capturedRequest, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("ReadAll() error = %v", err)
+		}
+		requests <- capturedRequest{
+			Method:        r.Method,
+			Path:          r.URL.Path,
+			Authorization: r.Header.Get("Authorization"),
+			ContentType:   r.Header.Get("Content-Type"),
+			SessionID:     r.Header.Get("session_id"),
+			Body:          body,
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{
+			"object":"response.compaction",
+			"output":[
+				{"type":"message","role":"developer","content":"retained"},
+				{"type":"compaction","id":"cmp_1","encrypted_content":"sealed"}
+			],
+			"usage":{"input_tokens":1200,"output_tokens":80,"total_tokens":1280}
+		}`)
+	}))
+	defer server.Close()
+
+	provider, err := NewProvider(ProviderConfig{
+		BaseURL:    server.URL + "/v1/",
+		APIKey:     "test-key",
+		HTTPClient: server.Client(),
+	})
+	if err != nil {
+		t.Fatalf("NewProvider() error = %v", err)
+	}
+	result, err := provider.Compact(context.Background(), model.Request{
+		Model:     "gpt-5.6",
+		SessionID: "session-1",
+		Messages: []model.Message{
+			{Role: model.MessageRoleUser, Content: "Do work"},
+			{Role: model.MessageRoleAssistant, Content: "ignored", ResponseState: &model.ResponseState{
+				Origin: server.URL + "/v1",
+				Model:  "gpt-5.6",
+				OutputItems: []json.RawMessage{
+					json.RawMessage(`{"type":"message","id":"msg_1","role":"assistant","content":[{"type":"output_text","text":"Done"}],"future_counter":9007199254740993}`),
+				},
+			}},
+		},
+		Parameters: map[string]any{
+			"temperature":  0.7,
+			"service_tier": "priority",
+			"responses": map[string]any{
+				"store":      true,
+				"state":      "previous_response_id",
+				"compaction": map[string]any{"mode": "responses-compact"},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Compact() error = %v", err)
+	}
+
+	gotRequest := <-requests
+	if gotRequest.Method != http.MethodPost || gotRequest.Path != "/v1/responses/compact" {
+		t.Fatalf("request = %s %s, want POST /v1/responses/compact", gotRequest.Method, gotRequest.Path)
+	}
+	if gotRequest.Authorization != "Bearer test-key" || gotRequest.ContentType != "application/json" {
+		t.Fatalf("request headers = authorization %q content-type %q", gotRequest.Authorization, gotRequest.ContentType)
+	}
+	if gotRequest.SessionID != "session-1" {
+		t.Fatalf("session_id = %q, want session-1", gotRequest.SessionID)
+	}
+	assertJSONEqual(t, gotRequest.Body, `{
+		"model":"gpt-5.6",
+		"input":[
+			{"role":"user","content":"Do work"},
+			{"type":"message","id":"msg_1","role":"assistant","content":[{"type":"output_text","text":"Done"}],"future_counter":9007199254740993}
+		],
+		"prompt_cache_key":"session-1",
+		"service_tier":"priority"
+	}`)
+	if !bytes.Contains(gotRequest.Body, []byte(`"future_counter":9007199254740993`)) {
+		t.Fatalf("compact input was not forwarded without numeric coercion: %s", gotRequest.Body)
+	}
+	if len(result.Items) != 2 {
+		t.Fatalf("len(result.Items) = %d, want 2", len(result.Items))
+	}
+	if result.Items[1].Origin != server.URL+"/v1" || result.Items[1].Model != "gpt-5.6" {
+		t.Fatalf("compaction item scope = %#v", result.Items[1])
+	}
+	if got := decodeJSON(t, result.Items[1].Data).(map[string]any)["encrypted_content"]; got != "sealed" {
+		t.Fatalf("encrypted_content = %#v, want sealed", got)
+	}
+	if result.Usage != (model.Usage{InputTokens: 1200, OutputTokens: 80, TotalTokens: 1280}) {
+		t.Fatalf("usage = %#v", result.Usage)
+	}
 }
 
 func TestProviderStreamReturnsUsefulHTTPError(t *testing.T) {

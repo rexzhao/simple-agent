@@ -304,12 +304,42 @@ func EstimateMessageTokens(message model.Message) int {
 		total += EstimateTextTokens(toolCall.Name)
 		total += EstimateTextTokens(toolCall.Arguments)
 	}
+	for _, item := range message.ProviderItems {
+		total += estimateProviderItemTokens(item)
+	}
 	if message.ResponseState != nil {
 		for _, item := range message.ResponseState.ReasoningItems {
 			total += EstimateTextTokens(string(item))
 		}
 	}
 	return total
+}
+
+func estimateProviderItemTokens(item model.ProviderItem) int {
+	var value any
+	if json.Unmarshal(item.Data, &value) != nil {
+		return 0
+	}
+	stripEncryptedProviderContent(value)
+	data, err := json.Marshal(value)
+	if err != nil {
+		return 0
+	}
+	return EstimateTextTokens(string(data))
+}
+
+func stripEncryptedProviderContent(value any) {
+	switch value := value.(type) {
+	case map[string]any:
+		delete(value, "encrypted_content")
+		for _, child := range value {
+			stripEncryptedProviderContent(child)
+		}
+	case []any:
+		for _, child := range value {
+			stripEncryptedProviderContent(child)
+		}
+	}
 }
 
 func EstimateToolTokens(tool model.Tool) int {
