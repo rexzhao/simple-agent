@@ -3,17 +3,12 @@
 package tools
 
 import (
-	"context"
 	"errors"
 	"os"
 	"os/exec"
 	"sync"
 	"syscall"
 )
-
-func newShellCommand(ctx context.Context, command string) *exec.Cmd {
-	return exec.CommandContext(ctx, "sh", "-c", command)
-}
 
 type unixShellCommandController struct {
 	cmd  *exec.Cmd

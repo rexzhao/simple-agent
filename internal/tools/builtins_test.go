@@ -41,6 +41,20 @@ func TestRegisterBuiltinsRegistersExpectedTools(t *testing.T) {
 	}
 }
 
+func TestShellDefinitionDescribesBashSyntax(t *testing.T) {
+	definition := shellDefinition()
+	for _, want := range []string{"Bash", "not PowerShell", "Git Bash"} {
+		if !strings.Contains(definition.Description, want) {
+			t.Fatalf("shell description = %q, want contain %q", definition.Description, want)
+		}
+	}
+	properties := definition.InputSchema["properties"].(map[string]any)
+	command := properties["command"].(map[string]any)
+	if got := command["description"]; got != "Bash command to run." {
+		t.Fatalf("shell command description = %#v, want Bash command description", got)
+	}
+}
+
 func TestRegisterBuiltinsRejectsBlankRootDir(t *testing.T) {
 	err := RegisterBuiltins(NewRegistry(), " \t\n")
 	if err == nil {
@@ -555,6 +569,30 @@ func TestShellRunsInRootDir(t *testing.T) {
 	got := strings.TrimSpace(result.Content)
 	if got != "from-root" {
 		t.Fatalf("Execute(shell) content = %q, want from-root", result.Content)
+	}
+}
+
+func TestShellRunsBashSyntaxWhenBashIsAvailable(t *testing.T) {
+	config, err := resolveShellCommandConfig()
+	if err != nil {
+		if runtime.GOOS == "windows" {
+			t.Skipf("Bash is unavailable on this Windows test host: %v", err)
+		}
+		t.Fatalf("resolveShellCommandConfig() error = %v", err)
+	}
+	if config.shell == "sh" {
+		t.Skip("Bash is unavailable; pi-compatible fallback is sh")
+	}
+
+	registry := registerBuiltinsForTest(t, t.TempDir())
+	result, err := registry.Execute(context.Background(), BuiltinShell, map[string]any{
+		"command": "[[ -n \"${BASH_VERSION:-}\" ]] && printf bash",
+	})
+	if err != nil {
+		t.Fatalf("Execute(shell) error = %v", err)
+	}
+	if result.IsError || result.Content != "bash" {
+		t.Fatalf("Execute(shell) result = %#v, want Bash-specific syntax to succeed", result)
 	}
 }
 
@@ -1236,37 +1274,22 @@ func createDirSymlinkOrSkip(t *testing.T, target string, link string) {
 }
 
 func readMarkerCommand() string {
-	if runtime.GOOS == "windows" {
-		return "Get-Content marker.txt"
-	}
 	return "cat marker.txt"
 }
 
 func failingCommand() string {
-	if runtime.GOOS == "windows" {
-		return "Write-Output fail; exit 7"
-	}
-	return "printf fail; exit 7"
+	return "printf fail >&2; exit 7"
 }
 
 func sleepCommand() string {
-	if runtime.GOOS == "windows" {
-		return "Start-Sleep -Milliseconds 2000"
-	}
 	return "sleep 2"
 }
 
 func printTextCommand(text string) string {
-	if runtime.GOOS == "windows" {
-		return "[Console]::Out.Write('" + text + "')"
-	}
 	return "printf '" + text + "'"
 }
 
 func childProcessTreeCommand() string {
-	if runtime.GOOS == "windows" {
-		return "powershell -NoProfile -NonInteractive -Command 'Set-Content -LiteralPath child.pid -Value $PID; Set-Content -LiteralPath started.txt -Value started; while ($true) { Add-Content -LiteralPath child.txt -Value tick; Start-Sleep -Milliseconds 200 }'"
-	}
 	return "sh -c 'printf \"%s\" \"$$\" > child.pid; printf started > started.txt; while :; do printf tick >> child.txt; sleep 0.2; done'"
 }
 

@@ -66,10 +66,6 @@ type windowsJobObjectExtendedLimitInformation struct {
 	PeakJobMemoryUsed     uintptr
 }
 
-func newShellCommand(ctx context.Context, command string) *exec.Cmd {
-	return exec.CommandContext(ctx, "powershell", "-NoProfile", "-NonInteractive", "-Command", command)
-}
-
 type windowsShellCommandController struct {
 	cmd *exec.Cmd
 

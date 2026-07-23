@@ -253,13 +253,13 @@ func grepFilesDefinition() model.Tool {
 func shellDefinition() model.Tool {
 	return model.Tool{
 		Name:        BuiltinShell,
-		Description: "Run a shell command in the workspace.",
+		Description: "Execute a Bash command in the workspace. Commands use Bash/POSIX syntax (not PowerShell or cmd.exe syntax). On Windows this runs Git Bash or another bash.exe found on the machine; stdout and stderr are returned together.",
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
 				"command": map[string]any{
 					"type":        "string",
-					"description": "Command to run.",
+					"description": "Bash command to run.",
 				},
 				"timeout_ms": map[string]any{
 					"type":        "integer",
@@ -767,7 +767,14 @@ func newShellExecutor(rootDir string) Executor {
 			defer cancel()
 		}
 
-		cmd := newShellCommand(commandCtx, command)
+		cmd, err := newShellCommand(commandCtx, command)
+		if err != nil {
+			return model.ToolResult{
+				Name:    BuiltinShell,
+				Content: err.Error(),
+				IsError: true,
+			}, nil
+		}
 		cmd.Dir = rootDir
 		controller := newShellCommandController(cmd)
 		defer controller.Close()
