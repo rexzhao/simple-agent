@@ -34,8 +34,12 @@ func TestLoadResolvesConfigAndProviderModels(t *testing.T) {
 	}
 
 	wantSkillDirs := []string{filepath.Join(wantConfigDir, "skills")}
-	if !sameStrings(cfg.SkillDirs, wantSkillDirs) {
-		t.Fatalf("SkillDirs = %#v, want %#v", cfg.SkillDirs, wantSkillDirs)
+	resolvedSkillDirs, err := cfg.ResolveSkillDirs(dir)
+	if err != nil {
+		t.Fatalf("ResolveSkillDirs() error = %v", err)
+	}
+	if !sameStrings(resolvedSkillDirs, wantSkillDirs) {
+		t.Fatalf("ResolveSkillDirs() = %#v, want %#v", resolvedSkillDirs, wantSkillDirs)
 	}
 
 	wantLogPath := filepath.Join(wantConfigDir, "logs", "sai.jsonl")
@@ -293,8 +297,72 @@ skill_dirs:
 		filepath.Join(filepath.Clean(wantConfigDir), "team-skills"),
 		filepath.Clean(absSkills),
 	}
-	if !sameStrings(cfg.SkillDirs, wantSkillDirs) {
-		t.Fatalf("SkillDirs = %#v, want %#v", cfg.SkillDirs, wantSkillDirs)
+	resolvedSkillDirs, err := cfg.ResolveSkillDirs(dir)
+	if err != nil {
+		t.Fatalf("ResolveSkillDirs() error = %v", err)
+	}
+	if !sameStrings(resolvedSkillDirs, wantSkillDirs) {
+		t.Fatalf("ResolveSkillDirs() = %#v, want %#v", resolvedSkillDirs, wantSkillDirs)
+	}
+}
+
+func TestResolveSkillDirsExpandsPathPlaceholders(t *testing.T) {
+	root := t.TempDir()
+	configDir := filepath.Join(root, "config")
+	configPath := filepath.Join(configDir, "sai.yaml")
+	repoDir := filepath.Join(root, "repo")
+	cwd := filepath.Join(repoDir, "work", "nested")
+	if err := os.MkdirAll(configDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll(config) error = %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(repoDir, ".git"), 0o755); err != nil {
+		t.Fatalf("MkdirAll(.git) error = %v", err)
+	}
+	if err := os.MkdirAll(cwd, 0o755); err != nil {
+		t.Fatalf("MkdirAll(cwd) error = %v", err)
+	}
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		t.Fatalf("UserHomeDir() error = %v", err)
+	}
+
+	configured := []string{
+		"$HOME/global-skills",
+		"$USER/legacy-skills",
+		"$REPO/.agents/skills",
+		"$CWD/.agents/skills",
+		"$CONFIG/skills",
+		"relative-skills",
+	}
+	writeFile(t, configPath, `skill_dirs:
+  - $HOME/global-skills
+  - $USER/legacy-skills
+  - $REPO/.agents/skills
+  - $CWD/.agents/skills
+  - $CONFIG/skills
+  - relative-skills
+`)
+	cfg, err := LoadBase(configPath)
+	if err != nil {
+		t.Fatalf("LoadBase() error = %v", err)
+	}
+	if !sameStrings(cfg.SkillDirs, configured) {
+		t.Fatalf("SkillDirs = %#v, want raw configured values %#v", cfg.SkillDirs, configured)
+	}
+	got, err := cfg.ResolveSkillDirs(cwd)
+	if err != nil {
+		t.Fatalf("ResolveSkillDirs() error = %v", err)
+	}
+	want := []string{
+		filepath.Join(homeDir, "global-skills"),
+		filepath.Join(homeDir, "legacy-skills"),
+		filepath.Join(repoDir, ".agents", "skills"),
+		filepath.Join(cwd, ".agents", "skills"),
+		filepath.Join(configDir, "skills"),
+		filepath.Join(configDir, "relative-skills"),
+	}
+	if !sameStrings(got, want) {
+		t.Fatalf("ResolveSkillDirs() = %#v, want %#v", got, want)
 	}
 }
 
@@ -420,8 +488,12 @@ prompt:
 	if cfg.Prompt.SystemPrompt != "Review only the assigned scope.\n" {
 		t.Fatalf("Prompt.SystemPrompt = %q, want child prompt", cfg.Prompt.SystemPrompt)
 	}
-	if !sameStrings(cfg.SkillDirs, []string{filepath.Join(childDir, "child-skills")}) {
-		t.Fatalf("SkillDirs = %#v, want child-relative skill dir", cfg.SkillDirs)
+	resolvedSkillDirs, err := cfg.ResolveSkillDirs(childDir)
+	if err != nil {
+		t.Fatalf("ResolveSkillDirs() error = %v", err)
+	}
+	if !sameStrings(resolvedSkillDirs, []string{filepath.Join(childDir, "child-skills")}) {
+		t.Fatalf("ResolveSkillDirs() = %#v, want child-relative skill dir", resolvedSkillDirs)
 	}
 }
 
@@ -476,8 +548,12 @@ models:
 	if cfg.AuthDir != filepath.Join(rootDir, "auth-files") {
 		t.Fatalf("AuthDir = %q", cfg.AuthDir)
 	}
-	if !sameStrings(cfg.SkillDirs, []string{filepath.Join(rootDir, "local-skills")}) {
-		t.Fatalf("SkillDirs = %#v", cfg.SkillDirs)
+	resolvedSkillDirs, err := cfg.ResolveSkillDirs(rootDir)
+	if err != nil {
+		t.Fatalf("ResolveSkillDirs() error = %v", err)
+	}
+	if !sameStrings(resolvedSkillDirs, []string{filepath.Join(rootDir, "local-skills")}) {
+		t.Fatalf("ResolveSkillDirs() = %#v", resolvedSkillDirs)
 	}
 	if cfg.MCPDir != filepath.Join(rootDir, "mcp-files") {
 		t.Fatalf("MCPDir = %q", cfg.MCPDir)

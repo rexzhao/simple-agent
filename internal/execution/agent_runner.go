@@ -225,7 +225,7 @@ func (r AgentTurnRunner) prepareRuntime(ctx context.Context, session sessions.Se
 		if err != nil {
 			return nil, err
 		}
-		selectedSkills, err := enabledSkillsForRun(cfg)
+		selectedSkills, err := enabledSkillsForRun(cfg, cwd)
 		if err != nil {
 			return nil, err
 		}
@@ -1034,8 +1034,12 @@ func mcpToolsForRun(ctx context.Context, servers []config.MCPServerConfig, enabl
 	return activeSessions, sessionsByID, schemas, nil
 }
 
-func enabledSkillsForRun(cfg *config.Config) ([]localskills.Skill, error) {
-	discovered, err := localskills.DiscoverDirs(cfg.SkillDirs)
+func enabledSkillsForRun(cfg *config.Config, cwd string) ([]localskills.Skill, error) {
+	skillDirs, err := cfg.ResolveSkillDirs(cwd)
+	if err != nil {
+		return nil, err
+	}
+	discovered, err := localskills.DiscoverDirs(skillDirs)
 	if err != nil {
 		return nil, fmt.Errorf("load skills: %w", err)
 	}

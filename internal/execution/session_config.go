@@ -105,7 +105,7 @@ func (s *Service) CreateConfiguredSession(projectID string, options ConfiguredSe
 	if err != nil {
 		return SessionDetail{}, err
 	}
-	selectedSkills, err := enabledSkillsForRun(cfg)
+	selectedSkills, err := enabledSkillsForRun(cfg, cwd)
 	if err != nil {
 		return SessionDetail{}, err
 	}

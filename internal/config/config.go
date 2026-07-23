@@ -191,7 +191,6 @@ func LoadBase(configPath string) (*Config, error) {
 	cfg.ConfigPath = absConfigPath
 	cfg.ProviderDir = resolvePath(configDir, cfg.ProviderDir)
 	cfg.AuthDir = resolvePath(configDir, cfg.AuthDir)
-	cfg.SkillDirs = resolvePaths(configDir, cfg.SkillDirs)
 	cfg.Subagents = resolvePathMap(configDir, cfg.Subagents)
 	if cfg.Logging.Path != "" {
 		cfg.Logging.Path = resolvePath(configDir, cfg.Logging.Path)

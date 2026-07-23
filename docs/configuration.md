@@ -237,6 +237,17 @@ Each direct child of a configured `skill_dirs` directory may contain a
 `SKILL.md`. Skills that allow model invocation are added to the session's
 instruction snapshot and their IDs are recorded with the session.
 
+`skill_dirs` supports `$HOME`, `$REPO`, `$CWD`, and `$CONFIG` path placeholders;
+`$USER` remains an alias for `$HOME`. `$CWD` is the durable session working
+directory, `$REPO` is discovered upward from it, and relative entries continue
+to resolve from the root configuration directory. For example:
+
+```yaml
+skill_dirs:
+  - $REPO/.agents/skills
+  - $HOME/.sai/skills
+```
+
 ## Sessions and storage
 
 Web sessions are always durable because browser refresh and event recovery
