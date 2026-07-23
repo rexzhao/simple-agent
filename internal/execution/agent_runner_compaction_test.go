@@ -19,6 +19,117 @@ import (
 	"github.com/rexzhao/simple-agent/internal/sessions"
 )
 
+func TestAutoCompactionUsageCountUsesPreviousProviderUsage(t *testing.T) {
+	tests := []struct {
+		name     string
+		metadata contextwindow.Metadata
+		want     int64
+	}{
+		{
+			name: "recorded count",
+			metadata: contextwindow.Metadata{
+				LastUsageSource:      string(contextwindow.UsageSourceProvider),
+				LastUsageCountTokens: 252000,
+				LastTotalTokens:      240000,
+			},
+			want: 252000,
+		},
+		{
+			name: "legacy provider total",
+			metadata: contextwindow.Metadata{
+				LastUsageSource: string(contextwindow.UsageSourceProvider),
+				LastTotalTokens: 252000,
+			},
+			want: 252000,
+		},
+		{
+			name: "component fallback",
+			metadata: contextwindow.Metadata{
+				LastUsageSource:      string(contextwindow.UsageSourceProvider),
+				LastInputTokens:      200000,
+				LastOutputTokens:     10000,
+				LastCachedTokens:     40000,
+				LastCacheWriteTokens: 2000,
+			},
+			want: 252000,
+		},
+		{
+			name: "local estimate is not a model response",
+			metadata: contextwindow.Metadata{
+				LastUsageSource:      string(contextwindow.UsageSourceEstimated),
+				LastUsageCountTokens: 300000,
+			},
+			want: 0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := autoCompactionUsageCount(tt.metadata); got != tt.want {
+				t.Fatalf("autoCompactionUsageCount() = %d, want %d", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestAutoCompactionThresholdUsesModelLimits(t *testing.T) {
+	tests := []struct {
+		name             string
+		inputLimit       int
+		contextWindow    int
+		outputLimit      int
+		reserved         int
+		thresholdPercent int
+		want             int64
+	}{
+		{
+			name:             "input limit with default reserve",
+			inputLimit:       272000,
+			contextWindow:    400000,
+			outputLimit:      128000,
+			thresholdPercent: 80,
+			want:             252000,
+		},
+		{
+			name:             "input limit with configured reserve",
+			inputLimit:       272000,
+			contextWindow:    400000,
+			outputLimit:      128000,
+			reserved:         12000,
+			thresholdPercent: 80,
+			want:             260000,
+		},
+		{
+			name:             "context minus output without input limit",
+			contextWindow:    400000,
+			outputLimit:      128000,
+			thresholdPercent: 80,
+			want:             272000,
+		},
+		{
+			name:             "legacy percent fallback without model limits",
+			contextWindow:    400000,
+			thresholdPercent: 80,
+			want:             320000,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := autoCompactionThreshold(
+				tt.inputLimit,
+				tt.contextWindow,
+				tt.outputLimit,
+				tt.reserved,
+				tt.thresholdPercent,
+			)
+			if got != tt.want {
+				t.Fatalf("autoCompactionThreshold() = %d, want %d", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestPlanCompactionCheckpointUsesStandaloneResponsesCompaction(t *testing.T) {
 	requestBody := make(chan []byte, 1)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -173,6 +284,120 @@ func TestPlanCompactionCheckpointUsesStandaloneResponsesCompaction(t *testing.T)
 	input, ok := body["input"].([]any)
 	if !ok || len(input) != 2 {
 		t.Fatalf("compact input = %#v, want two messages", body["input"])
+	}
+}
+
+func TestPlanCompactionCheckpointLogsRemoteFailureBeforeSummaryFallback(t *testing.T) {
+	const responseSecret = "prompt secret returned by compact endpoint"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/responses/compact":
+			http.Error(w, responseSecret, http.StatusNotFound)
+		case "/responses":
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = io.WriteString(w, "data: {\"type\":\"response.output_text.delta\",\"delta\":\"fallback summary\"}\n\n")
+			_, _ = io.WriteString(w, "data: {\"type\":\"response.completed\"}\n\n")
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	parameters := map[string]any{
+		"responses": map[string]any{
+			"compaction": map[string]any{"mode": "responses-compact"},
+		},
+	}
+	cfg := &config.Config{
+		Compaction: config.CompactionConfig{Enabled: true, ThresholdPercent: 80},
+		Providers: map[string]config.ProviderConfig{
+			"openai": {
+				Name:    "openai",
+				BaseURL: server.URL,
+				APIKey:  "test-key",
+				Models: map[string]config.ModelProfile{
+					"default": {
+						ID:         "gpt-5.6",
+						Type:       config.ProviderTypeOpenAIResponses,
+						Parameters: parameters,
+					},
+				},
+			},
+		},
+	}
+	session := sessions.SessionV2{
+		ID: "session-1",
+		Items: []sessions.SessionItem{
+			{
+				ID:         "user-1",
+				Kind:       sessions.ItemKindMessage,
+				Visibility: sessions.ItemVisibilityVisible,
+				Audience:   sessions.ItemAudienceUser,
+				Message:    &model.Message{Role: model.MessageRoleUser, Content: "Do work"},
+			},
+			{
+				ID:         "assistant-1",
+				Kind:       sessions.ItemKindMessage,
+				Visibility: sessions.ItemVisibilityVisible,
+				Audience:   sessions.ItemAudienceModel,
+				Message:    &model.Message{Role: model.MessageRoleAssistant, Content: "Done"},
+			},
+		},
+		ActiveHistory: []string{"user-1", "assistant-1"},
+	}
+	logger, err := eventlog.Open(filepath.Join(t.TempDir(), "logs", "sai.jsonl"), eventlog.Attributes{
+		Provider: "openai",
+		Model:    "gpt-5.6",
+	})
+	if err != nil {
+		t.Fatalf("logging.Open() error = %v", err)
+	}
+	t.Cleanup(func() {
+		_ = logger.Close()
+	})
+	runtime := &agentRunnerRuntime{
+		config:       cfg,
+		providerName: "openai",
+		modelProfile: "default",
+		modelID:      "gpt-5.6",
+		parameters:   parameters,
+		session:      session,
+		logger:       logger,
+	}
+
+	plan, err := runtime.planCompactionCheckpoint(context.Background(), compactionCheckpointOptions{
+		reason:  "context_limit",
+		phase:   "pre_turn",
+		trigger: "auto",
+	})
+	if err != nil {
+		t.Fatalf("planCompactionCheckpoint() error = %v", err)
+	}
+	if !strings.HasPrefix(plan.summaryItem.ID, "summary-") {
+		t.Fatalf("summary item ID = %q, want local summary fallback", plan.summaryItem.ID)
+	}
+	if err := logger.Close(); err != nil {
+		t.Fatalf("logger.Close() error = %v", err)
+	}
+	logData, err := os.ReadFile(logger.Path())
+	if err != nil {
+		t.Fatalf("ReadFile(compaction log) error = %v", err)
+	}
+	logText := string(logData)
+	for _, want := range []string{
+		`"event":"error"`,
+		`"level":"error"`,
+		`"provider":"openai"`,
+		`"model":"gpt-5.6"`,
+		`"message":"POST /responses/compact failed (reason=context_limit phase=pre_turn trigger=auto); falling back to local summary"`,
+		`"error":"404 Not Found"`,
+	} {
+		if !strings.Contains(logText, want) {
+			t.Fatalf("compaction log = %s, want contain %q", logText, want)
+		}
+	}
+	if strings.Contains(logText, responseSecret) {
+		t.Fatalf("compaction log leaked provider response body: %s", logText)
 	}
 }
 

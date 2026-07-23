@@ -50,6 +50,7 @@ type Metadata struct {
 	LastInputTokens         int    `json:"last_input_tokens,omitempty"`
 	LastOutputTokens        int    `json:"last_output_tokens,omitempty"`
 	LastTotalTokens         int    `json:"last_total_tokens,omitempty"`
+	LastUsageCountTokens    int    `json:"last_usage_count_tokens,omitempty"`
 	LastCachedTokens        int    `json:"last_cached_tokens,omitempty"`
 	LastCacheWriteTokens    int    `json:"last_cache_write_tokens,omitempty"`
 	LastReasoningTokens     int    `json:"last_reasoning_tokens,omitempty"`
@@ -197,6 +198,10 @@ func (t *Tracker) recordUsage(source UsageSource, usage model.Usage, anchor *usa
 	if t == nil {
 		return
 	}
+	usageCount := usage.TotalTokens
+	if usageCount <= 0 {
+		usageCount = usage.InputTokens + usage.OutputTokens + usage.CachedTokens + usage.CacheWriteTokens
+	}
 	if usage.TotalTokens == 0 {
 		usage.TotalTokens = usage.InputTokens + usage.OutputTokens
 	}
@@ -205,6 +210,7 @@ func (t *Tracker) recordUsage(source UsageSource, usage model.Usage, anchor *usa
 	t.metadata.LastInputTokens = usage.InputTokens
 	t.metadata.LastOutputTokens = usage.OutputTokens
 	t.metadata.LastTotalTokens = usage.TotalTokens
+	t.metadata.LastUsageCountTokens = usageCount
 	t.metadata.LastCachedTokens = usage.CachedTokens
 	t.metadata.LastCacheWriteTokens = usage.CacheWriteTokens
 	t.metadata.LastReasoningTokens = usage.ReasoningTokens

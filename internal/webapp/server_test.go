@@ -248,6 +248,8 @@ func TestServerProviderSettingsPreserveSecretsAndWriteReasoningDefaults(t *testi
 			ID:            "gpt-5.5",
 			Type:          "openai-responses",
 			ContextWindow: 400000,
+			InputLimit:    272000,
+			OutputLimit:   128000,
 		}},
 	}
 	response = doJSONRequest(t, http.MethodPut, baseURL+"/providers/fake", input)
@@ -258,6 +260,9 @@ func TestServerProviderSettingsPreserveSecretsAndWriteReasoningDefaults(t *testi
 	model := document.Providers[0].Models[0]
 	if model.ReasoningConfig.Parameter != "reasoning.effort" || model.ReasoningConfig.Default != "xhigh" {
 		t.Fatalf("reasoning default = %#v", model.ReasoningConfig)
+	}
+	if model.ContextWindow != 400000 || model.InputLimit != 272000 || model.OutputLimit != 128000 {
+		t.Fatalf("model limits = context %d input %d output %d, want 400000/272000/128000", model.ContextWindow, model.InputLimit, model.OutputLimit)
 	}
 
 	response = doJSONRequest(t, http.MethodGet, server.URL+"/api/projects/"+projectResult.Project.ID+"/models", nil)
@@ -272,7 +277,10 @@ func TestServerProviderSettingsPreserveSecretsAndWriteReasoningDefaults(t *testi
 	if err != nil {
 		t.Fatalf("ReadFile(provider) error = %v", err)
 	}
-	if !bytes.Contains(providerData, []byte("api_key: test-key")) || !bytes.Contains(providerData, []byte("reasoning_config:")) {
+	if !bytes.Contains(providerData, []byte("api_key: test-key")) ||
+		!bytes.Contains(providerData, []byte("input_limit: 272000")) ||
+		!bytes.Contains(providerData, []byte("output_limit: 128000")) ||
+		!bytes.Contains(providerData, []byte("reasoning_config:")) {
 		t.Fatalf("persisted provider = %s", providerData)
 	}
 }

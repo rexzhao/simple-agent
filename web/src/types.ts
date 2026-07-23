@@ -39,6 +39,8 @@ export interface ProviderModelSettings {
   id: string
   type: string
   context_window?: number
+  input_limit?: number
+  output_limit?: number
   parameters?: Record<string, unknown>
   reasoning_config?: ReasoningConfig
 }
@@ -91,6 +93,7 @@ export interface ContextMetadata {
   last_input_tokens?: number
   last_output_tokens?: number
   last_total_tokens?: number
+  last_usage_count_tokens?: number
   last_cached_tokens?: number
   last_cache_write_tokens?: number
   last_reasoning_tokens?: number

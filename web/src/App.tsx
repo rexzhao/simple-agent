@@ -1203,6 +1203,8 @@ interface EditableProviderModel {
   id: string
   type: string
   contextWindow: string
+  inputLimit: string
+  outputLimit: string
   parametersJSON: string
   reasoningParameter: string
   reasoningDefault: string
@@ -1397,6 +1399,8 @@ function ProviderManagerDialog(props: {
                         <label>模型 ID<input value={model.id} onChange={(event) => updateModel(index, { id: event.target.value })} placeholder="也可以手动输入" /></label>
                         <label>API 类型<select value={model.type || 'openai-chat'} onChange={(event) => updateModel(index, { type: event.target.value })}><option value="openai-chat">OpenAI Chat</option><option value="openai-responses">OpenAI Responses</option><option value="openai-codex">OpenAI Codex</option><option value="anthropic-messages">Anthropic Messages</option></select></label>
                         <label>Context Window<input type="number" min="0" value={model.contextWindow} onChange={(event) => updateModel(index, { contextWindow: event.target.value })} placeholder="400000" /></label>
+                        <label>Input Limit<input type="number" min="0" value={model.inputLimit} onChange={(event) => updateModel(index, { inputLimit: event.target.value })} placeholder="272000" /></label>
+                        <label>Output Limit<input type="number" min="0" value={model.outputLimit} onChange={(event) => updateModel(index, { outputLimit: event.target.value })} placeholder="128000" /></label>
                         <label className="wide">其他请求参数（JSON）<textarea value={model.parametersJSON} onChange={(event) => updateModel(index, { parametersJSON: event.target.value })} rows={3} spellCheck={false} /></label>
                       </div>
                       <details className="reasoning-config" open={Boolean(model.reasoningParameter)}>
@@ -1444,6 +1448,8 @@ function editableProviderModel(model: ProviderModelSettings): EditableProviderMo
     id: model.id,
     type: model.type || 'openai-chat',
     contextWindow: model.context_window ? String(model.context_window) : '',
+    inputLimit: model.input_limit ? String(model.input_limit) : '',
+    outputLimit: model.output_limit ? String(model.output_limit) : '',
     parametersJSON: prettyJSON(model.parameters ?? {}),
     reasoningParameter: model.reasoning_config?.parameter ?? '',
     reasoningDefault: model.reasoning_config?.default ?? '',
@@ -1452,7 +1458,7 @@ function editableProviderModel(model: ProviderModelSettings): EditableProviderMo
 }
 
 function emptyProviderModel(): EditableProviderModel {
-  return { profile: '', id: '', type: 'openai-chat', contextWindow: '', parametersJSON: '{}', reasoningParameter: '', reasoningDefault: '', reasoningLevelsJSON: '{}' }
+  return { profile: '', id: '', type: 'openai-chat', contextWindow: '', inputLimit: '', outputLimit: '', parametersJSON: '{}', reasoningParameter: '', reasoningDefault: '', reasoningLevelsJSON: '{}' }
 }
 
 function providerInput(draft: ProviderDraft): ProviderSettingsInput {
@@ -1475,6 +1481,8 @@ function providerInput(draft: ProviderDraft): ProviderSettingsInput {
         id: model.id.trim(),
         type: model.type,
         context_window: model.contextWindow ? Number(model.contextWindow) : 0,
+        input_limit: model.inputLimit ? Number(model.inputLimit) : 0,
+        output_limit: model.outputLimit ? Number(model.outputLimit) : 0,
         parameters: parseJSONRecord(model.parametersJSON, `模型 ${model.profile} 的请求参数`),
         reasoning_config: {
           parameter: model.reasoningParameter.trim(),

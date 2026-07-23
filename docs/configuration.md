@@ -68,6 +68,7 @@ tools:
 compaction:
   enabled: false
   threshold_percent: 80
+  reserved: 0
 ```
 
 `default_provider` selects a provider file by name. `default_model` selects a
@@ -93,6 +94,7 @@ models:
     id: glm-5.2
     type: openai-chat
     context_window: 128000
+    output_limit: 4096
     temperature: 0.6
     max_tokens: 4096
     reasoning_config:
@@ -299,10 +301,18 @@ this diagnostic logging switch.
 
 ## Context window and compaction
 
-`context_window` supplies local budgeting metadata. If omitted, SAI uses a
-conservative estimated default. The Web UI shows usage events and exposes manual
-compaction. Automatic compaction follows the `compaction` configuration when
-enabled.
+`context_window`, `input_limit`, and `output_limit` supply local model-budget
+metadata; they are not sent as provider request parameters. If `context_window`
+is omitted, SAI uses a conservative estimated default. The Web UI shows usage
+events and exposes manual compaction.
+
+When compaction is enabled, the next user turn checks the previous model
+response usage. The provider's `total_tokens` is preferred; if it is absent,
+SAI uses input + output + cache-read + cache-write tokens. With an
+`input_limit`, the trigger is `input_limit - reserved`; an omitted or zero
+`reserved` defaults to `min(20000, output_limit)`. Without an `input_limit`, the
+trigger is `context_window - output_limit`. `threshold_percent` remains the
+compatibility fallback for profiles that do not define output limits.
 
 Compaction defaults to the provider-neutral local summary implementation. An
 OpenAI Responses or Codex model profile can explicitly opt into the public

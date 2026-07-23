@@ -205,6 +205,42 @@ func TestProviderCompactPostsCanonicalInputAndReturnsOpaqueItems(t *testing.T) {
 	}
 }
 
+func TestProviderCompactAcceptsCompactionSummary(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{
+			"object":"response.compaction",
+			"output":[
+				{"type":"message","role":"developer","content":"retained"},
+				{"type":"compaction_summary","id":"cmp_1","encrypted_content":"sealed"}
+			]
+		}`)
+	}))
+	defer server.Close()
+
+	provider, err := NewProvider(ProviderConfig{
+		BaseURL:    server.URL,
+		APIKey:     "test-key",
+		HTTPClient: server.Client(),
+	})
+	if err != nil {
+		t.Fatalf("NewProvider() error = %v", err)
+	}
+	result, err := provider.Compact(context.Background(), model.Request{
+		Model:    "gpt-5.6",
+		Messages: []model.Message{{Role: model.MessageRoleUser, Content: "Do work"}},
+	})
+	if err != nil {
+		t.Fatalf("Compact() error = %v", err)
+	}
+	if len(result.Items) != 2 {
+		t.Fatalf("len(result.Items) = %d, want 2", len(result.Items))
+	}
+	if got := decodeJSON(t, result.Items[1].Data).(map[string]any)["type"]; got != "compaction_summary" {
+		t.Fatalf("compaction item type = %#v, want compaction_summary", got)
+	}
+}
+
 func TestProviderStreamReturnsUsefulHTTPError(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "rate limited for Authorization: Bearer http-secret-value", http.StatusTooManyRequests)

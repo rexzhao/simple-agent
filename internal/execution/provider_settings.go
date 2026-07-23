@@ -42,6 +42,8 @@ type ProviderModelSettings struct {
 	ID              string                 `json:"id"`
 	Type            string                 `json:"type"`
 	ContextWindow   int                    `json:"context_window,omitempty"`
+	InputLimit      int                    `json:"input_limit,omitempty"`
+	OutputLimit     int                    `json:"output_limit,omitempty"`
 	Parameters      map[string]any         `json:"parameters,omitempty"`
 	ReasoningConfig config.ReasoningConfig `json:"reasoning_config,omitempty"`
 }
@@ -166,6 +168,8 @@ func (s *Service) saveProviderSettings(existingName string, input ProviderSettin
 			ID:              strings.TrimSpace(model.ID),
 			Type:            modelType,
 			ContextWindow:   model.ContextWindow,
+			InputLimit:      model.InputLimit,
+			OutputLimit:     model.OutputLimit,
 			Parameters:      copyParameterMap(model.Parameters),
 			ReasoningConfig: model.ReasoningConfig,
 		}
@@ -432,6 +436,8 @@ func providerSettingsFromConfig(providerDir string, provider config.ProviderConf
 			ID:              model.ID,
 			Type:            model.Type,
 			ContextWindow:   model.ContextWindow,
+			InputLimit:      model.InputLimit,
+			OutputLimit:     model.OutputLimit,
 			Parameters:      copyParameterMap(model.Parameters),
 			ReasoningConfig: model.ReasoningConfig,
 		})

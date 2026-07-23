@@ -635,7 +635,7 @@ func TestBuildProviderRequestReplaysOpaqueProviderItemsInOrder(t *testing.T) {
 				Role: model.MessageRoleProvider,
 				ProviderItems: []model.ProviderItem{
 					{Origin: "https://api.openai.com/v1", Model: "gpt-5.6", Data: json.RawMessage(`{"type":"message","role":"developer","content":"retained"}`)},
-					{Origin: "https://api.openai.com/v1", Model: "gpt-5.6", Data: json.RawMessage(`{"type":"compaction","id":"cmp_1","encrypted_content":"sealed","future_counter":9007199254740993}`)},
+					{Origin: "https://api.openai.com/v1", Model: "gpt-5.6", Data: json.RawMessage(`{"type":"compaction_summary","id":"cmp_1","encrypted_content":"sealed","future_counter":9007199254740993}`)},
 				},
 			},
 			{Role: model.MessageRoleUser, Content: "Continue"},
@@ -648,7 +648,7 @@ func TestBuildProviderRequestReplaysOpaqueProviderItemsInOrder(t *testing.T) {
 		"model": "gpt-5.6",
 		"input": [
 			{"type":"message","role":"developer","content":"retained"},
-			{"type":"compaction","id":"cmp_1","encrypted_content":"sealed","future_counter":9007199254740993},
+			{"type":"compaction_summary","id":"cmp_1","encrypted_content":"sealed","future_counter":9007199254740993},
 			{"role":"user","content":"Continue"}
 		],
 		"stream": true,

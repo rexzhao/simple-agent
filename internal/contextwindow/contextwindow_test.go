@@ -38,8 +38,29 @@ func TestTrackingProviderPrefersProviderUsageEvent(t *testing.T) {
 	if metadata.LastInputTokens != 10 || metadata.LastOutputTokens != 5 || metadata.LastTotalTokens != 15 {
 		t.Fatalf("metadata usage = input %d output %d total %d, want 10/5/15", metadata.LastInputTokens, metadata.LastOutputTokens, metadata.LastTotalTokens)
 	}
+	if metadata.LastUsageCountTokens != 15 {
+		t.Fatalf("LastUsageCountTokens = %d, want provider total 15", metadata.LastUsageCountTokens)
+	}
 	if metadata.LastCachedTokens != 8 || metadata.LastCacheWriteTokens != 2 || metadata.LastReasoningTokens != 3 {
 		t.Fatalf("metadata details = cached %d write %d reasoning %d, want 8/2/3", metadata.LastCachedTokens, metadata.LastCacheWriteTokens, metadata.LastReasoningTokens)
+	}
+}
+
+func TestTrackerUsageCountFallsBackToComponentsIncludingCache(t *testing.T) {
+	tracker := NewTracker(Window{Tokens: 1000, Source: WindowSourceConfigured}, Metadata{})
+	tracker.RecordProviderUsage(model.Usage{
+		InputTokens:      10,
+		OutputTokens:     5,
+		CachedTokens:     8,
+		CacheWriteTokens: 2,
+	})
+
+	metadata := tracker.Metadata()
+	if metadata.LastUsageCountTokens != 25 {
+		t.Fatalf("LastUsageCountTokens = %d, want 10+5+8+2", metadata.LastUsageCountTokens)
+	}
+	if metadata.LastTotalTokens != 15 {
+		t.Fatalf("LastTotalTokens = %d, want normalized input+output total 15", metadata.LastTotalTokens)
 	}
 }
 

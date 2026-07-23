@@ -153,7 +153,7 @@ func (p *Provider) Compact(ctx context.Context, request model.Request) (model.Co
 		if err := json.Unmarshal(raw, &item); err != nil || strings.TrimSpace(item.Type) == "" {
 			return model.CompactionResult{}, fmt.Errorf("OpenAI Responses compact output item %d is invalid", index)
 		}
-		hasCompaction = hasCompaction || item.Type == "compaction"
+		hasCompaction = hasCompaction || item.Type == "compaction" || item.Type == "compaction_summary"
 		result.Items = append(result.Items, model.ProviderItem{
 			Origin: p.baseURL,
 			Model:  request.Model,

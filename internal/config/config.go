@@ -72,6 +72,7 @@ type SessionsConfig struct {
 type CompactionConfig struct {
 	Enabled          bool   `json:"enabled" yaml:"enabled"`
 	ThresholdPercent int    `json:"threshold_percent" yaml:"threshold_percent"`
+	Reserved         int    `json:"reserved,omitempty" yaml:"reserved,omitempty"`
 	SummaryProvider  string `json:"summary_provider" yaml:"summary_provider"`
 	SummaryModel     string `json:"summary_model" yaml:"summary_model"`
 }
@@ -90,6 +91,8 @@ type ModelProfile struct {
 	ID              string          `json:"id" yaml:"id"`
 	Type            string          `json:"type,omitempty" yaml:"type,omitempty"`
 	ContextWindow   int             `json:"context_window,omitempty" yaml:"context_window,omitempty"`
+	InputLimit      int             `json:"input_limit,omitempty" yaml:"input_limit,omitempty"`
+	OutputLimit     int             `json:"output_limit,omitempty" yaml:"output_limit,omitempty"`
 	Parameters      map[string]any  `json:"parameters,omitempty" yaml:"parameters,omitempty"`
 	ReasoningConfig ReasoningConfig `json:"reasoning_config,omitempty" yaml:"reasoning_config,omitempty"`
 }
@@ -115,6 +118,8 @@ type ResolvedModel struct {
 	Parameters          map[string]any
 	ContextWindow       int
 	ContextWindowSource string
+	InputLimit          int
+	OutputLimit         int
 	ReasoningConfig     ReasoningConfig
 }
 
@@ -258,6 +263,8 @@ func (c *Config) ResolveModel(providerName, modelName string) (ResolvedModel, er
 		Parameters:          copyParameters(profile.Parameters),
 		ContextWindow:       window.Tokens,
 		ContextWindowSource: string(window.Source),
+		InputLimit:          profile.InputLimit,
+		OutputLimit:         profile.OutputLimit,
 		ReasoningConfig:     copyReasoningConfig(profile.ReasoningConfig),
 	}, nil
 }
@@ -398,6 +405,22 @@ func (m *ModelProfile) UnmarshalYAML(value *yaml.Node) error {
 		m.ContextWindow = contextWindow
 		delete(fields, "context_window")
 	}
+	if rawInputLimit, ok := fields["input_limit"]; ok {
+		inputLimit, err := parseModelTokenLimit("input_limit", rawInputLimit)
+		if err != nil {
+			return err
+		}
+		m.InputLimit = inputLimit
+		delete(fields, "input_limit")
+	}
+	if rawOutputLimit, ok := fields["output_limit"]; ok {
+		outputLimit, err := parseModelTokenLimit("output_limit", rawOutputLimit)
+		if err != nil {
+			return err
+		}
+		m.OutputLimit = outputLimit
+		delete(fields, "output_limit")
+	}
 
 	if rawType, ok := fields["type"]; ok {
 		switch modelType := rawType.(type) {
@@ -432,12 +455,16 @@ func (m *ModelProfile) UnmarshalYAML(value *yaml.Node) error {
 }
 
 func parseContextWindow(value any) (int, error) {
+	return parseModelTokenLimit("context_window", value)
+}
+
+func parseModelTokenLimit(name string, value any) (int, error) {
 	tokens, ok := value.(int)
 	if !ok {
-		return 0, fmt.Errorf("model profile context_window must be a positive integer")
+		return 0, fmt.Errorf("model profile %s must be a positive integer", name)
 	}
 	if tokens <= 0 {
-		return 0, fmt.Errorf("model profile context_window must be a positive integer")
+		return 0, fmt.Errorf("model profile %s must be a positive integer", name)
 	}
 	return tokens, nil
 }
@@ -445,6 +472,9 @@ func parseContextWindow(value any) (int, error) {
 func validateConfig(cfg Config) error {
 	if cfg.Compaction.ThresholdPercent <= 0 {
 		return fmt.Errorf("compaction.threshold_percent must be positive")
+	}
+	if cfg.Compaction.Reserved < 0 {
+		return fmt.Errorf("compaction.reserved must not be negative")
 	}
 	return nil
 }

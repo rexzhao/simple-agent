@@ -275,20 +275,29 @@ MVP 只实现：
 
 ### Pre-turn 自动压缩
 
-每次新用户消息真正提交前检查：
+每次新用户消息真正提交前，读取上一轮模型响应持久化的 usage：
 
 ```text
-estimate(ActiveHistory + pending user message + tool schemas)
+count = total_tokens
+     or input_tokens + output_tokens + cached_tokens + cache_write_tokens
+
+有 input_limit:
+  threshold = input_limit - reserved
+
+无 input_limit:
+  threshold = context_window - output_limit
 ```
 
-如果估算值超过自动压缩阈值：
+未显式配置 `reserved` 时默认使用 `min(20000, output_limit)`。当
+`count >= threshold` 时：
 
 1. 先 compact。
 2. compact 成功后，再把新用户消息加入 active history 并跑模型。
 3. compact 失败时，本轮直接失败，不请求主模型。
 4. compact 失败时，不保存 turn，不更新 `ActiveHistory`。
 
-默认阈值建议 80%，后续可配置。
+没有配置模型 output limit 的旧 profile 继续使用
+`context_window * threshold_percent` 作为兼容回退。
 
 暂不做 mid-turn 的原因：工具链中途压缩要处理 assistant tool call / tool result 的合法性，
 风险较高。MVP 如果工具结果追加后下一次请求超窗，先返回清晰错误。
@@ -306,6 +315,7 @@ provider/model。
 compaction:
   enabled: false
   threshold_percent: 80
+  reserved: 0
   summary_provider: ""
   summary_model: ""
 ```
@@ -313,6 +323,7 @@ compaction:
 语义：
 
 - `enabled` 默认 `false`；启用后才执行手动 `/compact` 和 pre-turn 自动压缩。
+- `reserved` 为 `0` 或省略时，按模型 output limit 自动保留最多 20000 tokens。
 - `summary_provider` 和 `summary_model` 为空：使用当前 provider/model。
 - 只配置 `summary_model`：默认在当前 provider 下找该 model profile。
 - 同时配置 `summary_provider` 和 `summary_model`：使用指定 provider/profile。

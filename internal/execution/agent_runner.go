@@ -107,7 +107,7 @@ func (r AgentTurnRunner) PlanSessionTurnCompaction(ctx context.Context, request 
 	if err != nil {
 		return SessionCompactionResult{}, err
 	}
-	_, compaction, err := runtime.planAutoCompactBeforeTurn(ctx, messages, request.Content)
+	_, compaction, err := runtime.planAutoCompactBeforeTurn(ctx, messages)
 	if err != nil {
 		return SessionCompactionResult{}, err
 	}
@@ -263,6 +263,8 @@ func (r AgentTurnRunner) prepareRuntime(ctx context.Context, session sessions.Se
 		providerName: resolved.ProviderName,
 		modelProfile: resolved.Profile,
 		modelID:      resolved.ModelID,
+		inputLimit:   resolved.InputLimit,
+		outputLimit:  resolved.OutputLimit,
 		parameters:   resolved.Parameters,
 		provider:     provider,
 		toolExecutor: runToolExecutor{
@@ -298,6 +300,8 @@ type agentRunnerRuntime struct {
 	providerName       string
 	modelProfile       string
 	modelID            string
+	inputLimit         int
+	outputLimit        int
 	parameters         map[string]any
 	provider           model.Provider
 	toolExecutor       runToolExecutor
@@ -495,7 +499,7 @@ type compactionPlan struct {
 	context     *contextwindow.Metadata
 }
 
-func (r *agentRunnerRuntime) planAutoCompactBeforeTurn(ctx context.Context, messages []model.Message, prompt string) ([]model.Message, *compactionPlan, error) {
+func (r *agentRunnerRuntime) planAutoCompactBeforeTurn(ctx context.Context, messages []model.Message) ([]model.Message, *compactionPlan, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, nil, err
 	}
@@ -512,25 +516,19 @@ func (r *agentRunnerRuntime) planAutoCompactBeforeTurn(ctx context.Context, mess
 	if !compactable {
 		return messages, nil, nil
 	}
-	contextWindow := 0
-	if r.contextTracker != nil {
-		contextWindow = r.contextTracker.Metadata().ContextWindow
-	}
-	if contextWindow <= 0 {
+	if r.contextTracker == nil {
 		return messages, nil, nil
 	}
-
-	requestMessages := append(copyMessageSlice(messages), model.Message{
-		Role:    model.MessageRoleUser,
-		Content: prompt,
-	})
-	estimated := contextwindow.EstimateRequestTokens(model.Request{
-		Model:      r.modelID,
-		Messages:   requestMessages,
-		Tools:      r.toolSchemas,
-		Parameters: r.parameters,
-	})
-	if !autoCompactionThresholdExceeded(estimated, contextWindow, r.config.Compaction.ThresholdPercent) {
+	contextMetadata := r.contextTracker.Metadata()
+	usageCount := autoCompactionUsageCount(contextMetadata)
+	threshold := autoCompactionThreshold(
+		r.inputLimit,
+		contextMetadata.ContextWindow,
+		r.outputLimit,
+		r.config.Compaction.Reserved,
+		r.config.Compaction.ThresholdPercent,
+	)
+	if usageCount <= 0 || threshold <= 0 || usageCount < threshold {
 		return messages, nil, nil
 	}
 
@@ -545,11 +543,47 @@ func (r *agentRunnerRuntime) planAutoCompactBeforeTurn(ctx context.Context, mess
 	return plan.messages, &plan, nil
 }
 
-func autoCompactionThresholdExceeded(inputTokens, contextWindow, thresholdPercent int) bool {
-	if inputTokens <= 0 || contextWindow <= 0 || thresholdPercent <= 0 {
-		return false
+func autoCompactionUsageCount(metadata contextwindow.Metadata) int64 {
+	if metadata.LastUsageSource != string(contextwindow.UsageSourceProvider) {
+		return 0
 	}
-	return int64(inputTokens)*100 > int64(contextWindow)*int64(thresholdPercent)
+	if metadata.LastUsageCountTokens > 0 {
+		return int64(metadata.LastUsageCountTokens)
+	}
+	if metadata.LastTotalTokens > 0 {
+		return int64(metadata.LastTotalTokens)
+	}
+	return int64(metadata.LastInputTokens) +
+		int64(metadata.LastOutputTokens) +
+		int64(metadata.LastCachedTokens) +
+		int64(metadata.LastCacheWriteTokens)
+}
+
+func autoCompactionThreshold(inputLimit, contextWindow, outputLimit, reserved, thresholdPercent int) int64 {
+	if inputLimit > 0 {
+		if reserved == 0 {
+			reserved = 20_000
+			if outputLimit > 0 && outputLimit < reserved {
+				reserved = outputLimit
+			}
+		}
+		threshold := int64(inputLimit) - int64(reserved)
+		if threshold > 0 {
+			return threshold
+		}
+		return 0
+	}
+	if contextWindow > 0 && outputLimit > 0 {
+		threshold := int64(contextWindow) - int64(outputLimit)
+		if threshold > 0 {
+			return threshold
+		}
+		return 0
+	}
+	if contextWindow <= 0 || thresholdPercent <= 0 {
+		return 0
+	}
+	return (int64(contextWindow)*int64(thresholdPercent) + 99) / 100
 }
 
 func (r *agentRunnerRuntime) planCompactionCheckpoint(ctx context.Context, checkpointOptions compactionCheckpointOptions) (compactionPlan, error) {
@@ -574,6 +608,20 @@ func (r *agentRunnerRuntime) planCompactionCheckpoint(ctx context.Context, check
 		plan, remoteErr := r.planRemoteCompactionCheckpoint(ctx, checkpointOptions)
 		if remoteErr == nil {
 			return plan, nil
+		}
+		if r.logger != nil {
+			message := fmt.Sprintf(
+				"POST /responses/compact failed (reason=%s phase=%s trigger=%s); falling back to local summary",
+				checkpointOptions.reason,
+				checkpointOptions.phase,
+				checkpointOptions.trigger,
+			)
+			if logErr := r.logger.LogEvent(model.ErrorEvent{Err: remoteErr, Message: message}); logErr != nil {
+				return compactionPlan{}, errors.Join(
+					fmt.Errorf("remote Responses compaction failed: %w", remoteErr),
+					fmt.Errorf("log remote Responses compaction failure: %w", logErr),
+				)
+			}
 		}
 		plan, fallbackErr := r.planSummaryCompactionCheckpoint(ctx, checkpointOptions)
 		if fallbackErr == nil {

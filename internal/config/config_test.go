@@ -236,6 +236,7 @@ provider_dir: providers
 compaction:
   enabled: true
   threshold_percent: 65
+  reserved: 12000
   summary_provider: ../summary-provider
   summary_model: models/summary
 `)
@@ -251,12 +252,29 @@ compaction:
 	if cfg.Compaction.ThresholdPercent != 65 {
 		t.Fatalf("Compaction.ThresholdPercent = %d, want 65", cfg.Compaction.ThresholdPercent)
 	}
+	if cfg.Compaction.Reserved != 12000 {
+		t.Fatalf("Compaction.Reserved = %d, want 12000", cfg.Compaction.Reserved)
+	}
 	if cfg.Compaction.SummaryProvider != "../summary-provider" {
 		t.Fatalf("Compaction.SummaryProvider = %q, want path-like value unchanged", cfg.Compaction.SummaryProvider)
 	}
 	if cfg.Compaction.SummaryModel != "models/summary" {
 		t.Fatalf("Compaction.SummaryModel = %q, want path-like value unchanged", cfg.Compaction.SummaryModel)
 	}
+}
+
+func TestLoadRejectsNegativeCompactionReserved(t *testing.T) {
+	dir := writeConfigFixture(t)
+	writeFile(t, filepath.Join(dir, "sai.yaml"), `default_provider: paperhub
+default_model: glm-5.2
+provider_dir: providers
+
+compaction:
+  reserved: -1
+`)
+
+	_, err := Load(rootConfigPath(dir))
+	assertErrorContains(t, err, "validate config file", "compaction.reserved must not be negative")
 }
 
 func TestLoadRejectsInvalidCompactionThreshold(t *testing.T) {
@@ -883,7 +901,9 @@ models:
   default:
     id: model-default
     type: anthropic-messages
-    context_window: 128000
+    context_window: 400000
+    input_limit: 272000
+    output_limit: 128000
     parameters:
       temperature: 0.2
       max_tokens: 64
@@ -898,8 +918,8 @@ models:
 	}
 
 	profile := cfg.Providers["fake"].Models["default"]
-	if profile.ContextWindow != 128000 {
-		t.Fatalf("ContextWindow = %d, want 128000", profile.ContextWindow)
+	if profile.ContextWindow != 400000 || profile.InputLimit != 272000 || profile.OutputLimit != 128000 {
+		t.Fatalf("model limits = context %d input %d output %d, want 400000/272000/128000", profile.ContextWindow, profile.InputLimit, profile.OutputLimit)
 	}
 	if got := profile.Parameters["temperature"]; got != 0.2 {
 		t.Fatalf("temperature = %#v, want 0.2", got)
@@ -916,6 +936,12 @@ models:
 	if _, ok := profile.Parameters["context_window"]; ok {
 		t.Fatal("Parameters unexpectedly contains context_window")
 	}
+	if _, ok := profile.Parameters["input_limit"]; ok {
+		t.Fatal("Parameters unexpectedly contains input_limit")
+	}
+	if _, ok := profile.Parameters["output_limit"]; ok {
+		t.Fatal("Parameters unexpectedly contains output_limit")
+	}
 	if _, ok := profile.Parameters["parameters"]; ok {
 		t.Fatal("Parameters unexpectedly contains nested parameters field")
 	}
@@ -924,8 +950,15 @@ models:
 	if err != nil {
 		t.Fatalf("ResolveModel(default) error = %v", err)
 	}
-	if resolved.ContextWindow != 128000 || resolved.ContextWindowSource != string(contextwindow.WindowSourceConfigured) {
-		t.Fatalf("resolved context = %d/%q, want 128000/configured", resolved.ContextWindow, resolved.ContextWindowSource)
+	if resolved.ContextWindow != 400000 || resolved.ContextWindowSource != string(contextwindow.WindowSourceConfigured) ||
+		resolved.InputLimit != 272000 || resolved.OutputLimit != 128000 {
+		t.Fatalf(
+			"resolved limits = context %d/%q input %d output %d, want 400000/configured/272000/128000",
+			resolved.ContextWindow,
+			resolved.ContextWindowSource,
+			resolved.InputLimit,
+			resolved.OutputLimit,
+		)
 	}
 	if resolved.Type != ProviderTypeAnthropicMessages {
 		t.Fatalf("resolved.Type = %q, want %q", resolved.Type, ProviderTypeAnthropicMessages)
