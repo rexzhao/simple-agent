@@ -1,4 +1,4 @@
-import type { ActiveRunDescriptor, Bootstrap, CodexAuthStatus, ItemsPage, Project, ProviderSettingsDocument, ProviderSettingsInput, RunEvent, Session, SessionModelOptions } from './types'
+import type { ActiveRunDescriptor, Bootstrap, CodexAuthStatus, ImageAttachmentInput, ItemsPage, Project, ProviderSettingsDocument, ProviderSettingsInput, RunEvent, Session, SessionModelOptions } from './types'
 
 const tokenStorageKey = 'sai-capability-token'
 
@@ -98,10 +98,28 @@ export const api = {
     method: 'POST',
     body: '{}',
   }),
-  startRun: (sessionID: string, content: string) => request<{ run_id: string; session_id: string; status: string }>(`/api/sessions/${encodeURIComponent(sessionID)}/runs`, {
+  startRun: (sessionID: string, content: string, images: ImageAttachmentInput[] = []) => request<{ run_id: string; session_id: string; status: string }>(`/api/sessions/${encodeURIComponent(sessionID)}/runs`, {
     method: 'POST',
-    body: JSON.stringify({ content }),
+    body: JSON.stringify({ content, images }),
   }),
+  sessionImage: async (sessionID: string, hash: string): Promise<Blob> => {
+    const response = await fetch(`/api/sessions/${encodeURIComponent(sessionID)}/images/${encodeURIComponent(hash)}`, {
+      headers: { Authorization: `Bearer ${token}` },
+    })
+    if (!response.ok) {
+      let code = 'request_failed'
+      let message = `请求失败 (${response.status})`
+      try {
+        const payload = await response.json() as { error?: { code?: string; message?: string } }
+        code = payload.error?.code ?? code
+        message = payload.error?.message ?? message
+      } catch {
+        // Preserve the safe fallback above.
+      }
+      throw new APIError(response.status, code, message)
+    }
+    return await response.blob()
+  },
   cancelRun: (runID: string) => request(`/api/runs/${encodeURIComponent(runID)}`, { method: 'DELETE' }),
   activeRuns: () => request<{ runs: ActiveRunDescriptor[] }>('/api/runs/active'),
 }

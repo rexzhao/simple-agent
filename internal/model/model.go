@@ -60,13 +60,14 @@ type ProviderItem struct {
 	Data   json.RawMessage
 }
 
-// InputContentBlock represents a Responses API input content block. Other
-// adapters may continue to use Message.Content until they add equivalent
-// multimodal support.
+// InputContentBlock represents a provider input content block. ImageURL is a
+// data URL while the message is in memory; ImageBlob is the durable reference
+// used by session storage and is hydrated back into ImageURL before requests.
 type InputContentBlock struct {
 	Type                  string
 	Text                  string
 	ImageURL              string
+	ImageBlob             *BlobRef `json:"image_blob,omitempty"`
 	FileID                string
 	Detail                string
 	PromptCacheBreakpoint bool

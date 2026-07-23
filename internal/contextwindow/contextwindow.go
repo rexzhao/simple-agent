@@ -293,6 +293,8 @@ func EstimateRequestTokens(request model.Request) int {
 	return total
 }
 
+const estimatedImageInputTokens = 1_000
+
 func EstimateMessageTokens(message model.Message) int {
 	total := messageOverheadTokens
 	total += EstimateTextTokens(string(message.Role))
@@ -300,7 +302,14 @@ func EstimateMessageTokens(message model.Message) int {
 	for _, block := range message.ContentBlocks {
 		total += EstimateTextTokens(block.Type)
 		total += EstimateTextTokens(block.Text)
-		total += EstimateTextTokens(block.ImageURL)
+		if block.Type == "input_image" {
+			// A data URL contains base64 bytes, not model text. Counting that
+			// representation would inflate an image into millions of text tokens;
+			// use a stable vision-input estimate until the provider reports usage.
+			total += estimatedImageInputTokens
+		} else {
+			total += EstimateTextTokens(block.ImageURL)
+		}
 		total += EstimateTextTokens(block.FileID)
 	}
 	total += EstimateTextTokens(message.ToolCallID)

@@ -223,3 +223,44 @@ func decodeJSON(t *testing.T, data []byte) any {
 	}
 	return value
 }
+
+func TestBuildRequestBodyMapsUserImageContentBlocks(t *testing.T) {
+	imageURL := model.ImageDataURL("image/png", []byte{0x89, 'P', 'N', 'G', 0x0d, 0x0a, 0x1a, 0x0a})
+	body, err := BuildRequestBody(model.Request{
+		Model: "gpt-5.4",
+		Messages: []model.Message{{
+			Role: model.MessageRoleUser,
+			ContentBlocks: []model.InputContentBlock{
+				{Type: "input_text", Text: "What is shown?"},
+				{Type: "input_image", ImageURL: imageURL, Detail: "high"},
+			},
+		}},
+	}, true)
+	if err != nil {
+		t.Fatalf("BuildRequestBody() error = %v", err)
+	}
+	assertJSONEqual(t, body, `{
+		"model": "gpt-5.4",
+		"messages": [{
+			"role": "user",
+			"content": [
+				{"type": "text", "text": "What is shown?"},
+				{"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBORw0KGgo=", "detail": "high"}}
+			]
+		}],
+		"stream": true
+	}`)
+}
+
+func TestBuildRequestBodyRejectsNonUserContentBlocks(t *testing.T) {
+	_, err := BuildRequestBody(model.Request{
+		Model: "gpt-5.4",
+		Messages: []model.Message{{
+			Role:          model.MessageRoleAssistant,
+			ContentBlocks: []model.InputContentBlock{{Type: "input_text", Text: "not allowed"}},
+		}},
+	}, true)
+	if err == nil {
+		t.Fatal("BuildRequestBody() error = nil, want non-user content block error")
+	}
+}

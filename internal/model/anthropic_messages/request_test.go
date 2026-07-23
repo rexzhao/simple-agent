@@ -174,3 +174,45 @@ func decodeJSON(t *testing.T, data []byte) any {
 	}
 	return value
 }
+
+func TestBuildRequestBodyMapsUserImageContentBlocks(t *testing.T) {
+	body, err := BuildRequestBody(model.Request{
+		Model: "claude-sonnet-5",
+		Messages: []model.Message{{
+			Role: model.MessageRoleUser,
+			ContentBlocks: []model.InputContentBlock{
+				{Type: "input_text", Text: "What is shown?"},
+				{Type: "input_image", ImageURL: model.ImageDataURL("image/png", []byte{0x89, 'P', 'N', 'G', 0x0d, 0x0a, 0x1a, 0x0a})},
+			},
+		}},
+	}, true)
+	if err != nil {
+		t.Fatalf("BuildRequestBody() error = %v", err)
+	}
+	assertJSONEqual(t, body, `{
+		"model": "claude-sonnet-5",
+		"messages": [{
+			"role": "user",
+			"content": [
+				{"type": "text", "text": "What is shown?"},
+				{"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "iVBORw0KGgo="}}
+			]
+		}],
+		"stream": true
+	}`)
+}
+
+func TestBuildRequestBodyRejectsUnsupportedImageMediaType(t *testing.T) {
+	_, err := BuildRequestBody(model.Request{
+		Model: "claude-sonnet-5",
+		Messages: []model.Message{{
+			Role: model.MessageRoleUser,
+			ContentBlocks: []model.InputContentBlock{
+				{Type: "input_image", ImageURL: model.ImageDataURL("image/bmp", []byte{'B', 'M'})},
+			},
+		}},
+	}, true)
+	if err == nil {
+		t.Fatal("BuildRequestBody() error = nil, want unsupported media type error")
+	}
+}

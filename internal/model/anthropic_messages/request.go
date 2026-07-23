@@ -2,6 +2,7 @@ package anthropicmessages
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -55,8 +56,20 @@ func buildMessages(messages []model.Message, toolNames *toolNameMapper) ([]map[s
 			if content != "" {
 				systemParts = append(systemParts, content)
 			}
-		case model.MessageRoleUser, model.MessageRoleAssistant:
-			if message.Role == model.MessageRoleAssistant && len(message.ToolCalls) > 0 {
+		case model.MessageRoleUser:
+			content, err := anthropicUserContent(message)
+			if err != nil {
+				return nil, "", err
+			}
+			out = append(out, map[string]any{
+				"role":    string(message.Role),
+				"content": content,
+			})
+		case model.MessageRoleAssistant:
+			if len(message.ContentBlocks) > 0 {
+				return nil, "", fmt.Errorf("Anthropic Messages content blocks are only supported for user messages")
+			}
+			if len(message.ToolCalls) > 0 {
 				content, err := buildAssistantContent(message, toolNames)
 				if err != nil {
 					return nil, "", err
@@ -79,6 +92,47 @@ func buildMessages(messages []model.Message, toolNames *toolNameMapper) ([]map[s
 	}
 
 	return out, strings.Join(systemParts, "\n\n"), nil
+}
+
+func anthropicUserContent(message model.Message) (any, error) {
+	if len(message.ContentBlocks) == 0 {
+		return message.Content, nil
+	}
+	if message.Content != "" {
+		return nil, fmt.Errorf("Anthropic Messages message cannot set both content and content blocks")
+	}
+
+	content := make([]map[string]any, 0, len(message.ContentBlocks))
+	for _, block := range message.ContentBlocks {
+		switch strings.TrimSpace(block.Type) {
+		case "", "input_text":
+			content = append(content, map[string]any{"type": "text", "text": block.Text})
+		case "input_image":
+			if block.ImageBlob != nil {
+				return nil, fmt.Errorf("Anthropic image attachment must be materialized before requesting the model")
+			}
+			mediaType, data, err := model.ParseImageDataURL(block.ImageURL)
+			if err != nil {
+				return nil, fmt.Errorf("Anthropic input_image: %w", err)
+			}
+			switch mediaType {
+			case "image/jpeg", "image/png", "image/gif", "image/webp":
+			default:
+				return nil, fmt.Errorf("unsupported Anthropic image media type %q", mediaType)
+			}
+			content = append(content, map[string]any{
+				"type": "image",
+				"source": map[string]any{
+					"type":       "base64",
+					"media_type": mediaType,
+					"data":       base64.StdEncoding.EncodeToString(data),
+				},
+			})
+		default:
+			return nil, fmt.Errorf("unsupported Anthropic content block type %q", block.Type)
+		}
+	}
+	return content, nil
 }
 
 func buildTools(tools []model.Tool, toolNames *toolNameMapper) []map[string]any {

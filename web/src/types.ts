@@ -38,6 +38,7 @@ export interface ProviderModelSettings {
   profile: string
   id: string
   type: string
+  input?: string[]
   context_window?: number
   input_limit?: number
   output_limit?: number
@@ -133,6 +134,17 @@ export interface MessageContent {
   preview?: string
 }
 
+export interface ImageAttachmentInput {
+  data_url: string
+  detail?: 'auto' | 'low' | 'high'
+}
+
+export interface SessionImageAttachment {
+  hash: string
+  media_type: string
+  size_bytes: number
+}
+
 export interface SessionItem {
   seq: number
   id: string
@@ -146,6 +158,7 @@ export interface SessionItem {
   message?: {
     role: 'user' | 'assistant' | string
     content?: MessageContent
+    images?: SessionImageAttachment[]
 		tool_call_id?: string
 		tool_calls?: SessionToolCall[]
 		is_error?: boolean
@@ -213,6 +226,7 @@ export interface ActiveRun {
 	turnID?: string
   restored?: boolean
   userText: string
+  userImages?: ImageAttachmentInput[]
 	assistantText: string
 	steps: RunStep[]
   agentIteration: number

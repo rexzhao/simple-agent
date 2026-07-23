@@ -41,6 +41,7 @@ type ProviderModelSettings struct {
 	Profile         string                 `json:"profile"`
 	ID              string                 `json:"id"`
 	Type            string                 `json:"type"`
+	Input           []string               `json:"input,omitempty"`
 	ContextWindow   int                    `json:"context_window,omitempty"`
 	InputLimit      int                    `json:"input_limit,omitempty"`
 	OutputLimit     int                    `json:"output_limit,omitempty"`
@@ -164,9 +165,17 @@ func (s *Service) saveProviderSettings(existingName string, input ProviderSettin
 		}
 		modelType := strings.TrimSpace(model.Type)
 		usesCodex = usesCodex || modelType == config.ProviderTypeOpenAICodex
+		modelInput := append([]string(nil), model.Input...)
+		if len(modelInput) > 0 {
+			modelInput, err = config.NormalizeModelInput(modelInput)
+			if err != nil {
+				return ProviderSettingsDocument{}, fmt.Errorf("model profile %q: %w", profile, err)
+			}
+		}
 		modelProfile := config.ModelProfile{
 			ID:              strings.TrimSpace(model.ID),
 			Type:            modelType,
+			Input:           modelInput,
 			ContextWindow:   model.ContextWindow,
 			InputLimit:      model.InputLimit,
 			OutputLimit:     model.OutputLimit,
@@ -435,6 +444,7 @@ func providerSettingsFromConfig(providerDir string, provider config.ProviderConf
 			Profile:         profile,
 			ID:              model.ID,
 			Type:            model.Type,
+			Input:           append([]string(nil), model.Input...),
 			ContextWindow:   model.ContextWindow,
 			InputLimit:      model.InputLimit,
 			OutputLimit:     model.OutputLimit,

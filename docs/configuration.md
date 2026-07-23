@@ -93,6 +93,7 @@ models:
   glm-5.2:
     id: glm-5.2
     type: openai-chat
+    input: [text, image]
     context_window: 128000
     output_limit: 4096
     temperature: 0.6
@@ -111,6 +112,14 @@ Supported model profile types:
 - `openai-responses`
 - `openai-codex`
 - `anthropic-messages`
+
+`input` declares the modalities accepted by a model profile. Omit it (or use
+`[text]`) for text-only models; add `image` to enable image attachments in the
+Web application:
+
+```yaml
+input: [text, image]
+```
 
 ### OpenAI Responses cache and state
 

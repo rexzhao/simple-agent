@@ -47,11 +47,23 @@ type SessionItem struct {
 }
 
 type SessionItemMessage struct {
-	Role       string                     `json:"role"`
-	Content    *SessionItemMessageContent `json:"content,omitempty"`
-	ToolCallID string                     `json:"tool_call_id,omitempty"`
-	ToolCalls  []SessionItemToolCall      `json:"tool_calls,omitempty"`
-	IsError    bool                       `json:"is_error,omitempty"`
+	Role       string                       `json:"role"`
+	Content    *SessionItemMessageContent   `json:"content,omitempty"`
+	Images     []SessionItemImageAttachment `json:"images,omitempty"`
+	ToolCallID string                       `json:"tool_call_id,omitempty"`
+	ToolCalls  []SessionItemToolCall        `json:"tool_calls,omitempty"`
+	IsError    bool                         `json:"is_error,omitempty"`
+}
+
+type SessionItemImageAttachment struct {
+	Hash      string `json:"hash"`
+	MediaType string `json:"media_type"`
+	SizeBytes int64  `json:"size_bytes"`
+}
+
+type SessionImage struct {
+	Data      []byte
+	MediaType string
 }
 
 type SessionItemToolCall struct {
@@ -260,6 +272,43 @@ func (s *Service) GetSessionChatItemsPage(id string, options SessionItemsOptions
 		HasMoreBefore: hasMoreBefore,
 		HasMoreAfter:  hasMoreAfter,
 	}, nil
+}
+
+// ReadSessionImage returns an image blob only when it is referenced by a
+// visible message in the specified session. It deliberately does not expose a
+// generic blob lookup endpoint.
+func (s *Service) ReadSessionImage(id, hash string) (SessionImage, error) {
+	if s == nil || s.sessionStore == nil {
+		return SessionImage{}, fmt.Errorf("execution session store is not configured")
+	}
+	hash = strings.ToLower(strings.TrimSpace(hash))
+	if hash == "" {
+		return SessionImage{}, fmt.Errorf("image hash is required")
+	}
+	session, err := s.sessionStore.Load(id)
+	if err != nil {
+		return SessionImage{}, err
+	}
+	for _, item := range session.Items {
+		if !sessionItemVisibleInChat(item) || item.Message == nil {
+			continue
+		}
+		for _, block := range item.Message.ContentBlocks {
+			if block.Type != "input_image" || block.ImageBlob == nil || !strings.EqualFold(block.ImageBlob.Hash, hash) {
+				continue
+			}
+			mediaType, supported := model.NormalizeImageMediaType(block.ImageBlob.MediaType)
+			if !supported {
+				return SessionImage{}, fmt.Errorf("image %q has unsupported media type", hash)
+			}
+			raw, err := s.sessionStore.ReadBlob(*block.ImageBlob)
+			if err != nil {
+				return SessionImage{}, err
+			}
+			return SessionImage{Data: raw, MediaType: mediaType}, nil
+		}
+	}
+	return SessionImage{}, fmt.Errorf("%w: image %q", sessions.ErrNotFound, hash)
 }
 
 func (s *Service) GetSessionTurnFinalAssistantOutput(id, turnID string) (string, error) {
@@ -599,12 +648,43 @@ func (s *Service) sessionItemDTO(item sessions.SessionItem) (SessionItem, error)
 			Preview: preview,
 		}
 	}
+	dto.Message.Images = sessionItemImageAttachments(item)
 	return dto, nil
 }
 
+func sessionItemImageAttachments(item sessions.SessionItem) []SessionItemImageAttachment {
+	if item.Message == nil {
+		return nil
+	}
+	attachments := make([]SessionItemImageAttachment, 0, len(item.Message.ContentBlocks))
+	for _, block := range item.Message.ContentBlocks {
+		if block.Type != "input_image" || block.ImageBlob == nil {
+			continue
+		}
+		mediaType, supported := model.NormalizeImageMediaType(block.ImageBlob.MediaType)
+		if !supported || strings.TrimSpace(block.ImageBlob.Hash) == "" || block.ImageBlob.SizeBytes <= 0 {
+			continue
+		}
+		attachments = append(attachments, SessionItemImageAttachment{
+			Hash:      block.ImageBlob.Hash,
+			MediaType: mediaType,
+			SizeBytes: block.ImageBlob.SizeBytes,
+		})
+	}
+	if len(attachments) == 0 {
+		return nil
+	}
+	return attachments
+}
+
 func (s *Service) sessionItemDisplayContent(item sessions.SessionItem) (string, string, error) {
-	if item.Message != nil && item.Message.Content != "" {
-		return item.Message.Content, "", nil
+	if item.Message != nil {
+		if item.Message.Content != "" {
+			return item.Message.Content, "", nil
+		}
+		if text := inputContentBlockText(item.Message.ContentBlocks); text != "" {
+			return text, "", nil
+		}
 	}
 	if item.Content == nil {
 		return "", "", nil
@@ -626,8 +706,13 @@ func (s *Service) sessionItemDisplayContent(item sessions.SessionItem) (string, 
 }
 
 func (s *Service) sessionItemFullContent(item sessions.SessionItem) (string, error) {
-	if item.Message != nil && item.Message.Content != "" {
-		return item.Message.Content, nil
+	if item.Message != nil {
+		if item.Message.Content != "" {
+			return item.Message.Content, nil
+		}
+		if text := inputContentBlockText(item.Message.ContentBlocks); text != "" {
+			return text, nil
+		}
 	}
 	if item.Content == nil {
 		return "", nil
@@ -646,6 +731,16 @@ func (s *Service) sessionItemFullContent(item sessions.SessionItem) (string, err
 		return item.Content.Preview, nil
 	}
 	return "", nil
+}
+
+func inputContentBlockText(blocks []model.InputContentBlock) string {
+	parts := make([]string, 0, len(blocks))
+	for _, block := range blocks {
+		if (block.Type == "" || block.Type == "input_text") && block.Text != "" {
+			parts = append(parts, block.Text)
+		}
+	}
+	return strings.Join(parts, "\n")
 }
 
 func sessionItemVisibleInChat(item sessions.SessionItem) bool {

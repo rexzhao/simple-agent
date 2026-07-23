@@ -95,12 +95,7 @@ type StoredContent struct {
 	Preview string   `json:"preview,omitempty"`
 }
 
-type BlobRef struct {
-	Hash      string `json:"hash"`
-	SizeBytes int64  `json:"size_bytes"`
-	Encoding  string `json:"encoding"`
-	MediaType string `json:"media_type,omitempty"`
-}
+type BlobRef = model.BlobRef
 
 type SessionV2 struct {
 	ID                   string                 `json:"id"`
@@ -183,9 +178,38 @@ func materializeActiveHistory(session SessionV2, readBlob func(BlobRef) ([]byte,
 				message.Content = content
 			}
 		}
+		if err := materializeMessageImages(&message, readBlob); err != nil {
+			return nil, err
+		}
 		messages = append(messages, message)
 	}
 	return messages, nil
+}
+
+func materializeMessageImages(message *model.Message, readBlob func(BlobRef) ([]byte, error)) error {
+	if message == nil {
+		return nil
+	}
+	for index := range message.ContentBlocks {
+		block := &message.ContentBlocks[index]
+		if block.ImageBlob == nil {
+			continue
+		}
+		if readBlob == nil {
+			return fmt.Errorf("image attachment %q requires a session blob reader", block.ImageBlob.Hash)
+		}
+		raw, err := readBlob(*block.ImageBlob)
+		if err != nil {
+			return err
+		}
+		mediaType := strings.TrimSpace(block.ImageBlob.MediaType)
+		if mediaType == "" {
+			return fmt.Errorf("image attachment %q is missing media type", block.ImageBlob.Hash)
+		}
+		block.ImageURL = model.ImageDataURL(mediaType, raw)
+		block.ImageBlob = nil
+	}
+	return nil
 }
 
 func shouldSynthesizeInterruptedToolResult(item SessionItem, message model.Message) bool {
@@ -1147,21 +1171,45 @@ func (s *V2Store) ReadBlob(ref BlobRef) ([]byte, error) {
 }
 
 func (s *V2Store) blobifySessionItemContent(item SessionItem) (SessionItem, error) {
-	if item.Message == nil || len(item.Message.Content) <= largeContentBlobBytes {
+	if item.Message == nil {
 		return item, nil
 	}
 
 	message := copyMessage(*item.Message)
-	raw := []byte(message.Content)
-	ref, err := s.WriteBlob(raw, "utf-8", "text/plain")
-	if err != nil {
-		return SessionItem{}, err
+	changed := false
+	if len(message.Content) > largeContentBlobBytes {
+		raw := []byte(message.Content)
+		ref, err := s.WriteBlob(raw, "utf-8", "text/plain")
+		if err != nil {
+			return SessionItem{}, err
+		}
+		message.Content = ""
+		item.Content = &StoredContent{
+			Blob:    &ref,
+			Preview: previewStringByBytes(string(raw), storedContentPreviewBytes),
+		}
+		changed = true
 	}
-	item.Message = &message
-	item.Message.Content = ""
-	item.Content = &StoredContent{
-		Blob:    &ref,
-		Preview: previewStringByBytes(string(raw), storedContentPreviewBytes),
+
+	for index := range message.ContentBlocks {
+		block := &message.ContentBlocks[index]
+		if block.Type != "input_image" || block.ImageBlob != nil || !strings.HasPrefix(strings.ToLower(strings.TrimSpace(block.ImageURL)), "data:") {
+			continue
+		}
+		mediaType, raw, err := model.ParseImageDataURL(block.ImageURL)
+		if err != nil {
+			return SessionItem{}, fmt.Errorf("persist image attachment: %w", err)
+		}
+		ref, err := s.WriteBlob(raw, "binary", mediaType)
+		if err != nil {
+			return SessionItem{}, err
+		}
+		block.ImageURL = ""
+		block.ImageBlob = &ref
+		changed = true
+	}
+	if changed {
+		item.Message = &message
 	}
 	return item, nil
 }
@@ -2145,6 +2193,12 @@ func corruptedSessionError(sessionID, format string, args ...any) error {
 
 func copyMessage(message model.Message) model.Message {
 	message.ContentBlocks = append([]model.InputContentBlock(nil), message.ContentBlocks...)
+	for index := range message.ContentBlocks {
+		if message.ContentBlocks[index].ImageBlob != nil {
+			ref := *message.ContentBlocks[index].ImageBlob
+			message.ContentBlocks[index].ImageBlob = &ref
+		}
+	}
 	message.ToolCalls = append([]model.ToolCall(nil), message.ToolCalls...)
 	message.ProviderItems = copyProviderItems(message.ProviderItems)
 	if message.ResponseState != nil {

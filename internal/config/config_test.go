@@ -901,6 +901,7 @@ models:
   default:
     id: model-default
     type: anthropic-messages
+    input: [text, image]
     context_window: 400000
     input_limit: 272000
     output_limit: 128000
@@ -921,6 +922,9 @@ models:
 	if profile.ContextWindow != 400000 || profile.InputLimit != 272000 || profile.OutputLimit != 128000 {
 		t.Fatalf("model limits = context %d input %d output %d, want 400000/272000/128000", profile.ContextWindow, profile.InputLimit, profile.OutputLimit)
 	}
+	if !sameStrings(profile.Input, []string{"text", "image"}) {
+		t.Fatalf("model input = %#v, want text/image", profile.Input)
+	}
 	if got := profile.Parameters["temperature"]; got != 0.2 {
 		t.Fatalf("temperature = %#v, want 0.2", got)
 	}
@@ -932,6 +936,9 @@ models:
 	}
 	if _, ok := profile.Parameters["type"]; ok {
 		t.Fatal("Parameters unexpectedly contains type")
+	}
+	if _, ok := profile.Parameters["input"]; ok {
+		t.Fatal("Parameters unexpectedly contains input")
 	}
 	if _, ok := profile.Parameters["context_window"]; ok {
 		t.Fatal("Parameters unexpectedly contains context_window")
@@ -962,6 +969,9 @@ models:
 	}
 	if resolved.Type != ProviderTypeAnthropicMessages {
 		t.Fatalf("resolved.Type = %q, want %q", resolved.Type, ProviderTypeAnthropicMessages)
+	}
+	if !sameStrings(resolved.Input, []string{"text", "image"}) {
+		t.Fatalf("resolved.Input = %#v, want text/image", resolved.Input)
 	}
 
 	resolved, err = cfg.ResolveModel("fake", "estimated")

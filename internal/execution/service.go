@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/rexzhao/simple-agent/internal/config"
 	"github.com/rexzhao/simple-agent/internal/contextwindow"
 	"github.com/rexzhao/simple-agent/internal/eventbus"
 	"github.com/rexzhao/simple-agent/internal/model"
@@ -134,6 +135,42 @@ type SessionMessageResult struct {
 	LastSeq int64  `json:"last_seq"`
 }
 
+type SessionMessageInput struct {
+	Content       string
+	ContentBlocks []model.InputContentBlock
+}
+
+// Message builds the model-facing user message. When attachments exist the
+// text becomes an input_text block because OpenAI Responses rejects a message
+// that sets both Content and ContentBlocks.
+func (input SessionMessageInput) Message() model.Message {
+	if len(input.ContentBlocks) == 0 {
+		return model.Message{Role: model.MessageRoleUser, Content: input.Content}
+	}
+	blocks := make([]model.InputContentBlock, 0, len(input.ContentBlocks)+1)
+	if input.Content != "" {
+		blocks = append(blocks, model.InputContentBlock{Type: "input_text", Text: input.Content})
+	}
+	for _, block := range input.ContentBlocks {
+		copied := block
+		if block.ImageBlob != nil {
+			ref := *block.ImageBlob
+			copied.ImageBlob = &ref
+		}
+		blocks = append(blocks, copied)
+	}
+	return model.Message{Role: model.MessageRoleUser, ContentBlocks: blocks}
+}
+
+func sessionMessageHasImage(input SessionMessageInput) bool {
+	for _, block := range input.ContentBlocks {
+		if block.Type == "input_image" || block.ImageURL != "" || block.ImageBlob != nil {
+			return true
+		}
+	}
+	return false
+}
+
 type SessionCompactResult struct {
 	Status        string `json:"status"`
 	CompactionID  string `json:"compaction_id"`
@@ -165,12 +202,13 @@ type SessionTurnCompactionPlanner interface {
 }
 
 type SessionTurnRequest struct {
-	Session      sessions.SessionV2
-	SessionStore *sessions.V2Store
-	TurnID       string
-	Content      string
-	Emit         func(model.Event)
-	Publisher    eventbus.Publisher
+	Session       sessions.SessionV2
+	SessionStore  *sessions.V2Store
+	TurnID        string
+	Content       string
+	ContentBlocks []model.InputContentBlock
+	Emit          func(model.Event)
+	Publisher     eventbus.Publisher
 	// ActivePromptDrain is an optional callback polled at safe checkpoints
 	// during the active turn. When set, AgentTurnRunner adapts it into the
 	// agent-loop active prompt drain so queued user messages are appended to the
@@ -232,6 +270,7 @@ var (
 	ErrTurnRunnerUnavailable = errors.New("turn runner is not configured")
 	ErrTurnFailed            = errors.New("turn failed")
 	ErrSessionRunSettled     = errors.New("session run is no longer accepting prompts")
+	ErrUnsupportedModelInput = errors.New("model does not support the requested input")
 )
 
 // turnFailure is the safe, stable payload for a turn.failed session stream
@@ -666,6 +705,12 @@ type SessionRun struct {
 // as committed, context.Canceled as cancelled, and any other error as failed.
 // Cancelling after the run has settled does not change its status.
 func (s *Service) StartSessionRun(ctx context.Context, id, content string, emit func(SessionStreamEvent)) *SessionRun {
+	return s.StartSessionRunWithInput(ctx, id, SessionMessageInput{Content: content}, emit)
+}
+
+// StartSessionRunWithInput starts a run whose user message can include image
+// input blocks as well as text. Text-only callers should use StartSessionRun.
+func (s *Service) StartSessionRunWithInput(ctx context.Context, id string, input SessionMessageInput, emit func(SessionStreamEvent)) *SessionRun {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -679,14 +724,14 @@ func (s *Service) StartSessionRun(ctx context.Context, id, content string, emit 
 	go func() {
 		defer cancel()
 		defer close(run.done)
-		result, err := s.runSessionMessage(runCtx, id, content, emit)
+		result, err := s.runSessionMessage(runCtx, id, input, emit)
 		if err == nil {
 			for {
 				receipt, ok := run.nextReceiptOrStop()
 				if !ok {
 					break
 				}
-				turnResult, turnErr := s.runSessionMessage(runCtx, id, receipt.event.Content, emit)
+				turnResult, turnErr := s.runSessionMessage(runCtx, id, SessionMessageInput{Content: receipt.event.Content}, emit)
 				if turnErr != nil {
 					effErr := run.effectiveError(turnErr, runCtx)
 					receipt.settle(turnResult, effErr)
@@ -860,15 +905,49 @@ func (r *PromptReceipt) settle(result SessionMessageResult, err error) {
 	close(r.done)
 }
 
-func (s *Service) runSessionMessage(ctx context.Context, id, content string, emit func(SessionStreamEvent)) (SessionMessageResult, error) {
+func (s *Service) ValidateSessionMessageInput(id string, input SessionMessageInput) error {
+	if s == nil || s.sessionStore == nil {
+		return fmt.Errorf("execution session store is not configured")
+	}
+	session, err := s.sessionStore.Load(id)
+	if err != nil {
+		return err
+	}
+	return s.validateSessionMessageInput(session, input)
+}
+
+func (s *Service) validateSessionMessageInput(session sessions.SessionV2, input SessionMessageInput) error {
+	if !sessionMessageHasImage(input) {
+		return nil
+	}
+	cfg, err := config.Load(s.ConfigPath())
+	if err != nil {
+		return err
+	}
+	resolved, err := cfg.ResolveModel(session.Provider, session.ModelProfile)
+	if err != nil {
+		return err
+	}
+	if !config.ModelSupportsInput(resolved.Input, "image") {
+		return fmt.Errorf(
+			"%w: model %q is not configured for image input",
+			ErrUnsupportedModelInput,
+			session.Provider+"/"+session.ModelProfile,
+		)
+	}
+	return nil
+}
+
+func (s *Service) runSessionMessage(ctx context.Context, id string, input SessionMessageInput, emit func(SessionStreamEvent)) (SessionMessageResult, error) {
+	content := input.Content
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	if s == nil || s.sessionStore == nil {
 		return SessionMessageResult{}, fmt.Errorf("execution session store is not configured")
 	}
-	if strings.TrimSpace(content) == "" {
-		return SessionMessageResult{}, fmt.Errorf("content must be a non-empty string")
+	if strings.TrimSpace(content) == "" && len(input.ContentBlocks) == 0 {
+		return SessionMessageResult{}, fmt.Errorf("message content or image attachment is required")
 	}
 	if s.turnRunner == nil {
 		return SessionMessageResult{}, ErrTurnRunnerUnavailable
@@ -902,10 +981,13 @@ func (s *Service) runSessionMessage(ctx context.Context, id, content string, emi
 		return SessionMessageResult{}, fmt.Errorf("archived session cannot run a turn")
 	}
 	session.ConfigPath = s.ConfigPath()
+	if err := s.validateSessionMessageInput(session, input); err != nil {
+		return SessionMessageResult{}, err
+	}
 	if strings.TrimSpace(session.CWD) == "" {
 		session.CWD = session.CreatedCWD
 	}
-	if err := s.requireIncrementalSessionTurn(ctx, session, content); err != nil {
+	if err := s.requireIncrementalSessionTurn(ctx, session, input); err != nil {
 		return SessionMessageResult{}, err
 	}
 
@@ -991,21 +1073,22 @@ func (s *Service) runSessionMessage(ctx context.Context, id, content string, emi
 		"turn_id": turnID,
 	}))
 
-	session, err = s.planAutoCompaction(ctx, bus, session, turnID, content)
+	session, err = s.planAutoCompaction(ctx, bus, session, turnID, input)
 	if err != nil {
 		markFailed(turnFailureCompaction)
 		return SessionMessageResult{}, err
 	}
-	if err := bus.Publish(eventbus.TurnInputReady{TurnID: turnID, Message: model.Message{Role: model.MessageRoleUser, Content: content}}); err != nil {
+	if err := bus.Publish(eventbus.TurnInputReady{TurnID: turnID, Message: input.Message()}); err != nil {
 		markFailed(turnFailureTurnInput)
 		return SessionMessageResult{}, fmt.Errorf("could not save turn input")
 	}
 
 	result, err := s.turnRunner.RunSessionTurn(ctx, SessionTurnRequest{
-		Session:      session,
-		SessionStore: s.sessionStore,
-		TurnID:       turnID,
-		Content:      content,
+		Session:       session,
+		SessionStore:  s.sessionStore,
+		TurnID:        turnID,
+		Content:       content,
+		ContentBlocks: copyInputContentBlocks(input.ContentBlocks),
 		Emit: func(event model.Event) {
 			if event != nil {
 				_ = bus.Publish(eventbus.ModelEvent{Event: event})
@@ -1077,15 +1160,16 @@ func turnFailureForRunnerError(err error) turnFailure {
 	return turnFailureRunner
 }
 
-func (s *Service) requireIncrementalSessionTurn(ctx context.Context, session sessions.SessionV2, content string) error {
+func (s *Service) requireIncrementalSessionTurn(ctx context.Context, session sessions.SessionV2, input SessionMessageInput) error {
 	supporter, ok := s.turnRunner.(SessionIncrementalSupporter)
 	if !ok {
 		return fmt.Errorf("turn runner does not support incremental persistence")
 	}
 	supported, err := supporter.SupportsIncrementalSessionTurn(ctx, SessionTurnRequest{
-		Session:      session,
-		SessionStore: s.sessionStore,
-		Content:      content,
+		Session:       session,
+		SessionStore:  s.sessionStore,
+		Content:       input.Content,
+		ContentBlocks: copyInputContentBlocks(input.ContentBlocks),
 	})
 	if err != nil {
 		return ErrTurnFailed
@@ -1096,16 +1180,17 @@ func (s *Service) requireIncrementalSessionTurn(ctx context.Context, session ses
 	return nil
 }
 
-func (s *Service) planAutoCompaction(ctx context.Context, bus eventbus.Publisher, session sessions.SessionV2, turnID, content string) (sessions.SessionV2, error) {
+func (s *Service) planAutoCompaction(ctx context.Context, bus eventbus.Publisher, session sessions.SessionV2, turnID string, input SessionMessageInput) (sessions.SessionV2, error) {
 	planner, ok := s.turnRunner.(SessionTurnCompactionPlanner)
 	if !ok {
 		return session, nil
 	}
 	result, err := planner.PlanSessionTurnCompaction(ctx, SessionTurnRequest{
-		Session:      session,
-		SessionStore: s.sessionStore,
-		TurnID:       turnID,
-		Content:      content,
+		Session:       session,
+		SessionStore:  s.sessionStore,
+		TurnID:        turnID,
+		Content:       input.Content,
+		ContentBlocks: copyInputContentBlocks(input.ContentBlocks),
 	})
 	if err != nil {
 		return sessions.SessionV2{}, ErrTurnFailed
@@ -1326,6 +1411,20 @@ func copyStrings(values []string) []string {
 	}
 	copied := make([]string, len(values))
 	copy(copied, values)
+	return copied
+}
+
+func copyInputContentBlocks(blocks []model.InputContentBlock) []model.InputContentBlock {
+	if blocks == nil {
+		return nil
+	}
+	copied := append([]model.InputContentBlock(nil), blocks...)
+	for index := range copied {
+		if copied[index].ImageBlob != nil {
+			ref := *copied[index].ImageBlob
+			copied[index].ImageBlob = &ref
+		}
+	}
 	return copied
 }
 

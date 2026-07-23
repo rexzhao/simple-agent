@@ -112,6 +112,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /api/sessions/{sessionID}/archive", s.handleArchiveSession)
 	s.mux.HandleFunc("DELETE /api/sessions/{sessionID}", s.handleRemoveSession)
 	s.mux.HandleFunc("GET /api/sessions/{sessionID}/items", s.handleSessionItems)
+	s.mux.HandleFunc("GET /api/sessions/{sessionID}/images/{hash}", s.handleSessionImage)
 	s.mux.HandleFunc("POST /api/sessions/{sessionID}/compact", s.handleCompactSession)
 	s.mux.HandleFunc("POST /api/sessions/{sessionID}/runs", s.handleStartRun)
 	s.mux.HandleFunc("GET /api/runs/active", s.handleListActiveRuns)
@@ -354,8 +355,17 @@ func validLoopbackHost(hostport string) bool {
 	return ip != nil && ip.IsLoopback()
 }
 
+const defaultJSONRequestBytes = 1 << 20
+
 func decodeJSON(w http.ResponseWriter, r *http.Request, target any) bool {
-	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+	return decodeJSONWithLimit(w, r, target, defaultJSONRequestBytes)
+}
+
+func decodeJSONWithLimit(w http.ResponseWriter, r *http.Request, target any, maxBytes int64) bool {
+	if maxBytes <= 0 {
+		maxBytes = defaultJSONRequestBytes
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, maxBytes)
 	decoder := json.NewDecoder(r.Body)
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(target); err != nil {

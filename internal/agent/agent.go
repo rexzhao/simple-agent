@@ -237,6 +237,12 @@ func copyMessages(messages []model.Message) []model.Message {
 	copied := append([]model.Message(nil), messages...)
 	for i := range copied {
 		copied[i].ContentBlocks = append([]model.InputContentBlock(nil), messages[i].ContentBlocks...)
+		for blockIndex := range copied[i].ContentBlocks {
+			if copied[i].ContentBlocks[blockIndex].ImageBlob != nil {
+				ref := *copied[i].ContentBlocks[blockIndex].ImageBlob
+				copied[i].ContentBlocks[blockIndex].ImageBlob = &ref
+			}
+		}
 		copied[i].ToolCalls = append([]model.ToolCall(nil), messages[i].ToolCalls...)
 		copied[i].ProviderItems = copyProviderItems(messages[i].ProviderItems)
 		if messages[i].ResponseState != nil {

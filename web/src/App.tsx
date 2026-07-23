@@ -3,7 +3,7 @@ import Markdown from 'react-markdown'
 import type { Components } from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { api, streamRun } from './api'
-import type { ActiveRun, ActiveRunDescriptor, Bootstrap, CodexAuthStatus, ItemsPage, Project, ProviderModelSettings, ProviderSettings, ProviderSettingsDocument, ProviderSettingsInput, RunEvent, RunStep, Session, SessionItem, SessionModelOption, ToolActivity } from './types'
+import type { ActiveRun, ActiveRunDescriptor, Bootstrap, CodexAuthStatus, ImageAttachmentInput, ItemsPage, Project, ProviderModelSettings, ProviderSettings, ProviderSettingsDocument, ProviderSettingsInput, RunEvent, RunStep, Session, SessionImageAttachment, SessionItem, SessionModelOption, ToolActivity } from './types'
 
 interface SessionCreatorState {
   projectID: string
@@ -25,14 +25,26 @@ interface PastedTextAttachment {
   content: string
 }
 
+interface PastedImageAttachment {
+  id: number
+  dataURL: string
+  mediaType: string
+  sizeBytes: number
+}
+
 interface ComposerDraft {
   content: string
   pastedTexts: PastedTextAttachment[]
+  pastedImages: PastedImageAttachment[]
 }
 
-const emptyComposerDraft: ComposerDraft = { content: '', pastedTexts: [] }
+const emptyComposerDraft: ComposerDraft = { content: '', pastedTexts: [], pastedImages: [] }
 const longPasteLineLimit = 10
 const longPasteCharacterLimit = 1000
+const maxPastedImageAttachments = 5
+const maxPastedImageBytes = 4 * 1024 * 1024
+const maxPastedImageTotalBytes = 12 * 1024 * 1024
+const supportedPastedImageMediaTypes = new Set(['image/png', 'image/jpeg', 'image/gif', 'image/webp'])
 const autoScrollThresholdPX = 160
 
 function App() {
@@ -74,6 +86,20 @@ function App() {
       const draft = current[sessionID]
       if (!draft || !draft.pastedTexts.some((pastedText) => pastedText.id === pastedTextID)) return current
       return { ...current, [sessionID]: { ...draft, pastedTexts: draft.pastedTexts.filter((pastedText) => pastedText.id !== pastedTextID) } }
+    })
+  }, [])
+  const addPastedImage = useCallback((sessionID: string, pastedImage: PastedImageAttachment) => {
+    setDraftsBySession((current) => {
+      const draft = current[sessionID] ?? emptyComposerDraft
+      if (draft.pastedImages.length >= maxPastedImageAttachments) return current
+      return { ...current, [sessionID]: { ...draft, pastedImages: [...draft.pastedImages, pastedImage] } }
+    })
+  }, [])
+  const removePastedImage = useCallback((sessionID: string, pastedImageID: number) => {
+    setDraftsBySession((current) => {
+      const draft = current[sessionID]
+      if (!draft || !draft.pastedImages.some((pastedImage) => pastedImage.id === pastedImageID)) return current
+      return { ...current, [sessionID]: { ...draft, pastedImages: draft.pastedImages.filter((pastedImage) => pastedImage.id !== pastedImageID) } }
     })
   }, [])
   const clearDraft = useCallback((sessionID: string) => {
@@ -414,15 +440,17 @@ function App() {
     }
   }, [addActiveRun, handleRunEvent, recoveredRuns, refreshSession, updateActiveRun])
 
-  const sendMessage = async (content: string) => {
-    if (!selectedSessionID || activeRunsRef.current[selectedSessionID] || !content.trim()) return
+  const sendMessage = async (content: string, images: PastedImageAttachment[]) => {
+    if (!selectedSessionID || activeRunsRef.current[selectedSessionID] || (!content.trim() && images.length === 0)) return
     const sessionID = selectedSessionID
+    const imageInputs: ImageAttachmentInput[] = images.map((image) => ({ data_url: image.dataURL, detail: 'auto' }))
     try {
-      const started = await api.startRun(sessionID, content)
+      const started = await api.startRun(sessionID, content, imageInputs)
       addActiveRun({
         id: started.run_id,
         sessionID,
         userText: content,
+        userImages: imageInputs,
         assistantText: '',
         steps: [],
         agentIteration: 0,
@@ -497,11 +525,13 @@ function App() {
 			onDraftChange={(content) => updateDraft(selectedSessionID, content)}
 			onPastedTextAdd={(pastedText) => addPastedText(selectedSessionID, pastedText)}
 			onPastedTextRemove={(pastedTextID) => removePastedText(selectedSessionID, pastedTextID)}
+			onPastedImageAdd={(pastedImage) => addPastedImage(selectedSessionID, pastedImage)}
+			onPastedImageRemove={(pastedImageID) => removePastedImage(selectedSessionID, pastedImageID)}
 			onDraftClear={() => clearDraft(selectedSessionID)}
 			otherSessionsRunning={otherSessionsRunning}
 					recentStepsByTurn={recentStepsByTurn}
             onLoadOlder={() => void loadOlder()}
-            onSend={(content) => void sendMessage(content)}
+            onSend={(content, images) => void sendMessage(content, images)}
             onCancel={() => void cancelRun()}
             onCompact={() => void compactSession()}
           />
@@ -646,11 +676,13 @@ function Conversation(props: {
 	onDraftChange: (content: string) => void
 	onPastedTextAdd: (pastedText: PastedTextAttachment) => void
 	onPastedTextRemove: (pastedTextID: number) => void
+	onPastedImageAdd: (pastedImage: PastedImageAttachment) => void
+	onPastedImageRemove: (pastedImageID: number) => void
 	onDraftClear: () => void
 	otherSessionsRunning: boolean
 	recentStepsByTurn: Record<string, RunStep[]>
   onLoadOlder: () => void
-  onSend: (content: string) => void
+  onSend: (content: string, images: PastedImageAttachment[]) => void
   onCancel: () => void
   onCompact: () => void
 }) {
@@ -695,7 +727,7 @@ function Conversation(props: {
         {props.page?.has_more_before && <button className="load-older" onClick={props.onLoadOlder}>加载更早消息</button>}
         {!props.page && <MessageSkeleton />}
 				{buildConversationEntries(visibleItems, props.detail?.id ?? '', props.recentStepsByTurn).map((entry) => entry.kind === 'message'
-					? <Message key={entry.item.id} item={entry.item} />
+					? <Message key={entry.item.id} item={entry.item} sessionID={props.detail?.id ?? ''} />
 					: <HistoricalProcess key={entry.id} entry={entry} />)}
         {props.activeRun && <ActiveRunView run={props.activeRun} />}
 		{props.page && visibleItems.length === 0 && !props.activeRun && (
@@ -708,6 +740,8 @@ function Conversation(props: {
 		onContentChange={props.onDraftChange}
 		onPastedTextAdd={props.onPastedTextAdd}
 		onPastedTextRemove={props.onPastedTextRemove}
+		onPastedImageAdd={props.onPastedImageAdd}
+		onPastedImageRemove={props.onPastedImageRemove}
 		onDraftClear={props.onDraftClear}
 		running={Boolean(props.activeRun)}
 		blocked={false}
@@ -763,11 +797,12 @@ function ContextUsage(props: { context: Session['context']; activeInputTokens?: 
 	)
 }
 
-function Message({ item }: { item: SessionItem }) {
+function Message({ item, sessionID }: { item: SessionItem; sessionID: string }) {
   const role = item.message?.role
   const text = item.message?.content?.inline || item.message?.content?.preview || ''
+  const images = item.message?.images ?? []
 	const [copyStatus, setCopyStatus] = useState<'idle' | 'copied' | 'error'>('idle')
-  if (!text) return null
+  if (!text && images.length === 0) return null
 	const copyMessage = async () => {
 		try {
 			await copyText(text)
@@ -783,7 +818,9 @@ function Message({ item }: { item: SessionItem }) {
       <div className="message-avatar">{role === 'user' ? '你' : <LogoIcon />}</div>
       <div className="message-content">
         <div className="message-meta"><strong>{role === 'user' ? '你' : 'SAI'}</strong><time>{formatTime(item.created_at)}</time></div>
-        {role === 'user' ? <div className="message-text">{text}</div> : <MarkdownMessage text={text} />}
+        {role === 'user' && text && <div className="message-text">{text}</div>}
+        {role === 'user' && images.length > 0 && <StoredImageAttachments sessionID={sessionID} images={images} />}
+        {role !== 'user' && text && <MarkdownMessage text={text} />}
 		{role === 'assistant' && (
 			<div className="message-tools" aria-label="消息操作">
 				<button className="message-tool-button" onClick={() => void copyMessage()} title="复制完整输出">
@@ -796,13 +833,51 @@ function Message({ item }: { item: SessionItem }) {
   )
 }
 
+function StoredImageAttachments(props: { sessionID: string; images: SessionImageAttachment[] }) {
+  return (
+    <div className="message-image-grid" aria-label="已附加图片">
+      {props.images.map((image) => <StoredImageAttachment key={image.hash} sessionID={props.sessionID} image={image} />)}
+    </div>
+  )
+}
+
+function StoredImageAttachment(props: { sessionID: string; image: SessionImageAttachment }) {
+  const [dataURL, setDataURL] = useState('')
+  const [failed, setFailed] = useState(false)
+
+  useEffect(() => {
+    let active = true
+    void api.sessionImage(props.sessionID, props.image.hash)
+      .then(blobAsDataURL)
+      .then((url) => {
+        if (active) setDataURL(url)
+      })
+      .catch(() => {
+        if (active) setFailed(true)
+      })
+    return () => { active = false }
+  }, [props.image.hash, props.sessionID])
+
+  if (failed) return <div className="message-image-unavailable">图片不可用</div>
+  if (!dataURL) return <div className="message-image-loading">加载图片…</div>
+  return <img className="message-image" src={dataURL} alt={`已附加图片（${props.image.media_type}）`} />
+}
+
 function ActiveRunView({ run }: { run: ActiveRun }) {
   return (
     <>
-      {run.userText && (
+      {(run.userText || (run.userImages?.length ?? 0) > 0) && (
         <article className="message user transient">
           <div className="message-avatar">你</div>
-          <div className="message-content"><div className="message-meta"><strong>你</strong><span>刚刚</span></div><div className="message-text">{run.userText}</div></div>
+          <div className="message-content">
+            <div className="message-meta"><strong>你</strong><span>刚刚</span></div>
+            {run.userText && <div className="message-text">{run.userText}</div>}
+            {(run.userImages?.length ?? 0) > 0 && (
+              <div className="message-image-grid" aria-label="已附加图片">
+                {run.userImages?.map((image, index) => <img className="message-image" src={image.data_url} alt={`待发送图片 #${index + 1}`} key={`${image.data_url}-${index}`} />)}
+              </div>
+            )}
+          </div>
         </article>
       )}
       <article className="message assistant transient">
@@ -1023,14 +1098,18 @@ function Composer(props: {
   onContentChange: (content: string) => void
   onPastedTextAdd: (pastedText: PastedTextAttachment) => void
   onPastedTextRemove: (pastedTextID: number) => void
+  onPastedImageAdd: (pastedImage: PastedImageAttachment) => void
+  onPastedImageRemove: (pastedImageID: number) => void
   onDraftClear: () => void
   running: boolean
   blocked: boolean
-  onSend: (content: string) => void
+  onSend: (content: string, images: PastedImageAttachment[]) => void
   onCancel: () => void
 }) {
   const textareaRef = useRef<HTMLTextAreaElement>(null)
   const nextPastedTextID = useRef(1)
+  const nextPastedImageID = useRef(1)
+  const [imageError, setImageError] = useState('')
   const resizeTextarea = useCallback(() => {
     const textarea = textareaRef.current
     if (!textarea) return
@@ -1053,9 +1132,50 @@ function Composer(props: {
       .filter((part) => part.trim())
       .join('\n\n')
       .trim()
-    if (!content) return
-    props.onSend(content)
+    if (!content && props.draft.pastedImages.length === 0) return
+    props.onSend(content, props.draft.pastedImages)
     props.onDraftClear()
+    setImageError('')
+  }
+
+  const addClipboardImages = async (files: File[]) => {
+    setImageError('')
+    if (props.draft.pastedImages.length+files.length > maxPastedImageAttachments) {
+      setImageError(`最多可附加 ${maxPastedImageAttachments} 张图片`)
+      return
+    }
+    let totalBytes = props.draft.pastedImages.reduce((total, image) => total + image.sizeBytes, 0)
+    for (const file of files) {
+      if (!supportedPastedImageMediaTypes.has(file.type)) {
+        setImageError(`不支持 ${file.type || '未知'} 图片格式`)
+        return
+      }
+      if (file.size === 0) {
+        setImageError('不能附加空图片')
+        return
+      }
+      if (file.size > maxPastedImageBytes) {
+        setImageError(`单张图片不能超过 ${formatBytes(maxPastedImageBytes)}`)
+        return
+      }
+      totalBytes += file.size
+      if (totalBytes > maxPastedImageTotalBytes) {
+        setImageError(`图片总大小不能超过 ${formatBytes(maxPastedImageTotalBytes)}`)
+        return
+      }
+    }
+    try {
+      for (const file of files) {
+        props.onPastedImageAdd({
+          id: nextPastedImageID.current++,
+          dataURL: await blobAsDataURL(file),
+          mediaType: file.type,
+          sizeBytes: file.size,
+        })
+      }
+    } catch (reason) {
+      setImageError(errorMessage(reason))
+    }
   }
 
   const placeholder = props.running
@@ -1089,6 +1209,25 @@ function Composer(props: {
           ))}
         </div>
       )}
+      {props.draft.pastedImages.length > 0 && (
+        <div className="pasted-image-attachments" aria-label="待发送的图片">
+          {props.draft.pastedImages.map((image, index) => (
+            <div className="pasted-image-attachment" key={image.id}>
+              <img src={image.dataURL} alt={`待发送图片 #${index + 1}`} />
+              <span><strong>图片 #{index + 1}</strong><small>{image.mediaType} · {formatBytes(image.sizeBytes)}</small></span>
+              <button
+                type="button"
+                className="pasted-text-attachment-remove"
+                disabled={props.running || props.blocked}
+                onClick={() => props.onPastedImageRemove(image.id)}
+                aria-label={`移除图片 #${index + 1}`}
+                title="移除"
+              >×</button>
+            </div>
+          ))}
+        </div>
+      )}
+      {imageError && <div className="pasted-image-error" role="alert">{imageError}</div>}
       <div className="composer">
         <textarea
           ref={textareaRef}
@@ -1098,6 +1237,15 @@ function Composer(props: {
 		  placeholder={placeholder}
           onChange={(event) => props.onContentChange(event.target.value)}
           onPaste={(event) => {
+            const imageFiles = Array.from(event.clipboardData.items)
+              .filter((item) => item.kind === 'file' && item.type.startsWith('image/'))
+              .map((item) => item.getAsFile())
+              .filter((file): file is File => file !== null)
+            if (imageFiles.length > 0) {
+              event.preventDefault()
+              void addClipboardImages(imageFiles)
+              return
+            }
             const pastedText = event.clipboardData.getData('text/plain').replace(/\r\n?/g, '\n')
             if (!isLongPastedText(pastedText)) return
             event.preventDefault()
@@ -1113,10 +1261,10 @@ function Composer(props: {
         {props.running ? (
           <button className="stop-button" onClick={props.onCancel}><StopIcon /> 停止</button>
         ) : (
-		  <button className="send-button" disabled={(!props.draft.content.trim() && props.draft.pastedTexts.length === 0) || props.blocked} onClick={submit} aria-label="发送"><SendIcon /></button>
+		  <button className="send-button" disabled={(!props.draft.content.trim() && props.draft.pastedTexts.length === 0 && props.draft.pastedImages.length === 0) || props.blocked} onClick={submit} aria-label="发送"><SendIcon /></button>
         )}
       </div>
-      <div className="composer-hint"><span>{props.draft.pastedTexts.length > 0 ? '粘贴文本会先发送，补充说明随后附加' : 'Enter 发送 · Shift+Enter 换行'}</span><span>本地运行</span></div>
+      <div className="composer-hint"><span>{props.draft.pastedImages.length > 0 ? '图片将与消息一起发送' : props.draft.pastedTexts.length > 0 ? '粘贴文本会先发送，补充说明随后附加' : 'Enter 发送 · Shift+Enter 换行 · 可粘贴图片'}</span><span>本地运行</span></div>
     </div>
   )
 }
@@ -1202,6 +1350,7 @@ interface EditableProviderModel {
   profile: string
   id: string
   type: string
+  supportsImages: boolean
   contextWindow: string
   inputLimit: string
   outputLimit: string
@@ -1398,6 +1547,7 @@ function ProviderManagerDialog(props: {
                         <label>配置名<input value={model.profile} onChange={(event) => updateModel(index, { profile: event.target.value })} placeholder="gpt-5.5" /></label>
                         <label>模型 ID<input value={model.id} onChange={(event) => updateModel(index, { id: event.target.value })} placeholder="也可以手动输入" /></label>
                         <label>API 类型<select value={model.type || 'openai-chat'} onChange={(event) => updateModel(index, { type: event.target.value })}><option value="openai-chat">OpenAI Chat</option><option value="openai-responses">OpenAI Responses</option><option value="openai-codex">OpenAI Codex</option><option value="anthropic-messages">Anthropic Messages</option></select></label>
+                        <label className="checkbox-field"><input type="checkbox" checked={model.supportsImages} onChange={(event) => updateModel(index, { supportsImages: event.target.checked })} /> 支持图片输入</label>
                         <label>Context Window<input type="number" min="0" value={model.contextWindow} onChange={(event) => updateModel(index, { contextWindow: event.target.value })} placeholder="400000" /></label>
                         <label>Input Limit<input type="number" min="0" value={model.inputLimit} onChange={(event) => updateModel(index, { inputLimit: event.target.value })} placeholder="272000" /></label>
                         <label>Output Limit<input type="number" min="0" value={model.outputLimit} onChange={(event) => updateModel(index, { outputLimit: event.target.value })} placeholder="128000" /></label>
@@ -1447,6 +1597,7 @@ function editableProviderModel(model: ProviderModelSettings): EditableProviderMo
     profile: model.profile,
     id: model.id,
     type: model.type || 'openai-chat',
+    supportsImages: model.input?.includes('image') ?? false,
     contextWindow: model.context_window ? String(model.context_window) : '',
     inputLimit: model.input_limit ? String(model.input_limit) : '',
     outputLimit: model.output_limit ? String(model.output_limit) : '',
@@ -1458,7 +1609,7 @@ function editableProviderModel(model: ProviderModelSettings): EditableProviderMo
 }
 
 function emptyProviderModel(): EditableProviderModel {
-  return { profile: '', id: '', type: 'openai-chat', contextWindow: '', inputLimit: '', outputLimit: '', parametersJSON: '{}', reasoningParameter: '', reasoningDefault: '', reasoningLevelsJSON: '{}' }
+  return { profile: '', id: '', type: 'openai-chat', supportsImages: false, contextWindow: '', inputLimit: '', outputLimit: '', parametersJSON: '{}', reasoningParameter: '', reasoningDefault: '', reasoningLevelsJSON: '{}' }
 }
 
 function providerInput(draft: ProviderDraft): ProviderSettingsInput {
@@ -1480,6 +1631,7 @@ function providerInput(draft: ProviderDraft): ProviderSettingsInput {
         profile: model.profile.trim(),
         id: model.id.trim(),
         type: model.type,
+        input: model.supportsImages ? ['text', 'image'] : ['text'],
         context_window: model.contextWindow ? Number(model.contextWindow) : 0,
         input_limit: model.inputLimit ? Number(model.inputLimit) : 0,
         output_limit: model.outputLimit ? Number(model.outputLimit) : 0,
@@ -1724,6 +1876,20 @@ function toolStatus(status: ToolActivity['status']): string {
 
 function errorMessage(reason: unknown): string {
   return reason instanceof Error ? reason.message : '发生未知错误'
+}
+
+function blobAsDataURL(blob: Blob): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader()
+    reader.onerror = () => reject(reader.error ?? new Error('could not read image attachment'))
+    reader.onload = () => typeof reader.result === 'string' ? resolve(reader.result) : reject(new Error('could not read image attachment'))
+    reader.readAsDataURL(blob)
+  })
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes >= 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1).replace(/\.0$/, '')} MiB`
+  return `${Math.max(0, Math.ceil(bytes / 1024))} KiB`
 }
 
 async function copyText(text: string): Promise<void> {

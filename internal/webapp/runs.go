@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/rexzhao/simple-agent/internal/execution"
+	"github.com/rexzhao/simple-agent/internal/model"
 )
 
 const (
@@ -24,6 +25,11 @@ const (
 	defaultMaxRunEventBytes  = 1 << 20 // 1 MiB per active run replay buffer.
 	defaultTerminalRunLimit  = 64
 	defaultTerminalRunTTL    = 10 * time.Minute
+
+	maxRunRequestBytes     = 17 * 1024 * 1024
+	maxRunImageAttachments = 5
+	maxRunImageBytes       = 4 * 1024 * 1024
+	maxRunImageTotalBytes  = 12 * 1024 * 1024
 )
 
 var (
@@ -149,12 +155,16 @@ func newManagedRun(id, sessionID string, options runRegistryOptions) *managedRun
 }
 
 func (r *runRegistry) start(sessionID, content string) (*managedRun, error) {
+	return r.startWithInput(sessionID, execution.SessionMessageInput{Content: content})
+}
+
+func (r *runRegistry) startWithInput(sessionID string, input execution.SessionMessageInput) (*managedRun, error) {
 	sessionID = strings.TrimSpace(sessionID)
 	if sessionID == "" {
 		return nil, fmt.Errorf("session id is required")
 	}
-	if strings.TrimSpace(content) == "" {
-		return nil, fmt.Errorf("message content must be a non-empty string")
+	if strings.TrimSpace(input.Content) == "" && len(input.ContentBlocks) == 0 {
+		return nil, fmt.Errorf("message content or image attachment is required")
 	}
 	id, err := randomID("run-")
 	if err != nil {
@@ -178,7 +188,7 @@ func (r *runRegistry) start(sessionID, content string) (*managedRun, error) {
 		r.mu.Unlock()
 		return nil, ErrRunRegistryCapacity
 	}
-	managed.run = r.service.StartSessionRun(r.ctx, sessionID, content, managed.append)
+	managed.run = r.service.StartSessionRunWithInput(r.ctx, sessionID, input, managed.append)
 	r.byID[id] = managed
 	r.activeBySession[sessionID] = managed
 	r.mu.Unlock()
@@ -475,18 +485,85 @@ func encodeRunEvent(event execution.SessionStreamEvent) []byte {
 	return []byte(`{"type":"run.event_encoding_failed"}`)
 }
 
-func (s *Server) handleStartRun(w http.ResponseWriter, r *http.Request) {
-	var body struct {
-		Content string `json:"content"`
+type startRunRequest struct {
+	Content string                    `json:"content"`
+	Images  []startRunImageAttachment `json:"images,omitempty"`
+}
+
+type startRunImageAttachment struct {
+	DataURL string `json:"data_url"`
+	Detail  string `json:"detail,omitempty"`
+}
+
+func (request startRunRequest) messageInput() (execution.SessionMessageInput, error) {
+	if len(request.Images) > maxRunImageAttachments {
+		return execution.SessionMessageInput{}, fmt.Errorf("at most %d images may be attached", maxRunImageAttachments)
 	}
-	if !decodeJSON(w, r, &body) {
+
+	blocks := make([]model.InputContentBlock, 0, len(request.Images))
+	totalBytes := 0
+	for index, attachment := range request.Images {
+		mediaType, raw, err := model.ParseImageDataURL(attachment.DataURL)
+		if err != nil {
+			return execution.SessionMessageInput{}, fmt.Errorf("image %d is not a valid base64 data URL", index+1)
+		}
+		normalizedMediaType, supported := model.NormalizeImageMediaType(mediaType)
+		if !supported {
+			return execution.SessionMessageInput{}, fmt.Errorf("image %d has unsupported media type %q", index+1, mediaType)
+		}
+		if len(raw) == 0 {
+			return execution.SessionMessageInput{}, fmt.Errorf("image %d is empty", index+1)
+		}
+		if !model.ImageBytesMatchMediaType(normalizedMediaType, raw) {
+			return execution.SessionMessageInput{}, fmt.Errorf("image %d data does not match media type %q", index+1, normalizedMediaType)
+		}
+		if len(raw) > maxRunImageBytes {
+			return execution.SessionMessageInput{}, fmt.Errorf("image %d exceeds the %d MiB limit", index+1, maxRunImageBytes/(1024*1024))
+		}
+		totalBytes += len(raw)
+		if totalBytes > maxRunImageTotalBytes {
+			return execution.SessionMessageInput{}, fmt.Errorf("attached images exceed the %d MiB total limit", maxRunImageTotalBytes/(1024*1024))
+		}
+
+		detail := strings.ToLower(strings.TrimSpace(attachment.Detail))
+		switch detail {
+		case "", "auto":
+			detail = "auto"
+		case "low", "high":
+		default:
+			return execution.SessionMessageInput{}, fmt.Errorf("image %d has unsupported detail %q", index+1, attachment.Detail)
+		}
+		blocks = append(blocks, model.InputContentBlock{
+			Type:     "input_image",
+			ImageURL: model.ImageDataURL(normalizedMediaType, raw),
+			Detail:   detail,
+		})
+	}
+	if strings.TrimSpace(request.Content) == "" && len(blocks) == 0 {
+		return execution.SessionMessageInput{}, fmt.Errorf("message content or image attachment is required")
+	}
+	return execution.SessionMessageInput{Content: request.Content, ContentBlocks: blocks}, nil
+}
+
+func (s *Server) handleStartRun(w http.ResponseWriter, r *http.Request) {
+	var body startRunRequest
+	if !decodeJSONWithLimit(w, r, &body, maxRunRequestBytes) {
 		return
 	}
-	if _, err := s.service.GetSession(r.PathValue("sessionID")); err != nil {
+	input, err := body.messageInput()
+	if err != nil {
+		writeAPIError(w, http.StatusBadRequest, "invalid_image_attachment", err.Error())
+		return
+	}
+	if err := s.service.ValidateSessionMessageInput(r.PathValue("sessionID"), input); err != nil {
+		if errors.Is(err, execution.ErrUnsupportedModelInput) {
+			writeAPIError(w, http.StatusBadRequest, "unsupported_model_input", err.Error())
+			return
+		}
 		writeServiceError(w, err)
 		return
 	}
-	managed, err := s.runs.start(r.PathValue("sessionID"), body.Content)
+	managed, err := s.runs.startWithInput(r.PathValue("sessionID"), input)
 	if err != nil {
 		if errors.Is(err, ErrRunRegistryCapacity) {
 			writeAPIError(w, http.StatusTooManyRequests, "run_capacity", "too many runs are currently active")

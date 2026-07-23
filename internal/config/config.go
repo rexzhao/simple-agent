@@ -90,6 +90,7 @@ type ProviderConfig struct {
 type ModelProfile struct {
 	ID              string          `json:"id" yaml:"id"`
 	Type            string          `json:"type,omitempty" yaml:"type,omitempty"`
+	Input           []string        `json:"input,omitempty" yaml:"input,omitempty"`
 	ContextWindow   int             `json:"context_window,omitempty" yaml:"context_window,omitempty"`
 	InputLimit      int             `json:"input_limit,omitempty" yaml:"input_limit,omitempty"`
 	OutputLimit     int             `json:"output_limit,omitempty" yaml:"output_limit,omitempty"`
@@ -115,6 +116,7 @@ type ResolvedModel struct {
 	Profile             string
 	ModelID             string
 	Type                string
+	Input               []string
 	Parameters          map[string]any
 	ContextWindow       int
 	ContextWindowSource string
@@ -260,6 +262,7 @@ func (c *Config) ResolveModel(providerName, modelName string) (ResolvedModel, er
 		Profile:             modelName,
 		ModelID:             profile.ID,
 		Type:                modelType,
+		Input:               append([]string(nil), profile.Input...),
 		Parameters:          copyParameters(profile.Parameters),
 		ContextWindow:       window.Tokens,
 		ContextWindowSource: string(window.Source),
@@ -349,6 +352,7 @@ func copyModels(models map[string]ModelProfile) map[string]ModelProfile {
 
 	copied := make(map[string]ModelProfile, len(models))
 	for name, profile := range models {
+		profile.Input = append([]string(nil), profile.Input...)
 		profile.Parameters = copyParameters(profile.Parameters)
 		profile.ReasoningConfig = copyReasoningConfig(profile.ReasoningConfig)
 		copied[name] = profile
@@ -397,6 +401,14 @@ func (m *ModelProfile) UnmarshalYAML(value *yaml.Node) error {
 	m.ReasoningConfig = structured.ReasoningConfig
 	delete(fields, "reasoning_config")
 
+	if rawInput, ok := fields["input"]; ok {
+		input, err := parseModelInput(rawInput)
+		if err != nil {
+			return err
+		}
+		m.Input = input
+		delete(fields, "input")
+	}
 	if rawContextWindow, ok := fields["context_window"]; ok {
 		contextWindow, err := parseContextWindow(rawContextWindow)
 		if err != nil {
@@ -456,6 +468,54 @@ func (m *ModelProfile) UnmarshalYAML(value *yaml.Node) error {
 
 func parseContextWindow(value any) (int, error) {
 	return parseModelTokenLimit("context_window", value)
+}
+
+func parseModelInput(value any) ([]string, error) {
+	values, ok := value.([]any)
+	if !ok || len(values) == 0 {
+		return nil, fmt.Errorf("model profile input must be a non-empty list")
+	}
+	input := make([]string, 0, len(values))
+	for _, raw := range values {
+		modality, ok := raw.(string)
+		if !ok {
+			return nil, fmt.Errorf("model profile input values must be strings")
+		}
+		input = append(input, modality)
+	}
+	return NormalizeModelInput(input)
+}
+
+func NormalizeModelInput(input []string) ([]string, error) {
+	if len(input) == 0 {
+		return nil, fmt.Errorf("model profile input must be a non-empty list")
+	}
+	normalized := make([]string, 0, len(input))
+	seen := make(map[string]struct{}, len(input))
+	for _, raw := range input {
+		modality := strings.ToLower(strings.TrimSpace(raw))
+		switch modality {
+		case "text", "image":
+		default:
+			return nil, fmt.Errorf("model profile input contains unsupported modality %q", modality)
+		}
+		if _, duplicate := seen[modality]; duplicate {
+			return nil, fmt.Errorf("model profile input contains duplicate modality %q", modality)
+		}
+		seen[modality] = struct{}{}
+		normalized = append(normalized, modality)
+	}
+	return normalized, nil
+}
+
+func ModelSupportsInput(input []string, modality string) bool {
+	modality = strings.ToLower(strings.TrimSpace(modality))
+	for _, configured := range input {
+		if strings.EqualFold(strings.TrimSpace(configured), modality) {
+			return true
+		}
+	}
+	return false
 }
 
 func parseModelTokenLimit(name string, value any) (int, error) {

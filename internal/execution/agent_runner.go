@@ -65,6 +65,7 @@ func (r AgentTurnRunner) RunSessionTurn(ctx context.Context, request SessionTurn
 	}()
 
 	_, runErr := runtime.runSessionTurn(ctx, request.Content, sessionTurnRunOptions{
+		contentBlocks:     copyInputContentBlocks(request.ContentBlocks),
 		emit:              request.Emit,
 		publisher:         request.Publisher,
 		turnID:            request.TurnID,
@@ -385,6 +386,7 @@ func (r *agentRunnerRuntime) refreshSessionRuntimeMetadata(session sessions.Sess
 }
 
 type sessionTurnRunOptions struct {
+	contentBlocks     []model.InputContentBlock
 	emit              func(model.Event)
 	publisher         eventbus.Publisher
 	turnID            string
@@ -429,10 +431,10 @@ func (r *agentRunnerRuntime) runSessionTurn(ctx context.Context, prompt string, 
 	if err != nil {
 		return nil, err
 	}
-	requestMessages := append(copyMessageSlice(messages), model.Message{
-		Role:    model.MessageRoleUser,
-		Content: prompt,
-	})
+	requestMessages := append(copyMessageSlice(messages), SessionMessageInput{
+		Content:       prompt,
+		ContentBlocks: copyInputContentBlocks(options.contentBlocks),
+	}.Message())
 	request := model.Request{
 		Model:      r.modelID,
 		Messages:   requestMessages,
@@ -1581,6 +1583,12 @@ func copyMessageSlice(messages []model.Message) []model.Message {
 	copied := append([]model.Message(nil), messages...)
 	for i := range copied {
 		copied[i].ContentBlocks = append([]model.InputContentBlock(nil), messages[i].ContentBlocks...)
+		for blockIndex := range copied[i].ContentBlocks {
+			if copied[i].ContentBlocks[blockIndex].ImageBlob != nil {
+				ref := *copied[i].ContentBlocks[blockIndex].ImageBlob
+				copied[i].ContentBlocks[blockIndex].ImageBlob = &ref
+			}
+		}
 		copied[i].ToolCalls = append([]model.ToolCall(nil), messages[i].ToolCalls...)
 		copied[i].ProviderItems = copyProviderItemSlice(messages[i].ProviderItems)
 		if messages[i].ResponseState != nil {
