@@ -1023,6 +1023,45 @@ func TestV2StoreUpdateItemFromStateAdvancesCachedState(t *testing.T) {
 	}
 }
 
+func TestV2StorePreservesResponsesStateForManualReplay(t *testing.T) {
+	store := NewV2Store(filepath.Join(t.TempDir(), "sessions"))
+	wantState := model.ResponseState{
+		ID: "resp_1", Origin: "https://api.openai.com/v1", Model: "gpt-5.6", Stored: false,
+		MessageID: "msg_1", MessagePhase: "final_answer",
+		ReasoningItems: []json.RawMessage{json.RawMessage(`{"type":"reasoning","id":"rs_1","encrypted_content":"cipher"}`)},
+	}
+	if _, err := store.AppendItem("session-1", SessionItem{
+		ID:         "assistant-1",
+		Kind:       ItemKindMessage,
+		Visibility: ItemVisibilityVisible,
+		Audience:   ItemAudienceModel,
+		Status:     ItemStatusCompleted,
+		Message: &model.Message{
+			Role: model.MessageRoleAssistant, Content: "answer", ResponseState: &wantState,
+		},
+	}); err != nil {
+		t.Fatalf("AppendItem() error = %v", err)
+	}
+	if _, err := store.ReplaceActiveHistory("session-1", []string{"assistant-1"}); err != nil {
+		t.Fatalf("ReplaceActiveHistory() error = %v", err)
+	}
+
+	replayed, err := store.Replay("session-1")
+	if err != nil {
+		t.Fatalf("Replay() error = %v", err)
+	}
+	messages, err := store.MaterializeActiveHistory(replayed)
+	if err != nil {
+		t.Fatalf("MaterializeActiveHistory() error = %v", err)
+	}
+	if len(messages) != 1 || messages[0].ResponseState == nil {
+		t.Fatalf("messages = %#v, want one response state", messages)
+	}
+	if !reflect.DeepEqual(*messages[0].ResponseState, wantState) {
+		t.Fatalf("response state = %#v, want %#v", *messages[0].ResponseState, wantState)
+	}
+}
+
 func TestV2StoreUpdateItemRejectsUnknownItem(t *testing.T) {
 	store := NewV2Store(filepath.Join(t.TempDir(), "sessions"))
 

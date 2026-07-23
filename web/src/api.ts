@@ -61,26 +61,26 @@ export const api = {
     method: 'POST',
     body: JSON.stringify({ provider, model_profile: modelProfile, reasoning_level: reasoningLevel }),
   }),
-  providerSettings: (projectID: string) => request<ProviderSettingsDocument>(`/api/projects/${encodeURIComponent(projectID)}/provider-settings`),
-  createProvider: (projectID: string, input: ProviderSettingsInput) => request<ProviderSettingsDocument>(`/api/projects/${encodeURIComponent(projectID)}/providers`, {
+  providerSettings: () => request<ProviderSettingsDocument>('/api/provider-settings'),
+  createProvider: (input: ProviderSettingsInput) => request<ProviderSettingsDocument>('/api/providers', {
     method: 'POST',
     body: JSON.stringify(input),
   }),
-  updateProvider: (projectID: string, providerName: string, input: ProviderSettingsInput) => request<ProviderSettingsDocument>(`/api/projects/${encodeURIComponent(projectID)}/providers/${encodeURIComponent(providerName)}`, {
+  updateProvider: (providerName: string, input: ProviderSettingsInput) => request<ProviderSettingsDocument>(`/api/providers/${encodeURIComponent(providerName)}`, {
     method: 'PUT',
     body: JSON.stringify(input),
   }),
-  updateProviderDefault: (projectID: string, provider: string, model: string) => request<ProviderSettingsDocument>(`/api/projects/${encodeURIComponent(projectID)}/provider-default`, {
+  updateProviderDefault: (provider: string, model: string) => request<ProviderSettingsDocument>('/api/provider-default', {
     method: 'PATCH',
     body: JSON.stringify({ provider, model }),
   }),
-  discoverProviderModels: (projectID: string, providerName: string) => request<{ models: string[] }>(`/api/projects/${encodeURIComponent(projectID)}/providers/${encodeURIComponent(providerName)}/models`),
-  startCodexLogin: (projectID: string, providerName: string) => request<CodexAuthStatus>(`/api/projects/${encodeURIComponent(projectID)}/providers/${encodeURIComponent(providerName)}/codex-login`, {
+  discoverProviderModels: (providerName: string) => request<{ models: string[] }>(`/api/providers/${encodeURIComponent(providerName)}/models`),
+  startCodexLogin: (providerName: string) => request<CodexAuthStatus>(`/api/providers/${encodeURIComponent(providerName)}/codex-login`, {
     method: 'POST',
     body: '{}',
   }),
-  codexLoginStatus: (projectID: string, providerName: string) => request<CodexAuthStatus>(`/api/projects/${encodeURIComponent(projectID)}/providers/${encodeURIComponent(providerName)}/codex-login`),
-  clearCodexLogin: (projectID: string, providerName: string) => request<void>(`/api/projects/${encodeURIComponent(projectID)}/providers/${encodeURIComponent(providerName)}/codex-login`, { method: 'DELETE' }),
+  codexLoginStatus: (providerName: string) => request<CodexAuthStatus>(`/api/providers/${encodeURIComponent(providerName)}/codex-login`),
+  clearCodexLogin: (providerName: string) => request<void>(`/api/providers/${encodeURIComponent(providerName)}/codex-login`, { method: 'DELETE' }),
   session: (sessionID: string) => request<Session>(`/api/sessions/${encodeURIComponent(sessionID)}`),
   archiveSession: (sessionID: string) => request<Session>(`/api/sessions/${encodeURIComponent(sessionID)}/archive`, {
     method: 'POST',

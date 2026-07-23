@@ -362,6 +362,7 @@ func (s *Service) CompactSession(ctx context.Context, id string) (SessionCompact
 		interruptOperation()
 		return SessionCompactResult{}, err
 	}
+	session.ConfigPath = s.ConfigPath()
 	if strings.TrimSpace(session.CWD) == "" {
 		session.CWD = session.CreatedCWD
 	}
@@ -530,9 +531,12 @@ func sessionStreamEventFromModelEvent(turnID string, agentIteration int, event m
 		}), true
 	case model.UsageEvent:
 		return modelSessionStreamEvent("usage.updated", turnID, agentIteration, map[string]any{
-			"input_tokens":  event.Usage.InputTokens,
-			"output_tokens": event.Usage.OutputTokens,
-			"total_tokens":  event.Usage.TotalTokens,
+			"input_tokens":       event.Usage.InputTokens,
+			"output_tokens":      event.Usage.OutputTokens,
+			"total_tokens":       event.Usage.TotalTokens,
+			"cached_tokens":      event.Usage.CachedTokens,
+			"cache_write_tokens": event.Usage.CacheWriteTokens,
+			"reasoning_tokens":   event.Usage.ReasoningTokens,
 		}), true
 	default:
 		return nil, false

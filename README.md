@@ -34,16 +34,22 @@ sai --help
 The former interactive CLI, TUI, mailbox server, and project/session CLI
 commands are not part of the product anymore.
 
-## Project setup
+## Server root and project setup
 
-Add a local project directory from the Web UI. The project should contain a
-root configuration at `.agents/sai.yaml` and provider profiles under the
-configured `provider_dir`.
+`--server-root` selects one namespace for configuration, Provider credentials,
+optional diagnostic logs, projects, sessions, and blobs. It defaults to the OS
+user configuration directory under the executable basename. The root config is
+`<server-root>/<basename>.yaml`; the launcher creates an empty config and its
+core resource directories on first use.
+
+Add local project directories from the Web UI. Projects are workspaces and do
+not need their own `.agents/sai.yaml`; every project managed by the running
+application uses the current server-root configuration.
 
 Minimal root configuration:
 
 ```yaml
-# .agents/sai.yaml
+# <server-root>/sai.yaml
 default_provider: paperhub
 default_model: glm-5.2
 provider_dir: providers
@@ -55,16 +61,12 @@ agent:
 
 tools:
   enabled: []
-
-logging:
-  path: logs/sai.jsonl
-  level: info
 ```
 
 Provider profile:
 
 ```yaml
-# .agents/providers/paperhub.yaml
+# <server-root>/providers/paperhub.yaml
 name: paperhub
 base_url: https://tc-paperhub.diezhi.net/v1
 api_key: $PAPERHUB_API_KEY
@@ -77,9 +79,10 @@ models:
     max_tokens: 4096
 ```
 
-Relative paths in configuration files resolve from the file that declares
-them. API keys can reference environment variables and are resolved only by the
-Go process.
+Relative paths in the root configuration resolve from the server root. API keys
+can reference environment variables and are resolved only by the Go process.
+Diagnostic logging is disabled unless a non-empty `logging.path` is explicitly
+configured.
 
 See [docs/configuration.md](docs/configuration.md) for the supported schema.
 
@@ -88,7 +91,7 @@ See [docs/configuration.md](docs/configuration.md) for the supported schema.
 The first release provides:
 
 - Registered project navigation.
-- Project-level Provider/model configuration and Codex device login.
+- Server-root Provider/model configuration and Codex device login.
 - Durable session creation and history.
 - Streaming assistant and reasoning output.
 - Tool requested/running/finished status.

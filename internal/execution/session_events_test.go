@@ -16,6 +16,25 @@ import (
 	"github.com/rexzhao/simple-agent/internal/sessions"
 )
 
+func TestSessionStreamUsageEventIncludesCacheDetails(t *testing.T) {
+	event, ok := sessionStreamEventFromModelEvent("turn-1", 2, model.UsageEvent{Usage: model.Usage{
+		InputTokens: 10, OutputTokens: 5, TotalTokens: 15,
+		CachedTokens: 8, CacheWriteTokens: 2, ReasoningTokens: 3,
+	}}, true)
+	if !ok {
+		t.Fatal("sessionStreamEventFromModelEvent() ok = false, want true")
+	}
+	for key, want := range map[string]any{
+		"type": "usage.updated", "turn_id": "turn-1", "agent_iteration": 2,
+		"input_tokens": 10, "output_tokens": 5, "total_tokens": 15,
+		"cached_tokens": 8, "cache_write_tokens": 2, "reasoning_tokens": 3,
+	} {
+		if got := event[key]; got != want {
+			t.Fatalf("event[%q] = %#v, want %#v; event = %#v", key, got, want, event)
+		}
+	}
+}
+
 // TestSessionStreamBlockedCallbackDoesNotBlockRunner verifies that a slow
 // presentation callback never blocks provider emission or tool execution: the
 // runner must reach completion while emit is blocked, and Send only waits for

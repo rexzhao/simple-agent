@@ -4,6 +4,9 @@
 M0 到 M3：先把 `sai` 跑起来、能调用模型、能执行基础 tool call，并能单文件分发。
 MCP 放到 MVP 之后。
 
+> 历史说明：各里程碑保留其完成时的设计。当前配置位置以 `docs/configuration.md`
+> 为准；Web 执行端现已统一使用 `server-root`。
+
 ## M0：项目骨架和关键决策
 
 目标：建立最小项目结构，并锁定 v0.1 范围。
@@ -166,8 +169,12 @@ function tools / function_call_output，使现有 agent tool loop 能通过 `ope
 
 - custom tools。
 - built-in web/code tools。
-- stateful `previous_response_id` 对话续写。
-- reasoning output item passthrough。
+
+已补齐：
+
+- prompt cache key/options/retention、显式 breakpoint 与 cache usage 观测。
+- 可选 stateful `previous_response_id` 续写及失效后的 full-input fallback。
+- 默认 `store:false` manual replay，持久化 reasoning/encrypted reasoning、message phase 和 function item ID。
 
 验证：
 

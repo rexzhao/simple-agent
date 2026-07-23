@@ -1,6 +1,9 @@
 package model
 
-import "context"
+import (
+	"context"
+	"encoding/json"
+)
 
 type Provider interface {
 	Stream(ctx context.Context, request Request) (<-chan Event, error)
@@ -11,6 +14,7 @@ type Request struct {
 	Messages   []Message
 	Tools      []Tool
 	Parameters map[string]any
+	SessionID  string
 }
 
 type MessageRole string
@@ -24,11 +28,39 @@ const (
 )
 
 type Message struct {
-	Role       MessageRole
-	Content    string
-	ToolCallID string
-	ToolCalls  []ToolCall
-	IsError    bool
+	Role          MessageRole
+	Content       string
+	ContentBlocks []InputContentBlock
+	ToolCallID    string
+	ToolCalls     []ToolCall
+	IsError       bool
+	ResponseState *ResponseState
+}
+
+// InputContentBlock represents a Responses API input content block. Other
+// adapters may continue to use Message.Content until they add equivalent
+// multimodal support.
+type InputContentBlock struct {
+	Type                  string
+	Text                  string
+	ImageURL              string
+	FileID                string
+	Detail                string
+	PromptCacheBreakpoint bool
+}
+
+// ResponseState contains the provider-owned identifiers and opaque reasoning
+// items required to continue or manually replay an OpenAI Responses turn.
+// Response output text remains in Message.Content so existing session blob
+// storage continues to own large visible content.
+type ResponseState struct {
+	ID             string
+	Origin         string
+	Model          string
+	Stored         bool
+	MessageID      string
+	MessagePhase   string
+	ReasoningItems []json.RawMessage
 }
 
 type Tool struct {
@@ -38,9 +70,10 @@ type Tool struct {
 }
 
 type ToolCall struct {
-	ID        string
-	Name      string
-	Arguments string
+	ID         string
+	ProviderID string
+	Name       string
+	Arguments  string
 }
 
 type ToolResult struct {
@@ -62,6 +95,7 @@ const (
 	EventTypeToolStarted           EventType = "tool_started"
 	EventTypeToolResult            EventType = "tool_result"
 	EventTypeUsage                 EventType = "usage"
+	EventTypeResponseState         EventType = "response_state"
 	EventTypeSubagentCompletion    EventType = "subagent_completion"
 	EventTypeError                 EventType = "error"
 )
@@ -142,9 +176,12 @@ func (ToolResultEvent) Type() EventType {
 }
 
 type Usage struct {
-	InputTokens  int
-	OutputTokens int
-	TotalTokens  int
+	InputTokens      int
+	OutputTokens     int
+	TotalTokens      int
+	CachedTokens     int
+	CacheWriteTokens int
+	ReasoningTokens  int
 }
 
 type UsageEvent struct {
@@ -153,6 +190,14 @@ type UsageEvent struct {
 
 func (UsageEvent) Type() EventType {
 	return EventTypeUsage
+}
+
+type ResponseStateEvent struct {
+	State ResponseState
+}
+
+func (ResponseStateEvent) Type() EventType {
+	return EventTypeResponseState
 }
 
 type SubagentCompletionEvent struct {

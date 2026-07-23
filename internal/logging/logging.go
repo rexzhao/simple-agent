@@ -164,9 +164,12 @@ func (l *Logger) eventRecord(event model.Event) map[string]any {
 		record["is_error"] = event.Result.IsError
 	case model.UsageEvent:
 		record["usage"] = map[string]int{
-			"input_tokens":  event.Usage.InputTokens,
-			"output_tokens": event.Usage.OutputTokens,
-			"total_tokens":  event.Usage.TotalTokens,
+			"input_tokens":       event.Usage.InputTokens,
+			"output_tokens":      event.Usage.OutputTokens,
+			"total_tokens":       event.Usage.TotalTokens,
+			"cached_tokens":      event.Usage.CachedTokens,
+			"cache_write_tokens": event.Usage.CacheWriteTokens,
+			"reasoning_tokens":   event.Usage.ReasoningTokens,
 		}
 	case model.SubagentCompletionEvent:
 		record["job_id"] = event.JobID

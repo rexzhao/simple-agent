@@ -26,8 +26,8 @@ func newCodexLoginRegistry(ctx context.Context, service *execution.Service) *cod
 	return &codexLoginRegistry{ctx: ctx, service: service, byTarget: make(map[string]*codexLoginState)}
 }
 
-func (r *codexLoginRegistry) start(projectID, providerName string) (execution.CodexAuthStatus, error) {
-	key := codexLoginKey(projectID, providerName)
+func (r *codexLoginRegistry) start(providerName string) (execution.CodexAuthStatus, error) {
+	key := codexLoginKey(providerName)
 	r.mu.Lock()
 	if current := r.byTarget[key]; current != nil && current.status.Status == "pending" {
 		status := current.status
@@ -62,11 +62,11 @@ func (r *codexLoginRegistry) start(projectID, providerName string) (execution.Co
 	r.byTarget[key] = state
 	r.mu.Unlock()
 
-	go r.complete(loginCtx, key, projectID, providerName, state, pending)
+	go r.complete(loginCtx, key, providerName, state, pending)
 	return state.status, nil
 }
 
-func (r *codexLoginRegistry) complete(ctx context.Context, key, projectID, providerName string, state *codexLoginState, pending codexauth.PendingDeviceLogin) {
+func (r *codexLoginRegistry) complete(ctx context.Context, key, providerName string, state *codexLoginState, pending codexauth.PendingDeviceLogin) {
 	result, err := pending.Complete(ctx)
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -77,11 +77,11 @@ func (r *codexLoginRegistry) complete(ctx context.Context, key, projectID, provi
 		state.status = execution.CodexAuthStatus{Status: "error", LoginID: state.status.LoginID, Message: err.Error()}
 		return
 	}
-	if err := r.service.SaveCodexAuth(projectID, providerName, result.Token); err != nil {
+	if err := r.service.SaveCodexAuth(providerName, result.Token); err != nil {
 		state.status = execution.CodexAuthStatus{Status: "error", LoginID: state.status.LoginID, Message: err.Error()}
 		return
 	}
-	status, err := r.service.CodexAuthStatus(projectID, providerName)
+	status, err := r.service.CodexAuthStatus(providerName)
 	if err != nil {
 		state.status = execution.CodexAuthStatus{Status: "error", LoginID: state.status.LoginID, Message: err.Error()}
 		return
@@ -90,8 +90,8 @@ func (r *codexLoginRegistry) complete(ctx context.Context, key, projectID, provi
 	state.status = status
 }
 
-func (r *codexLoginRegistry) status(projectID, providerName string) (execution.CodexAuthStatus, error) {
-	key := codexLoginKey(projectID, providerName)
+func (r *codexLoginRegistry) status(providerName string) (execution.CodexAuthStatus, error) {
+	key := codexLoginKey(providerName)
 	r.mu.Lock()
 	if current := r.byTarget[key]; current != nil {
 		status := current.status
@@ -99,11 +99,11 @@ func (r *codexLoginRegistry) status(projectID, providerName string) (execution.C
 		return status, nil
 	}
 	r.mu.Unlock()
-	return r.service.CodexAuthStatus(projectID, providerName)
+	return r.service.CodexAuthStatus(providerName)
 }
 
-func (r *codexLoginRegistry) clear(projectID, providerName string) error {
-	key := codexLoginKey(projectID, providerName)
+func (r *codexLoginRegistry) clear(providerName string) error {
+	key := codexLoginKey(providerName)
 	r.mu.Lock()
 	if current := r.byTarget[key]; current != nil {
 		if current.cancel != nil {
@@ -112,12 +112,12 @@ func (r *codexLoginRegistry) clear(projectID, providerName string) error {
 		delete(r.byTarget, key)
 	}
 	defer r.mu.Unlock()
-	if err := r.service.ClearCodexAuth(projectID, providerName); err != nil {
+	if err := r.service.ClearCodexAuth(providerName); err != nil {
 		return fmt.Errorf("clear Codex login: %w", err)
 	}
 	return nil
 }
 
-func codexLoginKey(projectID, providerName string) string {
-	return projectID + "\x00" + providerName
+func codexLoginKey(providerName string) string {
+	return providerName
 }

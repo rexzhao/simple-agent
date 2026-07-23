@@ -1,6 +1,8 @@
 export interface Bootstrap {
   version: string
   cwd: string
+  server_root: string
+  config_path: string
 }
 
 export interface Project {
@@ -74,7 +76,7 @@ export interface ProviderSettingsInput {
 }
 
 export interface ProviderSettingsDocument {
-  project_id: string
+  server_root: string
   config_path: string
   default_provider: string
   default_model: string
@@ -89,6 +91,9 @@ export interface ContextMetadata {
   last_input_tokens?: number
   last_output_tokens?: number
   last_total_tokens?: number
+  last_cached_tokens?: number
+  last_cache_write_tokens?: number
+  last_reasoning_tokens?: number
   last_usage_source?: string
   warning_issued?: boolean
 }
@@ -157,7 +162,7 @@ export type RunEvent =
 	| { type: 'reasoning.delta'; turn_id: string; agent_iteration: number; text: string }
 	| { type: 'tool.requested' | 'tool.started'; turn_id: string; agent_iteration: number; tool_call_id: string; name: string; arguments?: string }
 	| { type: 'tool.finished'; turn_id: string; agent_iteration: number; tool_call_id: string; name: string; is_error: boolean; content?: string }
-	| { type: 'usage.updated'; turn_id: string; agent_iteration: number; input_tokens: number; output_tokens: number; total_tokens: number }
+	| { type: 'usage.updated'; turn_id: string; agent_iteration: number; input_tokens: number; output_tokens: number; total_tokens: number; cached_tokens: number; cache_write_tokens: number; reasoning_tokens: number }
   | { type: 'turn.committed'; turn_id: string; last_seq: number }
   | { type: 'turn.failed'; turn_id: string; code: string; message: string }
   | { type: 'run.settled'; run_id: string; status: string; turn_id?: string; last_seq?: number; message?: string }
@@ -200,6 +205,9 @@ export interface ActiveRun {
   agentIteration: number
   inputTokens?: number
   totalTokens?: number
+	cachedTokens?: number
+	cacheWriteTokens?: number
+	reasoningTokens?: number
   status: 'running' | 'failed' | 'cancelled'
   error?: string
 }

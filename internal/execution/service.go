@@ -20,6 +20,8 @@ import (
 )
 
 type Service struct {
+	serverRoot              string
+	configPath              string
 	projectStore            *projectstore.Store
 	sessionStore            *sessions.V2Store
 	turnRunner              SessionTurnRunner
@@ -139,6 +141,7 @@ type SessionCompactResult struct {
 }
 
 type ServiceOptions struct {
+	ConfigPath              string
 	TurnRunner              SessionTurnRunner
 	CompactPlanner          SessionCompactPlanner
 	SessionWriteLockTimeout time.Duration
@@ -254,6 +257,26 @@ func NewService(home string) (*Service, error) {
 }
 
 func NewServiceWithOptions(home string, options ServiceOptions) (*Service, error) {
+	serverRoot, err := filepath.Abs(strings.TrimSpace(home))
+	if err != nil {
+		return nil, fmt.Errorf("resolve server root %q: %w", home, err)
+	}
+	serverRoot = filepath.Clean(serverRoot)
+	configPath := strings.TrimSpace(options.ConfigPath)
+	if configPath == "" {
+		configPath = filepath.Join(serverRoot, "sai.yaml")
+	} else if !filepath.IsAbs(configPath) {
+		configPath = filepath.Join(serverRoot, configPath)
+	}
+	configPath, err = filepath.Abs(configPath)
+	if err != nil {
+		return nil, fmt.Errorf("resolve server-root config path %q: %w", options.ConfigPath, err)
+	}
+	configPath = filepath.Clean(configPath)
+	if projectPathKey(filepath.Dir(configPath)) != projectPathKey(serverRoot) {
+		return nil, fmt.Errorf("server-root config file %q must be directly inside %q", configPath, serverRoot)
+	}
+
 	projectRoot, err := projectstore.RootForHome(home)
 	if err != nil {
 		return nil, err
@@ -273,12 +296,28 @@ func NewServiceWithOptions(home string, options ServiceOptions) (*Service, error
 		lockTimeout = defaultSessionWriteLockTimeout
 	}
 	return &Service{
+		serverRoot:              serverRoot,
+		configPath:              configPath,
 		projectStore:            projectstore.NewStore(projectRoot),
 		sessionStore:            sessions.NewV2Store(sessionRoot),
 		turnRunner:              options.TurnRunner,
 		compactPlanner:          compactPlanner,
 		sessionWriteLockTimeout: lockTimeout,
 	}, nil
+}
+
+func (s *Service) ServerRoot() string {
+	if s == nil {
+		return ""
+	}
+	return s.serverRoot
+}
+
+func (s *Service) ConfigPath() string {
+	if s == nil {
+		return ""
+	}
+	return s.configPath
 }
 
 func (s *Service) CreateProject(root, displayName string) (ProjectCreateResult, error) {
@@ -816,6 +855,7 @@ func (s *Service) runSessionMessage(ctx context.Context, id, content string, emi
 	if err != nil {
 		return SessionMessageResult{}, err
 	}
+	session.ConfigPath = s.ConfigPath()
 	if strings.TrimSpace(session.CWD) == "" {
 		session.CWD = session.CreatedCWD
 	}

@@ -7,7 +7,7 @@ import (
 )
 
 func (s *Server) handleProviderSettings(w http.ResponseWriter, r *http.Request) {
-	document, err := s.service.ProviderSettings(r.PathValue("projectID"))
+	document, err := s.service.ProviderSettings()
 	if err != nil {
 		writeServiceError(w, err)
 		return
@@ -16,7 +16,7 @@ func (s *Server) handleProviderSettings(w http.ResponseWriter, r *http.Request) 
 		if document.Providers[index].CodexAuth == nil {
 			continue
 		}
-		status, err := s.codexLogins.status(document.ProjectID, document.Providers[index].Name)
+		status, err := s.codexLogins.status(document.Providers[index].Name)
 		if err == nil {
 			document.Providers[index].CodexAuth = &status
 		}
@@ -29,7 +29,7 @@ func (s *Server) handleCreateProvider(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &input) {
 		return
 	}
-	document, err := s.service.CreateProviderSettings(r.PathValue("projectID"), input)
+	document, err := s.service.CreateProviderSettings(input)
 	if err != nil {
 		writeServiceError(w, err)
 		return
@@ -42,7 +42,7 @@ func (s *Server) handleUpdateProvider(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &input) {
 		return
 	}
-	document, err := s.service.UpdateProviderSettings(r.PathValue("projectID"), r.PathValue("providerName"), input)
+	document, err := s.service.UpdateProviderSettings(r.PathValue("providerName"), input)
 	if err != nil {
 		writeServiceError(w, err)
 		return
@@ -58,7 +58,7 @@ func (s *Server) handleUpdateDefaultProviderModel(w http.ResponseWriter, r *http
 	if !decodeJSON(w, r, &input) {
 		return
 	}
-	document, err := s.service.UpdateDefaultProviderModel(r.PathValue("projectID"), input.Provider, input.Model)
+	document, err := s.service.UpdateDefaultProviderModel(input.Provider, input.Model)
 	if err != nil {
 		writeServiceError(w, err)
 		return
@@ -67,7 +67,7 @@ func (s *Server) handleUpdateDefaultProviderModel(w http.ResponseWriter, r *http
 }
 
 func (s *Server) handleDiscoverProviderModels(w http.ResponseWriter, r *http.Request) {
-	models, err := s.service.DiscoverProviderModels(r.Context(), r.PathValue("projectID"), r.PathValue("providerName"))
+	models, err := s.service.DiscoverProviderModels(r.Context(), r.PathValue("providerName"))
 	if err != nil {
 		writeServiceError(w, err)
 		return
@@ -76,7 +76,7 @@ func (s *Server) handleDiscoverProviderModels(w http.ResponseWriter, r *http.Req
 }
 
 func (s *Server) handleStartCodexLogin(w http.ResponseWriter, r *http.Request) {
-	status, err := s.codexLogins.start(r.PathValue("projectID"), r.PathValue("providerName"))
+	status, err := s.codexLogins.start(r.PathValue("providerName"))
 	if err != nil {
 		writeServiceError(w, err)
 		return
@@ -85,7 +85,7 @@ func (s *Server) handleStartCodexLogin(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleCodexLoginStatus(w http.ResponseWriter, r *http.Request) {
-	status, err := s.codexLogins.status(r.PathValue("projectID"), r.PathValue("providerName"))
+	status, err := s.codexLogins.status(r.PathValue("providerName"))
 	if err != nil {
 		writeServiceError(w, err)
 		return
@@ -94,7 +94,7 @@ func (s *Server) handleCodexLoginStatus(w http.ResponseWriter, r *http.Request) 
 }
 
 func (s *Server) handleClearCodexLogin(w http.ResponseWriter, r *http.Request) {
-	if err := s.codexLogins.clear(r.PathValue("projectID"), r.PathValue("providerName")); err != nil {
+	if err := s.codexLogins.clear(r.PathValue("providerName")); err != nil {
 		writeServiceError(w, err)
 		return
 	}

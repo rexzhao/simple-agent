@@ -1,6 +1,7 @@
 package openairesponses
 
 import (
+	"encoding/json"
 	"reflect"
 	"testing"
 
@@ -123,7 +124,7 @@ func TestEventsFromSSEConvertsFunctionCallArgumentDeltasAndDoneOnce(t *testing.T
 	if !ok {
 		t.Fatalf("event[2] = %T, want model.ToolCallDoneEvent", events[2])
 	}
-	want := model.ToolCall{ID: "call_1", Name: "mcp.local.search", Arguments: `{"query":"needle"}`}
+	want := model.ToolCall{ID: "call_1", ProviderID: "fc_1", Name: "mcp.local.search", Arguments: `{"query":"needle"}`}
 	if doneEvent.ToolCall != want {
 		t.Fatalf("ToolCall = %#v, want %#v", doneEvent.ToolCall, want)
 	}
@@ -153,7 +154,7 @@ func TestEventsFromSSEConvertsFunctionCallOutputItemDone(t *testing.T) {
 	if !ok {
 		t.Fatalf("event[2] = %T, want model.ToolCallDoneEvent", events[2])
 	}
-	want := model.ToolCall{ID: "call_1", Name: "read_file", Arguments: `{"path":"note.txt"}`}
+	want := model.ToolCall{ID: "call_1", ProviderID: "fc_1", Name: "read_file", Arguments: `{"path":"note.txt"}`}
 	if doneEvent.ToolCall != want {
 		t.Fatalf("ToolCall = %#v, want %#v", doneEvent.ToolCall, want)
 	}
@@ -185,5 +186,159 @@ func TestEventsFromChunkConvertsErrorEvents(t *testing.T) {
 	}
 	if got.Message != "OpenAI Responses response failed" || got.Err == nil {
 		t.Fatalf("error event = %#v, want response failed with error", got)
+	}
+}
+
+func TestEventsFromChunkMapsCacheAndReasoningUsage(t *testing.T) {
+	tests := []struct {
+		name string
+		json string
+		want model.Usage
+	}{
+		{
+			name: "cache miss",
+			json: `{"type":"response.completed","response":{"usage":{"input_tokens":1500,"output_tokens":12,"total_tokens":1512}}}`,
+			want: model.Usage{InputTokens: 1500, OutputTokens: 12, TotalTokens: 1512},
+		},
+		{
+			name: "cache read",
+			json: `{"type":"response.completed","response":{"usage":{"input_tokens":1500,"output_tokens":12,"total_tokens":1512,"input_tokens_details":{"cached_tokens":1408},"output_tokens_details":{"reasoning_tokens":8}}}}`,
+			want: model.Usage{InputTokens: 1500, OutputTokens: 12, TotalTokens: 1512, CachedTokens: 1408, ReasoningTokens: 8},
+		},
+		{
+			name: "cache write",
+			json: `{"type":"response.completed","response":{"usage":{"input_tokens":1500,"output_tokens":12,"total_tokens":1512,"input_tokens_details":{"cache_write_tokens":1408}}}}`,
+			want: model.Usage{InputTokens: 1500, OutputTokens: 12, TotalTokens: 1512, CacheWriteTokens: 1408},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			events, done, err := EventsFromChunk([]byte(tt.json))
+			if err != nil {
+				t.Fatalf("EventsFromChunk() error = %v", err)
+			}
+			if !done {
+				t.Fatal("done = false, want true")
+			}
+			if len(events) != 1 {
+				t.Fatalf("len(events) = %d, want 1: %#v", len(events), events)
+			}
+			usage, ok := events[0].(model.UsageEvent)
+			if !ok || usage.Usage != tt.want {
+				t.Fatalf("event = %#v, want usage %#v", events[0], tt.want)
+			}
+		})
+	}
+}
+
+func TestStreamDecoderPreservesResponseOutputStateForManualReplay(t *testing.T) {
+	decoder := newStreamEventDecoderWithState(nil, model.ResponseState{
+		Origin: "https://api.openai.com/v1",
+		Model:  "gpt-5.6",
+		Stored: false,
+	})
+	events, done, err := decoder.EventsFromSSE([]byte(
+		"data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\"}}\n\n" +
+			"data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"reasoning\",\"id\":\"rs_1\"}}\n\n" +
+			"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"output\":[{\"type\":\"reasoning\",\"id\":\"rs_1\",\"encrypted_content\":\"cipher\"},{\"type\":\"message\",\"id\":\"msg_1\",\"phase\":\"final_answer\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"Done\"}]}],\"usage\":{\"input_tokens\":10,\"output_tokens\":4,\"total_tokens\":14}}}\n\n",
+	))
+	if err != nil {
+		t.Fatalf("EventsFromSSE() error = %v", err)
+	}
+	if !done || !decoder.terminal {
+		t.Fatalf("done = %v, terminal = %v, want both true", done, decoder.terminal)
+	}
+	if len(events) != 3 {
+		t.Fatalf("len(events) = %d, want 3: %#v", len(events), events)
+	}
+	stateEvent, ok := events[2].(model.ResponseStateEvent)
+	if !ok {
+		t.Fatalf("event[2] = %T, want model.ResponseStateEvent", events[2])
+	}
+	state := stateEvent.State
+	if state.ID != "resp_1" || state.Origin != "https://api.openai.com/v1" || state.Model != "gpt-5.6" || state.Stored || state.MessageID != "msg_1" || state.MessagePhase != "final_answer" {
+		t.Fatalf("state = %#v, want preserved response metadata", state)
+	}
+	if len(state.ReasoningItems) != 1 {
+		t.Fatalf("len(ReasoningItems) = %d, want 1", len(state.ReasoningItems))
+	}
+	var reasoning map[string]any
+	if err := json.Unmarshal(state.ReasoningItems[0], &reasoning); err != nil {
+		t.Fatalf("unmarshal reasoning item: %v", err)
+	}
+	if reasoning["encrypted_content"] != "cipher" {
+		t.Fatalf("reasoning item = %#v, want terminal encrypted content", reasoning)
+	}
+}
+
+func TestEventsFromChunkTreatsIncompleteAsTerminal(t *testing.T) {
+	events, done, err := EventsFromChunk([]byte(`{
+		"type":"response.incomplete",
+		"response":{"id":"resp_incomplete","usage":{"input_tokens":3,"output_tokens":1,"total_tokens":4}}
+	}`))
+	if err != nil {
+		t.Fatalf("EventsFromChunk() error = %v", err)
+	}
+	if !done {
+		t.Fatal("done = false, want true")
+	}
+	if len(events) != 2 {
+		t.Fatalf("len(events) = %d, want usage and state: %#v", len(events), events)
+	}
+}
+
+func TestEventsFromChunkBackfillsFinalMessageTextAndRefusal(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		content string
+		want    string
+	}{
+		{name: "output text", content: `{"type":"output_text","text":"complete text"}`, want: "complete text"},
+		{name: "refusal", content: `{"type":"refusal","refusal":"cannot comply"}`, want: "cannot comply"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			decoder := newStreamEventDecoder()
+			events, done, err := decoder.eventsFromChunk([]byte(`{"type":"response.output_item.done","output_index":0,"item":{"type":"message","id":"msg_1","content":[` + tt.content + `]}}`))
+			if err != nil {
+				t.Fatalf("eventsFromChunk() error = %v", err)
+			}
+			if done || len(events) != 1 {
+				t.Fatalf("done = %v, events = %#v, want one non-terminal event", done, events)
+			}
+			text, ok := events[0].(model.TextDeltaEvent)
+			if !ok || text.Text != tt.want {
+				t.Fatalf("event = %#v, want text %q", events[0], tt.want)
+			}
+		})
+	}
+}
+
+func TestEventsFromChunkBackfillsTerminalOutputWithoutItemDoneEvents(t *testing.T) {
+	events, done, err := EventsFromChunk([]byte(`{
+		"type":"response.completed",
+		"response":{
+			"output":[
+				{"type":"message","id":"msg_1","content":[{"type":"output_text","text":"terminal text"}]},
+				{"type":"function_call","id":"fc_1","call_id":"call_1","name":"lookup","arguments":"{\"id\":1}"}
+			]
+		}
+	}`))
+	if err != nil {
+		t.Fatalf("EventsFromChunk() error = %v", err)
+	}
+	if !done || len(events) != 3 {
+		t.Fatalf("done = %v, events = %#v, want text, tool call, and state", done, events)
+	}
+	text, ok := events[0].(model.TextDeltaEvent)
+	if !ok || text.Text != "terminal text" {
+		t.Fatalf("event[0] = %#v, want terminal text", events[0])
+	}
+	tool, ok := events[1].(model.ToolCallDoneEvent)
+	if !ok || tool.ToolCall != (model.ToolCall{ID: "call_1", ProviderID: "fc_1", Name: "lookup", Arguments: `{"id":1}`}) {
+		t.Fatalf("event[1] = %#v, want terminal tool call", events[1])
+	}
+	if _, ok := events[2].(model.ResponseStateEvent); !ok {
+		t.Fatalf("event[2] = %T, want model.ResponseStateEvent", events[2])
 	}
 }

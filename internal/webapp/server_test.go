@@ -76,7 +76,6 @@ func TestServerRequiresTokenForAPIAndServesEmbeddedUI(t *testing.T) {
 func TestServerProjectSessionAndRunFlow(t *testing.T) {
 	server, service := newWebTestServer(t)
 	root := t.TempDir()
-	writeWebTestConfig(t, root)
 
 	created := doJSONRequest(t, http.MethodPost, server.URL+"/api/projects", map[string]string{
 		"root":         root,
@@ -160,7 +159,6 @@ func TestServerProjectSessionAndRunFlow(t *testing.T) {
 func TestServerCancelsRun(t *testing.T) {
 	server, _ := newWebTestServerWithRunner(t, blockingWebTestRunner{})
 	root := t.TempDir()
-	writeWebTestConfig(t, root)
 
 	created := doJSONRequest(t, http.MethodPost, server.URL+"/api/projects", map[string]string{"root": root})
 	var projectResult execution.ProjectCreateResult
@@ -200,14 +198,13 @@ func TestServerCancelsRun(t *testing.T) {
 }
 
 func TestServerProviderSettingsPreserveSecretsAndWriteReasoningDefaults(t *testing.T) {
-	server, _ := newWebTestServer(t)
+	server, service := newWebTestServer(t)
 	root := t.TempDir()
-	writeWebTestConfig(t, root)
 
 	created := doJSONRequest(t, http.MethodPost, server.URL+"/api/projects", map[string]string{"root": root})
 	var projectResult execution.ProjectCreateResult
 	decodeResponse(t, created, &projectResult)
-	baseURL := server.URL + "/api/projects/" + projectResult.Project.ID
+	baseURL := server.URL + "/api"
 
 	response := doJSONRequest(t, http.MethodGet, baseURL+"/provider-settings", nil)
 	if response.StatusCode != http.StatusOK {
@@ -215,6 +212,9 @@ func TestServerProviderSettingsPreserveSecretsAndWriteReasoningDefaults(t *testi
 	}
 	var document execution.ProviderSettingsDocument
 	decodeResponse(t, response, &document)
+	if document.ServerRoot != service.ServerRoot() || document.ConfigPath != service.ConfigPath() {
+		t.Fatalf("provider settings paths = %q/%q, want %q/%q", document.ServerRoot, document.ConfigPath, service.ServerRoot(), service.ConfigPath())
+	}
 	if len(document.Providers) != 1 || document.Providers[0].APIKey != "" || !document.Providers[0].APIKeyConfigured {
 		t.Fatalf("provider settings exposed or lost API key state: %#v", document.Providers)
 	}
@@ -240,7 +240,7 @@ func TestServerProviderSettingsPreserveSecretsAndWriteReasoningDefaults(t *testi
 		t.Fatalf("reasoning default = %#v", model.ReasoningConfig)
 	}
 
-	response = doJSONRequest(t, http.MethodGet, baseURL+"/models", nil)
+	response = doJSONRequest(t, http.MethodGet, server.URL+"/api/projects/"+projectResult.Project.ID+"/models", nil)
 	var options execution.SessionModelOptions
 	decodeResponse(t, response, &options)
 	wantLevels := []string{"minimal", "low", "medium", "high", "xhigh"}
@@ -248,7 +248,7 @@ func TestServerProviderSettingsPreserveSecretsAndWriteReasoningDefaults(t *testi
 		t.Fatalf("session model reasoning levels = %#v, want %#v", options.Models, wantLevels)
 	}
 
-	providerData, err := os.ReadFile(filepath.Join(root, ".agents", "providers", "fake.yaml"))
+	providerData, err := os.ReadFile(filepath.Join(service.ServerRoot(), "providers", "fake.yaml"))
 	if err != nil {
 		t.Fatalf("ReadFile(provider) error = %v", err)
 	}
@@ -268,6 +268,7 @@ func newWebTestServerWithRunner(t *testing.T, runner execution.SessionTurnRunner
 	if err != nil {
 		t.Fatalf("NewServiceWithOptions() error = %v", err)
 	}
+	writeWebTestConfig(t, home)
 	app, err := NewServer(ServerOptions{Context: context.Background(), Service: service, Token: testToken, CWD: home})
 	if err != nil {
 		t.Fatalf("NewServer() error = %v", err)
@@ -312,8 +313,7 @@ func readBody(response *http.Response) string {
 
 func writeWebTestConfig(t *testing.T, root string) {
 	t.Helper()
-	agentsDir := filepath.Join(root, ".agents")
-	providersDir := filepath.Join(agentsDir, "providers")
+	providersDir := filepath.Join(root, "providers")
 	if err := os.MkdirAll(providersDir, 0o755); err != nil {
 		t.Fatalf("MkdirAll(providers) error = %v", err)
 	}
@@ -332,7 +332,7 @@ models:
     id: fake-precise
     context_window: 64000
 `
-	if err := os.WriteFile(filepath.Join(agentsDir, "sai.yaml"), []byte(rootConfig), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(root, "sai.yaml"), []byte(rootConfig), 0o600); err != nil {
 		t.Fatalf("WriteFile(root config) error = %v", err)
 	}
 	if err := os.WriteFile(filepath.Join(providersDir, "fake.yaml"), []byte(providerConfig), 0o600); err != nil {

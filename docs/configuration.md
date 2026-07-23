@@ -1,29 +1,37 @@
 # Configuration
 
-Configuration belongs to a registered project. The Web UI registers a project
-directory; creating a session loads `<project>/.agents/sai.yaml` unless another
-config path is provided through the Web API.
+Configuration belongs to the launcher server root and is shared by all
+registered projects. `--server-root` selects the namespace containing the root
+configuration, Provider credentials, optional diagnostic logs, and durable
+project/session data. Projects remain independent workspaces for `$CWD`,
+`AGENTS.md`, and tool execution; they do not carry their own `.agents/sai.yaml`.
 
 The browser never receives resolved API keys or authorization tokens.
 
 ## Layout
 
 ```text
-project/
-  .agents/
-    sai.yaml
-    providers/
-      paperhub.yaml
-      anthropic.yaml
-    mcp/
-      local.yaml
-    skills/
-      reviewer/
-        SKILL.md
-  AGENTS.md
+<server-root>/
+  <basename>.yaml
+  providers/
+    paperhub.yaml
+    anthropic.yaml
+  auth/
+  mcp/
+    local.yaml
+  skills/
+    reviewer/
+      SKILL.md
+  logs/                    # only when logging.path is configured
+  data/
+    projects/
+    sessions/
 ```
 
-Relative paths in `sai.yaml` resolve from the directory containing that file.
+The default server root is `<os.UserConfigDir()>/<basename>`. A custom
+`--server-root PATH` takes precedence over the basename-derived
+`<BASENAME>_SERVER_ROOT` environment variable. Relative paths in the root config
+resolve from the server root.
 Relative paths in provider and MCP files resolve from their own file location.
 
 ## Root configuration
@@ -51,10 +59,6 @@ tools:
   enabled:
     - list_files
     - read_file
-
-logging:
-  path: logs/sai.jsonl
-  level: info
 
 compaction:
   enabled: false
@@ -101,6 +105,52 @@ Supported model profile types:
 - `openai-codex`
 - `anthropic-messages`
 
+### OpenAI Responses cache and state
+
+Responses profiles default to `store: false` and manual history replay. During a
+session, SAI uses the stable session ID as `prompt_cache_key` (clamped to 64
+Unicode characters) and sends matching session-affinity headers. The provider
+combines that routing key with the actual prompt-prefix hash, so different
+prefixes do not share a cache entry; an explicit key can group a known workload.
+
+Adapter-only options live below `parameters.responses` and are not sent as a
+literal `responses` API field:
+
+```yaml
+models:
+  gpt-5.6:
+    id: gpt-5.6
+    type: openai-responses
+    parameters:
+      max_output_tokens: 4096
+      responses:
+        store: false                    # default
+        state: manual                   # manual | previous_response_id
+        cache:
+          enabled: true                 # default
+          key: shared-code-review       # optional; session ID is the default
+          capability: auto              # auto | modern | legacy | disabled
+          mode: explicit                # GPT-5.6+: implicit | explicit
+          ttl: 30m                      # GPT-5.6+: currently only 30m
+          breakpoint: instructions      # mark the last leading system/developer block
+          session_affinity: auto        # auto | openai | openrouter | none
+```
+
+`mode: explicit` requires an actual cache breakpoint. Conversely, a breakpoint
+is rejected unless explicit mode is active. For older Responses models, use
+`cache.retention: in_memory` or `cache.retention: 24h`; modern cache fields are
+not sent unless the model is detected or configured as `modern`. Set
+`capability: disabled` for a compatible endpoint that rejects prompt-cache
+fields. Top-level raw `prompt_cache_*` parameters remain available as an escape
+hatch.
+
+`state: previous_response_id` requires `store: true`. It sends only input added
+after the latest matching stored response. If the provider rejects an expired
+or unavailable ID, SAI retries once with the full input. Manual mode preserves
+and replays Responses reasoning/encrypted reasoning, message IDs/phases,
+function-call item IDs, and tool outputs so `store: false` and ZDR-style flows
+retain model state without relying on server-side response storage.
+
 Secrets beginning with `$` are read from the named environment variable. A
 direct secret string is supported but should not be committed.
 
@@ -140,10 +190,10 @@ models:
         xhigh: xhigh
 ```
 
-The Web project's Provider settings page can add and edit provider files, fetch
-model IDs from compatible `/models` endpoints, change the project default, and
-start or clear a Codex device login. Codex access and refresh tokens stay in the
-project's configured `auth_file`; the browser only receives status, account,
+The Web Server Root settings page can add and edit provider files, fetch model
+IDs from compatible `/models` endpoints, change the shared default, and start or
+clear a Codex device login. Codex access and refresh tokens stay in the current
+server root's configured `auth_file`; the browser only receives status, account,
 expiry, verification URL, and device-code metadata.
 
 ## Tools
@@ -200,9 +250,10 @@ depend on canonical persisted items. Session creation records:
 - Context-window metadata.
 - Whether reasoning is visible.
 
-Project/session records live below the launcher storage root, which defaults to
-the OS user configuration directory under `sai`. Override it with
-`--server-root` or `SAI_SERVER_ROOT`.
+Project/session records live below the same server root as configuration. For a
+binary named `sai`, override the default with `--server-root` or
+`SAI_SERVER_ROOT`; renamed binaries use the corresponding basename-derived
+environment variable.
 
 Session segments are append-only JSONL. Large content may be stored as verified
 blobs. The authenticated browser chat API materializes complete user and
@@ -211,9 +262,20 @@ preview.
 
 ## Logging
 
-An empty `logging.path` disables JSONL logging. A configured path is resolved
-from `sai.yaml`. Logs contain operational metadata but must not contain prompt,
-response, tool-result, API-key, or authorization-header bodies.
+Diagnostic JSONL logging is disabled by default. It is enabled only when the
+root configuration explicitly contains a non-empty path:
+
+```yaml
+logging:
+  path: logs/sai.jsonl
+  level: info
+```
+
+A relative path resolves from the server root. Disabled logging creates no
+`logs` directory or empty JSONL file. Logs contain operational metadata but
+must not contain prompt, response, tool-result, API-key, or
+authorization-header bodies. Durable session event records are independent of
+this diagnostic logging switch.
 
 ## Context window and compaction
 

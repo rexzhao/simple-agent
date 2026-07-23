@@ -6,11 +6,49 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"syscall"
 	"time"
 
 	"gopkg.in/yaml.v3"
 )
+
+// EnsureRootConfig makes a server-root configuration usable by the Web
+// application without enabling diagnostic logging. Existing configuration is
+// preserved; only missing root files and core resource directories are
+// created.
+func EnsureRootConfig(path string) error {
+	if strings.TrimSpace(path) == "" {
+		return fmt.Errorf("config file is required")
+	}
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return fmt.Errorf("resolve config file: %w", err)
+	}
+	abs = filepath.Clean(abs)
+	if _, err := os.Stat(abs); err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("stat config file %q: %w", abs, err)
+		}
+		if err := writeConfigFileAtomic(abs, []byte("{}\n")); err != nil {
+			return fmt.Errorf("create root config file %q: %w", abs, err)
+		}
+	}
+
+	cfg, err := LoadBase(abs)
+	if err != nil {
+		return err
+	}
+	for _, dir := range []string{cfg.ProviderDir, cfg.AuthDir, cfg.MCPDir} {
+		if strings.TrimSpace(dir) == "" {
+			continue
+		}
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return fmt.Errorf("create config resource directory %q: %w", dir, err)
+		}
+	}
+	return nil
+}
 
 func WriteProviderConfig(path string, provider ProviderConfig) error {
 	path = filepath.Clean(path)

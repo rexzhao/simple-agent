@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"reflect"
@@ -223,6 +224,51 @@ func TestStreamWithResultAppendsFinalAssistantMessage(t *testing.T) {
 	}
 	assertAgentMessage(t, result.Messages[0], model.MessageRoleUser, "Say hi", "")
 	assertAgentMessage(t, result.Messages[1], model.MessageRoleAssistant, "hello there", "")
+}
+
+func TestStreamWithResultPersistsResponseStateOnAssistantMessage(t *testing.T) {
+	wantState := model.ResponseState{
+		ID: "resp_1", Origin: "https://api.openai.com/v1", Model: "gpt-5.6", Stored: false,
+		MessageID: "msg_1", MessagePhase: "final_answer",
+		ReasoningItems: []json.RawMessage{json.RawMessage(`{"type":"reasoning","id":"rs_1","encrypted_content":"cipher"}`)},
+	}
+	provider := &fakeProvider{turns: [][]model.Event{{
+		model.TextDeltaEvent{Text: "answer"},
+		model.ResponseStateEvent{State: wantState},
+	}}}
+	publisher := &fakePublisher{}
+
+	events, results, err := StreamWithResult(context.Background(), model.Request{
+		Model:    "gpt-5.6",
+		Messages: []model.Message{{Role: model.MessageRoleUser, Content: "Question"}},
+	}, Options{Provider: provider, Publisher: publisher, TurnID: "turn-1"})
+	if err != nil {
+		t.Fatalf("StreamWithResult() error = %v", err)
+	}
+	gotEvents := collectAgentEvents(t, events)
+	if gotText := collectText(gotEvents); gotText != "answer" {
+		t.Fatalf("text events = %q, want answer", gotText)
+	}
+	for _, event := range gotEvents {
+		if _, ok := event.(model.ResponseStateEvent); ok {
+			t.Fatal("ResponseStateEvent leaked to agent consumers")
+		}
+	}
+
+	result := collectTurnResult(t, results)
+	if len(result.Messages) != 2 || result.Messages[1].ResponseState == nil {
+		t.Fatalf("result messages = %#v, want assistant response state", result.Messages)
+	}
+	if !reflect.DeepEqual(*result.Messages[1].ResponseState, wantState) {
+		t.Fatalf("result response state = %#v, want %#v", *result.Messages[1].ResponseState, wantState)
+	}
+	if len(publisher.events) != 1 {
+		t.Fatalf("publisher events = %#v, want one AssistantReady", publisher.events)
+	}
+	ready, ok := publisher.events[0].(eventbus.AssistantReady)
+	if !ok || ready.Message.ResponseState == nil || !reflect.DeepEqual(*ready.Message.ResponseState, wantState) {
+		t.Fatalf("published event = %#v, want AssistantReady with response state", publisher.events[0])
+	}
 }
 
 func TestStreamWithResultIncludesToolHistoryAndFinalAssistantText(t *testing.T) {

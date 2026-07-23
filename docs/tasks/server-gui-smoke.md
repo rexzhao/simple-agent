@@ -2,6 +2,10 @@
 
 Date: 2026-07-03
 
+> Historical evidence only. The current Web execution path uses the unified
+> `server-root` layout documented in `docs/configuration.md`; project-local
+> `.agents/sai.yaml` is no longer its configuration source.
+
 Main agent ran a real-binary local smoke on this branch with a temporary fake
 OpenAI-compatible provider. The smoke built `cmd/sai` into a temporary
 `sai.exe`, created a temporary project containing `.agents/sai.yaml` and a fake

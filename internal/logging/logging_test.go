@@ -117,6 +117,33 @@ func TestLogEventAnnotatesRecordsWithAgentIteration(t *testing.T) {
 	}
 }
 
+func TestLogEventRecordsCacheUsageMetadata(t *testing.T) {
+	logger, err := Open(filepath.Join(t.TempDir(), "logs", "sai.jsonl"), Attributes{Provider: "fake", Model: "model-default"})
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	if err := logger.LogEvent(model.UsageEvent{Usage: model.Usage{
+		InputTokens: 10, OutputTokens: 5, TotalTokens: 15,
+		CachedTokens: 8, CacheWriteTokens: 2, ReasoningTokens: 3,
+	}}); err != nil {
+		t.Fatalf("LogEvent() error = %v", err)
+	}
+	if err := logger.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+
+	data, err := os.ReadFile(logger.Path())
+	if err != nil {
+		t.Fatalf("ReadFile(%q) error = %v", logger.Path(), err)
+	}
+	logText := string(data)
+	for _, want := range []string{`"cached_tokens":8`, `"cache_write_tokens":2`, `"reasoning_tokens":3`} {
+		if !strings.Contains(logText, want) {
+			t.Fatalf("log = %q, want contain %q", logText, want)
+		}
+	}
+}
+
 func TestCloseIsIdempotentAndFlushesBufferedData(t *testing.T) {
 	parent := t.TempDir()
 	logRoot := filepath.Join(parent, "logs")

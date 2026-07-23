@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/rexzhao/simple-agent/internal/model"
@@ -36,6 +37,7 @@ func TestBuildRequestBodyMapsMessagesStreamAndParameters(t *testing.T) {
 			{"role": "assistant", "content": "Hi."}
 		],
 		"stream": true,
+		"store": false,
 		"temperature": 0.6,
 		"max_output_tokens": 4096
 	}`)
@@ -64,6 +66,7 @@ func TestBuildRequestBodyPreservesExplicitMaxOutputTokens(t *testing.T) {
 			{"role": "user", "content": "Hello"}
 		],
 		"stream": true,
+		"store": false,
 		"max_output_tokens": 1024
 	}`)
 	assertJSONOmitsKey(t, body, "max_tokens")
@@ -135,7 +138,6 @@ func TestBuildRequestBodyRejectsUnsupportedToolParameters(t *testing.T) {
 		{name: "tool resources", parameter: "tool_resources", value: map[string]any{}},
 		{name: "legacy functions", parameter: "functions", value: []any{map[string]any{"name": "read_file"}}},
 		{name: "function call output", parameter: "function_call_output", value: map[string]any{"call_id": "call_1"}},
-		{name: "previous response id", parameter: "previous_response_id", value: "resp_1"},
 	}
 
 	for _, tt := range tests {
@@ -214,6 +216,7 @@ func TestBuildRequestBodyMapsToolsFunctionCallsToolOutputsAndToolParameters(t *t
 			{"type": "function_call_output", "call_id": "call_read", "output": "missing file"}
 		],
 		"stream": true,
+		"store": false,
 		"tool_choice": "auto",
 		"parallel_tool_calls": true,
 		"tools": [
@@ -257,6 +260,7 @@ func TestBuildRequestBodyAvoidsResponsesToolNameAliasConflicts(t *testing.T) {
 		"model": "gpt-5.1",
 		"input": [],
 		"stream": false,
+		"store": false,
 		"tools": [
 			{
 				"type": "function",
@@ -293,6 +297,7 @@ func TestBuildRequestBodyMapsForcedToolChoiceAlias(t *testing.T) {
 		"model": "gpt-5.1",
 		"input": [],
 		"stream": true,
+		"store": false,
 		"tool_choice": {"type": "function", "name": "tool_0"},
 		"tools": [
 			{
@@ -330,6 +335,7 @@ func TestBuildRequestBodyMapsAllowedToolsToolChoiceAliases(t *testing.T) {
 		"model": "gpt-5.1",
 		"input": [],
 		"stream": true,
+		"store": false,
 		"tool_choice": {
 			"type": "allowed_tools",
 			"mode": "auto",
@@ -346,6 +352,283 @@ func TestBuildRequestBodyMapsAllowedToolsToolChoiceAliases(t *testing.T) {
 			}
 		]
 	}`)
+}
+
+func TestBuildProviderRequestUsesSessionCacheKeyAndClampsMinimumOutputTokens(t *testing.T) {
+	sessionID := strings.Repeat("会", 70)
+	body, _, metadata, err := buildProviderRequest(model.Request{
+		Model:     "gpt-5.5",
+		SessionID: sessionID,
+		Messages: []model.Message{
+			{Role: model.MessageRoleUser, Content: "Hello"},
+		},
+		Parameters: map[string]any{"max_output_tokens": 1},
+	}, true, requestBodyOptions{origin: "https://api.openai.com/v1"})
+	if err != nil {
+		t.Fatalf("buildProviderRequest() error = %v", err)
+	}
+
+	wantKey := strings.Repeat("会", 64)
+	if metadata.CacheKey != wantKey || metadata.SessionAffinity != "auto" {
+		t.Fatalf("metadata = %#v, want cache key %q and auto affinity", metadata, wantKey)
+	}
+	assertJSONEqual(t, body, `{
+		"model": "gpt-5.5",
+		"input": [{"role": "user", "content": "Hello"}],
+		"stream": true,
+		"store": false,
+		"prompt_cache_key": "`+wantKey+`",
+		"max_output_tokens": 16
+	}`)
+}
+
+func TestBuildProviderRequestMapsLegacyAndModernCacheOptions(t *testing.T) {
+	t.Run("legacy retention", func(t *testing.T) {
+		body, _, _, err := buildProviderRequest(model.Request{
+			Model:     "gpt-5.5",
+			SessionID: "session-1",
+			Parameters: map[string]any{
+				"responses": map[string]any{
+					"cache": map[string]any{"retention": "24h"},
+				},
+			},
+		}, true, requestBodyOptions{})
+		if err != nil {
+			t.Fatalf("buildProviderRequest() error = %v", err)
+		}
+		assertJSONEqual(t, body, `{
+			"model": "gpt-5.5",
+			"input": [],
+			"stream": true,
+			"store": false,
+			"prompt_cache_key": "session-1",
+			"prompt_cache_retention": "24h"
+		}`)
+	})
+
+	t.Run("modern explicit instructions", func(t *testing.T) {
+		body, _, _, err := buildProviderRequest(model.Request{
+			Model:     "gpt-5.6",
+			SessionID: "session-2",
+			Messages: []model.Message{
+				{Role: model.MessageRoleSystem, Content: "Stable instructions"},
+				{Role: model.MessageRoleUser, Content: "Hello"},
+			},
+			Parameters: map[string]any{
+				"responses": map[string]any{
+					"cache": map[string]any{
+						"mode":       "explicit",
+						"ttl":        "30m",
+						"breakpoint": "instructions",
+					},
+				},
+			},
+		}, true, requestBodyOptions{})
+		if err != nil {
+			t.Fatalf("buildProviderRequest() error = %v", err)
+		}
+		assertJSONEqual(t, body, `{
+			"model": "gpt-5.6",
+			"input": [
+				{"role": "system", "content": [{
+					"type": "input_text",
+					"text": "Stable instructions",
+					"prompt_cache_breakpoint": {"mode": "explicit"}
+				}]},
+				{"role": "user", "content": "Hello"}
+			],
+			"stream": true,
+			"store": false,
+			"prompt_cache_key": "session-2",
+			"prompt_cache_options": {"mode": "explicit", "ttl": "30m"}
+		}`)
+	})
+
+	t.Run("modern implicit", func(t *testing.T) {
+		body, _, _, err := buildProviderRequest(model.Request{
+			Model:     "gpt-5.6",
+			SessionID: "session-3",
+			Parameters: map[string]any{
+				"responses": map[string]any{
+					"cache": map[string]any{"mode": "implicit", "ttl": "30m"},
+				},
+			},
+		}, true, requestBodyOptions{})
+		if err != nil {
+			t.Fatalf("buildProviderRequest() error = %v", err)
+		}
+		assertJSONEqual(t, body, `{
+			"model": "gpt-5.6",
+			"input": [],
+			"stream": true,
+			"store": false,
+			"prompt_cache_key": "session-3",
+			"prompt_cache_options": {"mode": "implicit", "ttl": "30m"}
+		}`)
+	})
+}
+
+func TestBuildProviderRequestValidatesCacheCapabilities(t *testing.T) {
+	tests := []struct {
+		name       string
+		modelID    string
+		cache      map[string]any
+		messages   []model.Message
+		wantErrSub string
+	}{
+		{
+			name:       "explicit requires breakpoint",
+			modelID:    "gpt-5.6",
+			cache:      map[string]any{"mode": "explicit"},
+			wantErrSub: "requires at least one prompt_cache_breakpoint",
+		},
+		{
+			name:       "breakpoint requires explicit mode",
+			modelID:    "gpt-5.6",
+			cache:      map[string]any{"breakpoint": "instructions"},
+			messages:   []model.Message{{Role: model.MessageRoleSystem, Content: "Stable"}},
+			wantErrSub: "requires explicit cache mode",
+		},
+		{
+			name:       "legacy rejects modern options",
+			modelID:    "gpt-5.5",
+			cache:      map[string]any{"mode": "implicit"},
+			wantErrSub: "require a GPT-5.6-compatible model",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, _, _, err := buildProviderRequest(model.Request{
+				Model:    tt.modelID,
+				Messages: tt.messages,
+				Parameters: map[string]any{
+					"responses": map[string]any{"cache": tt.cache},
+				},
+			}, true, requestBodyOptions{})
+			if err == nil || !strings.Contains(err.Error(), tt.wantErrSub) {
+				t.Fatalf("buildProviderRequest() error = %v, want containing %q", err, tt.wantErrSub)
+			}
+		})
+	}
+}
+
+func TestBuildProviderRequestMapsInputContentBlocks(t *testing.T) {
+	body, _, _, err := buildProviderRequest(model.Request{
+		Model: "gpt-5.6",
+		Messages: []model.Message{{
+			Role: model.MessageRoleUser,
+			ContentBlocks: []model.InputContentBlock{
+				{Type: "input_text", Text: "Inspect these"},
+				{Type: "input_image", ImageURL: "https://example.com/image.png", Detail: "high"},
+				{Type: "input_file", FileID: "file_123", PromptCacheBreakpoint: true},
+			},
+		}},
+		Parameters: map[string]any{
+			"responses": map[string]any{
+				"cache": map[string]any{"mode": "explicit"},
+			},
+		},
+	}, true, requestBodyOptions{})
+	if err != nil {
+		t.Fatalf("buildProviderRequest() error = %v", err)
+	}
+	assertJSONEqual(t, body, `{
+		"model": "gpt-5.6",
+		"input": [{"role": "user", "content": [
+			{"type": "input_text", "text": "Inspect these"},
+			{"type": "input_image", "image_url": "https://example.com/image.png", "detail": "high"},
+			{"type": "input_file", "file_id": "file_123", "prompt_cache_breakpoint": {"mode": "explicit"}}
+		]}],
+		"stream": true,
+		"store": false,
+		"prompt_cache_options": {"mode": "explicit"}
+	}`)
+}
+
+func TestBuildProviderRequestReplaysResponsesOutputItemsWhenStoreFalse(t *testing.T) {
+	body, _, metadata, err := buildProviderRequest(model.Request{
+		Model: "gpt-5.6",
+		Messages: []model.Message{
+			{Role: model.MessageRoleUser, Content: "Do work"},
+			{
+				Role:    model.MessageRoleAssistant,
+				Content: "Done",
+				ToolCalls: []model.ToolCall{{
+					ID: "call_1", ProviderID: "fc_1", Name: "lookup", Arguments: `{"id":1}`,
+				}},
+				ResponseState: &model.ResponseState{
+					ID: "resp_1", Origin: "https://api.openai.com/v1", Model: "gpt-5.6",
+					MessageID: "msg_1", MessagePhase: "final_answer",
+					ReasoningItems: []json.RawMessage{json.RawMessage(`{"type":"reasoning","id":"rs_1","encrypted_content":"cipher"}`)},
+				},
+			},
+			{Role: model.MessageRoleTool, ToolCallID: "call_1", Content: "result"},
+		},
+		Tools: []model.Tool{{Name: "lookup"}},
+	}, true, requestBodyOptions{origin: "https://api.openai.com/v1"})
+	if err != nil {
+		t.Fatalf("buildProviderRequest() error = %v", err)
+	}
+	if metadata.Store {
+		t.Fatal("metadata.Store = true, want false")
+	}
+	assertJSONEqual(t, body, `{
+		"model": "gpt-5.6",
+		"input": [
+			{"role": "user", "content": "Do work"},
+			{"type": "reasoning", "id": "rs_1", "encrypted_content": "cipher"},
+			{"type": "message", "id": "msg_1", "role": "assistant", "status": "completed", "phase": "final_answer", "content": [
+				{"type": "output_text", "text": "Done", "annotations": []}
+			]},
+			{"type": "function_call", "id": "fc_1", "call_id": "call_1", "name": "lookup", "arguments": "{\"id\":1}"},
+			{"type": "function_call_output", "call_id": "call_1", "output": "result"}
+		],
+		"stream": true,
+		"store": false,
+		"tools": [{"type": "function", "name": "lookup", "description": "", "parameters": {"type": "object", "properties": {}}}]
+	}`)
+}
+
+func TestBuildProviderRequestUsesPreviousResponseIDOnlyForMatchingStoredState(t *testing.T) {
+	request := model.Request{
+		Model: "gpt-5.6",
+		Messages: []model.Message{
+			{Role: model.MessageRoleUser, Content: "First"},
+			{Role: model.MessageRoleAssistant, Content: "Answer", ResponseState: &model.ResponseState{
+				ID: "resp_1", Origin: "https://api.openai.com/v1", Model: "gpt-5.6", Stored: true,
+			}},
+			{Role: model.MessageRoleUser, Content: "Follow up"},
+		},
+		Parameters: map[string]any{
+			"responses": map[string]any{"store": true, "state": "previous_response_id"},
+		},
+	}
+	body, _, metadata, err := buildProviderRequest(request, true, requestBodyOptions{origin: "https://api.openai.com/v1"})
+	if err != nil {
+		t.Fatalf("buildProviderRequest() error = %v", err)
+	}
+	if !metadata.Store || !metadata.UsedContinuation {
+		t.Fatalf("metadata = %#v, want stored continuation", metadata)
+	}
+	assertJSONEqual(t, body, `{
+		"model": "gpt-5.6",
+		"input": [{"role": "user", "content": "Follow up"}],
+		"stream": true,
+		"store": true,
+		"previous_response_id": "resp_1"
+	}`)
+
+	body, _, metadata, err = buildProviderRequest(request, true, requestBodyOptions{
+		origin: "https://another.example/v1", disableContinuation: true,
+	})
+	if err != nil {
+		t.Fatalf("buildProviderRequest(full fallback) error = %v", err)
+	}
+	if metadata.UsedContinuation {
+		t.Fatalf("metadata.UsedContinuation = true, want false")
+	}
+	assertJSONOmitsKey(t, body, "previous_response_id")
 }
 
 func assertJSONEqual(t *testing.T, got []byte, want string) {

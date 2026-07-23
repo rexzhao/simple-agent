@@ -70,6 +70,11 @@ svg { width: 1.1em; height: 1.1em; fill: none; stroke: currentColor; stroke-widt
 
 .brand svg, .splash-logo svg { width: 27px; height: 27px; color: var(--text); stroke-width: 1.8; }
 .brand svg path:first-child, .splash-logo svg path:first-child { fill: #ffffff; }
+.brand-settings { width: 32px; height: 32px; display: grid; place-items: center; margin-left: auto; border: 2px solid transparent; color: var(--text); background: transparent; cursor: pointer; }
+.brand-settings svg { width: 19px; height: 19px; }
+.brand-settings:hover, .brand-settings:focus-visible { border-color: var(--border); color: #ffffff; background: #111111; box-shadow: var(--shadow-1); }
+.brand-settings:active { box-shadow: none; transform: translate(2px, 2px); }
+.brand-settings:disabled { cursor: default; opacity: .35; }
 
 .rail-label {
   padding: 19px 9px 9px;

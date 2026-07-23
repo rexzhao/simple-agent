@@ -78,6 +78,44 @@ func TestLoadResolvesConfigAndProviderModels(t *testing.T) {
 	}
 }
 
+func TestLoadBaseDisablesDiagnosticLoggingByDefault(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "sai.yaml")
+	writeFile(t, path, "{}\n")
+	cfg, err := LoadBase(path)
+	if err != nil {
+		t.Fatalf("LoadBase() error = %v", err)
+	}
+	if cfg.Logging.Path != "" {
+		t.Fatalf("Logging.Path = %q, want disabled by default", cfg.Logging.Path)
+	}
+}
+
+func TestEnsureRootConfigCreatesCoreLayoutWithoutLogs(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "custom-agent.yaml")
+	if err := EnsureRootConfig(path); err != nil {
+		t.Fatalf("EnsureRootConfig() error = %v", err)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("Stat(config) error = %v", err)
+	}
+	for _, name := range []string{"providers", "auth", "mcp"} {
+		if info, err := os.Stat(filepath.Join(root, name)); err != nil || !info.IsDir() {
+			t.Fatalf("Stat(%s) = %v/%v, want directory", name, info, err)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(root, "logs")); !os.IsNotExist(err) {
+		t.Fatalf("Stat(logs) error = %v, want no logs directory", err)
+	}
+	cfg, err := LoadBase(path)
+	if err != nil {
+		t.Fatalf("LoadBase(created config) error = %v", err)
+	}
+	if cfg.Logging.Path != "" {
+		t.Fatalf("created config logging path = %q, want disabled", cfg.Logging.Path)
+	}
+}
+
 func TestLoadDefaultsCompactionConfig(t *testing.T) {
 	dir := writeConfigFixture(t)
 

@@ -353,7 +353,7 @@ func copyMessages(messages []model.Message) []model.Message {
 	}
 	copied := append([]model.Message(nil), messages...)
 	for i := range copied {
-		copied[i].ToolCalls = append([]model.ToolCall(nil), messages[i].ToolCalls...)
+		copied[i] = copyMessage(messages[i])
 	}
 	return copied
 }

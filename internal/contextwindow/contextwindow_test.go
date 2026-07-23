@@ -12,7 +12,10 @@ func TestTrackingProviderPrefersProviderUsageEvent(t *testing.T) {
 	provider := TrackingProvider{
 		Inner: fakeProvider{events: []model.Event{
 			model.TextDeltaEvent{Text: "fallback text should not win"},
-			model.UsageEvent{Usage: model.Usage{InputTokens: 10, OutputTokens: 5, TotalTokens: 15}},
+			model.UsageEvent{Usage: model.Usage{
+				InputTokens: 10, OutputTokens: 5, TotalTokens: 15,
+				CachedTokens: 8, CacheWriteTokens: 2, ReasoningTokens: 3,
+			}},
 		}},
 		Tracker: tracker,
 	}
@@ -32,6 +35,9 @@ func TestTrackingProviderPrefersProviderUsageEvent(t *testing.T) {
 	}
 	if metadata.LastInputTokens != 10 || metadata.LastOutputTokens != 5 || metadata.LastTotalTokens != 15 {
 		t.Fatalf("metadata usage = input %d output %d total %d, want 10/5/15", metadata.LastInputTokens, metadata.LastOutputTokens, metadata.LastTotalTokens)
+	}
+	if metadata.LastCachedTokens != 8 || metadata.LastCacheWriteTokens != 2 || metadata.LastReasoningTokens != 3 {
+		t.Fatalf("metadata details = cached %d write %d reasoning %d, want 8/2/3", metadata.LastCachedTokens, metadata.LastCacheWriteTokens, metadata.LastReasoningTokens)
 	}
 }
 

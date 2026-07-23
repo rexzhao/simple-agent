@@ -463,9 +463,6 @@ func defaultConfig() Config {
 		Tools: ToolsConfig{
 			Enabled: []string{},
 		},
-		Logging: LoggingConfig{
-			Path: "logs/sai.jsonl",
-		},
 		Sessions: SessionsConfig{
 			Dir:             "sessions",
 			SaveToolResults: true,

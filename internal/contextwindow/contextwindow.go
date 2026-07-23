@@ -49,6 +49,9 @@ type Metadata struct {
 	LastInputTokens         int    `json:"last_input_tokens,omitempty"`
 	LastOutputTokens        int    `json:"last_output_tokens,omitempty"`
 	LastTotalTokens         int    `json:"last_total_tokens,omitempty"`
+	LastCachedTokens        int    `json:"last_cached_tokens,omitempty"`
+	LastCacheWriteTokens    int    `json:"last_cache_write_tokens,omitempty"`
+	LastReasoningTokens     int    `json:"last_reasoning_tokens,omitempty"`
 	LastUsageSource         string `json:"last_usage_source,omitempty"`
 	WarningIssued           bool   `json:"warning_issued,omitempty"`
 }
@@ -159,6 +162,9 @@ func (t *Tracker) recordUsage(source UsageSource, usage model.Usage) {
 	t.metadata.LastInputTokens = usage.InputTokens
 	t.metadata.LastOutputTokens = usage.OutputTokens
 	t.metadata.LastTotalTokens = usage.TotalTokens
+	t.metadata.LastCachedTokens = usage.CachedTokens
+	t.metadata.LastCacheWriteTokens = usage.CacheWriteTokens
+	t.metadata.LastReasoningTokens = usage.ReasoningTokens
 	t.metadata.LastUsageSource = string(source)
 }
 
@@ -233,11 +239,23 @@ func EstimateMessageTokens(message model.Message) int {
 	total := messageOverheadTokens
 	total += EstimateTextTokens(string(message.Role))
 	total += EstimateTextTokens(message.Content)
+	for _, block := range message.ContentBlocks {
+		total += EstimateTextTokens(block.Type)
+		total += EstimateTextTokens(block.Text)
+		total += EstimateTextTokens(block.ImageURL)
+		total += EstimateTextTokens(block.FileID)
+	}
 	total += EstimateTextTokens(message.ToolCallID)
 	for _, toolCall := range message.ToolCalls {
 		total += EstimateTextTokens(toolCall.ID)
+		total += EstimateTextTokens(toolCall.ProviderID)
 		total += EstimateTextTokens(toolCall.Name)
 		total += EstimateTextTokens(toolCall.Arguments)
+	}
+	if message.ResponseState != nil {
+		for _, item := range message.ResponseState.ReasoningItems {
+			total += EstimateTextTokens(string(item))
+		}
 	}
 	return total
 }

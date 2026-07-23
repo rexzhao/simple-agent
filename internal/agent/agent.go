@@ -113,15 +113,16 @@ func run(ctx context.Context, request model.Request, options Options, maxTurns i
 		request.Messages = messages
 		events <- model.AgentIterationStartedEvent{Iteration: iteration}
 
-		assistantContent, toolCalls, stopped := streamModelTurn(ctx, options.Provider, request, events)
+		assistantContent, toolCalls, responseState, stopped := streamModelTurn(ctx, options.Provider, request, events)
 		if stopped {
 			return
 		}
 
 		assistantMessage := model.Message{
-			Role:      model.MessageRoleAssistant,
-			Content:   assistantContent,
-			ToolCalls: toolCalls,
+			Role:          model.MessageRoleAssistant,
+			Content:       assistantContent,
+			ToolCalls:     toolCalls,
+			ResponseState: responseState,
 		}
 		if len(toolCalls) == 0 && strings.TrimSpace(assistantContent) == "" {
 			events <- model.ErrorEvent{Err: fmt.Errorf("agent returned empty final response")}
@@ -235,33 +236,51 @@ func sendResult(results chan<- TurnResult, messages []model.Message) {
 func copyMessages(messages []model.Message) []model.Message {
 	copied := append([]model.Message(nil), messages...)
 	for i := range copied {
+		copied[i].ContentBlocks = append([]model.InputContentBlock(nil), messages[i].ContentBlocks...)
 		copied[i].ToolCalls = append([]model.ToolCall(nil), messages[i].ToolCalls...)
+		if messages[i].ResponseState != nil {
+			state := copyResponseState(*messages[i].ResponseState)
+			copied[i].ResponseState = &state
+		}
 	}
 	return copied
 }
 
-func streamModelTurn(ctx context.Context, provider model.Provider, request model.Request, out chan<- model.Event) (string, []model.ToolCall, bool) {
+func streamModelTurn(ctx context.Context, provider model.Provider, request model.Request, out chan<- model.Event) (string, []model.ToolCall, *model.ResponseState, bool) {
 	stream, err := provider.Stream(ctx, request)
 	if err != nil {
 		out <- model.ErrorEvent{Err: err, Message: "request model"}
-		return "", nil, true
+		return "", nil, nil, true
 	}
 
 	var assistantContent strings.Builder
 	var toolCalls []model.ToolCall
+	var responseState *model.ResponseState
 	for event := range stream {
 		switch event := event.(type) {
 		case model.TextDeltaEvent:
 			assistantContent.WriteString(event.Text)
 		case model.ToolCallDoneEvent:
 			toolCalls = append(toolCalls, event.ToolCall)
+		case model.ResponseStateEvent:
+			state := copyResponseState(event.State)
+			responseState = &state
+			continue
 		case model.ErrorEvent:
 			out <- event
-			return assistantContent.String(), nil, true
+			return assistantContent.String(), nil, nil, true
 		}
 		out <- event
 	}
-	return assistantContent.String(), toolCalls, false
+	return assistantContent.String(), toolCalls, responseState, false
+}
+
+func copyResponseState(state model.ResponseState) model.ResponseState {
+	state.ReasoningItems = append([]json.RawMessage(nil), state.ReasoningItems...)
+	for index := range state.ReasoningItems {
+		state.ReasoningItems[index] = append(json.RawMessage(nil), state.ReasoningItems[index]...)
+	}
+	return state
 }
 
 func executeToolCall(ctx context.Context, executor ToolExecutor, enabledTools map[string]struct{}, toolCall model.ToolCall, out chan<- model.Event) model.ToolResult {

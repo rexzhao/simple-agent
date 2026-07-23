@@ -2,6 +2,7 @@ package execution
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"path/filepath"
@@ -36,9 +37,13 @@ func NewAgentTurnRunner() AgentTurnRunner {
 	return AgentTurnRunner{}
 }
 
-func NewServiceWithAgentRunner(home string) (*Service, error) {
+func NewServiceWithAgentRunner(home, configPath string) (*Service, error) {
+	if err := config.EnsureRootConfig(configPath); err != nil {
+		return nil, err
+	}
 	runner := NewAgentTurnRunner()
 	return NewServiceWithOptions(home, ServiceOptions{
+		ConfigPath:     configPath,
 		TurnRunner:     runner,
 		CompactPlanner: runner,
 	})
@@ -423,6 +428,7 @@ func (r *agentRunnerRuntime) runSessionTurn(ctx context.Context, prompt string, 
 		Messages:   requestMessages,
 		Tools:      r.toolSchemas,
 		Parameters: r.parameters,
+		SessionID:  r.session.ID,
 	}
 	events, results, err := agent.StreamWithResult(turnCtx, request, agent.Options{
 		Provider:          r.provider,
@@ -1340,7 +1346,16 @@ func copyParameterMap(values map[string]any) map[string]any {
 func copyMessageSlice(messages []model.Message) []model.Message {
 	copied := append([]model.Message(nil), messages...)
 	for i := range copied {
+		copied[i].ContentBlocks = append([]model.InputContentBlock(nil), messages[i].ContentBlocks...)
 		copied[i].ToolCalls = append([]model.ToolCall(nil), messages[i].ToolCalls...)
+		if messages[i].ResponseState != nil {
+			state := *messages[i].ResponseState
+			state.ReasoningItems = make([]json.RawMessage, len(messages[i].ResponseState.ReasoningItems))
+			for index, item := range messages[i].ResponseState.ReasoningItems {
+				state.ReasoningItems[index] = append(json.RawMessage(nil), item...)
+			}
+			copied[i].ResponseState = &state
+		}
 	}
 	return copied
 }

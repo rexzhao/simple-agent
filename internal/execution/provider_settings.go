@@ -19,7 +19,7 @@ import (
 )
 
 type ProviderSettingsDocument struct {
-	ProjectID       string             `json:"project_id"`
+	ServerRoot      string             `json:"server_root"`
 	ConfigPath      string             `json:"config_path"`
 	DefaultProvider string             `json:"default_provider"`
 	DefaultModel    string             `json:"default_model"`
@@ -67,18 +67,14 @@ type CodexAuthStatus struct {
 	VerifyURL   string    `json:"verification_url,omitempty"`
 }
 
-func (s *Service) ProviderSettings(projectID string) (ProviderSettingsDocument, error) {
-	project, err := s.loadActiveProject(projectID)
-	if err != nil {
-		return ProviderSettingsDocument{}, err
-	}
-	configPath := filepath.Join(project.Root, ".agents", "sai.yaml")
+func (s *Service) ProviderSettings() (ProviderSettingsDocument, error) {
+	configPath := s.ConfigPath()
 	cfg, err := config.Load(configPath)
 	if err != nil {
 		return ProviderSettingsDocument{}, err
 	}
 	document := ProviderSettingsDocument{
-		ProjectID:       project.ID,
+		ServerRoot:      s.ServerRoot(),
 		ConfigPath:      cfg.ConfigPath,
 		DefaultProvider: strings.TrimSpace(cfg.DefaultProvider),
 		DefaultModel:    strings.TrimSpace(cfg.DefaultModel),
@@ -101,20 +97,16 @@ func (s *Service) ProviderSettings(projectID string) (ProviderSettingsDocument, 
 	return document, nil
 }
 
-func (s *Service) CreateProviderSettings(projectID string, input ProviderSettingsInput) (ProviderSettingsDocument, error) {
-	return s.saveProviderSettings(projectID, "", input)
+func (s *Service) CreateProviderSettings(input ProviderSettingsInput) (ProviderSettingsDocument, error) {
+	return s.saveProviderSettings("", input)
 }
 
-func (s *Service) UpdateProviderSettings(projectID, providerName string, input ProviderSettingsInput) (ProviderSettingsDocument, error) {
-	return s.saveProviderSettings(projectID, strings.TrimSpace(providerName), input)
+func (s *Service) UpdateProviderSettings(providerName string, input ProviderSettingsInput) (ProviderSettingsDocument, error) {
+	return s.saveProviderSettings(strings.TrimSpace(providerName), input)
 }
 
-func (s *Service) saveProviderSettings(projectID, existingName string, input ProviderSettingsInput) (ProviderSettingsDocument, error) {
-	project, err := s.loadActiveProject(projectID)
-	if err != nil {
-		return ProviderSettingsDocument{}, err
-	}
-	configPath := filepath.Join(project.Root, ".agents", "sai.yaml")
+func (s *Service) saveProviderSettings(existingName string, input ProviderSettingsInput) (ProviderSettingsDocument, error) {
+	configPath := s.ConfigPath()
 	base, err := config.LoadBase(configPath)
 	if err != nil {
 		return ProviderSettingsDocument{}, err
@@ -191,14 +183,19 @@ func (s *Service) saveProviderSettings(projectID, existingName string, input Pro
 		provider.Models[profile] = modelProfile
 	}
 	if usesCodex && provider.AuthFile == "" {
-		provider.AuthFile = filepath.ToSlash(filepath.Join("..", "auth", name+".json"))
+		authPath := filepath.Join(base.AuthDir, name+".json")
+		relative, err := filepath.Rel(base.ProviderDir, authPath)
+		if err != nil {
+			return ProviderSettingsDocument{}, fmt.Errorf("resolve provider auth path: %w", err)
+		}
+		provider.AuthFile = filepath.ToSlash(relative)
 	}
 	if provider.AuthFile != "" {
 		resolvedAuth := provider.AuthFile
 		if !filepath.IsAbs(resolvedAuth) {
 			resolvedAuth = filepath.Join(base.ProviderDir, resolvedAuth)
 		}
-		authRoot := filepath.Join(filepath.Dir(configPath), "auth")
+		authRoot := base.AuthDir
 		if !isSameOrAncestorProjectPath(authRoot, resolvedAuth) {
 			return ProviderSettingsDocument{}, fmt.Errorf("auth_file must stay inside %q", authRoot)
 		}
@@ -210,15 +207,11 @@ func (s *Service) saveProviderSettings(projectID, existingName string, input Pro
 	if err := config.WriteProviderConfig(path, provider); err != nil {
 		return ProviderSettingsDocument{}, err
 	}
-	return s.ProviderSettings(projectID)
+	return s.ProviderSettings()
 }
 
-func (s *Service) UpdateDefaultProviderModel(projectID, providerName, modelProfile string) (ProviderSettingsDocument, error) {
-	project, err := s.loadActiveProject(projectID)
-	if err != nil {
-		return ProviderSettingsDocument{}, err
-	}
-	configPath := filepath.Join(project.Root, ".agents", "sai.yaml")
+func (s *Service) UpdateDefaultProviderModel(providerName, modelProfile string) (ProviderSettingsDocument, error) {
+	configPath := s.ConfigPath()
 	cfg, err := config.Load(configPath)
 	if err != nil {
 		return ProviderSettingsDocument{}, err
@@ -229,27 +222,27 @@ func (s *Service) UpdateDefaultProviderModel(projectID, providerName, modelProfi
 	if err := config.UpdateDefaultModel(configPath, strings.TrimSpace(providerName), strings.TrimSpace(modelProfile)); err != nil {
 		return ProviderSettingsDocument{}, err
 	}
-	return s.ProviderSettings(projectID)
+	return s.ProviderSettings()
 }
 
-func (s *Service) CodexAuthStatus(projectID, providerName string) (CodexAuthStatus, error) {
-	provider, err := s.codexProvider(projectID, providerName)
+func (s *Service) CodexAuthStatus(providerName string) (CodexAuthStatus, error) {
+	provider, err := s.codexProvider(providerName)
 	if err != nil {
 		return CodexAuthStatus{}, err
 	}
 	return codexAuthStatus(provider.AuthFile), nil
 }
 
-func (s *Service) SaveCodexAuth(projectID, providerName string, token codexauth.TokenFile) error {
-	provider, err := s.codexProvider(projectID, providerName)
+func (s *Service) SaveCodexAuth(providerName string, token codexauth.TokenFile) error {
+	provider, err := s.codexProvider(providerName)
 	if err != nil {
 		return err
 	}
 	return (codexauth.Store{Path: provider.AuthFile}).Save(token)
 }
 
-func (s *Service) ClearCodexAuth(projectID, providerName string) error {
-	provider, err := s.codexProvider(projectID, providerName)
+func (s *Service) ClearCodexAuth(providerName string) error {
+	provider, err := s.codexProvider(providerName)
 	if err != nil {
 		return err
 	}
@@ -259,12 +252,8 @@ func (s *Service) ClearCodexAuth(projectID, providerName string) error {
 	return nil
 }
 
-func (s *Service) DiscoverProviderModels(ctx context.Context, projectID, providerName string) ([]string, error) {
-	project, err := s.loadActiveProject(projectID)
-	if err != nil {
-		return nil, err
-	}
-	cfg, err := config.Load(filepath.Join(project.Root, ".agents", "sai.yaml"))
+func (s *Service) DiscoverProviderModels(ctx context.Context, providerName string) ([]string, error) {
+	cfg, err := config.Load(s.ConfigPath())
 	if err != nil {
 		return nil, err
 	}
@@ -482,12 +471,8 @@ func codexAuthStatus(path string) CodexAuthStatus {
 	}
 }
 
-func (s *Service) codexProvider(projectID, providerName string) (config.ProviderConfig, error) {
-	project, err := s.loadActiveProject(projectID)
-	if err != nil {
-		return config.ProviderConfig{}, err
-	}
-	cfg, err := config.Load(filepath.Join(project.Root, ".agents", "sai.yaml"))
+func (s *Service) codexProvider(providerName string) (config.ProviderConfig, error) {
+	cfg, err := config.Load(s.ConfigPath())
 	if err != nil {
 		return config.ProviderConfig{}, err
 	}

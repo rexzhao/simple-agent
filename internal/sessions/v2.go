@@ -2124,7 +2124,16 @@ func corruptedSessionError(sessionID, format string, args ...any) error {
 }
 
 func copyMessage(message model.Message) model.Message {
+	message.ContentBlocks = append([]model.InputContentBlock(nil), message.ContentBlocks...)
 	message.ToolCalls = append([]model.ToolCall(nil), message.ToolCalls...)
+	if message.ResponseState != nil {
+		state := *message.ResponseState
+		state.ReasoningItems = make([]json.RawMessage, len(message.ResponseState.ReasoningItems))
+		for index, item := range message.ResponseState.ReasoningItems {
+			state.ReasoningItems[index] = append(json.RawMessage(nil), item...)
+		}
+		message.ResponseState = &state
+	}
 	return message
 }
 

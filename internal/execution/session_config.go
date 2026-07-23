@@ -9,9 +9,9 @@ import (
 	"github.com/rexzhao/simple-agent/internal/contextwindow"
 )
 
-// ConfiguredSessionOptions selects the working directory and root config used
-// to create a durable session. Empty values use the project root and
-// <cwd>/.agents/sai.yaml respectively.
+// ConfiguredSessionOptions selects the working directory and model used to
+// create a durable session. Configuration always comes from the service's
+// server-root config path.
 type ConfiguredSessionOptions struct {
 	CWD            string
 	ConfigPath     string
@@ -34,14 +34,13 @@ type SessionModelOptions struct {
 	DefaultModel    string               `json:"default_model"`
 }
 
-// ConfiguredSessionModels returns the models available to new sessions for a
-// project without exposing provider credentials or the rest of its config.
+// ConfiguredSessionModels returns the server-root models available to new
+// sessions without exposing provider credentials or the rest of the config.
 func (s *Service) ConfiguredSessionModels(projectID string) (SessionModelOptions, error) {
-	project, err := s.loadActiveProject(projectID)
-	if err != nil {
+	if _, err := s.loadActiveProject(projectID); err != nil {
 		return SessionModelOptions{}, err
 	}
-	cfg, err := config.Load(filepath.Join(project.Root, ".agents", "sai.yaml"))
+	cfg, err := config.Load(s.ConfigPath())
 	if err != nil {
 		return SessionModelOptions{}, err
 	}
@@ -87,13 +86,10 @@ func (s *Service) CreateConfiguredSession(projectID string, options ConfiguredSe
 		return SessionDetail{}, fmt.Errorf("session cwd %q is outside project root %q", cwd, project.Root)
 	}
 
-	configPath := strings.TrimSpace(options.ConfigPath)
-	if configPath == "" {
-		configPath = filepath.Join(cwd, ".agents", "sai.yaml")
-	} else if !filepath.IsAbs(configPath) {
-		configPath = filepath.Join(cwd, configPath)
+	if strings.TrimSpace(options.ConfigPath) != "" {
+		return SessionDetail{}, fmt.Errorf("per-session config path is not supported; configuration comes from server root")
 	}
-	cfg, err := config.Load(configPath)
+	cfg, err := config.Load(s.ConfigPath())
 	if err != nil {
 		return SessionDetail{}, err
 	}

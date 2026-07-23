@@ -49,8 +49,12 @@ func EventsFromChunk(data []byte) ([]model.Event, bool, error) {
 }
 
 type streamEventDecoder struct {
-	toolNames *toolNameMapper
-	toolCalls map[int]*responsesToolCallAccumulator
+	toolNames     *toolNameMapper
+	toolCalls     map[int]*responsesToolCallAccumulator
+	textByOutput  map[int]*strings.Builder
+	state         model.ResponseState
+	reasoningByID map[string]int
+	terminal      bool
 }
 
 type responsesToolCallAccumulator struct {
@@ -66,9 +70,16 @@ func newStreamEventDecoder(toolNames ...*toolNameMapper) *streamEventDecoder {
 	if len(toolNames) > 0 {
 		mapper = toolNames[0]
 	}
+	return newStreamEventDecoderWithState(mapper, model.ResponseState{})
+}
+
+func newStreamEventDecoderWithState(toolNames *toolNameMapper, state model.ResponseState) *streamEventDecoder {
 	return &streamEventDecoder{
-		toolNames: mapper,
-		toolCalls: make(map[int]*responsesToolCallAccumulator),
+		toolNames:     toolNames,
+		toolCalls:     make(map[int]*responsesToolCallAccumulator),
+		textByOutput:  make(map[int]*strings.Builder),
+		state:         state,
+		reasoningByID: make(map[string]int),
 	}
 }
 
@@ -99,10 +110,20 @@ func (d *streamEventDecoder) eventsFromChunk(data []byte) ([]model.Event, bool, 
 	}
 
 	switch event.Type {
+	case "response.created":
+		d.applyResponseState(event.Response)
+		return nil, false, nil
 	case "response.output_text.delta":
 		if event.Delta == "" {
 			return nil, false, nil
 		}
+		d.textAccumulator(event.OutputIndex).WriteString(event.Delta)
+		return []model.Event{model.TextDeltaEvent{Text: event.Delta}}, false, nil
+	case "response.refusal.delta":
+		if event.Delta == "" {
+			return nil, false, nil
+		}
+		d.textAccumulator(event.OutputIndex).WriteString(event.Delta)
 		return []model.Event{model.TextDeltaEvent{Text: event.Delta}}, false, nil
 	case "response.output_item.added":
 		return d.outputItemAddedEvents(event), false, nil
@@ -112,14 +133,22 @@ func (d *streamEventDecoder) eventsFromChunk(data []byte) ([]model.Event, bool, 
 		return d.functionCallArgumentsDoneEvents(event), false, nil
 	case "response.output_item.done":
 		return d.outputItemDoneEvents(event), false, nil
-	case "response.completed":
-		if event.Response == nil || event.Response.Usage == nil {
-			return nil, true, nil
+	case "response.completed", "response.incomplete":
+		d.terminal = true
+		d.applyResponseState(event.Response)
+		events := d.terminalOutputEvents(event.Response)
+		if event.Response != nil && event.Response.Usage != nil {
+			events = append(events, model.UsageEvent{Usage: usageFromResponse(event.Response.Usage)})
 		}
-		return []model.Event{model.UsageEvent{Usage: usageFromResponse(event.Response.Usage)}}, true, nil
+		if d.hasResponseState() {
+			events = append(events, model.ResponseStateEvent{State: d.copyResponseState()})
+		}
+		return events, true, nil
 	case "error":
+		d.terminal = true
 		return []model.Event{responseErrorEvent("OpenAI Responses stream error", event.Error, event.Message)}, true, nil
-	case "response.failed":
+	case "response.failed", "response.cancelled":
+		d.terminal = true
 		var responseError *responseError
 		if event.Response != nil {
 			responseError = event.Response.Error
@@ -139,12 +168,27 @@ func (d *streamEventDecoder) eventsFromChunk(data []byte) ([]model.Event, bool, 
 	}
 }
 
+func (d *streamEventDecoder) terminalOutputEvents(response *responseObject) []model.Event {
+	if response == nil {
+		return nil
+	}
+	var events []model.Event
+	for outputIndex, raw := range response.Output {
+		events = append(events, d.outputItemDoneEvents(responseStreamEvent{
+			OutputIndex: outputIndex,
+			Item:        raw,
+		})...)
+	}
+	return events
+}
+
 func (d *streamEventDecoder) outputItemAddedEvents(event responseStreamEvent) []model.Event {
-	if event.Item == nil || event.Item.Type != "function_call" {
+	item := event.outputItem()
+	if item == nil || item.Type != "function_call" {
 		return nil
 	}
 	accumulator := d.toolCallAccumulator(event.OutputIndex)
-	d.applyOutputItem(accumulator, event.Item, false)
+	d.applyOutputItem(accumulator, item, false)
 	return nil
 }
 
@@ -175,18 +219,33 @@ func (d *streamEventDecoder) functionCallArgumentsDoneEvents(event responseStrea
 	if event.Arguments != nil {
 		accumulator.setArguments(*event.Arguments)
 	}
-	if event.Item != nil && event.Item.Type == "function_call" {
-		d.applyOutputItem(accumulator, event.Item, true)
+	if item := event.outputItem(); item != nil && item.Type == "function_call" {
+		d.applyOutputItem(accumulator, item, true)
 	}
 	return d.toolCallDoneEvents(event.OutputIndex)
 }
 
 func (d *streamEventDecoder) outputItemDoneEvents(event responseStreamEvent) []model.Event {
-	if event.Item == nil || event.Item.Type != "function_call" {
+	item := event.outputItem()
+	if item == nil {
+		return nil
+	}
+	d.captureOutputItem(event.Item, item)
+	if item.Type == "message" {
+		finalText := item.outputText()
+		seen := d.textAccumulator(event.OutputIndex).String()
+		if strings.HasPrefix(finalText, seen) && len(finalText) > len(seen) {
+			delta := finalText[len(seen):]
+			d.textAccumulator(event.OutputIndex).WriteString(delta)
+			return []model.Event{model.TextDeltaEvent{Text: delta}}
+		}
+		return nil
+	}
+	if item.Type != "function_call" {
 		return nil
 	}
 	accumulator := d.toolCallAccumulator(event.OutputIndex)
-	d.applyOutputItem(accumulator, event.Item, true)
+	d.applyOutputItem(accumulator, item, true)
 	return d.toolCallDoneEvents(event.OutputIndex)
 }
 
@@ -225,9 +284,10 @@ func (d *streamEventDecoder) toolCallDoneEvents(outputIndex int) []model.Event {
 	accumulator.Done = true
 	return []model.Event{model.ToolCallDoneEvent{
 		ToolCall: model.ToolCall{
-			ID:        accumulator.CallID,
-			Name:      accumulator.Name,
-			Arguments: arguments,
+			ID:         accumulator.CallID,
+			ProviderID: accumulator.ItemID,
+			Name:       accumulator.Name,
+			Arguments:  arguments,
 		},
 	}}
 }
@@ -237,6 +297,15 @@ func (d *streamEventDecoder) toolCallAccumulator(outputIndex int) *responsesTool
 	if accumulator == nil {
 		accumulator = &responsesToolCallAccumulator{}
 		d.toolCalls[outputIndex] = accumulator
+	}
+	return accumulator
+}
+
+func (d *streamEventDecoder) textAccumulator(outputIndex int) *strings.Builder {
+	accumulator := d.textByOutput[outputIndex]
+	if accumulator == nil {
+		accumulator = &strings.Builder{}
+		d.textByOutput[outputIndex] = accumulator
 	}
 	return accumulator
 }
@@ -253,6 +322,68 @@ func (a *responsesToolCallAccumulator) setArguments(arguments string) {
 	a.Arguments.WriteString(arguments)
 }
 
+func (event responseStreamEvent) outputItem() *responseOutputItem {
+	if len(event.Item) == 0 || string(event.Item) == "null" {
+		return nil
+	}
+	var item responseOutputItem
+	if json.Unmarshal(event.Item, &item) != nil {
+		return nil
+	}
+	return &item
+}
+
+func (d *streamEventDecoder) applyResponseState(response *responseObject) {
+	if response == nil {
+		return
+	}
+	if response.ID != "" {
+		d.state.ID = response.ID
+	}
+	for _, raw := range response.Output {
+		var item responseOutputItem
+		if json.Unmarshal(raw, &item) == nil {
+			d.captureOutputItem(raw, &item)
+		}
+	}
+}
+
+func (d *streamEventDecoder) captureOutputItem(raw json.RawMessage, item *responseOutputItem) {
+	if item == nil {
+		return
+	}
+	switch item.Type {
+	case "reasoning":
+		copied := append(json.RawMessage(nil), raw...)
+		if index, ok := d.reasoningByID[item.ID]; ok {
+			d.state.ReasoningItems[index] = copied
+			return
+		}
+		d.reasoningByID[item.ID] = len(d.state.ReasoningItems)
+		d.state.ReasoningItems = append(d.state.ReasoningItems, copied)
+	case "message":
+		if item.ID != "" {
+			d.state.MessageID = item.ID
+		}
+		if item.Phase != "" {
+			d.state.MessagePhase = item.Phase
+		}
+	}
+}
+
+func (d *streamEventDecoder) hasResponseState() bool {
+	return d.state.ID != "" || d.state.MessageID != "" || len(d.state.ReasoningItems) > 0
+}
+
+func (d *streamEventDecoder) copyResponseState() model.ResponseState {
+	state := d.state
+	state.ReasoningItems = make([]json.RawMessage, len(d.state.ReasoningItems))
+	for index, item := range d.state.ReasoningItems {
+		state.ReasoningItems[index] = append(json.RawMessage(nil), item...)
+	}
+	return state
+}
+
 func isReasoningDeltaEvent(eventType string) bool {
 	return strings.HasPrefix(eventType, "response.") &&
 		strings.Contains(eventType, "reasoning") &&
@@ -261,9 +392,12 @@ func isReasoningDeltaEvent(eventType string) bool {
 
 func usageFromResponse(usage *responseUsage) model.Usage {
 	return model.Usage{
-		InputTokens:  usage.InputTokens,
-		OutputTokens: usage.OutputTokens,
-		TotalTokens:  usage.TotalTokens,
+		InputTokens:      usage.InputTokens,
+		OutputTokens:     usage.OutputTokens,
+		TotalTokens:      usage.TotalTokens,
+		CachedTokens:     usage.InputTokensDetails.CachedTokens,
+		CacheWriteTokens: usage.InputTokensDetails.CacheWriteTokens,
+		ReasoningTokens:  usage.OutputTokensDetails.ReasoningTokens,
 	}
 }
 
@@ -300,35 +434,68 @@ func appendSSEMessage(messages []SSEMessage, dataLines []string) []SSEMessage {
 }
 
 type responseStreamEvent struct {
-	Type        string              `json:"type"`
-	Delta       string              `json:"delta"`
-	Text        string              `json:"text"`
-	Message     string              `json:"message"`
-	ItemID      string              `json:"item_id"`
-	OutputIndex int                 `json:"output_index"`
-	Arguments   *string             `json:"arguments"`
-	Item        *responseOutputItem `json:"item"`
-	Error       *responseError      `json:"error"`
-	Response    *responseObject     `json:"response"`
+	Type        string          `json:"type"`
+	Delta       string          `json:"delta"`
+	Text        string          `json:"text"`
+	Message     string          `json:"message"`
+	ItemID      string          `json:"item_id"`
+	OutputIndex int             `json:"output_index"`
+	Arguments   *string         `json:"arguments"`
+	Item        json.RawMessage `json:"item"`
+	Error       *responseError  `json:"error"`
+	Response    *responseObject `json:"response"`
 }
 
 type responseOutputItem struct {
-	Type      string `json:"type"`
-	ID        string `json:"id"`
-	CallID    string `json:"call_id"`
-	Name      string `json:"name"`
-	Arguments string `json:"arguments"`
+	Type      string                  `json:"type"`
+	ID        string                  `json:"id"`
+	Phase     string                  `json:"phase"`
+	CallID    string                  `json:"call_id"`
+	Name      string                  `json:"name"`
+	Arguments string                  `json:"arguments"`
+	Content   []responseOutputContent `json:"content"`
+}
+
+func (item responseOutputItem) outputText() string {
+	var text strings.Builder
+	for _, content := range item.Content {
+		if content.Type == "output_text" {
+			text.WriteString(content.Text)
+		} else if content.Type == "refusal" {
+			text.WriteString(content.Refusal)
+		}
+	}
+	return text.String()
+}
+
+type responseOutputContent struct {
+	Type    string `json:"type"`
+	Text    string `json:"text"`
+	Refusal string `json:"refusal"`
 }
 
 type responseObject struct {
-	Usage *responseUsage `json:"usage"`
-	Error *responseError `json:"error"`
+	ID     string            `json:"id"`
+	Output []json.RawMessage `json:"output"`
+	Usage  *responseUsage    `json:"usage"`
+	Error  *responseError    `json:"error"`
 }
 
 type responseUsage struct {
-	InputTokens  int `json:"input_tokens"`
-	OutputTokens int `json:"output_tokens"`
-	TotalTokens  int `json:"total_tokens"`
+	InputTokens         int                        `json:"input_tokens"`
+	OutputTokens        int                        `json:"output_tokens"`
+	TotalTokens         int                        `json:"total_tokens"`
+	InputTokensDetails  responseInputTokenDetails  `json:"input_tokens_details"`
+	OutputTokensDetails responseOutputTokenDetails `json:"output_tokens_details"`
+}
+
+type responseInputTokenDetails struct {
+	CachedTokens     int `json:"cached_tokens"`
+	CacheWriteTokens int `json:"cache_write_tokens"`
+}
+
+type responseOutputTokenDetails struct {
+	ReasoningTokens int `json:"reasoning_tokens"`
 }
 
 type responseError struct {

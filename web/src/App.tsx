@@ -16,7 +16,6 @@ interface SessionCreatorState {
 }
 
 interface ProviderManagerState {
-  projectID: string
   document: ProviderSettingsDocument | null
   loading: boolean
 }
@@ -176,12 +175,11 @@ function App() {
     }
   }
 
-  const openProviderManager = async (projectID: string) => {
-    if (!projectID) return
-    setProviderManager({ projectID, document: null, loading: true })
+  const openProviderManager = async () => {
+    setProviderManager({ document: null, loading: true })
     try {
-      const document = await api.providerSettings(projectID)
-      setProviderManager((current) => current?.projectID === projectID ? { projectID, document, loading: false } : current)
+      const document = await api.providerSettings()
+      setProviderManager((current) => current ? { document, loading: false } : current)
     } catch (reason) {
       setProviderManager(null)
       setError(errorMessage(reason))
@@ -293,6 +291,9 @@ function App() {
 					...run,
 					inputTokens: Number(event.input_tokens ?? 0),
 					totalTokens: Number(event.total_tokens ?? 0),
+					cachedTokens: Number(event.cached_tokens ?? 0),
+					cacheWriteTokens: Number(event.cache_write_tokens ?? 0),
+					reasoningTokens: Number(event.reasoning_tokens ?? 0),
 				} : run)
         break
       case 'turn.failed':
@@ -378,7 +379,7 @@ function App() {
         onSelectProject={selectProject}
         onSelectSession={selectSession}
         onCreateSession={(projectID) => void openSessionCreator(projectID)}
-        onManageProviders={(projectID) => void openProviderManager(projectID)}
+        onManageProviders={() => void openProviderManager()}
         onArchiveSession={(session) => void archiveSession(session)}
         onDeleteSession={(session) => void deleteSession(session)}
         onAdd={() => setShowProjectForm(true)}
@@ -433,7 +434,6 @@ function App() {
       )}
       {providerManager && (
         <ProviderManagerDialog
-          project={projects.find((project) => project.id === providerManager.projectID)}
           state={providerManager}
           onDocument={(document) => setProviderManager((current) => current ? { ...current, document, loading: false } : current)}
           onClose={() => setProviderManager(null)}
@@ -455,7 +455,7 @@ function WorkspaceTree(props: {
   onSelectProject: (id: string) => void
   onSelectSession: (projectID: string, sessionID: string) => void
   onCreateSession: (projectID: string) => void
-  onManageProviders: (projectID: string) => void
+  onManageProviders: () => void
   onArchiveSession: (session: Session) => void
   onDeleteSession: (session: Session) => void
   onAdd: () => void
@@ -472,7 +472,7 @@ function WorkspaceTree(props: {
 
   return (
     <aside className="project-rail">
-      <div className="brand"><LogoIcon /><span>SAI</span></div>
+      <div className="brand"><LogoIcon /><span>SAI</span><button className="brand-settings" disabled={props.disabled} onClick={props.onManageProviders} aria-label="管理 Server Root 配置" title="Server Root 配置"><SettingsIcon /></button></div>
       <div className="rail-label">项目与会话</div>
       <nav className="project-tree" aria-label="项目和会话树">
         {props.projects.map((project) => {
@@ -494,12 +494,6 @@ function WorkspaceTree(props: {
                   </span>
                   <span className="project-session-count">{sessions.length}</span>
                 </button>
-                <button
-                  className="tree-icon-button"
-                  onClick={() => props.onManageProviders(project.id)}
-                  aria-label={`管理 ${projectName(project)} 的 Provider`}
-                  title="Provider 与模型设置"
-                ><SettingsIcon /></button>
                 <button
                   className="tree-icon-button"
                   disabled={props.disabled}
@@ -629,7 +623,12 @@ function ContextUsage(props: { context: Session['context']; activeInputTokens?: 
 	const percentLabel = `${usageEstimated && usedTokens > 0 ? '约 ' : ''}${Math.round(percent)}%`
 	const usageSource = usedTokens <= 0 ? '尚无使用数据' : usageEstimated ? '使用量为本地估算' : '使用量来自模型返回值'
 	const windowSource = context?.context_window_source === 'configured' ? '窗口来自模型配置' : '窗口为默认估算值'
-	const title = `上下文：${usedTokens.toLocaleString()} / ${contextWindow.toLocaleString()} tokens（${percent.toFixed(1)}%）\n${usageSource}；${windowSource}`
+	const cacheDetails = [
+		Number(context?.last_cached_tokens ?? 0) > 0 ? `缓存命中 ${Number(context?.last_cached_tokens).toLocaleString()}` : '',
+		Number(context?.last_cache_write_tokens ?? 0) > 0 ? `缓存写入 ${Number(context?.last_cache_write_tokens).toLocaleString()}` : '',
+		Number(context?.last_reasoning_tokens ?? 0) > 0 ? `推理 ${Number(context?.last_reasoning_tokens).toLocaleString()}` : '',
+	].filter(Boolean).join('；')
+	const title = `上下文：${usedTokens.toLocaleString()} / ${contextWindow.toLocaleString()} tokens（${percent.toFixed(1)}%）\n${usageSource}；${windowSource}${cacheDetails ? `\n${cacheDetails} tokens` : ''}`
 
 	return (
 		<div className={`context-usage ${tone}`} title={title}>
@@ -698,7 +697,14 @@ function ActiveRunView({ run }: { run: ActiveRun }) {
           <div className="message-meta"><strong>SAI</strong><span className="streaming-label"><i />生成中</span></div>
 					{run.steps.length > 0 && <ProcessTimeline steps={run.steps} />}
           {run.assistantText ? <MarkdownMessage text={run.assistantText} streaming /> : <div className="message-text assistant-stream"><span className="cursor" /></div>}
-          {run.totalTokens !== undefined && <div className="token-note">本轮 {run.totalTokens.toLocaleString()} tokens</div>}
+			{run.totalTokens !== undefined && (
+				<div className="token-note">
+					本轮 {run.totalTokens.toLocaleString()} tokens
+					{Boolean(run.cachedTokens) && ` · 缓存命中 ${run.cachedTokens?.toLocaleString()}`}
+					{Boolean(run.cacheWriteTokens) && ` · 缓存写入 ${run.cacheWriteTokens?.toLocaleString()}`}
+					{Boolean(run.reasoningTokens) && ` · 推理 ${run.reasoningTokens?.toLocaleString()}`}
+				</div>
+			)}
         </div>
       </article>
     </>
@@ -902,7 +908,7 @@ function SessionModelDialog(props: {
           <div>
             <span className="eyebrow">新建会话</span>
             <h2 id="model-dialog-title">选择模型</h2>
-            <p>{props.project ? `${projectName(props.project)} · ${props.project.root}` : '加载项目配置'}</p>
+            <p>{props.project ? `${projectName(props.project)} · ${props.project.root}` : '加载 Server Root 配置'}</p>
           </div>
           <button className="model-dialog-close" disabled={props.creating} onClick={props.onCancel} aria-label="关闭">×</button>
         </div>
@@ -929,7 +935,7 @@ function SessionModelDialog(props: {
               </button>
             )
           }) : (
-            <p className="model-choice-empty">项目配置中没有可用模型。</p>
+            <p className="model-choice-empty">Server Root 配置中没有可用模型。</p>
           )}
         </div>
         {selected && (selected.reasoning_levels?.length ?? 0) > 0 && (
@@ -976,7 +982,6 @@ interface ProviderDraft {
 }
 
 function ProviderManagerDialog(props: {
-  project?: Project
   state: ProviderManagerState
   onDocument: (document: ProviderSettingsDocument) => void
   onClose: () => void
@@ -1005,12 +1010,12 @@ function ProviderManagerDialog(props: {
   useEffect(() => {
     if (codexAuth?.status !== 'pending' || !draft?.existingName) return
     const timer = window.setInterval(() => {
-      void api.codexLoginStatus(props.state.projectID, draft.existingName)
+      void api.codexLoginStatus(draft.existingName)
         .then(setCodexAuth)
         .catch((reason: unknown) => props.onError(errorMessage(reason)))
     }, 1500)
     return () => window.clearInterval(timer)
-  }, [codexAuth?.status, draft?.existingName, props.state.projectID, props.onError])
+  }, [codexAuth?.status, draft?.existingName, props.onError])
 
   const save = async () => {
     if (!draft || saving) return
@@ -1018,8 +1023,8 @@ function ProviderManagerDialog(props: {
     try {
       const input = providerInput(draft)
       const updated = draft.existingName
-        ? await api.updateProvider(props.state.projectID, draft.existingName, input)
-        : await api.createProvider(props.state.projectID, input)
+        ? await api.updateProvider(draft.existingName, input)
+        : await api.createProvider(input)
       props.onDocument(updated)
       const saved = updated.providers.find((provider) => provider.name === input.name)
       if (saved) selectProvider(saved)
@@ -1034,7 +1039,7 @@ function ProviderManagerDialog(props: {
     if (!draft?.existingName || discovering) return
     setDiscovering(true)
     try {
-      const result = await api.discoverProviderModels(props.state.projectID, draft.existingName)
+      const result = await api.discoverProviderModels(draft.existingName)
       setDiscoveredModels(result.models)
     } catch (reason) {
       props.onError(errorMessage(reason))
@@ -1046,7 +1051,7 @@ function ProviderManagerDialog(props: {
   const setDefault = async (profile: string) => {
     if (!draft?.existingName) return
     try {
-      props.onDocument(await api.updateProviderDefault(props.state.projectID, draft.existingName, profile))
+      props.onDocument(await api.updateProviderDefault(draft.existingName, profile))
     } catch (reason) {
       props.onError(errorMessage(reason))
     }
@@ -1055,16 +1060,16 @@ function ProviderManagerDialog(props: {
   const startCodexLogin = async () => {
     if (!draft?.existingName) return
     try {
-      setCodexAuth(await api.startCodexLogin(props.state.projectID, draft.existingName))
+      setCodexAuth(await api.startCodexLogin(draft.existingName))
     } catch (reason) {
       props.onError(errorMessage(reason))
     }
   }
 
   const clearCodexLogin = async () => {
-    if (!draft?.existingName || !window.confirm('退出该项目的 Codex 登录？')) return
+    if (!draft?.existingName || !window.confirm('退出当前 Server Root 的 Codex 登录？')) return
     try {
-      await api.clearCodexLogin(props.state.projectID, draft.existingName)
+      await api.clearCodexLogin(draft.existingName)
       setCodexAuth({ status: 'signed_out' })
     } catch (reason) {
       props.onError(errorMessage(reason))
@@ -1083,14 +1088,14 @@ function ProviderManagerDialog(props: {
       <section className="provider-dialog" role="dialog" aria-modal="true" aria-labelledby="provider-dialog-title">
         <header className="provider-dialog-header">
           <div>
-            <span className="eyebrow">项目配置</span>
+            <span className="eyebrow">Server Root 配置</span>
             <h2 id="provider-dialog-title">Provider 与模型</h2>
-            <p>{props.project ? `${projectName(props.project)} · ${props.project.root}` : props.state.projectID}</p>
+            <p>{document ? `${document.server_root} · ${document.config_path}` : '读取当前 Server Root'}</p>
           </div>
           <button className="model-dialog-close" disabled={saving} onClick={props.onClose} aria-label="关闭">×</button>
         </header>
         {props.state.loading || !document || !draft ? (
-          <div className="provider-loading">读取项目配置…</div>
+          <div className="provider-loading">读取 Server Root 配置…</div>
         ) : (
           <div className="provider-dialog-body">
             <aside className="provider-list">
@@ -1280,7 +1285,7 @@ function ProjectSetup(props: { suggestedRoot: string; hasProjects: boolean; onCa
         <div className="setup-icon"><FolderIcon /></div>
         <span className="eyebrow">本地工作区</span>
         <h1>{props.hasProjects ? '添加另一个项目' : '连接你的第一个项目'}</h1>
-        <p>项目目录中应包含 <code>.agents/sai.yaml</code>，模型、工具和指令均由该配置加载。</p>
+        <p>项目目录只作为工作区；Provider、模型和运行配置由当前 Server Root 统一管理。</p>
         <label>项目目录<input value={root} onChange={(event) => setRoot(event.target.value)} placeholder="F:\work\project" autoFocus /></label>
         <label>显示名称 <small>可选</small><input value={name} onChange={(event) => setName(event.target.value)} placeholder="例如：Simple Agent" /></label>
         <div className="setup-actions">

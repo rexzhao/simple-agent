@@ -29,7 +29,7 @@ random loopback port and opens the application in the default browser.
 
 Options:
   --listen addr      Loopback listen address (default 127.0.0.1:0)
-  --server-root dir  Project and session storage root
+  --server-root dir  Configuration and durable data namespace root
   --cwd dir          Initial working-directory hint shown in the Web UI
   --no-open          Do not open the browser automatically
   --version          Print version and exit
@@ -62,7 +62,12 @@ func Run(args []string, stdout, stderr io.Writer) int {
 		return 0
 	}
 
-	root, err := resolveStorageRoot(*serverRoot)
+	basename, err := commandBasename(os.Args[0])
+	if err != nil {
+		fmt.Fprintf(stderr, "sai: %v\n", err)
+		return 1
+	}
+	root, err := resolveStorageRoot(*serverRoot, basename)
 	if err != nil {
 		fmt.Fprintf(stderr, "sai: %v\n", err)
 		return 1
@@ -79,7 +84,8 @@ func Run(args []string, stdout, stderr io.Writer) int {
 	}
 	defer listener.Close()
 
-	service, err := execution.NewServiceWithAgentRunner(root)
+	configPath := filepath.Join(root, basename+".yaml")
+	service, err := execution.NewServiceWithAgentRunner(root, configPath)
 	if err != nil {
 		fmt.Fprintf(stderr, "sai: %v\n", err)
 		return 1
@@ -109,7 +115,8 @@ func Run(args []string, stdout, stderr io.Writer) int {
 	url := "http://" + listener.Addr().String() + "/#token=" + token
 	publicURL := "http://" + listener.Addr().String() + "/"
 	fmt.Fprintf(stderr, "sai: starting %s\n", Version)
-	fmt.Fprintf(stderr, "sai: storage root: %s\n", root)
+	fmt.Fprintf(stderr, "sai: server root: %s\n", root)
+	fmt.Fprintf(stderr, "sai: root config: %s\n", configPath)
 	fmt.Fprintf(stderr, "sai: initial workspace: %s\n", initialCWD)
 	fmt.Fprintf(stderr, "sai: web server listening on %s\n", publicURL)
 	fmt.Fprintf(stdout, "SAI_WEB_URL\t%s\n", url)
@@ -144,23 +151,59 @@ func Run(args []string, stdout, stderr io.Writer) int {
 	}
 }
 
-func resolveStorageRoot(explicit string) (string, error) {
+func resolveStorageRoot(explicit, basename string) (string, error) {
 	root := strings.TrimSpace(explicit)
 	if root == "" {
-		root = strings.TrimSpace(os.Getenv("SAI_SERVER_ROOT"))
+		root = strings.TrimSpace(os.Getenv(serverRootEnvName(basename)))
 	}
 	if root == "" {
 		configDir, err := os.UserConfigDir()
 		if err != nil {
 			return "", fmt.Errorf("find user config directory: %w", err)
 		}
-		root = filepath.Join(configDir, "sai")
+		root = filepath.Join(configDir, basename)
 	}
 	abs, err := filepath.Abs(root)
 	if err != nil {
 		return "", fmt.Errorf("resolve storage root %q: %w", root, err)
 	}
 	return filepath.Clean(abs), nil
+}
+
+func commandBasename(argv0 string) (string, error) {
+	name := strings.TrimSpace(argv0)
+	if separator := strings.LastIndexAny(name, `/\`); separator >= 0 {
+		name = name[separator+1:]
+	}
+	if strings.EqualFold(filepath.Ext(name), ".exe") {
+		name = strings.TrimSuffix(name, filepath.Ext(name))
+	}
+	name = strings.TrimSpace(name)
+	if name == "" || name == "." {
+		return "", fmt.Errorf("derive command basename from argv[0] %q", argv0)
+	}
+	return name, nil
+}
+
+func serverRootEnvName(basename string) string {
+	var normalized strings.Builder
+	lastUnderscore := false
+	for _, char := range strings.ToUpper(basename) {
+		if (char >= 'A' && char <= 'Z') || (char >= '0' && char <= '9') {
+			normalized.WriteRune(char)
+			lastUnderscore = false
+			continue
+		}
+		if normalized.Len() > 0 && !lastUnderscore {
+			normalized.WriteByte('_')
+			lastUnderscore = true
+		}
+	}
+	name := strings.Trim(normalized.String(), "_")
+	if name == "" {
+		return "SAI_SERVER_ROOT"
+	}
+	return name + "_SERVER_ROOT"
 }
 
 func resolveInitialCWD(value string) (string, error) {

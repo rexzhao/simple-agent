@@ -1,7 +1,9 @@
 package openairesponses
 
 import (
+	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -99,6 +101,7 @@ func TestProviderStreamPostsResponsesRequestAndEmitsEvents(t *testing.T) {
 			{"role": "user", "content": "Hello"}
 		],
 		"stream": true,
+		"store": false,
 		"temperature": 0.6
 	}`)
 }
@@ -371,13 +374,165 @@ func TestProviderStreamRequiresAPIKey(t *testing.T) {
 	}
 }
 
+func TestProviderStreamReusesStableCacheAffinityForLongPrefix(t *testing.T) {
+	requests := make(chan capturedRequest, 2)
+	var requestCount atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("ReadAll() error = %v", err)
+		}
+		requests <- capturedRequest{
+			SessionID:       r.Header.Get("session_id"),
+			ClientRequestID: r.Header.Get("x-client-request-id"),
+			Body:            body,
+		}
+		count := requestCount.Add(1)
+		cached := 0
+		if count == 2 {
+			cached = 1408
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, `data: {"type":"response.completed","response":{"usage":{"input_tokens":1500,"output_tokens":8,"total_tokens":1508,"input_tokens_details":{"cached_tokens":`+fmt.Sprint(cached)+`}}}}`+"\n\n")
+	}))
+	defer server.Close()
+
+	provider, err := NewProvider(ProviderConfig{BaseURL: server.URL, APIKey: "test-key", HTTPClient: server.Client()})
+	if err != nil {
+		t.Fatalf("NewProvider() error = %v", err)
+	}
+	request := model.Request{
+		Model:     "gpt-5.5",
+		SessionID: "session-cache-key",
+		Messages: []model.Message{{
+			Role:    model.MessageRoleUser,
+			Content: strings.Repeat("stable prompt prefix ", 300),
+		}},
+	}
+
+	for attempt := 1; attempt <= 2; attempt++ {
+		events, err := provider.Stream(context.Background(), request)
+		if err != nil {
+			t.Fatalf("Stream(attempt %d) error = %v", attempt, err)
+		}
+		got := collectEvents(t, events)
+		if len(got) != 1 {
+			t.Fatalf("attempt %d events = %#v, want one usage event", attempt, got)
+		}
+		usage := got[0].(model.UsageEvent).Usage
+		if attempt == 1 && usage.CachedTokens != 0 {
+			t.Fatalf("first CachedTokens = %d, want 0", usage.CachedTokens)
+		}
+		if attempt == 2 && usage.CachedTokens != 1408 {
+			t.Fatalf("second CachedTokens = %d, want 1408", usage.CachedTokens)
+		}
+	}
+
+	first := <-requests
+	second := <-requests
+	for index, captured := range []capturedRequest{first, second} {
+		if captured.SessionID != "session-cache-key" || captured.ClientRequestID != "session-cache-key" {
+			t.Fatalf("request %d affinity headers = session_id %q, client request %q", index+1, captured.SessionID, captured.ClientRequestID)
+		}
+	}
+	if !bytes.Equal(first.Body, second.Body) {
+		t.Fatalf("request bodies differ\nfirst:  %s\nsecond: %s", first.Body, second.Body)
+	}
+	if got := decodeJSON(t, first.Body).(map[string]any)["prompt_cache_key"]; got != "session-cache-key" {
+		t.Fatalf("prompt_cache_key = %#v, want session-cache-key", got)
+	}
+}
+
+func TestProviderStreamFallsBackWhenPreviousResponseIDIsUnavailable(t *testing.T) {
+	requests := make(chan []byte, 2)
+	var requestCount atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("ReadAll() error = %v", err)
+		}
+		requests <- body
+		if requestCount.Add(1) == 1 {
+			http.Error(w, `{"error":{"message":"previous_response_id not found"}}`, http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: {\"type\":\"response.completed\"}\n\n")
+	}))
+	defer server.Close()
+
+	provider, err := NewProvider(ProviderConfig{BaseURL: server.URL, APIKey: "test-key", HTTPClient: server.Client()})
+	if err != nil {
+		t.Fatalf("NewProvider() error = %v", err)
+	}
+	events, err := provider.Stream(context.Background(), model.Request{
+		Model: "gpt-5.6",
+		Messages: []model.Message{
+			{Role: model.MessageRoleUser, Content: "First"},
+			{Role: model.MessageRoleAssistant, Content: "Answer", ResponseState: &model.ResponseState{
+				ID: "resp_missing", Origin: server.URL, Model: "gpt-5.6", Stored: true,
+			}},
+			{Role: model.MessageRoleUser, Content: "Follow up"},
+		},
+		Parameters: map[string]any{
+			"responses": map[string]any{"store": true, "state": "previous_response_id"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Stream() error = %v", err)
+	}
+	_ = collectEvents(t, events)
+
+	first := decodeJSON(t, <-requests).(map[string]any)
+	second := decodeJSON(t, <-requests).(map[string]any)
+	if first["previous_response_id"] != "resp_missing" {
+		t.Fatalf("first previous_response_id = %#v, want resp_missing", first["previous_response_id"])
+	}
+	if got := len(first["input"].([]any)); got != 1 {
+		t.Fatalf("first input count = %d, want only follow-up", got)
+	}
+	if _, ok := second["previous_response_id"]; ok {
+		t.Fatalf("fallback request retained previous_response_id: %#v", second)
+	}
+	if got := len(second["input"].([]any)); got != 3 {
+		t.Fatalf("fallback input count = %d, want full context", got)
+	}
+}
+
+func TestProviderStreamReportsMissingTerminalEvent(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\n")
+	}))
+	defer server.Close()
+
+	provider, err := NewProvider(ProviderConfig{BaseURL: server.URL, APIKey: "test-key", HTTPClient: server.Client()})
+	if err != nil {
+		t.Fatalf("NewProvider() error = %v", err)
+	}
+	events, err := provider.Stream(context.Background(), model.Request{Model: "gpt-5.5"})
+	if err != nil {
+		t.Fatalf("Stream() error = %v", err)
+	}
+	got := collectEventsIncludingErrors(t, events)
+	if len(got) != 2 {
+		t.Fatalf("events = %#v, want text and terminal error", got)
+	}
+	errorEvent, ok := got[1].(model.ErrorEvent)
+	if !ok || !strings.Contains(errorEvent.Err.Error(), "before a terminal response event") {
+		t.Fatalf("event[1] = %#v, want missing terminal error", got[1])
+	}
+}
+
 type capturedRequest struct {
-	Method        string
-	Path          string
-	Authorization string
-	AccountID     string
-	ContentType   string
-	Body          []byte
+	Method          string
+	Path            string
+	Authorization   string
+	AccountID       string
+	ContentType     string
+	SessionID       string
+	ClientRequestID string
+	Body            []byte
 }
 
 type fakeTokenSource struct {
@@ -418,6 +573,24 @@ func collectEvents(t *testing.T, events <-chan model.Event) []model.Event {
 			got = append(got, event)
 		case <-timeout:
 			t.Fatalf("timed out waiting for stream events")
+		}
+	}
+}
+
+func collectEventsIncludingErrors(t *testing.T, events <-chan model.Event) []model.Event {
+	t.Helper()
+
+	var got []model.Event
+	timeout := time.After(time.Second)
+	for {
+		select {
+		case event, ok := <-events:
+			if !ok {
+				return got
+			}
+			got = append(got, event)
+		case <-timeout:
+			t.Fatal("timed out waiting for stream events")
 		}
 	}
 }
