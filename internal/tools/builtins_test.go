@@ -284,6 +284,38 @@ func TestGlobFilesMaxResultsTruncates(t *testing.T) {
 	}
 }
 
+func TestGlobAndGrepRespectGitIgnore(t *testing.T) {
+	root := t.TempDir()
+	writeTestFile(t, filepath.Join(root, ".gitignore"), "ignored/\n*.secret\n!keep.secret\n")
+	writeTestFile(t, filepath.Join(root, "visible.txt"), "needle\n")
+	writeTestFile(t, filepath.Join(root, "hidden.secret"), "needle\n")
+	writeTestFile(t, filepath.Join(root, "keep.secret"), "needle\n")
+	mkdirTestDir(t, filepath.Join(root, "ignored"))
+	writeTestFile(t, filepath.Join(root, "ignored", "hidden.txt"), "needle\n")
+	mkdirTestDir(t, filepath.Join(root, "nested"))
+	writeTestFile(t, filepath.Join(root, "nested", ".gitignore"), "generated/\n")
+	writeTestFile(t, filepath.Join(root, "nested", "visible.txt"), "needle\n")
+	mkdirTestDir(t, filepath.Join(root, "nested", "generated"))
+	writeTestFile(t, filepath.Join(root, "nested", "generated", "hidden.txt"), "needle\n")
+
+	registry := registerBuiltinsForTest(t, root)
+	globResult, err := registry.Execute(context.Background(), BuiltinGlobFiles, map[string]any{"pattern": "**"})
+	if err != nil {
+		t.Fatalf("Execute(glob_files) error = %v", err)
+	}
+	if got, want := globResult.Content, "keep.secret\nnested/visible.txt\nvisible.txt"; got != want {
+		t.Fatalf("Execute(glob_files) content = %q, want %q", got, want)
+	}
+
+	grepResult, err := registry.Execute(context.Background(), BuiltinGrepFiles, map[string]any{"query": "needle"})
+	if err != nil {
+		t.Fatalf("Execute(grep_files) error = %v", err)
+	}
+	if got, want := grepResult.Content, "keep.secret:1:needle\nnested/visible.txt:1:needle\nvisible.txt:1:needle"; got != want {
+		t.Fatalf("Execute(grep_files) content = %q, want %q", got, want)
+	}
+}
+
 func TestGlobFilesRejectsOutsideSearchPath(t *testing.T) {
 	root := t.TempDir()
 	outside := t.TempDir()

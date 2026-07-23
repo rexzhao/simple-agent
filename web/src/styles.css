@@ -378,7 +378,11 @@ svg { width: 1.1em; height: 1.1em; fill: none; stroke: currentColor; stroke-widt
 .model-output-step pre { color: var(--text); }
 
 .tool-row { width: min(660px, 100%); border: 2px solid var(--border); color: var(--text); background: #ffffff; font-family: "Space Grotesk", "Segoe UI", sans-serif; font-size: 10.5px; }
-.tool-row-header { min-height: 35px; display: flex; align-items: center; gap: 8px; padding: 6px 9px; }
+.tool-row-header { min-height: 35px; display: flex; align-items: center; gap: 8px; padding: 6px 9px; list-style: none; }
+.tool-row-header::-webkit-details-marker { display: none; }
+.tool-row.expandable > .tool-row-header { cursor: pointer; }
+.tool-row.expandable > .tool-row-header:hover { background: var(--accent-soft); }
+.tool-row.expandable[open] > .tool-row-header { border-bottom: 2px solid var(--border); background: var(--panel); }
 .tool-row-header svg { width: 15px; height: 15px; flex: 0 0 auto; color: var(--text); }
 .tool-row-header strong { flex: 0 0 auto; font-weight: 800; }
 .tool-row-header code { min-width: 0; overflow: hidden; color: var(--muted); font: 10px var(--font-mono); text-overflow: ellipsis; white-space: nowrap; }
@@ -389,11 +393,16 @@ svg { width: 1.1em; height: 1.1em; fill: none; stroke: currentColor; stroke-widt
 .tool-row.finished .tool-row-header svg { color: var(--success); }
 .tool-row.error .tool-row-header small { color: #ffffff; background: var(--danger); }
 .tool-row.error .tool-row-header svg { color: var(--danger); }
-.tool-details { border-top: 2px solid var(--border); background: var(--panel); }
-.tool-details > summary { padding: 7px 9px; color: var(--muted); cursor: pointer; font-size: 9.5px; font-weight: 750; }
+.tool-details { background: var(--panel); }
 .tool-details > div { padding: 0 9px 9px; }
+.tool-details > div:first-child { padding-top: 9px; }
 .tool-details > div > span { display: block; margin: 4px 0 5px; color: var(--muted); font-size: 9px; font-weight: 800; text-transform: uppercase; }
 .tool-details pre { max-height: 260px; margin: 0; padding: 9px 10px; overflow: auto; border: 2px solid var(--border); color: #f9fafb; background: #111111; font: 10.5px/1.6 var(--font-mono); white-space: pre-wrap; overflow-wrap: anywhere; }
+.tool-edit-diff pre span { display: block; }
+.tool-edit-diff pre .diff-meta { color: #9ca3af; }
+.tool-edit-diff pre .diff-context { color: #e5e7eb; }
+.tool-edit-diff pre .diff-removed { color: #fecaca; background: rgba(220, 38, 38, .24); }
+.tool-edit-diff pre .diff-added { color: #bbf7d0; background: rgba(21, 128, 61, .28); }
 
 .load-older { display: block; margin: 0 auto 30px; padding: 7px 12px; border: 2px solid var(--border); color: var(--text); background: #ffffff; box-shadow: var(--shadow-2); cursor: pointer; font-size: 10.5px; font-weight: 750; }
 .load-older:hover { box-shadow: none; transform: translate(3px, 3px); }

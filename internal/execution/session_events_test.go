@@ -2,6 +2,7 @@ package execution
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -33,6 +34,39 @@ func TestSessionStreamUsageEventIncludesCacheDetails(t *testing.T) {
 		if got := event[key]; got != want {
 			t.Fatalf("event[%q] = %#v, want %#v; event = %#v", key, got, want, event)
 		}
+	}
+}
+
+func TestSessionToolDisplayArgumentsIncludesEditDiffInputs(t *testing.T) {
+	displayed := sessionToolDisplayArguments("edit_file", `{"path":"notes.txt","old":"before","new":"after","extra":"hidden"}`)
+	var arguments map[string]string
+	if err := json.Unmarshal([]byte(displayed), &arguments); err != nil {
+		t.Fatalf("displayed arguments are not JSON: %v", err)
+	}
+	want := map[string]string{"path": "notes.txt", "old": "before", "new": "after"}
+	if len(arguments) != len(want) {
+		t.Fatalf("displayed arguments = %#v, want %#v", arguments, want)
+	}
+	for key, value := range want {
+		if arguments[key] != value {
+			t.Fatalf("displayed arguments[%q] = %q, want %q; all = %#v", key, arguments[key], value, arguments)
+		}
+	}
+}
+
+func TestSessionToolDisplayArgumentsIncludesGrepSearchMode(t *testing.T) {
+	displayed := sessionToolDisplayArguments("grep_files", `{"path":"src","query":"foo.*bar","regex":true,"case_sensitive":true,"exclude":["vendor/**"]}`)
+	var arguments map[string]any
+	if err := json.Unmarshal([]byte(displayed), &arguments); err != nil {
+		t.Fatalf("displayed arguments are not JSON: %v", err)
+	}
+	for key, want := range map[string]any{"path": "src", "query": "foo.*bar", "regex": true, "case_sensitive": true} {
+		if arguments[key] != want {
+			t.Fatalf("displayed arguments[%q] = %#v, want %#v; all = %#v", key, arguments[key], want, arguments)
+		}
+	}
+	if _, ok := arguments["exclude"]; ok {
+		t.Fatalf("displayed arguments = %#v, want exclude omitted", arguments)
 	}
 }
 

@@ -954,19 +954,67 @@ function ToolRow({ tool }: { tool: ToolActivity }) {
 	const argumentsObject = parseToolArguments(tool.arguments)
 	const target = toolTarget(tool.name, argumentsObject)
 	const command = tool.name === 'shell' ? stringField(argumentsObject, 'command') : ''
-	const showDetails = Boolean(command || tool.result)
-	return (
-		<div className={`tool-row ${tool.status}`}>
-			<div className="tool-row-header"><ToolIcon /><strong>{toolDisplayName(tool.name)}</strong>{target && <code title={target}>{target}</code>}<small>{toolStatus(tool.status)}</small></div>
-			{showDetails && (
-				<details className="tool-details">
-					<summary>{command ? '查看命令与输出' : '查看输出'}</summary>
-					{command && <div><span>命令</span><pre>{command}</pre></div>}
-					{tool.result && <div><span>输出</span><pre>{tool.result}</pre></div>}
-				</details>
-			)}
+	const oldText = tool.name === 'edit_file' ? stringField(argumentsObject, 'old') : ''
+	const newText = tool.name === 'edit_file' ? stringField(argumentsObject, 'new') : ''
+	const showEditDiff = tool.name === 'edit_file' && Boolean(oldText)
+	const showResult = Boolean(tool.result) && (tool.name !== 'edit_file' || tool.status === 'error')
+	const showDetails = Boolean(command || showEditDiff || showResult)
+	const header = <><ToolIcon /><strong>{toolDisplayName(tool.name)}</strong>{target && <code title={target}>{target}</code>}<small>{toolStatus(tool.status)}</small></>
+	const details = (
+		<div className="tool-details">
+			{command && <div><span>命令</span><pre>{command}</pre></div>}
+			{showEditDiff && <EditFileDiff path={target} oldText={oldText} newText={newText} />}
+			{showResult && <div><span>{tool.name === 'edit_file' ? '错误详情' : '输出'}</span><pre>{tool.result}</pre></div>}
 		</div>
+	)
+	if (!showDetails) {
+		return <div className={`tool-row ${tool.status}`}><div className="tool-row-header">{header}</div></div>
+	}
+	return (
+		<details className={`tool-row ${tool.status} expandable`}>
+			<summary className="tool-row-header">{header}</summary>
+			{details}
+		</details>
   )
+}
+
+function EditFileDiff(props: { path: string; oldText: string; newText: string }) {
+	const lines = editFileDiffLines(props.oldText, props.newText)
+	return (
+		<div className="tool-edit-diff">
+			<span>变更</span>
+			<pre aria-label={`编辑 ${props.path} 的差异`}><span className="diff-meta">{`--- ${props.path}\n+++ ${props.path}\n@@\n`}</span>{lines.map((line, index) => <span className={`diff-${line.kind}`} key={`${line.kind}-${index}`}>{`${diffPrefix(line.kind)}${line.text}${index < lines.length - 1 ? '\n' : ''}`}</span>)}</pre>
+		</div>
+	)
+}
+
+type EditDiffLine = { kind: 'context' | 'removed' | 'added'; text: string }
+
+function editFileDiffLines(oldText: string, newText: string): EditDiffLine[] {
+	const oldLines = splitEditDiffLines(oldText)
+	const newLines = splitEditDiffLines(newText)
+	let prefixLength = 0
+	for (; prefixLength < oldLines.length && prefixLength < newLines.length && oldLines[prefixLength] === newLines[prefixLength]; prefixLength++) {
+		// Shared prefix is displayed as diff context.
+	}
+	let suffixLength = 0
+	for (; suffixLength < oldLines.length - prefixLength && suffixLength < newLines.length - prefixLength && oldLines[oldLines.length - suffixLength - 1] === newLines[newLines.length - suffixLength - 1]; suffixLength++) {
+		// Shared suffix is displayed as diff context.
+	}
+	return [
+		...oldLines.slice(0, prefixLength).map((text) => ({ kind: 'context' as const, text })),
+		...oldLines.slice(prefixLength, oldLines.length - suffixLength).map((text) => ({ kind: 'removed' as const, text })),
+		...newLines.slice(prefixLength, newLines.length - suffixLength).map((text) => ({ kind: 'added' as const, text })),
+		...oldLines.slice(oldLines.length - suffixLength).map((text) => ({ kind: 'context' as const, text })),
+	]
+}
+
+function splitEditDiffLines(text: string): string[] {
+	return text === '' ? [] : text.split('\n')
+}
+
+function diffPrefix(kind: EditDiffLine['kind']): string {
+	return kind === 'removed' ? '-' : kind === 'added' ? '+' : ' '
 }
 
 function Composer(props: {
@@ -1584,6 +1632,16 @@ function stringField(value: Record<string, unknown>, key: string): string {
 
 function toolTarget(name: string, argumentsObject: Record<string, unknown>): string {
 	const path = stringField(argumentsObject, 'path')
+	if (name === 'list_files') return path || '.'
+	if (name === 'glob_files') {
+		const pattern = stringField(argumentsObject, 'pattern')
+		return [path, pattern && `模式: ${pattern}`].filter(Boolean).join(' · ')
+	}
+	if (name === 'grep_files') {
+		const query = stringField(argumentsObject, 'query')
+		const mode = argumentsObject.regex === true ? '正则' : '文本'
+		return [path, query && `${mode}: ${query}`].filter(Boolean).join(' · ')
+	}
 	if (path) return path
 	if (name === 'shell') {
 		const command = stringField(argumentsObject, 'command').replace(/\s+/g, ' ').trim()

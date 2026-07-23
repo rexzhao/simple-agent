@@ -684,6 +684,10 @@ func sessionToolDisplayArguments(name, arguments string) string {
 	keys := []string{"path", "pattern", "query", "start_line", "line_count"}
 	if name == "shell" {
 		keys = []string{"command"}
+	} else if name == "edit_file" {
+		keys = []string{"path", "old", "new"}
+	} else if name == "grep_files" {
+		keys = []string{"path", "query", "regex", "case_sensitive"}
 	}
 	for _, key := range keys {
 		if value, ok := parsed[key]; ok {

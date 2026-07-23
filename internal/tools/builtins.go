@@ -445,6 +445,7 @@ func newGlobFilesExecutor(rootDir string) Executor {
 		}
 
 		results := []string{}
+		gitIgnore := newGitIgnoreMatcher(rootDir)
 		err = filepath.WalkDir(searchRoot, func(current string, entry fs.DirEntry, walkErr error) error {
 			if walkErr != nil {
 				return walkErr
@@ -461,6 +462,16 @@ func newGlobFilesExecutor(rootDir string) Executor {
 				return err
 			}
 			if workspaceRel == "." {
+				return nil
+			}
+			ignored, err := gitIgnore.ignores(workspaceRel, entry.IsDir())
+			if err != nil {
+				return err
+			}
+			if ignored {
+				if entry.IsDir() {
+					return filepath.SkipDir
+				}
 				return nil
 			}
 			if !includeHidden && hasHiddenPathSegment(workspaceRel) {
@@ -577,7 +588,8 @@ func newGrepFilesExecutor(rootDir string) Executor {
 			return model.ToolResult{}, fmt.Errorf("path %q is not a directory", searchPath)
 		}
 
-		files, err := grepCandidateFiles(ctx, rootDir, searchRoot, include, exclude)
+		gitIgnore := newGitIgnoreMatcher(rootDir)
+		files, err := grepCandidateFiles(ctx, rootDir, searchRoot, include, exclude, gitIgnore)
 		if err != nil {
 			return model.ToolResult{}, err
 		}
@@ -1064,7 +1076,7 @@ type grepCandidateFile struct {
 	workspaceRel string
 }
 
-func grepCandidateFiles(ctx context.Context, rootDir, searchRoot string, include, exclude []string) ([]grepCandidateFile, error) {
+func grepCandidateFiles(ctx context.Context, rootDir, searchRoot string, include, exclude []string, gitIgnore *gitIgnoreMatcher) ([]grepCandidateFile, error) {
 	files := []grepCandidateFile{}
 	err := filepath.WalkDir(searchRoot, func(current string, entry fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
@@ -1074,6 +1086,21 @@ func grepCandidateFiles(ctx context.Context, rootDir, searchRoot string, include
 			return ctxErr
 		}
 		if entry.Type()&os.ModeSymlink != 0 {
+			return nil
+		}
+
+		workspaceRel, err := slashRel(rootDir, current)
+		if err != nil {
+			return err
+		}
+		ignored, err := gitIgnore.ignores(workspaceRel, entry.IsDir())
+		if err != nil {
+			return err
+		}
+		if ignored {
+			if entry.IsDir() {
+				return filepath.SkipDir
+			}
 			return nil
 		}
 		if entry.IsDir() {
@@ -1100,10 +1127,6 @@ func grepCandidateFiles(ctx context.Context, rootDir, searchRoot string, include
 			}
 		}
 
-		workspaceRel, err := slashRel(rootDir, current)
-		if err != nil {
-			return err
-		}
 		files = append(files, grepCandidateFile{
 			absolute:     current,
 			workspaceRel: workspaceRel,
