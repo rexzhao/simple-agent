@@ -440,8 +440,8 @@ function App() {
     }
   }, [addActiveRun, handleRunEvent, recoveredRuns, refreshSession, updateActiveRun])
 
-  const sendMessage = async (content: string, images: PastedImageAttachment[]) => {
-    if (!selectedSessionID || activeRunsRef.current[selectedSessionID] || (!content.trim() && images.length === 0)) return
+  const sendMessage = async (content: string, images: PastedImageAttachment[]): Promise<boolean> => {
+    if (!selectedSessionID || activeRunsRef.current[selectedSessionID] || (!content.trim() && images.length === 0)) return false
     const sessionID = selectedSessionID
     const imageInputs: ImageAttachmentInput[] = images.map((image) => ({ data_url: image.dataURL, detail: 'auto' }))
     try {
@@ -456,11 +456,17 @@ function App() {
         agentIteration: 0,
         status: 'running',
       })
-      await streamRun(started.run_id, (event) => handleRunEvent(sessionID, started.run_id, event))
+      void streamRun(started.run_id, (event) => handleRunEvent(sessionID, started.run_id, event)).catch((reason: unknown) => {
+        const runID = activeRunsRef.current[sessionID]?.id
+        if (runID) updateActiveRun(sessionID, runID, () => null)
+        setError(errorMessage(reason))
+      })
+      return true
     } catch (reason) {
       const runID = activeRunsRef.current[sessionID]?.id
       if (runID) updateActiveRun(sessionID, runID, () => null)
       setError(errorMessage(reason))
+      return false
     }
   }
 
@@ -531,7 +537,7 @@ function App() {
 			otherSessionsRunning={otherSessionsRunning}
 					recentStepsByTurn={recentStepsByTurn}
             onLoadOlder={() => void loadOlder()}
-            onSend={(content, images) => void sendMessage(content, images)}
+            onSend={(content, images) => sendMessage(content, images)}
             onCancel={() => void cancelRun()}
             onCompact={() => void compactSession()}
           />
@@ -682,7 +688,7 @@ function Conversation(props: {
 	otherSessionsRunning: boolean
 	recentStepsByTurn: Record<string, RunStep[]>
   onLoadOlder: () => void
-  onSend: (content: string, images: PastedImageAttachment[]) => void
+  onSend: (content: string, images: PastedImageAttachment[]) => Promise<boolean>
   onCancel: () => void
   onCompact: () => void
 }) {
@@ -1103,13 +1109,15 @@ function Composer(props: {
   onDraftClear: () => void
   running: boolean
   blocked: boolean
-  onSend: (content: string, images: PastedImageAttachment[]) => void
+  onSend: (content: string, images: PastedImageAttachment[]) => Promise<boolean>
   onCancel: () => void
 }) {
   const textareaRef = useRef<HTMLTextAreaElement>(null)
   const nextPastedTextID = useRef(1)
   const nextPastedImageID = useRef(1)
   const [imageError, setImageError] = useState('')
+  const [submitting, setSubmitting] = useState(false)
+  const composerDisabled = props.running || props.blocked || submitting
   const resizeTextarea = useCallback(() => {
     const textarea = textareaRef.current
     if (!textarea) return
@@ -1126,16 +1134,24 @@ function Composer(props: {
     return () => window.removeEventListener('resize', resizeTextarea)
   }, [resizeTextarea])
 
-  const submit = () => {
-    if (props.running || props.blocked) return
+  const submit = async () => {
+    if (props.running || props.blocked || submitting) return
     const content = [...props.draft.pastedTexts.map((pastedText) => pastedText.content), props.draft.content]
       .filter((part) => part.trim())
       .join('\n\n')
       .trim()
     if (!content && props.draft.pastedImages.length === 0) return
-    props.onSend(content, props.draft.pastedImages)
-    props.onDraftClear()
-    setImageError('')
+    setSubmitting(true)
+    try {
+      if (await props.onSend(content, props.draft.pastedImages)) {
+        props.onDraftClear()
+        setImageError('')
+      }
+    } catch (reason) {
+      setImageError(errorMessage(reason))
+    } finally {
+      setSubmitting(false)
+    }
   }
 
   const addClipboardImages = async (files: File[]) => {
@@ -1200,7 +1216,7 @@ function Composer(props: {
               <button
                 type="button"
                 className="pasted-text-attachment-remove"
-                disabled={props.running || props.blocked}
+                disabled={composerDisabled}
                 onClick={() => props.onPastedTextRemove(pastedText.id)}
                 aria-label={`移除粘贴文本 #${index + 1}`}
                 title="移除"
@@ -1218,7 +1234,7 @@ function Composer(props: {
               <button
                 type="button"
                 className="pasted-text-attachment-remove"
-                disabled={props.running || props.blocked}
+                disabled={composerDisabled}
                 onClick={() => props.onPastedImageRemove(image.id)}
                 aria-label={`移除图片 #${index + 1}`}
                 title="移除"
@@ -1232,7 +1248,7 @@ function Composer(props: {
         <textarea
           ref={textareaRef}
           value={props.draft.content}
-		  disabled={props.running || props.blocked}
+		  disabled={composerDisabled}
           rows={1}
 		  placeholder={placeholder}
           onChange={(event) => props.onContentChange(event.target.value)}
@@ -1254,14 +1270,14 @@ function Composer(props: {
           onKeyDown={(event) => {
             if (event.key === 'Enter' && !event.shiftKey) {
               event.preventDefault()
-              submit()
+              void submit()
             }
           }}
         />
         {props.running ? (
           <button className="stop-button" onClick={props.onCancel}><StopIcon /> 停止</button>
         ) : (
-		  <button className="send-button" disabled={(!props.draft.content.trim() && props.draft.pastedTexts.length === 0 && props.draft.pastedImages.length === 0) || props.blocked} onClick={submit} aria-label="发送"><SendIcon /></button>
+		  <button className="send-button" disabled={(!props.draft.content.trim() && props.draft.pastedTexts.length === 0 && props.draft.pastedImages.length === 0) || composerDisabled} onClick={() => void submit()} aria-label="发送"><SendIcon /></button>
         )}
       </div>
       <div className="composer-hint"><span>{props.draft.pastedImages.length > 0 ? '图片将与消息一起发送' : props.draft.pastedTexts.length > 0 ? '粘贴文本会先发送，补充说明随后附加' : 'Enter 发送 · Shift+Enter 换行 · 可粘贴图片'}</span><span>本地运行</span></div>

@@ -17,6 +17,15 @@ type BlobRef struct {
 	MediaType string `json:"media_type,omitempty"`
 }
 
+const (
+	// MaxImageInputAttachments, MaxImageInputBytes, and
+	// MaxImageInputTotalBytes bound every user image input path, including
+	// callers that do not pass through the Web API.
+	MaxImageInputAttachments = 5
+	MaxImageInputBytes       = 4 * 1024 * 1024
+	MaxImageInputTotalBytes  = 12 * 1024 * 1024
+)
+
 // NormalizeImageMediaType returns the canonical MIME type for image formats
 // accepted by every built-in multimodal provider.
 func NormalizeImageMediaType(mediaType string) (string, bool) {
@@ -54,6 +63,86 @@ func ImageBytesMatchMediaType(mediaType string, data []byte) bool {
 // the supported model providers.
 func ImageDataURL(mediaType string, data []byte) string {
 	return "data:" + strings.ToLower(strings.TrimSpace(mediaType)) + ";base64," + base64.StdEncoding.EncodeToString(data)
+}
+
+// ParseSupportedImageDataURL decodes an inline data URL and validates the
+// image format accepted by every built-in multimodal provider.
+func ParseSupportedImageDataURL(value string) (string, []byte, error) {
+	mediaType, data, err := ParseImageDataURL(value)
+	if err != nil {
+		return "", nil, err
+	}
+	normalizedMediaType, supported := NormalizeImageMediaType(mediaType)
+	if !supported {
+		return "", nil, fmt.Errorf("unsupported image media type %q", mediaType)
+	}
+	if len(data) == 0 {
+		return "", nil, fmt.Errorf("image data is empty")
+	}
+	if !ImageBytesMatchMediaType(normalizedMediaType, data) {
+		return "", nil, fmt.Errorf("image data does not match media type %q", normalizedMediaType)
+	}
+	return normalizedMediaType, data, nil
+}
+
+// ValidateImageInputBlocks checks image-bearing content blocks before they
+// reach durable session storage or a provider request. Blob references are
+// permitted only while reading or rewriting an already persisted message.
+func ValidateImageInputBlocks(blocks []InputContentBlock, allowBlobRefs bool) error {
+	imageCount := 0
+	totalBytes := int64(0)
+	for index, block := range blocks {
+		typeName := strings.TrimSpace(block.Type)
+		hasImage := typeName == "input_image" || strings.TrimSpace(block.ImageURL) != "" || block.ImageBlob != nil
+		if !hasImage {
+			continue
+		}
+		if typeName != "input_image" {
+			return fmt.Errorf("content block %d has image data but is not input_image", index+1)
+		}
+		imageCount++
+		if imageCount > MaxImageInputAttachments {
+			return fmt.Errorf("at most %d images may be attached", MaxImageInputAttachments)
+		}
+
+		detail := strings.ToLower(strings.TrimSpace(block.Detail))
+		switch detail {
+		case "", "auto", "low", "high":
+		default:
+			return fmt.Errorf("image %d has unsupported detail %q", imageCount, block.Detail)
+		}
+
+		var imageBytes int64
+		if block.ImageBlob != nil {
+			if !allowBlobRefs {
+				return fmt.Errorf("image %d must be an inline base64 data URL", imageCount)
+			}
+			if strings.TrimSpace(block.ImageURL) != "" {
+				return fmt.Errorf("image %d cannot set both image_url and image_blob", imageCount)
+			}
+			if _, supported := NormalizeImageMediaType(block.ImageBlob.MediaType); !supported {
+				return fmt.Errorf("image %d has unsupported media type %q", imageCount, block.ImageBlob.MediaType)
+			}
+			if block.ImageBlob.SizeBytes <= 0 {
+				return fmt.Errorf("image %d has invalid size", imageCount)
+			}
+			imageBytes = block.ImageBlob.SizeBytes
+		} else {
+			_, data, err := ParseSupportedImageDataURL(block.ImageURL)
+			if err != nil {
+				return fmt.Errorf("image %d: %w", imageCount, err)
+			}
+			imageBytes = int64(len(data))
+		}
+		if imageBytes > MaxImageInputBytes {
+			return fmt.Errorf("image %d exceeds the %d MiB limit", imageCount, MaxImageInputBytes/(1024*1024))
+		}
+		if imageBytes > MaxImageInputTotalBytes-totalBytes {
+			return fmt.Errorf("attached images exceed the %d MiB total limit", MaxImageInputTotalBytes/(1024*1024))
+		}
+		totalBytes += imageBytes
+	}
+	return nil
 }
 
 // ParseImageDataURL decodes a base64 data URL. It deliberately accepts only

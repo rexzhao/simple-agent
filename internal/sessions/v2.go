@@ -190,6 +190,9 @@ func materializeMessageImages(message *model.Message, readBlob func(BlobRef) ([]
 	if message == nil {
 		return nil
 	}
+	if err := model.ValidateImageInputBlocks(message.ContentBlocks, true); err != nil {
+		return fmt.Errorf("materialize image attachment: %w", err)
+	}
 	for index := range message.ContentBlocks {
 		block := &message.ContentBlocks[index]
 		if block.ImageBlob == nil {
@@ -202,9 +205,12 @@ func materializeMessageImages(message *model.Message, readBlob func(BlobRef) ([]
 		if err != nil {
 			return err
 		}
-		mediaType := strings.TrimSpace(block.ImageBlob.MediaType)
-		if mediaType == "" {
-			return fmt.Errorf("image attachment %q is missing media type", block.ImageBlob.Hash)
+		mediaType, supported := model.NormalizeImageMediaType(block.ImageBlob.MediaType)
+		if !supported {
+			return fmt.Errorf("image attachment %q has unsupported media type %q", block.ImageBlob.Hash, block.ImageBlob.MediaType)
+		}
+		if !model.ImageBytesMatchMediaType(mediaType, raw) {
+			return fmt.Errorf("image attachment %q data does not match media type %q", block.ImageBlob.Hash, mediaType)
 		}
 		block.ImageURL = model.ImageDataURL(mediaType, raw)
 		block.ImageBlob = nil
@@ -1176,6 +1182,9 @@ func (s *V2Store) blobifySessionItemContent(item SessionItem) (SessionItem, erro
 	}
 
 	message := copyMessage(*item.Message)
+	if err := model.ValidateImageInputBlocks(message.ContentBlocks, true); err != nil {
+		return SessionItem{}, fmt.Errorf("persist image attachment: %w", err)
+	}
 	changed := false
 	if len(message.Content) > largeContentBlobBytes {
 		raw := []byte(message.Content)
@@ -1193,10 +1202,10 @@ func (s *V2Store) blobifySessionItemContent(item SessionItem) (SessionItem, erro
 
 	for index := range message.ContentBlocks {
 		block := &message.ContentBlocks[index]
-		if block.Type != "input_image" || block.ImageBlob != nil || !strings.HasPrefix(strings.ToLower(strings.TrimSpace(block.ImageURL)), "data:") {
+		if block.Type != "input_image" || block.ImageBlob != nil {
 			continue
 		}
-		mediaType, raw, err := model.ParseImageDataURL(block.ImageURL)
+		mediaType, raw, err := model.ParseSupportedImageDataURL(block.ImageURL)
 		if err != nil {
 			return SessionItem{}, fmt.Errorf("persist image attachment: %w", err)
 		}

@@ -27,9 +27,9 @@ const (
 	defaultTerminalRunTTL    = 10 * time.Minute
 
 	maxRunRequestBytes     = 17 * 1024 * 1024
-	maxRunImageAttachments = 5
-	maxRunImageBytes       = 4 * 1024 * 1024
-	maxRunImageTotalBytes  = 12 * 1024 * 1024
+	maxRunImageAttachments = model.MaxImageInputAttachments
+	maxRunImageBytes       = model.MaxImageInputBytes
+	maxRunImageTotalBytes  = model.MaxImageInputTotalBytes
 )
 
 var (
@@ -503,19 +503,9 @@ func (request startRunRequest) messageInput() (execution.SessionMessageInput, er
 	blocks := make([]model.InputContentBlock, 0, len(request.Images))
 	totalBytes := 0
 	for index, attachment := range request.Images {
-		mediaType, raw, err := model.ParseImageDataURL(attachment.DataURL)
+		normalizedMediaType, raw, err := model.ParseSupportedImageDataURL(attachment.DataURL)
 		if err != nil {
-			return execution.SessionMessageInput{}, fmt.Errorf("image %d is not a valid base64 data URL", index+1)
-		}
-		normalizedMediaType, supported := model.NormalizeImageMediaType(mediaType)
-		if !supported {
-			return execution.SessionMessageInput{}, fmt.Errorf("image %d has unsupported media type %q", index+1, mediaType)
-		}
-		if len(raw) == 0 {
-			return execution.SessionMessageInput{}, fmt.Errorf("image %d is empty", index+1)
-		}
-		if !model.ImageBytesMatchMediaType(normalizedMediaType, raw) {
-			return execution.SessionMessageInput{}, fmt.Errorf("image %d data does not match media type %q", index+1, normalizedMediaType)
+			return execution.SessionMessageInput{}, fmt.Errorf("image %d: %w", index+1, err)
 		}
 		if len(raw) > maxRunImageBytes {
 			return execution.SessionMessageInput{}, fmt.Errorf("image %d exceeds the %d MiB limit", index+1, maxRunImageBytes/(1024*1024))

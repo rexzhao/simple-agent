@@ -917,6 +917,9 @@ func (s *Service) ValidateSessionMessageInput(id string, input SessionMessageInp
 }
 
 func (s *Service) validateSessionMessageInput(session sessions.SessionV2, input SessionMessageInput) error {
+	if err := model.ValidateImageInputBlocks(input.ContentBlocks, false); err != nil {
+		return err
+	}
 	if !sessionMessageHasImage(input) {
 		return nil
 	}
