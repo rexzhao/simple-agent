@@ -31,6 +31,7 @@ function App() {
   const [sessionDetail, setSessionDetail] = useState<Session | null>(null)
   const [itemsPage, setItemsPage] = useState<ItemsPage | null>(null)
   const [activeRunsBySession, setActiveRunsBySession] = useState<Record<string, ActiveRun>>({})
+  const [draftsBySession, setDraftsBySession] = useState<Record<string, string>>({})
   const [recoveredRuns, setRecoveredRuns] = useState<ActiveRunDescriptor[]>([])
 	const [recentStepsByTurn, setRecentStepsByTurn] = useState<Record<string, RunStep[]>>({})
   const [loading, setLoading] = useState(true)
@@ -42,6 +43,9 @@ function App() {
   const selectedProjectRef = useRef('')
   const selectedSessionRef = useRef('')
 	const activeRunsRef = useRef<Record<string, ActiveRun>>({})
+  const updateDraft = useCallback((sessionID: string, content: string) => {
+    setDraftsBySession((current) => current[sessionID] === content ? current : { ...current, [sessionID]: content })
+  }, [])
 	const addActiveRun = useCallback((run: ActiveRun) => {
 		const next = { ...activeRunsRef.current, [run.sessionID]: run }
 		activeRunsRef.current = next
@@ -453,6 +457,8 @@ function App() {
             detail={sessionDetail}
             page={itemsPage}
 			activeRun={selectedActiveRun}
+			draft={draftsBySession[selectedSessionID] ?? ''}
+			onDraftChange={(content) => updateDraft(selectedSessionID, content)}
 			otherSessionsRunning={otherSessionsRunning}
 					recentStepsByTurn={recentStepsByTurn}
             onLoadOlder={() => void loadOlder()}
@@ -597,6 +603,8 @@ function Conversation(props: {
   detail: Session | null
   page: ItemsPage | null
   activeRun: ActiveRun | null
+	draft: string
+	onDraftChange: (content: string) => void
 	otherSessionsRunning: boolean
 	recentStepsByTurn: Record<string, RunStep[]>
   onLoadOlder: () => void
@@ -652,7 +660,14 @@ function Conversation(props: {
         )}
         <div ref={bottomRef} />
       </section>
-	  <Composer running={Boolean(props.activeRun)} blocked={false} onSend={props.onSend} onCancel={props.onCancel} />
+	  <Composer
+		content={props.draft}
+		onContentChange={props.onDraftChange}
+		running={Boolean(props.activeRun)}
+		blocked={false}
+		onSend={props.onSend}
+		onCancel={props.onCancel}
+	  />
     </div>
   )
 }
@@ -909,22 +924,46 @@ function ToolRow({ tool }: { tool: ToolActivity }) {
   )
 }
 
-function Composer(props: { running: boolean; blocked: boolean; onSend: (content: string) => void; onCancel: () => void }) {
-  const [content, setContent] = useState('')
+function Composer(props: {
+  content: string
+  onContentChange: (content: string) => void
+  running: boolean
+  blocked: boolean
+  onSend: (content: string) => void
+  onCancel: () => void
+}) {
+  const textareaRef = useRef<HTMLTextAreaElement>(null)
+  const resizeTextarea = useCallback(() => {
+    const textarea = textareaRef.current
+    if (!textarea) return
+    textarea.style.height = 'auto'
+    textarea.style.height = `${textarea.scrollHeight}px`
+  }, [])
+
+  useEffect(() => {
+    resizeTextarea()
+  }, [props.content, resizeTextarea])
+
+  useEffect(() => {
+    window.addEventListener('resize', resizeTextarea)
+    return () => window.removeEventListener('resize', resizeTextarea)
+  }, [resizeTextarea])
+
   const submit = () => {
-	if (!content.trim() || props.running || props.blocked) return
-    props.onSend(content.trim())
-    setContent('')
+	if (!props.content.trim() || props.running || props.blocked) return
+    props.onSend(props.content.trim())
+    props.onContentChange('')
   }
   return (
     <div className="composer-wrap">
       <div className="composer">
         <textarea
-          value={content}
+          ref={textareaRef}
+          value={props.content}
 		  disabled={props.running || props.blocked}
           rows={1}
 		  placeholder={props.running ? 'SAI 正在执行…' : props.blocked ? '另一个会话正在执行，可切回查看进度' : '给 SAI 发送消息'}
-          onChange={(event) => setContent(event.target.value)}
+          onChange={(event) => props.onContentChange(event.target.value)}
           onKeyDown={(event) => {
             if (event.key === 'Enter' && !event.shiftKey) {
               event.preventDefault()
@@ -935,7 +974,7 @@ function Composer(props: { running: boolean; blocked: boolean; onSend: (content:
         {props.running ? (
           <button className="stop-button" onClick={props.onCancel}><StopIcon /> 停止</button>
         ) : (
-		  <button className="send-button" disabled={!content.trim() || props.blocked} onClick={submit} aria-label="发送"><SendIcon /></button>
+		  <button className="send-button" disabled={!props.content.trim() || props.blocked} onClick={submit} aria-label="发送"><SendIcon /></button>
         )}
       </div>
       <div className="composer-hint"><span>Enter 发送 · Shift+Enter 换行</span><span>本地运行</span></div>
