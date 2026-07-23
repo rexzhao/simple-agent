@@ -669,8 +669,9 @@ function Conversation(props: {
 		if (!messages) return
 		followOutputRef.current = messages.scrollHeight - messages.scrollTop - messages.clientHeight <= autoScrollThresholdPX
 	}
-	const visibleItems = props.activeRun?.turnID && !props.activeRun.restored
-		? (props.page?.items ?? []).filter((item) => item.turn_id !== props.activeRun?.turnID)
+	const visibleItems = props.activeRun?.turnID
+		? (props.page?.items ?? []).filter((item) =>
+			item.turn_id !== props.activeRun?.turnID || (props.activeRun?.restored && item.message?.role === 'user'))
 		: (props.page?.items ?? [])
 
   return (
