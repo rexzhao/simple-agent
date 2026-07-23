@@ -102,6 +102,7 @@ func Run(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "sai: %v\n", err)
 		return 1
 	}
+	defer app.Close()
 	httpServer := &http.Server{
 		Handler:           app.Handler(),
 		ReadHeaderTimeout: 5 * time.Second,

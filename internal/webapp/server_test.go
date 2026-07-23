@@ -273,6 +273,7 @@ func newWebTestServerWithRunner(t *testing.T, runner execution.SessionTurnRunner
 	if err != nil {
 		t.Fatalf("NewServer() error = %v", err)
 	}
+	t.Cleanup(app.Close)
 	server := httptest.NewServer(app.Handler())
 	t.Cleanup(server.Close)
 	return server, service

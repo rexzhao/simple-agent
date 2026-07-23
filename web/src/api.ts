@@ -105,31 +105,64 @@ export const api = {
   cancelRun: (runID: string) => request(`/api/runs/${encodeURIComponent(runID)}`, { method: 'DELETE' }),
 }
 
-export async function streamRun(runID: string, onEvent: (event: RunEvent) => void | Promise<void>): Promise<void> {
-  const response = await fetch(`/api/runs/${encodeURIComponent(runID)}/events`, {
-    headers: { Authorization: `Bearer ${token}` },
-  })
-  if (!response.ok || !response.body) {
-    throw new APIError(response.status, 'stream_failed', `无法连接运行事件 (${response.status})`)
-  }
+const streamReconnectLimit = 5
 
-  const reader = response.body.getReader()
-  const decoder = new TextDecoder()
-  let buffer = ''
+function waitForStreamReconnect(attempt: number): Promise<void> {
+  const delay = Math.min(200 * (2 ** attempt), 2000)
+  return new Promise((resolve) => window.setTimeout(resolve, delay))
+}
+
+export async function streamRun(runID: string, onEvent: (event: RunEvent) => void | Promise<void>): Promise<void> {
+  let after = 0
+  let reconnects = 0
+
   while (true) {
-    const { done, value } = await reader.read()
-    buffer += decoder.decode(value, { stream: !done })
-    let boundary = buffer.indexOf('\n\n')
-    while (boundary >= 0) {
-      const frame = buffer.slice(0, boundary)
-      buffer = buffer.slice(boundary + 2)
-      const data = frame.split('\n')
-        .filter((line) => line.startsWith('data:'))
-        .map((line) => line.slice(5).trimStart())
-        .join('\n')
-      if (data) await onEvent(JSON.parse(data) as RunEvent)
-      boundary = buffer.indexOf('\n\n')
+    try {
+      const query = after > 0 ? `?after=${encodeURIComponent(String(after))}` : ''
+      const response = await fetch(`/api/runs/${encodeURIComponent(runID)}/events${query}`, {
+        headers: { Authorization: `Bearer ${token}` },
+      })
+      if (!response.ok || !response.body) {
+        throw new APIError(response.status, 'stream_failed', `无法连接运行事件 (${response.status})`)
+      }
+
+      const reader = response.body.getReader()
+      const decoder = new TextDecoder()
+      let buffer = ''
+      let settled = false
+      while (true) {
+        const { done, value } = await reader.read()
+        buffer += decoder.decode(value, { stream: !done })
+        let boundary = buffer.indexOf('\n\n')
+        while (boundary >= 0) {
+          const frame = buffer.slice(0, boundary)
+          buffer = buffer.slice(boundary + 2)
+          const lines = frame.split('\n')
+          const sequence = Number(lines.find((line) => line.startsWith('id:'))?.slice(3).trim() ?? '')
+          const data = lines
+            .filter((line) => line.startsWith('data:'))
+            .map((line) => line.slice(5).trimStart())
+            .join('\n')
+          if (data) {
+            const event = JSON.parse(data) as RunEvent
+            await onEvent(event)
+            if (Number.isSafeInteger(sequence) && sequence > after) after = sequence
+            reconnects = 0
+            if (event.type === 'run.settled') settled = true
+          }
+          boundary = buffer.indexOf('\n\n')
+        }
+        if (done) break
+      }
+      if (settled) return
+    } catch (reason) {
+      if (reason instanceof APIError) throw reason
     }
-    if (done) break
+
+    if (reconnects >= streamReconnectLimit) {
+      throw new APIError(0, 'stream_interrupted', '运行事件流意外中断，请刷新会话查看已保存的结果。')
+    }
+    await waitForStreamReconnect(reconnects)
+    reconnects++
   }
 }

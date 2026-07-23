@@ -75,7 +75,11 @@ POST   /api/sessions/{id}/compact
 
 The event contract includes `turn.started`, `text.delta`, `reasoning.delta`,
 `tool.requested`, `tool.started`, `tool.finished`, `usage.updated`, persisted
-item notifications, `turn.committed`, `turn.failed`, and `run.settled`.
+item notifications, `turn.committed`, `turn.failed`, `run.resync_required`, and
+`run.settled`. Web run events are a bounded replay buffer for live rendering;
+the durable session item API remains canonical. A replay gap emits
+`run.resync_required`, and terminal runs retain only their settlement event for
+a short recovery window.
 
 ## Security
 

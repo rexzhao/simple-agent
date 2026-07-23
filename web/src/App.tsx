@@ -296,6 +296,17 @@ function App() {
 					reasoningTokens: Number(event.reasoning_tokens ?? 0),
 				} : run)
         break
+      case 'run.resync_required': {
+        const sessionID = String(event.session_id ?? activeRunRef.current?.sessionID ?? '')
+        if (sessionID) {
+          try {
+            await refreshSession(sessionID)
+          } catch (reason) {
+            setError(errorMessage(reason))
+          }
+        }
+        break
+      }
       case 'turn.failed':
 				updateActiveRun((run) => run ? { ...run, status: 'failed', error: String(event.message ?? '运行失败') } : run)
         setError(String(event.message ?? '运行失败'))

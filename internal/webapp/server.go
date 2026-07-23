@@ -82,6 +82,13 @@ func (s *Server) Handler() http.Handler {
 	})
 }
 
+func (s *Server) Close() {
+	if s == nil || s.runs == nil {
+		return
+	}
+	s.runs.Close()
+}
+
 func (s *Server) routes() {
 	s.mux.HandleFunc("GET /api/bootstrap", s.handleBootstrap)
 	s.mux.HandleFunc("GET /api/projects", s.handleListProjects)

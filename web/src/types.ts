@@ -163,6 +163,7 @@ export type RunEvent =
 	| { type: 'tool.requested' | 'tool.started'; turn_id: string; agent_iteration: number; tool_call_id: string; name: string; arguments?: string }
 	| { type: 'tool.finished'; turn_id: string; agent_iteration: number; tool_call_id: string; name: string; is_error: boolean; content?: string }
 	| { type: 'usage.updated'; turn_id: string; agent_iteration: number; input_tokens: number; output_tokens: number; total_tokens: number; cached_tokens: number; cache_write_tokens: number; reasoning_tokens: number }
+  | { type: 'run.resync_required'; run_id: string; session_id: string; oldest_seq: number }
   | { type: 'turn.committed'; turn_id: string; last_seq: number }
   | { type: 'turn.failed'; turn_id: string; code: string; message: string }
   | { type: 'run.settled'; run_id: string; status: string; turn_id?: string; last_seq?: number; message?: string }
