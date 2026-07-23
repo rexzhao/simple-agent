@@ -21,7 +21,7 @@ func TestRegisterBuiltinsRegistersExpectedTools(t *testing.T) {
 		t.Fatalf("RegisterBuiltins() error = %v", err)
 	}
 
-	for _, name := range []string{BuiltinListFiles, BuiltinReadFile, BuiltinGlobFiles, BuiltinGrepFiles, BuiltinWriteFile, BuiltinEditFile, BuiltinShell} {
+	for _, name := range []string{BuiltinListFiles, BuiltinReadFile, BuiltinGlobFiles, BuiltinGrepFiles, BuiltinWriteFile, BuiltinEditFile, BuiltinApplyPatch, BuiltinShell} {
 		entry, ok := registry.Lookup(name)
 		if !ok {
 			t.Fatalf("Lookup(%q) ok = false, want true", name)
@@ -1185,6 +1185,14 @@ func TestBuiltinDefinitionsHaveExpectedSchemas(t *testing.T) {
 				"required": []any{"path", "old", "new"},
 			},
 			wantProps: []string{"path", "old", "new"},
+		},
+		{
+			name: BuiltinApplyPatch,
+			want: map[string]any{
+				"type":     "object",
+				"required": []any{"patch"},
+			},
+			wantProps: []string{"patch"},
 		},
 	}
 

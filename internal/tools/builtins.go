@@ -22,13 +22,14 @@ import (
 )
 
 const (
-	BuiltinListFiles = "list_files"
-	BuiltinReadFile  = "read_file"
-	BuiltinGlobFiles = "glob_files"
-	BuiltinGrepFiles = "grep_files"
-	BuiltinWriteFile = "write_file"
-	BuiltinEditFile  = "edit_file"
-	BuiltinShell     = "shell"
+	BuiltinListFiles  = "list_files"
+	BuiltinReadFile   = "read_file"
+	BuiltinGlobFiles  = "glob_files"
+	BuiltinGrepFiles  = "grep_files"
+	BuiltinWriteFile  = "write_file"
+	BuiltinEditFile   = "edit_file"
+	BuiltinApplyPatch = "apply_patch"
+	BuiltinShell      = "shell"
 )
 
 const shellCancelWaitDelay = 2 * time.Second
@@ -96,6 +97,10 @@ func RegisterBuiltins(registry *Registry, rootDir string) error {
 		{
 			Definition: editFileDefinition(),
 			Executor:   newEditFileExecutor(canonicalRoot),
+		},
+		{
+			Definition: applyPatchDefinition(),
+			Executor:   newApplyPatchExecutor(canonicalRoot),
 		},
 		{
 			Definition: shellDefinition(),

@@ -237,11 +237,16 @@ tools:
     - read_file
     - write_file
     - edit_file
+    - apply_patch
     - shell
 ```
 
 All relative tool paths and shell working directories are based on the durable
-session's creation directory.
+session's creation directory. `apply_patch` accepts a text-only unified diff
+with `---` / `+++` file headers and `@@` hunks. It supports workspace-relative
+file creation, updates, and deletion (`/dev/null` for added or deleted files),
+validates every hunk before writing, and does not support renames or binary
+patches.
 
 ## MCP tool sources
 
