@@ -64,16 +64,18 @@ func (r AgentTurnRunner) RunSessionTurn(ctx context.Context, request SessionTurn
 		err = errors.Join(err, runtime.Close())
 	}()
 
-	if _, err := runtime.runSessionTurn(ctx, request.Content, sessionTurnRunOptions{
+	_, runErr := runtime.runSessionTurn(ctx, request.Content, sessionTurnRunOptions{
 		emit:              request.Emit,
 		publisher:         request.Publisher,
 		turnID:            request.TurnID,
 		activePromptDrain: request.ActivePromptDrain,
-	}); err != nil {
-		return SessionTurnResult{}, err
+	})
+	metadataErr := runtime.saveRuntimeMetadataForSession(request.Session.ID)
+	if runErr != nil {
+		return SessionTurnResult{}, errors.Join(runErr, metadataErr)
 	}
-	if err := runtime.saveRuntimeMetadataForSession(request.Session.ID); err != nil {
-		return SessionTurnResult{}, err
+	if metadataErr != nil {
+		return SessionTurnResult{}, metadataErr
 	}
 	return SessionTurnResult{
 		Session:     runtime.session,

@@ -995,6 +995,18 @@ func (s *Service) runSessionMessage(ctx context.Context, id, content string, emi
 }
 
 func turnFailureForRunnerError(err error) turnFailure {
+	var contextBudget *contextwindow.BudgetExceededError
+	if errors.As(err, &contextBudget) {
+		return turnFailure{
+			code: "context_window_exceeded",
+			message: fmt.Sprintf(
+				"estimated context usage reached the model context window (%d/%d tokens)",
+				contextBudget.EstimatedInputTokens,
+				contextBudget.ContextWindow,
+			),
+		}
+	}
+
 	var requestTimeout *httpstream.RequestTimeoutError
 	if errors.As(err, &requestTimeout) {
 		if requestTimeout.Attempts > 1 {

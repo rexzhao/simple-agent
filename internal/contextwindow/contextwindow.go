@@ -2,6 +2,7 @@ package contextwindow
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -53,6 +54,8 @@ type Metadata struct {
 	LastCacheWriteTokens    int    `json:"last_cache_write_tokens,omitempty"`
 	LastReasoningTokens     int    `json:"last_reasoning_tokens,omitempty"`
 	LastUsageSource         string `json:"last_usage_source,omitempty"`
+	LastUsageAnchorMessages int    `json:"last_usage_anchor_messages,omitempty"`
+	LastUsageAnchorHash     string `json:"last_usage_anchor_hash,omitempty"`
 	WarningIssued           bool   `json:"warning_issued,omitempty"`
 }
 
@@ -60,6 +63,22 @@ type RequestEstimate struct {
 	InputTokens             int
 	ContextWindow           int
 	WarningThresholdPercent int
+}
+
+type BudgetExceededError struct {
+	EstimatedInputTokens int
+	ContextWindow        int
+}
+
+func (e *BudgetExceededError) Error() string {
+	if e == nil {
+		return "context window budget exceeded"
+	}
+	return fmt.Sprintf(
+		"context window budget exceeded: estimated input tokens %d >= context window %d; refusing to send provider request; no context was truncated",
+		e.EstimatedInputTokens,
+		e.ContextWindow,
+	)
 }
 
 type Tracker struct {
@@ -111,11 +130,15 @@ func (t *Tracker) CheckRequest(request model.Request) (RequestEstimate, bool, er
 	if t == nil {
 		return RequestEstimate{}, false, nil
 	}
-	inputTokens := EstimateRequestTokens(request)
+	fullEstimate := EstimateRequestTokens(request)
 
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
+	inputTokens := fullEstimate
+	if anchoredEstimate, ok := t.estimateFromProviderUsage(request); ok {
+		inputTokens = anchoredEstimate
+	}
 	estimate := RequestEstimate{
 		InputTokens:             inputTokens,
 		ContextWindow:           t.metadata.ContextWindow,
@@ -126,7 +149,10 @@ func (t *Tracker) CheckRequest(request model.Request) (RequestEstimate, bool, er
 		return estimate, false, nil
 	}
 	if inputTokens >= estimate.ContextWindow {
-		return estimate, false, fmt.Errorf("context window budget exceeded: estimated input tokens %d >= context window %d; refusing to send provider request; no context was truncated", inputTokens, estimate.ContextWindow)
+		return estimate, false, &BudgetExceededError{
+			EstimatedInputTokens: inputTokens,
+			ContextWindow:        estimate.ContextWindow,
+		}
 	}
 
 	threshold := int(math.Ceil(float64(estimate.ContextWindow) * float64(estimate.WarningThresholdPercent) / 100))
@@ -138,7 +164,19 @@ func (t *Tracker) CheckRequest(request model.Request) (RequestEstimate, bool, er
 }
 
 func (t *Tracker) RecordProviderUsage(usage model.Usage) {
-	t.recordUsage(UsageSourceProvider, usage)
+	t.recordUsage(UsageSourceProvider, usage, nil)
+}
+
+func (t *Tracker) RecordProviderUsageForRequest(usage model.Usage, request model.Request) {
+	hash := requestPrefixHash(request, len(request.Messages))
+	var anchor *usageAnchor
+	if hash != "" {
+		anchor = &usageAnchor{
+			messageCount: len(request.Messages),
+			hash:         hash,
+		}
+	}
+	t.recordUsage(UsageSourceProvider, usage, anchor)
 }
 
 func (t *Tracker) RecordEstimatedUsage(inputTokens, outputTokens int) {
@@ -147,10 +185,15 @@ func (t *Tracker) RecordEstimatedUsage(inputTokens, outputTokens int) {
 		InputTokens:  inputTokens,
 		OutputTokens: outputTokens,
 		TotalTokens:  totalTokens,
-	})
+	}, nil)
 }
 
-func (t *Tracker) recordUsage(source UsageSource, usage model.Usage) {
+type usageAnchor struct {
+	messageCount int
+	hash         string
+}
+
+func (t *Tracker) recordUsage(source UsageSource, usage model.Usage, anchor *usageAnchor) {
 	if t == nil {
 		return
 	}
@@ -166,6 +209,12 @@ func (t *Tracker) recordUsage(source UsageSource, usage model.Usage) {
 	t.metadata.LastCacheWriteTokens = usage.CacheWriteTokens
 	t.metadata.LastReasoningTokens = usage.ReasoningTokens
 	t.metadata.LastUsageSource = string(source)
+	t.metadata.LastUsageAnchorMessages = 0
+	t.metadata.LastUsageAnchorHash = ""
+	if anchor != nil {
+		t.metadata.LastUsageAnchorMessages = anchor.messageCount
+		t.metadata.LastUsageAnchorHash = anchor.hash
+	}
 }
 
 func (p TrackingProvider) Stream(ctx context.Context, request model.Request) (<-chan model.Event, error) {
@@ -193,12 +242,13 @@ func (p TrackingProvider) Stream(ctx context.Context, request model.Request) (<-
 
 		sawUsage := false
 		sawError := false
+		var providerUsage model.Usage
 		outputTokens := 0
 		for event := range stream {
 			switch event := event.(type) {
 			case model.UsageEvent:
 				sawUsage = true
-				p.Tracker.RecordProviderUsage(event.Usage)
+				providerUsage = event.Usage
 			case model.ErrorEvent:
 				sawError = true
 			case model.TextDeltaEvent:
@@ -214,7 +264,9 @@ func (p TrackingProvider) Stream(ctx context.Context, request model.Request) (<-
 
 			events <- event
 		}
-		if !sawUsage && !sawError && ctx.Err() == nil {
+		if sawUsage && !sawError && ctx.Err() == nil {
+			p.Tracker.RecordProviderUsageForRequest(providerUsage, request)
+		} else if !sawUsage && !sawError && ctx.Err() == nil {
 			p.Tracker.RecordEstimatedUsage(estimate.InputTokens, outputTokens)
 		}
 	}()
@@ -276,7 +328,63 @@ func EstimateTextTokens(text string) int {
 	if text == "" {
 		return 0
 	}
-	return utf8.RuneCountInString(text)
+	asciiCharacters := 0
+	nonASCIICharacters := 0
+	for _, character := range text {
+		if character < utf8.RuneSelf {
+			asciiCharacters++
+		} else {
+			nonASCIICharacters++
+		}
+	}
+	return int(math.Ceil(float64(asciiCharacters)/4)) + nonASCIICharacters
+}
+
+func (t *Tracker) estimateFromProviderUsage(request model.Request) (int, bool) {
+	if t.metadata.LastUsageSource != string(UsageSourceProvider) ||
+		t.metadata.LastTotalTokens <= 0 ||
+		t.metadata.LastUsageAnchorHash == "" {
+		return 0, false
+	}
+	prefixMessages := t.metadata.LastUsageAnchorMessages
+	if prefixMessages < 0 || len(request.Messages) <= prefixMessages {
+		return 0, false
+	}
+	if request.Messages[prefixMessages].Role != model.MessageRoleAssistant {
+		return 0, false
+	}
+	if requestPrefixHash(request, prefixMessages) != t.metadata.LastUsageAnchorHash {
+		return 0, false
+	}
+
+	total := t.metadata.LastTotalTokens
+	for _, message := range request.Messages[prefixMessages+1:] {
+		total += EstimateMessageTokens(message)
+	}
+	if total < 1 {
+		return 1, true
+	}
+	return total, true
+}
+
+func requestPrefixHash(request model.Request, messageCount int) string {
+	if messageCount < 0 || messageCount > len(request.Messages) {
+		return ""
+	}
+	data, err := json.Marshal(struct {
+		Model    string
+		Messages []model.Message
+		Tools    []model.Tool
+	}{
+		Model:    request.Model,
+		Messages: request.Messages[:messageCount],
+		Tools:    request.Tools,
+	})
+	if err != nil {
+		return ""
+	}
+	sum := sha256.Sum256(data)
+	return fmt.Sprintf("%x", sum)
 }
 
 func ParseWindowSource(source string) WindowSource {

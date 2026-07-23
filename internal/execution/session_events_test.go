@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/rexzhao/simple-agent/internal/contextwindow"
 	"github.com/rexzhao/simple-agent/internal/model"
 	"github.com/rexzhao/simple-agent/internal/model/httpstream"
 	"github.com/rexzhao/simple-agent/internal/sessions"
@@ -630,6 +631,34 @@ func TestSessionStreamTurnFailedSafePayloadByStage(t *testing.T) {
 			t.Fatalf("returned error leaks secret: %v", err)
 		}
 		assertSafeTurnFailedTerminal(t, events, "runner_failed", "turn runner failed", turnFailedSecret)
+	})
+
+	t.Run("context_window_exceeded", func(t *testing.T) {
+		home := t.TempDir()
+		runner := fakeExecutionTurnRunner{
+			supports: true,
+			run: func(ctx context.Context, request SessionTurnRequest) (SessionTurnResult, error) {
+				return SessionTurnResult{}, fmt.Errorf("request model: %w", &contextwindow.BudgetExceededError{
+					EstimatedInputTokens: 1200,
+					ContextWindow:        1000,
+				})
+			},
+		}
+		service, _, session := newExecutionServiceWithSession(t, home, runner)
+		var events []SessionStreamEvent
+		_, err := service.SendSessionMessageWithEvents(context.Background(), session.ID, prompt, func(event SessionStreamEvent) {
+			events = append(events, event)
+		})
+		if !errors.Is(err, ErrTurnFailed) {
+			t.Fatalf("error = %v, want ErrTurnFailed", err)
+		}
+		assertSafeTurnFailedTerminal(
+			t,
+			events,
+			"context_window_exceeded",
+			"estimated context usage reached the model context window (1200/1000 tokens)",
+			turnFailedSecret,
+		)
 	})
 
 	t.Run("model_request_timeout", func(t *testing.T) {
