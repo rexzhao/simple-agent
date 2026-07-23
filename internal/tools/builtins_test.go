@@ -581,6 +581,29 @@ func TestShellMaxOutputBytesTruncatesOutput(t *testing.T) {
 	}
 }
 
+func TestLimitedOutputCapsRetainedMemoryWhileDraining(t *testing.T) {
+	output := newLimitedOutput(3)
+	for _, chunk := range [][]byte{
+		[]byte("ab"),
+		[]byte("cdef"),
+		[]byte(strings.Repeat("x", 1<<20)),
+	} {
+		written, err := output.Write(chunk)
+		if err != nil {
+			t.Fatalf("limitedOutput.Write() error = %v", err)
+		}
+		if written != len(chunk) {
+			t.Fatalf("limitedOutput.Write() = %d, want %d", written, len(chunk))
+		}
+	}
+	if got := output.String(); got != "abc" {
+		t.Fatalf("limitedOutput.String() = %q, want abc", got)
+	}
+	if !output.Truncated() {
+		t.Fatal("limitedOutput.Truncated() = false, want true")
+	}
+}
+
 func TestShellContextCancelReturnsErrorResult(t *testing.T) {
 	root := t.TempDir()
 	registry := registerBuiltinsForTest(t, root)

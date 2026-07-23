@@ -18,6 +18,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -264,7 +265,7 @@ func shellDefinition() model.Tool {
 				"max_output_bytes": map[string]any{
 					"type":        "integer",
 					"minimum":     1,
-					"description": "Optional positive byte cap for returned combined stdout/stderr.",
+					"description": "Optional positive cap for combined stdout/stderr bytes retained and returned.",
 				},
 			},
 			"required":             []any{"command"},
@@ -754,10 +755,25 @@ func newShellExecutor(rootDir string) Executor {
 		cmd.Dir = rootDir
 		configureShellCommandCancel(cmd)
 
-		output, err := cmd.CombinedOutput()
-		content, outputTruncated := string(output), false
+		var (
+			content         string
+			outputTruncated bool
+		)
 		if maxOutputSet {
-			content, outputTruncated = truncateBytes(content, maxOutputBytes)
+			// Do not use CombinedOutput here: it buffers the complete command
+			// output before we can truncate it. limitedOutput always reports a
+			// successful full write to os/exec so both pipes keep draining, while
+			// retaining at most maxOutputBytes in process memory.
+			output := newLimitedOutput(maxOutputBytes)
+			cmd.Stdout = output
+			cmd.Stderr = output
+			err = cmd.Run()
+			content = output.String()
+			outputTruncated = output.Truncated()
+		} else {
+			var output []byte
+			output, err = cmd.CombinedOutput()
+			content = string(output)
 		}
 		result := model.ToolResult{
 			Name:    BuiltinShell,
@@ -778,6 +794,53 @@ func newShellExecutor(rootDir string) Executor {
 		}
 		return result, nil
 	})
+}
+
+// limitedOutput is an io.Writer for command stdout/stderr. It acknowledges
+// every write so os/exec continues draining child pipes, but retains only the
+// configured prefix. This bounds the agent process memory used by a shell
+// command even when that command produces unbounded output.
+type limitedOutput struct {
+	mu        sync.Mutex
+	limit     int
+	data      []byte
+	truncated bool
+}
+
+func newLimitedOutput(limit int) *limitedOutput {
+	return &limitedOutput{limit: limit}
+}
+
+func (o *limitedOutput) Write(data []byte) (int, error) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+
+	remaining := o.limit - len(o.data)
+	if remaining <= 0 {
+		if len(data) > 0 {
+			o.truncated = true
+		}
+		return len(data), nil
+	}
+	if len(data) > remaining {
+		o.data = append(o.data, data[:remaining]...)
+		o.truncated = true
+		return len(data), nil
+	}
+	o.data = append(o.data, data...)
+	return len(data), nil
+}
+
+func (o *limitedOutput) String() string {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return string(o.data)
+}
+
+func (o *limitedOutput) Truncated() bool {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.truncated
 }
 
 func shellCommand(ctx context.Context, command string) *exec.Cmd {
