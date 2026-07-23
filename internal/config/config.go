@@ -571,7 +571,11 @@ func defaultConfig() Config {
 	return Config{
 		ProviderDir: "providers",
 		AuthDir:     "auth",
-		SkillDirs:   []string{"skills"},
+		SkillDirs: []string{
+			"$USER/.agents/skills",
+			"$REPO/.agents/skills",
+			"$CWD/.agents/skills",
+		},
 		Agent: AgentConfig{
 			InstructionFiles: []string{"$CWD/AGENTS.md"},
 			MaxTurns:         defaultAgentMaxTurns,

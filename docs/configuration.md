@@ -47,7 +47,9 @@ default_model: glm-5.2
 provider_dir: providers
 auth_dir: auth
 skill_dirs:
-  - skills
+  - $USER/.agents/skills
+  - $REPO/.agents/skills
+  - $CWD/.agents/skills
 mcp_dir: mcp
 
 agent:
@@ -268,12 +270,15 @@ instruction snapshot and their IDs are recorded with the session.
 `skill_dirs` supports `$HOME`, `$REPO`, `$CWD`, and `$CONFIG` path placeholders;
 `$USER` remains an alias for `$HOME`. `$CWD` is the durable session working
 directory, `$REPO` is discovered upward from it, and relative entries continue
-to resolve from the root configuration directory. For example:
+to resolve from the root configuration directory. An entry that references
+`$REPO` is skipped (without error) when the working directory is not inside a
+repository. The default layers user, repository, and working-directory skills:
 
 ```yaml
 skill_dirs:
+  - $USER/.agents/skills
   - $REPO/.agents/skills
-  - $HOME/.sai/skills
+  - $CWD/.agents/skills
 ```
 
 ## Sessions and storage

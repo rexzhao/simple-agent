@@ -1,11 +1,17 @@
 package pathresolver
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 )
+
+// ErrRepoRootNotFound reports that a $REPO placeholder could not be resolved
+// because no repository root (.git) was found from the current directory.
+// Callers may treat it as a signal to skip the entry rather than fail.
+var ErrRepoRootNotFound = errors.New("repository root not found")
 
 // Variables supplies the roots used by path placeholders. Empty HomeDir and
 // RepoDir values are resolved lazily when their placeholders are present.
@@ -76,7 +82,7 @@ func Expand(value string, variables Variables) (string, error) {
 				return "", fmt.Errorf("resolve $REPO from %q: %w", cwd, err)
 			}
 			if !ok {
-				return "", fmt.Errorf("resolve $REPO from %q: repository root not found", cwd)
+				return "", fmt.Errorf("resolve $REPO from %q: %w", cwd, ErrRepoRootNotFound)
 			}
 		}
 		repo, err := absoluteRoot("$REPO", repo)

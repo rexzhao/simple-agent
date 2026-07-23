@@ -34,7 +34,16 @@ func TestLoadResolvesConfigAndProviderModels(t *testing.T) {
 		t.Fatalf("ProviderDir = %q, want %q", cfg.ProviderDir, wantProviderDir)
 	}
 
-	wantSkillDirs := []string{filepath.Join(wantConfigDir, "skills")}
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		t.Fatalf("UserHomeDir() error = %v", err)
+	}
+	// dir is a t.TempDir() outside any repository, so the default
+	// $REPO/.agents/skills entry is skipped; only $USER and $CWD resolve.
+	wantSkillDirs := []string{
+		filepath.Join(homeDir, ".agents", "skills"),
+		filepath.Join(dir, ".agents", "skills"),
+	}
 	resolvedSkillDirs, err := cfg.ResolveSkillDirs(dir)
 	if err != nil {
 		t.Fatalf("ResolveSkillDirs() error = %v", err)
@@ -1660,5 +1669,62 @@ func writeFile(t *testing.T, path, content string) {
 	t.Helper()
 	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
 		t.Fatalf("WriteFile(%q) error = %v", path, err)
+	}
+}
+
+func TestDefaultSkillDirsLayerUserRepoAndCWD(t *testing.T) {
+	cfg := defaultConfig()
+	wantRaw := []string{
+		"$USER/.agents/skills",
+		"$REPO/.agents/skills",
+		"$CWD/.agents/skills",
+	}
+	if !sameStrings(cfg.SkillDirs, wantRaw) {
+		t.Fatalf("default SkillDirs = %#v, want %#v", cfg.SkillDirs, wantRaw)
+	}
+
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		t.Fatalf("UserHomeDir() error = %v", err)
+	}
+
+	// Inside a repository: all three layers resolve, in order.
+	root := t.TempDir()
+	repoDir := filepath.Join(root, "repo")
+	cwd := filepath.Join(repoDir, "work")
+	if err := os.MkdirAll(filepath.Join(repoDir, ".git"), 0o755); err != nil {
+		t.Fatalf("MkdirAll(.git) error = %v", err)
+	}
+	if err := os.MkdirAll(cwd, 0o755); err != nil {
+		t.Fatalf("MkdirAll(cwd) error = %v", err)
+	}
+	got, err := cfg.ResolveSkillDirs(cwd)
+	if err != nil {
+		t.Fatalf("ResolveSkillDirs(in repo) error = %v", err)
+	}
+	want := []string{
+		filepath.Join(homeDir, ".agents", "skills"),
+		filepath.Join(repoDir, ".agents", "skills"),
+		filepath.Join(cwd, ".agents", "skills"),
+	}
+	if !sameStrings(got, want) {
+		t.Fatalf("ResolveSkillDirs(in repo) = %#v, want %#v", got, want)
+	}
+
+	// Outside a repository: the $REPO layer is skipped without error.
+	outside := filepath.Join(root, "plain")
+	if err := os.MkdirAll(outside, 0o755); err != nil {
+		t.Fatalf("MkdirAll(plain) error = %v", err)
+	}
+	got, err = cfg.ResolveSkillDirs(outside)
+	if err != nil {
+		t.Fatalf("ResolveSkillDirs(outside repo) error = %v", err)
+	}
+	want = []string{
+		filepath.Join(homeDir, ".agents", "skills"),
+		filepath.Join(outside, ".agents", "skills"),
+	}
+	if !sameStrings(got, want) {
+		t.Fatalf("ResolveSkillDirs(outside repo) = %#v, want %#v", got, want)
 	}
 }
