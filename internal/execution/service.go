@@ -69,6 +69,7 @@ type SessionMetadata struct {
 	Provider          string    `json:"provider"`
 	ModelProfile      string    `json:"model_profile"`
 	ModelID           string    `json:"model_id"`
+	Status            string    `json:"status"`
 	ProjectID         string    `json:"project_id"`
 	CreatedCWD        string    `json:"created_cwd"`
 	LastSeq           int64     `json:"last_seq"`
@@ -546,9 +547,18 @@ func (s *Service) ArchiveSession(id string) (SessionDetail, error) {
 	if s == nil || s.sessionStore == nil {
 		return SessionDetail{}, fmt.Errorf("execution session store is not configured")
 	}
+	writeLock, err := s.acquireSessionMutationLock(id)
+	if err != nil {
+		return SessionDetail{}, err
+	}
+	defer func() { _ = writeLock.Release() }()
+
 	session, err := s.sessionStore.Load(id)
 	if err != nil {
 		return SessionDetail{}, err
+	}
+	if strings.TrimSpace(session.RunningTurnID) != "" {
+		return SessionDetail{}, ErrSessionBusy
 	}
 	if !session.Archived {
 		session.Archived = true
@@ -566,17 +576,48 @@ func (s *Service) RemoveSession(id string) (SessionRemoveResult, error) {
 	if s == nil || s.sessionStore == nil {
 		return SessionRemoveResult{}, fmt.Errorf("execution session store is not configured")
 	}
+	writeLock, err := s.acquireSessionMutationLock(id)
+	if err != nil {
+		return SessionRemoveResult{}, err
+	}
+	defer func() { _ = writeLock.Release() }()
+
 	session, err := s.sessionStore.Load(id)
 	if err != nil {
 		return SessionRemoveResult{}, err
 	}
+	if strings.TrimSpace(session.RunningTurnID) != "" {
+		return SessionRemoveResult{}, ErrSessionBusy
+	}
 	if !session.Archived {
 		return SessionRemoveResult{}, fmt.Errorf("archive session before removing it")
+	}
+	// Windows cannot remove a directory while its write.lock handle is open.
+	// The archived state prevents a new run from starting after this release.
+	if err := writeLock.Release(); err != nil {
+		return SessionRemoveResult{}, fmt.Errorf("release session write lock: %w", err)
 	}
 	if err := s.sessionStore.Delete(session.ID); err != nil {
 		return SessionRemoveResult{}, err
 	}
 	return SessionRemoveResult{Status: "removed", ID: session.ID}, nil
+}
+
+func (s *Service) acquireSessionMutationLock(id string) (*sessions.SessionWriteLock, error) {
+	if s == nil || s.sessionStore == nil {
+		return nil, fmt.Errorf("execution session store is not configured")
+	}
+	ctx := context.Background()
+	cancel := func() {}
+	if s.sessionWriteLockTimeout > 0 {
+		ctx, cancel = context.WithTimeout(ctx, s.sessionWriteLockTimeout)
+	}
+	defer cancel()
+	lock, err := s.sessionStore.AcquireSessionWriteLock(ctx, id)
+	if errors.Is(err, context.DeadlineExceeded) {
+		return nil, ErrSessionBusy
+	}
+	return lock, err
 }
 
 func (s *Service) SendSessionMessage(ctx context.Context, id, content string) (SessionMessageResult, error) {
@@ -854,6 +895,9 @@ func (s *Service) runSessionMessage(ctx context.Context, id, content string, emi
 	session, err := s.sessionStore.Load(id)
 	if err != nil {
 		return SessionMessageResult{}, err
+	}
+	if session.Archived {
+		return SessionMessageResult{}, fmt.Errorf("archived session cannot run a turn")
 	}
 	session.ConfigPath = s.ConfigPath()
 	if strings.TrimSpace(session.CWD) == "" {
@@ -1194,6 +1238,7 @@ func sessionMetadataFromStore(session sessions.SessionV2) SessionMetadata {
 		Provider:          session.Provider,
 		ModelProfile:      session.ModelProfile,
 		ModelID:           session.ModelID,
+		Status:            sessionStatus(session),
 		ProjectID:         session.ProjectID,
 		CreatedCWD:        session.CreatedCWD,
 		LastSeq:           session.LastSeq,

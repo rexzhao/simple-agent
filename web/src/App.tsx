@@ -30,8 +30,8 @@ function App() {
   const [selectedSessionID, setSelectedSessionID] = useState('')
   const [sessionDetail, setSessionDetail] = useState<Session | null>(null)
   const [itemsPage, setItemsPage] = useState<ItemsPage | null>(null)
-  const [activeRun, setActiveRun] = useState<ActiveRun | null>(null)
-  const [recoveredRun, setRecoveredRun] = useState<ActiveRunDescriptor | null>(null)
+  const [activeRunsBySession, setActiveRunsBySession] = useState<Record<string, ActiveRun>>({})
+  const [recoveredRuns, setRecoveredRuns] = useState<ActiveRunDescriptor[]>([])
 	const [recentStepsByTurn, setRecentStepsByTurn] = useState<Record<string, RunStep[]>>({})
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
@@ -41,11 +41,21 @@ function App() {
   const [creatingSession, setCreatingSession] = useState(false)
   const selectedProjectRef = useRef('')
   const selectedSessionRef = useRef('')
-	const activeRunRef = useRef<ActiveRun | null>(null)
-	const updateActiveRun = useCallback((updater: (run: ActiveRun | null) => ActiveRun | null) => {
-		const next = updater(activeRunRef.current)
-		activeRunRef.current = next
-		setActiveRun(next)
+	const activeRunsRef = useRef<Record<string, ActiveRun>>({})
+	const addActiveRun = useCallback((run: ActiveRun) => {
+		const next = { ...activeRunsRef.current, [run.sessionID]: run }
+		activeRunsRef.current = next
+		setActiveRunsBySession(next)
+	}, [])
+	const updateActiveRun = useCallback((sessionID: string, runID: string, updater: (run: ActiveRun) => ActiveRun | null) => {
+		const current = activeRunsRef.current[sessionID]
+		if (!current || current.id !== runID) return
+		const updated = updater(current)
+		const next = { ...activeRunsRef.current }
+		if (updated) next[sessionID] = updated
+		else delete next[sessionID]
+		activeRunsRef.current = next
+		setActiveRunsBySession(next)
 	}, [])
 
   selectedProjectRef.current = selectedProjectID
@@ -74,19 +84,18 @@ function App() {
         }))
         if (cancelled) return
         const sessionMap = Object.fromEntries(sessionEntries)
-        const recoveredCandidate = activeRunsPayload.runs[0] ?? null
-        const recoveredProject = recoveredCandidate
-          ? projectsPayload.projects.find((project) => sessionMap[project.id]?.some((session) => session.id === recoveredCandidate.session_id))
+        const recovered = activeRunsPayload.runs.filter((run) => projectsPayload.projects.some((project) => sessionMap[project.id]?.some((session) => session.id === run.session_id)))
+        const recoveredProject = recovered.length > 0
+          ? projectsPayload.projects.find((project) => sessionMap[project.id]?.some((session) => session.id === recovered[0].session_id))
           : null
-        const recovered = recoveredProject ? recoveredCandidate : null
         const firstProjectID = recoveredProject?.id ?? projectsPayload.projects[0]?.id ?? ''
-        const firstSessionID = recovered?.session_id ?? sessionMap[firstProjectID]?.[0]?.id ?? ''
+        const firstSessionID = recovered[0]?.session_id ?? sessionMap[firstProjectID]?.[0]?.id ?? ''
         setBootstrap(bootstrapPayload)
         setProjects(projectsPayload.projects)
         setSessionsByProject(sessionMap)
         setSelectedProjectID(firstProjectID)
         setSelectedSessionID(firstSessionID)
-        setRecoveredRun(recovered)
+        setRecoveredRuns(recovered)
         setShowProjectForm(projectsPayload.projects.length === 0)
       })
       .catch((reason: unknown) => setError(errorMessage(reason)))
@@ -146,7 +155,7 @@ function App() {
   }
 
   const openSessionCreator = async (projectID = selectedProjectID) => {
-    if (!projectID || activeRunRef.current) return
+    if (!projectID) return
     setSessionCreator({ projectID, models: [], selectedKey: '', defaultProvider: '', defaultModel: '', reasoningLevel: '', loading: true })
     try {
       const options = await api.sessionModels(projectID)
@@ -218,7 +227,7 @@ function App() {
   }
 
   const archiveSession = async (session: Session) => {
-    if (activeRun || !window.confirm(`归档“${sessionName(session)}”？归档后会从当前列表隐藏。`)) return
+    if (session.status === 'running' || Boolean(activeRunsRef.current[session.id]) || !window.confirm(`归档“${sessionName(session)}”？归档后会从当前列表隐藏。`)) return
     try {
       await api.archiveSession(session.id)
       removeSessionFromTree(session)
@@ -228,7 +237,7 @@ function App() {
   }
 
   const deleteSession = async (session: Session) => {
-    if (activeRun || !window.confirm(`永久删除“${sessionName(session)}”？此操作无法撤销。`)) return
+    if (session.status === 'running' || Boolean(activeRunsRef.current[session.id]) || !window.confirm(`永久删除“${sessionName(session)}”？此操作无法撤销。`)) return
     try {
       await api.archiveSession(session.id)
       await api.deleteSession(session.id)
@@ -259,151 +268,146 @@ function App() {
     }
   }
 
-  const handleRunEvent = useCallback(async (event: RunEvent) => {
+  const handleRunEvent = useCallback(async (sessionID: string, runID: string, event: RunEvent) => {
+    const update = (updater: (run: ActiveRun) => ActiveRun | null) => updateActiveRun(sessionID, runID, updater)
     switch (event.type) {
-			case 'turn.started':
-				updateActiveRun((run) => run ? { ...run, turnID: String(event.turn_id ?? '') } : run)
-				break
-			case 'agent.iteration.started':
-				updateActiveRun((run) => {
-					if (!run) return run
-					const agentIteration = Number(event.agent_iteration ?? 0)
-					if (agentIteration <= 0) return run
-					return {
-						...run,
-						agentIteration,
-						assistantText: '',
-						steps: appendModelOutput(run.steps, run.assistantText, run.agentIteration),
-					}
-				})
-				break
+      case 'turn.started':
+        update((run) => ({ ...run, turnID: String(event.turn_id ?? '') }))
+        break
+      case 'agent.iteration.started':
+        update((run) => {
+          const agentIteration = Number(event.agent_iteration ?? 0)
+          if (agentIteration <= 0) return run
+          return {
+            ...run,
+            agentIteration,
+            assistantText: '',
+            steps: appendModelOutput(run.steps, run.assistantText, run.agentIteration),
+          }
+        })
+        break
       case 'text.delta':
-				updateActiveRun((run) => run ? { ...run, assistantText: run.assistantText + String(event.text ?? '') } : run)
+        update((run) => ({ ...run, assistantText: run.assistantText + String(event.text ?? '') }))
         break
       case 'reasoning.delta':
-				updateActiveRun((run) => run ? { ...run, steps: appendReasoning(run.steps, String(event.text ?? ''), Number(event.agent_iteration ?? run.agentIteration)) } : run)
+        update((run) => ({ ...run, steps: appendReasoning(run.steps, String(event.text ?? ''), Number(event.agent_iteration ?? run.agentIteration)) }))
         break
       case 'tool.requested':
-				updateActiveRun((run) => run ? {
-					...run,
-					assistantText: '',
-					steps: updateToolStep(appendModelOutput(run.steps, run.assistantText, Number(event.agent_iteration ?? run.agentIteration)), event, Number(event.agent_iteration ?? run.agentIteration)),
-				} : run)
-				break
+        update((run) => ({
+          ...run,
+          assistantText: '',
+          steps: updateToolStep(appendModelOutput(run.steps, run.assistantText, Number(event.agent_iteration ?? run.agentIteration)), event, Number(event.agent_iteration ?? run.agentIteration)),
+        }))
+        break
       case 'tool.started':
       case 'tool.finished':
-				updateActiveRun((run) => run ? { ...run, steps: updateToolStep(run.steps, event, Number(event.agent_iteration ?? run.agentIteration)) } : run)
+        update((run) => ({ ...run, steps: updateToolStep(run.steps, event, Number(event.agent_iteration ?? run.agentIteration)) }))
         break
       case 'usage.updated':
-				updateActiveRun((run) => run ? {
-					...run,
-					inputTokens: Number(event.input_tokens ?? 0),
-					totalTokens: Number(event.total_tokens ?? 0),
-					cachedTokens: Number(event.cached_tokens ?? 0),
-					cacheWriteTokens: Number(event.cache_write_tokens ?? 0),
-					reasoningTokens: Number(event.reasoning_tokens ?? 0),
-				} : run)
+        update((run) => ({
+          ...run,
+          inputTokens: Number(event.input_tokens ?? 0),
+          totalTokens: Number(event.total_tokens ?? 0),
+          cachedTokens: Number(event.cached_tokens ?? 0),
+          cacheWriteTokens: Number(event.cache_write_tokens ?? 0),
+          reasoningTokens: Number(event.reasoning_tokens ?? 0),
+        }))
         break
-      case 'run.resync_required': {
-        const sessionID = String(event.session_id ?? activeRunRef.current?.sessionID ?? '')
-        if (sessionID) {
-          try {
-            await refreshSession(sessionID)
-          } catch (reason) {
-            setError(errorMessage(reason))
-          }
+      case 'run.resync_required':
+        try {
+          await refreshSession(sessionID)
+        } catch (reason) {
+          setError(errorMessage(reason))
         }
         break
-      }
       case 'turn.failed':
-				updateActiveRun((run) => run ? { ...run, status: 'failed', error: String(event.message ?? '运行失败') } : run)
+        update((run) => ({ ...run, status: 'failed', error: String(event.message ?? '运行失败') }))
         setError(String(event.message ?? '运行失败'))
         break
       case 'run.settled': {
+        const settledRun = activeRunsRef.current[sessionID]
+        if (!settledRun || settledRun.id !== runID) return
         if (String(event.status) === 'cancelled') {
-					updateActiveRun((run) => run ? { ...run, status: 'cancelled' } : run)
+          update((run) => ({ ...run, status: 'cancelled' }))
         }
-				const settledRun = activeRunRef.current
-        setRecoveredRun((current) => current?.run_id === settledRun?.id ? null : current)
-				const sessionID = settledRun?.sessionID ?? ''
-				const turnID = String(event.turn_id ?? settledRun?.turnID ?? '')
-				if (sessionID && turnID && settledRun && settledRun.steps.length > 0) {
-					setRecentStepsByTurn((current) => ({ ...current, [processKey(sessionID, turnID)]: settledRun.steps }))
-				}
-        if (sessionID) {
-          try {
-            await refreshSession(sessionID)
-          } catch (reason) {
-            setError(errorMessage(reason))
-          }
+        setRecoveredRuns((current) => current.filter((run) => run.run_id !== runID))
+        const turnID = String(event.turn_id ?? settledRun.turnID ?? '')
+        if (turnID && settledRun.steps.length > 0) {
+          setRecentStepsByTurn((current) => ({ ...current, [processKey(sessionID, turnID)]: settledRun.steps }))
         }
-				updateActiveRun(() => null)
+        try {
+          await refreshSession(sessionID)
+        } catch (reason) {
+          setError(errorMessage(reason))
+        }
+        update(() => null)
         break
       }
     }
-	}, [refreshSession, updateActiveRun])
+  }, [refreshSession, updateActiveRun])
 
   useEffect(() => {
-    if (!recoveredRun || activeRunRef.current) return
-    const run = recoveredRun
-    let disposed = false
-    updateActiveRun(() => ({
-      id: run.run_id,
-      sessionID: run.session_id,
-      turnID: run.turn_id,
-      restored: true,
-      userText: '',
-      assistantText: '',
-      steps: [],
-      agentIteration: 0,
-      status: 'running',
-    }))
-    void streamRun(run.run_id, handleRunEvent).catch(async (reason: unknown) => {
-      if (disposed) return
-      try {
-        await refreshSession(run.session_id)
-      } catch {
-        // Preserve the stream error below.
-      }
-      updateActiveRun((current) => current?.id === run.run_id ? null : current)
-      setRecoveredRun(null)
-      setError(errorMessage(reason))
-    })
-    return () => { disposed = true }
-  }, [handleRunEvent, recoveredRun, refreshSession, updateActiveRun])
+    if (recoveredRuns.length === 0) return
+    for (const run of recoveredRuns) {
+      if (activeRunsRef.current[run.session_id]) continue
+      addActiveRun({
+        id: run.run_id,
+        sessionID: run.session_id,
+        turnID: run.turn_id,
+        restored: true,
+        userText: '',
+        assistantText: '',
+        steps: [],
+        agentIteration: 0,
+        status: 'running',
+      })
+      void streamRun(run.run_id, (event) => handleRunEvent(run.session_id, run.run_id, event)).catch(async (reason: unknown) => {
+        try {
+          await refreshSession(run.session_id)
+        } catch {
+          // Preserve the stream error below.
+        }
+        updateActiveRun(run.session_id, run.run_id, () => null)
+        setRecoveredRuns((current) => current.filter((item) => item.run_id !== run.run_id))
+        setError(errorMessage(reason))
+      })
+    }
+  }, [addActiveRun, handleRunEvent, recoveredRuns, refreshSession, updateActiveRun])
 
   const sendMessage = async (content: string) => {
-    if (!selectedSessionID || activeRun || !content.trim()) return
-		const sessionID = selectedSessionID
+    if (!selectedSessionID || activeRunsRef.current[selectedSessionID] || !content.trim()) return
+    const sessionID = selectedSessionID
     try {
-			const started = await api.startRun(sessionID, content)
-			updateActiveRun(() => ({
+      const started = await api.startRun(sessionID, content)
+      addActiveRun({
         id: started.run_id,
-			sessionID,
+        sessionID,
         userText: content,
         assistantText: '',
-				steps: [],
-				agentIteration: 0,
+        steps: [],
+        agentIteration: 0,
         status: 'running',
-			}))
-      await streamRun(started.run_id, handleRunEvent)
+      })
+      await streamRun(started.run_id, (event) => handleRunEvent(sessionID, started.run_id, event))
     } catch (reason) {
-			updateActiveRun(() => null)
+      const runID = activeRunsRef.current[sessionID]?.id
+      if (runID) updateActiveRun(sessionID, runID, () => null)
       setError(errorMessage(reason))
     }
   }
 
   const cancelRun = async () => {
-    if (!activeRun) return
+    const run = activeRunsRef.current[selectedSessionID]
+    if (!run) return
     try {
-      await api.cancelRun(activeRun.id)
+      await api.cancelRun(run.id)
     } catch (reason) {
       setError(errorMessage(reason))
     }
   }
 
   const compactSession = async () => {
-    if (!selectedSessionID || activeRun) return
+    if (!selectedSessionID || sessionDetail?.status === 'running' || activeRunsRef.current[selectedSessionID]) return
     try {
       await api.compact(selectedSessionID)
       await refreshSession(selectedSessionID)
@@ -413,6 +417,8 @@ function App() {
   }
 
   const selectedProject = projects.find((project) => project.id === selectedProjectID) ?? null
+  const selectedActiveRun = activeRunsBySession[selectedSessionID] ?? null
+  const otherSessionsRunning = Object.keys(activeRunsBySession).some((sessionID) => sessionID !== selectedSessionID)
 
   if (loading) return <Splash />
 
@@ -423,8 +429,7 @@ function App() {
         sessionsByProject={sessionsByProject}
         selectedProjectID={selectedProjectID}
         selectedSessionID={selectedSessionID}
-        disabled={Boolean(activeRun)}
-		runningSessionID={activeRun?.sessionID ?? ''}
+		runningSessionIDs={new Set(Object.keys(activeRunsBySession))}
         onSelectProject={selectProject}
         onSelectSession={selectSession}
         onCreateSession={(projectID) => void openSessionCreator(projectID)}
@@ -447,8 +452,8 @@ function App() {
           <Conversation
             detail={sessionDetail}
             page={itemsPage}
-			activeRun={activeRun?.sessionID === selectedSessionID ? activeRun : null}
-			busy={Boolean(activeRun)}
+			activeRun={selectedActiveRun}
+			otherSessionsRunning={otherSessionsRunning}
 					recentStepsByTurn={recentStepsByTurn}
             onLoadOlder={() => void loadOlder()}
             onSend={(content) => void sendMessage(content)}
@@ -456,7 +461,7 @@ function App() {
             onCompact={() => void compactSession()}
           />
         ) : selectedProject ? (
-		  <EmptySession disabled={Boolean(activeRun)} onCreate={() => void openSessionCreator()} />
+		  <EmptySession disabled={false} onCreate={() => void openSessionCreator()} />
         ) : (
           <ProjectSetup
             suggestedRoot={bootstrap?.cwd ?? ''}
@@ -498,8 +503,7 @@ function WorkspaceTree(props: {
   sessionsByProject: Record<string, Session[]>
   selectedProjectID: string
   selectedSessionID: string
-  disabled: boolean
-  runningSessionID: string
+  runningSessionIDs: ReadonlySet<string>
   version: string
   onSelectProject: (id: string) => void
   onSelectSession: (projectID: string, sessionID: string) => void
@@ -521,17 +525,16 @@ function WorkspaceTree(props: {
 
   return (
     <aside className="project-rail">
-      <div className="brand"><LogoIcon /><span>SAI</span><button className="brand-settings" disabled={props.disabled} onClick={props.onManageProviders} aria-label="管理 Server Root 配置" title="Server Root 配置"><SettingsIcon /></button></div>
+      <div className="brand"><LogoIcon /><span>SAI</span><button className="brand-settings" onClick={props.onManageProviders} aria-label="管理 Server Root 配置" title="Server Root 配置"><SettingsIcon /></button></div>
       <div className="rail-label">项目与会话</div>
       <nav className="project-tree" aria-label="项目和会话树">
         {props.projects.map((project) => {
           const sessions = props.sessionsByProject[project.id] ?? []
           const expanded = expandedProjects.has(project.id)
 		  const collapsedSessions = sessions.slice(0, 3)
-		  const runningSession = sessions.find((session) => session.id === props.runningSessionID)
-		  const visibleSessions = expanded || !runningSession || collapsedSessions.some((session) => session.id === runningSession.id)
-			? (expanded ? sessions : collapsedSessions)
-			: [...collapsedSessions, runningSession]
+		  const visibleSessions = expanded
+			? sessions
+			: sessions.filter((session) => collapsedSessions.some((item) => item.id === session.id) || props.runningSessionIDs.has(session.id))
           return (
             <section className="project-tree-group" key={project.id}>
               <div className={`project-tree-header ${project.id === props.selectedProjectID ? 'selected' : ''}`}>
@@ -545,7 +548,6 @@ function WorkspaceTree(props: {
                 </button>
                 <button
                   className="tree-icon-button"
-                  disabled={props.disabled}
                   onClick={() => props.onCreateSession(project.id)}
                   aria-label={`在 ${projectName(project)} 中新建会话`}
                   title="新建会话"
@@ -563,11 +565,11 @@ function WorkspaceTree(props: {
                         <strong>{sessionName(session)}</strong>
                         <small>{relativeTime(session.last_used_at || session.updated_at)} · {session.model_id || session.model_profile}</small>
                       </span>
-					  {(session.status === 'running' || session.id === props.runningSessionID) && <span className="live-dot" />}
+					  {(session.status === 'running' || props.runningSessionIDs.has(session.id)) && <span className="live-dot" />}
                     </button>
                     <div className="session-tree-actions">
-                      <button disabled={props.disabled} onClick={() => props.onArchiveSession(session)} aria-label={`归档 ${sessionName(session)}`} title="归档"><ArchiveIcon /></button>
-                      <button className="danger" disabled={props.disabled} onClick={() => props.onDeleteSession(session)} aria-label={`删除 ${sessionName(session)}`} title="删除"><TrashIcon /></button>
+                      <button disabled={session.status === 'running' || props.runningSessionIDs.has(session.id)} onClick={() => props.onArchiveSession(session)} aria-label={`归档 ${sessionName(session)}`} title="归档"><ArchiveIcon /></button>
+                      <button className="danger" disabled={session.status === 'running' || props.runningSessionIDs.has(session.id)} onClick={() => props.onDeleteSession(session)} aria-label={`删除 ${sessionName(session)}`} title="删除"><TrashIcon /></button>
                     </div>
                   </div>
                 ))}
@@ -584,7 +586,7 @@ function WorkspaceTree(props: {
         })}
       </nav>
       <div className="project-rail-footer">
-		<button className="secondary-button full" disabled={props.disabled} onClick={props.onAdd}><PlusIcon /> 添加项目</button>
+		<button className="secondary-button full" onClick={props.onAdd}><PlusIcon /> 添加项目</button>
         <span className="version">v{props.version || 'dev'} · local</span>
       </div>
     </aside>
@@ -595,7 +597,7 @@ function Conversation(props: {
   detail: Session | null
   page: ItemsPage | null
   activeRun: ActiveRun | null
-	busy: boolean
+	otherSessionsRunning: boolean
 	recentStepsByTurn: Record<string, RunStep[]>
   onLoadOlder: () => void
   onSend: (content: string) => void
@@ -634,8 +636,8 @@ function Conversation(props: {
 		  )}
         </div>
         <div className="header-actions">
-		  <span className={`status-pill ${props.busy ? 'running' : ''}`}><span />{props.activeRun ? '运行中' : props.busy ? '其他会话运行中' : '就绪'}</span>
-		  <button className="secondary-button" disabled={!props.detail || props.busy} onClick={props.onCompact}>压缩上下文</button>
+		  <span className={`status-pill ${props.activeRun || props.otherSessionsRunning ? 'running' : ''}`}><span />{props.activeRun ? '运行中' : props.otherSessionsRunning ? '其他会话运行中' : '就绪'}</span>
+		  <button className="secondary-button" disabled={!props.detail || props.detail.status === 'running' || Boolean(props.activeRun)} onClick={props.onCompact}>压缩上下文</button>
         </div>
       </header>
       <section ref={messagesRef} className="messages" aria-live="polite" onScroll={updateFollowOutput}>
@@ -650,7 +652,7 @@ function Conversation(props: {
         )}
         <div ref={bottomRef} />
       </section>
-	  <Composer running={Boolean(props.activeRun)} blocked={props.busy && !props.activeRun} onSend={props.onSend} onCancel={props.onCancel} />
+	  <Composer running={Boolean(props.activeRun)} blocked={false} onSend={props.onSend} onCancel={props.onCancel} />
     </div>
   )
 }

@@ -457,6 +457,13 @@ func TestServiceSessionStatusPrioritizesRunningTurn(t *testing.T) {
 	if detail.Status != "running" {
 		t.Fatalf("GetSession() Status = %q, want running", detail.Status)
 	}
+	listed, err := service.ListSessions(SessionListOptions{ProjectID: project.Project.ID})
+	if err != nil {
+		t.Fatalf("ListSessions() error = %v", err)
+	}
+	if len(listed) != 1 || listed[0].Status != "running" {
+		t.Fatalf("ListSessions() = %#v, want one running session", listed)
+	}
 	if _, err := sessionStore.ClearRunningTurn(saved.ID, saved.RunningTurnID); err != nil {
 		t.Fatalf("ClearRunningTurn() error = %v", err)
 	}
@@ -466,6 +473,37 @@ func TestServiceSessionStatusPrioritizesRunningTurn(t *testing.T) {
 	}
 	if detail.Status != "interrupted" {
 		t.Fatalf("GetSession() Status after clear = %q, want interrupted", detail.Status)
+	}
+}
+
+func TestServiceRejectsArchiveAndRemoveForRunningSession(t *testing.T) {
+	home := t.TempDir()
+	service, err := NewService(home)
+	if err != nil {
+		t.Fatalf("NewService() error = %v", err)
+	}
+	project, err := service.CreateProject(mkdirProjectRoot(t, "repo"), "Repo")
+	if err != nil {
+		t.Fatalf("CreateProject() error = %v", err)
+	}
+	session, err := service.CreateSession(project.Project.ID, SessionCreateMetadata{CreatedCWD: project.Project.Root, Provider: "fake", ModelProfile: "default", ModelID: "model"})
+	if err != nil {
+		t.Fatalf("CreateSession() error = %v", err)
+	}
+	stored, err := service.sessionStore.Load(session.ID)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	stored.RunningTurnID = "turn-000001"
+	stored.Archived = true
+	if _, err := service.sessionStore.SaveMetadata(stored); err != nil {
+		t.Fatalf("SaveMetadata() error = %v", err)
+	}
+	if _, err := service.ArchiveSession(session.ID); !errors.Is(err, ErrSessionBusy) {
+		t.Fatalf("ArchiveSession() error = %v, want ErrSessionBusy", err)
+	}
+	if _, err := service.RemoveSession(session.ID); !errors.Is(err, ErrSessionBusy) {
+		t.Fatalf("RemoveSession() error = %v, want ErrSessionBusy", err)
 	}
 }
 
