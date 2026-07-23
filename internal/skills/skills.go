@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 
@@ -111,21 +112,45 @@ func DiscoverRefs(dir string) ([]SkillRef, error) {
 
 func DiscoverRefsDirs(dirs []string) ([]SkillRef, error) {
 	found := []SkillRef{}
-	seen := map[string]SkillRef{}
+	seen := map[string]int{}
+	seenDirs := map[string]struct{}{}
 	for _, dir := range dirs {
+		if strings.TrimSpace(dir) == "" {
+			continue
+		}
+		key := skillDirKey(dir)
+		if _, duplicate := seenDirs[key]; duplicate {
+			continue
+		}
+		seenDirs[key] = struct{}{}
 		refs, err := DiscoverRefs(dir)
 		if err != nil {
 			return nil, err
 		}
 		for _, ref := range refs {
 			if previous, ok := seen[ref.ID]; ok {
-				return nil, fmt.Errorf("duplicate skill id %q in %q (already discovered in %q)", ref.ID, ref.Path, previous.Path)
+				found[previous] = ref
+				continue
 			}
-			seen[ref.ID] = ref
+			seen[ref.ID] = len(found)
 			found = append(found, ref)
 		}
 	}
 	return found, nil
+}
+
+func skillDirKey(dir string) string {
+	key := filepath.Clean(dir)
+	if abs, err := filepath.Abs(key); err == nil {
+		key = abs
+	}
+	if evaluated, err := filepath.EvalSymlinks(key); err == nil {
+		key = evaluated
+	}
+	if runtime.GOOS == "windows" {
+		key = strings.ToLower(key)
+	}
+	return key
 }
 
 func Load(path string) (Skill, error) {

@@ -37,6 +37,29 @@ func TestEnabledSkillsForRunResolvesRepoAndCWDPlaceholders(t *testing.T) {
 	}
 }
 
+func TestEnabledSkillsForRunDeduplicatesRepoAndCWDAtRepoRoot(t *testing.T) {
+	repoDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(repoDir, ".git"), 0o755); err != nil {
+		t.Fatalf("MkdirAll(.git) error = %v", err)
+	}
+	writeExecutionSkill(t, filepath.Join(repoDir, ".agents", "skills", "hello"), "hello instructions")
+
+	cfg := &config.Config{
+		ConfigPath: filepath.Join(t.TempDir(), "sai.yaml"),
+		SkillDirs: []string{
+			"$REPO/.agents/skills",
+			"$CWD/.agents/skills",
+		},
+	}
+	got, err := enabledSkillsForRun(cfg, repoDir)
+	if err != nil {
+		t.Fatalf("enabledSkillsForRun() error = %v", err)
+	}
+	if len(got) != 1 || got[0].ID != "hello" {
+		t.Fatalf("enabledSkillsForRun() = %#v, want one hello skill", got)
+	}
+}
+
 func writeExecutionSkill(t *testing.T, dir, instructions string) {
 	t.Helper()
 	if err := os.MkdirAll(dir, 0o755); err != nil {

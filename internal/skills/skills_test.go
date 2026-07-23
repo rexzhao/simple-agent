@@ -100,22 +100,39 @@ func TestDiscoverDirsPreservesDirectoryOrder(t *testing.T) {
 	}
 }
 
-func TestDiscoverDirsRejectsDuplicateIDs(t *testing.T) {
+func TestDiscoverDirsDeduplicatesEquivalentDirectories(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "skills")
+	writeSkill(t, filepath.Join(dir, "shared"), "Shared instructions")
+
+	got, err := DiscoverDirs([]string{dir, filepath.Join(dir, ".")})
+	if err != nil {
+		t.Fatalf("DiscoverDirs() error = %v", err)
+	}
+	if len(got) != 1 || got[0].ID != "shared" {
+		t.Fatalf("DiscoverDirs() = %#v, want one shared skill", got)
+	}
+}
+
+func TestDiscoverDirsUsesLastDirectoryForDuplicateIDs(t *testing.T) {
 	root := t.TempDir()
 	first := filepath.Join(root, "first")
 	second := filepath.Join(root, "second")
 	writeSkill(t, filepath.Join(first, "shared"), "First instructions")
 	writeSkill(t, filepath.Join(second, "shared"), "Second instructions")
 
-	_, err := DiscoverDirs([]string{first, second})
-	if err == nil {
-		t.Fatal("DiscoverDirs() error = nil, want duplicate id error")
+	got, err := DiscoverDirs([]string{first, second})
+	if err != nil {
+		t.Fatalf("DiscoverDirs() error = %v", err)
 	}
-	got := err.Error()
-	for _, want := range []string{`duplicate skill id "shared"`, "first", "second"} {
-		if !strings.Contains(got, want) {
-			t.Fatalf("DiscoverDirs() error = %q, want contain %q", got, want)
-		}
+	if len(got) != 1 {
+		t.Fatalf("DiscoverDirs() = %#v, want one shared skill", got)
+	}
+	if got[0].Instructions != "Second instructions" {
+		t.Fatalf("shared instructions = %q, want last directory contents", got[0].Instructions)
+	}
+	if wantPath := filepath.Join(second, "shared", skillFileName); got[0].Path != wantPath {
+		t.Fatalf("shared path = %q, want %q", got[0].Path, wantPath)
 	}
 }
 
