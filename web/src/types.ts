@@ -39,6 +39,7 @@ export interface ProviderModelSettings {
   id: string
   type: string
   input?: string[]
+  developer_role?: string
   context_window?: number
   input_limit?: number
   output_limit?: number

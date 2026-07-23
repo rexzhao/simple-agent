@@ -1367,6 +1367,7 @@ interface EditableProviderModel {
   id: string
   type: string
   supportsImages: boolean
+  developerRole: string
   contextWindow: string
   inputLimit: string
   outputLimit: string
@@ -1564,6 +1565,7 @@ function ProviderManagerDialog(props: {
                         <label>模型 ID<input value={model.id} onChange={(event) => updateModel(index, { id: event.target.value })} placeholder="也可以手动输入" /></label>
                         <label>API 类型<select value={model.type || 'openai-chat'} onChange={(event) => updateModel(index, { type: event.target.value })}><option value="openai-chat">OpenAI Chat</option><option value="openai-responses">OpenAI Responses</option><option value="openai-codex">OpenAI Codex</option><option value="anthropic-messages">Anthropic Messages</option></select></label>
                         <label className="checkbox-field"><input type="checkbox" checked={model.supportsImages} onChange={(event) => updateModel(index, { supportsImages: event.target.checked })} /> 支持图片输入</label>
+                        <label>Developer 角色<select value={model.developerRole} onChange={(event) => updateModel(index, { developerRole: event.target.value })}><option value="">保持 developer</option><option value="system">映射为 system</option></select></label>
                         <label>Context Window<input type="number" min="0" value={model.contextWindow} onChange={(event) => updateModel(index, { contextWindow: event.target.value })} placeholder="400000" /></label>
                         <label>Input Limit<input type="number" min="0" value={model.inputLimit} onChange={(event) => updateModel(index, { inputLimit: event.target.value })} placeholder="272000" /></label>
                         <label>Output Limit<input type="number" min="0" value={model.outputLimit} onChange={(event) => updateModel(index, { outputLimit: event.target.value })} placeholder="128000" /></label>
@@ -1614,6 +1616,7 @@ function editableProviderModel(model: ProviderModelSettings): EditableProviderMo
     id: model.id,
     type: model.type || 'openai-chat',
     supportsImages: model.input?.includes('image') ?? false,
+    developerRole: model.developer_role ?? '',
     contextWindow: model.context_window ? String(model.context_window) : '',
     inputLimit: model.input_limit ? String(model.input_limit) : '',
     outputLimit: model.output_limit ? String(model.output_limit) : '',
@@ -1625,7 +1628,7 @@ function editableProviderModel(model: ProviderModelSettings): EditableProviderMo
 }
 
 function emptyProviderModel(): EditableProviderModel {
-  return { profile: '', id: '', type: 'openai-chat', supportsImages: false, contextWindow: '', inputLimit: '', outputLimit: '', parametersJSON: '{}', reasoningParameter: '', reasoningDefault: '', reasoningLevelsJSON: '{}' }
+  return { profile: '', id: '', type: 'openai-chat', supportsImages: false, developerRole: '', contextWindow: '', inputLimit: '', outputLimit: '', parametersJSON: '{}', reasoningParameter: '', reasoningDefault: '', reasoningLevelsJSON: '{}' }
 }
 
 function providerInput(draft: ProviderDraft): ProviderSettingsInput {
@@ -1648,6 +1651,7 @@ function providerInput(draft: ProviderDraft): ProviderSettingsInput {
         id: model.id.trim(),
         type: model.type,
         input: model.supportsImages ? ['text', 'image'] : ['text'],
+        developer_role: model.developerRole,
         context_window: model.contextWindow ? Number(model.contextWindow) : 0,
         input_limit: model.inputLimit ? Number(model.inputLimit) : 0,
         output_limit: model.outputLimit ? Number(model.outputLimit) : 0,

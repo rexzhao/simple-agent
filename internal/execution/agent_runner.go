@@ -259,15 +259,16 @@ func (r AgentTurnRunner) prepareRuntime(ctx context.Context, session sessions.Se
 	}
 
 	runtime := &agentRunnerRuntime{
-		cwd:          cwd,
-		configPath:   cfg.ConfigPath,
-		providerName: resolved.ProviderName,
-		modelProfile: resolved.Profile,
-		modelID:      resolved.ModelID,
-		inputLimit:   resolved.InputLimit,
-		outputLimit:  resolved.OutputLimit,
-		parameters:   resolved.Parameters,
-		provider:     provider,
+		cwd:           cwd,
+		configPath:    cfg.ConfigPath,
+		providerName:  resolved.ProviderName,
+		modelProfile:  resolved.Profile,
+		modelID:       resolved.ModelID,
+		developerRole: model.MessageRole(resolved.DeveloperRole),
+		inputLimit:    resolved.InputLimit,
+		outputLimit:   resolved.OutputLimit,
+		parameters:    resolved.Parameters,
+		provider:      provider,
 		toolExecutor: runToolExecutor{
 			builtins:    toolRegistry,
 			mcpSessions: mcpSessionsByID,
@@ -301,6 +302,7 @@ type agentRunnerRuntime struct {
 	providerName       string
 	modelProfile       string
 	modelID            string
+	developerRole      model.MessageRole
 	inputLimit         int
 	outputLimit        int
 	parameters         map[string]any
@@ -436,11 +438,12 @@ func (r *agentRunnerRuntime) runSessionTurn(ctx context.Context, prompt string, 
 		ContentBlocks: copyInputContentBlocks(options.contentBlocks),
 	}.Message())
 	request := model.Request{
-		Model:      r.modelID,
-		Messages:   requestMessages,
-		Tools:      r.toolSchemas,
-		Parameters: r.parameters,
-		SessionID:  r.session.ID,
+		Model:         r.modelID,
+		Messages:      requestMessages,
+		Tools:         r.toolSchemas,
+		Parameters:    r.parameters,
+		SessionID:     r.session.ID,
+		DeveloperRole: r.developerRole,
 	}
 	events, results, err := agent.StreamWithResult(turnCtx, request, agent.Options{
 		Provider:          r.provider,
@@ -886,9 +889,10 @@ func buildCompactionSummaryInput(session sessions.SessionV2, resolved config.Res
 	for drop := 0; drop <= len(visibleGroups); drop++ {
 		messages := compactionPromptMessages(contextItems, visibleGroups[drop:])
 		request := model.Request{
-			Model:      resolved.ModelID,
-			Messages:   messages,
-			Parameters: resolved.Parameters,
+			Model:         resolved.ModelID,
+			Messages:      messages,
+			Parameters:    resolved.Parameters,
+			DeveloperRole: model.MessageRole(resolved.DeveloperRole),
 		}
 		estimated := contextwindow.EstimateRequestTokens(request)
 		if resolved.ContextWindow <= 0 || estimated < resolved.ContextWindow {
@@ -999,9 +1003,10 @@ func writeSummaryTranscriptMessage(out *strings.Builder, message model.Message) 
 
 func collectCompactionSummary(ctx context.Context, provider model.Provider, resolved config.ResolvedModel, input compactionSummaryInput) (string, error) {
 	stream, err := provider.Stream(ctx, model.Request{
-		Model:      resolved.ModelID,
-		Messages:   input.Messages,
-		Parameters: resolved.Parameters,
+		Model:         resolved.ModelID,
+		Messages:      input.Messages,
+		Parameters:    resolved.Parameters,
+		DeveloperRole: model.MessageRole(resolved.DeveloperRole),
 	})
 	if err != nil {
 		return "", fmt.Errorf("request compaction summary: %w", err)

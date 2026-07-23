@@ -248,6 +248,7 @@ func TestServerProviderSettingsPreserveSecretsAndWriteReasoningDefaults(t *testi
 			ID:            "gpt-5.5",
 			Type:          "openai-responses",
 			Input:         []string{"text", "image"},
+			DeveloperRole: "system",
 			ContextWindow: 400000,
 			InputLimit:    272000,
 			OutputLimit:   128000,
@@ -268,6 +269,9 @@ func TestServerProviderSettingsPreserveSecretsAndWriteReasoningDefaults(t *testi
 	if !reflect.DeepEqual(model.Input, []string{"text", "image"}) {
 		t.Fatalf("model input = %#v, want text/image", model.Input)
 	}
+	if model.DeveloperRole != "system" {
+		t.Fatalf("model developer role = %q, want system", model.DeveloperRole)
+	}
 
 	response = doJSONRequest(t, http.MethodGet, server.URL+"/api/projects/"+projectResult.Project.ID+"/models", nil)
 	var options execution.SessionModelOptions
@@ -284,6 +288,7 @@ func TestServerProviderSettingsPreserveSecretsAndWriteReasoningDefaults(t *testi
 	if !bytes.Contains(providerData, []byte("api_key: test-key")) ||
 		!bytes.Contains(providerData, []byte("input:")) ||
 		!bytes.Contains(providerData, []byte("- image")) ||
+		!bytes.Contains(providerData, []byte("developer_role: system")) ||
 		!bytes.Contains(providerData, []byte("input_limit: 272000")) ||
 		!bytes.Contains(providerData, []byte("output_limit: 128000")) ||
 		!bytes.Contains(providerData, []byte("reasoning_config:")) {

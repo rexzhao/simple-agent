@@ -22,11 +22,12 @@ type CompactionResult struct {
 }
 
 type Request struct {
-	Model      string
-	Messages   []Message
-	Tools      []Tool
-	Parameters map[string]any
-	SessionID  string
+	Model         string
+	Messages      []Message
+	Tools         []Tool
+	Parameters    map[string]any
+	SessionID     string
+	DeveloperRole MessageRole
 }
 
 type MessageRole string

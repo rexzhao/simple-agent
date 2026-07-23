@@ -38,6 +38,42 @@ func TestBuildRequestBodyMapsMessagesStreamAndParameters(t *testing.T) {
 	assertJSONOmitsKey(t, body, "tools")
 }
 
+func TestBuildRequestBodyMapsConfiguredDeveloperRole(t *testing.T) {
+	body, err := BuildRequestBody(model.Request{
+		Model: "kimi-k3",
+		Messages: []model.Message{
+			{Role: model.MessageRoleSystem, Content: "You are helpful."},
+			{Role: model.MessageRoleDeveloper, Content: "Follow project rules."},
+			{Role: model.MessageRoleUser, Content: "Hello"},
+		},
+		DeveloperRole: model.MessageRoleSystem,
+	}, true)
+	if err != nil {
+		t.Fatalf("BuildRequestBody() error = %v", err)
+	}
+
+	assertJSONEqual(t, body, `{
+		"model": "kimi-k3",
+		"messages": [
+			{"role": "system", "content": "You are helpful."},
+			{"role": "system", "content": "Follow project rules."},
+			{"role": "user", "content": "Hello"}
+		],
+		"stream": true
+	}`)
+}
+
+func TestBuildRequestBodyRejectsUnsupportedDeveloperRoleMapping(t *testing.T) {
+	_, err := BuildRequestBody(model.Request{
+		Model:         "model-default",
+		Messages:      []model.Message{{Role: model.MessageRoleDeveloper, Content: "rules"}},
+		DeveloperRole: model.MessageRoleUser,
+	}, true)
+	if err == nil {
+		t.Fatal("BuildRequestBody() error = nil, want unsupported developer role mapping error")
+	}
+}
+
 func TestBuildRequestBodyMapsToolsToOpenAIFunctionShape(t *testing.T) {
 	body, err := BuildRequestBody(model.Request{
 		Model: "glm-5.2",

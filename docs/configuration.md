@@ -121,6 +121,14 @@ Web application:
 input: [text, image]
 ```
 
+Some OpenAI-compatible Chat providers do not accept the newer `developer`
+message role. Configure a model-specific wire-role mapping without changing
+the durable session history:
+
+```yaml
+developer_role: system
+```
+
 ### OpenAI Responses cache and state
 
 Responses profiles default to `store: false` and manual history replay. During a

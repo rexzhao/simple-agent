@@ -14,7 +14,7 @@ func BuildRequestBody(request model.Request, stream bool) ([]byte, error) {
 		body[key] = value
 	}
 
-	messages, err := buildMessages(request.Messages)
+	messages, err := buildMessages(request.Messages, request.DeveloperRole)
 	if err != nil {
 		return nil, err
 	}
@@ -29,15 +29,24 @@ func BuildRequestBody(request model.Request, stream bool) ([]byte, error) {
 	return json.Marshal(body)
 }
 
-func buildMessages(messages []model.Message) ([]map[string]any, error) {
+func buildMessages(messages []model.Message, developerRole model.MessageRole) ([]map[string]any, error) {
+	switch developerRole {
+	case "", model.MessageRoleDeveloper, model.MessageRoleSystem:
+	default:
+		return nil, fmt.Errorf("unsupported OpenAI Chat developer role mapping %q", developerRole)
+	}
 	out := make([]map[string]any, 0, len(messages))
 	for _, message := range messages {
 		content, err := openAIChatMessageContent(message)
 		if err != nil {
 			return nil, err
 		}
+		role := message.Role
+		if role == model.MessageRoleDeveloper && developerRole != "" {
+			role = developerRole
+		}
 		item := map[string]any{
-			"role":    string(message.Role),
+			"role":    string(role),
 			"content": content,
 		}
 		if len(message.ToolCalls) > 0 {

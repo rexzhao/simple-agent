@@ -42,6 +42,7 @@ type ProviderModelSettings struct {
 	ID              string                 `json:"id"`
 	Type            string                 `json:"type"`
 	Input           []string               `json:"input,omitempty"`
+	DeveloperRole   string                 `json:"developer_role,omitempty"`
 	ContextWindow   int                    `json:"context_window,omitempty"`
 	InputLimit      int                    `json:"input_limit,omitempty"`
 	OutputLimit     int                    `json:"output_limit,omitempty"`
@@ -172,10 +173,15 @@ func (s *Service) saveProviderSettings(existingName string, input ProviderSettin
 				return ProviderSettingsDocument{}, fmt.Errorf("model profile %q: %w", profile, err)
 			}
 		}
+		developerRole, err := config.NormalizeDeveloperRole(model.DeveloperRole)
+		if err != nil {
+			return ProviderSettingsDocument{}, fmt.Errorf("model profile %q: %w", profile, err)
+		}
 		modelProfile := config.ModelProfile{
 			ID:              strings.TrimSpace(model.ID),
 			Type:            modelType,
 			Input:           modelInput,
+			DeveloperRole:   developerRole,
 			ContextWindow:   model.ContextWindow,
 			InputLimit:      model.InputLimit,
 			OutputLimit:     model.OutputLimit,
@@ -445,6 +451,7 @@ func providerSettingsFromConfig(providerDir string, provider config.ProviderConf
 			ID:              model.ID,
 			Type:            model.Type,
 			Input:           append([]string(nil), model.Input...),
+			DeveloperRole:   model.DeveloperRole,
 			ContextWindow:   model.ContextWindow,
 			InputLimit:      model.InputLimit,
 			OutputLimit:     model.OutputLimit,

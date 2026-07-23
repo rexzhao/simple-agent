@@ -91,6 +91,7 @@ type ModelProfile struct {
 	ID              string          `json:"id" yaml:"id"`
 	Type            string          `json:"type,omitempty" yaml:"type,omitempty"`
 	Input           []string        `json:"input,omitempty" yaml:"input,omitempty"`
+	DeveloperRole   string          `json:"developer_role,omitempty" yaml:"developer_role,omitempty"`
 	ContextWindow   int             `json:"context_window,omitempty" yaml:"context_window,omitempty"`
 	InputLimit      int             `json:"input_limit,omitempty" yaml:"input_limit,omitempty"`
 	OutputLimit     int             `json:"output_limit,omitempty" yaml:"output_limit,omitempty"`
@@ -117,6 +118,7 @@ type ResolvedModel struct {
 	ModelID             string
 	Type                string
 	Input               []string
+	DeveloperRole       string
 	Parameters          map[string]any
 	ContextWindow       int
 	ContextWindowSource string
@@ -263,6 +265,7 @@ func (c *Config) ResolveModel(providerName, modelName string) (ResolvedModel, er
 		ModelID:             profile.ID,
 		Type:                modelType,
 		Input:               append([]string(nil), profile.Input...),
+		DeveloperRole:       profile.DeveloperRole,
 		Parameters:          copyParameters(profile.Parameters),
 		ContextWindow:       window.Tokens,
 		ContextWindowSource: string(window.Source),
@@ -409,6 +412,14 @@ func (m *ModelProfile) UnmarshalYAML(value *yaml.Node) error {
 		m.Input = input
 		delete(fields, "input")
 	}
+	if rawDeveloperRole, ok := fields["developer_role"]; ok {
+		developerRole, err := NormalizeDeveloperRole(rawDeveloperRole)
+		if err != nil {
+			return err
+		}
+		m.DeveloperRole = developerRole
+		delete(fields, "developer_role")
+	}
 	if rawContextWindow, ok := fields["context_window"]; ok {
 		contextWindow, err := parseContextWindow(rawContextWindow)
 		if err != nil {
@@ -516,6 +527,23 @@ func ModelSupportsInput(input []string, modality string) bool {
 		}
 	}
 	return false
+}
+
+func NormalizeDeveloperRole(value any) (string, error) {
+	if value == nil {
+		return "", nil
+	}
+	role, ok := value.(string)
+	if !ok {
+		return "", fmt.Errorf("model profile developer_role must be a string")
+	}
+	role = strings.ToLower(strings.TrimSpace(role))
+	switch role {
+	case "", "developer", "system":
+		return role, nil
+	default:
+		return "", fmt.Errorf("model profile developer_role must be developer or system")
+	}
 }
 
 func parseModelTokenLimit(name string, value any) (int, error) {

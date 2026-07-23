@@ -902,6 +902,7 @@ models:
     id: model-default
     type: anthropic-messages
     input: [text, image]
+    developer_role: system
     context_window: 400000
     input_limit: 272000
     output_limit: 128000
@@ -925,6 +926,9 @@ models:
 	if !sameStrings(profile.Input, []string{"text", "image"}) {
 		t.Fatalf("model input = %#v, want text/image", profile.Input)
 	}
+	if profile.DeveloperRole != "system" {
+		t.Fatalf("DeveloperRole = %q, want system", profile.DeveloperRole)
+	}
 	if got := profile.Parameters["temperature"]; got != 0.2 {
 		t.Fatalf("temperature = %#v, want 0.2", got)
 	}
@@ -939,6 +943,9 @@ models:
 	}
 	if _, ok := profile.Parameters["input"]; ok {
 		t.Fatal("Parameters unexpectedly contains input")
+	}
+	if _, ok := profile.Parameters["developer_role"]; ok {
+		t.Fatal("Parameters unexpectedly contains developer_role")
 	}
 	if _, ok := profile.Parameters["context_window"]; ok {
 		t.Fatal("Parameters unexpectedly contains context_window")
@@ -973,6 +980,9 @@ models:
 	if !sameStrings(resolved.Input, []string{"text", "image"}) {
 		t.Fatalf("resolved.Input = %#v, want text/image", resolved.Input)
 	}
+	if resolved.DeveloperRole != "system" {
+		t.Fatalf("resolved.DeveloperRole = %q, want system", resolved.DeveloperRole)
+	}
 
 	resolved, err = cfg.ResolveModel("fake", "estimated")
 	if err != nil {
@@ -983,6 +993,29 @@ models:
 	}
 	if resolved.Type != ProviderTypeOpenAIChat {
 		t.Fatalf("resolved.Type = %q, want default %q", resolved.Type, ProviderTypeOpenAIChat)
+	}
+}
+
+func TestNormalizeDeveloperRole(t *testing.T) {
+	for _, test := range []struct {
+		value any
+		want  string
+		ok    bool
+	}{
+		{value: nil, want: "", ok: true},
+		{value: "", want: "", ok: true},
+		{value: " SYSTEM ", want: "system", ok: true},
+		{value: "developer", want: "developer", ok: true},
+		{value: "user"},
+		{value: 1},
+	} {
+		got, err := NormalizeDeveloperRole(test.value)
+		if (err == nil) != test.ok {
+			t.Errorf("NormalizeDeveloperRole(%#v) error = %v, want ok=%t", test.value, err, test.ok)
+		}
+		if err == nil && got != test.want {
+			t.Errorf("NormalizeDeveloperRole(%#v) = %q, want %q", test.value, got, test.want)
+		}
 	}
 }
 
