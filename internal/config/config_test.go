@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -117,6 +118,76 @@ func TestEnsureRootConfigCreatesCoreLayoutWithoutLogs(t *testing.T) {
 	}
 	if cfg.Logging.Path != "" {
 		t.Fatalf("created config logging path = %q, want disabled", cfg.Logging.Path)
+	}
+}
+
+func TestEnsureRootConfigRestrictsConfigPermissions(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Unix permission bits are not an access-control guarantee on Windows")
+	}
+
+	root := t.TempDir()
+	if err := os.Chmod(root, 0o755); err != nil {
+		t.Fatalf("Chmod(root) error = %v", err)
+	}
+	path := filepath.Join(root, "sai.yaml")
+	if err := os.WriteFile(path, []byte("{}\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(config) error = %v", err)
+	}
+	if err := os.Chmod(path, 0o644); err != nil {
+		t.Fatalf("Chmod(config) error = %v", err)
+	}
+
+	if err := EnsureRootConfig(path); err != nil {
+		t.Fatalf("EnsureRootConfig() error = %v", err)
+	}
+	assertFileMode(t, root, 0o700)
+	assertFileMode(t, path, 0o600)
+	for _, name := range []string{"providers", "auth", "mcp"} {
+		assertFileMode(t, filepath.Join(root, name), 0o700)
+	}
+}
+
+func TestWriteProviderConfigRestrictsExistingPermissions(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Unix permission bits are not an access-control guarantee on Windows")
+	}
+
+	root := t.TempDir()
+	providers := filepath.Join(root, "providers")
+	if err := os.Mkdir(providers, 0o755); err != nil {
+		t.Fatalf("Mkdir(providers) error = %v", err)
+	}
+	path := filepath.Join(providers, "local.yaml")
+	if err := os.WriteFile(path, []byte("old\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(provider) error = %v", err)
+	}
+	if err := os.Chmod(path, 0o644); err != nil {
+		t.Fatalf("Chmod(provider) error = %v", err)
+	}
+
+	if err := WriteProviderConfig(path, ProviderConfig{
+		Name:    "local",
+		BaseURL: "https://example.test/v1",
+		APIKey:  "$LOCAL_API_KEY",
+		Models: map[string]ModelProfile{
+			"default": {ID: "example-model"},
+		},
+	}); err != nil {
+		t.Fatalf("WriteProviderConfig() error = %v", err)
+	}
+	assertFileMode(t, providers, 0o700)
+	assertFileMode(t, path, 0o600)
+}
+
+func assertFileMode(t *testing.T, path string, want os.FileMode) {
+	t.Helper()
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("Stat(%q) error = %v", path, err)
+	}
+	if got := info.Mode().Perm(); got != want {
+		t.Fatalf("mode(%q) = %04o, want %04o", path, got, want)
 	}
 }
 

@@ -8,6 +8,11 @@ project/session data. Projects remain independent workspaces for `$CWD`,
 
 The browser never receives resolved API keys or authorization tokens.
 
+On Unix-like systems SAI creates the server-root core directories with mode
+`0700`, and creates or rewrites root/provider configuration files with mode
+`0600`. Manually managed provider YAML files should use the same restrictive
+permissions. Windows access control continues to rely on the owning user's ACL.
+
 ## Layout
 
 ```text

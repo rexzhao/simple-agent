@@ -13,6 +13,11 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+const (
+	privateConfigDirectoryMode os.FileMode = 0o700
+	privateConfigFileMode      os.FileMode = 0o600
+)
+
 // EnsureRootConfig makes a server-root configuration usable by the Web
 // application without enabling diagnostic logging. Existing configuration is
 // preserved; only missing root files and core resource directories are
@@ -26,6 +31,9 @@ func EnsureRootConfig(path string) error {
 		return fmt.Errorf("resolve config file: %w", err)
 	}
 	abs = filepath.Clean(abs)
+	if err := ensurePrivateConfigDirectory(filepath.Dir(abs)); err != nil {
+		return fmt.Errorf("create config directory: %w", err)
+	}
 	if _, err := os.Stat(abs); err != nil {
 		if !errors.Is(err, os.ErrNotExist) {
 			return fmt.Errorf("stat config file %q: %w", abs, err)
@@ -33,6 +41,9 @@ func EnsureRootConfig(path string) error {
 		if err := writeConfigFileAtomic(abs, []byte("{}\n")); err != nil {
 			return fmt.Errorf("create root config file %q: %w", abs, err)
 		}
+	}
+	if err := os.Chmod(abs, privateConfigFileMode); err != nil {
+		return fmt.Errorf("restrict config file permissions %q: %w", abs, err)
 	}
 
 	cfg, err := LoadBase(abs)
@@ -43,7 +54,7 @@ func EnsureRootConfig(path string) error {
 		if strings.TrimSpace(dir) == "" {
 			continue
 		}
-		if err := os.MkdirAll(dir, 0o755); err != nil {
+		if err := ensurePrivateConfigDirectory(dir); err != nil {
 			return fmt.Errorf("create config resource directory %q: %w", dir, err)
 		}
 	}
@@ -107,15 +118,10 @@ func setYAMLScalar(mapping *yaml.Node, key, value string) {
 
 func writeConfigFileAtomic(path string, data []byte) error {
 	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := ensurePrivateConfigDirectory(dir); err != nil {
 		return fmt.Errorf("create config directory: %w", err)
 	}
-	mode := os.FileMode(0o644)
-	if info, err := os.Stat(path); err == nil {
-		mode = info.Mode().Perm()
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("stat config file: %w", err)
-	}
+	mode := privateConfigFileMode
 	temp, err := os.CreateTemp(dir, ".config-*.tmp")
 	if err != nil {
 		return fmt.Errorf("create temporary config file: %w", err)
@@ -145,8 +151,25 @@ func writeConfigFileAtomic(path string, data []byte) error {
 	if err := replaceConfigFile(tempPath, path); err != nil {
 		return fmt.Errorf("replace config file: %w", err)
 	}
+	if err := os.Chmod(path, privateConfigFileMode); err != nil {
+		return fmt.Errorf("restrict config file permissions %q: %w", path, err)
+	}
 	cleanup = false
 	return nil
+}
+
+func ensurePrivateConfigDirectory(dir string) error {
+	if err := os.MkdirAll(dir, privateConfigDirectoryMode); err != nil {
+		return err
+	}
+	info, err := os.Stat(dir)
+	if err != nil {
+		return err
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("%q is not a directory", dir)
+	}
+	return os.Chmod(dir, privateConfigDirectoryMode)
 }
 
 func replaceConfigFile(source, target string) error {

@@ -12,14 +12,10 @@ import (
 	"os/exec"
 	"path"
 	"path/filepath"
-	"reflect"
 	"regexp"
-	"runtime"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/rexzhao/simple-agent/internal/model"
@@ -36,6 +32,14 @@ const (
 )
 
 const shellCancelWaitDelay = 2 * time.Second
+
+// shellCommandController owns the platform-specific process-group or process-
+// tree lifecycle for one shell command. Run starts and waits for the command;
+// Close is idempotent and removes any remaining descendants after completion.
+type shellCommandController interface {
+	Run(*exec.Cmd) error
+	Close()
+}
 
 const (
 	defaultReadFileMaxBytes    = 50 * 1024
@@ -751,9 +755,10 @@ func newShellExecutor(rootDir string) Executor {
 			defer cancel()
 		}
 
-		cmd := shellCommand(commandCtx, command)
+		cmd := newShellCommand(commandCtx, command)
 		cmd.Dir = rootDir
-		configureShellCommandCancel(cmd)
+		controller := newShellCommandController(cmd)
+		defer controller.Close()
 
 		var (
 			content         string
@@ -767,13 +772,17 @@ func newShellExecutor(rootDir string) Executor {
 			output := newLimitedOutput(maxOutputBytes)
 			cmd.Stdout = output
 			cmd.Stderr = output
-			err = cmd.Run()
+			err = controller.Run(cmd)
 			content = output.String()
 			outputTruncated = output.Truncated()
 		} else {
-			var output []byte
-			output, err = cmd.CombinedOutput()
-			content = string(output)
+			// This matches exec.Cmd.CombinedOutput while allowing the platform
+			// controller to attach process-group/process-tree cleanup after Start.
+			var output bytes.Buffer
+			cmd.Stdout = &output
+			cmd.Stderr = &output
+			err = controller.Run(cmd)
+			content = output.String()
 		}
 		result := model.ToolResult{
 			Name:    BuiltinShell,
@@ -841,74 +850,6 @@ func (o *limitedOutput) Truncated() bool {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	return o.truncated
-}
-
-func shellCommand(ctx context.Context, command string) *exec.Cmd {
-	if runtime.GOOS == "windows" {
-		return exec.CommandContext(ctx, "powershell", "-NoProfile", "-NonInteractive", "-Command", command)
-	}
-	return exec.CommandContext(ctx, "sh", "-c", command)
-}
-
-func configureShellCommandCancel(cmd *exec.Cmd) {
-	cmd.WaitDelay = shellCancelWaitDelay
-
-	killProcessGroup := false
-	if runtime.GOOS != "windows" {
-		attr := &syscall.SysProcAttr{}
-		killProcessGroup = setSysProcAttrBool(attr, "Setpgid", true)
-		if killProcessGroup {
-			cmd.SysProcAttr = attr
-		}
-	}
-
-	cmd.Cancel = func() error {
-		if cmd.Process == nil {
-			return os.ErrProcessDone
-		}
-		if killProcessGroup {
-			if err := killShellProcessGroup(cmd.Process.Pid); err == nil || errors.Is(err, os.ErrProcessDone) {
-				return err
-			}
-		}
-		if runtime.GOOS == "windows" {
-			if err := killWindowsProcessTree(cmd.Process.Pid); err == nil || errors.Is(err, os.ErrProcessDone) {
-				return err
-			}
-		}
-		return cmd.Process.Kill()
-	}
-}
-
-func setSysProcAttrBool(attr *syscall.SysProcAttr, name string, value bool) bool {
-	field := reflect.ValueOf(attr).Elem().FieldByName(name)
-	if !field.IsValid() || !field.CanSet() || field.Kind() != reflect.Bool {
-		return false
-	}
-	field.SetBool(value)
-	return true
-}
-
-func killShellProcessGroup(pid int) error {
-	if pid <= 0 {
-		return os.ErrProcessDone
-	}
-	process, err := os.FindProcess(-pid)
-	if err != nil {
-		return err
-	}
-	return process.Kill()
-}
-
-func killWindowsProcessTree(pid int) error {
-	if pid <= 0 {
-		return os.ErrProcessDone
-	}
-	output, err := exec.Command("taskkill", "/T", "/F", "/PID", strconv.Itoa(pid)).CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("taskkill process tree pid %d: %w: %s", pid, err, strings.TrimSpace(string(output)))
-	}
-	return nil
 }
 
 func shellErrorContent(ctx context.Context, output string, err error) string {
