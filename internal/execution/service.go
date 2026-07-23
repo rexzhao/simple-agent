@@ -1230,6 +1230,9 @@ func sessionDetailFromStore(session sessions.SessionV2) SessionDetail {
 }
 
 func sessionStatus(session sessions.SessionV2) string {
+	if strings.TrimSpace(session.RunningTurnID) != "" {
+		return "running"
+	}
 	if !session.InterruptedAt.IsZero() && (session.LastUsedAt.IsZero() || !session.LastUsedAt.After(session.InterruptedAt)) {
 		return "interrupted"
 	}

@@ -172,6 +172,18 @@ func TestServerCancelsRun(t *testing.T) {
 	}
 	decodeResponse(t, created, &run)
 
+	active := doJSONRequest(t, http.MethodGet, server.URL+"/api/runs/active", nil)
+	if active.StatusCode != http.StatusOK {
+		t.Fatalf("GET active runs status = %d body=%s", active.StatusCode, readBody(active))
+	}
+	var activePayload struct {
+		Runs []activeRunSnapshot `json:"runs"`
+	}
+	decodeResponse(t, active, &activePayload)
+	if len(activePayload.Runs) != 1 || activePayload.Runs[0].RunID != run.ID || activePayload.Runs[0].SessionID != session.ID || activePayload.Runs[0].Status != "running" {
+		t.Fatalf("GET active runs = %#v, want running %s/%s", activePayload.Runs, run.ID, session.ID)
+	}
+
 	cancelled := doJSONRequest(t, http.MethodDelete, server.URL+"/api/runs/"+run.ID, map[string]string{})
 	if cancelled.StatusCode != http.StatusAccepted {
 		t.Fatalf("POST cancel status = %d body=%s", cancelled.StatusCode, readBody(cancelled))
@@ -194,6 +206,14 @@ func TestServerCancelsRun(t *testing.T) {
 	}
 	if !bytes.Contains(events, []byte(`"type":"run.settled"`)) || !bytes.Contains(events, []byte(`"status":"cancelled"`)) {
 		t.Fatalf("cancel events = %s", events)
+	}
+	active = doJSONRequest(t, http.MethodGet, server.URL+"/api/runs/active", nil)
+	if active.StatusCode != http.StatusOK {
+		t.Fatalf("GET active runs after cancellation status = %d body=%s", active.StatusCode, readBody(active))
+	}
+	decodeResponse(t, active, &activePayload)
+	if len(activePayload.Runs) != 0 {
+		t.Fatalf("GET active runs after cancellation = %#v, want empty", activePayload.Runs)
 	}
 }
 

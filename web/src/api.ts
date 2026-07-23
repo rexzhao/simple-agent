@@ -1,4 +1,4 @@
-import type { Bootstrap, CodexAuthStatus, ItemsPage, Project, ProviderSettingsDocument, ProviderSettingsInput, RunEvent, Session, SessionModelOptions } from './types'
+import type { ActiveRunDescriptor, Bootstrap, CodexAuthStatus, ItemsPage, Project, ProviderSettingsDocument, ProviderSettingsInput, RunEvent, Session, SessionModelOptions } from './types'
 
 const tokenStorageKey = 'sai-capability-token'
 
@@ -103,6 +103,7 @@ export const api = {
     body: JSON.stringify({ content }),
   }),
   cancelRun: (runID: string) => request(`/api/runs/${encodeURIComponent(runID)}`, { method: 'DELETE' }),
+  activeRuns: () => request<{ runs: ActiveRunDescriptor[] }>('/api/runs/active'),
 }
 
 const streamReconnectLimit = 5

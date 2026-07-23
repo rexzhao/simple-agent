@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -92,7 +93,9 @@ type managedRun struct {
 	eventBytes    int
 	nextSeq       int64
 	terminal      bool
+	startedAt     time.Time
 	finishedAt    time.Time
+	turnID        string
 	changed       chan struct{}
 	maxEvents     int
 	maxEventBytes int
@@ -102,6 +105,17 @@ type runEvent struct {
 	Seq     int64
 	Payload []byte
 	Bytes   int
+}
+
+// activeRunSnapshot is the server-owned descriptor a newly opened browser uses
+// to reattach to an existing Web run. Session data remains durable; this only
+// identifies the in-memory SSE stream and its current turn.
+type activeRunSnapshot struct {
+	RunID     string    `json:"run_id"`
+	SessionID string    `json:"session_id"`
+	TurnID    string    `json:"turn_id,omitempty"`
+	StartedAt time.Time `json:"started_at"`
+	Status    string    `json:"status"`
 }
 
 func newRunRegistry(ctx context.Context, service *execution.Service, logWriter io.Writer) *runRegistry {
@@ -127,6 +141,7 @@ func newManagedRun(id, sessionID string, options runRegistryOptions) *managedRun
 	return &managedRun{
 		id:            id,
 		sessionID:     sessionID,
+		startedAt:     options.Now().UTC(),
 		changed:       make(chan struct{}),
 		maxEvents:     options.MaxRunEvents,
 		maxEventBytes: options.MaxRunEventBytes,
@@ -307,6 +322,36 @@ func (r *runRegistry) get(id string) (*managedRun, bool) {
 	return managed, ok
 }
 
+func (r *runRegistry) activeRuns() []activeRunSnapshot {
+	if r == nil {
+		return []activeRunSnapshot{}
+	}
+	r.mu.Lock()
+	if r.closed {
+		r.mu.Unlock()
+		return []activeRunSnapshot{}
+	}
+	managedRuns := make([]*managedRun, 0, len(r.activeBySession))
+	for _, managed := range r.activeBySession {
+		managedRuns = append(managedRuns, managed)
+	}
+	r.mu.Unlock()
+
+	active := make([]activeRunSnapshot, 0, len(managedRuns))
+	for _, managed := range managedRuns {
+		if snapshot, ok := managed.activeSnapshot(); ok {
+			active = append(active, snapshot)
+		}
+	}
+	sort.Slice(active, func(i, j int) bool {
+		if active[i].StartedAt.Equal(active[j].StartedAt) {
+			return active[i].RunID < active[j].RunID
+		}
+		return active[i].StartedAt.Before(active[j].StartedAt)
+	})
+	return active
+}
+
 func (r *runRegistry) cancel(id string) (*managedRun, bool) {
 	managed, ok := r.get(id)
 	if ok {
@@ -319,11 +364,18 @@ func (r *managedRun) append(event execution.SessionStreamEvent) {
 	if event == nil {
 		return
 	}
+	turnID := ""
+	if eventType, _ := event["type"].(string); eventType == "turn.started" {
+		turnID, _ = event["turn_id"].(string)
+	}
 	payload := encodeRunEvent(event)
 	r.mu.Lock()
 	if r.terminal {
 		r.mu.Unlock()
 		return
+	}
+	if turnID != "" {
+		r.turnID = turnID
 	}
 	r.nextSeq++
 	r.events = append(r.events, runEvent{Seq: r.nextSeq, Payload: payload, Bytes: len(payload)})
@@ -374,6 +426,21 @@ func (r *managedRun) finishedTime() time.Time {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.finishedAt
+}
+
+func (r *managedRun) activeSnapshot() (activeRunSnapshot, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.terminal || r.run == nil || r.run.Status() != execution.SessionRunRunning {
+		return activeRunSnapshot{}, false
+	}
+	return activeRunSnapshot{
+		RunID:     r.id,
+		SessionID: r.sessionID,
+		TurnID:    r.turnID,
+		StartedAt: r.startedAt,
+		Status:    string(execution.SessionRunRunning),
+	}, true
 }
 
 func (r *managedRun) snapshot(after int64) ([]runEvent, bool, bool, int64, <-chan struct{}) {
@@ -433,6 +500,10 @@ func (s *Server) handleStartRun(w http.ResponseWriter, r *http.Request) {
 		"session_id": managed.sessionID,
 		"status":     string(execution.SessionRunRunning),
 	})
+}
+
+func (s *Server) handleListActiveRuns(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]any{"runs": s.runs.activeRuns()})
 }
 
 func (s *Server) handleCancelRun(w http.ResponseWriter, r *http.Request) {

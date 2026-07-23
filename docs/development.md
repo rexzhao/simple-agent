@@ -68,6 +68,7 @@ POST   /api/projects/{id}/sessions
 GET    /api/sessions/{id}
 GET    /api/sessions/{id}/items?before_seq=&after_seq=&limit=
 POST   /api/sessions/{id}/runs
+GET    /api/runs/active
 GET    /api/runs/{id}/events
 DELETE /api/runs/{id}
 POST   /api/sessions/{id}/compact

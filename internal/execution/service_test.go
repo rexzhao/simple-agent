@@ -422,7 +422,7 @@ func TestServiceSessionListRejectsMissingOrArchivedProject(t *testing.T) {
 	}
 }
 
-func TestServiceSessionStatusUsesInterruptedMetadataOnly(t *testing.T) {
+func TestServiceSessionStatusPrioritizesRunningTurn(t *testing.T) {
 	home := t.TempDir()
 	service, err := NewService(home)
 	if err != nil {
@@ -454,8 +454,18 @@ func TestServiceSessionStatusUsesInterruptedMetadataOnly(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetSession() error = %v", err)
 	}
+	if detail.Status != "running" {
+		t.Fatalf("GetSession() Status = %q, want running", detail.Status)
+	}
+	if _, err := sessionStore.ClearRunningTurn(saved.ID, saved.RunningTurnID); err != nil {
+		t.Fatalf("ClearRunningTurn() error = %v", err)
+	}
+	detail, err = service.GetSession(saved.ID)
+	if err != nil {
+		t.Fatalf("GetSession() after clear error = %v", err)
+	}
 	if detail.Status != "interrupted" {
-		t.Fatalf("GetSession() Status = %q, want interrupted", detail.Status)
+		t.Fatalf("GetSession() Status after clear = %q, want interrupted", detail.Status)
 	}
 }
 

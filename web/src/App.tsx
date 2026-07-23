@@ -3,7 +3,7 @@ import Markdown from 'react-markdown'
 import type { Components } from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { api, streamRun } from './api'
-import type { ActiveRun, Bootstrap, CodexAuthStatus, ItemsPage, Project, ProviderModelSettings, ProviderSettings, ProviderSettingsDocument, ProviderSettingsInput, RunEvent, RunStep, Session, SessionItem, SessionModelOption, ToolActivity } from './types'
+import type { ActiveRun, ActiveRunDescriptor, Bootstrap, CodexAuthStatus, ItemsPage, Project, ProviderModelSettings, ProviderSettings, ProviderSettingsDocument, ProviderSettingsInput, RunEvent, RunStep, Session, SessionItem, SessionModelOption, ToolActivity } from './types'
 
 interface SessionCreatorState {
   projectID: string
@@ -31,6 +31,7 @@ function App() {
   const [sessionDetail, setSessionDetail] = useState<Session | null>(null)
   const [itemsPage, setItemsPage] = useState<ItemsPage | null>(null)
   const [activeRun, setActiveRun] = useState<ActiveRun | null>(null)
+  const [recoveredRun, setRecoveredRun] = useState<ActiveRunDescriptor | null>(null)
 	const [recentStepsByTurn, setRecentStepsByTurn] = useState<Record<string, RunStep[]>>({})
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
@@ -65,20 +66,27 @@ function App() {
 
   useEffect(() => {
     let cancelled = false
-    void Promise.all([api.bootstrap(), api.projects()])
-      .then(async ([bootstrapPayload, projectsPayload]) => {
+    void Promise.all([api.bootstrap(), api.projects(), api.activeRuns()])
+      .then(async ([bootstrapPayload, projectsPayload, activeRunsPayload]) => {
         const sessionEntries = await Promise.all(projectsPayload.projects.map(async (project) => {
           const payload = await api.sessions(project.id)
           return [project.id, orderSessions(payload.sessions)] as const
         }))
         if (cancelled) return
         const sessionMap = Object.fromEntries(sessionEntries)
-        const firstProjectID = projectsPayload.projects[0]?.id ?? ''
+        const recoveredCandidate = activeRunsPayload.runs[0] ?? null
+        const recoveredProject = recoveredCandidate
+          ? projectsPayload.projects.find((project) => sessionMap[project.id]?.some((session) => session.id === recoveredCandidate.session_id))
+          : null
+        const recovered = recoveredProject ? recoveredCandidate : null
+        const firstProjectID = recoveredProject?.id ?? projectsPayload.projects[0]?.id ?? ''
+        const firstSessionID = recovered?.session_id ?? sessionMap[firstProjectID]?.[0]?.id ?? ''
         setBootstrap(bootstrapPayload)
         setProjects(projectsPayload.projects)
         setSessionsByProject(sessionMap)
         setSelectedProjectID(firstProjectID)
-        setSelectedSessionID(sessionMap[firstProjectID]?.[0]?.id ?? '')
+        setSelectedSessionID(firstSessionID)
+        setRecoveredRun(recovered)
         setShowProjectForm(projectsPayload.projects.length === 0)
       })
       .catch((reason: unknown) => setError(errorMessage(reason)))
@@ -316,6 +324,7 @@ function App() {
 					updateActiveRun((run) => run ? { ...run, status: 'cancelled' } : run)
         }
 				const settledRun = activeRunRef.current
+        setRecoveredRun((current) => current?.run_id === settledRun?.id ? null : current)
 				const sessionID = settledRun?.sessionID ?? ''
 				const turnID = String(event.turn_id ?? settledRun?.turnID ?? '')
 				if (sessionID && turnID && settledRun && settledRun.steps.length > 0) {
@@ -333,6 +342,35 @@ function App() {
       }
     }
 	}, [refreshSession, updateActiveRun])
+
+  useEffect(() => {
+    if (!recoveredRun || activeRunRef.current) return
+    const run = recoveredRun
+    let disposed = false
+    updateActiveRun(() => ({
+      id: run.run_id,
+      sessionID: run.session_id,
+      turnID: run.turn_id,
+      restored: true,
+      userText: '',
+      assistantText: '',
+      steps: [],
+      agentIteration: 0,
+      status: 'running',
+    }))
+    void streamRun(run.run_id, handleRunEvent).catch(async (reason: unknown) => {
+      if (disposed) return
+      try {
+        await refreshSession(run.session_id)
+      } catch {
+        // Preserve the stream error below.
+      }
+      updateActiveRun((current) => current?.id === run.run_id ? null : current)
+      setRecoveredRun(null)
+      setError(errorMessage(reason))
+    })
+    return () => { disposed = true }
+  }, [handleRunEvent, recoveredRun, refreshSession, updateActiveRun])
 
   const sendMessage = async (content: string) => {
     if (!selectedSessionID || activeRun || !content.trim()) return
@@ -579,7 +617,7 @@ function Conversation(props: {
 		if (!messages) return
 		followOutputRef.current = messages.scrollHeight - messages.scrollTop - messages.clientHeight <= autoScrollThresholdPX
 	}
-	const visibleItems = props.activeRun?.turnID
+	const visibleItems = props.activeRun?.turnID && !props.activeRun.restored
 		? (props.page?.items ?? []).filter((item) => item.turn_id !== props.activeRun?.turnID)
 		: (props.page?.items ?? [])
 
@@ -698,10 +736,12 @@ function Message({ item }: { item: SessionItem }) {
 function ActiveRunView({ run }: { run: ActiveRun }) {
   return (
     <>
-      <article className="message user transient">
-        <div className="message-avatar">你</div>
-        <div className="message-content"><div className="message-meta"><strong>你</strong><span>刚刚</span></div><div className="message-text">{run.userText}</div></div>
-      </article>
+      {run.userText && (
+        <article className="message user transient">
+          <div className="message-avatar">你</div>
+          <div className="message-content"><div className="message-meta"><strong>你</strong><span>刚刚</span></div><div className="message-text">{run.userText}</div></div>
+        </article>
+      )}
       <article className="message assistant transient">
         <div className="message-avatar"><LogoIcon /></div>
         <div className="message-content">

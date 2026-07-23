@@ -117,6 +117,14 @@ export interface Session {
   context?: ContextMetadata
 }
 
+export interface ActiveRunDescriptor {
+  run_id: string
+  session_id: string
+  turn_id?: string
+  started_at: string
+  status: string
+}
+
 export interface MessageContent {
   inline?: string
   preview?: string
@@ -200,6 +208,7 @@ export interface ActiveRun {
   id: string
 	sessionID: string
 	turnID?: string
+  restored?: boolean
   userText: string
 	assistantText: string
 	steps: RunStep[]
