@@ -20,6 +20,19 @@ interface ProviderManagerState {
   loading: boolean
 }
 
+interface PastedTextAttachment {
+  id: number
+  content: string
+}
+
+interface ComposerDraft {
+  content: string
+  pastedTexts: PastedTextAttachment[]
+}
+
+const emptyComposerDraft: ComposerDraft = { content: '', pastedTexts: [] }
+const longPasteLineLimit = 10
+const longPasteCharacterLimit = 1000
 const autoScrollThresholdPX = 160
 
 function App() {
@@ -31,7 +44,7 @@ function App() {
   const [sessionDetail, setSessionDetail] = useState<Session | null>(null)
   const [itemsPage, setItemsPage] = useState<ItemsPage | null>(null)
   const [activeRunsBySession, setActiveRunsBySession] = useState<Record<string, ActiveRun>>({})
-  const [draftsBySession, setDraftsBySession] = useState<Record<string, string>>({})
+  const [draftsBySession, setDraftsBySession] = useState<Record<string, ComposerDraft>>({})
   const [recoveredRuns, setRecoveredRuns] = useState<ActiveRunDescriptor[]>([])
 	const [recentStepsByTurn, setRecentStepsByTurn] = useState<Record<string, RunStep[]>>({})
   const [loading, setLoading] = useState(true)
@@ -44,7 +57,30 @@ function App() {
   const selectedSessionRef = useRef('')
 	const activeRunsRef = useRef<Record<string, ActiveRun>>({})
   const updateDraft = useCallback((sessionID: string, content: string) => {
-    setDraftsBySession((current) => current[sessionID] === content ? current : { ...current, [sessionID]: content })
+    setDraftsBySession((current) => {
+      const draft = current[sessionID] ?? emptyComposerDraft
+      if (draft.content === content) return current
+      return { ...current, [sessionID]: { ...draft, content } }
+    })
+  }, [])
+  const addPastedText = useCallback((sessionID: string, pastedText: PastedTextAttachment) => {
+    setDraftsBySession((current) => {
+      const draft = current[sessionID] ?? emptyComposerDraft
+      return { ...current, [sessionID]: { ...draft, pastedTexts: [...draft.pastedTexts, pastedText] } }
+    })
+  }, [])
+  const removePastedText = useCallback((sessionID: string, pastedTextID: number) => {
+    setDraftsBySession((current) => {
+      const draft = current[sessionID]
+      if (!draft || !draft.pastedTexts.some((pastedText) => pastedText.id === pastedTextID)) return current
+      return { ...current, [sessionID]: { ...draft, pastedTexts: draft.pastedTexts.filter((pastedText) => pastedText.id !== pastedTextID) } }
+    })
+  }, [])
+  const clearDraft = useCallback((sessionID: string) => {
+    setDraftsBySession((current) => {
+      if (!current[sessionID]) return current
+      return { ...current, [sessionID]: emptyComposerDraft }
+    })
   }, [])
 	const addActiveRun = useCallback((run: ActiveRun) => {
 		const next = { ...activeRunsRef.current, [run.sessionID]: run }
@@ -457,8 +493,11 @@ function App() {
             detail={sessionDetail}
             page={itemsPage}
 			activeRun={selectedActiveRun}
-			draft={draftsBySession[selectedSessionID] ?? ''}
+			draft={draftsBySession[selectedSessionID] ?? emptyComposerDraft}
 			onDraftChange={(content) => updateDraft(selectedSessionID, content)}
+			onPastedTextAdd={(pastedText) => addPastedText(selectedSessionID, pastedText)}
+			onPastedTextRemove={(pastedTextID) => removePastedText(selectedSessionID, pastedTextID)}
+			onDraftClear={() => clearDraft(selectedSessionID)}
 			otherSessionsRunning={otherSessionsRunning}
 					recentStepsByTurn={recentStepsByTurn}
             onLoadOlder={() => void loadOlder()}
@@ -603,8 +642,11 @@ function Conversation(props: {
   detail: Session | null
   page: ItemsPage | null
   activeRun: ActiveRun | null
-	draft: string
+	draft: ComposerDraft
 	onDraftChange: (content: string) => void
+	onPastedTextAdd: (pastedText: PastedTextAttachment) => void
+	onPastedTextRemove: (pastedTextID: number) => void
+	onDraftClear: () => void
 	otherSessionsRunning: boolean
 	recentStepsByTurn: Record<string, RunStep[]>
   onLoadOlder: () => void
@@ -661,8 +703,11 @@ function Conversation(props: {
         <div ref={bottomRef} />
       </section>
 	  <Composer
-		content={props.draft}
+		draft={props.draft}
 		onContentChange={props.onDraftChange}
+		onPastedTextAdd={props.onPastedTextAdd}
+		onPastedTextRemove={props.onPastedTextRemove}
+		onDraftClear={props.onDraftClear}
 		running={Boolean(props.activeRun)}
 		blocked={false}
 		onSend={props.onSend}
@@ -925,14 +970,18 @@ function ToolRow({ tool }: { tool: ToolActivity }) {
 }
 
 function Composer(props: {
-  content: string
+  draft: ComposerDraft
   onContentChange: (content: string) => void
+  onPastedTextAdd: (pastedText: PastedTextAttachment) => void
+  onPastedTextRemove: (pastedTextID: number) => void
+  onDraftClear: () => void
   running: boolean
   blocked: boolean
   onSend: (content: string) => void
   onCancel: () => void
 }) {
   const textareaRef = useRef<HTMLTextAreaElement>(null)
+  const nextPastedTextID = useRef(1)
   const resizeTextarea = useCallback(() => {
     const textarea = textareaRef.current
     if (!textarea) return
@@ -942,7 +991,7 @@ function Composer(props: {
 
   useEffect(() => {
     resizeTextarea()
-  }, [props.content, resizeTextarea])
+  }, [props.draft.content, resizeTextarea])
 
   useEffect(() => {
     window.addEventListener('resize', resizeTextarea)
@@ -950,20 +999,61 @@ function Composer(props: {
   }, [resizeTextarea])
 
   const submit = () => {
-	if (!props.content.trim() || props.running || props.blocked) return
-    props.onSend(props.content.trim())
-    props.onContentChange('')
+    if (props.running || props.blocked) return
+    const content = [...props.draft.pastedTexts.map((pastedText) => pastedText.content), props.draft.content]
+      .filter((part) => part.trim())
+      .join('\n\n')
+      .trim()
+    if (!content) return
+    props.onSend(content)
+    props.onDraftClear()
   }
+
+  const placeholder = props.running
+    ? 'SAI 正在执行…'
+    : props.blocked
+      ? '另一个会话正在执行，可切回查看进度'
+      : props.draft.pastedTexts.length > 0
+        ? '在粘贴文本后补充说明'
+        : '给 SAI 发送消息'
+
   return (
     <div className="composer-wrap">
+      {props.draft.pastedTexts.length > 0 && (
+        <div className="pasted-text-attachments" aria-label="待发送的粘贴文本">
+          {props.draft.pastedTexts.map((pastedText, index) => (
+            <div className="pasted-text-attachment" key={pastedText.id}>
+              <span className="pasted-text-attachment-icon"><PaperclipIcon /></span>
+              <span className="pasted-text-attachment-copy">
+                <strong>粘贴文本 #{index + 1}</strong>
+                <small>{pastedTextSummary(pastedText.content)}</small>
+              </span>
+              <button
+                type="button"
+                className="pasted-text-attachment-remove"
+                disabled={props.running || props.blocked}
+                onClick={() => props.onPastedTextRemove(pastedText.id)}
+                aria-label={`移除粘贴文本 #${index + 1}`}
+                title="移除"
+              >×</button>
+            </div>
+          ))}
+        </div>
+      )}
       <div className="composer">
         <textarea
           ref={textareaRef}
-          value={props.content}
+          value={props.draft.content}
 		  disabled={props.running || props.blocked}
           rows={1}
-		  placeholder={props.running ? 'SAI 正在执行…' : props.blocked ? '另一个会话正在执行，可切回查看进度' : '给 SAI 发送消息'}
+		  placeholder={placeholder}
           onChange={(event) => props.onContentChange(event.target.value)}
+          onPaste={(event) => {
+            const pastedText = event.clipboardData.getData('text/plain').replace(/\r\n?/g, '\n')
+            if (!isLongPastedText(pastedText)) return
+            event.preventDefault()
+            props.onPastedTextAdd({ id: nextPastedTextID.current++, content: pastedText })
+          }}
           onKeyDown={(event) => {
             if (event.key === 'Enter' && !event.shiftKey) {
               event.preventDefault()
@@ -974,12 +1064,21 @@ function Composer(props: {
         {props.running ? (
           <button className="stop-button" onClick={props.onCancel}><StopIcon /> 停止</button>
         ) : (
-		  <button className="send-button" disabled={!props.content.trim() || props.blocked} onClick={submit} aria-label="发送"><SendIcon /></button>
+		  <button className="send-button" disabled={(!props.draft.content.trim() && props.draft.pastedTexts.length === 0) || props.blocked} onClick={submit} aria-label="发送"><SendIcon /></button>
         )}
       </div>
-      <div className="composer-hint"><span>Enter 发送 · Shift+Enter 换行</span><span>本地运行</span></div>
+      <div className="composer-hint"><span>{props.draft.pastedTexts.length > 0 ? '粘贴文本会先发送，补充说明随后附加' : 'Enter 发送 · Shift+Enter 换行'}</span><span>本地运行</span></div>
     </div>
   )
+}
+
+function isLongPastedText(content: string): boolean {
+  return content.split('\n').length > longPasteLineLimit || content.length > longPasteCharacterLimit
+}
+
+function pastedTextSummary(content: string): string {
+  const lineCount = content.split('\n').length
+  return lineCount > longPasteLineLimit ? `${lineCount.toLocaleString()} 行` : `${content.length.toLocaleString()} 字符`
 }
 
 function SessionModelDialog(props: {
@@ -1584,6 +1683,7 @@ const ChatIcon = () => <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 5
 const ArchiveIcon = () => <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16v13H4V7Zm-1-4h18v4H3V3Zm6 8h6" /></svg>
 const TrashIcon = () => <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M9 7V4h6v3m3 0-1 14H7L6 7m4 4v6m4-6v6" /></svg>
 const CopyIcon = () => <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="8" y="8" width="11" height="11" /><path d="M16 8V5H5v11h3" /></svg>
+const PaperclipIcon = () => <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m8.5 12.5 6.8-6.8a3 3 0 1 1 4.2 4.2l-8.7 8.7a5 5 0 0 1-7.1-7.1l8.2-8.2" /></svg>
 const ChevronIcon = ({ expanded }: { expanded: boolean }) => <svg className={expanded ? 'expanded' : ''} viewBox="0 0 24 24" aria-hidden="true"><path d="m8 10 4 4 4-4" /></svg>
 const SendIcon = () => <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m4 4 17 8-17 8 3-8-3-8Zm3 8h14" /></svg>
 const StopIcon = () => <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="7" y="7" width="10" height="10" rx="1" /></svg>

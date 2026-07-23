@@ -402,7 +402,18 @@ svg { width: 1.1em; height: 1.1em; fill: none; stroke: currentColor; stroke-widt
 .conversation-empty h3 { margin: 15px 0 5px; color: var(--text); font-size: 16px; font-weight: 800; }
 .conversation-empty p { margin: 0; font-size: 12px; }
 
-.composer-wrap { max-height: 33.333vh; padding: 11px max(28px, calc((100% - 900px) / 2)) 15px; overflow: hidden; border-top: 2px solid var(--rule); background: var(--panel-soft); }
+.composer-wrap { max-height: 33.333vh; padding: 11px max(28px, calc((100% - 900px) / 2)) 15px; overflow-x: hidden; overflow-y: auto; border-top: 2px solid var(--rule); background: var(--panel-soft); scrollbar-color: #111111 #eeeeee; }
+.pasted-text-attachments { display: flex; flex-direction: column; gap: 7px; margin: 0 0 10px; }
+.pasted-text-attachment { min-height: 46px; display: flex; align-items: center; gap: 9px; padding: 7px 8px; border: 2px solid var(--border); background: #ffffff; box-shadow: var(--shadow-1); }
+.pasted-text-attachment-icon { width: 28px; height: 28px; flex: 0 0 auto; display: grid; place-items: center; border: 2px solid var(--border); color: var(--text); background: var(--accent-soft); }
+.pasted-text-attachment-icon svg { width: 15px; height: 15px; }
+.pasted-text-attachment-copy { min-width: 0; flex: 1; display: flex; flex-direction: column; gap: 3px; }
+.pasted-text-attachment-copy strong { font-size: 10.5px; font-weight: 850; }
+.pasted-text-attachment-copy small { color: var(--muted); font-family: var(--font-mono); font-size: 9px; }
+.pasted-text-attachment-remove { width: 27px; height: 27px; flex: 0 0 auto; display: grid; place-items: center; border: 2px solid transparent; color: var(--muted); background: transparent; cursor: pointer; font-size: 20px; font-weight: 800; line-height: 1; }
+.pasted-text-attachment-remove:hover { border-color: var(--border); color: #ffffff; background: var(--danger); box-shadow: var(--shadow-1); }
+.pasted-text-attachment-remove:active { box-shadow: none; transform: translate(2px, 2px); }
+.pasted-text-attachment-remove:disabled { cursor: default; opacity: .35; }
 .composer { display: flex; align-items: flex-end; gap: 10px; padding: 9px 10px 9px 14px; border: 2px solid var(--border); background: #ffffff; box-shadow: var(--shadow-3); }
 .composer:focus-within { outline: 3px solid var(--accent); outline-offset: 2px; }
 .composer textarea { flex: 1; min-height: 27px; max-height: max(27px, calc(33.333vh - 104px)); resize: none; overflow-y: auto; padding: 3px 0; border: 0; outline: 0; color: var(--text); background: transparent; font-family: var(--font-content); font-size: 13px; line-height: 1.5; }
