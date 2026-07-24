@@ -341,7 +341,8 @@
 - [x] `glob_files` 返回稳定相对路径，支持 `max_results`，并在截断时返回 metadata。
 - [x] 新增 `grep_files`，只在工作区内执行文本搜索。
 - [x] `grep_files` 支持 include / exclude globs。
-- [x] `grep_files` 默认 literal 搜索，可选 regex、大小写敏感和 context lines。
+- [x] `grep_files` 默认使用大小写敏感的 Go RE2 单行正则，`literal: true` 切换字面量搜索，
+  并支持 context lines。
 - [x] `grep_files` 支持 `max_results` 和 snippet limits，并在结果或 snippet 截断时返回
   metadata。
 - [x] `shell` 支持可选 `timeout_ms` 和 `max_output_bytes`。

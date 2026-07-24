@@ -74,12 +74,12 @@ func TestSessionToolDisplayArgumentsIncludesApplyPatchContent(t *testing.T) {
 }
 
 func TestSessionToolDisplayArgumentsIncludesGrepSearchMode(t *testing.T) {
-	displayed := sessionToolDisplayArguments("grep_files", `{"path":"src","query":"foo.*bar","regex":true,"case_sensitive":true,"exclude":["vendor/**"]}`)
+	displayed := sessionToolDisplayArguments("grep_files", `{"path":"src","query":"foo.*bar","literal":true,"case_sensitive":false,"exclude":["vendor/**"]}`)
 	var arguments map[string]any
 	if err := json.Unmarshal([]byte(displayed), &arguments); err != nil {
 		t.Fatalf("displayed arguments are not JSON: %v", err)
 	}
-	for key, want := range map[string]any{"path": "src", "query": "foo.*bar", "regex": true, "case_sensitive": true} {
+	for key, want := range map[string]any{"path": "src", "query": "foo.*bar", "literal": true, "case_sensitive": false} {
 		if arguments[key] != want {
 			t.Fatalf("displayed arguments[%q] = %#v, want %#v; all = %#v", key, arguments[key], want, arguments)
 		}

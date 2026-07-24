@@ -204,7 +204,7 @@ function toolTarget(name: string, argumentsObject: Record<string, unknown>): str
 	}
 	if (name === 'grep_files') {
 		const query = stringField(argumentsObject, 'query')
-		const mode = argumentsObject.regex === true ? 'regex' : 'text'
+		const mode = argumentsObject.literal === true ? 'literal' : 'regex'
 		return [path, query && `${mode}: ${query}`].filter(Boolean).join(' · ')
 	}
 	if (path) return path

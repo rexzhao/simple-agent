@@ -603,8 +603,9 @@ agent 在大工作区内安全定位文本内容，同时不默认启用任何�
 - 小文件、非范围且未截断的完整读取可以继续返回原始文件内容，以保持兼容。
 - 新增 `glob_files`，仅在工作区内执行 glob 搜索，返回稳定相对路径，支持
   `max_results`，并在结果截断时返回明确 metadata。
-- 新增 `grep_files`，仅在工作区内执行文本搜索，支持 include / exclude globs；默认 literal
-  搜索，可选 regex、大小写敏感和 context lines；支持 `max_results` 和 snippet limits，
+- 新增 `grep_files`，仅在工作区内执行文本搜索，支持 include / exclude globs；默认使用
+  大小写敏感的 Go RE2 单行正则，`literal: true` 切换字面量搜索，并支持 context lines；
+  支持 `max_results` 和 snippet limits，
   并在结果或 snippet 截断时返回明确 metadata。
 - 增强 `shell`，支持可选 `timeout_ms` 和 `max_output_bytes`。
 - `shell` 输出被 `max_output_bytes` 截断时，tool result 必须明确说明截断。
@@ -616,7 +617,7 @@ agent 在大工作区内安全定位文本内容，同时不默认启用任何�
 - 聚焦单元测试覆盖 `read_file` 默认读取、行范围读取、`max_bytes` 截断、
   `line_truncated=true` 单长行场景和非法参数。
 - 聚焦单元测试覆盖 `glob_files` 的工作区边界、稳定相对路径、`max_results` 和截断 metadata。
-- 聚焦单元测试覆盖 `grep_files` 的 literal 默认行为、可选 regex、大小写敏感、include /
+- 聚焦单元测试覆盖 `grep_files` 的正则默认行为、可选 literal、大小写敏感、include /
   exclude globs、context lines、snippet limits 和截断 metadata。
 - 聚焦单元测试覆盖 `shell` 的 `timeout_ms`、`max_output_bytes`、输出截断 metadata，以及
   status 行不泄露命令参数。

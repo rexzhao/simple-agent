@@ -784,7 +784,7 @@ func sessionToolDisplayArguments(name, arguments string) string {
 	} else if name == "apply_patch" {
 		keys = []string{"patch"}
 	} else if name == "grep_files" {
-		keys = []string{"path", "query", "regex", "case_sensitive"}
+		keys = []string{"path", "query", "literal", "case_sensitive"}
 	}
 	for _, key := range keys {
 		if value, ok := parsed[key]; ok {

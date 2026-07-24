@@ -366,30 +366,51 @@ func TestGrepFilesRejectsOutsideSearchPath(t *testing.T) {
 	}
 }
 
-func TestGrepFilesLiteralDefaultAndCaseSensitivity(t *testing.T) {
+func TestGrepFilesRegexDefaultLiteralAndCaseSensitivity(t *testing.T) {
 	root := t.TempDir()
-	writeTestFile(t, filepath.Join(root, "notes.txt"), "Needle here\nneedle there\n")
+	writeTestFile(t, filepath.Join(root, "notes.txt"), "Needle here\nneedle there\nvalue[1]\nvalue1\n")
 
 	registry := registerBuiltinsForTest(t, root)
 	result, err := registry.Execute(context.Background(), BuiltinGrepFiles, map[string]any{
 		"query": "needle",
 	})
 	if err != nil {
-		t.Fatalf("Execute(grep_files literal) error = %v", err)
+		t.Fatalf("Execute(grep_files regex default) error = %v", err)
 	}
-	if got, want := result.Content, "notes.txt:1:Needle here\nnotes.txt:2:needle there"; got != want {
-		t.Fatalf("Execute(grep_files literal) content = %q, want %q", got, want)
+	if got, want := result.Content, "notes.txt:2:needle there"; got != want {
+		t.Fatalf("Execute(grep_files regex default) content = %q, want %q", got, want)
 	}
 
 	result, err = registry.Execute(context.Background(), BuiltinGrepFiles, map[string]any{
 		"query":          "needle",
-		"case_sensitive": true,
+		"case_sensitive": false,
 	})
 	if err != nil {
-		t.Fatalf("Execute(grep_files case_sensitive) error = %v", err)
+		t.Fatalf("Execute(grep_files case insensitive) error = %v", err)
 	}
-	if got, want := result.Content, "notes.txt:2:needle there"; got != want {
-		t.Fatalf("Execute(grep_files case_sensitive) content = %q, want %q", got, want)
+	if got, want := result.Content, "notes.txt:1:Needle here\nnotes.txt:2:needle there"; got != want {
+		t.Fatalf("Execute(grep_files case insensitive) content = %q, want %q", got, want)
+	}
+
+	result, err = registry.Execute(context.Background(), BuiltinGrepFiles, map[string]any{
+		"query": `value[1]`,
+	})
+	if err != nil {
+		t.Fatalf("Execute(grep_files regex metacharacter) error = %v", err)
+	}
+	if got, want := result.Content, "notes.txt:4:value1"; got != want {
+		t.Fatalf("Execute(grep_files regex metacharacter) content = %q, want %q", got, want)
+	}
+
+	result, err = registry.Execute(context.Background(), BuiltinGrepFiles, map[string]any{
+		"query":   `value[1]`,
+		"literal": true,
+	})
+	if err != nil {
+		t.Fatalf("Execute(grep_files literal) error = %v", err)
+	}
+	if got, want := result.Content, "notes.txt:3:value[1]"; got != want {
+		t.Fatalf("Execute(grep_files literal) content = %q, want %q", got, want)
 	}
 }
 
@@ -433,7 +454,6 @@ func TestGrepFilesRegexIncludeExcludeAndContext(t *testing.T) {
 	registry := registerBuiltinsForTest(t, root)
 	result, err := registry.Execute(context.Background(), BuiltinGrepFiles, map[string]any{
 		"query":          `abc\d+`,
-		"regex":          true,
 		"case_sensitive": true,
 		"include":        []any{"*.txt"},
 		"exclude":        []any{"skip.txt"},
@@ -867,10 +887,16 @@ func TestBuiltinArgumentErrorsAreReadable(t *testing.T) {
 			wantErr: "query is required",
 		},
 		{
-			name:    "grep files regex type",
+			name:    "grep files literal type",
 			tool:    BuiltinGrepFiles,
-			args:    map[string]any{"query": "needle", "regex": "false"},
-			wantErr: "regex must be a boolean",
+			args:    map[string]any{"query": "needle", "literal": "false"},
+			wantErr: "literal must be a boolean",
+		},
+		{
+			name:    "grep files invalid regex",
+			tool:    BuiltinGrepFiles,
+			args:    map[string]any{"query": "["},
+			wantErr: "invalid regex query",
 		},
 		{
 			name:    "grep files context non-negative",
@@ -1212,7 +1238,7 @@ func TestBuiltinDefinitionsHaveExpectedSchemas(t *testing.T) {
 				"type":     "object",
 				"required": []any{"query"},
 			},
-			wantProps: []string{"path", "query", "include", "exclude", "regex", "case_sensitive", "context_lines", "max_results", "max_snippet_bytes"},
+			wantProps: []string{"path", "query", "include", "exclude", "literal", "case_sensitive", "context_lines", "max_results", "max_snippet_bytes"},
 		},
 		{
 			name: BuiltinShell,

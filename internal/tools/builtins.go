@@ -203,7 +203,7 @@ func globFilesDefinition() model.Tool {
 func grepFilesDefinition() model.Tool {
 	return model.Tool{
 		Name:        BuiltinGrepFiles,
-		Description: "Search workspace text files and return path:line:snippet matches. The path may identify either a directory or one text file.",
+		Description: "Search workspace text files and return path:line:snippet matches. Query is a case-sensitive Go RE2 regular expression by default; set literal=true for literal text. Matching is line-by-line, so multi-line patterns, look-around, and backreferences are not supported. The path may identify either a directory or one text file.",
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
@@ -213,7 +213,7 @@ func grepFilesDefinition() model.Tool {
 				},
 				"query": map[string]any{
 					"type":        "string",
-					"description": "Text or regular expression to search for.",
+					"description": "Case-sensitive Go RE2 regular expression by default. Set literal=true to search for this exact text. Regex backslashes must be JSON-escaped, for example \\\\d+.",
 				},
 				"include": map[string]any{
 					"type":        "array",
@@ -225,13 +225,13 @@ func grepFilesDefinition() model.Tool {
 					"items":       map[string]any{"type": "string"},
 					"description": "Optional slash-style glob patterns to exclude. They are relative to path for directory searches and to the workspace for a file search.",
 				},
-				"regex": map[string]any{
+				"literal": map[string]any{
 					"type":        "boolean",
-					"description": "Treat query as a Go regular expression. Defaults to false for literal search.",
+					"description": "Treat query as literal text instead of a regular expression. Defaults to false.",
 				},
 				"case_sensitive": map[string]any{
 					"type":        "boolean",
-					"description": "Use case-sensitive matching. Defaults to false.",
+					"description": "Use case-sensitive matching for regex or literal mode. Defaults to true.",
 				},
 				"context_lines": map[string]any{
 					"type":        "integer",
@@ -556,11 +556,11 @@ func newGrepFilesExecutor(rootDir string) Executor {
 		if err != nil {
 			return model.ToolResult{}, err
 		}
-		useRegex, err := optionalBoolArgument(arguments, "regex", false)
+		literal, err := optionalBoolArgument(arguments, "literal", false)
 		if err != nil {
 			return model.ToolResult{}, err
 		}
-		caseSensitive, err := optionalBoolArgument(arguments, "case_sensitive", false)
+		caseSensitive, err := optionalBoolArgument(arguments, "case_sensitive", true)
 		if err != nil {
 			return model.ToolResult{}, err
 		}
@@ -576,7 +576,7 @@ func newGrepFilesExecutor(rootDir string) Executor {
 		if err != nil {
 			return model.ToolResult{}, err
 		}
-		matcher, err := newTextMatcher(query, useRegex, caseSensitive)
+		matcher, err := newTextMatcher(query, literal, caseSensitive)
 		if err != nil {
 			return model.ToolResult{}, err
 		}
@@ -1243,8 +1243,8 @@ type textMatcher struct {
 	regex         *regexp.Regexp
 }
 
-func newTextMatcher(query string, useRegex bool, caseSensitive bool) (textMatcher, error) {
-	if useRegex {
+func newTextMatcher(query string, literal bool, caseSensitive bool) (textMatcher, error) {
+	if !literal {
 		pattern := query
 		if !caseSensitive {
 			pattern = "(?i:" + query + ")"
