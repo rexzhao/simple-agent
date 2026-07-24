@@ -242,14 +242,17 @@ tools:
 ```
 
 All relative tool paths and shell working directories are based on the durable
-session's creation directory. `apply_patch` accepts a raw text-only unified diff;
-do not wrap it in `*** Begin Patch` / `*** End Patch` markers. Every file change
-starts with `---` / `+++` headers, and every hunk uses
-`@@ -oldStart,oldCount +newStart,newCount @@`. The declared old/new counts must
-exactly match the space, `-`, and `+` lines in that hunk. Paths must be
-workspace-relative. It supports file creation, updates, and deletion (`/dev/null`
-for added or deleted files), validates every file and hunk before writing, and
-does not support renames or binary patches.
+session's creation directory. `apply_patch` accepts the OpenCode patch format. A
+patch must start with `*** Begin Patch` and end with `*** End Patch`; it can
+contain `*** Add File:`, `*** Update File:`, `*** Delete File:`, and optional
+`*** Move to:` sections. Added-file content lines start with `+`; update hunks
+start with `@@` (optionally followed by an anchor) and use space, `-`, and `+`
+lines for context, removal, and addition. Paths must be workspace-relative. It
+validates every file and hunk before writing, creates required parent
+directories, and rejects binary files and paths outside the workspace.
+
+`edit_file` matches LF and CRLF input equivalently, preserves a UTF-8 BOM, and
+writes using the file's original line-ending style.
 
 ## MCP tool sources
 

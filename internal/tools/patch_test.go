@@ -14,20 +14,20 @@ func TestApplyPatchUpdatesTextAndPreservesLineEnding(t *testing.T) {
 	registry := registerBuiltinsForTest(t, root)
 
 	result, err := registry.Execute(context.Background(), BuiltinApplyPatch, map[string]any{
-		"patch": `--- a/notes.txt
-+++ b/notes.txt
-@@ -1,3 +1,4 @@
+		"patch": `*** Begin Patch
+*** Update File: notes.txt
+@@
  first
 -old
 +new
 +middle
  last
-`,
+*** End Patch`,
 	})
 	if err != nil {
 		t.Fatalf("Execute(apply_patch) error = %v", err)
 	}
-	if result.Name != BuiltinApplyPatch || result.Content != "applied unified patch (1 updated)" || result.IsError {
+	if result.Name != BuiltinApplyPatch || result.Content != "applied OpenCode patch (1 updated)" || result.IsError {
 		t.Fatalf("Execute(apply_patch) result = %#v", result)
 	}
 	if got := readTestFile(t, filepath.Join(root, "notes.txt")); got != "first\r\nnew\r\nmiddle\r\nlast\r\n" {
@@ -35,78 +35,90 @@ func TestApplyPatchUpdatesTextAndPreservesLineEnding(t *testing.T) {
 	}
 }
 
-func TestApplyPatchPreservesMissingTrailingNewline(t *testing.T) {
+func TestApplyPatchAddsDeletesAndMovesFiles(t *testing.T) {
 	root := t.TempDir()
-	writeTestFile(t, filepath.Join(root, "notes.txt"), "old")
-	registry := registerBuiltinsForTest(t, root)
-
-	_, err := registry.Execute(context.Background(), BuiltinApplyPatch, map[string]any{
-		"patch": `--- a/notes.txt
-+++ b/notes.txt
-@@ -1 +1 @@
--old
-\ No newline at end of file
-+new
-\ No newline at end of file
-`,
-	})
-	if err != nil {
-		t.Fatalf("Execute(apply_patch) error = %v", err)
-	}
-	if got := readTestFile(t, filepath.Join(root, "notes.txt")); got != "new" {
-		t.Fatalf("patched content = %q, want no trailing newline", got)
-	}
-}
-
-func TestApplyPatchCreatesAndDeletesFiles(t *testing.T) {
-	root := t.TempDir()
+	writeTestFile(t, filepath.Join(root, "move.txt"), "old\n")
 	writeTestFile(t, filepath.Join(root, "remove.txt"), "remove\n")
 	registry := registerBuiltinsForTest(t, root)
 
 	result, err := registry.Execute(context.Background(), BuiltinApplyPatch, map[string]any{
-		"patch": `--- /dev/null
-+++ b/nested/new.txt
-@@ -0,0 +1,2 @@
+		"patch": `*** Begin Patch
+*** Add File: nested/new.txt
 +new
 +file
---- a/remove.txt
-+++ /dev/null
-@@ -1 +0,0 @@
--remove
-`,
+*** Update File: move.txt
+@@
+-old
++changed
+*** Move to: nested/moved.txt
+*** Delete File: remove.txt
+*** End Patch`,
 	})
 	if err != nil {
 		t.Fatalf("Execute(apply_patch) error = %v", err)
 	}
-	if result.Content != "applied unified patch (1 added, 1 deleted)" {
+	if result.Content != "applied OpenCode patch (1 added, 1 deleted, 1 moved)" {
 		t.Fatalf("Execute(apply_patch) result = %#v", result)
 	}
 	if got := readTestFile(t, filepath.Join(root, "nested", "new.txt")); got != "new\nfile\n" {
 		t.Fatalf("created content = %q", got)
+	}
+	if got := readTestFile(t, filepath.Join(root, "nested", "moved.txt")); got != "changed\n" {
+		t.Fatalf("moved content = %q", got)
+	}
+	if _, err := os.Stat(filepath.Join(root, "move.txt")); !os.IsNotExist(err) {
+		t.Fatalf("moved source stat error = %v, want not exist", err)
 	}
 	if _, err := os.Stat(filepath.Join(root, "remove.txt")); !os.IsNotExist(err) {
 		t.Fatalf("removed file stat error = %v, want not exist", err)
 	}
 }
 
-func TestApplyPatchValidatesAllHunksBeforeWriting(t *testing.T) {
+func TestApplyPatchSupportsAnchorAndEndOfFile(t *testing.T) {
+	root := t.TempDir()
+	writeTestFile(t, filepath.Join(root, "anchored.txt"), "first\nlast\n")
+	writeTestFile(t, filepath.Join(root, "eof.txt"), "first\nlast\n")
+	registry := registerBuiltinsForTest(t, root)
+
+	_, err := registry.Execute(context.Background(), BuiltinApplyPatch, map[string]any{
+		"patch": `*** Begin Patch
+*** Update File: anchored.txt
+@@ last
++after-anchor
+*** Update File: eof.txt
+@@
+ last
++at-end
+*** End of File
+*** End Patch`,
+	})
+	if err != nil {
+		t.Fatalf("Execute(apply_patch) error = %v", err)
+	}
+	if got := readTestFile(t, filepath.Join(root, "anchored.txt")); got != "first\nlast\nafter-anchor\n" {
+		t.Fatalf("anchored content = %q", got)
+	}
+	if got := readTestFile(t, filepath.Join(root, "eof.txt")); got != "first\nlast\nat-end\n" {
+		t.Fatalf("end-of-file content = %q", got)
+	}
+}
+
+func TestApplyPatchValidatesAllFilesBeforeWriting(t *testing.T) {
 	root := t.TempDir()
 	writeTestFile(t, filepath.Join(root, "notes.txt"), "actual\n")
 	registry := registerBuiltinsForTest(t, root)
 
 	_, err := registry.Execute(context.Background(), BuiltinApplyPatch, map[string]any{
-		"patch": `--- /dev/null
-+++ b/new.txt
-@@ -0,0 +1 @@
+		"patch": `*** Begin Patch
+*** Add File: new.txt
 +should not be written
---- a/notes.txt
-+++ b/notes.txt
-@@ -1 +1 @@
+*** Update File: notes.txt
+@@
 -expected
 +changed
-`,
+*** End Patch`,
 	})
-	if err == nil || !strings.Contains(err.Error(), "does not match") {
+	if err == nil || !strings.Contains(err.Error(), "expected hunk content") {
 		t.Fatalf("Execute(apply_patch) error = %v, want hunk mismatch", err)
 	}
 	if got := readTestFile(t, filepath.Join(root, "notes.txt")); got != "actual\n" {
@@ -126,12 +138,12 @@ func TestApplyPatchRejectsSymlinkOutsideWorkspace(t *testing.T) {
 	registry := registerBuiltinsForTest(t, root)
 
 	_, err := registry.Execute(context.Background(), BuiltinApplyPatch, map[string]any{
-		"patch": `--- a/secret-link.txt
-+++ b/secret-link.txt
-@@ -1 +1 @@
+		"patch": `*** Begin Patch
+*** Update File: secret-link.txt
+@@
 -secret
 +changed
-`,
+*** End Patch`,
 	})
 	if err == nil || !strings.Contains(err.Error(), "outside rootDir") {
 		t.Fatalf("Execute(apply_patch) error = %v, want workspace path rejection", err)
@@ -141,41 +153,46 @@ func TestApplyPatchRejectsSymlinkOutsideWorkspace(t *testing.T) {
 	}
 }
 
-func TestApplyPatchRejectsWindowsAbsolutePath(t *testing.T) {
-	registry := registerBuiltinsForTest(t, t.TempDir())
-	_, err := registry.Execute(context.Background(), BuiltinApplyPatch, map[string]any{
-		"patch": `--- /dev/null
-+++ b/C:/outside.txt
-@@ -0,0 +1 @@
-+secret
-`,
-	})
-	if err == nil || !strings.Contains(err.Error(), "workspace-relative") {
-		t.Fatalf("Execute(apply_patch) error = %v, want Windows absolute path rejection", err)
+func TestApplyPatchRejectsInvalidPaths(t *testing.T) {
+	tests := []struct {
+		name  string
+		path  string
+		match string
+	}{
+		{name: "Windows absolute", path: "C:/outside.txt", match: "workspace-relative"},
+		{name: "outside workspace", path: "../outside.txt", match: "outside the workspace"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			registry := registerBuiltinsForTest(t, t.TempDir())
+			_, err := registry.Execute(context.Background(), BuiltinApplyPatch, map[string]any{
+				"patch": "*** Begin Patch\n*** Add File: " + test.path + "\n+secret\n*** End Patch",
+			})
+			if err == nil || !strings.Contains(err.Error(), test.match) {
+				t.Fatalf("Execute(apply_patch) error = %v, want %q", err, test.match)
+			}
+		})
 	}
 }
 
-func TestApplyPatchRejectsPathsOutsideWorkspace(t *testing.T) {
+func TestApplyPatchRejectsStandardUnifiedDiff(t *testing.T) {
 	registry := registerBuiltinsForTest(t, t.TempDir())
 	_, err := registry.Execute(context.Background(), BuiltinApplyPatch, map[string]any{
-		"patch": `--- /dev/null
-+++ b/../outside.txt
-@@ -0,0 +1 @@
-+secret
-`,
+		"patch": "--- a/notes.txt\n+++ b/notes.txt\n@@ -1 +1 @@\n-old\n+new\n",
 	})
-	if err == nil || !strings.Contains(err.Error(), "outside the workspace") {
-		t.Fatalf("Execute(apply_patch) error = %v, want workspace path rejection", err)
+	if err == nil || !strings.Contains(err.Error(), openCodePatchBegin) {
+		t.Fatalf("Execute(apply_patch) error = %v, want OpenCode format rejection", err)
 	}
 }
 
-func TestApplyPatchDefinitionDescribesUnifiedDiffRequirements(t *testing.T) {
+func TestApplyPatchDefinitionDescribesOpenCodeRequirements(t *testing.T) {
 	definition := applyPatchDefinition()
 	for _, want := range []string{
-		"raw diff only",
-		"--- and +++ headers",
-		"@@ -oldStart,oldCount +newStart,newCount @@",
-		"counts must exactly match",
+		"OpenCode-format",
+		"*** Begin Patch",
+		"*** End Patch",
+		"*** Add File:",
+		"*** Move to:",
 		"validated before any write",
 	} {
 		if !strings.Contains(definition.Description, want) {
@@ -184,7 +201,7 @@ func TestApplyPatchDefinitionDescribesUnifiedDiffRequirements(t *testing.T) {
 	}
 	properties := definition.InputSchema["properties"].(map[string]any)
 	patch := properties["patch"].(map[string]any)
-	for _, want := range []string{"Raw standard unified diff only", "*** Begin Patch/End Patch wrappers", "--- a/path", "+++ b/path", "counts must match"} {
+	for _, want := range []string{"*** Begin Patch", "*** Update File: path", "*** Delete File: path", "*** Move to:"} {
 		if !strings.Contains(patch["description"].(string), want) {
 			t.Fatalf("patch description = %q, want contain %q", patch["description"], want)
 		}

@@ -54,6 +54,25 @@ func TestSessionToolDisplayArgumentsIncludesEditDiffInputs(t *testing.T) {
 	}
 }
 
+func TestSessionToolDisplayArgumentsIncludesApplyPatchContent(t *testing.T) {
+	patch := "--- a/notes.txt\n+++ b/notes.txt\n@@ -1 +1 @@\n-old\n+new\n"
+	raw, err := json.Marshal(map[string]string{"patch": patch, "extra": "hidden"})
+	if err != nil {
+		t.Fatalf("Marshal() error = %v", err)
+	}
+	displayed := sessionToolDisplayArguments("apply_patch", string(raw))
+	var arguments map[string]string
+	if err := json.Unmarshal([]byte(displayed), &arguments); err != nil {
+		t.Fatalf("displayed arguments are not JSON: %v", err)
+	}
+	if got := arguments["patch"]; got != patch {
+		t.Fatalf("displayed patch = %q, want %q", got, patch)
+	}
+	if len(arguments) != 1 {
+		t.Fatalf("displayed arguments = %#v, want only patch", arguments)
+	}
+}
+
 func TestSessionToolDisplayArgumentsIncludesGrepSearchMode(t *testing.T) {
 	displayed := sessionToolDisplayArguments("grep_files", `{"path":"src","query":"foo.*bar","regex":true,"case_sensitive":true,"exclude":["vendor/**"]}`)
 	var arguments map[string]any

@@ -308,7 +308,7 @@ func writeFileDefinition() model.Tool {
 func editFileDefinition() model.Tool {
 	return model.Tool{
 		Name:        BuiltinEditFile,
-		Description: "Edit a text file under the workspace by replacing one exact text match.",
+		Description: "Edit a text file under the workspace by replacing one unique text match. LF and CRLF line endings are treated as equivalent during matching; the saved file keeps its original line-ending style.",
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
@@ -318,7 +318,7 @@ func editFileDefinition() model.Tool {
 				},
 				"old": map[string]any{
 					"type":        "string",
-					"description": "Existing text to replace. It must appear exactly once.",
+					"description": "Existing text to replace. It must appear exactly once after LF/CRLF normalization.",
 				},
 				"new": map[string]any{
 					"type":        "string",
@@ -731,15 +731,20 @@ func newEditFileExecutor(rootDir string) Executor {
 		if err != nil {
 			return model.ToolResult{}, fmt.Errorf("read file %q: %w", path, err)
 		}
-		content := string(data)
-		matches := strings.Count(content, oldText)
+		bom, content := splitEditUTF8BOM(string(data))
+		lineEnding := detectEditLineEnding(content)
+		normalizedContent := normalizeEditLineEndings(content)
+		normalizedOldText := normalizeEditLineEndings(oldText)
+		normalizedNewText := normalizeEditLineEndings(newText)
+		matches := strings.Count(normalizedContent, normalizedOldText)
 		if matches == 0 {
 			return model.ToolResult{}, fmt.Errorf("edit file %q: old text not found", path)
 		}
 		if matches > 1 {
 			return model.ToolResult{}, fmt.Errorf("edit file %q: old text matched %d times", path, matches)
 		}
-		updated := strings.Replace(content, oldText, newText, 1)
+		updated := strings.Replace(normalizedContent, normalizedOldText, normalizedNewText, 1)
+		updated = bom + restoreEditLineEndings(updated, lineEnding)
 		if err := os.WriteFile(resolved, []byte(updated), 0o644); err != nil {
 			return model.ToolResult{}, fmt.Errorf("write file %q: %w", path, err)
 		}
@@ -748,6 +753,41 @@ func newEditFileExecutor(rootDir string) Executor {
 			Content: fmt.Sprintf("edited %s (1 replacement)", path),
 		}, nil
 	})
+}
+
+const editUTF8BOM = "\uFEFF"
+
+func splitEditUTF8BOM(content string) (bom, text string) {
+	if strings.HasPrefix(content, editUTF8BOM) {
+		return editUTF8BOM, strings.TrimPrefix(content, editUTF8BOM)
+	}
+	return "", content
+}
+
+func detectEditLineEnding(content string) string {
+	crlfIndex := strings.Index(content, "\r\n")
+	lfIndex := strings.Index(content, "\n")
+	if lfIndex < 0 {
+		return "\n"
+	}
+	if crlfIndex < 0 {
+		return "\n"
+	}
+	if crlfIndex < lfIndex {
+		return "\r\n"
+	}
+	return "\n"
+}
+
+func normalizeEditLineEndings(content string) string {
+	return strings.ReplaceAll(strings.ReplaceAll(content, "\r\n", "\n"), "\r", "\n")
+}
+
+func restoreEditLineEndings(content, lineEnding string) string {
+	if lineEnding == "\r\n" {
+		return strings.ReplaceAll(content, "\n", "\r\n")
+	}
+	return content
 }
 
 func newShellExecutor(rootDir string) Executor {

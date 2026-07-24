@@ -1074,7 +1074,7 @@ function AppliedPatchDiff({ patch }: { patch: string }) {
 }
 
 function patchDiffLineClass(line: string): string {
-	if (line.startsWith('--- ') || line.startsWith('+++ ') || line.startsWith('@@')) return 'diff-meta'
+	if (line.startsWith('*** ') || line.startsWith('--- ') || line.startsWith('+++ ') || line.startsWith('@@')) return 'diff-meta'
 	if (line.startsWith('+')) return 'diff-added'
 	if (line.startsWith('-')) return 'diff-removed'
 	return 'diff-context'

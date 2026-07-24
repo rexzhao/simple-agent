@@ -507,6 +507,27 @@ func TestEditFileReplacesSingleMatch(t *testing.T) {
 	}
 }
 
+func TestEditFileNormalizesLineEndingsAndPreservesBOM(t *testing.T) {
+	root := t.TempDir()
+	writeTestFile(t, filepath.Join(root, "notes.txt"), "\uFEFFfirst\r\nold\r\nlast\r\n")
+
+	registry := registerBuiltinsForTest(t, root)
+	result, err := registry.Execute(context.Background(), BuiltinEditFile, map[string]any{
+		"path": "notes.txt",
+		"old":  "first\nold\n",
+		"new":  "first\nnew\nmiddle\n",
+	})
+	if err != nil {
+		t.Fatalf("Execute(edit_file) error = %v", err)
+	}
+	if result.Name != BuiltinEditFile || result.IsError {
+		t.Fatalf("Execute(edit_file) result = %#v", result)
+	}
+	if got := readTestFile(t, filepath.Join(root, "notes.txt")); got != "\uFEFFfirst\r\nnew\r\nmiddle\r\nlast\r\n" {
+		t.Fatalf("edited content = %q, want CRLF content with BOM", got)
+	}
+}
+
 func TestEditFileErrorsForNotFoundAndMultipleMatches(t *testing.T) {
 	root := t.TempDir()
 	writeTestFile(t, filepath.Join(root, "not-found.txt"), "alpha beta")
