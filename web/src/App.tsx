@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import { api, streamRun } from './api'
 import type { ActiveRun, ActiveRunDescriptor, Bootstrap, ImageAttachmentInput, Project, RunEvent, RunStep, Session, SessionModelOption } from './types'
 import { errorMessage } from './lib/format'
@@ -123,7 +123,7 @@ function App() {
     }
   }
 
-  const openSessionCreator = async (projectID = selectedProjectID) => {
+  const openSessionCreator = useCallback(async (projectID = selectedProjectID) => {
     if (!projectID) return
     setSessionCreator({ projectID, models: [], selectedKey: '', defaultProvider: '', defaultModel: '', reasoningLevel: '', loading: true })
     try {
@@ -142,7 +142,7 @@ function App() {
       setSessionCreator(null)
       setError(errorMessage(reason))
     }
-  }
+  }, [selectedProjectID])
 
   const createSession = async (projectID: string, model: SessionModelOption) => {
     if (!projectID || creatingSession) return
@@ -161,7 +161,7 @@ function App() {
     }
   }
 
-  const openProviderManager = async () => {
+  const openProviderManager = useCallback(async () => {
     setProviderManager({ document: null, loading: true })
     try {
       const document = await api.providerSettings()
@@ -170,21 +170,21 @@ function App() {
       setProviderManager(null)
       setError(errorMessage(reason))
     }
-  }
+  }, [])
 
-  const selectProject = (projectID: string) => {
+  const selectProject = useCallback((projectID: string) => {
     setSelectedProjectID(projectID)
     setSelectedSessionID(sessionsByProject[projectID]?.[0]?.id ?? '')
     setShowProjectForm(false)
-  }
+  }, [sessionsByProject, setSelectedProjectID, setSelectedSessionID])
 
-  const selectSession = (projectID: string, sessionID: string) => {
+  const selectSession = useCallback((projectID: string, sessionID: string) => {
     setSelectedProjectID(projectID)
     setSelectedSessionID(sessionID)
     setShowProjectForm(false)
-  }
+  }, [setSelectedProjectID, setSelectedSessionID])
 
-  const removeSessionFromTree = (session: Session) => {
+  const removeSessionFromTree = useCallback((session: Session) => {
     const remaining = (sessionsByProject[session.project_id] ?? []).filter((item) => item.id !== session.id)
     setSessionsByProject((current) => ({ ...current, [session.project_id]: remaining }))
     if (selectedSessionID === session.id) {
@@ -193,9 +193,9 @@ function App() {
       setSessionDetail(null)
       setItemsPage(null)
     }
-  }
+  }, [selectedSessionID, setSelectedProjectID, setSelectedSessionID, sessionsByProject])
 
-  const archiveSession = async (session: Session) => {
+  const archiveSession = useCallback(async (session: Session) => {
     if (session.status === 'running' || Boolean(activeRunsRef.current[session.id]) || !window.confirm(`Archive "${sessionName(session)}"? It will be hidden from the current list.`)) return
     try {
       await api.archiveSession(session.id)
@@ -203,9 +203,9 @@ function App() {
     } catch (reason) {
       setError(errorMessage(reason))
     }
-  }
+  }, [activeRunsRef, removeSessionFromTree])
 
-  const deleteSession = async (session: Session) => {
+  const deleteSession = useCallback(async (session: Session) => {
     if (session.status === 'running' || Boolean(activeRunsRef.current[session.id]) || !window.confirm(`Permanently delete "${sessionName(session)}"? This action cannot be undone.`)) return
     try {
       await api.archiveSession(session.id)
@@ -219,7 +219,7 @@ function App() {
       }
       setError(errorMessage(reason))
     }
-  }
+  }, [activeRunsRef, loadSessions, removeSessionFromTree])
 
   const handleRunEvent = useCallback(async (sessionID: string, runID: string, event: RunEvent) => {
     if (event.type === 'text.delta' || event.type === 'reasoning.delta') {
@@ -386,6 +386,8 @@ function App() {
   const selectedProject = projects.find((project) => project.id === selectedProjectID) ?? null
   const selectedActiveRun = activeRunsBySession[selectedSessionID] ?? null
   const otherSessionsRunning = Object.keys(activeRunsBySession).some((sessionID) => sessionID !== selectedSessionID)
+  const runningSessionIDs = useMemo(() => new Set(Object.keys(activeRunsBySession)), [activeRunsBySession])
+  const showAddProject = useCallback(() => setShowProjectForm(true), [])
 
   if (loading) return <Splash />
 
@@ -396,14 +398,14 @@ function App() {
         sessionsByProject={sessionsByProject}
         selectedProjectID={selectedProjectID}
         selectedSessionID={selectedSessionID}
-		runningSessionIDs={new Set(Object.keys(activeRunsBySession))}
+		runningSessionIDs={runningSessionIDs}
         onSelectProject={selectProject}
         onSelectSession={selectSession}
-        onCreateSession={(projectID) => void openSessionCreator(projectID)}
-        onManageProviders={() => void openProviderManager()}
-        onArchiveSession={(session) => void archiveSession(session)}
-        onDeleteSession={(session) => void deleteSession(session)}
-        onAdd={() => setShowProjectForm(true)}
+        onCreateSession={openSessionCreator}
+        onManageProviders={openProviderManager}
+        onArchiveSession={archiveSession}
+        onDeleteSession={deleteSession}
+        onAdd={showAddProject}
         version={bootstrap?.version ?? ''}
       />
       <main className="conversation-panel">

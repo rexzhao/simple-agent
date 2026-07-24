@@ -1,4 +1,4 @@
-import { memo, useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import Markdown from 'react-markdown'
 import type { Components } from 'react-markdown'
 import remarkGfm from 'remark-gfm'
@@ -99,10 +99,11 @@ export function Conversation(props: {
 		observer.observe(button)
 		return () => observer.disconnect()
 	}, [loadOlder, loadingOlder, props.page?.has_more_before])
-	const visibleItems = props.activeRun?.turnID
+	const visibleItems = useMemo(() => props.activeRun?.turnID
 		? (props.page?.items ?? []).filter((item) =>
 			item.turn_id !== props.activeRun?.turnID || (props.activeRun?.restored && item.message?.role === 'user'))
-		: (props.page?.items ?? [])
+		: (props.page?.items ?? []), [props.activeRun?.restored, props.activeRun?.turnID, props.page?.items])
+	const conversationEntries = useMemo(() => buildConversationEntries(visibleItems, props.detail?.id ?? '', props.recentStepsByTurn), [props.detail?.id, props.recentStepsByTurn, visibleItems])
 
   return (
     <div className="conversation">
@@ -124,7 +125,7 @@ export function Conversation(props: {
       <section ref={messagesRef} className="messages" aria-live="polite" onScroll={updateFollowOutput}>
         {props.page?.has_more_before && <button ref={loadOlderRef} className="load-older" disabled={loadingOlder} onClick={() => void loadOlder()}>{loadingOlder ? 'Loading earlier messages…' : 'Load earlier messages'}</button>}
         {!props.page && <MessageSkeleton />}
-				{buildConversationEntries(visibleItems, props.detail?.id ?? '', props.recentStepsByTurn).map((entry) => entry.kind === 'message'
+				{conversationEntries.map((entry) => entry.kind === 'message'
 					? <Message key={entry.item.id} item={entry.item} sessionID={props.detail?.id ?? ''} />
 					: <HistoricalProcess key={entry.id} entry={entry} />)}
         {props.activeRun && <ActiveRunView run={props.activeRun} />}
@@ -315,18 +316,7 @@ function ActiveRunView({ run }: { run: ActiveRun }) {
 // user bubble, and the remaining steps continue in a following assistant
 // segment. The streaming text and token note live in the trailing segment.
 function ActiveRunBody({ run }: { run: ActiveRun }) {
-  const segments: Array<{ kind: 'steps'; steps: RunStep[] } | { kind: 'user'; step: Extract<RunStep, { kind: 'user' }> }> = []
-  let current: RunStep[] = []
-  for (const step of run.steps) {
-    if (step.kind === 'user') {
-      if (current.length > 0) segments.push({ kind: 'steps', steps: current })
-      current = []
-      segments.push({ kind: 'user', step })
-    } else {
-      current.push(step)
-    }
-  }
-  if (current.length > 0) segments.push({ kind: 'steps', steps: current })
+  const segments = useMemo(() => buildActiveRunSegments(run.steps), [run.steps])
 
   const trailing = run.assistantText || run.totalTokens !== undefined || segments.length === 0
   const tokenNote = run.totalTokens !== undefined && (
@@ -342,28 +332,32 @@ function ActiveRunBody({ run }: { run: ActiveRun }) {
     <>
       {segments.map((segment, index) => {
         const isLast = index === segments.length - 1
-        if (segment.kind === 'user') {
-          return (
-            <article className="message user transient" key={segment.step.id}>
-              <div className="message-content">
-                <div className="message-text">{segment.step.text}</div>
-              </div>
-            </article>
-          )
-        }
-        return (
-          <article className="message assistant transient" key={`steps-${index}`}>
-            <div className="message-content">
-              {isLast && <div className="message-meta"><span className="streaming-label"><i />Generating</span></div>}
-              <ProcessTimeline steps={segment.steps} live={isLast && run.status === 'running'} />
-              {isLast && trailing && (run.assistantText ? <MarkdownMessage text={run.assistantText} streaming /> : <div className="message-text assistant-stream"><span className="cursor" /></div>)}
-              {isLast && tokenNote}
-            </div>
-          </article>
-        )
+        if (segment.kind === 'user') return <article className="message user transient" key={segment.step.id}><div className="message-content"><div className="message-text">{segment.step.text}</div></div></article>
+        return <article className="message assistant transient" key={`steps-${index}`}><div className="message-content">
+          {isLast && <div className="message-meta"><span className="streaming-label"><i />Generating</span></div>}
+          <ProcessTimeline steps={segment.steps} live={isLast && run.status === 'running'} />
+          {isLast && trailing && (run.assistantText ? <MarkdownMessage text={run.assistantText} streaming /> : <div className="message-text assistant-stream"><span className="cursor" /></div>)}
+          {isLast && tokenNote}
+        </div></article>
       })}
     </>
   )
+}
+
+function buildActiveRunSegments(steps: RunStep[]) {
+  const segments: Array<{ kind: 'steps'; steps: RunStep[] } | { kind: 'user'; step: Extract<RunStep, { kind: 'user' }> }> = []
+  let current: RunStep[] = []
+  for (const step of steps) {
+    if (step.kind === 'user') {
+      if (current.length > 0) segments.push({ kind: 'steps', steps: current })
+      current = []
+      segments.push({ kind: 'user', step })
+    } else {
+      current.push(step)
+    }
+  }
+  if (current.length > 0) segments.push({ kind: 'steps', steps: current })
+  return segments
 }
 
 const markdownComponents: Components = {

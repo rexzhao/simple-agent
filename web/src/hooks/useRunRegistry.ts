@@ -4,7 +4,24 @@ import { reduceRunEvent } from '../lib/runEventReducer'
 
 const fallbackDelayMS = 40
 
-type Pending = { events: RunEvent[]; frame?: number; timer?: number }
+type Pending = { runID: string; events: RunEvent[]; frame?: number; timer?: number }
+
+export function coalesceRunEvents(events: RunEvent[]): RunEvent[] {
+  const result: RunEvent[] = []
+  for (const event of events) {
+    const previous = result[result.length - 1]
+    if ((event.type === 'text.delta' || event.type === 'reasoning.delta') && previous?.type === event.type) {
+      const current = event as Extract<RunEvent, { type: 'text.delta' | 'reasoning.delta' }>
+      const prior = previous as typeof current
+      if (prior.turn_id === current.turn_id && prior.agent_iteration === current.agent_iteration) {
+        result[result.length - 1] = { ...current, text: prior.text + current.text }
+        continue
+      }
+    }
+    result.push(event)
+  }
+  return result
+}
 
 export function useRunRegistry() {
   const [activeRunsBySession, setActiveRunsBySession] = useState<Record<string, ActiveRun>>({})
@@ -28,16 +45,22 @@ export function useRunRegistry() {
 
   const flushRunEvents = useCallback((sessionID: string, runID: string) => {
     const pending = pendingRef.current[sessionID]
-    if (!pending) return
+    if (!pending || pending.runID !== runID) return
     if (pending.frame !== undefined) cancelAnimationFrame(pending.frame)
     if (pending.timer !== undefined) window.clearTimeout(pending.timer)
     delete pendingRef.current[sessionID]
-    if (pending.events.length) updateActiveRun(sessionID, runID, (run) => pending.events.reduce(reduceRunEvent, run))
+    if (pending.events.length) updateActiveRun(sessionID, runID, (run) => coalesceRunEvents(pending.events).reduce(reduceRunEvent, run))
   }, [updateActiveRun])
 
   const queueRunEvent = useCallback((sessionID: string, runID: string, event: RunEvent) => {
     let pending = pendingRef.current[sessionID]
-    if (!pending) pending = pendingRef.current[sessionID] = { events: [] }
+    if (pending && pending.runID !== runID) {
+      if (pending.frame !== undefined) cancelAnimationFrame(pending.frame)
+      if (pending.timer !== undefined) window.clearTimeout(pending.timer)
+      delete pendingRef.current[sessionID]
+      pending = pendingRef.current[sessionID] = { runID, events: [] }
+    }
+    if (!pending) pending = pendingRef.current[sessionID] = { runID, events: [] }
     pending.events.push(event)
     if (pending.frame !== undefined) return
     const flush = () => flushRunEvents(sessionID, runID)

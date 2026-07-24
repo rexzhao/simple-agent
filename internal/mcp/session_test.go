@@ -65,8 +65,8 @@ func TestSessionContextCancelKillsServerWithoutCloseError(t *testing.T) {
 	if err := session.Close(); err != nil {
 		t.Fatalf("Close() after context cancel error = %v", err)
 	}
-	if session.cmd.ProcessState == nil || !session.cmd.ProcessState.Exited() {
-		t.Fatalf("server process did not exit after context cancel")
+	if session.cmd.ProcessState == nil {
+		t.Fatal("server process was not reaped after context cancel")
 	}
 }
 
@@ -86,8 +86,8 @@ func TestCloseKillsServerThatIgnoresStdinClose(t *testing.T) {
 	if elapsed := time.Since(start); elapsed > 1500*time.Millisecond {
 		t.Fatalf("Close() took %v, want bounded wait under 1.5s", elapsed)
 	}
-	if session.cmd.ProcessState == nil || !session.cmd.ProcessState.Exited() {
-		t.Fatalf("server process did not exit after Close kill fallback")
+	if session.cmd.ProcessState == nil {
+		t.Fatal("server process was not reaped after Close kill fallback")
 	}
 }
 
