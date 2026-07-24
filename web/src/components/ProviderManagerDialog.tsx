@@ -137,6 +137,17 @@ export function ProviderManagerDialog(props: {
     setDraft((current) => current ? { ...current, models: current.models.map((model, modelIndex) => modelIndex === index ? { ...model, ...patch } : model) } : current)
   }
 
+  const duplicateModel = (index: number) => {
+    setDraft((current) => {
+      if (!current) return current
+      const source = current.models[index]
+      if (!source) return current
+      const models = [...current.models]
+      models.splice(index + 1, 0, { ...source, profile: duplicateProfileName(source.profile, current.models) })
+      return { ...current, models }
+    })
+  }
+
   const usesCodex = draft?.models.some((model) => model.type === 'openai-codex') ?? false
   const savedCodexProvider = document?.providers.find((provider) => provider.name === draft?.existingName)?.models.some((model) => model.type === 'openai-codex') ?? false
 
@@ -204,7 +215,7 @@ export function ProviderManagerDialog(props: {
                     const isDefault = draft.existingName === document.default_provider && model.profile === document.default_model
                     const reasoningLevels = reasoningLevelOptions(model.reasoningLevelsJSON)
                     return <article className="provider-model-card" key={`${index}-${model.profile}`}>
-                      <div className="provider-model-heading"><strong>{model.profile || `Model ${index + 1}`}</strong><div className="inline-actions">{isDefault ? <span className="default-badge">Default</span> : <button className="plain-button" disabled={!draft.existingName || !model.profile} onClick={() => void setDefault(model.profile)}>Set as default</button>}<button className="plain-button danger" disabled={draft.models.length === 1} onClick={() => setDraft({ ...draft, models: draft.models.filter((_, modelIndex) => modelIndex !== index) })}>Remove</button></div></div>
+                      <div className="provider-model-heading"><strong>{model.profile || `Model ${index + 1}`}</strong><div className="inline-actions">{isDefault ? <span className="default-badge">Default</span> : <button className="plain-button" disabled={!draft.existingName || !model.profile} onClick={() => void setDefault(model.profile)}>Set as default</button>}<button className="plain-button" onClick={() => duplicateModel(index)}>Duplicate</button><button className="plain-button danger" disabled={draft.models.length === 1} onClick={() => setDraft({ ...draft, models: draft.models.filter((_, modelIndex) => modelIndex !== index) })}>Remove</button></div></div>
                       <div className="settings-grid model-grid">
                         {discoveredModels.length > 0 && <label className="wide model-catalog-select">Choose from model list<select value={discoveredModels.includes(model.id) ? model.id : ''} onChange={(event) => {
                           const selectedID = event.target.value
@@ -278,6 +289,16 @@ function editableProviderModel(model: ProviderModelSettings): EditableProviderMo
     reasoningParameter: model.reasoning_config?.parameter ?? '',
     reasoningDefault: model.reasoning_config?.default ?? '',
     reasoningLevelsJSON: prettyJSON(model.reasoning_config?.levels ?? {}),
+  }
+}
+
+function duplicateProfileName(profile: string, models: EditableProviderModel[]): string {
+  const base = profile.trim()
+  if (!base) return ''
+  const taken = new Set(models.map((model) => model.profile.trim()))
+  for (let suffix = 1; ; suffix += 1) {
+    const candidate = suffix === 1 ? `${base} copy` : `${base} copy ${suffix}`
+    if (!taken.has(candidate)) return candidate
   }
 }
 
