@@ -566,6 +566,10 @@ svg { width: 1.1em; height: 1.1em; fill: none; stroke: currentColor; stroke-widt
 
 .error-banner { position: absolute; z-index: 20; top: 15px; left: 50%; width: min(620px, calc(100% - 32px)); display: flex; align-items: center; justify-content: space-between; gap: 15px; padding: 10px 12px 10px 14px; border: 2px solid var(--border); color: var(--text); background: var(--danger-soft); box-shadow: var(--shadow-3); transform: translateX(-50%); font-size: 11px; font-weight: 700; }
 .error-banner button { border: 0; color: var(--danger); background: transparent; cursor: pointer; font-size: 20px; font-weight: 900; line-height: 1; }
+.completion-notice { position: absolute; z-index: 20; right: 20px; bottom: 20px; display: flex; align-items: center; gap: 14px; max-width: min(430px, calc(100% - 40px)); padding: 10px 10px 10px 13px; border: 2px solid var(--border); color: var(--text); background: var(--success-soft); box-shadow: var(--shadow-3); font-size: 11px; font-weight: 750; }
+.completion-notice span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.completion-notice button { width: 22px; height: 22px; display: grid; flex: 0 0 auto; place-items: center; border: 0; color: var(--success); background: transparent; cursor: pointer; font-size: 20px; font-weight: 900; line-height: 1; }
+.completion-notice button:hover { color: #ffffff; background: var(--success); }
 
 .splash { width: 100%; height: 100%; display: flex; align-items: center; justify-content: center; gap: 12px; color: var(--text); background: var(--accent); font-size: 18px; font-weight: 900; letter-spacing: .14em; }
 .splash-logo { width: 42px; height: 42px; display: grid; place-items: center; border: 2px solid var(--border); background: #ffffff; box-shadow: var(--shadow-3); animation: breathe 1.6s ease-in-out infinite; }

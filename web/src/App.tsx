@@ -14,6 +14,11 @@ import { SessionModelDialog } from './components/SessionModelDialog'
 import type { SessionCreatorState } from './components/SessionModelDialog'
 import { WorkspaceTree } from './components/WorkspaceTree'
 
+type BackgroundCompletionNotice = {
+  sessionID: string
+  sessionName: string
+}
+
 function App() {
   const [bootstrap, setBootstrap] = useState<Bootstrap | null>(null)
   const [projects, setProjects] = useState<Project[]>([])
@@ -32,6 +37,7 @@ function App() {
   const [sessionCreator, setSessionCreator] = useState<SessionCreatorState | null>(null)
   const [providerManager, setProviderManager] = useState<ProviderManagerState | null>(null)
   const [creatingSession, setCreatingSession] = useState(false)
+  const [completionNotice, setCompletionNotice] = useState<BackgroundCompletionNotice | null>(null)
   const selectedProjectRef = useRef('')
   const selectedSessionRef = useRef('')
 	const activeRunsRef = useRef<Record<string, ActiveRun>>({})
@@ -154,15 +160,24 @@ function App() {
     return ordered
   }, [])
 
-  const refreshSession = useCallback(async (sessionID: string) => {
-    if (!sessionID) return
+  const refreshSession = useCallback(async (sessionID: string): Promise<Session | null> => {
+    if (!sessionID) return null
     const [detail, page] = await Promise.all([api.session(sessionID), api.items(sessionID)])
     if (selectedSessionRef.current === sessionID) {
       setSessionDetail(detail)
       setItemsPage(page)
     }
-    if (detail.project_id) await loadSessions(detail.project_id, sessionID)
+    // Refreshing a background session must not select it. The session list is
+    // still updated so its status and ordering remain current.
+    if (detail.project_id) await loadSessions(detail.project_id)
+    return detail
   }, [loadSessions])
+
+  useEffect(() => {
+    if (!completionNotice) return
+    const timer = window.setTimeout(() => setCompletionNotice(null), 5000)
+    return () => window.clearTimeout(timer)
+  }, [completionNotice])
 
   useEffect(() => {
     if (!selectedSessionID) {
@@ -368,10 +383,17 @@ function App() {
         if (turnID && settledRun.steps.length > 0) {
           setRecentStepsByTurn((current) => ({ ...current, [processKey(sessionID, turnID)]: settledRun.steps }))
         }
+        let settledSession: Session | null = null
         try {
-          await refreshSession(sessionID)
+          settledSession = await refreshSession(sessionID)
         } catch (reason) {
           setError(errorMessage(reason))
+        }
+        if (String(event.status) === 'committed' && selectedSessionRef.current !== sessionID) {
+          setCompletionNotice({
+            sessionID,
+            sessionName: settledSession ? sessionName(settledSession) : `Session ${sessionID.slice(-6)}`,
+          })
         }
         update(() => null)
         break
@@ -482,6 +504,7 @@ function App() {
       />
       <main className="conversation-panel">
         {error && <ErrorBanner message={error} onDismiss={() => setError('')} />}
+        {completionNotice && <div className="completion-notice" role="status"><span>{completionNotice.sessionName} completed in the background.</span><button onClick={() => setCompletionNotice(null)} aria-label="Dismiss completion notification">×</button></div>}
         {showProjectForm ? (
           <ProjectSetup
             suggestedRoot={bootstrap?.cwd ?? ''}
