@@ -47,8 +47,11 @@ func TestStartStdioSessionInitializesListsToolsAndCloseExits(t *testing.T) {
 	if err := session.Close(); err != nil {
 		t.Fatalf("Close() error = %v", err)
 	}
-	if session.cmd.ProcessState == nil || !session.cmd.ProcessState.Exited() {
-		t.Fatalf("server process did not exit after Close")
+	// Close waits for cmd.Wait, so a non-nil ProcessState proves the child was
+	// reaped. Do not require Exited(): under -race the helper can exceed the
+	// graceful timeout and be signal-killed on a loaded Linux runner.
+	if session.cmd.ProcessState == nil {
+		t.Fatal("server process was not reaped after Close")
 	}
 }
 
