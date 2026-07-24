@@ -77,12 +77,19 @@ function ToolGroupRow({ flats, live }: { flats: FlatProcessStep[]; live: boolean
 		setExpanded(event.currentTarget.open)
 	}
 
-	// A group spanning iterations is marked with the latest iteration it
-	// contains, so the marker tracks progress instead of the run's origin.
+	// A collapsed group is marked with the latest iteration it contains, so
+	// the marker tracks progress. An expanded group that spans iterations
+	// shows the span instead: the first contained iteration at the top and
+	// the last at the bottom.
 	let markerIteration: number | undefined
 	for (const flat of flats) {
 		if (flat.iterationStart) markerIteration = flat.iteration
 	}
+	const firstIteration = flats[0]?.iteration
+	const lastIteration = flats[flats.length - 1]?.iteration
+	const spansIterations = firstIteration !== undefined && lastIteration !== undefined && lastIteration > firstIteration
+	const showSpan = expanded && spansIterations
+	const topMarker = showSpan ? firstIteration : markerIteration
 	const status = hasError ? 'error' : pending > 0 ? 'running' : 'finished'
 	const badge = hasError ? `${failed} failed` : pending > 0 ? `${tools.length - pending}/${tools.length}` : 'Done'
 	const summary = toolGroupSummary(tools)
@@ -91,7 +98,7 @@ function ToolGroupRow({ flats, live }: { flats: FlatProcessStep[]; live: boolean
 	return (
 		<details className={`tool-group ${status}`} open={expanded} onToggle={toggle}>
 			<summary>
-				{markerIteration !== undefined && <i className="iteration-marker">{markerIteration}</i>}
+				{topMarker !== undefined && <i className="iteration-marker">{topMarker}</i>}
 				<ChevronIcon expanded={expanded} />
 				<ToolIcon />
 				<span className="tool-group-summary" title={summary}>{summary}</span>
@@ -112,6 +119,7 @@ function ToolGroupRow({ flats, live }: { flats: FlatProcessStep[]; live: boolean
 					})}
 				</div>
 			)}
+			{showSpan && <i className="iteration-marker iteration-marker-end">{lastIteration}</i>}
 		</details>
 	)
 }
