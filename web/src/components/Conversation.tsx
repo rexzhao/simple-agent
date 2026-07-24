@@ -40,8 +40,8 @@ export function Conversation(props: {
 	const loadingOlderRef = useRef(false)
 	const prependAnchorRef = useRef<{
 		sessionID: string
-		scrollHeight: number
-		scrollTop: number
+		element: HTMLElement | null
+		top: number
 		oldestSeq: number
 		itemCount: number
 	} | null>(null)
@@ -63,10 +63,13 @@ export function Conversation(props: {
 		if (!messages || loadingOlderRef.current || !props.page?.has_more_before) return
 		loadingOlderRef.current = true
 		setLoadingOlder(true)
+		const containerTop = messages.getBoundingClientRect().top
+		const anchorElement = [...messages.querySelectorAll<HTMLElement>('.message, .historical-process')]
+			.find((element) => element.getBoundingClientRect().bottom > containerTop) ?? null
 		prependAnchorRef.current = {
 			sessionID: props.detail?.id ?? '',
-			scrollHeight: messages.scrollHeight,
-			scrollTop: messages.scrollTop,
+			element: anchorElement,
+			top: anchorElement?.getBoundingClientRect().top ?? containerTop,
 			oldestSeq: props.page.oldest_seq,
 			itemCount: props.page.items.length,
 		}
@@ -86,7 +89,7 @@ export function Conversation(props: {
 			return
 		}
 		if (anchor.oldestSeq === props.page?.oldest_seq && anchor.itemCount === (props.page?.items.length ?? 0) && props.page?.has_more_before) return
-		messages.scrollTop = anchor.scrollTop + messages.scrollHeight - anchor.scrollHeight
+		if (anchor.element?.isConnected) messages.scrollTop += anchor.element.getBoundingClientRect().top - anchor.top
 		prependAnchorRef.current = null
 	}, [props.detail?.id, props.page?.has_more_before, props.page?.items.length, props.page?.oldest_seq])
 	useEffect(() => {
