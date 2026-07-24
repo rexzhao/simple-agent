@@ -62,13 +62,13 @@ type patchOperation struct {
 func applyPatchDefinition() model.Tool {
 	return model.Tool{
 		Name:        BuiltinApplyPatch,
-		Description: "Apply a unified diff patch to text files under the workspace. The patch must use ---/+++ file headers and @@ hunks; paths must be workspace-relative. It supports file creation, updates, and deletion, and validates every hunk before writing.",
+		Description: "Apply a text-only unified diff patch to workspace-relative files. Provide the raw diff only; do not wrap it in *** Begin Patch/End Patch markers. Each file must begin with --- and +++ headers and contain @@ -oldStart,oldCount +newStart,newCount @@ hunks. Header counts must exactly match the old/new lines consumed by space, - and + hunk lines. Supports create, update, and delete (/dev/null); rejects renames and binary patches. All files and hunks are validated before any write.",
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
 				"patch": map[string]any{
 					"type":        "string",
-					"description": "Unified diff patch. Use --- a/path and +++ b/path headers; use /dev/null for added or deleted files.",
+					"description": "Raw standard unified diff only; do not use *** Begin Patch/End Patch wrappers. Start each file with --- a/path and +++ b/path (or /dev/null). Every hunk uses @@ -oldStart,oldCount +newStart,newCount @@ and its counts must match the space, - and + lines. Paths are workspace-relative; use /dev/null only for file creation or deletion.",
 				},
 			},
 			"required":             []any{"patch"},

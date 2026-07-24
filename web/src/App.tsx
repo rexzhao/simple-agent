@@ -1036,15 +1036,18 @@ function ToolRow({ tool }: { tool: ToolActivity }) {
 	const argumentsObject = parseToolArguments(tool.arguments)
 	const target = toolTarget(tool.name, argumentsObject)
 	const command = tool.name === 'shell' ? stringField(argumentsObject, 'command') : ''
+	const patch = tool.name === 'apply_patch' ? stringField(argumentsObject, 'patch') : ''
 	const oldText = tool.name === 'edit_file' ? stringField(argumentsObject, 'old') : ''
 	const newText = tool.name === 'edit_file' ? stringField(argumentsObject, 'new') : ''
 	const showEditDiff = tool.name === 'edit_file' && Boolean(oldText)
+	const showPatch = Boolean(patch)
 	const showResult = Boolean(tool.result) && (tool.name !== 'edit_file' || tool.status === 'error')
-	const showDetails = Boolean(command || showEditDiff || showResult)
+	const showDetails = Boolean(command || showPatch || showEditDiff || showResult)
 	const header = <><ToolIcon /><strong>{toolDisplayName(tool.name)}</strong>{target && <code title={target}>{target}</code>}<small>{toolStatus(tool.status)}</small></>
 	const details = (
 		<div className="tool-details">
 			{command && <div><span>命令</span><pre>{command}</pre></div>}
+			{showPatch && <AppliedPatchDiff patch={patch} />}
 			{showEditDiff && <EditFileDiff path={target} oldText={oldText} newText={newText} />}
 			{showResult && <div><span>{tool.name === 'edit_file' ? '错误详情' : '输出'}</span><pre>{tool.result}</pre></div>}
 		</div>
@@ -1058,6 +1061,23 @@ function ToolRow({ tool }: { tool: ToolActivity }) {
 			{details}
 		</details>
   )
+}
+
+function AppliedPatchDiff({ patch }: { patch: string }) {
+	const lines = patch.split('\n')
+	return (
+		<div className="tool-apply-patch">
+			<span>补丁</span>
+			<pre aria-label="apply_patch 内容">{lines.map((line, index) => <span className={patchDiffLineClass(line)} key={`${index}-${line}`}>{`${line}${index < lines.length - 1 ? '\n' : ''}`}</span>)}</pre>
+		</div>
+	)
+}
+
+function patchDiffLineClass(line: string): string {
+	if (line.startsWith('--- ') || line.startsWith('+++ ') || line.startsWith('@@')) return 'diff-meta'
+	if (line.startsWith('+')) return 'diff-added'
+	if (line.startsWith('-')) return 'diff-removed'
+	return 'diff-context'
 }
 
 function EditFileDiff(props: { path: string; oldText: string; newText: string }) {
@@ -1839,6 +1859,7 @@ function toolDisplayName(name: string): string {
 		list_files: '列出文件',
 		glob_files: '查找文件',
 		grep_files: '搜索文件',
+		apply_patch: '应用补丁',
 		shell: 'Shell',
 	}[name] || name
 }

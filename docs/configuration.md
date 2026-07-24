@@ -242,11 +242,14 @@ tools:
 ```
 
 All relative tool paths and shell working directories are based on the durable
-session's creation directory. `apply_patch` accepts a text-only unified diff
-with `---` / `+++` file headers and `@@` hunks. It supports workspace-relative
-file creation, updates, and deletion (`/dev/null` for added or deleted files),
-validates every hunk before writing, and does not support renames or binary
-patches.
+session's creation directory. `apply_patch` accepts a raw text-only unified diff;
+do not wrap it in `*** Begin Patch` / `*** End Patch` markers. Every file change
+starts with `---` / `+++` headers, and every hunk uses
+`@@ -oldStart,oldCount +newStart,newCount @@`. The declared old/new counts must
+exactly match the space, `-`, and `+` lines in that hunk. Paths must be
+workspace-relative. It supports file creation, updates, and deletion (`/dev/null`
+for added or deleted files), validates every file and hunk before writing, and
+does not support renames or binary patches.
 
 ## MCP tool sources
 

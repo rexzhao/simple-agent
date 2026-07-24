@@ -168,3 +168,25 @@ func TestApplyPatchRejectsPathsOutsideWorkspace(t *testing.T) {
 		t.Fatalf("Execute(apply_patch) error = %v, want workspace path rejection", err)
 	}
 }
+
+func TestApplyPatchDefinitionDescribesUnifiedDiffRequirements(t *testing.T) {
+	definition := applyPatchDefinition()
+	for _, want := range []string{
+		"raw diff only",
+		"--- and +++ headers",
+		"@@ -oldStart,oldCount +newStart,newCount @@",
+		"counts must exactly match",
+		"validated before any write",
+	} {
+		if !strings.Contains(definition.Description, want) {
+			t.Fatalf("description = %q, want contain %q", definition.Description, want)
+		}
+	}
+	properties := definition.InputSchema["properties"].(map[string]any)
+	patch := properties["patch"].(map[string]any)
+	for _, want := range []string{"Raw standard unified diff only", "*** Begin Patch/End Patch wrappers", "--- a/path", "+++ b/path", "counts must match"} {
+		if !strings.Contains(patch["description"].(string), want) {
+			t.Fatalf("patch description = %q, want contain %q", patch["description"], want)
+		}
+	}
+}

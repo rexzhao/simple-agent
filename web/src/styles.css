@@ -408,6 +408,12 @@ svg { width: 1.1em; height: 1.1em; fill: none; stroke: currentColor; stroke-widt
 .tool-edit-diff pre .diff-context { color: #e5e7eb; }
 .tool-edit-diff pre .diff-removed { color: #fecaca; background: rgba(220, 38, 38, .24); }
 .tool-edit-diff pre .diff-added { color: #bbf7d0; background: rgba(21, 128, 61, .28); }
+.tool-apply-patch pre { max-height: 420px; }
+.tool-apply-patch pre span { display: block; }
+.tool-apply-patch pre .diff-meta { color: #9ca3af; }
+.tool-apply-patch pre .diff-context { color: #e5e7eb; }
+.tool-apply-patch pre .diff-removed { color: #fecaca; background: rgba(220, 38, 38, .24); }
+.tool-apply-patch pre .diff-added { color: #bbf7d0; background: rgba(21, 128, 61, .28); }
 
 .load-older { display: block; margin: 0 auto 30px; padding: 7px 12px; border: 2px solid var(--border); color: var(--text); background: #ffffff; box-shadow: var(--shadow-2); cursor: pointer; font-size: 10.5px; font-weight: 750; }
 .load-older:hover { box-shadow: none; transform: translate(3px, 3px); }
