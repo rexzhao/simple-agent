@@ -14,7 +14,7 @@ import { CopyIcon, SparkIcon } from './icons'
 
 const autoScrollThresholdPX = 160
 
-export function Conversation(props: {
+export const Conversation = memo(function Conversation(props: {
   detail: Session | null
   page: ItemsPage | null
   activeRun: ActiveRun | null
@@ -153,7 +153,13 @@ export function Conversation(props: {
 	  />
     </div>
   )
-}
+}, (previous, next) =>
+  previous.detail === next.detail &&
+  previous.page === next.page &&
+  previous.activeRun === next.activeRun &&
+  previous.draft === next.draft &&
+  previous.otherSessionsRunning === next.otherSessionsRunning &&
+  previous.recentStepsByTurn === next.recentStepsByTurn)
 
 function ContextUsage(props: { context: Session['context']; activeInputTokens?: number; activeCachedTokens?: number; activeCacheWriteTokens?: number }) {
 	const context = props.context

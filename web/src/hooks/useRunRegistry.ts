@@ -2,9 +2,9 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import type { ActiveRun, RunEvent } from '../types'
 import { reduceRunEvent } from '../lib/runEventReducer'
 
-const fallbackDelayMS = 40
+export const streamPublishIntervalMS = 40
 
-type Pending = { runID: string; events: RunEvent[]; frame?: number; timer?: number }
+type Pending = { runID: string; timer: number }
 
 export function coalesceRunEvents(events: RunEvent[]): RunEvent[] {
   const result: RunEvent[] = []
@@ -41,9 +41,12 @@ export function useRunRegistry() {
     if (updated) next[sessionID] = updated
     else {
       delete next[sessionID]
-      setRunningSessionIDs((current) => {
-        if (!current.has(sessionID)) return current
-        const nextIDs = new Set(current)
+      const pending = pendingRef.current[sessionID]
+      if (pending) window.clearTimeout(pending.timer)
+      delete pendingRef.current[sessionID]
+      setRunningSessionIDs((currentIDs) => {
+        if (!currentIDs.has(sessionID)) return currentIDs
+        const nextIDs = new Set(currentIDs)
         nextIDs.delete(sessionID)
         return nextIDs
       })
@@ -52,6 +55,11 @@ export function useRunRegistry() {
   }, [publish])
   const addActiveRun = useCallback((run: ActiveRun) => {
     const isNewSession = !activeRunsRef.current[run.sessionID]
+    const pending = pendingRef.current[run.sessionID]
+    if (pending && pending.runID !== run.id) {
+      window.clearTimeout(pending.timer)
+      delete pendingRef.current[run.sessionID]
+    }
     publish({ ...activeRunsRef.current, [run.sessionID]: run })
     if (isNewSession) setRunningSessionIDs((current) => new Set(current).add(run.sessionID))
   }, [publish])
@@ -59,34 +67,33 @@ export function useRunRegistry() {
   const flushRunEvents = useCallback((sessionID: string, runID: string) => {
     const pending = pendingRef.current[sessionID]
     if (!pending || pending.runID !== runID) return
-    if (pending.frame !== undefined) cancelAnimationFrame(pending.frame)
-    if (pending.timer !== undefined) window.clearTimeout(pending.timer)
+    window.clearTimeout(pending.timer)
     delete pendingRef.current[sessionID]
-    if (pending.events.length) updateActiveRun(sessionID, runID, (run) => coalesceRunEvents(pending.events).reduce(reduceRunEvent, run))
-  }, [updateActiveRun])
+    // Publish a snapshot. The authoritative ref has already received every
+    // delta, while React presentation is limited to this cadence.
+    setActiveRunsBySession({ ...activeRunsRef.current })
+  }, [])
 
   const queueRunEvent = useCallback((sessionID: string, runID: string, event: RunEvent) => {
-    let pending = pendingRef.current[sessionID]
+    const current = activeRunsRef.current[sessionID]
+    if (!current || current.id !== runID) return
+    // Keep lifecycle reads authoritative without forcing a React commit.
+    activeRunsRef.current = { ...activeRunsRef.current, [sessionID]: reduceRunEvent(current, event) }
+
+    let pending: Pending | undefined = pendingRef.current[sessionID]
     if (pending && pending.runID !== runID) {
-      if (pending.frame !== undefined) cancelAnimationFrame(pending.frame)
-      if (pending.timer !== undefined) window.clearTimeout(pending.timer)
+      window.clearTimeout(pending.timer)
       delete pendingRef.current[sessionID]
-      pending = pendingRef.current[sessionID] = { runID, events: [] }
+      pending = undefined
     }
-    if (!pending) pending = pendingRef.current[sessionID] = { runID, events: [] }
-    pending.events.push(event)
-    if (pending.frame !== undefined) return
-    const flush = () => flushRunEvents(sessionID, runID)
-    pending.frame = requestAnimationFrame(flush)
-    // Browsers throttle rAF in background tabs. The timeout keeps streams moving.
-    pending.timer = window.setTimeout(flush, fallbackDelayMS)
+    if (!pending) {
+      const timer = window.setTimeout(() => flushRunEvents(sessionID, runID), streamPublishIntervalMS)
+      pendingRef.current[sessionID] = { runID, timer }
+    }
   }, [flushRunEvents])
 
   useEffect(() => () => {
-    for (const pending of Object.values(pendingRef.current)) {
-      if (pending.frame !== undefined) cancelAnimationFrame(pending.frame)
-      if (pending.timer !== undefined) window.clearTimeout(pending.timer)
-    }
+    for (const pending of Object.values(pendingRef.current)) window.clearTimeout(pending.timer)
     pendingRef.current = {}
   }, [])
 

@@ -81,4 +81,18 @@ describe('useSessionHistory', () => {
     await act(async () => { oldDetail.resolve(session('a')); oldPage.resolve(page(2)); await oldRefresh })
     expect(result.current.itemsPage?.oldest_seq).toBe(3)
   })
+
+  it('suppresses a stale session-list rejection after selection changes', async () => {
+    mocked.session.mockImplementation((id) => Promise.resolve(session(id)))
+    mocked.items.mockImplementation((id) => Promise.resolve(page(id === 'a' ? 10 : 20)))
+    const staleList = deferred<Session[]>()
+    const loadSessions = vi.fn().mockReturnValueOnce(staleList.promise).mockResolvedValue([])
+    const onError = vi.fn()
+    const { result, rerender } = renderHook(({ id }) => useSessionHistory(id, loadSessions, onError), { initialProps: { id: 'a' } })
+    await waitFor(() => expect(result.current.sessionDetail?.id).toBe('a'))
+    rerender({ id: 'b' })
+    await waitFor(() => expect(result.current.sessionDetail?.id).toBe('b'))
+    await act(async () => { staleList.reject(new Error('stale list')); await Promise.resolve() })
+    expect(onError).not.toHaveBeenCalled()
+  })
 })

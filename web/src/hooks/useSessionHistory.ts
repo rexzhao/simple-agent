@@ -33,7 +33,13 @@ export function useSessionHistory(
       setSessionDetail(detail)
       setItemsPage(page)
     }
-    if (detail.project_id) await loadSessions(detail.project_id)
+    if (detail.project_id) {
+      try {
+        await loadSessions(detail.project_id)
+      } catch (reason) {
+        if (selectedSessionRef.current === sessionID && refreshGenerationRef.current[sessionID] === generation) throw reason
+      }
+    }
     return detail
   }, [loadSessions])
 
