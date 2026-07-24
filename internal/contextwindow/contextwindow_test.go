@@ -9,6 +9,25 @@ import (
 	"github.com/rexzhao/simple-agent/internal/model"
 )
 
+func TestNewTrackerRefreshesWindowFromCurrentResolution(t *testing.T) {
+	saved := Metadata{
+		ContextWindow:       1000000,
+		ContextWindowSource: string(WindowSourceConfigured),
+		LastInputTokens:     90,
+		LastTotalTokens:     100,
+		LastUsageSource:     string(UsageSourceProvider),
+		LastUsageAnchorHash: "anchor",
+	}
+	tracker := NewTracker(Window{Tokens: 262144, Source: WindowSourceConfigured}, saved)
+	metadata := tracker.Metadata()
+	if metadata.ContextWindow != 262144 || metadata.ContextWindowSource != string(WindowSourceConfigured) {
+		t.Fatalf("window = %d/%q, want 262144/%q", metadata.ContextWindow, metadata.ContextWindowSource, WindowSourceConfigured)
+	}
+	if metadata.LastInputTokens != 90 || metadata.LastTotalTokens != 100 || metadata.LastUsageAnchorHash != "anchor" {
+		t.Fatalf("usage stats = %+v, want carried over from saved metadata", metadata)
+	}
+}
+
 func TestTrackingProviderPrefersProviderUsageEvent(t *testing.T) {
 	tracker := NewTracker(Window{Tokens: 1000, Source: WindowSourceConfigured}, Metadata{})
 	provider := TrackingProvider{

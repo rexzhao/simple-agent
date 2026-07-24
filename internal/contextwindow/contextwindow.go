@@ -108,12 +108,13 @@ func NewTracker(window Window, saved Metadata) *Tracker {
 	}
 	if saved.ContextWindow > 0 {
 		metadata = saved
-		if metadata.ContextWindowSource == "" {
-			metadata.ContextWindowSource = string(WindowSourceEstimated)
-		}
 		if metadata.WarningThresholdPercent <= 0 {
 			metadata.WarningThresholdPercent = WarningThresholdPercent
 		}
+		// Usage history carries over, but the window itself always reflects
+		// the current resolution so config edits reach existing sessions.
+		metadata.ContextWindow = window.Tokens
+		metadata.ContextWindowSource = string(window.Source)
 	}
 	return &Tracker{metadata: metadata}
 }
