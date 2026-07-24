@@ -61,7 +61,7 @@ export function Conversation(props: {
 		  {props.detail && (
 			<div className="conversation-meta">
 			  <p>{props.detail.provider} / {props.detail.model_id}</p>
-			  <ContextUsage context={props.detail.context} activeInputTokens={props.activeRun?.inputTokens} />
+			  <ContextUsage context={props.detail.context} activeInputTokens={props.activeRun?.inputTokens} activeCachedTokens={props.activeRun?.cachedTokens} activeCacheWriteTokens={props.activeRun?.cacheWriteTokens} />
 			</div>
 		  )}
         </div>
@@ -100,16 +100,24 @@ export function Conversation(props: {
   )
 }
 
-function ContextUsage(props: { context: Session['context']; activeInputTokens?: number }) {
+function ContextUsage(props: { context: Session['context']; activeInputTokens?: number; activeCachedTokens?: number; activeCacheWriteTokens?: number }) {
 	const context = props.context
 	const contextWindow = Number(context?.context_window ?? 0)
 	if (contextWindow <= 0) return null
 
+	// Usage buckets are disjoint: input tokens exclude cache reads and writes.
+	// The meter tracks the full prompt, so add the cache buckets back.
 	const liveInputTokens = Number(props.activeInputTokens ?? 0)
+	const livePromptTokens = liveInputTokens > 0
+		? liveInputTokens + Number(props.activeCachedTokens ?? 0) + Number(props.activeCacheWriteTokens ?? 0)
+		: 0
 	const recordedInputTokens = Number(context?.last_input_tokens ?? 0)
+	const recordedPromptTokens = recordedInputTokens > 0
+		? recordedInputTokens + Number(context?.last_cached_tokens ?? 0) + Number(context?.last_cache_write_tokens ?? 0)
+		: 0
 	const requestEstimate = Number(context?.last_request_tokens ?? 0)
-	const usedTokens = liveInputTokens > 0 ? liveInputTokens : recordedInputTokens > 0 ? recordedInputTokens : requestEstimate
-	const usageEstimated = liveInputTokens <= 0 && (recordedInputTokens <= 0 || context?.last_usage_source !== 'provider')
+	const usedTokens = livePromptTokens > 0 ? livePromptTokens : recordedPromptTokens > 0 ? recordedPromptTokens : requestEstimate
+	const usageEstimated = livePromptTokens <= 0 && (recordedPromptTokens <= 0 || context?.last_usage_source !== 'provider')
 	const percent = usedTokens > 0 ? usedTokens / contextWindow * 100 : 0
 	const warningThreshold = Number(context?.warning_threshold_percent ?? 80)
 	const tone = percent >= 100 ? 'critical' : percent >= warningThreshold ? 'warning' : ''
