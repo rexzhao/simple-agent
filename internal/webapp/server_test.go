@@ -141,9 +141,21 @@ func TestServerProjectSessionAndRunFlow(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReadAll(events) error = %v", err)
 	}
-	for _, eventType := range []string{"turn.started", "text.delta", "turn.committed", "run.settled"} {
+	requireEvent := func(eventType string) {
+		t.Helper()
 		if !bytes.Contains(events, []byte(`"type":"`+eventType+`"`)) {
 			t.Fatalf("events missing %q: %s", eventType, events)
+		}
+	}
+	requireEvent("run.settled")
+	// A fast run may settle between SSE snapshots. Terminal replay deliberately
+	// retains only run.settled, so the server signals run.resync_required and the
+	// client reloads the durable session instead of receiving every transient
+	// event. Require the complete live sequence only when replay was not
+	// truncated; the persisted-item assertions below verify the resync path.
+	if !bytes.Contains(events, []byte(`"type":"run.resync_required"`)) {
+		for _, eventType := range []string{"turn.started", "text.delta", "turn.committed"} {
+			requireEvent(eventType)
 		}
 	}
 
