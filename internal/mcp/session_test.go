@@ -141,6 +141,10 @@ func TestStartStdioSessionReadWaitCancelClosesServer(t *testing.T) {
 func helperMCPServerConfig(mode string, env map[string]string) config.MCPServerConfig {
 	values := map[string]string{
 		"SAI_MCP_HELPER_PROCESS": "1",
+		// The race runtime otherwise sleeps for one second while exiting. That
+		// exceeds Session.Close's graceful-shutdown window and turns this test's
+		// normal exit into a signal-based kill on Unix.
+		"GORACE": "atexit_sleep_ms=0",
 	}
 	for name, value := range env {
 		values[name] = value
