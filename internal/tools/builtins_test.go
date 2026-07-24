@@ -393,6 +393,37 @@ func TestGrepFilesLiteralDefaultAndCaseSensitivity(t *testing.T) {
 	}
 }
 
+func TestGrepFilesSearchesSingleFilePath(t *testing.T) {
+	root := t.TempDir()
+	mkdirTestDir(t, filepath.Join(root, "nested"))
+	writeTestFile(t, filepath.Join(root, "other.txt"), "needle outside target\n")
+	writeTestFile(t, filepath.Join(root, "nested", "target.txt"), "needle inside target\n")
+
+	registry := registerBuiltinsForTest(t, root)
+	result, err := registry.Execute(context.Background(), BuiltinGrepFiles, map[string]any{
+		"path":  "nested/target.txt",
+		"query": "needle",
+	})
+	if err != nil {
+		t.Fatalf("Execute(grep_files file) error = %v", err)
+	}
+	if got, want := result.Content, "nested/target.txt:1:needle inside target"; got != want {
+		t.Fatalf("Execute(grep_files file) content = %q, want %q", got, want)
+	}
+
+	result, err = registry.Execute(context.Background(), BuiltinGrepFiles, map[string]any{
+		"path":    "nested/target.txt",
+		"query":   "needle",
+		"exclude": []any{"nested/target.txt"},
+	})
+	if err != nil {
+		t.Fatalf("Execute(grep_files excluded file) error = %v", err)
+	}
+	if result.Content != "" {
+		t.Fatalf("Execute(grep_files excluded file) content = %q, want empty", result.Content)
+	}
+}
+
 func TestGrepFilesRegexIncludeExcludeAndContext(t *testing.T) {
 	root := t.TempDir()
 	writeTestFile(t, filepath.Join(root, "a.txt"), "before\nabc123\nafter\n")

@@ -203,13 +203,13 @@ func globFilesDefinition() model.Tool {
 func grepFilesDefinition() model.Tool {
 	return model.Tool{
 		Name:        BuiltinGrepFiles,
-		Description: "Search workspace text files and return path:line:snippet matches.",
+		Description: "Search workspace text files and return path:line:snippet matches. The path may identify either a directory or one text file.",
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
 				"path": map[string]any{
 					"type":        "string",
-					"description": "Directory path relative to the workspace to search from. Defaults to the workspace root.",
+					"description": "File or directory path relative to the workspace to search. Defaults to the workspace root.",
 				},
 				"query": map[string]any{
 					"type":        "string",
@@ -218,12 +218,12 @@ func grepFilesDefinition() model.Tool {
 				"include": map[string]any{
 					"type":        "array",
 					"items":       map[string]any{"type": "string"},
-					"description": "Optional slash-style glob patterns to include, relative to path.",
+					"description": "Optional slash-style glob patterns to include. They are relative to path for directory searches and to the workspace for a file search.",
 				},
 				"exclude": map[string]any{
 					"type":        "array",
 					"items":       map[string]any{"type": "string"},
-					"description": "Optional slash-style glob patterns to exclude, relative to path.",
+					"description": "Optional slash-style glob patterns to exclude. They are relative to path for directory searches and to the workspace for a file search.",
 				},
 				"regex": map[string]any{
 					"type":        "boolean",
@@ -589,14 +589,20 @@ func newGrepFilesExecutor(rootDir string) Executor {
 		if err != nil {
 			return model.ToolResult{}, fmt.Errorf("stat path %q: %w", searchPath, err)
 		}
-		if !info.IsDir() {
-			return model.ToolResult{}, fmt.Errorf("path %q is not a directory", searchPath)
-		}
-
-		gitIgnore := newGitIgnoreMatcher(rootDir)
-		files, err := grepCandidateFiles(ctx, rootDir, searchRoot, include, exclude, gitIgnore)
-		if err != nil {
-			return model.ToolResult{}, err
+		var files []grepCandidateFile
+		if info.IsDir() {
+			gitIgnore := newGitIgnoreMatcher(rootDir)
+			files, err = grepCandidateFiles(ctx, rootDir, searchRoot, include, exclude, gitIgnore)
+			if err != nil {
+				return model.ToolResult{}, err
+			}
+		} else if info.Mode().IsRegular() {
+			files, err = grepSingleCandidateFile(rootDir, searchRoot, include, exclude)
+			if err != nil {
+				return model.ToolResult{}, err
+			}
+		} else {
+			return model.ToolResult{}, fmt.Errorf("path %q is not a regular file or directory", searchPath)
 		}
 
 		lines := []string{}
@@ -1126,6 +1132,32 @@ func slashRel(base, target string) (string, error) {
 type grepCandidateFile struct {
 	absolute     string
 	workspaceRel string
+}
+
+func grepSingleCandidateFile(rootDir, file string, include, exclude []string) ([]grepCandidateFile, error) {
+	workspaceRel, err := slashRel(rootDir, file)
+	if err != nil {
+		return nil, err
+	}
+	if len(include) > 0 {
+		matched, err := matchAnySlashGlob(include, workspaceRel)
+		if err != nil {
+			return nil, err
+		}
+		if !matched {
+			return nil, nil
+		}
+	}
+	if len(exclude) > 0 {
+		matched, err := matchAnySlashGlob(exclude, workspaceRel)
+		if err != nil {
+			return nil, err
+		}
+		if matched {
+			return nil, nil
+		}
+	}
+	return []grepCandidateFile{{absolute: file, workspaceRel: workspaceRel}}, nil
 }
 
 func grepCandidateFiles(ctx context.Context, rootDir, searchRoot string, include, exclude []string, gitIgnore *gitIgnoreMatcher) ([]grepCandidateFile, error) {
