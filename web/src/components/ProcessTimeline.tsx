@@ -100,8 +100,13 @@ function ToolGroupRow({ flats, live }: { flats: FlatProcessStep[]; live: boolean
 			</summary>
 			{expanded && (
 				<div className="tool-group-body">
-					{flats.map(({ step }) => {
-						if (step.kind === 'reasoning') return <ReasoningStep key={step.id} step={step} streaming={false} />
+					{flats.map(({ step }, index) => {
+						if (step.kind === 'reasoning') {
+							// Reasoning still streaming inside a live group renders
+							// expanded and follows new lines, exactly like an
+							// ungrouped streaming reasoning block.
+							return <ReasoningStep key={step.id} step={step} streaming={live && index === flats.length - 1} />
+						}
 						if (step.kind === 'tool') return <ToolRow key={step.id} tool={step} />
 						return null
 					})}
