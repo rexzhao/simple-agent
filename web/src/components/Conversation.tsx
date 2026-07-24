@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
 import Markdown from 'react-markdown'
 import type { Components } from 'react-markdown'
 import remarkGfm from 'remark-gfm'
@@ -27,7 +27,7 @@ export function Conversation(props: {
 	onDraftClear: () => void
 	otherSessionsRunning: boolean
 	recentStepsByTurn: Record<string, RunStep[]>
-  onLoadOlder: () => void
+  onLoadOlder: () => Promise<boolean>
   onSend: (content: string, images: PastedImageAttachment[]) => Promise<boolean>
   onCancel: () => void
   onRemoveQueuedPrompt: (promptID: string) => void
@@ -35,7 +35,17 @@ export function Conversation(props: {
 }) {
   const bottomRef = useRef<HTMLDivElement>(null)
 	const messagesRef = useRef<HTMLElement>(null)
+	const loadOlderRef = useRef<HTMLButtonElement>(null)
 	const followOutputRef = useRef(true)
+	const loadingOlderRef = useRef(false)
+	const prependAnchorRef = useRef<{
+		sessionID: string
+		scrollHeight: number
+		scrollTop: number
+		oldestSeq: number
+		itemCount: number
+	} | null>(null)
+	const [loadingOlder, setLoadingOlder] = useState(false)
 	useEffect(() => {
 		followOutputRef.current = true
 		bottomRef.current?.scrollIntoView({ behavior: 'auto' })
@@ -48,6 +58,47 @@ export function Conversation(props: {
 		if (!messages) return
 		followOutputRef.current = messages.scrollHeight - messages.scrollTop - messages.clientHeight <= autoScrollThresholdPX
 	}
+	const loadOlder = useCallback(async () => {
+		const messages = messagesRef.current
+		if (!messages || loadingOlderRef.current || !props.page?.has_more_before) return
+		loadingOlderRef.current = true
+		setLoadingOlder(true)
+		prependAnchorRef.current = {
+			sessionID: props.detail?.id ?? '',
+			scrollHeight: messages.scrollHeight,
+			scrollTop: messages.scrollTop,
+			oldestSeq: props.page.oldest_seq,
+			itemCount: props.page.items.length,
+		}
+		try {
+			if (!await props.onLoadOlder()) prependAnchorRef.current = null
+		} finally {
+			loadingOlderRef.current = false
+			setLoadingOlder(false)
+		}
+	}, [props.detail?.id, props.onLoadOlder, props.page])
+	useLayoutEffect(() => {
+		const anchor = prependAnchorRef.current
+		const messages = messagesRef.current
+		if (!anchor || !messages) return
+		if (anchor.sessionID !== (props.detail?.id ?? '')) {
+			prependAnchorRef.current = null
+			return
+		}
+		if (anchor.oldestSeq === props.page?.oldest_seq && anchor.itemCount === (props.page?.items.length ?? 0) && props.page?.has_more_before) return
+		messages.scrollTop = anchor.scrollTop + messages.scrollHeight - anchor.scrollHeight
+		prependAnchorRef.current = null
+	}, [props.detail?.id, props.page?.has_more_before, props.page?.items.length, props.page?.oldest_seq])
+	useEffect(() => {
+		const messages = messagesRef.current
+		const button = loadOlderRef.current
+		if (!messages || !button || loadingOlder || !props.page?.has_more_before || typeof IntersectionObserver === 'undefined') return
+		const observer = new IntersectionObserver((entries) => {
+			if (entries.some((entry) => entry.isIntersecting)) void loadOlder()
+		}, { root: messages, threshold: 0.01 })
+		observer.observe(button)
+		return () => observer.disconnect()
+	}, [loadOlder, loadingOlder, props.page?.has_more_before])
 	const visibleItems = props.activeRun?.turnID
 		? (props.page?.items ?? []).filter((item) =>
 			item.turn_id !== props.activeRun?.turnID || (props.activeRun?.restored && item.message?.role === 'user'))
@@ -71,7 +122,7 @@ export function Conversation(props: {
         </div>
       </header>
       <section ref={messagesRef} className="messages" aria-live="polite" onScroll={updateFollowOutput}>
-        {props.page?.has_more_before && <button className="load-older" onClick={props.onLoadOlder}>Load earlier messages</button>}
+        {props.page?.has_more_before && <button ref={loadOlderRef} className="load-older" disabled={loadingOlder} onClick={() => void loadOlder()}>{loadingOlder ? 'Loading earlier messages…' : 'Load earlier messages'}</button>}
         {!props.page && <MessageSkeleton />}
 				{buildConversationEntries(visibleItems, props.detail?.id ?? '', props.recentStepsByTurn).map((entry) => entry.kind === 'message'
 					? <Message key={entry.item.id} item={entry.item} sessionID={props.detail?.id ?? ''} />

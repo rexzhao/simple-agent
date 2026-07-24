@@ -300,21 +300,29 @@ function App() {
     }
   }
 
-  const loadOlder = async () => {
-    if (!selectedSessionID || !itemsPage?.has_more_before || !itemsPage.oldest_seq) return
+  const loadOlder = useCallback(async (): Promise<boolean> => {
+    if (!selectedSessionID || !itemsPage?.has_more_before || !itemsPage.oldest_seq) return false
+    const sessionID = selectedSessionID
+    const oldestSeq = itemsPage.oldest_seq
     try {
-      const older = await api.items(selectedSessionID, itemsPage.oldest_seq)
-      setItemsPage({
-        items: [...older.items, ...itemsPage.items],
-        oldest_seq: older.oldest_seq,
-        newest_seq: itemsPage.newest_seq,
-        has_more_before: older.has_more_before,
-        has_more_after: false,
+      const older = await api.items(sessionID, oldestSeq)
+      if (selectedSessionRef.current !== sessionID) return false
+      setItemsPage((current) => {
+        if (!current || current.oldest_seq !== oldestSeq) return current
+        return {
+          items: [...older.items, ...current.items],
+          oldest_seq: older.oldest_seq,
+          newest_seq: current.newest_seq,
+          has_more_before: older.has_more_before,
+          has_more_after: false,
+        }
       })
+      return true
     } catch (reason) {
       setError(errorMessage(reason))
+      return false
     }
-  }
+  }, [itemsPage, selectedSessionID])
 
   const handleRunEvent = useCallback(async (sessionID: string, runID: string, event: RunEvent) => {
     const update = (updater: (run: ActiveRun) => ActiveRun | null) => updateActiveRun(sessionID, runID, updater)
@@ -573,7 +581,7 @@ function App() {
 			onDraftClear={() => clearDraft(selectedSessionID)}
 			otherSessionsRunning={otherSessionsRunning}
 					recentStepsByTurn={recentStepsByTurn}
-            onLoadOlder={() => void loadOlder()}
+            onLoadOlder={loadOlder}
             onSend={(content, images) => sendMessage(content, images)}
             onCancel={() => void cancelRun()}
             onRemoveQueuedPrompt={(promptID) => void removeQueuedPrompt(promptID)}
