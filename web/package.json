@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "vite",
     "check": "tsc --noEmit",
+    "test": "vitest run",
     "build": "tsc --noEmit && vite build"
   },
   "dependencies": {
@@ -15,10 +16,14 @@
     "remark-gfm": "^4.0.1"
   },
   "devDependencies": {
+    "@testing-library/jest-dom": "^7.0.0",
+    "@testing-library/react": "^16.3.2",
     "@types/react": "19.2.14",
     "@types/react-dom": "19.2.3",
     "@vitejs/plugin-react": "6.0.4",
+    "jsdom": "^29.1.1",
     "typescript": "7.0.2",
-    "vite": "8.1.5"
+    "vite": "8.1.5",
+    "vitest": "^4.1.10"
   }
 }

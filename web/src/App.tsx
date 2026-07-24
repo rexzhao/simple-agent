@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { api, streamRun } from './api'
-import type { ActiveRun, ActiveRunDescriptor, Bootstrap, ImageAttachmentInput, ItemsPage, Project, QueuedPrompt, RunEvent, RunStep, Session, SessionModelOption } from './types'
+import type { ActiveRun, ActiveRunDescriptor, Bootstrap, ImageAttachmentInput, ItemsPage, Project, RunEvent, RunStep, Session, SessionModelOption } from './types'
 import { errorMessage } from './lib/format'
-import { appendModelOutput, appendReasoning, updateToolStep } from './lib/runSteps'
+import { reduceRunEvent } from './lib/runEventReducer'
 import { modelKey, orderSessions, processKey, sessionName } from './lib/session'
 import { Composer, emptyComposerDraft, maxPastedImageAttachments } from './components/Composer'
 import type { ComposerDraft, PastedImageAttachment, PastedTextAttachment } from './components/Composer'
@@ -328,68 +328,16 @@ function App() {
     const update = (updater: (run: ActiveRun) => ActiveRun | null) => updateActiveRun(sessionID, runID, updater)
     switch (event.type) {
       case 'turn.started':
-        update((run) => ({ ...run, turnID: String(event.turn_id ?? '') }))
-        break
       case 'run.prompt_queue':
-        update((run) => ({
-          ...run,
-          queuedPrompts: Array.isArray(event.prompts)
-            ? event.prompts
-                .map((prompt) => (prompt && typeof prompt === 'object' ? { id: String((prompt as QueuedPrompt).id ?? ''), content: String((prompt as QueuedPrompt).content ?? '') } : null))
-                .filter((prompt): prompt is QueuedPrompt => Boolean(prompt && prompt.id))
-            : [],
-        }))
-        break
       case 'run.prompt_appended':
-        update((run) => {
-          const prompts = Array.isArray(event.prompts) ? event.prompts.map(String).filter((text) => text.trim()) : []
-          if (prompts.length === 0) return run
-          const iteration = run.agentIteration > 0 ? run.agentIteration : 1
-          const steps = [...run.steps]
-          prompts.forEach((text, index) => {
-            steps.push({ kind: 'user', id: `appended-${run.id}-${steps.length}-${index}`, text, iteration })
-          })
-          return { ...run, steps }
-        })
-        break
       case 'agent.iteration.started':
-        update((run) => {
-          const agentIteration = Number(event.agent_iteration ?? 0)
-          if (agentIteration <= 0) return run
-          return {
-            ...run,
-            agentIteration,
-            assistantText: '',
-            steps: appendModelOutput(run.steps, run.assistantText, run.agentIteration),
-          }
-        })
-        break
       case 'text.delta':
-        update((run) => ({ ...run, assistantText: run.assistantText + String(event.text ?? '') }))
-        break
       case 'reasoning.delta':
-        update((run) => ({ ...run, steps: appendReasoning(run.steps, String(event.text ?? ''), Number(event.agent_iteration ?? run.agentIteration)) }))
-        break
       case 'tool.requested':
-        update((run) => ({
-          ...run,
-          assistantText: '',
-          steps: updateToolStep(appendModelOutput(run.steps, run.assistantText, Number(event.agent_iteration ?? run.agentIteration)), event, Number(event.agent_iteration ?? run.agentIteration)),
-        }))
-        break
       case 'tool.started':
       case 'tool.finished':
-        update((run) => ({ ...run, steps: updateToolStep(run.steps, event, Number(event.agent_iteration ?? run.agentIteration)) }))
-        break
       case 'usage.updated':
-        update((run) => ({
-          ...run,
-          inputTokens: Number(event.input_tokens ?? 0),
-          totalTokens: Number(event.total_tokens ?? 0),
-          cachedTokens: Number(event.cached_tokens ?? 0),
-          cacheWriteTokens: Number(event.cache_write_tokens ?? 0),
-          reasoningTokens: Number(event.reasoning_tokens ?? 0),
-        }))
+        update((run) => reduceRunEvent(run, event))
         break
       case 'run.resync_required':
         try {
@@ -399,7 +347,7 @@ function App() {
         }
         break
       case 'turn.failed':
-        update((run) => ({ ...run, status: 'failed', error: String(event.message ?? 'Run failed') }))
+        update((run) => reduceRunEvent(run, event))
         setError(String(event.message ?? 'Run failed'))
         break
       case 'run.settled': {
