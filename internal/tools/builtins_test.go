@@ -833,12 +833,6 @@ func TestBuiltinArgumentErrorsAreReadable(t *testing.T) {
 			wantErr: "path must be a string",
 		},
 		{
-			name:    "list files blank path",
-			tool:    BuiltinListFiles,
-			args:    map[string]any{"path": ""},
-			wantErr: "path must not be blank",
-		},
-		{
 			name:    "read file missing path",
 			tool:    BuiltinReadFile,
 			args:    map[string]any{},
@@ -1205,6 +1199,33 @@ func TestListFilesDefaultsToRoot(t *testing.T) {
 	}
 	if result.Content != "root.txt" {
 		t.Fatalf("Execute(list_files) content = %q, want root.txt", result.Content)
+	}
+}
+
+func TestWorkspaceSearchToolsTreatBlankPathAsRoot(t *testing.T) {
+	root := t.TempDir()
+	writeTestFile(t, filepath.Join(root, "root.txt"), "find me")
+	registry := registerBuiltinsForTest(t, root)
+
+	tests := []struct {
+		name      string
+		arguments map[string]any
+		want      string
+	}{
+		{BuiltinListFiles, map[string]any{"path": ""}, "root.txt"},
+		{BuiltinGlobFiles, map[string]any{"path": " ", "pattern": "*.txt"}, "root.txt"},
+		{BuiltinGrepFiles, map[string]any{"path": "\t", "query": "find me"}, "root.txt:1:find me"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, err := registry.Execute(context.Background(), tt.name, tt.arguments)
+			if err != nil {
+				t.Fatalf("Execute(%s) error = %v", tt.name, err)
+			}
+			if result.Content != tt.want {
+				t.Fatalf("Execute(%s) content = %q, want %q", tt.name, result.Content, tt.want)
+			}
+		})
 	}
 }
 

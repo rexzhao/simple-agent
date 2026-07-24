@@ -1312,7 +1312,7 @@ func optionalStringArgument(arguments map[string]any, name string, defaultValue 
 		return "", fmt.Errorf("%s must be a string", name)
 	}
 	if strings.TrimSpace(text) == "" {
-		return "", fmt.Errorf("%s must not be blank", name)
+		return defaultValue, nil
 	}
 	return text, nil
 }
