@@ -55,14 +55,15 @@ export function ProcessTimeline({ steps, live = false }: { steps: RunStep[]; liv
 }
 
 // ToolGroupRow renders a folded run of consecutive tool calls as one
-// aggregated row. The row stays expanded while it is the live in-flight tail,
-// collapses once the run moves on, and re-expands whenever a member tool
-// fails. Reasoning steps inside the run stay individually collapsed.
+// aggregated row. The row stays expanded while it is the live in-flight tail
+// — even between tool batches — and collapses only once a run-breaking step
+// seals it or the run settles. It re-expands whenever a member tool fails.
+// Reasoning steps inside the run stay individually collapsed.
 function ToolGroupRow({ flats, live }: { flats: FlatProcessStep[]; live: boolean }) {
 	const tools = flats.map((flat) => flat.step).filter((step): step is ToolActivity => step.kind === 'tool')
 	const failed = tools.filter((tool) => tool.status === 'error').length
 	const pending = tools.filter((tool) => tool.status === 'requested' || tool.status === 'running').length
-	const active = live && pending > 0
+	const active = live
 	const hasError = failed > 0
 	const [expanded, setExpanded] = useState(active || hasError)
 	useEffect(() => {
@@ -76,7 +77,12 @@ function ToolGroupRow({ flats, live }: { flats: FlatProcessStep[]; live: boolean
 		setExpanded(event.currentTarget.open)
 	}
 
-	const markerIteration = flats.find((flat) => flat.iterationStart)?.iteration
+	// A group spanning iterations is marked with the latest iteration it
+	// contains, so the marker tracks progress instead of the run's origin.
+	let markerIteration: number | undefined
+	for (const flat of flats) {
+		if (flat.iterationStart) markerIteration = flat.iteration
+	}
 	const status = hasError ? 'error' : pending > 0 ? 'running' : 'finished'
 	const badge = hasError ? `${failed} failed` : pending > 0 ? `${tools.length - pending}/${tools.length}` : 'Done'
 	const summary = toolGroupSummary(tools)
