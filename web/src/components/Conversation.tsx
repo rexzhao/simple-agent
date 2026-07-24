@@ -4,13 +4,13 @@ import type { Components } from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { api } from '../api'
 import type { ActiveRun, ItemsPage, QueuedPrompt, RunStep, Session, SessionImageAttachment, SessionItem, ToolActivity } from '../types'
-import { blobAsDataURL, copyText, formatTime, formatTokenCount } from '../lib/format'
+import { blobAsDataURL, copyText, formatTokenCount } from '../lib/format'
 import { itemText, processKey, sessionName } from '../lib/session'
 import { Composer } from './Composer'
 import type { ComposerDraft, PastedImageAttachment, PastedTextAttachment } from './Composer'
 import { MessageSkeleton } from './misc'
 import { ProcessTimeline } from './ProcessTimeline'
-import { CopyIcon, LogoIcon, SparkIcon } from './icons'
+import { CopyIcon, SparkIcon } from './icons'
 
 const autoScrollThresholdPX = 160
 
@@ -74,7 +74,7 @@ export function Conversation(props: {
         {props.page?.has_more_before && <button className="load-older" onClick={props.onLoadOlder}>Load earlier messages</button>}
         {!props.page && <MessageSkeleton />}
 				{buildConversationEntries(visibleItems, props.detail?.id ?? '', props.recentStepsByTurn).map((entry) => entry.kind === 'message'
-					? <Message key={entry.item.id} item={entry.item} sessionID={props.detail?.id ?? ''} suppressAvatar={Boolean(entry.suppressAvatar)} />
+					? <Message key={entry.item.id} item={entry.item} sessionID={props.detail?.id ?? ''} />
 					: <HistoricalProcess key={entry.id} entry={entry} />)}
         {props.activeRun && <ActiveRunView run={props.activeRun} />}
 		{props.page && visibleItems.length === 0 && !props.activeRun && (
@@ -145,7 +145,7 @@ function ContextUsage(props: { context: Session['context']; activeInputTokens?: 
 	)
 }
 
-function Message({ item, sessionID, suppressAvatar = false }: { item: SessionItem; sessionID: string; suppressAvatar?: boolean }) {
+function Message({ item, sessionID }: { item: SessionItem; sessionID: string }) {
   const role = item.message?.role
   const text = item.message?.content?.inline || item.message?.content?.preview || ''
   const images = item.message?.images ?? []
@@ -162,10 +162,8 @@ function Message({ item, sessionID, suppressAvatar = false }: { item: SessionIte
 		}
 	}
   return (
-    <article className={`message ${role === 'user' ? 'user' : 'assistant'}${suppressAvatar ? ' no-avatar' : ''}`}>
-      <div className="message-avatar">{role === 'user' ? 'You' : <LogoIcon />}</div>
+    <article className={`message ${role === 'user' ? 'user' : 'assistant'}`}>
       <div className="message-content">
-        <div className="message-meta"><strong>{role === 'user' ? 'You' : 'SAI'}</strong><time>{formatTime(item.created_at)}</time></div>
         {role === 'user' && text && <div className="message-text">{text}</div>}
         {role === 'user' && images.length > 0 && <StoredImageAttachments sessionID={sessionID} images={images} />}
         {role !== 'user' && text && <MarkdownMessage text={text} />}
@@ -237,9 +235,7 @@ function ActiveRunView({ run }: { run: ActiveRun }) {
     <>
       {(run.userText || (run.userImages?.length ?? 0) > 0) && (
         <article className="message user transient">
-          <div className="message-avatar">You</div>
           <div className="message-content">
-            <div className="message-meta"><strong>You</strong><span>just now</span></div>
             {run.userText && <div className="message-text">{run.userText}</div>}
             {(run.userImages?.length ?? 0) > 0 && (
               <div className="message-image-grid" aria-label="Attached images">
@@ -290,9 +286,7 @@ function ActiveRunBody({ run }: { run: ActiveRun }) {
         if (segment.kind === 'user') {
           return (
             <article className="message user transient" key={segment.step.id}>
-              <div className="message-avatar">You</div>
               <div className="message-content">
-                <div className="message-meta"><strong>You</strong></div>
                 <div className="message-text">{segment.step.text}</div>
               </div>
             </article>
@@ -300,9 +294,8 @@ function ActiveRunBody({ run }: { run: ActiveRun }) {
         }
         return (
           <article className="message assistant transient" key={`steps-${index}`}>
-            <div className="message-avatar"><LogoIcon /></div>
             <div className="message-content">
-              {index === 0 && <div className="message-meta"><strong>SAI</strong><span className="streaming-label"><i />Generating</span></div>}
+              {isLast && <div className="message-meta"><span className="streaming-label"><i />Generating</span></div>}
               <ProcessTimeline steps={segment.steps} />
               {isLast && trailing && (run.assistantText ? <MarkdownMessage text={run.assistantText} streaming /> : <div className="message-text assistant-stream"><span className="cursor" /></div>)}
               {isLast && tokenNote}
@@ -327,7 +320,7 @@ function MarkdownMessage({ text, streaming = false }: { text: string; streaming?
 }
 
 type ConversationEntry =
-	| { kind: 'message'; item: SessionItem; suppressAvatar?: boolean }
+	| { kind: 'message'; item: SessionItem }
 	| { kind: 'process'; id: string; createdAt: string; steps: RunStep[] }
 
 function buildConversationEntries(items: SessionItem[], sessionID: string, recentStepsByTurn: Record<string, RunStep[]>): ConversationEntry[] {
@@ -410,33 +403,12 @@ function buildConversationEntries(items: SessionItem[], sessionID: string, recen
 		if (text) entries.push({ kind: 'message', item })
 	}
 	flushProcess(processTurnID)
-	return withSuppressedAvatars(entries)
-}
-
-// withSuppressedAvatars marks assistant messages whose immediately preceding
-// visible entry is also assistant-side (an assistant message or a process
-// card). A process card already carries the assistant avatar, so a directly
-// following assistant message repeats it unless a user message in between
-// switched the visible role back to the user.
-function withSuppressedAvatars(entries: ConversationEntry[]): ConversationEntry[] {
-	let previousRole: 'user' | 'assistant' | null = null
-	return entries.map((entry) => {
-		const role: 'user' | 'assistant' = entry.kind === 'process'
-			? 'assistant'
-			: entry.item.message?.role === 'user' ? 'user' : 'assistant'
-		const suppress = role === 'assistant' && previousRole === 'assistant'
-		previousRole = role
-		if (entry.kind === 'message' && suppress) {
-			return { ...entry, suppressAvatar: true }
-		}
-		return entry
-	})
+	return entries
 }
 
 function HistoricalProcess({ entry }: { entry: Extract<ConversationEntry, { kind: 'process' }> }) {
 	return (
 		<article className="message assistant process-message">
-			<div className="message-avatar"><LogoIcon /></div>
 			<div className="message-content">
 				<ProcessTimeline steps={entry.steps} />
 			</div>

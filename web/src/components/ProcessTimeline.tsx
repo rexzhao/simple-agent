@@ -34,12 +34,10 @@ export function ProcessTimeline({ steps }: { steps: RunStep[] }) {
 							}
 							if (step.kind === 'user') {
 								// A mid-turn appended message renders like a regular user
-								// message: avatar and name on the right, plain text.
+								// message: light bubble on the right.
 								return (
 									<article className="message user step-message" key={step.id}>{marker}
-										<div className="message-avatar">You</div>
 										<div className="message-content">
-											<div className="message-meta"><strong>You</strong></div>
 											<div className="message-text">{step.text}</div>
 										</div>
 									</article>
