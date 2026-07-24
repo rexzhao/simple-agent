@@ -14,17 +14,19 @@ import (
 )
 
 type ProviderConfig struct {
-	BaseURL     string
-	APIKey      string
-	HTTPClient  *http.Client
-	HTTPOptions httpstream.Options
+	BaseURL       string
+	APIKey        string
+	Compatibility string
+	HTTPClient    *http.Client
+	HTTPOptions   httpstream.Options
 }
 
 type Provider struct {
-	baseURL     string
-	apiKey      string
-	httpClient  *http.Client
-	httpOptions httpstream.Options
+	baseURL       string
+	apiKey        string
+	compatibility chatCompatibility
+	httpClient    *http.Client
+	httpOptions   httpstream.Options
 }
 
 var _ model.Provider = (*Provider)(nil)
@@ -34,6 +36,10 @@ func NewProvider(config ProviderConfig) (*Provider, error) {
 	if baseURL == "" {
 		return nil, fmt.Errorf("base URL is required")
 	}
+	compatibility, err := resolveCompatibility(config.Compatibility)
+	if err != nil {
+		return nil, err
+	}
 
 	httpClient := config.HTTPClient
 	if httpClient == nil {
@@ -41,10 +47,11 @@ func NewProvider(config ProviderConfig) (*Provider, error) {
 	}
 
 	return &Provider{
-		baseURL:     baseURL,
-		apiKey:      strings.TrimSpace(config.APIKey),
-		httpClient:  httpClient,
-		httpOptions: config.HTTPOptions,
+		baseURL:       baseURL,
+		apiKey:        strings.TrimSpace(config.APIKey),
+		compatibility: compatibility,
+		httpClient:    httpClient,
+		httpOptions:   config.HTTPOptions,
 	}, nil
 }
 
@@ -54,7 +61,7 @@ func (p *Provider) Stream(ctx context.Context, request model.Request) (<-chan mo
 		return nil, err
 	}
 
-	body, err := BuildRequestBody(request, true)
+	body, err := buildRequestBody(request, true, p.compatibility)
 	if err != nil {
 		return nil, fmt.Errorf("build OpenAI chat request body: %w", err)
 	}
@@ -81,7 +88,7 @@ func (p *Provider) Stream(ctx context.Context, request model.Request) (<-chan mo
 	go func() {
 		defer close(events)
 		defer response.Body.Close()
-		streamResponseEvents(ctx, response.Body, p.httpOptions.WithDefaults().StreamIdleTimeout, events)
+		streamResponseEvents(ctx, response.Body, p.httpOptions.WithDefaults().StreamIdleTimeout, p.compatibility, events)
 	}()
 	return events, nil
 }
@@ -93,8 +100,8 @@ func (p *Provider) apiKeyValue() (string, error) {
 	return "", fmt.Errorf("API key is required")
 }
 
-func streamResponseEvents(ctx context.Context, body io.Reader, idleTimeout time.Duration, events chan<- model.Event) {
-	decoder := newStreamEventDecoder()
+func streamResponseEvents(ctx context.Context, body io.Reader, idleTimeout time.Duration, compatibility chatCompatibility, events chan<- model.Event) {
+	decoder := newStreamEventDecoderWithCompatibility(compatibility)
 	err := httpstream.ReadSSEFrames(ctx, body, idleTimeout, func(frame []byte) bool {
 		return emitSSEFrame(decoder, frame, events)
 	})

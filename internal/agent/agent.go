@@ -113,16 +113,17 @@ func run(ctx context.Context, request model.Request, options Options, maxTurns i
 		request.Messages = messages
 		events <- model.AgentIterationStartedEvent{Iteration: iteration}
 
-		assistantContent, toolCalls, responseState, stopped := streamModelTurn(ctx, options.Provider, request, events)
+		assistantContent, reasoningContent, toolCalls, responseState, stopped := streamModelTurn(ctx, options.Provider, request, events)
 		if stopped {
 			return
 		}
 
 		assistantMessage := model.Message{
-			Role:          model.MessageRoleAssistant,
-			Content:       assistantContent,
-			ToolCalls:     toolCalls,
-			ResponseState: responseState,
+			Role:             model.MessageRoleAssistant,
+			Content:          assistantContent,
+			ReasoningContent: reasoningContent,
+			ToolCalls:        toolCalls,
+			ResponseState:    responseState,
 		}
 		if len(toolCalls) == 0 && strings.TrimSpace(assistantContent) == "" {
 			events <- model.ErrorEvent{Err: fmt.Errorf("agent returned empty final response")}
@@ -253,20 +254,23 @@ func copyMessages(messages []model.Message) []model.Message {
 	return copied
 }
 
-func streamModelTurn(ctx context.Context, provider model.Provider, request model.Request, out chan<- model.Event) (string, []model.ToolCall, *model.ResponseState, bool) {
+func streamModelTurn(ctx context.Context, provider model.Provider, request model.Request, out chan<- model.Event) (string, string, []model.ToolCall, *model.ResponseState, bool) {
 	stream, err := provider.Stream(ctx, request)
 	if err != nil {
 		out <- model.ErrorEvent{Err: err, Message: "request model"}
-		return "", nil, nil, true
+		return "", "", nil, nil, true
 	}
 
 	var assistantContent strings.Builder
+	var reasoningContent strings.Builder
 	var toolCalls []model.ToolCall
 	var responseState *model.ResponseState
 	for event := range stream {
 		switch event := event.(type) {
 		case model.TextDeltaEvent:
 			assistantContent.WriteString(event.Text)
+		case model.ReasoningDeltaEvent:
+			reasoningContent.WriteString(event.Text)
 		case model.ToolCallDoneEvent:
 			toolCalls = append(toolCalls, event.ToolCall)
 		case model.ResponseStateEvent:
@@ -275,11 +279,11 @@ func streamModelTurn(ctx context.Context, provider model.Provider, request model
 			continue
 		case model.ErrorEvent:
 			out <- event
-			return assistantContent.String(), nil, nil, true
+			return assistantContent.String(), reasoningContent.String(), nil, nil, true
 		}
 		out <- event
 	}
-	return assistantContent.String(), toolCalls, responseState, false
+	return assistantContent.String(), reasoningContent.String(), toolCalls, responseState, false
 }
 
 func copyResponseState(state model.ResponseState) model.ResponseState {

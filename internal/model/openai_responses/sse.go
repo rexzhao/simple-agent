@@ -412,14 +412,13 @@ func isReasoningDeltaEvent(eventType string) bool {
 }
 
 func usageFromResponse(usage *responseUsage) model.Usage {
-	return model.Usage{
-		InputTokens:      usage.InputTokens,
-		OutputTokens:     usage.OutputTokens,
-		TotalTokens:      usage.TotalTokens,
-		CachedTokens:     usage.InputTokensDetails.CachedTokens,
-		CacheWriteTokens: usage.InputTokensDetails.CacheWriteTokens,
-		ReasoningTokens:  usage.OutputTokensDetails.ReasoningTokens,
-	}
+	return model.UsageFromInclusiveInput(
+		usage.InputTokens,
+		usage.OutputTokens,
+		usage.InputTokensDetails.CachedTokens,
+		usage.InputTokensDetails.CacheWriteTokens,
+		usage.OutputTokensDetails.ReasoningTokens,
+	)
 }
 
 func responseErrorEvent(message string, responseError *responseError, fallback string) model.ErrorEvent {

@@ -184,7 +184,7 @@ func (r AgentTurnRunner) prepareRuntime(ctx context.Context, session sessions.Se
 	if session.ModelParameters != nil {
 		resolved.Parameters = copyParameterMap(session.ModelParameters)
 	}
-	provider, err := newProviderForRun(resolved.ProviderName, resolved.Type, resolved.Provider)
+	provider, err := newProviderForRun(resolved.ProviderName, resolved.Type, resolved.Compatibility, resolved.Provider)
 	if err != nil {
 		return nil, err
 	}
@@ -653,7 +653,7 @@ func (r *agentRunnerRuntime) planSummaryCompactionCheckpoint(ctx context.Context
 	if err != nil {
 		return compactionPlan{}, err
 	}
-	provider, err := newProviderForRun(summaryModel.ProviderName, summaryModel.Type, summaryModel.Provider)
+	provider, err := newProviderForRun(summaryModel.ProviderName, summaryModel.Type, summaryModel.Compatibility, summaryModel.Provider)
 	if err != nil {
 		return compactionPlan{}, err
 	}
@@ -717,7 +717,7 @@ func (r *agentRunnerRuntime) planRemoteCompactionCheckpoint(ctx context.Context,
 	if err != nil {
 		return compactionPlan{}, err
 	}
-	provider, err := newProviderForRun(resolved.ProviderName, resolved.Type, resolved.Provider)
+	provider, err := newProviderForRun(resolved.ProviderName, resolved.Type, resolved.Compatibility, resolved.Provider)
 	if err != nil {
 		return compactionPlan{}, err
 	}
@@ -1309,14 +1309,14 @@ func closeMCPSessions(sessions []*mcp.Session) error {
 	return nil
 }
 
-func newProviderForRun(providerName, modelType string, provider config.ProviderConfig) (model.Provider, error) {
+func newProviderForRun(providerName, modelType, compatibility string, provider config.ProviderConfig) (model.Provider, error) {
 	httpOptions, err := providerHTTPOptions(provider)
 	if err != nil {
 		return nil, fmt.Errorf("provider %q: %w", providerName, err)
 	}
 	switch modelType {
 	case config.ProviderTypeOpenAIChat:
-		return openaichat.NewProvider(openAIChatProviderConfig(provider, httpOptions))
+		return openaichat.NewProvider(openAIChatProviderConfig(provider, compatibility, httpOptions))
 	case config.ProviderTypeOpenAIResponses:
 		return openairesponses.NewProvider(openAIResponsesProviderConfig(provider, httpOptions))
 	case config.ProviderTypeOpenAICodex:
@@ -1339,11 +1339,12 @@ func providerHTTPOptions(provider config.ProviderConfig) (httpstream.Options, er
 	return httpstream.Options{RequestTimeout: requestTimeout}, nil
 }
 
-func openAIChatProviderConfig(provider config.ProviderConfig, httpOptions httpstream.Options) openaichat.ProviderConfig {
+func openAIChatProviderConfig(provider config.ProviderConfig, compatibility string, httpOptions httpstream.Options) openaichat.ProviderConfig {
 	return openaichat.ProviderConfig{
-		BaseURL:     provider.BaseURL,
-		APIKey:      provider.ResolvedAPIKey,
-		HTTPOptions: httpOptions,
+		BaseURL:       provider.BaseURL,
+		APIKey:        provider.ResolvedAPIKey,
+		Compatibility: compatibility,
+		HTTPOptions:   httpOptions,
 	}
 }
 

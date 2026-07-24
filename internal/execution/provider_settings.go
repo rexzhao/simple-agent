@@ -41,6 +41,7 @@ type ProviderModelSettings struct {
 	Profile         string                 `json:"profile"`
 	ID              string                 `json:"id"`
 	Type            string                 `json:"type"`
+	Compatibility   string                 `json:"compatibility,omitempty"`
 	Input           []string               `json:"input,omitempty"`
 	DeveloperRole   string                 `json:"developer_role,omitempty"`
 	ContextWindow   int                    `json:"context_window,omitempty"`
@@ -166,6 +167,13 @@ func (s *Service) saveProviderSettings(existingName string, input ProviderSettin
 		}
 		modelType := strings.TrimSpace(model.Type)
 		usesCodex = usesCodex || modelType == config.ProviderTypeOpenAICodex
+		compatibility, err := config.NormalizeModelCompatibility(model.Compatibility)
+		if err != nil {
+			return ProviderSettingsDocument{}, fmt.Errorf("model profile %q: %w", profile, err)
+		}
+		if compatibility != "" && modelType != "" && modelType != config.ProviderTypeOpenAIChat {
+			return ProviderSettingsDocument{}, fmt.Errorf("model profile %q: compatibility is only supported for %s models", profile, config.ProviderTypeOpenAIChat)
+		}
 		modelInput := append([]string(nil), model.Input...)
 		if len(modelInput) > 0 {
 			modelInput, err = config.NormalizeModelInput(modelInput)
@@ -180,6 +188,7 @@ func (s *Service) saveProviderSettings(existingName string, input ProviderSettin
 		modelProfile := config.ModelProfile{
 			ID:              strings.TrimSpace(model.ID),
 			Type:            modelType,
+			Compatibility:   compatibility,
 			Input:           modelInput,
 			DeveloperRole:   developerRole,
 			ContextWindow:   model.ContextWindow,
@@ -450,6 +459,7 @@ func providerSettingsFromConfig(providerDir string, provider config.ProviderConf
 			Profile:         profile,
 			ID:              model.ID,
 			Type:            model.Type,
+			Compatibility:   model.Compatibility,
 			Input:           append([]string(nil), model.Input...),
 			DeveloperRole:   model.DeveloperRole,
 			ContextWindow:   model.ContextWindow,

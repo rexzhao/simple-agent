@@ -225,6 +225,82 @@ func TestBuildRequestBodyMapsAssistantToolCallsAndToolMessages(t *testing.T) {
 	}`)
 }
 
+func TestBuildRequestBodyAppliesKimiCompatibility(t *testing.T) {
+	compatibility, err := resolveCompatibility(CompatibilityKimi)
+	if err != nil {
+		t.Fatalf("resolveCompatibility() error = %v", err)
+	}
+	body, err := buildRequestBody(model.Request{
+		Model:     "kimi-k3",
+		SessionID: "session-123",
+		Messages: []model.Message{
+			{Role: model.MessageRoleUser, Content: "Inspect the repository"},
+			{
+				Role:             model.MessageRoleAssistant,
+				ReasoningContent: "I should inspect the files first.",
+				ToolCalls: []model.ToolCall{
+					{ID: "call_1", Name: "list_files", Arguments: `{}`},
+				},
+			},
+			{Role: model.MessageRoleTool, Content: "README.md", ToolCallID: "call_1"},
+		},
+		Parameters: map[string]any{
+			"stream_options": map[string]any{"custom": true},
+		},
+	}, true, compatibility)
+	if err != nil {
+		t.Fatalf("buildRequestBody() error = %v", err)
+	}
+
+	assertJSONEqual(t, body, `{
+		"model": "kimi-k3",
+		"messages": [
+			{"role": "user", "content": "Inspect the repository"},
+			{
+				"role": "assistant",
+				"content": "",
+				"reasoning_content": "I should inspect the files first.",
+				"tool_calls": [{
+					"id": "call_1",
+					"type": "function",
+					"function": {"name": "list_files", "arguments": "{}"}
+				}]
+			},
+			{"role": "tool", "content": "README.md", "tool_call_id": "call_1"}
+		],
+		"stream": true,
+		"prompt_cache_key": "session-123",
+		"stream_options": {"custom": true, "include_usage": true}
+	}`)
+}
+
+func TestBuildRequestBodyPreservesExplicitKimiCacheAndUsageSettings(t *testing.T) {
+	compatibility, err := resolveCompatibility(CompatibilityKimi)
+	if err != nil {
+		t.Fatalf("resolveCompatibility() error = %v", err)
+	}
+	body, err := buildRequestBody(model.Request{
+		Model:     "kimi-k3",
+		SessionID: "session-123",
+		Messages:  []model.Message{{Role: model.MessageRoleUser, Content: "Hello"}},
+		Parameters: map[string]any{
+			"prompt_cache_key": "configured-key",
+			"stream_options":   map[string]any{"include_usage": false},
+		},
+	}, true, compatibility)
+	if err != nil {
+		t.Fatalf("buildRequestBody() error = %v", err)
+	}
+
+	assertJSONEqual(t, body, `{
+		"model": "kimi-k3",
+		"messages": [{"role": "user", "content": "Hello"}],
+		"stream": true,
+		"prompt_cache_key": "configured-key",
+		"stream_options": {"include_usage": false}
+	}`)
+}
+
 func assertJSONEqual(t *testing.T, got []byte, want string) {
 	t.Helper()
 

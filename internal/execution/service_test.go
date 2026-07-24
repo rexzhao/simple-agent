@@ -77,7 +77,7 @@ func TestPublishCompactionUsagePublishesModelUsageEvent(t *testing.T) {
 	defer bus.Close()
 	events := bus.SubscribeLossless(1)
 	usage := model.Usage{
-		InputTokens: 1200, OutputTokens: 80, TotalTokens: 1280,
+		InputTokens: 100, OutputTokens: 80, TotalTokens: 1280,
 		CachedTokens: 900, CacheWriteTokens: 200, ReasoningTokens: 64,
 	}
 

@@ -921,6 +921,10 @@ models:
   estimated:
     id: model-estimated
     max_tokens: 32
+  compatible:
+    id: kimi-k3
+    type: openai-chat
+    compatibility: kimi
 `)
 
 	cfg, err := Load(rootConfigPath(dir))
@@ -1003,6 +1007,21 @@ models:
 	if resolved.Type != ProviderTypeOpenAIChat {
 		t.Fatalf("resolved.Type = %q, want default %q", resolved.Type, ProviderTypeOpenAIChat)
 	}
+
+	compatible := cfg.Providers["fake"].Models["compatible"]
+	if compatible.Compatibility != ModelCompatibilityKimi {
+		t.Fatalf("compatible.Compatibility = %q, want %q", compatible.Compatibility, ModelCompatibilityKimi)
+	}
+	if _, ok := compatible.Parameters["compatibility"]; ok {
+		t.Fatal("compatible.Parameters unexpectedly contains compatibility")
+	}
+	resolved, err = cfg.ResolveModel("fake", "compatible")
+	if err != nil {
+		t.Fatalf("ResolveModel(compatible) error = %v", err)
+	}
+	if resolved.Compatibility != ModelCompatibilityKimi {
+		t.Fatalf("resolved.Compatibility = %q, want %q", resolved.Compatibility, ModelCompatibilityKimi)
+	}
 }
 
 func TestNormalizeDeveloperRole(t *testing.T) {
@@ -1028,6 +1047,29 @@ func TestNormalizeDeveloperRole(t *testing.T) {
 	}
 }
 
+func TestNormalizeModelCompatibility(t *testing.T) {
+	for _, test := range []struct {
+		value any
+		want  string
+		ok    bool
+	}{
+		{value: nil, want: "", ok: true},
+		{value: "", want: "", ok: true},
+		{value: " KIMI ", want: ModelCompatibilityKimi, ok: true},
+		{value: "openai", want: ModelCompatibilityOpenAI, ok: true},
+		{value: "moonshot"},
+		{value: 1},
+	} {
+		got, err := NormalizeModelCompatibility(test.value)
+		if (err == nil) != test.ok {
+			t.Errorf("NormalizeModelCompatibility(%#v) error = %v, want ok=%t", test.value, err, test.ok)
+		}
+		if err == nil && got != test.want {
+			t.Errorf("NormalizeModelCompatibility(%#v) = %q, want %q", test.value, got, test.want)
+		}
+	}
+}
+
 func TestLoadRejectsUnknownModelType(t *testing.T) {
 	dir := writeConfigFixture(t)
 	writeFile(t, filepath.Join(dir, "providers", "unknown.yaml"), `name: unknown
@@ -1042,6 +1084,23 @@ models:
 
 	_, err := Load(rootConfigPath(dir))
 	assertErrorContains(t, err, `unknown model type "not-openai"`, "supported provider types: anthropic-messages, openai-codex, openai-chat, openai-responses")
+}
+
+func TestLoadRejectsCompatibilityForNonChatModel(t *testing.T) {
+	dir := writeConfigFixture(t)
+	writeFile(t, filepath.Join(dir, "providers", "incompatible.yaml"), `name: incompatible
+base_url: http://localhost:8080/v1
+api_key: direct-secret
+
+models:
+  default:
+    id: model-default
+    type: openai-responses
+    compatibility: kimi
+`)
+
+	_, err := Load(rootConfigPath(dir))
+	assertErrorContains(t, err, "compatibility is only supported for openai-chat models")
 }
 
 func TestLoadRejectsInvalidProviderRequestTimeout(t *testing.T) {

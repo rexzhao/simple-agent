@@ -38,6 +38,8 @@ const (
 	ProviderTypeOpenAIResponses   = "openai-responses"
 	ProviderTypeOpenAICodex       = "openai-codex"
 	ProviderTypeAnthropicMessages = "anthropic-messages"
+	ModelCompatibilityOpenAI      = "openai"
+	ModelCompatibilityKimi        = "kimi"
 )
 
 type AgentConfig struct {
@@ -90,6 +92,7 @@ type ProviderConfig struct {
 type ModelProfile struct {
 	ID              string          `json:"id" yaml:"id"`
 	Type            string          `json:"type,omitempty" yaml:"type,omitempty"`
+	Compatibility   string          `json:"compatibility,omitempty" yaml:"compatibility,omitempty"`
 	Input           []string        `json:"input,omitempty" yaml:"input,omitempty"`
 	DeveloperRole   string          `json:"developer_role,omitempty" yaml:"developer_role,omitempty"`
 	ContextWindow   int             `json:"context_window,omitempty" yaml:"context_window,omitempty"`
@@ -117,6 +120,7 @@ type ResolvedModel struct {
 	Profile             string
 	ModelID             string
 	Type                string
+	Compatibility       string
 	Input               []string
 	DeveloperRole       string
 	Parameters          map[string]any
@@ -264,6 +268,7 @@ func (c *Config) ResolveModel(providerName, modelName string) (ResolvedModel, er
 		Profile:             modelName,
 		ModelID:             profile.ID,
 		Type:                modelType,
+		Compatibility:       profile.Compatibility,
 		Input:               append([]string(nil), profile.Input...),
 		DeveloperRole:       profile.DeveloperRole,
 		Parameters:          copyParameters(profile.Parameters),
@@ -456,6 +461,14 @@ func (m *ModelProfile) UnmarshalYAML(value *yaml.Node) error {
 		}
 		delete(fields, "type")
 	}
+	if rawCompatibility, ok := fields["compatibility"]; ok {
+		compatibility, err := NormalizeModelCompatibility(rawCompatibility)
+		if err != nil {
+			return err
+		}
+		m.Compatibility = compatibility
+		delete(fields, "compatibility")
+	}
 
 	parameters := map[string]any{}
 	if rawParameters, ok := fields["parameters"]; ok {
@@ -543,6 +556,23 @@ func NormalizeDeveloperRole(value any) (string, error) {
 		return role, nil
 	default:
 		return "", fmt.Errorf("model profile developer_role must be developer or system")
+	}
+}
+
+func NormalizeModelCompatibility(value any) (string, error) {
+	if value == nil {
+		return "", nil
+	}
+	compatibility, ok := value.(string)
+	if !ok {
+		return "", fmt.Errorf("model profile compatibility must be a string")
+	}
+	compatibility = strings.ToLower(strings.TrimSpace(compatibility))
+	switch compatibility {
+	case "", ModelCompatibilityOpenAI, ModelCompatibilityKimi:
+		return compatibility, nil
+	default:
+		return "", fmt.Errorf("model profile compatibility must be openai or kimi")
 	}
 }
 
@@ -658,6 +688,17 @@ func validateProvider(path string, provider ProviderConfig) error {
 		if profile.Type != "" && !isKnownProviderType(profile.Type) {
 			return fmt.Errorf("provider file %q model %q has unknown model type %q; supported provider types: %s", path, profileName, profile.Type, formatSupportedProviderTypes())
 		}
+		compatibility, err := NormalizeModelCompatibility(profile.Compatibility)
+		if err != nil {
+			return fmt.Errorf("provider file %q model %q: %w", path, profileName, err)
+		}
+		modelType, err := resolveModelType(provider.Name, profileName, profile.Type)
+		if err != nil {
+			return err
+		}
+		if compatibility != "" && modelType != ProviderTypeOpenAIChat {
+			return fmt.Errorf("provider file %q model %q compatibility is only supported for %s models", path, profileName, ProviderTypeOpenAIChat)
+		}
 		if strings.TrimSpace(profile.Type) == ProviderTypeOpenAICodex && strings.TrimSpace(provider.AuthFile) == "" {
 			return fmt.Errorf("provider file %q model %q uses %s but auth_file is missing", path, profileName, ProviderTypeOpenAICodex)
 		}
@@ -683,6 +724,7 @@ func normalizeProvider(provider ProviderConfig, providerFileDir string) Provider
 	for profileName, profile := range provider.Models {
 		profile.ID = strings.TrimSpace(profile.ID)
 		profile.Type = strings.TrimSpace(profile.Type)
+		profile.Compatibility = strings.ToLower(strings.TrimSpace(profile.Compatibility))
 		provider.Models[profileName] = profile
 	}
 	return provider

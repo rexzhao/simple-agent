@@ -15,7 +15,7 @@ func TestTrackingProviderPrefersProviderUsageEvent(t *testing.T) {
 		Inner: fakeProvider{events: []model.Event{
 			model.TextDeltaEvent{Text: "fallback text should not win"},
 			model.UsageEvent{Usage: model.Usage{
-				InputTokens: 10, OutputTokens: 5, TotalTokens: 15,
+				InputTokens: 10, OutputTokens: 5, TotalTokens: 25,
 				CachedTokens: 8, CacheWriteTokens: 2, ReasoningTokens: 3,
 			}},
 		}},
@@ -35,11 +35,11 @@ func TestTrackingProviderPrefersProviderUsageEvent(t *testing.T) {
 	if metadata.LastUsageSource != string(UsageSourceProvider) {
 		t.Fatalf("LastUsageSource = %q, want provider", metadata.LastUsageSource)
 	}
-	if metadata.LastInputTokens != 10 || metadata.LastOutputTokens != 5 || metadata.LastTotalTokens != 15 {
-		t.Fatalf("metadata usage = input %d output %d total %d, want 10/5/15", metadata.LastInputTokens, metadata.LastOutputTokens, metadata.LastTotalTokens)
+	if metadata.LastInputTokens != 10 || metadata.LastOutputTokens != 5 || metadata.LastTotalTokens != 25 {
+		t.Fatalf("metadata usage = input %d output %d total %d, want 10/5/25", metadata.LastInputTokens, metadata.LastOutputTokens, metadata.LastTotalTokens)
 	}
-	if metadata.LastUsageCountTokens != 15 {
-		t.Fatalf("LastUsageCountTokens = %d, want provider total 15", metadata.LastUsageCountTokens)
+	if metadata.LastUsageCountTokens != 25 {
+		t.Fatalf("LastUsageCountTokens = %d, want provider total 25", metadata.LastUsageCountTokens)
 	}
 	if metadata.LastCachedTokens != 8 || metadata.LastCacheWriteTokens != 2 || metadata.LastReasoningTokens != 3 {
 		t.Fatalf("metadata details = cached %d write %d reasoning %d, want 8/2/3", metadata.LastCachedTokens, metadata.LastCacheWriteTokens, metadata.LastReasoningTokens)
@@ -59,8 +59,8 @@ func TestTrackerUsageCountFallsBackToComponentsIncludingCache(t *testing.T) {
 	if metadata.LastUsageCountTokens != 25 {
 		t.Fatalf("LastUsageCountTokens = %d, want 10+5+8+2", metadata.LastUsageCountTokens)
 	}
-	if metadata.LastTotalTokens != 15 {
-		t.Fatalf("LastTotalTokens = %d, want normalized input+output total 15", metadata.LastTotalTokens)
+	if metadata.LastTotalTokens != 25 {
+		t.Fatalf("LastTotalTokens = %d, want normalized bucket total 25", metadata.LastTotalTokens)
 	}
 }
 
@@ -92,6 +92,18 @@ func TestTrackingProviderRecordsFallbackEstimateWhenUsageIsMissing(t *testing.T)
 	}
 	if metadata.LastOutputTokens != 1 || metadata.LastTotalTokens != metadata.LastInputTokens+1 {
 		t.Fatalf("metadata usage = input %d output %d total %d, want estimated output 1", metadata.LastInputTokens, metadata.LastOutputTokens, metadata.LastTotalTokens)
+	}
+}
+
+func TestEstimateMessageTokensIncludesReasoningContent(t *testing.T) {
+	base := model.Message{Role: model.MessageRoleAssistant, Content: "answer"}
+	withReasoning := base
+	withReasoning.ReasoningContent = "inspect the files before answering"
+
+	got := EstimateMessageTokens(withReasoning) - EstimateMessageTokens(base)
+	want := EstimateTextTokens(withReasoning.ReasoningContent)
+	if got != want {
+		t.Fatalf("reasoning token estimate = %d, want %d", got, want)
 	}
 }
 

@@ -100,6 +100,98 @@ func TestEventsFromChunkConvertsUsage(t *testing.T) {
 	}
 }
 
+func TestEventsFromChunkNormalizesCachedUsageBuckets(t *testing.T) {
+	events, err := EventsFromChunk([]byte(`{
+		"choices": [],
+		"usage": {
+			"prompt_tokens": 100,
+			"completion_tokens": 5,
+			"total_tokens": 105,
+			"prompt_tokens_details": {
+				"cached_tokens": 60,
+				"cache_write_tokens": 20
+			},
+			"completion_tokens_details": {
+				"reasoning_tokens": 3
+			}
+		}
+	}`))
+	if err != nil {
+		t.Fatalf("EventsFromChunk() error = %v", err)
+	}
+
+	got := events[0].(model.UsageEvent).Usage
+	want := model.Usage{
+		InputTokens: 20, OutputTokens: 5, TotalTokens: 105,
+		CachedTokens: 60, CacheWriteTokens: 20, ReasoningTokens: 3,
+	}
+	if got != want {
+		t.Fatalf("Usage = %#v, want %#v", got, want)
+	}
+}
+
+func TestKimiCompatibilityReadsTopLevelCachedTokens(t *testing.T) {
+	compatibility, err := resolveCompatibility(CompatibilityKimi)
+	if err != nil {
+		t.Fatalf("resolveCompatibility() error = %v", err)
+	}
+	events, err := newStreamEventDecoderWithCompatibility(compatibility).eventsFromChunk([]byte(`{
+		"choices": [],
+		"usage": {
+			"prompt_tokens": 100,
+			"completion_tokens": 5,
+			"total_tokens": 105,
+			"cached_tokens": 60
+		}
+	}`))
+	if err != nil {
+		t.Fatalf("eventsFromChunk() error = %v", err)
+	}
+
+	got := events[0].(model.UsageEvent).Usage
+	want := model.Usage{InputTokens: 40, OutputTokens: 5, TotalTokens: 105, CachedTokens: 60}
+	if got != want {
+		t.Fatalf("Usage = %#v, want %#v", got, want)
+	}
+}
+
+func TestKimiCompatibilityFallsBackToChoiceUsage(t *testing.T) {
+	compatibility, err := resolveCompatibility(CompatibilityKimi)
+	if err != nil {
+		t.Fatalf("resolveCompatibility() error = %v", err)
+	}
+	chunk := []byte(`{
+		"choices": [{
+			"index": 0,
+			"delta": {},
+			"usage": {
+				"prompt_tokens": 100,
+				"completion_tokens": 5,
+				"total_tokens": 105,
+				"prompt_cache_hit_tokens": 80
+			}
+		}]
+	}`)
+	events, err := newStreamEventDecoderWithCompatibility(compatibility).eventsFromChunk(chunk)
+	if err != nil {
+		t.Fatalf("eventsFromChunk() error = %v", err)
+	}
+
+	got := events[0].(model.UsageEvent).Usage
+	want := model.Usage{InputTokens: 20, OutputTokens: 5, TotalTokens: 105, CachedTokens: 80}
+	if got != want {
+		t.Fatalf("Usage = %#v, want %#v", got, want)
+	}
+
+	defaultEvents, err := EventsFromChunk(chunk)
+	if err != nil {
+		t.Fatalf("EventsFromChunk() error = %v", err)
+	}
+	if len(defaultEvents) != 0 {
+		t.Fatalf("default events = %#v, want no choice-level usage event", defaultEvents)
+	}
+}
+
 func TestEventsFromChunkConvertsToolCallDeltaAndDone(t *testing.T) {
 	events, err := EventsFromChunk([]byte(`{
 		"object": "chat.completion.chunk",

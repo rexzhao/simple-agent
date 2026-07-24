@@ -38,6 +38,7 @@ export interface ProviderModelSettings {
   profile: string
   id: string
   type: string
+  compatibility?: string
   input?: string[]
   developer_role?: string
   context_window?: number

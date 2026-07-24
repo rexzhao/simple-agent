@@ -9,12 +9,17 @@ import (
 )
 
 func BuildRequestBody(request model.Request, stream bool) ([]byte, error) {
+	compatibility, _ := resolveCompatibility("")
+	return buildRequestBody(request, stream, compatibility)
+}
+
+func buildRequestBody(request model.Request, stream bool, compatibility chatCompatibility) ([]byte, error) {
 	body := make(map[string]any, len(request.Parameters)+4)
 	for key, value := range request.Parameters {
 		body[key] = value
 	}
 
-	messages, err := buildMessages(request.Messages, request.DeveloperRole)
+	messages, err := buildMessages(request.Messages, request.DeveloperRole, compatibility)
 	if err != nil {
 		return nil, err
 	}
@@ -25,11 +30,12 @@ func BuildRequestBody(request model.Request, stream bool) ([]byte, error) {
 	if len(request.Tools) > 0 {
 		body["tools"] = buildTools(request.Tools)
 	}
+	compatibility.prepareRequest(body, request, stream)
 
 	return json.Marshal(body)
 }
 
-func buildMessages(messages []model.Message, developerRole model.MessageRole) ([]map[string]any, error) {
+func buildMessages(messages []model.Message, developerRole model.MessageRole, compatibility chatCompatibility) ([]map[string]any, error) {
 	switch developerRole {
 	case "", model.MessageRoleDeveloper, model.MessageRoleSystem:
 	default:
@@ -55,6 +61,7 @@ func buildMessages(messages []model.Message, developerRole model.MessageRole) ([
 		if message.Role == model.MessageRoleTool {
 			item["tool_call_id"] = message.ToolCallID
 		}
+		compatibility.prepareMessage(item, message)
 		out = append(out, item)
 	}
 	return out, nil

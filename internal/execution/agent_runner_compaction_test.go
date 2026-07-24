@@ -245,14 +245,14 @@ func TestPlanCompactionCheckpointUsesStandaloneResponsesCompaction(t *testing.T)
 		t.Fatalf("plan messages = %#v", plan.messages)
 	}
 	wantUsage := model.Usage{
-		InputTokens: 1200, OutputTokens: 80, TotalTokens: 1280,
+		InputTokens: 100, OutputTokens: 80, TotalTokens: 1280,
 		CachedTokens: 900, CacheWriteTokens: 200, ReasoningTokens: 64,
 	}
 	if plan.usage == nil || *plan.usage != wantUsage {
 		t.Fatalf("plan usage = %#v, want %#v", plan.usage, wantUsage)
 	}
 	if plan.context == nil ||
-		plan.context.LastInputTokens != 1200 ||
+		plan.context.LastInputTokens != 100 ||
 		plan.context.LastCachedTokens != 900 ||
 		plan.context.LastCacheWriteTokens != 200 ||
 		plan.context.LastUsageSource != string(contextwindow.UsageSourceProvider) {

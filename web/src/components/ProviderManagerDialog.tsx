@@ -14,6 +14,7 @@ interface EditableProviderModel {
   profile: string
   id: string
   type: string
+  compatibility: string
   supportsImages: boolean
   developerRole: string
   contextWindow: string
@@ -211,7 +212,11 @@ export function ProviderManagerDialog(props: {
                         }}><option value="">Select a model ({discoveredModels.length} fetched)</option>{discoveredModels.map((modelID) => <option value={modelID} key={modelID}>{modelID}</option>)}</select></label>}
                         <label>Profile name<input value={model.profile} onChange={(event) => updateModel(index, { profile: event.target.value })} placeholder="gpt-5.5" /></label>
                         <label>Model ID<input value={model.id} onChange={(event) => updateModel(index, { id: event.target.value })} placeholder="Or enter manually" /></label>
-                        <label>API type<select value={model.type || 'openai-chat'} onChange={(event) => updateModel(index, { type: event.target.value })}><option value="openai-chat">OpenAI Chat</option><option value="openai-responses">OpenAI Responses</option><option value="openai-codex">OpenAI Codex</option><option value="anthropic-messages">Anthropic Messages</option></select></label>
+                        <label>API type<select value={model.type || 'openai-chat'} onChange={(event) => {
+                          const type = event.target.value
+                          updateModel(index, { type, compatibility: type === 'openai-chat' ? model.compatibility : '' })
+                        }}><option value="openai-chat">OpenAI Chat</option><option value="openai-responses">OpenAI Responses</option><option value="openai-codex">OpenAI Codex</option><option value="anthropic-messages">Anthropic Messages</option></select></label>
+                        <label>Compatibility<select value={model.compatibility} disabled={model.type !== 'openai-chat'} onChange={(event) => updateModel(index, { compatibility: event.target.value })}><option value="">Provider default</option><option value="openai">Standard OpenAI</option><option value="kimi">Kimi</option></select></label>
                         <label className="checkbox-field"><input type="checkbox" checked={model.supportsImages} onChange={(event) => updateModel(index, { supportsImages: event.target.checked })} /> Supports image input</label>
                         <label>Developer role<select value={model.developerRole} onChange={(event) => updateModel(index, { developerRole: event.target.value })}><option value="">Keep developer</option><option value="system">Map to system</option></select></label>
                         <label>Context Window<input type="number" min="0" value={model.contextWindow} onChange={(event) => updateModel(index, { contextWindow: event.target.value })} placeholder="400000" /></label>
@@ -263,6 +268,7 @@ function editableProviderModel(model: ProviderModelSettings): EditableProviderMo
     profile: model.profile,
     id: model.id,
     type: model.type || 'openai-chat',
+    compatibility: model.compatibility ?? '',
     supportsImages: model.input?.includes('image') ?? false,
     developerRole: model.developer_role ?? '',
     contextWindow: model.context_window ? String(model.context_window) : '',
@@ -276,7 +282,7 @@ function editableProviderModel(model: ProviderModelSettings): EditableProviderMo
 }
 
 function emptyProviderModel(): EditableProviderModel {
-  return { profile: '', id: '', type: 'openai-chat', supportsImages: false, developerRole: '', contextWindow: '', inputLimit: '', outputLimit: '', parametersJSON: '{}', reasoningParameter: '', reasoningDefault: '', reasoningLevelsJSON: '{}' }
+  return { profile: '', id: '', type: 'openai-chat', compatibility: '', supportsImages: false, developerRole: '', contextWindow: '', inputLimit: '', outputLimit: '', parametersJSON: '{}', reasoningParameter: '', reasoningDefault: '', reasoningLevelsJSON: '{}' }
 }
 
 function providerInput(draft: ProviderDraft): ProviderSettingsInput {
@@ -298,6 +304,7 @@ function providerInput(draft: ProviderDraft): ProviderSettingsInput {
         profile: model.profile.trim(),
         id: model.id.trim(),
         type: model.type,
+        compatibility: model.compatibility,
         input: model.supportsImages ? ['text', 'image'] : ['text'],
         developer_role: model.developerRole,
         context_window: model.contextWindow ? Number(model.contextWindow) : 0,

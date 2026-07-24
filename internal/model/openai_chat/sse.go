@@ -51,7 +51,8 @@ func EventsFromChunk(data []byte) ([]model.Event, error) {
 }
 
 type streamEventDecoder struct {
-	choices map[int]map[int]*toolCallAccumulator
+	compatibility chatCompatibility
+	choices       map[int]map[int]*toolCallAccumulator
 }
 
 type toolCallAccumulator struct {
@@ -61,8 +62,14 @@ type toolCallAccumulator struct {
 }
 
 func newStreamEventDecoder() *streamEventDecoder {
+	compatibility, _ := resolveCompatibility("")
+	return newStreamEventDecoderWithCompatibility(compatibility)
+}
+
+func newStreamEventDecoderWithCompatibility(compatibility chatCompatibility) *streamEventDecoder {
 	return &streamEventDecoder{
-		choices: make(map[int]map[int]*toolCallAccumulator),
+		compatibility: compatibility,
+		choices:       make(map[int]map[int]*toolCallAccumulator),
 	}
 }
 
@@ -103,13 +110,9 @@ func (d *streamEventDecoder) eventsFromChunk(data []byte) ([]model.Event, error)
 			events = d.appendToolCallDoneEvents(events, choice.Index)
 		}
 	}
-	if chunk.Usage != nil {
+	if usage := d.compatibility.usage(chunk); usage != nil {
 		events = append(events, model.UsageEvent{
-			Usage: model.Usage{
-				InputTokens:  chunk.Usage.PromptTokens,
-				OutputTokens: chunk.Usage.CompletionTokens,
-				TotalTokens:  chunk.Usage.TotalTokens,
-			},
+			Usage: usageFromChatCompletion(usage),
 		})
 	}
 	return events, nil
@@ -212,9 +215,10 @@ type chatCompletionChunk struct {
 }
 
 type chatCompletionChoice struct {
-	Index        int                 `json:"index"`
-	Delta        chatCompletionDelta `json:"delta"`
-	FinishReason *string             `json:"finish_reason"`
+	Index        int                  `json:"index"`
+	Delta        chatCompletionDelta  `json:"delta"`
+	FinishReason *string              `json:"finish_reason"`
+	Usage        *chatCompletionUsage `json:"usage"`
 }
 
 type chatCompletionDelta struct {
@@ -235,7 +239,42 @@ type chatCompletionToolFunctionDelta struct {
 }
 
 type chatCompletionUsage struct {
-	PromptTokens     int `json:"prompt_tokens"`
-	CompletionTokens int `json:"completion_tokens"`
-	TotalTokens      int `json:"total_tokens"`
+	PromptTokens            int                         `json:"prompt_tokens"`
+	CompletionTokens        int                         `json:"completion_tokens"`
+	TotalTokens             int                         `json:"total_tokens"`
+	CachedTokens            int                         `json:"cached_tokens"`
+	CacheWriteTokens        int                         `json:"cache_write_tokens"`
+	PromptCacheHitTokens    int                         `json:"prompt_cache_hit_tokens"`
+	PromptTokensDetails     chatPromptTokensDetails     `json:"prompt_tokens_details"`
+	CompletionTokensDetails chatCompletionTokensDetails `json:"completion_tokens_details"`
+}
+
+type chatPromptTokensDetails struct {
+	CachedTokens     int `json:"cached_tokens"`
+	CacheWriteTokens int `json:"cache_write_tokens"`
+}
+
+type chatCompletionTokensDetails struct {
+	ReasoningTokens int `json:"reasoning_tokens"`
+}
+
+func usageFromChatCompletion(usage *chatCompletionUsage) model.Usage {
+	cachedTokens := usage.CachedTokens
+	if cachedTokens == 0 {
+		cachedTokens = usage.PromptTokensDetails.CachedTokens
+	}
+	if cachedTokens == 0 {
+		cachedTokens = usage.PromptCacheHitTokens
+	}
+	cacheWriteTokens := usage.CacheWriteTokens
+	if cacheWriteTokens == 0 {
+		cacheWriteTokens = usage.PromptTokensDetails.CacheWriteTokens
+	}
+	return model.UsageFromInclusiveInput(
+		usage.PromptTokens,
+		usage.CompletionTokens,
+		cachedTokens,
+		cacheWriteTokens,
+		usage.CompletionTokensDetails.ReasoningTokens,
+	)
 }

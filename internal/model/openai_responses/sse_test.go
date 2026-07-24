@@ -203,12 +203,12 @@ func TestEventsFromChunkMapsCacheAndReasoningUsage(t *testing.T) {
 		{
 			name: "cache read",
 			json: `{"type":"response.completed","response":{"usage":{"input_tokens":1500,"output_tokens":12,"total_tokens":1512,"input_tokens_details":{"cached_tokens":1408},"output_tokens_details":{"reasoning_tokens":8}}}}`,
-			want: model.Usage{InputTokens: 1500, OutputTokens: 12, TotalTokens: 1512, CachedTokens: 1408, ReasoningTokens: 8},
+			want: model.Usage{InputTokens: 92, OutputTokens: 12, TotalTokens: 1512, CachedTokens: 1408, ReasoningTokens: 8},
 		},
 		{
 			name: "cache write",
 			json: `{"type":"response.completed","response":{"usage":{"input_tokens":1500,"output_tokens":12,"total_tokens":1512,"input_tokens_details":{"cache_write_tokens":1408}}}}`,
-			want: model.Usage{InputTokens: 1500, OutputTokens: 12, TotalTokens: 1512, CacheWriteTokens: 1408},
+			want: model.Usage{InputTokens: 92, OutputTokens: 12, TotalTokens: 1512, CacheWriteTokens: 1408},
 		},
 	}
 

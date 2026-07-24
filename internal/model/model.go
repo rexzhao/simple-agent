@@ -42,14 +42,15 @@ const (
 )
 
 type Message struct {
-	Role          MessageRole
-	Content       string
-	ContentBlocks []InputContentBlock
-	ToolCallID    string
-	ToolCalls     []ToolCall
-	IsError       bool
-	ResponseState *ResponseState
-	ProviderItems []ProviderItem
+	Role             MessageRole
+	Content          string
+	ReasoningContent string
+	ContentBlocks    []InputContentBlock
+	ToolCallID       string
+	ToolCalls        []ToolCall
+	IsError          bool
+	ResponseState    *ResponseState
+	ProviderItems    []ProviderItem
 }
 
 // ProviderItem is an opaque provider input/output item. Origin and Model scope
@@ -202,12 +203,33 @@ func (ToolResultEvent) Type() EventType {
 }
 
 type Usage struct {
+	// InputTokens excludes tokens reported in CachedTokens and
+	// CacheWriteTokens. The four token buckets are mutually exclusive.
 	InputTokens      int
 	OutputTokens     int
 	TotalTokens      int
 	CachedTokens     int
 	CacheWriteTokens int
 	ReasoningTokens  int
+}
+
+// UsageFromInclusiveInput converts OpenAI-style usage, where inputTokens
+// includes cached reads and cache writes, into the disjoint Usage buckets used
+// throughout the agent. Provider-reported totals are intentionally ignored so
+// TotalTokens always equals the sum of those buckets.
+func UsageFromInclusiveInput(inputTokens, outputTokens, cachedTokens, cacheWriteTokens, reasoningTokens int) Usage {
+	uncachedInputTokens := inputTokens - cachedTokens - cacheWriteTokens
+	if uncachedInputTokens < 0 {
+		uncachedInputTokens = 0
+	}
+	return Usage{
+		InputTokens:      uncachedInputTokens,
+		OutputTokens:     outputTokens,
+		TotalTokens:      uncachedInputTokens + outputTokens + cachedTokens + cacheWriteTokens,
+		CachedTokens:     cachedTokens,
+		CacheWriteTokens: cacheWriteTokens,
+		ReasoningTokens:  reasoningTokens,
+	}
 }
 
 type UsageEvent struct {

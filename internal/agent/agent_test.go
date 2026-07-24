@@ -275,6 +275,7 @@ func TestStreamWithResultIncludesToolHistoryAndFinalAssistantText(t *testing.T) 
 	provider := &fakeProvider{
 		turns: [][]model.Event{
 			{
+				model.ReasoningDeltaEvent{Text: "inspect first"},
 				model.ToolCallDoneEvent{
 					ToolCall: model.ToolCall{ID: "call_1", Name: "echo", Arguments: `{"text":"hello"}`},
 				},
@@ -311,8 +312,14 @@ func TestStreamWithResultIncludesToolHistoryAndFinalAssistantText(t *testing.T) 
 	}
 	assertAgentMessage(t, result.Messages[0], model.MessageRoleUser, "Use a tool", "")
 	assertAgentMessage(t, result.Messages[1], model.MessageRoleAssistant, "", "call_1")
+	if result.Messages[1].ReasoningContent != "inspect first" {
+		t.Fatalf("first assistant reasoning = %q, want inspect first", result.Messages[1].ReasoningContent)
+	}
 	assertAgentMessage(t, result.Messages[2], model.MessageRoleTool, "tool output", "call_1")
 	assertAgentMessage(t, result.Messages[3], model.MessageRoleAssistant, "final", "")
+	if got := provider.requests[1].Messages[1].ReasoningContent; got != "inspect first" {
+		t.Fatalf("replayed assistant reasoning = %q, want inspect first", got)
+	}
 }
 
 func TestStreamWithResultFailsWhenFinalResponseHasNoVisibleOutput(t *testing.T) {

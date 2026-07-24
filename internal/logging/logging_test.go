@@ -123,7 +123,7 @@ func TestLogEventRecordsCacheUsageMetadata(t *testing.T) {
 		t.Fatalf("Open() error = %v", err)
 	}
 	if err := logger.LogEvent(model.UsageEvent{Usage: model.Usage{
-		InputTokens: 10, OutputTokens: 5, TotalTokens: 15,
+		InputTokens: 10, OutputTokens: 5, TotalTokens: 25,
 		CachedTokens: 8, CacheWriteTokens: 2, ReasoningTokens: 3,
 	}}); err != nil {
 		t.Fatalf("LogEvent() error = %v", err)

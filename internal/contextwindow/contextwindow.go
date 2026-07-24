@@ -202,8 +202,8 @@ func (t *Tracker) recordUsage(source UsageSource, usage model.Usage, anchor *usa
 	if usageCount <= 0 {
 		usageCount = usage.InputTokens + usage.OutputTokens + usage.CachedTokens + usage.CacheWriteTokens
 	}
-	if usage.TotalTokens == 0 {
-		usage.TotalTokens = usage.InputTokens + usage.OutputTokens
+	if usage.TotalTokens <= 0 {
+		usage.TotalTokens = usageCount
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -299,6 +299,7 @@ func EstimateMessageTokens(message model.Message) int {
 	total := messageOverheadTokens
 	total += EstimateTextTokens(string(message.Role))
 	total += EstimateTextTokens(message.Content)
+	total += EstimateTextTokens(message.ReasoningContent)
 	for _, block := range message.ContentBlocks {
 		total += EstimateTextTokens(block.Type)
 		total += EstimateTextTokens(block.Text)

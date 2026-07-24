@@ -20,7 +20,7 @@ import (
 
 func TestSessionStreamUsageEventIncludesCacheDetails(t *testing.T) {
 	event, ok := sessionStreamEventFromModelEvent("turn-1", 2, model.UsageEvent{Usage: model.Usage{
-		InputTokens: 10, OutputTokens: 5, TotalTokens: 15,
+		InputTokens: 10, OutputTokens: 5, TotalTokens: 25,
 		CachedTokens: 8, CacheWriteTokens: 2, ReasoningTokens: 3,
 	}}, true)
 	if !ok {
@@ -28,7 +28,7 @@ func TestSessionStreamUsageEventIncludesCacheDetails(t *testing.T) {
 	}
 	for key, want := range map[string]any{
 		"type": "usage.updated", "turn_id": "turn-1", "agent_iteration": 2,
-		"input_tokens": 10, "output_tokens": 5, "total_tokens": 15,
+		"input_tokens": 10, "output_tokens": 5, "total_tokens": 25,
 		"cached_tokens": 8, "cache_write_tokens": 2, "reasoning_tokens": 3,
 	} {
 		if got := event[key]; got != want {
