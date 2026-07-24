@@ -296,7 +296,7 @@ function ActiveRunBody({ run }: { run: ActiveRun }) {
           <article className="message assistant transient" key={`steps-${index}`}>
             <div className="message-content">
               {isLast && <div className="message-meta"><span className="streaming-label"><i />Generating</span></div>}
-              <ProcessTimeline steps={segment.steps} />
+              <ProcessTimeline steps={segment.steps} live={isLast && run.status === 'running'} />
               {isLast && trailing && (run.assistantText ? <MarkdownMessage text={run.assistantText} streaming /> : <div className="message-text assistant-stream"><span className="cursor" /></div>)}
               {isLast && tokenNote}
             </div>

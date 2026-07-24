@@ -367,7 +367,11 @@ svg { width: 1.1em; height: 1.1em; fill: none; stroke: currentColor; stroke-widt
 .process-timeline { display: flex; flex-direction: column; gap: 8px; margin: 3px 0 14px; }
 .iteration-marker { position: absolute; top: 9px; right: 100%; margin-right: 9px; color: var(--faint); font-family: var(--font-mono); font-size: 9px; font-weight: 500; font-style: normal; line-height: 1; pointer-events: none; }
 .reasoning-step { position: relative; padding: 7px 9px 8px 11px; border-left: 4px solid var(--accent); background: var(--panel-soft); }
-.reasoning-step > span { color: var(--muted); font-family: "Space Grotesk", "Segoe UI", sans-serif; font-size: 9.5px; font-weight: 800; text-transform: uppercase; letter-spacing: .05em; }
+.reasoning-step > summary { display: flex; align-items: center; gap: 5px; list-style: none; cursor: pointer; }
+.reasoning-step > summary::-webkit-details-marker { display: none; }
+.reasoning-step > summary > svg { width: 11px; height: 11px; flex: 0 0 auto; color: var(--muted); }
+.reasoning-step > summary > svg.expanded { transform: rotate(180deg); }
+.reasoning-step > summary > span { color: var(--muted); font-family: "Space Grotesk", "Segoe UI", sans-serif; font-size: 9.5px; font-weight: 800; text-transform: uppercase; letter-spacing: .05em; }
 /* Mid-turn assistant output renders like the final assistant message, not as a
    process card. */
 .step-message { position: relative; }

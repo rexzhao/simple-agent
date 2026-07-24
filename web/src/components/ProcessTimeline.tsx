@@ -1,17 +1,20 @@
-import type { ReactNode } from 'react'
+import { useEffect, useRef, useState } from 'react'
+import type { ReactNode, SyntheticEvent } from 'react'
 import Markdown from 'react-markdown'
 import type { Components } from 'react-markdown'
 import remarkGfm from 'remark-gfm'
-import type { RunStep, ToolActivity } from '../types'
+import type { ReasoningActivity, RunStep, ToolActivity } from '../types'
 import { groupProcessSteps } from '../lib/runSteps'
-import { ToolIcon } from './icons'
+import { ChevronIcon, ToolIcon } from './icons'
 
 const markdownComponents: Components = {
 	a: ({ node: _node, ...props }) => <a {...props} target="_blank" rel="noreferrer noopener" />,
 }
 
-export function ProcessTimeline({ steps }: { steps: RunStep[] }) {
+export function ProcessTimeline({ steps, live = false }: { steps: RunStep[]; live?: boolean }) {
 	const iterations = groupProcessSteps(steps)
+	const lastIteration = iterations[iterations.length - 1]
+	const lastStepID = lastIteration?.steps[lastIteration.steps.length - 1]?.id
 	return (
 		<div className="process-iterations">
 			{iterations.map((iteration) => (
@@ -21,7 +24,7 @@ export function ProcessTimeline({ steps }: { steps: RunStep[] }) {
 							const first = stepIndex === 0
 							const marker = first ? <i className="iteration-marker">{iteration.number}</i> : null
 							if (step.kind === 'reasoning') {
-								return <div className="reasoning-step" key={step.id}>{marker}<span>{step.label || 'Reasoning'}</span><pre>{step.text}</pre></div>
+								return <ReasoningStep key={step.id} step={step} marker={marker} streaming={live && step.id === lastStepID} />
 							}
 							if (step.kind === 'output') {
 								// Mid-turn assistant output renders like the final assistant
@@ -49,6 +52,45 @@ export function ProcessTimeline({ steps }: { steps: RunStep[] }) {
 				</section>
 			))}
 		</div>
+	)
+}
+
+// Distance from the bottom within which a streaming reasoning block keeps
+// following new lines; scrolling further up pauses the auto-scroll.
+const reasoningFollowThresholdPX = 24
+
+// ReasoningStep streams expanded, follows the latest line while the user stays
+// at the bottom, and collapses by itself once the reasoning stream ends.
+function ReasoningStep({ step, marker, streaming }: { step: ReasoningActivity; marker?: ReactNode; streaming: boolean }) {
+	const [expanded, setExpanded] = useState(streaming)
+	const preRef = useRef<HTMLPreElement>(null)
+	const followRef = useRef(true)
+
+	useEffect(() => {
+		const pre = preRef.current
+		if (pre && streaming && expanded && followRef.current) pre.scrollTop = pre.scrollHeight
+	}, [step.text, streaming, expanded])
+
+	useEffect(() => {
+		if (!streaming) setExpanded(false)
+	}, [streaming])
+
+	const updateFollow = () => {
+		const pre = preRef.current
+		if (pre) followRef.current = pre.scrollHeight - pre.scrollTop - pre.clientHeight <= reasoningFollowThresholdPX
+	}
+
+	const toggle = (event: SyntheticEvent<HTMLDetailsElement>) => {
+		const open = event.currentTarget.open
+		if (open && streaming) followRef.current = true
+		setExpanded(open)
+	}
+
+	return (
+		<details className="reasoning-step" open={expanded} onToggle={toggle}>
+			<summary>{marker}<ChevronIcon expanded={expanded} /><span>{step.label || 'Reasoning'}</span></summary>
+			{expanded && <pre ref={preRef} onScroll={updateFollow}>{step.text}</pre>}
+		</details>
 	)
 }
 
