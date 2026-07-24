@@ -411,6 +411,25 @@ svg { width: 1.1em; height: 1.1em; fill: none; stroke: currentColor; stroke-widt
 .tool-apply-patch pre .diff-removed { color: #fecaca; background: rgba(220, 38, 38, .24); }
 .tool-apply-patch pre .diff-added { color: #bbf7d0; background: rgba(21, 128, 61, .28); }
 
+/* A folded run of consecutive tool calls: one aggregated row that expands to
+   the member rows. */
+.tool-group { position: relative; width: min(660px, 100%); border: 2px solid var(--border); color: var(--text); background: #ffffff; font-family: "Space Grotesk", "Segoe UI", sans-serif; font-size: 10.5px; }
+.tool-group > summary { min-height: 35px; display: flex; align-items: center; gap: 8px; padding: 6px 9px; list-style: none; cursor: pointer; }
+.tool-group > summary::-webkit-details-marker { display: none; }
+.tool-group > summary:hover { background: var(--accent-soft); }
+.tool-group[open] > summary { border-bottom: 2px solid var(--border); background: var(--panel); }
+.tool-group > summary > svg { width: 15px; height: 15px; flex: 0 0 auto; color: var(--text); }
+.tool-group > summary > svg:nth-of-type(1) { width: 11px; height: 11px; color: var(--muted); }
+.tool-group > summary > svg.expanded { transform: rotate(180deg); }
+.tool-group-summary { min-width: 0; overflow: hidden; font-weight: 800; text-overflow: ellipsis; white-space: nowrap; }
+.tool-group > summary code { min-width: 0; overflow: hidden; color: var(--muted); font: 10px var(--font-mono); text-overflow: ellipsis; white-space: nowrap; }
+.tool-group > summary small { flex: 0 0 auto; margin-left: auto; padding: 2px 5px; border: 1px solid var(--border); color: var(--text); background: var(--panel); font-size: 9px; font-weight: 800; }
+.tool-group.running > summary small { background: var(--accent); }
+.tool-group.running > summary > svg:nth-of-type(2) { color: var(--accent-hover); animation: spin 1.3s linear infinite; }
+.tool-group.finished > summary small { color: #ffffff; background: var(--success); }
+.tool-group.error > summary small { color: #ffffff; background: var(--danger); }
+.tool-group-body { display: flex; flex-direction: column; gap: 8px; padding: 8px; background: var(--panel); }
+
 .load-older { display: block; margin: 0 auto 30px; padding: 7px 12px; border: 2px solid var(--border); color: var(--text); background: #ffffff; box-shadow: var(--shadow-2); cursor: pointer; font-size: 10.5px; font-weight: 750; }
 .load-older:hover { box-shadow: none; transform: translate(3px, 3px); }
 .conversation-empty { min-height: 60%; display: flex; flex-direction: column; align-items: center; justify-content: center; color: var(--faint); text-align: center; }

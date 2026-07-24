@@ -4,7 +4,8 @@ import Markdown from 'react-markdown'
 import type { Components } from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import type { ReasoningActivity, RunStep, ToolActivity } from '../types'
-import { groupProcessSteps } from '../lib/runSteps'
+import { foldToolGroups } from '../lib/runSteps'
+import type { FlatProcessStep } from '../lib/runSteps'
 import { ChevronIcon, ToolIcon } from './icons'
 
 const markdownComponents: Components = {
@@ -12,47 +13,144 @@ const markdownComponents: Components = {
 }
 
 export function ProcessTimeline({ steps, live = false }: { steps: RunStep[]; live?: boolean }) {
-	const iterations = groupProcessSteps(steps)
-	const lastIteration = iterations[iterations.length - 1]
-	const lastStepID = lastIteration?.steps[lastIteration.steps.length - 1]?.id
+	const nodes = foldToolGroups(steps)
+	const lastNode = nodes[nodes.length - 1]
+	const lastFlat = lastNode ? (lastNode.kind === 'tool-group' ? lastNode.flats[lastNode.flats.length - 1] : lastNode.flat) : undefined
+	const lastStepID = lastFlat?.step.id
 	return (
-		<div className="process-iterations">
-			{iterations.map((iteration) => (
-				<section className="process-iteration" key={iteration.number}>
-					<div className="process-timeline">
-						{iteration.steps.map((step, stepIndex) => {
-							const first = stepIndex === 0
-							const marker = first ? <i className="iteration-marker">{iteration.number}</i> : null
-							if (step.kind === 'reasoning') {
-								return <ReasoningStep key={step.id} step={step} marker={marker} streaming={live && step.id === lastStepID} />
-							}
-							if (step.kind === 'output') {
-								// Mid-turn assistant output renders like the final assistant
-								// message: plain markdown body, no process card chrome.
-								return (
-									<div className="step-message assistant" key={step.id}>{marker}
-										<div className="message-text markdown-body"><Markdown remarkPlugins={[remarkGfm]} components={markdownComponents} skipHtml>{step.text}</Markdown></div>
-									</div>
-								)
-							}
-							if (step.kind === 'user') {
-								// A mid-turn appended message renders like a regular user
-								// message: light bubble on the right.
-								return (
-									<article className="message user step-message" key={step.id}>{marker}
-										<div className="message-content">
-											<div className="message-text">{step.text}</div>
-										</div>
-									</article>
-								)
-							}
-							return <ToolRow key={step.id} tool={step} marker={marker} />
-						})}
-					</div>
-				</section>
-			))}
+		<div className="process-timeline">
+			{nodes.map((node, nodeIndex) => {
+				if (node.kind === 'tool-group') {
+					return <ToolGroupRow key={node.id} flats={node.flats} live={live && nodeIndex === nodes.length - 1} />
+				}
+				const { step, iteration, iterationStart } = node.flat
+				const marker = iterationStart ? <i className="iteration-marker">{iteration}</i> : null
+				if (step.kind === 'reasoning') {
+					return <ReasoningStep key={step.id} step={step} marker={marker} streaming={live && step.id === lastStepID} />
+				}
+				if (step.kind === 'output') {
+					// Mid-turn assistant output renders like the final assistant
+					// message: plain markdown body, no process card chrome.
+					return (
+						<div className="step-message assistant" key={step.id}>{marker}
+							<div className="message-text markdown-body"><Markdown remarkPlugins={[remarkGfm]} components={markdownComponents} skipHtml>{step.text}</Markdown></div>
+						</div>
+					)
+				}
+				if (step.kind === 'user') {
+					// A mid-turn appended message renders like a regular user
+					// message: light bubble on the right.
+					return (
+						<article className="message user step-message" key={step.id}>{marker}
+							<div className="message-content">
+								<div className="message-text">{step.text}</div>
+							</div>
+						</article>
+					)
+				}
+				return <ToolRow key={step.id} tool={step} marker={marker} />
+			})}
 		</div>
 	)
+}
+
+// ToolGroupRow renders a folded run of consecutive tool calls as one
+// aggregated row. The row stays expanded while it is the live in-flight tail,
+// collapses once the run moves on, and re-expands whenever a member tool
+// fails. Reasoning steps inside the run stay individually collapsed.
+function ToolGroupRow({ flats, live }: { flats: FlatProcessStep[]; live: boolean }) {
+	const tools = flats.map((flat) => flat.step).filter((step): step is ToolActivity => step.kind === 'tool')
+	const failed = tools.filter((tool) => tool.status === 'error').length
+	const pending = tools.filter((tool) => tool.status === 'requested' || tool.status === 'running').length
+	const active = live && pending > 0
+	const hasError = failed > 0
+	const [expanded, setExpanded] = useState(active || hasError)
+	useEffect(() => {
+		if (hasError) setExpanded(true)
+	}, [hasError])
+	useEffect(() => {
+		if (!active && !hasError) setExpanded(false)
+	}, [active, hasError])
+
+	const toggle = (event: SyntheticEvent<HTMLDetailsElement>) => {
+		setExpanded(event.currentTarget.open)
+	}
+
+	const markerIteration = flats.find((flat) => flat.iterationStart)?.iteration
+	const status = hasError ? 'error' : pending > 0 ? 'running' : 'finished'
+	const badge = hasError ? `${failed} failed` : pending > 0 ? `${tools.length - pending}/${tools.length}` : 'Done'
+	const summary = toolGroupSummary(tools)
+	const targets = toolGroupTargets(tools)
+
+	return (
+		<details className={`tool-group ${status}`} open={expanded} onToggle={toggle}>
+			<summary>
+				{markerIteration !== undefined && <i className="iteration-marker">{markerIteration}</i>}
+				<ChevronIcon expanded={expanded} />
+				<ToolIcon />
+				<span className="tool-group-summary" title={summary}>{summary}</span>
+				{targets && <code title={targets}>{targets}</code>}
+				<small>{badge}</small>
+			</summary>
+			{expanded && (
+				<div className="tool-group-body">
+					{flats.map(({ step }) => {
+						if (step.kind === 'reasoning') return <ReasoningStep key={step.id} step={step} streaming={false} />
+						if (step.kind === 'tool') return <ToolRow key={step.id} tool={step} />
+						return null
+					})}
+				</div>
+			)}
+		</details>
+	)
+}
+
+function toolGroupSummary(tools: ToolActivity[]): string {
+	const counts = new Map<string, number>()
+	for (const tool of tools) counts.set(tool.name, (counts.get(tool.name) ?? 0) + 1)
+	return [...counts.entries()].map(([name, count]) => toolPhrase(name, count)).join(' · ')
+}
+
+function toolPhrase(name: string, count: number): string {
+	const plural = count === 1 ? '' : 's'
+	switch (name) {
+		case 'read_file': return `Read ${count} file${plural}`
+		case 'write_file': return `Wrote ${count} file${plural}`
+		case 'edit_file': return `Edited ${count} file${plural}`
+		case 'apply_patch': return `Applied ${count} patch${count === 1 ? '' : 'es'}`
+		case 'shell': return `Ran ${count} command${plural}`
+		case 'grep_files': return `Ran ${count} search${count === 1 ? '' : 'es'}`
+		case 'glob_files': return `Ran ${count} glob${plural}`
+		case 'list_files': return `Listed ${count} ${count === 1 ? 'directory' : 'directories'}`
+		default: return count > 1 ? `${name} ×${count}` : name
+	}
+}
+
+// toolGroupTargets names the files a run modified so that write operations
+// stay visible even while the group is collapsed.
+function toolGroupTargets(tools: ToolActivity[]): string {
+	const targets: string[] = []
+	for (const tool of tools) {
+		for (const target of toolWriteTargets(tool)) {
+			if (!targets.includes(target)) targets.push(target)
+		}
+	}
+	return targets.join(', ')
+}
+
+function toolWriteTargets(tool: ToolActivity): string[] {
+	const argumentsObject = parseToolArguments(tool.arguments)
+	if (tool.name === 'apply_patch') {
+		return stringField(argumentsObject, 'patch')
+			.split('\n')
+			.map((line) => /^\*\*\* (?:Add File|Update File|Delete File|Move to):\s*(.+)$/.exec(line)?.[1].trim() ?? '')
+			.filter(Boolean)
+	}
+	if (tool.name === 'write_file' || tool.name === 'edit_file') {
+		const target = toolTarget(tool.name, argumentsObject)
+		return target ? [target] : []
+	}
+	return []
 }
 
 // Distance from the bottom within which a streaming reasoning block keeps
