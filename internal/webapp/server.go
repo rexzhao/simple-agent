@@ -117,6 +117,8 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /api/sessions/{sessionID}/runs", s.handleStartRun)
 	s.mux.HandleFunc("GET /api/runs/active", s.handleListActiveRuns)
 	s.mux.HandleFunc("GET /api/runs/{runID}/events", s.handleRunEvents)
+	s.mux.HandleFunc("POST /api/runs/{runID}/prompts", s.handleAppendActive)
+	s.mux.HandleFunc("DELETE /api/runs/{runID}/prompts/{promptID}", s.handleRemoveActivePrompt)
 	s.mux.HandleFunc("DELETE /api/runs/{runID}", s.handleCancelRun)
 	s.mux.Handle("/", s.staticHandler())
 }

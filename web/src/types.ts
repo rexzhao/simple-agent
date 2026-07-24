@@ -188,6 +188,8 @@ export type RunEvent =
 	| { type: 'tool.requested' | 'tool.started'; turn_id: string; agent_iteration: number; tool_call_id: string; name: string; arguments?: string }
 	| { type: 'tool.finished'; turn_id: string; agent_iteration: number; tool_call_id: string; name: string; is_error: boolean; content?: string }
 	| { type: 'usage.updated'; turn_id: string; agent_iteration: number; input_tokens: number; output_tokens: number; total_tokens: number; cached_tokens: number; cache_write_tokens: number; reasoning_tokens: number }
+  | { type: 'run.prompt_queue'; turn_id?: string; prompts?: QueuedPrompt[] }
+  | { type: 'run.prompt_appended'; turn_id?: string; prompts?: string[] }
   | { type: 'run.resync_required'; run_id: string; session_id: string; oldest_seq: number }
   | { type: 'turn.committed'; turn_id: string; last_seq: number }
   | { type: 'turn.failed'; turn_id: string; code: string; message: string }
@@ -219,7 +221,19 @@ export interface ModelOutputActivity {
 	iteration: number
 }
 
-export type RunStep = ReasoningActivity | ModelOutputActivity | ToolActivity
+export interface UserPromptActivity {
+	kind: 'user'
+	id: string
+	text: string
+	iteration: number
+}
+
+export type RunStep = ReasoningActivity | ModelOutputActivity | ToolActivity | UserPromptActivity
+
+export interface QueuedPrompt {
+  id: string
+  content: string
+}
 
 export interface ActiveRun {
   id: string
@@ -228,6 +242,7 @@ export interface ActiveRun {
   restored?: boolean
   userText: string
   userImages?: ImageAttachmentInput[]
+	queuedPrompts?: QueuedPrompt[]
 	assistantText: string
 	steps: RunStep[]
   agentIteration: number

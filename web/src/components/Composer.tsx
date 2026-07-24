@@ -47,7 +47,7 @@ export function Composer(props: {
   const nextPastedImageID = useRef(1)
   const [imageError, setImageError] = useState('')
   const [submitting, setSubmitting] = useState(false)
-  const composerDisabled = props.running || props.blocked || submitting
+  const composerDisabled = props.blocked || submitting
   const resizeTextarea = useCallback(() => {
     const textarea = textareaRef.current
     if (!textarea) return
@@ -65,7 +65,7 @@ export function Composer(props: {
   }, [resizeTextarea])
 
   const submit = async () => {
-    if (props.running || props.blocked || submitting) return
+    if (props.blocked || submitting) return
     const content = [...props.draft.pastedTexts.map((pastedText) => pastedText.content), props.draft.content]
       .filter((part) => part.trim())
       .join('\n\n')
@@ -76,6 +76,9 @@ export function Composer(props: {
       if (await props.onSend(content, props.draft.pastedImages)) {
         props.onDraftClear()
         setImageError('')
+        // Keep focus in the textarea so the user can keep typing (e.g. append
+        // another message) without clicking back after Enter submits.
+        textareaRef.current?.focus()
       }
     } catch (reason) {
       setImageError(errorMessage(reason))
@@ -125,7 +128,7 @@ export function Composer(props: {
   }
 
   const placeholder = props.running
-    ? 'SAI is working…'
+    ? 'Append a message to the current run…'
     : props.blocked
       ? 'Another session is running. Switch back to check progress'
       : props.draft.pastedTexts.length > 0
@@ -204,11 +207,8 @@ export function Composer(props: {
             }
           }}
         />
-        {props.running ? (
-          <button className="stop-button" onClick={props.onCancel}><StopIcon /> Stop</button>
-        ) : (
-		  <button className="send-button" disabled={(!props.draft.content.trim() && props.draft.pastedTexts.length === 0 && props.draft.pastedImages.length === 0) || composerDisabled} onClick={() => void submit()} aria-label="Send"><SendIcon /></button>
-        )}
+        {props.running && <button className="stop-button" onClick={props.onCancel} aria-label="Stop"><StopIcon /></button>}
+		<button className="send-button" disabled={(!props.draft.content.trim() && props.draft.pastedTexts.length === 0 && props.draft.pastedImages.length === 0) || composerDisabled} onClick={() => void submit()} aria-label={props.running ? 'Append to current run' : 'Send'}><SendIcon /></button>
       </div>
       <div className="composer-hint"><span>{props.draft.pastedImages.length > 0 ? 'Images will be sent with the message' : props.draft.pastedTexts.length > 0 ? 'Pasted text is sent first, then your note' : 'Enter to send · Shift+Enter for a new line · Paste images supported'}</span><span>Running locally</span></div>
     </div>

@@ -585,6 +585,62 @@ func (s *Server) handleCancelRun(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+type appendActiveRequest struct {
+	Content string `json:"content"`
+}
+
+// handleAppendActive queues a user prompt on a running session run. The prompt
+// is appended to the in-flight turn at the next safe checkpoint, or sent as a
+// follow-up turn if the active turn settles first; it is never dropped. The
+// current queue is published to the run's event stream as run.prompt_queue.
+func (s *Server) handleAppendActive(w http.ResponseWriter, r *http.Request) {
+	var body appendActiveRequest
+	if !decodeJSONWithLimit(w, r, &body, maxRunRequestBytes) {
+		return
+	}
+	if strings.TrimSpace(body.Content) == "" {
+		writeAPIError(w, http.StatusBadRequest, "invalid_content", "content is required")
+		return
+	}
+	managed, ok := s.runs.get(r.PathValue("runID"))
+	if !ok {
+		writeAPIError(w, http.StatusNotFound, "not_found", "run not found")
+		return
+	}
+	if err := managed.run.AppendActive(body.Content); err != nil {
+		if errors.Is(err, execution.ErrSessionRunSettled) {
+			writeAPIError(w, http.StatusConflict, "run_settled", "run is no longer accepting prompts")
+			return
+		}
+		writeServiceError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusAccepted, map[string]string{
+		"run_id": managed.id,
+		"status": "accepted",
+	})
+}
+
+// handleRemoveActivePrompt deletes a not-yet-sent queued prompt from a running
+// session run. Only prompts still in the queue can be removed; once a prompt
+// has been drained into a turn it is durable session input. The updated queue
+// is published to the run's event stream as run.prompt_queue.
+func (s *Server) handleRemoveActivePrompt(w http.ResponseWriter, r *http.Request) {
+	managed, ok := s.runs.get(r.PathValue("runID"))
+	if !ok {
+		writeAPIError(w, http.StatusNotFound, "not_found", "run not found")
+		return
+	}
+	if !managed.run.RemoveActive(r.PathValue("promptID")) {
+		writeAPIError(w, http.StatusNotFound, "not_found", "queued prompt not found")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{
+		"run_id": managed.id,
+		"status": "removed",
+	})
+}
+
 func (s *Server) handleRunEvents(w http.ResponseWriter, r *http.Request) {
 	managed, ok := s.runs.get(r.PathValue("runID"))
 	if !ok {

@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { api, streamRun } from './api'
-import type { ActiveRun, ActiveRunDescriptor, Bootstrap, ImageAttachmentInput, ItemsPage, Project, RunEvent, RunStep, Session, SessionModelOption } from './types'
+import type { ActiveRun, ActiveRunDescriptor, Bootstrap, ImageAttachmentInput, ItemsPage, Project, QueuedPrompt, RunEvent, RunStep, Session, SessionModelOption } from './types'
 import { errorMessage } from './lib/format'
 import { appendModelOutput, appendReasoning, updateToolStep } from './lib/runSteps'
 import { modelKey, orderSessions, processKey, sessionName } from './lib/session'
@@ -322,6 +322,28 @@ function App() {
       case 'turn.started':
         update((run) => ({ ...run, turnID: String(event.turn_id ?? '') }))
         break
+      case 'run.prompt_queue':
+        update((run) => ({
+          ...run,
+          queuedPrompts: Array.isArray(event.prompts)
+            ? event.prompts
+                .map((prompt) => (prompt && typeof prompt === 'object' ? { id: String((prompt as QueuedPrompt).id ?? ''), content: String((prompt as QueuedPrompt).content ?? '') } : null))
+                .filter((prompt): prompt is QueuedPrompt => Boolean(prompt && prompt.id))
+            : [],
+        }))
+        break
+      case 'run.prompt_appended':
+        update((run) => {
+          const prompts = Array.isArray(event.prompts) ? event.prompts.map(String).filter((text) => text.trim()) : []
+          if (prompts.length === 0) return run
+          const iteration = run.agentIteration > 0 ? run.agentIteration : 1
+          const steps = [...run.steps]
+          prompts.forEach((text, index) => {
+            steps.push({ kind: 'user', id: `appended-${run.id}-${steps.length}-${index}`, text, iteration })
+          })
+          return { ...run, steps }
+        })
+        break
       case 'agent.iteration.started':
         update((run) => {
           const agentIteration = Number(event.agent_iteration ?? 0)
@@ -430,8 +452,23 @@ function App() {
   }, [addActiveRun, handleRunEvent, recoveredRuns, refreshSession, updateActiveRun])
 
   const sendMessage = async (content: string, images: PastedImageAttachment[]): Promise<boolean> => {
-    if (!selectedSessionID || activeRunsRef.current[selectedSessionID] || (!content.trim() && images.length === 0)) return false
+    if (!selectedSessionID || (!content.trim() && images.length === 0)) return false
     const sessionID = selectedSessionID
+    const activeRun = activeRunsRef.current[sessionID]
+    if (activeRun) {
+      // Append to the in-flight run: the message is queued and injected into
+      // the active turn at the next safe checkpoint, or sent as a follow-up
+      // turn. It is never sent as a new run here. The queued state arrives via
+      // the run.prompt_queue stream event; no local echo is added.
+      if (!content.trim()) return false
+      try {
+        await api.appendRunMessage(activeRun.id, content)
+        return true
+      } catch (reason) {
+        setError(errorMessage(reason))
+        return false
+      }
+    }
     const imageInputs: ImageAttachmentInput[] = images.map((image) => ({ data_url: image.dataURL, detail: 'auto' }))
     try {
       const started = await api.startRun(sessionID, content, imageInputs)
@@ -464,6 +501,16 @@ function App() {
     if (!run) return
     try {
       await api.cancelRun(run.id)
+    } catch (reason) {
+      setError(errorMessage(reason))
+    }
+  }
+
+  const removeQueuedPrompt = async (promptID: string) => {
+    const run = activeRunsRef.current[selectedSessionID]
+    if (!run) return
+    try {
+      await api.removeRunMessage(run.id, promptID)
     } catch (reason) {
       setError(errorMessage(reason))
     }
@@ -529,6 +576,7 @@ function App() {
             onLoadOlder={() => void loadOlder()}
             onSend={(content, images) => sendMessage(content, images)}
             onCancel={() => void cancelRun()}
+            onRemoveQueuedPrompt={(promptID) => void removeQueuedPrompt(promptID)}
             onCompact={() => void compactSession()}
           />
         ) : selectedProject ? (

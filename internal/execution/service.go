@@ -692,6 +692,25 @@ type SessionRun struct {
 	err       error
 	accepting bool
 	queue     []*PromptReceipt
+
+	// activeQueue holds user prompt contents submitted via AppendActive that
+	// have not yet been sent to the model. Messages leave the queue in exactly
+	// two ways, both of which send them to the server: (1) the active prompt
+	// drain injects them into the in-flight turn at a safe checkpoint, or
+	// (2) the run goroutine drains any remainder into a fresh follow-up turn
+	// after the active turn settles. Queued messages are never dropped. Every
+	// mutation publishes a full run.prompt_queue snapshot via queueNotify.
+	activeQueue   []activePrompt
+	activeTurnID  string
+	activeEmit    func(SessionStreamEvent)
+	nextPromptID  int
+}
+
+// activePrompt is one queued append-active prompt with a stable id so clients
+// can remove a specific not-yet-sent message even when contents repeat.
+type activePrompt struct {
+	ID      string `json:"id"`
+	Content string `json:"content"`
 }
 
 // StartSessionRun begins running the session message orchestration for id in a
@@ -724,14 +743,38 @@ func (s *Service) StartSessionRunWithInput(ctx context.Context, id string, input
 	go func() {
 		defer cancel()
 		defer close(run.done)
-		result, err := s.runSessionMessage(runCtx, id, input, emit)
+		result, err := s.runSessionMessageWithActive(runCtx, run, id, input, emit)
+		if err == nil {
+			// After the active turn settles, send any prompts still queued via
+			// AppendActive as a follow-up turn so they are never dropped. The
+			// drain may already have consumed some into the active turn; only
+			// the remainder is still in the queue. Drain while the emit path is
+			// still registered so the emptied snapshot is published.
+			remaining := run.drainActiveQueue()
+			run.clearActiveTurn()
+			if len(remaining) > 0 {
+				followInput := SessionMessageInput{Content: strings.Join(remaining, "\n\n")}
+				var followResult SessionMessageResult
+				followResult, err = s.runSessionMessageWithActive(runCtx, run, id, followInput, emit)
+				run.clearActiveTurn()
+				if err == nil {
+					result = followResult
+				}
+			}
+		} else {
+			// The active turn failed or was cancelled; drop any unsent queued
+			// prompts and publish an empty snapshot before clearing the emit
+			// path so the queue visibly drains.
+			run.drainActiveQueue()
+			run.clearActiveTurn()
+		}
 		if err == nil {
 			for {
 				receipt, ok := run.nextReceiptOrStop()
 				if !ok {
 					break
 				}
-				turnResult, turnErr := s.runSessionMessage(runCtx, id, SessionMessageInput{Content: receipt.event.Content}, emit)
+				turnResult, turnErr := s.runSessionMessage(runCtx, id, SessionMessageInput{Content: receipt.event.Content}, emit, nil)
 				if turnErr != nil {
 					effErr := run.effectiveError(turnErr, runCtx)
 					receipt.settle(turnResult, effErr)
@@ -774,6 +817,155 @@ func (r *SessionRun) Cancel() {
 		return
 	}
 	r.cancel()
+}
+
+// AppendActive queues a user prompt to be appended to the in-flight turn at
+// the next safe checkpoint, or, if the turn has already settled, sent as a
+// follow-up turn. Queued prompts are never dropped: they are always delivered
+// to the model, either by injection into the active turn or by a follow-up
+// turn. It returns ErrSessionRunSettled once the run is no longer accepting
+// prompts. Every accepted append publishes a full run.prompt_queue snapshot.
+func (r *SessionRun) AppendActive(content string) error {
+	if r == nil {
+		return ErrSessionRunSettled
+	}
+	if strings.TrimSpace(content) == "" {
+		return fmt.Errorf("active prompt content must be a non-empty string")
+	}
+	r.mu.Lock()
+	if !r.accepting {
+		r.mu.Unlock()
+		return ErrSessionRunSettled
+	}
+	r.nextPromptID++
+	r.activeQueue = append(r.activeQueue, activePrompt{ID: fmt.Sprintf("ap-%d", r.nextPromptID), Content: content})
+	r.publishQueueSnapshotLocked()
+	r.mu.Unlock()
+	return nil
+}
+
+// RemoveActive deletes a not-yet-sent queued prompt by id and publishes the
+// updated snapshot. It reports whether a prompt with that id was present; a
+// missing id (already sent or never queued) is a no-op returning false. Only
+// prompts still in the queue can be removed; once drained into a turn they are
+// durable session input and out of scope.
+func (r *SessionRun) RemoveActive(promptID string) bool {
+	if r == nil {
+		return false
+	}
+	r.mu.Lock()
+	index := -1
+	for i, prompt := range r.activeQueue {
+		if prompt.ID == promptID {
+			index = i
+			break
+		}
+	}
+	if index < 0 {
+		r.mu.Unlock()
+		return false
+	}
+	r.activeQueue = append(r.activeQueue[:index], r.activeQueue[index+1:]...)
+	r.publishQueueSnapshotLocked()
+	r.mu.Unlock()
+	return true
+}
+
+// publishQueueSnapshotLocked emits a full snapshot of the current queue. The
+// caller must hold r.mu; the emit happens after the lock would normally be
+// released, but emitting under the lock keeps the snapshot consistent with the
+// mutation and the sink serializes delivery without blocking the bus.
+func (r *SessionRun) publishQueueSnapshotLocked() {
+	publishPromptQueueSnapshot(r.activeEmit, r.activeTurnID, r.activeQueue)
+}
+
+// setActiveTurn registers the in-flight turn's id and emit path so AppendActive
+// can publish queue snapshots tagged with the turn being appended to. It is
+// called by the run goroutine before RunSessionTurn.
+func (r *SessionRun) setActiveTurn(turnID string, emit func(SessionStreamEvent)) {
+	r.mu.Lock()
+	r.activeTurnID = turnID
+	r.activeEmit = emit
+	r.mu.Unlock()
+}
+
+// clearActiveTurn deregisters the in-flight turn after it settles. It does not
+// touch the queue; any remainder is handled by the run goroutine.
+func (r *SessionRun) clearActiveTurn() {
+	r.mu.Lock()
+	r.activeTurnID = ""
+	r.activeEmit = nil
+	r.mu.Unlock()
+}
+
+// drainActiveQueue removes and returns every queued active prompt, publishing
+// an empty snapshot. It returns nil when the queue is already empty. The run
+// goroutine uses it both to inject prompts into the active turn and to gather
+// the remainder for a follow-up turn; AppendActive uses the returned contents
+// verbatim and never reorders them.
+func (r *SessionRun) drainActiveQueue() []string {
+	r.mu.Lock()
+	if len(r.activeQueue) == 0 {
+		r.mu.Unlock()
+		return nil
+	}
+	drained := make([]string, 0, len(r.activeQueue))
+	for _, prompt := range r.activeQueue {
+		drained = append(drained, prompt.Content)
+	}
+	r.activeQueue = nil
+	r.publishQueueSnapshotLocked()
+	r.mu.Unlock()
+	return drained
+}
+
+// activePromptDrain adapts the run's append-active queue into the session turn
+// drain callback polled at safe checkpoints. Drained prompts become
+// model.Message values with role user; the agent loop persists each with the
+// shared turn id before appending it to the in-flight history.
+func (r *SessionRun) activePromptDrain() SessionActivePromptDrain {
+	return func(SessionActivePromptCheckpoint) []model.Message {
+		drained := r.drainActiveQueue()
+		if len(drained) == 0 {
+			return nil
+		}
+		messages := make([]model.Message, 0, len(drained))
+		for _, content := range drained {
+			messages = append(messages, model.Message{Role: model.MessageRoleUser, Content: content})
+		}
+		// Notify live clients that queued prompts were just injected into the
+		// active turn so they can render them in place before the durable
+		// history is refreshed at turn end.
+		r.mu.Lock()
+		turnID := r.activeTurnID
+		emit := r.activeEmit
+		r.mu.Unlock()
+		if emit != nil {
+			fields := map[string]any{"prompts": append([]string(nil), drained...)}
+			if turnID != "" {
+				fields["turn_id"] = turnID
+			}
+			emit(NewSessionStreamEvent("run.prompt_appended", fields))
+		}
+		return messages
+	}
+}
+
+// publishPromptQueueSnapshot emits a full run.prompt_queue snapshot so clients
+// can render the not-yet-sent queue. A nil emit is a no-op; prompts is the
+// complete current queue (nil or empty clears it). Each prompt carries a stable
+// id so clients can remove a specific not-yet-sent message.
+func publishPromptQueueSnapshot(emit func(SessionStreamEvent), turnID string, prompts []activePrompt) {
+	if emit == nil {
+		return
+	}
+	list := make([]activePrompt, 0, len(prompts))
+	list = append(list, prompts...)
+	fields := map[string]any{"prompts": list}
+	if turnID != "" {
+		fields["turn_id"] = turnID
+	}
+	emit(NewSessionStreamEvent("run.prompt_queue", fields))
 }
 
 // settle records the terminal result and derives the run status from the
@@ -941,7 +1133,16 @@ func (s *Service) validateSessionMessageInput(session sessions.SessionV2, input 
 	return nil
 }
 
-func (s *Service) runSessionMessage(ctx context.Context, id string, input SessionMessageInput, emit func(SessionStreamEvent)) (SessionMessageResult, error) {
+// runSessionMessageWithActive runs one session message turn with run's
+// append-active queue wired in: it registers the turn so AppendActive publishes
+// turn-tagged queue snapshots, and supplies the drain that injects queued
+// prompts at safe checkpoints. All other runSessionMessage callers pass a nil
+// run and no drain.
+func (s *Service) runSessionMessageWithActive(ctx context.Context, run *SessionRun, id string, input SessionMessageInput, emit func(SessionStreamEvent)) (SessionMessageResult, error) {
+	return s.runSessionMessage(ctx, id, input, emit, run)
+}
+
+func (s *Service) runSessionMessage(ctx context.Context, id string, input SessionMessageInput, emit func(SessionStreamEvent), run *SessionRun) (SessionMessageResult, error) {
 	content := input.Content
 	if ctx == nil {
 		ctx = context.Background()
@@ -1075,6 +1276,11 @@ func (s *Service) runSessionMessage(ctx context.Context, id string, input Sessio
 	submitSessionStreamEvent(submit, NewSessionStreamEvent("turn.started", map[string]any{
 		"turn_id": turnID,
 	}))
+	var activePromptDrain SessionActivePromptDrain
+	if run != nil {
+		run.setActiveTurn(turnID, emit)
+		activePromptDrain = run.activePromptDrain()
+	}
 
 	session, err = s.planAutoCompaction(ctx, bus, session, turnID, input)
 	if err != nil {
@@ -1087,11 +1293,12 @@ func (s *Service) runSessionMessage(ctx context.Context, id string, input Sessio
 	}
 
 	result, err := s.turnRunner.RunSessionTurn(ctx, SessionTurnRequest{
-		Session:       session,
-		SessionStore:  s.sessionStore,
-		TurnID:        turnID,
-		Content:       content,
-		ContentBlocks: copyInputContentBlocks(input.ContentBlocks),
+		Session:           session,
+		SessionStore:      s.sessionStore,
+		TurnID:            turnID,
+		Content:           content,
+		ContentBlocks:     copyInputContentBlocks(input.ContentBlocks),
+		ActivePromptDrain: activePromptDrain,
 		Emit: func(event model.Event) {
 			if event != nil {
 				_ = bus.Publish(eventbus.ModelEvent{Event: event})

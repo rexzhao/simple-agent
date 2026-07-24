@@ -121,6 +121,13 @@ export const api = {
     return await response.blob()
   },
   cancelRun: (runID: string) => request(`/api/runs/${encodeURIComponent(runID)}`, { method: 'DELETE' }),
+  appendRunMessage: (runID: string, content: string) => request(`/api/runs/${encodeURIComponent(runID)}/prompts`, {
+    method: 'POST',
+    body: JSON.stringify({ content }),
+  }),
+  removeRunMessage: (runID: string, promptID: string) => request(`/api/runs/${encodeURIComponent(runID)}/prompts/${encodeURIComponent(promptID)}`, {
+    method: 'DELETE',
+  }),
   activeRuns: () => request<{ runs: ActiveRunDescriptor[] }>('/api/runs/active'),
 }
 

@@ -20,11 +20,32 @@ export function ProcessTimeline({ steps }: { steps: RunStep[] }) {
 						{iteration.steps.map((step, stepIndex) => {
 							const first = stepIndex === 0
 							const marker = first ? <i className="iteration-marker">{iteration.number}</i> : null
-							return step.kind === 'reasoning'
-								? <div className="reasoning-step" key={step.id}>{marker}<span>{step.label || 'Reasoning'}</span><pre>{step.text}</pre></div>
-								: step.kind === 'output'
-									? <div className="model-output-step" key={step.id}>{marker}<div className="markdown-body"><Markdown remarkPlugins={[remarkGfm]} components={markdownComponents} skipHtml>{step.text}</Markdown></div></div>
-									: <ToolRow key={step.id} tool={step} marker={marker} />
+							if (step.kind === 'reasoning') {
+								return <div className="reasoning-step" key={step.id}>{marker}<span>{step.label || 'Reasoning'}</span><pre>{step.text}</pre></div>
+							}
+							if (step.kind === 'output') {
+								// Mid-turn assistant output renders like the final assistant
+								// message: plain markdown body, no process card chrome.
+								return (
+									<div className="step-message assistant" key={step.id}>{marker}
+										<div className="message-text markdown-body"><Markdown remarkPlugins={[remarkGfm]} components={markdownComponents} skipHtml>{step.text}</Markdown></div>
+									</div>
+								)
+							}
+							if (step.kind === 'user') {
+								// A mid-turn appended message renders like a regular user
+								// message: avatar and name on the right, plain text.
+								return (
+									<article className="message user step-message" key={step.id}>{marker}
+										<div className="message-avatar">You</div>
+										<div className="message-content">
+											<div className="message-meta"><strong>You</strong></div>
+											<div className="message-text">{step.text}</div>
+										</div>
+									</article>
+								)
+							}
+							return <ToolRow key={step.id} tool={step} marker={marker} />
 						})}
 					</div>
 				</section>

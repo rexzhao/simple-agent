@@ -3,7 +3,7 @@ import Markdown from 'react-markdown'
 import type { Components } from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { api } from '../api'
-import type { ActiveRun, ItemsPage, RunStep, Session, SessionImageAttachment, SessionItem, ToolActivity } from '../types'
+import type { ActiveRun, ItemsPage, QueuedPrompt, RunStep, Session, SessionImageAttachment, SessionItem, ToolActivity } from '../types'
 import { blobAsDataURL, copyText, formatTime, formatTokenCount } from '../lib/format'
 import { itemText, processKey, sessionName } from '../lib/session'
 import { Composer } from './Composer'
@@ -30,6 +30,7 @@ export function Conversation(props: {
   onLoadOlder: () => void
   onSend: (content: string, images: PastedImageAttachment[]) => Promise<boolean>
   onCancel: () => void
+  onRemoveQueuedPrompt: (promptID: string) => void
   onCompact: () => void
 }) {
   const bottomRef = useRef<HTMLDivElement>(null)
@@ -73,7 +74,7 @@ export function Conversation(props: {
         {props.page?.has_more_before && <button className="load-older" onClick={props.onLoadOlder}>Load earlier messages</button>}
         {!props.page && <MessageSkeleton />}
 				{buildConversationEntries(visibleItems, props.detail?.id ?? '', props.recentStepsByTurn).map((entry) => entry.kind === 'message'
-					? <Message key={entry.item.id} item={entry.item} sessionID={props.detail?.id ?? ''} />
+					? <Message key={entry.item.id} item={entry.item} sessionID={props.detail?.id ?? ''} suppressAvatar={Boolean(entry.suppressAvatar)} />
 					: <HistoricalProcess key={entry.id} entry={entry} />)}
         {props.activeRun && <ActiveRunView run={props.activeRun} />}
 		{props.page && visibleItems.length === 0 && !props.activeRun && (
@@ -81,6 +82,7 @@ export function Conversation(props: {
         )}
         <div ref={bottomRef} />
       </section>
+	  <QueuedPromptList prompts={props.activeRun?.queuedPrompts ?? []} onRemove={props.onRemoveQueuedPrompt} />
 	  <Composer
 		draft={props.draft}
 		onContentChange={props.onDraftChange}
@@ -143,7 +145,7 @@ function ContextUsage(props: { context: Session['context']; activeInputTokens?: 
 	)
 }
 
-function Message({ item, sessionID }: { item: SessionItem; sessionID: string }) {
+function Message({ item, sessionID, suppressAvatar = false }: { item: SessionItem; sessionID: string; suppressAvatar?: boolean }) {
   const role = item.message?.role
   const text = item.message?.content?.inline || item.message?.content?.preview || ''
   const images = item.message?.images ?? []
@@ -160,7 +162,7 @@ function Message({ item, sessionID }: { item: SessionItem; sessionID: string }) 
 		}
 	}
   return (
-    <article className={`message ${role === 'user' ? 'user' : 'assistant'}`}>
+    <article className={`message ${role === 'user' ? 'user' : 'assistant'}${suppressAvatar ? ' no-avatar' : ''}`}>
       <div className="message-avatar">{role === 'user' ? 'You' : <LogoIcon />}</div>
       <div className="message-content">
         <div className="message-meta"><strong>{role === 'user' ? 'You' : 'SAI'}</strong><time>{formatTime(item.created_at)}</time></div>
@@ -209,6 +211,27 @@ function StoredImageAttachment(props: { sessionID: string; image: SessionImageAt
   return <img className="message-image" src={dataURL} alt={`Attached image (${props.image.media_type})`} />
 }
 
+function QueuedPromptList({ prompts, onRemove }: { prompts: QueuedPrompt[]; onRemove: (promptID: string) => void }) {
+  if (prompts.length === 0) return null
+  return (
+    <div className="queued-prompt-list" aria-label="Queued messages">
+      {prompts.map((prompt) => (
+        <div className="queued-prompt-row" key={prompt.id}>
+          <span className="queued-prompt-badge">Queued</span>
+          <span className="queued-prompt-text" title={prompt.content}>{prompt.content}</span>
+          <button
+            type="button"
+            className="queued-prompt-remove"
+            onClick={() => onRemove(prompt.id)}
+            aria-label="Remove queued message"
+            title="Remove"
+          >×</button>
+        </div>
+      ))}
+    </div>
+  )
+}
+
 function ActiveRunView({ run }: { run: ActiveRun }) {
   return (
     <>
@@ -226,22 +249,67 @@ function ActiveRunView({ run }: { run: ActiveRun }) {
           </div>
         </article>
       )}
-      <article className="message assistant transient">
-        <div className="message-avatar"><LogoIcon /></div>
-        <div className="message-content">
-          <div className="message-meta"><strong>SAI</strong><span className="streaming-label"><i />Generating</span></div>
-					{run.steps.length > 0 && <ProcessTimeline steps={run.steps} />}
-          {run.assistantText ? <MarkdownMessage text={run.assistantText} streaming /> : <div className="message-text assistant-stream"><span className="cursor" /></div>}
-			{run.totalTokens !== undefined && (
-				<div className="token-note">
-					This turn: {run.totalTokens.toLocaleString()} tokens
-					{Boolean(run.cachedTokens) && ` · Cache hit ${run.cachedTokens?.toLocaleString()}`}
-					{Boolean(run.cacheWriteTokens) && ` · Cache write ${run.cacheWriteTokens?.toLocaleString()}`}
-					{Boolean(run.reasoningTokens) && ` · Reasoning ${run.reasoningTokens?.toLocaleString()}`}
-				</div>
-			)}
-        </div>
-      </article>
+      <ActiveRunBody run={run} />
+    </>
+  )
+}
+
+// ActiveRunBody renders the in-flight turn. Mid-turn appended user messages
+// interrupt the assistant process: the steps gathered before an appended user
+// message form one assistant segment, the appended message renders as its own
+// user bubble, and the remaining steps continue in a following assistant
+// segment. The streaming text and token note live in the trailing segment.
+function ActiveRunBody({ run }: { run: ActiveRun }) {
+  const segments: Array<{ kind: 'steps'; steps: RunStep[] } | { kind: 'user'; step: Extract<RunStep, { kind: 'user' }> }> = []
+  let current: RunStep[] = []
+  for (const step of run.steps) {
+    if (step.kind === 'user') {
+      if (current.length > 0) segments.push({ kind: 'steps', steps: current })
+      current = []
+      segments.push({ kind: 'user', step })
+    } else {
+      current.push(step)
+    }
+  }
+  if (current.length > 0) segments.push({ kind: 'steps', steps: current })
+
+  const trailing = run.assistantText || run.totalTokens !== undefined || segments.length === 0
+  const tokenNote = run.totalTokens !== undefined && (
+    <div className="token-note">
+      This turn: {run.totalTokens.toLocaleString()} tokens
+      {Boolean(run.cachedTokens) && ` · Cache hit ${run.cachedTokens?.toLocaleString()}`}
+      {Boolean(run.cacheWriteTokens) && ` · Cache write ${run.cacheWriteTokens?.toLocaleString()}`}
+      {Boolean(run.reasoningTokens) && ` · Reasoning ${run.reasoningTokens?.toLocaleString()}`}
+    </div>
+  )
+
+  return (
+    <>
+      {segments.map((segment, index) => {
+        const isLast = index === segments.length - 1
+        if (segment.kind === 'user') {
+          return (
+            <article className="message user transient" key={segment.step.id}>
+              <div className="message-avatar">You</div>
+              <div className="message-content">
+                <div className="message-meta"><strong>You</strong></div>
+                <div className="message-text">{segment.step.text}</div>
+              </div>
+            </article>
+          )
+        }
+        return (
+          <article className="message assistant transient" key={`steps-${index}`}>
+            <div className="message-avatar"><LogoIcon /></div>
+            <div className="message-content">
+              {index === 0 && <div className="message-meta"><strong>SAI</strong><span className="streaming-label"><i />Generating</span></div>}
+              <ProcessTimeline steps={segment.steps} />
+              {isLast && trailing && (run.assistantText ? <MarkdownMessage text={run.assistantText} streaming /> : <div className="message-text assistant-stream"><span className="cursor" /></div>)}
+              {isLast && tokenNote}
+            </div>
+          </article>
+        )
+      })}
     </>
   )
 }
@@ -259,7 +327,7 @@ function MarkdownMessage({ text, streaming = false }: { text: string; streaming?
 }
 
 type ConversationEntry =
-	| { kind: 'message'; item: SessionItem }
+	| { kind: 'message'; item: SessionItem; suppressAvatar?: boolean }
 	| { kind: 'process'; id: string; createdAt: string; steps: RunStep[] }
 
 function buildConversationEntries(items: SessionItem[], sessionID: string, recentStepsByTurn: Record<string, RunStep[]>): ConversationEntry[] {
@@ -287,8 +355,20 @@ function buildConversationEntries(items: SessionItem[], sessionID: string, recen
 		const role = item.message?.role
 		const text = itemText(item)
 		if (role === 'user') {
+			const itemTurnID = item.turn_id || ''
+			// A user item sharing the in-progress process turn id is a mid-turn
+			// appended message: it interrupts the process. Flush the steps gathered
+			// so far into their own process entry, render the user message as a
+			// regular bubble, then keep accumulating the rest of the same turn into
+			// a fresh process entry.
+			if (processTurnID && itemTurnID && itemTurnID === processTurnID) {
+				flushProcess(processTurnID)
+				processTurnID = itemTurnID
+				entries.push({ kind: 'message', item })
+				continue
+			}
 			flushProcess(processTurnID)
-			processTurnID = item.turn_id || ''
+			processTurnID = itemTurnID
 			agentIteration = 0
 			entries.push({ kind: 'message', item })
 			continue
@@ -330,23 +410,35 @@ function buildConversationEntries(items: SessionItem[], sessionID: string, recen
 		if (text) entries.push({ kind: 'message', item })
 	}
 	flushProcess(processTurnID)
-	return entries
+	return withSuppressedAvatars(entries)
+}
+
+// withSuppressedAvatars marks assistant messages whose immediately preceding
+// visible entry is also assistant-side (an assistant message or a process
+// card). A process card already carries the assistant avatar, so a directly
+// following assistant message repeats it unless a user message in between
+// switched the visible role back to the user.
+function withSuppressedAvatars(entries: ConversationEntry[]): ConversationEntry[] {
+	let previousRole: 'user' | 'assistant' | null = null
+	return entries.map((entry) => {
+		const role: 'user' | 'assistant' = entry.kind === 'process'
+			? 'assistant'
+			: entry.item.message?.role === 'user' ? 'user' : 'assistant'
+		const suppress = role === 'assistant' && previousRole === 'assistant'
+		previousRole = role
+		if (entry.kind === 'message' && suppress) {
+			return { ...entry, suppressAvatar: true }
+		}
+		return entry
+	})
 }
 
 function HistoricalProcess({ entry }: { entry: Extract<ConversationEntry, { kind: 'process' }> }) {
-	const reasoningCount = entry.steps.filter((step) => step.kind === 'reasoning').length
-	const outputCount = entry.steps.filter((step) => step.kind === 'output').length
-	const toolCount = entry.steps.filter((step) => step.kind === 'tool').length
-	const iterationCount = new Set(entry.steps.map((step) => step.iteration)).size
-	const summary = [`${iterationCount} ${iterationCount === 1 ? 'iteration' : 'iterations'}`, reasoningCount > 0 ? `${reasoningCount} reasoning ${reasoningCount === 1 ? 'block' : 'blocks'}` : '', outputCount > 0 ? `${outputCount} intermediate ${outputCount === 1 ? 'output' : 'outputs'}` : '', toolCount > 0 ? `${toolCount} tool ${toolCount === 1 ? 'call' : 'calls'}` : ''].filter(Boolean).join(' · ')
 	return (
 		<article className="message assistant process-message">
 			<div className="message-avatar"><LogoIcon /></div>
 			<div className="message-content">
-				<details className="process-card">
-					<summary><span>Execution details</span><small>{summary}</small><time>{formatTime(entry.createdAt)}</time></summary>
-					<ProcessTimeline steps={entry.steps} />
-				</details>
+				<ProcessTimeline steps={entry.steps} />
 			</div>
 		</article>
 	)

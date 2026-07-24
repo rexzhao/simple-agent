@@ -46,7 +46,7 @@ export function groupProcessSteps(steps: RunStep[]): Array<{ number: number; ste
 		const iteration = normalizedAgentIteration(step.iteration)
 		groups.set(iteration, [...(groups.get(iteration) ?? []), step])
 	}
-	const rank = (step: RunStep) => step.kind === 'reasoning' ? 0 : step.kind === 'output' ? 1 : 2
+	const rank = (step: RunStep) => step.kind === 'reasoning' ? 0 : step.kind === 'output' ? 1 : step.kind === 'user' ? 3 : 2
 	return [...groups.entries()]
 		.sort(([left], [right]) => left - right)
 		.map(([number, turnSteps]) => ({ number, steps: [...turnSteps].sort((left, right) => rank(left) - rank(right)) }))
