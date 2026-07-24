@@ -288,7 +288,14 @@ svg { width: 1.1em; height: 1.1em; fill: none; stroke: currentColor; stroke-widt
   font-family: var(--font-content);
 }
 
-.message { display: block; margin: 0 0 30px; }
+.message {
+  display: block;
+  margin: 0 0 30px;
+  /* Keep long histories in the DOM for reliable scroll anchoring, but let the
+     browser skip layout/paint work for messages far outside the viewport. */
+  content-visibility: auto;
+  contain-intrinsic-size: auto 160px;
+}
 .message.user { margin-left: min(120px, 10%); }
 .message.user .message-content { display: flex; flex-direction: column; align-items: flex-end; }
 .message-content { min-width: 0; }

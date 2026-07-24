@@ -1,10 +1,10 @@
-import { useState } from 'react'
+import { memo, useState } from 'react'
 import type { Project, Session } from '../types'
 import { projectName, sessionName } from '../lib/session'
 import { relativeTime } from '../lib/format'
 import { ArchiveIcon, ChatIcon, ChevronIcon, LogoIcon, PlusIcon, SettingsIcon, TrashIcon } from './icons'
 
-export function WorkspaceTree(props: {
+export const WorkspaceTree = memo(function WorkspaceTree(props: {
   projects: Project[]
   sessionsByProject: Record<string, Session[]>
   selectedProjectID: string
@@ -97,4 +97,4 @@ export function WorkspaceTree(props: {
       </div>
     </aside>
   )
-}
+})

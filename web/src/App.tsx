@@ -1,11 +1,11 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 import { api, streamRun } from './api'
-import type { ActiveRun, ActiveRunDescriptor, Bootstrap, ImageAttachmentInput, ItemsPage, Project, RunEvent, RunStep, Session, SessionModelOption } from './types'
+import type { ActiveRun, ActiveRunDescriptor, Bootstrap, ImageAttachmentInput, Project, RunEvent, RunStep, Session, SessionModelOption } from './types'
 import { errorMessage } from './lib/format'
 import { reduceRunEvent } from './lib/runEventReducer'
 import { modelKey, orderSessions, processKey, sessionName } from './lib/session'
-import { Composer, emptyComposerDraft, maxPastedImageAttachments } from './components/Composer'
-import type { ComposerDraft, PastedImageAttachment, PastedTextAttachment } from './components/Composer'
+import { emptyComposerDraft } from './components/Composer'
+import type { PastedImageAttachment } from './components/Composer'
 import { Conversation } from './components/Conversation'
 import { EmptySession, ErrorBanner, ProjectSetup, Splash } from './components/misc'
 import { ProviderManagerDialog } from './components/ProviderManagerDialog'
@@ -13,6 +13,10 @@ import type { ProviderManagerState } from './components/ProviderManagerDialog'
 import { SessionModelDialog } from './components/SessionModelDialog'
 import type { SessionCreatorState } from './components/SessionModelDialog'
 import { WorkspaceTree } from './components/WorkspaceTree'
+import { useComposerDrafts } from './hooks/useComposerDrafts'
+import { useRunRegistry } from './hooks/useRunRegistry'
+import { useSessionHistory } from './hooks/useSessionHistory'
+import { useSessionSelection } from './hooks/useSessionSelection'
 
 type BackgroundCompletionNotice = {
   sessionID: string
@@ -23,12 +27,7 @@ function App() {
   const [bootstrap, setBootstrap] = useState<Bootstrap | null>(null)
   const [projects, setProjects] = useState<Project[]>([])
   const [sessionsByProject, setSessionsByProject] = useState<Record<string, Session[]>>({})
-  const [selectedProjectID, setSelectedProjectID] = useState('')
-  const [selectedSessionID, setSelectedSessionID] = useState('')
-  const [sessionDetail, setSessionDetail] = useState<Session | null>(null)
-  const [itemsPage, setItemsPage] = useState<ItemsPage | null>(null)
-  const [activeRunsBySession, setActiveRunsBySession] = useState<Record<string, ActiveRun>>({})
-  const [draftsBySession, setDraftsBySession] = useState<Record<string, ComposerDraft>>({})
+  const { selectedProjectID, selectedSessionID, selectedProjectRef, setSelectedProjectID, setSelectedSessionID } = useSessionSelection()
   const [recoveredRuns, setRecoveredRuns] = useState<ActiveRunDescriptor[]>([])
 	const [recentStepsByTurn, setRecentStepsByTurn] = useState<Record<string, RunStep[]>>({})
   const [loading, setLoading] = useState(true)
@@ -38,67 +37,8 @@ function App() {
   const [providerManager, setProviderManager] = useState<ProviderManagerState | null>(null)
   const [creatingSession, setCreatingSession] = useState(false)
   const [completionNotice, setCompletionNotice] = useState<BackgroundCompletionNotice | null>(null)
-  const selectedProjectRef = useRef('')
-  const selectedSessionRef = useRef('')
-	const activeRunsRef = useRef<Record<string, ActiveRun>>({})
-  const updateDraft = useCallback((sessionID: string, content: string) => {
-    setDraftsBySession((current) => {
-      const draft = current[sessionID] ?? emptyComposerDraft
-      if (draft.content === content) return current
-      return { ...current, [sessionID]: { ...draft, content } }
-    })
-  }, [])
-  const addPastedText = useCallback((sessionID: string, pastedText: PastedTextAttachment) => {
-    setDraftsBySession((current) => {
-      const draft = current[sessionID] ?? emptyComposerDraft
-      return { ...current, [sessionID]: { ...draft, pastedTexts: [...draft.pastedTexts, pastedText] } }
-    })
-  }, [])
-  const removePastedText = useCallback((sessionID: string, pastedTextID: number) => {
-    setDraftsBySession((current) => {
-      const draft = current[sessionID]
-      if (!draft || !draft.pastedTexts.some((pastedText) => pastedText.id === pastedTextID)) return current
-      return { ...current, [sessionID]: { ...draft, pastedTexts: draft.pastedTexts.filter((pastedText) => pastedText.id !== pastedTextID) } }
-    })
-  }, [])
-  const addPastedImage = useCallback((sessionID: string, pastedImage: PastedImageAttachment) => {
-    setDraftsBySession((current) => {
-      const draft = current[sessionID] ?? emptyComposerDraft
-      if (draft.pastedImages.length >= maxPastedImageAttachments) return current
-      return { ...current, [sessionID]: { ...draft, pastedImages: [...draft.pastedImages, pastedImage] } }
-    })
-  }, [])
-  const removePastedImage = useCallback((sessionID: string, pastedImageID: number) => {
-    setDraftsBySession((current) => {
-      const draft = current[sessionID]
-      if (!draft || !draft.pastedImages.some((pastedImage) => pastedImage.id === pastedImageID)) return current
-      return { ...current, [sessionID]: { ...draft, pastedImages: draft.pastedImages.filter((pastedImage) => pastedImage.id !== pastedImageID) } }
-    })
-  }, [])
-  const clearDraft = useCallback((sessionID: string) => {
-    setDraftsBySession((current) => {
-      if (!current[sessionID]) return current
-      return { ...current, [sessionID]: emptyComposerDraft }
-    })
-  }, [])
-	const addActiveRun = useCallback((run: ActiveRun) => {
-		const next = { ...activeRunsRef.current, [run.sessionID]: run }
-		activeRunsRef.current = next
-		setActiveRunsBySession(next)
-	}, [])
-	const updateActiveRun = useCallback((sessionID: string, runID: string, updater: (run: ActiveRun) => ActiveRun | null) => {
-		const current = activeRunsRef.current[sessionID]
-		if (!current || current.id !== runID) return
-		const updated = updater(current)
-		const next = { ...activeRunsRef.current }
-		if (updated) next[sessionID] = updated
-		else delete next[sessionID]
-		activeRunsRef.current = next
-		setActiveRunsBySession(next)
-	}, [])
-
-  selectedProjectRef.current = selectedProjectID
-  selectedSessionRef.current = selectedSessionID
+  const { draftsBySession, updateDraft, addPastedText, removePastedText, addPastedImage, removePastedImage, clearDraft } = useComposerDrafts()
+  const { activeRunsBySession, activeRunsRef, addActiveRun, updateActiveRun, queueRunEvent, flushRunEvents } = useRunRegistry()
 
   const loadProjects = useCallback(async () => {
     const payload = await api.projects()
@@ -160,34 +100,15 @@ function App() {
     return ordered
   }, [])
 
-  const refreshSession = useCallback(async (sessionID: string): Promise<Session | null> => {
-    if (!sessionID) return null
-    const [detail, page] = await Promise.all([api.session(sessionID), api.items(sessionID)])
-    if (selectedSessionRef.current === sessionID) {
-      setSessionDetail(detail)
-      setItemsPage(page)
-    }
-    // Refreshing a background session must not select it. The session list is
-    // still updated so its status and ordering remain current.
-    if (detail.project_id) await loadSessions(detail.project_id)
-    return detail
-  }, [loadSessions])
+  const reportError = useCallback((reason: unknown) => setError(errorMessage(reason)), [])
+  const { sessionDetail, itemsPage, setSessionDetail, setItemsPage, selectedSessionRef, refreshSession, loadOlder } =
+    useSessionHistory(selectedSessionID, loadSessions, reportError)
 
   useEffect(() => {
     if (!completionNotice) return
     const timer = window.setTimeout(() => setCompletionNotice(null), 5000)
     return () => window.clearTimeout(timer)
   }, [completionNotice])
-
-  useEffect(() => {
-    if (!selectedSessionID) {
-      setSessionDetail(null)
-      setItemsPage(null)
-      return
-    }
-    setItemsPage(null)
-    void refreshSession(selectedSessionID).catch((reason: unknown) => setError(errorMessage(reason)))
-  }, [selectedSessionID, refreshSession])
 
   const createProject = async (root: string, displayName: string) => {
     try {
@@ -300,39 +221,19 @@ function App() {
     }
   }
 
-  const loadOlder = useCallback(async (): Promise<boolean> => {
-    if (!selectedSessionID || !itemsPage?.has_more_before || !itemsPage.oldest_seq) return false
-    const sessionID = selectedSessionID
-    const oldestSeq = itemsPage.oldest_seq
-    try {
-      const older = await api.items(sessionID, oldestSeq)
-      if (selectedSessionRef.current !== sessionID) return false
-      setItemsPage((current) => {
-        if (!current || current.oldest_seq !== oldestSeq) return current
-        return {
-          items: [...older.items, ...current.items],
-          oldest_seq: older.oldest_seq,
-          newest_seq: current.newest_seq,
-          has_more_before: older.has_more_before,
-          has_more_after: false,
-        }
-      })
-      return true
-    } catch (reason) {
-      setError(errorMessage(reason))
-      return false
-    }
-  }, [itemsPage, selectedSessionID])
-
   const handleRunEvent = useCallback(async (sessionID: string, runID: string, event: RunEvent) => {
+    if (event.type === 'text.delta' || event.type === 'reasoning.delta') {
+      queueRunEvent(sessionID, runID, event)
+      return
+    }
+    // Preserve stream ordering and ensure tool/settled events observe all deltas.
+    flushRunEvents(sessionID, runID)
     const update = (updater: (run: ActiveRun) => ActiveRun | null) => updateActiveRun(sessionID, runID, updater)
     switch (event.type) {
       case 'turn.started':
       case 'run.prompt_queue':
       case 'run.prompt_appended':
       case 'agent.iteration.started':
-      case 'text.delta':
-      case 'reasoning.delta':
       case 'tool.requested':
       case 'tool.started':
       case 'tool.finished':
@@ -377,7 +278,7 @@ function App() {
         break
       }
     }
-  }, [refreshSession, updateActiveRun])
+  }, [flushRunEvents, queueRunEvent, refreshSession, updateActiveRun])
 
   useEffect(() => {
     if (recoveredRuns.length === 0) return

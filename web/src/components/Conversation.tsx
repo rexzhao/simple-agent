@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
+import { memo, useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
 import Markdown from 'react-markdown'
 import type { Components } from 'react-markdown'
 import remarkGfm from 'remark-gfm'
@@ -204,7 +204,7 @@ function ContextUsage(props: { context: Session['context']; activeInputTokens?: 
 	)
 }
 
-function Message({ item, sessionID }: { item: SessionItem; sessionID: string }) {
+const Message = memo(function Message({ item, sessionID }: { item: SessionItem; sessionID: string }) {
   const role = item.message?.role
   const text = item.message?.content?.inline || item.message?.content?.preview || ''
   const images = item.message?.images ?? []
@@ -236,7 +236,7 @@ function Message({ item, sessionID }: { item: SessionItem; sessionID: string }) 
       </div>
     </article>
   )
-}
+})
 
 function StoredImageAttachments(props: { sessionID: string; images: SessionImageAttachment[] }) {
   return (

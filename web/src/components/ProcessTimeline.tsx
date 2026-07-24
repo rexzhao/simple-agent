@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { memo, useEffect, useRef, useState } from 'react'
 import type { ReactNode, SyntheticEvent } from 'react'
 import Markdown from 'react-markdown'
 import type { Components } from 'react-markdown'
@@ -12,7 +12,7 @@ const markdownComponents: Components = {
 	a: ({ node: _node, ...props }) => <a {...props} target="_blank" rel="noreferrer noopener" />,
 }
 
-export function ProcessTimeline({ steps, live = false }: { steps: RunStep[]; live?: boolean }) {
+export const ProcessTimeline = memo(function ProcessTimeline({ steps, live = false }: { steps: RunStep[]; live?: boolean }) {
 	const nodes = foldToolGroups(steps)
 	const lastNode = nodes[nodes.length - 1]
 	const lastFlat = lastNode ? (lastNode.kind === 'tool-group' ? lastNode.flats[lastNode.flats.length - 1] : lastNode.flat) : undefined
@@ -52,7 +52,7 @@ export function ProcessTimeline({ steps, live = false }: { steps: RunStep[]; liv
 			})}
 		</div>
 	)
-}
+})
 
 // ToolGroupRow renders a folded run of consecutive tool calls as one
 // aggregated row. The row stays expanded while it is the live in-flight tail
