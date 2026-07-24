@@ -31,9 +31,9 @@ export function WorkspaceTree(props: {
 
   return (
     <aside className="project-rail">
-      <div className="brand"><LogoIcon /><span>SAI</span><button className="brand-settings" onClick={props.onManageProviders} aria-label="管理 Server Root 配置" title="Server Root 配置"><SettingsIcon /></button></div>
-      <div className="rail-label">项目与会话</div>
-      <nav className="project-tree" aria-label="项目和会话树">
+      <div className="brand"><LogoIcon /><span>SAI</span><button className="brand-settings" onClick={props.onManageProviders} aria-label="Manage Server Root settings" title="Server Root settings"><SettingsIcon /></button></div>
+      <div className="rail-label">Projects & sessions</div>
+      <nav className="project-tree" aria-label="Project and session tree">
         {props.projects.map((project) => {
           const sessions = props.sessionsByProject[project.id] ?? []
           const expanded = expandedProjects.has(project.id)
@@ -55,11 +55,11 @@ export function WorkspaceTree(props: {
                 <button
                   className="tree-icon-button"
                   onClick={() => props.onCreateSession(project.id)}
-                  aria-label={`在 ${projectName(project)} 中新建会话`}
-                  title="新建会话"
+                  aria-label={`New session in ${projectName(project)}`}
+                  title="New session"
                 ><PlusIcon /></button>
               </div>
-              <div className="session-tree" role="group" aria-label={`${projectName(project)} 的会话`}>
+              <div className="session-tree" role="group" aria-label={`Sessions of ${projectName(project)}`}>
                 {visibleSessions.map((session) => (
                   <div className={`session-tree-row ${session.id === props.selectedSessionID ? 'selected' : ''}`} key={session.id}>
                     <button
@@ -74,16 +74,16 @@ export function WorkspaceTree(props: {
 					  {(session.status === 'running' || props.runningSessionIDs.has(session.id)) && <span className="live-dot" />}
                     </button>
                     <div className="session-tree-actions">
-                      <button disabled={session.status === 'running' || props.runningSessionIDs.has(session.id)} onClick={() => props.onArchiveSession(session)} aria-label={`归档 ${sessionName(session)}`} title="归档"><ArchiveIcon /></button>
-                      <button className="danger" disabled={session.status === 'running' || props.runningSessionIDs.has(session.id)} onClick={() => props.onDeleteSession(session)} aria-label={`删除 ${sessionName(session)}`} title="删除"><TrashIcon /></button>
+                      <button disabled={session.status === 'running' || props.runningSessionIDs.has(session.id)} onClick={() => props.onArchiveSession(session)} aria-label={`Archive ${sessionName(session)}`} title="Archive"><ArchiveIcon /></button>
+                      <button className="danger" disabled={session.status === 'running' || props.runningSessionIDs.has(session.id)} onClick={() => props.onDeleteSession(session)} aria-label={`Delete ${sessionName(session)}`} title="Delete"><TrashIcon /></button>
                     </div>
                   </div>
                 ))}
-                {sessions.length === 0 && <p className="tree-empty">暂无会话</p>}
+                {sessions.length === 0 && <p className="tree-empty">No sessions yet</p>}
                 {(expanded ? sessions.length > 3 : sessions.length > visibleSessions.length) && (
                   <button className="tree-expand-button" onClick={() => toggleProject(project.id)}>
                     <ChevronIcon expanded={expanded} />
-					{expanded ? '收起' : `展开另外 ${sessions.length - visibleSessions.length} 个会话`}
+					{expanded ? 'Collapse' : `Show ${sessions.length - visibleSessions.length} more sessions`}
                   </button>
                 )}
               </div>
@@ -92,7 +92,7 @@ export function WorkspaceTree(props: {
         })}
       </nav>
       <div className="project-rail-footer">
-		<button className="secondary-button full" onClick={props.onAdd}><PlusIcon /> 添加项目</button>
+		<button className="secondary-button full" onClick={props.onAdd}><PlusIcon /> Add project</button>
         <span className="version">v{props.version || 'dev'} · local</span>
       </div>
     </aside>

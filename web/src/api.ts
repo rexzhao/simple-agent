@@ -34,7 +34,7 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   const response = await fetch(path, { ...init, headers })
   if (!response.ok) {
     let code = 'request_failed'
-    let message = `请求失败 (${response.status})`
+    let message = `Request failed (${response.status})`
     try {
       const payload = await response.json() as { error?: { code?: string; message?: string } }
       code = payload.error?.code ?? code
@@ -108,7 +108,7 @@ export const api = {
     })
     if (!response.ok) {
       let code = 'request_failed'
-      let message = `请求失败 (${response.status})`
+      let message = `Request failed (${response.status})`
       try {
         const payload = await response.json() as { error?: { code?: string; message?: string } }
         code = payload.error?.code ?? code
@@ -142,7 +142,7 @@ export async function streamRun(runID: string, onEvent: (event: RunEvent) => voi
         headers: { Authorization: `Bearer ${token}` },
       })
       if (!response.ok || !response.body) {
-        throw new APIError(response.status, 'stream_failed', `无法连接运行事件 (${response.status})`)
+        throw new APIError(response.status, 'stream_failed', `Unable to connect to run events (${response.status})`)
       }
 
       const reader = response.body.getReader()
@@ -179,7 +179,7 @@ export async function streamRun(runID: string, onEvent: (event: RunEvent) => voi
     }
 
     if (reconnects >= streamReconnectLimit) {
-      throw new APIError(0, 'stream_interrupted', '运行事件流意外中断，请刷新会话查看已保存的结果。')
+      throw new APIError(0, 'stream_interrupted', 'The run event stream was interrupted. Refresh the session to view saved results.')
     }
     await waitForStreamReconnect(reconnects)
     reconnects++

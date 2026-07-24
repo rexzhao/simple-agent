@@ -56,7 +56,7 @@ export function Conversation(props: {
     <div className="conversation">
       <header className="conversation-header">
         <div className="conversation-heading">
-          <h1>{props.detail ? sessionName(props.detail) : '加载中…'}</h1>
+          <h1>{props.detail ? sessionName(props.detail) : 'Loading…'}</h1>
 		  {props.detail && (
 			<div className="conversation-meta">
 			  <p>{props.detail.provider} / {props.detail.model_id}</p>
@@ -65,19 +65,19 @@ export function Conversation(props: {
 		  )}
         </div>
         <div className="header-actions">
-		  <span className={`status-pill ${props.activeRun || props.otherSessionsRunning ? 'running' : ''}`}><span />{props.activeRun ? '运行中' : props.otherSessionsRunning ? '其他会话运行中' : '就绪'}</span>
-		  <button className="secondary-button" disabled={!props.detail || props.detail.status === 'running' || Boolean(props.activeRun)} onClick={props.onCompact}>压缩上下文</button>
+		  <span className={`status-pill ${props.activeRun || props.otherSessionsRunning ? 'running' : ''}`}><span />{props.activeRun ? 'Running' : props.otherSessionsRunning ? 'Another session running' : 'Ready'}</span>
+		  <button className="secondary-button" disabled={!props.detail || props.detail.status === 'running' || Boolean(props.activeRun)} onClick={props.onCompact}>Compact context</button>
         </div>
       </header>
       <section ref={messagesRef} className="messages" aria-live="polite" onScroll={updateFollowOutput}>
-        {props.page?.has_more_before && <button className="load-older" onClick={props.onLoadOlder}>加载更早消息</button>}
+        {props.page?.has_more_before && <button className="load-older" onClick={props.onLoadOlder}>Load earlier messages</button>}
         {!props.page && <MessageSkeleton />}
 				{buildConversationEntries(visibleItems, props.detail?.id ?? '', props.recentStepsByTurn).map((entry) => entry.kind === 'message'
 					? <Message key={entry.item.id} item={entry.item} sessionID={props.detail?.id ?? ''} />
 					: <HistoricalProcess key={entry.id} entry={entry} />)}
         {props.activeRun && <ActiveRunView run={props.activeRun} />}
 		{props.page && visibleItems.length === 0 && !props.activeRun && (
-          <div className="conversation-empty"><SparkIcon /><h3>开始一个新任务</h3><p>描述目标、问题或需要修改的代码。</p></div>
+          <div className="conversation-empty"><SparkIcon /><h3>Start a new task</h3><p>Describe a goal, a problem, or the code you want to change.</p></div>
         )}
         <div ref={bottomRef} />
       </section>
@@ -112,15 +112,15 @@ function ContextUsage(props: { context: Session['context']; activeInputTokens?: 
 	const warningThreshold = Number(context?.warning_threshold_percent ?? 80)
 	const tone = percent >= 100 ? 'critical' : percent >= warningThreshold ? 'warning' : ''
 	const progress = Math.min(100, Math.max(0, percent))
-	const percentLabel = `${usageEstimated && usedTokens > 0 ? '约 ' : ''}${Math.round(percent)}%`
-	const usageSource = usedTokens <= 0 ? '尚无使用数据' : usageEstimated ? '使用量为本地估算' : '使用量来自模型返回值'
-	const windowSource = context?.context_window_source === 'configured' ? '窗口来自模型配置' : '窗口为默认估算值'
+	const percentLabel = `${usageEstimated && usedTokens > 0 ? '~' : ''}${Math.round(percent)}%`
+	const usageSource = usedTokens <= 0 ? 'No usage data yet' : usageEstimated ? 'Usage estimated locally' : 'Usage reported by the model'
+	const windowSource = context?.context_window_source === 'configured' ? 'Window from model config' : 'Window is a default estimate'
 	const cacheDetails = [
-		Number(context?.last_cached_tokens ?? 0) > 0 ? `缓存命中 ${Number(context?.last_cached_tokens).toLocaleString()}` : '',
-		Number(context?.last_cache_write_tokens ?? 0) > 0 ? `缓存写入 ${Number(context?.last_cache_write_tokens).toLocaleString()}` : '',
-		Number(context?.last_reasoning_tokens ?? 0) > 0 ? `推理 ${Number(context?.last_reasoning_tokens).toLocaleString()}` : '',
-	].filter(Boolean).join('；')
-	const title = `上下文：${usedTokens.toLocaleString()} / ${contextWindow.toLocaleString()} tokens（${percent.toFixed(1)}%）\n${usageSource}；${windowSource}${cacheDetails ? `\n${cacheDetails} tokens` : ''}`
+		Number(context?.last_cached_tokens ?? 0) > 0 ? `Cache hit ${Number(context?.last_cached_tokens).toLocaleString()}` : '',
+		Number(context?.last_cache_write_tokens ?? 0) > 0 ? `Cache write ${Number(context?.last_cache_write_tokens).toLocaleString()}` : '',
+		Number(context?.last_reasoning_tokens ?? 0) > 0 ? `Reasoning ${Number(context?.last_reasoning_tokens).toLocaleString()}` : '',
+	].filter(Boolean).join('; ')
+	const title = `Context: ${usedTokens.toLocaleString()} / ${contextWindow.toLocaleString()} tokens (${percent.toFixed(1)}%)\n${usageSource}; ${windowSource}${cacheDetails ? `\n${cacheDetails} tokens` : ''}`
 
 	return (
 		<div className={`context-usage ${tone}`} title={title}>
@@ -132,7 +132,7 @@ function ContextUsage(props: { context: Session['context']; activeInputTokens?: 
 			<div
 				className="context-progress"
 				role="progressbar"
-				aria-label="上下文使用量"
+				aria-label="Context usage"
 				aria-valuemin={0}
 				aria-valuemax={contextWindow}
 				aria-valuenow={Math.min(usedTokens, contextWindow)}
@@ -161,16 +161,16 @@ function Message({ item, sessionID }: { item: SessionItem; sessionID: string }) 
 	}
   return (
     <article className={`message ${role === 'user' ? 'user' : 'assistant'}`}>
-      <div className="message-avatar">{role === 'user' ? '你' : <LogoIcon />}</div>
+      <div className="message-avatar">{role === 'user' ? 'You' : <LogoIcon />}</div>
       <div className="message-content">
-        <div className="message-meta"><strong>{role === 'user' ? '你' : 'SAI'}</strong><time>{formatTime(item.created_at)}</time></div>
+        <div className="message-meta"><strong>{role === 'user' ? 'You' : 'SAI'}</strong><time>{formatTime(item.created_at)}</time></div>
         {role === 'user' && text && <div className="message-text">{text}</div>}
         {role === 'user' && images.length > 0 && <StoredImageAttachments sessionID={sessionID} images={images} />}
         {role !== 'user' && text && <MarkdownMessage text={text} />}
 		{role === 'assistant' && (
-			<div className="message-tools" aria-label="消息操作">
-				<button className="message-tool-button" onClick={() => void copyMessage()} title="复制完整输出">
-					<CopyIcon />{copyStatus === 'copied' ? '已复制' : copyStatus === 'error' ? '复制失败' : '复制'}
+			<div className="message-tools" aria-label="Message actions">
+				<button className="message-tool-button" onClick={() => void copyMessage()} title="Copy full output">
+					<CopyIcon />{copyStatus === 'copied' ? 'Copied' : copyStatus === 'error' ? 'Copy failed' : 'Copy'}
 				</button>
 			</div>
 		)}
@@ -181,7 +181,7 @@ function Message({ item, sessionID }: { item: SessionItem; sessionID: string }) 
 
 function StoredImageAttachments(props: { sessionID: string; images: SessionImageAttachment[] }) {
   return (
-    <div className="message-image-grid" aria-label="已附加图片">
+    <div className="message-image-grid" aria-label="Attached images">
       {props.images.map((image) => <StoredImageAttachment key={image.hash} sessionID={props.sessionID} image={image} />)}
     </div>
   )
@@ -204,9 +204,9 @@ function StoredImageAttachment(props: { sessionID: string; image: SessionImageAt
     return () => { active = false }
   }, [props.image.hash, props.sessionID])
 
-  if (failed) return <div className="message-image-unavailable">图片不可用</div>
-  if (!dataURL) return <div className="message-image-loading">加载图片…</div>
-  return <img className="message-image" src={dataURL} alt={`已附加图片（${props.image.media_type}）`} />
+  if (failed) return <div className="message-image-unavailable">Image unavailable</div>
+  if (!dataURL) return <div className="message-image-loading">Loading image…</div>
+  return <img className="message-image" src={dataURL} alt={`Attached image (${props.image.media_type})`} />
 }
 
 function ActiveRunView({ run }: { run: ActiveRun }) {
@@ -214,13 +214,13 @@ function ActiveRunView({ run }: { run: ActiveRun }) {
     <>
       {(run.userText || (run.userImages?.length ?? 0) > 0) && (
         <article className="message user transient">
-          <div className="message-avatar">你</div>
+          <div className="message-avatar">You</div>
           <div className="message-content">
-            <div className="message-meta"><strong>你</strong><span>刚刚</span></div>
+            <div className="message-meta"><strong>You</strong><span>just now</span></div>
             {run.userText && <div className="message-text">{run.userText}</div>}
             {(run.userImages?.length ?? 0) > 0 && (
-              <div className="message-image-grid" aria-label="已附加图片">
-                {run.userImages?.map((image, index) => <img className="message-image" src={image.data_url} alt={`待发送图片 #${index + 1}`} key={`${image.data_url}-${index}`} />)}
+              <div className="message-image-grid" aria-label="Attached images">
+                {run.userImages?.map((image, index) => <img className="message-image" src={image.data_url} alt={`Image to send #${index + 1}`} key={`${image.data_url}-${index}`} />)}
               </div>
             )}
           </div>
@@ -229,15 +229,15 @@ function ActiveRunView({ run }: { run: ActiveRun }) {
       <article className="message assistant transient">
         <div className="message-avatar"><LogoIcon /></div>
         <div className="message-content">
-          <div className="message-meta"><strong>SAI</strong><span className="streaming-label"><i />生成中</span></div>
+          <div className="message-meta"><strong>SAI</strong><span className="streaming-label"><i />Generating</span></div>
 					{run.steps.length > 0 && <ProcessTimeline steps={run.steps} />}
           {run.assistantText ? <MarkdownMessage text={run.assistantText} streaming /> : <div className="message-text assistant-stream"><span className="cursor" /></div>}
 			{run.totalTokens !== undefined && (
 				<div className="token-note">
-					本轮 {run.totalTokens.toLocaleString()} tokens
-					{Boolean(run.cachedTokens) && ` · 缓存命中 ${run.cachedTokens?.toLocaleString()}`}
-					{Boolean(run.cacheWriteTokens) && ` · 缓存写入 ${run.cacheWriteTokens?.toLocaleString()}`}
-					{Boolean(run.reasoningTokens) && ` · 推理 ${run.reasoningTokens?.toLocaleString()}`}
+					This turn: {run.totalTokens.toLocaleString()} tokens
+					{Boolean(run.cachedTokens) && ` · Cache hit ${run.cachedTokens?.toLocaleString()}`}
+					{Boolean(run.cacheWriteTokens) && ` · Cache write ${run.cacheWriteTokens?.toLocaleString()}`}
+					{Boolean(run.reasoningTokens) && ` · Reasoning ${run.reasoningTokens?.toLocaleString()}`}
 				</div>
 			)}
         </div>
@@ -338,13 +338,13 @@ function HistoricalProcess({ entry }: { entry: Extract<ConversationEntry, { kind
 	const outputCount = entry.steps.filter((step) => step.kind === 'output').length
 	const toolCount = entry.steps.filter((step) => step.kind === 'tool').length
 	const iterationCount = new Set(entry.steps.map((step) => step.iteration)).size
-	const summary = [`${iterationCount} 轮`, reasoningCount > 0 ? `${reasoningCount} 段思考` : '', outputCount > 0 ? `${outputCount} 段中间输出` : '', toolCount > 0 ? `${toolCount} 次工具调用` : ''].filter(Boolean).join(' · ')
+	const summary = [`${iterationCount} ${iterationCount === 1 ? 'iteration' : 'iterations'}`, reasoningCount > 0 ? `${reasoningCount} reasoning ${reasoningCount === 1 ? 'block' : 'blocks'}` : '', outputCount > 0 ? `${outputCount} intermediate ${outputCount === 1 ? 'output' : 'outputs'}` : '', toolCount > 0 ? `${toolCount} tool ${toolCount === 1 ? 'call' : 'calls'}` : ''].filter(Boolean).join(' · ')
 	return (
 		<article className="message assistant process-message">
 			<div className="message-avatar"><LogoIcon /></div>
 			<div className="message-content">
 				<details className="process-card">
-					<summary><span>执行过程</span><small>{summary}</small><time>{formatTime(entry.createdAt)}</time></summary>
+					<summary><span>Execution details</span><small>{summary}</small><time>{formatTime(entry.createdAt)}</time></summary>
 					<ProcessTimeline steps={entry.steps} />
 				</details>
 			</div>

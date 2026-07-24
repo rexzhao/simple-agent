@@ -123,7 +123,7 @@ export function ProviderManagerDialog(props: {
   }
 
   const clearCodexLogin = async () => {
-    if (!draft?.existingName || !window.confirm('退出当前 Server Root 的 Codex 登录？')) return
+    if (!draft?.existingName || !window.confirm('Sign out of Codex for the current Server Root?')) return
     try {
       await api.clearCodexLogin(draft.existingName)
       setCodexAuth({ status: 'signed_out' })
@@ -144,58 +144,58 @@ export function ProviderManagerDialog(props: {
       <section className="provider-dialog" role="dialog" aria-modal="true" aria-labelledby="provider-dialog-title">
         <header className="provider-dialog-header">
           <div>
-            <span className="eyebrow">Server Root 配置</span>
-            <h2 id="provider-dialog-title">Provider 与模型</h2>
-            <p>{document ? `${document.server_root} · ${document.config_path}` : '读取当前 Server Root'}</p>
+            <span className="eyebrow">Server Root settings</span>
+            <h2 id="provider-dialog-title">Providers & models</h2>
+            <p>{document ? `${document.server_root} · ${document.config_path}` : 'Reading current Server Root'}</p>
           </div>
-          <button className="model-dialog-close" disabled={saving} onClick={props.onClose} aria-label="关闭">×</button>
+          <button className="model-dialog-close" disabled={saving} onClick={props.onClose} aria-label="Close">×</button>
         </header>
         {props.state.loading || !document || !draft ? (
-          <div className="provider-loading">读取 Server Root 配置…</div>
+          <div className="provider-loading">Reading Server Root settings…</div>
         ) : (
           <div className="provider-dialog-body">
             <aside className="provider-list">
               {document.providers.map((provider) => (
                 <button className={draft.existingName === provider.name ? 'selected' : ''} onClick={() => selectProvider(provider)} key={provider.name}>
                   <strong>{provider.name}</strong>
-                  <small>{provider.models.length} 个模型</small>
+                  <small>{provider.models.length} {provider.models.length === 1 ? 'model' : 'models'}</small>
                 </button>
               ))}
-              <button className={!draft.existingName ? 'selected add-provider' : 'add-provider'} onClick={() => { setDraft(emptyProviderDraft()); setCodexAuth(null); setDiscoveredModels([]) }}><PlusIcon /> 新增 Provider</button>
+              <button className={!draft.existingName ? 'selected add-provider' : 'add-provider'} onClick={() => { setDraft(emptyProviderDraft()); setCodexAuth(null); setDiscoveredModels([]) }}><PlusIcon /> Add provider</button>
             </aside>
             <div className="provider-editor">
               <section className="settings-section">
-                <div className="settings-section-title"><h3>连接配置</h3>{draft.existingName && <code>{draft.existingName}.yaml</code>}</div>
+                <div className="settings-section-title"><h3>Connection</h3>{draft.existingName && <code>{draft.existingName}.yaml</code>}</div>
                 <div className="settings-grid">
-                  <label>名称<input value={draft.name} disabled={Boolean(draft.existingName)} onChange={(event) => setDraft({ ...draft, name: event.target.value })} placeholder="openai" /></label>
-                  <label>请求超时<input value={draft.requestTimeout} onChange={(event) => setDraft({ ...draft, requestTimeout: event.target.value })} placeholder="60s" /></label>
+                  <label>Name<input value={draft.name} disabled={Boolean(draft.existingName)} onChange={(event) => setDraft({ ...draft, name: event.target.value })} placeholder="openai" /></label>
+                  <label>Request timeout<input value={draft.requestTimeout} onChange={(event) => setDraft({ ...draft, requestTimeout: event.target.value })} placeholder="60s" /></label>
                   <label className="wide">Base URL<input value={draft.baseURL} onChange={(event) => setDraft({ ...draft, baseURL: event.target.value })} placeholder="https://api.openai.com/v1" /></label>
-                  <label className="wide">API Key / 环境变量<input value={draft.apiKey} onChange={(event) => setDraft({ ...draft, apiKey: event.target.value, keepAPIKey: false })} placeholder={draft.apiKeyConfigured ? '已配置；留空并保留下方选项不会修改' : '$OPENAI_API_KEY'} /></label>
-                  {draft.apiKeyConfigured && <label className="checkbox-field wide"><input type="checkbox" checked={draft.keepAPIKey} onChange={(event) => setDraft({ ...draft, keepAPIKey: event.target.checked })} /> 保留当前 API Key</label>}
+                  <label className="wide">API key / environment variable<input value={draft.apiKey} onChange={(event) => setDraft({ ...draft, apiKey: event.target.value, keepAPIKey: false })} placeholder={draft.apiKeyConfigured ? 'Configured; leave empty and keep the option below to leave unchanged' : '$OPENAI_API_KEY'} /></label>
+                  {draft.apiKeyConfigured && <label className="checkbox-field wide"><input type="checkbox" checked={draft.keepAPIKey} onChange={(event) => setDraft({ ...draft, keepAPIKey: event.target.checked })} /> Keep current API key</label>}
                 </div>
               </section>
 
               {usesCodex && (
                 <section className="settings-section codex-auth-card">
-                  <div className="settings-section-title"><h3>Codex 登录态</h3><span className={`auth-status ${codexAuth?.status ?? 'signed_out'}`}>{codexAuthLabel(codexAuth?.status)}</span></div>
-                  {codexAuth?.account_id && <p>账户：<code>{codexAuth.account_id}</code></p>}
-                  {codexAuth?.expires_at && <p>过期时间：{new Date(codexAuth.expires_at).toLocaleString('zh-CN')}</p>}
-                  {codexAuth?.status === 'pending' && <div className="device-login"><strong>{codexAuth.user_code}</strong><button className="secondary-button" onClick={() => void copyText(codexAuth.user_code ?? '')}>复制验证码</button>{codexAuth.verification_url && <a href={codexAuth.verification_url} target="_blank" rel="noreferrer">打开登录页面</a>}</div>}
+                  <div className="settings-section-title"><h3>Codex sign-in</h3><span className={`auth-status ${codexAuth?.status ?? 'signed_out'}`}>{codexAuthLabel(codexAuth?.status)}</span></div>
+                  {codexAuth?.account_id && <p>Account: <code>{codexAuth.account_id}</code></p>}
+                  {codexAuth?.expires_at && <p>Expires: {new Date(codexAuth.expires_at).toLocaleString()}</p>}
+                  {codexAuth?.status === 'pending' && <div className="device-login"><strong>{codexAuth.user_code}</strong><button className="secondary-button" onClick={() => void copyText(codexAuth.user_code ?? '')}>Copy code</button>{codexAuth.verification_url && <a href={codexAuth.verification_url} target="_blank" rel="noreferrer">Open sign-in page</a>}</div>}
                   {codexAuth?.message && <p className="settings-error">{codexAuth.message}</p>}
                   <div className="inline-actions">
-                    {codexAuth?.status !== 'pending' && codexAuth?.status !== 'signed_in' && <button className="primary-button" disabled={!savedCodexProvider} onClick={() => void startCodexLogin()}>登录 Codex</button>}
-                    {(codexAuth?.status === 'signed_in' || codexAuth?.status === 'expired') && <button className="secondary-button" onClick={() => void clearCodexLogin()}>退出登录</button>}
-                    {!savedCodexProvider && <small>请先保存 Codex Provider，再开始登录。</small>}
+                    {codexAuth?.status !== 'pending' && codexAuth?.status !== 'signed_in' && <button className="primary-button" disabled={!savedCodexProvider} onClick={() => void startCodexLogin()}>Sign in to Codex</button>}
+                    {(codexAuth?.status === 'signed_in' || codexAuth?.status === 'expired') && <button className="secondary-button" onClick={() => void clearCodexLogin()}>Sign out</button>}
+                    {!savedCodexProvider && <small>Save the Codex provider before signing in.</small>}
                   </div>
                 </section>
               )}
 
               <section className="settings-section">
                 <div className="settings-section-title">
-                  <div><h3>模型列表</h3><p>推理等级使用统一显示名，映射值可以是字符串、数字、布尔值或对象。</p></div>
+                  <div><h3>Models</h3><p>Reasoning levels use unified display names; mapped values can be strings, numbers, booleans, or objects.</p></div>
                   <div className="inline-actions">
-                    <button className="secondary-button compact" disabled={!draft.existingName || discovering} onClick={() => void discoverModels()}>{discovering ? '获取中…' : '从 Provider 获取'}</button>
-                    <button className="secondary-button compact" onClick={() => setDraft({ ...draft, models: [...draft.models, emptyProviderModel()] })}><PlusIcon /> 添加模型</button>
+                    <button className="secondary-button compact" disabled={!draft.existingName || discovering} onClick={() => void discoverModels()}>{discovering ? 'Fetching…' : 'Fetch from provider'}</button>
+                    <button className="secondary-button compact" onClick={() => setDraft({ ...draft, models: [...draft.models, emptyProviderModel()] })}><PlusIcon /> Add model</button>
                   </div>
                 </div>
                 <div className="provider-models">
@@ -203,28 +203,28 @@ export function ProviderManagerDialog(props: {
                     const isDefault = draft.existingName === document.default_provider && model.profile === document.default_model
                     const reasoningLevels = reasoningLevelOptions(model.reasoningLevelsJSON)
                     return <article className="provider-model-card" key={`${index}-${model.profile}`}>
-                      <div className="provider-model-heading"><strong>{model.profile || `模型 ${index + 1}`}</strong><div className="inline-actions">{isDefault ? <span className="default-badge">默认</span> : <button className="plain-button" disabled={!draft.existingName || !model.profile} onClick={() => void setDefault(model.profile)}>设为默认</button>}<button className="plain-button danger" disabled={draft.models.length === 1} onClick={() => setDraft({ ...draft, models: draft.models.filter((_, modelIndex) => modelIndex !== index) })}>移除</button></div></div>
+                      <div className="provider-model-heading"><strong>{model.profile || `Model ${index + 1}`}</strong><div className="inline-actions">{isDefault ? <span className="default-badge">Default</span> : <button className="plain-button" disabled={!draft.existingName || !model.profile} onClick={() => void setDefault(model.profile)}>Set as default</button>}<button className="plain-button danger" disabled={draft.models.length === 1} onClick={() => setDraft({ ...draft, models: draft.models.filter((_, modelIndex) => modelIndex !== index) })}>Remove</button></div></div>
                       <div className="settings-grid model-grid">
-                        {discoveredModels.length > 0 && <label className="wide model-catalog-select">从模型列表选择<select value={discoveredModels.includes(model.id) ? model.id : ''} onChange={(event) => {
+                        {discoveredModels.length > 0 && <label className="wide model-catalog-select">Choose from model list<select value={discoveredModels.includes(model.id) ? model.id : ''} onChange={(event) => {
                           const selectedID = event.target.value
                           if (selectedID) updateModel(index, { id: selectedID, profile: !model.profile || model.profile === model.id ? selectedID : model.profile })
-                        }}><option value="">请选择模型（已获取 {discoveredModels.length} 个）</option>{discoveredModels.map((modelID) => <option value={modelID} key={modelID}>{modelID}</option>)}</select></label>}
-                        <label>配置名<input value={model.profile} onChange={(event) => updateModel(index, { profile: event.target.value })} placeholder="gpt-5.5" /></label>
-                        <label>模型 ID<input value={model.id} onChange={(event) => updateModel(index, { id: event.target.value })} placeholder="也可以手动输入" /></label>
-                        <label>API 类型<select value={model.type || 'openai-chat'} onChange={(event) => updateModel(index, { type: event.target.value })}><option value="openai-chat">OpenAI Chat</option><option value="openai-responses">OpenAI Responses</option><option value="openai-codex">OpenAI Codex</option><option value="anthropic-messages">Anthropic Messages</option></select></label>
-                        <label className="checkbox-field"><input type="checkbox" checked={model.supportsImages} onChange={(event) => updateModel(index, { supportsImages: event.target.checked })} /> 支持图片输入</label>
-                        <label>Developer 角色<select value={model.developerRole} onChange={(event) => updateModel(index, { developerRole: event.target.value })}><option value="">保持 developer</option><option value="system">映射为 system</option></select></label>
+                        }}><option value="">Select a model ({discoveredModels.length} fetched)</option>{discoveredModels.map((modelID) => <option value={modelID} key={modelID}>{modelID}</option>)}</select></label>}
+                        <label>Profile name<input value={model.profile} onChange={(event) => updateModel(index, { profile: event.target.value })} placeholder="gpt-5.5" /></label>
+                        <label>Model ID<input value={model.id} onChange={(event) => updateModel(index, { id: event.target.value })} placeholder="Or enter manually" /></label>
+                        <label>API type<select value={model.type || 'openai-chat'} onChange={(event) => updateModel(index, { type: event.target.value })}><option value="openai-chat">OpenAI Chat</option><option value="openai-responses">OpenAI Responses</option><option value="openai-codex">OpenAI Codex</option><option value="anthropic-messages">Anthropic Messages</option></select></label>
+                        <label className="checkbox-field"><input type="checkbox" checked={model.supportsImages} onChange={(event) => updateModel(index, { supportsImages: event.target.checked })} /> Supports image input</label>
+                        <label>Developer role<select value={model.developerRole} onChange={(event) => updateModel(index, { developerRole: event.target.value })}><option value="">Keep developer</option><option value="system">Map to system</option></select></label>
                         <label>Context Window<input type="number" min="0" value={model.contextWindow} onChange={(event) => updateModel(index, { contextWindow: event.target.value })} placeholder="400000" /></label>
                         <label>Input Limit<input type="number" min="0" value={model.inputLimit} onChange={(event) => updateModel(index, { inputLimit: event.target.value })} placeholder="272000" /></label>
                         <label>Output Limit<input type="number" min="0" value={model.outputLimit} onChange={(event) => updateModel(index, { outputLimit: event.target.value })} placeholder="128000" /></label>
-                        <label className="wide">其他请求参数（JSON）<textarea value={model.parametersJSON} onChange={(event) => updateModel(index, { parametersJSON: event.target.value })} rows={3} spellCheck={false} /></label>
+                        <label className="wide">Extra request parameters (JSON)<textarea value={model.parametersJSON} onChange={(event) => updateModel(index, { parametersJSON: event.target.value })} rows={3} spellCheck={false} /></label>
                       </div>
                       <details className="reasoning-config" open={Boolean(model.reasoningParameter)}>
-                        <summary>Reasoning config {model.reasoningParameter ? <code>{model.reasoningParameter}</code> : <small>留空会写入 Pi 推荐默认</small>}</summary>
+                        <summary>Reasoning config {model.reasoningParameter ? <code>{model.reasoningParameter}</code> : <small>Leave empty to use Pi recommended defaults</small>}</summary>
                         <div className="settings-grid model-grid">
-                          <label>参数路径<input value={model.reasoningParameter} onChange={(event) => updateModel(index, { reasoningParameter: event.target.value })} placeholder="reasoning.effort" /></label>
-                          <label>默认等级<select value={reasoningLevels.includes(model.reasoningDefault) ? model.reasoningDefault : ''} disabled={reasoningLevels.length === 0} onChange={(event) => updateModel(index, { reasoningDefault: event.target.value })}><option value="">{reasoningLevels.length === 0 ? '请先填写等级映射' : '不设置默认等级'}</option>{reasoningLevels.map((level) => <option value={level} key={level}>{reasoningLevelLabel(level)} ({level})</option>)}</select></label>
-                          <label className="wide">等级映射（JSON）<textarea value={model.reasoningLevelsJSON} onChange={(event) => updateModel(index, { reasoningLevelsJSON: event.target.value })} rows={4} spellCheck={false} placeholder={'{"low":"low","high":"high"}'} /></label>
+                          <label>Parameter path<input value={model.reasoningParameter} onChange={(event) => updateModel(index, { reasoningParameter: event.target.value })} placeholder="reasoning.effort" /></label>
+                          <label>Default level<select value={reasoningLevels.includes(model.reasoningDefault) ? model.reasoningDefault : ''} disabled={reasoningLevels.length === 0} onChange={(event) => updateModel(index, { reasoningDefault: event.target.value })}><option value="">{reasoningLevels.length === 0 ? 'Fill in the level mapping first' : 'No default level'}</option>{reasoningLevels.map((level) => <option value={level} key={level}>{reasoningLevelLabel(level)} ({level})</option>)}</select></label>
+                          <label className="wide">Level mapping (JSON)<textarea value={model.reasoningLevelsJSON} onChange={(event) => updateModel(index, { reasoningLevelsJSON: event.target.value })} rows={4} spellCheck={false} placeholder={'{"low":"low","high":"high"}'} /></label>
                         </div>
                       </details>
                     </article>
@@ -234,7 +234,7 @@ export function ProviderManagerDialog(props: {
             </div>
           </div>
         )}
-        <footer className="model-dialog-actions"><button className="secondary-button" disabled={saving} onClick={props.onClose}>取消</button><button className="primary-button" disabled={!draft || saving} onClick={() => void save()}>{saving ? '保存中…' : '保存配置'}</button></footer>
+        <footer className="model-dialog-actions"><button className="secondary-button" disabled={saving} onClick={props.onClose}>Cancel</button><button className="primary-button" disabled={!draft || saving} onClick={() => void save()}>{saving ? 'Saving…' : 'Save settings'}</button></footer>
       </section>
     </div>
   )
@@ -280,9 +280,9 @@ function emptyProviderModel(): EditableProviderModel {
 }
 
 function providerInput(draft: ProviderDraft): ProviderSettingsInput {
-  if (!draft.name.trim()) throw new Error('Provider 名称不能为空')
-  if (!draft.baseURL.trim()) throw new Error('Base URL 不能为空')
-  if (draft.models.length === 0) throw new Error('至少需要一个模型')
+  if (!draft.name.trim()) throw new Error('Provider name is required')
+  if (!draft.baseURL.trim()) throw new Error('Base URL is required')
+  if (draft.models.length === 0) throw new Error('At least one model is required')
   return {
     name: draft.name.trim(),
     base_url: draft.baseURL.trim(),
@@ -291,9 +291,9 @@ function providerInput(draft: ProviderDraft): ProviderSettingsInput {
     auth_file: draft.authFile.trim(),
     request_timeout: draft.requestTimeout.trim(),
     models: draft.models.map((model, index) => {
-      if (!model.profile.trim() || !model.id.trim()) throw new Error(`模型 ${index + 1} 的配置名和模型 ID 不能为空`)
-      const reasoningLevels = parseJSONRecord(model.reasoningLevelsJSON, `模型 ${model.profile} 的等级映射`)
-      if (model.reasoningDefault.trim() && !(model.reasoningDefault.trim() in reasoningLevels)) throw new Error(`模型 ${model.profile} 的默认等级不在等级映射中`)
+      if (!model.profile.trim() || !model.id.trim()) throw new Error(`Model ${index + 1}: profile name and model ID are required`)
+      const reasoningLevels = parseJSONRecord(model.reasoningLevelsJSON, `Level mapping for model ${model.profile}`)
+      if (model.reasoningDefault.trim() && !(model.reasoningDefault.trim() in reasoningLevels)) throw new Error(`Model ${model.profile}: default level is not in the level mapping`)
       return {
         profile: model.profile.trim(),
         id: model.id.trim(),
@@ -303,7 +303,7 @@ function providerInput(draft: ProviderDraft): ProviderSettingsInput {
         context_window: model.contextWindow ? Number(model.contextWindow) : 0,
         input_limit: model.inputLimit ? Number(model.inputLimit) : 0,
         output_limit: model.outputLimit ? Number(model.outputLimit) : 0,
-        parameters: parseJSONRecord(model.parametersJSON, `模型 ${model.profile} 的请求参数`),
+        parameters: parseJSONRecord(model.parametersJSON, `Request parameters for model ${model.profile}`),
         reasoning_config: {
           parameter: model.reasoningParameter.trim(),
           default: model.reasoningDefault.trim(),
@@ -327,5 +327,5 @@ function reasoningLevelOptions(value: string): string[] {
 }
 
 function codexAuthLabel(status?: string): string {
-  return { signed_out: '未登录', pending: '等待授权', signed_in: '已登录', expired: '已过期', error: '认证异常' }[status ?? 'signed_out'] ?? status ?? '未登录'
+  return { signed_out: 'Signed out', pending: 'Waiting for authorization', signed_in: 'Signed in', expired: 'Expired', error: 'Auth error' }[status ?? 'signed_out'] ?? status ?? 'Signed out'
 }

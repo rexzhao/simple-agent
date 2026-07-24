@@ -28,11 +28,11 @@ export function SessionModelDialog(props: {
         <div className="model-dialog-header">
           <div className="model-dialog-icon"><ChatIcon /></div>
           <div>
-            <span className="eyebrow">新建会话</span>
-            <h2 id="model-dialog-title">选择模型</h2>
-            <p>{props.project ? `${projectName(props.project)} · ${props.project.root}` : '加载 Server Root 配置'}</p>
+            <span className="eyebrow">New session</span>
+            <h2 id="model-dialog-title">Choose a model</h2>
+            <p>{props.project ? `${projectName(props.project)} · ${props.project.root}` : 'Loading Server Root settings'}</p>
           </div>
-          <button className="model-dialog-close" disabled={props.creating} onClick={props.onCancel} aria-label="关闭">×</button>
+          <button className="model-dialog-close" disabled={props.creating} onClick={props.onCancel} aria-label="Close">×</button>
         </div>
         <div className="model-choice-list">
           {props.state.loading ? (
@@ -51,28 +51,28 @@ export function SessionModelDialog(props: {
               >
                 <span className="model-choice-mark">{selectedModel ? '✓' : ''}</span>
                 <span className="model-choice-copy">
-                  <span><strong>{model.model_profile}</strong>{isDefault && <small>默认</small>}</span>
+                  <span><strong>{model.model_profile}</strong>{isDefault && <small>Default</small>}</span>
                   <code>{model.provider} / {model.model_id}</code>
                 </span>
               </button>
             )
           }) : (
-            <p className="model-choice-empty">Server Root 配置中没有可用模型。</p>
+            <p className="model-choice-empty">No models available in the Server Root settings.</p>
           )}
         </div>
         {selected && (selected.reasoning_levels?.length ?? 0) > 0 && (
           <label className="reasoning-choice">
-            <span>推理强度</span>
+            <span>Reasoning effort</span>
             <select value={props.state.reasoningLevel || selected.default_reasoning_level || ''} disabled={props.creating} onChange={(event) => props.onReasoningLevel(event.target.value)}>
               {selected.reasoning_levels?.map((level) => <option value={level} key={level}>{reasoningLevelLabel(level)}</option>)}
             </select>
-            <small>界面使用统一等级，实际请求值由该模型的 reasoning config 映射。</small>
+            <small>The UI uses unified levels; the actual request value is mapped by this model's reasoning config.</small>
           </label>
         )}
         <div className="model-dialog-actions">
-          <button className="secondary-button" disabled={props.creating} onClick={props.onCancel}>取消</button>
+          <button className="secondary-button" disabled={props.creating} onClick={props.onCancel}>Cancel</button>
           <button className="primary-button" disabled={!selected || props.creating} onClick={() => selected && props.onCreate(selected)}>
-            {props.creating ? '创建中…' : '创建会话'}
+            {props.creating ? 'Creating…' : 'Create session'}
           </button>
         </div>
       </section>

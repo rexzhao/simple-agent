@@ -87,26 +87,26 @@ export function Composer(props: {
   const addClipboardImages = async (files: File[]) => {
     setImageError('')
     if (props.draft.pastedImages.length+files.length > maxPastedImageAttachments) {
-      setImageError(`最多可附加 ${maxPastedImageAttachments} 张图片`)
+      setImageError(`You can attach up to ${maxPastedImageAttachments} images`)
       return
     }
     let totalBytes = props.draft.pastedImages.reduce((total, image) => total + image.sizeBytes, 0)
     for (const file of files) {
       if (!supportedPastedImageMediaTypes.has(file.type)) {
-        setImageError(`不支持 ${file.type || '未知'} 图片格式`)
+        setImageError(`Unsupported image format: ${file.type || 'unknown'}`)
         return
       }
       if (file.size === 0) {
-        setImageError('不能附加空图片')
+        setImageError('Cannot attach an empty image')
         return
       }
       if (file.size > maxPastedImageBytes) {
-        setImageError(`单张图片不能超过 ${formatBytes(maxPastedImageBytes)}`)
+        setImageError(`A single image cannot exceed ${formatBytes(maxPastedImageBytes)}`)
         return
       }
       totalBytes += file.size
       if (totalBytes > maxPastedImageTotalBytes) {
-        setImageError(`图片总大小不能超过 ${formatBytes(maxPastedImageTotalBytes)}`)
+        setImageError(`Total image size cannot exceed ${formatBytes(maxPastedImageTotalBytes)}`)
         return
       }
     }
@@ -125,22 +125,22 @@ export function Composer(props: {
   }
 
   const placeholder = props.running
-    ? 'SAI 正在执行…'
+    ? 'SAI is working…'
     : props.blocked
-      ? '另一个会话正在执行，可切回查看进度'
+      ? 'Another session is running. Switch back to check progress'
       : props.draft.pastedTexts.length > 0
-        ? '在粘贴文本后补充说明'
-        : '给 SAI 发送消息'
+        ? 'Add a note after the pasted text'
+        : 'Send a message to SAI'
 
   return (
     <div className="composer-wrap">
       {props.draft.pastedTexts.length > 0 && (
-        <div className="pasted-text-attachments" aria-label="待发送的粘贴文本">
+        <div className="pasted-text-attachments" aria-label="Pasted text to send">
           {props.draft.pastedTexts.map((pastedText, index) => (
             <div className="pasted-text-attachment" key={pastedText.id}>
               <span className="pasted-text-attachment-icon"><PaperclipIcon /></span>
               <span className="pasted-text-attachment-copy">
-                <strong>粘贴文本 #{index + 1}</strong>
+                <strong>Pasted text #{index + 1}</strong>
                 <small>{pastedTextSummary(pastedText.content)}</small>
               </span>
               <button
@@ -148,26 +148,26 @@ export function Composer(props: {
                 className="pasted-text-attachment-remove"
                 disabled={composerDisabled}
                 onClick={() => props.onPastedTextRemove(pastedText.id)}
-                aria-label={`移除粘贴文本 #${index + 1}`}
-                title="移除"
+                aria-label={`Remove pasted text #${index + 1}`}
+                title="Remove"
               >×</button>
             </div>
           ))}
         </div>
       )}
       {props.draft.pastedImages.length > 0 && (
-        <div className="pasted-image-attachments" aria-label="待发送的图片">
+        <div className="pasted-image-attachments" aria-label="Images to send">
           {props.draft.pastedImages.map((image, index) => (
             <div className="pasted-image-attachment" key={image.id}>
-              <img src={image.dataURL} alt={`待发送图片 #${index + 1}`} />
-              <span><strong>图片 #{index + 1}</strong><small>{image.mediaType} · {formatBytes(image.sizeBytes)}</small></span>
+              <img src={image.dataURL} alt={`Image to send #${index + 1}`} />
+              <span><strong>Image #{index + 1}</strong><small>{image.mediaType} · {formatBytes(image.sizeBytes)}</small></span>
               <button
                 type="button"
                 className="pasted-text-attachment-remove"
                 disabled={composerDisabled}
                 onClick={() => props.onPastedImageRemove(image.id)}
-                aria-label={`移除图片 #${index + 1}`}
-                title="移除"
+                aria-label={`Remove image #${index + 1}`}
+                title="Remove"
               >×</button>
             </div>
           ))}
@@ -205,12 +205,12 @@ export function Composer(props: {
           }}
         />
         {props.running ? (
-          <button className="stop-button" onClick={props.onCancel}><StopIcon /> 停止</button>
+          <button className="stop-button" onClick={props.onCancel}><StopIcon /> Stop</button>
         ) : (
-		  <button className="send-button" disabled={(!props.draft.content.trim() && props.draft.pastedTexts.length === 0 && props.draft.pastedImages.length === 0) || composerDisabled} onClick={() => void submit()} aria-label="发送"><SendIcon /></button>
+		  <button className="send-button" disabled={(!props.draft.content.trim() && props.draft.pastedTexts.length === 0 && props.draft.pastedImages.length === 0) || composerDisabled} onClick={() => void submit()} aria-label="Send"><SendIcon /></button>
         )}
       </div>
-      <div className="composer-hint"><span>{props.draft.pastedImages.length > 0 ? '图片将与消息一起发送' : props.draft.pastedTexts.length > 0 ? '粘贴文本会先发送，补充说明随后附加' : 'Enter 发送 · Shift+Enter 换行 · 可粘贴图片'}</span><span>本地运行</span></div>
+      <div className="composer-hint"><span>{props.draft.pastedImages.length > 0 ? 'Images will be sent with the message' : props.draft.pastedTexts.length > 0 ? 'Pasted text is sent first, then your note' : 'Enter to send · Shift+Enter for a new line · Paste images supported'}</span><span>Running locally</span></div>
     </div>
   )
 }
@@ -223,5 +223,5 @@ function isLongPastedText(content: string): boolean {
 
 function pastedTextSummary(content: string): string {
   const lineCount = content.split('\n').length
-  return lineCount > longPasteLineLimit ? `${lineCount.toLocaleString()} 行` : `${content.length.toLocaleString()} 字符`
+  return lineCount > longPasteLineLimit ? `${lineCount.toLocaleString()} lines` : `${content.length.toLocaleString()} characters`
 }

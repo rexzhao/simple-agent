@@ -1,12 +1,12 @@
 export function relativeTime(value: string): string {
   const timestamp = new Date(value).getTime()
-  if (!Number.isFinite(timestamp)) return '刚刚'
+  if (!Number.isFinite(timestamp)) return 'just now'
   const seconds = Math.max(0, Math.round((Date.now() - timestamp) / 1000))
-  if (seconds < 60) return '刚刚'
-  if (seconds < 3600) return `${Math.floor(seconds / 60)} 分钟前`
-  if (seconds < 86400) return `${Math.floor(seconds / 3600)} 小时前`
-  if (seconds < 604800) return `${Math.floor(seconds / 86400)} 天前`
-  return new Date(value).toLocaleDateString('zh-CN')
+  if (seconds < 60) return 'just now'
+  if (seconds < 3600) return `${Math.floor(seconds / 60)}m ago`
+  if (seconds < 86400) return `${Math.floor(seconds / 3600)}h ago`
+  if (seconds < 604800) return `${Math.floor(seconds / 86400)}d ago`
+  return new Date(value).toLocaleDateString('en-US')
 }
 
 export function formatTokenCount(tokens: number): string {
@@ -17,11 +17,11 @@ export function formatTokenCount(tokens: number): string {
 
 export function formatTime(value: string): string {
   const date = new Date(value)
-  return Number.isFinite(date.getTime()) ? date.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' }) : ''
+  return Number.isFinite(date.getTime()) ? date.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' }) : ''
 }
 
 export function errorMessage(reason: unknown): string {
-  return reason instanceof Error ? reason.message : '发生未知错误'
+  return reason instanceof Error ? reason.message : 'An unknown error occurred'
 }
 
 export function blobAsDataURL(blob: Blob): Promise<string> {
@@ -59,10 +59,10 @@ export async function copyText(text: string): Promise<void> {
 export function parseJSONRecord(value: string, label: string): Record<string, unknown> {
   try {
     const parsed: unknown = JSON.parse(value || '{}')
-    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('必须是 JSON 对象')
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('must be a JSON object')
     return parsed as Record<string, unknown>
   } catch (reason) {
-    throw new Error(`${label}格式错误：${errorMessage(reason)}`)
+    throw new Error(`${label} is invalid: ${errorMessage(reason)}`)
   }
 }
 

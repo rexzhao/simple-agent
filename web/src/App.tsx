@@ -260,7 +260,7 @@ function App() {
   }
 
   const archiveSession = async (session: Session) => {
-    if (session.status === 'running' || Boolean(activeRunsRef.current[session.id]) || !window.confirm(`归档“${sessionName(session)}”？归档后会从当前列表隐藏。`)) return
+    if (session.status === 'running' || Boolean(activeRunsRef.current[session.id]) || !window.confirm(`Archive "${sessionName(session)}"? It will be hidden from the current list.`)) return
     try {
       await api.archiveSession(session.id)
       removeSessionFromTree(session)
@@ -270,7 +270,7 @@ function App() {
   }
 
   const deleteSession = async (session: Session) => {
-    if (session.status === 'running' || Boolean(activeRunsRef.current[session.id]) || !window.confirm(`永久删除“${sessionName(session)}”？此操作无法撤销。`)) return
+    if (session.status === 'running' || Boolean(activeRunsRef.current[session.id]) || !window.confirm(`Permanently delete "${sessionName(session)}"? This action cannot be undone.`)) return
     try {
       await api.archiveSession(session.id)
       await api.deleteSession(session.id)
@@ -354,8 +354,8 @@ function App() {
         }
         break
       case 'turn.failed':
-        update((run) => ({ ...run, status: 'failed', error: String(event.message ?? '运行失败') }))
-        setError(String(event.message ?? '运行失败'))
+        update((run) => ({ ...run, status: 'failed', error: String(event.message ?? 'Run failed') }))
+        setError(String(event.message ?? 'Run failed'))
         break
       case 'run.settled': {
         const settledRun = activeRunsRef.current[sessionID]
