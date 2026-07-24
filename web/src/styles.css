@@ -369,20 +369,22 @@ svg { width: 1.1em; height: 1.1em; fill: none; stroke: currentColor; stroke-widt
 .process-card > summary time { margin-left: auto; color: var(--faint); font-family: var(--font-mono); font-size: 9px; font-weight: 500; }
 .process-card > .process-iterations { margin: 0; border-top: 2px solid var(--border); }
 .process-iterations { display: flex; flex-direction: column; gap: 10px; margin: 3px 0 14px; }
-.process-iteration { width: min(680px, 100%); border: 2px solid var(--border); background: #ffffff; }
-.process-iteration-title { padding: 6px 9px; border-bottom: 2px solid var(--border); color: var(--text); background: var(--accent); font-family: "Space Grotesk", "Segoe UI", sans-serif; font-size: 9.5px; font-weight: 800; letter-spacing: .04em; }
-.process-iteration > .process-timeline { margin: 0; padding: 10px; }
+.process-iteration { width: min(680px, 100%); }
+.process-iteration + .process-iteration { margin-top: 4px; }
+.process-iteration > .process-timeline { margin: 0; }
 .process-card > .process-iterations { gap: 0; }
-.process-card > .process-iterations .process-iteration { width: 100%; border: 0; border-bottom: 2px solid var(--border); }
-.process-card > .process-iterations .process-iteration:last-child { border-bottom: 0; }
+.process-card > .process-iterations .process-iteration { width: 100%; }
 .process-timeline { display: flex; flex-direction: column; gap: 8px; margin: 3px 0 14px; }
-.reasoning-step, .model-output-step { padding: 7px 9px 8px 11px; border-left: 4px solid var(--accent); background: var(--panel-soft); }
+.iteration-marker { position: absolute; top: 9px; right: 100%; margin-right: 9px; color: var(--faint); font-family: var(--font-mono); font-size: 9px; font-weight: 500; font-style: normal; line-height: 1; pointer-events: none; }
+.reasoning-step, .model-output-step { position: relative; padding: 7px 9px 8px 11px; border-left: 4px solid var(--accent); background: var(--panel-soft); }
 .model-output-step { border-left-color: var(--purple); }
 .reasoning-step > span, .model-output-step > span { color: var(--muted); font-family: "Space Grotesk", "Segoe UI", sans-serif; font-size: 9.5px; font-weight: 800; text-transform: uppercase; letter-spacing: .05em; }
 .reasoning-step pre, .model-output-step pre { max-height: 280px; margin: 6px 0 0; overflow: auto; color: #374151; font: 10.5px/1.65 var(--font-mono); white-space: pre-wrap; overflow-wrap: anywhere; }
 .model-output-step pre { color: var(--text); }
+.model-output-step .markdown-body { max-height: 280px; margin: 0; overflow: auto; color: var(--text); font-size: 11px; line-height: 1.65; }
+.model-output-step .markdown-body pre { max-height: none; margin: .5em 0; overflow: auto; box-shadow: none; }
 
-.tool-row { width: min(660px, 100%); border: 2px solid var(--border); color: var(--text); background: #ffffff; font-family: "Space Grotesk", "Segoe UI", sans-serif; font-size: 10.5px; }
+.tool-row { position: relative; width: min(660px, 100%); border: 2px solid var(--border); color: var(--text); background: #ffffff; font-family: "Space Grotesk", "Segoe UI", sans-serif; font-size: 10.5px; }
 .tool-row-header { min-height: 35px; display: flex; align-items: center; gap: 8px; padding: 6px 9px; list-style: none; }
 .tool-row-header::-webkit-details-marker { display: none; }
 .tool-row.expandable > .tool-row-header { cursor: pointer; }

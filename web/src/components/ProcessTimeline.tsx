@@ -1,6 +1,14 @@
+import type { ReactNode } from 'react'
+import Markdown from 'react-markdown'
+import type { Components } from 'react-markdown'
+import remarkGfm from 'remark-gfm'
 import type { RunStep, ToolActivity } from '../types'
 import { groupProcessSteps } from '../lib/runSteps'
 import { ToolIcon } from './icons'
+
+const markdownComponents: Components = {
+	a: ({ node: _node, ...props }) => <a {...props} target="_blank" rel="noreferrer noopener" />,
+}
 
 export function ProcessTimeline({ steps }: { steps: RunStep[] }) {
 	const iterations = groupProcessSteps(steps)
@@ -8,13 +16,16 @@ export function ProcessTimeline({ steps }: { steps: RunStep[] }) {
 		<div className="process-iterations">
 			{iterations.map((iteration) => (
 				<section className="process-iteration" key={iteration.number}>
-					<div className="process-iteration-title">Iteration {iteration.number}</div>
 					<div className="process-timeline">
-						{iteration.steps.map((step) => step.kind === 'reasoning'
-							? <div className="reasoning-step" key={step.id}><span>{step.label || 'Reasoning'}</span><pre>{step.text}</pre></div>
-							: step.kind === 'output'
-								? <div className="model-output-step" key={step.id}><span>Agent intermediate output</span><pre>{step.text}</pre></div>
-								: <ToolRow key={step.id} tool={step} />)}
+						{iteration.steps.map((step, stepIndex) => {
+							const first = stepIndex === 0
+							const marker = first ? <i className="iteration-marker">{iteration.number}</i> : null
+							return step.kind === 'reasoning'
+								? <div className="reasoning-step" key={step.id}>{marker}<span>{step.label || 'Reasoning'}</span><pre>{step.text}</pre></div>
+								: step.kind === 'output'
+									? <div className="model-output-step" key={step.id}>{marker}<div className="markdown-body"><Markdown remarkPlugins={[remarkGfm]} components={markdownComponents} skipHtml>{step.text}</Markdown></div></div>
+									: <ToolRow key={step.id} tool={step} marker={marker} />
+						})}
 					</div>
 				</section>
 			))}
@@ -22,7 +33,7 @@ export function ProcessTimeline({ steps }: { steps: RunStep[] }) {
 	)
 }
 
-function ToolRow({ tool }: { tool: ToolActivity }) {
+function ToolRow({ tool, marker }: { tool: ToolActivity; marker?: ReactNode }) {
 	const argumentsObject = parseToolArguments(tool.arguments)
 	const target = toolTarget(tool.name, argumentsObject)
 	const command = tool.name === 'shell' ? stringField(argumentsObject, 'command') : ''
@@ -43,11 +54,11 @@ function ToolRow({ tool }: { tool: ToolActivity }) {
 		</div>
 	)
 	if (!showDetails) {
-		return <div className={`tool-row ${tool.status}`}><div className="tool-row-header">{header}</div></div>
+		return <div className={`tool-row ${tool.status}`}><div className="tool-row-header">{marker}{header}</div></div>
 	}
 	return (
 		<details className={`tool-row ${tool.status} expandable`}>
-			<summary className="tool-row-header">{header}</summary>
+			<summary className="tool-row-header">{marker}{header}</summary>
 			{details}
 		</details>
   )
