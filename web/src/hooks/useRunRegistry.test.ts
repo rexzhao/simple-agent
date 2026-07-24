@@ -37,6 +37,20 @@ describe('useRunRegistry delta batching', () => {
     expect(result.current.activeRunsRef.current['session-1'].steps[0]).toMatchObject({ kind: 'reasoning', text: 'thinking' })
   })
 
+  it('keeps run membership stable during stream updates', () => {
+    vi.spyOn(window, 'requestAnimationFrame').mockImplementation(() => 1)
+    vi.spyOn(window, 'cancelAnimationFrame').mockImplementation(() => undefined)
+    const { result } = renderHook(() => useRunRegistry())
+    act(() => result.current.addActiveRun(run))
+    const membership = result.current.runningSessionIDs
+    act(() => result.current.queueRunEvent('session-1', 'run-1', { type: 'text.delta', turn_id: 'turn', agent_iteration: 1, text: 'delta' }))
+    act(() => result.current.flushRunEvents('session-1', 'run-1'))
+    expect(result.current.runningSessionIDs).toBe(membership)
+    act(() => result.current.updateActiveRun('session-1', 'run-1', () => null))
+    expect(result.current.runningSessionIDs).not.toBe(membership)
+    expect(result.current.runningSessionIDs.has('session-1')).toBe(false)
+  })
+
   it('does not mix consecutive runs in one session', () => {
     let frame: FrameRequestCallback | undefined
     vi.spyOn(window, 'requestAnimationFrame').mockImplementation((callback) => { frame = callback; return 1 })

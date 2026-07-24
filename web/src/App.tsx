@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 import { api, streamRun } from './api'
 import type { ActiveRun, ActiveRunDescriptor, Bootstrap, ImageAttachmentInput, Project, RunEvent, RunStep, Session, SessionModelOption } from './types'
 import { errorMessage } from './lib/format'
@@ -38,7 +38,7 @@ function App() {
   const [creatingSession, setCreatingSession] = useState(false)
   const [completionNotice, setCompletionNotice] = useState<BackgroundCompletionNotice | null>(null)
   const { draftsBySession, updateDraft, addPastedText, removePastedText, addPastedImage, removePastedImage, clearDraft } = useComposerDrafts()
-  const { activeRunsBySession, activeRunsRef, addActiveRun, updateActiveRun, queueRunEvent, flushRunEvents } = useRunRegistry()
+  const { activeRunsBySession, activeRunsRef, runningSessionIDs, addActiveRun, updateActiveRun, queueRunEvent, flushRunEvents } = useRunRegistry()
 
   const loadProjects = useCallback(async () => {
     const payload = await api.projects()
@@ -386,7 +386,6 @@ function App() {
   const selectedProject = projects.find((project) => project.id === selectedProjectID) ?? null
   const selectedActiveRun = activeRunsBySession[selectedSessionID] ?? null
   const otherSessionsRunning = Object.keys(activeRunsBySession).some((sessionID) => sessionID !== selectedSessionID)
-  const runningSessionIDs = useMemo(() => new Set(Object.keys(activeRunsBySession)), [activeRunsBySession])
   const showAddProject = useCallback(() => setShowProjectForm(true), [])
 
   if (loading) return <Splash />

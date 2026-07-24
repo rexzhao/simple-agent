@@ -25,6 +25,7 @@ export function coalesceRunEvents(events: RunEvent[]): RunEvent[] {
 
 export function useRunRegistry() {
   const [activeRunsBySession, setActiveRunsBySession] = useState<Record<string, ActiveRun>>({})
+  const [runningSessionIDs, setRunningSessionIDs] = useState<ReadonlySet<string>>(() => new Set())
   const activeRunsRef = useRef<Record<string, ActiveRun>>({})
   const pendingRef = useRef<Record<string, Pending>>({})
 
@@ -38,10 +39,22 @@ export function useRunRegistry() {
     const updated = updater(current)
     const next = { ...activeRunsRef.current }
     if (updated) next[sessionID] = updated
-    else delete next[sessionID]
+    else {
+      delete next[sessionID]
+      setRunningSessionIDs((current) => {
+        if (!current.has(sessionID)) return current
+        const nextIDs = new Set(current)
+        nextIDs.delete(sessionID)
+        return nextIDs
+      })
+    }
     publish(next)
   }, [publish])
-  const addActiveRun = useCallback((run: ActiveRun) => publish({ ...activeRunsRef.current, [run.sessionID]: run }), [publish])
+  const addActiveRun = useCallback((run: ActiveRun) => {
+    const isNewSession = !activeRunsRef.current[run.sessionID]
+    publish({ ...activeRunsRef.current, [run.sessionID]: run })
+    if (isNewSession) setRunningSessionIDs((current) => new Set(current).add(run.sessionID))
+  }, [publish])
 
   const flushRunEvents = useCallback((sessionID: string, runID: string) => {
     const pending = pendingRef.current[sessionID]
@@ -77,5 +90,5 @@ export function useRunRegistry() {
     pendingRef.current = {}
   }, [])
 
-  return { activeRunsBySession, activeRunsRef, addActiveRun, updateActiveRun, queueRunEvent, flushRunEvents }
+  return { activeRunsBySession, activeRunsRef, runningSessionIDs, addActiveRun, updateActiveRun, queueRunEvent, flushRunEvents }
 }
