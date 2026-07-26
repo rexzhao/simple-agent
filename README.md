@@ -70,6 +70,9 @@ Provider profile:
 name: paperhub
 base_url: https://tc-paperhub.diezhi.net/v1
 api_key: $PAPERHUB_API_KEY
+# Optional provider-wide proxies:
+# http_proxy: http://127.0.0.1:7890
+# https_proxy: http://127.0.0.1:7890
 
 models:
   glm-5.2:

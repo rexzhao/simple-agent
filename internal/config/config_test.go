@@ -84,6 +84,12 @@ func TestLoadResolvesConfigAndProviderModels(t *testing.T) {
 	if provider.APIKey != "$PAPERHUB_API_KEY" {
 		t.Fatalf("APIKey = %q, want $PAPERHUB_API_KEY", provider.APIKey)
 	}
+	if provider.HTTPProxy != "http://127.0.0.1:7890" {
+		t.Fatalf("HTTPProxy = %q, want http://127.0.0.1:7890", provider.HTTPProxy)
+	}
+	if provider.HTTPSProxy != "https://proxy.example.test:8443" {
+		t.Fatalf("HTTPSProxy = %q, want https://proxy.example.test:8443", provider.HTTPSProxy)
+	}
 	if got := provider.Models["glm-5.2-fast"].ID; got != "glm-5.2" {
 		t.Fatalf("fast profile id = %q, want glm-5.2", got)
 	}
@@ -1118,6 +1124,34 @@ models:
 	assertErrorContains(t, err, "request_timeout must be a positive duration")
 }
 
+func TestLoadRejectsInvalidProviderProxyURLs(t *testing.T) {
+	tests := []struct {
+		name  string
+		field string
+		value string
+	}{
+		{name: "HTTP proxy without scheme", field: "http_proxy", value: "127.0.0.1:7890"},
+		{name: "HTTPS proxy without host", field: "https_proxy", value: "https://"},
+		{name: "unsupported proxy scheme", field: "https_proxy", value: "socks5://127.0.0.1:7890"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			dir := writeConfigFixture(t)
+			writeFile(t, filepath.Join(dir, "providers", "invalid-proxy.yaml"), `name: invalid-proxy
+base_url: http://localhost:8080/v1
+`+test.field+`: `+test.value+`
+
+models:
+  default:
+    id: model-default
+`)
+
+			_, err := Load(rootConfigPath(dir))
+			assertErrorContains(t, err, test.field+" must be an absolute HTTP or HTTPS URL")
+		})
+	}
+}
+
 func TestLoadReadsMCPServerYAMLFiles(t *testing.T) {
 	dir := writeConfigFixture(t)
 	writeMCPFixture(t, dir)
@@ -1362,6 +1396,9 @@ func TestResolveModelExplicitProviderModel(t *testing.T) {
 	}
 	if got.Provider.RequestTimeout != "45s" {
 		t.Fatalf("Provider.RequestTimeout = %q, want 45s", got.Provider.RequestTimeout)
+	}
+	if got.Provider.HTTPProxy != "http://127.0.0.1:7890" || got.Provider.HTTPSProxy != "https://proxy.example.test:8443" {
+		t.Fatalf("Provider proxies = %q/%q, want configured HTTP/HTTPS proxies", got.Provider.HTTPProxy, got.Provider.HTTPSProxy)
 	}
 	if got.Provider.APIKey != "$PAPERHUB_API_KEY" {
 		t.Fatalf("Provider.APIKey = %q, want $PAPERHUB_API_KEY", got.Provider.APIKey)
@@ -1660,6 +1697,8 @@ logging:
 base_url: https://tc-paperhub.diezhi.net/v1
 api_key: $PAPERHUB_API_KEY
 request_timeout: 45s
+http_proxy: http://127.0.0.1:7890
+https_proxy: https://proxy.example.test:8443
 
 models:
   glm-5.2:

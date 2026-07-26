@@ -35,6 +35,8 @@ interface ProviderDraft {
   apiKeyConfigured: boolean
   authFile: string
   requestTimeout: string
+  httpProxy: string
+  httpsProxy: string
   models: EditableProviderModel[]
 }
 
@@ -177,11 +179,13 @@ export function ProviderManagerDialog(props: {
             </aside>
             <div className="provider-editor">
               <section className="settings-section">
-                <div className="settings-section-title"><h3>Connection</h3>{draft.existingName && <code>{draft.existingName}.yaml</code>}</div>
+                <div className="settings-section-title"><div><h3>Connection</h3><p>Proxy settings apply to every model in this provider.</p></div>{draft.existingName && <code>{draft.existingName}.yaml</code>}</div>
                 <div className="settings-grid">
                   <label>Name<input value={draft.name} disabled={Boolean(draft.existingName)} onChange={(event) => setDraft({ ...draft, name: event.target.value })} placeholder="openai" /></label>
                   <label>Request timeout<input value={draft.requestTimeout} onChange={(event) => setDraft({ ...draft, requestTimeout: event.target.value })} placeholder="60s" /></label>
                   <label className="wide">Base URL<input value={draft.baseURL} onChange={(event) => setDraft({ ...draft, baseURL: event.target.value })} placeholder="https://api.openai.com/v1" /></label>
+                  <label>HTTP proxy<input value={draft.httpProxy} onChange={(event) => setDraft({ ...draft, httpProxy: event.target.value })} placeholder="http://127.0.0.1:7890" /></label>
+                  <label>HTTPS proxy<input value={draft.httpsProxy} onChange={(event) => setDraft({ ...draft, httpsProxy: event.target.value })} placeholder="http://127.0.0.1:7890" /></label>
                   <label className="wide">API key / environment variable<input value={draft.apiKey} onChange={(event) => setDraft({ ...draft, apiKey: event.target.value, keepAPIKey: false })} placeholder={draft.apiKeyConfigured ? 'Configured; leave empty and keep the option below to leave unchanged' : '$OPENAI_API_KEY'} /></label>
                   {draft.apiKeyConfigured && <label className="checkbox-field wide"><input type="checkbox" checked={draft.keepAPIKey} onChange={(event) => setDraft({ ...draft, keepAPIKey: event.target.checked })} /> Keep current API key</label>}
                 </div>
@@ -266,12 +270,14 @@ function providerDraft(provider: ProviderSettings): ProviderDraft {
     apiKeyConfigured: provider.api_key_configured,
     authFile: provider.auth_file ?? '',
     requestTimeout: provider.request_timeout ?? '',
+    httpProxy: provider.http_proxy ?? '',
+    httpsProxy: provider.https_proxy ?? '',
     models: provider.models.map(editableProviderModel),
   }
 }
 
 function emptyProviderDraft(): ProviderDraft {
-  return { existingName: '', name: '', baseURL: '', apiKey: '', keepAPIKey: false, apiKeyConfigured: false, authFile: '', requestTimeout: '60s', models: [emptyProviderModel()] }
+  return { existingName: '', name: '', baseURL: '', apiKey: '', keepAPIKey: false, apiKeyConfigured: false, authFile: '', requestTimeout: '60s', httpProxy: '', httpsProxy: '', models: [emptyProviderModel()] }
 }
 
 function editableProviderModel(model: ProviderModelSettings): EditableProviderModel {
@@ -317,6 +323,8 @@ function providerInput(draft: ProviderDraft): ProviderSettingsInput {
     keep_api_key: draft.keepAPIKey,
     auth_file: draft.authFile.trim(),
     request_timeout: draft.requestTimeout.trim(),
+    http_proxy: draft.httpProxy.trim(),
+    https_proxy: draft.httpsProxy.trim(),
     models: draft.models.map((model, index) => {
       if (!model.profile.trim() || !model.id.trim()) throw new Error(`Model ${index + 1}: profile name and model ID are required`)
       const reasoningLevels = parseJSONRecord(model.reasoningLevelsJSON, `Level mapping for model ${model.profile}`)

@@ -90,6 +90,9 @@ name: paperhub
 base_url: https://tc-paperhub.diezhi.net/v1
 api_key: $PAPERHUB_API_KEY
 request_timeout: 60s
+# Optional provider-wide proxies:
+# http_proxy: http://127.0.0.1:7890
+# https_proxy: http://127.0.0.1:7890
 
 models:
   glm-5.2:
@@ -179,6 +182,17 @@ retain model state without relying on server-side response storage.
 
 Secrets beginning with `$` are read from the named environment variable. A
 direct secret string is supported but should not be committed.
+
+`http_proxy` and `https_proxy` are optional provider-level proxy URLs. They
+apply to every model profile in that provider, including model discovery;
+Codex token refreshes triggered by model requests use the same proxy client.
+`http_proxy` handles requests whose destination URL uses HTTP, while
+`https_proxy` handles HTTPS destinations. The proxy URL itself may use either
+`http://` or `https://` (an HTTPS API commonly uses an `http://` CONNECT proxy).
+When either provider-level field is set, an omitted counterpart connects
+directly. When both are omitted, the standard Go transport remains in use, so
+the process-level `HTTP_PROXY`, `HTTPS_PROXY`, and `NO_PROXY` environment
+variables keep their normal behavior.
 
 `request_timeout` controls how long each attempt waits for HTTP response
 headers. Header timeouts are retried once before the turn fails. The default is

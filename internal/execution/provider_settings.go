@@ -33,6 +33,8 @@ type ProviderSettings struct {
 	APIKeyConfigured bool                    `json:"api_key_configured"`
 	AuthFile         string                  `json:"auth_file,omitempty"`
 	RequestTimeout   string                  `json:"request_timeout,omitempty"`
+	HTTPProxy        string                  `json:"http_proxy,omitempty"`
+	HTTPSProxy       string                  `json:"https_proxy,omitempty"`
 	Models           []ProviderModelSettings `json:"models"`
 	CodexAuth        *CodexAuthStatus        `json:"codex_auth,omitempty"`
 }
@@ -58,6 +60,8 @@ type ProviderSettingsInput struct {
 	KeepAPIKey     bool                    `json:"keep_api_key,omitempty"`
 	AuthFile       string                  `json:"auth_file,omitempty"`
 	RequestTimeout string                  `json:"request_timeout,omitempty"`
+	HTTPProxy      string                  `json:"http_proxy,omitempty"`
+	HTTPSProxy     string                  `json:"https_proxy,omitempty"`
 	Models         []ProviderModelSettings `json:"models"`
 }
 
@@ -154,6 +158,8 @@ func (s *Service) saveProviderSettings(existingName string, input ProviderSettin
 		APIKey:         apiKey,
 		AuthFile:       authFile,
 		RequestTimeout: strings.TrimSpace(input.RequestTimeout),
+		HTTPProxy:      strings.TrimSpace(input.HTTPProxy),
+		HTTPSProxy:     strings.TrimSpace(input.HTTPSProxy),
 		Models:         make(map[string]config.ModelProfile, len(input.Models)),
 	}
 	usesCodex := false
@@ -323,7 +329,14 @@ func (s *Service) DiscoverProviderModels(ctx context.Context, providerName strin
 	} else {
 		request.Header.Set("Authorization", "Bearer "+resolved.Provider.ResolvedAPIKey)
 	}
-	client := &http.Client{Timeout: 20 * time.Second}
+	client, err := providerHTTPClient(provider)
+	if err != nil {
+		return nil, fmt.Errorf("provider %q: %w", providerName, err)
+	}
+	if client == nil {
+		client = &http.Client{}
+	}
+	client.Timeout = 20 * time.Second
 	response, err := client.Do(request)
 	if err != nil {
 		return nil, fmt.Errorf("request provider model list: %w", err)
@@ -443,6 +456,8 @@ func providerSettingsFromConfig(providerDir string, provider config.ProviderConf
 		APIKeyConfigured: apiKey != "",
 		AuthFile:         authFile,
 		RequestTimeout:   provider.RequestTimeout,
+		HTTPProxy:        provider.HTTPProxy,
+		HTTPSProxy:       provider.HTTPSProxy,
 		Models:           make([]ProviderModelSettings, 0, len(provider.Models)),
 	}
 	profiles := make([]string, 0, len(provider.Models))

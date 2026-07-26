@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -85,6 +86,8 @@ type ProviderConfig struct {
 	APIKey         string                  `json:"api_key" yaml:"api_key"`
 	AuthFile       string                  `json:"auth_file,omitempty" yaml:"auth_file,omitempty"`
 	RequestTimeout string                  `json:"request_timeout,omitempty" yaml:"request_timeout,omitempty"`
+	HTTPProxy      string                  `json:"http_proxy,omitempty" yaml:"http_proxy,omitempty"`
+	HTTPSProxy     string                  `json:"https_proxy,omitempty" yaml:"https_proxy,omitempty"`
 	ResolvedAPIKey string                  `json:"-" yaml:"-"`
 	Models         map[string]ModelProfile `json:"models" yaml:"models"`
 }
@@ -138,6 +141,8 @@ func (p ProviderConfig) MarshalJSON() ([]byte, error) {
 		APIKey         string                  `json:"api_key"`
 		AuthFile       string                  `json:"auth_file,omitempty"`
 		RequestTimeout string                  `json:"request_timeout,omitempty"`
+		HTTPProxy      string                  `json:"http_proxy,omitempty"`
+		HTTPSProxy     string                  `json:"https_proxy,omitempty"`
 		Models         map[string]ModelProfile `json:"models"`
 	}
 
@@ -150,6 +155,8 @@ func (p ProviderConfig) MarshalJSON() ([]byte, error) {
 		APIKey:         redactedSecretValue(p.APIKey),
 		AuthFile:       p.AuthFile,
 		RequestTimeout: p.RequestTimeout,
+		HTTPProxy:      p.HTTPProxy,
+		HTTPSProxy:     p.HTTPSProxy,
 		Models:         p.Models,
 	}); err != nil {
 		return nil, err
@@ -681,6 +688,12 @@ func validateProvider(path string, provider ProviderConfig) error {
 			return fmt.Errorf("provider file %q request_timeout must be a positive duration", path)
 		}
 	}
+	if err := validateProviderProxyURL(path, "http_proxy", provider.HTTPProxy); err != nil {
+		return err
+	}
+	if err := validateProviderProxyURL(path, "https_proxy", provider.HTTPSProxy); err != nil {
+		return err
+	}
 	for profileName, profile := range provider.Models {
 		if profile.ID == "" {
 			return fmt.Errorf("provider file %q model %q is missing id", path, profileName)
@@ -718,6 +731,8 @@ func normalizeProvider(provider ProviderConfig, providerFileDir string) Provider
 	provider.Name = strings.TrimSpace(provider.Name)
 	provider.AuthFile = strings.TrimSpace(provider.AuthFile)
 	provider.RequestTimeout = strings.TrimSpace(provider.RequestTimeout)
+	provider.HTTPProxy = strings.TrimSpace(provider.HTTPProxy)
+	provider.HTTPSProxy = strings.TrimSpace(provider.HTTPSProxy)
 	if provider.AuthFile != "" {
 		provider.AuthFile = resolvePath(providerFileDir, provider.AuthFile)
 	}
@@ -728,6 +743,22 @@ func normalizeProvider(provider ProviderConfig, providerFileDir string) Provider
 		provider.Models[profileName] = profile
 	}
 	return provider
+}
+
+func validateProviderProxyURL(path, field, value string) error {
+	if value == "" {
+		return nil
+	}
+	proxyURL, err := url.Parse(value)
+	if err != nil || proxyURL.Host == "" {
+		return fmt.Errorf("provider file %q %s must be an absolute HTTP or HTTPS URL", path, field)
+	}
+	switch strings.ToLower(proxyURL.Scheme) {
+	case "http", "https":
+		return nil
+	default:
+		return fmt.Errorf("provider file %q %s must be an absolute HTTP or HTTPS URL", path, field)
+	}
 }
 
 func resolveModelType(providerName, modelName, modelType string) (string, error) {

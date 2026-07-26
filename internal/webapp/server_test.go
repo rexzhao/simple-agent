@@ -255,6 +255,8 @@ func TestServerProviderSettingsPreserveSecretsAndWriteReasoningDefaults(t *testi
 		Name:       "fake",
 		BaseURL:    "http://127.0.0.1:1/v1",
 		KeepAPIKey: true,
+		HTTPProxy:  "http://127.0.0.1:7890",
+		HTTPSProxy: "https://proxy.example.test:8443",
 		Models: []execution.ProviderModelSettings{{
 			Profile:       "gpt",
 			ID:            "gpt-5.5",
@@ -284,6 +286,9 @@ func TestServerProviderSettingsPreserveSecretsAndWriteReasoningDefaults(t *testi
 	if model.DeveloperRole != "system" {
 		t.Fatalf("model developer role = %q, want system", model.DeveloperRole)
 	}
+	if document.Providers[0].HTTPProxy != input.HTTPProxy || document.Providers[0].HTTPSProxy != input.HTTPSProxy {
+		t.Fatalf("provider proxies = %q/%q, want %q/%q", document.Providers[0].HTTPProxy, document.Providers[0].HTTPSProxy, input.HTTPProxy, input.HTTPSProxy)
+	}
 
 	response = doJSONRequest(t, http.MethodGet, server.URL+"/api/projects/"+projectResult.Project.ID+"/models", nil)
 	var options execution.SessionModelOptions
@@ -301,6 +306,8 @@ func TestServerProviderSettingsPreserveSecretsAndWriteReasoningDefaults(t *testi
 		!bytes.Contains(providerData, []byte("input:")) ||
 		!bytes.Contains(providerData, []byte("- image")) ||
 		!bytes.Contains(providerData, []byte("developer_role: system")) ||
+		!bytes.Contains(providerData, []byte("http_proxy: http://127.0.0.1:7890")) ||
+		!bytes.Contains(providerData, []byte("https_proxy: https://proxy.example.test:8443")) ||
 		!bytes.Contains(providerData, []byte("input_limit: 272000")) ||
 		!bytes.Contains(providerData, []byte("output_limit: 128000")) ||
 		!bytes.Contains(providerData, []byte("reasoning_config:")) {

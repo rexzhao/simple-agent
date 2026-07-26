@@ -66,6 +66,8 @@ export interface ProviderSettings {
   api_key_configured: boolean
   auth_file?: string
   request_timeout?: string
+  http_proxy?: string
+  https_proxy?: string
   models: ProviderModelSettings[]
   codex_auth?: CodexAuthStatus
 }
@@ -77,6 +79,8 @@ export interface ProviderSettingsInput {
   keep_api_key?: boolean
   auth_file?: string
   request_timeout?: string
+  http_proxy?: string
+  https_proxy?: string
   models: ProviderModelSettings[]
 }
 

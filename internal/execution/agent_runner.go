@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -1327,15 +1328,19 @@ func newProviderForRun(providerName, modelType, compatibility string, provider c
 	if err != nil {
 		return nil, fmt.Errorf("provider %q: %w", providerName, err)
 	}
+	httpClient, err := providerHTTPClient(provider)
+	if err != nil {
+		return nil, fmt.Errorf("provider %q: %w", providerName, err)
+	}
 	switch modelType {
 	case config.ProviderTypeOpenAIChat:
-		return openaichat.NewProvider(openAIChatProviderConfig(provider, compatibility, httpOptions))
+		return openaichat.NewProvider(openAIChatProviderConfig(provider, compatibility, httpClient, httpOptions))
 	case config.ProviderTypeOpenAIResponses:
-		return openairesponses.NewProvider(openAIResponsesProviderConfig(provider, httpOptions))
+		return openairesponses.NewProvider(openAIResponsesProviderConfig(provider, httpClient, httpOptions))
 	case config.ProviderTypeOpenAICodex:
-		return openairesponses.NewProvider(openAICodexProviderConfig(provider, httpOptions))
+		return openairesponses.NewProvider(openAICodexProviderConfig(provider, httpClient, httpOptions))
 	case config.ProviderTypeAnthropicMessages:
-		return anthropicmessages.NewProvider(anthropicMessagesProviderConfig(provider, httpOptions))
+		return anthropicmessages.NewProvider(anthropicMessagesProviderConfig(provider, httpClient, httpOptions))
 	default:
 		return nil, fmt.Errorf("unsupported model type %q for provider %q", modelType, providerName)
 	}
@@ -1352,40 +1357,45 @@ func providerHTTPOptions(provider config.ProviderConfig) (httpstream.Options, er
 	return httpstream.Options{RequestTimeout: requestTimeout}, nil
 }
 
-func openAIChatProviderConfig(provider config.ProviderConfig, compatibility string, httpOptions httpstream.Options) openaichat.ProviderConfig {
+func openAIChatProviderConfig(provider config.ProviderConfig, compatibility string, httpClient *http.Client, httpOptions httpstream.Options) openaichat.ProviderConfig {
 	return openaichat.ProviderConfig{
 		BaseURL:       provider.BaseURL,
 		APIKey:        provider.ResolvedAPIKey,
 		Compatibility: compatibility,
+		HTTPClient:    httpClient,
 		HTTPOptions:   httpOptions,
 	}
 }
 
-func openAIResponsesProviderConfig(provider config.ProviderConfig, httpOptions httpstream.Options) openairesponses.ProviderConfig {
+func openAIResponsesProviderConfig(provider config.ProviderConfig, httpClient *http.Client, httpOptions httpstream.Options) openairesponses.ProviderConfig {
 	return openairesponses.ProviderConfig{
 		BaseURL:     provider.BaseURL,
 		APIKey:      provider.ResolvedAPIKey,
+		HTTPClient:  httpClient,
 		HTTPOptions: httpOptions,
 	}
 }
 
-func openAICodexProviderConfig(provider config.ProviderConfig, httpOptions httpstream.Options) openairesponses.ProviderConfig {
+func openAICodexProviderConfig(provider config.ProviderConfig, httpClient *http.Client, httpOptions httpstream.Options) openairesponses.ProviderConfig {
 	return openairesponses.ProviderConfig{
 		BaseURL:         provider.BaseURL,
 		ForceStoreFalse: true,
+		HTTPClient:      httpClient,
 		HTTPOptions:     httpOptions,
 		TokenSource: codexResponsesTokenSource{
 			source: &codexauth.TokenSource{
-				Store: codexauth.Store{Path: provider.AuthFile},
+				Store:      codexauth.Store{Path: provider.AuthFile},
+				HTTPClient: httpClient,
 			},
 		},
 	}
 }
 
-func anthropicMessagesProviderConfig(provider config.ProviderConfig, httpOptions httpstream.Options) anthropicmessages.ProviderConfig {
+func anthropicMessagesProviderConfig(provider config.ProviderConfig, httpClient *http.Client, httpOptions httpstream.Options) anthropicmessages.ProviderConfig {
 	return anthropicmessages.ProviderConfig{
 		BaseURL:     provider.BaseURL,
 		APIKey:      provider.ResolvedAPIKey,
+		HTTPClient:  httpClient,
 		HTTPOptions: httpOptions,
 	}
 }
