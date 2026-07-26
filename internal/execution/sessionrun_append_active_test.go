@@ -130,6 +130,7 @@ func TestAppendActiveDrainedIntoActiveTurn(t *testing.T) {
 // sent together as a follow-up turn.
 func TestAppendActiveRemainderRunsFollowUpTurn(t *testing.T) {
 	home := t.TempDir()
+	release := make(chan struct{})
 	var mu sync.Mutex
 	var contents []string
 	runner := fakeExecutionTurnRunner{
@@ -138,6 +139,15 @@ func TestAppendActiveRemainderRunsFollowUpTurn(t *testing.T) {
 			mu.Lock()
 			contents = append(contents, request.Content)
 			mu.Unlock()
+			// Hold the first turn open so the appends below land while it is
+			// running; the follow-up turn runs to completion immediately.
+			if request.Content == "init" {
+				select {
+				case <-release:
+				case <-ctx.Done():
+					return SessionTurnResult{}, ctx.Err()
+				}
+			}
 			// Never drain via ActivePromptDrain: appended prompts remain queued
 			// until the turn settles, forcing the follow-up path.
 			if err := request.Publisher.Publish(eventAssistant(request.TurnID, "answer-"+request.Content)); err != nil {
@@ -153,6 +163,7 @@ func TestAppendActiveRemainderRunsFollowUpTurn(t *testing.T) {
 	emit := collectQueueEvents(&mu2, &snapshots)
 
 	run := service.StartSessionRun(context.Background(), session.ID, "init", emit)
+	// Wait until the turn is blocked inside the runner before appending.
 	waitForRunningTurn(t, service, session.ID)
 
 	if err := run.AppendActive("first"); err != nil {
@@ -161,6 +172,7 @@ func TestAppendActiveRemainderRunsFollowUpTurn(t *testing.T) {
 	if err := run.AppendActive("second"); err != nil {
 		t.Fatalf("AppendActive(second) error = %v", err)
 	}
+	close(release)
 
 	result, err := run.Wait()
 	if err != nil {
@@ -262,6 +274,7 @@ func TestAppendActiveRejectsSettledAndEmpty(t *testing.T) {
 // id, the snapshot reflects the removal, and the removed prompt is never sent.
 func TestAppendActiveRemoveQueued(t *testing.T) {
 	home := t.TempDir()
+	release := make(chan struct{})
 	var mu sync.Mutex
 	var contents []string
 	runner := fakeExecutionTurnRunner{
@@ -270,6 +283,15 @@ func TestAppendActiveRemoveQueued(t *testing.T) {
 			mu.Lock()
 			contents = append(contents, request.Content)
 			mu.Unlock()
+			// Hold the first turn open so the appends and removal below land
+			// while it is running; the follow-up turn runs to completion.
+			if request.Content == "init" {
+				select {
+				case <-release:
+				case <-ctx.Done():
+					return SessionTurnResult{}, ctx.Err()
+				}
+			}
 			// Do not drain: appended prompts stay queued until settle, forcing
 			// the follow-up path for whatever remains after removal.
 			if err := request.Publisher.Publish(eventAssistant(request.TurnID, "answer-"+request.Content)); err != nil {
@@ -285,6 +307,7 @@ func TestAppendActiveRemoveQueued(t *testing.T) {
 	emit := collectQueueEvents(&mu2, &snapshots)
 
 	run := service.StartSessionRun(context.Background(), session.ID, "init", emit)
+	// Wait until the turn is blocked inside the runner before appending.
 	waitForRunningTurn(t, service, session.ID)
 
 	if err := run.AppendActive("keep"); err != nil {
@@ -305,6 +328,7 @@ func TestAppendActiveRemoveQueued(t *testing.T) {
 	if run.RemoveActive("ap-999") {
 		t.Fatalf("RemoveActive(ap-999) = true, want false")
 	}
+	close(release)
 
 	if _, err := run.Wait(); err != nil {
 		t.Fatalf("Wait() error = %v", err)
@@ -337,16 +361,22 @@ func TestAppendActiveRemoveQueued(t *testing.T) {
 }
 
 // waitForRunningTurn blocks until the session's running turn id is set, so the
-// test can AppendActive against an in-flight turn deterministically.
+// test can AppendActive against an in-flight turn deterministically. The fake
+// runner must hold the turn open (e.g. block on a release channel): a turn
+// that completes immediately only keeps the running marker for a few
+// milliseconds, and any poll interval can miss that transient window.
 func waitForRunningTurn(t *testing.T, service *Service, sessionID string) {
 	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
+	// Every poll reloads metadata and replays the session ledger from disk,
+	// so keep the interval modest and the deadline generous: on a busy CI
+	// runner the run goroutine can take seconds to mark the turn running.
+	deadline := time.Now().Add(30 * time.Second)
 	for time.Now().Before(deadline) {
 		session, err := service.sessionStore.Load(sessionID)
 		if err == nil && session.RunningTurnID != "" {
 			return
 		}
-		time.Sleep(time.Millisecond)
+		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatalf("session %s did not enter running state", sessionID)
 }
