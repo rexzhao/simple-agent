@@ -97,6 +97,21 @@ func ReasoningLevelNames(levels map[string]any) []string {
 	return append(result, custom...)
 }
 
+// ResolveReasoningLevel returns the unified level that ApplyReasoningLevel
+// would apply: the explicit selection, or the configured default when the
+// selection is empty. It returns "" when no reasoning levels are configured,
+// matching ApplyReasoningLevel's no-op case.
+func ResolveReasoningLevel(reasoning ReasoningConfig, selected string) string {
+	selected = strings.TrimSpace(selected)
+	if selected == "" {
+		selected = strings.TrimSpace(reasoning.Default)
+	}
+	if selected == "" || len(reasoning.Levels) == 0 {
+		return ""
+	}
+	return selected
+}
+
 func commonEffortLevels() map[string]any {
 	return map[string]any{
 		"minimal": "minimal",
@@ -140,11 +155,8 @@ func supportsClaudeXHigh(modelID string) bool {
 
 func ApplyReasoningLevel(parameters map[string]any, reasoning ReasoningConfig, selected string) (map[string]any, error) {
 	result := copyParameters(parameters)
-	selected = strings.TrimSpace(selected)
+	selected = ResolveReasoningLevel(reasoning, selected)
 	if selected == "" {
-		selected = strings.TrimSpace(reasoning.Default)
-	}
-	if selected == "" || len(reasoning.Levels) == 0 {
 		return result, nil
 	}
 	value, ok := reasoning.Levels[selected]

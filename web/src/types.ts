@@ -114,6 +114,7 @@ export interface Session {
   provider: string
   model_profile: string
   model_id: string
+  reasoning_level?: string
   project_id: string
   created_cwd: string
   last_seq: number

@@ -113,6 +113,7 @@ type SessionV2 struct {
 	Provider             string                 `json:"provider"`
 	ModelProfile         string                 `json:"model_profile"`
 	ModelID              string                 `json:"model_id"`
+	ReasoningLevel       string                 `json:"reasoning_level,omitempty"`
 	ModelParameters      map[string]any         `json:"model_parameters,omitempty"`
 	CWD                  string                 `json:"cwd"`
 	ProjectID            string                 `json:"project_id,omitempty"`
@@ -1445,6 +1446,7 @@ type sessionV2Metadata struct {
 	Provider             string                 `json:"provider"`
 	ModelProfile         string                 `json:"model_profile"`
 	ModelID              string                 `json:"model_id"`
+	ReasoningLevel       string                 `json:"reasoning_level,omitempty"`
 	ModelParameters      map[string]any         `json:"model_parameters,omitempty"`
 	CWD                  string                 `json:"cwd"`
 	ProjectID            string                 `json:"project_id,omitempty"`
@@ -1546,6 +1548,7 @@ func metadataFromSessionV2(session SessionV2) sessionV2Metadata {
 		Provider:             session.Provider,
 		ModelProfile:         session.ModelProfile,
 		ModelID:              session.ModelID,
+		ReasoningLevel:       session.ReasoningLevel,
 		ModelParameters:      session.ModelParameters,
 		CWD:                  session.CWD,
 		ProjectID:            session.ProjectID,
@@ -1578,6 +1581,7 @@ func (m sessionV2Metadata) session() SessionV2 {
 		Provider:             m.Provider,
 		ModelProfile:         m.ModelProfile,
 		ModelID:              m.ModelID,
+		ReasoningLevel:       m.ReasoningLevel,
 		ModelParameters:      copyMap(m.ModelParameters),
 		CWD:                  m.CWD,
 		ProjectID:            m.ProjectID,

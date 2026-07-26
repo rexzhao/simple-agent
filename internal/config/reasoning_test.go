@@ -81,6 +81,34 @@ func TestDefaultReasoningConfigLeavesUnknownModelAlone(t *testing.T) {
 	}
 }
 
+func TestResolveReasoningLevel(t *testing.T) {
+	reasoning := ReasoningConfig{
+		Parameter: "reasoning_effort",
+		Default:   "high",
+		Levels:    map[string]any{"low": "low", "high": "high"},
+	}
+	tests := []struct {
+		name      string
+		reasoning ReasoningConfig
+		selected  string
+		want      string
+	}{
+		{name: "explicit selection wins", reasoning: reasoning, selected: "low", want: "low"},
+		{name: "empty selection falls back to default", reasoning: reasoning, selected: "", want: "high"},
+		{name: "whitespace selection falls back to default", reasoning: reasoning, selected: "  ", want: "high"},
+		{name: "selection is trimmed", reasoning: reasoning, selected: " low ", want: "low"},
+		{name: "no levels configured", reasoning: ReasoningConfig{Default: "high"}, selected: "high", want: ""},
+		{name: "empty config", reasoning: ReasoningConfig{}, selected: "", want: ""},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := ResolveReasoningLevel(test.reasoning, test.selected); got != test.want {
+				t.Fatalf("ResolveReasoningLevel() = %q, want %q", got, test.want)
+			}
+		})
+	}
+}
+
 func TestApplyReasoningLevelSetsNestedValueWithoutMutatingDefaults(t *testing.T) {
 	parameters := map[string]any{
 		"reasoning": map[string]any{"summary": "auto", "effort": "medium"},

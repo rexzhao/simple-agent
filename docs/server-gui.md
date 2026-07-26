@@ -328,6 +328,7 @@ GET  /sessions/{id}/items/{item_id}/content
   "provider": "codex",
   "model_profile": "default",
   "model_id": "gpt-5.5",
+  "reasoning_level": "high",
   "status": "idle",
   "last_seq": 1234,
   "context": {
@@ -336,6 +337,9 @@ GET  /sessions/{id}/items/{item_id}/content
   }
 }
 ```
+
+`reasoning_level` 是创建会话时生效的统一 reasoning 档位（缺省回落到模型的
+`reasoning_config.default`）；模型未配置 reasoning 或旧会话时该字段省略。
 
 ### Paginated Items
 

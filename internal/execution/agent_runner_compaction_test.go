@@ -287,6 +287,61 @@ func TestPlanCompactionCheckpointUsesStandaloneResponsesCompaction(t *testing.T)
 	}
 }
 
+func TestResolveSummaryModelPinsSessionParametersForSessionModel(t *testing.T) {
+	cfg := &config.Config{
+		Providers: map[string]config.ProviderConfig{
+			"fake": {
+				Name:    "fake",
+				BaseURL: "http://127.0.0.1:1/v1",
+				APIKey:  "test-key",
+				Models: map[string]config.ModelProfile{
+					"default": {
+						ID:         "fake-model-v2",
+						Parameters: map[string]any{"temperature": 0.9},
+					},
+					"summary": {
+						ID:         "fake-summary",
+						Parameters: map[string]any{"temperature": 0.1},
+					},
+				},
+			},
+		},
+	}
+	sessionParameters := map[string]any{"temperature": 0.2, "reasoning_effort": "high"}
+	runtime := &agentRunnerRuntime{
+		config:       cfg,
+		providerName: "fake",
+		modelProfile: "default",
+		modelID:      "fake-model",
+		parameters:   sessionParameters,
+	}
+
+	resolved, err := runtime.resolveSummaryModel()
+	if err != nil {
+		t.Fatalf("resolveSummaryModel() error = %v", err)
+	}
+	if resolved.ModelID != "fake-model" {
+		t.Fatalf("summary model ID = %q, want session-pinned fake-model", resolved.ModelID)
+	}
+	if !reflect.DeepEqual(resolved.Parameters, sessionParameters) {
+		t.Fatalf("summary parameters = %#v, want session parameters %#v", resolved.Parameters, sessionParameters)
+	}
+	resolved.Parameters["temperature"] = 99
+	if sessionParameters["temperature"] != 0.2 {
+		t.Fatalf("resolveSummaryModel aliased runtime parameters: %#v", sessionParameters)
+	}
+
+	// A separately configured summary model keeps its own config parameters.
+	runtime.config.Compaction = config.CompactionConfig{SummaryProvider: "fake", SummaryModel: "summary"}
+	resolved, err = runtime.resolveSummaryModel()
+	if err != nil {
+		t.Fatalf("resolveSummaryModel(dedicated summary model) error = %v", err)
+	}
+	if resolved.ModelID != "fake-summary" || !reflect.DeepEqual(resolved.Parameters, map[string]any{"temperature": 0.1}) {
+		t.Fatalf("dedicated summary model = %q parameters %#v, want its own config", resolved.ModelID, resolved.Parameters)
+	}
+}
+
 func TestPlanCompactionCheckpointLogsRemoteFailureBeforeSummaryFallback(t *testing.T) {
 	const responseSecret = "prompt secret returned by compact endpoint"
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

@@ -124,6 +124,7 @@ func (s *Service) CreateConfiguredSession(projectID string, options ConfiguredSe
 		Provider:        resolved.ProviderName,
 		ModelProfile:    resolved.Profile,
 		ModelID:         resolved.ModelID,
+		ReasoningLevel:  config.ResolveReasoningLevel(resolved.ReasoningConfig, options.ReasoningLevel),
 		ModelParameters: copyParameterMap(parameters),
 		EnabledTools:    copyStringSlice(cfg.Tools.Enabled),
 		EnabledMCP:      mcpServerIDs(selectedMCP),

@@ -201,6 +201,7 @@ func TestServiceSessionLifecycle(t *testing.T) {
 		Provider:        "fake",
 		ModelProfile:    "default",
 		ModelID:         "model-default",
+		ReasoningLevel:  "high",
 		ModelParameters: map[string]any{"max_tokens": float64(128)},
 		EnabledTools:    []string{"read_file"},
 		EnabledMCP:      []string{"local"},
@@ -217,6 +218,9 @@ func TestServiceSessionLifecycle(t *testing.T) {
 	}
 	if session.Provider != "fake" || session.ModelProfile != "default" || session.ModelID != "model-default" {
 		t.Fatalf("CreateSession() model metadata = %#v", session)
+	}
+	if session.ReasoningLevel != "high" {
+		t.Fatalf("CreateSession() ReasoningLevel = %q, want high", session.ReasoningLevel)
 	}
 	if got := session.ModelParameters["max_tokens"]; got != float64(128) {
 		t.Fatalf("CreateSession() model max_tokens = %#v, want 128", got)
@@ -291,6 +295,12 @@ models:
   precise:
     id: fake-precise
     context_window: 128000
+    reasoning_config:
+      parameter: reasoning_effort
+      default: high
+      levels:
+        low: low
+        high: high
 `
 	if err := os.WriteFile(filepath.Join(home, "sai.yaml"), []byte(rootConfig), 0o600); err != nil {
 		t.Fatalf("WriteFile(root config) error = %v", err)
@@ -335,12 +345,32 @@ models:
 	if session.Context.ContextWindow != 64000 || session.Context.ContextWindowSource != string(contextwindow.WindowSourceConfigured) {
 		t.Fatalf("context metadata = %#v", session.Context)
 	}
-	selected, err := service.CreateConfiguredSession(project.Project.ID, ConfiguredSessionOptions{Provider: "fake", ModelProfile: "precise"})
+	if session.ReasoningLevel != "" {
+		t.Fatalf("session reasoning level = %q, want empty for a model without reasoning config", session.ReasoningLevel)
+	}
+	selected, err := service.CreateConfiguredSession(project.Project.ID, ConfiguredSessionOptions{Provider: "fake", ModelProfile: "precise", ReasoningLevel: "low"})
 	if err != nil {
 		t.Fatalf("CreateConfiguredSession(selected model) error = %v", err)
 	}
 	if selected.Provider != "fake" || selected.ModelProfile != "precise" || selected.ModelID != "fake-precise" || selected.Context.ContextWindow != 128000 {
 		t.Fatalf("selected session model = %#v", selected)
+	}
+	if selected.ReasoningLevel != "low" || selected.ModelParameters["reasoning_effort"] != "low" {
+		t.Fatalf("selected session reasoning = level %q parameters %#v, want low", selected.ReasoningLevel, selected.ModelParameters)
+	}
+	defaulted, err := service.CreateConfiguredSession(project.Project.ID, ConfiguredSessionOptions{Provider: "fake", ModelProfile: "precise"})
+	if err != nil {
+		t.Fatalf("CreateConfiguredSession(default reasoning) error = %v", err)
+	}
+	if defaulted.ReasoningLevel != "high" || defaulted.ModelParameters["reasoning_effort"] != "high" {
+		t.Fatalf("defaulted session reasoning = level %q parameters %#v, want high", defaulted.ReasoningLevel, defaulted.ModelParameters)
+	}
+	reloaded, err := service.GetSession(selected.ID)
+	if err != nil {
+		t.Fatalf("GetSession() error = %v", err)
+	}
+	if reloaded.ReasoningLevel != "low" {
+		t.Fatalf("reloaded ReasoningLevel = %q, want low", reloaded.ReasoningLevel)
 	}
 }
 

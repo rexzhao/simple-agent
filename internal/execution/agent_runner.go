@@ -873,6 +873,19 @@ func (r *agentRunnerRuntime) resolveSummaryModel() (config.ResolvedModel, error)
 	if err != nil {
 		return config.ResolvedModel{}, fmt.Errorf("resolve compaction summary model: %w", err)
 	}
+	if providerName == r.providerName && modelProfile == r.modelProfile {
+		// Summaries produced by the session's own model must use the session's
+		// pinned parameters, which include the reasoning level selected at
+		// creation. Otherwise the summary request silently falls back to the
+		// current config defaults, diverging from the main turn loop and from
+		// the remote compaction path.
+		if r.modelID != "" {
+			resolved.ModelID = r.modelID
+		}
+		if r.parameters != nil {
+			resolved.Parameters = copyParameterMap(r.parameters)
+		}
+	}
 	return resolved, nil
 }
 

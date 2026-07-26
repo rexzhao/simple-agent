@@ -126,13 +126,14 @@ func TestV2StoreSaveLoadMetadata(t *testing.T) {
 	store := newV2StoreWithClock(root, V2StoreOptions{}, clock.Now)
 
 	session := SessionV2{
-		ID:           "session-1",
-		DisplayName:  "Planning Session",
-		Archived:     true,
-		LastUsedAt:   time.Date(2026, 7, 3, 0, 59, 0, 0, time.UTC),
-		Provider:     "paperhub",
-		ModelProfile: "glm-5.2-fast",
-		ModelID:      "glm-5.2",
+		ID:             "session-1",
+		DisplayName:    "Planning Session",
+		Archived:       true,
+		LastUsedAt:     time.Date(2026, 7, 3, 0, 59, 0, 0, time.UTC),
+		Provider:       "paperhub",
+		ModelProfile:   "glm-5.2-fast",
+		ModelID:        "glm-5.2",
+		ReasoningLevel: "high",
 		ModelParameters: map[string]any{
 			"max_tokens":  2048,
 			"temperature": 0.2,
@@ -243,6 +244,9 @@ func TestV2StoreSaveLoadMetadata(t *testing.T) {
 	}
 	if loaded.ID != saved.ID || loaded.Provider != saved.Provider || loaded.ModelProfile != saved.ModelProfile || loaded.ModelID != saved.ModelID {
 		t.Fatalf("loaded model metadata = %#v, want saved metadata %#v", loaded, saved)
+	}
+	if loaded.ReasoningLevel != saved.ReasoningLevel {
+		t.Fatalf("ReasoningLevel = %q, want %q", loaded.ReasoningLevel, saved.ReasoningLevel)
 	}
 	if loaded.CWD != saved.CWD || loaded.ConfigPath != saved.ConfigPath {
 		t.Fatalf("loaded paths = cwd %q config %q, want cwd %q config %q", loaded.CWD, loaded.ConfigPath, saved.CWD, saved.ConfigPath)

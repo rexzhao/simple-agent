@@ -88,6 +88,7 @@ type SessionDetail struct {
 	Provider          string                 `json:"provider"`
 	ModelProfile      string                 `json:"model_profile"`
 	ModelID           string                 `json:"model_id"`
+	ReasoningLevel    string                 `json:"reasoning_level,omitempty"`
 	Status            string                 `json:"status"`
 	LastSeq           int64                  `json:"last_seq"`
 	CWD               string                 `json:"cwd"`
@@ -109,6 +110,7 @@ type SessionCreateMetadata struct {
 	Provider        string
 	ModelProfile    string
 	ModelID         string
+	ReasoningLevel  string
 	ModelParameters map[string]any
 	EnabledTools    []string
 	EnabledMCP      []string
@@ -1490,6 +1492,9 @@ func applySessionCreateMetadata(session sessions.SessionV2, metadata SessionCrea
 	if value := strings.TrimSpace(metadata.ModelID); value != "" {
 		session.ModelID = value
 	}
+	if value := strings.TrimSpace(metadata.ReasoningLevel); value != "" {
+		session.ReasoningLevel = value
+	}
 	if metadata.ModelParameters != nil {
 		session.ModelParameters = copyMap(metadata.ModelParameters)
 	}
@@ -1566,6 +1571,7 @@ func sessionDetailFromStore(session sessions.SessionV2) SessionDetail {
 		Provider:          session.Provider,
 		ModelProfile:      session.ModelProfile,
 		ModelID:           session.ModelID,
+		ReasoningLevel:    session.ReasoningLevel,
 		Status:            sessionStatus(session),
 		LastSeq:           session.LastSeq,
 		CWD:               session.CWD,
