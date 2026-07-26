@@ -41,7 +41,7 @@ func (r *codexLoginRegistry) start(providerName string) (execution.CodexAuthStat
 		return execution.CodexAuthStatus{}, err
 	}
 	loginCtx, cancel := context.WithCancel(r.ctx)
-	pending, err := codexauth.StartDeviceLogin(loginCtx, codexauth.DeviceLoginOptions{})
+	pending, err := r.service.StartCodexDeviceLogin(loginCtx, providerName)
 	if err != nil {
 		cancel()
 		return execution.CodexAuthStatus{}, err

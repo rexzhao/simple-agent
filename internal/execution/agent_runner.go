@@ -42,6 +42,9 @@ func NewServiceWithAgentRunner(home, configPath string) (*Service, error) {
 	if err := config.EnsureRootConfig(configPath); err != nil {
 		return nil, err
 	}
+	if err := ensureDefaultCodexProvider(configPath); err != nil {
+		return nil, err
+	}
 	runner := NewAgentTurnRunner()
 	return NewServiceWithOptions(home, ServiceOptions{
 		ConfigPath:     configPath,

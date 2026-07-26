@@ -61,7 +61,9 @@ export function ProviderManagerDialog(props: {
 
   useEffect(() => {
     if (!document || draft) return
-    const provider = document.providers.find((item) => item.name === document.default_provider) ?? document.providers[0]
+    const provider = document.providers.find((item) => item.name === 'codex' && item.codex_auth)
+      ?? document.providers.find((item) => item.name === document.default_provider)
+      ?? document.providers[0]
     if (provider) selectProvider(provider)
     else setDraft(emptyProviderDraft())
   }, [document, draft, selectProvider])

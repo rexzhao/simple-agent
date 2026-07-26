@@ -275,6 +275,18 @@ func (s *Service) SaveCodexAuth(providerName string, token codexauth.TokenFile) 
 	return (codexauth.Store{Path: provider.AuthFile}).Save(token)
 }
 
+func (s *Service) StartCodexDeviceLogin(ctx context.Context, providerName string) (codexauth.PendingDeviceLogin, error) {
+	provider, err := s.codexProvider(providerName)
+	if err != nil {
+		return codexauth.PendingDeviceLogin{}, err
+	}
+	client, err := providerHTTPClient(provider)
+	if err != nil {
+		return codexauth.PendingDeviceLogin{}, fmt.Errorf("provider %q: %w", providerName, err)
+	}
+	return codexauth.StartDeviceLogin(ctx, codexauth.DeviceLoginOptions{HTTPClient: client})
+}
+
 func (s *Service) ClearCodexAuth(providerName string) error {
 	provider, err := s.codexProvider(providerName)
 	if err != nil {

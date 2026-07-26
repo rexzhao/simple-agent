@@ -39,8 +39,9 @@ commands are not part of the product anymore.
 `--server-root` selects one namespace for configuration, Provider credentials,
 optional diagnostic logs, projects, sessions, and blobs. It defaults to the OS
 user configuration directory under the executable basename. The root config is
-`<server-root>/<basename>.yaml`; the launcher creates an empty config and its
-core resource directories on first use.
+`<server-root>/<basename>.yaml`; the launcher ensures its core resource
+directories and a ready-to-sign-in Codex provider exist. Existing providers
+and complete defaults are preserved.
 
 Add local project directories from the Web UI. Projects are workspaces and do
 not need their own `.agents/sai.yaml`; every project managed by the running

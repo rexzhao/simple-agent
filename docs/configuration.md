@@ -8,6 +8,12 @@ project/session data. Projects remain independent workspaces for `$CWD`,
 
 The browser never receives resolved API keys or authorization tokens.
 
+When opening a Server Root, SAI creates a `codex` provider when that provider
+name is not already configured. It includes a ready-to-use `default` model
+profile and is selected as the shared default only when `default_provider` or
+`default_model` is still empty. Existing provider files and a complete existing
+default are never replaced.
+
 On Unix-like systems SAI creates the server-root core directories with mode
 `0700`, and creates or rewrites root/provider configuration files with mode
 `0600`. Manually managed provider YAML files should use the same restrictive
@@ -207,18 +213,23 @@ OpenRouter, GLM-5.2/DeepSeek-v4, and adaptive Claude models receive Pi-compatibl
 defaults when a model is saved without an explicit mapping. Unknown models are
 left unconfigured.
 
-Codex subscription profiles use an OAuth token file:
+The generated Codex subscription profile uses an OAuth token file and is
+equivalent to:
 
 ```yaml
-name: codex-work
+name: codex
 base_url: https://chatgpt.com/backend-api/codex
-auth_file: ../auth/codex-work.json
+auth_file: ../auth/codex.json
+request_timeout: 60s
 
 models:
   default:
-    id: gpt-5.3-codex
+    id: gpt-5.5
     type: openai-codex
-    context_window: 200000
+    input: [text, image]
+    context_window: 400000
+    input_limit: 272000
+    output_limit: 128000
     parameters:
       responses:
         compaction:
@@ -227,6 +238,7 @@ models:
       parameter: reasoning.effort
       default: xhigh
       levels:
+        off: none
         minimal: low
         low: low
         medium: medium
