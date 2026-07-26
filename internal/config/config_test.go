@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
 	"testing"
@@ -133,6 +134,13 @@ func TestEnsureRootConfigCreatesCoreLayoutWithoutLogs(t *testing.T) {
 	}
 	if cfg.Logging.Path != "" {
 		t.Fatalf("created config logging path = %q, want disabled", cfg.Logging.Path)
+	}
+	wantTools := []string{"list_files", "read_file", "glob_files", "grep_files", "write_file", "edit_file", "apply_patch", "shell"}
+	if !reflect.DeepEqual(cfg.Tools.Enabled, wantTools) {
+		t.Fatalf("created config tools = %#v, want %#v", cfg.Tools.Enabled, wantTools)
+	}
+	if cfg.Agent.MaxTurns != 8 || !cfg.Agent.Stream || cfg.Agent.ShowReasoning {
+		t.Fatalf("created agent config = %#v, want practical defaults", cfg.Agent)
 	}
 }
 

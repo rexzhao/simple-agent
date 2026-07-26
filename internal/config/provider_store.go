@@ -16,6 +16,40 @@ import (
 const (
 	privateConfigDirectoryMode os.FileMode = 0o700
 	privateConfigFileMode      os.FileMode = 0o600
+	defaultRootConfigYAML                  = `provider_dir: providers
+auth_dir: auth
+skill_dirs:
+  - $USER/.agents/skills
+  - $REPO/.agents/skills
+  - $CWD/.agents/skills
+mcp_dir: mcp
+
+agent:
+  instruction_files:
+    - $CWD/AGENTS.md
+  max_turns: 8
+  stream: true
+  show_reasoning: false
+
+prompt:
+  system_prompt: ""
+
+tools:
+  enabled:
+    - list_files
+    - read_file
+    - glob_files
+    - grep_files
+    - write_file
+    - edit_file
+    - apply_patch
+    - shell
+
+compaction:
+  enabled: false
+  threshold_percent: 80
+  reserved: 0
+`
 )
 
 // EnsureRootConfig makes a server-root configuration usable by the Web
@@ -38,7 +72,7 @@ func EnsureRootConfig(path string) error {
 		if !errors.Is(err, os.ErrNotExist) {
 			return fmt.Errorf("stat config file %q: %w", abs, err)
 		}
-		if err := writeConfigFileAtomic(abs, []byte("{}\n")); err != nil {
+		if err := writeConfigFileAtomic(abs, []byte(defaultRootConfigYAML)); err != nil {
 			return fmt.Errorf("create root config file %q: %w", abs, err)
 		}
 	}

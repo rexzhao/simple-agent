@@ -61,7 +61,15 @@ agent:
   show_reasoning: false
 
 tools:
-  enabled: []
+  enabled:
+    - list_files
+    - read_file
+    - glob_files
+    - grep_files
+    - write_file
+    - edit_file
+    - apply_patch
+    - shell
 ```
 
 Provider profile:
