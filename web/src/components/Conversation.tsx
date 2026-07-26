@@ -5,7 +5,7 @@ import remarkGfm from 'remark-gfm'
 import { api } from '../api'
 import type { ActiveRun, ItemsPage, QueuedPrompt, RunStep, Session, SessionImageAttachment, SessionItem, ToolActivity } from '../types'
 import { blobAsDataURL, copyText, formatTokenCount } from '../lib/format'
-import { itemText, processKey, reasoningLevelLabel, sessionName } from '../lib/session'
+import { itemText, processKey, sessionName } from '../lib/session'
 import { Composer } from './Composer'
 import type { ComposerDraft, PastedImageAttachment, PastedTextAttachment } from './Composer'
 import { MessageSkeleton } from './misc'
@@ -115,7 +115,7 @@ export const Conversation = memo(function Conversation(props: {
           <h1>{props.detail ? sessionName(props.detail) : 'Loading…'}</h1>
 		  {props.detail && (
 			<div className="conversation-meta">
-			  <p>{props.detail.provider} / {props.detail.model_id}{props.detail.reasoning_level && ` · Reasoning: ${reasoningLevelLabel(props.detail.reasoning_level)}`}</p>
+			  <p>{props.detail.provider} / {props.detail.model_id}{props.detail.reasoning_level && ` · ${props.detail.reasoning_level}`}</p>
 			  <ContextUsage context={props.detail.context} activeInputTokens={props.activeRun?.inputTokens} activeCachedTokens={props.activeRun?.cachedTokens} activeCacheWriteTokens={props.activeRun?.cacheWriteTokens} />
 			</div>
 		  )}
