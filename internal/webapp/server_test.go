@@ -216,6 +216,74 @@ func TestServerProjectSessionAndRunFlow(t *testing.T) {
 	if restoredProject.Archived {
 		t.Fatalf("restored project remains archived: %#v", restoredProject)
 	}
+
+	sessionResponse := doJSONRequest(t, http.MethodGet, server.URL+"/api/sessions/"+session.ID, nil)
+	if sessionResponse.StatusCode != http.StatusOK {
+		t.Fatalf("GET session status = %d body=%s", sessionResponse.StatusCode, readBody(sessionResponse))
+	}
+	var loadedSession execution.SessionDetail
+	decodeResponse(t, sessionResponse, &loadedSession)
+	if loadedSession.ID != session.ID {
+		t.Fatalf("GET session = %#v, want %s", loadedSession, session.ID)
+	}
+	renamedSessionResponse := doJSONRequest(t, http.MethodPatch, server.URL+"/api/sessions/"+session.ID, map[string]string{"display_name": "Renamed Session"})
+	if renamedSessionResponse.StatusCode != http.StatusOK {
+		t.Fatalf("PATCH session status = %d body=%s", renamedSessionResponse.StatusCode, readBody(renamedSessionResponse))
+	}
+	decodeResponse(t, renamedSessionResponse, &loadedSession)
+	if loadedSession.DisplayName != "Renamed Session" {
+		t.Fatalf("renamed session = %#v", loadedSession)
+	}
+	itemsResponse := doJSONRequest(t, http.MethodGet, server.URL+"/api/sessions/"+session.ID+"/items?limit=1", nil)
+	if itemsResponse.StatusCode != http.StatusOK {
+		t.Fatalf("GET session items status = %d body=%s", itemsResponse.StatusCode, readBody(itemsResponse))
+	}
+	var itemsPage execution.SessionItemsPage
+	decodeResponse(t, itemsResponse, &itemsPage)
+	if len(itemsPage.Items) != 1 || !itemsPage.HasMoreBefore {
+		t.Fatalf("GET session items page = %#v, want newest item and earlier page", itemsPage)
+	}
+
+	archivedResponse = doJSONRequest(t, http.MethodPost, server.URL+"/api/sessions/"+session.ID+"/archive", map[string]string{})
+	if archivedResponse.StatusCode != http.StatusOK {
+		t.Fatalf("POST final archive session status = %d body=%s", archivedResponse.StatusCode, readBody(archivedResponse))
+	}
+	archivedResponse.Body.Close()
+	removedSessionResponse := doJSONRequest(t, http.MethodDelete, server.URL+"/api/sessions/"+session.ID, nil)
+	if removedSessionResponse.StatusCode != http.StatusOK {
+		t.Fatalf("DELETE session status = %d body=%s", removedSessionResponse.StatusCode, readBody(removedSessionResponse))
+	}
+	var removedSession execution.SessionRemoveResult
+	decodeResponse(t, removedSessionResponse, &removedSession)
+	if removedSession.ID != session.ID || removedSession.Status != "removed" {
+		t.Fatalf("DELETE session = %#v", removedSession)
+	}
+
+	archivedProjectResponse = doJSONRequest(t, http.MethodPost, server.URL+"/api/projects/"+projectResult.Project.ID+"/archive", map[string]string{})
+	if archivedProjectResponse.StatusCode != http.StatusOK {
+		t.Fatalf("POST final archive project status = %d body=%s", archivedProjectResponse.StatusCode, readBody(archivedProjectResponse))
+	}
+	archivedProjectResponse.Body.Close()
+	removedProjectResponse := doJSONRequest(t, http.MethodDelete, server.URL+"/api/projects/"+projectResult.Project.ID, nil)
+	if removedProjectResponse.StatusCode != http.StatusOK {
+		t.Fatalf("DELETE project status = %d body=%s", removedProjectResponse.StatusCode, readBody(removedProjectResponse))
+	}
+	var removedProject execution.ProjectRemoveResult
+	decodeResponse(t, removedProjectResponse, &removedProject)
+	if removedProject.ID != projectResult.Project.ID || removedProject.Status != "removed" || removedProject.RemovedSessions != 0 {
+		t.Fatalf("DELETE project = %#v", removedProject)
+	}
+	projectsResponse := doJSONRequest(t, http.MethodGet, server.URL+"/api/projects", nil)
+	if projectsResponse.StatusCode != http.StatusOK {
+		t.Fatalf("GET projects status = %d body=%s", projectsResponse.StatusCode, readBody(projectsResponse))
+	}
+	var projectsPayload struct {
+		Projects []execution.Project `json:"projects"`
+	}
+	decodeResponse(t, projectsResponse, &projectsPayload)
+	if len(projectsPayload.Projects) != 0 {
+		t.Fatalf("GET projects after removal = %#v, want empty", projectsPayload.Projects)
+	}
 }
 
 func TestServerCancelsRun(t *testing.T) {
@@ -371,6 +439,12 @@ func newWebTestServer(t *testing.T) (*httptest.Server, *execution.Service) {
 
 func newWebTestServerWithRunner(t *testing.T, runner execution.SessionTurnRunner) (*httptest.Server, *execution.Service) {
 	t.Helper()
+	server, service, _ := newWebTestAppServerWithRunner(t, runner)
+	return server, service
+}
+
+func newWebTestAppServerWithRunner(t *testing.T, runner execution.SessionTurnRunner) (*httptest.Server, *execution.Service, *Server) {
+	t.Helper()
 	home := t.TempDir()
 	service, err := execution.NewServiceWithOptions(home, execution.ServiceOptions{TurnRunner: runner})
 	if err != nil {
@@ -384,7 +458,7 @@ func newWebTestServerWithRunner(t *testing.T, runner execution.SessionTurnRunner
 	t.Cleanup(app.Close)
 	server := httptest.NewServer(app.Handler())
 	t.Cleanup(server.Close)
-	return server, service
+	return server, service, app
 }
 
 func doJSONRequest(t *testing.T, method, url string, body any) *http.Response {

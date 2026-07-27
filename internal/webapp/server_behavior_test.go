@@ -1,0 +1,402 @@
+package webapp
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"reflect"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/rexzhao/simple-agent/internal/execution"
+)
+
+type enteredBlockingWebTestRunner struct {
+	entered chan struct{}
+	once    *sync.Once
+}
+
+func (r enteredBlockingWebTestRunner) SupportsIncrementalSessionTurn(context.Context, execution.SessionTurnRequest) (bool, error) {
+	return true, nil
+}
+
+func (r enteredBlockingWebTestRunner) RunSessionTurn(ctx context.Context, _ execution.SessionTurnRequest) (execution.SessionTurnResult, error) {
+	r.once.Do(func() { close(r.entered) })
+	<-ctx.Done()
+	return execution.SessionTurnResult{}, ctx.Err()
+}
+
+func TestServerSecurityBootstrapAndJSONContract(t *testing.T) {
+	server, service, app := newWebTestAppServerWithRunner(t, webTestRunner{})
+
+	originalVersion := Version
+	Version = "v-behavior-test"
+	t.Cleanup(func() { Version = originalVersion })
+	response := doJSONRequest(t, http.MethodGet, server.URL+"/api/bootstrap", nil)
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("GET bootstrap status = %d body=%s", response.StatusCode, readBody(response))
+	}
+	for name, want := range map[string]string{
+		"Content-Security-Policy": "default-src 'self'",
+		"Referrer-Policy":         "no-referrer",
+		"X-Content-Type-Options":  "nosniff",
+		"X-Frame-Options":         "DENY",
+	} {
+		if got := response.Header.Get(name); !strings.Contains(got, want) {
+			t.Fatalf("GET bootstrap header %s = %q, want %q", name, got, want)
+		}
+	}
+	var bootstrap struct {
+		Version    string `json:"version"`
+		CWD        string `json:"cwd"`
+		ServerRoot string `json:"server_root"`
+		ConfigPath string `json:"config_path"`
+	}
+	decodeResponse(t, response, &bootstrap)
+	if bootstrap.Version != "v-behavior-test" || bootstrap.CWD != service.ServerRoot() || bootstrap.ServerRoot != service.ServerRoot() || bootstrap.ConfigPath != service.ConfigPath() {
+		t.Fatalf("GET bootstrap = %#v, want version and resolved server paths", bootstrap)
+	}
+
+	request := httptest.NewRequest(http.MethodGet, "http://example.com/api/bootstrap", nil)
+	request.Header.Set("Authorization", "Bearer "+testToken)
+	recorder := httptest.NewRecorder()
+	app.Handler().ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusForbidden || responseErrorCode(t, recorder.Result()) != "invalid_host" {
+		t.Fatalf("invalid host response = %d %s", recorder.Code, recorder.Body.String())
+	}
+
+	request, err := http.NewRequest(http.MethodGet, server.URL+"/api/bootstrap", nil)
+	if err != nil {
+		t.Fatalf("NewRequest(origin) error = %v", err)
+	}
+	request.Header.Set("Authorization", "Bearer "+testToken)
+	request.Header.Set("Origin", "https://attacker.example.test")
+	response, err = http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatalf("GET bootstrap with invalid origin error = %v", err)
+	}
+	if response.StatusCode != http.StatusForbidden || responseErrorCode(t, response) != "invalid_origin" {
+		t.Fatalf("invalid origin status = %d, want forbidden invalid_origin", response.StatusCode)
+	}
+
+	response, err = http.Get(server.URL + "/client/side/route")
+	if err != nil {
+		t.Fatalf("GET SPA fallback error = %v", err)
+	}
+	spaBody, err := io.ReadAll(response.Body)
+	response.Body.Close()
+	if err != nil {
+		t.Fatalf("ReadAll(SPA fallback) error = %v", err)
+	}
+	if response.StatusCode != http.StatusOK || !bytes.Contains(spaBody, []byte("SAI")) {
+		t.Fatalf("GET SPA fallback = %d %q, want embedded UI", response.StatusCode, spaBody)
+	}
+
+	for _, body := range []string{
+		`{"root":"ignored","unexpected":true}`,
+		`{"root":"ignored"} {"root":"second"}`,
+	} {
+		response = doRawAPIRequest(t, http.MethodPost, server.URL+"/api/projects", body)
+		if response.StatusCode != http.StatusBadRequest || responseErrorCode(t, response) != "invalid_json" {
+			t.Fatalf("POST invalid JSON %q status = %d, want bad request invalid_json", body, response.StatusCode)
+		}
+	}
+}
+
+func TestServerLifecycleFailuresUseStableHTTPContract(t *testing.T) {
+	runner := enteredBlockingWebTestRunner{entered: make(chan struct{}), once: &sync.Once{}}
+	server, _, app := newWebTestAppServerWithRunner(t, runner)
+	project, session := createWebProjectAndSession(t, server)
+
+	response := doJSONRequest(t, http.MethodDelete, server.URL+"/api/sessions/"+session.ID, nil)
+	if response.StatusCode != http.StatusUnprocessableEntity || responseErrorCode(t, response) != "request_failed" {
+		t.Fatalf("DELETE active session status = %d, want 422 request_failed", response.StatusCode)
+	}
+	response = doJSONRequest(t, http.MethodDelete, server.URL+"/api/projects/"+project.ID, nil)
+	if response.StatusCode != http.StatusUnprocessableEntity || responseErrorCode(t, response) != "request_failed" {
+		t.Fatalf("DELETE active project status = %d, want 422 request_failed", response.StatusCode)
+	}
+	response = doJSONRequest(t, http.MethodGet, server.URL+"/api/sessions/session-missing", nil)
+	if response.StatusCode != http.StatusNotFound || responseErrorCode(t, response) != "not_found" {
+		t.Fatalf("GET missing session status = %d, want 404 not_found", response.StatusCode)
+	}
+
+	response = doJSONRequest(t, http.MethodPost, server.URL+"/api/sessions/"+session.ID+"/runs", map[string]string{"content": "block"})
+	if response.StatusCode != http.StatusAccepted {
+		t.Fatalf("POST blocking run status = %d body=%s", response.StatusCode, readBody(response))
+	}
+	var run struct {
+		ID string `json:"run_id"`
+	}
+	decodeResponse(t, response, &run)
+	select {
+	case <-runner.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("blocking runner was not entered")
+	}
+	managed, ok := app.runs.get(run.ID)
+	if !ok {
+		t.Fatalf("run %s not found in registry", run.ID)
+	}
+
+	response = doJSONRequest(t, http.MethodPost, server.URL+"/api/projects/"+project.ID+"/archive", map[string]string{})
+	if response.StatusCode != http.StatusConflict || responseErrorCode(t, response) != "session_busy" {
+		t.Fatalf("POST archive project with active run status = %d, want 409 session_busy", response.StatusCode)
+	}
+	response = doJSONRequest(t, http.MethodPost, server.URL+"/api/sessions/"+session.ID+"/archive", map[string]string{})
+	if response.StatusCode != http.StatusConflict || responseErrorCode(t, response) != "session_busy" {
+		t.Fatalf("POST archive session with active run status = %d, want 409 session_busy", response.StatusCode)
+	}
+
+	response = doJSONRequest(t, http.MethodDelete, server.URL+"/api/runs/"+run.ID, nil)
+	if response.StatusCode != http.StatusAccepted {
+		t.Fatalf("DELETE active run status = %d body=%s", response.StatusCode, readBody(response))
+	}
+	response.Body.Close()
+	waitForManagedRunTerminal(t, managed)
+}
+
+func TestServerActivePromptQueueLifecycle(t *testing.T) {
+	runner := enteredBlockingWebTestRunner{entered: make(chan struct{}), once: &sync.Once{}}
+	server, _, app := newWebTestAppServerWithRunner(t, runner)
+	_, session := createWebProjectAndSession(t, server)
+
+	response := doJSONRequest(t, http.MethodPost, server.URL+"/api/sessions/"+session.ID+"/runs", map[string]string{"content": "block"})
+	if response.StatusCode != http.StatusAccepted {
+		t.Fatalf("POST blocking run status = %d body=%s", response.StatusCode, readBody(response))
+	}
+	var run struct {
+		ID string `json:"run_id"`
+	}
+	decodeResponse(t, response, &run)
+	select {
+	case <-runner.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("blocking runner was not entered")
+	}
+	managed, ok := app.runs.get(run.ID)
+	if !ok {
+		t.Fatalf("run %s not found in registry", run.ID)
+	}
+
+	response = doJSONRequest(t, http.MethodPost, server.URL+"/api/runs/"+run.ID+"/prompts", map[string]string{"content": "follow up"})
+	if response.StatusCode != http.StatusAccepted {
+		t.Fatalf("POST active prompt status = %d body=%s", response.StatusCode, readBody(response))
+	}
+	response.Body.Close()
+	queued := waitForPromptQueue(t, managed, 1)
+	if queued[0].ID == "" || queued[0].Content != "follow up" {
+		t.Fatalf("active prompt queue = %#v, want stable id and content", queued)
+	}
+
+	response = doJSONRequest(t, http.MethodDelete, server.URL+"/api/runs/"+run.ID+"/prompts/"+queued[0].ID, nil)
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("DELETE active prompt status = %d body=%s", response.StatusCode, readBody(response))
+	}
+	response.Body.Close()
+	waitForPromptQueue(t, managed, 0)
+
+	response = doJSONRequest(t, http.MethodPost, server.URL+"/api/runs/"+run.ID+"/prompts", map[string]string{"content": "   "})
+	if response.StatusCode != http.StatusBadRequest || responseErrorCode(t, response) != "invalid_content" {
+		t.Fatalf("POST empty active prompt status = %d, want 400 invalid_content", response.StatusCode)
+	}
+	response = doJSONRequest(t, http.MethodDelete, server.URL+"/api/runs/"+run.ID+"/prompts/ap-missing", nil)
+	if response.StatusCode != http.StatusNotFound || responseErrorCode(t, response) != "not_found" {
+		t.Fatalf("DELETE missing active prompt status = %d, want 404 not_found", response.StatusCode)
+	}
+
+	response = doJSONRequest(t, http.MethodDelete, server.URL+"/api/runs/"+run.ID, nil)
+	if response.StatusCode != http.StatusAccepted {
+		t.Fatalf("DELETE active run status = %d body=%s", response.StatusCode, readBody(response))
+	}
+	response.Body.Close()
+	waitForManagedRunTerminal(t, managed)
+	response = doJSONRequest(t, http.MethodPost, server.URL+"/api/runs/"+run.ID+"/prompts", map[string]string{"content": "too late"})
+	if response.StatusCode != http.StatusConflict || responseErrorCode(t, response) != "run_settled" {
+		t.Fatalf("POST prompt to settled run status = %d, want 409 run_settled", response.StatusCode)
+	}
+}
+
+func TestServerProviderManagementDiscoveryAndCodexErrors(t *testing.T) {
+	type observedRequest struct {
+		Path          string
+		Authorization string
+	}
+	requests := make(chan observedRequest, 1)
+	providerServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests <- observedRequest{Path: r.URL.Path, Authorization: r.Header.Get("Authorization")}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":[{"id":"model-z"},{"id":"model-a"},{"id":"model-a"}]}`))
+	}))
+	defer providerServer.Close()
+	server, _ := newWebTestServer(t)
+
+	input := execution.ProviderSettingsInput{
+		Name:    "remote",
+		BaseURL: providerServer.URL + "/v1",
+		APIKey:  "remote-secret",
+		Models: []execution.ProviderModelSettings{{
+			Profile: "main",
+			ID:      "configured-model",
+			Type:    "openai-chat",
+			Input:   []string{"text"},
+		}},
+	}
+	response := doJSONRequest(t, http.MethodPost, server.URL+"/api/providers", input)
+	if response.StatusCode != http.StatusCreated {
+		t.Fatalf("POST provider status = %d body=%s", response.StatusCode, readBody(response))
+	}
+	var document execution.ProviderSettingsDocument
+	decodeResponse(t, response, &document)
+	remote := providerSettingsByName(document.Providers, "remote")
+	if remote == nil || remote.APIKey != "" || !remote.APIKeyConfigured {
+		t.Fatalf("POST provider document = %#v, want hidden configured remote key", document)
+	}
+
+	response = doJSONRequest(t, http.MethodPatch, server.URL+"/api/provider-default", map[string]string{"provider": "remote", "model": "main"})
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("PATCH provider default status = %d body=%s", response.StatusCode, readBody(response))
+	}
+	decodeResponse(t, response, &document)
+	if document.DefaultProvider != "remote" || document.DefaultModel != "main" {
+		t.Fatalf("PATCH provider default = %q/%q, want remote/main", document.DefaultProvider, document.DefaultModel)
+	}
+
+	response = doJSONRequest(t, http.MethodGet, server.URL+"/api/providers/remote/models", nil)
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("GET discovered models status = %d body=%s", response.StatusCode, readBody(response))
+	}
+	var modelsPayload struct {
+		Models []string `json:"models"`
+	}
+	decodeResponse(t, response, &modelsPayload)
+	if !reflect.DeepEqual(modelsPayload.Models, []string{"model-a", "model-z"}) {
+		t.Fatalf("GET discovered models = %#v, want sorted unique models", modelsPayload.Models)
+	}
+	select {
+	case request := <-requests:
+		if request.Path != "/v1/models" || request.Authorization != "Bearer remote-secret" {
+			t.Fatalf("model discovery request = %#v, want authenticated /v1/models", request)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("provider did not receive model discovery request")
+	}
+
+	response = doJSONRequest(t, http.MethodPost, server.URL+"/api/providers", input)
+	if response.StatusCode != http.StatusUnprocessableEntity || responseErrorCode(t, response) != "request_failed" {
+		t.Fatalf("POST duplicate provider status = %d, want 422 request_failed", response.StatusCode)
+	}
+	for _, method := range []string{http.MethodPost, http.MethodGet, http.MethodDelete} {
+		response = doJSONRequest(t, method, server.URL+"/api/providers/fake/codex-login", map[string]string{})
+		if response.StatusCode != http.StatusUnprocessableEntity || responseErrorCode(t, response) != "request_failed" {
+			t.Fatalf("%s non-Codex login status = %d, want 422 request_failed", method, response.StatusCode)
+		}
+	}
+}
+
+func createWebProjectAndSession(t *testing.T, server *httptest.Server) (execution.Project, execution.SessionDetail) {
+	t.Helper()
+	response := doJSONRequest(t, http.MethodPost, server.URL+"/api/projects", map[string]string{"root": t.TempDir(), "display_name": "Behavior Test"})
+	if response.StatusCode != http.StatusCreated {
+		t.Fatalf("POST project status = %d body=%s", response.StatusCode, readBody(response))
+	}
+	var projectResult execution.ProjectCreateResult
+	decodeResponse(t, response, &projectResult)
+	response = doJSONRequest(t, http.MethodPost, server.URL+"/api/projects/"+projectResult.Project.ID+"/sessions", map[string]string{})
+	if response.StatusCode != http.StatusCreated {
+		t.Fatalf("POST session status = %d body=%s", response.StatusCode, readBody(response))
+	}
+	var session execution.SessionDetail
+	decodeResponse(t, response, &session)
+	return projectResult.Project, session
+}
+
+func doRawAPIRequest(t *testing.T, method, url, body string) *http.Response {
+	t.Helper()
+	request, err := http.NewRequest(method, url, strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("NewRequest() error = %v", err)
+	}
+	request.Header.Set("Authorization", "Bearer "+testToken)
+	request.Header.Set("Content-Type", "application/json")
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatalf("request %s %s error = %v", method, url, err)
+	}
+	return response
+}
+
+func responseErrorCode(t *testing.T, response *http.Response) string {
+	t.Helper()
+	defer response.Body.Close()
+	var payload struct {
+		Error struct {
+			Code string `json:"code"`
+		} `json:"error"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&payload); err != nil {
+		t.Fatalf("Decode(error response) error = %v", err)
+	}
+	return payload.Error.Code
+}
+
+type queuedPromptPayload struct {
+	ID      string `json:"id"`
+	Content string `json:"content"`
+}
+
+func waitForPromptQueue(t *testing.T, managed *managedRun, count int) []queuedPromptPayload {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		events, _, _, _, changed := managed.snapshot(0)
+		for index := len(events) - 1; index >= 0; index-- {
+			var event struct {
+				Type    string                `json:"type"`
+				Prompts []queuedPromptPayload `json:"prompts"`
+			}
+			if json.Unmarshal(events[index].Payload, &event) == nil && event.Type == "run.prompt_queue" && len(event.Prompts) == count {
+				return event.Prompts
+			}
+		}
+		select {
+		case <-changed:
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+	t.Fatalf("run prompt queue did not reach %d items", count)
+	return nil
+}
+
+func waitForManagedRunTerminal(t *testing.T, managed *managedRun) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		_, terminal, _, _, changed := managed.snapshot(0)
+		if terminal {
+			return
+		}
+		select {
+		case <-changed:
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+	t.Fatal("managed run did not become terminal")
+}
+
+func providerSettingsByName(providers []execution.ProviderSettings, name string) *execution.ProviderSettings {
+	for index := range providers {
+		if providers[index].Name == name {
+			return &providers[index]
+		}
+	}
+	return nil
+}
+
+var _ execution.SessionIncrementalSupporter = enteredBlockingWebTestRunner{}
+var _ execution.SessionTurnRunner = enteredBlockingWebTestRunner{}
