@@ -1,4 +1,9 @@
-# Mailbox Task Board Checklist
+# Mailbox Task Board Checklist（Historical Proposal）
+
+> Superseded by M25. M25 removed the CLI/mailbox product surface, so the unchecked
+> items below are not part of the current backlog and must not be implemented against
+> the current Web product without a new approved milestone and design. The active
+> roadmap is `docs/tasks/v0.1-release-hardening-checklist.md`.
 
 这份文档记录 mailbox 从“一次性 prompt 队列”演进为任务看板的后续开发任务。
 它是 M23 Mailbox MCP Input Adapter 之后的 proposal / checklist，不代表本次已经开始实现，

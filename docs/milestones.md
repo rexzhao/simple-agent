@@ -975,7 +975,8 @@ MCP 向当前 session 投递 queued prompt，同时不恢复 HTTP/WS 产品层�
 
 ## M24：PromptEvent Input
 
-状态说明：`enqueue_turn` 已实现，`append_active` 尚未实现；当前版本没有 active turn 输入队列。
+状态说明：M24 是历史 CLI/mailbox 里程碑。`enqueue_turn` 和底层 execution `append_active`
+均已实现；M25 删除 mailbox CLI 后，当前产品通过 Web run prompt API 使用追加输入能力。
 
 目标：在不恢复 HTTP layer、不改变 execution library 边界的前提下，把 stdin 和 mailbox
 输入统一为 PromptEvent。
@@ -1029,3 +1030,29 @@ MCP 向当前 session 投递 queued prompt，同时不恢复 HTTP/WS 产品层�
 - 浏览器 smoke 覆盖项目注册、session 创建、流式 run、持久历史和 cancel。
 - Windows amd64 EXE 可独立启动并包含全部静态资源。
 - task checklist 中记录 smoke evidence。
+
+## M26：v0.1 Release Hardening
+
+状态说明：当前执行里程碑。M26 不新增 provider protocol、tool family 或另一套产品入口，目标是
+把 M25 的单可执行文件 Web 应用收敛为可重复验证和发布的 v0.1。
+
+目标：修复会让用户进入不可恢复状态的生命周期 UX，覆盖浏览器主路径，并建立正式版本发布流程。
+
+交付物：
+
+- 归档 session 在 Web UI 中有明确入口，可恢复到 active list，也可显式永久删除。
+- 浏览器 E2E 覆盖首次项目接入、session/model 创建、文本 streaming、durable commit、cancel、
+  run resync 和 archive/restore。
+- 当前 roadmap 与 M20-M24 历史 CLI/server/mailbox 方案明确分离。
+- 补齐 session/project rename 和 project remove 等日常管理 UX，并给出明确确认和影响范围。
+- tag 驱动的 release workflow 注入版本，构建 Windows amd64、Linux amd64、macOS arm64 单文件产物，
+  生成 SHA-256 checksums 并发布。
+- 发布 smoke 使用真实构建二进制和 fake provider，从项目接入跑到 durable assistant response。
+
+验证：
+
+- `go test ./...`、`go vet ./...` 和 `go test -race ./internal/...` 通过。
+- `npm run check`、`npm test`、`npm run build` 和 `npm run test:e2e` 通过。
+- production build 后 `git diff --exit-code -- internal/webapp/assets` 通过。
+- `git diff --check` 通过。
+- release 产物的 `--version` 与 tag 一致，checksums 可校验。

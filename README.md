@@ -108,8 +108,11 @@ The first release provides:
 - Streaming assistant and reasoning output.
 - Tool requested/running/finished status.
 - Run cancellation.
+- Safe message append while a run is active.
+- Archived session restore and permanent deletion.
 - Manual context compaction.
 - Cursor-based history loading.
+- Active-run recovery and durable-history resync after a browser refresh.
 
 The server binds only to loopback, generates a random capability token for each
 start, validates Host and Origin, and does not enable CORS. Static assets are
@@ -152,3 +155,6 @@ Go validation:
 ```powershell
 go test ./...
 ```
+
+The active release-hardening roadmap is tracked in
+[docs/tasks/v0.1-release-hardening-checklist.md](docs/tasks/v0.1-release-hardening-checklist.md).

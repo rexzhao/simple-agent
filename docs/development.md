@@ -117,6 +117,12 @@ Do not edit generated files under `internal/webapp/assets` manually; edit
 - `go test ./internal/webapp` covers capability auth, embedded assets, project
   and configured session creation, SSE events, and durable results.
 - `npm run build` performs strict TypeScript checking and a production bundle.
+- `npm run test:e2e` covers onboarding, session creation, streaming commit,
+  cancellation, run recovery, archive/restore, and history scrolling in Chromium.
 - `go test ./...` is the full backend regression suite.
 - Final releases should be opened in a real browser and smoke-tested from
   project registration through a committed assistant response.
+
+The current implementation and release backlog is
+`docs/tasks/v0.1-release-hardening-checklist.md`. M20-M24 server/CLI/mailbox
+documents are historical records, not active product specifications.
