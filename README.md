@@ -143,6 +143,16 @@ cross-compiles:
 - `dist/sai-linux-amd64`
 - `dist/sai-darwin-arm64`
 
+These are the supported v0.1 release targets: Windows amd64, Linux amd64, and
+macOS arm64. Automatic browser opening uses the platform launcher; Linux needs
+`xdg-open`. If no launcher is available, start with `--no-open` and open the
+printed `SAI_WEB_URL` manually. macOS release binaries are not code-signed in
+v0.1, so Gatekeeper may require an explicit first-open approval.
+
+Pushing a `v*` tag runs the release workflow. It validates backend, frontend,
+race, browser, and embedded-asset checks; injects the tag as the executable
+version; publishes all three binaries; and includes a `SHA256SUMS` manifest.
+
 Frontend checks can be run independently:
 
 ```powershell

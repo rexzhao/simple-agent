@@ -1,0 +1,107 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate-build-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install frontend dependencies
+        working-directory: web
+        run: npm ci
+
+      - name: Check and test frontend
+        working-directory: web
+        run: |
+          npm run check
+          npm test
+
+      - name: Install Chromium
+        working-directory: web
+        run: npx playwright install --with-deps chromium
+
+      - name: Run browser tests
+        working-directory: web
+        run: npm run test:e2e
+
+      - name: Build embedded frontend
+        working-directory: web
+        run: npm run build
+
+      - name: Verify embedded frontend is current
+        run: git diff --exit-code -- internal/webapp/assets
+
+      - name: Validate backend
+        run: |
+          go test ./...
+          go vet ./...
+          go test -race ./internal/...
+
+      - name: Build release binaries
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: sh scripts/build.sh
+
+      - name: Verify release versions
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          test "$(./dist/sai-linux-amd64 --version)" = "$VERSION"
+          for artifact in \
+            dist/sai-windows-amd64.exe \
+            dist/sai-linux-amd64 \
+            dist/sai-darwin-arm64
+          do
+            strings "$artifact" | grep -Fx -- "$VERSION"
+          done
+
+      - name: Generate checksums
+        working-directory: dist
+        run: |
+          sha256sum \
+            sai-windows-amd64.exe \
+            sai-linux-amd64 \
+            sai-darwin-arm64 > SHA256SUMS
+          sha256sum --check SHA256SUMS
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ github.ref_name }}
+        run: |
+          artifacts=(
+            dist/sai-windows-amd64.exe
+            dist/sai-linux-amd64
+            dist/sai-darwin-arm64
+            dist/SHA256SUMS
+          )
+          if gh release view "$VERSION" >/dev/null 2>&1; then
+            gh release upload "$VERSION" "${artifacts[@]}" --clobber
+          else
+            gh release create "$VERSION" "${artifacts[@]}" --verify-tag --generate-notes --title "$VERSION"
+          fi

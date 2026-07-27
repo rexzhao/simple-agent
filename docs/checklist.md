@@ -577,6 +577,6 @@ M25 删除 mailbox 后，当前公开入口是 Web run prompt API。
   run resync 和 session archive/restore。
 - [x] M21-M24 历史方案与当前 backlog 明确分离，mailbox task-board proposal 标记为 superseded。
 - [x] 补齐 session/project 的日常管理 UX，包括 rename 和 project remove 的明确影响提示。
-- [ ] 增加 tag 驱动的 release workflow，注入正式版本并发布三平台产物和 SHA-256 checksums。
+- [x] 增加 tag 驱动的 release workflow，注入正式版本并发布三平台产物和 SHA-256 checksums。
 - [ ] 使用真实构建出的单文件程序和 fake provider 完成发布 smoke。
 - [ ] 发布前通过完整 Go、race、frontend、Playwright、embed freshness 和 diff 检查。

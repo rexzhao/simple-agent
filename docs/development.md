@@ -111,6 +111,11 @@ powershell -ExecutionPolicy Bypass -File scripts/build.ps1
 Do not edit generated files under `internal/webapp/assets` manually; edit
 `web/src` and rebuild.
 
+Pushing a `v*` tag runs `.github/workflows/release.yml`. The workflow repeats
+the full validation suite, builds the three documented target binaries with the
+tag injected into `webapp.Version`, verifies the version marker, generates
+`SHA256SUMS`, and creates or updates the matching GitHub Release.
+
 ## Testing
 
 - `go test ./internal/execution` covers project/session/run contracts.
