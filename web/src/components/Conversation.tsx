@@ -328,6 +328,10 @@ function ActiveRunBody({ run }: { run: ActiveRun }) {
   const segments = useMemo(() => buildActiveRunSegments(run.steps), [run.steps])
   const displaySegments = segments.length > 0 ? segments : [{ kind: 'steps' as const, steps: [] }]
 
+  // Streaming text soft-seals the live tail: once the model starts writing,
+  // the trailing tool group collapses instead of staying open until the
+  // output step flush at the next tool call (or until the run settles).
+  const textStreaming = Boolean(run.assistantText)
   const trailing = run.assistantText || run.totalTokens !== undefined || segments.length === 0
   const tokenNote = run.totalTokens !== undefined && (
     <div className="token-note">
@@ -345,7 +349,7 @@ function ActiveRunBody({ run }: { run: ActiveRun }) {
         if (segment.kind === 'user') return <article className="message user transient" key={segment.step.id}><div className="message-content"><div className="message-text">{segment.step.text}</div></div></article>
         return <article className="message assistant transient" key={`steps-${index}`}><div className="message-content">
           {isLast && <div className="message-meta"><span className="streaming-label"><i />Generating</span></div>}
-          <ProcessTimeline steps={segment.steps} live={isLast && run.status === 'running'} />
+          <ProcessTimeline steps={segment.steps} live={isLast && run.status === 'running' && !textStreaming} />
           {isLast && trailing && (run.assistantText ? <MarkdownMessage text={run.assistantText} streaming /> : <div className="message-text assistant-stream"><span className="cursor" /></div>)}
           {isLast && tokenNote}
         </div></article>

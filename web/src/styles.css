@@ -376,8 +376,14 @@ svg { width: 1.1em; height: 1.1em; fill: none; stroke: currentColor; stroke-widt
 .process-iteration > .process-timeline { margin: 0; }
 .process-card > .process-iterations { gap: 0; }
 .process-card > .process-iterations .process-iteration { width: 100%; }
-.process-timeline { display: flex; flex-direction: column; gap: 8px; margin: 3px 0 14px; }
+/* The left gutter keeps iteration markers — which hang left of their row via
+   right: 100% — inside the .message paint box, so content-visibility's paint
+   containment does not clip them. 22px fits two digits plus the 9px gap. */
+.process-timeline { display: flex; flex-direction: column; gap: 8px; margin: 3px 0 14px; padding-left: 22px; }
 .iteration-marker { position: absolute; top: 9px; right: 100%; margin-right: 9px; color: var(--faint); font-family: var(--font-mono); font-size: 9px; font-weight: 500; font-style: normal; line-height: 1; pointer-events: none; }
+/* Tool group markers sit 2px further left so their digits align with the
+   assistant body text edge. */
+.tool-group .iteration-marker { margin-right: 11px; }
 .iteration-marker-end { top: auto; bottom: 9px; }
 .reasoning-step { position: relative; padding: 7px 9px 8px 11px; border-left: 4px solid var(--accent); background: var(--panel-soft); }
 .reasoning-step > summary { display: flex; align-items: center; gap: 5px; list-style: none; cursor: pointer; }
