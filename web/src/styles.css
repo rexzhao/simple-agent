@@ -382,9 +382,10 @@ svg { width: 1.1em; height: 1.1em; fill: none; stroke: currentColor; stroke-widt
 .process-timeline { display: flex; flex-direction: column; gap: 8px; margin: 3px 0 14px; padding-left: 22px; }
 .iteration-marker { position: absolute; top: 9px; right: 100%; margin-right: 9px; color: var(--faint); font-family: var(--font-mono); font-size: 9px; font-weight: 500; font-style: normal; line-height: 1; pointer-events: none; }
 /* Tool group markers sit 2px further left so their digits align with the
-   assistant body text edge. */
+   assistant body text edge. Markers on rows inside an expanded group body
+   align to that same edge, accounting for the 10px body inset. */
 .tool-group .iteration-marker { margin-right: 11px; }
-.iteration-marker-end { top: auto; bottom: 9px; }
+.tool-group-body .iteration-marker { margin-right: 21px; }
 .reasoning-step { position: relative; padding: 7px 9px 8px 11px; border-left: 4px solid var(--accent); background: var(--panel-soft); }
 .reasoning-step > summary { display: flex; align-items: center; gap: 5px; list-style: none; cursor: pointer; }
 .reasoning-step > summary::-webkit-details-marker { display: none; }

@@ -78,18 +78,16 @@ function ToolGroupRow({ flats, live }: { flats: FlatProcessStep[]; live: boolean
 	}
 
 	// A collapsed group is marked with the latest iteration it contains, so
-	// the marker tracks progress. An expanded group that spans iterations
-	// shows the span instead: the first contained iteration at the top and
-	// the last at the bottom.
+	// the marker tracks progress. An expanded group instead marks each round
+	// on the row where the round actually begins: the first tool or
+	// reasoning step of that round inside the group. Rounds that begin with
+	// an output or user step outside the group keep their marker there and
+	// are not repeated inside.
 	let markerIteration: number | undefined
 	for (const flat of flats) {
 		if (flat.iterationStart) markerIteration = flat.iteration
 	}
-	const firstIteration = flats[0]?.iteration
-	const lastIteration = flats[flats.length - 1]?.iteration
-	const spansIterations = firstIteration !== undefined && lastIteration !== undefined && lastIteration > firstIteration
-	const showSpan = expanded && spansIterations
-	const topMarker = showSpan ? firstIteration : markerIteration
+	const topMarker = expanded ? undefined : markerIteration
 	const status = hasError ? 'error' : pending > 0 ? 'running' : 'finished'
 	const badge = hasError ? `${failed} failed` : pending > 0 ? `${tools.length - pending}/${tools.length}` : 'Done'
 	const summary = toolGroupSummary(tools)
@@ -107,19 +105,19 @@ function ToolGroupRow({ flats, live }: { flats: FlatProcessStep[]; live: boolean
 			</summary>
 			{expanded && (
 				<div className="tool-group-body">
-					{flats.map(({ step }, index) => {
+					{flats.map(({ step, iteration, iterationStart }, index) => {
+						const marker = iterationStart ? <i className="iteration-marker">{iteration}</i> : undefined
 						if (step.kind === 'reasoning') {
 							// Reasoning still streaming inside a live group renders
 							// expanded and follows new lines, exactly like an
 							// ungrouped streaming reasoning block.
-							return <ReasoningStep key={step.id} step={step} streaming={live && index === flats.length - 1} />
+							return <ReasoningStep key={step.id} step={step} marker={marker} streaming={live && index === flats.length - 1} />
 						}
-						if (step.kind === 'tool') return <ToolRow key={step.id} tool={step} />
+						if (step.kind === 'tool') return <ToolRow key={step.id} tool={step} marker={marker} />
 						return null
 					})}
 				</div>
 			)}
-			{showSpan && <i className="iteration-marker iteration-marker-end">{lastIteration}</i>}
 		</details>
 	)
 }

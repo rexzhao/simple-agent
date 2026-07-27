@@ -126,9 +126,13 @@ test('iteration markers are painted next to live tool groups', async ({ page }) 
   })
   await expect(page.locator('details.tool-group')).toHaveCount(1)
   await expectMarkerVisible(page)
-  // Tool group markers hang 11px left of the row so digits align with body text.
-  const marginRight = await page.locator('.tool-group .iteration-marker').first().evaluate((el) => getComputedStyle(el).marginRight)
-  expect(marginRight).toBe('11px')
+  // An expanded group marks each round on its first row inside the body,
+  // aligned to the same edge as top-level markers (21px accounting for the
+  // 10px body inset).
+  const bodyMarkers = page.locator('.tool-group-body .iteration-marker')
+  expect(await bodyMarkers.allTextContents()).toEqual(['1', '2'])
+  const marginRight = await bodyMarkers.first().evaluate((el) => getComputedStyle(el).marginRight)
+  expect(marginRight).toBe('21px')
   hold.release([])
 })
 
@@ -192,6 +196,42 @@ test('tool batches without intermediate text keep the live group open', async ({
   hold.release([])
 })
 
+test('rounds that begin with output keep their marker outside the expanded group', async ({ page }) => {
+  const hold = newGate()
+  await mockApp(page, {
+    initial: [
+      { type: 'turn.started', turn_id: 'turn-main' },
+      { type: 'agent.iteration.started', turn_id: 'turn-main', agent_iteration: 1 },
+      { type: 'tool.requested', turn_id: 'turn-main', agent_iteration: 1, tool_call_id: 't1', name: 'read_file', arguments: '{"path":"a.ts"}' },
+      { type: 'tool.finished', turn_id: 'turn-main', agent_iteration: 1, tool_call_id: 't1', name: 'read_file', is_error: false, content: 'a' },
+      { type: 'tool.requested', turn_id: 'turn-main', agent_iteration: 1, tool_call_id: 't2', name: 'read_file', arguments: '{"path":"b.ts"}' },
+      { type: 'tool.finished', turn_id: 'turn-main', agent_iteration: 1, tool_call_id: 't2', name: 'read_file', is_error: false, content: 'b' },
+      { type: 'agent.iteration.started', turn_id: 'turn-main', agent_iteration: 2 },
+      // Round 2 begins with text output, so round 2's marker belongs to the
+      // output step — not to the tool group that follows.
+      { type: 'text.delta', turn_id: 'turn-main', agent_iteration: 2, text: 'Round two. ' },
+      { type: 'tool.requested', turn_id: 'turn-main', agent_iteration: 2, tool_call_id: 't3', name: 'shell', arguments: '{"command":"ls"}' },
+      { type: 'tool.finished', turn_id: 'turn-main', agent_iteration: 2, tool_call_id: 't3', name: 'shell', is_error: false, content: 'ok' },
+      { type: 'agent.iteration.started', turn_id: 'turn-main', agent_iteration: 3 },
+      { type: 'tool.requested', turn_id: 'turn-main', agent_iteration: 3, tool_call_id: 't4', name: 'shell', arguments: '{"command":"pwd"}' },
+      { type: 'tool.finished', turn_id: 'turn-main', agent_iteration: 3, tool_call_id: 't4', name: 'shell', is_error: false, content: 'ok' },
+      { type: 'tool.requested', turn_id: 'turn-main', agent_iteration: 3, tool_call_id: 't5', name: 'shell', arguments: '{"command":"git status"}' },
+    ],
+    gates: [hold],
+  })
+  await expect(page.locator('details.tool-group')).toHaveCount(2)
+  expect(await groupStates(page)).toEqual([
+    { open: false, summary: 'Read 2 files' },
+    { open: true, summary: 'Ran 3 commands' },
+  ])
+  // The expanded group repeats no round-2 marker; it only marks round 3,
+  // which actually begins inside the group.
+  expect(await page.locator('.tool-group-body .iteration-marker').allTextContents()).toEqual(['3'])
+  // Page order: collapsed group marker, output step marker, body marker.
+  expect(await page.locator('.iteration-marker').allTextContents()).toEqual(['1', '2', '3'])
+  hold.release([])
+})
+
 test('groups render collapsed with visible markers after the run settles', async ({ page }) => {
   const settle = newGate()
   let committed = false
@@ -230,4 +270,8 @@ test('groups render collapsed with visible markers after the run settles', async
   await expect(page.locator('.message.assistant:not(.transient)').last()).toContainText('All done.')
   expect(await groupStates(page)).toEqual([{ open: false, summary: 'Read 2 files · Ran 1 command' }])
   await expectMarkerVisible(page)
+  // Collapsed group markers hang 11px left of the summary so digits align
+  // with the body text edge.
+  const marginRight = await page.locator('.tool-group > summary > .iteration-marker').first().evaluate((el) => getComputedStyle(el).marginRight)
+  expect(marginRight).toBe('11px')
 })
