@@ -27,6 +27,7 @@ function App() {
   const [bootstrap, setBootstrap] = useState<Bootstrap | null>(null)
   const [projects, setProjects] = useState<Project[]>([])
   const [sessionsByProject, setSessionsByProject] = useState<Record<string, Session[]>>({})
+  const [archivedSessionsByProject, setArchivedSessionsByProject] = useState<Record<string, Session[]>>({})
   const { selectedProjectID, selectedSessionID, selectedProjectRef, setSelectedProjectID, setSelectedSessionID } = useSessionSelection()
   const [recoveredRuns, setRecoveredRuns] = useState<ActiveRunDescriptor[]>([])
 	const [recentStepsByTurn, setRecentStepsByTurn] = useState<Record<string, RunStep[]>>({})
@@ -46,6 +47,9 @@ function App() {
     setSessionsByProject((current) => Object.fromEntries(
       payload.projects.map((project) => [project.id, current[project.id] ?? []]),
     ))
+    setArchivedSessionsByProject((current) => Object.fromEntries(
+      payload.projects.map((project) => [project.id, current[project.id] ?? []]),
+    ))
     setSelectedProjectID((current) => {
       if (current && payload.projects.some((project) => project.id === current)) return current
       return payload.projects[0]?.id ?? ''
@@ -58,11 +62,12 @@ function App() {
     void Promise.all([api.bootstrap(), api.projects(), api.activeRuns()])
       .then(async ([bootstrapPayload, projectsPayload, activeRunsPayload]) => {
         const sessionEntries = await Promise.all(projectsPayload.projects.map(async (project) => {
-          const payload = await api.sessions(project.id)
-          return [project.id, orderSessions(payload.sessions)] as const
+          const [activePayload, archivedPayload] = await Promise.all([api.sessions(project.id), api.sessions(project.id, true)])
+          return [project.id, orderSessions(activePayload.sessions), orderSessions(archivedPayload.sessions)] as const
         }))
         if (cancelled) return
-        const sessionMap = Object.fromEntries(sessionEntries)
+        const sessionMap = Object.fromEntries(sessionEntries.map(([projectID, sessions]) => [projectID, sessions]))
+        const archivedSessionMap = Object.fromEntries(sessionEntries.map(([projectID, , sessions]) => [projectID, sessions]))
         const recovered = activeRunsPayload.runs.filter((run) => projectsPayload.projects.some((project) => sessionMap[project.id]?.some((session) => session.id === run.session_id)))
         const recoveredProject = recovered.length > 0
           ? projectsPayload.projects.find((project) => sessionMap[project.id]?.some((session) => session.id === recovered[0].session_id))
@@ -72,6 +77,7 @@ function App() {
         setBootstrap(bootstrapPayload)
         setProjects(projectsPayload.projects)
         setSessionsByProject(sessionMap)
+        setArchivedSessionsByProject(archivedSessionMap)
         setSelectedProjectID(firstProjectID)
         setSelectedSessionID(firstSessionID)
         setRecoveredRuns(recovered)
@@ -87,9 +93,10 @@ function App() {
       setSelectedSessionID('')
       return []
     }
-    const payload = await api.sessions(projectID)
+    const [payload, archivedPayload] = await Promise.all([api.sessions(projectID), api.sessions(projectID, true)])
     const ordered = orderSessions(payload.sessions)
     setSessionsByProject((current) => ({ ...current, [projectID]: ordered }))
+    setArchivedSessionsByProject((current) => ({ ...current, [projectID]: orderSessions(archivedPayload.sessions) }))
     if (selectedProjectRef.current === projectID) {
       setSelectedSessionID((current) => {
         const preferred = preferredSessionID || current
@@ -101,7 +108,7 @@ function App() {
   }, [])
 
   const reportError = useCallback((reason: unknown) => setError(errorMessage(reason)), [])
-  const { sessionDetail, itemsPage, setSessionDetail, setItemsPage, selectedSessionRef, refreshSession, loadOlder } =
+  const { sessionDetail, itemsPage, selectedSessionRef, refreshSession, loadOlder } =
     useSessionHistory(selectedSessionID, loadSessions, reportError)
 
   useEffect(() => {
@@ -184,33 +191,34 @@ function App() {
     setShowProjectForm(false)
   }, [setSelectedProjectID, setSelectedSessionID])
 
-  const removeSessionFromTree = useCallback((session: Session) => {
-    const remaining = (sessionsByProject[session.project_id] ?? []).filter((item) => item.id !== session.id)
-    setSessionsByProject((current) => ({ ...current, [session.project_id]: remaining }))
-    if (selectedSessionID === session.id) {
-      setSelectedProjectID(session.project_id)
-      setSelectedSessionID(remaining[0]?.id ?? '')
-      setSessionDetail(null)
-      setItemsPage(null)
-    }
-  }, [selectedSessionID, setSelectedProjectID, setSelectedSessionID, sessionsByProject])
-
   const archiveSession = useCallback(async (session: Session) => {
     if (session.status === 'running' || Boolean(activeRunsRef.current[session.id]) || !window.confirm(`Archive "${sessionName(session)}"? It will be hidden from the current list.`)) return
     try {
       await api.archiveSession(session.id)
-      removeSessionFromTree(session)
+      await loadSessions(session.project_id)
     } catch (reason) {
       setError(errorMessage(reason))
     }
-  }, [activeRunsRef, removeSessionFromTree])
+  }, [activeRunsRef, loadSessions])
+
+  const restoreSession = useCallback(async (session: Session) => {
+    try {
+      const restored = await api.restoreSession(session.id)
+      await loadSessions(session.project_id)
+      setSelectedProjectID(session.project_id)
+      setSelectedSessionID(restored.id)
+      setShowProjectForm(false)
+    } catch (reason) {
+      setError(errorMessage(reason))
+    }
+  }, [loadSessions, setSelectedProjectID, setSelectedSessionID])
 
   const deleteSession = useCallback(async (session: Session) => {
     if (session.status === 'running' || Boolean(activeRunsRef.current[session.id]) || !window.confirm(`Permanently delete "${sessionName(session)}"? This action cannot be undone.`)) return
     try {
       await api.archiveSession(session.id)
       await api.deleteSession(session.id)
-      removeSessionFromTree(session)
+      await loadSessions(session.project_id)
     } catch (reason) {
       try {
         await loadSessions(session.project_id)
@@ -219,7 +227,7 @@ function App() {
       }
       setError(errorMessage(reason))
     }
-  }, [activeRunsRef, loadSessions, removeSessionFromTree])
+  }, [activeRunsRef, loadSessions])
 
   const handleRunEvent = useCallback(async (sessionID: string, runID: string, event: RunEvent) => {
     if (event.type === 'text.delta' || event.type === 'reasoning.delta') {
@@ -395,6 +403,7 @@ function App() {
       <WorkspaceTree
         projects={projects}
         sessionsByProject={sessionsByProject}
+        archivedSessionsByProject={archivedSessionsByProject}
         selectedProjectID={selectedProjectID}
         selectedSessionID={selectedSessionID}
 		runningSessionIDs={runningSessionIDs}
@@ -403,6 +412,7 @@ function App() {
         onCreateSession={openSessionCreator}
         onManageProviders={openProviderManager}
         onArchiveSession={archiveSession}
+        onRestoreSession={restoreSession}
         onDeleteSession={deleteSession}
         onAdd={showAddProject}
         version={bootstrap?.version ?? ''}

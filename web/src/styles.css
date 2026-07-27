@@ -181,6 +181,8 @@ svg { width: 1.1em; height: 1.1em; fill: none; stroke: currentColor; stroke-widt
 .session-icon { width: 25px; height: 25px; flex: 0 0 auto; display: grid; place-items: center; border: 2px solid currentColor; color: #111111; background: var(--accent); }
 .session-icon svg { width: 13px; height: 13px; }
 .session-tree-row.selected .session-icon { color: #111111; background: var(--accent); }
+.session-tree-row.archived { opacity: .72; }
+.session-tree-row.archived:hover, .session-tree-row.archived:focus-within { opacity: 1; }
 .live-dot { width: 8px; height: 8px; margin-left: auto; border: 2px solid #ffffff; background: #22c55e; animation: pulse 1.2s infinite; }
 
 .session-tree-actions { display: flex; gap: 1px; padding-right: 3px; opacity: 0; }
@@ -219,6 +221,8 @@ svg { width: 1.1em; height: 1.1em; fill: none; stroke: currentColor; stroke-widt
 .tree-expand-button:active { box-shadow: none; transform: translate(2px, 2px); }
 .tree-expand-button svg { width: 13px; height: 13px; }
 .tree-expand-button svg.expanded { transform: rotate(180deg); }
+.archived-session-toggle { margin-top: 7px; }
+.archived-session-toggle > svg:first-child { transform: none; }
 .tree-empty { margin: 6px 0 4px 5px; color: rgba(0, 0, 0, .56); font-size: 10.5px; }
 
 .project-rail-footer { display: flex; flex-direction: column; gap: 10px; padding: 10px 4px 0; border-top: 2px solid rgba(0, 0, 0, .18); }

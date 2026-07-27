@@ -55,7 +55,7 @@ export const api = {
     method: 'POST',
     body: JSON.stringify({ root, display_name: displayName }),
   }),
-  sessions: (projectID: string) => request<{ sessions: Session[] }>(`/api/projects/${encodeURIComponent(projectID)}/sessions`),
+  sessions: (projectID: string, archived = false) => request<{ sessions: Session[] }>(`/api/projects/${encodeURIComponent(projectID)}/sessions${archived ? '?archived=true' : ''}`),
   sessionModels: (projectID: string) => request<SessionModelOptions>(`/api/projects/${encodeURIComponent(projectID)}/models`),
   createSession: (projectID: string, provider: string, modelProfile: string, reasoningLevel = '') => request<Session>(`/api/projects/${encodeURIComponent(projectID)}/sessions`, {
     method: 'POST',
@@ -83,6 +83,10 @@ export const api = {
   clearCodexLogin: (providerName: string) => request<void>(`/api/providers/${encodeURIComponent(providerName)}/codex-login`, { method: 'DELETE' }),
   session: (sessionID: string) => request<Session>(`/api/sessions/${encodeURIComponent(sessionID)}`),
   archiveSession: (sessionID: string) => request<Session>(`/api/sessions/${encodeURIComponent(sessionID)}/archive`, {
+    method: 'POST',
+    body: '{}',
+  }),
+  restoreSession: (sessionID: string) => request<Session>(`/api/sessions/${encodeURIComponent(sessionID)}/restore`, {
     method: 'POST',
     body: '{}',
   }),

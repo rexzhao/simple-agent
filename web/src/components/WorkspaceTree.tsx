@@ -2,11 +2,12 @@ import { memo, useState } from 'react'
 import type { Project, Session } from '../types'
 import { projectName, sessionName } from '../lib/session'
 import { relativeTime } from '../lib/format'
-import { ArchiveIcon, ChatIcon, ChevronIcon, LogoIcon, PlusIcon, SettingsIcon, TrashIcon } from './icons'
+import { ArchiveIcon, ChatIcon, ChevronIcon, LogoIcon, PlusIcon, RestoreIcon, SettingsIcon, TrashIcon } from './icons'
 
 export const WorkspaceTree = memo(function WorkspaceTree(props: {
   projects: Project[]
   sessionsByProject: Record<string, Session[]>
+  archivedSessionsByProject: Record<string, Session[]>
   selectedProjectID: string
   selectedSessionID: string
   runningSessionIDs: ReadonlySet<string>
@@ -16,12 +17,22 @@ export const WorkspaceTree = memo(function WorkspaceTree(props: {
   onCreateSession: (projectID: string) => void
   onManageProviders: () => void
   onArchiveSession: (session: Session) => void
+  onRestoreSession: (session: Session) => void
   onDeleteSession: (session: Session) => void
   onAdd: () => void
 }) {
   const [expandedProjects, setExpandedProjects] = useState<Set<string>>(new Set())
+  const [expandedArchivedProjects, setExpandedArchivedProjects] = useState<Set<string>>(new Set())
   const toggleProject = (projectID: string) => {
     setExpandedProjects((current) => {
+      const next = new Set(current)
+      if (next.has(projectID)) next.delete(projectID)
+      else next.add(projectID)
+      return next
+    })
+  }
+  const toggleArchivedProject = (projectID: string) => {
+    setExpandedArchivedProjects((current) => {
       const next = new Set(current)
       if (next.has(projectID)) next.delete(projectID)
       else next.add(projectID)
@@ -36,7 +47,9 @@ export const WorkspaceTree = memo(function WorkspaceTree(props: {
       <nav className="project-tree" aria-label="Project and session tree">
         {props.projects.map((project) => {
           const sessions = props.sessionsByProject[project.id] ?? []
+          const archivedSessions = props.archivedSessionsByProject[project.id] ?? []
           const expanded = expandedProjects.has(project.id)
+		  const archivedExpanded = expandedArchivedProjects.has(project.id)
 		  const collapsedSessions = sessions.slice(0, 3)
 		  const visibleSessions = expanded
 			? sessions
@@ -85,6 +98,28 @@ export const WorkspaceTree = memo(function WorkspaceTree(props: {
                     <ChevronIcon expanded={expanded} />
 					{expanded ? 'Collapse' : `Show ${sessions.length - visibleSessions.length} more sessions`}
                   </button>
+                )}
+                {archivedSessions.length > 0 && (
+                  <>
+                    <button className="tree-expand-button archived-session-toggle" onClick={() => toggleArchivedProject(project.id)} aria-expanded={archivedExpanded}>
+                      <ArchiveIcon /> Archived ({archivedSessions.length}) <ChevronIcon expanded={archivedExpanded} />
+                    </button>
+                    {archivedExpanded && archivedSessions.map((session) => (
+                      <div className="session-tree-row archived" key={session.id}>
+                        <button className="session-tree-button" disabled title="Restore this session to open it">
+                          <span className="session-icon"><ArchiveIcon /></span>
+                          <span className="session-copy">
+                            <strong>{sessionName(session)}</strong>
+                            <small>Archived · {session.model_id || session.model_profile}</small>
+                          </span>
+                        </button>
+                        <div className="session-tree-actions">
+                          <button onClick={() => props.onRestoreSession(session)} aria-label={`Restore ${sessionName(session)}`} title="Restore"><RestoreIcon /></button>
+                          <button className="danger" onClick={() => props.onDeleteSession(session)} aria-label={`Delete ${sessionName(session)}`} title="Delete permanently"><TrashIcon /></button>
+                        </div>
+                      </div>
+                    ))}
+                  </>
                 )}
               </div>
             </section>

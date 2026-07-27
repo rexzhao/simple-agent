@@ -2,6 +2,7 @@ export const LogoIcon = () => <svg viewBox="0 0 24 24" aria-hidden="true"><path 
 export const PlusIcon = () => <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14" /></svg>
 export const ChatIcon = () => <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 5h14v11H9l-4 3V5Z" /></svg>
 export const ArchiveIcon = () => <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16v13H4V7Zm-1-4h18v4H3V3Zm6 8h6" /></svg>
+export const RestoreIcon = () => <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 8v5h5M6.5 17.5A8 8 0 1 0 6 7l-1 1" /></svg>
 export const TrashIcon = () => <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M9 7V4h6v3m3 0-1 14H7L6 7m4 4v6m4-6v6" /></svg>
 export const CopyIcon = () => <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="8" y="8" width="11" height="11" /><path d="M16 8V5H5v11h3" /></svg>
 export const PaperclipIcon = () => <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m8.5 12.5 6.8-6.8a3 3 0 1 1 4.2 4.2l-8.7 8.7a5 5 0 0 1-7.1-7.1l8.2-8.2" /></svg>

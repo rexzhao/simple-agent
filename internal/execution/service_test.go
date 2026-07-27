@@ -246,6 +246,19 @@ func TestServiceSessionLifecycle(t *testing.T) {
 	if _, err := service.RenameSession(session.ID, "Nope"); err == nil || !strings.Contains(err.Error(), "archived session cannot be renamed") {
 		t.Fatalf("RenameSession(archived) error = %v, want archived rejection", err)
 	}
+	restored, err := service.RestoreSession(session.ID)
+	if err != nil {
+		t.Fatalf("RestoreSession() error = %v", err)
+	}
+	if restored.Archived {
+		t.Fatalf("RestoreSession() archived = true: %#v", restored)
+	}
+	if _, err := service.RenameSession(session.ID, "Restored Session"); err != nil {
+		t.Fatalf("RenameSession(restored) error = %v", err)
+	}
+	if _, err := service.ArchiveSession(session.ID); err != nil {
+		t.Fatalf("ArchiveSession(restored) error = %v", err)
+	}
 	result, err := service.RemoveSession(session.ID)
 	if err != nil {
 		t.Fatalf("RemoveSession() error = %v", err)

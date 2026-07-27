@@ -615,6 +615,35 @@ func (s *Service) ArchiveSession(id string) (SessionDetail, error) {
 	return sessionDetailFromStore(session), nil
 }
 
+func (s *Service) RestoreSession(id string) (SessionDetail, error) {
+	if s == nil || s.sessionStore == nil {
+		return SessionDetail{}, fmt.Errorf("execution session store is not configured")
+	}
+	writeLock, err := s.acquireSessionMutationLock(id)
+	if err != nil {
+		return SessionDetail{}, err
+	}
+	defer func() { _ = writeLock.Release() }()
+
+	session, err := s.sessionStore.Load(id)
+	if err != nil {
+		return SessionDetail{}, err
+	}
+	if !session.Archived {
+		return sessionDetailFromStore(session), nil
+	}
+	if _, err := s.loadActiveProject(session.ProjectID); err != nil {
+		return SessionDetail{}, err
+	}
+	session.Archived = false
+	session.ArchivedAt = time.Time{}
+	saved, err := s.sessionStore.SaveMetadata(session)
+	if err != nil {
+		return SessionDetail{}, err
+	}
+	return sessionDetailFromStore(saved), nil
+}
+
 func (s *Service) RemoveSession(id string) (SessionRemoveResult, error) {
 	if s == nil || s.sessionStore == nil {
 		return SessionRemoveResult{}, fmt.Errorf("execution session store is not configured")
@@ -702,10 +731,10 @@ type SessionRun struct {
 	// (2) the run goroutine drains any remainder into a fresh follow-up turn
 	// after the active turn settles. Queued messages are never dropped. Every
 	// mutation publishes a full run.prompt_queue snapshot via queueNotify.
-	activeQueue   []activePrompt
-	activeTurnID  string
-	activeEmit    func(SessionStreamEvent)
-	nextPromptID  int
+	activeQueue  []activePrompt
+	activeTurnID string
+	activeEmit   func(SessionStreamEvent)
+	nextPromptID int
 }
 
 // activePrompt is one queued append-active prompt with a stable id so clients

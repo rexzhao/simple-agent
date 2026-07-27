@@ -110,6 +110,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /api/sessions/{sessionID}", s.handleGetSession)
 	s.mux.HandleFunc("PATCH /api/sessions/{sessionID}", s.handleRenameSession)
 	s.mux.HandleFunc("POST /api/sessions/{sessionID}/archive", s.handleArchiveSession)
+	s.mux.HandleFunc("POST /api/sessions/{sessionID}/restore", s.handleRestoreSession)
 	s.mux.HandleFunc("DELETE /api/sessions/{sessionID}", s.handleRemoveSession)
 	s.mux.HandleFunc("GET /api/sessions/{sessionID}/items", s.handleSessionItems)
 	s.mux.HandleFunc("GET /api/sessions/{sessionID}/images/{hash}", s.handleSessionImage)
@@ -298,6 +299,15 @@ func (s *Server) handleRenameSession(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleArchiveSession(w http.ResponseWriter, r *http.Request) {
 	session, err := s.service.ArchiveSession(r.PathValue("sessionID"))
+	if err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, session)
+}
+
+func (s *Server) handleRestoreSession(w http.ResponseWriter, r *http.Request) {
+	session, err := s.service.RestoreSession(r.PathValue("sessionID"))
 	if err != nil {
 		writeServiceError(w, err)
 		return

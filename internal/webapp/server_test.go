@@ -166,6 +166,32 @@ func TestServerProjectSessionAndRunFlow(t *testing.T) {
 	if len(page.Items) != 2 {
 		t.Fatalf("persisted chat items = %d, want 2: %#v", len(page.Items), page.Items)
 	}
+
+	archivedResponse := doJSONRequest(t, http.MethodPost, server.URL+"/api/sessions/"+session.ID+"/archive", map[string]string{})
+	if archivedResponse.StatusCode != http.StatusOK {
+		t.Fatalf("POST archive session status = %d body=%s", archivedResponse.StatusCode, readBody(archivedResponse))
+	}
+	archivedResponse.Body.Close()
+	archivedResponse = doJSONRequest(t, http.MethodGet, server.URL+"/api/projects/"+projectResult.Project.ID+"/sessions?archived=true", nil)
+	if archivedResponse.StatusCode != http.StatusOK {
+		t.Fatalf("GET archived sessions status = %d body=%s", archivedResponse.StatusCode, readBody(archivedResponse))
+	}
+	var archivedSessions struct {
+		Sessions []execution.SessionMetadata `json:"sessions"`
+	}
+	decodeResponse(t, archivedResponse, &archivedSessions)
+	if len(archivedSessions.Sessions) != 1 || archivedSessions.Sessions[0].ID != session.ID {
+		t.Fatalf("GET archived sessions = %#v, want %s", archivedSessions.Sessions, session.ID)
+	}
+	restoredResponse := doJSONRequest(t, http.MethodPost, server.URL+"/api/sessions/"+session.ID+"/restore", map[string]string{})
+	if restoredResponse.StatusCode != http.StatusOK {
+		t.Fatalf("POST restore session status = %d body=%s", restoredResponse.StatusCode, readBody(restoredResponse))
+	}
+	var restored execution.SessionDetail
+	decodeResponse(t, restoredResponse, &restored)
+	if restored.Archived {
+		t.Fatalf("restored session remains archived: %#v", restored)
+	}
 }
 
 func TestServerCancelsRun(t *testing.T) {
