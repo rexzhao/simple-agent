@@ -109,6 +109,7 @@ The first release provides:
 - Tool requested/running/finished status.
 - Run cancellation.
 - Safe message append while a run is active.
+- Project and session rename, plus confirmed project-wide deletion.
 - Archived session restore and permanent deletion.
 - Manual context compaction.
 - Cursor-based history loading.

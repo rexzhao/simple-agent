@@ -231,6 +231,76 @@ test('resyncs a recovered run from durable session history', async ({ page }) =>
   await expect(page.getByText('Ready', { exact: true })).toBeVisible()
 })
 
+test('renames sessions and projects and confirms project-wide deletion', async ({ page }) => {
+  let currentProject = { ...project }
+  let currentSession = { ...session }
+  let projectExists = true
+  let deleteConfirmation = ''
+
+  page.on('dialog', (dialog) => {
+    if (dialog.type() === 'prompt' && dialog.message() === 'Rename project') {
+      void dialog.accept('Renamed project')
+      return
+    }
+    if (dialog.type() === 'prompt' && dialog.message() === 'Rename session') {
+      void dialog.accept('Renamed session')
+      return
+    }
+    deleteConfirmation = dialog.message()
+    void dialog.accept()
+  })
+
+  await mockExistingSessionApp(page, async (route, url) => {
+    const request = route.request()
+    if (url.pathname === '/api/projects' && request.method() === 'GET') {
+      await json(route, { projects: projectExists ? [currentProject] : [] })
+      return true
+    }
+    if (url.pathname === `/api/projects/${project.id}` && request.method() === 'PATCH') {
+      const body = request.postDataJSON() as { display_name: string }
+      currentProject = { ...currentProject, display_name: body.display_name }
+      await json(route, currentProject)
+      return true
+    }
+    if (url.pathname === `/api/projects/${project.id}/sessions`) {
+      await json(route, { sessions: url.searchParams.get('archived') === 'true' ? [] : [currentSession] })
+      return true
+    }
+    if (url.pathname === `/api/sessions/${session.id}` && request.method() === 'PATCH') {
+      const body = request.postDataJSON() as { display_name: string }
+      currentSession = { ...currentSession, display_name: body.display_name }
+      await json(route, currentSession)
+      return true
+    }
+    if (url.pathname === `/api/sessions/${session.id}` && request.method() === 'GET') {
+      await json(route, currentSession)
+      return true
+    }
+    if (url.pathname === `/api/projects/${project.id}/archive` && request.method() === 'POST') {
+      await json(route, { ...currentProject, archived: true })
+      return true
+    }
+    if (url.pathname === `/api/projects/${project.id}` && request.method() === 'DELETE') {
+      projectExists = false
+      await json(route, { status: 'removed', id: project.id, removed_sessions: 1 })
+      return true
+    }
+    return false
+  })
+
+  await page.goto('/')
+  await page.getByRole('button', { name: `Rename ${project.display_name}` }).click()
+  await expect(page.getByText('Renamed project', { exact: true })).toBeVisible()
+
+  await page.getByRole('button', { name: `Rename ${session.display_name}` }).click()
+  await expect(page.getByRole('heading', { name: 'Renamed session' })).toBeVisible()
+
+  await page.getByRole('button', { name: 'Delete Renamed project', exact: true }).click()
+  await expect(page.getByRole('heading', { name: 'Connect your first project' })).toBeVisible()
+  expect(deleteConfirmation).toContain('1 saved session')
+  expect(deleteConfirmation).toContain('All session history and attachments')
+})
+
 test('shows archived sessions and restores them to the active list', async ({ page }) => {
   let archived = false
   page.on('dialog', (dialog) => void dialog.accept())

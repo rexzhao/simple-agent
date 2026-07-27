@@ -190,6 +190,20 @@ func (s *Store) Archive(id string) (Project, error) {
 	return copyProject(project), nil
 }
 
+func (s *Store) Restore(id string) (Project, error) {
+	project, err := s.Load(id)
+	if err != nil {
+		return Project{}, err
+	}
+	project.Archived = false
+	project.ArchivedAt = time.Time{}
+	project.UpdatedAt = s.now().UTC()
+	if err := s.writeProject(project); err != nil {
+		return Project{}, err
+	}
+	return copyProject(project), nil
+}
+
 func (s *Store) Delete(id string) error {
 	if err := s.requireRoot(); err != nil {
 		return err

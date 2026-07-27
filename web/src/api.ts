@@ -55,6 +55,21 @@ export const api = {
     method: 'POST',
     body: JSON.stringify({ root, display_name: displayName }),
   }),
+  renameProject: (projectID: string, displayName: string) => request<Project>(`/api/projects/${encodeURIComponent(projectID)}`, {
+    method: 'PATCH',
+    body: JSON.stringify({ display_name: displayName }),
+  }),
+  archiveProject: (projectID: string) => request<Project>(`/api/projects/${encodeURIComponent(projectID)}/archive`, {
+    method: 'POST',
+    body: '{}',
+  }),
+  restoreProject: (projectID: string) => request<Project>(`/api/projects/${encodeURIComponent(projectID)}/restore`, {
+    method: 'POST',
+    body: '{}',
+  }),
+  deleteProject: (projectID: string) => request<{ status: string; id: string; removed_sessions: number }>(`/api/projects/${encodeURIComponent(projectID)}`, {
+    method: 'DELETE',
+  }),
   sessions: (projectID: string, archived = false) => request<{ sessions: Session[] }>(`/api/projects/${encodeURIComponent(projectID)}/sessions${archived ? '?archived=true' : ''}`),
   sessionModels: (projectID: string) => request<SessionModelOptions>(`/api/projects/${encodeURIComponent(projectID)}/models`),
   createSession: (projectID: string, provider: string, modelProfile: string, reasoningLevel = '') => request<Session>(`/api/projects/${encodeURIComponent(projectID)}/sessions`, {
@@ -82,6 +97,10 @@ export const api = {
   codexLoginStatus: (providerName: string) => request<CodexAuthStatus>(`/api/providers/${encodeURIComponent(providerName)}/codex-login`),
   clearCodexLogin: (providerName: string) => request<void>(`/api/providers/${encodeURIComponent(providerName)}/codex-login`, { method: 'DELETE' }),
   session: (sessionID: string) => request<Session>(`/api/sessions/${encodeURIComponent(sessionID)}`),
+  renameSession: (sessionID: string, displayName: string) => request<Session>(`/api/sessions/${encodeURIComponent(sessionID)}`, {
+    method: 'PATCH',
+    body: JSON.stringify({ display_name: displayName }),
+  }),
   archiveSession: (sessionID: string) => request<Session>(`/api/sessions/${encodeURIComponent(sessionID)}/archive`, {
     method: 'POST',
     body: '{}',

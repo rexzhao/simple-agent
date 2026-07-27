@@ -95,6 +95,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /api/projects", s.handleCreateProject)
 	s.mux.HandleFunc("PATCH /api/projects/{projectID}", s.handleRenameProject)
 	s.mux.HandleFunc("POST /api/projects/{projectID}/archive", s.handleArchiveProject)
+	s.mux.HandleFunc("POST /api/projects/{projectID}/restore", s.handleRestoreProject)
 	s.mux.HandleFunc("DELETE /api/projects/{projectID}", s.handleRemoveProject)
 	s.mux.HandleFunc("GET /api/projects/{projectID}/models", s.handleSessionModels)
 	s.mux.HandleFunc("GET /api/provider-settings", s.handleProviderSettings)
@@ -211,6 +212,15 @@ func (s *Server) handleRenameProject(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleArchiveProject(w http.ResponseWriter, r *http.Request) {
 	project, err := s.service.ArchiveProject(r.PathValue("projectID"))
+	if err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, project)
+}
+
+func (s *Server) handleRestoreProject(w http.ResponseWriter, r *http.Request) {
+	project, err := s.service.RestoreProject(r.PathValue("projectID"))
 	if err != nil {
 		writeServiceError(w, err)
 		return

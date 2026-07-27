@@ -466,7 +466,28 @@ func (s *Service) ArchiveProject(id string) (Project, error) {
 	if project.Archived {
 		return projectFromStore(project), nil
 	}
+	if err := s.ensureProjectSessionsIdle(project.ID); err != nil {
+		return Project{}, err
+	}
 	project, err = s.projectStore.Archive(project.ID)
+	if err != nil {
+		return Project{}, err
+	}
+	return projectFromStore(project), nil
+}
+
+func (s *Service) RestoreProject(id string) (Project, error) {
+	if s == nil || s.projectStore == nil {
+		return Project{}, fmt.Errorf("execution project store is not configured")
+	}
+	project, err := s.projectStore.Load(id)
+	if err != nil {
+		return Project{}, err
+	}
+	if !project.Archived {
+		return projectFromStore(project), nil
+	}
+	project, err = s.projectStore.Restore(project.ID)
 	if err != nil {
 		return Project{}, err
 	}
@@ -483,6 +504,9 @@ func (s *Service) RemoveProject(id string) (ProjectRemoveResult, error) {
 	}
 	if !project.Archived {
 		return ProjectRemoveResult{}, fmt.Errorf("archive project before removing it")
+	}
+	if err := s.ensureProjectSessionsIdle(project.ID); err != nil {
+		return ProjectRemoveResult{}, err
 	}
 	removedSessions, err := s.removeProjectSessions(project.ID)
 	if err != nil {
@@ -1501,6 +1525,30 @@ func (s *Service) removeProjectSessions(projectID string) (int, error) {
 		removed++
 	}
 	return removed, nil
+}
+
+func (s *Service) ensureProjectSessionsIdle(projectID string) error {
+	projectID = strings.TrimSpace(projectID)
+	if projectID == "" || s == nil || s.sessionStore == nil {
+		return nil
+	}
+	infos, err := s.sessionStore.ListWithOptions(sessions.V2ListOptions{All: true})
+	if err != nil {
+		return err
+	}
+	for _, info := range infos {
+		if info.ProjectID != projectID {
+			continue
+		}
+		session, err := s.sessionStore.Load(info.ID)
+		if err != nil {
+			return err
+		}
+		if strings.TrimSpace(session.RunningTurnID) != "" {
+			return ErrSessionBusy
+		}
+	}
+	return nil
 }
 
 func applySessionCreateMetadata(session sessions.SessionV2, metadata SessionCreateMetadata) sessions.SessionV2 {

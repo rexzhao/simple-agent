@@ -192,6 +192,30 @@ func TestServerProjectSessionAndRunFlow(t *testing.T) {
 	if restored.Archived {
 		t.Fatalf("restored session remains archived: %#v", restored)
 	}
+
+	renamedProjectResponse := doJSONRequest(t, http.MethodPatch, server.URL+"/api/projects/"+projectResult.Project.ID, map[string]string{"display_name": "Renamed Web Test"})
+	if renamedProjectResponse.StatusCode != http.StatusOK {
+		t.Fatalf("PATCH project status = %d body=%s", renamedProjectResponse.StatusCode, readBody(renamedProjectResponse))
+	}
+	var renamedProject execution.Project
+	decodeResponse(t, renamedProjectResponse, &renamedProject)
+	if renamedProject.DisplayName != "Renamed Web Test" {
+		t.Fatalf("renamed project = %#v", renamedProject)
+	}
+	archivedProjectResponse := doJSONRequest(t, http.MethodPost, server.URL+"/api/projects/"+projectResult.Project.ID+"/archive", map[string]string{})
+	if archivedProjectResponse.StatusCode != http.StatusOK {
+		t.Fatalf("POST archive project status = %d body=%s", archivedProjectResponse.StatusCode, readBody(archivedProjectResponse))
+	}
+	archivedProjectResponse.Body.Close()
+	restoredProjectResponse := doJSONRequest(t, http.MethodPost, server.URL+"/api/projects/"+projectResult.Project.ID+"/restore", map[string]string{})
+	if restoredProjectResponse.StatusCode != http.StatusOK {
+		t.Fatalf("POST restore project status = %d body=%s", restoredProjectResponse.StatusCode, readBody(restoredProjectResponse))
+	}
+	var restoredProject execution.Project
+	decodeResponse(t, restoredProjectResponse, &restoredProject)
+	if restoredProject.Archived {
+		t.Fatalf("restored project remains archived: %#v", restoredProject)
+	}
 }
 
 func TestServerCancelsRun(t *testing.T) {

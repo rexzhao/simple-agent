@@ -2,7 +2,7 @@ import { memo, useState } from 'react'
 import type { Project, Session } from '../types'
 import { projectName, sessionName } from '../lib/session'
 import { relativeTime } from '../lib/format'
-import { ArchiveIcon, ChatIcon, ChevronIcon, LogoIcon, PlusIcon, RestoreIcon, SettingsIcon, TrashIcon } from './icons'
+import { ArchiveIcon, ChatIcon, ChevronIcon, EditIcon, LogoIcon, PlusIcon, RestoreIcon, SettingsIcon, TrashIcon } from './icons'
 
 export const WorkspaceTree = memo(function WorkspaceTree(props: {
   projects: Project[]
@@ -16,6 +16,9 @@ export const WorkspaceTree = memo(function WorkspaceTree(props: {
   onSelectSession: (projectID: string, sessionID: string) => void
   onCreateSession: (projectID: string) => void
   onManageProviders: () => void
+  onRenameProject: (project: Project) => void
+  onDeleteProject: (project: Project) => void
+  onRenameSession: (session: Session) => void
   onArchiveSession: (session: Session) => void
   onRestoreSession: (session: Session) => void
   onDeleteSession: (session: Session) => void
@@ -67,10 +70,23 @@ export const WorkspaceTree = memo(function WorkspaceTree(props: {
                 </button>
                 <button
                   className="tree-icon-button"
+                  onClick={() => props.onRenameProject(project)}
+                  aria-label={`Rename ${projectName(project)}`}
+                  title="Rename project"
+                ><EditIcon /></button>
+                <button
+                  className="tree-icon-button"
                   onClick={() => props.onCreateSession(project.id)}
                   aria-label={`New session in ${projectName(project)}`}
                   title="New session"
                 ><PlusIcon /></button>
+                <button
+                  className="tree-icon-button danger"
+                  disabled={sessions.some((session) => session.status === 'running' || props.runningSessionIDs.has(session.id))}
+                  onClick={() => props.onDeleteProject(project)}
+                  aria-label={`Delete ${projectName(project)}`}
+                  title="Delete project and sessions"
+                ><TrashIcon /></button>
               </div>
               <div className="session-tree" role="group" aria-label={`Sessions of ${projectName(project)}`}>
                 {visibleSessions.map((session) => (
@@ -87,6 +103,7 @@ export const WorkspaceTree = memo(function WorkspaceTree(props: {
 					  {(session.status === 'running' || props.runningSessionIDs.has(session.id)) && <span className="live-dot" />}
                     </button>
                     <div className="session-tree-actions">
+                      <button disabled={session.status === 'running' || props.runningSessionIDs.has(session.id)} onClick={() => props.onRenameSession(session)} aria-label={`Rename ${sessionName(session)}`} title="Rename"><EditIcon /></button>
                       <button disabled={session.status === 'running' || props.runningSessionIDs.has(session.id)} onClick={() => props.onArchiveSession(session)} aria-label={`Archive ${sessionName(session)}`} title="Archive"><ArchiveIcon /></button>
                       <button className="danger" disabled={session.status === 'running' || props.runningSessionIDs.has(session.id)} onClick={() => props.onDeleteSession(session)} aria-label={`Delete ${sessionName(session)}`} title="Delete"><TrashIcon /></button>
                     </div>

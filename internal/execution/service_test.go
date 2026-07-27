@@ -117,6 +117,16 @@ func TestServiceProjectLifecycleRules(t *testing.T) {
 	if _, err := service.RenameProject(result.Project.ID, "Renamed"); err == nil || !strings.Contains(err.Error(), "archived project cannot be renamed") {
 		t.Fatalf("RenameProject(archived) error = %v, want archived rejection", err)
 	}
+	restored, err := service.RestoreProject(result.Project.ID)
+	if err != nil {
+		t.Fatalf("RestoreProject() error = %v", err)
+	}
+	if restored.Archived {
+		t.Fatalf("RestoreProject() archived = true: %#v", restored)
+	}
+	if _, err := service.RenameProject(result.Project.ID, "Restored"); err != nil {
+		t.Fatalf("RenameProject(restored) error = %v", err)
+	}
 }
 
 func TestServiceRemoveProjectDeletesProjectSessions(t *testing.T) {
@@ -173,6 +183,39 @@ func TestServiceRemoveProjectDeletesProjectSessions(t *testing.T) {
 	}
 	if _, err := service.GetProject(project.Project.ID); !errors.Is(err, projectstore.ErrNotFound) {
 		t.Fatalf("GetProject(removed) error = %v, want ErrNotFound", err)
+	}
+}
+
+func TestServiceProjectArchiveAndRemoveRejectRunningSession(t *testing.T) {
+	service, err := NewService(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewService() error = %v", err)
+	}
+	project, err := service.CreateProject(mkdirProjectRoot(t, "running-project"), "Running")
+	if err != nil {
+		t.Fatalf("CreateProject() error = %v", err)
+	}
+	session, err := service.CreateSession(project.Project.ID, SessionCreateMetadata{CreatedCWD: project.Project.Root})
+	if err != nil {
+		t.Fatalf("CreateSession() error = %v", err)
+	}
+	stored, err := service.sessionStore.Load(session.ID)
+	if err != nil {
+		t.Fatalf("Load(session) error = %v", err)
+	}
+	stored.RunningTurnID = "turn-running"
+	stored.RunningStartedAt = time.Now().UTC()
+	if _, err := service.sessionStore.SaveMetadata(stored); err != nil {
+		t.Fatalf("SaveMetadata(running session) error = %v", err)
+	}
+	if _, err := service.ArchiveProject(project.Project.ID); !errors.Is(err, ErrSessionBusy) {
+		t.Fatalf("ArchiveProject() error = %v, want ErrSessionBusy", err)
+	}
+	if _, err := service.projectStore.Archive(project.Project.ID); err != nil {
+		t.Fatalf("projectStore.Archive() error = %v", err)
+	}
+	if _, err := service.RemoveProject(project.Project.ID); !errors.Is(err, ErrSessionBusy) {
+		t.Fatalf("RemoveProject() error = %v, want ErrSessionBusy", err)
 	}
 }
 

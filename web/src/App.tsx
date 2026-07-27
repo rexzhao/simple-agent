@@ -3,7 +3,7 @@ import { api, streamRun } from './api'
 import type { ActiveRun, ActiveRunDescriptor, Bootstrap, ImageAttachmentInput, Project, RunEvent, RunStep, Session, SessionModelOption } from './types'
 import { errorMessage } from './lib/format'
 import { reduceRunEvent } from './lib/runEventReducer'
-import { modelKey, orderSessions, processKey, sessionName } from './lib/session'
+import { modelKey, orderSessions, processKey, projectName, sessionName } from './lib/session'
 import { emptyComposerDraft } from './components/Composer'
 import type { PastedImageAttachment } from './components/Composer'
 import { Conversation } from './components/Conversation'
@@ -190,6 +190,71 @@ function App() {
     setSelectedSessionID(sessionID)
     setShowProjectForm(false)
   }, [setSelectedProjectID, setSelectedSessionID])
+
+  const renameProject = useCallback(async (project: Project) => {
+    const displayName = window.prompt('Rename project', projectName(project))
+    if (displayName === null || displayName.trim() === project.display_name) return
+    if (!displayName.trim()) {
+      setError('Project name cannot be empty')
+      return
+    }
+    try {
+      await api.renameProject(project.id, displayName.trim())
+      await loadProjects()
+    } catch (reason) {
+      setError(errorMessage(reason))
+    }
+  }, [loadProjects])
+
+  const deleteProject = useCallback(async (project: Project) => {
+    const activeSessions = sessionsByProject[project.id] ?? []
+    const archivedSessions = archivedSessionsByProject[project.id] ?? []
+    if (activeSessions.some((session) => session.status === 'running' || Boolean(activeRunsRef.current[session.id]))) return
+    const sessionCount = activeSessions.length + archivedSessions.length
+    const message = `Permanently delete "${projectName(project)}" and ${sessionCount} saved ${sessionCount === 1 ? 'session' : 'sessions'}? All session history and attachments for this project will be removed. This action cannot be undone.`
+    if (!window.confirm(message)) return
+    let archived = false
+    try {
+      await api.archiveProject(project.id)
+      archived = true
+      await api.deleteProject(project.id)
+      const remaining = await loadProjects()
+      const nextProject = remaining[0]
+      setSelectedProjectID(nextProject?.id ?? '')
+      setSelectedSessionID(nextProject ? sessionsByProject[nextProject.id]?.[0]?.id ?? '' : '')
+      setShowProjectForm(remaining.length === 0)
+    } catch (reason) {
+      if (archived) {
+        try {
+          await api.restoreProject(project.id)
+        } catch {
+          // Preserve the original removal error.
+        }
+      }
+      try {
+        await loadProjects()
+      } catch {
+        // Preserve the original removal error.
+      }
+      setError(errorMessage(reason))
+    }
+  }, [activeRunsRef, archivedSessionsByProject, loadProjects, sessionsByProject, setSelectedProjectID, setSelectedSessionID])
+
+  const renameSession = useCallback(async (session: Session) => {
+    const displayName = window.prompt('Rename session', sessionName(session))
+    if (displayName === null || displayName.trim() === session.display_name) return
+    if (!displayName.trim()) {
+      setError('Session name cannot be empty')
+      return
+    }
+    try {
+      await api.renameSession(session.id, displayName.trim())
+      await loadSessions(session.project_id, session.id)
+      if (selectedSessionRef.current === session.id) await refreshSession(session.id)
+    } catch (reason) {
+      setError(errorMessage(reason))
+    }
+  }, [loadSessions, refreshSession, selectedSessionRef])
 
   const archiveSession = useCallback(async (session: Session) => {
     if (session.status === 'running' || Boolean(activeRunsRef.current[session.id]) || !window.confirm(`Archive "${sessionName(session)}"? It will be hidden from the current list.`)) return
@@ -411,6 +476,9 @@ function App() {
         onSelectSession={selectSession}
         onCreateSession={openSessionCreator}
         onManageProviders={openProviderManager}
+        onRenameProject={renameProject}
+        onDeleteProject={deleteProject}
+        onRenameSession={renameSession}
         onArchiveSession={archiveSession}
         onRestoreSession={restoreSession}
         onDeleteSession={deleteSession}
