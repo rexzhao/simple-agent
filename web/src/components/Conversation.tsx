@@ -326,6 +326,7 @@ function ActiveRunView({ run }: { run: ActiveRun }) {
 // segment. The streaming text and token note live in the trailing segment.
 function ActiveRunBody({ run }: { run: ActiveRun }) {
   const segments = useMemo(() => buildActiveRunSegments(run.steps), [run.steps])
+  const displaySegments = segments.length > 0 ? segments : [{ kind: 'steps' as const, steps: [] }]
 
   const trailing = run.assistantText || run.totalTokens !== undefined || segments.length === 0
   const tokenNote = run.totalTokens !== undefined && (
@@ -339,8 +340,8 @@ function ActiveRunBody({ run }: { run: ActiveRun }) {
 
   return (
     <>
-      {segments.map((segment, index) => {
-        const isLast = index === segments.length - 1
+      {displaySegments.map((segment, index) => {
+        const isLast = index === displaySegments.length - 1
         if (segment.kind === 'user') return <article className="message user transient" key={segment.step.id}><div className="message-content"><div className="message-text">{segment.step.text}</div></div></article>
         return <article className="message assistant transient" key={`steps-${index}`}><div className="message-content">
           {isLast && <div className="message-meta"><span className="streaming-label"><i />Generating</span></div>}

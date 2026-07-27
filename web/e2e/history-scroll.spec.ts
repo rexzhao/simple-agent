@@ -21,7 +21,7 @@ async function mockApp(page: Page, olderGate?: Promise<void>) {
     let body: unknown
     if (url.pathname === '/api/bootstrap') body = { version: 'e2e', cwd: '/fixture', server_root: '/fixture', config_path: '/fixture/config' }
     else if (url.pathname === '/api/projects') body = { projects: [project] }
-    else if (url.pathname === `/api/projects/${project.id}/sessions`) body = { sessions: [session] }
+    else if (url.pathname === `/api/projects/${project.id}/sessions`) body = { sessions: url.searchParams.get('archived') === 'true' ? [] : [session] }
     else if (url.pathname === '/api/runs/active') body = { runs: [] }
     else if (url.pathname === `/api/sessions/${session.id}`) body = session
     else if (url.pathname === `/api/sessions/${session.id}/items`) {
