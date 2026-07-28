@@ -311,6 +311,13 @@ func (run *CoordinatedSessionRun) AppendActive(content string) error {
 	return run.run.AppendActive(content)
 }
 
+func (run *CoordinatedSessionRun) TrySteer(content string) error {
+	if run == nil || run.run == nil {
+		return ErrSessionNotSteerable
+	}
+	return run.run.TrySteer(content)
+}
+
 func (run *CoordinatedSessionRun) RemoveActive(promptID string) bool {
 	return run != nil && run.run != nil && run.run.RemoveActive(promptID)
 }

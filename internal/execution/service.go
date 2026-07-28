@@ -272,6 +272,10 @@ var (
 	ErrTurnRunnerUnavailable = errors.New("turn runner is not configured")
 	ErrTurnFailed            = errors.New("turn failed")
 	ErrSessionRunSettled     = errors.New("session run is no longer accepting prompts")
+	// ErrSessionNotSteerable means there is no active turn whose strict steer
+	// gate is still open. Unlike Web AppendActive, strict agent steer never
+	// falls back to a follow-up turn.
+	ErrSessionNotSteerable   = errors.New("session has no active turn accepting steer messages")
 	ErrUnsupportedModelInput = errors.New("model does not support the requested input")
 )
 
@@ -758,7 +762,11 @@ type SessionRun struct {
 	activeQueue  []activePrompt
 	activeTurnID string
 	activeEmit   func(SessionStreamEvent)
-	nextPromptID int
+	// steerAccepting is scoped to activeTurnID. The terminal checkpoint seals
+	// it atomically when no already-accepted prompt remains. Web AppendActive
+	// intentionally ignores this gate and keeps its no-loss follow-up policy.
+	steerAccepting bool
+	nextPromptID   int
 }
 
 // activePrompt is one queued append-active prompt with a stable id so clients
@@ -766,6 +774,7 @@ type SessionRun struct {
 type activePrompt struct {
 	ID      string `json:"id"`
 	Content string `json:"content"`
+	strict  bool
 }
 
 // StartSessionRun begins running the session message orchestration for id in a
@@ -800,12 +809,11 @@ func (s *Service) StartSessionRunWithInput(ctx context.Context, id string, input
 		defer close(run.done)
 		result, err := s.runSessionMessageWithActive(runCtx, run, id, input, emit)
 		if err == nil {
-			// After the active turn settles, send any prompts still queued via
-			// AppendActive as a follow-up turn so they are never dropped. The
-			// drain may already have consumed some into the active turn; only
-			// the remainder is still in the queue. Drain while the emit path is
-			// still registered so the emptied snapshot is published.
-			remaining := run.drainActiveQueue()
+			// After the active turn settles, send any Web no-loss appends still
+			// queued via AppendActive as a follow-up turn. Strict agent steers
+			// are never converted into follow-up work. Drain while the emit path
+			// is still registered so the emptied snapshot is published.
+			remaining := run.drainFollowUpQueue()
 			run.clearActiveTurn()
 			if len(remaining) > 0 {
 				followInput := SessionMessageInput{Content: strings.Join(remaining, "\n\n")}
@@ -899,6 +907,33 @@ func (r *SessionRun) AppendActive(content string) error {
 	return nil
 }
 
+// TrySteer strictly appends content to the currently active turn. It is the
+// agent-facing counterpart to AppendActive: once the active turn's terminal
+// checkpoint seals steer acceptance, TrySteer returns
+// ErrSessionNotSteerable and never converts the message into a follow-up turn.
+func (r *SessionRun) TrySteer(content string) error {
+	if r == nil {
+		return ErrSessionNotSteerable
+	}
+	if strings.TrimSpace(content) == "" {
+		return fmt.Errorf("steer content must be a non-empty string")
+	}
+	r.mu.Lock()
+	if !r.accepting || strings.TrimSpace(r.activeTurnID) == "" || !r.steerAccepting {
+		r.mu.Unlock()
+		return ErrSessionNotSteerable
+	}
+	r.nextPromptID++
+	r.activeQueue = append(r.activeQueue, activePrompt{
+		ID:      fmt.Sprintf("ap-%d", r.nextPromptID),
+		Content: content,
+		strict:  true,
+	})
+	r.publishQueueSnapshotLocked()
+	r.mu.Unlock()
+	return nil
+}
+
 // RemoveActive deletes a not-yet-sent queued prompt by id and publishes the
 // updated snapshot. It reports whether a prompt with that id was present; a
 // missing id (already sent or never queued) is a no-op returning false. Only
@@ -941,6 +976,7 @@ func (r *SessionRun) setActiveTurn(turnID string, emit func(SessionStreamEvent))
 	r.mu.Lock()
 	r.activeTurnID = turnID
 	r.activeEmit = emit
+	r.steerAccepting = strings.TrimSpace(turnID) != ""
 	r.mu.Unlock()
 }
 
@@ -950,17 +986,60 @@ func (r *SessionRun) clearActiveTurn() {
 	r.mu.Lock()
 	r.activeTurnID = ""
 	r.activeEmit = nil
+	r.steerAccepting = false
 	r.mu.Unlock()
 }
 
 // drainActiveQueue removes and returns every queued active prompt, publishing
-// an empty snapshot. It returns nil when the queue is already empty. The run
-// goroutine uses it both to inject prompts into the active turn and to gather
-// the remainder for a follow-up turn; AppendActive uses the returned contents
-// verbatim and never reorders them.
+// an empty snapshot. The failure/cancellation path uses it to clear all
+// pending Web appends and strict steers without scheduling follow-up work.
 func (r *SessionRun) drainActiveQueue() []string {
 	r.mu.Lock()
 	if len(r.activeQueue) == 0 {
+		r.mu.Unlock()
+		return nil
+	}
+	drained := make([]string, 0, len(r.activeQueue))
+	for _, prompt := range r.activeQueue {
+		drained = append(drained, prompt.Content)
+	}
+	r.activeQueue = nil
+	r.publishQueueSnapshotLocked()
+	r.mu.Unlock()
+	return drained
+}
+
+// drainFollowUpQueue drains only Web no-loss appends for follow-up delivery.
+// Any strict steer left behind by a failed/non-conforming turn runner is
+// removed but is never silently converted into a new turn.
+func (r *SessionRun) drainFollowUpQueue() []string {
+	r.mu.Lock()
+	if len(r.activeQueue) == 0 {
+		r.mu.Unlock()
+		return nil
+	}
+	drained := make([]string, 0, len(r.activeQueue))
+	for _, prompt := range r.activeQueue {
+		if !prompt.strict {
+			drained = append(drained, prompt.Content)
+		}
+	}
+	r.activeQueue = nil
+	r.publishQueueSnapshotLocked()
+	r.mu.Unlock()
+	return drained
+}
+
+// drainActiveQueueAtCheckpoint is the strict-steer linearization point. At a
+// terminal checkpoint an empty queue seals the active turn before returning;
+// a racing TrySteer therefore either lands in the queue and is drained into
+// this turn, or observes the sealed gate and fails explicitly.
+func (r *SessionRun) drainActiveQueueAtCheckpoint(checkpoint SessionActivePromptCheckpoint) []string {
+	r.mu.Lock()
+	if len(r.activeQueue) == 0 {
+		if checkpoint == SessionActivePromptCheckpointBeforeTerminal {
+			r.steerAccepting = false
+		}
 		r.mu.Unlock()
 		return nil
 	}
@@ -979,8 +1058,8 @@ func (r *SessionRun) drainActiveQueue() []string {
 // model.Message values with role user; the agent loop persists each with the
 // shared turn id before appending it to the in-flight history.
 func (r *SessionRun) activePromptDrain() SessionActivePromptDrain {
-	return func(SessionActivePromptCheckpoint) []model.Message {
-		drained := r.drainActiveQueue()
+	return func(checkpoint SessionActivePromptCheckpoint) []model.Message {
+		drained := r.drainActiveQueueAtCheckpoint(checkpoint)
 		if len(drained) == 0 {
 			return nil
 		}
