@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -36,7 +35,7 @@ var (
 	// ErrRunRegistryCapacity means the local Web application is already running
 	// the maximum number of concurrent session runs. It prevents many active
 	// runs from multiplying the bounded per-run replay buffer allocation.
-	ErrRunRegistryCapacity = errors.New("web run registry is at its concurrent run limit")
+	ErrRunRegistryCapacity = execution.ErrSessionRunCoordinatorCapacity
 	ErrRunRegistryClosed   = errors.New("web run registry is closed")
 )
 
@@ -76,23 +75,23 @@ func (o runRegistryOptions) withDefaults() runRegistryOptions {
 }
 
 type runRegistry struct {
-	ctx     context.Context
-	service *execution.Service
-	log     io.Writer
-	logMu   sync.Mutex
-	options runRegistryOptions
+	ctx         context.Context
+	service     *execution.Service
+	coordinator *execution.SessionRunCoordinator
+	log         io.Writer
+	logMu       sync.Mutex
+	options     runRegistryOptions
 
-	mu              sync.Mutex
-	closed          bool
-	byID            map[string]*managedRun
-	activeBySession map[string]*managedRun
-	terminalTimers  map[string]*time.Timer
+	mu             sync.Mutex
+	closed         bool
+	byID           map[string]*managedRun
+	terminalTimers map[string]*time.Timer
 }
 
 type managedRun struct {
 	id        string
 	sessionID string
-	run       *execution.SessionRun
+	run       *execution.CoordinatedSessionRun
 
 	mu            sync.Mutex
 	events        []runEvent
@@ -132,14 +131,15 @@ func newRunRegistryWithOptions(ctx context.Context, service *execution.Service, 
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	resolvedOptions := options.withDefaults()
 	return &runRegistry{
-		ctx:             ctx,
-		service:         service,
-		log:             logWriter,
-		options:         options.withDefaults(),
-		byID:            make(map[string]*managedRun),
-		activeBySession: make(map[string]*managedRun),
-		terminalTimers:  make(map[string]*time.Timer),
+		ctx:            ctx,
+		service:        service,
+		coordinator:    execution.NewSessionRunCoordinator(ctx, service, execution.SessionRunCoordinatorOptions{MaxConcurrentRuns: resolvedOptions.MaxConcurrentRuns}),
+		log:            logWriter,
+		options:        resolvedOptions,
+		byID:           make(map[string]*managedRun),
+		terminalTimers: make(map[string]*time.Timer),
 	}
 }
 
@@ -166,31 +166,28 @@ func (r *runRegistry) startWithInput(sessionID string, input execution.SessionMe
 	if strings.TrimSpace(input.Content) == "" && len(input.ContentBlocks) == 0 {
 		return nil, fmt.Errorf("message content or image attachment is required")
 	}
-	id, err := randomID("run-")
-	if err != nil {
-		return nil, err
-	}
-	managed := newManagedRun(id, sessionID, r.options)
-
 	r.mu.Lock()
 	if r.closed {
 		r.mu.Unlock()
 		return nil, ErrRunRegistryClosed
 	}
-	if existing := r.activeBySession[sessionID]; existing != nil {
-		if existing.run.Status() == execution.SessionRunRunning {
-			r.mu.Unlock()
-			return nil, execution.ErrSessionBusy
-		}
-		delete(r.activeBySession, sessionID)
+	r.mu.Unlock()
+
+	managed := newManagedRun("", sessionID, r.options)
+	coordinated, err := r.coordinator.Start(sessionID, input, managed.append)
+	if err != nil {
+		return nil, err
 	}
-	if len(r.activeBySession) >= r.options.MaxConcurrentRuns {
+	managed.id = coordinated.ID()
+	managed.run = coordinated
+
+	r.mu.Lock()
+	if r.closed {
 		r.mu.Unlock()
-		return nil, ErrRunRegistryCapacity
+		coordinated.Cancel()
+		return nil, ErrRunRegistryClosed
 	}
-	managed.run = r.service.StartSessionRunWithInput(r.ctx, sessionID, input, managed.append)
-	r.byID[id] = managed
-	r.activeBySession[sessionID] = managed
+	r.byID[managed.id] = managed
 	r.mu.Unlock()
 
 	go r.await(managed)
@@ -218,9 +215,6 @@ func (r *runRegistry) await(managed *managedRun) {
 	managed.finish(r.options.Now().UTC())
 
 	r.mu.Lock()
-	if r.activeBySession[managed.sessionID] == managed {
-		delete(r.activeBySession, managed.sessionID)
-	}
 	if !r.closed && r.byID[managed.id] == managed {
 		r.retainTerminalLocked(managed)
 	}
@@ -300,8 +294,8 @@ func (r *runRegistry) Close() {
 		return
 	}
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	if r.closed {
+		r.mu.Unlock()
 		return
 	}
 	r.closed = true
@@ -310,7 +304,9 @@ func (r *runRegistry) Close() {
 	}
 	r.terminalTimers = make(map[string]*time.Timer)
 	r.byID = make(map[string]*managedRun)
-	r.activeBySession = make(map[string]*managedRun)
+	coordinator := r.coordinator
+	r.mu.Unlock()
+	coordinator.Close()
 }
 
 func (r *runRegistry) logRunFailure(managed *managedRun, err error) {
@@ -333,32 +329,18 @@ func (r *runRegistry) get(id string) (*managedRun, bool) {
 }
 
 func (r *runRegistry) activeRuns() []activeRunSnapshot {
-	if r == nil {
+	if r == nil || r.coordinator == nil {
 		return []activeRunSnapshot{}
 	}
-	r.mu.Lock()
-	if r.closed {
-		r.mu.Unlock()
-		return []activeRunSnapshot{}
+	descriptors := r.coordinator.ActiveRuns()
+	active := make([]activeRunSnapshot, 0, len(descriptors))
+	for _, descriptor := range descriptors {
+		active = append(active, activeRunSnapshot{
+			RunID: descriptor.RunID, SessionID: descriptor.SessionID,
+			TurnID: descriptor.TurnID, StartedAt: descriptor.StartedAt,
+			Status: descriptor.Status,
+		})
 	}
-	managedRuns := make([]*managedRun, 0, len(r.activeBySession))
-	for _, managed := range r.activeBySession {
-		managedRuns = append(managedRuns, managed)
-	}
-	r.mu.Unlock()
-
-	active := make([]activeRunSnapshot, 0, len(managedRuns))
-	for _, managed := range managedRuns {
-		if snapshot, ok := managed.activeSnapshot(); ok {
-			active = append(active, snapshot)
-		}
-	}
-	sort.Slice(active, func(i, j int) bool {
-		if active[i].StartedAt.Equal(active[j].StartedAt) {
-			return active[i].RunID < active[j].RunID
-		}
-		return active[i].StartedAt.Before(active[j].StartedAt)
-	})
 	return active
 }
 

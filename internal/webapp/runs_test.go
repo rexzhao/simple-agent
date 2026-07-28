@@ -2,7 +2,6 @@ package webapp
 
 import (
 	"context"
-	"errors"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -64,16 +63,9 @@ func TestManagedRunFinishCollapsesReplayToSettledEvent(t *testing.T) {
 	}
 }
 
-func TestRunRegistryRejectsRunsAboveConcurrentLimit(t *testing.T) {
-	registry := newRunRegistryWithOptions(context.Background(), nil, nil, runRegistryOptions{MaxConcurrentRuns: 1})
-	defer registry.Close()
-	registry.mu.Lock()
-	registry.activeBySession["already-running"] = newManagedRun("run-active", "already-running", registry.options)
-	registry.mu.Unlock()
-
-	_, err := registry.start("another-session", "hello")
-	if !errors.Is(err, ErrRunRegistryCapacity) {
-		t.Fatalf("start() error = %v, want ErrRunRegistryCapacity", err)
+func TestRunRegistryUsesExecutionCoordinatorCapacityError(t *testing.T) {
+	if ErrRunRegistryCapacity != execution.ErrSessionRunCoordinatorCapacity {
+		t.Fatalf("ErrRunRegistryCapacity = %v, want execution coordinator capacity error", ErrRunRegistryCapacity)
 	}
 }
 
