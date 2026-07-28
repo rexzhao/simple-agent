@@ -34,7 +34,7 @@ never included in tool results.
 | Tool | Purpose | Important limits |
 | --- | --- | --- |
 | `session_models` | List configured provider/model profiles that `session_start` can select. | No arguments; secrets are omitted. |
-| `session_start` | Create a child session and asynchronously start its first turn. | Name: 120 Unicode characters; maximum lineage depth: 4. |
+| `session_start` | Create a leaf-worker child session and asynchronously start its first turn. | Name: 120 Unicode characters; the child cannot start or send to sessions. |
 | `session_search` | Match canonical session names with a Go RE2 regular expression. | Default 20 results; maximum 100. |
 | `session_get` | Read session state and its latest relevant persisted assistant item. | Default output limit 64 Ki characters; maximum 256 Ki. |
 | `session_history` | Read a page of persisted, user-visible conversation items. | Default 50 items; maximum 200. |
@@ -58,9 +58,10 @@ A minimal start inherits the caller's exact frozen runtime snapshot:
 ```
 
 When `provider`, `model`, and `reasoning_level` are all omitted, the child
-inherits the caller's provider, model ID, model parameters, enabled tools, MCP
-servers, skills, reasoning visibility, context-window limit, and working
-directory. It starts with fresh history and fresh token usage.
+inherits the caller's provider, model ID, model parameters, MCP servers, skills,
+reasoning visibility, context-window limit, working directory, and enabled
+tools except `session_start` and `session_send`. It starts with fresh history
+and fresh token usage.
 
 To use another configured model, first call `session_models`, then provide both
 profile selectors:
@@ -84,8 +85,15 @@ Every tool-created session records:
 
 - `parent_session_id`: the calling session;
 - `root_session_id`: the root of the lineage;
-- `spawn_depth`: root is 0 and the deepest child is 4;
+- `spawn_depth`: root is 0 and a normal tool-created leaf child is 1;
 - `created_by: "agent"`.
+
+Agent-created children are deliberately leaf workers. Both inherited-model and
+explicit-model children have `session_start` and `session_send` removed from
+their frozen capability snapshot. The runtime repeats this filtering for child
+sessions saved by older releases, so stale metadata cannot restore either
+tool. The existing maximum-depth check remains as defense for legacy data and
+non-tool service callers.
 
 The result returns `session_id` and `run_id` immediately; completion is observed
 with `session_get` or `session_wait`. If durable session creation succeeds but
@@ -232,5 +240,5 @@ Agent-created sessions use the same global run coordinator as Web-created
 runs. Their stream events, cancellation, active-run recovery, and replay are
 therefore visible through the existing Web runtime. The workspace navigation
 renders `parent_session_id` relationships as a tree, labels agent-created
-nodes, and preserves orphaned nodes as roots if an older/missing parent cannot
-be loaded.
+nodes, allows every parent branch to collapse or expand its children, and
+preserves orphaned nodes as roots if an older/missing parent cannot be loaded.

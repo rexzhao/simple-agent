@@ -224,6 +224,23 @@ func enabledSessionToolSchemas(enabled []string) []model.Tool {
 	return schemas
 }
 
+// enabledToolsForAgentChild turns an agent-created child into a leaf worker.
+// It may inspect and wait on project sessions, but it cannot recursively spawn
+// work or inject input into another session. The runtime applies this filter as
+// well as session creation so children persisted by older releases are covered.
+func enabledToolsForAgentChild(enabled []string) []string {
+	filtered := make([]string, 0, len(enabled))
+	for _, name := range enabled {
+		switch name {
+		case ToolSessionStart, ToolSessionSend:
+			continue
+		default:
+			filtered = append(filtered, name)
+		}
+	}
+	return filtered
+}
+
 type sessionToolExecutor struct {
 	service     *Service
 	coordinator *SessionRunCoordinator

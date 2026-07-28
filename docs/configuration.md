@@ -310,9 +310,12 @@ fails once that turn stops accepting input) and a separate next-turn `queue`.
 uncommitted streaming deltas. `session_history` returns paginated,
 user-visible persisted conversation items. Session tools cannot query sessions
 in another project, wait for or stop their own run, or spawn beyond the bounded
-child depth. See [Agent session orchestration](agent-session-orchestration.md)
-for the complete tool arguments, output semantics, concurrency behavior,
-limits, and stable error codes.
+child depth. Agent-created children are leaf workers: `session_start` and
+`session_send` are removed from their capability snapshots even when those
+tools are enabled for root sessions. See
+[Agent session orchestration](agent-session-orchestration.md) for the complete
+tool arguments, output semantics, concurrency behavior, limits, and stable
+error codes.
 
 ## MCP tool sources
 

@@ -192,6 +192,25 @@ svg { width: 1.1em; height: 1.1em; fill: none; stroke: currentColor; stroke-widt
 .session-tree-row { position: relative; min-width: 0; display: flex; align-items: center; border: 2px solid transparent; }
 .session-tree-row:hover { border-color: var(--border); background: #ffffff; box-shadow: var(--shadow-1); }
 .session-tree-row.selected { border-color: var(--border); color: #ffffff; background: #111111; box-shadow: var(--shadow-1); }
+.session-branch-toggle, .session-branch-toggle-spacer {
+  width: 18px;
+  height: 25px;
+  flex: 0 0 18px;
+}
+.session-branch-toggle {
+  display: grid;
+  place-items: center;
+  padding: 0;
+  border: 0;
+  color: var(--muted);
+  background: transparent;
+  cursor: pointer;
+}
+.session-branch-toggle:hover { color: var(--text); background: var(--accent); }
+.session-tree-row.selected .session-branch-toggle { color: #ffffff; }
+.session-tree-row.selected .session-branch-toggle:hover { color: #111111; }
+.session-branch-toggle svg { width: 13px; height: 13px; transform: rotate(-90deg); }
+.session-branch-toggle svg.expanded { transform: none; }
 .session-tree-button { flex: 1; gap: 8px; padding: 7px 4px 7px 6px; }
 .session-tree-button:disabled { cursor: default; opacity: .5; }
 .session-tree-row.selected .session-tree-button { color: #ffffff; }

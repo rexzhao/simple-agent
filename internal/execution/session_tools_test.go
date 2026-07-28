@@ -54,6 +54,13 @@ func TestSessionToolDefinitionsAndExplicitSelection(t *testing.T) {
 	if len(sessionSchemas) != 2 || sessionSchemas[0].Name != ToolSessionGet || sessionSchemas[1].Name != ToolSessionStart {
 		t.Fatalf("session schema selection = %#v", sessionSchemas)
 	}
+	childTools := enabledToolsForAgentChild([]string{
+		"read_file", ToolSessionStart, ToolSessionSearch, ToolSessionSend, ToolSessionWait,
+	})
+	wantChildTools := []string{"read_file", ToolSessionSearch, ToolSessionWait}
+	if !reflect.DeepEqual(childTools, wantChildTools) {
+		t.Fatalf("enabledToolsForAgentChild() = %#v, want %#v", childTools, wantChildTools)
+	}
 
 	dispatch := runToolExecutor{
 		sessionTools:        &sessionToolExecutor{},
@@ -164,6 +171,9 @@ func TestSessionToolsStartInspectQueueAndWait(t *testing.T) {
 	}
 	if child.Provider != parent.Provider || child.ModelProfile != parent.ModelProfile || child.ModelID != parent.ModelID || canonicalTestJSON(t, child.ModelParameters) != canonicalTestJSON(t, parent.ModelParameters) {
 		t.Fatalf("child model snapshot = %#v, want parent %#v", child, parent)
+	}
+	if want := []string{ToolSessionGet, ToolSessionWait}; !reflect.DeepEqual(child.EnabledTools, want) {
+		t.Fatalf("child enabled tools = %#v, want leaf-worker tools %#v", child.EnabledTools, want)
 	}
 	if child.Context.LastTotalTokens != 0 || child.Context.ContextWindow != parent.Context.ContextWindow {
 		t.Fatalf("child context = %#v, want fresh usage with inherited window", child.Context)
@@ -582,6 +592,9 @@ models:
 	}
 	if child.ParentSessionID != parent.ID || child.Provider != "fake" || child.ModelProfile != "precise" || child.ModelID != "fake-precise" || child.ReasoningLevel != "low" {
 		t.Fatalf("explicit child = %#v", child)
+	}
+	if want := []string{ToolSessionModels}; !reflect.DeepEqual(child.EnabledTools, want) {
+		t.Fatalf("explicit child enabled tools = %#v, want %#v", child.EnabledTools, want)
 	}
 }
 

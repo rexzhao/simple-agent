@@ -201,6 +201,9 @@ func (r AgentTurnRunner) prepareRuntime(ctx context.Context, session sessions.Se
 	}
 
 	enabledToolNames := copyStringSlice(session.EnabledTools)
+	if strings.TrimSpace(session.ParentSessionID) != "" {
+		enabledToolNames = enabledToolsForAgentChild(enabledToolNames)
+	}
 	toolRegistry, toolSchemas, err := enabledToolsForRun(cwd, enabledToolNames)
 	if err != nil {
 		return nil, err

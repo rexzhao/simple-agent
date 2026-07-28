@@ -605,6 +605,7 @@ func (s *Service) CreateSession(projectID string, metadata SessionCreateMetadata
 			session.RootSessionID = parent.ID
 		}
 		session.SpawnDepth = parent.SpawnDepth + 1
+		session.EnabledTools = enabledToolsForAgentChild(session.EnabledTools)
 	} else {
 		session.CreatedBy = sessions.SessionCreatedByUser
 	}

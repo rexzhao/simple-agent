@@ -56,16 +56,26 @@ function renderTree(sessions: Session[], runningSessionIDs: ReadonlySet<string> 
 }
 
 describe('WorkspaceTree session lineage', () => {
-  it('renders an agent child beneath its parent and selects it', () => {
+  it('renders, collapses, expands, and selects an agent child beneath its parent', () => {
     const root = session('root', 'Root')
     const child = session('child', 'Child', {
       created_by: 'agent', parent_session_id: root.id, root_session_id: root.id, spawn_depth: 1,
     })
     const onSelectSession = renderTree([child, root])
 
-    const childLabel = screen.getByText('Child')
+    let childLabel = screen.getByText('Child')
     expect(childLabel.closest('.session-tree-row')?.parentElement?.parentElement?.classList.contains('session-tree-children')).toBe(true)
     expect(screen.getByText(/Agent/)).not.toBeNull()
+
+    const collapse = screen.getByRole('button', { name: 'Collapse child sessions of Root' })
+    expect(collapse.getAttribute('aria-expanded')).toBe('true')
+    fireEvent.click(collapse)
+    expect(screen.queryByText('Child')).toBeNull()
+
+    const expand = screen.getByRole('button', { name: 'Expand child sessions of Root' })
+    expect(expand.getAttribute('aria-expanded')).toBe('false')
+    fireEvent.click(expand)
+    childLabel = screen.getByText('Child')
     fireEvent.click(childLabel)
     expect(onSelectSession).toHaveBeenCalledWith(project.id, child.id)
   })
