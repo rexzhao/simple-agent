@@ -296,11 +296,13 @@ var (
 	ErrUnsupportedModelInput = errors.New("model does not support the requested input")
 )
 
-// turnFailure is the safe, stable payload for a turn.failed session stream
-// event. It carries only a stable code and a short canned message selected by
-// the failing stage; the underlying error text, provider body, auth data, the
-// prompt and tool results stay in logs and returned errors and are never placed
-// in a SessionStreamEvent.
+// turnFailure is the payload for a turn.failed session stream event. It
+// carries a stable code and a short message selected by the failing stage.
+// Provider HTTP failures surface the status and response body verbatim
+// (bounded) — operators need the provider's own message to act on rate
+// limits, quota, and model errors. Everything else stays canned: internal
+// error text, auth data, the prompt and tool results remain in logs and
+// returned errors and are never placed in a SessionStreamEvent.
 type turnFailure struct {
 	code    string
 	message string
@@ -1561,6 +1563,22 @@ func turnFailureForRunnerError(err error) turnFailure {
 		}
 	}
 
+	var statusErr *httpstream.StatusError
+	if errors.As(err, &statusErr) {
+		status := strings.TrimSpace(statusErr.Status)
+		if status == "" {
+			status = fmt.Sprintf("HTTP %d", statusErr.StatusCode)
+		}
+		message := fmt.Sprintf("model provider returned %s", status)
+		if statusErr.Attempts > 1 {
+			message = fmt.Sprintf("%s after %d attempts", message, statusErr.Attempts)
+		}
+		if body := strings.TrimSpace(statusErr.Body); body != "" {
+			message = fmt.Sprintf("%s: %s", message, truncateTurnFailureDetail(body, turnFailureDetailLimit))
+		}
+		return turnFailure{code: "model_http_error", message: message}
+	}
+
 	var requestTimeout *httpstream.RequestTimeoutError
 	if errors.As(err, &requestTimeout) {
 		if requestTimeout.Attempts > 1 {
@@ -1583,6 +1601,18 @@ func turnFailureForRunnerError(err error) turnFailure {
 		}
 	}
 	return turnFailureRunner
+}
+
+// turnFailureDetailLimit bounds provider error bodies so a multi-kilobyte
+// HTML error page cannot flood the session stream and the conversation UI.
+const turnFailureDetailLimit = 600
+
+func truncateTurnFailureDetail(text string, limit int) string {
+	runes := []rune(text)
+	if len(runes) <= limit {
+		return text
+	}
+	return string(runes[:limit]) + "…"
 }
 
 func (s *Service) requireIncrementalSessionTurn(ctx context.Context, session sessions.SessionV2, input SessionMessageInput) error {

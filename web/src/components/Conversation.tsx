@@ -10,7 +10,7 @@ import { Composer } from './Composer'
 import type { ComposerDraft, PastedImageAttachment, PastedTextAttachment } from './Composer'
 import { MessageSkeleton } from './misc'
 import { ProcessTimeline } from './ProcessTimeline'
-import { CopyIcon, SparkIcon } from './icons'
+import { CopyIcon, RetryIcon, SparkIcon, WarningIcon } from './icons'
 
 // Distance from the bottom that still counts as "at the bottom". Kept tiny on
 // purpose: any deliberate scroll away from the bottom disengages output
@@ -30,6 +30,9 @@ export const Conversation = memo(function Conversation(props: {
 	onDraftClear: () => void
 	otherSessionsRunning: boolean
 	recentStepsByTurn: Record<string, RunStep[]>
+  turnError: { turnID: string; message: string } | null
+  onDismissTurnError: () => void
+  onResend: (item: SessionItem) => Promise<boolean>
   onLoadOlder: () => Promise<boolean>
   onSend: (content: string, images: PastedImageAttachment[]) => Promise<boolean>
   onCancel: () => void
@@ -55,6 +58,7 @@ export const Conversation = memo(function Conversation(props: {
 	const settleActiveRef = useRef(false)
 	const [loadingOlder, setLoadingOlder] = useState(false)
 	sessionIDRef.current = props.detail?.id ?? ''
+	const [resendPending, setResendPending] = useState(false)
 
 	// Scoped to the messages container: unlike scrollIntoView this can never
 	// drag along other scrollable ancestors (window, sidebar).
@@ -194,7 +198,17 @@ export const Conversation = memo(function Conversation(props: {
 	useLayoutEffect(() => {
 		if (settleActiveRef.current) return
 		if (followOutputRef.current) scrollToBottom()
-	}, [props.activeRun, props.page?.newest_seq, scrollToBottom])
+	}, [props.activeRun, props.page?.newest_seq, props.turnError, scrollToBottom])
+	// Resending replays the trailing user message as a new run.
+	const handleResend = useCallback(async (item: SessionItem) => {
+		if (resendPending) return
+		setResendPending(true)
+		try {
+			await props.onResend(item)
+		} finally {
+			setResendPending(false)
+		}
+	}, [props.onResend, resendPending])
 	// Sending is explicit intent to be at the bottom: re-engage following even
 	// when the user had scrolled up to read history.
 	const handleSend = useCallback(async (content: string, images: PastedImageAttachment[]): Promise<boolean> => {
@@ -263,6 +277,13 @@ export const Conversation = memo(function Conversation(props: {
 			item.turn_id !== props.activeRun?.turnID || (props.activeRun?.restored && item.message?.role === 'user'))
 		: (props.page?.items ?? []), [props.activeRun?.restored, props.activeRun?.turnID, props.page?.items])
 	const conversationEntries = useMemo(() => buildConversationEntries(visibleItems, props.detail?.id ?? '', props.recentStepsByTurn), [props.detail?.id, props.recentStepsByTurn, visibleItems])
+	// A session that is idle with a user message at the tail almost always
+  // means the turn died mid-flight: offer to resend it in place.
+	const trailingUserItem = useMemo(() => {
+		if (props.activeRun || props.detail?.status === 'running') return null
+		const last = visibleItems[visibleItems.length - 1]
+		return last?.message?.role === 'user' ? last : null
+	}, [props.activeRun, props.detail?.status, visibleItems])
 
   return (
     <div className="conversation">
@@ -285,9 +306,19 @@ export const Conversation = memo(function Conversation(props: {
         {props.page?.has_more_before && <button ref={loadOlderRef} className="load-older" disabled={loadingOlder} onClick={() => void loadOlder()}>{loadingOlder ? 'Loading earlier messages…' : 'Load earlier messages'}</button>}
         {!props.page && <MessageSkeleton />}
 				{conversationEntries.map((entry) => entry.kind === 'message'
-					? <Message key={entry.item.id} item={entry.item} sessionID={props.detail?.id ?? ''} />
+					? <Message key={entry.item.id} item={entry.item} sessionID={props.detail?.id ?? ''} onResend={entry.item === trailingUserItem ? handleResend : undefined} resendPending={resendPending} />
 					: <HistoricalProcess key={entry.id} entry={entry} />)}
         {props.activeRun && <ActiveRunView run={props.activeRun} />}
+		{props.turnError && (
+			<div className="turn-error" role="alert">
+				<WarningIcon />
+				<div className="turn-error-copy">
+					<strong>Turn failed</strong>
+					<p>{props.turnError.message}</p>
+				</div>
+				<button className="turn-error-dismiss" onClick={props.onDismissTurnError} aria-label="Dismiss error" title="Dismiss">×</button>
+			</div>
+		)}
 		{props.page && visibleItems.length === 0 && !props.activeRun && (
           <div className="conversation-empty"><SparkIcon /><h3>Start a new task</h3><p>Describe a goal, a problem, or the code you want to change.</p></div>
         )}
@@ -313,6 +344,7 @@ export const Conversation = memo(function Conversation(props: {
   previous.page === next.page &&
   previous.activeRun === next.activeRun &&
   previous.draft === next.draft &&
+  previous.turnError === next.turnError &&
   previous.otherSessionsRunning === next.otherSessionsRunning &&
   previous.recentStepsByTurn === next.recentStepsByTurn)
 
@@ -369,7 +401,7 @@ function ContextUsage(props: { context: Session['context']; activeInputTokens?: 
 	)
 }
 
-const Message = memo(function Message({ item, sessionID }: { item: SessionItem; sessionID: string }) {
+const Message = memo(function Message({ item, sessionID, onResend, resendPending }: { item: SessionItem; sessionID: string; onResend?: (item: SessionItem) => void; resendPending?: boolean }) {
   const role = item.message?.role
   const text = item.message?.content?.inline || item.message?.content?.preview || ''
   const images = item.message?.images ?? []
@@ -390,6 +422,13 @@ const Message = memo(function Message({ item, sessionID }: { item: SessionItem; 
       <div className="message-content">
         {role === 'user' && text && <div className="message-text">{text}</div>}
         {role === 'user' && images.length > 0 && <StoredImageAttachments sessionID={sessionID} images={images} />}
+		{role === 'user' && onResend && (
+			<div className="message-tools" aria-label="Message actions">
+				<button className="message-tool-button" disabled={resendPending} onClick={() => onResend(item)} title="Send this message again">
+					<RetryIcon />{resendPending ? 'Sending…' : 'Resend'}
+				</button>
+			</div>
+		)}
         {role !== 'user' && text && <MarkdownMessage text={text} />}
 		{role === 'assistant' && (
 			<div className="message-tools" aria-label="Message actions">

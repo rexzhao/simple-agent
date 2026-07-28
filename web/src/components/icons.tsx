@@ -6,6 +6,8 @@ export const RestoreIcon = () => <svg viewBox="0 0 24 24" aria-hidden="true"><pa
 export const EditIcon = () => <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m4 20 4.5-1 10-10-3.5-3.5-10 10L4 20Zm9-12.5 3.5 3.5M14.5 6l2-2 3.5 3.5-2 2" /></svg>
 export const TrashIcon = () => <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M9 7V4h6v3m3 0-1 14H7L6 7m4 4v6m4-6v6" /></svg>
 export const CopyIcon = () => <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="8" y="8" width="11" height="11" /><path d="M16 8V5H5v11h3" /></svg>
+export const RetryIcon = () => <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 4v6h-6" /><path d="M20 10a8 8 0 1 0 .6 5" /></svg>
+export const WarningIcon = () => <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3 2.5 20h19L12 3Z" /><path d="M12 9v6m0 3.5v.5" /></svg>
 export const PaperclipIcon = () => <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m8.5 12.5 6.8-6.8a3 3 0 1 1 4.2 4.2l-8.7 8.7a5 5 0 0 1-7.1-7.1l8.2-8.2" /></svg>
 export const ChevronIcon = ({ expanded }: { expanded: boolean }) => <svg className={expanded ? 'expanded' : ''} viewBox="0 0 24 24" aria-hidden="true"><path d="m8 10 4 4 4-4" /></svg>
 export const SendIcon = () => <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m4 4 17 8-17 8 3-8-3-8Zm3 8h14" /></svg>

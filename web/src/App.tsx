@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { api, streamRun } from './api'
-import type { ActiveRun, ActiveRunDescriptor, Bootstrap, ImageAttachmentInput, Project, RunEvent, RunStep, Session, SessionModelOption } from './types'
-import { errorMessage } from './lib/format'
+import type { ActiveRun, ActiveRunDescriptor, Bootstrap, ImageAttachmentInput, Project, RunEvent, RunStep, Session, SessionItem, SessionModelOption } from './types'
+import { blobAsDataURL, errorMessage } from './lib/format'
 import { reduceRunEvent } from './lib/runEventReducer'
+import { itemText } from './lib/session'
 import { modelKey, orderSessions, processKey, projectName, sessionName } from './lib/session'
 import { emptyComposerDraft } from './components/Composer'
 import type { PastedImageAttachment } from './components/Composer'
@@ -40,8 +41,18 @@ function App() {
   const [providerManager, setProviderManager] = useState<ProviderManagerState | null>(null)
   const [creatingSession, setCreatingSession] = useState(false)
   const [completionNotice, setCompletionNotice] = useState<BackgroundCompletionNotice | null>(null)
+  const [turnErrors, setTurnErrors] = useState<Record<string, { turnID: string; message: string }>>({})
   const { draftsBySession, updateDraft, addPastedText, removePastedText, addPastedImage, removePastedImage, clearDraft } = useComposerDrafts()
   const { activeRunsBySession, activeRunsRef, runningSessionIDs, addActiveRun, updateActiveRun, queueRunEvent, flushRunEvents } = useRunRegistry()
+
+  const clearTurnError = useCallback((sessionID: string) => {
+    setTurnErrors((current) => {
+      if (!current[sessionID]) return current
+      const next = { ...current }
+      delete next[sessionID]
+      return next
+    })
+  }, [])
 
   const loadProjects = useCallback(async () => {
     const payload = await api.projects()
@@ -324,11 +335,21 @@ function App() {
         break
       case 'turn.failed':
         update((run) => reduceRunEvent(run, event))
-        setError(String(event.message ?? 'Run failed'))
+        setTurnErrors((current) => ({
+          ...current,
+          [sessionID]: { turnID: String(event.turn_id ?? ''), message: String(event.message ?? 'Run failed') },
+        }))
         break
       case 'run.settled': {
         const settledRun = activeRunsRef.current[sessionID]
         if (!settledRun || settledRun.id !== runID) return
+        if (String(event.status) === 'failed') {
+          // turn.failed normally landed first with the real reason; this is
+          // only a fallback for streams that attached after it.
+          setTurnErrors((current) => current[sessionID]
+            ? current
+            : { ...current, [sessionID]: { turnID: String(event.turn_id ?? ''), message: 'Run failed' } })
+        }
         if (String(event.status) === 'cancelled') {
           update((run) => ({ ...run, status: 'cancelled' }))
         }
@@ -423,6 +444,37 @@ function App() {
     }
   }, [loadSessions])
 
+  // startNewRun is the single place a fresh run begins: composer sends and
+  // resends of a trailing user message both go through it. A successful
+  // start clears the session's recorded turn failure.
+  const startNewRun = async (sessionID: string, content: string, imageInputs: ImageAttachmentInput[]): Promise<boolean> => {
+    try {
+      const started = await api.startRun(sessionID, content, imageInputs)
+      addActiveRun({
+        id: started.run_id,
+        sessionID,
+        userText: content,
+        userImages: imageInputs,
+        assistantText: '',
+        steps: [],
+        agentIteration: 0,
+        status: 'running',
+      })
+      clearTurnError(sessionID)
+      void streamRun(started.run_id, (event) => handleRunEvent(sessionID, started.run_id, event)).catch((reason: unknown) => {
+        const runID = activeRunsRef.current[sessionID]?.id
+        if (runID) updateActiveRun(sessionID, runID, () => null)
+        setError(errorMessage(reason))
+      })
+      return true
+    } catch (reason) {
+      const runID = activeRunsRef.current[sessionID]?.id
+      if (runID) updateActiveRun(sessionID, runID, () => null)
+      setError(errorMessage(reason))
+      return false
+    }
+  }
+
   const sendMessage = async (content: string, images: PastedImageAttachment[]): Promise<boolean> => {
     if (!selectedSessionID || (!content.trim() && images.length === 0)) return false
     const sessionID = selectedSessionID
@@ -442,30 +494,28 @@ function App() {
       }
     }
     const imageInputs: ImageAttachmentInput[] = images.map((image) => ({ data_url: image.dataURL, detail: 'auto' }))
+    return startNewRun(sessionID, content, imageInputs)
+  }
+
+  // resendMessage replays a trailing user message — the usual shape of a
+  // turn that died mid-flight. Stored image attachments are fetched back as
+  // data URLs so the new run gets the same payload.
+  const resendMessage = async (item: SessionItem): Promise<boolean> => {
+    if (!selectedSessionID) return false
+    const sessionID = selectedSessionID
+    const content = itemText(item)
+    let imageInputs: ImageAttachmentInput[]
     try {
-      const started = await api.startRun(sessionID, content, imageInputs)
-      addActiveRun({
-        id: started.run_id,
-        sessionID,
-        userText: content,
-        userImages: imageInputs,
-        assistantText: '',
-        steps: [],
-        agentIteration: 0,
-        status: 'running',
-      })
-      void streamRun(started.run_id, (event) => handleRunEvent(sessionID, started.run_id, event)).catch((reason: unknown) => {
-        const runID = activeRunsRef.current[sessionID]?.id
-        if (runID) updateActiveRun(sessionID, runID, () => null)
-        setError(errorMessage(reason))
-      })
-      return true
+      imageInputs = await Promise.all((item.message?.images ?? []).map(async (image) => ({
+        data_url: await blobAsDataURL(await api.sessionImage(sessionID, image.hash)),
+        detail: 'auto' as const,
+      })))
     } catch (reason) {
-      const runID = activeRunsRef.current[sessionID]?.id
-      if (runID) updateActiveRun(sessionID, runID, () => null)
       setError(errorMessage(reason))
       return false
     }
+    if (!content.trim() && imageInputs.length === 0) return false
+    return startNewRun(sessionID, content, imageInputs)
   }
 
   const cancelRun = async () => {
@@ -551,6 +601,9 @@ function App() {
 			onDraftClear={() => clearDraft(selectedSessionID)}
 			otherSessionsRunning={otherSessionsRunning}
 					recentStepsByTurn={recentStepsByTurn}
+            turnError={turnErrors[selectedSessionID] ?? null}
+            onDismissTurnError={() => clearTurnError(selectedSessionID)}
+            onResend={(item) => resendMessage(item)}
             onLoadOlder={loadOlder}
             onSend={(content, images) => sendMessage(content, images)}
             onCancel={() => void cancelRun()}

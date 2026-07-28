@@ -755,6 +755,61 @@ func TestSessionStreamTurnFailedSafePayloadByStage(t *testing.T) {
 		assertSafeTurnFailedTerminal(t, events, "model_stream_idle_timeout", "model response stream produced no data for 2m0s", turnFailedSecret)
 	})
 
+	t.Run("model_http_error", func(t *testing.T) {
+		home := t.TempDir()
+		runner := fakeExecutionTurnRunner{
+			supports: true,
+			run: func(ctx context.Context, request SessionTurnRequest) (SessionTurnResult, error) {
+				return SessionTurnResult{}, fmt.Errorf("request model: %w", &httpstream.StatusError{
+					StatusCode: 429,
+					Status:     "429 Too Many Requests",
+					Body:       `{"error":{"message":"slow down and try later"}}`,
+					Attempts:   2,
+				})
+			},
+		}
+		service, _, session := newExecutionServiceWithSession(t, home, runner)
+		var events []SessionStreamEvent
+		_, err := service.SendSessionMessageWithEvents(context.Background(), session.ID, prompt, func(event SessionStreamEvent) {
+			events = append(events, event)
+		})
+		if !errors.Is(err, ErrTurnFailed) {
+			t.Fatalf("error = %v, want ErrTurnFailed", err)
+		}
+		if strings.Contains(err.Error(), turnFailedSecret) {
+			t.Fatalf("returned error leaks secret: %v", err)
+		}
+		assertSafeTurnFailedTerminal(
+			t,
+			events,
+			"model_http_error",
+			`model provider returned 429 Too Many Requests after 2 attempts: {"error":{"message":"slow down and try later"}}`,
+			turnFailedSecret,
+		)
+	})
+
+	t.Run("model_http_error_without_body", func(t *testing.T) {
+		home := t.TempDir()
+		runner := fakeExecutionTurnRunner{
+			supports: true,
+			run: func(ctx context.Context, request SessionTurnRequest) (SessionTurnResult, error) {
+				return SessionTurnResult{}, fmt.Errorf("request model: %w", &httpstream.StatusError{
+					StatusCode: 500,
+					Body:       "   ",
+				})
+			},
+		}
+		service, _, session := newExecutionServiceWithSession(t, home, runner)
+		var events []SessionStreamEvent
+		_, err := service.SendSessionMessageWithEvents(context.Background(), session.ID, prompt, func(event SessionStreamEvent) {
+			events = append(events, event)
+		})
+		if !errors.Is(err, ErrTurnFailed) {
+			t.Fatalf("error = %v, want ErrTurnFailed", err)
+		}
+		assertSafeTurnFailedTerminal(t, events, "model_http_error", "model provider returned HTTP 500", turnFailedSecret)
+	})
+
 	t.Run("runner_not_incremental", func(t *testing.T) {
 		home := t.TempDir()
 		runner := fakeExecutionTurnRunner{
