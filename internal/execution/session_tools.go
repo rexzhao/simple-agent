@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -350,15 +351,27 @@ func (e *sessionToolExecutor) search(toolName string, arguments map[string]any) 
 	if err != nil {
 		return sessionToolError(toolName, "invalid_arguments", err.Error())
 	}
+	if _, err := regexp.Compile(pattern); err != nil {
+		return sessionToolError(toolName, "invalid_arguments", fmt.Sprintf("name_regex is not a valid RE2 expression: %v", err))
+	}
 	statuses, err := optionalSessionStringSlice(arguments, "statuses")
 	if err != nil {
 		return sessionToolError(toolName, "invalid_arguments", err.Error())
+	}
+	for _, status := range statuses {
+		switch strings.TrimSpace(status) {
+		case "running", "idle", "interrupted":
+		case "":
+			return sessionToolError(toolName, "invalid_arguments", "statuses must not contain a blank value")
+		default:
+			return sessionToolError(toolName, "invalid_arguments", fmt.Sprintf("statuses contains unknown status %q", status))
+		}
 	}
 	includeArchived, err := optionalSessionBool(arguments, "include_archived", false)
 	if err != nil {
 		return sessionToolError(toolName, "invalid_arguments", err.Error())
 	}
-	limit, err := optionalSessionInteger(arguments, "limit", 0)
+	limit, err := optionalSessionIntegerInRange(arguments, "limit", 0, 1, maximumSessionSearchLimit)
 	if err != nil {
 		return sessionToolError(toolName, "invalid_arguments", err.Error())
 	}
@@ -384,7 +397,7 @@ func (e *sessionToolExecutor) get(toolName string, arguments map[string]any) (mo
 	if !ok {
 		return result, nil
 	}
-	maxOutputChars, err := optionalSessionInteger(arguments, "max_output_chars", 0)
+	maxOutputChars, err := optionalSessionIntegerInRange(arguments, "max_output_chars", 0, 1, maximumSessionOutputMaxChars)
 	if err != nil {
 		return sessionToolError(toolName, "invalid_arguments", err.Error())
 	}
@@ -467,14 +480,17 @@ func (e *sessionToolExecutor) wait(ctx context.Context, toolName string, argumen
 	if target.ID == e.caller.ID {
 		return sessionToolError(toolName, "self_wait_forbidden", "a session cannot wait for its own active run")
 	}
-	timeoutMS, err := optionalSessionInteger(arguments, "timeout_ms", int(defaultSessionWaitTimeout/time.Millisecond))
+	timeoutMS, err := optionalSessionIntegerInRange(
+		arguments,
+		"timeout_ms",
+		int(defaultSessionWaitTimeout/time.Millisecond),
+		0,
+		int(maximumSessionWaitTimeout/time.Millisecond),
+	)
 	if err != nil {
 		return sessionToolError(toolName, "invalid_arguments", err.Error())
 	}
-	if timeoutMS < 0 || time.Duration(timeoutMS)*time.Millisecond > maximumSessionWaitTimeout {
-		return sessionToolError(toolName, "invalid_arguments", fmt.Sprintf("timeout_ms must be between 0 and %d", maximumSessionWaitTimeout/time.Millisecond))
-	}
-	maxOutputChars, err := optionalSessionInteger(arguments, "max_output_chars", 0)
+	maxOutputChars, err := optionalSessionIntegerInRange(arguments, "max_output_chars", 0, 1, maximumSessionOutputMaxChars)
 	if err != nil {
 		return sessionToolError(toolName, "invalid_arguments", err.Error())
 	}
@@ -726,4 +742,19 @@ func optionalSessionInteger(arguments map[string]any, name string, defaultValue 
 		return 0, fmt.Errorf("%s is outside the supported integer range", name)
 	}
 	return converted, nil
+}
+
+// optionalSessionIntegerInRange validates executor calls independently of the
+// model-facing JSON Schema. Tool calls normally pass schema validation first,
+// but keeping the boundary here prevents alternate callers and tests from
+// silently turning explicit zero or negative values into service defaults.
+func optionalSessionIntegerInRange(arguments map[string]any, name string, defaultValue, minimum, maximum int) (int, error) {
+	value, err := optionalSessionInteger(arguments, name, defaultValue)
+	if err != nil {
+		return 0, err
+	}
+	if _, supplied := arguments[name]; supplied && (value < minimum || value > maximum) {
+		return 0, fmt.Errorf("%s must be between %d and %d", name, minimum, maximum)
+	}
+	return value, nil
 }

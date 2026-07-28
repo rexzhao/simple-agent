@@ -274,9 +274,10 @@ func (r AgentTurnRunner) prepareRuntime(ctx context.Context, session sessions.Se
 		parameters:    resolved.Parameters,
 		provider:      provider,
 		toolExecutor: runToolExecutor{
-			builtins:     toolRegistry,
-			mcpSessions:  mcpSessionsByID,
-			sessionTools: newSessionToolExecutor(service, coordinator, session),
+			builtins:            toolRegistry,
+			mcpSessions:         mcpSessionsByID,
+			sessionTools:        newSessionToolExecutor(service, coordinator, session),
+			enabledSessionTools: enabledSessionToolSet(enabledToolNames),
 		},
 		toolSchemas:        toolSchemas,
 		maxTurns:           cfg.Agent.MaxTurns,
@@ -1223,13 +1224,17 @@ func enabledToolsForRun(rootDir string, enabled []string) (*tools.Registry, []mo
 }
 
 type runToolExecutor struct {
-	builtins     *tools.Registry
-	mcpSessions  map[string]*mcp.Session
-	sessionTools *sessionToolExecutor
+	builtins            *tools.Registry
+	mcpSessions         map[string]*mcp.Session
+	sessionTools        *sessionToolExecutor
+	enabledSessionTools map[string]struct{}
 }
 
 func (e runToolExecutor) Execute(ctx context.Context, name string, arguments map[string]any) (model.ToolResult, error) {
 	if IsSessionTool(name) {
+		if _, enabled := e.enabledSessionTools[name]; !enabled {
+			return model.ToolResult{}, fmt.Errorf("session tool %q is not enabled for this run", name)
+		}
 		if e.sessionTools == nil {
 			return model.ToolResult{}, fmt.Errorf("session tool %q is not configured", name)
 		}
@@ -1256,6 +1261,16 @@ func (e runToolExecutor) Execute(ctx context.Context, name string, arguments map
 		return model.ToolResult{}, fmt.Errorf("tool %q is not registered", name)
 	}
 	return e.builtins.Execute(ctx, name, arguments)
+}
+
+func enabledSessionToolSet(enabled []string) map[string]struct{} {
+	result := make(map[string]struct{})
+	for _, name := range enabled {
+		if IsSessionTool(name) {
+			result[name] = struct{}{}
+		}
+	}
+	return result
 }
 
 func mcpToolsForRun(ctx context.Context, servers []config.MCPServerConfig, enabled []string) ([]*mcp.Session, map[string]*mcp.Session, []model.Tool, error) {

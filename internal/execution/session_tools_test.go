@@ -52,6 +52,19 @@ func TestSessionToolDefinitionsAndExplicitSelection(t *testing.T) {
 	if len(sessionSchemas) != 2 || sessionSchemas[0].Name != ToolSessionGet || sessionSchemas[1].Name != ToolSessionStart {
 		t.Fatalf("session schema selection = %#v", sessionSchemas)
 	}
+
+	dispatch := runToolExecutor{
+		sessionTools:        &sessionToolExecutor{},
+		enabledSessionTools: enabledSessionToolSet([]string{ToolSessionModels}),
+	}
+	if _, err := dispatch.Execute(context.Background(), ToolSessionStop, map[string]any{}); err == nil || err.Error() != `session tool "session_stop" is not enabled for this run` {
+		t.Fatalf("disabled session tool dispatch error = %v", err)
+	}
+	allowed, err := dispatch.Execute(context.Background(), ToolSessionModels, map[string]any{})
+	if err != nil {
+		t.Fatalf("enabled session tool dispatch error = %v", err)
+	}
+	assertSessionToolErrorCode(t, allowed, "service_unavailable")
 }
 
 func TestSessionToolsStartInspectQueueAndWait(t *testing.T) {
@@ -302,6 +315,147 @@ func TestSessionStartValidatesModelPairDepthAndCoordinator(t *testing.T) {
 	executor.caller = deep
 	tooDeep := executeSessionTool(t, executor, ToolSessionStart, map[string]any{"prompt": "x"})
 	assertSessionToolErrorCode(t, tooDeep, "spawn_depth_exceeded")
+}
+
+func TestSessionStartCapacityFailureReturnsRecoverableCreatedSession(t *testing.T) {
+	release := make(chan struct{})
+	started := make(chan struct{}, 1)
+	runner := fakeExecutionTurnRunner{
+		supports: true,
+		run: func(ctx context.Context, _ SessionTurnRequest) (SessionTurnResult, error) {
+			started <- struct{}{}
+			select {
+			case <-release:
+				return SessionTurnResult{Incremental: true}, nil
+			case <-ctx.Done():
+				return SessionTurnResult{}, ctx.Err()
+			}
+		},
+	}
+	service, parent, occupied, _ := newSessionToolTestSessions(t, t.TempDir(), runner)
+	coordinator := NewSessionRunCoordinator(context.Background(), service, SessionRunCoordinatorOptions{MaxConcurrentRuns: 1})
+	defer coordinator.Close()
+	executor := &sessionToolExecutor{service: service, coordinator: coordinator, caller: parent}
+
+	active, err := coordinator.Start(occupied.ID, SessionMessageInput{Content: "occupy capacity"}, nil)
+	if err != nil {
+		t.Fatalf("coordinator.Start(occupied) error = %v", err)
+	}
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("capacity-occupying run did not start")
+	}
+
+	result := executeSessionTool(t, executor, ToolSessionStart, map[string]any{
+		"prompt": "created but not admitted",
+		"name":   "Recoverable child",
+	})
+	assertSessionToolErrorCode(t, result, "run_capacity_reached")
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(result.Content), &payload); err != nil {
+		t.Fatalf("decode capacity error result %q: %v", result.Content, err)
+	}
+	childID := requiredPayloadString(t, payload, "session_id")
+	if payload["created"] != true {
+		t.Fatalf("capacity error payload = %#v, want created=true", payload)
+	}
+	child, err := service.GetSession(childID)
+	if err != nil {
+		t.Fatalf("GetSession(recoverable child) error = %v", err)
+	}
+	if child.ParentSessionID != parent.ID || child.DisplayName != "Recoverable child" || child.Status != "idle" {
+		t.Fatalf("recoverable child = %#v", child)
+	}
+
+	close(release)
+	if _, err := active.Wait(); err != nil {
+		t.Fatalf("capacity-occupying run Wait() error = %v", err)
+	}
+}
+
+func TestSessionToolsValidateArgumentsAtExecutorBoundary(t *testing.T) {
+	service, parent, child, _ := newSessionToolTestSessions(t, t.TempDir(), fakeExecutionTurnRunner{supports: true})
+	executor := &sessionToolExecutor{service: service, caller: parent}
+	tooLongName := make([]rune, maximumSessionDisplayNameRunes+1)
+	for index := range tooLongName {
+		tooLongName[index] = '会'
+	}
+
+	tests := []struct {
+		name      string
+		tool      string
+		arguments map[string]any
+	}{
+		{
+			name: "start name over Unicode limit",
+			tool: ToolSessionStart,
+			arguments: map[string]any{
+				"prompt": "task",
+				"name":   string(tooLongName),
+			},
+		},
+		{
+			name:      "search invalid regex",
+			tool:      ToolSessionSearch,
+			arguments: map[string]any{"name_regex": "["},
+		},
+		{
+			name: "search unknown status",
+			tool: ToolSessionSearch,
+			arguments: map[string]any{
+				"name_regex": ".*",
+				"statuses":   []any{"paused"},
+			},
+		},
+		{
+			name:      "search explicit zero limit",
+			tool:      ToolSessionSearch,
+			arguments: map[string]any{"name_regex": ".*", "limit": 0},
+		},
+		{
+			name:      "search over maximum limit",
+			tool:      ToolSessionSearch,
+			arguments: map[string]any{"name_regex": ".*", "limit": maximumSessionSearchLimit + 1},
+		},
+		{
+			name:      "search fractional limit",
+			tool:      ToolSessionSearch,
+			arguments: map[string]any{"name_regex": ".*", "limit": 1.5},
+		},
+		{
+			name:      "get explicit zero output limit",
+			tool:      ToolSessionGet,
+			arguments: map[string]any{"session_id": child.ID, "max_output_chars": 0},
+		},
+		{
+			name:      "get over maximum output limit",
+			tool:      ToolSessionGet,
+			arguments: map[string]any{"session_id": child.ID, "max_output_chars": maximumSessionOutputMaxChars + 1},
+		},
+		{
+			name:      "wait negative timeout",
+			tool:      ToolSessionWait,
+			arguments: map[string]any{"session_id": child.ID, "timeout_ms": -1},
+		},
+		{
+			name:      "wait over maximum timeout",
+			tool:      ToolSessionWait,
+			arguments: map[string]any{"session_id": child.ID, "timeout_ms": int(maximumSessionWaitTimeout/time.Millisecond) + 1},
+		},
+		{
+			name:      "wait explicit zero output limit",
+			tool:      ToolSessionWait,
+			arguments: map[string]any{"session_id": child.ID, "max_output_chars": 0},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			result := executeSessionTool(t, executor, test.tool, test.arguments)
+			assertSessionToolErrorCode(t, result, "invalid_arguments")
+		})
+	}
 }
 
 func TestSessionToolsListModelsAndStartExplicitModel(t *testing.T) {

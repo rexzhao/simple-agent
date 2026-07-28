@@ -96,7 +96,9 @@ can reference environment variables and are resolved only by the Go process.
 Diagnostic logging is disabled unless a non-empty `logging.path` is explicitly
 configured.
 
-See [docs/configuration.md](docs/configuration.md) for the supported schema.
+See [docs/configuration.md](docs/configuration.md) for the supported schema and
+[docs/agent-session-orchestration.md](docs/agent-session-orchestration.md) for
+the agent session tool contract.
 
 ## Web application
 
@@ -114,6 +116,9 @@ The first release provides:
 - Manual context compaction.
 - Cursor-based history loading.
 - Active-run recovery and durable-history resync after a browser refresh.
+- Explicit agent session orchestration for child starts, search,
+  persisted-output inspection, strict steer/queue input, wait, and stop.
+- Parent/child session trees for agent-created work.
 
 The server binds only to loopback, generates a random capability token for each
 start, validates Host and Origin, and does not enable CORS. Static assets are
