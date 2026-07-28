@@ -201,7 +201,7 @@ export function Composer(props: {
             props.onPastedTextAdd({ id: nextPastedTextID.current++, content: pastedText })
           }}
           onKeyDown={(event) => {
-            if (event.key === 'Enter' && !event.shiftKey) {
+            if (event.key === 'Enter' && !event.altKey) {
               event.preventDefault()
               void submit()
             }
@@ -210,7 +210,7 @@ export function Composer(props: {
         {props.running && <button className="stop-button" onClick={props.onCancel} aria-label="Stop"><StopIcon /></button>}
 		<button className="send-button" disabled={(!props.draft.content.trim() && props.draft.pastedTexts.length === 0 && props.draft.pastedImages.length === 0) || composerDisabled} onClick={() => void submit()} aria-label={props.running ? 'Append to current run' : 'Send'}><SendIcon /></button>
       </div>
-      <div className="composer-hint"><span>{props.draft.pastedImages.length > 0 ? 'Images will be sent with the message' : props.draft.pastedTexts.length > 0 ? 'Pasted text is sent first, then your note' : 'Enter to send · Shift+Enter for a new line · Paste images supported'}</span><span>Running locally</span></div>
+      <div className="composer-hint"><span>{props.draft.pastedImages.length > 0 ? 'Images will be sent with the message' : props.draft.pastedTexts.length > 0 ? 'Pasted text is sent first, then your note' : 'Enter to send · Alt+Enter for a new line · Paste images supported'}</span><span>Running locally</span></div>
     </div>
   )
 }
