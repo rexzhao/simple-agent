@@ -21,6 +21,7 @@ export const Conversation = memo(function Conversation(props: {
   detail: Session | null
   page: ItemsPage | null
   activeRun: ActiveRun | null
+  compacting: boolean
 	draft: ComposerDraft
 	onDraftChange: (content: string) => void
 	onPastedTextAdd: (pastedText: PastedTextAttachment) => void
@@ -293,13 +294,13 @@ export const Conversation = memo(function Conversation(props: {
 		  {props.detail && (
 			<div className="conversation-meta">
 			  <p>{props.detail.provider} / {props.detail.model_id}{props.detail.reasoning_level && ` · ${props.detail.reasoning_level}`}</p>
-			  <ContextUsage context={props.detail.context} activeInputTokens={props.activeRun?.inputTokens} activeCachedTokens={props.activeRun?.cachedTokens} activeCacheWriteTokens={props.activeRun?.cacheWriteTokens} />
+			  <ContextUsage context={props.detail.context} activeInputTokens={props.activeRun?.inputTokens} activeCachedTokens={props.activeRun?.cachedTokens} activeCacheWriteTokens={props.activeRun?.cacheWriteTokens} compactedContextTokens={props.activeRun?.compaction?.status === 'completed' ? props.activeRun.compaction.activeContextTokens : undefined} />
 			</div>
 		  )}
         </div>
         <div className="header-actions">
-		  <span className={`status-pill ${props.activeRun || props.otherSessionsRunning ? 'running' : ''}`}><span />{props.activeRun ? 'Running' : props.otherSessionsRunning ? 'Another session running' : 'Ready'}</span>
-		  <button className="secondary-button" disabled={!props.detail || props.detail.status === 'running' || Boolean(props.activeRun)} onClick={props.onCompact}>Compact context</button>
+		  <span className={`status-pill ${props.compacting || props.activeRun || props.detail?.status === 'running' || props.otherSessionsRunning ? 'running' : ''}`}><span />{props.compacting || props.activeRun?.compaction?.status === 'running' ? 'Compacting context' : props.activeRun || props.detail?.status === 'running' ? 'Running' : props.otherSessionsRunning ? 'Another session running' : 'Ready'}</span>
+		  <button className="secondary-button" disabled={!props.detail || props.detail.status === 'running' || props.compacting || Boolean(props.activeRun)} onClick={props.onCompact}>{props.compacting ? 'Compacting…' : 'Compact context'}</button>
         </div>
       </header>
       <section ref={messagesRef} className="messages" aria-live="polite" onScroll={handleScroll} onWheel={cancelSettle} onTouchMove={cancelSettle} onKeyDown={cancelSettle} onPointerDown={cancelSettle}>
@@ -309,6 +310,7 @@ export const Conversation = memo(function Conversation(props: {
 					? <Message key={entry.item.id} item={entry.item} sessionID={props.detail?.id ?? ''} onResend={entry.item === trailingUserItem ? handleResend : undefined} resendPending={resendPending} />
 					: <HistoricalProcess key={entry.id} entry={entry} />)}
         {props.activeRun && <ActiveRunView run={props.activeRun} />}
+        {props.compacting && <CompactionStatus trigger="manual" status="running" />}
 		{props.turnError && (
 			<div className="turn-error" role="alert">
 				<WarningIcon />
@@ -333,7 +335,7 @@ export const Conversation = memo(function Conversation(props: {
 		onPastedImageRemove={props.onPastedImageRemove}
 		onDraftClear={props.onDraftClear}
 		running={Boolean(props.activeRun)}
-		blocked={false}
+		blocked={!props.activeRun && (props.compacting || props.detail?.status === 'running')}
 		onSend={handleSend}
 		onCancel={props.onCancel}
 	  />
@@ -343,12 +345,13 @@ export const Conversation = memo(function Conversation(props: {
   previous.detail === next.detail &&
   previous.page === next.page &&
   previous.activeRun === next.activeRun &&
+  previous.compacting === next.compacting &&
   previous.draft === next.draft &&
   previous.turnError === next.turnError &&
   previous.otherSessionsRunning === next.otherSessionsRunning &&
   previous.recentStepsByTurn === next.recentStepsByTurn)
 
-function ContextUsage(props: { context: Session['context']; activeInputTokens?: number; activeCachedTokens?: number; activeCacheWriteTokens?: number }) {
+function ContextUsage(props: { context: Session['context']; activeInputTokens?: number; activeCachedTokens?: number; activeCacheWriteTokens?: number; compactedContextTokens?: number }) {
 	const context = props.context
 	const contextWindow = Number(context?.context_window ?? 0)
 	if (contextWindow <= 0) return null
@@ -364,8 +367,9 @@ function ContextUsage(props: { context: Session['context']; activeInputTokens?: 
 		? recordedInputTokens + Number(context?.last_cached_tokens ?? 0) + Number(context?.last_cache_write_tokens ?? 0)
 		: 0
 	const requestEstimate = Number(context?.last_request_tokens ?? 0)
-	const usedTokens = livePromptTokens > 0 ? livePromptTokens : recordedPromptTokens > 0 ? recordedPromptTokens : requestEstimate
-	const usageEstimated = livePromptTokens <= 0 && (recordedPromptTokens <= 0 || context?.last_usage_source !== 'provider')
+	const compactedContextTokens = Number(props.compactedContextTokens ?? 0)
+	const usedTokens = compactedContextTokens > 0 ? compactedContextTokens : livePromptTokens > 0 ? livePromptTokens : recordedPromptTokens > 0 ? recordedPromptTokens : requestEstimate
+	const usageEstimated = compactedContextTokens > 0 || (livePromptTokens <= 0 && (recordedPromptTokens <= 0 || context?.last_usage_source !== 'provider'))
 	const percent = usedTokens > 0 ? usedTokens / contextWindow * 100 : 0
 	const warningThreshold = Number(context?.warning_threshold_percent ?? 80)
 	const tone = percent >= 100 ? 'critical' : percent >= warningThreshold ? 'warning' : ''
@@ -508,9 +512,22 @@ function ActiveRunView({ run }: { run: ActiveRun }) {
           </div>
         </article>
       )}
+      {run.compaction && <CompactionStatus trigger={run.compaction.trigger} status={run.compaction.status} activeContextTokens={run.compaction.activeContextTokens} contextWindow={run.compaction.contextWindow} />}
       <ActiveRunBody run={run} />
     </>
   )
+}
+
+function CompactionStatus({ trigger, status, activeContextTokens, contextWindow }: {
+  trigger: 'auto' | 'manual'
+  status: 'running' | 'completed'
+  activeContextTokens?: number
+  contextWindow?: number
+}) {
+  const detail = status === 'running'
+    ? `${trigger === 'auto' ? 'Automatic' : 'Manual'} compaction is running…`
+    : `Context compacted${activeContextTokens ? ` to approximately ${formatTokenCount(activeContextTokens)}${contextWindow ? ` / ${formatTokenCount(contextWindow)}` : ''}` : ''}. Continuing the turn…`
+  return <div className={`compaction-status ${status}`} role="status"><span />{detail}</div>
 }
 
 // ActiveRunBody renders the in-flight turn. Mid-turn appended user messages

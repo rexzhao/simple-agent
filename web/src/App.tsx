@@ -42,6 +42,7 @@ function App() {
   const [creatingSession, setCreatingSession] = useState(false)
   const [completionNotice, setCompletionNotice] = useState<BackgroundCompletionNotice | null>(null)
   const [turnErrors, setTurnErrors] = useState<Record<string, { turnID: string; message: string }>>({})
+  const [compactingSessionIDs, setCompactingSessionIDs] = useState<Record<string, boolean>>({})
   const { draftsBySession, updateDraft, addPastedText, removePastedText, addPastedImage, removePastedImage, clearDraft } = useComposerDrafts()
   const { activeRunsBySession, activeRunsRef, runningSessionIDs, addActiveRun, updateActiveRun, queueRunEvent, flushRunEvents } = useRunRegistry()
 
@@ -317,6 +318,8 @@ function App() {
     const update = (updater: (run: ActiveRun) => ActiveRun | null) => updateActiveRun(sessionID, runID, updater)
     switch (event.type) {
       case 'turn.started':
+      case 'compaction.started':
+      case 'compaction.completed':
       case 'run.prompt_queue':
       case 'run.prompt_appended':
       case 'agent.iteration.started':
@@ -540,17 +543,26 @@ function App() {
 
   const compactSession = async () => {
     if (!selectedSessionID || sessionDetail?.status === 'running' || activeRunsRef.current[selectedSessionID]) return
+    const sessionID = selectedSessionID
+    setCompactingSessionIDs((current) => ({ ...current, [sessionID]: true }))
     try {
-      await api.compact(selectedSessionID)
-      await refreshSession(selectedSessionID)
+      await api.compact(sessionID)
+      await refreshSession(sessionID)
     } catch (reason) {
       setError(errorMessage(reason))
+    } finally {
+      setCompactingSessionIDs((current) => {
+        const next = { ...current }
+        delete next[sessionID]
+        return next
+      })
     }
   }
 
   const selectedProject = projects.find((project) => project.id === selectedProjectID) ?? null
   const selectedActiveRun = activeRunsBySession[selectedSessionID] ?? null
-  const otherSessionsRunning = Object.keys(activeRunsBySession).some((sessionID) => sessionID !== selectedSessionID)
+  const visibleRunningSessionIDs = new Set([...runningSessionIDs, ...Object.keys(compactingSessionIDs)])
+  const otherSessionsRunning = [...visibleRunningSessionIDs].some((sessionID) => sessionID !== selectedSessionID)
   const showAddProject = useCallback(() => setShowProjectForm(true), [])
 
   if (loading) return <Splash />
@@ -563,7 +575,7 @@ function App() {
         archivedSessionsByProject={archivedSessionsByProject}
         selectedProjectID={selectedProjectID}
         selectedSessionID={selectedSessionID}
-		runningSessionIDs={runningSessionIDs}
+		runningSessionIDs={visibleRunningSessionIDs}
         onSelectProject={selectProject}
         onSelectSession={selectSession}
         onCreateSession={openSessionCreator}
@@ -591,7 +603,8 @@ function App() {
           <Conversation
             detail={sessionDetail}
             page={itemsPage}
-			activeRun={selectedActiveRun}
+            activeRun={selectedActiveRun}
+            compacting={Boolean(compactingSessionIDs[selectedSessionID])}
 			draft={draftsBySession[selectedSessionID] ?? emptyComposerDraft}
 			onDraftChange={(content) => updateDraft(selectedSessionID, content)}
 			onPastedTextAdd={(pastedText) => addPastedText(selectedSessionID, pastedText)}

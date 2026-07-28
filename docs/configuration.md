@@ -83,6 +83,7 @@ compaction:
   enabled: false
   threshold_percent: 80
   reserved: 0
+  max_request_bytes: 716800
 ```
 
 `default_provider` selects a provider file by name. `default_model` selects a
@@ -387,13 +388,23 @@ root configuration explicitly contains a non-empty path:
 logging:
   path: logs/sai.jsonl
   level: info
+  request_bodies: false
 ```
 
 A relative path resolves from the server root. Disabled logging creates no
 `logs` directory or empty JSONL file. Logs contain operational metadata but
 must not contain prompt, response, tool-result, API-key, or
-authorization-header bodies. Durable session event records are independent of
-this diagnostic logging switch.
+authorization-header bodies by default. Durable session event records are
+independent of this diagnostic logging switch.
+
+For temporary provider-protocol diagnosis, set `request_bodies: true`. Each
+OpenAI Responses or Codex request body is then written exactly as sent to a
+`responses-request-NNNNNN.json` or
+`responses-compact-request-NNNNNN.json` file beside `sai.jsonl`. These captures
+never include HTTP authorization headers, but they do contain complete prompts,
+tool definitions, reasoning state, and tool outputs. Disable the option and
+remove the captures after diagnosis. Changing this setting requires restarting
+the SAI server.
 
 ## Context window and compaction
 
@@ -427,3 +438,7 @@ SAI rebuilds the complete history from the append-only session ledger and falls
 back to the configured local summary model. Compatible third-party endpoints
 are never assumed to support remote compaction. `context_management` and the
 Codex-specific `compaction_trigger` protocol are not enabled by this option.
+When compaction is enabled, `max_request_bytes` adds a pre-turn replay-pressure
+guard for OpenAI Responses and Codex requests. SAI compacts before the turn when
+either the token threshold or this serialized request-size threshold is reached.
+Set it to `0` to disable the byte-size guard.

@@ -58,8 +58,9 @@ type ToolsConfig struct {
 }
 
 type LoggingConfig struct {
-	Path  string `json:"path" yaml:"path"`
-	Level string `json:"level" yaml:"level"`
+	Path          string `json:"path" yaml:"path"`
+	Level         string `json:"level" yaml:"level"`
+	RequestBodies bool   `json:"request_bodies,omitempty" yaml:"request_bodies,omitempty"`
 }
 
 type SessionsConfig struct {
@@ -72,6 +73,7 @@ type CompactionConfig struct {
 	Enabled          bool   `json:"enabled" yaml:"enabled"`
 	ThresholdPercent int    `json:"threshold_percent" yaml:"threshold_percent"`
 	Reserved         int    `json:"reserved,omitempty" yaml:"reserved,omitempty"`
+	MaxRequestBytes  int    `json:"max_request_bytes,omitempty" yaml:"max_request_bytes,omitempty"`
 	SummaryProvider  string `json:"summary_provider" yaml:"summary_provider"`
 	SummaryModel     string `json:"summary_model" yaml:"summary_model"`
 }
@@ -596,6 +598,9 @@ func validateConfig(cfg Config) error {
 	if cfg.Compaction.Reserved < 0 {
 		return fmt.Errorf("compaction.reserved must not be negative")
 	}
+	if cfg.Compaction.MaxRequestBytes < 0 {
+		return fmt.Errorf("compaction.max_request_bytes must not be negative")
+	}
 	return nil
 }
 
@@ -622,6 +627,7 @@ func defaultConfig() Config {
 		},
 		Compaction: CompactionConfig{
 			ThresholdPercent: 80,
+			MaxRequestBytes:  700 * 1024,
 		},
 		MCPDir:     "mcp",
 		Providers:  map[string]ProviderConfig{},

@@ -107,6 +107,51 @@ func TestProviderStreamPostsResponsesRequestAndEmitsEvents(t *testing.T) {
 	}`)
 }
 
+func TestProviderRecordsExactRequestBodyBeforeSending(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: {\"type\":\"response.completed\",\"response\":{}}\n\n")
+	}))
+	defer server.Close()
+
+	var gotEndpoint string
+	var gotBody []byte
+	provider, err := NewProvider(ProviderConfig{
+		BaseURL:    server.URL,
+		APIKey:     "secret-not-recorded",
+		HTTPClient: server.Client(),
+		RecordRequest: func(endpoint string, body []byte) error {
+			gotEndpoint = endpoint
+			gotBody = append([]byte(nil), body...)
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewProvider() error = %v", err)
+	}
+	events, err := provider.Stream(context.Background(), model.Request{
+		Model:    "gpt-test",
+		Messages: []model.Message{{Role: model.MessageRoleUser, Content: "Hello"}},
+	})
+	if err != nil {
+		t.Fatalf("Stream() error = %v", err)
+	}
+	collectEvents(t, events)
+
+	if gotEndpoint != "/responses" {
+		t.Fatalf("recorded endpoint = %q, want /responses", gotEndpoint)
+	}
+	assertJSONEqual(t, gotBody, `{
+		"model": "gpt-test",
+		"input": [{"role": "user", "content": "Hello"}],
+		"stream": true,
+		"store": false
+	}`)
+	if bytes.Contains(gotBody, []byte("secret-not-recorded")) {
+		t.Fatalf("recorded request body leaked authorization token: %s", gotBody)
+	}
+}
+
 func TestProviderCompactPostsCanonicalInputAndReturnsOpaqueItems(t *testing.T) {
 	requests := make(chan capturedRequest, 1)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

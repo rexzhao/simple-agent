@@ -106,12 +106,21 @@ func (r AgentTurnRunner) PlanSessionTurnCompaction(ctx context.Context, request 
 	defer func() {
 		err = errors.Join(err, runtime.Close())
 	}()
+	runtime.onCompactionStarted = request.OnCompactionStarted
 
 	messages, err := runtime.initialMessages()
 	if err != nil {
 		return SessionCompactionResult{}, err
 	}
-	_, compaction, err := runtime.planAutoCompactBeforeTurn(ctx, messages)
+	pendingInput := request.Content
+	if len(request.ContentBlocks) > 0 {
+		pendingInput = ""
+	}
+	_, compaction, err := runtime.planAutoCompactBeforeTurn(ctx, messages, model.Message{
+		Role:          model.MessageRoleUser,
+		Content:       pendingInput,
+		ContentBlocks: copyInputContentBlocks(request.ContentBlocks),
+	})
 	if err != nil {
 		return SessionCompactionResult{}, err
 	}
@@ -137,7 +146,6 @@ func (r AgentTurnRunner) PlanSessionCompaction(ctx context.Context, request Sess
 	defer func() {
 		err = errors.Join(err, runtime.Close())
 	}()
-
 	plan, err := runtime.planCompactionCheckpoint(ctx, compactionCheckpointOptions{
 		reason:  "user_requested",
 		phase:   "manual",
@@ -187,7 +195,17 @@ func (r AgentTurnRunner) prepareRuntime(ctx context.Context, session sessions.Se
 	if session.ModelParameters != nil {
 		resolved.Parameters = copyParameterMap(session.ModelParameters)
 	}
-	provider, err := newProviderForRun(resolved.ProviderName, resolved.Type, resolved.Compatibility, resolved.Provider)
+	var logger *eventlog.Logger
+	var recordRequest func(endpoint string, body []byte) error
+	if cfg.Logging.RequestBodies {
+		recordRequest = func(endpoint string, body []byte) error {
+			if logger == nil {
+				return fmt.Errorf("request body logger is not initialized")
+			}
+			return logger.RecordRequestBody(endpoint, body)
+		}
+	}
+	provider, err := newProviderForRun(resolved.ProviderName, resolved.Type, resolved.Compatibility, resolved.Provider, recordRequest)
 	if err != nil {
 		return nil, err
 	}
@@ -213,10 +231,7 @@ func (r AgentTurnRunner) prepareRuntime(ctx context.Context, session sessions.Se
 	if err != nil {
 		return nil, err
 	}
-	var (
-		mcpSessions []*mcp.Session
-		logger      *eventlog.Logger
-	)
+	var mcpSessions []*mcp.Session
 	defer func() {
 		if err != nil {
 			err = errors.Join(err, closeMCPSessions(mcpSessions))
@@ -271,6 +286,7 @@ func (r AgentTurnRunner) prepareRuntime(ctx context.Context, session sessions.Se
 		providerName:  resolved.ProviderName,
 		modelProfile:  resolved.Profile,
 		modelID:       resolved.ModelID,
+		modelType:     resolved.Type,
 		developerRole: model.MessageRole(resolved.DeveloperRole),
 		inputLimit:    resolved.InputLimit,
 		outputLimit:   resolved.OutputLimit,
@@ -294,6 +310,7 @@ func (r AgentTurnRunner) prepareRuntime(ctx context.Context, session sessions.Se
 		activeItemIDs:      copyStringSlice(session.ActiveHistory),
 		contextTracker:     contextTracker,
 		logger:             logger,
+		recordRequest:      recordRequest,
 		mcpSessions:        mcpSessions,
 		config:             cfg,
 	}
@@ -306,31 +323,34 @@ func (r AgentTurnRunner) prepareRuntime(ctx context.Context, session sessions.Se
 }
 
 type agentRunnerRuntime struct {
-	cwd                string
-	configPath         string
-	providerName       string
-	modelProfile       string
-	modelID            string
-	developerRole      model.MessageRole
-	inputLimit         int
-	outputLimit        int
-	parameters         map[string]any
-	provider           model.Provider
-	toolExecutor       runToolExecutor
-	toolSchemas        []model.Tool
-	maxTurns           int
-	enabledTools       []string
-	enabledMCP         []string
-	enabledSkills      []string
-	baseMessages       []model.Message
-	instructionSources []sessions.InstructionSource
-	session            sessions.SessionV2
-	sessionStore       *sessions.V2Store
-	activeItemIDs      []string
-	contextTracker     *contextwindow.Tracker
-	logger             *eventlog.Logger
-	mcpSessions        []*mcp.Session
-	config             *config.Config
+	cwd                 string
+	configPath          string
+	providerName        string
+	modelProfile        string
+	modelID             string
+	modelType           string
+	developerRole       model.MessageRole
+	inputLimit          int
+	outputLimit         int
+	parameters          map[string]any
+	provider            model.Provider
+	toolExecutor        runToolExecutor
+	toolSchemas         []model.Tool
+	maxTurns            int
+	enabledTools        []string
+	enabledMCP          []string
+	enabledSkills       []string
+	baseMessages        []model.Message
+	instructionSources  []sessions.InstructionSource
+	session             sessions.SessionV2
+	sessionStore        *sessions.V2Store
+	activeItemIDs       []string
+	contextTracker      *contextwindow.Tracker
+	logger              *eventlog.Logger
+	recordRequest       func(endpoint string, body []byte) error
+	mcpSessions         []*mcp.Session
+	config              *config.Config
+	onCompactionStarted func(trigger string)
 }
 
 func (r *agentRunnerRuntime) Close() error {
@@ -513,7 +533,7 @@ type compactionPlan struct {
 	context     *contextwindow.Metadata
 }
 
-func (r *agentRunnerRuntime) planAutoCompactBeforeTurn(ctx context.Context, messages []model.Message) ([]model.Message, *compactionPlan, error) {
+func (r *agentRunnerRuntime) planAutoCompactBeforeTurn(ctx context.Context, messages []model.Message, pendingInput model.Message) ([]model.Message, *compactionPlan, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, nil, err
 	}
@@ -542,8 +562,15 @@ func (r *agentRunnerRuntime) planAutoCompactBeforeTurn(ctx context.Context, mess
 		r.config.Compaction.Reserved,
 		r.config.Compaction.ThresholdPercent,
 	)
-	if usageCount <= 0 || threshold <= 0 || usageCount < threshold {
+	tokenPressure := usageCount > 0 && threshold > 0 && usageCount >= threshold
+	pressureMessages := append(copyMessageSlice(messages), pendingInput)
+	requestPressure := r.config.Compaction.MaxRequestBytes > 0 &&
+		r.autoCompactionRequestBytes(pressureMessages) >= r.config.Compaction.MaxRequestBytes
+	if !tokenPressure && !requestPressure {
 		return messages, nil, nil
+	}
+	if r.onCompactionStarted != nil {
+		r.onCompactionStarted("auto")
 	}
 
 	plan, err := r.planCompactionCheckpoint(ctx, compactionCheckpointOptions{
@@ -662,7 +689,7 @@ func (r *agentRunnerRuntime) planSummaryCompactionCheckpoint(ctx context.Context
 	if err != nil {
 		return compactionPlan{}, err
 	}
-	provider, err := newProviderForRun(summaryModel.ProviderName, summaryModel.Type, summaryModel.Compatibility, summaryModel.Provider)
+	provider, err := newProviderForRun(summaryModel.ProviderName, summaryModel.Type, summaryModel.Compatibility, summaryModel.Provider, r.recordRequest)
 	if err != nil {
 		return compactionPlan{}, err
 	}
@@ -708,6 +735,7 @@ func (r *agentRunnerRuntime) planSummaryCompactionCheckpoint(ctx context.Context
 		summaryItem: summaryItem,
 		checkpoint:  checkpoint,
 		messages:    messages,
+		context:     r.estimatedReplacementContext(messages),
 	}, nil
 }
 
@@ -726,7 +754,7 @@ func (r *agentRunnerRuntime) planRemoteCompactionCheckpoint(ctx context.Context,
 	if err != nil {
 		return compactionPlan{}, err
 	}
-	provider, err := newProviderForRun(resolved.ProviderName, resolved.Type, resolved.Compatibility, resolved.Provider)
+	provider, err := newProviderForRun(resolved.ProviderName, resolved.Type, resolved.Compatibility, resolved.Provider, r.recordRequest)
 	if err != nil {
 		return compactionPlan{}, err
 	}
@@ -744,11 +772,6 @@ func (r *agentRunnerRuntime) planRemoteCompactionCheckpoint(ctx context.Context,
 	if err != nil {
 		return compactionPlan{}, err
 	}
-	usage, contextMetadata, err := r.recordRemoteCompactionUsage(compacted.Usage)
-	if err != nil {
-		return compactionPlan{}, err
-	}
-
 	compactionMessage := model.Message{
 		Role:          model.MessageRoleProvider,
 		ProviderItems: copyProviderItemSlice(compacted.Items),
@@ -763,6 +786,10 @@ func (r *agentRunnerRuntime) planRemoteCompactionCheckpoint(ctx context.Context,
 	}
 	replacementHistory := []string{itemID}
 	messages, err = validateCompactionReplacementHistory(r.session, compactionItem, replacementHistory)
+	if err != nil {
+		return compactionPlan{}, err
+	}
+	usage, contextMetadata, err := r.recordRemoteCompactionUsage(compacted.Usage, messages)
 	if err != nil {
 		return compactionPlan{}, err
 	}
@@ -788,7 +815,7 @@ func (r *agentRunnerRuntime) planRemoteCompactionCheckpoint(ctx context.Context,
 	}, nil
 }
 
-func (r *agentRunnerRuntime) recordRemoteCompactionUsage(usage model.Usage) (*model.Usage, *contextwindow.Metadata, error) {
+func (r *agentRunnerRuntime) recordRemoteCompactionUsage(usage model.Usage, replacementMessages []model.Message) (*model.Usage, *contextwindow.Metadata, error) {
 	if usage == (model.Usage{}) {
 		return nil, nil, nil
 	}
@@ -803,9 +830,40 @@ func (r *agentRunnerRuntime) recordRemoteCompactionUsage(usage model.Usage) (*mo
 	if r.contextTracker == nil {
 		return &usageCopy, nil, nil
 	}
-	r.contextTracker.RecordProviderUsage(usage)
+	return &usageCopy, r.estimatedReplacementContext(replacementMessages), nil
+}
+
+func (r *agentRunnerRuntime) estimatedReplacementContext(replacementMessages []model.Message) *contextwindow.Metadata {
+	if r == nil || r.contextTracker == nil {
+		return nil
+	}
+	estimate := contextwindow.EstimateRequestTokens(model.Request{
+		Model:      r.modelID,
+		Messages:   replacementMessages,
+		Tools:      r.toolSchemas,
+		Parameters: r.parameters,
+		SessionID:  r.session.ID,
+	})
+	r.contextTracker.RecordEstimatedUsage(estimate, 0)
 	metadata := r.contextTracker.Metadata()
-	return &usageCopy, &metadata, nil
+	return &metadata
+}
+
+func (r *agentRunnerRuntime) autoCompactionRequestBytes(messages []model.Message) int {
+	if r == nil || (r.modelType != config.ProviderTypeOpenAIResponses && r.modelType != config.ProviderTypeOpenAICodex) {
+		return 0
+	}
+	body, err := openairesponses.BuildRequestBody(model.Request{
+		Model:      r.modelID,
+		Messages:   messages,
+		Tools:      r.toolSchemas,
+		Parameters: r.parameters,
+		SessionID:  r.session.ID,
+	}, true)
+	if err != nil {
+		return 0
+	}
+	return len(body)
 }
 
 func expandRemoteCompactionHistory(session sessions.SessionV2) (sessions.SessionV2, error) {
@@ -1345,7 +1403,7 @@ func closeMCPSessions(sessions []*mcp.Session) error {
 	return nil
 }
 
-func newProviderForRun(providerName, modelType, compatibility string, provider config.ProviderConfig) (model.Provider, error) {
+func newProviderForRun(providerName, modelType, compatibility string, provider config.ProviderConfig, recordRequest func(endpoint string, body []byte) error) (model.Provider, error) {
 	httpOptions, err := providerHTTPOptions(provider)
 	if err != nil {
 		return nil, fmt.Errorf("provider %q: %w", providerName, err)
@@ -1358,9 +1416,13 @@ func newProviderForRun(providerName, modelType, compatibility string, provider c
 	case config.ProviderTypeOpenAIChat:
 		return openaichat.NewProvider(openAIChatProviderConfig(provider, compatibility, httpClient, httpOptions))
 	case config.ProviderTypeOpenAIResponses:
-		return openairesponses.NewProvider(openAIResponsesProviderConfig(provider, httpClient, httpOptions))
+		providerConfig := openAIResponsesProviderConfig(provider, httpClient, httpOptions)
+		providerConfig.RecordRequest = recordRequest
+		return openairesponses.NewProvider(providerConfig)
 	case config.ProviderTypeOpenAICodex:
-		return openairesponses.NewProvider(openAICodexProviderConfig(provider, httpClient, httpOptions))
+		providerConfig := openAICodexProviderConfig(provider, httpClient, httpOptions)
+		providerConfig.RecordRequest = recordRequest
+		return openairesponses.NewProvider(providerConfig)
 	case config.ProviderTypeAnthropicMessages:
 		return anthropicmessages.NewProvider(anthropicMessagesProviderConfig(provider, httpClient, httpOptions))
 	default:

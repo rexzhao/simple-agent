@@ -252,11 +252,12 @@ func TestPlanCompactionCheckpointUsesStandaloneResponsesCompaction(t *testing.T)
 		t.Fatalf("plan usage = %#v, want %#v", plan.usage, wantUsage)
 	}
 	if plan.context == nil ||
-		plan.context.LastInputTokens != 100 ||
-		plan.context.LastCachedTokens != 900 ||
-		plan.context.LastCacheWriteTokens != 200 ||
-		plan.context.LastUsageSource != string(contextwindow.UsageSourceProvider) {
-		t.Fatalf("plan context = %#v, want compact usage metadata", plan.context)
+		plan.context.LastInputTokens <= 0 ||
+		plan.context.LastInputTokens >= wantUsage.TotalTokens ||
+		plan.context.LastCachedTokens != 0 ||
+		plan.context.LastCacheWriteTokens != 0 ||
+		plan.context.LastUsageSource != string(contextwindow.UsageSourceEstimated) {
+		t.Fatalf("plan context = %#v, want estimated replacement-history usage", plan.context)
 	}
 	if plan.context.LastUsageAnchorMessages != 0 || plan.context.LastUsageAnchorHash != "" {
 		t.Fatalf("compact usage must not anchor the next response request: %#v", plan.context)
@@ -284,6 +285,18 @@ func TestPlanCompactionCheckpointUsesStandaloneResponsesCompaction(t *testing.T)
 	input, ok := body["input"].([]any)
 	if !ok || len(input) != 2 {
 		t.Fatalf("compact input = %#v, want two messages", body["input"])
+	}
+}
+
+func TestAutoCompactionRequestBytesMeasuresResponsesReplay(t *testing.T) {
+	runtime := &agentRunnerRuntime{
+		modelType: config.ProviderTypeOpenAIResponses,
+		modelID:   "gpt-test",
+	}
+	small := runtime.autoCompactionRequestBytes([]model.Message{{Role: model.MessageRoleUser, Content: "short"}})
+	large := runtime.autoCompactionRequestBytes([]model.Message{{Role: model.MessageRoleUser, Content: strings.Repeat("x", 4096)}})
+	if small <= 0 || large <= small+4000 {
+		t.Fatalf("request sizes small=%d large=%d, want serialized replay growth", small, large)
 	}
 }
 

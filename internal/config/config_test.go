@@ -228,6 +228,9 @@ func TestLoadDefaultsCompactionConfig(t *testing.T) {
 	if cfg.Compaction.ThresholdPercent != 80 {
 		t.Fatalf("Compaction.ThresholdPercent = %d, want 80", cfg.Compaction.ThresholdPercent)
 	}
+	if cfg.Compaction.MaxRequestBytes != 700*1024 {
+		t.Fatalf("Compaction.MaxRequestBytes = %d, want %d", cfg.Compaction.MaxRequestBytes, 700*1024)
+	}
 	if cfg.Compaction.SummaryProvider != "" {
 		t.Fatalf("Compaction.SummaryProvider = %q, want empty default", cfg.Compaction.SummaryProvider)
 	}
@@ -260,6 +263,7 @@ compaction:
   enabled: true
   threshold_percent: 65
   reserved: 12000
+  max_request_bytes: 800000
   summary_provider: ../summary-provider
   summary_model: models/summary
 `)
@@ -277,6 +281,9 @@ compaction:
 	}
 	if cfg.Compaction.Reserved != 12000 {
 		t.Fatalf("Compaction.Reserved = %d, want 12000", cfg.Compaction.Reserved)
+	}
+	if cfg.Compaction.MaxRequestBytes != 800000 {
+		t.Fatalf("Compaction.MaxRequestBytes = %d, want 800000", cfg.Compaction.MaxRequestBytes)
 	}
 	if cfg.Compaction.SummaryProvider != "../summary-provider" {
 		t.Fatalf("Compaction.SummaryProvider = %q, want path-like value unchanged", cfg.Compaction.SummaryProvider)
@@ -556,6 +563,7 @@ mcp_dir: mcp-files
 
 logging:
   path: run-logs/sai.jsonl
+  request_bodies: true
 
 sessions:
   dir: saved-sessions
@@ -600,6 +608,9 @@ models:
 	}
 	if cfg.Logging.Path != filepath.Join(rootDir, "run-logs", "sai.jsonl") {
 		t.Fatalf("Logging.Path = %q", cfg.Logging.Path)
+	}
+	if !cfg.Logging.RequestBodies {
+		t.Fatal("Logging.RequestBodies = false, want true")
 	}
 	if cfg.Sessions.Dir != filepath.Join(rootDir, "saved-sessions") {
 		t.Fatalf("Sessions.Dir = %q", cfg.Sessions.Dir)

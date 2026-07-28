@@ -82,7 +82,7 @@ func TestProviderRunUsesConfiguredHTTPProxy(t *testing.T) {
 		BaseURL:        "http://provider.example.test/v1",
 		ResolvedAPIKey: "test-key",
 		HTTPProxy:      proxy.URL,
-	})
+	}, nil)
 	if err != nil {
 		t.Fatalf("newProviderForRun() error = %v", err)
 	}

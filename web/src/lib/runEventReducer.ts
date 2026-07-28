@@ -8,6 +8,24 @@ export function reduceRunEvent(run: ActiveRun, event: RunEvent): ActiveRun {
   switch (event.type) {
     case 'turn.started':
       return { ...run, turnID: String(event.turn_id ?? '') }
+    case 'compaction.started':
+      return {
+        ...run,
+        compaction: {
+          trigger: event.trigger === 'manual' ? 'manual' : 'auto',
+          status: 'running',
+        },
+      }
+    case 'compaction.completed':
+      return {
+        ...run,
+        compaction: {
+          trigger: event.trigger === 'manual' ? 'manual' : 'auto',
+          status: 'completed',
+          activeContextTokens: Number(event.active_context_tokens ?? 0) || undefined,
+          contextWindow: Number(event.context_window ?? 0) || undefined,
+        },
+      }
     case 'run.prompt_queue':
       return {
         ...run,

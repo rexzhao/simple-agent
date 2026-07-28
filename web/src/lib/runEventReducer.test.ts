@@ -74,4 +74,28 @@ describe('reduceRunEvent', () => {
     expect(run.steps).toEqual([expect.objectContaining({ kind: 'reasoning', text: 'think more' })])
     expect(run).toMatchObject({ inputTokens: 10, totalTokens: 14, cachedTokens: 2, reasoningTokens: 3, status: 'failed', error: 'boom' })
   })
+
+  it('tracks automatic compaction lifecycle and replacement context size', () => {
+    const compacting = reduceRunEvent(newRun(), {
+      type: 'compaction.started',
+      turn_id: 'turn-1',
+      trigger: 'auto',
+    })
+    expect(compacting.compaction).toEqual({ trigger: 'auto', status: 'running' })
+
+    const completed = reduceRunEvent(compacting, {
+      type: 'compaction.completed',
+      turn_id: 'turn-1',
+      trigger: 'auto',
+      compaction_id: 'compact-1',
+      active_context_tokens: 12000,
+      context_window: 400000,
+    })
+    expect(completed.compaction).toEqual({
+      trigger: 'auto',
+      status: 'completed',
+      activeContextTokens: 12000,
+      contextWindow: 400000,
+    })
+  })
 })

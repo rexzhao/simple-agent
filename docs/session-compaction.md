@@ -316,9 +316,13 @@ compaction:
   enabled: false
   threshold_percent: 80
   reserved: 0
+  max_request_bytes: 716800
   summary_provider: ""
   summary_model: ""
 ```
+
+`max_request_bytes` 是 OpenAI Responses / Codex 的 pre-turn replay 压力保护线。
+序列化请求达到该大小时，即使尚未达到 token 阈值也会先压缩；设为 `0` 可关闭此保护。
 
 语义：
 

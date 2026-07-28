@@ -219,15 +219,16 @@ type SessionTurnCompactionPlanner interface {
 }
 
 type SessionTurnRequest struct {
-	Session        sessions.SessionV2
-	SessionStore   *sessions.V2Store
-	SessionService *Service
-	RunCoordinator *SessionRunCoordinator
-	TurnID         string
-	Content        string
-	ContentBlocks  []model.InputContentBlock
-	Emit           func(model.Event)
-	Publisher      eventbus.Publisher
+	Session             sessions.SessionV2
+	SessionStore        *sessions.V2Store
+	SessionService      *Service
+	RunCoordinator      *SessionRunCoordinator
+	TurnID              string
+	Content             string
+	ContentBlocks       []model.InputContentBlock
+	Emit                func(model.Event)
+	Publisher           eventbus.Publisher
+	OnCompactionStarted func(trigger string)
 	// ActivePromptDrain is an optional callback polled at safe checkpoints
 	// during the active turn. When set, AgentTurnRunner adapts it into the
 	// agent-loop active prompt drain so queued user messages are appended to the
@@ -1501,7 +1502,7 @@ func (s *Service) runSessionMessage(ctx context.Context, id string, input Sessio
 		activePromptDrain = run.activePromptDrain()
 	}
 
-	session, err = s.planAutoCompaction(ctx, bus, session, turnID, input)
+	session, err = s.planAutoCompaction(ctx, bus, session, turnID, input, submit)
 	if err != nil {
 		markFailed(turnFailureCompaction)
 		return SessionMessageResult{}, err
@@ -1661,7 +1662,7 @@ func (s *Service) requireIncrementalSessionTurn(ctx context.Context, session ses
 	return nil
 }
 
-func (s *Service) planAutoCompaction(ctx context.Context, bus eventbus.Publisher, session sessions.SessionV2, turnID string, input SessionMessageInput) (sessions.SessionV2, error) {
+func (s *Service) planAutoCompaction(ctx context.Context, bus eventbus.Publisher, session sessions.SessionV2, turnID string, input SessionMessageInput, submit func(SessionStreamEvent)) (sessions.SessionV2, error) {
 	planner, ok := s.turnRunner.(SessionTurnCompactionPlanner)
 	if !ok {
 		return session, nil
@@ -1674,6 +1675,12 @@ func (s *Service) planAutoCompaction(ctx context.Context, bus eventbus.Publisher
 		TurnID:         turnID,
 		Content:        input.Content,
 		ContentBlocks:  copyInputContentBlocks(input.ContentBlocks),
+		OnCompactionStarted: func(trigger string) {
+			submitSessionStreamEvent(submit, NewSessionStreamEvent("compaction.started", map[string]any{
+				"turn_id": turnID,
+				"trigger": trigger,
+			}))
+		},
 	})
 	if err != nil {
 		return sessions.SessionV2{}, ErrTurnFailed
@@ -1692,6 +1699,16 @@ func (s *Service) planAutoCompaction(ctx context.Context, bus eventbus.Publisher
 	}); err != nil {
 		return sessions.SessionV2{}, fmt.Errorf("could not compact session")
 	}
+	fields := map[string]any{
+		"turn_id":       turnID,
+		"trigger":       "auto",
+		"compaction_id": result.Compaction.Checkpoint.ID,
+	}
+	if result.Compaction.Context != nil {
+		fields["active_context_tokens"] = result.Compaction.Context.LastInputTokens
+		fields["context_window"] = result.Compaction.Context.ContextWindow
+	}
+	submitSessionStreamEvent(submit, NewSessionStreamEvent("compaction.completed", fields))
 	compacted, err := s.sessionStore.Load(session.ID)
 	if err != nil {
 		return sessions.SessionV2{}, err

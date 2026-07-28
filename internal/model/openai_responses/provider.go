@@ -22,6 +22,7 @@ type ProviderConfig struct {
 	ForceStoreFalse bool
 	HTTPClient      *http.Client
 	HTTPOptions     httpstream.Options
+	RecordRequest   func(endpoint string, body []byte) error
 }
 
 type TokenSource interface {
@@ -40,6 +41,7 @@ type Provider struct {
 	forceStoreFalse bool
 	httpClient      *http.Client
 	httpOptions     httpstream.Options
+	recordRequest   func(endpoint string, body []byte) error
 }
 
 var _ model.Provider = (*Provider)(nil)
@@ -63,6 +65,7 @@ func NewProvider(config ProviderConfig) (*Provider, error) {
 		forceStoreFalse: config.ForceStoreFalse,
 		httpClient:      httpClient,
 		httpOptions:     config.HTTPOptions,
+		recordRequest:   config.RecordRequest,
 	}, nil
 }
 
@@ -174,6 +177,11 @@ func (p *Provider) doRequest(ctx context.Context, token AccessToken, body []byte
 }
 
 func (p *Provider) doRequestTo(ctx context.Context, token AccessToken, body []byte, metadata providerRequestMetadata, path string) (*http.Response, error) {
+	if p.recordRequest != nil {
+		if err := p.recordRequest(path, body); err != nil {
+			return nil, fmt.Errorf("record OpenAI Responses request: %w", err)
+		}
+	}
 	return httpstream.DoRequest(ctx, p.httpClient, p.httpOptions, func(requestCtx context.Context) (*http.Request, error) {
 		httpRequest, err := http.NewRequestWithContext(requestCtx, http.MethodPost, p.baseURL+path, bytes.NewReader(body))
 		if err != nil {

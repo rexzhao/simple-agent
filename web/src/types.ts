@@ -192,6 +192,8 @@ export interface ItemsPage {
 
 export type RunEvent =
   | { type: 'turn.started'; turn_id: string }
+  | { type: 'compaction.started'; turn_id: string; trigger: 'auto' | 'manual' }
+  | { type: 'compaction.completed'; turn_id: string; trigger: 'auto' | 'manual'; compaction_id: string; active_context_tokens?: number; context_window?: number }
 	| { type: 'agent.iteration.started'; turn_id: string; agent_iteration: number }
 	| { type: 'text.delta'; turn_id: string; agent_iteration: number; text: string }
 	| { type: 'reasoning.delta'; turn_id: string; agent_iteration: number; text: string }
@@ -260,7 +262,13 @@ export interface ActiveRun {
   totalTokens?: number
 	cachedTokens?: number
 	cacheWriteTokens?: number
-	reasoningTokens?: number
+  reasoningTokens?: number
+  compaction?: {
+    trigger: 'auto' | 'manual'
+    status: 'running' | 'completed'
+    activeContextTokens?: number
+    contextWindow?: number
+  }
   status: 'running' | 'failed' | 'cancelled'
   error?: string
 }
