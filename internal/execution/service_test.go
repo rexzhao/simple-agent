@@ -664,6 +664,76 @@ func TestServiceSendSessionMessagePersistsSuccessfulTurn(t *testing.T) {
 	}
 }
 
+func TestServiceReplayTrailingUserUsesExistingHistoryWithoutAppendingInput(t *testing.T) {
+	home := t.TempDir()
+	runner := fakeExecutionTurnRunner{
+		supports: true,
+		run: func(ctx context.Context, request SessionTurnRequest) (SessionTurnResult, error) {
+			if !request.ReplayHistory {
+				t.Fatal("RunSessionTurn ReplayHistory = false, want true")
+			}
+			if request.Content != "" || len(request.ContentBlocks) != 0 {
+				t.Fatalf("RunSessionTurn input = %q/%#v, want no new input", request.Content, request.ContentBlocks)
+			}
+			messages, err := request.Session.MaterializeActiveHistory()
+			if err != nil {
+				return SessionTurnResult{}, err
+			}
+			if got := messageContents(messages); !sameStringSlice(got, []string{"original prompt"}) {
+				t.Fatalf("runner history = %#v, want original prompt once", got)
+			}
+			if err := request.Publisher.Publish(eventAssistant(request.TurnID, "replayed answer")); err != nil {
+				return SessionTurnResult{}, err
+			}
+			return SessionTurnResult{Incremental: true}, nil
+		},
+	}
+	service, _, session := newExecutionServiceWithSession(t, home, runner)
+	userItem := sessions.SessionItem{
+		ID:         "original-user",
+		Kind:       sessions.ItemKindMessage,
+		Visibility: sessions.ItemVisibilityVisible,
+		Audience:   sessions.ItemAudienceUser,
+		Message:    &model.Message{Role: model.MessageRoleUser, Content: "original prompt"},
+	}
+	if _, err := service.sessionStore.AppendItemsAndReplaceActiveHistory(session.ID, []sessions.SessionItem{userItem}, []string{userItem.ID}); err != nil {
+		t.Fatalf("AppendItemsAndReplaceActiveHistory() error = %v", err)
+	}
+
+	result, err := service.runSessionMessage(context.Background(), session.ID, SessionMessageInput{ReplayItemID: userItem.ID}, nil, nil)
+	if err != nil {
+		t.Fatalf("runSessionMessage(replay) error = %v", err)
+	}
+	if result.Status != "committed" {
+		t.Fatalf("runSessionMessage(replay) result = %#v, want committed", result)
+	}
+	loaded, err := service.sessionStore.Load(session.ID)
+	if err != nil {
+		t.Fatalf("Load(session) error = %v", err)
+	}
+	messages, err := loaded.MaterializeActiveHistory()
+	if err != nil {
+		t.Fatalf("MaterializeActiveHistory() error = %v", err)
+	}
+	if got := messageContents(messages); !sameStringSlice(got, []string{"original prompt", "replayed answer"}) {
+		t.Fatalf("active messages = %#v, want original prompt once followed by answer", got)
+	}
+}
+
+func TestServiceReplayRejectsNonTrailingHistoryItem(t *testing.T) {
+	service, _, session := newExecutionServiceWithSession(t, t.TempDir(), fakeExecutionTurnRunner{supports: true})
+	items := []sessions.SessionItem{
+		{ID: "older-user", Kind: sessions.ItemKindMessage, Visibility: sessions.ItemVisibilityVisible, Audience: sessions.ItemAudienceUser, Message: &model.Message{Role: model.MessageRoleUser, Content: "older"}},
+		{ID: "latest-user", Kind: sessions.ItemKindMessage, Visibility: sessions.ItemVisibilityVisible, Audience: sessions.ItemAudienceUser, Message: &model.Message{Role: model.MessageRoleUser, Content: "latest"}},
+	}
+	if _, err := service.sessionStore.AppendItemsAndReplaceActiveHistory(session.ID, items, []string{"older-user", "latest-user"}); err != nil {
+		t.Fatalf("AppendItemsAndReplaceActiveHistory() error = %v", err)
+	}
+	if err := service.ValidateSessionMessageInput(session.ID, SessionMessageInput{ReplayItemID: "older-user"}); err == nil {
+		t.Fatal("ValidateSessionMessageInput(non-trailing replay) error = nil, want rejection")
+	}
+}
+
 func TestServiceGetSessionChatItemsFiltersItemBackedVisibleMessages(t *testing.T) {
 	home := t.TempDir()
 	service, _, session := newExecutionServiceWithSession(t, home, fakeExecutionTurnRunner{supports: true})

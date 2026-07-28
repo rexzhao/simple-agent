@@ -173,7 +173,7 @@ func (r *runRegistry) startWithInput(sessionID string, input execution.SessionMe
 	if sessionID == "" {
 		return nil, fmt.Errorf("session id is required")
 	}
-	if strings.TrimSpace(input.Content) == "" && len(input.ContentBlocks) == 0 {
+	if strings.TrimSpace(input.Content) == "" && len(input.ContentBlocks) == 0 && strings.TrimSpace(input.ReplayItemID) == "" {
 		return nil, fmt.Errorf("message content or image attachment is required")
 	}
 	r.mu.Lock()
@@ -516,8 +516,9 @@ func encodeRunEvent(event execution.SessionStreamEvent) []byte {
 }
 
 type startRunRequest struct {
-	Content string                    `json:"content"`
-	Images  []startRunImageAttachment `json:"images,omitempty"`
+	Content      string                    `json:"content"`
+	Images       []startRunImageAttachment `json:"images,omitempty"`
+	ReplayItemID string                    `json:"replay_item_id,omitempty"`
 }
 
 type startRunImageAttachment struct {
@@ -526,6 +527,12 @@ type startRunImageAttachment struct {
 }
 
 func (request startRunRequest) messageInput() (execution.SessionMessageInput, error) {
+	if strings.TrimSpace(request.ReplayItemID) != "" {
+		if strings.TrimSpace(request.Content) != "" || len(request.Images) != 0 {
+			return execution.SessionMessageInput{}, fmt.Errorf("replay cannot include new message content")
+		}
+		return execution.SessionMessageInput{ReplayItemID: request.ReplayItemID}, nil
+	}
 	if len(request.Images) > maxRunImageAttachments {
 		return execution.SessionMessageInput{}, fmt.Errorf("at most %d images may be attached", maxRunImageAttachments)
 	}

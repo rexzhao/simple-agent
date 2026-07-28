@@ -213,6 +213,11 @@ func (l *Logger) eventRecord(event model.Event) map[string]any {
 			"cache_write_tokens": event.Usage.CacheWriteTokens,
 			"reasoning_tokens":   event.Usage.ReasoningTokens,
 		}
+	case model.ProviderRetryEvent:
+		record["attempt"] = event.Attempt
+		record["max_attempts"] = event.MaxAttempts
+		record["delay_ms"] = event.Delay.Milliseconds()
+		record["reason"] = event.Reason
 	case model.ErrorEvent:
 		record["is_error"] = true
 		record["message"] = safeErrorMessage(event)

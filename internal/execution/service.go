@@ -155,6 +155,9 @@ type SessionMessageResult struct {
 type SessionMessageInput struct {
 	Content       string
 	ContentBlocks []model.InputContentBlock
+	// ReplayItemID starts a turn from the already-persisted active history.
+	// It must identify the trailing user message; no new user item is appended.
+	ReplayItemID string
 }
 
 // Message builds the model-facing user message. When attachments exist the
@@ -226,6 +229,7 @@ type SessionTurnRequest struct {
 	TurnID              string
 	Content             string
 	ContentBlocks       []model.InputContentBlock
+	ReplayHistory       bool
 	Emit                func(model.Event)
 	Publisher           eventbus.Publisher
 	OnCompactionStarted func(trigger string)
@@ -1329,6 +1333,24 @@ func (s *Service) ValidateSessionMessageInput(id string, input SessionMessageInp
 }
 
 func (s *Service) validateSessionMessageInput(session sessions.SessionV2, input SessionMessageInput) error {
+	if strings.TrimSpace(input.ReplayItemID) != "" {
+		if strings.TrimSpace(input.Content) != "" || len(input.ContentBlocks) != 0 {
+			return fmt.Errorf("replay cannot include new message content")
+		}
+		if len(session.ActiveHistory) == 0 || session.ActiveHistory[len(session.ActiveHistory)-1] != input.ReplayItemID {
+			return fmt.Errorf("replay item must be the trailing active history item")
+		}
+		for _, item := range session.Items {
+			if item.ID != input.ReplayItemID {
+				continue
+			}
+			if item.Message == nil || item.Message.Role != model.MessageRoleUser {
+				return fmt.Errorf("replay item must be a user message")
+			}
+			return nil
+		}
+		return fmt.Errorf("replay item was not found")
+	}
 	if err := model.ValidateImageInputBlocks(input.ContentBlocks, false); err != nil {
 		return err
 	}
@@ -1370,7 +1392,7 @@ func (s *Service) runSessionMessage(ctx context.Context, id string, input Sessio
 	if s == nil || s.sessionStore == nil {
 		return SessionMessageResult{}, fmt.Errorf("execution session store is not configured")
 	}
-	if strings.TrimSpace(content) == "" && len(input.ContentBlocks) == 0 {
+	if strings.TrimSpace(content) == "" && len(input.ContentBlocks) == 0 && strings.TrimSpace(input.ReplayItemID) == "" {
 		return SessionMessageResult{}, fmt.Errorf("message content or image attachment is required")
 	}
 	if s.turnRunner == nil {
@@ -1507,9 +1529,11 @@ func (s *Service) runSessionMessage(ctx context.Context, id string, input Sessio
 		markFailed(turnFailureCompaction)
 		return SessionMessageResult{}, err
 	}
-	if err := bus.Publish(eventbus.TurnInputReady{TurnID: turnID, Message: input.Message()}); err != nil {
-		markFailed(turnFailureTurnInput)
-		return SessionMessageResult{}, fmt.Errorf("could not save turn input")
+	if input.ReplayItemID == "" {
+		if err := bus.Publish(eventbus.TurnInputReady{TurnID: turnID, Message: input.Message()}); err != nil {
+			markFailed(turnFailureTurnInput)
+			return SessionMessageResult{}, fmt.Errorf("could not save turn input")
+		}
 	}
 
 	result, err := s.turnRunner.RunSessionTurn(ctx, SessionTurnRequest{
@@ -1520,6 +1544,7 @@ func (s *Service) runSessionMessage(ctx context.Context, id string, input Sessio
 		TurnID:            turnID,
 		Content:           content,
 		ContentBlocks:     copyInputContentBlocks(input.ContentBlocks),
+		ReplayHistory:     input.ReplayItemID != "",
 		ActivePromptDrain: activePromptDrain,
 		Emit: func(event model.Event) {
 			if event != nil {
@@ -1652,6 +1677,7 @@ func (s *Service) requireIncrementalSessionTurn(ctx context.Context, session ses
 		RunCoordinator: s.sessionRunCoordinator(),
 		Content:        input.Content,
 		ContentBlocks:  copyInputContentBlocks(input.ContentBlocks),
+		ReplayHistory:  input.ReplayItemID != "",
 	})
 	if err != nil {
 		return ErrTurnFailed
@@ -1675,6 +1701,7 @@ func (s *Service) planAutoCompaction(ctx context.Context, bus eventbus.Publisher
 		TurnID:         turnID,
 		Content:        input.Content,
 		ContentBlocks:  copyInputContentBlocks(input.ContentBlocks),
+		ReplayHistory:  input.ReplayItemID != "",
 		OnCompactionStarted: func(trigger string) {
 			submitSessionStreamEvent(submit, NewSessionStreamEvent("compaction.started", map[string]any{
 				"turn_id": turnID,

@@ -38,6 +38,26 @@ func TestSessionStreamUsageEventIncludesCacheDetails(t *testing.T) {
 	}
 }
 
+func TestSessionStreamProviderRetryEventIncludesBackoffDetails(t *testing.T) {
+	event, ok := sessionStreamEventFromModelEvent("turn-1", 6, model.ProviderRetryEvent{
+		Attempt:     2,
+		MaxAttempts: 3,
+		Delay:       time.Second,
+		Reason:      "server_error",
+	}, true)
+	if !ok {
+		t.Fatal("sessionStreamEventFromModelEvent() ok = false, want true")
+	}
+	for key, want := range map[string]any{
+		"type": "provider.retrying", "turn_id": "turn-1", "agent_iteration": 6,
+		"attempt": 2, "max_attempts": 3, "delay_ms": int64(1000), "reason": "server_error",
+	} {
+		if got := event[key]; got != want {
+			t.Fatalf("event[%q] = %#v, want %#v; event = %#v", key, got, want, event)
+		}
+	}
+}
+
 func TestSessionToolDisplayArgumentsIncludesEditDiffInputs(t *testing.T) {
 	displayed := sessionToolDisplayArguments("edit_file", `{"path":"notes.txt","old":"before","new":"after","extra":"hidden"}`)
 	var arguments map[string]string

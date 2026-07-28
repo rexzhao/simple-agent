@@ -308,6 +308,8 @@ svg { width: 1.1em; height: 1.1em; fill: none; stroke: currentColor; stroke-widt
 .compaction-status span { width: 9px; height: 9px; flex: 0 0 auto; border: 2px solid var(--border); background: var(--accent); animation: pulse 1.2s infinite; }
 .compaction-status.completed { background: var(--success-soft); }
 .compaction-status.completed span { background: var(--success); animation: none; }
+.provider-retry-status { width: min(700px, 100%); display: flex; align-items: center; gap: 9px; margin: 0 0 20px; padding: 10px 12px; border: 2px solid var(--border); background: var(--warning-soft, #fff7d6); font-size: 11px; font-weight: 750; }
+.provider-retry-status span { width: 9px; height: 9px; flex: 0 0 auto; border: 2px solid var(--border); background: var(--accent); animation: pulse 1.2s infinite; }
 
 .secondary-button, .primary-button {
   min-height: 34px;

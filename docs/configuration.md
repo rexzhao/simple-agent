@@ -211,6 +211,12 @@ variables keep their normal behavior.
 headers. Header timeouts are retried once before the turn fails. The default is
 15 seconds when this option is omitted.
 
+OpenAI Responses and Codex can also report transient `server_error` or
+`server_is_overloaded` failures inside an already-open SSE stream. SAI retries
+those failures up to two times with 1s/2s backoff, but only when that provider
+attempt produced no text, reasoning, usage, or tool-call events. Once any model
+progress is observed, the request is never replayed automatically.
+
 `reasoning_config` maps the reasoning names shown by SAI to the value expected
 by that model. `parameter` is a dot-separated request path, `default` is the
 level selected for a new session, and `levels` may contain string, number,

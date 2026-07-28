@@ -69,6 +69,7 @@ func (r AgentTurnRunner) RunSessionTurn(ctx context.Context, request SessionTurn
 
 	_, runErr := runtime.runSessionTurn(ctx, request.Content, sessionTurnRunOptions{
 		contentBlocks:     copyInputContentBlocks(request.ContentBlocks),
+		replayHistory:     request.ReplayHistory,
 		emit:              request.Emit,
 		publisher:         request.Publisher,
 		turnID:            request.TurnID,
@@ -116,11 +117,15 @@ func (r AgentTurnRunner) PlanSessionTurnCompaction(ctx context.Context, request 
 	if len(request.ContentBlocks) > 0 {
 		pendingInput = ""
 	}
-	_, compaction, err := runtime.planAutoCompactBeforeTurn(ctx, messages, model.Message{
-		Role:          model.MessageRoleUser,
-		Content:       pendingInput,
-		ContentBlocks: copyInputContentBlocks(request.ContentBlocks),
-	})
+	pendingMessage := model.Message{}
+	if !request.ReplayHistory {
+		pendingMessage = model.Message{
+			Role:          model.MessageRoleUser,
+			Content:       pendingInput,
+			ContentBlocks: copyInputContentBlocks(request.ContentBlocks),
+		}
+	}
+	_, compaction, err := runtime.planAutoCompactBeforeTurn(ctx, messages, pendingMessage)
 	if err != nil {
 		return SessionCompactionResult{}, err
 	}
@@ -418,6 +423,7 @@ func (r *agentRunnerRuntime) refreshSessionRuntimeMetadata(session sessions.Sess
 
 type sessionTurnRunOptions struct {
 	contentBlocks     []model.InputContentBlock
+	replayHistory     bool
 	emit              func(model.Event)
 	publisher         eventbus.Publisher
 	turnID            string
@@ -462,10 +468,13 @@ func (r *agentRunnerRuntime) runSessionTurn(ctx context.Context, prompt string, 
 	if err != nil {
 		return nil, err
 	}
-	requestMessages := append(copyMessageSlice(messages), SessionMessageInput{
-		Content:       prompt,
-		ContentBlocks: copyInputContentBlocks(options.contentBlocks),
-	}.Message())
+	requestMessages := copyMessageSlice(messages)
+	if !options.replayHistory {
+		requestMessages = append(requestMessages, SessionMessageInput{
+			Content:       prompt,
+			ContentBlocks: copyInputContentBlocks(options.contentBlocks),
+		}.Message())
+	}
 	request := model.Request{
 		Model:         r.modelID,
 		Messages:      requestMessages,
@@ -563,7 +572,10 @@ func (r *agentRunnerRuntime) planAutoCompactBeforeTurn(ctx context.Context, mess
 		r.config.Compaction.ThresholdPercent,
 	)
 	tokenPressure := usageCount > 0 && threshold > 0 && usageCount >= threshold
-	pressureMessages := append(copyMessageSlice(messages), pendingInput)
+	pressureMessages := copyMessageSlice(messages)
+	if pendingInput.Role != "" {
+		pressureMessages = append(pressureMessages, pendingInput)
+	}
 	requestPressure := r.config.Compaction.MaxRequestBytes > 0 &&
 		r.autoCompactionRequestBytes(pressureMessages) >= r.config.Compaction.MaxRequestBytes
 	if !tokenPressure && !requestPressure {

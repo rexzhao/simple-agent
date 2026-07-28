@@ -125,6 +125,10 @@ export const api = {
     method: 'POST',
     body: JSON.stringify({ content, images }),
   }),
+  resendRun: (sessionID: string, replayItemID: string) => request<{ run_id: string; session_id: string; status: string }>(`/api/sessions/${encodeURIComponent(sessionID)}/runs`, {
+    method: 'POST',
+    body: JSON.stringify({ replay_item_id: replayItemID }),
+  }),
   sessionImage: async (sessionID: string, hash: string): Promise<Blob> => {
     const response = await fetch(`/api/sessions/${encodeURIComponent(sessionID)}/images/${encodeURIComponent(hash)}`, {
       headers: { Authorization: `Bearer ${token}` },

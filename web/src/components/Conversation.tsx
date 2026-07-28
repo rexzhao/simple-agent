@@ -200,7 +200,7 @@ export const Conversation = memo(function Conversation(props: {
 		if (settleActiveRef.current) return
 		if (followOutputRef.current) scrollToBottom()
 	}, [props.activeRun, props.page?.newest_seq, props.turnError, scrollToBottom])
-	// Resending replays the trailing user message as a new run.
+	// Resending starts a run from the trailing user message already in history.
 	const handleResend = useCallback(async (item: SessionItem) => {
 		if (resendPending) return
 		setResendPending(true)
@@ -299,7 +299,7 @@ export const Conversation = memo(function Conversation(props: {
 		  )}
         </div>
         <div className="header-actions">
-		  <span className={`status-pill ${props.compacting || props.activeRun || props.detail?.status === 'running' || props.otherSessionsRunning ? 'running' : ''}`}><span />{props.compacting || props.activeRun?.compaction?.status === 'running' ? 'Compacting context' : props.activeRun || props.detail?.status === 'running' ? 'Running' : props.otherSessionsRunning ? 'Another session running' : 'Ready'}</span>
+		  <span className={`status-pill ${props.compacting || props.activeRun || props.detail?.status === 'running' || props.otherSessionsRunning ? 'running' : ''}`}><span />{props.activeRun?.providerRetry ? 'Retrying request' : props.compacting || props.activeRun?.compaction?.status === 'running' ? 'Compacting context' : props.activeRun || props.detail?.status === 'running' ? 'Running' : props.otherSessionsRunning ? 'Another session running' : 'Ready'}</span>
 		  <button className="secondary-button" disabled={!props.detail || props.detail.status === 'running' || props.compacting || Boolean(props.activeRun)} onClick={props.onCompact}>{props.compacting ? 'Compacting…' : 'Compact context'}</button>
         </div>
       </header>
@@ -513,8 +513,19 @@ function ActiveRunView({ run }: { run: ActiveRun }) {
         </article>
       )}
       {run.compaction && <CompactionStatus trigger={run.compaction.trigger} status={run.compaction.status} activeContextTokens={run.compaction.activeContextTokens} contextWindow={run.compaction.contextWindow} />}
+      {run.providerRetry && <ProviderRetryStatus retry={run.providerRetry} />}
       <ActiveRunBody run={run} />
     </>
+  )
+}
+
+function ProviderRetryStatus({ retry }: { retry: NonNullable<ActiveRun['providerRetry']> }) {
+  const delaySeconds = Math.max(0, retry.delayMS / 1000)
+  return (
+    <div className="provider-retry-status" role="status">
+      <span />
+      Server temporarily failed. Retrying request {retry.attempt} of {retry.maxAttempts} after {delaySeconds.toLocaleString()}s…
+    </div>
   )
 }
 

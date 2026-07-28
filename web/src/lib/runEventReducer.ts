@@ -5,6 +5,9 @@ import { appendModelOutput, appendReasoning, updateToolStep } from './runSteps'
  * Events requiring I/O (resync and settled) remain orchestrated by App.
  */
 export function reduceRunEvent(run: ActiveRun, event: RunEvent): ActiveRun {
+  if (run.providerRetry && ['text.delta', 'reasoning.delta', 'tool.requested', 'tool.started', 'tool.finished', 'usage.updated'].includes(event.type)) {
+    run = { ...run, providerRetry: undefined }
+  }
   switch (event.type) {
     case 'turn.started':
       return { ...run, turnID: String(event.turn_id ?? '') }
@@ -24,6 +27,15 @@ export function reduceRunEvent(run: ActiveRun, event: RunEvent): ActiveRun {
           status: 'completed',
           activeContextTokens: Number(event.active_context_tokens ?? 0) || undefined,
           contextWindow: Number(event.context_window ?? 0) || undefined,
+        },
+      }
+    case 'provider.retrying':
+      return {
+        ...run,
+        providerRetry: {
+          attempt: Number(event.attempt ?? 0),
+          maxAttempts: Number(event.max_attempts ?? 0),
+          delayMS: Number(event.delay_ms ?? 0),
         },
       }
     case 'run.prompt_queue':

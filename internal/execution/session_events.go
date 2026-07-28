@@ -597,6 +597,13 @@ func sessionStreamEventFromModelEvent(turnID string, agentIteration int, event m
 			"cache_write_tokens": event.Usage.CacheWriteTokens,
 			"reasoning_tokens":   event.Usage.ReasoningTokens,
 		}), true
+	case model.ProviderRetryEvent:
+		return modelSessionStreamEvent("provider.retrying", turnID, agentIteration, map[string]any{
+			"attempt":      event.Attempt,
+			"max_attempts": event.MaxAttempts,
+			"delay_ms":     event.Delay.Milliseconds(),
+			"reason":       event.Reason,
+		}), true
 	default:
 		return nil, false
 	}

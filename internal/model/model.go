@@ -3,6 +3,7 @@ package model
 import (
 	"context"
 	"encoding/json"
+	"time"
 )
 
 type Provider interface {
@@ -123,6 +124,7 @@ const (
 	EventTypeToolResult            EventType = "tool_result"
 	EventTypeUsage                 EventType = "usage"
 	EventTypeResponseState         EventType = "response_state"
+	EventTypeProviderRetry         EventType = "provider_retry"
 	EventTypeError                 EventType = "error"
 )
 
@@ -241,6 +243,17 @@ func (UsageEvent) Type() EventType {
 
 type ResponseStateEvent struct {
 	State ResponseState
+}
+
+type ProviderRetryEvent struct {
+	Attempt     int
+	MaxAttempts int
+	Delay       time.Duration
+	Reason      string
+}
+
+func (ProviderRetryEvent) Type() EventType {
+	return EventTypeProviderRetry
 }
 
 func (ResponseStateEvent) Type() EventType {

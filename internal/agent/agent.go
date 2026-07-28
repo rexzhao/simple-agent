@@ -4,15 +4,21 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"strings"
+	"time"
 
 	"github.com/rexzhao/simple-agent/internal/eventbus"
 	"github.com/rexzhao/simple-agent/internal/model"
 )
 
 const DefaultMaxTurns = 8
+
+var providerRetryBackoff = func(attempt int) time.Duration {
+	return time.Duration(1<<(attempt-1)) * time.Second
+}
 
 type ToolExecutor interface {
 	Execute(ctx context.Context, name string, arguments map[string]any) (model.ToolResult, error)
@@ -255,35 +261,87 @@ func copyMessages(messages []model.Message) []model.Message {
 }
 
 func streamModelTurn(ctx context.Context, provider model.Provider, request model.Request, out chan<- model.Event) (string, string, []model.ToolCall, *model.ResponseState, bool) {
-	stream, err := provider.Stream(ctx, request)
-	if err != nil {
-		out <- model.ErrorEvent{Err: err, Message: "request model"}
-		return "", "", nil, nil, true
-	}
-
 	var assistantContent strings.Builder
 	var reasoningContent strings.Builder
 	var toolCalls []model.ToolCall
 	var responseState *model.ResponseState
-	for event := range stream {
-		switch event := event.(type) {
-		case model.TextDeltaEvent:
-			assistantContent.WriteString(event.Text)
-		case model.ReasoningDeltaEvent:
-			reasoningContent.WriteString(event.Text)
-		case model.ToolCallDoneEvent:
-			toolCalls = append(toolCalls, event.ToolCall)
-		case model.ResponseStateEvent:
-			state := copyResponseState(event.State)
-			responseState = &state
-			continue
-		case model.ErrorEvent:
-			out <- event
-			return assistantContent.String(), reasoningContent.String(), nil, nil, true
+	const maxAttempts = 3
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		stream, err := provider.Stream(ctx, request)
+		if err != nil {
+			out <- model.ErrorEvent{Err: err, Message: "request model"}
+			return "", "", nil, nil, true
 		}
-		out <- event
+
+		madeProgress := false
+		retry := false
+		for event := range stream {
+			switch event := event.(type) {
+			case model.TextDeltaEvent:
+				madeProgress = true
+				assistantContent.WriteString(event.Text)
+			case model.ReasoningDeltaEvent:
+				madeProgress = true
+				reasoningContent.WriteString(event.Text)
+			case model.ToolCallDeltaEvent:
+				madeProgress = true
+			case model.ToolCallDoneEvent:
+				madeProgress = true
+				toolCalls = append(toolCalls, event.ToolCall)
+			case model.MessageDoneEvent, model.UsageEvent:
+				madeProgress = true
+			case model.ResponseStateEvent:
+				state := copyResponseState(event.State)
+				responseState = &state
+				continue
+			case model.ErrorEvent:
+				if !madeProgress && attempt < maxAttempts && isRetryableProviderStreamError(event.Err) {
+					delay := providerRetryBackoff(attempt)
+					out <- model.ProviderRetryEvent{
+						Attempt:     attempt + 1,
+						MaxAttempts: maxAttempts,
+						Delay:       delay,
+						Reason:      "server_error",
+					}
+					if err := waitForProviderRetry(ctx, delay); err != nil {
+						out <- model.ErrorEvent{Err: err, Message: "retry model request"}
+						return assistantContent.String(), reasoningContent.String(), nil, nil, true
+					}
+					retry = true
+					break
+				}
+				out <- event
+				return assistantContent.String(), reasoningContent.String(), nil, nil, true
+			}
+			out <- event
+		}
+		if retry {
+			continue
+		}
+		return assistantContent.String(), reasoningContent.String(), toolCalls, responseState, false
 	}
-	return assistantContent.String(), reasoningContent.String(), toolCalls, responseState, false
+	panic("unreachable")
+}
+
+func isRetryableProviderStreamError(err error) bool {
+	var providerErr *model.ProviderError
+	if !errors.As(err, &providerErr) {
+		return false
+	}
+	message := strings.ToLower(providerErr.Message)
+	return strings.Contains(message, "code server_error") ||
+		strings.Contains(message, "server_is_overloaded")
+}
+
+func waitForProviderRetry(ctx context.Context, delay time.Duration) error {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 func copyResponseState(state model.ResponseState) model.ResponseState {

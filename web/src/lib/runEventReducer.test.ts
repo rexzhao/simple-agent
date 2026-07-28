@@ -98,4 +98,25 @@ describe('reduceRunEvent', () => {
       contextWindow: 400000,
     })
   })
+
+  it('shows provider retry state until the retried request makes progress', () => {
+    const retrying = reduceRunEvent(newRun(), {
+      type: 'provider.retrying',
+      turn_id: 'turn-1',
+      agent_iteration: 2,
+      attempt: 2,
+      max_attempts: 3,
+      delay_ms: 1000,
+      reason: 'server_error',
+    })
+    expect(retrying.providerRetry).toEqual({ attempt: 2, maxAttempts: 3, delayMS: 1000 })
+
+    const recovered = reduceRunEvent(retrying, {
+      type: 'text.delta',
+      turn_id: 'turn-1',
+      agent_iteration: 2,
+      text: 'ok',
+    })
+    expect(recovered.providerRetry).toBeUndefined()
+  })
 })

@@ -65,6 +65,74 @@ func TestStreamEmitsToolRequestedStartedFinishedInOrder(t *testing.T) {
 	}
 }
 
+func TestStreamRetriesServerErrorBeforeAnyProviderProgress(t *testing.T) {
+	originalBackoff := providerRetryBackoff
+	providerRetryBackoff = func(int) time.Duration { return 0 }
+	t.Cleanup(func() { providerRetryBackoff = originalBackoff })
+
+	provider := &fakeProvider{turns: [][]model.Event{
+		{model.ErrorEvent{
+			Err:     &model.ProviderError{Message: "server_error: temporary failure (code server_error)"},
+			Message: "OpenAI Responses stream error",
+		}},
+		{model.TextDeltaEvent{Text: "recovered"}},
+	}}
+
+	events, err := Stream(context.Background(), model.Request{
+		Model:    "model-test",
+		Messages: []model.Message{{Role: model.MessageRoleUser, Content: "continue"}},
+	}, Options{Provider: provider, MaxTurns: 2})
+	if err != nil {
+		t.Fatalf("Stream() error = %v", err)
+	}
+	got := collectAgentEvents(t, events)
+	if len(provider.requests) != 2 {
+		t.Fatalf("provider requests = %d, want 2", len(provider.requests))
+	}
+	if collectText(got) != "recovered" {
+		t.Fatalf("text = %q, want recovered", collectText(got))
+	}
+	var retry model.ProviderRetryEvent
+	found := false
+	for _, event := range got {
+		if value, ok := event.(model.ProviderRetryEvent); ok {
+			retry = value
+			found = true
+		}
+	}
+	if !found || retry.Attempt != 2 || retry.MaxAttempts != 3 {
+		t.Fatalf("retry event = %#v, found=%v", retry, found)
+	}
+}
+
+func TestStreamDoesNotRetryServerErrorAfterProviderProgress(t *testing.T) {
+	provider := &fakeProvider{turns: [][]model.Event{{
+		model.TextDeltaEvent{Text: "partial"},
+		model.ErrorEvent{
+			Err:     &model.ProviderError{Message: "server_error: temporary failure (code server_error)"},
+			Message: "OpenAI Responses stream error",
+		},
+	}}}
+
+	events, err := Stream(context.Background(), model.Request{
+		Model:    "model-test",
+		Messages: []model.Message{{Role: model.MessageRoleUser, Content: "continue"}},
+	}, Options{Provider: provider, MaxTurns: 2})
+	if err != nil {
+		t.Fatalf("Stream() error = %v", err)
+	}
+	got := collectAgentEvents(t, events)
+	if len(provider.requests) != 1 {
+		t.Fatalf("provider requests = %d, want no retry", len(provider.requests))
+	}
+	if collectText(got) != "partial" {
+		t.Fatalf("text = %q, want partial", collectText(got))
+	}
+	if firstErrorEvent(t, got).Err == nil {
+		t.Fatal("error event is missing")
+	}
+}
+
 func TestStreamOmitsToolStartedForValidationFailures(t *testing.T) {
 	tests := []struct {
 		name    string

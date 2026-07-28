@@ -1,9 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { api, streamRun } from './api'
 import type { ActiveRun, ActiveRunDescriptor, Bootstrap, ImageAttachmentInput, Project, RunEvent, RunStep, Session, SessionItem, SessionModelOption } from './types'
-import { blobAsDataURL, errorMessage } from './lib/format'
+import { errorMessage } from './lib/format'
 import { reduceRunEvent } from './lib/runEventReducer'
-import { itemText } from './lib/session'
 import { modelKey, orderSessions, processKey, projectName, sessionName } from './lib/session'
 import { emptyComposerDraft } from './components/Composer'
 import type { PastedImageAttachment } from './components/Composer'
@@ -320,6 +319,7 @@ function App() {
       case 'turn.started':
       case 'compaction.started':
       case 'compaction.completed':
+      case 'provider.retrying':
       case 'run.prompt_queue':
       case 'run.prompt_appended':
       case 'agent.iteration.started':
@@ -447,9 +447,8 @@ function App() {
     }
   }, [loadSessions])
 
-  // startNewRun is the single place a fresh run begins: composer sends and
-  // resends of a trailing user message both go through it. A successful
-  // start clears the session's recorded turn failure.
+  // startNewRun handles new composer input. A successful start clears the
+  // session's recorded turn failure.
   const startNewRun = async (sessionID: string, content: string, imageInputs: ImageAttachmentInput[]): Promise<boolean> => {
     try {
       const started = await api.startRun(sessionID, content, imageInputs)
@@ -500,25 +499,34 @@ function App() {
     return startNewRun(sessionID, content, imageInputs)
   }
 
-  // resendMessage replays a trailing user message — the usual shape of a
-  // turn that died mid-flight. Stored image attachments are fetched back as
-  // data URLs so the new run gets the same payload.
+  // Resend asks the server to run directly from the existing active history.
+  // The original user item is not downloaded, echoed, or appended again.
   const resendMessage = async (item: SessionItem): Promise<boolean> => {
     if (!selectedSessionID) return false
     const sessionID = selectedSessionID
-    const content = itemText(item)
-    let imageInputs: ImageAttachmentInput[]
     try {
-      imageInputs = await Promise.all((item.message?.images ?? []).map(async (image) => ({
-        data_url: await blobAsDataURL(await api.sessionImage(sessionID, image.hash)),
-        detail: 'auto' as const,
-      })))
+      const started = await api.resendRun(sessionID, item.id)
+      addActiveRun({
+        id: started.run_id,
+        sessionID,
+        userText: '',
+        userImages: [],
+        assistantText: '',
+        steps: [],
+        agentIteration: 0,
+        status: 'running',
+      })
+      clearTurnError(sessionID)
+      void streamRun(started.run_id, (event) => handleRunEvent(sessionID, started.run_id, event)).catch((reason: unknown) => {
+        const runID = activeRunsRef.current[sessionID]?.id
+        if (runID) updateActiveRun(sessionID, runID, () => null)
+        setError(errorMessage(reason))
+      })
+      return true
     } catch (reason) {
       setError(errorMessage(reason))
       return false
     }
-    if (!content.trim() && imageInputs.length === 0) return false
-    return startNewRun(sessionID, content, imageInputs)
   }
 
   const cancelRun = async () => {
