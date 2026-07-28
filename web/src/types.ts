@@ -113,6 +113,10 @@ export interface Session {
   created_at: string
   updated_at: string
   display_name: string
+  created_by: 'user' | 'agent' | string
+  parent_session_id?: string
+  root_session_id: string
+  spawn_depth: number
   archived: boolean
   last_used_at: string
   provider: string

@@ -67,6 +67,10 @@ type Info struct {
 	Provider          string    `json:"provider"`
 	ModelProfile      string    `json:"model_profile"`
 	ModelID           string    `json:"model_id"`
+	CreatedBy         string    `json:"created_by,omitempty"`
+	ParentSessionID   string    `json:"parent_session_id,omitempty"`
+	RootSessionID     string    `json:"root_session_id,omitempty"`
+	SpawnDepth        int       `json:"spawn_depth,omitempty"`
 	RunningTurnID     string    `json:"running_turn_id,omitempty"`
 	RunningStartedAt  time.Time `json:"running_started_at,omitempty"`
 	InterruptedTurnID string    `json:"interrupted_turn_id,omitempty"`

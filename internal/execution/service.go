@@ -63,6 +63,10 @@ type SessionMetadata struct {
 	CreatedAt         time.Time `json:"created_at"`
 	UpdatedAt         time.Time `json:"updated_at"`
 	DisplayName       string    `json:"display_name"`
+	CreatedBy         string    `json:"created_by"`
+	ParentSessionID   string    `json:"parent_session_id,omitempty"`
+	RootSessionID     string    `json:"root_session_id"`
+	SpawnDepth        int       `json:"spawn_depth"`
 	Archived          bool      `json:"archived"`
 	LastUsedAt        time.Time `json:"last_used_at"`
 	InterruptedAt     time.Time `json:"interrupted_at,omitempty"`
@@ -81,6 +85,10 @@ type SessionDetail struct {
 	CreatedAt         time.Time              `json:"created_at"`
 	UpdatedAt         time.Time              `json:"updated_at"`
 	DisplayName       string                 `json:"display_name"`
+	CreatedBy         string                 `json:"created_by"`
+	ParentSessionID   string                 `json:"parent_session_id,omitempty"`
+	RootSessionID     string                 `json:"root_session_id"`
+	SpawnDepth        int                    `json:"spawn_depth"`
 	Archived          bool                   `json:"archived"`
 	LastUsedAt        time.Time              `json:"last_used_at"`
 	InterruptedAt     time.Time              `json:"interrupted_at,omitempty"`
@@ -105,6 +113,8 @@ type SessionDetail struct {
 }
 
 type SessionCreateMetadata struct {
+	DisplayName     string
+	ParentSessionID string
 	CreatedCWD      string
 	ConfigPath      string
 	Provider        string
@@ -535,6 +545,23 @@ func (s *Service) CreateSession(projectID string, metadata SessionCreateMetadata
 	}
 	session := applySessionCreateMetadata(sessions.SessionV2{}, metadata)
 	session.ProjectID = project.ID
+	if session.ParentSessionID != "" {
+		parent, err := s.sessionStore.Load(session.ParentSessionID)
+		if err != nil {
+			return SessionDetail{}, fmt.Errorf("load parent session %q: %w", session.ParentSessionID, err)
+		}
+		if parent.ProjectID != project.ID {
+			return SessionDetail{}, fmt.Errorf("parent session belongs to a different project")
+		}
+		session.CreatedBy = sessions.SessionCreatedByAgent
+		session.RootSessionID = strings.TrimSpace(parent.RootSessionID)
+		if session.RootSessionID == "" {
+			session.RootSessionID = parent.ID
+		}
+		session.SpawnDepth = parent.SpawnDepth + 1
+	} else {
+		session.CreatedBy = sessions.SessionCreatedByUser
+	}
 	if strings.TrimSpace(session.CreatedCWD) == "" {
 		session.CreatedCWD = session.CWD
 	}
@@ -1631,6 +1658,12 @@ func (s *Service) ensureProjectSessionsIdle(projectID string) error {
 }
 
 func applySessionCreateMetadata(session sessions.SessionV2, metadata SessionCreateMetadata) sessions.SessionV2 {
+	if value := strings.TrimSpace(metadata.DisplayName); value != "" {
+		session.DisplayName = value
+	}
+	if value := strings.TrimSpace(metadata.ParentSessionID); value != "" {
+		session.ParentSessionID = value
+	}
 	if value := strings.TrimSpace(metadata.CreatedCWD); value != "" {
 		session.CreatedCWD = value
 		session.CWD = value
@@ -1700,6 +1733,10 @@ func sessionMetadataFromStore(session sessions.SessionV2) SessionMetadata {
 		CreatedAt:         session.CreatedAt,
 		UpdatedAt:         session.UpdatedAt,
 		DisplayName:       session.DisplayName,
+		CreatedBy:         session.CreatedBy,
+		ParentSessionID:   session.ParentSessionID,
+		RootSessionID:     session.RootSessionID,
+		SpawnDepth:        session.SpawnDepth,
 		Archived:          session.Archived,
 		LastUsedAt:        session.LastUsedAt,
 		InterruptedAt:     session.InterruptedAt,
@@ -1720,6 +1757,10 @@ func sessionDetailFromStore(session sessions.SessionV2) SessionDetail {
 		CreatedAt:         session.CreatedAt,
 		UpdatedAt:         session.UpdatedAt,
 		DisplayName:       session.DisplayName,
+		CreatedBy:         session.CreatedBy,
+		ParentSessionID:   session.ParentSessionID,
+		RootSessionID:     session.RootSessionID,
+		SpawnDepth:        session.SpawnDepth,
 		Archived:          session.Archived,
 		LastUsedAt:        session.LastUsedAt,
 		InterruptedAt:     session.InterruptedAt,

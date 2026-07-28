@@ -21,6 +21,9 @@ import (
 const (
 	VersionV2 = 2
 
+	SessionCreatedByUser  = "user"
+	SessionCreatedByAgent = "agent"
+
 	ItemKindMessage        = "message"
 	ItemKindCompaction     = "compaction"
 	ItemKindRuntimeContext = "runtime_context"
@@ -103,6 +106,10 @@ type SessionV2 struct {
 	CreatedAt            time.Time              `json:"created_at"`
 	UpdatedAt            time.Time              `json:"updated_at"`
 	DisplayName          string                 `json:"display_name,omitempty"`
+	CreatedBy            string                 `json:"created_by,omitempty"`
+	ParentSessionID      string                 `json:"parent_session_id,omitempty"`
+	RootSessionID        string                 `json:"root_session_id,omitempty"`
+	SpawnDepth           int                    `json:"spawn_depth,omitempty"`
 	Archived             bool                   `json:"-"`
 	ArchivedAt           time.Time              `json:"-"`
 	LastUsedAt           time.Time              `json:"last_used_at"`
@@ -311,6 +318,24 @@ func (s *V2Store) SaveMetadata(session SessionV2) (SessionV2, error) {
 	}
 	if err := validateV2SessionID(session.ID); err != nil {
 		return SessionV2{}, err
+	}
+	session, err := normalizeSessionLineage(session)
+	if err != nil {
+		return SessionV2{}, err
+	}
+	if existing, loadErr := s.loadMetadata(session.ID); loadErr == nil {
+		existing, err = normalizeSessionLineage(existing)
+		if err != nil {
+			return SessionV2{}, err
+		}
+		if existing.CreatedBy != session.CreatedBy ||
+			existing.ParentSessionID != session.ParentSessionID ||
+			existing.RootSessionID != session.RootSessionID ||
+			existing.SpawnDepth != session.SpawnDepth {
+			return SessionV2{}, fmt.Errorf("session %q lineage is immutable", session.ID)
+		}
+	} else if !errors.Is(loadErr, ErrNotFound) {
+		return SessionV2{}, loadErr
 	}
 	if session.Version == 0 {
 		session.Version = VersionV2
@@ -1437,6 +1462,10 @@ type sessionV2Metadata struct {
 	CreatedAt            time.Time              `json:"created_at"`
 	UpdatedAt            time.Time              `json:"updated_at"`
 	DisplayName          string                 `json:"display_name,omitempty"`
+	CreatedBy            string                 `json:"created_by,omitempty"`
+	ParentSessionID      string                 `json:"parent_session_id,omitempty"`
+	RootSessionID        string                 `json:"root_session_id,omitempty"`
+	SpawnDepth           int                    `json:"spawn_depth,omitempty"`
 	ArchivedAt           *time.Time             `json:"archived_at"`
 	LastUsedAt           time.Time              `json:"last_used_at"`
 	RunningTurnID        string                 `json:"running_turn_id,omitempty"`
@@ -1476,6 +1505,10 @@ func (s *V2Store) loadMetadata(id string) (SessionV2, error) {
 	}
 	if session.ID != id {
 		return SessionV2{}, mismatchedSessionIDError(id, session.ID)
+	}
+	session, err = normalizeSessionLineage(session)
+	if err != nil {
+		return SessionV2{}, fmt.Errorf("invalid session lineage for %q: %w", id, err)
 	}
 	return copySessionV2(session), nil
 }
@@ -1539,6 +1572,10 @@ func metadataFromSessionV2(session SessionV2) sessionV2Metadata {
 		CreatedAt:            session.CreatedAt,
 		UpdatedAt:            session.UpdatedAt,
 		DisplayName:          session.DisplayName,
+		CreatedBy:            session.CreatedBy,
+		ParentSessionID:      session.ParentSessionID,
+		RootSessionID:        session.RootSessionID,
+		SpawnDepth:           session.SpawnDepth,
 		ArchivedAt:           sessionArchivedAtPtr(session),
 		LastUsedAt:           session.LastUsedAt,
 		RunningTurnID:        session.RunningTurnID,
@@ -1573,6 +1610,10 @@ func (m sessionV2Metadata) session() SessionV2 {
 		CreatedAt:            m.CreatedAt,
 		UpdatedAt:            m.UpdatedAt,
 		DisplayName:          m.DisplayName,
+		CreatedBy:            m.CreatedBy,
+		ParentSessionID:      m.ParentSessionID,
+		RootSessionID:        m.RootSessionID,
+		SpawnDepth:           m.SpawnDepth,
 		LastUsedAt:           m.LastUsedAt,
 		RunningTurnID:        m.RunningTurnID,
 		RunningStartedAt:     m.RunningStartedAt,
@@ -2309,6 +2350,10 @@ func (s SessionV2) info() Info {
 		Provider:          s.Provider,
 		ModelProfile:      s.ModelProfile,
 		ModelID:           s.ModelID,
+		CreatedBy:         s.CreatedBy,
+		ParentSessionID:   s.ParentSessionID,
+		RootSessionID:     s.RootSessionID,
+		SpawnDepth:        s.SpawnDepth,
 		RunningTurnID:     s.RunningTurnID,
 		RunningStartedAt:  s.RunningStartedAt,
 		InterruptedTurnID: s.InterruptedTurnID,
@@ -2319,6 +2364,46 @@ func (s SessionV2) info() Info {
 		ContextSource:     s.Context.ContextWindowSource,
 		SaveToolResults:   s.SaveToolResults,
 	}
+}
+
+func normalizeSessionLineage(session SessionV2) (SessionV2, error) {
+	session.CreatedBy = strings.TrimSpace(session.CreatedBy)
+	session.ParentSessionID = strings.TrimSpace(session.ParentSessionID)
+	session.RootSessionID = strings.TrimSpace(session.RootSessionID)
+	if session.CreatedBy == "" {
+		if session.ParentSessionID == "" {
+			session.CreatedBy = SessionCreatedByUser
+		} else {
+			session.CreatedBy = SessionCreatedByAgent
+		}
+	}
+	if session.CreatedBy != SessionCreatedByUser && session.CreatedBy != SessionCreatedByAgent {
+		return SessionV2{}, fmt.Errorf("session created_by must be %q or %q", SessionCreatedByUser, SessionCreatedByAgent)
+	}
+	if session.SpawnDepth < 0 {
+		return SessionV2{}, fmt.Errorf("session spawn_depth must be non-negative")
+	}
+	if session.ParentSessionID == "" {
+		session.RootSessionID = session.ID
+		session.SpawnDepth = 0
+		return session, nil
+	}
+	if err := validateV2SessionID(session.ParentSessionID); err != nil {
+		return SessionV2{}, fmt.Errorf("invalid parent session id: %w", err)
+	}
+	if session.ParentSessionID == session.ID {
+		return SessionV2{}, fmt.Errorf("session cannot be its own parent")
+	}
+	if session.RootSessionID == "" {
+		session.RootSessionID = session.ParentSessionID
+	}
+	if err := validateV2SessionID(session.RootSessionID); err != nil {
+		return SessionV2{}, fmt.Errorf("invalid root session id: %w", err)
+	}
+	if session.SpawnDepth == 0 {
+		session.SpawnDepth = 1
+	}
+	return session, nil
 }
 
 func sessionEffectiveLastUsedAt(session SessionV2) time.Time {
