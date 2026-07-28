@@ -5,7 +5,7 @@ import remarkGfm from 'remark-gfm'
 import { api } from '../api'
 import type { ActiveRun, ItemsPage, QueuedPrompt, RunStep, Session, SessionImageAttachment, SessionItem, ToolActivity } from '../types'
 import { blobAsDataURL, copyText, formatTokenCount } from '../lib/format'
-import { itemText, processKey, sessionName } from '../lib/session'
+import { itemText, processKey, sessionName, visibleSessionItems } from '../lib/session'
 import { Composer } from './Composer'
 import type { ComposerDraft, PastedImageAttachment, PastedTextAttachment } from './Composer'
 import { MessageSkeleton } from './misc'
@@ -272,10 +272,10 @@ export const Conversation = memo(function Conversation(props: {
 	useEffect(() => () => {
 		if (saveMemoryFrameRef.current) cancelAnimationFrame(saveMemoryFrameRef.current)
 	}, [])
-	const visibleItems = useMemo(() => props.activeRun?.turnID
-		? (props.page?.items ?? []).filter((item) =>
-			item.turn_id !== props.activeRun?.turnID || (props.activeRun?.restored && item.message?.role === 'user'))
-		: (props.page?.items ?? []), [props.activeRun?.restored, props.activeRun?.turnID, props.page?.items])
+	const visibleItems = useMemo(
+		() => visibleSessionItems(props.page?.items ?? [], props.activeRun),
+		[props.activeRun, props.page?.items],
+	)
 	const conversationEntries = useMemo(() => buildConversationEntries(visibleItems, props.detail?.id ?? '', props.recentStepsByTurn), [props.detail?.id, props.recentStepsByTurn, visibleItems])
 	// A session that is idle with a user message at the tail almost always
   // means the turn died mid-flight: offer to resend it in place.

@@ -23,11 +23,12 @@ export function reduceRunEvent(run: ActiveRun, event: RunEvent): ActiveRun {
       const prompts = Array.isArray(event.prompts) ? event.prompts.map(String).filter((text) => text.trim()) : []
       if (prompts.length === 0) return run
       const iteration = run.agentIteration > 0 ? run.agentIteration : 1
+      const turnID = String(event.turn_id ?? run.turnID ?? '') || undefined
       const steps = [...run.steps]
       prompts.forEach((text, index) => {
         steps.push({ kind: 'user', id: `appended-${run.id}-${steps.length}-${index}`, text, iteration })
       })
-      return { ...run, steps }
+      return { ...run, turnID, steps }
     }
     case 'agent.iteration.started': {
       const agentIteration = Number(event.agent_iteration ?? 0)

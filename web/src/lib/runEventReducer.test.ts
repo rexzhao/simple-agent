@@ -54,10 +54,11 @@ describe('reduceRunEvent', () => {
 
     const drained = apply(
       queued,
-      { type: 'run.prompt_appended', prompts: ['follow up'] },
+      { type: 'run.prompt_appended', turn_id: 'turn-1', prompts: ['follow up'] },
       { type: 'run.prompt_queue', prompts: [] },
     )
     expect(drained.queuedPrompts).toEqual([])
+    expect(drained.turnID).toBe('turn-1')
     expect(drained.steps).toContainEqual(expect.objectContaining({ kind: 'user', text: 'follow up' }))
   })
 
