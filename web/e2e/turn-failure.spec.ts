@@ -27,7 +27,7 @@ async function json(route: Route, body: unknown, status = 200) {
 async function mockApp(page: Page, options: { gates: Gate[]; initialItems?: Array<Record<string, unknown>>; committedItems?: () => Array<Record<string, unknown>> }) {
   let connection = 0
   let runPosts = 0
-  const runBodies: Array<{ content?: string; images?: unknown[] }> = []
+  const runBodies: Array<{ content?: string; images?: unknown[]; replay_item_id?: string }> = []
   await page.route('**/api/**', async (route: Route) => {
     const request = route.request()
     const url = new URL(request.url())
@@ -43,7 +43,7 @@ async function mockApp(page: Page, options: { gates: Gate[]; initialItems?: Arra
     }
     if (url.pathname === `/api/sessions/${session.id}/runs` && request.method() === 'POST') {
       runPosts++
-      runBodies.push(request.postDataJSON() as { content?: string })
+      runBodies.push(request.postDataJSON() as { content?: string; images?: unknown[]; replay_item_id?: string })
       return json(route, { run_id: 'run-1', session_id: session.id, status: 'running' }, 202)
     }
     if (url.pathname === '/api/runs/run-1/events') {
@@ -95,10 +95,11 @@ test('shows the failure reason in the conversation and resends the trailing user
   await expect(turnError).toHaveCount(0)
   await expect(resend).toBeVisible()
 
-  // Resending posts the same content as a new run and clears the offer.
+  // Resending replays the persisted user item without duplicating its content.
   await resend.click()
   await expect.poll(app.runPosts).toBe(2)
-  expect(app.runBodies[1]?.content).toBe('fix the bug')
+  expect(app.runBodies[1]?.replay_item_id).toBe(failedUserItem.id)
+  expect(app.runBodies[1]?.content).toBeUndefined()
   await expect(resend).toHaveCount(0)
   await expect(turnError).toHaveCount(0)
 })
