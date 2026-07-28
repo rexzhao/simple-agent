@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/rexzhao/simple-agent/internal/model"
@@ -23,6 +24,7 @@ type Attributes struct {
 }
 
 type Logger struct {
+	mu             sync.Mutex
 	path           string
 	root           string
 	sessionDir     string
@@ -33,6 +35,7 @@ type Logger struct {
 	now            func() time.Time
 	file           *os.File
 	writer         *bufio.Writer
+	requestSeq     int
 }
 
 func Open(path string, attributes Attributes) (*Logger, error) {
@@ -64,7 +67,10 @@ func (l *Logger) LogEvent(event model.Event) error {
 	if l == nil || l.path == "" {
 		return nil
 	}
-	if err := l.ensureOpen(); err != nil {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	if err := l.ensureOpenLocked(); err != nil {
 		return err
 	}
 	if started, ok := event.(model.AgentIterationStartedEvent); ok {
@@ -85,7 +91,37 @@ func (l *Logger) LogEvent(event model.Event) error {
 	return nil
 }
 
-func (l *Logger) ensureOpen() error {
+// RecordRequestBody writes the exact provider request body beside sai.jsonl.
+// Request bodies can contain prompts and tool outputs, so captures request
+// restrictive permissions where supported and are only explicitly enabled.
+func (l *Logger) RecordRequestBody(endpoint string, body []byte) error {
+	if l == nil || l.path == "" {
+		return nil
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	if err := l.ensureOpenLocked(); err != nil {
+		return err
+	}
+	l.requestSeq++
+	name := fmt.Sprintf("%s-request-%06d.json", requestEndpointName(endpoint), l.requestSeq)
+	path := filepath.Join(l.sessionDir, name)
+	if err := os.WriteFile(path, body, 0o600); err != nil {
+		return fmt.Errorf("write provider request body %q: %w", path, err)
+	}
+	return nil
+}
+
+func requestEndpointName(endpoint string) string {
+	name := strings.Trim(strings.TrimSpace(endpoint), "/")
+	if name == "" {
+		return "provider"
+	}
+	return strings.ReplaceAll(name, "/", "-")
+}
+
+func (l *Logger) ensureOpenLocked() error {
 	if l.writer != nil {
 		return nil
 	}
@@ -105,7 +141,13 @@ func (l *Logger) ensureOpen() error {
 }
 
 func (l *Logger) Close() error {
-	if l == nil || l.file == nil {
+	if l == nil {
+		return nil
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	if l.file == nil {
 		return nil
 	}
 

@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/rexzhao/simple-agent/internal/model"
@@ -83,6 +85,84 @@ func TestLogEventLazilyCreatesSessionLog(t *testing.T) {
 	}
 	if strings.Contains(logText, "hidden response body") {
 		t.Fatalf("log leaked event body: %s", logText)
+	}
+}
+
+func TestRecordRequestBodyWritesExactOwnerOnlyCapture(t *testing.T) {
+	logRoot := filepath.Join(t.TempDir(), "logs")
+	logger, err := Open(filepath.Join(logRoot, "sai.jsonl"), Attributes{
+		Provider: "codex",
+		Model:    "gpt-test",
+	})
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	body := []byte(`{"model":"gpt-test","input":[{"role":"user","content":"diagnose"}]}`)
+	if err := logger.RecordRequestBody("/responses", body); err != nil {
+		t.Fatalf("RecordRequestBody() error = %v", err)
+	}
+	if err := logger.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+
+	path := filepath.Join(filepath.Dir(logger.Path()), "responses-request-000001.json")
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile(%q) error = %v", path, err)
+	}
+	if string(got) != string(body) {
+		t.Fatalf("request capture = %q, want exact body %q", got, body)
+	}
+	if runtime.GOOS != "windows" {
+		if info, err := os.Stat(path); err != nil {
+			t.Fatalf("Stat(%q) error = %v", path, err)
+		} else if info.Mode().Perm()&0o077 != 0 {
+			t.Fatalf("request capture permissions = %v, want owner-only", info.Mode().Perm())
+		}
+	}
+}
+
+func TestConcurrentFirstEventAndRequestBodyShareLogger(t *testing.T) {
+	logger, err := Open(filepath.Join(t.TempDir(), "logs", "sai.jsonl"), Attributes{
+		Provider: "codex",
+		Model:    "gpt-test",
+	})
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+
+	start := make(chan struct{})
+	errs := make(chan error, 2)
+	var ready sync.WaitGroup
+	ready.Add(2)
+	go func() {
+		ready.Done()
+		<-start
+		errs <- logger.LogEvent(model.AgentIterationStartedEvent{Iteration: 1})
+	}()
+	go func() {
+		ready.Done()
+		<-start
+		errs <- logger.RecordRequestBody("/responses", []byte(`{"model":"gpt-test"}`))
+	}()
+	ready.Wait()
+	close(start)
+
+	for range 2 {
+		if err := <-errs; err != nil {
+			t.Fatalf("concurrent logger operation error = %v", err)
+		}
+	}
+	if err := logger.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+
+	if _, err := os.Stat(logger.Path()); err != nil {
+		t.Fatalf("Stat(%q) error = %v", logger.Path(), err)
+	}
+	requestPath := filepath.Join(filepath.Dir(logger.Path()), "responses-request-000001.json")
+	if _, err := os.Stat(requestPath); err != nil {
+		t.Fatalf("Stat(%q) error = %v", requestPath, err)
 	}
 }
 
