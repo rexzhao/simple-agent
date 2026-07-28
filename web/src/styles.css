@@ -171,6 +171,24 @@ svg { width: 1.1em; height: 1.1em; fill: none; stroke: currentColor; stroke-widt
   border-left: 2px solid rgba(0, 0, 0, .36);
 }
 
+.session-tree-branch { min-width: 0; display: flex; flex-direction: column; gap: 4px; }
+.session-tree-children {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-left: 15px;
+  padding-left: 8px;
+  border-left: 2px solid rgba(0, 0, 0, .2);
+}
+.session-tree-children > .session-tree-branch > .session-tree-row::before {
+  position: absolute;
+  top: 50%;
+  left: -10px;
+  width: 8px;
+  border-top: 2px solid rgba(0, 0, 0, .2);
+  content: '';
+}
 .session-tree-row { position: relative; min-width: 0; display: flex; align-items: center; border: 2px solid transparent; }
 .session-tree-row:hover { border-color: var(--border); background: #ffffff; box-shadow: var(--shadow-1); }
 .session-tree-row.selected { border-color: var(--border); color: #ffffff; background: #111111; box-shadow: var(--shadow-1); }
@@ -180,6 +198,8 @@ svg { width: 1.1em; height: 1.1em; fill: none; stroke: currentColor; stroke-widt
 .session-tree-row.selected .session-copy small { color: rgba(255, 255, 255, .64); }
 
 .session-icon { width: 25px; height: 25px; flex: 0 0 auto; display: grid; place-items: center; border: 2px solid currentColor; color: #111111; background: var(--accent); }
+.session-icon.agent-session-icon { background: #bfdbfe; }
+.session-tree-branch.orphaned > .session-tree-row > .session-tree-button > .session-icon { background: #e5e7eb; }
 .session-icon svg { width: 13px; height: 13px; }
 .session-tree-row.selected .session-icon { color: #111111; background: var(--accent); }
 .session-tree-row.archived { opacity: .72; }

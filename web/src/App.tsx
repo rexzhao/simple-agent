@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { api, streamRun } from './api'
 import type { ActiveRun, ActiveRunDescriptor, Bootstrap, ImageAttachmentInput, Project, RunEvent, RunStep, Session, SessionModelOption } from './types'
 import { errorMessage } from './lib/format'
@@ -27,6 +27,8 @@ function App() {
   const [bootstrap, setBootstrap] = useState<Bootstrap | null>(null)
   const [projects, setProjects] = useState<Project[]>([])
   const [sessionsByProject, setSessionsByProject] = useState<Record<string, Session[]>>({})
+  const sessionsByProjectRef = useRef(sessionsByProject)
+  sessionsByProjectRef.current = sessionsByProject
   const [archivedSessionsByProject, setArchivedSessionsByProject] = useState<Record<string, Session[]>>({})
   const { selectedProjectID, selectedSessionID, selectedProjectRef, setSelectedProjectID, setSelectedSessionID } = useSessionSelection()
   const [recoveredRuns, setRecoveredRuns] = useState<ActiveRunDescriptor[]>([])
@@ -380,6 +382,46 @@ function App() {
       })
     }
   }, [addActiveRun, handleRunEvent, recoveredRuns, refreshSession, updateActiveRun])
+
+  // Agent tools can create child sessions and start runs without a Web
+  // request. Periodically reconcile the coordinator's active set so those
+  // sessions appear in the tree and attach to the same replayable SSE stream.
+  useEffect(() => {
+    let disposed = false
+    let syncing = false
+    const syncCoordinatorRuns = async () => {
+      if (syncing) return
+      syncing = true
+      try {
+        const payload = await api.activeRuns()
+        if (disposed) return
+		const projectBySessionID = new Map(Object.entries(sessionsByProjectRef.current).flatMap(([projectID, sessions]) => sessions.map((session) => [session.id, projectID] as const)))
+		const unknownSessionIDs = [...new Set(payload.runs.map((run) => run.session_id).filter((sessionID) => !projectBySessionID.has(sessionID)))]
+		const activeProjectIDs = new Set(payload.runs.map((run) => projectBySessionID.get(run.session_id)).filter((projectID): projectID is string => Boolean(projectID)))
+        if (unknownSessionIDs.length > 0) {
+          const details = await Promise.all(unknownSessionIDs.map((sessionID) => api.session(sessionID)))
+          if (disposed) return
+		  for (const detail of details) if (detail.project_id) activeProjectIDs.add(detail.project_id)
+        }
+		// Refresh projects containing active runs as well as unknown runs. This
+		// discovers short-lived child sessions that may start and finish entirely
+		// between two coordinator polls while their parent is still running.
+		await Promise.all([...activeProjectIDs].map((projectID) => loadSessions(projectID)))
+        if (!disposed) setRecoveredRuns(payload.runs)
+      } catch {
+        // Bootstrap and explicit actions surface errors. Background discovery
+        // remains best-effort and retries on the next interval.
+      } finally {
+        syncing = false
+      }
+    }
+    void syncCoordinatorRuns()
+    const timer = window.setInterval(() => void syncCoordinatorRuns(), 1500)
+    return () => {
+      disposed = true
+      window.clearInterval(timer)
+    }
+  }, [loadSessions])
 
   const sendMessage = async (content: string, images: PastedImageAttachment[]): Promise<boolean> => {
     if (!selectedSessionID || (!content.trim() && images.length === 0)) return false

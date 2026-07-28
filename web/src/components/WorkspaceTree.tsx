@@ -1,6 +1,7 @@
 import { memo, useState } from 'react'
 import type { Project, Session } from '../types'
-import { projectName, sessionName } from '../lib/session'
+import { buildSessionTree, flattenSessionTree, projectName, sessionName, sessionTreeContains } from '../lib/session'
+import type { SessionTreeNode } from '../lib/session'
 import { relativeTime } from '../lib/format'
 import { ArchiveIcon, ChatIcon, ChevronIcon, EditIcon, LogoIcon, PlusIcon, RestoreIcon, SettingsIcon, TrashIcon } from './icons'
 
@@ -43,6 +44,52 @@ export const WorkspaceTree = memo(function WorkspaceTree(props: {
     })
   }
 
+  const renderSessionBranch = (projectID: string, node: SessionTreeNode, archived = false) => {
+    const session = node.session
+    const running = session.status === 'running' || props.runningSessionIDs.has(session.id)
+    const agentLabel = session.created_by === 'agent'
+      ? node.orphaned ? 'Agent · parent unavailable · ' : 'Agent · '
+      : ''
+    return (
+      <div className={`session-tree-branch ${node.orphaned ? 'orphaned' : ''}`} key={session.id}>
+        <div className={`session-tree-row ${archived ? 'archived' : ''} ${session.id === props.selectedSessionID ? 'selected' : ''}`}>
+          <button
+            className="session-tree-button"
+            disabled={archived}
+            title={node.orphaned ? 'Parent session is unavailable in this view' : undefined}
+            onClick={archived ? undefined : () => props.onSelectSession(projectID, session.id)}
+          >
+            <span className={`session-icon ${session.created_by === 'agent' ? 'agent-session-icon' : ''}`}>{archived ? <ArchiveIcon /> : <ChatIcon />}</span>
+            <span className="session-copy">
+              <strong>{sessionName(session)}</strong>
+              <small>{archived ? `${agentLabel}Archived` : `${agentLabel}${relativeTime(session.last_used_at || session.updated_at)}`} · {session.model_id || session.model_profile}</small>
+            </span>
+            {!archived && running && <span className="live-dot" />}
+          </button>
+          <div className="session-tree-actions">
+            {archived ? (
+              <>
+                <button onClick={() => props.onRestoreSession(session)} aria-label={`Restore ${sessionName(session)}`} title="Restore"><RestoreIcon /></button>
+                <button className="danger" onClick={() => props.onDeleteSession(session)} aria-label={`Delete ${sessionName(session)}`} title="Delete permanently"><TrashIcon /></button>
+              </>
+            ) : (
+              <>
+                <button disabled={running} onClick={() => props.onRenameSession(session)} aria-label={`Rename ${sessionName(session)}`} title="Rename"><EditIcon /></button>
+                <button disabled={running} onClick={() => props.onArchiveSession(session)} aria-label={`Archive ${sessionName(session)}`} title="Archive"><ArchiveIcon /></button>
+                <button className="danger" disabled={running} onClick={() => props.onDeleteSession(session)} aria-label={`Delete ${sessionName(session)}`} title="Delete"><TrashIcon /></button>
+              </>
+            )}
+          </div>
+        </div>
+        {node.children.length > 0 && (
+          <div className="session-tree-children">
+            {node.children.map((child) => renderSessionBranch(projectID, child, archived))}
+          </div>
+        )}
+      </div>
+    )
+  }
+
   return (
     <aside className="project-rail">
       <div className="brand"><LogoIcon /><span>SAI</span><button className="brand-settings" onClick={props.onManageProviders} aria-label="Manage Server Root settings" title="Server Root settings"><SettingsIcon /></button></div>
@@ -51,12 +98,17 @@ export const WorkspaceTree = memo(function WorkspaceTree(props: {
         {props.projects.map((project) => {
           const sessions = props.sessionsByProject[project.id] ?? []
           const archivedSessions = props.archivedSessionsByProject[project.id] ?? []
+		  const sessionRoots = buildSessionTree(sessions)
+		  const archivedSessionRoots = buildSessionTree(archivedSessions)
           const expanded = expandedProjects.has(project.id)
 		  const archivedExpanded = expandedArchivedProjects.has(project.id)
-		  const collapsedSessions = sessions.slice(0, 3)
-		  const visibleSessions = expanded
-			? sessions
-			: sessions.filter((session) => collapsedSessions.some((item) => item.id === session.id) || props.runningSessionIDs.has(session.id))
+		  const attentionSessionIDs = new Set(props.runningSessionIDs)
+		  if (props.selectedProjectID === project.id && props.selectedSessionID) attentionSessionIDs.add(props.selectedSessionID)
+		  const collapsedRoots = new Set(sessionRoots.slice(0, 3).map((node) => node.session.id))
+		  const visibleRoots = expanded
+			? sessionRoots
+			: sessionRoots.filter((node) => collapsedRoots.has(node.session.id) || sessionTreeContains(node, attentionSessionIDs))
+		  const hiddenSessionCount = sessions.length - flattenSessionTree(visibleRoots).length
           return (
             <section className="project-tree-group" key={project.id}>
               <div className={`project-tree-header ${project.id === props.selectedProjectID ? 'selected' : ''}`}>
@@ -89,31 +141,12 @@ export const WorkspaceTree = memo(function WorkspaceTree(props: {
                 ><TrashIcon /></button>
               </div>
               <div className="session-tree" role="group" aria-label={`Sessions of ${projectName(project)}`}>
-                {visibleSessions.map((session) => (
-                  <div className={`session-tree-row ${session.id === props.selectedSessionID ? 'selected' : ''}`} key={session.id}>
-                    <button
-                      className="session-tree-button"
-                      onClick={() => props.onSelectSession(project.id, session.id)}
-                    >
-                      <span className="session-icon"><ChatIcon /></span>
-                      <span className="session-copy">
-                        <strong>{sessionName(session)}</strong>
-                        <small>{relativeTime(session.last_used_at || session.updated_at)} · {session.model_id || session.model_profile}</small>
-                      </span>
-					  {(session.status === 'running' || props.runningSessionIDs.has(session.id)) && <span className="live-dot" />}
-                    </button>
-                    <div className="session-tree-actions">
-                      <button disabled={session.status === 'running' || props.runningSessionIDs.has(session.id)} onClick={() => props.onRenameSession(session)} aria-label={`Rename ${sessionName(session)}`} title="Rename"><EditIcon /></button>
-                      <button disabled={session.status === 'running' || props.runningSessionIDs.has(session.id)} onClick={() => props.onArchiveSession(session)} aria-label={`Archive ${sessionName(session)}`} title="Archive"><ArchiveIcon /></button>
-                      <button className="danger" disabled={session.status === 'running' || props.runningSessionIDs.has(session.id)} onClick={() => props.onDeleteSession(session)} aria-label={`Delete ${sessionName(session)}`} title="Delete"><TrashIcon /></button>
-                    </div>
-                  </div>
-                ))}
+				{visibleRoots.map((node) => renderSessionBranch(project.id, node))}
                 {sessions.length === 0 && <p className="tree-empty">No sessions yet</p>}
-                {(expanded ? sessions.length > 3 : sessions.length > visibleSessions.length) && (
+				{(expanded ? sessionRoots.length > 3 : hiddenSessionCount > 0) && (
                   <button className="tree-expand-button" onClick={() => toggleProject(project.id)}>
                     <ChevronIcon expanded={expanded} />
-					{expanded ? 'Collapse' : `Show ${sessions.length - visibleSessions.length} more sessions`}
+					{expanded ? 'Collapse' : `Show ${hiddenSessionCount} more sessions`}
                   </button>
                 )}
                 {archivedSessions.length > 0 && (
@@ -121,21 +154,7 @@ export const WorkspaceTree = memo(function WorkspaceTree(props: {
                     <button className="tree-expand-button archived-session-toggle" onClick={() => toggleArchivedProject(project.id)} aria-expanded={archivedExpanded}>
                       <ArchiveIcon /> Archived ({archivedSessions.length}) <ChevronIcon expanded={archivedExpanded} />
                     </button>
-                    {archivedExpanded && archivedSessions.map((session) => (
-                      <div className="session-tree-row archived" key={session.id}>
-                        <button className="session-tree-button" disabled title="Restore this session to open it">
-                          <span className="session-icon"><ArchiveIcon /></span>
-                          <span className="session-copy">
-                            <strong>{sessionName(session)}</strong>
-                            <small>Archived · {session.model_id || session.model_profile}</small>
-                          </span>
-                        </button>
-                        <div className="session-tree-actions">
-                          <button onClick={() => props.onRestoreSession(session)} aria-label={`Restore ${sessionName(session)}`} title="Restore"><RestoreIcon /></button>
-                          <button className="danger" onClick={() => props.onDeleteSession(session)} aria-label={`Delete ${sessionName(session)}`} title="Delete permanently"><TrashIcon /></button>
-                        </div>
-                      </div>
-                    ))}
+					{archivedExpanded && archivedSessionRoots.map((node) => renderSessionBranch(project.id, node, true))}
                   </>
                 )}
               </div>

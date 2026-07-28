@@ -34,6 +34,13 @@ type SessionRunCoordinatorOptions struct {
 	MaxConcurrentRuns int
 	Now               func() time.Time
 	NewRunID          func() (string, error)
+	// OnRunEvent observes every event from every admitted run, including runs
+	// started by agent tools. It lets presentation adapters attach one shared
+	// replay layer without supplying a per-Start callback.
+	OnRunEvent func(*CoordinatedSessionRun, SessionStreamEvent)
+	// OnRunSettled observes the stable result after Wait returns and before the
+	// run is removed from the coordinator's active indexes.
+	OnRunSettled func(*CoordinatedSessionRun, SessionMessageResult, error)
 }
 
 func (options SessionRunCoordinatorOptions) withDefaults() SessionRunCoordinatorOptions {
@@ -150,6 +157,9 @@ func (coordinator *SessionRunCoordinator) Start(sessionID string, input SessionM
 	}
 	forward := func(event SessionStreamEvent) {
 		handle.observe(event)
+		if coordinator.options.OnRunEvent != nil {
+			coordinator.options.OnRunEvent(handle, event)
+		}
 		if emit != nil {
 			emit(event)
 		}
@@ -170,7 +180,10 @@ func (coordinator *SessionRunCoordinator) Start(sessionID string, input SessionM
 
 func (coordinator *SessionRunCoordinator) await(handle *CoordinatedSessionRun) {
 	defer coordinator.wg.Done()
-	_, _ = handle.Wait()
+	result, err := handle.Wait()
+	if coordinator.options.OnRunSettled != nil {
+		coordinator.options.OnRunSettled(handle, result, err)
+	}
 
 	coordinator.mu.Lock()
 	if coordinator.byID[handle.id] == handle {

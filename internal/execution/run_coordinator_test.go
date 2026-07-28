@@ -149,6 +149,59 @@ func TestSessionRunCoordinatorCloseCancelsRunsAndRejectsStarts(t *testing.T) {
 	}
 }
 
+func TestSessionRunCoordinatorObservesEventsAndSettlementForAllStarts(t *testing.T) {
+	starter := newCoordinatorTestStarter()
+	events := make(chan SessionStreamEvent, 1)
+	settled := make(chan struct {
+		runID  string
+		result SessionMessageResult
+		err    error
+	}, 1)
+	coordinator := NewSessionRunCoordinator(context.Background(), starter, SessionRunCoordinatorOptions{
+		NewRunID: func() (string, error) { return "run-observed", nil },
+		OnRunEvent: func(run *CoordinatedSessionRun, event SessionStreamEvent) {
+			if run.ID() != "run-observed" || run.SessionID() != "session-observed" {
+				t.Errorf("observed run = %q/%q", run.ID(), run.SessionID())
+			}
+			events <- event
+		},
+		OnRunSettled: func(run *CoordinatedSessionRun, result SessionMessageResult, err error) {
+			settled <- struct {
+				runID  string
+				result SessionMessageResult
+				err    error
+			}{runID: run.ID(), result: result, err: err}
+		},
+	})
+	defer coordinator.Close()
+
+	run, err := coordinator.Start("session-observed", SessionMessageInput{Content: "observe"}, nil)
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	select {
+	case event := <-events:
+		if event["type"] != "turn.started" || event["turn_id"] != "turn-session-observed" {
+			t.Fatalf("observed event = %#v", event)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("coordinator did not observe run event")
+	}
+
+	starter.complete("session-observed")
+	if _, err := run.Wait(); err != nil {
+		t.Fatalf("Wait() error = %v", err)
+	}
+	select {
+	case observed := <-settled:
+		if observed.runID != run.ID() || observed.result.Status != "committed" || observed.err != nil {
+			t.Fatalf("settled observation = %#v", observed)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("coordinator did not observe run settlement")
+	}
+}
+
 func waitForCoordinatorRunRemoval(t *testing.T, coordinator *SessionRunCoordinator, runID string) {
 	t.Helper()
 	deadline := time.Now().Add(time.Second)

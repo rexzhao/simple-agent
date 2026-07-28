@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -153,6 +154,66 @@ func TestRunRegistryLogsUnderlyingFailure(t *testing.T) {
 	got := logs.String()
 	if !strings.Contains(got, "missing-session") || !strings.Contains(got, "session not found") {
 		t.Fatalf("failure log = %q, want session id and underlying error", got)
+	}
+}
+
+func TestRunRegistryAdoptsAgentStartedCoordinatorRun(t *testing.T) {
+	runner := enteredBlockingWebTestRunner{entered: make(chan struct{}), once: &sync.Once{}}
+	server, _, app := newWebTestAppServerWithRunner(t, runner)
+	_, session := createWebProjectAndSession(t, server)
+
+	run, err := app.runs.coordinator.Start(session.ID, execution.SessionMessageInput{Content: "agent-started"}, nil)
+	if err != nil {
+		t.Fatalf("coordinator.Start() error = %v", err)
+	}
+	select {
+	case <-runner.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("agent-started run did not enter runner")
+	}
+
+	managed, ok := app.runs.get(run.ID())
+	if !ok || managed.run != run || managed.sessionID != session.ID {
+		t.Fatalf("adopted run = %#v/%t, want coordinator handle", managed, ok)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		events, terminal, _, _, changed := managed.snapshot(0)
+		if len(events) > 0 && strings.Contains(string(events[0].Payload), `"type":"turn.started"`) {
+			if terminal {
+				t.Fatal("agent-started run became terminal before cancellation")
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("agent-started event was not replayable: %#v", events)
+		}
+		select {
+		case <-changed:
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+
+	run.Cancel()
+	if _, err := run.Wait(); err == nil {
+		t.Fatal("cancelled agent-started run returned nil error")
+	}
+	deadline = time.Now().Add(5 * time.Second)
+	for {
+		events, terminal, _, _, changed := managed.snapshot(0)
+		if terminal {
+			if len(events) != 1 || !strings.Contains(string(events[0].Payload), `"type":"run.settled"`) || !strings.Contains(string(events[0].Payload), `"status":"cancelled"`) {
+				t.Fatalf("terminal replay = %#v", events)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("adopted run did not become terminal")
+		}
+		select {
+		case <-changed:
+		case <-time.After(10 * time.Millisecond):
+		}
 	}
 }
 

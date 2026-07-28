@@ -112,9 +112,10 @@ type runEvent struct {
 	Bytes   int
 }
 
-// activeRunSnapshot is the server-owned descriptor a newly opened browser uses
-// to reattach to an existing Web run. Session data remains durable; this only
-// identifies the in-memory SSE stream and its current turn.
+// activeRunSnapshot is the server-owned descriptor a browser uses to reattach
+// to any coordinated run, whether it was started by Web or by an agent tool.
+// Session data remains durable; this only identifies the in-memory SSE stream
+// and its current turn.
 type activeRunSnapshot struct {
 	RunID     string    `json:"run_id"`
 	SessionID string    `json:"session_id"`
@@ -132,19 +133,24 @@ func newRunRegistryWithOptions(ctx context.Context, service *execution.Service, 
 		ctx = context.Background()
 	}
 	resolvedOptions := options.withDefaults()
-	coordinator := execution.NewSessionRunCoordinator(ctx, service, execution.SessionRunCoordinatorOptions{MaxConcurrentRuns: resolvedOptions.MaxConcurrentRuns})
-	if service != nil {
-		service.SetSessionRunCoordinator(coordinator)
-	}
-	return &runRegistry{
+	registry := &runRegistry{
 		ctx:            ctx,
 		service:        service,
-		coordinator:    coordinator,
 		log:            logWriter,
 		options:        resolvedOptions,
 		byID:           make(map[string]*managedRun),
 		terminalTimers: make(map[string]*time.Timer),
 	}
+	coordinator := execution.NewSessionRunCoordinator(ctx, service, execution.SessionRunCoordinatorOptions{
+		MaxConcurrentRuns: resolvedOptions.MaxConcurrentRuns,
+		OnRunEvent:        registry.observeRunEvent,
+		OnRunSettled:      registry.settleRun,
+	})
+	registry.coordinator = coordinator
+	if service != nil {
+		service.SetSessionRunCoordinator(coordinator)
+	}
+	return registry
 }
 
 func newManagedRun(id, sessionID string, options runRegistryOptions) *managedRun {
@@ -177,30 +183,38 @@ func (r *runRegistry) startWithInput(sessionID string, input execution.SessionMe
 	}
 	r.mu.Unlock()
 
-	managed := newManagedRun("", sessionID, r.options)
-	coordinated, err := r.coordinator.Start(sessionID, input, managed.append)
+	coordinated, err := r.coordinator.Start(sessionID, input, nil)
 	if err != nil {
 		return nil, err
 	}
-	managed.id = coordinated.ID()
-	managed.run = coordinated
-
-	r.mu.Lock()
-	if r.closed {
-		r.mu.Unlock()
+	managed, ok := r.ensureManaged(coordinated)
+	if !ok {
 		coordinated.Cancel()
 		return nil, ErrRunRegistryClosed
 	}
-	r.byID[managed.id] = managed
-	r.mu.Unlock()
-
-	go r.await(managed)
 	return managed, nil
 }
 
-func (r *runRegistry) await(managed *managedRun) {
-	result, err := managed.run.Wait()
-	status := string(managed.run.Status())
+// observeRunEvent is installed on the shared execution coordinator, so runs
+// started by Web requests and runs started by agent session tools enter the
+// same bounded replay registry.
+func (r *runRegistry) observeRunEvent(run *execution.CoordinatedSessionRun, event execution.SessionStreamEvent) {
+	managed, ok := r.ensureManaged(run)
+	if !ok {
+		return
+	}
+	managed.append(event)
+}
+
+// settleRun finalizes replay for every coordinated run. The coordinator calls
+// it before removing the active handle, which closes the discovery race for a
+// browser attaching as the run settles.
+func (r *runRegistry) settleRun(run *execution.CoordinatedSessionRun, result execution.SessionMessageResult, err error) {
+	managed, ok := r.ensureManaged(run)
+	if !ok {
+		return
+	}
+	status := string(run.Status())
 	fields := map[string]any{
 		"run_id":   managed.id,
 		"status":   status,
@@ -223,6 +237,25 @@ func (r *runRegistry) await(managed *managedRun) {
 		r.retainTerminalLocked(managed)
 	}
 	r.mu.Unlock()
+}
+
+func (r *runRegistry) ensureManaged(run *execution.CoordinatedSessionRun) (*managedRun, bool) {
+	if r == nil || run == nil || strings.TrimSpace(run.ID()) == "" {
+		return nil, false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closed {
+		return nil, false
+	}
+	if managed := r.byID[run.ID()]; managed != nil {
+		return managed, true
+	}
+	managed := newManagedRun(run.ID(), run.SessionID(), r.options)
+	managed.startedAt = run.StartedAt()
+	managed.run = run
+	r.byID[managed.id] = managed
+	return managed, true
 }
 
 func (r *runRegistry) retainTerminalLocked(managed *managedRun) {
@@ -328,12 +361,19 @@ func (r *runRegistry) logRunFailure(managed *managedRun, err error) {
 
 func (r *runRegistry) get(id string) (*managedRun, bool) {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	if r.closed {
+		r.mu.Unlock()
 		return nil, false
 	}
 	managed, ok := r.byID[id]
-	return managed, ok
+	r.mu.Unlock()
+	if ok {
+		return managed, true
+	}
+	if run, active := r.coordinator.Get(id); active {
+		return r.ensureManaged(run)
+	}
+	return nil, false
 }
 
 func (r *runRegistry) activeRuns() []activeRunSnapshot {
