@@ -382,6 +382,10 @@
 
 ## M19：Async Subagent-as-Tool Runtime
 
+状态说明（2026-07-28）：该进程内 job runtime、`subagents` 配置和 `subagent_*` tools 已删除，
+由持久化的 `session_*` orchestration tools、session lineage 和共享 run coordinator 取代。以下
+内容只作为历史完成记录保留。
+
 - [x] 根配置文件支持 `subagents` 映射，形态为 `id -> relative config file path`。
 - [x] `subagents` 相对路径基于写出该配置项的父配置文件所在目录解析。
 - [x] subagent config 文件复用 main config 的 `sai` schema。

@@ -26,7 +26,6 @@ import (
 	openairesponses "github.com/rexzhao/simple-agent/internal/model/openai_responses"
 	"github.com/rexzhao/simple-agent/internal/sessions"
 	localskills "github.com/rexzhao/simple-agent/internal/skills"
-	"github.com/rexzhao/simple-agent/internal/subagents"
 	"github.com/rexzhao/simple-agent/internal/tools"
 )
 
@@ -1201,9 +1200,6 @@ func lastString(values []string) string {
 func enabledToolsForRun(rootDir string, enabled []string) (*tools.Registry, []model.Tool, error) {
 	builtinEnabled := make([]string, 0, len(enabled))
 	for _, name := range enabled {
-		if subagents.IsTool(name) {
-			return nil, nil, explicitSubagentToolError(name)
-		}
 		if IsSessionTool(name) {
 			continue
 		}
@@ -1226,10 +1222,6 @@ func enabledToolsForRun(rootDir string, enabled []string) (*tools.Registry, []mo
 	return registry, schemas, nil
 }
 
-func explicitSubagentToolError(name string) error {
-	return fmt.Errorf("enabled tool %q is a subagent tool; subagent tools are auto-enabled by configuring subagents and must not be listed in tools.enabled or --enable-tools", name)
-}
-
 type runToolExecutor struct {
 	builtins     *tools.Registry
 	mcpSessions  map[string]*mcp.Session
@@ -1237,9 +1229,6 @@ type runToolExecutor struct {
 }
 
 func (e runToolExecutor) Execute(ctx context.Context, name string, arguments map[string]any) (model.ToolResult, error) {
-	if subagents.IsTool(name) {
-		return model.ToolResult{}, fmt.Errorf("subagent tool %q is not registered", name)
-	}
 	if IsSessionTool(name) {
 		if e.sessionTools == nil {
 			return model.ToolResult{}, fmt.Errorf("session tool %q is not configured", name)

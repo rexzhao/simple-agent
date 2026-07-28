@@ -171,16 +171,6 @@ func (l *Logger) eventRecord(event model.Event) map[string]any {
 			"cache_write_tokens": event.Usage.CacheWriteTokens,
 			"reasoning_tokens":   event.Usage.ReasoningTokens,
 		}
-	case model.SubagentCompletionEvent:
-		record["job_id"] = event.JobID
-		record["agent_id"] = event.AgentID
-		if event.DisplayName != "" {
-			record["display_name"] = event.DisplayName
-		}
-		if event.JobName != "" {
-			record["job_name"] = event.JobName
-		}
-		record["status"] = event.Status
 	case model.ErrorEvent:
 		record["is_error"] = true
 		record["message"] = safeErrorMessage(event)

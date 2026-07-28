@@ -123,7 +123,6 @@ const (
 	EventTypeToolResult            EventType = "tool_result"
 	EventTypeUsage                 EventType = "usage"
 	EventTypeResponseState         EventType = "response_state"
-	EventTypeSubagentCompletion    EventType = "subagent_completion"
 	EventTypeError                 EventType = "error"
 )
 
@@ -246,18 +245,6 @@ type ResponseStateEvent struct {
 
 func (ResponseStateEvent) Type() EventType {
 	return EventTypeResponseState
-}
-
-type SubagentCompletionEvent struct {
-	JobID       string
-	AgentID     string
-	DisplayName string
-	JobName     string
-	Status      string
-}
-
-func (SubagentCompletionEvent) Type() EventType {
-	return EventTypeSubagentCompletion
 }
 
 type ErrorEvent struct {

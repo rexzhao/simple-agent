@@ -683,6 +683,10 @@ developer message 注入在内置基础约束之后、loaded skills 之前；res
 
 ## M19：Async Subagent-as-Tool Runtime
 
+状态说明（2026-07-28）：该进程内 job runtime、`subagents` 配置和 `subagent_*` tools 已删除，
+由持久化的 `session_*` orchestration tools、session lineage 和共享 run coordinator 取代。本节
+只作为历史设计记录保留。
+
 目标：在保持纯 CLI 和现有单 agent loop 稳定的前提下，把配置好的 child agents 作为 parent
 agent 的异步工具暴露出来。M19 只交付 async subagent runtime，不交付完整 multi-agent
 orchestration。

@@ -311,55 +311,6 @@ func TestErrorEventHTTPStatusErrorLogsStatusWithoutResponseBody(t *testing.T) {
 	}
 }
 
-func TestSubagentCompletionEventLogsMetadataOnly(t *testing.T) {
-	parent := t.TempDir()
-	logRoot := filepath.Join(parent, "logs")
-	logger, err := Open(filepath.Join(logRoot, "sai.jsonl"), Attributes{
-		Provider: "fake",
-		Model:    "model-default",
-	})
-	if err != nil {
-		t.Fatalf("Open() error = %v", err)
-	}
-	futurePath := logger.Path()
-
-	if err := logger.LogEvent(model.SubagentCompletionEvent{
-		JobID:       "job-123",
-		AgentID:     "reviewer",
-		DisplayName: "Review UI",
-		JobName:     "review-1",
-		Status:      "completed",
-	}); err != nil {
-		t.Fatalf("LogEvent() error = %v", err)
-	}
-	if err := logger.Close(); err != nil {
-		t.Fatalf("Close() error = %v", err)
-	}
-
-	data, err := os.ReadFile(futurePath)
-	if err != nil {
-		t.Fatalf("ReadFile(%q) error = %v", futurePath, err)
-	}
-	logText := string(data)
-	for _, want := range []string{
-		`"event":"subagent_completion"`,
-		`"job_id":"job-123"`,
-		`"agent_id":"reviewer"`,
-		`"display_name":"Review UI"`,
-		`"job_name":"review-1"`,
-		`"status":"completed"`,
-	} {
-		if !strings.Contains(logText, want) {
-			t.Fatalf("log = %q, want contain %q", logText, want)
-		}
-	}
-	for _, leaked := range []string{"child output secret", "child error secret", `"output"`, `"error"`} {
-		if strings.Contains(logText, leaked) {
-			t.Fatalf("log leaked %q: %s", leaked, logText)
-		}
-	}
-}
-
 func TestOpenWithEmptyPathDisablesLogging(t *testing.T) {
 	logger, err := Open(" \t ", Attributes{Provider: "fake", Model: "model-default"})
 	if err != nil {
