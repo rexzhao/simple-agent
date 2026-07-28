@@ -295,6 +295,7 @@ tools:
     - session_start
     - session_search
     - session_get
+    - session_history
     - session_send
     - session_wait
     - session_stop
@@ -306,11 +307,12 @@ provider/model snapshot or select a provider and model profile returned by
 `session_models`. `session_send` supports strict active-turn `steer` (which
 fails once that turn stops accepting input) and a separate next-turn `queue`.
 `session_get` and `session_wait` return only persisted assistant items, never
-uncommitted streaming deltas. Session tools cannot query sessions in another
-project, wait for or stop their own run, or spawn beyond the bounded child
-depth. See [Agent session orchestration](agent-session-orchestration.md) for
-the complete tool arguments, output semantics, concurrency behavior, limits,
-and stable error codes.
+uncommitted streaming deltas. `session_history` returns paginated,
+user-visible persisted conversation items. Session tools cannot query sessions
+in another project, wait for or stop their own run, or spawn beyond the bounded
+child depth. See [Agent session orchestration](agent-session-orchestration.md)
+for the complete tool arguments, output semantics, concurrency behavior,
+limits, and stable error codes.
 
 ## MCP tool sources
 

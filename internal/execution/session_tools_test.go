@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -13,12 +14,13 @@ import (
 
 	"github.com/rexzhao/simple-agent/internal/contextwindow"
 	"github.com/rexzhao/simple-agent/internal/model"
+	"github.com/rexzhao/simple-agent/internal/sessions"
 )
 
 func TestSessionToolDefinitionsAndExplicitSelection(t *testing.T) {
 	definitions := sessionToolDefinitions()
-	if len(definitions) != 7 {
-		t.Fatalf("len(sessionToolDefinitions()) = %d, want 7", len(definitions))
+	if len(definitions) != 8 {
+		t.Fatalf("len(sessionToolDefinitions()) = %d, want 8", len(definitions))
 	}
 	gotNames := make([]string, 0, len(definitions))
 	for _, definition := range definitions {
@@ -35,7 +37,7 @@ func TestSessionToolDefinitionsAndExplicitSelection(t *testing.T) {
 	}
 	wantNames := []string{
 		ToolSessionModels, ToolSessionStart, ToolSessionSearch, ToolSessionGet,
-		ToolSessionSend, ToolSessionWait, ToolSessionStop,
+		ToolSessionHistory, ToolSessionSend, ToolSessionWait, ToolSessionStop,
 	}
 	if !reflect.DeepEqual(gotNames, wantNames) {
 		t.Fatalf("session tool names = %#v, want %#v", gotNames, wantNames)
@@ -434,6 +436,21 @@ func TestSessionToolsValidateArgumentsAtExecutorBoundary(t *testing.T) {
 			arguments: map[string]any{"session_id": child.ID, "max_output_chars": maximumSessionOutputMaxChars + 1},
 		},
 		{
+			name:      "history combines cursors",
+			tool:      ToolSessionHistory,
+			arguments: map[string]any{"session_id": child.ID, "before_seq": 2, "after_seq": 1},
+		},
+		{
+			name:      "history explicit zero cursor",
+			tool:      ToolSessionHistory,
+			arguments: map[string]any{"session_id": child.ID, "before_seq": 0},
+		},
+		{
+			name:      "history over maximum limit",
+			tool:      ToolSessionHistory,
+			arguments: map[string]any{"session_id": child.ID, "limit": maximumSessionChatItemsLimit + 1},
+		},
+		{
 			name:      "wait negative timeout",
 			tool:      ToolSessionWait,
 			arguments: map[string]any{"session_id": child.ID, "timeout_ms": -1},
@@ -456,6 +473,50 @@ func TestSessionToolsValidateArgumentsAtExecutorBoundary(t *testing.T) {
 			assertSessionToolErrorCode(t, result, "invalid_arguments")
 		})
 	}
+}
+
+func TestSessionHistoryReadsVisibleItemsWithPaginationAndProjectScope(t *testing.T) {
+	service, parent, child, outside := newSessionToolTestSessions(t, t.TempDir(), fakeExecutionTurnRunner{supports: true})
+	executor := &sessionToolExecutor{service: service, caller: parent}
+
+	for index, content := range []string{"first", "second", "third"} {
+		item := sessions.SessionItemFromMessage(fmt.Sprintf("message-%d", index), model.Message{
+			Role:    model.MessageRoleAssistant,
+			Content: content,
+		})
+		if _, err := service.sessionStore.AppendItem(child.ID, item); err != nil {
+			t.Fatalf("AppendItem(%q) error = %v", content, err)
+		}
+	}
+
+	latestResult := executeSessionTool(t, executor, ToolSessionHistory, map[string]any{
+		"session_id": child.ID,
+		"limit":      2,
+	})
+	latestPayload := decodeSessionToolPayload(t, latestResult)
+	history := payloadMap(t, latestPayload, "history")
+	items, ok := history["items"].([]any)
+	if !ok || len(items) != 2 || items[0].(map[string]any)["id"] != "message-1" || items[1].(map[string]any)["id"] != "message-2" {
+		t.Fatalf("session_history latest payload = %#v", latestPayload)
+	}
+	if history["has_more_before"] != true || history["has_more_after"] != false {
+		t.Fatalf("session_history latest cursors = %#v", history)
+	}
+
+	olderResult := executeSessionTool(t, executor, ToolSessionHistory, map[string]any{
+		"session_id": child.ID,
+		"before_seq": int(history["oldest_seq"].(float64)),
+		"limit":      2,
+	})
+	olderPayload := decodeSessionToolPayload(t, olderResult)
+	olderHistory := payloadMap(t, olderPayload, "history")
+	olderItems := olderHistory["items"].([]any)
+	if len(olderItems) != 1 || olderItems[0].(map[string]any)["id"] != "message-0" {
+		t.Fatalf("session_history older payload = %#v", olderPayload)
+	}
+
+	outsideResult := executeSessionTool(t, executor, ToolSessionHistory, map[string]any{"session_id": outside.ID})
+	assertSessionToolErrorCode(t, outsideResult, "session_forbidden")
 }
 
 func TestSessionToolsListModelsAndStartExplicitModel(t *testing.T) {

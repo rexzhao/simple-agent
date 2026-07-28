@@ -18,6 +18,7 @@ tools:
     - session_start
     - session_search
     - session_get
+    - session_history
     - session_send
     - session_wait
     - session_stop
@@ -36,6 +37,7 @@ never included in tool results.
 | `session_start` | Create a child session and asynchronously start its first turn. | Name: 120 Unicode characters; maximum lineage depth: 4. |
 | `session_search` | Match canonical session names with a Go RE2 regular expression. | Default 20 results; maximum 100. |
 | `session_get` | Read session state and its latest relevant persisted assistant item. | Default output limit 64 Ki characters; maximum 256 Ki. |
+| `session_history` | Read a page of persisted, user-visible conversation items. | Default 50 items; maximum 200. |
 | `session_send` | Strictly steer the current turn or queue an independent next turn. | `mode` is `steer` or `queue`. |
 | `session_wait` | Wait for the run active when the call begins, then inspect the session. | Default and maximum timeout: 30 seconds. |
 | `session_stop` | Request cancellation of a session's active run. | Self-stop is rejected; the durable session is not deleted. |
@@ -122,6 +124,13 @@ reasoning deltas, in-memory buffers, tool results, and hidden items never count.
 This ensures an agent sees only state that can be recovered after a restart.
 `max_output_chars` truncates by Unicode characters and marks the output with
 `truncated: true`.
+
+`session_history` accepts a durable `session_id` and returns the same visible
+conversation items used by the Web history API. The newest page is returned by
+default. Pass `before_seq: oldest_seq` to page backward or
+`after_seq: newest_seq` to read newer items; the two cursors cannot be combined.
+Resolve names with `session_search` first because display names are not unique.
+Hidden items and sessions outside the caller's project are never returned.
 
 ## `steer` versus `queue`
 

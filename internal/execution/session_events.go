@@ -15,7 +15,10 @@ import (
 	"github.com/rexzhao/simple-agent/internal/sessions"
 )
 
-const defaultSessionChatItemsLimit = 50
+const (
+	defaultSessionChatItemsLimit = 50
+	maximumSessionChatItemsLimit = 200
+)
 
 const maxSessionStreamToolContentRunes = 4096
 
@@ -241,8 +244,8 @@ func (s *Service) GetSessionChatItemsPage(id string, options SessionItemsOptions
 	if limit <= 0 {
 		limit = defaultSessionChatItemsLimit
 	}
-	if limit > 200 {
-		return SessionItemsPage{}, fmt.Errorf("session item limit cannot exceed 200")
+	if limit > maximumSessionChatItemsLimit {
+		return SessionItemsPage{}, fmt.Errorf("session item limit cannot exceed %d", maximumSessionChatItemsLimit)
 	}
 	session, err := s.sessionStore.Load(id)
 	if err != nil {

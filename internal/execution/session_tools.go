@@ -16,13 +16,14 @@ import (
 )
 
 const (
-	ToolSessionModels = "session_models"
-	ToolSessionStart  = "session_start"
-	ToolSessionSearch = "session_search"
-	ToolSessionGet    = "session_get"
-	ToolSessionSend   = "session_send"
-	ToolSessionWait   = "session_wait"
-	ToolSessionStop   = "session_stop"
+	ToolSessionModels  = "session_models"
+	ToolSessionStart   = "session_start"
+	ToolSessionSearch  = "session_search"
+	ToolSessionGet     = "session_get"
+	ToolSessionHistory = "session_history"
+	ToolSessionSend    = "session_send"
+	ToolSessionWait    = "session_wait"
+	ToolSessionStop    = "session_stop"
 
 	maximumAgentSessionSpawnDepth  = 4
 	maximumSessionDisplayNameRunes = 120
@@ -36,7 +37,7 @@ const (
 // calling session at runtime.
 func IsSessionTool(name string) bool {
 	switch name {
-	case ToolSessionModels, ToolSessionStart, ToolSessionSearch, ToolSessionGet, ToolSessionSend, ToolSessionWait, ToolSessionStop:
+	case ToolSessionModels, ToolSessionStart, ToolSessionSearch, ToolSessionGet, ToolSessionHistory, ToolSessionSend, ToolSessionWait, ToolSessionStop:
 		return true
 	default:
 		return false
@@ -114,6 +115,32 @@ func sessionToolDefinitions() []model.Tool {
 					"description": "Maximum Unicode characters of assistant output to return.",
 					"minimum":     1,
 					"maximum":     maximumSessionOutputMaxChars,
+				},
+			}, []any{"session_id"}),
+		},
+		{
+			Name:        ToolSessionHistory,
+			Description: "Read one page of persisted, user-visible conversation history for a session in the current project. Use session_search to resolve a name to a session id first.",
+			InputSchema: sessionToolObjectSchema(map[string]any{
+				"session_id": map[string]any{
+					"type":        "string",
+					"description": "Durable session id.",
+				},
+				"before_seq": map[string]any{
+					"type":        "integer",
+					"description": "Return items older than this sequence number. Cannot be combined with after_seq.",
+					"minimum":     1,
+				},
+				"after_seq": map[string]any{
+					"type":        "integer",
+					"description": "Return items newer than this sequence number. Cannot be combined with before_seq.",
+					"minimum":     1,
+				},
+				"limit": map[string]any{
+					"type":        "integer",
+					"description": "Maximum items to return; defaults to 50.",
+					"minimum":     1,
+					"maximum":     maximumSessionChatItemsLimit,
 				},
 			}, []any{"session_id"}),
 		},
@@ -230,6 +257,8 @@ func (e *sessionToolExecutor) Execute(ctx context.Context, name string, argument
 		return e.search(name, arguments)
 	case ToolSessionGet:
 		return e.get(name, arguments)
+	case ToolSessionHistory:
+		return e.history(name, arguments)
 	case ToolSessionSend:
 		return e.send(name, arguments)
 	case ToolSessionWait:
@@ -406,6 +435,41 @@ func (e *sessionToolExecutor) get(toolName string, arguments map[string]any) (mo
 		return sessionToolFailure(toolName, err)
 	}
 	return sessionToolResult(toolName, map[string]any{"ok": true, "inspection": inspection})
+}
+
+func (e *sessionToolExecutor) history(toolName string, arguments map[string]any) (model.ToolResult, error) {
+	target, result, ok := e.targetFromArguments(toolName, arguments)
+	if !ok {
+		return result, nil
+	}
+	beforeSeq, err := optionalSessionIntegerInRange(arguments, "before_seq", 0, 1, int(^uint(0)>>1))
+	if err != nil {
+		return sessionToolError(toolName, "invalid_arguments", err.Error())
+	}
+	afterSeq, err := optionalSessionIntegerInRange(arguments, "after_seq", 0, 1, int(^uint(0)>>1))
+	if err != nil {
+		return sessionToolError(toolName, "invalid_arguments", err.Error())
+	}
+	if beforeSeq > 0 && afterSeq > 0 {
+		return sessionToolError(toolName, "invalid_arguments", "before_seq and after_seq cannot be combined")
+	}
+	limit, err := optionalSessionIntegerInRange(arguments, "limit", 0, 1, maximumSessionChatItemsLimit)
+	if err != nil {
+		return sessionToolError(toolName, "invalid_arguments", err.Error())
+	}
+	page, err := e.service.GetSessionChatItemsPage(target.ID, SessionItemsOptions{
+		BeforeSeq: int64(beforeSeq),
+		AfterSeq:  int64(afterSeq),
+		Limit:     limit,
+	})
+	if err != nil {
+		return sessionToolFailure(toolName, err)
+	}
+	return sessionToolResult(toolName, map[string]any{
+		"ok":         true,
+		"session_id": target.ID,
+		"history":    page,
+	})
 }
 
 func (e *sessionToolExecutor) send(toolName string, arguments map[string]any) (model.ToolResult, error) {
