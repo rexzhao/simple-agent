@@ -57,7 +57,9 @@ export const ProcessTimeline = memo(function ProcessTimeline({ steps, live = fal
 // ToolGroupRow renders a folded run of consecutive tool calls as one
 // aggregated row. The row stays expanded while it is the live in-flight tail
 // — even between tool batches — and collapses only once a run-breaking step
-// seals it or the run settles. It re-expands whenever a member tool fails.
+// seals it or the run settles. While live, it re-expands whenever a member
+// tool fails; historical groups always start collapsed, failed or not — a
+// finished session should not greet the reader with walls of tool output.
 // Reasoning steps inside the run stay individually collapsed.
 function ToolGroupRow({ flats, live }: { flats: FlatProcessStep[]; live: boolean }) {
 	const tools = flats.map((flat) => flat.step).filter((step): step is ToolActivity => step.kind === 'tool')
@@ -65,13 +67,13 @@ function ToolGroupRow({ flats, live }: { flats: FlatProcessStep[]; live: boolean
 	const pending = tools.filter((tool) => tool.status === 'requested' || tool.status === 'running').length
 	const active = live
 	const hasError = failed > 0
-	const [expanded, setExpanded] = useState(active || hasError)
+	const [expanded, setExpanded] = useState(active || (live && hasError))
 	useEffect(() => {
-		if (hasError) setExpanded(true)
-	}, [hasError])
+		if (live && hasError) setExpanded(true)
+	}, [live, hasError])
 	useEffect(() => {
-		if (!active && !hasError) setExpanded(false)
-	}, [active, hasError])
+		if (!active && !(live && hasError)) setExpanded(false)
+	}, [active, live, hasError])
 
 	const toggle = (event: SyntheticEvent<HTMLDetailsElement>) => {
 		setExpanded(event.currentTarget.open)

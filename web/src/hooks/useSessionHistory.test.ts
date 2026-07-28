@@ -38,6 +38,64 @@ describe('useSessionHistory', () => {
     expect(result.current.itemsPage?.items.map((item) => item.seq)).toEqual([5, 10])
   })
 
+  it('keeps previously loaded older items when a refresh extends the tail', async () => {
+    mocked.session.mockResolvedValue(session('a'))
+    mocked.items.mockResolvedValueOnce(page(10)).mockResolvedValueOnce(page(5)).mockResolvedValueOnce(page(11))
+    const loadSessions = vi.fn().mockResolvedValue([]); const onError = vi.fn()
+    const { result } = renderHook(() => useSessionHistory('a', loadSessions, onError))
+    await waitFor(() => expect(result.current.itemsPage?.oldest_seq).toBe(10))
+    await act(async () => { expect(await result.current.loadOlder()).toBe(true) })
+    expect(result.current.itemsPage?.items.map((item) => item.seq)).toEqual([5, 10])
+    await act(async () => { await result.current.refreshSession('a') })
+    expect(result.current.itemsPage?.items.map((item) => item.seq)).toEqual([5, 10, 11])
+    expect(result.current.itemsPage?.oldest_seq).toBe(5)
+    expect(result.current.itemsPage?.newest_seq).toBe(11)
+  })
+
+  it('keeps the loaded window when a refresh brings no new items', async () => {
+    mocked.session.mockResolvedValue(session('a'))
+    mocked.items.mockResolvedValueOnce(page(10)).mockResolvedValueOnce(page(5)).mockResolvedValueOnce(page(10))
+    const loadSessions = vi.fn().mockResolvedValue([]); const onError = vi.fn()
+    const { result } = renderHook(() => useSessionHistory('a', loadSessions, onError))
+    await waitFor(() => expect(result.current.itemsPage?.oldest_seq).toBe(10))
+    await act(async () => { expect(await result.current.loadOlder()).toBe(true) })
+    await act(async () => { await result.current.refreshSession('a') })
+    expect(result.current.itemsPage?.items.map((item) => item.seq)).toEqual([5, 10])
+    expect(result.current.itemsPage?.oldest_seq).toBe(5)
+  })
+
+  it('replaces the page when a refresh no longer overlaps the loaded window', async () => {
+    mocked.session.mockResolvedValue(session('a'))
+    mocked.items.mockResolvedValueOnce(page(10)).mockResolvedValueOnce(page(5)).mockResolvedValueOnce(page(30))
+    const loadSessions = vi.fn().mockResolvedValue([]); const onError = vi.fn()
+    const { result } = renderHook(() => useSessionHistory('a', loadSessions, onError))
+    await waitFor(() => expect(result.current.itemsPage?.oldest_seq).toBe(10))
+    await act(async () => { expect(await result.current.loadOlder()).toBe(true) })
+    await act(async () => { await result.current.refreshSession('a') })
+    expect(result.current.itemsPage?.items.map((item) => item.seq)).toEqual([30])
+    expect(result.current.itemsPage?.oldest_seq).toBe(30)
+  })
+
+  it('restores the cached conversation when switching back and merges the refresh', async () => {
+    mocked.session.mockImplementation((id) => Promise.resolve(session(id)))
+    mocked.items.mockImplementation((id) => Promise.resolve(page(id === 'a' ? 10 : 20)))
+    const loadSessions = vi.fn().mockResolvedValue([]); const onError = vi.fn()
+    const { result, rerender } = renderHook(({ id }) => useSessionHistory(id, loadSessions, onError), { initialProps: { id: 'a' } })
+    await waitFor(() => expect(result.current.itemsPage?.oldest_seq).toBe(10))
+    mocked.items.mockImplementationOnce(() => Promise.resolve(page(5)))
+    await act(async () => { expect(await result.current.loadOlder()).toBe(true) })
+    expect(result.current.itemsPage?.items.map((item) => item.seq)).toEqual([5, 10])
+    rerender({ id: 'b' })
+    await waitFor(() => expect(result.current.itemsPage?.oldest_seq).toBe(20))
+    mocked.items.mockImplementation((id) => Promise.resolve(page(id === 'a' ? 11 : 20)))
+    rerender({ id: 'a' })
+    // The cached conversation is back synchronously, header included…
+    expect(result.current.sessionDetail?.id).toBe('a')
+    expect(result.current.itemsPage?.items.map((item) => item.seq)).toEqual([5, 10])
+    // …and the background refresh merges the new tail into it.
+    await waitFor(() => expect(result.current.itemsPage?.items.map((item) => item.seq)).toEqual([5, 10, 11]))
+  })
+
   it('does not merge loadOlder after switching sessions', async () => {
     const older = deferred<ItemsPage>()
     mocked.session.mockImplementation((id) => Promise.resolve(session(id)))

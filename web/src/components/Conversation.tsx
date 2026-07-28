@@ -12,7 +12,10 @@ import { MessageSkeleton } from './misc'
 import { ProcessTimeline } from './ProcessTimeline'
 import { CopyIcon, SparkIcon } from './icons'
 
-const autoScrollThresholdPX = 160
+// Distance from the bottom that still counts as "at the bottom". Kept tiny on
+// purpose: any deliberate scroll away from the bottom disengages output
+// following, and only scrolling back to (nearly) the bottom re-engages it.
+const stickToBottomThresholdPX = 8
 
 export const Conversation = memo(function Conversation(props: {
   detail: Session | null
@@ -33,7 +36,6 @@ export const Conversation = memo(function Conversation(props: {
   onRemoveQueuedPrompt: (promptID: string) => void
   onCompact: () => void
 }) {
-  const bottomRef = useRef<HTMLDivElement>(null)
 	const messagesRef = useRef<HTMLElement>(null)
 	const loadOlderRef = useRef<HTMLButtonElement>(null)
 	const followOutputRef = useRef(true)
@@ -43,35 +45,180 @@ export const Conversation = memo(function Conversation(props: {
 		element: HTMLElement | null
 		top: number
 		oldestSeq: number
-		itemCount: number
 	} | null>(null)
+	// Per-session scroll memory: where the user was (and whether they were
+	// following output) when they left the session.
+	const scrollMemoryRef = useRef(new Map<string, { following: boolean; seq: number | null; offsetPX: number }>())
+	const sessionIDRef = useRef('')
+	const saveMemoryFrameRef = useRef(0)
+	const settleFrameRef = useRef(0)
+	const settleActiveRef = useRef(false)
 	const [loadingOlder, setLoadingOlder] = useState(false)
-	useEffect(() => {
-		followOutputRef.current = true
-		bottomRef.current?.scrollIntoView({ behavior: 'auto' })
-	}, [props.detail?.id])
-  useEffect(() => {
-		if (followOutputRef.current) bottomRef.current?.scrollIntoView({ behavior: 'auto' })
-	}, [props.activeRun?.assistantText, props.activeRun?.steps, props.page?.newest_seq])
-	const updateFollowOutput = () => {
+	sessionIDRef.current = props.detail?.id ?? ''
+
+	// Scoped to the messages container: unlike scrollIntoView this can never
+	// drag along other scrollable ancestors (window, sidebar).
+	const scrollToBottom = useCallback(() => {
+		const messages = messagesRef.current
+		if (messages) messages.scrollTop = messages.scrollHeight
+	}, [])
+	// Scroll events are the single source of truth for follow intent. Landing
+	// at the bottom engages following; leaving it — wheel, touch, keyboard,
+	// scrollbar — disengages, so streaming output never yanks the viewport.
+	const updateFollowOutput = useCallback(() => {
 		const messages = messagesRef.current
 		if (!messages) return
-		followOutputRef.current = messages.scrollHeight - messages.scrollTop - messages.clientHeight <= autoScrollThresholdPX
-	}
+		followOutputRef.current = messages.scrollHeight - messages.scrollTop - messages.clientHeight <= stickToBottomThresholdPX
+	}, [])
+	// Keeps the per-session scroll memory fresh; rAF-throttled so busy scroll
+	// gestures record at most one sample per frame.
+	const scheduleScrollMemorySave = useCallback(() => {
+		if (saveMemoryFrameRef.current) return
+		saveMemoryFrameRef.current = requestAnimationFrame(() => {
+			saveMemoryFrameRef.current = 0
+			const messages = messagesRef.current
+			const sessionID = sessionIDRef.current
+			if (!messages || !sessionID) return
+			const containerTop = messages.getBoundingClientRect().top
+			const anchor = [...messages.querySelectorAll<HTMLElement>('.message[data-seq]')]
+				.find((element) => element.getBoundingClientRect().bottom > containerTop) ?? null
+			scrollMemoryRef.current.set(sessionID, {
+				following: followOutputRef.current,
+				seq: anchor ? Number(anchor.dataset.seq) : null,
+				offsetPX: anchor ? anchor.getBoundingClientRect().top - containerTop : 0,
+			})
+		})
+	}, [])
+	const handleScroll = useCallback(() => {
+		updateFollowOutput()
+		scheduleScrollMemorySave()
+	}, [scheduleScrollMemorySave, updateFollowOutput])
+	// Any deliberate scroll gesture cancels an in-flight position restore.
+	const cancelSettle = useCallback(() => {
+		if (settleFrameRef.current) cancelAnimationFrame(settleFrameRef.current)
+		settleFrameRef.current = 0
+		settleActiveRef.current = false
+	}, [])
+	// On session switch, restore where the user left off: snapping to the
+	// bottom when they were following output (or have never visited), otherwise
+	// re-anchoring on the remembered message. content-visibility estimates make
+	// scrollHeight a moving target right after the swap, so the restore pins
+	// the target whenever the layout moves; without it the viewport lands
+	// wherever the estimates put it — e.g. the top of the last page — and even
+	// triggers a spurious older-page load. Position changes the restore did
+	// not cause (user scrolls) are respected after one reclaim frame, and any
+	// scroll gesture cancels the loop outright.
+	useLayoutEffect(() => {
+		const messages = messagesRef.current
+		const sessionID = props.detail?.id ?? ''
+		if (!messages || !sessionID) return
+		const memory = scrollMemoryRef.current.get(sessionID)
+		const anchorTarget = memory && !memory.following && memory.seq != null
+			? { seq: memory.seq, offsetPX: memory.offsetPX }
+			: null
+		followOutputRef.current = !anchorTarget
+		settleActiveRef.current = true
+		let lastHeight = -1
+		let stableFrames = 0
+		let misses = 0
+		let foundAnchor = false
+		const startedAt = performance.now()
+		const finish = (container: HTMLElement) => {
+			settleActiveRef.current = false
+			settleFrameRef.current = 0
+			if (anchorTarget && !foundAnchor) {
+				// The remembered message is gone (history rewritten): fall back
+				// to the bottom rather than stranding the user mid-list.
+				followOutputRef.current = true
+				container.scrollTop = container.scrollHeight
+			} else {
+				updateFollowOutput()
+			}
+		}
+		const step = () => {
+			const container = messagesRef.current
+			if (!container || !settleActiveRef.current) return
+			if (performance.now() - startedAt > 2500) {
+				finish(container)
+				return
+			}
+			let distance: number
+			if (anchorTarget) {
+				const anchor = container.querySelector<HTMLElement>(`.message[data-seq="${anchorTarget.seq}"]`)
+				if (anchor) {
+					foundAnchor = true
+					distance = anchor.getBoundingClientRect().top - container.getBoundingClientRect().top - anchorTarget.offsetPX
+				} else {
+					distance = Number.POSITIVE_INFINITY
+				}
+			} else {
+				distance = container.scrollHeight - container.scrollTop - container.clientHeight
+			}
+			const height = container.scrollHeight
+			const heightChanged = height !== lastHeight
+			lastHeight = height
+			if (Math.abs(distance) <= 2) {
+				misses = 0
+				stableFrames += 1
+				if (stableFrames >= 3) {
+					finish(container)
+					return
+				}
+			} else if (!heightChanged) {
+				// The position moved without a layout change — an external
+				// scroll. Reclaim once in case it was estimate drift, then
+				// respect it and stop.
+				misses += 1
+				if (misses >= 2) {
+					finish(container)
+					return
+				}
+				stableFrames = 0
+				if (anchorTarget) container.scrollTop += distance
+				else container.scrollTop = container.scrollHeight
+			} else {
+				// Layout still converging: keep the restore target pinned.
+				misses = 0
+				stableFrames = 0
+				if (anchorTarget) container.scrollTop += distance
+				else container.scrollTop = container.scrollHeight
+			}
+			settleFrameRef.current = requestAnimationFrame(step)
+		}
+		step()
+		return cancelSettle
+	}, [props.detail?.id, cancelSettle, updateFollowOutput])
+	// Follow the output stream, but only while the user stays at the bottom.
+	// Runs before paint so streaming growth never shows an un-scrolled frame.
+	// While a switch restore is settling, the restore loop owns scrolling.
+	useLayoutEffect(() => {
+		if (settleActiveRef.current) return
+		if (followOutputRef.current) scrollToBottom()
+	}, [props.activeRun, props.page?.newest_seq, scrollToBottom])
+	// Sending is explicit intent to be at the bottom: re-engage following even
+	// when the user had scrolled up to read history.
+	const handleSend = useCallback(async (content: string, images: PastedImageAttachment[]): Promise<boolean> => {
+		const sent = await props.onSend(content, images)
+		if (sent) {
+			cancelSettle()
+			followOutputRef.current = true
+			scrollToBottom()
+		}
+		return sent
+	}, [props.onSend, scrollToBottom, cancelSettle])
 	const loadOlder = useCallback(async () => {
 		const messages = messagesRef.current
 		if (!messages || loadingOlderRef.current || !props.page?.has_more_before) return
 		loadingOlderRef.current = true
 		setLoadingOlder(true)
 		const containerTop = messages.getBoundingClientRect().top
-		const anchorElement = [...messages.querySelectorAll<HTMLElement>('.message, .historical-process')]
+		const anchorElement = [...messages.querySelectorAll<HTMLElement>('.message')]
 			.find((element) => element.getBoundingClientRect().bottom > containerTop) ?? null
 		prependAnchorRef.current = {
 			sessionID: props.detail?.id ?? '',
 			element: anchorElement,
 			top: anchorElement?.getBoundingClientRect().top ?? containerTop,
 			oldestSeq: props.page.oldest_seq,
-			itemCount: props.page.items.length,
 		}
 		try {
 			if (!await props.onLoadOlder()) prependAnchorRef.current = null
@@ -80,6 +227,11 @@ export const Conversation = memo(function Conversation(props: {
 			setLoadingOlder(false)
 		}
 	}, [props.detail?.id, props.onLoadOlder, props.page])
+	// Restore the viewport anchor after older items are prepended. Only a true
+	// prepend (oldest_seq moved backwards) consumes the anchor: refresh merges
+	// append at the tail and leave the geometry untouched. The compensation is
+	// geometric, so it composes with the browser's own scroll anchoring: when
+	// the browser already compensated, the measured delta is zero.
 	useLayoutEffect(() => {
 		const anchor = prependAnchorRef.current
 		const messages = messagesRef.current
@@ -88,10 +240,11 @@ export const Conversation = memo(function Conversation(props: {
 			prependAnchorRef.current = null
 			return
 		}
-		if (anchor.oldestSeq === props.page?.oldest_seq && anchor.itemCount === (props.page?.items.length ?? 0) && props.page?.has_more_before) return
-		if (anchor.element?.isConnected) messages.scrollTop += anchor.element.getBoundingClientRect().top - anchor.top
+		const page = props.page
+		if (!page || page.oldest_seq === anchor.oldestSeq) return
 		prependAnchorRef.current = null
-	}, [props.detail?.id, props.page?.has_more_before, props.page?.items.length, props.page?.oldest_seq])
+		if (anchor.element?.isConnected) messages.scrollTop += anchor.element.getBoundingClientRect().top - anchor.top
+	}, [props.detail?.id, props.page])
 	useEffect(() => {
 		const messages = messagesRef.current
 		const button = loadOlderRef.current
@@ -102,6 +255,9 @@ export const Conversation = memo(function Conversation(props: {
 		observer.observe(button)
 		return () => observer.disconnect()
 	}, [loadOlder, loadingOlder, props.page?.has_more_before])
+	useEffect(() => () => {
+		if (saveMemoryFrameRef.current) cancelAnimationFrame(saveMemoryFrameRef.current)
+	}, [])
 	const visibleItems = useMemo(() => props.activeRun?.turnID
 		? (props.page?.items ?? []).filter((item) =>
 			item.turn_id !== props.activeRun?.turnID || (props.activeRun?.restored && item.message?.role === 'user'))
@@ -125,7 +281,7 @@ export const Conversation = memo(function Conversation(props: {
 		  <button className="secondary-button" disabled={!props.detail || props.detail.status === 'running' || Boolean(props.activeRun)} onClick={props.onCompact}>Compact context</button>
         </div>
       </header>
-      <section ref={messagesRef} className="messages" aria-live="polite" onScroll={updateFollowOutput}>
+      <section ref={messagesRef} className="messages" aria-live="polite" onScroll={handleScroll} onWheel={cancelSettle} onTouchMove={cancelSettle} onKeyDown={cancelSettle} onPointerDown={cancelSettle}>
         {props.page?.has_more_before && <button ref={loadOlderRef} className="load-older" disabled={loadingOlder} onClick={() => void loadOlder()}>{loadingOlder ? 'Loading earlier messages…' : 'Load earlier messages'}</button>}
         {!props.page && <MessageSkeleton />}
 				{conversationEntries.map((entry) => entry.kind === 'message'
@@ -135,7 +291,6 @@ export const Conversation = memo(function Conversation(props: {
 		{props.page && visibleItems.length === 0 && !props.activeRun && (
           <div className="conversation-empty"><SparkIcon /><h3>Start a new task</h3><p>Describe a goal, a problem, or the code you want to change.</p></div>
         )}
-        <div ref={bottomRef} />
       </section>
 	  <QueuedPromptList prompts={props.activeRun?.queuedPrompts ?? []} onRemove={props.onRemoveQueuedPrompt} />
 	  <Composer
@@ -148,7 +303,7 @@ export const Conversation = memo(function Conversation(props: {
 		onDraftClear={props.onDraftClear}
 		running={Boolean(props.activeRun)}
 		blocked={false}
-		onSend={props.onSend}
+		onSend={handleSend}
 		onCancel={props.onCancel}
 	  />
     </div>
@@ -231,7 +386,7 @@ const Message = memo(function Message({ item, sessionID }: { item: SessionItem; 
 		}
 	}
   return (
-    <article className={`message ${role === 'user' ? 'user' : 'assistant'}`}>
+    <article className={`message ${role === 'user' ? 'user' : 'assistant'}`} data-seq={item.seq}>
       <div className="message-content">
         {role === 'user' && text && <div className="message-text">{text}</div>}
         {role === 'user' && images.length > 0 && <StoredImageAttachments sessionID={sessionID} images={images} />}
@@ -388,13 +543,14 @@ function MarkdownMessage({ text, streaming = false }: { text: string; streaming?
 
 type ConversationEntry =
 	| { kind: 'message'; item: SessionItem }
-	| { kind: 'process'; id: string; createdAt: string; steps: RunStep[] }
+	| { kind: 'process'; id: string; createdAt: string; lastSeq: number; steps: RunStep[] }
 
 function buildConversationEntries(items: SessionItem[], sessionID: string, recentStepsByTurn: Record<string, RunStep[]>): ConversationEntry[] {
 	const entries: ConversationEntry[] = []
 	let steps: RunStep[] = []
 	let processCreatedAt = ''
 	let processTurnID = ''
+	let processLastSeq = 0
 	let agentIteration = 0
 	const emittedRecentTurns = new Set<string>()
 
@@ -403,12 +559,13 @@ function buildConversationEntries(items: SessionItem[], sessionID: string, recen
 		const recentSteps = recentKey && !emittedRecentTurns.has(recentKey) ? recentStepsByTurn[recentKey] : undefined
 		const displayedSteps = recentSteps?.length ? recentSteps : steps
 		if (displayedSteps.length > 0) {
-			entries.push({ kind: 'process', id: `process-${sessionID}-${turnID || displayedSteps[0].id}`, createdAt: processCreatedAt, steps: displayedSteps })
+			entries.push({ kind: 'process', id: `process-${sessionID}-${turnID || displayedSteps[0].id}`, createdAt: processCreatedAt, lastSeq: processLastSeq, steps: displayedSteps })
 		}
 		if (recentKey && recentSteps?.length) emittedRecentTurns.add(recentKey)
 		steps = []
 		processCreatedAt = ''
 		processTurnID = ''
+		processLastSeq = 0
 	}
 
 	for (const item of items) {
@@ -437,6 +594,7 @@ function buildConversationEntries(items: SessionItem[], sessionID: string, recen
 			agentIteration = item.agent_iteration || agentIteration + 1
 			if (!processCreatedAt) processCreatedAt = item.created_at
 			if (!processTurnID) processTurnID = item.turn_id || ''
+			processLastSeq = item.seq
 			if (text) steps.push({ kind: 'output', id: `${item.id}-output`, text, iteration: agentIteration })
 			for (const toolCall of item.message?.tool_calls ?? []) {
 				steps.push({
@@ -454,6 +612,7 @@ function buildConversationEntries(items: SessionItem[], sessionID: string, recen
 			agentIteration = item.agent_iteration || agentIteration || 1
 			if (!processCreatedAt) processCreatedAt = item.created_at
 			if (!processTurnID) processTurnID = item.turn_id || ''
+			processLastSeq = item.seq
 			const toolCallID = item.message?.tool_call_id || item.id
 			const index = steps.findIndex((step) => step.kind === 'tool' && step.id === toolCallID)
 			const status: ToolActivity['status'] = item.message?.is_error || item.status === 'error' ? 'error' : item.status === 'pending' ? 'requested' : 'finished'
@@ -475,7 +634,7 @@ function buildConversationEntries(items: SessionItem[], sessionID: string, recen
 
 function HistoricalProcess({ entry }: { entry: Extract<ConversationEntry, { kind: 'process' }> }) {
 	return (
-		<article className="message assistant process-message">
+		<article className="message assistant process-message" data-seq={entry.lastSeq}>
 			<div className="message-content">
 				<ProcessTimeline steps={entry.steps} />
 			</div>

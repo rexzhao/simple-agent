@@ -275,3 +275,39 @@ test('groups render collapsed with visible markers after the run settles', async
   const marginRight = await page.locator('.tool-group > summary > .iteration-marker').first().evaluate((el) => getComputedStyle(el).marginRight)
   expect(marginRight).toBe('11px')
 })
+
+test('failed tools expand the live group but stay collapsed once settled', async ({ page }) => {
+  const settle = newGate()
+  let committed = false
+  const turnItems = [
+    { seq: 1, id: 'i1', turn_id: 'turn-main', created_at: '2026-01-01T00:00:01Z', kind: 'message', visibility: 'normal', audience: 'user', message: { role: 'user', content: { inline: 'Run tools' } } },
+    { seq: 2, id: 'i2', turn_id: 'turn-main', agent_iteration: 1, created_at: '2026-01-01T00:00:02Z', kind: 'message', visibility: 'normal', audience: 'model', message: { role: 'assistant', tool_calls: [{ id: 't1', name: 'read_file', arguments: '{"path":"a.ts"}' }, { id: 't2', name: 'read_file', arguments: '{"path":"b.ts"}' }] } },
+    { seq: 3, id: 'i3', turn_id: 'turn-main', agent_iteration: 1, created_at: '2026-01-01T00:00:03Z', kind: 'message', visibility: 'normal', audience: 'model', message: { role: 'tool', tool_call_id: 't1', content: { inline: 'a' } } },
+    { seq: 4, id: 'i4', turn_id: 'turn-main', agent_iteration: 1, created_at: '2026-01-01T00:00:04Z', kind: 'message', visibility: 'normal', audience: 'model', message: { role: 'tool', tool_call_id: 't2', is_error: true, content: { inline: 'boom' } } },
+    { seq: 5, id: 'i5', turn_id: 'turn-main', agent_iteration: 2, created_at: '2026-01-01T00:00:05Z', kind: 'message', visibility: 'normal', audience: 'model', message: { role: 'assistant', content: { inline: 'One read failed.' } } },
+  ]
+  await mockApp(page, {
+    initial: [
+      { type: 'turn.started', turn_id: 'turn-main' },
+      { type: 'agent.iteration.started', turn_id: 'turn-main', agent_iteration: 1 },
+      { type: 'tool.requested', turn_id: 'turn-main', agent_iteration: 1, tool_call_id: 't1', name: 'read_file', arguments: '{"path":"a.ts"}' },
+      { type: 'tool.finished', turn_id: 'turn-main', agent_iteration: 1, tool_call_id: 't1', name: 'read_file', is_error: false, content: 'a' },
+      { type: 'tool.requested', turn_id: 'turn-main', agent_iteration: 1, tool_call_id: 't2', name: 'read_file', arguments: '{"path":"b.ts"}' },
+      { type: 'tool.finished', turn_id: 'turn-main', agent_iteration: 1, tool_call_id: 't2', name: 'read_file', is_error: true, content: 'boom' },
+    ],
+    gates: [settle],
+    items: () => (committed ? turnItems : []),
+  })
+  // The live tail group surfaces the failure by staying expanded.
+  await expect(page.locator('details.tool-group')).toHaveCount(1)
+  expect(await groupStates(page)).toEqual([{ open: true, summary: 'Read 2 files' }])
+
+  // Once the run settles and the steps reload from history, the group
+  // collapses; the failure remains discoverable via the badge.
+  committed = true
+  settle.release([{ type: 'run.settled', run_id: 'run-main', status: 'committed', turn_id: 'turn-main', last_seq: 5 }])
+  await expect(page.getByText('Ready', { exact: true })).toBeVisible()
+  await expect(page.locator('.message.assistant:not(.transient)').last()).toContainText('One read failed.')
+  expect(await groupStates(page)).toEqual([{ open: false, summary: 'Read 2 files' }])
+  await expect(page.locator('.tool-group > summary small')).toHaveText('1 failed')
+})
