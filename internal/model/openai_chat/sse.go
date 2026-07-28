@@ -96,6 +96,9 @@ func (d *streamEventDecoder) eventsFromChunk(data []byte) ([]model.Event, error)
 	if err := json.Unmarshal(data, &chunk); err != nil {
 		return nil, fmt.Errorf("parse chat completion chunk: %w", err)
 	}
+	if chunk.Error != nil {
+		return []model.Event{chatCompletionErrorEvent(chunk.Error)}, nil
+	}
 
 	var events []model.Event
 	for _, choice := range chunk.Choices {
@@ -212,6 +215,32 @@ func appendSSEMessage(messages []SSEMessage, dataLines []string) []SSEMessage {
 type chatCompletionChunk struct {
 	Choices []chatCompletionChoice `json:"choices"`
 	Usage   *chatCompletionUsage   `json:"usage"`
+	Error   *chatCompletionError   `json:"error"`
+}
+
+type chatCompletionError struct {
+	Message string `json:"message"`
+	Type    string `json:"type"`
+	Code    any    `json:"code"`
+}
+
+// Some providers deliver failures as an in-stream error object instead of
+// an HTTP error status.
+func chatCompletionErrorEvent(chatError *chatCompletionError) model.Event {
+	errorMessage := strings.TrimSpace(chatError.Message)
+	if errorMessage == "" {
+		errorMessage = "unknown error"
+	}
+	if strings.TrimSpace(chatError.Type) != "" {
+		errorMessage = strings.TrimSpace(chatError.Type) + ": " + errorMessage
+	}
+	if chatError.Code != nil {
+		errorMessage = fmt.Sprintf("%s (code %v)", errorMessage, chatError.Code)
+	}
+	return model.ErrorEvent{
+		Err:     &model.ProviderError{Message: errorMessage},
+		Message: "OpenAI chat stream error",
+	}
 }
 
 type chatCompletionChoice struct {

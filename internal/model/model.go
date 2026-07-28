@@ -255,3 +255,12 @@ type ErrorEvent struct {
 func (ErrorEvent) Type() EventType {
 	return EventTypeError
 }
+
+// ProviderError reports a failure returned by the model provider itself —
+// an in-stream error event or an HTTP error status. The message is the
+// provider's own text and is safe to surface to operators.
+type ProviderError struct {
+	Message string
+}
+
+func (e *ProviderError) Error() string { return e.Message }

@@ -187,6 +187,13 @@ func TestEventsFromChunkConvertsErrorEvents(t *testing.T) {
 	if got.Message != "OpenAI Responses response failed" || got.Err == nil {
 		t.Fatalf("error event = %#v, want response failed with error", got)
 	}
+	providerErr, ok := got.Err.(*model.ProviderError)
+	if !ok {
+		t.Fatalf("error event Err = %T, want *model.ProviderError", got.Err)
+	}
+	if providerErr.Message != "invalid_request_error: bad input (code invalid)" {
+		t.Fatalf("provider error message = %q", providerErr.Message)
+	}
 }
 
 func TestEventsFromChunkMapsCacheAndReasoningUsage(t *testing.T) {

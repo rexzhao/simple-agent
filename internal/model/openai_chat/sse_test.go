@@ -50,6 +50,29 @@ func TestEventsFromChunkConvertsTextDelta(t *testing.T) {
 	}
 }
 
+func TestEventsFromChunkConvertsErrorObject(t *testing.T) {
+	events, err := EventsFromChunk([]byte(`{
+		"error": {"message": "Your rate limit is exceeded", "type": "rate_limit_error", "code": "rate_limited"}
+	}`))
+	if err != nil {
+		t.Fatalf("EventsFromChunk() error = %v", err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("len(events) = %d, want 1: %#v", len(events), events)
+	}
+	got, ok := events[0].(model.ErrorEvent)
+	if !ok {
+		t.Fatalf("event[0] = %T, want model.ErrorEvent", events[0])
+	}
+	providerErr, ok := got.Err.(*model.ProviderError)
+	if !ok {
+		t.Fatalf("error event Err = %T, want *model.ProviderError", got.Err)
+	}
+	if providerErr.Message != "rate_limit_error: Your rate limit is exceeded (code rate_limited)" {
+		t.Fatalf("provider error message = %q", providerErr.Message)
+	}
+}
+
 func TestEventsFromChunkConvertsReasoningDelta(t *testing.T) {
 	events, err := EventsFromChunk([]byte(`{
 		"object": "chat.completion.chunk",

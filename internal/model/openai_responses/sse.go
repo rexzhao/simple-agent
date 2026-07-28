@@ -438,7 +438,7 @@ func responseErrorEvent(message string, responseError *responseError, fallback s
 	}
 
 	return model.ErrorEvent{
-		Err:     fmt.Errorf("%s", errorMessage),
+		Err:     &model.ProviderError{Message: errorMessage},
 		Message: message,
 	}
 }

@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"net"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -298,11 +300,12 @@ var (
 
 // turnFailure is the payload for a turn.failed session stream event. It
 // carries a stable code and a short message selected by the failing stage.
-// Provider HTTP failures surface the status and response body verbatim
-// (bounded) — operators need the provider's own message to act on rate
-// limits, quota, and model errors. Everything else stays canned: internal
-// error text, auth data, the prompt and tool results remain in logs and
-// returned errors and are never placed in a SessionStreamEvent.
+// Provider-reported failures — HTTP statuses with response bodies and
+// in-stream error events — surface the provider's own message verbatim
+// (bounded): operators need it to act on rate limits, quota, and model
+// errors. Everything else stays canned: internal error text, auth data,
+// the prompt and tool results remain in logs and returned errors and are
+// never placed in a SessionStreamEvent.
 type turnFailure struct {
 	code    string
 	message string
@@ -1579,6 +1582,13 @@ func turnFailureForRunnerError(err error) turnFailure {
 		return turnFailure{code: "model_http_error", message: message}
 	}
 
+	var providerErr *model.ProviderError
+	if errors.As(err, &providerErr) {
+		if message := strings.TrimSpace(providerErr.Message); message != "" {
+			return turnFailure{code: "model_provider_error", message: truncateTurnFailureDetail(message, turnFailureDetailLimit)}
+		}
+	}
+
 	var requestTimeout *httpstream.RequestTimeoutError
 	if errors.As(err, &requestTimeout) {
 		if requestTimeout.Attempts > 1 {
@@ -1599,6 +1609,19 @@ func turnFailureForRunnerError(err error) turnFailure {
 			code:    "model_stream_idle_timeout",
 			message: fmt.Sprintf("model response stream produced no data for %s", streamIdleTimeout.Timeout),
 		}
+	}
+
+	if errors.Is(err, context.DeadlineExceeded) {
+		return turnFailure{code: "model_request_deadline", message: "model request exceeded its deadline"}
+	}
+
+	var netErr *net.OpError
+	if errors.As(err, &netErr) {
+		return turnFailure{code: "model_connection_failed", message: "could not reach the model provider (connection failed)"}
+	}
+
+	if errors.Is(err, io.ErrUnexpectedEOF) {
+		return turnFailure{code: "model_stream_interrupted", message: "model response stream ended unexpectedly"}
 	}
 	return turnFailureRunner
 }

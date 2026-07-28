@@ -116,6 +116,8 @@ func (d *streamEventDecoder) eventsFromChunk(data []byte) ([]model.Event, bool, 
 		return []model.Event{d.usageEvent(chunk.Usage)}, false, nil
 	case "message_stop":
 		return nil, true, nil
+	case "error":
+		return []model.Event{anthropicStreamErrorEvent(chunk.Error)}, true, nil
 	default:
 		return nil, false, nil
 	}
@@ -250,6 +252,28 @@ type anthropicStreamEvent struct {
 	ContentBlock *anthropicContentBlock `json:"content_block"`
 	Delta        anthropicDelta         `json:"delta"`
 	Usage        *anthropicUsage        `json:"usage"`
+	Error        *anthropicStreamError  `json:"error"`
+}
+
+type anthropicStreamError struct {
+	Type    string `json:"type"`
+	Message string `json:"message"`
+}
+
+// Anthropic sends a terminal error frame (e.g. overloaded_error) before
+// closing the stream; surface it as a provider error instead of dropping it.
+func anthropicStreamErrorEvent(streamError *anthropicStreamError) model.Event {
+	errorMessage := "unknown error"
+	if streamError != nil && strings.TrimSpace(streamError.Message) != "" {
+		errorMessage = strings.TrimSpace(streamError.Message)
+	}
+	if streamError != nil && strings.TrimSpace(streamError.Type) != "" {
+		errorMessage = strings.TrimSpace(streamError.Type) + ": " + errorMessage
+	}
+	return model.ErrorEvent{
+		Err:     &model.ProviderError{Message: errorMessage},
+		Message: "Anthropic Messages stream error",
+	}
 }
 
 type anthropicMessage struct {

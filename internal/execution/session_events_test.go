@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -808,6 +809,47 @@ func TestSessionStreamTurnFailedSafePayloadByStage(t *testing.T) {
 			t.Fatalf("error = %v, want ErrTurnFailed", err)
 		}
 		assertSafeTurnFailedTerminal(t, events, "model_http_error", "model provider returned HTTP 500", turnFailedSecret)
+	})
+
+	t.Run("model_provider_error", func(t *testing.T) {
+		home := t.TempDir()
+		runner := fakeExecutionTurnRunner{
+			supports: true,
+			run: func(ctx context.Context, request SessionTurnRequest) (SessionTurnResult, error) {
+				return SessionTurnResult{}, fmt.Errorf("read stream: %w", &model.ProviderError{Message: "rate_limit_error: Your rate limit is exceeded (code 429)"})
+			},
+		}
+		service, _, session := newExecutionServiceWithSession(t, home, runner)
+		var events []SessionStreamEvent
+		_, err := service.SendSessionMessageWithEvents(context.Background(), session.ID, prompt, func(event SessionStreamEvent) {
+			events = append(events, event)
+		})
+		if !errors.Is(err, ErrTurnFailed) {
+			t.Fatalf("error = %v, want ErrTurnFailed", err)
+		}
+		if strings.Contains(err.Error(), turnFailedSecret) {
+			t.Fatalf("returned error leaks secret: %v", err)
+		}
+		assertSafeTurnFailedTerminal(t, events, "model_provider_error", "rate_limit_error: Your rate limit is exceeded (code 429)", turnFailedSecret)
+	})
+
+	t.Run("model_connection_failed", func(t *testing.T) {
+		home := t.TempDir()
+		runner := fakeExecutionTurnRunner{
+			supports: true,
+			run: func(ctx context.Context, request SessionTurnRequest) (SessionTurnResult, error) {
+				return SessionTurnResult{}, fmt.Errorf("request model: %w", &net.OpError{Op: "dial", Err: fmt.Errorf("connection refused")})
+			},
+		}
+		service, _, session := newExecutionServiceWithSession(t, home, runner)
+		var events []SessionStreamEvent
+		_, err := service.SendSessionMessageWithEvents(context.Background(), session.ID, prompt, func(event SessionStreamEvent) {
+			events = append(events, event)
+		})
+		if !errors.Is(err, ErrTurnFailed) {
+			t.Fatalf("error = %v, want ErrTurnFailed", err)
+		}
+		assertSafeTurnFailedTerminal(t, events, "model_connection_failed", "could not reach the model provider (connection failed)", turnFailedSecret)
 	})
 
 	t.Run("runner_not_incremental", func(t *testing.T) {

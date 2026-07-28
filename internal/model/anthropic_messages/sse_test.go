@@ -43,6 +43,30 @@ func TestEventsFromSSEConvertsTextDeltaAndStopsAtMessageStop(t *testing.T) {
 	}
 }
 
+func TestEventsFromSSEConvertsErrorFrame(t *testing.T) {
+	events, done, err := EventsFromSSE([]byte("event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n\n"))
+	if err != nil {
+		t.Fatalf("EventsFromSSE() error = %v", err)
+	}
+	if !done {
+		t.Fatalf("done = false, want true after an error frame")
+	}
+	if len(events) != 1 {
+		t.Fatalf("len(events) = %d, want 1: %#v", len(events), events)
+	}
+	got, ok := events[0].(model.ErrorEvent)
+	if !ok {
+		t.Fatalf("event[0] = %T, want model.ErrorEvent", events[0])
+	}
+	providerErr, ok := got.Err.(*model.ProviderError)
+	if !ok {
+		t.Fatalf("error event Err = %T, want *model.ProviderError", got.Err)
+	}
+	if providerErr.Message != "overloaded_error: Overloaded" {
+		t.Fatalf("provider error message = %q", providerErr.Message)
+	}
+}
+
 func TestEventsFromChunkConvertsThinkingDelta(t *testing.T) {
 	events, done, err := EventsFromChunk([]byte(`{
 		"type": "content_block_delta",
