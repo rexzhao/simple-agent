@@ -60,7 +60,7 @@ func (r AgentTurnRunner) RunSessionTurn(ctx context.Context, request SessionTurn
 	if strings.TrimSpace(request.TurnID) == "" {
 		return SessionTurnResult{}, fmt.Errorf("session turn id is required when publisher is configured")
 	}
-	runtime, err := r.prepareRuntime(ctx, request.Session, request.SessionStore)
+	runtime, err := r.prepareRuntime(ctx, request.Session, request.SessionStore, request.SessionService, request.RunCoordinator)
 	if err != nil {
 		return SessionTurnResult{}, err
 	}
@@ -89,7 +89,7 @@ func (r AgentTurnRunner) RunSessionTurn(ctx context.Context, request SessionTurn
 }
 
 func (r AgentTurnRunner) SupportsIncrementalSessionTurn(ctx context.Context, request SessionTurnRequest) (supported bool, err error) {
-	runtime, err := r.prepareRuntime(ctx, request.Session, request.SessionStore)
+	runtime, err := r.prepareRuntime(ctx, request.Session, request.SessionStore, request.SessionService, request.RunCoordinator)
 	if err != nil {
 		return false, err
 	}
@@ -100,7 +100,7 @@ func (r AgentTurnRunner) SupportsIncrementalSessionTurn(ctx context.Context, req
 }
 
 func (r AgentTurnRunner) PlanSessionTurnCompaction(ctx context.Context, request SessionTurnRequest) (result SessionCompactionResult, err error) {
-	runtime, err := r.prepareRuntime(ctx, request.Session, request.SessionStore)
+	runtime, err := r.prepareRuntime(ctx, request.Session, request.SessionStore, request.SessionService, request.RunCoordinator)
 	if err != nil {
 		return SessionCompactionResult{}, err
 	}
@@ -131,7 +131,7 @@ func (r AgentTurnRunner) PlanSessionTurnCompaction(ctx context.Context, request 
 }
 
 func (r AgentTurnRunner) PlanSessionCompaction(ctx context.Context, request SessionCompactionRequest) (result SessionCompactionResult, err error) {
-	runtime, err := r.prepareRuntime(ctx, request.Session, request.SessionStore)
+	runtime, err := r.prepareRuntime(ctx, request.Session, request.SessionStore, request.SessionService, request.RunCoordinator)
 	if err != nil {
 		return SessionCompactionResult{}, err
 	}
@@ -158,7 +158,7 @@ func (r AgentTurnRunner) PlanSessionCompaction(ctx context.Context, request Sess
 	}, nil
 }
 
-func (r AgentTurnRunner) prepareRuntime(ctx context.Context, session sessions.SessionV2, store *sessions.V2Store) (*agentRunnerRuntime, error) {
+func (r AgentTurnRunner) prepareRuntime(ctx context.Context, session sessions.SessionV2, store *sessions.V2Store, service *Service, coordinator *SessionRunCoordinator) (*agentRunnerRuntime, error) {
 	cwd := strings.TrimSpace(session.CreatedCWD)
 	if cwd == "" {
 		return nil, fmt.Errorf("session created_cwd is required")
@@ -206,6 +206,7 @@ func (r AgentTurnRunner) prepareRuntime(ctx context.Context, session sessions.Se
 	if err != nil {
 		return nil, err
 	}
+	toolSchemas = append(toolSchemas, enabledSessionToolSchemas(enabledToolNames)...)
 	selectedMCPServers, err := cfg.SelectedMCPServers(session.EnabledMCP, true)
 	if err != nil {
 		return nil, err
@@ -274,8 +275,9 @@ func (r AgentTurnRunner) prepareRuntime(ctx context.Context, session sessions.Se
 		parameters:    resolved.Parameters,
 		provider:      provider,
 		toolExecutor: runToolExecutor{
-			builtins:    toolRegistry,
-			mcpSessions: mcpSessionsByID,
+			builtins:     toolRegistry,
+			mcpSessions:  mcpSessionsByID,
+			sessionTools: newSessionToolExecutor(service, coordinator, session),
 		},
 		toolSchemas:        toolSchemas,
 		maxTurns:           cfg.Agent.MaxTurns,
@@ -1202,6 +1204,9 @@ func enabledToolsForRun(rootDir string, enabled []string) (*tools.Registry, []mo
 		if subagents.IsTool(name) {
 			return nil, nil, explicitSubagentToolError(name)
 		}
+		if IsSessionTool(name) {
+			continue
+		}
 		if !strings.HasPrefix(name, "mcp.") {
 			builtinEnabled = append(builtinEnabled, name)
 		}
@@ -1226,13 +1231,20 @@ func explicitSubagentToolError(name string) error {
 }
 
 type runToolExecutor struct {
-	builtins    *tools.Registry
-	mcpSessions map[string]*mcp.Session
+	builtins     *tools.Registry
+	mcpSessions  map[string]*mcp.Session
+	sessionTools *sessionToolExecutor
 }
 
 func (e runToolExecutor) Execute(ctx context.Context, name string, arguments map[string]any) (model.ToolResult, error) {
 	if subagents.IsTool(name) {
 		return model.ToolResult{}, fmt.Errorf("subagent tool %q is not registered", name)
+	}
+	if IsSessionTool(name) {
+		if e.sessionTools == nil {
+			return model.ToolResult{}, fmt.Errorf("session tool %q is not configured", name)
+		}
+		return e.sessionTools.Execute(ctx, name, arguments)
 	}
 
 	if strings.HasPrefix(name, "mcp.") {

@@ -1,0 +1,477 @@
+package execution
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"os"
+	"path/filepath"
+	"reflect"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/rexzhao/simple-agent/internal/contextwindow"
+	"github.com/rexzhao/simple-agent/internal/model"
+)
+
+func TestSessionToolDefinitionsAndExplicitSelection(t *testing.T) {
+	definitions := sessionToolDefinitions()
+	if len(definitions) != 7 {
+		t.Fatalf("len(sessionToolDefinitions()) = %d, want 7", len(definitions))
+	}
+	gotNames := make([]string, 0, len(definitions))
+	for _, definition := range definitions {
+		gotNames = append(gotNames, definition.Name)
+		if !IsSessionTool(definition.Name) {
+			t.Fatalf("IsSessionTool(%q) = false", definition.Name)
+		}
+		if definition.Description == "" || definition.InputSchema["type"] != "object" {
+			t.Fatalf("definition %q is incomplete: %#v", definition.Name, definition)
+		}
+		if definition.InputSchema["additionalProperties"] != false {
+			t.Fatalf("definition %q permits additional properties", definition.Name)
+		}
+	}
+	wantNames := []string{
+		ToolSessionModels, ToolSessionStart, ToolSessionSearch, ToolSessionGet,
+		ToolSessionSend, ToolSessionWait, ToolSessionStop,
+	}
+	if !reflect.DeepEqual(gotNames, wantNames) {
+		t.Fatalf("session tool names = %#v, want %#v", gotNames, wantNames)
+	}
+
+	registry, builtinSchemas, err := enabledToolsForRun(t.TempDir(), []string{ToolSessionStart, "read_file", ToolSessionGet})
+	if err != nil {
+		t.Fatalf("enabledToolsForRun() error = %v", err)
+	}
+	if registry == nil || len(builtinSchemas) != 1 || builtinSchemas[0].Name != "read_file" {
+		t.Fatalf("built-in selection = registry %p schemas %#v", registry, builtinSchemas)
+	}
+	sessionSchemas := enabledSessionToolSchemas([]string{"read_file", ToolSessionGet, ToolSessionStart})
+	if len(sessionSchemas) != 2 || sessionSchemas[0].Name != ToolSessionGet || sessionSchemas[1].Name != ToolSessionStart {
+		t.Fatalf("session schema selection = %#v", sessionSchemas)
+	}
+}
+
+func TestSessionToolsStartInspectQueueAndWait(t *testing.T) {
+	home := t.TempDir()
+	releaseFirst := make(chan struct{})
+	firstStarted := make(chan SessionTurnRequest, 1)
+	var (
+		mu       sync.Mutex
+		contents []string
+		calls    int
+	)
+	runner := fakeExecutionTurnRunner{
+		supports: true,
+		run: func(ctx context.Context, request SessionTurnRequest) (SessionTurnResult, error) {
+			mu.Lock()
+			calls++
+			call := calls
+			contents = append(contents, request.Content)
+			mu.Unlock()
+			if err := request.Publisher.Publish(eventAssistant(request.TurnID, "persisted: "+request.Content)); err != nil {
+				return SessionTurnResult{}, err
+			}
+			if call == 1 {
+				firstStarted <- request
+				select {
+				case <-releaseFirst:
+				case <-ctx.Done():
+					return SessionTurnResult{}, ctx.Err()
+				}
+			}
+			return SessionTurnResult{Incremental: true}, nil
+		},
+	}
+	service, err := NewServiceWithOptions(home, ServiceOptions{TurnRunner: runner})
+	if err != nil {
+		t.Fatalf("NewServiceWithOptions() error = %v", err)
+	}
+	projectRoot := mkdirProjectRoot(t, "session-tools-project")
+	project, err := service.CreateProject(projectRoot, "Session Tools")
+	if err != nil {
+		t.Fatalf("CreateProject() error = %v", err)
+	}
+	showReasoning := true
+	saveToolResults := true
+	parent, err := service.CreateSession(project.Project.ID, SessionCreateMetadata{
+		DisplayName:     "Parent",
+		CreatedCWD:      projectRoot,
+		ConfigPath:      filepath.Join(home, "sai.yaml"),
+		Provider:        "provider-a",
+		ModelProfile:    "model-a",
+		ModelID:         "model-id-a",
+		ReasoningLevel:  "high",
+		ModelParameters: map[string]any{"temperature": 0.25, "reasoning_effort": "high"},
+		EnabledTools:    []string{ToolSessionStart, ToolSessionGet, ToolSessionSend, ToolSessionWait},
+		EnabledMCP:      []string{"mcp-a"},
+		EnabledSkills:   []string{"skill-a"},
+		ShowReasoning:   &showReasoning,
+		Context:         &contextwindow.Metadata{ContextWindow: 64000, ContextWindowSource: "configured", WarningThresholdPercent: 80, LastTotalTokens: 999},
+		SaveToolResults: &saveToolResults,
+	})
+	if err != nil {
+		t.Fatalf("CreateSession(parent) error = %v", err)
+	}
+	coordinator := NewSessionRunCoordinator(context.Background(), service, SessionRunCoordinatorOptions{MaxConcurrentRuns: 4})
+	service.SetSessionRunCoordinator(coordinator)
+	defer service.ClearSessionRunCoordinator(coordinator)
+	defer coordinator.Close()
+	executor := &sessionToolExecutor{service: service, coordinator: coordinator, caller: parent}
+
+	startResult := executeSessionTool(t, executor, ToolSessionStart, map[string]any{
+		"name": "Research child", "prompt": "first task",
+	})
+	startPayload := decodeSessionToolPayload(t, startResult)
+	childID := requiredPayloadString(t, startPayload, "session_id")
+	if requiredPayloadString(t, startPayload, "name") != "Research child" {
+		t.Fatalf("session_start payload = %#v", startPayload)
+	}
+
+	var firstRequest SessionTurnRequest
+	select {
+	case firstRequest = <-firstStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("child first turn did not start")
+	}
+	if firstRequest.Session.ID != childID || firstRequest.SessionService != service || firstRequest.RunCoordinator != coordinator {
+		t.Fatalf("child request dependencies = session %q service %p coordinator %p", firstRequest.Session.ID, firstRequest.SessionService, firstRequest.RunCoordinator)
+	}
+
+	child, err := service.GetSession(childID)
+	if err != nil {
+		t.Fatalf("GetSession(child) error = %v", err)
+	}
+	if child.ParentSessionID != parent.ID || child.RootSessionID != parent.ID || child.SpawnDepth != 1 || child.CreatedBy != "agent" {
+		t.Fatalf("child lineage = parent %q root %q depth %d created_by %q", child.ParentSessionID, child.RootSessionID, child.SpawnDepth, child.CreatedBy)
+	}
+	if child.Provider != parent.Provider || child.ModelProfile != parent.ModelProfile || child.ModelID != parent.ModelID || canonicalTestJSON(t, child.ModelParameters) != canonicalTestJSON(t, parent.ModelParameters) {
+		t.Fatalf("child model snapshot = %#v, want parent %#v", child, parent)
+	}
+	if child.Context.LastTotalTokens != 0 || child.Context.ContextWindow != parent.Context.ContextWindow {
+		t.Fatalf("child context = %#v, want fresh usage with inherited window", child.Context)
+	}
+	searchResult := executeSessionTool(t, executor, ToolSessionSearch, map[string]any{"name_regex": "^Research child$"})
+	searchPayload := decodeSessionToolPayload(t, searchResult)
+	matches, ok := searchPayload["matches"].([]any)
+	if !ok || len(matches) != 1 || matches[0].(map[string]any)["id"] != childID {
+		t.Fatalf("session_search payload = %#v", searchPayload)
+	}
+
+	// The assistant item was published durably before the fake runner blocked.
+	var getPayload map[string]any
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		getResult := executeSessionTool(t, executor, ToolSessionGet, map[string]any{"session_id": childID})
+		getPayload = decodeSessionToolPayload(t, getResult)
+		inspection := payloadMap(t, getPayload, "inspection")
+		if output, ok := inspection["output"].(map[string]any); ok && output["content"] == "persisted: first task" {
+			if output["kind"] != "intermediate" || output["complete"] != false {
+				t.Fatalf("running output = %#v", output)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("session_get never observed persisted intermediate output: %#v", getPayload)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	queueResult := executeSessionTool(t, executor, ToolSessionSend, map[string]any{
+		"session_id": childID, "mode": "queue", "message": "second task",
+	})
+	queuePayload := decodeSessionToolPayload(t, queueResult)
+	if queuePayload["delivery"] != "queued" {
+		t.Fatalf("session_send queue payload = %#v", queuePayload)
+	}
+
+	timedResult := executeSessionTool(t, executor, ToolSessionWait, map[string]any{
+		"session_id": childID, "timeout_ms": 0,
+	})
+	timedPayload := decodeSessionToolPayload(t, timedResult)
+	if timedPayload["completed"] != false || timedPayload["timed_out"] != true {
+		t.Fatalf("session_wait(timeout) payload = %#v", timedPayload)
+	}
+
+	close(releaseFirst)
+	waitResult := executeSessionTool(t, executor, ToolSessionWait, map[string]any{
+		"session_id": childID, "timeout_ms": 5000,
+	})
+	waitPayload := decodeSessionToolPayload(t, waitResult)
+	if waitPayload["completed"] != true || waitPayload["timed_out"] != false {
+		t.Fatalf("session_wait(completed) payload = %#v", waitPayload)
+	}
+	inspection := payloadMap(t, waitPayload, "inspection")
+	output := payloadMap(t, inspection, "output")
+	if output["content"] != "persisted: second task" || output["kind"] != "final" || output["complete"] != true {
+		t.Fatalf("completed output = %#v", output)
+	}
+	mu.Lock()
+	gotContents := append([]string(nil), contents...)
+	mu.Unlock()
+	if !reflect.DeepEqual(gotContents, []string{"first task", "second task"}) {
+		t.Fatalf("runner contents = %#v", gotContents)
+	}
+}
+
+func TestSessionToolsStrictSteerStopAndProjectScope(t *testing.T) {
+	home := t.TempDir()
+	started := make(chan string, 1)
+	runner := fakeExecutionTurnRunner{
+		supports: true,
+		run: func(ctx context.Context, request SessionTurnRequest) (SessionTurnResult, error) {
+			started <- request.Session.ID
+			<-ctx.Done()
+			return SessionTurnResult{}, ctx.Err()
+		},
+	}
+	service, parent, child, otherProjectSession := newSessionToolTestSessions(t, home, runner)
+	coordinator := NewSessionRunCoordinator(context.Background(), service, SessionRunCoordinatorOptions{})
+	service.SetSessionRunCoordinator(coordinator)
+	defer service.ClearSessionRunCoordinator(coordinator)
+	defer coordinator.Close()
+	executor := &sessionToolExecutor{service: service, coordinator: coordinator, caller: parent}
+
+	steerResult := executeSessionTool(t, executor, ToolSessionSend, map[string]any{
+		"session_id": child.ID, "mode": "steer", "message": "too late",
+	})
+	assertSessionToolErrorCode(t, steerResult, "session_not_steerable")
+
+	run, err := coordinator.Start(child.ID, SessionMessageInput{Content: "work"}, nil)
+	if err != nil {
+		t.Fatalf("coordinator.Start() error = %v", err)
+	}
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("target run did not start")
+	}
+	steered := executeSessionTool(t, executor, ToolSessionSend, map[string]any{
+		"session_id": child.ID, "mode": "steer", "message": "active guidance",
+	})
+	steeredPayload := decodeSessionToolPayload(t, steered)
+	if steeredPayload["delivery"] != "steered" || steeredPayload["run_id"] != run.ID() {
+		t.Fatalf("active steer payload = %#v", steeredPayload)
+	}
+
+	stopResult := executeSessionTool(t, executor, ToolSessionStop, map[string]any{"session_id": child.ID})
+	stopPayload := decodeSessionToolPayload(t, stopResult)
+	if stopPayload["cancellation_requested"] != true || stopPayload["run_id"] != run.ID() {
+		t.Fatalf("session_stop payload = %#v", stopPayload)
+	}
+	select {
+	case <-run.Done():
+	case <-time.After(5 * time.Second):
+		t.Fatal("stopped run did not settle")
+	}
+	if _, err := run.Wait(); !errors.Is(err, context.Canceled) {
+		t.Fatalf("stopped run error = %v, want context.Canceled", err)
+	}
+
+	idleStop := executeSessionTool(t, executor, ToolSessionStop, map[string]any{"session_id": child.ID})
+	idlePayload := decodeSessionToolPayload(t, idleStop)
+	if idlePayload["status"] != "idle" || idlePayload["cancellation_requested"] != false {
+		t.Fatalf("idle session_stop payload = %#v", idlePayload)
+	}
+
+	selfStop := executeSessionTool(t, executor, ToolSessionStop, map[string]any{"session_id": parent.ID})
+	assertSessionToolErrorCode(t, selfStop, "self_stop_forbidden")
+	selfWait := executeSessionTool(t, executor, ToolSessionWait, map[string]any{"session_id": parent.ID, "timeout_ms": 0})
+	assertSessionToolErrorCode(t, selfWait, "self_wait_forbidden")
+
+	outside := executeSessionTool(t, executor, ToolSessionGet, map[string]any{"session_id": otherProjectSession.ID})
+	assertSessionToolErrorCode(t, outside, "session_forbidden")
+}
+
+func TestSessionStartValidatesModelPairDepthAndCoordinator(t *testing.T) {
+	service, parent, _, _ := newSessionToolTestSessions(t, t.TempDir(), fakeExecutionTurnRunner{supports: true})
+	executor := &sessionToolExecutor{service: service, caller: parent}
+
+	missingModel := executeSessionTool(t, executor, ToolSessionStart, map[string]any{
+		"prompt": "x", "provider": "provider-a",
+	})
+	assertSessionToolErrorCode(t, missingModel, "invalid_arguments")
+
+	noCoordinator := executeSessionTool(t, executor, ToolSessionStart, map[string]any{"prompt": "x"})
+	assertSessionToolErrorCode(t, noCoordinator, "coordinator_unavailable")
+
+	deep := parent
+	deep.SpawnDepth = maximumAgentSessionSpawnDepth
+	executor.caller = deep
+	tooDeep := executeSessionTool(t, executor, ToolSessionStart, map[string]any{"prompt": "x"})
+	assertSessionToolErrorCode(t, tooDeep, "spawn_depth_exceeded")
+}
+
+func TestSessionToolsListModelsAndStartExplicitModel(t *testing.T) {
+	home := t.TempDir()
+	service, parent, _, _ := newSessionToolTestSessions(t, home, fakeExecutionTurnRunner{supports: true})
+	providersDir := filepath.Join(home, "providers")
+	if err := os.MkdirAll(providersDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll(providers) error = %v", err)
+	}
+	rootConfig := `default_provider: fake
+default_model: fast
+provider_dir: providers
+tools:
+  enabled: [session_start, session_models]
+`
+	providerConfig := `name: fake
+base_url: http://127.0.0.1:1/v1
+api_key: test-key
+models:
+  fast:
+    id: fake-fast
+  precise:
+    id: fake-precise
+    context_window: 128000
+    reasoning_config:
+      parameter: reasoning_effort
+      default: high
+      levels:
+        low: low
+        high: high
+`
+	if err := os.WriteFile(filepath.Join(home, "sai.yaml"), []byte(rootConfig), 0o600); err != nil {
+		t.Fatalf("WriteFile(root config) error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(providersDir, "fake.yaml"), []byte(providerConfig), 0o600); err != nil {
+		t.Fatalf("WriteFile(provider config) error = %v", err)
+	}
+	coordinator := NewSessionRunCoordinator(context.Background(), service, SessionRunCoordinatorOptions{})
+	service.SetSessionRunCoordinator(coordinator)
+	defer service.ClearSessionRunCoordinator(coordinator)
+	defer coordinator.Close()
+	executor := &sessionToolExecutor{service: service, coordinator: coordinator, caller: parent}
+
+	modelsResult := executeSessionTool(t, executor, ToolSessionModels, map[string]any{})
+	modelsPayload := decodeSessionToolPayload(t, modelsResult)
+	models, ok := modelsPayload["models"].([]any)
+	if !ok || len(models) != 2 {
+		t.Fatalf("session_models payload = %#v", modelsPayload)
+	}
+	precise := models[1].(map[string]any)
+	if precise["provider"] != "fake" || precise["model"] != "precise" || precise["model_id"] != "fake-precise" {
+		t.Fatalf("session_models precise entry = %#v", precise)
+	}
+
+	startResult := executeSessionTool(t, executor, ToolSessionStart, map[string]any{
+		"prompt": "explicit model task", "name": "Precise child",
+		"provider": "fake", "model": "precise", "reasoning_level": "low",
+	})
+	startPayload := decodeSessionToolPayload(t, startResult)
+	child, err := service.GetSession(requiredPayloadString(t, startPayload, "session_id"))
+	if err != nil {
+		t.Fatalf("GetSession(explicit child) error = %v", err)
+	}
+	if child.ParentSessionID != parent.ID || child.Provider != "fake" || child.ModelProfile != "precise" || child.ModelID != "fake-precise" || child.ReasoningLevel != "low" {
+		t.Fatalf("explicit child = %#v", child)
+	}
+}
+
+func newSessionToolTestSessions(t *testing.T, home string, runner SessionTurnRunner) (*Service, SessionDetail, SessionDetail, SessionDetail) {
+	t.Helper()
+	service, err := NewServiceWithOptions(home, ServiceOptions{TurnRunner: runner})
+	if err != nil {
+		t.Fatalf("NewServiceWithOptions() error = %v", err)
+	}
+	projectRoot := mkdirProjectRoot(t, "tool-project-a")
+	project, err := service.CreateProject(projectRoot, "A")
+	if err != nil {
+		t.Fatalf("CreateProject(A) error = %v", err)
+	}
+	otherRoot := mkdirProjectRoot(t, "tool-project-b")
+	otherProject, err := service.CreateProject(otherRoot, "B")
+	if err != nil {
+		t.Fatalf("CreateProject(B) error = %v", err)
+	}
+	save := true
+	metadata := func(cwd string) SessionCreateMetadata {
+		return SessionCreateMetadata{
+			CreatedCWD: cwd, ConfigPath: filepath.Join(home, "sai.yaml"),
+			Provider: "provider-a", ModelProfile: "model-a", ModelID: "model-id-a",
+			SaveToolResults: &save,
+		}
+	}
+	parent, err := service.CreateSession(project.Project.ID, metadata(projectRoot))
+	if err != nil {
+		t.Fatalf("CreateSession(parent) error = %v", err)
+	}
+	childMetadata := metadata(projectRoot)
+	childMetadata.ParentSessionID = parent.ID
+	child, err := service.CreateSession(project.Project.ID, childMetadata)
+	if err != nil {
+		t.Fatalf("CreateSession(child) error = %v", err)
+	}
+	outside, err := service.CreateSession(otherProject.Project.ID, metadata(otherRoot))
+	if err != nil {
+		t.Fatalf("CreateSession(outside) error = %v", err)
+	}
+	return service, parent, child, outside
+}
+
+func executeSessionTool(t *testing.T, executor *sessionToolExecutor, name string, arguments map[string]any) model.ToolResult {
+	t.Helper()
+	result, err := executor.Execute(context.Background(), name, arguments)
+	if err != nil {
+		t.Fatalf("Execute(%s) error = %v", name, err)
+	}
+	return result
+}
+
+func decodeSessionToolPayload(t *testing.T, result model.ToolResult) map[string]any {
+	t.Helper()
+	if result.IsError {
+		t.Fatalf("tool result is error: %s", result.Content)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(result.Content), &payload); err != nil {
+		t.Fatalf("decode tool result %q: %v", result.Content, err)
+	}
+	if payload["ok"] != true {
+		t.Fatalf("tool payload ok = %#v, payload = %#v", payload["ok"], payload)
+	}
+	return payload
+}
+
+func assertSessionToolErrorCode(t *testing.T, result model.ToolResult, code string) {
+	t.Helper()
+	if !result.IsError {
+		t.Fatalf("tool result IsError = false, content = %s", result.Content)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(result.Content), &payload); err != nil {
+		t.Fatalf("decode error result %q: %v", result.Content, err)
+	}
+	if payload["ok"] != false || payload["code"] != code {
+		t.Fatalf("tool error payload = %#v, want code %q", payload, code)
+	}
+}
+
+func requiredPayloadString(t *testing.T, payload map[string]any, name string) string {
+	t.Helper()
+	value, ok := payload[name].(string)
+	if !ok || value == "" {
+		t.Fatalf("payload[%q] = %#v, want non-empty string in %#v", name, payload[name], payload)
+	}
+	return value
+}
+
+func payloadMap(t *testing.T, payload map[string]any, name string) map[string]any {
+	t.Helper()
+	value, ok := payload[name].(map[string]any)
+	if !ok {
+		t.Fatalf("payload[%q] = %#v (%T), want object in %#v", name, payload[name], payload[name], payload)
+	}
+	return value
+}
+
+func canonicalTestJSON(t *testing.T, value any) string {
+	t.Helper()
+	data, err := json.Marshal(value)
+	if err != nil {
+		t.Fatalf("json.Marshal(%#v) error = %v", value, err)
+	}
+	return string(data)
+}

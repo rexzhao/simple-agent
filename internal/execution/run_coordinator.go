@@ -205,6 +205,9 @@ func (coordinator *SessionRunCoordinator) ActiveForSession(sessionID string) (*C
 		return nil, false
 	}
 	run, ok := coordinator.activeBySession[strings.TrimSpace(sessionID)]
+	if !ok || run.Status() != SessionRunRunning {
+		return nil, false
+	}
 	return run, ok
 }
 
@@ -296,6 +299,17 @@ func (run *CoordinatedSessionRun) Wait() (SessionMessageResult, error) {
 		return SessionMessageResult{}, fmt.Errorf("session run is not configured")
 	}
 	return run.run.Wait()
+}
+
+// Done is closed when the coordinated run settles. It is suitable for
+// context- and timeout-aware waiting without spawning a goroutine around Wait.
+func (run *CoordinatedSessionRun) Done() <-chan struct{} {
+	if run == nil || run.run == nil {
+		closed := make(chan struct{})
+		close(closed)
+		return closed
+	}
+	return run.run.Done()
 }
 
 func (run *CoordinatedSessionRun) Cancel() {

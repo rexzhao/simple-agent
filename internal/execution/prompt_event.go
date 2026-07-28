@@ -19,6 +19,7 @@ const (
 	PromptSourceStdin         PromptSource = "stdin"
 	PromptSourceMailbox       PromptSource = "mailbox"
 	PromptSourceMCPTaskUpdate PromptSource = "mcp_task_update"
+	PromptSourceAgentSession  PromptSource = "agent_session"
 )
 
 // PromptMode determines how a prompt is applied to a session run.
@@ -46,7 +47,7 @@ type PromptEvent struct {
 // rewrites Content. MailboxTaskID and InputID are optional and not validated.
 func (e PromptEvent) Validate() error {
 	switch e.Source {
-	case PromptSourceStdin, PromptSourceMailbox, PromptSourceMCPTaskUpdate:
+	case PromptSourceStdin, PromptSourceMailbox, PromptSourceMCPTaskUpdate, PromptSourceAgentSession:
 	default:
 		return fmt.Errorf("prompt event source %q is unknown or empty", e.Source)
 	}

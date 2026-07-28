@@ -132,10 +132,14 @@ func newRunRegistryWithOptions(ctx context.Context, service *execution.Service, 
 		ctx = context.Background()
 	}
 	resolvedOptions := options.withDefaults()
+	coordinator := execution.NewSessionRunCoordinator(ctx, service, execution.SessionRunCoordinatorOptions{MaxConcurrentRuns: resolvedOptions.MaxConcurrentRuns})
+	if service != nil {
+		service.SetSessionRunCoordinator(coordinator)
+	}
 	return &runRegistry{
 		ctx:            ctx,
 		service:        service,
-		coordinator:    execution.NewSessionRunCoordinator(ctx, service, execution.SessionRunCoordinatorOptions{MaxConcurrentRuns: resolvedOptions.MaxConcurrentRuns}),
+		coordinator:    coordinator,
 		log:            logWriter,
 		options:        resolvedOptions,
 		byID:           make(map[string]*managedRun),
@@ -305,7 +309,11 @@ func (r *runRegistry) Close() {
 	r.terminalTimers = make(map[string]*time.Timer)
 	r.byID = make(map[string]*managedRun)
 	coordinator := r.coordinator
+	service := r.service
 	r.mu.Unlock()
+	if service != nil {
+		service.ClearSessionRunCoordinator(coordinator)
+	}
 	coordinator.Close()
 }
 

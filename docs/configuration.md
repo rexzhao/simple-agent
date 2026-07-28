@@ -286,6 +286,30 @@ directories, and rejects binary files and paths outside the workspace.
 `edit_file` matches LF and CRLF input equivalently, preserves a UTF-8 BOM, and
 writes using the file's original line-ending style.
 
+Durable session orchestration tools use the same explicit capability list:
+
+```yaml
+tools:
+  enabled:
+    - session_models
+    - session_start
+    - session_search
+    - session_get
+    - session_send
+    - session_wait
+    - session_stop
+```
+
+`session_start` creates an asynchronous child session in the same project and
+records its parent/root lineage. It can inherit the caller's frozen
+provider/model snapshot or select a provider and model profile returned by
+`session_models`. `session_send` supports strict active-turn `steer` (which
+fails once that turn stops accepting input) and durable next-turn `queue`.
+`session_get` and `session_wait` return only persisted assistant items, never
+uncommitted streaming deltas. Session tools cannot query sessions in another
+project, wait for or stop their own run, or spawn beyond the bounded child
+depth.
+
 ## MCP tool sources
 
 MCP currently acts only as a tool source for the agent runtime. A configured

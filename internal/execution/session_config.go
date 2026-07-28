@@ -13,11 +13,13 @@ import (
 // create a durable session. Configuration always comes from the service's
 // server-root config path.
 type ConfiguredSessionOptions struct {
-	CWD            string
-	ConfigPath     string
-	Provider       string
-	ModelProfile   string
-	ReasoningLevel string
+	CWD             string
+	ConfigPath      string
+	DisplayName     string
+	ParentSessionID string
+	Provider        string
+	ModelProfile    string
+	ReasoningLevel  string
 }
 
 type SessionModelOption struct {
@@ -119,6 +121,8 @@ func (s *Service) CreateConfiguredSession(projectID string, options ConfiguredSe
 	}
 
 	return s.CreateSession(project.ID, SessionCreateMetadata{
+		DisplayName:     strings.TrimSpace(options.DisplayName),
+		ParentSessionID: strings.TrimSpace(options.ParentSessionID),
 		CreatedCWD:      cwd,
 		ConfigPath:      cfg.ConfigPath,
 		Provider:        resolved.ProviderName,
@@ -129,6 +133,47 @@ func (s *Service) CreateConfiguredSession(projectID string, options ConfiguredSe
 		EnabledTools:    copyStringSlice(cfg.Tools.Enabled),
 		EnabledMCP:      mcpServerIDs(selectedMCP),
 		EnabledSkills:   skillIDs(selectedSkills),
+		ShowReasoning:   &showReasoning,
+		Context:         &contextMetadata,
+		SaveToolResults: &saveToolResults,
+	})
+}
+
+// CreateInheritedSession creates an agent child using the parent's frozen
+// runtime model and capability snapshot. It starts with fresh history and
+// context usage while retaining the same project and working directory.
+func (s *Service) CreateInheritedSession(parentID, displayName string) (SessionDetail, error) {
+	parent, err := s.GetSession(parentID)
+	if err != nil {
+		return SessionDetail{}, err
+	}
+	contextMetadata := contextwindow.Metadata{
+		ContextWindow:           parent.Context.ContextWindow,
+		ContextWindowSource:     parent.Context.ContextWindowSource,
+		WarningThresholdPercent: parent.Context.WarningThresholdPercent,
+	}
+	if contextMetadata.WarningThresholdPercent <= 0 {
+		contextMetadata.WarningThresholdPercent = contextwindow.WarningThresholdPercent
+	}
+	showReasoning := parent.ShowReasoning
+	saveToolResults := true
+	cwd := strings.TrimSpace(parent.CWD)
+	if cwd == "" {
+		cwd = parent.CreatedCWD
+	}
+	return s.CreateSession(parent.ProjectID, SessionCreateMetadata{
+		DisplayName:     strings.TrimSpace(displayName),
+		ParentSessionID: parent.ID,
+		CreatedCWD:      cwd,
+		ConfigPath:      s.ConfigPath(),
+		Provider:        parent.Provider,
+		ModelProfile:    parent.ModelProfile,
+		ModelID:         parent.ModelID,
+		ReasoningLevel:  parent.ReasoningLevel,
+		ModelParameters: copyParameterMap(parent.ModelParameters),
+		EnabledTools:    copyStringSlice(parent.EnabledTools),
+		EnabledMCP:      copyStringSlice(parent.EnabledMCP),
+		EnabledSkills:   copyStringSlice(parent.EnabledSkills),
 		ShowReasoning:   &showReasoning,
 		Context:         &contextMetadata,
 		SaveToolResults: &saveToolResults,

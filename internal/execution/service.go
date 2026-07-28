@@ -28,6 +28,9 @@ type Service struct {
 	turnRunner              SessionTurnRunner
 	compactPlanner          SessionCompactPlanner
 	sessionWriteLockTimeout time.Duration
+
+	runCoordinatorMu sync.RWMutex
+	runCoordinator   *SessionRunCoordinator
 }
 
 type Project struct {
@@ -214,13 +217,15 @@ type SessionTurnCompactionPlanner interface {
 }
 
 type SessionTurnRequest struct {
-	Session       sessions.SessionV2
-	SessionStore  *sessions.V2Store
-	TurnID        string
-	Content       string
-	ContentBlocks []model.InputContentBlock
-	Emit          func(model.Event)
-	Publisher     eventbus.Publisher
+	Session        sessions.SessionV2
+	SessionStore   *sessions.V2Store
+	SessionService *Service
+	RunCoordinator *SessionRunCoordinator
+	TurnID         string
+	Content        string
+	ContentBlocks  []model.InputContentBlock
+	Emit           func(model.Event)
+	Publisher      eventbus.Publisher
 	// ActivePromptDrain is an optional callback polled at safe checkpoints
 	// during the active turn. When set, AgentTurnRunner adapts it into the
 	// agent-loop active prompt drain so queued user messages are appended to the
@@ -253,8 +258,10 @@ const (
 type SessionActivePromptDrain func(SessionActivePromptCheckpoint) []model.Message
 
 type SessionCompactionRequest struct {
-	Session      sessions.SessionV2
-	SessionStore *sessions.V2Store
+	Session        sessions.SessionV2
+	SessionStore   *sessions.V2Store
+	SessionService *Service
+	RunCoordinator *SessionRunCoordinator
 }
 
 type SessionTurnResult struct {
@@ -376,6 +383,40 @@ func (s *Service) ConfigPath() string {
 		return ""
 	}
 	return s.configPath
+}
+
+// SetSessionRunCoordinator installs the application-wide active-run owner used
+// by both presentation adapters and session tools. Passing nil detaches it.
+func (s *Service) SetSessionRunCoordinator(coordinator *SessionRunCoordinator) {
+	if s == nil {
+		return
+	}
+	s.runCoordinatorMu.Lock()
+	s.runCoordinator = coordinator
+	s.runCoordinatorMu.Unlock()
+}
+
+// ClearSessionRunCoordinator detaches coordinator only if it is still the
+// installed instance. This prevents an older adapter from clearing a newer
+// coordinator during overlapping shutdown/startup.
+func (s *Service) ClearSessionRunCoordinator(coordinator *SessionRunCoordinator) {
+	if s == nil {
+		return
+	}
+	s.runCoordinatorMu.Lock()
+	if s.runCoordinator == coordinator {
+		s.runCoordinator = nil
+	}
+	s.runCoordinatorMu.Unlock()
+}
+
+func (s *Service) sessionRunCoordinator() *SessionRunCoordinator {
+	if s == nil {
+		return nil
+	}
+	s.runCoordinatorMu.RLock()
+	defer s.runCoordinatorMu.RUnlock()
+	return s.runCoordinator
 }
 
 func (s *Service) CreateProject(root, displayName string) (ProjectCreateResult, error) {
@@ -890,6 +931,17 @@ func (r *SessionRun) Wait() (SessionMessageResult, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.result, r.err
+}
+
+// Done is closed when the run settles. Callers must use Wait to retrieve the
+// stable terminal result after the channel is closed.
+func (r *SessionRun) Done() <-chan struct{} {
+	if r == nil || r.done == nil {
+		closed := make(chan struct{})
+		close(closed)
+		return closed
+	}
+	return r.done
 }
 
 // Status returns the current lifecycle status of the run.
@@ -1456,6 +1508,8 @@ func (s *Service) runSessionMessage(ctx context.Context, id string, input Sessio
 	result, err := s.turnRunner.RunSessionTurn(ctx, SessionTurnRequest{
 		Session:           session,
 		SessionStore:      s.sessionStore,
+		SessionService:    s,
+		RunCoordinator:    s.sessionRunCoordinator(),
 		TurnID:            turnID,
 		Content:           content,
 		ContentBlocks:     copyInputContentBlocks(input.ContentBlocks),
@@ -1537,10 +1591,12 @@ func (s *Service) requireIncrementalSessionTurn(ctx context.Context, session ses
 		return fmt.Errorf("turn runner does not support incremental persistence")
 	}
 	supported, err := supporter.SupportsIncrementalSessionTurn(ctx, SessionTurnRequest{
-		Session:       session,
-		SessionStore:  s.sessionStore,
-		Content:       input.Content,
-		ContentBlocks: copyInputContentBlocks(input.ContentBlocks),
+		Session:        session,
+		SessionStore:   s.sessionStore,
+		SessionService: s,
+		RunCoordinator: s.sessionRunCoordinator(),
+		Content:        input.Content,
+		ContentBlocks:  copyInputContentBlocks(input.ContentBlocks),
 	})
 	if err != nil {
 		return ErrTurnFailed
@@ -1557,11 +1613,13 @@ func (s *Service) planAutoCompaction(ctx context.Context, bus eventbus.Publisher
 		return session, nil
 	}
 	result, err := planner.PlanSessionTurnCompaction(ctx, SessionTurnRequest{
-		Session:       session,
-		SessionStore:  s.sessionStore,
-		TurnID:        turnID,
-		Content:       input.Content,
-		ContentBlocks: copyInputContentBlocks(input.ContentBlocks),
+		Session:        session,
+		SessionStore:   s.sessionStore,
+		SessionService: s,
+		RunCoordinator: s.sessionRunCoordinator(),
+		TurnID:         turnID,
+		Content:        input.Content,
+		ContentBlocks:  copyInputContentBlocks(input.ContentBlocks),
 	})
 	if err != nil {
 		return sessions.SessionV2{}, ErrTurnFailed

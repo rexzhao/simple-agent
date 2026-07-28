@@ -416,8 +416,10 @@ func (s *Service) CompactSession(ctx context.Context, id string) (SessionCompact
 		session.CWD = session.CreatedCWD
 	}
 	result, err := s.compactPlanner.PlanSessionCompaction(ctx, SessionCompactionRequest{
-		Session:      session,
-		SessionStore: s.sessionStore,
+		Session:        session,
+		SessionStore:   s.sessionStore,
+		SessionService: s,
+		RunCoordinator: s.sessionRunCoordinator(),
 	})
 	if err != nil {
 		interruptOperation()
