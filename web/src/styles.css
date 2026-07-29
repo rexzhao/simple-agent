@@ -286,7 +286,7 @@ svg { width: 1.1em; height: 1.1em; fill: none; stroke: currentColor; stroke-widt
 .conversation-header p { margin: 0; color: var(--faint); font-family: var(--font-mono); font-size: 10px; }
 .conversation-heading { min-width: 0; display: flex; flex-direction: column; gap: 2px; }
 .conversation-title-row { display: flex; align-items: baseline; gap: 5px; }
-.conversation-context-group { display: flex; align-items: center; }
+.conversation-left-group { display: flex; align-items: flex-end; gap: 14px; min-width: 0; }
 .context-usage { width: 230px; display: flex; flex-direction: column; gap: 4px; padding: 4px 7px 5px; border: 1px solid var(--border); background: var(--panel); }
 .context-usage-copy { display: flex; align-items: baseline; gap: 7px; font: 9px var(--font-mono); white-space: nowrap; }
 .context-usage-copy span { color: var(--faint); font-weight: 800; text-transform: uppercase; letter-spacing: .06em; }
