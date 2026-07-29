@@ -148,6 +148,7 @@ export const api = {
     return await response.blob()
   },
   cancelRun: (runID: string) => request(`/api/runs/${encodeURIComponent(runID)}`, { method: 'DELETE' }),
+  cancelToolCall: (runID: string, toolCallID: string) => request(`/api/runs/${encodeURIComponent(runID)}/tools/${encodeURIComponent(toolCallID)}`, { method: 'DELETE' }),
   appendRunMessage: (runID: string, content: string) => request(`/api/runs/${encodeURIComponent(runID)}/prompts`, {
     method: 'POST',
     body: JSON.stringify({ content }),

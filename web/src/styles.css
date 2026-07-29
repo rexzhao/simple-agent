@@ -453,6 +453,8 @@ svg { width: 1.1em; height: 1.1em; fill: none; stroke: currentColor; stroke-widt
 .tool-row-header strong { flex: 0 0 auto; font-weight: 800; }
 .tool-row-header code { min-width: 0; overflow: hidden; color: var(--muted); font: 10px var(--font-mono); text-overflow: ellipsis; white-space: nowrap; }
 .tool-row-header small { flex: 0 0 auto; margin-left: auto; padding: 2px 5px; border: 1px solid var(--border); color: var(--text); background: var(--panel); font-size: 9px; font-weight: 800; }
+.tool-cancel-button { flex: 0 0 auto; display: flex; align-items: center; justify-content: center; width: 20px; height: 20px; margin-left: 4px; border: 1px solid var(--danger); border-radius: 4px; color: var(--danger); background: transparent; font-size: 13px; line-height: 1; cursor: pointer; }
+.tool-cancel-button:hover { background: var(--danger); color: #ffffff; }
 .tool-row.running .tool-row-header small { background: var(--accent); }
 .tool-row.running .tool-row-header svg { color: var(--accent-hover); animation: spin 1.3s linear infinite; }
 .tool-row.finished .tool-row-header small { color: #ffffff; background: var(--success); }

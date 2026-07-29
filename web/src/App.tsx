@@ -539,6 +539,16 @@ function App() {
     }
   }
 
+  const cancelToolCall = useCallback(async (toolCallID: string) => {
+    const run = activeRunsRef.current[selectedSessionID]
+    if (!run) return
+    try {
+      await api.cancelToolCall(run.id, toolCallID)
+    } catch (reason) {
+      setError(errorMessage(reason))
+    }
+  }, [selectedSessionID])
+
   const removeQueuedPrompt = async (promptID: string) => {
     const run = activeRunsRef.current[selectedSessionID]
     if (!run) return
@@ -628,6 +638,7 @@ function App() {
             onLoadOlder={loadOlder}
             onSend={(content, images) => sendMessage(content, images)}
             onCancel={() => void cancelRun()}
+            onCancelTool={(toolCallID) => void cancelToolCall(toolCallID)}
             onRemoveQueuedPrompt={(promptID) => void removeQueuedPrompt(promptID)}
             onCompact={() => void compactSession()}
           />

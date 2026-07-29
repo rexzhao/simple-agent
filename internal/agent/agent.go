@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/rexzhao/simple-agent/internal/eventbus"
@@ -49,6 +50,55 @@ const (
 // preserves the existing turn behavior.
 type ActivePromptDrain func(ActivePromptCheckpoint) []model.Message
 
+// ToolCancellationRegistry tracks in-flight tool calls so they can be
+// individually cancelled without aborting the entire agent turn. The agent
+// loop registers each tool call before execution and unregisters it after.
+// A nil registry is a no-op.
+type ToolCancellationRegistry struct {
+	mu   sync.Mutex
+	stop map[string]context.CancelFunc
+}
+
+// NewToolCancellationRegistry returns an empty registry.
+func NewToolCancellationRegistry() *ToolCancellationRegistry {
+	return &ToolCancellationRegistry{stop: make(map[string]context.CancelFunc)}
+}
+
+// Register associates toolCallID with cancel. It returns a wrapped context
+// derived from parent that is cancelled when Cancel is called for the same ID
+// or when parent is cancelled. The returned cleanup function unregisters the
+// entry and must be called when the tool call finishes.
+func (r *ToolCancellationRegistry) Register(parent context.Context, toolCallID string) (context.Context, func()) {
+	if r == nil {
+		return parent, func() {}
+	}
+	ctx, cancel := context.WithCancel(parent)
+	r.mu.Lock()
+	r.stop[toolCallID] = cancel
+	r.mu.Unlock()
+	return ctx, func() {
+		cancel()
+		r.mu.Lock()
+		delete(r.stop, toolCallID)
+		r.mu.Unlock()
+	}
+}
+
+// Cancel cancels the in-flight tool call identified by toolCallID. It returns
+// true if a tool call was found and cancelled.
+func (r *ToolCancellationRegistry) Cancel(toolCallID string) bool {
+	if r == nil {
+		return false
+	}
+	r.mu.Lock()
+	cancel, ok := r.stop[toolCallID]
+	r.mu.Unlock()
+	if ok {
+		cancel()
+	}
+	return ok
+}
+
 type Options struct {
 	Provider          model.Provider
 	ToolExecutor      ToolExecutor
@@ -56,6 +106,7 @@ type Options struct {
 	TurnID            string
 	Publisher         eventbus.Publisher
 	ActivePromptDrain ActivePromptDrain
+	ToolCancel        *ToolCancellationRegistry
 }
 
 type TurnResult struct {
@@ -164,7 +215,7 @@ func run(ctx context.Context, request model.Request, options Options, maxTurns i
 		}
 
 		for _, toolCall := range toolCalls {
-			result := executeToolCall(ctx, options.ToolExecutor, enabledTools, toolCall, events)
+			result := executeToolCall(ctx, options.ToolExecutor, enabledTools, toolCall, options.ToolCancel, events)
 			if !publishDurable(events, options.Publisher, eventbus.ToolResultReady{TurnID: turnID, AgentIteration: iteration, Result: result}, "persist tool result") {
 				return
 			}
@@ -366,7 +417,7 @@ func copyProviderItems(items []model.ProviderItem) []model.ProviderItem {
 	return copied
 }
 
-func executeToolCall(ctx context.Context, executor ToolExecutor, enabledTools map[string]struct{}, toolCall model.ToolCall, out chan<- model.Event) model.ToolResult {
+func executeToolCall(ctx context.Context, executor ToolExecutor, enabledTools map[string]struct{}, toolCall model.ToolCall, cancel *ToolCancellationRegistry, out chan<- model.Event) model.ToolResult {
 	arguments, err := parseToolArguments(toolCall.Arguments)
 	if err != nil {
 		return toolErrorResult(toolCall, "invalid tool arguments: %v", err)
@@ -379,8 +430,18 @@ func executeToolCall(ctx context.Context, executor ToolExecutor, enabledTools ma
 	}
 
 	out <- model.ToolStartedEvent{ToolCall: toolCall}
-	result, err := executor.Execute(ctx, toolCall.Name, arguments)
+	toolCtx, cleanup := cancel.Register(ctx, toolCall.ID)
+	defer cleanup()
+	result, err := executor.Execute(toolCtx, toolCall.Name, arguments)
 	if err != nil {
+		if errors.Is(err, context.Canceled) && toolCtx.Err() == context.Canceled && ctx.Err() == nil {
+			return model.ToolResult{
+				ToolCallID: toolCall.ID,
+				Name:       toolCall.Name,
+				Content:    "[tool execution cancelled by user]",
+				IsError:    true,
+			}
+		}
 		return toolErrorResult(toolCall, "%v", err)
 	}
 	if result.ToolCallID == "" {

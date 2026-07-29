@@ -74,14 +74,14 @@ func TestExecuteToolCallLimitsSuccessfulAndErrorOutputs(t *testing.T) {
 
 	success := executeToolCall(context.Background(), staticToolExecutor{
 		result: model.ToolResult{Content: strings.Repeat("x", defaultToolOutputMaxBytes+1)},
-	}, enabled, toolCall, out)
+	}, enabled, toolCall, nil, out)
 	if !strings.Contains(success.Content, "Tool output truncated") {
 		t.Fatalf("successful tool output was not limited: %d bytes", len(success.Content))
 	}
 
 	failure := executeToolCall(context.Background(), staticToolExecutor{
 		err: errors.New(strings.Repeat("y", defaultToolOutputMaxBytes+1)),
-	}, enabled, toolCall, out)
+	}, enabled, toolCall, nil, out)
 	if !failure.IsError || !strings.Contains(failure.Content, "Tool output truncated") {
 		t.Fatalf("error tool output was not limited: %#v", failure)
 	}

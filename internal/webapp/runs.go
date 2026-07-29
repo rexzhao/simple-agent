@@ -622,6 +622,28 @@ func (s *Server) handleCancelRun(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (s *Server) handleCancelToolCall(w http.ResponseWriter, r *http.Request) {
+	managed, ok := s.runs.get(r.PathValue("runID"))
+	if !ok {
+		writeAPIError(w, http.StatusNotFound, "not_found", "run not found")
+		return
+	}
+	toolCallID := r.PathValue("toolCallID")
+	if toolCallID == "" {
+		writeAPIError(w, http.StatusBadRequest, "invalid_tool_call_id", "tool call id is required")
+		return
+	}
+	if !managed.run.CancelToolCall(toolCallID) {
+		writeAPIError(w, http.StatusNotFound, "not_found", "tool call not found or already finished")
+		return
+	}
+	writeJSON(w, http.StatusAccepted, map[string]string{
+		"run_id":        managed.id,
+		"tool_call_id":  toolCallID,
+		"status":        "cancelled",
+	})
+}
+
 type appendActiveRequest struct {
 	Content string `json:"content"`
 }

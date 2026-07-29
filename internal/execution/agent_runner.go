@@ -74,6 +74,7 @@ func (r AgentTurnRunner) RunSessionTurn(ctx context.Context, request SessionTurn
 		publisher:         request.Publisher,
 		turnID:            request.TurnID,
 		activePromptDrain: request.ActivePromptDrain,
+		toolCancel:        request.ToolCancel,
 	})
 	metadataErr := runtime.saveRuntimeMetadataForSession(request.Session.ID)
 	if runErr != nil {
@@ -428,6 +429,7 @@ type sessionTurnRunOptions struct {
 	publisher         eventbus.Publisher
 	turnID            string
 	activePromptDrain SessionActivePromptDrain
+	toolCancel        *agent.ToolCancellationRegistry
 }
 
 // adaptActivePromptDrain adapts an execution-domain active prompt drain into
@@ -490,6 +492,7 @@ func (r *agentRunnerRuntime) runSessionTurn(ctx context.Context, prompt string, 
 		TurnID:            options.turnID,
 		Publisher:         options.publisher,
 		ActivePromptDrain: adaptActivePromptDrain(options.activePromptDrain),
+		ToolCancel:        options.toolCancel,
 	})
 	if err != nil {
 		return nil, err

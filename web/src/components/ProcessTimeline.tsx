@@ -12,7 +12,7 @@ const markdownComponents: Components = {
 	a: ({ node: _node, ...props }) => <a {...props} target="_blank" rel="noreferrer noopener" />,
 }
 
-export const ProcessTimeline = memo(function ProcessTimeline({ steps, live = false }: { steps: RunStep[]; live?: boolean }) {
+export const ProcessTimeline = memo(function ProcessTimeline({ steps, live = false, onCancelTool }: { steps: RunStep[]; live?: boolean; onCancelTool?: (toolCallID: string) => void }) {
 	const nodes = foldToolGroups(steps)
 	const lastNode = nodes[nodes.length - 1]
 	const lastFlat = lastNode ? (lastNode.kind === 'tool-group' ? lastNode.flats[lastNode.flats.length - 1] : lastNode.flat) : undefined
@@ -21,7 +21,7 @@ export const ProcessTimeline = memo(function ProcessTimeline({ steps, live = fal
 		<div className="process-timeline">
 			{nodes.map((node, nodeIndex) => {
 				if (node.kind === 'tool-group') {
-					return <ToolGroupRow key={node.id} flats={node.flats} live={live && nodeIndex === nodes.length - 1} />
+					return <ToolGroupRow key={node.id} flats={node.flats} live={live && nodeIndex === nodes.length - 1} onCancelTool={onCancelTool} />
 				}
 				const { step, iteration, iterationStart } = node.flat
 				const marker = iterationStart ? <i className="iteration-marker">{iteration}</i> : null
@@ -48,7 +48,7 @@ export const ProcessTimeline = memo(function ProcessTimeline({ steps, live = fal
 						</article>
 					)
 				}
-				return <ToolRow key={step.id} tool={step} marker={marker} />
+				return <ToolRow key={step.id} tool={step} marker={marker} onCancelTool={onCancelTool} />
 			})}
 		</div>
 	)
@@ -61,7 +61,7 @@ export const ProcessTimeline = memo(function ProcessTimeline({ steps, live = fal
 // tool fails; historical groups always start collapsed, failed or not — a
 // finished session should not greet the reader with walls of tool output.
 // Reasoning steps inside the run stay individually collapsed.
-function ToolGroupRow({ flats, live }: { flats: FlatProcessStep[]; live: boolean }) {
+function ToolGroupRow({ flats, live, onCancelTool }: { flats: FlatProcessStep[]; live: boolean; onCancelTool?: (toolCallID: string) => void }) {
 	const tools = flats.map((flat) => flat.step).filter((step): step is ToolActivity => step.kind === 'tool')
 	const failed = tools.filter((tool) => tool.status === 'error').length
 	const pending = tools.filter((tool) => tool.status === 'requested' || tool.status === 'running').length
@@ -115,7 +115,7 @@ function ToolGroupRow({ flats, live }: { flats: FlatProcessStep[]; live: boolean
 							// ungrouped streaming reasoning block.
 							return <ReasoningStep key={step.id} step={step} marker={marker} streaming={live && index === flats.length - 1} />
 						}
-						if (step.kind === 'tool') return <ToolRow key={step.id} tool={step} marker={marker} />
+						if (step.kind === 'tool') return <ToolRow key={step.id} tool={step} marker={marker} onCancelTool={onCancelTool} />
 						return null
 					})}
 				</div>
@@ -211,7 +211,7 @@ function ReasoningStep({ step, marker, streaming }: { step: ReasoningActivity; m
 	)
 }
 
-function ToolRow({ tool, marker }: { tool: ToolActivity; marker?: ReactNode }) {
+function ToolRow({ tool, marker, onCancelTool }: { tool: ToolActivity; marker?: ReactNode; onCancelTool?: (toolCallID: string) => void }) {
 	const argumentsObject = parseToolArguments(tool.arguments)
 	const target = toolTarget(tool.name, argumentsObject)
 	const command = tool.name === 'shell' ? stringField(argumentsObject, 'command') : ''
@@ -222,7 +222,10 @@ function ToolRow({ tool, marker }: { tool: ToolActivity; marker?: ReactNode }) {
 	const showPatch = Boolean(patch)
 	const showResult = Boolean(tool.result) && (tool.name !== 'edit_file' || tool.status === 'error')
 	const showDetails = Boolean(command || showPatch || showEditDiff || showResult)
-	const header = <><ToolIcon /><strong>{tool.name}</strong>{target && <code title={target}>{target}</code>}<small>{toolStatus(tool.status)}</small></>
+	const cancelButton = tool.status === 'running' && onCancelTool
+		? <button className="tool-cancel-button" onClick={() => onCancelTool(tool.id)} title="Cancel this tool call" aria-label="Cancel tool">×</button>
+		: null
+	const header = <><ToolIcon /><strong>{tool.name}</strong>{target && <code title={target}>{target}</code>}<small>{toolStatus(tool.status)}</small>{cancelButton}</>
 	const details = (
 		<div className="tool-details">
 			{command && <div><span>Command</span><pre>{command}</pre></div>}

@@ -331,6 +331,14 @@ func (run *CoordinatedSessionRun) Cancel() {
 	}
 }
 
+// CancelToolCall cancels a single in-flight tool call without aborting the run.
+func (run *CoordinatedSessionRun) CancelToolCall(toolCallID string) bool {
+	if run == nil || run.run == nil {
+		return false
+	}
+	return run.run.CancelToolCall(toolCallID)
+}
+
 func (run *CoordinatedSessionRun) AppendActive(content string) error {
 	if run == nil || run.run == nil {
 		return ErrSessionRunSettled

@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/rexzhao/simple-agent/internal/agent"
 	"github.com/rexzhao/simple-agent/internal/config"
 	"github.com/rexzhao/simple-agent/internal/contextwindow"
 	"github.com/rexzhao/simple-agent/internal/eventbus"
@@ -238,6 +239,11 @@ type SessionTurnRequest struct {
 	// agent-loop active prompt drain so queued user messages are appended to the
 	// active turn history within the same TurnID. A nil drain is a no-op.
 	ActivePromptDrain SessionActivePromptDrain
+	// ToolCancel is an optional registry that allows individual in-flight tool
+	// calls to be cancelled without aborting the entire turn. When set,
+	// AgentTurnRunner passes it to the agent loop so each tool call runs under
+	// a cancellable child context registered by tool call ID.
+	ToolCancel *agent.ToolCancellationRegistry
 }
 
 // SessionActivePromptCheckpoint identifies a safe point in an active session
@@ -846,6 +852,9 @@ type SessionRun struct {
 	// intentionally ignores this gate and keeps its no-loss follow-up policy.
 	steerAccepting bool
 	nextPromptID   int
+	// toolCancel tracks in-flight tool calls so they can be individually
+	// cancelled without aborting the entire run.
+	toolCancel *agent.ToolCancellationRegistry
 }
 
 // activePrompt is one queued append-active prompt with a stable id so clients
@@ -878,10 +887,11 @@ func (s *Service) StartSessionRunWithInput(ctx context.Context, id string, input
 	}
 	runCtx, cancel := context.WithCancel(ctx)
 	run := &SessionRun{
-		cancel:    cancel,
-		done:      make(chan struct{}),
-		status:    SessionRunRunning,
-		accepting: true,
+		cancel:     cancel,
+		done:       make(chan struct{}),
+		status:     SessionRunRunning,
+		accepting:  true,
+		toolCancel: agent.NewToolCancellationRegistry(),
 	}
 	go func() {
 		defer cancel()
@@ -970,6 +980,16 @@ func (r *SessionRun) Cancel() {
 		return
 	}
 	r.cancel()
+}
+
+// CancelToolCall cancels a single in-flight tool call identified by its tool
+// call ID without aborting the run. It returns false if no matching tool call
+// is currently executing.
+func (r *SessionRun) CancelToolCall(toolCallID string) bool {
+	if r == nil || r.toolCancel == nil {
+		return false
+	}
+	return r.toolCancel.Cancel(toolCallID)
 }
 
 // AppendActive queues a user prompt to be appended to the in-flight turn at
@@ -1375,6 +1395,15 @@ func (s *Service) validateSessionMessageInput(session sessions.SessionV2, input 
 	return nil
 }
 
+// runToolCancel returns the tool cancellation registry for a run, or nil if
+// the run is nil (e.g. replay/compact paths that do not need tool cancellation).
+func runToolCancel(run *SessionRun) *agent.ToolCancellationRegistry {
+	if run == nil {
+		return nil
+	}
+	return run.toolCancel
+}
+
 // runSessionMessageWithActive runs one session message turn with run's
 // append-active queue wired in: it registers the turn so AppendActive publishes
 // turn-tagged queue snapshots, and supplies the drain that injects queued
@@ -1546,6 +1575,7 @@ func (s *Service) runSessionMessage(ctx context.Context, id string, input Sessio
 		ContentBlocks:     copyInputContentBlocks(input.ContentBlocks),
 		ReplayHistory:     input.ReplayItemID != "",
 		ActivePromptDrain: activePromptDrain,
+		ToolCancel:        runToolCancel(run),
 		Emit: func(event model.Event) {
 			if event != nil {
 				_ = bus.Publish(eventbus.ModelEvent{Event: event})

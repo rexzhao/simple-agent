@@ -37,6 +37,7 @@ export const Conversation = memo(function Conversation(props: {
   onLoadOlder: () => Promise<boolean>
   onSend: (content: string, images: PastedImageAttachment[]) => Promise<boolean>
   onCancel: () => void
+  onCancelTool: (toolCallID: string) => void
   onRemoveQueuedPrompt: (promptID: string) => void
   onCompact: () => void
 }) {
@@ -309,7 +310,7 @@ export const Conversation = memo(function Conversation(props: {
 				{conversationEntries.map((entry) => entry.kind === 'message'
 					? <Message key={entry.item.id} item={entry.item} sessionID={props.detail?.id ?? ''} onResend={entry.item === trailingUserItem ? handleResend : undefined} resendPending={resendPending} />
 					: <HistoricalProcess key={entry.id} entry={entry} />)}
-        {props.activeRun && <ActiveRunView run={props.activeRun} />}
+        {props.activeRun && <ActiveRunView run={props.activeRun} onCancelTool={props.onCancelTool} />}
         {props.compacting && <CompactionStatus trigger="manual" status="running" />}
 		{props.turnError && (
 			<div className="turn-error" role="alert">
@@ -349,7 +350,8 @@ export const Conversation = memo(function Conversation(props: {
   previous.draft === next.draft &&
   previous.turnError === next.turnError &&
   previous.otherSessionsRunning === next.otherSessionsRunning &&
-  previous.recentStepsByTurn === next.recentStepsByTurn)
+  previous.recentStepsByTurn === next.recentStepsByTurn &&
+  previous.onCancelTool === next.onCancelTool)
 
 function ContextUsage(props: { context: Session['context']; activeInputTokens?: number; activeCachedTokens?: number; activeCacheWriteTokens?: number; compactedContextTokens?: number }) {
 	const context = props.context
@@ -497,7 +499,7 @@ function QueuedPromptList({ prompts, onRemove }: { prompts: QueuedPrompt[]; onRe
   )
 }
 
-function ActiveRunView({ run }: { run: ActiveRun }) {
+function ActiveRunView({ run, onCancelTool }: { run: ActiveRun; onCancelTool?: (toolCallID: string) => void }) {
   return (
     <>
       {(run.userText || (run.userImages?.length ?? 0) > 0) && (
@@ -514,7 +516,7 @@ function ActiveRunView({ run }: { run: ActiveRun }) {
       )}
       {run.compaction && <CompactionStatus trigger={run.compaction.trigger} status={run.compaction.status} activeContextTokens={run.compaction.activeContextTokens} contextWindow={run.compaction.contextWindow} />}
       {run.providerRetry && <ProviderRetryStatus retry={run.providerRetry} />}
-      <ActiveRunBody run={run} />
+      <ActiveRunBody run={run} onCancelTool={onCancelTool} />
     </>
   )
 }
@@ -546,7 +548,7 @@ function CompactionStatus({ trigger, status, activeContextTokens, contextWindow 
 // message form one assistant segment, the appended message renders as its own
 // user bubble, and the remaining steps continue in a following assistant
 // segment. The streaming text and token note live in the trailing segment.
-function ActiveRunBody({ run }: { run: ActiveRun }) {
+function ActiveRunBody({ run, onCancelTool }: { run: ActiveRun; onCancelTool?: (toolCallID: string) => void }) {
   const segments = useMemo(() => buildActiveRunSegments(run.steps), [run.steps])
   const displaySegments = segments.length > 0 ? segments : [{ kind: 'steps' as const, steps: [] }]
 
@@ -571,7 +573,7 @@ function ActiveRunBody({ run }: { run: ActiveRun }) {
         if (segment.kind === 'user') return <article className="message user transient" key={segment.step.id}><div className="message-content"><div className="message-text">{segment.step.text}</div></div></article>
         return <article className="message assistant transient" key={`steps-${index}`}><div className="message-content">
           {isLast && <div className="message-meta"><span className="streaming-label"><i />Generating</span></div>}
-          <ProcessTimeline steps={segment.steps} live={isLast && run.status === 'running' && !textStreaming} />
+          <ProcessTimeline steps={segment.steps} live={isLast && run.status === 'running' && !textStreaming} onCancelTool={onCancelTool} />
           {isLast && trailing && (run.assistantText ? <MarkdownMessage text={run.assistantText} streaming /> : <div className="message-text assistant-stream"><span className="cursor" /></div>)}
           {isLast && tokenNote}
         </div></article>
