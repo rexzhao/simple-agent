@@ -72,9 +72,9 @@ export const api = {
   }),
   sessions: (projectID: string, archived = false) => request<{ sessions: Session[] }>(`/api/projects/${encodeURIComponent(projectID)}/sessions${archived ? '?archived=true' : ''}`),
   sessionModels: (projectID: string) => request<SessionModelOptions>(`/api/projects/${encodeURIComponent(projectID)}/models`),
-  createSession: (projectID: string, provider: string, modelProfile: string, reasoningLevel = '') => request<Session>(`/api/projects/${encodeURIComponent(projectID)}/sessions`, {
+  createSession: (projectID: string, provider: string, modelProfile: string, reasoningLevel = '', fullAccess = false) => request<Session>(`/api/projects/${encodeURIComponent(projectID)}/sessions`, {
     method: 'POST',
-    body: JSON.stringify({ provider, model_profile: modelProfile, reasoning_level: reasoningLevel }),
+    body: JSON.stringify({ provider, model_profile: modelProfile, reasoning_level: reasoningLevel, full_access: fullAccess }),
   }),
   providerSettings: () => request<ProviderSettingsDocument>('/api/provider-settings'),
   createProvider: (input: ProviderSettingsInput) => request<ProviderSettingsDocument>('/api/providers', {
@@ -100,6 +100,10 @@ export const api = {
   renameSession: (sessionID: string, displayName: string) => request<Session>(`/api/sessions/${encodeURIComponent(sessionID)}`, {
     method: 'PATCH',
     body: JSON.stringify({ display_name: displayName }),
+  }),
+  setSessionFullAccess: (sessionID: string, fullAccess: boolean) => request<Session>(`/api/sessions/${encodeURIComponent(sessionID)}/full-access`, {
+    method: 'POST',
+    body: JSON.stringify({ full_access: fullAccess }),
   }),
   archiveSession: (sessionID: string) => request<Session>(`/api/sessions/${encodeURIComponent(sessionID)}/archive`, {
     method: 'POST',

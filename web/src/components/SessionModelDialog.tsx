@@ -9,6 +9,7 @@ export interface SessionCreatorState {
   defaultProvider: string
   defaultModel: string
   reasoningLevel: string
+  fullAccess: boolean
   loading: boolean
 }
 
@@ -18,6 +19,7 @@ export function SessionModelDialog(props: {
   creating: boolean
   onSelect: (key: string) => void
   onReasoningLevel: (level: string) => void
+  onFullAccess: (fullAccess: boolean) => void
   onCancel: () => void
   onCreate: (model: SessionModelOption) => void
 }) {
@@ -69,6 +71,13 @@ export function SessionModelDialog(props: {
             <small>The UI uses unified levels; the actual request value is mapped by this model's reasoning config.</small>
           </label>
         )}
+        <label className="full-access-choice">
+          <input type="checkbox" checked={props.state.fullAccess} disabled={props.creating} onChange={(event) => props.onFullAccess(event.target.checked)} />
+          <span>
+            <strong>Full access</strong>
+            <small>File tools may read and write outside the workspace. Out-of-workspace paths are flagged in the conversation. Applies from the first turn; child sessions inherit it.</small>
+          </span>
+        </label>
         <div className="model-dialog-actions">
           <button className="secondary-button" disabled={props.creating} onClick={props.onCancel}>Cancel</button>
           <button className="primary-button" disabled={!selected || props.creating} onClick={() => selected && props.onCreate(selected)}>

@@ -84,6 +84,7 @@ type SessionMetadata struct {
 	ProjectID         string    `json:"project_id"`
 	CreatedCWD        string    `json:"created_cwd"`
 	LastSeq           int64     `json:"last_seq"`
+	FullAccess        bool      `json:"full_access"`
 }
 
 type SessionDetail struct {
@@ -114,6 +115,7 @@ type SessionDetail struct {
 	EnabledMCP        []string               `json:"enabled_mcp,omitempty"`
 	EnabledSkills     []string               `json:"enabled_skills,omitempty"`
 	ShowReasoning     bool                   `json:"show_reasoning"`
+	FullAccess        bool                   `json:"full_access"`
 	Context           contextwindow.Metadata `json:"context"`
 	SaveToolResults   bool                   `json:"save_tool_results"`
 }
@@ -132,6 +134,7 @@ type SessionCreateMetadata struct {
 	EnabledMCP      []string
 	EnabledSkills   []string
 	ShowReasoning   *bool
+	FullAccess      bool
 	Context         *contextwindow.Metadata
 	SaveToolResults *bool
 }
@@ -692,6 +695,29 @@ func (s *Service) RenameSession(id, displayName string) (SessionDetail, error) {
 		return SessionDetail{}, fmt.Errorf("archived session cannot be renamed")
 	}
 	session.DisplayName = displayName
+	saved, err := s.sessionStore.SaveMetadata(session)
+	if err != nil {
+		return SessionDetail{}, err
+	}
+	return sessionDetailFromStore(saved), nil
+}
+
+// SetSessionFullAccess toggles the session's full access mode: with full
+// access the file tools accept absolute paths outside the session workspace.
+// The flag is read when a run prepares its tool registry, so a toggle takes
+// effect from the next turn; an in-flight turn keeps its original mode.
+func (s *Service) SetSessionFullAccess(id string, fullAccess bool) (SessionDetail, error) {
+	if s == nil || s.sessionStore == nil {
+		return SessionDetail{}, fmt.Errorf("execution session store is not configured")
+	}
+	session, err := s.sessionStore.Load(id)
+	if err != nil {
+		return SessionDetail{}, err
+	}
+	if session.Archived {
+		return SessionDetail{}, fmt.Errorf("archived session cannot change full access mode")
+	}
+	session.FullAccess = fullAccess
 	saved, err := s.sessionStore.SaveMetadata(session)
 	if err != nil {
 		return SessionDetail{}, err
@@ -1885,6 +1911,7 @@ func applySessionCreateMetadata(session sessions.SessionV2, metadata SessionCrea
 	if metadata.ShowReasoning != nil {
 		session.ShowReasoning = *metadata.ShowReasoning
 	}
+	session.FullAccess = metadata.FullAccess
 	if metadata.Context != nil {
 		session.Context = *metadata.Context
 	}
@@ -1934,6 +1961,7 @@ func sessionMetadataFromStore(session sessions.SessionV2) SessionMetadata {
 		ProjectID:         session.ProjectID,
 		CreatedCWD:        session.CreatedCWD,
 		LastSeq:           session.LastSeq,
+		FullAccess:        session.FullAccess,
 	}
 }
 
@@ -1966,6 +1994,7 @@ func sessionDetailFromStore(session sessions.SessionV2) SessionDetail {
 		EnabledMCP:        copyStrings(session.EnabledMCP),
 		EnabledSkills:     copyStrings(session.EnabledSkills),
 		ShowReasoning:     session.ShowReasoning,
+		FullAccess:        session.FullAccess,
 		Context:           session.Context,
 		SaveToolResults:   session.SaveToolResults,
 	}

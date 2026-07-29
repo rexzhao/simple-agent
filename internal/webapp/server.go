@@ -110,6 +110,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /api/projects/{projectID}/sessions", s.handleCreateSession)
 	s.mux.HandleFunc("GET /api/sessions/{sessionID}", s.handleGetSession)
 	s.mux.HandleFunc("PATCH /api/sessions/{sessionID}", s.handleRenameSession)
+	s.mux.HandleFunc("POST /api/sessions/{sessionID}/full-access", s.handleSetSessionFullAccess)
 	s.mux.HandleFunc("POST /api/sessions/{sessionID}/archive", s.handleArchiveSession)
 	s.mux.HandleFunc("POST /api/sessions/{sessionID}/restore", s.handleRestoreSession)
 	s.mux.HandleFunc("DELETE /api/sessions/{sessionID}", s.handleRemoveSession)
@@ -266,6 +267,7 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 		Provider       string `json:"provider"`
 		ModelProfile   string `json:"model_profile"`
 		ReasoningLevel string `json:"reasoning_level"`
+		FullAccess     bool   `json:"full_access"`
 	}
 	if !decodeOptionalJSON(w, r, &body) {
 		return
@@ -276,6 +278,7 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 		Provider:       body.Provider,
 		ModelProfile:   body.ModelProfile,
 		ReasoningLevel: body.ReasoningLevel,
+		FullAccess:     body.FullAccess,
 	})
 	if err != nil {
 		writeServiceError(w, err)
@@ -301,6 +304,21 @@ func (s *Server) handleRenameSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	session, err := s.service.RenameSession(r.PathValue("sessionID"), body.DisplayName)
+	if err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, session)
+}
+
+func (s *Server) handleSetSessionFullAccess(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		FullAccess bool `json:"full_access"`
+	}
+	if !decodeJSON(w, r, &body) {
+		return
+	}
+	session, err := s.service.SetSessionFullAccess(r.PathValue("sessionID"), body.FullAccess)
 	if err != nil {
 		writeServiceError(w, err)
 		return

@@ -228,7 +228,7 @@ func (r AgentTurnRunner) prepareRuntime(ctx context.Context, session sessions.Se
 	if strings.TrimSpace(session.ParentSessionID) != "" {
 		enabledToolNames = enabledToolsForAgentChild(enabledToolNames)
 	}
-	toolRegistry, toolSchemas, err := enabledToolsForRun(cwd, enabledToolNames)
+	toolRegistry, toolSchemas, err := enabledToolsForRun(cwd, enabledToolNames, session.FullAccess)
 	if err != nil {
 		return nil, err
 	}
@@ -1274,7 +1274,7 @@ func lastString(values []string) string {
 	return values[len(values)-1]
 }
 
-func enabledToolsForRun(rootDir string, enabled []string) (*tools.Registry, []model.Tool, error) {
+func enabledToolsForRun(rootDir string, enabled []string, fullAccess bool) (*tools.Registry, []model.Tool, error) {
 	builtinEnabled := make([]string, 0, len(enabled))
 	for _, name := range enabled {
 		if IsSessionTool(name) {
@@ -1289,7 +1289,7 @@ func enabledToolsForRun(rootDir string, enabled []string) (*tools.Registry, []mo
 	}
 
 	registry := tools.NewRegistry()
-	if err := tools.RegisterBuiltins(registry, rootDir); err != nil {
+	if err := tools.RegisterBuiltins(registry, rootDir, fullAccess); err != nil {
 		return nil, nil, fmt.Errorf("register built-in tools: %w", err)
 	}
 	schemas, err := registry.EnabledSchemas(builtinEnabled)

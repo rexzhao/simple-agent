@@ -26,6 +26,7 @@ function session(id: string, name: string, options: Partial<Session> = {}): Sess
     project_id: project.id,
     created_cwd: project.root,
     last_seq: 0,
+    full_access: false,
     ...options,
   }
 }

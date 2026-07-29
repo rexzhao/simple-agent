@@ -6,6 +6,7 @@ import remarkGfm from 'remark-gfm'
 import type { ReasoningActivity, RunStep, ToolActivity } from '../types'
 import { foldToolGroups } from '../lib/runSteps'
 import type { FlatProcessStep } from '../lib/runSteps'
+import { isPathOutsideWorkspace } from '../lib/paths'
 import { isSessionToolName, prettyJSONText, sessionToolPhrase, sessionToolTarget } from '../lib/sessionTools'
 import { ChevronIcon, ToolIcon } from './icons'
 
@@ -13,7 +14,7 @@ const markdownComponents: Components = {
 	a: ({ node: _node, ...props }) => <a {...props} target="_blank" rel="noreferrer noopener" />,
 }
 
-export const ProcessTimeline = memo(function ProcessTimeline({ steps, live = false, onCancelTool, sessionNames }: { steps: RunStep[]; live?: boolean; onCancelTool?: (toolCallID: string) => void; sessionNames?: Record<string, string> }) {
+export const ProcessTimeline = memo(function ProcessTimeline({ steps, live = false, onCancelTool, sessionNames, workspaceRoot }: { steps: RunStep[]; live?: boolean; onCancelTool?: (toolCallID: string) => void; sessionNames?: Record<string, string>; workspaceRoot?: string }) {
 	const nodes = foldToolGroups(steps)
 	const lastNode = nodes[nodes.length - 1]
 	const lastFlat = lastNode ? (lastNode.kind === 'tool-group' ? lastNode.flats[lastNode.flats.length - 1] : lastNode.flat) : undefined
@@ -22,7 +23,7 @@ export const ProcessTimeline = memo(function ProcessTimeline({ steps, live = fal
 		<div className="process-timeline">
 			{nodes.map((node, nodeIndex) => {
 				if (node.kind === 'tool-group') {
-					return <ToolGroupRow key={node.id} flats={node.flats} live={live && nodeIndex === nodes.length - 1} onCancelTool={onCancelTool} sessionNames={sessionNames} />
+					return <ToolGroupRow key={node.id} flats={node.flats} live={live && nodeIndex === nodes.length - 1} onCancelTool={onCancelTool} sessionNames={sessionNames} workspaceRoot={workspaceRoot} />
 				}
 				const { step, iteration, iterationStart } = node.flat
 				const marker = iterationStart ? <i className="iteration-marker">{iteration}</i> : null
@@ -49,7 +50,7 @@ export const ProcessTimeline = memo(function ProcessTimeline({ steps, live = fal
 						</article>
 					)
 				}
-				return <ToolRow key={step.id} tool={step} marker={marker} onCancelTool={onCancelTool} sessionNames={sessionNames} />
+				return <ToolRow key={step.id} tool={step} marker={marker} onCancelTool={onCancelTool} sessionNames={sessionNames} workspaceRoot={workspaceRoot} />
 			})}
 		</div>
 	)
@@ -62,7 +63,7 @@ export const ProcessTimeline = memo(function ProcessTimeline({ steps, live = fal
 // tool fails; historical groups always start collapsed, failed or not — a
 // finished session should not greet the reader with walls of tool output.
 // Reasoning steps inside the run stay individually collapsed.
-function ToolGroupRow({ flats, live, onCancelTool, sessionNames }: { flats: FlatProcessStep[]; live: boolean; onCancelTool?: (toolCallID: string) => void; sessionNames?: Record<string, string> }) {
+function ToolGroupRow({ flats, live, onCancelTool, sessionNames, workspaceRoot }: { flats: FlatProcessStep[]; live: boolean; onCancelTool?: (toolCallID: string) => void; sessionNames?: Record<string, string>; workspaceRoot?: string }) {
 	const tools = flats.map((flat) => flat.step).filter((step): step is ToolActivity => step.kind === 'tool')
 	const failed = tools.filter((tool) => tool.status === 'error').length
 	const pending = tools.filter((tool) => tool.status === 'requested' || tool.status === 'running').length
@@ -103,7 +104,9 @@ function ToolGroupRow({ flats, live, onCancelTool, sessionNames }: { flats: Flat
 				<ChevronIcon expanded={expanded} />
 				<ToolIcon />
 				<span className="tool-group-summary" title={summary}>{summary}</span>
-				{targets && <code title={targets}>{targets}</code>}
+				{targets.map((target) => (
+					<code key={target} title={workspaceRoot && isPathOutsideWorkspace(workspaceRoot, target) ? `Outside workspace: ${target}` : target} className={workspaceRoot && isPathOutsideWorkspace(workspaceRoot, target) ? 'outside-workspace' : undefined}>{target}</code>
+				))}
 				<small>{badge}</small>
 			</summary>
 			{expanded && (
@@ -116,7 +119,7 @@ function ToolGroupRow({ flats, live, onCancelTool, sessionNames }: { flats: Flat
 							// ungrouped streaming reasoning block.
 							return <ReasoningStep key={step.id} step={step} marker={marker} streaming={live && index === flats.length - 1} />
 						}
-						if (step.kind === 'tool') return <ToolRow key={step.id} tool={step} marker={marker} onCancelTool={onCancelTool} sessionNames={sessionNames} />
+						if (step.kind === 'tool') return <ToolRow key={step.id} tool={step} marker={marker} onCancelTool={onCancelTool} sessionNames={sessionNames} workspaceRoot={workspaceRoot} />
 						return null
 					})}
 				</div>
@@ -149,14 +152,14 @@ function toolPhrase(name: string, count: number): string {
 
 // toolGroupTargets names the files a run modified so that write operations
 // stay visible even while the group is collapsed.
-function toolGroupTargets(tools: ToolActivity[]): string {
+function toolGroupTargets(tools: ToolActivity[]): string[] {
 	const targets: string[] = []
 	for (const tool of tools) {
 		for (const target of toolWriteTargets(tool)) {
 			if (!targets.includes(target)) targets.push(target)
 		}
 	}
-	return targets.join(', ')
+	return targets
 }
 
 function toolWriteTargets(tool: ToolActivity): string[] {
@@ -213,7 +216,7 @@ function ReasoningStep({ step, marker, streaming }: { step: ReasoningActivity; m
 	)
 }
 
-function ToolRow({ tool, marker, onCancelTool, sessionNames }: { tool: ToolActivity; marker?: ReactNode; onCancelTool?: (toolCallID: string) => void; sessionNames?: Record<string, string> }) {
+function ToolRow({ tool, marker, onCancelTool, sessionNames, workspaceRoot }: { tool: ToolActivity; marker?: ReactNode; onCancelTool?: (toolCallID: string) => void; sessionNames?: Record<string, string>; workspaceRoot?: string }) {
 	const argumentsObject = parseToolArguments(tool.arguments)
 	const isSessionTool = isSessionToolName(tool.name)
 	const target = isSessionTool ? sessionToolTarget(tool.name, argumentsObject, sessionNames) : toolTarget(tool.name, argumentsObject)
@@ -230,10 +233,14 @@ function ToolRow({ tool, marker, onCancelTool, sessionNames }: { tool: ToolActiv
 	const result = isSessionTool && tool.result ? prettyJSONText(tool.result) : tool.result
 	const showResult = Boolean(result) && (tool.name !== 'edit_file' || tool.status === 'error')
 	const showDetails = Boolean(command || showPatch || showEditDiff || showArguments || showResult)
+	// Full access sessions may address files outside the workspace; those
+	// targets are flagged so out-of-workspace reads and writes stay visible.
+	const outsideTargets = workspaceRoot ? toolOutsideTargets(tool.name, argumentsObject, workspaceRoot) : []
+	const outside = outsideTargets.length > 0
 	const cancelButton = tool.status === 'running' && onCancelTool
 		? <button className="tool-cancel-button" onClick={() => onCancelTool(tool.id)} title="Cancel this tool call" aria-label="Cancel tool">×</button>
 		: null
-	const header = <><ToolIcon /><strong>{tool.name}</strong>{target && <code title={target}>{target}</code>}<small>{toolStatus(tool.status)}</small>{cancelButton}</>
+	const header = <><ToolIcon /><strong>{tool.name}</strong>{target && <code title={target} className={outside ? 'outside-workspace' : undefined}>{target}</code>}{outside && <span className="outside-workspace-flag" title={`Outside workspace: ${outsideTargets.join(', ')}`}>!</span>}<small>{toolStatus(tool.status)}</small>{cancelButton}</>
 	const details = (
 		<div className="tool-details">
 			{command && <div><span>Command</span><pre>{command}</pre></div>}
@@ -308,6 +315,30 @@ function splitEditDiffLines(text: string): string[] {
 
 function diffPrefix(kind: EditDiffLine['kind']): string {
 	return kind === 'removed' ? '-' : kind === 'added' ? '+' : ' '
+}
+
+// toolOutsideTargets lists the file paths a tool call addresses outside the
+// workspace. Only path-taking file tools are classified; shell commands and
+// session tools are not parsed for paths.
+function toolOutsideTargets(name: string, argumentsObject: Record<string, unknown>, workspaceRoot: string): string[] {
+	switch (name) {
+		case 'read_file':
+		case 'write_file':
+		case 'edit_file':
+		case 'list_files':
+		case 'glob_files':
+		case 'grep_files': {
+			const path = stringField(argumentsObject, 'path')
+			return path && isPathOutsideWorkspace(workspaceRoot, path) ? [path] : []
+		}
+		case 'apply_patch':
+			return stringField(argumentsObject, 'patch')
+				.split('\n')
+				.map((line) => /^\*\*\* (?:Add File|Update File|Delete File|Move to):\s*(.+)$/.exec(line)?.[1].trim() ?? '')
+				.filter((path) => path && isPathOutsideWorkspace(workspaceRoot, path))
+		default:
+			return []
+	}
 }
 
 function parseToolArguments(value?: string): Record<string, unknown> {

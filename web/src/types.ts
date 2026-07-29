@@ -130,6 +130,7 @@ export interface Session {
   last_seq: number
   status?: string
   show_reasoning?: boolean
+  full_access: boolean
   config_path?: string
   context?: ContextMetadata
 }

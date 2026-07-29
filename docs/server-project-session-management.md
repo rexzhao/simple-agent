@@ -439,12 +439,21 @@ GET    /sessions?all_projects=true&archived=false|true
 GET    /sessions/{session_id}
 PATCH  /sessions/{session_id}
 DELETE /sessions/{session_id}
+POST   /sessions/{session_id}/full-access
 GET    /sessions/{session_id}/items?before_seq=N&after_seq=N&limit=N&view=chat|debug
 GET    /sessions/{session_id}/content/{blob_hash}
 POST   /sessions/{session_id}/messages
 POST   /sessions/{session_id}/commands/compact
 WS     /sessions/{session_id}/stream
 ```
+
+`POST /projects/{project_id}/sessions` accepts an optional `full_access`
+boolean. `POST /sessions/{session_id}/full-access` toggles it later with
+`{"full_access":true|false}`; the flag is persisted per session, inherited by
+agent child sessions, and rejected on archived sessions. With full access the
+file tools accept absolute paths outside the session workspace (relative
+paths stay anchored at the workspace). A toggle applies from the next turn:
+an in-flight run keeps the tool registry and schemas it started with.
 
 `PATCH {"display_name":"..."}` renames active targets. `PATCH
 {"archived":true}` archives. `DELETE` removes archived targets only. `PATCH

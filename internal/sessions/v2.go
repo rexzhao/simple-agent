@@ -131,6 +131,7 @@ type SessionV2 struct {
 	EnabledMCP           []string               `json:"enabled_mcp,omitempty"`
 	EnabledSkills        []string               `json:"enabled_skills,omitempty"`
 	ShowReasoning        bool                   `json:"show_reasoning"`
+	FullAccess           bool                   `json:"full_access,omitempty"`
 	InstructionsSnapshot []model.Message        `json:"instructions_snapshot,omitempty"`
 	InstructionSources   []InstructionSource    `json:"instruction_sources,omitempty"`
 	Items                []SessionItem          `json:"items,omitempty"`
@@ -1486,6 +1487,7 @@ type sessionV2Metadata struct {
 	EnabledMCP           []string               `json:"enabled_mcp,omitempty"`
 	EnabledSkills        []string               `json:"enabled_skills,omitempty"`
 	ShowReasoning        bool                   `json:"show_reasoning"`
+	FullAccess           bool                   `json:"full_access,omitempty"`
 	InstructionsSnapshot []model.Message        `json:"instructions_snapshot,omitempty"`
 	InstructionSources   []InstructionSource    `json:"instruction_sources,omitempty"`
 	Context              contextwindow.Metadata `json:"context,omitempty"`
@@ -1596,6 +1598,7 @@ func metadataFromSessionV2(session SessionV2) sessionV2Metadata {
 		EnabledMCP:           session.EnabledMCP,
 		EnabledSkills:        session.EnabledSkills,
 		ShowReasoning:        session.ShowReasoning,
+		FullAccess:           session.FullAccess,
 		InstructionsSnapshot: session.InstructionsSnapshot,
 		InstructionSources:   session.InstructionSources,
 		Context:              session.Context,
@@ -1633,6 +1636,7 @@ func (m sessionV2Metadata) session() SessionV2 {
 		EnabledMCP:           copyStrings(m.EnabledMCP),
 		EnabledSkills:        copyStrings(m.EnabledSkills),
 		ShowReasoning:        m.ShowReasoning,
+		FullAccess:           m.FullAccess,
 		InstructionsSnapshot: copyMessages(m.InstructionsSnapshot),
 		InstructionSources:   copyInstructionSources(m.InstructionSources),
 		Context:              m.Context,

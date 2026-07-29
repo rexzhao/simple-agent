@@ -19,6 +19,7 @@ function session(id: string, options: Partial<Session> = {}): Session {
     project_id: 'project-1',
     created_cwd: '/workspace',
     last_seq: 0,
+    full_access: false,
     ...options,
   }
 }

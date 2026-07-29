@@ -186,7 +186,7 @@ func TestApplyPatchRejectsStandardUnifiedDiff(t *testing.T) {
 }
 
 func TestApplyPatchDefinitionDescribesOpenCodeRequirements(t *testing.T) {
-	definition := applyPatchDefinition()
+	definition := applyPatchDefinition(false)
 	for _, want := range []string{
 		"OpenCode-format",
 		"*** Begin Patch",

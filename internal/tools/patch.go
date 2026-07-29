@@ -61,10 +61,14 @@ type patchOperation struct {
 	mode           os.FileMode
 }
 
-func applyPatchDefinition() model.Tool {
+func applyPatchDefinition(fullAccess bool) model.Tool {
+	description := "Apply an OpenCode-format text patch to workspace-relative files. The patch must start with *** Begin Patch and end with *** End Patch. Use *** Add File:, *** Update File:, *** Delete File:, and optional *** Move to: sections; update hunks use @@ anchors with space, - and + lines. Supports create, update, delete, and move. All files and hunks are validated before any write; binary files and paths outside the workspace are rejected."
+	if fullAccess {
+		description = "Apply an OpenCode-format text patch to files, addressed by absolute or workspace-relative paths. The patch must start with *** Begin Patch and end with *** End Patch. Use *** Add File:, *** Update File:, *** Delete File:, and optional *** Move to: sections; update hunks use @@ anchors with space, - and + lines. Supports create, update, delete, and move. All files and hunks are validated before any write; binary files are rejected."
+	}
 	return model.Tool{
 		Name:        BuiltinApplyPatch,
-		Description: "Apply an OpenCode-format text patch to workspace-relative files. The patch must start with *** Begin Patch and end with *** End Patch. Use *** Add File:, *** Update File:, *** Delete File:, and optional *** Move to: sections; update hunks use @@ anchors with space, - and + lines. Supports create, update, delete, and move. All files and hunks are validated before any write; binary files and paths outside the workspace are rejected.",
+		Description: description,
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
@@ -79,7 +83,7 @@ func applyPatchDefinition() model.Tool {
 	}
 }
 
-func newApplyPatchExecutor(rootDir string) Executor {
+func newApplyPatchExecutor(rootDir string, fullAccess bool) Executor {
 	return ExecutorFunc(func(ctx context.Context, arguments map[string]any) (model.ToolResult, error) {
 		patch, err := requiredNonEmptyStringArgument(arguments, "patch")
 		if err != nil {
@@ -92,11 +96,11 @@ func newApplyPatchExecutor(rootDir string) Executor {
 			return model.ToolResult{}, err
 		}
 
-		files, err := parseOpenCodePatch(patch)
+		files, err := parseOpenCodePatch(patch, fullAccess)
 		if err != nil {
 			return model.ToolResult{}, err
 		}
-		operations, err := prepareOpenCodePatchOperations(rootDir, files)
+		operations, err := prepareOpenCodePatchOperations(rootDir, files, fullAccess)
 		if err != nil {
 			return model.ToolResult{}, err
 		}
@@ -137,7 +141,7 @@ func newApplyPatchExecutor(rootDir string) Executor {
 	})
 }
 
-func parseOpenCodePatch(value string) ([]openCodePatchFile, error) {
+func parseOpenCodePatch(value string, fullAccess bool) ([]openCodePatchFile, error) {
 	if strings.ContainsRune(value, 0) {
 		return nil, fmt.Errorf("patch must be text")
 	}
@@ -164,7 +168,7 @@ func parseOpenCodePatch(value string) ([]openCodePatchFile, error) {
 		}
 		switch {
 		case strings.HasPrefix(line, "*** Add File: "):
-			path, err := parseOpenCodePatchPath(strings.TrimPrefix(line, "*** Add File: "))
+			path, err := parseOpenCodePatchPath(strings.TrimPrefix(line, "*** Add File: "), fullAccess)
 			if err != nil {
 				return nil, fmt.Errorf("invalid added file path at patch line %d: %w", index+1, err)
 			}
@@ -179,7 +183,7 @@ func parseOpenCodePatch(value string) ([]openCodePatchFile, error) {
 			}
 			files = append(files, openCodePatchFile{kind: patchCreate, path: path, hunks: []openCodePatchHunk{hunk}})
 		case strings.HasPrefix(line, "*** Update File: "):
-			path, err := parseOpenCodePatchPath(strings.TrimPrefix(line, "*** Update File: "))
+			path, err := parseOpenCodePatchPath(strings.TrimPrefix(line, "*** Update File: "), fullAccess)
 			if err != nil {
 				return nil, fmt.Errorf("invalid updated file path at patch line %d: %w", index+1, err)
 			}
@@ -203,7 +207,7 @@ func parseOpenCodePatch(value string) ([]openCodePatchFile, error) {
 					if file.moveTo != "" {
 						return nil, fmt.Errorf("updated file %q has multiple move destinations", path)
 					}
-					moveTo, err := parseOpenCodePatchPath(strings.TrimPrefix(line, "*** Move to: "))
+					moveTo, err := parseOpenCodePatchPath(strings.TrimPrefix(line, "*** Move to: "), fullAccess)
 					if err != nil {
 						return nil, fmt.Errorf("invalid move destination at patch line %d: %w", index+1, err)
 					}
@@ -225,7 +229,7 @@ func parseOpenCodePatch(value string) ([]openCodePatchFile, error) {
 			}
 			files = append(files, file)
 		case strings.HasPrefix(line, "*** Delete File: "):
-			path, err := parseOpenCodePatchPath(strings.TrimPrefix(line, "*** Delete File: "))
+			path, err := parseOpenCodePatchPath(strings.TrimPrefix(line, "*** Delete File: "), fullAccess)
 			if err != nil {
 				return nil, fmt.Errorf("invalid deleted file path at patch line %d: %w", index+1, err)
 			}
@@ -298,8 +302,18 @@ func isOpenCodePatchDirective(line string) bool {
 		strings.HasPrefix(line, "*** Move to: ")
 }
 
-func parseOpenCodePatchPath(value string) (string, error) {
+func parseOpenCodePatchPath(value string, fullAccess bool) (string, error) {
 	value = strings.TrimSpace(value)
+	if fullAccess {
+		// Full access sessions may address files anywhere, so the parser
+		// only rejects blank paths; the resolvers classify absolute vs
+		// workspace-relative paths (including ../ escapes and, on Windows,
+		// drive-letter paths in either slash style).
+		if value == "" {
+			return "", fmt.Errorf("path must not be blank")
+		}
+		return pathpkg.Clean(value), nil
+	}
 	if value == "" || strings.Contains(value, "\\") || strings.HasPrefix(value, "/") || (len(value) >= 3 && value[1] == ':' && (value[2] == '/' || value[2] == '\\')) {
 		return "", fmt.Errorf("path must be a workspace-relative slash path")
 	}
@@ -314,7 +328,7 @@ func normalizePatchNewlines(value string) string {
 	return strings.ReplaceAll(strings.ReplaceAll(value, "\r\n", "\n"), "\r", "\n")
 }
 
-func prepareOpenCodePatchOperations(rootDir string, files []openCodePatchFile) ([]patchOperation, error) {
+func prepareOpenCodePatchOperations(rootDir string, files []openCodePatchFile, fullAccess bool) ([]patchOperation, error) {
 	seen := make(map[string]struct{}, len(files)*2)
 	operations := make([]patchOperation, 0, len(files))
 	for _, file := range files {
@@ -331,7 +345,7 @@ func prepareOpenCodePatchOperations(rootDir string, files []openCodePatchFile) (
 
 		switch file.kind {
 		case patchCreate:
-			resolved, err := resolveWritableFilePath(rootDir, file.path)
+			resolved, err := resolveToolWritePath(rootDir, file.path, fullAccess)
 			if err != nil {
 				return nil, err
 			}
@@ -346,13 +360,13 @@ func prepareOpenCodePatchOperations(rootDir string, files []openCodePatchFile) (
 			}
 			operations = append(operations, patchOperation{kind: patchCreate, workspaceRel: file.path, resolved: resolved, content: content, mode: 0o644})
 		case patchDelete:
-			resolved, _, _, err := readPatchSource(rootDir, file.path)
+			resolved, _, _, err := readPatchSource(rootDir, file.path, fullAccess)
 			if err != nil {
 				return nil, err
 			}
 			operations = append(operations, patchOperation{kind: patchDelete, workspaceRel: file.path, resolved: resolved})
 		case patchUpdate, patchMove:
-			resolved, info, source, err := readPatchSource(rootDir, file.path)
+			resolved, info, source, err := readPatchSource(rootDir, file.path, fullAccess)
 			if err != nil {
 				return nil, err
 			}
@@ -364,7 +378,7 @@ func prepareOpenCodePatchOperations(rootDir string, files []openCodePatchFile) (
 				operations = append(operations, patchOperation{kind: patchUpdate, workspaceRel: file.path, resolved: resolved, content: content, mode: info.Mode().Perm()})
 				continue
 			}
-			targetResolved, err := resolveWritableFilePath(rootDir, file.moveTo)
+			targetResolved, err := resolveToolWritePath(rootDir, file.moveTo, fullAccess)
 			if err != nil {
 				return nil, err
 			}
@@ -381,8 +395,8 @@ func prepareOpenCodePatchOperations(rootDir string, files []openCodePatchFile) (
 	return operations, nil
 }
 
-func readPatchSource(rootDir, workspaceRel string) (string, os.FileInfo, []byte, error) {
-	resolved, err := resolveRootPath(rootDir, filepath.FromSlash(workspaceRel))
+func readPatchSource(rootDir, workspaceRel string, fullAccess bool) (string, os.FileInfo, []byte, error) {
+	resolved, err := resolveToolReadPath(rootDir, filepath.FromSlash(workspaceRel), fullAccess)
 	if err != nil {
 		return "", nil, nil, err
 	}

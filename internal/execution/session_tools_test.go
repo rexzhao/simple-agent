@@ -44,7 +44,7 @@ func TestSessionToolDefinitionsAndExplicitSelection(t *testing.T) {
 		t.Fatalf("session tool names = %#v, want %#v", gotNames, wantNames)
 	}
 
-	registry, builtinSchemas, err := enabledToolsForRun(t.TempDir(), []string{ToolSessionStart, "read_file", ToolSessionGet})
+	registry, builtinSchemas, err := enabledToolsForRun(t.TempDir(), []string{ToolSessionStart, "read_file", ToolSessionGet}, false)
 	if err != nil {
 		t.Fatalf("enabledToolsForRun() error = %v", err)
 	}

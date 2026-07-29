@@ -219,6 +219,86 @@ func TestServiceProjectArchiveAndRemoveRejectRunningSession(t *testing.T) {
 	}
 }
 
+func TestServiceSessionFullAccessLifecycle(t *testing.T) {
+	home := t.TempDir()
+	service, err := NewService(home)
+	if err != nil {
+		t.Fatalf("NewService() error = %v", err)
+	}
+	projectRoot := mkdirProjectRoot(t, "repo")
+	project, err := service.CreateProject(projectRoot, "Repo")
+	if err != nil {
+		t.Fatalf("CreateProject() error = %v", err)
+	}
+
+	session, err := service.CreateSession(project.Project.ID, SessionCreateMetadata{
+		CreatedCWD:  project.Project.Root,
+		ConfigPath:  filepath.Join(project.Project.Root, ".agents", "sai.yaml"),
+		FullAccess:  true,
+		DisplayName: "Parent",
+	})
+	if err != nil {
+		t.Fatalf("CreateSession() error = %v", err)
+	}
+	if !session.FullAccess {
+		t.Fatalf("CreateSession(FullAccess) FullAccess = false: %#v", session)
+	}
+	// The flag round-trips through the store and the list metadata.
+	loaded, err := service.GetSession(session.ID)
+	if err != nil {
+		t.Fatalf("GetSession() error = %v", err)
+	}
+	if !loaded.FullAccess {
+		t.Fatalf("GetSession() FullAccess = false, want persisted true")
+	}
+	listed, err := service.ListSessions(SessionListOptions{ProjectID: project.Project.ID})
+	if err != nil {
+		t.Fatalf("ListSessions() error = %v", err)
+	}
+	if len(listed) != 1 || !listed[0].FullAccess {
+		t.Fatalf("ListSessions() = %#v, want one full access session", listed)
+	}
+
+	// Agent children inherit the parent's mode.
+	child, err := service.CreateInheritedSession(session.ID, "Child")
+	if err != nil {
+		t.Fatalf("CreateInheritedSession() error = %v", err)
+	}
+	if !child.FullAccess {
+		t.Fatalf("CreateInheritedSession() FullAccess = false, want inherited true")
+	}
+
+	// Runtime toggle applies to parent and child independently and persists.
+	toggled, err := service.SetSessionFullAccess(child.ID, false)
+	if err != nil {
+		t.Fatalf("SetSessionFullAccess(child, false) error = %v", err)
+	}
+	if toggled.FullAccess {
+		t.Fatalf("SetSessionFullAccess(child, false) FullAccess = true: %#v", toggled)
+	}
+	reloaded, err := service.GetSession(child.ID)
+	if err != nil {
+		t.Fatalf("GetSession(child) error = %v", err)
+	}
+	if reloaded.FullAccess {
+		t.Fatalf("GetSession(child) FullAccess = true, want persisted false")
+	}
+	parentAfter, err := service.GetSession(session.ID)
+	if err != nil {
+		t.Fatalf("GetSession(parent) error = %v", err)
+	}
+	if !parentAfter.FullAccess {
+		t.Fatalf("GetSession(parent) FullAccess = false, want unaffected true")
+	}
+
+	if _, err := service.ArchiveSession(session.ID); err != nil {
+		t.Fatalf("ArchiveSession() error = %v", err)
+	}
+	if _, err := service.SetSessionFullAccess(session.ID, false); err == nil || !strings.Contains(err.Error(), "archived session") {
+		t.Fatalf("SetSessionFullAccess(archived) error = %v, want archived rejection", err)
+	}
+}
+
 func TestServiceSessionLifecycle(t *testing.T) {
 	home := t.TempDir()
 	service, err := NewService(home)

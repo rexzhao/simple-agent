@@ -20,6 +20,7 @@ type ConfiguredSessionOptions struct {
 	Provider        string
 	ModelProfile    string
 	ReasoningLevel  string
+	FullAccess      bool
 }
 
 type SessionModelOption struct {
@@ -134,6 +135,7 @@ func (s *Service) CreateConfiguredSession(projectID string, options ConfiguredSe
 		EnabledMCP:      mcpServerIDs(selectedMCP),
 		EnabledSkills:   skillIDs(selectedSkills),
 		ShowReasoning:   &showReasoning,
+		FullAccess:      options.FullAccess,
 		Context:         &contextMetadata,
 		SaveToolResults: &saveToolResults,
 	})
@@ -175,6 +177,7 @@ func (s *Service) CreateInheritedSession(parentID, displayName string) (SessionD
 		EnabledMCP:      copyStringSlice(parent.EnabledMCP),
 		EnabledSkills:   copyStringSlice(parent.EnabledSkills),
 		ShowReasoning:   &showReasoning,
+		FullAccess:      parent.FullAccess,
 		Context:         &contextMetadata,
 		SaveToolResults: &saveToolResults,
 	})

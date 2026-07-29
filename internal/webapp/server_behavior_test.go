@@ -161,6 +161,58 @@ func TestServerLifecycleFailuresUseStableHTTPContract(t *testing.T) {
 	waitForManagedRunTerminal(t, managed)
 }
 
+func TestServerSessionFullAccessEndpoint(t *testing.T) {
+	server, _, _ := newWebTestAppServerWithRunner(t, webTestRunner{})
+	project, session := createWebProjectAndSession(t, server)
+	if session.FullAccess {
+		t.Fatalf("new session FullAccess = true, want default false")
+	}
+
+	response := doJSONRequest(t, http.MethodPost, server.URL+"/api/sessions/"+session.ID+"/full-access", map[string]any{"full_access": true})
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("POST full-access status = %d body=%s", response.StatusCode, readBody(response))
+	}
+	var updated execution.SessionDetail
+	decodeResponse(t, response, &updated)
+	if !updated.FullAccess {
+		t.Fatalf("POST full-access session = %#v, want full_access true", updated)
+	}
+
+	response = doJSONRequest(t, http.MethodGet, server.URL+"/api/sessions/"+session.ID, nil)
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("GET session status = %d", response.StatusCode)
+	}
+	var fetched execution.SessionDetail
+	decodeResponse(t, response, &fetched)
+	if !fetched.FullAccess {
+		t.Fatalf("GET session full_access = false, want persisted true")
+	}
+
+	response = doJSONRequest(t, http.MethodPost, server.URL+"/api/sessions/"+session.ID+"/full-access", map[string]any{"full_access": false})
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("POST full-access off status = %d body=%s", response.StatusCode, readBody(response))
+	}
+	decodeResponse(t, response, &updated)
+	if updated.FullAccess {
+		t.Fatalf("POST full-access off session = %#v, want full_access false", updated)
+	}
+
+	response = doJSONRequest(t, http.MethodPost, server.URL+"/api/sessions/session-missing/full-access", map[string]any{"full_access": true})
+	if response.StatusCode != http.StatusNotFound || responseErrorCode(t, response) != "not_found" {
+		t.Fatalf("POST full-access missing session status = %d, want 404 not_found", response.StatusCode)
+	}
+
+	response = doJSONRequest(t, http.MethodPost, server.URL+"/api/projects/"+project.ID+"/sessions", map[string]any{"full_access": true})
+	if response.StatusCode != http.StatusCreated {
+		t.Fatalf("POST session with full_access status = %d body=%s", response.StatusCode, readBody(response))
+	}
+	var created execution.SessionDetail
+	decodeResponse(t, response, &created)
+	if !created.FullAccess {
+		t.Fatalf("POST session with full_access = %#v, want full_access true", created)
+	}
+}
+
 func TestServerActivePromptQueueLifecycle(t *testing.T) {
 	runner := enteredBlockingWebTestRunner{entered: make(chan struct{}), once: &sync.Once{}}
 	server, _, app := newWebTestAppServerWithRunner(t, runner)

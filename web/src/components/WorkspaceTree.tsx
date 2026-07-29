@@ -87,6 +87,7 @@ export const WorkspaceTree = memo(function WorkspaceTree(props: {
               <strong>{sessionName(session)}</strong>
               <small>{archived ? `${agentLabel}Archived` : `${agentLabel}${relativeTime(session.last_used_at || session.updated_at)}`} · {session.model_id || session.model_profile}</small>
             </span>
+            {session.full_access && <span className="full-access-badge" title="Full access: file tools may read and write outside the workspace">FA</span>}
             {!archived && running && <span className="live-dot" />}
           </button>
           <div className="session-tree-actions">

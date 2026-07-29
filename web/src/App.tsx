@@ -158,7 +158,7 @@ function App() {
 
   const openSessionCreator = useCallback(async (projectID = selectedProjectID) => {
     if (!projectID) return
-    setSessionCreator({ projectID, models: [], selectedKey: '', defaultProvider: '', defaultModel: '', reasoningLevel: '', loading: true })
+    setSessionCreator({ projectID, models: [], selectedKey: '', defaultProvider: '', defaultModel: '', reasoningLevel: '', fullAccess: false, loading: true })
     try {
       const options = await api.sessionModels(projectID)
       const defaultModel = options.models.find((model) => model.provider === options.default_provider && model.model_profile === options.default_model)
@@ -169,6 +169,7 @@ function App() {
         defaultProvider: options.default_provider,
         defaultModel: options.default_model,
         reasoningLevel: defaultModel?.default_reasoning_level ?? options.models[0]?.default_reasoning_level ?? '',
+        fullAccess: current.fullAccess,
         loading: false,
       } : current)
     } catch (reason) {
@@ -181,7 +182,7 @@ function App() {
     if (!projectID || creatingSession) return
     setCreatingSession(true)
     try {
-      const session = await api.createSession(projectID, model.provider, model.model_profile, sessionCreator?.reasoningLevel ?? model.default_reasoning_level ?? '')
+      const session = await api.createSession(projectID, model.provider, model.model_profile, sessionCreator?.reasoningLevel ?? model.default_reasoning_level ?? '', sessionCreator?.fullAccess ?? false)
       setSelectedProjectID(projectID)
       await loadSessions(projectID, session.id)
       setSelectedSessionID(session.id)
@@ -275,6 +276,16 @@ function App() {
     }
     try {
       await api.renameSession(session.id, displayName.trim())
+      await loadSessions(session.project_id, session.id)
+      if (selectedSessionRef.current === session.id) await refreshSession(session.id)
+    } catch (reason) {
+      setError(errorMessage(reason))
+    }
+  }, [loadSessions, refreshSession, selectedSessionRef])
+
+  const toggleFullAccess = useCallback(async (session: Session) => {
+    try {
+      await api.setSessionFullAccess(session.id, !session.full_access)
       await loadSessions(session.project_id, session.id)
       if (selectedSessionRef.current === session.id) await refreshSession(session.id)
     } catch (reason) {
@@ -655,6 +666,7 @@ function App() {
             onCancelTool={(toolCallID) => void cancelToolCall(toolCallID)}
             onRemoveQueuedPrompt={(promptID) => void removeQueuedPrompt(promptID)}
             onCompact={() => void compactSession()}
+            onToggleFullAccess={() => sessionDetail && void toggleFullAccess(sessionDetail)}
           />
         ) : selectedProject ? (
 		  <EmptySession disabled={false} onCreate={() => void openSessionCreator()} />
@@ -678,6 +690,7 @@ function App() {
             return { ...current, selectedKey, reasoningLevel: model?.default_reasoning_level ?? '' }
           })}
           onReasoningLevel={(reasoningLevel) => setSessionCreator((current) => current ? { ...current, reasoningLevel } : current)}
+          onFullAccess={(fullAccess) => setSessionCreator((current) => current ? { ...current, fullAccess } : current)}
           onCancel={() => { if (!creatingSession) setSessionCreator(null) }}
           onCreate={(model) => void createSession(sessionCreator.projectID, model)}
         />

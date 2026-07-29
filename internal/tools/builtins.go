@@ -49,7 +49,11 @@ const (
 	defaultGrepSnippetMaxBytes = 200
 )
 
-func RegisterBuiltins(registry *Registry, rootDir string) error {
+// RegisterBuiltins registers the built-in file and shell tools rooted at
+// rootDir. With fullAccess the file tools additionally accept absolute paths
+// outside rootDir; relative paths stay anchored at rootDir either way. The
+// shell tool is never path-confined and is unaffected by fullAccess.
+func RegisterBuiltins(registry *Registry, rootDir string, fullAccess bool) error {
 	if registry == nil {
 		return fmt.Errorf("registry must not be nil")
 	}
@@ -75,32 +79,32 @@ func RegisterBuiltins(registry *Registry, rootDir string) error {
 
 	builtins := []Entry{
 		{
-			Definition: listFilesDefinition(),
-			Executor:   newListFilesExecutor(canonicalRoot),
+			Definition: listFilesDefinition(fullAccess),
+			Executor:   newListFilesExecutor(canonicalRoot, fullAccess),
 		},
 		{
-			Definition: readFileDefinition(),
-			Executor:   newReadFileExecutor(canonicalRoot),
+			Definition: readFileDefinition(fullAccess),
+			Executor:   newReadFileExecutor(canonicalRoot, fullAccess),
 		},
 		{
-			Definition: globFilesDefinition(),
-			Executor:   newGlobFilesExecutor(canonicalRoot),
+			Definition: globFilesDefinition(fullAccess),
+			Executor:   newGlobFilesExecutor(canonicalRoot, fullAccess),
 		},
 		{
-			Definition: grepFilesDefinition(),
-			Executor:   newGrepFilesExecutor(canonicalRoot),
+			Definition: grepFilesDefinition(fullAccess),
+			Executor:   newGrepFilesExecutor(canonicalRoot, fullAccess),
 		},
 		{
-			Definition: writeFileDefinition(),
-			Executor:   newWriteFileExecutor(canonicalRoot),
+			Definition: writeFileDefinition(fullAccess),
+			Executor:   newWriteFileExecutor(canonicalRoot, fullAccess),
 		},
 		{
-			Definition: editFileDefinition(),
-			Executor:   newEditFileExecutor(canonicalRoot),
+			Definition: editFileDefinition(fullAccess),
+			Executor:   newEditFileExecutor(canonicalRoot, fullAccess),
 		},
 		{
-			Definition: applyPatchDefinition(),
-			Executor:   newApplyPatchExecutor(canonicalRoot),
+			Definition: applyPatchDefinition(fullAccess),
+			Executor:   newApplyPatchExecutor(canonicalRoot, fullAccess),
 		},
 		{
 			Definition: shellDefinition(),
@@ -115,16 +119,22 @@ func RegisterBuiltins(registry *Registry, rootDir string) error {
 	return nil
 }
 
-func listFilesDefinition() model.Tool {
+func listFilesDefinition(fullAccess bool) model.Tool {
+	description := "List files and directories under the workspace."
+	pathDescription := "Directory path relative to the workspace. Defaults to the workspace root."
+	if fullAccess {
+		description = "List files and directories under the workspace or any absolute path."
+		pathDescription = "Directory path: absolute, or relative to the workspace. Defaults to the workspace root."
+	}
 	return model.Tool{
 		Name:        BuiltinListFiles,
-		Description: "List files and directories under the workspace.",
+		Description: description,
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
 				"path": map[string]any{
 					"type":        "string",
-					"description": "Directory path relative to the workspace. Defaults to the workspace root.",
+					"description": pathDescription,
 				},
 			},
 			"additionalProperties": false,
@@ -132,16 +142,22 @@ func listFilesDefinition() model.Tool {
 	}
 }
 
-func readFileDefinition() model.Tool {
+func readFileDefinition(fullAccess bool) model.Tool {
+	description := "Read a text file under the workspace."
+	pathDescription := "File path relative to the workspace."
+	if fullAccess {
+		description = "Read a text file under the workspace or any absolute path."
+		pathDescription = "File path: absolute, or relative to the workspace."
+	}
 	return model.Tool{
 		Name:        BuiltinReadFile,
-		Description: "Read a text file under the workspace.",
+		Description: description,
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
 				"path": map[string]any{
 					"type":        "string",
-					"description": "File path relative to the workspace.",
+					"description": pathDescription,
 				},
 				"start_line": map[string]any{
 					"type":        "integer",
@@ -165,16 +181,22 @@ func readFileDefinition() model.Tool {
 	}
 }
 
-func globFilesDefinition() model.Tool {
+func globFilesDefinition(fullAccess bool) model.Tool {
+	description := "Find workspace files by slash-style glob pattern."
+	pathDescription := "Directory path relative to the workspace to search from. Defaults to the workspace root."
+	if fullAccess {
+		description = "Find files by slash-style glob pattern under the workspace or any absolute path."
+		pathDescription = "Directory path to search from: absolute, or relative to the workspace. Defaults to the workspace root. Matches outside the workspace are returned as absolute paths."
+	}
 	return model.Tool{
 		Name:        BuiltinGlobFiles,
-		Description: "Find workspace files by slash-style glob pattern.",
+		Description: description,
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
 				"path": map[string]any{
 					"type":        "string",
-					"description": "Directory path relative to the workspace to search from. Defaults to the workspace root.",
+					"description": pathDescription,
 				},
 				"pattern": map[string]any{
 					"type":        "string",
@@ -200,16 +222,22 @@ func globFilesDefinition() model.Tool {
 	}
 }
 
-func grepFilesDefinition() model.Tool {
+func grepFilesDefinition(fullAccess bool) model.Tool {
+	description := "Search workspace text files and return path:line:snippet matches. Query is a case-sensitive Go RE2 regular expression by default; set literal=true for literal text. Matching is line-by-line, so multi-line patterns, look-around, and backreferences are not supported. The path may identify either a directory or one text file."
+	pathDescription := "File or directory path relative to the workspace to search. Defaults to the workspace root."
+	if fullAccess {
+		description = "Search text files and return path:line:snippet matches. Query is a case-sensitive Go RE2 regular expression by default; set literal=true for literal text. Matching is line-by-line, so multi-line patterns, look-around, and backreferences are not supported. The path may identify either a directory or one text file, under the workspace or any absolute path."
+		pathDescription = "File or directory path to search: absolute, or relative to the workspace. Defaults to the workspace root. Matches outside the workspace are reported with absolute paths."
+	}
 	return model.Tool{
 		Name:        BuiltinGrepFiles,
-		Description: "Search workspace text files and return path:line:snippet matches. Query is a case-sensitive Go RE2 regular expression by default; set literal=true for literal text. Matching is line-by-line, so multi-line patterns, look-around, and backreferences are not supported. The path may identify either a directory or one text file.",
+		Description: description,
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
 				"path": map[string]any{
 					"type":        "string",
-					"description": "File or directory path relative to the workspace to search. Defaults to the workspace root.",
+					"description": pathDescription,
 				},
 				"query": map[string]any{
 					"type":        "string",
@@ -283,16 +311,22 @@ func shellDefinition() model.Tool {
 	}
 }
 
-func writeFileDefinition() model.Tool {
+func writeFileDefinition(fullAccess bool) model.Tool {
+	description := "Write a text file under the workspace, creating parent directories if needed."
+	pathDescription := "File path relative to the workspace."
+	if fullAccess {
+		description = "Write a text file under the workspace or any absolute path, creating parent directories if needed."
+		pathDescription = "File path: absolute, or relative to the workspace."
+	}
 	return model.Tool{
 		Name:        BuiltinWriteFile,
-		Description: "Write a text file under the workspace, creating parent directories if needed.",
+		Description: description,
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
 				"path": map[string]any{
 					"type":        "string",
-					"description": "File path relative to the workspace.",
+					"description": pathDescription,
 				},
 				"content": map[string]any{
 					"type":        "string",
@@ -305,16 +339,22 @@ func writeFileDefinition() model.Tool {
 	}
 }
 
-func editFileDefinition() model.Tool {
+func editFileDefinition(fullAccess bool) model.Tool {
+	description := "Edit a text file under the workspace by replacing one unique text match. LF and CRLF line endings are treated as equivalent during matching; the saved file keeps its original line-ending style."
+	pathDescription := "File path relative to the workspace."
+	if fullAccess {
+		description = "Edit a text file under the workspace or any absolute path by replacing one unique text match. LF and CRLF line endings are treated as equivalent during matching; the saved file keeps its original line-ending style."
+		pathDescription = "File path: absolute, or relative to the workspace."
+	}
 	return model.Tool{
 		Name:        BuiltinEditFile,
-		Description: "Edit a text file under the workspace by replacing one unique text match. LF and CRLF line endings are treated as equivalent during matching; the saved file keeps its original line-ending style.",
+		Description: description,
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
 				"path": map[string]any{
 					"type":        "string",
-					"description": "File path relative to the workspace.",
+					"description": pathDescription,
 				},
 				"old": map[string]any{
 					"type":        "string",
@@ -331,13 +371,13 @@ func editFileDefinition() model.Tool {
 	}
 }
 
-func newListFilesExecutor(rootDir string) Executor {
+func newListFilesExecutor(rootDir string, fullAccess bool) Executor {
 	return ExecutorFunc(func(ctx context.Context, arguments map[string]any) (model.ToolResult, error) {
 		path, err := optionalStringArgument(arguments, "path", ".")
 		if err != nil {
 			return model.ToolResult{}, err
 		}
-		resolved, err := resolveRootPath(rootDir, path)
+		resolved, err := resolveToolReadPath(rootDir, path, fullAccess)
 		if err != nil {
 			return model.ToolResult{}, err
 		}
@@ -364,7 +404,7 @@ func newListFilesExecutor(rootDir string) Executor {
 	})
 }
 
-func newReadFileExecutor(rootDir string) Executor {
+func newReadFileExecutor(rootDir string, fullAccess bool) Executor {
 	return ExecutorFunc(func(ctx context.Context, arguments map[string]any) (model.ToolResult, error) {
 		path, err := requiredStringArgument(arguments, "path")
 		if err != nil {
@@ -382,7 +422,7 @@ func newReadFileExecutor(rootDir string) Executor {
 		if err != nil {
 			return model.ToolResult{}, err
 		}
-		resolved, err := resolveRootPath(rootDir, path)
+		resolved, err := resolveToolReadPath(rootDir, path, fullAccess)
 		if err != nil {
 			return model.ToolResult{}, err
 		}
@@ -410,7 +450,7 @@ func newReadFileExecutor(rootDir string) Executor {
 	})
 }
 
-func newGlobFilesExecutor(rootDir string) Executor {
+func newGlobFilesExecutor(rootDir string, fullAccess bool) Executor {
 	return ExecutorFunc(func(ctx context.Context, arguments map[string]any) (model.ToolResult, error) {
 		searchPath, err := optionalStringArgument(arguments, "path", ".")
 		if err != nil {
@@ -437,7 +477,7 @@ func newGlobFilesExecutor(rootDir string) Executor {
 			return model.ToolResult{}, err
 		}
 
-		searchRoot, err := resolveRootPath(rootDir, searchPath)
+		searchRoot, err := resolveToolReadPath(rootDir, searchPath, fullAccess)
 		if err != nil {
 			return model.ToolResult{}, err
 		}
@@ -462,24 +502,38 @@ func newGlobFilesExecutor(rootDir string) Executor {
 				return nil
 			}
 
-			workspaceRel, err := slashRel(rootDir, current)
+			searchRel, err := slashRel(searchRoot, current)
 			if err != nil {
 				return err
 			}
-			if workspaceRel == "." {
+			if searchRel == "." {
 				return nil
 			}
-			ignored, err := gitIgnore.ignores(workspaceRel, entry.IsDir())
-			if err != nil {
-				return err
-			}
-			if ignored {
-				if entry.IsDir() {
-					return filepath.SkipDir
+
+			// Workspace gitignore rules only apply inside the workspace;
+			// matches outside it (full access mode) are reported with
+			// absolute paths and hidden filtering follows the search root.
+			display := filepath.ToSlash(current)
+			hiddenBase := searchRel
+			if pathInsideRoot(rootDir, current) {
+				workspaceRel, err := slashRel(rootDir, current)
+				if err != nil {
+					return err
 				}
-				return nil
+				ignored, err := gitIgnore.ignores(workspaceRel, entry.IsDir())
+				if err != nil {
+					return err
+				}
+				if ignored {
+					if entry.IsDir() {
+						return filepath.SkipDir
+					}
+					return nil
+				}
+				display = workspaceRel
+				hiddenBase = workspaceRel
 			}
-			if !includeHidden && hasHiddenPathSegment(workspaceRel) {
+			if !includeHidden && hasHiddenPathSegment(hiddenBase) {
 				if entry.IsDir() {
 					return filepath.SkipDir
 				}
@@ -489,16 +543,12 @@ func newGlobFilesExecutor(rootDir string) Executor {
 				return nil
 			}
 
-			searchRel, err := slashRel(searchRoot, current)
-			if err != nil {
-				return err
-			}
 			matched, err := matchSlashGlob(normalizedPattern, searchRel)
 			if err != nil {
 				return err
 			}
 			if matched {
-				results = append(results, workspaceRel)
+				results = append(results, display)
 			}
 			return nil
 		})
@@ -530,7 +580,7 @@ func newGlobFilesExecutor(rootDir string) Executor {
 	})
 }
 
-func newGrepFilesExecutor(rootDir string) Executor {
+func newGrepFilesExecutor(rootDir string, fullAccess bool) Executor {
 	return ExecutorFunc(func(ctx context.Context, arguments map[string]any) (model.ToolResult, error) {
 		searchPath, err := optionalStringArgument(arguments, "path", ".")
 		if err != nil {
@@ -581,7 +631,7 @@ func newGrepFilesExecutor(rootDir string) Executor {
 			return model.ToolResult{}, err
 		}
 
-		searchRoot, err := resolveRootPath(rootDir, searchPath)
+		searchRoot, err := resolveToolReadPath(rootDir, searchPath, fullAccess)
 		if err != nil {
 			return model.ToolResult{}, err
 		}
@@ -680,7 +730,7 @@ func newGrepFilesExecutor(rootDir string) Executor {
 	})
 }
 
-func newWriteFileExecutor(rootDir string) Executor {
+func newWriteFileExecutor(rootDir string, fullAccess bool) Executor {
 	return ExecutorFunc(func(ctx context.Context, arguments map[string]any) (model.ToolResult, error) {
 		path, err := requiredStringArgument(arguments, "path")
 		if err != nil {
@@ -690,7 +740,7 @@ func newWriteFileExecutor(rootDir string) Executor {
 		if err != nil {
 			return model.ToolResult{}, err
 		}
-		resolved, err := resolveWritableFilePath(rootDir, path)
+		resolved, err := resolveToolWritePath(rootDir, path, fullAccess)
 		if err != nil {
 			return model.ToolResult{}, err
 		}
@@ -708,7 +758,7 @@ func newWriteFileExecutor(rootDir string) Executor {
 	})
 }
 
-func newEditFileExecutor(rootDir string) Executor {
+func newEditFileExecutor(rootDir string, fullAccess bool) Executor {
 	return ExecutorFunc(func(ctx context.Context, arguments map[string]any) (model.ToolResult, error) {
 		path, err := requiredStringArgument(arguments, "path")
 		if err != nil {
@@ -722,7 +772,7 @@ func newEditFileExecutor(rootDir string) Executor {
 		if err != nil {
 			return model.ToolResult{}, err
 		}
-		resolved, err := resolveRootPath(rootDir, path)
+		resolved, err := resolveToolReadPath(rootDir, path, fullAccess)
 		if err != nil {
 			return model.ToolResult{}, err
 		}
@@ -1135,12 +1185,12 @@ type grepCandidateFile struct {
 }
 
 func grepSingleCandidateFile(rootDir, file string, include, exclude []string) ([]grepCandidateFile, error) {
-	workspaceRel, err := slashRel(rootDir, file)
+	display, err := grepDisplayPath(rootDir, file)
 	if err != nil {
 		return nil, err
 	}
 	if len(include) > 0 {
-		matched, err := matchAnySlashGlob(include, workspaceRel)
+		matched, err := matchAnySlashGlob(include, display)
 		if err != nil {
 			return nil, err
 		}
@@ -1149,7 +1199,7 @@ func grepSingleCandidateFile(rootDir, file string, include, exclude []string) ([
 		}
 	}
 	if len(exclude) > 0 {
-		matched, err := matchAnySlashGlob(exclude, workspaceRel)
+		matched, err := matchAnySlashGlob(exclude, display)
 		if err != nil {
 			return nil, err
 		}
@@ -1157,7 +1207,16 @@ func grepSingleCandidateFile(rootDir, file string, include, exclude []string) ([
 			return nil, nil
 		}
 	}
-	return []grepCandidateFile{{absolute: file, workspaceRel: workspaceRel}}, nil
+	return []grepCandidateFile{{absolute: file, workspaceRel: display}}, nil
+}
+
+// grepDisplayPath labels a match with its workspace-relative path, or with
+// its absolute path when it sits outside the workspace (full access mode).
+func grepDisplayPath(rootDir, target string) (string, error) {
+	if pathInsideRoot(rootDir, target) {
+		return slashRel(rootDir, target)
+	}
+	return filepath.ToSlash(target), nil
 }
 
 func grepCandidateFiles(ctx context.Context, rootDir, searchRoot string, include, exclude []string, gitIgnore *gitIgnoreMatcher) ([]grepCandidateFile, error) {
@@ -1173,19 +1232,22 @@ func grepCandidateFiles(ctx context.Context, rootDir, searchRoot string, include
 			return nil
 		}
 
-		workspaceRel, err := slashRel(rootDir, current)
+		display, err := grepDisplayPath(rootDir, current)
 		if err != nil {
 			return err
 		}
-		ignored, err := gitIgnore.ignores(workspaceRel, entry.IsDir())
-		if err != nil {
-			return err
-		}
-		if ignored {
-			if entry.IsDir() {
-				return filepath.SkipDir
+		// Workspace gitignore rules only apply inside the workspace.
+		if pathInsideRoot(rootDir, current) {
+			ignored, err := gitIgnore.ignores(display, entry.IsDir())
+			if err != nil {
+				return err
 			}
-			return nil
+			if ignored {
+				if entry.IsDir() {
+					return filepath.SkipDir
+				}
+				return nil
+			}
 		}
 		if entry.IsDir() {
 			return nil
@@ -1213,7 +1275,7 @@ func grepCandidateFiles(ctx context.Context, rootDir, searchRoot string, include
 
 		files = append(files, grepCandidateFile{
 			absolute:     current,
-			workspaceRel: workspaceRel,
+			workspaceRel: display,
 		})
 		return nil
 	})
@@ -1485,6 +1547,51 @@ func requiredNonEmptyStringArgument(arguments map[string]any, name string) (stri
 	return text, nil
 }
 
+// resolveToolReadPath resolves a read-side file-tool path against rootDir.
+// Relative paths stay anchored at the workspace. With fullAccess absolute
+// paths outside the workspace are accepted as well; without it the confined
+// resolver rejects them.
+func resolveToolReadPath(rootDir, path string, fullAccess bool) (string, error) {
+	if !fullAccess {
+		return resolveRootPath(rootDir, path)
+	}
+	if strings.TrimSpace(path) == "" {
+		return "", fmt.Errorf("path must not be blank")
+	}
+	target := path
+	if !filepath.IsAbs(target) {
+		target = filepath.Join(rootDir, target)
+	}
+	abs, err := filepath.Abs(target)
+	if err != nil {
+		return "", fmt.Errorf("resolve path %q: %w", path, err)
+	}
+	canonical, err := filepath.EvalSymlinks(abs)
+	if err != nil {
+		// Missing targets fall back to the lexical absolute path so the
+		// tool operation itself reports the natural not-exist error.
+		return abs, nil
+	}
+	return canonical, nil
+}
+
+// resolveToolWritePath resolves a write-side file-tool path against rootDir
+// with the same fullAccess semantics as resolveToolReadPath.
+func resolveToolWritePath(rootDir, path string, fullAccess bool) (string, error) {
+	return resolveWritableFilePathAccess(rootDir, path, fullAccess)
+}
+
+// pathInsideRoot reports whether target lies inside rootDir by lexical
+// comparison. Callers pass canonicalized paths (rootDir is canonicalized at
+// registration, targets come from resolvers or WalkDir).
+func pathInsideRoot(rootDir, target string) bool {
+	relative, err := filepath.Rel(rootDir, target)
+	if err != nil {
+		return false
+	}
+	return relative == "." || (relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator)) && !filepath.IsAbs(relative))
+}
+
 func resolveRootPath(rootDir string, path string) (string, error) {
 	if strings.TrimSpace(path) == "" {
 		return "", fmt.Errorf("path must not be blank")
@@ -1528,6 +1635,14 @@ func resolveRootPath(rootDir string, path string) (string, error) {
 }
 
 func resolveWritableFilePath(rootDir string, path string) (string, error) {
+	return resolveWritableFilePathAccess(rootDir, path, false)
+}
+
+// resolveWritableFilePathAccess validates a write target like
+// resolveWritableFilePath but skips the workspace containment check when
+// fullAccess is set. All other validation (directory targets, parent
+// resolution, symlink handling) applies in both modes.
+func resolveWritableFilePathAccess(rootDir string, path string, fullAccess bool) (string, error) {
 	if strings.TrimSpace(path) == "" {
 		return "", fmt.Errorf("path must not be blank")
 	}
@@ -1540,6 +1655,12 @@ func resolveWritableFilePath(rootDir string, path string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("resolve rootDir: %w", err)
 	}
+	contain := func(target string) error {
+		if fullAccess {
+			return nil
+		}
+		return ensurePathInsideRoot(canonicalRoot, target, path)
+	}
 
 	var target string
 	if filepath.IsAbs(path) {
@@ -1551,7 +1672,7 @@ func resolveWritableFilePath(rootDir string, path string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("resolve path %q: %w", path, err)
 	}
-	if err := ensurePathInsideRoot(canonicalRoot, target, path); err != nil {
+	if err := contain(target); err != nil {
 		return "", err
 	}
 
@@ -1560,7 +1681,7 @@ func resolveWritableFilePath(rootDir string, path string) (string, error) {
 		if err != nil {
 			return "", fmt.Errorf("resolve path %q: %w", path, err)
 		}
-		if err := ensurePathInsideRoot(canonicalRoot, canonicalTarget, path); err != nil {
+		if err := contain(canonicalTarget); err != nil {
 			return "", err
 		}
 		info, err := os.Stat(canonicalTarget)
@@ -1586,7 +1707,7 @@ func resolveWritableFilePath(rootDir string, path string) (string, error) {
 			if err != nil {
 				return "", fmt.Errorf("resolve parent path %q: %w", path, err)
 			}
-			if err := ensurePathInsideRoot(canonicalRoot, canonicalAncestor, path); err != nil {
+			if err := contain(canonicalAncestor); err != nil {
 				return "", err
 			}
 			return target, nil

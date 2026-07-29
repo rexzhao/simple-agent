@@ -17,7 +17,7 @@ import (
 
 func TestRegisterBuiltinsRegistersExpectedTools(t *testing.T) {
 	registry := NewRegistry()
-	if err := RegisterBuiltins(registry, t.TempDir()); err != nil {
+	if err := RegisterBuiltins(registry, t.TempDir(), false); err != nil {
 		t.Fatalf("RegisterBuiltins() error = %v", err)
 	}
 
@@ -56,7 +56,7 @@ func TestShellDefinitionDescribesBashSyntax(t *testing.T) {
 }
 
 func TestRegisterBuiltinsRejectsBlankRootDir(t *testing.T) {
-	err := RegisterBuiltins(NewRegistry(), " \t\n")
+	err := RegisterBuiltins(NewRegistry(), " \t\n", false)
 	if err == nil {
 		t.Fatal("RegisterBuiltins() error = nil, want error")
 	}
@@ -1323,7 +1323,7 @@ func registerBuiltinsForTest(t *testing.T, root string) *Registry {
 	t.Helper()
 
 	registry := NewRegistry()
-	if err := RegisterBuiltins(registry, root); err != nil {
+	if err := RegisterBuiltins(registry, root, false); err != nil {
 		t.Fatalf("RegisterBuiltins() error = %v", err)
 	}
 	return registry

@@ -706,3 +706,13 @@ svg { width: 1.1em; height: 1.1em; fill: none; stroke: currentColor; stroke-widt
   .reasoning-choice { grid-template-columns: 85px minmax(0, 1fr); }
   .reasoning-choice small { grid-column: 1 / -1; }
 }
+
+/* Full access mode: session toggle, badges, and out-of-workspace flags */
+.full-access-toggle.on { background: var(--accent); }
+.full-access-badge { flex: 0 0 auto; align-self: center; padding: 1px 4px; border: 1.5px solid var(--border); background: var(--accent-soft); color: var(--text); font-size: 9px; font-weight: 800; }
+.full-access-choice { display: flex; align-items: flex-start; gap: 10px; padding: 12px 22px; border-top: 2px solid var(--border); background: var(--accent-soft); font-size: 11px; }
+.full-access-choice input { width: 16px; height: 16px; margin: 1px 0 0; accent-color: var(--accent-hover); }
+.full-access-choice span { display: grid; gap: 3px; }
+.full-access-choice small { color: var(--muted); font-size: 9px; font-weight: 500; line-height: 1.4; }
+.tool-row-header code.outside-workspace, .tool-group code.outside-workspace { color: #92610a; background: var(--accent-soft); font-weight: 700; }
+.outside-workspace-flag { flex: 0 0 auto; display: inline-flex; align-items: center; justify-content: center; width: 15px; height: 15px; border: 1.5px solid var(--border); background: var(--accent); color: var(--text); font-size: 10px; font-weight: 800; }
