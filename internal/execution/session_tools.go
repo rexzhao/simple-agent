@@ -125,15 +125,15 @@ func sessionToolDefinitions() []model.Tool {
 					"type":        "string",
 					"description": "Durable session id.",
 				},
-				"before_seq": map[string]any{
+				"cursor": map[string]any{
 					"type":        "integer",
-					"description": "Return items older than this sequence number. Cannot be combined with after_seq.",
+					"description": "Pagination cursor: an item sequence number taken from a previous page (oldest_seq or newest_seq). When omitted, the newest page is returned.",
 					"minimum":     1,
 				},
-				"after_seq": map[string]any{
-					"type":        "integer",
-					"description": "Return items newer than this sequence number. Cannot be combined with before_seq.",
-					"minimum":     1,
+				"direction": map[string]any{
+					"type":        "string",
+					"enum":        []any{"before", "after"},
+					"description": "Selects which side of cursor to read: \"before\" returns older items, \"after\" returns newer items. Required when cursor is provided; omit together with cursor for the newest page.",
 				},
 				"limit": map[string]any{
 					"type":        "integer",
@@ -457,6 +457,27 @@ func (e *sessionToolExecutor) history(toolName string, arguments map[string]any)
 	if !ok {
 		return result, nil
 	}
+	cursor, err := optionalSessionIntegerInRange(arguments, "cursor", 0, 1, int(^uint(0)>>1))
+	if err != nil {
+		return sessionToolError(toolName, "invalid_arguments", err.Error())
+	}
+	direction, err := optionalTrimmedSessionString(arguments, "direction")
+	if err != nil {
+		return sessionToolError(toolName, "invalid_arguments", err.Error())
+	}
+	if direction != "" && direction != "before" && direction != "after" {
+		return sessionToolError(toolName, "invalid_arguments", "direction must be \"before\" (items older than cursor) or \"after\" (items newer than cursor)")
+	}
+	if direction != "" && cursor == 0 {
+		return sessionToolError(toolName, "invalid_arguments", "direction requires cursor; omit both for the newest page")
+	}
+	if cursor > 0 && direction == "" {
+		return sessionToolError(toolName, "invalid_arguments", "cursor requires direction: \"before\" returns items older than cursor, \"after\" returns items newer than cursor")
+	}
+	// before_seq/after_seq are the retired cursor parameters. They stay
+	// accepted so agents started before the cursor/direction contract keep
+	// working, but they are no longer advertised in the tool schema, and
+	// misuse errors teach the current contract.
 	beforeSeq, err := optionalSessionIntegerInRange(arguments, "before_seq", 0, 1, int(^uint(0)>>1))
 	if err != nil {
 		return sessionToolError(toolName, "invalid_arguments", err.Error())
@@ -466,7 +487,17 @@ func (e *sessionToolExecutor) history(toolName string, arguments map[string]any)
 		return sessionToolError(toolName, "invalid_arguments", err.Error())
 	}
 	if beforeSeq > 0 && afterSeq > 0 {
-		return sessionToolError(toolName, "invalid_arguments", "before_seq and after_seq cannot be combined")
+		return sessionToolError(toolName, "invalid_arguments", "before_seq and after_seq cannot be combined; retry with exactly one of them, or use cursor with direction: \"before\" returns items older than cursor, \"after\" returns items newer than cursor")
+	}
+	if cursor > 0 && (beforeSeq > 0 || afterSeq > 0) {
+		return sessionToolError(toolName, "invalid_arguments", "cursor cannot be combined with before_seq/after_seq; use cursor with direction only")
+	}
+	if cursor > 0 {
+		if direction == "after" {
+			afterSeq = cursor
+		} else {
+			beforeSeq = cursor
+		}
 	}
 	limit, err := optionalSessionIntegerInRange(arguments, "limit", 0, 1, maximumSessionChatItemsLimit)
 	if err != nil {

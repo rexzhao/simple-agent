@@ -135,8 +135,12 @@ This ensures an agent sees only state that can be recovered after a restart.
 
 `session_history` accepts a durable `session_id` and returns the same visible
 conversation items used by the Web history API. The newest page is returned by
-default. Pass `before_seq: oldest_seq` to page backward or
-`after_seq: newest_seq` to read newer items; the two cursors cannot be combined.
+default. Pass `cursor: oldest_seq` with `direction: "before"` to page backward
+or `cursor: newest_seq` with `direction: "after"` to read newer items;
+`direction` is required whenever `cursor` is present. The retired
+`before_seq`/`after_seq` parameters remain accepted for compatibility with
+agents started before this contract, but are no longer advertised in the tool
+schema; conflict errors point at the cursor/direction contract.
 Resolve names with `session_search` first because display names are not unique.
 Hidden items and sessions outside the caller's project are never returned.
 

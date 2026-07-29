@@ -31,6 +31,7 @@ export const Conversation = memo(function Conversation(props: {
 	onDraftClear: () => void
 	otherSessionsRunning: boolean
 	recentStepsByTurn: Record<string, RunStep[]>
+  sessionNames: Record<string, string>
   turnError: { turnID: string; message: string } | null
   onDismissTurnError: () => void
   onResend: (item: SessionItem) => Promise<boolean>
@@ -298,6 +299,7 @@ export const Conversation = memo(function Conversation(props: {
       <header className="conversation-header">
         <div className="conversation-heading">
           <h1>{props.detail ? sessionName(props.detail) : 'Loading…'}</h1>
+		  {props.detail && <button className="message-tool-button copy-id-button" onClick={() => void copySessionID()} title="Copy project and session ID" aria-label="Copy project and session ID"><CopyIcon /></button>}
 		  {props.detail && (
 			<div className="conversation-meta">
 			  <p>{props.detail.provider} / {props.detail.model_id}{props.detail.reasoning_level && ` · ${props.detail.reasoning_level}`}</p>
@@ -307,7 +309,6 @@ export const Conversation = memo(function Conversation(props: {
         </div>
         <div className="header-actions">
 		  <span className={`status-pill ${props.compacting || props.activeRun || props.detail?.status === 'running' || props.otherSessionsRunning ? 'running' : ''}`}><span />{props.activeRun?.providerRetry ? 'Retrying request' : props.compacting || props.activeRun?.compaction?.status === 'running' ? 'Compacting context' : props.activeRun || props.detail?.status === 'running' ? 'Running' : props.otherSessionsRunning ? 'Another session running' : 'Ready'}</span>
-		  <button className="secondary-button copy-id-button" onClick={() => void copySessionID()} title="Copy project and session ID" aria-label="Copy project and session ID"><CopyIcon /></button>
 		  <button className="secondary-button" disabled={!props.detail || props.detail.status === 'running' || props.compacting || Boolean(props.activeRun)} onClick={props.onCompact}>{props.compacting ? 'Compacting…' : 'Compact context'}</button>
         </div>
       </header>
@@ -316,8 +317,8 @@ export const Conversation = memo(function Conversation(props: {
         {!props.page && <MessageSkeleton />}
 				{conversationEntries.map((entry) => entry.kind === 'message'
 					? <Message key={entry.item.id} item={entry.item} sessionID={props.detail?.id ?? ''} onResend={entry.item === trailingUserItem ? handleResend : undefined} resendPending={resendPending} />
-					: <HistoricalProcess key={entry.id} entry={entry} />)}
-        {props.activeRun && <ActiveRunView run={props.activeRun} onCancelTool={props.onCancelTool} />}
+					: <HistoricalProcess key={entry.id} entry={entry} sessionNames={props.sessionNames} />)}
+        {props.activeRun && <ActiveRunView run={props.activeRun} onCancelTool={props.onCancelTool} sessionNames={props.sessionNames} />}
         {props.compacting && <CompactionStatus trigger="manual" status="running" />}
 		{props.turnError && (
 			<div className="turn-error" role="alert">
@@ -358,6 +359,7 @@ export const Conversation = memo(function Conversation(props: {
   previous.turnError === next.turnError &&
   previous.otherSessionsRunning === next.otherSessionsRunning &&
   previous.recentStepsByTurn === next.recentStepsByTurn &&
+  previous.sessionNames === next.sessionNames &&
   previous.onCancelTool === next.onCancelTool)
 
 function ContextUsage(props: { context: Session['context']; activeInputTokens?: number; activeCachedTokens?: number; activeCacheWriteTokens?: number; compactedContextTokens?: number }) {
@@ -506,7 +508,7 @@ function QueuedPromptList({ prompts, onRemove }: { prompts: QueuedPrompt[]; onRe
   )
 }
 
-function ActiveRunView({ run, onCancelTool }: { run: ActiveRun; onCancelTool?: (toolCallID: string) => void }) {
+function ActiveRunView({ run, onCancelTool, sessionNames }: { run: ActiveRun; onCancelTool?: (toolCallID: string) => void; sessionNames?: Record<string, string> }) {
   return (
     <>
       {(run.userText || (run.userImages?.length ?? 0) > 0) && (
@@ -523,7 +525,7 @@ function ActiveRunView({ run, onCancelTool }: { run: ActiveRun; onCancelTool?: (
       )}
       {run.compaction && <CompactionStatus trigger={run.compaction.trigger} status={run.compaction.status} activeContextTokens={run.compaction.activeContextTokens} contextWindow={run.compaction.contextWindow} />}
       {run.providerRetry && <ProviderRetryStatus retry={run.providerRetry} />}
-      <ActiveRunBody run={run} onCancelTool={onCancelTool} />
+      <ActiveRunBody run={run} onCancelTool={onCancelTool} sessionNames={sessionNames} />
     </>
   )
 }
@@ -555,7 +557,7 @@ function CompactionStatus({ trigger, status, activeContextTokens, contextWindow 
 // message form one assistant segment, the appended message renders as its own
 // user bubble, and the remaining steps continue in a following assistant
 // segment. The streaming text and token note live in the trailing segment.
-function ActiveRunBody({ run, onCancelTool }: { run: ActiveRun; onCancelTool?: (toolCallID: string) => void }) {
+function ActiveRunBody({ run, onCancelTool, sessionNames }: { run: ActiveRun; onCancelTool?: (toolCallID: string) => void; sessionNames?: Record<string, string> }) {
   const segments = useMemo(() => buildActiveRunSegments(run.steps), [run.steps])
   const displaySegments = segments.length > 0 ? segments : [{ kind: 'steps' as const, steps: [] }]
 
@@ -580,7 +582,7 @@ function ActiveRunBody({ run, onCancelTool }: { run: ActiveRun; onCancelTool?: (
         if (segment.kind === 'user') return <article className="message user transient" key={segment.step.id}><div className="message-content"><div className="message-text">{segment.step.text}</div></div></article>
         return <article className="message assistant transient" key={`steps-${index}`}><div className="message-content">
           {isLast && <div className="message-meta"><span className="streaming-label"><i />Generating</span></div>}
-          <ProcessTimeline steps={segment.steps} live={isLast && run.status === 'running' && !textStreaming} onCancelTool={onCancelTool} />
+          <ProcessTimeline steps={segment.steps} live={isLast && run.status === 'running' && !textStreaming} onCancelTool={onCancelTool} sessionNames={sessionNames} />
           {isLast && trailing && (run.assistantText ? <MarkdownMessage text={run.assistantText} streaming /> : <div className="message-text assistant-stream"><span className="cursor" /></div>)}
           {isLast && tokenNote}
         </div></article>
@@ -708,11 +710,11 @@ function buildConversationEntries(items: SessionItem[], sessionID: string, recen
 	return entries
 }
 
-function HistoricalProcess({ entry }: { entry: Extract<ConversationEntry, { kind: 'process' }> }) {
+function HistoricalProcess({ entry, sessionNames }: { entry: Extract<ConversationEntry, { kind: 'process' }>; sessionNames?: Record<string, string> }) {
 	return (
 		<article className="message assistant process-message" data-seq={entry.lastSeq}>
 			<div className="message-content">
-				<ProcessTimeline steps={entry.steps} />
+				<ProcessTimeline steps={entry.steps} sessionNames={sessionNames} />
 			</div>
 		</article>
 	)

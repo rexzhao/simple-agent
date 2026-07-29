@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { api, streamRun } from './api'
 import type { ActiveRun, ActiveRunDescriptor, Bootstrap, ImageAttachmentInput, Project, RunEvent, RunStep, Session, SessionItem, SessionModelOption } from './types'
 import { errorMessage } from './lib/format'
@@ -43,6 +43,19 @@ function App() {
   const [turnErrors, setTurnErrors] = useState<Record<string, { turnID: string; message: string }>>({})
   const [compactingSessionIDs, setCompactingSessionIDs] = useState<Record<string, boolean>>({})
   const { draftsBySession, updateDraft, addPastedText, removePastedText, addPastedImage, removePastedImage, clearDraft } = useComposerDrafts()
+
+  // Session id → display name across every known project, so tool rows can
+  // label session_* calls with human-readable targets instead of raw ids.
+  const sessionNames = useMemo(() => {
+    const names: Record<string, string> = {}
+    for (const sessions of Object.values(archivedSessionsByProject)) {
+      for (const session of sessions) if (session.display_name) names[session.id] = session.display_name
+    }
+    for (const sessions of Object.values(sessionsByProject)) {
+      for (const session of sessions) if (session.display_name) names[session.id] = session.display_name
+    }
+    return names
+  }, [sessionsByProject, archivedSessionsByProject])
   const { activeRunsBySession, activeRunsRef, runningSessionIDs, addActiveRun, updateActiveRun, queueRunEvent, flushRunEvents } = useRunRegistry()
 
   const clearTurnError = useCallback((sessionID: string) => {
@@ -632,6 +645,7 @@ function App() {
 			onDraftClear={() => clearDraft(selectedSessionID)}
 			otherSessionsRunning={otherSessionsRunning}
 					recentStepsByTurn={recentStepsByTurn}
+            sessionNames={sessionNames}
             turnError={turnErrors[selectedSessionID] ?? null}
             onDismissTurnError={() => clearTurnError(selectedSessionID)}
             onResend={(item) => resendMessage(item)}

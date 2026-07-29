@@ -284,7 +284,8 @@ svg { width: 1.1em; height: 1.1em; fill: none; stroke: currentColor; stroke-widt
 }
 .conversation-header h1 { margin: 0 0 4px; font-size: 17px; font-weight: 800; letter-spacing: -.015em; }
 .conversation-header p { margin: 0; color: var(--faint); font-family: var(--font-mono); font-size: 10px; }
-.conversation-heading { min-width: 0; }
+.conversation-heading { min-width: 0; display: flex; align-items: baseline; gap: 5px; }
+.conversation-heading h1 { margin: 0 0 4px; }
 .conversation-meta { display: flex; align-items: center; gap: 14px; }
 .conversation-meta > p { max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .context-usage { width: 230px; display: flex; flex-direction: column; gap: 4px; padding: 4px 7px 5px; border: 1px solid var(--border); background: var(--panel); }

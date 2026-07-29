@@ -6,13 +6,14 @@ import remarkGfm from 'remark-gfm'
 import type { ReasoningActivity, RunStep, ToolActivity } from '../types'
 import { foldToolGroups } from '../lib/runSteps'
 import type { FlatProcessStep } from '../lib/runSteps'
+import { isSessionToolName, prettyJSONText, sessionToolPhrase, sessionToolTarget } from '../lib/sessionTools'
 import { ChevronIcon, ToolIcon } from './icons'
 
 const markdownComponents: Components = {
 	a: ({ node: _node, ...props }) => <a {...props} target="_blank" rel="noreferrer noopener" />,
 }
 
-export const ProcessTimeline = memo(function ProcessTimeline({ steps, live = false, onCancelTool }: { steps: RunStep[]; live?: boolean; onCancelTool?: (toolCallID: string) => void }) {
+export const ProcessTimeline = memo(function ProcessTimeline({ steps, live = false, onCancelTool, sessionNames }: { steps: RunStep[]; live?: boolean; onCancelTool?: (toolCallID: string) => void; sessionNames?: Record<string, string> }) {
 	const nodes = foldToolGroups(steps)
 	const lastNode = nodes[nodes.length - 1]
 	const lastFlat = lastNode ? (lastNode.kind === 'tool-group' ? lastNode.flats[lastNode.flats.length - 1] : lastNode.flat) : undefined
@@ -21,7 +22,7 @@ export const ProcessTimeline = memo(function ProcessTimeline({ steps, live = fal
 		<div className="process-timeline">
 			{nodes.map((node, nodeIndex) => {
 				if (node.kind === 'tool-group') {
-					return <ToolGroupRow key={node.id} flats={node.flats} live={live && nodeIndex === nodes.length - 1} onCancelTool={onCancelTool} />
+					return <ToolGroupRow key={node.id} flats={node.flats} live={live && nodeIndex === nodes.length - 1} onCancelTool={onCancelTool} sessionNames={sessionNames} />
 				}
 				const { step, iteration, iterationStart } = node.flat
 				const marker = iterationStart ? <i className="iteration-marker">{iteration}</i> : null
@@ -48,7 +49,7 @@ export const ProcessTimeline = memo(function ProcessTimeline({ steps, live = fal
 						</article>
 					)
 				}
-				return <ToolRow key={step.id} tool={step} marker={marker} onCancelTool={onCancelTool} />
+				return <ToolRow key={step.id} tool={step} marker={marker} onCancelTool={onCancelTool} sessionNames={sessionNames} />
 			})}
 		</div>
 	)
@@ -61,7 +62,7 @@ export const ProcessTimeline = memo(function ProcessTimeline({ steps, live = fal
 // tool fails; historical groups always start collapsed, failed or not — a
 // finished session should not greet the reader with walls of tool output.
 // Reasoning steps inside the run stay individually collapsed.
-function ToolGroupRow({ flats, live, onCancelTool }: { flats: FlatProcessStep[]; live: boolean; onCancelTool?: (toolCallID: string) => void }) {
+function ToolGroupRow({ flats, live, onCancelTool, sessionNames }: { flats: FlatProcessStep[]; live: boolean; onCancelTool?: (toolCallID: string) => void; sessionNames?: Record<string, string> }) {
 	const tools = flats.map((flat) => flat.step).filter((step): step is ToolActivity => step.kind === 'tool')
 	const failed = tools.filter((tool) => tool.status === 'error').length
 	const pending = tools.filter((tool) => tool.status === 'requested' || tool.status === 'running').length
@@ -115,7 +116,7 @@ function ToolGroupRow({ flats, live, onCancelTool }: { flats: FlatProcessStep[];
 							// ungrouped streaming reasoning block.
 							return <ReasoningStep key={step.id} step={step} marker={marker} streaming={live && index === flats.length - 1} />
 						}
-						if (step.kind === 'tool') return <ToolRow key={step.id} tool={step} marker={marker} onCancelTool={onCancelTool} />
+						if (step.kind === 'tool') return <ToolRow key={step.id} tool={step} marker={marker} onCancelTool={onCancelTool} sessionNames={sessionNames} />
 						return null
 					})}
 				</div>
@@ -131,6 +132,7 @@ function toolGroupSummary(tools: ToolActivity[]): string {
 }
 
 function toolPhrase(name: string, count: number): string {
+	if (isSessionToolName(name)) return sessionToolPhrase(name, count)
 	const plural = count === 1 ? '' : 's'
 	switch (name) {
 		case 'read_file': return `Read ${count} file${plural}`
@@ -211,17 +213,23 @@ function ReasoningStep({ step, marker, streaming }: { step: ReasoningActivity; m
 	)
 }
 
-function ToolRow({ tool, marker, onCancelTool }: { tool: ToolActivity; marker?: ReactNode; onCancelTool?: (toolCallID: string) => void }) {
+function ToolRow({ tool, marker, onCancelTool, sessionNames }: { tool: ToolActivity; marker?: ReactNode; onCancelTool?: (toolCallID: string) => void; sessionNames?: Record<string, string> }) {
 	const argumentsObject = parseToolArguments(tool.arguments)
-	const target = toolTarget(tool.name, argumentsObject)
+	const isSessionTool = isSessionToolName(tool.name)
+	const target = isSessionTool ? sessionToolTarget(tool.name, argumentsObject, sessionNames) : toolTarget(tool.name, argumentsObject)
 	const command = tool.name === 'shell' ? stringField(argumentsObject, 'command') : ''
 	const patch = tool.name === 'apply_patch' ? stringField(argumentsObject, 'patch') : ''
 	const oldText = tool.name === 'edit_file' ? stringField(argumentsObject, 'old') : ''
 	const newText = tool.name === 'edit_file' ? stringField(argumentsObject, 'new') : ''
 	const showEditDiff = tool.name === 'edit_file' && Boolean(oldText)
 	const showPatch = Boolean(patch)
-	const showResult = Boolean(tool.result) && (tool.name !== 'edit_file' || tool.status === 'error')
-	const showDetails = Boolean(command || showPatch || showEditDiff || showResult)
+	// Session tools have no file/command affordance of their own; the expanded
+	// row instead shows the exact request arguments and the (JSON) result, so
+	// both sides of the orchestration call stay inspectable.
+	const showArguments = isSessionTool && Boolean(tool.arguments)
+	const result = isSessionTool && tool.result ? prettyJSONText(tool.result) : tool.result
+	const showResult = Boolean(result) && (tool.name !== 'edit_file' || tool.status === 'error')
+	const showDetails = Boolean(command || showPatch || showEditDiff || showArguments || showResult)
 	const cancelButton = tool.status === 'running' && onCancelTool
 		? <button className="tool-cancel-button" onClick={() => onCancelTool(tool.id)} title="Cancel this tool call" aria-label="Cancel tool">×</button>
 		: null
@@ -231,7 +239,8 @@ function ToolRow({ tool, marker, onCancelTool }: { tool: ToolActivity; marker?: 
 			{command && <div><span>Command</span><pre>{command}</pre></div>}
 			{showPatch && <AppliedPatchDiff patch={patch} />}
 			{showEditDiff && <EditFileDiff path={target} oldText={oldText} newText={newText} />}
-			{showResult && <div><span>{tool.name === 'edit_file' ? 'Error details' : 'Output'}</span><pre>{tool.result}</pre></div>}
+			{showArguments && <div><span>Arguments</span><pre>{prettyJSONText(tool.arguments ?? '')}</pre></div>}
+			{showResult && <div><span>{tool.name === 'edit_file' ? 'Error details' : 'Output'}</span><pre>{result}</pre></div>}
 		</div>
 	)
 	if (!showDetails) {

@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -446,14 +447,34 @@ func TestSessionToolsValidateArgumentsAtExecutorBoundary(t *testing.T) {
 			arguments: map[string]any{"session_id": child.ID, "max_output_chars": maximumSessionOutputMaxChars + 1},
 		},
 		{
-			name:      "history combines cursors",
+			name:      "history combines legacy cursors",
 			tool:      ToolSessionHistory,
 			arguments: map[string]any{"session_id": child.ID, "before_seq": 2, "after_seq": 1},
 		},
 		{
-			name:      "history explicit zero cursor",
+			name:      "history explicit zero legacy cursor",
 			tool:      ToolSessionHistory,
 			arguments: map[string]any{"session_id": child.ID, "before_seq": 0},
+		},
+		{
+			name:      "history cursor without direction",
+			tool:      ToolSessionHistory,
+			arguments: map[string]any{"session_id": child.ID, "cursor": 2},
+		},
+		{
+			name:      "history direction without cursor",
+			tool:      ToolSessionHistory,
+			arguments: map[string]any{"session_id": child.ID, "direction": "before"},
+		},
+		{
+			name:      "history unknown direction",
+			tool:      ToolSessionHistory,
+			arguments: map[string]any{"session_id": child.ID, "cursor": 2, "direction": "sideways"},
+		},
+		{
+			name:      "history cursor mixed with legacy cursor",
+			tool:      ToolSessionHistory,
+			arguments: map[string]any{"session_id": child.ID, "cursor": 2, "direction": "before", "before_seq": 1},
 		},
 		{
 			name:      "history over maximum limit",
@@ -510,7 +531,8 @@ func TestSessionHistoryReadsVisibleItemsWithPaginationAndProjectScope(t *testing
 
 	olderResult := executeSessionTool(t, executor, ToolSessionHistory, map[string]any{
 		"session_id": child.ID,
-		"before_seq": int(history["oldest_seq"].(float64)),
+		"cursor":     int(history["oldest_seq"].(float64)),
+		"direction":  "before",
 		"limit":      2,
 	})
 	olderPayload := decodeSessionToolPayload(t, olderResult)
@@ -520,8 +542,56 @@ func TestSessionHistoryReadsVisibleItemsWithPaginationAndProjectScope(t *testing
 		t.Fatalf("session_history older payload = %#v", olderPayload)
 	}
 
+	// The retired before_seq parameter keeps working and maps to the same page.
+	legacyResult := executeSessionTool(t, executor, ToolSessionHistory, map[string]any{
+		"session_id": child.ID,
+		"before_seq": int(history["oldest_seq"].(float64)),
+		"limit":      2,
+	})
+	legacyPayload := decodeSessionToolPayload(t, legacyResult)
+	legacyItems := payloadMap(t, legacyPayload, "history")["items"].([]any)
+	if len(legacyItems) != 1 || legacyItems[0].(map[string]any)["id"] != "message-0" {
+		t.Fatalf("session_history legacy before_seq payload = %#v", legacyPayload)
+	}
+
+	// direction=after reads items newer than the cursor.
+	newerResult := executeSessionTool(t, executor, ToolSessionHistory, map[string]any{
+		"session_id": child.ID,
+		"cursor":     int(olderItems[0].(map[string]any)["seq"].(float64)),
+		"direction":  "after",
+		"limit":      2,
+	})
+	newerPayload := decodeSessionToolPayload(t, newerResult)
+	newerItems := payloadMap(t, newerPayload, "history")["items"].([]any)
+	if len(newerItems) != 2 || newerItems[0].(map[string]any)["id"] != "message-1" || newerItems[1].(map[string]any)["id"] != "message-2" {
+		t.Fatalf("session_history newer payload = %#v", newerPayload)
+	}
+
 	outsideResult := executeSessionTool(t, executor, ToolSessionHistory, map[string]any{"session_id": outside.ID})
 	assertSessionToolErrorCode(t, outsideResult, "session_forbidden")
+}
+
+// Agents started before the cursor/direction contract still call with the
+// retired before_seq/after_seq pair; the conflict error must teach the
+// current contract so the next call self-corrects.
+func TestSessionHistoryLegacyCursorConflictTeachesCurrentContract(t *testing.T) {
+	service, parent, child, _ := newSessionToolTestSessions(t, t.TempDir(), fakeExecutionTurnRunner{supports: true})
+	executor := &sessionToolExecutor{service: service, caller: parent}
+
+	result := executeSessionTool(t, executor, ToolSessionHistory, map[string]any{
+		"session_id": child.ID,
+		"before_seq": 2,
+		"after_seq":  1,
+	})
+	assertSessionToolErrorCode(t, result, "invalid_arguments")
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(result.Content), &payload); err != nil {
+		t.Fatalf("decode error result %q: %v", result.Content, err)
+	}
+	message, _ := payload["error"].(string)
+	if !strings.Contains(message, "cursor") || !strings.Contains(message, "direction") {
+		t.Fatalf("session_history conflict error = %q, want it to teach cursor/direction", message)
+	}
 }
 
 func TestSessionToolsListModelsAndStartExplicitModel(t *testing.T) {
