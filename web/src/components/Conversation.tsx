@@ -305,7 +305,6 @@ export const Conversation = memo(function Conversation(props: {
               <span className={`status-dot ${props.compacting || props.activeRun || props.detail?.status === 'running' ? 'running' : ''} ${props.detail?.status === 'interrupted' ? 'interrupted' : ''}`} />
               <h1>{props.detail ? sessionName(props.detail) : 'Loading…'}</h1>
               {props.detail && <button className="message-tool-button copy-id-button" onClick={() => void copySessionID()} title="Copy project and session ID" aria-label="Copy project and session ID"><CopyIcon /></button>}
-              {props.detail?.status === 'interrupted' && !props.activeRun && <button className="message-tool-button" onClick={props.onRetry} title="Retry last turn"><RetryIcon /></button>}
             </div>
             {props.detail && <p>{props.detail.provider} / {props.detail.model_id}{props.detail.reasoning_level && ` · ${props.detail.reasoning_level}`}</p>}
           </div>
@@ -357,6 +356,11 @@ export const Conversation = memo(function Conversation(props: {
 		)}
 		{props.page && visibleItems.length === 0 && !props.activeRun && (
           <div className="conversation-empty"><SparkIcon /><h3>Start a new task</h3><p>Describe a goal, a problem, or the code you want to change.</p></div>
+        )}
+		{props.detail?.status === 'interrupted' && !props.activeRun && !props.turnError && (
+          <div className="conversation-retry">
+            <button className="message-tool-button" onClick={props.onRetry} title="Retry last turn"><RetryIcon />Retry last turn</button>
+          </div>
         )}
       </section>
 	  <QueuedPromptList prompts={props.activeRun?.queuedPrompts ?? []} onRemove={props.onRemoveQueuedPrompt} />

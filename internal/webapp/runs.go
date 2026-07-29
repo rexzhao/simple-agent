@@ -173,7 +173,7 @@ func (r *runRegistry) startWithInput(sessionID string, input execution.SessionMe
 	if sessionID == "" {
 		return nil, fmt.Errorf("session id is required")
 	}
-	if strings.TrimSpace(input.Content) == "" && len(input.ContentBlocks) == 0 && strings.TrimSpace(input.ReplayItemID) == "" {
+	if strings.TrimSpace(input.Content) == "" && len(input.ContentBlocks) == 0 && strings.TrimSpace(input.ReplayItemID) == "" && !input.Replay {
 		return nil, fmt.Errorf("message content or image attachment is required")
 	}
 	r.mu.Lock()
