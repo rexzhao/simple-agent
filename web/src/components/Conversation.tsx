@@ -333,6 +333,7 @@ export const Conversation = memo(function Conversation(props: {
 					<strong>Turn failed</strong>
 					<p>{props.turnError.message}</p>
 				</div>
+				<button className="message-tool-button" onClick={props.onRetry} title="Retry last turn"><RetryIcon />Retry</button>
 				<button className="turn-error-dismiss" onClick={props.onDismissTurnError} aria-label="Dismiss error" title="Dismiss">×</button>
 			</div>
 		)}
