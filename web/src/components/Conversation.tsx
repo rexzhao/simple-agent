@@ -211,6 +211,12 @@ export const Conversation = memo(function Conversation(props: {
 			setResendPending(false)
 		}
 	}, [props.onResend, resendPending])
+	const copySessionID = async () => {
+		if (!props.detail) return
+		try {
+			await copyText(`${props.detail.project_id} ${props.detail.id}`)
+		} catch { /* ignore copy errors */ }
+	}
 	// Sending is explicit intent to be at the bottom: re-engage following even
 	// when the user had scrolled up to read history.
 	const handleSend = useCallback(async (content: string, images: PastedImageAttachment[]): Promise<boolean> => {
@@ -301,6 +307,7 @@ export const Conversation = memo(function Conversation(props: {
         </div>
         <div className="header-actions">
 		  <span className={`status-pill ${props.compacting || props.activeRun || props.detail?.status === 'running' || props.otherSessionsRunning ? 'running' : ''}`}><span />{props.activeRun?.providerRetry ? 'Retrying request' : props.compacting || props.activeRun?.compaction?.status === 'running' ? 'Compacting context' : props.activeRun || props.detail?.status === 'running' ? 'Running' : props.otherSessionsRunning ? 'Another session running' : 'Ready'}</span>
+		  <button className="secondary-button copy-id-button" onClick={() => void copySessionID()} title="Copy project and session ID" aria-label="Copy project and session ID"><CopyIcon /></button>
 		  <button className="secondary-button" disabled={!props.detail || props.detail.status === 'running' || props.compacting || Boolean(props.activeRun)} onClick={props.onCompact}>{props.compacting ? 'Compacting…' : 'Compact context'}</button>
         </div>
       </header>
