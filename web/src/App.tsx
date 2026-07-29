@@ -101,16 +101,16 @@ function App() {
     return () => { cancelled = true }
   }, [])
 
-  const loadSessions = useCallback(async (projectID: string, preferredSessionID = '') => {
+  const loadSessions = useCallback(async (projectID: string, preferredSessionID = '', preserveSelection = false) => {
     if (!projectID) {
-      setSelectedSessionID('')
+      if (!preserveSelection) setSelectedSessionID('')
       return []
     }
     const [payload, archivedPayload] = await Promise.all([api.sessions(projectID), api.sessions(projectID, true)])
     const ordered = orderSessions(payload.sessions)
     setSessionsByProject((current) => ({ ...current, [projectID]: ordered }))
     setArchivedSessionsByProject((current) => ({ ...current, [projectID]: orderSessions(archivedPayload.sessions) }))
-    if (selectedProjectRef.current === projectID) {
+    if (!preserveSelection && selectedProjectRef.current === projectID) {
       setSelectedSessionID((current) => {
         const preferred = preferredSessionID || current
         if (preferred && ordered.some((session) => session.id === preferred)) return preferred
@@ -430,7 +430,7 @@ function App() {
 		// Refresh projects containing active runs as well as unknown runs. This
 		// discovers short-lived child sessions that may start and finish entirely
 		// between two coordinator polls while their parent is still running.
-		await Promise.all([...activeProjectIDs].map((projectID) => loadSessions(projectID)))
+		await Promise.all([...activeProjectIDs].map((projectID) => loadSessions(projectID, '', true)))
         if (!disposed) setRecoveredRuns(payload.runs)
       } catch {
         // Bootstrap and explicit actions surface errors. Background discovery
