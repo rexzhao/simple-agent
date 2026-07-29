@@ -299,13 +299,15 @@ export const Conversation = memo(function Conversation(props: {
     <div className="conversation">
       <header className="conversation-header">
         <div className="conversation-heading">
-          <h1>{props.detail ? sessionName(props.detail) : 'Loading…'}</h1>
-		  {props.detail && <button className="message-tool-button copy-id-button" onClick={() => void copySessionID()} title="Copy project and session ID" aria-label="Copy project and session ID"><CopyIcon /></button>}
+          <div className="conversation-title-row">
+            <h1>{props.detail ? sessionName(props.detail) : 'Loading…'}</h1>
+            {props.detail && <button className="message-tool-button copy-id-button" onClick={() => void copySessionID()} title="Copy project and session ID" aria-label="Copy project and session ID"><CopyIcon /></button>}
+          </div>
+          {props.detail && <p>{props.detail.provider} / {props.detail.model_id}{props.detail.reasoning_level && ` · ${props.detail.reasoning_level}`}</p>}
+        </div>
+        <div className="conversation-context-group">
 		  {props.detail && (
-			<div className="conversation-meta">
-			  <p>{props.detail.provider} / {props.detail.model_id}{props.detail.reasoning_level && ` · ${props.detail.reasoning_level}`}</p>
-			  <ContextUsage context={props.detail.context} activeInputTokens={props.activeRun?.inputTokens} activeCachedTokens={props.activeRun?.cachedTokens} activeCacheWriteTokens={props.activeRun?.cacheWriteTokens} compactedContextTokens={props.activeRun?.compaction?.status === 'completed' ? props.activeRun.compaction.activeContextTokens : undefined} />
-			</div>
+            <ContextUsage context={props.detail.context} activeInputTokens={props.activeRun?.inputTokens} activeCachedTokens={props.activeRun?.cachedTokens} activeCacheWriteTokens={props.activeRun?.cacheWriteTokens} compactedContextTokens={props.activeRun?.compaction?.status === 'completed' ? props.activeRun.compaction.activeContextTokens : undefined} />
 		  )}
         </div>
         <div className="header-actions">
