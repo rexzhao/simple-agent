@@ -34,6 +34,12 @@ type SessionItemsOptions struct {
 	BeforeSeq int64
 	AfterSeq  int64
 	Limit     int
+	// AlignTurn extends the page's oldest edge backwards so the page never
+	// starts mid-turn: with AlignTurn set, a latest or before page always
+	// contains at least one complete turn and may exceed Limit for long
+	// turns. AfterSeq pages are never extended (their oldest edge is an
+	// explicit cursor).
+	AlignTurn bool
 }
 
 type SessionItem struct {
@@ -258,7 +264,7 @@ func (s *Service) GetSessionChatItemsPage(id string, options SessionItemsOptions
 			filtered = append(filtered, item)
 		}
 	}
-	page, hasMoreBefore, hasMoreAfter := pagedSessionItems(filtered, options.BeforeSeq, options.AfterSeq, limit)
+	page, hasMoreBefore, hasMoreAfter := pagedSessionItems(filtered, options.BeforeSeq, options.AfterSeq, limit, options.AlignTurn)
 	items := make([]SessionItem, 0, len(page))
 	for _, item := range page {
 		dto, err := s.sessionItemDTO(item)
@@ -820,7 +826,7 @@ func recentSessionItems(items []sessions.SessionItem, limit int) ([]sessions.Ses
 	return items[len(items)-limit:], true
 }
 
-func pagedSessionItems(items []sessions.SessionItem, beforeSeq, afterSeq int64, limit int) ([]sessions.SessionItem, bool, bool) {
+func pagedSessionItems(items []sessions.SessionItem, beforeSeq, afterSeq int64, limit int, alignTurn bool) ([]sessions.SessionItem, bool, bool) {
 	start := 0
 	end := len(items)
 	if beforeSeq > 0 {
@@ -843,6 +849,15 @@ func pagedSessionItems(items []sessions.SessionItem, beforeSeq, afterSeq int64, 
 	pageStart := start
 	if end-pageStart > limit {
 		pageStart = end - limit
+	}
+	if alignTurn {
+		// Extend the oldest edge backwards until the page starts at a turn
+		// boundary, so a latest/before page never cuts a turn and always
+		// contains at least one complete turn. Items without a turn id are
+		// boundaries of their own and never trigger extension.
+		for pageStart > 0 && items[pageStart].TurnID != "" && items[pageStart-1].TurnID == items[pageStart].TurnID {
+			pageStart--
+		}
 	}
 	return items[pageStart:end], pageStart > 0, end < len(items)
 }

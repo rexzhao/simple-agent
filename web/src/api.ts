@@ -117,7 +117,10 @@ export const api = {
     method: 'DELETE',
   }),
   items: (sessionID: string, beforeSeq = 0) => {
-    const query = new URLSearchParams({ limit: '50' })
+    // align_turn keeps every page whole-turn aligned: the conversation never
+    // renders half a turn at the window's oldest edge, on initial load,
+    // refresh, or when paging older.
+    const query = new URLSearchParams({ limit: '50', align_turn: 'true' })
     if (beforeSeq > 0) query.set('before_seq', String(beforeSeq))
     return request<ItemsPage>(`/api/sessions/${encodeURIComponent(sessionID)}/items?${query}`)
   },

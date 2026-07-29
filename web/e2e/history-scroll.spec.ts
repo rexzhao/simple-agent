@@ -66,6 +66,36 @@ test('loads older history only on click and preserves the viewport anchor', asyn
   expect(olderCalls()).toBe(1)
 })
 
+test('requests history pages with turn alignment enabled', async ({ page }) => {
+  const itemQueries: string[] = []
+  await page.route('**/api/**', async (route: Route) => {
+    const url = new URL(route.request().url())
+    if (url.pathname === '/api/bootstrap') return json(route, { version: 'e2e', cwd: '/fixture', server_root: '/fixture', config_path: '/fixture/config' })
+    if (url.pathname === '/api/projects') return json(route, { projects: [project] })
+    if (url.pathname === `/api/projects/${project.id}/sessions`) return json(route, { sessions: url.searchParams.get('archived') === 'true' ? [] : [session] })
+    if (url.pathname === '/api/runs/active') return json(route, { runs: [] })
+    if (url.pathname === `/api/sessions/${session.id}`) return json(route, session)
+    if (url.pathname === `/api/sessions/${session.id}/items`) {
+      itemQueries.push(url.search)
+      if (url.searchParams.has('before_seq')) {
+        return json(route, { items: items(51, 100), oldest_seq: 51, newest_seq: 100, has_more_before: false, has_more_after: false })
+      }
+      return json(route, { items: items(101, 150), oldest_seq: 101, newest_seq: 150, has_more_before: true, has_more_after: false })
+    }
+    return json(route, { error: { code: 'not_mocked', message: `${route.request().method()} ${url.pathname}` } }, 404)
+  })
+  await page.goto('/')
+  await expect(page.getByText('message-150', { exact: true })).toBeAttached()
+  await page.getByRole('button', { name: 'Load earlier messages' }).click()
+  await expect(page.getByText('message-51', { exact: true })).toBeAttached()
+  // The latest page (initial load/refresh) and the older page (click) must
+  // both ask the server for turn-aligned pages.
+  expect(itemQueries.length).toBeGreaterThanOrEqual(2)
+  for (const query of itemQueries) {
+    expect(new URLSearchParams(query).get('align_turn')).toBe('true')
+  }
+})
+
 test('content-visibility does not cause a second jump when older messages become visible', async ({ page }) => {
   await mockApp(page, Promise.resolve())
   await page.goto('/')

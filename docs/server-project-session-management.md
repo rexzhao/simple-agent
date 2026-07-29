@@ -440,7 +440,7 @@ GET    /sessions/{session_id}
 PATCH  /sessions/{session_id}
 DELETE /sessions/{session_id}
 POST   /sessions/{session_id}/full-access
-GET    /sessions/{session_id}/items?before_seq=N&after_seq=N&limit=N&view=chat|debug
+GET    /sessions/{session_id}/items?before_seq=N&after_seq=N&limit=N&align_turn=false&view=chat|debug
 GET    /sessions/{session_id}/content/{blob_hash}
 POST   /sessions/{session_id}/messages
 POST   /sessions/{session_id}/commands/compact
@@ -454,6 +454,13 @@ agent child sessions, and rejected on archived sessions. With full access the
 file tools accept absolute paths outside the session workspace (relative
 paths stay anchored at the workspace). A toggle applies from the next turn:
 an in-flight run keeps the tool registry and schemas it started with.
+
+With `align_turn=true`, latest and `before_seq` pages are extended backwards
+to the nearest turn boundary, so a page never starts mid-turn and always
+contains at least one complete turn; such pages may exceed `limit` for long
+turns. `after_seq` pages are never extended. The Web conversation passes
+`align_turn=true` on every history fetch. The default `false` keeps the
+strict `limit` window for API consumers that need exact page sizes.
 
 `PATCH {"display_name":"..."}` renames active targets. `PATCH
 {"archived":true}` archives. `DELETE` removes archived targets only. `PATCH

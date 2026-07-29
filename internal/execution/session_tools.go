@@ -141,6 +141,10 @@ func sessionToolDefinitions() []model.Tool {
 					"minimum":     1,
 					"maximum":     maximumSessionChatItemsLimit,
 				},
+				"align_turn": map[string]any{
+					"type":        "boolean",
+					"description": "Align the page to whole turns: the oldest edge is extended backwards so the page never starts mid-turn and always contains at least one complete turn; it may exceed limit for long turns. Defaults to false.",
+				},
 			}, []any{"session_id"}),
 		},
 		{
@@ -503,10 +507,15 @@ func (e *sessionToolExecutor) history(toolName string, arguments map[string]any)
 	if err != nil {
 		return sessionToolError(toolName, "invalid_arguments", err.Error())
 	}
+	alignTurn, err := optionalSessionBool(arguments, "align_turn", false)
+	if err != nil {
+		return sessionToolError(toolName, "invalid_arguments", err.Error())
+	}
 	page, err := e.service.GetSessionChatItemsPage(target.ID, SessionItemsOptions{
 		BeforeSeq: int64(beforeSeq),
 		AfterSeq:  int64(afterSeq),
 		Limit:     limit,
+		AlignTurn: alignTurn,
 	})
 	if err != nil {
 		return sessionToolFailure(toolName, err)

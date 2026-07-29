@@ -571,6 +571,43 @@ func TestSessionHistoryReadsVisibleItemsWithPaginationAndProjectScope(t *testing
 	assertSessionToolErrorCode(t, outsideResult, "session_forbidden")
 }
 
+func TestSessionHistoryAlignTurn(t *testing.T) {
+	service, parent, child, _ := newSessionToolTestSessions(t, t.TempDir(), fakeExecutionTurnRunner{supports: true})
+	executor := &sessionToolExecutor{service: service, caller: parent}
+
+	for index, turn := range []string{"turn-1", "turn-1", "turn-2", "turn-2"} {
+		item := sessions.SessionItemFromMessage(fmt.Sprintf("message-%d", index), model.Message{
+			Role:    model.MessageRoleAssistant,
+			Content: fmt.Sprintf("content-%d", index),
+		})
+		item.TurnID = turn
+		if _, err := service.sessionStore.AppendItem(child.ID, item); err != nil {
+			t.Fatalf("AppendItem(%d) error = %v", index, err)
+		}
+	}
+
+	// The strict limit window starts mid-turn-1.
+	plainResult := executeSessionTool(t, executor, ToolSessionHistory, map[string]any{
+		"session_id": child.ID,
+		"limit":      3,
+	})
+	plainItems := payloadMap(t, decodeSessionToolPayload(t, plainResult), "history")["items"].([]any)
+	if len(plainItems) != 3 || plainItems[0].(map[string]any)["id"] != "message-1" {
+		t.Fatalf("session_history plain payload = %#v", plainItems)
+	}
+
+	// align_turn extends the oldest edge to the turn boundary.
+	alignedResult := executeSessionTool(t, executor, ToolSessionHistory, map[string]any{
+		"session_id": child.ID,
+		"limit":      3,
+		"align_turn": true,
+	})
+	alignedItems := payloadMap(t, decodeSessionToolPayload(t, alignedResult), "history")["items"].([]any)
+	if len(alignedItems) != 4 || alignedItems[0].(map[string]any)["id"] != "message-0" {
+		t.Fatalf("session_history aligned payload = %#v", alignedItems)
+	}
+}
+
 // Agents started before the cursor/direction contract still call with the
 // retired before_seq/after_seq pair; the conflict error must teach the
 // current contract so the next call self-corrects.

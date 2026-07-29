@@ -211,6 +211,113 @@ func TestSessionStreamBlockedCallbackDoesNotBlockRunner(t *testing.T) {
 	}
 }
 
+func TestGetSessionChatItemsPageAlignTurnExtendsToWholeTurns(t *testing.T) {
+	home := t.TempDir()
+	service, _, session := newExecutionServiceWithSession(t, home, fakeExecutionTurnRunner{supports: true})
+
+	// Layout: turn-1 = items 1-2, turn-2 = items 3-6, turn-3 = items 7-8.
+	turns := []string{"turn-1", "turn-1", "turn-2", "turn-2", "turn-2", "turn-2", "turn-3", "turn-3"}
+	for index, turn := range turns {
+		item := sessions.SessionItemFromMessage(fmt.Sprintf("msg-%d", index+1), model.Message{
+			Role:    model.MessageRoleUser,
+			Content: fmt.Sprintf("message-%d", index+1),
+		})
+		item.TurnID = turn
+		if _, err := service.sessionStore.AppendItem(session.ID, item); err != nil {
+			t.Fatalf("AppendItem(%d) error = %v", index+1, err)
+		}
+	}
+
+	// Default (align off): the strict limit window starts mid-turn-2.
+	plain, err := service.GetSessionChatItemsPage(session.ID, SessionItemsOptions{Limit: 4})
+	if err != nil {
+		t.Fatalf("GetSessionChatItemsPage(plain) error = %v", err)
+	}
+	if got := sessionItemContents(plain.Items); !sameStringSlice(got, []string{"message-5", "message-6", "message-7", "message-8"}) {
+		t.Fatalf("plain latest contents = %#v", got)
+	}
+
+	// align on: the oldest edge extends back to turn-2's first item, so the
+	// page exceeds the limit instead of cutting a turn.
+	aligned, err := service.GetSessionChatItemsPage(session.ID, SessionItemsOptions{Limit: 4, AlignTurn: true})
+	if err != nil {
+		t.Fatalf("GetSessionChatItemsPage(aligned) error = %v", err)
+	}
+	if got := sessionItemContents(aligned.Items); !sameStringSlice(got, []string{"message-3", "message-4", "message-5", "message-6", "message-7", "message-8"}) {
+		t.Fatalf("aligned latest contents = %#v", got)
+	}
+	if !aligned.HasMoreBefore || aligned.HasMoreAfter {
+		t.Fatalf("aligned latest flags = before %t after %t", aligned.HasMoreBefore, aligned.HasMoreAfter)
+	}
+
+	// A turn longer than the limit still comes back whole.
+	longTurn, err := service.GetSessionChatItemsPage(session.ID, SessionItemsOptions{Limit: 1, AlignTurn: true})
+	if err != nil {
+		t.Fatalf("GetSessionChatItemsPage(long turn) error = %v", err)
+	}
+	if got := sessionItemContents(longTurn.Items); !sameStringSlice(got, []string{"message-7", "message-8"}) {
+		t.Fatalf("long turn contents = %#v", got)
+	}
+
+	// An aligned before page that already starts at a turn boundary is unchanged.
+	before, err := service.GetSessionChatItemsPage(session.ID, SessionItemsOptions{BeforeSeq: aligned.OldestSeq, Limit: 2, AlignTurn: true})
+	if err != nil {
+		t.Fatalf("GetSessionChatItemsPage(before) error = %v", err)
+	}
+	if got := sessionItemContents(before.Items); !sameStringSlice(got, []string{"message-1", "message-2"}) {
+		t.Fatalf("aligned before contents = %#v", got)
+	}
+	if before.HasMoreBefore || !before.HasMoreAfter {
+		t.Fatalf("aligned before flags = before %t after %t", before.HasMoreBefore, before.HasMoreAfter)
+	}
+
+	// after pages keep their explicit oldest edge even with align on.
+	after, err := service.GetSessionChatItemsPage(session.ID, SessionItemsOptions{AfterSeq: before.NewestSeq, Limit: 4, AlignTurn: true})
+	if err != nil {
+		t.Fatalf("GetSessionChatItemsPage(after) error = %v", err)
+	}
+	if got := sessionItemContents(after.Items); !sameStringSlice(got, []string{"message-3", "message-4", "message-5", "message-6"}) {
+		t.Fatalf("aligned after contents = %#v", got)
+	}
+}
+
+func TestGetSessionChatItemsPageAlignTurnStopsAtMissingTurnID(t *testing.T) {
+	home := t.TempDir()
+	service, _, session := newExecutionServiceWithSession(t, home, fakeExecutionTurnRunner{supports: true})
+
+	// Layout: item 1 = turn-1, item 2 untagged (legacy data), items 3-4 = turn-2.
+	turns := []string{"turn-1", "", "turn-2", "turn-2"}
+	for index, turn := range turns {
+		item := sessions.SessionItemFromMessage(fmt.Sprintf("msg-%d", index+1), model.Message{
+			Role:    model.MessageRoleUser,
+			Content: fmt.Sprintf("message-%d", index+1),
+		})
+		item.TurnID = turn
+		if _, err := service.sessionStore.AppendItem(session.ID, item); err != nil {
+			t.Fatalf("AppendItem(%d) error = %v", index+1, err)
+		}
+	}
+
+	// An untagged window edge is a boundary of its own: extension must not
+	// pull the earlier turn-1 item across it.
+	latest, err := service.GetSessionChatItemsPage(session.ID, SessionItemsOptions{Limit: 3, AlignTurn: true})
+	if err != nil {
+		t.Fatalf("GetSessionChatItemsPage(latest) error = %v", err)
+	}
+	if got := sessionItemContents(latest.Items); !sameStringSlice(got, []string{"message-2", "message-3", "message-4"}) {
+		t.Fatalf("latest contents = %#v", got)
+	}
+
+	// Turn extension still applies within the tagged items themselves.
+	turnOnly, err := service.GetSessionChatItemsPage(session.ID, SessionItemsOptions{Limit: 1, AlignTurn: true})
+	if err != nil {
+		t.Fatalf("GetSessionChatItemsPage(turn only) error = %v", err)
+	}
+	if got := sessionItemContents(turnOnly.Items); !sameStringSlice(got, []string{"message-3", "message-4"}) {
+		t.Fatalf("turn only contents = %#v", got)
+	}
+}
+
 func TestGetSessionChatItemsPageSupportsBeforeAndAfterCursors(t *testing.T) {
 	home := t.TempDir()
 	service, _, session := newExecutionServiceWithSession(t, home, fakeExecutionTurnRunner{supports: true})

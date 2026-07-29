@@ -358,6 +358,7 @@ func (s *Server) handleSessionItems(w http.ResponseWriter, r *http.Request) {
 		BeforeSeq: queryInt64(r, "before_seq"),
 		AfterSeq:  queryInt64(r, "after_seq"),
 		Limit:     queryInt(r, "limit"),
+		AlignTurn: queryBool(r, "align_turn"),
 	}
 	page, err := s.service.GetSessionChatItemsPage(r.PathValue("sessionID"), options)
 	if err != nil {
