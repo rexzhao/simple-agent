@@ -301,6 +301,7 @@ export const Conversation = memo(function Conversation(props: {
         <div className="conversation-left-group">
           <div className="conversation-heading">
             <div className="conversation-title-row">
+              <span className={`status-dot ${props.compacting || props.activeRun || props.detail?.status === 'running' ? 'running' : ''}`} />
               <h1>{props.detail ? sessionName(props.detail) : 'Loading…'}</h1>
               {props.detail && <button className="message-tool-button copy-id-button" onClick={() => void copySessionID()} title="Copy project and session ID" aria-label="Copy project and session ID"><CopyIcon /></button>}
             </div>
@@ -321,7 +322,6 @@ export const Conversation = memo(function Conversation(props: {
 				Full access{props.detail.full_access ? ' · ON' : ''}
 			</button>
 		  )}
-		  <span className={`status-pill ${props.compacting || props.activeRun || props.detail?.status === 'running' || props.otherSessionsRunning ? 'running' : ''}`}><span />{props.activeRun?.providerRetry ? 'Retrying request' : props.compacting || props.activeRun?.compaction?.status === 'running' ? 'Compacting context' : props.activeRun || props.detail?.status === 'running' ? 'Running' : props.otherSessionsRunning ? 'Another session running' : 'Ready'}</span>
 		  <button className="secondary-button" disabled={!props.detail || props.detail.status === 'running' || props.compacting || Boolean(props.activeRun)} onClick={props.onCompact}>{props.compacting ? 'Compacting…' : 'Compact context'}</button>
         </div>
       </header>

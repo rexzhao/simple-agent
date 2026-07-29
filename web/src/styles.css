@@ -304,6 +304,8 @@ svg { width: 1.1em; height: 1.1em; fill: none; stroke: currentColor; stroke-widt
 .status-pill span { width: 8px; height: 8px; border: 2px solid var(--border); background: #22c55e; }
 .status-pill.running { background: var(--accent); }
 .status-pill.running span { background: #ffffff; animation: pulse 1.2s infinite; }
+.status-dot { width: 8px; height: 8px; flex: 0 0 auto; border: 2px solid var(--border); background: #22c55e; align-self: center; }
+.status-dot.running { background: #ffffff; border-color: var(--accent); animation: pulse 1.2s infinite; }
 .compaction-status { width: min(700px, 100%); display: flex; align-items: center; gap: 9px; margin: 0 0 20px; padding: 10px 12px; border: 2px solid var(--border); background: var(--accent-soft); font-size: 11px; font-weight: 750; }
 .compaction-status span { width: 9px; height: 9px; flex: 0 0 auto; border: 2px solid var(--border); background: var(--accent); animation: pulse 1.2s infinite; }
 .compaction-status.completed { background: var(--success-soft); }
