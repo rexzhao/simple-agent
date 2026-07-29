@@ -8,6 +8,7 @@ import (
 	"net"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -118,6 +119,16 @@ type SessionDetail struct {
 	FullAccess        bool                   `json:"full_access"`
 	Context           contextwindow.Metadata `json:"context"`
 	SaveToolResults   bool                   `json:"save_tool_results"`
+}
+
+// SessionSnapshot is the single-load aggregate returned by the snapshot
+// endpoint. Revision is the session LastSeq formatted as a decimal string so
+// the browser can compare it without losing int64 precision.
+type SessionSnapshot struct {
+	SessionID string           `json:"session_id"`
+	Revision  string           `json:"revision"`
+	Session   SessionDetail    `json:"session"`
+	History   SessionItemsPage `json:"history"`
 }
 
 type SessionCreateMetadata struct {
@@ -681,6 +692,31 @@ func (s *Service) GetSession(id string) (SessionDetail, error) {
 		return SessionDetail{}, err
 	}
 	return sessionDetailFromStore(session), nil
+}
+
+// GetSessionSnapshot loads a session once and returns its detail, history
+// page, and a revision (LastSeq as a decimal string) in a single response.
+// This avoids the mixed state that results from separate detail and items
+// loads racing with compaction or run settlement.
+func (s *Service) GetSessionSnapshot(id string) (SessionSnapshot, error) {
+	if s == nil || s.sessionStore == nil {
+		return SessionSnapshot{}, fmt.Errorf("execution session store is not configured")
+	}
+	session, err := s.sessionStore.Load(id)
+	if err != nil {
+		return SessionSnapshot{}, err
+	}
+	detail := sessionDetailFromStore(session)
+	history, err := s.buildItemsPage(session, 0, 0, defaultSessionChatItemsLimit, true)
+	if err != nil {
+		return SessionSnapshot{}, err
+	}
+	return SessionSnapshot{
+		SessionID: id,
+		Revision:  strconv.FormatInt(session.LastSeq, 10),
+		Session:   detail,
+		History:   history,
+	}, nil
 }
 
 func (s *Service) RenameSession(id, displayName string) (SessionDetail, error) {

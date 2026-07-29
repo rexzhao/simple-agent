@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -452,3 +453,115 @@ func providerSettingsByName(providers []execution.ProviderSettings, name string)
 
 var _ execution.SessionIncrementalSupporter = enteredBlockingWebTestRunner{}
 var _ execution.SessionTurnRunner = enteredBlockingWebTestRunner{}
+
+func TestServerSessionSnapshot(t *testing.T) {
+	server, service := newWebTestServer(t)
+	root := t.TempDir()
+
+	// Create project + session + run (to produce durable items).
+	created := doJSONRequest(t, http.MethodPost, server.URL+"/api/projects", map[string]string{
+		"root":         root,
+		"display_name": "Snapshot Test",
+	})
+	var projectResult execution.ProjectCreateResult
+	decodeResponse(t, created, &projectResult)
+
+	created = doJSONRequest(t, http.MethodPost, server.URL+"/api/projects/"+projectResult.Project.ID+"/sessions", map[string]string{
+		"provider":      "fake",
+		"model_profile": "precise",
+	})
+	var session execution.SessionDetail
+	decodeResponse(t, created, &session)
+
+	// Start a run to produce durable items.
+	created = doJSONRequest(t, http.MethodPost, server.URL+"/api/sessions/"+session.ID+"/runs", map[string]string{"content": "hi"})
+	var run struct {
+		ID string `json:"run_id"`
+	}
+	decodeResponse(t, created, &run)
+
+	// Wait for the run to settle by polling items, then add a small delay
+	// to avoid racing with the session store's final metadata write on Windows.
+	deadline := time.Now().Add(5 * time.Second)
+	var chatPage execution.SessionItemsPage
+	for time.Now().Before(deadline) {
+		chatPage, _ = service.GetSessionChatItems(session.ID)
+		if len(chatPage.Items) >= 2 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if len(chatPage.Items) < 2 {
+		t.Fatalf("expected at least 2 chat items, got %d", len(chatPage.Items))
+	}
+	time.Sleep(50 * time.Millisecond)
+
+	// Fetch the snapshot (retry once to tolerate transient file-lock on Windows).
+	var snapshot execution.SessionSnapshot
+	for attempt := 0; attempt < 3; attempt++ {
+		response := doJSONRequest(t, http.MethodGet, server.URL+"/api/sessions/"+session.ID+"/snapshot", nil)
+		if response.StatusCode == http.StatusOK {
+			decodeResponse(t, response, &snapshot)
+			break
+		}
+		if attempt == 2 {
+			t.Fatalf("GET snapshot status = %d body=%s", response.StatusCode, readBody(response))
+		}
+		response.Body.Close()
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	// Verify identity.
+	if snapshot.SessionID != session.ID {
+		t.Fatalf("snapshot session_id = %q, want %q", snapshot.SessionID, session.ID)
+	}
+
+	// Verify revision = LastSeq (as decimal string).
+	detail, err := service.GetSession(session.ID)
+	if err != nil {
+		t.Fatalf("GetSession() error = %v", err)
+	}
+	wantRevision := strconv.FormatInt(detail.LastSeq, 10)
+	if snapshot.Revision != wantRevision {
+		t.Fatalf("snapshot revision = %q, want %q (LastSeq=%d)", snapshot.Revision, wantRevision, detail.LastSeq)
+	}
+
+	// Verify session detail matches.
+	if snapshot.Session.ID != session.ID {
+		t.Fatalf("snapshot session.id = %q, want %q", snapshot.Session.ID, session.ID)
+	}
+	if snapshot.Session.LastSeq != detail.LastSeq {
+		t.Fatalf("snapshot session.last_seq = %d, want %d", snapshot.Session.LastSeq, detail.LastSeq)
+	}
+
+	// Verify history matches GetSessionChatItems.
+	if len(snapshot.History.Items) != len(chatPage.Items) {
+		t.Fatalf("snapshot history items = %d, want %d", len(snapshot.History.Items), len(chatPage.Items))
+	}
+	if snapshot.History.NewestSeq != chatPage.NewestSeq {
+		t.Fatalf("snapshot history newest_seq = %d, want %d", snapshot.History.NewestSeq, chatPage.NewestSeq)
+	}
+
+	// Verify revision is a string (not a number) in raw JSON.
+	var rawBody string
+	for attempt := 0; attempt < 3; attempt++ {
+		rawResponse := doJSONRequest(t, http.MethodGet, server.URL+"/api/sessions/"+session.ID+"/snapshot", nil)
+		rawBody = readBody(rawResponse)
+		if strings.Contains(rawBody, `"revision":"`) {
+			break
+		}
+		if attempt == 2 {
+			t.Fatalf("snapshot raw JSON does not contain revision as string: %s", rawBody)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if !strings.Contains(rawBody, `"revision":"`+wantRevision+`"`) {
+		t.Fatalf("snapshot raw JSON does not contain revision as string %q: %s", wantRevision, rawBody)
+	}
+
+	// Verify snapshot for non-existent session returns not_found.
+	notFoundResponse := doJSONRequest(t, http.MethodGet, server.URL+"/api/sessions/nonexistent/snapshot", nil)
+	if notFoundResponse.StatusCode != http.StatusNotFound || responseErrorCode(t, notFoundResponse) != "not_found" {
+		t.Fatalf("GET snapshot nonexistent status = %d, want 404 not_found", notFoundResponse.StatusCode)
+	}
+}

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -1312,6 +1313,86 @@ func TestServiceSendSessionMessageReturnsBusyForHeldWriteLock(t *testing.T) {
 	_, err = service.SendSessionMessage(context.Background(), session.ID, "busy")
 	if !errors.Is(err, ErrSessionBusy) {
 		t.Fatalf("SendSessionMessage(locked) error = %v, want ErrSessionBusy", err)
+	}
+}
+
+func TestServiceGetSessionSnapshot(t *testing.T) {
+	home := t.TempDir()
+	service, err := NewService(home)
+	if err != nil {
+		t.Fatalf("NewService() error = %v", err)
+	}
+	projectRoot := mkdirProjectRoot(t, "repo")
+	project, err := service.CreateProject(projectRoot, "Repo")
+	if err != nil {
+		t.Fatalf("CreateProject() error = %v", err)
+	}
+	session, err := service.CreateSession(project.Project.ID, SessionCreateMetadata{
+		CreatedCWD:    project.Project.Root,
+		Provider:      "fake",
+		ModelProfile:  "default",
+		ModelID:       "model",
+	})
+	if err != nil {
+		t.Fatalf("CreateSession() error = %v", err)
+	}
+
+	// Snapshot of an empty session: revision = "0".
+	snapshot, err := service.GetSessionSnapshot(session.ID)
+	if err != nil {
+		t.Fatalf("GetSessionSnapshot() error = %v", err)
+	}
+	if snapshot.SessionID != session.ID {
+		t.Fatalf("snapshot SessionID = %q, want %q", snapshot.SessionID, session.ID)
+	}
+	if snapshot.Revision != "0" {
+		t.Fatalf("empty session revision = %q, want 0", snapshot.Revision)
+	}
+	if snapshot.Session.ID != session.ID {
+		t.Fatalf("snapshot Session.ID = %q, want %q", snapshot.Session.ID, session.ID)
+	}
+	if len(snapshot.History.Items) != 0 {
+		t.Fatalf("empty session history items = %d, want 0", len(snapshot.History.Items))
+	}
+
+	// Add a turn with visible items via SaveTurn.
+	stored, err := service.sessionStore.Load(session.ID)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	userItem := sessions.SessionItemFromMessage("item-user-1", model.Message{Role: model.MessageRoleUser, Content: "hello"})
+	userItem.TurnID = "turn-1"
+	asstItem := sessions.SessionItemFromMessage("item-asst-1", model.Message{Role: model.MessageRoleAssistant, Content: "hi there"})
+	asstItem.TurnID = "turn-1"
+	saved, err := service.sessionStore.SaveTurn(stored, []sessions.SessionItem{userItem, asstItem}, nil)
+	if err != nil {
+		t.Fatalf("SaveTurn() error = %v", err)
+	}
+
+	// Snapshot after items: revision should match LastSeq (as string), history should have items.
+	snapshot, err = service.GetSessionSnapshot(session.ID)
+	if err != nil {
+		t.Fatalf("GetSessionSnapshot() after SaveTurn error = %v", err)
+	}
+	wantRevision := strconv.FormatInt(saved.LastSeq, 10)
+	if snapshot.Revision != wantRevision {
+		t.Fatalf("snapshot revision after SaveTurn = %q, want %q (LastSeq=%d)", snapshot.Revision, wantRevision, saved.LastSeq)
+	}
+	if snapshot.Session.LastSeq != saved.LastSeq {
+		t.Fatalf("snapshot Session.LastSeq = %d, want %d", snapshot.Session.LastSeq, saved.LastSeq)
+	}
+	if len(snapshot.History.Items) != 2 {
+		t.Fatalf("snapshot history items = %d, want 2", len(snapshot.History.Items))
+	}
+	if snapshot.History.NewestSeq < 1 {
+		t.Fatalf("snapshot history NewestSeq = %d, expected > 0", snapshot.History.NewestSeq)
+	}
+	// NewestSeq is the seq of the last visible chat item; LastSeq includes
+	// transaction records (begin/commit/active_history_replaced), so
+	// NewestSeq < LastSeq. This is the key distinction that makes
+	// session.last_seq the correct settlement watermark, not history.newest_seq.
+	if snapshot.History.NewestSeq >= saved.LastSeq {
+		t.Fatalf("snapshot history NewestSeq = %d should be < LastSeq = %d", snapshot.History.NewestSeq, saved.LastSeq)
 	}
 }
 

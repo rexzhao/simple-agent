@@ -109,6 +109,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /api/projects/{projectID}/sessions", s.handleListSessions)
 	s.mux.HandleFunc("POST /api/projects/{projectID}/sessions", s.handleCreateSession)
 	s.mux.HandleFunc("GET /api/sessions/{sessionID}", s.handleGetSession)
+	s.mux.HandleFunc("GET /api/sessions/{sessionID}/snapshot", s.handleGetSessionSnapshot)
 	s.mux.HandleFunc("PATCH /api/sessions/{sessionID}", s.handleRenameSession)
 	s.mux.HandleFunc("POST /api/sessions/{sessionID}/full-access", s.handleSetSessionFullAccess)
 	s.mux.HandleFunc("POST /api/sessions/{sessionID}/archive", s.handleArchiveSession)
@@ -294,6 +295,15 @@ func (s *Server) handleGetSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, session)
+}
+
+func (s *Server) handleGetSessionSnapshot(w http.ResponseWriter, r *http.Request) {
+	snapshot, err := s.service.GetSessionSnapshot(r.PathValue("sessionID"))
+	if err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, snapshot)
 }
 
 func (s *Server) handleRenameSession(w http.ResponseWriter, r *http.Request) {

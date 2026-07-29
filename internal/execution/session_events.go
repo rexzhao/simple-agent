@@ -257,14 +257,20 @@ func (s *Service) GetSessionChatItemsPage(id string, options SessionItemsOptions
 	if err != nil {
 		return SessionItemsPage{}, err
 	}
+	return s.buildItemsPage(session, options.BeforeSeq, options.AfterSeq, limit, options.AlignTurn)
+}
 
+// buildItemsPage derives a chat items page from an already-loaded session
+// without re-reading the store. Shared by GetSessionChatItemsPage and
+// GetSessionSnapshot so both see the same items for a single load.
+func (s *Service) buildItemsPage(session sessions.SessionV2, beforeSeq, afterSeq int64, limit int, alignTurn bool) (SessionItemsPage, error) {
 	filtered := make([]sessions.SessionItem, 0, len(session.Items))
 	for _, item := range session.Items {
 		if sessionItemVisibleInChat(item) {
 			filtered = append(filtered, item)
 		}
 	}
-	page, hasMoreBefore, hasMoreAfter := pagedSessionItems(filtered, options.BeforeSeq, options.AfterSeq, limit, options.AlignTurn)
+	page, hasMoreBefore, hasMoreAfter := pagedSessionItems(filtered, beforeSeq, afterSeq, limit, alignTurn)
 	items := make([]SessionItem, 0, len(page))
 	for _, item := range page {
 		dto, err := s.sessionItemDTO(item)
