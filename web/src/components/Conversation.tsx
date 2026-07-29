@@ -39,6 +39,7 @@ export const Conversation = memo(function Conversation(props: {
   onSend: (content: string, images: PastedImageAttachment[]) => Promise<boolean>
   onCancel: () => void
   onCancelTool: (toolCallID: string) => void
+  onRetry: () => void
   onToggleFullAccess: () => void
   onRemoveQueuedPrompt: (promptID: string) => void
   onCompact: () => void
@@ -301,9 +302,10 @@ export const Conversation = memo(function Conversation(props: {
         <div className="conversation-left-group">
           <div className="conversation-heading">
             <div className="conversation-title-row">
-              <span className={`status-dot ${props.compacting || props.activeRun || props.detail?.status === 'running' ? 'running' : ''}`} />
+              <span className={`status-dot ${props.compacting || props.activeRun || props.detail?.status === 'running' ? 'running' : ''} ${props.detail?.status === 'interrupted' ? 'interrupted' : ''}`} />
               <h1>{props.detail ? sessionName(props.detail) : 'Loading…'}</h1>
               {props.detail && <button className="message-tool-button copy-id-button" onClick={() => void copySessionID()} title="Copy project and session ID" aria-label="Copy project and session ID"><CopyIcon /></button>}
+              {props.detail?.status === 'interrupted' && !props.activeRun && <button className="message-tool-button" onClick={props.onRetry} title="Retry last turn"><RetryIcon /></button>}
             </div>
             {props.detail && <p>{props.detail.provider} / {props.detail.model_id}{props.detail.reasoning_level && ` · ${props.detail.reasoning_level}`}</p>}
           </div>
@@ -343,6 +345,16 @@ export const Conversation = memo(function Conversation(props: {
 				<button className="turn-error-dismiss" onClick={props.onDismissTurnError} aria-label="Dismiss error" title="Dismiss">×</button>
 			</div>
 		)}
+		{!props.turnError && props.detail?.status === 'interrupted' && !props.activeRun && (
+			<div className="turn-error" role="alert">
+				<WarningIcon />
+				<div className="turn-error-copy">
+					<strong>Session interrupted</strong>
+					<p>The last turn did not complete. You can retry it.</p>
+				</div>
+				<button className="turn-error-dismiss" onClick={props.onDismissTurnError} aria-label="Dismiss" title="Dismiss">×</button>
+			</div>
+		)}
 		{props.page && visibleItems.length === 0 && !props.activeRun && (
           <div className="conversation-empty"><SparkIcon /><h3>Start a new task</h3><p>Describe a goal, a problem, or the code you want to change.</p></div>
         )}
@@ -373,7 +385,8 @@ export const Conversation = memo(function Conversation(props: {
   previous.otherSessionsRunning === next.otherSessionsRunning &&
   previous.recentStepsByTurn === next.recentStepsByTurn &&
   previous.sessionNames === next.sessionNames &&
-  previous.onCancelTool === next.onCancelTool)
+  previous.onCancelTool === next.onCancelTool &&
+  previous.onRetry === next.onRetry)
 
 function ContextUsage(props: { context: Session['context']; activeInputTokens?: number; activeCachedTokens?: number; activeCacheWriteTokens?: number; compactedContextTokens?: number }) {
 	const context = props.context

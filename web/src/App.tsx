@@ -553,6 +553,34 @@ function App() {
     }
   }
 
+  const retryRun = useCallback(async (): Promise<boolean> => {
+    if (!selectedSessionID) return false
+    const sessionID = selectedSessionID
+    try {
+      const started = await api.retryRun(sessionID)
+      addActiveRun({
+        id: started.run_id,
+        sessionID,
+        userText: '',
+        userImages: [],
+        assistantText: '',
+        steps: [],
+        agentIteration: 0,
+        status: 'running',
+      })
+      clearTurnError(sessionID)
+      void streamRun(started.run_id, (event) => handleRunEvent(sessionID, started.run_id, event)).catch((reason: unknown) => {
+        const runID = activeRunsRef.current[sessionID]?.id
+        if (runID) updateActiveRun(sessionID, runID, () => null)
+        setError(errorMessage(reason))
+      })
+      return true
+    } catch (reason) {
+      setError(errorMessage(reason))
+      return false
+    }
+  }, [selectedSessionID])
+
   const cancelRun = async () => {
     const run = activeRunsRef.current[selectedSessionID]
     if (!run) return
@@ -664,6 +692,7 @@ function App() {
             onSend={(content, images) => sendMessage(content, images)}
             onCancel={() => void cancelRun()}
             onCancelTool={(toolCallID) => void cancelToolCall(toolCallID)}
+            onRetry={() => void retryRun()}
             onRemoveQueuedPrompt={(promptID) => void removeQueuedPrompt(promptID)}
             onCompact={() => void compactSession()}
             onToggleFullAccess={() => sessionDetail && void toggleFullAccess(sessionDetail)}

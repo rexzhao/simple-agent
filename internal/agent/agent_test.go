@@ -100,7 +100,7 @@ func TestStreamRetriesServerErrorBeforeAnyProviderProgress(t *testing.T) {
 			found = true
 		}
 	}
-	if !found || retry.Attempt != 2 || retry.MaxAttempts != 3 {
+	if !found || retry.Attempt != 2 || retry.MaxAttempts != 5 {
 		t.Fatalf("retry event = %#v, found=%v", retry, found)
 	}
 }

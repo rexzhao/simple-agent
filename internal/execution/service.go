@@ -162,6 +162,10 @@ type SessionMessageInput struct {
 	// ReplayItemID starts a turn from the already-persisted active history.
 	// It must identify the trailing user message; no new user item is appended.
 	ReplayItemID string
+	// Replay retries an interrupted turn by resending the entire persisted
+	// active history (including tool results) to the model without appending
+	// new input. It does not require a trailing user message.
+	Replay bool
 }
 
 // Message builds the model-facing user message. When attachments exist the
@@ -1379,6 +1383,18 @@ func (s *Service) ValidateSessionMessageInput(id string, input SessionMessageInp
 }
 
 func (s *Service) validateSessionMessageInput(session sessions.SessionV2, input SessionMessageInput) error {
+	if input.Replay {
+		if strings.TrimSpace(input.Content) != "" || len(input.ContentBlocks) != 0 {
+			return fmt.Errorf("replay cannot include new message content")
+		}
+		if strings.TrimSpace(input.ReplayItemID) != "" {
+			return fmt.Errorf("replay and replay_item_id are mutually exclusive")
+		}
+		if len(session.ActiveHistory) == 0 {
+			return fmt.Errorf("replay requires existing active history")
+		}
+		return nil
+	}
 	if strings.TrimSpace(input.ReplayItemID) != "" {
 		if strings.TrimSpace(input.Content) != "" || len(input.ContentBlocks) != 0 {
 			return fmt.Errorf("replay cannot include new message content")
@@ -1447,7 +1463,7 @@ func (s *Service) runSessionMessage(ctx context.Context, id string, input Sessio
 	if s == nil || s.sessionStore == nil {
 		return SessionMessageResult{}, fmt.Errorf("execution session store is not configured")
 	}
-	if strings.TrimSpace(content) == "" && len(input.ContentBlocks) == 0 && strings.TrimSpace(input.ReplayItemID) == "" {
+	if strings.TrimSpace(content) == "" && len(input.ContentBlocks) == 0 && strings.TrimSpace(input.ReplayItemID) == "" && !input.Replay {
 		return SessionMessageResult{}, fmt.Errorf("message content or image attachment is required")
 	}
 	if s.turnRunner == nil {
@@ -1584,7 +1600,7 @@ func (s *Service) runSessionMessage(ctx context.Context, id string, input Sessio
 		markFailed(turnFailureCompaction)
 		return SessionMessageResult{}, err
 	}
-	if input.ReplayItemID == "" {
+	if !input.Replay && input.ReplayItemID == "" {
 		if err := bus.Publish(eventbus.TurnInputReady{TurnID: turnID, Message: input.Message()}); err != nil {
 			markFailed(turnFailureTurnInput)
 			return SessionMessageResult{}, fmt.Errorf("could not save turn input")
@@ -1599,7 +1615,7 @@ func (s *Service) runSessionMessage(ctx context.Context, id string, input Sessio
 		TurnID:            turnID,
 		Content:           content,
 		ContentBlocks:     copyInputContentBlocks(input.ContentBlocks),
-		ReplayHistory:     input.ReplayItemID != "",
+		ReplayHistory:     input.ReplayItemID != "" || input.Replay,
 		ActivePromptDrain: activePromptDrain,
 		ToolCancel:        runToolCancel(run),
 		Emit: func(event model.Event) {
@@ -1757,7 +1773,7 @@ func (s *Service) planAutoCompaction(ctx context.Context, bus eventbus.Publisher
 		TurnID:         turnID,
 		Content:        input.Content,
 		ContentBlocks:  copyInputContentBlocks(input.ContentBlocks),
-		ReplayHistory:  input.ReplayItemID != "",
+		ReplayHistory:  input.ReplayItemID != "" || input.Replay,
 		OnCompactionStarted: func(trigger string) {
 			submitSessionStreamEvent(submit, NewSessionStreamEvent("compaction.started", map[string]any{
 				"turn_id": turnID,

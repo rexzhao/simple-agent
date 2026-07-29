@@ -18,7 +18,7 @@ import (
 const DefaultMaxTurns = 8
 
 var providerRetryBackoff = func(attempt int) time.Duration {
-	return time.Duration(1<<(attempt-1)) * time.Second
+	return time.Duration(5*(1<<(attempt-1))) * time.Second
 }
 
 type ToolExecutor interface {
@@ -316,7 +316,7 @@ func streamModelTurn(ctx context.Context, provider model.Provider, request model
 	var reasoningContent strings.Builder
 	var toolCalls []model.ToolCall
 	var responseState *model.ResponseState
-	const maxAttempts = 3
+	const maxAttempts = 5
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		stream, err := provider.Stream(ctx, request)
 		if err != nil {
