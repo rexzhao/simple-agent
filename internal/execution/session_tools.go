@@ -27,8 +27,7 @@ const (
 
 	maximumAgentSessionSpawnDepth  = 4
 	maximumSessionDisplayNameRunes = 120
-	defaultSessionWaitTimeout      = 30 * time.Second
-	maximumSessionWaitTimeout      = 30 * time.Second
+	defaultSessionWaitTimeout = 30 * time.Second
 )
 
 // IsSessionTool reports whether name belongs to the durable session
@@ -175,7 +174,6 @@ func sessionToolDefinitions() []model.Tool {
 					"type":        "integer",
 					"description": "Maximum wait in milliseconds; defaults to 30000.",
 					"minimum":     0,
-					"maximum":     int(maximumSessionWaitTimeout / time.Millisecond),
 				},
 				"max_output_chars": map[string]any{
 					"type":        "integer",
@@ -561,15 +559,12 @@ func (e *sessionToolExecutor) wait(ctx context.Context, toolName string, argumen
 	if target.ID == e.caller.ID {
 		return sessionToolError(toolName, "self_wait_forbidden", "a session cannot wait for its own active run")
 	}
-	timeoutMS, err := optionalSessionIntegerInRange(
-		arguments,
-		"timeout_ms",
-		int(defaultSessionWaitTimeout/time.Millisecond),
-		0,
-		int(maximumSessionWaitTimeout/time.Millisecond),
-	)
+	timeoutMS, err := optionalSessionInteger(arguments, "timeout_ms", int(defaultSessionWaitTimeout/time.Millisecond))
 	if err != nil {
 		return sessionToolError(toolName, "invalid_arguments", err.Error())
+	}
+	if _, supplied := arguments["timeout_ms"]; supplied && timeoutMS < 0 {
+		return sessionToolError(toolName, "invalid_arguments", "timeout_ms must be non-negative")
 	}
 	maxOutputChars, err := optionalSessionIntegerInRange(arguments, "max_output_chars", 0, 1, maximumSessionOutputMaxChars)
 	if err != nil {

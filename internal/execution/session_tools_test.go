@@ -466,11 +466,6 @@ func TestSessionToolsValidateArgumentsAtExecutorBoundary(t *testing.T) {
 			arguments: map[string]any{"session_id": child.ID, "timeout_ms": -1},
 		},
 		{
-			name:      "wait over maximum timeout",
-			tool:      ToolSessionWait,
-			arguments: map[string]any{"session_id": child.ID, "timeout_ms": int(maximumSessionWaitTimeout/time.Millisecond) + 1},
-		},
-		{
 			name:      "wait explicit zero output limit",
 			tool:      ToolSessionWait,
 			arguments: map[string]any{"session_id": child.ID, "max_output_chars": 0},
