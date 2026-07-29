@@ -30,10 +30,11 @@ func TestServiceProviderSettingsLifecycleAndModelDiscovery(t *testing.T) {
 
 	service := newProviderSettingsTestService(t)
 	input := ProviderSettingsInput{
-		Name:           "remote",
-		BaseURL:        providerServer.URL + "/v1/",
-		APIKey:         "discovery-secret",
-		RequestTimeout: "45s",
+		Name:                  "remote",
+		BaseURL:               providerServer.URL + "/v1/",
+		APIKey:                "discovery-secret",
+		RequestTimeout:        "45s",
+		MaxConcurrentRequests: 3,
 		Models: []ProviderModelSettings{
 			{Profile: "main", ID: "configured-main", Type: config.ProviderTypeOpenAIChat, Input: []string{"text", "image"}, DeveloperRole: "developer"},
 			{Profile: "text", ID: "configured-text", Type: config.ProviderTypeOpenAIChat, Input: []string{"text"}},
@@ -50,6 +51,9 @@ func TestServiceProviderSettingsLifecycleAndModelDiscovery(t *testing.T) {
 	if created.Name != input.Name || created.APIKey != "" || !created.APIKeyConfigured || len(created.Models) != 2 {
 		t.Fatalf("created provider = %#v, want hidden configured API key and two models", created)
 	}
+	if created.MaxConcurrentRequests != 3 {
+		t.Fatalf("created provider MaxConcurrentRequests = %d, want 3", created.MaxConcurrentRequests)
+	}
 
 	input.APIKey = ""
 	input.KeepAPIKey = true
@@ -60,6 +64,9 @@ func TestServiceProviderSettingsLifecycleAndModelDiscovery(t *testing.T) {
 	}
 	if document.Providers[0].Models[0].ID != "updated-main" || !document.Providers[0].APIKeyConfigured {
 		t.Fatalf("updated provider = %#v, want updated model and retained API key", document.Providers[0])
+	}
+	if document.Providers[0].MaxConcurrentRequests != 3 {
+		t.Fatalf("updated provider MaxConcurrentRequests = %d, want 3", document.Providers[0].MaxConcurrentRequests)
 	}
 
 	document, err = service.UpdateDefaultProviderModel("remote", "main")
@@ -92,6 +99,9 @@ func TestServiceProviderSettingsLifecycleAndModelDiscovery(t *testing.T) {
 	}
 	if !strings.Contains(string(data), "api_key: discovery-secret") || !strings.Contains(string(data), "id: updated-main") {
 		t.Fatalf("persisted provider = %s, want retained secret and updated model", data)
+	}
+	if !strings.Contains(string(data), "max_concurrent_requests: 3") {
+		t.Fatalf("persisted provider = %s, want max_concurrent_requests: 3", data)
 	}
 	if _, err := service.CreateProviderSettings(input); err == nil || !strings.Contains(err.Error(), "already exists") {
 		t.Fatalf("CreateProviderSettings(duplicate) error = %v, want duplicate rejection", err)

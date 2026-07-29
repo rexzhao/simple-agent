@@ -27,16 +27,17 @@ type ProviderSettingsDocument struct {
 }
 
 type ProviderSettings struct {
-	Name             string                  `json:"name"`
-	BaseURL          string                  `json:"base_url"`
-	APIKey           string                  `json:"api_key,omitempty"`
-	APIKeyConfigured bool                    `json:"api_key_configured"`
-	AuthFile         string                  `json:"auth_file,omitempty"`
-	RequestTimeout   string                  `json:"request_timeout,omitempty"`
-	HTTPProxy        string                  `json:"http_proxy,omitempty"`
-	HTTPSProxy       string                  `json:"https_proxy,omitempty"`
-	Models           []ProviderModelSettings `json:"models"`
-	CodexAuth        *CodexAuthStatus        `json:"codex_auth,omitempty"`
+	Name                  string                  `json:"name"`
+	BaseURL               string                  `json:"base_url"`
+	APIKey                string                  `json:"api_key,omitempty"`
+	APIKeyConfigured      bool                    `json:"api_key_configured"`
+	AuthFile              string                  `json:"auth_file,omitempty"`
+	RequestTimeout        string                  `json:"request_timeout,omitempty"`
+	HTTPProxy             string                  `json:"http_proxy,omitempty"`
+	HTTPSProxy            string                  `json:"https_proxy,omitempty"`
+	MaxConcurrentRequests int                     `json:"max_concurrent_requests,omitempty"`
+	Models                []ProviderModelSettings `json:"models"`
+	CodexAuth             *CodexAuthStatus        `json:"codex_auth,omitempty"`
 }
 
 type ProviderModelSettings struct {
@@ -54,15 +55,16 @@ type ProviderModelSettings struct {
 }
 
 type ProviderSettingsInput struct {
-	Name           string                  `json:"name"`
-	BaseURL        string                  `json:"base_url"`
-	APIKey         string                  `json:"api_key,omitempty"`
-	KeepAPIKey     bool                    `json:"keep_api_key,omitempty"`
-	AuthFile       string                  `json:"auth_file,omitempty"`
-	RequestTimeout string                  `json:"request_timeout,omitempty"`
-	HTTPProxy      string                  `json:"http_proxy,omitempty"`
-	HTTPSProxy     string                  `json:"https_proxy,omitempty"`
-	Models         []ProviderModelSettings `json:"models"`
+	Name                  string                  `json:"name"`
+	BaseURL               string                  `json:"base_url"`
+	APIKey                string                  `json:"api_key,omitempty"`
+	KeepAPIKey            bool                    `json:"keep_api_key,omitempty"`
+	AuthFile              string                  `json:"auth_file,omitempty"`
+	RequestTimeout        string                  `json:"request_timeout,omitempty"`
+	HTTPProxy             string                  `json:"http_proxy,omitempty"`
+	HTTPSProxy            string                  `json:"https_proxy,omitempty"`
+	MaxConcurrentRequests int                     `json:"max_concurrent_requests,omitempty"`
+	Models                []ProviderModelSettings `json:"models"`
 }
 
 type CodexAuthStatus struct {
@@ -153,14 +155,15 @@ func (s *Service) saveProviderSettings(existingName string, input ProviderSettin
 		authFile = existing.Provider.AuthFile
 	}
 	provider := config.ProviderConfig{
-		Name:           name,
-		BaseURL:        strings.TrimSpace(input.BaseURL),
-		APIKey:         apiKey,
-		AuthFile:       authFile,
-		RequestTimeout: strings.TrimSpace(input.RequestTimeout),
-		HTTPProxy:      strings.TrimSpace(input.HTTPProxy),
-		HTTPSProxy:     strings.TrimSpace(input.HTTPSProxy),
-		Models:         make(map[string]config.ModelProfile, len(input.Models)),
+		Name:                  name,
+		BaseURL:               strings.TrimSpace(input.BaseURL),
+		APIKey:                apiKey,
+		AuthFile:              authFile,
+		RequestTimeout:        strings.TrimSpace(input.RequestTimeout),
+		HTTPProxy:             strings.TrimSpace(input.HTTPProxy),
+		HTTPSProxy:            strings.TrimSpace(input.HTTPSProxy),
+		MaxConcurrentRequests: input.MaxConcurrentRequests,
+		Models:                make(map[string]config.ModelProfile, len(input.Models)),
 	}
 	usesCodex := false
 	for _, model := range input.Models {
@@ -462,15 +465,16 @@ func providerSettingsFromConfig(providerDir string, provider config.ProviderConf
 		}
 	}
 	settings := ProviderSettings{
-		Name:             provider.Name,
-		BaseURL:          provider.BaseURL,
-		APIKey:           visibleAPIKey,
-		APIKeyConfigured: apiKey != "",
-		AuthFile:         authFile,
-		RequestTimeout:   provider.RequestTimeout,
-		HTTPProxy:        provider.HTTPProxy,
-		HTTPSProxy:       provider.HTTPSProxy,
-		Models:           make([]ProviderModelSettings, 0, len(provider.Models)),
+		Name:                  provider.Name,
+		BaseURL:               provider.BaseURL,
+		APIKey:                visibleAPIKey,
+		APIKeyConfigured:      apiKey != "",
+		AuthFile:              authFile,
+		RequestTimeout:        provider.RequestTimeout,
+		HTTPProxy:             provider.HTTPProxy,
+		HTTPSProxy:            provider.HTTPSProxy,
+		MaxConcurrentRequests: provider.MaxConcurrentRequests,
+		Models:                make([]ProviderModelSettings, 0, len(provider.Models)),
 	}
 	profiles := make([]string, 0, len(provider.Models))
 	for profile := range provider.Models {

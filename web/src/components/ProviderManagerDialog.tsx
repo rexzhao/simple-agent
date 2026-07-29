@@ -35,6 +35,7 @@ interface ProviderDraft {
   apiKeyConfigured: boolean
   authFile: string
   requestTimeout: string
+  maxConcurrentRequests: string
   httpProxy: string
   httpsProxy: string
   models: EditableProviderModel[]
@@ -185,6 +186,7 @@ export function ProviderManagerDialog(props: {
                 <div className="settings-grid">
                   <label>Name<input value={draft.name} disabled={Boolean(draft.existingName)} onChange={(event) => setDraft({ ...draft, name: event.target.value })} placeholder="openai" /></label>
                   <label>Request timeout<input value={draft.requestTimeout} onChange={(event) => setDraft({ ...draft, requestTimeout: event.target.value })} placeholder="60s" /></label>
+                  <label>Max concurrent requests<input type="number" min="0" value={draft.maxConcurrentRequests} onChange={(event) => setDraft({ ...draft, maxConcurrentRequests: event.target.value })} placeholder="Unlimited" /></label>
                   <label className="wide">Base URL<input value={draft.baseURL} onChange={(event) => setDraft({ ...draft, baseURL: event.target.value })} placeholder="https://api.openai.com/v1" /></label>
                   <label>HTTP proxy<input value={draft.httpProxy} onChange={(event) => setDraft({ ...draft, httpProxy: event.target.value })} placeholder="http://127.0.0.1:7890" /></label>
                   <label>HTTPS proxy<input value={draft.httpsProxy} onChange={(event) => setDraft({ ...draft, httpsProxy: event.target.value })} placeholder="http://127.0.0.1:7890" /></label>
@@ -272,6 +274,7 @@ function providerDraft(provider: ProviderSettings): ProviderDraft {
     apiKeyConfigured: provider.api_key_configured,
     authFile: provider.auth_file ?? '',
     requestTimeout: provider.request_timeout ?? '',
+    maxConcurrentRequests: provider.max_concurrent_requests ? String(provider.max_concurrent_requests) : '',
     httpProxy: provider.http_proxy ?? '',
     httpsProxy: provider.https_proxy ?? '',
     models: provider.models.map(editableProviderModel),
@@ -279,7 +282,7 @@ function providerDraft(provider: ProviderSettings): ProviderDraft {
 }
 
 function emptyProviderDraft(): ProviderDraft {
-  return { existingName: '', name: '', baseURL: '', apiKey: '', keepAPIKey: false, apiKeyConfigured: false, authFile: '', requestTimeout: '60s', httpProxy: '', httpsProxy: '', models: [emptyProviderModel()] }
+  return { existingName: '', name: '', baseURL: '', apiKey: '', keepAPIKey: false, apiKeyConfigured: false, authFile: '', requestTimeout: '60s', maxConcurrentRequests: '', httpProxy: '', httpsProxy: '', models: [emptyProviderModel()] }
 }
 
 function editableProviderModel(model: ProviderModelSettings): EditableProviderModel {
@@ -325,6 +328,7 @@ function providerInput(draft: ProviderDraft): ProviderSettingsInput {
     keep_api_key: draft.keepAPIKey,
     auth_file: draft.authFile.trim(),
     request_timeout: draft.requestTimeout.trim(),
+    max_concurrent_requests: draft.maxConcurrentRequests.trim() ? Number(draft.maxConcurrentRequests) : 0,
     http_proxy: draft.httpProxy.trim(),
     https_proxy: draft.httpsProxy.trim(),
     models: draft.models.map((model, index) => {

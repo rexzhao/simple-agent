@@ -103,6 +103,8 @@ name: paperhub
 base_url: https://tc-paperhub.diezhi.net/v1
 api_key: $PAPERHUB_API_KEY
 request_timeout: 60s
+# Optional cap on in-flight HTTP requests across the whole process:
+# max_concurrent_requests: 5
 # Optional provider-wide proxies:
 # http_proxy: http://127.0.0.1:7890
 # https_proxy: http://127.0.0.1:7890
@@ -210,6 +212,14 @@ variables keep their normal behavior.
 `request_timeout` controls how long each attempt waits for HTTP response
 headers. Header timeouts are retried once before the turn fails. The default is
 15 seconds when this option is omitted.
+
+`max_concurrent_requests` caps how many HTTP requests to this provider may be
+in flight at once across the whole process. The limit is shared by every
+session, subagent run, and compaction summary using the provider, and it also
+covers auxiliary calls such as model discovery and Codex token refreshes. Once
+the budget is exhausted, further requests wait for a free slot instead of
+failing; a streaming request holds its slot until the stream ends. Omit the
+option (or set it to 0) for no limit.
 
 OpenAI Responses and Codex can also report transient `server_error` or
 `server_is_overloaded` failures inside an already-open SSE stream. SAI retries

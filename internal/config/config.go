@@ -79,15 +79,16 @@ type CompactionConfig struct {
 }
 
 type ProviderConfig struct {
-	Name           string                  `json:"name" yaml:"name"`
-	BaseURL        string                  `json:"base_url" yaml:"base_url"`
-	APIKey         string                  `json:"api_key" yaml:"api_key"`
-	AuthFile       string                  `json:"auth_file,omitempty" yaml:"auth_file,omitempty"`
-	RequestTimeout string                  `json:"request_timeout,omitempty" yaml:"request_timeout,omitempty"`
-	HTTPProxy      string                  `json:"http_proxy,omitempty" yaml:"http_proxy,omitempty"`
-	HTTPSProxy     string                  `json:"https_proxy,omitempty" yaml:"https_proxy,omitempty"`
-	ResolvedAPIKey string                  `json:"-" yaml:"-"`
-	Models         map[string]ModelProfile `json:"models" yaml:"models"`
+	Name                  string                  `json:"name" yaml:"name"`
+	BaseURL               string                  `json:"base_url" yaml:"base_url"`
+	APIKey                string                  `json:"api_key" yaml:"api_key"`
+	AuthFile              string                  `json:"auth_file,omitempty" yaml:"auth_file,omitempty"`
+	RequestTimeout        string                  `json:"request_timeout,omitempty" yaml:"request_timeout,omitempty"`
+	HTTPProxy             string                  `json:"http_proxy,omitempty" yaml:"http_proxy,omitempty"`
+	HTTPSProxy            string                  `json:"https_proxy,omitempty" yaml:"https_proxy,omitempty"`
+	MaxConcurrentRequests int                     `json:"max_concurrent_requests,omitempty" yaml:"max_concurrent_requests,omitempty"`
+	ResolvedAPIKey        string                  `json:"-" yaml:"-"`
+	Models                map[string]ModelProfile `json:"models" yaml:"models"`
 }
 
 type ModelProfile struct {
@@ -134,28 +135,30 @@ type ResolvedModel struct {
 
 func (p ProviderConfig) MarshalJSON() ([]byte, error) {
 	type providerJSON struct {
-		Name           string                  `json:"name"`
-		BaseURL        string                  `json:"base_url"`
-		APIKey         string                  `json:"api_key"`
-		AuthFile       string                  `json:"auth_file,omitempty"`
-		RequestTimeout string                  `json:"request_timeout,omitempty"`
-		HTTPProxy      string                  `json:"http_proxy,omitempty"`
-		HTTPSProxy     string                  `json:"https_proxy,omitempty"`
-		Models         map[string]ModelProfile `json:"models"`
+		Name                  string                  `json:"name"`
+		BaseURL               string                  `json:"base_url"`
+		APIKey                string                  `json:"api_key"`
+		AuthFile              string                  `json:"auth_file,omitempty"`
+		RequestTimeout        string                  `json:"request_timeout,omitempty"`
+		HTTPProxy             string                  `json:"http_proxy,omitempty"`
+		HTTPSProxy            string                  `json:"https_proxy,omitempty"`
+		MaxConcurrentRequests int                     `json:"max_concurrent_requests,omitempty"`
+		Models                map[string]ModelProfile `json:"models"`
 	}
 
 	var buf bytes.Buffer
 	encoder := json.NewEncoder(&buf)
 	encoder.SetEscapeHTML(false)
 	if err := encoder.Encode(providerJSON{
-		Name:           p.Name,
-		BaseURL:        p.BaseURL,
-		APIKey:         redactedSecretValue(p.APIKey),
-		AuthFile:       p.AuthFile,
-		RequestTimeout: p.RequestTimeout,
-		HTTPProxy:      p.HTTPProxy,
-		HTTPSProxy:     p.HTTPSProxy,
-		Models:         p.Models,
+		Name:                  p.Name,
+		BaseURL:               p.BaseURL,
+		APIKey:                redactedSecretValue(p.APIKey),
+		AuthFile:              p.AuthFile,
+		RequestTimeout:        p.RequestTimeout,
+		HTTPProxy:             p.HTTPProxy,
+		HTTPSProxy:            p.HTTPSProxy,
+		MaxConcurrentRequests: p.MaxConcurrentRequests,
+		Models:                p.Models,
 	}); err != nil {
 		return nil, err
 	}
@@ -688,6 +691,9 @@ func validateProvider(path string, provider ProviderConfig) error {
 		if err != nil || requestTimeout <= 0 {
 			return fmt.Errorf("provider file %q request_timeout must be a positive duration", path)
 		}
+	}
+	if provider.MaxConcurrentRequests < 0 {
+		return fmt.Errorf("provider file %q max_concurrent_requests must not be negative", path)
 	}
 	if err := validateProviderProxyURL(path, "http_proxy", provider.HTTPProxy); err != nil {
 		return err

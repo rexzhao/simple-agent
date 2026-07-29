@@ -68,6 +68,7 @@ export interface ProviderSettings {
   request_timeout?: string
   http_proxy?: string
   https_proxy?: string
+  max_concurrent_requests?: number
   models: ProviderModelSettings[]
   codex_auth?: CodexAuthStatus
 }
@@ -81,6 +82,7 @@ export interface ProviderSettingsInput {
   request_timeout?: string
   http_proxy?: string
   https_proxy?: string
+  max_concurrent_requests?: number
   models: ProviderModelSettings[]
 }
 
