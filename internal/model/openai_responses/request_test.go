@@ -578,16 +578,52 @@ func TestBuildProviderRequestReplaysResponsesOutputItemsWhenStoreFalse(t *testin
 		"model": "gpt-5.6",
 		"input": [
 			{"role": "user", "content": "Do work"},
-			{"type": "reasoning", "id": "rs_1", "encrypted_content": "cipher"},
-			{"type": "message", "id": "msg_1", "role": "assistant", "status": "completed", "phase": "final_answer", "content": [
+			{"type": "reasoning", "encrypted_content": "cipher"},
+			{"type": "message", "role": "assistant", "status": "completed", "phase": "final_answer", "content": [
 				{"type": "output_text", "text": "Done", "annotations": []}
 			]},
-			{"type": "function_call", "id": "fc_1", "call_id": "call_1", "name": "lookup", "arguments": "{\"id\":1}"},
+			{"type": "function_call", "call_id": "call_1", "name": "lookup", "arguments": "{\"id\":1}"},
 			{"type": "function_call_output", "call_id": "call_1", "output": "result"}
 		],
 		"stream": true,
 		"store": false,
 		"tools": [{"type": "function", "name": "lookup", "description": "", "parameters": {"type": "object", "properties": {}}}]
+	}`)
+}
+
+func TestBuildProviderRequestKeepsItemIDsForStoredResponses(t *testing.T) {
+	body, _, metadata, err := buildProviderRequest(model.Request{
+		Model: "gpt-5.6",
+		Messages: []model.Message{{
+			Role: model.MessageRoleAssistant,
+			ResponseState: &model.ResponseState{
+				Stored: true,
+				Origin: "https://api.openai.com/v1",
+				Model:  "gpt-5.6",
+				OutputItems: []json.RawMessage{
+					json.RawMessage(`{"type":"reasoning","id":"rs_1","encrypted_content":"cipher"}`),
+					json.RawMessage(`{"type":"function_call","id":"fc_1","call_id":"call_1","name":"lookup","arguments":"{}"}`),
+				},
+			},
+		}},
+		Parameters: map[string]any{
+			"responses": map[string]any{"store": true},
+		},
+	}, true, requestBodyOptions{origin: "https://api.openai.com/v1"})
+	if err != nil {
+		t.Fatalf("buildProviderRequest() error = %v", err)
+	}
+	if !metadata.Store {
+		t.Fatal("metadata.Store = false, want true")
+	}
+	assertJSONEqual(t, body, `{
+		"model":"gpt-5.6",
+		"input":[
+			{"type":"reasoning","id":"rs_1","encrypted_content":"cipher"},
+			{"type":"function_call","id":"fc_1","call_id":"call_1","name":"lookup","arguments":"{}"}
+		],
+		"stream":true,
+		"store":true
 	}`)
 }
 
@@ -617,8 +653,8 @@ func TestBuildProviderRequestReplaysExactResponsesOutputItems(t *testing.T) {
 		"model": "gpt-5.6",
 		"input": [
 			{"role": "user", "content": "Do work"},
-			{"type": "reasoning", "id": "rs_exact", "encrypted_content": "cipher"},
-			{"type": "message", "id": "msg_exact", "role": "assistant", "status": "completed", "content": [
+			{"type": "reasoning", "encrypted_content": "cipher"},
+			{"type": "message", "role": "assistant", "status": "completed", "content": [
 				{"type": "output_text", "text": "Exact"}
 			]}
 		],
@@ -648,7 +684,7 @@ func TestBuildProviderRequestReplaysOpaqueProviderItemsInOrder(t *testing.T) {
 		"model": "gpt-5.6",
 		"input": [
 			{"type":"message","role":"developer","content":"retained"},
-			{"type":"compaction_summary","id":"cmp_1","encrypted_content":"sealed","future_counter":9007199254740993},
+			{"type":"compaction_summary","encrypted_content":"sealed","future_counter":9007199254740993},
 			{"role":"user","content":"Continue"}
 		],
 		"stream": true,
@@ -693,6 +729,22 @@ func TestUsesStandaloneCompactionRequiresExplicitSupportedMode(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "responses.compaction.mode") {
 		t.Fatalf("UsesStandaloneCompaction(invalid) error = %v, want mode validation error", err)
 	}
+}
+
+func TestBuildCompactionRequestBodyIncludesCanonicalToolPolicyDefaults(t *testing.T) {
+	body, _, err := buildCompactionRequestBody(model.Request{
+		Model:    "gpt-test",
+		Messages: []model.Message{{Role: model.MessageRoleUser, Content: "work"}},
+	}, requestBodyOptions{})
+	if err != nil {
+		t.Fatalf("buildCompactionRequestBody() error = %v", err)
+	}
+	assertJSONEqual(t, body, `{
+		"model":"gpt-test",
+		"input":[{"role":"user","content":"work"}],
+		"tools":[],
+		"parallel_tool_calls":false
+	}`)
 }
 
 func TestBuildProviderRequestUsesPreviousResponseIDOnlyForMatchingStoredState(t *testing.T) {

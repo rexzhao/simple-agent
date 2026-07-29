@@ -197,6 +197,47 @@ func TestStreamDrainsActivePromptsAfterToolBatchAsSeparateUserItems(t *testing.T
 	}
 }
 
+func TestStreamAutoCompactsAfterCompleteToolBatchBeforeNextProvider(t *testing.T) {
+	provider := &fakeProvider{
+		turns: [][]model.Event{
+			{model.ToolCallDoneEvent{ToolCall: model.ToolCall{ID: "call_1", Name: "echo", Arguments: `{}`}}},
+			{model.TextDeltaEvent{Text: "final"}},
+		},
+	}
+	executor := &fakeToolExecutor{result: model.ToolResult{Name: "echo", Content: "tool output"}}
+	drain, _ := drainSequence(nil, []model.Message{{Role: model.MessageRoleUser, Content: "queued"}})
+	var compactInput []model.Message
+
+	events, results, err := StreamWithResult(context.Background(), model.Request{
+		Model:    "model-test",
+		Messages: []model.Message{{Role: model.MessageRoleUser, Content: "original"}},
+		Tools:    []model.Tool{{Name: "echo"}},
+	}, Options{
+		Provider:          provider,
+		ToolExecutor:      executor,
+		MaxTurns:          4,
+		ActivePromptDrain: drain,
+		AutoCompact: func(_ context.Context, messages []model.Message) ([]model.Message, error) {
+			compactInput = copyMessages(messages)
+			return []model.Message{{Role: model.MessageRoleDeveloper, Content: "compacted"}}, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("StreamWithResult() error = %v", err)
+	}
+	collectAgentEvents(t, events)
+	collectTurnResult(t, results)
+
+	if len(compactInput) != 4 {
+		t.Fatalf("auto compact input = %#v, want original, assistant tool call, tool output, queued input", compactInput)
+	}
+	assertAgentMessage(t, compactInput[2], model.MessageRoleTool, "tool output", "call_1")
+	assertAgentMessage(t, compactInput[3], model.MessageRoleUser, "queued", "")
+	if got := provider.requests[1].Messages; len(got) != 1 || got[0].Role != model.MessageRoleDeveloper || got[0].Content != "compacted" {
+		t.Fatalf("second provider messages = %#v, want compacted replacement", got)
+	}
+}
+
 func TestStreamDrainsActivePromptsAfterNoToolResponseExtendsTurn(t *testing.T) {
 	provider := &fakeProvider{
 		turns: [][]model.Event{

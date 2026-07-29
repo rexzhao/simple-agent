@@ -164,7 +164,8 @@ func TestProviderCompactPostsCanonicalInputAndReturnsOpaqueItems(t *testing.T) {
 			Path:          r.URL.Path,
 			Authorization: r.Header.Get("Authorization"),
 			ContentType:   r.Header.Get("Content-Type"),
-			SessionID:     r.Header.Get("session_id"),
+			SessionID:     r.Header.Get("session-id"),
+			ThreadID:      r.Header.Get("thread-id"),
 			Body:          body,
 		}
 		w.Header().Set("Content-Type", "application/json")
@@ -190,6 +191,11 @@ func TestProviderCompactPostsCanonicalInputAndReturnsOpaqueItems(t *testing.T) {
 	result, err := provider.Compact(context.Background(), model.Request{
 		Model:     "gpt-5.6",
 		SessionID: "session-1",
+		Tools: []model.Tool{{
+			Name:        "read_file",
+			Description: "Read a file.",
+			InputSchema: map[string]any{"type": "object"},
+		}},
 		Messages: []model.Message{
 			{Role: model.MessageRoleUser, Content: "Do work"},
 			{Role: model.MessageRoleAssistant, Content: "ignored", ResponseState: &model.ResponseState{
@@ -201,8 +207,11 @@ func TestProviderCompactPostsCanonicalInputAndReturnsOpaqueItems(t *testing.T) {
 			}},
 		},
 		Parameters: map[string]any{
-			"temperature":  0.7,
-			"service_tier": "priority",
+			"temperature":         0.7,
+			"service_tier":        "priority",
+			"parallel_tool_calls": true,
+			"reasoning":           map[string]any{"effort": "high"},
+			"text":                map[string]any{"verbosity": "low"},
 			"responses": map[string]any{
 				"store":      true,
 				"state":      "previous_response_id",
@@ -221,17 +230,26 @@ func TestProviderCompactPostsCanonicalInputAndReturnsOpaqueItems(t *testing.T) {
 	if gotRequest.Authorization != "Bearer test-key" || gotRequest.ContentType != "application/json" {
 		t.Fatalf("request headers = authorization %q content-type %q", gotRequest.Authorization, gotRequest.ContentType)
 	}
-	if gotRequest.SessionID != "session-1" {
-		t.Fatalf("session_id = %q, want session-1", gotRequest.SessionID)
+	if gotRequest.SessionID != "session-1" || gotRequest.ThreadID != "session-1" {
+		t.Fatalf("session/thread headers = %q/%q, want session-1/session-1", gotRequest.SessionID, gotRequest.ThreadID)
 	}
 	assertJSONEqual(t, gotRequest.Body, `{
 		"model":"gpt-5.6",
 		"input":[
 			{"role":"user","content":"Do work"},
-			{"type":"message","id":"msg_1","role":"assistant","content":[{"type":"output_text","text":"Done"}],"future_counter":9007199254740993}
+			{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Done"}],"future_counter":9007199254740993}
 		],
+		"tools":[{
+			"type":"function",
+			"name":"read_file",
+			"description":"Read a file.",
+			"parameters":{"type":"object"}
+		}],
+		"parallel_tool_calls":true,
+		"reasoning":{"effort":"high"},
 		"prompt_cache_key":"session-1",
-		"service_tier":"priority"
+		"service_tier":"priority",
+		"text":{"verbosity":"low"}
 	}`)
 	if !bytes.Contains(gotRequest.Body, []byte(`"future_counter":9007199254740993`)) {
 		t.Fatalf("compact input was not forwarded without numeric coercion: %s", gotRequest.Body)
@@ -563,7 +581,8 @@ func TestProviderStreamReusesStableCacheAffinityForLongPrefix(t *testing.T) {
 			t.Errorf("ReadAll() error = %v", err)
 		}
 		requests <- capturedRequest{
-			SessionID:       r.Header.Get("session_id"),
+			SessionID:       r.Header.Get("session-id"),
+			ThreadID:        r.Header.Get("thread-id"),
 			ClientRequestID: r.Header.Get("x-client-request-id"),
 			Body:            body,
 		}
@@ -611,8 +630,8 @@ func TestProviderStreamReusesStableCacheAffinityForLongPrefix(t *testing.T) {
 	first := <-requests
 	second := <-requests
 	for index, captured := range []capturedRequest{first, second} {
-		if captured.SessionID != "session-cache-key" || captured.ClientRequestID != "session-cache-key" {
-			t.Fatalf("request %d affinity headers = session_id %q, client request %q", index+1, captured.SessionID, captured.ClientRequestID)
+		if captured.SessionID != "session-cache-key" || captured.ThreadID != "session-cache-key" || captured.ClientRequestID != "session-cache-key" {
+			t.Fatalf("request %d affinity headers = session %q, thread %q, client request %q", index+1, captured.SessionID, captured.ThreadID, captured.ClientRequestID)
 		}
 	}
 	if !bytes.Equal(first.Body, second.Body) {
@@ -620,6 +639,36 @@ func TestProviderStreamReusesStableCacheAffinityForLongPrefix(t *testing.T) {
 	}
 	if got := decodeJSON(t, first.Body).(map[string]any)["prompt_cache_key"]; got != "session-cache-key" {
 		t.Fatalf("prompt_cache_key = %#v, want session-cache-key", got)
+	}
+}
+
+func TestProviderStreamReplaysCodexTurnStateWithinProvider(t *testing.T) {
+	requests := make(chan capturedRequest, 2)
+	var requestCount atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests <- capturedRequest{TurnState: r.Header.Get("x-codex-turn-state")}
+		if requestCount.Add(1) == 1 {
+			w.Header().Set("x-codex-turn-state", "turn-state-1")
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: {\"type\":\"response.completed\"}\n\n")
+	}))
+	defer server.Close()
+
+	provider, err := NewProvider(ProviderConfig{BaseURL: server.URL, APIKey: "test-key", HTTPClient: server.Client()})
+	if err != nil {
+		t.Fatalf("NewProvider() error = %v", err)
+	}
+	request := model.Request{Model: "gpt-test", Messages: []model.Message{{Role: model.MessageRoleUser, Content: "work"}}}
+	for attempt := 0; attempt < 2; attempt++ {
+		events, streamErr := provider.Stream(context.Background(), request)
+		if streamErr != nil {
+			t.Fatalf("Stream(%d) error = %v", attempt+1, streamErr)
+		}
+		collectEvents(t, events)
+	}
+	if first, second := <-requests, <-requests; first.TurnState != "" || second.TurnState != "turn-state-1" {
+		t.Fatalf("turn states = %q, %q, want empty then turn-state-1", first.TurnState, second.TurnState)
 	}
 }
 
@@ -711,7 +760,9 @@ type capturedRequest struct {
 	AccountID       string
 	ContentType     string
 	SessionID       string
+	ThreadID        string
 	ClientRequestID string
+	TurnState       string
 	Body            []byte
 }
 

@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/rexzhao/simple-agent/internal/model"
@@ -42,6 +43,8 @@ type Provider struct {
 	httpClient      *http.Client
 	httpOptions     httpstream.Options
 	recordRequest   func(endpoint string, body []byte) error
+	turnStateMu     sync.Mutex
+	turnState       string
 }
 
 var _ model.Provider = (*Provider)(nil)
@@ -182,7 +185,7 @@ func (p *Provider) doRequestTo(ctx context.Context, token AccessToken, body []by
 			return nil, fmt.Errorf("record OpenAI Responses request: %w", err)
 		}
 	}
-	return httpstream.DoRequest(ctx, p.httpClient, p.httpOptions, func(requestCtx context.Context) (*http.Request, error) {
+	response, err := httpstream.DoRequest(ctx, p.httpClient, p.httpOptions, func(requestCtx context.Context) (*http.Request, error) {
 		httpRequest, err := http.NewRequestWithContext(requestCtx, http.MethodPost, p.baseURL+path, bytes.NewReader(body))
 		if err != nil {
 			return nil, fmt.Errorf("create OpenAI Responses request: %w", err)
@@ -192,11 +195,18 @@ func (p *Provider) doRequestTo(ctx context.Context, token AccessToken, body []by
 			httpRequest.Header.Set("ChatGPT-Account-Id", token.AccountID)
 		}
 		applySessionAffinityHeaders(httpRequest.Header, metadata, p.baseURL)
+		if turnState := p.currentTurnState(); turnState != "" {
+			httpRequest.Header.Set("x-codex-turn-state", turnState)
+		}
 		httpRequest.Header.Set("Content-Type", "application/json")
 		return httpRequest, nil
 	}, func(body io.Reader) string {
 		return httpstream.ReadErrorBody(body, token.Token)
 	})
+	if err == nil {
+		p.captureTurnState(response.Header.Get("x-codex-turn-state"))
+	}
+	return response, err
 }
 
 func applySessionAffinityHeaders(headers http.Header, metadata providerRequestMetadata, baseURL string) {
@@ -215,8 +225,27 @@ func applySessionAffinityHeaders(headers http.Header, metadata providerRequestMe
 		headers.Set("x-session-id", metadata.CacheKey)
 		return
 	}
-	headers.Set("session_id", metadata.CacheKey)
+	headers.Set("session-id", metadata.CacheKey)
+	headers.Set("thread-id", metadata.CacheKey)
 	headers.Set("x-client-request-id", metadata.CacheKey)
+}
+
+func (p *Provider) currentTurnState() string {
+	p.turnStateMu.Lock()
+	defer p.turnStateMu.Unlock()
+	return p.turnState
+}
+
+func (p *Provider) captureTurnState(value string) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return
+	}
+	p.turnStateMu.Lock()
+	defer p.turnStateMu.Unlock()
+	if p.turnState == "" {
+		p.turnState = value
+	}
 }
 
 func shouldRetryWithoutContinuation(err error, metadata providerRequestMetadata) bool {

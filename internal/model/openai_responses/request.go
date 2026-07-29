@@ -43,15 +43,21 @@ func buildCompactionRequestBody(request model.Request, options requestBodyOption
 	}
 
 	compact := map[string]json.RawMessage{
-		"model": expanded["model"],
-		"input": expanded["input"],
+		"model":               expanded["model"],
+		"input":               expanded["input"],
+		"tools":               json.RawMessage(`[]`),
+		"parallel_tool_calls": json.RawMessage(`false`),
 	}
 	for _, key := range []string{
 		"instructions",
+		"tools",
+		"parallel_tool_calls",
+		"reasoning",
 		"prompt_cache_key",
 		"prompt_cache_options",
 		"prompt_cache_retention",
 		"service_tier",
+		"text",
 	} {
 		if value, ok := expanded[key]; ok {
 			compact[key] = value
@@ -96,6 +102,7 @@ type responsesCompactionOptions struct {
 type responseInputOptions struct {
 	origin                    string
 	model                     string
+	includeProviderItemIDs    bool
 	markInstructionBreakpoint bool
 	allowCacheBreakpoints     bool
 }
@@ -131,6 +138,7 @@ func buildProviderRequest(request model.Request, stream bool, options requestBod
 	inputOptions := responseInputOptions{
 		origin:                    options.origin,
 		model:                     request.Model,
+		includeProviderItemIDs:    store,
 		markInstructionBreakpoint: markInstructionBreakpoint,
 		allowCacheBreakpoints:     cacheEnabled && capability == "modern",
 	}
@@ -318,7 +326,7 @@ func buildInput(messages []model.Message, toolNames *toolNameMapper, options res
 				"output":  message.Content,
 			})
 		case model.MessageRoleProvider:
-			items, err := buildProviderItems(message.ProviderItems, options.origin, options.model)
+			items, err := buildProviderItems(message.ProviderItems, options.origin, options.model, options.includeProviderItemIDs)
 			if err != nil {
 				return nil, 0, err
 			}
@@ -332,6 +340,7 @@ func buildInput(messages []model.Message, toolNames *toolNameMapper, options res
 
 func buildAssistantInput(message model.Message, toolNames *toolNameMapper, options responseInputOptions) ([]any, error) {
 	stateMatches := responseStateMatches(message.ResponseState, options.origin, options.model)
+	includeProviderItemIDs := stateMatches && options.includeProviderItemIDs && message.ResponseState.Stored
 	if stateMatches && len(message.ResponseState.OutputItems) > 0 {
 		items := make([]model.ProviderItem, 0, len(message.ResponseState.OutputItems))
 		for _, raw := range message.ResponseState.OutputItems {
@@ -341,7 +350,7 @@ func buildAssistantInput(message model.Message, toolNames *toolNameMapper, optio
 				Data:   raw,
 			})
 		}
-		return buildProviderItems(items, options.origin, options.model)
+		return buildProviderItems(items, options.origin, options.model, includeProviderItemIDs)
 	}
 
 	out := make([]any, 0, len(message.ToolCalls)+2)
@@ -351,7 +360,7 @@ func buildAssistantInput(message model.Message, toolNames *toolNameMapper, optio
 				Type string `json:"type"`
 			}
 			if json.Unmarshal(reasoning, &item) == nil && strings.TrimSpace(item.Type) != "" {
-				out = append(out, append(json.RawMessage(nil), reasoning...))
+				out = append(out, providerItemForReplay(reasoning, includeProviderItemIDs))
 			}
 		}
 	}
@@ -359,7 +368,6 @@ func buildAssistantInput(message model.Message, toolNames *toolNameMapper, optio
 		if stateMatches && message.ResponseState.MessageID != "" {
 			item := map[string]any{
 				"type":   "message",
-				"id":     message.ResponseState.MessageID,
 				"role":   "assistant",
 				"status": "completed",
 				"content": []map[string]any{{
@@ -371,6 +379,9 @@ func buildAssistantInput(message model.Message, toolNames *toolNameMapper, optio
 			if message.ResponseState.MessagePhase != "" {
 				item["phase"] = message.ResponseState.MessagePhase
 			}
+			if includeProviderItemIDs {
+				item["id"] = message.ResponseState.MessageID
+			}
 			out = append(out, item)
 		} else {
 			out = append(out, map[string]any{
@@ -380,12 +391,12 @@ func buildAssistantInput(message model.Message, toolNames *toolNameMapper, optio
 		}
 	}
 	for _, toolCall := range message.ToolCalls {
-		out = append(out, buildFunctionCallInput(toolCall, toolNames, stateMatches))
+		out = append(out, buildFunctionCallInput(toolCall, toolNames, includeProviderItemIDs))
 	}
 	return out, nil
 }
 
-func buildProviderItems(items []model.ProviderItem, origin, modelID string) ([]any, error) {
+func buildProviderItems(items []model.ProviderItem, origin, modelID string, includeProviderItemIDs bool) ([]any, error) {
 	if len(items) == 0 {
 		return nil, fmt.Errorf("OpenAI Responses provider message has no items")
 	}
@@ -403,9 +414,25 @@ func buildProviderItems(items []model.ProviderItem, origin, modelID string) ([]a
 		if strings.TrimSpace(envelope.Type) == "" {
 			return nil, fmt.Errorf("OpenAI Responses provider item %d has no type", index)
 		}
-		out = append(out, append(json.RawMessage(nil), item.Data...))
+		out = append(out, providerItemForReplay(item.Data, includeProviderItemIDs))
 	}
 	return out, nil
+}
+
+func providerItemForReplay(item json.RawMessage, includeProviderItemID bool) json.RawMessage {
+	if includeProviderItemID {
+		return append(json.RawMessage(nil), item...)
+	}
+	var fields map[string]json.RawMessage
+	if json.Unmarshal(item, &fields) != nil {
+		return append(json.RawMessage(nil), item...)
+	}
+	delete(fields, "id")
+	stripped, err := json.Marshal(fields)
+	if err != nil {
+		return append(json.RawMessage(nil), item...)
+	}
+	return stripped
 }
 
 func buildFunctionCallInput(toolCall model.ToolCall, toolNames *toolNameMapper, includeProviderID bool) map[string]any {

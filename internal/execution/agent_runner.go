@@ -66,6 +66,7 @@ func (r AgentTurnRunner) RunSessionTurn(ctx context.Context, request SessionTurn
 	defer func() {
 		err = errors.Join(err, runtime.Close())
 	}()
+	runtime.onCompactionStarted = request.OnCompactionStarted
 
 	_, runErr := runtime.runSessionTurn(ctx, request.Content, sessionTurnRunOptions{
 		contentBlocks:     copyInputContentBlocks(request.ContentBlocks),
@@ -492,7 +493,10 @@ func (r *agentRunnerRuntime) runSessionTurn(ctx context.Context, prompt string, 
 		TurnID:            options.turnID,
 		Publisher:         options.publisher,
 		ActivePromptDrain: adaptActivePromptDrain(options.activePromptDrain),
-		ToolCancel:        options.toolCancel,
+		AutoCompact: func(ctx context.Context, messages []model.Message) ([]model.Message, error) {
+			return r.autoCompactAfterToolBatch(ctx, messages, options.publisher, options.turnID)
+		},
+		ToolCancel: options.toolCancel,
 	})
 	if err != nil {
 		return nil, err
@@ -562,26 +566,11 @@ func (r *agentRunnerRuntime) planAutoCompactBeforeTurn(ctx context.Context, mess
 	if !compactable {
 		return messages, nil, nil
 	}
-	if r.contextTracker == nil {
-		return messages, nil, nil
-	}
-	contextMetadata := r.contextTracker.Metadata()
-	usageCount := autoCompactionUsageCount(contextMetadata)
-	threshold := autoCompactionThreshold(
-		r.inputLimit,
-		contextMetadata.ContextWindow,
-		r.outputLimit,
-		r.config.Compaction.Reserved,
-		r.config.Compaction.ThresholdPercent,
-	)
-	tokenPressure := usageCount > 0 && threshold > 0 && usageCount >= threshold
 	pressureMessages := copyMessageSlice(messages)
 	if pendingInput.Role != "" {
 		pressureMessages = append(pressureMessages, pendingInput)
 	}
-	requestPressure := r.config.Compaction.MaxRequestBytes > 0 &&
-		r.autoCompactionRequestBytes(pressureMessages) >= r.config.Compaction.MaxRequestBytes
-	if !tokenPressure && !requestPressure {
+	if !r.autoCompactionPressure(pressureMessages) {
 		return messages, nil, nil
 	}
 	if r.onCompactionStarted != nil {
@@ -597,6 +586,73 @@ func (r *agentRunnerRuntime) planAutoCompactBeforeTurn(ctx context.Context, mess
 		return nil, nil, fmt.Errorf("auto compact failed: %w", err)
 	}
 	return plan.messages, &plan, nil
+}
+
+func (r *agentRunnerRuntime) autoCompactAfterToolBatch(ctx context.Context, messages []model.Message, publisher eventbus.Publisher, turnID string) ([]model.Message, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if r == nil || r.config == nil || !r.config.Compaction.Enabled || r.sessionStore == nil || publisher == nil {
+		return messages, nil
+	}
+	if !r.autoCompactionPressure(messages) {
+		return messages, nil
+	}
+
+	latest, err := r.sessionStore.Load(r.session.ID)
+	if err != nil {
+		return nil, fmt.Errorf("load session before mid-turn auto compact: %w", err)
+	}
+	r.session = latest
+	r.activeItemIDs = copyStringSlice(latest.ActiveHistory)
+	if r.onCompactionStarted != nil {
+		r.onCompactionStarted("auto")
+	}
+	plan, err := r.planCompactionCheckpoint(ctx, compactionCheckpointOptions{
+		reason:  "context_limit",
+		phase:   "mid_turn",
+		trigger: "auto",
+	})
+	if err != nil {
+		return nil, fmt.Errorf("mid-turn auto compact failed: %w", err)
+	}
+	if err := publishCompactionUsage(publisher, plan.usage); err != nil {
+		return nil, fmt.Errorf("publish mid-turn compaction usage: %w", err)
+	}
+	if err := publisher.Publish(eventbus.CompactionRequested{
+		TurnID:     strings.TrimSpace(turnID),
+		Summary:    plan.summaryItem,
+		Checkpoint: plan.checkpoint,
+		Context:    plan.context,
+	}); err != nil {
+		return nil, fmt.Errorf("publish mid-turn compaction: %w", err)
+	}
+	compacted, err := r.sessionStore.Load(r.session.ID)
+	if err != nil {
+		return nil, fmt.Errorf("load session after mid-turn auto compact: %w", err)
+	}
+	r.session = compacted
+	r.activeItemIDs = copyStringSlice(compacted.ActiveHistory)
+	return plan.messages, nil
+}
+
+func (r *agentRunnerRuntime) autoCompactionPressure(messages []model.Message) bool {
+	if r == nil || r.config == nil || r.contextTracker == nil {
+		return false
+	}
+	contextMetadata := r.contextTracker.Metadata()
+	usageCount := autoCompactionUsageCount(contextMetadata)
+	threshold := autoCompactionThreshold(
+		r.inputLimit,
+		contextMetadata.ContextWindow,
+		r.outputLimit,
+		r.config.Compaction.Reserved,
+		r.config.Compaction.ThresholdPercent,
+	)
+	tokenPressure := usageCount > 0 && threshold > 0 && usageCount >= threshold
+	requestPressure := r.config.Compaction.MaxRequestBytes > 0 &&
+		r.autoCompactionRequestBytes(messages) >= r.config.Compaction.MaxRequestBytes
+	return tokenPressure || requestPressure
 }
 
 func autoCompactionUsageCount(metadata contextwindow.Metadata) int64 {

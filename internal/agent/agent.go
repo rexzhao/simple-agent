@@ -50,6 +50,11 @@ const (
 // preserves the existing turn behavior.
 type ActivePromptDrain func(ActivePromptCheckpoint) []model.Message
 
+// AutoCompact is an optional safe-checkpoint callback invoked after a complete
+// tool batch and any queued user input have been durably published, immediately
+// before the next provider request. It may return replacement model history.
+type AutoCompact func(context.Context, []model.Message) ([]model.Message, error)
+
 // ToolCancellationRegistry tracks in-flight tool calls so they can be
 // individually cancelled without aborting the entire agent turn. The agent
 // loop registers each tool call before execution and unregisters it after.
@@ -106,6 +111,7 @@ type Options struct {
 	TurnID            string
 	Publisher         eventbus.Publisher
 	ActivePromptDrain ActivePromptDrain
+	AutoCompact       AutoCompact
 	ToolCancel        *ToolCancellationRegistry
 }
 
@@ -243,6 +249,14 @@ func run(ctx context.Context, request model.Request, options Options, maxTurns i
 				Err: fmt.Errorf("agent reached max_turns %d before the model returned a final response", maxTurns),
 			}
 			return
+		}
+		if options.AutoCompact != nil {
+			compacted, err := options.AutoCompact(ctx, copyMessages(messages))
+			if err != nil {
+				events <- model.ErrorEvent{Err: err, Message: "auto compact"}
+				return
+			}
+			messages = compacted
 		}
 	}
 }

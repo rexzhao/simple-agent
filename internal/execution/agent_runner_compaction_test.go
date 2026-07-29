@@ -14,6 +14,7 @@ import (
 
 	"github.com/rexzhao/simple-agent/internal/config"
 	"github.com/rexzhao/simple-agent/internal/contextwindow"
+	"github.com/rexzhao/simple-agent/internal/eventbus"
 	eventlog "github.com/rexzhao/simple-agent/internal/logging"
 	"github.com/rexzhao/simple-agent/internal/model"
 	"github.com/rexzhao/simple-agent/internal/sessions"
@@ -298,6 +299,117 @@ func TestAutoCompactionRequestBytesMeasuresResponsesReplay(t *testing.T) {
 	if small <= 0 || large <= small+4000 {
 		t.Fatalf("request sizes small=%d large=%d, want serialized replay growth", small, large)
 	}
+}
+
+func TestAutoCompactAfterToolBatchPersistsMidTurnCheckpoint(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/responses/compact" {
+			t.Errorf("path = %q, want /responses/compact", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{
+			"object":"response.compaction",
+			"output":[{"type":"compaction","id":"cmp_mid_turn","encrypted_content":"sealed"}]
+		}`)
+	}))
+	defer server.Close()
+
+	parameters := map[string]any{
+		"responses": map[string]any{
+			"compaction": map[string]any{"mode": "responses-compact"},
+		},
+	}
+	cfg := &config.Config{
+		Compaction: config.CompactionConfig{Enabled: true, MaxRequestBytes: 1},
+		Providers: map[string]config.ProviderConfig{
+			"openai": {
+				Name:    "openai",
+				BaseURL: server.URL,
+				APIKey:  "test-key",
+				Models: map[string]config.ModelProfile{
+					"default": {
+						ID:         "gpt-test",
+						Type:       config.ProviderTypeOpenAIResponses,
+						Parameters: parameters,
+					},
+				},
+			},
+		},
+	}
+	messages := []model.Message{
+		{Role: model.MessageRoleUser, Content: "work"},
+		{Role: model.MessageRoleAssistant, ToolCalls: []model.ToolCall{{ID: "call-1", Name: "read_file", Arguments: `{}`}}},
+		{Role: model.MessageRoleTool, ToolCallID: "call-1", Content: "result"},
+	}
+	items := make([]sessions.SessionItem, len(messages))
+	activeHistory := make([]string, len(messages))
+	for i, message := range messages {
+		id := "item-" + string(rune('1'+i))
+		items[i] = sessions.SessionItemFromMessage(id, message)
+		activeHistory[i] = id
+	}
+	store := sessions.NewV2Store(t.TempDir())
+	session, err := store.SaveMetadata(sessions.SessionV2{ID: "session-mid-turn"})
+	if err != nil {
+		t.Fatalf("SaveMetadata() error = %v", err)
+	}
+	session, err = store.AppendItemsAndReplaceActiveHistoryFromState(session.ID, session, items, activeHistory)
+	if err != nil {
+		t.Fatalf("AppendItemsAndReplaceActiveHistoryFromState() error = %v", err)
+	}
+	session, err = store.MarkTurnRunning(session.ID, "turn-1")
+	if err != nil {
+		t.Fatalf("MarkTurnRunning() error = %v", err)
+	}
+	publisher := &compactionApplyingPublisher{store: store, sessionID: session.ID}
+	runtime := &agentRunnerRuntime{
+		config:         cfg,
+		providerName:   "openai",
+		modelProfile:   "default",
+		modelID:        "gpt-test",
+		modelType:      config.ProviderTypeOpenAIResponses,
+		parameters:     parameters,
+		toolSchemas:    []model.Tool{{Name: "read_file"}},
+		session:        session,
+		sessionStore:   store,
+		contextTracker: contextwindow.NewTracker(contextwindow.Window{}, contextwindow.Metadata{}),
+	}
+
+	replacement, err := runtime.autoCompactAfterToolBatch(context.Background(), messages, publisher, "turn-1")
+	if err != nil {
+		t.Fatalf("autoCompactAfterToolBatch() error = %v", err)
+	}
+	if len(replacement) != 1 || replacement[0].Role != model.MessageRoleProvider {
+		t.Fatalf("replacement = %#v, want one provider compaction message", replacement)
+	}
+	loaded, err := store.Load(session.ID)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if len(loaded.Compactions) != 1 || loaded.Compactions[0].Phase != "mid_turn" || loaded.Compactions[0].Trigger != "auto" {
+		t.Fatalf("compactions = %#v, want one mid_turn auto checkpoint", loaded.Compactions)
+	}
+	if loaded.RunningTurnID != "turn-1" {
+		t.Fatalf("RunningTurnID = %q, want turn-1", loaded.RunningTurnID)
+	}
+}
+
+type compactionApplyingPublisher struct {
+	store     *sessions.V2Store
+	sessionID string
+}
+
+func (p *compactionApplyingPublisher) Publish(event eventbus.Event) error {
+	compaction, ok := event.(eventbus.CompactionRequested)
+	if !ok {
+		return nil
+	}
+	session, err := p.store.Load(p.sessionID)
+	if err != nil {
+		return err
+	}
+	_, err = p.store.SaveCompactedTurn(session, compaction.Summary, compaction.Checkpoint, nil, compaction.Checkpoint.ReplacementHistory)
+	return err
 }
 
 func TestResolveSummaryModelPinsSessionParametersForSessionModel(t *testing.T) {
