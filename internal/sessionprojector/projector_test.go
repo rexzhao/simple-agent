@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/rexzhao/simple-agent/internal/contextwindow"
 	"github.com/rexzhao/simple-agent/internal/eventbus"
@@ -447,7 +448,7 @@ func TestProjectorWithFakeBusAndStoreRecordsOrderedLifecycle(t *testing.T) {
 		t.Fatalf("round two update call = %#v, want update of %q after second AssistantReady append", store.calls[6], roundTwoToolID)
 	}
 
-	publishFake(t, &bus, store, eventbus.TurnCompleted{TurnID: "turn-1"}, 8)
+	publishFake(t, &bus, store, eventbus.TurnCompleted{TurnID: "turn-1"}, 9)
 	gotCallNames := store.callNames()
 	wantCallNames := []string{
 		"mark_running",
@@ -458,6 +459,7 @@ func TestProjectorWithFakeBusAndStoreRecordsOrderedLifecycle(t *testing.T) {
 		"append_items",
 		"update_item",
 		"clear_running",
+		"clear_interrupted",
 	}
 	if !reflect.DeepEqual(gotCallNames, wantCallNames) {
 		t.Fatalf("store call order = %#v, want %#v", gotCallNames, wantCallNames)
@@ -875,6 +877,16 @@ func (s *fakeProjectorStore) ClearRunningTurn(sessionID, turnID string) (session
 	}
 	s.session.RunningTurnID = ""
 	s.calls = append(s.calls, fakeProjectorStoreCall{name: "clear_running", seq: s.session.LastSeq})
+	return cloneProjectorTestSession(s.session), nil
+}
+
+func (s *fakeProjectorStore) ClearInterruptedTurn(sessionID string) (sessions.SessionV2, error) {
+	if err := s.requireSession(sessionID); err != nil {
+		return sessions.SessionV2{}, err
+	}
+	s.session.InterruptedTurnID = ""
+	s.session.InterruptedAt = time.Time{}
+	s.calls = append(s.calls, fakeProjectorStoreCall{name: "clear_interrupted", seq: s.session.LastSeq})
 	return cloneProjectorTestSession(s.session), nil
 }
 

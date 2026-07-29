@@ -38,6 +38,7 @@ type projectorStore interface {
 	AppendItemsAndReplaceActiveHistoryFromState(sessionID string, state sessions.SessionV2, items []sessions.SessionItem, itemIDs []string) (sessions.SessionV2, error)
 	UpdateItemFromState(sessionID string, state sessions.SessionV2, item sessions.SessionItem) (sessions.SessionItem, sessions.SessionV2, error)
 	ClearRunningTurn(sessionID, turnID string) (sessions.SessionV2, error)
+	ClearInterruptedTurn(sessionID string) (sessions.SessionV2, error)
 	MarkTurnInterrupted(sessionID, turnID string) (sessions.SessionV2, error)
 }
 
@@ -345,6 +346,12 @@ func (p *Projector) handleTurnCompleted(event eventbus.TurnCompleted) error {
 		return fmt.Errorf("turn %q has pending tool items", turnID)
 	}
 	metadata, err := p.store.ClearRunningTurn(p.session.ID, turnID)
+	if err != nil {
+		return err
+	}
+	// A successful completion clears any prior interrupted-turn marker so
+	// that a retried session does not retain the interrupted status.
+	metadata, err = p.store.ClearInterruptedTurn(p.session.ID)
 	if err != nil {
 		return err
 	}

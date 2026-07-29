@@ -407,6 +407,22 @@ func (s *V2Store) ClearRunningTurn(sessionID, turnID string) (SessionV2, error) 
 	return s.SaveMetadata(session)
 }
 
+// ClearInterruptedTurn clears stale interrupted-turn metadata. It is called
+// when a turn completes normally so that a previously interrupted session
+// does not retain the interrupted status indefinitely.
+func (s *V2Store) ClearInterruptedTurn(sessionID string) (SessionV2, error) {
+	if err := s.requireRoot(); err != nil {
+		return SessionV2{}, err
+	}
+	session, err := s.loadMetadata(sessionID)
+	if err != nil {
+		return session, err
+	}
+	session.InterruptedTurnID = ""
+	session.InterruptedAt = time.Time{}
+	return s.SaveMetadata(session)
+}
+
 func (s *V2Store) MarkTurnInterrupted(sessionID, turnID string) (SessionV2, error) {
 	if err := s.requireRoot(); err != nil {
 		return SessionV2{}, err
