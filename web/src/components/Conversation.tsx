@@ -45,7 +45,6 @@ export const Conversation = memo(function Conversation(props: {
   onCompact: () => void
 }) {
 	const messagesRef = useRef<HTMLElement>(null)
-	const loadOlderRef = useRef<HTMLButtonElement>(null)
 	const followOutputRef = useRef(true)
 	const loadingOlderRef = useRef(false)
 	const prependAnchorRef = useRef<{
@@ -270,16 +269,9 @@ export const Conversation = memo(function Conversation(props: {
 		prependAnchorRef.current = null
 		if (anchor.element?.isConnected) messages.scrollTop += anchor.element.getBoundingClientRect().top - anchor.top
 	}, [props.detail?.id, props.page])
-	useEffect(() => {
-		const messages = messagesRef.current
-		const button = loadOlderRef.current
-		if (!messages || !button || loadingOlder || !props.page?.has_more_before || typeof IntersectionObserver === 'undefined') return
-		const observer = new IntersectionObserver((entries) => {
-			if (entries.some((entry) => entry.isIntersecting)) void loadOlder()
-		}, { root: messages, threshold: 0.01 })
-		observer.observe(button)
-		return () => observer.disconnect()
-	}, [loadOlder, loadingOlder, props.page?.has_more_before])
+	// Older history pages load only on an explicit click on the "Load earlier
+	// messages" button. Scrolling to the top deliberately does not auto-load:
+	// casual upward scrolls must not silently grow the history window.
 	useEffect(() => () => {
 		if (saveMemoryFrameRef.current) cancelAnimationFrame(saveMemoryFrameRef.current)
 	}, [])
@@ -327,7 +319,7 @@ export const Conversation = memo(function Conversation(props: {
         </div>
       </header>
       <section ref={messagesRef} className="messages" aria-live="polite" onScroll={handleScroll} onWheel={cancelSettle} onTouchMove={cancelSettle} onKeyDown={cancelSettle} onPointerDown={cancelSettle}>
-        {props.page?.has_more_before && <button ref={loadOlderRef} className="load-older" disabled={loadingOlder} onClick={() => void loadOlder()}>{loadingOlder ? 'Loading earlier messages…' : 'Load earlier messages'}</button>}
+        {props.page?.has_more_before && <button className="load-older" disabled={loadingOlder} onClick={() => void loadOlder()}>{loadingOlder ? 'Loading earlier messages…' : 'Load earlier messages'}</button>}
         {!props.page && <MessageSkeleton />}
 				{conversationEntries.map((entry) => entry.kind === 'message'
 					? <Message key={entry.item.id} item={entry.item} sessionID={props.detail?.id ?? ''} onResend={entry.item === trailingUserItem ? handleResend : undefined} resendPending={resendPending} />

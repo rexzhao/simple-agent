@@ -40,7 +40,7 @@ async function twoFrames(page: Page) {
   await page.evaluate(() => new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))))
 }
 
-test('automatically loads older history and preserves the viewport anchor', async ({ page }) => {
+test('loads older history only on click and preserves the viewport anchor', async ({ page }) => {
   let release!: () => void
   const gate = new Promise<void>((resolve) => { release = resolve })
   const olderCalls = await mockApp(page, gate)
@@ -49,10 +49,15 @@ test('automatically loads older history and preserves the viewport anchor', asyn
   const anchor = page.getByText('message-101', { exact: true })
   await expect(anchor).toBeAttached()
 
+  // Scrolling to the top must not page older history by itself.
   await interruptSettle(page)
   await messages.evaluate((element) => { element.scrollTop = 0 })
-  await expect.poll(olderCalls).toBe(1)
+  await twoFrames(page)
+  expect(olderCalls()).toBe(0)
+
   const before = await anchor.evaluate((element) => element.getBoundingClientRect().top)
+  await page.getByRole('button', { name: 'Load earlier messages' }).click()
+  await expect.poll(olderCalls).toBe(1)
   release()
   await expect(page.getByText('message-51', { exact: true })).toBeAttached()
   await twoFrames(page)
@@ -70,6 +75,7 @@ test('content-visibility does not cause a second jump when older messages become
   await expect(anchor.locator('xpath=ancestor::article[1]')).toHaveCSS('content-visibility', 'auto')
   await interruptSettle(page)
   await messages.evaluate((element) => { element.scrollTop = 0 })
+  await page.getByRole('button', { name: 'Load earlier messages' }).click()
   await expect(page.getByText('message-51', { exact: true })).toBeAttached()
   await twoFrames(page)
   await anchor.scrollIntoViewIfNeeded()
@@ -185,8 +191,8 @@ test('stops following output when the user scrolls up, resumes at the bottom', a
   await page.getByRole('button', { name: 'Send' }).click()
   await expect(page.getByText(/First chunk/)).toBeAttached()
 
-  // Scroll up: output following must disengage. The scroll stays far from the
-  // top so the load-older observer does not interfere.
+  // Scroll up: output following must disengage. Loading older history needs
+  // a click, so scrolling alone cannot grow the history window here.
   await interruptSettle(page)
   await messages.evaluate((element) => { element.scrollTop -= 900 })
   await settleViewport(page)
@@ -216,7 +222,7 @@ test('sending a message while scrolled up snaps back to the bottom', async ({ pa
   const messages = page.locator('.messages')
   await expect(page.getByText('message-150', { exact: true })).toBeAttached()
 
-  // Deep in history, far from both edges: no auto-load, no follow.
+  // Deep in history, far from both edges: no load, no follow.
   await interruptSettle(page)
   await messages.evaluate((element) => { element.scrollTop = element.scrollHeight / 2 })
   await twoFrames(page)
@@ -247,9 +253,10 @@ test('a settling run keeps loaded older history and the viewport anchor', async 
   const anchor = page.getByText('message-101', { exact: true })
   await expect(anchor).toBeAttached()
 
-  // Page older history in.
+  // Page older history in with an explicit click.
   await interruptSettle(page)
   await messages.evaluate((element) => { element.scrollTop = 0 })
+  await page.getByRole('button', { name: 'Load earlier messages' }).click()
   await expect(page.getByText('message-51', { exact: true })).toBeAttached()
   await settleViewport(page)
   const before = await anchor.evaluate((element) => element.getBoundingClientRect().top)
@@ -273,7 +280,7 @@ test('opens a tall session at the bottom without paging older history', async ({
   // The settle loop must converge to the real bottom, not the estimate-based
   // position content-visibility produces on first render.
   expect(await distanceFromBottom(page)).toBeLessThanOrEqual(12)
-  // Landing at the bottom must not trip the load-older observer.
+  // Landing at the bottom must not load older history.
   expect(olderCalls()).toBe(0)
 })
 
