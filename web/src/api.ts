@@ -1,4 +1,4 @@
-import type { ActiveRunDescriptor, Bootstrap, CodexAuthStatus, ImageAttachmentInput, ItemsPage, Project, ProviderSettingsDocument, ProviderSettingsInput, RunEvent, Session, SessionModelOptions } from './types'
+import type { ActiveRunDescriptor, Bootstrap, CodexAuthStatus, ImageAttachmentInput, ItemsPage, Project, ProviderSettingsDocument, ProviderSettingsInput, RunEvent, Session, SessionModelOptions, SessionSnapshot } from './types'
 
 const tokenStorageKey = 'sai-capability-token'
 
@@ -97,6 +97,7 @@ export const api = {
   codexLoginStatus: (providerName: string) => request<CodexAuthStatus>(`/api/providers/${encodeURIComponent(providerName)}/codex-login`),
   clearCodexLogin: (providerName: string) => request<void>(`/api/providers/${encodeURIComponent(providerName)}/codex-login`, { method: 'DELETE' }),
   session: (sessionID: string) => request<Session>(`/api/sessions/${encodeURIComponent(sessionID)}`),
+  snapshot: (sessionID: string) => request<SessionSnapshot>(`/api/sessions/${encodeURIComponent(sessionID)}/snapshot`),
   renameSession: (sessionID: string, displayName: string) => request<Session>(`/api/sessions/${encodeURIComponent(sessionID)}`, {
     method: 'PATCH',
     body: JSON.stringify({ display_name: displayName }),

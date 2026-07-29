@@ -193,6 +193,13 @@ export interface ItemsPage {
   has_more_after: boolean
 }
 
+export interface SessionSnapshot {
+  session_id: string
+  revision: string
+  session: Session
+  history: ItemsPage
+}
+
 export type RunEvent =
   | { type: 'turn.started'; turn_id: string }
   | { type: 'compaction.started'; turn_id: string; trigger: 'auto' | 'manual' }
