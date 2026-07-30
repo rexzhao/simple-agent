@@ -90,6 +90,31 @@ describe('useSessionHistory', () => {
     expect(onError).not.toHaveBeenCalled()
   })
 
+  it('returns the refreshed session for background sessions while skipping the sidebar reload', async () => {
+    mocked.snapshot.mockImplementation((id) => Promise.resolve(snapshotFor(id, '10', 10)))
+    const loadSessions = vi.fn().mockResolvedValue([])
+    const onError = vi.fn()
+    const { result } = renderHook(() => useSessionHistory('a', loadSessions, onError))
+    await waitFor(() => expect(result.current.sessionDetail?.id).toBe('a'))
+    loadSessions.mockClear()
+    const refreshed = await act(async () => result.current.refreshSession('b'))
+    // Run settlement reconciliation depends on this value for
+    // non-selected sessions; only the sidebar reload stays selection-scoped.
+    expect(refreshed?.id).toBe('b')
+    expect(loadSessions).not.toHaveBeenCalled()
+  })
+
+  it('suppresses refresh errors for background sessions instead of throwing', async () => {
+    mocked.snapshot.mockImplementation((id) => id === 'a' ? Promise.resolve(snapshotFor('a', '10', 10)) : Promise.reject(new Error('boom')))
+    const loadSessions = vi.fn().mockResolvedValue([])
+    const onError = vi.fn()
+    const { result } = renderHook(() => useSessionHistory('a', loadSessions, onError))
+    await waitFor(() => expect(result.current.sessionDetail?.id).toBe('a'))
+    const refreshed = await act(async () => result.current.refreshSession('b'))
+    expect(refreshed).toBeNull()
+    expect(onError).not.toHaveBeenCalled()
+  })
+
   it('loadOlder prepends older items', async () => {
     mocked.snapshot.mockResolvedValue(snapshotFor('a', '10', 10))
     mocked.items.mockResolvedValueOnce({ items: [{ id: 'item-5', seq: 5 } as never], oldest_seq: 5, newest_seq: 5, has_more_before: false, has_more_after: false } as ItemsPage)

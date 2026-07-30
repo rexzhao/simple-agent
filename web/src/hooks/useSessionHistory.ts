@@ -26,9 +26,11 @@ export function useSessionHistory(
     if (!sessionID) return null
     try {
       const { session } = await storeRefresh(sessionID)
-      // Suppress errors for sessions the user has already navigated away from.
-      if (selectedSessionRef.current !== sessionID) return null
-      if (session.project_id) {
+      // The fetched session is always returned: run settlement reconciles
+      // background sessions through this value, and suppressing it strands
+      // their runs in reconciling until the manual-refresh banner appears.
+      // Only the sidebar reload and surfaced errors stay selection-scoped.
+      if (selectedSessionRef.current === sessionID && session.project_id) {
         try {
           await loadSessions(session.project_id)
         } catch (reason) {

@@ -170,6 +170,19 @@ function App() {
     void refreshSessionRef.current(sessionID).catch(() => {})
   }, [saveRecentStepsAndRemove])
 
+  // startReconcileTimeout: 60s timer → error_pending_refresh.
+  const startReconcileTimeout = useCallback((sessionID: string) => {
+    const existing = reconcileTimeoutRef.current[sessionID]
+    if (existing) window.clearTimeout(existing)
+    reconcileTimeoutRef.current[sessionID] = window.setTimeout(() => {
+      delete reconcileTimeoutRef.current[sessionID]
+      const run = activeRunsRef.current[sessionID]
+      if (run && run.status === 'reconciling') {
+        updateActiveRun(sessionID, run.id, (r) => ({ ...r, status: 'error_pending_refresh' }))
+      }
+    }, 60000)
+  }, [updateActiveRun])
+
   // onSnapshotApplied: unified settlement check point.
   const onSnapshotApplied = useCallback((sessionID: string, session: Session) => {
     const run = activeRunsRef.current[sessionID]
@@ -184,10 +197,15 @@ function App() {
     } else {
       if (run.status === 'error_pending_refresh') {
         updateActiveRun(sessionID, run.id, (r) => ({ ...r, status: 'reconciling' }))
+        // Re-entering reconciling needs a fresh terminal deadline: the
+        // original 60s timeout already fired when the run entered
+        // error_pending_refresh, and without one the run could strand here
+        // invisibly once the bounded retries are exhausted.
+        startReconcileTimeout(sessionID)
       }
       scheduleReconcileRetry(sessionID, run.id, run.settledLastSeq)
     }
-  }, [saveRecentStepsAndRemove, updateActiveRun])
+  }, [saveRecentStepsAndRemove, startReconcileTimeout, updateActiveRun])
 
   // scheduleReconcileRetry: backoff refresh, max 2 retries.
   const scheduleReconcileRetry = useCallback((sessionID: string, runID: string, settledLastSeq: number) => {
@@ -205,19 +223,6 @@ function App() {
     }, 2000)
   }, [onSnapshotApplied])
 
-  // startReconcileTimeout: 60s timer → error_pending_refresh.
-  const startReconcileTimeout = useCallback((sessionID: string) => {
-    const existing = reconcileTimeoutRef.current[sessionID]
-    if (existing) window.clearTimeout(existing)
-    reconcileTimeoutRef.current[sessionID] = window.setTimeout(() => {
-      delete reconcileTimeoutRef.current[sessionID]
-      const run = activeRunsRef.current[sessionID]
-      if (run && run.status === 'reconciling') {
-        updateActiveRun(sessionID, run.id, (r) => ({ ...r, status: 'error_pending_refresh' }))
-      }
-    }, 60000)
-  }, [updateActiveRun])
-
   // retryRefreshSession: manual "refresh to see latest" handler.
   const retryRefreshSession = useCallback(async (sessionID: string) => {
     const run = activeRunsRef.current[sessionID]
@@ -227,6 +232,13 @@ function App() {
       if (session) onSnapshotApplied(sessionID, session)
     } catch { /* stay in error_pending_refresh */ }
   }, [onSnapshotApplied])
+
+  // Auto-resolve pending reconciliation whenever fresh session detail
+  // arrives: navigating to a session with a stuck "Refresh needed" banner
+  // settles it without a manual click once the durable state has caught up.
+  useEffect(() => {
+    if (sessionDetail) onSnapshotApplied(sessionDetail.id, sessionDetail)
+  }, [sessionDetail, onSnapshotApplied])
 
   useEffect(() => {
     if (!completionNotice) return
@@ -503,20 +515,22 @@ function App() {
         startReconcileTimeout(sessionID)
         let settledSession: Session | null = null
         try {
-          const result = await refreshSession(sessionID)
-          settledSession = result
-          if (result && activeRunsRef.current[sessionID]?.id === runID) {
-            const durableLastSeq = result.last_seq ?? 0
-            if (settledLastSeq === 0 || durableLastSeq >= settledLastSeq) {
-              saveRecentStepsAndRemove(sessionID, runID)
-            } else {
-              // Not caught up; onSnapshotApplied (if triggered) schedules backoff.
-              // If not triggered (discard), schedule backoff here as fallback.
-              scheduleReconcileRetry(sessionID, runID, settledLastSeq)
-            }
-          }
+          settledSession = await refreshSession(sessionID)
         } catch {
-          update((run) => ({ ...run, status: 'error_pending_refresh' }))
+          // Fall through to the bounded reconcile retry below: a transient
+          // refresh failure must not strand the run on the manual-refresh
+          // banner while the state is still converging.
+        }
+        if (activeRunsRef.current[sessionID]?.id === runID) {
+          const durableLastSeq = settledSession?.last_seq ?? 0
+          if (settledSession && (settledLastSeq === 0 || durableLastSeq >= settledLastSeq)) {
+            saveRecentStepsAndRemove(sessionID, runID)
+          } else {
+            // Refresh failed or the store is genuinely behind: keep
+            // reconciling with bounded retries. The 60s reconcile timeout is
+            // the terminal fallback that surfaces the Refresh banner.
+            scheduleReconcileRetry(sessionID, runID, settledLastSeq)
+          }
         }
         if (settledStatus === 'committed' && selectedSessionRef.current !== sessionID) {
           setCompletionNotice({
