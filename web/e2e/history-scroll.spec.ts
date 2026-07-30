@@ -24,6 +24,7 @@ async function mockApp(page: Page, olderGate?: Promise<void>) {
     else if (url.pathname === `/api/projects/${project.id}/sessions`) body = { sessions: url.searchParams.get('archived') === 'true' ? [] : [session] }
     else if (url.pathname === '/api/runs/active') body = { runs: [] }
     else if (url.pathname === `/api/sessions/${session.id}`) body = session
+    else if (url.pathname === `/api/sessions/${session.id}/snapshot`) body = { session_id: session.id, revision: String(session.last_seq), session, history: { items: items(101, 150), oldest_seq: 101, newest_seq: 150, has_more_before: true, has_more_after: false } }
     else if (url.pathname === `/api/sessions/${session.id}/items`) {
       if (url.searchParams.has('before_seq')) {
         olderCalls++
@@ -75,6 +76,12 @@ test('requests history pages with turn alignment enabled', async ({ page }) => {
     if (url.pathname === `/api/projects/${project.id}/sessions`) return json(route, { sessions: url.searchParams.get('archived') === 'true' ? [] : [session] })
     if (url.pathname === '/api/runs/active') return json(route, { runs: [] })
     if (url.pathname === `/api/sessions/${session.id}`) return json(route, session)
+    if (url.pathname === `/api/sessions/${session.id}/snapshot`) {
+      const latest = options.latestItems?.() ?? items(101, 150)
+      const seqs = latest.map((item) => Number((item as { seq?: number }).seq ?? 0)).filter(Boolean)
+      const lastSeq = seqs.at(-1) ?? session.last_seq
+      return json(route, { session_id: session.id, revision: String(lastSeq), session: { ...session, last_seq: lastSeq }, history: { items: latest, oldest_seq: seqs[0] ?? 0, newest_seq: seqs.at(-1) ?? 0, has_more_before: options.hasMoreBefore ?? true, has_more_after: false } })
+    }
     if (url.pathname === `/api/sessions/${session.id}/items`) {
       itemQueries.push(url.search)
       if (url.searchParams.has('before_seq')) {
@@ -157,6 +164,9 @@ async function mockStreamingApp(
     if (url.pathname === `/api/projects/${project.id}/sessions`) return json(route, { sessions: url.searchParams.get('archived') === 'true' ? [] : [session] })
     if (url.pathname === '/api/runs/active') return json(route, { runs: options.activeRuns?.() ?? [] })
     if (url.pathname === `/api/sessions/${session.id}`) return json(route, session)
+    if (url.pathname === `/api/sessions/${session.id}/snapshot`) {
+      return json(route, { session_id: session.id, revision: String(session.last_seq), session, history: { items: items(101, 150), oldest_seq: 101, newest_seq: 150, has_more_before: true, has_more_after: false } })
+    }
     if (url.pathname === `/api/sessions/${session.id}/items`) {
       if (url.searchParams.has('before_seq')) {
         return json(route, { items: items(51, 100), oldest_seq: 51, newest_seq: 100, has_more_before: false, has_more_after: false })
@@ -325,6 +335,8 @@ async function mockTwoSessionApp(page: Page) {
     if (url.pathname === '/api/runs/active') return json(route, { runs: [] })
     if (url.pathname === `/api/sessions/${session.id}`) return json(route, session)
     if (url.pathname === `/api/sessions/${sessionB.id}`) return json(route, sessionB)
+    if (url.pathname === `/api/sessions/${session.id}/snapshot`) return json(route, { session_id: session.id, revision: String(session.last_seq), session, history: { items: items(101, 150), oldest_seq: 101, newest_seq: 150, has_more_before: false, has_more_after: false } })
+    if (url.pathname === `/api/sessions/${sessionB.id}/snapshot`) return json(route, { session_id: sessionB.id, revision: String(sessionB.last_seq), session: sessionB, history: { items: items(1, 3), oldest_seq: 1, newest_seq: 3, has_more_before: false, has_more_after: false } })
     if (url.pathname === `/api/sessions/${session.id}/items`) {
       return json(route, { items: items(101, 150), oldest_seq: 101, newest_seq: 150, has_more_before: false, has_more_after: false })
     }

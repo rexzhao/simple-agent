@@ -36,6 +36,12 @@ async function mockApp(page: Page, options: { gates: Gate[]; initialItems?: Arra
     if (url.pathname === `/api/projects/${project.id}/sessions`) return json(route, { sessions: url.searchParams.get('archived') === 'true' ? [] : [session] })
     if (url.pathname === '/api/runs/active') return json(route, { runs: [] })
     if (url.pathname === `/api/sessions/${session.id}`) return json(route, session)
+    if (url.pathname === `/api/sessions/${session.id}/snapshot`) {
+      const items = options.committedItems?.() ?? options.initialItems ?? []
+      const seqs = items.map((item) => Number((item as { seq?: number }).seq ?? 0)).filter(Boolean)
+      const lastSeq = seqs.at(-1) ?? 0
+      return json(route, { session_id: session.id, revision: String(lastSeq), session: { ...session, last_seq: lastSeq }, history: { items, oldest_seq: seqs[0] ?? 0, newest_seq: seqs.at(-1) ?? 0, has_more_before: false, has_more_after: false } })
+    }
     if (url.pathname === `/api/sessions/${session.id}/items`) {
       const items = options.committedItems?.() ?? options.initialItems ?? []
       const seqs = items.map((item) => Number((item as { seq?: number }).seq ?? 0)).filter(Boolean)

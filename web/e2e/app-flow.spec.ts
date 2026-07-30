@@ -59,7 +59,7 @@ function commonBootstrap(pathname: string): unknown | undefined {
   return undefined
 }
 
-async function mockExistingSessionApp(page: Page, handler?: (route: Route, url: URL) => Promise<boolean>) {
+async function mockExistingSessionApp(page: Page, handler?: (route: Route, url: URL) => Promise<boolean>, options?: { sessionLastSeq?: () => number }) {
   await page.route('**/api/**', async (route) => {
     const url = new URL(route.request().url())
     if (handler && await handler(route, url)) return
@@ -69,8 +69,12 @@ async function mockExistingSessionApp(page: Page, handler?: (route: Route, url: 
     if (url.pathname === `/api/projects/${project.id}/sessions`) {
       return json(route, { sessions: url.searchParams.get('archived') === 'true' ? [] : [session] })
     }
-    if (url.pathname === `/api/sessions/${session.id}`) return json(route, session)
-    if (url.pathname === `/api/sessions/${session.id}/snapshot`) return json(route, { session_id: session.id, revision: String(session.last_seq), session, history: itemsPage() })
+    const effectiveLastSeq = options?.sessionLastSeq?.() ?? session.last_seq
+    const effectiveSession = { ...session, last_seq: effectiveLastSeq }
+    if (url.pathname === `/api/sessions/${session.id}`) return json(route, effectiveSession)
+    if (url.pathname === `/api/sessions/${session.id}/snapshot`) {
+      return json(route, { session_id: session.id, revision: String(effectiveLastSeq), session: effectiveSession, history: itemsPage() })
+    }
     if (url.pathname === `/api/sessions/${session.id}/items`) return json(route, itemsPage())
     return json(route, { error: { code: 'not_mocked', message: `${route.request().method()} ${url.pathname} was not mocked` } }, 404)
   })
@@ -226,7 +230,7 @@ test('resyncs a recovered run from durable session history', async ({ page }) =>
       return true
     }
     return false
-  })
+  }, { sessionLastSeq: () => 2 })
 
   await page.goto('/')
   await expect(page.locator('.message.assistant:not(.transient)')).toContainText('Recovered answer')
@@ -276,6 +280,10 @@ test('renames sessions and projects and confirms project-wide deletion', async (
     }
     if (url.pathname === `/api/sessions/${session.id}` && request.method() === 'GET') {
       await json(route, currentSession)
+      return true
+    }
+    if (url.pathname === `/api/sessions/${session.id}/snapshot`) {
+      await json(route, { session_id: session.id, revision: String(currentSession.last_seq), session: currentSession, history: itemsPage() })
       return true
     }
     if (url.pathname === `/api/projects/${project.id}/archive` && request.method() === 'POST') {
