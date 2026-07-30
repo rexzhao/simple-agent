@@ -464,6 +464,9 @@ function ContextUsage(props: { context: Session['context']; activeInputTokens?: 
 }
 
 const Message = memo(function Message({ item, sessionID, onResend, resendPending }: { item: SessionItem; sessionID: string; onResend?: (item: SessionItem) => void; resendPending?: boolean }) {
+  // A compaction record is the durable divider marking where earlier
+  // messages were summarized; it renders as one muted line, not a bubble.
+  if (item.kind === 'compaction') return <CompactionRecord item={item} />
   const role = item.message?.role
   const text = item.message?.content?.inline || item.message?.content?.preview || ''
   const images = item.message?.images ?? []
@@ -694,6 +697,19 @@ function buildActiveRunSegments(steps: RunStep[]) {
   return segments
 }
 
+// CompactionRecord renders the durable compaction marker as a subtle
+// one-line divider in the message flow.
+function CompactionRecord({ item }: { item: SessionItem }) {
+  const text = itemText(item) || 'Context compacted'
+  return (
+    <div className="compaction-record" role="note" title="Earlier messages were summarized to fit the context window">
+      <span className="compaction-record-rule" aria-hidden="true" />
+      <span className="compaction-record-text">{text}</span>
+      <span className="compaction-record-rule" aria-hidden="true" />
+    </div>
+  )
+}
+
 const markdownComponents: Components = {
   a: ({ node: _node, ...props }) => <a {...props} target="_blank" rel="noreferrer noopener" />,
 }
@@ -725,7 +741,11 @@ function buildConversationEntries(items: SessionItem[], sessionID: string, recen
 		const recentSteps = recentKey && !emittedRecentTurns.has(recentKey) ? recentStepsByTurn[recentKey] : undefined
 		const displayedSteps = recentSteps?.length ? recentSteps : steps
 		if (displayedSteps.length > 0) {
-			entries.push({ kind: 'process', id: `process-${sessionID}-${turnID || displayedSteps[0].id}`, createdAt: processCreatedAt, lastSeq: processLastSeq, steps: displayedSteps })
+			// The id must stay unique per group: a mid-turn user message or a
+			// compaction record splits one turn into several process groups.
+			// The id must stay unique per group: a mid-turn user message or a
+			// compaction record splits one turn into several process groups.
+			entries.push({ kind: 'process', id: `process-${sessionID}-${turnID || displayedSteps[0].id}-${processLastSeq}`, createdAt: processCreatedAt, lastSeq: processLastSeq, steps: displayedSteps })
 		}
 		if (recentKey && recentSteps?.length) emittedRecentTurns.add(recentKey)
 		steps = []

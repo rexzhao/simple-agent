@@ -191,12 +191,35 @@ func (p *Projector) handleCompactionRequested(event eventbus.CompactionRequested
 	if event.Context != nil {
 		p.session.Context = *event.Context
 	}
-	next, err := p.store.SaveCompactedTurn(p.session, event.Summary, event.Checkpoint, nil, event.Checkpoint.ReplacementHistory)
+	record := compactionRecordItem(event.Checkpoint, p.turnID)
+	next, err := p.store.SaveCompactedTurn(p.session, event.Summary, event.Checkpoint, []sessions.SessionItem{record}, event.Checkpoint.ReplacementHistory)
 	if err != nil {
 		return err
 	}
 	p.session = next
 	return nil
+}
+
+// compactionRecordItem builds the durable, user-visible record marking where
+// a compaction cut the chat timeline. Unlike the hidden model-audience
+// summary, it renders as a one-line divider in the conversation. It is
+// deliberately not part of the replacement (active) history, so the model
+// never sees it. The id derives from the summary item id, which is validated
+// non-empty and unique per session.
+func compactionRecordItem(checkpoint sessions.CompactionCheckpoint, turnID string) sessions.SessionItem {
+	text := "Context compacted"
+	if checkpoint.Trigger == "auto" {
+		text = "Context compacted automatically"
+	}
+	return sessions.SessionItem{
+		ID:         checkpoint.SummaryItemID + "-record",
+		TurnID:     turnID,
+		CreatedAt:  checkpoint.CreatedAt,
+		Kind:       sessions.ItemKindCompaction,
+		Visibility: sessions.ItemVisibilityVisible,
+		Audience:   sessions.ItemAudienceUser,
+		Message:    &model.Message{Role: model.MessageRoleDeveloper, Content: text},
+	}
 }
 
 func (p *Projector) handleTurnInputReady(event eventbus.TurnInputReady) error {

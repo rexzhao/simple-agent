@@ -70,6 +70,59 @@ describe('Conversation identity boundary', () => {
     expect(screen.getByTitle('Refresh session')).toBeDefined()
   })
 
+  it('renders a compaction item as a one-line record instead of a chat bubble', () => {
+    const detail = session('s1')
+    const page: ItemsPage = {
+      items: [
+        { seq: 1, id: 'm1', created_at: '', kind: 'message', visibility: 'visible', audience: 'user', message: { role: 'user', content: { inline: 'hello' } } },
+        { seq: 2, id: 'summary-1-record', created_at: '', kind: 'compaction', visibility: 'visible', audience: 'user', message: { role: 'developer', content: { inline: 'Context compacted automatically' } } },
+        { seq: 3, id: 'm2', created_at: '', kind: 'message', visibility: 'visible', audience: 'model', message: { role: 'assistant', content: { inline: 'hi there' } } },
+      ],
+      oldest_seq: 1, newest_seq: 3, has_more_before: false, has_more_after: false,
+    }
+    const { container } = render(<Conversation {...baseProps} sessionID="s1" detail={detail} page={page} />)
+    const record = screen.getByText('Context compacted automatically')
+    expect(record.closest('.compaction-record')).not.toBeNull()
+    expect(record.closest('.message')).toBeNull()
+    expect(container.querySelectorAll('.compaction-record .compaction-record-rule')).toHaveLength(2)
+    // The surrounding conversation renders as regular bubbles around the record.
+    expect(container.querySelectorAll('.message')).toHaveLength(2)
+  })
+
+  it('splits one turn into separate process groups around a compaction record without key collisions', () => {
+    const detail = session('s1')
+    const toolCallItem = (seq: number, callID: string) => ({
+      seq, id: `asst-${callID}`, turn_id: 'turn-1', created_at: '', kind: 'message', visibility: 'visible', audience: 'model',
+      message: { role: 'assistant', content: { inline: '' }, tool_calls: [{ id: callID, name: 'bash' }] },
+    })
+    const toolResultItem = (seq: number, callID: string, result: string) => ({
+      seq, id: `tool-${callID}`, turn_id: 'turn-1', created_at: '', kind: 'message', visibility: 'visible', audience: 'model',
+      message: { role: 'tool', tool_call_id: callID, content: { inline: result } },
+    })
+    const page: ItemsPage = {
+      items: [
+        { seq: 1, id: 'u1', turn_id: 'turn-1', created_at: '', kind: 'message', visibility: 'visible', audience: 'user', message: { role: 'user', content: { inline: 'run tools' } } },
+        toolCallItem(2, 'tc-1'),
+        toolResultItem(3, 'tc-1', 'result one'),
+        { seq: 4, id: 'summary-1-record', turn_id: 'turn-1', created_at: '', kind: 'compaction', visibility: 'visible', audience: 'user', message: { role: 'developer', content: { inline: 'Context compacted automatically' } } },
+        toolCallItem(5, 'tc-2'),
+        toolResultItem(6, 'tc-2', 'result two'),
+        { seq: 7, id: 'a-final', turn_id: 'turn-1', created_at: '', kind: 'message', visibility: 'visible', audience: 'model', message: { role: 'assistant', content: { inline: 'done' } } },
+      ],
+      oldest_seq: 1, newest_seq: 7, has_more_before: false, has_more_after: false,
+    }
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+    try {
+      const { container } = render(<Conversation {...baseProps} sessionID="s1" detail={detail} page={page} />)
+      expect(container.querySelectorAll('.process-message')).toHaveLength(2)
+      expect(screen.getByText('Context compacted automatically').closest('.compaction-record')).not.toBeNull()
+      const keyWarnings = errorSpy.mock.calls.filter((args) => String(args[0]).includes('same key'))
+      expect(keyWarnings).toHaveLength(0)
+    } finally {
+      errorSpy.mockRestore()
+    }
+  })
+
   it('does not show refresh button when activeRun is running', () => {
     const detail = session('s1')
     const run: ActiveRun = {

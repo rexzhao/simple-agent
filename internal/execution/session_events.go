@@ -771,6 +771,12 @@ func sessionItemVisibleInChat(item sessions.SessionItem) bool {
 	if item.Visibility != sessions.ItemVisibilityVisible || item.Message == nil {
 		return false
 	}
+	// Visible compaction records are the durable "context compacted" divider
+	// in the chat timeline. Hidden model-audience compaction payloads (the
+	// summary and remote provider items) stay out of the chat.
+	if item.Kind == sessions.ItemKindCompaction {
+		return item.Audience == sessions.ItemAudienceUser
+	}
 	if item.Kind != sessions.ItemKindMessage {
 		return false
 	}

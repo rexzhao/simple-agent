@@ -324,8 +324,26 @@ func TestProjectorRefreshesCachedStateAfterCompaction(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Replay() error = %v", err)
 	}
-	if replayed.LastSeq != 14 {
-		t.Fatalf("LastSeq = %d, want 14", replayed.LastSeq)
+	if replayed.LastSeq != 15 {
+		t.Fatalf("LastSeq = %d, want 15", replayed.LastSeq)
+	}
+	record, ok := sessionItemByID(replayed.Items, "summary-1-record")
+	if !ok {
+		t.Fatalf("compaction record item missing from %#v", replayed.Items)
+	}
+	if record.Kind != sessions.ItemKindCompaction || record.Visibility != sessions.ItemVisibilityVisible || record.Audience != sessions.ItemAudienceUser {
+		t.Fatalf("compaction record kind/visibility/audience = %q/%q/%q, want compaction/visible/user", record.Kind, record.Visibility, record.Audience)
+	}
+	if record.TurnID != "turn-1" {
+		t.Fatalf("compaction record turn_id = %q, want turn-1", record.TurnID)
+	}
+	if record.Message == nil || record.Message.Content != "Context compacted" {
+		t.Fatalf("compaction record message = %#v, want divider text", record.Message)
+	}
+	for _, id := range replayed.ActiveHistory {
+		if id == record.ID {
+			t.Fatalf("compaction record must stay out of active history: %#v", replayed.ActiveHistory)
+		}
 	}
 	if len(replayed.ActiveHistory) != 2 || replayed.ActiveHistory[0] != "summary-1" {
 		t.Fatalf("ActiveHistory = %#v, want summary then new user", replayed.ActiveHistory)

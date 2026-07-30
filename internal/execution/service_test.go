@@ -1180,6 +1180,27 @@ func TestServiceCompactSessionUsesConfiguredPlanner(t *testing.T) {
 	if got := messageContents(messages); !sameStringSlice(got, []string{"manual summary"}) {
 		t.Fatalf("active messages = %#v, want compacted summary", got)
 	}
+
+	// The durable compaction record shows in the chat timeline as the divider;
+	// the hidden summary itself stays out of the chat.
+	page, err := service.GetSessionChatItems(session.ID)
+	if err != nil {
+		t.Fatalf("GetSessionChatItems() error = %v", err)
+	}
+	if got := executionSessionItemIDs(page.Items); !sameStringSlice(got, []string{"old-user", "old-assistant", "manual-summary-record"}) {
+		t.Fatalf("chat item IDs = %#v, want conversation plus compaction record", got)
+	}
+	for _, item := range page.Items {
+		if item.ID != "manual-summary-record" {
+			continue
+		}
+		if item.Kind != sessions.ItemKindCompaction || item.Visibility != sessions.ItemVisibilityVisible || item.Audience != sessions.ItemAudienceUser {
+			t.Fatalf("record kind/visibility/audience = %q/%q/%q, want compaction/visible/user", item.Kind, item.Visibility, item.Audience)
+		}
+		if item.Message == nil || item.Message.Content == nil || item.Message.Content.Inline != "Context compacted" {
+			t.Fatalf("record content = %#v, want manual divider text", item.Message)
+		}
+	}
 }
 
 func TestServiceSendSessionMessageRunsAutoCompactionBeforeTurn(t *testing.T) {
@@ -1212,8 +1233,8 @@ func TestServiceSendSessionMessageRunsAutoCompactionBeforeTurn(t *testing.T) {
 			}}, nil
 		},
 		run: func(ctx context.Context, request SessionTurnRequest) (SessionTurnResult, error) {
-			if got := sessionItemIDs(request.Session.Items); !sameStringSet(got, []string{"seed-user", "seed-assistant", "summary-1"}) {
-				t.Fatalf("RunSessionTurn session items = %#v, want compacted summary before turn", got)
+			if got := sessionItemIDs(request.Session.Items); !sameStringSet(got, []string{"seed-user", "seed-assistant", "summary-1", "summary-1-record"}) {
+				t.Fatalf("RunSessionTurn session items = %#v, want compacted summary and record before turn", got)
 			}
 			if err := request.Publisher.Publish(eventAssistant(request.TurnID, "after compaction")); err != nil {
 				return SessionTurnResult{}, err
@@ -1264,6 +1285,16 @@ func TestServiceSendSessionMessageRunsAutoCompactionBeforeTurn(t *testing.T) {
 	}
 	if got := messageContents(messages); !sameStringSlice(got, []string{"summary", "new prompt", "after compaction"}) {
 		t.Fatalf("active messages = %#v, want summary plus new turn", got)
+	}
+	for _, item := range loaded.Items {
+		if item.ID == "summary-1-record" {
+			if item.Message == nil || item.Message.Content != "Context compacted automatically" {
+				t.Fatalf("auto compaction record content = %#v, want automatic divider text", item.Message)
+			}
+			if item.TurnID != result.TurnID {
+				t.Fatalf("auto compaction record turn_id = %q, want %q", item.TurnID, result.TurnID)
+			}
+		}
 	}
 }
 
