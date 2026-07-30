@@ -8,6 +8,7 @@ import (
 	"net"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -765,33 +766,41 @@ func (s *Service) SetSessionFullAccess(id string, fullAccess bool) (SessionDetai
 	return sessionDetailFromStore(saved), nil
 }
 
+// ArchiveSession archives the session together with every descendant session
+// reachable through parent links (children, grandchildren, …). The cascade is
+// all-or-nothing: the whole subtree is locked up front, so a running turn on
+// any session in the subtree rejects the operation before anything changes.
 func (s *Service) ArchiveSession(id string) (SessionDetail, error) {
 	if s == nil || s.sessionStore == nil {
 		return SessionDetail{}, fmt.Errorf("execution session store is not configured")
 	}
-	writeLock, err := s.acquireSessionMutationLock(id)
+	subtree, err := s.sessionSubtreeIDs(id)
 	if err != nil {
 		return SessionDetail{}, err
 	}
-	defer func() { _ = writeLock.Release() }()
+	locks, err := s.acquireSessionMutationLocks(subtree)
+	if err != nil {
+		return SessionDetail{}, err
+	}
+	defer releaseSessionMutationLocks(locks)
 
-	session, err := s.sessionStore.Load(id)
+	subtreeSessions, err := s.loadSubtreeSessions(subtree, id)
 	if err != nil {
 		return SessionDetail{}, err
 	}
-	if strings.TrimSpace(session.RunningTurnID) != "" {
-		return SessionDetail{}, ErrSessionBusy
-	}
-	if !session.Archived {
-		session.Archived = true
-		var saved sessions.SessionV2
-		saved, err = s.sessionStore.SaveMetadata(session)
-		if err != nil {
-			return SessionDetail{}, err
+	for _, sessionID := range subtree {
+		session, ok := subtreeSessions[sessionID]
+		if !ok || session.Archived {
+			continue
 		}
-		session = saved
+		session.Archived = true
+		saved, saveErr := s.sessionStore.SaveMetadata(session)
+		if saveErr != nil {
+			return SessionDetail{}, saveErr
+		}
+		subtreeSessions[sessionID] = saved
 	}
-	return sessionDetailFromStore(session), nil
+	return sessionDetailFromStore(subtreeSessions[id]), nil
 }
 
 func (s *Service) RestoreSession(id string) (SessionDetail, error) {
@@ -823,52 +832,182 @@ func (s *Service) RestoreSession(id string) (SessionDetail, error) {
 	return sessionDetailFromStore(saved), nil
 }
 
+// RemoveSession permanently deletes the session together with every
+// descendant session reachable through parent links. The target must be
+// archived first; still-active descendants are archived as part of the
+// cascade so no run can start on them once the locks drop. The whole subtree
+// is locked while validating, so a running turn anywhere in it rejects the
+// removal before anything changes.
 func (s *Service) RemoveSession(id string) (SessionRemoveResult, error) {
 	if s == nil || s.sessionStore == nil {
 		return SessionRemoveResult{}, fmt.Errorf("execution session store is not configured")
 	}
-	writeLock, err := s.acquireSessionMutationLock(id)
+	subtree, err := s.sessionSubtreeIDs(id)
 	if err != nil {
 		return SessionRemoveResult{}, err
 	}
-	defer func() { _ = writeLock.Release() }()
+	locks, err := s.acquireSessionMutationLocks(subtree)
+	if err != nil {
+		return SessionRemoveResult{}, err
+	}
+	defer releaseSessionMutationLocks(locks)
 
-	session, err := s.sessionStore.Load(id)
+	subtreeSessions, err := s.loadSubtreeSessions(subtree, id)
 	if err != nil {
 		return SessionRemoveResult{}, err
 	}
-	if strings.TrimSpace(session.RunningTurnID) != "" {
-		return SessionRemoveResult{}, ErrSessionBusy
-	}
-	if !session.Archived {
+	if !subtreeSessions[id].Archived {
 		return SessionRemoveResult{}, fmt.Errorf("archive session before removing it")
+	}
+	deleteOrder := make([]sessions.SessionV2, 0, len(subtreeSessions))
+	for _, sessionID := range subtree {
+		session, ok := subtreeSessions[sessionID]
+		if !ok {
+			continue
+		}
+		if !session.Archived {
+			session.Archived = true
+			saved, saveErr := s.sessionStore.SaveMetadata(session)
+			if saveErr != nil {
+				return SessionRemoveResult{}, saveErr
+			}
+			session = saved
+		}
+		deleteOrder = append(deleteOrder, session)
 	}
 	// Windows cannot remove a directory while its write.lock handle is open.
 	// The archived state prevents a new run from starting after this release.
-	if err := writeLock.Release(); err != nil {
-		return SessionRemoveResult{}, fmt.Errorf("release session write lock: %w", err)
+	releaseSessionMutationLocks(locks)
+
+	// Deepest sessions first: a partial failure leaves the parent in place so
+	// a retry can finish the cascade instead of leaving orphaned children.
+	sort.SliceStable(deleteOrder, func(i, j int) bool {
+		if deleteOrder[i].SpawnDepth != deleteOrder[j].SpawnDepth {
+			return deleteOrder[i].SpawnDepth > deleteOrder[j].SpawnDepth
+		}
+		return deleteOrder[i].ID < deleteOrder[j].ID
+	})
+	for _, session := range deleteOrder {
+		if session.ID == id {
+			continue
+		}
+		if err := s.sessionStore.Delete(session.ID); err != nil && !errors.Is(err, sessions.ErrNotFound) {
+			return SessionRemoveResult{}, err
+		}
 	}
-	if err := s.sessionStore.Delete(session.ID); err != nil {
+	if err := s.sessionStore.Delete(id); err != nil {
 		return SessionRemoveResult{}, err
 	}
-	return SessionRemoveResult{Status: "removed", ID: session.ID}, nil
+	return SessionRemoveResult{Status: "removed", ID: id}, nil
 }
 
-func (s *Service) acquireSessionMutationLock(id string) (*sessions.SessionWriteLock, error) {
+// sessionSubtreeIDs returns the sorted ids of the subtree rooted at rootID:
+// rootID itself plus every descendant reachable through parent links. The
+// traversal is cycle-safe, so corrupted lineage can never send it into a
+// loop, and the sorted result gives every caller the same multi-lock
+// acquisition order.
+func (s *Service) sessionSubtreeIDs(rootID string) ([]string, error) {
 	if s == nil || s.sessionStore == nil {
 		return nil, fmt.Errorf("execution session store is not configured")
 	}
+	infos, err := s.sessionStore.ListWithOptions(sessions.V2ListOptions{All: true})
+	if err != nil {
+		return nil, err
+	}
+	childrenByParent := make(map[string][]string)
+	for _, info := range infos {
+		if parent := strings.TrimSpace(info.ParentSessionID); parent != "" {
+			childrenByParent[parent] = append(childrenByParent[parent], info.ID)
+		}
+	}
+	ids := []string{rootID}
+	seen := map[string]bool{rootID: true}
+	queue := []string{rootID}
+	for len(queue) > 0 {
+		parent := queue[0]
+		queue = queue[1:]
+		for _, child := range childrenByParent[parent] {
+			if seen[child] {
+				continue
+			}
+			seen[child] = true
+			ids = append(ids, child)
+			queue = append(queue, child)
+		}
+	}
+	sort.Strings(ids)
+	return ids, nil
+}
+
+// loadSubtreeSessions loads every session in the subtree while the caller
+// holds the subtree locks and rejects the operation with ErrSessionBusy when
+// any session has a running turn. requiredID identifies the operation target:
+// it must exist, while a concurrently removed descendant is simply skipped.
+func (s *Service) loadSubtreeSessions(subtree []string, requiredID string) (map[string]sessions.SessionV2, error) {
+	loaded := make(map[string]sessions.SessionV2, len(subtree))
+	for _, sessionID := range subtree {
+		session, err := s.sessionStore.Load(sessionID)
+		if errors.Is(err, sessions.ErrNotFound) && sessionID != requiredID {
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		if strings.TrimSpace(session.RunningTurnID) != "" {
+			return nil, ErrSessionBusy
+		}
+		loaded[sessionID] = session
+	}
+	return loaded, nil
+}
+
+func (s *Service) acquireSessionMutationLock(id string) (*sessions.SessionWriteLock, error) {
+	locks, err := s.acquireSessionMutationLocks([]string{id})
+	if err != nil {
+		return nil, err
+	}
+	return locks[0], nil
+}
+
+// acquireSessionMutationLocks acquires the per-session writer locks for ids
+// in deterministic sorted order so concurrent subtree operations cannot
+// deadlock. A single shared timeout bounds the whole batch; on any failure
+// every lock taken so far is released. context.DeadlineExceeded maps to
+// ErrSessionBusy, matching the single-session mutation contract.
+func (s *Service) acquireSessionMutationLocks(ids []string) ([]*sessions.SessionWriteLock, error) {
+	if s == nil || s.sessionStore == nil {
+		return nil, fmt.Errorf("execution session store is not configured")
+	}
+	sorted := append([]string(nil), ids...)
+	sort.Strings(sorted)
 	ctx := context.Background()
 	cancel := func() {}
 	if s.sessionWriteLockTimeout > 0 {
 		ctx, cancel = context.WithTimeout(ctx, s.sessionWriteLockTimeout)
 	}
 	defer cancel()
-	lock, err := s.sessionStore.AcquireSessionWriteLock(ctx, id)
-	if errors.Is(err, context.DeadlineExceeded) {
-		return nil, ErrSessionBusy
+	locks := make([]*sessions.SessionWriteLock, 0, len(sorted))
+	for _, id := range sorted {
+		lock, err := s.sessionStore.AcquireSessionWriteLock(ctx, id)
+		if errors.Is(err, context.DeadlineExceeded) {
+			releaseSessionMutationLocks(locks)
+			return nil, ErrSessionBusy
+		}
+		if err != nil {
+			releaseSessionMutationLocks(locks)
+			return nil, err
+		}
+		locks = append(locks, lock)
 	}
-	return lock, err
+	return locks, nil
+}
+
+// releaseSessionMutationLocks releases every lock in the batch. Release is
+// idempotent, so a batch may be released both explicitly and via defer.
+func releaseSessionMutationLocks(locks []*sessions.SessionWriteLock) {
+	for _, lock := range locks {
+		_ = lock.Release()
+	}
 }
 
 func (s *Service) SendSessionMessage(ctx context.Context, id, content string) (SessionMessageResult, error) {

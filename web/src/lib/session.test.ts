@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import type { ActiveRun, Session, SessionItem } from '../types'
-import { buildSessionTree, flattenSessionTree, visibleSessionItems } from './session'
+import { buildSessionTree, flattenSessionTree, sessionDescendantIDs, visibleSessionItems } from './session'
 
 function session(id: string, options: Partial<Session> = {}): Session {
   return {
@@ -60,6 +60,26 @@ describe('buildSessionTree', () => {
     const roots = buildSessionTree([missing, cycleA, cycleB])
     expect(new Set(roots.map((node) => node.session.id))).toEqual(new Set(['missing-child', 'cycle-a', 'cycle-b']))
     expect(roots.every((node) => node.orphaned)).toBe(true)
+  })
+})
+
+describe('sessionDescendantIDs', () => {
+  it('collects children and grandchildren but not unrelated roots', () => {
+    const root = session('root')
+    const child = session('child', { parent_session_id: 'root', root_session_id: 'root', spawn_depth: 1 })
+    const grandchild = session('grandchild', { parent_session_id: 'child', root_session_id: 'root', spawn_depth: 2 })
+    const other = session('other')
+
+    expect(sessionDescendantIDs([root, grandchild, other, child], 'root')).toEqual(['child', 'grandchild'])
+    expect(sessionDescendantIDs([root, child, grandchild, other], 'child')).toEqual(['grandchild'])
+    expect(sessionDescendantIDs([root, child, grandchild, other], 'other')).toEqual([])
+  })
+
+  it('never loops on corrupted cycles', () => {
+    const cycleA = session('cycle-a', { parent_session_id: 'cycle-b', root_session_id: 'cycle-a' })
+    const cycleB = session('cycle-b', { parent_session_id: 'cycle-a', root_session_id: 'cycle-a' })
+
+    expect(sessionDescendantIDs([cycleA, cycleB], 'cycle-a')).toEqual(['cycle-b'])
   })
 })
 

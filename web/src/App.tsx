@@ -3,7 +3,7 @@ import { api, streamRun } from './api'
 import type { ActiveRun, ActiveRunDescriptor, Bootstrap, ImageAttachmentInput, ItemsPage, Project, RunEvent, RunStep, Session, SessionItem, SessionModelOption } from './types'
 import { errorMessage } from './lib/format'
 import { reduceRunEvent } from './lib/runEventReducer'
-import { modelKey, orderSessions, processKey, projectName, sessionName } from './lib/session'
+import { modelKey, orderSessions, processKey, projectName, sessionDescendantIDs, sessionName } from './lib/session'
 import { emptyComposerDraft } from './components/Composer'
 import type { PastedImageAttachment } from './components/Composer'
 import { Conversation } from './components/Conversation'
@@ -385,14 +385,22 @@ function App() {
   }, [loadSessions, refreshSession, selectedSessionRef])
 
   const archiveSession = useCallback(async (session: Session) => {
-    if (session.status === 'running' || activeRunsRef.current[session.id]?.status === 'running' || !window.confirm(`Archive "${sessionName(session)}"? It will be hidden from the current list.`)) return
+    // The backend archives the whole subtree together, so guard and confirm
+    // against every descendant, not just the target.
+    const projectSessions = sessionsByProject[session.project_id] ?? []
+    const subtreeIDs = [session.id, ...sessionDescendantIDs(projectSessions, session.id)]
+    const busyIDs = new Set(projectSessions.filter((item) => item.status === 'running').map((item) => item.id))
+    if (subtreeIDs.some((id) => busyIDs.has(id) || activeRunsRef.current[id]?.status === 'running')) return
+    const childCount = subtreeIDs.length - 1
+    const childNote = childCount > 0 ? ` ${childCount} child ${childCount === 1 ? 'session' : 'sessions'} will also be archived.` : ''
+    if (!window.confirm(`Archive "${sessionName(session)}"? It will be hidden from the current list.${childNote}`)) return
     try {
       await api.archiveSession(session.id)
       await loadSessions(session.project_id)
     } catch (reason) {
       setError(errorMessage(reason))
     }
-  }, [activeRunsRef, loadSessions])
+  }, [activeRunsRef, loadSessions, sessionsByProject])
 
   const restoreSession = useCallback(async (session: Session) => {
     try {
@@ -407,7 +415,15 @@ function App() {
   }, [loadSessions, setSelectedProjectID, setSelectedSessionID])
 
   const deleteSession = useCallback(async (session: Session) => {
-    if (session.status === 'running' || activeRunsRef.current[session.id]?.status === 'running' || !window.confirm(`Permanently delete "${sessionName(session)}"? This action cannot be undone.`)) return
+    // The backend removes the whole subtree together: count descendants in
+    // both the active and archived lists, since every one of them is deleted.
+    const projectSessions = [...(sessionsByProject[session.project_id] ?? []), ...(archivedSessionsByProject[session.project_id] ?? [])]
+    const subtreeIDs = [session.id, ...sessionDescendantIDs(projectSessions, session.id)]
+    const busyIDs = new Set(projectSessions.filter((item) => item.status === 'running').map((item) => item.id))
+    if (subtreeIDs.some((id) => busyIDs.has(id) || activeRunsRef.current[id]?.status === 'running')) return
+    const childCount = subtreeIDs.length - 1
+    const childNote = childCount > 0 ? ` ${childCount} child ${childCount === 1 ? 'session' : 'sessions'} will also be permanently deleted.` : ''
+    if (!window.confirm(`Permanently delete "${sessionName(session)}"? This action cannot be undone.${childNote}`)) return
     try {
       await api.archiveSession(session.id)
       await api.deleteSession(session.id)
@@ -420,7 +436,7 @@ function App() {
       }
       setError(errorMessage(reason))
     }
-  }, [activeRunsRef, loadSessions])
+  }, [activeRunsRef, archivedSessionsByProject, loadSessions, sessionsByProject])
 
   const handleRunEvent = useCallback(async (sessionID: string, runID: string, event: RunEvent) => {
     if (event.type === 'text.delta' || event.type === 'reasoning.delta') {

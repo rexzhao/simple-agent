@@ -376,6 +376,55 @@ func TestServerActivePromptSteerAndMove(t *testing.T) {
 	waitForManagedRunTerminal(t, managed)
 }
 
+func TestServerSessionArchiveAndRemoveCascade(t *testing.T) {
+	server, service, _ := newWebTestAppServerWithRunner(t, webTestRunner{})
+	_, session := createWebProjectAndSession(t, server)
+
+	// Child sessions are normally spawned by the agent at runtime; create the
+	// lineage directly through the service.
+	child, err := service.CreateSession(session.ProjectID, execution.SessionCreateMetadata{
+		DisplayName: "Child", ParentSessionID: session.ID, CreatedCWD: session.CreatedCWD,
+		Provider: "fake", ModelProfile: "default", ModelID: "model",
+	})
+	if err != nil {
+		t.Fatalf("CreateSession(child) error = %v", err)
+	}
+	grandchild, err := service.CreateSession(session.ProjectID, execution.SessionCreateMetadata{
+		DisplayName: "Grandchild", ParentSessionID: child.ID, CreatedCWD: session.CreatedCWD,
+		Provider: "fake", ModelProfile: "default", ModelID: "model",
+	})
+	if err != nil {
+		t.Fatalf("CreateSession(grandchild) error = %v", err)
+	}
+
+	// Archiving the root cascades to every descendant.
+	response := doJSONRequest(t, http.MethodPost, server.URL+"/api/sessions/"+session.ID+"/archive", map[string]string{})
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("POST archive status = %d body=%s", response.StatusCode, readBody(response))
+	}
+	response.Body.Close()
+	for _, id := range []string{session.ID, child.ID, grandchild.ID} {
+		stored, err := service.GetSession(id)
+		if err != nil || !stored.Archived {
+			t.Fatalf("GetSession(%s) archived = %v, err = %v; want archived after cascade", id, stored.Archived, err)
+		}
+	}
+
+	// Removing the root deletes the whole subtree.
+	response = doJSONRequest(t, http.MethodDelete, server.URL+"/api/sessions/"+session.ID, nil)
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("DELETE session status = %d body=%s", response.StatusCode, readBody(response))
+	}
+	response.Body.Close()
+	for _, id := range []string{session.ID, child.ID, grandchild.ID} {
+		response = doJSONRequest(t, http.MethodGet, server.URL+"/api/sessions/"+id, nil)
+		if response.StatusCode != http.StatusNotFound {
+			t.Fatalf("GET removed session %s status = %d, want 404", id, response.StatusCode)
+		}
+		response.Body.Close()
+	}
+}
+
 func TestServerProviderManagementDiscoveryAndCodexErrors(t *testing.T) {
 	type observedRequest struct {
 		Path          string

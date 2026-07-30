@@ -87,6 +87,35 @@ export function flattenSessionTree(nodes: SessionTreeNode[]): Session[] {
   return nodes.flatMap((node) => [node.session, ...flattenSessionTree(node.children)])
 }
 
+/**
+ * Returns the ids of every descendant of rootID inside sessions, following
+ * parent links breadth-first. Cycle-safe: corrupted lineage can never loop.
+ * The backend archives/removes a whole subtree together, so this count lets
+ * confirmation dialogs spell out the cascade.
+ */
+export function sessionDescendantIDs(sessions: Session[], rootID: string): string[] {
+  const childrenByParent = new Map<string, string[]>()
+  for (const session of sessions) {
+    if (!session.parent_session_id) continue
+    const siblings = childrenByParent.get(session.parent_session_id) ?? []
+    siblings.push(session.id)
+    childrenByParent.set(session.parent_session_id, siblings)
+  }
+  const descendants: string[] = []
+  const seen = new Set([rootID])
+  const queue = [rootID]
+  while (queue.length > 0) {
+    const parent = queue.shift()!
+    for (const child of childrenByParent.get(parent) ?? []) {
+      if (seen.has(child)) continue
+      seen.add(child)
+      descendants.push(child)
+      queue.push(child)
+    }
+  }
+  return descendants
+}
+
 export function sessionTreeContains(node: SessionTreeNode, sessionIDs: ReadonlySet<string>): boolean {
   return sessionIDs.has(node.session.id) || node.children.some((child) => sessionTreeContains(child, sessionIDs))
 }
