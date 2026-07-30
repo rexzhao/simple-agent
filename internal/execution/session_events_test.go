@@ -56,6 +56,21 @@ func TestSessionStreamProviderRetryEventIncludesBackoffDetails(t *testing.T) {
 			t.Fatalf("event[%q] = %#v, want %#v; event = %#v", key, got, want, event)
 		}
 	}
+
+	for _, reason := range []string{"rate_limited", "timeout", "transport"} {
+		reasonEvent, ok := sessionStreamEventFromModelEvent("turn-1", 6, model.ProviderRetryEvent{
+			Attempt:     3,
+			MaxAttempts: 5,
+			Delay:       time.Second,
+			Reason:      reason,
+		}, true)
+		if !ok {
+			t.Fatalf("sessionStreamEventFromModelEvent() ok = false for reason %q, want true", reason)
+		}
+		if got := reasonEvent["reason"]; got != reason {
+			t.Fatalf("reason passthrough: event[reason] = %#v, want %q", got, reason)
+		}
+	}
 }
 
 func TestSessionToolDisplayArgumentsIncludesEditDiffInputs(t *testing.T) {

@@ -14,6 +14,35 @@ import (
 	"github.com/rexzhao/simple-agent/internal/model/httpstream"
 )
 
+func TestProviderHTTPOptionsDisableTransportStatusRetry(t *testing.T) {
+	// Status-code retries are decided at the session layer; every return path
+	// of providerHTTPOptions must carry an explicit MaxRetryAttempts == 1
+	// (httpstream.Options.WithDefaults backfills 3 when the value is <= 0).
+	tests := []struct {
+		name         string
+		provider     config.ProviderConfig
+		wantTimeout  time.Duration
+		wantAttempts int
+	}{
+		{name: "default", provider: config.ProviderConfig{}, wantAttempts: 1},
+		{name: "with request timeout", provider: config.ProviderConfig{RequestTimeout: "30s"}, wantTimeout: 30 * time.Second, wantAttempts: 1},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			options, err := providerHTTPOptions(test.provider)
+			if err != nil {
+				t.Fatalf("providerHTTPOptions() error = %v", err)
+			}
+			if options.MaxRetryAttempts != test.wantAttempts {
+				t.Fatalf("MaxRetryAttempts = %d, want %d", options.MaxRetryAttempts, test.wantAttempts)
+			}
+			if options.RequestTimeout != test.wantTimeout {
+				t.Fatalf("RequestTimeout = %v, want %v", options.RequestTimeout, test.wantTimeout)
+			}
+		})
+	}
+}
+
 func TestProviderHTTPClientSelectsProxyByRequestScheme(t *testing.T) {
 	client, err := providerHTTPClient(config.ProviderConfig{
 		HTTPProxy:  "http://127.0.0.1:8080",

@@ -326,7 +326,16 @@ func streamingClient(client *http.Client) *http.Client {
 }
 
 func isRetryableStatus(statusCode int) bool {
-	return statusCode == http.StatusTooManyRequests || (statusCode >= http.StatusInternalServerError && statusCode <= 599)
+	return IsRetryableStatus(statusCode)
+}
+
+// IsRetryableStatus reports whether the HTTP status code represents a
+// transient failure worth retrying: request timeout (408), rate limiting
+// (429), or any server error (5xx).
+func IsRetryableStatus(statusCode int) bool {
+	return statusCode == http.StatusRequestTimeout ||
+		statusCode == http.StatusTooManyRequests ||
+		(statusCode >= http.StatusInternalServerError && statusCode <= 599)
 }
 
 func sleep(ctx context.Context, duration time.Duration) error {

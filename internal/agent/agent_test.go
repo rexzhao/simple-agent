@@ -12,6 +12,7 @@ import (
 
 	"github.com/rexzhao/simple-agent/internal/eventbus"
 	"github.com/rexzhao/simple-agent/internal/model"
+	"github.com/rexzhao/simple-agent/internal/model/httpstream"
 )
 
 func TestStreamEmitsToolRequestedStartedFinishedInOrder(t *testing.T) {
@@ -130,6 +131,358 @@ func TestStreamDoesNotRetryServerErrorAfterProviderProgress(t *testing.T) {
 	}
 	if firstErrorEvent(t, got).Err == nil {
 		t.Fatal("error event is missing")
+	}
+}
+
+func TestStreamRetryDoesNotForwardRetryableErrorEvent(t *testing.T) {
+	originalBackoff := providerRetryBackoff
+	providerRetryBackoff = func(int) time.Duration { return 0 }
+	t.Cleanup(func() { providerRetryBackoff = originalBackoff })
+
+	provider := &fakeProvider{turns: [][]model.Event{
+		{model.ErrorEvent{
+			Err:     &model.ProviderError{Message: "server_error: temporary failure (code server_error)"},
+			Message: "OpenAI Responses stream error",
+		}},
+		{model.TextDeltaEvent{Text: "recovered"}},
+	}}
+
+	events, err := Stream(context.Background(), model.Request{
+		Model:    "model-test",
+		Messages: []model.Message{{Role: model.MessageRoleUser, Content: "continue"}},
+	}, Options{Provider: provider, MaxTurns: 2})
+	if err != nil {
+		t.Fatalf("Stream() error = %v", err)
+	}
+	got := collectAgentEvents(t, events)
+	if len(provider.requests) != 2 {
+		t.Fatalf("provider requests = %d, want 2", len(provider.requests))
+	}
+	for _, event := range got {
+		if errEvent, ok := event.(model.ErrorEvent); ok {
+			t.Fatalf("retryable error leaked to event stream: %#v", errEvent)
+		}
+	}
+	if collectText(got) != "recovered" {
+		t.Fatalf("text = %q, want recovered", collectText(got))
+	}
+}
+
+func TestStreamSuccessfulTurnMakesSingleProviderRequest(t *testing.T) {
+	provider := &fakeProvider{turns: [][]model.Event{{
+		model.TextDeltaEvent{Text: "done"},
+	}}}
+
+	events, err := Stream(context.Background(), model.Request{
+		Model:    "model-test",
+		Messages: []model.Message{{Role: model.MessageRoleUser, Content: "continue"}},
+	}, Options{Provider: provider, MaxTurns: 1})
+	if err != nil {
+		t.Fatalf("Stream() error = %v", err)
+	}
+	got := collectAgentEvents(t, events)
+	if len(provider.requests) != 1 {
+		t.Fatalf("provider requests = %d, want exactly 1 (success must not re-request)", len(provider.requests))
+	}
+	if collectText(got) != "done" {
+		t.Fatalf("text = %q, want done", collectText(got))
+	}
+}
+
+func TestStreamRetriesStreamCallStatusError(t *testing.T) {
+	originalBackoff := providerRetryBackoff
+	providerRetryBackoff = func(int) time.Duration { return 0 }
+	t.Cleanup(func() { providerRetryBackoff = originalBackoff })
+
+	provider := &fakeProvider{
+		turns: [][]model.Event{
+			nil,
+			{model.TextDeltaEvent{Text: "recovered"}},
+		},
+		streamErrs: []error{
+			&httpstream.StatusError{StatusCode: 500, Status: "500 Internal Server Error"},
+		},
+	}
+
+	events, err := Stream(context.Background(), model.Request{
+		Model:    "model-test",
+		Messages: []model.Message{{Role: model.MessageRoleUser, Content: "continue"}},
+	}, Options{Provider: provider, MaxTurns: 2})
+	if err != nil {
+		t.Fatalf("Stream() error = %v", err)
+	}
+	got := collectAgentEvents(t, events)
+	if len(provider.requests) != 2 {
+		t.Fatalf("provider requests = %d, want 2", len(provider.requests))
+	}
+	var retry model.ProviderRetryEvent
+	found := false
+	for _, event := range got {
+		if value, ok := event.(model.ProviderRetryEvent); ok {
+			retry = value
+			found = true
+		}
+		if errEvent, ok := event.(model.ErrorEvent); ok {
+			t.Fatalf("retryable Stream() error leaked to event stream: %#v", errEvent)
+		}
+	}
+	if !found || retry.Attempt != 2 || retry.MaxAttempts != 5 || retry.Reason != "server_error" {
+		t.Fatalf("retry event = %#v, found=%v", retry, found)
+	}
+	if collectText(got) != "recovered" {
+		t.Fatalf("text = %q, want recovered", collectText(got))
+	}
+}
+
+func TestStreamDoesNotRetryStreamCallClientError(t *testing.T) {
+	provider := &fakeProvider{
+		turns:      [][]model.Event{nil},
+		streamErrs: []error{&httpstream.StatusError{StatusCode: 400, Status: "400 Bad Request"}},
+	}
+
+	events, err := Stream(context.Background(), model.Request{
+		Model:    "model-test",
+		Messages: []model.Message{{Role: model.MessageRoleUser, Content: "continue"}},
+	}, Options{Provider: provider, MaxTurns: 1})
+	if err != nil {
+		t.Fatalf("Stream() error = %v", err)
+	}
+	got := collectAgentEvents(t, events)
+	if len(provider.requests) != 1 {
+		t.Fatalf("provider requests = %d, want no retry", len(provider.requests))
+	}
+	if errEvent := firstErrorEvent(t, got); errEvent.Message != "request model" {
+		t.Fatalf("error event = %#v, want terminal request model", errEvent)
+	}
+}
+
+func TestStreamRetriesStreamCallRequestTimeout(t *testing.T) {
+	originalBackoff := providerRetryBackoff
+	providerRetryBackoff = func(int) time.Duration { return 0 }
+	t.Cleanup(func() { providerRetryBackoff = originalBackoff })
+
+	provider := &fakeProvider{
+		turns: [][]model.Event{
+			nil,
+			{model.TextDeltaEvent{Text: "recovered"}},
+		},
+		streamErrs: []error{&httpstream.RequestTimeoutError{Timeout: 15 * time.Second}},
+	}
+
+	events, err := Stream(context.Background(), model.Request{
+		Model:    "model-test",
+		Messages: []model.Message{{Role: model.MessageRoleUser, Content: "continue"}},
+	}, Options{Provider: provider, MaxTurns: 2})
+	if err != nil {
+		t.Fatalf("Stream() error = %v", err)
+	}
+	got := collectAgentEvents(t, events)
+	if len(provider.requests) != 2 {
+		t.Fatalf("provider requests = %d, want 2", len(provider.requests))
+	}
+	var retry model.ProviderRetryEvent
+	found := false
+	for _, event := range got {
+		if value, ok := event.(model.ProviderRetryEvent); ok {
+			retry = value
+			found = true
+		}
+	}
+	if !found || retry.Reason != "timeout" {
+		t.Fatalf("retry event = %#v, found=%v, want reason timeout", retry, found)
+	}
+}
+
+func TestStreamRetriesIdleTimeoutOnlyOnce(t *testing.T) {
+	originalBackoff := providerRetryBackoff
+	providerRetryBackoff = func(int) time.Duration { return 0 }
+	t.Cleanup(func() { providerRetryBackoff = originalBackoff })
+
+	idleError := model.ErrorEvent{
+		Err:     &httpstream.StreamIdleTimeoutError{Timeout: 2 * time.Minute},
+		Message: "OpenAI Responses stream idle timeout",
+	}
+	provider := &fakeProvider{turns: [][]model.Event{
+		{idleError},
+		{idleError},
+		{model.TextDeltaEvent{Text: "must not reach"}},
+	}}
+
+	events, err := Stream(context.Background(), model.Request{
+		Model:    "model-test",
+		Messages: []model.Message{{Role: model.MessageRoleUser, Content: "continue"}},
+	}, Options{Provider: provider, MaxTurns: 2})
+	if err != nil {
+		t.Fatalf("Stream() error = %v", err)
+	}
+	got := collectAgentEvents(t, events)
+	if len(provider.requests) != 2 {
+		t.Fatalf("provider requests = %d, want 2 (idle retried only once)", len(provider.requests))
+	}
+	retries := 0
+	for _, event := range got {
+		if value, ok := event.(model.ProviderRetryEvent); ok {
+			retries++
+			if value.Reason != "timeout" {
+				t.Fatalf("retry reason = %q, want timeout", value.Reason)
+			}
+		}
+	}
+	if retries != 1 {
+		t.Fatalf("retry events = %d, want exactly 1", retries)
+	}
+	if errEvent := firstErrorEvent(t, got); errEvent.Err == nil {
+		t.Fatal("terminal error event is missing")
+	}
+}
+
+func TestStreamRetryReasonRateLimited(t *testing.T) {
+	originalBackoff := providerRetryBackoff
+	providerRetryBackoff = func(int) time.Duration { return 0 }
+	t.Cleanup(func() { providerRetryBackoff = originalBackoff })
+
+	provider := &fakeProvider{
+		turns: [][]model.Event{
+			nil,
+			{model.TextDeltaEvent{Text: "recovered"}},
+		},
+		streamErrs: []error{&httpstream.StatusError{StatusCode: 429, Status: "429 Too Many Requests"}},
+	}
+
+	events, err := Stream(context.Background(), model.Request{
+		Model:    "model-test",
+		Messages: []model.Message{{Role: model.MessageRoleUser, Content: "continue"}},
+	}, Options{Provider: provider, MaxTurns: 2})
+	if err != nil {
+		t.Fatalf("Stream() error = %v", err)
+	}
+	got := collectAgentEvents(t, events)
+	var retry model.ProviderRetryEvent
+	found := false
+	for _, event := range got {
+		if value, ok := event.(model.ProviderRetryEvent); ok {
+			retry = value
+			found = true
+		}
+	}
+	if !found || retry.Reason != "rate_limited" {
+		t.Fatalf("retry event = %#v, found=%v, want reason rate_limited", retry, found)
+	}
+}
+
+func TestStreamExhaustsRetryBudget(t *testing.T) {
+	originalBackoff := providerRetryBackoff
+	providerRetryBackoff = func(int) time.Duration { return 0 }
+	t.Cleanup(func() { providerRetryBackoff = originalBackoff })
+
+	serverError := model.ErrorEvent{
+		Err:     &model.ProviderError{Message: "server_error: persistent failure (code server_error)"},
+		Message: "OpenAI Responses stream error",
+	}
+	provider := &fakeProvider{turns: [][]model.Event{
+		{serverError}, {serverError}, {serverError}, {serverError}, {serverError},
+	}}
+
+	events, err := Stream(context.Background(), model.Request{
+		Model:    "model-test",
+		Messages: []model.Message{{Role: model.MessageRoleUser, Content: "continue"}},
+	}, Options{Provider: provider, MaxTurns: 2})
+	if err != nil {
+		t.Fatalf("Stream() error = %v", err)
+	}
+	got := collectAgentEvents(t, events)
+	if len(provider.requests) != 5 {
+		t.Fatalf("provider requests = %d, want exactly 5", len(provider.requests))
+	}
+	var attempts []int
+	for _, event := range got {
+		if value, ok := event.(model.ProviderRetryEvent); ok {
+			attempts = append(attempts, value.Attempt)
+		}
+	}
+	if want := []int{2, 3, 4, 5}; !reflect.DeepEqual(attempts, want) {
+		t.Fatalf("retry attempts = %#v, want %#v", attempts, want)
+	}
+	if errEvent := firstErrorEvent(t, got); errEvent.Err == nil {
+		t.Fatal("terminal error event is missing after budget exhaustion")
+	}
+}
+
+func TestStreamStopsRetryWhenContextCancelledDuringBackoff(t *testing.T) {
+	originalBackoff := providerRetryBackoff
+	providerRetryBackoff = func(int) time.Duration { return time.Minute }
+	t.Cleanup(func() { providerRetryBackoff = originalBackoff })
+
+	provider := &fakeProvider{turns: [][]model.Event{
+		{model.ErrorEvent{
+			Err:     &model.ProviderError{Message: "server_error: temporary failure (code server_error)"},
+			Message: "OpenAI Responses stream error",
+		}},
+		{model.TextDeltaEvent{Text: "must not reach"}},
+	}}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	events, err := Stream(ctx, model.Request{
+		Model:    "model-test",
+		Messages: []model.Message{{Role: model.MessageRoleUser, Content: "continue"}},
+	}, Options{Provider: provider, MaxTurns: 2})
+	if err != nil {
+		t.Fatalf("Stream() error = %v", err)
+	}
+
+	var got []model.Event
+	timeout := time.After(time.Second)
+	for {
+		select {
+		case event, ok := <-events:
+			if !ok {
+				goto drained
+			}
+			got = append(got, event)
+			if _, isRetry := event.(model.ProviderRetryEvent); isRetry {
+				cancel()
+			}
+		case <-timeout:
+			t.Fatal("timed out waiting for agent events")
+		}
+	}
+drained:
+	if len(provider.requests) != 1 {
+		t.Fatalf("provider requests = %d, want no further request after cancel", len(provider.requests))
+	}
+	errEvent := firstErrorEvent(t, got)
+	if errEvent.Message != "retry model request" {
+		t.Fatalf("error event = %#v, want retry model request", errEvent)
+	}
+}
+
+func TestStreamRetriesAnthropicOverloadedError(t *testing.T) {
+	originalBackoff := providerRetryBackoff
+	providerRetryBackoff = func(int) time.Duration { return 0 }
+	t.Cleanup(func() { providerRetryBackoff = originalBackoff })
+
+	provider := &fakeProvider{turns: [][]model.Event{
+		{model.ErrorEvent{
+			Err:     &model.ProviderError{Message: "overloaded_error: Overloaded"},
+			Message: "Anthropic Messages stream error",
+		}},
+		{model.TextDeltaEvent{Text: "recovered"}},
+	}}
+
+	events, err := Stream(context.Background(), model.Request{
+		Model:    "model-test",
+		Messages: []model.Message{{Role: model.MessageRoleUser, Content: "continue"}},
+	}, Options{Provider: provider, MaxTurns: 2})
+	if err != nil {
+		t.Fatalf("Stream() error = %v", err)
+	}
+	got := collectAgentEvents(t, events)
+	if len(provider.requests) != 2 {
+		t.Fatalf("provider requests = %d, want 2", len(provider.requests))
+	}
+	if collectText(got) != "recovered" {
+		t.Fatalf("text = %q, want recovered", collectText(got))
 	}
 }
 
@@ -776,8 +1129,9 @@ func TestStreamStopsWithClearErrorAtMaxTurns(t *testing.T) {
 }
 
 type fakeProvider struct {
-	turns    [][]model.Event
-	requests []model.Request
+	turns      [][]model.Event
+	streamErrs []error
+	requests   []model.Request
 }
 
 func (p *fakeProvider) Stream(ctx context.Context, request model.Request) (<-chan model.Event, error) {
@@ -787,6 +1141,10 @@ func (p *fakeProvider) Stream(ctx context.Context, request model.Request) (<-cha
 
 	turn := len(p.requests)
 	p.requests = append(p.requests, copyAgentRequest(request))
+
+	if turn < len(p.streamErrs) && p.streamErrs[turn] != nil {
+		return nil, p.streamErrs[turn]
+	}
 
 	events := make(chan model.Event, len(p.turns[turn]))
 	for _, event := range p.turns[turn] {

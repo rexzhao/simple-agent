@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -301,6 +302,122 @@ func TestProviderCompactAcceptsCompactionSummary(t *testing.T) {
 	}
 	if got := decodeJSON(t, result.Items[1].Data).(map[string]any)["type"]; got != "compaction_summary" {
 		t.Fatalf("compaction item type = %#v, want compaction_summary", got)
+	}
+}
+
+func TestProviderCompactRetriesTransientStatusError(t *testing.T) {
+	originalBackoff := compactRetryBackoff
+	compactRetryBackoff = 0
+	t.Cleanup(func() { compactRetryBackoff = originalBackoff })
+
+	var requests int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		if requests == 1 {
+			http.Error(w, "server error", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{
+			"object":"response.compaction",
+			"output":[
+				{"type":"compaction","id":"cmp_1","encrypted_content":"sealed"}
+			]
+		}`)
+	}))
+	defer server.Close()
+
+	provider, err := NewProvider(ProviderConfig{
+		BaseURL:     server.URL,
+		APIKey:      "test-key",
+		HTTPClient:  server.Client(),
+		HTTPOptions: httpstream.Options{MaxRetryAttempts: 1},
+	})
+	if err != nil {
+		t.Fatalf("NewProvider() error = %v", err)
+	}
+	result, err := provider.Compact(context.Background(), model.Request{
+		Model:    "gpt-5.6",
+		Messages: []model.Message{{Role: model.MessageRoleUser, Content: "Do work"}},
+	})
+	if err != nil {
+		t.Fatalf("Compact() error = %v", err)
+	}
+	if requests != 2 {
+		t.Fatalf("requests = %d, want 2 (one retry)", requests)
+	}
+	if len(result.Items) != 1 {
+		t.Fatalf("len(result.Items) = %d, want 1", len(result.Items))
+	}
+}
+
+func TestProviderCompactExhaustsRetryBudget(t *testing.T) {
+	originalBackoff := compactRetryBackoff
+	compactRetryBackoff = 0
+	t.Cleanup(func() { compactRetryBackoff = originalBackoff })
+
+	var requests int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		http.Error(w, "server error", http.StatusInternalServerError)
+	}))
+	defer server.Close()
+
+	provider, err := NewProvider(ProviderConfig{
+		BaseURL:     server.URL,
+		APIKey:      "test-key",
+		HTTPClient:  server.Client(),
+		HTTPOptions: httpstream.Options{MaxRetryAttempts: 1},
+	})
+	if err != nil {
+		t.Fatalf("NewProvider() error = %v", err)
+	}
+	_, err = provider.Compact(context.Background(), model.Request{
+		Model:    "gpt-5.6",
+		Messages: []model.Message{{Role: model.MessageRoleUser, Content: "Do work"}},
+	})
+	if err == nil {
+		t.Fatal("Compact() error = nil, want failure after budget exhaustion")
+	}
+	if requests != 2 {
+		t.Fatalf("requests = %d, want exactly 2 outer attempts", requests)
+	}
+	var statusErr *httpstream.StatusError
+	if !errors.As(err, &statusErr) {
+		t.Fatalf("Compact() error = %T(%v), want wrapped *StatusError", err, err)
+	}
+}
+
+func TestProviderCompactDoesNotRetryClientError(t *testing.T) {
+	originalBackoff := compactRetryBackoff
+	compactRetryBackoff = 0
+	t.Cleanup(func() { compactRetryBackoff = originalBackoff })
+
+	var requests int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		http.Error(w, "bad request", http.StatusBadRequest)
+	}))
+	defer server.Close()
+
+	provider, err := NewProvider(ProviderConfig{
+		BaseURL:     server.URL,
+		APIKey:      "test-key",
+		HTTPClient:  server.Client(),
+		HTTPOptions: httpstream.Options{MaxRetryAttempts: 1},
+	})
+	if err != nil {
+		t.Fatalf("NewProvider() error = %v", err)
+	}
+	_, err = provider.Compact(context.Background(), model.Request{
+		Model:    "gpt-5.6",
+		Messages: []model.Message{{Role: model.MessageRoleUser, Content: "Do work"}},
+	})
+	if err == nil {
+		t.Fatal("Compact() error = nil, want failure")
+	}
+	if requests != 1 {
+		t.Fatalf("requests = %d, want no retry for 400", requests)
 	}
 }
 

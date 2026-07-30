@@ -126,8 +126,23 @@ func (p *Provider) Compact(ctx context.Context, request model.Request) (model.Co
 	if err != nil {
 		return model.CompactionResult{}, fmt.Errorf("build OpenAI Responses compact request body: %w", err)
 	}
-	response, err := p.doRequestTo(ctx, token, body, metadata, "/responses/compact")
-	if err != nil {
+	// The compact endpoint has no session-level retry loop above it, so allow
+	// one retry for transient failures. Status codes are not retried by the
+	// transport layer (MaxRetryAttempts is 1 in production wiring); each
+	// attempt may still perform the transport's quick timeout retry.
+	const maxCompactAttempts = 2
+	var response *http.Response
+	for attempt := 1; attempt <= maxCompactAttempts; attempt++ {
+		response, err = p.doRequestTo(ctx, token, body, metadata, "/responses/compact")
+		if err == nil {
+			break
+		}
+		if attempt < maxCompactAttempts && ctx.Err() == nil && model.IsRetryableProviderError(err) {
+			if waitErr := waitForCompactRetry(ctx, compactRetryBackoff); waitErr != nil {
+				return model.CompactionResult{}, waitErr
+			}
+			continue
+		}
 		if _, ok := err.(*httpstream.StatusError); ok {
 			return model.CompactionResult{}, fmt.Errorf("OpenAI Responses compact request failed: %w", err)
 		}
@@ -245,6 +260,20 @@ func (p *Provider) captureTurnState(value string) {
 	defer p.turnStateMu.Unlock()
 	if p.turnState == "" {
 		p.turnState = value
+	}
+}
+
+// compactRetryBackoff is a var so tests can shrink the wait.
+var compactRetryBackoff = time.Second
+
+func waitForCompactRetry(ctx context.Context, delay time.Duration) error {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
 	}
 }
 

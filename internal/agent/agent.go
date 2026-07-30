@@ -13,6 +13,7 @@ import (
 
 	"github.com/rexzhao/simple-agent/internal/eventbus"
 	"github.com/rexzhao/simple-agent/internal/model"
+	"github.com/rexzhao/simple-agent/internal/model/httpstream"
 )
 
 const DefaultMaxTurns = 8
@@ -331,15 +332,33 @@ func streamModelTurn(ctx context.Context, provider model.Provider, request model
 	var toolCalls []model.ToolCall
 	var responseState *model.ResponseState
 	const maxAttempts = 5
+	var idleRetried bool
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		stream, err := provider.Stream(ctx, request)
 		if err != nil {
+			// A failed Stream() call never made progress, so only the
+			// classification, budget, and context decide whether to retry.
+			if ctx.Err() == nil && attempt < maxAttempts && model.IsRetryableProviderError(err) {
+				delay := providerRetryBackoff(attempt)
+				out <- model.ProviderRetryEvent{
+					Attempt:     attempt + 1,
+					MaxAttempts: maxAttempts,
+					Delay:       delay,
+					Reason:      model.RetryReason(err),
+				}
+				if err := waitForProviderRetry(ctx, delay); err != nil {
+					out <- model.ErrorEvent{Err: err, Message: "retry model request"}
+					return assistantContent.String(), reasoningContent.String(), nil, nil, true
+				}
+				continue
+			}
 			out <- model.ErrorEvent{Err: err, Message: "request model"}
-			return "", "", nil, nil, true
+			return assistantContent.String(), reasoningContent.String(), nil, nil, true
 		}
 
 		madeProgress := false
 		retry := false
+	streamLoop:
 		for event := range stream {
 			switch event := event.(type) {
 			case model.TextDeltaEvent:
@@ -360,20 +379,25 @@ func streamModelTurn(ctx context.Context, provider model.Provider, request model
 				responseState = &state
 				continue
 			case model.ErrorEvent:
-				if !madeProgress && attempt < maxAttempts && isRetryableProviderStreamError(event.Err) {
+				idle := httpstream.IsStreamIdleTimeout(event.Err)
+				if !madeProgress && attempt < maxAttempts && ctx.Err() == nil &&
+					model.IsRetryableProviderError(event.Err) && (!idle || !idleRetried) {
+					if idle {
+						idleRetried = true
+					}
 					delay := providerRetryBackoff(attempt)
 					out <- model.ProviderRetryEvent{
 						Attempt:     attempt + 1,
 						MaxAttempts: maxAttempts,
 						Delay:       delay,
-						Reason:      "server_error",
+						Reason:      model.RetryReason(event.Err),
 					}
 					if err := waitForProviderRetry(ctx, delay); err != nil {
 						out <- model.ErrorEvent{Err: err, Message: "retry model request"}
 						return assistantContent.String(), reasoningContent.String(), nil, nil, true
 					}
 					retry = true
-					break
+					break streamLoop
 				}
 				out <- event
 				return assistantContent.String(), reasoningContent.String(), nil, nil, true
@@ -386,16 +410,6 @@ func streamModelTurn(ctx context.Context, provider model.Provider, request model
 		return assistantContent.String(), reasoningContent.String(), toolCalls, responseState, false
 	}
 	panic("unreachable")
-}
-
-func isRetryableProviderStreamError(err error) bool {
-	var providerErr *model.ProviderError
-	if !errors.As(err, &providerErr) {
-		return false
-	}
-	message := strings.ToLower(providerErr.Message)
-	return strings.Contains(message, "code server_error") ||
-		strings.Contains(message, "server_is_overloaded")
 }
 
 func waitForProviderRetry(ctx context.Context, delay time.Duration) error {

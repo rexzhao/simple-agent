@@ -1502,14 +1502,20 @@ func newProviderForRun(providerName, modelType, compatibility string, provider c
 }
 
 func providerHTTPOptions(provider config.ProviderConfig) (httpstream.Options, error) {
+	// Status-code retries are decided at the session layer (agent.streamModelTurn);
+	// the transport layer must not retry statuses on its own. An explicit 1 is
+	// required on every return path: httpstream.Options.WithDefaults backfills
+	// DefaultMaxRetryAttempts when the value is <= 0.
+	options := httpstream.Options{MaxRetryAttempts: 1}
 	if provider.RequestTimeout == "" {
-		return httpstream.Options{}, nil
+		return options, nil
 	}
 	requestTimeout, err := time.ParseDuration(provider.RequestTimeout)
 	if err != nil || requestTimeout <= 0 {
 		return httpstream.Options{}, fmt.Errorf("request_timeout must be a positive duration")
 	}
-	return httpstream.Options{RequestTimeout: requestTimeout}, nil
+	options.RequestTimeout = requestTimeout
+	return options, nil
 }
 
 func openAIChatProviderConfig(provider config.ProviderConfig, compatibility string, httpClient *http.Client, httpOptions httpstream.Options) openaichat.ProviderConfig {

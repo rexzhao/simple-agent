@@ -133,6 +133,65 @@ func TestDoRequestStopsRetryBackoffOnContextCancel(t *testing.T) {
 	}
 }
 
+func TestIsRetryableStatus(t *testing.T) {
+	tests := []struct {
+		code int
+		want bool
+	}{
+		{http.StatusRequestTimeout, true},
+		{http.StatusTooManyRequests, true},
+		{http.StatusInternalServerError, true},
+		{http.StatusBadGateway, true},
+		{http.StatusServiceUnavailable, true},
+		{599, true},
+		{600, false},
+		{http.StatusBadRequest, false},
+		{http.StatusUnauthorized, false},
+		{http.StatusNotFound, false},
+		{http.StatusOK, false},
+	}
+	for _, test := range tests {
+		if got := IsRetryableStatus(test.code); got != test.want {
+			t.Fatalf("IsRetryableStatus(%d) = %v, want %v", test.code, got, test.want)
+		}
+	}
+}
+
+func TestDoRequestDoesNotRetryStatusWhenMaxAttemptsIsOne(t *testing.T) {
+	requests := make(chan struct{}, 3)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests <- struct{}{}
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = io.WriteString(w, "server error")
+	}))
+	defer server.Close()
+
+	response, err := DoRequest(context.Background(), server.Client(), Options{
+		RequestTimeout:    time.Second,
+		StreamIdleTimeout: time.Second,
+		MaxRetryAttempts:  1,
+		RetryBackoff:      time.Millisecond,
+	}, func(requestCtx context.Context) (*http.Request, error) {
+		return http.NewRequestWithContext(requestCtx, http.MethodPost, server.URL, strings.NewReader("body"))
+	}, func(body io.Reader) string {
+		return ReadErrorBody(body, "")
+	})
+	if response != nil {
+		_ = response.Body.Close()
+		t.Fatalf("response = %#v, want nil", response)
+	}
+	var statusErr *StatusError
+	if !errors.As(err, &statusErr) {
+		t.Fatalf("DoRequest() error = %T(%v), want *StatusError", err, err)
+	}
+	if statusErr.StatusCode != 500 || statusErr.Attempts != 1 {
+		t.Fatalf("StatusError = %#v, want status 500 after 1 attempt", statusErr)
+	}
+	if got := len(requests); got != 1 {
+		t.Fatalf("requests = %d, want exactly 1 (status retry disabled)", got)
+	}
+}
+
 func TestDoRequestDoesNotRetryStatus600(t *testing.T) {
 	requests := make(chan struct{}, 3)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
