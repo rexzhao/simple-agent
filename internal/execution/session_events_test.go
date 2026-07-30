@@ -387,6 +387,9 @@ func TestSessionToolDisplayArgumentsKeepsOnlyUsefulPresentationFields(t *testing
 		{name: "file path without content", toolName: "write_file", arguments: `{"path":"notes.txt","content":"secret body"}`, want: `{"path":"notes.txt"}`},
 		{name: "shell command", toolName: "shell", arguments: `{"command":"go test ./...","timeout_ms":1000}`, want: `{"command":"go test ./..."}`},
 		{name: "invalid json", toolName: "read_file", arguments: `{`, want: ""},
+		{name: "session_start keeps every field", toolName: "session_start", arguments: `{"name":"Review","provider":"paperhub","model":"grok-4.5","prompt":"please review the plan"}`, want: `{"name":"Review","provider":"paperhub","model":"grok-4.5","prompt":"please review the plan"}`},
+		{name: "session_send keeps every field", toolName: "session_send", arguments: `{"session_id":"20260729T101411.113294500Z-edc0c394","mode":"steer","message":"please retry"}`, want: `{"session_id":"20260729T101411.113294500Z-edc0c394","mode":"steer","message":"please retry"}`},
+		{name: "session tool invalid json", toolName: "session_wait", arguments: `{`, want: ""},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

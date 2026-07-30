@@ -1,0 +1,64 @@
+// @vitest-environment jsdom
+import { afterEach, describe, expect, it } from 'vitest'
+import { cleanup, render, screen, fireEvent } from '@testing-library/react'
+import { ProcessTimeline } from './ProcessTimeline'
+import type { RunStep, ToolActivity } from '../types'
+
+afterEach(cleanup)
+
+const tool = (overrides: Partial<ToolActivity>): ToolActivity => ({
+	kind: 'tool',
+	id: 'call-1',
+	name: 'read_file',
+	iteration: 1,
+	status: 'finished',
+	...overrides,
+})
+
+describe('ProcessTimeline session tools', () => {
+	it('shows a summary target on the collapsed session_start row', () => {
+		const steps: RunStep[] = [tool({
+			name: 'session_start',
+			arguments: JSON.stringify({ name: 'Review', provider: 'paperhub', model: 'grok-4.5', prompt: 'please review the plan' }),
+		})]
+		render(<ProcessTimeline steps={steps} />)
+
+		expect(screen.getByText('session_start')).not.toBeNull()
+		expect(screen.getByText('"Review" · grok-4.5')).not.toBeNull()
+	})
+
+	it('shows request arguments and the result when the session tool row expands', () => {
+		const args = JSON.stringify({ session_id: 'sess-1', mode: 'steer', message: 'please retry' })
+		const steps: RunStep[] = [tool({
+			name: 'session_send',
+			arguments: args,
+			result: '{"delivery":"started","ok":true}',
+		})]
+		render(<ProcessTimeline steps={steps} sessionNames={{ 'sess-1': 'Review session' }} />)
+
+		// Collapsed summary resolves the session display name and snippets the message.
+		expect(screen.getByText(/Review session/)).not.toBeNull()
+
+		const summary = screen.getByText('session_send').closest('summary')
+		expect(summary).not.toBeNull()
+		fireEvent.click(summary as Element)
+
+		expect(screen.getByText('Arguments')).not.toBeNull()
+		expect(screen.getByText(/"mode": "steer"/)).not.toBeNull()
+		expect(screen.getByText('Output')).not.toBeNull()
+		expect(screen.getByText(/"ok": true/)).not.toBeNull()
+	})
+
+	it('keeps session tool rows expandable on pending results without output', () => {
+		const steps: RunStep[] = [tool({
+			name: 'session_wait',
+			arguments: JSON.stringify({ session_id: 'sess-9', timeout_ms: 1000 }),
+			status: 'running',
+		})]
+		render(<ProcessTimeline steps={steps} />)
+
+		expect(screen.getByText('session_wait')).not.toBeNull()
+		expect(screen.getByText('sess-9')).not.toBeNull()
+		expect(screen.queryByText('Output')).toBeNull()
+	})
+})

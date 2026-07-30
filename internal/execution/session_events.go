@@ -794,10 +794,28 @@ func sessionStreamToolContent(content string) string {
 	return string(runes[:maxSessionStreamToolContentRunes]) + "\n…"
 }
 
+// sessionOrchestrationToolNames are the session_* tools. Their arguments are
+// displayed in full in the UI: collapsed rows summarize the call (target
+// session, model, message snippet) and expanded rows show the exact request
+// payload, so none of their fields are filtered out.
+var sessionOrchestrationToolNames = map[string]bool{
+	"session_models":  true,
+	"session_start":   true,
+	"session_search":  true,
+	"session_get":     true,
+	"session_history": true,
+	"session_send":    true,
+	"session_wait":    true,
+	"session_stop":    true,
+}
+
 func sessionToolDisplayArguments(name, arguments string) string {
 	var parsed map[string]any
 	if json.Unmarshal([]byte(arguments), &parsed) != nil {
 		return ""
+	}
+	if sessionOrchestrationToolNames[name] {
+		return arguments
 	}
 	displayed := make(map[string]any)
 	keys := []string{"path", "pattern", "query", "start_line", "line_count"}
