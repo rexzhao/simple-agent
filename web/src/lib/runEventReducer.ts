@@ -43,8 +43,12 @@ export function reduceRunEvent(run: ActiveRun, event: RunEvent): ActiveRun {
         ...run,
         queuedPrompts: Array.isArray(event.prompts)
           ? event.prompts
-              .map((prompt) => (prompt && typeof prompt === 'object'
-                ? { id: String((prompt as QueuedPrompt).id ?? ''), content: String((prompt as QueuedPrompt).content ?? '') }
+              .map((prompt): QueuedPrompt | null => (prompt && typeof prompt === 'object'
+                ? {
+                    id: String((prompt as QueuedPrompt).id ?? ''),
+                    content: String((prompt as QueuedPrompt).content ?? ''),
+                    steer: Boolean((prompt as QueuedPrompt).steer),
+                  }
                 : null))
               .filter((prompt): prompt is QueuedPrompt => Boolean(prompt?.id))
           : [],

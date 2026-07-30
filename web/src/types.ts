@@ -256,6 +256,7 @@ export type RunStep = ReasoningActivity | ModelOutputActivity | ToolActivity | U
 export interface QueuedPrompt {
   id: string
   content: string
+  steer?: boolean
 }
 
 export interface ActiveRun {

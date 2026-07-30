@@ -168,6 +168,14 @@ export const api = {
   removeRunMessage: (runID: string, promptID: string) => request(`/api/runs/${encodeURIComponent(runID)}/prompts/${encodeURIComponent(promptID)}`, {
     method: 'DELETE',
   }),
+  steerRunMessage: (runID: string, promptID: string, steer: boolean) => request(`/api/runs/${encodeURIComponent(runID)}/prompts/${encodeURIComponent(promptID)}/steer`, {
+    method: 'POST',
+    body: JSON.stringify({ steer }),
+  }),
+  moveRunMessage: (runID: string, promptID: string, direction: 'up' | 'down') => request(`/api/runs/${encodeURIComponent(runID)}/prompts/${encodeURIComponent(promptID)}/move`, {
+    method: 'POST',
+    body: JSON.stringify({ direction }),
+  }),
   activeRuns: () => request<{ runs: ActiveRunDescriptor[] }>('/api/runs/active'),
 }
 

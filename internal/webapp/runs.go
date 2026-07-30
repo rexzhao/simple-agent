@@ -707,6 +707,73 @@ func (s *Server) handleRemoveActivePrompt(w http.ResponseWriter, r *http.Request
 	})
 }
 
+type steerActivePromptRequest struct {
+	Steer bool `json:"steer"`
+}
+
+// handleSteerActivePrompt marks a not-yet-sent queued prompt as a steer
+// prompt (or demotes it back to the plain queue). Steer prompts always sort
+// ahead of plain queued prompts and drain first; like every Web queued
+// prompt they stay no-loss and run as a follow-up turn if the active turn
+// settles first. The updated queue is published as run.prompt_queue.
+func (s *Server) handleSteerActivePrompt(w http.ResponseWriter, r *http.Request) {
+	var body steerActivePromptRequest
+	if !decodeJSONWithLimit(w, r, &body, maxRunRequestBytes) {
+		return
+	}
+	managed, ok := s.runs.get(r.PathValue("runID"))
+	if !ok {
+		writeAPIError(w, http.StatusNotFound, "not_found", "run not found")
+		return
+	}
+	if !managed.run.SetActivePromptSteer(r.PathValue("promptID"), body.Steer) {
+		writeAPIError(w, http.StatusNotFound, "not_found", "queued prompt not found")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{
+		"run_id": managed.id,
+		"status": "updated",
+	})
+}
+
+type moveActivePromptRequest struct {
+	Direction string `json:"direction"`
+}
+
+// handleMoveActivePrompt reorders a not-yet-sent queued prompt one step up or
+// down within its priority group (steer prompts ahead of plain queued
+// prompts). Moves clamp at the group boundary. The updated queue is published
+// as run.prompt_queue.
+func (s *Server) handleMoveActivePrompt(w http.ResponseWriter, r *http.Request) {
+	var body moveActivePromptRequest
+	if !decodeJSONWithLimit(w, r, &body, maxRunRequestBytes) {
+		return
+	}
+	delta := 0
+	switch body.Direction {
+	case "up":
+		delta = -1
+	case "down":
+		delta = 1
+	default:
+		writeAPIError(w, http.StatusBadRequest, "invalid_direction", `direction must be "up" or "down"`)
+		return
+	}
+	managed, ok := s.runs.get(r.PathValue("runID"))
+	if !ok {
+		writeAPIError(w, http.StatusNotFound, "not_found", "run not found")
+		return
+	}
+	if !managed.run.MoveActivePrompt(r.PathValue("promptID"), delta) {
+		writeAPIError(w, http.StatusNotFound, "not_found", "queued prompt not found")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{
+		"run_id": managed.id,
+		"status": "updated",
+	})
+}
+
 func (s *Server) handleRunEvents(w http.ResponseWriter, r *http.Request) {
 	managed, ok := s.runs.get(r.PathValue("runID"))
 	if !ok {

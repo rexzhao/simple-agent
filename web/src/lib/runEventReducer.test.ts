@@ -50,7 +50,19 @@ describe('reduceRunEvent', () => {
       type: 'run.prompt_queue',
       prompts: [{ id: 'prompt-1', content: 'follow up' }],
     })
-    expect(queued.queuedPrompts).toEqual([{ id: 'prompt-1', content: 'follow up' }])
+    expect(queued.queuedPrompts).toEqual([{ id: 'prompt-1', content: 'follow up', steer: false }])
+
+    const steered = reduceRunEvent(newRun(), {
+      type: 'run.prompt_queue',
+      prompts: [
+        { id: 'prompt-2', content: 'steer me', steer: true },
+        { id: 'prompt-3', content: 'later' },
+      ],
+    })
+    expect(steered.queuedPrompts).toEqual([
+      { id: 'prompt-2', content: 'steer me', steer: true },
+      { id: 'prompt-3', content: 'later', steer: false },
+    ])
 
     const drained = apply(
       queued,

@@ -275,6 +275,107 @@ func TestServerActivePromptQueueLifecycle(t *testing.T) {
 	}
 }
 
+func TestServerActivePromptSteerAndMove(t *testing.T) {
+	runner := enteredBlockingWebTestRunner{entered: make(chan struct{}), once: &sync.Once{}}
+	server, _, app := newWebTestAppServerWithRunner(t, runner)
+	_, session := createWebProjectAndSession(t, server)
+
+	response := doJSONRequest(t, http.MethodPost, server.URL+"/api/sessions/"+session.ID+"/runs", map[string]string{"content": "block"})
+	if response.StatusCode != http.StatusAccepted {
+		t.Fatalf("POST blocking run status = %d body=%s", response.StatusCode, readBody(response))
+	}
+	var run struct {
+		ID string `json:"run_id"`
+	}
+	decodeResponse(t, response, &run)
+	select {
+	case <-runner.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("blocking runner was not entered")
+	}
+	managed, ok := app.runs.get(run.ID)
+	if !ok {
+		t.Fatalf("run %s not found in registry", run.ID)
+	}
+
+	for _, content := range []string{"first", "second", "third"} {
+		response = doJSONRequest(t, http.MethodPost, server.URL+"/api/runs/"+run.ID+"/prompts", map[string]string{"content": content})
+		if response.StatusCode != http.StatusAccepted {
+			t.Fatalf("POST active prompt %q status = %d body=%s", content, response.StatusCode, readBody(response))
+		}
+		response.Body.Close()
+	}
+	queued := waitForPromptQueueOrder(t, managed, []string{"first", "second", "third"})
+	if queued[0].Steer || queued[1].Steer || queued[2].Steer {
+		t.Fatalf("fresh queue steer flags = %#v, want all plain", queued)
+	}
+	byContent := make(map[string]string, len(queued))
+	for _, prompt := range queued {
+		byContent[prompt.Content] = prompt.ID
+	}
+
+	// Promote "second" to steer: it jumps to the top of the queue.
+	response = doJSONRequest(t, http.MethodPost, server.URL+"/api/runs/"+run.ID+"/prompts/"+byContent["second"]+"/steer", map[string]bool{"steer": true})
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("POST steer status = %d body=%s", response.StatusCode, readBody(response))
+	}
+	response.Body.Close()
+	queued = waitForPromptQueueOrder(t, managed, []string{"second", "first", "third"})
+	if !queued[0].Steer || queued[1].Steer || queued[2].Steer {
+		t.Fatalf("steer flags after promotion = %#v, want only second steered", queued)
+	}
+
+	// Reorder within the plain group: "third" moves above "first".
+	response = doJSONRequest(t, http.MethodPost, server.URL+"/api/runs/"+run.ID+"/prompts/"+byContent["third"]+"/move", map[string]string{"direction": "up"})
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("POST move status = %d body=%s", response.StatusCode, readBody(response))
+	}
+	response.Body.Close()
+	waitForPromptQueueOrder(t, managed, []string{"second", "third", "first"})
+
+	// The plain group cannot climb above the steer: moving "third" up again is
+	// a clamped no-op.
+	response = doJSONRequest(t, http.MethodPost, server.URL+"/api/runs/"+run.ID+"/prompts/"+byContent["third"]+"/move", map[string]string{"direction": "up"})
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("POST clamped move status = %d body=%s", response.StatusCode, readBody(response))
+	}
+	response.Body.Close()
+	waitForPromptQueueOrder(t, managed, []string{"second", "third", "first"})
+
+	// Demote "second" back to the plain queue.
+	response = doJSONRequest(t, http.MethodPost, server.URL+"/api/runs/"+run.ID+"/prompts/"+byContent["second"]+"/steer", map[string]bool{"steer": false})
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("POST demote status = %d body=%s", response.StatusCode, readBody(response))
+	}
+	response.Body.Close()
+	waitForPromptQueueOrder(t, managed, []string{"second", "third", "first"})
+
+	// Error branches: invalid direction, missing prompt, missing run.
+	response = doJSONRequest(t, http.MethodPost, server.URL+"/api/runs/"+run.ID+"/prompts/"+byContent["first"]+"/move", map[string]string{"direction": "sideways"})
+	if response.StatusCode != http.StatusBadRequest || responseErrorCode(t, response) != "invalid_direction" {
+		t.Fatalf("POST invalid move direction status = %d, want 400 invalid_direction", response.StatusCode)
+	}
+	response = doJSONRequest(t, http.MethodPost, server.URL+"/api/runs/"+run.ID+"/prompts/ap-missing/steer", map[string]bool{"steer": true})
+	if response.StatusCode != http.StatusNotFound || responseErrorCode(t, response) != "not_found" {
+		t.Fatalf("POST steer missing prompt status = %d, want 404 not_found", response.StatusCode)
+	}
+	response = doJSONRequest(t, http.MethodPost, server.URL+"/api/runs/"+run.ID+"/prompts/ap-missing/move", map[string]string{"direction": "up"})
+	if response.StatusCode != http.StatusNotFound || responseErrorCode(t, response) != "not_found" {
+		t.Fatalf("POST move missing prompt status = %d, want 404 not_found", response.StatusCode)
+	}
+	response = doJSONRequest(t, http.MethodPost, server.URL+"/api/runs/run-missing/prompts/ap-1/steer", map[string]bool{"steer": true})
+	if response.StatusCode != http.StatusNotFound || responseErrorCode(t, response) != "not_found" {
+		t.Fatalf("POST steer missing run status = %d, want 404 not_found", response.StatusCode)
+	}
+
+	response = doJSONRequest(t, http.MethodDelete, server.URL+"/api/runs/"+run.ID, nil)
+	if response.StatusCode != http.StatusAccepted {
+		t.Fatalf("DELETE active run status = %d body=%s", response.StatusCode, readBody(response))
+	}
+	response.Body.Close()
+	waitForManagedRunTerminal(t, managed)
+}
+
 func TestServerProviderManagementDiscoveryAndCodexErrors(t *testing.T) {
 	type observedRequest struct {
 		Path          string
@@ -401,6 +502,7 @@ func responseErrorCode(t *testing.T, response *http.Response) string {
 type queuedPromptPayload struct {
 	ID      string `json:"id"`
 	Content string `json:"content"`
+	Steer   bool   `json:"steer"`
 }
 
 func waitForPromptQueue(t *testing.T, managed *managedRun, count int) []queuedPromptPayload {
@@ -423,6 +525,42 @@ func waitForPromptQueue(t *testing.T, managed *managedRun, count int) []queuedPr
 		}
 	}
 	t.Fatalf("run prompt queue did not reach %d items", count)
+	return nil
+}
+
+// waitForPromptQueueOrder polls until the newest run.prompt_queue snapshot
+// holds exactly the wanted contents in order, returning the full payload.
+func waitForPromptQueueOrder(t *testing.T, managed *managedRun, want []string) []queuedPromptPayload {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		events, _, _, _, changed := managed.snapshot(0)
+		for index := len(events) - 1; index >= 0; index-- {
+			var event struct {
+				Type    string                `json:"type"`
+				Prompts []queuedPromptPayload `json:"prompts"`
+			}
+			if json.Unmarshal(events[index].Payload, &event) != nil || event.Type != "run.prompt_queue" || len(event.Prompts) != len(want) {
+				continue
+			}
+			matches := true
+			for i, content := range want {
+				if event.Prompts[i].Content != content {
+					matches = false
+					break
+				}
+			}
+			if matches {
+				return event.Prompts
+			}
+			break
+		}
+		select {
+		case <-changed:
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+	t.Fatalf("run prompt queue order did not become %#v", want)
 	return nil
 }
 

@@ -43,6 +43,8 @@ export const Conversation = memo(function Conversation(props: {
   onRetryRefresh: () => void
   onToggleFullAccess: () => void
   onRemoveQueuedPrompt: (promptID: string) => void
+  onSteerQueuedPrompt: (promptID: string, steer: boolean) => void
+  onMoveQueuedPrompt: (promptID: string, direction: 'up' | 'down') => void
   onCompact: () => void
 }) {
 	const messagesRef = useRef<HTMLElement>(null)
@@ -372,7 +374,12 @@ export const Conversation = memo(function Conversation(props: {
           </div>
         )}
       </section>
-	  <QueuedPromptList prompts={props.activeRun?.queuedPrompts ?? []} onRemove={props.onRemoveQueuedPrompt} />
+	  <QueuedPromptList
+		prompts={props.activeRun?.queuedPrompts ?? []}
+		onRemove={props.onRemoveQueuedPrompt}
+		onSteer={props.onSteerQueuedPrompt}
+		onMove={props.onMoveQueuedPrompt}
+	  />
 	  <Composer
 		draft={props.draft}
 		onContentChange={props.onDraftChange}
@@ -527,14 +534,49 @@ function StoredImageAttachment(props: { sessionID: string; image: SessionImageAt
   return <img className="message-image" src={dataURL} alt={`Attached image (${props.image.media_type})`} />
 }
 
-function QueuedPromptList({ prompts, onRemove }: { prompts: QueuedPrompt[]; onRemove: (promptID: string) => void }) {
+function QueuedPromptList({ prompts, onRemove, onSteer, onMove }: {
+  prompts: QueuedPrompt[]
+  onRemove: (promptID: string) => void
+  onSteer: (promptID: string, steer: boolean) => void
+  onMove: (promptID: string, direction: 'up' | 'down') => void
+}) {
   if (prompts.length === 0) return null
+  // The server keeps steer prompts ahead of plain queued prompts, so the list
+  // is two contiguous groups. Reorder buttons clamp at the group boundary: a
+  // plain queued message can never move above a steer.
+  const firstOfGroup = (index: number) =>
+    prompts.findIndex((entry) => Boolean(entry.steer) === Boolean(prompts[index].steer)) === index
+  const lastOfGroup = (index: number) =>
+    index === prompts.length - 1 || Boolean(prompts[index + 1].steer) !== Boolean(prompts[index].steer)
   return (
     <div className="queued-prompt-list" aria-label="Queued messages">
-      {prompts.map((prompt) => (
-        <div className="queued-prompt-row" key={prompt.id}>
-          <span className="queued-prompt-badge">Queued</span>
+      {prompts.map((prompt, index) => (
+        <div className={`queued-prompt-row${prompt.steer ? ' steer' : ''}`} key={prompt.id}>
+          <span className={`queued-prompt-badge${prompt.steer ? ' steer' : ''}`}>{prompt.steer ? 'Steer' : 'Queued'}</span>
           <span className="queued-prompt-text" title={prompt.content}>{prompt.content}</span>
+          <button
+            type="button"
+            className="queued-prompt-move"
+            disabled={firstOfGroup(index)}
+            onClick={() => onMove(prompt.id, 'up')}
+            aria-label="Move queued message up"
+            title="Move up"
+          >↑</button>
+          <button
+            type="button"
+            className="queued-prompt-move"
+            disabled={lastOfGroup(index)}
+            onClick={() => onMove(prompt.id, 'down')}
+            aria-label="Move queued message down"
+            title="Move down"
+          >↓</button>
+          <button
+            type="button"
+            className={`queued-prompt-steer${prompt.steer ? ' active' : ''}`}
+            onClick={() => onSteer(prompt.id, !prompt.steer)}
+            aria-label={prompt.steer ? 'Demote to queued message' : 'Promote to steer message'}
+            title={prompt.steer ? 'Demote to regular queue' : 'Steer: deliver first, ahead of queued messages'}
+          >{prompt.steer ? 'Queued' : 'Steer'}</button>
           <button
             type="button"
             className="queued-prompt-remove"

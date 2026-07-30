@@ -928,7 +928,15 @@ type SessionRun struct {
 type activePrompt struct {
 	ID      string `json:"id"`
 	Content string `json:"content"`
-	strict  bool
+	// Steer marks a priority prompt: steer prompts always sort ahead of plain
+	// queued prompts and drain first, both into the active turn and into a
+	// follow-up turn. The queue invariant (steers on top, stable order within
+	// each group) is re-established after every mutation.
+	Steer bool `json:"steer"`
+	// strict is set for agent TrySteer prompts only: a strict prompt left
+	// behind when the active turn settles is dropped, never converted into a
+	// follow-up turn. Web steer prompts are not strict and stay no-loss.
+	strict bool
 }
 
 // StartSessionRun begins running the session message orchestration for id in a
@@ -1078,6 +1086,7 @@ func (r *SessionRun) AppendActive(content string) error {
 	}
 	r.nextPromptID++
 	r.activeQueue = append(r.activeQueue, activePrompt{ID: fmt.Sprintf("ap-%d", r.nextPromptID), Content: content})
+	r.normalizeActiveQueueLocked()
 	r.publishQueueSnapshotLocked()
 	r.mu.Unlock()
 	return nil
@@ -1103,11 +1112,120 @@ func (r *SessionRun) TrySteer(content string) error {
 	r.activeQueue = append(r.activeQueue, activePrompt{
 		ID:      fmt.Sprintf("ap-%d", r.nextPromptID),
 		Content: content,
+		Steer:   true,
 		strict:  true,
 	})
+	r.normalizeActiveQueueLocked()
 	r.publishQueueSnapshotLocked()
 	r.mu.Unlock()
 	return nil
+}
+
+// SetActivePromptSteer marks or unmarks a not-yet-sent queued prompt as a
+// steer prompt. Steer prompts sort ahead of plain queued prompts and drain
+// first; demoting returns the prompt below any remaining steers. It reports
+// whether a prompt with that id is still queued. The updated queue is
+// published as a run.prompt_queue snapshot.
+func (r *SessionRun) SetActivePromptSteer(promptID string, steer bool) bool {
+	if r == nil {
+		return false
+	}
+	r.mu.Lock()
+	index := activePromptIndex(r.activeQueue, promptID)
+	if index < 0 {
+		r.mu.Unlock()
+		return false
+	}
+	if r.activeQueue[index].Steer == steer {
+		r.mu.Unlock()
+		return true
+	}
+	r.activeQueue[index].Steer = steer
+	r.normalizeActiveQueueLocked()
+	r.publishQueueSnapshotLocked()
+	r.mu.Unlock()
+	return true
+}
+
+// MoveActivePrompt shifts a not-yet-sent queued prompt by delta positions
+// (negative moves up, positive moves down). The move is clamped to the
+// prompt's own priority group — steer prompts stay ahead of plain queued
+// prompts — so reordering can never violate the steers-on-top invariant. It
+// reports whether a prompt with that id is still queued. The updated queue is
+// published as a run.prompt_queue snapshot.
+func (r *SessionRun) MoveActivePrompt(promptID string, delta int) bool {
+	if r == nil {
+		return false
+	}
+	r.mu.Lock()
+	index := activePromptIndex(r.activeQueue, promptID)
+	if index < 0 {
+		r.mu.Unlock()
+		return false
+	}
+	// Group bounds: the queue is partitioned into steers (lo..hi of the steer
+	// group) followed by plain queued prompts; a move clamps to whichever
+	// group the prompt belongs to.
+	lo, hi := 0, len(r.activeQueue)
+	for i, prompt := range r.activeQueue {
+		if prompt.Steer == r.activeQueue[index].Steer {
+			continue
+		}
+		if i < index && i+1 > lo {
+			lo = i + 1
+		}
+		if i > index && i < hi {
+			hi = i
+		}
+	}
+	target := index + delta
+	if target < lo {
+		target = lo
+	}
+	if target > hi-1 {
+		target = hi - 1
+	}
+	if target != index {
+		prompt := r.activeQueue[index]
+		if target < index {
+			copy(r.activeQueue[target+1:index+1], r.activeQueue[target:index])
+		} else {
+			copy(r.activeQueue[index:target], r.activeQueue[index+1:target+1])
+		}
+		r.activeQueue[target] = prompt
+		r.publishQueueSnapshotLocked()
+	}
+	r.mu.Unlock()
+	return true
+}
+
+// activePromptIndex returns the index of the queued prompt with id, or -1.
+func activePromptIndex(queue []activePrompt, promptID string) int {
+	for i, prompt := range queue {
+		if prompt.ID == promptID {
+			return i
+		}
+	}
+	return -1
+}
+
+// normalizeActiveQueueLocked stable-partitions the queue so steer prompts sit
+// ahead of plain queued prompts, preserving the relative order inside each
+// group. The caller must hold r.mu.
+func (r *SessionRun) normalizeActiveQueueLocked() {
+	if len(r.activeQueue) < 2 {
+		return
+	}
+	steers := make([]activePrompt, 0, len(r.activeQueue))
+	queued := make([]activePrompt, 0, len(r.activeQueue))
+	for _, prompt := range r.activeQueue {
+		if prompt.Steer {
+			steers = append(steers, prompt)
+		} else {
+			queued = append(queued, prompt)
+		}
+	}
+	r.activeQueue = append(steers, queued...)
 }
 
 // RemoveActive deletes a not-yet-sent queued prompt by id and publishes the
@@ -1120,13 +1238,7 @@ func (r *SessionRun) RemoveActive(promptID string) bool {
 		return false
 	}
 	r.mu.Lock()
-	index := -1
-	for i, prompt := range r.activeQueue {
-		if prompt.ID == promptID {
-			index = i
-			break
-		}
-	}
+	index := activePromptIndex(r.activeQueue, promptID)
 	if index < 0 {
 		r.mu.Unlock()
 		return false

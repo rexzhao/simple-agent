@@ -357,6 +357,17 @@ func (run *CoordinatedSessionRun) RemoveActive(promptID string) bool {
 	return run != nil && run.run != nil && run.run.RemoveActive(promptID)
 }
 
+// SetActivePromptSteer marks or unmarks a queued prompt as a steer prompt;
+// steer prompts sort ahead of plain queued prompts and drain first.
+func (run *CoordinatedSessionRun) SetActivePromptSteer(promptID string, steer bool) bool {
+	return run != nil && run.run != nil && run.run.SetActivePromptSteer(promptID, steer)
+}
+
+// MoveActivePrompt reorders a queued prompt within its priority group.
+func (run *CoordinatedSessionRun) MoveActivePrompt(promptID string, delta int) bool {
+	return run != nil && run.run != nil && run.run.MoveActivePrompt(promptID, delta)
+}
+
 func (run *CoordinatedSessionRun) Enqueue(event PromptEvent) (*PromptReceipt, error) {
 	if run == nil || run.run == nil {
 		return nil, ErrSessionRunSettled

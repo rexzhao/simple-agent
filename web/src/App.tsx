@@ -720,6 +720,29 @@ function App() {
     }
   }
 
+  // Steer/move mutations only call the API; the updated queue arrives via the
+  // run.prompt_queue stream event, keeping the server the single source of
+  // truth for queue order.
+  const setQueuedPromptSteer = async (promptID: string, steer: boolean) => {
+    const run = activeRunsRef.current[selectedSessionID]
+    if (!run) return
+    try {
+      await api.steerRunMessage(run.id, promptID, steer)
+    } catch (reason) {
+      setError(errorMessage(reason))
+    }
+  }
+
+  const moveQueuedPrompt = async (promptID: string, direction: 'up' | 'down') => {
+    const run = activeRunsRef.current[selectedSessionID]
+    if (!run) return
+    try {
+      await api.moveRunMessage(run.id, promptID, direction)
+    } catch (reason) {
+      setError(errorMessage(reason))
+    }
+  }
+
   const compactSession = async () => {
     if (!selectedSessionID || sessionDetail?.status === 'running' || activeRunsRef.current[selectedSessionID]?.status === 'running') return
     const sessionID = selectedSessionID
@@ -803,6 +826,8 @@ function App() {
             onRetry={() => void retryRun()}
             onRetryRefresh={() => void retryRefreshSession(selectedSessionID)}
             onRemoveQueuedPrompt={(promptID) => void removeQueuedPrompt(promptID)}
+            onSteerQueuedPrompt={(promptID, steer) => void setQueuedPromptSteer(promptID, steer)}
+            onMoveQueuedPrompt={(promptID, direction) => void moveQueuedPrompt(promptID, direction)}
             onCompact={() => void compactSession()}
             onToggleFullAccess={() => sessionDetail && void toggleFullAccess(sessionDetail)}
           />

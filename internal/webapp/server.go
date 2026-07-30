@@ -123,6 +123,8 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /api/runs/{runID}/events", s.handleRunEvents)
 	s.mux.HandleFunc("POST /api/runs/{runID}/prompts", s.handleAppendActive)
 	s.mux.HandleFunc("DELETE /api/runs/{runID}/prompts/{promptID}", s.handleRemoveActivePrompt)
+	s.mux.HandleFunc("POST /api/runs/{runID}/prompts/{promptID}/steer", s.handleSteerActivePrompt)
+	s.mux.HandleFunc("POST /api/runs/{runID}/prompts/{promptID}/move", s.handleMoveActivePrompt)
 	s.mux.HandleFunc("DELETE /api/runs/{runID}", s.handleCancelRun)
 	s.mux.HandleFunc("DELETE /api/runs/{runID}/tools/{toolCallID}", s.handleCancelToolCall)
 	s.mux.Handle("/", s.staticHandler())
