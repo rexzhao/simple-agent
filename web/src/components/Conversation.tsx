@@ -297,10 +297,11 @@ export const Conversation = memo(function Conversation(props: {
         <div className="conversation-left-group">
           <div className="conversation-heading">
             <div className="conversation-title-row">
-              <span className={`status-dot ${props.compacting || props.activeRun || safeDetail?.status === 'running' ? 'running' : ''} ${safeDetail?.status === 'interrupted' ? 'interrupted' : ''}`} />
+              <span className={`status-dot ${props.compacting || props.activeRun?.status === 'running' || safeDetail?.status === 'running' ? 'running' : ''} ${safeDetail?.status === 'interrupted' ? 'interrupted' : ''}`} />
               <h1>{safeDetail ? sessionName(safeDetail) : 'Loading…'}</h1>
               {safeDetail && <button className="message-tool-button copy-id-button" onClick={() => void copySessionID()} title="Copy project and session ID" aria-label="Copy project and session ID"><CopyIcon /></button>}
             </div>
+            <span className={`status-pill ${props.compacting || props.activeRun?.status === 'running' || safeDetail?.status === 'running' || props.otherSessionsRunning ? 'running' : ''}`}><span />{props.activeRun?.providerRetry ? 'Retrying request' : props.compacting || props.activeRun?.compaction?.status === 'running' ? 'Compacting context' : props.activeRun?.status === 'running' || safeDetail?.status === 'running' ? 'Running' : props.otherSessionsRunning ? 'Another session running' : 'Ready'}</span>
             {safeDetail && <p>{safeDetail.provider} / {safeDetail.model_id}{safeDetail.reasoning_level && ` · ${safeDetail.reasoning_level}`}</p>}
           </div>
           {safeDetail && (

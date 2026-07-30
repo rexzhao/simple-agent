@@ -70,6 +70,7 @@ async function mockExistingSessionApp(page: Page, handler?: (route: Route, url: 
       return json(route, { sessions: url.searchParams.get('archived') === 'true' ? [] : [session] })
     }
     if (url.pathname === `/api/sessions/${session.id}`) return json(route, session)
+    if (url.pathname === `/api/sessions/${session.id}/snapshot`) return json(route, { session_id: session.id, revision: String(session.last_seq), session, history: itemsPage() })
     if (url.pathname === `/api/sessions/${session.id}/items`) return json(route, itemsPage())
     return json(route, { error: { code: 'not_mocked', message: `${route.request().method()} ${url.pathname} was not mocked` } }, 404)
   })
@@ -108,6 +109,7 @@ test('connects a first project, creates a session, and commits a streamed run', 
       return json(route, session, 201)
     }
     if (url.pathname === `/api/sessions/${session.id}`) return json(route, { ...session, last_seq: savedItems.length })
+    if (url.pathname === `/api/sessions/${session.id}/snapshot`) return json(route, { session_id: session.id, revision: String(savedItems.length), session: { ...session, last_seq: savedItems.length }, history: itemsPage(savedItems) })
     if (url.pathname === `/api/sessions/${session.id}/items`) return json(route, itemsPage(savedItems))
     if (url.pathname === `/api/sessions/${session.id}/runs` && request.method() === 'POST') {
       return json(route, { run_id: 'run-main', session_id: session.id, status: 'running' }, 202)

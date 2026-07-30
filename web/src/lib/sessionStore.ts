@@ -88,8 +88,14 @@ export function sessionStoreReducer(state: SessionStoreState, action: SessionSto
       if (snapshot.session_id !== expectedSessionID) return state
 
       const existing = state.historyBySession[snapshot.session_id]
-      // Invariant 3: older revision must not overwrite newer.
-      if (existing && revisionGTE(existing.revision, snapshot.revision)) return state
+      // Invariant 3: older revision must not overwrite newer history.
+      // But always update sessionsByID — metadata-only changes (rename, full
+      // access toggle) don't change LastSeq but must still update the session.
+      if (existing && revisionGTE(existing.revision, snapshot.revision)) {
+        // Revision unchanged: just update session metadata in sessionsByID.
+        const sessionsByID = { ...state.sessionsByID, [snapshot.session_id]: snapshot.session }
+        return { ...state, sessionsByID }
+      }
 
       const merged = mergeRefreshedPage(existing?.page ?? null, snapshot.history)
       const historyBySession = { ...state.historyBySession }

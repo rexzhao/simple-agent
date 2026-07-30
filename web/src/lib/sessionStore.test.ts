@@ -61,7 +61,32 @@ describe('sessionStoreReducer', () => {
       expect(state.sessionsByID['s1'].id).toBe('s1')
     })
 
-    it('discards a snapshot with older revision', () => {
+    it('discards history from a snapshot with older revision but updates metadata', () => {
+      let state = sessionStoreReducer(initialSessionStoreState(), {
+        type: 'snapshot',
+        snapshot: snapshot('s1', '10', [1, 2, 3]),
+        expectedSessionID: 's1',
+      })
+      // Same revision but different display_name (metadata-only change).
+      const renamedSnapshot: SessionSnapshot = {
+        session_id: 's1',
+        revision: '10',
+        session: { ...session('s1'), display_name: 'Renamed' } as Session,
+        history: { items: [{ id: 'item-1', seq: 1 } as never, { id: 'item-2', seq: 2 } as never, { id: 'item-3', seq: 3 } as never, { id: 'item-4', seq: 4 } as never], oldest_seq: 1, newest_seq: 4, has_more_before: false, has_more_after: false },
+      }
+      state = sessionStoreReducer(state, {
+        type: 'snapshot',
+        snapshot: renamedSnapshot,
+        expectedSessionID: 's1',
+      })
+      // History unchanged (revision not newer).
+      expect(state.historyBySession['s1'].revision).toBe('10')
+      expect(state.historyBySession['s1'].page.items).toHaveLength(3)
+      // But session metadata updated.
+      expect(state.sessionsByID['s1'].display_name).toBe('Renamed')
+    })
+
+    it('discards history from a snapshot with older revision', () => {
       let state = sessionStoreReducer(initialSessionStoreState(), {
         type: 'snapshot',
         snapshot: snapshot('s1', '10', [1, 2, 3]),
