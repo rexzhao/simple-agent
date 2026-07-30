@@ -340,7 +340,7 @@ export const Conversation = memo(function Conversation(props: {
 				<button className="turn-error-dismiss" onClick={props.onDismissTurnError} aria-label="Dismiss error" title="Dismiss">×</button>
 			</div>
 		)}
-t{props.activeRun?.status === 'error_pending_refresh' && (
+	{props.activeRun?.status === 'error_pending_refresh' && (
 		<div className="turn-error" role="alert">
 			<WarningIcon />
 			<div className="turn-error-copy">
