@@ -564,8 +564,8 @@ function ActiveRunView({ run, onCancelTool, sessionNames, workspaceRoot }: { run
         </article>
       )}
       {run.compaction && <CompactionStatus trigger={run.compaction.trigger} status={run.compaction.status} activeContextTokens={run.compaction.activeContextTokens} contextWindow={run.compaction.contextWindow} />}
-      {run.providerRetry && <ProviderRetryStatus retry={run.providerRetry} />}
       <ActiveRunBody run={run} onCancelTool={onCancelTool} sessionNames={sessionNames} workspaceRoot={workspaceRoot} />
+      {run.providerRetry && <ProviderRetryStatus retry={run.providerRetry} />}
     </>
   )
 }
