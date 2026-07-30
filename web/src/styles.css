@@ -223,7 +223,7 @@ svg { width: 1.1em; height: 1.1em; fill: none; stroke: currentColor; stroke-widt
 .session-tree-row.selected .session-icon { color: #111111; background: var(--accent); }
 .session-tree-row.archived { opacity: .72; }
 .session-tree-row.archived:hover, .session-tree-row.archived:focus-within { opacity: 1; }
-.live-dot { width: 8px; height: 8px; margin-left: auto; border: 2px solid #ffffff; background: #22c55e; animation: pulse 1.2s infinite; }
+.session-tree-button .status-dot { margin-left: auto; }
 
 .session-tree-actions { display: flex; gap: 1px; padding-right: 3px; opacity: 0; }
 .session-tree-row:hover .session-tree-actions, .session-tree-row:focus-within .session-tree-actions { opacity: 1; }
@@ -300,10 +300,6 @@ svg { width: 1.1em; height: 1.1em; fill: none; stroke: currentColor; stroke-widt
 .context-usage.critical .context-usage-copy span, .context-usage.critical .context-usage-copy strong, .context-usage.critical .context-usage-copy small { color: #ffffff; }
 .context-usage.critical .context-progress i { background: var(--danger); }
 .header-actions { display: flex; align-items: center; gap: 12px; }
-.status-pill { min-height: 28px; display: flex; align-items: center; gap: 7px; padding: 0 9px; border: 2px solid var(--border); color: var(--text); background: var(--panel); font-size: 10.5px; font-weight: 750; }
-.status-pill span { width: 8px; height: 8px; border: 2px solid var(--border); background: #22c55e; }
-.status-pill.running { background: var(--accent); }
-.status-pill.running span { background: #ffffff; animation: pulse 1.2s infinite; }
 .status-dot { width: 8px; height: 8px; flex: 0 0 auto; border: 2px solid var(--border); background: #22c55e; align-self: center; }
 .status-dot.running { background: #ffffff; border-color: var(--accent); animation: pulse 1.2s infinite; }
 .status-dot.interrupted { background: var(--danger); border-color: var(--danger); }

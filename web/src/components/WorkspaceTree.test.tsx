@@ -93,6 +93,15 @@ describe('WorkspaceTree session lineage', () => {
 
     expect(screen.getByText('Root 4')).not.toBeNull()
     expect(screen.getByText('Running child')).not.toBeNull()
-    expect(screen.getByText('Running child').closest('.session-tree-row')?.querySelector('.live-dot')).not.toBeNull()
+    expect(screen.getByText('Running child').closest('.session-tree-row')?.querySelector('.status-dot.running')).not.toBeNull()
+  })
+
+  it('shows a red interrupted indicator on failed sessions in the list', () => {
+    const failed = session('failed', 'Failed', { status: 'interrupted' })
+    const idle = session('idle', 'Idle', { status: 'idle' })
+    renderTree([failed, idle])
+
+    expect(screen.getByText('Failed').closest('.session-tree-row')?.querySelector('.status-dot.interrupted')).not.toBeNull()
+    expect(screen.getByText('Idle').closest('.session-tree-row')?.querySelector('.status-dot')).toBeNull()
   })
 })

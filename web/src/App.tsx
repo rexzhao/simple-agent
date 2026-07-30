@@ -741,7 +741,6 @@ function App() {
   const selectedProject = projects.find((project) => project.id === selectedProjectID) ?? null
   const selectedActiveRun = activeRunsBySession[selectedSessionID] ?? null
   const visibleRunningSessionIDs = new Set([...runningSessionIDs, ...Object.keys(compactingSessionIDs)])
-  const otherSessionsRunning = [...visibleRunningSessionIDs].some((sessionID) => sessionID !== selectedSessionID)
   const showAddProject = useCallback(() => setShowProjectForm(true), [])
 
   if (loading) return <Splash />
@@ -792,7 +791,6 @@ function App() {
 			onPastedImageAdd={(pastedImage) => addPastedImage(selectedSessionID, pastedImage)}
 			onPastedImageRemove={(pastedImageID) => removePastedImage(selectedSessionID, pastedImageID)}
 			onDraftClear={() => clearDraft(selectedSessionID)}
-			otherSessionsRunning={otherSessionsRunning}
 					recentStepsByTurn={recentStepsByTurn}
             sessionNames={sessionNames}
             turnError={turnErrors[selectedSessionID] ?? null}

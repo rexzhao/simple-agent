@@ -25,7 +25,6 @@ const baseProps = {
   onPastedImageAdd: vi.fn(),
   onPastedImageRemove: vi.fn(),
   onDraftClear: vi.fn(),
-  otherSessionsRunning: false,
   recentStepsByTurn: {},
   sessionNames: {},
   turnError: null,
