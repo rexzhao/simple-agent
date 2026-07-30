@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { ActiveRun, RunEvent } from '../types'
 import { reduceRunEvent } from '../lib/runEventReducer'
 
@@ -23,11 +23,17 @@ export function coalesceRunEvents(events: RunEvent[]): RunEvent[] {
   return result
 }
 
-export function useRunRegistry() {
+export interface UseRunRegistryOptions {
+  /** Called when a new run is about to supersede a non-running old run in the same session. */
+  onSupersedeRun?: (sessionID: string, oldRunID: string) => void
+}
+
+export function useRunRegistry(options?: UseRunRegistryOptions) {
   const [activeRunsBySession, setActiveRunsBySession] = useState<Record<string, ActiveRun>>({})
-  const [runningSessionIDs, setRunningSessionIDs] = useState<ReadonlySet<string>>(() => new Set())
   const activeRunsRef = useRef<Record<string, ActiveRun>>({})
   const pendingRef = useRef<Record<string, Pending>>({})
+  const onSupersedeRunRef = useRef(options?.onSupersedeRun)
+  onSupersedeRunRef.current = options?.onSupersedeRun
 
   const publish = useCallback((next: Record<string, ActiveRun>) => {
     activeRunsRef.current = next
@@ -44,24 +50,28 @@ export function useRunRegistry() {
       const pending = pendingRef.current[sessionID]
       if (pending) window.clearTimeout(pending.timer)
       delete pendingRef.current[sessionID]
-      setRunningSessionIDs((currentIDs) => {
-        if (!currentIDs.has(sessionID)) return currentIDs
-        const nextIDs = new Set(currentIDs)
-        nextIDs.delete(sessionID)
-        return nextIDs
-      })
     }
     publish(next)
   }, [publish])
-  const addActiveRun = useCallback((run: ActiveRun) => {
-    const isNewSession = !activeRunsRef.current[run.sessionID]
+
+  const addActiveRun = useCallback((run: ActiveRun): boolean => {
+    const existing = activeRunsRef.current[run.sessionID]
+    if (existing && existing.id !== run.id) {
+      if (existing.status === 'running') {
+        // Not allowed to supersede a running run (coordinator is single-run per session).
+        return false
+      }
+      // Old run is reconciling/error_pending_refresh/failed/cancelled:
+      // save steps + trigger refresh via App-layer callback, then overwrite.
+      onSupersedeRunRef.current?.(run.sessionID, existing.id)
+    }
     const pending = pendingRef.current[run.sessionID]
     if (pending && pending.runID !== run.id) {
       window.clearTimeout(pending.timer)
       delete pendingRef.current[run.sessionID]
     }
     publish({ ...activeRunsRef.current, [run.sessionID]: run })
-    if (isNewSession) setRunningSessionIDs((current) => new Set(current).add(run.sessionID))
+    return true
   }, [publish])
 
   const flushRunEvents = useCallback((sessionID: string, runID: string) => {
@@ -91,6 +101,15 @@ export function useRunRegistry() {
       pendingRef.current[sessionID] = { runID, timer }
     }
   }, [flushRunEvents])
+
+  // Derive runningSessionIDs from activeRunsBySession: only sessions with
+  // status === 'running' are considered active. This replaces the old manual
+  // set management which treated any run presence as "running".
+  const runningSessionIDs = useMemo(() =>
+    new Set(Object.entries(activeRunsBySession)
+      .filter(([, run]) => run.status === 'running')
+      .map(([sessionID]) => sessionID))
+  , [activeRunsBySession])
 
   useEffect(() => () => {
     for (const pending of Object.values(pendingRef.current)) window.clearTimeout(pending.timer)

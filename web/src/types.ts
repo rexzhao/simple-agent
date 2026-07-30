@@ -285,6 +285,7 @@ export interface ActiveRun {
     maxAttempts: number
     delayMS: number
   }
-  status: 'running' | 'failed' | 'cancelled'
+  status: 'running' | 'failed' | 'cancelled' | 'reconciling' | 'error_pending_refresh'
+  settledLastSeq?: number  // run.settled last_seq, for durable settlement check
   error?: string
 }

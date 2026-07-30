@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { api, streamRun } from './api'
-import type { ActiveRun, ActiveRunDescriptor, Bootstrap, ImageAttachmentInput, Project, RunEvent, RunStep, Session, SessionItem, SessionModelOption } from './types'
+import type { ActiveRun, ActiveRunDescriptor, Bootstrap, ImageAttachmentInput, ItemsPage, Project, RunEvent, RunStep, Session, SessionItem, SessionModelOption } from './types'
 import { errorMessage } from './lib/format'
 import { reduceRunEvent } from './lib/runEventReducer'
 import { modelKey, orderSessions, processKey, projectName, sessionName } from './lib/session'
@@ -56,7 +56,15 @@ function App() {
     }
     return names
   }, [sessionsByProject, archivedSessionsByProject])
-  const { activeRunsBySession, activeRunsRef, runningSessionIDs, addActiveRun, updateActiveRun, queueRunEvent, flushRunEvents } = useRunRegistry()
+  // Refs for reconciling timeout and backoff retry tracking.
+  const reconcileTimeoutRef = useRef<Record<string, number>>({})
+  const reconcileRetryCountRef = useRef<Record<string, number>>({})
+  const reconcileRetryTimerRef = useRef<Record<string, number>>({})
+  const refreshSessionRef = useRef<(sessionID: string) => Promise<Session | null>>(async () => null)
+
+  const onSupersedeRunRef = useRef<(sessionID: string, oldRunID: string) => void>(() => {})
+
+  const { activeRunsBySession, activeRunsRef, runningSessionIDs, addActiveRun, updateActiveRun, queueRunEvent, flushRunEvents } = useRunRegistry({ onSupersedeRun: (sessionID, oldRunID) => onSupersedeRunRef.current(sessionID, oldRunID) })
 
   const clearTurnError = useCallback((sessionID: string) => {
     setTurnErrors((current) => {
@@ -136,6 +144,89 @@ function App() {
   const reportError = useCallback((reason: unknown) => setError(errorMessage(reason)), [])
   const { sessionDetail, itemsPage, selectedSessionRef, refreshSession, loadOlder } =
     useSessionHistory(selectedSessionID, loadSessions, reportError)
+  refreshSessionRef.current = refreshSession
+
+  // saveRecentStepsAndRemove: saves steps to recentStepsByTurn, clears timers, removes run.
+  const saveRecentStepsAndRemove = useCallback((sessionID: string, runID: string) => {
+    const run = activeRunsRef.current[sessionID]
+    if (!run || run.id !== runID) return
+    const turnID = String(run.turnID ?? '')
+    if (turnID && run.steps.length > 0) {
+      setRecentStepsByTurn((current) => ({ ...current, [processKey(sessionID, turnID)]: run.steps }))
+    }
+    setRecoveredRuns((current) => current.filter((r) => r.run_id !== runID))
+    // Clear reconciling timers for this session.
+    const timeout = reconcileTimeoutRef.current[sessionID]
+    if (timeout) { window.clearTimeout(timeout); delete reconcileTimeoutRef.current[sessionID] }
+    const retryTimer = reconcileRetryTimerRef.current[sessionID]
+    if (retryTimer) { window.clearTimeout(retryTimer); delete reconcileRetryTimerRef.current[sessionID] }
+    delete reconcileRetryCountRef.current[`${sessionID}:${runID}`]
+    updateActiveRun(sessionID, runID, () => null)
+  }, [updateActiveRun])
+
+  // Wire onSupersedeRun: save old run steps + best-effort refresh.
+  onSupersedeRunRef.current = useCallback((sessionID: string, oldRunID: string) => {
+    saveRecentStepsAndRemove(sessionID, oldRunID)
+    void refreshSessionRef.current(sessionID).catch(() => {})
+  }, [saveRecentStepsAndRemove])
+
+  // onSnapshotApplied: unified settlement check point.
+  const onSnapshotApplied = useCallback((sessionID: string, session: Session) => {
+    const run = activeRunsRef.current[sessionID]
+    if (!run) return
+    if (run.status !== 'reconciling' && run.status !== 'error_pending_refresh') return
+    if (run.settledLastSeq == null || run.settledLastSeq === 0) {
+      saveRecentStepsAndRemove(sessionID, run.id)
+      return
+    }
+    if (session.last_seq >= run.settledLastSeq) {
+      saveRecentStepsAndRemove(sessionID, run.id)
+    } else {
+      if (run.status === 'error_pending_refresh') {
+        updateActiveRun(sessionID, run.id, (r) => ({ ...r, status: 'reconciling' }))
+      }
+      scheduleReconcileRetry(sessionID, run.id, run.settledLastSeq)
+    }
+  }, [saveRecentStepsAndRemove, updateActiveRun])
+
+  // scheduleReconcileRetry: backoff refresh, max 2 retries.
+  const scheduleReconcileRetry = useCallback((sessionID: string, runID: string, settledLastSeq: number) => {
+    const key = `${sessionID}:${runID}`
+    const count = reconcileRetryCountRef.current[key] ?? 0
+    if (count >= 2) return
+    reconcileRetryCountRef.current[key] = count + 1
+    const existing = reconcileRetryTimerRef.current[sessionID]
+    if (existing) window.clearTimeout(existing)
+    reconcileRetryTimerRef.current[sessionID] = window.setTimeout(() => {
+      delete reconcileRetryTimerRef.current[sessionID]
+      void refreshSessionRef.current(sessionID)
+        .then((session) => { if (session) onSnapshotApplied(sessionID, session) })
+        .catch(() => {})
+    }, 2000)
+  }, [onSnapshotApplied])
+
+  // startReconcileTimeout: 60s timer → error_pending_refresh.
+  const startReconcileTimeout = useCallback((sessionID: string) => {
+    const existing = reconcileTimeoutRef.current[sessionID]
+    if (existing) window.clearTimeout(existing)
+    reconcileTimeoutRef.current[sessionID] = window.setTimeout(() => {
+      delete reconcileTimeoutRef.current[sessionID]
+      const run = activeRunsRef.current[sessionID]
+      if (run && run.status === 'reconciling') {
+        updateActiveRun(sessionID, run.id, (r) => ({ ...r, status: 'error_pending_refresh' }))
+      }
+    }, 60000)
+  }, [updateActiveRun])
+
+  // retryRefreshSession: manual "refresh to see latest" handler.
+  const retryRefreshSession = useCallback(async (sessionID: string) => {
+    const run = activeRunsRef.current[sessionID]
+    if (!run || run.status !== 'error_pending_refresh') return
+    try {
+      const session = await refreshSessionRef.current(sessionID)
+      if (session) onSnapshotApplied(sessionID, session)
+    } catch { /* stay in error_pending_refresh */ }
+  }, [onSnapshotApplied])
 
   useEffect(() => {
     if (!completionNotice) return
@@ -370,38 +461,57 @@ function App() {
       case 'run.settled': {
         const settledRun = activeRunsRef.current[sessionID]
         if (!settledRun || settledRun.id !== runID) return
-        if (String(event.status) === 'failed') {
-          // turn.failed normally landed first with the real reason; this is
-          // only a fallback for streams that attached after it.
+        const settledLastSeq = Number(event.last_seq ?? 0)
+        const settledStatus = String(event.status)
+
+        if (settledStatus === 'failed') {
+          // turn.failed usually landed first with the real reason; fallback for late-attach.
           setTurnErrors((current) => current[sessionID]
             ? current
-            : { ...current, [sessionID]: { turnID: String(event.turn_id ?? ''), message: 'Run failed' } })
+            : { ...current, [sessionID]: { turnID: String(event.turn_id ?? ''), message: String(event.message ?? 'Run failed') } })
+          update((run) => ({ ...run, status: 'failed', settledLastSeq }))
+          try { await refreshSession(sessionID) } catch { /* error already shown */ }
+          saveRecentStepsAndRemove(sessionID, runID)
+          break
         }
-        if (String(event.status) === 'cancelled') {
-          update((run) => ({ ...run, status: 'cancelled' }))
+
+        if (settledStatus === 'cancelled') {
+          update((run) => ({ ...run, status: 'cancelled', settledLastSeq }))
+          try { await refreshSession(sessionID) } catch { /* ignore */ }
+          saveRecentStepsAndRemove(sessionID, runID)
+          break
         }
-        setRecoveredRuns((current) => current.filter((run) => run.run_id !== runID))
-        const turnID = String(event.turn_id ?? settledRun.turnID ?? '')
-        if (turnID && settledRun.steps.length > 0) {
-          setRecentStepsByTurn((current) => ({ ...current, [processKey(sessionID, turnID)]: settledRun.steps }))
-        }
+
+        // committed
+        update((run) => ({ ...run, status: 'reconciling', settledLastSeq }))
+        startReconcileTimeout(sessionID)
         let settledSession: Session | null = null
         try {
-          settledSession = await refreshSession(sessionID)
-        } catch (reason) {
-          setError(errorMessage(reason))
+          const result = await refreshSession(sessionID)
+          settledSession = result
+          if (result && activeRunsRef.current[sessionID]?.id === runID) {
+            const durableLastSeq = result.last_seq ?? 0
+            if (settledLastSeq === 0 || durableLastSeq >= settledLastSeq) {
+              saveRecentStepsAndRemove(sessionID, runID)
+            } else {
+              // Not caught up; onSnapshotApplied (if triggered) schedules backoff.
+              // If not triggered (discard), schedule backoff here as fallback.
+              scheduleReconcileRetry(sessionID, runID, settledLastSeq)
+            }
+          }
+        } catch {
+          update((run) => ({ ...run, status: 'error_pending_refresh' }))
         }
-        if (String(event.status) === 'committed' && selectedSessionRef.current !== sessionID) {
+        if (settledStatus === 'committed' && selectedSessionRef.current !== sessionID) {
           setCompletionNotice({
             sessionID,
             sessionName: settledSession ? sessionName(settledSession) : `Session ${sessionID.slice(-6)}`,
           })
         }
-        update(() => null)
         break
       }
     }
-  }, [flushRunEvents, queueRunEvent, refreshSession, updateActiveRun])
+  }, [flushRunEvents, queueRunEvent, refreshSession, saveRecentStepsAndRemove, scheduleReconcileRetry, startReconcileTimeout, updateActiveRun])
 
   useEffect(() => {
     if (recoveredRuns.length === 0) return
@@ -418,13 +528,9 @@ function App() {
         agentIteration: 0,
         status: 'running',
       })
-      void streamRun(run.run_id, (event) => handleRunEvent(run.session_id, run.run_id, event)).catch(async (reason: unknown) => {
-        try {
-          await refreshSession(run.session_id)
-        } catch {
-          // Preserve the stream error below.
-        }
-        updateActiveRun(run.session_id, run.run_id, () => null)
+      void streamRun(run.run_id, (event) => handleRunEvent(run.session_id, run.run_id, event)).catch((reason: unknown) => {
+        updateActiveRun(run.session_id, run.run_id, (existing) =>
+          existing ? { ...existing, status: 'error_pending_refresh' } : null)
         setRecoveredRuns((current) => current.filter((item) => item.run_id !== run.run_id))
         setError(errorMessage(reason))
       })
@@ -487,9 +593,10 @@ function App() {
         status: 'running',
       })
       clearTurnError(sessionID)
-      void streamRun(started.run_id, (event) => handleRunEvent(sessionID, started.run_id, event)).catch((reason: unknown) => {
-        const runID = activeRunsRef.current[sessionID]?.id
-        if (runID) updateActiveRun(sessionID, runID, () => null)
+      const boundRunID = started.run_id
+      void streamRun(boundRunID, (event) => handleRunEvent(sessionID, boundRunID, event)).catch((reason: unknown) => {
+        updateActiveRun(sessionID, boundRunID, (existing) =>
+          existing ? { ...existing, status: 'error_pending_refresh' } : null)
         setError(errorMessage(reason))
       })
       return true
@@ -505,7 +612,7 @@ function App() {
     if (!selectedSessionID || (!content.trim() && images.length === 0)) return false
     const sessionID = selectedSessionID
     const activeRun = activeRunsRef.current[sessionID]
-    if (activeRun) {
+    if (activeRun && activeRun.status === 'running') {
       // Append to the in-flight run: the message is queued and injected into
       // the active turn at the next safe checkpoint, or sent as a follow-up
       // turn. It is never sent as a new run here. The queued state arrives via
@@ -541,9 +648,10 @@ function App() {
         status: 'running',
       })
       clearTurnError(sessionID)
-      void streamRun(started.run_id, (event) => handleRunEvent(sessionID, started.run_id, event)).catch((reason: unknown) => {
-        const runID = activeRunsRef.current[sessionID]?.id
-        if (runID) updateActiveRun(sessionID, runID, () => null)
+      const boundRunID = started.run_id
+      void streamRun(boundRunID, (event) => handleRunEvent(sessionID, boundRunID, event)).catch((reason: unknown) => {
+        updateActiveRun(sessionID, boundRunID, (existing) =>
+          existing ? { ...existing, status: 'error_pending_refresh' } : null)
         setError(errorMessage(reason))
       })
       return true
@@ -569,9 +677,10 @@ function App() {
         status: 'running',
       })
       clearTurnError(sessionID)
-      void streamRun(started.run_id, (event) => handleRunEvent(sessionID, started.run_id, event)).catch((reason: unknown) => {
-        const runID = activeRunsRef.current[sessionID]?.id
-        if (runID) updateActiveRun(sessionID, runID, () => null)
+      const boundRunID = started.run_id
+      void streamRun(boundRunID, (event) => handleRunEvent(sessionID, boundRunID, event)).catch((reason: unknown) => {
+        updateActiveRun(sessionID, boundRunID, (existing) =>
+          existing ? { ...existing, status: 'error_pending_refresh' } : null)
         setError(errorMessage(reason))
       })
       return true
@@ -612,7 +721,7 @@ function App() {
   }
 
   const compactSession = async () => {
-    if (!selectedSessionID || sessionDetail?.status === 'running' || activeRunsRef.current[selectedSessionID]) return
+    if (!selectedSessionID || sessionDetail?.status === 'running' || activeRunsRef.current[selectedSessionID]?.status === 'running') return
     const sessionID = selectedSessionID
     setCompactingSessionIDs((current) => ({ ...current, [sessionID]: true }))
     try {
