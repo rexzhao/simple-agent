@@ -18,6 +18,7 @@ import { CopyIcon, RetryIcon, SparkIcon, WarningIcon } from './icons'
 const stickToBottomThresholdPX = 8
 
 export const Conversation = memo(function Conversation(props: {
+  sessionID: string
   detail: Session | null
   page: ItemsPage | null
   activeRun: ActiveRun | null
@@ -40,6 +41,7 @@ export const Conversation = memo(function Conversation(props: {
   onCancel: () => void
   onCancelTool: (toolCallID: string) => void
   onRetry: () => void
+  onRetryRefresh: () => void
   onToggleFullAccess: () => void
   onRemoveQueuedPrompt: (promptID: string) => void
   onCompact: () => void
@@ -61,7 +63,8 @@ export const Conversation = memo(function Conversation(props: {
 	const settleFrameRef = useRef(0)
 	const settleActiveRef = useRef(false)
 	const [loadingOlder, setLoadingOlder] = useState(false)
-	sessionIDRef.current = props.detail?.id ?? ''
+	sessionIDRef.current = props.sessionID
+	const safeDetail = props.detail && props.detail.id === props.sessionID ? props.detail : null
 	const [resendPending, setResendPending] = useState(false)
 
 	// Scoped to the messages container: unlike scrollIntoView this can never
@@ -118,7 +121,7 @@ export const Conversation = memo(function Conversation(props: {
 	// scroll gesture cancels the loop outright.
 	useLayoutEffect(() => {
 		const messages = messagesRef.current
-		const sessionID = props.detail?.id ?? ''
+		const sessionID = props.sessionID
 		if (!messages || !sessionID) return
 		const memory = scrollMemoryRef.current.get(sessionID)
 		const anchorTarget = memory && !memory.following && memory.seq != null
@@ -195,7 +198,7 @@ export const Conversation = memo(function Conversation(props: {
 		}
 		step()
 		return cancelSettle
-	}, [props.detail?.id, cancelSettle, updateFollowOutput])
+	}, [props.sessionID, cancelSettle, updateFollowOutput])
 	// Follow the output stream, but only while the user stays at the bottom.
 	// Runs before paint so streaming growth never shows an un-scrolled frame.
 	// While a switch restore is settling, the restore loop owns scrolling.
@@ -214,9 +217,9 @@ export const Conversation = memo(function Conversation(props: {
 		}
 	}, [props.onResend, resendPending])
 	const copySessionID = async () => {
-		if (!props.detail) return
+		if (!safeDetail) return
 		try {
-			await copyText(`${props.detail.project_id} ${props.detail.id}`)
+			await copyText(`${safeDetail.project_id} ${safeDetail.id}`)
 		} catch { /* ignore copy errors */ }
 	}
 	// Sending is explicit intent to be at the bottom: re-engage following even
@@ -239,7 +242,7 @@ export const Conversation = memo(function Conversation(props: {
 		const anchorElement = [...messages.querySelectorAll<HTMLElement>('.message')]
 			.find((element) => element.getBoundingClientRect().bottom > containerTop) ?? null
 		prependAnchorRef.current = {
-			sessionID: props.detail?.id ?? '',
+			sessionID: props.sessionID ?? '',
 			element: anchorElement,
 			top: anchorElement?.getBoundingClientRect().top ?? containerTop,
 			oldestSeq: props.page.oldest_seq,
@@ -250,7 +253,7 @@ export const Conversation = memo(function Conversation(props: {
 			loadingOlderRef.current = false
 			setLoadingOlder(false)
 		}
-	}, [props.detail?.id, props.onLoadOlder, props.page])
+	}, [props.sessionID, props.onLoadOlder, props.page])
 	// Restore the viewport anchor after older items are prepended. Only a true
 	// prepend (oldest_seq moved backwards) consumes the anchor: refresh merges
 	// append at the tail and leave the geometry untouched. The compensation is
@@ -260,7 +263,7 @@ export const Conversation = memo(function Conversation(props: {
 		const anchor = prependAnchorRef.current
 		const messages = messagesRef.current
 		if (!anchor || !messages) return
-		if (anchor.sessionID !== (props.detail?.id ?? '')) {
+		if (anchor.sessionID !== (props.sessionID ?? '')) {
 			prependAnchorRef.current = null
 			return
 		}
@@ -268,7 +271,7 @@ export const Conversation = memo(function Conversation(props: {
 		if (!page || page.oldest_seq === anchor.oldestSeq) return
 		prependAnchorRef.current = null
 		if (anchor.element?.isConnected) messages.scrollTop += anchor.element.getBoundingClientRect().top - anchor.top
-	}, [props.detail?.id, props.page])
+	}, [props.sessionID, props.page])
 	// Older history pages load only on an explicit click on the "Load earlier
 	// messages" button. Scrolling to the top deliberately does not auto-load:
 	// casual upward scrolls must not silently grow the history window.
@@ -279,14 +282,14 @@ export const Conversation = memo(function Conversation(props: {
 		() => visibleSessionItems(props.page?.items ?? [], props.activeRun),
 		[props.activeRun, props.page?.items],
 	)
-	const conversationEntries = useMemo(() => buildConversationEntries(visibleItems, props.detail?.id ?? '', props.recentStepsByTurn), [props.detail?.id, props.recentStepsByTurn, visibleItems])
+	const conversationEntries = useMemo(() => buildConversationEntries(visibleItems, props.sessionID ?? '', props.recentStepsByTurn), [props.sessionID, props.recentStepsByTurn, visibleItems])
 	// A session that is idle with a user message at the tail almost always
   // means the turn died mid-flight: offer to resend it in place.
 	const trailingUserItem = useMemo(() => {
-		if (props.activeRun || props.detail?.status === 'running') return null
+		if (props.activeRun || safeDetail?.status === 'running') return null
 		const last = visibleItems[visibleItems.length - 1]
 		return last?.message?.role === 'user' ? last : null
-	}, [props.activeRun, props.detail?.status, visibleItems])
+	}, [props.activeRun, safeDetail?.status, visibleItems])
 
   return (
     <div className="conversation">
@@ -294,37 +297,37 @@ export const Conversation = memo(function Conversation(props: {
         <div className="conversation-left-group">
           <div className="conversation-heading">
             <div className="conversation-title-row">
-              <span className={`status-dot ${props.compacting || props.activeRun || props.detail?.status === 'running' ? 'running' : ''} ${props.detail?.status === 'interrupted' ? 'interrupted' : ''}`} />
-              <h1>{props.detail ? sessionName(props.detail) : 'Loading…'}</h1>
-              {props.detail && <button className="message-tool-button copy-id-button" onClick={() => void copySessionID()} title="Copy project and session ID" aria-label="Copy project and session ID"><CopyIcon /></button>}
+              <span className={`status-dot ${props.compacting || props.activeRun || safeDetail?.status === 'running' ? 'running' : ''} ${safeDetail?.status === 'interrupted' ? 'interrupted' : ''}`} />
+              <h1>{safeDetail ? sessionName(safeDetail) : 'Loading…'}</h1>
+              {safeDetail && <button className="message-tool-button copy-id-button" onClick={() => void copySessionID()} title="Copy project and session ID" aria-label="Copy project and session ID"><CopyIcon /></button>}
             </div>
-            {props.detail && <p>{props.detail.provider} / {props.detail.model_id}{props.detail.reasoning_level && ` · ${props.detail.reasoning_level}`}</p>}
+            {safeDetail && <p>{safeDetail.provider} / {safeDetail.model_id}{safeDetail.reasoning_level && ` · ${safeDetail.reasoning_level}`}</p>}
           </div>
-          {props.detail && (
-            <ContextUsage context={props.detail.context} activeInputTokens={props.activeRun?.inputTokens} activeCachedTokens={props.activeRun?.cachedTokens} activeCacheWriteTokens={props.activeRun?.cacheWriteTokens} compactedContextTokens={props.activeRun?.compaction?.status === 'completed' ? props.activeRun.compaction.activeContextTokens : undefined} />
+          {safeDetail && (
+            <ContextUsage context={safeDetail.context} activeInputTokens={props.activeRun?.inputTokens} activeCachedTokens={props.activeRun?.cachedTokens} activeCacheWriteTokens={props.activeRun?.cacheWriteTokens} compactedContextTokens={props.activeRun?.compaction?.status === 'completed' ? props.activeRun.compaction.activeContextTokens : undefined} />
           )}
         </div>
         <div className="header-actions">
-		  {props.detail && (
+		  {safeDetail && (
 			<button
-				className={`secondary-button full-access-toggle${props.detail.full_access ? ' on' : ''}`}
+				className={`secondary-button full-access-toggle${safeDetail.full_access ? ' on' : ''}`}
 				onClick={props.onToggleFullAccess}
-				title={`Full access ${props.detail.full_access ? 'ON' : 'OFF'}: file tools ${props.detail.full_access ? 'may read and write outside the workspace' : 'are confined to the workspace'}. Toggling applies from the next turn.`}
-				aria-pressed={props.detail.full_access}
+				title={`Full access ${safeDetail.full_access ? 'ON' : 'OFF'}: file tools ${safeDetail.full_access ? 'may read and write outside the workspace' : 'are confined to the workspace'}. Toggling applies from the next turn.`}
+				aria-pressed={safeDetail.full_access}
 			>
-				Full access{props.detail.full_access ? ' · ON' : ''}
+				Full access{safeDetail.full_access ? ' · ON' : ''}
 			</button>
 		  )}
-		  <button className="secondary-button" disabled={!props.detail || props.detail.status === 'running' || props.compacting || Boolean(props.activeRun)} onClick={props.onCompact}>{props.compacting ? 'Compacting…' : 'Compact context'}</button>
+		  <button className="secondary-button" disabled={!safeDetail || safeDetail.status === 'running' || props.compacting || props.activeRun?.status === 'running'} onClick={props.onCompact}>{props.compacting ? 'Compacting…' : 'Compact context'}</button>
         </div>
       </header>
       <section ref={messagesRef} className="messages" aria-live="polite" onScroll={handleScroll} onWheel={cancelSettle} onTouchMove={cancelSettle} onKeyDown={cancelSettle} onPointerDown={cancelSettle}>
         {props.page?.has_more_before && <button className="load-older" disabled={loadingOlder} onClick={() => void loadOlder()}>{loadingOlder ? 'Loading earlier messages…' : 'Load earlier messages'}</button>}
         {!props.page && <MessageSkeleton />}
 				{conversationEntries.map((entry) => entry.kind === 'message'
-					? <Message key={entry.item.id} item={entry.item} sessionID={props.detail?.id ?? ''} onResend={entry.item === trailingUserItem ? handleResend : undefined} resendPending={resendPending} />
-					: <HistoricalProcess key={entry.id} entry={entry} sessionNames={props.sessionNames} workspaceRoot={props.detail?.created_cwd} />)}
-        {props.activeRun && <ActiveRunView run={props.activeRun} onCancelTool={props.onCancelTool} sessionNames={props.sessionNames} workspaceRoot={props.detail?.created_cwd} />}
+					? <Message key={entry.item.id} item={entry.item} sessionID={props.sessionID ?? ''} onResend={entry.item === trailingUserItem ? handleResend : undefined} resendPending={resendPending} />
+					: <HistoricalProcess key={entry.id} entry={entry} sessionNames={props.sessionNames} workspaceRoot={safeDetail?.created_cwd} />)}
+        {props.activeRun && <ActiveRunView run={props.activeRun} onCancelTool={props.onCancelTool} sessionNames={props.sessionNames} workspaceRoot={safeDetail?.created_cwd} />}
         {props.compacting && <CompactionStatus trigger="manual" status="running" />}
 		{props.turnError && (
 			<div className="turn-error" role="alert">
@@ -337,7 +340,17 @@ export const Conversation = memo(function Conversation(props: {
 				<button className="turn-error-dismiss" onClick={props.onDismissTurnError} aria-label="Dismiss error" title="Dismiss">×</button>
 			</div>
 		)}
-		{!props.turnError && props.detail?.status === 'interrupted' && !props.activeRun && (
+t{props.activeRun?.status === 'error_pending_refresh' && (
+		<div className="turn-error" role="alert">
+			<WarningIcon />
+			<div className="turn-error-copy">
+				<strong>Refresh needed</strong>
+				<p>The session state may be outdated. Refresh to see the latest.</p>
+			</div>
+			<button className="message-tool-button" onClick={props.onRetryRefresh} title="Refresh session">Refresh</button>
+		</div>
+	)}
+		{!props.turnError && safeDetail?.status === 'interrupted' && !props.activeRun && (
 			<div className="turn-error" role="alert">
 				<WarningIcon />
 				<div className="turn-error-copy">
@@ -350,7 +363,7 @@ export const Conversation = memo(function Conversation(props: {
 		{props.page && visibleItems.length === 0 && !props.activeRun && (
           <div className="conversation-empty"><SparkIcon /><h3>Start a new task</h3><p>Describe a goal, a problem, or the code you want to change.</p></div>
         )}
-		{props.detail?.status === 'interrupted' && !props.activeRun && !props.turnError && (
+		{safeDetail?.status === 'interrupted' && !props.activeRun && !props.turnError && (
           <div className="conversation-retry">
             <button className="message-tool-button" onClick={props.onRetry} title="Retry last turn"><RetryIcon />Retry last turn</button>
           </div>
@@ -365,14 +378,15 @@ export const Conversation = memo(function Conversation(props: {
 		onPastedImageAdd={props.onPastedImageAdd}
 		onPastedImageRemove={props.onPastedImageRemove}
 		onDraftClear={props.onDraftClear}
-		running={Boolean(props.activeRun)}
-		blocked={!props.activeRun && (props.compacting || props.detail?.status === 'running')}
+		running={props.activeRun?.status === 'running'}
+		blocked={!props.activeRun && (props.compacting || safeDetail?.status === 'running')}
 		onSend={handleSend}
 		onCancel={props.onCancel}
 	  />
     </div>
   )
 }, (previous, next) =>
+  previous.sessionID === next.sessionID &&
   previous.detail === next.detail &&
   previous.page === next.page &&
   previous.activeRun === next.activeRun &&
@@ -383,7 +397,8 @@ export const Conversation = memo(function Conversation(props: {
   previous.recentStepsByTurn === next.recentStepsByTurn &&
   previous.sessionNames === next.sessionNames &&
   previous.onCancelTool === next.onCancelTool &&
-  previous.onRetry === next.onRetry)
+  previous.onRetry === next.onRetry &&
+  previous.onRetryRefresh === next.onRetryRefresh)
 
 function ContextUsage(props: { context: Session['context']; activeInputTokens?: number; activeCachedTokens?: number; activeCacheWriteTokens?: number; compactedContextTokens?: number }) {
 	const context = props.context

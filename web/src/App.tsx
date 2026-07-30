@@ -327,7 +327,7 @@ function App() {
   const deleteProject = useCallback(async (project: Project) => {
     const activeSessions = sessionsByProject[project.id] ?? []
     const archivedSessions = archivedSessionsByProject[project.id] ?? []
-    if (activeSessions.some((session) => session.status === 'running' || Boolean(activeRunsRef.current[session.id]))) return
+    if (activeSessions.some((session) => session.status === 'running' || activeRunsRef.current[session.id]?.status === 'running')) return
     const sessionCount = activeSessions.length + archivedSessions.length
     const message = `Permanently delete "${projectName(project)}" and ${sessionCount} saved ${sessionCount === 1 ? 'session' : 'sessions'}? All session history and attachments for this project will be removed. This action cannot be undone.`
     if (!window.confirm(message)) return
@@ -385,7 +385,7 @@ function App() {
   }, [loadSessions, refreshSession, selectedSessionRef])
 
   const archiveSession = useCallback(async (session: Session) => {
-    if (session.status === 'running' || Boolean(activeRunsRef.current[session.id]) || !window.confirm(`Archive "${sessionName(session)}"? It will be hidden from the current list.`)) return
+    if (session.status === 'running' || activeRunsRef.current[session.id]?.status === 'running' || !window.confirm(`Archive "${sessionName(session)}"? It will be hidden from the current list.`)) return
     try {
       await api.archiveSession(session.id)
       await loadSessions(session.project_id)
@@ -407,7 +407,7 @@ function App() {
   }, [loadSessions, setSelectedProjectID, setSelectedSessionID])
 
   const deleteSession = useCallback(async (session: Session) => {
-    if (session.status === 'running' || Boolean(activeRunsRef.current[session.id]) || !window.confirm(`Permanently delete "${sessionName(session)}"? This action cannot be undone.`)) return
+    if (session.status === 'running' || activeRunsRef.current[session.id]?.status === 'running' || !window.confirm(`Permanently delete "${sessionName(session)}"? This action cannot be undone.`)) return
     try {
       await api.archiveSession(session.id)
       await api.deleteSession(session.id)
@@ -780,6 +780,7 @@ function App() {
           />
         ) : selectedSessionID ? (
           <Conversation
+            sessionID={selectedSessionID}
             detail={sessionDetail}
             page={itemsPage}
             activeRun={selectedActiveRun}
@@ -802,6 +803,7 @@ function App() {
             onCancel={() => void cancelRun()}
             onCancelTool={(toolCallID) => void cancelToolCall(toolCallID)}
             onRetry={() => void retryRun()}
+            onRetryRefresh={() => void retryRefreshSession(selectedSessionID)}
             onRemoveQueuedPrompt={(promptID) => void removeQueuedPrompt(promptID)}
             onCompact={() => void compactSession()}
             onToggleFullAccess={() => sessionDetail && void toggleFullAccess(sessionDetail)}
