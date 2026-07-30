@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { cleanup, render, screen, fireEvent } from '@testing-library/react'
+import { act, cleanup, render, screen, fireEvent } from '@testing-library/react'
 import { Conversation } from './Conversation'
 import type { ActiveRun, ItemsPage, Session } from '../types'
 import { emptyComposerDraft } from './Composer'
@@ -120,6 +120,48 @@ describe('Conversation identity boundary', () => {
       expect(keyWarnings).toHaveLength(0)
     } finally {
       errorSpy.mockRestore()
+    }
+  })
+
+  it('counts down the provider retry delay, then switches to the reconnecting label', () => {
+    vi.useFakeTimers()
+    try {
+      const detail = session('s1')
+      const run: ActiveRun = {
+        id: 'run-1', sessionID: 's1', userText: 'hi', assistantText: '', steps: [],
+        agentIteration: 1, status: 'running',
+        providerRetry: { attempt: 3, maxAttempts: 5, delayMS: 10000 },
+      }
+      render(<Conversation {...baseProps} sessionID="s1" detail={detail} activeRun={run} />)
+      expect(screen.getByText(/Retrying request 3 of 5 in 10s/)).toBeDefined()
+      act(() => { vi.advanceTimersByTime(4100) })
+      expect(screen.getByText(/Retrying request 3 of 5 in 6s/)).toBeDefined()
+      act(() => { vi.advanceTimersByTime(6000) })
+      expect(screen.queryByText(/Retrying request/)).toBeNull()
+      expect(screen.getByText(/Reconnecting \(attempt 3 of 5\)/)).toBeDefined()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('restarts the provider retry countdown when a new attempt arrives', () => {
+    vi.useFakeTimers()
+    try {
+      const detail = session('s1')
+      const run: ActiveRun = {
+        id: 'run-1', sessionID: 's1', userText: 'hi', assistantText: '', steps: [],
+        agentIteration: 1, status: 'running',
+        providerRetry: { attempt: 3, maxAttempts: 5, delayMS: 10000 },
+      }
+      const { rerender } = render(<Conversation {...baseProps} sessionID="s1" detail={detail} activeRun={run} />)
+      act(() => { vi.advanceTimersByTime(5000) })
+      expect(screen.getByText(/in 5s/)).toBeDefined()
+      // The retried connection failed again: attempt 4 with a fresh 20s delay.
+      const next: ActiveRun = { ...run, providerRetry: { attempt: 4, maxAttempts: 5, delayMS: 20000 } }
+      rerender(<Conversation {...baseProps} sessionID="s1" detail={detail} activeRun={next} />)
+      expect(screen.getByText(/Retrying request 4 of 5 in 20s/)).toBeDefined()
+    } finally {
+      vi.useRealTimers()
     }
   })
 

@@ -131,4 +131,25 @@ describe('reduceRunEvent', () => {
     })
     expect(recovered.providerRetry).toBeUndefined()
   })
+
+  it('clears the provider retry notice when the turn fails', () => {
+    const retrying = reduceRunEvent(newRun(), {
+      type: 'provider.retrying',
+      turn_id: 'turn-1',
+      agent_iteration: 1,
+      attempt: 5,
+      max_attempts: 5,
+      delay_ms: 40000,
+      reason: 'server_error',
+    })
+    expect(retrying.providerRetry).toBeDefined()
+    const failed = reduceRunEvent(retrying, {
+      type: 'turn.failed',
+      turn_id: 'turn-1',
+      code: 'model_server_error',
+      message: 'server unavailable',
+    })
+    expect(failed.status).toBe('failed')
+    expect(failed.providerRetry).toBeUndefined()
+  })
 })

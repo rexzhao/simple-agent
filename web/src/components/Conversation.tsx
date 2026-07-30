@@ -610,17 +610,32 @@ function ActiveRunView({ run, onCancelTool, sessionNames, workspaceRoot }: { run
       )}
       {run.compaction && <CompactionStatus trigger={run.compaction.trigger} status={run.compaction.status} activeContextTokens={run.compaction.activeContextTokens} contextWindow={run.compaction.contextWindow} />}
       <ActiveRunBody run={run} onCancelTool={onCancelTool} sessionNames={sessionNames} workspaceRoot={workspaceRoot} />
-      {run.providerRetry && <ProviderRetryStatus retry={run.providerRetry} />}
+      {run.providerRetry && <ProviderRetryStatus key={run.providerRetry.attempt} retry={run.providerRetry} />}
     </>
   )
 }
 
+// ProviderRetryStatus counts down the backoff delay, then switches to a
+// "reconnecting" label while the retry attempt itself is in flight. The
+// component is keyed by attempt, so a new provider.retrying event restarts
+// the countdown from the new delay.
 function ProviderRetryStatus({ retry }: { retry: NonNullable<ActiveRun['providerRetry']> }) {
-  const delaySeconds = Math.max(0, retry.delayMS / 1000)
+  const [remainingMS, setRemainingMS] = useState(() => Math.max(0, retry.delayMS))
+  useEffect(() => {
+    if (retry.delayMS <= 0) return
+    const startedAt = Date.now()
+    const timer = window.setInterval(() => {
+      setRemainingMS(Math.max(0, retry.delayMS - (Date.now() - startedAt)))
+    }, 250)
+    return () => window.clearInterval(timer)
+  }, [retry.delayMS])
+  const waiting = remainingMS > 0
   return (
     <div className="provider-retry-status" role="status">
       <span />
-      Server temporarily failed. Retrying request {retry.attempt} of {retry.maxAttempts} after {delaySeconds.toLocaleString()}s…
+      {waiting
+        ? <>Server temporarily failed. Retrying request {retry.attempt} of {retry.maxAttempts} in {Math.ceil(remainingMS / 1000).toLocaleString()}s…</>
+        : <>Server temporarily failed. Reconnecting (attempt {retry.attempt} of {retry.maxAttempts})…</>}
     </div>
   )
 }

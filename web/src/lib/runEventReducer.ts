@@ -101,7 +101,9 @@ export function reduceRunEvent(run: ActiveRun, event: RunEvent): ActiveRun {
         reasoningTokens: Number(event.reasoning_tokens ?? 0),
       }
     case 'turn.failed':
-      return { ...run, status: 'failed', error: String(event.message ?? 'Run failed') }
+      // Terminal failure: drop any pending retry notice so it does not
+      // linger next to the Turn failed banner.
+      return { ...run, status: 'failed', error: String(event.message ?? 'Run failed'), providerRetry: undefined }
     default:
       return run
   }
