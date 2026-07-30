@@ -145,3 +145,33 @@ describe('Conversation queued prompt list', () => {
     expect(onMoveQueuedPrompt).toHaveBeenCalledWith('ap-1', 'down')
   })
 })
+
+describe('Conversation streaming cursor', () => {
+  const runWith = (overrides: Partial<ActiveRun>): ActiveRun => ({
+    id: 'run-1', sessionID: 's1', userText: 'hi', assistantText: '', steps: [],
+    agentIteration: 0, status: 'running', ...overrides,
+  })
+
+  it('shows the cursor after streaming text while the turn is running', () => {
+    const { container } = render(<Conversation {...baseProps} sessionID="s1" detail={session('s1')}
+      activeRun={runWith({ assistantText: 'partial output' })} />)
+    const stream = container.querySelector('.assistant-stream')
+    expect(stream).not.toBeNull()
+    expect(stream?.querySelector('.cursor')).not.toBeNull()
+  })
+
+  it('keeps the cursor visible between iterations when tools run before any usage update', () => {
+    const { container } = render(<Conversation {...baseProps} sessionID="s1" detail={session('s1')}
+      activeRun={runWith({ steps: [{ kind: 'tool', id: 't1', name: 'shell', iteration: 1, status: 'running' }] })} />)
+    expect(container.querySelector('.cursor')).not.toBeNull()
+  })
+
+  it('hides the cursor once the run leaves the running state', () => {
+    const { container, rerender } = render(<Conversation {...baseProps} sessionID="s1" detail={session('s1')}
+      activeRun={runWith({ assistantText: 'partial output', status: 'reconciling' })} />)
+    expect(container.querySelector('.cursor')).toBeNull()
+    rerender(<Conversation {...baseProps} sessionID="s1" detail={session('s1')}
+      activeRun={runWith({ status: 'failed' })} />)
+    expect(container.querySelector('.cursor')).toBeNull()
+  })
+})

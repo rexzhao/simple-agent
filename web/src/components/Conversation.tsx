@@ -647,7 +647,11 @@ function ActiveRunBody({ run, onCancelTool, sessionNames, workspaceRoot }: { run
   // the trailing tool group collapses instead of staying open until the
   // output step flush at the next tool call (or until the run settles).
   const textStreaming = Boolean(run.assistantText)
-  const trailing = run.assistantText || run.totalTokens !== undefined || segments.length === 0
+  // The cursor tracks the turn, not the text: it stays visible for the whole
+  // run — while the model writes, while tools run between iterations, and
+  // before the first usage update — and only stops once the run leaves the
+  // running state (settled, failed, cancelled, or reconciling).
+  const running = run.status === 'running'
   const tokenNote = run.totalTokens !== undefined && (
     <div className="token-note">
       This turn: {run.totalTokens.toLocaleString()} tokens
@@ -665,7 +669,8 @@ function ActiveRunBody({ run, onCancelTool, sessionNames, workspaceRoot }: { run
         return <article className="message assistant transient" key={`steps-${index}`}><div className="message-content">
           {isLast && <div className="message-meta"><span className="streaming-label"><i />Generating</span></div>}
           <ProcessTimeline steps={segment.steps} live={isLast && run.status === 'running' && !textStreaming} onCancelTool={onCancelTool} sessionNames={sessionNames} workspaceRoot={workspaceRoot} />
-          {isLast && trailing && (run.assistantText ? <MarkdownMessage text={run.assistantText} streaming /> : <div className="message-text assistant-stream"><span className="cursor" /></div>)}
+          {isLast && run.assistantText && <MarkdownMessage text={run.assistantText} streaming cursor={running} />}
+          {isLast && running && !run.assistantText && <div className="message-text assistant-stream"><span className="cursor" /></div>}
           {isLast && tokenNote}
         </div></article>
       })}
@@ -693,10 +698,11 @@ const markdownComponents: Components = {
   a: ({ node: _node, ...props }) => <a {...props} target="_blank" rel="noreferrer noopener" />,
 }
 
-function MarkdownMessage({ text, streaming = false }: { text: string; streaming?: boolean }) {
+function MarkdownMessage({ text, streaming = false, cursor = false }: { text: string; streaming?: boolean; cursor?: boolean }) {
   return (
     <div className={`message-text markdown-body ${streaming ? 'assistant-stream' : ''}`}>
       <Markdown remarkPlugins={[remarkGfm]} components={markdownComponents} skipHtml>{text}</Markdown>
+      {cursor && <span className="cursor" />}
     </div>
   )
 }
