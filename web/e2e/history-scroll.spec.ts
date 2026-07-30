@@ -77,10 +77,8 @@ test('requests history pages with turn alignment enabled', async ({ page }) => {
     if (url.pathname === '/api/runs/active') return json(route, { runs: [] })
     if (url.pathname === `/api/sessions/${session.id}`) return json(route, session)
     if (url.pathname === `/api/sessions/${session.id}/snapshot`) {
-      const latest = options.latestItems?.() ?? items(101, 150)
-      const seqs = latest.map((item) => Number((item as { seq?: number }).seq ?? 0)).filter(Boolean)
-      const lastSeq = seqs.at(-1) ?? session.last_seq
-      return json(route, { session_id: session.id, revision: String(lastSeq), session: { ...session, last_seq: lastSeq }, history: { items: latest, oldest_seq: seqs[0] ?? 0, newest_seq: seqs.at(-1) ?? 0, has_more_before: options.hasMoreBefore ?? true, has_more_after: false } })
+      itemQueries.push('?align_turn=true')
+      return json(route, { session_id: session.id, revision: String(session.last_seq), session, history: { items: items(101, 150), oldest_seq: 101, newest_seq: 150, has_more_before: true, has_more_after: false } })
     }
     if (url.pathname === `/api/sessions/${session.id}/items`) {
       itemQueries.push(url.search)
@@ -165,7 +163,9 @@ async function mockStreamingApp(
     if (url.pathname === '/api/runs/active') return json(route, { runs: options.activeRuns?.() ?? [] })
     if (url.pathname === `/api/sessions/${session.id}`) return json(route, session)
     if (url.pathname === `/api/sessions/${session.id}/snapshot`) {
-      return json(route, { session_id: session.id, revision: String(session.last_seq), session, history: { items: items(101, 150), oldest_seq: 101, newest_seq: 150, has_more_before: true, has_more_after: false } })
+      const latest = options.latestItems?.() ?? items(101, 150)
+      const seqs = latest.map((item) => Number((item as { seq?: number }).seq ?? 0)).filter(Boolean)
+      return json(route, { session_id: session.id, revision: String(seqs.at(-1) ?? session.last_seq), session: { ...session, last_seq: seqs.at(-1) ?? session.last_seq }, history: { items: latest, oldest_seq: seqs[0] ?? 0, newest_seq: seqs.at(-1) ?? 0, has_more_before: options.hasMoreBefore ?? true, has_more_after: false } })
     }
     if (url.pathname === `/api/sessions/${session.id}/items`) {
       if (url.searchParams.has('before_seq')) {

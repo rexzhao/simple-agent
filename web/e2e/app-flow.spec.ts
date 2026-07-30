@@ -218,6 +218,10 @@ test('resyncs a recovered run from durable session history', async ({ page }) =>
       await json(route, itemsPage(recoveredItems))
       return true
     }
+    if (url.pathname === `/api/sessions/${session.id}/snapshot`) {
+      await json(route, { session_id: session.id, revision: '2', session: { ...session, last_seq: 2 }, history: itemsPage(recoveredItems) })
+      return true
+    }
     if (url.pathname === '/api/runs/run-recovered/events') {
       await route.fulfill({
         status: 200,
