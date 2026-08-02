@@ -34,6 +34,24 @@ export interface ReasoningConfig {
   levels?: Record<string, unknown>
 }
 
+/** Prices are currency units per one million tokens. */
+export interface ModelPricing {
+  input_cache_hit: number
+  input_cache_miss: number
+  cache_write?: number
+  output: number
+  currency?: string
+  long_context_threshold?: number
+  long_context?: ModelPricingTier
+}
+
+export interface ModelPricingTier {
+  input_cache_hit: number
+  input_cache_miss: number
+  cache_write: number
+  output: number
+}
+
 export interface ProviderModelSettings {
   profile: string
   id: string
@@ -46,6 +64,7 @@ export interface ProviderModelSettings {
   output_limit?: number
   parameters?: Record<string, unknown>
   reasoning_config?: ReasoningConfig
+  pricing?: ModelPricing
 }
 
 export interface CodexAuthStatus {
@@ -107,6 +126,21 @@ export interface ContextMetadata {
   last_cache_write_tokens?: number
   last_reasoning_tokens?: number
   last_usage_source?: string
+  total_input_tokens?: number
+  total_output_tokens?: number
+  total_tokens?: number
+  total_requests?: number
+  total_cached_tokens?: number
+  total_cache_write_tokens?: number
+  total_reasoning_tokens?: number
+  total_short_input_tokens?: number
+  total_short_output_tokens?: number
+  total_short_cached_tokens?: number
+  total_short_cache_write_tokens?: number
+  total_long_input_tokens?: number
+  total_long_output_tokens?: number
+  total_long_cached_tokens?: number
+  total_long_cache_write_tokens?: number
   warning_issued?: boolean
 }
 
@@ -124,6 +158,7 @@ export interface Session {
   provider: string
   model_profile: string
   model_id: string
+  pricing?: ModelPricing
   reasoning_level?: string
   project_id: string
   created_cwd: string
@@ -271,10 +306,30 @@ export interface ActiveRun {
 	steps: RunStep[]
   agentIteration: number
   inputTokens?: number
+  outputTokens?: number
   totalTokens?: number
 	cachedTokens?: number
 	cacheWriteTokens?: number
   reasoningTokens?: number
+  /** Additive usage for every provider request in this turn. */
+  usage?: {
+    inputTokens: number
+    outputTokens: number
+    totalTokens: number
+    cachedTokens: number
+    cacheWriteTokens: number
+    reasoningTokens: number
+  }
+  /** Individual provider usages are retained so short/long pricing can be selected per request. */
+  usageEvents?: Array<{
+    agentIteration: number
+    inputTokens: number
+    outputTokens: number
+    totalTokens: number
+    cachedTokens: number
+    cacheWriteTokens: number
+    reasoningTokens: number
+  }>
   compaction?: {
     trigger: 'auto' | 'manual'
     status: 'running' | 'completed'

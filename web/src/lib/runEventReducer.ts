@@ -29,15 +29,19 @@ export function reduceRunEvent(run: ActiveRun, event: RunEvent): ActiveRun {
           contextWindow: Number(event.context_window ?? 0) || undefined,
         },
       }
-    case 'provider.retrying':
+    case 'provider.retrying': {
+      const agentIteration = Number(event.agent_iteration ?? run.agentIteration)
+      const usageEvents = run.usageEvents?.filter((usage) => usage.agentIteration !== agentIteration)
       return {
         ...run,
+        ...(usageEvents ? { usageEvents, usage: sumUsageEvents(usageEvents) } : {}),
         providerRetry: {
           attempt: Number(event.attempt ?? 0),
           maxAttempts: Number(event.max_attempts ?? 0),
           delayMS: Number(event.delay_ms ?? 0),
         },
       }
+    }
     case 'run.prompt_queue':
       return {
         ...run,
@@ -91,15 +95,34 @@ export function reduceRunEvent(run: ActiveRun, event: RunEvent): ActiveRun {
     case 'tool.started':
     case 'tool.finished':
       return { ...run, steps: updateToolStep(run.steps, event, Number(event.agent_iteration ?? run.agentIteration)) }
-    case 'usage.updated':
-      return {
-        ...run,
+    case 'usage.updated': {
+      const usage = {
         inputTokens: Number(event.input_tokens ?? 0),
+        outputTokens: Number(event.output_tokens ?? 0),
         totalTokens: Number(event.total_tokens ?? 0),
         cachedTokens: Number(event.cached_tokens ?? 0),
         cacheWriteTokens: Number(event.cache_write_tokens ?? 0),
         reasoningTokens: Number(event.reasoning_tokens ?? 0),
       }
+      const agentIteration = Number(event.agent_iteration ?? run.agentIteration)
+      const usageEvents = [
+        ...(run.usageEvents ?? []).filter((previous) => previous.agentIteration !== agentIteration),
+        { ...usage, agentIteration },
+      ]
+      return {
+        ...run,
+        // Keep the latest request at the top level for the context-window
+        // meter; cost reporting uses the additive turn usage below.
+        inputTokens: usage.inputTokens,
+        outputTokens: usage.outputTokens,
+        totalTokens: usage.totalTokens,
+        cachedTokens: usage.cachedTokens,
+        cacheWriteTokens: usage.cacheWriteTokens,
+        reasoningTokens: usage.reasoningTokens,
+        usage: sumUsageEvents(usageEvents),
+        usageEvents,
+      }
+    }
     case 'turn.failed':
       // Terminal failure: drop any pending retry notice so it does not
       // linger next to the Turn failed banner.
@@ -107,4 +130,23 @@ export function reduceRunEvent(run: ActiveRun, event: RunEvent): ActiveRun {
     default:
       return run
   }
+}
+
+function sumUsageEvents(events: NonNullable<ActiveRun['usageEvents']>): NonNullable<ActiveRun['usage']> | undefined {
+  if (events.length === 0) return undefined
+  return events.reduce((total, event) => ({
+    inputTokens: total.inputTokens + event.inputTokens,
+    outputTokens: total.outputTokens + event.outputTokens,
+    totalTokens: total.totalTokens + event.totalTokens,
+    cachedTokens: total.cachedTokens + event.cachedTokens,
+    cacheWriteTokens: total.cacheWriteTokens + event.cacheWriteTokens,
+    reasoningTokens: total.reasoningTokens + event.reasoningTokens,
+  }), {
+    inputTokens: 0,
+    outputTokens: 0,
+    totalTokens: 0,
+    cachedTokens: 0,
+    cacheWriteTokens: 0,
+    reasoningTokens: 0,
+  })
 }

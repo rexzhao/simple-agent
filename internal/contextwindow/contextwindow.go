@@ -57,7 +57,26 @@ type Metadata struct {
 	LastUsageSource         string `json:"last_usage_source,omitempty"`
 	LastUsageAnchorMessages int    `json:"last_usage_anchor_messages,omitempty"`
 	LastUsageAnchorHash     string `json:"last_usage_anchor_hash,omitempty"`
-	WarningIssued           bool   `json:"warning_issued,omitempty"`
+	// Total usage is cumulative for the durable session. The Last* fields
+	// above intentionally remain the most recent provider request because the
+	// context-window meter uses that request, while cost reporting uses these
+	// totals.
+	TotalInputTokens           int  `json:"total_input_tokens,omitempty"`
+	TotalOutputTokens          int  `json:"total_output_tokens,omitempty"`
+	TotalTokens                int  `json:"total_tokens,omitempty"`
+	TotalRequests              int  `json:"total_requests,omitempty"`
+	TotalCachedTokens          int  `json:"total_cached_tokens,omitempty"`
+	TotalCacheWriteTokens      int  `json:"total_cache_write_tokens,omitempty"`
+	TotalReasoningTokens       int  `json:"total_reasoning_tokens,omitempty"`
+	TotalShortInputTokens      int  `json:"total_short_input_tokens,omitempty"`
+	TotalShortOutputTokens     int  `json:"total_short_output_tokens,omitempty"`
+	TotalShortCachedTokens     int  `json:"total_short_cached_tokens,omitempty"`
+	TotalShortCacheWriteTokens int  `json:"total_short_cache_write_tokens,omitempty"`
+	TotalLongInputTokens       int  `json:"total_long_input_tokens,omitempty"`
+	TotalLongOutputTokens      int  `json:"total_long_output_tokens,omitempty"`
+	TotalLongCachedTokens      int  `json:"total_long_cached_tokens,omitempty"`
+	TotalLongCacheWriteTokens  int  `json:"total_long_cache_write_tokens,omitempty"`
+	WarningIssued              bool `json:"warning_issued,omitempty"`
 }
 
 type RequestEstimate struct {
@@ -83,8 +102,9 @@ func (e *BudgetExceededError) Error() string {
 }
 
 type Tracker struct {
-	mu       sync.Mutex
-	metadata Metadata
+	mu                        sync.Mutex
+	metadata                  Metadata
+	longContextTokenThreshold int
 }
 
 type TrackingProvider struct {
@@ -128,6 +148,18 @@ func (t *Tracker) Metadata() Metadata {
 	return t.metadata
 }
 
+// SetLongContextTokenThreshold configures the boundary used to split
+// cumulative provider usage into short- and long-context billing buckets.
+// Requests above the boundary are long-context requests.
+func (t *Tracker) SetLongContextTokenThreshold(threshold int) {
+	if t == nil {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.longContextTokenThreshold = threshold
+}
+
 func (t *Tracker) CheckRequest(request model.Request) (RequestEstimate, bool, error) {
 	if t == nil {
 		return RequestEstimate{}, false, nil
@@ -166,7 +198,7 @@ func (t *Tracker) CheckRequest(request model.Request) (RequestEstimate, bool, er
 }
 
 func (t *Tracker) RecordProviderUsage(usage model.Usage) {
-	t.recordUsage(UsageSourceProvider, usage, nil)
+	t.recordUsage(UsageSourceProvider, usage, nil, true)
 }
 
 func (t *Tracker) RecordProviderUsageForRequest(usage model.Usage, request model.Request) {
@@ -178,7 +210,7 @@ func (t *Tracker) RecordProviderUsageForRequest(usage model.Usage, request model
 			hash:         hash,
 		}
 	}
-	t.recordUsage(UsageSourceProvider, usage, anchor)
+	t.recordUsage(UsageSourceProvider, usage, anchor, true)
 }
 
 func (t *Tracker) RecordEstimatedUsage(inputTokens, outputTokens int) {
@@ -187,7 +219,19 @@ func (t *Tracker) RecordEstimatedUsage(inputTokens, outputTokens int) {
 		InputTokens:  inputTokens,
 		OutputTokens: outputTokens,
 		TotalTokens:  totalTokens,
-	}, nil)
+	}, nil, true)
+}
+
+// RecordEstimatedContextUsage updates the latest context estimate without
+// counting it as an API request. This is used after compaction to show the
+// replacement history's context size.
+func (t *Tracker) RecordEstimatedContextUsage(inputTokens, outputTokens int) {
+	totalTokens := inputTokens + outputTokens
+	t.recordUsage(UsageSourceEstimated, model.Usage{
+		InputTokens:  inputTokens,
+		OutputTokens: outputTokens,
+		TotalTokens:  totalTokens,
+	}, nil, false)
 }
 
 type usageAnchor struct {
@@ -195,7 +239,7 @@ type usageAnchor struct {
 	hash         string
 }
 
-func (t *Tracker) recordUsage(source UsageSource, usage model.Usage, anchor *usageAnchor) {
+func (t *Tracker) recordUsage(source UsageSource, usage model.Usage, anchor *usageAnchor, countRequest bool) {
 	if t == nil {
 		return
 	}
@@ -218,6 +262,34 @@ func (t *Tracker) recordUsage(source UsageSource, usage model.Usage, anchor *usa
 	t.metadata.LastUsageSource = string(source)
 	t.metadata.LastUsageAnchorMessages = 0
 	t.metadata.LastUsageAnchorHash = ""
+	// Provider streams report one usage event per request (and an agent turn
+	// may contain multiple requests for tool iterations), so keep both the
+	// latest request and an additive session total. Estimates are used for the
+	// context-window meter only; they are not actual billable provider usage and
+	// must not be included in the cost total.
+	if countRequest {
+		t.metadata.TotalRequests++
+	}
+	if source == UsageSourceProvider {
+		t.metadata.TotalInputTokens += usage.InputTokens
+		t.metadata.TotalOutputTokens += usage.OutputTokens
+		t.metadata.TotalCachedTokens += usage.CachedTokens
+		t.metadata.TotalCacheWriteTokens += usage.CacheWriteTokens
+		t.metadata.TotalReasoningTokens += usage.ReasoningTokens
+		t.metadata.TotalTokens += usage.TotalTokens
+		inputTokens := usage.InputTokens + usage.CachedTokens + usage.CacheWriteTokens
+		if t.longContextTokenThreshold > 0 && inputTokens > t.longContextTokenThreshold {
+			t.metadata.TotalLongInputTokens += usage.InputTokens
+			t.metadata.TotalLongOutputTokens += usage.OutputTokens
+			t.metadata.TotalLongCachedTokens += usage.CachedTokens
+			t.metadata.TotalLongCacheWriteTokens += usage.CacheWriteTokens
+		} else {
+			t.metadata.TotalShortInputTokens += usage.InputTokens
+			t.metadata.TotalShortOutputTokens += usage.OutputTokens
+			t.metadata.TotalShortCachedTokens += usage.CachedTokens
+			t.metadata.TotalShortCacheWriteTokens += usage.CacheWriteTokens
+		}
+	}
 	if anchor != nil {
 		t.metadata.LastUsageAnchorMessages = anchor.messageCount
 		t.metadata.LastUsageAnchorHash = anchor.hash

@@ -133,6 +133,14 @@ models:
     output_limit: 8192
     temperature: 0.4
     max_tokens: 8192
+    # Optional prices, in currency units per 1,000,000 tokens.
+    # Cache-write pricing is optional and defaults to cache-miss pricing.
+    pricing:
+      currency: USD
+      input_cache_hit: 0.15
+      input_cache_miss: 1.50
+      cache_write: 1.50
+      output: 7.50
     reasoning_config:
       parameter: reasoning_effort
       default: high
@@ -148,6 +156,40 @@ Supported model profile types:
 - `openai-responses`
 - `openai-codex`
 - `anthropic-messages`
+
+### Model pricing and session cost
+
+`pricing` is optional and belongs to a model profile. Values are per one
+million tokens, so the example above charges `1.50` currency units for one
+million uncached input tokens and `0.15` for one million cache-hit tokens.
+`input_tokens` in SAI usage events is the uncached input bucket. `cache_write`
+is optional for backwards compatibility and defaults to the cache-miss price
+when omitted. `output` usage already includes any provider-reported reasoning
+output and is not charged a second time.
+
+For providers with different short- and long-context prices, the top-level
+prices are the short-context prices and `long_context` is selected when the
+request input exceeds `long_context_threshold`:
+
+```yaml
+pricing:
+  currency: USD
+  input_cache_hit: 0.50
+  input_cache_miss: 5.00
+  cache_write: 6.25
+  output: 30.00
+  long_context_threshold: 272000
+  long_context:
+    input_cache_hit: 1.00
+    input_cache_miss: 10.00
+    cache_write: 12.50
+    output: 45.00
+```
+
+The Web UI shows cost, API request count, token count, and the cumulative
+session cost when a price is configured. A session stores the price snapshot
+from creation, so changing the model price does not rewrite historical
+session costs.
 
 `input` declares the modalities accepted by a model profile. Omit it (or use
 `[text]`) for text-only models; add `image` to enable image attachments in the

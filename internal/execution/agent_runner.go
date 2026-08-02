@@ -202,6 +202,12 @@ func (r AgentTurnRunner) prepareRuntime(ctx context.Context, session sessions.Se
 	if session.ModelParameters != nil {
 		resolved.Parameters = copyParameterMap(session.ModelParameters)
 	}
+	// Older sessions predate pricing snapshots. Capture the configured price
+	// the first time they are resumed, while new sessions already carry the
+	// snapshot created by CreateConfiguredSession.
+	if session.Pricing == nil {
+		session.Pricing = copyModelPricing(resolved.Pricing)
+	}
 	var logger *eventlog.Logger
 	var recordRequest func(endpoint string, body []byte) error
 	if cfg.Logging.RequestBodies {
@@ -220,6 +226,9 @@ func (r AgentTurnRunner) prepareRuntime(ctx context.Context, session sessions.Se
 		Tokens: resolved.ContextWindow,
 		Source: contextwindow.ParseWindowSource(resolved.ContextWindowSource),
 	}, session.Context)
+	if resolved.Pricing != nil {
+		contextTracker.SetLongContextTokenThreshold(resolved.Pricing.LongContextThreshold)
+	}
 	provider = contextwindow.TrackingProvider{
 		Inner:   provider,
 		Tracker: contextTracker,
@@ -409,6 +418,7 @@ func (r *agentRunnerRuntime) refreshSessionRuntimeMetadata(session sessions.Sess
 		Provider:             r.providerName,
 		ModelProfile:         r.modelProfile,
 		ModelID:              r.modelID,
+		Pricing:              copyModelPricing(r.session.Pricing),
 		ModelParameters:      r.parameters,
 		CWD:                  r.cwd,
 		ConfigPath:           r.configPath,
@@ -901,6 +911,10 @@ func (r *agentRunnerRuntime) recordRemoteCompactionUsage(usage model.Usage, repl
 	if r.contextTracker == nil {
 		return &usageCopy, nil, nil
 	}
+	// Standalone compaction bypasses TrackingProvider, so record its provider
+	// usage explicitly. The replacement-history estimate below is only for the
+	// context-window meter and is intentionally not billable usage.
+	r.contextTracker.RecordProviderUsage(usage)
 	return &usageCopy, r.estimatedReplacementContext(replacementMessages), nil
 }
 
@@ -915,7 +929,7 @@ func (r *agentRunnerRuntime) estimatedReplacementContext(replacementMessages []m
 		Parameters: r.parameters,
 		SessionID:  r.session.ID,
 	})
-	r.contextTracker.RecordEstimatedUsage(estimate, 0)
+	r.contextTracker.RecordEstimatedContextUsage(estimate, 0)
 	metadata := r.contextTracker.Metadata()
 	return &metadata
 }

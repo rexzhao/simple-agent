@@ -52,6 +52,26 @@ describe('Conversation identity boundary', () => {
     expect(screen.getByText('Session s1')).toBeDefined()
   })
 
+  it('shows session cost, API request count, and token count when usage is available', () => {
+    const detail = {
+      ...session('s1'),
+      pricing: { input_cache_hit: 0.5, input_cache_miss: 5, cache_write: 6.25, output: 30, currency: 'USD' },
+      context: {
+        context_window: 1000,
+        context_window_source: 'configured',
+        warning_threshold_percent: 80,
+        total_input_tokens: 100,
+        total_output_tokens: 20,
+        total_tokens: 120,
+        total_requests: 2,
+      },
+    } as Session
+    render(<Conversation {...baseProps} sessionID="s1" detail={detail} />)
+    expect(screen.getByText('Cost')).toBeDefined()
+    expect(screen.getByText('API requests')).toBeDefined()
+    expect(screen.getByText('Tokens')).toBeDefined()
+  })
+
   it('does not render stale detail when sessionID does not match', () => {
     const detail = session('old')
     render(<Conversation {...baseProps} sessionID="new" detail={detail} />)

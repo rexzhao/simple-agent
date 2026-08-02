@@ -4,7 +4,8 @@ import type { Components } from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { api } from '../api'
 import type { ActiveRun, ItemsPage, QueuedPrompt, RunStep, Session, SessionImageAttachment, SessionItem, ToolActivity } from '../types'
-import { blobAsDataURL, copyText, formatTokenCount } from '../lib/format'
+import { addUsageBreakdown, contextRequestCount, contextUsageBreakdown, usageBreakdownFromEvents, usageCostBreakdown, usageEventCount } from '../lib/cost'
+import { blobAsDataURL, copyText, formatCost, formatTokenCount } from '../lib/format'
 import { itemText, processKey, sessionName, visibleSessionItems } from '../lib/session'
 import { Composer } from './Composer'
 import type { ComposerDraft, PastedImageAttachment, PastedTextAttachment } from './Composer'
@@ -311,6 +312,7 @@ export const Conversation = memo(function Conversation(props: {
           {safeDetail && (
             <ContextUsage context={safeDetail.context} activeInputTokens={props.activeRun?.inputTokens} activeCachedTokens={props.activeRun?.cachedTokens} activeCacheWriteTokens={props.activeRun?.cacheWriteTokens} compactedContextTokens={props.activeRun?.compaction?.status === 'completed' ? props.activeRun.compaction.activeContextTokens : undefined} />
           )}
+          {safeDetail && <CostUsage pricing={safeDetail.pricing} context={safeDetail.context} activeUsageEvents={props.activeRun?.usageEvents} activeStatus={props.activeRun?.status} />}
         </div>
         <div className="header-actions">
 		  {safeDetail && (
@@ -459,6 +461,34 @@ function ContextUsage(props: { context: Session['context']; activeInputTokens?: 
 			>
 				<i style={{ width: `${progress}%` }} />
 			</div>
+		</div>
+	)
+}
+
+function CostUsage(props: { pricing?: Session['pricing']; context: Session['context']; activeUsageEvents?: ActiveRun['usageEvents']; activeStatus?: ActiveRun['status'] }) {
+	const storedUsage = contextUsageBreakdown(props.context)
+	const activeUsage = usageBreakdownFromEvents(props.activeUsageEvents, props.pricing)
+	// While a run is live its usage has not been persisted yet. Once the run
+	// enters reconciliation, the refreshed session may already include it, so
+	// do not add the in-memory usage a second time.
+	const totalUsage = props.activeStatus === 'running' ? addUsageBreakdown(storedUsage, activeUsage) : storedUsage
+	const totalCost = usageCostBreakdown(totalUsage, props.pricing) ?? (props.pricing ? 0 : undefined)
+	const runCost = usageCostBreakdown(activeUsage, props.pricing)
+	const totalRequests = contextRequestCount(props.context) + (props.activeStatus === 'running' ? usageEventCount(props.activeUsageEvents) : 0)
+	const usage = totalUsage?.total
+	if (!usage && totalRequests <= 0 && !props.pricing) return null
+	const currency = props.pricing?.currency ?? 'USD'
+	const details = [
+		`Cache hit ${usage?.cachedTokens.toLocaleString() ?? 0}`,
+		`Cache miss ${Math.max(0, usage?.inputTokens ?? 0).toLocaleString()}`,
+		`Cache write ${Math.max(0, usage?.cacheWriteTokens ?? 0).toLocaleString()}`,
+		`Output ${usage?.outputTokens.toLocaleString() ?? 0}`,
+	].join('; ')
+	return (
+		<div className="cost-usage" title={`${details}\nAPI requests ${totalRequests.toLocaleString()}\nPrices are per 1M tokens`}>
+			<div className="session-stat"><span>Cost</span><strong>{totalCost !== undefined ? formatCost(totalCost, currency) : '—'}</strong><small>{runCost !== undefined ? `Run ${formatCost(runCost, currency)}` : 'Session'}</small></div>
+			<div className="session-stat"><span>API requests</span><strong>{totalRequests.toLocaleString()}</strong></div>
+			<div className="session-stat"><span>Tokens</span><strong>{formatTokenCount(usage?.totalTokens ?? 0)}</strong></div>
 		</div>
 	)
 }

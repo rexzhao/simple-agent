@@ -3,6 +3,7 @@ package sessions
 import (
 	"fmt"
 
+	"github.com/rexzhao/simple-agent/internal/config"
 	"github.com/rexzhao/simple-agent/internal/contextwindow"
 	"github.com/rexzhao/simple-agent/internal/model"
 )
@@ -11,6 +12,7 @@ type RuntimeMetadataUpdate struct {
 	Provider             string
 	ModelProfile         string
 	ModelID              string
+	Pricing              *config.ModelPricing
 	ModelParameters      map[string]any
 	CWD                  string
 	ConfigPath           string
@@ -28,6 +30,9 @@ func RefreshRuntimeMetadata(session SessionV2, update RuntimeMetadataUpdate) Ses
 	session.Provider = update.Provider
 	session.ModelProfile = update.ModelProfile
 	session.ModelID = update.ModelID
+	if update.Pricing != nil {
+		session.Pricing = copyModelPricing(update.Pricing)
+	}
 	session.ModelParameters = copyMap(update.ModelParameters)
 	session.CWD = update.CWD
 	session.ConfigPath = update.ConfigPath
@@ -47,6 +52,18 @@ func RefreshRuntimeMetadata(session SessionV2, update RuntimeMetadataUpdate) Ses
 	}
 	session.SaveToolResults = update.SaveToolResults
 	return session
+}
+
+func copyModelPricing(pricing *config.ModelPricing) *config.ModelPricing {
+	if pricing == nil {
+		return nil
+	}
+	copied := *pricing
+	if pricing.LongContext != nil {
+		longContext := *pricing.LongContext
+		copied.LongContext = &longContext
+	}
+	return &copied
 }
 
 func AppendMessagesToActiveHistory(existingItems []SessionItem, activeItemIDs []string, messages []model.Message) ([]SessionItem, []string, error) {

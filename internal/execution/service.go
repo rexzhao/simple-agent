@@ -67,26 +67,27 @@ type NearestProjectOptions struct {
 }
 
 type SessionMetadata struct {
-	ID                string    `json:"id"`
-	CreatedAt         time.Time `json:"created_at"`
-	UpdatedAt         time.Time `json:"updated_at"`
-	DisplayName       string    `json:"display_name"`
-	CreatedBy         string    `json:"created_by"`
-	ParentSessionID   string    `json:"parent_session_id,omitempty"`
-	RootSessionID     string    `json:"root_session_id"`
-	SpawnDepth        int       `json:"spawn_depth"`
-	Archived          bool      `json:"archived"`
-	LastUsedAt        time.Time `json:"last_used_at"`
-	InterruptedAt     time.Time `json:"interrupted_at,omitempty"`
-	InterruptedTurnID string    `json:"interrupted_turn_id,omitempty"`
-	Provider          string    `json:"provider"`
-	ModelProfile      string    `json:"model_profile"`
-	ModelID           string    `json:"model_id"`
-	Status            string    `json:"status"`
-	ProjectID         string    `json:"project_id"`
-	CreatedCWD        string    `json:"created_cwd"`
-	LastSeq           int64     `json:"last_seq"`
-	FullAccess        bool      `json:"full_access"`
+	ID                string               `json:"id"`
+	CreatedAt         time.Time            `json:"created_at"`
+	UpdatedAt         time.Time            `json:"updated_at"`
+	DisplayName       string               `json:"display_name"`
+	CreatedBy         string               `json:"created_by"`
+	ParentSessionID   string               `json:"parent_session_id,omitempty"`
+	RootSessionID     string               `json:"root_session_id"`
+	SpawnDepth        int                  `json:"spawn_depth"`
+	Archived          bool                 `json:"archived"`
+	LastUsedAt        time.Time            `json:"last_used_at"`
+	InterruptedAt     time.Time            `json:"interrupted_at,omitempty"`
+	InterruptedTurnID string               `json:"interrupted_turn_id,omitempty"`
+	Provider          string               `json:"provider"`
+	ModelProfile      string               `json:"model_profile"`
+	ModelID           string               `json:"model_id"`
+	Pricing           *config.ModelPricing `json:"pricing,omitempty"`
+	Status            string               `json:"status"`
+	ProjectID         string               `json:"project_id"`
+	CreatedCWD        string               `json:"created_cwd"`
+	LastSeq           int64                `json:"last_seq"`
+	FullAccess        bool                 `json:"full_access"`
 }
 
 type SessionDetail struct {
@@ -105,6 +106,7 @@ type SessionDetail struct {
 	Provider          string                 `json:"provider"`
 	ModelProfile      string                 `json:"model_profile"`
 	ModelID           string                 `json:"model_id"`
+	Pricing           *config.ModelPricing   `json:"pricing,omitempty"`
 	ReasoningLevel    string                 `json:"reasoning_level,omitempty"`
 	Status            string                 `json:"status"`
 	LastSeq           int64                  `json:"last_seq"`
@@ -140,6 +142,7 @@ type SessionCreateMetadata struct {
 	Provider        string
 	ModelProfile    string
 	ModelID         string
+	Pricing         *config.ModelPricing
 	ReasoningLevel  string
 	ModelParameters map[string]any
 	EnabledTools    []string
@@ -692,6 +695,7 @@ func (s *Service) GetSession(id string) (SessionDetail, error) {
 	if err != nil {
 		return SessionDetail{}, err
 	}
+	session = s.hydrateSessionPricing(session)
 	return sessionDetailFromStore(session), nil
 }
 
@@ -707,6 +711,7 @@ func (s *Service) GetSessionSnapshot(id string) (SessionSnapshot, error) {
 	if err != nil {
 		return SessionSnapshot{}, err
 	}
+	session = s.hydrateSessionPricing(session)
 	detail := sessionDetailFromStore(session)
 	history, err := s.buildItemsPage(session, 0, 0, defaultSessionChatItemsLimit, true)
 	if err != nil {
@@ -2196,6 +2201,9 @@ func applySessionCreateMetadata(session sessions.SessionV2, metadata SessionCrea
 	if value := strings.TrimSpace(metadata.ModelID); value != "" {
 		session.ModelID = value
 	}
+	if metadata.Pricing != nil {
+		session.Pricing = copyModelPricing(metadata.Pricing)
+	}
 	if value := strings.TrimSpace(metadata.ReasoningLevel); value != "" {
 		session.ReasoningLevel = value
 	}
@@ -2260,12 +2268,37 @@ func sessionMetadataFromStore(session sessions.SessionV2) SessionMetadata {
 		Provider:          session.Provider,
 		ModelProfile:      session.ModelProfile,
 		ModelID:           session.ModelID,
+		Pricing:           copyModelPricing(session.Pricing),
 		Status:            sessionStatus(session),
 		ProjectID:         session.ProjectID,
 		CreatedCWD:        session.CreatedCWD,
 		LastSeq:           session.LastSeq,
 		FullAccess:        session.FullAccess,
 	}
+}
+
+// hydrateSessionPricing provides configured pricing to the UI for sessions
+// created before pricing snapshots were introduced. The runtime persists the
+// snapshot on the next turn; this read-side fallback makes existing sessions
+// show their current configured cost immediately without mutating storage.
+func (s *Service) hydrateSessionPricing(session sessions.SessionV2) sessions.SessionV2 {
+	if s == nil || session.Pricing != nil {
+		return session
+	}
+	configPath := session.RootConfigPath()
+	if strings.TrimSpace(configPath) == "" {
+		configPath = s.ConfigPath()
+	}
+	cfg, err := config.Load(configPath)
+	if err != nil {
+		return session
+	}
+	resolved, err := cfg.ResolveModel(session.Provider, session.ModelProfile)
+	if err != nil {
+		return session
+	}
+	session.Pricing = copyModelPricing(resolved.Pricing)
+	return session
 }
 
 func sessionDetailFromStore(session sessions.SessionV2) SessionDetail {
@@ -2285,6 +2318,7 @@ func sessionDetailFromStore(session sessions.SessionV2) SessionDetail {
 		Provider:          session.Provider,
 		ModelProfile:      session.ModelProfile,
 		ModelID:           session.ModelID,
+		Pricing:           copyModelPricing(session.Pricing),
 		ReasoningLevel:    session.ReasoningLevel,
 		Status:            sessionStatus(session),
 		LastSeq:           session.LastSeq,

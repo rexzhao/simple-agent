@@ -15,6 +15,21 @@ export function formatTokenCount(tokens: number): string {
 	return Math.max(0, tokens).toLocaleString()
 }
 
+export function formatCost(amount: number, currency = 'USD'): string {
+  if (!Number.isFinite(amount)) return '—'
+  const code = currency.trim().toUpperCase() || 'USD'
+  try {
+    return new Intl.NumberFormat(undefined, {
+      style: 'currency',
+      currency: code,
+      minimumFractionDigits: amount === 0 ? 2 : 4,
+      maximumFractionDigits: 6,
+    }).format(amount)
+  } catch {
+    return `${code} ${amount.toFixed(6).replace(/0+$/, '').replace(/\.$/, '')}`
+  }
+}
+
 export function formatTime(value: string): string {
   const date = new Date(value)
   return Number.isFinite(date.getTime()) ? date.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' }) : ''

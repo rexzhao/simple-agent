@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from 'react'
 import { api } from '../api'
-import type { CodexAuthStatus, ProviderModelSettings, ProviderSettings, ProviderSettingsDocument, ProviderSettingsInput } from '../types'
+import type { CodexAuthStatus, ModelPricing, ProviderModelSettings, ProviderSettings, ProviderSettingsDocument, ProviderSettingsInput } from '../types'
 import { copyText, errorMessage, parseJSONRecord, prettyJSON } from '../lib/format'
 import { reasoningLevelLabel } from '../lib/session'
 import { PlusIcon } from './icons'
@@ -24,6 +24,16 @@ interface EditableProviderModel {
   reasoningParameter: string
   reasoningDefault: string
   reasoningLevelsJSON: string
+  pricingCurrency: string
+  inputCacheHitPrice: string
+  inputCacheMissPrice: string
+  cacheWritePrice: string
+  outputPrice: string
+  longContextThreshold: string
+  longInputCacheHitPrice: string
+  longInputCacheMissPrice: string
+  longCacheWritePrice: string
+  longOutputPrice: string
 }
 
 interface ProviderDraft {
@@ -241,6 +251,17 @@ export function ProviderManagerDialog(props: {
                         <label>Context Window<input type="number" min="0" value={model.contextWindow} onChange={(event) => updateModel(index, { contextWindow: event.target.value })} placeholder="400000" /></label>
                         <label>Input Limit<input type="number" min="0" value={model.inputLimit} onChange={(event) => updateModel(index, { inputLimit: event.target.value })} placeholder="272000" /></label>
                         <label>Output Limit<input type="number" min="0" value={model.outputLimit} onChange={(event) => updateModel(index, { outputLimit: event.target.value })} placeholder="128000" /></label>
+                        <label>Currency<input value={model.pricingCurrency} onChange={(event) => updateModel(index, { pricingCurrency: event.target.value.toUpperCase() })} placeholder="USD" maxLength={3} /></label>
+                        <label>Input tokens (cache hit)<input type="number" min="0" step="any" value={model.inputCacheHitPrice} onChange={(event) => updateModel(index, { inputCacheHitPrice: event.target.value })} placeholder="per 1M tokens" /></label>
+                        <label>Input tokens (cache miss)<input type="number" min="0" step="any" value={model.inputCacheMissPrice} onChange={(event) => updateModel(index, { inputCacheMissPrice: event.target.value })} placeholder="per 1M tokens" /></label>
+                        <label>Cache-write tokens<input type="number" min="0" step="any" value={model.cacheWritePrice} onChange={(event) => updateModel(index, { cacheWritePrice: event.target.value })} placeholder="defaults to cache miss" /></label>
+                        <label>Output tokens<input type="number" min="0" step="any" value={model.outputPrice} onChange={(event) => updateModel(index, { outputPrice: event.target.value })} placeholder="per 1M tokens" /></label>
+                        <label>Long context threshold<input type="number" min="1" step="1" value={model.longContextThreshold} onChange={(event) => updateModel(index, { longContextThreshold: event.target.value })} placeholder="e.g. 272000" /></label>
+                        <label>Long input (cache hit)<input type="number" min="0" step="any" value={model.longInputCacheHitPrice} onChange={(event) => updateModel(index, { longInputCacheHitPrice: event.target.value })} placeholder="optional" /></label>
+                        <label>Long input (cache miss)<input type="number" min="0" step="any" value={model.longInputCacheMissPrice} onChange={(event) => updateModel(index, { longInputCacheMissPrice: event.target.value })} placeholder="optional" /></label>
+                        <label>Long cache-write<input type="number" min="0" step="any" value={model.longCacheWritePrice} onChange={(event) => updateModel(index, { longCacheWritePrice: event.target.value })} placeholder="optional" /></label>
+                        <label>Long output tokens<input type="number" min="0" step="any" value={model.longOutputPrice} onChange={(event) => updateModel(index, { longOutputPrice: event.target.value })} placeholder="optional" /></label>
+                        <p className="field-help wide">Prices are in the selected currency per 1 million tokens. Top-level prices are short-context prices; long-context prices apply above the threshold. Cache-write can be configured separately.</p>
                         <label className="wide">Extra request parameters (JSON)<textarea value={model.parametersJSON} onChange={(event) => updateModel(index, { parametersJSON: event.target.value })} rows={3} spellCheck={false} /></label>
                       </div>
                       <details className="reasoning-config" open={Boolean(model.reasoningParameter)}>
@@ -300,6 +321,16 @@ function editableProviderModel(model: ProviderModelSettings): EditableProviderMo
     reasoningParameter: model.reasoning_config?.parameter ?? '',
     reasoningDefault: model.reasoning_config?.default ?? '',
     reasoningLevelsJSON: prettyJSON(model.reasoning_config?.levels ?? {}),
+    pricingCurrency: model.pricing?.currency ?? '',
+    inputCacheHitPrice: priceText(model.pricing, 'input_cache_hit'),
+    inputCacheMissPrice: priceText(model.pricing, 'input_cache_miss'),
+    cacheWritePrice: priceText(model.pricing, 'cache_write'),
+    outputPrice: priceText(model.pricing, 'output'),
+    longContextThreshold: model.pricing?.long_context_threshold ? String(model.pricing.long_context_threshold) : '',
+    longInputCacheHitPrice: tierPriceText(model.pricing?.long_context, 'input_cache_hit'),
+    longInputCacheMissPrice: tierPriceText(model.pricing?.long_context, 'input_cache_miss'),
+    longCacheWritePrice: tierPriceText(model.pricing?.long_context, 'cache_write'),
+    longOutputPrice: tierPriceText(model.pricing?.long_context, 'output'),
   }
 }
 
@@ -314,7 +345,7 @@ function duplicateProfileName(profile: string, models: EditableProviderModel[]):
 }
 
 function emptyProviderModel(): EditableProviderModel {
-  return { profile: '', id: '', type: 'openai-chat', compatibility: '', supportsImages: false, developerRole: '', contextWindow: '', inputLimit: '', outputLimit: '', parametersJSON: '{}', reasoningParameter: '', reasoningDefault: '', reasoningLevelsJSON: '{}' }
+  return { profile: '', id: '', type: 'openai-chat', compatibility: '', supportsImages: false, developerRole: '', contextWindow: '', inputLimit: '', outputLimit: '', parametersJSON: '{}', reasoningParameter: '', reasoningDefault: '', reasoningLevelsJSON: '{}', pricingCurrency: 'USD', inputCacheHitPrice: '', inputCacheMissPrice: '', cacheWritePrice: '', outputPrice: '', longContextThreshold: '', longInputCacheHitPrice: '', longInputCacheMissPrice: '', longCacheWritePrice: '', longOutputPrice: '' }
 }
 
 function providerInput(draft: ProviderDraft): ProviderSettingsInput {
@@ -335,6 +366,27 @@ function providerInput(draft: ProviderDraft): ProviderSettingsInput {
       if (!model.profile.trim() || !model.id.trim()) throw new Error(`Model ${index + 1}: profile name and model ID are required`)
       const reasoningLevels = parseJSONRecord(model.reasoningLevelsJSON, `Level mapping for model ${model.profile}`)
       if (model.reasoningDefault.trim() && !(model.reasoningDefault.trim() in reasoningLevels)) throw new Error(`Model ${model.profile}: default level is not in the level mapping`)
+      const hasLongPricing = model.longInputCacheHitPrice.trim() || model.longInputCacheMissPrice.trim() || model.longCacheWritePrice.trim() || model.longOutputPrice.trim()
+      const hasBasePricing = model.inputCacheHitPrice.trim() || model.inputCacheMissPrice.trim() || model.cacheWritePrice.trim() || model.outputPrice.trim()
+      const pricing = hasBasePricing || hasLongPricing
+        ? {
+            input_cache_hit: priceNumber(model.inputCacheHitPrice, `Cache-hit price for model ${model.profile}`),
+            input_cache_miss: priceNumber(model.inputCacheMissPrice, `Cache-miss price for model ${model.profile}`),
+            ...(model.cacheWritePrice.trim() ? { cache_write: priceNumber(model.cacheWritePrice, `Cache-write price for model ${model.profile}`) } : {}),
+            output: priceNumber(model.outputPrice, `Output price for model ${model.profile}`),
+            currency: model.pricingCurrency.trim().toUpperCase() || 'USD',
+            ...(hasLongPricing ? {
+              long_context_threshold: positiveInteger(model.longContextThreshold, `Long context threshold for model ${model.profile}`),
+              long_context: {
+                input_cache_hit: priceNumber(model.longInputCacheHitPrice, `Long cache-hit price for model ${model.profile}`),
+                input_cache_miss: priceNumber(model.longInputCacheMissPrice, `Long cache-miss price for model ${model.profile}`),
+                cache_write: priceNumber(model.longCacheWritePrice, `Long cache-write price for model ${model.profile}`),
+                output: priceNumber(model.longOutputPrice, `Long output price for model ${model.profile}`),
+              },
+            } : {}),
+          } satisfies ModelPricing
+        : undefined
+      if (pricing && !/^[A-Z]{3}$/.test(pricing.currency)) throw new Error(`Model ${model.profile}: currency must be a 3-letter code`)
       return {
         profile: model.profile.trim(),
         id: model.id.trim(),
@@ -351,9 +403,32 @@ function providerInput(draft: ProviderDraft): ProviderSettingsInput {
           default: model.reasoningDefault.trim(),
           levels: reasoningLevels,
         },
+        pricing,
       }
     }),
   }
+}
+
+function priceText(pricing: ModelPricing | undefined, field: keyof Pick<ModelPricing, 'input_cache_hit' | 'input_cache_miss' | 'cache_write' | 'output'>): string {
+  const value = pricing?.[field]
+  return typeof value === 'number' ? String(value) : ''
+}
+
+function tierPriceText(tier: ModelPricing['long_context'], field: 'input_cache_hit' | 'input_cache_miss' | 'cache_write' | 'output'): string {
+  const value = tier?.[field]
+  return typeof value === 'number' ? String(value) : ''
+}
+
+function priceNumber(value: string, label: string): number {
+  const parsed = Number(value)
+  if (!value.trim() || !Number.isFinite(parsed) || parsed < 0) throw new Error(`${label} must be a non-negative number`)
+  return parsed
+}
+
+function positiveInteger(value: string, label: string): number {
+  const parsed = Number(value)
+  if (!value.trim() || !Number.isInteger(parsed) || parsed <= 0) throw new Error(`${label} must be a positive integer`)
+  return parsed
 }
 
 function reasoningLevelOptions(value: string): string[] {

@@ -165,6 +165,7 @@ func (s *Service) InspectSession(id string, maxOutputChars int) (SessionInspecti
 	if err != nil {
 		return SessionInspection{}, err
 	}
+	session = s.hydrateSessionPricing(session)
 	detail := sessionDetailFromStore(session)
 	item, kind, ok := latestAssistantItemForSessionState(session, detail.Status)
 	if !ok {

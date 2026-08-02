@@ -52,6 +52,7 @@ type ProviderModelSettings struct {
 	OutputLimit     int                    `json:"output_limit,omitempty"`
 	Parameters      map[string]any         `json:"parameters,omitempty"`
 	ReasoningConfig config.ReasoningConfig `json:"reasoning_config,omitempty"`
+	Pricing         *config.ModelPricing   `json:"pricing,omitempty"`
 }
 
 type ProviderSettingsInput struct {
@@ -205,6 +206,15 @@ func (s *Service) saveProviderSettings(existingName string, input ProviderSettin
 			OutputLimit:     model.OutputLimit,
 			Parameters:      copyParameterMap(model.Parameters),
 			ReasoningConfig: model.ReasoningConfig,
+			Pricing:         copyModelPricing(model.Pricing),
+		}
+		if modelProfile.Pricing != nil {
+			if err := modelProfile.Pricing.Validate(); err != nil {
+				return ProviderSettingsDocument{}, fmt.Errorf("model profile %q: %w", profile, err)
+			}
+			if strings.TrimSpace(modelProfile.Pricing.Currency) == "" {
+				modelProfile.Pricing.Currency = "USD"
+			}
 		}
 		if len(modelProfile.ReasoningConfig.Levels) == 0 && strings.TrimSpace(modelProfile.ReasoningConfig.Parameter) == "" {
 			modelProfile.ReasoningConfig = config.DefaultReasoningConfig(name, provider.BaseURL, modelProfile)
@@ -498,9 +508,26 @@ func providerSettingsFromConfig(providerDir string, provider config.ProviderConf
 			OutputLimit:     model.OutputLimit,
 			Parameters:      copyParameterMap(model.Parameters),
 			ReasoningConfig: model.ReasoningConfig,
+			Pricing:         copyModelPricing(model.Pricing),
 		})
 	}
 	return settings
+}
+
+func copyModelPricing(pricing *config.ModelPricing) *config.ModelPricing {
+	if pricing == nil {
+		return nil
+	}
+	copied := *pricing
+	copied.Currency = strings.ToUpper(strings.TrimSpace(copied.Currency))
+	if copied.Currency == "" {
+		copied.Currency = "USD"
+	}
+	if pricing.LongContext != nil {
+		longContext := *pricing.LongContext
+		copied.LongContext = &longContext
+	}
+	return &copied
 }
 
 func providerUsesCodex(provider config.ProviderConfig) bool {

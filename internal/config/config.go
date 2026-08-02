@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"math"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -102,6 +103,102 @@ type ModelProfile struct {
 	OutputLimit     int             `json:"output_limit,omitempty" yaml:"output_limit,omitempty"`
 	Parameters      map[string]any  `json:"parameters,omitempty" yaml:"parameters,omitempty"`
 	ReasoningConfig ReasoningConfig `json:"reasoning_config,omitempty" yaml:"reasoning_config,omitempty"`
+	// Pricing is expressed in USD (or Currency) per one million tokens.  It is
+	// optional so existing provider files remain valid and models without a
+	// price configured simply do not show a cost in the UI.
+	Pricing *ModelPricing `json:"pricing,omitempty" yaml:"pricing,omitempty"`
+}
+
+// ModelPricing contains the billing buckets supported by the usage pipeline.
+// InputTokens is the uncached input bucket; cache-write tokens can either use
+// their own price or fall back to the cache-miss rate for legacy configs.
+//
+// Prices are per 1,000,000 tokens. This is the unit used by most hosted model
+// providers and avoids losing precision for the small per-token values users
+// normally enter.
+type ModelPricing struct {
+	InputCacheHit  float64 `json:"input_cache_hit" yaml:"input_cache_hit"`
+	InputCacheMiss float64 `json:"input_cache_miss" yaml:"input_cache_miss"`
+	CacheWrite     float64 `json:"cache_write,omitempty" yaml:"cache_write,omitempty"`
+	Output         float64 `json:"output" yaml:"output"`
+	Currency       string  `json:"currency,omitempty" yaml:"currency,omitempty"`
+	// LongContext contains the alternate prices used when a request's input
+	// token count exceeds LongContextThreshold. The top-level prices are the
+	// short-context prices for backwards compatibility with existing configs.
+	LongContextThreshold int               `json:"long_context_threshold,omitempty" yaml:"long_context_threshold,omitempty"`
+	LongContext          *ModelPricingTier `json:"long_context,omitempty" yaml:"long_context,omitempty"`
+}
+
+// ModelPricingTier is a complete price table for one context-length tier.
+// Prices are currency units per one million tokens.
+type ModelPricingTier struct {
+	InputCacheHit  float64 `json:"input_cache_hit" yaml:"input_cache_hit"`
+	InputCacheMiss float64 `json:"input_cache_miss" yaml:"input_cache_miss"`
+	CacheWrite     float64 `json:"cache_write" yaml:"cache_write"`
+	Output         float64 `json:"output" yaml:"output"`
+}
+
+func (p ModelPricing) Validate() error {
+	for name, value := range map[string]float64{
+		"input_cache_hit":  p.InputCacheHit,
+		"input_cache_miss": p.InputCacheMiss,
+		"cache_write":      p.CacheWrite,
+		"output":           p.Output,
+	} {
+		if math.IsNaN(value) || math.IsInf(value, 0) || value < 0 {
+			return fmt.Errorf("pricing %s must be a finite non-negative number", name)
+		}
+	}
+	if p.LongContextThreshold < 0 {
+		return fmt.Errorf("pricing long_context_threshold must be non-negative")
+	}
+	if p.LongContext != nil {
+		if p.LongContextThreshold <= 0 {
+			return fmt.Errorf("pricing long_context_threshold must be positive when long_context is configured")
+		}
+		if err := p.LongContext.Validate(); err != nil {
+			return fmt.Errorf("pricing long_context: %w", err)
+		}
+	}
+	if currency := strings.ToUpper(strings.TrimSpace(p.Currency)); currency != "" {
+		if len(currency) != 3 || strings.IndexFunc(currency, func(r rune) bool { return r < 'A' || r > 'Z' }) >= 0 {
+			return fmt.Errorf("pricing currency must be a 3-letter code")
+		}
+	}
+	return nil
+}
+
+func (p ModelPricingTier) Validate() error {
+	for name, value := range map[string]float64{
+		"input_cache_hit":  p.InputCacheHit,
+		"input_cache_miss": p.InputCacheMiss,
+		"cache_write":      p.CacheWrite,
+		"output":           p.Output,
+	} {
+		if math.IsNaN(value) || math.IsInf(value, 0) || value < 0 {
+			return fmt.Errorf("pricing %s must be a finite non-negative number", name)
+		}
+	}
+	return nil
+}
+
+// PricingTierForInput returns the price tier for a provider request. Input
+// tokens are the disjoint usage buckets combined: uncached input, cache hits,
+// and cache writes.
+func (p ModelPricing) PricingTierForInput(inputTokens int) ModelPricingTier {
+	tier := ModelPricingTier{
+		InputCacheHit:  p.InputCacheHit,
+		InputCacheMiss: p.InputCacheMiss,
+		CacheWrite:     p.CacheWrite,
+		Output:         p.Output,
+	}
+	if tier.CacheWrite == 0 {
+		tier.CacheWrite = tier.InputCacheMiss
+	}
+	if p.LongContext != nil && p.LongContextThreshold > 0 && inputTokens > p.LongContextThreshold {
+		return *p.LongContext
+	}
+	return tier
 }
 
 type ReasoningConfig struct {
@@ -131,6 +228,7 @@ type ResolvedModel struct {
 	InputLimit          int
 	OutputLimit         int
 	ReasoningConfig     ReasoningConfig
+	Pricing             *ModelPricing
 }
 
 func (p ProviderConfig) MarshalJSON() ([]byte, error) {
@@ -284,6 +382,7 @@ func (c *Config) ResolveModel(providerName, modelName string) (ResolvedModel, er
 		InputLimit:          profile.InputLimit,
 		OutputLimit:         profile.OutputLimit,
 		ReasoningConfig:     copyReasoningConfig(profile.ReasoningConfig),
+		Pricing:             copyModelPricing(profile.Pricing),
 	}, nil
 }
 
@@ -370,6 +469,7 @@ func copyModels(models map[string]ModelProfile) map[string]ModelProfile {
 		profile.Input = append([]string(nil), profile.Input...)
 		profile.Parameters = copyParameters(profile.Parameters)
 		profile.ReasoningConfig = copyReasoningConfig(profile.ReasoningConfig)
+		profile.Pricing = copyModelPricing(profile.Pricing)
 		copied[name] = profile
 	}
 	return copied
@@ -392,6 +492,22 @@ func copyReasoningConfig(reasoning ReasoningConfig) ReasoningConfig {
 	return reasoning
 }
 
+func copyModelPricing(pricing *ModelPricing) *ModelPricing {
+	if pricing == nil {
+		return nil
+	}
+	copied := *pricing
+	copied.Currency = strings.ToUpper(strings.TrimSpace(copied.Currency))
+	if copied.Currency == "" {
+		copied.Currency = "USD"
+	}
+	if pricing.LongContext != nil {
+		longContext := *pricing.LongContext
+		copied.LongContext = &longContext
+	}
+	return &copied
+}
+
 func (m *ModelProfile) UnmarshalYAML(value *yaml.Node) error {
 	var fields map[string]any
 	if err := value.Decode(&fields); err != nil {
@@ -409,12 +525,23 @@ func (m *ModelProfile) UnmarshalYAML(value *yaml.Node) error {
 	delete(fields, "id")
 	var structured struct {
 		ReasoningConfig ReasoningConfig `yaml:"reasoning_config"`
+		Pricing         *ModelPricing   `yaml:"pricing"`
 	}
 	if err := value.Decode(&structured); err != nil {
 		return err
 	}
 	m.ReasoningConfig = structured.ReasoningConfig
 	delete(fields, "reasoning_config")
+	if structured.Pricing != nil {
+		if err := structured.Pricing.Validate(); err != nil {
+			return fmt.Errorf("model profile pricing: %w", err)
+		}
+		if strings.TrimSpace(structured.Pricing.Currency) == "" {
+			structured.Pricing.Currency = "USD"
+		}
+		m.Pricing = structured.Pricing
+	}
+	delete(fields, "pricing")
 
 	if rawInput, ok := fields["input"]; ok {
 		input, err := parseModelInput(rawInput)
@@ -705,6 +832,11 @@ func validateProvider(path string, provider ProviderConfig) error {
 		if profile.ID == "" {
 			return fmt.Errorf("provider file %q model %q is missing id", path, profileName)
 		}
+		if profile.Pricing != nil {
+			if err := profile.Pricing.Validate(); err != nil {
+				return fmt.Errorf("provider file %q model %q: %w", path, profileName, err)
+			}
+		}
 		if profile.Type != "" && !isKnownProviderType(profile.Type) {
 			return fmt.Errorf("provider file %q model %q has unknown model type %q; supported provider types: %s", path, profileName, profile.Type, formatSupportedProviderTypes())
 		}
@@ -747,6 +879,9 @@ func normalizeProvider(provider ProviderConfig, providerFileDir string) Provider
 		profile.ID = strings.TrimSpace(profile.ID)
 		profile.Type = strings.TrimSpace(profile.Type)
 		profile.Compatibility = strings.ToLower(strings.TrimSpace(profile.Compatibility))
+		if profile.Pricing != nil {
+			profile.Pricing = copyModelPricing(profile.Pricing)
+		}
 		provider.Models[profileName] = profile
 	}
 	return provider

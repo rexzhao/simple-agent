@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/rexzhao/simple-agent/internal/config"
 	"github.com/rexzhao/simple-agent/internal/contextwindow"
 	"github.com/rexzhao/simple-agent/internal/model"
 )
@@ -120,6 +121,7 @@ type SessionV2 struct {
 	Provider             string                 `json:"provider"`
 	ModelProfile         string                 `json:"model_profile"`
 	ModelID              string                 `json:"model_id"`
+	Pricing              *config.ModelPricing   `json:"pricing,omitempty"`
 	ReasoningLevel       string                 `json:"reasoning_level,omitempty"`
 	ModelParameters      map[string]any         `json:"model_parameters,omitempty"`
 	CWD                  string                 `json:"cwd"`

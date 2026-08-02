@@ -87,6 +87,39 @@ describe('reduceRunEvent', () => {
     expect(run).toMatchObject({ inputTokens: 10, totalTokens: 14, cachedTokens: 2, reasoningTokens: 3, status: 'failed', error: 'boom' })
   })
 
+  it('accumulates usage across agent iterations while keeping the latest context meter values', () => {
+    const run = apply(
+      newRun(),
+      { type: 'usage.updated', turn_id: 'turn-1', agent_iteration: 1, input_tokens: 10, output_tokens: 4, total_tokens: 14, cached_tokens: 2, cache_write_tokens: 1, reasoning_tokens: 3 },
+      { type: 'usage.updated', turn_id: 'turn-1', agent_iteration: 2, input_tokens: 6, output_tokens: 5, total_tokens: 11, cached_tokens: 4, cache_write_tokens: 0, reasoning_tokens: 2 },
+    )
+
+    expect(run).toMatchObject({ inputTokens: 6, outputTokens: 5, totalTokens: 11, cachedTokens: 4, cacheWriteTokens: 0, reasoningTokens: 2 })
+    expect(run.usage).toEqual({ inputTokens: 16, outputTokens: 9, totalTokens: 25, cachedTokens: 6, cacheWriteTokens: 1, reasoningTokens: 5 })
+  })
+
+  it('replaces usage updates from the same provider request', () => {
+    const run = apply(
+      newRun(),
+      { type: 'usage.updated', turn_id: 'turn-1', agent_iteration: 1, input_tokens: 10, output_tokens: 4, total_tokens: 14, cached_tokens: 2, cache_write_tokens: 1, reasoning_tokens: 3 },
+      { type: 'usage.updated', turn_id: 'turn-1', agent_iteration: 1, input_tokens: 12, output_tokens: 5, total_tokens: 17, cached_tokens: 4, cache_write_tokens: 0, reasoning_tokens: 2 },
+    )
+
+    expect(run.usageEvents).toHaveLength(1)
+    expect(run.usage).toEqual({ inputTokens: 12, outputTokens: 5, totalTokens: 17, cachedTokens: 4, cacheWriteTokens: 0, reasoningTokens: 2 })
+  })
+
+  it('drops a failed provider request before its retry', () => {
+    const run = apply(
+      newRun(),
+      { type: 'usage.updated', turn_id: 'turn-1', agent_iteration: 1, input_tokens: 10, output_tokens: 4, total_tokens: 14, cached_tokens: 2, cache_write_tokens: 1, reasoning_tokens: 3 },
+      { type: 'provider.retrying', turn_id: 'turn-1', agent_iteration: 1, attempt: 2, max_attempts: 3, delay_ms: 1000, reason: 'server_error' },
+    )
+
+    expect(run.usageEvents).toEqual([])
+    expect(run.usage).toBeUndefined()
+  })
+
   it('tracks automatic compaction lifecycle and replacement context size', () => {
     const compacting = reduceRunEvent(newRun(), {
       type: 'compaction.started',

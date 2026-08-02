@@ -299,6 +299,12 @@ svg { width: 1.1em; height: 1.1em; fill: none; stroke: currentColor; stroke-widt
 .context-usage.critical { color: #ffffff; background: var(--danger); }
 .context-usage.critical .context-usage-copy span, .context-usage.critical .context-usage-copy strong, .context-usage.critical .context-usage-copy small { color: #ffffff; }
 .context-usage.critical .context-progress i { background: var(--danger); }
+.cost-usage { min-width: 290px; display: flex; align-items: stretch; gap: 12px; padding: 4px 7px 5px; border: 1px solid var(--border); background: var(--panel); }
+.session-stat { display: flex; align-items: baseline; gap: 5px; font: 9px var(--font-mono); white-space: nowrap; }
+.session-stat span { color: var(--faint); font-weight: 800; text-transform: uppercase; letter-spacing: .06em; }
+.session-stat strong { color: var(--text); font-size: 10px; }
+.session-stat small { color: var(--muted); font-size: 8px; }
+.field-help { margin: 0; color: var(--muted); font-size: 10px; line-height: 1.4; }
 .header-actions { display: flex; align-items: center; gap: 12px; }
 .status-dot { width: 8px; height: 8px; flex: 0 0 auto; border: 2px solid var(--border); background: #22c55e; align-self: center; }
 .status-dot.running { background: #ffffff; border-color: var(--accent); animation: pulse 1.2s infinite; }
@@ -702,6 +708,8 @@ svg { width: 1.1em; height: 1.1em; fill: none; stroke: currentColor; stroke-widt
   .conversation-meta { gap: 7px; }
   .conversation-meta > p { max-width: 110px; }
   .context-usage { width: 155px; }
+  .cost-usage { min-width: 0; gap: 7px; }
+  .session-stat span { display: none; }
   .context-usage-copy span { display: none; }
   .messages, .composer-wrap { padding-left: 18px; padding-right: 18px; }
   .message.user { margin-left: 30px; }
