@@ -272,7 +272,7 @@ test('groups render collapsed with visible markers after the run settles', async
 
   committed = true
   settle.release([{ type: 'run.settled', run_id: 'run-main', status: 'committed', turn_id: 'turn-main', last_seq: 7 }])
-  await expect(page.getByText('Ready', { exact: true })).toBeVisible()
+  await expect(page.getByLabel('Session status: idle')).toBeVisible()
   await expect(page.locator('.message.assistant:not(.transient)').last()).toContainText('All done.')
   expect(await groupStates(page)).toEqual([{ open: false, summary: 'Read 2 files · Ran 1 command' }])
   await expectMarkerVisible(page)
@@ -312,7 +312,7 @@ test('failed tools expand the live group but stay collapsed once settled', async
   // collapses; the failure remains discoverable via the badge.
   committed = true
   settle.release([{ type: 'run.settled', run_id: 'run-main', status: 'committed', turn_id: 'turn-main', last_seq: 5 }])
-  await expect(page.getByText('Ready', { exact: true })).toBeVisible()
+  await expect(page.getByLabel('Session status: idle')).toBeVisible()
   await expect(page.locator('.message.assistant:not(.transient)').last()).toContainText('One read failed.')
   expect(await groupStates(page)).toEqual([{ open: false, summary: 'Read 2 files' }])
   await expect(page.locator('.tool-group > summary small')).toHaveText('1 failed')

@@ -165,7 +165,7 @@ test('connects a first project, creates a session, and commits a streamed run', 
 
   finishRun()
   await expect(page.locator('.message.assistant:not(.transient)')).toContainText('Streamed answer')
-  await expect(page.getByText('Ready', { exact: true })).toBeVisible()
+  await expect(page.getByLabel('Session status: idle')).toBeVisible()
   expect(eventConnections).toBeGreaterThanOrEqual(2)
 })
 
@@ -202,7 +202,7 @@ test('cancels an active run without persisting its transient turn', async ({ pag
   await expect(page.locator('.message.user.transient')).toContainText('Wait for cancellation')
 
   await page.getByRole('button', { name: 'Stop' }).click()
-  await expect(page.getByText('Ready', { exact: true })).toBeVisible()
+  await expect(page.getByLabel('Session status: idle')).toBeVisible()
   await expect(page.locator('.message.user.transient')).toHaveCount(0)
   expect(cancelRequests).toBe(1)
 })
@@ -238,7 +238,7 @@ test('resyncs a recovered run from durable session history', async ({ page }) =>
 
   await page.goto('/')
   await expect(page.locator('.message.assistant:not(.transient)')).toContainText('Recovered answer')
-  await expect(page.getByText('Ready', { exact: true })).toBeVisible()
+  await expect(page.getByLabel('Session status: idle')).toBeVisible()
 })
 
 test('renames sessions and projects and confirms project-wide deletion', async ({ page }) => {
