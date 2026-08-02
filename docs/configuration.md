@@ -124,6 +124,22 @@ models:
       levels:
         high: high
         max: max
+
+  deepseek-v4-flash:
+    id: deepseek-v4-flash
+    type: openai-chat
+    input: [text, image]
+    context_window: 128000
+    output_limit: 8192
+    temperature: 0.4
+    max_tokens: 8192
+    reasoning_config:
+      parameter: reasoning_effort
+      default: high
+      levels:
+        low: low
+        high: high
+        max: max
 ```
 
 Supported model profile types:
@@ -232,9 +248,9 @@ by that model. `parameter` is a dot-separated request path, `default` is the
 level selected for a new session, and `levels` may contain string, number,
 boolean, or object values. SAI follows Pi's common level vocabulary:
 `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, and `max`. Known GPT-5,
-OpenRouter, GLM-5.2/DeepSeek-v4, and adaptive Claude models receive Pi-compatible
-defaults when a model is saved without an explicit mapping. Unknown models are
-left unconfigured.
+OpenRouter, GLM-5.2, DeepSeek-v4 (including the `deepseek-v4-flash` tier), and
+adaptive Claude models receive Pi-compatible defaults when a model is saved
+without an explicit mapping. Unknown models are left unconfigured.
 
 The generated Codex subscription profile uses an OAuth token file and is
 equivalent to:

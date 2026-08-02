@@ -58,10 +58,16 @@ func DefaultReasoningConfig(providerName, baseURL string, model ModelProfile) Re
 		parameter = "reasoning.effort"
 	}
 	if modelID == "glm-5.2" || strings.Contains(modelID, "deepseek-v4") {
-		levels := map[string]any{"high": "high", "max": "max"}
-		if providerName == "zai" || providerName == "z-ai" || strings.Contains(baseURL, "api.z.ai") || strings.Contains(baseURL, "bigmodel.cn") {
-			levels["low"] = "high"
-			levels["medium"] = "high"
+		// DeepSeek v4 (including the fast deepseek-v4-flash tier) exposes
+		// exactly three thinking levels: low, high, and max. GLM-5.2 keeps
+		// its own compact set and only advertises low/medium on Z.ai.
+		levels := deepseekV4Levels()
+		if modelID == "glm-5.2" {
+			levels = map[string]any{"high": "high", "max": "max"}
+			if isZAIEndpoint(providerName, baseURL) {
+				levels["low"] = "high"
+				levels["medium"] = "high"
+			}
 		}
 		return ReasoningConfig{
 			Parameter: parameter,
@@ -119,6 +125,25 @@ func commonEffortLevels() map[string]any {
 		"medium":  "medium",
 		"high":    "high",
 	}
+}
+
+// deepseekV4Levels returns the three thinking levels shared by every
+// DeepSeek v4 member, including the fast deepseek-v4-flash tier: low, high,
+// and max. SAI exposes exactly these options so a session always picks a
+// 思考等级 from the real catalog instead of a binary on/off switch.
+func deepseekV4Levels() map[string]any {
+	return map[string]any{
+		"low":  "low",
+		"high": "high",
+		"max":  "max",
+	}
+}
+
+// isZAIEndpoint reports whether a provider routes to Z.ai (Zhipu) endpoints,
+// which collapse the low/medium thinking names onto the heavier effort value.
+func isZAIEndpoint(providerName, baseURL string) bool {
+	return providerName == "zai" || providerName == "z-ai" ||
+		strings.Contains(baseURL, "api.z.ai") || strings.Contains(baseURL, "bigmodel.cn")
 }
 
 func addOpenAIExtendedLevels(levels map[string]any, modelID string) {

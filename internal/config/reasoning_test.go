@@ -63,6 +63,68 @@ func TestDefaultReasoningConfigMatchesPiOpenAIMappings(t *testing.T) {
 	}
 }
 
+func TestDefaultReasoningConfigForDeepSeekV4Flash(t *testing.T) {
+	tests := []struct {
+		name      string
+		provider  string
+		baseURL   string
+		model     ModelProfile
+		parameter string
+		defaultID string
+		levels    []string
+		lowValue  any
+	}{
+		{
+			name:      "deepseek-v4-flash exposes low/high/max only",
+			provider:  "paperhub",
+			baseURL:   "https://tc-paperhub.diezhi.net/v1",
+			model:     ModelProfile{ID: "deepseek-v4-flash", Type: ProviderTypeOpenAIChat},
+			parameter: "reasoning_effort",
+			defaultID: "high",
+			levels:    []string{"low", "high", "max"},
+			lowValue:  "low",
+		},
+		{
+			name:      "deepseek-v4 keeps the same three levels",
+			provider:  "paperhub",
+			baseURL:   "https://tc-paperhub.diezhi.net/v1",
+			model:     ModelProfile{ID: "deepseek-v4", Type: ProviderTypeOpenAIChat},
+			parameter: "reasoning_effort",
+			defaultID: "high",
+			levels:    []string{"low", "high", "max"},
+			lowValue:  "low",
+		},
+		{
+			name:      "deepseek-v4-flash keeps low/high/max on zai too",
+			provider:  "zai",
+			baseURL:   "https://api.z.ai/api/paas/v4",
+			model:     ModelProfile{ID: "deepseek-v4-flash", Type: ProviderTypeOpenAIChat},
+			parameter: "reasoning_effort",
+			defaultID: "high",
+			levels:    []string{"low", "high", "max"},
+			lowValue:  "low",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got := DefaultReasoningConfig(test.provider, test.baseURL, test.model)
+			if got.Parameter != test.parameter || got.Default != test.defaultID {
+				t.Fatalf("DefaultReasoningConfig() = parameter %q default %q, want %q %q", got.Parameter, got.Default, test.parameter, test.defaultID)
+			}
+			if levels := ReasoningLevelNames(got.Levels); !reflect.DeepEqual(levels, test.levels) {
+				t.Fatalf("levels = %#v, want %#v", levels, test.levels)
+			}
+			if got.Levels["low"] != test.lowValue {
+				t.Fatalf("levels[low] = %#v, want %#v", got.Levels["low"], test.lowValue)
+			}
+			if _, ok := got.Levels["medium"]; ok {
+				t.Fatalf("levels contains medium, want low/high/max only: %#v", got.Levels)
+			}
+		})
+	}
+}
+
 func TestDefaultReasoningConfigForAdaptiveClaude(t *testing.T) {
 	got := DefaultReasoningConfig("anthropic", "", ModelProfile{ID: "claude-opus-4-7", Type: ProviderTypeAnthropicMessages})
 	if got.Parameter != "output_config.effort" || got.Default != "high" {
