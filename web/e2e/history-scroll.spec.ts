@@ -48,22 +48,33 @@ test('loads older history only on click and preserves the viewport anchor', asyn
   await page.goto('/')
   const messages = page.locator('.messages')
   const anchor = page.getByText('message-101', { exact: true })
-  await expect(anchor).toBeAttached()
 
   // Scrolling to the top must not page older history by itself.
   await interruptSettle(page)
   await messages.evaluate((element) => { element.scrollTop = 0 })
+  await expect(anchor).toBeAttached()
   await twoFrames(page)
+  // Virtuoso may finish its initial measurement by adjusting the scroll
+  // position. Re-apply the real top gesture and poll the anchor at that point,
+  // rather than assuming the first mount stayed in the DOM.
+  await messages.evaluate((element) => { element.scrollTop = 0 })
+  await expect.poll(async () => messages.evaluate((element) => element.scrollTop)).toBe(0)
+  await expect.poll(async () => anchor.count()).toBeGreaterThan(0)
   expect(olderCalls()).toBe(0)
 
   const before = await anchor.evaluate((element) => element.getBoundingClientRect().top)
   await page.getByRole('button', { name: 'Load earlier messages' }).click()
   await expect.poll(olderCalls).toBe(1)
   release()
-  await expect(page.getByText('message-51', { exact: true })).toBeAttached()
+  await expect(page.getByRole('button', { name: 'Load earlier messages' })).toHaveCount(0)
+  // The old first row is the logical anchor. The newly prepended rows may be
+  // above the viewport and therefore need not be mounted yet.
+  await expect.poll(async () => anchor.count()).toBeGreaterThan(0)
   await twoFrames(page)
   const after = await anchor.evaluate((element) => element.getBoundingClientRect().top)
   expect(Math.abs(after - before)).toBeLessThanOrEqual(2)
+  await messages.evaluate((element) => { element.scrollTop = 0 })
+  await expect(page.getByText('message-51', { exact: true })).toBeAttached()
   expect(olderCalls()).toBe(1)
 })
 
@@ -92,7 +103,7 @@ test('requests history pages with turn alignment enabled', async ({ page }) => {
   await page.goto('/')
   await expect(page.getByText('message-150', { exact: true })).toBeAttached()
   await page.getByRole('button', { name: 'Load earlier messages' }).click()
-  await expect(page.getByText('message-51', { exact: true })).toBeAttached()
+  await expect(page.getByRole('button', { name: 'Load earlier messages' })).toHaveCount(0)
   // The latest page (initial load/refresh) and the older page (click) must
   // both ask the server for turn-aligned pages.
   expect(itemQueries.length).toBeGreaterThanOrEqual(2)
@@ -101,23 +112,26 @@ test('requests history pages with turn alignment enabled', async ({ page }) => {
   }
 })
 
-test('content-visibility does not cause a second jump when older messages become visible', async ({ page }) => {
+test('virtualized rows do not cause a second jump when older messages become visible', async ({ page }) => {
   await mockApp(page, Promise.resolve())
   await page.goto('/')
   const messages = page.locator('.messages')
   const anchor = page.getByText('message-101', { exact: true })
-  await expect(anchor).toBeAttached()
-  await expect(anchor.locator('xpath=ancestor::article[1]')).toHaveCSS('content-visibility', 'auto')
+  const mountedRow = page.locator('.message').filter({ hasText: 'message-150' }).first()
+  await expect(mountedRow).toBeAttached()
+  await expect(mountedRow).not.toHaveCSS('content-visibility', 'auto')
   await interruptSettle(page)
   await messages.evaluate((element) => { element.scrollTop = 0 })
-  await page.getByRole('button', { name: 'Load earlier messages' }).click()
-  await expect(page.getByText('message-51', { exact: true })).toBeAttached()
-  await twoFrames(page)
-  await anchor.scrollIntoViewIfNeeded()
+  await expect(anchor).toBeAttached()
   const before = await anchor.evaluate((element) => element.getBoundingClientRect().top)
+  await page.getByRole('button', { name: 'Load earlier messages' }).click()
+  await expect(page.getByRole('button', { name: 'Load earlier messages' })).toHaveCount(0)
+  await expect.poll(async () => anchor.count()).toBeGreaterThan(0)
   await twoFrames(page)
   const after = await anchor.evaluate((element) => element.getBoundingClientRect().top)
   expect(Math.abs(after - before)).toBeLessThanOrEqual(2)
+  await messages.evaluate((element) => { element.scrollTop = 0 })
+  await expect(page.getByText('message-51', { exact: true })).toBeAttached()
 })
 
 // --- Streaming harness ----------------------------------------------------
@@ -192,9 +206,8 @@ async function mockStreamingApp(
 const distanceFromBottom = (page: Page) =>
   page.locator('.messages').evaluate((element) => element.scrollHeight - element.scrollTop - element.clientHeight)
 
-// Native scroll anchoring keeps adjusting scrollTop for a few hundred ms
-// after a large jump while content-visibility estimates are replaced by real
-// sizes. Wait for that settling to finish before measuring positions.
+// Virtuoso may perform a few measurement passes after a large jump. Wait for
+// those passes to finish before measuring positions.
 async function settleViewport(page: Page) {
   await expect.poll(async () => {
     const before = await page.locator('.messages').evaluate((element) => element.scrollTop)
@@ -204,9 +217,9 @@ async function settleViewport(page: Page) {
   }).toBeLessThanOrEqual(2)
 }
 
-// A tiny wheel gesture cancels the session-switch settle loop, exactly like
-// any real user scroll does; programmatic scrolls that follow then behave
-// like deliberate user positioning instead of fighting the restore.
+// A tiny wheel gesture establishes user intent, exactly like a real scroll.
+// Programmatic scrolls that follow then behave like deliberate positioning
+// instead of being mistaken for the initial bottom placement.
 async function interruptSettle(page: Page) {
   await page.locator('.messages').hover()
   await page.mouse.wheel(0, -1)
@@ -240,13 +253,13 @@ test('stops following output when the user scrolls up, resumes at the bottom', a
 
   // New streamed output must not move the viewport.
   more.release([{ type: 'text.delta', turn_id: 'turn-1', agent_iteration: 1, text: 'Second chunk, deliberately padded. '.repeat(20) }])
-  await expect(page.getByText(/Second chunk/)).toBeAttached()
   await twoFrames(page)
   const afterGrowth = await messages.evaluate((element) => element.scrollTop)
   expect(Math.abs(afterGrowth - scrolledTo)).toBeLessThanOrEqual(4)
 
   // Scrolling back to the bottom re-engages following.
   await messages.evaluate((element) => { element.scrollTop = element.scrollHeight })
+  await expect(page.getByText(/Second chunk/)).toBeAttached()
   await twoFrames(page)
   finale.release([{ type: 'text.delta', turn_id: 'turn-1', agent_iteration: 1, text: 'Final chunk. ' }])
   await expect(page.getByText(/Final chunk/)).toBeAttached()
@@ -291,13 +304,14 @@ test('a settling run keeps loaded older history and the viewport anchor', async 
   await page.goto('/')
   const messages = page.locator('.messages')
   const anchor = page.getByText('message-101', { exact: true })
-  await expect(anchor).toBeAttached()
 
   // Page older history in with an explicit click.
   await interruptSettle(page)
   await messages.evaluate((element) => { element.scrollTop = 0 })
+  await expect(anchor).toBeAttached()
   await page.getByRole('button', { name: 'Load earlier messages' }).click()
-  await expect(page.getByText('message-51', { exact: true })).toBeAttached()
+  await expect(page.getByRole('button', { name: 'Load earlier messages' })).toHaveCount(0)
+  await expect(anchor).toBeAttached()
   await settleViewport(page)
   const before = await anchor.evaluate((element) => element.getBoundingClientRect().top)
 
@@ -305,11 +319,15 @@ test('a settling run keeps loaded older history and the viewport anchor', async 
   // into the loaded window instead of replacing it.
   settle.release([{ type: 'run.settled', turn_id: 'turn-1', status: 'committed' }])
   settled = true
-  await expect(page.getByText('message-152', { exact: true })).toBeAttached()
   await twoFrames(page)
-  await expect(page.getByText('message-51', { exact: true })).toBeAttached()
+  await expect.poll(async () => anchor.count()).toBeGreaterThan(0)
   const after = await anchor.evaluate((element) => element.getBoundingClientRect().top)
   expect(Math.abs(after - before)).toBeLessThanOrEqual(2)
+
+  // The newly committed tail may be virtualized away while the viewport is
+  // held on the older anchor. Mount it explicitly before asserting its text.
+  await messages.evaluate((element) => { element.scrollTop = element.scrollHeight })
+  await expect(page.getByText('message-152', { exact: true })).toBeAttached()
 })
 
 test('opens a tall session at the bottom without paging older history', async ({ page }) => {
@@ -317,8 +335,8 @@ test('opens a tall session at the bottom without paging older history', async ({
   await page.goto('/')
   await expect(page.getByText('message-150', { exact: true })).toBeAttached()
   await settleViewport(page)
-  // The settle loop must converge to the real bottom, not the estimate-based
-  // position content-visibility produces on first render.
+  // Initial placement must converge to the real bottom, not an estimate-only
+  // position before the variable-height rows have been measured.
   expect(await distanceFromBottom(page)).toBeLessThanOrEqual(12)
   // Landing at the bottom must not load older history.
   expect(olderCalls()).toBe(0)
@@ -367,10 +385,7 @@ test('restores the previous scroll position when switching back to a session', a
 
   // Scroll deep into the middle of the history.
   await interruptSettle(page)
-  await page.locator('.messages').evaluate((element) => {
-    const anchor = element.querySelector<HTMLElement>('.message[data-seq="120"]')
-    if (anchor) element.scrollTop += anchor.getBoundingClientRect().top - element.getBoundingClientRect().top - 40
-  })
+  await page.locator('.messages').evaluate((element) => { element.scrollTop = element.scrollHeight / 2 })
   await settleViewport(page)
   const remembered = await firstVisible(page)
   expect(remembered).not.toBeNull()
@@ -381,8 +396,8 @@ test('restores the previous scroll position when switching back to a session', a
   await page.getByRole('button', { name: /^Second session/ }).click()
   await expect(page.getByText('message-1', { exact: true })).toBeAttached()
   await page.getByRole('button', { name: /^History fixture/ }).click()
-  await expect(page.getByText('message-150', { exact: true })).toBeAttached()
   await settleViewport(page)
+  await expect.poll(async () => (await firstVisible(page))?.seq).toBe(remembered?.seq)
   const restored = await firstVisible(page)
   expect(restored?.seq).toBe(remembered?.seq)
   expect(Math.abs((restored?.offset ?? 0) - (remembered?.offset ?? 0))).toBeLessThanOrEqual(4)

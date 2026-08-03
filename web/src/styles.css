@@ -270,7 +270,7 @@ svg { width: 1.1em; height: 1.1em; fill: none; stroke: currentColor; stroke-widt
 .eyebrow { display: block; color: var(--faint); font-size: 10px; font-weight: 850; letter-spacing: .14em; text-transform: uppercase; }
 
 .conversation-panel { position: relative; min-width: 0; min-height: 0; background: var(--bg); }
-.conversation { height: 100%; display: grid; grid-template-rows: auto minmax(0, 1fr) auto; }
+.conversation { height: 100%; display: grid; grid-template-rows: auto minmax(0, 1fr) auto auto; }
 
 .conversation-header {
   min-height: 74px;
@@ -337,19 +337,21 @@ svg { width: 1.1em; height: 1.1em; fill: none; stroke: currentColor; stroke-widt
 .secondary-button.full { width: 100%; background: #ffffff; }
 
 .messages {
-  overflow-y: auto;
-  padding: 32px max(28px, calc((100% - 900px) / 2)) 46px;
+  overflow: auto;
+  overflow-anchor: none;
   scrollbar-color: #111111 #eeeeee;
   font-family: var(--font-content);
 }
+.messages-list { padding-right: max(28px, calc((100% - 900px) / 2)); padding-left: max(28px, calc((100% - 900px) / 2)); }
+.conversation-row { display: flow-root; }
+.messages-top-padding { height: 32px; }
+.messages-header-content { height: 62px; box-sizing: border-box; }
+.messages-header-slot { height: 62px; box-sizing: border-box; overflow: visible; }
+.messages-bottom-padding { height: 46px; }
 
 .message {
   display: block;
   margin: 0 0 30px;
-  /* Keep long histories in the DOM for reliable scroll anchoring, but let the
-     browser skip layout/paint work for messages far outside the viewport. */
-  content-visibility: auto;
-  contain-intrinsic-size: auto 160px;
 }
 .message.user { margin-left: min(120px, 10%); }
 .message.user .message-content { display: flex; flex-direction: column; align-items: flex-end; }
@@ -436,8 +438,8 @@ svg { width: 1.1em; height: 1.1em; fill: none; stroke: currentColor; stroke-widt
 .process-card > .process-iterations { gap: 0; }
 .process-card > .process-iterations .process-iteration { width: 100%; }
 /* The left gutter keeps iteration markers — which hang left of their row via
-   right: 100% — inside the .message paint box, so content-visibility's paint
-   containment does not clip them. 22px fits two digits plus the 9px gap. */
+   right: 100% — inside the .message paint box. 22px fits two digits plus the
+   9px gap. */
 .process-timeline { display: flex; flex-direction: column; gap: 8px; margin: 3px 0 14px; padding-left: 22px; }
 .iteration-marker { position: absolute; top: 9px; right: 100%; margin-right: 9px; color: var(--faint); font-family: var(--font-mono); font-size: 9px; font-weight: 500; font-style: normal; line-height: 1; pointer-events: none; }
 /* Tool group markers sit 2px further left so their digits align with the
@@ -718,7 +720,7 @@ svg { width: 1.1em; height: 1.1em; fill: none; stroke: currentColor; stroke-widt
   .cost-usage { min-width: 0; gap: 7px; }
   .session-stat span { display: none; }
   .context-usage-copy span { display: none; }
-  .messages, .composer-wrap { padding-left: 18px; padding-right: 18px; }
+  .messages-list, .composer-wrap { padding-left: 18px; padding-right: 18px; }
   .message.user { margin-left: 30px; }
   .provider-dialog-backdrop { padding: 8px; }
   .provider-dialog { height: calc(100vh - 16px); }

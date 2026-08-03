@@ -3,20 +3,19 @@ import Markdown from 'react-markdown'
 import type { Components } from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { api } from '../api'
-import type { ActiveRun, ItemsPage, QueuedPrompt, RunStep, Session, SessionImageAttachment, SessionItem, ToolActivity } from '../types'
+import type { ActiveRun, ItemsPage, QueuedPrompt, RunStep, Session, SessionImageAttachment, SessionItem } from '../types'
 import { addUsageBreakdown, contextRequestCount, contextUsageBreakdown, usageBreakdownFromEvents, usageCostBreakdown, usageEventCount } from '../lib/cost'
+import { buildConversationRows, conversationRowKey } from '../lib/conversationRows'
+import type { ConversationRow } from '../lib/conversationRows'
 import { blobAsDataURL, copyText, formatCost, formatTokenCount } from '../lib/format'
-import { itemText, processKey, sessionName, visibleSessionItems } from '../lib/session'
+import { itemText, sessionName, visibleSessionItems } from '../lib/session'
 import { Composer } from './Composer'
 import type { ComposerDraft, PastedImageAttachment, PastedTextAttachment } from './Composer'
 import { MessageSkeleton } from './misc'
 import { ProcessTimeline } from './ProcessTimeline'
 import { BugIcon, CopyIcon, RetryIcon, SparkIcon, WarningIcon } from './icons'
-
-// Distance from the bottom that still counts as "at the bottom". Kept tiny on
-// purpose: any deliberate scroll away from the bottom disengages output
-// following, and only scrolling back to (nearly) the bottom re-engages it.
-const stickToBottomThresholdPX = 8
+import { VirtualConversationList } from './VirtualConversationList'
+import type { VirtuosoHandle } from 'react-virtuoso'
 
 export const Conversation = memo(function Conversation(props: {
   sessionID: string
@@ -49,166 +48,102 @@ export const Conversation = memo(function Conversation(props: {
   onMoveQueuedPrompt: (promptID: string, direction: 'up' | 'down') => void
   onCompact: () => void
 }) {
-	const messagesRef = useRef<HTMLElement>(null)
-	const followOutputRef = useRef(true)
+	const virtuosoRef = useRef<VirtuosoHandle | null>(null)
+	const followMemoryRef = useRef(new Map<string, boolean>())
+	type FollowIntent = 'initial' | 'following' | 'detached' | 'pending-send'
+	const followIntentRef = useRef<FollowIntent>('initial')
+	const userScrollRef = useRef(false)
 	const loadingOlderRef = useRef(false)
-	const prependAnchorRef = useRef<{
-		sessionID: string
-		element: HTMLElement | null
-		top: number
-		oldestSeq: number
-	} | null>(null)
-	// Per-session scroll memory: where the user was (and whether they were
-	// following output) when they left the session.
-	const scrollMemoryRef = useRef(new Map<string, { following: boolean; seq: number | null; offsetPX: number }>())
-	const sessionIDRef = useRef('')
-	const saveMemoryFrameRef = useRef(0)
-	const settleFrameRef = useRef(0)
-	const settleActiveRef = useRef(false)
 	const [loadingOlder, setLoadingOlder] = useState(false)
-	sessionIDRef.current = props.sessionID
 	const safeDetail = props.detail && props.detail.id === props.sessionID ? props.detail : null
 	const [resendPending, setResendPending] = useState(false)
 
-	// Scoped to the messages container: unlike scrollIntoView this can never
-	// drag along other scrollable ancestors (window, sidebar).
+	// Virtuoso's Scroller is the sole .messages element. Use its imperative API
+	// for explicit bottom requests instead of competing with its scroll model.
 	const scrollToBottom = useCallback(() => {
-		const messages = messagesRef.current
-		if (messages) messages.scrollTop = messages.scrollHeight
+		virtuosoRef.current?.scrollToIndex({ index: 'LAST', align: 'end', behavior: 'auto' })
 	}, [])
-	// Scroll events are the single source of truth for follow intent. Landing
-	// at the bottom engages following; leaving it — wheel, touch, keyboard,
-	// scrollbar — disengages, so streaming output never yanks the viewport.
-	const updateFollowOutput = useCallback(() => {
-		const messages = messagesRef.current
-		if (!messages) return
-		followOutputRef.current = messages.scrollHeight - messages.scrollTop - messages.clientHeight <= stickToBottomThresholdPX
-	}, [])
-	// Keeps the per-session scroll memory fresh; rAF-throttled so busy scroll
-	// gestures record at most one sample per frame.
-	const scheduleScrollMemorySave = useCallback(() => {
-		if (saveMemoryFrameRef.current) return
-		saveMemoryFrameRef.current = requestAnimationFrame(() => {
-			saveMemoryFrameRef.current = 0
-			const messages = messagesRef.current
-			const sessionID = sessionIDRef.current
-			if (!messages || !sessionID) return
-			const containerTop = messages.getBoundingClientRect().top
-			const anchor = [...messages.querySelectorAll<HTMLElement>('.message[data-seq]')]
-				.find((element) => element.getBoundingClientRect().bottom > containerTop) ?? null
-			scrollMemoryRef.current.set(sessionID, {
-				following: followOutputRef.current,
-				seq: anchor ? Number(anchor.dataset.seq) : null,
-				offsetPX: anchor ? anchor.getBoundingClientRect().top - containerTop : 0,
-			})
-		})
-	}, [])
-	const handleScroll = useCallback(() => {
-		updateFollowOutput()
-		scheduleScrollMemorySave()
-	}, [scheduleScrollMemorySave, updateFollowOutput])
-	// Any deliberate scroll gesture cancels an in-flight position restore.
-	const cancelSettle = useCallback(() => {
-		if (settleFrameRef.current) cancelAnimationFrame(settleFrameRef.current)
-		settleFrameRef.current = 0
-		settleActiveRef.current = false
-	}, [])
-	// On session switch, restore where the user left off: snapping to the
-	// bottom when they were following output (or have never visited), otherwise
-	// re-anchoring on the remembered message. content-visibility estimates make
-	// scrollHeight a moving target right after the swap, so the restore pins
-	// the target whenever the layout moves; without it the viewport lands
-	// wherever the estimates put it — e.g. the top of the last page — and even
-	// triggers a spurious older-page load. Position changes the restore did
-	// not cause (user scrolls) are respected after one reclaim frame, and any
-	// scroll gesture cancels the loop outright.
-	useLayoutEffect(() => {
-		const messages = messagesRef.current
-		const sessionID = props.sessionID
-		if (!messages || !sessionID) return
-		const memory = scrollMemoryRef.current.get(sessionID)
-		const anchorTarget = memory && !memory.following && memory.seq != null
-			? { seq: memory.seq, offsetPX: memory.offsetPX }
-			: null
-		followOutputRef.current = !anchorTarget
-		settleActiveRef.current = true
-		let lastHeight = -1
-		let stableFrames = 0
-		let misses = 0
-		let foundAnchor = false
-		const startedAt = performance.now()
-		const finish = (container: HTMLElement) => {
-			settleActiveRef.current = false
-			settleFrameRef.current = 0
-			if (anchorTarget && !foundAnchor) {
-				// The remembered message is gone (history rewritten): fall back
-				// to the bottom rather than stranding the user mid-list.
-				followOutputRef.current = true
-				container.scrollTop = container.scrollHeight
-			} else {
-				updateFollowOutput()
-			}
+	const handleVirtuosoRef = useCallback((sessionID: string, handle: VirtuosoHandle | null) => {
+		if (sessionID !== props.sessionID) return
+		virtuosoRef.current = handle
+	}, [props.sessionID])
+	// Virtuoso reports a new total height after variable rows are measured. A
+	// bottom request here is event-driven: it is allowed only while the state
+	// machine owns the viewport, and is never used to reclaim a detached or
+	// restoring session.
+	const handleTotalListHeightChanged = useCallback((sessionID: string) => {
+		if (sessionID !== props.sessionID) return
+		const intent = followIntentRef.current
+		if (intent === 'initial' || intent === 'following' || intent === 'pending-send') {
+			virtuosoRef.current?.scrollToIndex({ index: 'LAST', align: 'end', behavior: 'auto' })
 		}
-		const step = () => {
-			const container = messagesRef.current
-			if (!container || !settleActiveRef.current) return
-			if (performance.now() - startedAt > 2500) {
-				finish(container)
-				return
+	}, [props.sessionID])
+	// Keep intent separate from Virtuoso's measurement signal. In particular,
+	// an atBottom=false notification during an explicit send must not cancel
+	// following before the new row has committed and been measured.
+	const handleAtBottomStateChange = useCallback((sessionID: string, atBottom: boolean, fromScroll = false) => {
+		if (sessionID !== props.sessionID) return
+		const intent = followIntentRef.current
+		if (intent === 'pending-send') {
+			if (atBottom) {
+				followIntentRef.current = 'following'
+				userScrollRef.current = false
+				followMemoryRef.current.set(sessionID, true)
 			}
-			let distance: number
-			if (anchorTarget) {
-				const anchor = container.querySelector<HTMLElement>(`.message[data-seq="${anchorTarget.seq}"]`)
-				if (anchor) {
-					foundAnchor = true
-					distance = anchor.getBoundingClientRect().top - container.getBoundingClientRect().top - anchorTarget.offsetPX
-				} else {
-					distance = Number.POSITIVE_INFINITY
-				}
-			} else {
-				distance = container.scrollHeight - container.scrollTop - container.clientHeight
-			}
-			const height = container.scrollHeight
-			const heightChanged = height !== lastHeight
-			lastHeight = height
-			if (Math.abs(distance) <= 2) {
-				misses = 0
-				stableFrames += 1
-				if (stableFrames >= 3) {
-					finish(container)
-					return
-				}
-			} else if (!heightChanged) {
-				// The position moved without a layout change — an external
-				// scroll. Reclaim once in case it was estimate drift, then
-				// respect it and stop.
-				misses += 1
-				if (misses >= 2) {
-					finish(container)
-					return
-				}
-				stableFrames = 0
-				if (anchorTarget) container.scrollTop += distance
-				else container.scrollTop = container.scrollHeight
-			} else {
-				// Layout still converging: keep the restore target pinned.
-				misses = 0
-				stableFrames = 0
-				if (anchorTarget) container.scrollTop += distance
-				else container.scrollTop = container.scrollHeight
-			}
-			settleFrameRef.current = requestAnimationFrame(step)
+			return
 		}
-		step()
-		return cancelSettle
-	}, [props.sessionID, cancelSettle, updateFollowOutput])
-	// Follow the output stream, but only while the user stays at the bottom.
-	// Runs before paint so streaming growth never shows an un-scrolled frame.
-	// While a switch restore is settling, the restore loop owns scrolling.
+		if (intent === 'initial') {
+			// Initial measurement can report false before LAST is placed. It is
+			// not user intent and must not turn off initial following.
+			if (atBottom) {
+				followIntentRef.current = 'following'
+				userScrollRef.current = false
+				followMemoryRef.current.set(sessionID, true)
+			}
+			return
+		}
+		if (intent === 'detached') {
+			if (fromScroll && atBottom) {
+				followIntentRef.current = 'following'
+				userScrollRef.current = false
+				followMemoryRef.current.set(sessionID, true)
+			}
+			return
+		}
+		if (atBottom) {
+			followIntentRef.current = 'following'
+			userScrollRef.current = false
+			followMemoryRef.current.set(sessionID, true)
+		} else if (fromScroll && userScrollRef.current) {
+			followIntentRef.current = 'detached'
+			followMemoryRef.current.set(sessionID, false)
+		}
+		// A false notification while following can be caused by a row's measured
+		// height changing. Explicit user input is what detaches the viewport;
+		// totalListHeightChanged keeps this state at the bottom without a timer.
+	}, [props.sessionID])
+	const markScrollInteraction = useCallback((sessionID: string) => {
+		if (sessionID !== props.sessionID) return
+		followIntentRef.current = 'detached'
+		userScrollRef.current = true
+		followMemoryRef.current.set(sessionID, false)
+	}, [props.sessionID])
+	const followOutput = useCallback((sessionID: string, isAtBottom: boolean) => {
+		if (sessionID !== props.sessionID) return false
+		const intent = followIntentRef.current
+		if (intent === 'initial' || intent === 'pending-send' || intent === 'following') return 'auto'
+		// A detached session can still legitimately receive a callback while
+		// already at the bottom; honor Virtuoso's authoritative signal there.
+		return isAtBottom ? 'auto' : false
+	}, [props.sessionID])
+	// Restore the session's follow intent before Virtuoso evaluates its first
+	// layout. The scroll position itself comes from restoreStateFrom.
 	useLayoutEffect(() => {
-		if (settleActiveRef.current) return
-		if (followOutputRef.current) scrollToBottom()
-	}, [props.activeRun, props.page?.newest_seq, props.turnError, scrollToBottom])
+		userScrollRef.current = false
+		followIntentRef.current = followMemoryRef.current.has(props.sessionID)
+			? (followMemoryRef.current.get(props.sessionID) ? 'following' : 'detached')
+			: 'initial'
+	}, [props.sessionID])
 	// Resending starts a run from the trailing user message already in history.
 	const handleResend = useCallback(async (item: SessionItem) => {
 		if (resendPending) return
@@ -228,64 +163,55 @@ export const Conversation = memo(function Conversation(props: {
 	// Sending is explicit intent to be at the bottom: re-engage following even
 	// when the user had scrolled up to read history.
 	const handleSend = useCallback(async (content: string, images: PastedImageAttachment[]): Promise<boolean> => {
+		// Set this before awaiting the server response: startNewRun publishes the
+		// active row before the promise resolves, and an early atBottom(false)
+		// notification must not turn off explicit send-following in that commit.
+		followIntentRef.current = 'pending-send'
 		const sent = await props.onSend(content, images)
 		if (sent) {
-			cancelSettle()
-			followOutputRef.current = true
 			scrollToBottom()
+		} else {
+			// There was no data commit to follow. Keep the explicit intent, but
+			// let the next atBottom signal settle it normally.
+			followIntentRef.current = 'following'
 		}
 		return sent
-	}, [props.onSend, scrollToBottom, cancelSettle])
-	const loadOlder = useCallback(async () => {
-		const messages = messagesRef.current
-		if (!messages || loadingOlderRef.current || !props.page?.has_more_before) return
-		loadingOlderRef.current = true
-		setLoadingOlder(true)
-		const containerTop = messages.getBoundingClientRect().top
-		const anchorElement = [...messages.querySelectorAll<HTMLElement>('.message')]
-			.find((element) => element.getBoundingClientRect().bottom > containerTop) ?? null
-		prependAnchorRef.current = {
-			sessionID: props.sessionID ?? '',
-			element: anchorElement,
-			top: anchorElement?.getBoundingClientRect().top ?? containerTop,
-			oldestSeq: props.page.oldest_seq,
-		}
-		try {
-			if (!await props.onLoadOlder()) prependAnchorRef.current = null
-		} finally {
-			loadingOlderRef.current = false
-			setLoadingOlder(false)
-		}
-	}, [props.sessionID, props.onLoadOlder, props.page])
-	// Restore the viewport anchor after older items are prepended. Only a true
-	// prepend (oldest_seq moved backwards) consumes the anchor: refresh merges
-	// append at the tail and leave the geometry untouched. The compensation is
-	// geometric, so it composes with the browser's own scroll anchoring: when
-	// the browser already compensated, the measured delta is zero.
-	useLayoutEffect(() => {
-		const anchor = prependAnchorRef.current
-		const messages = messagesRef.current
-		if (!anchor || !messages) return
-		if (anchor.sessionID !== (props.sessionID ?? '')) {
-			prependAnchorRef.current = null
-			return
-		}
-		const page = props.page
-		if (!page || page.oldest_seq === anchor.oldestSeq) return
-		prependAnchorRef.current = null
-		if (anchor.element?.isConnected) messages.scrollTop += anchor.element.getBoundingClientRect().top - anchor.top
-	}, [props.sessionID, props.page])
+	}, [props.onSend, scrollToBottom])
 	// Older history pages load only on an explicit click on the "Load earlier
 	// messages" button. Scrolling to the top deliberately does not auto-load:
 	// casual upward scrolls must not silently grow the history window.
-	useEffect(() => () => {
-		if (saveMemoryFrameRef.current) cancelAnimationFrame(saveMemoryFrameRef.current)
-	}, [])
 	const visibleItems = useMemo(
 		() => visibleSessionItems(props.page?.items ?? [], props.activeRun),
 		[props.activeRun, props.page?.items],
 	)
-	const conversationEntries = useMemo(() => buildConversationEntries(visibleItems, props.sessionID ?? '', props.recentStepsByTurn), [props.sessionID, props.recentStepsByTurn, visibleItems])
+	const conversationRows = useMemo(() => {
+		const rows = buildConversationRows({
+			sessionID: props.sessionID ?? '',
+			items: props.page?.items ?? [],
+			activeRun: props.activeRun,
+			recentStepsByTurn: props.recentStepsByTurn,
+			compacting: props.compacting,
+			turnError: props.turnError,
+			sessionStatus: safeDetail?.status,
+		})
+		// This is a real, stable final row rather than Virtuoso Footer padding.
+		// Aligning LAST with it gives the UI one unambiguous bottom geometry.
+		// An actually empty list stays empty so Virtuoso's EmptyPlaceholder can
+		// represent the empty state instead of an invisible helper item.
+		if (rows.length > 0) rows.push({ kind: 'bottom-spacer', key: conversationRowKey(props.sessionID, 'bottom-spacer') })
+		return rows
+	}, [props.activeRun, props.compacting, props.page?.items, props.recentStepsByTurn, props.sessionID, props.turnError, safeDetail?.status])
+	const loadOlder = useCallback(async () => {
+		if (loadingOlderRef.current || !props.page?.has_more_before) return
+		loadingOlderRef.current = true
+		setLoadingOlder(true)
+		try {
+			await props.onLoadOlder()
+		} finally {
+			loadingOlderRef.current = false
+			setLoadingOlder(false)
+		}
+	}, [props.onLoadOlder, props.page])
 	// A session that is idle with a user message at the tail almost always
   // means the turn died mid-flight: offer to resend it in place.
 	const trailingUserItem = useMemo(() => {
@@ -297,6 +223,31 @@ export const Conversation = memo(function Conversation(props: {
   const headerStatus = props.compacting || props.activeRun?.status === 'running' || safeDetail?.status === 'running'
     ? 'running'
     : safeDetail?.status === 'interrupted' ? 'interrupted' : 'idle'
+
+	const renderRow = useCallback((row: ConversationRow) => renderConversationRow(row, {
+		sessionID: props.sessionID ?? '',
+		sessionNames: props.sessionNames,
+		workspaceRoot: safeDetail?.created_cwd,
+		onCancelTool: props.onCancelTool,
+		onResend: handleResend,
+		trailingUserItem,
+		resendPending,
+		onRetry: props.onRetry,
+		onRetryRefresh: props.onRetryRefresh,
+		onDismissTurnError: props.onDismissTurnError,
+	}), [handleResend, props.onCancelTool, props.onDismissTurnError, props.onRetry, props.onRetryRefresh, props.sessionID, props.sessionNames, resendPending, safeDetail?.created_cwd, trailingUserItem])
+
+	const conversationEmpty = <div className="conversation-empty"><SparkIcon /><h3>Start a new task</h3><p>Describe a goal, a problem, or the code you want to change.</p></div>
+	const listHeader = (
+		<div className="messages-header-slot">
+			{props.page?.has_more_before
+				? <button className="load-older" disabled={loadingOlder} onClick={() => void loadOlder()}>{loadingOlder ? 'Loading earlier messages…' : 'Load earlier messages'}</button>
+				: <span aria-hidden="true" />}
+		</div>
+	)
+	const listFooter = safeDetail?.status === 'interrupted' && !props.activeRun && !props.turnError
+		? <div className="conversation-retry"><button className="message-tool-button" onClick={props.onRetry} title="Retry last turn"><RetryIcon />Retry last turn</button></div>
+		: undefined
 
   return (
     <div className="conversation">
@@ -339,54 +290,19 @@ export const Conversation = memo(function Conversation(props: {
 		  <button className="secondary-button" disabled={!safeDetail || safeDetail.status === 'running' || props.compacting || props.activeRun?.status === 'running'} onClick={props.onCompact}>{props.compacting ? 'Compacting…' : 'Compact context'}</button>
         </div>
       </header>
-      <section ref={messagesRef} className="messages" aria-live="polite" onScroll={handleScroll} onWheel={cancelSettle} onTouchMove={cancelSettle} onKeyDown={cancelSettle} onPointerDown={cancelSettle}>
-        {props.page?.has_more_before && <button className="load-older" disabled={loadingOlder} onClick={() => void loadOlder()}>{loadingOlder ? 'Loading earlier messages…' : 'Load earlier messages'}</button>}
-        {!props.page && <MessageSkeleton />}
-				{conversationEntries.map((entry) => entry.kind === 'message'
-					? <Message key={entry.item.id} item={entry.item} sessionID={props.sessionID ?? ''} onResend={entry.item === trailingUserItem ? handleResend : undefined} resendPending={resendPending} />
-					: <HistoricalProcess key={entry.id} entry={entry} sessionNames={props.sessionNames} workspaceRoot={safeDetail?.created_cwd} />)}
-        {props.activeRun && <ActiveRunView run={props.activeRun} onCancelTool={props.onCancelTool} sessionNames={props.sessionNames} workspaceRoot={safeDetail?.created_cwd} />}
-        {props.compacting && <CompactionStatus trigger="manual" status="running" />}
-		{props.turnError && (
-			<div className="turn-error" role="alert">
-				<WarningIcon />
-				<div className="turn-error-copy">
-					<strong>Turn failed</strong>
-					<p>{props.turnError.message}</p>
-				</div>
-				<button className="message-tool-button" onClick={props.onRetry} title="Retry last turn"><RetryIcon />Retry</button>
-				<button className="turn-error-dismiss" onClick={props.onDismissTurnError} aria-label="Dismiss error" title="Dismiss">×</button>
-			</div>
-		)}
-	{props.activeRun?.status === 'error_pending_refresh' && (
-		<div className="turn-error" role="alert">
-			<WarningIcon />
-			<div className="turn-error-copy">
-				<strong>Refresh needed</strong>
-				<p>The session state may be outdated. Refresh to see the latest.</p>
-			</div>
-			<button className="message-tool-button" onClick={props.onRetryRefresh} title="Refresh session">Refresh</button>
-		</div>
-	)}
-		{!props.turnError && safeDetail?.status === 'interrupted' && !props.activeRun && (
-			<div className="turn-error" role="alert">
-				<WarningIcon />
-				<div className="turn-error-copy">
-					<strong>Session interrupted</strong>
-					<p>The last turn did not complete. You can retry it.</p>
-				</div>
-				<button className="turn-error-dismiss" onClick={props.onDismissTurnError} aria-label="Dismiss" title="Dismiss">×</button>
-			</div>
-		)}
-		{props.page && visibleItems.length === 0 && !props.activeRun && (
-          <div className="conversation-empty"><SparkIcon /><h3>Start a new task</h3><p>Describe a goal, a problem, or the code you want to change.</p></div>
-        )}
-		{safeDetail?.status === 'interrupted' && !props.activeRun && !props.turnError && (
-          <div className="conversation-retry">
-            <button className="message-tool-button" onClick={props.onRetry} title="Retry last turn"><RetryIcon />Retry last turn</button>
-          </div>
-        )}
-      </section>
+		<VirtualConversationList
+			sessionID={props.sessionID}
+			rows={conversationRows}
+			header={listHeader}
+			footer={listFooter}
+			emptyPlaceholder={!props.page ? <MessageSkeleton /> : conversationRows.length === 0 ? conversationEmpty : undefined}
+			renderRow={renderRow}
+			followOutput={followOutput}
+			onInteraction={markScrollInteraction}
+			onAtBottomStateChange={handleAtBottomStateChange}
+			onTotalListHeightChanged={handleTotalListHeightChanged}
+			onVirtuosoRef={handleVirtuosoRef}
+		/>
 	  <QueuedPromptList
 		prompts={props.activeRun?.queuedPrompts ?? []}
 		onRemove={props.onRemoveQueuedPrompt}
@@ -505,23 +421,76 @@ function CostUsage(props: { pricing?: Session['pricing']; context: Session['cont
 	)
 }
 
+type ConversationRowRenderProps = {
+	sessionID: string
+	sessionNames?: Record<string, string>
+	workspaceRoot?: string
+	onCancelTool?: (toolCallID: string) => void
+	onResend: (item: SessionItem) => void
+	trailingUserItem: SessionItem | null
+	resendPending: boolean
+	onRetry: () => void
+	onRetryRefresh: () => void
+	onDismissTurnError: () => void
+}
+
+function renderConversationRow(row: ConversationRow, props: ConversationRowRenderProps) {
+	switch (row.kind) {
+		case 'message':
+			return <Message key={row.key} item={row.item} sessionID={props.sessionID} onResend={row.item === props.trailingUserItem ? props.onResend : undefined} resendPending={props.resendPending} />
+		case 'compaction':
+			return <CompactionRecord key={row.key} item={row.item} />
+		case 'process':
+			return <HistoricalProcess key={row.key} entry={row} sessionNames={props.sessionNames} workspaceRoot={props.workspaceRoot} />
+		case 'active-user':
+			return <ActiveUserRow key={row.key} row={row} />
+		case 'active-process':
+			return <ActiveProcessRow key={row.key} row={row} onCancelTool={props.onCancelTool} sessionNames={props.sessionNames} workspaceRoot={props.workspaceRoot} />
+		case 'active-compaction':
+			return <CompactionStatus key={row.key} trigger={row.compaction.trigger} status={row.compaction.status} activeContextTokens={row.compaction.activeContextTokens} contextWindow={row.compaction.contextWindow} />
+		case 'provider-retry':
+			return <ProviderRetryStatus key={row.key} retry={row.retry} />
+		case 'manual-compaction':
+			return <CompactionStatus key={row.key} trigger="manual" status="running" />
+		case 'turn-error':
+			return <TurnErrorRow key={row.key} message={row.message} onRetry={props.onRetry} onDismiss={props.onDismissTurnError} />
+		case 'refresh-error':
+			return <RefreshErrorRow key={row.key} onRetryRefresh={props.onRetryRefresh} />
+		case 'interrupted':
+			return <InterruptedRow key={row.key} onDismiss={props.onDismissTurnError} />
+		case 'bottom-spacer':
+			return <div className="messages-bottom-padding" aria-hidden="true" />
+	}
+}
+
 const Message = memo(function Message({ item, sessionID, onResend, resendPending }: { item: SessionItem; sessionID: string; onResend?: (item: SessionItem) => void; resendPending?: boolean }) {
+	const [copyStatus, setCopyStatus] = useState<'idle' | 'copied' | 'error'>('idle')
+	const copyResetTimerRef = useRef<number | null>(null)
+	useEffect(() => () => {
+		if (copyResetTimerRef.current !== null) window.clearTimeout(copyResetTimerRef.current)
+	}, [])
   // A compaction record is the durable divider marking where earlier
   // messages were summarized; it renders as one muted line, not a bubble.
   if (item.kind === 'compaction') return <CompactionRecord item={item} />
   const role = item.message?.role
   const text = item.message?.content?.inline || item.message?.content?.preview || ''
   const images = item.message?.images ?? []
-	const [copyStatus, setCopyStatus] = useState<'idle' | 'copied' | 'error'>('idle')
   if (!text && images.length === 0) return null
 	const copyMessage = async () => {
+		const resetCopyStatus = (delay: number) => {
+			if (copyResetTimerRef.current !== null) window.clearTimeout(copyResetTimerRef.current)
+			copyResetTimerRef.current = window.setTimeout(() => {
+				copyResetTimerRef.current = null
+				setCopyStatus('idle')
+			}, delay)
+		}
 		try {
 			await copyText(text)
 			setCopyStatus('copied')
-			window.setTimeout(() => setCopyStatus('idle'), 1600)
+			resetCopyStatus(1600)
 		} catch {
 			setCopyStatus('error')
-			window.setTimeout(() => setCopyStatus('idle'), 2200)
+			resetCopyStatus(2200)
 		}
 	}
   return (
@@ -577,6 +546,23 @@ function StoredImageAttachment(props: { sessionID: string; image: SessionImageAt
   if (failed) return <div className="message-image-unavailable">Image unavailable</div>
   if (!dataURL) return <div className="message-image-loading">Loading image…</div>
   return <img className="message-image" src={dataURL} alt={`Attached image (${props.image.media_type})`} />
+}
+
+type ActiveUserRowModel = Extract<ConversationRow, { kind: 'active-user' }>
+
+function ActiveUserRow({ row }: { row: ActiveUserRowModel }) {
+	return (
+		<article className="message user transient">
+			<div className="message-content">
+				{row.text && <div className="message-text">{row.text}</div>}
+				{(row.images?.length ?? 0) > 0 && (
+					<div className="message-image-grid" aria-label="Attached images">
+						{row.images?.map((image, index) => <img className="message-image" src={image.data_url} alt={`Image to send #${index + 1}`} key={`${row.key}:image:${index}`} />)}
+					</div>
+				)}
+			</div>
+		</article>
+	)
 }
 
 function QueuedPromptList({ prompts, onRemove, onSteer, onMove }: {
@@ -635,42 +621,49 @@ function QueuedPromptList({ prompts, onRemove, onSteer, onMove }: {
   )
 }
 
-function ActiveRunView({ run, onCancelTool, sessionNames, workspaceRoot }: { run: ActiveRun; onCancelTool?: (toolCallID: string) => void; sessionNames?: Record<string, string>; workspaceRoot?: string }) {
-  return (
-    <>
-      {(run.userText || (run.userImages?.length ?? 0) > 0) && (
-        <article className="message user transient">
-          <div className="message-content">
-            {run.userText && <div className="message-text">{run.userText}</div>}
-            {(run.userImages?.length ?? 0) > 0 && (
-              <div className="message-image-grid" aria-label="Attached images">
-                {run.userImages?.map((image, index) => <img className="message-image" src={image.data_url} alt={`Image to send #${index + 1}`} key={`${image.data_url}-${index}`} />)}
-              </div>
-            )}
-          </div>
-        </article>
-      )}
-      {run.compaction && <CompactionStatus trigger={run.compaction.trigger} status={run.compaction.status} activeContextTokens={run.compaction.activeContextTokens} contextWindow={run.compaction.contextWindow} />}
-      <ActiveRunBody run={run} onCancelTool={onCancelTool} sessionNames={sessionNames} workspaceRoot={workspaceRoot} />
-      {run.providerRetry && <ProviderRetryStatus key={run.providerRetry.attempt} retry={run.providerRetry} />}
-    </>
-  )
+type ActiveProcessRowModel = Extract<ConversationRow, { kind: 'active-process' }>
+
+function ActiveProcessRow({ row, onCancelTool, sessionNames, workspaceRoot }: { row: ActiveProcessRowModel; onCancelTool?: (toolCallID: string) => void; sessionNames?: Record<string, string>; workspaceRoot?: string }) {
+	const run = row.run
+	// Streaming text soft-seals the live tail: once the model starts writing,
+	// the trailing tool group collapses instead of staying open until the
+	// output step flushes at the next tool call (or until the run settles).
+	const textStreaming = Boolean(run.assistantText)
+	const running = run.status === 'running'
+	const tokenNote = row.isLast && run.totalTokens !== undefined && (
+		<div className="token-note">
+			This turn: {run.totalTokens.toLocaleString()} tokens
+			{Boolean(run.cachedTokens) && ` · Cache hit ${run.cachedTokens?.toLocaleString()}`}
+			{Boolean(run.cacheWriteTokens) && ` · Cache write ${run.cacheWriteTokens?.toLocaleString()}`}
+			{Boolean(run.reasoningTokens) && ` · Reasoning ${run.reasoningTokens?.toLocaleString()}`}
+		</div>
+	)
+	return (
+		<article className="message assistant transient">
+			<div className="message-content">
+				{row.isLast && <div className="message-meta"><span className="streaming-label"><i />Generating</span></div>}
+				<ProcessTimeline steps={row.steps} live={row.isLast && running && !textStreaming} onCancelTool={onCancelTool} sessionNames={sessionNames} workspaceRoot={workspaceRoot} />
+				{row.isLast && run.assistantText && <MarkdownMessage text={run.assistantText} streaming cursor={running} />}
+				{row.isLast && running && !run.assistantText && <div className="message-text assistant-stream"><span className="cursor" /></div>}
+				{tokenNote}
+			</div>
+		</article>
+	)
 }
 
 // ProviderRetryStatus counts down the backoff delay, then switches to a
-// "reconnecting" label while the retry attempt itself is in flight. The
-// component is keyed by attempt, so a new provider.retrying event restarts
-// the countdown from the new delay.
+// "reconnecting" label while the retry attempt itself is in flight.
 function ProviderRetryStatus({ retry }: { retry: NonNullable<ActiveRun['providerRetry']> }) {
   const [remainingMS, setRemainingMS] = useState(() => Math.max(0, retry.delayMS))
   useEffect(() => {
+    setRemainingMS(Math.max(0, retry.delayMS))
     if (retry.delayMS <= 0) return
     const startedAt = Date.now()
     const timer = window.setInterval(() => {
       setRemainingMS(Math.max(0, retry.delayMS - (Date.now() - startedAt)))
     }, 250)
     return () => window.clearInterval(timer)
-  }, [retry.delayMS])
+  }, [retry.attempt, retry.delayMS])
   const waiting = remainingMS > 0
   return (
     <div className="provider-retry-status" role="status">
@@ -694,64 +687,44 @@ function CompactionStatus({ trigger, status, activeContextTokens, contextWindow 
   return <div className={`compaction-status ${status}`} role="status"><span />{detail}</div>
 }
 
-// ActiveRunBody renders the in-flight turn. Mid-turn appended user messages
-// interrupt the assistant process: the steps gathered before an appended user
-// message form one assistant segment, the appended message renders as its own
-// user bubble, and the remaining steps continue in a following assistant
-// segment. The streaming text and token note live in the trailing segment.
-function ActiveRunBody({ run, onCancelTool, sessionNames, workspaceRoot }: { run: ActiveRun; onCancelTool?: (toolCallID: string) => void; sessionNames?: Record<string, string>; workspaceRoot?: string }) {
-  const segments = useMemo(() => buildActiveRunSegments(run.steps), [run.steps])
-  const displaySegments = segments.length > 0 ? segments : [{ kind: 'steps' as const, steps: [] }]
-
-  // Streaming text soft-seals the live tail: once the model starts writing,
-  // the trailing tool group collapses instead of staying open until the
-  // output step flush at the next tool call (or until the run settles).
-  const textStreaming = Boolean(run.assistantText)
-  // The cursor tracks the turn, not the text: it stays visible for the whole
-  // run — while the model writes, while tools run between iterations, and
-  // before the first usage update — and only stops once the run leaves the
-  // running state (settled, failed, cancelled, or reconciling).
-  const running = run.status === 'running'
-  const tokenNote = run.totalTokens !== undefined && (
-    <div className="token-note">
-      This turn: {run.totalTokens.toLocaleString()} tokens
-      {Boolean(run.cachedTokens) && ` · Cache hit ${run.cachedTokens?.toLocaleString()}`}
-      {Boolean(run.cacheWriteTokens) && ` · Cache write ${run.cacheWriteTokens?.toLocaleString()}`}
-      {Boolean(run.reasoningTokens) && ` · Reasoning ${run.reasoningTokens?.toLocaleString()}`}
-    </div>
-  )
-
-  return (
-    <>
-      {displaySegments.map((segment, index) => {
-        const isLast = index === displaySegments.length - 1
-        if (segment.kind === 'user') return <article className="message user transient" key={segment.step.id}><div className="message-content"><div className="message-text">{segment.step.text}</div></div></article>
-        return <article className="message assistant transient" key={`steps-${index}`}><div className="message-content">
-          {isLast && <div className="message-meta"><span className="streaming-label"><i />Generating</span></div>}
-          <ProcessTimeline steps={segment.steps} live={isLast && run.status === 'running' && !textStreaming} onCancelTool={onCancelTool} sessionNames={sessionNames} workspaceRoot={workspaceRoot} />
-          {isLast && run.assistantText && <MarkdownMessage text={run.assistantText} streaming cursor={running} />}
-          {isLast && running && !run.assistantText && <div className="message-text assistant-stream"><span className="cursor" /></div>}
-          {isLast && tokenNote}
-        </div></article>
-      })}
-    </>
-  )
+function TurnErrorRow({ message, onRetry, onDismiss }: { message: string; onRetry: () => void; onDismiss: () => void }) {
+	return (
+		<div className="turn-error" role="alert">
+			<WarningIcon />
+			<div className="turn-error-copy">
+				<strong>Turn failed</strong>
+				<p>{message}</p>
+			</div>
+			<button className="message-tool-button" onClick={onRetry} title="Retry last turn"><RetryIcon />Retry</button>
+			<button className="turn-error-dismiss" onClick={onDismiss} aria-label="Dismiss error" title="Dismiss">×</button>
+		</div>
+	)
 }
 
-function buildActiveRunSegments(steps: RunStep[]) {
-  const segments: Array<{ kind: 'steps'; steps: RunStep[] } | { kind: 'user'; step: Extract<RunStep, { kind: 'user' }> }> = []
-  let current: RunStep[] = []
-  for (const step of steps) {
-    if (step.kind === 'user') {
-      if (current.length > 0) segments.push({ kind: 'steps', steps: current })
-      current = []
-      segments.push({ kind: 'user', step })
-    } else {
-      current.push(step)
-    }
-  }
-  if (current.length > 0) segments.push({ kind: 'steps', steps: current })
-  return segments
+function RefreshErrorRow({ onRetryRefresh }: { onRetryRefresh: () => void }) {
+	return (
+		<div className="turn-error" role="alert">
+			<WarningIcon />
+			<div className="turn-error-copy">
+				<strong>Refresh needed</strong>
+				<p>The session state may be outdated. Refresh to see the latest.</p>
+			</div>
+			<button className="message-tool-button" onClick={onRetryRefresh} title="Refresh session">Refresh</button>
+		</div>
+	)
+}
+
+function InterruptedRow({ onDismiss }: { onDismiss: () => void }) {
+	return (
+		<div className="turn-error" role="alert">
+			<WarningIcon />
+			<div className="turn-error-copy">
+				<strong>Session interrupted</strong>
+				<p>The last turn did not complete. You can retry it.</p>
+			</div>
+			<button className="turn-error-dismiss" onClick={onDismiss} aria-label="Dismiss" title="Dismiss">×</button>
+		</div>
+	)
 }
 
 // CompactionRecord renders the durable compaction marker as a subtle
@@ -780,102 +753,7 @@ function MarkdownMessage({ text, streaming = false, cursor = false }: { text: st
   )
 }
 
-type ConversationEntry =
-	| { kind: 'message'; item: SessionItem }
-	| { kind: 'process'; id: string; createdAt: string; lastSeq: number; steps: RunStep[] }
-
-function buildConversationEntries(items: SessionItem[], sessionID: string, recentStepsByTurn: Record<string, RunStep[]>): ConversationEntry[] {
-	const entries: ConversationEntry[] = []
-	let steps: RunStep[] = []
-	let processCreatedAt = ''
-	let processTurnID = ''
-	let processLastSeq = 0
-	let agentIteration = 0
-	const emittedRecentTurns = new Set<string>()
-
-	const flushProcess = (turnID = processTurnID) => {
-		const recentKey = turnID ? processKey(sessionID, turnID) : ''
-		const recentSteps = recentKey && !emittedRecentTurns.has(recentKey) ? recentStepsByTurn[recentKey] : undefined
-		const displayedSteps = recentSteps?.length ? recentSteps : steps
-		if (displayedSteps.length > 0) {
-			// The id must stay unique per group: a mid-turn user message or a
-			// compaction record splits one turn into several process groups.
-			// The id must stay unique per group: a mid-turn user message or a
-			// compaction record splits one turn into several process groups.
-			entries.push({ kind: 'process', id: `process-${sessionID}-${turnID || displayedSteps[0].id}-${processLastSeq}`, createdAt: processCreatedAt, lastSeq: processLastSeq, steps: displayedSteps })
-		}
-		if (recentKey && recentSteps?.length) emittedRecentTurns.add(recentKey)
-		steps = []
-		processCreatedAt = ''
-		processTurnID = ''
-		processLastSeq = 0
-	}
-
-	for (const item of items) {
-		const role = item.message?.role
-		const text = itemText(item)
-		if (role === 'user') {
-			const itemTurnID = item.turn_id || ''
-			// A user item sharing the in-progress process turn id is a mid-turn
-			// appended message: it interrupts the process. Flush the steps gathered
-			// so far into their own process entry, render the user message as a
-			// regular bubble, then keep accumulating the rest of the same turn into
-			// a fresh process entry.
-			if (processTurnID && itemTurnID && itemTurnID === processTurnID) {
-				flushProcess(processTurnID)
-				processTurnID = itemTurnID
-				entries.push({ kind: 'message', item })
-				continue
-			}
-			flushProcess(processTurnID)
-			processTurnID = itemTurnID
-			agentIteration = 0
-			entries.push({ kind: 'message', item })
-			continue
-		}
-		if (role === 'assistant' && (item.message?.tool_calls?.length ?? 0) > 0) {
-			agentIteration = item.agent_iteration || agentIteration + 1
-			if (!processCreatedAt) processCreatedAt = item.created_at
-			if (!processTurnID) processTurnID = item.turn_id || ''
-			processLastSeq = item.seq
-			if (text) steps.push({ kind: 'output', id: `${item.id}-output`, text, iteration: agentIteration })
-			for (const toolCall of item.message?.tool_calls ?? []) {
-				steps.push({
-					kind: 'tool',
-					id: toolCall.id,
-					name: toolCall.name,
-					iteration: agentIteration,
-					arguments: toolCall.arguments,
-					status: 'requested',
-				})
-			}
-			continue
-		}
-		if (role === 'tool') {
-			agentIteration = item.agent_iteration || agentIteration || 1
-			if (!processCreatedAt) processCreatedAt = item.created_at
-			if (!processTurnID) processTurnID = item.turn_id || ''
-			processLastSeq = item.seq
-			const toolCallID = item.message?.tool_call_id || item.id
-			const index = steps.findIndex((step) => step.kind === 'tool' && step.id === toolCallID)
-			const status: ToolActivity['status'] = item.message?.is_error || item.status === 'error' ? 'error' : item.status === 'pending' ? 'requested' : 'finished'
-			if (index >= 0) {
-				const tool = steps[index] as ToolActivity
-				steps[index] = { ...tool, result: text, status }
-			} else {
-				steps.push({ kind: 'tool', id: toolCallID, name: 'tool', iteration: agentIteration, result: text, status })
-			}
-			continue
-		}
-		if (!processCreatedAt) processCreatedAt = item.created_at
-		flushProcess(item.turn_id || processTurnID)
-		if (text) entries.push({ kind: 'message', item })
-	}
-	flushProcess(processTurnID)
-	return entries
-}
-
-function HistoricalProcess({ entry, sessionNames, workspaceRoot }: { entry: Extract<ConversationEntry, { kind: 'process' }>; sessionNames?: Record<string, string>; workspaceRoot?: string }) {
+function HistoricalProcess({ entry, sessionNames, workspaceRoot }: { entry: Extract<ConversationRow, { kind: 'process' }>; sessionNames?: Record<string, string>; workspaceRoot?: string }) {
 	return (
 		<article className="message assistant process-message" data-seq={entry.lastSeq}>
 			<div className="message-content">

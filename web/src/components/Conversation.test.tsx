@@ -1,11 +1,67 @@
 // @vitest-environment jsdom
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { act, cleanup, render, screen, fireEvent } from '@testing-library/react'
+import type { ReactElement } from 'react'
+
+// VirtuosoMockContext deliberately renders only the mocked viewport range.
+// Conversation tests assert row rendering, rather than virtualization, so use
+// a small deterministic implementation that expands every item and exposes
+// the imperative methods the production wrapper calls.
+vi.mock('react-virtuoso', async () => {
+  const React = await import('react')
+  const MockVirtuoso = React.forwardRef<any, any>(function MockVirtuoso(props, ref) {
+    const scrollerRef = React.useRef<HTMLDivElement | null>(null)
+    const handle = React.useMemo(() => ({
+      autoscrollToBottom: () => {},
+      getState: (callback: (state: { ranges: []; scrollTop: number }) => void) => callback({ ranges: [], scrollTop: scrollerRef.current?.scrollTop ?? 0 }),
+      scrollBy: (location: ScrollToOptions) => scrollerRef.current?.scrollBy(location),
+      scrollIntoView: () => {},
+      scrollTo: (location: ScrollToOptions) => scrollerRef.current?.scrollTo(location),
+      scrollToIndex: () => {},
+    }), [])
+    React.useImperativeHandle(ref, () => handle, [handle])
+    React.useEffect(() => {
+      props.scrollerRef?.(scrollerRef.current)
+      props.atBottomStateChange?.(true)
+      return () => props.scrollerRef?.(null)
+    }, [props.atBottomStateChange, props.scrollerRef])
+
+    const Scroller = props.components?.Scroller ?? 'div'
+    const Header = props.components?.Header
+    const Footer = props.components?.Footer
+    const List = props.components?.List ?? 'div'
+    const EmptyPlaceholder = props.components?.EmptyPlaceholder
+    const data = props.data ?? []
+    return React.createElement(
+      Scroller,
+      { ref: scrollerRef },
+      Header ? React.createElement(Header) : null,
+      React.createElement(
+        List,
+        null,
+        data.length > 0
+          ? data.map((row: unknown, index: number) => React.createElement(React.Fragment, { key: props.computeItemKey?.(index, row) ?? index }, props.itemContent?.(index, row)))
+          : EmptyPlaceholder ? React.createElement(EmptyPlaceholder) : null,
+      ),
+      Footer ? React.createElement(Footer) : null,
+    )
+  })
+  return { Virtuoso: MockVirtuoso }
+})
+
 import { Conversation } from './Conversation'
 import type { ActiveRun, ItemsPage, Session } from '../types'
 import { emptyComposerDraft } from './Composer'
 
 afterEach(cleanup)
+
+function renderConversation(ui: ReactElement) {
+  const result = render(ui)
+  return {
+    ...result,
+    rerender: (next: ReactElement) => result.rerender(next),
+  }
+}
 
 const session = (id: string): Session => ({
   id, project_id: 'p', display_name: `Session ${id}`, last_seq: 0,
@@ -49,13 +105,13 @@ const baseProps = {
 describe('Conversation identity boundary', () => {
   it('renders detail when sessionID matches detail.id', () => {
     const detail = session('s1')
-    render(<Conversation {...baseProps} sessionID="s1" detail={detail} />)
+    renderConversation(<Conversation {...baseProps} sessionID="s1" detail={detail} />)
     expect(screen.getByText('Session s1')).toBeDefined()
   })
 
   it('shows the session debug button and opens the configured handler', () => {
     const onDebug = vi.fn()
-    render(<Conversation {...baseProps} onDebug={onDebug} sessionID="s1" detail={session('s1')} />)
+    renderConversation(<Conversation {...baseProps} onDebug={onDebug} sessionID="s1" detail={session('s1')} />)
     fireEvent.click(screen.getByRole('button', { name: /Debug/ }))
     expect(onDebug).toHaveBeenCalledTimes(1)
   })
@@ -74,7 +130,7 @@ describe('Conversation identity boundary', () => {
         total_requests: 2,
       },
     } as Session
-    render(<Conversation {...baseProps} sessionID="s1" detail={detail} />)
+    renderConversation(<Conversation {...baseProps} sessionID="s1" detail={detail} />)
     expect(screen.getByText('Cost')).toBeDefined()
     expect(screen.getByText('API requests')).toBeDefined()
     expect(screen.getByText('Tokens')).toBeDefined()
@@ -82,7 +138,7 @@ describe('Conversation identity boundary', () => {
 
   it('does not render stale detail when sessionID does not match', () => {
     const detail = session('old')
-    render(<Conversation {...baseProps} sessionID="new" detail={detail} />)
+    renderConversation(<Conversation {...baseProps} sessionID="new" detail={detail} />)
     // safeDetail is null → shows "Loading…" not the stale session name
     expect(screen.getByText('Loading…')).toBeDefined()
   })
@@ -93,7 +149,7 @@ describe('Conversation identity boundary', () => {
       id: 'run-1', sessionID: 's1', userText: '', assistantText: '', steps: [],
       agentIteration: 0, status: 'error_pending_refresh',
     }
-    render(<Conversation {...baseProps} sessionID="s1" detail={detail} activeRun={run} />)
+    renderConversation(<Conversation {...baseProps} sessionID="s1" detail={detail} activeRun={run} />)
     expect(screen.getByText('Refresh')).toBeDefined()
     expect(screen.getByTitle('Refresh session')).toBeDefined()
   })
@@ -108,7 +164,7 @@ describe('Conversation identity boundary', () => {
       ],
       oldest_seq: 1, newest_seq: 3, has_more_before: false, has_more_after: false,
     }
-    const { container } = render(<Conversation {...baseProps} sessionID="s1" detail={detail} page={page} />)
+    const { container } = renderConversation(<Conversation {...baseProps} sessionID="s1" detail={detail} page={page} />)
     const record = screen.getByText('Context compacted automatically')
     expect(record.closest('.compaction-record')).not.toBeNull()
     expect(record.closest('.message')).toBeNull()
@@ -141,7 +197,7 @@ describe('Conversation identity boundary', () => {
     }
     const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
     try {
-      const { container } = render(<Conversation {...baseProps} sessionID="s1" detail={detail} page={page} />)
+      const { container } = renderConversation(<Conversation {...baseProps} sessionID="s1" detail={detail} page={page} />)
       expect(container.querySelectorAll('.process-message')).toHaveLength(2)
       expect(screen.getByText('Context compacted automatically').closest('.compaction-record')).not.toBeNull()
       const keyWarnings = errorSpy.mock.calls.filter((args) => String(args[0]).includes('same key'))
@@ -160,7 +216,7 @@ describe('Conversation identity boundary', () => {
         agentIteration: 1, status: 'running',
         providerRetry: { attempt: 3, maxAttempts: 5, delayMS: 10000 },
       }
-      render(<Conversation {...baseProps} sessionID="s1" detail={detail} activeRun={run} />)
+      renderConversation(<Conversation {...baseProps} sessionID="s1" detail={detail} activeRun={run} />)
       expect(screen.getByText(/Retrying request 3 of 5 in 10s/)).toBeDefined()
       act(() => { vi.advanceTimersByTime(4100) })
       expect(screen.getByText(/Retrying request 3 of 5 in 6s/)).toBeDefined()
@@ -181,7 +237,7 @@ describe('Conversation identity boundary', () => {
         agentIteration: 1, status: 'running',
         providerRetry: { attempt: 3, maxAttempts: 5, delayMS: 10000 },
       }
-      const { rerender } = render(<Conversation {...baseProps} sessionID="s1" detail={detail} activeRun={run} />)
+      const { rerender } = renderConversation(<Conversation {...baseProps} sessionID="s1" detail={detail} activeRun={run} />)
       act(() => { vi.advanceTimersByTime(5000) })
       expect(screen.getByText(/in 5s/)).toBeDefined()
       // The retried connection failed again: attempt 4 with a fresh 20s delay.
@@ -199,7 +255,7 @@ describe('Conversation identity boundary', () => {
       id: 'run-1', sessionID: 's1', userText: 'hi', assistantText: '', steps: [],
       agentIteration: 0, status: 'running',
     }
-    render(<Conversation {...baseProps} sessionID="s1" detail={detail} activeRun={run} />)
+    renderConversation(<Conversation {...baseProps} sessionID="s1" detail={detail} activeRun={run} />)
     expect(screen.queryByText('Refresh session')).toBeNull()
   })
 })
@@ -216,7 +272,7 @@ describe('Conversation queued prompt list', () => {
       { id: 'ap-2', content: 'priority', steer: true },
       { id: 'ap-1', content: 'plain' },
     ])
-    render(<Conversation {...baseProps} sessionID="s1" detail={detail} activeRun={run} />)
+    renderConversation(<Conversation {...baseProps} sessionID="s1" detail={detail} activeRun={run} />)
     const list = screen.getByLabelText('Queued messages')
     const badges = Array.from(list.querySelectorAll('.queued-prompt-badge')).map((badge) => badge.textContent)
     expect(badges).toEqual(['Steer', 'Queued'])
@@ -234,7 +290,7 @@ describe('Conversation queued prompt list', () => {
       { id: 'ap-2', content: 'priority', steer: true },
       { id: 'ap-1', content: 'plain' },
     ])
-    render(<Conversation {...baseProps} sessionID="s1" detail={detail} activeRun={run} onSteerQueuedPrompt={onSteerQueuedPrompt} />)
+    renderConversation(<Conversation {...baseProps} sessionID="s1" detail={detail} activeRun={run} onSteerQueuedPrompt={onSteerQueuedPrompt} />)
     fireEvent.click(screen.getByRole('button', { name: 'Promote to steer message' }))
     expect(onSteerQueuedPrompt).toHaveBeenCalledWith('ap-1', true)
     fireEvent.click(screen.getByRole('button', { name: 'Demote to queued message' }))
@@ -249,7 +305,7 @@ describe('Conversation queued prompt list', () => {
       { id: 'ap-1', content: 'plain one' },
       { id: 'ap-2', content: 'plain two' },
     ])
-    render(<Conversation {...baseProps} sessionID="s1" detail={detail} activeRun={run} onMoveQueuedPrompt={onMoveQueuedPrompt} />)
+    renderConversation(<Conversation {...baseProps} sessionID="s1" detail={detail} activeRun={run} onMoveQueuedPrompt={onMoveQueuedPrompt} />)
     const ups = screen.getAllByRole('button', { name: 'Move queued message up' }) as HTMLButtonElement[]
     const downs = screen.getAllByRole('button', { name: 'Move queued message down' }) as HTMLButtonElement[]
     expect(ups).toHaveLength(3)
@@ -276,7 +332,7 @@ describe('Conversation streaming cursor', () => {
   })
 
   it('shows the cursor after streaming text while the turn is running', () => {
-    const { container } = render(<Conversation {...baseProps} sessionID="s1" detail={session('s1')}
+    const { container } = renderConversation(<Conversation {...baseProps} sessionID="s1" detail={session('s1')}
       activeRun={runWith({ assistantText: 'partial output' })} />)
     const stream = container.querySelector('.assistant-stream')
     expect(stream).not.toBeNull()
@@ -284,13 +340,13 @@ describe('Conversation streaming cursor', () => {
   })
 
   it('keeps the cursor visible between iterations when tools run before any usage update', () => {
-    const { container } = render(<Conversation {...baseProps} sessionID="s1" detail={session('s1')}
+    const { container } = renderConversation(<Conversation {...baseProps} sessionID="s1" detail={session('s1')}
       activeRun={runWith({ steps: [{ kind: 'tool', id: 't1', name: 'shell', iteration: 1, status: 'running' }] })} />)
     expect(container.querySelector('.cursor')).not.toBeNull()
   })
 
   it('hides the cursor once the run leaves the running state', () => {
-    const { container, rerender } = render(<Conversation {...baseProps} sessionID="s1" detail={session('s1')}
+    const { container, rerender } = renderConversation(<Conversation {...baseProps} sessionID="s1" detail={session('s1')}
       activeRun={runWith({ assistantText: 'partial output', status: 'reconciling' })} />)
     expect(container.querySelector('.cursor')).toBeNull()
     rerender(<Conversation {...baseProps} sessionID="s1" detail={session('s1')}
