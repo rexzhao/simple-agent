@@ -16,3 +16,4 @@ export const ToolIcon = () => <svg viewBox="0 0 24 24" aria-hidden="true"><path 
 export const FolderIcon = () => <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 6h7l2 2h9v11H3V6Z" /></svg>
 export const SparkIcon = () => <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m12 2 1.6 6.4L20 10l-6.4 1.6L12 18l-1.6-6.4L4 10l6.4-1.6L12 2Z" /></svg>
 export const SettingsIcon = () => <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3" /><path d="M19 13.5v-3l-2-.7-.7-1.7.9-1.9-2.1-2.1-1.9.9-1.7-.7-.7-2h-3l-.7 2-1.7.7-1.9-.9-2.1 2.1.9 1.9-.7 1.7-2 .7v3l2 .7.7 1.7-.9 1.9 2.1 2.1 1.9-.9 1.7.7.7 2h3l.7-2 1.7-.7 1.9.9 2.1-2.1-.9-1.9.7-1.7 2-.7Z" /></svg>
+export const BugIcon = () => <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 5.5A3 3 0 0 1 15 5.5M7 9h10v6a5 5 0 0 1-10 0V9Z" /><path d="M4 10h3M17 10h3M4 15h3M17 15h3M9 3 7 1M15 3l2-2M9 21l-1 2M15 21l1 2" /></svg>

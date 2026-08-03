@@ -59,9 +59,12 @@ type ToolsConfig struct {
 }
 
 type LoggingConfig struct {
-	Path          string `json:"path" yaml:"path"`
-	Level         string `json:"level" yaml:"level"`
-	RequestBodies bool   `json:"request_bodies,omitempty" yaml:"request_bodies,omitempty"`
+	Path  string `json:"path" yaml:"path"`
+	Level string `json:"level" yaml:"level"`
+	// RequestBodies is retained as the default for newly created sessions and
+	// as a fallback for sessions written before debug settings became scoped to
+	// a conversation. The Web UI can override it per session.
+	RequestBodies bool `json:"request_bodies,omitempty" yaml:"request_bodies,omitempty"`
 }
 
 type SessionsConfig struct {

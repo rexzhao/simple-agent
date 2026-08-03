@@ -67,27 +67,28 @@ type NearestProjectOptions struct {
 }
 
 type SessionMetadata struct {
-	ID                string               `json:"id"`
-	CreatedAt         time.Time            `json:"created_at"`
-	UpdatedAt         time.Time            `json:"updated_at"`
-	DisplayName       string               `json:"display_name"`
-	CreatedBy         string               `json:"created_by"`
-	ParentSessionID   string               `json:"parent_session_id,omitempty"`
-	RootSessionID     string               `json:"root_session_id"`
-	SpawnDepth        int                  `json:"spawn_depth"`
-	Archived          bool                 `json:"archived"`
-	LastUsedAt        time.Time            `json:"last_used_at"`
-	InterruptedAt     time.Time            `json:"interrupted_at,omitempty"`
-	InterruptedTurnID string               `json:"interrupted_turn_id,omitempty"`
-	Provider          string               `json:"provider"`
-	ModelProfile      string               `json:"model_profile"`
-	ModelID           string               `json:"model_id"`
-	Pricing           *config.ModelPricing `json:"pricing,omitempty"`
-	Status            string               `json:"status"`
-	ProjectID         string               `json:"project_id"`
-	CreatedCWD        string               `json:"created_cwd"`
-	LastSeq           int64                `json:"last_seq"`
-	FullAccess        bool                 `json:"full_access"`
+	ID                string                 `json:"id"`
+	CreatedAt         time.Time              `json:"created_at"`
+	UpdatedAt         time.Time              `json:"updated_at"`
+	DisplayName       string                 `json:"display_name"`
+	CreatedBy         string                 `json:"created_by"`
+	ParentSessionID   string                 `json:"parent_session_id,omitempty"`
+	RootSessionID     string                 `json:"root_session_id"`
+	SpawnDepth        int                    `json:"spawn_depth"`
+	Archived          bool                   `json:"archived"`
+	LastUsedAt        time.Time              `json:"last_used_at"`
+	InterruptedAt     time.Time              `json:"interrupted_at,omitempty"`
+	InterruptedTurnID string                 `json:"interrupted_turn_id,omitempty"`
+	Provider          string                 `json:"provider"`
+	ModelProfile      string                 `json:"model_profile"`
+	ModelID           string                 `json:"model_id"`
+	Pricing           *config.ModelPricing   `json:"pricing,omitempty"`
+	Status            string                 `json:"status"`
+	ProjectID         string                 `json:"project_id"`
+	CreatedCWD        string                 `json:"created_cwd"`
+	LastSeq           int64                  `json:"last_seq"`
+	FullAccess        bool                   `json:"full_access"`
+	Debug             sessions.DebugSettings `json:"debug"`
 }
 
 type SessionDetail struct {
@@ -122,6 +123,7 @@ type SessionDetail struct {
 	FullAccess        bool                   `json:"full_access"`
 	Context           contextwindow.Metadata `json:"context"`
 	SaveToolResults   bool                   `json:"save_tool_results"`
+	Debug             sessions.DebugSettings `json:"debug"`
 }
 
 // SessionSnapshot is the single-load aggregate returned by the snapshot
@@ -152,6 +154,7 @@ type SessionCreateMetadata struct {
 	FullAccess      bool
 	Context         *contextwindow.Metadata
 	SaveToolResults *bool
+	Debug           *sessions.DebugSettings
 }
 
 type SessionListOptions struct {
@@ -682,6 +685,7 @@ func (s *Service) ListSessions(options SessionListOptions) ([]SessionMetadata, e
 		if err != nil {
 			return nil, err
 		}
+		session = s.hydrateSessionDebug(session)
 		items = append(items, sessionMetadataFromStore(session))
 	}
 	return items, nil
@@ -696,6 +700,7 @@ func (s *Service) GetSession(id string) (SessionDetail, error) {
 		return SessionDetail{}, err
 	}
 	session = s.hydrateSessionPricing(session)
+	session = s.hydrateSessionDebug(session)
 	return sessionDetailFromStore(session), nil
 }
 
@@ -712,6 +717,7 @@ func (s *Service) GetSessionSnapshot(id string) (SessionSnapshot, error) {
 		return SessionSnapshot{}, err
 	}
 	session = s.hydrateSessionPricing(session)
+	session = s.hydrateSessionDebug(session)
 	detail := sessionDetailFromStore(session)
 	history, err := s.buildItemsPage(session, 0, 0, defaultSessionChatItemsLimit, true)
 	if err != nil {
@@ -764,6 +770,29 @@ func (s *Service) SetSessionFullAccess(id string, fullAccess bool) (SessionDetai
 		return SessionDetail{}, fmt.Errorf("archived session cannot change full access mode")
 	}
 	session.FullAccess = fullAccess
+	saved, err := s.sessionStore.SaveMetadata(session)
+	if err != nil {
+		return SessionDetail{}, err
+	}
+	return sessionDetailFromStore(saved), nil
+}
+
+// SetSessionDebug updates diagnostics for one conversation. The setting is
+// read when a run prepares its provider, so changes take effect from the next
+// turn; an in-flight turn keeps the setting it started with.
+func (s *Service) SetSessionDebug(id string, debug sessions.DebugSettings) (SessionDetail, error) {
+	if s == nil || s.sessionStore == nil {
+		return SessionDetail{}, fmt.Errorf("execution session store is not configured")
+	}
+	session, err := s.sessionStore.Load(id)
+	if err != nil {
+		return SessionDetail{}, err
+	}
+	if session.Archived {
+		return SessionDetail{}, fmt.Errorf("archived session cannot change debug settings")
+	}
+	session.Debug = debug
+	session.DebugConfigured = true
 	saved, err := s.sessionStore.SaveMetadata(session)
 	if err != nil {
 		return SessionDetail{}, err
@@ -2229,6 +2258,10 @@ func applySessionCreateMetadata(session sessions.SessionV2, metadata SessionCrea
 	if metadata.SaveToolResults != nil {
 		session.SaveToolResults = *metadata.SaveToolResults
 	}
+	if metadata.Debug != nil {
+		session.Debug = *metadata.Debug
+		session.DebugConfigured = true
+	}
 	return session
 }
 
@@ -2274,6 +2307,7 @@ func sessionMetadataFromStore(session sessions.SessionV2) SessionMetadata {
 		CreatedCWD:        session.CreatedCWD,
 		LastSeq:           session.LastSeq,
 		FullAccess:        session.FullAccess,
+		Debug:             session.Debug,
 	}
 }
 
@@ -2298,6 +2332,28 @@ func (s *Service) hydrateSessionPricing(session sessions.SessionV2) sessions.Ses
 		return session
 	}
 	session.Pricing = copyModelPricing(resolved.Pricing)
+	return session
+}
+
+// hydrateSessionDebug exposes the legacy global request-body setting for
+// sessions written before debug settings became session-scoped. The fallback
+// is read-only: once the user saves a choice, DebugConfigured makes that
+// choice authoritative for the session.
+func (s *Service) hydrateSessionDebug(session sessions.SessionV2) sessions.SessionV2 {
+	if s == nil || session.DebugConfigured {
+		return session
+	}
+	configPath := session.RootConfigPath()
+	if strings.TrimSpace(configPath) == "" {
+		configPath = s.ConfigPath()
+	}
+	cfg, err := config.Load(configPath)
+	if err != nil {
+		return session
+	}
+	if cfg.Logging.RequestBodies {
+		session.Debug.RequestBodies = true
+	}
 	return session
 }
 
@@ -2332,6 +2388,7 @@ func sessionDetailFromStore(session sessions.SessionV2) SessionDetail {
 		EnabledSkills:     copyStrings(session.EnabledSkills),
 		ShowReasoning:     session.ShowReasoning,
 		FullAccess:        session.FullAccess,
+		Debug:             session.Debug,
 		Context:           session.Context,
 		SaveToolResults:   session.SaveToolResults,
 	}

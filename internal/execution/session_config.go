@@ -7,6 +7,7 @@ import (
 
 	"github.com/rexzhao/simple-agent/internal/config"
 	"github.com/rexzhao/simple-agent/internal/contextwindow"
+	"github.com/rexzhao/simple-agent/internal/sessions"
 )
 
 // ConfiguredSessionOptions selects the working directory and model used to
@@ -120,6 +121,7 @@ func (s *Service) CreateConfiguredSession(projectID string, options ConfiguredSe
 		ContextWindowSource:     string(window.Source),
 		WarningThresholdPercent: contextwindow.WarningThresholdPercent,
 	}
+	debugSettings := sessions.DebugSettings{RequestBodies: cfg.Logging.RequestBodies}
 
 	return s.CreateSession(project.ID, SessionCreateMetadata{
 		DisplayName:     strings.TrimSpace(options.DisplayName),
@@ -137,6 +139,7 @@ func (s *Service) CreateConfiguredSession(projectID string, options ConfiguredSe
 		EnabledSkills:   skillIDs(selectedSkills),
 		ShowReasoning:   &showReasoning,
 		FullAccess:      options.FullAccess,
+		Debug:           &debugSettings,
 		Context:         &contextMetadata,
 		SaveToolResults: &saveToolResults,
 	})
@@ -180,7 +183,12 @@ func (s *Service) CreateInheritedSession(parentID, displayName string) (SessionD
 		EnabledSkills:   copyStringSlice(parent.EnabledSkills),
 		ShowReasoning:   &showReasoning,
 		FullAccess:      parent.FullAccess,
+		Debug:           debugSettingsPointer(parent.Debug),
 		Context:         &contextMetadata,
 		SaveToolResults: &saveToolResults,
 	})
+}
+
+func debugSettingsPointer(settings sessions.DebugSettings) *sessions.DebugSettings {
+	return &settings
 }

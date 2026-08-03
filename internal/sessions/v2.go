@@ -101,6 +101,13 @@ type StoredContent struct {
 
 type BlobRef = model.BlobRef
 
+// DebugSettings contains diagnostics that are scoped to one conversation.
+// Keep this as a separate object so new per-session debug switches can be
+// added without changing the session API shape again.
+type DebugSettings struct {
+	RequestBodies bool `json:"request_bodies"`
+}
+
 type SessionV2 struct {
 	ID                   string                 `json:"id"`
 	Version              int                    `json:"version"`
@@ -134,6 +141,8 @@ type SessionV2 struct {
 	EnabledSkills        []string               `json:"enabled_skills,omitempty"`
 	ShowReasoning        bool                   `json:"show_reasoning"`
 	FullAccess           bool                   `json:"full_access,omitempty"`
+	Debug                DebugSettings          `json:"debug,omitempty"`
+	DebugConfigured      bool                   `json:"debug_configured,omitempty"`
 	InstructionsSnapshot []model.Message        `json:"instructions_snapshot,omitempty"`
 	InstructionSources   []InstructionSource    `json:"instruction_sources,omitempty"`
 	Items                []SessionItem          `json:"items,omitempty"`
@@ -1506,6 +1515,8 @@ type sessionV2Metadata struct {
 	EnabledSkills        []string               `json:"enabled_skills,omitempty"`
 	ShowReasoning        bool                   `json:"show_reasoning"`
 	FullAccess           bool                   `json:"full_access,omitempty"`
+	Debug                DebugSettings          `json:"debug,omitempty"`
+	DebugConfigured      bool                   `json:"debug_configured,omitempty"`
 	InstructionsSnapshot []model.Message        `json:"instructions_snapshot,omitempty"`
 	InstructionSources   []InstructionSource    `json:"instruction_sources,omitempty"`
 	Context              contextwindow.Metadata `json:"context,omitempty"`
@@ -1617,6 +1628,8 @@ func metadataFromSessionV2(session SessionV2) sessionV2Metadata {
 		EnabledSkills:        session.EnabledSkills,
 		ShowReasoning:        session.ShowReasoning,
 		FullAccess:           session.FullAccess,
+		Debug:                session.Debug,
+		DebugConfigured:      session.DebugConfigured,
 		InstructionsSnapshot: session.InstructionsSnapshot,
 		InstructionSources:   session.InstructionSources,
 		Context:              session.Context,
@@ -1655,6 +1668,8 @@ func (m sessionV2Metadata) session() SessionV2 {
 		EnabledSkills:        copyStrings(m.EnabledSkills),
 		ShowReasoning:        m.ShowReasoning,
 		FullAccess:           m.FullAccess,
+		Debug:                m.Debug,
+		DebugConfigured:      m.DebugConfigured,
 		InstructionsSnapshot: copyMessages(m.InstructionsSnapshot),
 		InstructionSources:   copyInstructionSources(m.InstructionSources),
 		Context:              m.Context,

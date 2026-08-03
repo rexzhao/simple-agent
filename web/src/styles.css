@@ -593,6 +593,12 @@ svg { width: 1.1em; height: 1.1em; fill: none; stroke: currentColor; stroke-widt
 .reasoning-choice { display: grid; grid-template-columns: 105px minmax(0, 180px) minmax(0, 1fr); gap: 10px; align-items: center; padding: 12px 22px; border-top: 2px solid var(--border); background: var(--accent-soft); font-size: 11px; font-weight: 800; }
 .reasoning-choice select { height: 34px; padding: 0 9px; border: 2px solid var(--border); color: var(--text); background: #ffffff; }
 .reasoning-choice small { color: var(--muted); font-size: 9px; font-weight: 500; line-height: 1.4; }
+.debug-dialog-body { display: flex; flex-direction: column; gap: 15px; padding: 20px 22px; background: var(--panel); }
+.debug-dialog-intro { margin: 0; color: var(--muted); font-size: 10.5px; line-height: 1.55; }
+.debug-option { display: flex; align-items: flex-start; gap: 10px; padding: 13px 14px; border: 2px solid var(--border); background: #ffffff; box-shadow: var(--shadow-2); font-size: 11px; }
+.debug-option input { width: 16px; height: 16px; flex: 0 0 auto; margin: 1px 0 0; accent-color: var(--accent-hover); }
+.debug-option span { display: grid; gap: 4px; }
+.debug-option small { color: var(--muted); font-size: 9px; font-weight: 500; line-height: 1.45; }
 
 .provider-dialog-backdrop { padding: 18px; }
 .provider-dialog { width: min(1120px, 100%); height: min(820px, calc(100vh - 36px)); display: flex; flex-direction: column; border: 2px solid var(--border); background: #ffffff; box-shadow: 7px 7px 0 #000000; }
@@ -705,6 +711,7 @@ svg { width: 1.1em; height: 1.1em; fill: none; stroke: currentColor; stroke-widt
   .session-tree-actions { opacity: 1; }
   .conversation-header { padding-inline: 17px; }
   .conversation-header .secondary-button { display: none; }
+  .conversation-header .secondary-button.debug-toggle { display: inline-flex; }
   .conversation-meta { gap: 7px; }
   .conversation-meta > p { max-width: 110px; }
   .context-usage { width: 155px; }
@@ -725,8 +732,11 @@ svg { width: 1.1em; height: 1.1em; fill: none; stroke: currentColor; stroke-widt
   .reasoning-choice small { grid-column: 1 / -1; }
 }
 
-/* Full access mode: session toggle, badges, and out-of-workspace flags */
+/* Session capability toggles, badges, and out-of-workspace flags */
 .full-access-toggle.on { background: var(--accent); }
+.debug-toggle { gap: 6px; }
+.debug-toggle svg { width: 14px; height: 14px; }
+.debug-toggle.on { background: var(--accent); }
 .full-access-badge { flex: 0 0 auto; align-self: center; padding: 1px 4px; border: 1.5px solid var(--border); background: var(--accent-soft); color: var(--text); font-size: 9px; font-weight: 800; }
 .full-access-choice { display: flex; align-items: flex-start; gap: 10px; padding: 12px 22px; border-top: 2px solid var(--border); background: var(--accent-soft); font-size: 11px; }
 .full-access-choice input { width: 16px; height: 16px; margin: 1px 0 0; accent-color: var(--accent-hover); }

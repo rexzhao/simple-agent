@@ -144,6 +144,10 @@ export interface ContextMetadata {
   warning_issued?: boolean
 }
 
+export interface SessionDebugSettings {
+  request_bodies: boolean
+}
+
 export interface Session {
   id: string
   created_at: string
@@ -166,6 +170,7 @@ export interface Session {
   status?: string
   show_reasoning?: boolean
   full_access: boolean
+  debug?: SessionDebugSettings
   config_path?: string
   context?: ContextMetadata
 }

@@ -1,4 +1,4 @@
-import type { ActiveRunDescriptor, Bootstrap, CodexAuthStatus, ImageAttachmentInput, ItemsPage, Project, ProviderSettingsDocument, ProviderSettingsInput, RunEvent, Session, SessionModelOptions, SessionSnapshot } from './types'
+import type { ActiveRunDescriptor, Bootstrap, CodexAuthStatus, ImageAttachmentInput, ItemsPage, Project, ProviderSettingsDocument, ProviderSettingsInput, RunEvent, Session, SessionDebugSettings, SessionModelOptions, SessionSnapshot } from './types'
 
 const tokenStorageKey = 'sai-capability-token'
 
@@ -105,6 +105,10 @@ export const api = {
   setSessionFullAccess: (sessionID: string, fullAccess: boolean) => request<Session>(`/api/sessions/${encodeURIComponent(sessionID)}/full-access`, {
     method: 'POST',
     body: JSON.stringify({ full_access: fullAccess }),
+  }),
+  setSessionDebug: (sessionID: string, debug: SessionDebugSettings) => request<Session>(`/api/sessions/${encodeURIComponent(sessionID)}/debug`, {
+    method: 'POST',
+    body: JSON.stringify({ debug }),
   }),
   archiveSession: (sessionID: string) => request<Session>(`/api/sessions/${encodeURIComponent(sessionID)}/archive`, {
     method: 'POST',

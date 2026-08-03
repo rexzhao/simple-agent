@@ -1,12 +1,13 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { api, streamRun } from './api'
-import type { ActiveRun, ActiveRunDescriptor, Bootstrap, ImageAttachmentInput, ItemsPage, Project, RunEvent, RunStep, Session, SessionItem, SessionModelOption } from './types'
+import type { ActiveRun, ActiveRunDescriptor, Bootstrap, ImageAttachmentInput, ItemsPage, Project, RunEvent, RunStep, Session, SessionDebugSettings, SessionItem, SessionModelOption } from './types'
 import { errorMessage } from './lib/format'
 import { reduceRunEvent } from './lib/runEventReducer'
 import { modelKey, orderSessions, processKey, projectName, sessionDescendantIDs, sessionName } from './lib/session'
 import { emptyComposerDraft } from './components/Composer'
 import type { PastedImageAttachment } from './components/Composer'
 import { Conversation } from './components/Conversation'
+import { DebugSettingsDialog } from './components/DebugSettingsDialog'
 import { EmptySession, ErrorBanner, ProjectSetup, Splash } from './components/misc'
 import { ProviderManagerDialog } from './components/ProviderManagerDialog'
 import type { ProviderManagerState } from './components/ProviderManagerDialog'
@@ -38,6 +39,8 @@ function App() {
   const [showProjectForm, setShowProjectForm] = useState(false)
   const [sessionCreator, setSessionCreator] = useState<SessionCreatorState | null>(null)
   const [providerManager, setProviderManager] = useState<ProviderManagerState | null>(null)
+  const [debugSessionID, setDebugSessionID] = useState('')
+  const [savingDebugSettings, setSavingDebugSettings] = useState(false)
   const [creatingSession, setCreatingSession] = useState(false)
   const [completionNotice, setCompletionNotice] = useState<BackgroundCompletionNotice | null>(null)
   const [turnErrors, setTurnErrors] = useState<Record<string, { turnID: string; message: string }>>({})
@@ -393,6 +396,25 @@ function App() {
       if (selectedSessionRef.current === session.id) await refreshSession(session.id)
     } catch (reason) {
       setError(errorMessage(reason))
+    }
+  }, [loadSessions, refreshSession, selectedSessionRef])
+
+  const openDebugSettings = useCallback(() => {
+    if (selectedSessionID) setDebugSessionID(selectedSessionID)
+  }, [selectedSessionID])
+
+  const saveDebugSettings = useCallback(async (sessionID: string, settings: SessionDebugSettings) => {
+    setSavingDebugSettings(true)
+    try {
+      const updated = await api.setSessionDebug(sessionID, settings)
+      await loadSessions(updated.project_id, updated.id, true)
+      if (selectedSessionRef.current === sessionID) await refreshSession(sessionID)
+      setDebugSessionID('')
+    } catch (reason) {
+      setError(errorMessage(reason))
+      throw reason
+    } finally {
+      setSavingDebugSettings(false)
     }
   }, [loadSessions, refreshSession, selectedSessionRef])
 
@@ -793,6 +815,14 @@ function App() {
 
   const selectedProject = projects.find((project) => project.id === selectedProjectID) ?? null
   const selectedActiveRun = activeRunsBySession[selectedSessionID] ?? null
+  useEffect(() => {
+    if (debugSessionID && debugSessionID !== selectedSessionID) setDebugSessionID('')
+  }, [debugSessionID, selectedSessionID])
+  const debugSession = debugSessionID
+    ? sessionDetail?.id === debugSessionID
+      ? sessionDetail
+      : Object.values(sessionsByProject).flat().find((session) => session.id === debugSessionID) ?? null
+    : null
   const visibleRunningSessionIDs = new Set([...runningSessionIDs, ...Object.keys(compactingSessionIDs)])
   const showAddProject = useCallback(() => setShowProjectForm(true), [])
 
@@ -855,6 +885,7 @@ function App() {
             onCancelTool={(toolCallID) => void cancelToolCall(toolCallID)}
             onRetry={() => void retryRun()}
             onRetryRefresh={() => void retryRefreshSession(selectedSessionID)}
+            onDebug={openDebugSettings}
             onRemoveQueuedPrompt={(promptID) => void removeQueuedPrompt(promptID)}
             onSteerQueuedPrompt={(promptID, steer) => void setQueuedPromptSteer(promptID, steer)}
             onMoveQueuedPrompt={(promptID, direction) => void moveQueuedPrompt(promptID, direction)}
@@ -894,6 +925,14 @@ function App() {
           onDocument={(document) => setProviderManager((current) => current ? { ...current, document, loading: false } : current)}
           onClose={() => setProviderManager(null)}
           onError={(message) => setError(message)}
+        />
+      )}
+      {debugSession && (
+        <DebugSettingsDialog
+          session={debugSession}
+          saving={savingDebugSettings}
+          onSave={(settings) => saveDebugSettings(debugSession.id, settings)}
+          onClose={() => { if (!savingDebugSettings) setDebugSessionID('') }}
         />
       )}
     </div>

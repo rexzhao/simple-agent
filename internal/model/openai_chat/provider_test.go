@@ -83,6 +83,52 @@ func TestProviderStreamPostsChatCompletionsRequest(t *testing.T) {
 	}`)
 }
 
+func TestProviderStreamRecordsChatCompletionsRequest(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: [DONE]\n\n")
+	}))
+	defer server.Close()
+
+	var gotEndpoint string
+	var gotBody []byte
+	provider, err := NewProvider(ProviderConfig{
+		BaseURL:    server.URL,
+		APIKey:     "test-key",
+		HTTPClient: server.Client(),
+		RecordRequest: func(endpoint string, body []byte) error {
+			gotEndpoint = endpoint
+			gotBody = append([]byte(nil), body...)
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewProvider() error = %v", err)
+	}
+
+	events, err := provider.Stream(context.Background(), model.Request{
+		Model: "glm-5.2",
+		Messages: []model.Message{
+			{Role: model.MessageRoleUser, Content: "Hello"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Stream() error = %v", err)
+	}
+	_ = collectEvents(t, events)
+
+	if gotEndpoint != "/chat/completions" {
+		t.Fatalf("recorded endpoint = %q, want /chat/completions", gotEndpoint)
+	}
+	assertJSONEqual(t, gotBody, `{
+		"model": "glm-5.2",
+		"messages": [
+			{"role": "user", "content": "Hello"}
+		],
+		"stream": true
+	}`)
+}
+
 func TestProviderStreamEmitsContentReasoningUsageAndStopsAtDone(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -139,7 +185,7 @@ func TestProviderStreamEmitsCompleteToolCallDoneFromSplitArguments(t *testing.T)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		_, _ = io.WriteString(w, "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"docs/\"}}]}}]}\n\n")
-		_, _ = io.WriteString(w, "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"checklist.md\\\"}\"}}]}}]}\n\n")
+		_, _ = io.WriteString(w, "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"\",\"function\":{\"name\":\"\",\"arguments\":\"checklist.md\\\"}\"}}]}}]}\n\n")
 		_, _ = io.WriteString(w, "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n")
 		_, _ = io.WriteString(w, "data: [DONE]\n\n")
 	}))

@@ -1,6 +1,6 @@
 /.sai/
 /.agents/
-/dist/
+/dist/sai.exe
 /web/node_modules/
 /web/dist/
 /web/.vite/

@@ -266,7 +266,7 @@ func TestStreamEventDecoderAccumulatesSplitToolCallArguments(t *testing.T) {
 	decoder := newStreamEventDecoder()
 	frames := []string{
 		`data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"read_file","arguments":"{\"path\":\"docs/"}}]}}]}` + "\n\n",
-		`data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"checklist.md\"}"}}]}}]}` + "\n\n",
+		`data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"","function":{"name":"","arguments":"checklist.md\"}"}}]}}]}` + "\n\n",
 		`data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}` + "\n\n",
 	}
 

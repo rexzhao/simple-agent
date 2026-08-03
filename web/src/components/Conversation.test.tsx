@@ -38,6 +38,7 @@ const baseProps = {
   onCancelTool: vi.fn(),
   onRetry: vi.fn(),
   onRetryRefresh: vi.fn(),
+  onDebug: vi.fn(),
   onToggleFullAccess: vi.fn(),
   onRemoveQueuedPrompt: vi.fn(),
   onSteerQueuedPrompt: vi.fn(),
@@ -50,6 +51,13 @@ describe('Conversation identity boundary', () => {
     const detail = session('s1')
     render(<Conversation {...baseProps} sessionID="s1" detail={detail} />)
     expect(screen.getByText('Session s1')).toBeDefined()
+  })
+
+  it('shows the session debug button and opens the configured handler', () => {
+    const onDebug = vi.fn()
+    render(<Conversation {...baseProps} onDebug={onDebug} sessionID="s1" detail={session('s1')} />)
+    fireEvent.click(screen.getByRole('button', { name: /Debug/ }))
+    expect(onDebug).toHaveBeenCalledTimes(1)
   })
 
   it('shows session cost, API request count, and token count when usage is available', () => {

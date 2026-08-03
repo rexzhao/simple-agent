@@ -125,22 +125,18 @@ func (d *streamEventDecoder) appendToolCallDeltaEvents(events []model.Event, cho
 	for _, delta := range choice.Delta.ToolCalls {
 		accumulator := d.toolCallAccumulator(choice.Index, delta.Index)
 		id := ""
-		if delta.ID != nil {
-			id = *delta.ID
-			accumulator.ID = id
-		} else {
-			id = accumulator.ID
+		if delta.ID != nil && *delta.ID != "" {
+			accumulator.ID = *delta.ID
 		}
+		id = accumulator.ID
 
 		name := ""
 		argumentsDelta := ""
 		if delta.Function != nil {
-			if delta.Function.Name != nil {
-				name = *delta.Function.Name
-				accumulator.Name = name
-			} else {
-				name = accumulator.Name
+			if delta.Function.Name != nil && *delta.Function.Name != "" {
+				accumulator.Name = *delta.Function.Name
 			}
+			name = accumulator.Name
 			if delta.Function.Arguments != nil {
 				argumentsDelta = *delta.Function.Arguments
 				accumulator.Arguments.WriteString(argumentsDelta)

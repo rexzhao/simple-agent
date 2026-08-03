@@ -214,6 +214,56 @@ func TestServerSessionFullAccessEndpoint(t *testing.T) {
 	}
 }
 
+func TestServerSessionDebugEndpoint(t *testing.T) {
+	server, _, _ := newWebTestAppServerWithRunner(t, webTestRunner{})
+	_, session := createWebProjectAndSession(t, server)
+	if session.Debug.RequestBodies {
+		t.Fatalf("new session Debug.RequestBodies = true, want default false")
+	}
+
+	response := doJSONRequest(t, http.MethodPost, server.URL+"/api/sessions/"+session.ID+"/debug", map[string]any{
+		"debug": map[string]any{"request_bodies": true},
+	})
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("POST debug status = %d body=%s", response.StatusCode, readBody(response))
+	}
+	var updated execution.SessionDetail
+	decodeResponse(t, response, &updated)
+	if !updated.Debug.RequestBodies {
+		t.Fatalf("POST debug session = %#v, want request-body capture enabled", updated)
+	}
+
+	response = doJSONRequest(t, http.MethodGet, server.URL+"/api/sessions/"+session.ID, nil)
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("GET debug session status = %d", response.StatusCode)
+	}
+	var fetched execution.SessionDetail
+	decodeResponse(t, response, &fetched)
+	if !fetched.Debug.RequestBodies {
+		t.Fatalf("GET session debug.request_bodies = false, want persisted true")
+	}
+
+	// The flat form remains accepted for callers that used the original
+	// request_bodies setting before the debug namespace was introduced.
+	response = doJSONRequest(t, http.MethodPost, server.URL+"/api/sessions/"+session.ID+"/debug", map[string]any{"request_bodies": false})
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("POST flat debug status = %d body=%s", response.StatusCode, readBody(response))
+	}
+	flatBody := readBody(response)
+	var flat execution.SessionDetail
+	if err := json.Unmarshal([]byte(flatBody), &flat); err != nil {
+		t.Fatalf("decode flat debug response: %v", err)
+	}
+	if flat.Debug.RequestBodies {
+		t.Fatalf("POST flat debug session = %#v, want request-body capture disabled", flat)
+	}
+
+	response = doJSONRequest(t, http.MethodPost, server.URL+"/api/sessions/session-missing/debug", map[string]any{"debug": map[string]any{"request_bodies": true}})
+	if response.StatusCode != http.StatusNotFound || responseErrorCode(t, response) != "not_found" {
+		t.Fatalf("POST debug missing session status = %d, want 404 not_found", response.StatusCode)
+	}
+}
+
 func TestServerActivePromptQueueLifecycle(t *testing.T) {
 	runner := enteredBlockingWebTestRunner{entered: make(chan struct{}), once: &sync.Once{}}
 	server, _, app := newWebTestAppServerWithRunner(t, runner)

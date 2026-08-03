@@ -112,6 +112,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /api/sessions/{sessionID}/snapshot", s.handleGetSessionSnapshot)
 	s.mux.HandleFunc("PATCH /api/sessions/{sessionID}", s.handleRenameSession)
 	s.mux.HandleFunc("POST /api/sessions/{sessionID}/full-access", s.handleSetSessionFullAccess)
+	s.mux.HandleFunc("POST /api/sessions/{sessionID}/debug", s.handleSetSessionDebug)
 	s.mux.HandleFunc("POST /api/sessions/{sessionID}/archive", s.handleArchiveSession)
 	s.mux.HandleFunc("POST /api/sessions/{sessionID}/restore", s.handleRestoreSession)
 	s.mux.HandleFunc("DELETE /api/sessions/{sessionID}", s.handleRemoveSession)
@@ -331,6 +332,31 @@ func (s *Server) handleSetSessionFullAccess(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	session, err := s.service.SetSessionFullAccess(r.PathValue("sessionID"), body.FullAccess)
+	if err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, session)
+}
+
+func (s *Server) handleSetSessionDebug(w http.ResponseWriter, r *http.Request) {
+	// Keep the debug namespace in the request body so additional diagnostic
+	// switches can be added without creating a new endpoint for each one.
+	var body struct {
+		Debug         *sessions.DebugSettings `json:"debug"`
+		RequestBodies *bool                   `json:"request_bodies"` // legacy flat form
+	}
+	if !decodeJSON(w, r, &body) {
+		return
+	}
+	debug := sessions.DebugSettings{}
+	if body.Debug != nil {
+		debug = *body.Debug
+	}
+	if body.RequestBodies != nil {
+		debug.RequestBodies = *body.RequestBodies
+	}
+	session, err := s.service.SetSessionDebug(r.PathValue("sessionID"), debug)
 	if err != nil {
 		writeServiceError(w, err)
 		return

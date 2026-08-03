@@ -462,7 +462,6 @@ root configuration explicitly contains a non-empty path:
 logging:
   path: logs/sai.jsonl
   level: info
-  request_bodies: false
 ```
 
 A relative path resolves from the server root. Disabled logging creates no
@@ -471,14 +470,19 @@ must not contain prompt, response, tool-result, API-key, or
 authorization-header bodies by default. Durable session event records are
 independent of this diagnostic logging switch.
 
-For temporary provider-protocol diagnosis, set `request_bodies: true`. Each
-OpenAI Responses or Codex request body is then written exactly as sent to a
-`responses-request-NNNNNN.json` or
+The legacy `logging.request_bodies` setting is used only as the initial value
+for newly created sessions (and as a fallback for sessions created by older
+versions). A saved per-session Debug setting takes precedence.
+
+For temporary provider-protocol diagnosis, open the conversation's **Debug**
+menu in the Web UI and enable **Capture provider request bodies**. The setting
+is stored on that conversation and applies from its next turn; it does not
+enable capture for other conversations. Each OpenAI Responses or Codex request
+body is then written exactly as sent to a `responses-request-NNNNNN.json` or
 `responses-compact-request-NNNNNN.json` file beside `sai.jsonl`. These captures
 never include HTTP authorization headers, but they do contain complete prompts,
 tool definitions, reasoning state, and tool outputs. Disable the option and
-remove the captures after diagnosis. Changing this setting requires restarting
-the SAI server.
+remove the captures after diagnosis.
 
 ## Context window and compaction
 

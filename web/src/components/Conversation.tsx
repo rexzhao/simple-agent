@@ -11,7 +11,7 @@ import { Composer } from './Composer'
 import type { ComposerDraft, PastedImageAttachment, PastedTextAttachment } from './Composer'
 import { MessageSkeleton } from './misc'
 import { ProcessTimeline } from './ProcessTimeline'
-import { CopyIcon, RetryIcon, SparkIcon, WarningIcon } from './icons'
+import { BugIcon, CopyIcon, RetryIcon, SparkIcon, WarningIcon } from './icons'
 
 // Distance from the bottom that still counts as "at the bottom". Kept tiny on
 // purpose: any deliberate scroll away from the bottom disengages output
@@ -42,6 +42,7 @@ export const Conversation = memo(function Conversation(props: {
   onCancelTool: (toolCallID: string) => void
   onRetry: () => void
   onRetryRefresh: () => void
+  onDebug: () => void
   onToggleFullAccess: () => void
   onRemoveQueuedPrompt: (promptID: string) => void
   onSteerQueuedPrompt: (promptID: string, steer: boolean) => void
@@ -317,6 +318,16 @@ export const Conversation = memo(function Conversation(props: {
         <div className="header-actions">
 		  {safeDetail && (
 			<button
+				className={`secondary-button debug-toggle${safeDetail.debug?.request_bodies ? ' on' : ''}`}
+				onClick={props.onDebug}
+				title="Open debug settings for this conversation"
+				aria-pressed={safeDetail.debug?.request_bodies ?? false}
+			>
+				<BugIcon />Debug{safeDetail.debug?.request_bodies ? ' · ON' : ''}
+			</button>
+		  )}
+		  {safeDetail && (
+			<button
 				className={`secondary-button full-access-toggle${safeDetail.full_access ? ' on' : ''}`}
 				onClick={props.onToggleFullAccess}
 				title={`Full access ${safeDetail.full_access ? 'ON' : 'OFF'}: file tools ${safeDetail.full_access ? 'may read and write outside the workspace' : 'are confined to the workspace'}. Toggling applies from the next turn.`}
@@ -409,7 +420,8 @@ export const Conversation = memo(function Conversation(props: {
   previous.sessionNames === next.sessionNames &&
   previous.onCancelTool === next.onCancelTool &&
   previous.onRetry === next.onRetry &&
-  previous.onRetryRefresh === next.onRetryRefresh)
+  previous.onRetryRefresh === next.onRetryRefresh &&
+  previous.onDebug === next.onDebug)
 
 function ContextUsage(props: { context: Session['context']; activeInputTokens?: number; activeCachedTokens?: number; activeCacheWriteTokens?: number; compactedContextTokens?: number }) {
 	const context = props.context

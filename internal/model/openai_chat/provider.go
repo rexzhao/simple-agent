@@ -19,6 +19,7 @@ type ProviderConfig struct {
 	Compatibility string
 	HTTPClient    *http.Client
 	HTTPOptions   httpstream.Options
+	RecordRequest func(endpoint string, body []byte) error
 }
 
 type Provider struct {
@@ -27,6 +28,7 @@ type Provider struct {
 	compatibility chatCompatibility
 	httpClient    *http.Client
 	httpOptions   httpstream.Options
+	recordRequest func(endpoint string, body []byte) error
 }
 
 var _ model.Provider = (*Provider)(nil)
@@ -52,6 +54,7 @@ func NewProvider(config ProviderConfig) (*Provider, error) {
 		compatibility: compatibility,
 		httpClient:    httpClient,
 		httpOptions:   config.HTTPOptions,
+		recordRequest: config.RecordRequest,
 	}, nil
 }
 
@@ -64,6 +67,11 @@ func (p *Provider) Stream(ctx context.Context, request model.Request) (<-chan mo
 	body, err := buildRequestBody(request, true, p.compatibility)
 	if err != nil {
 		return nil, fmt.Errorf("build OpenAI chat request body: %w", err)
+	}
+	if p.recordRequest != nil {
+		if err := p.recordRequest("/chat/completions", body); err != nil {
+			return nil, fmt.Errorf("record OpenAI chat request: %w", err)
+		}
 	}
 
 	response, err := httpstream.DoRequest(ctx, p.httpClient, p.httpOptions, func(requestCtx context.Context) (*http.Request, error) {

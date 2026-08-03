@@ -300,6 +300,75 @@ func TestServiceSessionFullAccessLifecycle(t *testing.T) {
 	}
 }
 
+func TestServiceSessionDebugLifecycle(t *testing.T) {
+	home := t.TempDir()
+	service, err := NewService(home)
+	if err != nil {
+		t.Fatalf("NewService() error = %v", err)
+	}
+	projectRoot := mkdirProjectRoot(t, "repo")
+	project, err := service.CreateProject(projectRoot, "Repo")
+	if err != nil {
+		t.Fatalf("CreateProject() error = %v", err)
+	}
+	enabled := sessions.DebugSettings{RequestBodies: true}
+	parent, err := service.CreateSession(project.Project.ID, SessionCreateMetadata{
+		CreatedCWD: project.Project.Root,
+		ConfigPath: filepath.Join(project.Project.Root, ".agents", "sai.yaml"),
+		Debug:      &enabled,
+	})
+	if err != nil {
+		t.Fatalf("CreateSession() error = %v", err)
+	}
+	if !parent.Debug.RequestBodies {
+		t.Fatalf("CreateSession() Debug.RequestBodies = false, want true")
+	}
+
+	listed, err := service.ListSessions(SessionListOptions{ProjectID: project.Project.ID})
+	if err != nil {
+		t.Fatalf("ListSessions() error = %v", err)
+	}
+	if len(listed) != 1 || !listed[0].Debug.RequestBodies {
+		t.Fatalf("ListSessions() = %#v, want request-body capture enabled", listed)
+	}
+	reloaded, err := service.GetSession(parent.ID)
+	if err != nil {
+		t.Fatalf("GetSession() error = %v", err)
+	}
+	if !reloaded.Debug.RequestBodies {
+		t.Fatalf("GetSession() Debug.RequestBodies = false, want persisted true")
+	}
+
+	child, err := service.CreateInheritedSession(parent.ID, "Child")
+	if err != nil {
+		t.Fatalf("CreateInheritedSession() error = %v", err)
+	}
+	if !child.Debug.RequestBodies {
+		t.Fatalf("CreateInheritedSession() Debug.RequestBodies = false, want inherited true")
+	}
+	toggled, err := service.SetSessionDebug(child.ID, sessions.DebugSettings{})
+	if err != nil {
+		t.Fatalf("SetSessionDebug(child, false) error = %v", err)
+	}
+	if toggled.Debug.RequestBodies {
+		t.Fatalf("SetSessionDebug(child, false) Debug.RequestBodies = true")
+	}
+	parentAfter, err := service.GetSession(parent.ID)
+	if err != nil {
+		t.Fatalf("GetSession(parent) error = %v", err)
+	}
+	if !parentAfter.Debug.RequestBodies {
+		t.Fatalf("SetSessionDebug(child, false) changed parent")
+	}
+
+	if _, err := service.ArchiveSession(parent.ID); err != nil {
+		t.Fatalf("ArchiveSession() error = %v", err)
+	}
+	if _, err := service.SetSessionDebug(parent.ID, sessions.DebugSettings{}); err == nil || !strings.Contains(err.Error(), "archived session") {
+		t.Fatalf("SetSessionDebug(archived) error = %v, want archived rejection", err)
+	}
+}
+
 func TestServiceSessionLifecycle(t *testing.T) {
 	home := t.TempDir()
 	service, err := NewService(home)
@@ -1359,10 +1428,10 @@ func TestServiceGetSessionSnapshot(t *testing.T) {
 		t.Fatalf("CreateProject() error = %v", err)
 	}
 	session, err := service.CreateSession(project.Project.ID, SessionCreateMetadata{
-		CreatedCWD:    project.Project.Root,
-		Provider:      "fake",
-		ModelProfile:  "default",
-		ModelID:       "model",
+		CreatedCWD:   project.Project.Root,
+		Provider:     "fake",
+		ModelProfile: "default",
+		ModelID:      "model",
 	})
 	if err != nil {
 		t.Fatalf("CreateSession() error = %v", err)

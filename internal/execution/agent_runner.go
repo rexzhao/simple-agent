@@ -210,7 +210,13 @@ func (r AgentTurnRunner) prepareRuntime(ctx context.Context, session sessions.Se
 	}
 	var logger *eventlog.Logger
 	var recordRequest func(endpoint string, body []byte) error
-	if cfg.Logging.RequestBodies {
+	requestBodies := session.Debug.RequestBodies
+	if !session.DebugConfigured {
+		// Sessions written before the per-session setting was introduced use
+		// the old config value until the user explicitly saves a debug choice.
+		requestBodies = cfg.Logging.RequestBodies
+	}
+	if requestBodies {
 		recordRequest = func(endpoint string, body []byte) error {
 			if logger == nil {
 				return fmt.Errorf("request body logger is not initialized")
@@ -1499,7 +1505,9 @@ func newProviderForRun(providerName, modelType, compatibility string, provider c
 	}
 	switch modelType {
 	case config.ProviderTypeOpenAIChat:
-		return openaichat.NewProvider(openAIChatProviderConfig(provider, compatibility, httpClient, httpOptions))
+		providerConfig := openAIChatProviderConfig(provider, compatibility, httpClient, httpOptions)
+		providerConfig.RecordRequest = recordRequest
+		return openaichat.NewProvider(providerConfig)
 	case config.ProviderTypeOpenAIResponses:
 		providerConfig := openAIResponsesProviderConfig(provider, httpClient, httpOptions)
 		providerConfig.RecordRequest = recordRequest
