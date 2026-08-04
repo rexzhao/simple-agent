@@ -1,10 +1,10 @@
 # Session projection and run event contract
 
-**Status: frozen for stage 0 (protocol and test baseline).** This document is a
-wire-contract decision, not a request to change the current product behavior.
-The examples and compatibility notes deliberately describe the implementation
-in this repository. Later stages may add fields or migrate an event name, but
-must preserve the compatibility rules below.
+**Status: frozen through stage 1 (protocol and test baseline).** This document
+is a wire-contract decision, not a request to change the current product
+behavior. The examples and compatibility notes deliberately describe the
+implementation in this repository. Later stages may add fields or migrate an
+event name, but must preserve the compatibility rules below.
 
 ## 1. Scope and sources of truth
 
@@ -168,7 +168,9 @@ On the per-run stream, the current payload is:
   "type": "run.resync_required",
   "run_id": "run-1",
   "session_id": "session-1",
-  "oldest_seq": 37
+  "oldest_seq": 37,
+  "oldest_stream_event_id": 37,
+  "required_revision": "42"
 }
 ```
 
@@ -176,10 +178,19 @@ It means the requested `after` cursor is older than the oldest event retained
 in the run registry. It does **not** mean that durable session data is lost.
 The client MUST load the session snapshot (and any needed item pages), then
 reattach to the run stream using a current cursor if it still needs live
-updates. The server currently sets its internal replay position to
-`oldest_seq - 1` and then sends every retained event, including the control
-frame's following events; clients should not treat the control frame as an
-ordinary run event ID.
+updates. `oldest_stream_event_id` is the unambiguous name for the oldest
+retained per-run SSE ID. `oldest_seq` remains as a compatibility alias for
+that same value; it is not a session revision or an item sequence.
+
+When the registry can read the session store, `required_revision` is the
+decimal-string session `LastSeq` observed while creating the resync control
+frame. It is a repair hint for the snapshot watermark, not a promise that no
+new durable records will be written after the frame. The field is omitted when
+the adapter has no session service or cannot reliably read the session; clients
+must not treat omission as revision zero. The server sets its internal replay
+position to `oldest_stream_event_id - 1` and then sends every retained event,
+including the control frame's following events; clients should not treat the
+control frame as an ordinary run event ID.
 
 The current `oldest_seq` name is a run-buffer ID, despite the name `seq`; it is
 not a session revision or an item sequence. `session_id` is present on this
@@ -246,12 +257,15 @@ tests:
    `run.resync_required` frame without an ID and then the retained events. A
    buffer overflow therefore results in resync plus a durable snapshot refresh,
    not in fabricated missing events.
-4. A run event can be observed before the coordinator's `Start` call returns.
-   The registry installs its observer on the shared coordinator and adopts the
-   run on the first event, then reconciles it with the returned run handle.
-   Consumers must be able to connect after the HTTP 202 response and replay
-   from zero; they must not assume that the first `turn.started` arrives after
-   the response.
+4. The shared coordinator first reserves the run handle and invokes its
+   admission callback. The Web replay registry registers `managedRun` and its
+   buffer in that callback, before the execution starter is invoked. Therefore
+   no actual run event can be observed before the run is registered by
+   `run_id`, including synchronous starter emissions and agent/session-tool
+   starts. A run event can still be observed before the coordinator's `Start`
+   call returns. Consumers must be able to connect after the HTTP 202 response
+   and replay from zero; they must not assume that the first `turn.started`
+   arrives after the response.
 5. Each connection has its own `after` cursor. Multiple connections replay the
    same retained event with the same run-local IDs; connecting twice does not
    renumber or consume events.
@@ -276,8 +290,8 @@ must not wait for a nonexistent `command.accepted` frame today.
 
 | Command | Current response | Acceptance meaning |
 | --- | --- | --- |
-| `POST /api/sessions/{id}/runs` | HTTP 202; `run_id`, `session_id`, `status: "running"` | The run was admitted to the shared coordinator. Execution and durable item creation happen asynchronously. |
-| `POST /api/sessions/{id}/continue` | HTTP 202; same shape | The interrupted/failed context was admitted for continuation; it does not append new content. |
+| `POST /api/sessions/{id}/runs` | HTTP 202; `run_id`, `session_id`, `status: "running"` | The run was admitted to the shared coordinator, and its registry/replay buffer is already queryable by `run_id`. Execution and durable item creation happen asynchronously. |
+| `POST /api/sessions/{id}/continue` | HTTP 202; same shape | The interrupted/failed context was admitted to the shared coordinator, and its registry/replay buffer is already queryable by `run_id`; it does not append new content. |
 | `POST /api/runs/{runID}/prompts` | HTTP 202; `run_id`, `status: "accepted"` | The prompt was accepted by the active run queue. It may be injected at a safe checkpoint or delivered in a follow-up turn. |
 | `DELETE /api/runs/{runID}` | HTTP 202; `run_id`, current `status` | Cancellation was requested/applied to the run handle; durable settlement still arrives asynchronously. |
 

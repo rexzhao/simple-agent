@@ -288,7 +288,7 @@ export type RunEvent =
 	| { type: 'usage.updated'; turn_id: string; agent_iteration: number; input_tokens: number; output_tokens: number; total_tokens: number; cached_tokens: number; cache_write_tokens: number; reasoning_tokens: number }
   | { type: 'run.prompt_queue'; turn_id?: string; prompts?: QueuedPrompt[] }
   | { type: 'run.prompt_appended'; turn_id?: string; prompts?: string[] }
-  | { type: 'run.resync_required'; run_id: string; session_id: string; oldest_seq: number }
+  | { type: 'run.resync_required'; run_id: string; session_id: string; oldest_seq: number; oldest_stream_event_id?: number; required_revision?: string }
   | { type: 'turn.committed'; turn_id: string; last_seq: number }
   | { type: 'turn.failed'; turn_id: string; code: string; message: string }
   | { type: 'run.settled'; run_id: string; status: string; turn_id?: string; last_seq?: number; message?: string }

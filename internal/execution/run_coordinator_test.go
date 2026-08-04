@@ -22,6 +22,218 @@ func newCoordinatorTestStarter() *coordinatorTestStarter {
 	}
 }
 
+type synchronousCoordinatorTestStarter struct {
+	admitted                  *bool
+	emittedBeforeRegistration *bool
+}
+
+type cancellationBlockingCoordinatorStarter struct {
+	started   chan struct{}
+	startOnce sync.Once
+	returnRun bool
+}
+
+func (starter *cancellationBlockingCoordinatorStarter) StartSessionRunWithInput(
+	ctx context.Context,
+	_ string,
+	_ SessionMessageInput,
+	_ func(SessionStreamEvent),
+) *SessionRun {
+	starter.startOnce.Do(func() { close(starter.started) })
+	<-ctx.Done()
+	if !starter.returnRun {
+		return nil
+	}
+	runCtx, cancel := context.WithCancel(context.Background())
+	run := &SessionRun{
+		cancel:    cancel,
+		done:      make(chan struct{}),
+		status:    SessionRunRunning,
+		accepting: true,
+	}
+	go func() {
+		<-runCtx.Done()
+		run.mu.Lock()
+		run.status = SessionRunCancelled
+		run.err = context.Canceled
+		run.accepting = false
+		run.mu.Unlock()
+		close(run.done)
+	}()
+	return run
+}
+
+func (starter *synchronousCoordinatorTestStarter) StartSessionRunWithInput(
+	ctx context.Context,
+	_ string,
+	_ SessionMessageInput,
+	emit func(SessionStreamEvent),
+) *SessionRun {
+	if starter.admitted != nil && !*starter.admitted && starter.emittedBeforeRegistration != nil {
+		*starter.emittedBeforeRegistration = true
+	}
+	if emit != nil {
+		emit(NewSessionStreamEvent("turn.started", map[string]any{"turn_id": "turn-sync"}))
+	}
+	_, cancel := context.WithCancel(ctx)
+	run := &SessionRun{
+		cancel:    cancel,
+		done:      make(chan struct{}),
+		status:    SessionRunCommitted,
+		accepting: false,
+		result:    SessionMessageResult{Status: "committed", TurnID: "turn-sync"},
+	}
+	close(run.done)
+	return run
+}
+
+func TestSessionRunCoordinatorAdmitsReplayBeforeSynchronousStarterEvent(t *testing.T) {
+	admitted := false
+	emittedBeforeRegistration := false
+	starter := &synchronousCoordinatorTestStarter{
+		admitted:                  &admitted,
+		emittedBeforeRegistration: &emittedBeforeRegistration,
+	}
+	var coordinator *SessionRunCoordinator
+	coordinator = NewSessionRunCoordinator(context.Background(), starter, SessionRunCoordinatorOptions{
+		NewRunID: func() (string, error) { return "run-sync-admission", nil },
+		OnRunAdmitted: func(run *CoordinatedSessionRun) error {
+			if got, ok := coordinator.Get(run.ID()); !ok || got != run {
+				t.Fatalf("admitted run lookup = %#v/%t, want reserved handle", got, ok)
+			}
+			admitted = true
+			return nil
+		},
+	})
+	defer coordinator.Close()
+
+	run, err := coordinator.Start("session-sync-admission", SessionMessageInput{Content: "sync"}, nil)
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	if emittedBeforeRegistration {
+		t.Fatal("synchronous starter emitted before coordinator admission callback")
+	}
+	if _, err := run.Wait(); err != nil {
+		t.Fatalf("run.Wait() error = %v", err)
+	}
+}
+
+func TestSessionRunCoordinatorRejectsConcurrentStartsForOneSession(t *testing.T) {
+	starter := newCoordinatorTestStarter()
+	var idMu sync.Mutex
+	nextID := 0
+	coordinator := NewSessionRunCoordinator(context.Background(), starter, SessionRunCoordinatorOptions{
+		NewRunID: func() (string, error) {
+			idMu.Lock()
+			defer idMu.Unlock()
+			nextID++
+			return fmt.Sprintf("run-concurrent-%d", nextID), nil
+		},
+	})
+	defer coordinator.Close()
+
+	const attempts = 16
+	results := make(chan struct {
+		run *CoordinatedSessionRun
+		err error
+	}, attempts)
+	var wg sync.WaitGroup
+	for range attempts {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			run, err := coordinator.Start("session-concurrent", SessionMessageInput{Content: "one"}, nil)
+			results <- struct {
+				run *CoordinatedSessionRun
+				err error
+			}{run: run, err: err}
+		}()
+	}
+	wg.Wait()
+	close(results)
+
+	var admitted *CoordinatedSessionRun
+	busy := 0
+	for result := range results {
+		if result.err == nil {
+			if admitted != nil {
+				t.Fatal("more than one concurrent start was admitted")
+			}
+			admitted = result.run
+			continue
+		}
+		if errors.Is(result.err, ErrSessionBusy) {
+			busy++
+			continue
+		}
+		t.Fatalf("concurrent Start() error = %v, want ErrSessionBusy", result.err)
+	}
+	if admitted == nil || busy != attempts-1 {
+		t.Fatalf("concurrent admission result = run:%v busy:%d, want one run and %d busy errors", admitted != nil, busy, attempts-1)
+	}
+	admitted.Cancel()
+	if _, err := admitted.Wait(); !errors.Is(err, context.Canceled) {
+		t.Fatalf("admitted run.Wait() error = %v, want context.Canceled", err)
+	}
+}
+
+func TestSessionRunCoordinatorCloseCancelsAdmissionBeforeWaiting(t *testing.T) {
+	for _, returnRun := range []bool{false, true} {
+		t.Run(fmt.Sprintf("return-run-%t", returnRun), func(t *testing.T) {
+			starter := &cancellationBlockingCoordinatorStarter{
+				started:   make(chan struct{}),
+				returnRun: returnRun,
+			}
+			coordinator := NewSessionRunCoordinator(context.Background(), starter, SessionRunCoordinatorOptions{
+				NewRunID: func() (string, error) { return "run-close-admission", nil },
+			})
+			t.Cleanup(coordinator.Close)
+
+			startResult := make(chan error, 1)
+			go func() {
+				_, err := coordinator.Start("session-close-admission", SessionMessageInput{Content: "wait"}, nil)
+				startResult <- err
+			}()
+			select {
+			case <-starter.started:
+			case <-time.After(time.Second):
+				t.Fatal("starter did not begin")
+			}
+
+			closeDone := make(chan struct{})
+			go func() {
+				coordinator.Close()
+				close(closeDone)
+			}()
+			select {
+			case <-closeDone:
+			case <-time.After(time.Second):
+				t.Fatal("Close() deadlocked while starter waited for context cancellation")
+			}
+			select {
+			case err := <-startResult:
+				if returnRun && err != nil {
+					t.Fatalf("Start() error = %v, want successful admission before shutdown", err)
+				}
+				if !returnRun && err == nil {
+					t.Fatal("Start() succeeded after starter rolled back admission")
+				}
+			case <-time.After(time.Second):
+				t.Fatal("Start() did not finish after coordinator cancellation")
+			}
+
+			coordinator.mu.Lock()
+			byIDCount := len(coordinator.byID)
+			activeCount := len(coordinator.activeBySession)
+			coordinator.mu.Unlock()
+			if byIDCount != 0 || activeCount != 0 {
+				t.Fatalf("coordinator indexes after Close() = byID:%d active:%d, want empty", byIDCount, activeCount)
+			}
+		})
+	}
+}
+
 func (starter *coordinatorTestStarter) StartSessionRunWithInput(ctx context.Context, sessionID string, _ SessionMessageInput, emit func(SessionStreamEvent)) *SessionRun {
 	runCtx, cancel := context.WithCancel(ctx)
 	run := &SessionRun{

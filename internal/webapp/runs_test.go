@@ -131,8 +131,49 @@ func TestRunEventsSignalsResyncForTruncatedReplay(t *testing.T) {
 	if !strings.Contains(body, `"type":"run.resync_required"`) {
 		t.Fatalf("SSE body missing resync event: %s", body)
 	}
+	if !strings.Contains(body, `"oldest_stream_event_id":2`) || !strings.Contains(body, `"oldest_seq":2`) {
+		t.Fatalf("SSE body missing compatible oldest stream event IDs: %s", body)
+	}
 	if !strings.Contains(body, `"type":"run.settled"`) {
 		t.Fatalf("SSE body missing terminal event: %s", body)
+	}
+}
+
+func TestRunEventsResyncIncludesDurableRequiredRevision(t *testing.T) {
+	service, err := execution.NewServiceWithOptions(t.TempDir(), execution.ServiceOptions{TurnRunner: webTestRunner{}})
+	if err != nil {
+		t.Fatalf("NewServiceWithOptions() error = %v", err)
+	}
+	project, err := service.CreateProject(t.TempDir(), "resync revision")
+	if err != nil {
+		t.Fatalf("CreateProject() error = %v", err)
+	}
+	session, err := service.CreateSession(project.Project.ID, execution.SessionCreateMetadata{})
+	if err != nil {
+		t.Fatalf("CreateSession() error = %v", err)
+	}
+	registry := newRunRegistryWithOptions(context.Background(), service, nil, runRegistryOptions{MaxRunEvents: 1})
+	defer registry.Close()
+	managed := newManagedRun("run-required-revision", session.ID, registry.options)
+	managed.append(execution.NewSessionStreamEvent("text.delta", map[string]any{"text": "first"}))
+	managed.append(execution.NewSessionStreamEvent("run.settled", map[string]any{"status": "committed"}))
+	managed.finish(time.Now().UTC())
+	registry.mu.Lock()
+	registry.byID[managed.id] = managed
+	registry.mu.Unlock()
+
+	server := &Server{runs: registry}
+	request := httptest.NewRequest("GET", "/api/runs/"+managed.id+"/events?after=0", nil)
+	request.SetPathValue("runID", managed.id)
+	response := httptest.NewRecorder()
+	server.handleRunEvents(response, request)
+
+	body := response.Body.String()
+	if !strings.Contains(body, `"required_revision":"0"`) {
+		t.Fatalf("SSE body missing durable required_revision: %s", body)
+	}
+	if !strings.Contains(body, `"oldest_stream_event_id":2`) {
+		t.Fatalf("SSE body missing oldest_stream_event_id: %s", body)
 	}
 }
 
@@ -179,6 +220,9 @@ func TestRunEventsAfterZeroReplaysTerminalRunWithStableIDs(t *testing.T) {
 	if strings.Count(first, "id: ") != 1 {
 		t.Fatalf("resync notification must not consume an SSE event ID, body=%q", first)
 	}
+	if !strings.Contains(first, `"oldest_stream_event_id":3`) || !strings.Contains(first, `"oldest_seq":3`) {
+		t.Fatalf("resync notification missing compatible oldest stream event IDs, body=%q", first)
+	}
 
 	second := capture("0")
 	if second != first {
@@ -199,7 +243,9 @@ func TestRunEventsAfterZeroReplaysTerminalRunWithStableIDs(t *testing.T) {
 }
 
 type eventBeforeStartReturnStarter struct {
-	service *execution.Service
+	service                   *execution.Service
+	admitted                  *bool
+	emittedBeforeRegistration *bool
 }
 
 func (s eventBeforeStartReturnStarter) StartSessionRunWithInput(
@@ -208,6 +254,9 @@ func (s eventBeforeStartReturnStarter) StartSessionRunWithInput(
 	input execution.SessionMessageInput,
 	emit func(execution.SessionStreamEvent),
 ) *execution.SessionRun {
+	if s.admitted != nil && !*s.admitted && s.emittedBeforeRegistration != nil {
+		*s.emittedBeforeRegistration = true
+	}
 	if emit != nil {
 		emit(execution.NewSessionStreamEvent("turn.started", map[string]any{
 			"turn_id": "turn-before-start-return",
@@ -219,21 +268,36 @@ func (s eventBeforeStartReturnStarter) StartSessionRunWithInput(
 func TestRunRegistryAdoptsEventsObservedBeforeCoordinatorStartReturns(t *testing.T) {
 	server, service, app := newWebTestAppServerWithRunner(t, webTestRunner{})
 	_, session := createWebProjectAndSession(t, server)
+	admitted := false
+	emittedBeforeRegistration := false
 
 	coordinator := execution.NewSessionRunCoordinator(context.Background(), eventBeforeStartReturnStarter{
-		service: service,
+		service:                   service,
+		admitted:                  &admitted,
+		emittedBeforeRegistration: &emittedBeforeRegistration,
 	}, execution.SessionRunCoordinatorOptions{
 		NewRunID: func() (string, error) {
 			return "run-before-start-return", nil
 		},
-		OnRunEvent:   app.runs.observeRunEvent,
-		OnRunSettled: app.runs.settleRun,
+		OnRunAdmitted: func(run *execution.CoordinatedSessionRun) error {
+			if err := app.runs.admitRun(run); err != nil {
+				return err
+			}
+			admitted = true
+			return nil
+		},
+		OnRunAdmissionFailed: app.runs.rejectRun,
+		OnRunEvent:           app.runs.observeRunEvent,
+		OnRunSettled:         app.runs.settleRun,
 	})
 	defer coordinator.Close()
 
 	run, err := coordinator.Start(session.ID, execution.SessionMessageInput{Content: "hello"}, nil)
 	if err != nil {
 		t.Fatalf("coordinator.Start() error = %v", err)
+	}
+	if emittedBeforeRegistration {
+		t.Fatal("synchronous starter emitted before replay registration")
 	}
 	managed, ok := app.runs.get(run.ID())
 	if !ok {

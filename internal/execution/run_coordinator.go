@@ -38,9 +38,17 @@ type SessionRunCoordinatorOptions struct {
 	MaxConcurrentRuns int
 	Now               func() time.Time
 	NewRunID          func() (string, error)
+	// OnRunAdmitted is called after the coordinator reserves the run and
+	// before the starter is allowed to execute it. Presentation adapters use
+	// this phase to register a run-local replay buffer before the first event
+	// can be emitted.
+	OnRunAdmitted func(*CoordinatedSessionRun) error
+	// OnRunAdmissionFailed removes any adapter state created by OnRunAdmitted
+	// when the starter cannot be invoked or returns a nil run.
+	OnRunAdmissionFailed func(*CoordinatedSessionRun)
 	// OnRunEvent observes every event from every admitted run, including runs
-	// started by agent tools. It lets presentation adapters attach one shared
-	// replay layer without supplying a per-Start callback.
+	// started by agent tools. It observes an already-admitted run; adapters
+	// must not use this callback to perform first registration.
 	OnRunEvent func(*CoordinatedSessionRun, SessionStreamEvent)
 	// OnRunSettled observes the stable result after Wait returns and before the
 	// run is removed from the coordinator's active indexes.
@@ -81,7 +89,9 @@ type SessionRunCoordinator struct {
 	options SessionRunCoordinatorOptions
 
 	mu              sync.Mutex
+	startMu         sync.Mutex
 	closed          bool
+	closeDone       chan struct{}
 	byID            map[string]*CoordinatedSessionRun
 	activeBySession map[string]*CoordinatedSessionRun
 	wg              sync.WaitGroup
@@ -103,6 +113,25 @@ type CoordinatedSessionRun struct {
 	turnID string
 }
 
+func (run *CoordinatedSessionRun) setSessionRun(sessionRun *SessionRun) {
+	if run == nil {
+		return
+	}
+	run.mu.Lock()
+	run.run = sessionRun
+	run.mu.Unlock()
+}
+
+func (run *CoordinatedSessionRun) sessionRun() *SessionRun {
+	if run == nil {
+		return nil
+	}
+	run.mu.Lock()
+	sessionRun := run.run
+	run.mu.Unlock()
+	return sessionRun
+}
+
 func NewSessionRunCoordinator(ctx context.Context, starter SessionRunStarter, options SessionRunCoordinatorOptions) *SessionRunCoordinator {
 	if ctx == nil {
 		ctx = context.Background()
@@ -113,6 +142,7 @@ func NewSessionRunCoordinator(ctx context.Context, starter SessionRunStarter, op
 		cancel:          cancel,
 		starter:         starter,
 		options:         options.withDefaults(),
+		closeDone:       make(chan struct{}),
 		byID:            make(map[string]*CoordinatedSessionRun),
 		activeBySession: make(map[string]*CoordinatedSessionRun),
 	}
@@ -185,6 +215,13 @@ func (coordinator *SessionRunCoordinator) notifyRunIdle(run *CoordinatedSessionR
 	}
 }
 
+func (coordinator *SessionRunCoordinator) notifyRunAdmissionFailed(run *CoordinatedSessionRun) {
+	if coordinator == nil || coordinator.options.OnRunAdmissionFailed == nil {
+		return
+	}
+	coordinator.options.OnRunAdmissionFailed(run)
+}
+
 // Start atomically admits and starts a run. The run is rooted in the
 // coordinator context rather than an HTTP request or tool-call context, so an
 // asynchronous run outlives the request that created it.
@@ -249,6 +286,14 @@ func (coordinator *SessionRunCoordinator) startWithID(sessionID string, input Se
 		startedAt: coordinator.options.Now().UTC(),
 	}
 
+	// Keep the reservation, adapter admission, and starter invocation as one
+	// serialized transition. The coordinator mutex is deliberately released
+	// while callbacks and the starter run so observers may safely query the
+	// coordinator. Close cancels the coordinator context before waiting for
+	// this transition, so a starter waiting on ctx.Done() can always return.
+	coordinator.startMu.Lock()
+	defer coordinator.startMu.Unlock()
+
 	coordinator.mu.Lock()
 	if coordinator.closed {
 		coordinator.mu.Unlock()
@@ -270,6 +315,21 @@ func (coordinator *SessionRunCoordinator) startWithID(sessionID string, input Se
 		coordinator.mu.Unlock()
 		return nil, fmt.Errorf("generated run id %q is already active", runID)
 	}
+	// Reserve the coordinator indexes before invoking either the adapter
+	// admission callback or the execution starter. This makes the handle
+	// discoverable during the entire admission transition.
+	coordinator.byID[runID] = handle
+	coordinator.activeBySession[sessionID] = handle
+	coordinator.mu.Unlock()
+
+	if coordinator.options.OnRunAdmitted != nil {
+		if err := coordinator.options.OnRunAdmitted(handle); err != nil {
+			coordinator.removeAdmittedRun(handle)
+			coordinator.notifyRunAdmissionFailed(handle)
+			return nil, err
+		}
+	}
+
 	forward := func(event SessionStreamEvent) {
 		handle.observe(event)
 		if coordinator.options.OnRunEvent != nil {
@@ -280,22 +340,34 @@ func (coordinator *SessionRunCoordinator) startWithID(sessionID string, input Se
 		}
 	}
 	if starter, ok := coordinator.starter.(SessionRunStarterWithID); ok {
-		handle.run = starter.StartSessionRunWithID(coordinator.ctx, sessionID, input, runID, forward)
+		handle.setSessionRun(starter.StartSessionRunWithID(coordinator.ctx, sessionID, input, runID, forward))
 	} else {
-		handle.run = coordinator.starter.StartSessionRunWithInput(coordinator.ctx, sessionID, input, forward)
+		handle.setSessionRun(coordinator.starter.StartSessionRunWithInput(coordinator.ctx, sessionID, input, forward))
 	}
-	if handle.run == nil {
-		coordinator.mu.Unlock()
+	if handle.sessionRun() == nil {
+		coordinator.removeAdmittedRun(handle)
+		coordinator.notifyRunAdmissionFailed(handle)
 		return nil, fmt.Errorf("session run starter returned a nil run")
 	}
-	coordinator.byID[runID] = handle
-	coordinator.activeBySession[sessionID] = handle
-	coordinator.mu.Unlock()
 	coordinator.notifyRunStarted(handle)
 
 	coordinator.wg.Add(1)
 	go coordinator.await(handle)
 	return handle, nil
+}
+
+func (coordinator *SessionRunCoordinator) removeAdmittedRun(handle *CoordinatedSessionRun) {
+	if coordinator == nil || handle == nil {
+		return
+	}
+	coordinator.mu.Lock()
+	if coordinator.byID[handle.id] == handle {
+		delete(coordinator.byID, handle.id)
+	}
+	if coordinator.activeBySession[handle.sessionID] == handle {
+		delete(coordinator.activeBySession, handle.sessionID)
+	}
+	coordinator.mu.Unlock()
 }
 
 func (coordinator *SessionRunCoordinator) await(handle *CoordinatedSessionRun) {
@@ -376,29 +448,47 @@ func (coordinator *SessionRunCoordinator) ActiveRuns() []SessionRunDescriptor {
 	return descriptors
 }
 
-// Close rejects new runs, cancels all active runs, and waits for their
-// lifecycle goroutines to release coordinator entries.
+// Close rejects new runs and cancels the coordinator context before waiting
+// for an in-flight admission/starter transition. This ordering is important:
+// a starter may synchronously wait for ctx.Done() before returning. Once that
+// transition has completed, Close cancels any returned run handles and waits
+// for their lifecycle goroutines to release coordinator entries.
 func (coordinator *SessionRunCoordinator) Close() {
 	if coordinator == nil {
 		return
 	}
 	coordinator.mu.Lock()
 	if coordinator.closed {
+		closeDone := coordinator.closeDone
 		coordinator.mu.Unlock()
+		if closeDone != nil {
+			<-closeDone
+		}
 		return
 	}
 	coordinator.closed = true
+	coordinator.mu.Unlock()
+
+	// Cancel before taking startMu. The starter is invoked while startMu is
+	// held and may be waiting on this context, so taking startMu first would
+	// deadlock Close against a synchronous starter.
+	coordinator.cancel()
+	coordinator.startMu.Lock()
+	coordinator.mu.Lock()
 	runs := make([]*CoordinatedSessionRun, 0, len(coordinator.byID))
 	for _, run := range coordinator.byID {
 		runs = append(runs, run)
 	}
 	coordinator.mu.Unlock()
+	coordinator.startMu.Unlock()
 
-	coordinator.cancel()
 	for _, run := range runs {
 		run.Cancel()
 	}
 	coordinator.wg.Wait()
+	if coordinator.closeDone != nil {
+		close(coordinator.closeDone)
+	}
 }
 
 func (run *CoordinatedSessionRun) ID() string {
@@ -423,78 +513,100 @@ func (run *CoordinatedSessionRun) StartedAt() time.Time {
 }
 
 func (run *CoordinatedSessionRun) Status() SessionRunStatus {
-	if run == nil || run.run == nil {
+	if run == nil {
 		return SessionRunFailed
 	}
-	return run.run.Status()
+	sessionRun := run.sessionRun()
+	if sessionRun == nil {
+		// A handle is visible to observers during the short admission phase,
+		// before the starter has returned its SessionRun. It is already a
+		// reserved running slot, not a failed execution.
+		return SessionRunRunning
+	}
+	return sessionRun.Status()
 }
 
 func (run *CoordinatedSessionRun) Wait() (SessionMessageResult, error) {
-	if run == nil || run.run == nil {
+	if run == nil {
 		return SessionMessageResult{}, fmt.Errorf("session run is not configured")
 	}
-	return run.run.Wait()
+	sessionRun := run.sessionRun()
+	if sessionRun == nil {
+		return SessionMessageResult{}, fmt.Errorf("session run is not configured")
+	}
+	return sessionRun.Wait()
 }
 
 // Done is closed when the coordinated run settles. It is suitable for
 // context- and timeout-aware waiting without spawning a goroutine around Wait.
 func (run *CoordinatedSessionRun) Done() <-chan struct{} {
-	if run == nil || run.run == nil {
+	if run == nil {
 		closed := make(chan struct{})
 		close(closed)
 		return closed
 	}
-	return run.run.Done()
+	sessionRun := run.sessionRun()
+	if sessionRun == nil {
+		return nil
+	}
+	return sessionRun.Done()
 }
 
 func (run *CoordinatedSessionRun) Cancel() {
-	if run != nil && run.run != nil {
-		run.run.Cancel()
+	if sessionRun := run.sessionRun(); sessionRun != nil {
+		sessionRun.Cancel()
 	}
 }
 
 // CancelToolCall cancels a single in-flight tool call without aborting the run.
 func (run *CoordinatedSessionRun) CancelToolCall(toolCallID string) bool {
-	if run == nil || run.run == nil {
+	sessionRun := run.sessionRun()
+	if sessionRun == nil {
 		return false
 	}
-	return run.run.CancelToolCall(toolCallID)
+	return sessionRun.CancelToolCall(toolCallID)
 }
 
 func (run *CoordinatedSessionRun) AppendActive(content string) error {
-	if run == nil || run.run == nil {
+	sessionRun := run.sessionRun()
+	if sessionRun == nil {
 		return ErrSessionRunSettled
 	}
-	return run.run.AppendActive(content)
+	return sessionRun.AppendActive(content)
 }
 
 func (run *CoordinatedSessionRun) TrySteer(content string) error {
-	if run == nil || run.run == nil {
+	sessionRun := run.sessionRun()
+	if sessionRun == nil {
 		return ErrSessionNotSteerable
 	}
-	return run.run.TrySteer(content)
+	return sessionRun.TrySteer(content)
 }
 
 func (run *CoordinatedSessionRun) RemoveActive(promptID string) bool {
-	return run != nil && run.run != nil && run.run.RemoveActive(promptID)
+	sessionRun := run.sessionRun()
+	return sessionRun != nil && sessionRun.RemoveActive(promptID)
 }
 
 // SetActivePromptSteer marks or unmarks a queued prompt as a steer prompt;
 // steer prompts sort ahead of plain queued prompts and drain first.
 func (run *CoordinatedSessionRun) SetActivePromptSteer(promptID string, steer bool) bool {
-	return run != nil && run.run != nil && run.run.SetActivePromptSteer(promptID, steer)
+	sessionRun := run.sessionRun()
+	return sessionRun != nil && sessionRun.SetActivePromptSteer(promptID, steer)
 }
 
 // MoveActivePrompt reorders a queued prompt within its priority group.
 func (run *CoordinatedSessionRun) MoveActivePrompt(promptID string, delta int) bool {
-	return run != nil && run.run != nil && run.run.MoveActivePrompt(promptID, delta)
+	sessionRun := run.sessionRun()
+	return sessionRun != nil && sessionRun.MoveActivePrompt(promptID, delta)
 }
 
 func (run *CoordinatedSessionRun) Enqueue(event PromptEvent) (*PromptReceipt, error) {
-	if run == nil || run.run == nil {
+	sessionRun := run.sessionRun()
+	if sessionRun == nil {
 		return nil, ErrSessionRunSettled
 	}
-	return run.run.Enqueue(event)
+	return sessionRun.Enqueue(event)
 }
 
 func (run *CoordinatedSessionRun) ActiveDescriptor() (SessionRunDescriptor, bool) {

@@ -142,9 +142,11 @@ func newRunRegistryWithOptions(ctx context.Context, service *execution.Service, 
 		terminalTimers: make(map[string]*time.Timer),
 	}
 	coordinator := execution.NewSessionRunCoordinator(ctx, service, execution.SessionRunCoordinatorOptions{
-		MaxConcurrentRuns: resolvedOptions.MaxConcurrentRuns,
-		OnRunEvent:        registry.observeRunEvent,
-		OnRunSettled:      registry.settleRun,
+		MaxConcurrentRuns:    resolvedOptions.MaxConcurrentRuns,
+		OnRunAdmitted:        registry.admitRun,
+		OnRunAdmissionFailed: registry.rejectRun,
+		OnRunEvent:           registry.observeRunEvent,
+		OnRunSettled:         registry.settleRun,
 	})
 	registry.coordinator = coordinator
 	if service != nil {
@@ -187,7 +189,7 @@ func (r *runRegistry) startWithInput(sessionID string, input execution.SessionMe
 	if err != nil {
 		return nil, err
 	}
-	managed, ok := r.ensureManaged(coordinated)
+	managed, ok := r.get(coordinated.ID())
 	if !ok {
 		coordinated.Cancel()
 		return nil, ErrRunRegistryClosed
@@ -199,11 +201,51 @@ func (r *runRegistry) startContinue(sessionID string) (*managedRun, error) {
 	return r.startWithInput(sessionID, execution.SessionMessageInput{Continue: true})
 }
 
+// admitRun is the first presentation-adapter phase of coordinator admission.
+// It runs before the execution starter, which means a synchronous starter and
+// an agent/session-tool start have the same replay registration guarantee as a
+// Web start.
+func (r *runRegistry) admitRun(run *execution.CoordinatedSessionRun) error {
+	if r == nil || run == nil || strings.TrimSpace(run.ID()) == "" {
+		return ErrRunRegistryClosed
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closed {
+		return ErrRunRegistryClosed
+	}
+	if existing := r.byID[run.ID()]; existing != nil {
+		if existing.run == run {
+			return nil
+		}
+		return fmt.Errorf("run %q is already registered", run.ID())
+	}
+	managed := newManagedRun(run.ID(), run.SessionID(), r.options)
+	managed.startedAt = run.StartedAt()
+	managed.run = run
+	r.byID[managed.id] = managed
+	return nil
+}
+
+// rejectRun rolls back adapter admission when the coordinator cannot start a
+// SessionRun after reserving the handle (for example, a nil starter result).
+func (r *runRegistry) rejectRun(run *execution.CoordinatedSessionRun) {
+	if r == nil || run == nil {
+		return
+	}
+	r.mu.Lock()
+	if managed := r.byID[run.ID()]; managed != nil && managed.run == run && !managed.isTerminal() {
+		delete(r.byID, run.ID())
+	}
+	r.mu.Unlock()
+}
+
 // observeRunEvent is installed on the shared execution coordinator, so runs
 // started by Web requests and runs started by agent session tools enter the
-// same bounded replay registry.
+// same bounded replay registry. Registration has already happened in
+// admitRun; this observer only appends to the existing buffer.
 func (r *runRegistry) observeRunEvent(run *execution.CoordinatedSessionRun, event execution.SessionStreamEvent) {
-	managed, ok := r.ensureManaged(run)
+	managed, ok := r.lookupManaged(run)
 	if !ok {
 		return
 	}
@@ -214,7 +256,7 @@ func (r *runRegistry) observeRunEvent(run *execution.CoordinatedSessionRun, even
 // it before removing the active handle, which closes the discovery race for a
 // browser attaching as the run settles.
 func (r *runRegistry) settleRun(run *execution.CoordinatedSessionRun, result execution.SessionMessageResult, err error) {
-	managed, ok := r.ensureManaged(run)
+	managed, ok := r.lookupManaged(run)
 	if !ok {
 		return
 	}
@@ -243,7 +285,7 @@ func (r *runRegistry) settleRun(run *execution.CoordinatedSessionRun, result exe
 	r.mu.Unlock()
 }
 
-func (r *runRegistry) ensureManaged(run *execution.CoordinatedSessionRun) (*managedRun, bool) {
+func (r *runRegistry) lookupManaged(run *execution.CoordinatedSessionRun) (*managedRun, bool) {
 	if r == nil || run == nil || strings.TrimSpace(run.ID()) == "" {
 		return nil, false
 	}
@@ -252,13 +294,10 @@ func (r *runRegistry) ensureManaged(run *execution.CoordinatedSessionRun) (*mana
 	if r.closed {
 		return nil, false
 	}
-	if managed := r.byID[run.ID()]; managed != nil {
-		return managed, true
+	managed, ok := r.byID[run.ID()]
+	if !ok || managed.run != run {
+		return nil, false
 	}
-	managed := newManagedRun(run.ID(), run.SessionID(), r.options)
-	managed.startedAt = run.StartedAt()
-	managed.run = run
-	r.byID[managed.id] = managed
 	return managed, true
 }
 
@@ -364,6 +403,7 @@ func (r *runRegistry) logRunFailure(managed *managedRun, err error) {
 }
 
 func (r *runRegistry) get(id string) (*managedRun, bool) {
+	id = strings.TrimSpace(id)
 	r.mu.Lock()
 	if r.closed {
 		r.mu.Unlock()
@@ -371,13 +411,7 @@ func (r *runRegistry) get(id string) (*managedRun, bool) {
 	}
 	managed, ok := r.byID[id]
 	r.mu.Unlock()
-	if ok {
-		return managed, true
-	}
-	if run, active := r.coordinator.Get(id); active {
-		return r.ensureManaged(run)
-	}
-	return nil, false
+	return managed, ok
 }
 
 func (r *runRegistry) activeRuns() []activeRunSnapshot {
@@ -823,11 +857,16 @@ func (s *Server) handleRunEvents(w http.ResponseWriter, r *http.Request) {
 	for {
 		events, terminal, resyncRequired, oldestSeq, changed := managed.snapshot(after)
 		if resyncRequired {
-			resync := execution.NewSessionStreamEvent("run.resync_required", map[string]any{
-				"run_id":     managed.id,
-				"session_id": managed.sessionID,
-				"oldest_seq": oldestSeq,
-			})
+			resyncFields := map[string]any{
+				"run_id":                 managed.id,
+				"session_id":             managed.sessionID,
+				"oldest_seq":             oldestSeq, // Legacy name; this is a stream event ID.
+				"oldest_stream_event_id": oldestSeq,
+			}
+			if requiredRevision, ok := s.runs.requiredRevision(managed.sessionID); ok {
+				resyncFields["required_revision"] = requiredRevision
+			}
+			resync := execution.NewSessionStreamEvent("run.resync_required", resyncFields)
 			if err := writeSSEEvent(w, 0, resync); err != nil {
 				return
 			}
@@ -856,6 +895,22 @@ func (s *Server) handleRunEvents(w http.ResponseWriter, r *http.Request) {
 			flusher.Flush()
 		}
 	}
+}
+
+// requiredRevision returns the durable session watermark that a client should
+// use when repairing a replay gap. It is intentionally omitted when the
+// registry has no service or the session cannot be read; fabricating a
+// revision would make the resync contract less reliable than omitting the
+// additive hint.
+func (r *runRegistry) requiredRevision(sessionID string) (string, bool) {
+	if r == nil || r.service == nil {
+		return "", false
+	}
+	session, err := r.service.GetSession(sessionID)
+	if err != nil {
+		return "", false
+	}
+	return strconv.FormatInt(session.LastSeq, 10), true
 }
 
 func writeSSEEvent(w io.Writer, sequence int64, event execution.SessionStreamEvent) error {
