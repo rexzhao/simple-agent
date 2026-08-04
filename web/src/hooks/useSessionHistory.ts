@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef } from 'react'
 import type { ItemsPage, Session } from '../types'
-import { useSessionStore } from './useSessionStore'
+import type { SessionStoreHook } from './useSessionStore'
 
 /**
  * Owns selection-safe history requests and pagination.
@@ -14,8 +14,9 @@ export function useSessionHistory(
   selectedSessionID: string,
   loadSessions: (projectID: string, preferredSessionID?: string) => Promise<Session[]>,
   onError: (reason: unknown) => void,
+  store: SessionStoreHook,
 ) {
-  const { state, refreshSession: storeRefresh, loadOlder: storeLoadOlder } = useSessionStore()
+  const { state, refreshSession: storeRefresh, loadOlder: storeLoadOlder } = store
   const selectedSessionRef = useRef(selectedSessionID)
   selectedSessionRef.current = selectedSessionID
 

@@ -405,6 +405,48 @@ refresh is mandatory before claiming that the local projection is current.
 Refreshes must be revision-aware and must not let an older asynchronous response
 overwrite newer history.
 
+### 6.1 Stage 3 frontend consumption rules
+
+The web client keeps one normalized session projection store owned by `App`;
+the history hook receives that store rather than creating a second store. A
+committed item event is dispatched to that store for the event's `session_id`.
+For a cached history window, `item.appended` and `item.created` upsert by the
+projected `item.id` and insert new items by `item.seq`; `item.updated` replaces
+the matching item in place. An update for an item outside the cached page is
+held until pagination loads that item and is never inserted at the live page's
+end. Normal item events do not trigger a full-page refresh.
+
+The store compares the decimal `revision` and durable event `seq` as integers.
+Revision is a session-wide watermark, not an item cursor: several item events
+from one transaction can share it. The store therefore tracks per-item applied
+record sequences and snapshot coverage separately. A snapshot is authoritative
+for the returned history-page items at its revision, while older paged-in
+items remain eligible for same-revision event upserts until an older-page
+response establishes coverage for them. An equal-revision event already
+observed by the client is retained so a racing older snapshot cannot roll it
+back. Events
+for sessions without a cached snapshot may advance known metadata revision and
+are retained in a non-rendered pending queue keyed by durable record sequence.
+The first snapshot establishes the history base when its revision covers any
+pending overflow; pending events newer than that snapshot are replayed in
+sequence, while covered events are dropped. An older response after overflow
+does not establish a base and remains non-rendered until resync.
+The pending queue is bounded separately from the history LRU: background
+sessions and each session's records have fixed caps, and the oldest pending
+queues may be evicted because selecting the session later performs a fresh
+snapshot. Snapshot-in-flight sessions retain only a revision watermark if
+their bounded queue is evicted; an older initial response then triggers a
+second authoritative snapshot rather than exposing an incomplete history.
+The queue and its event payloads remain bounded even when many snapshots are
+in flight. The queue does not create a partial history that looks complete,
+and `clear` removes it with the session. When loading an older page, the client
+captures the entry revision before the request; the response covers at least
+that revision, so a replay at the same revision cannot roll the fetched item
+back, while a higher-revision event still wins. Existing active-run rendering
+and its
+`visibleSessionItems` de-duplication remain transient UI behavior and are not
+used as durable projection identity.
+
 ## 7. Migration compatibility checklist
 
 The following aliases and differences are intentionally frozen for migration:

@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
-import type { ItemsPage, Session, SessionSnapshot } from '../types'
-import { initialSessionStoreState, mergeRefreshedPage, revisionGTE, sessionStoreReducer } from './sessionStore'
+import type { ItemsPage, Session, SessionItem, SessionItemProjectionEvent, SessionSnapshot } from '../types'
+import { initialSessionStoreState, mergeRefreshedPage, pendingProjectionEventCap, pendingProjectionSessionCap, revisionGTE, sessionStoreReducer } from './sessionStore'
 
 const session = (id: string, lastSeq = 0): Session => ({ id, project_id: 'p', display_name: id, last_seq: lastSeq } as Session)
 const page = (seqs: number[]): ItemsPage => ({
@@ -9,6 +9,23 @@ const page = (seqs: number[]): ItemsPage => ({
   newest_seq: seqs[seqs.length - 1] ?? 0,
   has_more_before: seqs[0] > 1,
   has_more_after: false,
+})
+const item = (id: string, seq: number, text = id): SessionItem => ({
+  id,
+  seq,
+  created_at: '',
+  kind: 'message',
+  visibility: 'visible',
+  audience: 'user',
+  message: { role: 'user', content: { inline: text } },
+})
+const projectionEvent = (type: SessionItemProjectionEvent['type'], id: string, itemSeq: number, recordSeq: number, revision: string, text = id, sessionID = 's1'): SessionItemProjectionEvent => ({
+  type,
+  session_id: sessionID,
+  seq: recordSeq,
+  revision,
+  item_id: id,
+  item: item(id, itemSeq, text),
 })
 const snapshot = (sessionID: string, revision: string, seqs: number[]): SessionSnapshot => ({
   session_id: sessionID,
@@ -61,11 +78,15 @@ describe('sessionStoreReducer', () => {
       expect(state.sessionsByID['s1'].id).toBe('s1')
     })
 
-    it('discards history from a snapshot with older revision but updates metadata', () => {
+    it('merges equal-revision snapshot items without rolling back an observed update', () => {
       let state = sessionStoreReducer(initialSessionStoreState(), {
         type: 'snapshot',
-        snapshot: snapshot('s1', '10', [1, 2, 3]),
+        snapshot: snapshot('s1', '9', [1, 2, 3]),
         expectedSessionID: 's1',
+      })
+      state = sessionStoreReducer(state, {
+        type: 'projectionEvent',
+        event: projectionEvent('item.updated', 'item-2', 2, 20, '10', 'event update'),
       })
       // Same revision but different display_name (metadata-only change).
       const renamedSnapshot: SessionSnapshot = {
@@ -79,9 +100,11 @@ describe('sessionStoreReducer', () => {
         snapshot: renamedSnapshot,
         expectedSessionID: 's1',
       })
-      // History unchanged (revision not newer).
+      // The snapshot fills the missed same-revision create, while the event
+      // payload remains authoritative for the item already observed.
       expect(state.historyBySession['s1'].revision).toBe('10')
-      expect(state.historyBySession['s1'].page.items).toHaveLength(3)
+      expect(state.historyBySession['s1'].page.items).toHaveLength(4)
+      expect(state.historyBySession['s1'].page.items[1].message?.content?.inline).toBe('event update')
       // But session metadata updated.
       expect(state.sessionsByID['s1'].display_name).toBe('Renamed')
     })
@@ -171,6 +194,101 @@ describe('sessionStoreReducer', () => {
       })
       expect(state.sessionIDsByProject['p1'].active).toEqual(['s1', 's2'])
     })
+
+    it('preserves a higher projection revision while applying list metadata', () => {
+      let state = sessionStoreReducer(initialSessionStoreState(), {
+        type: 'sessions',
+        projectID: 'p',
+        sessions: [{
+          ...session('s1'),
+          status: 'running',
+          current_run_id: 'run-new',
+          running_run_id: 'run-new',
+          running_turn_id: 'turn-new',
+          latest_run_id: 'run-new',
+          last_run_id: 'run-new',
+          last_run_status: 'running',
+        } as Session],
+        archived: false,
+        generation: 1,
+      })
+      state = sessionStoreReducer(state, {
+        type: 'projectionEvent',
+        event: projectionEvent('item.appended', 'item-1', 1, 100, '100'),
+      })
+      state = sessionStoreReducer(state, {
+        type: 'sessions',
+        projectID: 'p',
+        sessions: [{ ...session('s1', 5), revision: '5', display_name: 'renamed', status: 'idle' } as Session],
+        archived: false,
+        generation: 2,
+      })
+      expect(state.sessionsByID.s1.display_name).toBe('renamed')
+      expect(state.sessionsByID.s1.revision).toBe('100')
+      expect(state.sessionsByID.s1.last_seq).toBe(100)
+      expect(state.sessionsByID.s1.status).toBe('running')
+      expect(state.sessionsByID.s1.current_run_id).toBe('run-new')
+      expect(state.sessionsByID.s1.latest_run_id).toBe('run-new')
+      expect(state.sessionsByID.s1.last_run_status).toBe('running')
+    })
+
+    it('does not resurrect cleared run fields from a stale list', () => {
+      let state = sessionStoreReducer(initialSessionStoreState(), {
+        type: 'sessions',
+        projectID: 'p',
+        sessions: [{ ...session('s1', 100), revision: '100', display_name: 'settled', status: 'completed' } as Session],
+        archived: false,
+        generation: 1,
+      })
+      state = sessionStoreReducer(state, {
+        type: 'sessions',
+        projectID: 'p',
+        sessions: [{
+          ...session('s1', 5),
+          revision: '5',
+          display_name: 'renamed by stale list',
+          status: 'running',
+          current_run_id: 'old-run',
+          running_run_id: 'old-run',
+          interrupted_run_id: 'old-run',
+        } as Session],
+        archived: false,
+        generation: 2,
+      })
+      expect(state.sessionsByID.s1.display_name).toBe('renamed by stale list')
+      expect(state.sessionsByID.s1.status).toBe('completed')
+      expect(state.sessionsByID.s1.current_run_id).toBeUndefined()
+      expect(state.sessionsByID.s1.running_run_id).toBeUndefined()
+      expect(state.sessionsByID.s1.interrupted_run_id).toBeUndefined()
+    })
+
+    it('does not resurrect cleared run fields from a stale snapshot', () => {
+      let state = sessionStoreReducer(initialSessionStoreState(), {
+        type: 'snapshot',
+        snapshot: { ...snapshot('s1', '100', [1]), session: { ...session('s1', 100), display_name: 'settled', status: 'completed' } as Session },
+        expectedSessionID: 's1',
+      })
+      state = sessionStoreReducer(state, {
+        type: 'snapshot',
+        snapshot: {
+          ...snapshot('s1', '5', [1, 2]),
+          session: {
+            ...session('s1', 5),
+            display_name: 'renamed by stale snapshot',
+            status: 'running',
+            current_run_id: 'old-run',
+            running_run_id: 'old-run',
+            interrupted_run_id: 'old-run',
+          } as Session,
+        },
+        expectedSessionID: 's1',
+      })
+      expect(state.sessionsByID.s1.display_name).toBe('renamed by stale snapshot')
+      expect(state.sessionsByID.s1.status).toBe('completed')
+      expect(state.sessionsByID.s1.current_run_id).toBeUndefined()
+      expect(state.sessionsByID.s1.running_run_id).toBeUndefined()
+      expect(state.sessionsByID.s1.interrupted_run_id).toBeUndefined()
+    })
   })
 
   describe('pageOlder action', () => {
@@ -184,6 +302,7 @@ describe('sessionStoreReducer', () => {
         type: 'pageOlder',
         sessionID: 's1',
         older: page([2, 3, 4]),
+        requestRevision: '10',
       })
       expect(state.historyBySession['s1'].page.items.map((i) => i.seq)).toEqual([2, 3, 4, 5, 6, 7])
       expect(state.historyBySession['s1'].page.oldest_seq).toBe(2)
@@ -194,8 +313,186 @@ describe('sessionStoreReducer', () => {
         type: 'pageOlder',
         sessionID: 'unknown',
         older: page([1, 2]),
+        requestRevision: '0',
       })
       expect(state.historyBySession).toEqual({})
+    })
+  })
+
+  describe('projectionEvent action', () => {
+    const cached = (revision = '0', seqs = [1, 2, 3]) => sessionStoreReducer(initialSessionStoreState(), {
+      type: 'snapshot',
+      snapshot: snapshot('s1', revision, seqs),
+      expectedSessionID: 's1',
+    })
+
+    it('upserts duplicate creates by item id and keeps them idempotent', () => {
+      let state = cached()
+      const created = projectionEvent('item.appended', 'created-1', 4, 4, '4', 'same')
+      state = sessionStoreReducer(state, { type: 'projectionEvent', event: created })
+      const applied = state
+      state = sessionStoreReducer(state, { type: 'projectionEvent', event: created })
+      expect(state).toBe(applied)
+      expect(state.historyBySession.s1.page.items.map((current) => current.id)).toEqual(['item-1', 'item-2', 'item-3', 'created-1'])
+    })
+
+    it('keeps same-text items distinct and inserts same-revision events by item sequence', () => {
+      let state = cached()
+      state = sessionStoreReducer(state, { type: 'projectionEvent', event: projectionEvent('item.created', 'created-a', 4, 4, '9', 'same') })
+      state = sessionStoreReducer(state, { type: 'projectionEvent', event: projectionEvent('item.appended', 'created-b', 5, 5, '9', 'same') })
+      expect(state.historyBySession.s1.page.items.map((current) => current.id)).toEqual(['item-1', 'item-2', 'item-3', 'created-a', 'created-b'])
+    })
+
+    it('updates an item in place without changing its history position', () => {
+      let state = cached()
+      state = sessionStoreReducer(state, { type: 'projectionEvent', event: projectionEvent('item.updated', 'item-2', 2, 12, '12', 'updated') })
+      expect(state.historyBySession.s1.page.items.map((current) => current.id)).toEqual(['item-1', 'item-2', 'item-3'])
+      expect(state.historyBySession.s1.page.items[1].message?.content?.inline).toBe('updated')
+    })
+
+    it('does not let an old create replay overwrite a newer update', () => {
+      let state = cached()
+      const create = projectionEvent('item.appended', 'item-2', 2, 12, '20', 'created')
+      const update = projectionEvent('item.updated', 'item-2', 2, 17, '20', 'updated')
+      state = sessionStoreReducer(state, { type: 'projectionEvent', event: create })
+      state = sessionStoreReducer(state, { type: 'projectionEvent', event: update })
+      state = sessionStoreReducer(state, { type: 'projectionEvent', event: create })
+      expect(state.historyBySession.s1.page.items[1].message?.content?.inline).toBe('updated')
+    })
+
+    it('does not insert an update outside the current page, then applies it after older paging', () => {
+      let state = sessionStoreReducer(initialSessionStoreState(), {
+        type: 'snapshot',
+        snapshot: snapshot('s1', '10', [5, 6]),
+        expectedSessionID: 's1',
+      })
+      state = sessionStoreReducer(state, { type: 'projectionEvent', event: projectionEvent('item.updated', 'item-3', 3, 11, '11', 'updated') })
+      expect(state.historyBySession.s1.page.items.map((current) => current.id)).toEqual(['item-5', 'item-6'])
+      state = sessionStoreReducer(state, { type: 'pageOlder', sessionID: 's1', older: page([1, 2, 3, 4]), requestRevision: '10' })
+      expect(state.historyBySession.s1.page.items.map((current) => current.id)).toEqual(['item-1', 'item-2', 'item-3', 'item-4', 'item-5', 'item-6'])
+      expect(state.historyBySession.s1.page.items[2].message?.content?.inline).toBe('updated')
+    })
+
+    it('does not let a same-revision replay roll back an older page response', () => {
+      let state = sessionStoreReducer(initialSessionStoreState(), {
+        type: 'snapshot',
+        snapshot: snapshot('s1', '10', [5, 6]),
+        expectedSessionID: 's1',
+      })
+      const older: ItemsPage = { ...page([1, 2, 3, 4]), items: [item('item-1', 1, 'server'), item('item-2', 2), item('item-3', 3, 'server'), item('item-4', 4)] }
+      state = sessionStoreReducer(state, { type: 'pageOlder', sessionID: 's1', older, requestRevision: '10' })
+      state = sessionStoreReducer(state, { type: 'projectionEvent', event: projectionEvent('item.updated', 'item-3', 3, 9, '10', 'same revision update') })
+      expect(state.historyBySession.s1.page.items.map((current) => current.id)).toEqual(['item-1', 'item-2', 'item-3', 'item-4', 'item-5', 'item-6'])
+      expect(state.historyBySession.s1.page.items[2].message?.content?.inline).toBe('server')
+    })
+
+    it('prefers a higher-revision update received while older paging is in flight', () => {
+      let state = sessionStoreReducer(initialSessionStoreState(), {
+        type: 'snapshot',
+        snapshot: snapshot('s1', '10', [5, 6]),
+        expectedSessionID: 's1',
+      })
+      state = sessionStoreReducer(state, { type: 'projectionEvent', event: projectionEvent('item.updated', 'item-3', 3, 11, '11', 'newer event') })
+      const older: ItemsPage = { ...page([1, 2, 3, 4]), items: [item('item-1', 1), item('item-2', 2), item('item-3', 3, 'old page'), item('item-4', 4)] }
+      state = sessionStoreReducer(state, { type: 'pageOlder', sessionID: 's1', older, requestRevision: '10' })
+      expect(state.historyBySession.s1.page.items[2].message?.content?.inline).toBe('newer event')
+    })
+
+    it('does not create a complete history for an uncached session', () => {
+      let state = sessionStoreReducer(initialSessionStoreState(), {
+        type: 'sessions',
+        projectID: 'p',
+        sessions: [session('s1')],
+        archived: false,
+        generation: 1,
+      })
+      state = sessionStoreReducer(state, { type: 'projectionEvent', event: projectionEvent('item.appended', 'item-1', 1, 1, '1') })
+      expect(state.historyBySession.s1).toBeUndefined()
+      expect(state.sessionsByID.s1.revision).toBe('1')
+      state = sessionStoreReducer(state, {
+        type: 'snapshot',
+        snapshot: snapshot('s1', '0', [1]),
+        expectedSessionID: 's1',
+      })
+      expect(state.historyBySession.s1.page.items.map((current) => current.id)).toEqual(['item-1'])
+      expect(state.sessionsByID.s1.revision).toBe('1')
+    })
+
+    it('keeps uncached events until an older first snapshot establishes the base', () => {
+      let state = initialSessionStoreState()
+      state = sessionStoreReducer(state, { type: 'projectionEvent', event: projectionEvent('item.created', 'created-1', 2, 2, '2') })
+      expect(state.historyBySession.s1).toBeUndefined()
+      expect(state.pendingProjectionBySession.s1.events).toHaveLength(1)
+
+      state = sessionStoreReducer(state, {
+        type: 'snapshot',
+        snapshot: snapshot('s1', '1', [1]),
+        expectedSessionID: 's1',
+      })
+      expect(state.historyBySession.s1.page.items.map((current) => current.id)).toEqual(['item-1', 'created-1'])
+      expect(state.pendingProjectionBySession.s1).toBeUndefined()
+      expect(state.historyBySession.s1.revision).toBe('2')
+    })
+
+    it('replays a pending create and update for the same item in record order', () => {
+      let state = initialSessionStoreState()
+      state = sessionStoreReducer(state, { type: 'projectionEvent', event: projectionEvent('item.created', 'created-1', 2, 2, '2', 'created') })
+      state = sessionStoreReducer(state, { type: 'projectionEvent', event: projectionEvent('item.updated', 'created-1', 2, 3, '3', 'updated') })
+      state = sessionStoreReducer(state, {
+        type: 'snapshot',
+        snapshot: snapshot('s1', '1', [1]),
+        expectedSessionID: 's1',
+      })
+      const projected = state.historyBySession.s1.page.items.find((current) => current.id === 'created-1')
+      expect(projected?.message?.content?.inline).toBe('updated')
+      expect(state.historyBySession.s1.page.items.map((current) => current.id)).toEqual(['item-1', 'created-1'])
+    })
+
+    it('deduplicates pending replay and clears it with the session', () => {
+      const event = projectionEvent('item.created', 'created-1', 2, 2, '2')
+      let state = sessionStoreReducer(initialSessionStoreState(), { type: 'projectionEvent', event })
+      state = sessionStoreReducer(state, { type: 'projectionEvent', event })
+      expect(state.pendingProjectionBySession.s1.events).toHaveLength(1)
+      state = sessionStoreReducer(state, {
+        type: 'snapshot',
+        snapshot: snapshot('s1', '1', [1]),
+        expectedSessionID: 's1',
+      })
+      state = sessionStoreReducer(state, { type: 'projectionEvent', event })
+      expect(state.historyBySession.s1.page.items.filter((current) => current.id === 'created-1')).toHaveLength(1)
+      state = sessionStoreReducer(state, { type: 'clearSession', sessionID: 's1' })
+      expect(state.pendingProjectionBySession.s1).toBeUndefined()
+      expect(state.historyBySession.s1).toBeUndefined()
+    })
+
+    it('updates an already cached background session without selecting it', () => {
+      let state = cached()
+      state = sessionStoreReducer(state, {
+        type: 'snapshot',
+        snapshot: snapshot('s2', '10', [10]),
+        expectedSessionID: 's2',
+      })
+      state = sessionStoreReducer(state, {
+        type: 'projectionEvent',
+        event: projectionEvent('item.updated', 'item-10', 10, 11, '11', 'background update', 's2'),
+      })
+      expect(state.historyBySession.s2.page.items[0].message?.content?.inline).toBe('background update')
+      expect(state.historyBySession.s1.page.items.map((current) => current.id)).toEqual(['item-1', 'item-2', 'item-3'])
+    })
+
+    it('keeps event and snapshot races monotonic at older and equal revisions', () => {
+      let state = cached()
+      const update = projectionEvent('item.updated', 'item-2', 2, 17, '20', 'updated')
+      state = sessionStoreReducer(state, { type: 'projectionEvent', event: update })
+      state = sessionStoreReducer(state, {
+        type: 'snapshot',
+        snapshot: { ...snapshot('s1', '20', [1, 2, 3]), history: { ...page([1, 2, 3]), items: [item('item-1', 1), item('item-2', 2, 'stale'), item('item-3', 3)] } },
+        expectedSessionID: 's1',
+      })
+      expect(state.historyBySession.s1.page.items[1].message?.content?.inline).toBe('updated')
+
+      state = sessionStoreReducer(state, { type: 'projectionEvent', event: projectionEvent('item.updated', 'item-2', 2, 16, '20', 'old replay') })
+      expect(state.historyBySession.s1.page.items[1].message?.content?.inline).toBe('updated')
     })
   })
 
@@ -228,6 +525,64 @@ describe('sessionStoreReducer', () => {
       expect(state.historyBySession['s2']).toBeDefined()
       expect(state.historyBySession['s11']).toBeDefined()
       expect(Object.keys(state.historyBySession)).toHaveLength(10)
+    })
+  })
+
+  describe('uncached projection queue capacity', () => {
+    it('bounds background session and per-session pending queues', () => {
+      let state = initialSessionStoreState()
+      for (let i = 0; i < pendingProjectionSessionCap + 8; i++) {
+        state = sessionStoreReducer(state, {
+          type: 'projectionEvent',
+          event: projectionEvent('item.created', `session-${i}`, i + 1, i + 1, String(i + 1), `session-${i}`, `background-${i}`),
+        })
+      }
+      expect(Object.keys(state.pendingProjectionBySession)).toHaveLength(pendingProjectionSessionCap)
+      expect(state.pendingProjectionBySession['background-0']).toBeUndefined()
+
+      for (let i = 0; i < pendingProjectionEventCap + 8; i++) {
+        state = sessionStoreReducer(state, {
+          type: 'projectionEvent',
+          event: projectionEvent('item.created', `many-${i}`, i + 1, i + 1000, String(i + 1000), `many-${i}`, 'many'),
+        })
+      }
+      expect(state.pendingProjectionBySession.many.events).toHaveLength(pendingProjectionEventCap)
+      expect(state.pendingProjectionBySession.many.events.at(-1)?.item.id).toBe(`many-${pendingProjectionEventCap + 7}`)
+      expect(state.pendingProjectionBySession.many.overflowed).toBe(true)
+    })
+
+    it('keeps the queue bounded and records resync when an in-flight slot is evicted', () => {
+      let state = sessionStoreReducer(initialSessionStoreState(), { type: 'snapshotStarted', sessionID: 'protected' })
+      state = sessionStoreReducer(state, {
+        type: 'projectionEvent',
+        event: projectionEvent('item.created', 'protected-item', 1, 1, '1', 'protected', 'protected'),
+      })
+      for (let i = 0; i < pendingProjectionSessionCap - 1; i++) {
+        state = sessionStoreReducer(state, {
+          type: 'projectionEvent',
+          event: projectionEvent('item.created', `background-item-${i}`, i + 1, i + 2, String(i + 2), 'background', `background-${i}`),
+        })
+      }
+      expect(state.pendingProjectionBySession.protected.events[0].item.id).toBe('protected-item')
+      expect(Object.keys(state.pendingProjectionBySession)).toHaveLength(pendingProjectionSessionCap)
+
+      state = sessionStoreReducer(state, {
+        type: 'projectionEvent',
+        event: projectionEvent('item.created', 'one-more', 100, 100, '100', 'one-more', 'one-more-session'),
+      })
+      expect(Object.keys(state.pendingProjectionBySession)).toHaveLength(pendingProjectionSessionCap)
+      expect(state.snapshotResyncBySession.protected).toBe('1')
+    })
+
+    it('counts concurrent snapshot requests so one finish cannot unprotect early', () => {
+      let state = initialSessionStoreState()
+      state = sessionStoreReducer(state, { type: 'snapshotStarted', sessionID: 's1' })
+      state = sessionStoreReducer(state, { type: 'snapshotStarted', sessionID: 's1' })
+      expect(state.snapshotInFlightBySession.s1).toBe(2)
+      state = sessionStoreReducer(state, { type: 'snapshotFinished', sessionID: 's1' })
+      expect(state.snapshotInFlightBySession.s1).toBe(1)
+      state = sessionStoreReducer(state, { type: 'snapshotFinished', sessionID: 's1' })
+      expect(state.snapshotInFlightBySession.s1).toBeUndefined()
     })
   })
 

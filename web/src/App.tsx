@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { api, streamLifecycle, streamRun } from './api'
-import type { ActiveRun, ActiveRunDescriptor, Bootstrap, ImageAttachmentInput, ItemsPage, LifecycleEvent, Project, RunEvent, RunStep, Session, SessionDebugSettings, SessionItem, SessionModelOption } from './types'
+import type { ActiveRun, ActiveRunDescriptor, Bootstrap, ImageAttachmentInput, ItemsPage, LifecycleEvent, Project, RunEvent, RunStep, Session, SessionDebugSettings, SessionItem, SessionItemProjectionEvent, SessionModelOption } from './types'
 import { errorMessage } from './lib/format'
 import { reduceLifecycleEvent, type SessionMaps } from './lib/lifecycleReducer'
 import { reduceRunEvent } from './lib/runEventReducer'
@@ -18,6 +18,7 @@ import { WorkspaceTree } from './components/WorkspaceTree'
 import { useComposerDrafts } from './hooks/useComposerDrafts'
 import { useRunRegistry } from './hooks/useRunRegistry'
 import { useSessionHistory } from './hooks/useSessionHistory'
+import { useSessionStore } from './hooks/useSessionStore'
 import { useSessionSelection } from './hooks/useSessionSelection'
 
 type BackgroundCompletionNotice = {
@@ -49,6 +50,7 @@ function App() {
   const [turnErrors, setTurnErrors] = useState<Record<string, { turnID: string; message: string }>>({})
   const [compactingSessionIDs, setCompactingSessionIDs] = useState<Record<string, boolean>>({})
   const { draftsBySession, updateDraft, addPastedText, removePastedText, addPastedImage, removePastedImage, clearDraft } = useComposerDrafts()
+  const sessionStore = useSessionStore()
 
   // Session id → display name across every known project, so tool rows can
   // label session_* calls with human-readable targets instead of raw ids.
@@ -183,7 +185,7 @@ function App() {
 
   const reportError = useCallback((reason: unknown) => setError(errorMessage(reason)), [])
   const { sessionDetail, itemsPage, selectedSessionRef, refreshSession, loadOlder } =
-    useSessionHistory(selectedSessionID, loadSessions, reportError)
+    useSessionHistory(selectedSessionID, loadSessions, reportError, sessionStore)
   refreshSessionRef.current = refreshSession
 
   // saveRecentStepsAndRemove: saves steps to recentStepsByTurn, clears timers, removes run.
@@ -531,6 +533,14 @@ function App() {
       case 'usage.updated':
         update((run) => reduceRunEvent(run, event))
         break
+      case 'item.appended':
+      case 'item.created':
+      case 'item.updated':
+        // Projection events are already committed durable DTOs. Apply them
+        // directly to the shared store; unlike run settlement they do not
+        // require a full-page refresh.
+        sessionStore.applyProjectionEvent(event as SessionItemProjectionEvent)
+        break
       case 'run.resync_required':
         try {
           await refreshSession(sessionID)
@@ -602,7 +612,7 @@ function App() {
         break
       }
     }
-  }, [flushRunEvents, queueRunEvent, refreshSession, saveRecentStepsAndRemove, scheduleReconcileRetry, startReconcileTimeout, updateActiveRun])
+  }, [flushRunEvents, queueRunEvent, refreshSession, saveRecentStepsAndRemove, scheduleReconcileRetry, sessionStore.applyProjectionEvent, startReconcileTimeout, updateActiveRun])
 
   const runStreamsRef = useRef(new Set<string>())
   const connectRunStream = useCallback((runID: string, sessionID: string) => {
