@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
-import type { ActiveRun, Session, SessionItem } from '../types'
-import { buildSessionTree, flattenSessionTree, sessionDescendantIDs, visibleSessionItems } from './session'
+import type { Session } from '../types'
+import { buildSessionTree, flattenSessionTree, sessionDescendantIDs } from './session'
 
 function session(id: string, options: Partial<Session> = {}): Session {
   return {
@@ -80,60 +80,5 @@ describe('sessionDescendantIDs', () => {
     const cycleB = session('cycle-b', { parent_session_id: 'cycle-a', root_session_id: 'cycle-a' })
 
     expect(sessionDescendantIDs([cycleA, cycleB], 'cycle-a')).toEqual(['cycle-b'])
-  })
-})
-
-describe('visibleSessionItems', () => {
-  const item = (id: string, turnID: string, role: string, content: string, seq: number): SessionItem => ({
-    id,
-    turn_id: turnID,
-    seq,
-    created_at: '2026-01-01T00:00:00Z',
-    kind: 'message',
-    visibility: 'visible',
-    audience: 'user',
-    message: { role, content: { inline: content } },
-  })
-  const restoredRun = (steps: ActiveRun['steps']): ActiveRun => ({
-    id: 'run-1',
-    sessionID: 'session-1',
-    turnID: 'turn-active',
-    restored: true,
-    userText: '',
-    assistantText: '',
-    steps,
-    agentIteration: 2,
-    status: 'running',
-  })
-
-  it('keeps the restored initial prompt but hides a durable mid-turn prompt rendered by the live run', () => {
-    const items = [
-      item('older', 'turn-older', 'user', 'older', 1),
-      item('initial', 'turn-active', 'user', 'repeat', 2),
-      item('assistant', 'turn-active', 'assistant', 'working', 3),
-      item('appended', 'turn-active', 'user', 'repeat', 4),
-    ]
-    const run = restoredRun([{ kind: 'user', id: 'appended-1', text: 'repeat', iteration: 2 }])
-
-    expect(visibleSessionItems(items, run).map((entry) => entry.id)).toEqual(['older', 'initial'])
-  })
-
-  it('keeps durable restored prompts that are missing from transient replay', () => {
-    const items = [
-      item('initial', 'turn-active', 'user', 'initial', 1),
-      item('appended', 'turn-active', 'user', 'follow up', 2),
-    ]
-
-    expect(visibleSessionItems(items, restoredRun([])).map((entry) => entry.id)).toEqual(['initial', 'appended'])
-  })
-
-  it('hides the complete active turn for a locally-started run', () => {
-    const items = [
-      item('older', 'turn-older', 'user', 'older', 1),
-      item('initial', 'turn-active', 'user', 'initial', 2),
-      item('appended', 'turn-active', 'user', 'follow up', 3),
-    ]
-
-    expect(visibleSessionItems(items, { ...restoredRun([]), restored: false }).map((entry) => entry.id)).toEqual(['older'])
   })
 })

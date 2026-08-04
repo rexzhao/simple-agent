@@ -392,8 +392,8 @@ func TestRunRegistryAdoptsEventsObservedBeforeCoordinatorStartReturns(t *testing
 		t.Fatal("run registry did not reconcile the early event with the returned coordinated run")
 	}
 	events, _, _, _, _ := managed.snapshot(0)
-	if len(events) == 0 || !strings.Contains(string(events[0].Payload), "turn-before-start-return") {
-		t.Fatalf("early event was not retained as the first replay event: %#v", events)
+	if len(events) < 2 || !strings.Contains(string(events[0].Payload), `"type":"run.started"`) || !strings.Contains(string(events[1].Payload), "turn-before-start-return") {
+		t.Fatalf("early replay events = %#v, want run.started followed by the synchronous turn event", events)
 	}
 }
 
@@ -446,7 +446,7 @@ func TestRunRegistryAdoptsAgentStartedCoordinatorRun(t *testing.T) {
 	deadline := time.Now().Add(5 * time.Second)
 	for {
 		events, terminal, _, _, changed := managed.snapshot(0)
-		if len(events) > 0 && strings.Contains(string(events[0].Payload), `"type":"turn.started"`) {
+		if len(events) > 1 && strings.Contains(string(events[0].Payload), `"type":"run.started"`) && strings.Contains(string(events[1].Payload), `"type":"turn.started"`) {
 			if terminal {
 				t.Fatal("agent-started run became terminal before cancellation")
 			}

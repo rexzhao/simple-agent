@@ -85,7 +85,6 @@ export function useRunRegistry(options?: UseRunRegistryOptions) {
             sessionID: descriptor.session_id,
             turnID: descriptor.turn_id,
             restored: true,
-            userText: '',
             assistantText: '',
             steps: [],
             agentIteration: 0,

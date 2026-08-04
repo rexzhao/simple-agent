@@ -1,4 +1,4 @@
-import type { ActiveRunDescriptor, Bootstrap, CodexAuthStatus, ImageAttachmentInput, ItemsPage, LifecycleEvent, Project, ProviderSettingsDocument, ProviderSettingsInput, RunEvent, Session, SessionDebugSettings, SessionModelOptions, SessionSnapshot } from './types'
+import type { ActiveRunDescriptor, Bootstrap, CodexAuthStatus, ImageAttachmentInput, ItemsPage, LifecycleEvent, Project, ProviderSettingsDocument, ProviderSettingsInput, RunAdmission, RunEvent, Session, SessionDebugSettings, SessionModelOptions, SessionSnapshot } from './types'
 
 const tokenStorageKey = 'sai-capability-token'
 
@@ -133,11 +133,11 @@ export const api = {
     method: 'POST',
     body: '{}',
   }),
-  startRun: (sessionID: string, content: string, images: ImageAttachmentInput[] = []) => request<{ run_id: string; session_id: string; status: string }>(`/api/sessions/${encodeURIComponent(sessionID)}/runs`, {
+  startRun: (sessionID: string, content: string, images: ImageAttachmentInput[] = []) => request<RunAdmission>(`/api/sessions/${encodeURIComponent(sessionID)}/runs`, {
     method: 'POST',
     body: JSON.stringify({ content, images }),
   }),
-  continueRun: (sessionID: string) => request<{ run_id: string; session_id: string; status: string }>(`/api/sessions/${encodeURIComponent(sessionID)}/continue`, {
+  continueRun: (sessionID: string) => request<RunAdmission>(`/api/sessions/${encodeURIComponent(sessionID)}/continue`, {
     method: 'POST',
     body: '{}',
   }),
@@ -186,20 +186,37 @@ export interface LifecycleStreamOptions {
   onReconnect?: () => void | Promise<void>
 }
 
-function waitForStreamReconnect(attempt: number): Promise<void> {
+function waitForStreamReconnect(attempt: number, signal?: AbortSignal): Promise<boolean> {
   const delay = Math.min(200 * (2 ** attempt), 2000)
-  return new Promise((resolve) => window.setTimeout(resolve, delay))
+  if (signal?.aborted) return Promise.resolve(false)
+  return new Promise((resolve) => {
+    let timer = 0
+    const finish = (shouldReconnect: boolean) => {
+      window.clearTimeout(timer)
+      signal?.removeEventListener('abort', onAbort)
+      resolve(shouldReconnect)
+    }
+    const onAbort = () => finish(false)
+    timer = window.setTimeout(() => finish(true), delay)
+    signal?.addEventListener('abort', onAbort, { once: true })
+    if (signal?.aborted) onAbort()
+  })
 }
 
-export async function streamRun(runID: string, onEvent: (event: RunEvent) => void | Promise<void>): Promise<void> {
+export interface RunStreamOptions {
+  signal?: AbortSignal
+}
+
+export async function streamRun(runID: string, onEvent: (event: RunEvent) => void | Promise<void>, options: RunStreamOptions = {}): Promise<void> {
   let after = 0
   let reconnects = 0
 
-  while (true) {
+  while (!options.signal?.aborted) {
     try {
       const query = after > 0 ? `?after=${encodeURIComponent(String(after))}` : ''
       const response = await fetch(`/api/runs/${encodeURIComponent(runID)}/events${query}`, {
         headers: { Authorization: `Bearer ${token}` },
+        signal: options.signal,
       })
       if (!response.ok || !response.body) {
         throw new APIError(response.status, 'stream_failed', `Unable to connect to run events (${response.status})`)
@@ -235,13 +252,14 @@ export async function streamRun(runID: string, onEvent: (event: RunEvent) => voi
       }
       if (settled) return
     } catch (reason) {
+      if (options.signal?.aborted) return
       if (reason instanceof APIError) throw reason
     }
 
     if (reconnects >= streamReconnectLimit) {
       throw new APIError(0, 'stream_interrupted', 'The run event stream was interrupted. Refresh the session to view saved results.')
     }
-    await waitForStreamReconnect(reconnects)
+    if (!await waitForStreamReconnect(reconnects, options.signal)) return
     reconnects++
   }
 }

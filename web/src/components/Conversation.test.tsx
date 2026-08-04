@@ -102,6 +102,24 @@ const baseProps = {
 }
 
 describe('Conversation identity boundary', () => {
+  it('rerenders the composer when admissionPending toggles through the memo boundary', () => {
+    const detail = session('s1')
+    const draft = { ...emptyComposerDraft, content: 'pending input' }
+    const view = renderConversation(<Conversation {...baseProps} sessionID="s1" detail={detail} draft={draft} admissionPending={false} />)
+    const composer = screen.getByRole('textbox') as HTMLTextAreaElement
+    const send = screen.getByRole('button', { name: 'Send' }) as HTMLButtonElement
+    expect(composer.disabled).toBe(false)
+    expect(send.disabled).toBe(false)
+
+    view.rerender(<Conversation {...baseProps} sessionID="s1" detail={detail} draft={draft} admissionPending />)
+    expect(composer.disabled).toBe(true)
+    expect(send.disabled).toBe(true)
+
+    view.rerender(<Conversation {...baseProps} sessionID="s1" detail={detail} draft={draft} admissionPending={false} />)
+    expect(composer.disabled).toBe(false)
+    expect(send.disabled).toBe(false)
+  })
+
   it('renders detail when sessionID matches detail.id', () => {
     const detail = session('s1')
     renderConversation(<Conversation {...baseProps} sessionID="s1" detail={detail} />)
@@ -145,7 +163,7 @@ describe('Conversation identity boundary', () => {
   it('shows refresh button when activeRun status is error_pending_refresh', () => {
     const detail = session('s1')
     const run: ActiveRun = {
-      id: 'run-1', sessionID: 's1', userText: '', assistantText: '', steps: [],
+      id: 'run-1', sessionID: 's1', assistantText: '', steps: [],
       agentIteration: 0, status: 'error_pending_refresh',
     }
     renderConversation(<Conversation {...baseProps} sessionID="s1" detail={detail} activeRun={run} />)
@@ -211,7 +229,7 @@ describe('Conversation identity boundary', () => {
     try {
       const detail = session('s1')
       const run: ActiveRun = {
-        id: 'run-1', sessionID: 's1', userText: 'hi', assistantText: '', steps: [],
+        id: 'run-1', sessionID: 's1', assistantText: '', steps: [],
         agentIteration: 1, status: 'running',
         providerRetry: { attempt: 3, maxAttempts: 5, delayMS: 10000 },
       }
@@ -232,7 +250,7 @@ describe('Conversation identity boundary', () => {
     try {
       const detail = session('s1')
       const run: ActiveRun = {
-        id: 'run-1', sessionID: 's1', userText: 'hi', assistantText: '', steps: [],
+        id: 'run-1', sessionID: 's1', assistantText: '', steps: [],
         agentIteration: 1, status: 'running',
         providerRetry: { attempt: 3, maxAttempts: 5, delayMS: 10000 },
       }
@@ -251,7 +269,7 @@ describe('Conversation identity boundary', () => {
   it('does not show refresh button when activeRun is running', () => {
     const detail = session('s1')
     const run: ActiveRun = {
-      id: 'run-1', sessionID: 's1', userText: 'hi', assistantText: '', steps: [],
+      id: 'run-1', sessionID: 's1', assistantText: '', steps: [],
       agentIteration: 0, status: 'running',
     }
     renderConversation(<Conversation {...baseProps} sessionID="s1" detail={detail} activeRun={run} />)
@@ -261,7 +279,7 @@ describe('Conversation identity boundary', () => {
 
 describe('Conversation queued prompt list', () => {
   const runWithQueue = (queuedPrompts: ActiveRun['queuedPrompts']): ActiveRun => ({
-    id: 'run-1', sessionID: 's1', userText: 'hi', assistantText: '', steps: [],
+    id: 'run-1', sessionID: 's1', assistantText: '', steps: [],
     agentIteration: 0, status: 'running', queuedPrompts,
   })
 
@@ -326,7 +344,7 @@ describe('Conversation queued prompt list', () => {
 
 describe('Conversation streaming cursor', () => {
   const runWith = (overrides: Partial<ActiveRun>): ActiveRun => ({
-    id: 'run-1', sessionID: 's1', userText: 'hi', assistantText: '', steps: [],
+    id: 'run-1', sessionID: 's1', assistantText: '', steps: [],
     agentIteration: 0, status: 'running', ...overrides,
   })
 

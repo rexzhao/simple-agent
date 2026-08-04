@@ -193,6 +193,13 @@ export interface ActiveRunDescriptor {
   status: string
 }
 
+/** HTTP 202 response after the coordinator has admitted a run. */
+export interface RunAdmission {
+  run_id: string
+  session_id: string
+  status: string
+}
+
 export type LifecycleEventType =
   | 'session.created'
   | 'session.updated'
@@ -292,6 +299,7 @@ export interface SessionItemProjectionEvent {
 }
 
 export type RunEvent =
+  | { type: 'run.started'; run_id?: string; session_id?: string; turn_id?: string; status?: string }
   | { type: 'turn.started'; turn_id: string }
   | { type: 'compaction.started'; turn_id: string; trigger: 'auto' | 'manual' }
   | { type: 'compaction.completed'; turn_id: string; trigger: 'auto' | 'manual'; compaction_id: string; active_context_tokens?: number; context_window?: number }
@@ -336,14 +344,7 @@ export interface ModelOutputActivity {
 	iteration: number
 }
 
-export interface UserPromptActivity {
-	kind: 'user'
-	id: string
-	text: string
-	iteration: number
-}
-
-export type RunStep = ReasoningActivity | ModelOutputActivity | ToolActivity | UserPromptActivity
+export type RunStep = ReasoningActivity | ModelOutputActivity | ToolActivity
 
 export interface QueuedPrompt {
   id: string
@@ -356,9 +357,9 @@ export interface ActiveRun {
 	sessionID: string
 	turnID?: string
   restored?: boolean
-  userText: string
-  userImages?: ImageAttachmentInput[]
 	queuedPrompts?: QueuedPrompt[]
+	/** Transient process boundaries for drained prompts; never a user item. */
+	processBoundaries?: Array<{ id: string; stepIndex: number }>
 	assistantText: string
 	steps: RunStep[]
   agentIteration: number

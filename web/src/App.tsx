@@ -49,6 +49,7 @@ function App() {
   const [completionNotice, setCompletionNotice] = useState<BackgroundCompletionNotice | null>(null)
   const [turnErrors, setTurnErrors] = useState<Record<string, { turnID: string; message: string }>>({})
   const [compactingSessionIDs, setCompactingSessionIDs] = useState<Record<string, boolean>>({})
+  const [awaitingRunStartedBySession, setAwaitingRunStartedBySession] = useState<Record<string, boolean>>({})
   const { draftsBySession, updateDraft, addPastedText, removePastedText, addPastedImage, removePastedImage, clearDraft } = useComposerDrafts()
   const sessionStore = useSessionStore()
 
@@ -70,6 +71,11 @@ function App() {
   const reconcileRetryTimerRef = useRef<Record<string, number>>({})
   const refreshSessionRef = useRef<(sessionID: string) => Promise<Session | null>>(async () => null)
   const settledRunIDsRef = useRef(new Set<string>())
+  // Local admission responses bind a run id until that run's replay delivers
+  // run.started. This prevents the process-wide lifecycle hint from creating
+  // a transient run before the per-run replay boundary.
+  const runStartedReplayBindingsRef = useRef(new Map<string, string>())
+  const pendingAdmissionSessionsRef = useRef(new Set<string>())
 
   const onSupersedeRunRef = useRef<(sessionID: string, oldRunID: string) => void>(() => {})
 
@@ -83,6 +89,16 @@ function App() {
 
   const clearTurnError = useCallback((sessionID: string) => {
     setTurnErrors((current) => {
+      if (!current[sessionID]) return current
+      const next = { ...current }
+      delete next[sessionID]
+      return next
+    })
+  }, [])
+
+  const setAwaitingRunStarted = useCallback((sessionID: string, awaiting: boolean) => {
+    setAwaitingRunStartedBySession((current) => {
+      if (awaiting) return current[sessionID] ? current : { ...current, [sessionID]: true }
       if (!current[sessionID]) return current
       const next = { ...current }
       delete next[sessionID]
@@ -119,8 +135,15 @@ function App() {
         archived: Object.fromEntries(sessionEntries.map(([projectID, , sessions]) => [projectID, sessions])),
       }
       const recovered = activeRunsPayload.runs.filter((run) => projectsPayload.projects.some((project) => maps.active[project.id]?.some((session) => session.id === run.session_id)))
-      const recoveredProject = recovered.length > 0
-        ? projectsPayload.projects.find((project) => maps.active[project.id]?.some((session) => session.id === recovered[0].session_id))
+      // A reconnect/bootstrap can overlap a local admission. Do not let the
+      // authoritative active-run listing bypass the replay boundary by
+      // creating the transient container for that pending session.
+      const admissionBoundSessions = new Set(runStartedReplayBindingsRef.current.values())
+      const recoveredForPresentation = recovered.filter((run) =>
+        !pendingAdmissionSessionsRef.current.has(run.session_id) && !admissionBoundSessions.has(run.session_id),
+      )
+      const recoveredProject = recoveredForPresentation.length > 0
+        ? projectsPayload.projects.find((project) => maps.active[project.id]?.some((session) => session.id === recoveredForPresentation[0].session_id))
         : null
       const currentProjectID = selectedProjectRef.current
       const currentSessionID = selectedSessionIDRef.current
@@ -134,16 +157,16 @@ function App() {
         : recoveredProject?.id ?? projectsPayload.projects[0]?.id ?? ''
       const firstSessionID = preserveSelection && currentSessionProject && currentSessionID
         ? currentSessionID
-        : recovered[0]?.session_id ?? maps.active[firstProjectID]?.[0]?.id ?? ''
+        : recoveredForPresentation[0]?.session_id ?? maps.active[firstProjectID]?.[0]?.id ?? ''
       setBootstrap(bootstrapPayload)
       setProjects(projectsPayload.projects)
       setSessionMaps(maps)
-      syncActiveRuns(recovered)
+      syncActiveRuns(recoveredForPresentation)
       setSelectedProjectID(firstProjectID)
       setSelectedSessionID(firstSessionID)
-      setRecoveredRuns(recovered)
+      setRecoveredRuns(recoveredForPresentation)
       if (!preserveSelection || projectsPayload.projects.length === 0) setShowProjectForm(projectsPayload.projects.length === 0)
-      return recovered
+      return recoveredForPresentation
     })()
     bootstrapInFlightRef.current = operation
     try {
@@ -520,6 +543,29 @@ function App() {
     flushRunEvents(sessionID, runID)
     const update = (updater: (run: ActiveRun) => ActiveRun | null) => updateActiveRun(sessionID, runID, updater)
     switch (event.type) {
+      case 'run.started': {
+        // Admission only identifies the run stream. The replay's committed
+        // run.started event is the boundary that creates the transient run
+        // container for subsequent deltas, tools, and process UI.
+        runStartedReplayBindingsRef.current.delete(runID)
+        setAwaitingRunStarted(sessionID, false)
+        const turnID = typeof event.turn_id === 'string' ? event.turn_id : undefined
+        const existing = activeRunsRef.current[sessionID]
+        if (existing?.id === runID) {
+          update((run) => ({ ...run, turnID: turnID ?? run.turnID, status: 'running' }))
+        } else {
+          addActiveRun({
+            id: runID,
+            sessionID,
+            turnID,
+            assistantText: '',
+            steps: [],
+            agentIteration: 0,
+            status: 'running',
+          })
+        }
+        break
+      }
       case 'turn.started':
       case 'compaction.started':
       case 'compaction.completed':
@@ -558,8 +604,24 @@ function App() {
       case 'run.settled': {
         if (settledRunIDsRef.current.has(runID)) return
         settledRunIDsRef.current.add(runID)
+        while (settledRunIDsRef.current.size > 256) {
+          const oldest = settledRunIDsRef.current.values().next().value as string | undefined
+          if (!oldest) break
+          settledRunIDsRef.current.delete(oldest)
+        }
+        runStartedReplayBindingsRef.current.delete(runID)
+        setAwaitingRunStarted(sessionID, false)
         const settledRun = activeRunsRef.current[sessionID]
-        if (!settledRun || settledRun.id !== runID) return
+        if (!settledRun || settledRun.id !== runID) {
+          // A terminal replay may retain only run.settled and can therefore
+          // arrive after the transient run container has already been
+          // discarded. The durable projection still needs its normal refresh
+          // when this is the selected session.
+          if (selectedSessionRef.current === sessionID) {
+            try { await refreshSession(sessionID) } catch (reason) { setError(errorMessage(reason)) }
+          }
+          return
+        }
         const settledLastSeq = Number(event.last_seq ?? 0)
         const settledStatus = String(event.status)
 
@@ -612,20 +674,41 @@ function App() {
         break
       }
     }
-  }, [flushRunEvents, queueRunEvent, refreshSession, saveRecentStepsAndRemove, scheduleReconcileRetry, sessionStore.applyProjectionEvent, startReconcileTimeout, updateActiveRun])
+  }, [activeRunsRef, addActiveRun, flushRunEvents, queueRunEvent, refreshSession, saveRecentStepsAndRemove, scheduleReconcileRetry, sessionStore.applyProjectionEvent, setAwaitingRunStarted, startReconcileTimeout, updateActiveRun])
 
+  // A run has at most one active connection by this App instance. streamRun
+  // owns its replay cursor and reconnects internally; a later authoritative
+  // recovery may retry a reader that has failed.
   const runStreamsRef = useRef(new Set<string>())
+  const runStreamControllersRef = useRef(new Map<string, AbortController>())
   const connectRunStream = useCallback((runID: string, sessionID: string) => {
-    if (!runID || !sessionID || runStreamsRef.current.has(runID)) return
+    if (!runID || !sessionID || runStreamsRef.current.has(runID) || settledRunIDsRef.current.has(runID)) return
     runStreamsRef.current.add(runID)
-    void streamRun(runID, (event) => handleRunEvent(sessionID, runID, event))
+    const controller = new AbortController()
+    runStreamControllersRef.current.set(runID, controller)
+    void streamRun(runID, (event) => handleRunEvent(sessionID, runID, event), { signal: controller.signal })
       .catch((reason: unknown) => {
+        if (controller.signal.aborted) return
+        // streamRun already exhausted its own replay reconnects. Allow an
+        // authoritative background bootstrap to retry this failed reader,
+        // while keeping successful/settled runs permanently de-duplicated.
+        runStreamsRef.current.delete(runID)
+        runStartedReplayBindingsRef.current.delete(runID)
+        setAwaitingRunStarted(sessionID, false)
         updateActiveRun(sessionID, runID, (existing) => ({ ...existing, status: 'error_pending_refresh' }))
         setRecoveredRuns((current) => current.filter((item) => item.run_id !== runID))
         setError(errorMessage(reason))
       })
-      .finally(() => runStreamsRef.current.delete(runID))
-  }, [handleRunEvent, updateActiveRun])
+      .finally(() => {
+        runStreamsRef.current.delete(runID)
+        runStreamControllersRef.current.delete(runID)
+      })
+  }, [handleRunEvent, setAwaitingRunStarted, updateActiveRun])
+
+  useEffect(() => () => {
+    for (const controller of runStreamControllersRef.current.values()) controller.abort()
+    runStreamControllersRef.current.clear()
+  }, [])
 
   const knownSession = useCallback((sessionID: string): Session | null => {
     for (const sessions of Object.values(sessionMapsRef.current.active)) {
@@ -683,20 +766,13 @@ function App() {
       }
       if (session) applyLifecycleSessionEvent({ type: 'session.updated', session: { ...session, status: 'running' } })
       if (sessionID && runID) {
-        if (!activeRunsRef.current[sessionID] || activeRunsRef.current[sessionID].id !== runID) {
-          addActiveRun({
-            id: runID,
-            sessionID,
-            turnID: event.turn_id,
-            restored: true,
-            userText: '',
-            assistantText: '',
-            steps: [],
-            agentIteration: 0,
-            status: 'running',
-          })
-        }
-        connectRunStream(runID, sessionID)
+        // A lifecycle hint may race a local POST. It can update session
+        // metadata above, but it never creates a transient run or connects a
+        // stream. Local admission waits for its run replay; background runs
+        // are discovered through the authoritative active-run registry.
+        if (pendingAdmissionSessionsRef.current.has(sessionID) || runStartedReplayBindingsRef.current.has(runID)) return
+        if (activeRunsRef.current[sessionID]?.id === runID) return
+        void bootstrapApplication(true).catch(() => {})
       }
       return
     }
@@ -716,7 +792,7 @@ function App() {
         try { await refreshSession(sessionID) } catch { /* the event metadata already updated the tree */ }
       }
     }
-  }, [activeRunsRef, addActiveRun, applyLifecycleSessionEvent, connectRunStream, handleRunEvent, knownSession, refreshSession])
+  }, [activeRunsRef, applyLifecycleSessionEvent, bootstrapApplication, handleRunEvent, knownSession, refreshSession])
 
   const lifecycleEventHandlerRef = useRef<(event: LifecycleEvent) => Promise<void>>(async () => {})
   lifecycleEventHandlerRef.current = handleLifecycleEvent
@@ -744,13 +820,13 @@ function App() {
   useEffect(() => {
     if (recoveredRuns.length === 0) return
     for (const run of recoveredRuns) {
+      if (pendingAdmissionSessionsRef.current.has(run.session_id) || runStartedReplayBindingsRef.current.has(run.run_id)) continue
       if (!activeRunsRef.current[run.session_id]) {
         addActiveRun({
           id: run.run_id,
           sessionID: run.session_id,
           turnID: run.turn_id,
           restored: true,
-          userText: '',
           assistantText: '',
           steps: [],
           agentIteration: 0,
@@ -764,25 +840,25 @@ function App() {
   // startNewRun handles new composer input. A successful start clears the
   // session's recorded turn failure.
   const startNewRun = async (sessionID: string, content: string, imageInputs: ImageAttachmentInput[]): Promise<boolean> => {
+    pendingAdmissionSessionsRef.current.add(sessionID)
     try {
+      // Admission is the only source of the run identity for a new submit.
+      // Do not construct a stream URL or attach to a session stream before
+      // this response has supplied the authoritative run_id.
       const started = await api.startRun(sessionID, content, imageInputs)
-      addActiveRun({
-        id: started.run_id,
-        sessionID,
-        userText: content,
-        userImages: imageInputs,
-        assistantText: '',
-        steps: [],
-        agentIteration: 0,
-        status: 'running',
-      })
+      if (!started.run_id || started.session_id !== sessionID) {
+        throw new Error('Run admission response did not include the requested session and run_id')
+      }
+      pendingAdmissionSessionsRef.current.delete(sessionID)
+      runStartedReplayBindingsRef.current.set(started.run_id, sessionID)
+      setAwaitingRunStarted(sessionID, true)
       clearTurnError(sessionID)
       const boundRunID = started.run_id
       connectRunStream(boundRunID, sessionID)
       return true
     } catch (reason) {
-      const runID = activeRunsRef.current[sessionID]?.id
-      if (runID) updateActiveRun(sessionID, runID, () => null)
+      pendingAdmissionSessionsRef.current.delete(sessionID)
+      setAwaitingRunStarted(sessionID, false)
       setError(errorMessage(reason))
       return false
     }
@@ -818,27 +894,26 @@ function App() {
     if (activeRun?.status === 'running' || !detail || (detail.status !== 'interrupted' && detail.status !== 'failed') || !detail.interrupted_run_id || !detail.interrupted_turn_id) {
       return false
     }
+    pendingAdmissionSessionsRef.current.add(sessionID)
     try {
       const started = await api.continueRun(sessionID)
-      addActiveRun({
-        id: started.run_id,
-        sessionID,
-        userText: '',
-        userImages: [],
-        assistantText: '',
-        steps: [],
-        agentIteration: 0,
-        status: 'running',
-      })
+      if (!started.run_id || started.session_id !== sessionID) {
+        throw new Error('Run admission response did not include the requested session and run_id')
+      }
+      pendingAdmissionSessionsRef.current.delete(sessionID)
+      runStartedReplayBindingsRef.current.set(started.run_id, sessionID)
+      setAwaitingRunStarted(sessionID, true)
       clearTurnError(sessionID)
       const boundRunID = started.run_id
       connectRunStream(boundRunID, sessionID)
       return true
     } catch (reason) {
+      pendingAdmissionSessionsRef.current.delete(sessionID)
+      setAwaitingRunStarted(sessionID, false)
       setError(errorMessage(reason))
       return false
     }
-  }, [addActiveRun, clearTurnError, connectRunStream, selectedSessionID, sessionDetail])
+  }, [clearTurnError, connectRunStream, selectedSessionID, sessionDetail, setAwaitingRunStarted])
 
   const cancelRun = async () => {
     const run = activeRunsRef.current[selectedSessionID]
@@ -964,6 +1039,7 @@ function App() {
             detail={sessionDetail}
             page={itemsPage}
             activeRun={selectedActiveRun}
+            admissionPending={Boolean(awaitingRunStartedBySession[selectedSessionID])}
             compacting={Boolean(compactingSessionIDs[selectedSessionID])}
 			draft={draftsBySession[selectedSessionID] ?? emptyComposerDraft}
 			onDraftChange={(content) => updateDraft(selectedSessionID, content)}

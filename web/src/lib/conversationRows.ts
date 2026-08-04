@@ -1,5 +1,5 @@
-import type { ActiveRun, ImageAttachmentInput, RunStep, SessionItem } from '../types'
-import { itemText, processKey, visibleSessionItems } from './session'
+import type { ActiveRun, RunStep, SessionItem } from '../types'
+import { itemText, processKey } from './session'
 
 /** A turn error is kept separate from ActiveRun so a failed turn can remain
  * actionable while the durable session is being refreshed. */
@@ -23,12 +23,6 @@ export type ConversationRow =
     steps: RunStep[]
   })
   | (ConversationRowBase & {
-    kind: 'active-user'
-    runID: string
-    text: string
-    images?: ImageAttachmentInput[]
-  })
-  | (ConversationRowBase & {
     kind: 'active-process'
     run: ActiveRun
     steps: RunStep[]
@@ -50,7 +44,7 @@ export type ConversationRow =
 
 export interface BuildConversationRowsInput {
   sessionID: string
-  /** The raw page items. Active-turn duplicates are filtered here. */
+  /** The raw page items from the shared durable session projection. */
   items: SessionItem[]
   activeRun?: ActiveRun | null
   recentStepsByTurn?: Record<string, RunStep[]>
@@ -68,19 +62,9 @@ export interface BuildConversationRowsInput {
  */
 export function buildConversationRows(input: BuildConversationRowsInput): ConversationRow[] {
   const activeRun = input.activeRun ?? null
-  const visibleItems = visibleSessionItems(input.items, activeRun)
-  const rows = buildHistoricalRows(visibleItems, input.sessionID, input.recentStepsByTurn ?? {})
+  const rows = buildHistoricalRows(input.items, input.sessionID, input.recentStepsByTurn ?? {})
 
   if (activeRun) {
-    if (activeRun.userText || (activeRun.userImages?.length ?? 0) > 0) {
-      rows.push({
-        kind: 'active-user',
-        key: rowKey(input.sessionID, 'active-user', activeRun.id),
-        runID: activeRun.id,
-        text: activeRun.userText,
-        images: activeRun.userImages,
-      })
-    }
     if (activeRun.compaction) {
       rows.push({
         kind: 'active-compaction',
@@ -88,26 +72,13 @@ export function buildConversationRows(input: BuildConversationRowsInput): Conver
         compaction: activeRun.compaction,
       })
     }
-    const segments = activeRunSegments(activeRun.steps)
-    const displaySegments = segments.length > 0
-      ? segments
-      : [{ kind: 'steps' as const, steps: [], boundary: 'initial' }]
-    displaySegments.forEach((segment, index) => {
-      if (segment.kind === 'user') {
-        rows.push({
-          kind: 'active-user',
-          key: rowKey(input.sessionID, 'active-user-step', activeRun.id, segment.step.id),
-          runID: activeRun.id,
-          text: segment.step.text,
-        })
-        return
-      }
+    activeRunSegments(activeRun).forEach((segment, index, segments) => {
       rows.push({
         kind: 'active-process',
         key: rowKey(input.sessionID, 'active-process', activeRun.id, segment.boundary),
         run: activeRun,
         steps: segment.steps,
-        isLast: index === displaySegments.length - 1,
+        isLast: index === segments.length - 1,
       })
     })
     if (activeRun.providerRetry) {
@@ -141,6 +112,35 @@ export function buildConversationRows(input: BuildConversationRowsInput): Conver
     rows.push({ kind: 'interrupted', key: rowKey(input.sessionID, 'interrupted') })
   }
   return rows
+}
+
+type ActiveRunSegment = { steps: RunStep[]; boundary: string }
+
+/**
+ * Splits transient process output at server-reported prompt boundaries
+ * without constructing a local user item. The boundary's step index is the
+ * position observed when the prompt was drained, so later assistant/tool
+ * steps remain in the following process segment.
+ */
+function activeRunSegments(run: ActiveRun): ActiveRunSegment[] {
+  const boundaries = [...(run.processBoundaries ?? [])]
+    .filter((boundary) => Number.isInteger(boundary.stepIndex) && boundary.stepIndex >= 0)
+    .sort((left, right) => left.stepIndex - right.stepIndex)
+  const segments: ActiveRunSegment[] = []
+  let start = 0
+  let boundary = 'initial'
+  for (const marker of boundaries) {
+    const end = Math.min(run.steps.length, Math.max(start, marker.stepIndex))
+    segments.push({ steps: run.steps.slice(start, end), boundary })
+    start = end
+    boundary = `after-boundary:${marker.id}`
+  }
+  segments.push({ steps: run.steps.slice(start), boundary })
+  // A boundary is an ordering marker, not a blank conversation row. Keep a
+  // single empty segment only while the run has no process steps at all, so
+  // the live cursor/Generating label still has a container.
+  const nonEmpty = segments.filter((segment) => segment.steps.length > 0)
+  return nonEmpty.length > 0 ? nonEmpty : [segments[segments.length - 1] ?? { steps: [], boundary: 'initial' }]
 }
 
 /** Builds only the durable part of the stream. Exported for consumers that
@@ -263,30 +263,6 @@ export function buildHistoricalRows(items: SessionItem[], sessionID: string, rec
   }
   flushProcess(processTurnID)
   return rows
-}
-
-type ActiveRunSegment =
-  | { kind: 'steps'; steps: RunStep[]; boundary: string }
-  | { kind: 'user'; step: Extract<RunStep, { kind: 'user' }> }
-
-/** Splits an active run at appended user prompts. Segment identity comes from
- * the prompt step (or the fixed initial boundary), never from its position. */
-export function activeRunSegments(steps: RunStep[]): ActiveRunSegment[] {
-  const segments: ActiveRunSegment[] = []
-  let current: RunStep[] = []
-  let boundary = 'initial'
-  for (const step of steps) {
-    if (step.kind === 'user') {
-      if (current.length > 0) segments.push({ kind: 'steps', steps: current, boundary })
-      current = []
-      segments.push({ kind: 'user', step })
-      boundary = `after-user:${step.id}`
-    } else {
-      current.push(step)
-    }
-  }
-  if (current.length > 0) segments.push({ kind: 'steps', steps: current, boundary })
-  return segments
 }
 
 export function conversationRowItemKey(_index: number, row: ConversationRow): string {

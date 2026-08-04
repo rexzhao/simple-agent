@@ -54,6 +54,10 @@ async function mockApp(
   },
 ) {
   let connection = 0
+  const initialEvents = [
+    { type: 'run.started', run_id: 'run-main', session_id: session.id, status: 'running' },
+    ...options.initial,
+  ]
   await page.route('**/api/**', async (route) => {
     const request = route.request()
     const url = new URL(request.url())
@@ -85,7 +89,7 @@ async function mockApp(
     if (url.pathname === '/api/runs/run-main/events') {
       connection++
       if (connection === 1) {
-        return route.fulfill({ status: 200, contentType: 'text/event-stream', body: sse(options.initial) })
+        return route.fulfill({ status: 200, contentType: 'text/event-stream', body: sse(initialEvents) })
       }
       const gate = options.gates[Math.min(connection - 2, options.gates.length - 1)]
       const events = await gate.promise

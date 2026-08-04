@@ -57,16 +57,23 @@ export function reduceRunEvent(run: ActiveRun, event: RunEvent): ActiveRun {
               .filter((prompt): prompt is QueuedPrompt => Boolean(prompt?.id))
           : [],
       }
-    case 'run.prompt_appended': { // A drained prompt becomes part of the visible run.
-      const prompts = Array.isArray(event.prompts) ? event.prompts.map(String).filter((text) => text.trim()) : []
-      if (prompts.length === 0) return run
-      const iteration = run.agentIteration > 0 ? run.agentIteration : 1
-      const turnID = String(event.turn_id ?? run.turnID ?? '') || undefined
-      const steps = [...run.steps]
-      prompts.forEach((text, index) => {
-        steps.push({ kind: 'user', id: `appended-${run.id}-${steps.length}-${index}`, text, iteration })
-      })
-      return { ...run, turnID, steps }
+    case 'run.prompt_appended': {
+      // Prompt admission/draining is not a conversation projection. The
+      // committed user item will arrive through the projection event stream.
+      const turnID = typeof event.turn_id === 'string' ? event.turn_id : ''
+      const prompts = Array.isArray(event.prompts)
+        ? event.prompts.map(String).filter((prompt) => prompt.trim())
+        : []
+      if (!turnID && prompts.length === 0) return run
+      const boundaryID = `prompt-boundary-${run.id}-${(run.processBoundaries?.length ?? 0) + 1}`
+      return {
+        ...run,
+        ...(turnID && turnID !== run.turnID ? { turnID } : {}),
+        processBoundaries: [
+          ...(run.processBoundaries ?? []),
+          { id: boundaryID, stepIndex: run.steps.length },
+        ],
+      }
     }
     case 'agent.iteration.started': {
       const agentIteration = Number(event.agent_iteration ?? 0)

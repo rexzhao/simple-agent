@@ -224,6 +224,16 @@ func (r *runRegistry) admitRun(run *execution.CoordinatedSessionRun) error {
 	managed.startedAt = run.StartedAt()
 	managed.run = run
 	r.byID[managed.id] = managed
+	// Keep the run-start boundary in the same replay buffer as the execution
+	// events. The HTTP admission response only gives the browser the identity
+	// needed to connect; it must not be used to synthesize the transient run
+	// container. This event is appended before the starter is invoked so a
+	// synchronous/very fast run still replays its authoritative start boundary.
+	managed.append(execution.NewSessionStreamEvent("run.started", map[string]any{
+		"run_id":     run.ID(),
+		"session_id": run.SessionID(),
+		"status":     string(execution.SessionRunRunning),
+	}))
 	return nil
 }
 

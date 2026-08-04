@@ -72,10 +72,10 @@ async function mockApp(page: Page, options: { gates: Gate[]; initialItems?: Arra
     }
     if (url.pathname === '/api/runs/run-1/events' || url.pathname === '/api/runs/run-2/events') {
       if (url.pathname.endsWith('run-2/events')) {
-        return route.fulfill({ status: 200, contentType: 'text/event-stream', body: sse([{ type: 'run.settled', run_id: 'run-2', status: 'committed', turn_id: 'turn-2', last_seq: 2 }]) })
+        return route.fulfill({ status: 200, contentType: 'text/event-stream', body: sse([{ type: 'run.started', run_id: 'run-2', session_id: session.id, status: 'running' }, { type: 'run.settled', run_id: 'run-2', status: 'committed', turn_id: 'turn-2', last_seq: 2 }]) })
       }
       connection++
-      if (connection === 1) return route.fulfill({ status: 200, contentType: 'text/event-stream', body: sse([{ type: 'turn.started', turn_id: 'turn-1' }]) })
+      if (connection === 1) return route.fulfill({ status: 200, contentType: 'text/event-stream', body: sse([{ type: 'run.started', run_id: 'run-1', session_id: session.id, status: 'running' }, { type: 'turn.started', turn_id: 'turn-1' }]) })
       const gate = options.gates[Math.min(connection - 2, options.gates.length - 1)] ?? newGate()
       const events = await gate.promise
       return route.fulfill({ status: 200, contentType: 'text/event-stream', body: sse(events, 100 * connection) })
@@ -99,7 +99,9 @@ test('shows the failure reason and continues without resending the user message'
   await page.goto('/')
   await page.getByPlaceholder('Send a message to SAI').fill('fix the bug')
   await page.getByRole('button', { name: 'Send' }).click()
-  await expect(page.locator('.message.user .message-text').last()).toHaveText('fix the bug')
+  // The request is admitted, but this fixture does not emit the committed
+  // item until settlement; there is no optimistic user bubble.
+  await expect(page.getByText('fix the bug')).toHaveCount(0)
 
   // The turn fails: the reason lands in the conversation, not the global banner.
   fail.release([{ type: 'turn.failed', turn_id: 'turn-1', code: 'model_http_error', message: 'model provider returned 429 Too Many Requests: {"error":{"message":"slow down"}}' }])
@@ -119,6 +121,7 @@ test('shows the failure reason and continues without resending the user message'
   const continueButton = page.getByRole('button', { name: 'Continue' })
   await expect(continueButton).toBeVisible()
   await expect(turnError).toBeVisible()
+  await expect(page.locator('.message.user .message-text').last()).toHaveText('fix the bug')
 
   // Continue uses its dedicated endpoint and sends no new user content.
   await continueButton.click()

@@ -5,7 +5,6 @@ import { reduceRunEvent } from './runEventReducer'
 const newRun = (): ActiveRun => ({
   id: 'run-1',
   sessionID: 'session-1',
-  userText: 'hello',
   assistantText: '',
   steps: [],
   agentIteration: 0,
@@ -45,7 +44,7 @@ describe('reduceRunEvent', () => {
     expect(run.steps[0]).toMatchObject({ kind: 'tool', id: 'tool-1', iteration: 1, status: 'finished', result: 'done' })
   })
 
-  it('replaces queued prompts and records drained prompts', () => {
+  it('replaces queued prompts without rendering drained prompts', () => {
     const queued = reduceRunEvent(newRun(), {
       type: 'run.prompt_queue',
       prompts: [{ id: 'prompt-1', content: 'follow up' }],
@@ -71,7 +70,8 @@ describe('reduceRunEvent', () => {
     )
     expect(drained.queuedPrompts).toEqual([])
     expect(drained.turnID).toBe('turn-1')
-    expect(drained.steps).toContainEqual(expect.objectContaining({ kind: 'user', text: 'follow up' }))
+    expect(drained.steps).toEqual([])
+    expect(drained.processBoundaries).toEqual([{ id: 'prompt-boundary-run-1-1', stepIndex: 0 }])
   })
 
   it('tracks reasoning and usage and marks failures', () => {

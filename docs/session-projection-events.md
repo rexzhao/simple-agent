@@ -1,6 +1,6 @@
 # Session projection and run event contract
 
-**Status: stage 2 implementation contract.** This document
+**Status: stage 4 implementation contract.** This document
 is a wire-contract decision, not a request to change the current product
 behavior. The examples and compatibility notes deliberately describe the
 implementation in this repository. Later stages may add fields or migrate an
@@ -347,7 +347,7 @@ tests:
    `run_id`, including synchronous starter emissions and agent/session-tool
    starts. A run event can still be observed before the coordinator's `Start`
    call returns. Consumers must be able to connect after the HTTP 202 response
-   and replay from zero; they must not assume that the first `turn.started`
+   and replay from zero; they must not assume that the first `run.started`
    arrives after the response.
 5. Each connection has its own `after` cursor. Multiple connections replay the
    same retained event with the same run-local IDs; connecting twice does not
@@ -388,16 +388,19 @@ A browser MUST NOT insert a submitted user message into canonical
 `history.items`, advance `session.last_seq`/`revision`, or synthesize an
 `item.created`/`item.appended` notification merely because a command returned
 202. The user item becomes authoritative only through the persisted projection
-notification followed by a snapshot/items refresh, or through a snapshot that
-already includes it. The same rule applies to a prompt accepted into an active
-run: a queued prompt is not yet a durable history item.
+notification applied to the projection store (with a snapshot/items refresh
+when required), or through a snapshot that already includes it. The same rule
+applies to a prompt accepted into an active run: a queued prompt is not yet a
+durable history item.
 
-The current UI may keep the original text in an active-run view (`userText`)
-so that the in-flight run has useful local rendering. That is ephemeral run UI,
-not a mutation of the session history, and it must not be used as a durable
-projection fallback. In particular, the current active-prompt path deliberately
-has no local echo; it renders the server's `run.prompt_queue` and later durable
-item events.
+The composer owns only draft and submission state. On successful admission it
+clears the draft; while the command is in flight it disables submission, and on
+failure it keeps the draft so the command can be retried. Submitted text and
+images are not copied into `ActiveRun`, a conversation row, or any other
+history-like projection. In particular, an active-prompt path may render the
+server's `run.prompt_queue`, but a queued prompt is not a local user message.
+The user bubble appears only after the committed item event is applied to the
+App-owned projection store.
 
 On `run.settled`, `turn.committed`, `item.created`/legacy `item.appended`, or
 `item.updated`, clients may schedule a refresh. On `run.resync_required`, a
@@ -442,10 +445,58 @@ in flight. The queue does not create a partial history that looks complete,
 and `clear` removes it with the session. When loading an older page, the client
 captures the entry revision before the request; the response covers at least
 that revision, so a replay at the same revision cannot roll the fetched item
-back, while a higher-revision event still wins. Existing active-run rendering
-and its
-`visibleSessionItems` de-duplication remain transient UI behavior and are not
-used as durable projection identity.
+back, while a higher-revision event still wins. Active-run state remains a
+transient view of assistant deltas, reasoning, tools, and process status; item
+projection events are applied to the shared store only and are not copied into
+the run. Conversation identity is the backend `item.id`, not message text,
+content, or turn matching.
+
+### 6.2 Stage 4 frontend submit and stream orchestration
+
+For a new composer submission, the frontend follows this order:
+
+1. Treat the composer action as a submit command and keep the text/images in
+   draft state while the request is in flight. Do not create a user item or an
+   optimistic `ActiveRun` message row.
+2. Await `POST /api/sessions/{id}/runs` (or the continue command) and its
+   admitted response. HTTP 202 is the admission boundary; it is not durable
+   item completion.
+3. Read and validate the authoritative `run_id` (and the returned
+   `session_id`) from that response.
+4. Only after that response is available, call
+   `connectRunStream(run_id, session_id)`. The first connection is to the
+   run-specific replay stream, not a guessed URL, a session stream, or a
+   lifecycle event. The App permits at most one *active* connection per run;
+   after a reader failure, a later authoritative recovery may retry it. The
+   run stream itself owns its run-event replay cursor and reconnect behavior.
+5. The registered replay supplies early `run.started` and item events even if
+   execution began immediately after admission. `run.started` creates or
+   updates the transient `ActiveRun`; the admission response itself does not
+   synthesize one. Item events (`item.appended`/`item.created`/`item.updated`) are
+   applied directly to the App-owned session projection store, including when no
+   `ActiveRun` exists yet. Render a submitted user message only from the
+   committed item event, using its
+   backend `item.id`; never fill a stream gap with an optimistic row or a
+   text/turn deduplication guess.
+6. Keep only transient assistant delta/tool/process UI in `ActiveRun` for this
+   stage. `run.prompt_appended` may add an anonymous transient process
+   boundary so transient process output is not folded across a drained prompt;
+   the before/after segments remain internally ordered. It never creates or
+   renders a user item. A committed durable user item still belongs to the
+   historical rows; this stage does not claim to place transient process
+   segments precisely on both sides of that historical bubble. On settlement,
+   retain the existing reconcile behavior and let an authoritative snapshot
+   complete the durable projection; later stages may change how assistant
+   streaming is persisted.
+
+`revision` in a snapshot or projection event is a session-wide snapshot and
+completeness watermark. It is compared numerically and says which durable
+projection state the snapshot/event covers; it is not a cursor for the run
+stream. Replay order and gap detection continue to use the per-run SSE event
+ID (and the backend's `after` replay mechanism), together with the run ID.
+Neither `revision`, item `seq`, `turn_id`, nor optimistic UI may be used to
+invent missing run events or to make the first stream connection before
+`run_id` admission.
 
 ## 7. Migration compatibility checklist
 

@@ -1,4 +1,4 @@
-import type { ActiveRun, Project, Session, SessionItem, SessionModelOption } from '../types'
+import type { Project, Session, SessionItem, SessionModelOption } from '../types'
 
 export function modelKey(model?: SessionModelOption): string {
   return model ? `${model.provider}/${model.model_profile}` : ''
@@ -118,42 +118,6 @@ export function sessionDescendantIDs(sessions: Session[], rootID: string): strin
 
 export function sessionTreeContains(node: SessionTreeNode, sessionIDs: ReadonlySet<string>): boolean {
   return sessionIDs.has(node.session.id) || node.children.some((child) => sessionTreeContains(child, sessionIDs))
-}
-
-/**
- * Keeps durable history and the transient ActiveRun view from rendering the
- * same in-flight items twice. A normal locally-started run renders its whole
- * active turn from transient state, so every durable item in that turn stays
- * hidden until settlement. A restored run must retain durable user input
- * because its initial prompt is not replayed as a stream event; however,
- * mid-turn prompts represented by run.prompt_appended steps are transient too
- * and must be removed from that durable subset.
- *
- * Matching proceeds newest-first so an appended prompt equal to the initial
- * prompt hides the later durable item rather than the initial user bubble.
- */
-export function visibleSessionItems(items: SessionItem[], activeRun: ActiveRun | null): SessionItem[] {
-  const activeTurnID = activeRun?.turnID
-  if (!activeRun || !activeTurnID) return items
-  if (!activeRun.restored) return items.filter((item) => item.turn_id !== activeTurnID)
-
-  const transientPromptCounts = new Map<string, number>()
-  for (const step of activeRun.steps) {
-    if (step.kind !== 'user') continue
-    transientPromptCounts.set(step.text, (transientPromptCounts.get(step.text) ?? 0) + 1)
-  }
-  const transientItemIDs = new Set<string>()
-  for (let index = items.length - 1; index >= 0; index -= 1) {
-    const item = items[index]
-    if (item.turn_id !== activeTurnID || item.message?.role !== 'user') continue
-    const text = itemText(item)
-    const remaining = transientPromptCounts.get(text) ?? 0
-    if (remaining <= 0) continue
-    transientItemIDs.add(item.id)
-    if (remaining === 1) transientPromptCounts.delete(text)
-    else transientPromptCounts.set(text, remaining - 1)
-  }
-  return items.filter((item) => item.turn_id !== activeTurnID || (item.message?.role === 'user' && !transientItemIDs.has(item.id)))
 }
 
 export function itemText(item: SessionItem): string {

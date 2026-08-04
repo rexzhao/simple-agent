@@ -271,7 +271,7 @@ backoff 重试、手动 refresh、切回 session 的 `refreshSession` 共用此 
 
 ### 2.8 reconciling 期间 UI 行为
 
-- reconciling run 仍在 `activeRunsBySession` 中，`visibleSessionItems` 继续隐藏对应 turn 的 durable items。
+- reconciling run 仍在 `activeRunsBySession` 中显示 transient process state；durable items 仍由 shared projection store 渲染，不再按文本/turn matching 隐藏。
 - `ProcessTimeline` / `ActiveRunView` 显示 run steps，但**不显示** "Generating..." / cancel 按钮（`status !== 'running'`）。
 - `Conversation` 的 `running` prop = `activeRun?.status === 'running'`（reconciling 时为 false，不显示 Stop 按钮）。
 - `runningSessionIDs`（sidebar 指示器）仅统计 `status === 'running'` 的 run。

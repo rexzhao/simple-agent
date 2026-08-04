@@ -22,6 +22,7 @@ export const Conversation = memo(function Conversation(props: {
   detail: Session | null
   page: ItemsPage | null
   activeRun: ActiveRun | null
+  admissionPending?: boolean
   compacting: boolean
 	draft: ComposerDraft
 	onDraftChange: (content: string) => void
@@ -293,7 +294,7 @@ export const Conversation = memo(function Conversation(props: {
 		onPastedImageRemove={props.onPastedImageRemove}
 		onDraftClear={props.onDraftClear}
 		running={props.activeRun?.status === 'running'}
-		blocked={!props.activeRun && (props.compacting || safeDetail?.status === 'running')}
+		blocked={Boolean(props.admissionPending) || (!props.activeRun && (props.compacting || safeDetail?.status === 'running'))}
 		onSend={handleSend}
 		onCancel={props.onCancel}
 	  />
@@ -304,6 +305,7 @@ export const Conversation = memo(function Conversation(props: {
   previous.detail === next.detail &&
   previous.page === next.page &&
   previous.activeRun === next.activeRun &&
+  previous.admissionPending === next.admissionPending &&
   previous.compacting === next.compacting &&
   previous.draft === next.draft &&
   previous.turnError === next.turnError &&
@@ -415,8 +417,6 @@ function renderConversationRow(row: ConversationRow, props: ConversationRowRende
 			return <CompactionRecord key={row.key} item={row.item} />
 		case 'process':
 			return <HistoricalProcess key={row.key} entry={row} sessionNames={props.sessionNames} workspaceRoot={props.workspaceRoot} />
-		case 'active-user':
-			return <ActiveUserRow key={row.key} row={row} />
 		case 'active-process':
 			return <ActiveProcessRow key={row.key} row={row} onCancelTool={props.onCancelTool} sessionNames={props.sessionNames} workspaceRoot={props.workspaceRoot} />
 		case 'active-compaction':
@@ -512,23 +512,6 @@ function StoredImageAttachment(props: { sessionID: string; image: SessionImageAt
   if (failed) return <div className="message-image-unavailable">Image unavailable</div>
   if (!dataURL) return <div className="message-image-loading">Loading image…</div>
   return <img className="message-image" src={dataURL} alt={`Attached image (${props.image.media_type})`} />
-}
-
-type ActiveUserRowModel = Extract<ConversationRow, { kind: 'active-user' }>
-
-function ActiveUserRow({ row }: { row: ActiveUserRowModel }) {
-	return (
-		<article className="message user transient">
-			<div className="message-content">
-				{row.text && <div className="message-text">{row.text}</div>}
-				{(row.images?.length ?? 0) > 0 && (
-					<div className="message-image-grid" aria-label="Attached images">
-						{row.images?.map((image, index) => <img className="message-image" src={image.data_url} alt={`Image to send #${index + 1}`} key={`${row.key}:image:${index}`} />)}
-					</div>
-				)}
-			</div>
-		</article>
-	)
 }
 
 function QueuedPromptList({ prompts, onRemove, onSteer, onMove }: {

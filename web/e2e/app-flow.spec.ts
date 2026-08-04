@@ -136,6 +136,7 @@ test('connects a first project, creates a session, and commits a streamed run', 
           status: 200,
           contentType: 'text/event-stream',
           body: sse([
+            { type: 'run.started', run_id: 'run-main', session_id: session.id, status: 'running' },
             { type: 'turn.started', turn_id: 'turn-main' },
             { type: 'agent.iteration.started', turn_id: 'turn-main', agent_iteration: 1 },
             { type: 'text.delta', turn_id: 'turn-main', agent_iteration: 1, text: 'Streamed answer' },
@@ -184,6 +185,7 @@ test('cancels an active run without persisting its transient turn', async ({ pag
   let cancelRun!: () => void
   const cancelled = new Promise<void>((resolve) => { cancelRun = resolve })
   let cancelRequests = 0
+  let cancelEventConnections = 0
 
   await mockExistingSessionApp(page, async (route, url) => {
     const request = route.request()
@@ -192,6 +194,11 @@ test('cancels an active run without persisting its transient turn', async ({ pag
       return true
     }
     if (url.pathname === '/api/runs/run-cancel/events') {
+      cancelEventConnections++
+      if (cancelEventConnections === 1) {
+        await route.fulfill({ status: 200, contentType: 'text/event-stream', body: sse([{ type: 'run.started', run_id: 'run-cancel', session_id: session.id, status: 'running' }]) })
+        return true
+      }
       await cancelled
       await route.fulfill({ status: 200, contentType: 'text/event-stream', body: sse([{ type: 'run.settled', run_id: 'run-cancel', status: 'cancelled', turn_id: 'turn-cancel' }]) })
       return true
@@ -210,11 +217,14 @@ test('cancels an active run without persisting its transient turn', async ({ pag
   await composer.fill('Wait for cancellation')
   await page.getByRole('button', { name: 'Send' }).click()
   await expect(page.getByRole('button', { name: 'Stop' })).toBeVisible()
-  await expect(page.locator('.message.user.transient')).toContainText('Wait for cancellation')
+  // Admission does not create a local user bubble. The committed item event
+  // (which this cancellation fixture intentionally never sends) is the only
+  // source of a rendered user message.
+  await expect(page.locator('.message.user')).toHaveCount(0)
 
   await page.getByRole('button', { name: 'Stop' }).click()
   await expect(page.getByLabel('Session status: idle')).toBeVisible()
-  await expect(page.locator('.message.user.transient')).toHaveCount(0)
+  await expect(page.locator('.message.user')).toHaveCount(0)
   expect(cancelRequests).toBe(1)
 })
 

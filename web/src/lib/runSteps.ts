@@ -46,7 +46,7 @@ export function groupProcessSteps(steps: RunStep[]): Array<{ number: number; ste
 		const iteration = normalizedAgentIteration(step.iteration)
 		groups.set(iteration, [...(groups.get(iteration) ?? []), step])
 	}
-	const rank = (step: RunStep) => step.kind === 'reasoning' ? 0 : step.kind === 'output' ? 1 : step.kind === 'user' ? 3 : 2
+	const rank = (step: RunStep) => step.kind === 'reasoning' ? 0 : step.kind === 'output' ? 1 : 2
 	return [...groups.entries()]
 		.sort(([left], [right]) => left - right)
 		.map(([number, turnSteps]) => ({ number, steps: [...turnSteps].sort((left, right) => rank(left) - rank(right)) }))
@@ -64,8 +64,8 @@ export type ProcessDisplayNode =
 
 // foldToolGroups collapses maximal runs of consecutive tool steps into one
 // display group, across agent iterations. Reasoning counts as part of a tool
-// run and never breaks it; only mid-turn assistant output and user messages
-// do. A run folds when it holds at least one tool call and two steps —
+// run and never breaks it; assistant output does. A run folds when it holds
+// at least one tool call and two steps —
 // shorter runs render as individual rows.
 export function foldToolGroups(steps: RunStep[]): ProcessDisplayNode[] {
 	const flats: FlatProcessStep[] = []

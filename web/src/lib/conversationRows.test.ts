@@ -21,7 +21,6 @@ function run(overrides: Partial<ActiveRun> = {}): ActiveRun {
     id: 'run-1',
     sessionID: 'session-1',
     turnID: 'turn-live',
-    userText: 'prompt',
     assistantText: '',
     steps: [],
     agentIteration: 1,
@@ -155,18 +154,26 @@ describe('buildConversationRows stable identities', () => {
     expect(second.find((row) => row.kind === 'provider-retry')).toMatchObject({ retry: { attempt: 2 } })
   })
 
-  it('uses prompt and run-step identities for appended active segments rather than positions', () => {
+  it('keeps prompt process boundaries without creating user rows and preserves durable identities', () => {
     const firstSteps: RunStep[] = [{ kind: 'reasoning', id: 'reasoning-1', text: 'before', iteration: 1 }]
-    const secondSteps: RunStep[] = [
-      ...firstSteps,
-      { kind: 'user', id: 'prompt-2', text: 'follow up', iteration: 1 },
-      { kind: 'output', id: 'output-2', text: 'after', iteration: 1 },
+    const durableItems = [
+      item('backend-user-1', 1, 'user', 'same text', { turn_id: 'turn-1' }),
+      item('backend-user-2', 2, 'user', 'same text', { turn_id: 'turn-2' }),
     ]
-    const first = buildConversationRows({ sessionID: 'session-1', items: [], activeRun: run({ steps: firstSteps }) })
-    const second = buildConversationRows({ sessionID: 'session-1', items: [], activeRun: run({ steps: secondSteps }) })
+    const first = buildConversationRows({
+      sessionID: 'session-1',
+      items: durableItems,
+      activeRun: run({
+        steps: [...firstSteps, { kind: 'output', id: 'output-2', text: 'after', iteration: 1 }],
+        processBoundaries: [{ id: 'boundary-1', stepIndex: firstSteps.length }],
+      }),
+    })
 
-    expect(second.filter((row) => row.kind === 'active-process')[0].key).toBe(first.filter((row) => row.kind === 'active-process')[0].key)
-    expect(second.filter((row) => row.kind === 'active-user')[1].key).toContain('prompt-2')
-    expect(new Set(keys(second)).size).toBe(second.length)
+    const processes = first.filter((row) => row.kind === 'active-process')
+    expect(processes).toHaveLength(2)
+    expect(processes[0].steps).toEqual(firstSteps)
+    expect(processes[1].steps).toEqual([{ kind: 'output', id: 'output-2', text: 'after', iteration: 1 }])
+    expect(first.filter((row) => row.kind === 'message').map((row) => row.item.id)).toEqual(['backend-user-1', 'backend-user-2'])
+    expect(new Set(keys(first)).size).toBe(first.length)
   })
 })

@@ -39,17 +39,6 @@ export const ProcessTimeline = memo(function ProcessTimeline({ steps, live = fal
 						</div>
 					)
 				}
-				if (step.kind === 'user') {
-					// A mid-turn appended message renders like a regular user
-					// message: light bubble on the right.
-					return (
-						<article className="message user step-message" key={step.id}>{marker}
-							<div className="message-content">
-								<div className="message-text">{step.text}</div>
-							</div>
-						</article>
-					)
-				}
 				return <ToolRow key={step.id} tool={step} marker={marker} onCancelTool={onCancelTool} sessionNames={sessionNames} workspaceRoot={workspaceRoot} />
 			})}
 		</div>
@@ -85,8 +74,8 @@ function ToolGroupRow({ flats, live, onCancelTool, sessionNames, workspaceRoot }
 	// the marker tracks progress. An expanded group instead marks each round
 	// on the row where the round actually begins: the first tool or
 	// reasoning step of that round inside the group. Rounds that begin with
-	// an output or user step outside the group keep their marker there and
-	// are not repeated inside.
+	// an output step outside the group keep their marker there and are not
+	// repeated inside.
 	let markerIteration: number | undefined
 	for (const flat of flats) {
 		if (flat.iterationStart) markerIteration = flat.iteration

@@ -4,7 +4,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { ActiveRun } from '../types'
 import { coalesceRunEvents, streamPublishIntervalMS, useRunRegistry } from './useRunRegistry'
 
-const run: ActiveRun = { id: 'run-1', sessionID: 'session-1', userText: '', assistantText: '', steps: [], agentIteration: 1, status: 'running' }
+const run: ActiveRun = { id: 'run-1', sessionID: 'session-1', assistantText: '', steps: [], agentIteration: 1, status: 'running' }
 
 describe('useRunRegistry delta batching', () => {
   afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks() })

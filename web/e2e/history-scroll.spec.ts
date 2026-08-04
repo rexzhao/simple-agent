@@ -176,6 +176,10 @@ async function mockStreamingApp(
   },
 ) {
   let connection = 0
+  const initialEvents = [
+    { type: 'run.started', run_id: runDescriptor.run_id, session_id: session.id, status: 'running' },
+    ...options.initialEvents,
+  ]
   await page.route('**/api/**', async (route: Route) => {
     const request = route.request()
     const url = new URL(request.url())
@@ -206,7 +210,7 @@ async function mockStreamingApp(
     }
     if (url.pathname === `/api/runs/${runDescriptor.run_id}/events`) {
       connection++
-      if (connection === 1) return route.fulfill({ status: 200, contentType: 'text/event-stream', body: sse(options.initialEvents) })
+      if (connection === 1) return route.fulfill({ status: 200, contentType: 'text/event-stream', body: sse(initialEvents) })
       const gate = options.gates[Math.min(connection - 2, options.gates.length - 1)] ?? newGate()
       const events = await gate.promise
       return route.fulfill({ status: 200, contentType: 'text/event-stream', body: sse(events, 100 * connection) })
@@ -250,6 +254,7 @@ test('stops following output when the user scrolls up, resumes at the bottom', a
   await page.goto('/')
   const messages = page.locator('.messages')
   await expect(page.getByText('message-150', { exact: true })).toBeAttached()
+  await settleViewport(page)
 
   // Start a run from the composer; the first streamed chunk renders.
   await page.getByPlaceholder('Send a message to SAI').fill('hi')
@@ -286,6 +291,7 @@ test('sending a message while scrolled up snaps back to the bottom', async ({ pa
   await page.goto('/')
   const messages = page.locator('.messages')
   await expect(page.getByText('message-150', { exact: true })).toBeAttached()
+  await settleViewport(page)
 
   // Deep in history, far from both edges: no load, no follow.
   await interruptSettle(page)
@@ -296,7 +302,9 @@ test('sending a message while scrolled up snaps back to the bottom', async ({ pa
   await page.getByPlaceholder('Send a message to SAI').fill('follow up')
   await page.getByRole('button', { name: 'Send' }).click()
   await expect.poll(() => distanceFromBottom(page)).toBeLessThanOrEqual(12)
-  await expect(page.getByText('follow up')).toBeAttached()
+  // The fixture does not send the committed projection item. Submission
+  // still follows the live tail, but there must be no local user bubble.
+  await expect(page.getByText('follow up')).toHaveCount(0)
 })
 
 test('a settling run keeps loaded older history and the viewport anchor', async ({ page }) => {
@@ -314,6 +322,7 @@ test('a settling run keeps loaded older history and the viewport anchor', async 
       : items(101, 150),
   })
   await page.goto('/')
+  await settleViewport(page)
   const messages = page.locator('.messages')
   const anchor = page.getByText('message-101', { exact: true })
 
