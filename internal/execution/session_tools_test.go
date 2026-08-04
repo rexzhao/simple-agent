@@ -311,6 +311,90 @@ func TestSessionToolsStrictSteerStopAndProjectScope(t *testing.T) {
 	assertSessionToolErrorCode(t, outside, "session_forbidden")
 }
 
+func TestSessionSendOnSettleValidatesChildAndRegistersSubscription(t *testing.T) {
+	releaseChild := make(chan struct{})
+	childStarted := make(chan SessionTurnRequest, 1)
+	runner := fakeExecutionTurnRunner{
+		supports: true,
+		run: func(ctx context.Context, request SessionTurnRequest) (SessionTurnResult, error) {
+			if err := request.Publisher.Publish(eventAssistant(request.TurnID, "persisted: "+request.Content)); err != nil {
+				return SessionTurnResult{}, err
+			}
+			childStarted <- request
+			select {
+			case <-releaseChild:
+			case <-ctx.Done():
+				return SessionTurnResult{}, ctx.Err()
+			}
+			return SessionTurnResult{Incremental: true}, nil
+		},
+	}
+	service, parent, child, _ := newSessionToolTestSessions(t, t.TempDir(), runner)
+	coordinator := NewSessionRunCoordinator(context.Background(), service, SessionRunCoordinatorOptions{})
+	service.SetSessionRunCoordinator(coordinator)
+	defer func() {
+		service.ClearSessionRunCoordinator(coordinator)
+		coordinator.Close()
+	}()
+	executor := &sessionToolExecutor{service: service, coordinator: coordinator, caller: parent}
+
+	// on_settle requires the target to be a direct child of the caller.
+	notChild := executeSessionTool(t, executor, ToolSessionSend, map[string]any{
+		"session_id": parent.ID, "message": "x", "on_settle": "continue_parent",
+	})
+	assertSessionToolErrorCode(t, notChild, "session_not_a_child")
+
+	// Invalid on_settle values and blank are rejected.
+	invalid := executeSessionTool(t, executor, ToolSessionSend, map[string]any{
+		"session_id": child.ID, "message": "x", "on_settle": "later",
+	})
+	assertSessionToolErrorCode(t, invalid, "invalid_arguments")
+	blank := executeSessionTool(t, executor, ToolSessionSend, map[string]any{
+		"session_id": child.ID, "message": "x", "on_settle": "",
+	})
+	assertSessionToolErrorCode(t, blank, "invalid_arguments")
+
+	// Idle child: on_settle starts a new run and registers a continuation.
+	started := executeSessionTool(t, executor, ToolSessionSend, map[string]any{
+		"session_id": child.ID, "message": "child task", "on_settle": "continue_parent",
+	})
+	startedPayload := decodeSessionToolPayload(t, started)
+	if startedPayload["delivery"] != "started" || startedPayload["on_settle"] != "continue_parent" {
+		t.Fatalf("idle on_settle payload = %#v", startedPayload)
+	}
+	childRunID := requiredPayloadString(t, startedPayload, "run_id")
+	select {
+	case <-childStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("child run did not start")
+	}
+	waitForCompletionTest(t, func() bool {
+		deliveries, err := service.sessionStore.ListSessionInbox(parent.ID)
+		if err != nil || len(deliveries) != 1 {
+			return false
+		}
+		return deliveries[0].ChildSessionID == child.ID && deliveries[0].ChildRunID == childRunID && deliveries[0].Status == sessions.SessionInboxStatusPending
+	})
+
+	// Active child: on_settle appends to the active run (non-strict steer).
+	appended := executeSessionTool(t, executor, ToolSessionSend, map[string]any{
+		"session_id": child.ID, "message": "active guidance", "on_settle": "continue_parent",
+	})
+	appendedPayload := decodeSessionToolPayload(t, appended)
+	if appendedPayload["delivery"] != "appended" || appendedPayload["session_id"] != child.ID {
+		t.Fatalf("active on_settle payload = %#v", appendedPayload)
+	}
+	// The appended message joins the same run; the subscription dedupes to the
+	// same child run, so the inbox still has exactly one pending delivery.
+	waitForCompletionTest(t, func() bool {
+		deliveries, err := service.sessionStore.ListSessionInbox(parent.ID)
+		if err != nil || len(deliveries) != 1 {
+			return false
+		}
+		return deliveries[0].ChildRunID == childRunID
+	})
+}
+
 func TestSessionStartValidatesModelPairDepthAndCoordinator(t *testing.T) {
 	service, parent, _, _ := newSessionToolTestSessions(t, t.TempDir(), fakeExecutionTurnRunner{supports: true})
 	executor := &sessionToolExecutor{service: service, caller: parent}

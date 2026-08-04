@@ -155,7 +155,7 @@ func sessionToolDefinitions() []model.Tool {
 		},
 		{
 			Name:        ToolSessionSend,
-			Description: "Send input to a session in the current project. mode=steer strictly targets the currently active turn and fails if its steer gate has closed; mode=queue schedules an independent next turn, starting an idle session when needed.",
+			Description: "Send input to a session in the current project. Without on_settle, mode=steer strictly targets the currently active turn and fails if its steer gate has closed, while mode=queue schedules an independent next turn, starting an idle session when needed. With on_settle=continue_parent the target must be a direct child of the calling session: the message joins the child's active run (or starts a new run when the child is idle) and the child run's settlement durably wakes the caller.",
 			InputSchema: sessionToolObjectSchema(map[string]any{
 				"session_id": map[string]any{
 					"type":        "string",
@@ -164,13 +164,19 @@ func sessionToolDefinitions() []model.Tool {
 				"mode": map[string]any{
 					"type":        "string",
 					"enum":        []any{"steer", "queue"},
-					"description": "Strictly steer the active turn, or queue a separate turn.",
+					"description": "Delivery mode. Required unless on_settle is set; with on_settle the message joins the child's active run or starts a new run.",
 				},
 				"message": map[string]any{
 					"type":        "string",
 					"description": "Message to deliver verbatim.",
 				},
-			}, []any{"session_id", "mode", "message"}),
+				"on_settle": map[string]any{
+					"type":        "string",
+					"enum":        []any{"none", "continue_parent"},
+					"default":     "none",
+					"description": "Completion behavior for the target child run. none leaves the caller untouched; continue_parent (valid only for a direct child session) durably wakes the caller with a compact completion notification after the child run settles.",
+				},
+			}, []any{"session_id", "message"}),
 		},
 		{
 			Name:        ToolSessionWait,
@@ -566,18 +572,38 @@ func (e *sessionToolExecutor) send(toolName string, arguments map[string]any) (m
 	if target.Archived {
 		return sessionToolError(toolName, "session_archived", "archived session cannot receive messages")
 	}
-	mode, err := requiredTrimmedSessionString(arguments, "mode")
-	if err != nil {
-		return sessionToolError(toolName, "invalid_arguments", err.Error())
-	}
 	message, err := requiredRawSessionString(arguments, "message")
 	if err != nil {
 		return sessionToolError(toolName, "invalid_arguments", err.Error())
+	}
+	onSettle, err := optionalTrimmedSessionString(arguments, "on_settle")
+	if err != nil {
+		return sessionToolError(toolName, "invalid_arguments", err.Error())
+	}
+	if _, supplied := arguments["on_settle"]; supplied && onSettle == "" {
+		return sessionToolError(toolName, "invalid_arguments", "on_settle must not be blank")
+	}
+	if onSettle == "" {
+		onSettle = "none"
+	}
+	if onSettle != "none" && onSettle != "continue_parent" {
+		return sessionToolError(toolName, "invalid_arguments", "on_settle must be one of none or continue_parent")
 	}
 	if e.coordinator == nil {
 		return sessionToolError(toolName, "coordinator_unavailable", "session run coordinator is not configured")
 	}
 
+	if onSettle == "continue_parent" {
+		if target.ParentSessionID != e.caller.ID {
+			return sessionToolError(toolName, "session_not_a_child", "on_settle=continue_parent requires the target session to be a direct child of the calling session")
+		}
+		return e.sendWithSettle(toolName, target.ID, message)
+	}
+
+	mode, err := requiredTrimmedSessionString(arguments, "mode")
+	if err != nil {
+		return sessionToolError(toolName, "invalid_arguments", err.Error())
+	}
 	switch mode {
 	case "steer":
 		run, active := e.coordinator.ActiveForSession(target.ID)
@@ -595,6 +621,49 @@ func (e *sessionToolExecutor) send(toolName string, arguments map[string]any) (m
 	default:
 		return sessionToolError(toolName, "invalid_arguments", "mode must be either steer or queue")
 	}
+}
+
+// sendWithSettle delivers a message to a direct child session and registers a
+// durable subscription so the child run's settlement wakes the caller. The
+// message is never dropped: it joins the child's active run's turn queue
+// (non-strict AppendActive, so it drains into a follow-up turn if the active
+// turn settles first), or starts a new run when the child is idle. Admission
+// races retry internally, and an unresolved race returns session_busy instead
+// of silently dropping the message. The subscription is registered after the
+// message is durably accepted; RegisterContinueParentSubscription closes the
+// fast-settle race itself.
+func (e *sessionToolExecutor) sendWithSettle(toolName, childID, message string) (model.ToolResult, error) {
+	for attempt := 0; attempt < 3; attempt++ {
+		if active, ok := e.coordinator.ActiveForSession(childID); ok {
+			if err := active.AppendActive(message); err == nil {
+				if err := e.service.RegisterContinueParentSubscription(e.caller.ID, childID, active.ID()); err != nil {
+					return sessionToolErrorFields(toolName, sessionToolErrorCode(err), safeSessionToolError(err), map[string]any{
+						"session_id": childID, "run_id": active.ID(), "delivery": "appended", "on_settle": "continue_parent",
+					})
+				}
+				return sessionToolResult(toolName, map[string]any{
+					"ok": true, "session_id": childID, "run_id": active.ID(), "delivery": "appended", "on_settle": "continue_parent",
+				})
+			} else if !errors.Is(err, ErrSessionRunSettled) {
+				return sessionToolFailure(toolName, err)
+			}
+		}
+		run, err := e.coordinator.Start(childID, SessionMessageInput{Content: message}, nil)
+		if err == nil {
+			if err := e.service.RegisterContinueParentSubscription(e.caller.ID, childID, run.ID()); err != nil {
+				return sessionToolErrorFields(toolName, sessionToolErrorCode(err), safeSessionToolError(err), map[string]any{
+					"session_id": childID, "run_id": run.ID(), "delivery": "started", "on_settle": "continue_parent",
+				})
+			}
+			return sessionToolResult(toolName, map[string]any{
+				"ok": true, "session_id": childID, "run_id": run.ID(), "delivery": "started", "on_settle": "continue_parent",
+			})
+		}
+		if !errors.Is(err, ErrSessionBusy) {
+			return sessionToolFailure(toolName, err)
+		}
+	}
+	return sessionToolError(toolName, "session_busy", "session run changed while delivering the message; retry")
 }
 
 func (e *sessionToolExecutor) queueMessage(toolName, sessionID, message string) (model.ToolResult, error) {

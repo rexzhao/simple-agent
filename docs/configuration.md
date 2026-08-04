@@ -380,8 +380,10 @@ tools:
 records its parent/root lineage. It can inherit the caller's frozen
 provider/model snapshot or select a provider and model profile returned by
 `session_models`. `session_send` supports strict active-turn `steer` (which
-fails once that turn stops accepting input) and a separate next-turn `queue`.
-`session_get` and `session_wait` return only persisted assistant items, never
+fails once that turn stops accepting input), a separate next-turn `queue`, and
+`on_settle=continue_parent` for delivering a message to a direct child session
+and being durably woken when the child run settles. `session_get` and
+`session_wait` return only persisted assistant items, never
 uncommitted streaming deltas. `session_history` returns paginated,
 user-visible persisted conversation items. Session tools cannot query sessions
 in another project, wait for or stop their own run, or spawn beyond the bounded

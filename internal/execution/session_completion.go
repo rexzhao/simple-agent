@@ -201,7 +201,7 @@ func completionNotification(delivery sessions.SessionInboxDelivery) string {
 	if status == "" {
 		status = "settled"
 	}
-	return fmt.Sprintf("Internal child-completion notification. Child session %q initial run %q settled with status %q. Read the child's persisted output using session_get or session_history before deciding how to continue the parent task. This is a notification, not a new user request; do not repeat the child's prompt.", delivery.ChildSessionID, delivery.ChildRunID, status)
+	return fmt.Sprintf("Internal child-completion notification. Child session %q run %q settled with status %q. Read the child's persisted output using session_get or session_history before deciding how to continue the parent task. This is a notification, not a new user request; do not repeat the child's prompt.", delivery.ChildSessionID, delivery.ChildRunID, status)
 }
 
 func (s *Service) dispatchCompletionDelivery(parent sessions.SessionV2, delivery sessions.SessionInboxDelivery, coordinator *SessionRunCoordinator) {

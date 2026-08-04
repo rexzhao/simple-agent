@@ -59,8 +59,12 @@ export function sessionToolTarget(name: string, args: Record<string, unknown>, s
 		}
 		case 'session_send': {
 			const mode = stringValue(args, 'mode')
+			const onSettle = stringValue(args, 'on_settle')
 			const message = inlineSnippet(stringValue(args, 'message'))
-			return [label, mode, message && `"${message}"`].filter(Boolean).join(' · ')
+			const parts = [label, mode]
+			if (onSettle) parts.push(onSettle)
+			if (message) parts.push(`"${message}"`)
+			return parts.filter(Boolean).join(' · ')
 		}
 		default:
 			return ''

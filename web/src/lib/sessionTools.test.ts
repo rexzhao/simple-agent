@@ -65,6 +65,13 @@ describe('sessionToolTarget', () => {
 			.toBe('id-1 · queue · "hello world"')
 	})
 
+	it('shows on_settle in session_send summaries', () => {
+		expect(sessionToolTarget('session_send', { session_id: 'id-1', message: 'go', on_settle: 'continue_parent' }, {}))
+			.toBe('id-1 · continue_parent · "go"')
+		expect(sessionToolTarget('session_send', { session_id: 'id-1', mode: 'queue', message: 'go', on_settle: 'continue_parent' }, {}))
+			.toBe('id-1 · queue · continue_parent · "go"')
+	})
+
 	it('returns an empty summary for session_models', () => {
 		expect(sessionToolTarget('session_models', {})).toBe('')
 	})

@@ -38,7 +38,7 @@ never included in tool results.
 | `session_search` | Match canonical session names with a Go RE2 regular expression. | Default 20 results; maximum 100. |
 | `session_get` | Read session state and its latest relevant persisted assistant item. | Default output limit 64 Ki characters; maximum 256 Ki. |
 | `session_history` | Read a page of persisted, user-visible conversation items. | Default 50 items; maximum 200. |
-| `session_send` | Strictly steer the current turn or queue an independent next turn. | `mode` is `steer` or `queue`. |
+| `session_send` | Send input to a session: strict `steer`, next-turn `queue`, or `on_settle=continue_parent` to a direct child that wakes the caller. | `target` must be a direct child of the caller for `on_settle`. |
 | `session_wait` | Wait for the run active when the call begins, then inspect the session. | Default and maximum timeout: 30 seconds. |
 | `session_stop` | Request cancellation of a session's active run. | Self-stop is rejected; the durable session is not deleted. |
 
@@ -185,6 +185,31 @@ run also settles its accepted-but-unstarted queue entries. Once a queued turn
 starts, its user and assistant items are persisted in the normal session
 ledger.
 
+### `on_settle=continue_parent` to a direct child
+
+`session_send` can also ask a direct child session to run a message and then
+wake the caller when the child run settles:
+
+```json
+{
+  "session_id": "child-session-id",
+  "message": "Run the migration and report failures.",
+  "on_settle": "continue_parent"
+}
+```
+
+The target must be a direct child of the calling session
+(`target.parent_session_id` equals the caller), otherwise the call fails with
+`session_not_a_child`. `mode` is omitted here: the message joins the child's
+active run (non-strict, so it drains into a follow-up turn if the active turn
+settles first) or starts a new run when the child is idle. When the child run
+settles, the caller is durably woken with a compact completion notification —
+the same mechanism `session_start`'s `continue_parent` uses — and the caller
+does not need to call `session_wait`. The subscription is registered after the
+message is accepted, so a fast child settlement cannot lose the wakeup. The
+result reports `delivery: "appended"` or `delivery: "started"` plus the child
+`run_id` and `on_settle: "continue_parent"`.
+
 Archived sessions can be inspected but cannot receive input.
 
 ## Waiting and stopping
@@ -225,6 +250,7 @@ Stable error codes include:
 | `session_not_found` | No durable session exists for the ID. |
 | `session_forbidden` | The target belongs to another project. |
 | `session_archived` | Input was attempted on an archived session. |
+| `session_not_a_child` | `on_settle=continue_parent` was used on a target that is not a direct child of the caller. |
 | `session_not_steerable` | No active turn currently accepts strict steer input. |
 | `session_busy` | A run-boundary race prevented safe queue/start admission; retry. |
 | `run_capacity_reached` | The application-wide active-run limit is full. |
