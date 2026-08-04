@@ -16,6 +16,26 @@ const tool = (overrides: Partial<ToolActivity>): ToolActivity => ({
 })
 
 describe('ProcessTimeline session tools', () => {
+	it('shows start_line and line_count on the read_file row', () => {
+		const steps: RunStep[] = [tool({
+			arguments: JSON.stringify({ path: 'notes.ts', start_line: 42, line_count: 10 }),
+		})]
+		render(<ProcessTimeline steps={steps} />)
+
+		expect(screen.getByText('read_file')).not.toBeNull()
+		expect(screen.getByText('notes.ts:42+10')).not.toBeNull()
+	})
+
+	it('omits the trailing +count when read_file has no line_count', () => {
+		const steps: RunStep[] = [tool({
+			arguments: JSON.stringify({ path: 'notes.ts', start_line: 42 }),
+		})]
+		render(<ProcessTimeline steps={steps} />)
+
+		expect(screen.getByText('read_file')).not.toBeNull()
+		expect(screen.getByText('notes.ts:42')).not.toBeNull()
+	})
+
 	it('shows a summary target on the collapsed session_start row', () => {
 		const steps: RunStep[] = [tool({
 			name: 'session_start',

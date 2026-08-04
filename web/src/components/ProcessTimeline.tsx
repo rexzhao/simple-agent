@@ -355,6 +355,10 @@ function stringField(value: Record<string, unknown>, key: string): string {
 	return typeof value[key] === 'string' ? value[key] : ''
 }
 
+function numberField(value: Record<string, unknown>, key: string): number | undefined {
+	return typeof value[key] === 'number' ? value[key] : undefined
+}
+
 function toolTarget(name: string, argumentsObject: Record<string, unknown>): string {
 	const path = stringField(argumentsObject, 'path')
 	if (name === 'list_files') return path || '.'
@@ -366,6 +370,12 @@ function toolTarget(name: string, argumentsObject: Record<string, unknown>): str
 		const query = stringField(argumentsObject, 'query')
 		const mode = argumentsObject.literal === true ? 'literal' : 'regex'
 		return [path, query && `${mode}: ${query}`].filter(Boolean).join(' · ')
+	}
+	if (name === 'read_file') {
+		const startLine = numberField(argumentsObject, 'start_line')
+		const lineCount = numberField(argumentsObject, 'line_count')
+		if (startLine === undefined) return path
+		return lineCount === undefined ? `${path}:${startLine}` : `${path}:${startLine}+${lineCount}`
 	}
 	if (path) return path
 	if (name === 'shell') {
