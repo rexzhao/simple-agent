@@ -253,16 +253,40 @@ func (s *Service) GetSessionChatItemsPage(id string, options SessionItemsOptions
 	if limit > maximumSessionChatItemsLimit {
 		return SessionItemsPage{}, fmt.Errorf("session item limit cannot exceed %d", maximumSessionChatItemsLimit)
 	}
-	session, err := s.sessionStore.Load(id)
+	page, err := s.sessionStore.ReadHistoryPage(id, sessions.HistoryPageOptions{
+		BeforeSeq:   options.BeforeSeq,
+		AfterSeq:    options.AfterSeq,
+		Limit:       limit,
+		AlignTurn:   options.AlignTurn,
+		VisibleOnly: true,
+	})
 	if err != nil {
 		return SessionItemsPage{}, err
 	}
-	return s.buildItemsPage(session, options.BeforeSeq, options.AfterSeq, limit, options.AlignTurn)
+	return s.sessionItemsPageFromStorePage(id, page)
 }
 
-// buildItemsPage derives a chat items page from an already-loaded session
-// without re-reading the store. Shared by GetSessionChatItemsPage and
-// GetSessionSnapshot so both see the same items for a single load.
+func (s *Service) sessionItemsPageFromStorePage(sessionID string, page sessions.HistoryPage) (SessionItemsPage, error) {
+	items := make([]SessionItem, 0, len(page.Items))
+	for _, item := range page.Items {
+		dto, err := s.sessionItemDTO(sessionID, item)
+		if err != nil {
+			return SessionItemsPage{}, err
+		}
+		items = append(items, dto)
+	}
+	return SessionItemsPage{
+		Items:         items,
+		OldestSeq:     page.OldestSeq,
+		NewestSeq:     page.NewestSeq,
+		HasMoreBefore: page.HasMoreBefore,
+		HasMoreAfter:  page.HasMoreAfter,
+	}, nil
+}
+
+// buildItemsPage derives a chat items page from an already-loaded execution
+// state without re-reading the store. It remains useful to callers that have
+// already made the explicit execution-state load.
 func (s *Service) buildItemsPage(session sessions.SessionV2, beforeSeq, afterSeq int64, limit int, alignTurn bool) (SessionItemsPage, error) {
 	filtered := make([]sessions.SessionItem, 0, len(session.Items))
 	for _, item := range session.Items {
@@ -273,7 +297,7 @@ func (s *Service) buildItemsPage(session sessions.SessionV2, beforeSeq, afterSeq
 	page, hasMoreBefore, hasMoreAfter := pagedSessionItems(filtered, beforeSeq, afterSeq, limit, alignTurn)
 	items := make([]SessionItem, 0, len(page))
 	for _, item := range page {
-		dto, err := s.sessionItemDTO(item)
+		dto, err := s.sessionItemDTO(session.ID, item)
 		if err != nil {
 			return SessionItemsPage{}, err
 		}
@@ -300,7 +324,7 @@ func (s *Service) ReadSessionImage(id, hash string) (SessionImage, error) {
 	if hash == "" {
 		return SessionImage{}, fmt.Errorf("image hash is required")
 	}
-	session, err := s.sessionStore.Load(id)
+	session, err := s.sessionStore.LoadExecutionState(id)
 	if err != nil {
 		return SessionImage{}, err
 	}
@@ -316,7 +340,7 @@ func (s *Service) ReadSessionImage(id, hash string) (SessionImage, error) {
 			if !supported {
 				return SessionImage{}, fmt.Errorf("image %q has unsupported media type", hash)
 			}
-			raw, err := s.sessionStore.ReadBlob(*block.ImageBlob)
+			raw, err := s.sessionStore.ReadBlobForSession(session.ID, *block.ImageBlob)
 			if err != nil {
 				return SessionImage{}, err
 			}
@@ -334,7 +358,7 @@ func (s *Service) GetSessionTurnFinalAssistantOutput(id, turnID string) (string,
 	if turnID == "" {
 		return "", fmt.Errorf("turn id is required")
 	}
-	session, err := s.sessionStore.Load(id)
+	session, err := s.sessionStore.LoadExecutionState(id)
 	if err != nil {
 		return "", err
 	}
@@ -347,7 +371,7 @@ func (s *Service) GetSessionTurnFinalAssistantOutput(id, turnID string) (string,
 		if item.Message == nil || item.Message.Role != model.MessageRoleAssistant || item.Audience != sessions.ItemAudienceModel {
 			continue
 		}
-		text, err := s.sessionItemFullContent(item)
+		text, err := s.sessionItemFullContent(id, item)
 		if err != nil {
 			return "", err
 		}
@@ -366,7 +390,7 @@ func (s *Service) CompactSession(ctx context.Context, id string) (SessionCompact
 	if s.compactPlanner == nil {
 		return SessionCompactResult{}, fmt.Errorf("compact planner is not configured")
 	}
-	if _, err := s.sessionStore.Load(id); err != nil {
+	if _, err := s.sessionStore.LoadState(id); err != nil {
 		return SessionCompactResult{}, err
 	}
 
@@ -387,7 +411,7 @@ func (s *Service) CompactSession(ctx context.Context, id string) (SessionCompact
 		_ = writeLock.Release()
 	}()
 
-	session, err := s.sessionStore.Load(id)
+	session, err := s.sessionStore.LoadExecutionState(id)
 	if err != nil {
 		return SessionCompactResult{}, err
 	}
@@ -421,7 +445,7 @@ func (s *Service) CompactSession(ctx context.Context, id string) (SessionCompact
 	}
 	operationStarted = true
 
-	session, err = s.sessionStore.Load(id)
+	session, err = s.sessionStore.LoadExecutionState(id)
 	if err != nil {
 		interruptOperation()
 		return SessionCompactResult{}, err
@@ -459,7 +483,7 @@ func (s *Service) CompactSession(ctx context.Context, id string) (SessionCompact
 	}
 	operationClosed = true
 
-	saved, err := s.sessionStore.Load(id)
+	saved, err := s.sessionStore.LoadState(id)
 	if err != nil {
 		return SessionCompactResult{}, err
 	}
@@ -492,6 +516,10 @@ func (s *Service) startSessionEventBridge(sessionID, turnID string, bus *eventbu
 					submit(streamEvent)
 				}
 			case eventbus.DurableCommitted:
+				if started, ok := event.Event.(eventbus.TurnStarted); ok {
+					turnID = started.TurnID
+					agentIteration = 0
+				}
 				nextSeq := s.emitPersistedSessionEventsThrough(sessionID, lastSeq, event.Seq, submit)
 				if nextSeq > lastSeq {
 					lastSeq = nextSeq
@@ -632,7 +660,7 @@ func modelSessionStreamEvent(eventType, turnID string, agentIteration int, field
 	return NewSessionStreamEvent(eventType, fields)
 }
 
-func (s *Service) sessionItemDTO(item sessions.SessionItem) (SessionItem, error) {
+func (s *Service) sessionItemDTO(sessionID string, item sessions.SessionItem) (SessionItem, error) {
 	dto := SessionItem{
 		Seq:            item.Seq,
 		ID:             item.ID,
@@ -662,7 +690,7 @@ func (s *Service) sessionItemDTO(item sessions.SessionItem) (SessionItem, error)
 			})
 		}
 	}
-	content, preview, err := s.sessionItemDisplayContent(item)
+	content, preview, err := s.sessionItemDisplayContent(sessionID, item)
 	if err != nil {
 		return SessionItem{}, err
 	}
@@ -701,7 +729,7 @@ func sessionItemImageAttachments(item sessions.SessionItem) []SessionItemImageAt
 	return attachments
 }
 
-func (s *Service) sessionItemDisplayContent(item sessions.SessionItem) (string, string, error) {
+func (s *Service) sessionItemDisplayContent(sessionID string, item sessions.SessionItem) (string, string, error) {
 	if item.Message != nil {
 		if item.Message.Content != "" {
 			return item.Message.Content, "", nil
@@ -717,7 +745,7 @@ func (s *Service) sessionItemDisplayContent(item sessions.SessionItem) (string, 
 		return item.Content.Inline, "", nil
 	}
 	if item.Content.Blob != nil && item.Message != nil && (item.Message.Role == model.MessageRoleUser || item.Message.Role == model.MessageRoleAssistant) {
-		content, err := s.sessionItemFullContent(item)
+		content, err := s.sessionItemFullContent(sessionID, item)
 		if err != nil {
 			return "", "", err
 		}
@@ -729,7 +757,7 @@ func (s *Service) sessionItemDisplayContent(item sessions.SessionItem) (string, 
 	return "", "", nil
 }
 
-func (s *Service) sessionItemFullContent(item sessions.SessionItem) (string, error) {
+func (s *Service) sessionItemFullContent(sessionID string, item sessions.SessionItem) (string, error) {
 	if item.Message != nil {
 		if item.Message.Content != "" {
 			return item.Message.Content, nil
@@ -745,7 +773,7 @@ func (s *Service) sessionItemFullContent(item sessions.SessionItem) (string, err
 		return item.Content.Inline, nil
 	}
 	if item.Content.Blob != nil {
-		raw, err := s.sessionStore.ReadBlob(*item.Content.Blob)
+		raw, err := s.sessionStore.ReadBlobForSession(sessionID, *item.Content.Blob)
 		if err != nil {
 			return "", err
 		}

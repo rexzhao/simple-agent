@@ -1,8 +1,9 @@
 package sessions
 
 import (
-	"bufio"
+	"crypto/rand"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -13,6 +14,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	_ "modernc.org/sqlite"
 
 	"github.com/rexzhao/simple-agent/internal/config"
 	"github.com/rexzhao/simple-agent/internal/contextwindow"
@@ -41,6 +44,12 @@ const (
 	RecordTypeItemUpdated           = "item.updated"
 	RecordTypeActiveHistoryReplaced = "active_history.replaced"
 	RecordTypeCompactionCreated     = "compaction.created"
+	RecordTypeRunStarted            = "run.started"
+	RecordTypeRunSettled            = "run.settled"
+	RecordTypeTurnRunning           = "turn.running"
+	RecordTypeTurnCleared           = "turn.cleared"
+	RecordTypeTurnInterrupted       = "turn.interrupted"
+	RecordTypeInterruptedCleared    = "interrupted.cleared"
 	RecordTypeTransactionBegin      = "transaction.begin"
 	RecordTypeTransactionCommit     = "transaction.commit"
 )
@@ -53,16 +62,36 @@ const (
 )
 
 const (
-	defaultV2MaxSegmentLines  = 1000
-	maxJSONLRecordBytes       = 16 * 1024 * 1024
-	largeContentBlobBytes     = 4 * 1024
-	storedContentPreviewBytes = 240
-	v2BlobsDirName            = "blobs"
+	RunStatusRunning     = "running"
+	RunStatusCommitted   = "committed"
+	RunStatusFailed      = "failed"
+	RunStatusInterrupted = "interrupted"
+	RunStatusCancelled   = "cancelled"
+
+	TurnStatusRunning     = "running"
+	TurnStatusCommitted   = "committed"
+	TurnStatusFailed      = "failed"
+	TurnStatusInterrupted = "interrupted"
 )
 
-var ErrCorruptedSession = errors.New("corrupted session")
+const (
+	largeContentBlobBytes     = 4 * 1024
+	storedContentPreviewBytes = 240
+	blobsDirName              = "blobs"
+)
+
+var (
+	ErrNotFound         = errors.New("session not found")
+	ErrCorruptedSession = errors.New("corrupted session")
+)
 
 const interruptedToolResultContent = "[tool execution interrupted]"
+
+type InstructionSource struct {
+	Role   model.MessageRole `json:"role"`
+	Source string            `json:"source"`
+	Path   string            `json:"path,omitempty"`
+}
 
 type SessionItem struct {
 	ID             string         `json:"id"`
@@ -76,6 +105,27 @@ type SessionItem struct {
 	Status         string         `json:"status,omitempty"`
 	Message        *model.Message `json:"message,omitempty"`
 	Content        *StoredContent `json:"content,omitempty"`
+}
+
+// RunRecord is the durable lifecycle record for one user request. Continue
+// resumes durable active history; it never treats InputPayload as a new user
+// message.
+type RunRecord struct {
+	ID            string    `json:"id"`
+	PreviousRunID string    `json:"previous_run_id,omitempty"`
+	Status        string    `json:"status"`
+	InputPayload  []byte    `json:"input_payload,omitempty"`
+	StartedAt     time.Time `json:"started_at"`
+	SettledAt     time.Time `json:"settled_at,omitempty"`
+}
+
+type TurnRecord struct {
+	ID        string    `json:"id"`
+	RunID     string    `json:"run_id"`
+	Ordinal   int       `json:"ordinal"`
+	Status    string    `json:"status"`
+	StartedAt time.Time `json:"started_at"`
+	SettledAt time.Time `json:"settled_at,omitempty"`
 }
 
 type CompactionCheckpoint struct {
@@ -101,9 +151,6 @@ type StoredContent struct {
 
 type BlobRef = model.BlobRef
 
-// DebugSettings contains diagnostics that are scoped to one conversation.
-// Keep this as a separate object so new per-session debug switches can be
-// added without changing the session API shape again.
 type DebugSettings struct {
 	RequestBodies bool `json:"request_bodies"`
 }
@@ -118,13 +165,19 @@ type SessionV2 struct {
 	ParentSessionID      string                 `json:"parent_session_id,omitempty"`
 	RootSessionID        string                 `json:"root_session_id,omitempty"`
 	SpawnDepth           int                    `json:"spawn_depth,omitempty"`
-	Archived             bool                   `json:"-"`
-	ArchivedAt           time.Time              `json:"-"`
+	Archived             bool                   `json:"archived,omitempty"`
+	ArchivedAt           time.Time              `json:"archived_at,omitempty"`
 	LastUsedAt           time.Time              `json:"last_used_at"`
+	CurrentRunID         string                 `json:"current_run_id,omitempty"`
+	RunningRunID         string                 `json:"running_run_id,omitempty"`
 	RunningTurnID        string                 `json:"running_turn_id,omitempty"`
 	RunningStartedAt     time.Time              `json:"running_started_at,omitempty"`
+	InterruptedRunID     string                 `json:"interrupted_run_id,omitempty"`
 	InterruptedTurnID    string                 `json:"interrupted_turn_id,omitempty"`
 	InterruptedAt        time.Time              `json:"interrupted_at,omitempty"`
+	LatestRunID          string                 `json:"latest_run_id,omitempty"`
+	LastRunID            string                 `json:"last_run_id,omitempty"`
+	LastRunStatus        string                 `json:"last_run_status,omitempty"`
 	Provider             string                 `json:"provider"`
 	ModelProfile         string                 `json:"model_profile"`
 	ModelID              string                 `json:"model_id"`
@@ -151,6 +204,7 @@ type SessionV2 struct {
 	LastSeq              int64                  `json:"last_seq,omitempty"`
 	Context              contextwindow.Metadata `json:"context,omitempty"`
 	SaveToolResults      bool                   `json:"save_tool_results"`
+	metadataVersion      int64
 }
 
 func (s SessionV2) RootConfigPath() string {
@@ -167,12 +221,15 @@ func (s SessionV2) MaterializeActiveHistory() ([]model.Message, error) {
 	return materializeActiveHistory(s, nil)
 }
 
+func MaterializeActiveHistory(session SessionV2) ([]model.Message, error) {
+	return session.MaterializeActiveHistory()
+}
+
 func materializeActiveHistory(session SessionV2, readBlob func(BlobRef) ([]byte, error)) ([]model.Message, error) {
 	itemsByID := make(map[string]SessionItem, len(session.Items))
 	for _, item := range session.Items {
 		itemsByID[item.ID] = item
 	}
-
 	messages := make([]model.Message, 0, len(session.ActiveHistory))
 	for _, id := range session.ActiveHistory {
 		item, ok := itemsByID[id]
@@ -239,18 +296,7 @@ func materializeMessageImages(message *model.Message, readBlob func(BlobRef) ([]
 }
 
 func shouldSynthesizeInterruptedToolResult(item SessionItem, message model.Message) bool {
-	if message.Role != model.MessageRoleTool {
-		return false
-	}
-	return item.Status == ItemStatusPending || item.Status == ItemStatusInterrupted
-}
-
-func MaterializeActiveHistory(session SessionV2) ([]model.Message, error) {
-	return session.MaterializeActiveHistory()
-}
-
-type V2StoreOptions struct {
-	MaxSegmentLines int
+	return message.Role == model.MessageRoleTool && (item.Status == ItemStatusPending || item.Status == ItemStatusInterrupted)
 }
 
 type V2ListOptions struct {
@@ -258,21 +304,30 @@ type V2ListOptions struct {
 	All      bool
 }
 
+type HistoryPageOptions struct {
+	BeforeSeq   int64
+	AfterSeq    int64
+	Limit       int
+	AlignTurn   bool
+	VisibleOnly bool
+}
+
+type HistoryPage struct {
+	Items         []SessionItem
+	OldestSeq     int64
+	NewestSeq     int64
+	HasMoreBefore bool
+	HasMoreAfter  bool
+}
+
 type V2Store struct {
-	root            string
-	maxSegmentLines int
-	now             func() time.Time
+	root string
+	now  func() time.Time
 }
 
-func NewV2Store(root string) *V2Store {
-	return NewV2StoreWithOptions(root, V2StoreOptions{})
-}
+func NewV2Store(root string) *V2Store { return newV2StoreWithClock(root, time.Now) }
 
-func NewV2StoreWithOptions(root string, options V2StoreOptions) *V2Store {
-	return newV2StoreWithClock(root, options, time.Now)
-}
-
-func newV2StoreWithClock(root string, options V2StoreOptions, now func() time.Time) *V2Store {
+func newV2StoreWithClock(root string, now func() time.Time) *V2Store {
 	if now == nil {
 		now = time.Now
 	}
@@ -280,15 +335,7 @@ func newV2StoreWithClock(root string, options V2StoreOptions, now func() time.Ti
 	if root != "" {
 		root = filepath.Clean(root)
 	}
-	maxSegmentLines := options.MaxSegmentLines
-	if maxSegmentLines <= 0 {
-		maxSegmentLines = defaultV2MaxSegmentLines
-	}
-	return &V2Store{
-		root:            root,
-		maxSegmentLines: maxSegmentLines,
-		now:             now,
-	}
+	return &V2Store{root: root, now: now}
 }
 
 func RootForHome(home string) (string, error) {
@@ -315,12 +362,78 @@ func RootForServerRoot(root string) (string, error) {
 	return filepath.Join(filepath.Clean(abs), "data", "sessions"), nil
 }
 
+const schema = `
+CREATE TABLE IF NOT EXISTS state (
+  singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+  session_id TEXT NOT NULL,
+  state_json BLOB NOT NULL,
+  last_seq INTEGER NOT NULL DEFAULT 0,
+  metadata_version INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS runs (
+  id TEXT PRIMARY KEY,
+  previous_run_id TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL,
+  input_payload BLOB NOT NULL DEFAULT X'',
+  started_at TEXT NOT NULL,
+  settled_at TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS runs_started_at ON runs(started_at);
+CREATE TABLE IF NOT EXISTS turns (
+  id TEXT PRIMARY KEY,
+  run_id TEXT NOT NULL,
+  ordinal INTEGER NOT NULL,
+  status TEXT NOT NULL,
+  started_at TEXT NOT NULL,
+  settled_at TEXT NOT NULL DEFAULT '',
+  UNIQUE(run_id, ordinal)
+);
+CREATE INDEX IF NOT EXISTS turns_run_ordinal ON turns(run_id, ordinal);
+CREATE TABLE IF NOT EXISTS events (
+  seq INTEGER PRIMARY KEY,
+  type TEXT NOT NULL,
+  turn_id TEXT NOT NULL DEFAULT '',
+  item_id TEXT NOT NULL DEFAULT '',
+  compaction_id TEXT NOT NULL DEFAULT '',
+  payload BLOB NOT NULL,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS events_type_seq ON events(type, seq);
+CREATE TABLE IF NOT EXISTS items (
+  id TEXT PRIMARY KEY,
+  seq INTEGER NOT NULL,
+  turn_id TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL,
+  payload BLOB NOT NULL
+);
+CREATE INDEX IF NOT EXISTS items_seq ON items(seq);
+CREATE INDEX IF NOT EXISTS items_turn_seq ON items(turn_id, seq);
+CREATE TABLE IF NOT EXISTS session_inbox (
+  delivery_id TEXT PRIMARY KEY,
+  child_session_id TEXT NOT NULL,
+  child_run_id TEXT NOT NULL,
+  parent_session_id TEXT NOT NULL,
+  status TEXT NOT NULL,
+  child_status TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL,
+  settled_at TEXT NOT NULL DEFAULT '',
+  delivered_at TEXT NOT NULL DEFAULT '',
+  consumed_at TEXT NOT NULL DEFAULT '',
+  attempt INTEGER NOT NULL DEFAULT 0,
+  started_run_id TEXT NOT NULL DEFAULT '',
+  last_error TEXT NOT NULL DEFAULT '',
+  UNIQUE(child_session_id, child_run_id, parent_session_id)
+);
+CREATE INDEX IF NOT EXISTS session_inbox_status_created ON session_inbox(status, created_at);
+CREATE INDEX IF NOT EXISTS session_inbox_child ON session_inbox(child_session_id, child_run_id);
+`
+
 func (s *V2Store) SaveMetadata(session SessionV2) (SessionV2, error) {
 	if err := s.requireRoot(); err != nil {
 		return SessionV2{}, err
 	}
-
 	now := s.now().UTC()
+	expectedUpdatedAt := session.UpdatedAt
 	if strings.TrimSpace(session.ID) == "" {
 		id, err := newSessionID(now)
 		if err != nil {
@@ -331,23 +444,10 @@ func (s *V2Store) SaveMetadata(session SessionV2) (SessionV2, error) {
 	if err := validateV2SessionID(session.ID); err != nil {
 		return SessionV2{}, err
 	}
-	session, err := normalizeSessionLineage(session)
+	var err error
+	session, err = normalizeSessionLineage(session)
 	if err != nil {
 		return SessionV2{}, err
-	}
-	if existing, loadErr := s.loadMetadata(session.ID); loadErr == nil {
-		existing, err = normalizeSessionLineage(existing)
-		if err != nil {
-			return SessionV2{}, err
-		}
-		if existing.CreatedBy != session.CreatedBy ||
-			existing.ParentSessionID != session.ParentSessionID ||
-			existing.RootSessionID != session.RootSessionID ||
-			existing.SpawnDepth != session.SpawnDepth {
-			return SessionV2{}, fmt.Errorf("session %q lineage is immutable", session.ID)
-		}
-	} else if !errors.Is(loadErr, ErrNotFound) {
-		return SessionV2{}, loadErr
 	}
 	if session.Version == 0 {
 		session.Version = VersionV2
@@ -361,106 +461,137 @@ func (s *V2Store) SaveMetadata(session SessionV2) (SessionV2, error) {
 			session.LastUsedAt = now
 		}
 	}
+	if session.Archived {
+		if session.ArchivedAt.IsZero() {
+			session.ArchivedAt = now
+		}
+	} else {
+		session.ArchivedAt = time.Time{}
+	}
 	session.UpdatedAt = now
-	session = normalizeSessionLifecycle(session, now)
 	session = copySessionV2(session)
 
-	sessionDir := s.sessionDir(session.ID)
-	if err := os.MkdirAll(sessionDir, 0o755); err != nil {
-		return SessionV2{}, fmt.Errorf("create session directory %q: %w", sessionDir, err)
-	}
-
-	data, err := json.MarshalIndent(metadataFromSessionV2(session), "", "  ")
+	db, err := s.openSessionDB(session.ID, true)
 	if err != nil {
-		return SessionV2{}, fmt.Errorf("marshal session metadata %q: %w", session.ID, err)
+		return SessionV2{}, err
 	}
-	data = append(data, '\n')
-	path := s.metadataPath(session.ID)
-	if err := writeSessionMetadataAtomic(path, data); err != nil {
-		return SessionV2{}, fmt.Errorf("write session metadata %q: %w", session.ID, err)
+	defer db.Close()
+	tx, err := db.Begin()
+	if err != nil {
+		return SessionV2{}, fmt.Errorf("begin save session metadata: %w", err)
 	}
-	return session, nil
+	defer tx.Rollback()
+	var existing SessionV2
+	var existingJSON []byte
+	var existingLastSeq, existingMetadataVersion int64
+	readErr := tx.QueryRow(`SELECT state_json, last_seq, metadata_version FROM state WHERE singleton = 1`).Scan(&existingJSON, &existingLastSeq, &existingMetadataVersion)
+	if readErr == nil {
+		if err := json.Unmarshal(existingJSON, &existing); err != nil {
+			return SessionV2{}, corruptedSessionError(session.ID, "parse SQLite state: %v", err)
+		}
+		if existing.ID == "" {
+			existing.ID = session.ID
+		}
+		if existing.CreatedBy != session.CreatedBy || existing.ParentSessionID != session.ParentSessionID || existing.RootSessionID != session.RootSessionID || existing.SpawnDepth != session.SpawnDepth {
+			return SessionV2{}, fmt.Errorf("session %q lineage is immutable", session.ID)
+		}
+		if session.LastSeq != existingLastSeq {
+			return SessionV2{}, fmt.Errorf("stale session metadata: got seq %d, current seq %d", session.LastSeq, existingLastSeq)
+		}
+		if session.metadataVersion != existingMetadataVersion {
+			return SessionV2{}, fmt.Errorf("stale session metadata version: got %d, current %d", session.metadataVersion, existingMetadataVersion)
+		}
+		if !expectedUpdatedAt.IsZero() && !existing.UpdatedAt.Equal(expectedUpdatedAt) {
+			return SessionV2{}, fmt.Errorf("stale session metadata timestamp for %q", session.ID)
+		}
+		session.LastSeq = existingLastSeq
+		session.metadataVersion = existingMetadataVersion + 1
+		// Metadata writes do not own the projected history. Always take these
+		// values from the row read in this transaction so a caller holding an
+		// older SessionV2 cannot overwrite a later event projection.
+		session.ActiveHistory = copyStrings(existing.ActiveHistory)
+		session.Compactions = copyCompactionCheckpoints(existing.Compactions)
+	} else if !errors.Is(readErr, sql.ErrNoRows) {
+		return SessionV2{}, fmt.Errorf("read session state: %w", readErr)
+	} else {
+		// A caller may pass a pre-populated in-memory value while creating a
+		// session, but sequence zero is owned by the SQLite state row.
+		session.LastSeq = 0
+		session.metadataVersion = 0
+	}
+	if readErr == nil {
+		for _, mutation := range lifecycleMutationsBetween(existing, session) {
+			session.LastSeq++
+			payload, marshalErr := json.Marshal(mutation)
+			if marshalErr != nil {
+				return SessionV2{}, fmt.Errorf("marshal lifecycle metadata mutation: %w", marshalErr)
+			}
+			if err := insertStoreEvent(tx, session.LastSeq, mutation.Type, mutation.TurnID, "", "", payload, now); err != nil {
+				return SessionV2{}, err
+			}
+		}
+	}
+	data, err := marshalState(session)
+	if err != nil {
+		return SessionV2{}, err
+	}
+	if readErr == nil {
+		_, err = tx.Exec(`UPDATE state SET session_id = ?, state_json = ?, last_seq = ?, metadata_version = ? WHERE singleton = 1`, session.ID, data, session.LastSeq, session.metadataVersion)
+	} else {
+		_, err = tx.Exec(`INSERT INTO state(singleton, session_id, state_json, last_seq, metadata_version) VALUES(1, ?, ?, ?, ?)`, session.ID, data, session.LastSeq, session.metadataVersion)
+	}
+	if err != nil {
+		return SessionV2{}, fmt.Errorf("write session state: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return SessionV2{}, fmt.Errorf("commit session state: %w", err)
+	}
+	return copySessionV2(session), nil
 }
 
-func (s *V2Store) MarkTurnRunning(sessionID, turnID string) (SessionV2, error) {
+func (s *V2Store) LoadState(id string) (SessionV2, error) {
+	return s.loadState(id)
+}
+
+func (s *V2Store) loadState(id string) (SessionV2, error) {
 	if err := s.requireRoot(); err != nil {
 		return SessionV2{}, err
 	}
-	turnID = strings.TrimSpace(turnID)
-	if turnID == "" {
-		return SessionV2{}, fmt.Errorf("running turn id is required")
+	if err := validateV2SessionID(id); err != nil {
+		return SessionV2{}, err
 	}
-	session, err := s.loadMetadata(sessionID)
+	db, err := s.openSessionDB(id, false)
 	if err != nil {
 		return SessionV2{}, err
 	}
-	session.RunningTurnID = turnID
-	session.RunningStartedAt = s.now().UTC()
-	return s.SaveMetadata(session)
+	defer db.Close()
+	var data []byte
+	var lastSeq, metadataVersion int64
+	if err := db.QueryRow(`SELECT state_json, last_seq, metadata_version FROM state WHERE singleton = 1`).Scan(&data, &lastSeq, &metadataVersion); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return SessionV2{}, fmt.Errorf("%w: %s", ErrNotFound, id)
+		}
+		return SessionV2{}, fmt.Errorf("read session state %q: %w", id, err)
+	}
+	var session SessionV2
+	if err := json.Unmarshal(data, &session); err != nil {
+		return SessionV2{}, corruptedSessionError(id, "parse SQLite state: %v", err)
+	}
+	if session.ID == "" {
+		session.ID = id
+	}
+	if session.ID != id {
+		return SessionV2{}, fmt.Errorf("session state %q contains id %q", id, session.ID)
+	}
+	session.Items = nil
+	session.LastSeq = lastSeq
+	session.metadataVersion = metadataVersion
+	return copySessionV2(session), nil
 }
 
-func (s *V2Store) ClearRunningTurn(sessionID, turnID string) (SessionV2, error) {
-	if err := s.requireRoot(); err != nil {
-		return SessionV2{}, err
-	}
-	session, err := s.loadMetadata(sessionID)
-	if err != nil {
-		return SessionV2{}, err
-	}
-	if session.RunningTurnID == "" {
-		return session, nil
-	}
-	if turnID = strings.TrimSpace(turnID); turnID != "" && session.RunningTurnID != turnID {
-		return session, nil
-	}
-	session.RunningTurnID = ""
-	session.RunningStartedAt = time.Time{}
-	return s.SaveMetadata(session)
-}
-
-// ClearInterruptedTurn clears stale interrupted-turn metadata. It is called
-// when a turn completes normally so that a previously interrupted session
-// does not retain the interrupted status indefinitely.
-func (s *V2Store) ClearInterruptedTurn(sessionID string) (SessionV2, error) {
-	if err := s.requireRoot(); err != nil {
-		return SessionV2{}, err
-	}
-	session, err := s.loadMetadata(sessionID)
-	if err != nil {
-		return session, err
-	}
-	session.InterruptedTurnID = ""
-	session.InterruptedAt = time.Time{}
-	return s.SaveMetadata(session)
-}
-
-func (s *V2Store) MarkTurnInterrupted(sessionID, turnID string) (SessionV2, error) {
-	if err := s.requireRoot(); err != nil {
-		return SessionV2{}, err
-	}
-	session, err := s.loadMetadata(sessionID)
-	if err != nil {
-		return SessionV2{}, err
-	}
-	runningTurnID := strings.TrimSpace(session.RunningTurnID)
-	turnID = strings.TrimSpace(turnID)
-	if runningTurnID == "" {
-		runningTurnID = turnID
-	}
-	if runningTurnID == "" {
-		return session, nil
-	}
-	if turnID != "" && session.RunningTurnID != "" && session.RunningTurnID != turnID {
-		return session, nil
-	}
-	session.RunningTurnID = ""
-	session.RunningStartedAt = time.Time{}
-	session.InterruptedTurnID = runningTurnID
-	session.InterruptedAt = s.now().UTC()
-	return s.SaveMetadata(session)
-}
-
-func (s *V2Store) MarkRunningTurnsInterrupted() ([]SessionV2, error) {
+// ListStates reads one compact state row from every session database. It never
+// opens the events table and never materializes item history.
+func (s *V2Store) ListStates(options V2ListOptions) ([]SessionV2, error) {
 	if err := s.requireRoot(); err != nil {
 		return nil, err
 	}
@@ -471,118 +602,85 @@ func (s *V2Store) MarkRunningTurnsInterrupted() ([]SessionV2, error) {
 		}
 		return nil, fmt.Errorf("read session store %q: %w", s.root, err)
 	}
-	marked := make([]SessionV2, 0)
+	states := make([]SessionV2, 0, len(entries))
 	for _, entry := range entries {
-		if !entry.IsDir() {
+		if !entry.IsDir() || !isSessionDirectory(entry.Name()) {
 			continue
 		}
-		id := entry.Name()
-		if err := validateV2SessionID(id); err != nil {
-			continue
-		}
-		session, err := s.loadMetadata(id)
-		if err != nil {
-			continue
-		}
-		if strings.TrimSpace(session.RunningTurnID) == "" {
-			continue
-		}
-		session, err = s.MarkTurnInterrupted(session.ID, session.RunningTurnID)
-		if err != nil {
-			return nil, err
-		}
-		marked = append(marked, session)
-	}
-	return marked, nil
-}
-
-func (s *V2Store) Load(id string) (SessionV2, error) {
-	if err := s.requireRoot(); err != nil {
-		return SessionV2{}, err
-	}
-	if err := validateV2SessionID(id); err != nil {
-		return SessionV2{}, err
-	}
-
-	session, err := s.loadMetadata(id)
-	if err != nil {
-		return SessionV2{}, err
-	}
-	replayed, err := s.Replay(id)
-	if err != nil {
-		return SessionV2{}, err
-	}
-	session.Items = copySessionItems(replayed.Items)
-	session.ActiveHistory = copyStrings(replayed.ActiveHistory)
-	session.Compactions = copyCompactionCheckpoints(replayed.Compactions)
-	session.LastSeq = replayed.LastSeq
-	return copySessionV2(session), nil
-}
-
-func (s *V2Store) List() ([]Info, error) {
-	return s.ListWithOptions(V2ListOptions{})
-}
-
-func (s *V2Store) ListWithOptions(options V2ListOptions) ([]Info, error) {
-	if err := s.requireRoot(); err != nil {
-		return nil, err
-	}
-	entries, err := os.ReadDir(s.root)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return []Info{}, nil
-		}
-		return nil, fmt.Errorf("read session store %q: %w", s.root, err)
-	}
-
-	sessions := make([]SessionV2, 0, len(entries))
-	for _, entry := range entries {
-		if !entry.IsDir() {
-			continue
-		}
-		id := entry.Name()
-		if err := validateV2SessionID(id); err != nil {
-			continue
-		}
-		session, err := s.loadMetadata(id)
+		state, err := s.LoadState(entry.Name())
 		if err != nil {
 			if errors.Is(err, ErrNotFound) || errors.Is(err, ErrCorruptedSession) {
 				continue
 			}
 			return nil, err
 		}
-		if !options.All && session.Archived != options.Archived {
+		if !options.All && state.Archived != options.Archived {
 			continue
 		}
-		sessions = append(sessions, session)
+		states = append(states, state)
 	}
-	sort.Slice(sessions, func(i, j int) bool {
-		leftLastUsed := sessionEffectiveLastUsedAt(sessions[i])
-		rightLastUsed := sessionEffectiveLastUsedAt(sessions[j])
-		if !leftLastUsed.Equal(rightLastUsed) {
-			return leftLastUsed.After(rightLastUsed)
+	sort.Slice(states, func(i, j int) bool {
+		li, lj := sessionEffectiveLastUsedAt(states[i]), sessionEffectiveLastUsedAt(states[j])
+		if !li.Equal(lj) {
+			return li.After(lj)
 		}
-		if !sessions[i].CreatedAt.Equal(sessions[j].CreatedAt) {
-			return sessions[i].CreatedAt.After(sessions[j].CreatedAt)
+		if !states[i].CreatedAt.Equal(states[j].CreatedAt) {
+			return states[i].CreatedAt.After(states[j].CreatedAt)
 		}
-		return sessions[i].ID < sessions[j].ID
+		return states[i].ID < states[j].ID
 	})
-	infos := make([]Info, 0, len(sessions))
-	for _, session := range sessions {
-		infos = append(infos, session.info())
+	for i := range states {
+		states[i].Items = nil
 	}
-	return infos, nil
+	return states, nil
 }
 
-func (s *V2Store) Latest() (SessionV2, error) {
-	infos, err := s.List()
+// LoadExecutionState is the explicit history-loading boundary. It reads the
+// compact state row and the item projection; it does not replay immutable
+// events.
+func (s *V2Store) LoadExecutionState(id string) (SessionV2, error) {
+	state, err := s.LoadState(id)
 	if err != nil {
 		return SessionV2{}, err
 	}
-	if len(infos) == 0 {
+	db, err := s.openSessionDB(id, false)
+	if err != nil {
+		return SessionV2{}, err
+	}
+	defer db.Close()
+	rows, err := db.Query(`SELECT payload FROM items ORDER BY seq`)
+	if err != nil {
+		return SessionV2{}, fmt.Errorf("read execution items %q: %w", id, err)
+	}
+	defer rows.Close()
+	items := make([]SessionItem, 0)
+	for rows.Next() {
+		var payload []byte
+		if err := rows.Scan(&payload); err != nil {
+			return SessionV2{}, err
+		}
+		var item SessionItem
+		if err := json.Unmarshal(payload, &item); err != nil {
+			return SessionV2{}, corruptedSessionError(id, "parse item projection: %v", err)
+		}
+		items = append(items, item)
+	}
+	if err := rows.Err(); err != nil {
+		return SessionV2{}, err
+	}
+	state.Items = items
+	return copySessionV2(state), nil
+}
+
+func (s *V2Store) Latest() (SessionV2, error) {
+	states, err := s.ListStates(V2ListOptions{})
+	if err != nil {
+		return SessionV2{}, err
+	}
+	if len(states) == 0 {
 		return SessionV2{}, ErrNotFound
 	}
-	return s.Load(infos[0].ID)
+	return s.LoadExecutionState(states[0].ID)
 }
 
 func (s *V2Store) Delete(id string) error {
@@ -592,62 +690,878 @@ func (s *V2Store) Delete(id string) error {
 	if err := validateV2SessionID(id); err != nil {
 		return err
 	}
-
-	sessionDir := s.sessionDir(id)
-	info, err := os.Stat(sessionDir)
-	if err != nil {
+	if _, err := os.Stat(s.sessionDir(id)); err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return fmt.Errorf("%w: %s", ErrNotFound, id)
 		}
-		return fmt.Errorf("stat session %q: %w", id, err)
+		return err
 	}
-	if !info.IsDir() {
-		return fmt.Errorf("session %q is not a directory", id)
-	}
-	if err := os.RemoveAll(sessionDir); err != nil {
+	if err := os.RemoveAll(s.sessionDir(id)); err != nil {
 		return fmt.Errorf("delete session %q: %w", id, err)
 	}
 	return nil
 }
 
+// CreateRun records the run and its active state in the same transaction as
+// the run.started event. previousRunID is resolved by the execution layer for
+// normal messages and is the interrupted run for Continue.
+func (s *V2Store) CreateRun(sessionID, runID, previousRunID string, inputPayload []byte, startedAt time.Time) (RunRecord, error) {
+	runID = strings.TrimSpace(runID)
+	previousRunID = strings.TrimSpace(previousRunID)
+	if runID == "" {
+		return RunRecord{}, fmt.Errorf("run id is required")
+	}
+	if startedAt.IsZero() {
+		startedAt = s.now().UTC()
+	}
+	if inputPayload == nil {
+		inputPayload = []byte{}
+	}
+	db, err := s.openSessionDB(sessionID, false)
+	if err != nil {
+		return RunRecord{}, err
+	}
+	defer db.Close()
+	tx, err := db.Begin()
+	if err != nil {
+		return RunRecord{}, fmt.Errorf("begin run creation: %w", err)
+	}
+	defer tx.Rollback()
+	state, err := readStateInTx(tx, sessionID)
+	if err != nil {
+		return RunRecord{}, err
+	}
+	if state.RunningRunID != "" || state.RunningTurnID != "" {
+		return RunRecord{}, fmt.Errorf("session %q already has active run %q turn %q", sessionID, state.RunningRunID, state.RunningTurnID)
+	}
+	if previousRunID != "" {
+		var previousStatus string
+		if err := tx.QueryRow(`SELECT status FROM runs WHERE id = ?`, previousRunID).Scan(&previousStatus); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return RunRecord{}, fmt.Errorf("previous run %q was not found", previousRunID)
+			}
+			return RunRecord{}, err
+		}
+		if previousStatus == RunStatusRunning {
+			return RunRecord{}, fmt.Errorf("previous run %q is still running", previousRunID)
+		}
+	}
+	startedAt = startedAt.UTC()
+	if _, err := tx.Exec(`INSERT INTO runs(id, previous_run_id, status, input_payload, started_at, settled_at) VALUES(?, ?, ?, ?, ?, '')`, runID, previousRunID, RunStatusRunning, inputPayload, startedAt.Format(time.RFC3339Nano)); err != nil {
+		return RunRecord{}, fmt.Errorf("insert run %q: %w", runID, err)
+	}
+	state.CurrentRunID = runID
+	state.RunningRunID = runID
+	state.RunningStartedAt = startedAt
+	state.LatestRunID = runID
+	state.LastRunStatus = RunStatusRunning
+	// A new run consumes the previous Continue opportunity. Clear its
+	// marker in the same transaction as the new run row and run.started event.
+	interruptedRunID := state.InterruptedRunID
+	interruptedTurnID := state.InterruptedTurnID
+	interruptedAt := state.InterruptedAt
+	state.InterruptedRunID = ""
+	state.InterruptedTurnID = ""
+	state.InterruptedAt = time.Time{}
+	events := []lifecycleEvent{{
+		Type:    RecordTypeRunStarted,
+		Payload: map[string]any{"run_id": runID, "previous_run_id": previousRunID},
+	}}
+	if interruptedRunID != "" || interruptedTurnID != "" || !interruptedAt.IsZero() {
+		events = append([]lifecycleEvent{{
+			Type:    RecordTypeInterruptedCleared,
+			TurnID:  interruptedTurnID,
+			Payload: map[string]any{"run_id": interruptedRunID, "turn_id": interruptedTurnID},
+		}}, events...)
+	}
+	if err := commitLifecycleEventsTx(tx, &state, events...); err != nil {
+		return RunRecord{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return RunRecord{}, fmt.Errorf("commit run creation: %w", err)
+	}
+	return RunRecord{ID: runID, PreviousRunID: previousRunID, Status: RunStatusRunning, InputPayload: append([]byte(nil), inputPayload...), StartedAt: startedAt}, nil
+}
+
+// StartTurn creates one model request/response turn under a durable run. An
+// ordinal of zero asks the store to allocate the next ordinal atomically.
+func (s *V2Store) StartTurn(sessionID, runID, turnID string, ordinal int, startedAt time.Time) (TurnRecord, error) {
+	if strings.TrimSpace(runID) == "" || strings.TrimSpace(turnID) == "" {
+		return TurnRecord{}, fmt.Errorf("run id and turn id are required")
+	}
+	if startedAt.IsZero() {
+		startedAt = s.now().UTC()
+	}
+	db, err := s.openSessionDB(sessionID, false)
+	if err != nil {
+		return TurnRecord{}, err
+	}
+	defer db.Close()
+	tx, err := db.Begin()
+	if err != nil {
+		return TurnRecord{}, err
+	}
+	defer tx.Rollback()
+	state, err := readStateInTx(tx, sessionID)
+	if err != nil {
+		return TurnRecord{}, err
+	}
+	if state.RunningRunID != runID {
+		return TurnRecord{}, fmt.Errorf("run %q is not the running run", runID)
+	}
+	var runStatus string
+	if err := tx.QueryRow(`SELECT status FROM runs WHERE id = ?`, runID).Scan(&runStatus); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return TurnRecord{}, fmt.Errorf("run %q was not found", runID)
+		}
+		return TurnRecord{}, err
+	}
+	if runStatus != RunStatusRunning {
+		return TurnRecord{}, fmt.Errorf("run %q is not running", runID)
+	}
+	if state.RunningTurnID != "" {
+		return TurnRecord{}, fmt.Errorf("run %q already has running turn %q", runID, state.RunningTurnID)
+	}
+	if ordinal <= 0 {
+		if err := tx.QueryRow(`SELECT COALESCE(MAX(ordinal), 0) + 1 FROM turns WHERE run_id = ?`, runID).Scan(&ordinal); err != nil {
+			return TurnRecord{}, err
+		}
+	}
+	startedAt = startedAt.UTC()
+	if _, err := tx.Exec(`INSERT INTO turns(id, run_id, ordinal, status, started_at, settled_at) VALUES(?, ?, ?, ?, ?, '')`, turnID, runID, ordinal, TurnStatusRunning, startedAt.Format(time.RFC3339Nano)); err != nil {
+		return TurnRecord{}, fmt.Errorf("insert turn %q: %w", turnID, err)
+	}
+	state.RunningTurnID = turnID
+	state.RunningStartedAt = startedAt
+	if err := commitLifecycleTx(tx, &state, RecordTypeTurnRunning, turnID, map[string]any{
+		"run_id": runID, "turn_id": turnID, "ordinal": ordinal,
+	}); err != nil {
+		return TurnRecord{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return TurnRecord{}, err
+	}
+	return TurnRecord{ID: turnID, RunID: runID, Ordinal: ordinal, Status: TurnStatusRunning, StartedAt: startedAt}, nil
+}
+
+// The following names are intentionally lifecycle-oriented adapters for the
+// projector. They return compact state just like the pre-Run store methods,
+// while also updating the explicit turns table.
+func (s *V2Store) MarkTurnRunningForRun(sessionID, runID, turnID string) (SessionV2, error) {
+	if _, err := s.StartTurn(sessionID, runID, turnID, 0, s.now().UTC()); err != nil {
+		return SessionV2{}, err
+	}
+	return s.LoadState(sessionID)
+}
+
+func (s *V2Store) CompleteTurnForRun(sessionID, runID, turnID string) (SessionV2, error) {
+	return s.SetTurnStatus(sessionID, runID, turnID, TurnStatusCommitted, s.now().UTC())
+}
+
+func (s *V2Store) InterruptTurnForRun(sessionID, runID, turnID string) (SessionV2, error) {
+	return s.SetTurnStatus(sessionID, runID, turnID, TurnStatusInterrupted, s.now().UTC())
+}
+
+func (s *V2Store) SetTurnStatus(sessionID, runID, turnID, status string, settledAt time.Time) (SessionV2, error) {
+	if strings.TrimSpace(runID) == "" || strings.TrimSpace(turnID) == "" {
+		return SessionV2{}, fmt.Errorf("run id and turn id are required")
+	}
+	if status != TurnStatusCommitted && status != TurnStatusFailed && status != TurnStatusInterrupted {
+		return SessionV2{}, fmt.Errorf("invalid turn status %q", status)
+	}
+	if settledAt.IsZero() {
+		settledAt = s.now().UTC()
+	}
+	db, err := s.openSessionDB(sessionID, false)
+	if err != nil {
+		return SessionV2{}, err
+	}
+	defer db.Close()
+	tx, err := db.Begin()
+	if err != nil {
+		return SessionV2{}, err
+	}
+	defer tx.Rollback()
+	state, err := readStateInTx(tx, sessionID)
+	if err != nil {
+		return SessionV2{}, err
+	}
+	var runStatus string
+	if err := tx.QueryRow(`SELECT status FROM runs WHERE id = ?`, runID).Scan(&runStatus); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return SessionV2{}, fmt.Errorf("run %q was not found", runID)
+		}
+		return SessionV2{}, err
+	}
+	if runStatus != RunStatusRunning {
+		return SessionV2{}, fmt.Errorf("run %q is already settled as %q", runID, runStatus)
+	}
+	var currentStatus string
+	if err := tx.QueryRow(`SELECT status FROM turns WHERE id = ? AND run_id = ?`, turnID, runID).Scan(&currentStatus); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return SessionV2{}, fmt.Errorf("turn %q was not found for run %q", turnID, runID)
+		}
+		return SessionV2{}, err
+	}
+	if currentStatus != TurnStatusRunning {
+		return SessionV2{}, fmt.Errorf("turn %q is already settled as %q", turnID, currentStatus)
+	}
+	result, err := tx.Exec(`UPDATE turns SET status = ?, settled_at = ? WHERE id = ? AND run_id = ? AND status = ?`, status, settledAt.UTC().Format(time.RFC3339Nano), turnID, runID, TurnStatusRunning)
+	if err != nil {
+		return SessionV2{}, err
+	}
+	if count, _ := result.RowsAffected(); count != 1 {
+		return SessionV2{}, fmt.Errorf("turn %q was not found for run %q", turnID, runID)
+	}
+	if state.RunningTurnID == turnID {
+		state.RunningTurnID = ""
+		state.RunningStartedAt = time.Time{}
+	}
+	if status == TurnStatusInterrupted || status == TurnStatusFailed {
+		state.InterruptedRunID = runID
+		state.InterruptedTurnID = turnID
+		state.InterruptedAt = settledAt.UTC()
+		state.LastRunStatus = status
+	}
+	eventType := RecordTypeTurnCleared
+	if status == TurnStatusInterrupted || status == TurnStatusFailed {
+		eventType = RecordTypeTurnInterrupted
+	}
+	if err := commitLifecycleTx(tx, &state, eventType, turnID, map[string]any{
+		"run_id": runID, "turn_id": turnID, "status": status,
+	}); err != nil {
+		return SessionV2{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return SessionV2{}, err
+	}
+	return state, nil
+}
+
+func (s *V2Store) SetRunStatus(sessionID, runID, status string, settledAt time.Time) (SessionV2, error) {
+	if strings.TrimSpace(runID) == "" {
+		return SessionV2{}, fmt.Errorf("run id is required")
+	}
+	if status != RunStatusCommitted && status != RunStatusFailed && status != RunStatusInterrupted && status != RunStatusCancelled {
+		return SessionV2{}, fmt.Errorf("invalid run status %q", status)
+	}
+	if settledAt.IsZero() {
+		settledAt = s.now().UTC()
+	}
+	db, err := s.openSessionDB(sessionID, false)
+	if err != nil {
+		return SessionV2{}, err
+	}
+	defer db.Close()
+	tx, err := db.Begin()
+	if err != nil {
+		return SessionV2{}, err
+	}
+	defer tx.Rollback()
+	state, err := readStateInTx(tx, sessionID)
+	if err != nil {
+		return SessionV2{}, err
+	}
+	var currentStatus string
+	if err := tx.QueryRow(`SELECT status FROM runs WHERE id = ?`, runID).Scan(&currentStatus); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return SessionV2{}, fmt.Errorf("run %q was not found", runID)
+		}
+		return SessionV2{}, err
+	}
+	if currentStatus != RunStatusRunning {
+		return SessionV2{}, fmt.Errorf("run %q is already settled as %q", runID, currentStatus)
+	}
+
+	// Settle still-running turns in this transaction. A terminal run row and
+	// a running turn row must never be observable together, including on
+	// cancellation and runner errors.
+	turnSettlementStatus := TurnStatusInterrupted
+	if status == RunStatusFailed {
+		turnSettlementStatus = TurnStatusFailed
+	}
+	rows, err := tx.Query(`SELECT id FROM turns WHERE run_id = ? AND status = ? ORDER BY ordinal`, runID, TurnStatusRunning)
+	if err != nil {
+		return SessionV2{}, err
+	}
+	var runningTurnIDs []string
+	for rows.Next() {
+		var turnID string
+		if err := rows.Scan(&turnID); err != nil {
+			rows.Close()
+			return SessionV2{}, err
+		}
+		runningTurnIDs = append(runningTurnIDs, turnID)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return SessionV2{}, err
+	}
+	rows.Close()
+	if status == RunStatusCommitted && len(runningTurnIDs) > 0 {
+		return SessionV2{}, fmt.Errorf("run %q still has running turn %q", runID, runningTurnIDs[0])
+	}
+	if status == RunStatusCommitted {
+		var unsettled int
+		if err := tx.QueryRow(`SELECT COUNT(*) FROM turns WHERE run_id = ? AND status != ?`, runID, TurnStatusCommitted).Scan(&unsettled); err != nil {
+			return SessionV2{}, err
+		}
+		if unsettled > 0 {
+			return SessionV2{}, fmt.Errorf("run %q has unsettled turns", runID)
+		}
+	}
+	for _, turnID := range runningTurnIDs {
+		if _, err := tx.Exec(`UPDATE turns SET status = ?, settled_at = ? WHERE id = ? AND run_id = ? AND status = ?`, turnSettlementStatus, settledAt.UTC().Format(time.RFC3339Nano), turnID, runID, TurnStatusRunning); err != nil {
+			return SessionV2{}, err
+		}
+	}
+	if _, err := tx.Exec(`UPDATE runs SET status = ?, settled_at = ? WHERE id = ? AND status = ?`, status, settledAt.UTC().Format(time.RFC3339Nano), runID, RunStatusRunning); err != nil {
+		return SessionV2{}, err
+	}
+	if state.RunningRunID == runID || state.CurrentRunID == runID {
+		state.RunningRunID = ""
+		state.CurrentRunID = ""
+		state.RunningTurnID = ""
+		state.RunningStartedAt = time.Time{}
+	} else if state.RunningTurnID != "" {
+		var turnRunID string
+		if err := tx.QueryRow(`SELECT run_id FROM turns WHERE id = ?`, state.RunningTurnID).Scan(&turnRunID); err == nil && turnRunID == runID {
+			state.RunningTurnID = ""
+			state.RunningStartedAt = time.Time{}
+		}
+	}
+	state.LastRunID = runID
+	state.LastRunStatus = status
+	if status == RunStatusInterrupted || status == RunStatusFailed {
+		state.InterruptedRunID = runID
+		state.InterruptedAt = settledAt.UTC()
+		// If the run failed before its first model request there is no valid
+		// Continue target. Otherwise use the turn settled above, or the latest
+		// completed turn when the error happened between requests.
+		var turnID string
+		if len(runningTurnIDs) > 0 {
+			turnID = runningTurnIDs[len(runningTurnIDs)-1]
+		} else {
+			_ = tx.QueryRow(`SELECT id FROM turns WHERE run_id = ? ORDER BY ordinal DESC LIMIT 1`, runID).Scan(&turnID)
+		}
+		state.InterruptedTurnID = turnID
+		if turnID == "" {
+			state.InterruptedRunID = ""
+			state.InterruptedAt = time.Time{}
+		}
+	}
+	if status == RunStatusCommitted || status == RunStatusCancelled {
+		state.InterruptedRunID = ""
+		state.InterruptedTurnID = ""
+		state.InterruptedAt = time.Time{}
+	}
+	events := make([]lifecycleEvent, 0, len(runningTurnIDs)+1)
+	for _, turnID := range runningTurnIDs {
+		events = append(events, lifecycleEvent{
+			Type:    RecordTypeTurnInterrupted,
+			TurnID:  turnID,
+			Payload: map[string]any{"run_id": runID, "turn_id": turnID, "status": turnSettlementStatus},
+		})
+	}
+	events = append(events, lifecycleEvent{
+		Type:    RecordTypeRunSettled,
+		Payload: map[string]any{"run_id": runID, "status": status},
+	})
+	if err := commitLifecycleEventsTx(tx, &state, events...); err != nil {
+		return SessionV2{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return SessionV2{}, err
+	}
+	return state, nil
+}
+
+type lifecycleEvent struct {
+	Type    string
+	TurnID  string
+	Payload any
+}
+
+func commitLifecycleTx(tx *sql.Tx, state *SessionV2, eventType, turnID string, payload any) error {
+	return commitLifecycleEventsTx(tx, state, lifecycleEvent{Type: eventType, TurnID: turnID, Payload: payload})
+}
+
+// commitLifecycleEventsTx writes every lifecycle event and the compact state
+// row as one SQLite transaction. Callers use this for transitions that touch
+// more than one durable record (for example, settling an active turn while
+// settling its run), so there is no committed prefix in the event stream.
+func commitLifecycleEventsTx(tx *sql.Tx, state *SessionV2, events ...lifecycleEvent) error {
+	if len(events) == 0 {
+		return fmt.Errorf("at least one lifecycle event is required")
+	}
+	updatedAt := time.Now().UTC()
+	state.UpdatedAt = updatedAt
+	state.metadataVersion++
+	for _, event := range events {
+		if strings.TrimSpace(event.Type) == "" {
+			return fmt.Errorf("lifecycle event type is required")
+		}
+		data, err := json.Marshal(event.Payload)
+		if err != nil {
+			return err
+		}
+		state.LastSeq++
+		if err := insertStoreEvent(tx, state.LastSeq, event.Type, event.TurnID, "", "", data, updatedAt); err != nil {
+			return err
+		}
+	}
+	stateData, err := marshalState(*state)
+	if err != nil {
+		return err
+	}
+	_, err = tx.Exec(`UPDATE state SET state_json = ?, last_seq = ?, metadata_version = ? WHERE singleton = 1`, stateData, state.LastSeq, state.metadataVersion)
+	return err
+}
+
+func (s *V2Store) ListRuns(sessionID string) ([]RunRecord, error) {
+	db, err := s.openSessionDB(sessionID, false)
+	if err != nil {
+		return nil, err
+	}
+	defer db.Close()
+	rows, err := db.Query(`SELECT id, previous_run_id, status, input_payload, started_at, settled_at FROM runs ORDER BY started_at, id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []RunRecord
+	for rows.Next() {
+		var r RunRecord
+		var started, settled string
+		if err := rows.Scan(&r.ID, &r.PreviousRunID, &r.Status, &r.InputPayload, &started, &settled); err != nil {
+			return nil, err
+		}
+		r.StartedAt, err = time.Parse(time.RFC3339Nano, started)
+		if err != nil {
+			return nil, err
+		}
+		if settled != "" {
+			r.SettledAt, err = time.Parse(time.RFC3339Nano, settled)
+			if err != nil {
+				return nil, err
+			}
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+func (s *V2Store) ListTurns(sessionID, runID string) ([]TurnRecord, error) {
+	db, err := s.openSessionDB(sessionID, false)
+	if err != nil {
+		return nil, err
+	}
+	defer db.Close()
+	query := `SELECT id, run_id, ordinal, status, started_at, settled_at FROM turns`
+	args := []any{}
+	if strings.TrimSpace(runID) != "" {
+		query += ` WHERE run_id = ?`
+		args = append(args, runID)
+	}
+	query += ` ORDER BY run_id, ordinal`
+	rows, err := db.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []TurnRecord
+	for rows.Next() {
+		var t TurnRecord
+		var started, settled string
+		if err := rows.Scan(&t.ID, &t.RunID, &t.Ordinal, &t.Status, &started, &settled); err != nil {
+			return nil, err
+		}
+		t.StartedAt, err = time.Parse(time.RFC3339Nano, started)
+		if err != nil {
+			return nil, err
+		}
+		if settled != "" {
+			t.SettledAt, err = time.Parse(time.RFC3339Nano, settled)
+			if err != nil {
+				return nil, err
+			}
+		}
+		out = append(out, t)
+	}
+	return out, rows.Err()
+}
+
+func (s *V2Store) MarkTurnRunning(sessionID, turnID string) (SessionV2, error) {
+	turnID = strings.TrimSpace(turnID)
+	if turnID == "" {
+		return SessionV2{}, fmt.Errorf("running turn id is required")
+	}
+	return s.mutateLifecycle(sessionID, func(state *SessionV2, now time.Time) (lifecycleMutation, bool, error) {
+		state.RunningTurnID = turnID
+		state.RunningStartedAt = now
+		return lifecycleMutation{Type: RecordTypeTurnRunning, TurnID: turnID}, true, nil
+	})
+}
+
+func (s *V2Store) ClearRunningTurn(sessionID, turnID string) (SessionV2, error) {
+	turnID = strings.TrimSpace(turnID)
+	return s.mutateLifecycle(sessionID, func(state *SessionV2, _ time.Time) (lifecycleMutation, bool, error) {
+		if state.RunningTurnID == "" || (turnID != "" && state.RunningTurnID != turnID) {
+			return lifecycleMutation{}, false, nil
+		}
+		cleared := state.RunningTurnID
+		state.RunningTurnID = ""
+		state.RunningStartedAt = time.Time{}
+		return lifecycleMutation{Type: RecordTypeTurnCleared, TurnID: cleared}, true, nil
+	})
+}
+
+func (s *V2Store) ClearInterruptedTurn(sessionID string) (SessionV2, error) {
+	return s.mutateLifecycle(sessionID, func(state *SessionV2, _ time.Time) (lifecycleMutation, bool, error) {
+		if state.InterruptedTurnID == "" && state.InterruptedAt.IsZero() {
+			return lifecycleMutation{}, false, nil
+		}
+		cleared := state.InterruptedTurnID
+		state.InterruptedTurnID = ""
+		state.InterruptedAt = time.Time{}
+		return lifecycleMutation{Type: RecordTypeInterruptedCleared, TurnID: cleared}, true, nil
+	})
+}
+
+func (s *V2Store) MarkTurnInterrupted(sessionID, turnID string) (SessionV2, error) {
+	turnID = strings.TrimSpace(turnID)
+	return s.mutateLifecycle(sessionID, func(state *SessionV2, now time.Time) (lifecycleMutation, bool, error) {
+		running := strings.TrimSpace(state.RunningTurnID)
+		if running == "" {
+			running = turnID
+		}
+		if running == "" || (turnID != "" && state.RunningTurnID != "" && state.RunningTurnID != turnID) {
+			return lifecycleMutation{}, false, nil
+		}
+		state.RunningTurnID = ""
+		state.RunningStartedAt = time.Time{}
+		state.InterruptedTurnID = running
+		state.InterruptedAt = now
+		return lifecycleMutation{Type: RecordTypeTurnInterrupted, TurnID: running}, true, nil
+	})
+}
+
+type lifecycleMutation struct {
+	Type   string
+	TurnID string
+}
+
+func lifecycleMutationsBetween(before, after SessionV2) []lifecycleMutation {
+	mutations := make([]lifecycleMutation, 0, 2)
+	if before.RunningTurnID != after.RunningTurnID || !before.RunningStartedAt.Equal(after.RunningStartedAt) {
+		if after.RunningTurnID == "" {
+			mutations = append(mutations, lifecycleMutation{Type: RecordTypeTurnCleared, TurnID: before.RunningTurnID})
+		} else {
+			mutations = append(mutations, lifecycleMutation{Type: RecordTypeTurnRunning, TurnID: after.RunningTurnID})
+		}
+	}
+	if before.InterruptedTurnID != after.InterruptedTurnID || !before.InterruptedAt.Equal(after.InterruptedAt) {
+		if after.InterruptedTurnID == "" {
+			mutations = append(mutations, lifecycleMutation{Type: RecordTypeInterruptedCleared, TurnID: before.InterruptedTurnID})
+		} else {
+			mutations = append(mutations, lifecycleMutation{Type: RecordTypeTurnInterrupted, TurnID: after.InterruptedTurnID})
+		}
+	}
+	return mutations
+}
+
+// mutateLifecycle performs the read/modify/write and its immutable lifecycle
+// record in one immediate SQLite transaction. In particular, recovery must
+// not read a state row, yield, and then save a stale copy of that row.
+func (s *V2Store) mutateLifecycle(sessionID string, mutate func(*SessionV2, time.Time) (lifecycleMutation, bool, error)) (SessionV2, error) {
+	if err := s.requireRoot(); err != nil {
+		return SessionV2{}, err
+	}
+	if err := validateV2SessionID(sessionID); err != nil {
+		return SessionV2{}, err
+	}
+	db, err := s.openSessionDB(sessionID, false)
+	if err != nil {
+		return SessionV2{}, err
+	}
+	defer db.Close()
+	tx, err := db.Begin()
+	if err != nil {
+		return SessionV2{}, fmt.Errorf("begin lifecycle mutation: %w", err)
+	}
+	defer tx.Rollback()
+	state, err := readStateInTx(tx, sessionID)
+	if err != nil {
+		return SessionV2{}, err
+	}
+	mutation, changed, err := mutate(&state, s.now().UTC())
+	if err != nil {
+		return SessionV2{}, err
+	}
+	if !changed {
+		return state, nil
+	}
+	if mutation.Type == "" {
+		return SessionV2{}, fmt.Errorf("lifecycle mutation event type is required")
+	}
+	state.UpdatedAt = s.now().UTC()
+	state.LastSeq++
+	state.metadataVersion++
+	payload, err := json.Marshal(mutation)
+	if err != nil {
+		return SessionV2{}, fmt.Errorf("marshal lifecycle mutation: %w", err)
+	}
+	if err := insertStoreEvent(tx, state.LastSeq, mutation.Type, mutation.TurnID, "", "", payload, state.UpdatedAt); err != nil {
+		return SessionV2{}, err
+	}
+	data, err := marshalState(state)
+	if err != nil {
+		return SessionV2{}, err
+	}
+	if _, err := tx.Exec(`UPDATE state SET state_json = ?, last_seq = ?, metadata_version = ? WHERE singleton = 1`, data, state.LastSeq, state.metadataVersion); err != nil {
+		return SessionV2{}, fmt.Errorf("update lifecycle state: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return SessionV2{}, fmt.Errorf("commit lifecycle mutation: %w", err)
+	}
+	return state, nil
+}
+
+func readStateInTx(tx *sql.Tx, sessionID string) (SessionV2, error) {
+	var data []byte
+	var lastSeq, metadataVersion int64
+	if err := tx.QueryRow(`SELECT state_json, last_seq, metadata_version FROM state WHERE singleton = 1`).Scan(&data, &lastSeq, &metadataVersion); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return SessionV2{}, fmt.Errorf("%w: %s", ErrNotFound, sessionID)
+		}
+		return SessionV2{}, fmt.Errorf("read session state %q: %w", sessionID, err)
+	}
+	var state SessionV2
+	if err := json.Unmarshal(data, &state); err != nil {
+		return SessionV2{}, corruptedSessionError(sessionID, "parse SQLite state: %v", err)
+	}
+	if state.ID == "" {
+		state.ID = sessionID
+	}
+	if state.ID != sessionID {
+		return SessionV2{}, fmt.Errorf("session state %q contains id %q", sessionID, state.ID)
+	}
+	state.Items = nil
+	state.LastSeq = lastSeq
+	state.metadataVersion = metadataVersion
+	return state, nil
+}
+
+// MarkRunningTurnsInterrupted is the startup recovery operation. It only
+// scans compact state rows, so startup cost is independent of event history.
+func (s *V2Store) MarkRunningTurnsInterrupted() ([]SessionV2, error) {
+	states, err := s.ListStates(V2ListOptions{All: true})
+	if err != nil {
+		return nil, err
+	}
+	marked := make([]SessionV2, 0)
+	for _, state := range states {
+		if strings.TrimSpace(state.RunningTurnID) == "" && strings.TrimSpace(state.RunningRunID) == "" {
+			continue
+		}
+		updated, err := s.recoverRunningSession(state.ID)
+		if err != nil {
+			return nil, err
+		}
+		marked = append(marked, updated)
+	}
+	return marked, nil
+}
+
+// recoverRunningSession closes a process-dead run, its active turn, and the
+// compact state row atomically. It deliberately does not reconstruct anything
+// from the event log: state and the lifecycle tables are the recovery source.
+func (s *V2Store) recoverRunningSession(sessionID string) (SessionV2, error) {
+	db, err := s.openSessionDB(sessionID, false)
+	if err != nil {
+		return SessionV2{}, err
+	}
+	defer db.Close()
+	tx, err := db.Begin()
+	if err != nil {
+		return SessionV2{}, err
+	}
+	defer tx.Rollback()
+	state, err := readStateInTx(tx, sessionID)
+	if err != nil {
+		return SessionV2{}, err
+	}
+	now := s.now().UTC()
+	runID, turnID := state.RunningRunID, state.RunningTurnID
+	if runID == "" && turnID == "" {
+		// The compact-state scan happens before each per-session recovery
+		// transaction. A concurrent terminal transition may have won between
+		// those two operations; there is then nothing left to recover.
+		return state, nil
+	}
+	var recoveredTurnIDs []string
+	if runID != "" {
+		if _, err := tx.Exec(`UPDATE runs SET status = ?, settled_at = ? WHERE id = ? AND status = ?`, RunStatusInterrupted, now.Format(time.RFC3339Nano), runID, RunStatusRunning); err != nil {
+			return SessionV2{}, err
+		}
+		rows, err := tx.Query(`SELECT id FROM turns WHERE run_id = ? AND status = ? ORDER BY ordinal`, runID, TurnStatusRunning)
+		if err != nil {
+			return SessionV2{}, err
+		}
+		for rows.Next() {
+			var id string
+			if err := rows.Scan(&id); err != nil {
+				rows.Close()
+				return SessionV2{}, err
+			}
+			recoveredTurnIDs = append(recoveredTurnIDs, id)
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return SessionV2{}, err
+		}
+		rows.Close()
+		for _, id := range recoveredTurnIDs {
+			if _, err := tx.Exec(`UPDATE turns SET status = ?, settled_at = ? WHERE id = ? AND run_id = ? AND status = ?`, TurnStatusInterrupted, now.Format(time.RFC3339Nano), id, runID, RunStatusRunning); err != nil {
+				return SessionV2{}, err
+			}
+		}
+	}
+	if len(recoveredTurnIDs) > 0 {
+		turnID = recoveredTurnIDs[len(recoveredTurnIDs)-1]
+		for _, id := range recoveredTurnIDs {
+			if id == state.RunningTurnID {
+				turnID = id
+				break
+			}
+		}
+	} else if runID != "" {
+		// Recovery can happen between model requests. The latest completed
+		// turn is then the active-history checkpoint for Continue.
+		_ = tx.QueryRow(`SELECT id FROM turns WHERE run_id = ? ORDER BY ordinal DESC LIMIT 1`, runID).Scan(&turnID)
+	}
+	if runID != "" {
+		state.InterruptedRunID = runID
+		state.LastRunStatus = RunStatusInterrupted
+	}
+	if turnID != "" {
+		state.InterruptedTurnID = turnID
+		state.InterruptedAt = now
+	} else {
+		state.InterruptedTurnID = ""
+		state.InterruptedAt = time.Time{}
+		if runID == "" {
+			state.InterruptedRunID = ""
+		}
+	}
+	state.RunningRunID = ""
+	state.CurrentRunID = ""
+	state.RunningTurnID = ""
+	state.RunningStartedAt = time.Time{}
+	if runID != "" {
+		state.LastRunID = runID
+	}
+	events := make([]lifecycleEvent, 0, len(recoveredTurnIDs)+1)
+	for _, id := range recoveredTurnIDs {
+		events = append(events, lifecycleEvent{
+			Type:    RecordTypeTurnInterrupted,
+			TurnID:  id,
+			Payload: map[string]any{"run_id": runID, "turn_id": id, "status": TurnStatusInterrupted, "recovered": true},
+		})
+	}
+	if runID == "" && turnID != "" {
+		events = append(events, lifecycleEvent{
+			Type:    RecordTypeTurnInterrupted,
+			TurnID:  turnID,
+			Payload: map[string]any{"turn_id": turnID, "status": TurnStatusInterrupted, "recovered": true},
+		})
+	}
+	if runID != "" {
+		events = append(events, lifecycleEvent{
+			Type:    RecordTypeRunSettled,
+			Payload: map[string]any{"run_id": runID, "turn_id": turnID, "status": RunStatusInterrupted, "recovered": true},
+		})
+	}
+	if err := commitLifecycleEventsTx(tx, &state, events...); err != nil {
+		return SessionV2{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return SessionV2{}, err
+	}
+	return state, nil
+}
+
 func (s *V2Store) MaterializeActiveHistory(session SessionV2) ([]model.Message, error) {
-	return materializeActiveHistory(session, s.ReadBlob)
+	if len(session.Items) == 0 && len(session.ActiveHistory) > 0 {
+		items, err := s.loadActiveHistoryItems(session.ID, session.ActiveHistory)
+		if err != nil {
+			return nil, err
+		}
+		session.Items = items
+	}
+	return materializeActiveHistory(session, func(ref BlobRef) ([]byte, error) {
+		return s.ReadBlobForSession(session.ID, ref)
+	})
+}
+
+// loadActiveHistoryItems is the narrow hydration path used by materialization
+// when the caller has a compact state row. It intentionally does not turn a
+// request for the active prompt into a full historical item scan.
+func (s *V2Store) loadActiveHistoryItems(sessionID string, itemIDs []string) ([]SessionItem, error) {
+	if err := s.requireRoot(); err != nil {
+		return nil, err
+	}
+	if err := validateV2SessionID(sessionID); err != nil {
+		return nil, err
+	}
+	db, err := s.openSessionDB(sessionID, false)
+	if err != nil {
+		return nil, err
+	}
+	defer db.Close()
+	items := make([]SessionItem, 0, len(itemIDs))
+	for _, itemID := range itemIDs {
+		var payload []byte
+		if err := db.QueryRow(`SELECT payload FROM items WHERE id = ?`, itemID).Scan(&payload); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				continue
+			}
+			return nil, err
+		}
+		var item SessionItem
+		if err := json.Unmarshal(payload, &item); err != nil {
+			return nil, corruptedSessionError(sessionID, "parse active item projection: %v", err)
+		}
+		items = append(items, item)
+	}
+	return items, nil
 }
 
 func (s *V2Store) AppendItem(sessionID string, item SessionItem) (SessionItem, error) {
 	if item.CreatedAt.IsZero() {
 		item.CreatedAt = s.now().UTC()
 	}
-	if item.ID == "" {
+	if strings.TrimSpace(item.ID) == "" {
 		return SessionItem{}, fmt.Errorf("session item id is required")
 	}
-	item, err := s.blobifySessionItemContent(item)
+	item, err := s.blobifySessionItemContent(sessionID, item)
 	if err != nil {
 		return SessionItem{}, err
 	}
-	seq, err := s.appendRecord(sessionID, v2Record{
-		Type: RecordTypeItemAppended,
-		Item: &item,
-	})
+	state, err := s.LoadState(sessionID)
 	if err != nil {
 		return SessionItem{}, err
 	}
-	item.Seq = seq
+	item.Seq = state.LastSeq + 1
+	_, err = s.appendEvents(sessionID, state, []storeEvent{{Type: RecordTypeItemAppended, Item: &item}}, false, false)
+	if err != nil {
+		return SessionItem{}, err
+	}
 	return item, nil
 }
 
 func (s *V2Store) UpdateItem(sessionID string, item SessionItem) (SessionItem, error) {
-	if err := s.requireRoot(); err != nil {
-		return SessionItem{}, err
-	}
-	if err := validateV2SessionID(sessionID); err != nil {
-		return SessionItem{}, err
-	}
-	if item.ID == "" {
-		return SessionItem{}, fmt.Errorf("session item id is required")
-	}
-
-	state, err := s.Replay(sessionID)
+	state, err := s.LoadExecutionState(sessionID)
 	if err != nil {
 		return SessionItem{}, err
 	}
@@ -655,83 +1569,66 @@ func (s *V2Store) UpdateItem(sessionID string, item SessionItem) (SessionItem, e
 	return updated, err
 }
 
-// UpdateItemFromState appends an item.updated record using the caller's cached
-// session state and returns both the updated item and the advanced state.
-// The caller must provide the latest state for this session and must be the
-// session's single writer; stale state can write duplicate seqs and corrupt the
-// log.
 func (s *V2Store) UpdateItemFromState(sessionID string, state SessionV2, item SessionItem) (SessionItem, SessionV2, error) {
-	if err := s.requireRoot(); err != nil {
-		return SessionItem{}, SessionV2{}, err
-	}
 	if err := validateCachedWriteState(sessionID, state); err != nil {
 		return SessionItem{}, SessionV2{}, err
 	}
-	if item.ID == "" {
+	if strings.TrimSpace(item.ID) == "" {
 		return SessionItem{}, SessionV2{}, fmt.Errorf("session item id is required")
 	}
-
 	existing, ok := findSessionItemByID(state.Items, item.ID)
 	if !ok {
 		return SessionItem{}, SessionV2{}, corruptedSessionError(sessionID, "item.updated references missing item %q", item.ID)
 	}
-
 	updated := existing
 	updated.Message = copyMessagePtr(item.Message)
 	updated.Content = copyStoredContent(item.Content)
 	updated.Status = item.Status
-	updated, err := s.blobifySessionItemContent(updated)
+	updated, err := s.blobifySessionItemContent(sessionID, updated)
 	if err != nil {
 		return SessionItem{}, SessionV2{}, err
 	}
-
-	record := v2Record{
-		Seq:  state.LastSeq + 1,
-		Type: RecordTypeItemUpdated,
-		Item: &updated,
-	}
-	nextState, err := replayRecordOnState(state, record)
+	next, err := s.appendEvents(sessionID, state, []storeEvent{{Type: RecordTypeItemUpdated, Item: &updated}}, false, true)
 	if err != nil {
 		return SessionItem{}, SessionV2{}, err
 	}
-	if err := s.appendRecords(sessionID, []v2Record{record}); err != nil {
-		return SessionItem{}, SessionV2{}, err
-	}
-	return updated, nextState, nil
+	return updated, next, nil
 }
 
 func (s *V2Store) ReplaceActiveHistory(sessionID string, itemIDs []string) (int64, error) {
-	return s.appendRecord(sessionID, v2Record{
-		Type:    RecordTypeActiveHistoryReplaced,
-		ItemIDs: copyStrings(itemIDs),
-	})
+	state, err := s.LoadState(sessionID)
+	if err != nil {
+		return 0, err
+	}
+	next, err := s.appendEvents(sessionID, state, []storeEvent{{Type: RecordTypeActiveHistoryReplaced, ItemIDs: copyStrings(itemIDs)}}, false, false)
+	if err != nil {
+		return 0, err
+	}
+	return next.LastSeq, nil
 }
 
 func (s *V2Store) AppendCompaction(sessionID string, checkpoint CompactionCheckpoint) (CompactionCheckpoint, error) {
 	if checkpoint.CreatedAt.IsZero() {
 		checkpoint.CreatedAt = s.now().UTC()
 	}
-	if checkpoint.ID == "" {
+	if strings.TrimSpace(checkpoint.ID) == "" {
 		return CompactionCheckpoint{}, fmt.Errorf("compaction checkpoint id is required")
 	}
-	_, err := s.appendRecord(sessionID, v2Record{
-		Type:       RecordTypeCompactionCreated,
-		Compaction: &checkpoint,
-	})
+	state, err := s.LoadState(sessionID)
 	if err != nil {
+		return CompactionCheckpoint{}, err
+	}
+	if _, err := s.appendEvents(sessionID, state, []storeEvent{{Type: RecordTypeCompactionCreated, Compaction: &checkpoint}}, false, false); err != nil {
 		return CompactionCheckpoint{}, err
 	}
 	return checkpoint, nil
 }
 
 func (s *V2Store) AppendCompactionCheckpoint(sessionID string, summaryItem SessionItem, checkpoint CompactionCheckpoint) (SessionV2, error) {
-	if err := s.requireRoot(); err != nil {
+	state, err := s.LoadExecutionState(sessionID)
+	if err != nil {
 		return SessionV2{}, err
 	}
-	if err := validateV2SessionID(sessionID); err != nil {
-		return SessionV2{}, err
-	}
-
 	now := s.now().UTC()
 	if summaryItem.CreatedAt.IsZero() {
 		summaryItem.CreatedAt = now
@@ -739,127 +1636,30 @@ func (s *V2Store) AppendCompactionCheckpoint(sessionID string, summaryItem Sessi
 	if checkpoint.CreatedAt.IsZero() {
 		checkpoint.CreatedAt = now
 	}
-	state, err := s.Replay(sessionID)
-	if err != nil {
-		return SessionV2{}, err
-	}
 	if err := validateCompactionCheckpointWrite(summaryItem, checkpoint, state); err != nil {
 		return SessionV2{}, err
 	}
-	summaryItem, err = s.blobifySessionItemContent(summaryItem)
+	summaryItem, err = s.blobifySessionItemContent(sessionID, summaryItem)
 	if err != nil {
 		return SessionV2{}, err
 	}
-
-	txID := fmt.Sprintf("tx-%06d", state.LastSeq+1)
-	records := make([]v2Record, 0, 5)
-	nextSeq := state.LastSeq + 1
-	records = append(records, v2Record{
-		Seq:  nextSeq,
-		Type: RecordTypeTransactionBegin,
-		TxID: txID,
-	})
-	nextSeq++
-
-	summaryItem.Seq = nextSeq
-	summaryCopy := summaryItem
-	records = append(records, v2Record{
-		Seq:  nextSeq,
-		Type: RecordTypeItemAppended,
-		TxID: txID,
-		Item: &summaryCopy,
-	})
-	nextSeq++
-
-	checkpointCopy := checkpoint
-	records = append(records, v2Record{
-		Seq:        nextSeq,
-		Type:       RecordTypeCompactionCreated,
-		TxID:       txID,
-		Compaction: &checkpointCopy,
-	})
-	nextSeq++
-
-	records = append(records, v2Record{
-		Seq:     nextSeq,
-		Type:    RecordTypeActiveHistoryReplaced,
-		TxID:    txID,
-		ItemIDs: copyStrings(checkpoint.ReplacementHistory),
-	})
-	nextSeq++
-	records = append(records, v2Record{
-		Seq:  nextSeq,
-		Type: RecordTypeTransactionCommit,
-		TxID: txID,
-	})
-
-	if err := s.appendRecords(sessionID, records); err != nil {
-		return SessionV2{}, err
-	}
-	return s.Replay(sessionID)
+	next, err := s.appendEvents(sessionID, state, []storeEvent{
+		{Type: RecordTypeItemAppended, Item: &summaryItem},
+		{Type: RecordTypeCompactionCreated, Compaction: &checkpoint},
+		{Type: RecordTypeActiveHistoryReplaced, ItemIDs: copyStrings(checkpoint.ReplacementHistory)},
+	}, true, true)
+	return next, err
 }
 
 func (s *V2Store) SaveTurn(session SessionV2, items []SessionItem, activeHistory []string) (SessionV2, error) {
-	if err := s.requireRoot(); err != nil {
-		return SessionV2{}, err
-	}
-
-	now := s.now().UTC()
-	isNew := strings.TrimSpace(session.ID) == ""
-	if isNew {
-		id, err := newSessionID(now)
-		if err != nil {
-			return SessionV2{}, err
-		}
-		session.ID = id
-	}
-	if err := validateV2SessionID(session.ID); err != nil {
-		return SessionV2{}, err
-	}
-	if session.Version == 0 {
-		session.Version = VersionV2
-	}
-	if session.CreatedAt.IsZero() {
-		session.CreatedAt = now
-	}
-	session.UpdatedAt = now
-	session.LastUsedAt = now
-	session = copySessionV2(session)
-
-	if !isNew {
-		if _, err := s.loadMetadata(session.ID); err != nil {
-			if !errors.Is(err, ErrNotFound) {
-				return SessionV2{}, err
-			}
-			isNew = true
-		}
-	}
-	if !isNew {
-		saved, err := s.SaveMetadata(session)
-		if err != nil {
-			return SessionV2{}, err
-		}
-		session = saved
-	}
-
-	if _, err := s.AppendItemsAndReplaceActiveHistory(session.ID, items, activeHistory); err != nil {
-		return SessionV2{}, err
-	}
-	if isNew {
-		if _, err := s.SaveMetadata(session); err != nil {
-			_ = s.Delete(session.ID)
-			return SessionV2{}, err
-		}
-	}
-
-	return s.Load(session.ID)
+	return s.saveTurn(session, nil, nil, items, activeHistory)
 }
 
 func (s *V2Store) SaveCompactedTurn(session SessionV2, summaryItem SessionItem, checkpoint CompactionCheckpoint, items []SessionItem, activeHistory []string) (SessionV2, error) {
-	if err := s.requireRoot(); err != nil {
-		return SessionV2{}, err
-	}
+	return s.saveTurn(session, &summaryItem, &checkpoint, items, activeHistory)
+}
 
+func (s *V2Store) saveTurn(session SessionV2, summaryItem *SessionItem, checkpoint *CompactionCheckpoint, items []SessionItem, activeHistory []string) (SessionV2, error) {
 	now := s.now().UTC()
 	isNew := strings.TrimSpace(session.ID) == ""
 	if isNew {
@@ -869,248 +1669,139 @@ func (s *V2Store) SaveCompactedTurn(session SessionV2, summaryItem SessionItem, 
 		}
 		session.ID = id
 	}
-	if err := validateV2SessionID(session.ID); err != nil {
-		return SessionV2{}, err
-	}
 	if session.Version == 0 {
 		session.Version = VersionV2
 	}
 	if session.CreatedAt.IsZero() {
 		session.CreatedAt = now
 	}
-	session.UpdatedAt = now
+	if isNew {
+		session.UpdatedAt = now
+	}
 	session.LastUsedAt = now
-	session = copySessionV2(session)
-
 	if !isNew {
-		if _, err := s.loadMetadata(session.ID); err != nil {
+		if _, err := s.LoadState(session.ID); err != nil {
 			if !errors.Is(err, ErrNotFound) {
 				return SessionV2{}, err
 			}
 			isNew = true
 		}
 	}
-	if !isNew {
-		saved, err := s.SaveMetadata(session)
+	if isNew {
+		if _, err := s.SaveMetadata(session); err != nil {
+			return SessionV2{}, err
+		}
+	} else {
+		if _, err := s.SaveMetadata(session); err != nil {
+			return SessionV2{}, err
+		}
+	}
+	state, err := s.LoadExecutionState(session.ID)
+	if err != nil {
+		return SessionV2{}, err
+	}
+	if summaryItem != nil && checkpoint != nil {
+		if summaryItem.CreatedAt.IsZero() {
+			summaryItem.CreatedAt = now
+		}
+		if checkpoint.CreatedAt.IsZero() {
+			checkpoint.CreatedAt = now
+		}
+		if err := validateCompactionCheckpointWrite(*summaryItem, *checkpoint, state); err != nil {
+			return SessionV2{}, err
+		}
+	}
+	events := make([]storeEvent, 0, len(items)+3)
+	if summaryItem != nil {
+		copyItem := *summaryItem
+		copyItem, err = s.blobifySessionItemContent(session.ID, copyItem)
 		if err != nil {
 			return SessionV2{}, err
 		}
-		session = saved
+		events = append(events, storeEvent{Type: RecordTypeItemAppended, Item: &copyItem})
+		events = append(events, storeEvent{Type: RecordTypeCompactionCreated, Compaction: checkpoint})
 	}
-
-	if _, err := s.appendCompactionAndItemsReplaceActiveHistory(session.ID, summaryItem, checkpoint, items, activeHistory); err != nil {
-		return SessionV2{}, err
-	}
-	if isNew {
-		if _, err := s.SaveMetadata(session); err != nil {
-			_ = s.Delete(session.ID)
+	for i := range items {
+		item := items[i]
+		if item.CreatedAt.IsZero() {
+			item.CreatedAt = now
+		}
+		if strings.TrimSpace(item.ID) == "" {
+			return SessionV2{}, fmt.Errorf("session item id is required")
+		}
+		item, err = s.blobifySessionItemContent(session.ID, item)
+		if err != nil {
 			return SessionV2{}, err
 		}
+		events = append(events, storeEvent{Type: RecordTypeItemAppended, Item: &item})
 	}
-
-	return s.Load(session.ID)
+	events = append(events, storeEvent{Type: RecordTypeActiveHistoryReplaced, ItemIDs: copyStrings(activeHistory)})
+	next, err := s.appendEvents(session.ID, state, events, true, true)
+	if err != nil {
+		return SessionV2{}, err
+	}
+	return next, nil
 }
 
 func (s *V2Store) AppendItemsAndReplaceActiveHistory(sessionID string, items []SessionItem, itemIDs []string) (SessionV2, error) {
-	if err := s.requireRoot(); err != nil {
-		return SessionV2{}, err
-	}
-	if err := validateV2SessionID(sessionID); err != nil {
-		return SessionV2{}, err
-	}
-
-	state, err := s.Replay(sessionID)
+	state, err := s.LoadExecutionState(sessionID)
 	if err != nil {
 		return SessionV2{}, err
 	}
 	return s.AppendItemsAndReplaceActiveHistoryFromState(sessionID, state, items, itemIDs)
 }
 
-// AppendItemsAndReplaceActiveHistoryFromState appends a transaction using the
-// caller's cached session state and returns the advanced state without replaying
-// from disk. The caller must provide the latest state for this session and must
-// be the session's single writer; stale state can write duplicate seqs and
-// corrupt the log.
 func (s *V2Store) AppendItemsAndReplaceActiveHistoryFromState(sessionID string, state SessionV2, items []SessionItem, itemIDs []string) (SessionV2, error) {
-	if err := s.requireRoot(); err != nil {
-		return SessionV2{}, err
-	}
 	if err := validateCachedWriteState(sessionID, state); err != nil {
 		return SessionV2{}, err
 	}
-
 	now := s.now().UTC()
-	txID := fmt.Sprintf("tx-%06d", state.LastSeq+1)
-	records := make([]v2Record, 0, len(items)+3)
-	nextSeq := state.LastSeq + 1
-	records = append(records, v2Record{
-		Seq:  nextSeq,
-		Type: RecordTypeTransactionBegin,
-		TxID: txID,
-	})
-	nextSeq++
-	for _, item := range items {
+	events := make([]storeEvent, 0, len(items)+1)
+	for i := range items {
+		item := items[i]
 		if item.CreatedAt.IsZero() {
 			item.CreatedAt = now
 		}
-		if item.ID == "" {
+		if strings.TrimSpace(item.ID) == "" {
 			return SessionV2{}, fmt.Errorf("session item id is required")
 		}
-		item, err := s.blobifySessionItemContent(item)
+		var err error
+		item, err = s.blobifySessionItemContent(sessionID, item)
 		if err != nil {
 			return SessionV2{}, err
 		}
-		item.Seq = nextSeq
-		itemCopy := item
-		records = append(records, v2Record{
-			Seq:  nextSeq,
-			Type: RecordTypeItemAppended,
-			TxID: txID,
-			Item: &itemCopy,
-		})
-		nextSeq++
+		events = append(events, storeEvent{Type: RecordTypeItemAppended, Item: &item})
 	}
-	records = append(records, v2Record{
-		Seq:     nextSeq,
-		Type:    RecordTypeActiveHistoryReplaced,
-		TxID:    txID,
-		ItemIDs: copyStrings(itemIDs),
-	})
-	nextSeq++
-	records = append(records, v2Record{
-		Seq:  nextSeq,
-		Type: RecordTypeTransactionCommit,
-		TxID: txID,
-	})
-
-	nextState, err := replayTransactionOnState(state, records)
-	if err != nil {
-		return SessionV2{}, err
-	}
-	if err := s.appendRecords(sessionID, records); err != nil {
-		return SessionV2{}, err
-	}
-	return nextState, nil
+	events = append(events, storeEvent{Type: RecordTypeActiveHistoryReplaced, ItemIDs: copyStrings(itemIDs)})
+	return s.appendEvents(sessionID, state, events, true, true)
 }
 
-func (s *V2Store) appendCompactionAndItemsReplaceActiveHistory(sessionID string, summaryItem SessionItem, checkpoint CompactionCheckpoint, items []SessionItem, itemIDs []string) (SessionV2, error) {
-	if err := s.requireRoot(); err != nil {
-		return SessionV2{}, err
+func (s *V2Store) PersistedEventsAfter(sessionID string, afterSeq int64) ([]PersistedEvent, error) {
+	if afterSeq < 0 {
+		return nil, fmt.Errorf("after seq must be non-negative")
 	}
-	if err := validateV2SessionID(sessionID); err != nil {
-		return SessionV2{}, err
+	if _, err := s.LoadState(sessionID); err != nil {
+		return nil, err
 	}
-
-	state, err := s.Replay(sessionID)
+	db, err := s.openSessionDB(sessionID, false)
 	if err != nil {
-		return SessionV2{}, err
+		return nil, err
 	}
-	if err := validateCompactionCheckpointWrite(summaryItem, checkpoint, state); err != nil {
-		return SessionV2{}, err
-	}
-	summaryItem, err = s.blobifySessionItemContent(summaryItem)
+	defer db.Close()
+	rows, err := db.Query(`SELECT seq, type, item_id, compaction_id FROM events WHERE seq > ? ORDER BY seq`, afterSeq)
 	if err != nil {
-		return SessionV2{}, err
+		return nil, err
 	}
-
-	now := s.now().UTC()
-	if summaryItem.CreatedAt.IsZero() {
-		summaryItem.CreatedAt = now
-	}
-	if checkpoint.CreatedAt.IsZero() {
-		checkpoint.CreatedAt = now
-	}
-	txID := fmt.Sprintf("tx-%06d", state.LastSeq+1)
-	records := make([]v2Record, 0, len(items)+5)
-	nextSeq := state.LastSeq + 1
-	records = append(records, v2Record{
-		Seq:  nextSeq,
-		Type: RecordTypeTransactionBegin,
-		TxID: txID,
-	})
-	nextSeq++
-
-	summaryItem.Seq = nextSeq
-	summaryCopy := summaryItem
-	records = append(records, v2Record{
-		Seq:  nextSeq,
-		Type: RecordTypeItemAppended,
-		TxID: txID,
-		Item: &summaryCopy,
-	})
-	nextSeq++
-
-	checkpointCopy := checkpoint
-	records = append(records, v2Record{
-		Seq:        nextSeq,
-		Type:       RecordTypeCompactionCreated,
-		TxID:       txID,
-		Compaction: &checkpointCopy,
-	})
-	nextSeq++
-
-	for _, item := range items {
-		if item.CreatedAt.IsZero() {
-			item.CreatedAt = now
+	defer rows.Close()
+	events := make([]PersistedEvent, 0)
+	for rows.Next() {
+		var event PersistedEvent
+		if err := rows.Scan(&event.Seq, &event.Type, &event.ItemID, &event.CompactionID); err != nil {
+			return nil, err
 		}
-		if item.ID == "" {
-			return SessionV2{}, fmt.Errorf("session item id is required")
-		}
-		item, err = s.blobifySessionItemContent(item)
-		if err != nil {
-			return SessionV2{}, err
-		}
-		item.Seq = nextSeq
-		itemCopy := item
-		records = append(records, v2Record{
-			Seq:  nextSeq,
-			Type: RecordTypeItemAppended,
-			TxID: txID,
-			Item: &itemCopy,
-		})
-		nextSeq++
+		events = append(events, event)
 	}
-	records = append(records, v2Record{
-		Seq:     nextSeq,
-		Type:    RecordTypeActiveHistoryReplaced,
-		TxID:    txID,
-		ItemIDs: copyStrings(itemIDs),
-	})
-	nextSeq++
-	records = append(records, v2Record{
-		Seq:  nextSeq,
-		Type: RecordTypeTransactionCommit,
-		TxID: txID,
-	})
-
-	if err := s.appendRecords(sessionID, records); err != nil {
-		return SessionV2{}, err
-	}
-	return s.Replay(sessionID)
-}
-
-func (s *V2Store) Replay(sessionID string) (SessionV2, error) {
-	if err := s.requireRoot(); err != nil {
-		return SessionV2{}, err
-	}
-	if err := validateV2SessionID(sessionID); err != nil {
-		return SessionV2{}, err
-	}
-
-	state := SessionV2{
-		ID:      sessionID,
-		Version: VersionV2,
-	}
-	segments, err := s.segmentPaths(sessionID)
-	if err != nil {
-		return SessionV2{}, err
-	}
-	for _, path := range segments {
-		if err := replaySegment(path, &state); err != nil {
-			return SessionV2{}, err
-		}
-	}
-	return state, nil
+	return events, rows.Err()
 }
 
 type PersistedEvent struct {
@@ -1120,48 +1811,159 @@ type PersistedEvent struct {
 	CompactionID string
 }
 
-func (s *V2Store) PersistedEventsAfter(sessionID string, afterSeq int64) ([]PersistedEvent, error) {
-	if err := s.requireRoot(); err != nil {
-		return nil, err
+// ReadHistoryPage performs bounded SQL reads from the item projection. It is
+// intentionally separate from LoadExecutionState so list/detail paths cannot
+// accidentally load the complete history.
+func (s *V2Store) ReadHistoryPage(sessionID string, options HistoryPageOptions) (HistoryPage, error) {
+	if options.BeforeSeq < 0 || options.AfterSeq < 0 {
+		return HistoryPage{}, fmt.Errorf("history cursors must be non-negative")
 	}
-	if err := validateV2SessionID(sessionID); err != nil {
-		return nil, err
+	if options.BeforeSeq > 0 && options.AfterSeq > 0 {
+		return HistoryPage{}, fmt.Errorf("before and after cursors cannot be combined")
 	}
-	if afterSeq < 0 {
-		return nil, fmt.Errorf("after seq must be non-negative")
+	if options.Limit <= 0 {
+		options.Limit = 50
 	}
-
-	state := SessionV2{
-		ID:      sessionID,
-		Version: VersionV2,
+	if options.Limit > 1000 {
+		return HistoryPage{}, fmt.Errorf("history page limit cannot exceed 1000")
 	}
-	segments, err := s.segmentPaths(sessionID)
+	if _, err := s.LoadState(sessionID); err != nil {
+		return HistoryPage{}, err
+	}
+	db, err := s.openSessionDB(sessionID, false)
 	if err != nil {
-		return nil, err
+		return HistoryPage{}, err
 	}
-	events := make([]PersistedEvent, 0)
-	for _, path := range segments {
-		if err := replaySegmentPersistedEvents(path, &state, afterSeq, &events); err != nil {
-			return nil, err
+	defer db.Close()
+	where := ""
+	args := []any{}
+	if options.BeforeSeq > 0 {
+		where = "seq < ?"
+		args = append(args, options.BeforeSeq)
+	} else if options.AfterSeq > 0 {
+		where = "seq > ?"
+		args = append(args, options.AfterSeq)
+	}
+	if options.VisibleOnly {
+		if where != "" {
+			where += " AND "
+		}
+		where += "json_extract(payload, '$.visibility') = 'visible'"
+	}
+	order := "seq ASC"
+	if options.AfterSeq == 0 {
+		order = "seq DESC"
+	}
+	query := `SELECT payload FROM items`
+	if where != "" {
+		query += " WHERE " + where
+	}
+	query += " ORDER BY " + order + " LIMIT ?"
+	args = append(args, options.Limit)
+	rows, err := db.Query(query, args...)
+	if err != nil {
+		return HistoryPage{}, fmt.Errorf("read history page: %w", err)
+	}
+	defer rows.Close()
+	items := make([]SessionItem, 0, options.Limit)
+	for rows.Next() {
+		var payload []byte
+		if err := rows.Scan(&payload); err != nil {
+			return HistoryPage{}, err
+		}
+		var item SessionItem
+		if err := json.Unmarshal(payload, &item); err != nil {
+			return HistoryPage{}, corruptedSessionError(sessionID, "parse item projection: %v", err)
+		}
+		items = append(items, item)
+	}
+	if err := rows.Err(); err != nil {
+		return HistoryPage{}, err
+	}
+	if options.AfterSeq == 0 {
+		reverseItems(items)
+	}
+	if options.AlignTurn && options.AfterSeq == 0 && len(items) > 0 {
+		items, err = s.extendHistoryPageBack(db, sessionID, items, options)
+		if err != nil {
+			return HistoryPage{}, err
 		}
 	}
-	return events, nil
+	page := HistoryPage{Items: items}
+	if len(items) > 0 {
+		page.OldestSeq, page.NewestSeq = items[0].Seq, items[len(items)-1].Seq
+		page.HasMoreBefore, err = s.historyExists(db, "seq < ?", page.OldestSeq, options.VisibleOnly)
+		if err != nil {
+			return HistoryPage{}, err
+		}
+		page.HasMoreAfter, err = s.historyExists(db, "seq > ?", page.NewestSeq, options.VisibleOnly)
+		if err != nil {
+			return HistoryPage{}, err
+		}
+	}
+	return page, nil
 }
 
-func (s *V2Store) WriteBlob(raw []byte, encoding, mediaType string) (BlobRef, error) {
+func (s *V2Store) extendHistoryPageBack(db *sql.DB, sessionID string, items []SessionItem, options HistoryPageOptions) ([]SessionItem, error) {
+	if len(items) == 0 {
+		return items, nil
+	}
+	first := items[0]
+	for first.TurnID != "" {
+		var payload []byte
+		err := db.QueryRow(`SELECT payload FROM items WHERE seq < ?`+visibleClause(options.VisibleOnly)+` ORDER BY seq DESC LIMIT 1`, first.Seq).Scan(&payload)
+		if errors.Is(err, sql.ErrNoRows) {
+			return items, nil
+		}
+		if err != nil {
+			return nil, fmt.Errorf("read preceding history item: %w", err)
+		}
+		var previous SessionItem
+		if err := json.Unmarshal(payload, &previous); err != nil {
+			return nil, corruptedSessionError(sessionID, "parse preceding item projection: %v", err)
+		}
+		if previous.TurnID != first.TurnID {
+			return items, nil
+		}
+		items = append([]SessionItem{previous}, items...)
+		first = previous
+	}
+	return items, nil
+}
+
+func visibleClause(visible bool) string {
+	if visible {
+		return " AND json_extract(payload, '$.visibility') = 'visible'"
+	}
+	return ""
+}
+
+func (s *V2Store) historyExists(db *sql.DB, condition string, seq int64, visible bool) (bool, error) {
+	query := `SELECT 1 FROM items WHERE ` + condition
+	if visible {
+		query += ` AND json_extract(payload, '$.visibility') = 'visible'`
+	}
+	query += ` LIMIT 1`
+	var one int
+	err := db.QueryRow(query, seq).Scan(&one)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("check history bounds: %w", err)
+	}
+	return true, nil
+}
+
+func (s *V2Store) WriteBlobForSession(sessionID string, raw []byte, encoding, mediaType string) (BlobRef, error) {
 	if err := s.requireRoot(); err != nil {
 		return BlobRef{}, err
 	}
-
-	sum := sha256.Sum256(raw)
-	hash := hex.EncodeToString(sum[:])
-	ref := BlobRef{
-		Hash:      hash,
-		SizeBytes: int64(len(raw)),
-		Encoding:  encoding,
-		MediaType: mediaType,
+	if err := validateV2SessionID(sessionID); err != nil {
+		return BlobRef{}, err
 	}
-	path, err := s.blobPath(ref)
+	ref := BlobRef{Hash: hashBytes(raw), SizeBytes: int64(len(raw)), Encoding: encoding, MediaType: mediaType}
+	path, err := s.blobPath(sessionID, ref)
 	if err != nil {
 		return BlobRef{}, err
 	}
@@ -1174,12 +1976,11 @@ func (s *V2Store) WriteBlob(raw []byte, encoding, mediaType string) (BlobRef, er
 		}
 		return ref, nil
 	} else if !errors.Is(err, os.ErrNotExist) {
-		return BlobRef{}, fmt.Errorf("stat blob %q: %w", ref.Hash, err)
+		return BlobRef{}, err
 	}
-
 	tmp, err := os.CreateTemp(filepath.Dir(path), "."+ref.Hash+".*.tmp")
 	if err != nil {
-		return BlobRef{}, fmt.Errorf("create temporary blob %q: %w", ref.Hash, err)
+		return BlobRef{}, err
 	}
 	tmpPath := tmp.Name()
 	cleanup := true
@@ -1188,13 +1989,12 @@ func (s *V2Store) WriteBlob(raw []byte, encoding, mediaType string) (BlobRef, er
 			_ = os.Remove(tmpPath)
 		}
 	}()
-
 	if _, err := tmp.Write(raw); err != nil {
 		_ = tmp.Close()
-		return BlobRef{}, fmt.Errorf("write temporary blob %q: %w", ref.Hash, err)
+		return BlobRef{}, err
 	}
 	if err := tmp.Close(); err != nil {
-		return BlobRef{}, fmt.Errorf("close temporary blob %q: %w", ref.Hash, err)
+		return BlobRef{}, err
 	}
 	if err := os.Rename(tmpPath, path); err != nil {
 		if _, statErr := os.Stat(path); statErr == nil {
@@ -1203,17 +2003,17 @@ func (s *V2Store) WriteBlob(raw []byte, encoding, mediaType string) (BlobRef, er
 			}
 			return ref, nil
 		}
-		return BlobRef{}, fmt.Errorf("commit blob %q: %w", ref.Hash, err)
+		return BlobRef{}, err
 	}
 	cleanup = false
 	return ref, nil
 }
 
-func (s *V2Store) ReadBlob(ref BlobRef) ([]byte, error) {
+func (s *V2Store) ReadBlobForSession(sessionID string, ref BlobRef) ([]byte, error) {
 	if err := s.requireRoot(); err != nil {
 		return nil, err
 	}
-	path, err := s.blobPath(ref)
+	path, err := s.blobPath(sessionID, ref)
 	if err != nil {
 		return nil, err
 	}
@@ -1222,7 +2022,7 @@ func (s *V2Store) ReadBlob(ref BlobRef) ([]byte, error) {
 		if errors.Is(err, os.ErrNotExist) {
 			return nil, fmt.Errorf("blob %q not found", ref.Hash)
 		}
-		return nil, fmt.Errorf("read blob %q: %w", ref.Hash, err)
+		return nil, err
 	}
 	if err := verifyBlobBytes(raw, ref); err != nil {
 		return nil, err
@@ -1230,11 +2030,10 @@ func (s *V2Store) ReadBlob(ref BlobRef) ([]byte, error) {
 	return raw, nil
 }
 
-func (s *V2Store) blobifySessionItemContent(item SessionItem) (SessionItem, error) {
+func (s *V2Store) blobifySessionItemContent(sessionID string, item SessionItem) (SessionItem, error) {
 	if item.Message == nil {
 		return item, nil
 	}
-
 	message := copyMessage(*item.Message)
 	if err := model.ValidateImageInputBlocks(message.ContentBlocks, true); err != nil {
 		return SessionItem{}, fmt.Errorf("persist image attachment: %w", err)
@@ -1242,18 +2041,14 @@ func (s *V2Store) blobifySessionItemContent(item SessionItem) (SessionItem, erro
 	changed := false
 	if len(message.Content) > largeContentBlobBytes {
 		raw := []byte(message.Content)
-		ref, err := s.WriteBlob(raw, "utf-8", "text/plain")
+		ref, err := s.WriteBlobForSession(sessionID, raw, "utf-8", "text/plain")
 		if err != nil {
 			return SessionItem{}, err
 		}
 		message.Content = ""
-		item.Content = &StoredContent{
-			Blob:    &ref,
-			Preview: previewStringByBytes(string(raw), storedContentPreviewBytes),
-		}
+		item.Content = &StoredContent{Blob: &ref, Preview: previewStringByBytes(string(raw), storedContentPreviewBytes)}
 		changed = true
 	}
-
 	for index := range message.ContentBlocks {
 		block := &message.ContentBlocks[index]
 		if block.Type != "input_image" || block.ImageBlob != nil {
@@ -1263,7 +2058,7 @@ func (s *V2Store) blobifySessionItemContent(item SessionItem) (SessionItem, erro
 		if err != nil {
 			return SessionItem{}, fmt.Errorf("persist image attachment: %w", err)
 		}
-		ref, err := s.WriteBlob(raw, "binary", mediaType)
+		ref, err := s.WriteBlobForSession(sessionID, raw, "binary", mediaType)
 		if err != nil {
 			return SessionItem{}, err
 		}
@@ -1277,159 +2072,266 @@ func (s *V2Store) blobifySessionItemContent(item SessionItem) (SessionItem, erro
 	return item, nil
 }
 
-func (s *V2Store) appendRecord(sessionID string, record v2Record) (int64, error) {
-	if err := s.requireRoot(); err != nil {
-		return 0, err
-	}
-	if err := validateV2SessionID(sessionID); err != nil {
-		return 0, err
-	}
-	state, err := s.Replay(sessionID)
-	if err != nil {
-		return 0, err
-	}
-	record.Seq = state.LastSeq + 1
-	if record.Type == RecordTypeItemAppended && record.Item != nil {
-		record.Item.Seq = record.Seq
-	}
-
-	if err := s.appendRecords(sessionID, []v2Record{record}); err != nil {
-		return 0, err
-	}
-	return record.Seq, nil
+type storeEvent struct {
+	Type       string
+	Item       *SessionItem
+	ItemIDs    []string
+	Compaction *CompactionCheckpoint
 }
 
-func (s *V2Store) appendRecords(sessionID string, records []v2Record) error {
-	if err := s.requireRoot(); err != nil {
-		return err
+// appendEvents is the only item/event write path. Immutable event rows, item
+// projection updates, and state.last_seq are committed in one SQLite
+// transaction. Any constraint or serialization failure rolls all of them back.
+// hydratedItems says whether the caller supplied the item projection in state;
+// compact callers deliberately keep Items nil and must not trigger a history
+// read merely to construct the return value.
+func (s *V2Store) appendEvents(sessionID string, state SessionV2, events []storeEvent, wrap, hydratedItems bool) (SessionV2, error) {
+	if err := validateCachedWriteState(sessionID, state); err != nil {
+		return SessionV2{}, err
 	}
-	if err := validateV2SessionID(sessionID); err != nil {
-		return err
+	if len(events) == 0 {
+		return state, nil
 	}
-	lines := make([][]byte, 0, len(records))
-	for _, record := range records {
-		line, err := marshalV2RecordLine(record)
-		if err != nil {
-			return err
+	db, err := s.openSessionDB(sessionID, false)
+	if err != nil {
+		return SessionV2{}, err
+	}
+	defer db.Close()
+	tx, err := db.Begin()
+	if err != nil {
+		return SessionV2{}, err
+	}
+	defer tx.Rollback()
+	var currentLastSeq, currentMetadataVersion int64
+	if err := tx.QueryRow(`SELECT last_seq, metadata_version FROM state WHERE singleton = 1`).Scan(&currentLastSeq, &currentMetadataVersion); err != nil {
+		return SessionV2{}, fmt.Errorf("read write state: %w", err)
+	}
+	if currentLastSeq != state.LastSeq {
+		return SessionV2{}, fmt.Errorf("stale cached session state: got seq %d, current seq %d", state.LastSeq, currentLastSeq)
+	}
+	if currentMetadataVersion != state.metadataVersion {
+		return SessionV2{}, fmt.Errorf("stale cached session state: got metadata version %d, current version %d", state.metadataVersion, currentMetadataVersion)
+	}
+	state.LastSeq = currentLastSeq
+	state.metadataVersion = currentMetadataVersion + 1
+	if hydratedItems {
+		// Keep projection updates local to the returned state. The caller's
+		// cached state must not be changed before the transaction commits.
+		state.Items = append([]SessionItem(nil), state.Items...)
+	} else {
+		state.Items = nil
+	}
+	state.ActiveHistory = copyStrings(state.ActiveHistory)
+	state.Compactions = copyCompactionCheckpoints(state.Compactions)
+	txID := ""
+	if wrap {
+		txID = fmt.Sprintf("tx-%d", state.LastSeq+1)
+		beginSeq := state.LastSeq + 1
+		if err := insertStoreEvent(tx, beginSeq, RecordTypeTransactionBegin, "", "", "", []byte(txID), s.now().UTC()); err != nil {
+			return SessionV2{}, err
 		}
-		lines = append(lines, line)
+		state.LastSeq = beginSeq
 	}
+	for _, event := range events {
+		seq := state.LastSeq + 1
+		payload, itemID, compactionID, err := marshalStoreEvent(event, seq)
+		if err != nil {
+			return SessionV2{}, err
+		}
+		if err := insertStoreEvent(tx, seq, event.Type, eventTurnID(event), itemID, compactionID, payload, s.now().UTC()); err != nil {
+			return SessionV2{}, err
+		}
+		switch event.Type {
+		case RecordTypeItemAppended:
+			if event.Item == nil {
+				return SessionV2{}, fmt.Errorf("item.appended event has no item")
+			}
+			item := copySessionItem(*event.Item)
+			item.Seq = seq
+			itemPayload, err := json.Marshal(item)
+			if err != nil {
+				return SessionV2{}, fmt.Errorf("marshal item projection %q: %w", item.ID, err)
+			}
+			if _, err := tx.Exec(`INSERT INTO items(id, seq, turn_id, created_at, payload) VALUES(?, ?, ?, ?, ?)`, item.ID, seq, item.TurnID, item.CreatedAt.UTC().Format(time.RFC3339Nano), itemPayload); err != nil {
+				return SessionV2{}, fmt.Errorf("insert item projection %q: %w", item.ID, err)
+			}
+			if hydratedItems {
+				state.Items = append(state.Items, item)
+			}
+		case RecordTypeItemUpdated:
+			if event.Item == nil {
+				return SessionV2{}, fmt.Errorf("item.updated event has no item")
+			}
+			item := copySessionItem(*event.Item)
+			itemPayload, err := json.Marshal(item)
+			if err != nil {
+				return SessionV2{}, fmt.Errorf("marshal item projection %q: %w", item.ID, err)
+			}
+			result, err := tx.Exec(`UPDATE items SET turn_id = ?, created_at = ?, payload = ? WHERE id = ?`, item.TurnID, item.CreatedAt.UTC().Format(time.RFC3339Nano), itemPayload, item.ID)
+			if err != nil {
+				return SessionV2{}, err
+			}
+			count, _ := result.RowsAffected()
+			if count != 1 {
+				return SessionV2{}, corruptedSessionError(sessionID, "item.updated references missing item %q", item.ID)
+			}
+			if hydratedItems {
+				found := false
+				for i := range state.Items {
+					if state.Items[i].ID == item.ID {
+						state.Items[i] = item
+						found = true
+						break
+					}
+				}
+				if !found {
+					return SessionV2{}, corruptedSessionError(sessionID, "item.updated references missing cached item %q", item.ID)
+				}
+			}
+		case RecordTypeActiveHistoryReplaced:
+			state.ActiveHistory = copyStrings(event.ItemIDs)
+		case RecordTypeCompactionCreated:
+			if event.Compaction == nil {
+				return SessionV2{}, fmt.Errorf("compaction.created event has no checkpoint")
+			}
+			state.Compactions = append(state.Compactions, copyCompactionCheckpoint(*event.Compaction))
+		default:
+			return SessionV2{}, fmt.Errorf("unknown session event type %q", event.Type)
+		}
+		state.LastSeq = seq
+	}
+	if wrap {
+		commitSeq := state.LastSeq + 1
+		if err := insertStoreEvent(tx, commitSeq, RecordTypeTransactionCommit, "", "", "", []byte(txID), s.now().UTC()); err != nil {
+			return SessionV2{}, err
+		}
+		state.LastSeq = commitSeq
+	}
+	nextState := copySessionV2(state)
+	newState, err := marshalState(nextState)
+	if err != nil {
+		return SessionV2{}, err
+	}
+	if _, err := tx.Exec(`UPDATE state SET state_json = ?, last_seq = ?, metadata_version = ? WHERE singleton = 1`, newState, nextState.LastSeq, nextState.metadataVersion); err != nil {
+		return SessionV2{}, fmt.Errorf("update session state: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return SessionV2{}, fmt.Errorf("commit session event transaction: %w", err)
+	}
+	return nextState, nil
+}
 
-	path, err := s.appendSegmentPathForLines(sessionID, len(lines))
-	if err != nil {
-		return err
-	}
-	file, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
-	if err != nil {
-		return fmt.Errorf("open segment %q: %w", path, err)
-	}
-	for _, line := range lines {
-		n, err := file.Write(line)
-		if err != nil {
-			_ = file.Close()
-			return fmt.Errorf("append segment %q: %w", path, err)
-		}
-		if n != len(line) {
-			_ = file.Close()
-			return fmt.Errorf("append segment %q: %w", path, io.ErrShortWrite)
-		}
-	}
-	if err := file.Close(); err != nil {
-		return fmt.Errorf("close segment %q: %w", path, err)
+func insertStoreEvent(tx *sql.Tx, seq int64, eventType, turnID, itemID, compactionID string, payload []byte, createdAt time.Time) error {
+	if _, err := tx.Exec(`INSERT INTO events(seq, type, turn_id, item_id, compaction_id, payload, created_at) VALUES(?, ?, ?, ?, ?, ?, ?)`, seq, eventType, turnID, itemID, compactionID, payload, createdAt.Format(time.RFC3339Nano)); err != nil {
+		return fmt.Errorf("insert session event %d: %w", seq, err)
 	}
 	return nil
 }
 
-func marshalV2RecordLine(record v2Record) ([]byte, error) {
-	line, err := json.Marshal(record)
-	if err != nil {
-		return nil, fmt.Errorf("marshal session record %d: %w", record.Seq, err)
-	}
-	line = append(line, '\n')
-	if len(line) > maxJSONLRecordBytes {
-		return nil, fmt.Errorf("session record %d is too large: %d bytes", record.Seq, len(line))
-	}
-	return line, nil
-}
-
-func (s *V2Store) appendSegmentPath(sessionID string) (string, error) {
-	return s.appendSegmentPathForLines(sessionID, 1)
-}
-
-func (s *V2Store) appendSegmentPathForLines(sessionID string, lineCount int) (string, error) {
-	segmentsDir := s.segmentsDir(sessionID)
-	if err := os.MkdirAll(segmentsDir, 0o755); err != nil {
-		return "", fmt.Errorf("create segments directory %q: %w", segmentsDir, err)
-	}
-
-	segments, err := s.segmentPaths(sessionID)
-	if err != nil {
-		return "", err
-	}
-	if len(segments) == 0 {
-		return filepath.Join(segmentsDir, "000001.jsonl"), nil
-	}
-	current := segments[len(segments)-1]
-	complete, err := fileEndsWithNewline(current)
-	if err != nil {
-		return "", err
-	}
-	if !complete {
-		next := segmentNumber(filepath.Base(current)) + 1
-		return filepath.Join(segmentsDir, fmt.Sprintf("%06d.jsonl", next)), nil
-	}
-	lines, err := countLines(current)
-	if err != nil {
-		return "", err
-	}
-	if lines+lineCount <= s.maxSegmentLines {
-		return current, nil
-	}
-	next := segmentNumber(filepath.Base(current)) + 1
-	return filepath.Join(segmentsDir, fmt.Sprintf("%06d.jsonl", next)), nil
-}
-
-func (s *V2Store) segmentPaths(sessionID string) ([]string, error) {
-	segmentsDir := s.segmentsDir(sessionID)
-	entries, err := os.ReadDir(segmentsDir)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return nil, nil
+func marshalStoreEvent(event storeEvent, seq int64) ([]byte, string, string, error) {
+	var payload any
+	var itemID, compactionID string
+	switch event.Type {
+	case RecordTypeItemAppended, RecordTypeItemUpdated:
+		if event.Item == nil {
+			return nil, "", "", fmt.Errorf("%s event has no item", event.Type)
 		}
-		return nil, fmt.Errorf("read segments directory %q: %w", segmentsDir, err)
-	}
-	paths := make([]string, 0, len(entries))
-	for _, entry := range entries {
-		if entry.IsDir() {
-			continue
+		item := copySessionItem(*event.Item)
+		item.Seq = seq
+		payload = item
+		itemID = item.ID
+	case RecordTypeActiveHistoryReplaced:
+		payload = event.ItemIDs
+	case RecordTypeCompactionCreated:
+		if event.Compaction == nil {
+			return nil, "", "", fmt.Errorf("compaction.created event has no checkpoint")
 		}
-		name := entry.Name()
-		if !strings.HasSuffix(name, ".jsonl") || segmentNumber(name) == 0 {
-			continue
+		payload = event.Compaction
+		compactionID = event.Compaction.ID
+	default:
+		return nil, "", "", fmt.Errorf("unknown session event type %q", event.Type)
+	}
+	data, err := json.Marshal(payload)
+	return data, itemID, compactionID, err
+}
+
+func eventTurnID(event storeEvent) string {
+	if event.Item != nil {
+		return event.Item.TurnID
+	}
+	return ""
+}
+
+func (s *V2Store) openSessionDB(id string, create bool) (*sql.DB, error) {
+	if err := validateV2SessionID(id); err != nil {
+		return nil, err
+	}
+	path := filepath.Join(s.sessionDir(id), "session.db")
+	databaseExists := false
+	info, statErr := os.Stat(path)
+	if statErr == nil {
+		if info.IsDir() {
+			return nil, fmt.Errorf("session database path %q is a directory", path)
 		}
-		paths = append(paths, filepath.Join(segmentsDir, name))
+		databaseExists = true
+	} else if !errors.Is(statErr, os.ErrNotExist) {
+		return nil, statErr
 	}
-	sort.Strings(paths)
-	return paths, nil
-}
-
-func (s *V2Store) segmentsDir(sessionID string) string {
-	return filepath.Join(s.root, sessionID, "segments")
-}
-
-func (s *V2Store) sessionDir(sessionID string) string {
-	return filepath.Join(s.root, sessionID)
-}
-
-func (s *V2Store) metadataPath(sessionID string) string {
-	return filepath.Join(s.sessionDir(sessionID), "meta.json")
-}
-
-func (s *V2Store) blobPath(ref BlobRef) (string, error) {
-	if err := validateBlobRef(ref); err != nil {
-		return "", err
+	if !create {
+		if !databaseExists {
+			return nil, fmt.Errorf("%w: %s", ErrNotFound, id)
+		}
+	} else if err := os.MkdirAll(s.sessionDir(id), 0o755); err != nil {
+		return nil, fmt.Errorf("create session directory %q: %w", id, err)
+	} else if err := os.MkdirAll(filepath.Join(s.sessionDir(id), blobsDirName), 0o755); err != nil {
+		return nil, fmt.Errorf("create session blob directory %q: %w", id, err)
 	}
-	return filepath.Join(s.root, v2BlobsDirName, "sha256", ref.Hash[:2], ref.Hash+".data"), nil
+	// modernc's _txlock=immediate makes every database/sql write transaction
+	// start with BEGIN IMMEDIATE instead of the deferred default. mode=rw is
+	// important for read paths: if the file disappears after os.Stat, opening
+	// it must not silently recreate a database.
+	mode := "rw"
+	if create && !databaseExists {
+		mode = "rwc"
+	}
+	// Put connection-local pragmas in the DSN so modernc applies them while
+	// opening the physical connection (busy_timeout is applied first by the
+	// driver). This avoids a burst of short-lived writers racing while each
+	// separately configures the same database connection.
+	dsn := "file:" + filepath.ToSlash(path) + "?_txlock=immediate&mode=" + mode +
+		"&_pragma=busy_timeout%285000%29&_pragma=foreign_keys%28ON%29&_pragma=synchronous%28FULL%29"
+	db, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		return nil, fmt.Errorf("open session database %q: %w", id, err)
+	}
+	db.SetMaxOpenConns(1)
+	// synchronous, foreign_keys and busy_timeout are connection settings. A
+	// read-only open may configure them, but it must not change journal mode or
+	// run schema DDL. journal_mode is set only on the create/setup path and the
+	// store deliberately uses rollback journaling rather than WAL.
+	if create && !databaseExists {
+		if _, err := db.Exec(`PRAGMA journal_mode = DELETE`); err != nil {
+			db.Close()
+			return nil, fmt.Errorf("configure session journal %q: %w", id, err)
+		}
+	}
+	if create && !databaseExists {
+		if _, err := db.Exec(schema); err != nil {
+			db.Close()
+			return nil, fmt.Errorf("initialize session database %q: %w", id, err)
+		}
+	}
+	return db, nil
+}
+
+func marshalState(session SessionV2) ([]byte, error) {
+	session = copySessionV2(session)
+	session.Items = nil
+	data, err := json.Marshal(session)
+	if err != nil {
+		return nil, fmt.Errorf("marshal SQLite session state %q: %w", session.ID, err)
+	}
+	return data, nil
 }
 
 func (s *V2Store) requireRoot() error {
@@ -1439,12 +2341,31 @@ func (s *V2Store) requireRoot() error {
 	return nil
 }
 
+func (s *V2Store) sessionDir(id string) string { return filepath.Join(s.root, id) }
+
+func isSessionDirectory(name string) bool {
+	return validateV2SessionID(name) == nil && !strings.EqualFold(name, blobsDirName)
+}
+
 func validateV2SessionID(id string) error {
 	if err := validateSessionID(id); err != nil {
 		return err
 	}
-	if strings.EqualFold(v2FilesystemAliasName(id), v2BlobsDirName) {
-		return fmt.Errorf("reserved v2 session id %q", id)
+	if strings.EqualFold(strings.TrimRight(id, ". "), blobsDirName) {
+		return fmt.Errorf("reserved session id %q", id)
+	}
+	return nil
+}
+
+func validateSessionID(id string) error {
+	if strings.TrimSpace(id) == "" || id != strings.TrimSpace(id) || id == "." || id == ".." {
+		return fmt.Errorf("invalid session id %q", id)
+	}
+	for _, r := range id {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' || r == '_' || r == '.' {
+			continue
+		}
+		return fmt.Errorf("invalid session id %q", id)
 	}
 	return nil
 }
@@ -1469,938 +2390,6 @@ func findSessionItemByID(items []SessionItem, id string) (SessionItem, bool) {
 		}
 	}
 	return SessionItem{}, false
-}
-
-func v2FilesystemAliasName(id string) string {
-	return strings.TrimRight(id, ". ")
-}
-
-type v2Record struct {
-	Seq        int64                 `json:"seq"`
-	Type       string                `json:"type"`
-	TxID       string                `json:"tx_id,omitempty"`
-	Item       *SessionItem          `json:"item,omitempty"`
-	ItemIDs    []string              `json:"item_ids,omitempty"`
-	Compaction *CompactionCheckpoint `json:"compaction,omitempty"`
-}
-
-type sessionV2Metadata struct {
-	ID                   string                 `json:"id"`
-	Version              int                    `json:"version"`
-	CreatedAt            time.Time              `json:"created_at"`
-	UpdatedAt            time.Time              `json:"updated_at"`
-	DisplayName          string                 `json:"display_name,omitempty"`
-	CreatedBy            string                 `json:"created_by,omitempty"`
-	ParentSessionID      string                 `json:"parent_session_id,omitempty"`
-	RootSessionID        string                 `json:"root_session_id,omitempty"`
-	SpawnDepth           int                    `json:"spawn_depth,omitempty"`
-	ArchivedAt           *time.Time             `json:"archived_at"`
-	LastUsedAt           time.Time              `json:"last_used_at"`
-	RunningTurnID        string                 `json:"running_turn_id,omitempty"`
-	RunningStartedAt     time.Time              `json:"running_started_at,omitempty"`
-	InterruptedTurnID    string                 `json:"interrupted_turn_id,omitempty"`
-	InterruptedAt        time.Time              `json:"interrupted_at,omitempty"`
-	Provider             string                 `json:"provider"`
-	ModelProfile         string                 `json:"model_profile"`
-	ModelID              string                 `json:"model_id"`
-	ReasoningLevel       string                 `json:"reasoning_level,omitempty"`
-	ModelParameters      map[string]any         `json:"model_parameters,omitempty"`
-	CWD                  string                 `json:"cwd"`
-	ProjectID            string                 `json:"project_id,omitempty"`
-	CreatedCWD           string                 `json:"created_cwd,omitempty"`
-	ConfigPath           string                 `json:"config_path,omitempty"`
-	ConfigDir            string                 `json:"config_dir,omitempty"`
-	EnabledTools         []string               `json:"enabled_tools,omitempty"`
-	EnabledMCP           []string               `json:"enabled_mcp,omitempty"`
-	EnabledSkills        []string               `json:"enabled_skills,omitempty"`
-	ShowReasoning        bool                   `json:"show_reasoning"`
-	FullAccess           bool                   `json:"full_access,omitempty"`
-	Debug                DebugSettings          `json:"debug,omitempty"`
-	DebugConfigured      bool                   `json:"debug_configured,omitempty"`
-	InstructionsSnapshot []model.Message        `json:"instructions_snapshot,omitempty"`
-	InstructionSources   []InstructionSource    `json:"instruction_sources,omitempty"`
-	Context              contextwindow.Metadata `json:"context,omitempty"`
-	SaveToolResults      bool                   `json:"save_tool_results"`
-}
-
-func (s *V2Store) loadMetadata(id string) (SessionV2, error) {
-	session, err := readSessionV2MetadataFile(s.metadataPath(id))
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return SessionV2{}, fmt.Errorf("%w: %s", ErrNotFound, id)
-		}
-		return SessionV2{}, err
-	}
-	if session.ID == "" {
-		session.ID = id
-	}
-	if session.ID != id {
-		return SessionV2{}, mismatchedSessionIDError(id, session.ID)
-	}
-	session, err = normalizeSessionLineage(session)
-	if err != nil {
-		return SessionV2{}, fmt.Errorf("invalid session lineage for %q: %w", id, err)
-	}
-	return copySessionV2(session), nil
-}
-
-func readSessionV2MetadataFile(path string) (SessionV2, error) {
-	file, err := os.Open(path)
-	if err != nil {
-		return SessionV2{}, err
-	}
-	defer file.Close()
-
-	var metadata sessionV2Metadata
-	decoder := json.NewDecoder(file)
-	decoder.UseNumber()
-	if err := decoder.Decode(&metadata); err != nil {
-		return SessionV2{}, fmt.Errorf("%w: parse session metadata %q: %v", ErrCorruptedSession, path, err)
-	}
-	return metadata.session(), nil
-}
-
-func writeSessionMetadataAtomic(path string, data []byte) error {
-	temp, err := os.CreateTemp(filepath.Dir(path), ".meta-*.tmp")
-	if err != nil {
-		return fmt.Errorf("create temporary file: %w", err)
-	}
-	tempPath := temp.Name()
-	cleanup := true
-	defer func() {
-		if cleanup {
-			_ = os.Remove(tempPath)
-		}
-	}()
-
-	if err := temp.Chmod(0o600); err != nil {
-		_ = temp.Close()
-		return fmt.Errorf("chmod temporary file: %w", err)
-	}
-	if _, err := temp.Write(data); err != nil {
-		_ = temp.Close()
-		return fmt.Errorf("write temporary file: %w", err)
-	}
-	if err := temp.Sync(); err != nil {
-		_ = temp.Close()
-		return fmt.Errorf("sync temporary file: %w", err)
-	}
-	if err := temp.Close(); err != nil {
-		return fmt.Errorf("close temporary file: %w", err)
-	}
-	if err := replaceFileAtomic(tempPath, path); err != nil {
-		return fmt.Errorf("replace file: %w", err)
-	}
-	cleanup = false
-	return nil
-}
-
-func metadataFromSessionV2(session SessionV2) sessionV2Metadata {
-	session = copySessionV2(session)
-	return sessionV2Metadata{
-		ID:                   session.ID,
-		Version:              session.Version,
-		CreatedAt:            session.CreatedAt,
-		UpdatedAt:            session.UpdatedAt,
-		DisplayName:          session.DisplayName,
-		CreatedBy:            session.CreatedBy,
-		ParentSessionID:      session.ParentSessionID,
-		RootSessionID:        session.RootSessionID,
-		SpawnDepth:           session.SpawnDepth,
-		ArchivedAt:           sessionArchivedAtPtr(session),
-		LastUsedAt:           session.LastUsedAt,
-		RunningTurnID:        session.RunningTurnID,
-		RunningStartedAt:     session.RunningStartedAt,
-		InterruptedTurnID:    session.InterruptedTurnID,
-		InterruptedAt:        session.InterruptedAt,
-		Provider:             session.Provider,
-		ModelProfile:         session.ModelProfile,
-		ModelID:              session.ModelID,
-		ReasoningLevel:       session.ReasoningLevel,
-		ModelParameters:      session.ModelParameters,
-		CWD:                  session.CWD,
-		ProjectID:            session.ProjectID,
-		CreatedCWD:           session.CreatedCWD,
-		ConfigPath:           session.ConfigPath,
-		ConfigDir:            session.ConfigDir,
-		EnabledTools:         session.EnabledTools,
-		EnabledMCP:           session.EnabledMCP,
-		EnabledSkills:        session.EnabledSkills,
-		ShowReasoning:        session.ShowReasoning,
-		FullAccess:           session.FullAccess,
-		Debug:                session.Debug,
-		DebugConfigured:      session.DebugConfigured,
-		InstructionsSnapshot: session.InstructionsSnapshot,
-		InstructionSources:   session.InstructionSources,
-		Context:              session.Context,
-		SaveToolResults:      session.SaveToolResults,
-	}
-}
-
-func (m sessionV2Metadata) session() SessionV2 {
-	session := SessionV2{
-		ID:                   m.ID,
-		Version:              m.Version,
-		CreatedAt:            m.CreatedAt,
-		UpdatedAt:            m.UpdatedAt,
-		DisplayName:          m.DisplayName,
-		CreatedBy:            m.CreatedBy,
-		ParentSessionID:      m.ParentSessionID,
-		RootSessionID:        m.RootSessionID,
-		SpawnDepth:           m.SpawnDepth,
-		LastUsedAt:           m.LastUsedAt,
-		RunningTurnID:        m.RunningTurnID,
-		RunningStartedAt:     m.RunningStartedAt,
-		InterruptedTurnID:    m.InterruptedTurnID,
-		InterruptedAt:        m.InterruptedAt,
-		Provider:             m.Provider,
-		ModelProfile:         m.ModelProfile,
-		ModelID:              m.ModelID,
-		ReasoningLevel:       m.ReasoningLevel,
-		ModelParameters:      copyMap(m.ModelParameters),
-		CWD:                  m.CWD,
-		ProjectID:            m.ProjectID,
-		CreatedCWD:           m.CreatedCWD,
-		ConfigPath:           m.ConfigPath,
-		ConfigDir:            m.ConfigDir,
-		EnabledTools:         copyStrings(m.EnabledTools),
-		EnabledMCP:           copyStrings(m.EnabledMCP),
-		EnabledSkills:        copyStrings(m.EnabledSkills),
-		ShowReasoning:        m.ShowReasoning,
-		FullAccess:           m.FullAccess,
-		Debug:                m.Debug,
-		DebugConfigured:      m.DebugConfigured,
-		InstructionsSnapshot: copyMessages(m.InstructionsSnapshot),
-		InstructionSources:   copyInstructionSources(m.InstructionSources),
-		Context:              m.Context,
-		SaveToolResults:      m.SaveToolResults,
-	}
-	if session.LastUsedAt.IsZero() {
-		session.LastUsedAt = sessionEffectiveLastUsedAt(session)
-	}
-	if m.ArchivedAt != nil {
-		session.ArchivedAt = m.ArchivedAt.UTC()
-	}
-	session = normalizeSessionLifecycle(session, session.UpdatedAt)
-	return session
-}
-
-func sessionArchivedAtPtr(session SessionV2) *time.Time {
-	session = normalizeSessionLifecycle(session, time.Time{})
-	if session.ArchivedAt.IsZero() {
-		return nil
-	}
-	value := session.ArchivedAt.UTC()
-	return &value
-}
-
-func normalizeSessionLifecycle(session SessionV2, fallback time.Time) SessionV2 {
-	if !session.ArchivedAt.IsZero() {
-		session.ArchivedAt = session.ArchivedAt.UTC()
-		session.Archived = true
-		return session
-	}
-	if session.Archived {
-		if !fallback.IsZero() {
-			session.ArchivedAt = fallback.UTC()
-		} else if !session.UpdatedAt.IsZero() {
-			session.ArchivedAt = session.UpdatedAt.UTC()
-		} else if !session.CreatedAt.IsZero() {
-			session.ArchivedAt = session.CreatedAt.UTC()
-		}
-		session.Archived = !session.ArchivedAt.IsZero()
-		return session
-	}
-	session.Archived = false
-	return session
-}
-
-type replayTransaction struct {
-	txID    string
-	records []v2Record
-}
-
-func replaySegment(path string, state *SessionV2) error {
-	file, err := os.Open(path)
-	if err != nil {
-		return fmt.Errorf("open segment %q: %w", path, err)
-	}
-	defer file.Close()
-
-	reader := bufio.NewReader(file)
-	lineNumber := 0
-	var pending *replayTransaction
-	for {
-		line, err := reader.ReadBytes('\n')
-		if len(line) > 0 {
-			if errors.Is(err, io.EOF) && line[len(line)-1] != '\n' {
-				break
-			}
-			lineNumber++
-			if len(line) > maxJSONLRecordBytes {
-				return corruptedSessionError(state.ID, "%s:%d record exceeds %d bytes", path, lineNumber, maxJSONLRecordBytes)
-			}
-			if err := replayRecord(path, lineNumber, line, state, &pending); err != nil {
-				return err
-			}
-		}
-		if errors.Is(err, io.EOF) {
-			break
-		}
-		if err != nil {
-			return fmt.Errorf("read segment %q: %w", path, err)
-		}
-	}
-	return nil
-}
-
-func replayRecord(path string, lineNumber int, line []byte, state *SessionV2, pending **replayTransaction) error {
-	line = []byte(strings.TrimSpace(string(line)))
-	if len(line) == 0 {
-		return nil
-	}
-	var record v2Record
-	if err := json.Unmarshal(line, &record); err != nil {
-		return corruptedSessionError(state.ID, "%s:%d invalid JSONL record: %v", path, lineNumber, err)
-	}
-	if record.Type == RecordTypeTransactionBegin {
-		if record.TxID == "" {
-			return corruptedSessionError(state.ID, "%s:%d transaction.begin missing tx_id", path, lineNumber)
-		}
-		if record.Seq != state.LastSeq+1 {
-			return corruptedSessionError(state.ID, "%s:%d record seq %d follows seq %d", path, lineNumber, record.Seq, state.LastSeq)
-		}
-		*pending = &replayTransaction{txID: record.TxID, records: []v2Record{record}}
-		return nil
-	}
-	if record.TxID != "" {
-		if *pending == nil || (*pending).txID != record.TxID {
-			*pending = nil
-			return nil
-		}
-		expectedSeq := state.LastSeq + int64(len((*pending).records)) + 1
-		if record.Seq != expectedSeq {
-			*pending = nil
-			return nil
-		}
-		if record.Type == RecordTypeTransactionCommit {
-			if err := replayCommittedTransaction(*pending, record, state); err != nil {
-				return err
-			}
-			*pending = nil
-			return nil
-		}
-		(*pending).records = append((*pending).records, record)
-		return nil
-	}
-	*pending = nil
-	return replayCommittedRecord(path, lineNumber, record, state)
-}
-
-func replaySegmentPersistedEvents(path string, state *SessionV2, afterSeq int64, events *[]PersistedEvent) error {
-	file, err := os.Open(path)
-	if err != nil {
-		return fmt.Errorf("open segment %q: %w", path, err)
-	}
-	defer file.Close()
-
-	reader := bufio.NewReader(file)
-	lineNumber := 0
-	var pending *replayTransaction
-	for {
-		line, err := reader.ReadBytes('\n')
-		if len(line) > 0 {
-			if errors.Is(err, io.EOF) && line[len(line)-1] != '\n' {
-				break
-			}
-			lineNumber++
-			if len(line) > maxJSONLRecordBytes {
-				return corruptedSessionError(state.ID, "%s:%d record exceeds %d bytes", path, lineNumber, maxJSONLRecordBytes)
-			}
-			if err := replayRecordPersistedEvents(path, lineNumber, line, state, &pending, afterSeq, events); err != nil {
-				return err
-			}
-		}
-		if errors.Is(err, io.EOF) {
-			break
-		}
-		if err != nil {
-			return fmt.Errorf("read segment %q: %w", path, err)
-		}
-	}
-	return nil
-}
-
-func replayRecordPersistedEvents(path string, lineNumber int, line []byte, state *SessionV2, pending **replayTransaction, afterSeq int64, events *[]PersistedEvent) error {
-	line = []byte(strings.TrimSpace(string(line)))
-	if len(line) == 0 {
-		return nil
-	}
-	var record v2Record
-	if err := json.Unmarshal(line, &record); err != nil {
-		return corruptedSessionError(state.ID, "%s:%d invalid JSONL record: %v", path, lineNumber, err)
-	}
-	if record.Type == RecordTypeTransactionBegin {
-		if record.TxID == "" {
-			return corruptedSessionError(state.ID, "%s:%d transaction.begin missing tx_id", path, lineNumber)
-		}
-		if record.Seq != state.LastSeq+1 {
-			return corruptedSessionError(state.ID, "%s:%d record seq %d follows seq %d", path, lineNumber, record.Seq, state.LastSeq)
-		}
-		*pending = &replayTransaction{txID: record.TxID, records: []v2Record{record}}
-		return nil
-	}
-	if record.TxID != "" {
-		if *pending == nil || (*pending).txID != record.TxID {
-			*pending = nil
-			return nil
-		}
-		expectedSeq := state.LastSeq + int64(len((*pending).records)) + 1
-		if record.Seq != expectedSeq {
-			*pending = nil
-			return nil
-		}
-		if record.Type == RecordTypeTransactionCommit {
-			if err := replayCommittedTransactionPersistedEvents(*pending, record, state, afterSeq, events); err != nil {
-				return err
-			}
-			*pending = nil
-			return nil
-		}
-		(*pending).records = append((*pending).records, record)
-		return nil
-	}
-	*pending = nil
-	if err := replayCommittedRecord(path, lineNumber, record, state); err != nil {
-		return err
-	}
-	if record.Seq > afterSeq {
-		if event, ok := persistedEventFromRecord(record, false); ok {
-			*events = append(*events, event)
-		}
-	}
-	return nil
-}
-
-func replayCommittedTransaction(pending *replayTransaction, commit v2Record, state *SessionV2) error {
-	if pending == nil || len(pending.records) == 0 {
-		return nil
-	}
-	temp := copySessionV2(*state)
-	temp.LastSeq = pending.records[0].Seq
-	for _, record := range pending.records[1:] {
-		if err := replayCommittedRecord("", 0, record, &temp); err != nil {
-			return err
-		}
-	}
-	if commit.Seq != temp.LastSeq+1 {
-		return corruptedSessionError(state.ID, "transaction %q commit seq %d follows seq %d", commit.TxID, commit.Seq, temp.LastSeq)
-	}
-	temp.LastSeq = commit.Seq
-	*state = temp
-	return nil
-}
-
-func replayTransactionOnState(state SessionV2, records []v2Record) (SessionV2, error) {
-	if len(records) < 2 {
-		return SessionV2{}, fmt.Errorf("transaction records are required")
-	}
-	begin := records[0]
-	commit := records[len(records)-1]
-	if begin.Type != RecordTypeTransactionBegin {
-		return SessionV2{}, fmt.Errorf("transaction must start with %s", RecordTypeTransactionBegin)
-	}
-	if commit.Type != RecordTypeTransactionCommit {
-		return SessionV2{}, fmt.Errorf("transaction must end with %s", RecordTypeTransactionCommit)
-	}
-	if begin.TxID == "" || begin.TxID != commit.TxID {
-		return SessionV2{}, fmt.Errorf("transaction tx_id mismatch")
-	}
-	next := copySessionV2(state)
-	pending := &replayTransaction{
-		txID:    begin.TxID,
-		records: append([]v2Record(nil), records[:len(records)-1]...),
-	}
-	if err := replayCommittedTransaction(pending, commit, &next); err != nil {
-		return SessionV2{}, err
-	}
-	return next, nil
-}
-
-func replayRecordOnState(state SessionV2, record v2Record) (SessionV2, error) {
-	next := copySessionV2(state)
-	if err := replayCommittedRecord("", 0, record, &next); err != nil {
-		return SessionV2{}, err
-	}
-	return next, nil
-}
-
-func replayCommittedTransactionPersistedEvents(pending *replayTransaction, commit v2Record, state *SessionV2, afterSeq int64, events *[]PersistedEvent) error {
-	if pending == nil || len(pending.records) == 0 {
-		return nil
-	}
-	temp := copySessionV2(*state)
-	temp.LastSeq = pending.records[0].Seq
-	hasCompaction := false
-	for _, record := range pending.records[1:] {
-		if record.Type == RecordTypeCompactionCreated {
-			hasCompaction = true
-			break
-		}
-	}
-	txEvents := make([]PersistedEvent, 0, len(pending.records))
-	for _, record := range pending.records[1:] {
-		if err := replayCommittedRecord("", 0, record, &temp); err != nil {
-			return err
-		}
-		if record.Seq <= afterSeq {
-			continue
-		}
-		if event, ok := persistedEventFromRecord(record, hasCompaction); ok {
-			txEvents = append(txEvents, event)
-		}
-	}
-	if commit.Seq != temp.LastSeq+1 {
-		return corruptedSessionError(state.ID, "transaction %q commit seq %d follows seq %d", commit.TxID, commit.Seq, temp.LastSeq)
-	}
-	temp.LastSeq = commit.Seq
-	*state = temp
-	*events = append(*events, txEvents...)
-	return nil
-}
-
-func persistedEventFromRecord(record v2Record, includeActiveHistory bool) (PersistedEvent, bool) {
-	switch record.Type {
-	case RecordTypeItemAppended:
-		if record.Item == nil {
-			return PersistedEvent{}, false
-		}
-		return PersistedEvent{
-			Seq:    record.Seq,
-			Type:   record.Type,
-			ItemID: record.Item.ID,
-		}, true
-	case RecordTypeItemUpdated:
-		if record.Item == nil {
-			return PersistedEvent{}, false
-		}
-		return PersistedEvent{
-			Seq:    record.Seq,
-			Type:   record.Type,
-			ItemID: record.Item.ID,
-		}, true
-	case RecordTypeCompactionCreated:
-		if record.Compaction == nil {
-			return PersistedEvent{}, false
-		}
-		return PersistedEvent{
-			Seq:          record.Seq,
-			Type:         record.Type,
-			CompactionID: record.Compaction.ID,
-		}, true
-	case RecordTypeActiveHistoryReplaced:
-		if !includeActiveHistory {
-			return PersistedEvent{}, false
-		}
-		return PersistedEvent{
-			Seq:  record.Seq,
-			Type: record.Type,
-		}, true
-	default:
-		return PersistedEvent{}, false
-	}
-}
-
-func replayCommittedRecord(path string, lineNumber int, record v2Record, state *SessionV2) error {
-	if record.Seq != state.LastSeq+1 {
-		return corruptedSessionError(state.ID, "%s:%d record seq %d follows seq %d", path, lineNumber, record.Seq, state.LastSeq)
-	}
-	switch record.Type {
-	case RecordTypeItemAppended:
-		if record.Item == nil {
-			return corruptedSessionError(state.ID, "%s:%d item.appended missing item", path, lineNumber)
-		}
-		if record.Item.Seq != 0 && record.Item.Seq != record.Seq {
-			return corruptedSessionError(state.ID, "%s:%d item seq %d does not match record seq %d", path, lineNumber, record.Item.Seq, record.Seq)
-		}
-		record.Item.Seq = record.Seq
-		state.Items = append(state.Items, *record.Item)
-	case RecordTypeItemUpdated:
-		if record.Item == nil {
-			return corruptedSessionError(state.ID, "%s:%d item.updated missing item", path, lineNumber)
-		}
-		updated := false
-		for i := range state.Items {
-			if state.Items[i].ID != record.Item.ID {
-				continue
-			}
-			existing := state.Items[i]
-			existing.Message = copyMessagePtr(record.Item.Message)
-			existing.Content = copyStoredContent(record.Item.Content)
-			existing.Status = record.Item.Status
-			state.Items[i] = existing
-			updated = true
-			break
-		}
-		if !updated {
-			return corruptedSessionError(state.ID, "%s:%d item.updated references missing item %q", path, lineNumber, record.Item.ID)
-		}
-	case RecordTypeActiveHistoryReplaced:
-		state.ActiveHistory = copyStrings(record.ItemIDs)
-	case RecordTypeCompactionCreated:
-		if record.Compaction == nil {
-			return corruptedSessionError(state.ID, "%s:%d compaction.created missing compaction", path, lineNumber)
-		}
-		state.Compactions = append(state.Compactions, *record.Compaction)
-	default:
-		return corruptedSessionError(state.ID, "%s:%d unknown session record type %q", path, lineNumber, record.Type)
-	}
-	state.LastSeq = record.Seq
-	return nil
-}
-
-func countLines(path string) (int, error) {
-	file, err := os.Open(path)
-	if err != nil {
-		return 0, fmt.Errorf("open segment %q: %w", path, err)
-	}
-	defer file.Close()
-
-	reader := bufio.NewReader(file)
-	lines := 0
-	for {
-		_, err := reader.ReadBytes('\n')
-		if err == nil {
-			lines++
-			continue
-		}
-		if errors.Is(err, io.EOF) {
-			return lines, nil
-		}
-		return 0, fmt.Errorf("read segment %q: %w", path, err)
-	}
-}
-
-func fileEndsWithNewline(path string) (bool, error) {
-	file, err := os.Open(path)
-	if err != nil {
-		return false, fmt.Errorf("open segment %q: %w", path, err)
-	}
-	defer file.Close()
-
-	info, err := file.Stat()
-	if err != nil {
-		return false, fmt.Errorf("stat segment %q: %w", path, err)
-	}
-	if info.Size() == 0 {
-		return true, nil
-	}
-	if _, err := file.Seek(-1, io.SeekEnd); err != nil {
-		return false, fmt.Errorf("seek segment %q: %w", path, err)
-	}
-	var last [1]byte
-	if _, err := io.ReadFull(file, last[:]); err != nil {
-		return false, fmt.Errorf("read segment %q: %w", path, err)
-	}
-	return last[0] == '\n', nil
-}
-
-func segmentNumber(name string) int {
-	if len(name) != len("000001.jsonl") || !strings.HasSuffix(name, ".jsonl") {
-		return 0
-	}
-	var number int
-	if _, err := fmt.Sscanf(strings.TrimSuffix(name, ".jsonl"), "%06d", &number); err != nil {
-		return 0
-	}
-	return number
-}
-
-func validateCompactionCheckpointWrite(summaryItem SessionItem, checkpoint CompactionCheckpoint, state SessionV2) error {
-	if strings.TrimSpace(summaryItem.ID) == "" {
-		return fmt.Errorf("compaction summary item id is required")
-	}
-	if summaryItem.Visibility != ItemVisibilityHidden {
-		return fmt.Errorf("compaction summary item visibility must be %q", ItemVisibilityHidden)
-	}
-	if summaryItem.Audience != ItemAudienceModel {
-		return fmt.Errorf("compaction summary item audience must be %q", ItemAudienceModel)
-	}
-	if summaryItem.Message == nil {
-		return fmt.Errorf("compaction summary item message is required")
-	}
-	switch summaryItem.Kind {
-	case ItemKindMessage:
-		if strings.TrimSpace(summaryItem.Message.Content) == "" {
-			return fmt.Errorf("compaction summary message content is required")
-		}
-	case ItemKindCompaction:
-		if summaryItem.Message.Role != model.MessageRoleProvider {
-			return fmt.Errorf("compaction summary item kind must be %q", ItemKindMessage)
-		}
-		if len(summaryItem.Message.ProviderItems) == 0 {
-			return fmt.Errorf("remote compaction provider items are required")
-		}
-		for index, item := range summaryItem.Message.ProviderItems {
-			if strings.TrimSpace(item.Origin) == "" || strings.TrimSpace(item.Model) == "" {
-				return fmt.Errorf("remote compaction provider item %d origin and model are required", index)
-			}
-			var decoded struct {
-				Type string `json:"type"`
-			}
-			if json.Unmarshal(item.Data, &decoded) != nil || strings.TrimSpace(decoded.Type) == "" {
-				return fmt.Errorf("remote compaction provider item %d is invalid", index)
-			}
-		}
-	default:
-		return fmt.Errorf("compaction summary item kind must be %q or %q", ItemKindMessage, ItemKindCompaction)
-	}
-	if strings.TrimSpace(checkpoint.ID) == "" {
-		return fmt.Errorf("compaction checkpoint id is required")
-	}
-	if strings.TrimSpace(checkpoint.SummaryItemID) == "" {
-		return fmt.Errorf("compaction checkpoint summary item id is required")
-	}
-	if checkpoint.SummaryItemID != summaryItem.ID {
-		return fmt.Errorf("compaction checkpoint summary item id %q does not match summary item id %q", checkpoint.SummaryItemID, summaryItem.ID)
-	}
-	if len(checkpoint.ReplacementHistory) == 0 {
-		return fmt.Errorf("compaction replacement history is required")
-	}
-	itemsByID := make(map[string]SessionItem, len(state.Items))
-	for _, item := range state.Items {
-		if item.ID == summaryItem.ID {
-			return fmt.Errorf("compaction summary item id %q already exists", summaryItem.ID)
-		}
-		itemsByID[item.ID] = item
-	}
-
-	includesSummary := false
-	for i, id := range checkpoint.ReplacementHistory {
-		if strings.TrimSpace(id) == "" {
-			return fmt.Errorf("compaction replacement history contains empty item id at index %d", i)
-		}
-		if id == summaryItem.ID {
-			includesSummary = true
-		}
-	}
-	if !includesSummary {
-		return fmt.Errorf("compaction replacement history must include summary item id %q", summaryItem.ID)
-	}
-	for _, id := range checkpoint.ReplacementHistory {
-		if id == summaryItem.ID {
-			continue
-		}
-		item, ok := itemsByID[id]
-		if !ok {
-			return fmt.Errorf("compaction replacement history references missing item id %q", id)
-		}
-		if item.Message == nil {
-			return fmt.Errorf("compaction replacement history references item id %q without a message", id)
-		}
-	}
-	return nil
-}
-
-func validateBlobRef(ref BlobRef) error {
-	if len(ref.Hash) != sha256.Size*2 {
-		return fmt.Errorf("invalid blob hash %q", ref.Hash)
-	}
-	if _, err := hex.DecodeString(ref.Hash); err != nil {
-		return fmt.Errorf("invalid blob hash %q: %w", ref.Hash, err)
-	}
-	if ref.SizeBytes < 0 {
-		return fmt.Errorf("invalid blob size %d", ref.SizeBytes)
-	}
-	return nil
-}
-
-func verifyBlobFile(path string, ref BlobRef) error {
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		return fmt.Errorf("read blob %q: %w", ref.Hash, err)
-	}
-	return verifyBlobBytes(raw, ref)
-}
-
-func verifyBlobBytes(raw []byte, ref BlobRef) error {
-	if int64(len(raw)) != ref.SizeBytes {
-		return fmt.Errorf("blob %q size mismatch: got %d bytes, want %d", ref.Hash, len(raw), ref.SizeBytes)
-	}
-	sum := sha256.Sum256(raw)
-	if got := hex.EncodeToString(sum[:]); got != ref.Hash {
-		return fmt.Errorf("blob %q hash mismatch: got %s", ref.Hash, got)
-	}
-	return nil
-}
-
-func materializeStoredContent(sessionID, itemID string, content *StoredContent, readBlob func(BlobRef) ([]byte, error)) (string, bool, error) {
-	if content == nil {
-		return "", false, nil
-	}
-	if content.Inline != "" {
-		return content.Inline, true, nil
-	}
-	if content.Blob == nil {
-		return "", false, nil
-	}
-	if readBlob == nil {
-		return "", false, corruptedSessionError(sessionID, "active history references blob-backed item %q without store-backed materialization", itemID)
-	}
-	raw, err := readBlob(*content.Blob)
-	if err != nil {
-		return "", false, corruptedSessionError(sessionID, "active history item %q blob content is unavailable: %v", itemID, err)
-	}
-	return string(raw), true, nil
-}
-
-func previewStringByBytes(value string, maxBytes int) string {
-	if maxBytes <= 0 {
-		return ""
-	}
-	if len(value) <= maxBytes {
-		return value
-	}
-	cut := 0
-	for i := range value {
-		if i > maxBytes {
-			break
-		}
-		cut = i
-	}
-	if cut == 0 {
-		return ""
-	}
-	return value[:cut]
-}
-
-func corruptedSessionError(sessionID, format string, args ...any) error {
-	message := fmt.Sprintf(format, args...)
-	if sessionID == "" {
-		return fmt.Errorf("%w: %s", ErrCorruptedSession, message)
-	}
-	return fmt.Errorf("%w %q: %s", ErrCorruptedSession, sessionID, message)
-}
-
-func copyMessage(message model.Message) model.Message {
-	message.ContentBlocks = append([]model.InputContentBlock(nil), message.ContentBlocks...)
-	for index := range message.ContentBlocks {
-		if message.ContentBlocks[index].ImageBlob != nil {
-			ref := *message.ContentBlocks[index].ImageBlob
-			message.ContentBlocks[index].ImageBlob = &ref
-		}
-	}
-	message.ToolCalls = append([]model.ToolCall(nil), message.ToolCalls...)
-	message.ProviderItems = copyProviderItems(message.ProviderItems)
-	if message.ResponseState != nil {
-		state := *message.ResponseState
-		state.ReasoningItems = make([]json.RawMessage, len(message.ResponseState.ReasoningItems))
-		for index, item := range message.ResponseState.ReasoningItems {
-			state.ReasoningItems[index] = append(json.RawMessage(nil), item...)
-		}
-		if message.ResponseState.OutputItems != nil {
-			state.OutputItems = make([]json.RawMessage, len(message.ResponseState.OutputItems))
-			for index, item := range message.ResponseState.OutputItems {
-				state.OutputItems[index] = append(json.RawMessage(nil), item...)
-			}
-		}
-		message.ResponseState = &state
-	}
-	return message
-}
-
-func copyProviderItems(items []model.ProviderItem) []model.ProviderItem {
-	copied := append([]model.ProviderItem(nil), items...)
-	for index := range copied {
-		copied[index].Data = append(json.RawMessage(nil), items[index].Data...)
-	}
-	return copied
-}
-
-func copyMessagePtr(message *model.Message) *model.Message {
-	if message == nil {
-		return nil
-	}
-	copied := copyMessage(*message)
-	return &copied
-}
-
-func copySessionV2(session SessionV2) SessionV2 {
-	session = normalizeSessionLifecycle(session, time.Time{})
-	session.ModelParameters = copyMap(session.ModelParameters)
-	session.EnabledTools = copyStrings(session.EnabledTools)
-	session.EnabledMCP = copyStrings(session.EnabledMCP)
-	session.EnabledSkills = copyStrings(session.EnabledSkills)
-	session.InstructionsSnapshot = copyMessages(session.InstructionsSnapshot)
-	session.InstructionSources = copyInstructionSources(session.InstructionSources)
-	session.Items = copySessionItems(session.Items)
-	session.ActiveHistory = copyStrings(session.ActiveHistory)
-	session.Compactions = copyCompactionCheckpoints(session.Compactions)
-	return session
-}
-
-func copySessionItems(items []SessionItem) []SessionItem {
-	if items == nil {
-		return nil
-	}
-	copied := append([]SessionItem(nil), items...)
-	for i := range copied {
-		if items[i].Message != nil {
-			message := copyMessage(*items[i].Message)
-			copied[i].Message = &message
-		}
-		copied[i].Content = copyStoredContent(items[i].Content)
-	}
-	return copied
-}
-
-func copyStoredContent(content *StoredContent) *StoredContent {
-	if content == nil {
-		return nil
-	}
-	copied := *content
-	if content.Blob != nil {
-		blob := *content.Blob
-		copied.Blob = &blob
-	}
-	return &copied
-}
-
-func copyCompactionCheckpoints(checkpoints []CompactionCheckpoint) []CompactionCheckpoint {
-	if checkpoints == nil {
-		return nil
-	}
-	copied := append([]CompactionCheckpoint(nil), checkpoints...)
-	for i := range copied {
-		copied[i].PreviousActiveHistory = copyStrings(checkpoints[i].PreviousActiveHistory)
-		copied[i].ReplacementHistory = copyStrings(checkpoints[i].ReplacementHistory)
-	}
-	return copied
-}
-
-func (s SessionV2) info() Info {
-	return Info{
-		ID:                s.ID,
-		CreatedAt:         s.CreatedAt,
-		UpdatedAt:         s.UpdatedAt,
-		Version:           s.Version,
-		Provider:          s.Provider,
-		ModelProfile:      s.ModelProfile,
-		ModelID:           s.ModelID,
-		CreatedBy:         s.CreatedBy,
-		ParentSessionID:   s.ParentSessionID,
-		RootSessionID:     s.RootSessionID,
-		SpawnDepth:        s.SpawnDepth,
-		RunningTurnID:     s.RunningTurnID,
-		RunningStartedAt:  s.RunningStartedAt,
-		InterruptedTurnID: s.InterruptedTurnID,
-		InterruptedAt:     s.InterruptedAt,
-		ProjectID:         s.ProjectID,
-		CreatedCWD:        s.CreatedCWD,
-		ContextWindow:     s.Context.ContextWindow,
-		ContextSource:     s.Context.ContextWindowSource,
-		SaveToolResults:   s.SaveToolResults,
-	}
 }
 
 func normalizeSessionLineage(session SessionV2) (SessionV2, error) {
@@ -2451,4 +2440,281 @@ func sessionEffectiveLastUsedAt(session SessionV2) time.Time {
 		return session.UpdatedAt
 	}
 	return session.CreatedAt
+}
+
+func newSessionID(now time.Time) (string, error) {
+	var randomBytes [4]byte
+	if _, err := rand.Read(randomBytes[:]); err != nil {
+		return "", fmt.Errorf("generate session id: %w", err)
+	}
+	return now.UTC().Format("20060102T150405.000000000Z") + "-" + hex.EncodeToString(randomBytes[:]), nil
+}
+
+func hashBytes(raw []byte) string {
+	sum := sha256.Sum256(raw)
+	return hex.EncodeToString(sum[:])
+}
+
+func (s *V2Store) blobPath(sessionID string, ref BlobRef) (string, error) {
+	if err := validateV2SessionID(sessionID); err != nil {
+		return "", err
+	}
+	if err := validateBlobRef(ref); err != nil {
+		return "", err
+	}
+	return filepath.Join(s.sessionDir(sessionID), blobsDirName, "sha256", ref.Hash[:2], ref.Hash+".data"), nil
+}
+
+func validateBlobRef(ref BlobRef) error {
+	if len(ref.Hash) != sha256.Size*2 {
+		return fmt.Errorf("invalid blob hash %q", ref.Hash)
+	}
+	if _, err := hex.DecodeString(ref.Hash); err != nil {
+		return fmt.Errorf("invalid blob hash %q: %w", ref.Hash, err)
+	}
+	if ref.SizeBytes < 0 {
+		return fmt.Errorf("invalid blob size %d", ref.SizeBytes)
+	}
+	return nil
+}
+
+func verifyBlobFile(path string, ref BlobRef) error {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	return verifyBlobBytes(raw, ref)
+}
+
+func verifyBlobBytes(raw []byte, ref BlobRef) error {
+	if int64(len(raw)) != ref.SizeBytes {
+		return fmt.Errorf("blob %q size mismatch: got %d, want %d", ref.Hash, len(raw), ref.SizeBytes)
+	}
+	if got := hashBytes(raw); !strings.EqualFold(got, ref.Hash) {
+		return fmt.Errorf("blob %q hash mismatch: got %s", ref.Hash, got)
+	}
+	return nil
+}
+
+func materializeStoredContent(sessionID, itemID string, content *StoredContent, readBlob func(BlobRef) ([]byte, error)) (string, bool, error) {
+	if content == nil {
+		return "", false, nil
+	}
+	if content.Blob == nil {
+		return content.Inline, content.Inline != "", nil
+	}
+	if readBlob == nil {
+		return "", false, fmt.Errorf("item %q content blob requires a session blob reader", itemID)
+	}
+	raw, err := readBlob(*content.Blob)
+	if err != nil {
+		return "", false, fmt.Errorf("read session %q content blob: %w", sessionID, err)
+	}
+	return string(raw), true, nil
+}
+
+func previewStringByBytes(value string, maxBytes int) string {
+	if maxBytes <= 0 || len(value) <= maxBytes {
+		return value
+	}
+	return value[:maxBytes]
+}
+
+func corruptedSessionError(sessionID, format string, args ...any) error {
+	message := fmt.Sprintf(format, args...)
+	if strings.TrimSpace(sessionID) == "" {
+		return fmt.Errorf("%w: %s", ErrCorruptedSession, message)
+	}
+	return fmt.Errorf("%w %q: %s", ErrCorruptedSession, sessionID, message)
+}
+
+func copyStrings(values []string) []string {
+	if values == nil {
+		return nil
+	}
+	return append([]string(nil), values...)
+}
+
+func copyMap(values map[string]any) map[string]any {
+	if values == nil {
+		return nil
+	}
+	copied := make(map[string]any, len(values))
+	for key, value := range values {
+		copied[key] = value
+	}
+	return copied
+}
+
+func copyMessage(message model.Message) model.Message {
+	copied := message
+	copied.ContentBlocks = append([]model.InputContentBlock(nil), message.ContentBlocks...)
+	for i := range copied.ContentBlocks {
+		if message.ContentBlocks[i].ImageBlob != nil {
+			ref := *message.ContentBlocks[i].ImageBlob
+			copied.ContentBlocks[i].ImageBlob = &ref
+		}
+	}
+	copied.ToolCalls = append([]model.ToolCall(nil), message.ToolCalls...)
+	copied.ProviderItems = copyProviderItems(message.ProviderItems)
+	if message.ResponseState != nil {
+		state := *message.ResponseState
+		state.ReasoningItems = append([]json.RawMessage(nil), message.ResponseState.ReasoningItems...)
+		state.OutputItems = append([]json.RawMessage(nil), message.ResponseState.OutputItems...)
+		copied.ResponseState = &state
+	}
+	return copied
+}
+
+func copyMessagePtr(message *model.Message) *model.Message {
+	if message == nil {
+		return nil
+	}
+	copied := copyMessage(*message)
+	return &copied
+}
+
+func copyMessages(messages []model.Message) []model.Message {
+	if messages == nil {
+		return nil
+	}
+	copied := make([]model.Message, len(messages))
+	for i := range messages {
+		copied[i] = copyMessage(messages[i])
+	}
+	return copied
+}
+
+func copyInstructionSources(sources []InstructionSource) []InstructionSource {
+	if sources == nil {
+		return nil
+	}
+	return append([]InstructionSource(nil), sources...)
+}
+
+func copyProviderItems(items []model.ProviderItem) []model.ProviderItem {
+	if items == nil {
+		return nil
+	}
+	copied := make([]model.ProviderItem, len(items))
+	for i := range items {
+		copied[i] = items[i]
+		copied[i].Data = append(json.RawMessage(nil), items[i].Data...)
+	}
+	return copied
+}
+
+func copyStoredContent(content *StoredContent) *StoredContent {
+	if content == nil {
+		return nil
+	}
+	copied := *content
+	if content.Blob != nil {
+		ref := *content.Blob
+		copied.Blob = &ref
+	}
+	return &copied
+}
+
+func copySessionItem(item SessionItem) SessionItem {
+	copied := item
+	copied.Message = copyMessagePtr(item.Message)
+	copied.Content = copyStoredContent(item.Content)
+	return copied
+}
+
+func copySessionItems(items []SessionItem) []SessionItem {
+	if items == nil {
+		return nil
+	}
+	copied := make([]SessionItem, len(items))
+	for i := range items {
+		copied[i] = copySessionItem(items[i])
+	}
+	return copied
+}
+
+func copyCompactionCheckpoint(checkpoint CompactionCheckpoint) CompactionCheckpoint {
+	checkpoint.PreviousActiveHistory = copyStrings(checkpoint.PreviousActiveHistory)
+	checkpoint.ReplacementHistory = copyStrings(checkpoint.ReplacementHistory)
+	return checkpoint
+}
+
+func copyCompactionCheckpoints(checkpoints []CompactionCheckpoint) []CompactionCheckpoint {
+	if checkpoints == nil {
+		return nil
+	}
+	copied := make([]CompactionCheckpoint, len(checkpoints))
+	for i := range checkpoints {
+		copied[i] = copyCompactionCheckpoint(checkpoints[i])
+	}
+	return copied
+}
+
+func copySessionV2(session SessionV2) SessionV2 {
+	copied := session
+	copied.ModelParameters = copyMap(session.ModelParameters)
+	copied.EnabledTools = copyStrings(session.EnabledTools)
+	copied.EnabledMCP = copyStrings(session.EnabledMCP)
+	copied.EnabledSkills = copyStrings(session.EnabledSkills)
+	copied.InstructionsSnapshot = copyMessages(session.InstructionsSnapshot)
+	copied.InstructionSources = copyInstructionSources(session.InstructionSources)
+	copied.Items = copySessionItems(session.Items)
+	copied.ActiveHistory = copyStrings(session.ActiveHistory)
+	copied.Compactions = copyCompactionCheckpoints(session.Compactions)
+	if session.Pricing != nil {
+		pricing := *session.Pricing
+		if session.Pricing.LongContext != nil {
+			longContext := *session.Pricing.LongContext
+			pricing.LongContext = &longContext
+		}
+		copied.Pricing = &pricing
+	}
+	return copied
+}
+
+func validateCompactionCheckpointWrite(summaryItem SessionItem, checkpoint CompactionCheckpoint, state SessionV2) error {
+	if strings.TrimSpace(summaryItem.ID) == "" {
+		return fmt.Errorf("compaction summary item id is required")
+	}
+	if strings.TrimSpace(checkpoint.ID) == "" {
+		return fmt.Errorf("compaction checkpoint id is required")
+	}
+	if checkpoint.SummaryItemID != "" && checkpoint.SummaryItemID != summaryItem.ID {
+		return fmt.Errorf("compaction checkpoint summary item %q does not match summary item %q", checkpoint.SummaryItemID, summaryItem.ID)
+	}
+	for _, id := range checkpoint.ReplacementHistory {
+		if id == summaryItem.ID {
+			continue
+		}
+		if _, ok := findSessionItemByID(state.Items, id); !ok {
+			return corruptedSessionError(state.ID, "compaction replacement references missing item %q", id)
+		}
+	}
+	return nil
+}
+
+func nextItemID(existing map[string]struct{}, message model.Message) string {
+	prefix := "msg"
+	if message.Role == model.MessageRoleSystem || message.Role == model.MessageRoleDeveloper {
+		prefix = "runtime"
+	} else if message.Role == model.MessageRoleProvider {
+		prefix = "compaction"
+	}
+	for i := len(existing) + 1; ; i++ {
+		id := fmt.Sprintf("%s-%06d", prefix, i)
+		if _, ok := existing[id]; !ok {
+			return id
+		}
+	}
+}
+
+// Keep io imported in this file's error surface for callers that used the old
+// short-write sentinel while the JSONL implementation was removed.
+var _ = io.ErrShortWrite
+
+func reverseItems(items []SessionItem) {
+	for i, j := 0, len(items)-1; i < j; i, j = i+1, j-1 {
+		items[i], items[j] = items[j], items[i]
+	}
 }

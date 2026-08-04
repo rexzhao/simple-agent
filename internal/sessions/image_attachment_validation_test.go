@@ -31,7 +31,7 @@ func TestV2StoreRejectsNonDurableImageURL(t *testing.T) {
 		t.Fatalf("AppendItem() error = %v, want base64 data URL rejection", err)
 	}
 
-	loaded, err := store.Load(session.ID)
+	loaded, err := store.LoadExecutionState(session.ID)
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
 	}

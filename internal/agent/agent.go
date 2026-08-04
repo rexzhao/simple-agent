@@ -114,6 +114,11 @@ type Options struct {
 	ActivePromptDrain ActivePromptDrain
 	AutoCompact       AutoCompact
 	ToolCancel        *ToolCancellationRegistry
+	// NextTurnID enables the execution layer to give each provider request its
+	// own durable Turn. When nil, the standalone agent API retains its
+	// historical single-turn behavior.
+	NextTurnID    func(iteration int) string
+	TurnIDChanged func(turnID string)
 }
 
 type TurnResult struct {
@@ -164,6 +169,23 @@ func run(ctx context.Context, request model.Request, options Options, maxTurns i
 	enabledTools := enabledToolNames(request.Tools)
 
 	for iteration := 1; iteration <= maxTurns; iteration++ {
+		if iteration > 1 && options.NextTurnID != nil && options.Publisher != nil {
+			if !publishDurable(events, options.Publisher, eventbus.TurnCompleted{TurnID: turnID}, "persist turn completion") {
+				return
+			}
+			next := strings.TrimSpace(options.NextTurnID(iteration))
+			if next == "" {
+				events <- model.ErrorEvent{Err: fmt.Errorf("next agent turn id is blank")}
+				return
+			}
+			turnID = next
+			if !publishDurable(events, options.Publisher, eventbus.TurnStarted{TurnID: turnID}, "persist turn start") {
+				return
+			}
+			if options.TurnIDChanged != nil {
+				options.TurnIDChanged(turnID)
+			}
+		}
 		// Checkpoint: drain queued active prompts before the first provider
 		// request so appended user input is part of the initial turn history.
 		if iteration == 1 {

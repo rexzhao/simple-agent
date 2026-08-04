@@ -27,7 +27,7 @@ const (
 
 	maximumAgentSessionSpawnDepth  = 4
 	maximumSessionDisplayNameRunes = 120
-	defaultSessionWaitTimeout = 30 * time.Second
+	defaultSessionWaitTimeout      = 30 * time.Second
 )
 
 // IsSessionTool reports whether name belongs to the durable session
@@ -52,7 +52,7 @@ func sessionToolDefinitions() []model.Tool {
 		},
 		{
 			Name:        ToolSessionStart,
-			Description: "Create a named durable child session and start its first turn asynchronously. Omit provider and model to inherit this session's exact runtime model snapshot; otherwise provide both to select a configured model.",
+			Description: "Create a named durable child session and start its first turn asynchronously. Omit provider and model to inherit this session's exact runtime model snapshot; otherwise provide both to select a configured model. Set on_settle=continue_parent to durably notify this parent and automatically start one new parent run after the child settles; the parent does not need to call session_wait.",
 			InputSchema: sessionToolObjectSchema(map[string]any{
 				"prompt": map[string]any{
 					"type":        "string",
@@ -73,6 +73,12 @@ func sessionToolDefinitions() []model.Tool {
 				"reasoning_level": map[string]any{
 					"type":        "string",
 					"description": "Optional configured reasoning level. When omitted with provider/model, the caller's exact parameters are inherited.",
+				},
+				"on_settle": map[string]any{
+					"type":        "string",
+					"enum":        []any{"none", "continue_parent"},
+					"default":     "none",
+					"description": "Completion behavior for the child's initial run. none leaves the parent untouched; continue_parent durably wakes the parent with a compact completion notification after the child settles.",
 				},
 			}, []any{"prompt"}),
 		},
@@ -337,6 +343,19 @@ func (e *sessionToolExecutor) start(toolName string, arguments map[string]any) (
 	if err != nil {
 		return sessionToolError(toolName, "invalid_arguments", err.Error())
 	}
+	onSettle, err := optionalTrimmedSessionString(arguments, "on_settle")
+	if err != nil {
+		return sessionToolError(toolName, "invalid_arguments", err.Error())
+	}
+	if _, supplied := arguments["on_settle"]; supplied && onSettle == "" {
+		return sessionToolError(toolName, "invalid_arguments", "on_settle must not be blank")
+	}
+	if onSettle == "" {
+		onSettle = "none"
+	}
+	if onSettle != "none" && onSettle != "continue_parent" {
+		return sessionToolError(toolName, "invalid_arguments", "on_settle must be one of none or continue_parent")
+	}
 	if (provider == "") != (modelProfile == "") {
 		return sessionToolError(toolName, "invalid_arguments", "provider and model must be supplied together")
 	}
@@ -377,7 +396,18 @@ func (e *sessionToolExecutor) start(toolName string, arguments map[string]any) (
 		return sessionToolErrorFields(toolName, code, safeSessionToolError(err), map[string]any{
 			"session_id": child.ID,
 			"created":    true,
+			"on_settle":  onSettle,
 		})
+	}
+	if onSettle == "continue_parent" {
+		if err := e.service.RegisterContinueParentSubscription(e.caller.ID, child.ID, run.ID()); err != nil {
+			return sessionToolErrorFields(toolName, sessionToolErrorCode(err), safeSessionToolError(err), map[string]any{
+				"session_id": child.ID,
+				"run_id":     run.ID(),
+				"created":    true,
+				"on_settle":  onSettle,
+			})
+		}
 	}
 	return sessionToolResult(toolName, map[string]any{
 		"ok":                true,
@@ -388,6 +418,7 @@ func (e *sessionToolExecutor) start(toolName string, arguments map[string]any) (
 		"provider":          child.Provider,
 		"model":             child.ModelProfile,
 		"model_id":          child.ModelID,
+		"on_settle":         onSettle,
 		"parent_session_id": child.ParentSessionID,
 		"root_session_id":   child.RootSessionID,
 		"spawn_depth":       child.SpawnDepth,

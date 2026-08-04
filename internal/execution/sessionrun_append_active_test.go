@@ -372,7 +372,7 @@ func waitForRunningTurn(t *testing.T, service *Service, sessionID string) {
 	// runner the run goroutine can take seconds to mark the turn running.
 	deadline := time.Now().Add(30 * time.Second)
 	for time.Now().Before(deadline) {
-		session, err := service.sessionStore.Load(sessionID)
+		session, err := service.sessionStore.LoadExecutionState(sessionID)
 		if err == nil && session.RunningTurnID != "" {
 			return
 		}
@@ -385,7 +385,7 @@ func waitForRunningTurn(t *testing.T, service *Service, sessionID string) {
 // scanning user messages, used to verify how many turns actually ran.
 func assertSessionTurnCount(t *testing.T, service *Service, sessionID string, want int) {
 	t.Helper()
-	session, err := service.sessionStore.Load(sessionID)
+	session, err := service.sessionStore.LoadExecutionState(sessionID)
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
 	}

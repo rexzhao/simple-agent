@@ -2,6 +2,9 @@ package execution
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -30,6 +33,7 @@ type Service struct {
 	configPath              string
 	projectStore            *projectstore.Store
 	sessionStore            *sessions.V2Store
+	lifecycleHub            *LifecycleHub
 	turnRunner              SessionTurnRunner
 	compactPlanner          SessionCompactPlanner
 	sessionWriteLockTimeout time.Duration
@@ -77,6 +81,13 @@ type SessionMetadata struct {
 	SpawnDepth        int                    `json:"spawn_depth"`
 	Archived          bool                   `json:"archived"`
 	LastUsedAt        time.Time              `json:"last_used_at"`
+	CurrentRunID      string                 `json:"current_run_id,omitempty"`
+	RunningRunID      string                 `json:"running_run_id,omitempty"`
+	RunningTurnID     string                 `json:"running_turn_id,omitempty"`
+	InterruptedRunID  string                 `json:"interrupted_run_id,omitempty"`
+	LatestRunID       string                 `json:"latest_run_id,omitempty"`
+	LastRunID         string                 `json:"last_run_id,omitempty"`
+	LastRunStatus     string                 `json:"last_run_status,omitempty"`
 	InterruptedAt     time.Time              `json:"interrupted_at,omitempty"`
 	InterruptedTurnID string                 `json:"interrupted_turn_id,omitempty"`
 	Provider          string                 `json:"provider"`
@@ -102,6 +113,13 @@ type SessionDetail struct {
 	SpawnDepth        int                    `json:"spawn_depth"`
 	Archived          bool                   `json:"archived"`
 	LastUsedAt        time.Time              `json:"last_used_at"`
+	CurrentRunID      string                 `json:"current_run_id,omitempty"`
+	RunningRunID      string                 `json:"running_run_id,omitempty"`
+	RunningTurnID     string                 `json:"running_turn_id,omitempty"`
+	InterruptedRunID  string                 `json:"interrupted_run_id,omitempty"`
+	LatestRunID       string                 `json:"latest_run_id,omitempty"`
+	LastRunID         string                 `json:"last_run_id,omitempty"`
+	LastRunStatus     string                 `json:"last_run_status,omitempty"`
 	InterruptedAt     time.Time              `json:"interrupted_at,omitempty"`
 	InterruptedTurnID string                 `json:"interrupted_turn_id,omitempty"`
 	Provider          string                 `json:"provider"`
@@ -170,6 +188,7 @@ type SessionRemoveResult struct {
 
 type SessionMessageResult struct {
 	Status  string `json:"status"`
+	RunID   string `json:"run_id,omitempty"`
 	TurnID  string `json:"turn_id"`
 	LastSeq int64  `json:"last_seq"`
 }
@@ -177,21 +196,29 @@ type SessionMessageResult struct {
 type SessionMessageInput struct {
 	Content       string
 	ContentBlocks []model.InputContentBlock
-	// ReplayItemID starts a turn from the already-persisted active history.
-	// It must identify the trailing user message; no new user item is appended.
-	ReplayItemID string
-	// Replay retries an interrupted turn by resending the entire persisted
-	// active history (including tool results) to the model without appending
-	// new input. It does not require a trailing user message.
-	Replay bool
+	// Continue resumes the durable active context of the interrupted/failed
+	// run. It is never combined with new content and never appends a user item.
+	Continue bool
+	// Internal marks a durable system/developer notification rather than a new
+	// user request. It is used for child-completion wakeups and is intentionally
+	// persisted as a compact descriptor, not as a copy of child output.
+	Internal bool `json:"internal,omitempty"`
+	// DeliveryID links an internal notification to its durable inbox record.
+	DeliveryID string `json:"delivery_id,omitempty"`
 }
 
-// Message builds the model-facing user message. When attachments exist the
-// text becomes an input_text block because OpenAI Responses rejects a message
-// that sets both Content and ContentBlocks.
+// Message builds the model-facing input message. Ordinary inputs are user
+// messages; durable internal wakeups are developer messages so they remain
+// hidden from user history. When attachments exist the text becomes an
+// input_text block because OpenAI Responses rejects a message that sets both
+// Content and ContentBlocks.
 func (input SessionMessageInput) Message() model.Message {
+	role := model.MessageRoleUser
+	if input.Internal {
+		role = model.MessageRoleDeveloper
+	}
 	if len(input.ContentBlocks) == 0 {
-		return model.Message{Role: model.MessageRoleUser, Content: input.Content}
+		return model.Message{Role: role, Content: input.Content}
 	}
 	blocks := make([]model.InputContentBlock, 0, len(input.ContentBlocks)+1)
 	if input.Content != "" {
@@ -205,7 +232,7 @@ func (input SessionMessageInput) Message() model.Message {
 		}
 		blocks = append(blocks, copied)
 	}
-	return model.Message{Role: model.MessageRoleUser, ContentBlocks: blocks}
+	return model.Message{Role: role, ContentBlocks: blocks}
 }
 
 func sessionMessageHasImage(input SessionMessageInput) bool {
@@ -252,10 +279,11 @@ type SessionTurnRequest struct {
 	SessionStore        *sessions.V2Store
 	SessionService      *Service
 	RunCoordinator      *SessionRunCoordinator
+	RunID               string
 	TurnID              string
 	Content             string
 	ContentBlocks       []model.InputContentBlock
-	ReplayHistory       bool
+	ResumeContext       bool
 	Emit                func(model.Event)
 	Publisher           eventbus.Publisher
 	OnCompactionStarted func(trigger string)
@@ -269,6 +297,9 @@ type SessionTurnRequest struct {
 	// AgentTurnRunner passes it to the agent loop so each tool call runs under
 	// a cancellable child context registered by tool call ID.
 	ToolCancel *agent.ToolCancellationRegistry
+	// TurnIDChanged is called when a multi-request Run advances to its next
+	// model request.
+	TurnIDChanged func(string)
 }
 
 // SessionActivePromptCheckpoint identifies a safe point in an active session
@@ -401,15 +432,25 @@ func NewServiceWithOptions(home string, options ServiceOptions) (*Service, error
 	if lockTimeout <= 0 {
 		lockTimeout = defaultSessionWriteLockTimeout
 	}
-	return &Service{
+	service := &Service{
 		serverRoot:              serverRoot,
 		configPath:              configPath,
 		projectStore:            projectstore.NewStore(projectRoot),
 		sessionStore:            sessions.NewV2Store(sessionRoot),
+		lifecycleHub:            NewLifecycleHub(),
 		turnRunner:              options.TurnRunner,
 		compactPlanner:          compactPlanner,
 		sessionWriteLockTimeout: lockTimeout,
-	}, nil
+	}
+	// A process may have exited after a run was marked running but before its
+	// terminal event was committed. Recover that durable state before exposing
+	// the service to callers. This is intentionally store-level recovery: it
+	// does not replay the event log and leaves the interrupted turn metadata
+	// available to inspection APIs.
+	if _, err := service.sessionStore.MarkRunningTurnsInterrupted(); err != nil {
+		return nil, fmt.Errorf("recover running sessions: %w", err)
+	}
+	return service, nil
 }
 
 func (s *Service) ServerRoot() string {
@@ -426,6 +467,16 @@ func (s *Service) ConfigPath() string {
 	return s.configPath
 }
 
+// LifecycleHub returns the process-local best-effort lifecycle stream shared
+// by the Web adapter and execution entry points. It intentionally has no
+// replay history; a subscriber that falls behind must bootstrap again.
+func (s *Service) LifecycleHub() *LifecycleHub {
+	if s == nil {
+		return nil
+	}
+	return s.lifecycleHub
+}
+
 // SetSessionRunCoordinator installs the application-wide active-run owner used
 // by both presentation adapters and session tools. Passing nil detaches it.
 func (s *Service) SetSessionRunCoordinator(coordinator *SessionRunCoordinator) {
@@ -435,6 +486,11 @@ func (s *Service) SetSessionRunCoordinator(coordinator *SessionRunCoordinator) {
 	s.runCoordinatorMu.Lock()
 	s.runCoordinator = coordinator
 	s.runCoordinatorMu.Unlock()
+	if coordinator != nil {
+		coordinator.SetLifecycleCallbacks(s.publishRunStarted, s.publishRunSettled)
+		coordinator.SetRunIdleCallback(s.onRunIdle)
+		go s.scanCompletionInboxes()
+	}
 }
 
 // ClearSessionRunCoordinator detaches coordinator only if it is still the
@@ -449,6 +505,10 @@ func (s *Service) ClearSessionRunCoordinator(coordinator *SessionRunCoordinator)
 		s.runCoordinator = nil
 	}
 	s.runCoordinatorMu.Unlock()
+	if coordinator != nil {
+		coordinator.SetLifecycleCallbacks(nil, nil)
+		coordinator.SetRunIdleCallback(nil)
+	}
 }
 
 func (s *Service) sessionRunCoordinator() *SessionRunCoordinator {
@@ -604,7 +664,7 @@ func (s *Service) RemoveProject(id string) (ProjectRemoveResult, error) {
 	if err := s.ensureProjectSessionsIdle(project.ID); err != nil {
 		return ProjectRemoveResult{}, err
 	}
-	removedSessions, err := s.removeProjectSessions(project.ID)
+	removedSessionStates, err := s.removeProjectSessions(project.ID)
 	if err != nil {
 		return ProjectRemoveResult{}, err
 	}
@@ -614,7 +674,13 @@ func (s *Service) RemoveProject(id string) (ProjectRemoveResult, error) {
 		}
 		return ProjectRemoveResult{}, fmt.Errorf("remove project %s: %w", project.ID, err)
 	}
-	return ProjectRemoveResult{Status: "removed", ID: project.ID, RemovedSessions: removedSessions}, nil
+	for _, cascade := range sessionDeletionCascades(removedSessionStates) {
+		// Project removal has committed both the session deletes and the
+		// project delete. Preserve the same root-plus-descendants contract as
+		// direct RemoveSession for each session tree in the project.
+		s.publishSessionDeleted(cascade.rootID, project.ID, cascade.descendants)
+	}
+	return ProjectRemoveResult{Status: "removed", ID: project.ID, RemovedSessions: len(removedSessionStates)}, nil
 }
 
 func (s *Service) CreateSession(projectID string, metadata SessionCreateMetadata) (SessionDetail, error) {
@@ -628,7 +694,7 @@ func (s *Service) CreateSession(projectID string, metadata SessionCreateMetadata
 	session := applySessionCreateMetadata(sessions.SessionV2{}, metadata)
 	session.ProjectID = project.ID
 	if session.ParentSessionID != "" {
-		parent, err := s.sessionStore.Load(session.ParentSessionID)
+		parent, err := s.sessionStore.LoadState(session.ParentSessionID)
 		if err != nil {
 			return SessionDetail{}, fmt.Errorf("load parent session %q: %w", session.ParentSessionID, err)
 		}
@@ -655,6 +721,7 @@ func (s *Service) CreateSession(projectID string, metadata SessionCreateMetadata
 	if err != nil {
 		return SessionDetail{}, err
 	}
+	s.publishSessionCreated(saved)
 	return sessionDetailFromStore(saved), nil
 }
 
@@ -672,18 +739,14 @@ func (s *Service) ListSessions(options SessionListOptions) ([]SessionMetadata, e
 	} else if !options.AllProjects {
 		return nil, fmt.Errorf("project id is required")
 	}
-	infos, err := s.sessionStore.ListWithOptions(sessions.V2ListOptions{Archived: options.Archived})
+	states, err := s.sessionStore.ListStates(sessions.V2ListOptions{Archived: options.Archived})
 	if err != nil {
 		return nil, err
 	}
-	items := make([]SessionMetadata, 0, len(infos))
-	for _, info := range infos {
-		if projectID != "" && info.ProjectID != projectID {
+	items := make([]SessionMetadata, 0, len(states))
+	for _, session := range states {
+		if projectID != "" && session.ProjectID != projectID {
 			continue
-		}
-		session, err := s.sessionStore.Load(info.ID)
-		if err != nil {
-			return nil, err
 		}
 		session = s.hydrateSessionDebug(session)
 		items = append(items, sessionMetadataFromStore(session))
@@ -695,7 +758,7 @@ func (s *Service) GetSession(id string) (SessionDetail, error) {
 	if s == nil || s.sessionStore == nil {
 		return SessionDetail{}, fmt.Errorf("execution session store is not configured")
 	}
-	session, err := s.sessionStore.Load(id)
+	session, err := s.sessionStore.LoadState(id)
 	if err != nil {
 		return SessionDetail{}, err
 	}
@@ -712,14 +775,18 @@ func (s *Service) GetSessionSnapshot(id string) (SessionSnapshot, error) {
 	if s == nil || s.sessionStore == nil {
 		return SessionSnapshot{}, fmt.Errorf("execution session store is not configured")
 	}
-	session, err := s.sessionStore.Load(id)
+	session, err := s.sessionStore.LoadState(id)
 	if err != nil {
 		return SessionSnapshot{}, err
 	}
 	session = s.hydrateSessionPricing(session)
 	session = s.hydrateSessionDebug(session)
 	detail := sessionDetailFromStore(session)
-	history, err := s.buildItemsPage(session, 0, 0, defaultSessionChatItemsLimit, true)
+	storePage, err := s.sessionStore.ReadHistoryPage(id, sessions.HistoryPageOptions{Limit: defaultSessionChatItemsLimit, AlignTurn: true, VisibleOnly: true})
+	if err != nil {
+		return SessionSnapshot{}, err
+	}
+	history, err := s.sessionItemsPageFromStorePage(id, storePage)
 	if err != nil {
 		return SessionSnapshot{}, err
 	}
@@ -739,7 +806,7 @@ func (s *Service) RenameSession(id, displayName string) (SessionDetail, error) {
 	if displayName == "" {
 		return SessionDetail{}, fmt.Errorf("session display name must be a non-empty string")
 	}
-	session, err := s.sessionStore.Load(id)
+	session, err := s.sessionStore.LoadState(id)
 	if err != nil {
 		return SessionDetail{}, err
 	}
@@ -751,6 +818,7 @@ func (s *Service) RenameSession(id, displayName string) (SessionDetail, error) {
 	if err != nil {
 		return SessionDetail{}, err
 	}
+	s.publishSessionUpdated(saved, "rename")
 	return sessionDetailFromStore(saved), nil
 }
 
@@ -762,7 +830,7 @@ func (s *Service) SetSessionFullAccess(id string, fullAccess bool) (SessionDetai
 	if s == nil || s.sessionStore == nil {
 		return SessionDetail{}, fmt.Errorf("execution session store is not configured")
 	}
-	session, err := s.sessionStore.Load(id)
+	session, err := s.sessionStore.LoadState(id)
 	if err != nil {
 		return SessionDetail{}, err
 	}
@@ -774,6 +842,7 @@ func (s *Service) SetSessionFullAccess(id string, fullAccess bool) (SessionDetai
 	if err != nil {
 		return SessionDetail{}, err
 	}
+	s.publishSessionUpdated(saved, "full_access")
 	return sessionDetailFromStore(saved), nil
 }
 
@@ -784,7 +853,7 @@ func (s *Service) SetSessionDebug(id string, debug sessions.DebugSettings) (Sess
 	if s == nil || s.sessionStore == nil {
 		return SessionDetail{}, fmt.Errorf("execution session store is not configured")
 	}
-	session, err := s.sessionStore.Load(id)
+	session, err := s.sessionStore.LoadState(id)
 	if err != nil {
 		return SessionDetail{}, err
 	}
@@ -797,6 +866,7 @@ func (s *Service) SetSessionDebug(id string, debug sessions.DebugSettings) (Sess
 	if err != nil {
 		return SessionDetail{}, err
 	}
+	s.publishSessionUpdated(saved, "debug")
 	return sessionDetailFromStore(saved), nil
 }
 
@@ -822,6 +892,7 @@ func (s *Service) ArchiveSession(id string) (SessionDetail, error) {
 	if err != nil {
 		return SessionDetail{}, err
 	}
+	changed := make([]sessions.SessionV2, 0, len(subtree))
 	for _, sessionID := range subtree {
 		session, ok := subtreeSessions[sessionID]
 		if !ok || session.Archived {
@@ -833,6 +904,14 @@ func (s *Service) ArchiveSession(id string) (SessionDetail, error) {
 			return SessionDetail{}, saveErr
 		}
 		subtreeSessions[sessionID] = saved
+		changed = append(changed, saved)
+	}
+	// Publish only after every metadata commit in the cascade succeeded. A
+	// failed operation therefore cannot expose a partially-applied lifecycle
+	// update to incremental clients.
+	descendants := sessionDescendantIDs(subtree, id)
+	for _, session := range changed {
+		s.publishSessionArchived(session, id, descendants)
 	}
 	return sessionDetailFromStore(subtreeSessions[id]), nil
 }
@@ -847,7 +926,7 @@ func (s *Service) RestoreSession(id string) (SessionDetail, error) {
 	}
 	defer func() { _ = writeLock.Release() }()
 
-	session, err := s.sessionStore.Load(id)
+	session, err := s.sessionStore.LoadState(id)
 	if err != nil {
 		return SessionDetail{}, err
 	}
@@ -863,6 +942,7 @@ func (s *Service) RestoreSession(id string) (SessionDetail, error) {
 	if err != nil {
 		return SessionDetail{}, err
 	}
+	s.publishSessionUpdated(saved, "restore")
 	return sessionDetailFromStore(saved), nil
 }
 
@@ -893,7 +973,10 @@ func (s *Service) RemoveSession(id string) (SessionRemoveResult, error) {
 	if !subtreeSessions[id].Archived {
 		return SessionRemoveResult{}, fmt.Errorf("archive session before removing it")
 	}
+	projectID := subtreeSessions[id].ProjectID
 	deleteOrder := make([]sessions.SessionV2, 0, len(subtreeSessions))
+	deletedParentIDs := make(map[string]struct{})
+	deleteIDs := make(map[string]struct{}, len(subtreeSessions))
 	for _, sessionID := range subtree {
 		session, ok := subtreeSessions[sessionID]
 		if !ok {
@@ -908,6 +991,10 @@ func (s *Service) RemoveSession(id string) (SessionRemoveResult, error) {
 			session = saved
 		}
 		deleteOrder = append(deleteOrder, session)
+		deleteIDs[session.ID] = struct{}{}
+		if parentID := strings.TrimSpace(session.ParentSessionID); parentID != "" {
+			deletedParentIDs[parentID] = struct{}{}
+		}
 	}
 	// Windows cannot remove a directory while its write.lock handle is open.
 	// The archived state prevents a new run from starting after this release.
@@ -932,6 +1019,22 @@ func (s *Service) RemoveSession(id string) (SessionRemoveResult, error) {
 	if err := s.sessionStore.Delete(id); err != nil {
 		return SessionRemoveResult{}, err
 	}
+	deletedDescendants := make([]string, 0, len(deleteOrder))
+	for _, session := range deleteOrder {
+		if session.ID != id {
+			deletedDescendants = append(deletedDescendants, session.ID)
+		}
+	}
+	s.publishSessionDeleted(id, projectID, deletedDescendants)
+	for parentID := range deletedParentIDs {
+		if _, deleting := deleteIDs[parentID]; deleting {
+			continue
+		}
+		// A child deletion is a durable terminal outcome for any parent inbox
+		// row that was waiting on it. Let the normal compact-descriptor scan
+		// deliver that notification without coupling deletion to the inbox DB.
+		go s.processCompletionInbox(parentID)
+	}
 	return SessionRemoveResult{Status: "removed", ID: id}, nil
 }
 
@@ -944,14 +1047,14 @@ func (s *Service) sessionSubtreeIDs(rootID string) ([]string, error) {
 	if s == nil || s.sessionStore == nil {
 		return nil, fmt.Errorf("execution session store is not configured")
 	}
-	infos, err := s.sessionStore.ListWithOptions(sessions.V2ListOptions{All: true})
+	states, err := s.sessionStore.ListStates(sessions.V2ListOptions{All: true})
 	if err != nil {
 		return nil, err
 	}
 	childrenByParent := make(map[string][]string)
-	for _, info := range infos {
-		if parent := strings.TrimSpace(info.ParentSessionID); parent != "" {
-			childrenByParent[parent] = append(childrenByParent[parent], info.ID)
+	for _, state := range states {
+		if parent := strings.TrimSpace(state.ParentSessionID); parent != "" {
+			childrenByParent[parent] = append(childrenByParent[parent], state.ID)
 		}
 	}
 	ids := []string{rootID}
@@ -973,6 +1076,17 @@ func (s *Service) sessionSubtreeIDs(rootID string) ([]string, error) {
 	return ids, nil
 }
 
+func sessionDescendantIDs(subtree []string, rootID string) []string {
+	rootID = strings.TrimSpace(rootID)
+	descendants := make([]string, 0, len(subtree))
+	for _, sessionID := range subtree {
+		if sessionID != rootID {
+			descendants = append(descendants, sessionID)
+		}
+	}
+	return descendants
+}
+
 // loadSubtreeSessions loads every session in the subtree while the caller
 // holds the subtree locks and rejects the operation with ErrSessionBusy when
 // any session has a running turn. requiredID identifies the operation target:
@@ -980,14 +1094,14 @@ func (s *Service) sessionSubtreeIDs(rootID string) ([]string, error) {
 func (s *Service) loadSubtreeSessions(subtree []string, requiredID string) (map[string]sessions.SessionV2, error) {
 	loaded := make(map[string]sessions.SessionV2, len(subtree))
 	for _, sessionID := range subtree {
-		session, err := s.sessionStore.Load(sessionID)
+		session, err := s.sessionStore.LoadState(sessionID)
 		if errors.Is(err, sessions.ErrNotFound) && sessionID != requiredID {
 			continue
 		}
 		if err != nil {
 			return nil, err
 		}
-		if strings.TrimSpace(session.RunningTurnID) != "" {
+		if sessionHasActiveRun(session) {
 			return nil, ErrSessionBusy
 		}
 		loaded[sessionID] = session
@@ -1068,6 +1182,7 @@ const (
 type SessionRun struct {
 	cancel context.CancelFunc
 	done   chan struct{}
+	runID  string
 
 	mu        sync.Mutex
 	status    SessionRunStatus
@@ -1094,6 +1209,36 @@ type SessionRun struct {
 	// toolCancel tracks in-flight tool calls so they can be individually
 	// cancelled without aborting the entire run.
 	toolCancel *agent.ToolCancellationRegistry
+	// persistentCreated is set only while the session write lock is held.
+	persistentCreated bool
+}
+
+// sessionTurnLifecyclePublisher keeps the service's terminal/interruption
+// bookkeeping in sync even when a custom runner advances to another Turn by
+// publishing TurnStarted itself. The real agent runner also exposes a local
+// callback for its compaction/runtime state; this publisher is the durable
+// execution boundary.
+type sessionTurnLifecyclePublisher struct {
+	bus           *eventbus.Bus
+	onStarted     func(string)
+	onCompleted   func(string)
+	onInterrupted func(string)
+}
+
+func (p sessionTurnLifecyclePublisher) Publish(event eventbus.Event) error {
+	if err := p.bus.Publish(event); err != nil {
+		return err
+	}
+	if started, ok := event.(eventbus.TurnStarted); ok && p.onStarted != nil {
+		p.onStarted(started.TurnID)
+	}
+	if completed, ok := event.(eventbus.TurnCompleted); ok && p.onCompleted != nil {
+		p.onCompleted(completed.TurnID)
+	}
+	if interrupted, ok := event.(eventbus.TurnInterrupted); ok && p.onInterrupted != nil {
+		p.onInterrupted(interrupted.TurnID)
+	}
+	return nil
 }
 
 // activePrompt is one queued append-active prompt with a stable id so clients
@@ -1126,9 +1271,25 @@ func (s *Service) StartSessionRun(ctx context.Context, id, content string, emit 
 	return s.StartSessionRunWithInput(ctx, id, SessionMessageInput{Content: content}, emit)
 }
 
+// ContinueSessionRun resumes the durable active context after an interrupted
+// or failed Run. It intentionally has no content argument.
+func (s *Service) ContinueSessionRun(ctx context.Context, id string, emit func(SessionStreamEvent)) *SessionRun {
+	return s.StartSessionRunWithInput(ctx, id, SessionMessageInput{Continue: true}, emit)
+}
+
 // StartSessionRunWithInput starts a run whose user message can include image
 // input blocks as well as text. Text-only callers should use StartSessionRun.
 func (s *Service) StartSessionRunWithInput(ctx context.Context, id string, input SessionMessageInput, emit func(SessionStreamEvent)) *SessionRun {
+	return s.startSessionRunWithID(ctx, id, input, "", emit)
+}
+
+// StartSessionRunWithID is used by the coordinator so the in-memory handle and
+// the durable Run row always carry the same ID.
+func (s *Service) StartSessionRunWithID(ctx context.Context, id string, input SessionMessageInput, runID string, emit func(SessionStreamEvent)) *SessionRun {
+	return s.startSessionRunWithID(ctx, id, input, runID, emit)
+}
+
+func (s *Service) startSessionRunWithID(ctx context.Context, id string, input SessionMessageInput, runID string, emit func(SessionStreamEvent)) *SessionRun {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -1136,6 +1297,7 @@ func (s *Service) StartSessionRunWithInput(ctx context.Context, id string, input
 	run := &SessionRun{
 		cancel:     cancel,
 		done:       make(chan struct{}),
+		runID:      strings.TrimSpace(runID),
 		status:     SessionRunRunning,
 		accepting:  true,
 		toolCancel: agent.NewToolCancellationRegistry(),
@@ -1143,6 +1305,13 @@ func (s *Service) StartSessionRunWithInput(ctx context.Context, id string, input
 	go func() {
 		defer cancel()
 		defer close(run.done)
+		persistent, err := s.beginPersistentRun(run)
+		if err != nil {
+			run.failRemaining(run.effectiveError(err, runCtx))
+			result, persistErr := run.settlePersistent(s, id, persistent, SessionMessageResult{RunID: run.runID}, err, runCtx)
+			run.settle(result, errors.Join(err, persistErr), runCtx)
+			return
+		}
 		result, err := s.runSessionMessageWithActive(runCtx, run, id, input, emit)
 		if err == nil {
 			// After the active turn settles, send any Web no-loss appends still
@@ -1173,12 +1342,13 @@ func (s *Service) StartSessionRunWithInput(ctx context.Context, id string, input
 				if !ok {
 					break
 				}
-				turnResult, turnErr := s.runSessionMessage(runCtx, id, SessionMessageInput{Content: receipt.event.Content}, emit, nil)
+				turnResult, turnErr := s.runSessionMessage(runCtx, id, SessionMessageInput{Content: receipt.event.Content}, emit, run)
 				if turnErr != nil {
 					effErr := run.effectiveError(turnErr, runCtx)
 					receipt.settle(turnResult, effErr)
 					run.failRemaining(effErr)
-					run.settle(turnResult, turnErr, runCtx)
+					turnResult, persistErr := run.settlePersistent(s, id, persistent, turnResult, turnErr, runCtx)
+					run.settle(turnResult, errors.Join(turnErr, persistErr), runCtx)
 					return
 				}
 				receipt.settle(turnResult, nil)
@@ -1187,9 +1357,68 @@ func (s *Service) StartSessionRunWithInput(ctx context.Context, id string, input
 		} else {
 			run.failRemaining(run.effectiveError(err, runCtx))
 		}
-		run.settle(result, err, runCtx)
+		result, persistErr := run.settlePersistent(s, id, persistent, result, err, runCtx)
+		run.settle(result, errors.Join(err, persistErr), runCtx)
 	}()
 	return run
+}
+
+func newServiceRunID() (string, error) {
+	var raw [16]byte
+	if _, err := rand.Read(raw[:]); err != nil {
+		return "", err
+	}
+	return "run-" + hex.EncodeToString(raw[:]), nil
+}
+
+// beginPersistentRun allocates/binds the coordinator Run ID before the first
+// Turn. Durable admission and row creation happen in runSessionMessage under
+// the session write lock, so Continue remains safe after a restart.
+func (s *Service) beginPersistentRun(run *SessionRun) (bool, error) {
+	if s == nil || s.sessionStore == nil {
+		return false, fmt.Errorf("execution session store is not configured")
+	}
+	if run.runID == "" {
+		var err error
+		run.runID, err = newServiceRunID()
+		if err != nil {
+			return false, err
+		}
+	}
+	// Actual durable creation happens in runSessionMessage after it acquires
+	// the existing session write lock. Keeping one lock acquisition here is
+	// important: it preserves the established non-blocking Start/Wait API and
+	// makes a held lock reject the run before any model request.
+	return true, nil
+}
+
+func (r *SessionRun) settlePersistent(s *Service, sessionID string, started bool, result SessionMessageResult, err error, ctx context.Context) (SessionMessageResult, error) {
+	if !started || !r.persistentCreated || s == nil || s.sessionStore == nil {
+		result.RunID = r.runID
+		return result, nil
+	}
+	status := sessions.RunStatusCommitted
+	if err != nil {
+		status = sessions.RunStatusFailed
+		if errors.Is(err, context.Canceled) || errors.Is(ctx.Err(), context.Canceled) {
+			status = sessions.RunStatusCancelled
+		}
+	}
+	var persistErr error
+	if state, err := s.sessionStore.SetRunStatus(sessionID, r.runID, status, time.Now().UTC()); err == nil {
+		result.LastSeq = state.LastSeq
+	} else {
+		persistErr = err
+	}
+	result.RunID = r.runID
+	return result, persistErr
+}
+
+func runIDForRequest(run *SessionRun) string {
+	if run == nil {
+		return ""
+	}
+	return run.runID
 }
 
 // Wait blocks until the run completes and returns its result and error. It is
@@ -1569,6 +1798,7 @@ func publishPromptQueueSnapshot(emit func(SessionStreamEvent), turnID string, pr
 func (r *SessionRun) settle(result SessionMessageResult, err error, runCtx context.Context) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	result.RunID = r.runID
 	r.result = result
 	if err == nil {
 		r.status = SessionRunCommitted
@@ -1696,43 +1926,42 @@ func (s *Service) ValidateSessionMessageInput(id string, input SessionMessageInp
 	if s == nil || s.sessionStore == nil {
 		return fmt.Errorf("execution session store is not configured")
 	}
-	session, err := s.sessionStore.Load(id)
+	session, err := s.sessionStore.LoadState(id)
 	if err != nil {
 		return err
 	}
 	return s.validateSessionMessageInput(session, input)
 }
 
+// ValidateContinue checks the durable session state, not an in-memory stream.
+// This makes Continue work after a process restart and prevents a second run
+// from being created while the session still has an active run.
+func (s *Service) ValidateContinue(id string) error {
+	if s == nil || s.sessionStore == nil {
+		return fmt.Errorf("execution session store is not configured")
+	}
+	session, err := s.sessionStore.LoadState(id)
+	if err != nil {
+		return err
+	}
+	return s.validateSessionMessageInput(session, SessionMessageInput{Continue: true})
+}
+
 func (s *Service) validateSessionMessageInput(session sessions.SessionV2, input SessionMessageInput) error {
-	if input.Replay {
+	if input.Continue {
 		if strings.TrimSpace(input.Content) != "" || len(input.ContentBlocks) != 0 {
-			return fmt.Errorf("replay cannot include new message content")
+			return fmt.Errorf("continue cannot include new message content")
 		}
-		if strings.TrimSpace(input.ReplayItemID) != "" {
-			return fmt.Errorf("replay and replay_item_id are mutually exclusive")
+		if sessionHasActiveRun(session) {
+			return ErrSessionBusy
 		}
-		if len(session.ActiveHistory) == 0 {
-			return fmt.Errorf("replay requires existing active history")
+		if session.LastRunStatus != sessions.RunStatusFailed && session.LastRunStatus != sessions.RunStatusInterrupted {
+			return fmt.Errorf("continue requires an interrupted or failed run")
+		}
+		if session.InterruptedRunID == "" || session.InterruptedTurnID == "" {
+			return fmt.Errorf("continue requires an interrupted or failed run")
 		}
 		return nil
-	}
-	if strings.TrimSpace(input.ReplayItemID) != "" {
-		if strings.TrimSpace(input.Content) != "" || len(input.ContentBlocks) != 0 {
-			return fmt.Errorf("replay cannot include new message content")
-		}
-		if len(session.ActiveHistory) == 0 || session.ActiveHistory[len(session.ActiveHistory)-1] != input.ReplayItemID {
-			return fmt.Errorf("replay item must be the trailing active history item")
-		}
-		for _, item := range session.Items {
-			if item.ID != input.ReplayItemID {
-				continue
-			}
-			if item.Message == nil || item.Message.Role != model.MessageRoleUser {
-				return fmt.Errorf("replay item must be a user message")
-			}
-			return nil
-		}
-		return fmt.Errorf("replay item was not found")
 	}
 	if err := model.ValidateImageInputBlocks(input.ContentBlocks, false); err != nil {
 		return err
@@ -1784,13 +2013,13 @@ func (s *Service) runSessionMessage(ctx context.Context, id string, input Sessio
 	if s == nil || s.sessionStore == nil {
 		return SessionMessageResult{}, fmt.Errorf("execution session store is not configured")
 	}
-	if strings.TrimSpace(content) == "" && len(input.ContentBlocks) == 0 && strings.TrimSpace(input.ReplayItemID) == "" && !input.Replay {
+	if strings.TrimSpace(content) == "" && len(input.ContentBlocks) == 0 && !input.Continue {
 		return SessionMessageResult{}, fmt.Errorf("message content or image attachment is required")
 	}
 	if s.turnRunner == nil {
 		return SessionMessageResult{}, ErrTurnRunnerUnavailable
 	}
-	if _, err := s.sessionStore.Load(id); err != nil {
+	if _, err := s.sessionStore.LoadState(id); err != nil {
 		return SessionMessageResult{}, err
 	}
 
@@ -1811,7 +2040,7 @@ func (s *Service) runSessionMessage(ctx context.Context, id string, input Sessio
 		_ = writeLock.Release()
 	}()
 
-	session, err := s.sessionStore.Load(id)
+	session, err := s.sessionStore.LoadExecutionState(id)
 	if err != nil {
 		return SessionMessageResult{}, err
 	}
@@ -1822,6 +2051,26 @@ func (s *Service) runSessionMessage(ctx context.Context, id string, input Sessio
 	if err := s.validateSessionMessageInput(session, input); err != nil {
 		return SessionMessageResult{}, err
 	}
+	if run != nil && !run.persistentCreated {
+		previous := session.LatestRunID
+		if input.Continue {
+			previous = session.InterruptedRunID
+		}
+		payload, marshalErr := json.Marshal(input)
+		if marshalErr != nil {
+			return SessionMessageResult{}, marshalErr
+		}
+		if _, createErr := s.sessionStore.CreateRun(id, run.runID, previous, payload, time.Now().UTC()); createErr != nil {
+			return SessionMessageResult{}, createErr
+		}
+		run.persistentCreated = true
+		// CreateRun advances compact metadata; use it as the projector baseline.
+		session, err = s.sessionStore.LoadExecutionState(id)
+		if err != nil {
+			return SessionMessageResult{}, err
+		}
+		session.ConfigPath = s.ConfigPath()
+	}
 	if strings.TrimSpace(session.CWD) == "" {
 		session.CWD = session.CreatedCWD
 	}
@@ -1829,8 +2078,11 @@ func (s *Service) runSessionMessage(ctx context.Context, id string, input Sessio
 		return SessionMessageResult{}, err
 	}
 
-	turnID := nextSessionTurnID(session)
-	projector, err := sessionprojector.New(s.sessionStore, session)
+	turnID, err := s.nextSessionTurnID(id)
+	if err != nil {
+		return SessionMessageResult{}, err
+	}
+	projector, err := sessionprojector.NewRun(s.sessionStore, session, runIDForRequest(run))
 	if err != nil {
 		return SessionMessageResult{}, fmt.Errorf("could not start session projector")
 	}
@@ -1921,7 +2173,7 @@ func (s *Service) runSessionMessage(ctx context.Context, id string, input Sessio
 		markFailed(turnFailureCompaction)
 		return SessionMessageResult{}, err
 	}
-	if !input.Replay && input.ReplayItemID == "" {
+	if !input.Continue {
 		if err := bus.Publish(eventbus.TurnInputReady{TurnID: turnID, Message: input.Message()}); err != nil {
 			markFailed(turnFailureTurnInput)
 			return SessionMessageResult{}, fmt.Errorf("could not save turn input")
@@ -1936,7 +2188,8 @@ func (s *Service) runSessionMessage(ctx context.Context, id string, input Sessio
 		TurnID:            turnID,
 		Content:           content,
 		ContentBlocks:     copyInputContentBlocks(input.ContentBlocks),
-		ReplayHistory:     input.ReplayItemID != "" || input.Replay,
+		ResumeContext:     input.Continue,
+		RunID:             runIDForRequest(run),
 		ActivePromptDrain: activePromptDrain,
 		ToolCancel:        runToolCancel(run),
 		Emit: func(event model.Event) {
@@ -1944,7 +2197,32 @@ func (s *Service) runSessionMessage(ctx context.Context, id string, input Sessio
 				_ = bus.Publish(eventbus.ModelEvent{Event: event})
 			}
 		},
-		Publisher: bus,
+		Publisher: sessionTurnLifecyclePublisher{
+			bus: bus,
+			onStarted: func(next string) {
+				turnID = next
+				turnClosed = false
+				if run != nil {
+					run.setActiveTurn(next, emit)
+				}
+				submitSessionStreamEvent(submit, NewSessionStreamEvent("turn.started", map[string]any{
+					"turn_id": next,
+				}))
+			},
+			onCompleted: func(completed string) {
+				// An internal model/tool request may complete before the agent
+				// advances to its next request. Do not interrupt that already
+				// committed turn if the next start or provider request fails.
+				if completed == turnID {
+					turnClosed = true
+				}
+			},
+			onInterrupted: func(interrupted string) {
+				if interrupted == turnID {
+					turnClosed = true
+				}
+			},
+		},
 	})
 	if err != nil {
 		markFailed(turnFailureForRunnerError(err))
@@ -1960,7 +2238,7 @@ func (s *Service) runSessionMessage(ctx context.Context, id string, input Sessio
 	}
 	turnClosed = true
 
-	saved, err := s.sessionStore.Load(id)
+	saved, err := s.sessionStore.LoadState(id)
 	if err != nil {
 		// TurnCompleted already cleared the running turn durably, so only the
 		// terminal stream event bookkeeping is needed here: emit exactly one
@@ -1970,7 +2248,7 @@ func (s *Service) runSessionMessage(ctx context.Context, id string, input Sessio
 	}
 	committed = true
 	committedLastSeq = saved.LastSeq
-	return SessionMessageResult{Status: "committed", TurnID: turnID, LastSeq: saved.LastSeq}, nil
+	return SessionMessageResult{Status: "committed", RunID: runIDForRequest(run), TurnID: turnID, LastSeq: saved.LastSeq}, nil
 }
 
 func turnFailureForRunnerError(err error) turnFailure {
@@ -2070,7 +2348,7 @@ func (s *Service) requireIncrementalSessionTurn(ctx context.Context, session ses
 		RunCoordinator: s.sessionRunCoordinator(),
 		Content:        input.Content,
 		ContentBlocks:  copyInputContentBlocks(input.ContentBlocks),
-		ReplayHistory:  input.ReplayItemID != "",
+		ResumeContext:  input.Continue,
 	})
 	if err != nil {
 		return ErrTurnFailed
@@ -2094,7 +2372,7 @@ func (s *Service) planAutoCompaction(ctx context.Context, bus eventbus.Publisher
 		TurnID:         turnID,
 		Content:        input.Content,
 		ContentBlocks:  copyInputContentBlocks(input.ContentBlocks),
-		ReplayHistory:  input.ReplayItemID != "" || input.Replay,
+		ResumeContext:  input.Continue,
 		OnCompactionStarted: func(trigger string) {
 			submitSessionStreamEvent(submit, NewSessionStreamEvent("compaction.started", map[string]any{
 				"turn_id": turnID,
@@ -2129,7 +2407,7 @@ func (s *Service) planAutoCompaction(ctx context.Context, bus eventbus.Publisher
 		fields["context_window"] = result.Compaction.Context.ContextWindow
 	}
 	submitSessionStreamEvent(submit, NewSessionStreamEvent("compaction.completed", fields))
-	compacted, err := s.sessionStore.Load(session.ID)
+	compacted, err := s.sessionStore.LoadExecutionState(session.ID)
 	if err != nil {
 		return sessions.SessionV2{}, err
 	}
@@ -2160,24 +2438,24 @@ func (s *Service) loadActiveProject(id string) (projectstore.Project, error) {
 	return project, nil
 }
 
-func (s *Service) removeProjectSessions(projectID string) (int, error) {
+func (s *Service) removeProjectSessions(projectID string) ([]sessions.SessionV2, error) {
 	projectID = strings.TrimSpace(projectID)
 	if projectID == "" || s == nil || s.sessionStore == nil {
-		return 0, nil
+		return nil, nil
 	}
-	infos, err := s.sessionStore.ListWithOptions(sessions.V2ListOptions{All: true})
+	states, err := s.sessionStore.ListStates(sessions.V2ListOptions{All: true})
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
-	removed := 0
-	for _, info := range infos {
-		if info.ProjectID != projectID {
+	removed := make([]sessions.SessionV2, 0)
+	for _, state := range states {
+		if state.ProjectID != projectID {
 			continue
 		}
-		if err := s.sessionStore.Delete(info.ID); err != nil {
+		if err := s.sessionStore.Delete(state.ID); err != nil {
 			return removed, err
 		}
-		removed++
+		removed = append(removed, state)
 	}
 	return removed, nil
 }
@@ -2187,19 +2465,15 @@ func (s *Service) ensureProjectSessionsIdle(projectID string) error {
 	if projectID == "" || s == nil || s.sessionStore == nil {
 		return nil
 	}
-	infos, err := s.sessionStore.ListWithOptions(sessions.V2ListOptions{All: true})
+	states, err := s.sessionStore.ListStates(sessions.V2ListOptions{All: true})
 	if err != nil {
 		return err
 	}
-	for _, info := range infos {
-		if info.ProjectID != projectID {
+	for _, state := range states {
+		if state.ProjectID != projectID {
 			continue
 		}
-		session, err := s.sessionStore.Load(info.ID)
-		if err != nil {
-			return err
-		}
-		if strings.TrimSpace(session.RunningTurnID) != "" {
+		if sessionHasActiveRun(state) {
 			return ErrSessionBusy
 		}
 	}
@@ -2296,6 +2570,13 @@ func sessionMetadataFromStore(session sessions.SessionV2) SessionMetadata {
 		SpawnDepth:        session.SpawnDepth,
 		Archived:          session.Archived,
 		LastUsedAt:        session.LastUsedAt,
+		CurrentRunID:      session.CurrentRunID,
+		RunningRunID:      session.RunningRunID,
+		RunningTurnID:     session.RunningTurnID,
+		InterruptedRunID:  session.InterruptedRunID,
+		LatestRunID:       session.LatestRunID,
+		LastRunID:         session.LastRunID,
+		LastRunStatus:     session.LastRunStatus,
 		InterruptedAt:     session.InterruptedAt,
 		InterruptedTurnID: session.InterruptedTurnID,
 		Provider:          session.Provider,
@@ -2369,6 +2650,13 @@ func sessionDetailFromStore(session sessions.SessionV2) SessionDetail {
 		SpawnDepth:        session.SpawnDepth,
 		Archived:          session.Archived,
 		LastUsedAt:        session.LastUsedAt,
+		CurrentRunID:      session.CurrentRunID,
+		RunningRunID:      session.RunningRunID,
+		RunningTurnID:     session.RunningTurnID,
+		InterruptedRunID:  session.InterruptedRunID,
+		LatestRunID:       session.LatestRunID,
+		LastRunID:         session.LastRunID,
+		LastRunStatus:     session.LastRunStatus,
 		InterruptedAt:     session.InterruptedAt,
 		InterruptedTurnID: session.InterruptedTurnID,
 		Provider:          session.Provider,
@@ -2395,8 +2683,14 @@ func sessionDetailFromStore(session sessions.SessionV2) SessionDetail {
 }
 
 func sessionStatus(session sessions.SessionV2) string {
-	if strings.TrimSpace(session.RunningTurnID) != "" {
+	if sessionHasActiveRun(session) {
 		return "running"
+	}
+	if session.LastRunStatus == sessions.RunStatusFailed {
+		return "failed"
+	}
+	if session.LastRunStatus == sessions.RunStatusInterrupted {
+		return "interrupted"
 	}
 	if !session.InterruptedAt.IsZero() && (session.LastUsedAt.IsZero() || !session.LastUsedAt.After(session.InterruptedAt)) {
 		return "interrupted"
@@ -2404,8 +2698,16 @@ func sessionStatus(session sessions.SessionV2) string {
 	return "idle"
 }
 
-func nextSessionTurnID(session sessions.SessionV2) string {
-	return fmt.Sprintf("turn-%06d", session.LastSeq+1)
+func sessionHasActiveRun(session sessions.SessionV2) bool {
+	return strings.TrimSpace(session.RunningRunID) != "" || strings.TrimSpace(session.RunningTurnID) != ""
+}
+
+func (s *Service) nextSessionTurnID(sessionID string) (string, error) {
+	turns, err := s.sessionStore.ListTurns(sessionID, "")
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("turn-%06d", len(turns)+1), nil
 }
 
 func nextSessionCompactID(session sessions.SessionV2) string {

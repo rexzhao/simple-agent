@@ -25,23 +25,23 @@ func TestV2StorePersistsImmutableSessionLineage(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SaveMetadata(child) error = %v", err)
 	}
-	loaded, err := store.Load(child.ID)
+	loaded, err := store.LoadExecutionState(child.ID)
 	if err != nil {
 		t.Fatalf("Load(child) error = %v", err)
 	}
 	if loaded.CreatedBy != SessionCreatedByAgent || loaded.ParentSessionID != root.ID || loaded.RootSessionID != root.ID || loaded.SpawnDepth != 1 {
 		t.Fatalf("loaded child lineage = %#v, want agent child of root", loaded)
 	}
-	infos, err := store.ListWithOptions(V2ListOptions{All: true})
+	states, err := store.ListStates(V2ListOptions{All: true})
 	if err != nil {
-		t.Fatalf("ListWithOptions() error = %v", err)
+		t.Fatalf("ListStates() error = %v", err)
 	}
 	var found bool
-	for _, info := range infos {
-		if info.ID == child.ID {
+	for _, state := range states {
+		if state.ID == child.ID {
 			found = true
-			if info.CreatedBy != SessionCreatedByAgent || info.ParentSessionID != root.ID || info.RootSessionID != root.ID || info.SpawnDepth != 1 {
-				t.Fatalf("child info lineage = %#v", info)
+			if state.CreatedBy != SessionCreatedByAgent || state.ParentSessionID != root.ID || state.RootSessionID != root.ID || state.SpawnDepth != 1 {
+				t.Fatalf("child state lineage = %#v", state)
 			}
 		}
 	}

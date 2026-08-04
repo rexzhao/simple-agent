@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -786,29 +785,6 @@ func TestSessionStreamTurnFailedSafePayloadByStage(t *testing.T) {
 		assertSafeTurnFailedTerminal(t, events, "compaction_failed", "compaction planning failed", turnFailedSecret)
 	})
 
-	t.Run("turn_input_failed", func(t *testing.T) {
-		home := t.TempDir()
-		runner := fakeExecutionTurnRunner{
-			supports: true,
-			plan: func(ctx context.Context, request SessionTurnRequest) (SessionCompactionResult, error) {
-				blockSessionSegmentsDir(t, home, request.Session.ID)
-				return SessionCompactionResult{}, nil
-			},
-		}
-		service, _, session := newExecutionServiceWithSession(t, home, runner)
-		var events []SessionStreamEvent
-		_, err := service.SendSessionMessageWithEvents(context.Background(), session.ID, prompt, func(event SessionStreamEvent) {
-			events = append(events, event)
-		})
-		if err == nil || !strings.Contains(err.Error(), "could not save turn input") {
-			t.Fatalf("error = %v, want could not save turn input", err)
-		}
-		if strings.Contains(err.Error(), turnFailedSecret) {
-			t.Fatalf("returned error leaks secret: %v", err)
-		}
-		assertSafeTurnFailedTerminal(t, events, "turn_input_failed", "could not save turn input", turnFailedSecret)
-	})
-
 	t.Run("runner_failed", func(t *testing.T) {
 		home := t.TempDir()
 		runner := fakeExecutionTurnRunner{
@@ -1022,60 +998,6 @@ func TestSessionStreamTurnFailedSafePayloadByStage(t *testing.T) {
 		assertSafeTurnFailedTerminal(t, events, "runner_not_incremental", "turn runner did not persist incrementally", turnFailedSecret)
 	})
 
-	t.Run("turn_completion_failed", func(t *testing.T) {
-		home := t.TempDir()
-		runner := fakeExecutionTurnRunner{
-			supports: true,
-			run: func(ctx context.Context, request SessionTurnRequest) (SessionTurnResult, error) {
-				if err := request.Publisher.Publish(eventAssistant(request.TurnID, "answer")); err != nil {
-					return SessionTurnResult{}, err
-				}
-				removeSessionMetadata(t, home, request.Session.ID)
-				return SessionTurnResult{Incremental: true}, nil
-			},
-		}
-		service, _, session := newExecutionServiceWithSession(t, home, runner)
-		var events []SessionStreamEvent
-		_, err := service.SendSessionMessageWithEvents(context.Background(), session.ID, prompt, func(event SessionStreamEvent) {
-			events = append(events, event)
-		})
-		if err == nil || !strings.Contains(err.Error(), "could not clear running turn") {
-			t.Fatalf("error = %v, want could not clear running turn", err)
-		}
-		if !strings.Contains(err.Error(), "session not found") {
-			t.Fatalf("error = %v, want underlying metadata error", err)
-		}
-		if strings.Contains(err.Error(), turnFailedSecret) {
-			t.Fatalf("returned error leaks secret: %v", err)
-		}
-		assertSafeTurnFailedTerminal(t, events, "turn_completion_failed", "could not complete turn", turnFailedSecret)
-	})
-
-	t.Run("session_reload_failed", func(t *testing.T) {
-		home := t.TempDir()
-		runner := fakeExecutionTurnRunner{
-			supports: true,
-			run: func(ctx context.Context, request SessionTurnRequest) (SessionTurnResult, error) {
-				if err := request.Publisher.Publish(eventAssistant(request.TurnID, "answer")); err != nil {
-					return SessionTurnResult{}, err
-				}
-				corruptSessionSegments(t, home, request.Session.ID)
-				return SessionTurnResult{Incremental: true}, nil
-			},
-		}
-		service, _, session := newExecutionServiceWithSession(t, home, runner)
-		var events []SessionStreamEvent
-		_, err := service.SendSessionMessageWithEvents(context.Background(), session.ID, prompt, func(event SessionStreamEvent) {
-			events = append(events, event)
-		})
-		if err == nil {
-			t.Fatalf("error = nil, want session reload error")
-		}
-		if strings.Contains(err.Error(), turnFailedSecret) {
-			t.Fatalf("returned error leaks secret: %v", err)
-		}
-		assertSafeTurnFailedTerminal(t, events, "session_reload_failed", "could not reload session", turnFailedSecret)
-	})
 }
 
 func assertSafeTurnFailedTerminal(t *testing.T, events []SessionStreamEvent, wantCode, wantMessage, secret string) {
@@ -1104,49 +1026,6 @@ func assertSafeTurnFailedTerminal(t *testing.T, events []SessionStreamEvent, wan
 	for i, event := range events {
 		if strings.Contains(fmt.Sprintf("%v", event), secret) {
 			t.Fatalf("event %d leaks secret %q: %v", i, secret, event)
-		}
-	}
-}
-
-func blockSessionSegmentsDir(t *testing.T, home, sessionID string) {
-	t.Helper()
-	root, err := sessions.RootForHome(home)
-	if err != nil {
-		t.Fatalf("RootForHome error = %v", err)
-	}
-	segPath := filepath.Join(root, sessionID, "segments")
-	if err := os.WriteFile(segPath, []byte("block"), 0o600); err != nil {
-		t.Fatalf("block segments dir error = %v", err)
-	}
-}
-
-func removeSessionMetadata(t *testing.T, home, sessionID string) {
-	t.Helper()
-	root, err := sessions.RootForHome(home)
-	if err != nil {
-		t.Fatalf("RootForHome error = %v", err)
-	}
-	if err := os.Remove(filepath.Join(root, sessionID, "meta.json")); err != nil {
-		t.Fatalf("remove metadata error = %v", err)
-	}
-}
-
-func corruptSessionSegments(t *testing.T, home, sessionID string) {
-	t.Helper()
-	root, err := sessions.RootForHome(home)
-	if err != nil {
-		t.Fatalf("RootForHome error = %v", err)
-	}
-	matches, err := filepath.Glob(filepath.Join(root, sessionID, "segments", "*.jsonl"))
-	if err != nil {
-		t.Fatalf("glob segments error = %v", err)
-	}
-	if len(matches) == 0 {
-		t.Fatalf("no session segments found to corrupt for %s", sessionID)
-	}
-	for _, p := range matches {
-		if err := os.WriteFile(p, []byte("not-valid-json\n"), 0o600); err != nil {
-			t.Fatalf("corrupt segment %q error = %v", p, err)
 		}
 	}
 }

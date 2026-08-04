@@ -26,10 +26,22 @@ type Projector struct {
 	wg       sync.WaitGroup
 
 	session        sessions.SessionV2
+	runID          string
 	turnID         string
 	finished       bool
 	toolItems      map[string]string
 	pendingItemIDs map[string]struct{}
+}
+
+// RunProjector routes durable events for a multi-request Run to one projector
+// per model request. A model/tool iteration therefore gets its own Turn row,
+// while the item projection and active history remain unchanged.
+type RunProjector struct {
+	store    projectorStore
+	runID    string
+	mu       sync.Mutex
+	current  sessions.SessionV2
+	byTurnID map[string]*Projector
 }
 
 type projectorStore interface {
@@ -40,6 +52,106 @@ type projectorStore interface {
 	ClearRunningTurn(sessionID, turnID string) (sessions.SessionV2, error)
 	ClearInterruptedTurn(sessionID string) (sessions.SessionV2, error)
 	MarkTurnInterrupted(sessionID, turnID string) (sessions.SessionV2, error)
+}
+
+type runProjectorStore interface {
+	MarkTurnRunningForRun(sessionID, runID, turnID string) (sessions.SessionV2, error)
+	CompleteTurnForRun(sessionID, runID, turnID string) (sessions.SessionV2, error)
+	InterruptTurnForRun(sessionID, runID, turnID string) (sessions.SessionV2, error)
+}
+
+func NewRun(store projectorStore, session sessions.SessionV2, runID string) (*RunProjector, error) {
+	if store == nil || strings.TrimSpace(session.ID) == "" || strings.TrimSpace(runID) == "" {
+		return nil, fmt.Errorf("session store, session id, and run id are required")
+	}
+	return &RunProjector{store: store, runID: strings.TrimSpace(runID), current: session, byTurnID: make(map[string]*Projector)}, nil
+}
+
+func (p *RunProjector) HandleWithCheckpoint(event eventbus.Event) (int64, error) {
+	if p == nil || event == nil {
+		return 0, fmt.Errorf("run projector and event are required")
+	}
+	turnID := eventTurnID(event)
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	projector := p.byTurnID[turnID]
+	if started, ok := event.(eventbus.TurnStarted); ok {
+		if strings.TrimSpace(started.TurnID) == "" {
+			return 0, fmt.Errorf("turn id is required")
+		}
+		if projector != nil {
+			return 0, fmt.Errorf("turn %q already started", started.TurnID)
+		}
+		loader, ok := p.store.(interface {
+			LoadExecutionState(string) (sessions.SessionV2, error)
+		})
+		if !ok {
+			return 0, fmt.Errorf("session store cannot load run projector state")
+		}
+		state, err := loader.LoadExecutionState(p.current.ID)
+		if err != nil {
+			return 0, err
+		}
+		projector, err = NewForRun(p.store, state, p.runID)
+		if err != nil {
+			return 0, err
+		}
+		p.byTurnID[started.TurnID] = projector
+	}
+	if projector == nil {
+		return 0, fmt.Errorf("turn %q has not started", turnID)
+	}
+	seq, err := projector.HandleWithCheckpoint(event)
+	if err != nil {
+		return 0, err
+	}
+	if _, ok := event.(eventbus.TurnCompleted); ok {
+		_ = projector.Close()
+		delete(p.byTurnID, turnID)
+	}
+	if _, ok := event.(eventbus.TurnInterrupted); ok {
+		_ = projector.Close()
+		delete(p.byTurnID, turnID)
+	}
+	return seq, nil
+}
+
+func (p *RunProjector) CheckpointHandler() eventbus.DurableCheckpointHandler {
+	return p.HandleWithCheckpoint
+}
+
+func (p *RunProjector) Close() error {
+	if p == nil {
+		return nil
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for id, projector := range p.byTurnID {
+		_ = projector.Close()
+		delete(p.byTurnID, id)
+	}
+	return nil
+}
+
+func eventTurnID(event eventbus.Event) string {
+	switch e := event.(type) {
+	case eventbus.TurnStarted:
+		return e.TurnID
+	case eventbus.CompactionRequested:
+		return e.TurnID
+	case eventbus.TurnInputReady:
+		return e.TurnID
+	case eventbus.AssistantReady:
+		return e.TurnID
+	case eventbus.ToolResultReady:
+		return e.TurnID
+	case eventbus.TurnCompleted:
+		return e.TurnID
+	case eventbus.TurnInterrupted:
+		return e.TurnID
+	default:
+		return ""
+	}
 }
 
 type projectorRequest struct {
@@ -53,6 +165,16 @@ type projectorResult struct {
 }
 
 func New(store projectorStore, session sessions.SessionV2) (*Projector, error) {
+	return newProjector(store, session, "")
+}
+
+// NewForRun binds the projector's turn lifecycle to an explicit durable Run.
+// New remains available for compaction and older low-level callers.
+func NewForRun(store projectorStore, session sessions.SessionV2, runID string) (*Projector, error) {
+	return newProjector(store, session, strings.TrimSpace(runID))
+}
+
+func newProjector(store projectorStore, session sessions.SessionV2, runID string) (*Projector, error) {
 	if store == nil {
 		return nil, fmt.Errorf("session store is required")
 	}
@@ -64,6 +186,7 @@ func New(store projectorStore, session sessions.SessionV2) (*Projector, error) {
 		done:           make(chan struct{}),
 		requests:       make(chan projectorRequest),
 		session:        session,
+		runID:          runID,
 		toolItems:      make(map[string]string),
 		pendingItemIDs: make(map[string]struct{}),
 	}
@@ -175,7 +298,16 @@ func (p *Projector) handleTurnStarted(event eventbus.TurnStarted) error {
 	if p.turnID != "" {
 		return fmt.Errorf("turn %q already started", p.turnID)
 	}
-	metadata, err := p.store.MarkTurnRunning(p.session.ID, turnID)
+	var metadata sessions.SessionV2
+	if p.runID != "" {
+		runStore, ok := p.store.(runProjectorStore)
+		if !ok {
+			return fmt.Errorf("session store does not support run turns")
+		}
+		metadata, err = runStore.MarkTurnRunningForRun(p.session.ID, p.runID, turnID)
+	} else {
+		metadata, err = p.store.MarkTurnRunning(p.session.ID, turnID)
+	}
 	if err != nil {
 		return err
 	}
@@ -227,8 +359,8 @@ func (p *Projector) handleTurnInputReady(event eventbus.TurnInputReady) error {
 	if err != nil {
 		return err
 	}
-	if event.Message.Role != model.MessageRoleUser {
-		return fmt.Errorf("turn input message role must be %q", model.MessageRoleUser)
+	if event.Message.Role != model.MessageRoleUser && event.Message.Role != model.MessageRoleDeveloper {
+		return fmt.Errorf("turn input message role must be %q or %q", model.MessageRoleUser, model.MessageRoleDeveloper)
 	}
 	existing := sessions.SessionItemIDs(p.session.Items)
 	items := make([]sessions.SessionItem, 0, len(p.session.InstructionsSnapshot)+1)
@@ -368,13 +500,19 @@ func (p *Projector) handleTurnCompleted(event eventbus.TurnCompleted) error {
 	if len(p.pendingItemIDs) > 0 {
 		return fmt.Errorf("turn %q has pending tool items", turnID)
 	}
-	metadata, err := p.store.ClearRunningTurn(p.session.ID, turnID)
-	if err != nil {
-		return err
+	var metadata sessions.SessionV2
+	if p.runID != "" {
+		runStore, ok := p.store.(runProjectorStore)
+		if !ok {
+			return fmt.Errorf("session store does not support run turns")
+		}
+		metadata, err = runStore.CompleteTurnForRun(p.session.ID, p.runID, turnID)
+	} else {
+		metadata, err = p.store.ClearRunningTurn(p.session.ID, turnID)
+		if err == nil {
+			metadata, err = p.store.ClearInterruptedTurn(p.session.ID)
+		}
 	}
-	// A successful completion clears any prior interrupted-turn marker so
-	// that a retried session does not retain the interrupted status.
-	metadata, err = p.store.ClearInterruptedTurn(p.session.ID)
 	if err != nil {
 		return err
 	}
@@ -410,7 +548,16 @@ func (p *Projector) handleTurnInterrupted(event eventbus.TurnInterrupted) error 
 		p.session = next
 		delete(p.pendingItemIDs, itemID)
 	}
-	metadata, err := p.store.MarkTurnInterrupted(p.session.ID, turnID)
+	var metadata sessions.SessionV2
+	if p.runID != "" {
+		runStore, ok := p.store.(runProjectorStore)
+		if !ok {
+			return fmt.Errorf("session store does not support run turns")
+		}
+		metadata, err = runStore.InterruptTurnForRun(p.session.ID, p.runID, turnID)
+	} else {
+		metadata, err = p.store.MarkTurnInterrupted(p.session.ID, turnID)
+	}
 	if err != nil {
 		return err
 	}
@@ -450,7 +597,6 @@ func mergeSessionMetadata(state, metadata sessions.SessionV2) sessions.SessionV2
 	metadata.Items = state.Items
 	metadata.ActiveHistory = state.ActiveHistory
 	metadata.Compactions = state.Compactions
-	metadata.LastSeq = state.LastSeq
 	return metadata
 }
 

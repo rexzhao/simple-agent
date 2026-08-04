@@ -89,7 +89,7 @@ export const WorkspaceTree = memo(function WorkspaceTree(props: {
             </span>
             {session.full_access && <span className="full-access-badge" title="Full access: file tools may read and write outside the workspace">FA</span>}
             {!archived && running && <span className="status-dot running" title="Session running" aria-label="Session running" />}
-            {!archived && !running && session.status === 'interrupted' && <span className="status-dot interrupted" title="Session interrupted" aria-label="Session interrupted" />}
+            {!archived && !running && (session.status === 'interrupted' || session.status === 'failed') && <span className="status-dot interrupted" title="Session interrupted" aria-label="Session interrupted" />}
           </button>
           <div className="session-tree-actions">
             {archived ? (

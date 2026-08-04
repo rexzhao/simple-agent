@@ -382,7 +382,7 @@ func TestAutoCompactAfterToolBatchPersistsMidTurnCheckpoint(t *testing.T) {
 	if len(replacement) != 1 || replacement[0].Role != model.MessageRoleProvider {
 		t.Fatalf("replacement = %#v, want one provider compaction message", replacement)
 	}
-	loaded, err := store.Load(session.ID)
+	loaded, err := store.LoadExecutionState(session.ID)
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
 	}
@@ -404,7 +404,7 @@ func (p *compactionApplyingPublisher) Publish(event eventbus.Event) error {
 	if !ok {
 		return nil
 	}
-	session, err := p.store.Load(p.sessionID)
+	session, err := p.store.LoadExecutionState(p.sessionID)
 	if err != nil {
 		return err
 	}

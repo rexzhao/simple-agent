@@ -70,12 +70,26 @@ func (r AgentTurnRunner) RunSessionTurn(ctx context.Context, request SessionTurn
 
 	_, runErr := runtime.runSessionTurn(ctx, request.Content, sessionTurnRunOptions{
 		contentBlocks:     copyInputContentBlocks(request.ContentBlocks),
-		replayHistory:     request.ReplayHistory,
+		resumeContext:     request.ResumeContext,
 		emit:              request.Emit,
 		publisher:         request.Publisher,
 		turnID:            request.TurnID,
 		activePromptDrain: request.ActivePromptDrain,
 		toolCancel:        request.ToolCancel,
+		nextTurnID: func(iteration int) string {
+			if request.SessionStore == nil || strings.TrimSpace(request.RunID) == "" {
+				return fmt.Sprintf("turn-%06d", iteration)
+			}
+			// Turn ids are session-scoped (the SQLite primary key is global
+			// within the session), while ordinals are run-scoped. Counting only
+			// this run would reuse turn-000001 on every subsequent run.
+			turns, err := request.SessionStore.ListTurns(request.Session.ID, "")
+			if err != nil {
+				return ""
+			}
+			return fmt.Sprintf("turn-%06d", len(turns)+1)
+		},
+		turnIDChanged: request.TurnIDChanged,
 	})
 	metadataErr := runtime.saveRuntimeMetadataForSession(request.Session.ID)
 	if runErr != nil {
@@ -120,7 +134,7 @@ func (r AgentTurnRunner) PlanSessionTurnCompaction(ctx context.Context, request 
 		pendingInput = ""
 	}
 	pendingMessage := model.Message{}
-	if !request.ReplayHistory {
+	if !request.ResumeContext {
 		pendingMessage = model.Message{
 			Role:          model.MessageRoleUser,
 			Content:       pendingInput,
@@ -401,7 +415,7 @@ func (r *agentRunnerRuntime) saveRuntimeMetadataForSession(sessionID string) err
 	if r == nil || r.sessionStore == nil || strings.TrimSpace(sessionID) == "" {
 		return nil
 	}
-	loaded, err := r.sessionStore.Load(sessionID)
+	loaded, err := r.sessionStore.LoadState(sessionID)
 	if err != nil {
 		return err
 	}
@@ -441,12 +455,14 @@ func (r *agentRunnerRuntime) refreshSessionRuntimeMetadata(session sessions.Sess
 
 type sessionTurnRunOptions struct {
 	contentBlocks     []model.InputContentBlock
-	replayHistory     bool
+	resumeContext     bool
 	emit              func(model.Event)
 	publisher         eventbus.Publisher
 	turnID            string
 	activePromptDrain SessionActivePromptDrain
 	toolCancel        *agent.ToolCancellationRegistry
+	nextTurnID        func(iteration int) string
+	turnIDChanged     func(string)
 }
 
 // adaptActivePromptDrain adapts an execution-domain active prompt drain into
@@ -488,7 +504,7 @@ func (r *agentRunnerRuntime) runSessionTurn(ctx context.Context, prompt string, 
 		return nil, err
 	}
 	requestMessages := copyMessageSlice(messages)
-	if !options.replayHistory {
+	if !options.resumeContext {
 		requestMessages = append(requestMessages, SessionMessageInput{
 			Content:       prompt,
 			ContentBlocks: copyInputContentBlocks(options.contentBlocks),
@@ -502,15 +518,23 @@ func (r *agentRunnerRuntime) runSessionTurn(ctx context.Context, prompt string, 
 		SessionID:     r.session.ID,
 		DeveloperRole: r.developerRole,
 	}
+	activeTurnID := options.turnID
 	events, results, err := agent.StreamWithResult(turnCtx, request, agent.Options{
-		Provider:          r.provider,
-		ToolExecutor:      r.toolExecutor,
-		MaxTurns:          r.maxTurns,
-		TurnID:            options.turnID,
-		Publisher:         options.publisher,
+		Provider:     r.provider,
+		ToolExecutor: r.toolExecutor,
+		MaxTurns:     r.maxTurns,
+		TurnID:       activeTurnID,
+		Publisher:    options.publisher,
+		NextTurnID:   options.nextTurnID,
+		TurnIDChanged: func(turnID string) {
+			activeTurnID = turnID
+			if options.turnIDChanged != nil {
+				options.turnIDChanged(turnID)
+			}
+		},
 		ActivePromptDrain: adaptActivePromptDrain(options.activePromptDrain),
 		AutoCompact: func(ctx context.Context, messages []model.Message) ([]model.Message, error) {
-			return r.autoCompactAfterToolBatch(ctx, messages, options.publisher, options.turnID)
+			return r.autoCompactAfterToolBatch(ctx, messages, options.publisher, activeTurnID)
 		},
 		ToolCancel: options.toolCancel,
 	})
@@ -615,7 +639,7 @@ func (r *agentRunnerRuntime) autoCompactAfterToolBatch(ctx context.Context, mess
 		return messages, nil
 	}
 
-	latest, err := r.sessionStore.Load(r.session.ID)
+	latest, err := r.sessionStore.LoadExecutionState(r.session.ID)
 	if err != nil {
 		return nil, fmt.Errorf("load session before mid-turn auto compact: %w", err)
 	}
@@ -643,7 +667,7 @@ func (r *agentRunnerRuntime) autoCompactAfterToolBatch(ctx context.Context, mess
 	}); err != nil {
 		return nil, fmt.Errorf("publish mid-turn compaction: %w", err)
 	}
-	compacted, err := r.sessionStore.Load(r.session.ID)
+	compacted, err := r.sessionStore.LoadExecutionState(r.session.ID)
 	if err != nil {
 		return nil, fmt.Errorf("load session after mid-turn auto compact: %w", err)
 	}

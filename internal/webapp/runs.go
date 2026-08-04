@@ -173,7 +173,7 @@ func (r *runRegistry) startWithInput(sessionID string, input execution.SessionMe
 	if sessionID == "" {
 		return nil, fmt.Errorf("session id is required")
 	}
-	if strings.TrimSpace(input.Content) == "" && len(input.ContentBlocks) == 0 && strings.TrimSpace(input.ReplayItemID) == "" && !input.Replay {
+	if strings.TrimSpace(input.Content) == "" && len(input.ContentBlocks) == 0 && !input.Continue {
 		return nil, fmt.Errorf("message content or image attachment is required")
 	}
 	r.mu.Lock()
@@ -193,6 +193,10 @@ func (r *runRegistry) startWithInput(sessionID string, input execution.SessionMe
 		return nil, ErrRunRegistryClosed
 	}
 	return managed, nil
+}
+
+func (r *runRegistry) startContinue(sessionID string) (*managedRun, error) {
+	return r.startWithInput(sessionID, execution.SessionMessageInput{Continue: true})
 }
 
 // observeRunEvent is installed on the shared execution coordinator, so runs
@@ -516,10 +520,9 @@ func encodeRunEvent(event execution.SessionStreamEvent) []byte {
 }
 
 type startRunRequest struct {
-	Content      string                    `json:"content"`
-	Images       []startRunImageAttachment `json:"images,omitempty"`
-	ReplayItemID string                    `json:"replay_item_id,omitempty"`
-	Replay       bool                      `json:"replay,omitempty"`
+	Content  string                    `json:"content"`
+	Images   []startRunImageAttachment `json:"images,omitempty"`
+	Continue bool                      `json:"continue,omitempty"`
 }
 
 type startRunImageAttachment struct {
@@ -528,17 +531,11 @@ type startRunImageAttachment struct {
 }
 
 func (request startRunRequest) messageInput() (execution.SessionMessageInput, error) {
-	if request.Replay {
-		if strings.TrimSpace(request.Content) != "" || len(request.Images) != 0 || strings.TrimSpace(request.ReplayItemID) != "" {
-			return execution.SessionMessageInput{}, fmt.Errorf("replay cannot include new message content")
-		}
-		return execution.SessionMessageInput{Replay: true}, nil
-	}
-	if strings.TrimSpace(request.ReplayItemID) != "" {
+	if request.Continue {
 		if strings.TrimSpace(request.Content) != "" || len(request.Images) != 0 {
-			return execution.SessionMessageInput{}, fmt.Errorf("replay cannot include new message content")
+			return execution.SessionMessageInput{}, fmt.Errorf("continue cannot include new message content; use POST /continue without content")
 		}
-		return execution.SessionMessageInput{ReplayItemID: request.ReplayItemID}, nil
+		return execution.SessionMessageInput{Continue: true}, nil
 	}
 	if len(request.Images) > maxRunImageAttachments {
 		return execution.SessionMessageInput{}, fmt.Errorf("at most %d images may be attached", maxRunImageAttachments)
@@ -613,6 +610,34 @@ func (s *Server) handleStartRun(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (s *Server) handleContinueRun(w http.ResponseWriter, r *http.Request) {
+	var body startRunRequest
+	if !decodeOptionalJSON(w, r, &body) {
+		return
+	}
+	if strings.TrimSpace(body.Content) != "" || len(body.Images) != 0 || body.Continue {
+		writeAPIError(w, http.StatusBadRequest, "invalid_continue", "Continue accepts no new content; send an empty POST body")
+		return
+	}
+	sessionID := r.PathValue("sessionID")
+	if err := s.service.ValidateContinue(sessionID); err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	managed, err := s.runs.startContinue(sessionID)
+	if err != nil {
+		if errors.Is(err, ErrRunRegistryCapacity) {
+			writeAPIError(w, http.StatusTooManyRequests, "run_capacity", "too many runs are currently active")
+			return
+		}
+		writeServiceError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusAccepted, map[string]string{
+		"run_id": managed.id, "session_id": managed.sessionID, "status": string(execution.SessionRunRunning),
+	})
+}
+
 func (s *Server) handleListActiveRuns(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"runs": s.runs.activeRuns()})
 }
@@ -645,9 +670,9 @@ func (s *Server) handleCancelToolCall(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusAccepted, map[string]string{
-		"run_id":        managed.id,
-		"tool_call_id":  toolCallID,
-		"status":        "cancelled",
+		"run_id":       managed.id,
+		"tool_call_id": toolCallID,
+		"status":       "cancelled",
 	})
 }
 

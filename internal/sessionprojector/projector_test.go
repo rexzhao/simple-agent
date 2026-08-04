@@ -19,7 +19,7 @@ func TestProjectorWritesTurnEventsSynchronously(t *testing.T) {
 	store, projector, bus := newProjectorFixture(t, "session-1")
 
 	publish(t, bus, eventbus.TurnStarted{TurnID: "turn-1"})
-	loaded, err := store.Load("session-1")
+	loaded, err := store.LoadExecutionState("session-1")
 	if err != nil {
 		t.Fatalf("Load() after TurnStarted error = %v", err)
 	}
@@ -31,12 +31,12 @@ func TestProjectorWritesTurnEventsSynchronously(t *testing.T) {
 		TurnID:  "turn-1",
 		Message: model.Message{Role: model.MessageRoleUser, Content: "use tools"},
 	})
-	replayed, err := store.Replay("session-1")
+	replayed, err := store.LoadExecutionState("session-1")
 	if err != nil {
 		t.Fatalf("Replay() after TurnInputReady error = %v", err)
 	}
-	if replayed.LastSeq != 4 || !reflect.DeepEqual(replayed.ActiveHistory, []string{"msg-000001"}) {
-		t.Fatalf("state after input = last %d active %#v, want last 4 active user", replayed.LastSeq, replayed.ActiveHistory)
+	if replayed.LastSeq != 5 || !reflect.DeepEqual(replayed.ActiveHistory, []string{"msg-000001"}) {
+		t.Fatalf("state after input = last %d active %#v, want last 5 active user", replayed.LastSeq, replayed.ActiveHistory)
 	}
 
 	publish(t, bus, eventbus.AssistantReady{
@@ -62,15 +62,15 @@ func TestProjectorWritesTurnEventsSynchronously(t *testing.T) {
 	})
 	publish(t, bus, eventbus.TurnCompleted{TurnID: "turn-1"})
 
-	loaded, err = store.Load("session-1")
+	loaded, err = store.LoadExecutionState("session-1")
 	if err != nil {
 		t.Fatalf("Load() final error = %v", err)
 	}
 	if loaded.RunningTurnID != "" {
 		t.Fatalf("RunningTurnID = %q, want cleared", loaded.RunningTurnID)
 	}
-	if loaded.LastSeq != 12 {
-		t.Fatalf("LastSeq = %d, want 12", loaded.LastSeq)
+	if loaded.LastSeq != 14 {
+		t.Fatalf("LastSeq = %d, want 14", loaded.LastSeq)
 	}
 	wantActive := []string{"msg-000001", "msg-000002", "msg-000003", "msg-000004"}
 	if !reflect.DeepEqual(loaded.ActiveHistory, wantActive) {
@@ -114,14 +114,14 @@ func TestProjectorMaintainsToolMapAcrossRounds(t *testing.T) {
 	})
 	publish(t, bus, eventbus.ToolResultReady{TurnID: "turn-1", Result: model.ToolResult{ToolCallID: "call-1", Content: "one"}})
 
-	before, err := store.Replay("session-1")
+	before, err := store.LoadExecutionState("session-1")
 	if err != nil {
 		t.Fatalf("Replay() before duplicate error = %v", err)
 	}
 	if err := bus.Publish(eventbus.ToolResultReady{TurnID: "turn-1", Result: model.ToolResult{ToolCallID: "call-1", Content: "duplicate"}}); err == nil {
 		t.Fatal("duplicate ToolResultReady error = nil, want error")
 	}
-	after, err := store.Replay("session-1")
+	after, err := store.LoadExecutionState("session-1")
 	if err != nil {
 		t.Fatalf("Replay() after duplicate error = %v", err)
 	}
@@ -140,7 +140,7 @@ func TestProjectorMaintainsToolMapAcrossRounds(t *testing.T) {
 	publish(t, bus, eventbus.ToolResultReady{TurnID: "turn-1", Result: model.ToolResult{ToolCallID: "call-2", Content: "two"}})
 	publish(t, bus, eventbus.TurnCompleted{TurnID: "turn-1"})
 
-	loaded, err := store.Load("session-1")
+	loaded, err := store.LoadExecutionState("session-1")
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
 	}
@@ -181,7 +181,7 @@ func TestProjectorBootstrapsRuntimeContextOnFirstInput(t *testing.T) {
 	publish(t, bus, eventbus.TurnStarted{TurnID: "turn-1"})
 	publish(t, bus, eventbus.TurnInputReady{TurnID: "turn-1", Message: model.Message{Role: model.MessageRoleUser, Content: "hello"}})
 
-	loaded, err := store.Load("session-1")
+	loaded, err := store.LoadExecutionState("session-1")
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
 	}
@@ -227,7 +227,7 @@ func TestProjectorDoesNotDuplicateRuntimeContextWhenActiveHistoryExists(t *testi
 	}, []string{"runtime-000001"}); err != nil {
 		t.Fatalf("AppendItemsAndReplaceActiveHistory(seed) error = %v", err)
 	}
-	loaded, err := store.Load("session-1")
+	loaded, err := store.LoadExecutionState("session-1")
 	if err != nil {
 		t.Fatalf("Load(seed) error = %v", err)
 	}
@@ -242,7 +242,7 @@ func TestProjectorDoesNotDuplicateRuntimeContextWhenActiveHistoryExists(t *testi
 	publish(t, bus, eventbus.TurnStarted{TurnID: "turn-1"})
 	publish(t, bus, eventbus.TurnInputReady{TurnID: "turn-1", Message: model.Message{Role: model.MessageRoleUser, Content: "hello"}})
 
-	replayed, err := store.Replay("session-1")
+	replayed, err := store.LoadExecutionState("session-1")
 	if err != nil {
 		t.Fatalf("Replay() error = %v", err)
 	}
@@ -278,7 +278,7 @@ func TestProjectorRefreshesCachedStateAfterCompaction(t *testing.T) {
 	}, []string{"old-user", "old-assistant"}); err != nil {
 		t.Fatalf("AppendItemsAndReplaceActiveHistory(seed) error = %v", err)
 	}
-	loaded, err := store.Load("session-1")
+	loaded, err := store.LoadExecutionState("session-1")
 	if err != nil {
 		t.Fatalf("Load(seed) error = %v", err)
 	}
@@ -320,12 +320,12 @@ func TestProjectorRefreshesCachedStateAfterCompaction(t *testing.T) {
 	})
 	publish(t, bus, eventbus.TurnInputReady{TurnID: "turn-1", Message: model.Message{Role: model.MessageRoleUser, Content: "new"}})
 
-	replayed, err := store.Replay("session-1")
+	replayed, err := store.LoadExecutionState("session-1")
 	if err != nil {
 		t.Fatalf("Replay() error = %v", err)
 	}
-	if replayed.LastSeq != 15 {
-		t.Fatalf("LastSeq = %d, want 15", replayed.LastSeq)
+	if replayed.LastSeq != 16 {
+		t.Fatalf("LastSeq = %d, want 16", replayed.LastSeq)
 	}
 	record, ok := sessionItemByID(replayed.Items, "summary-1-record")
 	if !ok {
@@ -355,7 +355,7 @@ func TestProjectorRefreshesCachedStateAfterCompaction(t *testing.T) {
 	if !ok || user.Message == nil || user.Message.Role != model.MessageRoleUser || user.Message.Content != "new" {
 		t.Fatalf("new active user item = %#v, ok %v", user, ok)
 	}
-	stored, err := store.Load("session-1")
+	stored, err := store.LoadExecutionState("session-1")
 	if err != nil {
 		t.Fatalf("Load(compacted) error = %v", err)
 	}
@@ -520,7 +520,7 @@ func TestProjectorInterruptsPendingTools(t *testing.T) {
 	})
 	publish(t, bus, eventbus.TurnInterrupted{TurnID: "turn-1"})
 
-	loaded, err := store.Load("session-1")
+	loaded, err := store.LoadExecutionState("session-1")
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
 	}
@@ -570,11 +570,11 @@ func TestProjectorSerializesConcurrentToolResults(t *testing.T) {
 		}
 	}
 
-	replayed, err := store.Replay("session-1")
+	replayed, err := store.LoadExecutionState("session-1")
 	if err != nil {
 		t.Fatalf("Replay() error = %v", err)
 	}
-	if want := int64(8 + 2*toolCount); replayed.LastSeq != want {
+	if want := int64(9 + 2*toolCount); replayed.LastSeq != want {
 		t.Fatalf("LastSeq = %d, want %d", replayed.LastSeq, want)
 	}
 	for _, toolCall := range toolCalls {
@@ -619,14 +619,14 @@ func TestProjectorValidationAndClose(t *testing.T) {
 	}
 	publish(t, bus, eventbus.TurnStarted{TurnID: "turn-1"})
 	publish(t, bus, eventbus.TurnInputReady{TurnID: "turn-1", Message: model.Message{Role: model.MessageRoleUser, Content: "validate"}})
-	before, err := store.Replay("session-1")
+	before, err := store.LoadExecutionState("session-1")
 	if err != nil {
 		t.Fatalf("Replay() before invalid event error = %v", err)
 	}
 	if err := bus.Publish(eventbus.ToolResultReady{TurnID: "turn-1", Result: model.ToolResult{ToolCallID: "missing", Content: "nope"}}); err == nil {
 		t.Fatal("unknown ToolResultReady error = nil, want error")
 	}
-	after, err := store.Replay("session-1")
+	after, err := store.LoadExecutionState("session-1")
 	if err != nil {
 		t.Fatalf("Replay() after invalid event error = %v", err)
 	}
@@ -646,7 +646,7 @@ func TestProjectorValidationAndClose(t *testing.T) {
 	}); err == nil || !strings.Contains(err.Error(), "duplicated") {
 		t.Fatalf("AssistantReady with duplicate tool calls error = %v, want duplicated", err)
 	}
-	afterDuplicate, err := store.Replay("session-1")
+	afterDuplicate, err := store.LoadExecutionState("session-1")
 	if err != nil {
 		t.Fatalf("Replay() after duplicate assistant error = %v", err)
 	}
@@ -661,7 +661,7 @@ func TestProjectorValidationAndClose(t *testing.T) {
 	if err := bus.Publish(eventbus.TurnCompleted{TurnID: "turn-1"}); err == nil || !strings.Contains(err.Error(), "pending tool items") {
 		t.Fatalf("TurnCompleted with pending error = %v, want pending tool items", err)
 	}
-	loaded, err := store.Load("session-1")
+	loaded, err := store.LoadExecutionState("session-1")
 	if err != nil {
 		t.Fatalf("Load() after pending completion error = %v", err)
 	}

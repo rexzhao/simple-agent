@@ -113,7 +113,11 @@ func TestAppendMessagesToActiveHistory(t *testing.T) {
 	if err != nil {
 		t.Fatalf("AppendMessagesToActiveHistory() error = %v", err)
 	}
-	if got := itemIDs(newItems); !reflect.DeepEqual(got, []string{"msg-000003", "msg-000004"}) {
+	got := make([]string, 0, len(newItems))
+	for _, item := range newItems {
+		got = append(got, item.ID)
+	}
+	if !reflect.DeepEqual(got, []string{"msg-000003", "msg-000004"}) {
 		t.Fatalf("new item IDs = %#v, want msg-000003,msg-000004", got)
 	}
 	if !reflect.DeepEqual(nextActive, []string{"runtime-000001", "msg-000003", "msg-000004"}) {

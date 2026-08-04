@@ -83,14 +83,17 @@ func (s *Server) Handler() http.Handler {
 }
 
 func (s *Server) Close() {
-	if s == nil || s.runs == nil {
+	if s == nil {
 		return
 	}
-	s.runs.Close()
+	if s.runs != nil {
+		s.runs.Close()
+	}
 }
 
 func (s *Server) routes() {
 	s.mux.HandleFunc("GET /api/bootstrap", s.handleBootstrap)
+	s.mux.HandleFunc("GET /api/events", s.handleLifecycleEvents)
 	s.mux.HandleFunc("GET /api/projects", s.handleListProjects)
 	s.mux.HandleFunc("POST /api/projects", s.handleCreateProject)
 	s.mux.HandleFunc("PATCH /api/projects/{projectID}", s.handleRenameProject)
@@ -120,6 +123,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /api/sessions/{sessionID}/images/{hash}", s.handleSessionImage)
 	s.mux.HandleFunc("POST /api/sessions/{sessionID}/compact", s.handleCompactSession)
 	s.mux.HandleFunc("POST /api/sessions/{sessionID}/runs", s.handleStartRun)
+	s.mux.HandleFunc("POST /api/sessions/{sessionID}/continue", s.handleContinueRun)
 	s.mux.HandleFunc("GET /api/runs/active", s.handleListActiveRuns)
 	s.mux.HandleFunc("GET /api/runs/{runID}/events", s.handleRunEvents)
 	s.mux.HandleFunc("POST /api/runs/{runID}/prompts", s.handleAppendActive)

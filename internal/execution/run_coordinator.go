@@ -29,6 +29,10 @@ type SessionRunStarter interface {
 	StartSessionRunWithInput(ctx context.Context, sessionID string, input SessionMessageInput, emit func(SessionStreamEvent)) *SessionRun
 }
 
+type SessionRunStarterWithID interface {
+	StartSessionRunWithID(ctx context.Context, sessionID string, input SessionMessageInput, runID string, emit func(SessionStreamEvent)) *SessionRun
+}
+
 // SessionRunCoordinatorOptions controls application-wide run admission.
 type SessionRunCoordinatorOptions struct {
 	MaxConcurrentRuns int
@@ -81,6 +85,11 @@ type SessionRunCoordinator struct {
 	byID            map[string]*CoordinatedSessionRun
 	activeBySession map[string]*CoordinatedSessionRun
 	wg              sync.WaitGroup
+
+	lifecycleMu  sync.RWMutex
+	onRunStarted func(*CoordinatedSessionRun)
+	onRunSettled func(*CoordinatedSessionRun, SessionMessageResult, error)
+	onRunIdle    func(*CoordinatedSessionRun)
 }
 
 // CoordinatedSessionRun is a concurrency-safe handle to one admitted run.
@@ -109,6 +118,73 @@ func NewSessionRunCoordinator(ctx context.Context, starter SessionRunStarter, op
 	}
 }
 
+// SetLifecycleCallbacks installs the service-owned lifecycle observer. The
+// observer is separate from the presentation callbacks in
+// SessionRunCoordinatorOptions so Web and agent-tool starts use the same
+// publication path even when no Web request supplied an emitter.
+func (coordinator *SessionRunCoordinator) SetLifecycleCallbacks(
+	onRunStarted func(*CoordinatedSessionRun),
+	onRunSettled func(*CoordinatedSessionRun, SessionMessageResult, error),
+) {
+	if coordinator == nil {
+		return
+	}
+	coordinator.lifecycleMu.Lock()
+	coordinator.onRunStarted = onRunStarted
+	coordinator.onRunSettled = onRunSettled
+	coordinator.lifecycleMu.Unlock()
+}
+
+// SetRunIdleCallback installs an observer which is called after a run has been
+// removed from the coordinator's active indexes. It is deliberately separate
+// from SetLifecycleCallbacks so installing the durable completion dispatcher
+// cannot replace the existing lifecycle/SSE callbacks (or the presentation
+// callbacks supplied in SessionRunCoordinatorOptions).
+func (coordinator *SessionRunCoordinator) SetRunIdleCallback(callback func(*CoordinatedSessionRun)) {
+	if coordinator == nil {
+		return
+	}
+	coordinator.lifecycleMu.Lock()
+	coordinator.onRunIdle = callback
+	coordinator.lifecycleMu.Unlock()
+}
+
+func (coordinator *SessionRunCoordinator) notifyRunStarted(run *CoordinatedSessionRun) {
+	if coordinator == nil {
+		return
+	}
+	coordinator.lifecycleMu.RLock()
+	callback := coordinator.onRunStarted
+	coordinator.lifecycleMu.RUnlock()
+	if callback != nil {
+		callback(run)
+	}
+}
+
+func (coordinator *SessionRunCoordinator) notifyRunSettled(run *CoordinatedSessionRun, result SessionMessageResult, err error) {
+	if coordinator == nil {
+		return
+	}
+	coordinator.lifecycleMu.RLock()
+	callback := coordinator.onRunSettled
+	coordinator.lifecycleMu.RUnlock()
+	if callback != nil {
+		callback(run, result, err)
+	}
+}
+
+func (coordinator *SessionRunCoordinator) notifyRunIdle(run *CoordinatedSessionRun) {
+	if coordinator == nil {
+		return
+	}
+	coordinator.lifecycleMu.RLock()
+	callback := coordinator.onRunIdle
+	coordinator.lifecycleMu.RUnlock()
+	if callback != nil {
+		callback(run)
+	}
+}
+
 // Start atomically admits and starts a run. The run is rooted in the
 // coordinator context rather than an HTTP request or tool-call context, so an
 // asynchronous run outlives the request that created it.
@@ -131,6 +207,41 @@ func (coordinator *SessionRunCoordinator) Start(sessionID string, input SessionM
 	if runID == "" {
 		return nil, fmt.Errorf("generated run id is blank")
 	}
+	return coordinator.startWithID(sessionID, input, runID, emit)
+}
+
+// StartWithID admits a run using a caller-provided stable id. Durable retry
+// paths use this for at-least-once notifications: a crash after admission but
+// before the inbox row is marked consumed can discover the same run instead of
+// creating a second durable run.
+func (coordinator *SessionRunCoordinator) StartWithID(sessionID string, input SessionMessageInput, runID string, emit func(SessionStreamEvent)) (*CoordinatedSessionRun, error) {
+	if coordinator == nil {
+		return nil, fmt.Errorf("session run coordinator is not configured")
+	}
+	if coordinator.starter == nil {
+		return nil, fmt.Errorf("session run starter is not configured")
+	}
+	runID = strings.TrimSpace(runID)
+	if runID == "" {
+		return nil, fmt.Errorf("run id is required")
+	}
+	if _, ok := coordinator.starter.(SessionRunStarterWithID); !ok {
+		return nil, fmt.Errorf("session run starter does not support stable run ids")
+	}
+	return coordinator.startWithID(sessionID, input, runID, emit)
+}
+
+func (coordinator *SessionRunCoordinator) startWithID(sessionID string, input SessionMessageInput, runID string, emit func(SessionStreamEvent)) (*CoordinatedSessionRun, error) {
+	if coordinator == nil {
+		return nil, fmt.Errorf("session run coordinator is not configured")
+	}
+	if coordinator.starter == nil {
+		return nil, fmt.Errorf("session run starter is not configured")
+	}
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		return nil, fmt.Errorf("session id is required")
+	}
 
 	handle := &CoordinatedSessionRun{
 		id:        runID,
@@ -143,7 +254,11 @@ func (coordinator *SessionRunCoordinator) Start(sessionID string, input SessionM
 		coordinator.mu.Unlock()
 		return nil, ErrSessionRunCoordinatorClosed
 	}
-	if active := coordinator.activeBySession[sessionID]; active != nil && active.Status() == SessionRunRunning {
+	// Keep the admission slot occupied until await has removed the handle from
+	// activeBySession. A run may have already changed its terminal status while
+	// its lifecycle goroutine is still settling; admitting here would overlap
+	// the old run with a queued durable continuation.
+	if active := coordinator.activeBySession[sessionID]; active != nil {
 		coordinator.mu.Unlock()
 		return nil, ErrSessionBusy
 	}
@@ -164,7 +279,11 @@ func (coordinator *SessionRunCoordinator) Start(sessionID string, input SessionM
 			emit(event)
 		}
 	}
-	handle.run = coordinator.starter.StartSessionRunWithInput(coordinator.ctx, sessionID, input, forward)
+	if starter, ok := coordinator.starter.(SessionRunStarterWithID); ok {
+		handle.run = starter.StartSessionRunWithID(coordinator.ctx, sessionID, input, runID, forward)
+	} else {
+		handle.run = coordinator.starter.StartSessionRunWithInput(coordinator.ctx, sessionID, input, forward)
+	}
 	if handle.run == nil {
 		coordinator.mu.Unlock()
 		return nil, fmt.Errorf("session run starter returned a nil run")
@@ -172,6 +291,7 @@ func (coordinator *SessionRunCoordinator) Start(sessionID string, input SessionM
 	coordinator.byID[runID] = handle
 	coordinator.activeBySession[sessionID] = handle
 	coordinator.mu.Unlock()
+	coordinator.notifyRunStarted(handle)
 
 	coordinator.wg.Add(1)
 	go coordinator.await(handle)
@@ -181,6 +301,7 @@ func (coordinator *SessionRunCoordinator) Start(sessionID string, input SessionM
 func (coordinator *SessionRunCoordinator) await(handle *CoordinatedSessionRun) {
 	defer coordinator.wg.Done()
 	result, err := handle.Wait()
+	coordinator.notifyRunSettled(handle, result, err)
 	if coordinator.options.OnRunSettled != nil {
 		coordinator.options.OnRunSettled(handle, result, err)
 	}
@@ -193,6 +314,7 @@ func (coordinator *SessionRunCoordinator) await(handle *CoordinatedSessionRun) {
 		delete(coordinator.activeBySession, handle.sessionID)
 	}
 	coordinator.mu.Unlock()
+	coordinator.notifyRunIdle(handle)
 }
 
 func (coordinator *SessionRunCoordinator) Get(runID string) (*CoordinatedSessionRun, bool) {

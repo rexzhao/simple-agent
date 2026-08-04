@@ -27,7 +27,8 @@ async function json(route: Route, body: unknown, status = 200) {
 async function mockApp(page: Page, options: { gates: Gate[]; initialItems?: Array<Record<string, unknown>>; committedItems?: () => Array<Record<string, unknown>> }) {
   let connection = 0
   let runPosts = 0
-  const runBodies: Array<{ content?: string; images?: unknown[]; replay_item_id?: string }> = []
+  const runBodies: Array<{ content?: string; images?: unknown[] }> = []
+  let continuePosts = 0
   await page.route('**/api/**', async (route: Route) => {
     const request = route.request()
     const url = new URL(request.url())
@@ -49,10 +50,17 @@ async function mockApp(page: Page, options: { gates: Gate[]; initialItems?: Arra
     }
     if (url.pathname === `/api/sessions/${session.id}/runs` && request.method() === 'POST') {
       runPosts++
-      runBodies.push(request.postDataJSON() as { content?: string; images?: unknown[]; replay_item_id?: string })
+      runBodies.push(request.postDataJSON() as { content?: string; images?: unknown[] })
       return json(route, { run_id: 'run-1', session_id: session.id, status: 'running' }, 202)
     }
-    if (url.pathname === '/api/runs/run-1/events') {
+    if (url.pathname === `/api/sessions/${session.id}/continue` && request.method() === 'POST') {
+      continuePosts++
+      return json(route, { run_id: 'run-2', session_id: session.id, status: 'running' }, 202)
+    }
+    if (url.pathname === '/api/runs/run-1/events' || url.pathname === '/api/runs/run-2/events') {
+      if (url.pathname.endsWith('run-2/events')) {
+        return route.fulfill({ status: 200, contentType: 'text/event-stream', body: sse([{ type: 'run.settled', run_id: 'run-2', status: 'committed', turn_id: 'turn-2', last_seq: 2 }]) })
+      }
       connection++
       if (connection === 1) return route.fulfill({ status: 200, contentType: 'text/event-stream', body: sse([{ type: 'turn.started', turn_id: 'turn-1' }]) })
       const gate = options.gates[Math.min(connection - 2, options.gates.length - 1)] ?? newGate()
@@ -61,10 +69,10 @@ async function mockApp(page: Page, options: { gates: Gate[]; initialItems?: Arra
     }
     return json(route, { error: { code: 'not_mocked', message: `${request.method()} ${url.pathname}` } }, 404)
   })
-  return { runPosts: () => runPosts, runBodies }
+  return { runPosts: () => runPosts, continuePosts: () => continuePosts, runBodies }
 }
 
-test('shows the failure reason in the conversation and resends the trailing user message', async ({ page }) => {
+test('shows the failure reason and continues without resending the user message', async ({ page }) => {
   const fail = newGate()
   const settle = newGate()
   const hang = newGate()
@@ -85,32 +93,25 @@ test('shows the failure reason in the conversation and resends the trailing user
   await expect(turnError).toContainText('429 Too Many Requests')
   await expect(turnError).toContainText('slow down')
   await expect(page.locator('.error-banner')).toHaveCount(0)
-  // The run is still attached: no resend offer yet.
-  await expect(page.getByRole('button', { name: 'Resend' })).toHaveCount(0)
+  // The run is still attached: no Continue offer yet.
+  await expect(page.getByRole('button', { name: 'Continue' })).toHaveCount(0)
 
-  // The run settles: the persisted user message remains as the tail and
-  // gets a resend offer; the failure card stays.
+  // The run settles: the persisted user message remains as the tail and the
+  // failure card offers Continue.
   committed = true
   settle.release([{ type: 'run.settled', run_id: 'run-1', status: 'failed', turn_id: 'turn-1', last_seq: 1, message: 'run failed' }])
-  const resend = page.getByRole('button', { name: 'Resend' })
-  await expect(resend).toBeVisible()
+  const continueButton = page.getByRole('button', { name: 'Continue' })
+  await expect(continueButton).toBeVisible()
   await expect(turnError).toBeVisible()
 
-  // Dismissal hides the card; the resend offer stays.
-  await page.getByRole('button', { name: 'Dismiss error' }).click()
-  await expect(turnError).toHaveCount(0)
-  await expect(resend).toBeVisible()
-
-  // Resending replays the persisted user item without duplicating its content.
-  await resend.click()
-  await expect.poll(app.runPosts).toBe(2)
-  expect(app.runBodies[1]?.replay_item_id).toBe(failedUserItem.id)
-  expect(app.runBodies[1]?.content).toBeUndefined()
-  await expect(resend).toHaveCount(0)
+  // Continue uses its dedicated endpoint and sends no new user content.
+  await continueButton.click()
+  await expect.poll(app.continuePosts).toBe(1)
+  await expect(app.runBodies[0]?.content).toBe('fix the bug')
   await expect(turnError).toHaveCount(0)
 })
 
-test('does not offer resend when the session ends with an assistant message', async ({ page }) => {
+test('does not offer Continue when the session ends with an assistant message', async ({ page }) => {
   await mockApp(page, {
     gates: [],
     initialItems: [
@@ -120,6 +121,6 @@ test('does not offer resend when the session ends with an assistant message', as
   })
   await page.goto('/')
   await expect(page.locator('.message.assistant .message-text').last()).toHaveText('answer')
-  await expect(page.getByRole('button', { name: 'Resend' })).toHaveCount(0)
+  await expect(page.getByRole('button', { name: 'Continue' })).toHaveCount(0)
   await expect(page.locator('.turn-error')).toHaveCount(0)
 })

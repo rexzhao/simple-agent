@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import type { ActiveRun, RunEvent } from '../types'
+import type { ActiveRun, ActiveRunDescriptor, RunEvent } from '../types'
 import { reduceRunEvent } from '../lib/runEventReducer'
 
 export const streamPublishIntervalMS = 40
@@ -74,6 +74,36 @@ export function useRunRegistry(options?: UseRunRegistryOptions) {
     return true
   }, [publish])
 
+  const syncActiveRuns = useCallback((descriptors: ActiveRunDescriptor[]) => {
+    const next: Record<string, ActiveRun> = {}
+    for (const descriptor of descriptors) {
+      const existing = activeRunsRef.current[descriptor.session_id]
+      next[descriptor.session_id] = existing && existing.id === descriptor.run_id
+        ? { ...existing, turnID: descriptor.turn_id ?? existing.turnID }
+        : {
+            id: descriptor.run_id,
+            sessionID: descriptor.session_id,
+            turnID: descriptor.turn_id,
+            restored: true,
+            userText: '',
+            assistantText: '',
+            steps: [],
+            agentIteration: 0,
+            status: 'running',
+          }
+      const pending = pendingRef.current[descriptor.session_id]
+      if (pending && pending.runID !== descriptor.run_id) {
+        window.clearTimeout(pending.timer)
+        delete pendingRef.current[descriptor.session_id]
+      }
+    }
+    for (const [sessionID, pending] of Object.entries(pendingRef.current)) {
+      if (!next[sessionID]) window.clearTimeout(pending.timer)
+    }
+    pendingRef.current = Object.fromEntries(Object.entries(pendingRef.current).filter(([sessionID]) => Boolean(next[sessionID])))
+    publish(next)
+  }, [publish])
+
   const flushRunEvents = useCallback((sessionID: string, runID: string) => {
     const pending = pendingRef.current[sessionID]
     if (!pending || pending.runID !== runID) return
@@ -116,5 +146,5 @@ export function useRunRegistry(options?: UseRunRegistryOptions) {
     pendingRef.current = {}
   }, [])
 
-  return { activeRunsBySession, activeRunsRef, runningSessionIDs, addActiveRun, updateActiveRun, queueRunEvent, flushRunEvents }
+  return { activeRunsBySession, activeRunsRef, runningSessionIDs, addActiveRun, syncActiveRuns, updateActiveRun, queueRunEvent, flushRunEvents }
 }

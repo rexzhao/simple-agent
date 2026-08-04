@@ -159,6 +159,14 @@ export interface Session {
   spawn_depth: number
   archived: boolean
   last_used_at: string
+  current_run_id?: string
+  running_run_id?: string
+  running_turn_id?: string
+  interrupted_run_id?: string
+  interrupted_turn_id?: string
+  latest_run_id?: string
+  last_run_id?: string
+  last_run_status?: string
   provider: string
   model_profile: string
   model_id: string
@@ -181,6 +189,33 @@ export interface ActiveRunDescriptor {
   turn_id?: string
   started_at: string
   status: string
+}
+
+export type LifecycleEventType =
+  | 'session.created'
+  | 'session.updated'
+  | 'session.archived'
+  | 'session.deleted'
+  | 'run.started'
+  | 'run.settled'
+
+/** Payload emitted by the process-wide /api/events SSE stream. */
+export interface LifecycleEvent {
+  type: LifecycleEventType
+  session?: Session | string
+  session_id?: string
+  project_id?: string
+  project?: string
+  descendants?: string[]
+  reason?: string
+  run?: string
+  run_id?: string
+  status?: string
+  last_seq?: number
+  turn_id?: string
+  metadata?: Session
+  session_metadata?: Session
+  message?: string
 }
 
 export interface MessageContent {

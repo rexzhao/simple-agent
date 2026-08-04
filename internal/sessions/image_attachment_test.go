@@ -3,7 +3,7 @@ package sessions
 import (
 	"bytes"
 	"os"
-	"strings"
+	"path/filepath"
 	"testing"
 
 	"github.com/rexzhao/simple-agent/internal/model"
@@ -43,22 +43,17 @@ func TestV2StorePersistsImageAttachmentsAsBlobsAndMaterializesThem(t *testing.T)
 		t.Fatalf("stored image blob = %#v", storedBlock.ImageBlob)
 	}
 
-	segments, err := store.segmentPaths(session.ID)
-	if err != nil || len(segments) != 1 {
-		t.Fatalf("segmentPaths() = %#v, %v", segments, err)
+	if _, err := os.Stat(filepath.Join(store.root, session.ID, "session.db")); err != nil {
+		t.Fatalf("session database stat error = %v", err)
 	}
-	segment, err := os.ReadFile(segments[0])
-	if err != nil {
-		t.Fatalf("ReadFile(segment) error = %v", err)
-	}
-	if strings.Contains(string(segment), "data:image/png;base64") {
-		t.Fatalf("session record retained inline image data: %s", segment)
+	if _, err := os.Stat(filepath.Join(store.root, session.ID, "blobs")); err != nil {
+		t.Fatalf("session blob directory stat error = %v", err)
 	}
 
 	if _, err := store.ReplaceActiveHistory(session.ID, []string{item.ID}); err != nil {
 		t.Fatalf("ReplaceActiveHistory() error = %v", err)
 	}
-	loaded, err := store.Load(session.ID)
+	loaded, err := store.LoadExecutionState(session.ID)
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
 	}

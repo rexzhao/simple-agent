@@ -11,6 +11,12 @@ import (
 	"github.com/rexzhao/simple-agent/internal/execution"
 )
 
+func TestContinueRequestRejectsNewContent(t *testing.T) {
+	if _, err := (startRunRequest{Continue: true, Content: "new input"}).messageInput(); err == nil {
+		t.Fatal("continue request with content was accepted")
+	}
+}
+
 func TestManagedRunBoundsActiveReplayBuffer(t *testing.T) {
 	options := runRegistryOptions{
 		MaxRunEvents:     3,

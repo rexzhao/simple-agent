@@ -60,7 +60,7 @@ func archivedFlag(t *testing.T, service *Service, sessionID string) bool {
 
 func markSessionRunning(t *testing.T, service *Service, sessionID string) {
 	t.Helper()
-	stored, err := service.sessionStore.Load(sessionID)
+	stored, err := service.sessionStore.LoadExecutionState(sessionID)
 	if err != nil {
 		t.Fatalf("Load(%s) error = %v", sessionID, err)
 	}
@@ -117,7 +117,7 @@ func TestRemoveSessionCascadesToDescendants(t *testing.T) {
 
 	// Archive only the target directly in the store: the removal cascade must
 	// archive the still-active descendants itself before deleting them.
-	stored, err := service.sessionStore.Load(tree.parent.ID)
+	stored, err := service.sessionStore.LoadExecutionState(tree.parent.ID)
 	if err != nil {
 		t.Fatalf("Load(parent) error = %v", err)
 	}

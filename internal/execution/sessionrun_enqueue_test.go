@@ -92,9 +92,9 @@ func TestSessionRunEnqueueProcessesFIFOAndProviderSeesPriorDurableTurns(t *testi
 	if err != nil || r2.Status != "committed" || r2.TurnID == "" || r2.LastSeq == 0 {
 		t.Fatalf("receipt2.Wait() = %#v/%v, want committed", r2, err)
 	}
-	// The run's final result is the last enqueued turn's result.
-	if result.TurnID != r2.TurnID || result.LastSeq != r2.LastSeq {
-		t.Fatalf("Wait() = %#v, want last receipt result %#v", result, r2)
+	// Run settlement has its own durable lifecycle event after the last turn.
+	if result.TurnID != r2.TurnID || result.LastSeq <= r2.LastSeq {
+		t.Fatalf("Wait() = %#v, want last turn %#v plus run settlement", result, r2)
 	}
 	if r1.LastSeq >= r2.LastSeq {
 		t.Fatalf("receipt seqs not monotonic: r1=%d r2=%d", r1.LastSeq, r2.LastSeq)
@@ -276,7 +276,7 @@ func TestSessionRunEnqueuePreservesSendAPIsWithoutEnqueue(t *testing.T) {
 	if result.Status != "committed" || result.TurnID != "turn-000001" {
 		t.Fatalf("SendSessionMessage() = %#v, want committed turn-000001", result)
 	}
-	loaded, err := service.sessionStore.Load(session.ID)
+	loaded, err := service.sessionStore.LoadExecutionState(session.ID)
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
 	}

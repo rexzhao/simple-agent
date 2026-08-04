@@ -175,11 +175,11 @@ func TestServiceRemoveProjectDeletesProjectSessions(t *testing.T) {
 		t.Fatalf("RemoveProject(repo) = %#v, want removed 2 sessions", result)
 	}
 	for _, id := range []string{sessionA.ID, sessionB.ID} {
-		if _, err := sessionStore.Load(id); !errors.Is(err, sessions.ErrNotFound) {
+		if _, err := sessionStore.LoadExecutionState(id); !errors.Is(err, sessions.ErrNotFound) {
 			t.Fatalf("Load(%s) error = %v, want ErrNotFound", id, err)
 		}
 	}
-	if _, err := sessionStore.Load(otherSession.ID); err != nil {
+	if _, err := sessionStore.LoadExecutionState(otherSession.ID); err != nil {
 		t.Fatalf("Load(other session) error = %v, want retained", err)
 	}
 	if _, err := service.GetProject(project.Project.ID); !errors.Is(err, projectstore.ErrNotFound) {
@@ -200,7 +200,7 @@ func TestServiceProjectArchiveAndRemoveRejectRunningSession(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateSession() error = %v", err)
 	}
-	stored, err := service.sessionStore.Load(session.ID)
+	stored, err := service.sessionStore.LoadExecutionState(session.ID)
 	if err != nil {
 		t.Fatalf("Load(session) error = %v", err)
 	}
@@ -749,7 +749,7 @@ func TestServiceRejectsArchiveAndRemoveForRunningSession(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateSession() error = %v", err)
 	}
-	stored, err := service.sessionStore.Load(session.ID)
+	stored, err := service.sessionStore.LoadExecutionState(session.ID)
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
 	}
@@ -795,7 +795,7 @@ func TestServiceSendSessionMessagePersistsSuccessfulTurn(t *testing.T) {
 	if result.Status != "committed" || result.TurnID != "turn-000001" || result.LastSeq == 0 {
 		t.Fatalf("SendSessionMessage() = %#v, want committed turn with last seq", result)
 	}
-	loaded, err := service.sessionStore.Load(session.ID)
+	loaded, err := service.sessionStore.LoadExecutionState(session.ID)
 	if err != nil {
 		t.Fatalf("Load(session) error = %v", err)
 	}
@@ -814,80 +814,10 @@ func TestServiceSendSessionMessagePersistsSuccessfulTurn(t *testing.T) {
 	}
 }
 
-func TestServiceReplayTrailingUserUsesExistingHistoryWithoutAppendingInput(t *testing.T) {
-	home := t.TempDir()
-	runner := fakeExecutionTurnRunner{
-		supports: true,
-		run: func(ctx context.Context, request SessionTurnRequest) (SessionTurnResult, error) {
-			if !request.ReplayHistory {
-				t.Fatal("RunSessionTurn ReplayHistory = false, want true")
-			}
-			if request.Content != "" || len(request.ContentBlocks) != 0 {
-				t.Fatalf("RunSessionTurn input = %q/%#v, want no new input", request.Content, request.ContentBlocks)
-			}
-			messages, err := request.Session.MaterializeActiveHistory()
-			if err != nil {
-				return SessionTurnResult{}, err
-			}
-			if got := messageContents(messages); !sameStringSlice(got, []string{"original prompt"}) {
-				t.Fatalf("runner history = %#v, want original prompt once", got)
-			}
-			if err := request.Publisher.Publish(eventAssistant(request.TurnID, "replayed answer")); err != nil {
-				return SessionTurnResult{}, err
-			}
-			return SessionTurnResult{Incremental: true}, nil
-		},
-	}
-	service, _, session := newExecutionServiceWithSession(t, home, runner)
-	userItem := sessions.SessionItem{
-		ID:         "original-user",
-		Kind:       sessions.ItemKindMessage,
-		Visibility: sessions.ItemVisibilityVisible,
-		Audience:   sessions.ItemAudienceUser,
-		Message:    &model.Message{Role: model.MessageRoleUser, Content: "original prompt"},
-	}
-	if _, err := service.sessionStore.AppendItemsAndReplaceActiveHistory(session.ID, []sessions.SessionItem{userItem}, []string{userItem.ID}); err != nil {
-		t.Fatalf("AppendItemsAndReplaceActiveHistory() error = %v", err)
-	}
-
-	result, err := service.runSessionMessage(context.Background(), session.ID, SessionMessageInput{ReplayItemID: userItem.ID}, nil, nil)
-	if err != nil {
-		t.Fatalf("runSessionMessage(replay) error = %v", err)
-	}
-	if result.Status != "committed" {
-		t.Fatalf("runSessionMessage(replay) result = %#v, want committed", result)
-	}
-	loaded, err := service.sessionStore.Load(session.ID)
-	if err != nil {
-		t.Fatalf("Load(session) error = %v", err)
-	}
-	messages, err := loaded.MaterializeActiveHistory()
-	if err != nil {
-		t.Fatalf("MaterializeActiveHistory() error = %v", err)
-	}
-	if got := messageContents(messages); !sameStringSlice(got, []string{"original prompt", "replayed answer"}) {
-		t.Fatalf("active messages = %#v, want original prompt once followed by answer", got)
-	}
-}
-
-func TestServiceReplayRejectsNonTrailingHistoryItem(t *testing.T) {
-	service, _, session := newExecutionServiceWithSession(t, t.TempDir(), fakeExecutionTurnRunner{supports: true})
-	items := []sessions.SessionItem{
-		{ID: "older-user", Kind: sessions.ItemKindMessage, Visibility: sessions.ItemVisibilityVisible, Audience: sessions.ItemAudienceUser, Message: &model.Message{Role: model.MessageRoleUser, Content: "older"}},
-		{ID: "latest-user", Kind: sessions.ItemKindMessage, Visibility: sessions.ItemVisibilityVisible, Audience: sessions.ItemAudienceUser, Message: &model.Message{Role: model.MessageRoleUser, Content: "latest"}},
-	}
-	if _, err := service.sessionStore.AppendItemsAndReplaceActiveHistory(session.ID, items, []string{"older-user", "latest-user"}); err != nil {
-		t.Fatalf("AppendItemsAndReplaceActiveHistory() error = %v", err)
-	}
-	if err := service.ValidateSessionMessageInput(session.ID, SessionMessageInput{ReplayItemID: "older-user"}); err == nil {
-		t.Fatal("ValidateSessionMessageInput(non-trailing replay) error = nil, want rejection")
-	}
-}
-
 func TestServiceGetSessionChatItemsFiltersItemBackedVisibleMessages(t *testing.T) {
 	home := t.TempDir()
 	service, _, session := newExecutionServiceWithSession(t, home, fakeExecutionTurnRunner{supports: true})
-	blob, err := service.sessionStore.WriteBlob([]byte("full blob-backed assistant response"), "utf-8", "text/plain")
+	blob, err := service.sessionStore.WriteBlobForSession(session.ID, []byte("full blob-backed assistant response"), "utf-8", "text/plain")
 	if err != nil {
 		t.Fatalf("WriteBlob() error = %v", err)
 	}
@@ -980,7 +910,7 @@ func TestServiceGetSessionTurnFinalAssistantOutputMaterializesLastVisibleAssista
 	home := t.TempDir()
 	service, _, session := newExecutionServiceWithSession(t, home, fakeExecutionTurnRunner{supports: true})
 	fullAnswer := strings.Repeat("final answer body ", 400) + "FINAL-SUFFIX"
-	blob, err := service.sessionStore.WriteBlob([]byte(fullAnswer), "utf-8", "text/plain")
+	blob, err := service.sessionStore.WriteBlobForSession(session.ID, []byte(fullAnswer), "utf-8", "text/plain")
 	if err != nil {
 		t.Fatalf("WriteBlob() error = %v", err)
 	}
@@ -1235,7 +1165,7 @@ func TestServiceCompactSessionUsesConfiguredPlanner(t *testing.T) {
 	if result.Status != "committed" || result.CompactionID != "manual-checkpoint" || result.SummaryItemID != "manual-summary" || result.LastSeq == 0 {
 		t.Fatalf("CompactSession() = %#v, want manual compaction result", result)
 	}
-	loaded, err := service.sessionStore.Load(session.ID)
+	loaded, err := service.sessionStore.LoadExecutionState(session.ID)
 	if err != nil {
 		t.Fatalf("Load(session) error = %v", err)
 	}
@@ -1341,7 +1271,7 @@ func TestServiceSendSessionMessageRunsAutoCompactionBeforeTurn(t *testing.T) {
 	if !strings.HasPrefix(result.TurnID, "turn-") || result.LastSeq == 0 {
 		t.Fatalf("SendSessionMessage() = %#v, want compacted turn result", result)
 	}
-	loaded, err := service.sessionStore.Load(session.ID)
+	loaded, err := service.sessionStore.LoadExecutionState(session.ID)
 	if err != nil {
 		t.Fatalf("Load(session) error = %v", err)
 	}
@@ -1384,7 +1314,7 @@ func TestServiceSendSessionMessageSanitizesRunnerErrorAndMarksInterrupted(t *tes
 	if strings.Contains(err.Error(), "prompt secret") || strings.Contains(err.Error(), "provider leaked") {
 		t.Fatalf("SendSessionMessage() leaked runner error: %v", err)
 	}
-	loaded, err := service.sessionStore.Load(session.ID)
+	loaded, err := service.sessionStore.LoadExecutionState(session.ID)
 	if err != nil {
 		t.Fatalf("Load(session) error = %v", err)
 	}
@@ -1456,7 +1386,7 @@ func TestServiceGetSessionSnapshot(t *testing.T) {
 	}
 
 	// Add a turn with visible items via SaveTurn.
-	stored, err := service.sessionStore.Load(session.ID)
+	stored, err := service.sessionStore.LoadExecutionState(session.ID)
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
 	}

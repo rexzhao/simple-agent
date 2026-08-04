@@ -8,7 +8,7 @@ import { addUsageBreakdown, contextRequestCount, contextUsageBreakdown, usageBre
 import { buildConversationRows, conversationRowKey } from '../lib/conversationRows'
 import type { ConversationRow } from '../lib/conversationRows'
 import { blobAsDataURL, copyText, formatCost, formatTokenCount } from '../lib/format'
-import { itemText, sessionName, visibleSessionItems } from '../lib/session'
+import { itemText, sessionName } from '../lib/session'
 import { Composer } from './Composer'
 import type { ComposerDraft, PastedImageAttachment, PastedTextAttachment } from './Composer'
 import { MessageSkeleton } from './misc'
@@ -34,12 +34,11 @@ export const Conversation = memo(function Conversation(props: {
   sessionNames: Record<string, string>
   turnError: { turnID: string; message: string } | null
   onDismissTurnError: () => void
-  onResend: (item: SessionItem) => Promise<boolean>
   onLoadOlder: () => Promise<boolean>
   onSend: (content: string, images: PastedImageAttachment[]) => Promise<boolean>
   onCancel: () => void
   onCancelTool: (toolCallID: string) => void
-  onRetry: () => void
+  onContinue: () => void
   onRetryRefresh: () => void
   onDebug: () => void
   onToggleFullAccess: () => void
@@ -56,7 +55,6 @@ export const Conversation = memo(function Conversation(props: {
 	const loadingOlderRef = useRef(false)
 	const [loadingOlder, setLoadingOlder] = useState(false)
 	const safeDetail = props.detail && props.detail.id === props.sessionID ? props.detail : null
-	const [resendPending, setResendPending] = useState(false)
 
 	// Virtuoso's Scroller is the sole .messages element. Use its imperative API
 	// for explicit bottom requests instead of competing with its scroll model.
@@ -144,16 +142,6 @@ export const Conversation = memo(function Conversation(props: {
 			? (followMemoryRef.current.get(props.sessionID) ? 'following' : 'detached')
 			: 'initial'
 	}, [props.sessionID])
-	// Resending starts a run from the trailing user message already in history.
-	const handleResend = useCallback(async (item: SessionItem) => {
-		if (resendPending) return
-		setResendPending(true)
-		try {
-			await props.onResend(item)
-		} finally {
-			setResendPending(false)
-		}
-	}, [props.onResend, resendPending])
 	const copySessionID = async () => {
 		if (!safeDetail) return
 		try {
@@ -180,10 +168,6 @@ export const Conversation = memo(function Conversation(props: {
 	// Older history pages load only on an explicit click on the "Load earlier
 	// messages" button. Scrolling to the top deliberately does not auto-load:
 	// casual upward scrolls must not silently grow the history window.
-	const visibleItems = useMemo(
-		() => visibleSessionItems(props.page?.items ?? [], props.activeRun),
-		[props.activeRun, props.page?.items],
-	)
 	const conversationRows = useMemo(() => {
 		const rows = buildConversationRows({
 			sessionID: props.sessionID ?? '',
@@ -212,30 +196,20 @@ export const Conversation = memo(function Conversation(props: {
 			setLoadingOlder(false)
 		}
 	}, [props.onLoadOlder, props.page])
-	// A session that is idle with a user message at the tail almost always
-  // means the turn died mid-flight: offer to resend it in place.
-	const trailingUserItem = useMemo(() => {
-		if (props.activeRun || safeDetail?.status === 'running') return null
-		const last = visibleItems[visibleItems.length - 1]
-		return last?.message?.role === 'user' ? last : null
-	}, [props.activeRun, safeDetail?.status, visibleItems])
-
   const headerStatus = props.compacting || props.activeRun?.status === 'running' || safeDetail?.status === 'running'
     ? 'running'
-    : safeDetail?.status === 'interrupted' ? 'interrupted' : 'idle'
+    : safeDetail?.status === 'interrupted' || safeDetail?.status === 'failed' ? 'interrupted' : 'idle'
 
 	const renderRow = useCallback((row: ConversationRow) => renderConversationRow(row, {
 		sessionID: props.sessionID ?? '',
 		sessionNames: props.sessionNames,
 		workspaceRoot: safeDetail?.created_cwd,
+		canContinue: Boolean(safeDetail && (safeDetail.status === 'interrupted' || safeDetail.status === 'failed') && !safeDetail.running_run_id && !safeDetail.running_turn_id && safeDetail.interrupted_run_id && safeDetail.interrupted_turn_id && !props.activeRun),
 		onCancelTool: props.onCancelTool,
-		onResend: handleResend,
-		trailingUserItem,
-		resendPending,
-		onRetry: props.onRetry,
+		onContinue: props.onContinue,
 		onRetryRefresh: props.onRetryRefresh,
 		onDismissTurnError: props.onDismissTurnError,
-	}), [handleResend, props.onCancelTool, props.onDismissTurnError, props.onRetry, props.onRetryRefresh, props.sessionID, props.sessionNames, resendPending, safeDetail?.created_cwd, trailingUserItem])
+	}), [props.activeRun, props.onCancelTool, props.onContinue, props.onDismissTurnError, props.onRetryRefresh, props.sessionID, props.sessionNames, safeDetail?.created_cwd, safeDetail?.interrupted_run_id, safeDetail?.interrupted_turn_id, safeDetail?.running_run_id, safeDetail?.running_turn_id, safeDetail?.status])
 
 	const conversationEmpty = <div className="conversation-empty"><SparkIcon /><h3>Start a new task</h3><p>Describe a goal, a problem, or the code you want to change.</p></div>
 	const listHeader = (
@@ -245,8 +219,9 @@ export const Conversation = memo(function Conversation(props: {
 				: <span aria-hidden="true" />}
 		</div>
 	)
-	const listFooter = safeDetail?.status === 'interrupted' && !props.activeRun && !props.turnError
-		? <div className="conversation-retry"><button className="message-tool-button" onClick={props.onRetry} title="Retry last turn"><RetryIcon />Retry last turn</button></div>
+	const canContinue = Boolean(safeDetail && (safeDetail.status === 'interrupted' || safeDetail.status === 'failed') && !safeDetail.running_run_id && !safeDetail.running_turn_id && safeDetail.interrupted_run_id && safeDetail.interrupted_turn_id && !props.activeRun)
+	const listFooter = canContinue && !props.turnError
+		? <div className="conversation-retry"><button className="message-tool-button" onClick={props.onContinue} title="Continue interrupted run"><RetryIcon />Continue</button></div>
 		: undefined
 
   return (
@@ -335,7 +310,7 @@ export const Conversation = memo(function Conversation(props: {
   previous.recentStepsByTurn === next.recentStepsByTurn &&
   previous.sessionNames === next.sessionNames &&
   previous.onCancelTool === next.onCancelTool &&
-  previous.onRetry === next.onRetry &&
+  previous.onContinue === next.onContinue &&
   previous.onRetryRefresh === next.onRetryRefresh &&
   previous.onDebug === next.onDebug)
 
@@ -426,10 +401,8 @@ type ConversationRowRenderProps = {
 	sessionNames?: Record<string, string>
 	workspaceRoot?: string
 	onCancelTool?: (toolCallID: string) => void
-	onResend: (item: SessionItem) => void
-	trailingUserItem: SessionItem | null
-	resendPending: boolean
-	onRetry: () => void
+	canContinue: boolean
+	onContinue: () => void
 	onRetryRefresh: () => void
 	onDismissTurnError: () => void
 }
@@ -437,7 +410,7 @@ type ConversationRowRenderProps = {
 function renderConversationRow(row: ConversationRow, props: ConversationRowRenderProps) {
 	switch (row.kind) {
 		case 'message':
-			return <Message key={row.key} item={row.item} sessionID={props.sessionID} onResend={row.item === props.trailingUserItem ? props.onResend : undefined} resendPending={props.resendPending} />
+			return <Message key={row.key} item={row.item} sessionID={props.sessionID} />
 		case 'compaction':
 			return <CompactionRecord key={row.key} item={row.item} />
 		case 'process':
@@ -453,7 +426,7 @@ function renderConversationRow(row: ConversationRow, props: ConversationRowRende
 		case 'manual-compaction':
 			return <CompactionStatus key={row.key} trigger="manual" status="running" />
 		case 'turn-error':
-			return <TurnErrorRow key={row.key} message={row.message} onRetry={props.onRetry} onDismiss={props.onDismissTurnError} />
+			return <TurnErrorRow key={row.key} message={row.message} canContinue={props.canContinue} onContinue={props.onContinue} onDismiss={props.onDismissTurnError} />
 		case 'refresh-error':
 			return <RefreshErrorRow key={row.key} onRetryRefresh={props.onRetryRefresh} />
 		case 'interrupted':
@@ -463,7 +436,7 @@ function renderConversationRow(row: ConversationRow, props: ConversationRowRende
 	}
 }
 
-const Message = memo(function Message({ item, sessionID, onResend, resendPending }: { item: SessionItem; sessionID: string; onResend?: (item: SessionItem) => void; resendPending?: boolean }) {
+const Message = memo(function Message({ item, sessionID }: { item: SessionItem; sessionID: string }) {
 	const [copyStatus, setCopyStatus] = useState<'idle' | 'copied' | 'error'>('idle')
 	const copyResetTimerRef = useRef<number | null>(null)
 	useEffect(() => () => {
@@ -498,13 +471,6 @@ const Message = memo(function Message({ item, sessionID, onResend, resendPending
       <div className="message-content">
         {role === 'user' && text && <div className="message-text">{text}</div>}
         {role === 'user' && images.length > 0 && <StoredImageAttachments sessionID={sessionID} images={images} />}
-		{role === 'user' && onResend && (
-			<div className="message-tools" aria-label="Message actions">
-				<button className="message-tool-button" disabled={resendPending} onClick={() => onResend(item)} title="Send this message again">
-					<RetryIcon />{resendPending ? 'Sending…' : 'Resend'}
-				</button>
-			</div>
-		)}
         {role !== 'user' && text && <MarkdownMessage text={text} />}
 		{role === 'assistant' && (
 			<div className="message-tools" aria-label="Message actions">
@@ -687,7 +653,7 @@ function CompactionStatus({ trigger, status, activeContextTokens, contextWindow 
   return <div className={`compaction-status ${status}`} role="status"><span />{detail}</div>
 }
 
-function TurnErrorRow({ message, onRetry, onDismiss }: { message: string; onRetry: () => void; onDismiss: () => void }) {
+function TurnErrorRow({ message, canContinue, onContinue, onDismiss }: { message: string; canContinue: boolean; onContinue: () => void; onDismiss: () => void }) {
 	return (
 		<div className="turn-error" role="alert">
 			<WarningIcon />
@@ -695,7 +661,7 @@ function TurnErrorRow({ message, onRetry, onDismiss }: { message: string; onRetr
 				<strong>Turn failed</strong>
 				<p>{message}</p>
 			</div>
-			<button className="message-tool-button" onClick={onRetry} title="Retry last turn"><RetryIcon />Retry</button>
+			{canContinue && <button className="message-tool-button" onClick={onContinue} title="Continue interrupted run"><RetryIcon />Continue</button>}
 			<button className="turn-error-dismiss" onClick={onDismiss} aria-label="Dismiss error" title="Dismiss">×</button>
 		</div>
 	)

@@ -99,7 +99,7 @@ func (s *Service) SearchSessions(options SessionSearchOptions) (SessionSearchRes
 		}
 	}
 
-	infos, err := s.sessionStore.ListWithOptions(sessions.V2ListOptions{
+	states, err := s.sessionStore.ListStates(sessions.V2ListOptions{
 		Archived: options.IncludeArchived,
 		All:      options.IncludeArchived,
 	})
@@ -107,13 +107,9 @@ func (s *Service) SearchSessions(options SessionSearchOptions) (SessionSearchRes
 		return SessionSearchResult{}, err
 	}
 	result := SessionSearchResult{Matches: []SessionSearchMatch{}}
-	for _, info := range infos {
-		if info.ProjectID != project.ID {
+	for _, session := range states {
+		if session.ProjectID != project.ID {
 			continue
-		}
-		session, err := s.sessionStore.Load(info.ID)
-		if err != nil {
-			return SessionSearchResult{}, err
 		}
 		name := CanonicalSessionName(session.ID, session.DisplayName)
 		if !matcher.MatchString(name) {
@@ -161,7 +157,7 @@ func (s *Service) InspectSession(id string, maxOutputChars int) (SessionInspecti
 	if maxOutputChars > maximumSessionOutputMaxChars {
 		return SessionInspection{}, fmt.Errorf("session output limit cannot exceed %d characters", maximumSessionOutputMaxChars)
 	}
-	session, err := s.sessionStore.Load(id)
+	session, err := s.sessionStore.LoadExecutionState(id)
 	if err != nil {
 		return SessionInspection{}, err
 	}
@@ -171,7 +167,7 @@ func (s *Service) InspectSession(id string, maxOutputChars int) (SessionInspecti
 	if !ok {
 		return SessionInspection{SessionDetail: detail}, nil
 	}
-	content, err := s.sessionItemFullContent(item)
+	content, err := s.sessionItemFullContent(id, item)
 	if err != nil {
 		return SessionInspection{}, err
 	}

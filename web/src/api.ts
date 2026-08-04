@@ -1,4 +1,4 @@
-import type { ActiveRunDescriptor, Bootstrap, CodexAuthStatus, ImageAttachmentInput, ItemsPage, Project, ProviderSettingsDocument, ProviderSettingsInput, RunEvent, Session, SessionDebugSettings, SessionModelOptions, SessionSnapshot } from './types'
+import type { ActiveRunDescriptor, Bootstrap, CodexAuthStatus, ImageAttachmentInput, ItemsPage, LifecycleEvent, Project, ProviderSettingsDocument, ProviderSettingsInput, RunEvent, Session, SessionDebugSettings, SessionModelOptions, SessionSnapshot } from './types'
 
 const tokenStorageKey = 'sai-capability-token'
 
@@ -137,13 +137,9 @@ export const api = {
     method: 'POST',
     body: JSON.stringify({ content, images }),
   }),
-  resendRun: (sessionID: string, replayItemID: string) => request<{ run_id: string; session_id: string; status: string }>(`/api/sessions/${encodeURIComponent(sessionID)}/runs`, {
+  continueRun: (sessionID: string) => request<{ run_id: string; session_id: string; status: string }>(`/api/sessions/${encodeURIComponent(sessionID)}/continue`, {
     method: 'POST',
-    body: JSON.stringify({ replay_item_id: replayItemID }),
-  }),
-  retryRun: (sessionID: string) => request<{ run_id: string; session_id: string; status: string }>(`/api/sessions/${encodeURIComponent(sessionID)}/runs`, {
-    method: 'POST',
-    body: JSON.stringify({ replay: true }),
+    body: '{}',
   }),
   sessionImage: async (sessionID: string, hash: string): Promise<Blob> => {
     const response = await fetch(`/api/sessions/${encodeURIComponent(sessionID)}/images/${encodeURIComponent(hash)}`, {
@@ -184,6 +180,11 @@ export const api = {
 }
 
 const streamReconnectLimit = 5
+
+export interface LifecycleStreamOptions {
+  signal?: AbortSignal
+  onReconnect?: () => void | Promise<void>
+}
 
 function waitForStreamReconnect(attempt: number): Promise<void> {
   const delay = Math.min(200 * (2 ** attempt), 2000)
@@ -242,5 +243,116 @@ export async function streamRun(runID: string, onEvent: (event: RunEvent) => voi
     }
     await waitForStreamReconnect(reconnects)
     reconnects++
+  }
+}
+
+/**
+ * Streams process-wide durable lifecycle events. Unlike a run stream this is
+ * intentionally long-lived: a closed best-effort hub subscription is healed
+ * by reconnecting and letting the caller bootstrap its durable snapshot.
+ */
+export async function streamLifecycle(
+  onEvent: (event: LifecycleEvent) => void | Promise<void>,
+  options: LifecycleStreamOptions = {},
+): Promise<void> {
+  let reconnectAttempt = 0
+
+  while (!options.signal?.aborted) {
+    try {
+      const response = await fetch('/api/events', {
+        headers: { Authorization: `Bearer ${token}` },
+        signal: options.signal,
+      })
+      if (!response.ok || !response.body) {
+        throw new APIError(response.status, 'stream_failed', `Unable to connect to lifecycle events (${response.status})`)
+      }
+
+      const reader = response.body.getReader()
+      const decoder = new TextDecoder()
+      let buffer = ''
+      let eventName = ''
+      let dataLines: string[] = []
+      let sawEvent = false
+
+      const dispatchFrame = async (frame: string): Promise<void> => {
+        const lines = frame.split('\n')
+        for (const line of lines) {
+          if (line.startsWith(':')) continue
+          if (line.startsWith('event:')) {
+            eventName = line.slice(6).trim()
+          } else if (line.startsWith('data:')) {
+            dataLines.push(line.slice(5).trimStart())
+          }
+        }
+        if (dataLines.length > 0) {
+          const data = dataLines.join('\n')
+          dataLines = []
+          const event = JSON.parse(data) as LifecycleEvent
+          if (!event.type && eventName) event.type = eventName as LifecycleEvent['type']
+          eventName = ''
+          await onEvent(event)
+          sawEvent = true
+        } else {
+          eventName = ''
+        }
+      }
+
+      while (true) {
+        const { done, value } = await reader.read()
+        buffer += decoder.decode(value, { stream: !done })
+        // The backend currently emits LF frames. Normalize CRLF as well so
+        // proxies that rewrite line endings do not corrupt the parser.
+        buffer = buffer.replaceAll('\r\n', '\n').replaceAll('\r', '\n')
+        let boundary = buffer.indexOf('\n\n')
+        while (boundary >= 0) {
+          const frame = buffer.slice(0, boundary)
+          buffer = buffer.slice(boundary + 2)
+          await dispatchFrame(frame)
+          boundary = buffer.indexOf('\n\n')
+        }
+        if (done) {
+          if (buffer.trim()) await dispatchFrame(buffer)
+          break
+        }
+      }
+
+      // Any successfully delivered event means the connection itself worked;
+      // do not keep an old failure backoff after the next disconnect.
+      if (sawEvent) reconnectAttempt = 0
+    } catch (reason) {
+      if (options.signal?.aborted) return
+      // Lifecycle delivery is best effort. A failed connection is handled by
+      // the same reconnect path as an EOF, including a fresh bootstrap.
+      void reason
+    }
+
+    if (options.signal?.aborted) return
+    // Awaiting this callback makes reconnect reconciliation single-flight with
+    // the next connection, rather than allowing a reconnect storm to launch
+    // overlapping bootstrap requests.
+    try {
+      await options.onReconnect?.()
+    } catch {
+      // The caller owns error presentation; continue reconnecting even when a
+      // transient bootstrap request failed.
+    }
+    if (options.signal?.aborted) return
+    const delay = Math.min(200 * (2 ** reconnectAttempt), 2000)
+    reconnectAttempt = Math.min(reconnectAttempt + 1, 4)
+    const shouldContinue = await new Promise<boolean>((resolve) => {
+      let timer = 0
+      const abort = () => {
+        window.clearTimeout(timer)
+        options.signal?.removeEventListener('abort', abort)
+        resolve(false)
+      }
+      timer = window.setTimeout(() => {
+        options.signal?.removeEventListener('abort', abort)
+        resolve(true)
+      }, delay)
+      options.signal?.addEventListener('abort', abort, { once: true })
+      if (options.signal?.aborted) abort()
+    })
+    if (!shouldContinue) return
   }
 }

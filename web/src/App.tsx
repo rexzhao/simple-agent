@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { api, streamRun } from './api'
-import type { ActiveRun, ActiveRunDescriptor, Bootstrap, ImageAttachmentInput, ItemsPage, Project, RunEvent, RunStep, Session, SessionDebugSettings, SessionItem, SessionModelOption } from './types'
+import { api, streamLifecycle, streamRun } from './api'
+import type { ActiveRun, ActiveRunDescriptor, Bootstrap, ImageAttachmentInput, ItemsPage, LifecycleEvent, Project, RunEvent, RunStep, Session, SessionDebugSettings, SessionItem, SessionModelOption } from './types'
 import { errorMessage } from './lib/format'
+import { reduceLifecycleEvent, type SessionMaps } from './lib/lifecycleReducer'
 import { reduceRunEvent } from './lib/runEventReducer'
 import { modelKey, orderSessions, processKey, projectName, sessionDescendantIDs, sessionName } from './lib/session'
 import { emptyComposerDraft } from './components/Composer'
@@ -28,10 +29,12 @@ function App() {
   const [bootstrap, setBootstrap] = useState<Bootstrap | null>(null)
   const [projects, setProjects] = useState<Project[]>([])
   const [sessionsByProject, setSessionsByProject] = useState<Record<string, Session[]>>({})
-  const sessionsByProjectRef = useRef(sessionsByProject)
-  sessionsByProjectRef.current = sessionsByProject
   const [archivedSessionsByProject, setArchivedSessionsByProject] = useState<Record<string, Session[]>>({})
   const { selectedProjectID, selectedSessionID, selectedProjectRef, setSelectedProjectID, setSelectedSessionID } = useSessionSelection()
+  const selectedSessionIDRef = useRef(selectedSessionID)
+  selectedSessionIDRef.current = selectedSessionID
+  const sessionMapsRef = useRef<SessionMaps>({ active: sessionsByProject, archived: archivedSessionsByProject })
+  sessionMapsRef.current = { active: sessionsByProject, archived: archivedSessionsByProject }
   const [recoveredRuns, setRecoveredRuns] = useState<ActiveRunDescriptor[]>([])
 	const [recentStepsByTurn, setRecentStepsByTurn] = useState<Record<string, RunStep[]>>({})
   const [loading, setLoading] = useState(true)
@@ -64,10 +67,17 @@ function App() {
   const reconcileRetryCountRef = useRef<Record<string, number>>({})
   const reconcileRetryTimerRef = useRef<Record<string, number>>({})
   const refreshSessionRef = useRef<(sessionID: string) => Promise<Session | null>>(async () => null)
+  const settledRunIDsRef = useRef(new Set<string>())
 
   const onSupersedeRunRef = useRef<(sessionID: string, oldRunID: string) => void>(() => {})
 
-  const { activeRunsBySession, activeRunsRef, runningSessionIDs, addActiveRun, updateActiveRun, queueRunEvent, flushRunEvents } = useRunRegistry({ onSupersedeRun: (sessionID, oldRunID) => onSupersedeRunRef.current(sessionID, oldRunID) })
+  const { activeRunsBySession, activeRunsRef, runningSessionIDs, addActiveRun, syncActiveRuns, updateActiveRun, queueRunEvent, flushRunEvents } = useRunRegistry({ onSupersedeRun: (sessionID, oldRunID) => onSupersedeRunRef.current(sessionID, oldRunID) })
+
+  const setSessionMaps = useCallback((maps: SessionMaps) => {
+    sessionMapsRef.current = maps
+    setSessionsByProject(maps.active)
+    setArchivedSessionsByProject(maps.archived)
+  }, [])
 
   const clearTurnError = useCallback((sessionID: string) => {
     setTurnErrors((current) => {
@@ -81,49 +91,73 @@ function App() {
   const loadProjects = useCallback(async () => {
     const payload = await api.projects()
     setProjects(payload.projects)
-    setSessionsByProject((current) => Object.fromEntries(
-      payload.projects.map((project) => [project.id, current[project.id] ?? []]),
-    ))
-    setArchivedSessionsByProject((current) => Object.fromEntries(
-      payload.projects.map((project) => [project.id, current[project.id] ?? []]),
-    ))
+    const maps = sessionMapsRef.current
+    setSessionMaps({
+      active: Object.fromEntries(payload.projects.map((project) => [project.id, maps.active[project.id] ?? []])),
+      archived: Object.fromEntries(payload.projects.map((project) => [project.id, maps.archived[project.id] ?? []])),
+    })
     setSelectedProjectID((current) => {
       if (current && payload.projects.some((project) => project.id === current)) return current
       return payload.projects[0]?.id ?? ''
     })
     return payload.projects
-  }, [])
+  }, [setSessionMaps])
+
+  const bootstrapInFlightRef = useRef<Promise<ActiveRunDescriptor[]> | null>(null)
+  const bootstrapApplication = useCallback(async (preserveSelection: boolean): Promise<ActiveRunDescriptor[]> => {
+    if (bootstrapInFlightRef.current) return bootstrapInFlightRef.current
+    const operation = (async () => {
+      const [bootstrapPayload, projectsPayload, activeRunsPayload] = await Promise.all([api.bootstrap(), api.projects(), api.activeRuns()])
+      const sessionEntries = await Promise.all(projectsPayload.projects.map(async (project) => {
+        const [activePayload, archivedPayload] = await Promise.all([api.sessions(project.id), api.sessions(project.id, true)])
+        return [project.id, orderSessions(activePayload.sessions), orderSessions(archivedPayload.sessions)] as const
+      }))
+      const maps: SessionMaps = {
+        active: Object.fromEntries(sessionEntries.map(([projectID, sessions]) => [projectID, sessions])),
+        archived: Object.fromEntries(sessionEntries.map(([projectID, , sessions]) => [projectID, sessions])),
+      }
+      const recovered = activeRunsPayload.runs.filter((run) => projectsPayload.projects.some((project) => maps.active[project.id]?.some((session) => session.id === run.session_id)))
+      const recoveredProject = recovered.length > 0
+        ? projectsPayload.projects.find((project) => maps.active[project.id]?.some((session) => session.id === recovered[0].session_id))
+        : null
+      const currentProjectID = selectedProjectRef.current
+      const currentSessionID = selectedSessionIDRef.current
+      const currentProject = projectsPayload.projects.find((project) => project.id === currentProjectID)
+      const currentSessionProject = projectsPayload.projects.find((project) =>
+        maps.active[project.id]?.some((session) => session.id === currentSessionID) ||
+        maps.archived[project.id]?.some((session) => session.id === currentSessionID),
+      )
+      const firstProjectID = preserveSelection && currentProject
+        ? currentProject.id
+        : recoveredProject?.id ?? projectsPayload.projects[0]?.id ?? ''
+      const firstSessionID = preserveSelection && currentSessionProject && currentSessionID
+        ? currentSessionID
+        : recovered[0]?.session_id ?? maps.active[firstProjectID]?.[0]?.id ?? ''
+      setBootstrap(bootstrapPayload)
+      setProjects(projectsPayload.projects)
+      setSessionMaps(maps)
+      syncActiveRuns(recovered)
+      setSelectedProjectID(firstProjectID)
+      setSelectedSessionID(firstSessionID)
+      setRecoveredRuns(recovered)
+      if (!preserveSelection || projectsPayload.projects.length === 0) setShowProjectForm(projectsPayload.projects.length === 0)
+      return recovered
+    })()
+    bootstrapInFlightRef.current = operation
+    try {
+      return await operation
+    } finally {
+      if (bootstrapInFlightRef.current === operation) bootstrapInFlightRef.current = null
+    }
+  }, [setSessionMaps, syncActiveRuns])
 
   useEffect(() => {
     let cancelled = false
-    void Promise.all([api.bootstrap(), api.projects(), api.activeRuns()])
-      .then(async ([bootstrapPayload, projectsPayload, activeRunsPayload]) => {
-        const sessionEntries = await Promise.all(projectsPayload.projects.map(async (project) => {
-          const [activePayload, archivedPayload] = await Promise.all([api.sessions(project.id), api.sessions(project.id, true)])
-          return [project.id, orderSessions(activePayload.sessions), orderSessions(archivedPayload.sessions)] as const
-        }))
-        if (cancelled) return
-        const sessionMap = Object.fromEntries(sessionEntries.map(([projectID, sessions]) => [projectID, sessions]))
-        const archivedSessionMap = Object.fromEntries(sessionEntries.map(([projectID, , sessions]) => [projectID, sessions]))
-        const recovered = activeRunsPayload.runs.filter((run) => projectsPayload.projects.some((project) => sessionMap[project.id]?.some((session) => session.id === run.session_id)))
-        const recoveredProject = recovered.length > 0
-          ? projectsPayload.projects.find((project) => sessionMap[project.id]?.some((session) => session.id === recovered[0].session_id))
-          : null
-        const firstProjectID = recoveredProject?.id ?? projectsPayload.projects[0]?.id ?? ''
-        const firstSessionID = recovered[0]?.session_id ?? sessionMap[firstProjectID]?.[0]?.id ?? ''
-        setBootstrap(bootstrapPayload)
-        setProjects(projectsPayload.projects)
-        setSessionsByProject(sessionMap)
-        setArchivedSessionsByProject(archivedSessionMap)
-        setSelectedProjectID(firstProjectID)
-        setSelectedSessionID(firstSessionID)
-        setRecoveredRuns(recovered)
-        setShowProjectForm(projectsPayload.projects.length === 0)
-      })
+    void bootstrapApplication(false)
       .catch((reason: unknown) => setError(errorMessage(reason)))
-      .finally(() => setLoading(false))
+      .finally(() => { if (!cancelled) setLoading(false) })
     return () => { cancelled = true }
-  }, [])
+  }, [bootstrapApplication])
 
   const loadSessions = useCallback(async (projectID: string, preferredSessionID = '', preserveSelection = false) => {
     if (!projectID) {
@@ -132,8 +166,11 @@ function App() {
     }
     const [payload, archivedPayload] = await Promise.all([api.sessions(projectID), api.sessions(projectID, true)])
     const ordered = orderSessions(payload.sessions)
-    setSessionsByProject((current) => ({ ...current, [projectID]: ordered }))
-    setArchivedSessionsByProject((current) => ({ ...current, [projectID]: orderSessions(archivedPayload.sessions) }))
+    const maps = sessionMapsRef.current
+    setSessionMaps({
+      active: { ...maps.active, [projectID]: ordered },
+      archived: { ...maps.archived, [projectID]: orderSessions(archivedPayload.sessions) },
+    })
     if (!preserveSelection && selectedProjectRef.current === projectID) {
       setSelectedSessionID((current) => {
         const preferred = preferredSessionID || current
@@ -142,7 +179,7 @@ function App() {
       })
     }
     return ordered
-  }, [])
+  }, [setSessionMaps])
 
   const reportError = useCallback((reason: unknown) => setError(errorMessage(reason)), [])
   const { sessionDetail, itemsPage, selectedSessionRef, refreshSession, loadOlder } =
@@ -509,6 +546,8 @@ function App() {
         }))
         break
       case 'run.settled': {
+        if (settledRunIDsRef.current.has(runID)) return
+        settledRunIDsRef.current.add(runID)
         const settledRun = activeRunsRef.current[sessionID]
         if (!settledRun || settledRun.id !== runID) return
         const settledLastSeq = Number(event.last_seq ?? 0)
@@ -565,69 +604,152 @@ function App() {
     }
   }, [flushRunEvents, queueRunEvent, refreshSession, saveRecentStepsAndRemove, scheduleReconcileRetry, startReconcileTimeout, updateActiveRun])
 
+  const runStreamsRef = useRef(new Set<string>())
+  const connectRunStream = useCallback((runID: string, sessionID: string) => {
+    if (!runID || !sessionID || runStreamsRef.current.has(runID)) return
+    runStreamsRef.current.add(runID)
+    void streamRun(runID, (event) => handleRunEvent(sessionID, runID, event))
+      .catch((reason: unknown) => {
+        updateActiveRun(sessionID, runID, (existing) => ({ ...existing, status: 'error_pending_refresh' }))
+        setRecoveredRuns((current) => current.filter((item) => item.run_id !== runID))
+        setError(errorMessage(reason))
+      })
+      .finally(() => runStreamsRef.current.delete(runID))
+  }, [handleRunEvent, updateActiveRun])
+
+  const knownSession = useCallback((sessionID: string): Session | null => {
+    for (const sessions of Object.values(sessionMapsRef.current.active)) {
+      const session = sessions.find((item) => item.id === sessionID)
+      if (session) return session
+    }
+    for (const sessions of Object.values(sessionMapsRef.current.archived)) {
+      const session = sessions.find((item) => item.id === sessionID)
+      if (session) return session
+    }
+    return null
+  }, [])
+
+  const applyLifecycleSessionEvent = useCallback((event: LifecycleEvent) => {
+    const current = sessionMapsRef.current
+    const next = reduceLifecycleEvent(current, event)
+    if (next === current) return
+    setSessionMaps(next)
+
+    if (event.type !== 'session.deleted') return
+    const deletedIDs = new Set([
+      typeof event.session === 'string' ? event.session : '',
+      event.session_id ?? '',
+      ...(event.descendants ?? []),
+    ])
+    if (!deletedIDs.has(selectedSessionIDRef.current)) return
+    const projectID = event.project_id ?? event.project ?? selectedProjectRef.current
+    const nextProjectID = next.active[projectID] || next.archived[projectID]
+      ? projectID
+      : Object.keys(next.active)[0] ?? ''
+    setSelectedProjectID(nextProjectID)
+    setSelectedSessionID(next.active[nextProjectID]?.[0]?.id ?? '')
+  }, [setSelectedProjectID, setSelectedSessionID, setSessionMaps])
+
+  const handleLifecycleEvent = useCallback(async (event: LifecycleEvent): Promise<void> => {
+    const eventSession = event.session && typeof event.session === 'object'
+      ? event.session
+      : event.metadata ?? event.session_metadata
+    if (event.type === 'session.created' || event.type === 'session.updated' || event.type === 'session.archived' || event.type === 'session.deleted' || event.type === 'run.settled') {
+      applyLifecycleSessionEvent(event)
+    }
+
+    const sessionID = event.session_id ?? (typeof event.session === 'string' ? event.session : eventSession?.id) ?? ''
+    const runID = event.run_id ?? event.run ?? ''
+    if (event.type === 'run.started') {
+      let session = eventSession ?? knownSession(sessionID)
+      if (!session && sessionID) {
+        try {
+          session = await api.session(sessionID)
+          applyLifecycleSessionEvent({ type: 'session.updated', session })
+        } catch {
+          // The event may race the initial project bootstrap. The next
+          // reconnect will reconcile it from the authoritative lists.
+        }
+      }
+      if (session) applyLifecycleSessionEvent({ type: 'session.updated', session: { ...session, status: 'running' } })
+      if (sessionID && runID) {
+        if (!activeRunsRef.current[sessionID] || activeRunsRef.current[sessionID].id !== runID) {
+          addActiveRun({
+            id: runID,
+            sessionID,
+            turnID: event.turn_id,
+            restored: true,
+            userText: '',
+            assistantText: '',
+            steps: [],
+            agentIteration: 0,
+            status: 'running',
+          })
+        }
+        connectRunStream(runID, sessionID)
+      }
+      return
+    }
+
+    if (event.type === 'run.settled' && sessionID && runID) {
+      const activeRun = activeRunsRef.current[sessionID]
+      if (activeRun?.id === runID) {
+        await handleRunEvent(sessionID, runID, {
+          type: 'run.settled',
+          run_id: runID,
+          status: event.status ?? 'committed',
+          turn_id: event.turn_id,
+          last_seq: event.last_seq,
+          message: event.message,
+        })
+      } else if (selectedSessionIDRef.current === sessionID) {
+        try { await refreshSession(sessionID) } catch { /* the event metadata already updated the tree */ }
+      }
+    }
+  }, [activeRunsRef, addActiveRun, applyLifecycleSessionEvent, connectRunStream, handleRunEvent, knownSession, refreshSession])
+
+  const lifecycleEventHandlerRef = useRef<(event: LifecycleEvent) => Promise<void>>(async () => {})
+  lifecycleEventHandlerRef.current = handleLifecycleEvent
+  const reconcileLifecycleRef = useRef<() => Promise<void>>(async () => {})
+  reconcileLifecycleRef.current = async () => {
+    try {
+      await bootstrapApplication(true)
+    } catch (reason) {
+      setError(errorMessage(reason))
+      throw reason
+    }
+  }
+
+  useEffect(() => {
+    const controller = new AbortController()
+    void streamLifecycle(
+      (event) => lifecycleEventHandlerRef.current(event),
+      { signal: controller.signal, onReconnect: () => reconcileLifecycleRef.current() },
+    ).catch((reason: unknown) => {
+      if (!controller.signal.aborted) setError(errorMessage(reason))
+    })
+    return () => controller.abort()
+  }, [])
+
   useEffect(() => {
     if (recoveredRuns.length === 0) return
     for (const run of recoveredRuns) {
-      if (activeRunsRef.current[run.session_id]) continue
-      addActiveRun({
-        id: run.run_id,
-        sessionID: run.session_id,
-        turnID: run.turn_id,
-        restored: true,
-        userText: '',
-        assistantText: '',
-        steps: [],
-        agentIteration: 0,
-        status: 'running',
-      })
-      void streamRun(run.run_id, (event) => handleRunEvent(run.session_id, run.run_id, event)).catch((reason: unknown) => {
-        updateActiveRun(run.session_id, run.run_id, (existing) =>
-          existing ? { ...existing, status: 'error_pending_refresh' } : null)
-        setRecoveredRuns((current) => current.filter((item) => item.run_id !== run.run_id))
-        setError(errorMessage(reason))
-      })
-    }
-  }, [addActiveRun, handleRunEvent, recoveredRuns, refreshSession, updateActiveRun])
-
-  // Agent tools can create child sessions and start runs without a Web
-  // request. Periodically reconcile the coordinator's active set so those
-  // sessions appear in the tree and attach to the same replayable SSE stream.
-  useEffect(() => {
-    let disposed = false
-    let syncing = false
-    const syncCoordinatorRuns = async () => {
-      if (syncing) return
-      syncing = true
-      try {
-        const payload = await api.activeRuns()
-        if (disposed) return
-		const projectBySessionID = new Map(Object.entries(sessionsByProjectRef.current).flatMap(([projectID, sessions]) => sessions.map((session) => [session.id, projectID] as const)))
-		const unknownSessionIDs = [...new Set(payload.runs.map((run) => run.session_id).filter((sessionID) => !projectBySessionID.has(sessionID)))]
-		const activeProjectIDs = new Set(payload.runs.map((run) => projectBySessionID.get(run.session_id)).filter((projectID): projectID is string => Boolean(projectID)))
-        if (unknownSessionIDs.length > 0) {
-          const details = await Promise.all(unknownSessionIDs.map((sessionID) => api.session(sessionID)))
-          if (disposed) return
-		  for (const detail of details) if (detail.project_id) activeProjectIDs.add(detail.project_id)
-        }
-		// Refresh projects containing active runs as well as unknown runs. This
-		// discovers short-lived child sessions that may start and finish entirely
-		// between two coordinator polls while their parent is still running.
-		await Promise.all([...activeProjectIDs].map((projectID) => loadSessions(projectID, '', true)))
-        if (!disposed) setRecoveredRuns(payload.runs)
-      } catch {
-        // Bootstrap and explicit actions surface errors. Background discovery
-        // remains best-effort and retries on the next interval.
-      } finally {
-        syncing = false
+      if (!activeRunsRef.current[run.session_id]) {
+        addActiveRun({
+          id: run.run_id,
+          sessionID: run.session_id,
+          turnID: run.turn_id,
+          restored: true,
+          userText: '',
+          assistantText: '',
+          steps: [],
+          agentIteration: 0,
+          status: 'running',
+        })
       }
+      connectRunStream(run.run_id, run.session_id)
     }
-    void syncCoordinatorRuns()
-    const timer = window.setInterval(() => void syncCoordinatorRuns(), 1500)
-    return () => {
-      disposed = true
-      window.clearInterval(timer)
-    }
-  }, [loadSessions])
+  }, [activeRunsRef, addActiveRun, connectRunStream, recoveredRuns])
 
   // startNewRun handles new composer input. A successful start clears the
   // session's recorded turn failure.
@@ -646,11 +768,7 @@ function App() {
       })
       clearTurnError(sessionID)
       const boundRunID = started.run_id
-      void streamRun(boundRunID, (event) => handleRunEvent(sessionID, boundRunID, event)).catch((reason: unknown) => {
-        updateActiveRun(sessionID, boundRunID, (existing) =>
-          existing ? { ...existing, status: 'error_pending_refresh' } : null)
-        setError(errorMessage(reason))
-      })
+      connectRunStream(boundRunID, sessionID)
       return true
     } catch (reason) {
       const runID = activeRunsRef.current[sessionID]?.id
@@ -682,13 +800,16 @@ function App() {
     return startNewRun(sessionID, content, imageInputs)
   }
 
-  // Resend asks the server to run directly from the existing active history.
-  // The original user item is not downloaded, echoed, or appended again.
-  const resendMessage = async (item: SessionItem): Promise<boolean> => {
+  const continueRun = useCallback(async (): Promise<boolean> => {
     if (!selectedSessionID) return false
     const sessionID = selectedSessionID
+    const activeRun = activeRunsRef.current[sessionID]
+    const detail = sessionDetail?.id === sessionID ? sessionDetail : undefined
+    if (activeRun?.status === 'running' || !detail || (detail.status !== 'interrupted' && detail.status !== 'failed') || !detail.interrupted_run_id || !detail.interrupted_turn_id) {
+      return false
+    }
     try {
-      const started = await api.resendRun(sessionID, item.id)
+      const started = await api.continueRun(sessionID)
       addActiveRun({
         id: started.run_id,
         sessionID,
@@ -701,46 +822,13 @@ function App() {
       })
       clearTurnError(sessionID)
       const boundRunID = started.run_id
-      void streamRun(boundRunID, (event) => handleRunEvent(sessionID, boundRunID, event)).catch((reason: unknown) => {
-        updateActiveRun(sessionID, boundRunID, (existing) =>
-          existing ? { ...existing, status: 'error_pending_refresh' } : null)
-        setError(errorMessage(reason))
-      })
+      connectRunStream(boundRunID, sessionID)
       return true
     } catch (reason) {
       setError(errorMessage(reason))
       return false
     }
-  }
-
-  const retryRun = useCallback(async (): Promise<boolean> => {
-    if (!selectedSessionID) return false
-    const sessionID = selectedSessionID
-    try {
-      const started = await api.retryRun(sessionID)
-      addActiveRun({
-        id: started.run_id,
-        sessionID,
-        userText: '',
-        userImages: [],
-        assistantText: '',
-        steps: [],
-        agentIteration: 0,
-        status: 'running',
-      })
-      clearTurnError(sessionID)
-      const boundRunID = started.run_id
-      void streamRun(boundRunID, (event) => handleRunEvent(sessionID, boundRunID, event)).catch((reason: unknown) => {
-        updateActiveRun(sessionID, boundRunID, (existing) =>
-          existing ? { ...existing, status: 'error_pending_refresh' } : null)
-        setError(errorMessage(reason))
-      })
-      return true
-    } catch (reason) {
-      setError(errorMessage(reason))
-      return false
-    }
-  }, [selectedSessionID])
+  }, [addActiveRun, clearTurnError, connectRunStream, selectedSessionID, sessionDetail])
 
   const cancelRun = async () => {
     const run = activeRunsRef.current[selectedSessionID]
@@ -878,12 +966,11 @@ function App() {
             sessionNames={sessionNames}
             turnError={turnErrors[selectedSessionID] ?? null}
             onDismissTurnError={() => clearTurnError(selectedSessionID)}
-            onResend={(item) => resendMessage(item)}
             onLoadOlder={loadOlder}
             onSend={(content, images) => sendMessage(content, images)}
             onCancel={() => void cancelRun()}
             onCancelTool={(toolCallID) => void cancelToolCall(toolCallID)}
-            onRetry={() => void retryRun()}
+            onContinue={() => void continueRun()}
             onRetryRefresh={() => void retryRefreshSession(selectedSessionID)}
             onDebug={openDebugSettings}
             onRemoveQueuedPrompt={(promptID) => void removeQueuedPrompt(promptID)}
