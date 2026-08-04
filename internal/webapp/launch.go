@@ -77,6 +77,19 @@ func Run(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "sai: %v\n", err)
 		return 1
 	}
+	instanceLock, exitCode, mustExit, err := acquireInstance(root, instanceAcquireOptions{
+		noOpen: *noOpen,
+		stdout: stdout,
+		stderr: stderr,
+	})
+	if err != nil {
+		fmt.Fprintf(stderr, "sai: %v\n", err)
+		return 1
+	}
+	if mustExit {
+		return exitCode
+	}
+	defer instanceLock.Release()
 	listener, err := listenLoopback(*listenAddress)
 	if err != nil {
 		fmt.Fprintf(stderr, "sai: %v\n", err)
@@ -115,6 +128,16 @@ func Run(args []string, stdout, stderr io.Writer) int {
 
 	url := "http://" + listener.Addr().String() + "/#token=" + token
 	publicURL := "http://" + listener.Addr().String() + "/"
+	if err := instanceLock.writeRegistry(instanceRegistry{
+		PID:       os.Getpid(),
+		BaseURL:   publicURL,
+		Token:     token,
+		StartedAt: time.Now().UTC().Format(time.RFC3339),
+		Ready:     true,
+	}); err != nil {
+		fmt.Fprintf(stderr, "sai: %v\n", err)
+		return 1
+	}
 	fmt.Fprintf(stderr, "sai: starting %s\n", Version)
 	fmt.Fprintf(stderr, "sai: server root: %s\n", root)
 	fmt.Fprintf(stderr, "sai: root config: %s\n", configPath)
@@ -254,7 +277,8 @@ func capabilityToken() (string, error) {
 	return hex.EncodeToString(raw), nil
 }
 
-func openBrowser(url string) error {
+// openBrowserImpl 是打开默认浏览器的真实实现。
+func openBrowserImpl(url string) error {
 	var command *exec.Cmd
 	switch runtime.GOOS {
 	case "windows":
@@ -266,3 +290,6 @@ func openBrowser(url string) error {
 	}
 	return command.Start()
 }
+
+// openBrowser 是可替换的浏览器打开函数，测试可替换为探针。
+var openBrowser = openBrowserImpl

@@ -20,6 +20,12 @@ The default behavior is to listen on a random `127.0.0.1` port and open the Web
 application automatically. Runtime use does not require Node.js or a separate
 Web server.
 
+Only one instance may run per server root. Starting a second instance while one
+is already running reuses the existing instance: it opens the existing
+application in the browser (or prints the `SAI_WEB_URL` with `--no-open`) and
+exits. The single-instance lock lives in `<server-root>/instance.json` and is
+released automatically when the process exits or crashes.
+
 Launcher options:
 
 ```text
