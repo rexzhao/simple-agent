@@ -462,6 +462,117 @@ describe('App lifecycle bootstrap', () => {
     view.unmount()
   })
 
+  it('does not let a superseded run stream error pollute the current session', async () => {
+    mocks.api.activeRuns.mockResolvedValue({ runs: [{ run_id: 'old-run', session_id: 'session-1', turn_id: 'turn-old', started_at: '', status: 'running' }] })
+    mocks.api.snapshot.mockResolvedValue({
+      ...emptySnapshot(),
+      session: { ...mocks.session, status: 'running', current_run_id: 'old-run', running_run_id: 'old-run', running_turn_id: 'turn-old' },
+    })
+    mocks.api.startRun.mockResolvedValue({ run_id: 'new-run', session_id: 'session-1', status: 'running' })
+    mocks.streamRun.mockReset()
+    let rejectOld!: (reason: unknown) => void
+    mocks.streamRun.mockImplementation(async (runID: string, _handler: (event: unknown) => void | Promise<void>) => {
+      if (runID === 'old-run') return await new Promise<void>((_resolve, reject) => { rejectOld = reject })
+      return await new Promise<void>(() => {})
+    })
+
+    const view = render(<App />)
+    const composer = await screen.findByRole('textbox')
+    await waitFor(() => expect(mocks.streamRun).toHaveBeenCalledTimes(1))
+    const oldHandler = mocks.streamRun.mock.calls[0][1] as (event: unknown) => Promise<void> | void
+    await act(async () => { await oldHandler({ type: 'turn.failed', turn_id: 'turn-old', code: 'failed', message: 'old failure' }) })
+    await waitFor(() => expect(view.container.querySelector('.message.assistant.transient')).not.toBeNull())
+
+    fireEvent.change(composer, { target: { value: 'new attempt' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+    await waitFor(() => expect(mocks.streamRun).toHaveBeenCalledTimes(2))
+    const newHandler = mocks.streamRun.mock.calls[1][1] as (event: unknown) => Promise<void> | void
+    await act(async () => { await newHandler({ type: 'run.started', run_id: 'new-run', session_id: 'session-1', turn_id: 'turn-new' }) })
+
+    // A stale reader can still deliver events after the newer run has taken
+    // the session slot.  Transient terminal events are ignored, while a
+    // committed projection from this old stream remains valid durable data.
+    await act(async () => {
+      await oldHandler({
+        type: 'item.appended', session_id: 'session-1', run_id: 'old-run', seq: 1, revision: '1', item_id: 'old-durable-item',
+        item: {
+          id: 'old-durable-item', seq: 1, turn_id: 'turn-old', created_at: '', kind: 'message', visibility: 'visible', audience: 'model',
+          message: { role: 'assistant', content: { inline: 'durable old output' } },
+        },
+      })
+      await oldHandler({ type: 'turn.failed', turn_id: 'turn-old', code: 'failed', message: 'late old failure' })
+      await oldHandler({ type: 'run.settled', run_id: 'old-run', status: 'committed', committed_revision: '9', message: 'late old settlement' })
+    })
+    expect(screen.getByText('durable old output')).toBeTruthy()
+    expect(screen.queryByText('late old failure')).toBeNull()
+    expect(view.container.querySelector('.turn-error')).toBeNull()
+    expect(screen.queryByRole('alert')).toBeNull()
+    expect(screen.getByRole('button', { name: 'Stop' })).toBeTruthy()
+    expect(screen.getByLabelText('Session status: running')).toBeTruthy()
+
+    // The old reader rejects after the new authoritative run has taken over.
+    // It may clean up its own connection, but must not create a global error
+    // banner or alter the new run's transient state.
+    await act(async () => { rejectOld(new Error('old stream disconnected')) })
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Stop' })).toBeTruthy())
+    expect(screen.queryByRole('alert')).toBeNull()
+    view.unmount()
+  })
+
+  it('keeps a pending new admission gated when an old terminal replay arrives', async () => {
+    mocks.api.activeRuns.mockResolvedValue({ runs: [{ run_id: 'old-run', session_id: 'session-1', turn_id: 'turn-old', started_at: '', status: 'running' }] })
+    mocks.api.snapshot.mockResolvedValue({
+      ...emptySnapshot(),
+      session: { ...mocks.session, status: 'running', current_run_id: 'old-run', running_run_id: 'old-run', running_turn_id: 'turn-old' },
+    })
+    let resolveAdmission!: (value: { run_id: string; session_id: string; status: string }) => void
+    mocks.api.startRun.mockImplementation(() => new Promise((resolve) => { resolveAdmission = resolve }))
+    mocks.streamRun.mockReset()
+    let rejectOld!: (reason: unknown) => void
+    mocks.streamRun.mockImplementation(async (runID: string, _handler: (event: unknown) => void | Promise<void>) => {
+      if (runID === 'old-run') return await new Promise<void>((_resolve, reject) => { rejectOld = reject })
+      return await new Promise<void>(() => {})
+    })
+
+    const view = render(<App />)
+    const composer = await screen.findByRole('textbox')
+    await waitFor(() => expect(mocks.streamRun).toHaveBeenCalledTimes(1))
+    const oldHandler = mocks.streamRun.mock.calls[0][1] as (event: unknown) => Promise<void> | void
+    await act(async () => { await oldHandler({ type: 'turn.failed', turn_id: 'turn-old', code: 'failed', message: 'old failure' }) })
+
+    fireEvent.change(composer, { target: { value: 'new admission' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+    await waitFor(() => expect(mocks.api.startRun).toHaveBeenCalledTimes(1))
+    expect((composer as HTMLTextAreaElement).disabled).toBe(true)
+
+    // There is no ActiveRun for the new run yet.  The old
+    // terminal replay must not clear awaitingRunStarted or mark the sidebar
+    // idle, and a second click must not submit another POST.
+    await act(async () => { await oldHandler({ type: 'run.settled', run_id: 'old-run', status: 'committed', committed_revision: '9' }) })
+    expect((composer as HTMLTextAreaElement).disabled).toBe(true)
+    const lifecycleHandler = mocks.streamLifecycle.mock.calls[0][0] as (event: unknown) => Promise<void>
+    await act(async () => {
+      await lifecycleHandler({
+        type: 'run.settled', session_id: 'session-1', run_id: 'old-run', status: 'committed', committed_revision: '9',
+        session: { ...mocks.session, status: 'idle', current_run_id: undefined, running_run_id: undefined },
+      })
+    })
+    expect(screen.getByLabelText('Session status: running')).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+    expect(mocks.api.startRun).toHaveBeenCalledTimes(1)
+
+    resolveAdmission({ run_id: 'new-run', session_id: 'session-1', status: 'running' })
+    await waitFor(() => expect(mocks.streamRun).toHaveBeenCalledTimes(2))
+    expect(mocks.streamRun.mock.calls[1][0]).toBe('new-run')
+    const newHandler = mocks.streamRun.mock.calls[1][1] as (event: unknown) => Promise<void> | void
+    await act(async () => { await newHandler({ type: 'run.started', run_id: 'new-run', session_id: 'session-1', turn_id: 'turn-new' }) })
+    expect((composer as HTMLTextAreaElement).disabled).toBe(false)
+
+    await act(async () => { rejectOld(new Error('old stream closed')) })
+    expect(screen.queryByRole('alert')).toBeNull()
+    view.unmount()
+  })
+
   it('keeps a lagging run through bounded refresh failures', async () => {
     const { view, onEvent } = await renderSettlementApp([emptySnapshot()])
     vi.useFakeTimers()

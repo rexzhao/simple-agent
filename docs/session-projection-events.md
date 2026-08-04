@@ -596,3 +596,48 @@ The frontend type declarations accept the logical `item.created` alias, but
 the backend emits only the legacy-compatible `item.appended` wire name. Any
 later protocol change must update this document and its characterization tests
 in the same change.
+
+## 8. Stage 7 fault-injection and E2E acceptance matrix
+
+This section is the final-stage verification matrix.  It deliberately names
+the test level: reducer/hook tests are deterministic **unit** tests, Go HTTP
+and coordinator tests are **integration** tests, and the Playwright specs are
+browser **E2E** tests using a controllable mock server.  The mock server uses
+request counters and `expect.poll`/Promise barriers rather than arbitrary
+sleep intervals.
+
+| Failure or ordering class | Unit | Integration | E2E |
+| --- | --- | --- | --- |
+| Admission/run identity: no stream before the 202 `run_id`, no optimistic user row, projection before `run.started`/first text, one user item on replay | `web/src/App.test.tsx` admission and early-projection cases; `sessionStore.test.ts` item upsert | `internal/webapp/runs_test.go` coordinator admission/early-event registry cases | `app-flow.spec.ts` first-run and durable-assistant cases |
+| Projection/settlement ordering, duplicate `item.created`/`item.appended`, duplicate lifecycle/per-run settlement, stable terminal replay and reconnect gap | `sessionStore.test.ts`, `App.test.tsx` settlement cases | `runs_test.go` stable IDs, terminal compaction and resync cases; `session_projection_events_test.go` safe DTO cases | `app-flow.spec.ts` durable bubble/replay assertions |
+| Revision watermark: covered settlement has zero extra snapshots; lagging settlement repairs; malformed/missing watermark is conservative; decimal values beyond `Number.MAX_SAFE_INTEGER`; old `last_seq` fallback | `settlement.test.ts`, `sessionStore.test.ts`, `App.test.tsx` reconciliation cases | `runs_test.go` durable final-watermark case; lifecycle contract tests | `app-flow.spec.ts` covered and lagging settlement cases |
+| Bounded reconciliation: stale repair remains transient, retry budget is finite, error/manual recovery is not treated as durable coverage | `App.test.tsx` bounded-refresh case | server/run replay resync tests | Playwright lagging-settlement fixture |
+| Initial snapshot races: events queued before first snapshot, replay newer than snapshot, queue/session overflow and in-flight resync watermark; pending queue alone never settles a run | `sessionStore.test.ts` pending/replay/capacity cases; `useSessionStore.test.ts` refresh loop | snapshot/dual-fetch handlers in `server_behavior_test.go` | background-settle and recovered-run specs |
+| Terminal committed/failed/cancelled partial item retention; transient teardown; durable reasoning/tool projection is not duplicated | run reducer/conversation row tests and `App.test.tsx` terminal cases | execution projection and lifecycle tests | `turn-failure`, `process-timeline`, cancel and durable-assistant specs |
+| Session identity/races: fast switching, late list/snapshot responses, stale bootstrap/list overlap, removed project responses, background completion, superseded stream error, and old run events not settling a new run | `App.test.tsx` superseded-stream case; store generation/identity tests | lifecycle/run registry identity tests | `app-flow.spec.ts` fast-switch old-stream-error, late-list-response, stale-bootstrap, and removed-project cases; background-settle spec |
+| Backend contract: precision-safe revision, commit-before-publish, first assistant create, cumulative update, terminal flush | execution projection/event unit tests | `session_events_test.go`, `session_projection_events_test.go`, lifecycle and webapp run tests | durable assistant stream fixture |
+
+Run the full acceptance set from the repository root (the `cd web` applies
+only to the web commands):
+
+```bash
+go test ./...
+go test -race ./internal/execution ./internal/webapp
+cd web
+npm run check
+npm test -- --run
+npm run build
+npm run test:e2e
+cd ..
+git diff --check
+```
+
+`npm run build` writes the checked-in embedded asset directory
+`internal/webapp/assets`.  The build is a verification step, not a source
+change: restore those generated files before review with
+`git checkout -- internal/webapp/assets` (or restore only the generated diff
+if another local asset change is intentional).  A passing E2E run requires
+the Playwright web server and mock routes to reach their barriers; a failed
+browser launch, missing dependency, or unavailable Go toolchain must be
+reported as an environment limitation rather than silently counted as a
+pass.  Always finish with `git status --short` and `git diff --check`.

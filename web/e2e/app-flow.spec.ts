@@ -27,6 +27,12 @@ const session = {
   context: { context_window: 32000, context_window_source: 'configured', warning_threshold_percent: 80 },
 }
 
+const secondarySession = {
+  ...session,
+  id: 'session-secondary',
+  display_name: 'Secondary session',
+}
+
 function itemsPage(items: unknown[] = []) {
   const sequences = items.map((item) => Number((item as { seq?: number }).seq ?? 0)).filter(Boolean)
   return {
@@ -330,6 +336,243 @@ test('snapshots once when settlement watermark is still ahead of local projectio
   await expect(page.getByText('repaired answer')).toBeVisible()
   await expect(page.getByLabel('Session status: idle')).toBeVisible()
   expect(snapshotRequests).toBe(2)
+})
+
+test('keeps a late old-run stream failure out of a fast-switched session', async ({ page }) => {
+  let oldStreamConnections = 0
+  let oldStreamFailures = 0
+
+  await page.route('**/api/**', async (route) => {
+    const request = route.request()
+    const url = new URL(request.url())
+    if (url.pathname === '/api/events') {
+      await new Promise<never>(() => {})
+      return
+    }
+    const common = commonBootstrap(url.pathname)
+    if (common) {
+      if (url.pathname === '/api/runs/active') return json(route, { runs: [{ run_id: 'old-run', session_id: session.id, turn_id: 'turn-old', started_at: '', status: 'running' }] })
+      return json(route, common)
+    }
+    if (url.pathname === '/api/projects') return json(route, { projects: [project] })
+    if (url.pathname === `/api/projects/${project.id}/sessions`) {
+      return json(route, { sessions: url.searchParams.get('archived') === 'true' ? [] : [session, secondarySession] })
+    }
+    if (url.pathname === `/api/sessions/${session.id}/snapshot`) {
+      return json(route, { session_id: session.id, revision: '0', session, history: itemsPage() })
+    }
+    if (url.pathname === `/api/sessions/${secondarySession.id}/snapshot`) {
+      return json(route, { session_id: secondarySession.id, revision: '0', session: secondarySession, history: itemsPage() })
+    }
+    if (url.pathname === `/api/runs/old-run/events`) {
+      oldStreamConnections++
+      if (oldStreamConnections === 1) {
+        return route.fulfill({
+          status: 200,
+          contentType: 'text/event-stream',
+          body: sse([{ type: 'run.started', run_id: 'old-run', session_id: session.id, status: 'running' }]),
+        })
+      }
+      oldStreamFailures++
+      return route.fulfill({ status: 503, contentType: 'application/json', body: JSON.stringify({ error: { message: 'old reader unavailable' } }) })
+    }
+    return json(route, { error: { code: 'not_mocked', message: `${request.method()} ${url.pathname}` } }, 404)
+  })
+
+  await page.goto('/')
+  await expect(page.getByRole('heading', { name: session.display_name })).toBeVisible()
+  await expect.poll(() => oldStreamConnections).toBeGreaterThanOrEqual(1)
+  await page.getByText(secondarySession.display_name, { exact: true }).click()
+  await expect(page.getByRole('heading', { name: secondarySession.display_name })).toBeVisible()
+  await expect.poll(() => oldStreamFailures).toBe(1)
+
+  // The old run remains a real background run, but its reader failure is not
+  // an error in the newly selected session.
+  await expect(page.getByRole('alert')).toHaveCount(0)
+})
+
+test('does not let a late session-list response undo a newer selection refresh', async ({ page }) => {
+  let activeListCalls = 0
+  let releaseStaleList!: () => void
+  const staleListGate = new Promise<void>((resolve) => { releaseStaleList = resolve })
+
+  await page.route('**/api/**', async (route) => {
+    const request = route.request()
+    const url = new URL(request.url())
+    if (url.pathname === '/api/events') {
+      await new Promise<never>(() => {})
+      return
+    }
+    const common = commonBootstrap(url.pathname)
+    if (common) return json(route, common)
+    if (url.pathname === '/api/projects') return json(route, { projects: [project] })
+    if (url.pathname === `/api/projects/${project.id}/sessions`) {
+      if (url.searchParams.get('archived') === 'true') return json(route, { sessions: [] })
+      activeListCalls++
+      if (activeListCalls === 3) {
+        await staleListGate
+        return json(route, { sessions: [session] })
+      }
+      return json(route, { sessions: [session, secondarySession] })
+    }
+    if (url.pathname === `/api/sessions/${session.id}/snapshot`) {
+      return json(route, { session_id: session.id, revision: '0', session, history: itemsPage() })
+    }
+    if (url.pathname === `/api/sessions/${secondarySession.id}/snapshot`) {
+      return json(route, { session_id: secondarySession.id, revision: '0', session: secondarySession, history: itemsPage() })
+    }
+    return json(route, { error: { code: 'not_mocked', message: `${request.method()} ${url.pathname}` } }, 404)
+  })
+
+  await page.goto('/')
+  await expect(page.getByRole('heading', { name: session.display_name })).toBeVisible()
+  // Bootstrap and the selected-session snapshot each refresh the sidebar
+  // list before the first deliberate switch.
+  await expect.poll(() => activeListCalls).toBe(2)
+  await page.getByText(secondarySession.display_name, { exact: true }).click()
+  await expect(page.getByRole('heading', { name: secondarySession.display_name })).toBeVisible()
+  await expect.poll(() => activeListCalls).toBe(3)
+
+  // The second selection starts a newer list request while the first
+  // selection's active-list response is still held at the barrier.
+  await page.getByText(session.display_name, { exact: true }).click()
+  await expect(page.getByRole('heading', { name: session.display_name })).toBeVisible()
+  await expect.poll(() => activeListCalls).toBe(4)
+  releaseStaleList()
+
+  // The stale response contains only the old selected session.  It must not
+  // erase the secondary session returned by the newer request.
+  await expect(page.getByText(secondarySession.display_name, { exact: true })).toBeVisible()
+})
+
+test('does not let stale bootstrap session lists overwrite a newer selection refresh', async ({ page }) => {
+  let activeListCalls = 0
+  let lifecycleConnections = 0
+  let releaseBootstrapLists!: () => void
+  let releaseLifecycle!: () => void
+  const bootstrapListGate = new Promise<void>((resolve) => { releaseBootstrapLists = resolve })
+  const lifecycleGate = new Promise<void>((resolve) => { releaseLifecycle = resolve })
+
+  await page.route('**/api/**', async (route) => {
+    const request = route.request()
+    const url = new URL(request.url())
+    if (url.pathname === '/api/events') {
+      lifecycleConnections++
+      if (lifecycleConnections > 2) {
+        await new Promise<never>(() => {})
+        return
+      }
+      await lifecycleGate
+      // The event both exercises the lifecycle path and starts a bootstrap
+      // while the user can still select a different session.
+      return route.fulfill({
+        status: 200,
+        contentType: 'text/event-stream',
+        body: sse([{ type: 'run.started', session_id: session.id, run_id: 'bootstrap-race-run', status: 'running' }]),
+      })
+    }
+    const common = commonBootstrap(url.pathname)
+    if (common) return json(route, common)
+    if (url.pathname === '/api/projects') return json(route, { projects: [project] })
+    if (url.pathname === `/api/projects/${project.id}/sessions`) {
+      if (url.searchParams.get('archived') === 'true') return json(route, { sessions: [] })
+      activeListCalls++
+      if (activeListCalls === 2) {
+        return json(route, { sessions: [session, secondarySession] })
+      }
+      if (activeListCalls === 3) {
+        await bootstrapListGate
+        return json(route, { sessions: [session] })
+      }
+      return json(route, { sessions: [session, secondarySession] })
+    }
+    if (url.pathname === `/api/sessions/${session.id}/snapshot`) {
+      return json(route, { session_id: session.id, revision: '0', session, history: itemsPage() })
+    }
+    if (url.pathname === `/api/sessions/${secondarySession.id}/snapshot`) {
+      return json(route, { session_id: secondarySession.id, revision: '0', session: secondarySession, history: itemsPage() })
+    }
+    return json(route, { error: { code: 'not_mocked', message: `${request.method()} ${url.pathname}` } }, 404)
+  })
+
+  await page.goto('/')
+  await expect(page.getByRole('heading', { name: session.display_name })).toBeVisible()
+  await expect.poll(() => activeListCalls).toBe(2)
+  releaseLifecycle()
+  await expect.poll(() => activeListCalls).toBe(3)
+  await page.getByText(secondarySession.display_name, { exact: true }).click()
+  await expect(page.getByRole('heading', { name: secondarySession.display_name })).toBeVisible()
+  await expect.poll(() => activeListCalls).toBe(4)
+
+  // Call 4 is the newer selection refresh.  Let it commit before releasing
+  // call 3, the stale bootstrap response, which intentionally contains only
+  // the old session.
+  releaseBootstrapLists()
+  await expect(page.locator('.session-tree-button').filter({ hasText: secondarySession.display_name })).toBeVisible()
+})
+
+test('does not resurrect a project removed while bootstrap lists are in flight', async ({ page }) => {
+  let projectsPresent = true
+  let activeListCalls = 0
+  let lifecycleConnections = 0
+  let releaseBootstrapLists!: () => void
+  let releaseLifecycle!: () => void
+  const bootstrapListGate = new Promise<void>((resolve) => { releaseBootstrapLists = resolve })
+  const lifecycleGate = new Promise<void>((resolve) => { releaseLifecycle = resolve })
+  page.on('dialog', (dialog) => void dialog.accept())
+
+  await page.route('**/api/**', async (route) => {
+    const request = route.request()
+    const url = new URL(request.url())
+    if (url.pathname === '/api/events') {
+      lifecycleConnections++
+      if (lifecycleConnections > 2) {
+        await new Promise<never>(() => {})
+        return
+      }
+      await lifecycleGate
+      return route.fulfill({
+        status: 200,
+        contentType: 'text/event-stream',
+        body: '',
+      })
+    }
+    const common = commonBootstrap(url.pathname)
+    if (common) return json(route, common)
+    if (url.pathname === '/api/projects') return json(route, { projects: projectsPresent ? [project] : [] })
+    if (url.pathname === `/api/projects/${project.id}/sessions`) {
+      if (url.searchParams.get('archived') === 'true') return json(route, { sessions: [] })
+      activeListCalls++
+      if (activeListCalls === 3) {
+        await bootstrapListGate
+        return json(route, { sessions: [session, secondarySession] })
+      }
+      return json(route, { sessions: [session, secondarySession] })
+    }
+    if (url.pathname === `/api/sessions/${session.id}/snapshot`) {
+      return json(route, { session_id: session.id, revision: '0', session, history: itemsPage() })
+    }
+    if (url.pathname === `/api/projects/${project.id}/archive` && request.method() === 'POST') {
+      return json(route, { ...project, archived: true })
+    }
+    if (url.pathname === `/api/projects/${project.id}` && request.method() === 'DELETE') {
+      projectsPresent = false
+      return json(route, { status: 'removed', id: project.id, removed_sessions: 2 })
+    }
+    return json(route, { error: { code: 'not_mocked', message: `${request.method()} ${url.pathname}` } }, 404)
+  })
+
+  await page.goto('/')
+  await expect(page.getByRole('heading', { name: session.display_name })).toBeVisible()
+  await expect.poll(() => activeListCalls).toBe(2)
+  releaseLifecycle()
+  await expect.poll(() => activeListCalls).toBe(3)
+
+  await page.getByRole('button', { name: `Delete ${project.display_name}`, exact: true }).click()
+  await expect(page.getByRole('heading', { name: 'Connect your first project' })).toBeVisible()
+  releaseBootstrapLists()
+  await expect(page.getByRole('heading', { name: 'Connect your first project' })).toBeVisible()
+  await expect(page.getByText(secondarySession.display_name, { exact: true })).toHaveCount(0)
 })
 
 test('cancels an active run without persisting its transient turn', async ({ page }) => {

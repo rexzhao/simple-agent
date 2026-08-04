@@ -32,11 +32,22 @@ function App() {
   const [projects, setProjects] = useState<Project[]>([])
   const [sessionsByProject, setSessionsByProject] = useState<Record<string, Session[]>>({})
   const [archivedSessionsByProject, setArchivedSessionsByProject] = useState<Record<string, Session[]>>({})
+  const projectsRef = useRef<Project[]>(projects)
+  projectsRef.current = projects
   const { selectedProjectID, selectedSessionID, selectedProjectRef, setSelectedProjectID, setSelectedSessionID } = useSessionSelection()
   const selectedSessionIDRef = useRef(selectedSessionID)
   selectedSessionIDRef.current = selectedSessionID
   const sessionMapsRef = useRef<SessionMaps>({ active: sessionsByProject, archived: archivedSessionsByProject })
   sessionMapsRef.current = { active: sessionsByProject, archived: archivedSessionsByProject }
+  // Session-list requests are point-in-time reads.  A rename/archive/refresh
+  // can start another read before the first one returns, so keep a per-project
+  // generation outside React state and discard an older pair of responses as
+  // one unit.  This is separate from the projection store's generation: these
+  // maps are still the tree's presentation cache.
+  const sessionListGenerationRef = useRef<Record<string, number>>({})
+  // Bootstrap and explicit project-list mutations share one generation.  A
+  // stale bootstrap must not restore a project that a newer mutation removed.
+  const projectListGenerationRef = useRef(0)
   const [recoveredRuns, setRecoveredRuns] = useState<ActiveRunDescriptor[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
@@ -82,6 +93,19 @@ function App() {
   const { activeRunsBySession, activeRunsRef, runningSessionIDs, addActiveRun, syncActiveRuns, updateActiveRun, queueRunEvent, flushRunEvents } = useRunRegistry({ onSupersedeRun: (sessionID, oldRunID) => onSupersedeRunRef.current(sessionID, oldRunID) })
 
   const setSessionMaps = useCallback((maps: SessionMaps) => {
+    // Any direct map replacement (bootstrap, lifecycle reducer, or mutation
+    // reload) supersedes a list request that was in flight for one of these
+    // projects.  Invalidate both the old and new key sets, including a
+    // project that was removed by the replacement.
+    const projectIDs = new Set([
+      ...Object.keys(sessionMapsRef.current.active),
+      ...Object.keys(sessionMapsRef.current.archived),
+      ...Object.keys(maps.active),
+      ...Object.keys(maps.archived),
+    ])
+    for (const projectID of projectIDs) {
+      sessionListGenerationRef.current[projectID] = (sessionListGenerationRef.current[projectID] ?? 0) + 1
+    }
     sessionMapsRef.current = maps
     setSessionsByProject(maps.active)
     setArchivedSessionsByProject(maps.archived)
@@ -107,7 +131,10 @@ function App() {
   }, [])
 
   const loadProjects = useCallback(async () => {
+    const generation = ++projectListGenerationRef.current
     const payload = await api.projects()
+    if (projectListGenerationRef.current !== generation) return projectsRef.current
+    projectsRef.current = payload.projects
     setProjects(payload.projects)
     const maps = sessionMapsRef.current
     setSessionMaps({
@@ -124,15 +151,37 @@ function App() {
   const bootstrapInFlightRef = useRef<Promise<ActiveRunDescriptor[]> | null>(null)
   const bootstrapApplication = useCallback(async (preserveSelection: boolean): Promise<ActiveRunDescriptor[]> => {
     if (bootstrapInFlightRef.current) return bootstrapInFlightRef.current
+    const projectGeneration = ++projectListGenerationRef.current
     const operation = (async () => {
       const [bootstrapPayload, projectsPayload, activeRunsPayload] = await Promise.all([api.bootstrap(), api.projects(), api.activeRuns()])
       const sessionEntries = await Promise.all(projectsPayload.projects.map(async (project) => {
+        const listGeneration = sessionListGenerationRef.current[project.id] ?? 0
         const [activePayload, archivedPayload] = await Promise.all([api.sessions(project.id), api.sessions(project.id, true)])
-        return [project.id, orderSessions(activePayload.sessions), orderSessions(archivedPayload.sessions)] as const
+        return {
+          projectID: project.id,
+          active: orderSessions(activePayload.sessions),
+          archived: orderSessions(archivedPayload.sessions),
+          listGeneration,
+        }
       }))
+      // A newer project mutation/list bootstrap owns the project set.  Do
+      // not let this operation resurrect removed projects or overwrite the
+      // newer selection with its stale active-run snapshot.
+      if (projectListGenerationRef.current !== projectGeneration) return []
+      const currentMaps = sessionMapsRef.current
       const maps: SessionMaps = {
-        active: Object.fromEntries(sessionEntries.map(([projectID, sessions]) => [projectID, sessions])),
-        archived: Object.fromEntries(sessionEntries.map(([projectID, , sessions]) => [projectID, sessions])),
+        active: Object.fromEntries(sessionEntries.map((entry) => [
+          entry.projectID,
+          (sessionListGenerationRef.current[entry.projectID] ?? 0) === entry.listGeneration
+            ? entry.active
+            : currentMaps.active[entry.projectID] ?? [],
+        ])),
+        archived: Object.fromEntries(sessionEntries.map((entry) => [
+          entry.projectID,
+          (sessionListGenerationRef.current[entry.projectID] ?? 0) === entry.listGeneration
+            ? entry.archived
+            : currentMaps.archived[entry.projectID] ?? [],
+        ])),
       }
       const recovered = activeRunsPayload.runs.filter((run) => projectsPayload.projects.some((project) => maps.active[project.id]?.some((session) => session.id === run.session_id)))
       // A reconnect/bootstrap can overlap a local admission. Do not let the
@@ -159,6 +208,7 @@ function App() {
         ? currentSessionID
         : recoveredForPresentation[0]?.session_id ?? maps.active[firstProjectID]?.[0]?.id ?? ''
       setBootstrap(bootstrapPayload)
+      projectsRef.current = projectsPayload.projects
       setProjects(projectsPayload.projects)
       setSessionMaps(maps)
       syncActiveRuns(recoveredForPresentation)
@@ -189,8 +239,19 @@ function App() {
       if (!preserveSelection) setSelectedSessionID('')
       return []
     }
+    // A response for a project that has already disappeared from the newest
+    // project list must not recreate that project's session maps.  In-flight
+    // requests started before removal are additionally rejected by the
+    // per-project generation check below.
+    if (!projectsRef.current.some((project) => project.id === projectID)) return []
+    const generation = (sessionListGenerationRef.current[projectID] ?? 0) + 1
+    sessionListGenerationRef.current[projectID] = generation
     const [payload, archivedPayload] = await Promise.all([api.sessions(projectID), api.sessions(projectID, true)])
     const ordered = orderSessions(payload.sessions)
+    // Do not let an older pair of active/archived responses roll back a more
+    // recent selection or mutation.  The caller still receives its response
+    // for operation-local bookkeeping, but it cannot mutate the tree.
+    if (sessionListGenerationRef.current[projectID] !== generation) return ordered
     const maps = sessionMapsRef.current
     setSessionMaps({
       active: { ...maps.active, [projectID]: ordered },
@@ -596,6 +657,29 @@ function App() {
   }, [applyLifecycleSessionEvent, knownSession, sessionStore.applySettlementMetadata])
 
   const handleRunEvent = useCallback(async (sessionID: string, runID: string, event: RunEvent) => {
+    const payload = event as unknown as Record<string, unknown>
+    const eventSessionID = typeof payload.session_id === 'string' ? payload.session_id : ''
+    const eventRunID = typeof payload.run_id === 'string' ? payload.run_id : ''
+    const projectionEvent = event.type === 'item.appended' || event.type === 'item.created' || event.type === 'item.updated'
+    // The stream callback is bound to (sessionID, runID), not to whatever an
+    // untrusted/replayed payload happens to claim.  A stale stream can finish
+    // after the user starts another run in the same session; accepting its
+    // lifecycle/terminal events would otherwise clear the newer run's
+    // sidebar state.  Committed projection events remain useful in that race,
+    // but they must still agree with the bound identity.
+    if ((eventSessionID && eventSessionID !== sessionID) || (eventRunID && eventRunID !== runID)) return
+    const currentRun = activeRunsRef.current[sessionID]
+    const admissionBinding = runStartedReplayBindingsRef.current.get(runID) === sessionID
+    const newerAdmissionBinding = [...runStartedReplayBindingsRef.current.entries()]
+      .some(([boundRunID, boundSessionID]) => boundSessionID === sessionID && boundRunID !== runID)
+    // A new POST owns the session as soon as it is in flight, even before its
+    // response can establish a run binding.  An old terminal replay must not
+    // clear that admission gate or synthesize an idle sidebar transition.
+    // Once the old run is the only owner, terminal replay remains legitimate
+    // even when its transient ActiveRun was already removed.
+    if (event.type === 'run.settled' && !admissionBinding && (pendingAdmissionSessionsRef.current.has(sessionID) || newerAdmissionBinding)) return
+    if (!projectionEvent && event.type !== 'run.settled' && !admissionBinding && (!currentRun || currentRun.id !== runID)) return
+    if (!projectionEvent && currentRun && currentRun.id !== runID && !(event.type === 'run.started' && currentRun.status !== 'running')) return
     if (event.type === 'text.delta' || event.type === 'reasoning.delta') {
       queueRunEvent(sessionID, runID, event)
       return
@@ -660,6 +744,11 @@ function App() {
         }
         break
       case 'turn.failed':
+        // A late failure from a superseded stream must not surface as the
+        // current turn's error.  The identity guard above normally handles
+        // this; retain the explicit check for a terminal replay with no
+        // transient container.
+        if (activeRunsRef.current[sessionID]?.id !== runID && !admissionBinding) return
         update((run) => reduceRunEvent(run, event))
         setTurnErrors((current) => ({
           ...current,
@@ -677,6 +766,10 @@ function App() {
         runStartedReplayBindingsRef.current.delete(runID)
         setAwaitingRunStarted(sessionID, false)
         const settledRun = activeRunsRef.current[sessionID]
+        // A terminal event from a previous run is still a valid durable
+        // projection notification, but it is not allowed to settle or
+        // reconcile a newer run occupying this session.
+        if (settledRun && settledRun.id !== runID) return
         const settledStatus = String(event.status)
         const settledRevision = settlementRevision(event)
         applySettledSidebarStatus(sessionID, runID, settledStatus, typeof event.turn_id === 'string' ? event.turn_id : undefined, settledRevision)
@@ -751,21 +844,34 @@ function App() {
     void streamRun(runID, (event) => handleRunEvent(sessionID, runID, event), { signal: controller.signal })
       .catch((reason: unknown) => {
         if (controller.signal.aborted) return
+        // The stream may outlive a superseded run or a completed run.  Only
+        // its own current run (or its still-awaiting admission binding) may
+        // transition transient UI or surface an error.  In particular, a
+        // late error from session A must not put a selected session B in an
+        // error state.
+        const currentRun = activeRunsRef.current[sessionID]
+        const ownsCurrentRun = currentRun?.id === runID
+        const ownsAdmission = runStartedReplayBindingsRef.current.get(runID) === sessionID
+        if (settledRunIDsRef.current.has(runID) || (!ownsCurrentRun && !ownsAdmission)) return
         // streamRun already exhausted its own replay reconnects. Allow an
         // authoritative background bootstrap to retry this failed reader,
         // while keeping successful/settled runs permanently de-duplicated.
         runStreamsRef.current.delete(runID)
-        runStartedReplayBindingsRef.current.delete(runID)
-        setAwaitingRunStarted(sessionID, false)
-        updateActiveRun(sessionID, runID, (existing) => ({ ...existing, status: 'error_pending_refresh' }))
-        setRecoveredRuns((current) => current.filter((item) => item.run_id !== runID))
-        setError(errorMessage(reason))
+        if (ownsAdmission) {
+          runStartedReplayBindingsRef.current.delete(runID)
+          setAwaitingRunStarted(sessionID, false)
+        }
+        if (ownsCurrentRun) {
+          updateActiveRun(sessionID, runID, (existing) => ({ ...existing, status: 'error_pending_refresh' }))
+          setRecoveredRuns((current) => current.filter((item) => item.run_id !== runID))
+        }
+        if (selectedSessionIDRef.current === sessionID) setError(errorMessage(reason))
       })
       .finally(() => {
         runStreamsRef.current.delete(runID)
         runStreamControllersRef.current.delete(runID)
       })
-  }, [handleRunEvent, setAwaitingRunStarted, updateActiveRun])
+  }, [activeRunsRef, handleRunEvent, setAwaitingRunStarted, updateActiveRun])
 
   useEffect(() => () => {
     for (const controller of runStreamControllersRef.current.values()) controller.abort()
@@ -776,12 +882,23 @@ function App() {
     const eventSession = event.session && typeof event.session === 'object'
       ? event.session
       : event.metadata ?? event.session_metadata
+    const sessionID = event.session_id ?? (typeof event.session === 'string' ? event.session : eventSession?.id) ?? ''
+    const runID = event.run_id ?? event.run ?? ''
+    if (event.type === 'run.settled' && sessionID && runID) {
+      const currentRun = activeRunsRef.current[sessionID]
+      const admissionBinding = runStartedReplayBindingsRef.current.get(runID) === sessionID
+      const newerAdmissionBinding = [...runStartedReplayBindingsRef.current.entries()]
+        .some(([boundRunID, boundSessionID]) => boundSessionID === sessionID && boundRunID !== runID)
+      // Lifecycle settlement applies metadata before forwarding the terminal
+      // event to the run reducer. Apply the same ownership gate here, or an
+      // old frame carrying `metadata` could still mark the sidebar idle while
+      // a new POST is waiting for its run_id.
+      if (!admissionBinding && (pendingAdmissionSessionsRef.current.has(sessionID) || newerAdmissionBinding || (currentRun && currentRun.id !== runID))) return
+    }
     if (event.type === 'session.created' || event.type === 'session.updated' || event.type === 'session.archived' || event.type === 'session.deleted' || event.type === 'run.settled') {
       applyLifecycleSessionEvent(event)
     }
 
-    const sessionID = event.session_id ?? (typeof event.session === 'string' ? event.session : eventSession?.id) ?? ''
-    const runID = event.run_id ?? event.run ?? ''
     if (event.type === 'run.started') {
       let session = eventSession ?? knownSession(sessionID)
       if (!session && sessionID) {

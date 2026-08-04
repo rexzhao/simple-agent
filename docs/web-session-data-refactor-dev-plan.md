@@ -857,3 +857,54 @@ WP-A（后端 snapshot）
 对应的最小回归覆盖在 `web/src/App.test.tsx`、`sessionStore.test.ts`、
 `useSessionStore.test.ts` 与 `conversationRows.test.ts`；本阶段不包含
 Stage 7 的 fault-injection/E2E 大规模收尾。
+
+## 8. Stage 7 验收收尾 — fault injection / E2E matrix
+
+Stage 7 is the final review-only verification stage.  The complete matrix,
+including the distinction between deterministic unit tests, Go integration
+tests, and browser E2E tests, is maintained in
+[`docs/session-projection-events.md` §8](session-projection-events.md#8-stage-7-fault-injection-and-e2e-acceptance-matrix).
+It covers the following acceptance risks rather than adding a second source
+of protocol truth:
+
+- admission is bound to the server `run_id`; no stream or optimistic user
+  item is created before the 202 response, and an early projection is still
+  rendered exactly once;
+- item projection, run settlement, lifecycle duplicates, terminal replay and
+  reconnect are idempotent and ordered by item identity/SSE cursor rather than
+  text, turn, or timing;
+- `committed_revision` is compared as a decimal string, with covered,
+  lagging, malformed/missing, bounded-retry, and legacy `last_seq` paths;
+- snapshot/event races retain a bounded non-rendered queue, replay events
+  newer than the snapshot, and force resync after queue overflow.  Queue
+  presence alone is never settlement coverage;
+- committed, failed, and cancelled runs retain durable partial/final items,
+  including reasoning/tool projections, while transient state is torn down;
+- rapid session switching, background completion, late list/snapshot responses,
+  stale bootstrap responses, removed projects, and a superseded old-run stream
+  error cannot mutate the currently selected session/run;
+- Go contract tests verify safe projection DTOs and that durable events are
+  published only after commit, including assistant create/update/final flush.
+
+The deterministic browser fault fixtures use response gates, stream request
+counters, and Playwright `expect.poll`; they do not use fixed sleeps to guess
+when a run or snapshot has settled.  Run the matrix from a clean working tree
+with:
+
+```bash
+go test ./...
+go test -race ./internal/execution ./internal/webapp
+cd web
+npm run check
+npm test -- --run
+npm run build
+npm run test:e2e
+cd ..
+git checkout -- internal/webapp/assets   # generated build output only
+git diff --check
+git status --short
+```
+
+The build-output restore is required before review; generated assets must not
+be included in the reviewed Stage 7 commit.  After review approval, create
+the single Stage 7 commit required by the project process.
