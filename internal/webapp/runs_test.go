@@ -136,6 +136,118 @@ func TestRunEventsSignalsResyncForTruncatedReplay(t *testing.T) {
 	}
 }
 
+func TestRunEventsAfterZeroReplaysTerminalRunWithStableIDs(t *testing.T) {
+	options := runRegistryOptions{
+		MaxRunEvents:     8,
+		MaxRunEventBytes: 512,
+	}.withDefaults()
+	managed := newManagedRun("run-terminal-replay", "session-terminal-replay", options)
+	managed.append(execution.NewSessionStreamEvent("turn.started", map[string]any{
+		"turn_id": "turn-terminal-replay",
+	}))
+	managed.append(execution.NewSessionStreamEvent("text.delta", map[string]any{
+		"text": "hello",
+	}))
+	managed.append(execution.NewSessionStreamEvent("run.settled", map[string]any{
+		"run_id": "run-terminal-replay",
+		"status": "completed",
+	}))
+	managed.finish(time.Now().UTC())
+
+	registry := newRunRegistryWithOptions(context.Background(), nil, nil, options)
+	defer registry.Close()
+	registry.mu.Lock()
+	registry.byID[managed.id] = managed
+	registry.mu.Unlock()
+	server := &Server{runs: registry}
+
+	capture := func(after string) string {
+		request := httptest.NewRequest("GET", "/api/runs/"+managed.id+"/events?after="+after, nil)
+		request.SetPathValue("runID", managed.id)
+		response := httptest.NewRecorder()
+		server.handleRunEvents(response, request)
+		return response.Body.String()
+	}
+
+	first := capture("0")
+	if !strings.Contains(first, "run.resync_required") {
+		t.Fatalf("after=0 terminal replay should require resync after terminal compaction, body=%q", first)
+	}
+	if !strings.Contains(first, "id: 3\n") {
+		t.Fatalf("terminal replay should retain the original SSE event ID, body=%q", first)
+	}
+	if strings.Count(first, "id: ") != 1 {
+		t.Fatalf("resync notification must not consume an SSE event ID, body=%q", first)
+	}
+
+	second := capture("0")
+	if second != first {
+		t.Fatalf("replaying the same terminal run from a second connection changed the stream:\nfirst=%q\nsecond=%q", first, second)
+	}
+
+	fromSettled := capture("2")
+	if strings.Contains(fromSettled, "run.resync_required") || !strings.Contains(fromSettled, "id: 3\n") {
+		t.Fatalf("after=2 should replay only the settled event without resync, body=%q", fromSettled)
+	}
+	if strings.Count(fromSettled, "id: ") != 1 {
+		t.Fatalf("after=2 should emit exactly one retained event, body=%q", fromSettled)
+	}
+
+	if body := capture("3"); body != "" {
+		t.Fatalf("after the terminal event should return an empty replay, body=%q", body)
+	}
+}
+
+type eventBeforeStartReturnStarter struct {
+	service *execution.Service
+}
+
+func (s eventBeforeStartReturnStarter) StartSessionRunWithInput(
+	ctx context.Context,
+	sessionID string,
+	input execution.SessionMessageInput,
+	emit func(execution.SessionStreamEvent),
+) *execution.SessionRun {
+	if emit != nil {
+		emit(execution.NewSessionStreamEvent("turn.started", map[string]any{
+			"turn_id": "turn-before-start-return",
+		}))
+	}
+	return s.service.StartSessionRunWithInput(ctx, sessionID, input, emit)
+}
+
+func TestRunRegistryAdoptsEventsObservedBeforeCoordinatorStartReturns(t *testing.T) {
+	server, service, app := newWebTestAppServerWithRunner(t, webTestRunner{})
+	_, session := createWebProjectAndSession(t, server)
+
+	coordinator := execution.NewSessionRunCoordinator(context.Background(), eventBeforeStartReturnStarter{
+		service: service,
+	}, execution.SessionRunCoordinatorOptions{
+		NewRunID: func() (string, error) {
+			return "run-before-start-return", nil
+		},
+		OnRunEvent:   app.runs.observeRunEvent,
+		OnRunSettled: app.runs.settleRun,
+	})
+	defer coordinator.Close()
+
+	run, err := coordinator.Start(session.ID, execution.SessionMessageInput{Content: "hello"}, nil)
+	if err != nil {
+		t.Fatalf("coordinator.Start() error = %v", err)
+	}
+	managed, ok := app.runs.get(run.ID())
+	if !ok {
+		t.Fatal("run registry lost the event observed before Start returned")
+	}
+	if managed.run != run {
+		t.Fatal("run registry did not reconcile the early event with the returned coordinated run")
+	}
+	events, _, _, _, _ := managed.snapshot(0)
+	if len(events) == 0 || !strings.Contains(string(events[0].Payload), "turn-before-start-return") {
+		t.Fatalf("early event was not retained as the first replay event: %#v", events)
+	}
+}
+
 func TestRunRegistryLogsUnderlyingFailure(t *testing.T) {
 	service, err := execution.NewServiceWithOptions(t.TempDir(), execution.ServiceOptions{TurnRunner: webTestRunner{}})
 	if err != nil {
