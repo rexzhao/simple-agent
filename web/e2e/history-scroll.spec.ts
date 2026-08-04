@@ -18,6 +18,10 @@ async function mockApp(page: Page, olderGate?: Promise<void>) {
   let olderCalls = 0
   await page.route('**/api/**', async (route: Route) => {
     const url = new URL(route.request().url())
+    if (url.pathname === '/api/events') {
+      await new Promise<never>(() => {})
+      return
+    }
     let body: unknown
     if (url.pathname === '/api/bootstrap') body = { version: 'e2e', cwd: '/fixture', server_root: '/fixture', config_path: '/fixture/config' }
     else if (url.pathname === '/api/projects') body = { projects: [project] }
@@ -82,6 +86,10 @@ test('requests history pages with turn alignment enabled', async ({ page }) => {
   const itemQueries: string[] = []
   await page.route('**/api/**', async (route: Route) => {
     const url = new URL(route.request().url())
+    if (url.pathname === '/api/events') {
+      await new Promise<never>(() => {})
+      return
+    }
     if (url.pathname === '/api/bootstrap') return json(route, { version: 'e2e', cwd: '/fixture', server_root: '/fixture', config_path: '/fixture/config' })
     if (url.pathname === '/api/projects') return json(route, { projects: [project] })
     if (url.pathname === `/api/projects/${project.id}/sessions`) return json(route, { sessions: url.searchParams.get('archived') === 'true' ? [] : [session] })
@@ -171,6 +179,10 @@ async function mockStreamingApp(
   await page.route('**/api/**', async (route: Route) => {
     const request = route.request()
     const url = new URL(request.url())
+    if (url.pathname === '/api/events') {
+      await new Promise<never>(() => {})
+      return
+    }
     if (url.pathname === '/api/bootstrap') return json(route, { version: 'e2e', cwd: '/fixture', server_root: '/fixture', config_path: '/fixture/config' })
     if (url.pathname === '/api/projects') return json(route, { projects: [project] })
     if (url.pathname === `/api/projects/${project.id}/sessions`) return json(route, { sessions: url.searchParams.get('archived') === 'true' ? [] : [session] })
@@ -347,6 +359,10 @@ const sessionB = { ...session, id: 'session-2', display_name: 'Second session', 
 async function mockTwoSessionApp(page: Page) {
   await page.route('**/api/**', async (route: Route) => {
     const url = new URL(route.request().url())
+    if (url.pathname === '/api/events') {
+      await new Promise<never>(() => {})
+      return
+    }
     if (url.pathname === '/api/bootstrap') return json(route, { version: 'e2e', cwd: '/fixture', server_root: '/fixture', config_path: '/fixture/config' })
     if (url.pathname === '/api/projects') return json(route, { projects: [project] })
     if (url.pathname === `/api/projects/${project.id}/sessions`) return json(route, { sessions: url.searchParams.get('archived') === 'true' ? [] : [session, sessionB] })

@@ -8,6 +8,15 @@ const failedUserItem = {
   message: { role: 'user', content: { inline: 'fix the bug' } },
 }
 
+// After a run settles as failed, the durable session reports the interrupted
+// run/turn so the UI can offer Continue.
+function effectiveSession(options: { failedSession?: () => boolean }): typeof session {
+  if (options.failedSession?.()) {
+    return { ...session, status: 'failed', running_run_id: '', running_turn_id: '', interrupted_run_id: 'run-1', interrupted_turn_id: 'turn-1', last_run_status: 'failed' }
+  }
+  return session
+}
+
 type Gate = { release: (events: Array<Record<string, unknown>>) => void; promise: Promise<Array<Record<string, unknown>>> }
 function newGate(): Gate {
   let release!: (events: Array<Record<string, unknown>>) => void
@@ -24,7 +33,7 @@ async function json(route: Route, body: unknown, status = 200) {
 // mockApp serves a session whose first run fails on demand. `committed`
 // flips the items endpoint to return the persisted user message, mirroring
 // the backend saving the turn input before the model runs.
-async function mockApp(page: Page, options: { gates: Gate[]; initialItems?: Array<Record<string, unknown>>; committedItems?: () => Array<Record<string, unknown>> }) {
+async function mockApp(page: Page, options: { gates: Gate[]; initialItems?: Array<Record<string, unknown>>; committedItems?: () => Array<Record<string, unknown>>; failedSession?: () => boolean }) {
   let connection = 0
   let runPosts = 0
   const runBodies: Array<{ content?: string; images?: unknown[] }> = []
@@ -32,16 +41,20 @@ async function mockApp(page: Page, options: { gates: Gate[]; initialItems?: Arra
   await page.route('**/api/**', async (route: Route) => {
     const request = route.request()
     const url = new URL(request.url())
+    if (url.pathname === '/api/events') {
+      await new Promise<never>(() => {})
+      return
+    }
     if (url.pathname === '/api/bootstrap') return json(route, { version: 'e2e', cwd: '/fixture', server_root: '/fixture', config_path: '/fixture/config' })
     if (url.pathname === '/api/projects') return json(route, { projects: [project] })
     if (url.pathname === `/api/projects/${project.id}/sessions`) return json(route, { sessions: url.searchParams.get('archived') === 'true' ? [] : [session] })
     if (url.pathname === '/api/runs/active') return json(route, { runs: [] })
-    if (url.pathname === `/api/sessions/${session.id}`) return json(route, session)
+    if (url.pathname === `/api/sessions/${session.id}`) return json(route, effectiveSession(options))
     if (url.pathname === `/api/sessions/${session.id}/snapshot`) {
       const items = options.committedItems?.() ?? options.initialItems ?? []
       const seqs = items.map((item) => Number((item as { seq?: number }).seq ?? 0)).filter(Boolean)
       const lastSeq = seqs.at(-1) ?? 0
-      return json(route, { session_id: session.id, revision: String(lastSeq), session: { ...session, last_seq: lastSeq }, history: { items, oldest_seq: seqs[0] ?? 0, newest_seq: seqs.at(-1) ?? 0, has_more_before: false, has_more_after: false } })
+      return json(route, { session_id: session.id, revision: String(lastSeq), session: { ...effectiveSession(options), last_seq: lastSeq }, history: { items, oldest_seq: seqs[0] ?? 0, newest_seq: seqs.at(-1) ?? 0, has_more_before: false, has_more_after: false } })
     }
     if (url.pathname === `/api/sessions/${session.id}/items`) {
       const items = options.committedItems?.() ?? options.initialItems ?? []
@@ -77,9 +90,11 @@ test('shows the failure reason and continues without resending the user message'
   const settle = newGate()
   const hang = newGate()
   let committed = false
+  let failed = false
   const app = await mockApp(page, {
     gates: [fail, settle, hang],
     committedItems: () => committed ? [failedUserItem] : [],
+    failedSession: () => failed,
   })
   await page.goto('/')
   await page.getByPlaceholder('Send a message to SAI').fill('fix the bug')
@@ -99,6 +114,7 @@ test('shows the failure reason and continues without resending the user message'
   // The run settles: the persisted user message remains as the tail and the
   // failure card offers Continue.
   committed = true
+  failed = true
   settle.release([{ type: 'run.settled', run_id: 'run-1', status: 'failed', turn_id: 'turn-1', last_seq: 1, message: 'run failed' }])
   const continueButton = page.getByRole('button', { name: 'Continue' })
   await expect(continueButton).toBeVisible()

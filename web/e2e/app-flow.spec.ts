@@ -62,6 +62,13 @@ function commonBootstrap(pathname: string): unknown | undefined {
 async function mockExistingSessionApp(page: Page, handler?: (route: Route, url: URL) => Promise<boolean>, options?: { sessionLastSeq?: () => number }) {
   await page.route('**/api/**', async (route) => {
     const url = new URL(route.request().url())
+    // The app keeps a long-lived lifecycle stream open. Holding the route
+    // prevents the client from treating an immediate EOF as a disconnect and
+    // re-running a full bootstrap (which would clear transient active runs).
+    if (url.pathname === '/api/events') {
+      await new Promise<never>(() => {})
+      return
+    }
     if (handler && await handler(route, url)) return
     const common = commonBootstrap(url.pathname)
     if (common) return json(route, common)
@@ -91,6 +98,10 @@ test('connects a first project, creates a session, and commits a streamed run', 
   await page.route('**/api/**', async (route) => {
     const request = route.request()
     const url = new URL(request.url())
+    if (url.pathname === '/api/events') {
+      await new Promise<never>(() => {})
+      return
+    }
     const common = commonBootstrap(url.pathname)
     if (common) return json(route, common)
     if (url.pathname === '/api/projects' && request.method() === 'GET') return json(route, { projects })

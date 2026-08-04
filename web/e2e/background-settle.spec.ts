@@ -55,6 +55,10 @@ test('a run settling on a background session reconciles without a manual refresh
   await page.route('**/api/**', async (route) => {
     const request = route.request()
     const url = new URL(request.url())
+    if (url.pathname === '/api/events') {
+      await new Promise<never>(() => {})
+      return
+    }
     if (url.pathname === '/api/bootstrap') return json(route, { version: 'e2e', cwd: '/workspace', server_root: '/server-root', config_path: '/server-root/sai.yaml' })
     if (url.pathname === '/api/runs/active') {
       return json(route, { runs: [{ run_id: 'run-bg', session_id: sessionBg.id, turn_id: 'turn-bg', started_at: '2026-01-01T00:00:00Z', status: 'running' }] })
