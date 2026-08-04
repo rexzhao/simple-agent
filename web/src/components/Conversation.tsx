@@ -412,7 +412,7 @@ type ConversationRowRenderProps = {
 function renderConversationRow(row: ConversationRow, props: ConversationRowRenderProps) {
 	switch (row.kind) {
 		case 'message':
-			return <Message key={row.key} item={row.item} sessionID={props.sessionID} />
+			return <Message key={row.key} item={row.item} sessionID={props.sessionID} assistantTail={row.assistantTail} assistantStreaming={row.assistantStreaming} />
 		case 'compaction':
 			return <CompactionRecord key={row.key} item={row.item} />
 		case 'process':
@@ -436,7 +436,7 @@ function renderConversationRow(row: ConversationRow, props: ConversationRowRende
 	}
 }
 
-const Message = memo(function Message({ item, sessionID }: { item: SessionItem; sessionID: string }) {
+const Message = memo(function Message({ item, sessionID, assistantTail = '', assistantStreaming = false }: { item: SessionItem; sessionID: string; assistantTail?: string; assistantStreaming?: boolean }) {
 	const [copyStatus, setCopyStatus] = useState<'idle' | 'copied' | 'error'>('idle')
 	const copyResetTimerRef = useRef<number | null>(null)
 	useEffect(() => () => {
@@ -446,7 +446,10 @@ const Message = memo(function Message({ item, sessionID }: { item: SessionItem; 
   // messages were summarized; it renders as one muted line, not a bubble.
   if (item.kind === 'compaction') return <CompactionRecord item={item} />
   const role = item.message?.role
-  const text = item.message?.content?.inline || item.message?.content?.preview || ''
+  const committedText = item.message?.content?.inline || item.message?.content?.preview || ''
+  // buildConversationRows attaches a tail only through the backend-provided
+  // item id. Rendering it in this durable row keeps one assistant bubble.
+  const text = role === 'assistant' ? committedText + assistantTail : committedText
   const images = item.message?.images ?? []
   if (!text && images.length === 0) return null
 	const copyMessage = async () => {
@@ -471,7 +474,7 @@ const Message = memo(function Message({ item, sessionID }: { item: SessionItem; 
       <div className="message-content">
         {role === 'user' && text && <div className="message-text">{text}</div>}
         {role === 'user' && images.length > 0 && <StoredImageAttachments sessionID={sessionID} images={images} />}
-        {role !== 'user' && text && <MarkdownMessage text={text} />}
+        {role !== 'user' && text && <MarkdownMessage text={text} streaming={role === 'assistant' && assistantStreaming} cursor={role === 'assistant' && assistantStreaming} />}
 		{role === 'assistant' && (
 			<div className="message-tools" aria-label="Message actions">
 				<button className="message-tool-button" onClick={() => void copyMessage()} title="Copy full output">
@@ -577,7 +580,7 @@ function ActiveProcessRow({ row, onCancelTool, sessionNames, workspaceRoot }: { 
 	// Streaming text soft-seals the live tail: once the model starts writing,
 	// the trailing tool group collapses instead of staying open until the
 	// output step flushes at the next tool call (or until the run settles).
-	const textStreaming = Boolean(run.assistantText)
+	const textStreaming = Boolean(run.assistantText) && !row.assistantTailAttached
 	const running = run.status === 'running'
 	const tokenNote = row.isLast && run.totalTokens !== undefined && (
 		<div className="token-note">
@@ -592,8 +595,8 @@ function ActiveProcessRow({ row, onCancelTool, sessionNames, workspaceRoot }: { 
 			<div className="message-content">
 				{row.isLast && <div className="message-meta"><span className="streaming-label"><i />Generating</span></div>}
 				<ProcessTimeline steps={row.steps} live={row.isLast && running && !textStreaming} onCancelTool={onCancelTool} sessionNames={sessionNames} workspaceRoot={workspaceRoot} />
-				{row.isLast && run.assistantText && <MarkdownMessage text={run.assistantText} streaming cursor={running} />}
-				{row.isLast && running && !run.assistantText && <div className="message-text assistant-stream"><span className="cursor" /></div>}
+				{row.isLast && !row.assistantTailAttached && run.assistantText && <MarkdownMessage text={run.assistantText} streaming cursor={running} />}
+				{row.isLast && !row.assistantTailAttached && running && !run.assistantText && <div className="message-text assistant-stream"><span className="cursor" /></div>}
 				{tokenNote}
 			</div>
 		</article>

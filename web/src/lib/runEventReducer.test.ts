@@ -32,6 +32,45 @@ describe('reduceRunEvent', () => {
     ])
   })
 
+  it('hands a durable assistant item off from the transient tail by identity', () => {
+    const run = apply(
+      newRun(),
+      { type: 'turn.started', turn_id: 'turn-1' },
+      { type: 'agent.iteration.started', turn_id: 'turn-1', agent_iteration: 1 },
+      {
+        type: 'item.appended', session_id: 'session-1', run_id: 'run-1', turn_id: 'turn-1',
+        seq: 10, revision: '10', item_id: 'assistant-1', assistant_text_length: 3,
+        item: { seq: 9, id: 'assistant-1', turn_id: 'turn-1', agent_iteration: 1, created_at: '', kind: 'message', visibility: 'visible', audience: 'model', message: { role: 'assistant', content: { inline: 'abc' } } },
+      },
+      { type: 'text.delta', turn_id: 'turn-1', agent_iteration: 1, text: 'abc', item_id: 'assistant-1', durable_text_length: 3, durable_checkpointed: true },
+    )
+    expect(run.assistantText).toBe('')
+    expect(run.assistantItems?.['turn-1:1']).toEqual({ itemID: 'assistant-1', durableTextLength: 3 })
+
+    const tailed = reduceRunEvent(run, {
+      type: 'text.delta', turn_id: 'turn-1', agent_iteration: 1, text: ' tail',
+      item_id: 'assistant-1', durable_text_length: 3, durable_checkpointed: false,
+    })
+    expect(tailed.assistantText).toBe(' tail')
+    const updated = reduceRunEvent(tailed, {
+      type: 'item.updated', session_id: 'session-1', turn_id: 'turn-1',
+      seq: 11, revision: '11', item_id: 'assistant-1', assistant_text_length: 8,
+      item: { seq: 9, id: 'assistant-1', turn_id: 'turn-1', agent_iteration: 1, created_at: '', kind: 'message', visibility: 'visible', audience: 'model', message: { role: 'assistant', content: { inline: 'abc tail' } } },
+    })
+    expect(updated.assistantText).toBe('')
+    expect(updated.assistantItems?.['turn-1:1']).toEqual({ itemID: 'assistant-1', durableTextLength: 8 })
+  })
+
+  it('does not deduplicate two durable assistant ids with identical text', () => {
+    const base = newRun()
+    const event = (id: string, seq: number): RunEvent => ({
+      type: 'item.appended', session_id: 'session-1', seq, revision: String(seq), item_id: id,
+      item: { seq, id, turn_id: 'turn-1', agent_iteration: seq, created_at: '', kind: 'message', visibility: 'visible', audience: 'model', message: { role: 'assistant', content: { inline: 'same' } } },
+    })
+    const run = apply(base, event('assistant-a', 1), event('assistant-b', 2))
+    expect(Object.values(run.assistantItems ?? {}).map((item) => item.itemID)).toEqual(['assistant-a', 'assistant-b'])
+  })
+
   it('updates one tool across iterations without duplicating it', () => {
     const run = apply(
       newRun(),

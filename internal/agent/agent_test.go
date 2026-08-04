@@ -66,6 +66,292 @@ func TestStreamEmitsToolRequestedStartedFinishedInOrder(t *testing.T) {
 	}
 }
 
+func TestStreamCheckpointsVisibleAssistantOutputWithoutAppendingTwice(t *testing.T) {
+	provider := &fakeProvider{turns: [][]model.Event{{
+		model.TextDeltaEvent{Text: ""},
+		model.TextDeltaEvent{Text: "a"},
+		model.TextDeltaEvent{Text: "b"},
+		model.TextDeltaEvent{Text: "c"},
+	}}}
+	publisher := &checkpointingPublisher{fakePublisher: &fakePublisher{}}
+	events, results, err := StreamWithResult(context.Background(), model.Request{
+		Model:    "model-test",
+		Messages: []model.Message{{Role: model.MessageRoleUser, Content: "hello"}},
+	}, Options{
+		Provider:  provider,
+		TurnID:    "turn-1",
+		Publisher: publisher,
+		AssistantCheckpoint: &AssistantCheckpointPolicy{
+			MinInterval: time.Hour,
+			MinNewRunes: 2,
+		},
+	})
+	if err != nil {
+		t.Fatalf("StreamWithResult() error = %v", err)
+	}
+	got := collectAgentEvents(t, events)
+	result, ok := <-results
+	if !ok || len(result.Messages) != 2 {
+		t.Fatalf("result = %#v, ok=%v, want completed message history", result, ok)
+	}
+
+	var checkpoints []eventbus.AssistantTextCheckpoint
+	var ready eventbus.AssistantReady
+	for _, event := range publisher.events {
+		switch event := event.(type) {
+		case eventbus.AssistantTextCheckpoint:
+			checkpoints = append(checkpoints, event)
+		case eventbus.AssistantReady:
+			ready = event
+		}
+	}
+	if len(checkpoints) != 2 {
+		t.Fatalf("checkpoints = %#v, want first and threshold/final checkpoint only", checkpoints)
+	}
+	if checkpoints[0].Content != "a" || checkpoints[1].Content != "abc" {
+		t.Fatalf("checkpoint contents = %#v, want a then abc", checkpoints)
+	}
+	if checkpoints[0].ItemID == "" || checkpoints[0].ItemID != checkpoints[1].ItemID || checkpoints[1].ItemID != ready.ItemID {
+		t.Fatalf("checkpoint/ready identities = %#v / %q, want one stable item id", checkpoints, ready.ItemID)
+	}
+	if ready.Message.Content != "abc" {
+		t.Fatalf("final assistant content = %q, want abc", ready.Message.Content)
+	}
+	var deltas []model.TextDeltaEvent
+	for _, event := range got {
+		if delta, ok := event.(model.TextDeltaEvent); ok {
+			if delta.Text != "" {
+				deltas = append(deltas, delta)
+			}
+		}
+	}
+	if len(deltas) != 3 || !deltas[0].DurableCheckpointed || deltas[1].DurableCheckpointed || !deltas[2].DurableCheckpointed {
+		t.Fatalf("delta checkpoint markers = %#v, want true,false,true", deltas)
+	}
+}
+
+func TestStreamStopsBeforeTransientDeltaWhenAssistantCheckpointFails(t *testing.T) {
+	provider := &fakeProvider{turns: [][]model.Event{{model.TextDeltaEvent{Text: "partial"}}}}
+	publisher := &checkpointingPublisher{fakePublisher: &fakePublisher{
+		errKind: eventbus.KindAssistantCheckpoint,
+		err:     errors.New("checkpoint unavailable"),
+	}}
+	events, err := Stream(context.Background(), model.Request{
+		Model:    "model-test",
+		Messages: []model.Message{{Role: model.MessageRoleUser, Content: "hello"}},
+	}, Options{Provider: provider, TurnID: "turn-1", Publisher: publisher})
+	if err != nil {
+		t.Fatalf("Stream() error = %v", err)
+	}
+	got := collectAgentEvents(t, events)
+	for _, event := range got {
+		if _, ok := event.(model.TextDeltaEvent); ok {
+			t.Fatalf("got transient text delta %#v after checkpoint failure", event)
+		}
+	}
+	foundError := false
+	for _, event := range got {
+		if errEvent, ok := event.(model.ErrorEvent); ok && errEvent.Message == "persist assistant output" {
+			foundError = true
+		}
+	}
+	if !foundError {
+		t.Fatalf("events = %#v, want persistence error", got)
+	}
+	for _, event := range publisher.events {
+		if _, ok := event.(eventbus.AssistantReady); ok {
+			t.Fatalf("published AssistantReady after checkpoint failure")
+		}
+	}
+}
+
+func TestStreamDoesNotCheckpointModelOnlyReasoning(t *testing.T) {
+	provider := &fakeProvider{turns: [][]model.Event{{model.ReasoningDeltaEvent{Text: "private reasoning"}}}}
+	publisher := &checkpointingPublisher{fakePublisher: &fakePublisher{}}
+	events, err := Stream(context.Background(), model.Request{
+		Model:    "model-test",
+		Messages: []model.Message{{Role: model.MessageRoleUser, Content: "think"}},
+	}, Options{Provider: provider, TurnID: "turn-1", Publisher: publisher})
+	if err != nil {
+		t.Fatalf("Stream() error = %v", err)
+	}
+	got := collectAgentEvents(t, events)
+	for _, event := range publisher.events {
+		if _, ok := event.(eventbus.AssistantTextCheckpoint); ok {
+			t.Fatalf("published checkpoint for model-only reasoning: %#v", event)
+		}
+		if _, ok := event.(eventbus.AssistantReady); ok {
+			t.Fatalf("published visible assistant item for model-only reasoning: %#v", event)
+		}
+	}
+	firstErrorEvent(t, got)
+}
+
+func TestStreamGivesEachAssistantIterationItsOwnItemIdentity(t *testing.T) {
+	provider := &fakeProvider{turns: [][]model.Event{
+		{
+			model.TextDeltaEvent{Text: "before tool"},
+			model.ToolCallDoneEvent{ToolCall: model.ToolCall{ID: "call-1", Name: "echo", Arguments: `{}`}},
+		},
+		{model.TextDeltaEvent{Text: "after tool"}},
+	}}
+	publisher := &checkpointingPublisher{fakePublisher: &fakePublisher{}}
+	events, results, err := StreamWithResult(context.Background(), model.Request{
+		Model:    "model-test",
+		Messages: []model.Message{{Role: model.MessageRoleUser, Content: "use echo"}},
+		Tools:    []model.Tool{{Name: "echo"}},
+	}, Options{
+		Provider:     provider,
+		ToolExecutor: &fakeToolExecutor{result: model.ToolResult{Name: "echo", ToolCallID: "call-1", Content: "echoed"}},
+		TurnID:       "turn-1",
+		Publisher:    publisher,
+		MaxTurns:     2,
+		AssistantCheckpoint: &AssistantCheckpointPolicy{
+			MinInterval: time.Hour,
+			MinNewRunes: 1000,
+		},
+	})
+	if err != nil {
+		t.Fatalf("StreamWithResult() error = %v", err)
+	}
+	_ = collectAgentEvents(t, events)
+	if _, ok := <-results; !ok {
+		t.Fatal("results closed without final turn result")
+	}
+	var checkpoints []eventbus.AssistantTextCheckpoint
+	var ready []eventbus.AssistantReady
+	for _, event := range publisher.events {
+		switch event := event.(type) {
+		case eventbus.AssistantTextCheckpoint:
+			checkpoints = append(checkpoints, event)
+		case eventbus.AssistantReady:
+			ready = append(ready, event)
+		}
+	}
+	if len(checkpoints) != 2 || len(ready) != 2 {
+		t.Fatalf("assistant lifecycle = %d checkpoints, %d ready; events = %#v", len(checkpoints), len(ready), publisher.events)
+	}
+	if checkpoints[0].ItemID == checkpoints[1].ItemID || ready[0].ItemID != checkpoints[0].ItemID || ready[1].ItemID != checkpoints[1].ItemID {
+		t.Fatalf("assistant identities = checkpoints %#v ready %#v, want one identity per iteration", checkpoints, ready)
+	}
+}
+
+func TestStreamCancellationAfterPartialOutputFlushesCheckpoint(t *testing.T) {
+	provider := &cancellingProvider{
+		firstReceived:  make(chan struct{}),
+		releaseSecond:  make(chan struct{}),
+		secondReceived: make(chan struct{}),
+	}
+	publisher := &checkpointingPublisher{
+		fakePublisher: &fakePublisher{},
+		checkpointed:  make(chan string, 4),
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	events, results, err := StreamWithResult(ctx, model.Request{
+		Model:    "model-test",
+		Messages: []model.Message{{Role: model.MessageRoleUser, Content: "cancel me"}},
+	}, Options{
+		Provider: provider, TurnID: "turn-1", Publisher: publisher,
+		AssistantCheckpoint: &AssistantCheckpointPolicy{MinInterval: time.Hour, MinNewRunes: 1000},
+	})
+	if err != nil {
+		t.Fatalf("StreamWithResult() error = %v", err)
+	}
+	// The first event is iteration-start. Collect the remaining unbuffered
+	// output concurrently so the provider can deliver the second, below-
+	// threshold delta before cancellation.
+	if _, ok := <-events; !ok {
+		t.Fatal("agent events closed before provider emitted output")
+	}
+	eventsDone := make(chan []model.Event, 1)
+	go func() { eventsDone <- collectAgentEvents(t, events) }()
+	if got := <-publisher.checkpointed; got != "a" {
+		t.Fatalf("first checkpoint = %q, want immediate checkpoint a", got)
+	}
+	close(provider.releaseSecond)
+	<-provider.secondReceived
+	cancel()
+	got := <-eventsDone
+	if _, ok := <-results; ok {
+		t.Fatal("got turn result after cancellation")
+	}
+	var checkpoints []eventbus.AssistantTextCheckpoint
+	for _, event := range publisher.events {
+		if checkpoint, ok := event.(eventbus.AssistantTextCheckpoint); ok {
+			checkpoints = append(checkpoints, checkpoint)
+		}
+	}
+	if len(checkpoints) != 2 || checkpoints[0].Content != "a" || checkpoints[1].Content != "ab" {
+		t.Fatalf("checkpoints = %#v, want a then forced ab", checkpoints)
+	}
+	if checkpoints[0].ItemID == "" || checkpoints[0].ItemID != checkpoints[1].ItemID {
+		t.Fatalf("checkpoint identities = %#v, want one item", checkpoints)
+	}
+	if len(got) < 2 {
+		t.Fatalf("events = %#v, want deltas and cancellation error", got)
+	}
+}
+
+func TestStreamDoesNotCheckpointEmptyOrWhitespaceOnlyOutput(t *testing.T) {
+	provider := &fakeProvider{turns: [][]model.Event{{
+		model.TextDeltaEvent{Text: ""},
+		model.TextDeltaEvent{Text: " \n\t  "},
+	}}}
+	publisher := &checkpointingPublisher{fakePublisher: &fakePublisher{}}
+	events, results, err := StreamWithResult(context.Background(), model.Request{
+		Model: "model-test", Messages: []model.Message{{Role: model.MessageRoleUser, Content: "only whitespace"}},
+	}, Options{Provider: provider, TurnID: "turn-whitespace", Publisher: publisher})
+	if err != nil {
+		t.Fatalf("StreamWithResult() error = %v", err)
+	}
+	_ = collectAgentEvents(t, events)
+	for range results {
+		// A provider turn may still produce a normal empty result; it must not
+		// create a visible assistant item.
+	}
+	for _, event := range publisher.events {
+		switch event.(type) {
+		case eventbus.AssistantTextCheckpoint, eventbus.AssistantReady:
+			t.Fatalf("publisher event = %#v, want no visible assistant lifecycle", event)
+		}
+	}
+}
+
+func TestStreamFailureAfterUncheckpointedTailFlushesCheckpoint(t *testing.T) {
+	provider := &fakeProvider{turns: [][]model.Event{{
+		model.TextDeltaEvent{Text: "a"},
+		model.TextDeltaEvent{Text: "b"},
+		model.ErrorEvent{Err: errors.New("provider failed"), Message: "provider failed"},
+	}}}
+	publisher := &checkpointingPublisher{fakePublisher: &fakePublisher{}}
+	events, results, err := StreamWithResult(context.Background(), model.Request{
+		Model: "model-test", Messages: []model.Message{{Role: model.MessageRoleUser, Content: "fail me"}},
+	}, Options{
+		Provider: provider, TurnID: "turn-failure", Publisher: publisher,
+		AssistantCheckpoint: &AssistantCheckpointPolicy{MinInterval: time.Hour, MinNewRunes: 1000},
+	})
+	if err != nil {
+		t.Fatalf("StreamWithResult() error = %v", err)
+	}
+	got := collectAgentEvents(t, events)
+	for range results {
+		t.Fatal("got turn result after provider failure")
+	}
+	var checkpoints []eventbus.AssistantTextCheckpoint
+	for _, event := range publisher.events {
+		if checkpoint, ok := event.(eventbus.AssistantTextCheckpoint); ok {
+			checkpoints = append(checkpoints, checkpoint)
+		}
+	}
+	if len(checkpoints) != 2 || checkpoints[0].Content != "a" || checkpoints[1].Content != "ab" || checkpoints[0].ItemID != checkpoints[1].ItemID {
+		t.Fatalf("checkpoints = %#v, want a then forced ab on one item", checkpoints)
+	}
+	if firstErrorEvent(t, got).Message != "provider failed" {
+		t.Fatalf("failure events = %#v, want provider failure", got)
+	}
+}
+
 func TestStreamRetriesServerErrorBeforeAnyProviderProgress(t *testing.T) {
 	originalBackoff := providerRetryBackoff
 	providerRetryBackoff = func(int) time.Duration { return 0 }
@@ -1134,6 +1420,26 @@ type fakeProvider struct {
 	requests   []model.Request
 }
 
+type cancellingProvider struct {
+	firstReceived  chan struct{}
+	releaseSecond  chan struct{}
+	secondReceived chan struct{}
+}
+
+func (p *cancellingProvider) Stream(ctx context.Context, request model.Request) (<-chan model.Event, error) {
+	events := make(chan model.Event)
+	go func() {
+		defer close(events)
+		events <- model.TextDeltaEvent{Text: "a"}
+		close(p.firstReceived)
+		<-p.releaseSecond
+		events <- model.TextDeltaEvent{Text: "b"}
+		close(p.secondReceived)
+		<-ctx.Done()
+	}()
+	return events, nil
+}
+
 func (p *fakeProvider) Stream(ctx context.Context, request model.Request) (<-chan model.Event, error) {
 	if len(p.requests) >= len(p.turns) {
 		return nil, fmt.Errorf("unexpected model request %d", len(p.requests)+1)
@@ -1177,6 +1483,25 @@ type fakePublisher struct {
 	events  []eventbus.Event
 	errKind string
 	err     error
+}
+
+type checkpointingPublisher struct {
+	*fakePublisher
+	checkpointed chan string
+}
+
+func (p *checkpointingPublisher) Publish(event eventbus.Event) error {
+	return p.fakePublisher.Publish(event)
+}
+
+func (p *checkpointingPublisher) PublishAssistantCheckpoint(turnID string, agentIteration int, itemID, content string) error {
+	err := p.Publish(eventbus.AssistantTextCheckpoint{
+		TurnID: turnID, AgentIteration: agentIteration, ItemID: itemID, Content: content,
+	})
+	if err == nil && p.checkpointed != nil {
+		p.checkpointed <- content
+	}
+	return err
 }
 
 func (p *fakePublisher) Publish(event eventbus.Event) error {

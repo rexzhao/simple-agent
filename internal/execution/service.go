@@ -1227,6 +1227,13 @@ type sessionTurnLifecyclePublisher struct {
 	onInterrupted func(string)
 }
 
+// PublishAssistantCheckpoint keeps the model stream's visible output behind
+// the same durable bus as turn/item lifecycle events. The bus only fans out
+// its committed wrapper after the projector has committed the item record.
+func (p sessionTurnLifecyclePublisher) PublishAssistantCheckpoint(turnID string, agentIteration int, itemID, content string) error {
+	return p.bus.PublishAssistantCheckpoint(turnID, agentIteration, itemID, content)
+}
+
 func (p sessionTurnLifecyclePublisher) Publish(event eventbus.Event) error {
 	if err := p.bus.Publish(event); err != nil {
 		return err

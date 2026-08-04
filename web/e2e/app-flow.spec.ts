@@ -181,6 +181,97 @@ test('connects a first project, creates a session, and commits a streamed run', 
   expect(eventConnections).toBeGreaterThanOrEqual(2)
 })
 
+test('hands a durable assistant bubble through checkpointed and transient stream output', async ({ page }) => {
+  let eventConnections = 0
+  let releaseTail!: () => void
+  let releaseSettled!: () => void
+  const tailGate = new Promise<void>((resolve) => { releaseTail = resolve })
+  const settledGate = new Promise<void>((resolve) => { releaseSettled = resolve })
+  const assistantItem = (content: string) => ({
+    seq: 2,
+    id: 'assistant-stream',
+    turn_id: 'turn-stream',
+    agent_iteration: 1,
+    created_at: '2026-01-01T00:00:02Z',
+    kind: 'message',
+    visibility: 'normal',
+    audience: 'model',
+    message: { role: 'assistant', content: { inline: content } },
+  })
+
+  await mockExistingSessionApp(page, async (route, url) => {
+    const request = route.request()
+    if (url.pathname === `/api/sessions/${session.id}/runs` && request.method() === 'POST') {
+      await json(route, { run_id: 'run-stream', session_id: session.id, status: 'running' }, 202)
+      return true
+    }
+    if (url.pathname !== '/api/runs/run-stream/events') return false
+    eventConnections++
+    if (eventConnections === 1) {
+      await route.fulfill({
+        status: 200,
+        contentType: 'text/event-stream',
+        body: sse([
+          { type: 'run.started', run_id: 'run-stream', session_id: session.id, status: 'running' },
+          { type: 'turn.started', turn_id: 'turn-stream' },
+          { type: 'agent.iteration.started', turn_id: 'turn-stream', agent_iteration: 1 },
+          {
+            type: 'item.appended', session_id: session.id, run_id: 'run-stream', turn_id: 'turn-stream',
+            seq: 2, revision: '2', item_id: 'assistant-stream', assistant_text_length: 1, item: assistantItem('a'),
+          },
+          { type: 'text.delta', turn_id: 'turn-stream', agent_iteration: 1, item_id: 'assistant-stream', text: 'a', durable_text_length: 1, durable_checkpointed: true },
+        ]),
+      })
+      return true
+    }
+    if (eventConnections === 2) {
+      await tailGate
+      await route.fulfill({
+        status: 200,
+        contentType: 'text/event-stream',
+        body: sse([{ type: 'text.delta', turn_id: 'turn-stream', agent_iteration: 1, item_id: 'assistant-stream', text: 'b', durable_text_length: 1, durable_checkpointed: false }]),
+      })
+      return true
+    }
+    await settledGate
+    await route.fulfill({
+      status: 200,
+      contentType: 'text/event-stream',
+      body: sse([
+        {
+          type: 'item.updated', session_id: session.id, run_id: 'run-stream', turn_id: 'turn-stream',
+          seq: 3, revision: '3', item_id: 'assistant-stream', assistant_text_length: 2, item: assistantItem('ab'),
+        },
+        { type: 'turn.committed', turn_id: 'turn-stream', last_seq: 3 },
+        { type: 'run.settled', run_id: 'run-stream', status: 'committed', turn_id: 'turn-stream', last_seq: 3 },
+      ]),
+    })
+    return true
+  })
+
+  await page.goto('/')
+  const composer = page.getByPlaceholder('Send a message to SAI')
+  await composer.fill('stream durable output')
+  await page.getByRole('button', { name: 'Send' }).click()
+
+  // The append is already a visible durable row before any tail is allowed.
+  await expect(page.locator('.message.assistant:not(.transient)')).toHaveCount(1)
+  await expect(page.locator('.message.assistant:not(.transient)')).toContainText('a')
+  await expect.poll(() => eventConnections).toBeGreaterThanOrEqual(2)
+
+  releaseTail()
+  // The uncheckpointed b is explicitly attached to the loaded item id, so it
+  // extends the one durable bubble instead of creating an active bubble.
+  await expect(page.locator('.message.assistant:not(.transient)')).toContainText('ab')
+  await expect(page.locator('.message.assistant.transient')).toHaveCount(0)
+  await expect(page.locator('.message.assistant:not(.transient)')).toHaveCount(1)
+
+  releaseSettled()
+  await expect(page.locator('.message.assistant:not(.transient)')).toContainText('ab')
+  await expect(page.locator('.message.assistant:not(.transient)')).toHaveCount(1)
+  await expect(page.getByLabel('Session status: idle')).toBeVisible()
+})
+
 test('cancels an active run without persisting its transient turn', async ({ page }) => {
   let cancelRun!: () => void
   const cancelled = new Promise<void>((resolve) => { cancelRun = resolve })

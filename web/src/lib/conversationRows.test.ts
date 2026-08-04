@@ -176,4 +176,57 @@ describe('buildConversationRows stable identities', () => {
     expect(first.filter((row) => row.kind === 'message').map((row) => row.item.id)).toEqual(['backend-user-1', 'backend-user-2'])
     expect(new Set(keys(first)).size).toBe(first.length)
   })
+
+  it('attaches an uncheckpointed tail to the loaded durable assistant item', () => {
+    const durable = item('assistant-1', 2, 'assistant', 'a', {
+      turn_id: 'turn-live',
+      agent_iteration: 1,
+    })
+    const rows = buildConversationRows({
+      sessionID: 'session-1',
+      items: [durable],
+      activeRun: run({
+        assistantText: 'b',
+        assistantItems: { 'turn-live:1': { itemID: 'assistant-1', durableTextLength: 1 } },
+      }),
+    })
+    const messages = rows.filter((row) => row.kind === 'message')
+    expect(messages).toHaveLength(1)
+    expect(messages[0]).toMatchObject({ item: { id: 'assistant-1' }, assistantTail: 'b' })
+    expect(rows.filter((row) => row.kind === 'active-process')).toHaveLength(0)
+
+    const afterCheckpoint = buildConversationRows({
+      sessionID: 'session-1',
+      items: [item('assistant-1', 2, 'assistant', 'ab', { turn_id: 'turn-live', agent_iteration: 1 })],
+      activeRun: run({
+        assistantItems: { 'turn-live:1': { itemID: 'assistant-1', durableTextLength: 2 } },
+      }),
+    })
+    expect(afterCheckpoint.filter((row) => row.kind === 'message')).toHaveLength(1)
+    expect(afterCheckpoint.filter((row) => row.kind === 'message')[0]).toMatchObject({ assistantTail: undefined })
+  })
+
+  it('falls back to one transient output row until the bound durable item is loaded', () => {
+    const rows = buildConversationRows({
+      sessionID: 'session-1',
+      items: [],
+      activeRun: run({
+        assistantText: 'tail',
+        assistantItems: { 'turn-live:1': { itemID: 'assistant-not-on-page', durableTextLength: 1 } },
+      }),
+    })
+    expect(rows.filter((row) => row.kind === 'message')).toHaveLength(0)
+    expect(rows.filter((row) => row.kind === 'active-process')).toHaveLength(1)
+  })
+
+  it('keeps identical text as separate messages when item ids differ', () => {
+    const rows = buildConversationRows({
+      sessionID: 'session-1',
+      items: [
+        item('assistant-a', 1, 'assistant', 'same', { turn_id: 'turn-1' }),
+        item('assistant-b', 2, 'assistant', 'same', { turn_id: 'turn-2' }),
+      ],
+    })
+    expect(rows.filter((row) => row.kind === 'message').map((row) => row.item.id)).toEqual(['assistant-a', 'assistant-b'])
+  })
 })

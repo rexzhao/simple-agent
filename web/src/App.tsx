@@ -586,6 +586,10 @@ function App() {
         // directly to the shared store; unlike run settlement they do not
         // require a full-page refresh.
         sessionStore.applyProjectionEvent(event as SessionItemProjectionEvent)
+        // Also hand the explicit assistant item identity to the transient run
+        // reducer. This clears only the committed prefix/tail for the same
+        // turn+iteration; it never compares message text to deduplicate.
+        update((run) => reduceRunEvent(run, event))
         break
       case 'run.resync_required':
         try {

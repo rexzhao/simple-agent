@@ -99,6 +99,156 @@ func TestProjectorWritesTurnEventsSynchronously(t *testing.T) {
 	}
 }
 
+func TestProjectorStreamsOneAssistantItemAndPreservesCreationSeq(t *testing.T) {
+	store, projector, bus := newProjectorFixture(t, "session-1")
+	defer projector.Close()
+
+	publish(t, bus, eventbus.TurnStarted{TurnID: "turn-1"})
+	publish(t, bus, eventbus.TurnInputReady{TurnID: "turn-1", Message: model.Message{Role: model.MessageRoleUser, Content: "stream"}})
+	const itemID = "assistant-stream-1"
+	publish(t, bus, eventbus.AssistantTextCheckpoint{TurnID: "turn-1", AgentIteration: 1, ItemID: itemID, Content: "hello"})
+	first, err := store.LoadExecutionState("session-1")
+	if err != nil {
+		t.Fatalf("LoadExecutionState() after append = %v", err)
+	}
+	assistant, ok := sessionItemByID(first.Items, itemID)
+	if !ok || assistant.Message == nil || assistant.Message.Content != "hello" {
+		t.Fatalf("assistant after append = %#v, want visible hello item", assistant)
+	}
+	creationSeq := assistant.Seq
+	appendSeq := first.LastSeq
+
+	publish(t, bus, eventbus.AssistantTextCheckpoint{TurnID: "turn-1", AgentIteration: 1, ItemID: itemID, Content: "hello world"})
+	second, err := store.LoadExecutionState("session-1")
+	if err != nil {
+		t.Fatalf("LoadExecutionState() after update = %v", err)
+	}
+	assistant, ok = sessionItemByID(second.Items, itemID)
+	if !ok || assistant.Message == nil || assistant.Message.Content != "hello world" {
+		t.Fatalf("assistant after update = %#v, want complete content", assistant)
+	}
+	if assistant.Seq != creationSeq {
+		t.Fatalf("assistant creation seq = %d, want unchanged %d", assistant.Seq, creationSeq)
+	}
+	if second.LastSeq <= appendSeq {
+		t.Fatalf("last seq after update = %d, want > append seq %d", second.LastSeq, appendSeq)
+	}
+
+	// AssistantReady is the terminal flush for this logical message. Since the
+	// checkpoint already contains the complete text, it must not append a
+	// second assistant item or manufacture a redundant update.
+	publish(t, bus, eventbus.AssistantReady{
+		TurnID: "turn-1", AgentIteration: 1, ItemID: itemID,
+		Message: model.Message{Role: model.MessageRoleAssistant, Content: "hello world"},
+	})
+	publish(t, bus, eventbus.TurnCompleted{TurnID: "turn-1"})
+	final, err := store.LoadExecutionState("session-1")
+	if err != nil {
+		t.Fatalf("LoadExecutionState() final = %v", err)
+	}
+	count := 0
+	for _, item := range final.Items {
+		if item.ID == itemID {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Fatalf("assistant item count = %d, want one", count)
+	}
+}
+
+func TestRunProjectorScopesAssistantIdentityByTurnAndIteration(t *testing.T) {
+	store := sessions.NewV2Store(t.TempDir())
+	session, err := store.SaveMetadata(sessions.SessionV2{
+		ID:           "session-follow-up",
+		Provider:     "test",
+		ModelProfile: "test",
+		ModelID:      "test",
+	})
+	if err != nil {
+		t.Fatalf("SaveMetadata() error = %v", err)
+	}
+	if _, err := store.CreateRun(session.ID, "run-follow-up", "", []byte(`{}`), time.Now()); err != nil {
+		t.Fatalf("CreateRun() error = %v", err)
+	}
+	projector, err := NewRun(store, session, "run-follow-up")
+	if err != nil {
+		t.Fatalf("NewRun() error = %v", err)
+	}
+	defer projector.Close()
+	bus := eventbus.NewBusWithCheckpoint(projector.CheckpointHandler())
+	defer bus.Close()
+
+	publish(t, bus, eventbus.TurnStarted{TurnID: "turn-first"})
+	publish(t, bus, eventbus.TurnInputReady{TurnID: "turn-first", Message: model.Message{Role: model.MessageRoleUser, Content: "first"}})
+	publish(t, bus, eventbus.AssistantTextCheckpoint{
+		TurnID: "turn-first", AgentIteration: 1, ItemID: "assistant-first", Content: "first",
+	})
+	publish(t, bus, eventbus.AssistantTextCheckpoint{
+		TurnID: "turn-first", AgentIteration: 1, ItemID: "assistant-first", Content: "first answer",
+	})
+	publish(t, bus, eventbus.TurnCompleted{TurnID: "turn-first"})
+
+	// A follow-up prompt is a new turn, so its first model invocation is also
+	// iteration one. It must not reuse the first turn's identity map entry.
+	publish(t, bus, eventbus.TurnStarted{TurnID: "turn-follow-up"})
+	publish(t, bus, eventbus.TurnInputReady{TurnID: "turn-follow-up", Message: model.Message{Role: model.MessageRoleUser, Content: "follow up"}})
+	publish(t, bus, eventbus.AssistantTextCheckpoint{
+		TurnID: "turn-follow-up", AgentIteration: 1, ItemID: "assistant-follow-up", Content: "follow-up answer",
+	})
+	publish(t, bus, eventbus.AssistantTextCheckpoint{
+		TurnID: "turn-follow-up", AgentIteration: 1, ItemID: "assistant-follow-up", Content: "follow-up answer complete",
+	})
+	publish(t, bus, eventbus.TurnCompleted{TurnID: "turn-follow-up"})
+
+	state, err := store.LoadExecutionState(session.ID)
+	if err != nil {
+		t.Fatalf("LoadExecutionState() error = %v", err)
+	}
+	first, ok := sessionItemByID(state.Items, "assistant-first")
+	if !ok || first.Message == nil || first.Message.Content != "first answer" {
+		t.Fatalf("first assistant item = %#v, want independent first-turn item", first)
+	}
+	followUp, ok := sessionItemByID(state.Items, "assistant-follow-up")
+	if !ok || followUp.Message == nil || followUp.Message.Content != "follow-up answer complete" {
+		t.Fatalf("follow-up assistant item = %#v, want independent second-turn item", followUp)
+	}
+	if first.TurnID != "turn-first" || followUp.TurnID != "turn-follow-up" || first.Seq == followUp.Seq {
+		t.Fatalf("assistant item identity/creation = %#v / %#v, want distinct turns and records", first, followUp)
+	}
+}
+
+func TestProjectorInterruptedStreamKeepsPartialAssistantAndCreatesNoEmptyItem(t *testing.T) {
+	store, projector, bus := newProjectorFixture(t, "session-1")
+	defer projector.Close()
+	publish(t, bus, eventbus.TurnStarted{TurnID: "turn-1"})
+	publish(t, bus, eventbus.TurnInputReady{TurnID: "turn-1", Message: model.Message{Role: model.MessageRoleUser, Content: "first"}})
+	publish(t, bus, eventbus.AssistantTextCheckpoint{TurnID: "turn-1", AgentIteration: 1, ItemID: "assistant-partial", Content: "partial"})
+	publish(t, bus, eventbus.TurnInterrupted{TurnID: "turn-1"})
+	state, err := store.LoadExecutionState("session-1")
+	if err != nil {
+		t.Fatalf("LoadExecutionState() after partial interruption = %v", err)
+	}
+	if item, ok := sessionItemByID(state.Items, "assistant-partial"); !ok || item.Message == nil || item.Message.Content != "partial" {
+		t.Fatalf("partial assistant = %#v, want retained partial content", item)
+	}
+
+	store2, projector2, bus2 := newProjectorFixture(t, "session-2")
+	defer projector2.Close()
+	publish(t, bus2, eventbus.TurnStarted{TurnID: "turn-2"})
+	publish(t, bus2, eventbus.TurnInputReady{TurnID: "turn-2", Message: model.Message{Role: model.MessageRoleUser, Content: "second"}})
+	publish(t, bus2, eventbus.TurnInterrupted{TurnID: "turn-2"})
+	state2, err := store2.LoadExecutionState("session-2")
+	if err != nil {
+		t.Fatalf("LoadExecutionState() before output = %v", err)
+	}
+	for _, item := range state2.Items {
+		if item.Message != nil && item.Message.Role == model.MessageRoleAssistant {
+			t.Fatalf("assistant item before output = %#v, want none", item)
+		}
+	}
+}
+
 func TestProjectorMaintainsToolMapAcrossRounds(t *testing.T) {
 	store, projector, bus := newProjectorFixture(t, "session-1")
 	defer projector.Close()

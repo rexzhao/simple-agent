@@ -104,4 +104,15 @@ describe('coalesceRunEvents', () => {
       { type: 'text.delta', text: 'c' },
     ])
   })
+
+  it('does not merge a committed prefix with an uncheckpointed tail', () => {
+    const events = coalesceRunEvents([
+      { type: 'text.delta', turn_id: 'turn', agent_iteration: 1, text: 'a', item_id: 'assistant-1', durable_text_length: 1, durable_checkpointed: true },
+      { type: 'text.delta', turn_id: 'turn', agent_iteration: 1, text: 'b', item_id: 'assistant-1', durable_text_length: 1, durable_checkpointed: false },
+      { type: 'text.delta', turn_id: 'turn', agent_iteration: 1, text: 'c', item_id: 'assistant-1', durable_text_length: 1, durable_checkpointed: false },
+    ])
+    expect(events).toHaveLength(2)
+    expect(events[0]).toMatchObject({ text: 'a', item_id: 'assistant-1', durable_checkpointed: true })
+    expect(events[1]).toMatchObject({ text: 'bc', item_id: 'assistant-1', durable_checkpointed: false })
+  })
 })

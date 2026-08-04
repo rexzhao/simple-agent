@@ -142,6 +142,13 @@ func (AgentIterationStartedEvent) Type() EventType {
 
 type TextDeltaEvent struct {
 	Text string
+	// AssistantItemID and the checkpoint fields are populated by the agent
+	// after its durable checkpoint attempt. Provider implementations do not
+	// set them. They let the UI attach transient text to the durable item
+	// without comparing message contents.
+	AssistantItemID     string
+	DurableTextLength   int
+	DurableCheckpointed bool
 }
 
 func (TextDeltaEvent) Type() EventType {

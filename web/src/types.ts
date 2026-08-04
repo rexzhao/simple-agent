@@ -296,6 +296,8 @@ export interface SessionItemProjectionEvent {
   revision: string
   item_id: string
   item: SessionItem
+  /** Present for assistant items; the full committed text length in runes. */
+  assistant_text_length?: number
 }
 
 export type RunEvent =
@@ -305,7 +307,7 @@ export type RunEvent =
   | { type: 'compaction.completed'; turn_id: string; trigger: 'auto' | 'manual'; compaction_id: string; active_context_tokens?: number; context_window?: number }
   | { type: 'provider.retrying'; turn_id: string; agent_iteration: number; attempt: number; max_attempts: number; delay_ms: number; reason: string }
 	| { type: 'agent.iteration.started'; turn_id: string; agent_iteration: number }
-	| { type: 'text.delta'; turn_id: string; agent_iteration: number; text: string }
+	| { type: 'text.delta'; turn_id: string; agent_iteration: number; text: string; item_id?: string; durable_text_length?: number; durable_checkpointed?: boolean }
 	| { type: 'reasoning.delta'; turn_id: string; agent_iteration: number; text: string }
 	| { type: 'tool.requested' | 'tool.started'; turn_id: string; agent_iteration: number; tool_call_id: string; name: string; arguments?: string }
 	| { type: 'tool.finished'; turn_id: string; agent_iteration: number; tool_call_id: string; name: string; is_error: boolean; content?: string }
@@ -361,6 +363,8 @@ export interface ActiveRun {
 	/** Transient process boundaries for drained prompts; never a user item. */
 	processBoundaries?: Array<{ id: string; stepIndex: number }>
 	assistantText: string
+	/** Explicit transient-to-durable assistant identity, keyed by turn/iteration. */
+	assistantItems?: Record<string, { itemID: string; durableTextLength: number }>
 	steps: RunStep[]
   agentIteration: number
   inputTokens?: number

@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/rexzhao/simple-agent/internal/eventbus"
 	"github.com/rexzhao/simple-agent/internal/model"
@@ -122,12 +123,16 @@ type sessionEventSink struct {
 }
 
 type sinkOp struct {
-	event          SessionStreamEvent // verbatim event for non-delta ops
-	isDelta        bool
-	eventType      string
-	turnID         string
-	agentIteration int
-	text           *strings.Builder // accumulator for delta ops
+	event               SessionStreamEvent // verbatim event for non-delta ops
+	isDelta             bool
+	eventType           string
+	turnID              string
+	agentIteration      int
+	text                *strings.Builder // accumulator for delta ops
+	assistantItemID     string
+	durableTextLength   int
+	durableCheckpointed bool
+	hasAssistantBinding bool
 }
 
 func newSessionEventSink(emit func(SessionStreamEvent)) *sessionEventSink {
@@ -154,9 +159,16 @@ func (s *sessionEventSink) submit(event SessionStreamEvent) {
 		text, _ := event["text"].(string)
 		turnID, _ := event["turn_id"].(string)
 		agentIteration, _ := event["agent_iteration"].(int)
+		assistantItemID, _ := event["item_id"].(string)
+		hasAssistantBinding := eventType == "text.delta" && assistantItemID != ""
+		durableTextLength, _ := sessionStreamInteger(event["durable_text_length"])
+		durableCheckpointed, _ := event["durable_checkpointed"].(bool)
 		if n := len(s.ops); n > 0 {
 			last := &s.ops[n-1]
-			if last.isDelta && last.eventType == eventType && last.turnID == turnID && last.agentIteration == agentIteration {
+			if last.isDelta && last.eventType == eventType && last.turnID == turnID && last.agentIteration == agentIteration &&
+				last.hasAssistantBinding == hasAssistantBinding &&
+				(!hasAssistantBinding || (last.assistantItemID == assistantItemID &&
+					last.durableCheckpointed == durableCheckpointed && last.durableTextLength == durableTextLength)) {
 				last.text.WriteString(text)
 				s.mu.Unlock()
 				return
@@ -165,11 +177,15 @@ func (s *sessionEventSink) submit(event SessionStreamEvent) {
 		builder := &strings.Builder{}
 		builder.WriteString(text)
 		s.ops = append(s.ops, sinkOp{
-			isDelta:        true,
-			eventType:      eventType,
-			turnID:         turnID,
-			agentIteration: agentIteration,
-			text:           builder,
+			isDelta:             true,
+			eventType:           eventType,
+			turnID:              turnID,
+			agentIteration:      agentIteration,
+			text:                builder,
+			assistantItemID:     assistantItemID,
+			durableTextLength:   durableTextLength,
+			durableCheckpointed: durableCheckpointed,
+			hasAssistantBinding: hasAssistantBinding,
 		})
 	} else {
 		s.ops = append(s.ops, sinkOp{event: event})
@@ -212,6 +228,11 @@ func (s *sessionEventSink) run() {
 				if op.agentIteration > 0 {
 					fields["agent_iteration"] = op.agentIteration
 				}
+				if op.hasAssistantBinding {
+					fields["item_id"] = op.assistantItemID
+					fields["durable_text_length"] = op.durableTextLength
+					fields["durable_checkpointed"] = op.durableCheckpointed
+				}
 				s.emit(NewSessionStreamEvent(op.eventType, fields))
 			} else {
 				s.emit(op.event)
@@ -224,6 +245,22 @@ func (s *sessionEventSink) run() {
 		if empty {
 			return
 		}
+	}
+}
+
+func sessionStreamInteger(value any) (int, bool) {
+	switch value := value.(type) {
+	case int:
+		return value, true
+	case int64:
+		return int(value), true
+	case float64:
+		if value != float64(int(value)) {
+			return 0, false
+		}
+		return int(value), true
+	default:
+		return 0, false
 	}
 }
 
@@ -585,6 +622,14 @@ func (s *Service) sessionStreamEventFromPersistedEvent(sessionID, runID, turnID 
 		if strings.TrimSpace(runID) != "" {
 			fields["run_id"] = runID
 		}
+		if item.Message != nil && item.Message.Role == model.MessageRoleAssistant {
+			// The public DTO may contain only a preview for blob-backed content;
+			// this additive length lets the transient projection discard exactly
+			// the committed prefix without inspecting or matching text.
+			if content, err := s.sessionItemFullContent(sessionID, item); err == nil {
+				fields["assistant_text_length"] = utf8.RuneCountInString(content)
+			}
+		}
 		eventType := "item.appended"
 		if event.Type == sessions.RecordTypeItemUpdated {
 			eventType = "item.updated"
@@ -642,9 +687,15 @@ func sessionStreamEventFromModelEvent(turnID string, agentIteration int, event m
 		if event.Text == "" {
 			return nil, false
 		}
-		return modelSessionStreamEvent("text.delta", turnID, agentIteration, map[string]any{
+		fields := map[string]any{
 			"text": event.Text,
-		}), true
+		}
+		if event.AssistantItemID != "" {
+			fields["item_id"] = event.AssistantItemID
+			fields["durable_text_length"] = event.DurableTextLength
+			fields["durable_checkpointed"] = event.DurableCheckpointed
+		}
+		return modelSessionStreamEvent("text.delta", turnID, agentIteration, fields), true
 	case model.ReasoningDeltaEvent:
 		if !showReasoning || event.Text == "" {
 			return nil, false

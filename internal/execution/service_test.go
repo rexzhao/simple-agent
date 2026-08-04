@@ -3,6 +3,7 @@ package execution
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -1050,6 +1051,95 @@ func TestServiceSendSessionMessageWithEventsEmitsDirectStreamEvents(t *testing.T
 	}
 }
 
+func TestServiceStreamsDurableAssistantItemBeforeTransientDelta(t *testing.T) {
+	home := t.TempDir()
+	const itemID = "assistant-stream-integration"
+	runner := fakeExecutionTurnRunner{
+		supports: true,
+		run: func(ctx context.Context, request SessionTurnRequest) (SessionTurnResult, error) {
+			checkpointPublisher, ok := request.Publisher.(eventbus.AssistantCheckpointPublisher)
+			if !ok {
+				return SessionTurnResult{}, fmt.Errorf("publisher does not support assistant checkpoints")
+			}
+			if err := checkpointPublisher.PublishAssistantCheckpoint(request.TurnID, 1, itemID, "hello"); err != nil {
+				return SessionTurnResult{}, err
+			}
+			request.Emit(model.TextDeltaEvent{
+				Text: "hello", AssistantItemID: itemID, DurableTextLength: 5, DurableCheckpointed: true,
+			})
+			if err := checkpointPublisher.PublishAssistantCheckpoint(request.TurnID, 1, itemID, "hello world"); err != nil {
+				return SessionTurnResult{}, err
+			}
+			request.Emit(model.TextDeltaEvent{
+				Text: " world", AssistantItemID: itemID, DurableTextLength: 11, DurableCheckpointed: true,
+			})
+			if err := request.Publisher.Publish(eventbus.AssistantReady{
+				TurnID: request.TurnID, AgentIteration: 1, ItemID: itemID,
+				Message: model.Message{Role: model.MessageRoleAssistant, Content: "hello world"},
+			}); err != nil {
+				return SessionTurnResult{}, err
+			}
+			return SessionTurnResult{Incremental: true}, nil
+		},
+	}
+	service, _, session := newExecutionServiceWithSession(t, home, runner)
+	var events []SessionStreamEvent
+	result, err := service.SendSessionMessageWithEvents(context.Background(), session.ID, "stream", func(event SessionStreamEvent) {
+		events = append(events, event)
+	})
+	if err != nil {
+		t.Fatalf("SendSessionMessageWithEvents() error = %v", err)
+	}
+	if result.Status != "committed" {
+		t.Fatalf("result = %#v, want committed", result)
+	}
+
+	var assistantAppends, assistantUpdates []SessionStreamEvent
+	for _, event := range events {
+		if event["item_id"] != itemID {
+			continue
+		}
+		switch event["type"] {
+		case "item.appended":
+			assistantAppends = append(assistantAppends, event)
+		case "item.updated":
+			assistantUpdates = append(assistantUpdates, event)
+		}
+	}
+	if len(assistantAppends) != 1 || len(assistantUpdates) != 1 {
+		t.Fatalf("assistant projection events = %d append, %d update; events = %#v", len(assistantAppends), len(assistantUpdates), events)
+	}
+	appendedItem := assistantAppends[0]["item"].(SessionItem)
+	updatedItem := assistantUpdates[0]["item"].(SessionItem)
+	if appendedItem.ID != itemID || updatedItem.ID != itemID || appendedItem.Seq != updatedItem.Seq {
+		t.Fatalf("assistant identities/sequences = %#v / %#v, want one creation seq", appendedItem, updatedItem)
+	}
+	if updatedItem.Message == nil || updatedItem.Message.Content == nil || updatedItem.Message.Content.Inline != "hello world" {
+		t.Fatalf("updated assistant DTO = %#v, want complete text", updatedItem)
+	}
+	if assistantUpdates[0]["assistant_text_length"] != 11 {
+		t.Fatalf("assistant text length = %#v, want 11", assistantUpdates[0]["assistant_text_length"])
+	}
+	appendSeq, appendSeqOK := assistantAppends[0]["seq"].(int64)
+	updateSeq, updateSeqOK := assistantUpdates[0]["seq"].(int64)
+	appendRevision, appendRevisionOK := assistantAppends[0]["revision"].(string)
+	updateRevision, updateRevisionOK := assistantUpdates[0]["revision"].(string)
+	appendRevisionNumber, appendRevisionErr := strconv.ParseInt(appendRevision, 10, 64)
+	updateRevisionNumber, updateRevisionErr := strconv.ParseInt(updateRevision, 10, 64)
+	if !appendSeqOK || !updateSeqOK || !appendRevisionOK || !updateRevisionOK || appendRevisionErr != nil || updateRevisionErr != nil ||
+		updateSeq <= appendSeq || updateRevisionNumber <= appendRevisionNumber {
+		t.Fatalf("assistant durable ordering = seq %v/%v revision %q/%q, want monotonically increasing", assistantAppends[0]["seq"], assistantUpdates[0]["seq"], appendRevision, updateRevision)
+	}
+	appendIndex := indexOfSessionStreamEvent(events, "item.appended", itemID)
+	firstDeltaIndex := indexOfSessionStreamEvent(events, "text.delta", itemID)
+	updateIndex := indexOfSessionStreamEvent(events, "item.updated", itemID)
+	secondDeltaIndex := nthIndexOfSessionStreamEvent(events, "text.delta", itemID, 2)
+	if appendIndex < 0 || firstDeltaIndex < 0 || updateIndex < 0 || secondDeltaIndex < 0 ||
+		appendIndex > firstDeltaIndex || updateIndex > secondDeltaIndex {
+		t.Fatalf("projection/transient order = append %d, first delta %d, update %d, second delta %d; events = %#v", appendIndex, firstDeltaIndex, updateIndex, secondDeltaIndex, events)
+	}
+}
+
 func TestServiceSendSessionMessageWithEventsReasoningFollowsSessionSetting(t *testing.T) {
 	for _, tt := range []struct {
 		name          string
@@ -1520,6 +1610,27 @@ func eventAssistant(turnID, content string) eventbus.AssistantReady {
 		TurnID:  turnID,
 		Message: model.Message{Role: model.MessageRoleAssistant, Content: content},
 	}
+}
+
+func indexOfSessionStreamEvent(events []SessionStreamEvent, eventType, itemID string) int {
+	return nthIndexOfSessionStreamEvent(events, eventType, itemID, 1)
+}
+
+func nthIndexOfSessionStreamEvent(events []SessionStreamEvent, eventType, itemID string, occurrence int) int {
+	if occurrence <= 0 {
+		return -1
+	}
+	found := 0
+	for index, event := range events {
+		if event["type"] != eventType || event["item_id"] != itemID {
+			continue
+		}
+		found++
+		if found == occurrence {
+			return index
+		}
+	}
+	return -1
 }
 
 func sessionMetadataIDs(items []SessionMetadata) []string {

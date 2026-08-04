@@ -751,6 +751,54 @@ func TestSessionEventSinkCoalescesAtSubmitTime(t *testing.T) {
 	}
 }
 
+func TestSessionEventSinkPreservesAssistantCheckpointBinding(t *testing.T) {
+	release := make(chan struct{})
+	blocked := make(chan struct{}, 1)
+	var mu sync.Mutex
+	var delivered []SessionStreamEvent
+	sink := newSessionEventSink(func(event SessionStreamEvent) {
+		select {
+		case blocked <- struct{}{}:
+		default:
+		}
+		<-release
+		mu.Lock()
+		delivered = append(delivered, event)
+		mu.Unlock()
+	})
+	sink.submit(NewSessionStreamEvent("turn.started", map[string]any{"turn_id": "turn-1"}))
+	<-blocked
+	// A checkpoint marker is a semantic boundary: merging the next tail into
+	// it would make the reducer append committed text a second time.
+	sink.submit(NewSessionStreamEvent("text.delta", map[string]any{
+		"turn_id": "turn-1", "agent_iteration": 1, "text": "a", "item_id": "assistant-1",
+		"durable_text_length": 1, "durable_checkpointed": true,
+	}))
+	sink.submit(NewSessionStreamEvent("text.delta", map[string]any{
+		"turn_id": "turn-1", "agent_iteration": 1, "text": "b", "item_id": "assistant-1",
+		"durable_text_length": 1, "durable_checkpointed": false,
+	}))
+	sink.submit(NewSessionStreamEvent("text.delta", map[string]any{
+		"turn_id": "turn-1", "agent_iteration": 1, "text": "c", "item_id": "assistant-1",
+		"durable_text_length": 1, "durable_checkpointed": false,
+	}))
+	close(release)
+	sink.close()
+	sink.wait()
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(delivered) != 3 {
+		t.Fatalf("delivered events = %#v, want turn.started plus append and tail deltas", delivered)
+	}
+	if delivered[1]["durable_checkpointed"] != true || delivered[1]["text"] != "a" {
+		t.Fatalf("append delta = %#v, want committed a", delivered[1])
+	}
+	if delivered[2]["durable_checkpointed"] != false || delivered[2]["text"] != "bc" || delivered[2]["item_id"] != "assistant-1" {
+		t.Fatalf("tail delta = %#v, want coalesced uncheckpointed bc with identity", delivered[2])
+	}
+}
+
 // turnFailedSecret is injected into the prompt and, where a runner/planner error
 // is simulated, into that error's text. It must never appear in any
 // SessionStreamEvent: turn.failed carries only a stable code and canned message.

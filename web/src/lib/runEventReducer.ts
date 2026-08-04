@@ -1,4 +1,4 @@
-import type { ActiveRun, QueuedPrompt, RunEvent } from '../types'
+import type { ActiveRun, QueuedPrompt, RunEvent, SessionItemProjectionEvent } from '../types'
 import { appendModelOutput, appendReasoning, updateToolStep } from './runSteps'
 
 /** Applies events that only change the in-memory representation of a run.
@@ -85,8 +85,43 @@ export function reduceRunEvent(run: ActiveRun, event: RunEvent): ActiveRun {
         steps: appendModelOutput(run.steps, run.assistantText, run.agentIteration),
       }
     }
-    case 'text.delta':
-      return { ...run, assistantText: run.assistantText + String(event.text ?? '') }
+    case 'text.delta': {
+      const delta = event as {
+        text?: unknown
+        item_id?: string
+        turn_id?: string
+        agent_iteration?: number
+        durable_text_length?: number
+        durable_checkpointed?: boolean
+      }
+      const text = String(delta.text ?? '')
+      if (!delta.item_id) return { ...run, assistantText: run.assistantText + text }
+      const key = assistantOutputKey(delta.turn_id ?? '', Number(delta.agent_iteration ?? run.agentIteration))
+      const previous = run.assistantItems?.[key]
+      const sameItem = previous?.itemID === delta.item_id
+      const eventLength = Number(delta.durable_text_length)
+      const durableTextLength = Number.isFinite(eventLength) && eventLength >= 0
+        ? eventLength
+        : (previous?.durableTextLength ?? 0)
+      const assistantItems = {
+        ...(run.assistantItems ?? {}),
+        [key]: {
+          itemID: delta.item_id,
+          durableTextLength: sameItem ? Math.max(previous?.durableTextLength ?? 0, durableTextLength) : durableTextLength,
+        },
+      }
+      if (key !== assistantOutputKey(run.turnID ?? '', run.agentIteration)) {
+        return { ...run, assistantItems }
+      }
+      // A checkpoint is committed before its corresponding transient delta is
+      // fanned out. It is therefore already represented by the durable row;
+      // only the uncheckpointed tail belongs in ActiveRun.
+      return {
+        ...run,
+        assistantItems,
+        assistantText: delta.durable_checkpointed ? '' : run.assistantText + text,
+      }
+    }
     case 'reasoning.delta':
       return { ...run, steps: appendReasoning(run.steps, String(event.text ?? ''), Number(event.agent_iteration ?? run.agentIteration)) }
     case 'tool.requested':
@@ -130,6 +165,34 @@ export function reduceRunEvent(run: ActiveRun, event: RunEvent): ActiveRun {
         usageEvents,
       }
     }
+    case 'item.appended':
+    case 'item.created':
+    case 'item.updated': {
+      const projection = event as SessionItemProjectionEvent
+      const item = projection.item
+      if (item.message?.role !== 'assistant') return run
+      const turnID = projection.turn_id ?? item.turn_id ?? run.turnID ?? ''
+      const iteration = Number(item.agent_iteration ?? 0)
+      const key = assistantOutputKey(turnID, iteration)
+      const previous = run.assistantItems?.[key]
+      const length = Number(projection.assistant_text_length)
+      const sameItem = previous?.itemID === projection.item_id
+      const durableTextLength = Number.isFinite(length) && length >= 0
+        ? (sameItem ? Math.max(previous?.durableTextLength ?? 0, length) : length)
+        : (previous?.durableTextLength ?? 0)
+      const assistantItems = {
+        ...(run.assistantItems ?? {}),
+        [key]: {
+          itemID: projection.item_id,
+          durableTextLength,
+        },
+      }
+      return {
+        ...run,
+        assistantItems,
+        ...(key === assistantOutputKey(run.turnID ?? '', run.agentIteration) ? { assistantText: '' } : {}),
+      }
+    }
     case 'turn.failed':
       // Terminal failure: drop any pending retry notice so it does not
       // linger next to the Turn failed banner.
@@ -137,6 +200,10 @@ export function reduceRunEvent(run: ActiveRun, event: RunEvent): ActiveRun {
     default:
       return run
   }
+}
+
+function assistantOutputKey(turnID: string, agentIteration: number): string {
+  return `${turnID}:${agentIteration}`
 }
 
 function sumUsageEvents(events: NonNullable<ActiveRun['usageEvents']>): NonNullable<ActiveRun['usage']> | undefined {

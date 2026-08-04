@@ -13,7 +13,12 @@ export function coalesceRunEvents(events: RunEvent[]): RunEvent[] {
     if ((event.type === 'text.delta' || event.type === 'reasoning.delta') && previous?.type === event.type) {
       const current = event as Extract<RunEvent, { type: 'text.delta' | 'reasoning.delta' }>
       const prior = previous as typeof current
-      if (prior.turn_id === current.turn_id && prior.agent_iteration === current.agent_iteration) {
+      const sameAssistantCheckpoint = current.type !== 'text.delta' ||
+        (prior.type === 'text.delta' &&
+          prior.item_id === current.item_id &&
+          prior.durable_text_length === current.durable_text_length &&
+          prior.durable_checkpointed === current.durable_checkpointed)
+      if (prior.turn_id === current.turn_id && prior.agent_iteration === current.agent_iteration && sameAssistantCheckpoint) {
         result[result.length - 1] = { ...current, text: prior.text + current.text }
         continue
       }

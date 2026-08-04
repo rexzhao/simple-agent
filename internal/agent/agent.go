@@ -3,12 +3,14 @@ package agent
 import (
 	"bytes"
 	"context"
+	cryptorand "crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/rexzhao/simple-agent/internal/eventbus"
@@ -21,6 +23,8 @@ const DefaultMaxTurns = 8
 var providerRetryBackoff = func(attempt int) time.Duration {
 	return time.Duration(5*(1<<(attempt-1))) * time.Second
 }
+
+var assistantFallbackID uint64
 
 type ToolExecutor interface {
 	Execute(ctx context.Context, name string, arguments map[string]any) (model.ToolResult, error)
@@ -114,11 +118,28 @@ type Options struct {
 	ActivePromptDrain ActivePromptDrain
 	AutoCompact       AutoCompact
 	ToolCancel        *ToolCancellationRegistry
+	// AssistantCheckpoint controls cumulative visible assistant checkpoints.
+	// A nil policy uses DefaultAssistantCheckpointPolicy. Checkpoints are only
+	// enabled when Publisher also implements eventbus.AssistantCheckpointPublisher.
+	AssistantCheckpoint *AssistantCheckpointPolicy
 	// NextTurnID enables the execution layer to give each provider request its
 	// own durable Turn. When nil, the standalone agent API retains its
 	// historical single-turn behavior.
 	NextTurnID    func(iteration int) string
 	TurnIDChanged func(turnID string)
+}
+
+// AssistantCheckpointPolicy bounds write amplification while preserving an
+// immediate first visible checkpoint. Either threshold may trigger a later
+// checkpoint; terminal and provider-failure paths always force one.
+type AssistantCheckpointPolicy struct {
+	MinInterval time.Duration
+	MinNewRunes int
+}
+
+var DefaultAssistantCheckpointPolicy = AssistantCheckpointPolicy{
+	MinInterval: 75 * time.Millisecond,
+	MinNewRunes: 64,
 }
 
 type TurnResult struct {
@@ -199,7 +220,12 @@ func run(ctx context.Context, request model.Request, options Options, maxTurns i
 		request.Messages = messages
 		events <- model.AgentIterationStartedEvent{Iteration: iteration}
 
-		assistantContent, reasoningContent, toolCalls, responseState, stopped := streamModelTurn(ctx, options.Provider, request, events)
+		assistantItemID := newAssistantItemID()
+		var checkpoint assistantOutputCheckpoint
+		if publisher, ok := options.Publisher.(eventbus.AssistantCheckpointPublisher); ok {
+			checkpoint = newAssistantOutputCheckpoint(publisher, turnID, iteration, assistantItemID, options.AssistantCheckpoint)
+		}
+		assistantContent, reasoningContent, toolCalls, responseState, stopped := streamModelTurn(ctx, options.Provider, request, events, assistantItemID, checkpoint)
 		if stopped {
 			return
 		}
@@ -215,7 +241,7 @@ func run(ctx context.Context, request model.Request, options Options, maxTurns i
 			events <- model.ErrorEvent{Err: fmt.Errorf("agent returned empty final response")}
 			return
 		}
-		if !publishDurable(events, options.Publisher, eventbus.AssistantReady{TurnID: turnID, AgentIteration: iteration, Message: assistantMessage}, "persist assistant") {
+		if !publishDurable(events, options.Publisher, eventbus.AssistantReady{TurnID: turnID, AgentIteration: iteration, ItemID: assistantItemID, Message: assistantMessage}, "persist assistant") {
 			return
 		}
 		messages = append(messages, assistantMessage)
@@ -348,13 +374,84 @@ func copyMessages(messages []model.Message) []model.Message {
 	return copied
 }
 
-func streamModelTurn(ctx context.Context, provider model.Provider, request model.Request, out chan<- model.Event) (string, string, []model.ToolCall, *model.ResponseState, bool) {
+func newAssistantItemID() string {
+	var raw [12]byte
+	if _, err := cryptorand.Read(raw[:]); err == nil {
+		return fmt.Sprintf("assistant-%x", raw[:])
+	}
+	// Randomness failure must not turn an otherwise usable model response into
+	// an item without identity. UnixNano is only a fallback; the normal path is
+	// cryptographically random and collision resistant across restarts.
+	return fmt.Sprintf("assistant-%d-%d", time.Now().UnixNano(), atomic.AddUint64(&assistantFallbackID, 1))
+}
+
+type assistantOutputCheckpoint func(content string, force bool) (length int, committed bool, err error)
+
+func newAssistantOutputCheckpoint(publisher eventbus.AssistantCheckpointPublisher, turnID string, iteration int, itemID string, policy *AssistantCheckpointPolicy) assistantOutputCheckpoint {
+	if publisher == nil {
+		return nil
+	}
+	config := DefaultAssistantCheckpointPolicy
+	if policy != nil {
+		config = *policy
+	}
+	lastLength := 0
+	lastCheckpointAt := time.Time{}
+	return func(content string, force bool) (int, bool, error) {
+		if strings.TrimSpace(content) == "" {
+			return lastLength, false, nil
+		}
+		length := runeCount(content)
+		if length == lastLength && lastLength > 0 {
+			return lastLength, false, nil
+		}
+		if !force && lastLength > 0 {
+			newRunes := length - lastLength
+			intervalElapsed := config.MinInterval <= 0 || time.Since(lastCheckpointAt) >= config.MinInterval
+			charsReached := config.MinNewRunes > 0 && newRunes >= config.MinNewRunes
+			if !charsReached && !intervalElapsed {
+				return lastLength, false, nil
+			}
+		}
+		if err := publisher.PublishAssistantCheckpoint(turnID, iteration, itemID, content); err != nil {
+			return lastLength, false, err
+		}
+		lastLength = length
+		lastCheckpointAt = time.Now()
+		return lastLength, true, nil
+	}
+}
+
+func runeCount(value string) int {
+	return len([]rune(value))
+}
+
+func streamModelTurn(ctx context.Context, provider model.Provider, request model.Request, out chan<- model.Event, assistantItemID string, checkpoint assistantOutputCheckpoint) (string, string, []model.ToolCall, *model.ResponseState, bool) {
 	var assistantContent strings.Builder
 	var reasoningContent strings.Builder
 	var toolCalls []model.ToolCall
 	var responseState *model.ResponseState
 	const maxAttempts = 5
 	var idleRetried bool
+	lastDurableTextLength := 0
+	flushAssistant := func() error {
+		if checkpoint == nil || assistantContent.Len() == 0 {
+			return nil
+		}
+		length, _, err := checkpoint(assistantContent.String(), true)
+		if err == nil {
+			lastDurableTextLength = length
+		}
+		return err
+	}
+	failAfterPartialOutput := func(err error, message string) (string, string, []model.ToolCall, *model.ResponseState, bool) {
+		if flushErr := flushAssistant(); flushErr != nil {
+			out <- model.ErrorEvent{Err: flushErr, Message: "persist assistant output"}
+			return assistantContent.String(), reasoningContent.String(), nil, nil, true
+		}
+		out <- model.ErrorEvent{Err: err, Message: message}
+		return assistantContent.String(), reasoningContent.String(), nil, nil, true
+	}
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		stream, err := provider.Stream(ctx, request)
 		if err != nil {
@@ -369,23 +466,38 @@ func streamModelTurn(ctx context.Context, provider model.Provider, request model
 					Reason:      model.RetryReason(err),
 				}
 				if err := waitForProviderRetry(ctx, delay); err != nil {
-					out <- model.ErrorEvent{Err: err, Message: "retry model request"}
-					return assistantContent.String(), reasoningContent.String(), nil, nil, true
+					return failAfterPartialOutput(err, "retry model request")
 				}
 				continue
 			}
-			out <- model.ErrorEvent{Err: err, Message: "request model"}
-			return assistantContent.String(), reasoningContent.String(), nil, nil, true
+			return failAfterPartialOutput(err, "request model")
 		}
 
 		madeProgress := false
 		retry := false
 	streamLoop:
 		for event := range stream {
+			outputEvent := event
 			switch event := event.(type) {
 			case model.TextDeltaEvent:
 				madeProgress = true
 				assistantContent.WriteString(event.Text)
+				checkpointed := false
+				if checkpoint != nil {
+					length, committed, err := checkpoint(assistantContent.String(), false)
+					if err != nil {
+						out <- model.ErrorEvent{Err: err, Message: "persist assistant output"}
+						return assistantContent.String(), reasoningContent.String(), nil, nil, true
+					}
+					lastDurableTextLength = length
+					checkpointed = committed
+				}
+				if checkpoint != nil {
+					event.AssistantItemID = assistantItemID
+					event.DurableTextLength = lastDurableTextLength
+					event.DurableCheckpointed = checkpointed
+					outputEvent = event
+				}
 			case model.ReasoningDeltaEvent:
 				madeProgress = true
 				reasoningContent.WriteString(event.Text)
@@ -415,19 +527,24 @@ func streamModelTurn(ctx context.Context, provider model.Provider, request model
 						Reason:      model.RetryReason(event.Err),
 					}
 					if err := waitForProviderRetry(ctx, delay); err != nil {
-						out <- model.ErrorEvent{Err: err, Message: "retry model request"}
-						return assistantContent.String(), reasoningContent.String(), nil, nil, true
+						return failAfterPartialOutput(err, "retry model request")
 					}
 					retry = true
 					break streamLoop
 				}
-				out <- event
-				return assistantContent.String(), reasoningContent.String(), nil, nil, true
+				return failAfterPartialOutput(event.Err, event.Message)
 			}
-			out <- event
+			out <- outputEvent
 		}
 		if retry {
 			continue
+		}
+		if err := ctx.Err(); err != nil {
+			return failAfterPartialOutput(err, "stream model")
+		}
+		if err := flushAssistant(); err != nil {
+			out <- model.ErrorEvent{Err: err, Message: "persist assistant output"}
+			return assistantContent.String(), reasoningContent.String(), nil, nil, true
 		}
 		return assistantContent.String(), reasoningContent.String(), toolCalls, responseState, false
 	}

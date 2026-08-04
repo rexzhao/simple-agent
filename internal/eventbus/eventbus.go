@@ -15,6 +15,7 @@ const (
 	KindCompactionRequested = "compaction.requested"
 	KindTurnInputReady      = "turn.input_ready"
 	KindAssistantReady      = "assistant.ready"
+	KindAssistantCheckpoint = "assistant.text_checkpoint"
 	KindToolResultReady     = "tool_result.ready"
 	KindTurnCompleted       = "turn.completed"
 	KindTurnInterrupted     = "turn.interrupted"
@@ -41,6 +42,14 @@ type TransientEvent interface {
 
 type Publisher interface {
 	Publish(Event) error
+}
+
+// AssistantCheckpointPublisher is implemented by the session publisher used
+// by the incremental agent runner.  It is deliberately an optional extension
+// of Publisher so low-level agent tests and non-session callers keep the
+// historical end-of-round persistence semantics.
+type AssistantCheckpointPublisher interface {
+	PublishAssistantCheckpoint(turnID string, agentIteration int, itemID, content string) error
 }
 
 type DurableHandler func(Event) error
@@ -104,6 +113,17 @@ func (b *Bus) Publish(event Event) error {
 		return b.fanout(event)
 	}
 	return fmt.Errorf("unsupported event type %T", event)
+}
+
+// PublishAssistantCheckpoint implements AssistantCheckpointPublisher for
+// callers that use a Bus directly instead of the execution lifecycle wrapper.
+func (b *Bus) PublishAssistantCheckpoint(turnID string, agentIteration int, itemID, content string) error {
+	return b.Publish(AssistantTextCheckpoint{
+		TurnID:         turnID,
+		AgentIteration: agentIteration,
+		ItemID:         itemID,
+		Content:        content,
+	})
 }
 
 func (b *Bus) Subscribe() <-chan Event {
@@ -259,11 +279,29 @@ func (TurnInputReady) durableEvent() {}
 type AssistantReady struct {
 	TurnID         string
 	AgentIteration int
-	Message        model.Message
+	// ItemID is stable for one logical assistant message.  It is populated by
+	// the agent even for messages that do not produce visible text, allowing a
+	// streamed message and its final AssistantReady event to share identity.
+	ItemID  string
+	Message model.Message
 }
 
 func (AssistantReady) Kind() string  { return KindAssistantReady }
 func (AssistantReady) durableEvent() {}
+
+// AssistantTextCheckpoint is a cumulative visible assistant text checkpoint.
+// The first non-blank checkpoint appends the item; later checkpoints update
+// that same item.  Content is cumulative rather than a delta so a retried or
+// delayed writer can never reconstruct a different prefix.
+type AssistantTextCheckpoint struct {
+	TurnID         string
+	AgentIteration int
+	ItemID         string
+	Content        string
+}
+
+func (AssistantTextCheckpoint) Kind() string  { return KindAssistantCheckpoint }
+func (AssistantTextCheckpoint) durableEvent() {}
 
 type ToolResultReady struct {
 	TurnID         string

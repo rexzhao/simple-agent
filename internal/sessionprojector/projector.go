@@ -7,6 +7,7 @@ package sessionprojector
 
 import (
 	"fmt"
+	"reflect"
 	"sort"
 	"strings"
 	"sync"
@@ -30,7 +31,17 @@ type Projector struct {
 	turnID         string
 	finished       bool
 	toolItems      map[string]string
+	assistantItems map[assistantItemKey]string
 	pendingItemIDs map[string]struct{}
+}
+
+// assistantItemKey identifies one logical model message. Agent iterations are
+// scoped to a turn: a queued/follow-up prompt may start a new turn whose first
+// invocation is iteration one again. Keeping the turn in this key prevents a
+// later turn from being mistaken for a continuation of the earlier message.
+type assistantItemKey struct {
+	turnID    string
+	iteration int
 }
 
 // RunProjector routes durable events for a multi-request Run to one projector
@@ -143,6 +154,8 @@ func eventTurnID(event eventbus.Event) string {
 		return e.TurnID
 	case eventbus.AssistantReady:
 		return e.TurnID
+	case eventbus.AssistantTextCheckpoint:
+		return e.TurnID
 	case eventbus.ToolResultReady:
 		return e.TurnID
 	case eventbus.TurnCompleted:
@@ -188,6 +201,7 @@ func newProjector(store projectorStore, session sessions.SessionV2, runID string
 		session:        session,
 		runID:          runID,
 		toolItems:      make(map[string]string),
+		assistantItems: make(map[assistantItemKey]string),
 		pendingItemIDs: make(map[string]struct{}),
 	}
 	projector.wg.Add(1)
@@ -275,6 +289,8 @@ func (p *Projector) handle(event eventbus.Event) (int64, error) {
 		err = p.handleTurnInputReady(event)
 	case eventbus.AssistantReady:
 		err = p.handleAssistantReady(event)
+	case eventbus.AssistantTextCheckpoint:
+		err = p.handleAssistantTextCheckpoint(event)
 	case eventbus.ToolResultReady:
 		err = p.handleToolResultReady(event)
 	case eventbus.TurnCompleted:
@@ -399,19 +415,53 @@ func (p *Projector) handleAssistantReady(event eventbus.AssistantReady) error {
 	}
 
 	existing := sessions.SessionItemIDs(p.session.Items)
-	items := make([]sessions.SessionItem, 0, 1+len(event.Message.ToolCalls))
+	items := make([]sessions.SessionItem, 0, len(event.Message.ToolCalls))
 	activeHistory := copyStrings(p.session.ActiveHistory)
 	seenToolCallIDs := make(map[string]struct{}, len(event.Message.ToolCalls))
 	toolItemAdds := make(map[string]string, len(event.Message.ToolCalls))
 	pendingItemAdds := make([]string, 0, len(event.Message.ToolCalls))
 
-	assistantID := sessions.NextSessionItemID(existing, event.Message)
-	existing[assistantID] = struct{}{}
-	assistantItem := sessions.SessionItemFromMessage(assistantID, event.Message)
-	assistantItem.TurnID = turnID
-	assistantItem.AgentIteration = event.AgentIteration
-	items = append(items, assistantItem)
-	activeHistory = append(activeHistory, assistantID)
+	assistantID := strings.TrimSpace(event.ItemID)
+	key := assistantItemKey{turnID: turnID, iteration: event.AgentIteration}
+	if assistantID == "" && event.AgentIteration > 0 {
+		assistantID = p.assistantItems[key]
+	}
+	assistantItem, assistantExists := sessionItemByID(p.session.Items, assistantID)
+	if assistantID != "" && assistantExists {
+		if assistantItem.Message == nil || assistantItem.Message.Role != model.MessageRoleAssistant {
+			return fmt.Errorf("assistant item %q has a non-assistant projection", assistantID)
+		}
+		if previous := p.assistantItems[key]; event.AgentIteration > 0 && previous != "" && previous != assistantID {
+			return fmt.Errorf("assistant iteration %d in turn %q changed item identity from %q to %q", event.AgentIteration, turnID, previous, assistantID)
+		}
+		if !reflect.DeepEqual(*assistantItem.Message, event.Message) {
+			_, next, err := p.store.UpdateItemFromState(p.session.ID, p.session, sessions.SessionItem{
+				ID:      assistantID,
+				Message: &event.Message,
+			})
+			if err != nil {
+				return err
+			}
+			p.session = next
+			assistantItem, _ = sessionItemByID(p.session.Items, assistantID)
+		}
+	} else {
+		if assistantID == "" {
+			assistantID = sessions.NextSessionItemID(existing, event.Message)
+		}
+		if _, alreadyUsed := existing[assistantID]; alreadyUsed {
+			return fmt.Errorf("assistant item %q already exists", assistantID)
+		}
+		assistantItem = sessions.SessionItemFromMessage(assistantID, event.Message)
+		assistantItem.TurnID = turnID
+		assistantItem.AgentIteration = event.AgentIteration
+		items = append(items, assistantItem)
+		activeHistory = append(activeHistory, assistantID)
+		existing[assistantID] = struct{}{}
+	}
+	if event.AgentIteration > 0 {
+		p.assistantItems[key] = assistantID
+	}
 
 	for _, toolCall := range event.Message.ToolCalls {
 		if strings.TrimSpace(toolCall.ID) == "" {
@@ -440,17 +490,73 @@ func (p *Projector) handleAssistantReady(event eventbus.AssistantReady) error {
 		pendingItemAdds = append(pendingItemAdds, itemID)
 	}
 
-	next, err := p.store.AppendItemsAndReplaceActiveHistoryFromState(p.session.ID, p.session, items, activeHistory)
-	if err != nil {
-		return err
+	if len(items) > 0 {
+		next, err := p.store.AppendItemsAndReplaceActiveHistoryFromState(p.session.ID, p.session, items, activeHistory)
+		if err != nil {
+			return err
+		}
+		p.session = next
 	}
-	p.session = next
 	for toolCallID, itemID := range toolItemAdds {
 		p.toolItems[toolCallID] = itemID
 	}
 	for _, itemID := range pendingItemAdds {
 		p.pendingItemIDs[itemID] = struct{}{}
 	}
+	return nil
+}
+
+func (p *Projector) handleAssistantTextCheckpoint(event eventbus.AssistantTextCheckpoint) error {
+	turnID, err := p.requireActiveTurnID(event.TurnID)
+	if err != nil {
+		return err
+	}
+	if event.AgentIteration <= 0 {
+		return fmt.Errorf("assistant iteration must be positive")
+	}
+	itemID := strings.TrimSpace(event.ItemID)
+	if itemID == "" {
+		return fmt.Errorf("assistant item id is required")
+	}
+	if strings.TrimSpace(event.Content) == "" {
+		// Whitespace-only provider output is not a visible assistant message.
+		return nil
+	}
+	key := assistantItemKey{turnID: turnID, iteration: event.AgentIteration}
+	if existingID := p.assistantItems[key]; existingID != "" && existingID != itemID {
+		return fmt.Errorf("assistant iteration %d in turn %q changed item identity from %q to %q", event.AgentIteration, turnID, existingID, itemID)
+	}
+	if existing, ok := sessionItemByID(p.session.Items, itemID); ok {
+		if existing.Message == nil || existing.Message.Role != model.MessageRoleAssistant {
+			return fmt.Errorf("assistant item %q has a non-assistant projection", itemID)
+		}
+		message := *existing.Message
+		message.Content = event.Content
+		_, next, err := p.store.UpdateItemFromState(p.session.ID, p.session, sessions.SessionItem{
+			ID:      itemID,
+			Message: &message,
+		})
+		if err != nil {
+			return err
+		}
+		p.session = next
+		p.assistantItems[key] = itemID
+		return nil
+	}
+	if _, used := sessions.SessionItemIDs(p.session.Items)[itemID]; used {
+		return fmt.Errorf("assistant item %q already exists", itemID)
+	}
+	message := model.Message{Role: model.MessageRoleAssistant, Content: event.Content}
+	item := sessions.SessionItemFromMessage(itemID, message)
+	item.TurnID = turnID
+	item.AgentIteration = event.AgentIteration
+	activeHistory := append(copyStrings(p.session.ActiveHistory), itemID)
+	next, err := p.store.AppendItemsAndReplaceActiveHistoryFromState(p.session.ID, p.session, []sessions.SessionItem{item}, activeHistory)
+	if err != nil {
+		return err
+	}
+	p.session = next
+	p.assistantItems[key] = itemID
 	return nil
 }
 

@@ -190,6 +190,36 @@ describe('Conversation identity boundary', () => {
     expect(container.querySelectorAll('.message')).toHaveLength(2)
   })
 
+  it('renders a durable assistant prefix and transient tail as one bubble', () => {
+    const detail = session('s1')
+    const page: ItemsPage = {
+      items: [{
+        seq: 2, id: 'assistant-stream', turn_id: 'turn-live', agent_iteration: 1, created_at: '',
+        kind: 'message', visibility: 'visible', audience: 'model',
+        message: { role: 'assistant', content: { inline: 'a' } },
+      }],
+      oldest_seq: 2, newest_seq: 2, has_more_before: false, has_more_after: false,
+    }
+    const activeRun: ActiveRun = {
+      id: 'run-1', sessionID: 's1', turnID: 'turn-live', assistantText: 'b', steps: [],
+      agentIteration: 1, status: 'running',
+      assistantItems: { 'turn-live:1': { itemID: 'assistant-stream', durableTextLength: 1 } },
+    }
+    const { container, rerender } = renderConversation(<Conversation {...baseProps} sessionID="s1" detail={detail} page={page} activeRun={activeRun} />)
+    expect(container.querySelectorAll('.message.assistant:not(.transient)')).toHaveLength(1)
+    expect(container.querySelectorAll('.message.assistant.transient')).toHaveLength(0)
+    expect(container.querySelector('.message.assistant:not(.transient)')?.textContent).toContain('ab')
+
+    const settledPage: ItemsPage = {
+      ...page,
+      items: [{ ...page.items[0], message: { role: 'assistant', content: { inline: 'ab' } } }],
+    }
+    rerender(<Conversation {...baseProps} sessionID="s1" detail={detail} page={settledPage} activeRun={{ ...activeRun, assistantText: '', status: 'failed' }} />)
+    expect(container.querySelectorAll('.message.assistant:not(.transient)')).toHaveLength(1)
+    expect(container.querySelectorAll('.message.assistant.transient')).toHaveLength(0)
+    expect(container.querySelector('.message.assistant:not(.transient)')?.textContent).toContain('ab')
+  })
+
   it('splits one turn into separate process groups around a compaction record without key collisions', () => {
     const detail = session('s1')
     const toolCallItem = (seq: number, callID: string) => ({

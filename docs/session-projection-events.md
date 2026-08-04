@@ -1,6 +1,6 @@
 # Session projection and run event contract
 
-**Status: stage 4 implementation contract.** This document
+**Status: stage 5 implementation contract.** This document
 is a wire-contract decision, not a request to change the current product
 behavior. The examples and compatibility notes deliberately describe the
 implementation in this repository. Later stages may add fields or migrate an
@@ -90,6 +90,54 @@ record/event sequence, which differs from the item's original
 `history.items[].seq`. The nested `item.seq` is always the item's creation
 sequence, including for `item.updated`. Consumers identify the item by
 `item_id` and must not assign the notification `seq` to the item.
+
+### 2.3 Streaming assistant item lifecycle
+
+The agent creates the durable assistant message at the first non-blank,
+user-visible text delta for one logical assistant message. It does not create
+an empty assistant placeholder at run admission or `turn.started`. The
+creation is committed as the existing `item.appended` event. Subsequent
+checkpoints use `item.updated` for the same `item.id`; the nested `item.seq`
+(creation sequence) is unchanged while the notification `seq` and session
+`revision` advance monotonically.
+
+Checkpointing is cumulative and serialized through the session projector. The
+first visible delta is flushed immediately. Later writes happen when either
+75ms has elapsed since the previous checkpoint or at least 64 new Unicode
+codepoints have accumulated. The terminal path always forces a final flush,
+including a provider failure or cancellation after partial output. The final
+assistant message event updates that same item when it adds final metadata or
+tool calls; it never appends a second copy.
+
+The ordering for every visible item event is commit first, notification second:
+the projector writes the item and obtains its durable record sequence before
+the committed `item.appended` or `item.updated` DTO is published. A turn may
+therefore have a low-latency transient tail after the most recent checkpoint;
+that tail is not itself a durable claim. If the forced terminal checkpoint
+fails, the authoritative item stops at the previous committed checkpoint and
+the run enters the existing failed/resync path. The client must not report
+that every transient delta it displayed was persisted.
+
+Each transient `text.delta` now optionally carries additive `item_id`,
+`durable_text_length`, and `durable_checkpointed` fields. The item projection
+event optionally carries `assistant_text_length`. These fields explicitly
+associate the run stream with the durable item; clients must not match text,
+turn content, or timing to deduplicate. The frontend renders the durable item
+as the message bubble and keeps only the uncheckpointed tail in `ActiveRun`. A
+committed append/update clears or replaces that tail, so replay, a fast
+append/update sequence, and duplicate projection events still produce one
+bubble.
+
+Reasoning deltas, provider items, and tool-internal events do not invoke the
+assistant checkpoint path. If the run fails or is cancelled after an assistant
+checkpoint, the partial item remains in history and the received tail is
+force-flushed when possible; it is not rolled back. If no visible output has
+arrived, no assistant item is created. A checkpoint write failure stops the
+run before its corresponding transient delta is broadcast and the run enters
+the normal failed/resync path; any already-visible but uncheckpointed tail is
+not authoritative and the last committed partial item remains the source of
+truth. If one turn contains multiple logical assistant messages, each gets
+its own stable item id and checkpoint sequence.
 
 ## 3. Event envelopes and streams
 
@@ -446,10 +494,11 @@ and `clear` removes it with the session. When loading an older page, the client
 captures the entry revision before the request; the response covers at least
 that revision, so a replay at the same revision cannot roll the fetched item
 back, while a higher-revision event still wins. Active-run state remains a
-transient view of assistant deltas, reasoning, tools, and process status; item
-projection events are applied to the shared store only and are not copied into
-the run. Conversation identity is the backend `item.id`, not message text,
-content, or turn matching.
+transient view of assistant deltas, reasoning, tools, and process status; the
+full item DTO is applied to the shared store, while only its explicit
+assistant `item.id`/durable-length ownership metadata is copied into the run.
+Conversation identity is the backend `item.id`, not message text, content, or
+turn matching.
 
 ### 6.2 Stage 4 frontend submit and stream orchestration
 
@@ -478,16 +527,23 @@ For a new composer submission, the frontend follows this order:
    committed item event, using its
    backend `item.id`; never fill a stream gap with an optimistic row or a
    text/turn deduplication guess.
-6. Keep only transient assistant delta/tool/process UI in `ActiveRun` for this
-   stage. `run.prompt_appended` may add an anonymous transient process
+6. Keep only the uncheckpointed assistant tail plus transient tool/process UI
+   in `ActiveRun` for this
+   stage. When the bound durable assistant item is loaded in the current page,
+   the conversation row attaches that tail to the durable message by its
+   explicit `item_id` and suppresses the assistant portion of the active
+   process row; if it is not loaded yet, the active row is a temporary
+   fallback. `run.prompt_appended` may add an anonymous transient process
    boundary so transient process output is not folded across a drained prompt;
    the before/after segments remain internally ordered. It never creates or
    renders a user item. A committed durable user item still belongs to the
    historical rows; this stage does not claim to place transient process
    segments precisely on both sides of that historical bubble. On settlement,
    retain the existing reconcile behavior and let an authoritative snapshot
-   complete the durable projection; later stages may change how assistant
-   streaming is persisted.
+   complete the durable projection. Durable assistant item events are applied
+   to the shared projection store and explicitly update transient item
+   ownership, never by text matching. Settlement/reconcile behavior remains
+   unchanged for this stage.
 
 `revision` in a snapshot or projection event is a session-wide snapshot and
 completeness watermark. It is compared numerically and says which durable

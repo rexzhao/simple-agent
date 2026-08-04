@@ -14,7 +14,13 @@ interface ConversationRowBase {
 }
 
 export type ConversationRow =
-  | (ConversationRowBase & { kind: 'message'; item: SessionItem })
+  | (ConversationRowBase & {
+    kind: 'message'
+    item: SessionItem
+    /** Uncheckpointed output attached to this item's authoritative id. */
+    assistantTail?: string
+    assistantStreaming?: boolean
+  })
   | (ConversationRowBase & { kind: 'compaction'; item: SessionItem })
   | (ConversationRowBase & {
     kind: 'process'
@@ -27,6 +33,8 @@ export type ConversationRow =
     run: ActiveRun
     steps: RunStep[]
     isLast: boolean
+    /** The assistant tail is rendered by the durable message row instead. */
+    assistantTailAttached?: boolean
   })
   | (ConversationRowBase & {
     kind: 'active-compaction'
@@ -62,7 +70,23 @@ export interface BuildConversationRowsInput {
  */
 export function buildConversationRows(input: BuildConversationRowsInput): ConversationRow[] {
   const activeRun = input.activeRun ?? null
-  const rows = buildHistoricalRows(input.items, input.sessionID, input.recentStepsByTurn ?? {})
+  const historicalRows = buildHistoricalRows(input.items, input.sessionID, input.recentStepsByTurn ?? {})
+  const assistantBinding = activeRun ? activeAssistantBinding(activeRun) : undefined
+  // The binding is an explicit backend-provided item id. The page may not yet
+  // contain that item during the append/snapshot race; only then do we retain
+  // the process-row fallback. Never infer this relationship from text or turn
+  // content, since identical output can be two distinct assistant messages.
+  const attachedAssistantItemID = assistantBinding && historicalRows.some((row) =>
+    row.kind === 'message' && row.item.id === assistantBinding.itemID && row.item.message?.role === 'assistant',
+  ) ? assistantBinding.itemID : undefined
+  const rows = historicalRows.map((row): ConversationRow => {
+    if (row.kind !== 'message' || row.item.id !== attachedAssistantItemID) return row
+    return {
+      ...row,
+      assistantTail: activeRun?.assistantText || undefined,
+      assistantStreaming: activeRun?.status === 'running',
+    }
+  })
 
   if (activeRun) {
     if (activeRun.compaction) {
@@ -72,15 +96,21 @@ export function buildConversationRows(input: BuildConversationRowsInput): Conver
         compaction: activeRun.compaction,
       })
     }
-    activeRunSegments(activeRun).forEach((segment, index, segments) => {
-      rows.push({
-        kind: 'active-process',
-        key: rowKey(input.sessionID, 'active-process', activeRun.id, segment.boundary),
-        run: activeRun,
-        steps: segment.steps,
-        isLast: index === segments.length - 1,
+    const segments = activeRunSegments(activeRun)
+    // With no process steps the durable Message row owns the generating
+    // cursor as well, so an attached tail does not create a second bubble.
+    if (!(attachedAssistantItemID && segments.every((segment) => segment.steps.length === 0))) {
+      segments.forEach((segment, index) => {
+        rows.push({
+          kind: 'active-process',
+          key: rowKey(input.sessionID, 'active-process', activeRun.id, segment.boundary),
+          run: activeRun,
+          steps: segment.steps,
+          isLast: index === segments.length - 1,
+          assistantTailAttached: Boolean(attachedAssistantItemID),
+        })
       })
-    })
+    }
     if (activeRun.providerRetry) {
       rows.push({
         kind: 'provider-retry',
@@ -112,6 +142,14 @@ export function buildConversationRows(input: BuildConversationRowsInput): Conver
     rows.push({ kind: 'interrupted', key: rowKey(input.sessionID, 'interrupted') })
   }
   return rows
+}
+
+function activeAssistantBinding(run: ActiveRun): { itemID: string; durableTextLength: number } | undefined {
+  const turnID = run.turnID?.trim()
+  if (!turnID || run.agentIteration <= 0) return undefined
+  // The key selects the current invocation, but the item id is the only
+  // identity used to attach the transient tail to a durable row.
+  return run.assistantItems?.[`${turnID}:${run.agentIteration}`]
 }
 
 type ActiveRunSegment = { steps: RunStep[]; boundary: string }
