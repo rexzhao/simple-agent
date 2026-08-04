@@ -183,6 +183,7 @@ test('connects a first project, creates a session, and commits a streamed run', 
 
 test('hands a durable assistant bubble through checkpointed and transient stream output', async ({ page }) => {
   let eventConnections = 0
+  let snapshotRequests = 0
   let releaseTail!: () => void
   let releaseSettled!: () => void
   const tailGate = new Promise<void>((resolve) => { releaseTail = resolve })
@@ -201,6 +202,10 @@ test('hands a durable assistant bubble through checkpointed and transient stream
 
   await mockExistingSessionApp(page, async (route, url) => {
     const request = route.request()
+    if (url.pathname === `/api/sessions/${session.id}/snapshot`) {
+      snapshotRequests++
+      return false
+    }
     if (url.pathname === `/api/sessions/${session.id}/runs` && request.method() === 'POST') {
       await json(route, { run_id: 'run-stream', session_id: session.id, status: 'running' }, 202)
       return true
@@ -243,7 +248,7 @@ test('hands a durable assistant bubble through checkpointed and transient stream
           seq: 3, revision: '3', item_id: 'assistant-stream', assistant_text_length: 2, item: assistantItem('ab'),
         },
         { type: 'turn.committed', turn_id: 'turn-stream', last_seq: 3 },
-        { type: 'run.settled', run_id: 'run-stream', status: 'committed', turn_id: 'turn-stream', last_seq: 3 },
+        { type: 'run.settled', run_id: 'run-stream', status: 'committed', turn_id: 'turn-stream', last_seq: 3, committed_revision: '3' },
       ]),
     })
     return true
@@ -270,6 +275,61 @@ test('hands a durable assistant bubble through checkpointed and transient stream
   await expect(page.locator('.message.assistant:not(.transient)')).toContainText('ab')
   await expect(page.locator('.message.assistant:not(.transient)')).toHaveCount(1)
   await expect(page.getByLabel('Session status: idle')).toBeVisible()
+  // The two projection events already advanced the local store to revision 3;
+  // settlement is a completeness check, not a second snapshot command.
+  expect(snapshotRequests).toBe(1)
+})
+
+test('snapshots once when settlement watermark is still ahead of local projection', async ({ page }) => {
+  let eventConnections = 0
+  let snapshotRequests = 0
+  let settled = false
+  const repairedAssistant = {
+    seq: 2, id: 'repaired-assistant', turn_id: 'turn-lagging', created_at: '', kind: 'message',
+    visibility: 'normal', audience: 'model', message: { role: 'assistant', content: { inline: 'repaired answer' } },
+  }
+  await mockExistingSessionApp(page, async (route, url) => {
+    const request = route.request()
+    if (url.pathname === `/api/sessions/${session.id}/runs` && request.method() === 'POST') {
+      await json(route, { run_id: 'run-lagging', session_id: session.id, status: 'running' }, 202)
+      return true
+    }
+    if (url.pathname === `/api/sessions/${session.id}/snapshot`) {
+      snapshotRequests++
+      await json(route, {
+        session_id: session.id,
+        revision: settled ? '3' : '0',
+        session: { ...session, revision: settled ? '3' : '0', last_seq: settled ? 3 : 0 },
+        history: settled ? itemsPage([repairedAssistant]) : itemsPage(),
+      })
+      return true
+    }
+    if (url.pathname === '/api/runs/run-lagging/events') {
+      eventConnections++
+      if (eventConnections === 1) {
+        await route.fulfill({
+          status: 200, contentType: 'text/event-stream',
+          body: sse([{ type: 'run.started', run_id: 'run-lagging', session_id: session.id, status: 'running' }]),
+        })
+        return true
+      }
+      settled = true
+      await route.fulfill({
+        status: 200, contentType: 'text/event-stream',
+        body: sse([{ type: 'run.settled', run_id: 'run-lagging', status: 'committed', committed_revision: '3', last_seq: 3 }]),
+      })
+      return true
+    }
+    return false
+  })
+
+  await page.goto('/')
+  const composer = page.getByPlaceholder('Send a message to SAI')
+  await composer.fill('lagging settlement')
+  await page.getByRole('button', { name: 'Send' }).click()
+  await expect(page.getByText('repaired answer')).toBeVisible()
+  await expect(page.getByLabel('Session status: idle')).toBeVisible()
+  expect(snapshotRequests).toBe(2)
 })
 
 test('cancels an active run without persisting its transient turn', async ({ page }) => {

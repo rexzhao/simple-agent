@@ -206,6 +206,127 @@ describe('buildConversationRows stable identities', () => {
     expect(afterCheckpoint.filter((row) => row.kind === 'message')[0]).toMatchObject({ assistantTail: undefined })
   })
 
+  it('does not double-render a durable tool while retaining transient reasoning', () => {
+    const rows = buildConversationRows({
+      sessionID: 'session-1',
+      items: [
+        item('assistant-call', 1, 'assistant', '', {
+          turn_id: 'turn-live',
+          message: { role: 'assistant', content: { inline: '' }, tool_calls: [{ id: 'call-1', name: 'shell' }] },
+        }),
+      ],
+      activeRun: run({
+        steps: [
+          { kind: 'reasoning', id: 'reasoning-live', text: 'still thinking', iteration: 1 },
+          { kind: 'tool', id: 'call-1', name: 'shell', status: 'running', iteration: 1 },
+        ],
+      }),
+    })
+    const active = rows.find((row) => row.kind === 'active-process')
+    expect(active?.steps).toEqual([{ kind: 'reasoning', id: 'reasoning-live', text: 'still thinking', iteration: 1 }])
+    const durableProcess = rows.find((row) => row.kind === 'process')
+    expect(durableProcess?.steps).toEqual(expect.arrayContaining([
+      expect.objectContaining({ kind: 'tool', id: 'call-1', status: 'running' }),
+    ]))
+  })
+
+  it('keeps a new empty generating row when an older turn has durable tools', () => {
+    const rows = buildConversationRows({
+      sessionID: 'session-1',
+      items: [item('old-call', 1, 'assistant', '', {
+        turn_id: 'old-turn',
+        message: { role: 'assistant', content: { inline: '' }, tool_calls: [{ id: 'old-call-1', name: 'shell' }] },
+      })],
+      activeRun: run({ id: 'new-run', turnID: 'new-turn', assistantText: '', steps: [] }),
+    })
+    expect(rows.filter((row) => row.kind === 'active-process')).toHaveLength(1)
+  })
+
+  it('does not duplicate reasoning after the bound assistant item becomes durable', () => {
+    const rows = buildConversationRows({
+      sessionID: 'session-1',
+      items: [item('assistant-1', 2, 'assistant', 'answer', {
+        turn_id: 'turn-live',
+        agent_iteration: 1,
+        message: {
+          role: 'assistant',
+          content: { inline: 'answer' },
+          reasoning: 'I checked the files.',
+        },
+      })],
+      activeRun: run({
+        turnID: 'turn-live',
+        agentIteration: 1,
+        steps: [{ kind: 'reasoning', id: 'reasoning-live', text: 'I checked the files.', iteration: 1 }],
+        assistantItems: { 'turn-live:1': { itemID: 'assistant-1', durableTextLength: 6 } },
+      }),
+    })
+
+    const reasoningSteps = rows.flatMap((row) => row.kind === 'process' || row.kind === 'active-process' ? row.steps : [])
+      .filter((step) => step.kind === 'reasoning')
+    expect(reasoningSteps).toEqual([
+      { kind: 'reasoning', id: 'assistant-1-reasoning', text: 'I checked the files.', iteration: 1 },
+    ])
+  })
+
+  it('retains prior-segment reasoning when the current turn reuses its iteration number', () => {
+    const rows = buildConversationRows({
+      sessionID: 'session-1',
+      items: [item('assistant-current', 3, 'assistant', 'answer', {
+        turn_id: 'turn-current',
+        agent_iteration: 1,
+        message: {
+          role: 'assistant',
+          content: { inline: 'answer' },
+          reasoning: 'Current turn reasoning.',
+        },
+      })],
+      activeRun: run({
+        turnID: 'turn-current',
+        agentIteration: 1,
+        steps: [
+          { kind: 'reasoning', id: 'reasoning-previous', text: 'Previous turn reasoning.', iteration: 1 },
+          { kind: 'reasoning', id: 'reasoning-current', text: 'Current turn reasoning.', iteration: 1 },
+        ],
+        processBoundaries: [{ id: 'prompt-boundary', stepIndex: 1 }],
+        assistantItems: { 'turn-current:1': { itemID: 'assistant-current', durableTextLength: 6 } },
+      }),
+    })
+
+    const reasoningSteps = rows.flatMap((row) => row.kind === 'process' || row.kind === 'active-process' ? row.steps : [])
+      .filter((step) => step.kind === 'reasoning')
+    expect(reasoningSteps).toEqual([
+      { kind: 'reasoning', id: 'assistant-current-reasoning', text: 'Current turn reasoning.', iteration: 1 },
+      { kind: 'reasoning', id: 'reasoning-previous', text: 'Previous turn reasoning.', iteration: 1 },
+    ])
+  })
+
+  it('reconstructs terminal reasoning from durable assistant items after the run is gone', () => {
+    const rows = buildConversationRows({
+      sessionID: 'session-1',
+      items: [
+        item('user-1', 1, 'user', 'inspect the repository', { turn_id: 'turn-1' }),
+        item('assistant-1', 2, 'assistant', 'The answer', {
+          turn_id: 'turn-1',
+          agent_iteration: 1,
+          message: {
+            role: 'assistant',
+            content: { inline: 'The answer' },
+            reasoning: 'I checked the relevant files first.',
+          },
+        }),
+      ],
+      // A settled run is intentionally absent. The item DTO is the only
+      // source for terminal reasoning; no recentStepsByTurn bridge exists.
+    })
+
+    expect(rows.filter((row) => row.kind === 'active-process')).toHaveLength(0)
+    expect(rows.find((row) => row.kind === 'process')?.steps).toEqual([
+      { kind: 'reasoning', id: 'assistant-1-reasoning', text: 'I checked the relevant files first.', iteration: 1 },
+    ])
+    expect(rows.filter((row) => row.kind === 'message').map((row) => row.item.id)).toEqual(['user-1', 'assistant-1'])
+  })
+
   it('falls back to one transient output row until the bound durable item is loaded', () => {
     const rows = buildConversationRows({
       sessionID: 'session-1',

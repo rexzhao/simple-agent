@@ -3,7 +3,7 @@ import Markdown from 'react-markdown'
 import type { Components } from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { api } from '../api'
-import type { ActiveRun, ItemsPage, QueuedPrompt, RunStep, Session, SessionImageAttachment, SessionItem } from '../types'
+import type { ActiveRun, ItemsPage, QueuedPrompt, Session, SessionImageAttachment, SessionItem } from '../types'
 import { addUsageBreakdown, contextRequestCount, contextUsageBreakdown, usageBreakdownFromEvents, usageCostBreakdown, usageEventCount } from '../lib/cost'
 import { buildConversationRows, conversationRowKey } from '../lib/conversationRows'
 import type { ConversationRow } from '../lib/conversationRows'
@@ -31,7 +31,6 @@ export const Conversation = memo(function Conversation(props: {
 	onPastedImageAdd: (pastedImage: PastedImageAttachment) => void
 	onPastedImageRemove: (pastedImageID: number) => void
 	onDraftClear: () => void
-	recentStepsByTurn: Record<string, RunStep[]>
   sessionNames: Record<string, string>
   turnError: { turnID: string; message: string } | null
   onDismissTurnError: () => void
@@ -174,7 +173,6 @@ export const Conversation = memo(function Conversation(props: {
 			sessionID: props.sessionID ?? '',
 			items: props.page?.items ?? [],
 			activeRun: props.activeRun,
-			recentStepsByTurn: props.recentStepsByTurn,
 			compacting: props.compacting,
 			turnError: props.turnError,
 			sessionStatus: safeDetail?.status,
@@ -185,7 +183,7 @@ export const Conversation = memo(function Conversation(props: {
 		// represent the empty state instead of an invisible helper item.
 		if (rows.length > 0) rows.push({ kind: 'bottom-spacer', key: conversationRowKey(props.sessionID, 'bottom-spacer') })
 		return rows
-	}, [props.activeRun, props.compacting, props.page?.items, props.recentStepsByTurn, props.sessionID, props.turnError, safeDetail?.status])
+	}, [props.activeRun, props.compacting, props.page?.items, props.sessionID, props.turnError, safeDetail?.status])
 	const loadOlder = useCallback(async () => {
 		if (loadingOlderRef.current || !props.page?.has_more_before) return
 		loadingOlderRef.current = true
@@ -309,7 +307,6 @@ export const Conversation = memo(function Conversation(props: {
   previous.compacting === next.compacting &&
   previous.draft === next.draft &&
   previous.turnError === next.turnError &&
-  previous.recentStepsByTurn === next.recentStepsByTurn &&
   previous.sessionNames === next.sessionNames &&
   previous.onCancelTool === next.onCancelTool &&
   previous.onContinue === next.onContinue &&
@@ -593,7 +590,7 @@ function ActiveProcessRow({ row, onCancelTool, sessionNames, workspaceRoot }: { 
 	return (
 		<article className="message assistant transient">
 			<div className="message-content">
-				{row.isLast && <div className="message-meta"><span className="streaming-label"><i />Generating</span></div>}
+				{row.isLast && running && <div className="message-meta"><span className="streaming-label"><i />Generating</span></div>}
 				<ProcessTimeline steps={row.steps} live={row.isLast && running && !textStreaming} onCancelTool={onCancelTool} sessionNames={sessionNames} workspaceRoot={workspaceRoot} />
 				{row.isLast && !row.assistantTailAttached && run.assistantText && <MarkdownMessage text={run.assistantText} streaming cursor={running} />}
 				{row.isLast && !row.assistantTailAttached && running && !run.assistantText && <div className="message-text assistant-stream"><span className="cursor" /></div>}

@@ -78,9 +78,19 @@ func TestSessionProjectionItemEventsCarryCommittedSafeDTO(t *testing.T) {
 		t.Fatalf("image projection event leaked inline image data: %s", encoded)
 	}
 
+	showReasoningState, err := service.sessionStore.LoadState(session.ID)
+	if err != nil {
+		t.Fatalf("LoadState(before reasoning projection) error = %v", err)
+	}
+	showReasoningState.ShowReasoning = true
+	if _, err := service.sessionStore.SaveMetadata(showReasoningState); err != nil {
+		t.Fatalf("SaveMetadata(show reasoning) error = %v", err)
+	}
+
 	assistant := sessions.SessionItemFromMessage("assistant-tool-call", model.Message{
-		Role:    model.MessageRoleAssistant,
-		Content: "I will inspect the file",
+		Role:             model.MessageRoleAssistant,
+		Content:          "I will inspect the file",
+		ReasoningContent: "First I will inspect the repository.",
 		ToolCalls: []model.ToolCall{{
 			ID:        "call-1",
 			Name:      "read_file",
@@ -104,6 +114,38 @@ func TestSessionProjectionItemEventsCarryCommittedSafeDTO(t *testing.T) {
 	assistantDTO := assistantStreamEvent["item"].(SessionItem)
 	if assistantDTO.Message == nil || len(assistantDTO.Message.ToolCalls) != 1 || assistantDTO.Message.ToolCalls[0].Arguments != `{"path":"README.md"}` {
 		t.Fatalf("assistant tool DTO = %#v, want filtered display arguments", assistantDTO)
+	}
+	if assistantDTO.Message.Reasoning != "First I will inspect the repository." {
+		t.Fatalf("assistant reasoning DTO = %q, want durable reasoning when enabled", assistantDTO.Message.Reasoning)
+	}
+	snapshot, err := service.GetSessionSnapshot(session.ID)
+	if err != nil {
+		t.Fatalf("GetSessionSnapshot(with reasoning) error = %v", err)
+	}
+	var snapshotAssistant *SessionItem
+	for index := range snapshot.History.Items {
+		if snapshot.History.Items[index].ID == assistant.ID {
+			snapshotAssistant = &snapshot.History.Items[index]
+			break
+		}
+	}
+	if snapshotAssistant == nil || snapshotAssistant.Message == nil || snapshotAssistant.Message.Reasoning != "First I will inspect the repository." {
+		t.Fatalf("snapshot assistant reasoning = %#v, want persisted reasoning", snapshotAssistant)
+	}
+	hiddenState, err := service.sessionStore.LoadState(session.ID)
+	if err != nil {
+		t.Fatalf("LoadState(before hidden reasoning projection) error = %v", err)
+	}
+	hiddenState.ShowReasoning = false
+	if _, err := service.sessionStore.SaveMetadata(hiddenState); err != nil {
+		t.Fatalf("SaveMetadata(hide reasoning) error = %v", err)
+	}
+	hiddenDTO, err := service.sessionItemDTO(session.ID, assistant)
+	if err != nil {
+		t.Fatalf("sessionItemDTO(hidden reasoning) error = %v", err)
+	}
+	if hiddenDTO.Message == nil || hiddenDTO.Message.Reasoning != "" {
+		t.Fatalf("hidden reasoning DTO = %#v, want omitted when disabled", hiddenDTO.Message)
 	}
 	if strings.Contains(mustMarshal(t, assistantStreamEvent), "provider-private") {
 		t.Fatal("assistant projection event leaked private tool argument")

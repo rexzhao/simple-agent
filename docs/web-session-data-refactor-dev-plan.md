@@ -1,6 +1,16 @@
-# Web 会话数据层重构 — 开发计划（对照代码补齐）
-
-> 基础方向见 `docs/web-session-data-refactor-plan.md`。本文件在原计划基础上，对照当前代码逐项补齐缺失的定义、状态机、迁移策略和可执行任务，作为接下来的开发依据。
+> **Stage 6 completed (HEAD review target).** The settlement state machine now
+> uses `run.settled.committed_revision` (with a legacy `last_seq` fallback) as
+> a precision-safe completeness watermark. A covered settlement tears down
+> only transient run state; it does not issue a snapshot. The old
+> `recentStepsByTurn` post-settlement process bridge has been removed because
+> durable assistant/tool items are already projected by the backend. When
+> `show_reasoning` is enabled, persisted assistant reasoning is also projected
+> into the item DTO, so terminal reasoning is not a client-side bridge. The
+> remaining live process row is intentionally limited to non-durable reasoning
+> and tool progress. The older run-state sketches below are historical
+> planning notes where they mention unconditional settled refreshes or saving
+> steps into `recentStepsByTurn`; § 6 records the superseding implementation.
+>
 
 ---
 
@@ -814,3 +824,36 @@ WP-A（后端 snapshot）
 ```
 
 每个 WP 完成后独立测试，确保不破坏现有行为。
+
+## 7. Stage 6 已完成 — committed revision settlement
+
+本阶段 supersede 上述旧的 settled 草图，实际规则如下：
+
+1. `run.settled.committed_revision` 是首选水位；没有该字段时才读取
+   `last_seq`。前端只接受非负十进制值，使用 `BigInt`/等价的
+   precision-safe 比较，绝不先转 `Number`。缺失或非法值走保守 snapshot
+   resync。
+2. run SSE 的 replay 顺序保证 settled 之前的 item projection event 已经
+   dispatch 到 store。`useSessionStore` 提供基于 `stateRef` 的
+   `getSessionRevision`/`isRevisionCovered`，但只把已建立的 snapshot
+   history entry（及其后应用的 events）视为完整 projection；未 snapshot
+   的 pending queue 不能证明 coverage。handler 因而不读取过期的 React
+   render state。local revision 覆盖 settled 水位时直接移除 transient run；
+   只有缺失或落后才 snapshot，并在覆盖前保留 run。
+3. retry/60 秒 timeout 只服务于确实落后的 reconciliation。failed/cancelled
+   同样保留已提交 partial item；covered 时不 refresh。lifecycle 与 per-run
+   settled 重复投递按 run id 幂等处理，sidebar 状态由 lifecycle 或本地
+   settlement metadata 更新，background covered completion 不刷新当前选中
+   session。
+4. 删除了 `recentStepsByTurn`、`saveRecentStepsAndRemove` 及
+   `processKey`。它们曾在 settlement 后复制 transient steps 以弥补“snapshot
+   才有 durable item”的旧假设；Stage 3/5 的后端 item projection 已取代该
+   bridge。必要的 transient reasoning 和尚未 durable 的 tool progress 仍在
+   `ActiveRun`，已 durable 的 tool call/result 只显示一次；terminal
+   assistant reasoning 则由后端在 `show_reasoning` 开启时投影到 durable
+   item DTO，历史行直接从该字段重建。`item.created` alias 与 dual-fetch
+   snapshot fallback 仍保留，作为迁移兼容项。
+
+对应的最小回归覆盖在 `web/src/App.test.tsx`、`sessionStore.test.ts`、
+`useSessionStore.test.ts` 与 `conversationRows.test.ts`；本阶段不包含
+Stage 7 的 fault-injection/E2E 大规模收尾。

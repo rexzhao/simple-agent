@@ -51,8 +51,11 @@ tool/MCP/skill loading, compaction, or storage logic.
 4. Starting a run returns a Web run ID immediately.
 5. The UI reads its ordered server-sent event stream with `fetch`.
 6. Transient text/reasoning/tool events update the active UI block.
-7. `turn.committed` and `run.settled` trigger a refresh from durable session
-   items, making the session store the canonical view.
+7. Committed item projection events update the canonical session store directly.
+   `run.settled` carries a committed revision watermark: a local projection
+   that covers it needs no snapshot; only a missing/lagging watermark (or
+   `run.resync_required`) triggers an authoritative refresh. The legacy
+   `last_seq` settlement fallback remains for older servers.
 8. Cancelling a run calls `SessionRun.Cancel` and interrupts only that run.
 
 ## Web API

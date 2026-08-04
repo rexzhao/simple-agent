@@ -257,6 +257,8 @@ export interface SessionItem {
   message?: {
     role: 'user' | 'assistant' | string
     content?: MessageContent
+    /** Durable assistant reasoning, present only when show_reasoning is enabled. */
+    reasoning?: string
     images?: SessionImageAttachment[]
 		tool_call_id?: string
 		tool_calls?: SessionToolCall[]
@@ -404,6 +406,7 @@ export interface ActiveRun {
     delayMS: number
   }
   status: 'running' | 'failed' | 'cancelled' | 'reconciling' | 'error_pending_refresh'
-  settledLastSeq?: number  // run.settled last_seq, for durable settlement check
+  /** Settlement completeness watermark; decimal string, never a Number. */
+  settledRevision?: string
   error?: string
 }

@@ -58,8 +58,12 @@ type SessionItem struct {
 }
 
 type SessionItemMessage struct {
-	Role       string                       `json:"role"`
-	Content    *SessionItemMessageContent   `json:"content,omitempty"`
+	Role    string                     `json:"role"`
+	Content *SessionItemMessageContent `json:"content,omitempty"`
+	// Reasoning is included only when the session's show_reasoning setting is
+	// enabled. It is persisted on the assistant message, so terminal history
+	// does not depend on the transient reasoning.delta stream.
+	Reasoning  string                       `json:"reasoning,omitempty"`
 	Images     []SessionItemImageAttachment `json:"images,omitempty"`
 	ToolCallID string                       `json:"tool_call_id,omitempty"`
 	ToolCalls  []SessionItemToolCall        `json:"tool_calls,omitempty"`
@@ -305,9 +309,17 @@ func (s *Service) GetSessionChatItemsPage(id string, options SessionItemsOptions
 }
 
 func (s *Service) sessionItemsPageFromStorePage(sessionID string, page sessions.HistoryPage) (SessionItemsPage, error) {
+	state, err := s.sessionStore.LoadState(sessionID)
+	if err != nil {
+		return SessionItemsPage{}, err
+	}
+	return s.sessionItemsPageFromStorePageWithReasoning(sessionID, page, state.ShowReasoning)
+}
+
+func (s *Service) sessionItemsPageFromStorePageWithReasoning(sessionID string, page sessions.HistoryPage, showReasoning bool) (SessionItemsPage, error) {
 	items := make([]SessionItem, 0, len(page.Items))
 	for _, item := range page.Items {
-		dto, err := s.sessionItemDTO(sessionID, item)
+		dto, err := s.sessionItemDTOWithReasoning(sessionID, item, showReasoning)
 		if err != nil {
 			return SessionItemsPage{}, err
 		}
@@ -335,7 +347,7 @@ func (s *Service) buildItemsPage(session sessions.SessionV2, beforeSeq, afterSeq
 	page, hasMoreBefore, hasMoreAfter := pagedSessionItems(filtered, beforeSeq, afterSeq, limit, alignTurn)
 	items := make([]SessionItem, 0, len(page))
 	for _, item := range page {
-		dto, err := s.sessionItemDTO(session.ID, item)
+		dto, err := s.sessionItemDTOWithReasoning(session.ID, item, session.ShowReasoning)
 		if err != nil {
 			return SessionItemsPage{}, err
 		}
@@ -764,6 +776,14 @@ func modelSessionStreamEvent(eventType, turnID string, agentIteration int, field
 }
 
 func (s *Service) sessionItemDTO(sessionID string, item sessions.SessionItem) (SessionItem, error) {
+	state, err := s.sessionStore.LoadState(sessionID)
+	if err != nil {
+		return SessionItem{}, err
+	}
+	return s.sessionItemDTOWithReasoning(sessionID, item, state.ShowReasoning)
+}
+
+func (s *Service) sessionItemDTOWithReasoning(sessionID string, item sessions.SessionItem, showReasoning bool) (SessionItem, error) {
 	dto := SessionItem{
 		Seq:            item.Seq,
 		ID:             item.ID,
@@ -782,6 +802,9 @@ func (s *Service) sessionItemDTO(sessionID string, item sessions.SessionItem) (S
 		Role:       string(item.Message.Role),
 		ToolCallID: item.Message.ToolCallID,
 		IsError:    item.Message.IsError,
+	}
+	if showReasoning && item.Message.Role == model.MessageRoleAssistant {
+		dto.Message.Reasoning = item.Message.ReasoningContent
 	}
 	if len(item.Message.ToolCalls) > 0 {
 		dto.Message.ToolCalls = make([]SessionItemToolCall, 0, len(item.Message.ToolCalls))

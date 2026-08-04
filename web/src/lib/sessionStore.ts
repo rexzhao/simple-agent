@@ -86,15 +86,49 @@ export type SessionStoreAction =
   | { type: 'sessions'; projectID: string; sessions: Session[]; archived: boolean; generation: number }
   | { type: 'pageOlder'; sessionID: string; older: ItemsPage; requestRevision: string }
   | { type: 'projectionEvent'; event: SessionItemProjectionEvent }
+  | { type: 'sessionMetadata'; session: Session }
+  | { type: 'settlementMetadata'; session: Session; revision: string }
   | { type: 'setMeta'; sessionID: string; loading?: boolean; error?: string }
   | { type: 'clearSession'; sessionID: string }
 
 /**
- * Compares two revision strings as integers using BigInt so that "9" < "10"
- * (dictionary order would give the wrong result).
+ * Normalize a session revision without ever routing it through Number.
+ *
+ * Revisions are wire-level decimal strings.  The runtime checks here are
+ * intentionally defensive: an old server, a malformed fixture, or a
+ * hostile SSE payload must make reconciliation conservative, not take down
+ * the reducer with a BigInt conversion error.
  */
-export function revisionGTE(a: string, b: string): boolean {
-  return BigInt(a) >= BigInt(b)
+export function parseDecimalRevision(value: unknown): string | null {
+  if (typeof value === 'bigint') return value >= 0n ? value.toString() : null
+  if (typeof value === 'number') {
+    return Number.isSafeInteger(value) && value >= 0 ? String(value) : null
+  }
+  if (typeof value !== 'string') return null
+  const trimmed = value.trim()
+  if (!/^\d+$/.test(trimmed)) return null
+  return trimmed.replace(/^0+(?=\d)/, '')
+}
+
+/** Returns -1, 0, or 1; null means at least one input is not a revision. */
+export function compareRevisions(a: unknown, b: unknown): -1 | 0 | 1 | null {
+  const left = parseDecimalRevision(a)
+  const right = parseDecimalRevision(b)
+  if (left === null || right === null) return null
+  const leftBig = BigInt(left)
+  const rightBig = BigInt(right)
+  if (leftBig < rightBig) return -1
+  if (leftBig > rightBig) return 1
+  return 0
+}
+
+/**
+ * Compares two revisions as integers so that "9" < "10". Invalid input is
+ * deliberately not considered covered.
+ */
+export function revisionGTE(a: unknown, b: unknown): boolean {
+  const comparison = compareRevisions(a, b)
+  return comparison !== null && comparison >= 0
 }
 
 /**
@@ -132,11 +166,13 @@ function touchLRU(historyBySession: Record<string, SessionHistoryEntry>, session
 }
 
 function maxDecimal(a: string, b: string): string {
-  return BigInt(a) >= BigInt(b) ? a : b
+  const left = parseDecimalRevision(a) ?? '0'
+  const right = parseDecimalRevision(b) ?? '0'
+  return BigInt(left) >= BigInt(right) ? left : right
 }
 
 function projectionEventRecordSeq(event: SessionItemProjectionEvent): string {
-  return String(event.seq)
+  return parseDecimalRevision(event.seq) ?? '0'
 }
 
 function compareProjectionEvents(a: SessionItemProjectionEvent, b: SessionItemProjectionEvent): number {
@@ -145,6 +181,17 @@ function compareProjectionEvents(a: SessionItemProjectionEvent, b: SessionItemPr
   if (aSeq < bSeq) return -1
   if (aSeq > bSeq) return 1
   return a.item.id.localeCompare(b.item.id)
+}
+
+function sessionRevision(session: Session | undefined, fallback = '0'): string {
+  return parseDecimalRevision(session?.revision)
+    ?? parseDecimalRevision(session?.last_seq)
+    ?? parseDecimalRevision(fallback)
+    ?? '0'
+}
+
+function normalizeSession(session: Session, fallbackRevision = '0'): Session {
+  return { ...session, revision: sessionRevision(session, fallbackRevision) }
 }
 
 function appendPendingProjectionEvent(
@@ -214,7 +261,7 @@ function applyPendingProjectionEvents(state: SessionStoreState, sessionID: strin
   const pending = state.pendingProjectionBySession[sessionID]
   if (!pending) return state
 
-  const replay = pending.events.filter((event) => BigInt(event.revision) > BigInt(snapshotRevision))
+  const replay = pending.events.filter((event) => !revisionGTE(snapshotRevision, event.revision))
   const pendingProjectionBySession = { ...state.pendingProjectionBySession }
   delete pendingProjectionBySession[sessionID]
   const snapshotResyncBySession = { ...state.snapshotResyncBySession }
@@ -240,10 +287,11 @@ const eventDrivenSessionFields: Array<keyof Session> = [
 
 /** Merge a point-in-time DTO that is known to be older than existing state. */
 function mergeStaleSessionMetadata(existing: Session, incoming: Session, existingRevision: string): Session {
-  const revisionNumber = Number(existingRevision)
+  const normalizedExistingRevision = parseDecimalRevision(existingRevision) ?? '0'
+  const revisionNumber = Number(normalizedExistingRevision)
   const merged: Session = {
-    ...incoming,
-    revision: existingRevision,
+    ...normalizeSession(incoming, normalizedExistingRevision),
+    revision: normalizedExistingRevision,
     ...(Number.isSafeInteger(revisionNumber) ? { last_seq: revisionNumber } : { last_seq: existing.last_seq }),
   }
   // Preserve the complete event-driven field shape, including cleared
@@ -256,43 +304,95 @@ function mergeStaleSessionMetadata(existing: Session, incoming: Session, existin
   return merged
 }
 
+const settlementSessionFields: Array<keyof Session> = [
+  'current_run_id',
+  'running_run_id',
+  'running_turn_id',
+  'interrupted_run_id',
+  'interrupted_turn_id',
+  'last_run_id',
+  'last_run_status',
+  'status',
+]
+
+/**
+ * Merge a terminal run transition independently of the revision ordering of
+ * point-in-time session DTOs. The settlement watermark must not move the
+ * durable revision backwards, but its run fields are authoritative even when
+ * the sidebar DTO was captured at an older revision (or at the same revision
+ * with stale lifecycle fields).
+ */
+function mergeAuthoritativeSettlementMetadata(existing: Session | undefined, incoming: Session, settlementRevision: string): Session {
+  if (!existing) {
+    const revisionNumber = Number(settlementRevision)
+    return {
+      // The lifecycle/sidebar DTO is the only metadata available for an
+      // uncached session, so use it as the fallback base. The explicit
+      // settlement watermark still wins over any stale revision on that DTO.
+      ...incoming,
+      revision: settlementRevision,
+      ...(Number.isSafeInteger(revisionNumber) ? { last_seq: revisionNumber } : {}),
+    }
+  }
+
+  const existingRevision = sessionRevision(existing)
+  const effectiveRevision = maxDecimal(existingRevision, settlementRevision)
+  // Do not use the stale sidebar DTO as the merge base for a cached session:
+  // it may carry an older display name, provider metadata, or other
+  // descriptive fields. Settlement owns only the terminal run fields below.
+  const withAuthoritativeRunFields = { ...existing } as Session
+  for (const field of settlementSessionFields) {
+    if (incoming[field] === undefined) delete (withAuthoritativeRunFields as unknown as Record<string, unknown>)[field]
+    else Object.assign(withAuthoritativeRunFields, { [field]: incoming[field] })
+  }
+  const revisionNumber = Number(effectiveRevision)
+  return {
+    ...withAuthoritativeRunFields,
+    revision: effectiveRevision,
+    ...(Number.isSafeInteger(revisionNumber) ? { last_seq: revisionNumber } : {}),
+  }
+}
+
 function mergeSessionFromList(existing: Session | undefined, incoming: Session): Session {
-  if (!existing) return incoming
-  const existingRevision = existing.revision ?? String(existing.last_seq)
-  const incomingRevision = incoming.revision ?? String(incoming.last_seq)
-  if (BigInt(existingRevision) <= BigInt(incomingRevision)) return incoming
+  const normalizedIncoming = normalizeSession(incoming)
+  if (!existing) return normalizedIncoming
+  const existingRevision = sessionRevision(existing)
+  const incomingRevision = sessionRevision(normalizedIncoming)
+  if (revisionGTE(incomingRevision, existingRevision)) return normalizedIncoming
   return mergeStaleSessionMetadata(existing, incoming, existingRevision)
 }
 
 function sessionMetadataForSnapshot(existing: Session | undefined, incoming: Session, snapshotRevision: string): Session {
-  if (!existing) return incoming
-  const existingRevision = existing.revision ?? String(existing.last_seq)
-  return BigInt(existingRevision) > BigInt(snapshotRevision)
+  const normalizedIncoming = normalizeSession(incoming, snapshotRevision)
+  if (!existing) return normalizedIncoming
+  const existingRevision = sessionRevision(existing)
+  return !revisionGTE(snapshotRevision, existingRevision)
     ? mergeStaleSessionMetadata(existing, incoming, existingRevision)
-    : incoming
+    : normalizedIncoming
 }
 
 function initialSnapshotNeedsResync(state: SessionStoreState, sessionID: string, snapshotRevision: string): boolean {
   const pending = state.pendingProjectionBySession[sessionID]
   const pendingOverflowRevision = pending?.overflowed ? pending.overflowRevision : '0'
   const markedRevision = state.snapshotResyncBySession[sessionID] ?? '0'
-  return BigInt(snapshotRevision) < BigInt(maxDecimal(pendingOverflowRevision, markedRevision))
+  return !revisionGTE(snapshotRevision, maxDecimal(pendingOverflowRevision, markedRevision))
 }
 
 function applySessionRevision(state: SessionStoreState, sessionID: string, revision: string): Record<string, Session> {
   const existing = state.sessionsByID[sessionID]
   if (!existing) return state.sessionsByID
-  const currentRevision = existing.revision ?? String(existing.last_seq)
+  const currentRevision = sessionRevision(existing)
   if (revisionGTE(currentRevision, revision)) return state.sessionsByID
 
-  const revisionNumber = Number(revision)
+  const normalizedRevision = parseDecimalRevision(revision) ?? currentRevision
+  const revisionNumber = Number(normalizedRevision)
   return {
     ...state.sessionsByID,
     [sessionID]: {
       ...existing,
       // Keep the decimal string authoritative. Update the compatibility
       // number only while it remains representable without precision loss.
-      revision,
+      revision: normalizedRevision,
       ...(Number.isSafeInteger(revisionNumber) ? { last_seq: revisionNumber } : {}),
     },
   }
@@ -433,7 +533,12 @@ export function sessionStoreReducer(state: SessionStoreState, action: SessionSto
     }
 
     case 'snapshot': {
-      const { snapshot, expectedSessionID } = action
+      const { expectedSessionID } = action
+      const snapshotRevision = parseDecimalRevision(action.snapshot.revision)
+      if (snapshotRevision === null) return state
+      const snapshot = action.snapshot.revision === snapshotRevision
+        ? action.snapshot
+        : { ...action.snapshot, revision: snapshotRevision }
       // Invariant 1: identity must match.
       if (snapshot.session_id !== expectedSessionID) return state
 
@@ -455,7 +560,7 @@ export function sessionStoreReducer(state: SessionStoreState, action: SessionSto
       // Invariant 3: older revision must not overwrite newer history.
       // But always update sessionsByID — metadata-only changes (rename, full
       // access toggle) don't change LastSeq but must still update the session.
-      if (existing && BigInt(existing.revision) > BigInt(snapshot.revision)) {
+      if (existing && !revisionGTE(snapshot.revision, existing.revision)) {
         // The snapshot is stale: just update session metadata in sessionsByID.
         const currentSession = state.sessionsByID[snapshot.session_id]
         const sessionsByID = {
@@ -466,7 +571,7 @@ export function sessionStoreReducer(state: SessionStoreState, action: SessionSto
         }
         return { ...stateForSnapshot, sessionsByID }
       }
-      if (existing && BigInt(existing.revision) === BigInt(snapshot.revision)) {
+      if (existing && compareRevisions(existing.revision, snapshot.revision) === 0) {
         // An equal-revision snapshot is still authoritative for the items it
         // returns. Merge it into the current window so a create from the same
         // transaction that was missed by the event stream is recovered, while
@@ -597,6 +702,7 @@ export function sessionStoreReducer(state: SessionStoreState, action: SessionSto
 
     case 'pageOlder': {
       const { sessionID, older, requestRevision } = action
+      if (parseDecimalRevision(requestRevision) === null) return state
       const existing = state.historyBySession[sessionID]
       if (!existing) return state
       const merged = mergeOlderPage(existing, older, requestRevision)
@@ -606,7 +712,12 @@ export function sessionStoreReducer(state: SessionStoreState, action: SessionSto
     }
 
     case 'projectionEvent': {
-      const { event } = action
+      const revision = parseDecimalRevision(action.event.revision)
+      const recordSeq = parseDecimalRevision(action.event.seq)
+      if (revision === null || recordSeq === null || !action.event.session_id || !action.event.item?.id) return state
+      const event = action.event.revision === revision
+        ? action.event
+        : { ...action.event, revision }
       const sessionID = event.session_id
       const existing = state.historyBySession[sessionID]
       const metadataRevision = existing && revisionGTE(existing.revision, event.revision)
@@ -641,6 +752,27 @@ export function sessionStoreReducer(state: SessionStoreState, action: SessionSto
       const historyBySession = { ...state.historyBySession, [sessionID]: nextEntry }
       touchLRU(historyBySession, sessionID)
       return { ...state, sessionsByID, historyBySession }
+    }
+
+    case 'sessionMetadata': {
+      const incoming = normalizeSession(action.session)
+      const existing = state.sessionsByID[incoming.id]
+      // Lifecycle/session DTOs are point-in-time metadata. Reuse the same
+      // revision-aware merge as session lists: a stale DTO may update safe
+      // descriptive fields, but it must not resurrect event-driven run IDs or
+      // statuses that a newer projection/lifecycle transition cleared.
+      const merged = mergeSessionFromList(existing, incoming)
+      const sessionsByID = { ...state.sessionsByID, [incoming.id]: merged }
+      return { ...state, sessionsByID }
+    }
+
+    case 'settlementMetadata': {
+      const revision = parseDecimalRevision(action.revision)
+      if (revision === null || !action.session.id) return state
+      const existing = state.sessionsByID[action.session.id]
+      const merged = mergeAuthoritativeSettlementMetadata(existing, action.session, revision)
+      const sessionsByID = { ...state.sessionsByID, [action.session.id]: merged }
+      return { ...state, sessionsByID }
     }
 
     case 'setMeta': {

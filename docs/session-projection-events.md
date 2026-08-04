@@ -1,6 +1,6 @@
 # Session projection and run event contract
 
-**Status: stage 5 implementation contract.** This document
+**Status: stage 6 implementation contract.** This document
 is a wire-contract decision, not a request to change the current product
 behavior. The examples and compatibility notes deliberately describe the
 implementation in this repository. Later stages may add fields or migrate an
@@ -275,10 +275,14 @@ not by assuming consecutive item or revision values.
 The `item` object uses the same safe `SessionItem` DTO as the snapshot/items
 API. It contains display text or a bounded preview, image reference metadata
 (hash/media type/size) rather than image bytes, and filtered tool arguments.
-It never contains stored blobs, image data URLs, hidden reasoning, provider
-request/response data, or other model-only private fields. The DTO is read
-from the committed item projection after the durable event is observed; it is
-not assembled from transient request parameters.
+It never contains stored blobs, image data URLs, hidden reasoning (when the
+session's `show_reasoning` setting is disabled), provider request/response
+data, or other model-only private fields. When `show_reasoning` is enabled, a
+persisted assistant item's safe DTO may include its `message.reasoning` text;
+this is the authoritative terminal-history projection and does not depend on
+the transient `reasoning.delta` stream. The DTO is read from the committed
+item projection after the durable event is observed; it is not assembled from
+transient request parameters.
 
 Other persisted stream names currently include `compaction.created` and
 `active_history.replaced`. They can change the durable projection and therefore
@@ -354,8 +358,25 @@ compacts the terminal replay buffer to the last event (normally this
 `run.settled`). Thus a late terminal replay can contain only `run.settled` and
 can legitimately begin with a resync control frame if the requested cursor is
 behind its original ID. The terminal event keeps its original run SSE ID.
-Receiving `run.settled` is the signal to refresh durable session data; it is not
-permission to construct the final history locally.
+`run.settled` is a completeness watermark, not a refresh command. The client
+first drains the ordered projection events already delivered on that run
+connection and reads its local session-store revision synchronously. If
+`localRevision >= committed_revision`, the durable projection is complete and
+the client must not issue a full snapshot merely because settlement arrived.
+If the local revision is missing or lower, the client resynchronizes from an
+authoritative snapshot and keeps the run transient overlay until the response
+covers the target; bounded retry/timeout/manual refresh is only for that
+lagging path. A failed or cancelled run uses the same rule, so committed
+partial items are retained. A missing or malformed watermark uses the
+conservative refresh path for compatibility with older services.
+
+`committed_revision` and the `last_seq` fallback are decimal values for
+comparison purposes and must be parsed without first converting to a
+JavaScript `Number`. The revision is a session-projection watermark; it is not
+the run SSE event ID. SSE IDs remain per-run transport cursors used only for
+`after=` replay and gap detection. A lifecycle `run.settled` is the same
+logical notification and is idempotent with the per-run copy; its authoritative
+metadata may update the sidebar without requiring a history refresh.
 
 The process-wide `/api/events` lifecycle `run.settled` has the same logical run
 completion but a different envelope. It currently includes compatibility
@@ -450,11 +471,12 @@ server's `run.prompt_queue`, but a queued prompt is not a local user message.
 The user bubble appears only after the committed item event is applied to the
 App-owned projection store.
 
-On `run.settled`, `turn.committed`, `item.created`/legacy `item.appended`, or
-`item.updated`, clients may schedule a refresh. On `run.resync_required`, a
-refresh is mandatory before claiming that the local projection is current.
-Refreshes must be revision-aware and must not let an older asynchronous response
-overwrite newer history.
+On `turn.committed`, `item.created`/legacy `item.appended`, or
+`item.updated`, clients may schedule a refresh. `run.settled` is handled by the
+watermark rule above: a covered settlement schedules no snapshot; a lagging
+settlement does. On `run.resync_required`, a refresh is mandatory before
+claiming that the local projection is current. Refreshes must be revision-aware
+and must not let an older asynchronous response overwrite newer history.
 
 ### 6.1 Stage 3 frontend consumption rules
 
@@ -498,7 +520,10 @@ transient view of assistant deltas, reasoning, tools, and process status; the
 full item DTO is applied to the shared store, while only its explicit
 assistant `item.id`/durable-length ownership metadata is copied into the run.
 Conversation identity is the backend `item.id`, not message text, content, or
-turn matching.
+turn matching. Durable assistant tool-call/result items are rendered from the
+projection; the live row suppresses only matching transient tool steps while
+retaining reasoning and tools that have not become durable. There is no
+post-settlement `recentStepsByTurn` bridge.
 
 ### 6.2 Stage 4 frontend submit and stream orchestration
 
@@ -537,13 +562,8 @@ For a new composer submission, the frontend follows this order:
    boundary so transient process output is not folded across a drained prompt;
    the before/after segments remain internally ordered. It never creates or
    renders a user item. A committed durable user item still belongs to the
-   historical rows; this stage does not claim to place transient process
-   segments precisely on both sides of that historical bubble. On settlement,
-   retain the existing reconcile behavior and let an authoritative snapshot
-   complete the durable projection. Durable assistant item events are applied
-   to the shared projection store and explicitly update transient item
-   ownership, never by text matching. Settlement/reconcile behavior remains
-   unchanged for this stage.
+   historical rows. Settlement uses the committed watermark rule in §3.4;
+   it does not unconditionally refresh the snapshot.
 
 `revision` in a snapshot or projection event is a session-wide snapshot and
 completeness watermark. It is compared numerically and says which durable

@@ -181,6 +181,40 @@ describe('App lifecycle bootstrap', () => {
     return { view, composer }
   }
 
+  async function renderSettlementApp(snapshots: Array<ReturnType<typeof emptySnapshot> & { revision: string }> = [emptySnapshot()]) {
+    mocks.api.activeRuns.mockResolvedValue({ runs: [{ run_id: 'settlement-run', session_id: 'session-1', turn_id: 'turn-1', started_at: '', status: 'running' }] })
+    mocks.api.snapshot.mockReset()
+    for (const response of snapshots) mocks.api.snapshot.mockResolvedValueOnce(response)
+    mocks.streamRun.mockReset()
+    let onEvent: ((event: unknown) => void | Promise<void>) | undefined
+    mocks.streamRun.mockImplementation(async (_runID: string, handler: (event: unknown) => void | Promise<void>) => {
+      onEvent = handler
+    })
+    const view = render(<App />)
+    await screen.findByRole('textbox')
+    await waitFor(() => expect(onEvent).toBeDefined())
+    return { view, onEvent: onEvent! }
+  }
+
+  const projection = (revision: string, text = 'durable answer') => ({
+    type: 'item.appended',
+    session_id: 'session-1',
+    run_id: 'settlement-run',
+    seq: 2,
+    revision,
+    item_id: `item-${revision}`,
+    item: {
+      id: `item-${revision}`,
+      seq: 2,
+      turn_id: 'turn-1',
+      created_at: '',
+      kind: 'message',
+      visibility: 'visible',
+      audience: 'model',
+      message: { role: 'assistant', content: { inline: text } },
+    },
+  })
+
   it('waits for admitted run_id before connecting and renders only the committed user item once', async () => {
     let resolveAdmission!: (value: { run_id: string; session_id: string; status: string }) => void
     mocks.api.startRun.mockImplementation(() => new Promise((resolve) => { resolveAdmission = resolve }))
@@ -257,6 +291,112 @@ describe('App lifecycle bootstrap', () => {
     view.unmount()
   })
 
+  it('tears down a covered settlement without an extra snapshot', async () => {
+    const { view, onEvent } = await renderSettlementApp()
+    await act(async () => {
+      await onEvent(projection('7'))
+      await onEvent({ type: 'run.settled', run_id: 'settlement-run', status: 'committed', committed_revision: '7' })
+      const lifecycleHandler = mocks.streamLifecycle.mock.calls[0][0] as (event: unknown) => Promise<void>
+      await lifecycleHandler({ type: 'run.settled', session_id: 'session-1', run_id: 'settlement-run', status: 'committed', committed_revision: '7' })
+    })
+    expect(mocks.api.snapshot).toHaveBeenCalledTimes(1)
+    await waitFor(() => expect(screen.queryByRole('button', { name: 'Stop' })).toBeNull())
+    expect(screen.getByText('durable answer')).toBeTruthy()
+    view.unmount()
+  })
+
+  it('applies covered settlement metadata to the shared store when the sidebar is stale', async () => {
+    const initial = {
+      ...emptySnapshot(),
+      session: {
+        ...mocks.session,
+        revision: '0',
+        last_seq: 0,
+        status: 'running',
+        current_run_id: 'settlement-run',
+        running_run_id: 'settlement-run',
+        running_turn_id: 'turn-1',
+      },
+    }
+    const { view, onEvent } = await renderSettlementApp([initial])
+    await act(async () => {
+      // This advances the shared projection/store revision, while the
+      // sidebar DTO remains at its older bootstrap revision.
+      await onEvent(projection('7'))
+      await onEvent({ type: 'run.settled', run_id: 'settlement-run', status: 'committed', committed_revision: '7' })
+    })
+    expect(mocks.api.snapshot).toHaveBeenCalledTimes(1)
+    await waitFor(() => expect(screen.getByLabelText('Session status: idle')).toBeTruthy())
+    expect(screen.queryByLabelText('Session status: running')).toBeNull()
+    view.unmount()
+  })
+
+  it('refreshes a lagging settlement and removes the run only after coverage', async () => {
+    const initial = emptySnapshot()
+    const repaired = {
+      ...emptySnapshot(),
+      revision: '2',
+      session: { ...mocks.session, revision: '2', last_seq: 2 },
+      history: {
+        items: [projection('2').item] as never[],
+        oldest_seq: 2,
+        newest_seq: 2,
+        has_more_before: false,
+        has_more_after: false,
+      },
+    }
+    const { view, onEvent } = await renderSettlementApp([initial, repaired])
+    await act(async () => {
+      await onEvent({ type: 'run.settled', run_id: 'settlement-run', status: 'committed', committed_revision: '2' })
+    })
+    await waitFor(() => expect(mocks.api.snapshot).toHaveBeenCalledTimes(2))
+    await waitFor(() => expect(screen.queryByRole('button', { name: 'Stop' })).toBeNull())
+    expect(screen.getByText('durable answer')).toBeTruthy()
+    view.unmount()
+  })
+
+  it('uses precision-safe comparison and keeps covered failed partial items', async () => {
+    const localRevision = '90071992547409929'
+    const committedRevision = '90071992547409930'
+    const initial = {
+      ...emptySnapshot(),
+      revision: localRevision,
+      session: { ...mocks.session, revision: localRevision, last_seq: 0 },
+    }
+    const { view, onEvent } = await renderSettlementApp([initial])
+    await act(async () => {
+      await onEvent(projection(committedRevision, 'partial answer'))
+      await onEvent({ type: 'run.settled', run_id: 'settlement-run', status: 'failed', committed_revision: committedRevision, message: 'failed after partial commit' })
+    })
+    expect(mocks.api.snapshot).toHaveBeenCalledTimes(1)
+    expect(screen.getByText('partial answer')).toBeTruthy()
+    await waitFor(() => expect(screen.queryByRole('button', { name: 'Stop' })).toBeNull())
+    view.unmount()
+  })
+
+  it('keeps covered cancelled partial items without a snapshot', async () => {
+    const { view, onEvent } = await renderSettlementApp([emptySnapshot()])
+    await act(async () => {
+      await onEvent(projection('4', 'cancelled partial'))
+      await onEvent({ type: 'run.settled', run_id: 'settlement-run', status: 'cancelled', committed_revision: '4' })
+    })
+    expect(mocks.api.snapshot).toHaveBeenCalledTimes(1)
+    expect(screen.getByText('cancelled partial')).toBeTruthy()
+    await waitFor(() => expect(screen.queryByRole('button', { name: 'Stop' })).toBeNull())
+    view.unmount()
+  })
+
+  it('conservatively refreshes an invalid settlement watermark and handles duplicate settlement', async () => {
+    const { view, onEvent } = await renderSettlementApp([emptySnapshot(), { ...emptySnapshot(), revision: '0' }])
+    await act(async () => {
+      await onEvent({ type: 'run.settled', run_id: 'settlement-run', status: 'committed', committed_revision: 'invalid' })
+      await onEvent({ type: 'run.settled', run_id: 'settlement-run', status: 'committed', committed_revision: 'invalid' })
+    })
+    await waitFor(() => expect(mocks.api.snapshot).toHaveBeenCalledTimes(2))
+    expect(screen.queryByRole('button', { name: 'Stop' })).toBeNull()
+    view.unmount()
+  })
+
   it('receives an early item from the run replay without an optimistic active-run user row', async () => {
     mocks.api.startRun.mockResolvedValue({ run_id: 'fast-run', session_id: 'session-1', status: 'running' })
     const { view, composer } = await renderSubmitReadyApp()
@@ -319,6 +459,72 @@ describe('App lifecycle bootstrap', () => {
     // Admission never owned existing-run, so its transient failure state is
     // still present after the rejected attempt.
     expect(view.container.querySelectorAll('.message.assistant.transient')).toHaveLength(1)
+    view.unmount()
+  })
+
+  it('keeps a lagging run through bounded refresh failures', async () => {
+    const { view, onEvent } = await renderSettlementApp([emptySnapshot()])
+    vi.useFakeTimers()
+    await act(async () => {
+      await onEvent({ type: 'run.settled', run_id: 'settlement-run', status: 'committed', committed_revision: '9' })
+    })
+    expect(mocks.api.snapshot).toHaveBeenCalledTimes(2)
+    expect(view.container.querySelector('.message.assistant.transient')).not.toBeNull()
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(5000) })
+    // Initial refresh plus only the bounded retry budget. The overlay is
+    // still present; only the terminal timeout/manual action may clear it.
+    expect(mocks.api.snapshot.mock.calls.length).toBeGreaterThanOrEqual(2)
+    expect(mocks.api.snapshot.mock.calls.length).toBeLessThanOrEqual(4)
+    expect(view.container.querySelector('.message.assistant.transient')).not.toBeNull()
+    view.unmount()
+  })
+
+  it('does not refresh the selected session for a covered background settlement', async () => {
+    const background = { ...mocks.session, id: 'session-2', display_name: 'background-session', revision: '5', last_seq: 5 }
+    mocks.api.sessions.mockImplementation(async (_projectID: string, archived = false) => ({ sessions: archived ? [] : [mocks.session, background] }))
+    let activeRunsCalls = 0
+    mocks.api.activeRuns.mockImplementation(async () => {
+      activeRunsCalls += 1
+      return activeRunsCalls === 1
+        ? { runs: [] }
+        : { runs: [{ run_id: 'background-run', session_id: 'session-2', turn_id: 'turn-2', started_at: '', status: 'running' }] }
+    })
+    // Coverage is only established by a snapshot. Prime the background
+    // session's empty history, then return to the selected session before its
+    // run settles; a pre-snapshot projection queue must not make this test
+    // accidentally prove coverage.
+    mocks.api.snapshot.mockReset().mockImplementation(async (sessionID: string) => sessionID === 'session-2'
+      ? {
+        session_id: 'session-2',
+        revision: '5',
+        session: background,
+        history: { items: [], oldest_seq: 0, newest_seq: 0, has_more_before: false, has_more_after: false },
+      }
+      : emptySnapshot())
+    mocks.streamRun.mockReset().mockImplementation(async (_runID: string, onEvent: (event: unknown) => void | Promise<void>) => {
+      await onEvent({
+        type: 'item.appended', session_id: 'session-2', seq: 1, revision: '5', item_id: 'background-item',
+        item: { id: 'background-item', seq: 1, kind: 'message', visibility: 'visible', audience: 'model', message: { role: 'assistant', content: { inline: 'background answer' } } },
+      })
+      await onEvent({ type: 'run.settled', run_id: 'background-run', status: 'committed', committed_revision: '5' })
+    })
+    const view = render(<App />)
+    await screen.findByRole('textbox')
+    fireEvent.click(screen.getByText('background-session'))
+    await waitFor(() => expect(mocks.api.snapshot).toHaveBeenCalledTimes(2))
+    fireEvent.click(screen.getByText('session-1'))
+    await waitFor(() => expect(mocks.api.snapshot).toHaveBeenCalledTimes(3))
+    const snapshotsBeforeSettlement = mocks.api.snapshot.mock.calls.length
+    const lifecycleHandler = mocks.streamLifecycle.mock.calls[0][0] as (event: unknown) => Promise<void>
+    await act(async () => {
+      await lifecycleHandler({
+        type: 'run.started', session_id: 'session-2', run_id: 'background-run', status: 'running', session: background,
+      })
+    })
+    await waitFor(() => expect(mocks.streamRun).toHaveBeenCalledTimes(1))
+    await waitFor(() => expect(screen.getByRole('status').textContent).toContain('background-session completed in the background'))
+    expect(mocks.api.snapshot).toHaveBeenCalledTimes(snapshotsBeforeSettlement)
     view.unmount()
   })
 })

@@ -788,7 +788,7 @@ func (s *Service) GetSessionSnapshot(id string) (SessionSnapshot, error) {
 	if err != nil {
 		return SessionSnapshot{}, err
 	}
-	history, err := s.sessionItemsPageFromStorePage(id, storePage)
+	history, err := s.sessionItemsPageFromStorePageWithReasoning(id, storePage, session.ShowReasoning)
 	if err != nil {
 		return SessionSnapshot{}, err
 	}

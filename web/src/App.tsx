@@ -1,10 +1,11 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { api, streamLifecycle, streamRun } from './api'
-import type { ActiveRun, ActiveRunDescriptor, Bootstrap, ImageAttachmentInput, ItemsPage, LifecycleEvent, Project, RunEvent, RunStep, Session, SessionDebugSettings, SessionItem, SessionItemProjectionEvent, SessionModelOption } from './types'
+import type { ActiveRun, ActiveRunDescriptor, Bootstrap, ImageAttachmentInput, ItemsPage, LifecycleEvent, Project, RunEvent, Session, SessionDebugSettings, SessionItem, SessionItemProjectionEvent, SessionModelOption } from './types'
 import { errorMessage } from './lib/format'
 import { reduceLifecycleEvent, type SessionMaps } from './lib/lifecycleReducer'
 import { reduceRunEvent } from './lib/runEventReducer'
-import { modelKey, orderSessions, processKey, projectName, sessionDescendantIDs, sessionName } from './lib/session'
+import { modelKey, orderSessions, projectName, sessionDescendantIDs, sessionName } from './lib/session'
+import { settlementRevision } from './lib/settlement'
 import { emptyComposerDraft } from './components/Composer'
 import type { PastedImageAttachment } from './components/Composer'
 import { Conversation } from './components/Conversation'
@@ -37,7 +38,6 @@ function App() {
   const sessionMapsRef = useRef<SessionMaps>({ active: sessionsByProject, archived: archivedSessionsByProject })
   sessionMapsRef.current = { active: sessionsByProject, archived: archivedSessionsByProject }
   const [recoveredRuns, setRecoveredRuns] = useState<ActiveRunDescriptor[]>([])
-	const [recentStepsByTurn, setRecentStepsByTurn] = useState<Record<string, RunStep[]>>({})
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
   const [showProjectForm, setShowProjectForm] = useState(false)
@@ -211,14 +211,12 @@ function App() {
     useSessionHistory(selectedSessionID, loadSessions, reportError, sessionStore)
   refreshSessionRef.current = refreshSession
 
-  // saveRecentStepsAndRemove: saves steps to recentStepsByTurn, clears timers, removes run.
-  const saveRecentStepsAndRemove = useCallback((sessionID: string, runID: string) => {
+  // Durable items are already in the session projection. Removing a run must
+  // therefore only tear down transient state; it must not copy its steps into
+  // a second, post-settlement history cache.
+  const removeRun = useCallback((sessionID: string, runID: string) => {
     const run = activeRunsRef.current[sessionID]
     if (!run || run.id !== runID) return
-    const turnID = String(run.turnID ?? '')
-    if (turnID && run.steps.length > 0) {
-      setRecentStepsByTurn((current) => ({ ...current, [processKey(sessionID, turnID)]: run.steps }))
-    }
     setRecoveredRuns((current) => current.filter((r) => r.run_id !== runID))
     // Clear reconciling timers for this session.
     const timeout = reconcileTimeoutRef.current[sessionID]
@@ -229,11 +227,12 @@ function App() {
     updateActiveRun(sessionID, runID, () => null)
   }, [updateActiveRun])
 
-  // Wire onSupersedeRun: save old run steps + best-effort refresh.
+  // A superseded run may still have a reconciliation request in flight. Keep
+  // that authoritative request, but do not preserve its transient steps.
   onSupersedeRunRef.current = useCallback((sessionID: string, oldRunID: string) => {
-    saveRecentStepsAndRemove(sessionID, oldRunID)
+    removeRun(sessionID, oldRunID)
     void refreshSessionRef.current(sessionID).catch(() => {})
-  }, [saveRecentStepsAndRemove])
+  }, [removeRun])
 
   // startReconcileTimeout: 60s timer → error_pending_refresh.
   const startReconcileTimeout = useCallback((sessionID: string) => {
@@ -248,32 +247,28 @@ function App() {
     }, 60000)
   }, [updateActiveRun])
 
-  // onSnapshotApplied: unified settlement check point.
-  const onSnapshotApplied = useCallback((sessionID: string, session: Session) => {
+  // onSnapshotApplied: the only path that decides whether a settled run can
+  // be removed after a refresh. The store reader is synchronous and therefore
+  // includes projection events dispatched immediately before run.settled.
+  const onSnapshotApplied = useCallback((sessionID: string) => {
     const run = activeRunsRef.current[sessionID]
     if (!run) return
     if (run.status !== 'reconciling' && run.status !== 'error_pending_refresh') return
-    if (run.settledLastSeq == null || run.settledLastSeq === 0) {
-      saveRecentStepsAndRemove(sessionID, run.id)
+    if (!run.settledRevision || sessionStore.isRevisionCovered(sessionID, run.settledRevision)) {
+      removeRun(sessionID, run.id)
       return
     }
-    if (session.last_seq >= run.settledLastSeq) {
-      saveRecentStepsAndRemove(sessionID, run.id)
-    } else {
-      if (run.status === 'error_pending_refresh') {
-        updateActiveRun(sessionID, run.id, (r) => ({ ...r, status: 'reconciling' }))
-        // Re-entering reconciling needs a fresh terminal deadline: the
-        // original 60s timeout already fired when the run entered
-        // error_pending_refresh, and without one the run could strand here
-        // invisibly once the bounded retries are exhausted.
-        startReconcileTimeout(sessionID)
-      }
-      scheduleReconcileRetry(sessionID, run.id, run.settledLastSeq)
+    if (run.status === 'error_pending_refresh') {
+      updateActiveRun(sessionID, run.id, (r) => ({ ...r, status: 'reconciling' }))
+      // Re-entering reconciling needs a fresh terminal deadline: the
+      // original timeout already fired when the run entered error_pending.
+      startReconcileTimeout(sessionID)
     }
-  }, [saveRecentStepsAndRemove, startReconcileTimeout, updateActiveRun])
+    scheduleReconcileRetry(sessionID, run.id)
+  }, [removeRun, sessionStore.isRevisionCovered, startReconcileTimeout, updateActiveRun])
 
   // scheduleReconcileRetry: backoff refresh, max 2 retries.
-  const scheduleReconcileRetry = useCallback((sessionID: string, runID: string, settledLastSeq: number) => {
+  const scheduleReconcileRetry = useCallback((sessionID: string, runID: string) => {
     const key = `${sessionID}:${runID}`
     const count = reconcileRetryCountRef.current[key] ?? 0
     if (count >= 2) return
@@ -283,18 +278,23 @@ function App() {
     reconcileRetryTimerRef.current[sessionID] = window.setTimeout(() => {
       delete reconcileRetryTimerRef.current[sessionID]
       void refreshSessionRef.current(sessionID)
-        .then((session) => { if (session) onSnapshotApplied(sessionID, session) })
-        .catch(() => {})
+        .then(() => onSnapshotApplied(sessionID))
+        .catch(() => {
+          // A failed retry still consumes one bounded attempt, but should not
+          // strand a lagging run until the 60s deadline without the remaining
+          // retry opportunity.
+          if (activeRunsRef.current[sessionID]?.id === runID) scheduleReconcileRetry(sessionID, runID)
+        })
     }, 2000)
-  }, [onSnapshotApplied])
+  }, [activeRunsRef, onSnapshotApplied])
 
   // retryRefreshSession: manual "refresh to see latest" handler.
   const retryRefreshSession = useCallback(async (sessionID: string) => {
     const run = activeRunsRef.current[sessionID]
     if (!run || run.status !== 'error_pending_refresh') return
     try {
-      const session = await refreshSessionRef.current(sessionID)
-      if (session) onSnapshotApplied(sessionID, session)
+      await refreshSessionRef.current(sessionID)
+      onSnapshotApplied(sessionID)
     } catch { /* stay in error_pending_refresh */ }
   }, [onSnapshotApplied])
 
@@ -302,7 +302,7 @@ function App() {
   // arrives: navigating to a session with a stuck "Refresh needed" banner
   // settles it without a manual click once the durable state has caught up.
   useEffect(() => {
-    if (sessionDetail) onSnapshotApplied(sessionDetail.id, sessionDetail)
+    if (sessionDetail) onSnapshotApplied(sessionDetail.id)
   }, [sessionDetail, onSnapshotApplied])
 
   useEffect(() => {
@@ -534,6 +534,67 @@ function App() {
     }
   }, [activeRunsRef, archivedSessionsByProject, loadSessions, sessionsByProject])
 
+  const applyLifecycleSessionEvent = useCallback((event: LifecycleEvent, options: { updateStore?: boolean } = {}) => {
+    const eventSession = event.session && typeof event.session === 'object'
+      ? event.session
+      : event.metadata ?? event.session_metadata
+    if (eventSession && options.updateStore !== false) sessionStore.updateSessionMetadata(eventSession)
+    const current = sessionMapsRef.current
+    const next = reduceLifecycleEvent(current, event)
+    if (next === current) return
+    setSessionMaps(next)
+
+    if (event.type !== 'session.deleted') return
+    const deletedIDs = new Set([
+      typeof event.session === 'string' ? event.session : '',
+      event.session_id ?? '',
+      ...(event.descendants ?? []),
+    ])
+    if (!deletedIDs.has(selectedSessionIDRef.current)) return
+    const projectID = event.project_id ?? event.project ?? selectedProjectRef.current
+    const nextProjectID = next.active[projectID] || next.archived[projectID]
+      ? projectID
+      : Object.keys(next.active)[0] ?? ''
+    setSelectedProjectID(nextProjectID)
+    setSelectedSessionID(next.active[nextProjectID]?.[0]?.id ?? '')
+  }, [sessionStore.updateSessionMetadata, setSelectedProjectID, setSelectedSessionID, setSessionMaps])
+
+  const knownSession = useCallback((sessionID: string): Session | null => {
+    for (const sessions of Object.values(sessionMapsRef.current.active)) {
+      const session = sessions.find((item) => item.id === sessionID)
+      if (session) return session
+    }
+    for (const sessions of Object.values(sessionMapsRef.current.archived)) {
+      const session = sessions.find((item) => item.id === sessionID)
+      if (session) return session
+    }
+    return null
+  }, [])
+
+  const applySettledSidebarStatus = useCallback((sessionID: string, runID: string, status: string, turnID?: string, settlementRevision?: string) => {
+    const current = knownSession(sessionID)
+    if (!current) return
+    const failed = status === 'failed'
+    const nextSession: Session = {
+      ...current,
+      status: failed ? 'failed' : 'idle',
+      current_run_id: undefined,
+      running_run_id: undefined,
+      running_turn_id: undefined,
+      last_run_id: runID,
+      last_run_status: status,
+      ...(failed
+        ? { interrupted_run_id: current.interrupted_run_id ?? runID, interrupted_turn_id: current.interrupted_turn_id ?? turnID }
+        : { interrupted_run_id: undefined, interrupted_turn_id: undefined }),
+    }
+    // Update the sidebar from the synthetic terminal transition, but do not
+    // first feed its potentially stale DTO through the ordinary metadata
+    // merge. The explicit settlement reducer action below owns the terminal
+    // run fields when a valid watermark is available.
+    applyLifecycleSessionEvent({ type: 'session.updated', session: nextSession }, { updateStore: false })
+    if (settlementRevision) sessionStore.applySettlementMetadata(nextSession, settlementRevision)
+  }, [applyLifecycleSessionEvent, knownSession, sessionStore.applySettlementMetadata])
+
   const handleRunEvent = useCallback(async (sessionID: string, runID: string, event: RunEvent) => {
     if (event.type === 'text.delta' || event.type === 'reasoning.delta') {
       queueRunEvent(sessionID, runID, event)
@@ -616,60 +677,57 @@ function App() {
         runStartedReplayBindingsRef.current.delete(runID)
         setAwaitingRunStarted(sessionID, false)
         const settledRun = activeRunsRef.current[sessionID]
+        const settledStatus = String(event.status)
+        const settledRevision = settlementRevision(event)
+        applySettledSidebarStatus(sessionID, runID, settledStatus, typeof event.turn_id === 'string' ? event.turn_id : undefined, settledRevision)
         if (!settledRun || settledRun.id !== runID) {
-          // A terminal replay may retain only run.settled and can therefore
-          // arrive after the transient run container has already been
-          // discarded. The durable projection still needs its normal refresh
-          // when this is the selected session.
-          if (selectedSessionRef.current === sessionID) {
-            try { await refreshSession(sessionID) } catch (reason) { setError(errorMessage(reason)) }
+          // Lifecycle replay can contain only the terminal event. Do not
+          // refresh merely because the transient container is gone: the
+          // reducer may already have applied the final item projection.
+          if (!settledRevision || !sessionStore.isRevisionCovered(sessionID, settledRevision)) {
+            try { await refreshSession(sessionID) } catch (reason) {
+              if (selectedSessionRef.current === sessionID) setError(errorMessage(reason))
+            }
+          }
+          if (settledStatus === 'committed' && selectedSessionRef.current !== sessionID) {
+            const session = knownSession(sessionID)
+            setCompletionNotice({ sessionID, sessionName: session ? sessionName(session) : `Session ${sessionID.slice(-6)}` })
           }
           return
         }
-        const settledLastSeq = Number(event.last_seq ?? 0)
-        const settledStatus = String(event.status)
 
         if (settledStatus === 'failed') {
           // turn.failed usually landed first with the real reason; fallback for late-attach.
           setTurnErrors((current) => current[sessionID]
             ? current
             : { ...current, [sessionID]: { turnID: String(event.turn_id ?? ''), message: String(event.message ?? 'Run failed') } })
-          update((run) => ({ ...run, status: 'failed', settledLastSeq }))
-          try { await refreshSession(sessionID) } catch { /* error already shown */ }
-          saveRecentStepsAndRemove(sessionID, runID)
-          break
+        } else if (settledStatus === 'cancelled') {
+          // Keep the durable partial projection. It is only a refresh target
+          // when the terminal watermark is absent or not yet local.
         }
 
-        if (settledStatus === 'cancelled') {
-          update((run) => ({ ...run, status: 'cancelled', settledLastSeq }))
-          try { await refreshSession(sessionID) } catch { /* ignore */ }
-          saveRecentStepsAndRemove(sessionID, runID)
-          break
-        }
-
-        // committed
-        update((run) => ({ ...run, status: 'reconciling', settledLastSeq }))
-        startReconcileTimeout(sessionID)
-        let settledSession: Session | null = null
-        try {
-          settledSession = await refreshSession(sessionID)
-        } catch {
-          // Fall through to the bounded reconcile retry below: a transient
-          // refresh failure must not strand the run on the manual-refresh
-          // banner while the state is still converging.
-        }
-        if (activeRunsRef.current[sessionID]?.id === runID) {
-          const durableLastSeq = settledSession?.last_seq ?? 0
-          if (settledSession && (settledLastSeq === 0 || durableLastSeq >= settledLastSeq)) {
-            saveRecentStepsAndRemove(sessionID, runID)
-          } else {
-            // Refresh failed or the store is genuinely behind: keep
-            // reconciling with bounded retries. The 60s reconcile timeout is
-            // the terminal fallback that surfaces the Refresh banner.
-            scheduleReconcileRetry(sessionID, runID, settledLastSeq)
+        const covered = settledRevision !== undefined && sessionStore.isRevisionCovered(sessionID, settledRevision)
+        if (covered) {
+          removeRun(sessionID, runID)
+        } else {
+          // A missing watermark is the compatibility/defensive path. It is
+          // deliberately conservative, but still bounded and never deletes
+          // the run until an authoritative refresh succeeds.
+          update((run) => ({
+            ...run,
+            status: 'reconciling',
+            ...(settledRevision ? { settledRevision } : {}),
+          }))
+          startReconcileTimeout(sessionID)
+          try {
+            await refreshSession(sessionID)
+            onSnapshotApplied(sessionID)
+          } catch {
+            scheduleReconcileRetry(sessionID, runID)
           }
         }
         if (settledStatus === 'committed' && selectedSessionRef.current !== sessionID) {
+          const settledSession = knownSession(sessionID)
           setCompletionNotice({
             sessionID,
             sessionName: settledSession ? sessionName(settledSession) : `Session ${sessionID.slice(-6)}`,
@@ -678,7 +736,7 @@ function App() {
         break
       }
     }
-  }, [activeRunsRef, addActiveRun, flushRunEvents, queueRunEvent, refreshSession, saveRecentStepsAndRemove, scheduleReconcileRetry, sessionStore.applyProjectionEvent, setAwaitingRunStarted, startReconcileTimeout, updateActiveRun])
+  }, [activeRunsRef, addActiveRun, applySettledSidebarStatus, flushRunEvents, knownSession, onSnapshotApplied, queueRunEvent, refreshSession, removeRun, scheduleReconcileRetry, sessionStore.applyProjectionEvent, sessionStore.isRevisionCovered, setAwaitingRunStarted, startReconcileTimeout, updateActiveRun])
 
   // A run has at most one active connection by this App instance. streamRun
   // owns its replay cursor and reconnects internally; a later authoritative
@@ -713,39 +771,6 @@ function App() {
     for (const controller of runStreamControllersRef.current.values()) controller.abort()
     runStreamControllersRef.current.clear()
   }, [])
-
-  const knownSession = useCallback((sessionID: string): Session | null => {
-    for (const sessions of Object.values(sessionMapsRef.current.active)) {
-      const session = sessions.find((item) => item.id === sessionID)
-      if (session) return session
-    }
-    for (const sessions of Object.values(sessionMapsRef.current.archived)) {
-      const session = sessions.find((item) => item.id === sessionID)
-      if (session) return session
-    }
-    return null
-  }, [])
-
-  const applyLifecycleSessionEvent = useCallback((event: LifecycleEvent) => {
-    const current = sessionMapsRef.current
-    const next = reduceLifecycleEvent(current, event)
-    if (next === current) return
-    setSessionMaps(next)
-
-    if (event.type !== 'session.deleted') return
-    const deletedIDs = new Set([
-      typeof event.session === 'string' ? event.session : '',
-      event.session_id ?? '',
-      ...(event.descendants ?? []),
-    ])
-    if (!deletedIDs.has(selectedSessionIDRef.current)) return
-    const projectID = event.project_id ?? event.project ?? selectedProjectRef.current
-    const nextProjectID = next.active[projectID] || next.archived[projectID]
-      ? projectID
-      : Object.keys(next.active)[0] ?? ''
-    setSelectedProjectID(nextProjectID)
-    setSelectedSessionID(next.active[nextProjectID]?.[0]?.id ?? '')
-  }, [setSelectedProjectID, setSelectedSessionID, setSessionMaps])
 
   const handleLifecycleEvent = useCallback(async (event: LifecycleEvent): Promise<void> => {
     const eventSession = event.session && typeof event.session === 'object'
@@ -782,21 +807,21 @@ function App() {
     }
 
     if (event.type === 'run.settled' && sessionID && runID) {
-      const activeRun = activeRunsRef.current[sessionID]
-      if (activeRun?.id === runID) {
-        await handleRunEvent(sessionID, runID, {
-          type: 'run.settled',
-          run_id: runID,
-          status: event.status ?? 'committed',
-          turn_id: event.turn_id,
-          last_seq: event.last_seq,
-          message: event.message,
-        })
-      } else if (selectedSessionIDRef.current === sessionID) {
-        try { await refreshSession(sessionID) } catch { /* the event metadata already updated the tree */ }
-      }
+      // Feed lifecycle settlement through the same watermark gate as the run
+      // stream. This is idempotent when both channels carry the event and,
+      // importantly, does not turn a background status notification into a
+      // selected-session snapshot.
+      await handleRunEvent(sessionID, runID, {
+        type: 'run.settled',
+        run_id: runID,
+        status: event.status ?? 'committed',
+        turn_id: event.turn_id,
+        last_seq: event.last_seq,
+        committed_revision: event.committed_revision,
+        message: event.message,
+      })
     }
-  }, [activeRunsRef, applyLifecycleSessionEvent, bootstrapApplication, handleRunEvent, knownSession, refreshSession])
+  }, [applyLifecycleSessionEvent, bootstrapApplication, handleRunEvent, knownSession])
 
   const lifecycleEventHandlerRef = useRef<(event: LifecycleEvent) => Promise<void>>(async () => {})
   lifecycleEventHandlerRef.current = handleLifecycleEvent
@@ -1052,7 +1077,6 @@ function App() {
 			onPastedImageAdd={(pastedImage) => addPastedImage(selectedSessionID, pastedImage)}
 			onPastedImageRemove={(pastedImageID) => removePastedImage(selectedSessionID, pastedImageID)}
 			onDraftClear={() => clearDraft(selectedSessionID)}
-					recentStepsByTurn={recentStepsByTurn}
             sessionNames={sessionNames}
             turnError={turnErrors[selectedSessionID] ?? null}
             onDismissTurnError={() => clearTurnError(selectedSessionID)}

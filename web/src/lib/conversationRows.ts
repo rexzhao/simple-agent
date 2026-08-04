@@ -1,5 +1,5 @@
 import type { ActiveRun, RunStep, SessionItem } from '../types'
-import { itemText, processKey } from './session'
+import { itemText } from './session'
 
 /** A turn error is kept separate from ActiveRun so a failed turn can remain
  * actionable while the durable session is being refreshed. */
@@ -55,7 +55,6 @@ export interface BuildConversationRowsInput {
   /** The raw page items from the shared durable session projection. */
   items: SessionItem[]
   activeRun?: ActiveRun | null
-  recentStepsByTurn?: Record<string, RunStep[]>
   compacting?: boolean
   turnError?: ConversationRowTurnError | null
   sessionStatus?: string
@@ -70,7 +69,28 @@ export interface BuildConversationRowsInput {
  */
 export function buildConversationRows(input: BuildConversationRowsInput): ConversationRow[] {
   const activeRun = input.activeRun ?? null
-  const historicalRows = buildHistoricalRows(input.items, input.sessionID, input.recentStepsByTurn ?? {})
+  const durableToolIDs = durableToolCallIDs(input.items)
+  const durableToolResultIDs = durableToolResultIDsForItems(input.items)
+  const liveTools = new Map(
+    (activeRun?.steps ?? [])
+      .filter((step): step is Extract<RunStep, { kind: 'tool' }> => step.kind === 'tool')
+      .map((step) => [step.id, step]),
+  )
+  // A tool call can be durable before its result is. Fold its current live
+  // status into the durable process group and then suppress the duplicate
+  // active step. This retains requested/running/error progress without
+  // creating two rows for one durable tool id.
+  const historicalRows = buildHistoricalRows(input.items, input.sessionID).map((row) => {
+    if (row.kind !== 'process') return row
+    return {
+      ...row,
+      steps: row.steps.map((step) => {
+        if (step.kind !== 'tool') return step
+        const live = liveTools.get(step.id)
+        return live && !durableToolResultIDs.has(step.id) ? { ...step, ...live } : step
+      }),
+    }
+  })
   const assistantBinding = activeRun ? activeAssistantBinding(activeRun) : undefined
   // The binding is an explicit backend-provided item id. The page may not yet
   // contain that item during the append/snapshot race; only then do we retain
@@ -79,6 +99,21 @@ export function buildConversationRows(input: BuildConversationRowsInput): Conver
   const attachedAssistantItemID = assistantBinding && historicalRows.some((row) =>
     row.kind === 'message' && row.item.id === assistantBinding.itemID && row.item.message?.role === 'assistant',
   ) ? assistantBinding.itemID : undefined
+  const boundAssistantItem = assistantBinding
+    ? input.items.find((item) => item.id === assistantBinding.itemID)
+    : undefined
+  // A final assistant projection can arrive while the stream still contains
+  // the reasoning deltas that produced it. Suppress only the matching
+  // turn/iteration owned by the explicit assistant item binding. A durable
+  // item from another iteration (or an unbound transient reasoning step) must
+  // remain visible.
+  const durableReasoningIteration = boundAssistantItem && assistantBinding &&
+    boundAssistantItem.turn_id?.trim() === activeRun?.turnID?.trim() &&
+    boundAssistantItem.agent_iteration === activeRun?.agentIteration &&
+    boundAssistantItem.message?.role === 'assistant' &&
+    Boolean(boundAssistantItem.message.reasoning)
+    ? boundAssistantItem.agent_iteration
+    : undefined
   const rows = historicalRows.map((row): ConversationRow => {
     if (row.kind !== 'message' || row.item.id !== attachedAssistantItemID) return row
     return {
@@ -96,10 +131,32 @@ export function buildConversationRows(input: BuildConversationRowsInput): Conver
         compaction: activeRun.compaction,
       })
     }
-    const segments = activeRunSegments(activeRun)
+    // Tool calls/results are durable projection items. Once one is present in
+    // the page, hide only that matching transient tool step; reasoning and
+    // still-transient tools remain visible while the run is live.
+    const segments = activeRunSegments(activeRun).map((segment, segmentIndex, allSegments) => {
+      // A run can contain an earlier prompt segment whose iteration counter
+      // restarts at 1 for the current turn. Only the final segment is the
+      // currently bound turn; never hide matching iteration numbers from the
+      // earlier process history.
+      const isCurrentSegment = segmentIndex === allSegments.length - 1
+      return {
+        ...segment,
+        steps: segment.steps.filter((step) => {
+          if (step.kind === 'tool' && durableToolIDs.has(step.id)) return false
+          if (isCurrentSegment && step.kind === 'reasoning' && durableReasoningIteration !== undefined && step.iteration === durableReasoningIteration) return false
+          return true
+        }),
+      }
+    })
+    const hasLiveSteps = segments.some((segment) => segment.steps.length > 0)
     // With no process steps the durable Message row owns the generating
     // cursor as well, so an attached tail does not create a second bubble.
-    if (!(attachedAssistantItemID && segments.every((segment) => segment.steps.length === 0))) {
+    // Only an explicitly attached durable assistant message owns the empty
+    // generating cursor. Durable tools in an older turn must not suppress a
+    // fresh run's active-process container.
+    const shouldRenderProcess = !attachedAssistantItemID || hasLiveSteps
+    if (shouldRenderProcess) {
       segments.forEach((segment, index) => {
         rows.push({
           kind: 'active-process',
@@ -183,7 +240,7 @@ function activeRunSegments(run: ActiveRun): ActiveRunSegment[] {
 
 /** Builds only the durable part of the stream. Exported for consumers that
  * need to inspect the historical model without transient run state. */
-export function buildHistoricalRows(items: SessionItem[], sessionID: string, recentStepsByTurn: Record<string, RunStep[]> = {}): ConversationRow[] {
+export function buildHistoricalRows(items: SessionItem[], sessionID: string): ConversationRow[] {
   const rows: ConversationRow[] = []
   let steps: RunStep[] = []
   let processCreatedAt = ''
@@ -192,23 +249,18 @@ export function buildHistoricalRows(items: SessionItem[], sessionID: string, rec
   let processBoundary = ''
   let flowBoundary = ''
   let agentIteration = 0
-  const emittedRecentTurns = new Set<string>()
 
   const flushProcess = (turnID = processTurnID) => {
-    const recentKey = turnID ? processKey(sessionID, turnID) : ''
-    const recentSteps = recentKey && !emittedRecentTurns.has(recentKey) ? recentStepsByTurn[recentKey] : undefined
-    const displayedSteps = recentSteps?.length ? recentSteps : steps
-    if (displayedSteps.length > 0) {
+    if (steps.length > 0) {
       const boundary = processBoundary || flowBoundary || `turn:${turnID || 'unknown'}`
       rows.push({
         kind: 'process',
         key: rowKey(sessionID, 'process', turnID || 'unknown', boundary),
         createdAt: processCreatedAt,
         lastSeq: processLastSeq,
-        steps: displayedSteps,
+        steps,
       })
     }
-    if (recentKey && recentSteps?.length) emittedRecentTurns.add(recentKey)
     steps = []
     processCreatedAt = ''
     processTurnID = ''
@@ -261,6 +313,9 @@ export function buildHistoricalRows(items: SessionItem[], sessionID: string, rec
       agentIteration = item.agent_iteration || agentIteration + 1
       ensureProcess(item)
       processLastSeq = item.seq
+      if (item.message?.reasoning) {
+        steps.push({ kind: 'reasoning', id: `${item.id}-reasoning`, text: item.message.reasoning, iteration: agentIteration })
+      }
       if (text) steps.push({ kind: 'output', id: `${item.id}-output`, text, iteration: agentIteration })
       for (const toolCall of item.message?.tool_calls ?? []) {
         steps.push({
@@ -294,6 +349,13 @@ export function buildHistoricalRows(items: SessionItem[], sessionID: string, rec
       continue
     }
 
+    if (role === 'assistant' && item.message?.reasoning) {
+      if (processTurnID && item.turn_id && processTurnID !== item.turn_id) flushProcess(processTurnID)
+      agentIteration = item.agent_iteration || agentIteration || 1
+      ensureProcess(item)
+      processLastSeq = item.seq
+      steps.push({ kind: 'reasoning', id: `${item.id}-reasoning`, text: item.message.reasoning, iteration: agentIteration })
+    }
     if (!processCreatedAt) processCreatedAt = item.created_at
     flushProcess(item.turn_id || processTurnID)
     flowBoundary = itemBoundary(item)
@@ -301,6 +363,30 @@ export function buildHistoricalRows(items: SessionItem[], sessionID: string, rec
   }
   flushProcess(processTurnID)
   return rows
+}
+
+function durableToolCallIDs(items: SessionItem[]): Set<string> {
+  const ids = new Set<string>()
+  for (const item of items) {
+    if (item.message?.role === 'assistant') {
+      for (const call of item.message.tool_calls ?? []) if (call.id) ids.add(call.id)
+    }
+    if (item.message?.role === 'tool') {
+      ids.add(item.message.tool_call_id || item.id)
+      ids.add(item.id)
+    }
+  }
+  return ids
+}
+
+function durableToolResultIDsForItems(items: SessionItem[]): Set<string> {
+  const ids = new Set<string>()
+  for (const item of items) {
+    if (item.message?.role !== 'tool') continue
+    ids.add(item.message.tool_call_id || item.id)
+    ids.add(item.id)
+  }
+  return ids
 }
 
 export function conversationRowItemKey(_index: number, row: ConversationRow): string {

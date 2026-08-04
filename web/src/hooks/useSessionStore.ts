@@ -1,7 +1,7 @@
 import { useCallback, useMemo, useReducer, useRef } from 'react'
 import type { ItemsPage, Session, SessionItemProjectionEvent, SessionSnapshot } from '../types'
 import { api } from '../api'
-import { initialSessionStoreState, revisionGTE, sessionStoreReducer, type SessionStoreAction } from '../lib/sessionStore'
+import { initialSessionStoreState, parseDecimalRevision, revisionGTE, sessionStoreReducer, type SessionStoreAction } from '../lib/sessionStore'
 
 type SnapshotFetchResult = { session: Session; history: ItemsPage; requiresResync: boolean }
 
@@ -30,14 +30,19 @@ export function useSessionStore() {
   const fetchSnapshot = useCallback(
     async (sessionID: string): Promise<SnapshotFetchResult> => {
       const snapshot: SessionSnapshot = await api.snapshot(sessionID)
+      const snapshotRevision = parseDecimalRevision(snapshot.revision)
+      if (snapshotRevision === null) throw new Error('Session snapshot returned an invalid revision')
+      const normalizedSnapshot = snapshot.revision === snapshotRevision
+        ? snapshot
+        : { ...snapshot, revision: snapshotRevision }
       const pending = stateRef.current.pendingProjectionBySession[sessionID]
       const overflowRevision = pending?.overflowed ? pending.overflowRevision : '0'
       const markedRevision = stateRef.current.snapshotResyncBySession[sessionID] ?? '0'
       const requiredRevision = revisionGTE(overflowRevision, markedRevision) ? overflowRevision : markedRevision
       const requiresResync = !stateRef.current.historyBySession[sessionID]
-        && BigInt(snapshot.revision) < BigInt(requiredRevision)
-      dispatchStore({ type: 'snapshot', snapshot, expectedSessionID: sessionID })
-      return { session: snapshot.session, history: snapshot.history, requiresResync }
+        && !revisionGTE(snapshotRevision, requiredRevision)
+      dispatchStore({ type: 'snapshot', snapshot: normalizedSnapshot, expectedSessionID: sessionID })
+      return { session: normalizedSnapshot.session, history: normalizedSnapshot.history, requiresResync }
     },
     [dispatchStore],
   )
@@ -46,9 +51,11 @@ export function useSessionStore() {
     async (sessionID: string): Promise<SnapshotFetchResult> => {
       // Fallback for servers that don't yet have the snapshot endpoint.
       const [session, history] = await Promise.all([api.session(sessionID), api.items(sessionID)])
+      const revision = parseDecimalRevision(session.revision) ?? parseDecimalRevision(session.last_seq)
+      if (revision === null) throw new Error('Session fallback returned an invalid revision')
       const snapshot: SessionSnapshot = {
         session_id: sessionID,
-        revision: String(session.last_seq),
+        revision,
         session,
         history,
       }
@@ -57,7 +64,7 @@ export function useSessionStore() {
       const markedRevision = stateRef.current.snapshotResyncBySession[sessionID] ?? '0'
       const requiredRevision = revisionGTE(overflowRevision, markedRevision) ? overflowRevision : markedRevision
       const requiresResync = !stateRef.current.historyBySession[sessionID]
-        && BigInt(snapshot.revision) < BigInt(requiredRevision)
+        && !revisionGTE(snapshot.revision, requiredRevision)
       dispatchStore({ type: 'snapshot', snapshot, expectedSessionID: sessionID })
       return { session, history, requiresResync }
     },
@@ -130,10 +137,49 @@ export function useSessionStore() {
     dispatchStore({ type: 'projectionEvent', event })
   }, [dispatchStore])
 
+  const updateSessionMetadata = useCallback((session: Session) => {
+    dispatchStore({ type: 'sessionMetadata', session })
+  }, [dispatchStore])
+
+  const applySettlementMetadata = useCallback((session: Session, revision: unknown): boolean => {
+    const normalizedRevision = parseDecimalRevision(revision)
+    if (normalizedRevision === null) return false
+    dispatchStore({ type: 'settlementMetadata', session, revision: normalizedRevision })
+    return true
+  }, [dispatchStore])
+
+  /**
+   * Read the reducer's synchronous watermark, rather than a React render
+   * closure.  This is used by SSE settlement handlers which can run in the
+   * same turn as the final projection event.
+   */
+  const getSessionRevision = useCallback((sessionID: string): string | undefined => {
+    const current = stateRef.current
+    const candidates: string[] = []
+    const add = (value: unknown) => {
+      const revision = parseDecimalRevision(value)
+      if (revision !== null) candidates.push(revision)
+    }
+    // Sidebar/list metadata is not projection coverage. A session DTO can
+    // describe a newer server revision while the browser still lacks the
+    // corresponding item events. Only an established snapshot history entry
+    // (plus events applied to that entry) is a complete local projection.
+    add(current.historyBySession[sessionID]?.revision)
+    if (candidates.length === 0) return undefined
+    return candidates.reduce((highest, candidate) => revisionGTE(candidate, highest) ? candidate : highest)
+  }, [])
+
+  const isRevisionCovered = useCallback((sessionID: string, target: unknown): boolean => {
+    const required = parseDecimalRevision(target)
+    if (required === null) return false
+    const local = getSessionRevision(sessionID)
+    return local !== undefined && revisionGTE(local, required)
+  }, [getSessionRevision])
+
   return useMemo(
-    () => ({ state, refreshSession, loadOlder, setSessions, clearSession, setMeta, applyProjectionEvent }),
+    () => ({ state, refreshSession, loadOlder, setSessions, clearSession, setMeta, applyProjectionEvent, updateSessionMetadata, applySettlementMetadata, getSessionRevision, isRevisionCovered }),
     // state must be in deps so consumers re-render when the reducer produces new state.
-    [state, refreshSession, loadOlder, setSessions, clearSession, setMeta, applyProjectionEvent],
+    [state, refreshSession, loadOlder, setSessions, clearSession, setMeta, applyProjectionEvent, updateSessionMetadata, applySettlementMetadata, getSessionRevision, isRevisionCovered],
   )
 }
 

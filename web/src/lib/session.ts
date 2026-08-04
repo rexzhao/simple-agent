@@ -123,7 +123,3 @@ export function sessionTreeContains(node: SessionTreeNode, sessionIDs: ReadonlyS
 export function itemText(item: SessionItem): string {
 	return item.message?.content?.inline || item.message?.content?.preview || ''
 }
-
-export function processKey(sessionID: string, turnID: string): string {
-	return `${sessionID}:${turnID}`
-}

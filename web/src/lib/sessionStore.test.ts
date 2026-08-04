@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import type { ItemsPage, Session, SessionItem, SessionItemProjectionEvent, SessionSnapshot } from '../types'
-import { initialSessionStoreState, mergeRefreshedPage, pendingProjectionEventCap, pendingProjectionSessionCap, revisionGTE, sessionStoreReducer } from './sessionStore'
+import { initialSessionStoreState, mergeRefreshedPage, parseDecimalRevision, pendingProjectionEventCap, pendingProjectionSessionCap, revisionGTE, sessionStoreReducer } from './sessionStore'
 
 const session = (id: string, lastSeq = 0): Session => ({ id, project_id: 'p', display_name: id, last_seq: lastSeq } as Session)
 const page = (seqs: number[]): ItemsPage => ({
@@ -40,6 +40,18 @@ describe('revisionGTE', () => {
     expect(revisionGTE('9', '10')).toBe(false)
     expect(revisionGTE('100', '99')).toBe(true)
     expect(revisionGTE('42', '42')).toBe(true)
+  })
+
+  it('rejects malformed revisions without throwing', () => {
+    expect(parseDecimalRevision('not-a-revision')).toBeNull()
+    expect(parseDecimalRevision('-1')).toBeNull()
+    expect(revisionGTE('not-a-revision', '1')).toBe(false)
+    expect(revisionGTE('1', 'not-a-revision')).toBe(false)
+  })
+
+  it('compares revisions beyond the JavaScript safe integer range', () => {
+    expect(revisionGTE('90071992547409930', '90071992547409929')).toBe(true)
+    expect(revisionGTE('90071992547409929', '90071992547409930')).toBe(false)
   })
 })
 
@@ -148,6 +160,15 @@ describe('sessionStoreReducer', () => {
       expect(state.historyBySession).toEqual({})
     })
 
+    it('ignores an invalid revision instead of throwing', () => {
+      const state = sessionStoreReducer(initialSessionStoreState(), {
+        type: 'snapshot',
+        snapshot: snapshot('s1', 'not-a-revision', [1]),
+        expectedSessionID: 's1',
+      })
+      expect(state.historyBySession).toEqual({})
+    })
+
     it('handles out-of-order snapshots (old resolved first)', () => {
       let state = sessionStoreReducer(initialSessionStoreState(), {
         type: 'snapshot',
@@ -162,6 +183,14 @@ describe('sessionStoreReducer', () => {
       })
       expect(state.historyBySession['s1'].revision).toBe('10')
     })
+  })
+
+  it('ignores a projection event with an invalid watermark', () => {
+    const state = sessionStoreReducer(initialSessionStoreState(), {
+      type: 'projectionEvent',
+      event: { ...projectionEvent('item.created', 'item-1', 1, 1, '1'), revision: 'oops' },
+    })
+    expect(state).toEqual(initialSessionStoreState())
   })
 
   describe('sessions action', () => {
@@ -260,6 +289,66 @@ describe('sessionStoreReducer', () => {
       expect(state.sessionsByID.s1.current_run_id).toBeUndefined()
       expect(state.sessionsByID.s1.running_run_id).toBeUndefined()
       expect(state.sessionsByID.s1.interrupted_run_id).toBeUndefined()
+    })
+
+    it('does not resurrect settled run metadata from stale lifecycle DTOs', () => {
+      let state = sessionStoreReducer(initialSessionStoreState(), {
+        type: 'sessions',
+        projectID: 'p',
+        sessions: [{
+          ...session('s1', 100), revision: '100', display_name: 'settled', status: 'idle',
+          last_run_id: 'run-new', last_run_status: 'committed',
+        } as Session],
+        archived: false,
+        generation: 1,
+      })
+      state = sessionStoreReducer(state, {
+        type: 'sessionMetadata',
+        session: {
+          ...session('s1', 5), revision: '5', display_name: 'renamed by lifecycle', status: 'running',
+          current_run_id: 'old-run', running_run_id: 'old-run', running_turn_id: 'old-turn',
+          last_run_id: 'old-run', last_run_status: 'running',
+        } as Session,
+      })
+      expect(state.sessionsByID.s1.display_name).toBe('renamed by lifecycle')
+      expect(state.sessionsByID.s1.revision).toBe('100')
+      expect(state.sessionsByID.s1.status).toBe('idle')
+      expect(state.sessionsByID.s1.current_run_id).toBeUndefined()
+      expect(state.sessionsByID.s1.running_run_id).toBeUndefined()
+      expect(state.sessionsByID.s1.running_turn_id).toBeUndefined()
+      expect(state.sessionsByID.s1.last_run_id).toBe('run-new')
+      expect(state.sessionsByID.s1.last_run_status).toBe('committed')
+    })
+
+    it('lets an explicit settlement win over stale or equal-revision run fields', () => {
+      let state = sessionStoreReducer(initialSessionStoreState(), {
+        type: 'sessions',
+        projectID: 'p',
+        sessions: [{
+          ...session('s1', 100), revision: '100', display_name: 'authoritative name', status: 'running',
+          current_run_id: 'run-live', running_run_id: 'run-live', running_turn_id: 'turn-live',
+        } as Session],
+        archived: false,
+        generation: 1,
+      })
+      state = sessionStoreReducer(state, {
+        type: 'settlementMetadata',
+        revision: '100',
+        session: {
+          ...session('s1', 5), revision: '5', display_name: 'sidebar copy', status: 'idle',
+          current_run_id: undefined, running_run_id: undefined, running_turn_id: undefined,
+          interrupted_run_id: undefined, interrupted_turn_id: undefined,
+          last_run_id: 'run-settled', last_run_status: 'committed',
+        } as Session,
+      })
+      expect(state.sessionsByID.s1.display_name).toBe('authoritative name')
+      expect(state.sessionsByID.s1.revision).toBe('100')
+      expect(state.sessionsByID.s1.status).toBe('idle')
+      expect(state.sessionsByID.s1.current_run_id).toBeUndefined()
+      expect(state.sessionsByID.s1.running_run_id).toBeUndefined()
+      expect(state.sessionsByID.s1.running_turn_id).toBeUndefined()
+      expect(state.sessionsByID.s1.last_run_id).toBe('run-settled')
+      expect(state.sessionsByID.s1.last_run_status).toBe('committed')
     })
 
     it('does not resurrect cleared run fields from a stale snapshot', () => {
