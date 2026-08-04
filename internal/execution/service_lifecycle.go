@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/rexzhao/simple-agent/internal/sessions"
@@ -177,6 +178,12 @@ func (s *Service) publishRunLifecycle(eventType string, run *CoordinatedSessionR
 		"session_id": run.SessionID(),
 		"status":     status,
 		"last_seq":   lastSeq,
+	}
+	if eventType == LifecycleRunSettled {
+		// last_seq is retained as the numeric compatibility field. The
+		// decimal string is safe for browser consumers that cannot represent
+		// every int64 exactly.
+		fields["committed_revision"] = strconv.FormatInt(lastSeq, 10)
 	}
 	if metadata != nil {
 		// settled metadata is a point-in-time copy. The pointer is only used

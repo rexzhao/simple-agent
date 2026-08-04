@@ -98,6 +98,7 @@ type SessionMetadata struct {
 	ProjectID         string                 `json:"project_id"`
 	CreatedCWD        string                 `json:"created_cwd"`
 	LastSeq           int64                  `json:"last_seq"`
+	Revision          string                 `json:"revision"`
 	FullAccess        bool                   `json:"full_access"`
 	Debug             sessions.DebugSettings `json:"debug"`
 }
@@ -133,6 +134,7 @@ type SessionDetail struct {
 	ProjectID         string                 `json:"project_id"`
 	CreatedCWD        string                 `json:"created_cwd"`
 	ConfigPath        string                 `json:"config_path"`
+	Revision          string                 `json:"revision"`
 	ModelParameters   map[string]any         `json:"model_parameters,omitempty"`
 	EnabledTools      []string               `json:"enabled_tools,omitempty"`
 	EnabledMCP        []string               `json:"enabled_mcp,omitempty"`
@@ -2095,7 +2097,7 @@ func (s *Service) runSessionMessage(ctx context.Context, id string, input Sessio
 		sink = newSessionEventSink(emit)
 		submit = sink.submit
 	}
-	waitBridge := s.startSessionEventBridge(id, turnID, bus, session.LastSeq, session.ShowReasoning, submit)
+	waitBridge := s.startSessionEventBridge(id, turnID, runIDForRequest(run), bus, session.LastSeq, session.ShowReasoning, submit)
 	bridgeClosed := false
 	closeBridge := func() {
 		if bridgeClosed {
@@ -2587,6 +2589,7 @@ func sessionMetadataFromStore(session sessions.SessionV2) SessionMetadata {
 		ProjectID:         session.ProjectID,
 		CreatedCWD:        session.CreatedCWD,
 		LastSeq:           session.LastSeq,
+		Revision:          strconv.FormatInt(session.LastSeq, 10),
 		FullAccess:        session.FullAccess,
 		Debug:             session.Debug,
 	}
@@ -2666,6 +2669,7 @@ func sessionDetailFromStore(session sessions.SessionV2) SessionDetail {
 		ReasoningLevel:    session.ReasoningLevel,
 		Status:            sessionStatus(session),
 		LastSeq:           session.LastSeq,
+		Revision:          strconv.FormatInt(session.LastSeq, 10),
 		CWD:               session.CWD,
 		ProjectID:         session.ProjectID,
 		CreatedCWD:        session.CreatedCWD,

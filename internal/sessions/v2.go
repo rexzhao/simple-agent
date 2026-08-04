@@ -1788,7 +1788,7 @@ func (s *V2Store) PersistedEventsAfter(sessionID string, afterSeq int64) ([]Pers
 		return nil, err
 	}
 	defer db.Close()
-	rows, err := db.Query(`SELECT seq, type, item_id, compaction_id FROM events WHERE seq > ? ORDER BY seq`, afterSeq)
+	rows, err := db.Query(`SELECT seq, type, item_id, compaction_id, payload FROM events WHERE seq > ? ORDER BY seq`, afterSeq)
 	if err != nil {
 		return nil, err
 	}
@@ -1796,8 +1796,16 @@ func (s *V2Store) PersistedEventsAfter(sessionID string, afterSeq int64) ([]Pers
 	events := make([]PersistedEvent, 0)
 	for rows.Next() {
 		var event PersistedEvent
-		if err := rows.Scan(&event.Seq, &event.Type, &event.ItemID, &event.CompactionID); err != nil {
+		var payload []byte
+		if err := rows.Scan(&event.Seq, &event.Type, &event.ItemID, &event.CompactionID, &payload); err != nil {
 			return nil, err
+		}
+		if event.Type == RecordTypeItemAppended || event.Type == RecordTypeItemUpdated {
+			var item SessionItem
+			if err := json.Unmarshal(payload, &item); err != nil {
+				return nil, corruptedSessionError(sessionID, "parse persisted item event %d: %v", event.Seq, err)
+			}
+			event.Item = &item
 		}
 		events = append(events, event)
 	}
@@ -1809,6 +1817,37 @@ type PersistedEvent struct {
 	Type         string
 	ItemID       string
 	CompactionID string
+	// Item is the committed event payload for item records. It is kept as an
+	// internal persistence representation; callers must convert it through a
+	// frontend-safe DTO before putting it on a wire.
+	Item *SessionItem
+}
+
+// ReadItem reads the latest committed item projection without loading the
+// complete execution state. Item notifications are emitted only after the
+// event transaction commits, so this is the projection source for their
+// frontend DTO rather than the transient event payload.
+func (s *V2Store) ReadItem(sessionID, itemID string) (SessionItem, error) {
+	if strings.TrimSpace(itemID) == "" {
+		return SessionItem{}, fmt.Errorf("session item id is required")
+	}
+	db, err := s.openSessionDB(sessionID, false)
+	if err != nil {
+		return SessionItem{}, err
+	}
+	defer db.Close()
+	var payload []byte
+	if err := db.QueryRow(`SELECT payload FROM items WHERE id = ?`, itemID).Scan(&payload); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return SessionItem{}, fmt.Errorf("%w: item %s", ErrNotFound, itemID)
+		}
+		return SessionItem{}, fmt.Errorf("read item projection %q: %w", itemID, err)
+	}
+	var item SessionItem
+	if err := json.Unmarshal(payload, &item); err != nil {
+		return SessionItem{}, corruptedSessionError(sessionID, "parse item projection %q: %v", itemID, err)
+	}
+	return item, nil
 }
 
 // ReadHistoryPage performs bounded SQL reads from the item projection. It is

@@ -148,6 +148,9 @@ func TestServerProjectSessionAndRunFlow(t *testing.T) {
 		}
 	}
 	requireEvent("run.settled")
+	if !bytes.Contains(events, []byte(`"committed_revision":"`)) {
+		t.Fatalf("run.settled missing committed_revision: %s", events)
+	}
 	// A fast run may settle between SSE snapshots. Terminal replay deliberately
 	// retains only run.settled, so the server signals run.resync_required and the
 	// client reloads the durable session instead of receiving every transient

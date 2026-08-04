@@ -175,6 +175,8 @@ export interface Session {
   project_id: string
   created_cwd: string
   last_seq: number
+  /** Precision-safe decimal form of the session last_seq watermark. */
+  revision?: string
   status?: string
   show_reasoning?: boolean
   full_access: boolean
@@ -212,6 +214,7 @@ export interface LifecycleEvent {
   run_id?: string
   status?: string
   last_seq?: number
+  committed_revision?: string
   turn_id?: string
   metadata?: Session
   session_metadata?: Session
@@ -275,6 +278,19 @@ export interface SessionSnapshot {
   history: ItemsPage
 }
 
+export interface SessionItemProjectionEvent {
+  type: 'item.appended' | 'item.created' | 'item.updated'
+  session_id: string
+  run_id?: string
+  turn_id?: string
+  /** Durable record sequence that caused this notification. */
+  seq: number
+  /** Precision-safe session watermark after the committed transaction. */
+  revision: string
+  item_id: string
+  item: SessionItem
+}
+
 export type RunEvent =
   | { type: 'turn.started'; turn_id: string }
   | { type: 'compaction.started'; turn_id: string; trigger: 'auto' | 'manual' }
@@ -286,12 +302,13 @@ export type RunEvent =
 	| { type: 'tool.requested' | 'tool.started'; turn_id: string; agent_iteration: number; tool_call_id: string; name: string; arguments?: string }
 	| { type: 'tool.finished'; turn_id: string; agent_iteration: number; tool_call_id: string; name: string; is_error: boolean; content?: string }
 	| { type: 'usage.updated'; turn_id: string; agent_iteration: number; input_tokens: number; output_tokens: number; total_tokens: number; cached_tokens: number; cache_write_tokens: number; reasoning_tokens: number }
+	| SessionItemProjectionEvent
   | { type: 'run.prompt_queue'; turn_id?: string; prompts?: QueuedPrompt[] }
   | { type: 'run.prompt_appended'; turn_id?: string; prompts?: string[] }
   | { type: 'run.resync_required'; run_id: string; session_id: string; oldest_seq: number; oldest_stream_event_id?: number; required_revision?: string }
   | { type: 'turn.committed'; turn_id: string; last_seq: number }
   | { type: 'turn.failed'; turn_id: string; code: string; message: string }
-  | { type: 'run.settled'; run_id: string; status: string; turn_id?: string; last_seq?: number; message?: string }
+  | { type: 'run.settled'; run_id: string; status: string; turn_id?: string; last_seq?: number; committed_revision?: string; message?: string }
   | { type: string; [key: string]: unknown }
 
 export interface ToolActivity {

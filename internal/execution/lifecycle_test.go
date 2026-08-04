@@ -3,6 +3,7 @@ package execution
 import (
 	"encoding/json"
 	"errors"
+	"strconv"
 	"testing"
 	"time"
 
@@ -160,6 +161,16 @@ func TestSessionRunCoordinatorPublishesRunLifecycleForSharedStarts(t *testing.T)
 	if _, ok := settledPayload["metadata"].(map[string]any); !ok {
 		t.Fatalf("run.settled metadata = %#v, want SessionMetadata", settledPayload["metadata"])
 	}
+	if got, ok := settledPayload["committed_revision"].(string); !ok || got == "" {
+		t.Fatalf("run.settled committed_revision = %#v, want decimal string", settledPayload["committed_revision"])
+	}
+	state, err := service.sessionStore.LoadState(session.ID)
+	if err != nil {
+		t.Fatalf("LoadState(after settled) error = %v", err)
+	}
+	if got := settledPayload["committed_revision"]; got != strconv.FormatInt(state.LastSeq, 10) {
+		t.Fatalf("run.settled committed_revision = %#v, want %q", got, strconv.FormatInt(state.LastSeq, 10))
+	}
 }
 
 func TestLifecycleHubDropsSlowSubscribersWithoutBlocking(t *testing.T) {
@@ -215,7 +226,7 @@ func assertSessionMetadataPayload(t *testing.T, event LifecycleEvent, sessionID,
 	if !ok {
 		t.Fatalf("session payload = %#v, want SessionMetadata object", payload["session"])
 	}
-	for _, field := range []string{"id", "created_at", "updated_at", "project_id", "last_seq", "full_access", "debug"} {
+	for _, field := range []string{"id", "created_at", "updated_at", "project_id", "last_seq", "revision", "full_access", "debug"} {
 		if _, ok := metadata[field]; !ok {
 			t.Fatalf("session metadata missing %q: %#v", field, metadata)
 		}

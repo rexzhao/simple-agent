@@ -261,11 +261,19 @@ func (r *runRegistry) settleRun(run *execution.CoordinatedSessionRun, result exe
 		return
 	}
 	status := string(run.Status())
+	lastSeq := result.LastSeq
+	if current, ok := r.currentSessionWatermark(managed.sessionID); ok {
+		// The run result can be a stale execution snapshot on failure or
+		// cancellation. Once the session is readable, both compatibility
+		// fields must describe the same final durable watermark.
+		lastSeq = current
+	}
 	fields := map[string]any{
-		"run_id":   managed.id,
-		"status":   status,
-		"turn_id":  result.TurnID,
-		"last_seq": result.LastSeq,
+		"run_id":             managed.id,
+		"status":             status,
+		"turn_id":            result.TurnID,
+		"last_seq":           lastSeq,
+		"committed_revision": strconv.FormatInt(lastSeq, 10),
 	}
 	if err != nil {
 		if errors.Is(err, context.Canceled) {
@@ -903,14 +911,22 @@ func (s *Server) handleRunEvents(w http.ResponseWriter, r *http.Request) {
 // revision would make the resync contract less reliable than omitting the
 // additive hint.
 func (r *runRegistry) requiredRevision(sessionID string) (string, bool) {
-	if r == nil || r.service == nil {
+	lastSeq, ok := r.currentSessionWatermark(sessionID)
+	if !ok {
 		return "", false
+	}
+	return strconv.FormatInt(lastSeq, 10), true
+}
+
+func (r *runRegistry) currentSessionWatermark(sessionID string) (int64, bool) {
+	if r == nil || r.service == nil {
+		return 0, false
 	}
 	session, err := r.service.GetSession(sessionID)
 	if err != nil {
-		return "", false
+		return 0, false
 	}
-	return strconv.FormatInt(session.LastSeq, 10), true
+	return session.LastSeq, true
 }
 
 func writeSSEEvent(w io.Writer, sequence int64, event execution.SessionStreamEvent) error {

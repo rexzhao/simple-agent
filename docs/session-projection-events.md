@@ -1,6 +1,6 @@
 # Session projection and run event contract
 
-**Status: frozen through stage 1 (protocol and test baseline).** This document
+**Status: stage 2 implementation contract.** This document
 is a wire-contract decision, not a request to change the current product
 behavior. The examples and compatibility notes deliberately describe the
 implementation in this repository. Later stages may add fields or migrate an
@@ -36,7 +36,7 @@ The snapshot response has this shape (irrelevant fields omitted):
 {
   "session_id": "session-1",
   "revision": "42",
-  "session": { "id": "session-1", "last_seq": 42 },
+  "session": { "id": "session-1", "last_seq": 42, "revision": "42" },
   "history": {
     "items": [],
     "oldest_seq": 1,
@@ -59,10 +59,12 @@ newer because its `history.newest_seq` is larger, or infer that the snapshot is
 stale because no item was added.
 
 The numeric `session.last_seq` in the ordinary session response and lifecycle
-payloads is the current compatibility representation of the same durable
-watermark. The snapshot's string `revision` is the precision-safe form for
-browser code. A snapshot is loaded as one aggregate, so a client applies its
-session metadata and history together when its revision is newer. Metadata-only
+payloads is retained as a compatibility representation of the same durable
+watermark. Ordinary Session DTOs now also carry `revision` as a decimal string;
+the snapshot's string `revision` and `session.revision` are the same value. The
+snapshot's string form is the precision-safe form for browser code. A snapshot
+is loaded as one aggregate, so a client applies its session metadata and history
+together when its revision is newer. Metadata-only
 changes can keep the same revision; those metadata changes still apply, while
 same-or-older history does not replace newer history.
 
@@ -81,13 +83,13 @@ does not create a second item identity. Do not append an update notification as
 a new history item.
 
 There is an intentional naming detail in the current implementation: the
-`seq` in a persisted item notification is the sequence of the persisted record
-that caused the notification. For an item creation this is also the item's
-creation `seq`. For an update it is the new durable revision/event sequence,
-which can differ from the item's original `history.items[].seq`. The current
-wire field is still named `seq`; consumers identify the item by `item_id` and
-refresh the projection rather than assigning the notification `seq` to the
-item.
+top-level `seq` in a persisted item notification is the sequence of the
+persisted record that caused the notification. For an item creation this is
+also the item's creation `seq`. For an update it is the new durable
+record/event sequence, which differs from the item's original
+`history.items[].seq`. The nested `item.seq` is always the item's creation
+sequence, including for `item.updated`. Consumers identify the item by
+`item_id` and must not assign the notification `seq` to the item.
 
 ## 3. Event envelopes and streams
 
@@ -130,13 +132,13 @@ The frozen logical event names and the current wire names are:
 
 | Logical event | Current wire name | Required payload | Meaning |
 | --- | --- | --- | --- |
-| `item.created` | `item.appended` | `seq`, `item_id` | A new durable item is in the projection. |
-| `item.updated` | `item.updated` | `seq`, `item_id` | An existing durable item changed. |
+| `item.created` | `item.appended` | `session_id`, optional `run_id`, `turn_id`, `seq`, `revision`, `item_id`, `item` | A new visible user-facing durable item is in the projection. |
+| `item.updated` | `item.updated` | `session_id`, optional `run_id`, `turn_id`, `seq`, `revision`, `item_id`, `item` | An existing visible user-facing durable item changed. |
 
 The current Go implementation emits `item.appended`, because that is also the
 current storage record name. `item.created` is the frozen logical/canonical
-name for the next compatible naming step; stage 0 does **not** rename the
-emitted event.
+name for a future compatible naming step; stage 2 does **not** rename the
+emitted event or dual-emit it.
 
 During migration:
 
@@ -148,11 +150,87 @@ During migration:
   so dual emission is not part of this contract unless a future version adds a
   stable event identity and an explicit deduplication rule.
 
-These notifications are hints/cursors for refreshing the durable projection.
-They intentionally contain `item_id` and the record `seq`, not the full item
-body. The full item is obtained from the snapshot/items API. A client that
-misses a notification is repaired by loading a snapshot; it must not invent an
-item from a partial notification.
+Stage 2 notifications contain the committed, frontend-safe item projection so
+the live stream can render the durable result without reconstructing it from a
+request or transient model event. A representative creation notification is:
+
+```json
+{
+  "type": "item.appended",
+  "session_id": "session-1",
+  "run_id": "run-1",
+  "turn_id": "turn-1",
+  "seq": 12,
+  "revision": "19",
+  "item_id": "msg-000001",
+  "item": {
+    "seq": 12,
+    "id": "msg-000001",
+    "turn_id": "turn-1",
+    "created_at": "2025-01-01T00:00:00Z",
+    "kind": "message",
+    "visibility": "visible",
+    "audience": "user",
+    "message": {
+      "role": "user",
+      "content": {"inline": "hello"}
+    }
+  }
+}
+```
+
+For an update, only the durable record sequence in the envelope advances; the
+item's creation sequence remains unchanged:
+
+```json
+{
+  "type": "item.updated",
+  "session_id": "session-1",
+  "run_id": "run-1",
+  "turn_id": "turn-1",
+  "seq": 17,
+  "revision": "19",
+  "item_id": "msg-000001",
+  "item": {
+    "seq": 12,
+    "id": "msg-000001",
+    "turn_id": "turn-1",
+    "kind": "message",
+    "visibility": "visible",
+    "audience": "model",
+    "status": "completed",
+    "message": {
+      "role": "assistant",
+      "content": {"inline": "updated answer"}
+    }
+  }
+}
+```
+
+`revision` is the session watermark after the committed transaction. When a
+transaction writes several records, their visible item notifications may all
+have the same revision. The envelope `seq` is still the causing durable record
+sequence, while `item.seq` remains the creation sequence. `run_id` is omitted
+when the bridge does not have a reliable run context; `turn_id` uses the
+projected item's turn and falls back to the current committed turn context
+only for legacy untagged items.
+
+Only items passing the user-facing projection filter enter this stream:
+visible `message` records with a user-audience user message, or a model-
+audience assistant/tool message, plus visible user-audience compaction
+dividers. Hidden, debug, internal/model-only runtime records, provider-private
+messages, model-audience compaction summaries, and other non-message records
+are skipped. Skipping a record does not renumber `revision`; it may therefore
+jump. Missing transport notifications are detected by the run SSE event ID,
+not by assuming consecutive item or revision values.
+
+The `item` object uses the same safe `SessionItem` DTO as the snapshot/items
+API. It contains display text or a bounded preview, image reference metadata
+(hash/media type/size) rather than image bytes, and filtered tool arguments.
+It never contains stored blobs, image data URLs, hidden reasoning, provider
+request/response data, or other model-only private fields. The DTO is read
+from the committed item projection after the durable event is observed; it is
+not assembled from transient request parameters.
 
 Other persisted stream names currently include `compaction.created` and
 `active_history.replaced`. They can change the durable projection and therefore
@@ -207,14 +285,18 @@ The per-run terminal payload currently has these fields:
   "run_id": "run-1",
   "status": "committed",
   "turn_id": "turn-1",
-  "last_seq": 42
+  "last_seq": 42,
+  "committed_revision": "42"
 }
 ```
 
 `message` is added for cancellation/failure (`"run cancelled"` or
 `"run failed"`). `status` is the execution status, such as `committed`,
-`failed`, or `cancelled`. `last_seq` is the run result's durable sequence
-watermark when available; it is not the per-run SSE ID. The current per-run
+`failed`, or `cancelled`. `last_seq` is retained as the numeric compatibility
+field, and `committed_revision` is the precision-safe decimal-string form of
+that same final durable session watermark. When the session can be read, both
+come from its current `LastSeq`; only a session read failure falls back to the
+run result's `LastSeq`. Neither is the per-run SSE ID. The current per-run
 payload does not include `session_id`; the endpoint and active-run descriptor
 already bind the run to its session. A future optional `session_id` field may
 be added, but clients must not require it today.
@@ -229,7 +311,8 @@ permission to construct the final history locally.
 
 The process-wide `/api/events` lifecycle `run.settled` has the same logical run
 completion but a different envelope. It currently includes compatibility
-aliases `run`/`run_id` and `session`/`session_id`, plus `status`, `last_seq`, and,
+aliases `run`/`run_id` and `session`/`session_id`, plus `status`, `last_seq`,
+`committed_revision`, and,
 when available, `metadata`/`session_metadata` and `message`. Lifecycle frames
 use an SSE `event: run.settled` line and do not use the per-run `id` cursor.
 
@@ -330,13 +413,17 @@ The following aliases and differences are intentionally frozen for migration:
 | --- | --- | --- |
 | Snapshot watermark | `revision` string; `session.last_seq` numeric | Prefer `revision`; accept/use `last_seq` when talking to older endpoints, comparing numerically. |
 | Item creation event | `item.appended` | Accept both `item.created` and `item.appended`; do not dual-emit without a later dedupe contract. |
-| Item event cursor | payload `seq` | Treat as the causing durable record sequence; use `item_id` to update the item projection. |
+| Item event body/cursor | `item` plus payload `seq` | `item` is the committed safe DTO; treat top-level `seq` as the causing durable record sequence and `item.seq` as creation sequence. |
+| Session DTO watermark | `revision` string plus `last_seq` number | Prefer the decimal string; retain/read `last_seq` for older clients. |
+| Run settlement watermark | `committed_revision` string plus `last_seq` number | Prefer the decimal string; retain/read `last_seq` for older clients. |
 | Lifecycle run identity | `run` and `run_id`; `session` and `session_id` | Read either alias; new payloads should retain both until a migration says otherwise. |
 | Lifecycle metadata | `metadata` and `session_metadata` | Read either alias; it is a point-in-time metadata copy, not a replacement for the snapshot. |
 | Per-run terminal identity | `run_id`, no current `session_id` | Bind through the run endpoint/descriptor; treat a later optional `session_id` as additive. |
 | Run cursor | per-run SSE `id` | Send as `after` only for the same `run_id`; never compare it to `revision` or item `seq`. |
 
-No stage-0 change renames storage records, changes the HTTP status codes,
-adds optimistic history mutation, or changes the frontend event handling. Any
+Stage 2 does not rename storage records, change the HTTP status codes, add
+optimistic history mutation, or add a second item event for the same record.
+The frontend type declarations accept the logical `item.created` alias, but
+the backend emits only the legacy-compatible `item.appended` wire name. Any
 later protocol change must update this document and its characterization tests
 in the same change.

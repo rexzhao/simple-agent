@@ -770,6 +770,9 @@ func TestServerSessionSnapshot(t *testing.T) {
 	if snapshot.Session.LastSeq != detail.LastSeq {
 		t.Fatalf("snapshot session.last_seq = %d, want %d", snapshot.Session.LastSeq, detail.LastSeq)
 	}
+	if snapshot.Session.Revision != wantRevision || detail.Revision != wantRevision {
+		t.Fatalf("session revisions = snapshot %q/detail %q, want %q", snapshot.Session.Revision, detail.Revision, wantRevision)
+	}
 
 	// Verify history matches GetSessionChatItems.
 	if len(snapshot.History.Items) != len(chatPage.Items) {

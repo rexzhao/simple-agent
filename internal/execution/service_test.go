@@ -1018,6 +1018,24 @@ func TestServiceSendSessionMessageWithEventsEmitsDirectStreamEvents(t *testing.T
 	if got := countString(types, "item.appended"); got != 2 {
 		t.Fatalf("item.appended count = %d, want user and assistant items", got)
 	}
+	for _, event := range events {
+		if event["type"] != "item.appended" {
+			continue
+		}
+		if event["session_id"] != session.ID || event["turn_id"] == "" {
+			t.Fatalf("item.appended context = %#v, want session and turn", event)
+		}
+		if runID, ok := event["run_id"].(string); !ok || runID == "" || runID != result.RunID {
+			t.Fatalf("item.appended run_id = %#v, want reliable run %q", event["run_id"], result.RunID)
+		}
+		revision, ok := event["revision"].(string)
+		if !ok || revision == "" {
+			t.Fatalf("item.appended revision = %#v, want decimal string", event["revision"])
+		}
+		if item, ok := event["item"].(SessionItem); !ok || item.ID != event["item_id"] || item.Seq <= 0 {
+			t.Fatalf("item.appended complete DTO = %#v, want SessionItem matching item_id", event["item"])
+		}
+	}
 	if !sessionStreamEventsContain(events, "text.delta", "text", "streamed") {
 		t.Fatalf("events = %#v, want streamed text delta", events)
 	}

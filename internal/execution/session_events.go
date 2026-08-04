@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -495,7 +496,7 @@ func (s *Service) CompactSession(ctx context.Context, id string) (SessionCompact
 	}, nil
 }
 
-func (s *Service) startSessionEventBridge(sessionID, turnID string, bus *eventbus.Bus, afterSeq int64, showReasoning bool, submit func(SessionStreamEvent)) func() {
+func (s *Service) startSessionEventBridge(sessionID, turnID, runID string, bus *eventbus.Bus, afterSeq int64, showReasoning bool, submit func(SessionStreamEvent)) func() {
 	done := make(chan struct{})
 	if s == nil || s.sessionStore == nil || bus == nil || submit == nil {
 		close(done)
@@ -520,7 +521,7 @@ func (s *Service) startSessionEventBridge(sessionID, turnID string, bus *eventbu
 					turnID = started.TurnID
 					agentIteration = 0
 				}
-				nextSeq := s.emitPersistedSessionEventsThrough(sessionID, lastSeq, event.Seq, submit)
+				nextSeq := s.emitPersistedSessionEventsThrough(sessionID, runID, turnID, lastSeq, event.Seq, submit)
 				if nextSeq > lastSeq {
 					lastSeq = nextSeq
 				}
@@ -532,7 +533,7 @@ func (s *Service) startSessionEventBridge(sessionID, turnID string, bus *eventbu
 	}
 }
 
-func (s *Service) emitPersistedSessionEventsThrough(sessionID string, afterSeq, throughSeq int64, submit func(SessionStreamEvent)) int64 {
+func (s *Service) emitPersistedSessionEventsThrough(sessionID, runID, turnID string, afterSeq, throughSeq int64, submit func(SessionStreamEvent)) int64 {
 	if s == nil || s.sessionStore == nil || submit == nil || throughSeq <= afterSeq {
 		return afterSeq
 	}
@@ -544,7 +545,7 @@ func (s *Service) emitPersistedSessionEventsThrough(sessionID string, afterSeq, 
 		if event.Seq > throughSeq {
 			break
 		}
-		streamEvent, ok := sessionStreamEventFromPersistedEvent(event)
+		streamEvent, ok := s.sessionStreamEventFromPersistedEvent(sessionID, runID, turnID, event, throughSeq)
 		if !ok {
 			continue
 		}
@@ -553,18 +554,42 @@ func (s *Service) emitPersistedSessionEventsThrough(sessionID string, afterSeq, 
 	return throughSeq
 }
 
-func sessionStreamEventFromPersistedEvent(event sessions.PersistedEvent) (SessionStreamEvent, bool) {
+func (s *Service) sessionStreamEventFromPersistedEvent(sessionID, runID, turnID string, event sessions.PersistedEvent, revision int64) (SessionStreamEvent, bool) {
 	switch event.Type {
-	case sessions.RecordTypeItemAppended:
-		return NewSessionStreamEvent("item.appended", map[string]any{
-			"seq":     event.Seq,
-			"item_id": event.ItemID,
-		}), true
-	case sessions.RecordTypeItemUpdated:
-		return NewSessionStreamEvent("item.updated", map[string]any{
-			"seq":     event.Seq,
-			"item_id": event.ItemID,
-		}), true
+	case sessions.RecordTypeItemAppended, sessions.RecordTypeItemUpdated:
+		item, err := s.committedPersistedItem(sessionID, event)
+		if err != nil || !sessionItemVisibleInChat(item) {
+			// Hidden/model-only/provider-private records still advance the
+			// session watermark. They are deliberately absent from the
+			// projection stream; run SSE IDs remain the transport gap signal.
+			return nil, false
+		}
+		dto, err := s.sessionItemDTO(sessionID, item)
+		if err != nil {
+			return nil, false
+		}
+		fields := map[string]any{
+			"session_id": sessionID,
+			"seq":        event.Seq,
+			"item_id":    item.ID,
+			"revision":   strconv.FormatInt(revision, 10),
+			"item":       dto,
+		}
+		resolvedTurnID := dto.TurnID
+		if resolvedTurnID == "" {
+			resolvedTurnID = turnID
+		}
+		if resolvedTurnID != "" {
+			fields["turn_id"] = resolvedTurnID
+		}
+		if strings.TrimSpace(runID) != "" {
+			fields["run_id"] = runID
+		}
+		eventType := "item.appended"
+		if event.Type == sessions.RecordTypeItemUpdated {
+			eventType = "item.updated"
+		}
+		return NewSessionStreamEvent(eventType, fields), true
 	case sessions.RecordTypeCompactionCreated:
 		return NewSessionStreamEvent("compaction.created", map[string]any{
 			"seq":           event.Seq,
@@ -577,6 +602,33 @@ func sessionStreamEventFromPersistedEvent(event sessions.PersistedEvent) (Sessio
 	default:
 		return nil, false
 	}
+}
+
+// committedPersistedItem returns the item as it was written by the durable
+// record. Reading the event payload is important when the lossless bridge is
+// briefly behind the writer: a later update must not make an earlier
+// item.appended notification contain the later contents. Updates overwrite
+// the event payload sequence with their record sequence, so restore the
+// immutable creation sequence from the item projection.
+func (s *Service) committedPersistedItem(sessionID string, event sessions.PersistedEvent) (sessions.SessionItem, error) {
+	var item sessions.SessionItem
+	if event.Item != nil {
+		item = *event.Item
+	} else {
+		loaded, err := s.sessionStore.ReadItem(sessionID, event.ItemID)
+		if err != nil {
+			return sessions.SessionItem{}, err
+		}
+		item = loaded
+	}
+	if event.Type == sessions.RecordTypeItemUpdated {
+		projected, err := s.sessionStore.ReadItem(sessionID, event.ItemID)
+		if err != nil {
+			return sessions.SessionItem{}, err
+		}
+		item.Seq = projected.Seq
+	}
+	return item, nil
 }
 
 func sessionStreamEventFromModelEvent(turnID string, agentIteration int, event model.Event, showReasoning bool) (SessionStreamEvent, bool) {

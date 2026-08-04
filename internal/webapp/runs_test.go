@@ -2,7 +2,9 @@ package webapp
 
 import (
 	"context"
+	"encoding/json"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -174,6 +176,89 @@ func TestRunEventsResyncIncludesDurableRequiredRevision(t *testing.T) {
 	}
 	if !strings.Contains(body, `"oldest_stream_event_id":2`) {
 		t.Fatalf("SSE body missing oldest_stream_event_id: %s", body)
+	}
+}
+
+func TestRunSettledUsesOneDurableWatermarkWhenCancelledResultIsStale(t *testing.T) {
+	server, service, app := newWebTestAppServerWithRunner(t, blockingWebTestRunner{})
+	_, session := createWebProjectAndSession(t, server)
+
+	// Use a coordinator without the Web registry callbacks so the test can
+	// inject a deliberately stale execution result into settleRun while the
+	// cancelled run has already committed its durable interruption records.
+	coordinator := execution.NewSessionRunCoordinator(context.Background(), service, execution.SessionRunCoordinatorOptions{
+		NewRunID: func() (string, error) { return "run-stale-settlement", nil },
+	})
+	defer coordinator.Close()
+	run, err := coordinator.Start(session.ID, execution.SessionMessageInput{Content: "cancel me"}, nil)
+	if err != nil {
+		t.Fatalf("coordinator.Start() error = %v", err)
+	}
+	managed := newManagedRun(run.ID(), session.ID, app.runs.options)
+	managed.run = run
+	app.runs.mu.Lock()
+	app.runs.byID[managed.id] = managed
+	app.runs.mu.Unlock()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		current, getErr := service.GetSession(session.ID)
+		if getErr == nil && current.RunningRunID == run.ID() {
+			break
+		}
+		select {
+		case <-run.Done():
+			t.Fatal("run settled before durable running state was observed")
+		default:
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	current, err := service.GetSession(session.ID)
+	if err != nil {
+		t.Fatalf("GetSession(before cancel) error = %v", err)
+	}
+	if current.RunningRunID != run.ID() {
+		t.Fatalf("running_run_id = %q, want %q", current.RunningRunID, run.ID())
+	}
+
+	run.Cancel()
+	result, runErr := run.Wait()
+	if runErr == nil || run.Status() != execution.SessionRunCancelled {
+		t.Fatalf("cancelled run status/error = %s/%v, want cancelled with an error", run.Status(), runErr)
+	}
+	final, err := service.GetSession(session.ID)
+	if err != nil {
+		t.Fatalf("GetSession(after cancel) error = %v", err)
+	}
+	if final.LastSeq <= 0 {
+		t.Fatalf("cancelled session LastSeq = %d, want durable interruption records", final.LastSeq)
+	}
+	// Model a stale result reaching the presentation adapter. The durable
+	// interruption revision is intentionally newer than this result value.
+	result.LastSeq = final.LastSeq - 1
+	if result.LastSeq >= final.LastSeq {
+		t.Fatalf("stale result LastSeq = %d, final durable LastSeq = %d", result.LastSeq, final.LastSeq)
+	}
+	app.runs.settleRun(run, result, runErr)
+
+	events, terminal, _, _, _ := managed.snapshot(0)
+	if !terminal || len(events) != 1 {
+		t.Fatalf("settled replay = terminal:%t events:%#v, want one terminal event", terminal, events)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(events[0].Payload, &payload); err != nil {
+		t.Fatalf("decode run.settled payload: %v", err)
+	}
+	gotLastSeq, ok := payload["last_seq"].(float64)
+	if !ok {
+		t.Fatalf("run.settled last_seq = %#v, want numeric field", payload["last_seq"])
+	}
+	gotRevision, ok := payload["committed_revision"].(string)
+	if !ok {
+		t.Fatalf("run.settled committed_revision = %#v, want decimal string", payload["committed_revision"])
+	}
+	if int64(gotLastSeq) != final.LastSeq || gotRevision != strconv.FormatInt(final.LastSeq, 10) || gotRevision != strconv.FormatInt(int64(gotLastSeq), 10) {
+		t.Fatalf("run.settled watermark fields = last_seq:%v committed_revision:%q, want %d/%q", gotLastSeq, gotRevision, final.LastSeq, strconv.FormatInt(final.LastSeq, 10))
 	}
 }
 
