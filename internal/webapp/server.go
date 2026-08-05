@@ -13,10 +13,12 @@ import (
 	"path"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/rexzhao/simple-agent/internal/execution"
 	projectstore "github.com/rexzhao/simple-agent/internal/projects"
 	"github.com/rexzhao/simple-agent/internal/sessions"
+	"github.com/rexzhao/simple-agent/internal/wsgateway"
 )
 
 var Version = "dev"
@@ -27,15 +29,26 @@ type ServerOptions struct {
 	Token     string
 	CWD       string
 	LogWriter io.Writer
+
+	// The gateway and ticket store hooks keep B1 independently testable. The
+	// production defaults use the secure bounded implementations.
+	WebSocketGateway *wsgateway.Gateway
+	WSTicketStore    *wsgateway.TicketStore
+	WSHandler        wsgateway.Handler
+	WSObserver       wsgateway.Observer
 }
 
 type Server struct {
 	service     *execution.Service
 	token       string
 	cwd         string
+	ctx         context.Context
+	cancel      context.CancelFunc
 	mux         *http.ServeMux
 	runs        *runRegistry
 	codexLogins *codexLoginRegistry
+	wsTickets   *wsgateway.TicketStore
+	wsGateway   *wsgateway.Gateway
 }
 
 func NewServer(options ServerOptions) (*Server, error) {
@@ -49,11 +62,35 @@ func NewServer(options ServerOptions) (*Server, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	ticketStore := options.WSTicketStore
+	if ticketStore == nil {
+		var err error
+		ticketStore, err = wsgateway.NewTicketStore(wsgateway.TicketStoreOptions{})
+		if err != nil {
+			return nil, err
+		}
+	}
+	gateway := options.WebSocketGateway
+	if gateway == nil {
+		var err error
+		gateway, err = wsgateway.New(wsgateway.Options{
+			Handler:  options.WSHandler,
+			Observer: options.WSObserver,
+		})
+		if err != nil {
+			return nil, err
+		}
+	}
+	ctx, cancel := context.WithCancel(ctx)
 	server := &Server{
-		service: options.Service,
-		token:   options.Token,
-		cwd:     options.CWD,
-		mux:     http.NewServeMux(),
+		service:   options.Service,
+		token:     options.Token,
+		cwd:       options.CWD,
+		ctx:       ctx,
+		cancel:    cancel,
+		mux:       http.NewServeMux(),
+		wsTickets: ticketStore,
+		wsGateway: gateway,
 	}
 	server.runs = newRunRegistry(ctx, options.Service, options.LogWriter)
 	server.codexLogins = newCodexLoginRegistry(ctx, options.Service)
@@ -69,11 +106,16 @@ func (s *Server) Handler() http.Handler {
 			return
 		}
 		if strings.HasPrefix(r.URL.Path, "/api/") {
-			if !s.authorized(r) {
+			if r.URL.Path != "/api/ws" && !s.authorized(r) {
 				writeAPIError(w, http.StatusUnauthorized, "unauthorized", "valid capability token required")
 				return
 			}
-			if origin := strings.TrimSpace(r.Header.Get("Origin")); origin != "" && origin != "http://"+r.Host {
+			if r.URL.Path == "/api/ws" {
+				if !validWebSocketOrigin(r) {
+					writeAPIError(w, http.StatusForbidden, "invalid_origin", "request origin is not allowed")
+					return
+				}
+			} else if origin := strings.TrimSpace(r.Header.Get("Origin")); origin != "" && origin != "http://"+r.Host {
 				writeAPIError(w, http.StatusForbidden, "invalid_origin", "request origin is not allowed")
 				return
 			}
@@ -86,6 +128,9 @@ func (s *Server) Close() {
 	if s == nil {
 		return
 	}
+	if s.cancel != nil {
+		s.cancel()
+	}
 	if s.runs != nil {
 		s.runs.Close()
 	}
@@ -93,6 +138,8 @@ func (s *Server) Close() {
 
 func (s *Server) routes() {
 	s.mux.HandleFunc("GET /api/bootstrap", s.handleBootstrap)
+	s.mux.HandleFunc("POST /api/ws-ticket", s.handleWSTicket)
+	s.mux.HandleFunc("GET /api/ws", s.handleWebSocket)
 	s.mux.HandleFunc("GET /api/events", s.handleLifecycleEvents)
 	s.mux.HandleFunc("GET /api/projects", s.handleListProjects)
 	s.mux.HandleFunc("POST /api/projects", s.handleCreateProject)
@@ -165,6 +212,42 @@ func (s *Server) staticHandler() http.Handler {
 		}
 		files.ServeHTTP(w, r)
 	})
+}
+
+func (s *Server) handleWSTicket(w http.ResponseWriter, r *http.Request) {
+	ticket, expiresAt, err := s.wsTickets.Issue(wsgateway.TicketClaims{Principal: "capability"})
+	if err != nil {
+		if errors.Is(err, wsgateway.ErrTicketStoreFull) {
+			writeAPIError(w, http.StatusServiceUnavailable, "ticket_unavailable", "websocket ticket service is temporarily unavailable")
+			return
+		}
+		writeAPIError(w, http.StatusInternalServerError, "ticket_unavailable", "websocket ticket service is unavailable")
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ticket":     ticket,
+		"expires_at": expiresAt.UTC().Format(time.RFC3339Nano),
+	})
+}
+
+func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
+	claims, ok := s.wsTickets.Consume(r.URL.Query().Get("ticket"))
+	if !ok {
+		// Keep this response identical for missing, malformed, expired, and
+		// replayed tickets. Never echo or log the URL credential.
+		writeAPIError(w, http.StatusUnauthorized, "invalid_ticket", "valid websocket ticket required")
+		return
+	}
+	s.wsGateway.HTTPHandler(s.ctx, w, r, claims)
+}
+
+func validWebSocketOrigin(r *http.Request) bool {
+	if r == nil || strings.TrimSpace(r.Host) == "" {
+		return false
+	}
+	origin := strings.TrimSpace(r.Header.Get("Origin"))
+	return origin != "" && origin == "http://"+r.Host
 }
 
 func (s *Server) handleBootstrap(w http.ResponseWriter, r *http.Request) {
