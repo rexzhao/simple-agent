@@ -37,6 +37,11 @@ export type ConversationRow =
     assistantTailAttached?: boolean
   })
   | (ConversationRowBase & {
+    /** Presentation-only live row for a run that has no process steps yet. */
+    kind: 'active-cursor'
+    run: ActiveRun
+  })
+  | (ConversationRowBase & {
     kind: 'active-compaction'
     compaction: NonNullable<ActiveRun['compaction']>
   })
@@ -138,27 +143,42 @@ export function buildConversationRows(input: BuildConversationRowsInput): Conver
     }).filter((segment) => segment.steps.length > 0)
     const hasLiveSteps = filteredSegments.length > 0
     // Drop segments emptied by durable reconciliation. An attached durable
-    // assistant message owns the cursor when it has the current item; a run
-    // with no attached item still gets exactly one empty process row so the
-    // current Generating cursor has a container. Durable tools in an older
-    // turn must not suppress a fresh run's active-process container.
+    // assistant message owns the cursor when it has the current item. A
+    // running run with no attached item gets a presentation-only cursor row
+    // when there are no process steps. A non-running run keeps that row only
+    // when it has partial assistant text; otherwise it must not manufacture
+    // an empty transient article.
+    // Durable tools in an older turn must not suppress a fresh run's cursor.
+    const keepEmptyPresentationRow = activeRun.status === 'running' || Boolean(activeRun.assistantText)
     const segments = hasLiveSteps
       ? filteredSegments
       : attachedAssistantIdentity
         ? []
-        : [{ steps: [], boundary: rawSegments[rawSegments.length - 1]?.boundary ?? 'initial' }]
+        : keepEmptyPresentationRow
+          ? [{ steps: [], boundary: rawSegments[rawSegments.length - 1]?.boundary ?? 'initial' }]
+          : []
     const shouldRenderProcess = segments.length > 0
     if (shouldRenderProcess) {
-      segments.forEach((segment, index) => {
+      if (!hasLiveSteps) {
+        // Keep the same key as the initial active-process segment so the
+        // placeholder converges in place when the first real step arrives.
         rows.push({
-          kind: 'active-process',
-          key: rowKey(input.sessionID, 'active-process', activeRun.id, segment.boundary),
+          kind: 'active-cursor',
+          key: rowKey(input.sessionID, 'active-process', activeRun.id, segments[0].boundary),
           run: activeRun,
-          steps: segment.steps,
-          isLast: index === segments.length - 1,
-          assistantTailAttached: Boolean(attachedAssistantIdentity),
         })
-      })
+      } else {
+        segments.forEach((segment, index) => {
+          rows.push({
+            kind: 'active-process',
+            key: rowKey(input.sessionID, 'active-process', activeRun.id, segment.boundary),
+            run: activeRun,
+            steps: segment.steps,
+            isLast: index === segments.length - 1,
+            assistantTailAttached: Boolean(attachedAssistantIdentity),
+          })
+        })
+      }
     }
     if (activeRun.providerRetry) {
       rows.push({
@@ -281,8 +301,8 @@ function activeRunSegments(run: ActiveRun): ActiveRunSegment[] {
   }
   segments.push({ steps: run.steps.slice(start), boundary })
   // A boundary is an ordering marker, not a blank conversation row. Keep a
-  // single empty segment only while the run has no process steps at all, so
-  // the live cursor/Generating label still has a container.
+  // single empty segment as an internal anchor for the presentation-only
+  // cursor row while the run has no process steps at all.
   const nonEmpty = segments.filter((segment) => segment.steps.length > 0)
   return nonEmpty.length > 0 ? nonEmpty : [segments[segments.length - 1] ?? { steps: [], boundary: 'initial' }]
 }

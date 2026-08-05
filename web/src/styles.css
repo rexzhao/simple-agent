@@ -361,15 +361,10 @@ svg { width: 1.1em; height: 1.1em; fill: none; stroke: currentColor; stroke-widt
 .message-image { width: min(220px, 100%); max-height: 260px; display: block; border: 2px solid var(--border); object-fit: contain; background: #ffffff; box-shadow: var(--shadow-1); }
 .message-image-loading, .message-image-unavailable { min-width: 130px; min-height: 72px; display: grid; place-items: center; padding: 10px; border: 2px solid var(--border); color: var(--muted); background: var(--panel); font-size: 9.5px; }
 .message-image-unavailable { color: var(--danger); background: var(--danger-soft); }
-.message-meta { height: 29px; display: flex; align-items: baseline; gap: 9px; font-family: "Space Grotesk", "Segoe UI", sans-serif; }
-.message-meta strong { font-size: 12px; font-weight: 800; }
-.message-meta time, .message-meta span { color: var(--faint); font-family: var(--font-mono); font-size: 9.5px; }
 .message-text { max-width: 680px; color: var(--text); font-size: 13.5px; line-height: 1.72; overflow-wrap: anywhere; }
 .message.user .message-text { width: fit-content; max-width: 680px; padding: 8px 13px; border-radius: 14px; background: var(--user-bubble); text-align: left; white-space: pre-wrap; }
 .message.transient { opacity: 1; }
 .assistant-stream { min-height: 20px; }
-.streaming-label { display: inline-flex; align-items: center; gap: 5px; padding: 2px 5px; color: var(--text) !important; background: var(--accent); }
-.streaming-label i { width: 6px; height: 6px; border: 1px solid var(--border); background: #ffffff; animation: pulse 1s infinite; }
 .queued-prompt-list { display: flex; flex-direction: column; gap: 4px; padding: 8px max(28px, calc((100% - 900px) / 2)); }
 .queued-prompt-row { display: flex; align-items: center; gap: 8px; padding: 4px 7px; border: 1px solid var(--border); border-left: 3px solid var(--accent); background: var(--panel-soft); font-size: 11px; }
 .queued-prompt-badge { flex: 0 0 auto; padding: 1px 5px; border: 1px dashed var(--border); color: var(--muted); background: var(--panel); font-family: "Space Grotesk", "Segoe UI", sans-serif; font-size: 8.5px; font-weight: 800; letter-spacing: .04em; text-transform: uppercase; }

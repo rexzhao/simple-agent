@@ -294,7 +294,7 @@ describe('buildConversationRows stable identities', () => {
     ]))
   })
 
-  it('keeps a new empty generating row when an older turn has durable tools', () => {
+  it('keeps a new cursor placeholder when an older turn has durable tools', () => {
     const rows = buildConversationRows({
       sessionID: 'session-1',
       items: [item('old-call', 1, 'assistant', '', {
@@ -303,7 +303,8 @@ describe('buildConversationRows stable identities', () => {
       })],
       activeRun: run({ id: 'new-run', turnID: 'new-turn', assistantText: '', steps: [] }),
     })
-    expect(rows.filter((row) => row.kind === 'active-process')).toHaveLength(1)
+    expect(rows.filter((row) => row.kind === 'active-cursor')).toHaveLength(1)
+    expect(rows.filter((row) => row.kind === 'active-process')).toHaveLength(0)
   })
 
   it('does not duplicate reasoning after the bound assistant item becomes durable', () => {
@@ -402,7 +403,7 @@ describe('buildConversationRows stable identities', () => {
     expect(reasoningSteps.some((step) => step.itemID === 'assistant-other')).toBe(true)
   })
 
-  it('drops emptied old segments but keeps one generating cursor when no output remains', () => {
+  it('drops emptied old segments but keeps one cursor placeholder when no output remains', () => {
     const rows = buildConversationRows({
       sessionID: 'session-1',
       items: [item('assistant-old', 1, 'assistant', 'old answer', {
@@ -418,9 +419,9 @@ describe('buildConversationRows stable identities', () => {
       }),
     })
 
-    const active = rows.filter((row) => row.kind === 'active-process')
+    const active = rows.filter((row) => row.kind === 'active-cursor')
     expect(active).toHaveLength(1)
-    expect(active[0]).toMatchObject({ steps: [] })
+    expect(rows.filter((row) => row.kind === 'active-process')).toHaveLength(0)
   })
 
   it('retains prior-segment reasoning when the current turn reuses its iteration number', () => {
@@ -482,7 +483,7 @@ describe('buildConversationRows stable identities', () => {
     expect(rows.filter((row) => row.kind === 'message').map((row) => row.item.id)).toEqual(['user-1', 'assistant-1'])
   })
 
-  it('falls back to one transient output row until the bound durable item is loaded', () => {
+  it('keeps one transient cursor row until the bound durable item is loaded', () => {
     const rows = buildConversationRows({
       sessionID: 'session-1',
       items: [],
@@ -492,7 +493,20 @@ describe('buildConversationRows stable identities', () => {
       }),
     })
     expect(rows.filter((row) => row.kind === 'message')).toHaveLength(0)
-    expect(rows.filter((row) => row.kind === 'active-process')).toHaveLength(1)
+    expect(rows.filter((row) => row.kind === 'active-cursor')).toHaveLength(1)
+    expect(rows.filter((row) => row.kind === 'active-process')).toHaveLength(0)
+  })
+
+  it('does not keep an empty presentation row after a run stops', () => {
+    for (const status of ['reconciling', 'failed', 'cancelled'] as const) {
+      const rows = buildConversationRows({
+        sessionID: 'session-1',
+        items: [],
+        activeRun: run({ status }),
+      })
+      expect(rows.filter((row) => row.kind === 'active-cursor')).toHaveLength(0)
+      expect(rows.filter((row) => row.kind === 'active-process')).toHaveLength(0)
+    }
   })
 
   it('keeps identical text as separate messages when item ids differ', () => {

@@ -514,7 +514,7 @@ describe('App lifecycle bootstrap', () => {
     // manufacture a conversation row while the stream is still quiet.
     expect((composer as HTMLTextAreaElement).value).toBe('')
     expect(screen.queryByRole('button', { name: 'Stop' })).toBeNull()
-    expect(screen.queryByText('Generating')).toBeNull()
+    expect(view.container.querySelectorAll('.cursor')).toHaveLength(0)
     expect((composer as HTMLTextAreaElement).disabled).toBe(true)
     const blockedSend = screen.getByRole('button', { name: 'Send' }) as HTMLButtonElement
     expect(blockedSend.disabled).toBe(true)
@@ -551,7 +551,8 @@ describe('App lifecycle bootstrap', () => {
       await onEvent({ type: 'run.started', run_id: 'authoritative-run', session_id: 'session-1', turn_id: 'turn-1' })
     })
     expect(screen.getByRole('button', { name: 'Stop' })).toBeTruthy()
-    expect(screen.getByText('Generating')).toBeTruthy()
+    expect(view.container.querySelectorAll('.cursor')).toHaveLength(1)
+    expect(view.container.querySelectorAll('.reasoning-step')).toHaveLength(0)
     expect((composer as HTMLTextAreaElement).disabled).toBe(false)
     expect(screen.getByRole('button', { name: 'Append to current run' })).toBeTruthy()
     await act(async () => {
@@ -716,7 +717,8 @@ describe('App lifecycle bootstrap', () => {
     await act(async () => {
       await existingOnEvent({ type: 'turn.failed', turn_id: 'turn-existing', code: 'failed', message: 'existing run failed' })
     })
-    await waitFor(() => expect(view.container.querySelectorAll('.message.assistant.transient')).toHaveLength(1))
+    await waitFor(() => expect(view.container.querySelector('.turn-error')).not.toBeNull())
+    expect(view.container.querySelectorAll('.message.assistant.transient')).toHaveLength(0)
 
     let rejectAdmission!: (reason: unknown) => void
     mocks.api.startRun.mockImplementation(() => new Promise((_resolve, reject) => { rejectAdmission = reject }))
@@ -731,9 +733,10 @@ describe('App lifecycle bootstrap', () => {
     rejectAdmission(new Error('new admission failed'))
     await waitFor(() => expect(view.container.querySelector('.error-banner')?.textContent).toContain('new admission failed'))
 
-    // Admission never owned existing-run, so its transient failure state is
-    // still present after the rejected attempt.
-    expect(view.container.querySelectorAll('.message.assistant.transient')).toHaveLength(1)
+    // Admission never owned existing-run, so its terminal error remains after
+    // the rejected attempt, without leaving an empty transient row.
+    expect(view.container.querySelector('.turn-error')).not.toBeNull()
+    expect(view.container.querySelectorAll('.message.assistant.transient')).toHaveLength(0)
     view.unmount()
   })
 
@@ -756,7 +759,8 @@ describe('App lifecycle bootstrap', () => {
     await waitFor(() => expect(mocks.streamRun).toHaveBeenCalledTimes(1))
     const oldHandler = mocks.streamRun.mock.calls[0][1] as (event: unknown) => Promise<void> | void
     await act(async () => { await oldHandler({ type: 'turn.failed', turn_id: 'turn-old', code: 'failed', message: 'old failure' }) })
-    await waitFor(() => expect(view.container.querySelector('.message.assistant.transient')).not.toBeNull())
+    await waitFor(() => expect(view.container.querySelector('.turn-error')).not.toBeNull())
+    expect(view.container.querySelectorAll('.message.assistant.transient')).toHaveLength(0)
 
     fireEvent.change(composer, { target: { value: 'new attempt' } })
     fireEvent.click(screen.getByRole('button', { name: 'Send' }))
@@ -855,14 +859,14 @@ describe('App lifecycle bootstrap', () => {
       await onEvent({ type: 'run.settled', run_id: 'settlement-run', status: 'committed', committed_revision: '9' })
     })
     expect(mocks.api.snapshot).toHaveBeenCalledTimes(2)
-    expect(view.container.querySelector('.message.assistant.transient')).not.toBeNull()
+    expect(view.container.querySelectorAll('.message.assistant.transient')).toHaveLength(0)
 
     await act(async () => { await vi.advanceTimersByTimeAsync(5000) })
     // Initial refresh plus only the bounded retry budget. The overlay is
     // still present; only the terminal timeout/manual action may clear it.
     expect(mocks.api.snapshot.mock.calls.length).toBeGreaterThanOrEqual(2)
     expect(mocks.api.snapshot.mock.calls.length).toBeLessThanOrEqual(4)
-    expect(view.container.querySelector('.message.assistant.transient')).not.toBeNull()
+    expect(view.container.querySelectorAll('.message.assistant.transient')).toHaveLength(0)
     view.unmount()
   })
 

@@ -371,32 +371,103 @@ describe('Conversation queued prompt list', () => {
   })
 })
 
-describe('Conversation streaming cursor', () => {
+describe('Conversation live cursor', () => {
   const runWith = (overrides: Partial<ActiveRun>): ActiveRun => ({
     id: 'run-1', sessionID: 's1', assistantText: '', steps: [],
     agentIteration: 0, status: 'running', ...overrides,
   })
 
-  it('shows the cursor after streaming text while the turn is running', () => {
+  it('shows one placeholder cursor after a run starts before any item or delta', () => {
+    const { container } = renderConversation(<Conversation {...baseProps} sessionID="s1" detail={session('s1')}
+      activeRun={runWith({})} />)
+    expect(container.querySelectorAll('.cursor')).toHaveLength(1)
+    expect(container.querySelectorAll('.active-cursor')).toHaveLength(1)
+    expect(container.querySelectorAll('.reasoning-step')).toHaveLength(0)
+    expect(container.querySelectorAll('.process-timeline')).toHaveLength(0)
+  })
+
+  it('shows one cursor after reasoning without creating an empty reasoning step', () => {
+    const { container } = renderConversation(<Conversation {...baseProps} sessionID="s1" detail={session('s1')}
+      activeRun={runWith({ steps: [{ kind: 'reasoning', id: 'r1', text: 'thinking', iteration: 1 }] })} />)
+    expect(container.querySelectorAll('.cursor')).toHaveLength(1)
+    expect(container.querySelectorAll('.reasoning-step')).toHaveLength(1)
+    expect(container.querySelectorAll('.reasoning-step pre')).toHaveLength(1)
+    expect(container.querySelectorAll('.active-cursor')).toHaveLength(0)
+    expect(container.querySelectorAll('.process-timeline')).toHaveLength(1)
+    expect(container.querySelector('.message.assistant.transient .cursor')).not.toBeNull()
+  })
+
+  it('keeps one cursor and the live tool status for a requested tool', () => {
+    const { container } = renderConversation(<Conversation {...baseProps} sessionID="s1" detail={session('s1')}
+      activeRun={runWith({ steps: [{ kind: 'tool', id: 't1', name: 'shell', iteration: 1, status: 'requested' }] })} />)
+    expect(container.querySelectorAll('.cursor')).toHaveLength(1)
+    expect(container.querySelectorAll('.tool-row')).toHaveLength(1)
+    expect(container.querySelector('.tool-row.requested')).not.toBeNull()
+  })
+
+  it('shows the cursor after transient text in the same text container', () => {
     const { container } = renderConversation(<Conversation {...baseProps} sessionID="s1" detail={session('s1')}
       activeRun={runWith({ assistantText: 'partial output' })} />)
     const stream = container.querySelector('.assistant-stream')
     expect(stream).not.toBeNull()
-    expect(stream?.querySelector('.cursor')).not.toBeNull()
+    expect(stream?.querySelectorAll('.cursor')).toHaveLength(1)
+    expect(container.querySelectorAll('.cursor')).toHaveLength(1)
   })
 
-  it('keeps the cursor visible between iterations when tools run before any usage update', () => {
-    const { container } = renderConversation(<Conversation {...baseProps} sessionID="s1" detail={session('s1')}
+  it('keeps one cursor through reasoning, tool, and text state changes', () => {
+    const view = renderConversation(<Conversation {...baseProps} sessionID="s1" detail={session('s1')}
+      activeRun={runWith({ steps: [{ kind: 'reasoning', id: 'r1', text: 'thinking', iteration: 1 }] })} />)
+    expect(view.container.querySelectorAll('.cursor')).toHaveLength(1)
+    view.rerender(<Conversation {...baseProps} sessionID="s1" detail={session('s1')}
       activeRun={runWith({ steps: [{ kind: 'tool', id: 't1', name: 'shell', iteration: 1, status: 'running' }] })} />)
-    expect(container.querySelector('.cursor')).not.toBeNull()
+    expect(view.container.querySelectorAll('.cursor')).toHaveLength(1)
+    expect(view.container.querySelector('.tool-row.running')).not.toBeNull()
+    view.rerender(<Conversation {...baseProps} sessionID="s1" detail={session('s1')}
+      activeRun={runWith({ assistantText: 'partial output' })} />)
+    expect(view.container.querySelectorAll('.cursor')).toHaveLength(1)
+  })
+
+  it('moves the cursor to the bound durable assistant item and not the active process', () => {
+    const page: ItemsPage = {
+      items: [{
+        seq: 1, id: 'assistant-1', turn_id: 'turn-live', agent_iteration: 1, created_at: '',
+        kind: 'message', visibility: 'visible', audience: 'model',
+        message: { role: 'assistant', content: { inline: 'answer' } },
+      }],
+      oldest_seq: 1, newest_seq: 1, has_more_before: false, has_more_after: false,
+    }
+    const { container } = renderConversation(<Conversation {...baseProps} sessionID="s1" detail={session('s1')} page={page}
+      activeRun={runWith({
+        turnID: 'turn-live', agentIteration: 1, assistantText: ' tail',
+        steps: [{ kind: 'reasoning', id: 'stale-reasoning', text: 'stale', iteration: 1, turnID: 'turn-live', itemID: 'assistant-1' }],
+        assistantItems: { 'turn-live:1': { itemID: 'assistant-1', durableTextLength: 6 } },
+      })} />)
+    const message = container.querySelector('.message.assistant:not(.transient)')
+    expect(container.querySelectorAll('.cursor')).toHaveLength(1)
+    expect(message?.querySelector('.cursor')).not.toBeNull()
+    expect(container.querySelectorAll('.active-process .cursor')).toHaveLength(0)
   })
 
   it('hides the cursor once the run leaves the running state', () => {
     const { container, rerender } = renderConversation(<Conversation {...baseProps} sessionID="s1" detail={session('s1')}
-      activeRun={runWith({ assistantText: 'partial output', status: 'reconciling' })} />)
-    expect(container.querySelector('.cursor')).toBeNull()
+      activeRun={runWith({ status: 'reconciling' })} />)
+    expect(container.querySelectorAll('.cursor')).toHaveLength(0)
+    expect(container.querySelectorAll('.active-cursor')).toHaveLength(0)
+    expect(container.querySelectorAll('.message.assistant.transient')).toHaveLength(0)
     rerender(<Conversation {...baseProps} sessionID="s1" detail={session('s1')}
       activeRun={runWith({ status: 'failed' })} />)
-    expect(container.querySelector('.cursor')).toBeNull()
+    expect(container.querySelectorAll('.cursor')).toHaveLength(0)
+    expect(container.querySelectorAll('.active-cursor')).toHaveLength(0)
+    expect(container.querySelectorAll('.message.assistant.transient')).toHaveLength(0)
+    rerender(<Conversation {...baseProps} sessionID="s1" detail={session('s1')}
+      activeRun={runWith({ status: 'cancelled' })} />)
+    expect(container.querySelectorAll('.cursor')).toHaveLength(0)
+    expect(container.querySelectorAll('.active-cursor')).toHaveLength(0)
+    expect(container.querySelectorAll('.message.assistant.transient')).toHaveLength(0)
+    rerender(<Conversation {...baseProps} sessionID="s1" detail={session('s1')}
+      activeRun={runWith({ assistantText: 'partial output', status: 'reconciling' })} />)
+    expect(container.querySelectorAll('.cursor')).toHaveLength(0)
+    expect(container.querySelectorAll('.active-cursor')).toHaveLength(1)
+    expect(container.querySelector('.active-cursor')?.textContent).toContain('partial output')
   })
 })

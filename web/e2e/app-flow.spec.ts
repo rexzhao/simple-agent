@@ -179,7 +179,7 @@ test('connects a first project, creates a session, and commits a streamed run', 
   await composer.fill('Build the feature')
   await page.getByRole('button', { name: 'Send' }).click()
   await expect(page.locator('.message.assistant.transient')).toContainText('Streamed answer')
-  await expect(page.getByText('Generating')).toBeVisible()
+  await expect(page.locator('.cursor')).toHaveCount(1)
 
   finishRun()
   await expect(page.locator('.message.assistant:not(.transient)')).toContainText('Streamed answer')

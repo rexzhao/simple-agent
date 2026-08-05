@@ -416,6 +416,8 @@ function renderConversationRow(row: ConversationRow, props: ConversationRowRende
 			return <HistoricalProcess key={row.key} entry={row} sessionNames={props.sessionNames} workspaceRoot={props.workspaceRoot} />
 		case 'active-process':
 			return <ActiveProcessRow key={row.key} row={row} onCancelTool={props.onCancelTool} sessionNames={props.sessionNames} workspaceRoot={props.workspaceRoot} />
+		case 'active-cursor':
+			return <ActiveCursorRow key={row.key} run={row.run} />
 		case 'active-compaction':
 			return <CompactionStatus key={row.key} trigger={row.compaction.trigger} status={row.compaction.status} activeContextTokens={row.compaction.activeContextTokens} contextWindow={row.compaction.contextWindow} />
 		case 'provider-retry':
@@ -448,7 +450,8 @@ const Message = memo(function Message({ item, sessionID, assistantTail = '', ass
   // item id. Rendering it in this durable row keeps one assistant bubble.
   const text = role === 'assistant' ? committedText + assistantTail : committedText
   const images = item.message?.images ?? []
-  if (!text && images.length === 0) return null
+  const showCursor = role === 'assistant' && assistantStreaming
+  if (!text && images.length === 0 && !showCursor) return null
 	const copyMessage = async () => {
 		const resetCopyStatus = (delay: number) => {
 			if (copyResetTimerRef.current !== null) window.clearTimeout(copyResetTimerRef.current)
@@ -471,8 +474,8 @@ const Message = memo(function Message({ item, sessionID, assistantTail = '', ass
       <div className="message-content">
         {role === 'user' && text && <div className="message-text">{text}</div>}
         {role === 'user' && images.length > 0 && <StoredImageAttachments sessionID={sessionID} images={images} />}
-        {role !== 'user' && text && <MarkdownMessage text={text} streaming={role === 'assistant' && assistantStreaming} cursor={role === 'assistant' && assistantStreaming} />}
-		{role === 'assistant' && (
+		{role !== 'user' && (text || showCursor) && <MarkdownMessage text={text} streaming={showCursor} cursor={showCursor} />}
+		{role === 'assistant' && (text || images.length > 0) && (
 			<div className="message-tools" aria-label="Message actions">
 				<button className="message-tool-button" onClick={() => void copyMessage()} title="Copy full output">
 					<CopyIcon />{copyStatus === 'copied' ? 'Copied' : copyStatus === 'error' ? 'Copy failed' : 'Copy'}
@@ -590,11 +593,23 @@ function ActiveProcessRow({ row, onCancelTool, sessionNames, workspaceRoot }: { 
 	return (
 		<article className="message assistant transient">
 			<div className="message-content">
-				{row.isLast && running && <div className="message-meta"><span className="streaming-label"><i />Generating</span></div>}
 				<ProcessTimeline steps={row.steps} live={row.isLast && running && !textStreaming} onCancelTool={onCancelTool} sessionNames={sessionNames} workspaceRoot={workspaceRoot} />
 				{row.isLast && !row.assistantTailAttached && run.assistantText && <MarkdownMessage text={run.assistantText} streaming cursor={running} />}
-				{row.isLast && !row.assistantTailAttached && running && !run.assistantText && <div className="message-text assistant-stream"><span className="cursor" /></div>}
+				{row.isLast && !row.assistantTailAttached && running && !run.assistantText && <div className="message-text assistant-stream"><span className="cursor" aria-hidden="true" /></div>}
 				{tokenNote}
+			</div>
+		</article>
+	)
+}
+
+function ActiveCursorRow({ run }: { run: ActiveRun }) {
+	const running = run.status === 'running'
+	return (
+		<article className="message assistant transient active-cursor">
+			<div className="message-content">
+				{run.assistantText
+					? <MarkdownMessage text={run.assistantText} streaming cursor={running} />
+					: running && <div className="message-text assistant-stream"><span className="cursor" aria-hidden="true" /></div>}
 			</div>
 		</article>
 	)
@@ -697,7 +712,7 @@ function MarkdownMessage({ text, streaming = false, cursor = false }: { text: st
   return (
     <div className={`message-text markdown-body ${streaming ? 'assistant-stream' : ''}`}>
       <Markdown remarkPlugins={[remarkGfm]} components={markdownComponents} skipHtml>{text}</Markdown>
-      {cursor && <span className="cursor" />}
+      {cursor && <span className="cursor" aria-hidden="true" />}
     </div>
   )
 }
