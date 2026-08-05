@@ -525,6 +525,12 @@ func validateResume(field string, resume *ResumeToken) error {
 	return requiredDecimal(field+".sequence", resume.Sequence)
 }
 
+// ValidateResumeToken validates the optional resume token shape used by the
+// subscribe wire message. Nil is valid and means an initial snapshot.
+func ValidateResumeToken(resume *ResumeToken) error {
+	return validateResume("resume", resume)
+}
+
 func (m UnsubscribeMessage) validate() error {
 	if err := validateTypedEnvelope(m.Envelope, m.messageType()); err != nil {
 		return err
@@ -573,6 +579,13 @@ func validateSnapshotContent(content SnapshotContent) error {
 	return validateBlobDescriptor(*content.Blob)
 }
 
+// ValidateSnapshotContent validates the same snapshot inline/blob union used
+// by SnapshotMessage. It is exported for internal protocol producers so they
+// cannot accept content that only fails later during wire encoding.
+func ValidateSnapshotContent(content SnapshotContent) error {
+	return validateSnapshotContent(content)
+}
+
 func validateBlobDescriptor(blob BlobDescriptor) error {
 	if err := requiredString("payload.content.blob.id", blob.ID); err != nil {
 		return err
@@ -593,6 +606,12 @@ func validateBlobDescriptor(blob BlobDescriptor) error {
 		return err
 	}
 	return validateRFC3339("payload.content.blob.expires_at", blob.ExpiresAt)
+}
+
+// ValidateBlobDescriptor validates blob metadata, including the safe JSON
+// integer size bound and the strict RFC3339 expiry format.
+func ValidateBlobDescriptor(blob BlobDescriptor) error {
+	return validateBlobDescriptor(blob)
 }
 
 func (m ChangeMessage) validate() error {
@@ -637,6 +656,13 @@ func (o ChangeOperation) validate(field string) error {
 		return invalidField(field+".op", "does not match raw operation op")
 	}
 	return nil
+}
+
+// ValidateChangeOperation validates the operation form accepted by the V1
+// change wire message. This keeps internal sync producers aligned with the
+// protocol encoder.
+func ValidateChangeOperation(operation ChangeOperation) error {
+	return operation.validate("operation")
 }
 
 func validateSubscriptionSequenceFields(subscriptionID string, resource ResourceKey, streamEpoch string, sequence, previousSequence Sequence, revision ResourceRevision) error {
@@ -742,4 +768,10 @@ func validateResourceKey(field string, resource ResourceKey) error {
 		return invalidField(field+".type", fmt.Sprintf("unknown resource type %q", resource.Type))
 	}
 	return requiredString(field+".id", resource.ID)
+}
+
+// ValidateResourceKey validates the closed resource key shape used by wire
+// messages and internal sync providers.
+func ValidateResourceKey(resource ResourceKey) error {
+	return validateResourceKey("resource", resource)
 }
