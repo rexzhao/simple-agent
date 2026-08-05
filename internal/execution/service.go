@@ -741,17 +741,26 @@ func (s *Service) ListSessions(options SessionListOptions) ([]SessionMetadata, e
 	} else if !options.AllProjects {
 		return nil, fmt.Errorf("project id is required")
 	}
-	states, err := s.sessionStore.ListStates(sessions.V2ListOptions{Archived: options.Archived})
+	// Load all sessions so the effective archived state (which depends on
+	// ancestor flags) can be computed, then filter by the requested view.
+	states, err := s.sessionStore.ListStates(sessions.V2ListOptions{All: true})
 	if err != nil {
 		return nil, err
 	}
+	effectiveArchived := computeEffectiveArchived(states)
 	items := make([]SessionMetadata, 0, len(states))
 	for _, session := range states {
 		if projectID != "" && session.ProjectID != projectID {
 			continue
 		}
+		isArchived := effectiveArchived[session.ID]
+		if isArchived != options.Archived {
+			continue
+		}
 		session = s.hydrateSessionDebug(session)
-		items = append(items, sessionMetadataFromStore(session))
+		metadata := sessionMetadataFromStore(session)
+		metadata.Archived = isArchived
+		items = append(items, metadata)
 	}
 	return items, nil
 }
@@ -766,7 +775,13 @@ func (s *Service) GetSession(id string) (SessionDetail, error) {
 	}
 	session = s.hydrateSessionPricing(session)
 	session = s.hydrateSessionDebug(session)
-	return sessionDetailFromStore(session), nil
+	detail := sessionDetailFromStore(session)
+	effective, err := s.sessionEffectivelyArchived(session)
+	if err != nil {
+		return SessionDetail{}, err
+	}
+	detail.Archived = effective
+	return detail, nil
 }
 
 // GetSessionSnapshot loads a session once and returns its detail, history
@@ -784,6 +799,11 @@ func (s *Service) GetSessionSnapshot(id string) (SessionSnapshot, error) {
 	session = s.hydrateSessionPricing(session)
 	session = s.hydrateSessionDebug(session)
 	detail := sessionDetailFromStore(session)
+	effective, err := s.sessionEffectivelyArchived(session)
+	if err != nil {
+		return SessionSnapshot{}, err
+	}
+	detail.Archived = effective
 	storePage, err := s.sessionStore.ReadHistoryPage(id, sessions.HistoryPageOptions{Limit: defaultSessionChatItemsLimit, AlignTurn: true, VisibleOnly: true})
 	if err != nil {
 		return SessionSnapshot{}, err
@@ -812,7 +832,9 @@ func (s *Service) RenameSession(id, displayName string) (SessionDetail, error) {
 	if err != nil {
 		return SessionDetail{}, err
 	}
-	if session.Archived {
+	if effective, err := s.sessionEffectivelyArchived(session); err != nil {
+		return SessionDetail{}, err
+	} else if effective {
 		return SessionDetail{}, fmt.Errorf("archived session cannot be renamed")
 	}
 	session.DisplayName = displayName
@@ -836,7 +858,9 @@ func (s *Service) SetSessionFullAccess(id string, fullAccess bool) (SessionDetai
 	if err != nil {
 		return SessionDetail{}, err
 	}
-	if session.Archived {
+	if effective, err := s.sessionEffectivelyArchived(session); err != nil {
+		return SessionDetail{}, err
+	} else if effective {
 		return SessionDetail{}, fmt.Errorf("archived session cannot change full access mode")
 	}
 	session.FullAccess = fullAccess
@@ -859,7 +883,9 @@ func (s *Service) SetSessionDebug(id string, debug sessions.DebugSettings) (Sess
 	if err != nil {
 		return SessionDetail{}, err
 	}
-	if session.Archived {
+	if effective, err := s.sessionEffectivelyArchived(session); err != nil {
+		return SessionDetail{}, err
+	} else if effective {
 		return SessionDetail{}, fmt.Errorf("archived session cannot change debug settings")
 	}
 	session.Debug = debug
@@ -872,10 +898,10 @@ func (s *Service) SetSessionDebug(id string, debug sessions.DebugSettings) (Sess
 	return sessionDetailFromStore(saved), nil
 }
 
-// ArchiveSession archives the session together with every descendant session
-// reachable through parent links (children, grandchildren, …). The cascade is
-// all-or-nothing: the whole subtree is locked up front, so a running turn on
-// any session in the subtree rejects the operation before anything changes.
+// ArchiveSession archives the target session. Descendant sessions become
+// effectively archived through the ancestor chain, so only the target's own
+// flag is set. The subtree is still locked so a running turn on any
+// descendant rejects the operation before anything changes.
 func (s *Service) ArchiveSession(id string) (SessionDetail, error) {
 	if s == nil || s.sessionStore == nil {
 		return SessionDetail{}, fmt.Errorf("execution session store is not configured")
@@ -890,32 +916,23 @@ func (s *Service) ArchiveSession(id string) (SessionDetail, error) {
 	}
 	defer releaseSessionMutationLocks(locks)
 
+	// Validate that no session in the subtree has a running turn.
 	subtreeSessions, err := s.loadSubtreeSessions(subtree, id)
 	if err != nil {
 		return SessionDetail{}, err
 	}
-	changed := make([]sessions.SessionV2, 0, len(subtree))
-	for _, sessionID := range subtree {
-		session, ok := subtreeSessions[sessionID]
-		if !ok || session.Archived {
-			continue
-		}
-		session.Archived = true
-		saved, saveErr := s.sessionStore.SaveMetadata(session)
-		if saveErr != nil {
-			return SessionDetail{}, saveErr
-		}
-		subtreeSessions[sessionID] = saved
-		changed = append(changed, saved)
+	session := subtreeSessions[id]
+	if session.Archived {
+		return sessionDetailFromStore(session), nil
 	}
-	// Publish only after every metadata commit in the cascade succeeded. A
-	// failed operation therefore cannot expose a partially-applied lifecycle
-	// update to incremental clients.
+	session.Archived = true
+	saved, err := s.sessionStore.SaveMetadata(session)
+	if err != nil {
+		return SessionDetail{}, err
+	}
 	descendants := sessionDescendantIDs(subtree, id)
-	for _, session := range changed {
-		s.publishSessionArchived(session, id, descendants)
-	}
-	return sessionDetailFromStore(subtreeSessions[id]), nil
+	s.publishSessionArchived(saved, id, descendants)
+	return sessionDetailFromStore(saved), nil
 }
 
 func (s *Service) RestoreSession(id string) (SessionDetail, error) {
@@ -932,6 +949,8 @@ func (s *Service) RestoreSession(id string) (SessionDetail, error) {
 	if err != nil {
 		return SessionDetail{}, err
 	}
+	// Only the session's own flag is cleared. If an ancestor is still
+	// archived the session remains effectively archived.
 	if !session.Archived {
 		return sessionDetailFromStore(session), nil
 	}
@@ -972,7 +991,9 @@ func (s *Service) RemoveSession(id string) (SessionRemoveResult, error) {
 	if err != nil {
 		return SessionRemoveResult{}, err
 	}
-	if !subtreeSessions[id].Archived {
+	if effective, err := s.sessionEffectivelyArchived(subtreeSessions[id]); err != nil {
+		return SessionRemoveResult{}, err
+	} else if !effective {
 		return SessionRemoveResult{}, fmt.Errorf("archive session before removing it")
 	}
 	projectID := subtreeSessions[id].ProjectID
@@ -1109,6 +1130,73 @@ func (s *Service) loadSubtreeSessions(subtree []string, requiredID string) (map[
 		loaded[sessionID] = session
 	}
 	return loaded, nil
+}
+
+// sessionEffectivelyArchived reports whether a session is archived, either
+// through its own flag or through any ancestor's flag. It walks the parent
+// chain one session at a time, stopping at the first archived ancestor.
+func (s *Service) sessionEffectivelyArchived(session sessions.SessionV2) (bool, error) {
+	if session.Archived {
+		return true, nil
+	}
+	seen := map[string]bool{session.ID: true}
+	parentID := strings.TrimSpace(session.ParentSessionID)
+	for parentID != "" {
+		if seen[parentID] {
+			break // cycle guard
+		}
+		seen[parentID] = true
+		parent, err := s.sessionStore.LoadState(parentID)
+		if errors.Is(err, sessions.ErrNotFound) {
+			break // parent removed; treat as not archived
+		}
+		if err != nil {
+			return false, err
+		}
+		if parent.Archived {
+			return true, nil
+		}
+		parentID = strings.TrimSpace(parent.ParentSessionID)
+	}
+	return false, nil
+}
+
+// computeEffectiveArchived builds a set of effectively-archived session IDs
+// from a full session list. A session is effectively archived if it or any
+// ancestor has its own Archived flag set.
+func computeEffectiveArchived(states []sessions.SessionV2) map[string]bool {
+	archived := make(map[string]bool, len(states))
+	byID := make(map[string]sessions.SessionV2, len(states))
+	for _, s := range states {
+		byID[s.ID] = s
+		if s.Archived {
+			archived[s.ID] = true
+		}
+	}
+	for _, s := range states {
+		if archived[s.ID] {
+			continue
+		}
+		// Walk parent chain.
+		seen := map[string]bool{s.ID: true}
+		parentID := strings.TrimSpace(s.ParentSessionID)
+		for parentID != "" {
+			if seen[parentID] {
+				break
+			}
+			seen[parentID] = true
+			parent, ok := byID[parentID]
+			if !ok {
+				break
+			}
+			if parent.Archived {
+				archived[s.ID] = true
+				break
+			}
+			parentID = strings.TrimSpace(parent.ParentSessionID)
+		}
+	}
+	return archived
 }
 
 func (s *Service) acquireSessionMutationLock(id string) (*sessions.SessionWriteLock, error) {
@@ -2053,7 +2141,9 @@ func (s *Service) runSessionMessage(ctx context.Context, id string, input Sessio
 	if err != nil {
 		return SessionMessageResult{}, err
 	}
-	if session.Archived {
+	if effective, err := s.sessionEffectivelyArchived(session); err != nil {
+		return SessionMessageResult{}, err
+	} else if effective {
 		return SessionMessageResult{}, fmt.Errorf("archived session cannot run a turn")
 	}
 	session.ConfigPath = s.ConfigPath()

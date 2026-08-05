@@ -87,6 +87,34 @@ export function flattenSessionTree(nodes: SessionTreeNode[]): Session[] {
   return nodes.flatMap((node) => [node.session, ...flattenSessionTree(node.children)])
 }
 
+export interface SessionSubPanelContext {
+  /** The parent session shown at the top of the sub-panel. */
+  parent: Session
+  /** Direct children sorted newest-first by creation time. */
+  children: Session[]
+}
+
+/**
+ * Resolves the sub-panel context for the currently selected session.
+ *
+ * If the selected session has children, it is the parent. If it is itself a
+ * child, its parent is the parent and its siblings (including itself) are the
+ * children. Returns null when the selected session has no parent and no
+ * children, meaning there is nothing to show in the sub-panel.
+ */
+export function sessionSubPanelContext(sessions: Session[], selectedID: string): SessionSubPanelContext | null {
+  const selected = sessions.find((s) => s.id === selectedID)
+  if (!selected) return null
+  const parentID = selected.parent_session_id
+  const parent = parentID ? sessions.find((s) => s.id === parentID) : undefined
+  const effectiveParent = parent ?? selected
+  const children = sessions
+    .filter((s) => s.parent_session_id === effectiveParent.id)
+    .sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime())
+  if (children.length === 0) return null
+  return { parent: effectiveParent, children }
+}
+
 /**
  * Returns the ids of every descendant of rootID inside sessions, following
  * parent links breadth-first. Cycle-safe: corrupted lineage can never loop.

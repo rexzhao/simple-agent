@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { fireEvent, render, screen } from '@testing-library/react'
-import { describe, expect, it, vi } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { Project, Session } from '../types'
 import { WorkspaceTree } from './WorkspaceTree'
 
@@ -56,44 +56,29 @@ function renderTree(sessions: Session[], runningSessionIDs: ReadonlySet<string> 
   return onSelectSession
 }
 
-describe('WorkspaceTree session lineage', () => {
-  it('renders, collapses, expands, and selects an agent child beneath its parent', () => {
+afterEach(() => { document.body.innerHTML = '' })
+
+describe('WorkspaceTree session list', () => {
+  it('shows only root sessions, not child sessions', () => {
     const root = session('root', 'Root')
     const child = session('child', 'Child', {
       created_by: 'agent', parent_session_id: root.id, root_session_id: root.id, spawn_depth: 1,
     })
-    const onSelectSession = renderTree([child, root])
+    renderTree([child, root])
 
-    let childLabel = screen.getByText('Child')
-    expect(childLabel.closest('.session-tree-row')?.parentElement?.parentElement?.classList.contains('session-tree-children')).toBe(true)
-    expect(screen.getByText(/Agent/)).not.toBeNull()
-
-    const collapse = screen.getByRole('button', { name: 'Collapse child sessions of Root' })
-    expect(collapse.getAttribute('aria-expanded')).toBe('true')
-    fireEvent.click(collapse)
+    expect(screen.getByText('Root')).not.toBeNull()
     expect(screen.queryByText('Child')).toBeNull()
-
-    const expand = screen.getByRole('button', { name: 'Expand child sessions of Root' })
-    expect(expand.getAttribute('aria-expanded')).toBe('false')
-    fireEvent.click(expand)
-    childLabel = screen.getByText('Child')
-    fireEvent.click(childLabel)
-    expect(onSelectSession).toHaveBeenCalledWith(project.id, child.id)
   })
 
-  it('keeps a running descendant visible when its root is outside the collapsed top three', () => {
+  it('keeps a running root visible when it is outside the collapsed top three', () => {
     const roots = [1, 2, 3, 4].map((index) => session(`root-${index}`, `Root ${index}`, {
       last_used_at: `2026-01-0${6 - index}T00:00:00Z`,
+      status: 'running',
     }))
-    const runningChild = session('running-child', 'Running child', {
-      created_by: 'agent', parent_session_id: roots[3].id, root_session_id: roots[3].id,
-      spawn_depth: 1, status: 'running', last_used_at: '2026-01-01T00:00:00Z',
-    })
-    renderTree([...roots, runningChild], new Set([runningChild.id]))
+    renderTree(roots, new Set([roots[3].id]))
 
     expect(screen.getByText('Root 4')).not.toBeNull()
-    expect(screen.getByText('Running child')).not.toBeNull()
-    expect(screen.getByText('Running child').closest('.session-tree-row')?.querySelector('.status-dot.running')).not.toBeNull()
+    expect(screen.getByText('Root 4').closest('.session-tree-row')?.querySelector('.status-dot.running')).not.toBeNull()
   })
 
   it('shows a red interrupted indicator on failed sessions in the list', () => {
@@ -103,5 +88,12 @@ describe('WorkspaceTree session lineage', () => {
 
     expect(screen.getByText('Failed').closest('.session-tree-row')?.querySelector('.status-dot.interrupted')).not.toBeNull()
     expect(screen.getByText('Idle').closest('.session-tree-row')?.querySelector('.status-dot')).toBeNull()
+  })
+
+  it('selects a root session when clicked', () => {
+    const root = session('root', 'Root')
+    const onSelectSession = renderTree([root])
+    fireEvent.click(screen.getByText('Root'))
+    expect(onSelectSession).toHaveBeenCalledWith(project.id, root.id)
   })
 })

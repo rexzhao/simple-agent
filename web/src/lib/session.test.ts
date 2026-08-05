@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import type { Session } from '../types'
-import { buildSessionTree, flattenSessionTree, sessionDescendantIDs } from './session'
+import { buildSessionTree, flattenSessionTree, sessionDescendantIDs, sessionSubPanelContext } from './session'
 
 function session(id: string, options: Partial<Session> = {}): Session {
   return {
@@ -80,5 +80,53 @@ describe('sessionDescendantIDs', () => {
     const cycleB = session('cycle-b', { parent_session_id: 'cycle-a', root_session_id: 'cycle-a' })
 
     expect(sessionDescendantIDs([cycleA, cycleB], 'cycle-a')).toEqual(['cycle-b'])
+  })
+})
+
+describe('sessionSubPanelContext', () => {
+  it('returns null when the selected session has no parent and no children', () => {
+    const root = session('root')
+    expect(sessionSubPanelContext([root], 'root')).toBeNull()
+  })
+
+  it('returns parent at top and children sorted newest-first when a root with children is selected', () => {
+    const root = session('root', { created_at: '2026-01-01T00:00:00Z' })
+    const older = session('older', {
+      parent_session_id: 'root', root_session_id: 'root', spawn_depth: 1,
+      created_at: '2026-01-02T00:00:00Z',
+    })
+    const newer = session('newer', {
+      parent_session_id: 'root', root_session_id: 'root', spawn_depth: 1,
+      created_at: '2026-01-04T00:00:00Z',
+    })
+    const mid = session('mid', {
+      parent_session_id: 'root', root_session_id: 'root', spawn_depth: 1,
+      created_at: '2026-01-03T00:00:00Z',
+    })
+
+    const ctx = sessionSubPanelContext([root, older, newer, mid], 'root')
+    expect(ctx).not.toBeNull()
+    expect(ctx!.parent.id).toBe('root')
+    expect(ctx!.children.map((c) => c.id)).toEqual(['newer', 'mid', 'older'])
+  })
+
+  it('resolves the parent and siblings when a child session is selected', () => {
+    const root = session('root')
+    const child1 = session('c1', { parent_session_id: 'root', root_session_id: 'root', spawn_depth: 1, created_at: '2026-01-02T00:00:00Z' })
+    const child2 = session('c2', { parent_session_id: 'root', root_session_id: 'root', spawn_depth: 1, created_at: '2026-01-03T00:00:00Z' })
+
+    const ctx = sessionSubPanelContext([root, child1, child2], 'c1')
+    expect(ctx).not.toBeNull()
+    expect(ctx!.parent.id).toBe('root')
+    expect(ctx!.children.map((c) => c.id)).toEqual(['c2', 'c1'])
+  })
+
+  it('only includes direct children, not grandchildren', () => {
+    const root = session('root')
+    const child = session('child', { parent_session_id: 'root', root_session_id: 'root', spawn_depth: 1, created_at: '2026-01-02T00:00:00Z' })
+    const grandchild = session('grandchild', { parent_session_id: 'child', root_session_id: 'root', spawn_depth: 2, created_at: '2026-01-03T00:00:00Z' })
+
+    const ctx = sessionSubPanelContext([root, child, grandchild], 'root')
+    expect(ctx!.children.map((c) => c.id)).toEqual(['child'])
   })
 })

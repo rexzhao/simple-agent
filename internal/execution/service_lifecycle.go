@@ -28,6 +28,11 @@ func (s *Service) publishSessionLifecycle(eventType string, session sessions.Ses
 	// store commit that caused the event.
 	session = s.hydrateSessionPricing(session)
 	session = s.hydrateSessionDebug(session)
+	// Compute the effective archived state (own flag or any ancestor's) so
+	// that events carry the same value the list/detail APIs return.
+	if effective, err := s.sessionEffectivelyArchived(session); err == nil {
+		session.Archived = effective
+	}
 	payload := make(map[string]any, len(fields)+3)
 	for key, value := range fields {
 		payload[key] = value

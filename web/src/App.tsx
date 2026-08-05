@@ -6,7 +6,7 @@ import { errorMessage } from './lib/format'
 import { copyFrontendProtocolJSONL, downloadFrontendProtocolJSONL, frontendProtocolLogger, protocolLogIdentity, useFrontendProtocolLogging } from './lib/frontendProtocolLogger'
 import { reduceLifecycleEvent, type SessionMaps } from './lib/lifecycleReducer'
 import { reduceRunEvent } from './lib/runEventReducer'
-import { modelKey, orderSessions, projectName, sessionDescendantIDs, sessionName } from './lib/session'
+import { modelKey, orderSessions, projectName, sessionDescendantIDs, sessionName, sessionSubPanelContext } from './lib/session'
 import { settlementRevision } from './lib/settlement'
 import { emptyComposerDraft } from './components/Composer'
 import type { PastedImageAttachment } from './components/Composer'
@@ -18,6 +18,7 @@ import type { ProviderManagerState } from './components/ProviderManagerDialog'
 import { SessionModelDialog } from './components/SessionModelDialog'
 import type { SessionCreatorState } from './components/SessionModelDialog'
 import { WorkspaceTree } from './components/WorkspaceTree'
+import { SessionSubPanel } from './components/SessionSubPanel'
 import { useComposerDrafts } from './hooks/useComposerDrafts'
 import { useRunRegistry } from './hooks/useRunRegistry'
 import { useSessionHistory } from './hooks/useSessionHistory'
@@ -39,6 +40,12 @@ function App() {
   const { selectedProjectID, selectedSessionID, selectedProjectRef, setSelectedProjectID, setSelectedSessionID } = useSessionSelection()
   const selectedSessionIDRef = useRef(selectedSessionID)
   selectedSessionIDRef.current = selectedSessionID
+  // viewingSessionID controls what the conversation panel displays. It follows
+  // the tree selection but can diverge when the user picks a sub-session from
+  // the floating sub-panel, without disturbing the tree's selected highlight.
+  const [viewingSessionID, setViewingSessionID] = useState('')
+  const viewingSessionIDRef = useRef(viewingSessionID)
+  viewingSessionIDRef.current = viewingSessionID
   const sessionMapsRef = useRef<SessionMaps>({ active: sessionsByProject, archived: archivedSessionsByProject })
   sessionMapsRef.current = { active: sessionsByProject, archived: archivedSessionsByProject }
   // Session-list requests are point-in-time reads.  A rename/archive/refresh
@@ -273,8 +280,14 @@ function App() {
 
   const reportError = useCallback((reason: unknown) => setError(errorMessage(reason)), [])
   const { sessionDetail, itemsPage, selectedSessionRef, refreshSession, loadOlder } =
-    useSessionHistory(selectedSessionID, loadSessions, reportError, sessionStore)
+    useSessionHistory(viewingSessionID, loadSessions, reportError, sessionStore)
   refreshSessionRef.current = refreshSession
+
+  // Tree selection is the authoritative navigation source. The viewing session
+  // follows it so that normal navigation (tree click, bootstrap, create) keeps
+  // the conversation panel in sync. The sub-panel can then override it without
+  // disturbing the tree's selected highlight.
+  useEffect(() => { setViewingSessionID(selectedSessionID) }, [selectedSessionID])
 
   // Durable items are already in the session projection. Removing a run must
   // therefore only tear down transient state; it must not copy its steps into
@@ -533,8 +546,8 @@ function App() {
   }, [loadSessions, refreshSession, selectedSessionRef])
 
   const openDebugSettings = useCallback(() => {
-    if (selectedSessionID) setDebugSessionID(selectedSessionID)
-  }, [selectedSessionID])
+    if (viewingSessionID) setDebugSessionID(viewingSessionID)
+  }, [viewingSessionID])
 
   const saveDebugSettings = useCallback(async (sessionID: string, settings: SessionDebugSettings) => {
     setSavingDebugSettings(true)
@@ -912,7 +925,7 @@ function App() {
           updateActiveRun(sessionID, runID, (existing) => ({ ...existing, status: 'error_pending_refresh' }))
           setRecoveredRuns((current) => current.filter((item) => item.run_id !== runID))
         }
-        if (selectedSessionIDRef.current === sessionID) setError(errorMessage(reason))
+        if (viewingSessionIDRef.current === sessionID) setError(errorMessage(reason))
       })
       .finally(() => {
         runStreamsRef.current.delete(runID)
@@ -1122,8 +1135,8 @@ function App() {
   }
 
   const sendMessage = async (content: string, images: PastedImageAttachment[]): Promise<boolean> => {
-    if (!selectedSessionID || (!content.trim() && images.length === 0)) return false
-    const sessionID = selectedSessionID
+    if (!viewingSessionID || (!content.trim() && images.length === 0)) return false
+    const sessionID = viewingSessionID
     if (content.trim() === '/new' && images.length === 0) {
       return createRootSession(sessionID)
     }
@@ -1147,8 +1160,8 @@ function App() {
   }
 
   const continueRun = useCallback(async (): Promise<boolean> => {
-    if (!selectedSessionID) return false
-    const sessionID = selectedSessionID
+    if (!viewingSessionID) return false
+    const sessionID = viewingSessionID
     const activeRun = activeRunsRef.current[sessionID]
     const detail = sessionDetail?.id === sessionID ? sessionDetail : undefined
     if (activeRun?.status === 'running' || !detail || (detail.status !== 'interrupted' && detail.status !== 'failed') || !detail.interrupted_run_id || !detail.interrupted_turn_id) {
@@ -1173,33 +1186,33 @@ function App() {
       setError(errorMessage(reason))
       return false
     }
-  }, [clearTurnError, connectRunStream, selectedSessionID, sessionDetail, setAwaitingRunStarted])
+  }, [clearTurnError, connectRunStream, viewingSessionID, sessionDetail, setAwaitingRunStarted])
 
   const cancelRun = async () => {
-    const run = activeRunsRef.current[selectedSessionID]
+    const run = activeRunsRef.current[viewingSessionID]
     if (!run) return
     try {
-      await api.cancelRun(run.id, selectedSessionID)
+      await api.cancelRun(run.id, viewingSessionID)
     } catch (reason) {
       setError(errorMessage(reason))
     }
   }
 
   const cancelToolCall = useCallback(async (toolCallID: string) => {
-    const run = activeRunsRef.current[selectedSessionID]
+    const run = activeRunsRef.current[viewingSessionID]
     if (!run) return
     try {
-      await api.cancelToolCall(run.id, toolCallID, selectedSessionID)
+      await api.cancelToolCall(run.id, toolCallID, viewingSessionID)
     } catch (reason) {
       setError(errorMessage(reason))
     }
-  }, [selectedSessionID])
+  }, [viewingSessionID])
 
   const removeQueuedPrompt = async (promptID: string) => {
-    const run = activeRunsRef.current[selectedSessionID]
+    const run = activeRunsRef.current[viewingSessionID]
     if (!run) return
     try {
-      await api.removeRunMessage(run.id, promptID, selectedSessionID)
+      await api.removeRunMessage(run.id, promptID, viewingSessionID)
     } catch (reason) {
       setError(errorMessage(reason))
     }
@@ -1209,28 +1222,28 @@ function App() {
   // run.prompt_queue stream event, keeping the server the single source of
   // truth for queue order.
   const setQueuedPromptSteer = async (promptID: string, steer: boolean) => {
-    const run = activeRunsRef.current[selectedSessionID]
+    const run = activeRunsRef.current[viewingSessionID]
     if (!run) return
     try {
-      await api.steerRunMessage(run.id, promptID, steer, selectedSessionID)
+      await api.steerRunMessage(run.id, promptID, steer, viewingSessionID)
     } catch (reason) {
       setError(errorMessage(reason))
     }
   }
 
   const moveQueuedPrompt = async (promptID: string, direction: 'up' | 'down') => {
-    const run = activeRunsRef.current[selectedSessionID]
+    const run = activeRunsRef.current[viewingSessionID]
     if (!run) return
     try {
-      await api.moveRunMessage(run.id, promptID, direction, selectedSessionID)
+      await api.moveRunMessage(run.id, promptID, direction, viewingSessionID)
     } catch (reason) {
       setError(errorMessage(reason))
     }
   }
 
   const compactSession = async () => {
-    if (!selectedSessionID || sessionDetail?.status === 'running' || activeRunsRef.current[selectedSessionID]?.status === 'running') return
-    const sessionID = selectedSessionID
+    if (!viewingSessionID || sessionDetail?.status === 'running' || activeRunsRef.current[viewingSessionID]?.status === 'running') return
+    const sessionID = viewingSessionID
     setCompactingSessionIDs((current) => ({ ...current, [sessionID]: true }))
     try {
       await api.compact(sessionID)
@@ -1247,10 +1260,12 @@ function App() {
   }
 
   const selectedProject = projects.find((project) => project.id === selectedProjectID) ?? null
-  const selectedActiveRun = activeRunsBySession[selectedSessionID] ?? null
+  const selectedProjectSessions = selectedProjectID ? (sessionsByProject[selectedProjectID] ?? []) : []
+  const subPanelContext = viewingSessionID ? sessionSubPanelContext(selectedProjectSessions, viewingSessionID) : null
+  const selectedActiveRun = activeRunsBySession[viewingSessionID] ?? null
   useEffect(() => {
-    if (debugSessionID && debugSessionID !== selectedSessionID) setDebugSessionID('')
-  }, [debugSessionID, selectedSessionID])
+    if (debugSessionID && debugSessionID !== viewingSessionID) setDebugSessionID('')
+  }, [debugSessionID, viewingSessionID])
   const debugSession = debugSessionID
     ? sessionDetail?.id === debugSessionID
       ? sessionDetail
@@ -1283,6 +1298,17 @@ function App() {
         onAdd={showAddProject}
         version={bootstrap?.version ?? ''}
       />
+      {subPanelContext && (
+        <SessionSubPanel
+          context={subPanelContext}
+          viewingSessionID={viewingSessionID}
+          runningSessionIDs={visibleRunningSessionIDs}
+          onSelectSession={(sessionID) => setViewingSessionID(sessionID)}
+          onRenameSession={renameSession}
+          onArchiveSession={archiveSession}
+          onDeleteSession={deleteSession}
+        />
+      )}
       <main className="conversation-panel">
         {error && <ErrorBanner message={error} onDismiss={() => setError('')} />}
         {completionNotice && <div className="completion-notice" role="status"><span>{completionNotice.sessionName} completed in the background.</span><button onClick={() => setCompletionNotice(null)} aria-label="Dismiss completion notification">×</button></div>}
@@ -1293,30 +1319,30 @@ function App() {
             onCancel={() => setShowProjectForm(false)}
             onSubmit={(root, name) => void createProject(root, name)}
           />
-        ) : selectedSessionID ? (
+        ) : viewingSessionID ? (
           <Conversation
-            sessionID={selectedSessionID}
+            sessionID={viewingSessionID}
             detail={sessionDetail}
             page={itemsPage}
             activeRun={selectedActiveRun}
-            admissionPending={Boolean(awaitingRunStartedBySession[selectedSessionID])}
-            compacting={Boolean(compactingSessionIDs[selectedSessionID])}
-			draft={draftsBySession[selectedSessionID] ?? emptyComposerDraft}
-			onDraftChange={(content) => updateDraft(selectedSessionID, content)}
-			onPastedTextAdd={(pastedText) => addPastedText(selectedSessionID, pastedText)}
-			onPastedTextRemove={(pastedTextID) => removePastedText(selectedSessionID, pastedTextID)}
-			onPastedImageAdd={(pastedImage) => addPastedImage(selectedSessionID, pastedImage)}
-			onPastedImageRemove={(pastedImageID) => removePastedImage(selectedSessionID, pastedImageID)}
-			onDraftClear={() => clearDraft(selectedSessionID)}
+            admissionPending={Boolean(awaitingRunStartedBySession[viewingSessionID])}
+            compacting={Boolean(compactingSessionIDs[viewingSessionID])}
+			draft={draftsBySession[viewingSessionID] ?? emptyComposerDraft}
+			onDraftChange={(content) => updateDraft(viewingSessionID, content)}
+			onPastedTextAdd={(pastedText) => addPastedText(viewingSessionID, pastedText)}
+			onPastedTextRemove={(pastedTextID) => removePastedText(viewingSessionID, pastedTextID)}
+			onPastedImageAdd={(pastedImage) => addPastedImage(viewingSessionID, pastedImage)}
+			onPastedImageRemove={(pastedImageID) => removePastedImage(viewingSessionID, pastedImageID)}
+			onDraftClear={() => clearDraft(viewingSessionID)}
             sessionNames={sessionNames}
-            turnError={turnErrors[selectedSessionID] ?? null}
-            onDismissTurnError={() => clearTurnError(selectedSessionID)}
+            turnError={turnErrors[viewingSessionID] ?? null}
+            onDismissTurnError={() => clearTurnError(viewingSessionID)}
             onLoadOlder={loadOlder}
             onSend={(content, images) => sendMessage(content, images)}
             onCancel={() => void cancelRun()}
             onCancelTool={(toolCallID) => void cancelToolCall(toolCallID)}
             onContinue={() => void continueRun()}
-            onRetryRefresh={() => void retryRefreshSession(selectedSessionID)}
+            onRetryRefresh={() => void retryRefreshSession(viewingSessionID)}
             onDebug={openDebugSettings}
             onRemoveQueuedPrompt={(promptID) => void removeQueuedPrompt(promptID)}
             onSteerQueuedPrompt={(promptID, steer) => void setQueuedPromptSteer(promptID, steer)}

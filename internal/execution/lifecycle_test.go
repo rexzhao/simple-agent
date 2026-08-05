@@ -45,14 +45,14 @@ func TestServicePublishesSessionLifecycleAfterSuccessfulStoreWrites(t *testing.T
 	if _, err := service.ArchiveSession(parent.ID); err != nil {
 		t.Fatalf("ArchiveSession() error = %v", err)
 	}
-	for range 2 {
-		event := nextLifecycleEvent(t, subscription)
-		assertLifecycleEvent(t, event, LifecycleSessionArchived)
-		var payload map[string]any
-		decodeLifecyclePayload(t, event, &payload)
-		if got := payload["cascade_root_id"]; got != parent.ID {
-			t.Fatalf("archive cascade_root_id = %#v, want %q", got, parent.ID)
-		}
+	// Only the target session gets an archive event; descendants become
+	// effectively archived through the ancestor chain.
+	archiveEvent := nextLifecycleEvent(t, subscription)
+	assertLifecycleEvent(t, archiveEvent, LifecycleSessionArchived)
+	var archivePayload map[string]any
+	decodeLifecyclePayload(t, archiveEvent, &archivePayload)
+	if got := archivePayload["cascade_root_id"]; got != parent.ID {
+		t.Fatalf("archive cascade_root_id = %#v, want %q", got, parent.ID)
 	}
 	if _, err := service.RestoreSession(parent.ID); err != nil {
 		t.Fatalf("RestoreSession() error = %v", err)

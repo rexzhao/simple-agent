@@ -80,6 +80,8 @@ func TestArchiveSessionCascadesToDescendants(t *testing.T) {
 	if !archived.Archived || archived.ID != tree.parent.ID {
 		t.Fatalf("ArchiveSession() = %#v, want archived target", archived)
 	}
+	// The parent's own flag is set; descendants become effectively archived
+	// through the ancestor chain but their own flags stay false.
 	for id, want := range map[string]bool{
 		tree.parent.ID:     true,
 		tree.child.ID:      true,
@@ -90,10 +92,43 @@ func TestArchiveSessionCascadesToDescendants(t *testing.T) {
 			t.Errorf("archived(%s) = %v, want %v", id, got, want)
 		}
 	}
+	// Verify the descendant's own stored flag is still false.
+	for _, id := range []string{tree.child.ID, tree.grandchild.ID} {
+		stored, err := service.sessionStore.LoadState(id)
+		if err != nil {
+			t.Fatalf("LoadState(%s) error = %v", id, err)
+		}
+		if stored.Archived {
+			t.Errorf("descendant %s own archived flag = true, want false (effective state only)", id)
+		}
+	}
 
 	// Archiving again is an idempotent no-op.
 	if _, err := service.ArchiveSession(tree.parent.ID); err != nil {
 		t.Fatalf("ArchiveSession(again) error = %v", err)
+	}
+}
+
+func TestArchiveSessionDescendantAlsoArchivedIndependently(t *testing.T) {
+	service, tree := newCascadeTestTree(t, t.TempDir())
+
+	// Archive the child directly: only the child's own flag is set.
+	if _, err := service.ArchiveSession(tree.child.ID); err != nil {
+		t.Fatalf("ArchiveSession(child) error = %v", err)
+	}
+	if !archivedFlag(t, service, tree.child.ID) {
+		t.Error("archived(child) = false, want true")
+	}
+	// The grandchild is effectively archived through its parent (child).
+	if !archivedFlag(t, service, tree.grandchild.ID) {
+		t.Error("archived(grandchild) = false, want true (inherited from child)")
+	}
+	// The parent and sibling are not affected.
+	if archivedFlag(t, service, tree.parent.ID) {
+		t.Error("archived(parent) = true, want false")
+	}
+	if archivedFlag(t, service, tree.sibling.ID) {
+		t.Error("archived(sibling) = true, want false")
 	}
 }
 
