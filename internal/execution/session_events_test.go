@@ -37,6 +37,24 @@ func TestSessionStreamUsageEventIncludesCacheDetails(t *testing.T) {
 	}
 }
 
+func TestSessionStreamReasoningDeltaCarriesAssistantItemBinding(t *testing.T) {
+	event, ok := sessionStreamEventFromModelEvent("turn-1", 2, model.ReasoningDeltaEvent{
+		Text:            "thinking",
+		AssistantItemID: "assistant-2",
+	}, true)
+	if !ok {
+		t.Fatal("sessionStreamEventFromModelEvent() ok = false, want true")
+	}
+	for key, want := range map[string]any{
+		"type": "reasoning.delta", "turn_id": "turn-1", "agent_iteration": 2,
+		"text": "thinking", "item_id": "assistant-2",
+	} {
+		if got := event[key]; got != want {
+			t.Fatalf("event[%q] = %#v, want %#v; event = %#v", key, got, want, event)
+		}
+	}
+}
+
 func TestSessionStreamProviderRetryEventIncludesBackoffDetails(t *testing.T) {
 	event, ok := sessionStreamEventFromModelEvent("turn-1", 6, model.ProviderRetryEvent{
 		Attempt:     2,
@@ -796,6 +814,51 @@ func TestSessionEventSinkPreservesAssistantCheckpointBinding(t *testing.T) {
 	}
 	if delivered[2]["durable_checkpointed"] != false || delivered[2]["text"] != "bc" || delivered[2]["item_id"] != "assistant-1" {
 		t.Fatalf("tail delta = %#v, want coalesced uncheckpointed bc with identity", delivered[2])
+	}
+}
+
+func TestSessionEventSinkPreservesReasoningItemBindingAcrossReplay(t *testing.T) {
+	release := make(chan struct{})
+	blocked := make(chan struct{}, 1)
+	var mu sync.Mutex
+	var delivered []SessionStreamEvent
+	sink := newSessionEventSink(func(event SessionStreamEvent) {
+		select {
+		case blocked <- struct{}{}:
+		default:
+		}
+		<-release
+		mu.Lock()
+		delivered = append(delivered, event)
+		mu.Unlock()
+	})
+	sink.submit(NewSessionStreamEvent("turn.started", map[string]any{"turn_id": "turn-1"}))
+	<-blocked
+	sink.submit(NewSessionStreamEvent("reasoning.delta", map[string]any{
+		"turn_id": "turn-1", "agent_iteration": 1, "item_id": "assistant-1", "text": "old ",
+	}))
+	sink.submit(NewSessionStreamEvent("reasoning.delta", map[string]any{
+		"turn_id": "turn-1", "agent_iteration": 1, "item_id": "assistant-1", "text": "reasoning",
+	}))
+	// A new assistant item is a new logical reasoning stream even when the
+	// provider text and turn/iteration happen to be identical.
+	sink.submit(NewSessionStreamEvent("reasoning.delta", map[string]any{
+		"turn_id": "turn-1", "agent_iteration": 1, "item_id": "assistant-2", "text": "same",
+	}))
+	close(release)
+	sink.close()
+	sink.wait()
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(delivered) != 3 {
+		t.Fatalf("delivered events = %#v, want turn.started plus two reasoning deltas", delivered)
+	}
+	if delivered[1]["item_id"] != "assistant-1" || delivered[1]["text"] != "old reasoning" {
+		t.Fatalf("first reasoning replay = %#v, want assistant-1 with coalesced text", delivered[1])
+	}
+	if delivered[2]["item_id"] != "assistant-2" || delivered[2]["text"] != "same" {
+		t.Fatalf("second reasoning replay = %#v, want assistant-2 identity", delivered[2])
 	}
 }
 

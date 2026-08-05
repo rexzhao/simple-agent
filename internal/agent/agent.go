@@ -501,6 +501,12 @@ func streamModelTurn(ctx context.Context, provider model.Provider, request model
 			case model.ReasoningDeltaEvent:
 				madeProgress = true
 				reasoningContent.WriteString(event.Text)
+				// The assistant item is allocated before the provider stream
+				// starts. Carry that identity on every reasoning delta just as
+				// the visible text deltas carry it, so replay can reconcile the
+				// transient step with the durable assistant projection.
+				event.AssistantItemID = assistantItemID
+				outputEvent = event
 			case model.ToolCallDeltaEvent:
 				madeProgress = true
 			case model.ToolCallDoneEvent:

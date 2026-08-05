@@ -119,14 +119,19 @@ the run enters the existing failed/resync path. The client must not report
 that every transient delta it displayed was persisted.
 
 Each transient `text.delta` now optionally carries additive `item_id`,
-`durable_text_length`, and `durable_checkpointed` fields. The item projection
-event optionally carries `assistant_text_length`. These fields explicitly
-associate the run stream with the durable item; clients must not match text,
-turn content, or timing to deduplicate. The frontend renders the durable item
-as the message bubble and keeps only the uncheckpointed tail in `ActiveRun`. A
+`durable_text_length`, and `durable_checkpointed` fields. A transient
+`reasoning.delta` optionally carries the same preallocated assistant
+`item_id` (without the text checkpoint fields). The item projection event
+optionally carries `assistant_text_length`. These fields explicitly associate
+the run stream with the durable item; clients must not match text, turn
+content, or timing to deduplicate. The frontend renders the durable item as
+the message bubble and keeps only the uncheckpointed tail in `ActiveRun`. A
 committed append/update clears or replaces that tail, so replay, a fast
 append/update sequence, and duplicate projection events still produce one
-bubble.
+bubble. Reasoning uses the same item identity to remove a transient step once
+the durable assistant item's reasoning is projected; old replay events without
+`item_id` may use their turn/iteration identity only as a conservative
+compatibility fallback.
 
 Reasoning deltas, provider items, and tool-internal events do not invoke the
 assistant checkpoint path. If the run fails or is cancelled after an assistant

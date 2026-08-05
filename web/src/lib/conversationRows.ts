@@ -99,21 +99,12 @@ export function buildConversationRows(input: BuildConversationRowsInput): Conver
   const attachedAssistantItemID = assistantBinding && historicalRows.some((row) =>
     row.kind === 'message' && row.item.id === assistantBinding.itemID && row.item.message?.role === 'assistant',
   ) ? assistantBinding.itemID : undefined
-  const boundAssistantItem = assistantBinding
-    ? input.items.find((item) => item.id === assistantBinding.itemID)
-    : undefined
   // A final assistant projection can arrive while the stream still contains
-  // the reasoning deltas that produced it. Suppress only the matching
-  // turn/iteration owned by the explicit assistant item binding. A durable
-  // item from another iteration (or an unbound transient reasoning step) must
-  // remain visible.
-  const durableReasoningIteration = boundAssistantItem && assistantBinding &&
-    boundAssistantItem.turn_id?.trim() === activeRun?.turnID?.trim() &&
-    boundAssistantItem.agent_iteration === activeRun?.agentIteration &&
-    boundAssistantItem.message?.role === 'assistant' &&
-    Boolean(boundAssistantItem.message.reasoning)
-    ? boundAssistantItem.agent_iteration
-    : undefined
+  // the reasoning deltas that produced it. Build the suppression set from the
+  // durable item id recorded for each turn/iteration, never from reasoning
+  // text. The turn/iteration set is only the compatibility path for old run
+  // replays that predate reasoning item_id.
+  const durableReasoning = activeRun ? durableReasoningIdentities(input.items, activeRun) : emptyDurableReasoningIdentities()
   const rows = historicalRows.map((row): ConversationRow => {
     if (row.kind !== 'message' || row.item.id !== attachedAssistantItemID) return row
     return {
@@ -134,28 +125,34 @@ export function buildConversationRows(input: BuildConversationRowsInput): Conver
     // Tool calls/results are durable projection items. Once one is present in
     // the page, hide only that matching transient tool step; reasoning and
     // still-transient tools remain visible while the run is live.
-    const segments = activeRunSegments(activeRun).map((segment, segmentIndex, allSegments) => {
+    const rawSegments = activeRunSegments(activeRun)
+    const filteredSegments = rawSegments.map((segment, segmentIndex) => {
       // A run can contain an earlier prompt segment whose iteration counter
-      // restarts at 1 for the current turn. Only the final segment is the
-      // currently bound turn; never hide matching iteration numbers from the
-      // earlier process history.
-      const isCurrentSegment = segmentIndex === allSegments.length - 1
+      // restarts at 1 for the current turn. The explicit reasoning identity is
+      // safe across every segment; only the legacy no-identity fallback is
+      // restricted to the final segment.
+      const isCurrentSegment = segmentIndex === rawSegments.length - 1
       return {
         ...segment,
         steps: segment.steps.filter((step) => {
           if (step.kind === 'tool' && durableToolIDs.has(step.id)) return false
-          if (isCurrentSegment && step.kind === 'reasoning' && durableReasoningIteration !== undefined && step.iteration === durableReasoningIteration) return false
+          if (step.kind === 'reasoning' && shouldSuppressDurableReasoning(step, segment, isCurrentSegment, activeRun, durableReasoning)) return false
           return true
         }),
       }
-    })
-    const hasLiveSteps = segments.some((segment) => segment.steps.length > 0)
-    // With no process steps the durable Message row owns the generating
-    // cursor as well, so an attached tail does not create a second bubble.
-    // Only an explicitly attached durable assistant message owns the empty
-    // generating cursor. Durable tools in an older turn must not suppress a
-    // fresh run's active-process container.
-    const shouldRenderProcess = !attachedAssistantItemID || hasLiveSteps
+    }).filter((segment) => segment.steps.length > 0)
+    const hasLiveSteps = filteredSegments.length > 0
+    // Drop segments emptied by durable reconciliation. An attached durable
+    // assistant message owns the cursor when it has the current item; a run
+    // with no attached item still gets exactly one empty process row so the
+    // current Generating cursor has a container. Durable tools in an older
+    // turn must not suppress a fresh run's active-process container.
+    const segments = hasLiveSteps
+      ? filteredSegments
+      : attachedAssistantItemID
+        ? []
+        : [{ steps: [], boundary: rawSegments[rawSegments.length - 1]?.boundary ?? 'initial' }]
+    const shouldRenderProcess = segments.length > 0
     if (shouldRenderProcess) {
       segments.forEach((segment, index) => {
         rows.push({
@@ -207,6 +204,72 @@ function activeAssistantBinding(run: ActiveRun): { itemID: string; durableTextLe
   // The key selects the current invocation, but the item id is the only
   // identity used to attach the transient tail to a durable row.
   return run.assistantItems?.[`${turnID}:${run.agentIteration}`]
+}
+
+interface DurableReasoningIdentities {
+  identities: Set<string>
+  itemIDs: Set<string>
+  turnIterations: Set<string>
+}
+
+function emptyDurableReasoningIdentities(): DurableReasoningIdentities {
+  return { identities: new Set(), itemIDs: new Set(), turnIterations: new Set() }
+}
+
+function durableReasoningIdentities(items: SessionItem[], run: ActiveRun): DurableReasoningIdentities {
+  const identities = emptyDurableReasoningIdentities()
+  for (const item of items) {
+    if (item.message?.role !== 'assistant' || !item.message.reasoning) continue
+    const turnID = item.turn_id?.trim() ?? ''
+    const iteration = item.agent_iteration ?? 0
+    if (!turnID || iteration <= 0) continue
+    const binding = run.assistantItems?.[`${turnID}:${iteration}`]
+    // A durable reasoning item is authoritative for a transient step only
+    // when the run's explicit turn/iteration binding points at this exact
+    // item. A page item alone is not enough to identify a live step.
+    if (binding?.itemID !== item.id) continue
+    identities.identities.add(reasoningIdentityKey(turnID, iteration, item.id))
+    identities.itemIDs.add(item.id)
+    identities.turnIterations.add(reasoningTurnIterationKey(turnID, iteration))
+  }
+  return identities
+}
+
+function shouldSuppressDurableReasoning(
+  step: Extract<RunStep, { kind: 'reasoning' }>,
+  segment: ActiveRunSegment,
+  isCurrentSegment: boolean,
+  run: ActiveRun,
+  durable: DurableReasoningIdentities,
+): boolean {
+  const itemID = step.itemID?.trim() ?? ''
+  const turnID = step.turnID?.trim() ?? ''
+  // New events carry both identities. An item id is globally stable, so it
+  // remains a safe fallback for a malformed/old event that has item_id but no
+  // turn_id; normal events use the complete tuple so a stale item cannot be
+  // suppressed under a different turn or restarted iteration.
+  if (itemID) return turnID
+    ? durable.identities.has(reasoningIdentityKey(turnID, step.iteration, itemID))
+    : durable.itemIDs.has(itemID)
+  // Compatibility for replayed events emitted before item_id was added.
+  if (turnID) return durable.turnIterations.has(reasoningTurnIterationKey(turnID, step.iteration))
+  // The oldest test/replay shape has neither identity. Only suppress a
+  // unique matching step in the final segment; if iteration was restarted
+  // and two such steps share a segment, retaining both is safer than deleting
+  // reasoning from the wrong turn.
+  if (!isCurrentSegment || !durable.turnIterations.has(reasoningTurnIterationKey(run.turnID?.trim() ?? '', step.iteration))) return false
+  const matchingLegacySteps = segment.steps.filter((candidate) =>
+    candidate.kind === 'reasoning' && !candidate.turnID && !candidate.itemID && candidate.iteration === step.iteration,
+  )
+  return matchingLegacySteps.length === 1 && step.iteration === run.agentIteration
+}
+
+function reasoningTurnIterationKey(turnID: string, iteration: number): string {
+  return `${turnID}\u0000${iteration}`
+}
+
+function reasoningIdentityKey(turnID: string, iteration: number, itemID: string): string {
+  return `${reasoningTurnIterationKey(turnID, iteration)}\u0000${itemID}`
 }
 
 type ActiveRunSegment = { steps: RunStep[]; boundary: string }

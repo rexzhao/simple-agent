@@ -310,7 +310,7 @@ export type RunEvent =
   | { type: 'provider.retrying'; turn_id: string; agent_iteration: number; attempt: number; max_attempts: number; delay_ms: number; reason: string }
 	| { type: 'agent.iteration.started'; turn_id: string; agent_iteration: number }
 	| { type: 'text.delta'; turn_id: string; agent_iteration: number; text: string; item_id?: string; durable_text_length?: number; durable_checkpointed?: boolean }
-	| { type: 'reasoning.delta'; turn_id: string; agent_iteration: number; text: string }
+	| { type: 'reasoning.delta'; turn_id: string; agent_iteration: number; text: string; item_id?: string }
 	| { type: 'tool.requested' | 'tool.started'; turn_id: string; agent_iteration: number; tool_call_id: string; name: string; arguments?: string }
 	| { type: 'tool.finished'; turn_id: string; agent_iteration: number; tool_call_id: string; name: string; is_error: boolean; content?: string }
 	| { type: 'usage.updated'; turn_id: string; agent_iteration: number; input_tokens: number; output_tokens: number; total_tokens: number; cached_tokens: number; cache_write_tokens: number; reasoning_tokens: number }
@@ -338,6 +338,9 @@ export interface ReasoningActivity {
 	id: string
 	text: string
 	iteration: number
+	/** Explicit identity of the assistant request that produced this step. */
+	turnID?: string
+	itemID?: string
 	label?: string
 }
 

@@ -1,13 +1,23 @@
 import type { RunEvent, RunStep, ToolActivity } from '../types'
 
-export function appendReasoning(steps: RunStep[], text: string, iteration: number): RunStep[] {
+export function appendReasoning(steps: RunStep[], text: string, iteration: number, turnID = '', itemID = ''): RunStep[] {
 	if (!text) return steps
 	const normalizedIteration = normalizedAgentIteration(iteration)
 	const last = steps[steps.length - 1]
-	if (last?.kind === 'reasoning' && last.iteration === normalizedIteration) {
+	const normalizedTurnID = turnID.trim()
+	const normalizedItemID = itemID.trim()
+	if (last?.kind === 'reasoning' && last.iteration === normalizedIteration &&
+		(last.turnID ?? '') === normalizedTurnID && (last.itemID ?? '') === normalizedItemID) {
 		return [...steps.slice(0, -1), { ...last, text: last.text + text }]
 	}
-	return [...steps, { kind: 'reasoning', id: `reasoning-${normalizedIteration}-${steps.length}`, text, iteration: normalizedIteration }]
+	return [...steps, {
+		kind: 'reasoning',
+		id: `reasoning-${normalizedTurnID || 'legacy'}-${normalizedItemID || 'unbound'}-${normalizedIteration}-${steps.length}`,
+		text,
+		iteration: normalizedIteration,
+		...(normalizedTurnID ? { turnID: normalizedTurnID } : {}),
+		...(normalizedItemID ? { itemID: normalizedItemID } : {}),
+	}]
 }
 
 export function appendModelOutput(steps: RunStep[], text: string, iteration: number): RunStep[] {

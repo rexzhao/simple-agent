@@ -187,6 +187,41 @@ func TestStreamDoesNotCheckpointModelOnlyReasoning(t *testing.T) {
 	firstErrorEvent(t, got)
 }
 
+func TestStreamBindsReasoningDeltasToPreallocatedAssistantItem(t *testing.T) {
+	provider := &fakeProvider{turns: [][]model.Event{{
+		model.ReasoningDeltaEvent{Text: "inspect first"},
+		model.TextDeltaEvent{Text: "final answer"},
+	}}}
+	publisher := &fakePublisher{}
+	events, err := Stream(context.Background(), model.Request{
+		Model:    "model-test",
+		Messages: []model.Message{{Role: model.MessageRoleUser, Content: "inspect"}},
+	}, Options{Provider: provider, TurnID: "turn-1", Publisher: publisher})
+	if err != nil {
+		t.Fatalf("Stream() error = %v", err)
+	}
+	got := collectAgentEvents(t, events)
+	var ready eventbus.AssistantReady
+	for _, published := range publisher.events {
+		if value, ok := published.(eventbus.AssistantReady); ok {
+			ready = value
+			break
+		}
+	}
+	if ready.ItemID == "" {
+		t.Fatalf("AssistantReady = %#v, want an assistant item identity", ready)
+	}
+	for _, event := range got {
+		if reasoning, ok := event.(model.ReasoningDeltaEvent); ok {
+			if reasoning.AssistantItemID != ready.ItemID {
+				t.Fatalf("reasoning item id = %q, want AssistantReady item id %q", reasoning.AssistantItemID, ready.ItemID)
+			}
+			return
+		}
+	}
+	t.Fatalf("events = %#v, want a reasoning delta", got)
+}
+
 func TestStreamGivesEachAssistantIterationItsOwnItemIdentity(t *testing.T) {
 	provider := &fakeProvider{turns: [][]model.Event{
 		{

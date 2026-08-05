@@ -126,6 +126,20 @@ describe('reduceRunEvent', () => {
     expect(run).toMatchObject({ inputTokens: 10, totalTokens: 14, cachedTokens: 2, reasoningTokens: 3, status: 'failed', error: 'boom' })
   })
 
+  it('keeps reasoning identity when iterations restart across turns', () => {
+    const run = apply(
+      newRun(),
+      { type: 'reasoning.delta', turn_id: 'turn-1', agent_iteration: 1, item_id: 'assistant-1', text: 'first ' },
+      { type: 'reasoning.delta', turn_id: 'turn-1', agent_iteration: 1, item_id: 'assistant-1', text: 'turn' },
+      { type: 'reasoning.delta', turn_id: 'turn-2', agent_iteration: 1, item_id: 'assistant-2', text: 'second' },
+    )
+
+    expect(run.steps).toEqual([
+      { kind: 'reasoning', id: 'reasoning-turn-1-assistant-1-1-0', text: 'first turn', iteration: 1, turnID: 'turn-1', itemID: 'assistant-1' },
+      { kind: 'reasoning', id: 'reasoning-turn-2-assistant-2-1-1', text: 'second', iteration: 1, turnID: 'turn-2', itemID: 'assistant-2' },
+    ])
+  })
+
   it('accumulates usage across agent iterations while keeping the latest context meter values', () => {
     const run = apply(
       newRun(),

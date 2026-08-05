@@ -123,7 +123,16 @@ export function reduceRunEvent(run: ActiveRun, event: RunEvent): ActiveRun {
       }
     }
     case 'reasoning.delta':
-      return { ...run, steps: appendReasoning(run.steps, String(event.text ?? ''), Number(event.agent_iteration ?? run.agentIteration)) }
+      return {
+        ...run,
+        steps: appendReasoning(
+          run.steps,
+          String(event.text ?? ''),
+          Number(event.agent_iteration ?? run.agentIteration),
+          String(event.turn_id ?? run.turnID ?? ''),
+          String(event.item_id ?? ''),
+        ),
+      }
     case 'tool.requested':
       return {
         ...run,

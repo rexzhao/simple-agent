@@ -157,6 +157,11 @@ func (TextDeltaEvent) Type() EventType {
 
 type ReasoningDeltaEvent struct {
 	Text string
+	// AssistantItemID is assigned by the agent after it allocates the
+	// assistant item for this provider request. Provider implementations do
+	// not set it; it lets the run stream identify the durable reasoning item
+	// without comparing its text.
+	AssistantItemID string
 }
 
 func (ReasoningDeltaEvent) Type() EventType {

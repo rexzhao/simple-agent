@@ -251,13 +251,13 @@ describe('buildConversationRows stable identities', () => {
         message: {
           role: 'assistant',
           content: { inline: 'answer' },
-          reasoning: 'I checked the files.',
+          reasoning: 'Authoritative durable reasoning.',
         },
       })],
       activeRun: run({
         turnID: 'turn-live',
         agentIteration: 1,
-        steps: [{ kind: 'reasoning', id: 'reasoning-live', text: 'I checked the files.', iteration: 1 }],
+        steps: [{ kind: 'reasoning', id: 'reasoning-live', text: 'stale transient copy.', iteration: 1, turnID: 'turn-live', itemID: 'assistant-1' }],
         assistantItems: { 'turn-live:1': { itemID: 'assistant-1', durableTextLength: 6 } },
       }),
     })
@@ -265,8 +265,98 @@ describe('buildConversationRows stable identities', () => {
     const reasoningSteps = rows.flatMap((row) => row.kind === 'process' || row.kind === 'active-process' ? row.steps : [])
       .filter((step) => step.kind === 'reasoning')
     expect(reasoningSteps).toEqual([
-      { kind: 'reasoning', id: 'assistant-1-reasoning', text: 'I checked the files.', iteration: 1 },
+      { kind: 'reasoning', id: 'assistant-1-reasoning', text: 'Authoritative durable reasoning.', iteration: 1 },
     ])
+  })
+
+  it('reconciles durable reasoning for every turn and iteration by item identity', () => {
+    const rows = buildConversationRows({
+      sessionID: 'session-1',
+      items: [
+        item('assistant-old-1', 1, 'assistant', 'old answer 1', {
+          turn_id: 'turn-old',
+          agent_iteration: 1,
+          message: { role: 'assistant', content: { inline: 'old answer 1' }, reasoning: 'durable old one' },
+        }),
+        item('assistant-old-2', 2, 'assistant', 'old answer 2', {
+          turn_id: 'turn-old',
+          agent_iteration: 2,
+          message: { role: 'assistant', content: { inline: 'old answer 2' }, reasoning: 'durable old two' },
+        }),
+        item('assistant-current', 3, 'assistant', 'current answer', {
+          turn_id: 'turn-current',
+          agent_iteration: 1,
+          message: { role: 'assistant', content: { inline: 'current answer' }, reasoning: 'durable current' },
+        }),
+      ],
+      activeRun: run({
+        turnID: 'turn-current',
+        agentIteration: 2,
+        steps: [
+          { kind: 'reasoning', id: 'old-transient-1', text: 'old transient one', iteration: 1, turnID: 'turn-old', itemID: 'assistant-old-1' },
+          { kind: 'reasoning', id: 'old-transient-2', text: 'old transient two', iteration: 2, turnID: 'turn-old', itemID: 'assistant-old-2' },
+          { kind: 'reasoning', id: 'current-transient', text: 'current not durable yet', iteration: 2, turnID: 'turn-current', itemID: 'assistant-current-2' },
+          { kind: 'tool', id: 'current-tool', name: 'shell', status: 'requested', iteration: 2 },
+        ],
+        assistantItems: {
+          'turn-old:1': { itemID: 'assistant-old-1', durableTextLength: 12 },
+          'turn-old:2': { itemID: 'assistant-old-2', durableTextLength: 12 },
+          'turn-current:1': { itemID: 'assistant-current', durableTextLength: 14 },
+        },
+      }),
+    })
+
+    const processSteps = rows.flatMap((row) => row.kind === 'process' || row.kind === 'active-process' ? row.steps : [])
+    expect(processSteps.filter((step) => step.kind === 'reasoning').map((step) => step.text)).toEqual([
+      'durable old one',
+      'durable old two',
+      'durable current',
+      'current not durable yet',
+    ])
+    expect(processSteps.filter((step) => step.kind === 'reasoning' && step.itemID?.startsWith('assistant-old'))).toHaveLength(0)
+    expect(processSteps).toContainEqual(expect.objectContaining({ kind: 'tool', id: 'current-tool', status: 'requested' }))
+    expect(rows.filter((row) => row.kind === 'active-process')).toHaveLength(1)
+  })
+
+  it('keeps same-text reasoning when an explicit item identity does not match', () => {
+    const rows = buildConversationRows({
+      sessionID: 'session-1',
+      items: [item('assistant-durable', 1, 'assistant', 'answer', {
+        turn_id: 'turn-live',
+        agent_iteration: 1,
+        message: { role: 'assistant', content: { inline: 'answer' }, reasoning: 'same reasoning' },
+      })],
+      activeRun: run({
+        steps: [{ kind: 'reasoning', id: 'other-item', text: 'same reasoning', iteration: 1, turnID: 'turn-live', itemID: 'assistant-other' }],
+        assistantItems: { 'turn-live:1': { itemID: 'assistant-durable', durableTextLength: 6 } },
+      }),
+    })
+
+    const reasoningSteps = rows.flatMap((row) => row.kind === 'process' || row.kind === 'active-process' ? row.steps : [])
+      .filter((step) => step.kind === 'reasoning')
+    expect(reasoningSteps.map((step) => step.text)).toEqual(['same reasoning', 'same reasoning'])
+    expect(reasoningSteps.some((step) => step.itemID === 'assistant-other')).toBe(true)
+  })
+
+  it('drops emptied old segments but keeps one generating cursor when no output remains', () => {
+    const rows = buildConversationRows({
+      sessionID: 'session-1',
+      items: [item('assistant-old', 1, 'assistant', 'old answer', {
+        turn_id: 'turn-old',
+        agent_iteration: 1,
+        message: { role: 'assistant', content: { inline: 'old answer' }, reasoning: 'durable old reasoning' },
+      })],
+      activeRun: run({
+        turnID: 'turn-current',
+        agentIteration: 1,
+        steps: [{ kind: 'reasoning', id: 'old-transient', text: 'old transient', iteration: 1, turnID: 'turn-old', itemID: 'assistant-old' }],
+        assistantItems: { 'turn-old:1': { itemID: 'assistant-old', durableTextLength: 10 } },
+      }),
+    })
+
+    const active = rows.filter((row) => row.kind === 'active-process')
+    expect(active).toHaveLength(1)
+    expect(active[0]).toMatchObject({ steps: [] })
   })
 
   it('retains prior-segment reasoning when the current turn reuses its iteration number', () => {

@@ -164,7 +164,7 @@ func (s *sessionEventSink) submit(event SessionStreamEvent) {
 		turnID, _ := event["turn_id"].(string)
 		agentIteration, _ := event["agent_iteration"].(int)
 		assistantItemID, _ := event["item_id"].(string)
-		hasAssistantBinding := eventType == "text.delta" && assistantItemID != ""
+		hasAssistantBinding := assistantItemID != ""
 		durableTextLength, _ := sessionStreamInteger(event["durable_text_length"])
 		durableCheckpointed, _ := event["durable_checkpointed"].(bool)
 		if n := len(s.ops); n > 0 {
@@ -172,7 +172,8 @@ func (s *sessionEventSink) submit(event SessionStreamEvent) {
 			if last.isDelta && last.eventType == eventType && last.turnID == turnID && last.agentIteration == agentIteration &&
 				last.hasAssistantBinding == hasAssistantBinding &&
 				(!hasAssistantBinding || (last.assistantItemID == assistantItemID &&
-					last.durableCheckpointed == durableCheckpointed && last.durableTextLength == durableTextLength)) {
+					(eventType != "text.delta" ||
+						(last.durableCheckpointed == durableCheckpointed && last.durableTextLength == durableTextLength)))) {
 				last.text.WriteString(text)
 				s.mu.Unlock()
 				return
@@ -234,8 +235,10 @@ func (s *sessionEventSink) run() {
 				}
 				if op.hasAssistantBinding {
 					fields["item_id"] = op.assistantItemID
-					fields["durable_text_length"] = op.durableTextLength
-					fields["durable_checkpointed"] = op.durableCheckpointed
+					if op.eventType == "text.delta" {
+						fields["durable_text_length"] = op.durableTextLength
+						fields["durable_checkpointed"] = op.durableCheckpointed
+					}
 				}
 				s.emit(NewSessionStreamEvent(op.eventType, fields))
 			} else {
@@ -712,9 +715,11 @@ func sessionStreamEventFromModelEvent(turnID string, agentIteration int, event m
 		if !showReasoning || event.Text == "" {
 			return nil, false
 		}
-		return modelSessionStreamEvent("reasoning.delta", turnID, agentIteration, map[string]any{
-			"text": event.Text,
-		}), true
+		fields := map[string]any{"text": event.Text}
+		if event.AssistantItemID != "" {
+			fields["item_id"] = event.AssistantItemID
+		}
+		return modelSessionStreamEvent("reasoning.delta", turnID, agentIteration, fields), true
 	case model.ToolCallDoneEvent:
 		if event.ToolCall.Name == "" {
 			return nil, false
