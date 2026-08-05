@@ -219,6 +219,68 @@
       }
     },
     {
+      "name": "session_content_snapshot_inline",
+      "message": {
+        "version": 1,
+        "type": "snapshot",
+        "id": "session_content_snapshot_1",
+        "payload": {
+          "subscription_id": "session-content:session_2",
+          "resource": {
+            "type": "session_content",
+            "id": "session_2"
+          },
+          "stream_epoch": "stream_session_content_1",
+          "sequence": "0",
+          "resource_revision": "12",
+          "content": {
+            "inline": {
+              "schema_version": 1,
+              "session": {
+                "id": "session_2",
+                "version": 2,
+                "created_at": "2025-03-08T12:00:00Z",
+                "updated_at": "2025-03-08T12:00:01Z",
+                "archived": false,
+                "last_used_at": "2025-03-08T12:00:01Z",
+                "has_unread_result": false,
+                "provider": "codex",
+                "model_profile": "default",
+                "model_id": "codex/gpt-5.6-luna",
+                "status": "idle",
+                "show_reasoning": false,
+                "full_access": false,
+                "debug": {
+                  "request_bodies": false
+                },
+                "context": {
+                  "context_window": 0,
+                  "context_window_source": "unknown",
+                  "warning_threshold_percent": 0
+                },
+                "save_tool_results": false
+              },
+              "history": {
+                "items": [],
+                "descriptor": {
+                  "limit": 50,
+                  "align_turn": false,
+                  "visible_only": true,
+                  "has_more_before": false,
+                  "has_more_after": false
+                }
+              },
+              "active_run": null,
+              "compaction": {
+                "checkpoints": [],
+                "truncated": false
+              }
+            }
+          }
+        }
+      }
+    },
+    {
       "name": "change",
       "message": {
         "version": 1,
@@ -274,9 +336,22 @@
               "op": "active_run.replace",
               "active_run": {
                 "run_id": "run_9",
-                "status": "running"
+                "session_id": "session_2",
+                "started_at": "2025-03-08T12:00:00Z",
+                "status": "running",
+                "recoverable": true
               },
               "changed_by": "run_coordinator"
+            },
+            {
+              "op": "history.window.descriptor.replace",
+              "descriptor": {
+                "limit": 50,
+                "align_turn": false,
+                "visible_only": true,
+                "has_more_before": true,
+                "has_more_after": false
+              }
             }
           ]
         }

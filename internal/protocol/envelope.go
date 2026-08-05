@@ -3,7 +3,18 @@ package protocol
 import (
 	"bytes"
 	"encoding/json"
+	"unicode/utf8"
 )
+
+// DefaultMaxMessageBytes is the single V1 frame-size contract. Transport
+// implementations and resource producers must use this value rather than
+// maintaining independent defaults.
+const DefaultMaxMessageBytes = 256 * 1024
+
+// MaxWireIdentifierBytes bounds IDs which are repeated in protocol envelopes
+// and resource payloads. It leaves room for resource operations and envelope
+// fields inside the frame limit.
+const MaxWireIdentifierBytes = 4096
 
 // MessageType is the discriminant carried by every V1 protocol envelope.
 type MessageType string
@@ -326,6 +337,12 @@ func isNonEmpty(value string) bool {
 func requiredString(field, value string) error {
 	if !isNonEmpty(value) {
 		return invalidField(field, "must be a non-empty string")
+	}
+	if !utf8.ValidString(value) {
+		return invalidField(field, "must be valid UTF-8")
+	}
+	if len(value) > MaxWireIdentifierBytes {
+		return invalidField(field, "exceeds the maximum wire identifier length")
 	}
 	return nil
 }

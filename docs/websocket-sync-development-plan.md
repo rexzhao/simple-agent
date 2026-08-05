@@ -241,13 +241,16 @@ type OpenedResource struct {
 metadata.replace
 item.upsert
 item.remove
-history.window.replace
+history.window.replace (legacy input only; D1 does not emit a full window)
+history.window.descriptor.replace
 active_run.replace
 active_run.clear
 compaction.replace
 ```
 
 不采用无限制 JSON Patch。所有操作由 schema 校验，并以 stable item ID 定位，不能按文本或数组位置匹配。
+
+D1 不在 live change 中重复发送可能很大的完整 history window。每个窗口变化先发送 `item.upsert`/`item.remove`，并在同一 Change 中发送有界的 `history.window.descriptor.replace`：该操作只替换 `before/after` cursor、`oldest/newest`、`has_more`、`limit` 等 descriptor 字段。客户端按 stable `(turn_id, agent_iteration, item_id)` 应用同一 Change 内的 item 操作，再原子替换 descriptor；不得从数组下标推导边界。`history.window.replace` 仅作为兼容性 schema 名称保留，D1 provider 不产生完整 window operation。
 
 ## 5. Wire protocol
 
@@ -471,6 +474,13 @@ HEAD /api/blobs/{blobID}
 - 无法补发时发送 `resync_required`，客户端重新加载 Session snapshot 和 active run descriptor；
 - 未订阅 `session_content` 的连接不接收该 Session 的 transient event。
 
+V1 的默认 text frame 上限由 `protocol.DefaultMaxMessageBytes` 与 gateway
+共享（当前为 256 KiB）。Resource provider 在写入 journal 前按完整
+`protocol.ChangeMessage` envelope（含 subscription/resource/epoch/sequence、
+revision 和 envelope ID 的合法上界）做 preflight；`MaxChangeMessageBytes`
+必须不大于 journal byte bound。超过上限的 durable mutation 只使该 resource
+进入 bounded resync/error，不得让 gateway 因发送超大 frame 而关闭整条连接。
+
 ### 5.7 Command
 
 ```json
@@ -583,6 +593,7 @@ item.upsert
 item.remove
 active_run.replace
 active_run.clear
+history.window.descriptor.replace
 history/compaction revision change
 ```
 
@@ -1046,15 +1057,20 @@ Blob 要求：
 
 ### 阶段 D：重建 Session Content 和 Run 实时流
 
+当前 D1 只交付后端 durable Session Content provider、严格 snapshot/typed durable
+operations、replay/resync 与 HTTP Blob data plane；不包含 transient run stream 或前端
+adapter。D2 再接入 bounded transient run stream、run cursor/settlement watermark 归并，
+D3 再实现前端 SessionContentStore/Repository cutover。
+
 交付：
 
 - Session snapshot provider；
 - durable item operations；
-- transient run event；
-- active run recovery；
-- history Blob/分页；
-- 前端 SessionContentStore；
-- settlement watermark 归并。
+- active run recovery（D1 durable baseline）；
+- transient run event（D2）；
+- history Blob/分页 command（D2/D3，D1 只定义 bounded window/cursor contract）；
+- 前端 SessionContentStore（D3）；
+- settlement watermark 归并（D2）。
 
 随后删除后端 per-run SSE renderer 和前端 run SSE parser，不保留双实现。
 

@@ -146,6 +146,17 @@ func New(options Options) (*Store, error) {
 }
 
 func (s *Store) Put(ctx context.Context, contentType string, content []byte) (protocol.BlobDescriptor, error) {
+	return s.put(ctx, contentType, content, false)
+}
+
+// PutFresh stores a new descriptor even when the same immutable bytes already
+// exist. It is used by consumers that intentionally refresh a descriptor
+// before its expiry; ordinary Put remains content-addressed and deduplicating.
+func (s *Store) PutFresh(ctx context.Context, contentType string, content []byte) (protocol.BlobDescriptor, error) {
+	return s.put(ctx, contentType, content, true)
+}
+
+func (s *Store) put(ctx context.Context, contentType string, content []byte, forceFresh bool) (protocol.BlobDescriptor, error) {
 	if s == nil {
 		return protocol.BlobDescriptor{}, ErrClosed
 	}
@@ -174,9 +185,11 @@ func (s *Store) Put(ctx context.Context, contentType string, content []byte) (pr
 		return protocol.BlobDescriptor{}, ErrClosed
 	}
 	s.sweepLocked(now)
-	for _, item := range s.blobs {
-		if item.descriptor.SHA256 == digestHex && item.descriptor.ContentType == contentType && now.Before(item.expires) {
-			return item.descriptor, nil
+	if !forceFresh {
+		for _, item := range s.blobs {
+			if item.descriptor.SHA256 == digestHex && item.descriptor.ContentType == contentType && now.Before(item.expires) {
+				return item.descriptor, nil
+			}
 		}
 	}
 	if len(s.blobs) >= s.maxEntries || s.bytes+int64(len(content)) > s.maxBytes {

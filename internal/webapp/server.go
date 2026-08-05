@@ -20,6 +20,7 @@ import (
 	"github.com/rexzhao/simple-agent/internal/blobstore"
 	"github.com/rexzhao/simple-agent/internal/execution"
 	projectstore "github.com/rexzhao/simple-agent/internal/projects"
+	"github.com/rexzhao/simple-agent/internal/sessioncontent"
 	"github.com/rexzhao/simple-agent/internal/sessionindex"
 	"github.com/rexzhao/simple-agent/internal/sessions"
 	"github.com/rexzhao/simple-agent/internal/syncengine"
@@ -46,21 +47,23 @@ type ServerOptions struct {
 }
 
 type Server struct {
-	service          *execution.Service
-	token            string
-	cwd              string
-	ctx              context.Context
-	cancel           context.CancelFunc
-	mux              *http.ServeMux
-	runs             *runRegistry
-	codexLogins      *codexLoginRegistry
-	wsTickets        *wsgateway.TicketStore
-	wsGateway        *wsgateway.Gateway
-	wsDispatcher     *wsgateway.Dispatcher
-	sessionIndex     *sessionindex.Provider
-	blobStore        *blobstore.Store
-	blobStoreOwned   bool
-	sinkRegistration *execution.SessionIndexSinkRegistration
+	service             *execution.Service
+	token               string
+	cwd                 string
+	ctx                 context.Context
+	cancel              context.CancelFunc
+	mux                 *http.ServeMux
+	runs                *runRegistry
+	codexLogins         *codexLoginRegistry
+	wsTickets           *wsgateway.TicketStore
+	wsGateway           *wsgateway.Gateway
+	wsDispatcher        *wsgateway.Dispatcher
+	sessionIndex        *sessionindex.Provider
+	sessionContent      *sessioncontent.Provider
+	blobStore           *blobstore.Store
+	blobStoreOwned      bool
+	sinkRegistration    *execution.SessionIndexSinkRegistration
+	contentRegistration *sessions.MutationSinkRegistration
 }
 
 func NewServer(options ServerOptions) (*Server, error) {
@@ -97,8 +100,13 @@ func NewServer(options ServerOptions) (*Server, error) {
 	gateway := options.WebSocketGateway
 	var dispatcher *wsgateway.Dispatcher
 	var sessionIndexProvider *sessionindex.Provider
+	var sessionContentProvider *sessioncontent.Provider
 	var sinkRegistration *execution.SessionIndexSinkRegistration
+	var contentRegistration *sessions.MutationSinkRegistration
 	cleanupAssembly := func() {
+		if contentRegistration != nil {
+			contentRegistration.Unregister()
+		}
 		if sinkRegistration != nil {
 			sinkRegistration.Unregister()
 		}
@@ -107,6 +115,9 @@ func NewServer(options ServerOptions) (*Server, error) {
 		}
 		if sessionIndexProvider != nil {
 			sessionIndexProvider.Close()
+		}
+		if sessionContentProvider != nil {
+			sessionContentProvider.Close()
 		}
 		if blobStoreOwned && blobStore != nil {
 			blobStore.Close()
@@ -149,8 +160,31 @@ func NewServer(options ServerOptions) (*Server, error) {
 				cleanupAssembly()
 				return nil, fmt.Errorf("warm session index provider: %w", err)
 			}
+			sessionContentProvider, err = sessioncontent.NewProvider(options.Service.SessionStore(), sessioncontent.ProviderOptions{
+				StreamEpoch:           serverEpoch,
+				OwnerContext:          ctx,
+				BlobWriter:            blobStore,
+				MaxChangeMessageBytes: wsgateway.DefaultMaxMessageBytes,
+			})
+			if err != nil {
+				cleanupAssembly()
+				return nil, err
+			}
+			contentRegistration = options.Service.SessionStore().RegisterMutationSink(sessionContentProvider)
+			if contentRegistration == nil {
+				cleanupAssembly()
+				return nil, fmt.Errorf("session content mutation registration failed")
+			}
+			if err := sessionContentProvider.Warm(ctx); err != nil {
+				cleanupAssembly()
+				return nil, fmt.Errorf("warm session content provider: %w", err)
+			}
 			providers := syncengine.NewProviderRegistry()
 			if err := providers.Register(sessionIndexProvider); err != nil {
+				cleanupAssembly()
+				return nil, err
+			}
+			if err := providers.Register(sessionContentProvider); err != nil {
 				cleanupAssembly()
 				return nil, err
 			}
@@ -182,19 +216,21 @@ func NewServer(options ServerOptions) (*Server, error) {
 		}
 	}
 	server := &Server{
-		service:          options.Service,
-		token:            options.Token,
-		cwd:              options.CWD,
-		ctx:              ctx,
-		cancel:           cancel,
-		mux:              http.NewServeMux(),
-		wsTickets:        ticketStore,
-		wsGateway:        gateway,
-		wsDispatcher:     dispatcher,
-		sessionIndex:     sessionIndexProvider,
-		blobStore:        blobStore,
-		blobStoreOwned:   blobStoreOwned,
-		sinkRegistration: sinkRegistration,
+		service:             options.Service,
+		token:               options.Token,
+		cwd:                 options.CWD,
+		ctx:                 ctx,
+		cancel:              cancel,
+		mux:                 http.NewServeMux(),
+		wsTickets:           ticketStore,
+		wsGateway:           gateway,
+		wsDispatcher:        dispatcher,
+		sessionIndex:        sessionIndexProvider,
+		sessionContent:      sessionContentProvider,
+		blobStore:           blobStore,
+		blobStoreOwned:      blobStoreOwned,
+		sinkRegistration:    sinkRegistration,
+		contentRegistration: contentRegistration,
 	}
 	server.runs = newRunRegistry(ctx, options.Service, options.LogWriter)
 	server.codexLogins = newCodexLoginRegistry(ctx, options.Service)
@@ -249,8 +285,14 @@ func (s *Server) Close() {
 	if s.sinkRegistration != nil {
 		s.sinkRegistration.Unregister()
 	}
+	if s.contentRegistration != nil {
+		s.contentRegistration.Unregister()
+	}
 	if s.sessionIndex != nil {
 		s.sessionIndex.Close()
+	}
+	if s.sessionContent != nil {
+		s.sessionContent.Close()
 	}
 	if s.blobStore != nil && s.blobStoreOwned {
 		s.blobStore.Close()

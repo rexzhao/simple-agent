@@ -127,6 +127,164 @@ export interface SnapshotPayload {
 // own the operation-specific fields and schemas.
 export type ChangeOperation = JsonObject & { op: string }
 
+// Durable session-content schema (D1). These types describe the strict
+// resource adapter payload while ChangeOperation remains open for other
+// resources at the protocol boundary.
+export interface SessionContentSnapshot {
+  schema_version: 1
+  session: SessionContentMetadata
+  history: SessionContentHistoryWindow
+  active_run: SessionContentActiveRun | null
+  compaction: SessionContentCompaction
+}
+
+export type SessionContentSessionStatus = 'idle' | 'running' | 'failed' | 'interrupted'
+export type SessionContentCreatedBy = 'user' | 'agent'
+export type SessionContentItemKind = 'message' | 'compaction' | 'runtime_context'
+export type SessionContentVisibility = 'visible' | 'hidden' | 'debug'
+export type SessionContentAudience = 'user' | 'model' | 'internal'
+export type SessionContentItemStatus = 'pending' | 'completed' | 'error' | 'interrupted'
+export type SessionContentRunStatus = 'running' | 'committed' | 'failed' | 'interrupted' | 'cancelled'
+export type SessionContentRole = 'system' | 'developer' | 'user' | 'assistant' | 'tool' | 'provider'
+
+export interface SessionContentMetadata {
+  id: string
+  version: number
+  created_at: string
+  updated_at: string
+  display_name?: string
+  created_by?: SessionContentCreatedBy
+  parent_session_id?: string
+  root_session_id?: string
+  spawn_depth?: number
+  archived: boolean
+  archived_at?: string
+  last_used_at: string
+  current_run_id?: string
+  running_run_id?: string
+  running_turn_id?: string
+  interrupted_run_id?: string
+  interrupted_turn_id?: string
+  interrupted_at?: string
+  latest_run_id?: string
+  last_run_id?: string
+  last_run_status?: SessionContentRunStatus
+  has_unread_result: boolean
+  provider?: string
+  model_profile?: string
+  model_id?: string
+  pricing?: JsonObject
+  reasoning_level?: string
+  model_parameters?: JsonObject
+  status: SessionContentSessionStatus
+  project_id?: string
+  cwd?: string
+  created_cwd?: string
+  config_path?: string
+  config_dir?: string
+  enabled_tools?: string[]
+  enabled_mcp?: string[]
+  enabled_skills?: string[]
+  show_reasoning: boolean
+  full_access: boolean
+  debug: { request_bodies: boolean }
+  context: JsonObject
+  save_tool_results: boolean
+  active_history?: string[]
+}
+
+export interface SessionContentHistoryWindow {
+  items: SessionContentItem[]
+  descriptor: SessionContentHistoryDescriptor
+}
+
+export interface SessionContentHistoryDescriptor {
+  limit: number
+  before_item_seq?: string
+  after_item_seq?: string
+  align_turn: boolean
+  visible_only: boolean
+  oldest_item_seq?: string
+  newest_item_seq?: string
+  has_more_before: boolean
+  has_more_after: boolean
+}
+
+export interface SessionContentItemKey {
+  turn_id: string
+  agent_iteration: number
+  item_id: string
+}
+
+export interface SessionContentItem {
+  key: SessionContentItemKey
+  seq: number
+  created_at: string
+  kind: SessionContentItemKind
+  visibility: SessionContentVisibility
+  audience: SessionContentAudience
+  status?: SessionContentItemStatus
+  message?: SessionContentMessage
+}
+
+export interface SessionContentMessage {
+  role: SessionContentRole
+  content?: SessionContentText
+  reasoning?: SessionContentText
+  images?: { hash: string; media_type: string; size_bytes: number }[]
+  tool_call_id?: string
+  tool_calls?: { id: string; name: string; arguments?: SessionContentText }[]
+  is_error?: boolean
+}
+
+export interface SessionContentText {
+  inline?: string
+  preview?: string
+  blob?: BlobDescriptor
+  /** Optional only for legacy inline records; D1 projections always set it. */
+  content_type?: 'text/plain' | 'text/plain; charset=utf-8' | 'application/json'
+  truncated?: boolean
+}
+
+export interface SessionContentActiveRun {
+  run_id: string
+  session_id: string
+  turn_id?: string
+  started_at: string
+  status: 'running'
+  recoverable: boolean
+}
+
+export interface SessionContentCompaction {
+  checkpoints: SessionContentCompactionCheckpoint[]
+  truncated: boolean
+}
+
+export interface SessionContentCompactionCheckpoint {
+  id: string
+  created_at: string
+  reason: string
+  phase: string
+  trigger: string
+  summary_item_id: string
+  from_item_id?: string
+  to_item_id?: string
+  previous_active_history?: string[]
+  replacement_history: string[]
+  summary_provider?: string
+  summary_model?: string
+}
+
+export type SessionContentOperation =
+  | { op: 'metadata.replace'; metadata: SessionContentMetadata }
+  | { op: 'item.upsert'; item: SessionContentItem }
+  | { op: 'item.remove'; key: SessionContentItemKey }
+  | { op: 'history.window.replace'; window: SessionContentHistoryWindow }
+  | { op: 'history.window.descriptor.replace'; descriptor: SessionContentHistoryDescriptor }
+  | { op: 'active_run.replace'; active_run: SessionContentActiveRun }
+  | { op: 'active_run.clear' }
+  | { op: 'compaction.replace'; compaction: SessionContentCompaction }
+
 export interface ChangePayload {
   subscription_id: string
   resource: ResourceKey

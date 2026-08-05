@@ -13,6 +13,8 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -328,6 +330,182 @@ type HistoryPage struct {
 type V2Store struct {
 	root string
 	now  func() time.Time
+
+	mutationMu    sync.RWMutex
+	mutationSinks map[uint64]*mutationSubscription
+	nextSinkID    uint64
+}
+
+// Mutation is a post-commit notification from the durable session store. It
+// deliberately contains no presentation payload: consumers must reload the
+// authoritative state from the store. Revision is the session's durable
+// LastSeq and is not a WebSocket stream sequence.
+type Mutation struct {
+	SessionID string
+	ProjectID string
+	Revision  int64
+	Deleted   bool
+	// Overflow means that one or more post-commit notifications were dropped
+	// by the bounded store-owned fanout queue. Consumers must discard any
+	// cached projection and rebuild from the durable source.
+	Overflow bool
+}
+
+// MutationSink is a non-blocking post-commit callback. The store owns the
+// bounded queue and invokes this callback only on its registration worker;
+// SQLite commit paths never invoke arbitrary sink code. Implementations must
+// return promptly (normally by enqueueing into their own bounded projector
+// queue), because Unregister waits for an in-flight callback to finish.
+type MutationSink interface {
+	PublishMutation(Mutation) error
+}
+
+// MutationSinkRegistration detaches one store observer without disturbing
+// other owners of the same store.
+type MutationSinkRegistration struct {
+	store *V2Store
+	sub   *mutationSubscription
+	once  sync.Once
+}
+
+type MutationSinkOptions struct {
+	QueueCapacity int
+}
+
+const defaultMutationSinkQueueCapacity = 256
+const defaultMaxMutationSinks = 1024
+
+type mutationSubscription struct {
+	sink     MutationSink
+	queue    chan Mutation
+	stop     chan struct{}
+	done     chan struct{}
+	mu       sync.Mutex
+	closed   bool
+	overflow atomic.Bool
+}
+
+func (r *MutationSinkRegistration) Unregister() {
+	if r == nil || r.store == nil {
+		return
+	}
+	r.once.Do(func() {
+		if r.sub == nil {
+			return
+		}
+		r.store.mutationMu.Lock()
+		for id, sub := range r.store.mutationSinks {
+			if sub == r.sub {
+				delete(r.store.mutationSinks, id)
+				break
+			}
+		}
+		r.store.mutationMu.Unlock()
+		r.sub.close()
+	})
+}
+
+// RegisterMutationSink attaches a store-owned bounded post-commit projector.
+// A durable commit only performs a non-blocking queue offer; it never calls
+// the sink synchronously.
+func (s *V2Store) RegisterMutationSink(sink MutationSink) *MutationSinkRegistration {
+	return s.RegisterMutationSinkWithOptions(sink, MutationSinkOptions{})
+}
+
+// RegisterMutationSinkWithOptions creates a store-owned bounded notification
+// queue. SQLite commit paths only perform a bounded channel send; arbitrary
+// sink code runs on the registration worker and can never block a durable
+// session write.
+func (s *V2Store) RegisterMutationSinkWithOptions(sink MutationSink, options MutationSinkOptions) *MutationSinkRegistration {
+	if s == nil || sink == nil {
+		return nil
+	}
+	if options.QueueCapacity <= 0 {
+		options.QueueCapacity = defaultMutationSinkQueueCapacity
+	}
+	sub := &mutationSubscription{
+		sink:  sink,
+		queue: make(chan Mutation, options.QueueCapacity),
+		stop:  make(chan struct{}),
+		done:  make(chan struct{}),
+	}
+	s.mutationMu.Lock()
+	defer s.mutationMu.Unlock()
+	if s.mutationSinks == nil {
+		s.mutationSinks = make(map[uint64]*mutationSubscription)
+	}
+	if len(s.mutationSinks) >= defaultMaxMutationSinks {
+		return nil
+	}
+	s.nextSinkID++
+	id := s.nextSinkID
+	s.mutationSinks[id] = sub
+	go sub.run()
+	return &MutationSinkRegistration{store: s, sub: sub}
+}
+
+func (s *V2Store) publishMutation(mutation Mutation) {
+	if s == nil || strings.TrimSpace(mutation.SessionID) == "" {
+		return
+	}
+	s.mutationMu.RLock()
+	sinks := make([]*mutationSubscription, 0, len(s.mutationSinks))
+	for _, sink := range s.mutationSinks {
+		sinks = append(sinks, sink)
+	}
+	s.mutationMu.RUnlock()
+	for _, sink := range sinks {
+		sink.offer(mutation)
+	}
+}
+
+func (s *mutationSubscription) offer(mutation Mutation) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return
+	}
+	select {
+	case s.queue <- mutation:
+	default:
+		s.overflow.Store(true)
+	}
+}
+
+func (s *mutationSubscription) run() {
+	defer close(s.done)
+	for {
+		if s.overflow.Swap(false) {
+			// An empty session ID is an intentional global invalidation marker.
+			// The receiver must rebuild all owners from durable state.
+			_ = s.sink.PublishMutation(Mutation{Overflow: true})
+		}
+		select {
+		case <-s.stop:
+			return
+		case mutation := <-s.queue:
+			_ = s.sink.PublishMutation(mutation)
+		}
+	}
+}
+
+func (s *mutationSubscription) close() {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		<-s.done
+		return
+	}
+	s.closed = true
+	close(s.stop)
+	s.mu.Unlock()
+	<-s.done
 }
 
 func NewV2Store(root string) *V2Store { return newV2StoreWithClock(root, time.Now) }
@@ -551,6 +729,7 @@ func (s *V2Store) SaveMetadata(session SessionV2) (SessionV2, error) {
 	if err := tx.Commit(); err != nil {
 		return SessionV2{}, fmt.Errorf("commit session state: %w", err)
 	}
+	s.publishMutation(Mutation{SessionID: session.ID, ProjectID: session.ProjectID, Revision: session.LastSeq})
 	return copySessionV2(session), nil
 }
 
@@ -695,6 +874,10 @@ func (s *V2Store) Delete(id string) error {
 	if err := validateV2SessionID(id); err != nil {
 		return err
 	}
+	state, err := s.LoadState(id)
+	if err != nil {
+		return err
+	}
 	if _, err := os.Stat(s.sessionDir(id)); err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return fmt.Errorf("%w: %s", ErrNotFound, id)
@@ -704,6 +887,7 @@ func (s *V2Store) Delete(id string) error {
 	if err := os.RemoveAll(s.sessionDir(id)); err != nil {
 		return fmt.Errorf("delete session %q: %w", id, err)
 	}
+	s.publishMutation(Mutation{SessionID: id, ProjectID: state.ProjectID, Revision: state.LastSeq, Deleted: true})
 	return nil
 }
 
@@ -746,6 +930,7 @@ func (s *V2Store) MarkRead(sessionID, runID string) (SessionV2, bool, error) {
 	if err := tx.Commit(); err != nil {
 		return SessionV2{}, false, fmt.Errorf("commit mark read: %w", err)
 	}
+	s.publishMutation(Mutation{SessionID: state.ID, ProjectID: state.ProjectID, Revision: state.LastSeq})
 	return state, true, nil
 }
 
@@ -830,6 +1015,7 @@ func (s *V2Store) CreateRun(sessionID, runID, previousRunID string, inputPayload
 	if err := tx.Commit(); err != nil {
 		return RunRecord{}, fmt.Errorf("commit run creation: %w", err)
 	}
+	s.publishMutation(Mutation{SessionID: state.ID, ProjectID: state.ProjectID, Revision: state.LastSeq})
 	return RunRecord{ID: runID, PreviousRunID: previousRunID, Status: RunStatusRunning, InputPayload: append([]byte(nil), inputPayload...), StartedAt: startedAt}, nil
 }
 
@@ -891,6 +1077,7 @@ func (s *V2Store) StartTurn(sessionID, runID, turnID string, ordinal int, starte
 	if err := tx.Commit(); err != nil {
 		return TurnRecord{}, err
 	}
+	s.publishMutation(Mutation{SessionID: state.ID, ProjectID: state.ProjectID, Revision: state.LastSeq})
 	return TurnRecord{ID: turnID, RunID: runID, Ordinal: ordinal, Status: TurnStatusRunning, StartedAt: startedAt}, nil
 }
 
@@ -985,6 +1172,7 @@ func (s *V2Store) SetTurnStatus(sessionID, runID, turnID, status string, settled
 	if err := tx.Commit(); err != nil {
 		return SessionV2{}, err
 	}
+	s.publishMutation(Mutation{SessionID: state.ID, ProjectID: state.ProjectID, Revision: state.LastSeq})
 	return state, nil
 }
 
@@ -1128,6 +1316,7 @@ func (s *V2Store) SetRunStatus(sessionID, runID, status string, settledAt time.T
 	if err := tx.Commit(); err != nil {
 		return SessionV2{}, err
 	}
+	s.publishMutation(Mutation{SessionID: state.ID, ProjectID: state.ProjectID, Revision: state.LastSeq})
 	return state, nil
 }
 
@@ -1379,6 +1568,7 @@ func (s *V2Store) mutateLifecycle(sessionID string, mutate func(*SessionV2, time
 	if err := tx.Commit(); err != nil {
 		return SessionV2{}, fmt.Errorf("commit lifecycle mutation: %w", err)
 	}
+	s.publishMutation(Mutation{SessionID: state.ID, ProjectID: state.ProjectID, Revision: state.LastSeq})
 	return state, nil
 }
 
@@ -1543,6 +1733,7 @@ func (s *V2Store) recoverRunningSession(sessionID string) (SessionV2, error) {
 	if err := tx.Commit(); err != nil {
 		return SessionV2{}, err
 	}
+	s.publishMutation(Mutation{SessionID: state.ID, ProjectID: state.ProjectID, Revision: state.LastSeq})
 	return state, nil
 }
 
@@ -2312,6 +2503,7 @@ func (s *V2Store) appendEvents(sessionID string, state SessionV2, events []store
 	if err := tx.Commit(); err != nil {
 		return SessionV2{}, fmt.Errorf("commit session event transaction: %w", err)
 	}
+	s.publishMutation(Mutation{SessionID: nextState.ID, ProjectID: nextState.ProjectID, Revision: nextState.LastSeq})
 	return nextState, nil
 }
 

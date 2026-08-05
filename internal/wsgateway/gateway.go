@@ -18,7 +18,7 @@ import (
 )
 
 const (
-	DefaultMaxMessageBytes      = 256 * 1024
+	DefaultMaxMessageBytes      = protocol.DefaultMaxMessageBytes
 	DefaultMaxOutboundMessages  = 1024
 	DefaultMaxOutboundBytes     = 8 * 1024 * 1024
 	DefaultHeartbeatInterval    = 15 * time.Second
