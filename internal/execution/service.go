@@ -24,19 +24,24 @@ import (
 	"github.com/rexzhao/simple-agent/internal/model"
 	"github.com/rexzhao/simple-agent/internal/model/httpstream"
 	projectstore "github.com/rexzhao/simple-agent/internal/projects"
+	"github.com/rexzhao/simple-agent/internal/sessionindex"
 	"github.com/rexzhao/simple-agent/internal/sessionprojector"
 	"github.com/rexzhao/simple-agent/internal/sessions"
 )
 
 type Service struct {
-	serverRoot              string
-	configPath              string
-	projectStore            *projectstore.Store
-	sessionStore            *sessions.V2Store
-	lifecycleHub            *LifecycleHub
-	turnRunner              SessionTurnRunner
-	compactPlanner          SessionCompactPlanner
-	sessionWriteLockTimeout time.Duration
+	serverRoot                string
+	configPath                string
+	projectStore              *projectstore.Store
+	sessionStore              *sessions.V2Store
+	lifecycleHub              *LifecycleHub
+	sessionIndexRegistrations map[uint64]sessionindex.ChangeSink
+	sessionIndexLegacyID      uint64
+	sessionIndexNextID        uint64
+	sessionIndexMu            sync.RWMutex
+	turnRunner                SessionTurnRunner
+	compactPlanner            SessionCompactPlanner
+	sessionWriteLockTimeout   time.Duration
 
 	runCoordinatorMu sync.RWMutex
 	runCoordinator   *SessionRunCoordinator
@@ -186,6 +191,12 @@ type SessionListOptions struct {
 type SessionRemoveResult struct {
 	Status string `json:"status"`
 	ID     string `json:"id"`
+}
+
+type SessionMarkReadResult struct {
+	SessionID string `json:"session_id"`
+	RunID     string `json:"run_id"`
+	Marked    bool   `json:"marked_read"`
 }
 
 type SessionMessageResult struct {
@@ -479,6 +490,98 @@ func (s *Service) LifecycleHub() *LifecycleHub {
 	return s.lifecycleHub
 }
 
+// SessionStore exposes the durable compact-state boundary to application
+// providers. Callers must not mutate the returned store outside its typed
+// methods.
+func (s *Service) SessionStore() *sessions.V2Store {
+	if s == nil {
+		return nil
+	}
+	return s.sessionStore
+}
+
+// SessionIndexSinkRegistration is an owner-scoped attachment. Unregister is
+// compare-and-swap: an old server cannot detach a newer server's sink.
+type SessionIndexSinkRegistration struct {
+	service *Service
+	id      uint64
+	once    sync.Once
+}
+
+func (r *SessionIndexSinkRegistration) Unregister() {
+	if r == nil || r.service == nil {
+		return
+	}
+	r.once.Do(func() {
+		r.service.sessionIndexMu.Lock()
+		delete(r.service.sessionIndexRegistrations, r.id)
+		r.service.sessionIndexMu.Unlock()
+	})
+}
+
+// RegisterSessionIndexChangeSink installs an owner-scoped post-commit adapter.
+// Registrations are fanned out independently; one server cannot make another
+// server's provider stale by replacing a single global sink.
+func (s *Service) RegisterSessionIndexChangeSink(sink sessionindex.ChangeSink) *SessionIndexSinkRegistration {
+	if s == nil || sink == nil {
+		return nil
+	}
+	s.sessionIndexMu.Lock()
+	defer s.sessionIndexMu.Unlock()
+	s.sessionIndexNextID++
+	id := s.sessionIndexNextID
+	if s.sessionIndexRegistrations == nil {
+		s.sessionIndexRegistrations = make(map[uint64]sessionindex.ChangeSink)
+	}
+	s.sessionIndexRegistrations[id] = sink
+	return &SessionIndexSinkRegistration{service: s, id: id}
+}
+
+// SetSessionIndexChangeSink is retained for older tests/adapters. It manages
+// one legacy registration while owner-scoped registrations remain untouched.
+func (s *Service) SetSessionIndexChangeSink(sink sessionindex.ChangeSink) {
+	if s == nil {
+		return
+	}
+	s.sessionIndexMu.Lock()
+	defer s.sessionIndexMu.Unlock()
+	if s.sessionIndexRegistrations == nil {
+		s.sessionIndexRegistrations = make(map[uint64]sessionindex.ChangeSink)
+	}
+	if s.sessionIndexLegacyID != 0 {
+		delete(s.sessionIndexRegistrations, s.sessionIndexLegacyID)
+		s.sessionIndexLegacyID = 0
+	}
+	if sink != nil {
+		s.sessionIndexNextID++
+		s.sessionIndexLegacyID = s.sessionIndexNextID
+		s.sessionIndexRegistrations[s.sessionIndexLegacyID] = sink
+	}
+}
+
+func (s *Service) sessionIndexChangeSinks() []sessionindex.ChangeSink {
+	if s == nil {
+		return nil
+	}
+	s.sessionIndexMu.RLock()
+	defer s.sessionIndexMu.RUnlock()
+	sinks := make([]sessionindex.ChangeSink, 0, len(s.sessionIndexRegistrations))
+	for _, sink := range s.sessionIndexRegistrations {
+		sinks = append(sinks, sink)
+	}
+	return sinks
+}
+
+// sessionIndexChangeSink is kept for compatibility with package-local legacy
+// callers; new projection paths use the complete fanout snapshot above.
+func (s *Service) sessionIndexChangeSink() sessionindex.ChangeSink {
+	sinks := s.sessionIndexChangeSinks()
+	if len(sinks) == 0 {
+		return nil
+	}
+	return sinks[0]
+}
+
 // SetSessionRunCoordinator installs the application-wide active-run owner used
 // by both presentation adapters and session tools. Passing nil detaches it.
 func (s *Service) SetSessionRunCoordinator(coordinator *SessionRunCoordinator) {
@@ -631,6 +734,7 @@ func (s *Service) ArchiveProject(id string) (Project, error) {
 	if err != nil {
 		return Project{}, err
 	}
+	s.publishProjectSessionIndex(project.ID)
 	return projectFromStore(project), nil
 }
 
@@ -649,6 +753,7 @@ func (s *Service) RestoreProject(id string) (Project, error) {
 	if err != nil {
 		return Project{}, err
 	}
+	s.publishProjectSessionIndex(project.ID)
 	return projectFromStore(project), nil
 }
 
@@ -846,6 +951,50 @@ func (s *Service) RenameSession(id, displayName string) (SessionDetail, error) {
 	return sessionDetailFromStore(saved), nil
 }
 
+// MarkSessionRead is the durable command boundary for the server-side result
+// badge. The optional project id is checked when supplied, but the session's
+// durable project id is authoritative and is never inferred from an HTTP URL.
+func (s *Service) MarkSessionRead(id, runID, projectID string) (SessionMarkReadResult, error) {
+	return s.MarkSessionReadContext(context.Background(), id, runID, projectID)
+}
+
+// MarkSessionReadContext is the command-facing form so dispatcher shutdown
+// can cancel a lock wait instead of leaving an owner task behind.
+func (s *Service) MarkSessionReadContext(ctx context.Context, id, runID, projectID string) (SessionMarkReadResult, error) {
+	if s == nil || s.sessionStore == nil {
+		return SessionMarkReadResult{}, fmt.Errorf("execution session store is not configured")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	id = strings.TrimSpace(id)
+	runID = strings.TrimSpace(runID)
+	projectID = strings.TrimSpace(projectID)
+	if id == "" || runID == "" {
+		return SessionMarkReadResult{}, fmt.Errorf("session id and run id are required")
+	}
+	writeLock, err := s.sessionStore.AcquireSessionWriteLock(ctx, id)
+	if err != nil {
+		return SessionMarkReadResult{}, err
+	}
+	defer func() { _ = writeLock.Release() }()
+	state, err := s.sessionStore.LoadState(id)
+	if err != nil {
+		return SessionMarkReadResult{}, err
+	}
+	if projectID != "" && projectID != state.ProjectID {
+		return SessionMarkReadResult{}, fmt.Errorf("session belongs to a different project")
+	}
+	markedState, marked, err := s.sessionStore.MarkRead(id, runID)
+	if err != nil {
+		return SessionMarkReadResult{}, err
+	}
+	if marked {
+		s.publishSessionUpdated(markedState, "mark_read")
+	}
+	return SessionMarkReadResult{SessionID: id, RunID: runID, Marked: marked}, nil
+}
+
 // SetSessionFullAccess toggles the session's full access mode: with full
 // access the file tools accept absolute paths outside the session workspace.
 // The flag is read when a run prepares its tool registry, so a toggle takes
@@ -939,6 +1088,10 @@ func (s *Service) RestoreSession(id string) (SessionDetail, error) {
 	if s == nil || s.sessionStore == nil {
 		return SessionDetail{}, fmt.Errorf("execution session store is not configured")
 	}
+	subtree, err := s.sessionSubtreeIDs(id)
+	if err != nil {
+		return SessionDetail{}, err
+	}
 	writeLock, err := s.acquireSessionMutationLock(id)
 	if err != nil {
 		return SessionDetail{}, err
@@ -963,7 +1116,7 @@ func (s *Service) RestoreSession(id string) (SessionDetail, error) {
 	if err != nil {
 		return SessionDetail{}, err
 	}
-	s.publishSessionUpdated(saved, "restore")
+	s.publishSessionRestored(saved, sessionDescendantIDs(subtree, id))
 	return sessionDetailFromStore(saved), nil
 }
 
@@ -1504,6 +1657,9 @@ func (r *SessionRun) settlePersistent(s *Service, sessionID string, started bool
 	var persistErr error
 	if state, err := s.sessionStore.SetRunStatus(sessionID, r.runID, status, time.Now().UTC()); err == nil {
 		result.LastSeq = state.LastSeq
+		// SetRunStatus has committed the terminal run and unread marker before
+		// the typed session-index projection is advanced.
+		s.publishCommittedRunSettled(sessionID, r.runID, state)
 	} else {
 		persistErr = err
 	}
@@ -2162,6 +2318,9 @@ func (s *Service) runSessionMessage(ctx context.Context, id string, input Sessio
 		if _, createErr := s.sessionStore.CreateRun(id, run.runID, previous, payload, time.Now().UTC()); createErr != nil {
 			return SessionMessageResult{}, createErr
 		}
+		// CreateRun commits the run.started event and running compact state in
+		// one transaction. Only now may the typed provider publish running.
+		s.publishCommittedRunStarted(id, session.ProjectID, run.runID)
 		run.persistentCreated = true
 		// CreateRun advances compact metadata; use it as the projector baseline.
 		session, err = s.sessionStore.LoadExecutionState(id)

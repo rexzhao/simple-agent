@@ -2,7 +2,9 @@ package webapp
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/subtle"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -15,9 +17,12 @@ import (
 	"strings"
 	"time"
 
+	"github.com/rexzhao/simple-agent/internal/blobstore"
 	"github.com/rexzhao/simple-agent/internal/execution"
 	projectstore "github.com/rexzhao/simple-agent/internal/projects"
+	"github.com/rexzhao/simple-agent/internal/sessionindex"
 	"github.com/rexzhao/simple-agent/internal/sessions"
+	"github.com/rexzhao/simple-agent/internal/syncengine"
 	"github.com/rexzhao/simple-agent/internal/wsgateway"
 )
 
@@ -32,23 +37,30 @@ type ServerOptions struct {
 
 	// The gateway and ticket store hooks keep B1 independently testable. The
 	// production defaults use the secure bounded implementations.
-	WebSocketGateway *wsgateway.Gateway
-	WSTicketStore    *wsgateway.TicketStore
-	WSHandler        wsgateway.Handler
-	WSObserver       wsgateway.Observer
+	WebSocketGateway     *wsgateway.Gateway
+	WSTicketStore        *wsgateway.TicketStore
+	WSHandler            wsgateway.Handler
+	WSObserver           wsgateway.Observer
+	SessionIndexObserver sessionindex.Observer
+	BlobStore            *blobstore.Store
 }
 
 type Server struct {
-	service     *execution.Service
-	token       string
-	cwd         string
-	ctx         context.Context
-	cancel      context.CancelFunc
-	mux         *http.ServeMux
-	runs        *runRegistry
-	codexLogins *codexLoginRegistry
-	wsTickets   *wsgateway.TicketStore
-	wsGateway   *wsgateway.Gateway
+	service          *execution.Service
+	token            string
+	cwd              string
+	ctx              context.Context
+	cancel           context.CancelFunc
+	mux              *http.ServeMux
+	runs             *runRegistry
+	codexLogins      *codexLoginRegistry
+	wsTickets        *wsgateway.TicketStore
+	wsGateway        *wsgateway.Gateway
+	wsDispatcher     *wsgateway.Dispatcher
+	sessionIndex     *sessionindex.Provider
+	blobStore        *blobstore.Store
+	blobStoreOwned   bool
+	sinkRegistration *execution.SessionIndexSinkRegistration
 }
 
 func NewServer(options ServerOptions) (*Server, error) {
@@ -62,40 +74,140 @@ func NewServer(options ServerOptions) (*Server, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	ctx, cancel := context.WithCancel(ctx)
 	ticketStore := options.WSTicketStore
 	if ticketStore == nil {
 		var err error
 		ticketStore, err = wsgateway.NewTicketStore(wsgateway.TicketStoreOptions{})
 		if err != nil {
+			cancel()
+			return nil, err
+		}
+	}
+	blobStore := options.BlobStore
+	blobStoreOwned := blobStore == nil
+	if blobStore == nil {
+		var err error
+		blobStore, err = blobstore.New(blobstore.Options{BaseURL: "/api/blobs/"})
+		if err != nil {
+			cancel()
 			return nil, err
 		}
 	}
 	gateway := options.WebSocketGateway
+	var dispatcher *wsgateway.Dispatcher
+	var sessionIndexProvider *sessionindex.Provider
+	var sinkRegistration *execution.SessionIndexSinkRegistration
+	cleanupAssembly := func() {
+		if sinkRegistration != nil {
+			sinkRegistration.Unregister()
+		}
+		if dispatcher != nil {
+			dispatcher.Close()
+		}
+		if sessionIndexProvider != nil {
+			sessionIndexProvider.Close()
+		}
+		if blobStoreOwned && blobStore != nil {
+			blobStore.Close()
+		}
+		cancel()
+	}
 	if gateway == nil {
-		var err error
-		gateway, err = wsgateway.New(wsgateway.Options{
-			Handler:  options.WSHandler,
-			Observer: options.WSObserver,
-		})
-		if err != nil {
-			return nil, err
+		if options.WSHandler != nil {
+			var err error
+			gateway, err = wsgateway.New(wsgateway.Options{
+				Handler:  options.WSHandler,
+				Observer: options.WSObserver,
+			})
+			if err != nil {
+				cleanupAssembly()
+				return nil, err
+			}
+		} else {
+			serverEpoch, err := newServerEpoch()
+			if err != nil {
+				cleanupAssembly()
+				return nil, err
+			}
+			sessionIndexProvider, err = sessionindex.NewProvider(options.Service.SessionStore(), sessionindex.ProviderOptions{
+				StreamEpoch:  serverEpoch,
+				OwnerContext: ctx,
+				Observer:     options.SessionIndexObserver,
+				BlobWriter:   blobStore,
+			})
+			if err != nil {
+				cleanupAssembly()
+				return nil, err
+			}
+			sinkRegistration = options.Service.RegisterSessionIndexChangeSink(sessionIndexProvider)
+			if sinkRegistration == nil {
+				cleanupAssembly()
+				return nil, fmt.Errorf("session index sink registration failed")
+			}
+			if err := sessionIndexProvider.Warm(ctx); err != nil {
+				cleanupAssembly()
+				return nil, fmt.Errorf("warm session index provider: %w", err)
+			}
+			providers := syncengine.NewProviderRegistry()
+			if err := providers.Register(sessionIndexProvider); err != nil {
+				cleanupAssembly()
+				return nil, err
+			}
+			engine, err := syncengine.NewEngine(providers)
+			if err != nil {
+				cleanupAssembly()
+				return nil, err
+			}
+			commandRegistry, err := newSessionCommandRegistry(options.Service)
+			if err != nil {
+				cleanupAssembly()
+				return nil, err
+			}
+			dispatcher, err = wsgateway.NewDispatcher(wsgateway.DispatcherOptions{
+				Engine: engine, Commands: commandRegistry, OwnerContext: ctx,
+				Observer: options.WSObserver,
+			})
+			if err != nil {
+				cleanupAssembly()
+				return nil, err
+			}
+			gateway, err = wsgateway.New(wsgateway.Options{
+				Handler: dispatcher, Observer: options.WSObserver, ServerEpoch: serverEpoch,
+			})
+			if err != nil {
+				cleanupAssembly()
+				return nil, err
+			}
 		}
 	}
-	ctx, cancel := context.WithCancel(ctx)
 	server := &Server{
-		service:   options.Service,
-		token:     options.Token,
-		cwd:       options.CWD,
-		ctx:       ctx,
-		cancel:    cancel,
-		mux:       http.NewServeMux(),
-		wsTickets: ticketStore,
-		wsGateway: gateway,
+		service:          options.Service,
+		token:            options.Token,
+		cwd:              options.CWD,
+		ctx:              ctx,
+		cancel:           cancel,
+		mux:              http.NewServeMux(),
+		wsTickets:        ticketStore,
+		wsGateway:        gateway,
+		wsDispatcher:     dispatcher,
+		sessionIndex:     sessionIndexProvider,
+		blobStore:        blobStore,
+		blobStoreOwned:   blobStoreOwned,
+		sinkRegistration: sinkRegistration,
 	}
 	server.runs = newRunRegistry(ctx, options.Service, options.LogWriter)
 	server.codexLogins = newCodexLoginRegistry(ctx, options.Service)
 	server.routes()
 	return server, nil
+}
+
+func newServerEpoch() (string, error) {
+	var raw [16]byte
+	if _, err := rand.Read(raw[:]); err != nil {
+		return "", err
+	}
+	return "server_" + hex.EncodeToString(raw[:]), nil
 }
 
 func (s *Server) Handler() http.Handler {
@@ -131,6 +243,18 @@ func (s *Server) Close() {
 	if s.cancel != nil {
 		s.cancel()
 	}
+	if s.wsDispatcher != nil {
+		s.wsDispatcher.Close()
+	}
+	if s.sinkRegistration != nil {
+		s.sinkRegistration.Unregister()
+	}
+	if s.sessionIndex != nil {
+		s.sessionIndex.Close()
+	}
+	if s.blobStore != nil && s.blobStoreOwned {
+		s.blobStore.Close()
+	}
 	if s.runs != nil {
 		s.runs.Close()
 	}
@@ -138,6 +262,7 @@ func (s *Server) Close() {
 
 func (s *Server) routes() {
 	s.mux.HandleFunc("GET /api/bootstrap", s.handleBootstrap)
+	s.mux.HandleFunc("GET /api/blobs/{blobID}", s.handleBlob)
 	s.mux.HandleFunc("POST /api/ws-ticket", s.handleWSTicket)
 	s.mux.HandleFunc("GET /api/ws", s.handleWebSocket)
 	s.mux.HandleFunc("GET /api/events", s.handleLifecycleEvents)

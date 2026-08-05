@@ -130,6 +130,30 @@ func (s *LiveSubscription) Close() {
 	})
 }
 
+// Desync terminates a live source with a resync-required sequence condition.
+// Providers use this when their durable rebuild becomes invalid; treating it
+// as a terminal condition is safer than sending a partial snapshot or a
+// fabricated journal entry.
+func (s *LiveSubscription) Desync(err error) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed || s.desynced {
+		return
+	}
+	if err == nil {
+		err = ErrLiveSequenceGap
+	}
+	s.terminateLocked(LiveTerminal{
+		Reason:       LiveTerminalSequence,
+		Err:          err,
+		StreamEpoch:  s.epoch,
+		LastSequence: s.lastDelivered,
+	})
+}
+
 func (s *LiveSubscription) terminateLocked(terminal LiveTerminal) {
 	if s.closed || s.desynced {
 		return

@@ -51,6 +51,11 @@ type DispatcherOptions struct {
 	MaxInflightCommands int
 	MaxCachedCommands   int
 	IDGenerator         func(string) (string, error)
+	// BeforeHandleDispatch is a deterministic test hook invoked after a
+	// synchronous Handle has been admitted and acquired its connection state,
+	// but before it dispatches the message. It is intentionally not used by
+	// production assembly.
+	BeforeHandleDispatch func()
 }
 
 // Dispatcher is the combined command/subscription/ack handler. It stores
@@ -60,21 +65,28 @@ type DispatcherOptions struct {
 // execute its side effect twice. Durable dedupe/outbox support belongs to a
 // later application stage.
 type Dispatcher struct {
-	engine       *syncengine.Engine
-	commands     *commands.Registry
-	ownerContext context.Context
-	observer     Observer
-	maxSubs      int
-	maxInflight  int
-	maxCached    int
-	idGenerator  func(string) (string, error)
-	observerMu   sync.Mutex
-
-	mu         sync.Mutex
-	states     map[string]*connectionState
-	commandsMu sync.Mutex
-	requests   map[commandCacheKey]*sharedCommand
-	sequence   atomic.Uint64
+	engine               *syncengine.Engine
+	commands             *commands.Registry
+	ownerContext         context.Context
+	ownerCancel          context.CancelFunc
+	observer             Observer
+	maxSubs              int
+	maxInflight          int
+	maxCached            int
+	idGenerator          func(string) (string, error)
+	beforeHandleDispatch func()
+	observerMu           sync.Mutex
+	closeOnce            sync.Once
+	taskMu               sync.Mutex
+	taskWG               sync.WaitGroup
+	closing              bool
+	activeHandle         int
+	handleCond           *sync.Cond
+	mu                   sync.Mutex
+	states               map[string]*connectionState
+	commandsMu           sync.Mutex
+	requests             map[commandCacheKey]*sharedCommand
+	sequence             atomic.Uint64
 }
 
 // NewDispatcher creates a closed-registry dispatcher. A nil command registry
@@ -101,6 +113,7 @@ func NewDispatcher(options DispatcherOptions) (*Dispatcher, error) {
 	if options.MaxSubscriptions < 1 || options.MaxInflightCommands < 1 || options.MaxCachedCommands < 1 {
 		return nil, errors.New("dispatcher limits must be positive")
 	}
+	ownerContext, ownerCancel := context.WithCancel(options.OwnerContext)
 	idGenerator := options.IDGenerator
 	if idGenerator == nil {
 		idGenerator = func(prefix string) (string, error) {
@@ -108,18 +121,78 @@ func NewDispatcher(options DispatcherOptions) (*Dispatcher, error) {
 			return fmt.Sprintf("%s-%d", prefix, value), nil
 		}
 	}
-	return &Dispatcher{
-		engine:       options.Engine,
-		commands:     options.Commands,
-		ownerContext: options.OwnerContext,
-		observer:     options.Observer,
-		maxSubs:      options.MaxSubscriptions,
-		maxInflight:  options.MaxInflightCommands,
-		maxCached:    options.MaxCachedCommands,
-		idGenerator:  idGenerator,
-		states:       make(map[string]*connectionState),
-		requests:     make(map[commandCacheKey]*sharedCommand),
-	}, nil
+	dispatcher := &Dispatcher{
+		engine:               options.Engine,
+		commands:             options.Commands,
+		ownerContext:         ownerContext,
+		ownerCancel:          ownerCancel,
+		observer:             options.Observer,
+		maxSubs:              options.MaxSubscriptions,
+		maxInflight:          options.MaxInflightCommands,
+		maxCached:            options.MaxCachedCommands,
+		idGenerator:          idGenerator,
+		states:               make(map[string]*connectionState),
+		requests:             make(map[commandCacheKey]*sharedCommand),
+		beforeHandleDispatch: options.BeforeHandleDispatch,
+	}
+	dispatcher.handleCond = sync.NewCond(&dispatcher.taskMu)
+	return dispatcher, nil
+}
+
+// Close cancels the owner, closes every connection-owned context, and waits
+// for every dispatcher task. The task admission lock prevents a late
+// handler/open from adding to the wait group after waiting begins.
+func (d *Dispatcher) Close() {
+	if d == nil {
+		return
+	}
+	d.closeOnce.Do(func() {
+		d.taskMu.Lock()
+		d.closing = true
+		d.taskMu.Unlock()
+		if d.ownerCancel != nil {
+			d.ownerCancel()
+		}
+		d.mu.Lock()
+		states := make([]*connectionState, 0, len(d.states))
+		for _, state := range d.states {
+			states = append(states, state)
+		}
+		d.mu.Unlock()
+		for _, state := range states {
+			state.close()
+		}
+		d.taskMu.Lock()
+		for d.activeHandle > 0 {
+			d.handleCond.Wait()
+		}
+		d.taskMu.Unlock()
+		d.taskWG.Wait()
+		// A Handle admitted immediately before closing may have installed a
+		// cache entry before command-task admission was refused. No new Handle
+		// can race this cleanup because closing is permanent.
+		d.commandsMu.Lock()
+		d.requests = make(map[commandCacheKey]*sharedCommand)
+		d.commandsMu.Unlock()
+	})
+}
+
+func (d *Dispatcher) startTask(task func()) bool {
+	if d == nil || task == nil {
+		return false
+	}
+	d.taskMu.Lock()
+	if d.closing {
+		d.taskMu.Unlock()
+		return false
+	}
+	d.taskWG.Add(1)
+	d.taskMu.Unlock()
+	go func() {
+		defer d.taskWG.Done()
+		task()
+	}()
+	return true
 }
 
 var dispatcherID uint64
@@ -189,6 +262,10 @@ func (d *Dispatcher) Handle(ctx context.Context, connection Connection, message 
 	if d == nil || connection == nil || message == nil {
 		return ErrConnectionClosed
 	}
+	if !d.beginHandle() {
+		return ErrConnectionClosed
+	}
+	defer d.endHandle()
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -202,18 +279,57 @@ func (d *Dispatcher) Handle(ctx context.Context, connection Connection, message 
 	if closed || state.ctx.Err() != nil || ctx.Err() != nil {
 		return ErrConnectionClosed
 	}
+	if d.beforeHandleDispatch != nil {
+		d.beforeHandleDispatch()
+	}
+	state.mu.Lock()
+	closed = state.closed
+	state.mu.Unlock()
+	if closed || state.ctx.Err() != nil || ctx.Err() != nil {
+		return ErrConnectionClosed
+	}
+	var handleErr error
 	switch typed := message.(type) {
 	case protocol.CommandMessage:
-		return d.handleCommand(state, typed)
+		handleErr = d.handleCommand(state, typed)
 	case protocol.SubscribeMessage:
-		return d.handleSubscribe(state, typed)
+		handleErr = d.handleSubscribe(state, typed)
 	case protocol.UnsubscribeMessage:
-		return d.handleUnsubscribe(state, typed)
+		handleErr = d.handleUnsubscribe(state, typed)
 	case protocol.AckMessage:
-		return d.handleAck(state, typed)
+		handleErr = d.handleAck(state, typed)
 	default:
-		return ErrUnsupportedMessage
+		handleErr = ErrUnsupportedMessage
 	}
+	if handleErr != nil {
+		return handleErr
+	}
+	state.mu.Lock()
+	closed = state.closed
+	state.mu.Unlock()
+	if closed || state.ctx.Err() != nil {
+		return ErrConnectionClosed
+	}
+	return nil
+}
+
+func (d *Dispatcher) beginHandle() bool {
+	d.taskMu.Lock()
+	defer d.taskMu.Unlock()
+	if d.closing {
+		return false
+	}
+	d.activeHandle++
+	return true
+}
+
+func (d *Dispatcher) endHandle() {
+	d.taskMu.Lock()
+	d.activeHandle--
+	if d.activeHandle == 0 {
+		d.handleCond.Broadcast()
+	}
+	d.taskMu.Unlock()
 }
 
 func (d *Dispatcher) stateFor(ctx context.Context, connection Connection) *connectionState {
@@ -228,16 +344,24 @@ func (d *Dispatcher) stateFor(ctx context.Context, connection Connection) *conne
 	if key == "" {
 		return nil
 	}
+	d.taskMu.Lock()
+	if d.closing {
+		d.taskMu.Unlock()
+		return nil
+	}
 	d.mu.Lock()
 	if state := d.states[key]; state != nil {
 		d.mu.Unlock()
+		d.taskMu.Unlock()
 		return state
 	}
+	stateCtx, stateCancel := context.WithCancel(ctx)
 	state := &connectionState{
 		dispatcher:   d,
 		key:          key,
 		connection:   connection,
-		ctx:          ctx,
+		ctx:          stateCtx,
+		cancel:       stateCancel,
 		subs:         make(map[string]*subscription),
 		pendingSubs:  make(map[string]*pendingSubscription),
 		pendingTasks: make(map[*pendingSubscription]struct{}),
@@ -245,8 +369,13 @@ func (d *Dispatcher) stateFor(ctx context.Context, connection Connection) *conne
 		done:         make(chan struct{}),
 	}
 	d.states[key] = state
+	d.taskWG.Add(1)
 	d.mu.Unlock()
-	go d.cleanupState(state)
+	d.taskMu.Unlock()
+	go func() {
+		defer d.taskWG.Done()
+		d.cleanupState(state)
+	}()
 	return state
 }
 
@@ -313,7 +442,12 @@ func (d *Dispatcher) handleSubscribe(state *connectionState, message protocol.Su
 	// Admission is the only synchronous part of subscribe. Provider Open may
 	// perform durable I/O or wait for an owner barrier and must not block the
 	// gateway reader from processing pong, commands or unsubscribe.
-	go d.openSubscription(state, message, pending)
+	if !d.startTask(func() { d.openSubscription(state, message, pending) }) {
+		pending.cancelled.Store(true)
+		pending.cancel()
+		state.releasePending(pending)
+		close(pending.done)
+	}
 	return nil
 }
 
@@ -465,7 +599,22 @@ func (d *Dispatcher) openSubscription(state *connectionState, message protocol.S
 	}
 
 	if sub.startPump() {
-		go d.pumpSubscription(state, sub)
+		if !d.startTask(func() { d.pumpSubscription(state, sub) }) {
+			state.mu.Lock()
+			if state.subs[sub.id] == sub {
+				delete(state.subs, sub.id)
+			}
+			state.mu.Unlock()
+			sub.stopOnce.Do(func() {
+				sub.cancel()
+				sub.opened.Close()
+				sub.mu.Lock()
+				sub.started = false
+				sub.stopped = true
+				close(sub.done)
+				sub.mu.Unlock()
+			})
+		}
 	}
 }
 
@@ -557,6 +706,10 @@ func (d *Dispatcher) pumpSubscription(state *connectionState, sub *subscription)
 
 func (d *Dispatcher) handleUnsubscribe(state *connectionState, message protocol.UnsubscribeMessage) error {
 	state.mu.Lock()
+	if state.closed {
+		state.mu.Unlock()
+		return ErrConnectionClosed
+	}
 	sub := state.subs[message.Payload.SubscriptionID]
 	pendingCancel := state.pendingSubs[message.Payload.SubscriptionID]
 	if sub != nil {
@@ -593,6 +746,10 @@ func (d *Dispatcher) handleUnsubscribe(state *connectionState, message protocol.
 
 func (d *Dispatcher) handleAck(state *connectionState, message protocol.AckMessage) error {
 	state.mu.Lock()
+	if state.closed {
+		state.mu.Unlock()
+		return ErrConnectionClosed
+	}
 	sub := state.subs[message.Payload.SubscriptionID]
 	state.mu.Unlock()
 	if sub == nil {
@@ -615,6 +772,12 @@ func (d *Dispatcher) handleAck(state *connectionState, message protocol.AckMessa
 }
 
 func (d *Dispatcher) handleCommand(state *connectionState, message protocol.CommandMessage) error {
+	state.mu.Lock()
+	if state.closed {
+		state.mu.Unlock()
+		return ErrConnectionClosed
+	}
+	state.mu.Unlock()
 	request := commands.CommandRequest{
 		Name: message.Payload.Name, SchemaVersion: message.Payload.SchemaVersion, RequestID: message.Payload.RequestID,
 		ExpectedRevision: message.Payload.ExpectedRevision, Arguments: append(json.RawMessage(nil), message.Payload.Arguments...), Principal: state.connection.Info().Principal,
@@ -665,6 +828,11 @@ func (d *Dispatcher) handleCommand(state *connectionState, message protocol.Comm
 			return nil
 		}
 		state.mu.Lock()
+		if state.closed {
+			state.mu.Unlock()
+			d.commandsMu.Unlock()
+			return ErrConnectionClosed
+		}
 		if len(state.inflight) >= d.maxInflight {
 			state.mu.Unlock()
 			d.commandsMu.Unlock()
@@ -680,7 +848,9 @@ func (d *Dispatcher) handleCommand(state *connectionState, message protocol.Comm
 		// connection in this server epoch can recover the cached result.
 		_ = d.sendCommandAccepted(state, request.RequestID)
 		d.observe(Event{Kind: EventCommandAccepted, CommandName: request.Name, RequestID: request.RequestID, ConnectionID: state.connection.Info().ConnectionID, InflightCommandsCurrent: state.inflightCount(), CommandCacheCurrent: d.CommandCacheCount()})
-		go d.executeCommand(shared)
+		if !d.startTask(func() { d.executeCommand(shared) }) {
+			shared.finish(nil, &protocol.CommandError{Code: "dispatcher_closed", Message: "command execution was cancelled"})
+		}
 		d.deliverResult(state, shared)
 		return nil
 	}
@@ -690,6 +860,10 @@ func (d *Dispatcher) handleCommand(state *connectionState, message protocol.Comm
 
 func (d *Dispatcher) joinSharedCommand(state *connectionState, shared *sharedCommand, request commands.CommandRequest) error {
 	state.mu.Lock()
+	if state.closed {
+		state.mu.Unlock()
+		return ErrConnectionClosed
+	}
 	_, attached := state.inflight[request.RequestID]
 	if !attached && !shared.finished() {
 		if len(state.inflight) >= d.maxInflight {
@@ -762,7 +936,7 @@ func commandErrorFrom(err error) *protocol.CommandError {
 }
 
 func (d *Dispatcher) deliverResult(state *connectionState, shared *sharedCommand) {
-	go func() {
+	d.startTask(func() {
 		select {
 		case <-shared.done:
 		case <-state.ctx.Done():
@@ -780,7 +954,7 @@ func (d *Dispatcher) deliverResult(state *connectionState, shared *sharedCommand
 			Payload:  payload,
 		}, SendOptions{})
 		state.release(shared.request.RequestID, shared.fingerprint)
-	}()
+	})
 }
 
 func (d *Dispatcher) send(state *connectionState, message protocol.Message, options SendOptions) error {
@@ -880,6 +1054,9 @@ func (d *Dispatcher) nextID(prefix string) string {
 
 func (s *connectionState) close() {
 	s.closeOnce.Do(func() {
+		if s.cancel != nil {
+			s.cancel()
+		}
 		s.mu.Lock()
 		s.closed = true
 		subs := make([]*subscription, 0, len(s.subs))
@@ -1028,6 +1205,7 @@ type connectionState struct {
 	key          string
 	connection   Connection
 	ctx          context.Context
+	cancel       context.CancelFunc
 	done         chan struct{}
 	closeOnce    sync.Once
 	mu           sync.Mutex

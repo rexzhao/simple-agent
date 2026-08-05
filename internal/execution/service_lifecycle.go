@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/rexzhao/simple-agent/internal/sessionindex"
 	"github.com/rexzhao/simple-agent/internal/sessions"
 )
 
@@ -45,10 +46,12 @@ func (s *Service) publishSessionLifecycle(eventType string, session sessions.Ses
 }
 
 func (s *Service) publishSessionCreated(session sessions.SessionV2) {
+	s.publishSessionIndexUpsert(session, sessionindex.CommittedSessionUpsert, "")
 	s.publishSessionLifecycle(LifecycleSessionCreated, session, nil)
 }
 
 func (s *Service) publishSessionUpdated(session sessions.SessionV2, reason string) {
+	s.publishSessionIndexUpsert(session, sessionindex.CommittedSessionUpsert, "")
 	fields := map[string]any{}
 	if strings.TrimSpace(reason) != "" {
 		fields["reason"] = reason
@@ -57,6 +60,13 @@ func (s *Service) publishSessionUpdated(session sessions.SessionV2, reason strin
 }
 
 func (s *Service) publishSessionArchived(session sessions.SessionV2, rootID string, descendants []string) {
+	s.publishSessionIndexUpsert(session, sessionindex.CommittedSessionUpsert, "")
+	// Descendant effective-archive changes are typed durable refreshes. The
+	// projector reloads them after this callback returns; execution never does
+	// descendant I/O or guesses a successful projection.
+	for _, descendantID := range descendants {
+		s.publishSessionIndexRefresh(session.ProjectID, descendantID, sessionindex.CommittedSessionUpsert)
+	}
 	fields := map[string]any{
 		"cascade_root_id": strings.TrimSpace(rootID),
 		"descendants":     append([]string(nil), descendants...),
@@ -64,7 +74,26 @@ func (s *Service) publishSessionArchived(session sessions.SessionV2, rootID stri
 	s.publishSessionLifecycle(LifecycleSessionArchived, session, fields)
 }
 
+func (s *Service) publishSessionRestored(session sessions.SessionV2, descendants []string) {
+	s.publishSessionIndexUpsert(session, sessionindex.CommittedSessionUpsert, "")
+	for _, descendantID := range descendants {
+		s.publishSessionIndexRefresh(session.ProjectID, descendantID, sessionindex.CommittedSessionUpsert)
+	}
+	fields := map[string]any{"reason": "restore"}
+	s.publishSessionLifecycle(LifecycleSessionUpdated, session, fields)
+}
+
 func (s *Service) publishSessionDeleted(id, projectID string, descendants []string) {
+	if s != nil {
+		s.publishSessionIndexChange(sessionindex.CommittedChange{
+			Kind: sessionindex.CommittedSessionRemove, ProjectID: projectID, SessionID: id,
+		})
+		for _, descendantID := range descendants {
+			s.publishSessionIndexChange(sessionindex.CommittedChange{
+				Kind: sessionindex.CommittedSessionRemove, ProjectID: projectID, SessionID: descendantID,
+			})
+		}
+	}
 	if s == nil || s.lifecycleHub == nil {
 		return
 	}
@@ -133,7 +162,13 @@ func sessionDeletionCascades(states []sessions.SessionV2) []sessionDeletionCasca
 }
 
 func (s *Service) publishRunStarted(run *CoordinatedSessionRun) {
-	if s == nil || s.lifecycleHub == nil || run == nil {
+	if s == nil || run == nil {
+		return
+	}
+	// The typed provider is notified at the durable CreateRun commit boundary
+	// in runSessionMessage. This callback remains the legacy SSE lifecycle
+	// compatibility path and must not be used as the index authority.
+	if s.lifecycleHub == nil {
 		return
 	}
 	lastSeq := int64(0)
@@ -170,6 +205,59 @@ func (s *Service) publishRunSettled(run *CoordinatedSessionRun, result SessionMe
 		}
 	}
 	s.publishRunLifecycle(LifecycleRunSettled, run, status, lastSeq, metadata, runErr)
+}
+
+func invalidateSessionIndexProject(sink sessionindex.ChangeSink, projectID, reason string) {
+	if invalidator, ok := sink.(sessionindex.InvalidationSink); ok && strings.TrimSpace(projectID) != "" {
+		_ = invalidator.InvalidateProject(projectID, reason)
+	}
+}
+
+func (s *Service) publishSessionIndexChange(change sessionindex.CommittedChange) {
+	if s == nil {
+		return
+	}
+	for _, sink := range s.sessionIndexChangeSinks() {
+		if err := sink.PublishCommitted(change); err != nil {
+			// The durable mutation already committed. An unhealthy provider is
+			// invalidated independently; other registered providers still receive
+			// the same committed change.
+			invalidateSessionIndexProject(sink, change.ProjectID, "committed_change_failed")
+		}
+	}
+}
+
+func (s *Service) publishSessionIndexRefresh(projectID, sessionID string, kind sessionindex.CommittedChangeKind) {
+	s.publishSessionIndexChange(sessionindex.CommittedChange{
+		Kind: kind, ProjectID: strings.TrimSpace(projectID), SessionID: strings.TrimSpace(sessionID),
+	})
+}
+
+func (s *Service) publishSessionIndexUpsert(session sessions.SessionV2, kind sessionindex.CommittedChangeKind, runID string) {
+	// The callback carries only the typed durable identity and lifecycle run
+	// guard. Every owner worker reloads the complete state after commit, so this
+	// path cannot block execution on archive traversal or JSON projection.
+	s.publishSessionIndexChange(sessionindex.CommittedChange{
+		Kind: kind, ProjectID: strings.TrimSpace(session.ProjectID), SessionID: session.ID,
+		RunID: strings.TrimSpace(runID),
+	})
+}
+
+func (s *Service) publishCommittedRunStarted(sessionID, projectID, runID string) {
+	s.publishSessionIndexChange(sessionindex.CommittedChange{
+		Kind: sessionindex.CommittedRunStarted, ProjectID: strings.TrimSpace(projectID),
+		SessionID: strings.TrimSpace(sessionID), RunID: strings.TrimSpace(runID),
+	})
+}
+
+func (s *Service) publishCommittedRunSettled(sessionID, runID string, state sessions.SessionV2) {
+	s.publishSessionIndexUpsert(state, sessionindex.CommittedRunSettled, runID)
+}
+
+func (s *Service) publishProjectSessionIndex(projectID string) {
+	s.publishSessionIndexChange(sessionindex.CommittedChange{
+		Kind: sessionindex.CommittedProjectRefresh, ProjectID: strings.TrimSpace(projectID),
+	})
 }
 
 func (s *Service) publishRunLifecycle(eventType string, run *CoordinatedSessionRun, status string, lastSeq int64, metadata *SessionMetadata, runErr error) {

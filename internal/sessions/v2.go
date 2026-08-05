@@ -46,6 +46,7 @@ const (
 	RecordTypeCompactionCreated     = "compaction.created"
 	RecordTypeRunStarted            = "run.started"
 	RecordTypeRunSettled            = "run.settled"
+	RecordTypeResultMarkedRead      = "result.marked_read"
 	RecordTypeTurnRunning           = "turn.running"
 	RecordTypeTurnCleared           = "turn.cleared"
 	RecordTypeTurnInterrupted       = "turn.interrupted"
@@ -156,28 +157,32 @@ type DebugSettings struct {
 }
 
 type SessionV2 struct {
-	ID                   string                 `json:"id"`
-	Version              int                    `json:"version"`
-	CreatedAt            time.Time              `json:"created_at"`
-	UpdatedAt            time.Time              `json:"updated_at"`
-	DisplayName          string                 `json:"display_name,omitempty"`
-	CreatedBy            string                 `json:"created_by,omitempty"`
-	ParentSessionID      string                 `json:"parent_session_id,omitempty"`
-	RootSessionID        string                 `json:"root_session_id,omitempty"`
-	SpawnDepth           int                    `json:"spawn_depth,omitempty"`
-	Archived             bool                   `json:"archived,omitempty"`
-	ArchivedAt           time.Time              `json:"archived_at,omitempty"`
-	LastUsedAt           time.Time              `json:"last_used_at"`
-	CurrentRunID         string                 `json:"current_run_id,omitempty"`
-	RunningRunID         string                 `json:"running_run_id,omitempty"`
-	RunningTurnID        string                 `json:"running_turn_id,omitempty"`
-	RunningStartedAt     time.Time              `json:"running_started_at,omitempty"`
-	InterruptedRunID     string                 `json:"interrupted_run_id,omitempty"`
-	InterruptedTurnID    string                 `json:"interrupted_turn_id,omitempty"`
-	InterruptedAt        time.Time              `json:"interrupted_at,omitempty"`
-	LatestRunID          string                 `json:"latest_run_id,omitempty"`
-	LastRunID            string                 `json:"last_run_id,omitempty"`
-	LastRunStatus        string                 `json:"last_run_status,omitempty"`
+	ID                string    `json:"id"`
+	Version           int       `json:"version"`
+	CreatedAt         time.Time `json:"created_at"`
+	UpdatedAt         time.Time `json:"updated_at"`
+	DisplayName       string    `json:"display_name,omitempty"`
+	CreatedBy         string    `json:"created_by,omitempty"`
+	ParentSessionID   string    `json:"parent_session_id,omitempty"`
+	RootSessionID     string    `json:"root_session_id,omitempty"`
+	SpawnDepth        int       `json:"spawn_depth,omitempty"`
+	Archived          bool      `json:"archived,omitempty"`
+	ArchivedAt        time.Time `json:"archived_at,omitempty"`
+	LastUsedAt        time.Time `json:"last_used_at"`
+	CurrentRunID      string    `json:"current_run_id,omitempty"`
+	RunningRunID      string    `json:"running_run_id,omitempty"`
+	RunningTurnID     string    `json:"running_turn_id,omitempty"`
+	RunningStartedAt  time.Time `json:"running_started_at,omitempty"`
+	InterruptedRunID  string    `json:"interrupted_run_id,omitempty"`
+	InterruptedTurnID string    `json:"interrupted_turn_id,omitempty"`
+	InterruptedAt     time.Time `json:"interrupted_at,omitempty"`
+	LatestRunID       string    `json:"latest_run_id,omitempty"`
+	LastRunID         string    `json:"last_run_id,omitempty"`
+	LastRunStatus     string    `json:"last_run_status,omitempty"`
+	// HasUnreadResult is an additive state-schema field. Older state_json rows
+	// unmarshal it as false, so this is a backwards-compatible migration of
+	// the existing compact state row rather than a second unread database.
+	HasUnreadResult      bool                   `json:"has_unread_result"`
 	Provider             string                 `json:"provider"`
 	ModelProfile         string                 `json:"model_profile"`
 	ModelID              string                 `json:"model_id"`
@@ -702,6 +707,48 @@ func (s *V2Store) Delete(id string) error {
 	return nil
 }
 
+// MarkRead clears the durable result badge only when runID is still the
+// session's latest run. A page that was opened for an older run can therefore
+// never clear the badge belonging to a newer run. Repeating the operation for
+// the matching run is an idempotent no-op.
+func (s *V2Store) MarkRead(sessionID, runID string) (SessionV2, bool, error) {
+	runID = strings.TrimSpace(runID)
+	if runID == "" {
+		return SessionV2{}, false, fmt.Errorf("run id is required")
+	}
+	db, err := s.openSessionDB(sessionID, false)
+	if err != nil {
+		return SessionV2{}, false, err
+	}
+	defer db.Close()
+	tx, err := db.Begin()
+	if err != nil {
+		return SessionV2{}, false, fmt.Errorf("begin mark read: %w", err)
+	}
+	defer tx.Rollback()
+	state, err := readStateInTx(tx, sessionID)
+	if err != nil {
+		return SessionV2{}, false, err
+	}
+	if state.LatestRunID != runID || !state.HasUnreadResult {
+		return state, false, nil
+	}
+	state.HasUnreadResult = false
+	state.UpdatedAt = s.now().UTC()
+	// Mark-read is a durable metadata mutation. The lifecycle event and state
+	// row are committed together, making the resulting index change
+	// replayable without inventing a sequence outside the session event log.
+	if err := commitLifecycleTx(tx, &state, RecordTypeResultMarkedRead, "", struct {
+		RunID string `json:"run_id"`
+	}{RunID: runID}); err != nil {
+		return SessionV2{}, false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return SessionV2{}, false, fmt.Errorf("commit mark read: %w", err)
+	}
+	return state, true, nil
+}
+
 // CreateRun records the run and its active state in the same transaction as
 // the run.started event. previousRunID is resolved by the execution layer for
 // normal messages and is the interrupted run for Continue.
@@ -755,6 +802,9 @@ func (s *V2Store) CreateRun(sessionID, runID, previousRunID string, inputPayload
 	state.RunningStartedAt = startedAt
 	state.LatestRunID = runID
 	state.LastRunStatus = RunStatusRunning
+	// A newly admitted run owns the current result slot. The previous run's
+	// unread marker must not survive as the marker for a different run.
+	state.HasUnreadResult = false
 	// A new run consumes the previous Continue opportunity. Clear its
 	// marker in the same transaction as the new run row and run.started event.
 	interruptedRunID := state.InterruptedRunID
@@ -1032,6 +1082,11 @@ func (s *V2Store) SetRunStatus(sessionID, runID, status string, settledAt time.T
 	}
 	state.LastRunID = runID
 	state.LastRunStatus = status
+	// A user-cancelled run is an intentional action, not a new result to
+	// inspect. Committed, failed, and interrupted outcomes remain unread.
+	if state.LatestRunID == runID && status != RunStatusCancelled {
+		state.HasUnreadResult = true
+	}
 	if status == RunStatusInterrupted || status == RunStatusFailed {
 		state.InterruptedRunID = runID
 		state.InterruptedAt = settledAt.UTC()
