@@ -1,0 +1,657 @@
+{
+  "valid": [
+    {
+      "name": "hello",
+      "message": {
+        "version": 1,
+        "type": "hello",
+        "id": "hello_1",
+        "timestamp": "2025-03-08T12:00:00+05:30",
+        "payload": {
+          "supported_versions": [1],
+          "client_id": "tab_1"
+        }
+      }
+    },
+    {
+      "name": "welcome",
+      "message": {
+        "version": 1,
+        "type": "welcome",
+        "id": "welcome_1",
+        "payload": {
+          "selected_version": 1,
+          "connection_id": "conn_1",
+          "server_epoch": "server_epoch_1",
+          "heartbeat_interval_ms": 15000,
+          "max_message_bytes": 262144
+        }
+      }
+    },
+    {
+      "name": "ping",
+      "message": {
+        "version": 1,
+        "type": "ping",
+        "id": "ping_1",
+        "timestamp": "2025-03-08T12:00:00.123456789Z",
+        "payload": {}
+      }
+    },
+    {
+      "name": "pong",
+      "message": {
+        "version": 1,
+        "type": "pong",
+        "id": "pong_1",
+        "payload": {}
+      }
+    },
+    {
+      "name": "command",
+      "message": {
+        "version": 1,
+        "type": "command",
+        "id": "command_msg_1",
+        "trace_id": "trace_1",
+        "payload": {
+          "name": "session.rename",
+          "schema_version": 1,
+          "request_id": "request_1",
+          "expected_revision": "42",
+          "arguments": {
+            "session_id": "session_2",
+            "display_name": "New title"
+          }
+        }
+      }
+    },
+    {
+      "name": "command_accepted",
+      "message": {
+        "version": 1,
+        "type": "command_accepted",
+        "id": "accepted_1",
+        "payload": {
+          "request_id": "request_1"
+        }
+      }
+    },
+    {
+      "name": "command_result",
+      "message": {
+        "version": 1,
+        "type": "command_result",
+        "id": "result_1",
+        "payload": {
+          "request_id": "request_1",
+          "status": "succeeded",
+          "result": {
+            "session_id": "session_2"
+          }
+        }
+      }
+    },
+    {
+      "name": "command_result_failed",
+      "message": {
+        "version": 1,
+        "type": "command_result",
+        "id": "result_failed_1",
+        "payload": {
+          "request_id": "request_2",
+          "status": "failed",
+          "error": {
+            "code": "conflict",
+            "message": "resource revision changed"
+          }
+        }
+      }
+    },
+    {
+      "name": "subscribe",
+      "message": {
+        "version": 1,
+        "type": "subscribe",
+        "id": "sub_request_1",
+        "payload": {
+          "subscription_id": "session-index:project_1",
+          "resource": {
+            "type": "session_index",
+            "id": "project_1"
+          },
+          "resume": {
+            "stream_epoch": "stream_1",
+            "sequence": "1938"
+          }
+        }
+      }
+    },
+    {
+      "name": "subscribed",
+      "message": {
+        "version": 1,
+        "type": "subscribed",
+        "id": "subscribed_1",
+        "payload": {
+          "subscription_id": "session-index:project_1",
+          "resource": {
+            "type": "session_index",
+            "id": "project_1"
+          },
+          "stream_epoch": "stream_1",
+          "sequence": "1938"
+        }
+      }
+    },
+    {
+      "name": "unsubscribe",
+      "message": {
+        "version": 1,
+        "type": "unsubscribe",
+        "id": "unsub_request_1",
+        "payload": {
+          "subscription_id": "session-index:project_1"
+        }
+      }
+    },
+    {
+      "name": "unsubscribed",
+      "message": {
+        "version": 1,
+        "type": "unsubscribed",
+        "id": "unsubscribed_1",
+        "payload": {
+          "subscription_id": "session-index:project_1"
+        }
+      }
+    },
+    {
+      "name": "snapshot_inline",
+      "message": {
+        "version": 1,
+        "type": "snapshot",
+        "id": "snapshot_1",
+        "payload": {
+          "subscription_id": "session-index:project_1",
+          "resource": {
+            "type": "session_index",
+            "id": "project_1"
+          },
+          "stream_epoch": "stream_1",
+          "sequence": "1938",
+          "resource_revision": "718",
+          "content": {
+            "inline": {
+              "sessions": []
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "snapshot_blob",
+      "message": {
+        "version": 1,
+        "type": "snapshot",
+        "id": "snapshot_2",
+        "payload": {
+          "subscription_id": "session-content:session_2",
+          "resource": {
+            "type": "session_content",
+            "id": "session_2"
+          },
+          "stream_epoch": "stream_1",
+          "sequence": "1938",
+          "resource_revision": "revision-718",
+          "content": {
+            "blob": {
+              "id": "blob_1",
+              "url": "/api/blobs/blob_1",
+              "content_type": "application/json",
+              "size": 28734912,
+              "sha256": "abc123",
+              "etag": "etag-1",
+              "expires_at": "2025-03-08T12:10:00Z"
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "change",
+      "message": {
+        "version": 1,
+        "type": "change",
+        "id": "change_1",
+        "trace_id": "trace_run_1",
+        "payload": {
+          "subscription_id": "session-index:project_1",
+          "resource": {
+            "type": "session_index",
+            "id": "project_1"
+          },
+          "stream_epoch": "stream_1",
+          "sequence": "1939",
+          "previous_sequence": "1938",
+          "resource_revision": "719",
+          "operations": [
+            {
+              "op": "metadata.replace",
+              "field": "display_name",
+              "metadata": {
+                "session_id": "session_2",
+                "display_name": "Renamed"
+              }
+            },
+            {
+              "op": "remove",
+              "key": "session_3",
+              "reason": "archived"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "resource_specific_change_operation",
+      "message": {
+        "version": 1,
+        "type": "change",
+        "id": "change_resource_specific_1",
+        "payload": {
+          "subscription_id": "session-content:session_2",
+          "resource": {
+            "type": "session_content",
+            "id": "session_2"
+          },
+          "stream_epoch": "stream_1",
+          "sequence": "1940",
+          "previous_sequence": "1939",
+          "resource_revision": "revision-720",
+          "operations": [
+            {
+              "op": "active_run.replace",
+              "active_run": {
+                "run_id": "run_9",
+                "status": "running"
+              },
+              "changed_by": "run_coordinator"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "subscription_event",
+      "message": {
+        "version": 1,
+        "type": "subscription_event",
+        "id": "server_msg_3",
+        "payload": {
+          "subscription_id": "session-content:session_2",
+          "resource": {
+            "type": "session_content",
+            "id": "session_2"
+          },
+          "event": {
+            "type": "text.delta",
+            "run_id": "run_9",
+            "run_cursor": "17",
+            "item_id": "item_3",
+            "durable_text_length": 128,
+            "delta": "...",
+            "tool_name": "shell",
+            "tool_call_id": "tool_7",
+            "session_phase": "running",
+            "arguments": {
+              "command": "pwd"
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "ack",
+      "message": {
+        "version": 1,
+        "type": "ack",
+        "id": "ack_1",
+        "payload": {
+          "subscription_id": "session-index:project_1",
+          "stream_epoch": "stream_1",
+          "sequence": "1939"
+        }
+      }
+    },
+    {
+      "name": "resync_required",
+      "message": {
+        "version": 1,
+        "type": "resync_required",
+        "id": "resync_1",
+        "payload": {
+          "subscription_id": "session-index:project_1",
+          "resource": {
+            "type": "session_index",
+            "id": "project_1"
+          },
+          "reason": "journal_expired"
+        }
+      }
+    },
+    {
+      "name": "error",
+      "message": {
+        "version": 1,
+        "type": "error",
+        "id": "error_1",
+        "payload": {
+          "code": "forbidden",
+          "message": "resource is not accessible",
+          "request_id": "request_1",
+          "details": {
+            "resource": "session_2"
+          }
+        }
+      }
+    }
+  ],
+  "invalid": [
+    {
+      "name": "unsupported_version",
+      "message": {
+        "version": 2,
+        "type": "ping",
+        "id": "bad_version",
+        "payload": {}
+      }
+    },
+    {
+      "name": "unknown_type",
+      "message": {
+        "version": 1,
+        "type": "future_message",
+        "id": "bad_type",
+        "payload": {}
+      }
+    },
+    {
+      "name": "missing_id",
+      "message": {
+        "version": 1,
+        "type": "ping",
+        "payload": {}
+      }
+    },
+    {
+      "name": "missing_required_field",
+      "message": {
+        "version": 1,
+        "type": "subscribe",
+        "id": "bad_field",
+        "payload": {
+          "subscription_id": "subscription_1",
+          "resource": {
+            "type": "session_index"
+          }
+        }
+      }
+    },
+    {
+      "name": "invalid_sequence",
+      "message": {
+        "version": 1,
+        "type": "ack",
+        "id": "bad_sequence",
+        "payload": {
+          "subscription_id": "session-index:project_1",
+          "stream_epoch": "stream_1",
+          "sequence": "-1"
+        }
+      }
+    },
+    {
+      "name": "unknown_resource_type",
+      "message": {
+        "version": 1,
+        "type": "subscribe",
+        "id": "bad_resource",
+        "payload": {
+          "subscription_id": "subscription_1",
+          "resource": {
+            "type": "future_resource",
+            "id": "resource_1"
+          }
+        }
+      }
+    },
+    {
+      "name": "snapshot_content_not_one_of",
+      "message": {
+        "version": 1,
+        "type": "snapshot",
+        "id": "bad_content",
+        "payload": {
+          "subscription_id": "session-index:project_1",
+          "resource": {
+            "type": "session_index",
+            "id": "project_1"
+          },
+          "stream_epoch": "stream_1",
+          "sequence": "1",
+          "resource_revision": "1",
+          "content": {
+            "inline": {},
+            "blob": {}
+          }
+        }
+      }
+    },
+    {
+      "name": "empty_change_operation_op",
+      "message": {
+        "version": 1,
+        "type": "change",
+        "id": "bad_empty_op",
+        "payload": {
+          "subscription_id": "session-index:project_1",
+          "resource": {
+            "type": "session_index",
+            "id": "project_1"
+          },
+          "stream_epoch": "stream_1",
+          "sequence": "2",
+          "previous_sequence": "1",
+          "resource_revision": "2",
+          "operations": [
+            {
+              "op": "",
+              "resource_field": "display_name"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "non_object_change_operation",
+      "message": {
+        "version": 1,
+        "type": "change",
+        "id": "bad_operation_object",
+        "payload": {
+          "subscription_id": "session-index:project_1",
+          "resource": {
+            "type": "session_index",
+            "id": "project_1"
+          },
+          "stream_epoch": "stream_1",
+          "sequence": "2",
+          "previous_sequence": "1",
+          "resource_revision": "2",
+          "operations": ["not an object"]
+        }
+      }
+    },
+    {
+      "name": "invalid_timestamp",
+      "message": {
+        "version": 1,
+        "type": "ping",
+        "id": "bad_timestamp",
+        "timestamp": "2025-03-08",
+        "payload": {}
+      }
+    },
+    {
+      "name": "invalid_non_leap_day",
+      "message": {
+        "version": 1,
+        "type": "ping",
+        "id": "bad_february_day",
+        "timestamp": "2025-02-29T12:00:00Z",
+        "payload": {}
+      }
+    },
+    {
+      "name": "invalid_month_day",
+      "message": {
+        "version": 1,
+        "type": "ping",
+        "id": "bad_april_day",
+        "timestamp": "2025-04-31T12:00:00Z",
+        "payload": {}
+      }
+    },
+    {
+      "name": "invalid_midnight_hour",
+      "message": {
+        "version": 1,
+        "type": "ping",
+        "id": "bad_midnight",
+        "timestamp": "2025-03-08T24:00:00Z",
+        "payload": {}
+      }
+    },
+    {
+      "name": "invalid_offset_hour",
+      "message": {
+        "version": 1,
+        "type": "ping",
+        "id": "bad_offset",
+        "timestamp": "2025-03-08T12:00:00+24:00",
+        "payload": {}
+      }
+    },
+    {
+      "name": "invalid_trace_id",
+      "message": {
+        "version": 1,
+        "type": "ping",
+        "id": "bad_trace_id",
+        "trace_id": " ",
+        "payload": {}
+      }
+    },
+    {
+      "name": "invalid_blob_expiry",
+      "message": {
+        "version": 1,
+        "type": "snapshot",
+        "id": "bad_blob_expiry",
+        "payload": {
+          "subscription_id": "session-content:session_2",
+          "resource": {
+            "type": "session_content",
+            "id": "session_2"
+          },
+          "stream_epoch": "stream_1",
+          "sequence": "1",
+          "resource_revision": "revision-1",
+          "content": {
+            "blob": {
+              "id": "blob_bad",
+              "url": "/api/blobs/blob_bad",
+              "content_type": "application/json",
+              "size": 1,
+              "sha256": "abc123",
+              "etag": "etag-bad",
+              "expires_at": "not-a-timestamp"
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "unsafe_number",
+      "message": {
+        "version": 1,
+        "type": "welcome",
+        "id": "bad_number",
+        "payload": {
+          "selected_version": 1,
+          "connection_id": "conn_1",
+          "server_epoch": "epoch_1",
+          "heartbeat_interval_ms": 9007199254740992,
+          "max_message_bytes": 262144
+        }
+      }
+    },
+    {
+      "name": "unsafe_blob_size",
+      "message": {
+        "version": 1,
+        "type": "snapshot",
+        "id": "bad_blob_size",
+        "payload": {
+          "subscription_id": "session-content:session_2",
+          "resource": {
+            "type": "session_content",
+            "id": "session_2"
+          },
+          "stream_epoch": "stream_1",
+          "sequence": "1",
+          "resource_revision": "revision-1",
+          "content": {
+            "blob": {
+              "id": "blob_unsafe",
+              "url": "/api/blobs/blob_unsafe",
+              "content_type": "application/json",
+              "size": 9007199254740992,
+              "sha256": "abc123",
+              "etag": "etag-unsafe",
+              "expires_at": "2025-03-08T12:10:00Z"
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "null_optional_field",
+      "message": {
+        "version": 1,
+        "type": "command",
+        "id": "bad_optional",
+        "payload": {
+          "name": "session.rename",
+          "schema_version": 1,
+          "request_id": "request_1",
+          "expected_revision": null,
+          "arguments": {}
+        }
+      }
+    },
+    {
+      "name": "failed_command_missing_error",
+      "message": {
+        "version": 1,
+        "type": "command_result",
+        "id": "bad_failed_result",
+        "payload": {
+          "request_id": "request_2",
+          "status": "failed"
+        }
+      }
+    }
+  ]
+}
