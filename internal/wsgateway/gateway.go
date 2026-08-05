@@ -34,10 +34,11 @@ const (
 )
 
 var (
-	ErrConnectionClosed   = errors.New("websocket connection is closed")
-	ErrOutboundQueueFull  = errors.New("websocket outbound queue is full")
-	ErrMessageTooLarge    = errors.New("websocket message exceeds the configured limit")
-	ErrUnsupportedMessage = errors.New("websocket message is unsupported")
+	ErrConnectionClosed     = errors.New("websocket connection is closed")
+	ErrOutboundQueueFull    = errors.New("websocket outbound queue is full")
+	ErrSubscriptionDesynced = errors.New("websocket subscription is desynced")
+	ErrMessageTooLarge      = errors.New("websocket message exceeds the configured limit")
+	ErrUnsupportedMessage   = errors.New("websocket message is unsupported")
 )
 
 // Limits are intentionally finite defaults. They bound both memory retained by
@@ -119,6 +120,25 @@ type Connection interface {
 	Info() ConnectionInfo
 }
 
+// SendOptions carries transport-neutral delivery metadata. Subscription
+// ownership is used only by the bounded queue; it is never serialized onto
+// the wire. OnWritten runs on the sole writer goroutine after the frame has
+// been successfully written, which prevents an ACK cursor from advancing for
+// a frame that was purged while queued.
+type SendOptions struct {
+	SubscriptionID string
+	OnWritten      func()
+}
+
+// OwnedConnection is implemented by the gateway's connection and is kept
+// optional so existing transport-neutral test/fake Connections remain valid.
+// Dispatcher code uses it when available and falls back to Connection.Send
+// for simpler in-process transports.
+type OwnedConnection interface {
+	Connection
+	SendWithOptions(protocol.Message, SendOptions) error
+}
+
 type Handler interface {
 	// Handle processes one validated client-to-server message. Implementations
 	// must return when ctx is cancelled. The gateway can cancel this context
@@ -136,25 +156,47 @@ func (f HandlerFunc) Handle(ctx context.Context, connection Connection, message 
 // Event is a safe structured observation hook. It contains labels and sizes,
 // never raw payloads, capability tokens, tickets, or provider secrets.
 type Event struct {
-	Kind         EventKind
-	Direction    Direction
-	MessageType  protocol.MessageType
-	Bytes        int
-	QueueBytes   int
-	Code         string
-	Reason       string
-	ConnectionID string
-	ClientID     string
+	Kind                    EventKind
+	Direction               Direction
+	MessageType             protocol.MessageType
+	Bytes                   int
+	QueueBytes              int
+	Code                    string
+	Reason                  string
+	ConnectionID            string
+	ClientID                string
+	SubscriptionID          string
+	ResourceType            protocol.ResourceType
+	ResourceID              string
+	RequestID               string
+	CommandName             string
+	StreamEpoch             string
+	Sequence                string
+	ResourceRevision        string
+	Duration                time.Duration
+	ConnectionsCurrent      int
+	SubscriptionsCurrent    int
+	InflightCommandsCurrent int
+	CommandCacheCurrent     int
 }
 
 type EventKind string
 
 const (
-	EventConnectionOpened EventKind = "connection_opened"
-	EventConnectionClosed EventKind = "connection_closed"
-	EventMessage          EventKind = "message"
-	EventProtocolError    EventKind = "protocol_error"
-	EventQueueChanged     EventKind = "queue_changed"
+	EventConnectionOpened     EventKind = "connection_opened"
+	EventConnectionClosed     EventKind = "connection_closed"
+	EventMessage              EventKind = "message"
+	EventProtocolError        EventKind = "protocol_error"
+	EventQueueChanged         EventKind = "queue_changed"
+	EventCommandAccepted      EventKind = "command_accepted"
+	EventCommandCompleted     EventKind = "command_completed"
+	EventCommandDeduped       EventKind = "command_deduped"
+	EventCommandConflict      EventKind = "command_conflict"
+	EventCommandCacheRejected EventKind = "command_cache_rejected"
+	EventSubscriptionOpened   EventKind = "subscription_opened"
+	EventSubscriptionClosed   EventKind = "subscription_closed"
+	EventSubscriptionResync   EventKind = "subscription_resync"
+	EventAckRejected          EventKind = "ack_rejected"
 )
 
 type Direction string
@@ -180,13 +222,14 @@ type Options struct {
 // Gateway owns the WebSocket transport but exposes only protocol messages and
 // Connection to its handler. No third-party websocket type crosses this API.
 type Gateway struct {
-	limits      Limits
-	clock       Clock
-	serverEpoch string
-	handler     Handler
-	observer    Observer
-	idGenerator func(prefix string) (string, error)
-	observerMu  sync.Mutex
+	limits             Limits
+	clock              Clock
+	serverEpoch        string
+	handler            Handler
+	observer           Observer
+	idGenerator        func(prefix string) (string, error)
+	observerMu         sync.Mutex
+	connectionsCurrent atomic.Int64
 }
 
 func New(options Options) (*Gateway, error) {
@@ -282,6 +325,7 @@ type connection struct {
 	terminated    bool
 	closeCode     websocket.StatusCode
 	closeWhy      string
+	desynced      map[string]struct{}
 	done          chan struct{}
 	terminateOnce sync.Once
 	handlerCancel context.CancelFunc
@@ -296,6 +340,7 @@ func newConnection(gateway *Gateway, ws *websocket.Conn, claims TicketClaims, co
 		lastPong:  lastPong,
 		queue:     newOutboundQueue(gateway.limits.MaxOutboundMessages, gateway.limits.MaxOutboundBytes),
 		clock:     gateway.clock,
+		desynced:  make(map[string]struct{}),
 		done:      make(chan struct{}),
 		handshake: make(chan struct{}),
 	}
@@ -326,6 +371,10 @@ func (c *connection) setClientID(clientID string) {
 }
 
 func (c *connection) Send(message protocol.Message) error {
+	return c.SendWithOptions(message, SendOptions{})
+}
+
+func (c *connection) SendWithOptions(message protocol.Message, options SendOptions) error {
 	if c == nil || message == nil {
 		return ErrConnectionClosed
 	}
@@ -337,14 +386,129 @@ func (c *connection) Send(message protocol.Message) error {
 		c.terminate(websocket.StatusMessageTooBig, "outbound message too large", nil)
 		return ErrMessageTooLarge
 	}
-	if err := c.queue.enqueue(outboundFrame{kind: frameMessage, payload: payload}); err != nil {
+	if options.SubscriptionID == "" {
+		options.SubscriptionID = messageSubscriptionID(message)
+	}
+	if message.Kind() == protocol.MessageTypeChange && options.SubscriptionID != "" {
+		c.mu.Lock()
+		_, desynced := c.desynced[options.SubscriptionID]
+		c.mu.Unlock()
+		if desynced {
+			return ErrSubscriptionDesynced
+		}
+	}
+	frame := outboundFrame{
+		kind:           frameMessage,
+		payload:        payload,
+		subscriptionID: options.SubscriptionID,
+		purgeable:      message.Kind() == protocol.MessageTypeChange && options.SubscriptionID != "",
+		onWritten:      options.OnWritten,
+	}
+	if err := c.queue.enqueue(frame); err != nil {
 		if errors.Is(err, ErrOutboundQueueFull) {
+			if frame.purgeable {
+				c.markSubscriptionDesynced(frame.subscriptionID)
+				c.queue.purgeSubscriptionChanges(frame.subscriptionID)
+				if recoveryErr := c.enqueueSubscriptionRecovery(message, frame.subscriptionID); recoveryErr == nil {
+					c.gateway.observe(Event{Kind: EventSubscriptionResync, Reason: "outbound_overflow", SubscriptionID: frame.subscriptionID, ConnectionID: c.infoSnapshot().ConnectionID, ClientID: c.infoSnapshot().ClientID})
+					return ErrSubscriptionDesynced
+				}
+			}
 			c.terminate(websocket.StatusTryAgainLater, closeReasonQueueOverflow, nil)
 		}
 		return err
 	}
 	c.gateway.observe(Event{Kind: EventQueueChanged, QueueBytes: c.queue.bytesQueued(), ConnectionID: c.infoSnapshot().ConnectionID, ClientID: c.infoSnapshot().ClientID})
 	return nil
+}
+
+func messageSubscriptionID(message protocol.Message) string {
+	switch typed := message.(type) {
+	case protocol.ChangeMessage:
+		return typed.Payload.SubscriptionID
+	case *protocol.ChangeMessage:
+		if typed != nil {
+			return typed.Payload.SubscriptionID
+		}
+	case protocol.SnapshotMessage:
+		return typed.Payload.SubscriptionID
+	case *protocol.SnapshotMessage:
+		if typed != nil {
+			return typed.Payload.SubscriptionID
+		}
+	case protocol.ResyncRequiredMessage:
+		return typed.Payload.SubscriptionID
+	case *protocol.ResyncRequiredMessage:
+		if typed != nil {
+			return typed.Payload.SubscriptionID
+		}
+	case protocol.SubscriptionEventMessage:
+		return typed.Payload.SubscriptionID
+	case *protocol.SubscriptionEventMessage:
+		if typed != nil {
+			return typed.Payload.SubscriptionID
+		}
+	default:
+		return ""
+	}
+	return ""
+}
+
+func (c *connection) enqueueSubscriptionRecovery(message protocol.Message, subscriptionID string) error {
+	var change protocol.ChangeMessage
+	switch typed := message.(type) {
+	case protocol.ChangeMessage:
+		change = typed
+	case *protocol.ChangeMessage:
+		if typed == nil {
+			return ErrOutboundQueueFull
+		}
+		change = *typed
+	default:
+		return ErrOutboundQueueFull
+	}
+	id, err := c.gateway.idGenerator("resync")
+	if err != nil {
+		return err
+	}
+	recovery := protocol.ResyncRequiredMessage{
+		Envelope: protocol.Envelope{Version: 1, Type: protocol.MessageTypeResyncRequired, ID: id},
+		Payload: protocol.ResyncRequiredPayload{
+			SubscriptionID: subscriptionID,
+			Resource:       change.Payload.Resource,
+			Reason:         "outbound_overflow",
+		},
+	}
+	payload, err := protocol.EncodeMessage(recovery)
+	if err != nil || len(payload) > c.gateway.limits.MaxMessageBytes {
+		if err != nil {
+			return err
+		}
+		return ErrMessageTooLarge
+	}
+	return c.queue.enqueue(outboundFrame{
+		kind:           frameMessage,
+		payload:        payload,
+		subscriptionID: subscriptionID,
+	})
+}
+
+func (c *connection) markSubscriptionDesynced(subscriptionID string) {
+	if c == nil || subscriptionID == "" {
+		return
+	}
+	c.mu.Lock()
+	c.desynced[subscriptionID] = struct{}{}
+	c.mu.Unlock()
+}
+
+func (c *connection) clearSubscriptionDesynced(subscriptionID string) {
+	if c == nil || subscriptionID == "" {
+		return
+	}
+	c.mu.Lock()
+	delete(c.desynced, subscriptionID)
+	c.mu.Unlock()
 }
 
 func (c *connection) run(parent context.Context) {
@@ -354,7 +518,16 @@ func (c *connection) run(parent context.Context) {
 	c.handlerCancel = handlerCancel
 	defer handlerCancel()
 
-	c.gateway.observe(Event{Kind: EventConnectionOpened, ConnectionID: c.infoSnapshot().ConnectionID, ClientID: c.infoSnapshot().ClientID})
+	current := int(c.gateway.connectionsCurrent.Add(1))
+	c.gateway.observe(Event{Kind: EventConnectionOpened, ConnectionsCurrent: current, ConnectionID: c.infoSnapshot().ConnectionID, ClientID: c.infoSnapshot().ClientID})
+	defer func() {
+		current := int(c.gateway.connectionsCurrent.Add(-1))
+		closeCode, closeWhy := c.closeDetails()
+		if closeWhy == "" {
+			closeWhy = closeReasonInternal
+		}
+		c.gateway.observe(Event{Kind: EventConnectionClosed, ConnectionsCurrent: current, Code: fmt.Sprintf("%d", closeCode), Reason: closeWhy, ConnectionID: c.infoSnapshot().ConnectionID, ClientID: c.infoSnapshot().ClientID})
+	}()
 
 	writerDone := make(chan struct{})
 	go c.writer(writerDone)
@@ -394,11 +567,9 @@ func (c *connection) run(parent context.Context) {
 	<-heartbeatDone
 	<-contextDone
 	<-handshakeTimeoutDone
-	closeCode, closeWhy := c.closeDetails()
-	if closeWhy == "" {
-		closeWhy = closeReasonInternal
-	}
-	c.gateway.observe(Event{Kind: EventConnectionClosed, Code: fmt.Sprintf("%d", closeCode), Reason: closeWhy, ConnectionID: c.infoSnapshot().ConnectionID, ClientID: c.infoSnapshot().ClientID})
+	// The lifecycle event is emitted by the defer above after all transport
+	// goroutines have stopped, so observers see a zero current count only after
+	// the connection is fully cleaned up.
 }
 
 func (c *connection) handshakeTimeout(ctx context.Context, done chan<- struct{}) {
@@ -616,6 +787,12 @@ func (c *connection) writer(done chan<- struct{}) {
 		case frameMessage:
 			err = c.ws.Write(context.Background(), websocket.MessageText, frame.payload)
 			if err == nil {
+				if frame.onWritten != nil {
+					func() {
+						defer func() { _ = recover() }()
+						frame.onWritten()
+					}()
+				}
 				var envelope protocol.Envelope
 				if json.Unmarshal(frame.payload, &envelope) == nil {
 					c.gateway.observe(Event{Kind: EventMessage, Direction: DirectionOutbound, MessageType: envelope.Type, Bytes: len(frame.payload), ConnectionID: c.infoSnapshot().ConnectionID, ClientID: c.infoSnapshot().ClientID})
@@ -719,8 +896,11 @@ const (
 )
 
 type outboundFrame struct {
-	kind    frameKind
-	payload []byte
+	kind           frameKind
+	payload        []byte
+	subscriptionID string
+	purgeable      bool
+	onWritten      func()
 }
 
 type outboundQueue struct {
@@ -753,11 +933,44 @@ func (q *outboundQueue) enqueue(frame outboundFrame) error {
 	return nil
 }
 
+// purgeSubscriptionChanges removes only not-yet-written durable changes for
+// one subscription. Control frames and frames owned by other subscriptions
+// retain their FIFO order and bytes.
+func (q *outboundQueue) purgeSubscriptionChanges(subscriptionID string) int {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if q.closed || subscriptionID == "" {
+		return 0
+	}
+	items := q.items
+	kept := items[:0]
+	removed := 0
+	for _, frame := range items {
+		if frame.purgeable && frame.subscriptionID == subscriptionID {
+			q.bytes -= len(frame.payload)
+			removed++
+			continue
+		}
+		kept = append(kept, frame)
+	}
+	for index := len(kept); index < len(items); index++ {
+		// Do not retain purged payloads or writer confirmations through the
+		// backing array after ownership has been discarded.
+		items[index] = outboundFrame{}
+	}
+	q.items = kept
+	if removed > 0 {
+		q.signalLocked()
+	}
+	return removed
+}
+
 func (q *outboundQueue) next(ctx context.Context) (outboundFrame, bool) {
 	for {
 		q.mu.Lock()
 		if len(q.items) > 0 {
 			frame := q.items[0]
+			q.items[0] = outboundFrame{}
 			q.items = q.items[1:]
 			q.bytes -= len(frame.payload)
 			q.signalLocked()

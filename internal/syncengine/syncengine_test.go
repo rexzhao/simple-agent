@@ -391,6 +391,28 @@ func TestSubscriptionACKStateTracksFloorAndContiguousSending(t *testing.T) {
 	}
 }
 
+func TestSnapshotDeliveryStateDoesNotClaimQueuedFrameWasSent(t *testing.T) {
+	if _, err := NewSubscriptionStateForSnapshot("epoch", ^uint64(0)); !errors.Is(err, ErrSequenceExhausted) {
+		t.Fatalf("max snapshot sequence error=%v, want ErrSequenceExhausted", err)
+	}
+	state, err := NewSubscriptionStateForSnapshot("epoch", 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.HasSent() || state.LastSent() != 0 {
+		t.Fatalf("queued snapshot was reported sent: has=%v sequence=%d", state.HasSent(), state.LastSent())
+	}
+	if _, err := state.Ack("epoch", 100); !errors.Is(err, ErrAckAhead) {
+		t.Fatalf("ACK for queued snapshot=%v, want ErrAckAhead", err)
+	}
+	if err := state.MarkSent("epoch", 100); err != nil {
+		t.Fatal(err)
+	}
+	if !state.HasSent() || state.LastSent() != 100 {
+		t.Fatalf("confirmed snapshot state: has=%v sequence=%d", state.HasSent(), state.LastSent())
+	}
+}
+
 func TestSnapshotContentUnionBlobAndOperationValidation(t *testing.T) {
 	inline := NewInlineSnapshotContent([]byte(`{"items":[]}`))
 	if err := inline.Validate(); err != nil {

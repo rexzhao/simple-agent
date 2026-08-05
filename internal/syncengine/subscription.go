@@ -14,8 +14,8 @@ var (
 )
 
 // SubscriptionState tracks only transport delivery progress for one
-// subscription. NewSubscriptionState's baseline is an already sent snapshot
-// sequence. It is not a claim that later sequences were sent.
+// subscription. Resume/snapshot baselines are kept internally for validation
+// but are not exposed as LastSent until the writer confirms the frame.
 type SubscriptionState struct {
 	mu sync.RWMutex
 
@@ -51,6 +51,25 @@ func NewSubscriptionState(streamEpoch string, baseline uint64) (*SubscriptionSta
 // constructor. NewSubscriptionState remains the compact form.
 func NewSubscriptionStateAtSnapshot(streamEpoch string, snapshotSequence uint64) (*SubscriptionState, error) {
 	return NewSubscriptionState(streamEpoch, snapshotSequence)
+}
+
+// NewSubscriptionStateForSnapshot initializes the delivery cursor before the
+// snapshot has been handed to the transport writer. ACK at the snapshot
+// sequence is therefore rejected until MarkSent confirms the actual write.
+func NewSubscriptionStateForSnapshot(streamEpoch string, snapshotSequence uint64) (*SubscriptionState, error) {
+	if strings.TrimSpace(streamEpoch) == "" {
+		return nil, ErrInvalidEpoch
+	}
+	if snapshotSequence == ^uint64(0) {
+		return nil, ErrSequenceExhausted
+	}
+	return &SubscriptionState{
+		epoch:        streamEpoch,
+		lastSent:     snapshotSequence,
+		ackFloor:     snapshotSequence,
+		nextSequence: snapshotSequence,
+		hasSent:      false,
+	}, nil
 }
 
 // NewSubscriptionStateForReplay initializes a subscription before replay
@@ -95,7 +114,21 @@ func (s *SubscriptionState) LastSent() uint64 {
 	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	if !s.hasSent {
+		return 0
+	}
 	return s.lastSent
+}
+
+// HasSent distinguishes an actual writer confirmation from the resume or
+// snapshot baseline held internally while the frame is still queued.
+func (s *SubscriptionState) HasSent() bool {
+	if s == nil {
+		return false
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.hasSent
 }
 
 func (s *SubscriptionState) Acknowledged() uint64 {
