@@ -61,6 +61,34 @@ describe('reduceRunEvent', () => {
     expect(updated.assistantItems?.['turn-1:1']).toEqual({ itemID: 'assistant-1', durableTextLength: 8 })
   })
 
+  it('falls back from an empty projection envelope turn to the item turn', () => {
+    const run = apply(newRun(), { type: 'turn.started', turn_id: 'turn-1' }, {
+      type: 'item.created', session_id: 'session-1', turn_id: '', agent_iteration: 1,
+      seq: 10, revision: '10', item_id: 'assistant-1', assistant_text_length: 3,
+      item: { seq: 9, id: 'assistant-1', turn_id: 'turn-1', agent_iteration: 1, created_at: '', kind: 'message', visibility: 'visible', audience: 'model', message: { role: 'assistant', content: { inline: 'abc' } } },
+    })
+    expect(run.assistantItems?.['turn-1:1']).toEqual({ itemID: 'assistant-1', durableTextLength: 3 })
+    expect(run.assistantItemBindings?.[JSON.stringify(['turn-1', 1, 'assistant-1'])]).toMatchObject({ itemID: 'assistant-1' })
+  })
+
+  it('ignores a projection with conflicting envelope and item turns', () => {
+    const run = apply(newRun(), {
+      type: 'item.created', session_id: 'session-1', turn_id: 'turn-envelope', agent_iteration: 1,
+      seq: 10, revision: '10', item_id: 'assistant-1',
+      item: { seq: 9, id: 'assistant-1', turn_id: 'turn-item', agent_iteration: 1, created_at: '', kind: 'message', visibility: 'visible', audience: 'model', message: { role: 'assistant', content: { inline: 'abc' } } },
+    })
+    expect(run.assistantItems).toBeUndefined()
+  })
+
+  it('does not invent a projection turn from the active run when both identities are missing', () => {
+    const run = apply({ ...newRun(), turnID: 'run-turn', agentIteration: 1 }, {
+      type: 'item.created', session_id: 'session-1', turn_id: '', agent_iteration: 1,
+      seq: 10, revision: '10', item_id: 'assistant-1',
+      item: { seq: 9, id: 'assistant-1', agent_iteration: 1, created_at: '', kind: 'message', visibility: 'visible', audience: 'model', message: { role: 'assistant', content: { inline: 'abc' } } },
+    })
+    expect(run.assistantItems).toBeUndefined()
+  })
+
   it('does not deduplicate two durable assistant ids with identical text', () => {
     const base = newRun()
     const event = (id: string, seq: number): RunEvent => ({
@@ -69,6 +97,30 @@ describe('reduceRunEvent', () => {
     })
     const run = apply(base, event('assistant-a', 1), event('assistant-b', 2))
     expect(Object.values(run.assistantItems ?? {}).map((item) => item.itemID)).toEqual(['assistant-a', 'assistant-b'])
+  })
+
+  it('keeps complete bindings when one invocation is replayed with a new item id', () => {
+    const run = apply(
+      newRun(),
+      { type: 'turn.started', turn_id: 'turn-1' },
+      { type: 'agent.iteration.started', turn_id: 'turn-1', agent_iteration: 1 },
+      { type: 'text.delta', turn_id: 'turn-1', agent_iteration: 1, text: 'old', item_id: 'assistant-old', durable_checkpointed: false },
+      { type: 'text.delta', turn_id: 'turn-1', agent_iteration: 1, text: 'new', item_id: 'assistant-new', durable_checkpointed: false },
+    )
+    expect(run.assistantText).toBe('new')
+    expect(Object.keys(run.assistantItemBindings ?? {})).toHaveLength(2)
+    expect(run.assistantItems?.['turn-1:1']).toMatchObject({ itemID: 'assistant-new' })
+  })
+
+  it('does not merge reasoning deltas that lack a complete identity', () => {
+    const run = apply(
+      newRun(),
+      { type: 'reasoning.delta', turn_id: 'turn-1', agent_iteration: 1, text: 'legacy-a' },
+      { type: 'reasoning.delta', turn_id: 'turn-1', agent_iteration: 1, text: 'legacy-b' },
+      { type: 'reasoning.delta', turn_id: 'turn-1', agent_iteration: 1, item_id: 'assistant-1', text: 'bound-a' },
+      { type: 'reasoning.delta', turn_id: 'turn-1', agent_iteration: 1, item_id: 'assistant-1', text: 'bound-b' },
+    )
+    expect(run.steps.map((step) => step.kind === 'reasoning' ? step.text : '')).toEqual(['legacy-a', 'legacy-b', 'bound-abound-b'])
   })
 
   it('updates one tool across iterations without duplicating it', () => {
@@ -122,7 +174,10 @@ describe('reduceRunEvent', () => {
       { type: 'turn.failed', turn_id: 'turn-1', code: 'failed', message: 'boom' },
     )
 
-    expect(run.steps).toEqual([expect.objectContaining({ kind: 'reasoning', text: 'think more' })])
+    expect(run.steps).toEqual([
+      expect.objectContaining({ kind: 'reasoning', text: 'think ' }),
+      expect.objectContaining({ kind: 'reasoning', text: 'more' }),
+    ])
     expect(run).toMatchObject({ inputTokens: 10, totalTokens: 14, cachedTokens: 2, reasoningTokens: 3, status: 'failed', error: 'boom' })
   })
 

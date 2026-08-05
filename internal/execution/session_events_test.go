@@ -468,9 +468,9 @@ func TestSessionStreamFailureOrdersTurnFailedAfterPriorEvents(t *testing.T) {
 	if got := joinSessionStreamEventTexts(events, "text.delta"); got != "partial output" {
 		t.Fatalf("combined text = %q, want %q", got, "partial output")
 	}
-	appendIdx := indexOfString(types, "item.appended")
+	appendIdx := indexOfString(types, "item.created")
 	if appendIdx < 0 || appendIdx >= failedIdx {
-		t.Fatalf("item.appended(%d) must precede turn.failed(%d): %#v", appendIdx, failedIdx, types)
+		t.Fatalf("item.created(%d) must precede turn.failed(%d): %#v", appendIdx, failedIdx, types)
 	}
 }
 
@@ -604,8 +604,11 @@ func TestSessionStreamCoalescesOnlyConsecutiveSameTypeDeltas(t *testing.T) {
 			}
 		}
 	}
-	if got := countString(gotTypes, "item.appended"); got != 2 {
-		t.Fatalf("item.appended count = %d, want 2", got)
+	if got := countString(gotTypes, "item.appended"); got != 0 {
+		t.Fatalf("item.appended count = %d, want no new public appended events", got)
+	}
+	if got := countString(gotTypes, "item.created"); got != 2 {
+		t.Fatalf("item.created count = %d, want user and assistant creation", got)
 	}
 }
 

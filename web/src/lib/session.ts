@@ -123,3 +123,10 @@ export function sessionTreeContains(node: SessionTreeNode, sessionIDs: ReadonlyS
 export function itemText(item: SessionItem): string {
 	return item.message?.content?.inline || item.message?.content?.preview || ''
 }
+
+/** Stable durable identity. Text, sequence and array position are never part
+ * of item identity. The empty turn/iteration values are the legacy shape for
+ * append-only user records. */
+export function sessionItemIdentityKey(item: Pick<SessionItem, 'id' | 'turn_id' | 'agent_iteration'>): string {
+  return JSON.stringify([item.turn_id?.trim() ?? '', Number(item.agent_iteration ?? 0), item.id])
+}

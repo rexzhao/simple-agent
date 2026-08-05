@@ -6,7 +6,7 @@ export function appendReasoning(steps: RunStep[], text: string, iteration: numbe
 	const last = steps[steps.length - 1]
 	const normalizedTurnID = turnID.trim()
 	const normalizedItemID = itemID.trim()
-	if (last?.kind === 'reasoning' && last.iteration === normalizedIteration &&
+	if (last?.kind === 'reasoning' && normalizedTurnID && normalizedItemID && last.iteration === normalizedIteration &&
 		(last.turnID ?? '') === normalizedTurnID && (last.itemID ?? '') === normalizedItemID) {
 		return [...steps.slice(0, -1), { ...last, text: last.text + text }]
 	}

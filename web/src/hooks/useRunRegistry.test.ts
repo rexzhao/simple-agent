@@ -88,6 +88,17 @@ describe('useRunRegistry delta batching', () => {
     act(() => result.current.updateActiveRun('session-1', 'run-1', (r) => ({ ...r, status: 'reconciling' })))
     expect(result.current.runningSessionIDs.has('session-1')).toBe(false)
   })
+
+  it('recovers an active run without a presentation-only restored flag', () => {
+    const { result } = renderHook(() => useRunRegistry())
+    act(() => result.current.syncActiveRuns([{ session_id: 'session-1', run_id: 'run-recovered', turn_id: 'turn-recovered', started_at: '', status: 'running' }]))
+    expect(result.current.activeRunsBySession['session-1']).toMatchObject({
+      id: 'run-recovered',
+      turnID: 'turn-recovered',
+      status: 'running',
+    })
+    expect('restored' in result.current.activeRunsBySession['session-1']).toBe(false)
+  })
 })
 
 describe('coalesceRunEvents', () => {
@@ -114,5 +125,25 @@ describe('coalesceRunEvents', () => {
     expect(events).toHaveLength(2)
     expect(events[0]).toMatchObject({ text: 'a', item_id: 'assistant-1', durable_checkpointed: true })
     expect(events[1]).toMatchObject({ text: 'bc', item_id: 'assistant-1', durable_checkpointed: false })
+  })
+
+  it('does not coalesce reasoning from different durable item identities', () => {
+    const events = coalesceRunEvents([
+      { type: 'reasoning.delta', turn_id: 'turn', agent_iteration: 1, item_id: 'assistant-a', text: 'same' },
+      { type: 'reasoning.delta', turn_id: 'turn', agent_iteration: 1, item_id: 'assistant-b', text: 'same' },
+      { type: 'reasoning.delta', turn_id: 'turn', agent_iteration: 1, item_id: 'assistant-b', text: ' tail' },
+    ])
+    expect(events).toEqual([
+      expect.objectContaining({ item_id: 'assistant-a', text: 'same' }),
+      expect.objectContaining({ item_id: 'assistant-b', text: 'same tail' }),
+    ])
+  })
+
+  it('does not coalesce legacy reasoning deltas without item identity', () => {
+    const events = coalesceRunEvents([
+      { type: 'reasoning.delta', turn_id: 'turn', agent_iteration: 1, text: 'a' },
+      { type: 'reasoning.delta', turn_id: 'turn', agent_iteration: 1, text: 'b' },
+    ])
+    expect(events).toHaveLength(2)
   })
 })

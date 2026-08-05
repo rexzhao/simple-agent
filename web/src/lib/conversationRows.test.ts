@@ -127,6 +127,19 @@ describe('buildConversationRows stable identities', () => {
     expect(keys(after).slice(-before.length)).toEqual(keys(before))
   })
 
+  it('keeps one row identity when an item update carries a different record sequence', () => {
+    const before = buildConversationRows({
+      sessionID: 'session-1',
+      items: [item('assistant-1', 2, 'assistant', 'before', { turn_id: 'turn-1', agent_iteration: 1 })],
+    })
+    const after = buildConversationRows({
+      sessionID: 'session-1',
+      items: [item('assistant-1', 9, 'assistant', 'after', { turn_id: 'turn-1', agent_iteration: 1 })],
+    })
+    expect(after.filter((row) => row.kind === 'message')).toHaveLength(1)
+    expect(after[0].key).toBe(before[0].key)
+  })
+
   it('keeps the active tail key while stream content, compaction, and retry state update', () => {
     const first = buildConversationRows({
       sessionID: 'session-1',
@@ -227,6 +240,57 @@ describe('buildConversationRows stable identities', () => {
     const durableProcess = rows.find((row) => row.kind === 'process')
     expect(durableProcess?.steps).toEqual(expect.arrayContaining([
       expect.objectContaining({ kind: 'tool', id: 'call-1', status: 'running' }),
+    ]))
+  })
+
+  it('keeps assistant content with tool calls in one process output', () => {
+    const rows = buildConversationRows({
+      sessionID: 'session-1',
+      items: [item('assistant-call', 1, 'assistant', 'I will inspect it.', {
+        turn_id: 'turn-1',
+        agent_iteration: 1,
+        message: {
+          role: 'assistant',
+          content: { inline: 'I will inspect it.' },
+          tool_calls: [{ id: 'call-1', name: 'shell' }],
+        },
+      })],
+    })
+    const processes = rows.filter((row) => row.kind === 'process')
+    expect(processes).toHaveLength(1)
+    expect(processes[0].steps).toEqual(expect.arrayContaining([
+      expect.objectContaining({ kind: 'output', text: 'I will inspect it.' }),
+      expect.objectContaining({ kind: 'tool', id: 'call-1' }),
+    ]))
+    expect(rows.filter((row) => row.kind === 'message')).toHaveLength(0)
+  })
+
+  it('uses the completed durable tool result instead of a pending live copy', () => {
+    const rows = buildConversationRows({
+      sessionID: 'session-1',
+      items: [
+        item('assistant-call', 1, 'assistant', 'inspect', {
+          turn_id: 'turn-1',
+          agent_iteration: 1,
+          message: { role: 'assistant', content: { inline: 'inspect' }, tool_calls: [{ id: 'call-1', name: 'shell' }] },
+        }),
+        item('tool-result', 2, 'tool', 'done', {
+          turn_id: 'turn-1',
+          agent_iteration: 1,
+          status: 'completed',
+          message: { role: 'tool', content: { inline: 'done' }, tool_call_id: 'call-1' },
+        }),
+      ],
+      activeRun: run({
+        steps: [{ kind: 'tool', id: 'call-1', name: 'shell', status: 'requested', iteration: 1 }],
+      }),
+    })
+    const process = rows.find((row) => row.kind === 'process')
+    expect(process?.steps).toEqual(expect.arrayContaining([
+      expect.objectContaining({ kind: 'tool', id: 'call-1', status: 'finished', result: 'done' }),
+    ]))
+    expect(process?.steps).not.toEqual(expect.arrayContaining([
+      expect.objectContaining({ kind: 'tool', id: 'call-1', status: 'requested' }),
     ]))
   })
 
@@ -388,6 +452,7 @@ describe('buildConversationRows stable identities', () => {
     expect(reasoningSteps).toEqual([
       { kind: 'reasoning', id: 'assistant-current-reasoning', text: 'Current turn reasoning.', iteration: 1 },
       { kind: 'reasoning', id: 'reasoning-previous', text: 'Previous turn reasoning.', iteration: 1 },
+      { kind: 'reasoning', id: 'reasoning-current', text: 'Current turn reasoning.', iteration: 1 },
     ])
   })
 

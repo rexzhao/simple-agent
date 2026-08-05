@@ -31,7 +31,7 @@ func TestSessionProjectionItemEventsCarryCommittedSafeDTO(t *testing.T) {
 	if !ok {
 		t.Fatal("user item projection event was skipped")
 	}
-	assertProjectionEnvelope(t, appended, "item.appended", session.ID, "run-1", "turn-1", userEvent.Seq, userState.LastSeq, user.Seq, user.ID)
+	assertProjectionEnvelope(t, appended, "item.created", session.ID, "run-1", "turn-1", userEvent.Seq, userState.LastSeq, user.Seq, user.ID)
 	userDTO, ok := appended["item"].(SessionItem)
 	if !ok {
 		t.Fatalf("appended item = %T, want SessionItem", appended["item"])
@@ -110,6 +110,12 @@ func TestSessionProjectionItemEventsCarryCommittedSafeDTO(t *testing.T) {
 	assistantStreamEvent, ok := service.sessionStreamEventFromPersistedEvent(session.ID, "run-1", "turn-1", assistantEvent, assistantState.LastSeq)
 	if !ok {
 		t.Fatal("assistant item projection event was skipped")
+	}
+	if assistantStreamEvent["type"] != "item.created" {
+		t.Fatalf("assistant projection type = %#v, want item.created", assistantStreamEvent["type"])
+	}
+	if assistantStreamEvent["agent_iteration"] != 0 {
+		t.Fatalf("assistant projection agent_iteration = %#v, want the explicit zero for this fixture", assistantStreamEvent["agent_iteration"])
 	}
 	assistantDTO := assistantStreamEvent["item"].(SessionItem)
 	if assistantDTO.Message == nil || len(assistantDTO.Message.ToolCalls) != 1 || assistantDTO.Message.ToolCalls[0].Arguments != `{"path":"README.md"}` {
@@ -219,6 +225,126 @@ func TestSessionProjectionItemEventsSkipHiddenAndProviderPrivateItems(t *testing
 		previousRevision = state.LastSeq
 		if streamEvent, ok := service.sessionStreamEventFromPersistedEvent(session.ID, "run-1", "turn-1", event, state.LastSeq); ok || streamEvent != nil {
 			t.Fatalf("private item %s entered projection stream: %#v", item.ID, streamEvent)
+		}
+	}
+}
+
+func TestSessionProjectionCreationUsesCreatedForUserAssistantAndTool(t *testing.T) {
+	service, _, session := newExecutionServiceWithSession(t, t.TempDir(), nil)
+	items := []sessions.SessionItem{
+		sessions.SessionItemFromMessage("user-created", model.Message{Role: model.MessageRoleUser, Content: "hello"}),
+		sessions.SessionItemFromMessage("assistant-created", model.Message{Role: model.MessageRoleAssistant, Content: "inspect"}),
+		sessions.SessionItemFromMessage("tool-created", model.Message{Role: model.MessageRoleTool, Content: "result", ToolCallID: "call-1"}),
+	}
+	for index := range items {
+		items[index].TurnID = "turn-created"
+		if index > 0 {
+			items[index].AgentIteration = 1
+		}
+		if items[index].Message.Role == model.MessageRoleTool {
+			items[index].Status = sessions.ItemStatusPending
+		}
+		var err error
+		items[index], err = service.sessionStore.AppendItem(session.ID, items[index])
+		if err != nil {
+			t.Fatalf("AppendItem(%s) error = %v", items[index].ID, err)
+		}
+		event := persistedItemEvent(t, service, session.ID, sessions.RecordTypeItemAppended, items[index].ID)
+		state, err := service.sessionStore.LoadState(session.ID)
+		if err != nil {
+			t.Fatalf("LoadState(%s) error = %v", items[index].ID, err)
+		}
+		streamEvent, ok := service.sessionStreamEventFromPersistedEvent(session.ID, "run-created", "turn-created", event, state.LastSeq)
+		if !ok {
+			t.Fatalf("%s creation projection was skipped", items[index].ID)
+		}
+		if streamEvent["type"] != "item.created" || streamEvent["item_id"] != items[index].ID || streamEvent["turn_id"] != "turn-created" || streamEvent["agent_iteration"] != items[index].AgentIteration {
+			t.Fatalf("creation projection = %#v, want created and complete identity", streamEvent)
+		}
+	}
+
+	tool := items[2]
+	tool.Message = &model.Message{Role: model.MessageRoleTool, Content: "completed", ToolCallID: "call-1"}
+	tool.Status = sessions.ItemStatusCompleted
+	updated, err := service.sessionStore.UpdateItem(session.ID, tool)
+	if err != nil {
+		t.Fatalf("UpdateItem(tool) error = %v", err)
+	}
+	updateEvent := persistedItemEvent(t, service, session.ID, sessions.RecordTypeItemUpdated, tool.ID)
+	state, err := service.sessionStore.LoadState(session.ID)
+	if err != nil {
+		t.Fatalf("LoadState(after tool update) error = %v", err)
+	}
+	streamUpdate, ok := service.sessionStreamEventFromPersistedEvent(session.ID, "run-created", "turn-created", updateEvent, state.LastSeq)
+	if !ok {
+		t.Fatal("tool update projection was skipped")
+	}
+	updatedDTO := streamUpdate["item"].(SessionItem)
+	if streamUpdate["type"] != "item.updated" || streamUpdate["item_id"] != tool.ID || streamUpdate["turn_id"] != "turn-created" || streamUpdate["agent_iteration"] != 1 || updatedDTO.ID != updated.ID || updatedDTO.TurnID != tool.TurnID || updatedDTO.AgentIteration != tool.AgentIteration {
+		t.Fatalf("tool update projection = %#v, want same complete identity", streamUpdate)
+	}
+
+	for _, event := range []sessions.PersistedEvent{
+		persistedItemEvent(t, service, session.ID, sessions.RecordTypeItemAppended, items[0].ID),
+		persistedItemEvent(t, service, session.ID, sessions.RecordTypeItemAppended, items[1].ID),
+		persistedItemEvent(t, service, session.ID, sessions.RecordTypeItemAppended, items[2].ID),
+	} {
+		if event.Type != sessions.RecordTypeItemAppended {
+			t.Fatalf("unexpected storage event type = %q", event.Type)
+		}
+	}
+}
+
+func TestSessionItemPageConversionUsesOneProvidedStateSnapshot(t *testing.T) {
+	service, _, session := newExecutionServiceWithSession(t, t.TempDir(), nil)
+	for index, text := range []string{"first", "second"} {
+		item := sessions.SessionItemFromMessage("assistant-"+strconv.Itoa(index), model.Message{
+			Role:             model.MessageRoleAssistant,
+			Content:          text,
+			ReasoningContent: "reasoning-" + text,
+		})
+		item.TurnID = "turn-1"
+		item.AgentIteration = index + 1
+		if _, err := service.sessionStore.AppendItem(session.ID, item); err != nil {
+			t.Fatalf("AppendItem(%d) error = %v", index, err)
+		}
+	}
+
+	state, err := service.sessionStore.LoadState(session.ID)
+	if err != nil {
+		t.Fatalf("LoadState(with reasoning) error = %v", err)
+	}
+	state.ShowReasoning = true
+	if _, err := service.sessionStore.SaveMetadata(state); err != nil {
+		t.Fatalf("SaveMetadata(show reasoning) error = %v", err)
+	}
+	state, err = service.sessionStore.LoadState(session.ID)
+	if err != nil {
+		t.Fatalf("LoadState(snapshot) error = %v", err)
+	}
+	page, err := service.sessionStore.ReadHistoryPage(session.ID, sessions.HistoryPageOptions{Limit: 10, VisibleOnly: true})
+	if err != nil {
+		t.Fatalf("ReadHistoryPage() error = %v", err)
+	}
+
+	// Change the live metadata after capturing the response state. Every DTO
+	// must still use the captured value; a per-item LoadState would make this
+	// page lose reasoning halfway through conversion.
+	stateAfter := state
+	stateAfter.ShowReasoning = false
+	if _, err := service.sessionStore.SaveMetadata(stateAfter); err != nil {
+		t.Fatalf("SaveMetadata(hide reasoning) error = %v", err)
+	}
+	converted, err := service.sessionItemsPageFromStorePageWithState(session.ID, page, state)
+	if err != nil {
+		t.Fatalf("sessionItemsPageFromStorePageWithState() error = %v", err)
+	}
+	if len(converted.Items) != 2 {
+		t.Fatalf("converted item count = %d, want 2", len(converted.Items))
+	}
+	for _, item := range converted.Items {
+		if item.Message == nil || item.Message.Reasoning == "" {
+			t.Fatalf("converted item %#v lost reasoning from captured state", item)
 		}
 	}
 }

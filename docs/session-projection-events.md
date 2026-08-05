@@ -76,6 +76,9 @@ Each returned `history.items[]` item has a stable `id` and an item `seq`:
 - `seq` is allocated when that item is created and remains the item's sequence
   when the item is later updated.
 - `turn_id` groups items into a turn; it is not a cursor for either stream.
+- The complete client identity is `(turn_id, agent_iteration, item_id)`. The
+  projection envelope repeats `turn_id` and `agent_iteration`; clients must
+  validate them against the nested item and must never use text as identity.
 - `history.oldest_seq` and `history.newest_seq` are item-history page cursors.
 
 An `item.updated` record changes the projection for the existing `item_id`; it
@@ -96,8 +99,8 @@ sequence, including for `item.updated`. Consumers identify the item by
 The agent creates the durable assistant message at the first non-blank,
 user-visible text delta for one logical assistant message. It does not create
 an empty assistant placeholder at run admission or `turn.started`. The
-creation is committed as the existing `item.appended` event. Subsequent
-checkpoints use `item.updated` for the same `item.id`; the nested `item.seq`
+creation is committed and projected as `item.created`. Subsequent checkpoints
+use `item.updated` for the same complete identity; the nested `item.seq`
 (creation sequence) is unchanged while the notification `seq` and session
 `revision` advance monotonically.
 
@@ -111,7 +114,7 @@ tool calls; it never appends a second copy.
 
 The ordering for every visible item event is commit first, notification second:
 the projector writes the item and obtains its durable record sequence before
-the committed `item.appended` or `item.updated` DTO is published. A turn may
+the committed `item.created` or `item.updated` DTO is published. A turn may
 therefore have a low-latency transient tail after the most recent checkpoint;
 that tail is not itself a durable claim. If the forced terminal checkpoint
 fails, the authoritative item stops at the previous committed checkpoint and
@@ -185,34 +188,35 @@ The frozen logical event names and the current wire names are:
 
 | Logical event | Current wire name | Required payload | Meaning |
 | --- | --- | --- | --- |
-| `item.created` | `item.appended` | `session_id`, optional `run_id`, `turn_id`, `seq`, `revision`, `item_id`, `item` | A new visible user-facing durable item is in the projection. |
-| `item.updated` | `item.updated` | `session_id`, optional `run_id`, `turn_id`, `seq`, `revision`, `item_id`, `item` | An existing visible user-facing durable item changed. |
+| `item.created` | `item.created` | `session_id`, optional `run_id`, `turn_id`, `agent_iteration`, `seq`, `revision`, `item_id`, `item` | A new visible user, assistant, or tool durable item is in the projection. |
+| `item.appended` | receive alias only | `session_id`, optional `run_id`, `turn_id`, `agent_iteration`, `seq`, `revision`, `item_id`, `item` | A legacy storage/public event accepted during migration; not emitted for new items. |
+| `item.updated` | `item.updated` | `session_id`, optional `run_id`, `turn_id`, `agent_iteration`, `seq`, `revision`, `item_id`, `item` | An existing visible user-facing durable item changed. |
 
-The current Go implementation emits `item.appended`, because that is also the
-current storage record name. `item.created` is the frozen logical/canonical
-name for a future compatible naming step; stage 2 does **not** rename the
-emitted event or dual-emit it.
+The storage record remains `item.appended`, but every new visible item uses
+the public `item.created` event, including user, assistant, and tool items.
+`item.appended` is receive-only compatibility for old services/records; the
+current backend does not emit it for new items and never dual-emits it with
+`item.created`.
 
 During migration:
 
-- consumers MUST accept both `item.created` and `item.appended` and process
-  them with the same semantics;
-- a producer MUST NOT make a consumer require `item.created` until the legacy
-  name has been retired by an explicit later migration; and
-- a producer that sends both names for one record would cause duplicate work,
-  so dual emission is not part of this contract unless a future version adds a
-  stable event identity and an explicit deduplication rule.
+- the current producer emits only `item.created` for each new visible item;
+- current consumers MUST accept both `item.created` and legacy `item.appended`;
+- a legacy producer may continue to emit `item.appended` during migration; and
+- no producer may dual-emit both names for one record, because that would cause
+  duplicate work without an explicit event identity/deduplication contract.
 
-Stage 2 notifications contain the committed, frontend-safe item projection so
+Projection notifications contain the committed, frontend-safe item projection so
 the live stream can render the durable result without reconstructing it from a
 request or transient model event. A representative creation notification is:
 
 ```json
 {
-  "type": "item.appended",
+  "type": "item.created",
   "session_id": "session-1",
   "run_id": "run-1",
   "turn_id": "turn-1",
+  "agent_iteration": 0,
   "seq": 12,
   "revision": "19",
   "item_id": "msg-000001",
@@ -241,6 +245,7 @@ item's creation sequence remains unchanged:
   "session_id": "session-1",
   "run_id": "run-1",
   "turn_id": "turn-1",
+  "agent_iteration": 1,
   "seq": 17,
   "revision": "19",
   "item_id": "msg-000001",
@@ -586,7 +591,7 @@ The following aliases and differences are intentionally frozen for migration:
 | Area | Current compatibility field/name | Rule for new code |
 | --- | --- | --- |
 | Snapshot watermark | `revision` string; `session.last_seq` numeric | Prefer `revision`; accept/use `last_seq` when talking to older endpoints, comparing numerically. |
-| Item creation event | `item.appended` | Accept both `item.created` and `item.appended`; do not dual-emit without a later dedupe contract. |
+| Item creation event | `item.created` for all new visible items | Accept `item.appended` as a receive alias for old records; do not dual-emit. |
 | Item event body/cursor | `item` plus payload `seq` | `item` is the committed safe DTO; treat top-level `seq` as the causing durable record sequence and `item.seq` as creation sequence. |
 | Session DTO watermark | `revision` string plus `last_seq` number | Prefer the decimal string; retain/read `last_seq` for older clients. |
 | Run settlement watermark | `committed_revision` string plus `last_seq` number | Prefer the decimal string; retain/read `last_seq` for older clients. |
@@ -595,12 +600,12 @@ The following aliases and differences are intentionally frozen for migration:
 | Per-run terminal identity | `run_id`, no current `session_id` | Bind through the run endpoint/descriptor; treat a later optional `session_id` as additive. |
 | Run cursor | per-run SSE `id` | Send as `after` only for the same `run_id`; never compare it to `revision` or item `seq`. |
 
-Stage 2 does not rename storage records, change the HTTP status codes, add
-optimistic history mutation, or add a second item event for the same record.
-The frontend type declarations accept the logical `item.created` alias, but
-the backend emits only the legacy-compatible `item.appended` wire name. Any
-later protocol change must update this document and its characterization tests
-in the same change.
+This protocol stage does not rename storage records, change the HTTP status
+codes, add optimistic history mutation, or add a second item event for the same
+record. The storage record may still be `item.appended` while the public wire
+projection uses `item.created` for every new visible item. Any later protocol
+change must update this document and its characterization tests in the same
+change.
 
 ## 8. Stage 7 fault-injection and E2E acceptance matrix
 

@@ -178,14 +178,16 @@ export function useSessionStore() {
     dispatchStore({ type: 'setMeta', sessionID, loading, error })
   }, [dispatchStore])
 
-  const applyProjectionEvent = useCallback((event: SessionItemProjectionEvent) => {
+  const applyProjectionEvent = useCallback((event: SessionItemProjectionEvent): boolean => {
     const before = stateRef.current
     dispatchStore({ type: 'projectionEvent', event })
+    const accepted = before !== stateRef.current
     logProjectionTransition(event.session_id, 'projection.apply', before, stateRef.current, () => ({
       ...protocolLogIdentity(event as unknown as Record<string, unknown>),
       event,
-      accepted: before !== stateRef.current,
+      accepted,
     }))
+    return accepted
   }, [dispatchStore])
 
   const updateSessionMetadata = useCallback((session: Session) => {

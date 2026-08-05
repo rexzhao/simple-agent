@@ -316,13 +316,17 @@ func (s *Service) sessionItemsPageFromStorePage(sessionID string, page sessions.
 	if err != nil {
 		return SessionItemsPage{}, err
 	}
-	return s.sessionItemsPageFromStorePageWithReasoning(sessionID, page, state.ShowReasoning)
+	return s.sessionItemsPageFromStorePageWithState(sessionID, page, state)
 }
 
-func (s *Service) sessionItemsPageFromStorePageWithReasoning(sessionID string, page sessions.HistoryPage, showReasoning bool) (SessionItemsPage, error) {
+// sessionItemsPageFromStorePageWithState converts a whole page against one
+// already-loaded state. In particular, ShowReasoning must not be read once
+// per item: a metadata write racing a page conversion would otherwise produce
+// a response whose DTOs disagree about the same session setting.
+func (s *Service) sessionItemsPageFromStorePageWithState(sessionID string, page sessions.HistoryPage, state sessions.SessionV2) (SessionItemsPage, error) {
 	items := make([]SessionItem, 0, len(page.Items))
 	for _, item := range page.Items {
-		dto, err := s.sessionItemDTOWithReasoning(sessionID, item, showReasoning)
+		dto, err := s.sessionItemDTOWithState(sessionID, item, state)
 		if err != nil {
 			return SessionItemsPage{}, err
 		}
@@ -350,7 +354,7 @@ func (s *Service) buildItemsPage(session sessions.SessionV2, beforeSeq, afterSeq
 	page, hasMoreBefore, hasMoreAfter := pagedSessionItems(filtered, beforeSeq, afterSeq, limit, alignTurn)
 	items := make([]SessionItem, 0, len(page))
 	for _, item := range page {
-		dto, err := s.sessionItemDTOWithReasoning(session.ID, item, session.ShowReasoning)
+		dto, err := s.sessionItemDTOWithState(session.ID, item, session)
 		if err != nil {
 			return SessionItemsPage{}, err
 		}
@@ -593,11 +597,18 @@ func (s *Service) emitPersistedSessionEventsThrough(sessionID, runID, turnID str
 	if err != nil {
 		return afterSeq
 	}
+	// Every DTO in this projection batch is converted from the same state
+	// snapshot. Loading state from sessionItemDTO for each item allowed a
+	// metadata update to make one SSE response expose mixed reasoning policy.
+	state, err := s.sessionStore.LoadState(sessionID)
+	if err != nil {
+		return afterSeq
+	}
 	for _, event := range events {
 		if event.Seq > throughSeq {
 			break
 		}
-		streamEvent, ok := s.sessionStreamEventFromPersistedEvent(sessionID, runID, turnID, event, throughSeq)
+		streamEvent, ok := s.sessionStreamEventFromPersistedEventWithState(sessionID, runID, turnID, event, throughSeq, state)
 		if !ok {
 			continue
 		}
@@ -607,6 +618,14 @@ func (s *Service) emitPersistedSessionEventsThrough(sessionID, runID, turnID str
 }
 
 func (s *Service) sessionStreamEventFromPersistedEvent(sessionID, runID, turnID string, event sessions.PersistedEvent, revision int64) (SessionStreamEvent, bool) {
+	state, err := s.sessionStore.LoadState(sessionID)
+	if err != nil {
+		return nil, false
+	}
+	return s.sessionStreamEventFromPersistedEventWithState(sessionID, runID, turnID, event, revision, state)
+}
+
+func (s *Service) sessionStreamEventFromPersistedEventWithState(sessionID, runID, turnID string, event sessions.PersistedEvent, revision int64, state sessions.SessionV2) (SessionStreamEvent, bool) {
 	switch event.Type {
 	case sessions.RecordTypeItemAppended, sessions.RecordTypeItemUpdated:
 		item, err := s.committedPersistedItem(sessionID, event)
@@ -616,7 +635,7 @@ func (s *Service) sessionStreamEventFromPersistedEvent(sessionID, runID, turnID 
 			// projection stream; run SSE IDs remain the transport gap signal.
 			return nil, false
 		}
-		dto, err := s.sessionItemDTO(sessionID, item)
+		dto, err := s.sessionItemDTOWithState(sessionID, item, state)
 		if err != nil {
 			return nil, false
 		}
@@ -634,6 +653,10 @@ func (s *Service) sessionStreamEventFromPersistedEvent(sessionID, runID, turnID 
 		if resolvedTurnID != "" {
 			fields["turn_id"] = resolvedTurnID
 		}
+		// Keep the complete projection identity at the envelope level as well
+		// as in item. This lets clients reject a malformed event without using
+		// text or a turn-only lookup.
+		fields["agent_iteration"] = item.AgentIteration
 		if strings.TrimSpace(runID) != "" {
 			fields["run_id"] = runID
 		}
@@ -645,7 +668,7 @@ func (s *Service) sessionStreamEventFromPersistedEvent(sessionID, runID, turnID 
 				fields["assistant_text_length"] = utf8.RuneCountInString(content)
 			}
 		}
-		eventType := "item.appended"
+		eventType := "item.created"
 		if event.Type == sessions.RecordTypeItemUpdated {
 			eventType = "item.updated"
 		}
@@ -664,12 +687,10 @@ func (s *Service) sessionStreamEventFromPersistedEvent(sessionID, runID, turnID 
 	}
 }
 
-// committedPersistedItem returns the item as it was written by the durable
-// record. Reading the event payload is important when the lossless bridge is
-// briefly behind the writer: a later update must not make an earlier
-// item.appended notification contain the later contents. Updates overwrite
-// the event payload sequence with their record sequence, so restore the
-// immutable creation sequence from the item projection.
+// committedPersistedItem returns the item payload carried by the durable
+// record. Updates restore the immutable history sequence from the item table;
+// the caller still converts the resulting DTO with its single batch state
+// snapshot.
 func (s *Service) committedPersistedItem(sessionID string, event sessions.PersistedEvent) (sessions.SessionItem, error) {
 	var item sessions.SessionItem
 	if event.Item != nil {
@@ -682,6 +703,10 @@ func (s *Service) committedPersistedItem(sessionID string, event sessions.Persis
 		item = loaded
 	}
 	if event.Type == sessions.RecordTypeItemUpdated {
+		// The execution-state JSON uses the latest record sequence for an
+		// updated item. ReadItem exposes the item-table sequence, which is the
+		// immutable history-row sequence. This is not a LoadState and does not
+		// change the single metadata/state snapshot used for DTO conversion.
 		projected, err := s.sessionStore.ReadItem(sessionID, event.ItemID)
 		if err != nil {
 			return sessions.SessionItem{}, err
@@ -785,10 +810,10 @@ func (s *Service) sessionItemDTO(sessionID string, item sessions.SessionItem) (S
 	if err != nil {
 		return SessionItem{}, err
 	}
-	return s.sessionItemDTOWithReasoning(sessionID, item, state.ShowReasoning)
+	return s.sessionItemDTOWithState(sessionID, item, state)
 }
 
-func (s *Service) sessionItemDTOWithReasoning(sessionID string, item sessions.SessionItem, showReasoning bool) (SessionItem, error) {
+func (s *Service) sessionItemDTOWithState(sessionID string, item sessions.SessionItem, state sessions.SessionV2) (SessionItem, error) {
 	dto := SessionItem{
 		Seq:            item.Seq,
 		ID:             item.ID,
@@ -808,7 +833,7 @@ func (s *Service) sessionItemDTOWithReasoning(sessionID string, item sessions.Se
 		ToolCallID: item.Message.ToolCallID,
 		IsError:    item.Message.IsError,
 	}
-	if showReasoning && item.Message.Role == model.MessageRoleAssistant {
+	if state.ShowReasoning && item.Message.Role == model.MessageRoleAssistant {
 		dto.Message.Reasoning = item.Message.ReasoningContent
 	}
 	if len(item.Message.ToolCalls) > 0 {

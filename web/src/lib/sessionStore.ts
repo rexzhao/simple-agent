@@ -1,4 +1,5 @@
 import type { ItemsPage, Session, SessionItem, SessionItemProjectionEvent, SessionSnapshot } from '../types'
+import { sessionItemIdentityKey } from './session'
 
 /**
  * The normalized session store holds all session data in a single
@@ -175,12 +176,33 @@ function projectionEventRecordSeq(event: SessionItemProjectionEvent): string {
   return parseDecimalRevision(event.seq) ?? '0'
 }
 
+/** Validate and normalize the complete durable item identity. A malformed
+ * envelope is ignored rather than allowing an item-id-only update to mutate a
+ * different turn/iteration. */
+function projectionItemIdentityKey(event: SessionItemProjectionEvent): string | null {
+  const itemID = event.item_id?.trim()
+  if (!itemID || event.item.id !== itemID) return null
+  const itemTurnID = event.item.turn_id?.trim() ?? ''
+  const envelopeTurnID = event.turn_id?.trim() ?? ''
+  if (itemTurnID && envelopeTurnID && itemTurnID !== envelopeTurnID) return null
+  const itemIteration = Number(event.item.agent_iteration ?? 0)
+  const envelopeIteration = event.agent_iteration
+  if (!Number.isInteger(itemIteration) || itemIteration < 0) return null
+  if (envelopeIteration !== undefined && (!Number.isInteger(Number(envelopeIteration)) || Number(envelopeIteration) < 0)) return null
+  if (envelopeIteration !== undefined && Number(envelopeIteration) !== itemIteration) return null
+  return sessionItemIdentityKey({
+    id: itemID,
+    turn_id: envelopeTurnID || itemTurnID,
+    agent_iteration: envelopeIteration ?? itemIteration,
+  })
+}
+
 function compareProjectionEvents(a: SessionItemProjectionEvent, b: SessionItemProjectionEvent): number {
   const aSeq = BigInt(projectionEventRecordSeq(a))
   const bSeq = BigInt(projectionEventRecordSeq(b))
   if (aSeq < bSeq) return -1
   if (aSeq > bSeq) return 1
-  return a.item.id.localeCompare(b.item.id)
+  return (projectionItemIdentityKey(a) ?? '').localeCompare(projectionItemIdentityKey(b) ?? '')
 }
 
 function sessionRevision(session: Session | undefined, fallback = '0'): string {
@@ -199,9 +221,12 @@ function appendPendingProjectionEvent(
   event: SessionItemProjectionEvent,
 ): PendingProjectionEntry {
   const recordSeq = projectionEventRecordSeq(event)
-  const itemID = event.item.id
+  const identityKey = projectionItemIdentityKey(event)
+  if (!identityKey) return pending ?? {
+    events: [], revision: '0', overflowed: false, overflowRevision: '0',
+  }
   const current = pending?.events ?? []
-  if (current.some((candidate) => projectionEventRecordSeq(candidate) === recordSeq && candidate.item.id === itemID)) {
+  if (current.some((candidate) => projectionEventRecordSeq(candidate) === recordSeq && projectionItemIdentityKey(candidate) === identityKey)) {
     return pending!
   }
   const events = [...current, event].sort(compareProjectionEvents)
@@ -459,7 +484,14 @@ function mergeOlderPage(entry: SessionHistoryEntry, older: ItemsPage, requestRev
 
 function applyProjectionEventToEntry(entry: SessionHistoryEntry, event: SessionItemProjectionEvent): SessionHistoryEntry | null {
   const itemID = event.item.id
-  if (!itemID) return null
+  const identityKey = projectionItemIdentityKey(event)
+  if (!itemID || !identityKey) return null
+
+  // A globally unique backend item id is expected, but reject a corrupted
+  // replay that tries to reuse it under a different complete identity.
+  const conflictingItem = entry.page.items.find((item) => item.id === itemID && sessionItemIdentityKey(item) !== identityKey)
+    ?? entry.pendingProjectionByItemID[itemID]?.item
+  if (conflictingItem && sessionItemIdentityKey(conflictingItem) !== identityKey) return null
 
   // A snapshot at this revision is complete authority for that revision.
   // Events at an older or covered revision are replay/stale data, even when
@@ -714,7 +746,7 @@ export function sessionStoreReducer(state: SessionStoreState, action: SessionSto
     case 'projectionEvent': {
       const revision = parseDecimalRevision(action.event.revision)
       const recordSeq = parseDecimalRevision(action.event.seq)
-      if (revision === null || recordSeq === null || !action.event.session_id || !action.event.item?.id) return state
+      if (revision === null || recordSeq === null || !action.event.session_id || !action.event.item?.id || !projectionItemIdentityKey(action.event)) return state
       const event = action.event.revision === revision
         ? action.event
         : { ...action.event, revision }

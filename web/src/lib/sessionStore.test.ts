@@ -185,6 +185,25 @@ describe('sessionStoreReducer', () => {
     })
   })
 
+  it('rejects a projection whose envelope identity disagrees with its item', () => {
+    let state = sessionStoreReducer(initialSessionStoreState(), {
+      type: 'snapshot',
+      snapshot: snapshot('s1', '1', [1]),
+      expectedSessionID: 's1',
+    })
+    const malformed = projectionEvent('item.updated', 'item-1', 1, 2, '2')
+    const before = state
+    state = sessionStoreReducer(state, {
+      type: 'projectionEvent',
+      event: {
+        ...malformed,
+        turn_id: 'turn-envelope',
+        item: { ...malformed.item, turn_id: 'turn-item' },
+      },
+    })
+    expect(state).toBe(before)
+  })
+
   it('ignores a projection event with an invalid watermark', () => {
     const state = sessionStoreReducer(initialSessionStoreState(), {
       type: 'projectionEvent',

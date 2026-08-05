@@ -1,5 +1,5 @@
 import type { ActiveRun, RunStep, SessionItem } from '../types'
-import { itemText } from './session'
+import { itemText, sessionItemIdentityKey } from './session'
 
 /** A turn error is kept separate from ActiveRun so a failed turn can remain
  * actionable while the durable session is being refreshed. */
@@ -63,9 +63,10 @@ export interface BuildConversationRowsInput {
 /**
  * Builds the complete render stream for a conversation without making any
  * assumptions about its eventual list implementation. Durable rows are
- * identified by SessionItem ids/sequences; transient rows are identified by
- * run ids and RunStep ids. Consequently prepending a turn-aligned page does
- * not renumber any existing row and stream deltas update a row in place.
+ * identified by their complete `(turn_id, agent_iteration, item_id)` identity;
+ * transient rows are identified by run ids and RunStep ids. Consequently
+ * prepending a turn-aligned page does not renumber any existing row and stream
+ * deltas update a row in place.
  */
 export function buildConversationRows(input: BuildConversationRowsInput): ConversationRow[] {
   const activeRun = input.activeRun ?? null
@@ -96,17 +97,16 @@ export function buildConversationRows(input: BuildConversationRowsInput): Conver
   // contain that item during the append/snapshot race; only then do we retain
   // the process-row fallback. Never infer this relationship from text or turn
   // content, since identical output can be two distinct assistant messages.
-  const attachedAssistantItemID = assistantBinding && historicalRows.some((row) =>
-    row.kind === 'message' && row.item.id === assistantBinding.itemID && row.item.message?.role === 'assistant',
-  ) ? assistantBinding.itemID : undefined
+  const attachedAssistantIdentity = assistantBinding && historicalRows.some((row) =>
+    row.kind === 'message' && sessionItemIdentityKey(row.item) === assistantIdentityKey(assistantBinding) && row.item.message?.role === 'assistant',
+  ) ? assistantIdentityKey(assistantBinding) : undefined
   // A final assistant projection can arrive while the stream still contains
-  // the reasoning deltas that produced it. Build the suppression set from the
-  // durable item id recorded for each turn/iteration, never from reasoning
-  // text. The turn/iteration set is only the compatibility path for old run
-  // replays that predate reasoning item_id.
+  // the reasoning deltas that produced it. Build the suppression set from
+  // complete durable identities only; incomplete legacy events remain
+  // transient until the durable projection is rendered after settlement.
   const durableReasoning = activeRun ? durableReasoningIdentities(input.items, activeRun) : emptyDurableReasoningIdentities()
   const rows = historicalRows.map((row): ConversationRow => {
-    if (row.kind !== 'message' || row.item.id !== attachedAssistantItemID) return row
+    if (row.kind !== 'message' || sessionItemIdentityKey(row.item) !== attachedAssistantIdentity) return row
     return {
       ...row,
       assistantTail: activeRun?.assistantText || undefined,
@@ -126,17 +126,12 @@ export function buildConversationRows(input: BuildConversationRowsInput): Conver
     // the page, hide only that matching transient tool step; reasoning and
     // still-transient tools remain visible while the run is live.
     const rawSegments = activeRunSegments(activeRun)
-    const filteredSegments = rawSegments.map((segment, segmentIndex) => {
-      // A run can contain an earlier prompt segment whose iteration counter
-      // restarts at 1 for the current turn. The explicit reasoning identity is
-      // safe across every segment; only the legacy no-identity fallback is
-      // restricted to the final segment.
-      const isCurrentSegment = segmentIndex === rawSegments.length - 1
+    const filteredSegments = rawSegments.map((segment) => {
       return {
         ...segment,
         steps: segment.steps.filter((step) => {
           if (step.kind === 'tool' && durableToolIDs.has(step.id)) return false
-          if (step.kind === 'reasoning' && shouldSuppressDurableReasoning(step, segment, isCurrentSegment, activeRun, durableReasoning)) return false
+          if (step.kind === 'reasoning' && shouldSuppressDurableReasoning(step, durableReasoning)) return false
           return true
         }),
       }
@@ -149,7 +144,7 @@ export function buildConversationRows(input: BuildConversationRowsInput): Conver
     // turn must not suppress a fresh run's active-process container.
     const segments = hasLiveSteps
       ? filteredSegments
-      : attachedAssistantItemID
+      : attachedAssistantIdentity
         ? []
         : [{ steps: [], boundary: rawSegments[rawSegments.length - 1]?.boundary ?? 'initial' }]
     const shouldRenderProcess = segments.length > 0
@@ -161,7 +156,7 @@ export function buildConversationRows(input: BuildConversationRowsInput): Conver
           run: activeRun,
           steps: segment.steps,
           isLast: index === segments.length - 1,
-          assistantTailAttached: Boolean(attachedAssistantItemID),
+          assistantTailAttached: Boolean(attachedAssistantIdentity),
         })
       })
     }
@@ -198,22 +193,24 @@ export function buildConversationRows(input: BuildConversationRowsInput): Conver
   return rows
 }
 
-function activeAssistantBinding(run: ActiveRun): { itemID: string; durableTextLength: number } | undefined {
+function activeAssistantBinding(run: ActiveRun): { itemID: string; turnID: string; agentIteration: number; durableTextLength: number } | undefined {
   const turnID = run.turnID?.trim()
   if (!turnID || run.agentIteration <= 0) return undefined
-  // The key selects the current invocation, but the item id is the only
-  // identity used to attach the transient tail to a durable row.
-  return run.assistantItems?.[`${turnID}:${run.agentIteration}`]
+  const invocationKey = `${turnID}:${run.agentIteration}`
+  const indexed = run.assistantItems?.[invocationKey]
+  if (!indexed) return undefined
+  // assistantItems is only a compatibility/current-invocation index. Resolve
+  // the actual entity through the complete identity binding when available.
+  const binding = run.assistantItemBindings?.[assistantItemIdentityKey(turnID, run.agentIteration, indexed.itemID)]
+  return binding ?? { ...indexed, turnID, agentIteration: run.agentIteration }
 }
 
 interface DurableReasoningIdentities {
   identities: Set<string>
-  itemIDs: Set<string>
-  turnIterations: Set<string>
 }
 
 function emptyDurableReasoningIdentities(): DurableReasoningIdentities {
-  return { identities: new Set(), itemIDs: new Set(), turnIterations: new Set() }
+  return { identities: new Set() }
 }
 
 function durableReasoningIdentities(items: SessionItem[], run: ActiveRun): DurableReasoningIdentities {
@@ -222,46 +219,27 @@ function durableReasoningIdentities(items: SessionItem[], run: ActiveRun): Durab
     if (item.message?.role !== 'assistant' || !item.message.reasoning) continue
     const turnID = item.turn_id?.trim() ?? ''
     const iteration = item.agent_iteration ?? 0
-    if (!turnID || iteration <= 0) continue
-    const binding = run.assistantItems?.[`${turnID}:${iteration}`]
+    if (!turnID || !item.id.trim() || !Number.isInteger(iteration) || iteration <= 0) continue
+    const binding = run.assistantItemBindings?.[assistantItemIdentityKey(turnID, iteration, item.id)]
+      ?? run.assistantItems?.[`${turnID}:${iteration}`]
     // A durable reasoning item is authoritative for a transient step only
     // when the run's explicit turn/iteration binding points at this exact
     // item. A page item alone is not enough to identify a live step.
     if (binding?.itemID !== item.id) continue
     identities.identities.add(reasoningIdentityKey(turnID, iteration, item.id))
-    identities.itemIDs.add(item.id)
-    identities.turnIterations.add(reasoningTurnIterationKey(turnID, iteration))
   }
   return identities
 }
 
 function shouldSuppressDurableReasoning(
   step: Extract<RunStep, { kind: 'reasoning' }>,
-  segment: ActiveRunSegment,
-  isCurrentSegment: boolean,
-  run: ActiveRun,
   durable: DurableReasoningIdentities,
 ): boolean {
   const itemID = step.itemID?.trim() ?? ''
   const turnID = step.turnID?.trim() ?? ''
-  // New events carry both identities. An item id is globally stable, so it
-  // remains a safe fallback for a malformed/old event that has item_id but no
-  // turn_id; normal events use the complete tuple so a stale item cannot be
-  // suppressed under a different turn or restarted iteration.
-  if (itemID) return turnID
-    ? durable.identities.has(reasoningIdentityKey(turnID, step.iteration, itemID))
-    : durable.itemIDs.has(itemID)
-  // Compatibility for replayed events emitted before item_id was added.
-  if (turnID) return durable.turnIterations.has(reasoningTurnIterationKey(turnID, step.iteration))
-  // The oldest test/replay shape has neither identity. Only suppress a
-  // unique matching step in the final segment; if iteration was restarted
-  // and two such steps share a segment, retaining both is safer than deleting
-  // reasoning from the wrong turn.
-  if (!isCurrentSegment || !durable.turnIterations.has(reasoningTurnIterationKey(run.turnID?.trim() ?? '', step.iteration))) return false
-  const matchingLegacySteps = segment.steps.filter((candidate) =>
-    candidate.kind === 'reasoning' && !candidate.turnID && !candidate.itemID && candidate.iteration === step.iteration,
-  )
-  return matchingLegacySteps.length === 1 && step.iteration === run.agentIteration
+  const iteration = step.iteration
+  if (!turnID || !itemID || !Number.isInteger(iteration) || iteration <= 0) return false
+  return durable.identities.has(reasoningIdentityKey(turnID, iteration, itemID))
 }
 
 function reasoningTurnIterationKey(turnID: string, iteration: number): string {
@@ -270,6 +248,14 @@ function reasoningTurnIterationKey(turnID: string, iteration: number): string {
 
 function reasoningIdentityKey(turnID: string, iteration: number, itemID: string): string {
   return `${reasoningTurnIterationKey(turnID, iteration)}\u0000${itemID}`
+}
+
+function assistantIdentityKey(binding: { turnID: string; agentIteration: number; itemID: string }): string {
+  return assistantItemIdentityKey(binding.turnID, binding.agentIteration, binding.itemID)
+}
+
+function assistantItemIdentityKey(turnID: string, agentIteration: number, itemID: string): string {
+  return JSON.stringify([turnID, agentIteration, itemID])
 }
 
 type ActiveRunSegment = { steps: RunStep[]; boundary: string }
@@ -331,7 +317,7 @@ export function buildHistoricalRows(items: SessionItem[], sessionID: string): Co
     processBoundary = ''
   }
 
-  const itemBoundary = (item: SessionItem): string => `item:${item.id}:${item.seq}`
+  const itemBoundary = (item: SessionItem): string => `item:${sessionItemIdentityKey(item)}`
   const ensureProcess = (item: SessionItem) => {
     if (!processCreatedAt) processCreatedAt = item.created_at
     if (!processTurnID) processTurnID = item.turn_id || ''
@@ -345,7 +331,7 @@ export function buildHistoricalRows(items: SessionItem[], sessionID: string): Co
     if (item.kind === 'compaction') {
       flushProcess(item.turn_id || processTurnID)
       flowBoundary = itemBoundary(item)
-      rows.push({ kind: 'compaction', key: rowKey(sessionID, 'compaction', item.id, item.seq), item })
+      rows.push({ kind: 'compaction', key: rowKey(sessionID, 'compaction', sessionItemIdentityKey(item)), item })
       continue
     }
 
@@ -358,14 +344,14 @@ export function buildHistoricalRows(items: SessionItem[], sessionID: string): Co
         flushProcess(processTurnID)
         processTurnID = itemTurnID
         flowBoundary = itemBoundary(item)
-        rows.push({ kind: 'message', key: rowKey(sessionID, 'message', item.id, item.seq), item })
+        rows.push({ kind: 'message', key: rowKey(sessionID, 'message', sessionItemIdentityKey(item)), item })
         continue
       }
       flushProcess(processTurnID)
       processTurnID = itemTurnID
       flowBoundary = itemBoundary(item)
       agentIteration = 0
-      rows.push({ kind: 'message', key: rowKey(sessionID, 'message', item.id, item.seq), item })
+      rows.push({ kind: 'message', key: rowKey(sessionID, 'message', sessionItemIdentityKey(item)), item })
       continue
     }
 
@@ -422,7 +408,7 @@ export function buildHistoricalRows(items: SessionItem[], sessionID: string): Co
     if (!processCreatedAt) processCreatedAt = item.created_at
     flushProcess(item.turn_id || processTurnID)
     flowBoundary = itemBoundary(item)
-    if (text) rows.push({ kind: 'message', key: rowKey(sessionID, 'message', item.id, item.seq), item })
+    if (text) rows.push({ kind: 'message', key: rowKey(sessionID, 'message', sessionItemIdentityKey(item)), item })
   }
   flushProcess(processTurnID)
   return rows

@@ -293,6 +293,8 @@ export interface SessionItemProjectionEvent {
   session_id: string
   run_id?: string
   turn_id?: string
+  /** Full projection identity is (turn_id, agent_iteration, item_id). */
+  agent_iteration?: number
   /** Durable record sequence that caused this notification. */
   seq: number
   /** Precision-safe session watermark after the committed transaction. */
@@ -364,13 +366,14 @@ export interface ActiveRun {
   id: string
 	sessionID: string
 	turnID?: string
-  restored?: boolean
 	queuedPrompts?: QueuedPrompt[]
 	/** Transient process boundaries for drained prompts; never a user item. */
 	processBoundaries?: Array<{ id: string; stepIndex: number }>
 	assistantText: string
 	/** Explicit transient-to-durable assistant identity, keyed by turn/iteration. */
 	assistantItems?: Record<string, { itemID: string; durableTextLength: number }>
+	/** Full identity bindings. assistantItems remains a compatibility index. */
+	assistantItemBindings?: Record<string, { turnID: string; agentIteration: number; itemID: string; durableTextLength: number }>
 	steps: RunStep[]
   agentIteration: number
   inputTokens?: number

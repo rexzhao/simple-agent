@@ -1025,30 +1025,30 @@ func TestServiceSendSessionMessageWithEventsEmitsDirectStreamEvents(t *testing.T
 	if len(types) < 7 || types[0] != "turn.started" || types[len(types)-1] != "turn.committed" {
 		t.Fatalf("event types = %#v, want turn.started first and turn.committed last", types)
 	}
-	for _, want := range []string{"item.appended", "text.delta", "tool.requested", "tool.started", "tool.finished", "usage.updated"} {
+	for _, want := range []string{"item.created", "text.delta", "tool.requested", "tool.started", "tool.finished", "usage.updated"} {
 		if !stringSliceContains(types, want) {
 			t.Fatalf("event types = %#v, want contain %q", types, want)
 		}
 	}
-	if got := countString(types, "item.appended"); got != 2 {
-		t.Fatalf("item.appended count = %d, want user and assistant items", got)
+	if got := countString(types, "item.appended"); got != 0 {
+		t.Fatalf("item.appended count = %d, want no new public appended events", got)
 	}
 	for _, event := range events {
-		if event["type"] != "item.appended" {
+		if event["type"] != "item.created" {
 			continue
 		}
 		if event["session_id"] != session.ID || event["turn_id"] == "" {
-			t.Fatalf("item.appended context = %#v, want session and turn", event)
+			t.Fatalf("item projection context = %#v, want session and turn", event)
 		}
 		if runID, ok := event["run_id"].(string); !ok || runID == "" || runID != result.RunID {
-			t.Fatalf("item.appended run_id = %#v, want reliable run %q", event["run_id"], result.RunID)
+			t.Fatalf("item projection run_id = %#v, want reliable run %q", event["run_id"], result.RunID)
 		}
 		revision, ok := event["revision"].(string)
 		if !ok || revision == "" {
-			t.Fatalf("item.appended revision = %#v, want decimal string", event["revision"])
+			t.Fatalf("item projection revision = %#v, want decimal string", event["revision"])
 		}
 		if item, ok := event["item"].(SessionItem); !ok || item.ID != event["item_id"] || item.Seq <= 0 {
-			t.Fatalf("item.appended complete DTO = %#v, want SessionItem matching item_id", event["item"])
+			t.Fatalf("item projection complete DTO = %#v, want SessionItem matching item_id", event["item"])
 		}
 	}
 	if !sessionStreamEventsContain(events, "text.delta", "text", "streamed") {
@@ -1108,25 +1108,28 @@ func TestServiceStreamsDurableAssistantItemBeforeTransientDelta(t *testing.T) {
 		t.Fatalf("result = %#v, want committed", result)
 	}
 
-	var assistantAppends, assistantUpdates []SessionStreamEvent
+	var assistantCreates, assistantUpdates []SessionStreamEvent
 	for _, event := range events {
 		if event["item_id"] != itemID {
 			continue
 		}
 		switch event["type"] {
-		case "item.appended":
-			assistantAppends = append(assistantAppends, event)
+		case "item.created":
+			assistantCreates = append(assistantCreates, event)
 		case "item.updated":
 			assistantUpdates = append(assistantUpdates, event)
 		}
 	}
-	if len(assistantAppends) != 1 || len(assistantUpdates) != 1 {
-		t.Fatalf("assistant projection events = %d append, %d update; events = %#v", len(assistantAppends), len(assistantUpdates), events)
+	if len(assistantCreates) != 1 || len(assistantUpdates) != 1 {
+		t.Fatalf("assistant projection events = %d create, %d update; events = %#v", len(assistantCreates), len(assistantUpdates), events)
 	}
-	appendedItem := assistantAppends[0]["item"].(SessionItem)
+	appendedItem := assistantCreates[0]["item"].(SessionItem)
 	updatedItem := assistantUpdates[0]["item"].(SessionItem)
 	if appendedItem.ID != itemID || updatedItem.ID != itemID || appendedItem.Seq != updatedItem.Seq {
 		t.Fatalf("assistant identities/sequences = %#v / %#v, want one creation seq", appendedItem, updatedItem)
+	}
+	if assistantCreates[0]["turn_id"] != "turn-000001" || assistantCreates[0]["agent_iteration"] != 1 || assistantUpdates[0]["agent_iteration"] != 1 {
+		t.Fatalf("assistant projection identity = create(%#v), update(%#v), want turn and iteration 1", assistantCreates[0], assistantUpdates[0])
 	}
 	if updatedItem.Message == nil || updatedItem.Message.Content == nil || updatedItem.Message.Content.Inline != "hello world" {
 		t.Fatalf("updated assistant DTO = %#v, want complete text", updatedItem)
@@ -1134,23 +1137,23 @@ func TestServiceStreamsDurableAssistantItemBeforeTransientDelta(t *testing.T) {
 	if assistantUpdates[0]["assistant_text_length"] != 11 {
 		t.Fatalf("assistant text length = %#v, want 11", assistantUpdates[0]["assistant_text_length"])
 	}
-	appendSeq, appendSeqOK := assistantAppends[0]["seq"].(int64)
+	appendSeq, appendSeqOK := assistantCreates[0]["seq"].(int64)
 	updateSeq, updateSeqOK := assistantUpdates[0]["seq"].(int64)
-	appendRevision, appendRevisionOK := assistantAppends[0]["revision"].(string)
+	appendRevision, appendRevisionOK := assistantCreates[0]["revision"].(string)
 	updateRevision, updateRevisionOK := assistantUpdates[0]["revision"].(string)
 	appendRevisionNumber, appendRevisionErr := strconv.ParseInt(appendRevision, 10, 64)
 	updateRevisionNumber, updateRevisionErr := strconv.ParseInt(updateRevision, 10, 64)
 	if !appendSeqOK || !updateSeqOK || !appendRevisionOK || !updateRevisionOK || appendRevisionErr != nil || updateRevisionErr != nil ||
 		updateSeq <= appendSeq || updateRevisionNumber <= appendRevisionNumber {
-		t.Fatalf("assistant durable ordering = seq %v/%v revision %q/%q, want monotonically increasing", assistantAppends[0]["seq"], assistantUpdates[0]["seq"], appendRevision, updateRevision)
+		t.Fatalf("assistant durable ordering = seq %v/%v revision %q/%q, want monotonically increasing", assistantCreates[0]["seq"], assistantUpdates[0]["seq"], appendRevision, updateRevision)
 	}
-	appendIndex := indexOfSessionStreamEvent(events, "item.appended", itemID)
+	appendIndex := indexOfSessionStreamEvent(events, "item.created", itemID)
 	firstDeltaIndex := indexOfSessionStreamEvent(events, "text.delta", itemID)
 	updateIndex := indexOfSessionStreamEvent(events, "item.updated", itemID)
 	secondDeltaIndex := nthIndexOfSessionStreamEvent(events, "text.delta", itemID, 2)
 	if appendIndex < 0 || firstDeltaIndex < 0 || updateIndex < 0 || secondDeltaIndex < 0 ||
 		appendIndex > firstDeltaIndex || updateIndex > secondDeltaIndex {
-		t.Fatalf("projection/transient order = append %d, first delta %d, update %d, second delta %d; events = %#v", appendIndex, firstDeltaIndex, updateIndex, secondDeltaIndex, events)
+		t.Fatalf("projection/transient order = create %d, first delta %d, update %d, second delta %d; events = %#v", appendIndex, firstDeltaIndex, updateIndex, secondDeltaIndex, events)
 	}
 }
 

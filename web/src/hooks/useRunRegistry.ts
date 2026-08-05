@@ -18,7 +18,9 @@ export function coalesceRunEvents(events: RunEvent[]): RunEvent[] {
           prior.item_id === current.item_id &&
           prior.durable_text_length === current.durable_text_length &&
           prior.durable_checkpointed === current.durable_checkpointed)
-      if (prior.turn_id === current.turn_id && prior.agent_iteration === current.agent_iteration && sameAssistantCheckpoint) {
+      const sameReasoningItem = current.type !== 'reasoning.delta' ||
+        (prior.type === 'reasoning.delta' && Boolean(prior.item_id?.trim()) && Boolean(current.item_id?.trim()) && prior.item_id?.trim() === current.item_id?.trim())
+      if (prior.turn_id === current.turn_id && prior.agent_iteration === current.agent_iteration && sameAssistantCheckpoint && sameReasoningItem) {
         result[result.length - 1] = { ...current, text: prior.text + current.text }
         continue
       }
@@ -89,7 +91,6 @@ export function useRunRegistry(options?: UseRunRegistryOptions) {
             id: descriptor.run_id,
             sessionID: descriptor.session_id,
             turnID: descriptor.turn_id,
-            restored: true,
             assistantText: '',
             steps: [],
             agentIteration: 0,

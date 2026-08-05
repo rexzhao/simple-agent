@@ -112,22 +112,33 @@ function reduceRunEventInternal(run: ActiveRun, event: RunEvent): ActiveRun {
       }
       const text = String(delta.text ?? '')
       if (!delta.item_id) return { ...run, assistantText: run.assistantText + text }
-      const key = assistantOutputKey(delta.turn_id ?? '', Number(delta.agent_iteration ?? run.agentIteration))
-      const previous = run.assistantItems?.[key]
+      const turnID = String(delta.turn_id ?? '').trim()
+      const agentIteration = Number(delta.agent_iteration ?? run.agentIteration)
+      if (!Number.isInteger(agentIteration) || agentIteration <= 0 || !turnID) return run
+      const key = assistantOutputKey(turnID, agentIteration)
+      const identityKey = assistantItemIdentityKey(turnID, agentIteration, delta.item_id)
+      const previous = run.assistantItemBindings?.[identityKey] ?? run.assistantItems?.[key]
       const sameItem = previous?.itemID === delta.item_id
       const eventLength = Number(delta.durable_text_length)
       const durableTextLength = Number.isFinite(eventLength) && eventLength >= 0
         ? eventLength
         : (previous?.durableTextLength ?? 0)
+      const binding = {
+        turnID,
+        agentIteration,
+        itemID: delta.item_id,
+        durableTextLength: sameItem ? Math.max(previous?.durableTextLength ?? 0, durableTextLength) : durableTextLength,
+      }
       const assistantItems = {
         ...(run.assistantItems ?? {}),
-        [key]: {
-          itemID: delta.item_id,
-          durableTextLength: sameItem ? Math.max(previous?.durableTextLength ?? 0, durableTextLength) : durableTextLength,
-        },
+        [key]: { itemID: binding.itemID, durableTextLength: binding.durableTextLength },
+      }
+      const assistantItemBindings = {
+        ...(run.assistantItemBindings ?? {}),
+        [identityKey]: binding,
       }
       if (key !== assistantOutputKey(run.turnID ?? '', run.agentIteration)) {
-        return { ...run, assistantItems }
+        return { ...run, assistantItems, assistantItemBindings }
       }
       // A checkpoint is committed before its corresponding transient delta is
       // fanned out. It is therefore already represented by the durable row;
@@ -135,7 +146,11 @@ function reduceRunEventInternal(run: ActiveRun, event: RunEvent): ActiveRun {
       return {
         ...run,
         assistantItems,
-        assistantText: delta.durable_checkpointed ? '' : run.assistantText + text,
+        assistantItemBindings,
+        // A new item in the same invocation is not a continuation. Never
+        // carry the old tail into it; only the backend identity can bind a
+        // tail to a durable row.
+        assistantText: delta.durable_checkpointed ? '' : (sameItem ? run.assistantText : '') + text,
       }
     }
     case 'reasoning.delta':
@@ -195,26 +210,41 @@ function reduceRunEventInternal(run: ActiveRun, event: RunEvent): ActiveRun {
     case 'item.updated': {
       const projection = event as SessionItemProjectionEvent
       const item = projection.item
-      if (item.message?.role !== 'assistant') return run
-      const turnID = projection.turn_id ?? item.turn_id ?? run.turnID ?? ''
-      const iteration = Number(item.agent_iteration ?? 0)
+      if (item.message?.role !== 'assistant' || !projection.item_id || item.id !== projection.item_id) return run
+      const envelopeTurnID = String(projection.turn_id ?? '').trim()
+      const itemTurnID = String(item.turn_id ?? '').trim()
+      if (envelopeTurnID && itemTurnID && envelopeTurnID !== itemTurnID) return run
+      const turnID = envelopeTurnID || itemTurnID
+      const iteration = Number(item.agent_iteration ?? projection.agent_iteration ?? 0)
+      if (!Number.isInteger(iteration) || iteration < 0) return run
+      if (projection.agent_iteration !== undefined && item.agent_iteration !== undefined && Number(projection.agent_iteration) !== Number(item.agent_iteration)) return run
+      if (!turnID || iteration <= 0) return run
       const key = assistantOutputKey(turnID, iteration)
-      const previous = run.assistantItems?.[key]
+      const identityKey = assistantItemIdentityKey(turnID, iteration, projection.item_id)
+      const previous = run.assistantItemBindings?.[identityKey] ?? run.assistantItems?.[key]
       const length = Number(projection.assistant_text_length)
       const sameItem = previous?.itemID === projection.item_id
       const durableTextLength = Number.isFinite(length) && length >= 0
         ? (sameItem ? Math.max(previous?.durableTextLength ?? 0, length) : length)
         : (previous?.durableTextLength ?? 0)
+      const binding = {
+        turnID,
+        agentIteration: iteration,
+        itemID: projection.item_id,
+        durableTextLength,
+      }
       const assistantItems = {
         ...(run.assistantItems ?? {}),
-        [key]: {
-          itemID: projection.item_id,
-          durableTextLength,
-        },
+        [key]: { itemID: binding.itemID, durableTextLength: binding.durableTextLength },
+      }
+      const assistantItemBindings = {
+        ...(run.assistantItemBindings ?? {}),
+        [identityKey]: binding,
       }
       return {
         ...run,
         assistantItems,
+        assistantItemBindings,
         ...(key === assistantOutputKey(run.turnID ?? '', run.agentIteration) ? { assistantText: '' } : {}),
       }
     }
@@ -229,6 +259,10 @@ function reduceRunEventInternal(run: ActiveRun, event: RunEvent): ActiveRun {
 
 function assistantOutputKey(turnID: string, agentIteration: number): string {
   return `${turnID}:${agentIteration}`
+}
+
+function assistantItemIdentityKey(turnID: string, agentIteration: number, itemID: string): string {
+  return JSON.stringify([turnID, agentIteration, itemID])
 }
 
 function sumUsageEvents(events: NonNullable<ActiveRun['usageEvents']>): NonNullable<ActiveRun['usage']> | undefined {
