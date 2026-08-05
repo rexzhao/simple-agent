@@ -1,0 +1,183 @@
+import { describe, expect, it } from 'vitest'
+import { decodeMessage } from '../protocol/decode'
+import type { ProtocolMessage } from '../protocol/types'
+import { CommandFacade, CommandFacadeError } from './commandFacade'
+import type { RuntimeTransport } from './runtime'
+import type { TransportCloseEvent, TransportReadyEvent } from './transport'
+
+class FakeCommandTransport implements RuntimeTransport {
+  isReady = true
+  connectionGeneration = 1
+  serverEpoch: string | undefined = 'epoch_1'
+  sent: ProtocolMessage[] = []
+  private messages = new Set<(message: ProtocolMessage, generation: number) => void>()
+  private ready = new Set<(event: TransportReadyEvent) => void>()
+  private close = new Set<(event: TransportCloseEvent) => void>()
+  start(): void { this.isReady = true }
+  stop(): void { this.isReady = false }
+  send(message: ProtocolMessage): void { this.sent.push(message) }
+  onMessage(listener: (message: ProtocolMessage, generation: number) => void): () => void { this.messages.add(listener); return () => this.messages.delete(listener) }
+  onReady(listener: (event: TransportReadyEvent) => void): () => void { this.ready.add(listener); return () => this.ready.delete(listener) }
+  onClose(listener: (event: TransportCloseEvent) => void): () => void { this.close.add(listener); return () => this.close.delete(listener) }
+  emit(value: unknown, generation = this.connectionGeneration): void {
+    const message = typeof value === 'string' ? decodeMessage(value) : value as ProtocolMessage
+    for (const listener of [...this.messages]) listener(message, generation)
+  }
+  emitReady(epoch = this.serverEpoch ?? 'epoch_1', previousServerEpoch?: string): void {
+    this.serverEpoch = epoch
+    for (const listener of [...this.ready]) listener({ generation: this.connectionGeneration, serverEpoch: epoch, previousServerEpoch, connectionID: 'connection', heartbeatIntervalMS: 1000, maxMessageBytes: 1024 })
+  }
+}
+
+function commandMessage(type: string, requestID: string, payload: unknown): ProtocolMessage {
+  return decodeMessage(JSON.stringify({ version: 1, type, id: `${type}_1`, payload: { request_id: requestID, ...payload as object } }))
+}
+
+class TimerBox {
+  next = 1
+  timers = new Map<number, () => void>()
+  set = (handler: () => void): number => { const id = this.next++; this.timers.set(id, handler); return id }
+  clear = (id: number): void => { this.timers.delete(id) }
+  runOnlyTimer(): void {
+    const entry = this.timers.entries().next().value as [number, () => void] | undefined
+    if (!entry) throw new Error('timer not found')
+    this.timers.delete(entry[0])
+    entry[1]()
+  }
+}
+
+describe('CommandFacade session.mark_read', () => {
+  it('correlates accepted/result in either order and never patches a replica', async () => {
+    const transport = new FakeCommandTransport()
+    const facade = new CommandFacade({ transport, timeoutMS: 1000 })
+    const pending = facade.markRead('session_1', 'run_1', 'project_1')
+    const command = transport.sent[0]
+    if (command.type !== 'command') throw new Error('wrong command')
+    expect(command.payload.name).toBe('session.mark_read')
+    expect(command.payload.schema_version).toBe(1)
+    expect(command.payload.arguments).toEqual({ session_id: 'session_1', run_id: 'run_1', project_id: 'project_1' })
+    const requestID = command.payload.request_id
+    transport.emit(commandMessage('command_result', requestID, { status: 'succeeded', result: { session_id: 'session_1', run_id: 'run_1', marked_read: true } }))
+    transport.emit(commandMessage('command_accepted', requestID, {}))
+    await expect(pending).resolves.toEqual({ session_id: 'session_1', run_id: 'run_1', marked_read: true })
+    facade.stop()
+  })
+
+  it('retries idempotently in the same epoch and safely across an epoch change', async () => {
+    const transport = new FakeCommandTransport()
+    const facade = new CommandFacade({ transport, timeoutMS: 1000 })
+    const pending = facade.markRead('session_1', 'run_1')
+    expect(transport.sent).toHaveLength(1)
+    transport.connectionGeneration = 2
+    transport.emitReady('epoch_1', 'epoch_1')
+    expect(transport.sent).toHaveLength(2)
+    transport.connectionGeneration = 3
+    transport.emitReady('epoch_2', 'epoch_1')
+    expect(transport.sent).toHaveLength(3)
+    const command = transport.sent[2]
+    if (command.type !== 'command') throw new Error('wrong command')
+    transport.emit(commandMessage('command_result', command.payload.request_id, { status: 'succeeded', result: { session_id: 'session_1', run_id: 'run_1', marked_read: true } }), 3)
+    await expect(pending).resolves.toMatchObject({ marked_read: true })
+  })
+
+  it('rejects on timeout, cancellation, and stop while clearing pending timers', async () => {
+    const timers = new TimerBox()
+    const transport = new FakeCommandTransport()
+    const facade = new CommandFacade({ transport, timeoutMS: 10, setTimeout: timers.set, clearTimeout: timers.clear })
+    const timedOut = facade.markRead('session_1', 'run_1')
+    timers.runOnlyTimer()
+    await expect(timedOut).rejects.toBeInstanceOf(CommandFacadeError)
+    await expect(timedOut).rejects.toMatchObject({ code: 'timeout' })
+
+    const controller = new AbortController()
+    const cancelled = facade.markRead('session_2', 'run_2', undefined, { signal: controller.signal })
+    controller.abort()
+    await expect(cancelled).rejects.toMatchObject({ code: 'cancelled' })
+    const stopped = facade.markRead('session_3', 'run_3')
+    facade.stop()
+    await expect(stopped).rejects.toMatchObject({ code: 'stopped' })
+    expect(timers.timers.size).toBe(0)
+  })
+
+  it('uses non-counter request IDs and rejects before sending when ID generation fails', async () => {
+    const firstTransport = new FakeCommandTransport()
+    const secondTransport = new FakeCommandTransport()
+    const first = new CommandFacade({ transport: firstTransport })
+    const second = new CommandFacade({ transport: secondTransport })
+    const firstPending = first.markRead('session_1', 'run_1')
+    const secondPending = second.markRead('session_1', 'run_1')
+    const firstID = firstTransport.sent[0].type === 'command' ? firstTransport.sent[0].payload.request_id : ''
+    const secondID = secondTransport.sent[0].type === 'command' ? secondTransport.sent[0].payload.request_id : ''
+    expect(firstID).toMatch(/^request_[0-9a-f-]{36}$/i)
+    expect(secondID).toMatch(/^request_[0-9a-f-]{36}$/i)
+    expect(secondID).not.toBe(firstID)
+    first.stop()
+    second.stop()
+    await expect(firstPending).rejects.toMatchObject({ code: 'stopped' })
+    await expect(secondPending).rejects.toMatchObject({ code: 'stopped' })
+
+    const failedTransport = new FakeCommandTransport()
+    const failed = new CommandFacade({ transport: failedTransport, requestIDGenerator: () => { throw new Error('no entropy') } })
+    await expect(failed.markRead('session_2', 'run_2')).rejects.toMatchObject({ code: 'id_generation' })
+    expect(failedTransport.sent).toHaveLength(0)
+  })
+
+  it('ignores old-generation result and error frames after an idempotent resend', async () => {
+    const transport = new FakeCommandTransport()
+    const facade = new CommandFacade({ transport })
+    const pending = facade.markRead('session_1', 'run_1')
+    const first = transport.sent[0]
+    if (first.type !== 'command') throw new Error('wrong initial command')
+    transport.connectionGeneration = 2
+    transport.emitReady('epoch_1', 'epoch_1')
+    const resent = transport.sent.at(-1)
+    if (!resent || resent.type !== 'command') throw new Error('missing resend')
+    expect(resent.payload.request_id).toBe(first.payload.request_id)
+
+    transport.emit(commandMessage('command_result', first.payload.request_id, {
+      status: 'succeeded', result: { session_id: 'session_1', run_id: 'run_1', marked_read: true },
+    }), 1)
+    transport.emit(commandMessage('error', first.payload.request_id, { code: 'old', message: 'old generation' }), 1)
+    let settled = false
+    void pending.finally(() => { settled = true })
+    await Promise.resolve()
+    expect(settled).toBe(false)
+
+    transport.emit(commandMessage('command_result', resent.payload.request_id, {
+      status: 'succeeded', result: { session_id: 'session_1', run_id: 'run_1', marked_read: true },
+    }), 2)
+    await expect(pending).resolves.toEqual({ session_id: 'session_1', run_id: 'run_1', marked_read: true })
+    facade.stop()
+  })
+
+  it('rejects request ID collisions without replacing the first pending promise', async () => {
+    const timers = new TimerBox()
+    const transport = new FakeCommandTransport()
+    const facade = new CommandFacade({
+      transport,
+      requestIDGenerator: () => 'request_collision',
+      timeoutMS: 10,
+      setTimeout: timers.set,
+      clearTimeout: timers.clear,
+    })
+    const first = facade.markRead('session_1', 'run_1')
+    const second = facade.markRead('session_2', 'run_2')
+    await expect(second).rejects.toMatchObject({ code: 'id_generation', details: { collision: true } })
+    expect(transport.sent).toHaveLength(1)
+    expect(timers.timers.size).toBe(1)
+    facade.stop()
+    await expect(first).rejects.toMatchObject({ code: 'stopped' })
+    expect(timers.timers.size).toBe(0)
+
+    const completed = new CommandFacade({ transport, requestIDGenerator: () => 'request_done' })
+    const done = completed.markRead('session_3', 'run_3')
+    const command = transport.sent.at(-1)
+    if (!command || command.type !== 'command') throw new Error('missing completed command')
+    transport.emit(commandMessage('command_result', command.payload.request_id, {
+      status: 'succeeded', result: { session_id: 'session_3', run_id: 'run_3', marked_read: true },
+    }))
+    await expect(done).resolves.toMatchObject({ marked_read: true })
+    await expect(completed.markRead('session_4', 'run_4')).rejects.toMatchObject({ code: 'id_generation', details: { collision: true } })
+    completed.stop()
+  })
+})
