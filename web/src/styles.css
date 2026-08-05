@@ -601,6 +601,16 @@ svg { width: 1.1em; height: 1.1em; fill: none; stroke: currentColor; stroke-widt
 .debug-option input { width: 16px; height: 16px; flex: 0 0 auto; margin: 1px 0 0; accent-color: var(--accent-hover); }
 .debug-option span { display: grid; gap: 4px; }
 .debug-option small { color: var(--muted); font-size: 9px; font-weight: 500; line-height: 1.45; }
+.frontend-debug-section { display: grid; gap: 10px; padding: 14px; border: 2px solid var(--border); background: var(--accent-soft); box-shadow: var(--shadow-2); }
+.frontend-debug-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 14px; }
+.frontend-debug-heading > div { display: grid; gap: 4px; }
+.frontend-debug-heading small { color: var(--muted); font-size: 9px; line-height: 1.45; }
+.debug-switch { min-width: 52px; padding: 6px 9px; border: 2px solid var(--border); background: #ffffff; color: var(--text); font-size: 10px; font-weight: 800; cursor: pointer; }
+.debug-switch.enabled { background: var(--accent); }
+.frontend-debug-status { color: var(--muted); font-size: 10px; font-variant-numeric: tabular-nums; }
+.frontend-debug-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.frontend-debug-actions button { padding: 7px 9px; font-size: 10px; }
+.frontend-debug-error { margin: 0; color: var(--danger, #a52929); font-size: 10px; line-height: 1.4; }
 
 .provider-dialog-backdrop { padding: 18px; }
 .provider-dialog { width: min(1120px, 100%); height: min(820px, calc(100vh - 36px)); display: flex; flex-direction: column; border: 2px solid var(--border); background: #ffffff; box-shadow: 7px 7px 0 #000000; }

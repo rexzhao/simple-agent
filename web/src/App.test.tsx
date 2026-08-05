@@ -2,6 +2,7 @@
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import App from './App'
+import { frontendProtocolLogger } from './lib/frontendProtocolLogger'
 
 vi.mock('react-virtuoso', async () => {
   const React = await import('react')
@@ -109,6 +110,8 @@ describe('App lifecycle bootstrap', () => {
   afterEach(() => {
     vi.useRealTimers()
     vi.clearAllMocks()
+    vi.restoreAllMocks()
+    frontendProtocolLogger.resetForTesting()
   })
 
   it('does not poll sessions or active runs while a run remains active', async () => {
@@ -449,6 +452,24 @@ describe('App lifecycle bootstrap', () => {
     await waitFor(() => expect(onEvent).toBeDefined())
     return { view, onEvent: onEvent! }
   }
+
+  it('records one accepted or ignored decision for each settled event', async () => {
+    vi.spyOn(console, 'log').mockImplementation(() => {})
+    frontendProtocolLogger.setEnabled('session-1', true)
+    const { view, onEvent } = await renderSettlementApp()
+    const settled = { type: 'run.settled' as const, run_id: 'settlement-run', status: 'committed', committed_revision: '0' }
+
+    await act(async () => {
+      await onEvent(settled)
+      await onEvent(settled)
+    })
+
+    const decisions = frontendProtocolLogger.getSnapshot('session-1').records
+      .filter((record) => record.source === 'app.event_gate' && record.event_type === 'run.settled')
+      .map((record) => record.kind)
+    expect(decisions).toEqual(['accepted', 'ignored'])
+    view.unmount()
+  })
 
   const projection = (revision: string, text = 'durable answer') => ({
     type: 'item.appended',

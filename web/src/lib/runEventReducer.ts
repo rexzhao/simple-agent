@@ -1,10 +1,26 @@
 import type { ActiveRun, QueuedPrompt, RunEvent, SessionItemProjectionEvent } from '../types'
+import { frontendProtocolLogger, protocolLogIdentity } from './frontendProtocolLogger'
 import { appendModelOutput, appendReasoning, updateToolStep } from './runSteps'
 
 /** Applies events that only change the in-memory representation of a run.
  * Events requiring I/O (resync and settled) remain orchestrated by App.
  */
 export function reduceRunEvent(run: ActiveRun, event: RunEvent): ActiveRun {
+  const next = reduceRunEventInternal(run, event)
+  if (frontendProtocolLogger.isEnabled(run.sessionID)) {
+    frontendProtocolLogger.log({
+      sessionID: run.sessionID,
+      source: 'run.reducer',
+      kind: 'reduce',
+      ...protocolLogIdentity(event as unknown as Record<string, unknown>, run.id),
+      before: run,
+      after: next,
+    })
+  }
+  return next
+}
+
+function reduceRunEventInternal(run: ActiveRun, event: RunEvent): ActiveRun {
   if (run.providerRetry && ['text.delta', 'reasoning.delta', 'tool.requested', 'tool.started', 'tool.finished', 'usage.updated'].includes(event.type)) {
     run = { ...run, providerRetry: undefined }
   }

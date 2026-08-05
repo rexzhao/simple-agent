@@ -3,6 +3,7 @@ import { api, streamLifecycle, streamRun } from './api'
 import type { CreateSessionOptions } from './api'
 import type { ActiveRun, ActiveRunDescriptor, Bootstrap, ImageAttachmentInput, ItemsPage, LifecycleEvent, Project, RunEvent, Session, SessionDebugSettings, SessionItem, SessionItemProjectionEvent, SessionModelOption } from './types'
 import { errorMessage } from './lib/format'
+import { copyFrontendProtocolJSONL, downloadFrontendProtocolJSONL, frontendProtocolLogger, protocolLogIdentity, useFrontendProtocolLogging } from './lib/frontendProtocolLogger'
 import { reduceLifecycleEvent, type SessionMaps } from './lib/lifecycleReducer'
 import { reduceRunEvent } from './lib/runEventReducer'
 import { modelKey, orderSessions, projectName, sessionDescendantIDs, sessionName } from './lib/session'
@@ -65,6 +66,7 @@ function App() {
   const [awaitingRunStartedBySession, setAwaitingRunStartedBySession] = useState<Record<string, boolean>>({})
   const { draftsBySession, updateDraft, addPastedText, removePastedText, addPastedImage, removePastedImage, clearDraft } = useComposerDrafts()
   const sessionStore = useSessionStore()
+  const frontendLogging = useFrontendProtocolLogging(debugSessionID)
 
   // Session id → display name across every known project, so tool rows can
   // label session_* calls with human-readable targets instead of raw ids.
@@ -669,13 +671,29 @@ function App() {
     const eventSessionID = typeof payload.session_id === 'string' ? payload.session_id : ''
     const eventRunID = typeof payload.run_id === 'string' ? payload.run_id : ''
     const projectionEvent = event.type === 'item.appended' || event.type === 'item.created' || event.type === 'item.updated'
+    const logGate = (kind: 'accepted' | 'ignored', reason?: string) => {
+      if (!frontendProtocolLogger.isEnabled(sessionID)) return
+      frontendProtocolLogger.log({
+        sessionID,
+        source: 'app.event_gate',
+        kind,
+        ...protocolLogIdentity(payload, runID),
+        reason,
+        bound_session_id: sessionID,
+        bound_run_id: runID,
+        event: payload,
+      })
+    }
     // The stream callback is bound to (sessionID, runID), not to whatever an
     // untrusted/replayed payload happens to claim.  A stale stream can finish
     // after the user starts another run in the same session; accepting its
     // lifecycle/terminal events would otherwise clear the newer run's
     // sidebar state.  Committed projection events remain useful in that race,
     // but they must still agree with the bound identity.
-    if ((eventSessionID && eventSessionID !== sessionID) || (eventRunID && eventRunID !== runID)) return
+    if ((eventSessionID && eventSessionID !== sessionID) || (eventRunID && eventRunID !== runID)) {
+      logGate('ignored', 'wrong binding')
+      return
+    }
     const currentRun = activeRunsRef.current[sessionID]
     const admissionBinding = runStartedReplayBindingsRef.current.get(runID) === sessionID
     const newerAdmissionBinding = [...runStartedReplayBindingsRef.current.entries()]
@@ -685,9 +703,19 @@ function App() {
     // clear that admission gate or synthesize an idle sidebar transition.
     // Once the old run is the only owner, terminal replay remains legitimate
     // even when its transient ActiveRun was already removed.
-    if (event.type === 'run.settled' && !admissionBinding && (pendingAdmissionSessionsRef.current.has(sessionID) || newerAdmissionBinding)) return
-    if (!projectionEvent && event.type !== 'run.settled' && !admissionBinding && (!currentRun || currentRun.id !== runID)) return
-    if (!projectionEvent && currentRun && currentRun.id !== runID && !(event.type === 'run.started' && currentRun.status !== 'running')) return
+    if (event.type === 'run.settled' && !admissionBinding && (pendingAdmissionSessionsRef.current.has(sessionID) || newerAdmissionBinding)) {
+      logGate('ignored', 'stale run/no active run')
+      return
+    }
+    if (!projectionEvent && event.type !== 'run.settled' && !admissionBinding && (!currentRun || currentRun.id !== runID)) {
+      logGate('ignored', 'stale run/no active run')
+      return
+    }
+    if (!projectionEvent && currentRun && currentRun.id !== runID && !(event.type === 'run.started' && currentRun.status !== 'running')) {
+      logGate('ignored', 'stale run')
+      return
+    }
+    if (event.type !== 'run.settled') logGate('accepted')
     if (event.type === 'text.delta' || event.type === 'reasoning.delta') {
       queueRunEvent(sessionID, runID, event)
       return
@@ -756,7 +784,10 @@ function App() {
         // current turn's error.  The identity guard above normally handles
         // this; retain the explicit check for a terminal replay with no
         // transient container.
-        if (activeRunsRef.current[sessionID]?.id !== runID && !admissionBinding) return
+        if (activeRunsRef.current[sessionID]?.id !== runID && !admissionBinding) {
+          logGate('ignored', 'stale run/no active run')
+          return
+        }
         update((run) => reduceRunEvent(run, event))
         setTurnErrors((current) => ({
           ...current,
@@ -764,7 +795,10 @@ function App() {
         }))
         break
       case 'run.settled': {
-        if (settledRunIDsRef.current.has(runID)) return
+        if (settledRunIDsRef.current.has(runID)) {
+          logGate('ignored', 'duplicate settlement')
+          return
+        }
         settledRunIDsRef.current.add(runID)
         while (settledRunIDsRef.current.size > 256) {
           const oldest = settledRunIDsRef.current.values().next().value as string | undefined
@@ -777,7 +811,11 @@ function App() {
         // A terminal event from a previous run is still a valid durable
         // projection notification, but it is not allowed to settle or
         // reconcile a newer run occupying this session.
-        if (settledRun && settledRun.id !== runID) return
+        if (settledRun && settledRun.id !== runID) {
+          logGate('ignored', 'stale run')
+          return
+        }
+        logGate('accepted')
         const settledStatus = String(event.status)
         const settledRevision = settlementRevision(event)
         applySettledSidebarStatus(sessionID, runID, settledStatus, typeof event.turn_id === 'string' ? event.turn_id : undefined, settledRevision)
@@ -849,7 +887,7 @@ function App() {
     runStreamsRef.current.add(runID)
     const controller = new AbortController()
     runStreamControllersRef.current.set(runID, controller)
-    void streamRun(runID, (event) => handleRunEvent(sessionID, runID, event), { signal: controller.signal })
+    void streamRun(runID, (event) => handleRunEvent(sessionID, runID, event), { signal: controller.signal, sessionID })
       .catch((reason: unknown) => {
         if (controller.signal.aborted) return
         // The stream may outlive a superseded run or a completed run.  Only
@@ -892,6 +930,18 @@ function App() {
       : event.metadata ?? event.session_metadata
     const sessionID = event.session_id ?? (typeof event.session === 'string' ? event.session : eventSession?.id) ?? ''
     const runID = event.run_id ?? event.run ?? ''
+    const logLifecycleGate = (kind: 'accepted' | 'ignored', reason?: string) => {
+      if (!sessionID || !frontendProtocolLogger.isEnabled(sessionID)) return
+      const payload = event as unknown as Record<string, unknown>
+      frontendProtocolLogger.log({
+        sessionID,
+        source: 'app.lifecycle_gate',
+        kind,
+        ...protocolLogIdentity(payload, runID),
+        reason,
+        event: payload,
+      })
+    }
     if (event.type === 'run.settled' && sessionID && runID) {
       const currentRun = activeRunsRef.current[sessionID]
       const admissionBinding = runStartedReplayBindingsRef.current.get(runID) === sessionID
@@ -901,8 +951,12 @@ function App() {
       // event to the run reducer. Apply the same ownership gate here, or an
       // old frame carrying `metadata` could still mark the sidebar idle while
       // a new POST is waiting for its run_id.
-      if (!admissionBinding && (pendingAdmissionSessionsRef.current.has(sessionID) || newerAdmissionBinding || (currentRun && currentRun.id !== runID))) return
+      if (!admissionBinding && (pendingAdmissionSessionsRef.current.has(sessionID) || newerAdmissionBinding || (currentRun && currentRun.id !== runID))) {
+        logLifecycleGate('ignored', 'stale run/no active run')
+        return
+      }
     }
+    if (event.type !== 'run.started') logLifecycleGate('accepted')
     if (event.type === 'session.created' || event.type === 'session.updated' || event.type === 'session.archived' || event.type === 'session.deleted' || event.type === 'run.settled') {
       applyLifecycleSessionEvent(event)
     }
@@ -924,9 +978,18 @@ function App() {
         // metadata above, but it never creates a transient run or connects a
         // stream. Local admission waits for its run replay; background runs
         // are discovered through the authoritative active-run registry.
-        if (pendingAdmissionSessionsRef.current.has(sessionID) || runStartedReplayBindingsRef.current.has(runID)) return
-        if (activeRunsRef.current[sessionID]?.id === runID) return
+        if (pendingAdmissionSessionsRef.current.has(sessionID) || runStartedReplayBindingsRef.current.has(runID)) {
+          logLifecycleGate('ignored', 'waiting for run replay binding')
+          return
+        }
+        if (activeRunsRef.current[sessionID]?.id === runID) {
+          logLifecycleGate('ignored', 'run already active')
+          return
+        }
+        logLifecycleGate('accepted')
         void bootstrapApplication(true).catch(() => {})
+      } else {
+        logLifecycleGate('accepted')
       }
       return
     }
@@ -1072,7 +1135,7 @@ function App() {
       // the run.prompt_queue stream event; no local echo is added.
       if (!content.trim()) return false
       try {
-        await api.appendRunMessage(activeRun.id, content)
+        await api.appendRunMessage(activeRun.id, content, sessionID)
         return true
       } catch (reason) {
         setError(errorMessage(reason))
@@ -1116,7 +1179,7 @@ function App() {
     const run = activeRunsRef.current[selectedSessionID]
     if (!run) return
     try {
-      await api.cancelRun(run.id)
+      await api.cancelRun(run.id, selectedSessionID)
     } catch (reason) {
       setError(errorMessage(reason))
     }
@@ -1126,7 +1189,7 @@ function App() {
     const run = activeRunsRef.current[selectedSessionID]
     if (!run) return
     try {
-      await api.cancelToolCall(run.id, toolCallID)
+      await api.cancelToolCall(run.id, toolCallID, selectedSessionID)
     } catch (reason) {
       setError(errorMessage(reason))
     }
@@ -1136,7 +1199,7 @@ function App() {
     const run = activeRunsRef.current[selectedSessionID]
     if (!run) return
     try {
-      await api.removeRunMessage(run.id, promptID)
+      await api.removeRunMessage(run.id, promptID, selectedSessionID)
     } catch (reason) {
       setError(errorMessage(reason))
     }
@@ -1149,7 +1212,7 @@ function App() {
     const run = activeRunsRef.current[selectedSessionID]
     if (!run) return
     try {
-      await api.steerRunMessage(run.id, promptID, steer)
+      await api.steerRunMessage(run.id, promptID, steer, selectedSessionID)
     } catch (reason) {
       setError(errorMessage(reason))
     }
@@ -1159,7 +1222,7 @@ function App() {
     const run = activeRunsRef.current[selectedSessionID]
     if (!run) return
     try {
-      await api.moveRunMessage(run.id, promptID, direction)
+      await api.moveRunMessage(run.id, promptID, direction, selectedSessionID)
     } catch (reason) {
       setError(errorMessage(reason))
     }
@@ -1301,6 +1364,11 @@ function App() {
           session={debugSession}
           saving={savingDebugSettings}
           onSave={(settings) => saveDebugSettings(debugSession.id, settings)}
+          frontendLogging={frontendLogging}
+          onFrontendProtocolLoggingToggle={frontendLogging.setEnabled}
+          onCopyFrontendProtocolLogs={() => copyFrontendProtocolJSONL(debugSession.id)}
+          onDownloadFrontendProtocolLogs={() => downloadFrontendProtocolJSONL(debugSession.id)}
+          onClearFrontendProtocolLogs={frontendLogging.clear}
           onClose={() => { if (!savingDebugSettings) setDebugSessionID('') }}
         />
       )}

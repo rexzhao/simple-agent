@@ -1,9 +1,38 @@
 import { useCallback, useMemo, useReducer, useRef } from 'react'
 import type { ItemsPage, Session, SessionItemProjectionEvent, SessionSnapshot } from '../types'
 import { api } from '../api'
+import { frontendProtocolLogger, protocolLogIdentity } from '../lib/frontendProtocolLogger'
 import { initialSessionStoreState, parseDecimalRevision, revisionGTE, sessionStoreReducer, type SessionStoreAction } from '../lib/sessionStore'
 
 type SnapshotFetchResult = { session: Session; history: ItemsPage; requiresResync: boolean }
+
+function projectionSummary(state: ReturnType<typeof initialSessionStoreState>, sessionID: string) {
+  const history = state.historyBySession[sessionID]
+  return {
+    revision: history?.revision ?? state.sessionsByID[sessionID]?.revision,
+    item_ids: history?.page.items.map((item) => item.id) ?? [],
+    pending_item_ids: Object.keys(history?.pendingProjectionByItemID ?? {}),
+    pending_event_count: state.pendingProjectionBySession[sessionID]?.events.length ?? 0,
+  }
+}
+
+function logProjectionTransition(
+  sessionID: string,
+  kind: string,
+  before: ReturnType<typeof initialSessionStoreState>,
+  after: ReturnType<typeof initialSessionStoreState>,
+  data: () => Record<string, unknown> = () => ({}),
+) {
+  if (!frontendProtocolLogger.isEnabled(sessionID)) return
+  frontendProtocolLogger.log({
+    sessionID,
+    source: 'projection.store',
+    kind,
+    before: projectionSummary(before, sessionID),
+    after: projectionSummary(after, sessionID),
+    ...data(),
+  })
+}
 
 /**
  * Wraps the session store reducer and provides the async operations that
@@ -35,6 +64,7 @@ export function useSessionStore() {
       const normalizedSnapshot = snapshot.revision === snapshotRevision
         ? snapshot
         : { ...snapshot, revision: snapshotRevision }
+      const before = stateRef.current
       const pending = stateRef.current.pendingProjectionBySession[sessionID]
       const overflowRevision = pending?.overflowed ? pending.overflowRevision : '0'
       const markedRevision = stateRef.current.snapshotResyncBySession[sessionID] ?? '0'
@@ -42,6 +72,10 @@ export function useSessionStore() {
       const requiresResync = !stateRef.current.historyBySession[sessionID]
         && !revisionGTE(snapshotRevision, requiredRevision)
       dispatchStore({ type: 'snapshot', snapshot: normalizedSnapshot, expectedSessionID: sessionID })
+      logProjectionTransition(sessionID, 'snapshot.load', before, stateRef.current, () => ({
+        revision: normalizedSnapshot.revision,
+        item_ids: normalizedSnapshot.history.items.map((item) => item.id),
+      }))
       return { session: normalizedSnapshot.session, history: normalizedSnapshot.history, requiresResync }
     },
     [dispatchStore],
@@ -59,6 +93,7 @@ export function useSessionStore() {
         session,
         history,
       }
+      const before = stateRef.current
       const pending = stateRef.current.pendingProjectionBySession[sessionID]
       const overflowRevision = pending?.overflowed ? pending.overflowRevision : '0'
       const markedRevision = stateRef.current.snapshotResyncBySession[sessionID] ?? '0'
@@ -66,6 +101,11 @@ export function useSessionStore() {
       const requiresResync = !stateRef.current.historyBySession[sessionID]
         && !revisionGTE(snapshot.revision, requiredRevision)
       dispatchStore({ type: 'snapshot', snapshot, expectedSessionID: sessionID })
+      logProjectionTransition(sessionID, 'snapshot.load', before, stateRef.current, () => ({
+        revision: snapshot.revision,
+        item_ids: snapshot.history.items.map((item) => item.id),
+        fallback: true,
+      }))
       return { session, history, requiresResync }
     },
     [dispatchStore],
@@ -112,7 +152,12 @@ export function useSessionStore() {
       // point when the response is merged.
       const requestRevision = existing.revision
       const older = await api.items(sessionID, existing.page.oldest_seq)
+      const before = stateRef.current
       dispatchStore({ type: 'pageOlder', sessionID, older, requestRevision })
+      logProjectionTransition(sessionID, 'page.load', before, stateRef.current, () => ({
+        revision: requestRevision,
+        item_ids: older.items.map((item) => item.id),
+      }))
       return true
     },
     [dispatchStore],
@@ -134,7 +179,13 @@ export function useSessionStore() {
   }, [dispatchStore])
 
   const applyProjectionEvent = useCallback((event: SessionItemProjectionEvent) => {
+    const before = stateRef.current
     dispatchStore({ type: 'projectionEvent', event })
+    logProjectionTransition(event.session_id, 'projection.apply', before, stateRef.current, () => ({
+      ...protocolLogIdentity(event as unknown as Record<string, unknown>),
+      event,
+      accepted: before !== stateRef.current,
+    }))
   }, [dispatchStore])
 
   const updateSessionMetadata = useCallback((session: Session) => {

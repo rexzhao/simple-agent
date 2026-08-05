@@ -5,6 +5,7 @@ import { api, streamLifecycle } from './api'
 describe('streamLifecycle', () => {
   afterEach(() => {
     vi.useRealTimers()
+    vi.unstubAllGlobals()
     vi.restoreAllMocks()
   })
 
