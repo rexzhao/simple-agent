@@ -1,5 +1,15 @@
 import type { ActiveRunDescriptor, Bootstrap, CodexAuthStatus, ImageAttachmentInput, ItemsPage, LifecycleEvent, Project, ProviderSettingsDocument, ProviderSettingsInput, RunAdmission, RunEvent, Session, SessionDebugSettings, SessionModelOptions, SessionSnapshot } from './types'
 
+export interface CreateSessionOptions {
+  projectID: string
+  provider?: string
+  modelProfile?: string
+  reasoningLevel?: string
+  fullAccess?: boolean
+  cwd?: string
+  configPath?: string
+}
+
 const tokenStorageKey = 'sai-capability-token'
 
 function capabilityToken(): string {
@@ -72,9 +82,16 @@ export const api = {
   }),
   sessions: (projectID: string, archived = false) => request<{ sessions: Session[] }>(`/api/projects/${encodeURIComponent(projectID)}/sessions${archived ? '?archived=true' : ''}`),
   sessionModels: (projectID: string) => request<SessionModelOptions>(`/api/projects/${encodeURIComponent(projectID)}/models`),
-  createSession: (projectID: string, provider: string, modelProfile: string, reasoningLevel = '', fullAccess = false) => request<Session>(`/api/projects/${encodeURIComponent(projectID)}/sessions`, {
+  createSession: (options: CreateSessionOptions) => request<Session>(`/api/projects/${encodeURIComponent(options.projectID)}/sessions`, {
     method: 'POST',
-    body: JSON.stringify({ provider, model_profile: modelProfile, reasoning_level: reasoningLevel, full_access: fullAccess }),
+    body: JSON.stringify({
+      cwd: options.cwd,
+      config_path: options.configPath,
+      provider: options.provider,
+      model_profile: options.modelProfile,
+      reasoning_level: options.reasoningLevel,
+      full_access: options.fullAccess,
+    }),
   }),
   providerSettings: () => request<ProviderSettingsDocument>('/api/provider-settings'),
   createProvider: (input: ProviderSettingsInput) => request<ProviderSettingsDocument>('/api/providers', {

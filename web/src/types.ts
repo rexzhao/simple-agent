@@ -181,6 +181,7 @@ export interface Session {
   show_reasoning?: boolean
   full_access: boolean
   debug?: SessionDebugSettings
+  cwd?: string
   config_path?: string
   context?: ContextMetadata
 }

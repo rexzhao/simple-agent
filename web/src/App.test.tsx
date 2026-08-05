@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import App from './App'
 
 vi.mock('react-virtuoso', async () => {
@@ -57,14 +57,21 @@ const mocks = vi.hoisted(() => {
     created_cwd: '/workspace',
     last_seq: 0,
     full_access: false,
+    cwd: '/workspace/src',
+    config_path: '/config',
+    reasoning_level: 'medium',
   }
   const api = {
     bootstrap: vi.fn().mockResolvedValue({ version: 'test', cwd: '/workspace', server_root: '/workspace', config_path: '/config' }),
     projects: vi.fn().mockResolvedValue({ projects: [{ id: 'project-1', root: '/workspace', display_name: 'project', archived: false, created_at: '', updated_at: '' }] }),
     activeRuns: vi.fn().mockResolvedValue({ runs: [{ run_id: 'run-1', session_id: 'session-1', turn_id: 'turn-1', started_at: '', status: 'running' }] }),
     sessions: vi.fn().mockResolvedValue({ sessions: [session] }),
+    session: vi.fn().mockResolvedValue(session),
     snapshot: vi.fn().mockImplementation(() => new Promise(() => {})),
+    createSession: vi.fn(),
     startRun: vi.fn(),
+    appendRunMessage: vi.fn(),
+    cancelRun: vi.fn(),
     continueRun: vi.fn(),
   }
   const streamLifecycle = vi.fn((_onEvent: unknown, options: { signal?: AbortSignal }) => new Promise<void>((resolve) => {
@@ -80,6 +87,25 @@ vi.mock('./api', () => ({
 }))
 
 describe('App lifecycle bootstrap', () => {
+  function resetApiMocks() {
+    mocks.api.bootstrap.mockReset().mockResolvedValue({ version: 'test', cwd: '/workspace', server_root: '/workspace', config_path: '/config' })
+    mocks.api.projects.mockReset().mockResolvedValue({ projects: [{ id: 'project-1', root: '/workspace', display_name: 'project', archived: false, created_at: '', updated_at: '' }] })
+    mocks.api.activeRuns.mockReset().mockResolvedValue({ runs: [{ run_id: 'run-1', session_id: 'session-1', turn_id: 'turn-1', started_at: '', status: 'running' }] })
+    mocks.api.sessions.mockReset().mockResolvedValue({ sessions: [mocks.session] })
+    mocks.api.session.mockReset().mockResolvedValue(mocks.session)
+    mocks.api.snapshot.mockReset().mockImplementation(() => new Promise(() => {}))
+    mocks.api.createSession.mockReset()
+    mocks.api.startRun.mockReset()
+    mocks.api.appendRunMessage.mockReset()
+    mocks.api.cancelRun.mockReset()
+    mocks.api.continueRun.mockReset()
+    mocks.streamRun.mockReset().mockResolvedValue(undefined)
+  }
+
+  beforeEach(() => {
+    resetApiMocks()
+  })
+
   afterEach(() => {
     vi.useRealTimers()
     vi.clearAllMocks()
@@ -171,15 +197,243 @@ describe('App lifecycle bootstrap', () => {
     history: { items: [], oldest_seq: 0, newest_seq: 0, has_more_before: false, has_more_after: false },
   })
 
-  async function renderSubmitReadyApp(activeRuns: Array<{ run_id: string; session_id: string; turn_id?: string; started_at: string; status: string }> = []) {
+  async function renderSubmitReadyApp(
+    activeRuns: Array<{ run_id: string; session_id: string; turn_id?: string; started_at: string; status: string }> = [],
+    snapshot = emptySnapshot(),
+  ) {
     mocks.api.activeRuns.mockResolvedValue({ runs: activeRuns })
-    mocks.api.snapshot.mockResolvedValue(emptySnapshot())
+    mocks.api.snapshot.mockResolvedValue(snapshot)
     mocks.streamRun.mockReset()
     mocks.streamRun.mockResolvedValue(undefined)
     const view = render(<App />)
     const composer = await screen.findByRole('textbox')
     return { view, composer }
   }
+
+  function configureCreatedRoot() {
+    const created = {
+      ...mocks.session,
+      id: 'session-new',
+      display_name: 'new root',
+      root_session_id: 'session-new',
+      parent_session_id: undefined,
+      spawn_depth: 0,
+    }
+    mocks.api.createSession.mockResolvedValue(created)
+    mocks.api.sessions.mockResolvedValue({ sessions: [mocks.session, created] })
+    return created
+  }
+
+  it('creates a configured root for exact /new without starting or appending a run', async () => {
+    const created = configureCreatedRoot()
+    const source = {
+      ...mocks.session,
+      reasoning_level: 'high',
+      full_access: true,
+      cwd: '/workspace/src',
+      config_path: '/config',
+      revision: '0',
+    }
+    const { view, composer } = await renderSubmitReadyApp([], {
+      ...emptySnapshot(),
+      session: source,
+    })
+
+    fireEvent.change(composer, { target: { value: '  /new  ' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+
+    await waitFor(() => expect(mocks.api.createSession).toHaveBeenCalledTimes(1))
+    expect(mocks.api.createSession).toHaveBeenCalledWith({
+      projectID: 'project-1',
+      provider: 'fake',
+      modelProfile: 'default',
+      reasoningLevel: 'high',
+      fullAccess: true,
+      cwd: '/workspace/src',
+      configPath: '/config',
+    })
+    expect(mocks.api.startRun).not.toHaveBeenCalled()
+    expect(mocks.api.appendRunMessage).not.toHaveBeenCalled()
+    expect(mocks.api.cancelRun).not.toHaveBeenCalled()
+    await waitFor(() => expect(screen.getByText('new root')).toBeTruthy())
+    const createdButton = screen.getByText('new root').closest('button')
+    expect(createdButton).not.toBeNull()
+    expect(createdButton?.parentElement?.className).toContain('selected')
+    expect(created.parent_session_id).toBeUndefined()
+    expect(created.root_session_id).toBe(created.id)
+    expect((composer as HTMLTextAreaElement).value).toBe('')
+    await waitFor(() => expect(mocks.api.sessions.mock.calls.length).toBeGreaterThanOrEqual(6))
+    view.unmount()
+  })
+
+  it('hydrates missing session creation fields from the authoritative session endpoint', async () => {
+    const created = configureCreatedRoot()
+    const authoritative = {
+      ...mocks.session,
+      provider: 'authoritative-provider',
+      model_profile: 'authoritative-model',
+      reasoning_level: 'low',
+      full_access: true,
+      cwd: '/workspace/authoritative',
+      config_path: '/config/authoritative.yaml',
+    }
+    const incomplete = {
+      ...mocks.session,
+      cwd: undefined,
+      config_path: undefined,
+      reasoning_level: undefined,
+      revision: '0',
+    } as unknown as ReturnType<typeof emptySnapshot>['session']
+    mocks.api.session.mockResolvedValue(authoritative)
+    const { view, composer } = await renderSubmitReadyApp([], {
+      ...emptySnapshot(),
+      session: incomplete,
+    })
+
+    fireEvent.change(composer, { target: { value: '/new' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+
+    await waitFor(() => expect(mocks.api.session).toHaveBeenCalledWith('session-1'))
+    expect(mocks.api.createSession).toHaveBeenCalledWith({
+      projectID: 'project-1',
+      provider: 'authoritative-provider',
+      modelProfile: 'authoritative-model',
+      reasoningLevel: 'low',
+      fullAccess: true,
+      cwd: '/workspace/authoritative',
+      configPath: '/config/authoritative.yaml',
+    })
+    expect(created.parent_session_id).toBeUndefined()
+    view.unmount()
+  })
+
+  it('allows /new while the source session has a running run without touching that run', async () => {
+    configureCreatedRoot()
+    const { view, composer } = await renderSubmitReadyApp([{
+      run_id: 'run-1', session_id: 'session-1', turn_id: 'turn-1', started_at: '', status: 'running',
+    }])
+
+    fireEvent.change(composer, { target: { value: '/new' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Append to current run' }))
+
+    await waitFor(() => expect(mocks.api.createSession).toHaveBeenCalledTimes(1))
+    expect(mocks.api.startRun).not.toHaveBeenCalled()
+    expect(mocks.api.appendRunMessage).not.toHaveBeenCalled()
+    expect(mocks.api.cancelRun).not.toHaveBeenCalled()
+    view.unmount()
+  })
+
+  it('sends /new as normal run input when an image is attached', async () => {
+    mocks.api.startRun.mockResolvedValue(undefined)
+    const { view, composer } = await renderSubmitReadyApp()
+    const file = new File(['image'], 'image.png', { type: 'image/png' })
+    const clipboardItem = { kind: 'file', type: 'image/png', getAsFile: () => file }
+
+    fireEvent.paste(composer, {
+      clipboardData: { items: [clipboardItem], getData: () => '' },
+    })
+    await waitFor(() => expect(screen.getByAltText('Image to send #1')).toBeTruthy())
+    fireEvent.change(composer, { target: { value: '/new' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+
+    await waitFor(() => expect(mocks.api.startRun).toHaveBeenCalledTimes(1))
+    expect(mocks.api.createSession).not.toHaveBeenCalled()
+    view.unmount()
+  })
+
+  it('does not treat /new extra as a session command', async () => {
+    mocks.api.startRun.mockResolvedValue(undefined)
+    const { view, composer } = await renderSubmitReadyApp()
+
+    fireEvent.change(composer, { target: { value: '/new extra' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+
+    await waitFor(() => expect(mocks.api.startRun).toHaveBeenCalledTimes(1))
+    expect(mocks.api.createSession).not.toHaveBeenCalled()
+    view.unmount()
+  })
+
+  it('keeps /new in the composer when root creation fails', async () => {
+    mocks.api.createSession.mockRejectedValue(new Error('create failed'))
+    const { view, composer } = await renderSubmitReadyApp()
+
+    fireEvent.change(composer, { target: { value: '/new' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+
+    await waitFor(() => expect(screen.getByRole('alert').textContent).toContain('create failed'))
+    expect((composer as HTMLTextAreaElement).value).toBe('/new')
+    expect(mocks.api.startRun).not.toHaveBeenCalled()
+    view.unmount()
+  })
+
+  it('does not create two roots when /new is submitted twice before the first response', async () => {
+    const created = configureCreatedRoot()
+    let resolveCreate!: (session: typeof created) => void
+    mocks.api.createSession.mockImplementation(() => new Promise((resolve) => { resolveCreate = resolve }))
+    const { view, composer } = await renderSubmitReadyApp()
+
+    fireEvent.change(composer, { target: { value: '/new' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+    await waitFor(() => expect(mocks.api.createSession).toHaveBeenCalledTimes(1))
+
+    resolveCreate(created)
+    await waitFor(() => expect(screen.getByText('new root')).toBeTruthy())
+    expect(mocks.api.createSession).toHaveBeenCalledTimes(1)
+    view.unmount()
+  })
+
+  it('keeps the submitted source configuration when selection changes during creation', async () => {
+    const created = configureCreatedRoot()
+    const other = { ...mocks.session, id: 'session-2', display_name: 'other session' }
+    const source = {
+      ...mocks.session,
+      provider: 'source-provider',
+      model_profile: 'source-model',
+      reasoning_level: 'source-level',
+      full_access: true,
+      cwd: '/workspace/source',
+      config_path: '/config/source.yaml',
+      revision: '0',
+    }
+    let createdAvailable = false
+    mocks.api.sessions.mockImplementation(async (_projectID: string, archived = false) => ({
+      sessions: archived ? [] : [mocks.session, other, ...(createdAvailable ? [created] : [])],
+    }))
+    let resolveCreate!: (session: typeof created) => void
+    mocks.api.createSession.mockImplementation(() => new Promise((resolve) => { resolveCreate = resolve }))
+    const { view, composer } = await renderSubmitReadyApp([], { ...emptySnapshot(), session: source })
+
+    fireEvent.change(composer, { target: { value: '/new' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+    await waitFor(() => expect(mocks.api.createSession).toHaveBeenCalledTimes(1))
+
+    mocks.api.snapshot.mockResolvedValue({
+      ...emptySnapshot(),
+      session_id: 'session-2',
+      session: { ...other, revision: '0' },
+    })
+    const otherButton = screen.getByText('other session').closest('button')
+    expect(otherButton).not.toBeNull()
+    fireEvent.click(otherButton!)
+    await waitFor(() => expect(mocks.api.snapshot).toHaveBeenCalledWith('session-2'))
+
+    expect(mocks.api.createSession).toHaveBeenCalledWith({
+      projectID: 'project-1',
+      provider: 'source-provider',
+      modelProfile: 'source-model',
+      reasoningLevel: 'source-level',
+      fullAccess: true,
+      cwd: '/workspace/source',
+      configPath: '/config/source.yaml',
+    })
+    createdAvailable = true
+    resolveCreate(created)
+    await waitFor(() => expect(screen.getByText('new root')).toBeTruthy())
+    const createdButton = screen.getByText('new root').closest('button')
+    expect(createdButton?.parentElement?.className).toContain('selected')
+    view.unmount()
+  })
 
   async function renderSettlementApp(snapshots: Array<ReturnType<typeof emptySnapshot> & { revision: string }> = [emptySnapshot()]) {
     mocks.api.activeRuns.mockResolvedValue({ runs: [{ run_id: 'settlement-run', session_id: 'session-1', turn_id: 'turn-1', started_at: '', status: 'running' }] })

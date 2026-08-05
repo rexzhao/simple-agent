@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { api, streamLifecycle, streamRun } from './api'
+import type { CreateSessionOptions } from './api'
 import type { ActiveRun, ActiveRunDescriptor, Bootstrap, ImageAttachmentInput, ItemsPage, LifecycleEvent, Project, RunEvent, Session, SessionDebugSettings, SessionItem, SessionItemProjectionEvent, SessionModelOption } from './types'
 import { errorMessage } from './lib/format'
 import { reduceLifecycleEvent, type SessionMaps } from './lib/lifecycleReducer'
@@ -57,6 +58,7 @@ function App() {
   const [debugSessionID, setDebugSessionID] = useState('')
   const [savingDebugSettings, setSavingDebugSettings] = useState(false)
   const [creatingSession, setCreatingSession] = useState(false)
+  const creatingRootSessionRef = useRef(false)
   const [completionNotice, setCompletionNotice] = useState<BackgroundCompletionNotice | null>(null)
   const [turnErrors, setTurnErrors] = useState<Record<string, { turnID: string; message: string }>>({})
   const [compactingSessionIDs, setCompactingSessionIDs] = useState<Record<string, boolean>>({})
@@ -411,7 +413,13 @@ function App() {
     if (!projectID || creatingSession) return
     setCreatingSession(true)
     try {
-      const session = await api.createSession(projectID, model.provider, model.model_profile, sessionCreator?.reasoningLevel ?? model.default_reasoning_level ?? '', sessionCreator?.fullAccess ?? false)
+      const session = await api.createSession({
+        projectID,
+        provider: model.provider,
+        modelProfile: model.model_profile,
+        reasoningLevel: sessionCreator?.reasoningLevel ?? model.default_reasoning_level ?? '',
+        fullAccess: sessionCreator?.fullAccess ?? false,
+      })
       setSelectedProjectID(projectID)
       await loadSessions(projectID, session.id)
       setSelectedSessionID(session.id)
@@ -1010,9 +1018,52 @@ function App() {
     }
   }
 
+  // /new creates a user root through the configured-session API. Capture the
+  // source session id before the first await so a later selection change cannot
+  // alter which configuration is cloned. Session-list entries do not carry
+  // all creation fields, so hydrate one when the selected snapshot is not yet
+  // available.
+  const createRootSession = async (sourceSessionID: string): Promise<boolean> => {
+    if (creatingRootSessionRef.current) return false
+    const listedSource = sessionDetail?.id === sourceSessionID ? sessionDetail : knownSession(sourceSessionID)
+    if (!listedSource) {
+      setError('The current session is still loading; try /new again')
+      return false
+    }
+    creatingRootSessionRef.current = true
+    try {
+      const source = listedSource.cwd && listedSource.config_path && listedSource.reasoning_level !== undefined
+        ? listedSource
+        : await api.session(sourceSessionID)
+      const options: CreateSessionOptions = {
+        projectID: source.project_id,
+        provider: source.provider,
+        modelProfile: source.model_profile,
+        reasoningLevel: source.reasoning_level ?? '',
+        fullAccess: source.full_access,
+        cwd: source.cwd ?? source.created_cwd,
+        configPath: source.config_path ?? '',
+      }
+      const session = await api.createSession(options)
+      await loadSessions(options.projectID, session.id)
+      setSelectedProjectID(options.projectID)
+      setSelectedSessionID(session.id)
+      setShowProjectForm(false)
+      return true
+    } catch (reason) {
+      setError(errorMessage(reason))
+      return false
+    } finally {
+      creatingRootSessionRef.current = false
+    }
+  }
+
   const sendMessage = async (content: string, images: PastedImageAttachment[]): Promise<boolean> => {
     if (!selectedSessionID || (!content.trim() && images.length === 0)) return false
     const sessionID = selectedSessionID
+    if (content.trim() === '/new' && images.length === 0) {
+      return createRootSession(sessionID)
+    }
     const activeRun = activeRunsRef.current[sessionID]
     if (activeRun && activeRun.status === 'running') {
       // Append to the in-flight run: the message is queued and injected into

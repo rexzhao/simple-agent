@@ -540,6 +540,20 @@ models:
 	if session.ConfigPath != filepath.Join(home, "sai.yaml") {
 		t.Fatalf("session config path = %q, want server-root config", session.ConfigPath)
 	}
+	samePath, err := service.CreateConfiguredSession(project.Project.ID, ConfiguredSessionOptions{
+		ConfigPath: filepath.Join(home, "providers", "..", "sai.yaml"),
+	})
+	if err != nil {
+		t.Fatalf("CreateConfiguredSession(equivalent server-root config path) error = %v", err)
+	}
+	if samePath.ConfigPath != session.ConfigPath {
+		t.Fatalf("equivalent config path created session with config path = %q, want %q", samePath.ConfigPath, session.ConfigPath)
+	}
+	if _, err := service.CreateConfiguredSession(project.Project.ID, ConfiguredSessionOptions{
+		ConfigPath: filepath.Join(root, ".agents", "sai.yaml"),
+	}); err == nil || !strings.Contains(err.Error(), "does not match server root config") {
+		t.Fatalf("CreateConfiguredSession(project config path) error = %v, want server-root mismatch", err)
+	}
 	if session.Provider != "fake" || session.ModelProfile != "fast" || session.ModelID != "fake-model" {
 		t.Fatalf("session model = %q/%q/%q", session.Provider, session.ModelProfile, session.ModelID)
 	}

@@ -90,8 +90,14 @@ func (s *Service) CreateConfiguredSession(projectID string, options ConfiguredSe
 		return SessionDetail{}, fmt.Errorf("session cwd %q is outside project root %q", cwd, project.Root)
 	}
 
-	if strings.TrimSpace(options.ConfigPath) != "" {
-		return SessionDetail{}, fmt.Errorf("per-session config path is not supported; configuration comes from server root")
+	if suppliedConfigPath := strings.TrimSpace(options.ConfigPath); suppliedConfigPath != "" {
+		resolvedConfigPath, err := filepath.Abs(suppliedConfigPath)
+		if err != nil {
+			return SessionDetail{}, fmt.Errorf("resolve session config path %q: %w", suppliedConfigPath, err)
+		}
+		if projectPathKey(resolvedConfigPath) != projectPathKey(s.ConfigPath()) {
+			return SessionDetail{}, fmt.Errorf("session config path %q does not match server root config %q", suppliedConfigPath, s.ConfigPath())
+		}
 	}
 	cfg, err := config.Load(s.ConfigPath())
 	if err != nil {
