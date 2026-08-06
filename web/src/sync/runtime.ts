@@ -8,6 +8,8 @@ import type {
   ResyncRequiredMessage,
   Sequence,
   SnapshotMessage,
+  SubscriptionEventMessage,
+  RunCursor,
   SubscribeMessage,
   SubscribedMessage,
   UnsubscribeMessage,
@@ -15,7 +17,8 @@ import type {
 import { BlobClient } from './blobClient'
 import { asSyncReadError, SyncReadError } from './errors'
 import { LocalReplica, resourceKeyString } from './localReplica'
-import type { ResourceAdapter, StagedReplicaChange } from './localReplica'
+import type { ResourceAdapter, StagedReplicaChange, TransientResumeToken } from './localReplica'
+import { SessionContentAdapter } from './sessionContentAdapter'
 import { SessionIndexAdapter } from './sessionIndexAdapter'
 import type { TransportCloseEvent, TransportReadyEvent, WebSocketTransport } from './transport'
 
@@ -40,7 +43,7 @@ export interface SyncRuntimeOptions {
   maxQueuedChanges?: number
   maxQueuedBytes?: number
   maxResyncAttempts?: number
-  adapters?: Partial<Record<ResourceKey['type'], (resource: ResourceKey) => ResourceAdapter<unknown>>>
+  adapters?: Partial<Record<ResourceKey['type'], (resource: ResourceKey) => ResourceAdapter<unknown, unknown>>>
 }
 
 export type SyncSubscriptionErrorCode = 'invalid_resource' | 'capacity'
@@ -74,7 +77,7 @@ interface Subscription {
   resourceRevision?: string
   resume?: { stream_epoch: string; sequence: Sequence }
   phase: 'waiting' | 'snapshot' | 'resuming' | 'live' | 'error'
-  queue: ChangeMessage[]
+  queue: Array<ChangeMessage | SubscriptionEventMessage>
   queueBytes: number
   snapshotBusy: boolean
   snapshotAbort: AbortController | null
@@ -154,7 +157,7 @@ export class SyncRuntime {
   private readonly maxResyncAttempts: number
   private readonly maxSubscriptions: number
   private readonly maxRetainedResources: number
-  private readonly adapterFactories: Partial<Record<ResourceKey['type'], (resource: ResourceKey) => ResourceAdapter<unknown>>>
+  private readonly adapterFactories: Partial<Record<ResourceKey['type'], (resource: ResourceKey) => ResourceAdapter<unknown, unknown>>>
   private subscriptions = new Map<string, Subscription>()
   private started = false
   private detachTransport: (() => void)[] = []
@@ -252,6 +255,7 @@ export class SyncRuntime {
     subscription.references -= 1
     if (subscription.references > 0) return
     subscription.snapshotAbort?.abort()
+    this.clearTransientOverlay(subscription)
     if (this.transport.isReady && subscription.subscriptionID) {
       const message: UnsubscribeMessage = emptyPayloadMessage('unsubscribe', messageID('unsubscribe'), {
         subscription_id: subscription.subscriptionID,
@@ -298,7 +302,7 @@ export class SyncRuntime {
     if (serverEpochChanged) {
       for (const subscription of this.subscriptions.values()) {
         subscription.resume = undefined
-        this.replica.markStale(subscription.resource, new SyncReadError('stream_epoch_mismatch', 'server epoch changed'), subscription.generation)
+        this.clearTransientAndMarkStale(subscription, new SyncReadError('stream_epoch_mismatch', 'server epoch changed'))
       }
     }
     for (const subscription of this.subscriptions.values()) {
@@ -350,6 +354,14 @@ export class SyncRuntime {
       resource: subscription.resource,
       ...(subscription.resume ? { resume: { ...subscription.resume } } : {}),
     }
+    const activeRunResume = this.transientResume(subscription)
+    if (activeRunResume && subscription.resource.type === 'session_content') {
+      payload.active_run_resume = {
+        run_epoch: activeRunResume.runEpoch,
+        run_id: activeRunResume.runID,
+        run_cursor: activeRunResume.runCursor as RunCursor,
+      }
+    }
     const requestID = messageID('subscribe')
     subscription.requestID = requestID
     const message: SubscribeMessage = emptyPayloadMessage('subscribe', requestID, payload) as SubscribeMessage
@@ -366,6 +378,7 @@ export class SyncRuntime {
       case 'subscribed': this.handleSubscribed(message as SubscribedMessage, socketGeneration); return
       case 'snapshot': this.handleSnapshot(message as SnapshotMessage, socketGeneration); return
       case 'change': this.handleChange(message as ChangeMessage, socketGeneration); return
+      case 'subscription_event': this.handleSubscriptionEvent(message as SubscriptionEventMessage, socketGeneration); return
       case 'resync_required': this.handleResync(message as ResyncRequiredMessage, socketGeneration); return
       case 'error': this.handleSubscriptionError(message, socketGeneration); return
       default: return
@@ -484,9 +497,17 @@ export class SyncRuntime {
     if (!this.current(subscription, socketGeneration, generation)) return
     const queued = [...subscription.queue]
     const stagedChanges: StagedReplicaChange[] = []
+    const stagedTransients: SubscriptionEventMessage['payload']['event'][] = []
     let previousSequence = message.payload.sequence
+    let finalResourceRevision = message.payload.resource_revision
     try {
-      for (const change of queued) {
+      for (const queuedMessage of queued) {
+        if (queuedMessage.type === 'subscription_event') {
+          if (!resourceMatches(subscription.resource, queuedMessage.payload.resource)) throw new SyncReadError('invalid_change', 'queued transient resource does not match subscription')
+          stagedTransients.push(queuedMessage.payload.event)
+          continue
+        }
+        const change = queuedMessage
         if (
           change.payload.stream_epoch !== message.payload.stream_epoch ||
           !sameSequence(change.payload.previous_sequence, previousSequence) ||
@@ -505,6 +526,7 @@ export class SyncRuntime {
           },
         })
         previousSequence = change.payload.sequence
+        finalResourceRevision = change.payload.resource_revision
       }
     } catch (reason) {
       subscription.snapshotBusy = false
@@ -514,7 +536,7 @@ export class SyncRuntime {
     }
     try {
       const adapter = this.adapterFor(subscription.resource)
-      this.replica.applySnapshotAndChanges(
+      this.replica.applySnapshotAndChangesAndTransient(
         subscription.resource,
         adapter,
         content,
@@ -526,6 +548,7 @@ export class SyncRuntime {
           readState: 'ready',
         },
         stagedChanges,
+        stagedTransients,
       )
     } catch (reason) {
       subscription.snapshotBusy = false
@@ -538,9 +561,7 @@ export class SyncRuntime {
     subscription.snapshotAbort = null
     subscription.streamEpoch = message.payload.stream_epoch
     subscription.sequence = previousSequence
-    subscription.resourceRevision = queued.length === 0
-      ? message.payload.resource_revision
-      : queued[queued.length - 1].payload.resource_revision
+    subscription.resourceRevision = finalResourceRevision
     subscription.resume = { stream_epoch: subscription.streamEpoch, sequence: subscription.sequence }
     subscription.phase = 'live'
     subscription.resyncAttempts = 0
@@ -578,6 +599,41 @@ export class SyncRuntime {
     this.applyChange(subscription, message, socketGeneration, subscription.generation)
   }
 
+  private handleSubscriptionEvent(message: SubscriptionEventMessage, socketGeneration: number): void {
+    const subscription = this.lookup(message.payload.subscription_id, socketGeneration)
+    if (!subscription || !resourceMatches(subscription.resource, message.payload.resource)) return
+    if (subscription.resource.type !== 'session_content') return
+    if (subscription.subscribedBarrier === undefined) {
+      this.requestResync(subscription, socketGeneration, new SyncReadError('protocol', 'transient event arrived before subscribed'))
+      return
+    }
+    if (subscription.snapshotBusy || subscription.phase === 'snapshot' || subscription.phase === 'resuming') {
+      const bytes = this.messageSize(message)
+      if (subscription.queue.length >= this.maxQueuedChanges || subscription.queueBytes + bytes > this.maxQueuedBytes) {
+        this.requestResync(subscription, socketGeneration, new SyncReadError('sequence_gap', 'resource transient buffer overflowed'))
+        return
+      }
+      subscription.queue.push(message)
+      subscription.queueBytes += bytes
+      return
+    }
+    if (subscription.phase !== 'live') {
+      if (subscription.phase === 'error') return
+      this.requestResync(subscription, socketGeneration, new SyncReadError('protocol', 'transient event arrived outside a live phase'))
+      return
+    }
+    const adapter = this.adapterFor(subscription.resource)
+    if (!adapter.applyTransient) {
+      this.requestResync(subscription, socketGeneration, new SyncReadError('invalid_change', 'session content adapter does not support transient events'))
+      return
+    }
+    try {
+      this.replica.applyTransient(subscription.resource, adapter, message.payload.event, subscription.generation)
+    } catch (reason) {
+      this.requestResync(subscription, socketGeneration, asSyncReadError(reason, 'sequence_gap', subscription.key))
+    }
+  }
+
   private applyChange(subscription: Subscription, message: ChangeMessage, socketGeneration: number, generation: number): boolean {
     if (!this.current(subscription, socketGeneration, generation)) return false
     if (!subscription.streamEpoch || !subscription.sequence || message.payload.stream_epoch !== subscription.streamEpoch || !sameSequence(message.payload.previous_sequence, subscription.sequence) || !sequenceAfter(message.payload.previous_sequence, message.payload.sequence)) {
@@ -610,6 +666,7 @@ export class SyncRuntime {
     if (reachesReplayBarrier) {
       subscription.phase = 'live'
       subscription.resyncAttempts = 0
+      if (!this.drainQueuedTransients(subscription, socketGeneration, generation)) return false
     }
     const acked = this.sendAck(subscription)
     if (!acked) this.transportFailure(subscription, new SyncReadError('transport', 'change ACK could not be sent'))
@@ -629,6 +686,32 @@ export class SyncRuntime {
     } catch {
       return false
     }
+  }
+
+  private drainQueuedTransients(subscription: Subscription, socketGeneration: number, generation: number): boolean {
+    const queued = subscription.queue.filter((message): message is SubscriptionEventMessage => message.type === 'subscription_event')
+    if (queued.length === 0) return true
+    subscription.queue = []
+    subscription.queueBytes = 0
+    const adapter = this.adapterFor(subscription.resource)
+    if (!adapter.applyTransient) {
+      this.requestResync(subscription, socketGeneration, new SyncReadError('invalid_change', 'session content adapter does not support transient events'))
+      return false
+    }
+    for (const message of queued) {
+      if (!this.current(subscription, socketGeneration, generation)) return false
+      if (!resourceMatches(subscription.resource, message.payload.resource)) {
+        this.requestResync(subscription, socketGeneration, new SyncReadError('invalid_change', 'queued transient resource does not match subscription'))
+        return false
+      }
+      try {
+        this.replica.applyTransient(subscription.resource, adapter, message.payload.event, generation)
+      } catch (reason) {
+        this.requestResync(subscription, socketGeneration, asSyncReadError(reason, 'sequence_gap', subscription.key))
+        return false
+      }
+    }
+    return true
   }
 
   private transportFailure(subscription: Subscription, reason: SyncReadError): void {
@@ -660,7 +743,7 @@ export class SyncRuntime {
     subscription.sequence = undefined
     subscription.resourceRevision = undefined
     subscription.phase = 'waiting'
-    this.replica.markStale(subscription.resource, reason, subscription.generation)
+    this.clearTransientAndMarkStale(subscription, reason)
     if (!this.started || this.subscriptions.get(subscription.key) !== subscription) {
       subscription.resyncing = false
       return
@@ -689,17 +772,48 @@ export class SyncRuntime {
     return this.started && this.subscriptions.get(subscription.key) === subscription && subscription.socketGeneration === socketGeneration && subscription.generation === generation
   }
 
-  private adapterFor(resource: ResourceKey): ResourceAdapter<unknown> {
+  private adapterFor(resource: ResourceKey): ResourceAdapter<unknown, unknown> {
     const factory = this.adapterFactories[resource.type]
     if (factory) return factory(resource)
-    if (resource.type === 'session_index') return new SessionIndexAdapter(resource.id) as ResourceAdapter<unknown>
+    if (resource.type === 'session_index') return new SessionIndexAdapter(resource.id) as ResourceAdapter<unknown, unknown>
+    if (resource.type === 'session_content') return new SessionContentAdapter(resource.id) as ResourceAdapter<unknown, unknown>
     throw new SyncReadError('invalid_snapshot', 'resource type is not registered', resourceKeyString(resource))
   }
 
-  private messageSize(message: ChangeMessage): number {
+  private messageSize(message: ProtocolMessage): number {
     try {
       const encoded = encodeMessage(message)
       return typeof TextEncoder === 'undefined' ? encoded.length : new TextEncoder().encode(encoded).byteLength
     } catch { return this.maxQueuedBytes }
+  }
+
+  private transientResume(subscription: Subscription): TransientResumeToken | undefined {
+    if (subscription.resource.type !== 'session_content') return undefined
+    try {
+      const adapter = this.adapterFor(subscription.resource)
+      const value = this.replica.get<unknown>(subscription.resource).value
+      return value === undefined ? undefined : adapter.getTransientResume?.(value)
+    } catch {
+      return undefined
+    }
+  }
+
+  private clearTransientOverlay(subscription: Subscription): void {
+    try {
+      const adapter = this.adapterFor(subscription.resource)
+      this.replica.clearTransient(subscription.resource, adapter)
+    } catch {
+      // A released/invalid resource is allowed to be absent from the replica.
+    }
+  }
+
+  private clearTransientAndMarkStale(subscription: Subscription, reason: SyncReadError): void {
+    try {
+      const adapter = this.adapterFor(subscription.resource)
+      this.replica.clearTransientAndMarkStale(subscription.resource, adapter, reason, subscription.generation)
+    } catch {
+      // A released/invalid resource is allowed to be absent from the replica.
+      this.replica.markStale(subscription.resource, reason, subscription.generation)
+    }
   }
 }

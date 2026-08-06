@@ -71,11 +71,13 @@ function validateDescriptor(descriptor: BlobDescriptor, maxBytes: number, now: D
   if (!isRFC3339Timestamp(descriptor.expires_at)) throw new SyncReadError('blob_expired', 'blob expiry is invalid')
   const expiresAt = Date.parse(descriptor.expires_at)
   if (!Number.isFinite(expiresAt) || now.getTime() >= expiresAt) throw new SyncReadError('blob_expired', 'blob has expired')
-  if (typeof descriptor.sha256 !== 'string' || !/^[0-9a-fA-F]{64}$/.test(descriptor.sha256)) throw new SyncReadError('blob_invalid', 'blob hash is invalid')
-  if (typeof descriptor.etag !== 'string' || descriptor.etag.trim() === '' || /[\r\n]/.test(descriptor.etag)) throw new SyncReadError('blob_invalid', 'blob etag is invalid')
-  if (typeof descriptor.content_type !== 'string' || descriptor.content_type.trim() === '' || !/^[^\s/]+\/[^\s/]+$/.test(descriptorContentType(descriptor.content_type))) {
-    throw new SyncReadError('blob_invalid', 'blob content type is invalid')
-  }
+  // Keep descriptor validation aligned with protocol.ValidateBlobDescriptor:
+  // these are required opaque strings, not a frontend-imposed hash/ETag or
+  // MIME grammar. Integrity and response-header comparisons below still
+  // verify the fetched bytes against the supplied values.
+  if (typeof descriptor.sha256 !== 'string' || descriptor.sha256.trim() === '') throw new SyncReadError('blob_invalid', 'blob hash is missing')
+  if (typeof descriptor.etag !== 'string' || descriptor.etag.trim() === '') throw new SyncReadError('blob_invalid', 'blob etag is missing')
+  if (typeof descriptor.content_type !== 'string' || descriptor.content_type.trim() === '') throw new SyncReadError('blob_invalid', 'blob content type is missing')
   if (/[\u0000-\u001f\u007f]/.test(descriptor.url)) throw new SyncReadError('blob_invalid', 'blob URL is invalid')
 }
 

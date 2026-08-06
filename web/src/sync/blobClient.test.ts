@@ -50,6 +50,7 @@ describe('BlobClient', () => {
     await expect(client.get(await descriptor({ sha256: '00'.repeat(32) }))).rejects.toMatchObject({ code: 'blob_hash' })
     await expect(client.get(await descriptor({ expires_at: '2020-01-01T00:00:00Z' }))).rejects.toMatchObject({ code: 'blob_expired' })
     await expect(client.get(await descriptor({ size: bytes.byteLength + 1 }))).rejects.toMatchObject({ code: 'blob_size' })
+    await expect(client.get(await descriptor({ size: Number.MAX_SAFE_INTEGER + 1 }))).rejects.toMatchObject({ code: 'blob_size' })
   })
 
   it('rejects a body over the hard limit while streaming and honors AbortSignal', async () => {
@@ -71,7 +72,7 @@ describe('BlobClient', () => {
     await expect(abortedClient.get(await descriptor(), { signal: controller.signal })).rejects.toMatchObject({ code: 'aborted' })
   })
 
-  it('requires a protocol hash and rejects forged headers, invalid origins, and redirect escapes', async () => {
+  it('accepts opaque protocol descriptor strings and rejects forged headers, invalid origins, and redirect escapes', async () => {
     const good = await descriptor()
     const calls: string[] = []
     const client = new BlobClient({
@@ -79,8 +80,11 @@ describe('BlobClient', () => {
       baseURL: 'http://example.test',
       fetcher: async (input) => { calls.push(String(input)); return response(bytes) },
     })
-    await expect(client.get({ ...good, sha256: 'abc' })).rejects.toMatchObject({ code: 'blob_invalid' })
-    await expect(client.get({ ...good, sha256: ` ${good.sha256}` })).rejects.toMatchObject({ code: 'blob_invalid' })
+    // The Go wire schema treats sha256/etag/content_type as opaque required
+    // strings. An arbitrary hash is accepted at the descriptor boundary and
+    // rejected only by the fetched-byte integrity check.
+    await expect(client.get({ ...good, sha256: 'abc' })).rejects.toMatchObject({ code: 'blob_hash' })
+    await expect(client.get({ ...good, sha256: ` ${good.sha256}` })).rejects.toMatchObject({ code: 'blob_hash' })
     await expect(new BlobClient({
       capabilityToken: () => 'capability',
       baseURL: 'http://example.test',
@@ -91,6 +95,7 @@ describe('BlobClient', () => {
       baseURL: 'http://example.test',
       fetcher: async () => response(bytes, { 'X-Content-SHA256': '' }),
     }).get(good)).rejects.toMatchObject({ code: 'blob_hash' })
+    calls.length = 0
     await expect(client.get({ ...good, url: 'http://evil.test/blob' })).rejects.toMatchObject({ code: 'blob_auth' })
 
     const redirected = response(bytes)

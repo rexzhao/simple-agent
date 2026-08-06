@@ -105,3 +105,95 @@ export class SessionIndexInterestPolicy {
 }
 
 export const CurrentProjectInterestPolicy = SessionIndexInterestPolicy
+
+export interface CurrentSessionSignal {
+  get(): string | null
+  subscribe(listener: () => void): () => void
+}
+
+export interface MutableCurrentSessionSignal extends CurrentSessionSignal {
+  set(sessionID: string | null): void
+}
+
+export function createCurrentSessionSignal(initialSessionID: string | null = null): MutableCurrentSessionSignal {
+  let current = initialSessionID
+  const listeners = new Set<() => void>()
+  return {
+    get: () => current,
+    set: (sessionID) => {
+      if (sessionID === current) return
+      current = sessionID
+      for (const listener of [...listeners]) listener()
+    },
+    subscribe: (listener) => {
+      listeners.add(listener)
+      return () => listeners.delete(listener)
+    },
+  }
+}
+
+export interface SessionContentInterestPolicyOptions {
+  /** Durable history may remain in the bounded runtime LRU, but the runtime
+   * always clears the transient overlay before releasing the reference. */
+  retainReleased?: boolean
+}
+
+/** Owns the selected session-content interest independently of page mounts. */
+export class SessionContentInterestPolicy {
+  private readonly runtime: Pick<SyncRuntime, 'subscribe' | 'evict'> | { subscribe: SyncRuntime['subscribe']; evict?: SyncRuntime['evict'] }
+  private readonly signal: CurrentSessionSignal
+  private readonly retainReleased: boolean
+  private started = false
+  private detachSignal: (() => void) | null = null
+  private releaseCurrent: (() => void) | null = null
+  private currentSessionID: string | null = null
+
+  constructor(runtime: Pick<SyncRuntime, 'subscribe' | 'evict'> | { subscribe: SyncRuntime['subscribe']; evict?: SyncRuntime['evict'] }, signal: CurrentSessionSignal, options: SessionContentInterestPolicyOptions = {}) {
+    this.runtime = runtime
+    this.signal = signal
+    this.retainReleased = options.retainReleased ?? true
+  }
+
+  start(): void {
+    if (this.started) return
+    this.started = true
+    this.detachSignal = this.signal.subscribe(() => this.reconcile())
+    this.reconcile()
+  }
+
+  stop(): void {
+    if (!this.started && !this.releaseCurrent && !this.detachSignal) return
+    this.started = false
+    this.detachSignal?.()
+    this.detachSignal = null
+    const old = this.currentSessionID
+    this.releaseCurrent?.()
+    if (old && !this.retainReleased) this.runtime.evict?.({ type: 'session_content', id: old })
+    this.releaseCurrent = null
+    this.currentSessionID = null
+  }
+
+  get sessionID(): string | null { return this.currentSessionID }
+
+  private reconcile(): void {
+    if (!this.started) return
+    const next = this.signal.get() || null
+    if (next !== null && next.trim() !== next) throw new SyncSubscriptionError('invalid_resource', 'current session id is not canonical')
+    if (next === this.currentSessionID) return
+    const old = this.currentSessionID
+    this.releaseCurrent?.()
+    if (old && !this.retainReleased) this.runtime.evict?.({ type: 'session_content', id: old })
+    this.releaseCurrent = null
+    if (!next) {
+      this.currentSessionID = null
+      return
+    }
+    try {
+      this.releaseCurrent = this.runtime.subscribe({ type: 'session_content', id: next }, { retainOnRelease: this.retainReleased })
+      this.currentSessionID = next
+    } catch (reason) {
+      this.currentSessionID = null
+      throw reason
+    }
+  }
+}

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { createCurrentProjectSignal, SessionIndexInterestPolicy } from './interestPolicy'
+import { createCurrentProjectSignal, createCurrentSessionSignal, SessionContentInterestPolicy, SessionIndexInterestPolicy } from './interestPolicy'
 
 describe('SessionIndexInterestPolicy', () => {
   it('keeps exactly the signal-selected resource subscribed independently of UI listeners', () => {
@@ -84,5 +84,29 @@ describe('SessionIndexInterestPolicy', () => {
     evicting.start()
     evicting.stop()
     expect(evicted).toEqual(['project_c'])
+  })
+})
+
+describe('SessionContentInterestPolicy', () => {
+  it('switches desired content interest and requests retention without retaining transient state itself', () => {
+    const signal = createCurrentSessionSignal('session_a')
+    const subscriptions: string[] = []
+    const options: boolean[] = []
+    const releases: string[] = []
+    const policy = new SessionContentInterestPolicy({
+      subscribe: (resource: { type: 'session_content'; id: string }, value?: { retainOnRelease?: boolean }) => {
+        subscriptions.push(resource.id)
+        options.push(value?.retainOnRelease === true)
+        return () => releases.push(resource.id)
+      },
+    }, signal)
+    policy.start()
+    signal.set('session_b')
+    expect(subscriptions).toEqual(['session_a', 'session_b'])
+    expect(releases).toEqual(['session_a'])
+    expect(options).toEqual([true, true])
+    expect(policy.sessionID).toBe('session_b')
+    policy.stop()
+    expect(releases).toEqual(['session_a', 'session_b'])
   })
 })

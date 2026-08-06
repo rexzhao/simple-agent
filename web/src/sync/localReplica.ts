@@ -12,11 +12,26 @@ export interface ResourceMetadata {
   readonly error?: SyncReadError
 }
 
-export interface ResourceAdapter<T> {
+export interface ReplicaApplyContext {
+  readonly resource: ResourceKey
+  readonly resourceRevision: string
+  readonly generation: number
+}
+
+export interface TransientResumeToken {
+  readonly runEpoch: string
+  readonly runID: string
+  readonly runCursor: string
+}
+
+export interface ResourceAdapter<T, TTransient = unknown> {
   readonly resourceType: ResourceType
   validateResourceRevision?(revision: string): void
-  decodeSnapshot(value: unknown, previous: T | undefined): T
-  applyChange(previous: T, operations: readonly ChangeOperation[]): T
+  decodeSnapshot(value: unknown, previous: T | undefined, context?: ReplicaApplyContext): T
+  applyChange(previous: T, operations: readonly ChangeOperation[], context?: ReplicaApplyContext): T
+  applyTransient?(previous: T, event: TTransient, context?: ReplicaApplyContext): T
+  clearTransient?(previous: T): T
+  getTransientResume?(previous: T): TransientResumeToken | undefined
 }
 
 export interface ReplicaApplyMetadata {
@@ -154,12 +169,33 @@ export class LocalReplica {
     snapshotMetadata: ReplicaApplyMetadata,
     changes: readonly StagedReplicaChange[],
   ): void {
+    this.applySnapshotAndChangesAndTransient(resource, adapter, content, snapshotMetadata, changes, [])
+  }
+
+  /**
+   * Applies a snapshot barrier, durable changes, and any transient frames
+   * queued while a Blob was downloading as one publication. Transient frames
+   * do not alter replica sequence metadata, but they must not be exposed in a
+   * half-applied state either.
+   */
+  applySnapshotAndChangesAndTransient<T, TTransient>(
+    resource: ResourceKey,
+    adapter: ResourceAdapter<T, TTransient>,
+    content: unknown,
+    snapshotMetadata: ReplicaApplyMetadata,
+    changes: readonly StagedReplicaChange[],
+    transients: readonly TTransient[],
+  ): void {
     const key = resourceKeyString(resource)
     const current = this.records.get(key)
     let value: T
     try {
       adapter.validateResourceRevision?.(snapshotMetadata.resourceRevision)
-      value = adapter.decodeSnapshot(content, current?.value as T | undefined)
+      value = adapter.decodeSnapshot(content, current?.value as T | undefined, {
+        resource,
+        resourceRevision: snapshotMetadata.resourceRevision,
+        generation: snapshotMetadata.generation,
+      })
     } catch {
       throw new SyncReadError('invalid_snapshot', 'resource snapshot failed validation', key)
     }
@@ -168,8 +204,23 @@ export class LocalReplica {
     try {
       for (const change of changes) {
         adapter.validateResourceRevision?.(change.metadata.resourceRevision)
-        value = adapter.applyChange(value, change.operations)
+        value = adapter.applyChange(value, change.operations, {
+          resource,
+          resourceRevision: change.metadata.resourceRevision,
+          generation: change.metadata.generation,
+        })
         finalMetadata = change.metadata
+      }
+      if (adapter.applyTransient) {
+        for (const transient of transients) {
+          value = adapter.applyTransient(value, transient, {
+            resource,
+            resourceRevision: finalMetadata.resourceRevision,
+            generation: finalMetadata.generation,
+          })
+        }
+      } else if (transients.length > 0) {
+        throw new SyncReadError('invalid_change', 'resource does not support transient events', key)
       }
     } catch {
       throw new SyncReadError('invalid_change', 'resource barrier change failed validation', key)
@@ -200,7 +251,11 @@ export class LocalReplica {
     let value: T
     try {
       adapter.validateResourceRevision?.(metadata.resourceRevision)
-      value = adapter.applyChange(current.value as T, operations)
+      value = adapter.applyChange(current.value as T, operations, {
+        resource,
+        resourceRevision: metadata.resourceRevision,
+        generation: metadata.generation,
+      })
     } catch {
       throw new SyncReadError('invalid_change', 'resource change failed validation', key)
     }
@@ -211,6 +266,74 @@ export class LocalReplica {
         ...metadata,
         readState: metadata.readState ?? 'ready',
         error: undefined,
+      },
+    }
+    this.records.set(key, next)
+    if (!sameReadModelState(current, next)) this.notify(resource)
+  }
+
+  /** Apply a transient subscription event without changing durable sequence metadata. */
+  applyTransient<T, TTransient>(
+    resource: ResourceKey,
+    adapter: ResourceAdapter<T, TTransient>,
+    event: TTransient,
+    generation?: number,
+  ): void {
+    const key = resourceKeyString(resource)
+    const current = this.records.get(key)
+    if (!current?.initialized) throw new SyncReadError('invalid_change', 'transient event arrived before a resource snapshot', key)
+    if (!adapter.applyTransient) throw new SyncReadError('invalid_change', 'resource does not support transient events', key)
+    let value: T
+    try {
+      value = adapter.applyTransient(current.value as T, event, {
+        resource,
+        resourceRevision: current.metadata.resourceRevision ?? '',
+        generation: generation ?? current.metadata.generation,
+      })
+    } catch {
+      throw new SyncReadError('invalid_change', 'resource transient event failed validation', key)
+    }
+    const next: ResourceRecord = { ...current, value }
+    this.records.set(key, next)
+    if (!sameReadModelState(current, next)) this.notify(resource)
+  }
+
+  /** Clear only a resource's transient overlay while retaining durable data. */
+  clearTransient<T>(resource: ResourceKey, adapter: ResourceAdapter<T>): void {
+    const key = resourceKeyString(resource)
+    const current = this.records.get(key)
+    if (!current?.initialized || !adapter.clearTransient) return
+    let value: T
+    try { value = adapter.clearTransient(current.value as T) } catch { return }
+    const next: ResourceRecord = { ...current, value }
+    this.records.set(key, next)
+    if (!sameReadModelState(current, next)) this.notify(resource)
+  }
+
+  /**
+   * Atomically discard a transient overlay and expose the recovery state.
+   * Recovery must not publish a ready resource with only half of the old
+   * overlay removed; observers receive one replica transaction instead.
+   */
+  clearTransientAndMarkStale<T>(resource: ResourceKey, adapter: ResourceAdapter<T>, error?: SyncReadError, generation?: number): void {
+    const key = resourceKeyString(resource)
+    const current = this.records.get(key)
+    if (!current) {
+      this.markStale(resource, error, generation)
+      return
+    }
+    let value = current.value as T | undefined
+    if (current.initialized && adapter.clearTransient) {
+      try { value = adapter.clearTransient(current.value as T) } catch { /* retain durable value and still publish stale */ }
+    }
+    const next: ResourceRecord = {
+      ...current,
+      value,
+      metadata: {
+        ...current.metadata,
+        generation: generation ?? current.metadata.generation,
+        readState: current.initialized ? 'stale' : 'loading',
+        error,
       },
     }
     this.records.set(key, next)

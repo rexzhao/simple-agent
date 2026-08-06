@@ -65,13 +65,19 @@ describe('domain-facing Session Index repository', () => {
   it('keeps the public entrypoint free of transport/protocol/sync details', () => {
     const entryFiles = [
       new URL('./sessionIndex.ts', import.meta.url),
+      new URL('./sessionContent.ts', import.meta.url),
       new URL('../hooks/useSessionIndex.ts', import.meta.url),
+      new URL('../hooks/useSessionContent.ts', import.meta.url),
       new URL('../commands/sessionCommands.ts', import.meta.url),
     ]
     for (const url of entryFiles) {
       const source = readFileSync(url, 'utf8')
       expect(source).not.toMatch(/from ['"][^'"]*(?:sync|protocol|transport|blob)/)
       expect(source).not.toMatch(/\b(?:ResourceKey|Sequence|BlobDescriptor|WebSocketTransport|SyncRuntime)\b/)
+    }
+    for (const url of [new URL('./sessionContent.ts', import.meta.url), new URL('../hooks/useSessionContent.ts', import.meta.url)]) {
+      const source = readFileSync(url, 'utf8')
+      expect(source).not.toMatch(/\b(?:subscription_id|stream_epoch|sequence|generation|resource_revision)\b/)
     }
   })
 
