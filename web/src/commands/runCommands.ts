@@ -44,6 +44,39 @@ export interface RunPromptAppendResult {
   readonly accepted: boolean
 }
 
+export interface RunPromptRemoveResult {
+  readonly session_id: string
+  readonly run_id: string
+  readonly prompt_id: string
+  readonly removed: boolean
+}
+
+export interface RunPromptSteerResult {
+  readonly session_id: string
+  readonly run_id: string
+  readonly prompt_id: string
+  readonly steer: boolean
+}
+
+export interface RunPromptMoveResult {
+  readonly session_id: string
+  readonly run_id: string
+  readonly prompt_id: string
+  readonly moved: boolean
+}
+
+export interface RunToolCancelResult {
+  readonly session_id: string
+  readonly run_id: string
+  readonly tool_call_id: string
+  readonly cancelled: boolean
+}
+
+export interface RunControlOptions {
+  /** Process-local controls are never retried into a new server epoch. */
+  readonly signal?: AbortSignal
+}
+
 export interface RunCommands {
   /**
    * Starts the bounded text-only durable command. The command request_id is
@@ -67,4 +100,8 @@ export interface RunCommands {
    * distinct from the gateway request_id and is the retry/idempotency key.
    */
   appendPrompt(sessionID: string, runID: string, content: string, options?: RunPromptAppendOptions): Promise<RunPromptAppendResult>
+  removePrompt(sessionID: string, runID: string, promptID: string, options?: RunControlOptions): Promise<RunPromptRemoveResult>
+  steerPrompt(sessionID: string, runID: string, promptID: string, steer: boolean, options?: RunControlOptions): Promise<RunPromptSteerResult>
+  movePrompt(sessionID: string, runID: string, promptID: string, delta: number, options?: RunControlOptions): Promise<RunPromptMoveResult>
+  cancelTool(sessionID: string, runID: string, toolCallID: string, options?: RunControlOptions): Promise<RunToolCancelResult>
 }

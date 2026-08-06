@@ -15,6 +15,23 @@ import (
 	"github.com/rexzhao/simple-agent/internal/model/httpstream"
 )
 
+func TestToolCancellationRegistryCancelIsOneShot(t *testing.T) {
+	registry := NewToolCancellationRegistry()
+	toolContext, cleanup := registry.Register(context.Background(), "call-one-shot")
+	if !registry.Cancel("call-one-shot") {
+		t.Fatal("first Cancel() = false, want true")
+	}
+	if registry.Cancel("call-one-shot") {
+		t.Fatal("second Cancel() = true, want false for an inactive call")
+	}
+	select {
+	case <-toolContext.Done():
+	default:
+		t.Fatal("tool context was not cancelled")
+	}
+	cleanup()
+}
+
 func TestStreamEmitsToolRequestedStartedFinishedInOrder(t *testing.T) {
 	provider := &fakeProvider{
 		turns: [][]model.Event{

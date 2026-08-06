@@ -409,6 +409,237 @@ func TestDurablePromptAppendCommandCacheAndNewRequestRetry(t *testing.T) {
 	}
 }
 
+func TestActiveRunControlCommandsUseProcessLocalOwnerAndGatewayCache(t *testing.T) {
+	runner := &blockingDurableWebRunner{entered: make(chan struct{}), release: make(chan struct{})}
+	server, service, app := newWebTestAppServerWithRunner(t, runner)
+	project, err := service.CreateProject(t.TempDir(), "active run control project")
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := service.CreateSession(project.Project.ID, execution.SessionCreateMetadata{Provider: "fake", ModelProfile: "default", ModelID: "model"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	other, err := service.CreateSession(project.Project.ID, execution.SessionCreateMetadata{Provider: "fake", ModelProfile: "default", ModelID: "model"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	startDone := make(chan error, 1)
+	go func() {
+		_, startErr := app.runs.startDurable(session.ID, "initial", "run-control", "run-control-start")
+		startDone <- startErr
+	}()
+	select {
+	case <-runner.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("blocking runner did not reach active turn")
+	}
+	if err := <-startDone; err != nil {
+		t.Fatal(err)
+	}
+	managed, ok := app.runs.get("run-control")
+	if !ok || managed == nil || managed.run == nil {
+		t.Fatal("active managed run missing")
+	}
+	for index := 0; index < 4; index++ {
+		if err := managed.run.AppendActive(fmt.Sprintf("queued-%d", index)); err != nil {
+			t.Fatalf("AppendActive(%d): %v", index, err)
+		}
+	}
+
+	released := false
+	defer func() {
+		if !released {
+			close(runner.release)
+		}
+	}()
+
+	connection := dialWebApp(t, server.URL, issueWebSocketTicket(t, server.URL), "http://"+strings.TrimPrefix(server.URL, "http://"))
+	defer connection.Close(websocket.StatusNormalClosure, "done")
+	writeWebAppHello(t, connection)
+	if _, ok := readWebAppMessage(t, connection).(protocol.WelcomeMessage); !ok {
+		t.Fatal("welcome missing")
+	}
+
+	type commandResponse struct {
+		result   protocol.CommandResultMessage
+		accepted bool
+	}
+	send := func(name, envelopeID, requestID string, arguments any) commandResponse {
+		t.Helper()
+		rawArguments, err := json.Marshal(arguments)
+		if err != nil {
+			t.Fatal(err)
+		}
+		message := protocol.CommandMessage{
+			Envelope: protocol.Envelope{Version: 1, Type: protocol.MessageTypeCommand, ID: envelopeID},
+			Payload:  protocol.CommandPayload{Name: name, SchemaVersion: 1, RequestID: requestID, Arguments: rawArguments},
+		}
+		payload, err := protocol.EncodeMessage(message)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := connection.Write(context.Background(), websocket.MessageText, payload); err != nil {
+			t.Fatal(err)
+		}
+		response := commandResponse{}
+		for {
+			value := readWebAppMessage(t, connection)
+			switch value := value.(type) {
+			case protocol.CommandAcceptedMessage:
+				if value.Payload.RequestID == requestID {
+					response.accepted = true
+				}
+			case protocol.CommandResultMessage:
+				if value.Payload.RequestID == requestID {
+					response.result = value
+					return response
+				}
+			}
+		}
+	}
+	expectSucceeded := func(response commandResponse, wantAccepted bool) {
+		t.Helper()
+		if response.result.Payload.Status != protocol.CommandStatusSucceeded || response.result.Payload.Error != nil || response.accepted != wantAccepted {
+			t.Fatalf("command response=%#v accepted=%v, want succeeded accepted=%t", response.result, response.accepted, wantAccepted)
+		}
+	}
+	expectFailed := func(response commandResponse, code string) {
+		t.Helper()
+		if response.result.Payload.Status != protocol.CommandStatusFailed || response.result.Payload.Error == nil || response.result.Payload.Error.Code != code || !response.accepted {
+			t.Fatalf("command response=%#v accepted=%v, want failed code %q", response.result, response.accepted, code)
+		}
+	}
+	// The Web adapter can retain a run identity during the short coordinator
+	// admission window before its SessionRun owner is installed. It must report
+	// not_active rather than searching a durable row or claiming the command.
+	inactive := newManagedRun("run-not-active", session.ID, app.runs.options)
+	app.runs.mu.Lock()
+	app.runs.byID[inactive.id] = inactive
+	app.runs.mu.Unlock()
+	expectFailed(send("run.prompt.remove", "not-active", "not-active-request", map[string]any{
+		"session_id": session.ID, "run_id": inactive.id, "prompt_id": "ap-1",
+	}), "run_not_active")
+
+	removeArguments := map[string]any{"session_id": session.ID, "run_id": "run-control", "prompt_id": "ap-1"}
+	removed := send("run.prompt.remove", "remove-first", "remove-request", removeArguments)
+	expectSucceeded(removed, true)
+	var removedResult runPromptRemoveResult
+	if err := json.Unmarshal(removed.result.Payload.Result, &removedResult); err != nil {
+		t.Fatal(err)
+	}
+	if removedResult.SessionID != session.ID || removedResult.RunID != "run-control" || removedResult.PromptID != "ap-1" || !removedResult.Removed {
+		t.Fatalf("remove result=%#v", removedResult)
+	}
+	removedCached := send("run.prompt.remove", "remove-cache", "remove-request", removeArguments)
+	expectSucceeded(removedCached, false)
+	if string(removedCached.result.Payload.Result) != string(removed.result.Payload.Result) {
+		t.Fatalf("cached remove result=%s, first=%s", removedCached.result.Payload.Result, removed.result.Payload.Result)
+	}
+	expectFailed(send("run.prompt.remove", "remove-missing", "remove-new-request", removeArguments), "prompt_not_found")
+
+	steerArguments := map[string]any{"session_id": session.ID, "run_id": "run-control", "prompt_id": "ap-2", "steer": true}
+	steered := send("run.prompt.steer", "steer-first", "steer-request", steerArguments)
+	expectSucceeded(steered, true)
+	var steeredResult runPromptSteerResult
+	if err := json.Unmarshal(steered.result.Payload.Result, &steeredResult); err != nil {
+		t.Fatal(err)
+	}
+	if steeredResult.SessionID != session.ID || steeredResult.RunID != "run-control" || steeredResult.PromptID != "ap-2" || !steeredResult.Steer {
+		t.Fatalf("steer result=%#v", steeredResult)
+	}
+	expectSucceeded(send("run.prompt.steer", "steer-cache", "steer-request", steerArguments), false)
+
+	moveArguments := map[string]any{"session_id": session.ID, "run_id": "run-control", "prompt_id": "ap-4", "delta": -1}
+	moved := send("run.prompt.move", "move-first", "move-request", moveArguments)
+	expectSucceeded(moved, true)
+	var movedResult runPromptMoveResult
+	if err := json.Unmarshal(moved.result.Payload.Result, &movedResult); err != nil {
+		t.Fatal(err)
+	}
+	if movedResult.SessionID != session.ID || movedResult.RunID != "run-control" || movedResult.PromptID != "ap-4" || !movedResult.Moved {
+		t.Fatalf("move result=%#v", movedResult)
+	}
+	// A cached retry returns the first move result. A second execution would
+	// have been a different, clamped move after ap-4 reached the front of its
+	// plain priority group.
+	expectSucceeded(send("run.prompt.move", "move-cache", "move-request", moveArguments), false)
+
+	type queuePrompt struct {
+		ID    string `json:"id"`
+		Steer bool   `json:"steer"`
+	}
+	type queueEvent struct {
+		Type    string        `json:"type"`
+		Prompts []queuePrompt `json:"prompts"`
+	}
+	waitForQueue := func(wantIDs []string, steerID string) {
+		t.Helper()
+		want := strings.Join(wantIDs, ",")
+		deadline := time.NewTimer(5 * time.Second)
+		defer deadline.Stop()
+		for {
+			events, _, _, _, changed := managed.snapshot(0)
+			for _, event := range events {
+				var payload queueEvent
+				if json.Unmarshal(event.Payload, &payload) != nil || payload.Type != "run.prompt_queue" {
+					continue
+				}
+				ids := make([]string, 0, len(payload.Prompts))
+				steer := false
+				for _, prompt := range payload.Prompts {
+					ids = append(ids, prompt.ID)
+					if prompt.ID == steerID {
+						steer = prompt.Steer
+					}
+				}
+				if strings.Join(ids, ",") == want && (steerID == "" || steer) {
+					return
+				}
+			}
+			select {
+			case <-changed:
+			case <-deadline.C:
+				t.Fatalf("authoritative queue snapshot %q was not observed", want)
+			}
+		}
+	}
+	// This snapshot is emitted by SessionRun's queue owner; no command result
+	// or Web adapter replica is used to synthesize the queue ordering.
+	waitForQueue([]string{"ap-2", "ap-4", "ap-3"}, "ap-2")
+	noMove := send("run.prompt.move", "move-clamped", "move-clamped-request", map[string]any{
+		"session_id": session.ID, "run_id": "run-control", "prompt_id": "ap-3", "delta": 64,
+	})
+	expectSucceeded(noMove, true)
+	var noMoveResult runPromptMoveResult
+	if err := json.Unmarshal(noMove.result.Payload.Result, &noMoveResult); err != nil {
+		t.Fatal(err)
+	}
+	if noMoveResult.PromptID != "ap-3" || noMoveResult.Moved {
+		t.Fatalf("clamped move result=%#v, want moved=false", noMoveResult)
+	}
+
+	expectFailed(send("run.prompt.remove", "wrong-session", "wrong-session-request", map[string]any{
+		"session_id": other.ID, "run_id": "run-control", "prompt_id": "ap-2",
+	}), "run_wrong_session")
+	expectFailed(send("run.prompt.remove", "missing-run", "missing-run-request", map[string]any{
+		"session_id": session.ID, "run_id": "run-missing", "prompt_id": "ap-2",
+	}), "run_not_found")
+	expectFailed(send("run.tool.cancel", "missing-tool", "missing-tool-request", map[string]any{
+		"session_id": session.ID, "run_id": "run-control", "tool_call_id": "call-missing",
+	}), "tool_call_not_active")
+
+	close(runner.release)
+	released = true
+	if _, err := managed.run.Wait(); err != nil && !errors.Is(err, context.Canceled) {
+		t.Fatal(err)
+	}
+	expectFailed(send("run.prompt.remove", "settled-run", "settled-run-request", map[string]any{
+		"session_id": session.ID, "run_id": "run-control", "prompt_id": "ap-2",
+	}), "run_settled")
+}
+
 func TestDurableRunContinueUsesInterruptedTargetAndSharedAdmission(t *testing.T) {
 	runner := &blockingDurableWebRunner{entered: make(chan struct{}), release: make(chan struct{})}
 	_, service, app := newWebTestAppServerWithRunner(t, runner)

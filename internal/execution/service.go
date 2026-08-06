@@ -398,6 +398,15 @@ var (
 	ErrPromptAppendRunNotActive   = errors.New("prompt append target run is not active")
 	ErrPromptAppendNotApplied     = errors.New("prompt append was not applied")
 	ErrPromptAppendOutcomeUnknown = errors.New("prompt append outcome is unknown; it may already have been applied")
+	// Active-run control is intentionally process-local. These errors describe
+	// the in-memory target state and must not be turned into durable replay
+	// claims or cross-epoch success.
+	ErrRunControlNotFound       = errors.New("active run control target was not found")
+	ErrRunControlWrongSession   = errors.New("active run control target belongs to another session")
+	ErrRunControlRunSettled     = errors.New("active run control target run is settled")
+	ErrRunControlNotActive      = errors.New("active run control target run is not active")
+	ErrRunControlPromptNotFound = errors.New("active prompt was not found")
+	ErrRunControlToolNotActive  = errors.New("tool call is not active")
 )
 
 // turnFailure is the payload for a turn.failed session stream event. It
@@ -2066,6 +2075,10 @@ func (r *SessionRun) SetActivePromptSteer(promptID string, steer bool) bool {
 		return false
 	}
 	r.mu.Lock()
+	if !r.accepting {
+		r.mu.Unlock()
+		return false
+	}
 	index := activePromptIndex(r.activeQueue, promptID)
 	if index < 0 {
 		r.mu.Unlock()
@@ -2089,14 +2102,31 @@ func (r *SessionRun) SetActivePromptSteer(promptID string, steer bool) bool {
 // reports whether a prompt with that id is still queued. The updated queue is
 // published as a run.prompt_queue snapshot.
 func (r *SessionRun) MoveActivePrompt(promptID string, delta int) bool {
+	found, _ := r.moveActivePrompt(promptID, delta)
+	return found
+}
+
+// MoveActivePromptResult is the queue owner's richer move result. The legacy
+// MoveActivePrompt API reports only whether the prompt existed; WebSocket
+// control commands also need to distinguish a clamped/no-op move from an
+// actual reorder without implementing queue logic outside this owner.
+func (r *SessionRun) MoveActivePromptResult(promptID string, delta int) (found, moved bool) {
+	return r.moveActivePrompt(promptID, delta)
+}
+
+func (r *SessionRun) moveActivePrompt(promptID string, delta int) (found, moved bool) {
 	if r == nil {
-		return false
+		return false, false
 	}
 	r.mu.Lock()
+	if !r.accepting {
+		r.mu.Unlock()
+		return false, false
+	}
 	index := activePromptIndex(r.activeQueue, promptID)
 	if index < 0 {
 		r.mu.Unlock()
-		return false
+		return false, false
 	}
 	// Group bounds: the queue is partitioned into steers (lo..hi of the steer
 	// group) followed by plain queued prompts; a move clamps to whichever
@@ -2129,9 +2159,10 @@ func (r *SessionRun) MoveActivePrompt(promptID string, delta int) bool {
 		}
 		r.activeQueue[target] = prompt
 		r.publishQueueSnapshotLocked()
+		moved = true
 	}
 	r.mu.Unlock()
-	return true
+	return true, moved
 }
 
 // activePromptIndex returns the index of the queued prompt with id, or -1.
@@ -2173,6 +2204,10 @@ func (r *SessionRun) RemoveActive(promptID string) bool {
 		return false
 	}
 	r.mu.Lock()
+	if !r.accepting {
+		r.mu.Unlock()
+		return false
+	}
 	index := activePromptIndex(r.activeQueue, promptID)
 	if index < 0 {
 		r.mu.Unlock()

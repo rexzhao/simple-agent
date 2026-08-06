@@ -241,12 +241,76 @@ func TestRunPromptAppendArgumentsAreStrictAndPreserveContentBytes(t *testing.T) 
 	}
 }
 
+func TestActiveRunControlCommandSchemasAreStrict(t *testing.T) {
+	tests := []struct {
+		name     string
+		validate func(json.RawMessage) error
+		valid    string
+		invalid  []string
+	}{
+		{
+			name: "remove", validate: validateRunPromptRemoveArguments,
+			valid: `{"session_id":"session","run_id":"run","prompt_id":"ap-1"}`,
+			invalid: []string{
+				`{"session_id":"session","run_id":"run"}`,
+				`{"session_id":"session","run_id":"run","prompt_id":""}`,
+				`{"session_id":"session","run_id":"run","prompt_id":"ap-1","unknown":true}`,
+				`{"session_id":"session","run_id":"run","prompt_id":"ap-1","prompt_id":"ap-2"}`,
+				`{"session_id":"session","run_id":"run","prompt_id":"ap-1"} trailing`,
+				`{"session_id":"session","run_id":1,"prompt_id":"ap-1"}`,
+			},
+		},
+		{
+			name: "steer", validate: validateRunPromptSteerArguments,
+			valid: `{"session_id":"session","run_id":"run","prompt_id":"ap-1","steer":false}`,
+			invalid: []string{
+				`{"session_id":"session","run_id":"run","prompt_id":"ap-1"}`,
+				`{"session_id":"session","run_id":"run","prompt_id":"ap-1","steer":1}`,
+				`{"session_id":"session","run_id":"run","prompt_id":"ap-1","steer":false,"extra":null}`,
+				`{"session_id":"session","run_id":"run","prompt_id":"ap-1","prompt_id":"ap-2","steer":true}`,
+			},
+		},
+		{
+			name: "move", validate: validateRunPromptMoveArguments,
+			valid: `{"session_id":"session","run_id":"run","prompt_id":"ap-1","delta":-1}`,
+			invalid: []string{
+				`{"session_id":"session","run_id":"run","prompt_id":"ap-1","delta":1.5}`,
+				`{"session_id":"session","run_id":"run","prompt_id":"ap-1","delta":65}`,
+				`{"session_id":"session","run_id":"run","prompt_id":"ap-1","delta":null}`,
+				`{"session_id":"session","run_id":"run","prompt_id":"ap-1","delta":0,"direction":"up"}`,
+			},
+		},
+		{
+			name: "tool_cancel", validate: validateRunToolCancelArguments,
+			valid: `{"session_id":"session","run_id":"run","tool_call_id":"call-1"}`,
+			invalid: []string{
+				`{"session_id":"session","run_id":"run","tool_call_id":""}`,
+				`{"session_id":"session","run_id":"run","tool_call_id":false}`,
+				`{"session_id":"session","run_id":"run","tool_call_id":"call-1","tool_call_id":"call-2"}`,
+				`{"session_id":"session","run_id":"run","tool_call_id":"call-1"}{}`,
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if err := test.validate(json.RawMessage(test.valid)); err != nil {
+				t.Fatalf("valid arguments rejected: %v", err)
+			}
+			for _, raw := range test.invalid {
+				if err := test.validate(json.RawMessage(raw)); err == nil {
+					t.Fatalf("invalid arguments accepted: %s", raw)
+				}
+			}
+		})
+	}
+}
+
 func TestSessionCommandRegistryIsClosedAndFlagsAreExplicit(t *testing.T) {
 	registry, err := newSessionCommandRegistry(nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantNames := []string{"run.cancel", "run.continue", "run.prompt.append", "run.start", "session.archive", "session.create", "session.mark_read", "session.rename", "session.restore", "session.set_debug", "session.set_full_access"}
+	wantNames := []string{"run.cancel", "run.continue", "run.prompt.append", "run.prompt.move", "run.prompt.remove", "run.prompt.steer", "run.start", "run.tool.cancel", "session.archive", "session.create", "session.mark_read", "session.rename", "session.restore", "session.set_debug", "session.set_full_access"}
 	if got := registry.Names(); !reflect.DeepEqual(got, wantNames) {
 		t.Fatalf("registry names=%v, want %v", got, wantNames)
 	}
@@ -258,9 +322,9 @@ func TestSessionCommandRegistryIsClosedAndFlagsAreExplicit(t *testing.T) {
 		if definition.SupportsExpectedRevision {
 			t.Fatalf("%s unexpectedly supports expected_revision", name)
 		}
-		if name == "run.cancel" {
+		if name == "run.cancel" || name == "run.prompt.move" || name == "run.prompt.remove" || name == "run.prompt.steer" || name == "run.tool.cancel" {
 			if definition.CrossEpochRetrySafe {
-				t.Fatalf("run.cancel must remain cross-epoch unsafe")
+				t.Fatalf("%s must remain cross-epoch unsafe", name)
 			}
 		} else if !definition.CrossEpochRetrySafe {
 			t.Fatalf("%s must be cross-epoch safe", name)

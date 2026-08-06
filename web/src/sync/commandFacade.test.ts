@@ -529,4 +529,48 @@ describe('CommandFacade session.mark_read', () => {
     await expect(malformed).rejects.toMatchObject({ code: 'invalid' })
     facade.stop()
   })
+
+  it('submits process-local prompt/tool controls with strict identities and no cross-epoch retry', async () => {
+    const transport = new FakeCommandTransport()
+    const facade = new CommandFacade({ transport, timeoutMS: 1000 })
+    const pending = [
+      [facade.removePrompt('session_1', 'run_1', 'ap-1'), 'run.prompt.remove', { session_id: 'session_1', run_id: 'run_1', prompt_id: 'ap-1' }, { session_id: 'session_1', run_id: 'run_1', prompt_id: 'ap-1', removed: true }],
+      [facade.steerPrompt('session_1', 'run_1', 'ap-1', true), 'run.prompt.steer', { session_id: 'session_1', run_id: 'run_1', prompt_id: 'ap-1', steer: true }, { session_id: 'session_1', run_id: 'run_1', prompt_id: 'ap-1', steer: true }],
+      [facade.movePrompt('session_1', 'run_1', 'ap-1', -1), 'run.prompt.move', { session_id: 'session_1', run_id: 'run_1', prompt_id: 'ap-1', delta: -1 }, { session_id: 'session_1', run_id: 'run_1', prompt_id: 'ap-1', moved: false }],
+      [facade.cancelTool('session_1', 'run_1', 'call-1'), 'run.tool.cancel', { session_id: 'session_1', run_id: 'run_1', tool_call_id: 'call-1' }, { session_id: 'session_1', run_id: 'run_1', tool_call_id: 'call-1', cancelled: true }],
+    ] as const
+    expect(transport.sent).toHaveLength(pending.length)
+    for (let index = 0; index < pending.length; index += 1) {
+      const command = transport.sent[index]
+      if (command.type !== 'command') throw new Error('wrong command')
+      expect(command.payload.name).toBe(pending[index][1])
+      expect(command.payload.arguments).toEqual(pending[index][2])
+      transport.emit(commandMessage('command_result', command.payload.request_id, { status: 'succeeded', result: pending[index][3] }))
+    }
+    await expect(pending[0][0]).resolves.toEqual(pending[0][3])
+    await expect(pending[1][0]).resolves.toEqual(pending[1][3])
+    await expect(pending[2][0]).resolves.toEqual(pending[2][3])
+    await expect(pending[3][0]).resolves.toEqual(pending[3][3])
+
+    await expect(facade.removePrompt('session_1', 'run_1', '')).rejects.toMatchObject({ code: 'invalid' })
+    await expect(facade.steerPrompt('session_1', 'run_1', 'ap-1', 'true' as unknown as boolean)).rejects.toMatchObject({ code: 'invalid' })
+    await expect(facade.movePrompt('session_1', 'run_1', 'ap-1', 65)).rejects.toMatchObject({ code: 'invalid' })
+    await expect(facade.cancelTool('session_1', 'run_1', '')).rejects.toMatchObject({ code: 'invalid' })
+
+    const unsafe = facade.movePrompt('session_1', 'run_1', 'ap-2', 1)
+    expect(transport.sent).toHaveLength(5)
+    transport.connectionGeneration = 2
+    transport.emitReady('epoch_2', 'epoch_1')
+    expect(transport.sent).toHaveLength(5)
+    await expect(unsafe).rejects.toMatchObject({ code: 'outcome_unknown' })
+
+    const malformed = facade.removePrompt('session_1', 'run_1', 'ap-shape')
+    const malformedCommand = transport.sent[5]
+    if (malformedCommand.type !== 'command') throw new Error('wrong malformed command')
+    transport.emit(commandMessage('command_result', malformedCommand.payload.request_id, {
+      status: 'succeeded', result: { session_id: 'session_1', run_id: 'run_1', prompt_id: 'ap-shape', removed: true, extra: true },
+    }), 2)
+    await expect(malformed).rejects.toMatchObject({ code: 'invalid' })
+    facade.stop()
+  })
 })

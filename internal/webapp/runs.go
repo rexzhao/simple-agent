@@ -25,10 +25,11 @@ const (
 	defaultTerminalRunLimit  = 64
 	defaultTerminalRunTTL    = 10 * time.Minute
 
-	maxRunRequestBytes     = 17 * 1024 * 1024
-	maxRunImageAttachments = model.MaxImageInputAttachments
-	maxRunImageBytes       = model.MaxImageInputBytes
-	maxRunImageTotalBytes  = model.MaxImageInputTotalBytes
+	maxRunRequestBytes       = 17 * 1024 * 1024
+	maxRunImageAttachments   = model.MaxImageInputAttachments
+	maxRunImageBytes         = model.MaxImageInputBytes
+	maxRunImageTotalBytes    = model.MaxImageInputTotalBytes
+	maxActivePromptMoveDelta = 64
 )
 
 var (
@@ -488,6 +489,93 @@ func (r *runRegistry) get(id string) (*managedRun, bool) {
 	managed, ok := r.byID[id]
 	r.mu.Unlock()
 	return managed, ok
+}
+
+// activeRunControl resolves a process-local control target. The lookup first
+// checks the Web adapter's retained identity so a run ID cannot be used to
+// search another session, then confirms that the same handle is still owned by
+// the shared coordinator. No durable row or operation claim is consulted.
+func (r *runRegistry) activeRunControl(sessionID, runID string) (*execution.CoordinatedSessionRun, error) {
+	sessionID = strings.TrimSpace(sessionID)
+	runID = strings.TrimSpace(runID)
+	if r == nil {
+		return nil, execution.ErrRunControlNotFound
+	}
+	managed, ok := r.get(runID)
+	if !ok || managed == nil {
+		return nil, execution.ErrRunControlNotFound
+	}
+	if managed.sessionID != sessionID {
+		return nil, execution.ErrRunControlWrongSession
+	}
+	if managed.run == nil {
+		return nil, execution.ErrRunControlNotActive
+	}
+	if managed.isTerminal() || managed.run.Status() != execution.SessionRunRunning {
+		return nil, execution.ErrRunControlRunSettled
+	}
+	if r.coordinator == nil {
+		return nil, execution.ErrRunControlNotActive
+	}
+	active, ok := r.coordinator.ActiveForSession(sessionID)
+	if !ok || active.ID() != runID || !active.ActiveControlReady() {
+		return nil, execution.ErrRunControlNotActive
+	}
+	return active, nil
+}
+
+func (r *runRegistry) removeActivePrompt(sessionID, runID, promptID string) error {
+	active, err := r.activeRunControl(sessionID, runID)
+	if err != nil {
+		return err
+	}
+	if !active.ActivePromptReady() {
+		return execution.ErrRunControlNotActive
+	}
+	if !active.RemoveActive(promptID) {
+		return execution.ErrRunControlPromptNotFound
+	}
+	return nil
+}
+
+func (r *runRegistry) steerActivePrompt(sessionID, runID, promptID string, steer bool) error {
+	active, err := r.activeRunControl(sessionID, runID)
+	if err != nil {
+		return err
+	}
+	if !active.ActivePromptReady() {
+		return execution.ErrRunControlNotActive
+	}
+	if !active.SetActivePromptSteer(promptID, steer) {
+		return execution.ErrRunControlPromptNotFound
+	}
+	return nil
+}
+
+func (r *runRegistry) moveActivePrompt(sessionID, runID, promptID string, delta int) (bool, error) {
+	active, err := r.activeRunControl(sessionID, runID)
+	if err != nil {
+		return false, err
+	}
+	if !active.ActivePromptReady() {
+		return false, execution.ErrRunControlNotActive
+	}
+	found, moved := active.MoveActivePromptResult(promptID, delta)
+	if !found {
+		return false, execution.ErrRunControlPromptNotFound
+	}
+	return moved, nil
+}
+
+func (r *runRegistry) cancelToolCall(sessionID, runID, toolCallID string) error {
+	active, err := r.activeRunControl(sessionID, runID)
+	if err != nil {
+		return err
+	}
+	if !active.CancelToolCall(toolCallID) {
+		return execution.ErrRunControlToolNotActive
+	}
+	return nil
 }
 
 func (r *runRegistry) activeRuns() []activeRunSnapshot {

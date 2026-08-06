@@ -1285,6 +1285,18 @@ func (run *CoordinatedSessionRun) ActivePromptReady() bool {
 	return sessionRun != nil && sessionRun.acceptsActivePrompt()
 }
 
+// ActiveControlReady reports whether the coordinator has installed the
+// process-local SessionRun owner and it is still running. Unlike
+// ActivePromptReady it does not require the enqueue/follow-up acceptance gate;
+// an in-flight tool may still be cancellable while that gate is closing.
+func (run *CoordinatedSessionRun) ActiveControlReady() bool {
+	if run == nil {
+		return false
+	}
+	sessionRun := run.sessionRun()
+	return sessionRun != nil && sessionRun.Status() == SessionRunRunning
+}
+
 func (run *CoordinatedSessionRun) TrySteer(content string) error {
 	sessionRun := run.sessionRun()
 	if sessionRun == nil {
@@ -1307,8 +1319,18 @@ func (run *CoordinatedSessionRun) SetActivePromptSteer(promptID string, steer bo
 
 // MoveActivePrompt reorders a queued prompt within its priority group.
 func (run *CoordinatedSessionRun) MoveActivePrompt(promptID string, delta int) bool {
+	found, _ := run.MoveActivePromptResult(promptID, delta)
+	return found
+}
+
+// MoveActivePromptResult delegates the richer queue-owner result without
+// moving queue policy into the coordinator or a presentation adapter.
+func (run *CoordinatedSessionRun) MoveActivePromptResult(promptID string, delta int) (found, moved bool) {
 	sessionRun := run.sessionRun()
-	return sessionRun != nil && sessionRun.MoveActivePrompt(promptID, delta)
+	if sessionRun == nil {
+		return false, false
+	}
+	return sessionRun.MoveActivePromptResult(promptID, delta)
 }
 
 func (run *CoordinatedSessionRun) Enqueue(event PromptEvent) (*PromptReceipt, error) {

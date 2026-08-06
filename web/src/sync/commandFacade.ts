@@ -10,7 +10,7 @@ import type {
   SessionCreateOptions,
   SessionCreateResult,
 } from '../commands/sessionCommands'
-import type { RunCancelResult, RunCommands, RunContinueOptions, RunContinueResult, RunPromptAppendOptions, RunPromptAppendResult, RunStartOptions, RunStartResult, RunStatus } from '../commands/runCommands'
+import type { RunCancelResult, RunCommands, RunContinueOptions, RunContinueResult, RunControlOptions, RunPromptAppendOptions, RunPromptAppendResult, RunPromptMoveResult, RunPromptRemoveResult, RunPromptSteerResult, RunStartOptions, RunStartResult, RunStatus, RunToolCancelResult } from '../commands/runCommands'
 import { SyncReadError } from './errors'
 import type { RuntimeTransport } from './runtime'
 
@@ -194,6 +194,42 @@ function decodeRunPromptAppendResult(value: unknown, sessionID: string, runID: s
   return { operation_id: resultOperationID, session_id: resultSessionID, run_id: resultRunID, accepted: true }
 }
 
+function decodeRunPromptRemoveResult(value: unknown, sessionID: string, runID: string, promptID: string): RunPromptRemoveResult {
+  const object = exactObject(value, ['session_id', 'run_id', 'prompt_id', 'removed'])
+  const resultSessionID = resultString(object, 'session_id')
+  const resultRunID = resultString(object, 'run_id')
+  const resultPromptID = resultString(object, 'prompt_id')
+  if (resultSessionID !== sessionID || resultRunID !== runID || resultPromptID !== promptID || object.removed !== true) throw new Error('result identity does not match request')
+  return { session_id: resultSessionID, run_id: resultRunID, prompt_id: resultPromptID, removed: true }
+}
+
+function decodeRunPromptSteerResult(value: unknown, sessionID: string, runID: string, promptID: string, steer: boolean): RunPromptSteerResult {
+  const object = exactObject(value, ['session_id', 'run_id', 'prompt_id', 'steer'])
+  const resultSessionID = resultString(object, 'session_id')
+  const resultRunID = resultString(object, 'run_id')
+  const resultPromptID = resultString(object, 'prompt_id')
+  if (resultSessionID !== sessionID || resultRunID !== runID || resultPromptID !== promptID || object.steer !== steer) throw new Error('result identity does not match request')
+  return { session_id: resultSessionID, run_id: resultRunID, prompt_id: resultPromptID, steer }
+}
+
+function decodeRunPromptMoveResult(value: unknown, sessionID: string, runID: string, promptID: string): RunPromptMoveResult {
+  const object = exactObject(value, ['session_id', 'run_id', 'prompt_id', 'moved'])
+  const resultSessionID = resultString(object, 'session_id')
+  const resultRunID = resultString(object, 'run_id')
+  const resultPromptID = resultString(object, 'prompt_id')
+  if (resultSessionID !== sessionID || resultRunID !== runID || resultPromptID !== promptID || typeof object.moved !== 'boolean') throw new Error('result identity does not match request')
+  return { session_id: resultSessionID, run_id: resultRunID, prompt_id: resultPromptID, moved: object.moved as boolean }
+}
+
+function decodeRunToolCancelResult(value: unknown, sessionID: string, runID: string, toolCallID: string): RunToolCancelResult {
+  const object = exactObject(value, ['session_id', 'run_id', 'tool_call_id', 'cancelled'])
+  const resultSessionID = resultString(object, 'session_id')
+  const resultRunID = resultString(object, 'run_id')
+  const resultToolCallID = resultString(object, 'tool_call_id')
+  if (resultSessionID !== sessionID || resultRunID !== runID || resultToolCallID !== toolCallID || object.cancelled !== true) throw new Error('result identity does not match request')
+  return { session_id: resultSessionID, run_id: resultRunID, tool_call_id: resultToolCallID, cancelled: true }
+}
+
 /**
  * Typed application command boundary. A command result is only a promise
  * result; it never mutates a replica. Durable authority still arrives through
@@ -374,6 +410,38 @@ export class CommandFacade implements SessionCommands, RunCommands {
     return this.submit('run.prompt.append', { session_id: cleanSessionID, run_id: cleanRunID, operation_id: operationID, content }, true, (value) => decodeRunPromptAppendResult(value, cleanSessionID, cleanRunID, operationID), options)
   }
 
+  removePrompt(sessionID: string, runID: string, promptID: string, options: RunControlOptions = {}): Promise<RunPromptRemoveResult> {
+    const cleanSessionID = this.cleanID(sessionID)
+    const cleanRunID = this.cleanID(runID)
+    const cleanPromptID = this.cleanControlID(promptID)
+    if (!this.validSessionID(cleanSessionID) || !this.validRunID(cleanRunID) || !cleanPromptID) return Promise.reject(new CommandFacadeError('invalid', 'session_id, run_id, and prompt_id are invalid'))
+    return this.submit('run.prompt.remove', { session_id: cleanSessionID, run_id: cleanRunID, prompt_id: cleanPromptID }, false, (value) => decodeRunPromptRemoveResult(value, cleanSessionID, cleanRunID, cleanPromptID), options)
+  }
+
+  steerPrompt(sessionID: string, runID: string, promptID: string, steer: boolean, options: RunControlOptions = {}): Promise<RunPromptSteerResult> {
+    const cleanSessionID = this.cleanID(sessionID)
+    const cleanRunID = this.cleanID(runID)
+    const cleanPromptID = this.cleanControlID(promptID)
+    if (!this.validSessionID(cleanSessionID) || !this.validRunID(cleanRunID) || !cleanPromptID || typeof steer !== 'boolean') return Promise.reject(new CommandFacadeError('invalid', 'session_id, run_id, prompt_id, and steer are invalid'))
+    return this.submit('run.prompt.steer', { session_id: cleanSessionID, run_id: cleanRunID, prompt_id: cleanPromptID, steer }, false, (value) => decodeRunPromptSteerResult(value, cleanSessionID, cleanRunID, cleanPromptID, steer), options)
+  }
+
+  movePrompt(sessionID: string, runID: string, promptID: string, delta: number, options: RunControlOptions = {}): Promise<RunPromptMoveResult> {
+    const cleanSessionID = this.cleanID(sessionID)
+    const cleanRunID = this.cleanID(runID)
+    const cleanPromptID = this.cleanControlID(promptID)
+    if (!this.validSessionID(cleanSessionID) || !this.validRunID(cleanRunID) || !cleanPromptID || !Number.isInteger(delta) || delta < -64 || delta > 64) return Promise.reject(new CommandFacadeError('invalid', 'session_id, run_id, prompt_id, and delta are invalid'))
+    return this.submit('run.prompt.move', { session_id: cleanSessionID, run_id: cleanRunID, prompt_id: cleanPromptID, delta }, false, (value) => decodeRunPromptMoveResult(value, cleanSessionID, cleanRunID, cleanPromptID), options)
+  }
+
+  cancelTool(sessionID: string, runID: string, toolCallID: string, options: RunControlOptions = {}): Promise<RunToolCancelResult> {
+    const cleanSessionID = this.cleanID(sessionID)
+    const cleanRunID = this.cleanID(runID)
+    const cleanToolCallID = this.cleanControlID(toolCallID)
+    if (!this.validSessionID(cleanSessionID) || !this.validRunID(cleanRunID) || !cleanToolCallID) return Promise.reject(new CommandFacadeError('invalid', 'session_id, run_id, and tool_call_id are invalid'))
+    return this.submit('run.tool.cancel', { session_id: cleanSessionID, run_id: cleanRunID, tool_call_id: cleanToolCallID }, false, (value) => decodeRunToolCancelResult(value, cleanSessionID, cleanRunID, cleanToolCallID), options)
+  }
+
   start(): void
   start(sessionID: string, content: string, options?: RunStartOptions): Promise<RunStartResult>
   start(sessionID?: string, content?: string, options: RunStartOptions = {}): void | Promise<RunStartResult> {
@@ -466,6 +534,11 @@ export class CommandFacade implements SessionCommands, RunCommands {
 
   private validOperationID(value: string): boolean {
     return this.validRunID(value)
+  }
+
+  private cleanControlID(value: string): string {
+    const cleaned = this.cleanID(value)
+    return this.utf8Bytes(cleaned) <= 256 ? cleaned : ''
   }
 
   private utf8Bytes(value: string): number {

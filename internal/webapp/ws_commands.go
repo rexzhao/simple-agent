@@ -75,6 +75,32 @@ type runPromptAppendArguments struct {
 	Content     string
 }
 
+type runPromptRemoveArguments struct {
+	SessionID string
+	RunID     string
+	PromptID  string
+}
+
+type runPromptSteerArguments struct {
+	SessionID string
+	RunID     string
+	PromptID  string
+	Steer     bool
+}
+
+type runPromptMoveArguments struct {
+	SessionID string
+	RunID     string
+	PromptID  string
+	Delta     int
+}
+
+type runToolCancelArguments struct {
+	SessionID  string
+	RunID      string
+	ToolCallID string
+}
+
 type sessionRenameResult struct {
 	SessionID   string `json:"session_id"`
 	DisplayName string `json:"display_name"`
@@ -163,6 +189,34 @@ type runPromptAppendResult struct {
 	SessionID   string `json:"session_id"`
 	RunID       string `json:"run_id"`
 	Accepted    bool   `json:"accepted"`
+}
+
+type runPromptRemoveResult struct {
+	SessionID string `json:"session_id"`
+	RunID     string `json:"run_id"`
+	PromptID  string `json:"prompt_id"`
+	Removed   bool   `json:"removed"`
+}
+
+type runPromptSteerResult struct {
+	SessionID string `json:"session_id"`
+	RunID     string `json:"run_id"`
+	PromptID  string `json:"prompt_id"`
+	Steer     bool   `json:"steer"`
+}
+
+type runPromptMoveResult struct {
+	SessionID string `json:"session_id"`
+	RunID     string `json:"run_id"`
+	PromptID  string `json:"prompt_id"`
+	Moved     bool   `json:"moved"`
+}
+
+type runToolCancelResult struct {
+	SessionID  string `json:"session_id"`
+	RunID      string `json:"run_id"`
+	ToolCallID string `json:"tool_call_id"`
+	Cancelled  bool   `json:"cancelled"`
 }
 
 func runStartFingerprint(request commands.CommandRequest, arguments runStartArguments) (string, error) {
@@ -313,6 +367,18 @@ func requiredCommandBool(fields map[string]json.RawMessage, name, command string
 	var value bool
 	if err := json.Unmarshal(raw, &value); err != nil {
 		return false, fmt.Errorf("invalid %s arguments", command)
+	}
+	return value, nil
+}
+
+func requiredCommandInt(fields map[string]json.RawMessage, name, command string, min, max int) (int, error) {
+	raw, ok := fields[name]
+	if !ok || strings.TrimSpace(string(raw)) == "null" {
+		return 0, fmt.Errorf("invalid %s arguments", command)
+	}
+	var value int
+	if err := json.Unmarshal(raw, &value); err != nil || value < min || value > max {
+		return 0, fmt.Errorf("invalid %s arguments", command)
 	}
 	return value, nil
 }
@@ -611,6 +677,120 @@ func decodeRunPromptAppendArguments(raw json.RawMessage) (runPromptAppendArgumen
 	return runPromptAppendArguments{SessionID: sessionID, RunID: runID, OperationID: operationID, Content: content}, nil
 }
 
+const maxActiveRunControlIDBytes = 256
+
+func requiredActiveRunControlID(fields map[string]json.RawMessage, name, command string) (string, error) {
+	value, err := requiredCommandString(fields, name, command)
+	if err != nil || len(value) > maxActiveRunControlIDBytes {
+		return "", fmt.Errorf("invalid %s arguments", command)
+	}
+	return value, nil
+}
+
+func decodeRunPromptRemoveArguments(raw json.RawMessage) (runPromptRemoveArguments, error) {
+	const command = "run.prompt.remove"
+	fields, err := strictCommandObject(raw, command)
+	if err != nil {
+		return runPromptRemoveArguments{}, err
+	}
+	if err := requireExactFields(fields, command, "session_id", "run_id", "prompt_id"); err != nil {
+		return runPromptRemoveArguments{}, err
+	}
+	sessionID, err := requiredCommandString(fields, "session_id", command)
+	if err != nil || sessions.ValidateSessionID(sessionID) != nil {
+		return runPromptRemoveArguments{}, fmt.Errorf("invalid %s arguments", command)
+	}
+	runID, err := requiredCommandString(fields, "run_id", command)
+	if err != nil || sessions.ValidateRunID(runID) != nil {
+		return runPromptRemoveArguments{}, fmt.Errorf("invalid %s arguments", command)
+	}
+	promptID, err := requiredActiveRunControlID(fields, "prompt_id", command)
+	if err != nil {
+		return runPromptRemoveArguments{}, err
+	}
+	return runPromptRemoveArguments{SessionID: sessionID, RunID: runID, PromptID: promptID}, nil
+}
+
+func decodeRunPromptSteerArguments(raw json.RawMessage) (runPromptSteerArguments, error) {
+	const command = "run.prompt.steer"
+	fields, err := strictCommandObject(raw, command)
+	if err != nil {
+		return runPromptSteerArguments{}, err
+	}
+	if err := requireExactFields(fields, command, "session_id", "run_id", "prompt_id", "steer"); err != nil {
+		return runPromptSteerArguments{}, err
+	}
+	sessionID, err := requiredCommandString(fields, "session_id", command)
+	if err != nil || sessions.ValidateSessionID(sessionID) != nil {
+		return runPromptSteerArguments{}, fmt.Errorf("invalid %s arguments", command)
+	}
+	runID, err := requiredCommandString(fields, "run_id", command)
+	if err != nil || sessions.ValidateRunID(runID) != nil {
+		return runPromptSteerArguments{}, fmt.Errorf("invalid %s arguments", command)
+	}
+	promptID, err := requiredActiveRunControlID(fields, "prompt_id", command)
+	if err != nil {
+		return runPromptSteerArguments{}, err
+	}
+	steer, err := requiredCommandBool(fields, "steer", command)
+	if err != nil {
+		return runPromptSteerArguments{}, err
+	}
+	return runPromptSteerArguments{SessionID: sessionID, RunID: runID, PromptID: promptID, Steer: steer}, nil
+}
+
+func decodeRunPromptMoveArguments(raw json.RawMessage) (runPromptMoveArguments, error) {
+	const command = "run.prompt.move"
+	fields, err := strictCommandObject(raw, command)
+	if err != nil {
+		return runPromptMoveArguments{}, err
+	}
+	if err := requireExactFields(fields, command, "session_id", "run_id", "prompt_id", "delta"); err != nil {
+		return runPromptMoveArguments{}, err
+	}
+	sessionID, err := requiredCommandString(fields, "session_id", command)
+	if err != nil || sessions.ValidateSessionID(sessionID) != nil {
+		return runPromptMoveArguments{}, fmt.Errorf("invalid %s arguments", command)
+	}
+	runID, err := requiredCommandString(fields, "run_id", command)
+	if err != nil || sessions.ValidateRunID(runID) != nil {
+		return runPromptMoveArguments{}, fmt.Errorf("invalid %s arguments", command)
+	}
+	promptID, err := requiredActiveRunControlID(fields, "prompt_id", command)
+	if err != nil {
+		return runPromptMoveArguments{}, err
+	}
+	delta, err := requiredCommandInt(fields, "delta", command, -maxActivePromptMoveDelta, maxActivePromptMoveDelta)
+	if err != nil {
+		return runPromptMoveArguments{}, err
+	}
+	return runPromptMoveArguments{SessionID: sessionID, RunID: runID, PromptID: promptID, Delta: delta}, nil
+}
+
+func decodeRunToolCancelArguments(raw json.RawMessage) (runToolCancelArguments, error) {
+	const command = "run.tool.cancel"
+	fields, err := strictCommandObject(raw, command)
+	if err != nil {
+		return runToolCancelArguments{}, err
+	}
+	if err := requireExactFields(fields, command, "session_id", "run_id", "tool_call_id"); err != nil {
+		return runToolCancelArguments{}, err
+	}
+	sessionID, err := requiredCommandString(fields, "session_id", command)
+	if err != nil || sessions.ValidateSessionID(sessionID) != nil {
+		return runToolCancelArguments{}, fmt.Errorf("invalid %s arguments", command)
+	}
+	runID, err := requiredCommandString(fields, "run_id", command)
+	if err != nil || sessions.ValidateRunID(runID) != nil {
+		return runToolCancelArguments{}, fmt.Errorf("invalid %s arguments", command)
+	}
+	toolCallID, err := requiredActiveRunControlID(fields, "tool_call_id", command)
+	if err != nil {
+		return runToolCancelArguments{}, err
+	}
+	return runToolCancelArguments{SessionID: sessionID, RunID: runID, ToolCallID: toolCallID}, nil
+}
+
 func validateSessionMarkReadArguments(raw json.RawMessage) error {
 	_, err := decodeSessionMarkReadArguments(raw)
 	return err
@@ -661,6 +841,26 @@ func validateRunPromptAppendArguments(raw json.RawMessage) error {
 	return err
 }
 
+func validateRunPromptRemoveArguments(raw json.RawMessage) error {
+	_, err := decodeRunPromptRemoveArguments(raw)
+	return err
+}
+
+func validateRunPromptSteerArguments(raw json.RawMessage) error {
+	_, err := decodeRunPromptSteerArguments(raw)
+	return err
+}
+
+func validateRunPromptMoveArguments(raw json.RawMessage) error {
+	_, err := decodeRunPromptMoveArguments(raw)
+	return err
+}
+
+func validateRunToolCancelArguments(raw json.RawMessage) error {
+	_, err := decodeRunToolCancelArguments(raw)
+	return err
+}
+
 func sessionCommandError(err error) error {
 	if err == nil {
 		return nil
@@ -688,6 +888,18 @@ func sessionCommandError(err error) error {
 		return commands.NewDomainError("operation_outcome_unknown", "prompt append may already have been applied; it will not be replayed automatically", err)
 	case errors.Is(err, execution.ErrPromptAppendNotApplied):
 		return commands.NewDomainError("operation_not_applied", "prompt append was not applied; retrying will not replay it", err)
+	case errors.Is(err, execution.ErrRunControlNotFound):
+		return commands.NewDomainError("run_not_found", "target run not found", err)
+	case errors.Is(err, execution.ErrRunControlWrongSession):
+		return commands.NewDomainError("run_wrong_session", "target run belongs to another session", err)
+	case errors.Is(err, execution.ErrRunControlRunSettled):
+		return commands.NewDomainError("run_settled", "target run is settled", err)
+	case errors.Is(err, execution.ErrRunControlNotActive):
+		return commands.NewDomainError("run_not_active", "target run is not active", err)
+	case errors.Is(err, execution.ErrRunControlPromptNotFound):
+		return commands.NewDomainError("prompt_not_found", "queued prompt not found", err)
+	case errors.Is(err, execution.ErrRunControlToolNotActive):
+		return commands.NewDomainError("tool_call_not_active", "tool call is not active", err)
 	case errors.Is(err, sessions.ErrIdempotencyConflict):
 		return commands.NewDomainError("idempotency_conflict", "client identity conflicts with an existing durable operation", err)
 	default:
@@ -697,6 +909,75 @@ func sessionCommandError(err error) error {
 
 func newSessionCommandRegistry(service *execution.Service, runs *runRegistry) (*commands.Registry, error) {
 	return commands.NewRegistry(
+		commands.CommandDefinition{
+			Name: "run.prompt.remove", SchemaVersion: 1, CrossEpochRetrySafe: false,
+			Validate: validateRunPromptRemoveArguments,
+			Execute: func(_ context.Context, request commands.CommandRequest) (json.RawMessage, error) {
+				arguments, err := decodeRunPromptRemoveArguments(request.Arguments)
+				if err != nil {
+					return nil, err
+				}
+				if runs == nil {
+					return nil, sessionCommandError(execution.ErrRunControlNotFound)
+				}
+				if err := runs.removeActivePrompt(arguments.SessionID, arguments.RunID, arguments.PromptID); err != nil {
+					return nil, sessionCommandError(err)
+				}
+				return json.Marshal(runPromptRemoveResult{SessionID: arguments.SessionID, RunID: arguments.RunID, PromptID: arguments.PromptID, Removed: true})
+			},
+		},
+		commands.CommandDefinition{
+			Name: "run.prompt.steer", SchemaVersion: 1, CrossEpochRetrySafe: false,
+			Validate: validateRunPromptSteerArguments,
+			Execute: func(_ context.Context, request commands.CommandRequest) (json.RawMessage, error) {
+				arguments, err := decodeRunPromptSteerArguments(request.Arguments)
+				if err != nil {
+					return nil, err
+				}
+				if runs == nil {
+					return nil, sessionCommandError(execution.ErrRunControlNotFound)
+				}
+				if err := runs.steerActivePrompt(arguments.SessionID, arguments.RunID, arguments.PromptID, arguments.Steer); err != nil {
+					return nil, sessionCommandError(err)
+				}
+				return json.Marshal(runPromptSteerResult{SessionID: arguments.SessionID, RunID: arguments.RunID, PromptID: arguments.PromptID, Steer: arguments.Steer})
+			},
+		},
+		commands.CommandDefinition{
+			Name: "run.prompt.move", SchemaVersion: 1, CrossEpochRetrySafe: false,
+			Validate: validateRunPromptMoveArguments,
+			Execute: func(_ context.Context, request commands.CommandRequest) (json.RawMessage, error) {
+				arguments, err := decodeRunPromptMoveArguments(request.Arguments)
+				if err != nil {
+					return nil, err
+				}
+				if runs == nil {
+					return nil, sessionCommandError(execution.ErrRunControlNotFound)
+				}
+				moved, err := runs.moveActivePrompt(arguments.SessionID, arguments.RunID, arguments.PromptID, arguments.Delta)
+				if err != nil {
+					return nil, sessionCommandError(err)
+				}
+				return json.Marshal(runPromptMoveResult{SessionID: arguments.SessionID, RunID: arguments.RunID, PromptID: arguments.PromptID, Moved: moved})
+			},
+		},
+		commands.CommandDefinition{
+			Name: "run.tool.cancel", SchemaVersion: 1, CrossEpochRetrySafe: false,
+			Validate: validateRunToolCancelArguments,
+			Execute: func(_ context.Context, request commands.CommandRequest) (json.RawMessage, error) {
+				arguments, err := decodeRunToolCancelArguments(request.Arguments)
+				if err != nil {
+					return nil, err
+				}
+				if runs == nil {
+					return nil, sessionCommandError(execution.ErrRunControlNotFound)
+				}
+				if err := runs.cancelToolCall(arguments.SessionID, arguments.RunID, arguments.ToolCallID); err != nil {
+					return nil, sessionCommandError(err)
+				}
+				return json.Marshal(runToolCancelResult{SessionID: arguments.SessionID, RunID: arguments.RunID, ToolCallID: arguments.ToolCallID, Cancelled: true})
+			},
+		},
 		commands.CommandDefinition{
 			Name: "run.prompt.append", SchemaVersion: 1, CrossEpochRetrySafe: true,
 			Validate: validateRunPromptAppendArguments,

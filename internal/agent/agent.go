@@ -102,6 +102,12 @@ func (r *ToolCancellationRegistry) Cancel(toolCallID string) bool {
 	}
 	r.mu.Lock()
 	cancel, ok := r.stop[toolCallID]
+	if ok {
+		// Cancellation is a one-shot control action. The gateway cache makes a
+		// duplicate request_id idempotent; a different request must not report
+		// an already-cancelled call as still active while the tool is unwinding.
+		delete(r.stop, toolCallID)
+	}
 	r.mu.Unlock()
 	if ok {
 		cancel()
