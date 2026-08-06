@@ -9,6 +9,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/coder/websocket"
 	"github.com/rexzhao/simple-agent/internal/execution"
@@ -27,6 +28,28 @@ func (*countingDurableWebRunner) SupportsIncrementalSessionTurn(context.Context,
 func (runner *countingDurableWebRunner) RunSessionTurn(context.Context, execution.SessionTurnRequest) (execution.SessionTurnResult, error) {
 	runner.starts.Add(1)
 	return execution.SessionTurnResult{Incremental: true}, nil
+}
+
+type blockingDurableWebRunner struct {
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+	starts  atomic.Int32
+}
+
+func (*blockingDurableWebRunner) SupportsIncrementalSessionTurn(context.Context, execution.SessionTurnRequest) (bool, error) {
+	return true, nil
+}
+
+func (runner *blockingDurableWebRunner) RunSessionTurn(ctx context.Context, _ execution.SessionTurnRequest) (execution.SessionTurnResult, error) {
+	runner.starts.Add(1)
+	runner.once.Do(func() { close(runner.entered) })
+	select {
+	case <-runner.release:
+		return execution.SessionTurnResult{Incremental: true}, nil
+	case <-ctx.Done():
+		return execution.SessionTurnResult{}, ctx.Err()
+	}
 }
 
 func TestDurableRunStartReusesIdentityWithoutStartingAgain(t *testing.T) {
@@ -111,6 +134,105 @@ func TestDurableRunStartConcurrentSameIdentityExecutesOnce(t *testing.T) {
 	}
 	if got := runner.starts.Load(); got != 1 {
 		t.Fatalf("model execution count=%d, want one", got)
+	}
+}
+
+func TestDurableRunContinueUsesInterruptedTargetAndSharedAdmission(t *testing.T) {
+	runner := &blockingDurableWebRunner{entered: make(chan struct{}), release: make(chan struct{})}
+	_, service, app := newWebTestAppServerWithRunner(t, runner)
+	project, err := service.CreateProject(t.TempDir(), "continue command project")
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := service.CreateSession(project.Project.ID, execution.SessionCreateMetadata{Provider: "fake", ModelProfile: "default", ModelID: "model"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	other, err := service.CreateSession(project.Project.ID, execution.SessionCreateMetadata{Provider: "fake", ModelProfile: "default", ModelID: "model"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.SessionStore().CreateRun(session.ID, "run-interrupted-web", "", nil, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.SessionStore().StartTurn(session.ID, "run-interrupted-web", "turn-interrupted-web", 0, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.SessionStore().SetTurnStatus(session.ID, "run-interrupted-web", "turn-interrupted-web", sessions.TurnStatusFailed, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.SessionStore().SetRunStatus(session.ID, "run-interrupted-web", sessions.RunStatusFailed, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	if state, err := service.SessionStore().LoadState(session.ID); err != nil || state.RunningRunID != "" || state.RunningTurnID != "" || state.InterruptedRunID != "run-interrupted-web" || state.InterruptedTurnID != "turn-interrupted-web" {
+		t.Fatalf("seeded interrupted state=%#v err=%v", state, err)
+	}
+
+	firstResult := make(chan struct {
+		status string
+		err    error
+	}, 1)
+	go func() {
+		status, err := app.runs.continueDurable(session.ID, "run-continue-web", "fingerprint-continue-web")
+		firstResult <- struct {
+			status string
+			err    error
+		}{status, err}
+	}()
+	select {
+	case <-runner.entered:
+	case <-time.After(5 * time.Second):
+		result := <-firstResult
+		managed, ok := app.runs.get("run-continue-web")
+		if ok && managed != nil && managed.run != nil {
+			_, waitErr := managed.run.Wait()
+			t.Fatalf("continue did not reach the model runner: first=%#v status=%s wait=%v", result, managed.run.Status(), waitErr)
+		}
+		t.Fatalf("continue did not reach the model runner: first=%#v managed=%t", result, ok)
+	}
+
+	if status, err := app.runs.continueDurable(session.ID, "run-continue-other", "fingerprint-other"); !errors.Is(err, execution.ErrSessionBusy) || status != "" {
+		t.Fatalf("different continue identity status=%q err=%v, want busy before admission", status, err)
+	}
+	if status, err := app.runs.continueDurable(session.ID, "run-continue-web", "fingerprint-continue-web"); err != nil || status != string(execution.SessionRunRunning) {
+		t.Fatalf("same continue identity retry status=%q err=%v, want running", status, err)
+	}
+	close(runner.release)
+	select {
+	case result := <-firstResult:
+		if result.err != nil || result.status != string(execution.SessionRunRunning) {
+			t.Fatalf("first continue result=%#v, want running acknowledgement", result)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("continue admission did not return")
+	}
+	managed, ok := app.runs.get("run-continue-web")
+	if !ok {
+		t.Fatal("continued run was not registered in the shared replay adapter")
+	}
+	if _, err := managed.run.Wait(); err != nil {
+		t.Fatalf("continued run wait error=%v", err)
+	}
+	if got := runner.starts.Load(); got != 1 {
+		t.Fatalf("continue model execution count=%d, want one", got)
+	}
+	if status, err := app.runs.continueDurable(session.ID, "run-continue-web", "fingerprint-continue-web"); err != nil || status != string(execution.SessionRunCommitted) {
+		t.Fatalf("settled continue retry status=%q err=%v", status, err)
+	}
+	if _, err := app.runs.continueDurable(session.ID, "run-continue-web", "different-fingerprint"); !errors.Is(err, sessions.ErrIdempotencyConflict) {
+		t.Fatalf("different continue fingerprint error=%v, want idempotency conflict", err)
+	}
+	if _, err := app.runs.continueDurable(other.ID, "run-continue-web", "fingerprint-continue-web"); !errors.Is(err, sessions.ErrIdempotencyConflict) {
+		t.Fatalf("cross-session continue identity error=%v, want idempotency conflict", err)
+	}
+	runs, err := service.SessionStore().ListRuns(session.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, run := range runs {
+		if run.ID == "run-continue-web" && run.PreviousRunID != "run-interrupted-web" {
+			t.Fatalf("continued run previous=%q, want interrupted target", run.PreviousRunID)
+		}
 	}
 }
 

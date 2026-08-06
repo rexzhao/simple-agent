@@ -209,10 +209,29 @@ func (r *runRegistry) startContinue(sessionID string) (*managedRun, error) {
 // the single active-run/replay path; this method only supplies the durable
 // identity fingerprint and returns the compact status acknowledgement.
 func (r *runRegistry) startDurable(sessionID, content, runID, inputFingerprint string) (string, error) {
+	return r.startDurableWithInput(sessionID, execution.SessionMessageInput{Content: content}, runID, inputFingerprint)
+}
+
+// continueDurable is the Web command entry point for a durable continuation.
+// It deliberately supplies no content: the execution service resolves the
+// interrupted target from durable session state while holding the same
+// admission lock used by run.start, and persists that target in PreviousRunID.
+func (r *runRegistry) continueDurable(sessionID, runID, inputFingerprint string) (string, error) {
+	return r.startDurableWithInput(sessionID, execution.SessionMessageInput{Continue: true}, runID, inputFingerprint)
+}
+
+func (r *runRegistry) startDurableWithInput(sessionID string, input execution.SessionMessageInput, runID, inputFingerprint string) (string, error) {
 	sessionID = strings.TrimSpace(sessionID)
 	runID = strings.TrimSpace(runID)
-	if sessionID == "" || runID == "" || strings.TrimSpace(content) == "" {
-		return "", fmt.Errorf("session id, run id, and content are required")
+	if sessionID == "" || runID == "" {
+		return "", fmt.Errorf("session id and run id are required")
+	}
+	if input.Continue {
+		if strings.TrimSpace(input.Content) != "" || len(input.ContentBlocks) != 0 {
+			return "", fmt.Errorf("continue cannot include new message content")
+		}
+	} else if strings.TrimSpace(input.Content) == "" && len(input.ContentBlocks) == 0 {
+		return "", fmt.Errorf("message content or image attachment is required")
 	}
 	r.mu.Lock()
 	if r.closed {
@@ -220,7 +239,7 @@ func (r *runRegistry) startDurable(sessionID, content, runID, inputFingerprint s
 		return "", ErrRunRegistryClosed
 	}
 	r.mu.Unlock()
-	coordinated, admission, err := r.coordinator.StartDurable(sessionID, execution.SessionMessageInput{Content: content}, runID, inputFingerprint, nil)
+	coordinated, admission, err := r.coordinator.StartDurable(sessionID, input, runID, inputFingerprint, nil)
 	if err != nil {
 		return "", err
 	}

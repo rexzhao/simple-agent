@@ -80,6 +80,11 @@ func TestSessionCommandSchemasAreStrict(t *testing.T) {
 			valid:   json.RawMessage(`{"session_id":"session","run_id":"run","content":"hello"}`),
 			invalid: []json.RawMessage{json.RawMessage(`{"session_id":"session","run_id":"run","content":""}`), json.RawMessage(`{"session_id":"session","run_id":"run","content":"hello","images":[]}`), json.RawMessage(`{"session_id":"session","run_id":"run","content":"hello"} trailing`), json.RawMessage(`{"session_id":"session","run_id":"run","content":"hello","content":"again"}`), json.RawMessage(`{"session_id":"session","run_id":"run","content":"` + strings.Repeat("x", maxRunStartContentBytes+1) + `"}`)},
 		},
+		{
+			name: "run_continue", validate: validateRunContinueArguments,
+			valid:   json.RawMessage(`{"session_id":"session","run_id":"run"}`),
+			invalid: []json.RawMessage{json.RawMessage(`{"session_id":"session","run_id":"run","content":"new"}`), json.RawMessage(`{"session_id":"session","run_id":"run","blob":null}`), json.RawMessage(`{"session_id":"session","run_id":"run"} trailing`), json.RawMessage(`{"session_id":"session","run_id":"run","run_id":"other"}`), json.RawMessage(`{"session_id":"session","run_id":1}`), json.RawMessage(`{"session_id":"session","run_id":"run","content":null}`)},
+		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -183,12 +188,34 @@ func TestRunStartPreservesExactContentAndUsesUTF8ByteLimit(t *testing.T) {
 	}
 }
 
+func TestRunContinueFingerprintNormalizesOnlyWireOperationAndSeparatesRunStart(t *testing.T) {
+	request := commands.CommandRequest{Name: "run.continue", SchemaVersion: 1, Arguments: json.RawMessage(`{"session_id":"session","run_id":"run-a"}`)}
+	first, err := runContinueFingerprint(request, runContinueArguments{SessionID: "session", RunID: "run-a"})
+	if err != nil {
+		t.Fatalf("runContinueFingerprint() error = %v", err)
+	}
+	second, err := runContinueFingerprint(request, runContinueArguments{SessionID: "session", RunID: "run-b"})
+	if err != nil {
+		t.Fatalf("runContinueFingerprint(second) error = %v", err)
+	}
+	if first != second {
+		t.Fatalf("continue fingerprint depends on stable run identity: %q != %q", first, second)
+	}
+	start, err := runStartFingerprint(commands.CommandRequest{Name: "run.start", SchemaVersion: 1}, runStartArguments{SessionID: "session", RunID: "run-a", Content: ""})
+	if err != nil {
+		t.Fatalf("runStartFingerprint() error = %v", err)
+	}
+	if first == start {
+		t.Fatal("run.start and run.continue share an idempotency fingerprint")
+	}
+}
+
 func TestSessionCommandRegistryIsClosedAndFlagsAreExplicit(t *testing.T) {
 	registry, err := newSessionCommandRegistry(nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantNames := []string{"run.cancel", "run.start", "session.archive", "session.create", "session.mark_read", "session.rename", "session.restore", "session.set_debug", "session.set_full_access"}
+	wantNames := []string{"run.cancel", "run.continue", "run.start", "session.archive", "session.create", "session.mark_read", "session.rename", "session.restore", "session.set_debug", "session.set_full_access"}
 	if got := registry.Names(); !reflect.DeepEqual(got, wantNames) {
 		t.Fatalf("registry names=%v, want %v", got, wantNames)
 	}

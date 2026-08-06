@@ -63,6 +63,11 @@ type runStartArguments struct {
 	Content   string
 }
 
+type runContinueArguments struct {
+	SessionID string
+	RunID     string
+}
+
 type sessionRenameResult struct {
 	SessionID   string `json:"session_id"`
 	DisplayName string `json:"display_name"`
@@ -140,10 +145,33 @@ type runStartResult struct {
 	Status    string `json:"status"`
 }
 
+type runContinueResult struct {
+	SessionID string `json:"session_id"`
+	RunID     string `json:"run_id"`
+	Status    string `json:"status"`
+}
+
 func runStartFingerprint(request commands.CommandRequest, arguments runStartArguments) (string, error) {
 	fingerprintArgs, err := json.Marshal(map[string]string{
 		"session_id": arguments.SessionID,
 		"content":    arguments.Content,
+	})
+	if err != nil {
+		return "", err
+	}
+	fingerprintRequest := request
+	fingerprintRequest.Arguments = fingerprintArgs
+	return commands.Fingerprint(fingerprintRequest)
+}
+
+// run.continue has no client-supplied target or content. The durable run row
+// binds the new identity to the interrupted run selected while admission is
+// locked (PreviousRunID); the wire fingerprint therefore contains only the
+// normalized operation argument. The command name/schema remain part of the
+// command fingerprint, so a run.start cannot collide with run.continue.
+func runContinueFingerprint(request commands.CommandRequest, arguments runContinueArguments) (string, error) {
+	fingerprintArgs, err := json.Marshal(map[string]string{
+		"session_id": arguments.SessionID,
 	})
 	if err != nil {
 		return "", err
@@ -520,6 +548,26 @@ func decodeRunStartArguments(raw json.RawMessage) (runStartArguments, error) {
 	return runStartArguments{SessionID: sessionID, RunID: runID, Content: content}, nil
 }
 
+func decodeRunContinueArguments(raw json.RawMessage) (runContinueArguments, error) {
+	const command = "run.continue"
+	fields, err := strictCommandObject(raw, command)
+	if err != nil {
+		return runContinueArguments{}, err
+	}
+	if err := requireExactFields(fields, command, "session_id", "run_id"); err != nil {
+		return runContinueArguments{}, err
+	}
+	sessionID, err := requiredCommandString(fields, "session_id", command)
+	if err != nil || sessions.ValidateSessionID(sessionID) != nil {
+		return runContinueArguments{}, fmt.Errorf("invalid %s arguments", command)
+	}
+	runID, err := requiredCommandString(fields, "run_id", command)
+	if err != nil || sessions.ValidateRunID(runID) != nil {
+		return runContinueArguments{}, fmt.Errorf("invalid %s arguments", command)
+	}
+	return runContinueArguments{SessionID: sessionID, RunID: runID}, nil
+}
+
 func validateSessionMarkReadArguments(raw json.RawMessage) error {
 	_, err := decodeSessionMarkReadArguments(raw)
 	return err
@@ -557,6 +605,11 @@ func validateRunCancelArguments(raw json.RawMessage) error {
 
 func validateRunStartArguments(raw json.RawMessage) error {
 	_, err := decodeRunStartArguments(raw)
+	return err
+}
+
+func validateRunContinueArguments(raw json.RawMessage) error {
+	_, err := decodeRunContinueArguments(raw)
 	return err
 }
 
@@ -604,6 +657,28 @@ func newSessionCommandRegistry(service *execution.Service, runs *runRegistry) (*
 					return nil, sessionCommandError(err)
 				}
 				return json.Marshal(runStartResult{SessionID: arguments.SessionID, RunID: arguments.RunID, Status: status})
+			},
+		},
+		commands.CommandDefinition{
+			Name: "run.continue", SchemaVersion: 1, CrossEpochRetrySafe: true,
+			Validate: validateRunContinueArguments,
+			Execute: func(ctx context.Context, request commands.CommandRequest) (json.RawMessage, error) {
+				arguments, err := decodeRunContinueArguments(request.Arguments)
+				if err != nil {
+					return nil, err
+				}
+				fingerprint, err := runContinueFingerprint(request, arguments)
+				if err != nil {
+					return nil, commands.NewDomainError("invalid_fingerprint", "command fingerprint is invalid", err)
+				}
+				if runs == nil {
+					return nil, commands.NewDomainError("run_unavailable", "run execution is not configured", nil)
+				}
+				status, err := runs.continueDurable(arguments.SessionID, arguments.RunID, fingerprint)
+				if err != nil {
+					return nil, sessionCommandError(err)
+				}
+				return json.Marshal(runContinueResult{SessionID: arguments.SessionID, RunID: arguments.RunID, Status: status})
 			},
 		},
 		commands.CommandDefinition{

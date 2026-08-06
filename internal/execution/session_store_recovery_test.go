@@ -2,11 +2,111 @@ package execution
 
 import (
 	"context"
+	"encoding/json"
 	"testing"
 	"time"
 
 	"github.com/rexzhao/simple-agent/internal/sessions"
 )
+
+func admitInterruptedTestRun(t *testing.T, service *Service, sessionID, runID, turnID string) {
+	t.Helper()
+	store := service.SessionStore()
+	if _, err := store.CreateRun(sessionID, runID, "", []byte(`{"content":"original"}`), time.Now().UTC()); err != nil {
+		t.Fatalf("CreateRun(%q) error = %v", runID, err)
+	}
+	if _, err := store.StartTurn(sessionID, runID, turnID, 0, time.Now().UTC()); err != nil {
+		t.Fatalf("StartTurn(%q) error = %v", turnID, err)
+	}
+	if _, err := store.SetTurnStatus(sessionID, runID, turnID, sessions.TurnStatusFailed, time.Now().UTC()); err != nil {
+		t.Fatalf("SetTurnStatus(%q) error = %v", turnID, err)
+	}
+	if _, err := store.SetRunStatus(sessionID, runID, sessions.RunStatusFailed, time.Now().UTC()); err != nil {
+		t.Fatalf("SetRunStatus(%q) error = %v", runID, err)
+	}
+}
+
+func TestDurableContinueAdmissionBindsInterruptedRunAndTurn(t *testing.T) {
+	home := t.TempDir()
+	service, _, session := newExecutionServiceWithSession(t, home, fakeExecutionTurnRunner{supports: true})
+	admitInterruptedTestRun(t, service, session.ID, "run-interrupted-target", "turn-interrupted-target")
+
+	input := SessionMessageInput{Continue: true}
+	admission, err := service.AdmitSessionRun(context.Background(), session.ID, input, "run-continue-bound", "fingerprint-continue-bound")
+	if err != nil || !admission.Created || admission.Status != SessionRunRunning {
+		t.Fatalf("continue admission=%#v err=%v", admission, err)
+	}
+	runs, err := service.SessionStore().ListRuns(session.ID)
+	if err != nil {
+		t.Fatalf("ListRuns() error = %v", err)
+	}
+	var continued sessions.RunRecord
+	for _, run := range runs {
+		if run.ID == "run-continue-bound" {
+			continued = run
+		}
+	}
+	if continued.PreviousRunID != "run-interrupted-target" || continued.Status != sessions.RunStatusRunning {
+		t.Fatalf("continue row=%#v, want previous interrupted target", continued)
+	}
+	var payload SessionMessageInput
+	if err := json.Unmarshal(continued.InputPayload, &payload); err != nil {
+		t.Fatalf("unmarshal continue payload: %v", err)
+	}
+	if !payload.Continue || payload.Content != "" || payload.ContinueTargetRunID != "run-interrupted-target" || payload.ContinueTargetTurnID != "turn-interrupted-target" {
+		t.Fatalf("continue payload=%#v, want server-bound target and no content", payload)
+	}
+
+	// Move the session's current interrupted marker to a later failed run. A
+	// retry of the original stable identity must still resolve the recorded row
+	// and status, not reinterpret it against this newer marker.
+	if _, err := service.SessionStore().StartTurn(session.ID, "run-continue-bound", "turn-continue-bound", 0, time.Now().UTC()); err != nil {
+		t.Fatalf("StartTurn(continue) error = %v", err)
+	}
+	if _, err := service.SessionStore().SetTurnStatus(session.ID, "run-continue-bound", "turn-continue-bound", sessions.TurnStatusFailed, time.Now().UTC()); err != nil {
+		t.Fatalf("SetTurnStatus(continue) error = %v", err)
+	}
+	if _, err := service.SessionStore().SetRunStatus(session.ID, "run-continue-bound", sessions.RunStatusFailed, time.Now().UTC()); err != nil {
+		t.Fatalf("SetRunStatus(continue) error = %v", err)
+	}
+	state, err := service.SessionStore().LoadState(session.ID)
+	if err != nil || state.InterruptedRunID != "run-continue-bound" {
+		t.Fatalf("current interrupted state=%#v err=%v", state, err)
+	}
+	retry, err := service.AdmitSessionRun(context.Background(), session.ID, input, "run-continue-bound", "fingerprint-continue-bound")
+	if err != nil || retry.Created || retry.Status != SessionRunFailed {
+		t.Fatalf("bound retry=%#v err=%v, want recorded failed status", retry, err)
+	}
+	runs, err = service.SessionStore().ListRuns(session.ID)
+	if err != nil {
+		t.Fatalf("ListRuns(retry) error = %v", err)
+	}
+	for _, run := range runs {
+		if run.ID == "run-continue-bound" && run.PreviousRunID != "run-interrupted-target" {
+			t.Fatalf("retry changed durable target: %#v", run)
+		}
+	}
+}
+
+func TestDurableContinueValidationFailureBeforeClaimCanRetry(t *testing.T) {
+	home := t.TempDir()
+	service, _, session := newExecutionServiceWithSession(t, home, fakeExecutionTurnRunner{supports: false})
+	admitInterruptedTestRun(t, service, session.ID, "run-continue-precondition", "turn-continue-precondition")
+	input := SessionMessageInput{Continue: true}
+	if _, err := service.AdmitSessionRun(context.Background(), session.ID, input, "run-continue-precondition-retry", "fingerprint-continue-precondition"); err == nil {
+		t.Fatal("unsupported continue runner was durably admitted")
+	}
+	if runs, err := service.SessionStore().ListRuns(session.ID); err != nil {
+		t.Fatal(err)
+	} else if len(runs) != 1 {
+		t.Fatalf("pre-admission failure created durable run rows=%#v", runs)
+	}
+	service.turnRunner = fakeExecutionTurnRunner{supports: true}
+	admission, err := service.AdmitSessionRun(context.Background(), session.ID, input, "run-continue-precondition-retry", "fingerprint-continue-precondition")
+	if err != nil || !admission.Created || admission.Status != SessionRunRunning {
+		t.Fatalf("retry continue admission=%#v err=%v", admission, err)
+	}
+}
 
 func TestDurableRunAdmissionRecoveryDoesNotReplayModelWork(t *testing.T) {
 	home := t.TempDir()

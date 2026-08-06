@@ -14,6 +14,18 @@ export interface RunStartResult {
   readonly status: RunStatus
 }
 
+export interface RunContinueOptions {
+  /** Caller-owned stable identity. Reuse it for a timeout/page-restore retry. */
+  readonly runID?: string
+  readonly signal?: AbortSignal
+}
+
+export interface RunContinueResult {
+  readonly session_id: string
+  readonly run_id: string
+  readonly status: RunStatus
+}
+
 export interface RunCancelResult {
   readonly run_id: string
   readonly status: RunStatus
@@ -26,6 +38,11 @@ export interface RunCommands {
    */
   start(sessionID: string, content: string, options?: RunStartOptions): Promise<RunStartResult>
   startRun(sessionID: string, content: string, options?: RunStartOptions): Promise<RunStartResult>
+  /**
+   * Resumes the durable interrupted context. It never accepts new content;
+   * run_id is separate from the gateway request_id and is the retry key.
+   */
+  continueRun(sessionID: string, options?: RunContinueOptions): Promise<RunContinueResult>
   /**
    * Cancels an active in-memory run. A resend in the same server epoch is
    * gateway-deduped; after an epoch change the outcome is intentionally

@@ -10,7 +10,7 @@ import type {
   SessionCreateOptions,
   SessionCreateResult,
 } from '../commands/sessionCommands'
-import type { RunCancelResult, RunCommands, RunStartOptions, RunStartResult, RunStatus } from '../commands/runCommands'
+import type { RunCancelResult, RunCommands, RunContinueOptions, RunContinueResult, RunStartOptions, RunStartResult, RunStatus } from '../commands/runCommands'
 import { SyncReadError } from './errors'
 import type { RuntimeTransport } from './runtime'
 
@@ -159,6 +159,16 @@ function decodeRunCancelResult(value: unknown, runID: string): RunCancelResult {
 }
 
 function decodeRunStartResult(value: unknown, sessionID: string, runID: string): RunStartResult {
+  const object = exactObject(value, ['session_id', 'run_id', 'status'])
+  const resultSessionID = resultString(object, 'session_id')
+  const resultRunID = resultString(object, 'run_id')
+  const status = object.status
+  const statuses: RunStatus[] = ['running', 'committed', 'failed', 'interrupted', 'cancelled']
+  if (resultSessionID !== sessionID || resultRunID !== runID || typeof status !== 'string' || !statuses.includes(status as RunStatus)) throw new Error('result does not match request')
+  return { session_id: resultSessionID, run_id: resultRunID, status: status as RunStatus }
+}
+
+function decodeRunContinueResult(value: unknown, sessionID: string, runID: string): RunContinueResult {
   const object = exactObject(value, ['session_id', 'run_id', 'status'])
   const resultSessionID = resultString(object, 'session_id')
   const resultRunID = resultString(object, 'run_id')
@@ -354,6 +364,32 @@ export class CommandFacade implements SessionCommands, RunCommands {
 
   startRun(sessionID: string, content: string, options: RunStartOptions = {}): Promise<RunStartResult> {
     return this.start(sessionID, content, options)
+  }
+
+  continueRun(sessionID: string, options: RunContinueOptions = {}): Promise<RunContinueResult> {
+    const cleanSessionID = this.cleanID(sessionID)
+    if (!this.validSessionID(cleanSessionID)) return Promise.reject(new CommandFacadeError('invalid', 'session_id is invalid'))
+
+    const explicitRunID = options.runID !== undefined
+    let runID: string
+    if (explicitRunID) {
+      // Explicit IDs intentionally bypass the process-local collision cache:
+      // the durable claim is the authority after a timeout, restore, or epoch
+      // change, and a new request_id will be generated for this retry.
+      if (typeof options.runID !== 'string') return Promise.reject(new CommandFacadeError('invalid', 'run_id is invalid'))
+      runID = this.cleanID(options.runID)
+      if (!this.validRunID(runID)) return Promise.reject(new CommandFacadeError('invalid', 'run_id is invalid'))
+    } else {
+      try {
+        runID = this.cleanID(this.runIDGenerator())
+        if (!this.validRunID(runID)) throw new Error('run ID is invalid')
+      } catch {
+        return Promise.reject(new CommandFacadeError('id_generation', 'cryptographic run ID generation failed'))
+      }
+      if (this.recentRunIDs.has(runID)) return Promise.reject(new CommandFacadeError('id_generation', 'run ID collided with an active or recently used command', { collision: true }))
+      this.rememberRunID(runID)
+    }
+    return this.submit('run.continue', { session_id: cleanSessionID, run_id: runID }, true, (value) => decodeRunContinueResult(value, cleanSessionID, runID), options)
   }
 
   private submitSessionToggle(name: 'session.archive' | 'session.restore', sessionID: string, archived: boolean, options: CommandOptions): Promise<SessionArchiveResult> {

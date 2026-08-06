@@ -226,6 +226,69 @@ describe('CommandFacade session.mark_read', () => {
     facade.stop()
   })
 
+  it('continues with only session/run identity, separates request IDs, and retries the exact payload', async () => {
+    const transport = new FakeCommandTransport()
+    let requestNumber = 0
+    const facade = new CommandFacade({
+      transport,
+      requestIDGenerator: () => `request_continue_${++requestNumber}`,
+      runIDGenerator: () => 'run_continue_generated',
+    })
+    const pending = facade.continueRun('session_1')
+    const initial = transport.sent[0]
+    if (initial.type !== 'command') throw new Error('wrong command')
+    expect(initial.payload.name).toBe('run.continue')
+    expect(initial.payload.arguments).toEqual({ session_id: 'session_1', run_id: 'run_continue_generated' })
+    expect(initial.payload.request_id).not.toBe(initial.payload.arguments.run_id)
+
+    transport.connectionGeneration = 2
+    transport.emitReady('epoch_2', 'epoch_1')
+    const resent = transport.sent[1]
+    if (resent.type !== 'command') throw new Error('wrong resent command')
+    expect(resent.payload).toEqual(initial.payload)
+    transport.emit(commandMessage('command_result', resent.payload.request_id, {
+      status: 'succeeded', result: { session_id: 'session_1', run_id: 'run_continue_generated', status: 'running' },
+    }), 2)
+    await expect(pending).resolves.toEqual({ session_id: 'session_1', run_id: 'run_continue_generated', status: 'running' })
+
+    const explicit = facade.continueRun('session_1', { runID: 'run_continue_explicit' })
+    const explicitMessage = transport.sent[2]
+    if (explicitMessage.type !== 'command') throw new Error('wrong explicit command')
+    transport.emit(commandMessage('command_result', explicitMessage.payload.request_id, {
+      status: 'succeeded', result: { session_id: 'session_1', run_id: 'run_continue_explicit', status: 'failed' },
+    }), 2)
+    await expect(explicit).resolves.toEqual({ session_id: 'session_1', run_id: 'run_continue_explicit', status: 'failed' })
+
+    const explicitRetry = facade.continueRun('session_1', { runID: 'run_continue_explicit' })
+    const retryMessage = transport.sent[3]
+    if (retryMessage.type !== 'command') throw new Error('wrong explicit retry')
+    expect(retryMessage.payload.arguments).toEqual(explicitMessage.payload.arguments)
+    expect(retryMessage.payload.request_id).not.toBe(explicitMessage.payload.request_id)
+    transport.emit(commandMessage('command_result', retryMessage.payload.request_id, {
+      status: 'succeeded', result: { session_id: 'session_1', run_id: 'run_continue_explicit', status: 'failed' },
+    }), 2)
+    await expect(explicitRetry).resolves.toMatchObject({ status: 'failed' })
+
+    await expect(facade.continueRun('')).rejects.toMatchObject({ code: 'invalid' })
+    await expect(facade.continueRun('session_1', { runID: 'not/valid' })).rejects.toMatchObject({ code: 'invalid' })
+    const collision = facade.continueRun('session_1')
+    await expect(collision).rejects.toMatchObject({ code: 'id_generation', details: { collision: true } })
+    facade.stop()
+  })
+
+  it('rejects a continue result that is not the compact requested identity', async () => {
+    const transport = new FakeCommandTransport()
+    const facade = new CommandFacade({ transport })
+    const pending = facade.continueRun('session_1', { runID: 'run_continue_shape' })
+    const command = transport.sent[0]
+    if (command.type !== 'command') throw new Error('wrong command')
+    transport.emit(commandMessage('command_result', command.payload.request_id, {
+      status: 'succeeded', result: { session_id: 'session_1', run_id: 'run_continue_shape', status: 'committed', extra: true },
+    }))
+    await expect(pending).rejects.toMatchObject({ code: 'invalid' })
+    facade.stop()
+  })
+
   it('rejects on timeout, cancellation, and stop while clearing pending timers', async () => {
     const timers = new TimerBox()
     const transport = new FakeCommandTransport()

@@ -218,6 +218,13 @@ type SessionMessageInput struct {
 	Internal bool `json:"internal,omitempty"`
 	// DeliveryID links an internal notification to its durable inbox record.
 	DeliveryID string `json:"delivery_id,omitempty"`
+	// ContinueTargetRunID and ContinueTargetTurnID are server-populated
+	// admission metadata. They are not accepted from the Web command and are
+	// not used as a client-selected resume target; they make the durable run
+	// payload self-describing even after the session's current interrupted
+	// marker moves on to a later run.
+	ContinueTargetRunID  string `json:"continue_target_run_id,omitempty"`
+	ContinueTargetTurnID string `json:"continue_target_turn_id,omitempty"`
 }
 
 // Message builds the model-facing input message. Ordinary inputs are user
@@ -2363,10 +2370,6 @@ func (s *Service) AdmitSessionRun(ctx context.Context, id string, input SessionM
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	payload, err := json.Marshal(input)
-	if err != nil {
-		return DurableRunAdmission{}, err
-	}
 	lockCtx := ctx
 	cancelLock := func() {}
 	if s.sessionWriteLockTimeout > 0 {
@@ -2433,6 +2436,19 @@ func (s *Service) AdmitSessionRun(ctx context.Context, id string, input SessionM
 	// configuration failure at this point is a pre-admission failure and is
 	// therefore safe for the client to retry.
 	if err := s.requireIncrementalSessionTurn(ctx, session, input); err != nil {
+		return DurableRunAdmission{}, err
+	}
+	// Capture the target selected by the same locked state snapshot used for
+	// validation. PreviousRunID is the relational lineage; these two fields
+	// make the continue operation's interrupted turn identity durable as well.
+	// They are populated only after validation, never taken from the client.
+	payloadInput := input
+	if input.Continue {
+		payloadInput.ContinueTargetRunID = session.InterruptedRunID
+		payloadInput.ContinueTargetTurnID = session.InterruptedTurnID
+	}
+	payload, err := json.Marshal(payloadInput)
+	if err != nil {
 		return DurableRunAdmission{}, err
 	}
 
@@ -2590,7 +2606,17 @@ func (s *Service) runSessionMessage(ctx context.Context, id string, input Sessio
 		return SessionMessageResult{}, fmt.Errorf("archived session cannot run a turn")
 	}
 	session.ConfigPath = s.ConfigPath()
-	if err := s.validateSessionMessageInput(session, input); err != nil {
+	if input.Continue && run != nil && run.persistentCreated {
+		// Durable admission already validated Continue against the interrupted
+		// state and committed the new run. CreateRun clears that marker and
+		// changes LastRunStatus to running, so re-running the full pre-admission
+		// predicate here would reject the admitted continuation before its first
+		// model request. The content prohibition remains invariant; the target
+		// identity is the durable row's PreviousRunID/target payload.
+		if strings.TrimSpace(input.Content) != "" || len(input.ContentBlocks) != 0 {
+			return SessionMessageResult{}, fmt.Errorf("continue cannot include new message content")
+		}
+	} else if err := s.validateSessionMessageInput(session, input); err != nil {
 		return SessionMessageResult{}, err
 	}
 	if run != nil && !run.persistentCreated {
