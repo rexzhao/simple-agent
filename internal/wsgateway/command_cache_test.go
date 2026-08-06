@@ -37,6 +37,31 @@ func readCommandResult(t *testing.T, connection *websocket.Conn) protocol.Comman
 	return result
 }
 
+func TestDispatcherRejectsUnsupportedExpectedRevisionBeforeExecution(t *testing.T) {
+	provider := newDispatcherFakeProvider(t)
+	var executions atomic.Int64
+	definition := commands.CommandDefinition{Name: "fake.no-revision", SchemaVersion: 1, Execute: func(context.Context, commands.CommandRequest) (json.RawMessage, error) {
+		executions.Add(1)
+		return json.RawMessage(`{"ok":true}`), nil
+	}}
+	endpoint, _ := newDispatcherForTest(t, provider, definition)
+	connection := dialTest(t, endpoint, issueTestTicket(t, endpoint))
+	defer connection.Close(websocket.StatusNormalClosure, "done")
+	writeHello(t, connection, "revision-client")
+	_ = readProtocol(t, connection)
+	revision := protocol.ResourceRevision("7")
+	message := commandMessage("revision-command", "revision-request", "fake.no-revision", `{}`)
+	message.Payload.ExpectedRevision = &revision
+	writeProtocol(t, connection, message)
+	result := readCommandResult(t, connection)
+	if result.Payload.Status != protocol.CommandStatusFailed || result.Payload.Error == nil || result.Payload.Error.Code != "unsupported_expected_revision" {
+		t.Fatalf("unsupported revision result=%#v", result)
+	}
+	if executions.Load() != 0 {
+		t.Fatalf("command executed despite unsupported revision: %d", executions.Load())
+	}
+}
+
 func TestDispatcherCommandCacheIsPrincipalScopedAcrossRunningAndCompleted(t *testing.T) {
 	provider := newDispatcherFakeProvider(t)
 	started := make(chan string, 2)

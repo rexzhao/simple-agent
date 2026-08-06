@@ -51,8 +51,14 @@ type CommandDefinition struct {
 	Name                string
 	SchemaVersion       int
 	CrossEpochRetrySafe bool
-	Validate            func(json.RawMessage) error
-	Execute             CommandHandler
+	// SupportsExpectedRevision is true only when Execute atomically checks the
+	// request revision as part of the mutation.  A dispatcher must reject an
+	// expected_revision for definitions which do not make that guarantee; it
+	// must never silently turn an optimistic-concurrency request into an
+	// unconditional write.
+	SupportsExpectedRevision bool
+	Validate                 func(json.RawMessage) error
+	Execute                  CommandHandler
 }
 
 // Registry is immutable after construction. This prevents a running server
@@ -76,6 +82,36 @@ type RegistryError struct {
 	Code    string
 	Message string
 	Err     error
+}
+
+// DomainError is a stable, transport-neutral application error.  The error
+// text from an underlying service is deliberately not sent to the client;
+// only Code and Message are exposed by the gateway.
+type DomainError struct {
+	Code    string
+	Message string
+	Err     error
+}
+
+func (e *DomainError) Error() string {
+	if e == nil {
+		return ""
+	}
+	if e.Message != "" {
+		return e.Message
+	}
+	return e.Code
+}
+
+func (e *DomainError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Err
+}
+
+func NewDomainError(code, message string, err error) error {
+	return &DomainError{Code: code, Message: message, Err: err}
 }
 
 func (e *RegistryError) Error() string {

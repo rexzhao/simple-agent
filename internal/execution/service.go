@@ -368,6 +368,7 @@ type SessionCompactionPlan struct {
 
 var (
 	ErrSessionBusy           = errors.New("session is currently running a turn")
+	ErrSessionArchived       = errors.New("session is archived")
 	ErrTurnRunnerUnavailable = errors.New("turn runner is not configured")
 	ErrTurnFailed            = errors.New("turn failed")
 	ErrSessionRunSettled     = errors.New("session run is no longer accepting prompts")
@@ -933,14 +934,22 @@ func (s *Service) RenameSession(id, displayName string) (SessionDetail, error) {
 	if displayName == "" {
 		return SessionDetail{}, fmt.Errorf("session display name must be a non-empty string")
 	}
+	writeLock, err := s.acquireSessionMutationLock(id)
+	if err != nil {
+		return SessionDetail{}, err
+	}
+	defer func() { _ = writeLock.Release() }()
 	session, err := s.sessionStore.LoadState(id)
 	if err != nil {
 		return SessionDetail{}, err
 	}
+	if session.DisplayName == displayName {
+		return sessionDetailFromStore(session), nil
+	}
 	if effective, err := s.sessionEffectivelyArchived(session); err != nil {
 		return SessionDetail{}, err
 	} else if effective {
-		return SessionDetail{}, fmt.Errorf("archived session cannot be renamed")
+		return SessionDetail{}, fmt.Errorf("archived session cannot be renamed: %w", ErrSessionArchived)
 	}
 	session.DisplayName = displayName
 	saved, err := s.sessionStore.SaveMetadata(session)
@@ -1003,14 +1012,22 @@ func (s *Service) SetSessionFullAccess(id string, fullAccess bool) (SessionDetai
 	if s == nil || s.sessionStore == nil {
 		return SessionDetail{}, fmt.Errorf("execution session store is not configured")
 	}
+	writeLock, err := s.acquireSessionMutationLock(id)
+	if err != nil {
+		return SessionDetail{}, err
+	}
+	defer func() { _ = writeLock.Release() }()
 	session, err := s.sessionStore.LoadState(id)
 	if err != nil {
 		return SessionDetail{}, err
 	}
+	if session.FullAccess == fullAccess {
+		return sessionDetailFromStore(session), nil
+	}
 	if effective, err := s.sessionEffectivelyArchived(session); err != nil {
 		return SessionDetail{}, err
 	} else if effective {
-		return SessionDetail{}, fmt.Errorf("archived session cannot change full access mode")
+		return SessionDetail{}, fmt.Errorf("archived session cannot change full access mode: %w", ErrSessionArchived)
 	}
 	session.FullAccess = fullAccess
 	saved, err := s.sessionStore.SaveMetadata(session)
@@ -1028,14 +1045,22 @@ func (s *Service) SetSessionDebug(id string, debug sessions.DebugSettings) (Sess
 	if s == nil || s.sessionStore == nil {
 		return SessionDetail{}, fmt.Errorf("execution session store is not configured")
 	}
+	writeLock, err := s.acquireSessionMutationLock(id)
+	if err != nil {
+		return SessionDetail{}, err
+	}
+	defer func() { _ = writeLock.Release() }()
 	session, err := s.sessionStore.LoadState(id)
 	if err != nil {
 		return SessionDetail{}, err
 	}
+	if session.DebugConfigured && session.Debug == debug {
+		return sessionDetailFromStore(session), nil
+	}
 	if effective, err := s.sessionEffectivelyArchived(session); err != nil {
 		return SessionDetail{}, err
 	} else if effective {
-		return SessionDetail{}, fmt.Errorf("archived session cannot change debug settings")
+		return SessionDetail{}, fmt.Errorf("archived session cannot change debug settings: %w", ErrSessionArchived)
 	}
 	session.Debug = debug
 	session.DebugConfigured = true

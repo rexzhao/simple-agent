@@ -104,6 +104,10 @@ func NewServer(options ServerOptions) (*Server, error) {
 	var sessionContentProvider *sessioncontent.Provider
 	var sinkRegistration *execution.SessionIndexSinkRegistration
 	var contentRegistration *sessions.MutationSinkRegistration
+	// The run registry is created before the command registry so run.cancel can
+	// use the same active-run owner as the REST adapter. It remains process
+	// local, therefore that command is deliberately not cross-epoch safe.
+	runs := newRunRegistry(ctx, options.Service, options.LogWriter)
 	cleanupAssembly := func() {
 		if contentRegistration != nil {
 			contentRegistration.Unregister()
@@ -119,6 +123,9 @@ func NewServer(options ServerOptions) (*Server, error) {
 		}
 		if sessionContentProvider != nil {
 			sessionContentProvider.Close()
+		}
+		if runs != nil {
+			runs.Close()
 		}
 		if blobStoreOwned && blobStore != nil {
 			blobStore.Close()
@@ -194,7 +201,7 @@ func NewServer(options ServerOptions) (*Server, error) {
 				cleanupAssembly()
 				return nil, err
 			}
-			commandRegistry, err := newSessionCommandRegistry(options.Service)
+			commandRegistry, err := newSessionCommandRegistry(options.Service, runs)
 			if err != nil {
 				cleanupAssembly()
 				return nil, err
@@ -233,7 +240,7 @@ func NewServer(options ServerOptions) (*Server, error) {
 		sinkRegistration:    sinkRegistration,
 		contentRegistration: contentRegistration,
 	}
-	server.runs = newRunRegistry(ctx, options.Service, options.LogWriter)
+	server.runs = runs
 	if sessionContentProvider != nil && server.runs != nil && server.runs.coordinator != nil {
 		server.contentRunObserver = server.runs.coordinator.RegisterRunEventObserver(sessionContentProvider)
 	}

@@ -296,7 +296,7 @@ func TestServiceSessionFullAccessLifecycle(t *testing.T) {
 	if _, err := service.ArchiveSession(session.ID); err != nil {
 		t.Fatalf("ArchiveSession() error = %v", err)
 	}
-	if _, err := service.SetSessionFullAccess(session.ID, false); err == nil || !strings.Contains(err.Error(), "archived session") {
+	if _, err := service.SetSessionFullAccess(session.ID, false); err == nil || !errors.Is(err, ErrSessionArchived) || !strings.Contains(err.Error(), "archived session") {
 		t.Fatalf("SetSessionFullAccess(archived) error = %v, want archived rejection", err)
 	}
 }
@@ -365,7 +365,7 @@ func TestServiceSessionDebugLifecycle(t *testing.T) {
 	if _, err := service.ArchiveSession(parent.ID); err != nil {
 		t.Fatalf("ArchiveSession() error = %v", err)
 	}
-	if _, err := service.SetSessionDebug(parent.ID, sessions.DebugSettings{}); err == nil || !strings.Contains(err.Error(), "archived session") {
+	if _, err := service.SetSessionDebug(parent.ID, sessions.DebugSettings{}); err == nil || !errors.Is(err, ErrSessionArchived) || !strings.Contains(err.Error(), "archived session") {
 		t.Fatalf("SetSessionDebug(archived) error = %v, want archived rejection", err)
 	}
 }
@@ -437,7 +437,7 @@ func TestServiceSessionLifecycle(t *testing.T) {
 	if !archived.Archived {
 		t.Fatalf("ArchiveSession() archived = false: %#v", archived)
 	}
-	if _, err := service.RenameSession(session.ID, "Nope"); err == nil || !strings.Contains(err.Error(), "archived session cannot be renamed") {
+	if _, err := service.RenameSession(session.ID, "Nope"); err == nil || !errors.Is(err, ErrSessionArchived) || !strings.Contains(err.Error(), "archived session cannot be renamed") {
 		t.Fatalf("RenameSession(archived) error = %v, want archived rejection", err)
 	}
 	restored, err := service.RestoreSession(session.ID)

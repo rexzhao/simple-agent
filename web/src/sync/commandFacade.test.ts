@@ -68,14 +68,20 @@ describe('CommandFacade session.mark_read', () => {
     const facade = new CommandFacade({ transport, timeoutMS: 1000 })
     const pending = facade.markRead('session_1', 'run_1')
     expect(transport.sent).toHaveLength(1)
+    const initial = transport.sent[0]
+    if (initial.type !== 'command') throw new Error('wrong initial command')
     transport.connectionGeneration = 2
     transport.emitReady('epoch_1', 'epoch_1')
     expect(transport.sent).toHaveLength(2)
+    const sameEpochRetry = transport.sent[1]
+    if (sameEpochRetry.type !== 'command') throw new Error('wrong same-epoch retry')
+    expect(sameEpochRetry.payload.request_id).toBe(initial.payload.request_id)
     transport.connectionGeneration = 3
     transport.emitReady('epoch_2', 'epoch_1')
     expect(transport.sent).toHaveLength(3)
     const command = transport.sent[2]
     if (command.type !== 'command') throw new Error('wrong command')
+    expect(command.payload.request_id).toBe(initial.payload.request_id)
     transport.emit(commandMessage('command_result', command.payload.request_id, { status: 'succeeded', result: { session_id: 'session_1', run_id: 'run_1', marked_read: true } }), 3)
     await expect(pending).resolves.toMatchObject({ marked_read: true })
   })
@@ -179,5 +185,93 @@ describe('CommandFacade session.mark_read', () => {
     await expect(done).resolves.toMatchObject({ marked_read: true })
     await expect(completed.markRead('session_4', 'run_4')).rejects.toMatchObject({ code: 'id_generation', details: { collision: true } })
     completed.stop()
+  })
+
+  it('submits every E1 typed command with exact arguments and validates exact results', async () => {
+    const transport = new FakeCommandTransport()
+    const facade = new CommandFacade({ transport })
+    const pending = [
+      [facade.rename('session_1', 'Renamed'), 'session.rename', { session_id: 'session_1', display_name: 'Renamed' }, { session_id: 'session_1', display_name: 'Renamed' }],
+      [facade.archive('session_1'), 'session.archive', { session_id: 'session_1' }, { session_id: 'session_1', archived: true }],
+      [facade.restore('session_1'), 'session.restore', { session_id: 'session_1' }, { session_id: 'session_1', archived: false }],
+      [facade.setFullAccess('session_1', false), 'session.set_full_access', { session_id: 'session_1', full_access: false }, { session_id: 'session_1', full_access: false }],
+      [facade.setDebug('session_1', true), 'session.set_debug', { session_id: 'session_1', request_bodies: true }, { session_id: 'session_1', request_bodies: true }],
+    ] as const
+    expect(transport.sent).toHaveLength(pending.length)
+    for (let index = 0; index < pending.length; index += 1) {
+      const command = transport.sent[index]
+      if (command.type !== 'command') throw new Error('wrong command')
+      expect(command.payload.name).toBe(pending[index][1])
+      expect(command.payload.arguments).toEqual(pending[index][2])
+      transport.emit(commandMessage('command_result', command.payload.request_id, { status: 'succeeded', result: pending[index][3] }))
+    }
+    await expect(pending[0][0]).resolves.toEqual({ session_id: 'session_1', display_name: 'Renamed' })
+    await expect(pending[1][0]).resolves.toEqual({ session_id: 'session_1', archived: true })
+    await expect(pending[2][0]).resolves.toEqual({ session_id: 'session_1', archived: false })
+    await expect(pending[3][0]).resolves.toEqual({ session_id: 'session_1', full_access: false })
+    await expect(pending[4][0]).resolves.toEqual({ session_id: 'session_1', request_bodies: true })
+    facade.stop()
+  })
+
+  it('rejects typed business errors without exposing or translating a result payload', async () => {
+    const transport = new FakeCommandTransport()
+    const facade = new CommandFacade({ transport })
+    const pending = facade.rename('session_1', 'Renamed')
+    const command = transport.sent[0]
+    if (command.type !== 'command') throw new Error('wrong command')
+    transport.emit(commandMessage('command_result', command.payload.request_id, {
+      status: 'failed', error: { code: 'session_busy', message: 'session is busy' },
+    }))
+    await expect(pending).rejects.toMatchObject({ code: 'session_busy', message: 'session is busy' })
+    facade.stop()
+  })
+
+  it('accepts every SessionRunStatus emitted by the Go run coordinator', async () => {
+    const transport = new FakeCommandTransport()
+    const facade = new CommandFacade({ transport })
+    const statuses = ['running', 'committed', 'failed', 'cancelled'] as const
+    const pending = statuses.map((status, index) => {
+      const promise = facade.cancelRun(`run_${index}`)
+      const command = transport.sent[index]
+      if (command.type !== 'command') throw new Error('wrong command')
+      transport.emit(commandMessage('command_result', command.payload.request_id, {
+        status: 'succeeded', result: { run_id: `run_${index}`, status },
+      }))
+      return promise
+    })
+    for (let index = 0; index < statuses.length; index += 1) {
+      await expect(pending[index]).resolves.toEqual({ run_id: `run_${index}`, status: statuses[index] })
+    }
+    facade.stop()
+  })
+
+  it('rejects unknown result fields and reports unsafe commands as outcome_unknown after an epoch change', async () => {
+    const transport = new FakeCommandTransport()
+    const facade = new CommandFacade({ transport, timeoutMS: 1000 })
+    const invalid = facade.setDebug('session_1', true)
+    const invalidCommand = transport.sent[0]
+    if (invalidCommand.type !== 'command') throw new Error('wrong command')
+    transport.emit(commandMessage('command_result', invalidCommand.payload.request_id, {
+      status: 'succeeded', result: { session_id: 'session_1', request_bodies: true, unexpected: false },
+    }))
+    await expect(invalid).rejects.toMatchObject({ code: 'invalid' })
+
+    const mismatched = facade.rename('session_1', 'Requested name')
+    const mismatchedCommand = transport.sent[1]
+    if (mismatchedCommand.type !== 'command') throw new Error('wrong command')
+    transport.emit(commandMessage('command_result', mismatchedCommand.payload.request_id, {
+      status: 'succeeded', result: { session_id: 'session_1', display_name: 'Different name' },
+    }))
+    await expect(mismatched).rejects.toMatchObject({ code: 'invalid' })
+
+    const unsafe = facade.cancelRun('run_1')
+    const unsafeCommand = transport.sent[2]
+    if (unsafeCommand.type !== 'command') throw new Error('wrong command')
+    expect(transport.sent).toHaveLength(3)
+    transport.connectionGeneration = 2
+    transport.emitReady('epoch_2', 'epoch_1')
+    expect(transport.sent).toHaveLength(3)
+    await expect(unsafe).rejects.toMatchObject({ code: 'outcome_unknown' })
+    facade.stop()
   })
 })

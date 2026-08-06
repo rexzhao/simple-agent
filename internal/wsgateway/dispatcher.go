@@ -897,6 +897,10 @@ func (d *Dispatcher) handleCommand(state *connectionState, message protocol.Comm
 		d.sendCommandFailure(state, request.RequestID, registryErrorCode(err), registryErrorMessage(err))
 		return nil
 	}
+	if request.ExpectedRevision != nil && !definition.SupportsExpectedRevision {
+		d.sendCommandFailure(state, request.RequestID, "unsupported_expected_revision", "this command does not support expected_revision")
+		return nil
+	}
 	if err := d.commands.Validate(definition, message.Payload.Arguments); err != nil {
 		d.sendCommandFailure(state, request.RequestID, registryErrorCode(err), registryErrorMessage(err))
 		return nil
@@ -1020,6 +1024,10 @@ func commandErrorFrom(err error) *protocol.CommandError {
 	var typed *commands.RegistryError
 	if errors.As(err, &typed) && typed != nil {
 		return &protocol.CommandError{Code: typed.Code, Message: typed.Message}
+	}
+	var domain *commands.DomainError
+	if errors.As(err, &domain) && domain != nil {
+		return &protocol.CommandError{Code: domain.Code, Message: domain.Message}
 	}
 	return &protocol.CommandError{Code: "command_failed", Message: "command execution failed"}
 }
