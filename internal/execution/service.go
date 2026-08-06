@@ -46,13 +46,18 @@ type Service struct {
 	providerSettingsLegacyID      uint64
 	providerSettingsNextID        uint64
 	providerSettingsMu            sync.RWMutex
-	sessionIndexRegistrations     map[uint64]sessionindex.ChangeSink
-	sessionIndexLegacyID          uint64
-	sessionIndexNextID            uint64
-	sessionIndexMu                sync.RWMutex
-	turnRunner                    SessionTurnRunner
-	compactPlanner                SessionCompactPlanner
-	sessionWriteLockTimeout       time.Duration
+	// providerConfigMu serializes target-state provider/default writes. The
+	// equality check and the subsequent durable write must be one service
+	// boundary so concurrent retries cannot both publish a change for the same
+	// target.
+	providerConfigMu          sync.Mutex
+	sessionIndexRegistrations map[uint64]sessionindex.ChangeSink
+	sessionIndexLegacyID      uint64
+	sessionIndexNextID        uint64
+	sessionIndexMu            sync.RWMutex
+	turnRunner                SessionTurnRunner
+	compactPlanner            SessionCompactPlanner
+	sessionWriteLockTimeout   time.Duration
 
 	// promptAppendStatusWriter is nil in production. Tests use it to inject
 	// the completion-write failure after AppendActive has succeeded.

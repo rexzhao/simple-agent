@@ -20,8 +20,12 @@ import { isCanonicalWireIdentifier, isWellFormedString } from '../protocol/ident
 import type { ItemsPage } from '../types'
 import type { RunCancelResult, RunCommands, RunContinueOptions, RunContinueResult, RunControlOptions, RunPromptAppendOptions, RunPromptAppendResult, RunPromptMoveResult, RunPromptRemoveResult, RunPromptSteerResult, RunStartOptions, RunStartResult, RunStatus, RunToolCancelResult } from '../commands/runCommands'
 import type { ProjectArchiveResult, ProjectCommands, ProjectCreateOptions, ProjectCreateResult, ProjectDeleteResult, ProjectRenameResult } from '../commands/projectCommands'
+import type { ProviderCommands, ProviderDefaultResult, ProviderDiscoverModelsResult, ProviderMutationResult, ProviderUpdateTarget } from '../commands/providerCommands'
+import { encodeProviderTarget, decodeProviderDiscoverResult, validateProviderCommandJSON } from './providerCommandCodec'
+import { isProviderName } from '../domain/providerIdentity'
 import { SyncReadError } from './errors'
 import type { RuntimeTransport } from './runtime'
+import type { BlobClient } from './blobClient'
 
 // Keep the original result type import path available while the typed command
 // contracts live under the page-independent commands boundary.
@@ -45,7 +49,7 @@ interface PendingCommand<T> {
   requestID: string
   message: CommandMessage
   crossEpochRetrySafe: boolean
-  decodeResult: (value: unknown) => T
+  decodeResult: (value: unknown, signal?: AbortSignal) => T | PromiseLike<T>
   resolve: (value: T) => void
   reject: (reason: CommandFacadeError) => void
   timer: ReturnType<typeof globalThis.setTimeout>
@@ -53,10 +57,13 @@ interface PendingCommand<T> {
   abortListener?: () => void
   sentGeneration?: number
   sentEpoch?: string
+  decodeGeneration?: number
+  decodeAbort?: AbortController
 }
 
 export interface CommandFacadeOptions {
   transport: RuntimeTransport
+  blobClient?: BlobClient
   timeoutMS?: number
   maxPendingCommands?: number
   maxRecentRequestIDs?: number
@@ -186,6 +193,21 @@ function decodeProjectDeleteResult(value: unknown, projectID: string): ProjectDe
   const removedSessions = resultSafeInteger(object, 'removed_sessions', 0, Number.MAX_SAFE_INTEGER)
   if (resultProjectID !== projectID || object.status !== 'removed') throw new Error('result identity does not match request')
   return { project_id: resultProjectID, status: 'removed', removed_sessions: removedSessions }
+}
+
+function decodeProviderMutationResult(value: unknown, provider: string): ProviderMutationResult {
+  const object = exactObject(value, ['provider', 'status'])
+  const resultProvider = resultString(object, 'provider')
+  if (resultProvider !== provider || object.status !== 'applied') throw new Error('provider result identity does not match request')
+  return { provider: resultProvider, status: 'applied' }
+}
+
+function decodeProviderDefaultResult(value: unknown, provider: string, model: string): ProviderDefaultResult {
+  const object = exactObject(value, ['provider', 'model', 'status'])
+  const resultProvider = resultString(object, 'provider')
+  const resultModel = resultString(object, 'model')
+  if (resultProvider !== provider || resultModel !== model || object.status !== 'applied') throw new Error('provider result identity does not match request')
+  return { provider: resultProvider, model: resultModel, status: 'applied' }
 }
 
 function decodeCompactResult(value: unknown, sessionID: string): SessionCompactResult {
@@ -416,8 +438,9 @@ function decodeRunToolCancelResult(value: unknown, sessionID: string, runID: str
  * result; it never mutates a replica. Durable authority still arrives through
  * the resource snapshot/change stream.
  */
-export class CommandFacade implements SessionCommands, RunCommands, ProjectCommands {
+export class CommandFacade implements SessionCommands, RunCommands, ProjectCommands, ProviderCommands {
   private readonly transport: RuntimeTransport
+  private readonly blobClient?: BlobClient
   private readonly timeoutMS: number
   private readonly maxPendingCommands: number
   private readonly maxRecentRequestIDs: number
@@ -442,6 +465,7 @@ export class CommandFacade implements SessionCommands, RunCommands, ProjectComma
 
   constructor(options: CommandFacadeOptions) {
     this.transport = options.transport
+    this.blobClient = options.blobClient
     this.timeoutMS = options.timeoutMS ?? 10_000
     this.maxPendingCommands = options.maxPendingCommands ?? 128
     this.maxRecentRequestIDs = options.maxRecentRequestIDs ?? 256
@@ -453,6 +477,28 @@ export class CommandFacade implements SessionCommands, RunCommands, ProjectComma
     this.setTimer = options.setTimeout ?? ((handler, timeout) => globalThis.setTimeout(handler, timeout))
     this.clearTimer = options.clearTimeout ?? ((handle) => globalThis.clearTimeout(handle))
     if (this.timeoutMS <= 0 || this.maxPendingCommands <= 0 || this.maxRecentRequestIDs <= 0 || this.maxRecentEntityIDs <= 0) throw new Error('command bounds must be positive')
+  }
+
+  update(provider: string, target: ProviderUpdateTarget, options: CommandOptions = {}): Promise<ProviderMutationResult> {
+    if (!isProviderName(provider)) return Promise.reject(new CommandFacadeError('invalid', 'provider is invalid'))
+    let args: JsonObject
+    try {
+      args = { provider, ...encodeProviderTarget(target) }
+      validateProviderCommandJSON(args)
+    } catch {
+      return Promise.reject(new CommandFacadeError('invalid', 'provider target is invalid'))
+    }
+    return this.submit('provider.update', args, true, (value) => decodeProviderMutationResult(value, provider), options)
+  }
+
+  setDefault(provider: string, model: string, options: CommandOptions = {}): Promise<ProviderDefaultResult> {
+    if (!isProviderName(provider) || typeof model !== 'string' || model.length === 0 || !isWellFormedString(model) || model !== model.trim() || this.utf8Bytes(model) > 4096) return Promise.reject(new CommandFacadeError('invalid', 'provider default is invalid'))
+    return this.submit('provider.set_default', { provider, model }, true, (value) => decodeProviderDefaultResult(value, provider, model), options)
+  }
+
+  discoverModels(provider: string, options: CommandOptions = {}): Promise<ProviderDiscoverModelsResult> {
+    if (!isProviderName(provider)) return Promise.reject(new CommandFacadeError('invalid', 'provider is invalid'))
+    return this.submit('provider.discover_models', { provider }, true, (value, signal) => decodeProviderDiscoverResult(value, provider, this.blobClient, signal), options)
   }
 
   private ensureStarted(): void {
@@ -830,7 +876,7 @@ export class CommandFacade implements SessionCommands, RunCommands, ProjectComma
     return typeof TextEncoder === 'function' ? new TextEncoder().encode(value).byteLength : value.length
   }
 
-  private submit<T>(name: string, args: JsonObject, crossEpochRetrySafe: boolean, decodeResult: (value: unknown) => T, options: CommandOptions): Promise<T> {
+  private submit<T>(name: string, args: JsonObject, crossEpochRetrySafe: boolean, decodeResult: (value: unknown, signal?: AbortSignal) => T | PromiseLike<T>, options: CommandOptions): Promise<T> {
     if (this.pending.size >= this.maxPendingCommands) return Promise.reject(new CommandFacadeError('capacity', 'too many pending commands'))
     let id: string
     try {
@@ -924,6 +970,7 @@ export class CommandFacade implements SessionCommands, RunCommands, ProjectComma
 
   private sendPending<T>(pending: PendingCommand<T>, generation = this.transport.connectionGeneration, epoch = this.transport.serverEpoch ?? ''): void {
     if (!this.transport.isReady || !this.pending.has(pending.requestID)) return
+    if (pending.sentGeneration !== undefined && pending.sentGeneration !== generation) this.cancelDecode(pending)
     pending.sentGeneration = generation
     pending.sentEpoch = epoch
     try {
@@ -952,21 +999,42 @@ export class CommandFacade implements SessionCommands, RunCommands, ProjectComma
 
   private handleResult(message: CommandResultMessage, generation: number): void {
     const pending = this.pending.get(message.payload.request_id)
-    if (!pending || pending.sentGeneration !== generation) return
+    if (!pending || pending.sentGeneration !== generation || pending.decodeGeneration === generation) return
     if (message.payload.status === 'failed') {
       const error = message.payload.error
       this.rejectPending(pending, errorFromCommand(error?.code ?? 'command_failed', error?.message ?? 'command failed', error?.details))
       return
     }
+    pending.decodeGeneration = generation
+    const controller = typeof AbortController === 'function' ? new AbortController() : undefined
+    pending.decodeAbort = controller
     try {
-      this.resolvePending(pending, pending.decodeResult(message.payload.result))
+      const decoded = pending.decodeResult(message.payload.result, controller?.signal)
+      if (decoded && typeof (decoded as PromiseLike<unknown>).then === 'function') {
+        Promise.resolve(decoded)
+          .then((value) => {
+            if (this.pending.get(pending.requestID) === pending && pending.sentGeneration === generation && pending.decodeGeneration === generation) this.resolvePending(pending, value)
+          })
+          .catch(() => {
+            if (this.pending.get(pending.requestID) === pending && pending.sentGeneration === generation && pending.decodeGeneration === generation) this.rejectPending(pending, new CommandFacadeError('invalid', 'command result was invalid'))
+          })
+      } else if (this.pending.get(pending.requestID) === pending && pending.sentGeneration === generation && pending.decodeGeneration === generation) {
+        this.resolvePending(pending, decoded)
+      }
     } catch {
-      this.rejectPending(pending, new CommandFacadeError('invalid', 'command result was invalid'))
+      if (this.pending.get(pending.requestID) === pending && pending.sentGeneration === generation && pending.decodeGeneration === generation) this.rejectPending(pending, new CommandFacadeError('invalid', 'command result was invalid'))
     }
+  }
+
+  private cancelDecode<T>(pending: PendingCommand<T>): void {
+    pending.decodeAbort?.abort()
+    pending.decodeAbort = undefined
+    pending.decodeGeneration = undefined
   }
 
   private resolvePending(pending: PendingCommand<unknown>, value: unknown): void {
     if (!this.pending.delete(pending.requestID)) return
+    this.cancelDecode(pending)
     this.clearTimer(pending.timer)
     if (pending.signal && pending.abortListener) pending.signal.removeEventListener('abort', pending.abortListener)
     pending.resolve(value)
@@ -974,6 +1042,7 @@ export class CommandFacade implements SessionCommands, RunCommands, ProjectComma
 
   private rejectPending<T>(pending: PendingCommand<T>, error: CommandFacadeError): void {
     if (!this.pending.delete(pending.requestID)) return
+    this.cancelDecode(pending as PendingCommand<unknown>)
     this.clearTimer(pending.timer)
     if (pending.signal && pending.abortListener) pending.signal.removeEventListener('abort', pending.abortListener)
     pending.reject(error)

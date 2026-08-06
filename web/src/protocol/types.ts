@@ -1,6 +1,5 @@
-export type JsonPrimitive = string | number | boolean | null
-export type JsonValue = JsonPrimitive | JsonObject | JsonValue[]
-export type JsonObject = { [key: string]: JsonValue }
+import type { JsonObject, JsonValue } from '../domain/json'
+export type { JsonObject, JsonPrimitive, JsonValue } from '../domain/json'
 
 export type MessageType =
   | 'hello'

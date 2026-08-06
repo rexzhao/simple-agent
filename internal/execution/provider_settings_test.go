@@ -132,11 +132,28 @@ func TestServiceProviderSettingsPublishesTypedPostCommitChanges(t *testing.T) {
 	if len(sink.changes) != 1 || sink.changes[0].Kind != providersettings.CommittedProviderUpsert || sink.changes[0].ProviderName != "remote" {
 		t.Fatalf("create publication = %#v", sink.changes)
 	}
+	// Repeating the exact target is a durable no-op. It must not rewrite the
+	// credential-bearing file or publish a second provider resource change.
+	if _, err := service.UpdateProviderSettings("remote", ProviderSettingsInput{
+		Name: "remote", BaseURL: "https://provider.example.test/v1", APIKey: "", KeepAPIKey: true,
+		Models: []ProviderModelSettings{{Profile: "main", ID: "model"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(sink.changes) != 1 {
+		t.Fatalf("identical provider update publication = %#v, want no additional change", sink.changes)
+	}
 	if _, err := service.UpdateDefaultProviderModel("remote", "main"); err != nil {
 		t.Fatal(err)
 	}
 	if len(sink.changes) != 2 || sink.changes[1].Kind != providersettings.CommittedDefaultChanged || sink.changes[1].DefaultProvider != "remote" || sink.changes[1].DefaultModel != "main" {
 		t.Fatalf("default publication = %#v", sink.changes)
+	}
+	if _, err := service.UpdateDefaultProviderModel("remote", "main"); err != nil {
+		t.Fatal(err)
+	}
+	if len(sink.changes) != 2 {
+		t.Fatalf("identical default update publication = %#v, want no additional change", sink.changes)
 	}
 }
 

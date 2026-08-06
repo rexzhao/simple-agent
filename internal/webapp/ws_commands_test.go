@@ -2,14 +2,21 @@ package webapp
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"reflect"
 	"strings"
 	"testing"
 
 	"github.com/rexzhao/simple-agent/internal/commands"
+	"github.com/rexzhao/simple-agent/internal/config"
 	"github.com/rexzhao/simple-agent/internal/execution"
+	"github.com/rexzhao/simple-agent/internal/protocol"
 )
 
 func TestSessionCommandSchemasAreStrict(t *testing.T) {
@@ -127,6 +134,210 @@ func TestSessionCommandSchemasAreStrict(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func providerUpdateTestArguments() json.RawMessage {
+	return json.RawMessage(`{"provider":"空 白 provider","base_url":"https://example.test/v1","api_key":"command-secret","keep_api_key":false,"auth_file":"","request_timeout":"30s","http_proxy":"","https_proxy":"","max_concurrent_requests":3,"models":[{"profile":"主 模型","id":"model-主","type":"","compatibility":"","input":["text"],"developer_role":"","context_window":1000,"input_limit":900,"output_limit":100,"parameters":{"temperature":0.2,"enabled":true,"nested":{"values":[null,2]}},"reasoning_config":{"parameter":"reasoning_effort","default":"medium","levels":{"low":"low","medium":2,"off":false,"none":null}},"pricing":{"input_cache_hit":0.1,"input_cache_miss":0.2,"cache_write":0.3,"output":0.4,"currency":"USD","long_context_threshold":10000,"long_context":null}}]}`)
+}
+
+func TestProviderCommandSchemasAreStrictAndBounded(t *testing.T) {
+	valid := providerUpdateTestArguments()
+	if err := validateProviderUpdateArguments(valid); err != nil {
+		t.Fatalf("valid provider.update arguments rejected: %v", err)
+	}
+	decoded, err := decodeProviderUpdateArguments(valid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decoded.Provider != "空 白 provider" || len(decoded.Input.Models) != 1 || decoded.Input.Models[0].ID != "model-主" {
+		t.Fatalf("provider update identity/model was not preserved: %#v", decoded.Input.Models[0])
+	}
+	model := decoded.Input.Models[0]
+	if got, ok := model.Parameters["temperature"].(float64); !ok || got != 0.2 {
+		t.Fatalf("parameter scalar = %#v, want float64 0.2", model.Parameters["temperature"])
+	}
+	if got, ok := model.ReasoningConfig.Levels["medium"].(int64); !ok || got != 2 {
+		t.Fatalf("reasoning scalar = %#v, want int64 2", model.ReasoningConfig.Levels["medium"])
+	}
+	if model.ReasoningConfig.Levels["off"] != false || model.ReasoningConfig.Levels["none"] != nil {
+		t.Fatalf("reasoning scalar union was not preserved: %#v", model.ReasoningConfig.Levels)
+	}
+	validSurrogate := json.RawMessage(`{"provider":"p","base_url":"https://example.test","models":[{"profile":"m","parameters":{"\ud83d\ude00":"\ud83d\ude00","nested":[1,0.25,1e-3]}}]}`)
+	surrogateDecoded, err := decodeProviderUpdateArguments(validSurrogate)
+	if err != nil || surrogateDecoded.Input.Models[0].Parameters["😀"] != "😀" {
+		t.Fatalf("valid surrogate pair was rejected or changed: %#v / %v", surrogateDecoded, err)
+	}
+	validNumbers := json.RawMessage(`{"provider":"p","base_url":"https://example.test","models":[{"profile":"m","parameters":{"max":9007199254740991,"min":-9007199254740991,"fraction":0.125,"exponent":1e-3,"replacement":"\ufffd"},"reasoning_config":{"parameter":"","default":"","levels":{"max":9007199254740991,"fraction":0.5}}}]}`)
+	numberDecoded, err := decodeProviderUpdateArguments(validNumbers)
+	if err != nil {
+		t.Fatalf("valid provider number boundaries rejected: %v", err)
+	}
+	parameters := numberDecoded.Input.Models[0].Parameters
+	if got, ok := parameters["max"].(int64); !ok || got != 9007199254740991 {
+		t.Fatalf("maximum safe integer parameter = %#v, want int64 MAX_SAFE_INTEGER", parameters["max"])
+	}
+	if got, ok := parameters["min"].(int64); !ok || got != -9007199254740991 {
+		t.Fatalf("minimum safe integer parameter = %#v, want int64 -MAX_SAFE_INTEGER", parameters["min"])
+	}
+	if got, ok := parameters["exponent"].(float64); !ok || got != 1e-3 {
+		t.Fatalf("finite exponent parameter = %#v, want float64 1e-3", parameters["exponent"])
+	}
+	if got, ok := numberDecoded.Input.Models[0].ReasoningConfig.Levels["max"].(int64); !ok || got != 9007199254740991 {
+		t.Fatalf("nested reasoning integer = %#v, want int64 MAX_SAFE_INTEGER", numberDecoded.Input.Models[0].ReasoningConfig.Levels["max"])
+	}
+	for _, raw := range []json.RawMessage{
+		json.RawMessage(`{"provider":"空 白 provider","unknown":true}`),
+		json.RawMessage(`{"provider":"空 白 provider","provider":"other"}`),
+		json.RawMessage(append([]byte(string(valid)), []byte(` trailing`)...)),
+		json.RawMessage(`{"provider":"空 白 provider","base_url":"https://example.test","models":[{"profile":"m","parameters":{"x":1,"x":2}}]}`),
+		json.RawMessage(`{"provider":" 空 白 provider","base_url":"https://example.test","models":[{"profile":"m"}]}`),
+		json.RawMessage(`{"provider":"p","base_url":"https://example.test","models":[{"profile":"m","parameters":{"\ud800":1}}]}`),
+		json.RawMessage(`{"provider":"p","base_url":"https://example.test","models":[{"profile":"m","parameters":{"x":"\udc00"}}]}`),
+		json.RawMessage(`{"provider":"p","base_url":"https://example.test","models":[{"profile":"m","parameters":{"x":"\ud83d\u0041"}}]}`),
+		json.RawMessage(`{"provider":"p","base_url":"https://example.test","models":[{"profile":"m","parameters":{"x":9007199254740992}}]}`),
+		json.RawMessage(`{"provider":"p","base_url":"https://example.test","models":[{"profile":"m","parameters":{"x":-9007199254740992}}]}`),
+		json.RawMessage(`{"provider":"p","base_url":"https://example.test","models":[{"profile":"m","parameters":{"x":1e1000000}}]}`),
+		json.RawMessage(`{"provider":"p","base_url":"https://example.test","models":[{"profile":"m","parameters":{"x":1e-400}}]}`),
+		json.RawMessage(`{"provider":"p","base_url":"https://example.test","models":[{"profile":"m","parameters":{"x":-1e-400}}]}`),
+		json.RawMessage(`{"provider":"p","base_url":"https://example.test","models":[{"profile":"m","parameters":{"x":9007199254740990.5}}]}`),
+		json.RawMessage(`{"provider":"p","base_url":"https://example.test","models":[{"profile":"m","parameters":{"x":-9007199254740990.5}}]}`),
+		json.RawMessage(`{"provider":"p","base_url":"https://example.test","api_key":null,"models":[{"profile":"m"}]}`),
+		json.RawMessage(`{"provider":"p","base_url":"https://example.test","max_concurrent_requests":null,"models":[{"profile":"m"}]}`),
+		json.RawMessage(`{"provider":"p","base_url":"https://example.test","models":[{"profile":"m","context_window":null}]}`),
+		json.RawMessage(`{"provider":"p","base_url":"https://example.test","models":[{"profile":"m","parameters":null}]}`),
+		json.RawMessage(`{"provider":"p","base_url":"https://example.test","models":[{"profile":"m","reasoning_config":null}]}`),
+		json.RawMessage(`{"provider":"p","base_url":"https://example.test","models":[{"profile":"m","pricing":{"input_cache_hit":null}}]}`),
+		json.RawMessage{0xff, '{', '}'},
+	} {
+		if err := validateProviderUpdateArguments(raw); err == nil {
+			t.Fatalf("provider.update accepted invalid arguments: %q", raw)
+		}
+	}
+	deep := []byte(`{"provider":"p","base_url":"https://example.test","models":[{"profile":"m","parameters":`)
+	deep = append(deep, []byte(strings.Repeat(`{"x":`, maxCommandJSONDepth+2))...)
+	deep = append(deep, []byte(`null`+strings.Repeat(`}`, maxCommandJSONDepth+2)+`}]}`)...)
+	if err := validateProviderUpdateArguments(deep); err == nil {
+		t.Fatal("provider.update accepted over-depth parameters")
+	}
+	if err := validateProviderDefaultArguments(json.RawMessage(`{"provider":"空 白 provider","model":"主 模型"}`)); err != nil {
+		t.Fatalf("valid provider.set_default rejected: %v", err)
+	}
+	for _, raw := range []json.RawMessage{
+		json.RawMessage(`{"provider":"空 白 provider","model":"主 模型","extra":true}`),
+		json.RawMessage(`{"provider":"空 白 provider","model":"主 模型","model":"other"}`),
+		json.RawMessage(`{"provider":"空 白 provider","model":"主 模型"} trailing`),
+	} {
+		if err := validateProviderDefaultArguments(raw); err == nil {
+			t.Fatalf("provider.set_default accepted invalid arguments: %s", raw)
+		}
+	}
+	if err := validateProviderDiscoverArguments(json.RawMessage(`{"provider":"空 白 provider"}`)); err != nil {
+		t.Fatalf("valid provider.discover_models rejected: %v", err)
+	}
+	redacted := redactProviderUpdateArguments(valid)
+	if string(redacted) != `{}` {
+		t.Fatalf("provider update cache tombstone = %s, want {}", redacted)
+	}
+	for _, secret := range []string{"command-secret", "auth_file", "base_url", "parameters"} {
+		if strings.Contains(string(redacted), secret) {
+			t.Fatalf("redacted command cache contains %q: %s", secret, redacted)
+		}
+	}
+}
+
+type providerCommandTestBlobWriter struct {
+	content  []byte
+	override *protocol.BlobDescriptor
+}
+
+func (w *providerCommandTestBlobWriter) Put(_ context.Context, _ string, content []byte) (protocol.BlobDescriptor, error) {
+	w.content = append([]byte(nil), content...)
+	if w.override != nil {
+		return *w.override, nil
+	}
+	digest := sha256.Sum256(content)
+	return protocol.BlobDescriptor{ID: "provider-models", URL: "/api/blobs/provider-models", ContentType: "application/json", Size: uint64(len(content)), SHA256: hex.EncodeToString(digest[:]), ETag: `"provider-models"`, ExpiresAt: "2099-01-01T00:00:00Z"}, nil
+}
+
+func TestProviderDiscoverCommandUsesBlobBoundaryAndRejectsOverage(t *testing.T) {
+	modelCount := 4000
+	providerServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		items := make([]map[string]string, modelCount)
+		for index := range items {
+			items[index] = map[string]string{"id": fmt.Sprintf("model-%04d-%s", index, strings.Repeat("x", 24))}
+		}
+		payload, err := json.Marshal(map[string]any{"data": items})
+		if err != nil {
+			t.Fatal(err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(payload)
+	}))
+	defer providerServer.Close()
+	server, service, _ := newWebTestAppServerWithRunner(t, webTestRunner{})
+	defer server.Close()
+	if _, err := service.CreateProviderSettings(execution.ProviderSettingsInput{
+		Name: "discover", BaseURL: providerServer.URL + "/v1", APIKey: "discover-secret",
+		Models: []execution.ProviderModelSettings{{Profile: "main", ID: "configured", Type: config.ProviderTypeOpenAIChat}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	writer := &providerCommandTestBlobWriter{}
+	registry, err := newSessionCommandRegistry(service, nil, writer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	definition, err := registry.Definition("provider.discover_models", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := definition.Execute(context.Background(), commands.CommandRequest{Arguments: json.RawMessage(`{"provider":"discover"}`)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(result), "discover-secret") || writer.content == nil || len(writer.content) <= maxProviderDiscoverInline {
+		t.Fatalf("discover result/blob boundary invalid: result=%s blobBytes=%d", result, len(writer.content))
+	}
+	var blobResult providerDiscoverBlobResult
+	if err := json.Unmarshal(result, &blobResult); err != nil || blobResult.Blob == nil || blobResult.Blob.ContentType != "application/json" {
+		t.Fatalf("discover blob result=%s err=%v", result, err)
+	}
+	digest := sha256.Sum256(writer.content)
+	if blobResult.Blob.Size != uint64(len(writer.content)) || blobResult.Blob.SHA256 != hex.EncodeToString(digest[:]) {
+		t.Fatalf("discover descriptor integrity = %#v, bytes=%d", blobResult.Blob, len(writer.content))
+	}
+	var models []string
+	if err := json.Unmarshal(writer.content, &models); err != nil || len(models) != modelCount || models[0] >= models[len(models)-1] {
+		t.Fatalf("discover blob models len=%d err=%v", len(models), err)
+	}
+	modelCount = 4000
+	validDescriptor := *blobResult.Blob
+	faults := []struct {
+		name string
+		edit func(*protocol.BlobDescriptor)
+	}{
+		{name: "content type", edit: func(value *protocol.BlobDescriptor) { value.ContentType = "text/plain" }},
+		{name: "size", edit: func(value *protocol.BlobDescriptor) { value.Size++ }},
+		{name: "hash", edit: func(value *protocol.BlobDescriptor) { value.SHA256 = strings.Repeat("a", 64) }},
+		{name: "missing id", edit: func(value *protocol.BlobDescriptor) { value.ID = "" }},
+		{name: "missing URL", edit: func(value *protocol.BlobDescriptor) { value.URL = "" }},
+		{name: "invalid expiry", edit: func(value *protocol.BlobDescriptor) { value.ExpiresAt = "not-a-timestamp" }},
+	}
+	for _, fault := range faults {
+		t.Run(fault.name, func(t *testing.T) {
+			bad := validDescriptor
+			fault.edit(&bad)
+			writer.override = &bad
+			defer func() { writer.override = nil }()
+			if _, err := definition.Execute(context.Background(), commands.CommandRequest{Arguments: json.RawMessage(`{"provider":"discover"}`)}); err == nil || strings.Contains(err.Error(), "discover-secret") {
+				t.Fatalf("faulty descriptor accepted or leaked detail: %v", err)
+			}
+		})
+	}
+	modelCount = maxProviderDiscoverModels + 1
+	if _, err := definition.Execute(context.Background(), commands.CommandRequest{Arguments: json.RawMessage(`{"provider":"discover"}`)}); err == nil {
+		t.Fatal("discover command accepted a model count over its bound")
 	}
 }
 
@@ -467,7 +678,7 @@ func TestSessionCommandRegistryIsClosedAndFlagsAreExplicit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantNames := []string{"project.archive", "project.create", "project.delete", "project.rename", "project.restore", "run.cancel", "run.continue", "run.prompt.append", "run.prompt.move", "run.prompt.remove", "run.prompt.steer", "run.start", "run.tool.cancel", "session.archive", "session.compact", "session.create", "session.delete", "session.history.read", "session.mark_read", "session.rename", "session.restore", "session.set_debug", "session.set_full_access"}
+	wantNames := []string{"project.archive", "project.create", "project.delete", "project.rename", "project.restore", "provider.discover_models", "provider.set_default", "provider.update", "run.cancel", "run.continue", "run.prompt.append", "run.prompt.move", "run.prompt.remove", "run.prompt.steer", "run.start", "run.tool.cancel", "session.archive", "session.compact", "session.create", "session.delete", "session.history.read", "session.mark_read", "session.rename", "session.restore", "session.set_debug", "session.set_full_access"}
 	if got := registry.Names(); !reflect.DeepEqual(got, wantNames) {
 		t.Fatalf("registry names=%v, want %v", got, wantNames)
 	}
@@ -479,7 +690,7 @@ func TestSessionCommandRegistryIsClosedAndFlagsAreExplicit(t *testing.T) {
 		if definition.SupportsExpectedRevision {
 			t.Fatalf("%s unexpectedly supports expected_revision", name)
 		}
-		if name == "session.history.read" {
+		if name == "session.history.read" || name == "provider.discover_models" {
 			if definition.CachePolicy != commands.ResultCacheVolatile {
 				t.Fatalf("%s must retain a volatile-result policy", name)
 			}

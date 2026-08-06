@@ -891,6 +891,14 @@ func (d *Dispatcher) handleCommand(state *connectionState, message protocol.Comm
 			d.sendCommandFailure(state, request.RequestID, "idempotency_conflict", "request ID was used with different command content")
 			return nil
 		}
+		// A request-id tombstone does not turn a malformed exact retry into a
+		// valid replay. Validate against the original typed definition before
+		// joining or refreshing; the fingerprint alone intentionally
+		// canonicalizes JSON and cannot detect duplicate keys or invalid UTF-8.
+		if err := d.commands.Validate(existing.definition, request.Arguments); err != nil {
+			d.sendCommandFailure(state, request.RequestID, registryErrorCode(err), registryErrorMessage(err))
+			return nil
+		}
 		if existing.cachePolicy == commands.ResultCacheVolatile && existing.finished() {
 			return d.refreshVolatileCommand(state, existing, request)
 		}
@@ -939,7 +947,12 @@ func (d *Dispatcher) handleCommand(state *connectionState, message protocol.Comm
 		}
 		state.inflight[request.RequestID] = fingerprint
 		state.mu.Unlock()
-		shared = &sharedCommand{fingerprint: fingerprint, request: request.Clone(), definition: definition, cachePolicy: definition.CachePolicy, done: make(chan struct{}), startedAt: time.Now()}
+		cachedRequest := request.Clone()
+		if definition.RedactArguments != nil {
+			cachedRequest.Arguments = definition.RedactArguments(cachedRequest.Arguments)
+		}
+		toExecute := request.Clone()
+		shared = &sharedCommand{fingerprint: fingerprint, request: cachedRequest, executionRequest: &toExecute, definition: definition, cachePolicy: definition.CachePolicy, done: make(chan struct{}), startedAt: time.Now()}
 		d.requests[cacheKey] = shared
 		d.commandsMu.Unlock()
 		// Delivery failure does not cancel the owner-scoped execution; another
@@ -1003,13 +1016,19 @@ func (d *Dispatcher) refreshVolatileCommand(state *connectionState, existing *sh
 	}
 	state.inflight[request.RequestID] = current.fingerprint
 	state.mu.Unlock()
+	cachedRequest := request.Clone()
+	if current.definition.RedactArguments != nil {
+		cachedRequest.Arguments = current.definition.RedactArguments(cachedRequest.Arguments)
+	}
+	toExecute := request.Clone()
 	shared := &sharedCommand{
-		fingerprint: current.fingerprint,
-		request:     request.Clone(),
-		definition:  current.definition,
-		cachePolicy: current.cachePolicy,
-		done:        make(chan struct{}),
-		startedAt:   time.Now(),
+		fingerprint:      current.fingerprint,
+		request:          cachedRequest,
+		executionRequest: &toExecute,
+		definition:       current.definition,
+		cachePolicy:      current.cachePolicy,
+		done:             make(chan struct{}),
+		startedAt:        time.Now(),
 	}
 	d.requests[cacheKey] = shared
 	d.commandsMu.Unlock()
@@ -1068,8 +1087,18 @@ func (d *Dispatcher) executeCommand(shared *sharedCommand) {
 				commandErr = &protocol.CommandError{Code: "command_panic", Message: "command execution failed"}
 			}
 		}()
+		request := shared.takeExecutionRequest()
+		if request == nil {
+			commandErr = &protocol.CommandError{Code: "command_execution_missing", Message: "command execution failed"}
+			return
+		}
+		defer clearCommandRequestArguments(request)
+		executionRequest := request.Clone()
+		defer clearCommandRequestArguments(&executionRequest)
 		var err error
-		result, err = shared.definition.Execute(d.ownerContext, shared.request.Clone())
+		result, err = shared.definition.Execute(d.ownerContext, executionRequest)
+		// Do not retain the credential-bearing argument buffer after the
+		// synchronous handler returns, including panic/error paths.
 		if err != nil {
 			commandErr = commandErrorFrom(err)
 			return
@@ -1082,6 +1111,16 @@ func (d *Dispatcher) executeCommand(shared *sharedCommand) {
 	}()
 	shared.finish(result, commandErr)
 	d.observe(Event{Kind: EventCommandCompleted, CommandName: shared.request.Name, RequestID: shared.request.RequestID, Code: commandStatus(commandErr), Duration: time.Since(shared.startedAt), CommandCacheCurrent: d.CommandCacheCount()})
+}
+
+func clearCommandRequestArguments(request *commands.CommandRequest) {
+	if request == nil {
+		return
+	}
+	for index := range request.Arguments {
+		request.Arguments[index] = 0
+	}
+	request.Arguments = nil
 }
 
 func commandStatus(err *protocol.CommandError) string {
@@ -1396,16 +1435,17 @@ type pendingSubscription struct {
 }
 
 type sharedCommand struct {
-	fingerprint  string
-	request      commands.CommandRequest
-	definition   commands.CommandDefinition
-	cachePolicy  commands.ResultCachePolicy
-	done         chan struct{}
-	mu           sync.Mutex
-	finishedFlag bool
-	result       json.RawMessage
-	err          *protocol.CommandError
-	startedAt    time.Time
+	fingerprint      string
+	request          commands.CommandRequest
+	executionRequest *commands.CommandRequest
+	definition       commands.CommandDefinition
+	cachePolicy      commands.ResultCachePolicy
+	done             chan struct{}
+	mu               sync.Mutex
+	finishedFlag     bool
+	result           json.RawMessage
+	err              *protocol.CommandError
+	startedAt        time.Time
 }
 
 func (s *sharedCommand) finish(result json.RawMessage, err *protocol.CommandError) {
@@ -1415,6 +1455,10 @@ func (s *sharedCommand) finish(result json.RawMessage, err *protocol.CommandErro
 		return
 	}
 	s.finishedFlag = true
+	if s.executionRequest != nil {
+		clearCommandRequestArguments(s.executionRequest)
+		s.executionRequest = nil
+	}
 	s.result = append(json.RawMessage(nil), result...)
 	if err != nil {
 		copyErr := *err
@@ -1422,6 +1466,14 @@ func (s *sharedCommand) finish(result json.RawMessage, err *protocol.CommandErro
 	}
 	close(s.done)
 	s.mu.Unlock()
+}
+
+func (s *sharedCommand) takeExecutionRequest() *commands.CommandRequest {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	request := s.executionRequest
+	s.executionRequest = nil
+	return request
 }
 
 func (s *sharedCommand) finished() bool { s.mu.Lock(); defer s.mu.Unlock(); return s.finishedFlag }

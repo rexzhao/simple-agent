@@ -74,8 +74,14 @@ type CommandDefinition struct {
 	// must never silently turn an optimistic-concurrency request into an
 	// unconditional write.
 	SupportsExpectedRevision bool
-	Validate                 func(json.RawMessage) error
-	Execute                  CommandHandler
+	// RedactArguments is applied before a request enters the dispatcher
+	// idempotency cache. It is intentionally a wire-level hook: a command may
+	// need a credential while executing, but the cache must retain only a
+	// non-sensitive request tombstone/result. Fingerprints are still calculated
+	// from the original validated arguments.
+	RedactArguments func(json.RawMessage) json.RawMessage
+	Validate        func(json.RawMessage) error
+	Execute         CommandHandler
 }
 
 // Registry is immutable after construction. This prevents a running server

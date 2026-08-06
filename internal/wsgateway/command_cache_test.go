@@ -3,6 +3,8 @@ package wsgateway
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"strings"
 	"sync/atomic"
 	"testing"
 
@@ -59,6 +61,88 @@ func TestDispatcherRejectsUnsupportedExpectedRevisionBeforeExecution(t *testing.
 	}
 	if executions.Load() != 0 {
 		t.Fatalf("command executed despite unsupported revision: %d", executions.Load())
+	}
+}
+
+func TestDispatcherCommandCacheStoresOnlyRedactedArguments(t *testing.T) {
+	provider := newDispatcherFakeProvider(t)
+	var executions atomic.Int64
+	const original = `{"api_key":"cache-secret","auth_file":"/secret/provider.json","base_url":"https://user:base-secret@example.test/v1","http_proxy":"http://proxy-user:proxy-secret@proxy.test:8080","models":[{"parameters":{"nested":{"token":"nested-secret","levels":[{"api_key":"deep-secret"}]}},"reasoning_config":{"levels":{"credential":"reasoning-secret"}}}]}`
+	definition := commands.CommandDefinition{
+		Name: "fake.redacted", SchemaVersion: 1,
+		RedactArguments: func(raw json.RawMessage) json.RawMessage {
+			// Provider update uses a tombstone, never a guessed field-by-field
+			// redaction: arbitrary model parameters are also untrusted secrets.
+			return json.RawMessage(`{}`)
+		},
+		Execute: func(_ context.Context, request commands.CommandRequest) (json.RawMessage, error) {
+			if string(request.Arguments) != original {
+				return nil, fmt.Errorf("executor did not receive the complete original arguments")
+			}
+			executions.Add(1)
+			return json.RawMessage(`{"status":"applied"}`), nil
+		},
+	}
+	endpoint, dispatcher := newDispatcherForTest(t, provider, definition)
+	connection := dialTest(t, endpoint, issueTestTicket(t, endpoint))
+	defer connection.Close(websocket.StatusNormalClosure, "done")
+	writeHello(t, connection, "redaction-client")
+	_ = readProtocol(t, connection)
+	writeProtocol(t, connection, commandMessage("redacted-command", "redacted-request", "fake.redacted", original))
+	if message := readProtocol(t, connection); message.Kind() != protocol.MessageTypeCommandAccepted {
+		t.Fatalf("accepted=%s", message.Kind())
+	}
+	result := readCommandResult(t, connection)
+	if result.Payload.Status != protocol.CommandStatusSucceeded || string(result.Payload.Result) != `{"status":"applied"}` {
+		t.Fatalf("redacted command result=%#v", result)
+	}
+	dispatcher.commandsMu.Lock()
+	shared := dispatcher.requests[commandCacheKey{Principal: "test-principal", RequestID: "redacted-request"}]
+	var cachedArguments []byte
+	if shared != nil {
+		cachedArguments = append([]byte(nil), shared.request.Arguments...)
+	}
+	dispatcher.commandsMu.Unlock()
+	if shared == nil || string(cachedArguments) != `{}` {
+		t.Fatalf("provider command cache retained original arguments: %s", cachedArguments)
+	}
+	for _, secret := range []string{"cache-secret", "/secret/provider.json", "base-secret", "proxy-secret", "nested-secret", "deep-secret", "reasoning-secret"} {
+		if strings.Contains(string(cachedArguments), secret) {
+			t.Fatalf("command cache retained %q: %s", secret, cachedArguments)
+		}
+	}
+
+	// Exact retries reuse the tombstone/result and do not execute again.
+	writeProtocol(t, connection, commandMessage("redacted-retry", "redacted-request", "fake.redacted", original))
+	if retry := readCommandResult(t, connection); retry.Payload.Status != protocol.CommandStatusSucceeded || string(retry.Payload.Result) != `{"status":"applied"}` {
+		t.Fatalf("exact retry result=%#v", retry)
+	}
+	if executions.Load() != 1 {
+		t.Fatalf("exact retry executed again: %d", executions.Load())
+	}
+	// A changed target under the same request ID is still a conflict even
+	// though the durable cache deliberately retained no argument bytes.
+	writeProtocol(t, connection, commandMessage("redacted-conflict", "redacted-request", "fake.redacted", strings.Replace(original, "cache-secret", "other-secret", 1)))
+	conflict := readCommandResult(t, connection)
+	if conflict.Payload.Status != protocol.CommandStatusFailed || conflict.Payload.Error == nil || conflict.Payload.Error.Code != "idempotency_conflict" {
+		t.Fatalf("changed retry result=%#v", conflict)
+	}
+	if executions.Load() != 1 {
+		t.Fatalf("conflicting retry executed: %d", executions.Load())
+	}
+}
+
+func TestSharedCommandFinishClearsUnstartedExecutionArguments(t *testing.T) {
+	arguments := json.RawMessage(`{"api_key":"finish-secret","nested":{"token":"finish-nested-secret"}}`)
+	shared := &sharedCommand{executionRequest: &commands.CommandRequest{Arguments: arguments}, done: make(chan struct{})}
+	shared.finish(nil, &protocol.CommandError{Code: "dispatcher_closed", Message: "command execution was cancelled"})
+	if shared.executionRequest != nil {
+		t.Fatal("finished shared command retained its execution request")
+	}
+	for index, value := range arguments {
+		if value != 0 {
+			t.Fatalf("execution argument byte %d was not zeroed: %d", index, value)
+		}
 	}
 }
 

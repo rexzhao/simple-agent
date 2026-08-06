@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strings"
 	"time"
@@ -120,6 +121,9 @@ func (s *Service) UpdateProviderSettings(providerName string, input ProviderSett
 }
 
 func (s *Service) saveProviderSettings(existingName string, input ProviderSettingsInput) (ProviderSettingsDocument, error) {
+	s.providerConfigMu.Lock()
+	defer s.providerConfigMu.Unlock()
+
 	configPath := s.ConfigPath()
 	base, err := config.LoadBase(configPath)
 	if err != nil {
@@ -256,6 +260,14 @@ func (s *Service) saveProviderSettings(existingName string, input ProviderSettin
 			return ProviderSettingsDocument{}, fmt.Errorf("auth_file must stay inside %q", authRoot)
 		}
 	}
+	// This is a target-state operation, not a write-intent operation. A
+	// cross-epoch retry may arrive after the original command has committed;
+	// avoid rewriting the file or publishing a second resource change when the
+	// durable provider already equals the requested target. The comparison is
+	// confined to this execution boundary and never serializes credentials.
+	if exists && providerConfigsEqual(existing.Provider, provider) {
+		return s.ProviderSettings()
+	}
 	path := filepath.Join(base.ProviderDir, name+".yaml")
 	if exists {
 		path = existing.Path
@@ -274,13 +286,21 @@ func (s *Service) saveProviderSettings(existingName string, input ProviderSettin
 }
 
 func (s *Service) UpdateDefaultProviderModel(providerName, modelProfile string) (ProviderSettingsDocument, error) {
+	s.providerConfigMu.Lock()
+	defer s.providerConfigMu.Unlock()
+
 	configPath := s.ConfigPath()
 	cfg, err := config.Load(configPath)
 	if err != nil {
 		return ProviderSettingsDocument{}, err
 	}
+	providerName = strings.TrimSpace(providerName)
+	modelProfile = strings.TrimSpace(modelProfile)
 	if _, err := cfg.ResolveModel(providerName, modelProfile); err != nil {
 		return ProviderSettingsDocument{}, err
+	}
+	if strings.TrimSpace(cfg.DefaultProvider) == providerName && strings.TrimSpace(cfg.DefaultModel) == modelProfile {
+		return s.ProviderSettings()
 	}
 	if err := config.UpdateDefaultModel(configPath, strings.TrimSpace(providerName), strings.TrimSpace(modelProfile)); err != nil {
 		return ProviderSettingsDocument{}, err
@@ -396,7 +416,14 @@ func (s *Service) DiscoverProviderModels(ctx context.Context, providerName strin
 			ID string `json:"id"`
 		} `json:"data"`
 	}
-	if err := json.NewDecoder(io.LimitReader(response.Body, 4<<20)).Decode(&payload); err != nil {
+	body, err := io.ReadAll(io.LimitReader(response.Body, 4<<20+1))
+	if err != nil {
+		return nil, fmt.Errorf("read provider model list: %w", err)
+	}
+	if len(body) > 4<<20 {
+		return nil, fmt.Errorf("provider model list is too large")
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
 		return nil, fmt.Errorf("decode provider model list: %w", err)
 	}
 	seen := make(map[string]struct{}, len(payload.Data))
@@ -453,6 +480,53 @@ func codexModelIDs(provider config.ProviderConfig) []string {
 type rawProviderFile struct {
 	Path     string
 	Provider config.ProviderConfig
+}
+
+func providerConfigsEqual(left, right config.ProviderConfig) bool {
+	// YAML's empty mapping and an omitted mapping have the same provider
+	// execution meaning for top-level model parameters/reasoning levels. Treat
+	// those representations as one target so a retry after the first durable
+	// write does not create a spurious change. Parameter numbers are compared
+	// through JSON so yaml.v3's int and the command decoder's int64 are the
+	// same target value.
+	if left.Name != right.Name || left.BaseURL != right.BaseURL || left.APIKey != right.APIKey || left.AuthFile != right.AuthFile || left.RequestTimeout != right.RequestTimeout || left.HTTPProxy != right.HTTPProxy || left.HTTPSProxy != right.HTTPSProxy || left.MaxConcurrentRequests != right.MaxConcurrentRequests || len(left.Models) != len(right.Models) {
+		return false
+	}
+	for profile, leftModel := range left.Models {
+		rightModel, ok := right.Models[profile]
+		if !ok {
+			return false
+		}
+		leftParameters, rightParameters := leftModel.Parameters, rightModel.Parameters
+		leftLevels, rightLevels := leftModel.ReasoningConfig.Levels, rightModel.ReasoningConfig.Levels
+		leftModel.Parameters, rightModel.Parameters = nil, nil
+		leftModel.ReasoningConfig.Levels, rightModel.ReasoningConfig.Levels = nil, nil
+		if len(leftModel.Input) == 0 {
+			leftModel.Input = nil
+		}
+		if len(rightModel.Input) == 0 {
+			rightModel.Input = nil
+		}
+		if reflect.DeepEqual(leftModel, rightModel) && canonicalProviderJSON(leftParameters) == canonicalProviderJSON(rightParameters) && canonicalProviderJSON(leftLevels) == canonicalProviderJSON(rightLevels) {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func canonicalProviderJSON(value any) string {
+	if value == nil {
+		return "null"
+	}
+	if reflected := reflect.ValueOf(value); reflected.Kind() == reflect.Map && reflected.Len() == 0 {
+		return "null"
+	}
+	data, err := json.Marshal(value)
+	if err != nil {
+		return "<invalid>"
+	}
+	return string(data)
 }
 
 func rawProviderFiles(providerDir string) (map[string]rawProviderFile, error) {

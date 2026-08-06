@@ -1,19 +1,27 @@
 package webapp
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"math"
+	"math/big"
+	"sort"
 	"strconv"
 	"strings"
 	"unicode/utf8"
 
 	"github.com/rexzhao/simple-agent/internal/commands"
+	"github.com/rexzhao/simple-agent/internal/config"
 	"github.com/rexzhao/simple-agent/internal/execution"
 	projectstore "github.com/rexzhao/simple-agent/internal/projects"
 	"github.com/rexzhao/simple-agent/internal/protocol"
+	"github.com/rexzhao/simple-agent/internal/providersettings"
 	"github.com/rexzhao/simple-agent/internal/sessions"
 )
 
@@ -126,6 +134,25 @@ type runToolCancelArguments struct {
 	ToolCallID string
 }
 
+// provider.update deliberately uses a flat, complete target document rather
+// than a patch.  The API key is the only sensitive member and is consumed
+// synchronously by the execution service; it is never included in a result or
+// in the durable command cache (the dispatcher applies the redactor on the
+// cache boundary).
+type providerUpdateArguments struct {
+	Provider string
+	Input    execution.ProviderSettingsInput
+}
+
+type providerDefaultArguments struct {
+	Provider string
+	Model    string
+}
+
+type providerDiscoverArguments struct {
+	Provider string
+}
+
 type sessionRenameResult struct {
 	SessionID   string `json:"session_id"`
 	DisplayName string `json:"display_name"`
@@ -185,6 +212,27 @@ type sessionCompactCommandResult struct {
 	CompactionID  string `json:"compaction_id"`
 	SummaryItemID string `json:"summary_item_id"`
 	Revision      string `json:"revision"`
+}
+
+type providerMutationResult struct {
+	Provider string `json:"provider"`
+	Status   string `json:"status"`
+}
+
+type providerDefaultResult struct {
+	Provider string `json:"provider"`
+	Model    string `json:"model"`
+	Status   string `json:"status"`
+}
+
+type providerDiscoverInlineResult struct {
+	Provider string   `json:"provider"`
+	Models   []string `json:"models"`
+}
+
+type providerDiscoverBlobResult struct {
+	Provider string                   `json:"provider"`
+	Blob     *protocol.BlobDescriptor `json:"blob"`
 }
 
 // sessionHistoryReadResult is a descriptor boundary, not a second history
@@ -323,12 +371,213 @@ func runContinueFingerprint(request commands.CommandRequest, arguments runContin
 	return commands.Fingerprint(fingerprintRequest)
 }
 
+const (
+	// These limits apply before a command-specific decoder runs.  They are
+	// intentionally shared by all commands so a future command cannot forget
+	// to put a bound around an extension map or nested array.
+	maxCommandArgumentBytes     = 1 << 20
+	maxCommandJSONDepth         = 32
+	maxCommandJSONFields        = 16384
+	maxCommandJSONCollectionLen = 4096
+)
+
+type commandJSONBounds struct {
+	fields int
+}
+
+// validateBoundedJSON walks tokens instead of unmarshalling into map[string]any.
+// Besides enforcing resource limits this catches duplicate keys at every
+// nesting level, including arbitrary model parameters.
+func validateBoundedJSON(raw []byte) error {
+	if len(raw) == 0 || len(raw) > maxCommandArgumentBytes || !utf8.Valid(raw) {
+		return fmt.Errorf("command JSON is outside the wire boundary")
+	}
+	if err := validateJSONStrings(raw); err != nil {
+		return err
+	}
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
+	bounds := commandJSONBounds{}
+	if err := validateCommandJSONValue(decoder, 0, &bounds); err != nil {
+		return err
+	}
+	var trailing json.RawMessage
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		return fmt.Errorf("command JSON contains trailing data")
+	}
+	return nil
+}
+
+func validateCommandJSONValue(decoder *json.Decoder, depth int, bounds *commandJSONBounds) error {
+	if depth > maxCommandJSONDepth {
+		return fmt.Errorf("command JSON nesting is too deep")
+	}
+	token, err := decoder.Token()
+	if err != nil {
+		return fmt.Errorf("invalid command JSON")
+	}
+	switch value := token.(type) {
+	case json.Delim:
+		switch value {
+		case '{':
+			keys := make(map[string]struct{})
+			count := 0
+			for decoder.More() {
+				key, err := decoder.Token()
+				if err != nil {
+					return fmt.Errorf("invalid command JSON")
+				}
+				name, ok := key.(string)
+				if !ok || !utf8.ValidString(name) {
+					return fmt.Errorf("invalid command JSON object key")
+				}
+				if _, exists := keys[name]; exists {
+					return fmt.Errorf("duplicate command JSON object key")
+				}
+				keys[name] = struct{}{}
+				count++
+				bounds.fields++
+				if bounds.fields > maxCommandJSONFields || count > maxCommandJSONCollectionLen {
+					return fmt.Errorf("command JSON object is too large")
+				}
+				if err := validateCommandJSONValue(decoder, depth+1, bounds); err != nil {
+					return err
+				}
+			}
+			end, err := decoder.Token()
+			if err != nil || end != json.Delim('}') {
+				return fmt.Errorf("invalid command JSON object")
+			}
+		case '[':
+			count := 0
+			for decoder.More() {
+				count++
+				if count > maxCommandJSONCollectionLen {
+					return fmt.Errorf("command JSON array is too large")
+				}
+				if err := validateCommandJSONValue(decoder, depth+1, bounds); err != nil {
+					return err
+				}
+			}
+			end, err := decoder.Token()
+			if err != nil || end != json.Delim(']') {
+				return fmt.Errorf("invalid command JSON array")
+			}
+		default:
+			return fmt.Errorf("invalid command JSON delimiter")
+		}
+	case string:
+		if !utf8.ValidString(value) {
+			return fmt.Errorf("command JSON string is not valid UTF-8")
+		}
+	case json.Number:
+		if _, err := normalizeProviderJSONNumber(value); err != nil {
+			return err
+		}
+	case bool, nil:
+		// The token decoder has already validated the JSON scalar.
+	default:
+		return fmt.Errorf("invalid command JSON value")
+	}
+	return nil
+}
+
+// encoding/json replaces an escaped lone surrogate with U+FFFD. That is
+// useful for permissive decoding, but unsafe for a target-state command: the
+// submitted target would silently differ from the caller's JSON. Validate the
+// string lexemes before Token/Unmarshal so every object key and nested value
+// has either no surrogate escape or an immediately paired high/low escape.
+func validateJSONStrings(raw []byte) error {
+	for index := 0; index < len(raw); index++ {
+		if raw[index] != '"' {
+			continue
+		}
+		next, err := validateJSONString(raw, index)
+		if err != nil {
+			return err
+		}
+		index = next - 1
+	}
+	return nil
+}
+
+func validateJSONString(raw []byte, start int) (int, error) {
+	for index := start + 1; index < len(raw); index++ {
+		switch raw[index] {
+		case '"':
+			return index + 1, nil
+		case '\\':
+			index++
+			if index >= len(raw) {
+				return 0, fmt.Errorf("invalid command JSON string escape")
+			}
+			switch raw[index] {
+			case '"', '\\', '/', 'b', 'f', 'n', 'r', 't':
+				continue
+			case 'u':
+				if index+4 >= len(raw) {
+					return 0, fmt.Errorf("invalid command JSON unicode escape")
+				}
+				code, ok := parseJSONHex4(raw[index+1 : index+5])
+				if !ok {
+					return 0, fmt.Errorf("invalid command JSON unicode escape")
+				}
+				index += 4
+				switch {
+				case code >= 0xdc00 && code <= 0xdfff:
+					return 0, fmt.Errorf("unpaired command JSON low surrogate")
+				case code >= 0xd800 && code <= 0xdbff:
+					if index+6 >= len(raw) || raw[index+1] != '\\' || raw[index+2] != 'u' {
+						return 0, fmt.Errorf("unpaired command JSON high surrogate")
+					}
+					low, ok := parseJSONHex4(raw[index+3 : index+7])
+					if !ok || low < 0xdc00 || low > 0xdfff {
+						return 0, fmt.Errorf("invalid command JSON surrogate pair")
+					}
+					index += 6
+				}
+			default:
+				return 0, fmt.Errorf("invalid command JSON string escape")
+			}
+		default:
+			if raw[index] < 0x20 {
+				return 0, fmt.Errorf("invalid command JSON control character")
+			}
+		}
+	}
+	return 0, fmt.Errorf("unterminated command JSON string")
+}
+
+func parseJSONHex4(value []byte) (int, bool) {
+	if len(value) != 4 {
+		return 0, false
+	}
+	result := 0
+	for _, digit := range value {
+		result <<= 4
+		switch {
+		case digit >= '0' && digit <= '9':
+			result += int(digit - '0')
+		case digit >= 'a' && digit <= 'f':
+			result += int(digit-'a') + 10
+		case digit >= 'A' && digit <= 'F':
+			result += int(digit-'A') + 10
+		default:
+			return 0, false
+		}
+	}
+	return result, true
+}
+
 // strictCommandObject parses one JSON object, rejects duplicate keys and
 // trailing values, and leaves field-level type checking to the command
 // decoder. This is intentionally stricter than encoding/json's usual struct
 // decoding, where duplicate fields are silently overwritten.
 func strictCommandObject(raw json.RawMessage, command string) (map[string]json.RawMessage, error) {
-	decoder := json.NewDecoder(strings.NewReader(string(raw)))
+	if err := validateBoundedJSON(raw); err != nil {
+		return nil, fmt.Errorf("invalid %s arguments", command)
+	}
+	decoder := json.NewDecoder(bytes.NewReader(raw))
 	start, err := decoder.Token()
 	if err != nil {
 		return nil, fmt.Errorf("invalid %s arguments", command)
@@ -455,6 +704,424 @@ func requiredCommandInt(fields map[string]json.RawMessage, name, command string,
 		return 0, fmt.Errorf("invalid %s arguments", command)
 	}
 	return value, nil
+}
+
+func requiredProviderIdentity(fields map[string]json.RawMessage, name, command string) (string, error) {
+	raw, ok := fields[name]
+	if !ok || strings.TrimSpace(string(raw)) == "null" {
+		return "", fmt.Errorf("invalid %s arguments", command)
+	}
+	var value string
+	if err := json.Unmarshal(raw, &value); err != nil || providersettings.ValidateProviderName(value) != nil {
+		return "", fmt.Errorf("invalid %s arguments", command)
+	}
+	// Do not trim this identity. Internal spaces and Unicode are part of the
+	// shared E10 provider-name contract; ValidateProviderName rejects only the
+	// ambiguous edges and path/control characters.
+	return value, nil
+}
+
+func decodeProviderJSONMap(raw json.RawMessage, command string) (map[string]any, error) {
+	if err := validateBoundedJSON(raw); err != nil || string(bytes.TrimSpace(raw)) == "null" {
+		return nil, fmt.Errorf("invalid %s arguments", command)
+	}
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
+	var value any
+	if err := decoder.Decode(&value); err != nil {
+		return nil, fmt.Errorf("invalid %s arguments", command)
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		return nil, fmt.Errorf("invalid %s arguments", command)
+	}
+	object, ok := value.(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf("invalid %s arguments", command)
+	}
+	normalized, err := normalizeProviderJSONNumbers(object)
+	if err != nil {
+		return nil, fmt.Errorf("invalid %s arguments", command)
+	}
+	return normalized.(map[string]any), nil
+}
+
+const maxProviderJSONSafeInteger int64 = 9007199254740991
+
+// yaml.v3 and the existing config loader use native integer values for YAML
+// integer parameters. Preserve that distinction for safe integers, retain
+// finite fractional/exponent values as float64, and reject values that JS or
+// Go cannot represent without a silent type/precision change.
+func normalizeProviderJSONNumbers(value any) (any, error) {
+	switch typed := value.(type) {
+	case json.Number:
+		return normalizeProviderJSONNumber(typed)
+	case map[string]any:
+		for key, item := range typed {
+			normalized, err := normalizeProviderJSONNumbers(item)
+			if err != nil {
+				return nil, err
+			}
+			typed[key] = normalized
+		}
+	case []any:
+		for index, item := range typed {
+			normalized, err := normalizeProviderJSONNumbers(item)
+			if err != nil {
+				return nil, err
+			}
+			typed[index] = normalized
+		}
+	}
+	return value, nil
+}
+
+func normalizeProviderJSONNumber(value json.Number) (any, error) {
+	text := value.String()
+	if strings.ContainsAny(text, ".eE") {
+		decimal, err := strconv.ParseFloat(text, 64)
+		if err != nil || math.IsNaN(decimal) || math.IsInf(decimal, 0) {
+			return nil, fmt.Errorf("provider JSON number is outside the finite float64 boundary")
+		}
+		// ParseFloat is allowed to silently round a decimal lexeme. In
+		// particular, depending on the Go version, a non-zero value such as
+		// 1e-400 can become zero without an error, and a value just below a
+		// large integer can become that integer. Keep the original lexeme in
+		// an exact rational long enough to distinguish those cases. This does
+		// not require decimal values to be represented exactly in float64; it
+		// only prevents a non-zero or mathematically fractional input from
+		// changing its integer/zero semantics at the wire boundary.
+		exact, ok := new(big.Rat).SetString(text)
+		if !ok {
+			return nil, fmt.Errorf("provider JSON number is not a valid decimal")
+		}
+		if exact.Sign() != 0 && decimal == 0 {
+			return nil, fmt.Errorf("provider JSON number underflows float64")
+		}
+		if !exact.IsInt() && math.Trunc(decimal) == decimal {
+			return nil, fmt.Errorf("provider JSON fractional number was rounded to an integer")
+		}
+		if math.Trunc(decimal) == decimal && math.Abs(decimal) > float64(maxProviderJSONSafeInteger) {
+			return nil, fmt.Errorf("provider JSON integer-valued number exceeds the safe integer boundary")
+		}
+		return decimal, nil
+	}
+	integer, err := strconv.ParseInt(text, 10, 64)
+	if err != nil || integer < -maxProviderJSONSafeInteger || integer > maxProviderJSONSafeInteger {
+		return nil, fmt.Errorf("provider JSON integer exceeds the safe integer boundary")
+	}
+	return integer, nil
+}
+
+func requiredProviderString(fields map[string]json.RawMessage, name, command string) (string, error) {
+	return requiredCommandString(fields, name, command)
+}
+
+func optionalProviderString(fields map[string]json.RawMessage, name, command string) (string, error) {
+	raw, ok := fields[name]
+	if !ok || strings.TrimSpace(string(raw)) == "null" {
+		if ok {
+			return "", fmt.Errorf("invalid %s arguments", command)
+		}
+		return "", nil
+	}
+	var value string
+	if err := json.Unmarshal(raw, &value); err != nil || !utf8.ValidString(value) {
+		return "", fmt.Errorf("invalid %s arguments", command)
+	}
+	return value, nil
+}
+
+func decodeProviderStringArray(raw json.RawMessage, command string) ([]string, error) {
+	if err := validateBoundedJSON(raw); err != nil {
+		return nil, fmt.Errorf("invalid %s arguments", command)
+	}
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	var items []json.RawMessage
+	if err := decoder.Decode(&items); err != nil || items == nil || len(items) > maxCommandJSONCollectionLen {
+		return nil, fmt.Errorf("invalid %s arguments", command)
+	}
+	result := make([]string, 0, len(items))
+	for _, item := range items {
+		var value string
+		if err := json.Unmarshal(item, &value); err != nil || !utf8.ValidString(value) {
+			return nil, fmt.Errorf("invalid %s arguments", command)
+		}
+		result = append(result, value)
+	}
+	return result, nil
+}
+
+func decodeProviderReasoning(raw json.RawMessage, command string) (config.ReasoningConfig, error) {
+	fields, err := strictCommandObject(raw, command+" reasoning_config")
+	if err != nil {
+		return config.ReasoningConfig{}, err
+	}
+	if err := requireExactFields(fields, command+" reasoning_config", "parameter", "default", "levels"); err != nil {
+		return config.ReasoningConfig{}, err
+	}
+	parameter, err := optionalProviderString(fields, "parameter", command)
+	if err != nil {
+		return config.ReasoningConfig{}, err
+	}
+	defaultLevel, err := optionalProviderString(fields, "default", command)
+	if err != nil {
+		return config.ReasoningConfig{}, err
+	}
+	levels := map[string]any(nil)
+	if levelRaw, ok := fields["levels"]; ok {
+		levels, err = decodeProviderJSONMap(levelRaw, command)
+		if err != nil {
+			return config.ReasoningConfig{}, err
+		}
+	}
+	return config.ReasoningConfig{Parameter: parameter, Default: defaultLevel, Levels: levels}, nil
+}
+
+func decodeProviderPricing(raw json.RawMessage, command string) (*config.ModelPricing, error) {
+	if string(bytes.TrimSpace(raw)) == "null" {
+		return nil, nil
+	}
+	fields, err := strictCommandObject(raw, command+" pricing")
+	if err != nil {
+		return nil, err
+	}
+	if err := requireExactFields(fields, command+" pricing", "input_cache_hit", "input_cache_miss", "cache_write", "output", "currency", "long_context_threshold", "long_context"); err != nil {
+		return nil, err
+	}
+	var result config.ModelPricing
+	for name, destination := range map[string]*float64{
+		"input_cache_hit": &result.InputCacheHit, "input_cache_miss": &result.InputCacheMiss,
+		"cache_write": &result.CacheWrite, "output": &result.Output,
+	} {
+		if value, ok := fields[name]; ok {
+			if strings.TrimSpace(string(value)) == "null" {
+				return nil, fmt.Errorf("invalid %s arguments", command)
+			}
+			if err := json.Unmarshal(value, destination); err != nil {
+				return nil, fmt.Errorf("invalid %s arguments", command)
+			}
+		}
+	}
+	if currency, err := optionalProviderString(fields, "currency", command); err != nil {
+		return nil, err
+	} else {
+		result.Currency = currency
+	}
+	if value, ok := fields["long_context_threshold"]; ok {
+		if strings.TrimSpace(string(value)) == "null" {
+			return nil, fmt.Errorf("invalid %s arguments", command)
+		}
+		var threshold int
+		if err := json.Unmarshal(value, &threshold); err != nil || threshold < 0 || threshold > providersettings.MaxWireInteger {
+			return nil, fmt.Errorf("invalid %s arguments", command)
+		}
+		result.LongContextThreshold = threshold
+	}
+	if value, ok := fields["long_context"]; ok && string(bytes.TrimSpace(value)) != "null" {
+		tierFields, err := strictCommandObject(value, command+" long_context")
+		if err != nil {
+			return nil, err
+		}
+		if err := requireExactFields(tierFields, command+" long_context", "input_cache_hit", "input_cache_miss", "cache_write", "output"); err != nil {
+			return nil, err
+		}
+		result.LongContext = &config.ModelPricingTier{}
+		for name, destination := range map[string]*float64{
+			"input_cache_hit": &result.LongContext.InputCacheHit, "input_cache_miss": &result.LongContext.InputCacheMiss,
+			"cache_write": &result.LongContext.CacheWrite, "output": &result.LongContext.Output,
+		} {
+			if field, ok := tierFields[name]; ok {
+				if err := json.Unmarshal(field, destination); err != nil {
+					return nil, fmt.Errorf("invalid %s arguments", command)
+				}
+			}
+		}
+	}
+	return &result, nil
+}
+
+func decodeProviderModel(raw json.RawMessage, command string) (execution.ProviderModelSettings, error) {
+	fields, err := strictCommandObject(raw, command+" model")
+	if err != nil {
+		return execution.ProviderModelSettings{}, err
+	}
+	if err := requireExactFields(fields, command+" model", "profile", "id", "type", "compatibility", "input", "developer_role", "context_window", "input_limit", "output_limit", "parameters", "reasoning_config", "pricing"); err != nil {
+		return execution.ProviderModelSettings{}, err
+	}
+	profile, err := requiredProviderString(fields, "profile", command)
+	if err != nil {
+		return execution.ProviderModelSettings{}, err
+	}
+	id, err := optionalProviderString(fields, "id", command)
+	if err != nil {
+		return execution.ProviderModelSettings{}, err
+	}
+	typeName, err := optionalProviderString(fields, "type", command)
+	if err != nil {
+		return execution.ProviderModelSettings{}, err
+	}
+	compatibility, err := optionalProviderString(fields, "compatibility", command)
+	if err != nil {
+		return execution.ProviderModelSettings{}, err
+	}
+	developerRole, err := optionalProviderString(fields, "developer_role", command)
+	if err != nil {
+		return execution.ProviderModelSettings{}, err
+	}
+	result := execution.ProviderModelSettings{Profile: profile, ID: id, Type: typeName, Compatibility: compatibility, DeveloperRole: developerRole}
+	if value, ok := fields["input"]; ok {
+		result.Input, err = decodeProviderStringArray(value, command)
+		if err != nil {
+			return execution.ProviderModelSettings{}, err
+		}
+	}
+	for name, destination := range map[string]*int{"context_window": &result.ContextWindow, "input_limit": &result.InputLimit, "output_limit": &result.OutputLimit} {
+		if value, ok := fields[name]; ok {
+			if strings.TrimSpace(string(value)) == "null" {
+				return execution.ProviderModelSettings{}, fmt.Errorf("invalid %s arguments", command)
+			}
+			if err := json.Unmarshal(value, destination); err != nil || *destination < 0 || *destination > providersettings.MaxWireInteger {
+				return execution.ProviderModelSettings{}, fmt.Errorf("invalid %s arguments", command)
+			}
+		}
+	}
+	if value, ok := fields["parameters"]; ok {
+		if string(bytes.TrimSpace(value)) == "null" {
+			return execution.ProviderModelSettings{}, fmt.Errorf("invalid %s arguments", command)
+		}
+		result.Parameters, err = decodeProviderJSONMap(value, command)
+		if err != nil {
+			return execution.ProviderModelSettings{}, err
+		}
+	}
+	if value, ok := fields["reasoning_config"]; ok {
+		if string(bytes.TrimSpace(value)) == "null" {
+			return execution.ProviderModelSettings{}, fmt.Errorf("invalid %s arguments", command)
+		}
+		result.ReasoningConfig, err = decodeProviderReasoning(value, command)
+		if err != nil {
+			return execution.ProviderModelSettings{}, err
+		}
+	}
+	if value, ok := fields["pricing"]; ok {
+		result.Pricing, err = decodeProviderPricing(value, command)
+		if err != nil {
+			return execution.ProviderModelSettings{}, err
+		}
+	}
+	return result, nil
+}
+
+func decodeProviderUpdateArguments(raw json.RawMessage) (providerUpdateArguments, error) {
+	const command = "provider.update"
+	fields, err := strictCommandObject(raw, command)
+	if err != nil {
+		return providerUpdateArguments{}, err
+	}
+	if err := requireExactFields(fields, command, "provider", "base_url", "api_key", "keep_api_key", "auth_file", "request_timeout", "http_proxy", "https_proxy", "max_concurrent_requests", "models"); err != nil {
+		return providerUpdateArguments{}, err
+	}
+	provider, err := requiredProviderIdentity(fields, "provider", command)
+	if err != nil {
+		return providerUpdateArguments{}, err
+	}
+	baseURL, err := requiredProviderString(fields, "base_url", command)
+	if err != nil {
+		return providerUpdateArguments{}, err
+	}
+	result := providerUpdateArguments{Provider: provider, Input: execution.ProviderSettingsInput{Name: provider, BaseURL: baseURL}}
+	for name, destination := range map[string]*string{"api_key": &result.Input.APIKey, "auth_file": &result.Input.AuthFile, "request_timeout": &result.Input.RequestTimeout, "http_proxy": &result.Input.HTTPProxy, "https_proxy": &result.Input.HTTPSProxy} {
+		if value, ok := fields[name]; ok {
+			if strings.TrimSpace(string(value)) == "null" {
+				return providerUpdateArguments{}, fmt.Errorf("invalid %s arguments", command)
+			}
+			if err := json.Unmarshal(value, destination); err != nil || !utf8.ValidString(*destination) {
+				return providerUpdateArguments{}, fmt.Errorf("invalid %s arguments", command)
+			}
+		}
+	}
+	keepAPIKey, err := optionalCommandBool(fields, "keep_api_key", command)
+	if err != nil {
+		return providerUpdateArguments{}, err
+	}
+	if keepAPIKey != nil {
+		result.Input.KeepAPIKey = *keepAPIKey
+	}
+	if value, ok := fields["max_concurrent_requests"]; ok {
+		if strings.TrimSpace(string(value)) == "null" {
+			return providerUpdateArguments{}, fmt.Errorf("invalid %s arguments", command)
+		}
+		if err := json.Unmarshal(value, &result.Input.MaxConcurrentRequests); err != nil || result.Input.MaxConcurrentRequests < 0 || result.Input.MaxConcurrentRequests > providersettings.MaxWireInteger {
+			return providerUpdateArguments{}, fmt.Errorf("invalid %s arguments", command)
+		}
+	}
+	modelsRaw, ok := fields["models"]
+	if !ok {
+		return providerUpdateArguments{}, fmt.Errorf("invalid %s arguments", command)
+	}
+	var modelItems []json.RawMessage
+	decoder := json.NewDecoder(bytes.NewReader(modelsRaw))
+	if err := decoder.Decode(&modelItems); err != nil || len(modelItems) == 0 || len(modelItems) > maxCommandJSONCollectionLen {
+		return providerUpdateArguments{}, fmt.Errorf("invalid %s arguments", command)
+	}
+	result.Input.Models = make([]execution.ProviderModelSettings, 0, len(modelItems))
+	for _, item := range modelItems {
+		model, err := decodeProviderModel(item, command)
+		if err != nil {
+			return providerUpdateArguments{}, err
+		}
+		result.Input.Models = append(result.Input.Models, model)
+	}
+	return result, nil
+}
+
+func decodeProviderDefaultArguments(raw json.RawMessage) (providerDefaultArguments, error) {
+	const command = "provider.set_default"
+	fields, err := strictCommandObject(raw, command)
+	if err != nil {
+		return providerDefaultArguments{}, err
+	}
+	if err := requireExactFields(fields, command, "provider", "model"); err != nil {
+		return providerDefaultArguments{}, err
+	}
+	provider, err := requiredProviderIdentity(fields, "provider", command)
+	if err != nil {
+		return providerDefaultArguments{}, err
+	}
+	model, err := requiredCommandString(fields, "model", command)
+	if err != nil {
+		return providerDefaultArguments{}, err
+	}
+	return providerDefaultArguments{Provider: provider, Model: model}, nil
+}
+
+func decodeProviderDiscoverArguments(raw json.RawMessage) (providerDiscoverArguments, error) {
+	const command = "provider.discover_models"
+	fields, err := strictCommandObject(raw, command)
+	if err != nil {
+		return providerDiscoverArguments{}, err
+	}
+	if err := requireExactFields(fields, command, "provider"); err != nil {
+		return providerDiscoverArguments{}, err
+	}
+	provider, err := requiredProviderIdentity(fields, "provider", command)
+	return providerDiscoverArguments{Provider: provider}, err
+}
+
+func validateProviderUpdateArguments(raw json.RawMessage) error {
+	_, err := decodeProviderUpdateArguments(raw)
+	return err
+}
+
+func validateProviderDefaultArguments(raw json.RawMessage) error {
+	_, err := decodeProviderDefaultArguments(raw)
+	return err
+}
+
+func validateProviderDiscoverArguments(raw json.RawMessage) error {
+	_, err := decodeProviderDiscoverArguments(raw)
+	return err
 }
 
 func optionalCommandInt64(fields map[string]json.RawMessage, name, command string, min, max int64) (*int64, error) {
@@ -1191,6 +1858,27 @@ func projectCommandError(err error) error {
 	}
 }
 
+func providerCommandError(err error) error {
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return commands.NewDomainError("cancelled", "command was cancelled", nil)
+	}
+	// Provider service errors can contain endpoint details, filesystem paths,
+	// or an implementation-specific diagnostic. In particular, never expose
+	// an authentication failure that might include a credential. The command
+	// boundary therefore has one deliberately small public error vocabulary.
+	return commands.NewDomainError("provider_command_failed", "provider command failed", nil)
+}
+
+// The durable command cache is an idempotency tombstone, not a second copy of
+// the target. Provider update arguments can contain credentials in any field
+// (including arbitrary model parameters), so retain no argument bytes at all.
+func redactProviderUpdateArguments(_ json.RawMessage) json.RawMessage {
+	return json.RawMessage(`{}`)
+}
+
 type sessionHistoryBlobWriter interface {
 	Put(context.Context, string, []byte) (protocol.BlobDescriptor, error)
 }
@@ -1198,7 +1886,25 @@ type sessionHistoryBlobWriter interface {
 const (
 	maxSessionHistoryInlineBytes = 64 * 1024
 	maxSessionHistoryBlobBytes   = 16 * 1024 * 1024
+	maxProviderDiscoverModels    = 4096
+	maxProviderDiscoverIDBytes   = 4096
+	maxProviderDiscoverBytes     = 8 * 1024 * 1024
+	maxProviderDiscoverInline    = 64 * 1024
 )
+
+func validateProviderDiscoverBlobDescriptor(descriptor protocol.BlobDescriptor, content []byte) error {
+	if descriptor.ContentType != "application/json" || descriptor.Size != uint64(len(content)) || descriptor.Size > maxProviderDiscoverBytes {
+		return errors.New("provider model blob descriptor size or content type is invalid")
+	}
+	if err := protocol.ValidateBlobDescriptor(descriptor); err != nil {
+		return err
+	}
+	digest := sha256.Sum256(content)
+	if !strings.EqualFold(descriptor.SHA256, hex.EncodeToString(digest[:])) {
+		return errors.New("provider model blob descriptor hash is invalid")
+	}
+	return nil
+}
 
 func sessionDeleteCommandError(err error) error {
 	if errors.Is(err, execution.ErrSessionArchiveFirst) {
@@ -1237,6 +1943,109 @@ func newSessionCommandRegistry(service *execution.Service, runs *runRegistry, hi
 		historyWriter = historyWriters[0]
 	}
 	return commands.NewRegistry(
+		commands.CommandDefinition{
+			Name: "provider.update", SchemaVersion: 1, CrossEpochRetrySafe: true,
+			CachePolicy: commands.ResultCacheDurable, SupportsExpectedRevision: false,
+			RedactArguments: redactProviderUpdateArguments,
+			Validate:        validateProviderUpdateArguments,
+			Execute: func(_ context.Context, request commands.CommandRequest) (json.RawMessage, error) {
+				arguments, err := decodeProviderUpdateArguments(request.Arguments)
+				if err != nil {
+					return nil, err
+				}
+				if service == nil {
+					return nil, commands.NewDomainError("provider_unavailable", "provider service is not configured", nil)
+				}
+				if _, err := service.UpdateProviderSettings(arguments.Provider, arguments.Input); err != nil {
+					return nil, providerCommandError(err)
+				}
+				return json.Marshal(providerMutationResult{Provider: arguments.Provider, Status: "applied"})
+			},
+		},
+		commands.CommandDefinition{
+			Name: "provider.set_default", SchemaVersion: 1, CrossEpochRetrySafe: true,
+			CachePolicy: commands.ResultCacheDurable, SupportsExpectedRevision: false,
+			Validate: validateProviderDefaultArguments,
+			Execute: func(_ context.Context, request commands.CommandRequest) (json.RawMessage, error) {
+				arguments, err := decodeProviderDefaultArguments(request.Arguments)
+				if err != nil {
+					return nil, err
+				}
+				if service == nil {
+					return nil, commands.NewDomainError("provider_unavailable", "provider service is not configured", nil)
+				}
+				if _, err := service.UpdateDefaultProviderModel(arguments.Provider, arguments.Model); err != nil {
+					return nil, providerCommandError(err)
+				}
+				// This is an acknowledgement only. ProviderSettings is the
+				// authority and reaches the client through its resource stream.
+				return json.Marshal(providerDefaultResult{Provider: arguments.Provider, Model: arguments.Model, Status: "applied"})
+			},
+		},
+		commands.CommandDefinition{
+			Name: "provider.discover_models", SchemaVersion: 1, CrossEpochRetrySafe: true,
+			CachePolicy: commands.ResultCacheVolatile, SupportsExpectedRevision: false,
+			Validate: validateProviderDiscoverArguments,
+			Execute: func(ctx context.Context, request commands.CommandRequest) (json.RawMessage, error) {
+				arguments, err := decodeProviderDiscoverArguments(request.Arguments)
+				if err != nil {
+					return nil, err
+				}
+				if service == nil {
+					return nil, commands.NewDomainError("provider_unavailable", "provider service is not configured", nil)
+				}
+				models, err := service.DiscoverProviderModels(ctx, arguments.Provider)
+				if err != nil {
+					return nil, providerCommandError(err)
+				}
+				if len(models) > maxProviderDiscoverModels {
+					return nil, commands.NewDomainError("provider_result_too_large", "provider model result is too large", nil)
+				}
+				seen := make(map[string]struct{}, len(models))
+				normalized := make([]string, 0, len(models))
+				totalBytes := 0
+				for _, model := range models {
+					if !utf8.ValidString(model) || len([]byte(model)) == 0 || len([]byte(model)) > maxProviderDiscoverIDBytes {
+						return nil, commands.NewDomainError("provider_result_invalid", "provider model result is invalid", nil)
+					}
+					if _, duplicate := seen[model]; duplicate {
+						continue
+					}
+					seen[model] = struct{}{}
+					normalized = append(normalized, model)
+					totalBytes += len([]byte(model))
+					if totalBytes > maxProviderDiscoverBytes {
+						return nil, commands.NewDomainError("provider_result_too_large", "provider model result is too large", nil)
+					}
+				}
+				sort.Strings(normalized)
+				modelBytes, err := json.Marshal(normalized)
+				if err != nil {
+					return nil, commands.NewDomainError("provider_result_invalid", "provider model result is invalid", nil)
+				}
+				if len(modelBytes) > maxProviderDiscoverBytes {
+					return nil, commands.NewDomainError("provider_result_too_large", "provider model result is too large", nil)
+				}
+				inline, err := json.Marshal(providerDiscoverInlineResult{Provider: arguments.Provider, Models: normalized})
+				if err != nil {
+					return nil, commands.NewDomainError("provider_result_invalid", "provider model result is invalid", err)
+				}
+				if len(inline) <= maxProviderDiscoverInline || historyWriter == nil {
+					if historyWriter == nil && len(inline) > maxProviderDiscoverInline {
+						return nil, commands.NewDomainError("provider_result_too_large", "provider model result is too large", nil)
+					}
+					return inline, nil
+				}
+				descriptor, err := historyWriter.Put(ctx, "application/json", modelBytes)
+				if err != nil {
+					return nil, providerCommandError(err)
+				}
+				if err := validateProviderDiscoverBlobDescriptor(descriptor, modelBytes); err != nil {
+					return nil, commands.NewDomainError("provider_result_invalid", "provider model result is invalid", nil)
+				}
+				return json.Marshal(providerDiscoverBlobResult{Provider: arguments.Provider, Blob: &descriptor})
+			},
+		},
 		commands.CommandDefinition{
 			Name: "project.create", SchemaVersion: 1, CrossEpochRetrySafe: true,
 			SupportsExpectedRevision: false, Validate: validateProjectCreateArguments,
