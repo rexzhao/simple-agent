@@ -1,6 +1,7 @@
 package sessions
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"database/sql"
@@ -86,6 +87,9 @@ const (
 var (
 	ErrNotFound         = errors.New("session not found")
 	ErrCorruptedSession = errors.New("corrupted session")
+	// ErrIdempotencyConflict means that a stable create identity has already
+	// been durably claimed by a different normalized operation.
+	ErrIdempotencyConflict = errors.New("session create idempotency conflict")
 )
 
 const interruptedToolResultContent = "[tool execution interrupted]"
@@ -551,7 +555,8 @@ CREATE TABLE IF NOT EXISTS state (
   session_id TEXT NOT NULL,
   state_json BLOB NOT NULL,
   last_seq INTEGER NOT NULL DEFAULT 0,
-  metadata_version INTEGER NOT NULL DEFAULT 0
+  metadata_version INTEGER NOT NULL DEFAULT 0,
+  create_fingerprint TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS runs (
   id TEXT PRIMARY KEY,
@@ -611,6 +616,14 @@ CREATE INDEX IF NOT EXISTS session_inbox_status_created ON session_inbox(status,
 CREATE INDEX IF NOT EXISTS session_inbox_child ON session_inbox(child_session_id, child_run_id);
 `
 
+// SaveMetadata does not acquire the per-session OS lock itself because the
+// execution service already holds that lock across its read/validate/write
+// mutation paths (and some paths hold a deterministic subtree lock set).
+// Callers that can target an existing ID concurrently with Delete must obey
+// that same upper-level mutation-lock contract. The normal generated-ID
+// CreateSession path is not a stable-ID retry path (and its claim check
+// rejects an accidental claimed-ID collision); durable command create and
+// Delete acquire the stable lock directly.
 func (s *V2Store) SaveMetadata(session SessionV2) (SessionV2, error) {
 	if err := s.requireRoot(); err != nil {
 		return SessionV2{}, err
@@ -626,6 +639,11 @@ func (s *V2Store) SaveMetadata(session SessionV2) (SessionV2, error) {
 	}
 	if err := validateV2SessionID(session.ID); err != nil {
 		return SessionV2{}, err
+	}
+	if claim, err := s.readSessionClaim(session.ID); err != nil {
+		return SessionV2{}, err
+	} else if claim != nil {
+		return SessionV2{}, fmt.Errorf("%w: session %q has a durable delete claim", ErrIdempotencyConflict, session.ID)
 	}
 	var err error
 	session, err = normalizeSessionLineage(session)
@@ -721,7 +739,7 @@ func (s *V2Store) SaveMetadata(session SessionV2) (SessionV2, error) {
 	if readErr == nil {
 		_, err = tx.Exec(`UPDATE state SET session_id = ?, state_json = ?, last_seq = ?, metadata_version = ? WHERE singleton = 1`, session.ID, data, session.LastSeq, session.metadataVersion)
 	} else {
-		_, err = tx.Exec(`INSERT INTO state(singleton, session_id, state_json, last_seq, metadata_version) VALUES(1, ?, ?, ?, ?)`, session.ID, data, session.LastSeq, session.metadataVersion)
+		_, err = tx.Exec(`INSERT INTO state(singleton, session_id, state_json, last_seq, metadata_version, create_fingerprint) VALUES(1, ?, ?, ?, ?, '')`, session.ID, data, session.LastSeq, session.metadataVersion)
 	}
 	if err != nil {
 		return SessionV2{}, fmt.Errorf("write session state: %w", err)
@@ -730,6 +748,306 @@ func (s *V2Store) SaveMetadata(session SessionV2) (SessionV2, error) {
 		return SessionV2{}, fmt.Errorf("commit session state: %w", err)
 	}
 	s.publishMutation(Mutation{SessionID: session.ID, ProjectID: session.ProjectID, Revision: session.LastSeq})
+	return copySessionV2(session), nil
+}
+
+// CreateMetadataIdempotent is the durable create primitive used by commands
+// with a client-owned entity identity. The per-session OS lock serializes
+// callers from different processes, while the SQLite transaction commits the
+// state row and its fingerprint together. A retry therefore either observes
+// the exact original state, or gets ErrIdempotencyConflict; it can never
+// observe a receipt without the business row (or vice versa).
+//
+// build is called only while the identity is still unclaimed. In particular,
+// a retry does not need to re-resolve provider configuration or its parent in
+// order to return the already durable result after a process restart. For a
+// new identity, build runs before openSessionDB(create=true), so a failed
+// provider/configuration build cannot leave a schema-only business directory.
+func (s *V2Store) CreateMetadataIdempotent(ctx context.Context, sessionID, fingerprint string, build func(context.Context) (SessionV2, error)) (SessionV2, bool, error) {
+	if err := s.requireRoot(); err != nil {
+		return SessionV2{}, false, err
+	}
+	if err := validateV2SessionID(sessionID); err != nil {
+		return SessionV2{}, false, err
+	}
+	fingerprint = strings.TrimSpace(fingerprint)
+	if fingerprint == "" || len(fingerprint) > 128 {
+		return SessionV2{}, false, fmt.Errorf("session create fingerprint is invalid")
+	}
+	if build == nil {
+		return SessionV2{}, false, fmt.Errorf("session create builder is required")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	lock, err := s.AcquireSessionWriteLock(ctx, sessionID)
+	if err != nil {
+		return SessionV2{}, false, err
+	}
+	defer func() { _ = lock.Release() }()
+	if err := ctx.Err(); err != nil {
+		return SessionV2{}, false, err
+	}
+	if claim, err := s.readSessionClaim(sessionID); err != nil {
+		return SessionV2{}, false, err
+	} else if claim != nil {
+		if claim.Fingerprint == "" || claim.Fingerprint != fingerprint {
+			return SessionV2{}, false, fmt.Errorf("%w: session %q", ErrIdempotencyConflict, sessionID)
+		}
+		return SessionV2{ID: sessionID, ProjectID: claim.ProjectID}, false, nil
+	}
+
+	// Inspect an already-existing database before building. This preserves the
+	// important retry property (no config/parent re-resolution), while a brand
+	// new ID does not open a database until after build succeeds. A schema-only
+	// database from an older failed attempt is harmless: it is inspected here,
+	// then the normal insert path below can reuse it.
+	sessionDirectoryExisted := false
+	if info, statErr := os.Stat(s.sessionDir(sessionID)); statErr == nil {
+		if !info.IsDir() {
+			return SessionV2{}, false, fmt.Errorf("session path %q is not a directory", s.sessionDir(sessionID))
+		}
+		sessionDirectoryExisted = true
+	} else if !errors.Is(statErr, os.ErrNotExist) {
+		return SessionV2{}, false, statErr
+	}
+	databasePath := filepath.Join(s.sessionDir(sessionID), "session.db")
+	databaseExisted := false
+	if info, statErr := os.Stat(databasePath); statErr == nil {
+		if info.IsDir() {
+			return SessionV2{}, false, fmt.Errorf("session database path %q is a directory", databasePath)
+		}
+		databaseExisted = true
+	} else if !errors.Is(statErr, os.ErrNotExist) {
+		return SessionV2{}, false, statErr
+	}
+	if databaseExisted {
+		existing, found, err := s.readExistingIdempotentSession(sessionID, fingerprint)
+		if err != nil {
+			return SessionV2{}, false, err
+		}
+		if found {
+			return existing, false, nil
+		}
+	}
+
+	if err := ctx.Err(); err != nil {
+		return SessionV2{}, false, err
+	}
+
+	session, err := build(ctx)
+	if err != nil {
+		return SessionV2{}, false, err
+	}
+	if strings.TrimSpace(session.ID) == "" {
+		session.ID = sessionID
+	}
+	if session.ID != sessionID {
+		return SessionV2{}, false, fmt.Errorf("session create builder returned id %q for %q", session.ID, sessionID)
+	}
+	session, err = prepareNewSessionMetadata(session, s.now().UTC())
+	if err != nil {
+		return SessionV2{}, false, err
+	}
+	if err := ctx.Err(); err != nil {
+		return SessionV2{}, false, err
+	}
+	data, err := marshalState(session)
+	if err != nil {
+		return SessionV2{}, false, err
+	}
+
+	// The lock is still held while this closure opens/creates the database and
+	// commits the first state row. If anything fails before a state row exists,
+	// the outer cleanup removes only the database created by this invocation.
+	var result SessionV2
+	created := false
+	operationErr := func() error {
+		db, err := s.openSessionDB(sessionID, true)
+		if err != nil {
+			return err
+		}
+		defer db.Close()
+		tx, err := db.Begin()
+		if err != nil {
+			return fmt.Errorf("begin idempotent session create: %w", err)
+		}
+		defer tx.Rollback()
+
+		var existingData []byte
+		var lastSeq, metadataVersion int64
+		var existingFingerprint string
+		readErr := tx.QueryRow(`SELECT state_json, last_seq, metadata_version, create_fingerprint FROM state WHERE singleton = 1`).Scan(&existingData, &lastSeq, &metadataVersion, &existingFingerprint)
+		if readErr == nil {
+			result, err = decodeExistingIdempotentSession(sessionID, fingerprint, existingData, lastSeq, metadataVersion, existingFingerprint)
+			return err
+		}
+		if !errors.Is(readErr, sql.ErrNoRows) {
+			return fmt.Errorf("read idempotent session state: %w", readErr)
+		}
+		if _, err := tx.Exec(`INSERT INTO state(singleton, session_id, state_json, last_seq, metadata_version, create_fingerprint) VALUES(1, ?, ?, ?, ?, ?)`, session.ID, data, session.LastSeq, session.metadataVersion, fingerprint); err != nil {
+			return fmt.Errorf("write idempotent session state: %w", err)
+		}
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("commit idempotent session create: %w", err)
+		}
+		result = copySessionV2(session)
+		created = true
+		return nil
+	}()
+	if operationErr != nil {
+		if !databaseExisted {
+			if cleanupErr := s.cleanupEmptyCreatedSession(sessionID, !sessionDirectoryExisted); cleanupErr != nil {
+				operationErr = errors.Join(operationErr, fmt.Errorf("cleanup failed session create %q: %w", sessionID, cleanupErr))
+			}
+		}
+		return SessionV2{}, false, operationErr
+	}
+	if created {
+		s.publishMutation(Mutation{SessionID: result.ID, ProjectID: result.ProjectID, Revision: result.LastSeq})
+	}
+	return result, created, nil
+}
+
+func (s *V2Store) readExistingIdempotentSession(sessionID, fingerprint string) (SessionV2, bool, error) {
+	db, err := s.openSessionDB(sessionID, true)
+	if err != nil {
+		return SessionV2{}, false, err
+	}
+	defer db.Close()
+	var data []byte
+	var lastSeq, metadataVersion int64
+	var existingFingerprint string
+	readErr := db.QueryRow(`SELECT state_json, last_seq, metadata_version, create_fingerprint FROM state WHERE singleton = 1`).Scan(&data, &lastSeq, &metadataVersion, &existingFingerprint)
+	if errors.Is(readErr, sql.ErrNoRows) {
+		return SessionV2{}, false, nil
+	}
+	if readErr != nil {
+		return SessionV2{}, false, fmt.Errorf("read idempotent session state: %w", readErr)
+	}
+	existing, err := decodeExistingIdempotentSession(sessionID, fingerprint, data, lastSeq, metadataVersion, existingFingerprint)
+	if err != nil {
+		return SessionV2{}, false, err
+	}
+	return existing, true, nil
+}
+
+func decodeExistingIdempotentSession(sessionID, fingerprint string, data []byte, lastSeq, metadataVersion int64, existingFingerprint string) (SessionV2, error) {
+	if existingFingerprint == "" || existingFingerprint != fingerprint {
+		return SessionV2{}, fmt.Errorf("%w: session %q", ErrIdempotencyConflict, sessionID)
+	}
+	var existing SessionV2
+	if err := json.Unmarshal(data, &existing); err != nil {
+		return SessionV2{}, corruptedSessionError(sessionID, "parse SQLite state: %v", err)
+	}
+	if existing.ID == "" {
+		existing.ID = sessionID
+	}
+	if existing.ID != sessionID {
+		return SessionV2{}, fmt.Errorf("session state %q contains id %q", sessionID, existing.ID)
+	}
+	existing.Items = nil
+	existing.LastSeq = lastSeq
+	existing.metadataVersion = metadataVersion
+	return copySessionV2(existing), nil
+}
+
+// cleanupEmptyCreatedSession is called only while the stable create lock is
+// still held. It verifies that no state row appeared before removing anything;
+// production metadata writers use the same upper-level session mutation lock,
+// so a normal SaveMetadata cannot race this check and be deleted accidentally.
+func (s *V2Store) cleanupEmptyCreatedSession(sessionID string, removeSessionDirectory bool) error {
+	db, err := s.openSessionDB(sessionID, false)
+	if errors.Is(err, ErrNotFound) {
+		if !removeSessionDirectory {
+			return nil
+		}
+		if err := os.RemoveAll(s.sessionDir(sessionID)); err != nil {
+			return fmt.Errorf("remove empty session directory %q: %w", sessionID, err)
+		}
+		return syncDirectory(s.root)
+	}
+	if err != nil {
+		return err
+	}
+	var marker int
+	queryErr := db.QueryRow(`SELECT 1 FROM state WHERE singleton = 1`).Scan(&marker)
+	closeErr := db.Close()
+	if queryErr == nil {
+		// A state row exists. Never remove a database that may have been
+		// committed by another legal writer while this operation was failing.
+		return closeErr
+	}
+	if !errors.Is(queryErr, sql.ErrNoRows) {
+		return errors.Join(queryErr, closeErr)
+	}
+	if closeErr != nil {
+		return closeErr
+	}
+	if removeSessionDirectory {
+		if err := os.RemoveAll(s.sessionDir(sessionID)); err != nil {
+			return fmt.Errorf("remove empty session directory %q: %w", sessionID, err)
+		}
+	} else {
+		if err := os.Remove(filepath.Join(s.sessionDir(sessionID), "session.db")); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("remove empty session database %q: %w", sessionID, err)
+		}
+	}
+	syncPath := s.root
+	if !removeSessionDirectory {
+		syncPath = s.sessionDir(sessionID)
+	}
+	if err := syncDirectory(syncPath); err != nil {
+		return fmt.Errorf("sync after empty create cleanup %q: %w", sessionID, err)
+	}
+	return nil
+}
+
+func prepareNewSessionMetadata(session SessionV2, now time.Time) (SessionV2, error) {
+	// Exported builders are not trusted to provide creation bookkeeping. A
+	// fresh session always starts with a clean projected lifecycle baseline;
+	// the SQLite row owns sequence/version zero.
+	session.LastSeq = 0
+	session.metadataVersion = 0
+	session.Items = nil
+	session.ActiveHistory = nil
+	session.Compactions = nil
+	session.CurrentRunID = ""
+	session.RunningRunID = ""
+	session.RunningTurnID = ""
+	session.RunningStartedAt = time.Time{}
+	session.InterruptedRunID = ""
+	session.InterruptedTurnID = ""
+	session.InterruptedAt = time.Time{}
+	session.LatestRunID = ""
+	session.LastRunID = ""
+	session.LastRunStatus = ""
+	session.HasUnreadResult = false
+	var err error
+	session, err = normalizeSessionLineage(session)
+	if err != nil {
+		return SessionV2{}, err
+	}
+	if session.Version == 0 {
+		session.Version = VersionV2
+	}
+	if session.CreatedAt.IsZero() {
+		session.CreatedAt = now
+	}
+	if session.LastUsedAt.IsZero() {
+		session.LastUsedAt = sessionEffectiveLastUsedAt(session)
+		if session.LastUsedAt.IsZero() {
+			session.LastUsedAt = now
+		}
+	}
+	if session.Archived {
+		if session.ArchivedAt.IsZero() {
+			session.ArchivedAt = now
+		}
+	} else {
+		session.ArchivedAt = time.Time{}
+	}
+	session.UpdatedAt = now
 	return copySessionV2(session), nil
 }
 
@@ -874,6 +1192,12 @@ func (s *V2Store) Delete(id string) error {
 	if err := validateV2SessionID(id); err != nil {
 		return err
 	}
+	lock, err := s.AcquireSessionWriteLock(context.Background(), id)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = lock.Release() }()
+
 	state, err := s.LoadState(id)
 	if err != nil {
 		return err
@@ -884,8 +1208,22 @@ func (s *V2Store) Delete(id string) error {
 		}
 		return err
 	}
+	// Install the non-removable identity claim before deleting the removable
+	// business directory. The claim directory is outside sessionDir and the
+	// same stable lock is used by create, so a crash cannot expose a deleted ID
+	// to a later create attempt.
+	fingerprint, err := s.loadCreateFingerprint(id)
+	if err != nil {
+		return err
+	}
+	if err := s.writeSessionClaim(id, fingerprint, state.ProjectID); err != nil {
+		return err
+	}
 	if err := os.RemoveAll(s.sessionDir(id)); err != nil {
 		return fmt.Errorf("delete session %q: %w", id, err)
+	}
+	if err := syncDirectory(s.root); err != nil {
+		return fmt.Errorf("sync session root after deleting %q: %w", id, err)
 	}
 	s.publishMutation(Mutation{SessionID: id, ProjectID: state.ProjectID, Revision: state.LastSeq, Deleted: true})
 	return nil
@@ -2607,7 +2945,42 @@ func (s *V2Store) openSessionDB(id string, create bool) (*sql.DB, error) {
 			return nil, fmt.Errorf("initialize session database %q: %w", id, err)
 		}
 	}
+	if create {
+		if err := ensureCreateFingerprintColumn(db); err != nil {
+			db.Close()
+			return nil, fmt.Errorf("prepare session create schema %q: %w", id, err)
+		}
+	}
 	return db, nil
+}
+
+func ensureCreateFingerprintColumn(db *sql.DB) error {
+	rows, err := db.Query(`PRAGMA table_info(state)`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	found := false
+	for rows.Next() {
+		var cid int
+		var name, columnType string
+		var notNull, primaryKey int
+		var defaultValue any
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &primaryKey); err != nil {
+			return err
+		}
+		if name == "create_fingerprint" {
+			found = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if found {
+		return nil
+	}
+	_, err = db.Exec(`ALTER TABLE state ADD COLUMN create_fingerprint TEXT NOT NULL DEFAULT ''`)
+	return err
 }
 
 func marshalState(session SessionV2) ([]byte, error) {
@@ -2630,7 +3003,7 @@ func (s *V2Store) requireRoot() error {
 func (s *V2Store) sessionDir(id string) string { return filepath.Join(s.root, id) }
 
 func isSessionDirectory(name string) bool {
-	return validateV2SessionID(name) == nil && !strings.EqualFold(name, blobsDirName)
+	return validateV2SessionID(name) == nil && !strings.EqualFold(name, blobsDirName) && name != sessionClaimsDirName
 }
 
 func validateV2SessionID(id string) error {
@@ -2638,6 +3011,9 @@ func validateV2SessionID(id string) error {
 		return err
 	}
 	if strings.EqualFold(strings.TrimRight(id, ". "), blobsDirName) {
+		return fmt.Errorf("reserved session id %q", id)
+	}
+	if strings.EqualFold(strings.TrimRight(id, ". "), sessionClaimsDirName) {
 		return fmt.Errorf("reserved session id %q", id)
 	}
 	return nil
@@ -2652,6 +3028,25 @@ func validateSessionID(id string) error {
 			continue
 		}
 		return fmt.Errorf("invalid session id %q", id)
+	}
+	return nil
+}
+
+// ValidateSessionID exposes the legacy path-safe boundary used by the durable
+// store. It intentionally has no newly-added length limit so existing
+// on-disk IDs remain loadable and removable.
+func ValidateSessionID(id string) error { return validateV2SessionID(id) }
+
+const maxSessionCreateIDLength = 128
+
+// ValidateSessionCreateID is the stricter client-command identity boundary.
+// It does not change compatibility for legacy IDs already present on disk.
+func ValidateSessionCreateID(id string) error {
+	if err := validateV2SessionID(id); err != nil {
+		return err
+	}
+	if len(id) > maxSessionCreateIDLength {
+		return fmt.Errorf("session create id is too long")
 	}
 	return nil
 }

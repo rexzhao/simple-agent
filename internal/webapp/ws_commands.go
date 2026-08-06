@@ -10,6 +10,7 @@ import (
 
 	"github.com/rexzhao/simple-agent/internal/commands"
 	"github.com/rexzhao/simple-agent/internal/execution"
+	"github.com/rexzhao/simple-agent/internal/projects"
 	"github.com/rexzhao/simple-agent/internal/sessions"
 )
 
@@ -38,6 +39,19 @@ type sessionDebugArguments struct {
 	RequestBodies bool
 }
 
+type sessionCreateArguments struct {
+	SessionID       string
+	ProjectID       string
+	DisplayName     *string
+	ParentSessionID *string
+	CWD             *string
+	ConfigPath      *string
+	Provider        *string
+	ModelProfile    *string
+	ReasoningLevel  *string
+	FullAccess      *bool
+}
+
 type runCancelArguments struct {
 	RunID string
 }
@@ -60,6 +74,52 @@ type sessionFullAccessResult struct {
 type sessionDebugResult struct {
 	SessionID     string `json:"session_id"`
 	RequestBodies bool   `json:"request_bodies"`
+}
+
+type sessionCreateResult struct {
+	SessionID string `json:"session_id"`
+	ProjectID string `json:"project_id"`
+}
+
+func normalizedSessionCreateFingerprint(request commands.CommandRequest, arguments sessionCreateArguments) (string, error) {
+	normalized := map[string]any{
+		"session_id": arguments.SessionID,
+		"project_id": arguments.ProjectID,
+		// false is the business default, so omitted and explicit false are
+		// one normalized operation rather than two claims for one entity.
+		"full_access": false,
+	}
+	if arguments.DisplayName != nil {
+		normalized["display_name"] = *arguments.DisplayName
+	}
+	if arguments.ParentSessionID != nil {
+		normalized["parent_session_id"] = *arguments.ParentSessionID
+	}
+	if arguments.CWD != nil {
+		normalized["cwd"] = *arguments.CWD
+	}
+	if arguments.ConfigPath != nil {
+		normalized["config_path"] = *arguments.ConfigPath
+	}
+	if arguments.Provider != nil {
+		normalized["provider"] = *arguments.Provider
+	}
+	if arguments.ModelProfile != nil {
+		normalized["model_profile"] = *arguments.ModelProfile
+	}
+	if arguments.ReasoningLevel != nil {
+		normalized["reasoning_level"] = *arguments.ReasoningLevel
+	}
+	if arguments.FullAccess != nil {
+		normalized["full_access"] = *arguments.FullAccess
+	}
+	data, err := json.Marshal(normalized)
+	if err != nil {
+		return "", err
+	}
+	normalizedRequest := request
+	normalizedRequest.Arguments = data
+	return commands.Fingerprint(normalizedRequest)
 }
 
 type runCancelResult struct {
@@ -165,6 +225,105 @@ func requiredCommandBool(fields map[string]json.RawMessage, name, command string
 		return false, fmt.Errorf("invalid %s arguments", command)
 	}
 	return value, nil
+}
+
+func optionalCommandBool(fields map[string]json.RawMessage, name, command string) (*bool, error) {
+	raw, ok := fields[name]
+	if !ok {
+		return nil, nil
+	}
+	if strings.TrimSpace(string(raw)) == "null" {
+		return nil, fmt.Errorf("invalid %s arguments", command)
+	}
+	value, err := requiredCommandBool(fields, name, command)
+	if err != nil {
+		return nil, err
+	}
+	return &value, nil
+}
+
+const maxSessionCreateArgumentBytes = 4096
+
+func boundedCommandString(fields map[string]json.RawMessage, name, command string, maxBytes int) (*string, error) {
+	value, err := optionalCommandString(fields, name, command)
+	if err != nil {
+		return nil, err
+	}
+	if value != nil && len(*value) > maxBytes {
+		return nil, fmt.Errorf("invalid %s arguments", command)
+	}
+	return value, nil
+}
+
+func decodeSessionCreateArguments(raw json.RawMessage) (sessionCreateArguments, error) {
+	const command = "session.create"
+	fields, err := strictCommandObject(raw, command)
+	if err != nil {
+		return sessionCreateArguments{}, err
+	}
+	if err := requireExactFields(fields, command, "session_id", "project_id", "display_name", "parent_session_id", "cwd", "config_path", "provider", "model_profile", "reasoning_level", "full_access"); err != nil {
+		return sessionCreateArguments{}, err
+	}
+	sessionID, err := requiredCommandString(fields, "session_id", command)
+	if err != nil || sessions.ValidateSessionCreateID(sessionID) != nil {
+		return sessionCreateArguments{}, fmt.Errorf("invalid %s arguments", command)
+	}
+	projectID, err := requiredCommandString(fields, "project_id", command)
+	if err != nil || len(projectID) > 128 || projects.ValidateProjectID(projectID) != nil {
+		return sessionCreateArguments{}, fmt.Errorf("invalid %s arguments", command)
+	}
+	displayName, err := boundedCommandString(fields, "display_name", command, maxSessionCreateArgumentBytes)
+	if err != nil {
+		return sessionCreateArguments{}, err
+	}
+	parentID, err := boundedCommandString(fields, "parent_session_id", command, maxSessionCreateArgumentBytes)
+	if err != nil {
+		return sessionCreateArguments{}, err
+	}
+	// parent_session_id references an existing entity; unlike the new entity
+	// ID it may be a legacy path-safe ID longer than the client-create bound.
+	if parentID != nil && sessions.ValidateSessionID(*parentID) != nil {
+		return sessionCreateArguments{}, fmt.Errorf("invalid %s arguments", command)
+	}
+	cwd, err := boundedCommandString(fields, "cwd", command, maxSessionCreateArgumentBytes)
+	if err != nil {
+		return sessionCreateArguments{}, err
+	}
+	configPath, err := boundedCommandString(fields, "config_path", command, maxSessionCreateArgumentBytes)
+	if err != nil {
+		return sessionCreateArguments{}, err
+	}
+	provider, err := boundedCommandString(fields, "provider", command, maxSessionCreateArgumentBytes)
+	if err != nil {
+		return sessionCreateArguments{}, err
+	}
+	modelProfile, err := boundedCommandString(fields, "model_profile", command, maxSessionCreateArgumentBytes)
+	if err != nil {
+		return sessionCreateArguments{}, err
+	}
+	reasoningLevel, err := boundedCommandString(fields, "reasoning_level", command, maxSessionCreateArgumentBytes)
+	if err != nil {
+		return sessionCreateArguments{}, err
+	}
+	fullAccess, err := optionalCommandBool(fields, "full_access", command)
+	if err != nil {
+		return sessionCreateArguments{}, err
+	}
+	// Parent-only creates use the existing inherited-session semantics: the
+	// child's provider/capability snapshot comes from the parent. Do not make
+	// the same wire shape ambiguously mean either "inherit" or "resolve the
+	// current server config" depending on which optional override happened to
+	// be supplied. Configured root creates may use the other fields; inherited
+	// overrides remain a later, separately specified command contract.
+	if parentID != nil && (cwd != nil || configPath != nil || provider != nil || modelProfile != nil || reasoningLevel != nil || fullAccess != nil) {
+		return sessionCreateArguments{}, fmt.Errorf("invalid %s arguments", command)
+	}
+	return sessionCreateArguments{
+		SessionID: sessionID, ProjectID: projectID, DisplayName: displayName,
+		ParentSessionID: parentID, CWD: cwd, ConfigPath: configPath,
+		Provider: provider, ModelProfile: modelProfile, ReasoningLevel: reasoningLevel,
+		FullAccess: fullAccess,
+	}, nil
 }
 
 func decodeSessionMarkReadArguments(raw json.RawMessage) (sessionMarkReadArguments, error) {
@@ -307,6 +466,11 @@ func validateSessionDebugArguments(raw json.RawMessage) error {
 	return err
 }
 
+func validateSessionCreateArguments(raw json.RawMessage) error {
+	_, err := decodeSessionCreateArguments(raw)
+	return err
+}
+
 func validateRunCancelArguments(raw json.RawMessage) error {
 	_, err := decodeRunCancelArguments(raw)
 	return err
@@ -325,6 +489,8 @@ func sessionCommandError(err error) error {
 		return commands.NewDomainError("cancelled", "command was cancelled", err)
 	case errors.Is(err, execution.ErrSessionArchived):
 		return commands.NewDomainError("session_archived", "session is archived", err)
+	case errors.Is(err, sessions.ErrIdempotencyConflict):
+		return commands.NewDomainError("idempotency_conflict", "session create identity conflicts with an existing operation", err)
 	default:
 		return commands.NewDomainError("command_failed", "command execution failed", err)
 	}
@@ -332,6 +498,62 @@ func sessionCommandError(err error) error {
 
 func newSessionCommandRegistry(service *execution.Service, runs *runRegistry) (*commands.Registry, error) {
 	return commands.NewRegistry(
+		commands.CommandDefinition{
+			Name: "session.create", SchemaVersion: 1, CrossEpochRetrySafe: true,
+			// The create primitive is durable at the session store. Expected
+			// revisions are deliberately rejected by the gateway because this
+			// command has no revision-conditional create semantics.
+			SupportsExpectedRevision: false,
+			Validate:                 validateSessionCreateArguments,
+			Execute: func(ctx context.Context, request commands.CommandRequest) (json.RawMessage, error) {
+				arguments, err := decodeSessionCreateArguments(request.Arguments)
+				if err != nil {
+					return nil, err
+				}
+				fingerprint, err := normalizedSessionCreateFingerprint(request, arguments)
+				if err != nil {
+					return nil, commands.NewDomainError("invalid_fingerprint", "command fingerprint is invalid", err)
+				}
+				displayName := ""
+				if arguments.DisplayName != nil {
+					displayName = *arguments.DisplayName
+				}
+				if arguments.ParentSessionID != nil {
+					result, _, err := service.CreateInheritedSessionIdempotent(ctx, arguments.ProjectID, *arguments.ParentSessionID, displayName, arguments.SessionID, fingerprint)
+					if err != nil {
+						return nil, sessionCommandError(err)
+					}
+					return json.Marshal(sessionCreateResult{SessionID: result.ID, ProjectID: result.ProjectID})
+				}
+				options := execution.ConfiguredSessionOptions{DisplayName: displayName}
+				if arguments.ParentSessionID != nil {
+					options.ParentSessionID = *arguments.ParentSessionID
+				}
+				if arguments.CWD != nil {
+					options.CWD = *arguments.CWD
+				}
+				if arguments.ConfigPath != nil {
+					options.ConfigPath = *arguments.ConfigPath
+				}
+				if arguments.Provider != nil {
+					options.Provider = *arguments.Provider
+				}
+				if arguments.ModelProfile != nil {
+					options.ModelProfile = *arguments.ModelProfile
+				}
+				if arguments.ReasoningLevel != nil {
+					options.ReasoningLevel = *arguments.ReasoningLevel
+				}
+				if arguments.FullAccess != nil {
+					options.FullAccess = *arguments.FullAccess
+				}
+				result, _, err := service.CreateConfiguredSessionIdempotent(ctx, arguments.ProjectID, arguments.SessionID, fingerprint, options)
+				if err != nil {
+					return nil, sessionCommandError(err)
+				}
+				return json.Marshal(sessionCreateResult{SessionID: result.ID, ProjectID: result.ProjectID})
+			},
+		},
 		commands.CommandDefinition{
 			Name: "session.mark_read", SchemaVersion: 1, CrossEpochRetrySafe: true,
 			Validate: validateSessionMarkReadArguments,

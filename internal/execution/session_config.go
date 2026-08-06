@@ -1,6 +1,7 @@
 package execution
 
 import (
+	"context"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -72,9 +73,38 @@ func (s *Service) ConfiguredSessionModels(projectID string) (SessionModelOptions
 // configuration. Presentation layers should use this method instead of
 // resolving provider, model, tool, MCP, and skill metadata themselves.
 func (s *Service) CreateConfiguredSession(projectID string, options ConfiguredSessionOptions) (SessionDetail, error) {
-	project, err := s.loadActiveProject(projectID)
+	projectID, metadata, err := s.resolveConfiguredSessionMetadata(projectID, options)
 	if err != nil {
 		return SessionDetail{}, err
+	}
+	return s.CreateSession(projectID, metadata)
+}
+
+// CreateConfiguredSessionIdempotent resolves configuration only for a new
+// identity. Once the store has committed the session, a retry returns the
+// original frozen provider/model metadata even if server configuration has
+// changed or is temporarily unavailable.
+func (s *Service) CreateConfiguredSessionIdempotent(ctx context.Context, projectID, sessionID, fingerprint string, options ConfiguredSessionOptions) (SessionDetail, bool, error) {
+	saved, created, err := s.createSessionIdempotent(ctx, sessionID, fingerprint, func(_ context.Context) (sessions.SessionV2, error) {
+		resolvedProjectID, metadata, err := s.resolveConfiguredSessionMetadata(projectID, options)
+		if err != nil {
+			return sessions.SessionV2{}, err
+		}
+		return s.buildSession(resolvedProjectID, metadata, sessionID)
+	})
+	if err != nil {
+		return SessionDetail{}, false, err
+	}
+	if created {
+		s.publishSessionCreated(saved)
+	}
+	return sessionDetailFromStore(saved), created, nil
+}
+
+func (s *Service) resolveConfiguredSessionMetadata(projectID string, options ConfiguredSessionOptions) (string, SessionCreateMetadata, error) {
+	project, err := s.loadActiveProject(projectID)
+	if err != nil {
+		return "", SessionCreateMetadata{}, err
 	}
 
 	cwd := strings.TrimSpace(options.CWD)
@@ -83,41 +113,41 @@ func (s *Service) CreateConfiguredSession(projectID string, options ConfiguredSe
 	}
 	cwd, err = filepath.Abs(cwd)
 	if err != nil {
-		return SessionDetail{}, fmt.Errorf("resolve session cwd %q: %w", options.CWD, err)
+		return "", SessionCreateMetadata{}, fmt.Errorf("resolve session cwd %q: %w", options.CWD, err)
 	}
 	cwd = filepath.Clean(cwd)
 	if !isSameOrAncestorProjectPath(project.Root, cwd) {
-		return SessionDetail{}, fmt.Errorf("session cwd %q is outside project root %q", cwd, project.Root)
+		return "", SessionCreateMetadata{}, fmt.Errorf("session cwd %q is outside project root %q", cwd, project.Root)
 	}
 
 	if suppliedConfigPath := strings.TrimSpace(options.ConfigPath); suppliedConfigPath != "" {
 		resolvedConfigPath, err := filepath.Abs(suppliedConfigPath)
 		if err != nil {
-			return SessionDetail{}, fmt.Errorf("resolve session config path %q: %w", suppliedConfigPath, err)
+			return "", SessionCreateMetadata{}, fmt.Errorf("resolve session config path %q: %w", suppliedConfigPath, err)
 		}
 		if projectPathKey(resolvedConfigPath) != projectPathKey(s.ConfigPath()) {
-			return SessionDetail{}, fmt.Errorf("session config path %q does not match server root config %q", suppliedConfigPath, s.ConfigPath())
+			return "", SessionCreateMetadata{}, fmt.Errorf("session config path %q does not match server root config %q", suppliedConfigPath, s.ConfigPath())
 		}
 	}
 	cfg, err := config.Load(s.ConfigPath())
 	if err != nil {
-		return SessionDetail{}, err
+		return "", SessionCreateMetadata{}, err
 	}
 	resolved, err := cfg.ResolveModel(options.Provider, options.ModelProfile)
 	if err != nil {
-		return SessionDetail{}, err
+		return "", SessionCreateMetadata{}, err
 	}
 	parameters, err := config.ApplyReasoningLevel(resolved.Parameters, resolved.ReasoningConfig, options.ReasoningLevel)
 	if err != nil {
-		return SessionDetail{}, err
+		return "", SessionCreateMetadata{}, err
 	}
 	selectedMCP, err := cfg.SelectedMCPServers(nil, false)
 	if err != nil {
-		return SessionDetail{}, err
+		return "", SessionCreateMetadata{}, err
 	}
 	selectedSkills, err := enabledSkillsForRun(cfg, cwd)
 	if err != nil {
-		return SessionDetail{}, err
+		return "", SessionCreateMetadata{}, err
 	}
 	window := contextwindow.ResolveWindow(resolved.ContextWindow)
 	showReasoning := cfg.Agent.ShowReasoning
@@ -129,7 +159,7 @@ func (s *Service) CreateConfiguredSession(projectID string, options ConfiguredSe
 	}
 	debugSettings := sessions.DebugSettings{RequestBodies: cfg.Logging.RequestBodies}
 
-	return s.CreateSession(project.ID, SessionCreateMetadata{
+	return project.ID, SessionCreateMetadata{
 		DisplayName:     strings.TrimSpace(options.DisplayName),
 		ParentSessionID: strings.TrimSpace(options.ParentSessionID),
 		CreatedCWD:      cwd,
@@ -148,7 +178,7 @@ func (s *Service) CreateConfiguredSession(projectID string, options ConfiguredSe
 		Debug:           &debugSettings,
 		Context:         &contextMetadata,
 		SaveToolResults: &saveToolResults,
-	})
+	}, nil
 }
 
 // CreateInheritedSession creates an agent child using the parent's frozen
@@ -194,6 +224,66 @@ func (s *Service) CreateInheritedSession(parentID, displayName string) (SessionD
 		SaveToolResults: &saveToolResults,
 	})
 }
+
+// CreateInheritedSessionIdempotent is the durable variant used when a
+// command explicitly requests an inherited child. The project id is checked
+// against the parent before the first commit; a committed retry returns the
+// frozen child without needing to rebuild the parent-derived metadata.
+func (s *Service) CreateInheritedSessionIdempotent(ctx context.Context, projectID, parentID, displayName, sessionID, fingerprint string) (SessionDetail, bool, error) {
+	saved, created, err := s.createSessionIdempotent(ctx, sessionID, fingerprint, func(_ context.Context) (sessions.SessionV2, error) {
+		parent, err := s.GetSession(parentID)
+		if err != nil {
+			return sessions.SessionV2{}, err
+		}
+		if strings.TrimSpace(projectID) == "" || parent.ProjectID != strings.TrimSpace(projectID) {
+			return sessions.SessionV2{}, fmt.Errorf("parent session belongs to a different project")
+		}
+		warningThreshold := parent.Context.WarningThresholdPercent
+		if warningThreshold <= 0 {
+			warningThreshold = contextwindow.WarningThresholdPercent
+		}
+		return s.buildSession(projectID, SessionCreateMetadata{
+			DisplayName:     strings.TrimSpace(displayName),
+			ParentSessionID: parent.ID,
+			CreatedCWD:      inheritedSessionCWD(parent),
+			ConfigPath:      s.ConfigPath(),
+			Provider:        parent.Provider,
+			ModelProfile:    parent.ModelProfile,
+			ModelID:         parent.ModelID,
+			Pricing:         copyModelPricing(parent.Pricing),
+			ReasoningLevel:  parent.ReasoningLevel,
+			ModelParameters: copyParameterMap(parent.ModelParameters),
+			EnabledTools:    copyStringSlice(parent.EnabledTools),
+			EnabledMCP:      copyStringSlice(parent.EnabledMCP),
+			EnabledSkills:   copyStringSlice(parent.EnabledSkills),
+			ShowReasoning:   boolPointer(parent.ShowReasoning),
+			FullAccess:      parent.FullAccess,
+			Debug:           debugSettingsPointer(parent.Debug),
+			Context: &contextwindow.Metadata{
+				ContextWindow:           parent.Context.ContextWindow,
+				ContextWindowSource:     parent.Context.ContextWindowSource,
+				WarningThresholdPercent: warningThreshold,
+			},
+			SaveToolResults: boolPointer(true),
+		}, sessionID)
+	})
+	if err != nil {
+		return SessionDetail{}, false, err
+	}
+	if created {
+		s.publishSessionCreated(saved)
+	}
+	return sessionDetailFromStore(saved), created, nil
+}
+
+func inheritedSessionCWD(parent SessionDetail) string {
+	if cwd := strings.TrimSpace(parent.CWD); cwd != "" {
+		return cwd
+	}
+	return strings.TrimSpace(parent.CreatedCWD)
+}
+
+func boolPointer(value bool) *bool { return &value }
 
 func debugSettingsPointer(settings sessions.DebugSettings) *sessions.DebugSettings {
 	return &settings

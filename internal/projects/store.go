@@ -473,6 +473,10 @@ func validateProjectID(id string) error {
 	return nil
 }
 
+// ValidateProjectID exposes the same path-safe boundary used by the project
+// store to transport-neutral application adapters.
+func ValidateProjectID(id string) error { return validateProjectID(id) }
+
 func projectRootKey(path string) string {
 	path = filepath.Clean(path)
 	if runtime.GOOS == "windows" {

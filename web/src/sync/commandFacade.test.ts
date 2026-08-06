@@ -86,6 +86,83 @@ describe('CommandFacade session.mark_read', () => {
     await expect(pending).resolves.toMatchObject({ marked_read: true })
   })
 
+  it('creates with separate cryptographic entity/request IDs and resends an identical payload across epochs', async () => {
+    const transport = new FakeCommandTransport()
+    let requestNumber = 0
+    const facade = new CommandFacade({
+      transport,
+      requestIDGenerator: () => `request_create_${++requestNumber}`,
+      sessionIDGenerator: () => 'session_create_stable',
+    })
+    const pending = facade.create('project_1', { displayName: 'Created', fullAccess: false })
+    const initial = transport.sent[0]
+    if (initial.type !== 'command') throw new Error('wrong initial command')
+    expect(initial.payload.name).toBe('session.create')
+    expect(initial.payload.arguments).toEqual({
+      session_id: 'session_create_stable', project_id: 'project_1', display_name: 'Created', full_access: false,
+    })
+    expect(initial.payload.request_id).toBe('request_create_1')
+    expect(initial.payload.request_id).not.toBe(initial.payload.arguments.session_id)
+
+    transport.connectionGeneration = 2
+    transport.emitReady('epoch_2', 'epoch_1')
+    const resent = transport.sent[1]
+    if (resent.type !== 'command') throw new Error('wrong resent command')
+    expect(resent.payload).toEqual(initial.payload)
+    transport.emit(commandMessage('command_result', resent.payload.request_id, {
+      status: 'succeeded', result: { session_id: 'session_create_stable', project_id: 'project_1' },
+    }), 2)
+    await expect(pending).resolves.toEqual({ session_id: 'session_create_stable', project_id: 'project_1' })
+    await expect(facade.create('project_1', { displayName: 'other' })).rejects.toMatchObject({ code: 'id_generation', details: { collision: true } })
+
+    const failedTransport = new FakeCommandTransport()
+    const failed = new CommandFacade({ transport: failedTransport, sessionIDGenerator: () => { throw new Error('no entropy') } })
+    await expect(failed.create('project_1')).rejects.toMatchObject({ code: 'id_generation' })
+    expect(failedTransport.sent).toHaveLength(0)
+    facade.stop()
+    failed.stop()
+  })
+
+  it('allows explicit stable session IDs to retry past the local collision cache', async () => {
+    const transport = new FakeCommandTransport()
+    let requestNumber = 0
+    const facade = new CommandFacade({ transport, requestIDGenerator: () => `request_explicit_${++requestNumber}` })
+    const first = facade.create('project_1', { sessionID: 'session_explicit_stable', displayName: 'Created' })
+    const firstMessage = transport.sent[0]
+    if (firstMessage.type !== 'command') throw new Error('wrong first command')
+    transport.emit(commandMessage('command_result', firstMessage.payload.request_id, {
+      status: 'succeeded', result: { session_id: 'session_explicit_stable', project_id: 'project_1' },
+    }))
+    await expect(first).resolves.toEqual({ session_id: 'session_explicit_stable', project_id: 'project_1' })
+
+    // This is a new request after the first result (the same case also occurs
+    // after a timeout/page restore). The explicit entity ID bypasses only the
+    // process-local cache; the server remains responsible for dedupe/conflict.
+    const retry = facade.create('project_1', { sessionID: 'session_explicit_stable', displayName: 'Created' })
+    const retryMessage = transport.sent[1]
+    if (retryMessage.type !== 'command') throw new Error('wrong retry command')
+    expect(retryMessage.payload.arguments).toEqual(firstMessage.payload.arguments)
+    expect(retryMessage.payload.request_id).not.toBe(firstMessage.payload.request_id)
+    transport.emit(commandMessage('command_result', retryMessage.payload.request_id, {
+      status: 'succeeded', result: { session_id: 'session_explicit_stable', project_id: 'project_1' },
+    }))
+    await expect(retry).resolves.toEqual({ session_id: 'session_explicit_stable', project_id: 'project_1' })
+
+    const conflict = facade.create('project_1', { sessionID: 'session_explicit_stable', displayName: 'Different' })
+    const conflictMessage = transport.sent[2]
+    if (conflictMessage.type !== 'command') throw new Error('wrong conflict command')
+    transport.emit(commandMessage('command_result', conflictMessage.payload.request_id, {
+      status: 'failed', error: { code: 'idempotency_conflict', message: 'session identity is already claimed' },
+    }))
+    await expect(conflict).rejects.toMatchObject({ code: 'idempotency_conflict' })
+
+    for (const sessionID of ['../not-valid', 'blobs.', 'BLOBS..', '.session-claims', '.SESSION-CLAIMS.']) {
+      await expect(facade.create('project_1', { sessionID })).rejects.toMatchObject({ code: 'invalid' })
+    }
+    expect(transport.sent).toHaveLength(3)
+    facade.stop()
+  })
+
   it('rejects on timeout, cancellation, and stop while clearing pending timers', async () => {
     const timers = new TimerBox()
     const transport = new FakeCommandTransport()

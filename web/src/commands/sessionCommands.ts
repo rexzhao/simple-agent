@@ -28,7 +28,25 @@ export interface SessionDebugResult {
   readonly request_bodies: boolean
 }
 
+export interface SessionCreateOptions {
+  readonly sessionID?: string
+  readonly displayName?: string
+  readonly parentSessionID?: string
+  readonly cwd?: string
+  readonly configPath?: string
+  readonly provider?: string
+  readonly modelProfile?: string
+  readonly reasoningLevel?: string
+  readonly fullAccess?: boolean
+}
+
+export interface SessionCreateResult {
+  readonly session_id: string
+  readonly project_id: string
+}
+
 export interface SessionCommands {
+  create(projectID: string, options?: SessionCreateOptions, commandOptions?: CommandOptions): Promise<SessionCreateResult>
   markRead(
     sessionID: string,
     runID: string,

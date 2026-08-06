@@ -792,22 +792,71 @@ func (s *Service) RemoveProject(id string) (ProjectRemoveResult, error) {
 }
 
 func (s *Service) CreateSession(projectID string, metadata SessionCreateMetadata) (SessionDetail, error) {
-	project, err := s.loadActiveProject(projectID)
-	if err != nil {
-		return SessionDetail{}, err
-	}
 	if s == nil || s.sessionStore == nil {
 		return SessionDetail{}, fmt.Errorf("execution session store is not configured")
 	}
+	session, err := s.buildSession(projectID, metadata, "")
+	if err != nil {
+		return SessionDetail{}, err
+	}
+	saved, err := s.sessionStore.SaveMetadata(session)
+	if err != nil {
+		return SessionDetail{}, err
+	}
+	s.publishSessionCreated(saved)
+	return sessionDetailFromStore(saved), nil
+}
+
+// CreateSessionIdempotent is the service boundary for a durable client-owned
+// session identity. The builder is evaluated only when the store has no
+// committed state for sessionID, so retries do not depend on a provider config
+// file or parent still being available after the original commit.
+func (s *Service) CreateSessionIdempotent(ctx context.Context, projectID, sessionID, fingerprint string, metadata SessionCreateMetadata) (SessionDetail, bool, error) {
+	if s == nil || s.sessionStore == nil {
+		return SessionDetail{}, false, fmt.Errorf("execution session store is not configured")
+	}
+	saved, created, err := s.createSessionIdempotent(ctx, sessionID, fingerprint, func(_ context.Context) (sessions.SessionV2, error) {
+		return s.buildSession(projectID, metadata, sessionID)
+	})
+	if err != nil {
+		return SessionDetail{}, false, err
+	}
+	if created {
+		s.publishSessionCreated(saved)
+	}
+	return sessionDetailFromStore(saved), created, nil
+}
+
+func (s *Service) createSessionIdempotent(ctx context.Context, sessionID, fingerprint string, build func(context.Context) (sessions.SessionV2, error)) (sessions.SessionV2, bool, error) {
+	if s == nil || s.sessionStore == nil {
+		return sessions.SessionV2{}, false, fmt.Errorf("execution session store is not configured")
+	}
+	return s.sessionStore.CreateMetadataIdempotent(ctx, sessionID, fingerprint, build)
+}
+
+func (s *Service) buildSession(projectID string, metadata SessionCreateMetadata, sessionID string) (sessions.SessionV2, error) {
+	project, err := s.loadActiveProject(projectID)
+	if err != nil {
+		return sessions.SessionV2{}, err
+	}
+	if s == nil || s.sessionStore == nil {
+		return sessions.SessionV2{}, fmt.Errorf("execution session store is not configured")
+	}
 	session := applySessionCreateMetadata(sessions.SessionV2{}, metadata)
 	session.ProjectID = project.ID
+	if strings.TrimSpace(sessionID) != "" {
+		session.ID = sessionID
+	}
 	if session.ParentSessionID != "" {
+		if session.ParentSessionID == session.ID {
+			return sessions.SessionV2{}, fmt.Errorf("session cannot be its own parent")
+		}
 		parent, err := s.sessionStore.LoadState(session.ParentSessionID)
 		if err != nil {
-			return SessionDetail{}, fmt.Errorf("load parent session %q: %w", session.ParentSessionID, err)
+			return sessions.SessionV2{}, fmt.Errorf("load parent session %q: %w", session.ParentSessionID, err)
 		}
 		if parent.ProjectID != project.ID {
-			return SessionDetail{}, fmt.Errorf("parent session belongs to a different project")
+			return sessions.SessionV2{}, fmt.Errorf("parent session belongs to a different project")
 		}
 		session.CreatedBy = sessions.SessionCreatedByAgent
 		session.RootSessionID = strings.TrimSpace(parent.RootSessionID)
@@ -825,12 +874,7 @@ func (s *Service) CreateSession(projectID string, metadata SessionCreateMetadata
 	if strings.TrimSpace(session.CWD) == "" {
 		session.CWD = session.CreatedCWD
 	}
-	saved, err := s.sessionStore.SaveMetadata(session)
-	if err != nil {
-		return SessionDetail{}, err
-	}
-	s.publishSessionCreated(saved)
-	return sessionDetailFromStore(saved), nil
+	return session, nil
 }
 
 func (s *Service) ListSessions(options SessionListOptions) ([]SessionMetadata, error) {

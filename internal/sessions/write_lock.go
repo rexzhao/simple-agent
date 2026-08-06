@@ -31,7 +31,11 @@ func (s *V2Store) AcquireSessionWriteLock(ctx context.Context, sessionID string)
 	}
 
 	path := s.sessionWriteLockPath(sessionID)
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	// Keep the lock outside the removable session directory. Delete and create
+	// must contend on the same inode even while the session directory is being
+	// removed; an in-session lock file would be unlinked and allow a second
+	// writer to recreate the lock during that window.
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return nil, fmt.Errorf("create session directory %q: %w", filepath.Dir(path), err)
 	}
 	file, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o600)
@@ -67,7 +71,7 @@ func (l *SessionWriteLock) Release() error {
 }
 
 func (s *V2Store) sessionWriteLockPath(sessionID string) string {
-	return filepath.Join(s.sessionDir(sessionID), sessionWriteLockFileName)
+	return filepath.Join(s.sessionClaimsDir(sessionID), sessionWriteLockFileName)
 }
 
 func lockSessionWriteFile(ctx context.Context, file *os.File) error {

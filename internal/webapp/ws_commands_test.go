@@ -24,6 +24,16 @@ func TestSessionCommandSchemasAreStrict(t *testing.T) {
 			},
 		},
 		{
+			name: "create", validate: validateSessionCreateArguments,
+			valid: json.RawMessage(`{"session_id":"session_s","project_id":"project_p","display_name":"new","full_access":false}`),
+			invalid: []json.RawMessage{
+				json.RawMessage(`{"session_id":"session_s","project_id":"project_p","unknown":true}`),
+				json.RawMessage(`{"session_id":"session_s","project_id":"project_p","session_id":"other"}`),
+				json.RawMessage(`{"session_id":"../escape","project_id":"project_p"}`),
+				json.RawMessage(`{"session_id":"session_s","project_id":"project_p"} trailing`),
+			},
+		},
+		{
 			name: "rename", validate: validateSessionRenameArguments,
 			valid: json.RawMessage(`{"session_id":"s","display_name":"new name"}`),
 			invalid: []json.RawMessage{
@@ -82,7 +92,7 @@ func TestSessionCommandRegistryIsClosedAndFlagsAreExplicit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantNames := []string{"run.cancel", "session.archive", "session.mark_read", "session.rename", "session.restore", "session.set_debug", "session.set_full_access"}
+	wantNames := []string{"run.cancel", "session.archive", "session.create", "session.mark_read", "session.rename", "session.restore", "session.set_debug", "session.set_full_access"}
 	if got := registry.Names(); !reflect.DeepEqual(got, wantNames) {
 		t.Fatalf("registry names=%v, want %v", got, wantNames)
 	}

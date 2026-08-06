@@ -125,6 +125,103 @@ func TestSessionCommandsMutateServiceAndProjectThroughWebSocket(t *testing.T) {
 	// reading the command stream; no local summary was patched by the command.
 }
 
+func TestSessionCreateCommandIsDurableAndProjectsOnlyThroughSessionIndex(t *testing.T) {
+	server, service, _ := newWebTestAppServerWithRunner(t, webTestRunner{})
+	project, err := service.CreateProject(t.TempDir(), "Create command project")
+	if err != nil {
+		t.Fatal(err)
+	}
+	connection := dialWebApp(t, server.URL, issueWebSocketTicket(t, server.URL), "http://"+strings.TrimPrefix(server.URL, "http://"))
+	defer connection.Close(websocket.StatusNormalClosure, "done")
+	writeWebAppHello(t, connection)
+	if _, ok := readWebAppMessage(t, connection).(protocol.WelcomeMessage); !ok {
+		t.Fatal("welcome missing")
+	}
+	writeIndexSubscribe(t, connection, project.Project.ID, nil)
+	if _, ok := readWebAppMessage(t, connection).(protocol.SubscribedMessage); !ok {
+		t.Fatal("subscribed missing")
+	}
+	if _, ok := readWebAppMessage(t, connection).(protocol.SnapshotMessage); !ok {
+		t.Fatal("snapshot missing")
+	}
+
+	sessionID := "session-ws-durable-create"
+	arguments := json.RawMessage(`{"session_id":"` + sessionID + `","project_id":"` + project.Project.ID + `","display_name":"Created from command"}`)
+	queuedChanges := make([]protocol.ChangeMessage, 0, 1)
+	send := func(requestID string, args json.RawMessage) protocol.CommandResultMessage {
+		t.Helper()
+		message := protocol.CommandMessage{
+			Envelope: protocol.Envelope{Version: 1, Type: protocol.MessageTypeCommand, ID: "command-" + requestID},
+			Payload:  protocol.CommandPayload{Name: "session.create", SchemaVersion: 1, RequestID: requestID, Arguments: args},
+		}
+		payload, err := protocol.EncodeMessage(message)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := connection.Write(context.Background(), websocket.MessageText, payload); err != nil {
+			t.Fatal(err)
+		}
+		var result protocol.CommandResultMessage
+		for {
+			value := readWebAppMessage(t, connection)
+			if change, ok := value.(protocol.ChangeMessage); ok {
+				queuedChanges = append(queuedChanges, change)
+				continue
+			}
+			if candidate, ok := value.(protocol.CommandResultMessage); ok && candidate.Payload.RequestID == requestID {
+				result = candidate
+				break
+			}
+		}
+		return result
+	}
+	first := send("create-request-1", arguments)
+	if first.Payload.Status != protocol.CommandStatusSucceeded || first.Payload.Error != nil {
+		t.Fatalf("first create result=%#v", first)
+	}
+	var change protocol.ChangeMessage
+	if len(queuedChanges) > 0 {
+		change = queuedChanges[0]
+	} else {
+		change = readIndexChange(t, connection)
+	}
+	summary := decodeIndexSummary(t, change)
+	if summary.SessionID != sessionID || summary.ProjectID != project.Project.ID {
+		t.Fatalf("created index summary=%#v", summary)
+	}
+	stored, err := service.SessionStore().LoadState(sessionID)
+	if err != nil || stored.DisplayName != "Created from command" || stored.Provider == "" || stored.ModelProfile == "" || stored.ModelID == "" {
+		t.Fatalf("created durable state=%#v err=%v", stored, err)
+	}
+
+	// A different request id is a new gateway/cache entry, so this exercises
+	// the durable store claim rather than the epoch-local request cache.
+	retry := send("create-request-2", arguments)
+	if retry.Payload.Status != protocol.CommandStatusSucceeded || retry.Payload.Error != nil {
+		t.Fatalf("durable retry result=%#v", retry)
+	}
+	var result map[string]any
+	if err := json.Unmarshal(retry.Payload.Result, &result); err != nil {
+		t.Fatal(err)
+	}
+	if result["session_id"] != sessionID || result["project_id"] != project.Project.ID {
+		t.Fatalf("retry result=%#v", result)
+	}
+	childID := "session-ws-inherited-create"
+	child := send("create-request-child", json.RawMessage(`{"session_id":"`+childID+`","project_id":"`+project.Project.ID+`","parent_session_id":"`+sessionID+`","display_name":"Inherited child"}`))
+	if child.Payload.Status != protocol.CommandStatusSucceeded || child.Payload.Error != nil {
+		t.Fatalf("inherited create result=%#v", child)
+	}
+	childState, err := service.SessionStore().LoadState(childID)
+	if err != nil || childState.ParentSessionID != sessionID || childState.RootSessionID != sessionID || childState.CreatedBy != "agent" {
+		t.Fatalf("inherited durable state=%#v err=%v", childState, err)
+	}
+	conflict := send("create-request-3", json.RawMessage(`{"session_id":"`+sessionID+`","project_id":"`+project.Project.ID+`","display_name":"Different"}`))
+	if conflict.Payload.Status != protocol.CommandStatusFailed || conflict.Payload.Error == nil || conflict.Payload.Error.Code != "idempotency_conflict" {
+		t.Fatalf("different create parameters result=%#v", conflict)
+	}
+}
+
 func TestRunCancelCommandCancelsActiveRun(t *testing.T) {
 	server, service, app := newWebTestAppServerWithRunner(t, blockingWebTestRunner{})
 	project, err := service.CreateProject(t.TempDir(), "Run command project")

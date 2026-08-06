@@ -7,6 +7,8 @@ import type {
   SessionFullAccessResult,
   SessionMarkReadResult,
   SessionRenameResult,
+  SessionCreateOptions,
+  SessionCreateResult,
 } from '../commands/sessionCommands'
 import type { RunCancelResult, RunCommands, RunStatus } from '../commands/runCommands'
 import { SyncReadError } from './errors'
@@ -49,7 +51,9 @@ export interface CommandFacadeOptions {
   timeoutMS?: number
   maxPendingCommands?: number
   maxRecentRequestIDs?: number
+  maxRecentEntityIDs?: number
   requestIDGenerator?: () => string
+  sessionIDGenerator?: () => string
   setTimeout?: (handler: () => void, timeout: number) => ReturnType<typeof globalThis.setTimeout>
   clearTimeout?: (handle: ReturnType<typeof globalThis.setTimeout>) => void
 }
@@ -58,6 +62,12 @@ function defaultRequestID(): string {
   const randomUUID = globalThis.crypto?.randomUUID?.bind(globalThis.crypto)
   if (!randomUUID) throw new Error('cryptographic request ID generation is unavailable')
   return `request_${randomUUID()}`
+}
+
+function defaultSessionID(): string {
+  const randomUUID = globalThis.crypto?.randomUUID?.bind(globalThis.crypto)
+  if (!randomUUID) throw new Error('cryptographic session ID generation is unavailable')
+  return `session_${randomUUID()}`
 }
 
 function errorFromCommand(code: string, message: string, details?: unknown): CommandFacadeError {
@@ -124,6 +134,14 @@ function decodeDebugResult(value: unknown, sessionID: string, requestBodies: boo
   return { session_id: resultSessionID, request_bodies: requestBodies }
 }
 
+function decodeCreateResult(value: unknown, sessionID: string, projectID: string): SessionCreateResult {
+  const object = exactObject(value, ['session_id', 'project_id'])
+  const resultSessionID = resultString(object, 'session_id')
+  const resultProjectID = resultString(object, 'project_id')
+  if (resultSessionID !== sessionID || resultProjectID !== projectID) throw new Error('result identity does not match request')
+  return { session_id: resultSessionID, project_id: resultProjectID }
+}
+
 function decodeRunCancelResult(value: unknown, runID: string): RunCancelResult {
   const object = exactObject(value, ['run_id', 'status'])
   const resultRunID = resultString(object, 'run_id')
@@ -143,12 +161,16 @@ export class CommandFacade implements SessionCommands, RunCommands {
   private readonly timeoutMS: number
   private readonly maxPendingCommands: number
   private readonly maxRecentRequestIDs: number
+  private readonly maxRecentEntityIDs: number
   private readonly requestIDGenerator: () => string
+  private readonly sessionIDGenerator: () => string
   private readonly setTimer: NonNullable<CommandFacadeOptions['setTimeout']>
   private readonly clearTimer: NonNullable<CommandFacadeOptions['clearTimeout']>
   private pending = new Map<string, PendingCommand<unknown>>()
   private recentRequestIDs = new Set<string>()
   private recentRequestIDOrder: string[] = []
+  private recentEntityIDs = new Set<string>()
+  private recentEntityIDOrder: string[] = []
   private detach: (() => void)[] = []
   private started = false
 
@@ -157,10 +179,12 @@ export class CommandFacade implements SessionCommands, RunCommands {
     this.timeoutMS = options.timeoutMS ?? 10_000
     this.maxPendingCommands = options.maxPendingCommands ?? 128
     this.maxRecentRequestIDs = options.maxRecentRequestIDs ?? 256
+    this.maxRecentEntityIDs = options.maxRecentEntityIDs ?? 256
     this.requestIDGenerator = options.requestIDGenerator ?? defaultRequestID
+    this.sessionIDGenerator = options.sessionIDGenerator ?? defaultSessionID
     this.setTimer = options.setTimeout ?? ((handler, timeout) => globalThis.setTimeout(handler, timeout))
     this.clearTimer = options.clearTimeout ?? ((handle) => globalThis.clearTimeout(handle))
-    if (this.timeoutMS <= 0 || this.maxPendingCommands <= 0 || this.maxRecentRequestIDs <= 0) throw new Error('command bounds must be positive')
+    if (this.timeoutMS <= 0 || this.maxPendingCommands <= 0 || this.maxRecentRequestIDs <= 0 || this.maxRecentEntityIDs <= 0) throw new Error('command bounds must be positive')
   }
 
   start(): void {
@@ -178,6 +202,55 @@ export class CommandFacade implements SessionCommands, RunCommands {
     this.started = false
     for (const detach of this.detach.splice(0)) detach()
     for (const pending of [...this.pending.values()]) this.rejectPending(pending, new CommandFacadeError('stopped', 'command facade stopped'))
+  }
+
+  create(projectID: string, options: SessionCreateOptions = {}, commandOptions: CommandOptions = {}): Promise<SessionCreateResult> {
+    const cleanProjectID = this.cleanID(projectID)
+    if (!cleanProjectID || cleanProjectID.length > 128 || !/^[A-Za-z0-9_.-]+$/.test(cleanProjectID) || cleanProjectID === '.' || cleanProjectID === '..') return Promise.reject(new CommandFacadeError('invalid', 'project_id is invalid'))
+
+    const explicitSessionID = options.sessionID !== undefined
+    let sessionID: string
+    if (explicitSessionID) {
+      // A caller-owned entity ID is the durable idempotency key. It is
+      // intentionally not checked against the local recent-ID cache: after a
+      // timeout, reload, or epoch change the same ID must reach the server so
+      // the durable claim can return the original result or a conflict.
+      if (typeof options.sessionID !== 'string') return Promise.reject(new CommandFacadeError('invalid', 'session_id is invalid'))
+      sessionID = this.cleanID(options.sessionID)
+      if (!this.validSessionID(sessionID)) return Promise.reject(new CommandFacadeError('invalid', 'session_id is invalid'))
+    } else {
+      try {
+        sessionID = this.cleanID(this.sessionIDGenerator())
+        if (!this.validSessionID(sessionID)) throw new Error('session ID is invalid')
+      } catch {
+        return Promise.reject(new CommandFacadeError('id_generation', 'cryptographic session ID generation failed'))
+      }
+      if (this.recentEntityIDs.has(sessionID)) return Promise.reject(new CommandFacadeError('id_generation', 'session ID collided with an active or recently used create command', { collision: true }))
+    }
+
+    const args: JsonObject = { session_id: sessionID, project_id: cleanProjectID }
+    const strings: Array<[keyof SessionCreateOptions, string]> = [
+      ['displayName', 'display_name'],
+      ['parentSessionID', 'parent_session_id'],
+      ['cwd', 'cwd'],
+      ['configPath', 'config_path'],
+      ['provider', 'provider'],
+      ['modelProfile', 'model_profile'],
+      ['reasoningLevel', 'reasoning_level'],
+    ]
+    for (const [source, wire] of strings) {
+      const value = options[source]
+      if (value !== undefined) {
+        if (typeof value !== 'string' || !value.trim() || value.length > 4096) return Promise.reject(new CommandFacadeError('invalid', `${wire} is invalid`))
+        args[wire] = value.trim()
+      }
+    }
+    if (options.fullAccess !== undefined) {
+      if (typeof options.fullAccess !== 'boolean') return Promise.reject(new CommandFacadeError('invalid', 'full_access is invalid'))
+      args.full_access = options.fullAccess
+    }
+    this.rememberEntityID(sessionID)
+    return this.submit('session.create', args, true, (value) => decodeCreateResult(value, sessionID, cleanProjectID), commandOptions)
   }
 
   markRead(sessionID: string, runID: string, projectID?: string, options: CommandOptions = {}): Promise<SessionMarkReadResult> {
@@ -233,6 +306,15 @@ export class CommandFacade implements SessionCommands, RunCommands {
     return typeof value === 'string' ? value.trim() : ''
   }
 
+  private validSessionID(value: string): boolean {
+    if (value.length === 0 || value.length > 128 || !/^[A-Za-z0-9_.-]+$/.test(value) || value === '.' || value === '..') return false
+    // Keep this client-side boundary byte-for-byte aligned with Go's
+    // ValidateSessionCreateID: path-safe IDs whose trailing dots/spaces are
+    // removed are compared case-insensitively against reserved directories.
+    const reservedKey = value.replace(/[. ]+$/g, '').toLowerCase()
+    return reservedKey !== 'blobs' && reservedKey !== '.session-claims'
+  }
+
   private submit<T>(name: string, args: JsonObject, crossEpochRetrySafe: boolean, decodeResult: (value: unknown) => T, options: CommandOptions): Promise<T> {
     if (this.pending.size >= this.maxPendingCommands) return Promise.reject(new CommandFacadeError('capacity', 'too many pending commands'))
     let id: string
@@ -277,6 +359,16 @@ export class CommandFacade implements SessionCommands, RunCommands {
     while (this.recentRequestIDOrder.length > this.maxRecentRequestIDs) {
       const retired = this.recentRequestIDOrder.shift()
       if (retired !== undefined) this.recentRequestIDs.delete(retired)
+    }
+  }
+
+  private rememberEntityID(id: string): void {
+    if (this.recentEntityIDs.has(id)) return
+    this.recentEntityIDs.add(id)
+    this.recentEntityIDOrder.push(id)
+    while (this.recentEntityIDOrder.length > this.maxRecentEntityIDs) {
+      const retired = this.recentEntityIDOrder.shift()
+      if (retired !== undefined) this.recentEntityIDs.delete(retired)
     }
   }
 
