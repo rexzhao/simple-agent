@@ -202,7 +202,7 @@ func (s *V2Store) GetRun(sessionID, runID string) (RunRecord, error) {
 	defer db.Close()
 	var run RunRecord
 	var started, settled string
-	if err := db.QueryRow(`SELECT id, previous_run_id, status, input_payload, started_at, settled_at FROM runs WHERE id = ?`, runID).Scan(&run.ID, &run.PreviousRunID, &run.Status, &run.InputPayload, &started, &settled); err != nil {
+	if err := db.QueryRow(`SELECT id, previous_run_id, status, input_payload, input_fingerprint, started_at, settled_at FROM runs WHERE id = ?`, runID).Scan(&run.ID, &run.PreviousRunID, &run.Status, &run.InputPayload, &run.InputFingerprint, &started, &settled); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return RunRecord{}, fmt.Errorf("%w: run %s", ErrNotFound, runID)
 		}

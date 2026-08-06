@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/rexzhao/simple-agent/internal/commands"
 	"github.com/rexzhao/simple-agent/internal/execution"
@@ -54,6 +55,12 @@ type sessionCreateArguments struct {
 
 type runCancelArguments struct {
 	RunID string
+}
+
+type runStartArguments struct {
+	SessionID string
+	RunID     string
+	Content   string
 }
 
 type sessionRenameResult struct {
@@ -125,6 +132,25 @@ func normalizedSessionCreateFingerprint(request commands.CommandRequest, argumen
 type runCancelResult struct {
 	RunID  string `json:"run_id"`
 	Status string `json:"status"`
+}
+
+type runStartResult struct {
+	SessionID string `json:"session_id"`
+	RunID     string `json:"run_id"`
+	Status    string `json:"status"`
+}
+
+func runStartFingerprint(request commands.CommandRequest, arguments runStartArguments) (string, error) {
+	fingerprintArgs, err := json.Marshal(map[string]string{
+		"session_id": arguments.SessionID,
+		"content":    arguments.Content,
+	})
+	if err != nil {
+		return "", err
+	}
+	fingerprintRequest := request
+	fingerprintRequest.Arguments = fingerprintArgs
+	return commands.Fingerprint(fingerprintRequest)
 }
 
 // strictCommandObject parses one JSON object, rejects duplicate keys and
@@ -203,6 +229,28 @@ func requiredCommandString(fields map[string]json.RawMessage, name, command stri
 	return value, nil
 }
 
+// requiredRunStartContent is deliberately not implemented in terms of
+// requiredCommandString. Content is user data whose exact string value is
+// part of the durable run fingerprint; unlike IDs, leading/trailing
+// whitespace must survive decoding unchanged.
+func requiredRunStartContent(fields map[string]json.RawMessage, command string, maxBytes int) (string, error) {
+	raw, ok := fields["content"]
+	if !ok || strings.TrimSpace(string(raw)) == "null" {
+		return "", fmt.Errorf("invalid %s arguments", command)
+	}
+	if !utf8.Valid(raw) {
+		return "", fmt.Errorf("invalid %s arguments", command)
+	}
+	var value string
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return "", fmt.Errorf("invalid %s arguments", command)
+	}
+	if strings.TrimSpace(value) == "" || len(value) > maxBytes {
+		return "", fmt.Errorf("invalid %s arguments", command)
+	}
+	return value, nil
+}
+
 func optionalCommandString(fields map[string]json.RawMessage, name, command string) (*string, error) {
 	raw, ok := fields[name]
 	if !ok {
@@ -243,6 +291,13 @@ func optionalCommandBool(fields map[string]json.RawMessage, name, command string
 }
 
 const maxSessionCreateArgumentBytes = 4096
+
+// run.start is intentionally a bounded text-only clean-break contract. The
+// existing REST endpoint retains its image/data-URL support; WebSocket
+// command frames do not carry blob bytes until a separate blob upload
+// contract is specified. Unknown image/blob/content-block fields are rejected
+// rather than silently dropped.
+const maxRunStartContentBytes = 256 * 1024
 
 func boundedCommandString(fields map[string]json.RawMessage, name, command string, maxBytes int) (*string, error) {
 	value, err := optionalCommandString(fields, name, command)
@@ -441,6 +496,30 @@ func decodeRunCancelArguments(raw json.RawMessage) (runCancelArguments, error) {
 	return runCancelArguments{RunID: runID}, nil
 }
 
+func decodeRunStartArguments(raw json.RawMessage) (runStartArguments, error) {
+	const command = "run.start"
+	fields, err := strictCommandObject(raw, command)
+	if err != nil {
+		return runStartArguments{}, err
+	}
+	if err := requireExactFields(fields, command, "session_id", "run_id", "content"); err != nil {
+		return runStartArguments{}, err
+	}
+	sessionID, err := requiredCommandString(fields, "session_id", command)
+	if err != nil || sessions.ValidateSessionID(sessionID) != nil {
+		return runStartArguments{}, fmt.Errorf("invalid %s arguments", command)
+	}
+	runID, err := requiredCommandString(fields, "run_id", command)
+	if err != nil || sessions.ValidateRunID(runID) != nil {
+		return runStartArguments{}, fmt.Errorf("invalid %s arguments", command)
+	}
+	content, err := requiredRunStartContent(fields, command, maxRunStartContentBytes)
+	if err != nil {
+		return runStartArguments{}, fmt.Errorf("invalid %s arguments", command)
+	}
+	return runStartArguments{SessionID: sessionID, RunID: runID, Content: content}, nil
+}
+
 func validateSessionMarkReadArguments(raw json.RawMessage) error {
 	_, err := decodeSessionMarkReadArguments(raw)
 	return err
@@ -476,6 +555,11 @@ func validateRunCancelArguments(raw json.RawMessage) error {
 	return err
 }
 
+func validateRunStartArguments(raw json.RawMessage) error {
+	_, err := decodeRunStartArguments(raw)
+	return err
+}
+
 func sessionCommandError(err error) error {
 	if err == nil {
 		return nil
@@ -483,6 +567,8 @@ func sessionCommandError(err error) error {
 	switch {
 	case errors.Is(err, sessions.ErrNotFound):
 		return commands.NewDomainError("not_found", "session not found", err)
+	case errors.Is(err, execution.ErrSessionRunCoordinatorCapacity):
+		return commands.NewDomainError("capacity", "too many runs are currently active", err)
 	case errors.Is(err, execution.ErrSessionBusy):
 		return commands.NewDomainError("session_busy", "session is busy", err)
 	case errors.Is(err, context.Canceled):
@@ -490,7 +576,7 @@ func sessionCommandError(err error) error {
 	case errors.Is(err, execution.ErrSessionArchived):
 		return commands.NewDomainError("session_archived", "session is archived", err)
 	case errors.Is(err, sessions.ErrIdempotencyConflict):
-		return commands.NewDomainError("idempotency_conflict", "session create identity conflicts with an existing operation", err)
+		return commands.NewDomainError("idempotency_conflict", "client identity conflicts with an existing durable operation", err)
 	default:
 		return commands.NewDomainError("command_failed", "command execution failed", err)
 	}
@@ -498,6 +584,28 @@ func sessionCommandError(err error) error {
 
 func newSessionCommandRegistry(service *execution.Service, runs *runRegistry) (*commands.Registry, error) {
 	return commands.NewRegistry(
+		commands.CommandDefinition{
+			Name: "run.start", SchemaVersion: 1, CrossEpochRetrySafe: true,
+			Validate: validateRunStartArguments,
+			Execute: func(ctx context.Context, request commands.CommandRequest) (json.RawMessage, error) {
+				arguments, err := decodeRunStartArguments(request.Arguments)
+				if err != nil {
+					return nil, err
+				}
+				fingerprint, err := runStartFingerprint(request, arguments)
+				if err != nil {
+					return nil, commands.NewDomainError("invalid_fingerprint", "command fingerprint is invalid", err)
+				}
+				if runs == nil {
+					return nil, commands.NewDomainError("run_unavailable", "run execution is not configured", nil)
+				}
+				status, err := runs.startDurable(arguments.SessionID, arguments.Content, arguments.RunID, fingerprint)
+				if err != nil {
+					return nil, sessionCommandError(err)
+				}
+				return json.Marshal(runStartResult{SessionID: arguments.SessionID, RunID: arguments.RunID, Status: status})
+			},
+		},
 		commands.CommandDefinition{
 			Name: "session.create", SchemaVersion: 1, CrossEpochRetrySafe: true,
 			// The create primitive is durable at the session store. Expected

@@ -3,14 +3,116 @@ package webapp
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/coder/websocket"
 	"github.com/rexzhao/simple-agent/internal/execution"
 	"github.com/rexzhao/simple-agent/internal/protocol"
+	"github.com/rexzhao/simple-agent/internal/sessions"
 )
+
+type countingDurableWebRunner struct {
+	starts atomic.Int32
+}
+
+func (*countingDurableWebRunner) SupportsIncrementalSessionTurn(context.Context, execution.SessionTurnRequest) (bool, error) {
+	return true, nil
+}
+
+func (runner *countingDurableWebRunner) RunSessionTurn(context.Context, execution.SessionTurnRequest) (execution.SessionTurnResult, error) {
+	runner.starts.Add(1)
+	return execution.SessionTurnResult{Incremental: true}, nil
+}
+
+func TestDurableRunStartReusesIdentityWithoutStartingAgain(t *testing.T) {
+	_, service, app := newWebTestAppServerWithRunner(t, webTestRunner{})
+	project, err := service.CreateProject(t.TempDir(), "durable run project")
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := service.CreateSession(project.Project.ID, execution.SessionCreateMetadata{Provider: "fake", ModelProfile: "default", ModelID: "model"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := service.CreateSession(project.Project.ID, execution.SessionCreateMetadata{Provider: "fake", ModelProfile: "default", ModelID: "model"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	status, err := app.runs.startDurable(first.ID, "hello", "run-durable-stable", "fingerprint-one")
+	if err != nil || status != string(execution.SessionRunRunning) {
+		t.Fatalf("first durable start status=%q err=%v", status, err)
+	}
+	managed, ok := app.runs.get("run-durable-stable")
+	if !ok {
+		t.Fatal("durable run was not registered in the shared replay adapter")
+	}
+	if _, err := managed.run.Wait(); err != nil {
+		t.Fatalf("durable run wait error=%v", err)
+	}
+
+	retryStatus, err := app.runs.startDurable(first.ID, "hello", "run-durable-stable", "fingerprint-one")
+	if err != nil || retryStatus != string(execution.SessionRunCommitted) {
+		t.Fatalf("durable retry status=%q err=%v", retryStatus, err)
+	}
+	if runs, err := service.SessionStore().ListRuns(first.ID); err != nil || len(runs) != 1 || runs[0].ID != "run-durable-stable" {
+		t.Fatalf("durable run records=%#v err=%v", runs, err)
+	}
+	if _, err := app.runs.startDurable(first.ID, "different", "run-durable-stable", "fingerprint-two"); !errors.Is(err, sessions.ErrIdempotencyConflict) {
+		t.Fatalf("different fingerprint error=%v, want idempotency conflict", err)
+	}
+	if _, err := app.runs.startDurable(second.ID, "hello", "run-durable-stable", "fingerprint-one"); !errors.Is(err, sessions.ErrIdempotencyConflict) {
+		t.Fatalf("cross-session identity error=%v, want idempotency conflict", err)
+	}
+}
+
+func TestDurableRunStartConcurrentSameIdentityExecutesOnce(t *testing.T) {
+	runner := &countingDurableWebRunner{}
+	_, service, app := newWebTestAppServerWithRunner(t, runner)
+	project, err := service.CreateProject(t.TempDir(), "concurrent durable run project")
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := service.CreateSession(project.Project.ID, execution.SessionCreateMetadata{Provider: "fake", ModelProfile: "default", ModelID: "model"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	statuses := make([]string, 2)
+	errs := make([]error, 2)
+	var group sync.WaitGroup
+	for index := range statuses {
+		group.Add(1)
+		go func(index int) {
+			defer group.Done()
+			statuses[index], errs[index] = app.runs.startDurable(session.ID, "same input", "run-concurrent-stable", "fingerprint-concurrent")
+		}(index)
+	}
+	group.Wait()
+	for index, err := range errs {
+		if err != nil {
+			t.Fatalf("concurrent start %d error=%v", index, err)
+		}
+		if statuses[index] != string(execution.SessionRunRunning) && statuses[index] != string(execution.SessionRunCommitted) {
+			t.Fatalf("concurrent start %d status=%q", index, statuses[index])
+		}
+	}
+	managed, ok := app.runs.get("run-concurrent-stable")
+	if !ok {
+		t.Fatal("concurrent durable run was not registered")
+	}
+	if _, err := managed.run.Wait(); err != nil {
+		t.Fatalf("concurrent durable run wait error=%v", err)
+	}
+	if got := runner.starts.Load(); got != 1 {
+		t.Fatalf("model execution count=%d, want one", got)
+	}
+}
 
 func TestSessionCommandsMutateServiceAndProjectThroughWebSocket(t *testing.T) {
 	server, service, _ := newWebTestAppServerWithRunner(t, webTestRunner{})

@@ -1,11 +1,84 @@
 package execution
 
 import (
+	"context"
 	"testing"
 	"time"
 
 	"github.com/rexzhao/simple-agent/internal/sessions"
 )
+
+func TestDurableRunAdmissionRecoveryDoesNotReplayModelWork(t *testing.T) {
+	home := t.TempDir()
+	service, _, session := newExecutionServiceWithSession(t, home, fakeExecutionTurnRunner{supports: true})
+	input := SessionMessageInput{Content: "durable command input"}
+	admission, err := service.AdmitSessionRun(context.Background(), session.ID, input, "run-restart-admitted", "fingerprint-restart")
+	if err != nil || !admission.Created || admission.Status != SessionRunRunning {
+		t.Fatalf("initial durable admission=%#v err=%v", admission, err)
+	}
+	state, err := service.SessionStore().LoadState(session.ID)
+	if err != nil || state.RunningRunID != "run-restart-admitted" {
+		t.Fatalf("admitted state=%#v err=%v", state, err)
+	}
+
+	restarted, err := NewServiceWithOptions(home, ServiceOptions{TurnRunner: fakeExecutionTurnRunner{supports: true}})
+	if err != nil {
+		t.Fatalf("restart service error=%v", err)
+	}
+	retry, err := restarted.AdmitSessionRun(context.Background(), session.ID, input, "run-restart-admitted", "fingerprint-restart")
+	if err != nil || retry.Created || retry.Status != SessionRunInterrupted {
+		t.Fatalf("restart retry=%#v err=%v, want interrupted non-created", retry, err)
+	}
+	runs, err := restarted.SessionStore().ListRuns(session.ID)
+	if err != nil || len(runs) != 1 || runs[0].Status != sessions.RunStatusInterrupted {
+		t.Fatalf("recovered runs=%#v err=%v", runs, err)
+	}
+}
+
+func TestDurableRunAdmissionRebuildsServiceAndCoordinatorWithoutReplay(t *testing.T) {
+	home := t.TempDir()
+	service, _, session := newExecutionServiceWithSession(t, home, fakeExecutionTurnRunner{supports: true})
+	input := SessionMessageInput{Content: "rebuild coordinator input"}
+	admission, err := service.AdmitSessionRun(context.Background(), session.ID, input, "run-rebuild-coordinator", "fingerprint-rebuild")
+	if err != nil || !admission.Created {
+		t.Fatalf("initial admission=%#v err=%v", admission, err)
+	}
+
+	var modelCalls int
+	restarted, err := NewServiceWithOptions(home, ServiceOptions{TurnRunner: fakeExecutionTurnRunner{
+		supports: true,
+		run: func(context.Context, SessionTurnRequest) (SessionTurnResult, error) {
+			modelCalls++
+			return SessionTurnResult{Incremental: true}, nil
+		},
+	}})
+	if err != nil {
+		t.Fatalf("rebuild service error=%v", err)
+	}
+	coordinator := NewSessionRunCoordinator(context.Background(), restarted, SessionRunCoordinatorOptions{DurableAdmitter: restarted})
+	defer coordinator.Close()
+	run, retry, err := coordinator.StartDurable(session.ID, input, "run-rebuild-coordinator", "fingerprint-rebuild", nil)
+	if err != nil || run != nil || retry.Created || retry.Status != SessionRunInterrupted {
+		t.Fatalf("rebuild retry run=%#v admission=%#v err=%v, want interrupted lookup only", run, retry, err)
+	}
+	if modelCalls != 0 {
+		t.Fatalf("restart retry invoked model runner %d times", modelCalls)
+	}
+}
+
+func TestDurableRunAdmissionFailureBeforeClaimCanRetry(t *testing.T) {
+	home := t.TempDir()
+	service, _, session := newExecutionServiceWithSession(t, home, fakeExecutionTurnRunner{supports: false})
+	input := SessionMessageInput{Content: "retry after validation failure"}
+	if _, err := service.AdmitSessionRun(context.Background(), session.ID, input, "run-pre-admission-retry", "fingerprint-pre-admission"); err == nil {
+		t.Fatal("unsupported runner was durably admitted")
+	}
+	service.turnRunner = fakeExecutionTurnRunner{supports: true}
+	admission, err := service.AdmitSessionRun(context.Background(), session.ID, input, "run-pre-admission-retry", "fingerprint-pre-admission")
+	if err != nil || !admission.Created || admission.Status != SessionRunRunning {
+		t.Fatalf("retry admission=%#v err=%v", admission, err)
+	}
+}
 
 func TestNewServiceRecoversRunningSessionBeforeUse(t *testing.T) {
 	home := t.TempDir()

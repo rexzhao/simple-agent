@@ -3,7 +3,10 @@ package webapp
 import (
 	"encoding/json"
 	"reflect"
+	"strings"
 	"testing"
+
+	"github.com/rexzhao/simple-agent/internal/commands"
 )
 
 func TestSessionCommandSchemasAreStrict(t *testing.T) {
@@ -72,6 +75,11 @@ func TestSessionCommandSchemasAreStrict(t *testing.T) {
 			valid:   json.RawMessage(`{"run_id":"run"}`),
 			invalid: []json.RawMessage{json.RawMessage(`{"run_id":""}`), json.RawMessage(`{"run_id":"run","extra":true}`), json.RawMessage(`{"run_id":"run"}{}`)},
 		},
+		{
+			name: "run_start", validate: validateRunStartArguments,
+			valid:   json.RawMessage(`{"session_id":"session","run_id":"run","content":"hello"}`),
+			invalid: []json.RawMessage{json.RawMessage(`{"session_id":"session","run_id":"run","content":""}`), json.RawMessage(`{"session_id":"session","run_id":"run","content":"hello","images":[]}`), json.RawMessage(`{"session_id":"session","run_id":"run","content":"hello"} trailing`), json.RawMessage(`{"session_id":"session","run_id":"run","content":"hello","content":"again"}`), json.RawMessage(`{"session_id":"session","run_id":"run","content":"` + strings.Repeat("x", maxRunStartContentBytes+1) + `"}`)},
+		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -87,12 +95,100 @@ func TestSessionCommandSchemasAreStrict(t *testing.T) {
 	}
 }
 
+func TestRunStartPreservesExactContentAndUsesUTF8ByteLimit(t *testing.T) {
+	exactContent := "  hello\n"
+	raw, err := json.Marshal(map[string]string{
+		"session_id": "session-content-boundary",
+		"run_id":     "run-content-boundary",
+		"content":    exactContent,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	arguments, err := decodeRunStartArguments(raw)
+	if err != nil {
+		t.Fatalf("decodeRunStartArguments() error = %v", err)
+	}
+	if arguments.Content != exactContent {
+		t.Fatalf("decoded content = %q, want exact wire value %q", arguments.Content, exactContent)
+	}
+	roundTrip, err := json.Marshal(arguments.Content)
+	if err != nil || string(roundTrip) != `"  hello\n"` {
+		t.Fatalf("content round trip = %s/%v, want preserved whitespace", roundTrip, err)
+	}
+
+	request := commands.CommandRequest{Name: "run.start", SchemaVersion: 1, Arguments: raw}
+	fingerprint, err := runStartFingerprint(request, arguments)
+	if err != nil {
+		t.Fatalf("runStartFingerprint() error = %v", err)
+	}
+	trimmedRaw, err := json.Marshal(map[string]string{
+		"session_id": "session-content-boundary",
+		"run_id":     "run-content-boundary",
+		"content":    "hello",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	trimmedArguments, err := decodeRunStartArguments(trimmedRaw)
+	if err != nil {
+		t.Fatalf("trimmed decode error = %v", err)
+	}
+	trimmedFingerprint, err := runStartFingerprint(request, trimmedArguments)
+	if err != nil {
+		t.Fatalf("trimmed runStartFingerprint() error = %v", err)
+	}
+	if fingerprint == trimmedFingerprint {
+		t.Fatal("content whitespace was lost from the durable fingerprint")
+	}
+
+	whitespaceOnly, err := json.Marshal(map[string]string{
+		"session_id": "session-content-boundary",
+		"run_id":     "run-content-whitespace",
+		"content":    " \n\t\u2003",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := decodeRunStartArguments(whitespaceOnly); err == nil {
+		t.Fatal("pure whitespace content was accepted")
+	}
+
+	unit := "界"
+	exactBytes := strings.Repeat(unit, maxRunStartContentBytes/len(unit)) + "x"
+	if len(exactBytes) != maxRunStartContentBytes {
+		t.Fatalf("test exact-boundary content bytes = %d, want %d", len(exactBytes), maxRunStartContentBytes)
+	}
+	exactBoundary, err := json.Marshal(map[string]string{
+		"session_id": "session-content-boundary",
+		"run_id":     "run-content-exact-bytes",
+		"content":    exactBytes,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if parsed, err := decodeRunStartArguments(exactBoundary); err != nil || len(parsed.Content) != maxRunStartContentBytes {
+		t.Fatalf("exact UTF-8 byte boundary decode = %d/%v, want accepted %d bytes", len(parsed.Content), err, maxRunStartContentBytes)
+	}
+	overBoundary, err := json.Marshal(map[string]string{
+		"session_id": "session-content-boundary",
+		"run_id":     "run-content-over-bytes",
+		"content":    exactBytes + "x",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := decodeRunStartArguments(overBoundary); err == nil {
+		t.Fatal("content over the UTF-8 byte boundary was accepted")
+	}
+}
+
 func TestSessionCommandRegistryIsClosedAndFlagsAreExplicit(t *testing.T) {
 	registry, err := newSessionCommandRegistry(nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantNames := []string{"run.cancel", "session.archive", "session.create", "session.mark_read", "session.rename", "session.restore", "session.set_debug", "session.set_full_access"}
+	wantNames := []string{"run.cancel", "run.start", "session.archive", "session.create", "session.mark_read", "session.rename", "session.restore", "session.set_debug", "session.set_full_access"}
 	if got := registry.Names(); !reflect.DeepEqual(got, wantNames) {
 		t.Fatalf("registry names=%v, want %v", got, wantNames)
 	}

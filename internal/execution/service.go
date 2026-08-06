@@ -1483,10 +1483,11 @@ func (s *Service) SendSessionMessageWithEvents(ctx context.Context, id, content 
 type SessionRunStatus string
 
 const (
-	SessionRunRunning   SessionRunStatus = "running"
-	SessionRunCommitted SessionRunStatus = "committed"
-	SessionRunFailed    SessionRunStatus = "failed"
-	SessionRunCancelled SessionRunStatus = "cancelled"
+	SessionRunRunning     SessionRunStatus = "running"
+	SessionRunCommitted   SessionRunStatus = "committed"
+	SessionRunFailed      SessionRunStatus = "failed"
+	SessionRunInterrupted SessionRunStatus = "interrupted"
+	SessionRunCancelled   SessionRunStatus = "cancelled"
 )
 
 // SessionRun is the lifecycle handle for an asynchronous session message turn
@@ -1599,27 +1600,36 @@ func (s *Service) ContinueSessionRun(ctx context.Context, id string, emit func(S
 // StartSessionRunWithInput starts a run whose user message can include image
 // input blocks as well as text. Text-only callers should use StartSessionRun.
 func (s *Service) StartSessionRunWithInput(ctx context.Context, id string, input SessionMessageInput, emit func(SessionStreamEvent)) *SessionRun {
-	return s.startSessionRunWithID(ctx, id, input, "", emit)
+	return s.startSessionRunWithID(ctx, id, input, "", false, emit)
 }
 
 // StartSessionRunWithID is used by the coordinator so the in-memory handle and
 // the durable Run row always carry the same ID.
 func (s *Service) StartSessionRunWithID(ctx context.Context, id string, input SessionMessageInput, runID string, emit func(SessionStreamEvent)) *SessionRun {
-	return s.startSessionRunWithID(ctx, id, input, runID, emit)
+	return s.startSessionRunWithID(ctx, id, input, runID, false, emit)
 }
 
-func (s *Service) startSessionRunWithID(ctx context.Context, id string, input SessionMessageInput, runID string, emit func(SessionStreamEvent)) *SessionRun {
+// StartSessionRunWithIDAdmitted starts only after a durable command admission
+// has committed the run row. It is deliberately a separate interface method
+// so ordinary REST/agent starts retain their existing asynchronous row
+// creation path.
+func (s *Service) StartSessionRunWithIDAdmitted(ctx context.Context, id string, input SessionMessageInput, runID string, emit func(SessionStreamEvent)) *SessionRun {
+	return s.startSessionRunWithID(ctx, id, input, runID, true, emit)
+}
+
+func (s *Service) startSessionRunWithID(ctx context.Context, id string, input SessionMessageInput, runID string, admitted bool, emit func(SessionStreamEvent)) *SessionRun {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	runCtx, cancel := context.WithCancel(ctx)
 	run := &SessionRun{
-		cancel:     cancel,
-		done:       make(chan struct{}),
-		runID:      strings.TrimSpace(runID),
-		status:     SessionRunRunning,
-		accepting:  true,
-		toolCancel: agent.NewToolCancellationRegistry(),
+		cancel:            cancel,
+		done:              make(chan struct{}),
+		runID:             strings.TrimSpace(runID),
+		status:            SessionRunRunning,
+		accepting:         true,
+		persistentCreated: admitted,
+		toolCancel:        agent.NewToolCancellationRegistry(),
 	}
 	go func() {
 		defer cancel()
@@ -2267,6 +2277,214 @@ func (s *Service) ValidateContinue(id string) error {
 		return err
 	}
 	return s.validateSessionMessageInput(session, SessionMessageInput{Continue: true})
+}
+
+// LookupSessionRun resolves only an already durable command identity. It does
+// not create a claim, so a not-found result can still be rejected by the
+// coordinator's ordinary active-session/capacity gates before admission.
+func (s *Service) LookupSessionRun(ctx context.Context, id string, _ SessionMessageInput, runID, inputFingerprint string) (DurableRunAdmission, bool, error) {
+	if s == nil || s.sessionStore == nil {
+		return DurableRunAdmission{}, false, fmt.Errorf("execution session store is not configured")
+	}
+	runID = strings.TrimSpace(runID)
+	inputFingerprint = strings.TrimSpace(inputFingerprint)
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := sessions.ValidateRunID(runID); err != nil {
+		return DurableRunAdmission{}, false, err
+	}
+	existing, err := s.sessionStore.GetRun(strings.TrimSpace(id), runID)
+	if err == nil {
+		if existing.InputFingerprint == "" || existing.InputFingerprint != inputFingerprint {
+			return DurableRunAdmission{}, false, fmt.Errorf("%w: run %q", sessions.ErrIdempotencyConflict, runID)
+		}
+		// The session row is authoritative. Claim synchronization is only
+		// lookup-index repair and must not turn a durable retry into failure.
+		_ = s.sessionStore.SetRunClaimStatus(runID, existing.Status, existing.SettledAt)
+		return DurableRunAdmission{Created: false, Status: SessionRunStatus(existing.Status)}, true, nil
+	}
+	if !errors.Is(err, sessions.ErrNotFound) {
+		return DurableRunAdmission{}, false, err
+	}
+	// Wait for another process to finish the claim+session-row boundary. A
+	// claim-only state is ambiguous only after the owner releases this lock.
+	runLock, err := s.sessionStore.AcquireRunAdmissionLock(ctx, runID)
+	if err != nil {
+		return DurableRunAdmission{}, false, err
+	}
+	defer func() { _ = runLock.Release() }()
+	if existing, err := s.sessionStore.GetRun(strings.TrimSpace(id), runID); err == nil {
+		if existing.InputFingerprint == "" || existing.InputFingerprint != inputFingerprint {
+			return DurableRunAdmission{}, false, fmt.Errorf("%w: run %q", sessions.ErrIdempotencyConflict, runID)
+		}
+		_ = s.sessionStore.SetRunClaimStatus(runID, existing.Status, existing.SettledAt)
+		return DurableRunAdmission{Created: false, Status: SessionRunStatus(existing.Status)}, true, nil
+	} else if !errors.Is(err, sessions.ErrNotFound) {
+		return DurableRunAdmission{}, false, err
+	}
+	claim, err := s.sessionStore.GetRunClaim(runID)
+	if errors.Is(err, sessions.ErrNotFound) {
+		return DurableRunAdmission{}, false, nil
+	}
+	if err != nil {
+		return DurableRunAdmission{}, false, err
+	}
+	if claim.SessionID != strings.TrimSpace(id) || claim.InputFingerprint != inputFingerprint {
+		return DurableRunAdmission{}, false, fmt.Errorf("%w: run %q", sessions.ErrIdempotencyConflict, runID)
+	}
+	status := claim.Status
+	if status == sessions.RunStatusRunning {
+		status = sessions.RunStatusInterrupted
+		_ = s.sessionStore.SetRunClaimStatus(runID, status, time.Now().UTC())
+	}
+	return DurableRunAdmission{Created: false, Status: SessionRunStatus(status)}, true, nil
+}
+
+// AdmitSessionRun is the durable command-owned run boundary. It performs all
+// validation which can fail without business side effects, then commits the
+// server-wide run identity claim and the session runs/state/event transaction
+// before returning Created=true. A claim is intentionally written first:
+// crashing after that commit but before the session row exists is resolved as
+// interrupted on the next retry, never replayed.
+func (s *Service) AdmitSessionRun(ctx context.Context, id string, input SessionMessageInput, runID, inputFingerprint string) (DurableRunAdmission, error) {
+	if s == nil || s.sessionStore == nil {
+		return DurableRunAdmission{}, fmt.Errorf("execution session store is not configured")
+	}
+	id = strings.TrimSpace(id)
+	runID = strings.TrimSpace(runID)
+	inputFingerprint = strings.TrimSpace(inputFingerprint)
+	if err := sessions.ValidateRunID(runID); err != nil {
+		return DurableRunAdmission{}, err
+	}
+	if inputFingerprint == "" || len(inputFingerprint) > 128 {
+		return DurableRunAdmission{}, fmt.Errorf("run input fingerprint is invalid")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	payload, err := json.Marshal(input)
+	if err != nil {
+		return DurableRunAdmission{}, err
+	}
+	lockCtx := ctx
+	cancelLock := func() {}
+	if s.sessionWriteLockTimeout > 0 {
+		lockCtx, cancelLock = context.WithTimeout(ctx, s.sessionWriteLockTimeout)
+	}
+	lock, err := s.sessionStore.AcquireSessionWriteLock(lockCtx, id)
+	cancelLock()
+	if err != nil {
+		if errors.Is(err, context.DeadlineExceeded) {
+			return DurableRunAdmission{}, ErrSessionBusy
+		}
+		return DurableRunAdmission{}, err
+	}
+	defer func() { _ = lock.Release() }()
+	runLock, err := s.sessionStore.AcquireRunAdmissionLock(ctx, runID)
+	if err != nil {
+		return DurableRunAdmission{}, err
+	}
+	defer func() { _ = runLock.Release() }()
+
+	// A command retry normally has both a shared claim and a session row. Read
+	// the row first so a legacy REST/agent row with the same ID is never
+	// silently treated as the new command's execution.
+	existing, existingErr := s.sessionStore.GetRun(id, runID)
+	if existingErr == nil {
+		if existing.InputFingerprint == "" || existing.InputFingerprint != inputFingerprint {
+			return DurableRunAdmission{}, fmt.Errorf("%w: run %q", sessions.ErrIdempotencyConflict, runID)
+		}
+		claim, _, claimErr := s.sessionStore.ClaimRunWhileLocked(ctx, id, runID, inputFingerprint, existing.StartedAt)
+		if claimErr != nil {
+			return DurableRunAdmission{}, claimErr
+		}
+		if claim.Status != existing.Status {
+			_ = s.sessionStore.SetRunClaimStatus(runID, existing.Status, existing.SettledAt)
+		}
+		return DurableRunAdmission{Created: false, Status: SessionRunStatus(existing.Status)}, nil
+	}
+	if !errors.Is(existingErr, sessions.ErrNotFound) {
+		return DurableRunAdmission{}, existingErr
+	}
+	session, err := s.sessionStore.LoadExecutionState(id)
+	if err != nil {
+		return DurableRunAdmission{}, err
+	}
+	// Everything below this point is pre-admission validation. In particular,
+	// a settled run is returned above even if the provider is currently
+	// unavailable or the session has since been archived.
+	if effective, err := s.sessionEffectivelyArchived(session); err != nil {
+		return DurableRunAdmission{}, err
+	} else if effective {
+		return DurableRunAdmission{}, ErrSessionArchived
+	}
+	session.ConfigPath = s.ConfigPath()
+	if err := s.validateSessionMessageInput(session, input); err != nil {
+		return DurableRunAdmission{}, err
+	}
+	if !input.Continue && sessionHasActiveRun(session) {
+		return DurableRunAdmission{}, ErrSessionBusy
+	}
+	if s.turnRunner == nil {
+		return DurableRunAdmission{}, ErrTurnRunnerUnavailable
+	}
+	// Capability/incremental support is checked before the claim. A provider
+	// configuration failure at this point is a pre-admission failure and is
+	// therefore safe for the client to retry.
+	if err := s.requireIncrementalSessionTurn(ctx, session, input); err != nil {
+		return DurableRunAdmission{}, err
+	}
+
+	claim, createdClaim, err := s.sessionStore.ClaimRunWhileLocked(ctx, id, runID, inputFingerprint, time.Now().UTC())
+	if err != nil {
+		return DurableRunAdmission{}, err
+	}
+	if !createdClaim {
+		// A claim without a row is the only ambiguous crash boundary. Because
+		// claim commit is the admission point, resolve it to an explicit
+		// interrupted/failed outcome rather than starting model work.
+		recoveredStatus := claim.Status
+		if recoveredStatus == sessions.RunStatusRunning {
+			recoveredStatus = sessions.RunStatusInterrupted
+			_ = s.sessionStore.SetRunClaimStatus(runID, recoveredStatus, time.Now().UTC())
+		}
+		return DurableRunAdmission{Created: false, Status: SessionRunStatus(recoveredStatus)}, nil
+	}
+
+	previous := session.LatestRunID
+	if input.Continue {
+		previous = session.InterruptedRunID
+	}
+	_, err = s.sessionStore.CreateRunWithFingerprint(id, runID, previous, payload, inputFingerprint, claim.StartedAt)
+	if err != nil {
+		// The claim is already durable. Even a known SQLite/session race is
+		// terminalized, not deleted, so a retry cannot turn an uncertain crash
+		// boundary into a second model execution.
+		_ = s.sessionStore.SetRunClaimStatus(runID, sessions.RunStatusFailed, time.Now().UTC())
+		return DurableRunAdmission{Created: false, Status: SessionRunFailed}, nil
+	}
+	// CreateRunWithFingerprint committed run.started and state atomically. The
+	// coordinator may now invoke the goroutine; no model request occurs before
+	// this point.
+	s.publishCommittedRunStarted(id, session.ProjectID, runID)
+	return DurableRunAdmission{Created: true, Status: SessionRunRunning}, nil
+}
+
+// FailAdmittedSessionRun closes the exceptional boundary where durable
+// admission succeeded but the coordinator's low-level starter returned nil.
+// It is never a retry path: the identity remains terminal.
+func (s *Service) FailAdmittedSessionRun(_ context.Context, sessionID, runID string) error {
+	if s == nil || s.sessionStore == nil {
+		return fmt.Errorf("execution session store is not configured")
+	}
+	if _, err := s.sessionStore.SetRunStatus(sessionID, runID, sessions.RunStatusFailed, time.Now().UTC()); err != nil {
+		if errors.Is(err, sessions.ErrNotFound) {
+			return s.sessionStore.SetRunClaimStatus(runID, sessions.RunStatusFailed, time.Now().UTC())
+		}
+		return err
+	}
+	return nil
 }
 
 func (s *Service) validateSessionMessageInput(session sessions.SessionV2, input SessionMessageInput) error {

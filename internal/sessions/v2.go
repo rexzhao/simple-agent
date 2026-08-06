@@ -85,8 +85,9 @@ const (
 )
 
 var (
-	ErrNotFound         = errors.New("session not found")
-	ErrCorruptedSession = errors.New("corrupted session")
+	ErrNotFound              = errors.New("session not found")
+	ErrCorruptedSession      = errors.New("corrupted session")
+	ErrInvalidRunClaimStatus = errors.New("invalid run claim status")
 	// ErrIdempotencyConflict means that a stable create identity has already
 	// been durably claimed by a different normalized operation.
 	ErrIdempotencyConflict = errors.New("session create idempotency conflict")
@@ -118,12 +119,13 @@ type SessionItem struct {
 // resumes durable active history; it never treats InputPayload as a new user
 // message.
 type RunRecord struct {
-	ID            string    `json:"id"`
-	PreviousRunID string    `json:"previous_run_id,omitempty"`
-	Status        string    `json:"status"`
-	InputPayload  []byte    `json:"input_payload,omitempty"`
-	StartedAt     time.Time `json:"started_at"`
-	SettledAt     time.Time `json:"settled_at,omitempty"`
+	ID               string    `json:"id"`
+	PreviousRunID    string    `json:"previous_run_id,omitempty"`
+	Status           string    `json:"status"`
+	InputPayload     []byte    `json:"input_payload,omitempty"`
+	InputFingerprint string    `json:"input_fingerprint,omitempty"`
+	StartedAt        time.Time `json:"started_at"`
+	SettledAt        time.Time `json:"settled_at,omitempty"`
 }
 
 type TurnRecord struct {
@@ -334,6 +336,10 @@ type HistoryPage struct {
 type V2Store struct {
 	root string
 	now  func() time.Time
+	// runClaimStatusWriter is nil in production. Tests use it to inject a
+	// secondary claim-index failure and prove that the session transaction
+	// remains authoritative.
+	runClaimStatusWriter func(string, string, time.Time) error
 
 	mutationMu    sync.RWMutex
 	mutationSinks map[uint64]*mutationSubscription
@@ -563,6 +569,7 @@ CREATE TABLE IF NOT EXISTS runs (
   previous_run_id TEXT NOT NULL DEFAULT '',
   status TEXT NOT NULL,
   input_payload BLOB NOT NULL DEFAULT X'',
+  input_fingerprint TEXT NOT NULL DEFAULT '',
   started_at TEXT NOT NULL,
   settled_at TEXT NOT NULL DEFAULT ''
 );
@@ -1208,6 +1215,9 @@ func (s *V2Store) Delete(id string) error {
 		}
 		return err
 	}
+	if err := s.reconcileRunClaimsForSession(id); err != nil {
+		return err
+	}
 	// Install the non-removable identity claim before deleting the removable
 	// business directory. The claim directory is outside sessionDir and the
 	// same stable lock is used by create, so a crash cannot expose a deleted ID
@@ -1274,12 +1284,26 @@ func (s *V2Store) MarkRead(sessionID, runID string) (SessionV2, bool, error) {
 
 // CreateRun records the run and its active state in the same transaction as
 // the run.started event. previousRunID is resolved by the execution layer for
-// normal messages and is the interrupted run for Continue.
+// normal messages and is the interrupted run for Continue. The legacy
+// signature intentionally keeps an empty fingerprint; durable command starts
+// use CreateRunWithFingerprint below.
 func (s *V2Store) CreateRun(sessionID, runID, previousRunID string, inputPayload []byte, startedAt time.Time) (RunRecord, error) {
+	return s.CreateRunWithFingerprint(sessionID, runID, previousRunID, inputPayload, "", startedAt)
+}
+
+// CreateRunWithFingerprint is the durable run admission record used by
+// idempotent command starts. The fingerprint is committed with the run row,
+// state row, and run.started event. An empty fingerprint is retained for
+// compatibility with old REST/agent-created rows.
+func (s *V2Store) CreateRunWithFingerprint(sessionID, runID, previousRunID string, inputPayload []byte, inputFingerprint string, startedAt time.Time) (RunRecord, error) {
 	runID = strings.TrimSpace(runID)
 	previousRunID = strings.TrimSpace(previousRunID)
+	inputFingerprint = strings.TrimSpace(inputFingerprint)
 	if runID == "" {
 		return RunRecord{}, fmt.Errorf("run id is required")
+	}
+	if len(inputFingerprint) > 128 {
+		return RunRecord{}, fmt.Errorf("run input fingerprint is too long")
 	}
 	if startedAt.IsZero() {
 		startedAt = s.now().UTC()
@@ -1317,7 +1341,7 @@ func (s *V2Store) CreateRun(sessionID, runID, previousRunID string, inputPayload
 		}
 	}
 	startedAt = startedAt.UTC()
-	if _, err := tx.Exec(`INSERT INTO runs(id, previous_run_id, status, input_payload, started_at, settled_at) VALUES(?, ?, ?, ?, ?, '')`, runID, previousRunID, RunStatusRunning, inputPayload, startedAt.Format(time.RFC3339Nano)); err != nil {
+	if _, err := tx.Exec(`INSERT INTO runs(id, previous_run_id, status, input_payload, input_fingerprint, started_at, settled_at) VALUES(?, ?, ?, ?, ?, ?, '')`, runID, previousRunID, RunStatusRunning, inputPayload, inputFingerprint, startedAt.Format(time.RFC3339Nano)); err != nil {
 		return RunRecord{}, fmt.Errorf("insert run %q: %w", runID, err)
 	}
 	state.CurrentRunID = runID
@@ -1354,7 +1378,7 @@ func (s *V2Store) CreateRun(sessionID, runID, previousRunID string, inputPayload
 		return RunRecord{}, fmt.Errorf("commit run creation: %w", err)
 	}
 	s.publishMutation(Mutation{SessionID: state.ID, ProjectID: state.ProjectID, Revision: state.LastSeq})
-	return RunRecord{ID: runID, PreviousRunID: previousRunID, Status: RunStatusRunning, InputPayload: append([]byte(nil), inputPayload...), StartedAt: startedAt}, nil
+	return RunRecord{ID: runID, PreviousRunID: previousRunID, Status: RunStatusRunning, InputPayload: append([]byte(nil), inputPayload...), InputFingerprint: inputFingerprint, StartedAt: startedAt}, nil
 }
 
 // StartTurn creates one model request/response turn under a durable run. An
@@ -1655,6 +1679,14 @@ func (s *V2Store) SetRunStatus(sessionID, runID, status string, settledAt time.T
 		return SessionV2{}, err
 	}
 	s.publishMutation(Mutation{SessionID: state.ID, ProjectID: state.ProjectID, Revision: state.LastSeq})
+	// The per-session transaction is the lifecycle authority. The shared claim
+	// is a lookup/index boundary, so update it only after the authoritative
+	// commit has succeeded. Legacy REST runs simply have no claim row. A
+	// secondary index failure must not turn the already-committed lifecycle
+	// transition into an execution error; LookupRunClaim later repairs it.
+	if ValidateRunID(runID) == nil {
+		_ = s.SetRunClaimStatus(runID, status, settledAt.UTC())
+	}
 	return state, nil
 }
 
@@ -1706,7 +1738,7 @@ func (s *V2Store) ListRuns(sessionID string) ([]RunRecord, error) {
 		return nil, err
 	}
 	defer db.Close()
-	rows, err := db.Query(`SELECT id, previous_run_id, status, input_payload, started_at, settled_at FROM runs ORDER BY started_at, id`)
+	rows, err := db.Query(`SELECT id, previous_run_id, status, input_payload, input_fingerprint, started_at, settled_at FROM runs ORDER BY started_at, id`)
 	if err != nil {
 		return nil, err
 	}
@@ -1715,7 +1747,7 @@ func (s *V2Store) ListRuns(sessionID string) ([]RunRecord, error) {
 	for rows.Next() {
 		var r RunRecord
 		var started, settled string
-		if err := rows.Scan(&r.ID, &r.PreviousRunID, &r.Status, &r.InputPayload, &started, &settled); err != nil {
+		if err := rows.Scan(&r.ID, &r.PreviousRunID, &r.Status, &r.InputPayload, &r.InputFingerprint, &started, &settled); err != nil {
 			return nil, err
 		}
 		r.StartedAt, err = time.Parse(time.RFC3339Nano, started)
@@ -2072,6 +2104,9 @@ func (s *V2Store) recoverRunningSession(sessionID string) (SessionV2, error) {
 		return SessionV2{}, err
 	}
 	s.publishMutation(Mutation{SessionID: state.ID, ProjectID: state.ProjectID, Revision: state.LastSeq})
+	if runID != "" && ValidateRunID(runID) == nil {
+		_ = s.SetRunClaimStatus(runID, RunStatusInterrupted, now)
+	}
 	return state, nil
 }
 
@@ -2951,6 +2986,14 @@ func (s *V2Store) openSessionDB(id string, create bool) (*sql.DB, error) {
 			return nil, fmt.Errorf("prepare session create schema %q: %w", id, err)
 		}
 	}
+	// Run fingerprints were added after the first durable run schema. Unlike
+	// the session-create claim, a run can be read during startup recovery before
+	// any create=true open, so make this tiny additive migration available to
+	// both read and write opens. It never rewrites business data.
+	if err := ensureRunInputFingerprintColumn(db); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("prepare run schema %q: %w", id, err)
+	}
 	return db, nil
 }
 
@@ -2980,6 +3023,43 @@ func ensureCreateFingerprintColumn(db *sql.DB) error {
 		return nil
 	}
 	_, err = db.Exec(`ALTER TABLE state ADD COLUMN create_fingerprint TEXT NOT NULL DEFAULT ''`)
+	return err
+}
+
+func ensureRunInputFingerprintColumn(db *sql.DB) error {
+	rows, err := db.Query(`PRAGMA table_info(runs)`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	found := false
+	hasRunsTable := false
+	for rows.Next() {
+		var cid int
+		var name, columnType string
+		var notNull, primaryKey int
+		var defaultValue any
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &primaryKey); err != nil {
+			return err
+		}
+		hasRunsTable = true
+		if name == "input_fingerprint" {
+			found = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	// A few tests and old read-only metadata directories intentionally contain
+	// only the state table. Read setup must not create or repair the rest of the
+	// schema; the normal create path initializes it when a run is first used.
+	if !hasRunsTable {
+		return nil
+	}
+	if found {
+		return nil
+	}
+	_, err = db.Exec(`ALTER TABLE runs ADD COLUMN input_fingerprint TEXT NOT NULL DEFAULT ''`)
 	return err
 }
 

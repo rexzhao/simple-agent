@@ -12,6 +12,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/rexzhao/simple-agent/internal/sessions"
 )
 
 const defaultMaxConcurrentSessionRuns = 8
@@ -46,6 +48,30 @@ type SessionRunStarterWithID interface {
 	StartSessionRunWithID(ctx context.Context, sessionID string, input SessionMessageInput, runID string, emit func(SessionStreamEvent)) *SessionRun
 }
 
+// SessionRunStarterWithIDAdmitted is used only after a durable command-owned
+// run row has been committed. It prevents the asynchronous service path from
+// attempting to create the same durable run a second time.
+type SessionRunStarterWithIDAdmitted interface {
+	StartSessionRunWithIDAdmitted(ctx context.Context, sessionID string, input SessionMessageInput, runID string, emit func(SessionStreamEvent)) *SessionRun
+}
+
+// DurableRunAdmission is the result of the durable run identity claim. A
+// false Created result is an idempotent lookup of an already admitted or
+// terminal run; the coordinator must not invoke a model starter for it.
+type DurableRunAdmission struct {
+	Created bool
+	Status  SessionRunStatus
+}
+
+// SessionRunDurableAdmitter is the store-backed admission boundary for
+// high-risk command starts. Implementations must make the identity claim and
+// lifecycle record durable before returning Created=true.
+type SessionRunDurableAdmitter interface {
+	LookupSessionRun(ctx context.Context, sessionID string, input SessionMessageInput, runID, inputFingerprint string) (DurableRunAdmission, bool, error)
+	AdmitSessionRun(ctx context.Context, sessionID string, input SessionMessageInput, runID, inputFingerprint string) (DurableRunAdmission, error)
+	FailAdmittedSessionRun(ctx context.Context, sessionID, runID string) error
+}
+
 // SessionRunCoordinatorOptions controls application-wide run admission.
 type SessionRunCoordinatorOptions struct {
 	MaxConcurrentRuns int
@@ -58,6 +84,10 @@ type SessionRunCoordinatorOptions struct {
 	ObserverQueueBytes    int
 	Now                   func() time.Time
 	NewRunID              func() (string, error)
+	// DurableAdmitter is intentionally opt-in. Existing REST/agent starts keep
+	// their established asynchronous admission path; run.start supplies this
+	// adapter and uses StartDurable below.
+	DurableAdmitter SessionRunDurableAdmitter
 	// OnRunAdmitted is called after the coordinator reserves the run and
 	// before the starter is allowed to execute it. Presentation adapters use
 	// this phase to register a run-local replay buffer before the first event
@@ -149,7 +179,12 @@ type SessionRunCoordinator struct {
 	closeDone       chan struct{}
 	byID            map[string]*CoordinatedSessionRun
 	activeBySession map[string]*CoordinatedSessionRun
-	wg              sync.WaitGroup
+	// transitionWG covers the interval after a provisional handle is reserved
+	// and before its starter is either running or the handle is removed. It lets
+	// Close release startMu while a durable admission callback is in flight,
+	// without returning before that transition has finished.
+	transitionWG sync.WaitGroup
+	wg           sync.WaitGroup
 
 	lifecycleMu  sync.RWMutex
 	onRunStarted func(*CoordinatedSessionRun)
@@ -162,13 +197,55 @@ type SessionRunCoordinator struct {
 
 // CoordinatedSessionRun is a concurrency-safe handle to one admitted run.
 type CoordinatedSessionRun struct {
-	id        string
-	sessionID string
-	startedAt time.Time
-	run       *SessionRun
+	id          string
+	sessionID   string
+	startedAt   time.Time
+	fingerprint string
+	run         *SessionRun
+	// admissionDone is present for durable starts only. It turns the
+	// provisional coordinator handle into a single-flight owner: joiners wait
+	// for the owner's durable admission/starter result instead of calling the
+	// durable store themselves.
+	admissionDone chan struct{}
+	admissionMu   sync.Mutex
+	admission     DurableRunAdmission
+	admissionErr  error
 
 	mu     sync.Mutex
 	turnID string
+}
+
+func (run *CoordinatedSessionRun) completeAdmission(admission DurableRunAdmission, err error) {
+	if run == nil || run.admissionDone == nil {
+		return
+	}
+	run.admissionMu.Lock()
+	if run.admissionDone != nil {
+		run.admission = admission
+		run.admissionErr = err
+		done := run.admissionDone
+		run.admissionDone = nil
+		close(done)
+	}
+	run.admissionMu.Unlock()
+}
+
+func (run *CoordinatedSessionRun) waitAdmission() (DurableRunAdmission, error) {
+	if run == nil {
+		return DurableRunAdmission{}, fmt.Errorf("session run is not configured")
+	}
+	run.admissionMu.Lock()
+	done := run.admissionDone
+	if done == nil {
+		admission, err := run.admission, run.admissionErr
+		run.admissionMu.Unlock()
+		return admission, err
+	}
+	run.admissionMu.Unlock()
+	<-done
+	run.admissionMu.Lock()
+	defer run.admissionMu.Unlock()
+	return run.admission, run.admissionErr
 }
 
 func (run *CoordinatedSessionRun) setSessionRun(sessionRun *SessionRun) {
@@ -745,66 +822,175 @@ func (coordinator *SessionRunCoordinator) StartWithID(sessionID string, input Se
 	return coordinator.startWithID(sessionID, input, runID, emit)
 }
 
-func (coordinator *SessionRunCoordinator) startWithID(sessionID string, input SessionMessageInput, runID string, emit func(SessionStreamEvent)) (*CoordinatedSessionRun, error) {
+// StartDurable reserves the normal in-memory session slot, then commits the
+// durable identity/lifecycle admission before invoking the execution starter.
+// This ordering leaves no business-start window in which a retry can run a
+// second model request without seeing the original durable claim.
+func (coordinator *SessionRunCoordinator) StartDurable(sessionID string, input SessionMessageInput, runID, inputFingerprint string, emit func(SessionStreamEvent)) (*CoordinatedSessionRun, DurableRunAdmission, error) {
 	if coordinator == nil {
-		return nil, fmt.Errorf("session run coordinator is not configured")
+		return nil, DurableRunAdmission{}, fmt.Errorf("session run coordinator is not configured")
+	}
+	if coordinator.options.DurableAdmitter == nil {
+		return nil, DurableRunAdmission{}, fmt.Errorf("durable run admission is not configured")
+	}
+	if strings.TrimSpace(runID) == "" {
+		return nil, DurableRunAdmission{}, fmt.Errorf("run id is required")
+	}
+	if _, ok := coordinator.starter.(SessionRunStarterWithIDAdmitted); !ok {
+		return nil, DurableRunAdmission{}, fmt.Errorf("session run starter does not support durable admitted run ids")
+	}
+	// Resolve an already durable identity before applying process-local
+	// capacity/busy gates. A retry of a settled run must return its status even
+	// when unrelated work currently fills the coordinator.
+	admission, found, err := coordinator.options.DurableAdmitter.LookupSessionRun(coordinator.ctx, strings.TrimSpace(sessionID), input, strings.TrimSpace(runID), inputFingerprint)
+	if err != nil {
+		return nil, DurableRunAdmission{}, err
+	}
+	if found {
+		if active, ok := coordinator.Get(runID); ok && active.SessionID() == strings.TrimSpace(sessionID) {
+			return active, admission, nil
+		}
+		return nil, admission, nil
+	}
+	return coordinator.startWithIDDurable(sessionID, input, runID, inputFingerprint, emit)
+}
+
+func (coordinator *SessionRunCoordinator) startWithID(sessionID string, input SessionMessageInput, runID string, emit func(SessionStreamEvent)) (*CoordinatedSessionRun, error) {
+	run, _, err := coordinator.startWithIDInternal(sessionID, input, runID, "", emit, false)
+	return run, err
+}
+
+func (coordinator *SessionRunCoordinator) startWithIDDurable(sessionID string, input SessionMessageInput, runID, inputFingerprint string, emit func(SessionStreamEvent)) (*CoordinatedSessionRun, DurableRunAdmission, error) {
+	return coordinator.startWithIDInternal(sessionID, input, runID, inputFingerprint, emit, true)
+}
+
+func (coordinator *SessionRunCoordinator) startWithIDInternal(sessionID string, input SessionMessageInput, runID, inputFingerprint string, emit func(SessionStreamEvent), durable bool) (*CoordinatedSessionRun, DurableRunAdmission, error) {
+	if coordinator == nil {
+		return nil, DurableRunAdmission{}, fmt.Errorf("session run coordinator is not configured")
 	}
 	if coordinator.starter == nil {
-		return nil, fmt.Errorf("session run starter is not configured")
+		return nil, DurableRunAdmission{}, fmt.Errorf("session run starter is not configured")
 	}
 	sessionID = strings.TrimSpace(sessionID)
 	if sessionID == "" {
-		return nil, fmt.Errorf("session id is required")
+		return nil, DurableRunAdmission{}, fmt.Errorf("session id is required")
 	}
 
 	handle := &CoordinatedSessionRun{
-		id:        runID,
-		sessionID: sessionID,
-		startedAt: coordinator.options.Now().UTC(),
+		id:          runID,
+		sessionID:   sessionID,
+		startedAt:   coordinator.options.Now().UTC(),
+		fingerprint: inputFingerprint,
+	}
+	if durable {
+		handle.admissionDone = make(chan struct{})
 	}
 
-	// Keep the reservation, adapter admission, and starter invocation as one
-	// serialized transition. The coordinator mutex is deliberately released
-	// while callbacks and the starter run so observers may safely query the
-	// coordinator. Close cancels the coordinator context before waiting for
-	// this transition, so a starter waiting on ctx.Done() can always return.
+	// Serialize only the provisional reservation. The coordinator mutex is
+	// deliberately released while admission callbacks and the starter run so
+	// a same-identity caller can join the provisional owner instead of invoking
+	// the durable admitter a second time. Close uses transitionWG to wait for
+	// these callbacks after cancelling the coordinator context.
 	coordinator.startMu.Lock()
-	defer coordinator.startMu.Unlock()
-
 	coordinator.mu.Lock()
 	if coordinator.closed {
 		coordinator.mu.Unlock()
-		return nil, ErrSessionRunCoordinatorClosed
+		coordinator.startMu.Unlock()
+		return nil, DurableRunAdmission{}, ErrSessionRunCoordinatorClosed
 	}
 	// Keep the admission slot occupied until await has removed the handle from
 	// activeBySession. A run may have already changed its terminal status while
 	// its lifecycle goroutine is still settling; admitting here would overlap
 	// the old run with a queued durable continuation.
 	if active := coordinator.activeBySession[sessionID]; active != nil {
+		if durable && active.ID() == runID {
+			if active.fingerprint != inputFingerprint {
+				coordinator.mu.Unlock()
+				coordinator.startMu.Unlock()
+				return nil, DurableRunAdmission{}, fmt.Errorf("%w: run %q", sessions.ErrIdempotencyConflict, runID)
+			}
+			coordinator.mu.Unlock()
+			coordinator.startMu.Unlock()
+			admission, err := active.waitAdmission()
+			if err != nil {
+				return nil, DurableRunAdmission{}, err
+			}
+			return active, DurableRunAdmission{Created: false, Status: admission.Status}, nil
+		}
 		coordinator.mu.Unlock()
-		return nil, ErrSessionBusy
+		coordinator.startMu.Unlock()
+		return nil, DurableRunAdmission{}, ErrSessionBusy
 	}
 	if len(coordinator.activeBySession) >= coordinator.options.MaxConcurrentRuns {
 		coordinator.mu.Unlock()
-		return nil, ErrSessionRunCoordinatorCapacity
+		coordinator.startMu.Unlock()
+		return nil, DurableRunAdmission{}, ErrSessionRunCoordinatorCapacity
 	}
 	if _, exists := coordinator.byID[runID]; exists {
+		existing := coordinator.byID[runID]
 		coordinator.mu.Unlock()
-		return nil, fmt.Errorf("generated run id %q is already active", runID)
+		if durable {
+			if existing.SessionID() != sessionID || existing.fingerprint != inputFingerprint {
+				coordinator.startMu.Unlock()
+				return nil, DurableRunAdmission{}, fmt.Errorf("%w: run %q", sessions.ErrIdempotencyConflict, runID)
+			}
+			coordinator.startMu.Unlock()
+			admission, err := existing.waitAdmission()
+			if err != nil {
+				return nil, DurableRunAdmission{}, err
+			}
+			return existing, DurableRunAdmission{Created: false, Status: admission.Status}, nil
+		}
+		coordinator.startMu.Unlock()
+		return nil, DurableRunAdmission{}, fmt.Errorf("generated run id %q is already active", runID)
 	}
 	// Reserve the coordinator indexes before invoking either the adapter
 	// admission callback or the execution starter. This makes the handle
 	// discoverable during the entire admission transition.
 	coordinator.byID[runID] = handle
 	coordinator.activeBySession[sessionID] = handle
+	coordinator.transitionWG.Add(1)
 	coordinator.mu.Unlock()
+	coordinator.startMu.Unlock()
+	defer coordinator.transitionWG.Done()
 
-	if coordinator.options.OnRunAdmitted != nil {
-		if err := coordinator.options.OnRunAdmitted(handle); err != nil {
+	admission := DurableRunAdmission{Created: true, Status: SessionRunRunning}
+	if durable {
+		var err error
+		admission, err = coordinator.options.DurableAdmitter.AdmitSessionRun(coordinator.ctx, sessionID, input, runID, inputFingerprint)
+		if err != nil {
+			handle.completeAdmission(DurableRunAdmission{}, err)
 			coordinator.removeAdmittedRun(handle)
 			coordinator.notifyRunAdmissionFailed(handle)
 			coordinator.notifyRunAdmissionFailedObservers(handle)
-			return nil, err
+			return nil, DurableRunAdmission{}, err
+		}
+		if !admission.Created {
+			handle.completeAdmission(admission, nil)
+			coordinator.removeAdmittedRun(handle)
+			return nil, admission, nil
+		}
+	}
+	if coordinator.options.OnRunAdmitted != nil {
+		if err := coordinator.options.OnRunAdmitted(handle); err != nil {
+			if durable {
+				if failErr := coordinator.options.DurableAdmitter.FailAdmittedSessionRun(coordinator.ctx, sessionID, runID); failErr == nil {
+					// The durable identity now has an authoritative failed outcome.
+					// Return that compact result to both the owner and joiners rather
+					// than exposing a presentation-adapter error which would hide the
+					// already-admitted identity from the command caller.
+					handle.completeAdmission(DurableRunAdmission{Created: false, Status: SessionRunFailed}, nil)
+					coordinator.removeAdmittedRun(handle)
+					coordinator.notifyRunAdmissionFailed(handle)
+					coordinator.notifyRunAdmissionFailedObservers(handle)
+					return nil, DurableRunAdmission{Created: false, Status: SessionRunFailed}, nil
+				}
+				handle.completeAdmission(DurableRunAdmission{Created: false, Status: SessionRunFailed}, err)
+			}
+			coordinator.removeAdmittedRun(handle)
+			coordinator.notifyRunAdmissionFailed(handle)
+			coordinator.notifyRunAdmissionFailedObservers(handle)
+			return nil, DurableRunAdmission{}, err
 		}
 	}
 	coordinator.notifyRunAdmittedObservers(handle)
@@ -819,22 +1005,37 @@ func (coordinator *SessionRunCoordinator) startWithID(sessionID string, input Se
 			emit(event)
 		}
 	}
-	if starter, ok := coordinator.starter.(SessionRunStarterWithID); ok {
+	if durable {
+		starter := coordinator.starter.(SessionRunStarterWithIDAdmitted)
+		handle.setSessionRun(starter.StartSessionRunWithIDAdmitted(coordinator.ctx, sessionID, input, runID, forward))
+	} else if starter, ok := coordinator.starter.(SessionRunStarterWithID); ok {
 		handle.setSessionRun(starter.StartSessionRunWithID(coordinator.ctx, sessionID, input, runID, forward))
 	} else {
 		handle.setSessionRun(coordinator.starter.StartSessionRunWithInput(coordinator.ctx, sessionID, input, forward))
 	}
 	if handle.sessionRun() == nil {
+		if durable {
+			starterErr := fmt.Errorf("session run starter returned a nil run")
+			if failErr := coordinator.options.DurableAdmitter.FailAdmittedSessionRun(coordinator.ctx, sessionID, runID); failErr == nil {
+				handle.completeAdmission(DurableRunAdmission{Created: false, Status: SessionRunFailed}, nil)
+				coordinator.removeAdmittedRun(handle)
+				coordinator.notifyRunAdmissionFailed(handle)
+				coordinator.notifyRunAdmissionFailedObservers(handle)
+				return nil, DurableRunAdmission{Created: false, Status: SessionRunFailed}, nil
+			}
+			handle.completeAdmission(DurableRunAdmission{Created: false, Status: SessionRunFailed}, starterErr)
+		}
 		coordinator.removeAdmittedRun(handle)
 		coordinator.notifyRunAdmissionFailed(handle)
 		coordinator.notifyRunAdmissionFailedObservers(handle)
-		return nil, fmt.Errorf("session run starter returned a nil run")
+		return nil, admission, fmt.Errorf("session run starter returned a nil run")
 	}
+	handle.completeAdmission(admission, nil)
 	coordinator.notifyRunStarted(handle)
 
 	coordinator.wg.Add(1)
 	go coordinator.await(handle)
-	return handle, nil
+	return handle, admission, nil
 }
 
 func (coordinator *SessionRunCoordinator) removeAdmittedRun(handle *CoordinatedSessionRun) {
@@ -953,17 +1154,21 @@ func (coordinator *SessionRunCoordinator) Close() {
 	coordinator.observerStop.Store(true)
 
 	// Cancel before taking startMu. The starter is invoked while startMu is
-	// held and may be waiting on this context, so taking startMu first would
-	// deadlock Close against a synchronous starter.
+	// held only for the reservation and may be waiting on this context after
+	// that reservation, so taking startMu first would deadlock Close against a
+	// synchronous reservation path.
 	coordinator.cancel()
 	coordinator.startMu.Lock()
+	coordinator.startMu.Unlock()
+	// No new transition can be added after startMu has been observed here;
+	// existing transitions may still be inside the durable admitter/starter.
+	coordinator.transitionWG.Wait()
 	coordinator.mu.Lock()
 	runs := make([]*CoordinatedSessionRun, 0, len(coordinator.byID))
 	for _, run := range coordinator.byID {
 		runs = append(runs, run)
 	}
 	coordinator.mu.Unlock()
-	coordinator.startMu.Unlock()
 
 	for _, run := range runs {
 		run.Cancel()

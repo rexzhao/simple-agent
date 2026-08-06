@@ -163,6 +163,69 @@ describe('CommandFacade session.mark_read', () => {
     facade.stop()
   })
 
+  it('starts a durable run with a stable client identity and identical cross-epoch payload', async () => {
+    const transport = new FakeCommandTransport()
+    let requestNumber = 0
+    const facade = new CommandFacade({
+      transport,
+      requestIDGenerator: () => `request_run_${++requestNumber}`,
+      runIDGenerator: () => 'run_generated_stable',
+    })
+    const pending = facade.start('session_1', 'hello')
+    const initial = transport.sent[0]
+    if (initial.type !== 'command') throw new Error('wrong initial command')
+    expect(initial.payload.name).toBe('run.start')
+    expect(initial.payload.arguments).toEqual({ session_id: 'session_1', run_id: 'run_generated_stable', content: 'hello' })
+    expect(initial.payload.request_id).not.toBe(initial.payload.arguments.run_id)
+
+    transport.connectionGeneration = 2
+    transport.emitReady('epoch_2', 'epoch_1')
+    const resent = transport.sent[1]
+    if (resent.type !== 'command') throw new Error('wrong resent command')
+    expect(resent.payload).toEqual(initial.payload)
+    transport.emit(commandMessage('command_result', resent.payload.request_id, {
+      status: 'succeeded', result: { session_id: 'session_1', run_id: 'run_generated_stable', status: 'running' },
+    }), 2)
+    await expect(pending).resolves.toEqual({ session_id: 'session_1', run_id: 'run_generated_stable', status: 'running' })
+
+    const explicit = facade.startRun('session_1', 'hello', { runID: 'run_explicit_stable' })
+    const retryRequest = transport.sent[2]
+    if (retryRequest.type !== 'command') throw new Error('wrong explicit command')
+    transport.emit(commandMessage('command_result', retryRequest.payload.request_id, {
+      status: 'succeeded', result: { session_id: 'session_1', run_id: 'run_explicit_stable', status: 'interrupted' },
+    }), 2)
+    await expect(explicit).resolves.toEqual({ session_id: 'session_1', run_id: 'run_explicit_stable', status: 'interrupted' })
+
+    const explicitRetry = facade.startRun('session_1', 'hello', { runID: 'run_explicit_stable' })
+    const explicitRetryMessage = transport.sent[3]
+    if (explicitRetryMessage.type !== 'command') throw new Error('wrong explicit retry command')
+    expect(explicitRetryMessage.payload.arguments).toEqual(retryRequest.payload.arguments)
+    expect(explicitRetryMessage.payload.request_id).not.toBe(retryRequest.payload.request_id)
+    transport.emit(commandMessage('command_result', explicitRetryMessage.payload.request_id, {
+      status: 'succeeded', result: { session_id: 'session_1', run_id: 'run_explicit_stable', status: 'interrupted' },
+    }), 2)
+    await expect(explicitRetry).resolves.toMatchObject({ status: 'interrupted' })
+
+    const collision = facade.start('session_1', 'different')
+    await expect(collision).rejects.toMatchObject({ code: 'id_generation', details: { collision: true } })
+    facade.stop()
+  })
+
+  it('rejects invalid and over-sized durable run input and strict result shapes', async () => {
+    const transport = new FakeCommandTransport()
+    const facade = new CommandFacade({ transport, runIDGenerator: () => 'run_invalid_test' })
+    await expect(facade.start('', 'hello')).rejects.toMatchObject({ code: 'invalid' })
+    await expect(facade.start('session_1', 'x'.repeat(256 * 1024 + 1))).rejects.toMatchObject({ code: 'invalid' })
+    const pending = facade.start('session_1', 'hello', { runID: 'run_result_shape' })
+    const command = transport.sent[0]
+    if (command.type !== 'command') throw new Error('wrong command')
+    transport.emit(commandMessage('command_result', command.payload.request_id, {
+      status: 'succeeded', result: { session_id: 'session_1', run_id: 'run_result_shape', status: 'running', extra: true },
+    }))
+    await expect(pending).rejects.toMatchObject({ code: 'invalid' })
+    facade.stop()
+  })
+
   it('rejects on timeout, cancellation, and stop while clearing pending timers', async () => {
     const timers = new TimerBox()
     const transport = new FakeCommandTransport()
@@ -306,7 +369,7 @@ describe('CommandFacade session.mark_read', () => {
   it('accepts every SessionRunStatus emitted by the Go run coordinator', async () => {
     const transport = new FakeCommandTransport()
     const facade = new CommandFacade({ transport })
-    const statuses = ['running', 'committed', 'failed', 'cancelled'] as const
+    const statuses = ['running', 'committed', 'failed', 'interrupted', 'cancelled'] as const
     const pending = statuses.map((status, index) => {
       const promise = facade.cancelRun(`run_${index}`)
       const command = transport.sent[index]

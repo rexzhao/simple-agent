@@ -141,13 +141,17 @@ func newRunRegistryWithOptions(ctx context.Context, service *execution.Service, 
 		byID:           make(map[string]*managedRun),
 		terminalTimers: make(map[string]*time.Timer),
 	}
-	coordinator := execution.NewSessionRunCoordinator(ctx, service, execution.SessionRunCoordinatorOptions{
+	coordinatorOptions := execution.SessionRunCoordinatorOptions{
 		MaxConcurrentRuns:    resolvedOptions.MaxConcurrentRuns,
 		OnRunAdmitted:        registry.admitRun,
 		OnRunAdmissionFailed: registry.rejectRun,
 		OnRunEvent:           registry.observeRunEvent,
 		OnRunSettled:         registry.settleRun,
-	})
+	}
+	if service != nil {
+		coordinatorOptions.DurableAdmitter = service
+	}
+	coordinator := execution.NewSessionRunCoordinator(ctx, service, coordinatorOptions)
 	registry.coordinator = coordinator
 	if service != nil {
 		service.SetSessionRunCoordinator(coordinator)
@@ -199,6 +203,41 @@ func (r *runRegistry) startWithInput(sessionID string, input execution.SessionMe
 
 func (r *runRegistry) startContinue(sessionID string) (*managedRun, error) {
 	return r.startWithInput(sessionID, execution.SessionMessageInput{Continue: true})
+}
+
+// startDurable is the Web command entry point. The coordinator still owns
+// the single active-run/replay path; this method only supplies the durable
+// identity fingerprint and returns the compact status acknowledgement.
+func (r *runRegistry) startDurable(sessionID, content, runID, inputFingerprint string) (string, error) {
+	sessionID = strings.TrimSpace(sessionID)
+	runID = strings.TrimSpace(runID)
+	if sessionID == "" || runID == "" || strings.TrimSpace(content) == "" {
+		return "", fmt.Errorf("session id, run id, and content are required")
+	}
+	r.mu.Lock()
+	if r.closed {
+		r.mu.Unlock()
+		return "", ErrRunRegistryClosed
+	}
+	r.mu.Unlock()
+	coordinated, admission, err := r.coordinator.StartDurable(sessionID, execution.SessionMessageInput{Content: content}, runID, inputFingerprint, nil)
+	if err != nil {
+		return "", err
+	}
+	if coordinated != nil && !admission.Created {
+		return string(admission.Status), nil
+	}
+	if !admission.Created {
+		return string(admission.Status), nil
+	}
+	if coordinated == nil {
+		return "", fmt.Errorf("durable run admission returned no active handle")
+	}
+	if _, ok := r.get(coordinated.ID()); !ok {
+		coordinated.Cancel()
+		return "", ErrRunRegistryClosed
+	}
+	return string(execution.SessionRunRunning), nil
 }
 
 // admitRun is the first presentation-adapter phase of coordinator admission.
