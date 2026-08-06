@@ -30,7 +30,7 @@ export function isResourceRevision(value: unknown): value is ResourceRevision {
 }
 
 export function isRunCursor(value: unknown): value is RunCursor {
-  return isDecimalString(value)
+  return typeof value === 'string' && /^(0|[1-9][0-9]*)$/.test(value)
 }
 
 export function parseSequence(value: string): bigint {
@@ -38,7 +38,10 @@ export function parseSequence(value: string): bigint {
 }
 
 export function parseRunCursor(value: string): bigint {
-  return parseDecimal(value)
+  if (!isRunCursor(value)) {
+    throw new Error('expected a canonical non-negative run cursor')
+  }
+  return BigInt(value)
 }
 
 export function compareSequence(left: string, right: string): -1 | 0 | 1 {
@@ -46,5 +49,9 @@ export function compareSequence(left: string, right: string): -1 | 0 | 1 {
 }
 
 export function compareRunCursor(left: string, right: string): -1 | 0 | 1 {
-  return compareDecimal(left, right)
+  const leftValue = parseRunCursor(left)
+  const rightValue = parseRunCursor(right)
+  if (leftValue < rightValue) return -1
+  if (leftValue > rightValue) return 1
+  return 0
 }

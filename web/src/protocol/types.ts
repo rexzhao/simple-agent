@@ -79,10 +79,17 @@ export interface ResumeToken {
   sequence: Sequence
 }
 
+export interface RunResumeToken {
+  run_epoch: string
+  run_id: string
+  run_cursor: RunCursor
+}
+
 export interface SubscribePayload {
   subscription_id: string
   resource: ResourceKey
   resume?: ResumeToken
+  active_run_resume?: RunResumeToken
 }
 
 export interface SubscribedPayload {
@@ -253,6 +260,27 @@ export interface SessionContentActiveRun {
   started_at: string
   status: 'running'
   recoverable: boolean
+  run_epoch?: string
+  run_cursor?: RunCursor
+  replay_available: boolean
+  replay_from_cursor?: RunCursor
+  replay_to_cursor?: RunCursor
+  recovery_required: boolean
+  durable_settlement_watermark?: DurableSettlementWatermark
+}
+
+export interface TransientItemWatermark {
+  turn_id: string
+  agent_iteration: number
+  item_id: string
+  run_cursor: RunCursor
+}
+
+export interface DurableSettlementWatermark {
+  resource_revision: ResourceRevision
+  run_cursor: RunCursor
+  verified: boolean
+  covered_items: TransientItemWatermark[]
 }
 
 export interface SessionContentCompaction {
@@ -295,9 +323,23 @@ export interface ChangePayload {
   operations: ChangeOperation[]
 }
 
-// Transient event fields are resource-specific. Only the discriminating type
-// is part of the protocol contract; adapters validate the remaining fields.
-export type SubscriptionEventData = JsonObject & { type: string }
+export interface SubscriptionEventBase {
+  session_id: string
+  run_id: string
+  run_cursor: RunCursor
+  turn_id?: string
+  agent_iteration?: number
+}
+
+export type SubscriptionEventData =
+  | (SubscriptionEventBase & { type: 'text.delta' | 'reasoning.delta'; item_id: string; delta: string; durable_text_length?: number; durable_checkpointed?: boolean })
+  | (SubscriptionEventBase & { type: 'tool.requested' | 'tool.running'; tool_call_id: string; name: string; arguments?: string })
+  | (SubscriptionEventBase & { type: 'tool.progress'; tool_call_id: string; name: string; arguments_delta: string })
+  | (SubscriptionEventBase & { type: 'tool.finished'; tool_call_id: string; name: string; is_error: boolean; content?: string })
+  | (SubscriptionEventBase & { type: 'run.prompt_queue'; turn_id?: string; prompts: { id: string; content: string; steer: boolean }[] })
+  | (SubscriptionEventBase & { type: 'run.prompt_appended'; turn_id?: string; prompts: string[] })
+  | (SubscriptionEventBase & { type: 'run.started'; status: 'running' })
+  | (SubscriptionEventBase & { type: 'run.settled'; status: 'committed' | 'failed' | 'interrupted' | 'cancelled'; durable_settlement_watermark: DurableSettlementWatermark })
 
 export interface SubscriptionEventPayload {
   subscription_id: string

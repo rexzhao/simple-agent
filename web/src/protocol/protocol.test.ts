@@ -70,9 +70,11 @@ describe('shared protocol golden fixtures', () => {
     })
     expect(event.payload.event).toMatchObject({
       type: 'text.delta',
-      tool_name: 'shell',
-      tool_call_id: 'tool_7',
-      arguments: { command: 'pwd' },
+      session_id: 'session_2',
+      run_id: 'run_9',
+      run_cursor: '17',
+      item_id: 'item_3',
+      delta: '...',
     })
   })
 
@@ -80,5 +82,33 @@ describe('shared protocol golden fixtures', () => {
     expect(() => decodeMessage('{"version":1')).toThrowError(
       expect.objectContaining({ code: 'invalid_json' }),
     )
+  })
+
+  it('rejects a session-content event whose identity names another resource', () => {
+    const fixture = fixtures.valid.find((candidate) => candidate.name === 'subscription_event')
+    expect(fixture).toBeDefined()
+    const message = structuredClone(fixture?.message) as Record<string, any>
+    message.payload.event.session_id = 'different-session'
+    expect(() => decodeMessage(JSON.stringify(message))).toThrow(ProtocolDecodeError)
+  })
+
+  it('rejects an ambiguous settlement watermark', () => {
+    const fixture = fixtures.valid.find((candidate) => candidate.name === 'subscription_event')
+    expect(fixture).toBeDefined()
+    const message = structuredClone(fixture?.message) as Record<string, any>
+    message.payload.event = {
+      type: 'run.settled',
+      session_id: 'session_1',
+      run_id: 'run_1',
+      run_cursor: '3',
+      status: 'committed',
+      durable_settlement_watermark: {
+        resource_revision: '4',
+        run_cursor: '2',
+        verified: false,
+        covered_items: [{ turn_id: 'turn-1', agent_iteration: 1, item_id: 'item-1', run_cursor: '1' }],
+      },
+    }
+    expect(() => decodeMessage(JSON.stringify(message))).toThrow(ProtocolDecodeError)
   })
 })

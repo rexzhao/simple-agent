@@ -457,7 +457,7 @@ func (d *Dispatcher) openSubscription(state *connectionState, message protocol.S
 	defer pending.cancel()
 
 	principal := syncengine.Principal{ID: state.connection.Info().Principal}
-	opened, err := d.engine.Open(pending.ctx, principal, message.Payload.Resource, message.Payload.Resume)
+	opened, err := d.engine.OpenSubscription(pending.ctx, principal, message.Payload.Resource, message.Payload.Resume, message.Payload.ActiveRunResume)
 	if err != nil {
 		if pending.cancelled.Load() || pending.ctx.Err() != nil {
 			return
@@ -558,6 +558,19 @@ func (d *Dispatcher) openSubscription(state *connectionState, message protocol.S
 		d.removeSubscription(state, sub, false)
 		return
 	}
+	if opened.TransientResync != "" {
+		// This subscription is already an unrecoverable transient stream. Send
+		// only its terminal resource-local recovery instruction; in particular,
+		// do not queue a snapshot/replay under the id that the client is about to
+		// retire. A fresh subscribe owns the new durable/active-run baseline.
+		_ = d.send(state, protocol.ResyncRequiredMessage{
+			Envelope: protocol.Envelope{Version: 1, Type: protocol.MessageTypeResyncRequired, ID: d.nextID("resync")},
+			Payload:  protocol.ResyncRequiredPayload{SubscriptionID: sub.id, Resource: sub.resource, Reason: opened.TransientResync},
+		}, SendOptions{SubscriptionID: sub.id})
+		d.observe(Event{Kind: EventSubscriptionResync, SubscriptionID: sub.id, ResourceType: sub.resource.Type, ResourceID: sub.resource.ID, Reason: opened.TransientResync, ConnectionID: state.connection.Info().ConnectionID})
+		d.removeSubscription(state, sub, false)
+		return
+	}
 	if opened.Decision.Action == syncengine.SyncActionResync {
 		if err := d.send(state, protocol.ResyncRequiredMessage{
 			Envelope: protocol.Envelope{Version: 1, Type: protocol.MessageTypeResyncRequired, ID: d.nextID("resync")},
@@ -597,7 +610,18 @@ func (d *Dispatcher) openSubscription(state *connectionState, message protocol.S
 			}
 		}
 	}
-
+	for _, entry := range opened.TransientReplay {
+		if pending.cancelled.Load() {
+			d.removeSubscription(state, sub, false)
+			return
+		}
+		event := subscriptionEventMessage(sub, entry)
+		event.Envelope.ID = d.nextID("subscription_event")
+		if err := d.send(state, event, SendOptions{SubscriptionID: sub.id}); err != nil {
+			d.removeSubscription(state, sub, false)
+			return
+		}
+	}
 	if sub.startPump() {
 		if !d.startTask(func() { d.pumpSubscription(state, sub) }) {
 			state.mu.Lock()
@@ -656,11 +680,47 @@ func changeMessage(sub *subscription, entry syncengine.JournalEntry) protocol.Ch
 	}
 }
 
+func subscriptionEventMessage(sub *subscription, entry syncengine.TransientEvent) protocol.SubscriptionEventMessage {
+	return protocol.SubscriptionEventMessage{
+		Envelope: protocol.Envelope{Version: 1, Type: protocol.MessageTypeSubscriptionEvent},
+		Payload: protocol.SubscriptionEventPayload{
+			SubscriptionID: sub.id,
+			Resource:       sub.resource,
+			Event:          append(json.RawMessage(nil), entry.Event...),
+		},
+	}
+}
+
+func transientReason(err error) string {
+	if err == nil {
+		return "transient_resync_required"
+	}
+	message := strings.ToLower(strings.TrimSpace(err.Error()))
+	if message == "" {
+		return "transient_resync_required"
+	}
+	// Do not expose arbitrary producer errors as an unbounded protocol reason.
+	// Keep the categories useful for recovery telemetry while retaining a
+	// stable, finite vocabulary for clients.
+	switch {
+	case strings.Contains(message, "overflow"):
+		return "transient_overflow"
+	case strings.Contains(message, "continuous"), strings.Contains(message, "cursor"):
+		return "transient_cursor_gap"
+	case strings.Contains(message, "identity"), strings.Contains(message, "invalid"):
+		return "transient_event_invalid"
+	default:
+		return "transient_resync_required"
+	}
+}
+
 func (d *Dispatcher) pumpSubscription(state *connectionState, sub *subscription) {
 	defer close(sub.done)
 	changes := sub.opened.Changes
 	terminal := sub.opened.Terminal
-	for changes != nil || terminal != nil {
+	transient := sub.opened.Transient.Events
+	transientTerminal := sub.opened.Transient.Terminal
+	for changes != nil || terminal != nil || transient != nil || transientTerminal != nil {
 		select {
 		case <-sub.ctx.Done():
 			return
@@ -694,6 +754,35 @@ func (d *Dispatcher) pumpSubscription(state *connectionState, sub *subscription)
 				}, SendOptions{SubscriptionID: sub.id})
 				d.observe(Event{Kind: EventSubscriptionResync, SubscriptionID: sub.id, ResourceType: sub.resource.Type, ResourceID: sub.resource.ID, Reason: string(end.Reason), ConnectionID: state.connection.Info().ConnectionID})
 			}
+			d.removeSubscription(state, sub, false)
+			return
+		case entry, ok := <-transient:
+			if !ok {
+				transient = nil
+				continue
+			}
+			event := subscriptionEventMessage(sub, entry)
+			event.Envelope.ID = d.nextID("subscription_event")
+			if err := d.send(state, event, SendOptions{SubscriptionID: sub.id}); err != nil {
+				if sub.opened.Transient.Consume != nil {
+					sub.opened.Transient.Consume(entry)
+				}
+				d.removeSubscription(state, sub, false)
+				return
+			}
+			if sub.opened.Transient.Consume != nil {
+				sub.opened.Transient.Consume(entry)
+			}
+		case end, ok := <-transientTerminal:
+			if !ok {
+				transientTerminal = nil
+				continue
+			}
+			_ = d.send(state, protocol.ResyncRequiredMessage{
+				Envelope: protocol.Envelope{Version: 1, Type: protocol.MessageTypeResyncRequired, ID: d.nextID("resync")},
+				Payload:  protocol.ResyncRequiredPayload{SubscriptionID: sub.id, Resource: sub.resource, Reason: transientReason(end.Reason)},
+			}, SendOptions{SubscriptionID: sub.id})
+			d.observe(Event{Kind: EventSubscriptionResync, SubscriptionID: sub.id, ResourceType: sub.resource.Type, ResourceID: sub.resource.ID, Reason: transientReason(end.Reason), ConnectionID: state.connection.Info().ConnectionID})
 			d.removeSubscription(state, sub, false)
 			return
 		}

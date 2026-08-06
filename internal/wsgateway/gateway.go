@@ -378,18 +378,24 @@ func (c *connection) SendWithOptions(message protocol.Message, options SendOptio
 	if c == nil || message == nil {
 		return ErrConnectionClosed
 	}
-	payload, err := protocol.EncodeMessage(message)
-	if err != nil {
-		return err
-	}
-	if len(payload) > c.gateway.limits.MaxMessageBytes {
-		c.terminate(websocket.StatusMessageTooBig, "outbound message too large", nil)
-		return ErrMessageTooLarge
-	}
 	if options.SubscriptionID == "" {
 		options.SubscriptionID = messageSubscriptionID(message)
 	}
-	if message.Kind() == protocol.MessageTypeChange && options.SubscriptionID != "" {
+	payload, err := protocol.EncodeMessage(message)
+	if err != nil {
+		if options.SubscriptionID != "" && subscriptionFramePurgeable(message) {
+			return c.desyncSubscription(options.SubscriptionID, message)
+		}
+		return err
+	}
+	if len(payload) > c.gateway.limits.MaxMessageBytes {
+		if options.SubscriptionID != "" && subscriptionFramePurgeable(message) {
+			return c.desyncSubscription(options.SubscriptionID, message)
+		}
+		c.terminate(websocket.StatusMessageTooBig, "outbound message too large", nil)
+		return ErrMessageTooLarge
+	}
+	if options.SubscriptionID != "" && subscriptionFramePurgeable(message) {
 		c.mu.Lock()
 		_, desynced := c.desynced[options.SubscriptionID]
 		c.mu.Unlock()
@@ -401,18 +407,13 @@ func (c *connection) SendWithOptions(message protocol.Message, options SendOptio
 		kind:           frameMessage,
 		payload:        payload,
 		subscriptionID: options.SubscriptionID,
-		purgeable:      message.Kind() == protocol.MessageTypeChange && options.SubscriptionID != "",
+		purgeable:      subscriptionFramePurgeable(message) && options.SubscriptionID != "",
 		onWritten:      options.OnWritten,
 	}
 	if err := c.queue.enqueue(frame); err != nil {
 		if errors.Is(err, ErrOutboundQueueFull) {
 			if frame.purgeable {
-				c.markSubscriptionDesynced(frame.subscriptionID)
-				c.queue.purgeSubscriptionChanges(frame.subscriptionID)
-				if recoveryErr := c.enqueueSubscriptionRecovery(message, frame.subscriptionID); recoveryErr == nil {
-					c.gateway.observe(Event{Kind: EventSubscriptionResync, Reason: "outbound_overflow", SubscriptionID: frame.subscriptionID, ConnectionID: c.infoSnapshot().ConnectionID, ClientID: c.infoSnapshot().ClientID})
-					return ErrSubscriptionDesynced
-				}
+				return c.desyncSubscription(frame.subscriptionID, message)
 			}
 			c.terminate(websocket.StatusTryAgainLater, closeReasonQueueOverflow, nil)
 		}
@@ -420,6 +421,25 @@ func (c *connection) SendWithOptions(message protocol.Message, options SendOptio
 	}
 	c.gateway.observe(Event{Kind: EventQueueChanged, QueueBytes: c.queue.bytesQueued(), ConnectionID: c.infoSnapshot().ConnectionID, ClientID: c.infoSnapshot().ClientID})
 	return nil
+}
+
+func subscriptionFramePurgeable(message protocol.Message) bool {
+	if message == nil {
+		return false
+	}
+	return message.Kind() == protocol.MessageTypeChange || message.Kind() == protocol.MessageTypeSubscriptionEvent
+}
+
+func (c *connection) desyncSubscription(subscriptionID string, message protocol.Message) error {
+	if c == nil || subscriptionID == "" {
+		return ErrSubscriptionDesynced
+	}
+	c.markSubscriptionDesynced(subscriptionID)
+	c.queue.purgeSubscriptionDataFrames(subscriptionID)
+	if recoveryErr := c.enqueueSubscriptionRecovery(message, subscriptionID); recoveryErr == nil {
+		c.gateway.observe(Event{Kind: EventSubscriptionResync, Reason: "subscription_frame_invalid_or_overflow", SubscriptionID: subscriptionID, ConnectionID: c.infoSnapshot().ConnectionID, ClientID: c.infoSnapshot().ClientID})
+	}
+	return ErrSubscriptionDesynced
 }
 
 func messageSubscriptionID(message protocol.Message) string {
@@ -455,16 +475,8 @@ func messageSubscriptionID(message protocol.Message) string {
 }
 
 func (c *connection) enqueueSubscriptionRecovery(message protocol.Message, subscriptionID string) error {
-	var change protocol.ChangeMessage
-	switch typed := message.(type) {
-	case protocol.ChangeMessage:
-		change = typed
-	case *protocol.ChangeMessage:
-		if typed == nil {
-			return ErrOutboundQueueFull
-		}
-		change = *typed
-	default:
+	resource, ok := messageResource(message)
+	if !ok {
 		return ErrOutboundQueueFull
 	}
 	id, err := c.gateway.idGenerator("resync")
@@ -475,7 +487,7 @@ func (c *connection) enqueueSubscriptionRecovery(message protocol.Message, subsc
 		Envelope: protocol.Envelope{Version: 1, Type: protocol.MessageTypeResyncRequired, ID: id},
 		Payload: protocol.ResyncRequiredPayload{
 			SubscriptionID: subscriptionID,
-			Resource:       change.Payload.Resource,
+			Resource:       resource,
 			Reason:         "outbound_overflow",
 		},
 	}
@@ -491,6 +503,24 @@ func (c *connection) enqueueSubscriptionRecovery(message protocol.Message, subsc
 		payload:        payload,
 		subscriptionID: subscriptionID,
 	})
+}
+
+func messageResource(message protocol.Message) (protocol.ResourceKey, bool) {
+	switch typed := message.(type) {
+	case protocol.ChangeMessage:
+		return typed.Payload.Resource, true
+	case *protocol.ChangeMessage:
+		if typed != nil {
+			return typed.Payload.Resource, true
+		}
+	case protocol.SubscriptionEventMessage:
+		return typed.Payload.Resource, true
+	case *protocol.SubscriptionEventMessage:
+		if typed != nil {
+			return typed.Payload.Resource, true
+		}
+	}
+	return protocol.ResourceKey{}, false
 }
 
 func (c *connection) markSubscriptionDesynced(subscriptionID string) {
@@ -933,10 +963,10 @@ func (q *outboundQueue) enqueue(frame outboundFrame) error {
 	return nil
 }
 
-// purgeSubscriptionChanges removes only not-yet-written durable changes for
-// one subscription. Control frames and frames owned by other subscriptions
-// retain their FIFO order and bytes.
-func (q *outboundQueue) purgeSubscriptionChanges(subscriptionID string) int {
+// purgeSubscriptionDataFrames removes only not-yet-written durable change and
+// transient subscription-event frames for one subscription. Control frames
+// and frames owned by other subscriptions retain their FIFO order and bytes.
+func (q *outboundQueue) purgeSubscriptionDataFrames(subscriptionID string) int {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	if q.closed || subscriptionID == "" {

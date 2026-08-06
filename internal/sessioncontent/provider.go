@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -15,6 +16,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/rexzhao/simple-agent/internal/execution"
 	"github.com/rexzhao/simple-agent/internal/model"
 	"github.com/rexzhao/simple-agent/internal/protocol"
 	"github.com/rexzhao/simple-agent/internal/sessions"
@@ -22,17 +24,23 @@ import (
 )
 
 const (
-	DefaultJournalEntries       = 4096
-	DefaultJournalBytes         = 8 * 1024 * 1024
-	DefaultLiveCapacity         = 256
-	DefaultProjectorQueue       = 256
-	DefaultInlineSnapshot       = 64 * 1024
-	DefaultHistoryLimit         = 50
-	DefaultMaxCompactionRecords = 64
-	DefaultMaxItemContentBytes  = 64 * 1024
-	DefaultMaxItemBlobs         = 256
-	DefaultMaxOwners            = 1024
-	DefaultBlobRefreshSkew      = time.Minute
+	DefaultJournalEntries         = 4096
+	DefaultJournalBytes           = 8 * 1024 * 1024
+	DefaultLiveCapacity           = 256
+	DefaultProjectorQueue         = 256
+	DefaultInlineSnapshot         = 64 * 1024
+	DefaultHistoryLimit           = 50
+	DefaultMaxCompactionRecords   = 64
+	DefaultMaxItemContentBytes    = 64 * 1024
+	DefaultMaxItemBlobs           = 256
+	DefaultMaxOwners              = 1024
+	DefaultBlobRefreshSkew        = time.Minute
+	DefaultTransientReplayEntries = 2048
+	DefaultTransientReplayBytes   = 4 * 1024 * 1024
+	DefaultTransientLiveCapacity  = 256
+	DefaultTransientLiveBytes     = 1 * 1024 * 1024
+	DefaultTransientQueueCapacity = 256
+	DefaultTransientQueueBytes    = 2 * 1024 * 1024
 )
 
 var (
@@ -67,6 +75,12 @@ type ProviderOptions struct {
 	MaxItemBlobs           int
 	MaxOwners              int
 	MaxChangeMessageBytes  int
+	TransientReplayEntries int
+	TransientReplayBytes   int
+	TransientLiveCapacity  int
+	TransientLiveBytes     int
+	TransientQueueCapacity int
+	TransientQueueBytes    int
 	BlobRefreshSkew        time.Duration
 	StreamEpoch            string
 	OwnerContext           context.Context
@@ -121,6 +135,24 @@ func (o ProviderOptions) withDefaults() (ProviderOptions, error) {
 	if o.BlobRefreshSkew == 0 {
 		o.BlobRefreshSkew = DefaultBlobRefreshSkew
 	}
+	if o.TransientReplayEntries == 0 {
+		o.TransientReplayEntries = DefaultTransientReplayEntries
+	}
+	if o.TransientReplayBytes == 0 {
+		o.TransientReplayBytes = DefaultTransientReplayBytes
+	}
+	if o.TransientLiveCapacity == 0 {
+		o.TransientLiveCapacity = DefaultTransientLiveCapacity
+	}
+	if o.TransientLiveBytes == 0 {
+		o.TransientLiveBytes = DefaultTransientLiveBytes
+	}
+	if o.TransientQueueCapacity == 0 {
+		o.TransientQueueCapacity = DefaultTransientQueueCapacity
+	}
+	if o.TransientQueueBytes == 0 {
+		o.TransientQueueBytes = DefaultTransientQueueBytes
+	}
 	if o.Now == nil {
 		o.Now = time.Now
 	}
@@ -129,6 +161,9 @@ func (o ProviderOptions) withDefaults() (ProviderOptions, error) {
 		o.MaxItemContentBytes <= 0 || o.MaxItemBlobs <= 0 || o.MaxOwners <= 0 || o.MaxChangeMessageBytes <= 0 ||
 		o.MaxChangeMessageBytes > o.JournalBytes || o.BlobRefreshSkew < 0 {
 		return ProviderOptions{}, fmt.Errorf("session content bounds are invalid")
+	}
+	if o.TransientReplayEntries <= 0 || o.TransientReplayBytes <= 0 || o.TransientLiveCapacity <= 0 || o.TransientLiveBytes <= 0 || o.TransientQueueCapacity <= 0 || o.TransientQueueBytes <= 0 {
+		return ProviderOptions{}, fmt.Errorf("session content transient bounds are invalid")
 	}
 	if strings.TrimSpace(o.StreamEpoch) == "" {
 		o.StreamEpoch = "session-content"
@@ -156,20 +191,40 @@ type owner struct {
 	epoch      string
 	journal    *syncengine.Journal
 	queue      chan ownerTask
-	ctx        context.Context
-	cancel     context.CancelFunc
-	workerDone chan struct{}
+	queueBytes int
+	queueMu    sync.Mutex
+	// queueOverflow is a coalesced, bounded signal separate from queue. A
+	// producer which finds the work queue full must not call invalidate inline:
+	// invalidation takes the owner projection mutex and would turn a slow owner
+	// into a blocking execution path. The owner worker consumes this marker and
+	// performs the resource-local recovery transition itself.
+	queueOverflow chan struct{}
+	ctx           context.Context
+	cancel        context.CancelFunc
+	workerDone    chan struct{}
 
-	mu          sync.Mutex
-	projection  projection
-	initialized bool
-	stale       bool
-	invalid     bool
-	closed      bool
-	subs        map[*syncengine.LiveSubscription]struct{}
-	lastUsed    time.Time
-	blobs       *itemBlobCache
-	claims      atomic.Int64
+	mu            sync.Mutex
+	projection    projection
+	initialized   bool
+	stale         bool
+	invalid       bool
+	closed        bool
+	subs          map[*syncengine.LiveSubscription]struct{}
+	transientSubs map[*syncengine.TransientSubscription]struct{}
+	transientRun  *runState
+	pendingOpens  int
+	// openInterest is a producer-facing atomic hint. It spans the complete
+	// beginOpen -> owner queue -> openBarrier/captureOpen -> endOpen interval,
+	// including durable snapshot/blob work before a live subscription exists.
+	// Execution producers read this atomically and never take owner.mu.
+	openInterest      atomic.Int64
+	pendingAdmissions map[string]int
+	gapMu             sync.Mutex
+	runGapPending     map[string]struct{}
+	subscriberHint    atomic.Int64
+	lastUsed          time.Time
+	blobs             *itemBlobCache
+	claims            atomic.Int64
 }
 
 type projection struct {
@@ -178,15 +233,52 @@ type projection struct {
 }
 
 type ownerTask struct {
-	mutation *sessions.Mutation
-	open     *openRequest
-	stop     bool
+	mutation           *sessions.Mutation
+	open               *openRequest
+	runAdmitted        *runAdmission
+	runGap             *runGapInput
+	runEvent           *runEventInput
+	runSettled         *runSettlement
+	runAdmissionFailed *runAdmission
+	stop               bool
+	bytes              int
+}
+
+type runState struct {
+	epoch               string
+	runID               string
+	cursor              uint64
+	desynced            bool
+	settled             bool
+	uncovered           bool
+	replay              []syncengine.TransientEvent
+	replayBytes         int
+	itemCursors         map[ItemKey]protocol.RunCursor
+	settlementWatermark *protocol.DurableSettlementWatermark
+}
+
+type runAdmission struct {
+	runID, sessionID, turnID string
+	startedAt                time.Time
+}
+type runEventInput struct {
+	runID, sessionID string
+	event            execution.SessionStreamEvent
+}
+type runGapInput struct {
+	runID, sessionID string
+}
+type runSettlement struct {
+	runID, sessionID, turnID, status string
+	result                           execution.SessionMessageResult
+	err                              error
 }
 
 type openRequest struct {
-	ctx    context.Context
-	resume *protocol.ResumeToken
-	result chan openResult
+	ctx             context.Context
+	resume          *protocol.ResumeToken
+	activeRunResume *protocol.RunResumeToken
+	result          chan openResult
 }
 
 type openResult struct {
@@ -252,7 +344,123 @@ func (p *Provider) PublishMutation(mutation sessions.Mutation) error {
 	if o == nil {
 		return nil
 	}
-	return o.enqueue(ownerTask{mutation: &mutation})
+	return o.enqueue(ownerTask{mutation: &mutation, bytes: 256})
+}
+
+// RunAdmitted/RunAdmissionFailed/RunEvent/RunSettled implement the shared
+// execution event source. They only enqueue full event work when this session
+// currently has a session-content subscriber; an idle active run receives at
+// most a bounded identity-only gap marker, never Web DTO JSON encoding or a
+// blocking producer path merely because it exists.
+func (p *Provider) RunAdmitted(run *execution.CoordinatedSessionRun) {
+	if run == nil {
+		return
+	}
+	p.publishRunTask(run.SessionID(), ownerTask{runAdmitted: &runAdmission{runID: run.ID(), sessionID: run.SessionID(), startedAt: run.StartedAt()}, bytes: 128})
+}
+
+func (p *Provider) RunAdmissionFailed(run *execution.CoordinatedSessionRun) {
+	if run == nil {
+		return
+	}
+	p.clearRunGapPending(run)
+	p.publishRunTask(run.SessionID(), ownerTask{runAdmissionFailed: &runAdmission{runID: run.ID(), sessionID: run.SessionID()}, bytes: 128})
+}
+
+func (p *Provider) RunEvent(run *execution.CoordinatedSessionRun, event execution.SessionStreamEvent) {
+	if run == nil || event == nil {
+		return
+	}
+	// The shared source also carries durable projector notices. They are
+	// already recovered through the journal and must not turn an otherwise
+	// continuous transient run into a gap merely because no session-content
+	// subscriber was present for that durable notice.
+	if !isTransientExecutionEvent(event) {
+		return
+	}
+	// Estimate/encode the transport-neutral source only after the owner hint
+	// says a session-content consumer exists. This both keeps the no-subscriber
+	// path cheap and lets the byte bound account for typed prompt slices and
+	// other JSON-shaped values that a hand-written estimator could undercount.
+	if p == nil || p.isClosed() || strings.TrimSpace(run.SessionID()) == "" {
+		return
+	}
+	p.mu.Lock()
+	o := p.owners[run.SessionID()]
+	p.mu.Unlock()
+	if o == nil {
+		return
+	}
+	if !o.hasOpenInterest() {
+		// Do not JSON-encode a source event when no session-content
+		// subscription exists. A bounded identity-only gap task preserves the
+		// stronger contract: a reconnect may reuse an already encoded replay
+		// buffer only when no event was missed while the resource was idle.
+		if o.markRunGapPending(run.ID()) {
+			if err := o.enqueue(ownerTask{runGap: &runGapInput{runID: run.ID(), sessionID: run.SessionID()}, bytes: 64}); err != nil {
+				o.clearRunGapPending(run.ID())
+			}
+		}
+		return
+	}
+	_ = o.enqueue(ownerTask{runEvent: &runEventInput{runID: run.ID(), sessionID: run.SessionID(), event: event}, bytes: estimateRunEventBytes(event)})
+}
+
+// RunEventObserverLoss is the explicit source-mailbox loss signal. It uses
+// the same coalesced identity-only marker as the no-subscriber path: at most
+// one task is accepted for a run, and the owner will mark that run recovery
+// required rather than pretending that later cursors are continuous.
+func (p *Provider) RunEventObserverLoss(run *execution.CoordinatedSessionRun, _ string) {
+	if run == nil || p == nil || p.isClosed() {
+		return
+	}
+	p.mu.Lock()
+	o := p.owners[run.SessionID()]
+	p.mu.Unlock()
+	if o == nil || !o.markRunGapPending(run.ID()) {
+		return
+	}
+	if err := o.enqueue(ownerTask{runGap: &runGapInput{runID: run.ID(), sessionID: run.SessionID()}, bytes: 64}); err != nil {
+		o.clearRunGapPending(run.ID())
+	}
+}
+
+func (p *Provider) RunSettled(run *execution.CoordinatedSessionRun, result execution.SessionMessageResult, err error) {
+	if run == nil {
+		return
+	}
+	p.clearRunGapPending(run)
+	p.publishRunTask(run.SessionID(), ownerTask{runSettled: &runSettlement{runID: run.ID(), sessionID: run.SessionID(), turnID: result.TurnID, status: string(run.Status()), result: result, err: err}, bytes: 256})
+}
+
+// Terminal source callbacks must retire the coalesced idle-gap marker even
+// when there are no subscribers and therefore no owner task is admitted. The
+// marker is a recovery hint for one active run, not a historical run index;
+// retaining it after settlement would make a long-lived owner grow one entry
+// per completed run.
+func (p *Provider) clearRunGapPending(run *execution.CoordinatedSessionRun) {
+	if p == nil || run == nil {
+		return
+	}
+	p.mu.Lock()
+	o := p.owners[run.SessionID()]
+	p.mu.Unlock()
+	if o != nil {
+		o.clearRunGapPending(run.ID())
+	}
+}
+
+func (p *Provider) publishRunTask(sessionID string, task ownerTask) {
+	if p == nil || p.isClosed() || strings.TrimSpace(sessionID) == "" {
+		return
+	}
+	p.mu.Lock()
+	o := p.owners[sessionID]
+	p.mu.Unlock()
+	if o == nil || !o.hasOpenInterest() {
+		return
+	}
+	_ = o.enqueue(task)
 }
 
 func (p *Provider) invalidateAll(err error) {
@@ -268,6 +476,10 @@ func (p *Provider) invalidateAll(err error) {
 }
 
 func (p *Provider) Open(ctx context.Context, key protocol.ResourceKey, resume *protocol.ResumeToken) (syncengine.OpenedResource, error) {
+	return p.OpenWithRunResume(ctx, key, resume, nil)
+}
+
+func (p *Provider) OpenWithRunResume(ctx context.Context, key protocol.ResourceKey, resume *protocol.ResumeToken, activeRunResume *protocol.RunResumeToken) (syncengine.OpenedResource, error) {
 	if p == nil || p.isClosed() {
 		return syncengine.OpenedResource{}, ErrProviderClosed
 	}
@@ -288,8 +500,10 @@ func (p *Provider) Open(ctx context.Context, key protocol.ResourceKey, resume *p
 		return syncengine.OpenedResource{}, err
 	}
 	defer o.claims.Add(-1)
-	request := &openRequest{ctx: ctx, resume: cloneResume(resume), result: make(chan openResult, 1)}
-	if err := o.enqueue(ownerTask{open: request}); err != nil {
+	o.beginOpen()
+	request := &openRequest{ctx: ctx, resume: cloneResume(resume), activeRunResume: cloneRunResume(activeRunResume), result: make(chan openResult, 1)}
+	if err := o.enqueue(ownerTask{open: request, bytes: 512}); err != nil {
+		o.endOpen()
 		return syncengine.OpenedResource{}, err
 	}
 	select {
@@ -425,12 +639,16 @@ func newOwner(p *Provider, sessionID string) (*owner, error) {
 		cancel()
 		return nil, fmt.Errorf("session content stream epoch exceeds the maximum wire identifier length")
 	}
+	queueCapacity := p.options.ProjectorQueueCapacity
+	if p.options.TransientQueueCapacity < queueCapacity {
+		queueCapacity = p.options.TransientQueueCapacity
+	}
 	journal, err := syncengine.NewBoundedJournal(epoch, p.options.JournalEntries, p.options.JournalBytes)
 	if err != nil {
 		cancel()
 		return nil, err
 	}
-	o := &owner{provider: p, sessionID: sessionID, epoch: epoch, journal: journal, queue: make(chan ownerTask, p.options.ProjectorQueueCapacity), ctx: ctx, cancel: cancel, workerDone: make(chan struct{}), subs: make(map[*syncengine.LiveSubscription]struct{}), blobs: newItemBlobCache(p.options.MaxItemBlobs)}
+	o := &owner{provider: p, sessionID: sessionID, epoch: epoch, journal: journal, queue: make(chan ownerTask, queueCapacity), queueOverflow: make(chan struct{}, 1), ctx: ctx, cancel: cancel, workerDone: make(chan struct{}), subs: make(map[*syncengine.LiveSubscription]struct{}), transientSubs: make(map[*syncengine.TransientSubscription]struct{}), pendingAdmissions: make(map[string]int), runGapPending: make(map[string]struct{}), blobs: newItemBlobCache(p.options.MaxItemBlobs)}
 	go o.run()
 	return o, nil
 }
@@ -444,22 +662,139 @@ func (o *owner) enqueue(task ownerTask) error {
 		return ErrProviderClosed
 	default:
 	}
-	select {
-	case o.queue <- task:
-		return nil
-	default:
-		o.invalidate(ErrQueueFull)
+	if task.bytes <= 0 {
+		task.bytes = 128
+	}
+	o.queueMu.Lock()
+	if len(o.queue) >= cap(o.queue) || o.queueBytes+task.bytes > o.provider.options.TransientQueueBytes {
+		o.queueMu.Unlock()
+		o.signalQueueOverflow()
 		return ErrQueueFull
 	}
+	select {
+	case o.queue <- task:
+		o.queueBytes += task.bytes
+		if task.runAdmitted != nil {
+			o.pendingAdmissions[task.runAdmitted.runID]++
+		}
+		o.queueMu.Unlock()
+		return nil
+	default:
+		o.queueMu.Unlock()
+		o.signalQueueOverflow()
+		return ErrQueueFull
+	}
+}
+
+// signalQueueOverflow is intentionally a non-blocking, coalesced handoff to
+// the owner worker. In particular, it never takes owner.mu, so a producer is
+// still bounded/non-blocking even while the worker is inside a slow snapshot
+// or projection operation. One marker is enough to invalidate the resource;
+// dropping further markers cannot create another silent cursor advance.
+func (o *owner) signalQueueOverflow() {
+	if o == nil || o.queueOverflow == nil {
+		return
+	}
+	select {
+	case o.queueOverflow <- struct{}{}:
+	default:
+	}
+}
+
+func (o *owner) releaseTask(task ownerTask) {
+	o.queueMu.Lock()
+	if o.queueBytes >= task.bytes {
+		o.queueBytes -= task.bytes
+	} else {
+		o.queueBytes = 0
+	}
+	if task.runAdmitted != nil {
+		if pending := o.pendingAdmissions[task.runAdmitted.runID]; pending <= 1 {
+			delete(o.pendingAdmissions, task.runAdmitted.runID)
+		} else {
+			o.pendingAdmissions[task.runAdmitted.runID] = pending - 1
+		}
+	}
+	o.queueMu.Unlock()
+}
+
+func (o *owner) hasPendingRunAdmission(runID string) bool {
+	o.queueMu.Lock()
+	defer o.queueMu.Unlock()
+	return o.pendingAdmissions[runID] > 0
+}
+
+func (o *owner) hasOpenInterest() bool {
+	if o == nil {
+		return false
+	}
+	// Both counters deliberately avoid owner.mu on the execution producer
+	// path. openInterest is separate from the subscriber count so a pending
+	// open cannot be mistaken for an already registered subscription (or be
+	// lost if a future subscriber accounting change adjusts subscriberHint).
+	return o.openInterest.Load() > 0 || o.subscriberHint.Load() > 0
+}
+
+func (o *owner) markRunGapPending(runID string) bool {
+	runID = strings.TrimSpace(runID)
+	if o == nil || runID == "" {
+		return false
+	}
+	o.gapMu.Lock()
+	defer o.gapMu.Unlock()
+	if _, exists := o.runGapPending[runID]; exists {
+		return false
+	}
+	o.runGapPending[runID] = struct{}{}
+	return true
+}
+
+func (o *owner) clearRunGapPending(runID string) {
+	if o == nil {
+		return
+	}
+	o.gapMu.Lock()
+	delete(o.runGapPending, runID)
+	o.gapMu.Unlock()
+}
+
+func (o *owner) beginOpen() {
+	o.mu.Lock()
+	if !o.closed {
+		o.pendingOpens++
+		o.openInterest.Add(1)
+	}
+	o.mu.Unlock()
+}
+func (o *owner) endOpen() {
+	o.mu.Lock()
+	if o.pendingOpens > 0 {
+		o.pendingOpens--
+		o.openInterest.Add(-1)
+	}
+	o.mu.Unlock()
 }
 
 func (o *owner) run() {
 	defer close(o.workerDone)
 	for {
+		// Prefer a queued overflow marker over another producer task. This keeps
+		// a full queue from being drained as if it were continuous after loss.
 		select {
 		case <-o.ctx.Done():
 			return
+		case <-o.queueOverflow:
+			o.invalidate(ErrQueueFull)
+			continue
+		default:
+		}
+		select {
+		case <-o.ctx.Done():
+			return
+		case <-o.queueOverflow:
+			o.invalidate(ErrQueueFull)
 		case task := <-o.queue:
+			o.releaseTask(task)
 			if task.stop {
 				return
 			}
@@ -470,6 +805,21 @@ func (o *owner) run() {
 			if task.mutation != nil {
 				o.handleMutation(*task.mutation)
 			}
+			if task.runAdmitted != nil {
+				o.handleRunAdmitted(*task.runAdmitted)
+			}
+			if task.runGap != nil {
+				o.handleRunGap(*task.runGap)
+			}
+			if task.runAdmissionFailed != nil {
+				o.handleRunAdmissionFailed(*task.runAdmissionFailed)
+			}
+			if task.runEvent != nil {
+				o.handleRunEvent(*task.runEvent)
+			}
+			if task.runSettled != nil {
+				o.handleRunSettled(*task.runSettled)
+			}
 		}
 	}
 }
@@ -478,7 +828,13 @@ func (o *owner) handleOpen(request *openRequest) {
 	if request == nil {
 		return
 	}
-	opened, err := o.openBarrier(request.ctx, request.resume)
+	// The owner queue is ordered and the pending-open hint keeps producers
+	// enqueueing while this task waits for the durable barrier. Consequently a
+	// run task accepted during Open is processed either before capture (and is
+	// included in replay) or after the registered live subscription (and is
+	// delivered live); no separate unbounded pending slice is needed.
+	defer o.endOpen()
+	opened, err := o.openBarrier(request.ctx, request.resume, request.activeRunResume)
 	if request.ctx != nil && request.ctx.Err() != nil {
 		if opened.Close != nil {
 			opened.Close()
@@ -494,7 +850,7 @@ func (o *owner) handleOpen(request *openRequest) {
 	}
 }
 
-func (o *owner) openBarrier(ctx context.Context, resume *protocol.ResumeToken) (syncengine.OpenedResource, error) {
+func (o *owner) openBarrier(ctx context.Context, resume *protocol.ResumeToken, activeRunResume *protocol.RunResumeToken) (syncengine.OpenedResource, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -515,10 +871,19 @@ func (o *owner) openBarrier(ctx context.Context, resume *protocol.ResumeToken) (
 		}
 		o.mu.Lock()
 		reset := o.initialized && (o.stale || o.invalid)
+		preserveTransient := o.transientRun != nil && !o.transientRun.settled && built.snapshot.ActiveRun != nil && built.snapshot.ActiveRun.RunID == o.transientRun.runID
 		if reset {
 			if err := o.resetJournalLocked(); err != nil {
 				o.mu.Unlock()
 				return syncengine.OpenedResource{}, err
+			}
+			// An idle unsubscribe can rebuild the durable journal while the
+			// independent in-memory run is still active. Preserve that run only
+			// when the rebuilt durable state names the same run; a new owner (or
+			// a settled/changed run) has no trustworthy transient baseline and
+			// remains recovery-required.
+			if !preserveTransient {
+				o.transientRun = nil
 			}
 		}
 		if !o.initialized || o.stale || o.invalid {
@@ -527,7 +892,7 @@ func (o *owner) openBarrier(ctx context.Context, resume *protocol.ResumeToken) (
 		}
 		o.mu.Unlock()
 	}
-	encoded, content, revision, epoch, sequence, decision, live, sub, err := o.captureOpen(ctx, resume)
+	encoded, content, revision, epoch, sequence, decision, live, sub, transientReplay, transient, transientResync, err := o.captureOpen(ctx, resume, activeRunResume)
 	if err != nil {
 		return syncengine.OpenedResource{}, err
 	}
@@ -535,6 +900,9 @@ func (o *owner) openBarrier(ctx context.Context, resume *protocol.ResumeToken) (
 		if o.provider.options.BlobWriter == nil {
 			sub.Close()
 			o.removeSub(sub)
+			if transient.Close != nil {
+				transient.Close()
+			}
 			return syncengine.OpenedResource{}, fmt.Errorf("session content snapshot is %d bytes and no blob writer is configured", len(encoded))
 		}
 		blobContext, finishBlob := o.requestContext(ctx)
@@ -543,6 +911,9 @@ func (o *owner) openBarrier(ctx context.Context, resume *protocol.ResumeToken) (
 		if blobErr != nil {
 			sub.Close()
 			o.removeSub(sub)
+			if transient.Close != nil {
+				transient.Close()
+			}
 			return syncengine.OpenedResource{}, fmt.Errorf("store session content snapshot blob: %w", blobErr)
 		}
 		content = syncengine.NewBlobSnapshotContent(descriptor)
@@ -551,7 +922,14 @@ func (o *owner) openBarrier(ctx context.Context, resume *protocol.ResumeToken) (
 		Snapshot:    syncengine.Snapshot{Content: content, ResourceRevision: revision},
 		StreamEpoch: epoch, Sequence: sequence, Decision: decision, LiveFromSequence: sequence + 1,
 		Changes: live.Entries, Terminal: live.Terminal,
-		Close: func() { sub.Close(); o.removeSub(sub) },
+		TransientReplay: transientReplay, Transient: transient, TransientResync: transientResync,
+		Close: func() {
+			sub.Close()
+			o.removeSub(sub)
+			if transient.Close != nil {
+				transient.Close()
+			}
+		},
 	}, nil
 }
 
@@ -570,32 +948,196 @@ func (o *owner) requestContext(request context.Context) (context.Context, func()
 	}
 }
 
-func (o *owner) captureOpen(ctx context.Context, resume *protocol.ResumeToken) ([]byte, syncengine.SnapshotContent, protocol.ResourceRevision, string, uint64, syncengine.ResumeDecision, syncengine.LiveDelivery, *syncengine.LiveSubscription, error) {
+func (o *owner) captureOpen(ctx context.Context, resume *protocol.ResumeToken, activeRunResume *protocol.RunResumeToken) ([]byte, syncengine.SnapshotContent, protocol.ResourceRevision, string, uint64, syncengine.ResumeDecision, syncengine.LiveDelivery, *syncengine.LiveSubscription, []syncengine.TransientEvent, syncengine.TransientDelivery, string, error) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	if o.closed {
-		return nil, syncengine.SnapshotContent{}, "", "", 0, syncengine.ResumeDecision{}, syncengine.LiveDelivery{}, nil, ErrProviderClosed
+		return nil, syncengine.SnapshotContent{}, "", "", 0, syncengine.ResumeDecision{}, syncengine.LiveDelivery{}, nil, nil, syncengine.TransientDelivery{}, "", ErrProviderClosed
 	}
 	if !o.initialized || o.invalid {
-		return nil, syncengine.SnapshotContent{}, "", "", 0, syncengine.ResumeDecision{}, syncengine.LiveDelivery{}, nil, ErrProviderInvalid
-	}
-	if err := o.projection.snapshot.Validate(); err != nil {
-		return nil, syncengine.SnapshotContent{}, "", "", 0, syncengine.ResumeDecision{}, syncengine.LiveDelivery{}, nil, err
-	}
-	encoded, err := json.Marshal(o.projection.snapshot)
-	if err != nil {
-		return nil, syncengine.SnapshotContent{}, "", "", 0, syncengine.ResumeDecision{}, syncengine.LiveDelivery{}, nil, err
+		return nil, syncengine.SnapshotContent{}, "", "", 0, syncengine.ResumeDecision{}, syncengine.LiveDelivery{}, nil, nil, syncengine.TransientDelivery{}, "", ErrProviderInvalid
 	}
 	sequence := o.journal.LastSequence()
 	epoch := o.journal.Epoch()
 	sub, err := syncengine.NewLiveSubscription(epoch, sequence, o.provider.options.LiveCapacity)
 	if err != nil {
-		return nil, syncengine.SnapshotContent{}, "", "", 0, syncengine.ResumeDecision{}, syncengine.LiveDelivery{}, nil, err
+		return nil, syncengine.SnapshotContent{}, "", "", 0, syncengine.ResumeDecision{}, syncengine.LiveDelivery{}, nil, nil, syncengine.TransientDelivery{}, "", err
 	}
 	o.subs[sub] = struct{}{}
+	o.subscriberHint.Add(1)
+	transientReplay, transientDelivery, transientResync, transientSub := o.captureTransientLocked(activeRunResume)
+	if transientSub != nil {
+		o.transientSubs[transientSub] = struct{}{}
+	}
+	snapshot := o.snapshotForOpenLocked()
+	if err := snapshot.Validate(); err != nil {
+		if transientSub != nil {
+			delete(o.transientSubs, transientSub)
+			transientSub.Close()
+		}
+		delete(o.subs, sub)
+		o.subscriberHint.Add(-1)
+		sub.Close()
+		return nil, syncengine.SnapshotContent{}, "", "", 0, syncengine.ResumeDecision{}, syncengine.LiveDelivery{}, nil, nil, syncengine.TransientDelivery{}, "", err
+	}
+	encoded, err := json.Marshal(snapshot)
+	if err != nil {
+		if transientSub != nil {
+			delete(o.transientSubs, transientSub)
+			transientSub.Close()
+		}
+		delete(o.subs, sub)
+		o.subscriberHint.Add(-1)
+		sub.Close()
+		return nil, syncengine.SnapshotContent{}, "", "", 0, syncengine.ResumeDecision{}, syncengine.LiveDelivery{}, nil, nil, syncengine.TransientDelivery{}, "", err
+	}
 	o.lastUsed = time.Now()
 	decision := o.journal.Decide(resume)
-	return encoded, syncengine.NewInlineSnapshotContent(encoded), o.projection.revision, epoch, sequence, decision, sub.Delivery(), sub, nil
+	return encoded, syncengine.NewInlineSnapshotContent(encoded), o.projection.revision, epoch, sequence, decision, sub.Delivery(), sub, transientReplay, transientDelivery, transientResync, nil
+}
+
+func (o *owner) snapshotForOpenLocked() Snapshot {
+	return o.snapshotWithTransientLocked(o.projection.snapshot)
+}
+
+// snapshotWithTransientLocked decorates a durable baseline with the current
+// in-memory run recovery descriptor. The decoration is not a durable write and
+// does not advance either resource revision or journal sequence. It is also
+// applied to active_run.replace changes, otherwise a client that was already
+// subscribed would never learn the run epoch needed for a later reconnect.
+func (o *owner) snapshotWithTransientLocked(snapshot Snapshot) Snapshot {
+	if snapshot.ActiveRun == nil {
+		return snapshot
+	}
+	active := *snapshot.ActiveRun
+	// Do not carry a previous in-memory decoration through a durable
+	// projection update. A desync/rebuild must not advertise stale replay
+	// coverage from an earlier run epoch.
+	active.RunEpoch = ""
+	active.RunCursor = ""
+	active.ReplayAvailable = false
+	active.ReplayFromCursor = ""
+	active.ReplayToCursor = ""
+	active.SettlementWatermark = nil
+	active.RecoveryRequired = true
+	if o.transientRun != nil && o.transientRun.runID == active.RunID {
+		active.RunEpoch = o.transientRun.epoch
+		active.RunCursor = protocol.RunCursor(strconv.FormatUint(o.transientRun.cursor, 10))
+		if !o.transientRun.desynced && (o.transientRun.cursor == 0 || len(o.transientRun.replay) > 0) {
+			active.RecoveryRequired = false
+		}
+		if !o.transientRun.desynced && len(o.transientRun.replay) > 0 {
+			active.ReplayAvailable = true
+			active.ReplayFromCursor = o.transientRun.replay[0].Cursor
+			active.ReplayToCursor = o.transientRun.replay[len(o.transientRun.replay)-1].Cursor
+		}
+		if o.transientRun.settlementWatermark != nil {
+			watermark := *o.transientRun.settlementWatermark
+			watermark.CoveredItems = make([]protocol.TransientItemWatermark, len(o.transientRun.settlementWatermark.CoveredItems))
+			copy(watermark.CoveredItems, o.transientRun.settlementWatermark.CoveredItems)
+			active.SettlementWatermark = &watermark
+		}
+	}
+	snapshot.ActiveRun = &active
+	return snapshot
+}
+
+func (o *owner) captureTransientLocked(resume *protocol.RunResumeToken) ([]syncengine.TransientEvent, syncengine.TransientDelivery, string, *syncengine.TransientSubscription) {
+	active := o.projection.snapshot.ActiveRun
+	runID := ""
+	// The transport-neutral run source is ahead of the durable active-run
+	// mutation during admission. Prefer it while it is live; otherwise a
+	// concurrent open could replace a just-admitted run with the previous
+	// durable descriptor and make all subsequent events look stale.
+	if o.transientRun != nil && !o.transientRun.settled {
+		runID = o.transientRun.runID
+	} else if active != nil {
+		runID = active.RunID
+	}
+	if o.transientRun == nil && active != nil && o.hasPendingRunAdmission(active.RunID) {
+		// The owner worker is currently inside the open barrier, so the
+		// admission task cannot have run yet. Its presence in the bounded queue
+		// is the proof that this active durable run is the run whose cursor-1
+		// baseline is about to be published; do not fabricate a baseline for a
+		// durable run which merely survived a process restart.
+		o.transientRun = &runState{epoch: o.epoch, runID: active.RunID, itemCursors: make(map[ItemKey]protocol.RunCursor)}
+		runID = active.RunID
+	}
+	if runID == "" {
+		if resume != nil {
+			return nil, syncengine.TransientDelivery{}, "active_run_mismatch", nil
+		}
+		sub, err := syncengine.NewTransientSubscription(o.epoch, "", 0, o.provider.options.TransientLiveCapacity, o.provider.options.TransientLiveBytes)
+		if err != nil {
+			return nil, syncengine.TransientDelivery{}, "active_run_recovery_required", nil
+		}
+		delivery := sub.Delivery()
+		delivery.Close = func() { o.removeTransientSub(sub) }
+		return nil, delivery, "", sub
+	}
+	// A durable active-run descriptor without an in-memory run state is the
+	// process-restart/late-join case. There is no trustworthy cursor baseline:
+	// starting at zero would fabricate continuity for events already emitted.
+	// Keep the durable snapshot, but force the resource-local active-run
+	// recovery contract instead of manufacturing a replayable stream.
+	if o.transientRun == nil || o.transientRun.runID != runID || o.transientRun.settled {
+		return nil, syncengine.TransientDelivery{}, "active_run_recovery_required", nil
+	}
+	run := o.transientRun
+	if run.desynced {
+		return nil, syncengine.TransientDelivery{}, "active_run_recovery_required", nil
+	}
+	base := uint64(0)
+	if resume != nil {
+		if resume.RunID != run.runID || resume.RunEpoch != run.epoch {
+			return nil, syncengine.TransientDelivery{}, "active_run_epoch_mismatch", nil
+		}
+		parsed, err := protocol.ParseUint64Decimal(string(resume.RunCursor))
+		if err != nil {
+			return nil, syncengine.TransientDelivery{}, "active_run_cursor_invalid", nil
+		}
+		base = parsed
+	}
+	if base > run.cursor {
+		return nil, syncengine.TransientDelivery{}, "active_run_cursor_ahead", nil
+	}
+	if run.cursor > 0 && len(run.replay) == 0 {
+		if resume != nil {
+			return nil, syncengine.TransientDelivery{}, "active_run_cursor_too_old", nil
+		}
+		return nil, syncengine.TransientDelivery{}, "active_run_recovery_required", nil
+	}
+	if len(run.replay) > 0 {
+		first, _ := protocol.ParseUint64Decimal(string(run.replay[0].Cursor))
+		if base+1 < first && resume != nil {
+			return nil, syncengine.TransientDelivery{}, "active_run_cursor_too_old", nil
+		}
+		if resume == nil && base+1 < first {
+			base = first - 1
+		}
+	}
+	replay := make([]syncengine.TransientEvent, 0, len(run.replay))
+	for _, event := range run.replay {
+		cursor, _ := protocol.ParseUint64Decimal(string(event.Cursor))
+		if cursor > base {
+			replay = append(replay, event)
+		}
+	}
+	// Replay is sent directly by the dispatcher before the live pump starts.
+	// Advance the live subscription's continuity baseline over those entries;
+	// otherwise the first post-barrier event would be reported as a cursor gap
+	// because the delivery object only sees live Offer calls.
+	liveBase := base
+	if len(replay) > 0 {
+		liveBase, _ = protocol.ParseUint64Decimal(string(replay[len(replay)-1].Cursor))
+	}
+	sub, err := syncengine.NewTransientSubscription(run.epoch, run.runID, liveBase, o.provider.options.TransientLiveCapacity, o.provider.options.TransientLiveBytes)
+	if err != nil {
+		return nil, syncengine.TransientDelivery{}, "active_run_recovery_required", nil
+	}
+	delivery := sub.Delivery()
+	delivery.Close = func() { o.removeTransientSub(sub) }
+	return replay, delivery, "", sub
 }
 
 func (o *owner) handleMutation(mutation sessions.Mutation) {
@@ -604,10 +1146,18 @@ func (o *owner) handleMutation(mutation sessions.Mutation) {
 		o.mu.Unlock()
 		return
 	}
-	if len(o.subs) == 0 {
+	if len(o.subs) == 0 && o.pendingOpens == 0 {
 		if o.initialized {
 			o.stale = true
-			_ = o.resetJournalLocked()
+			// Keep a live run's independent replay state across a short
+			// unsubscribe/reconnect window. RunEvent records an identity-only
+			// gap while the owner is idle, so this state is never advertised as
+			// continuous if a source event was missed. A settled/no-run state can
+			// be discarded immediately.
+			if o.transientRun == nil || o.transientRun.settled {
+				_ = o.resetJournalLocked()
+				o.transientRun = nil
+			}
 		}
 		o.mu.Unlock()
 		return
@@ -625,6 +1175,343 @@ func (o *owner) handleMutation(mutation sessions.Mutation) {
 	o.applyProjection(built)
 }
 
+func (o *owner) handleRunAdmitted(admission runAdmission) {
+	o.clearRunGapPending(admission.runID)
+	o.mu.Lock()
+	if o.closed || admission.sessionID != o.sessionID || (len(o.subs) == 0 && o.pendingOpens == 0) {
+		o.mu.Unlock()
+		return
+	}
+	// A desynced old run is already outside the continuity contract. The
+	// coordinator's next admission is authoritative and must replace that
+	// poisoned state; otherwise one lost run could prevent every later run in
+	// the same session from establishing a fresh cursor-1 baseline.
+	if o.transientRun != nil && o.transientRun.runID != admission.runID && !o.transientRun.settled && !o.transientRun.desynced {
+		o.mu.Unlock()
+		return
+	}
+	o.transientRun = &runState{epoch: o.epoch, runID: admission.runID, itemCursors: make(map[ItemKey]protocol.RunCursor)}
+	event := protocol.TransientSubscriptionEvent{Type: protocol.SubscriptionEventRunStarted, SessionID: admission.sessionID, RunID: admission.runID, RunCursor: protocol.RunCursor("0"), Status: "running"}
+	entries, subs, err := o.appendTransientLocked(event)
+	o.mu.Unlock()
+	if err != nil {
+		o.desyncTransient(err)
+		return
+	}
+	o.deliverTransient(entries, subs)
+}
+
+func (o *owner) handleRunAdmissionFailed(admission runAdmission) {
+	o.clearRunGapPending(admission.runID)
+	o.mu.Lock()
+	shouldDesync := admission.sessionID == o.sessionID && o.transientRun != nil && o.transientRun.runID == admission.runID && !o.transientRun.settled
+	if shouldDesync {
+		o.transientRun.desynced = true
+	}
+	o.mu.Unlock()
+	if shouldDesync {
+		o.desyncTransient(ErrProviderInvalid)
+	}
+}
+
+func (o *owner) handleRunGap(gap runGapInput) {
+	defer o.clearRunGapPending(gap.runID)
+	o.mu.Lock()
+	shouldDesync := !o.closed && gap.sessionID == o.sessionID && o.transientRun != nil && o.transientRun.runID == gap.runID && !o.transientRun.settled && !o.transientRun.desynced
+	if shouldDesync {
+		o.transientRun.desynced = true
+	}
+	o.mu.Unlock()
+	if shouldDesync {
+		o.desyncTransient(ErrProviderInvalid)
+	}
+}
+
+func (o *owner) handleRunEvent(input runEventInput) {
+	o.mu.Lock()
+	if o.closed || input.sessionID != o.sessionID {
+		o.mu.Unlock()
+		return
+	}
+	// Filter run identity before decoding the event. A late event from an old
+	// run must not turn a malformed old payload into a desync of the replacement
+	// active run. If no durable run is active either, there is no current
+	// transient stream which this event could validly establish.
+	if o.transientRun != nil {
+		if o.transientRun.runID != input.runID || o.transientRun.settled || o.transientRun.desynced {
+			o.mu.Unlock()
+			return
+		}
+	} else if active := o.projection.snapshot.ActiveRun; active == nil || active.RunID != input.runID {
+		o.mu.Unlock()
+		return
+	}
+	event, ok, err := subscriptionEventFromExecution(input.event, input.sessionID, input.runID)
+	if err != nil {
+		o.mu.Unlock()
+		o.desyncTransient(err)
+		return
+	}
+	if !ok {
+		// The execution source is shared with the durable projector. A durable
+		// notice has no transient cursor and therefore cannot create a transient
+		// gap when it arrives after a subscription closes.
+		o.mu.Unlock()
+		return
+	}
+	if len(o.subs) == 0 && o.pendingOpens == 0 {
+		shouldDesync := o.transientRun != nil && o.transientRun.runID == input.runID && !o.transientRun.settled && !o.transientRun.desynced
+		if shouldDesync {
+			o.transientRun.desynced = true
+		}
+		o.mu.Unlock()
+		if shouldDesync {
+			o.desyncTransient(ErrProviderInvalid)
+		}
+		return
+	}
+	if o.transientRun == nil {
+		// The admission/start event was not observed by this owner (for
+		// example, a bounded owner queue overflowed). Starting the cursor from
+		// an arbitrary mid-run event would be a fabricated replay baseline. If
+		// the durable projection already names a different active run, this is
+		// specifically a late event from the old run and must not poison the
+		// replacement run's recovery state.
+		o.transientRun = &runState{epoch: o.epoch, runID: input.runID, desynced: true, itemCursors: make(map[ItemKey]protocol.RunCursor)}
+		o.mu.Unlock()
+		o.desyncTransient(ErrProviderInvalid)
+		return
+	}
+	if o.transientRun == nil || o.transientRun.runID != input.runID || o.transientRun.settled || o.transientRun.desynced {
+		o.mu.Unlock()
+		return
+	}
+	entries, subs, appendErr := o.appendTransientLocked(event)
+	o.mu.Unlock()
+	if appendErr != nil {
+		o.desyncTransient(appendErr)
+		return
+	}
+	o.deliverTransient(entries, subs)
+}
+
+func (o *owner) handleRunSettled(settlement runSettlement) {
+	defer o.clearRunGapPending(settlement.runID)
+	o.mu.Lock()
+	if o.closed || settlement.sessionID != o.sessionID || o.transientRun == nil || o.transientRun.runID != settlement.runID || o.transientRun.desynced || o.transientRun.settled {
+		o.mu.Unlock()
+		return
+	}
+	itemCursors := make(map[ItemKey]protocol.RunCursor, len(o.transientRun.itemCursors))
+	for key, cursor := range o.transientRun.itemCursors {
+		itemCursors[key] = cursor
+	}
+	cursor := protocol.RunCursor(strconv.FormatUint(o.transientRun.cursor, 10))
+	uncovered := o.transientRun.uncovered
+	o.mu.Unlock()
+
+	watermark := protocol.DurableSettlementWatermark{ResourceRevision: protocol.ResourceRevision(strconv.FormatInt(settlement.result.LastSeq, 10)), RunCursor: cursor, CoveredItems: make([]protocol.TransientItemWatermark, 0)}
+	built, buildErr := o.provider.buildProjection(o.ctx, o.sessionID, o.blobs)
+	if !uncovered && buildErr == nil && built.revision == watermark.ResourceRevision {
+		watermark.Verified = true
+		for key, itemCursor := range itemCursors {
+			for _, item := range built.snapshot.History.Items {
+				if item.Key == key {
+					watermark.CoveredItems = append(watermark.CoveredItems, protocol.TransientItemWatermark{TurnID: key.TurnID, AgentIteration: key.AgentIteration, ItemID: key.ItemID, RunCursor: itemCursor})
+					break
+				}
+			}
+		}
+		// A non-empty transient item set must be completely present in the
+		// verified durable window. A revision match alone is not proof of item
+		// coverage, so fall back to recovery when the window was truncated.
+		if len(watermark.CoveredItems) != len(itemCursors) {
+			watermark.Verified = false
+		}
+		if !watermark.Verified {
+			// A partial list is not a usable proof. Do not leave D3 with a
+			// tempting subset that could accidentally clear only part of an
+			// overlay while the remaining tail still needs recovery.
+			watermark.CoveredItems = make([]protocol.TransientItemWatermark, 0)
+		} else {
+			sort.Slice(watermark.CoveredItems, func(i, j int) bool {
+				left, right := watermark.CoveredItems[i], watermark.CoveredItems[j]
+				if left.TurnID != right.TurnID {
+					return left.TurnID < right.TurnID
+				}
+				if left.AgentIteration != right.AgentIteration {
+					return left.AgentIteration < right.AgentIteration
+				}
+				return left.ItemID < right.ItemID
+			})
+		}
+	}
+	o.mu.Lock()
+	if o.transientRun == nil || o.transientRun.runID != settlement.runID || o.transientRun.desynced {
+		o.mu.Unlock()
+		return
+	}
+	event := protocol.TransientSubscriptionEvent{Type: protocol.SubscriptionEventRunSettled, SessionID: settlement.sessionID, RunID: settlement.runID, RunCursor: cursor, TurnID: settlement.turnID, Status: settlement.status, Settlement: &watermark}
+	entries, subs, err := o.appendTransientLocked(event)
+	if err == nil {
+		o.transientRun.settlementWatermark = &watermark
+		o.transientRun.settled = true
+	}
+	o.mu.Unlock()
+	if err != nil {
+		o.desyncTransient(err)
+		return
+	}
+	o.deliverTransient(entries, subs)
+}
+
+func (o *owner) appendTransientLocked(event protocol.TransientSubscriptionEvent) ([]syncengine.TransientEvent, []*syncengine.TransientSubscription, error) {
+	if o.transientRun == nil {
+		return nil, nil, fmt.Errorf("active run is not registered")
+	}
+	if event.RunID != o.transientRun.runID {
+		return nil, nil, fmt.Errorf("run identity changed")
+	}
+	parts := []protocol.TransientSubscriptionEvent{event}
+	splitValue := ""
+	switch event.Type {
+	case protocol.SubscriptionEventTextDelta, protocol.SubscriptionEventReasoningDelta:
+		if !utf8.ValidString(event.Delta) {
+			return nil, nil, fmt.Errorf("transient text delta is not valid UTF-8")
+		}
+		splitValue = event.Delta
+	case protocol.SubscriptionEventToolProgress:
+		if !utf8.ValidString(event.ArgumentsDelta) {
+			return nil, nil, fmt.Errorf("transient tool arguments delta is not valid UTF-8")
+		}
+		splitValue = event.ArgumentsDelta
+	}
+	if splitValue != "" && len(splitValue) > 128*1024 {
+		parts = nil
+		remaining := splitValue
+		for remaining != "" {
+			cut := 128 * 1024
+			if cut > len(remaining) {
+				cut = len(remaining)
+			}
+			for cut > 0 && cut < len(remaining) && !utf8.ValidString(remaining[:cut]) {
+				cut--
+			}
+			if cut == 0 {
+				_, size := utf8.DecodeRuneInString(remaining)
+				cut = size
+			}
+			part := event
+			if event.Type == protocol.SubscriptionEventToolProgress {
+				part.ArgumentsDelta, remaining = remaining[:cut], remaining[cut:]
+			} else {
+				part.Delta, remaining = remaining[:cut], remaining[cut:]
+			}
+			parts = append(parts, part)
+		}
+	}
+	entries := make([]syncengine.TransientEvent, 0, len(parts))
+	nextCursor := o.transientRun.cursor
+	for _, part := range parts {
+		nextCursor++
+		part.RunCursor = protocol.RunCursor(strconv.FormatUint(nextCursor, 10))
+		raw, err := json.Marshal(part)
+		if err != nil {
+			return nil, nil, err
+		}
+		frameBytes, frameErr := preflightSubscriptionEventFrame(raw, o.sessionID)
+		if frameErr != nil {
+			return nil, nil, frameErr
+		}
+		entry := syncengine.TransientEvent{RunEpoch: o.transientRun.epoch, RunID: o.transientRun.runID, Cursor: part.RunCursor, Event: raw, Bytes: frameBytes}
+		if entry.Bytes > o.provider.options.TransientReplayBytes {
+			return nil, nil, fmt.Errorf("single transient event exceeds replay byte bound")
+		}
+		entries = append(entries, entry)
+	}
+	o.transientRun.cursor = nextCursor
+	for index, entry := range entries {
+		// Replay is a sliding recovery window, not a lifetime event budget.
+		// Live subscribers receive every entry through their independent bounded
+		// delivery queue; only reconnects older than the retained first cursor
+		// require resource-local recovery. Evict before append so the retained
+		// messages and bytes never exceed either hard limit.
+		for len(o.transientRun.replay) >= o.provider.options.TransientReplayEntries || o.transientRun.replayBytes > o.provider.options.TransientReplayBytes-entry.Bytes {
+			if len(o.transientRun.replay) == 0 {
+				break
+			}
+			oldest := o.transientRun.replay[0]
+			o.transientRun.replay = o.transientRun.replay[1:]
+			if o.transientRun.replayBytes >= oldest.Bytes {
+				o.transientRun.replayBytes -= oldest.Bytes
+			} else {
+				o.transientRun.replayBytes = 0
+			}
+		}
+		o.transientRun.replay = append(o.transientRun.replay, entry)
+		o.transientRun.replayBytes += entry.Bytes
+		part := parts[index]
+		switch part.Type {
+		case protocol.SubscriptionEventTextDelta, protocol.SubscriptionEventReasoningDelta:
+			if part.ItemID != "" {
+				o.transientRun.itemCursors[ItemKey{TurnID: part.TurnID, AgentIteration: part.AgentIteration, ItemID: part.ItemID}] = entry.Cursor
+			}
+		case protocol.SubscriptionEventRunStarted, protocol.SubscriptionEventRunSettled:
+		default:
+			// Tool calls and prompt queue mutations have stable transient
+			// identities, but the current durable projection has no atomic
+			// relation from those identities to the covered assistant/user
+			// item. Do not claim a verified settlement watermark for them.
+			o.transientRun.uncovered = true
+		}
+	}
+	subs := make([]*syncengine.TransientSubscription, 0, len(o.transientSubs))
+	for sub := range o.transientSubs {
+		subs = append(subs, sub)
+	}
+	return entries, subs, nil
+}
+
+func (o *owner) deliverTransient(entries []syncengine.TransientEvent, subs []*syncengine.TransientSubscription) {
+	for _, entry := range entries {
+		for _, sub := range subs {
+			if !sub.Offer(entry) {
+				o.removeTransientSub(sub)
+			}
+		}
+	}
+}
+
+func (o *owner) desyncTransient(err error) {
+	o.mu.Lock()
+	if o.transientRun != nil {
+		o.transientRun.desynced = true
+	}
+	subs := make([]*syncengine.TransientSubscription, 0, len(o.transientSubs))
+	for sub := range o.transientSubs {
+		subs = append(subs, sub)
+	}
+	o.mu.Unlock()
+	for _, sub := range subs {
+		sub.Desync(err)
+	}
+}
+
+func (o *owner) removeTransientSub(sub *syncengine.TransientSubscription) {
+	if sub == nil {
+		return
+	}
+	o.mu.Lock()
+	if _, ok := o.transientSubs[sub]; ok {
+		delete(o.transientSubs, sub)
+	}
+	// Close even when invalidation already removed the map entry. Desync is a
+	// terminal signal, but the transient delivery channel must still be closed
+	// when the owning subscription is torn down.
+	sub.Close()
+	o.mu.Unlock()
+}
+
 func (o *owner) applyProjection(next projection) {
 	o.mu.Lock()
 	if o.closed || len(o.subs) == 0 {
@@ -632,6 +1519,7 @@ func (o *owner) applyProjection(next projection) {
 		o.mu.Unlock()
 		return
 	}
+	next.snapshot = o.snapshotWithTransientLocked(next.snapshot)
 	previous := o.projection
 	ops, err := diff(previous.snapshot, next.snapshot, next.revision)
 	if err != nil {
@@ -680,10 +1568,19 @@ func (o *owner) deleteResource() {
 	for sub := range o.subs {
 		subs = append(subs, sub)
 		delete(o.subs, sub)
+		o.subscriberHint.Add(-1)
+	}
+	transientSubs := make([]*syncengine.TransientSubscription, 0, len(o.transientSubs))
+	for sub := range o.transientSubs {
+		transientSubs = append(transientSubs, sub)
+		delete(o.transientSubs, sub)
 	}
 	o.invalid, o.stale = true, true
 	o.mu.Unlock()
 	for _, sub := range subs {
+		sub.Desync(sessions.ErrNotFound)
+	}
+	for _, sub := range transientSubs {
 		sub.Desync(sessions.ErrNotFound)
 	}
 }
@@ -698,13 +1595,28 @@ func (o *owner) invalidate(err error) {
 		return
 	}
 	o.invalid, o.stale = true, true
+	if o.transientRun != nil {
+		o.transientRun.desynced = true
+	}
 	subs := make([]*syncengine.LiveSubscription, 0, len(o.subs))
 	for sub := range o.subs {
 		subs = append(subs, sub)
 		delete(o.subs, sub)
+		o.subscriberHint.Add(-1)
 	}
+	transientSubs := make([]*syncengine.TransientSubscription, 0, len(o.transientSubs))
+	for sub := range o.transientSubs {
+		transientSubs = append(transientSubs, sub)
+		delete(o.transientSubs, sub)
+	}
+	o.pendingOpens = 0
+	o.openInterest.Store(0)
+	o.subscriberHint.Store(0)
 	o.mu.Unlock()
 	for _, sub := range subs {
+		sub.Desync(err)
+	}
+	for _, sub := range transientSubs {
 		sub.Desync(err)
 	}
 }
@@ -714,7 +1626,10 @@ func (o *owner) removeSub(sub *syncengine.LiveSubscription) {
 		return
 	}
 	o.mu.Lock()
-	delete(o.subs, sub)
+	if _, ok := o.subs[sub]; ok {
+		delete(o.subs, sub)
+		o.subscriberHint.Add(-1)
+	}
 	o.lastUsed = time.Now()
 	o.mu.Unlock()
 }
@@ -746,9 +1661,21 @@ func (o *owner) close() {
 	for sub := range o.subs {
 		subs = append(subs, sub)
 		delete(o.subs, sub)
+		o.subscriberHint.Add(-1)
 	}
+	transientSubs := make([]*syncengine.TransientSubscription, 0, len(o.transientSubs))
+	for sub := range o.transientSubs {
+		transientSubs = append(transientSubs, sub)
+		delete(o.transientSubs, sub)
+	}
+	o.pendingOpens = 0
+	o.openInterest.Store(0)
+	o.subscriberHint.Store(0)
 	o.mu.Unlock()
 	for _, sub := range subs {
+		sub.Close()
+	}
+	for _, sub := range transientSubs {
 		sub.Close()
 	}
 	o.cancel()
@@ -759,6 +1686,14 @@ func (o *owner) close() {
 }
 
 func cloneResume(token *protocol.ResumeToken) *protocol.ResumeToken {
+	if token == nil {
+		return nil
+	}
+	copy := *token
+	return &copy
+}
+
+func cloneRunResume(token *protocol.RunResumeToken) *protocol.RunResumeToken {
 	if token == nil {
 		return nil
 	}
@@ -875,7 +1810,27 @@ func (p *Provider) buildProjection(ctx context.Context, sessionID string, blobCa
 		snapshot := Snapshot{SchemaVersion: SchemaVersion, Session: sessionMetadataFromState(state), History: history, Compaction: compactionStateFromSession(state, p.options.MaxCompactionRecords)}
 		if state.RunningRunID != "" {
 			runID := state.RunningRunID
-			snapshot.ActiveRun = &ActiveRunDescriptor{RunID: runID, SessionID: state.ID, TurnID: state.RunningTurnID, StartedAt: state.RunningStartedAt, Status: sessions.RunStatusRunning, Recoverable: runID != ""}
+			startedAt := state.RunningStartedAt
+			// RunningStartedAt is also used by the legacy compact state as the
+			// current turn timestamp and is cleared between multi-turn requests.
+			// The active-run descriptor needs the durable run timestamp, so fall
+			// back to the run row rather than emitting an invalid zero time.
+			if startedAt.IsZero() {
+				runs, runErr := p.store.ListRuns(sessionID)
+				if runErr != nil {
+					return projection{}, runErr
+				}
+				for _, run := range runs {
+					if run.ID == runID {
+						startedAt = run.StartedAt
+						break
+					}
+				}
+			}
+			if startedAt.IsZero() {
+				return projection{}, fmt.Errorf("active run %q has no durable started_at", runID)
+			}
+			snapshot.ActiveRun = &ActiveRunDescriptor{RunID: runID, SessionID: state.ID, TurnID: state.RunningTurnID, StartedAt: startedAt, Status: sessions.RunStatusRunning, Recoverable: runID != "", RecoveryRequired: true}
 		}
 		if err := snapshot.Validate(); err != nil {
 			return projection{}, err

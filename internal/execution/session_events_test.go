@@ -772,6 +772,97 @@ func TestSessionEventSinkCoalescesAtSubmitTime(t *testing.T) {
 	}
 }
 
+func TestSessionEventSinkOverflowIsAnExplicitRecoveryBoundary(t *testing.T) {
+	release := make(chan struct{})
+	blocked := make(chan struct{}, 1)
+	var mu sync.Mutex
+	var types []string
+	sink := newSessionEventSinkWithBounds(func(event SessionStreamEvent) {
+		if len(types) == 0 {
+			select {
+			case blocked <- struct{}{}:
+			default:
+			}
+		}
+		<-release
+		mu.Lock()
+		if event != nil {
+			typeName, _ := event["type"].(string)
+			types = append(types, typeName)
+		}
+		mu.Unlock()
+	}, 2, 1<<20)
+
+	// Keep the first callback blocked so the following operations remain in
+	// the bounded queue. The third queued operation must not be silently
+	// dropped while later operations continue: it transitions the sink to the
+	// explicit recovery marker and clears the pending queue.
+	sink.submit(NewSessionStreamEvent("turn.started", map[string]any{"turn_id": "turn-1"}))
+	<-blocked
+	sink.submit(NewSessionStreamEvent("usage.updated", map[string]any{"n": 1}))
+	sink.submit(NewSessionStreamEvent("usage.updated", map[string]any{"n": 2}))
+	sink.submit(NewSessionStreamEvent("usage.updated", map[string]any{"n": 3}))
+	sink.close()
+	close(release)
+	sink.wait()
+
+	mu.Lock()
+	got := append([]string(nil), types...)
+	mu.Unlock()
+	want := []string{"turn.started", "run.resync_required"}
+	if len(got) != len(want) {
+		t.Fatalf("sink delivered types = %#v, want %#v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("sink delivered types[%d] = %q, want %q; full = %#v", i, got[i], want[i], got)
+		}
+	}
+	sink.mu.Lock()
+	if sink.queuedBytes != 0 || !sink.overflowed || !sink.markerDelivered {
+		t.Fatalf("sink after overflow = queuedBytes:%d overflowed:%t markerDelivered:%t", sink.queuedBytes, sink.overflowed, sink.markerDelivered)
+	}
+	sink.mu.Unlock()
+}
+
+func TestSessionEventSinkCoalescedDeltaBytesCanOverflow(t *testing.T) {
+	release := make(chan struct{})
+	started := make(chan struct{})
+	var once sync.Once
+	events := make(chan SessionStreamEvent, 4)
+	sink := newSessionEventSinkWithBounds(func(event SessionStreamEvent) {
+		once.Do(func() {
+			close(started)
+			<-release
+		})
+		events <- event
+	}, 16, 300)
+	// The first delta is admitted; repeated coalescing must charge the added
+	// UTF-8 bytes rather than only the one queued message.
+	sink.submit(NewSessionStreamEvent("text.delta", map[string]any{"turn_id": "turn-1", "text": strings.Repeat("a", 80)}))
+	<-started
+	sink.submit(NewSessionStreamEvent("text.delta", map[string]any{"turn_id": "turn-1", "text": strings.Repeat("b", 80)}))
+	sink.submit(NewSessionStreamEvent("text.delta", map[string]any{"turn_id": "turn-1", "text": strings.Repeat("c", 80)}))
+	sink.close()
+	close(release)
+	sink.wait()
+	var got []string
+	for {
+		select {
+		case event := <-events:
+			if event != nil {
+				typeName, _ := event["type"].(string)
+				got = append(got, typeName)
+			}
+		default:
+			if len(got) != 2 || got[0] != "text.delta" || got[1] != "run.resync_required" {
+				t.Fatalf("byte overflow delivered types = %#v", got)
+			}
+			return
+		}
+	}
+}
+
 func TestSessionEventSinkPreservesAssistantCheckpointBinding(t *testing.T) {
 	release := make(chan struct{})
 	blocked := make(chan struct{}, 1)

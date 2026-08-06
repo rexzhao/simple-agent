@@ -1,6 +1,6 @@
 import { isRFC3339Timestamp } from './datetime'
 import { ProtocolDecodeError } from './errors'
-import { isSequence } from './sequence'
+import { compareRunCursor, isRunCursor, isSequence } from './sequence'
 import type {
   ChangeOperation,
   ProtocolMessage,
@@ -121,6 +121,15 @@ function validatePayload(type: string, payload: RawObject): void {
         requiredString(resume, 'stream_epoch', 'payload.resume.stream_epoch')
         decimal(resume.sequence, 'payload.resume.sequence', isSequence)
       }
+      if (has(payload, 'active_run_resume')) {
+        if (payload.resource.type !== 'session_content') {
+          fail('invalid_field', 'is only valid for session_content', 'payload.active_run_resume')
+        }
+        const active = object(payload.active_run_resume, 'payload.active_run_resume')
+        requiredString(active, 'run_epoch', 'payload.active_run_resume.run_epoch')
+        requiredString(active, 'run_id', 'payload.active_run_resume.run_id')
+        decimal(active.run_cursor, 'payload.active_run_resume.run_cursor', isRunCursor)
+      }
       return
     case 'subscribed':
       requiredString(payload, 'subscription_id', 'payload.subscription_id')
@@ -147,7 +156,10 @@ function validatePayload(type: string, payload: RawObject): void {
       requiredString(payload, 'subscription_id', 'payload.subscription_id')
       validateResource(payload.resource, 'payload.resource')
       const event = object(payload.event, 'payload.event')
-      requiredString(event, 'type', 'payload.event.type')
+      validateSubscriptionEvent(event)
+      if (payload.resource.type === 'session_content' && event.session_id !== payload.resource.id) {
+        fail('invalid_field', 'must match payload.resource.id', 'payload.event.session_id')
+      }
       return
     case 'ack':
       requiredString(payload, 'subscription_id', 'payload.subscription_id')
@@ -204,6 +216,107 @@ function validateOperations(value: unknown): asserts value is ChangeOperation[] 
     const operation = object(value, `payload.operations[${index}]`)
     const field = `payload.operations[${index}]`
     requiredString(operation, 'op', `${field}.op`)
+  })
+}
+
+function validateSubscriptionEvent(event: RawObject): void {
+  const field = 'payload.event'
+  const type = requiredString(event, 'type', `${field}.type`)
+  const allowed = new Set(['type', 'session_id', 'run_id', 'run_cursor', 'turn_id', 'agent_iteration'])
+  requiredString(event, 'session_id', `${field}.session_id`)
+  requiredString(event, 'run_id', `${field}.run_id`)
+  decimal(event.run_cursor, `${field}.run_cursor`, isRunCursor)
+  if (has(event, 'turn_id')) requiredString(event, 'turn_id', `${field}.turn_id`)
+  if (has(event, 'agent_iteration')) positiveInteger(event.agent_iteration, `${field}.agent_iteration`)
+  const add = (...keys: string[]) => keys.forEach((key) => allowed.add(key))
+  const requireDelta = () => {
+    requiredString(event, 'turn_id', `${field}.turn_id`)
+    positiveInteger(event.agent_iteration, `${field}.agent_iteration`)
+    requiredString(event, 'item_id', `${field}.item_id`)
+    requiredString(event, 'delta', `${field}.delta`)
+    add('item_id', 'delta', 'durable_text_length', 'durable_checkpointed')
+    if (has(event, 'durable_text_length')) nonNegativeInteger(event.durable_text_length, `${field}.durable_text_length`)
+    if (has(event, 'durable_checkpointed') && typeof event.durable_checkpointed !== 'boolean') fail('invalid_field', 'must be boolean', `${field}.durable_checkpointed`)
+  }
+  const requireToolIdentity = () => {
+    requiredString(event, 'turn_id', `${field}.turn_id`)
+    positiveInteger(event.agent_iteration, `${field}.agent_iteration`)
+    requiredString(event, 'tool_call_id', `${field}.tool_call_id`)
+    requiredString(event, 'name', `${field}.name`)
+    add('tool_call_id', 'name')
+  }
+  switch (type) {
+    case 'text.delta':
+    case 'reasoning.delta':
+      requireDelta()
+      break
+    case 'tool.requested':
+    case 'tool.running':
+      requireToolIdentity(); add('arguments')
+      if (has(event, 'arguments')) requiredString(event, 'arguments', `${field}.arguments`)
+      break
+    case 'tool.progress':
+      requireToolIdentity(); add('arguments_delta'); requiredString(event, 'arguments_delta', `${field}.arguments_delta`)
+      break
+    case 'tool.finished':
+      requireToolIdentity(); add('is_error', 'content')
+      if (typeof event.is_error !== 'boolean') fail('invalid_field', 'must be boolean', `${field}.is_error`)
+      if (has(event, 'content')) requiredString(event, 'content', `${field}.content`)
+      break
+    case 'run.prompt_queue': {
+      add('prompts')
+      const prompts = requiredArray(event, 'prompts', `${field}.prompts`)
+      prompts.forEach((value, index) => {
+        const prompt = object(value, `${field}.prompts[${index}]`)
+        for (const key of Object.keys(prompt)) if (!['id', 'content', 'steer'].includes(key)) fail('invalid_field', `unknown field ${key}`, `${field}.prompts[${index}]`)
+        requiredString(prompt, 'id', `${field}.prompts[${index}].id`)
+        requiredString(prompt, 'content', `${field}.prompts[${index}].content`)
+        if (typeof prompt.steer !== 'boolean') fail('invalid_field', 'must be boolean', `${field}.prompts[${index}].steer`)
+      })
+      break
+    }
+    case 'run.prompt_appended':
+      add('prompts')
+      requiredArray(event, 'prompts', `${field}.prompts`).forEach((value, index) => {
+        if (typeof value !== 'string' || value.trim() === '') fail('invalid_field', 'must be a non-empty string', `${field}.prompts[${index}]`)
+      })
+      break
+    case 'run.started':
+      add('status')
+      if (event.status !== 'running') fail('invalid_field', 'must be running', `${field}.status`)
+      break
+    case 'run.settled':
+      add('status', 'durable_settlement_watermark')
+      if (!['committed', 'failed', 'interrupted', 'cancelled'].includes(String(event.status))) fail('invalid_field', 'invalid run status', `${field}.status`)
+      validateSettlementWatermark(event.durable_settlement_watermark, `${field}.durable_settlement_watermark`)
+      if (compareRunCursor(String((event.durable_settlement_watermark as RawObject).run_cursor), String(event.run_cursor)) > 0) {
+        fail('invalid_field', 'must not be after run.settled cursor', `${field}.durable_settlement_watermark.run_cursor`)
+      }
+      break
+    default:
+      fail('invalid_field', `unknown subscription event type ${JSON.stringify(type)}`, `${field}.type`)
+  }
+  for (const key of Object.keys(event)) if (!allowed.has(key)) fail('invalid_field', `unknown field ${key}`, `${field}.${key}`)
+}
+
+function validateSettlementWatermark(value: unknown, field: string): void {
+  const watermark = object(value, field)
+  for (const key of Object.keys(watermark)) if (!['resource_revision', 'run_cursor', 'verified', 'covered_items'].includes(key)) fail('invalid_field', `unknown field ${key}`, `${field}.${key}`)
+  revision(watermark.resource_revision, `${field}.resource_revision`)
+  decimal(watermark.run_cursor, `${field}.run_cursor`, isRunCursor)
+  if (typeof watermark.verified !== 'boolean') fail('invalid_field', 'must be boolean', `${field}.verified`)
+  const coveredItems = requiredArray(watermark, 'covered_items', `${field}.covered_items`)
+  if (watermark.verified === false && coveredItems.length !== 0) fail('invalid_field', 'unverified watermark must not contain covered items', `${field}.covered_items`)
+  coveredItems.forEach((value, index) => {
+    const item = object(value, `${field}.covered_items[${index}]`)
+    for (const key of Object.keys(item)) if (!['turn_id', 'agent_iteration', 'item_id', 'run_cursor'].includes(key)) fail('invalid_field', `unknown field ${key}`, `${field}.covered_items[${index}]`)
+    requiredString(item, 'turn_id', `${field}.covered_items[${index}].turn_id`)
+    positiveInteger(item.agent_iteration, `${field}.covered_items[${index}].agent_iteration`)
+    requiredString(item, 'item_id', `${field}.covered_items[${index}].item_id`)
+    decimal(item.run_cursor, `${field}.covered_items[${index}].run_cursor`, isRunCursor)
+    if (compareRunCursor(String(item.run_cursor), String(watermark.run_cursor)) > 0) {
+      fail('invalid_field', 'must not be after settlement run_cursor', `${field}.covered_items[${index}].run_cursor`)
+    }
   })
 }
 

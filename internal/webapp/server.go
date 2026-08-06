@@ -64,6 +64,7 @@ type Server struct {
 	blobStoreOwned      bool
 	sinkRegistration    *execution.SessionIndexSinkRegistration
 	contentRegistration *sessions.MutationSinkRegistration
+	contentRunObserver  func()
 }
 
 func NewServer(options ServerOptions) (*Server, error) {
@@ -233,6 +234,9 @@ func NewServer(options ServerOptions) (*Server, error) {
 		contentRegistration: contentRegistration,
 	}
 	server.runs = newRunRegistry(ctx, options.Service, options.LogWriter)
+	if sessionContentProvider != nil && server.runs != nil && server.runs.coordinator != nil {
+		server.contentRunObserver = server.runs.coordinator.RegisterRunEventObserver(sessionContentProvider)
+	}
 	server.codexLogins = newCodexLoginRegistry(ctx, options.Service)
 	server.routes()
 	return server, nil
@@ -278,6 +282,9 @@ func (s *Server) Close() {
 	}
 	if s.cancel != nil {
 		s.cancel()
+	}
+	if s.contentRunObserver != nil {
+		s.contentRunObserver()
 	}
 	if s.wsDispatcher != nil {
 		s.wsDispatcher.Close()

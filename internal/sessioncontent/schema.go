@@ -203,12 +203,19 @@ type ToolCall struct {
 }
 
 type ActiveRunDescriptor struct {
-	RunID       string    `json:"run_id"`
-	SessionID   string    `json:"session_id"`
-	TurnID      string    `json:"turn_id,omitempty"`
-	StartedAt   time.Time `json:"started_at"`
-	Status      string    `json:"status"`
-	Recoverable bool      `json:"recoverable"`
+	RunID               string                               `json:"run_id"`
+	SessionID           string                               `json:"session_id"`
+	TurnID              string                               `json:"turn_id,omitempty"`
+	StartedAt           time.Time                            `json:"started_at"`
+	Status              string                               `json:"status"`
+	Recoverable         bool                                 `json:"recoverable"`
+	RunEpoch            string                               `json:"run_epoch,omitempty"`
+	RunCursor           protocol.RunCursor                   `json:"run_cursor,omitempty"`
+	ReplayAvailable     bool                                 `json:"replay_available"`
+	ReplayFromCursor    protocol.RunCursor                   `json:"replay_from_cursor,omitempty"`
+	ReplayToCursor      protocol.RunCursor                   `json:"replay_to_cursor,omitempty"`
+	RecoveryRequired    bool                                 `json:"recovery_required"`
+	SettlementWatermark *protocol.DurableSettlementWatermark `json:"durable_settlement_watermark,omitempty"`
 }
 
 type CompactionState struct {
@@ -803,6 +810,34 @@ func (r ActiveRunDescriptor) Validate(metadata SessionMetadata) error {
 	if !r.Recoverable {
 		return fmt.Errorf("active run must be recoverable")
 	}
+	if r.RunEpoch != "" {
+		if err := validateID(r.RunEpoch, "run_epoch"); err != nil {
+			return err
+		}
+	}
+	if r.RunCursor != "" {
+		if err := protocol.ValidateRunCursor(r.RunCursor); err != nil {
+			return fmt.Errorf("run_cursor: %w", err)
+		}
+	}
+	if r.ReplayFromCursor != "" {
+		if err := protocol.ValidateRunCursor(r.ReplayFromCursor); err != nil {
+			return fmt.Errorf("replay_from_cursor: %w", err)
+		}
+	}
+	if r.ReplayToCursor != "" {
+		if err := protocol.ValidateRunCursor(r.ReplayToCursor); err != nil {
+			return fmt.Errorf("replay_to_cursor: %w", err)
+		}
+	}
+	if r.ReplayAvailable && (r.RunEpoch == "" || r.RunCursor == "" || r.ReplayFromCursor == "" || r.ReplayToCursor == "") {
+		return fmt.Errorf("replay availability requires run epoch and cursor range")
+	}
+	if r.SettlementWatermark != nil {
+		if err := validateSettlementWatermark(*r.SettlementWatermark); err != nil {
+			return err
+		}
+	}
 	if err := validateTime(r.StartedAt, "started_at"); err != nil {
 		return err
 	}
@@ -811,6 +846,24 @@ func (r ActiveRunDescriptor) Validate(metadata SessionMetadata) error {
 	}
 	if metadata.RunningTurnID != r.TurnID {
 		return fmt.Errorf("turn_id does not match metadata running_turn_id")
+	}
+	return nil
+}
+
+func validateSettlementWatermark(w protocol.DurableSettlementWatermark) error {
+	if err := protocol.ValidateDurableSettlementWatermark(w); err != nil {
+		return err
+	}
+	for index, item := range w.CoveredItems {
+		if err := validateID(item.TurnID, fmt.Sprintf("settlement covered_items[%d].turn_id", index)); err != nil {
+			return err
+		}
+		if item.AgentIteration <= 0 {
+			return fmt.Errorf("settlement covered_items[%d].agent_iteration must be positive", index)
+		}
+		if err := validateID(item.ItemID, fmt.Sprintf("settlement covered_items[%d].item_id", index)); err != nil {
+			return err
+		}
 	}
 	return nil
 }

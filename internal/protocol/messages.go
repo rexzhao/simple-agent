@@ -29,6 +29,15 @@ type ResumeToken struct {
 	Sequence    Sequence `json:"sequence"`
 }
 
+// RunResumeToken is deliberately independent from ResumeToken. A run cursor
+// is not a durable subscription sequence and is never acknowledged by the
+// durable ACK message.
+type RunResumeToken struct {
+	RunEpoch  string    `json:"run_epoch"`
+	RunID     string    `json:"run_id"`
+	RunCursor RunCursor `json:"run_cursor"`
+}
+
 type HelloPayload struct {
 	SupportedVersions []int  `json:"supported_versions"`
 	ClientID          string `json:"client_id"`
@@ -78,9 +87,10 @@ type CommandResultPayload struct {
 }
 
 type SubscribePayload struct {
-	SubscriptionID string       `json:"subscription_id"`
-	Resource       ResourceKey  `json:"resource"`
-	Resume         *ResumeToken `json:"resume,omitempty"`
+	SubscriptionID  string          `json:"subscription_id"`
+	Resource        ResourceKey     `json:"resource"`
+	Resume          *ResumeToken    `json:"resume,omitempty"`
+	ActiveRunResume *RunResumeToken `json:"active_run_resume,omitempty"`
 }
 
 type SubscribedPayload struct {
@@ -496,7 +506,13 @@ func (m SubscribeMessage) validate() error {
 	if err := validateResourceKey("payload.resource", m.Payload.Resource); err != nil {
 		return err
 	}
-	return validateResume("payload.resume", m.Payload.Resume)
+	if err := validateResume("payload.resume", m.Payload.Resume); err != nil {
+		return err
+	}
+	if m.Payload.ActiveRunResume != nil && m.Payload.Resource.Type != ResourceTypeSessionContent {
+		return invalidField("payload.active_run_resume", "is only valid for session_content")
+	}
+	return validateRunResume("payload.active_run_resume", m.Payload.ActiveRunResume)
 }
 
 func (m SubscribedMessage) validate() error {
@@ -529,6 +545,29 @@ func validateResume(field string, resume *ResumeToken) error {
 // subscribe wire message. Nil is valid and means an initial snapshot.
 func ValidateResumeToken(resume *ResumeToken) error {
 	return validateResume("resume", resume)
+}
+
+func validateRunResume(field string, resume *RunResumeToken) error {
+	if resume == nil {
+		return nil
+	}
+	if err := requiredString(field+".run_epoch", resume.RunEpoch); err != nil {
+		return err
+	}
+	if err := requiredString(field+".run_id", resume.RunID); err != nil {
+		return err
+	}
+	if err := requiredString(field+".run_cursor", string(resume.RunCursor)); err != nil {
+		return err
+	}
+	if err := ValidateRunCursor(resume.RunCursor); err != nil {
+		return invalidField(field+".run_cursor", err.Error())
+	}
+	return nil
+}
+
+func ValidateRunResumeToken(resume *RunResumeToken) error {
+	return validateRunResume("active_run_resume", resume)
 }
 
 func (m UnsubscribeMessage) validate() error {
@@ -694,20 +733,29 @@ func (m SubscriptionEventMessage) validate() error {
 	if err := validateResourceKey("payload.resource", m.Payload.Resource); err != nil {
 		return err
 	}
-	return validateSubscriptionEvent("payload.event", m.Payload.Event)
+	if err := validateSubscriptionEvent("payload.event", m.Payload.Event); err != nil {
+		return err
+	}
+	if m.Payload.Resource.Type == ResourceTypeSessionContent {
+		event, err := DecodeSubscriptionEvent(m.Payload.Event)
+		if err != nil {
+			return invalidField("payload.event", err.Error())
+		}
+		if event.SessionID != m.Payload.Resource.ID {
+			return invalidField("payload.event.session_id", "does not match payload.resource.id")
+		}
+	}
+	return nil
 }
 
 func validateSubscriptionEvent(field string, event json.RawMessage) error {
 	if err := requiredRawObject(field, event); err != nil {
 		return err
 	}
-	var header struct {
-		Type string `json:"type"`
-	}
-	if err := json.Unmarshal(event, &header); err != nil {
+	if err := ValidateSubscriptionEvent(event); err != nil {
 		return invalidField(field, err.Error())
 	}
-	return requiredString(field+".type", header.Type)
+	return nil
 }
 
 func (m AckMessage) validate() error {

@@ -4,15 +4,28 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
 const defaultMaxConcurrentSessionRuns = 8
+
+const (
+	// Observer delivery is a source-owned boundary. These limits are separate
+	// from the presentation/provider queues: a slow observer must not be able
+	// to retain an unbounded copy of the execution event stream before its own
+	// bounded adapter queue gets a chance to apply recovery semantics.
+	defaultRunObserverQueueMessages = 256
+	defaultRunObserverQueueBytes    = 2 * 1024 * 1024
+	maxRunObserverLossBytes         = 256
+	runObserverControlBytes         = 1
+)
 
 var (
 	// ErrSessionRunCoordinatorCapacity means the application-wide active-run
@@ -36,8 +49,15 @@ type SessionRunStarterWithID interface {
 // SessionRunCoordinatorOptions controls application-wide run admission.
 type SessionRunCoordinatorOptions struct {
 	MaxConcurrentRuns int
-	Now               func() time.Time
-	NewRunID          func() (string, error)
+	// ObserverQueueMessages and ObserverQueueBytes bound each registered
+	// SessionRunEventObserver mailbox. Submission is always non-blocking; an
+	// observer which cannot keep up receives one explicit loss notification for
+	// each affected run. The mailbox remains alive for later runs after their
+	// terminal cleanup has crossed the recovery boundary.
+	ObserverQueueMessages int
+	ObserverQueueBytes    int
+	Now                   func() time.Time
+	NewRunID              func() (string, error)
 	// OnRunAdmitted is called after the coordinator reserves the run and
 	// before the starter is allowed to execute it. Presentation adapters use
 	// this phase to register a run-local replay buffer before the first event
@@ -55,6 +75,29 @@ type SessionRunCoordinatorOptions struct {
 	OnRunSettled func(*CoordinatedSessionRun, SessionMessageResult, error)
 }
 
+// SessionRunEventObserver is the transport-neutral source used by both the
+// legacy SSE adapter and the D2 session-content provider. It observes the
+// coordinator's single event production path; it does not receive HTTP/SSE
+// frames or own a second event producer.
+type SessionRunEventObserver interface {
+	RunAdmitted(*CoordinatedSessionRun)
+	RunAdmissionFailed(*CoordinatedSessionRun)
+	RunEvent(*CoordinatedSessionRun, SessionStreamEvent)
+	RunSettled(*CoordinatedSessionRun, SessionMessageResult, error)
+}
+
+// SessionRunEventObserverLoss is optional for compatibility with existing
+// observers, but is implemented by D2 providers. It is delivered through the
+// same observer mailbox after the queued suffix has been discarded, and means
+// that the observer must not claim a continuous transient cursor from the loss
+// point. If the discarded suffix contained multiple runs, the one bounded
+// marker invokes the optional callback once for each affected run. The source
+// fences those affected runs until their terminal cleanup, while later runs
+// may continue through the same registration.
+type SessionRunEventObserverLoss interface {
+	RunEventObserverLoss(*CoordinatedSessionRun, string)
+}
+
 func (options SessionRunCoordinatorOptions) withDefaults() SessionRunCoordinatorOptions {
 	if options.MaxConcurrentRuns <= 0 {
 		options.MaxConcurrentRuns = defaultMaxConcurrentSessionRuns
@@ -64,6 +107,18 @@ func (options SessionRunCoordinatorOptions) withDefaults() SessionRunCoordinator
 	}
 	if options.NewRunID == nil {
 		options.NewRunID = newSessionRunID
+	}
+	if options.ObserverQueueMessages == 0 {
+		options.ObserverQueueMessages = defaultRunObserverQueueMessages
+	}
+	if options.ObserverQueueBytes == 0 {
+		options.ObserverQueueBytes = defaultRunObserverQueueBytes
+	}
+	if options.ObserverQueueMessages < 1 {
+		options.ObserverQueueMessages = defaultRunObserverQueueMessages
+	}
+	if options.ObserverQueueBytes < maxRunObserverLossBytes {
+		options.ObserverQueueBytes = defaultRunObserverQueueBytes
 	}
 	return options
 }
@@ -100,6 +155,9 @@ type SessionRunCoordinator struct {
 	onRunStarted func(*CoordinatedSessionRun)
 	onRunSettled func(*CoordinatedSessionRun, SessionMessageResult, error)
 	onRunIdle    func(*CoordinatedSessionRun)
+	observerNext uint64
+	observers    map[uint64]*runObserverMailbox
+	observerStop atomic.Bool
 }
 
 // CoordinatedSessionRun is a concurrency-safe handle to one admitted run.
@@ -145,6 +203,425 @@ func NewSessionRunCoordinator(ctx context.Context, starter SessionRunStarter, op
 		closeDone:       make(chan struct{}),
 		byID:            make(map[string]*CoordinatedSessionRun),
 		activeBySession: make(map[string]*CoordinatedSessionRun),
+		observers:       make(map[uint64]*runObserverMailbox),
+	}
+}
+
+// RegisterRunEventObserver attaches a source-owned bounded mailbox to the
+// shared coordinator event source. The producer only snapshots/clones the
+// event and performs a non-blocking mailbox submission; it never invokes
+// observer code inline. A single mailbox has one delivery goroutine, so its
+// admitted -> events -> settled order is FIFO. The returned function is
+// idempotent and waits for the mailbox to finish, which proves that no
+// callback remains in flight after an ordinary unregister.
+func (coordinator *SessionRunCoordinator) RegisterRunEventObserver(observer SessionRunEventObserver) func() {
+	if coordinator == nil || observer == nil || coordinator.observerStop.Load() {
+		return func() {}
+	}
+	mailbox := newRunObserverMailbox(observer, coordinator.options.ObserverQueueMessages, coordinator.options.ObserverQueueBytes)
+	coordinator.lifecycleMu.Lock()
+	if coordinator.observerStop.Load() {
+		coordinator.lifecycleMu.Unlock()
+		mailbox.stop()
+		return func() {}
+	}
+	coordinator.observerNext++
+	id := coordinator.observerNext
+	coordinator.observers[id] = mailbox
+	coordinator.lifecycleMu.Unlock()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			coordinator.lifecycleMu.Lock()
+			delete(coordinator.observers, id)
+			coordinator.lifecycleMu.Unlock()
+			mailbox.stop()
+		})
+	}
+}
+
+func (coordinator *SessionRunCoordinator) runObservers() []*runObserverMailbox {
+	coordinator.lifecycleMu.RLock()
+	defer coordinator.lifecycleMu.RUnlock()
+	observers := make([]*runObserverMailbox, 0, len(coordinator.observers))
+	for _, observer := range coordinator.observers {
+		observers = append(observers, observer)
+	}
+	return observers
+}
+
+func (coordinator *SessionRunCoordinator) notifyRunAdmittedObservers(run *CoordinatedSessionRun) {
+	for _, observer := range coordinator.runObservers() {
+		observer.enqueue(runObserverDelivery{kind: runObserverAdmitted, run: run})
+	}
+}
+
+func (coordinator *SessionRunCoordinator) notifyRunAdmissionFailedObservers(run *CoordinatedSessionRun) {
+	for _, observer := range coordinator.runObservers() {
+		observer.enqueue(runObserverDelivery{kind: runObserverAdmissionFailed, run: run})
+	}
+}
+
+func (coordinator *SessionRunCoordinator) notifyRunEventObservers(run *CoordinatedSessionRun, event SessionStreamEvent) {
+	for _, observer := range coordinator.runObservers() {
+		observer.enqueue(runObserverDelivery{kind: runObserverEvent, run: run, event: event})
+	}
+}
+
+func (coordinator *SessionRunCoordinator) notifyRunSettledObservers(run *CoordinatedSessionRun, result SessionMessageResult, err error) {
+	for _, observer := range coordinator.runObservers() {
+		observer.enqueue(runObserverDelivery{kind: runObserverSettled, run: run, result: result, err: err})
+	}
+}
+
+type runObserverDeliveryKind uint8
+
+const (
+	runObserverAdmitted runObserverDeliveryKind = iota
+	runObserverAdmissionFailed
+	runObserverEvent
+	runObserverSettled
+	runObserverLoss
+)
+
+type runObserverDelivery struct {
+	kind   runObserverDeliveryKind
+	run    *CoordinatedSessionRun
+	runs   []*CoordinatedSessionRun // populated for a loss covering a discarded suffix
+	event  SessionStreamEvent
+	result SessionMessageResult
+	err    error
+	reason string
+	bytes  int
+}
+
+type runObserverMailbox struct {
+	observer    SessionRunEventObserver
+	maxMessages int
+	maxBytes    int
+	queue       chan runObserverDelivery
+	stopCh      chan struct{}
+	done        chan struct{}
+
+	mu          sync.Mutex
+	queuedBytes int
+	closed      bool
+	// activeRuns covers the source-owned mailbox's whole admitted-but-not-yet
+	// settled set, not only the entries currently sitting in queue. Events for
+	// an active run which happened to be in flight (rather than queued) would
+	// otherwise be dropped silently after the marker and that run would never
+	// receive recovery.
+	activeRuns map[*CoordinatedSessionRun]struct{}
+	// poisonedRuns is the run-local recovery fence installed by an overflow.
+	// Normal lifecycle/event callbacks for a poisoned run are rejected until
+	// its terminal lifecycle callback is delivered; a later run can therefore
+	// reuse this mailbox.
+	poisonedRuns map[*CoordinatedSessionRun]struct{}
+	// pendingTerminals retains at most one compact terminal delivery per run
+	// while its loss marker is in flight. It is deliberately a sidecar to the
+	// normal queue: loss is delivered first, then these bounded cleanups are
+	// delivered before the worker resumes ordinary traffic.
+	pendingTerminals map[*CoordinatedSessionRun]runObserverDelivery
+	lossPending      bool
+	stopOnce         sync.Once
+}
+
+func newRunObserverMailbox(observer SessionRunEventObserver, maxMessages, maxBytes int) *runObserverMailbox {
+	if maxMessages <= 0 {
+		maxMessages = defaultRunObserverQueueMessages
+	}
+	if maxBytes < maxRunObserverLossBytes {
+		maxBytes = defaultRunObserverQueueBytes
+	}
+	mailbox := &runObserverMailbox{
+		observer:         observer,
+		maxMessages:      maxMessages,
+		maxBytes:         maxBytes,
+		queue:            make(chan runObserverDelivery, maxMessages),
+		stopCh:           make(chan struct{}),
+		done:             make(chan struct{}),
+		activeRuns:       make(map[*CoordinatedSessionRun]struct{}),
+		poisonedRuns:     make(map[*CoordinatedSessionRun]struct{}),
+		pendingTerminals: make(map[*CoordinatedSessionRun]runObserverDelivery),
+	}
+	go mailbox.run()
+	return mailbox
+}
+
+// enqueue is deliberately a try-send under the mailbox mutex. The mutex
+// protects the closed/send race without ever being held across observer code;
+// the channel is never closed, so there is no send-on-closed panic. A failed
+// submission discards the pending mailbox contents and queues exactly one
+// loss marker. The marker is the terminal recovery boundary for affected
+// runs, not for the observer registration: after it and affected terminal
+// cleanup are delivered, later runs may use the same bounded mailbox.
+func (mailbox *runObserverMailbox) enqueue(delivery runObserverDelivery) {
+	if mailbox == nil {
+		return
+	}
+	delivery = mailbox.cloneDelivery(delivery)
+	if delivery.bytes <= 0 {
+		delivery.bytes = 128
+	}
+	mailbox.mu.Lock()
+	defer mailbox.mu.Unlock()
+	if mailbox.closed {
+		return
+	}
+	if delivery.kind != runObserverSettled && delivery.kind != runObserverAdmissionFailed {
+		if _, poisoned := mailbox.poisonedRuns[delivery.run]; poisoned {
+			return
+		}
+	}
+	if isRunObserverTerminal(delivery.kind) && mailbox.lossPending {
+		mailbox.rememberTerminalLocked(delivery)
+		return
+	}
+	mailbox.trackRunLocked(delivery)
+	if delivery.bytes > mailbox.maxBytes || len(mailbox.queue) >= mailbox.maxMessages || mailbox.queuedBytes > mailbox.maxBytes-delivery.bytes {
+		mailbox.overflowLocked(delivery.run, delivery)
+		return
+	}
+	mailbox.queue <- delivery
+	mailbox.queuedBytes += delivery.bytes
+}
+
+func (mailbox *runObserverMailbox) trackRunLocked(delivery runObserverDelivery) {
+	if delivery.run == nil {
+		return
+	}
+	// Keep terminal deliveries in the set until their callback is actually
+	// delivered. If one is still queued when overflow happens, the loss marker
+	// must include that run as well.
+	mailbox.activeRuns[delivery.run] = struct{}{}
+}
+
+func (mailbox *runObserverMailbox) cloneDelivery(delivery runObserverDelivery) runObserverDelivery {
+	if delivery.kind != runObserverEvent || delivery.event == nil {
+		delivery.bytes = observerDeliveryBytes(delivery)
+		return delivery
+	}
+	// SessionStreamEvent is a mutable map with potentially mutable nested
+	// values. JSON round-tripping at this boundary creates an owned snapshot;
+	// the serialized size is also the conservative retained-byte accounting
+	// unit. This is intentionally before enqueue returns, so a producer may
+	// safely reuse/mutate its original map after RunEvent returns.
+	raw, err := json.Marshal(delivery.event)
+	if err != nil {
+		delivery.event = nil
+		delivery.bytes = mailbox.maxBytes + 1
+		return delivery
+	}
+	var snapshot map[string]any
+	if err := json.Unmarshal(raw, &snapshot); err != nil {
+		delivery.event = nil
+		delivery.bytes = mailbox.maxBytes + 1
+		return delivery
+	}
+	delivery.event = SessionStreamEvent(snapshot)
+	delivery.bytes = len(raw) + 256
+	return delivery
+}
+
+func observerDeliveryBytes(delivery runObserverDelivery) int {
+	bytes := 256
+	if delivery.run != nil {
+		bytes += len(delivery.run.ID()) + len(delivery.run.SessionID())
+	}
+	if delivery.event != nil {
+		if raw, err := json.Marshal(delivery.event); err == nil {
+			bytes += len(raw)
+		} else {
+			bytes += defaultRunObserverQueueBytes + 1
+		}
+	}
+	if delivery.err != nil {
+		bytes += len(delivery.err.Error())
+	}
+	if delivery.result.TurnID != "" || delivery.result.Status != "" || delivery.result.RunID != "" {
+		if raw, err := json.Marshal(delivery.result); err == nil {
+			bytes += len(raw)
+		} else {
+			bytes += defaultRunObserverQueueBytes + 1
+		}
+	}
+	bytes += len(delivery.reason)
+	return bytes
+}
+
+func isRunObserverTerminal(kind runObserverDeliveryKind) bool {
+	return kind == runObserverSettled || kind == runObserverAdmissionFailed
+}
+
+func compactRunObserverTerminal(delivery runObserverDelivery) runObserverDelivery {
+	// Recovery has already been signalled separately. Keep only the stable run
+	// handle and the small result identity needed by cleanup; do not retain a
+	// potentially unbounded error string in the sidecar.
+	delivery.err = nil
+	delivery.reason = ""
+	delivery.bytes = runObserverControlBytes
+	return delivery
+}
+
+func (mailbox *runObserverMailbox) rememberTerminalLocked(delivery runObserverDelivery) {
+	if mailbox == nil || delivery.run == nil || !isRunObserverTerminal(delivery.kind) {
+		return
+	}
+	if _, exists := mailbox.pendingTerminals[delivery.run]; exists {
+		return
+	}
+	mailbox.pendingTerminals[delivery.run] = compactRunObserverTerminal(delivery)
+}
+
+func (mailbox *runObserverMailbox) overflowLocked(run *CoordinatedSessionRun, triggering runObserverDelivery) {
+	if mailbox.closed {
+		return
+	}
+	mailbox.lossPending = true
+	runs := make([]*CoordinatedSessionRun, 0, len(mailbox.queue)+1)
+	seen := make(map[*CoordinatedSessionRun]struct{}, len(mailbox.queue)+1)
+	addRun := func(candidate *CoordinatedSessionRun) {
+		if candidate == nil {
+			return
+		}
+		if _, exists := seen[candidate]; exists {
+			return
+		}
+		seen[candidate] = struct{}{}
+		runs = append(runs, candidate)
+	}
+	for candidate := range mailbox.activeRuns {
+		addRun(candidate)
+	}
+	for {
+		select {
+		case pending := <-mailbox.queue:
+			addRun(pending.run)
+			mailbox.queuedBytes -= pending.bytes
+			if isRunObserverTerminal(pending.kind) {
+				mailbox.rememberTerminalLocked(pending)
+			}
+		default:
+			mailbox.queuedBytes = 0
+			addRun(run)
+			if isRunObserverTerminal(triggering.kind) {
+				mailbox.rememberTerminalLocked(triggering)
+			}
+			for _, affected := range runs {
+				mailbox.poisonedRuns[affected] = struct{}{}
+			}
+			loss := runObserverDelivery{kind: runObserverLoss, run: run, runs: runs, reason: "observer mailbox overflow", bytes: maxRunObserverLossBytes}
+			mailbox.queue <- loss
+			mailbox.queuedBytes = loss.bytes
+			return
+		}
+	}
+}
+
+func (mailbox *runObserverMailbox) stop() {
+	if mailbox == nil {
+		return
+	}
+	mailbox.mu.Lock()
+	if !mailbox.closed {
+		mailbox.closed = true
+		for {
+			select {
+			case pending := <-mailbox.queue:
+				mailbox.queuedBytes -= pending.bytes
+			default:
+				mailbox.queuedBytes = 0
+				clear(mailbox.activeRuns)
+				clear(mailbox.poisonedRuns)
+				clear(mailbox.pendingTerminals)
+				mailbox.lossPending = false
+				goto drained
+			}
+		}
+	}
+drained:
+	mailbox.mu.Unlock()
+	mailbox.stopOnce.Do(func() { close(mailbox.stopCh) })
+	<-mailbox.done
+}
+
+func (mailbox *runObserverMailbox) run() {
+	defer close(mailbox.done)
+	for {
+		select {
+		case delivery := <-mailbox.queue:
+			mailbox.mu.Lock()
+			if mailbox.queuedBytes >= delivery.bytes {
+				mailbox.queuedBytes -= delivery.bytes
+			} else {
+				mailbox.queuedBytes = 0
+			}
+			mailbox.mu.Unlock()
+			mailbox.deliver(delivery)
+			if isRunObserverTerminal(delivery.kind) {
+				mailbox.completeTerminal(delivery)
+			}
+			if delivery.kind == runObserverLoss {
+				// The loss marker is a run-local recovery boundary, not a
+				// registration-lifetime boundary. Deliver terminal cleanup only
+				// after recovery is visible, then keep this worker alive so a
+				// subsequent admitted run can use the same registration.
+				mailbox.deliverPendingTerminals()
+			}
+		case <-mailbox.stopCh:
+			return
+		}
+	}
+}
+
+func (mailbox *runObserverMailbox) deliverPendingTerminals() {
+	mailbox.mu.Lock()
+	terminals := make([]runObserverDelivery, 0, len(mailbox.pendingTerminals))
+	for _, terminal := range mailbox.pendingTerminals {
+		terminals = append(terminals, terminal)
+	}
+	clear(mailbox.pendingTerminals)
+	mailbox.lossPending = false
+	mailbox.mu.Unlock()
+	for _, terminal := range terminals {
+		mailbox.deliver(terminal)
+		mailbox.completeTerminal(terminal)
+	}
+}
+
+func (mailbox *runObserverMailbox) completeTerminal(delivery runObserverDelivery) {
+	if mailbox == nil || !isRunObserverTerminal(delivery.kind) {
+		return
+	}
+	mailbox.mu.Lock()
+	delete(mailbox.activeRuns, delivery.run)
+	delete(mailbox.poisonedRuns, delivery.run)
+	mailbox.mu.Unlock()
+}
+
+func (mailbox *runObserverMailbox) deliver(delivery runObserverDelivery) {
+	if mailbox == nil || mailbox.observer == nil {
+		return
+	}
+	switch delivery.kind {
+	case runObserverAdmitted:
+		mailbox.observer.RunAdmitted(delivery.run)
+	case runObserverAdmissionFailed:
+		mailbox.observer.RunAdmissionFailed(delivery.run)
+	case runObserverEvent:
+		mailbox.observer.RunEvent(delivery.run, delivery.event)
+	case runObserverSettled:
+		mailbox.observer.RunSettled(delivery.run, delivery.result, delivery.err)
+	case runObserverLoss:
+		if lossObserver, ok := mailbox.observer.(SessionRunEventObserverLoss); ok {
+			if len(delivery.runs) == 0 {
+				lossObserver.RunEventObserverLoss(delivery.run, delivery.reason)
+				return
+			}
+			for _, run := range delivery.runs {
+				lossObserver.RunEventObserverLoss(run, delivery.reason)
+			}
+		}
 	}
 }
 
@@ -326,15 +803,18 @@ func (coordinator *SessionRunCoordinator) startWithID(sessionID string, input Se
 		if err := coordinator.options.OnRunAdmitted(handle); err != nil {
 			coordinator.removeAdmittedRun(handle)
 			coordinator.notifyRunAdmissionFailed(handle)
+			coordinator.notifyRunAdmissionFailedObservers(handle)
 			return nil, err
 		}
 	}
+	coordinator.notifyRunAdmittedObservers(handle)
 
 	forward := func(event SessionStreamEvent) {
 		handle.observe(event)
 		if coordinator.options.OnRunEvent != nil {
 			coordinator.options.OnRunEvent(handle, event)
 		}
+		coordinator.notifyRunEventObservers(handle, event)
 		if emit != nil {
 			emit(event)
 		}
@@ -347,6 +827,7 @@ func (coordinator *SessionRunCoordinator) startWithID(sessionID string, input Se
 	if handle.sessionRun() == nil {
 		coordinator.removeAdmittedRun(handle)
 		coordinator.notifyRunAdmissionFailed(handle)
+		coordinator.notifyRunAdmissionFailedObservers(handle)
 		return nil, fmt.Errorf("session run starter returned a nil run")
 	}
 	coordinator.notifyRunStarted(handle)
@@ -374,6 +855,7 @@ func (coordinator *SessionRunCoordinator) await(handle *CoordinatedSessionRun) {
 	defer coordinator.wg.Done()
 	result, err := handle.Wait()
 	coordinator.notifyRunSettled(handle, result, err)
+	coordinator.notifyRunSettledObservers(handle, result, err)
 	if coordinator.options.OnRunSettled != nil {
 		coordinator.options.OnRunSettled(handle, result, err)
 	}
@@ -468,6 +950,7 @@ func (coordinator *SessionRunCoordinator) Close() {
 	}
 	coordinator.closed = true
 	coordinator.mu.Unlock()
+	coordinator.observerStop.Store(true)
 
 	// Cancel before taking startMu. The starter is invoked while startMu is
 	// held and may be waiting on this context, so taking startMu first would
@@ -486,6 +969,16 @@ func (coordinator *SessionRunCoordinator) Close() {
 		run.Cancel()
 	}
 	coordinator.wg.Wait()
+	coordinator.lifecycleMu.Lock()
+	observers := make([]*runObserverMailbox, 0, len(coordinator.observers))
+	for id, observer := range coordinator.observers {
+		observers = append(observers, observer)
+		delete(coordinator.observers, id)
+	}
+	coordinator.lifecycleMu.Unlock()
+	for _, observer := range observers {
+		observer.stop()
+	}
 	if coordinator.closeDone != nil {
 		close(coordinator.closeDone)
 	}

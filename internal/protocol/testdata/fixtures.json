@@ -115,14 +115,19 @@
         "type": "subscribe",
         "id": "sub_request_1",
         "payload": {
-          "subscription_id": "session-index:project_1",
+          "subscription_id": "session-content:session_2",
           "resource": {
-            "type": "session_index",
-            "id": "project_1"
+            "type": "session_content",
+            "id": "session_2"
           },
           "resume": {
             "stream_epoch": "stream_1",
             "sequence": "1938"
+          },
+          "active_run_resume": {
+            "run_epoch": "server_1:session_2:1",
+            "run_id": "run_9",
+            "run_cursor": "17"
           }
         }
       }
@@ -371,17 +376,14 @@
           },
           "event": {
             "type": "text.delta",
+            "session_id": "session_2",
             "run_id": "run_9",
             "run_cursor": "17",
+            "turn_id": "turn_3",
+            "agent_iteration": 1,
             "item_id": "item_3",
             "durable_text_length": 128,
-            "delta": "...",
-            "tool_name": "shell",
-            "tool_call_id": "tool_7",
-            "session_phase": "running",
-            "arguments": {
-              "command": "pwd"
-            }
+            "delta": "..."
           }
         }
       }
@@ -565,6 +567,29 @@
           "previous_sequence": "1",
           "resource_revision": "2",
           "operations": ["not an object"]
+        }
+      }
+    },
+    {
+      "name": "subscription_event_unknown_field",
+      "message": {
+        "version": 1,
+        "type": "subscription_event",
+        "id": "bad_event_field",
+        "payload": {
+          "subscription_id": "session-content:session_2",
+          "resource": { "type": "session_content", "id": "session_2" },
+          "event": {
+            "type": "text.delta",
+            "session_id": "session_2",
+            "run_id": "run_9",
+            "run_cursor": "18",
+            "turn_id": "turn_3",
+            "agent_iteration": 1,
+            "item_id": "item_3",
+            "delta": "x",
+            "future_field": true
+          }
         }
       }
     },

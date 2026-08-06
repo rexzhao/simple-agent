@@ -84,6 +84,19 @@ func (r *ProviderRegistry) Provider(resourceType protocol.ResourceType) (Resourc
 // ResourceProvider; the registry deliberately does not split snapshot,
 // journal decision, and live registration into separate calls.
 func (r *ProviderRegistry) Open(ctx context.Context, principal Principal, key protocol.ResourceKey, resume *protocol.ResumeToken) (OpenedResource, error) {
+	return r.OpenSubscription(ctx, principal, key, resume, nil)
+}
+
+// OpenSubscription is the combined durable and independent active-run open
+// barrier. The two resume descriptors remain separate all the way to the
+// resource provider.
+func (r *ProviderRegistry) OpenSubscription(ctx context.Context, principal Principal, key protocol.ResourceKey, resume *protocol.ResumeToken, activeRunResume *protocol.RunResumeToken) (OpenedResource, error) {
+	if err := protocol.ValidateResumeToken(resume); err != nil {
+		return OpenedResource{}, err
+	}
+	if err := protocol.ValidateRunResumeToken(activeRunResume); err != nil {
+		return OpenedResource{}, err
+	}
 	if err := ValidateResourceKey(key); err != nil {
 		return OpenedResource{}, err
 	}
@@ -94,11 +107,18 @@ func (r *ProviderRegistry) Open(ctx context.Context, principal Principal, key pr
 	if err := provider.Authorize(ctx, principal, key); err != nil {
 		return OpenedResource{}, fmt.Errorf("authorize %s/%s: %w", key.Type, key.ID, err)
 	}
-	opened, err := provider.Open(ctx, key, resume)
+	var opened OpenedResource
+	if runProvider, ok := provider.(RunResumeProvider); ok {
+		opened, err = runProvider.OpenWithRunResume(ctx, key, resume, activeRunResume)
+	} else if activeRunResume != nil {
+		return OpenedResource{}, fmt.Errorf("provider does not support active-run resume")
+	} else {
+		opened, err = provider.Open(ctx, key, resume)
+	}
 	if err != nil {
 		return OpenedResource{}, fmt.Errorf("open %s/%s: %w", key.Type, key.ID, err)
 	}
-	if err := validateOpenedResource(opened, resume); err != nil {
+	if err := validateOpenedResource(opened, resume, key); err != nil {
 		if opened.Close != nil {
 			opened.Close()
 		}
@@ -118,7 +138,7 @@ func (r *ProviderRegistry) Open(ctx context.Context, principal Principal, key pr
 	return opened, nil
 }
 
-func validateOpenedResource(opened OpenedResource, resume *protocol.ResumeToken) error {
+func validateOpenedResource(opened OpenedResource, resume *protocol.ResumeToken, resourceKeys ...protocol.ResourceKey) error {
 	if strings.TrimSpace(opened.StreamEpoch) == "" {
 		return fmt.Errorf("%w: stream epoch is required", ErrInvalidOpenedResource)
 	}
@@ -147,6 +167,28 @@ func validateOpenedResource(opened OpenedResource, resume *protocol.ResumeToken)
 	}
 	if err := validateDecisionShape(decision, resume, opened.StreamEpoch, opened.Sequence); err != nil {
 		return fmt.Errorf("%w: %v", ErrInvalidOpenedResource, err)
+	}
+	key, hasKey := protocol.ResourceKey{}, len(resourceKeys) > 0
+	if hasKey {
+		key = resourceKeys[0]
+	}
+	for index, event := range opened.TransientReplay {
+		if err := event.Validate(); err != nil {
+			return fmt.Errorf("%w: transient replay %d: %v", ErrInvalidOpenedResource, index, err)
+		}
+		if hasKey && key.Type == protocol.ResourceTypeSessionContent {
+			decoded, err := protocol.DecodeSubscriptionEvent(event.Event)
+			if err != nil || decoded.SessionID != key.ID {
+				return fmt.Errorf("%w: transient replay %d session identity does not match resource", ErrInvalidOpenedResource, index)
+			}
+		}
+		if index > 0 {
+			previous, previousErr := protocol.ParseUint64Decimal(string(opened.TransientReplay[index-1].Cursor))
+			current, currentErr := protocol.ParseUint64Decimal(string(event.Cursor))
+			if previousErr != nil || currentErr != nil || current != previous+1 || event.RunID != opened.TransientReplay[index-1].RunID || event.RunEpoch != opened.TransientReplay[index-1].RunEpoch {
+				return fmt.Errorf("%w: transient replay is not continuous", ErrInvalidOpenedResource)
+			}
+		}
 	}
 	return nil
 }
@@ -249,8 +291,12 @@ func NewEngine(providers *ProviderRegistry) (*Engine, error) {
 }
 
 func (e *Engine) Open(ctx context.Context, principal Principal, key protocol.ResourceKey, resume *protocol.ResumeToken) (OpenedResource, error) {
+	return e.OpenSubscription(ctx, principal, key, resume, nil)
+}
+
+func (e *Engine) OpenSubscription(ctx context.Context, principal Principal, key protocol.ResourceKey, resume *protocol.ResumeToken, activeRunResume *protocol.RunResumeToken) (OpenedResource, error) {
 	if e == nil || e.providers == nil {
 		return OpenedResource{}, fmt.Errorf("provider registry is required")
 	}
-	return e.providers.Open(ctx, principal, key, resume)
+	return e.providers.OpenSubscription(ctx, principal, key, resume, activeRunResume)
 }

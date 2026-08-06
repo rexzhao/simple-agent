@@ -98,7 +98,13 @@ func ValidateResourceRevision(value ResourceRevision) error {
 }
 
 func ValidateRunCursor(value RunCursor) error {
-	return ValidateDecimal(string(value))
+	if err := ValidateDecimal(string(value)); err != nil {
+		return err
+	}
+	if len(value) > 1 && value[0] == '0' {
+		return fmt.Errorf("must be a canonical non-negative decimal string")
+	}
+	return nil
 }
 
 func CompareSequence(left, right Sequence) (int, error) {
@@ -106,6 +112,12 @@ func CompareSequence(left, right Sequence) (int, error) {
 }
 
 func CompareRunCursor(left, right RunCursor) (int, error) {
+	if err := ValidateRunCursor(left); err != nil {
+		return 0, fmt.Errorf("left value: %w", err)
+	}
+	if err := ValidateRunCursor(right); err != nil {
+		return 0, fmt.Errorf("right value: %w", err)
+	}
 	return CompareDecimal(string(left), string(right))
 }
 
@@ -114,5 +126,8 @@ func ParseSequence(value Sequence) (*big.Int, error) {
 }
 
 func ParseRunCursor(value RunCursor) (*big.Int, error) {
+	if err := ValidateRunCursor(value); err != nil {
+		return nil, err
+	}
 	return ParseDecimal(string(value))
 }

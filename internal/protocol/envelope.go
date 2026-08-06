@@ -253,7 +253,7 @@ func validateOptionalFieldNullability(data []byte, envelope Envelope) error {
 	case MessageTypeCommand:
 		fields = []string{"expected_revision"}
 	case MessageTypeSubscribe:
-		fields = []string{"resume"}
+		fields = []string{"resume", "active_run_resume"}
 	case MessageTypeCommandResult:
 		fields = []string{"error"}
 	case MessageTypeError:

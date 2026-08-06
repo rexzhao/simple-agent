@@ -24,6 +24,13 @@ const (
 
 const maxSessionStreamToolContentRunes = 4096
 
+const (
+	// The callback sink is a presentation boundary shared by the legacy SSE
+	// path. It must not become an unbounded heap while a callback is slow.
+	defaultSessionEventSinkMessages = 256
+	defaultSessionEventSinkBytes    = 2 * 1024 * 1024
+)
+
 type SessionItemsPage struct {
 	Items         []SessionItem `json:"items"`
 	OldestSeq     int64         `json:"oldest_seq"`
@@ -113,17 +120,26 @@ func NewSessionStreamEvent(eventType string, fields map[string]any) SessionStrea
 // trailing queued delta via exact concatenation, so a blocked emit cannot grow
 // the queue by one map per delta. Caller-owned event maps are never mutated; a
 // merged delta is rebuilt from its accumulator when drained. Every other event
-// is delivered verbatim, in submission order, with no drops or reordering. The
-// terminal event (turn.committed / turn.failed) is submitted last and flushed
-// before close+wait returns, so no callback fires after the caller returns.
+// is delivered verbatim, in submission order, until a hard messages/bytes bound
+// is reached. On overflow the pending queue is discarded and one explicit
+// run.resync_required marker is emitted after any already-drained batch; this is
+// a recovery boundary, never a silent drop followed by continued cursor use.
+// The terminal event (turn.committed / turn.failed) is submitted last and
+// flushed before close+wait returns when the sink did not overflow.
 type sessionEventSink struct {
-	emit func(SessionStreamEvent)
+	emit        func(SessionStreamEvent)
+	maxMessages int
+	maxBytes    int
 
-	mu     sync.Mutex
-	cond   *sync.Cond
-	ops    []sinkOp
-	closed bool
-	done   chan struct{}
+	mu              sync.Mutex
+	cond            *sync.Cond
+	ops             []sinkOp
+	queuedBytes     int
+	closed          bool
+	overflowed      bool
+	overflowMarker  SessionStreamEvent
+	markerDelivered bool
+	done            chan struct{}
 }
 
 type sinkOp struct {
@@ -133,6 +149,7 @@ type sinkOp struct {
 	turnID              string
 	agentIteration      int
 	text                *strings.Builder // accumulator for delta ops
+	bytes               int
 	assistantItemID     string
 	durableTextLength   int
 	durableCheckpointed bool
@@ -140,9 +157,21 @@ type sinkOp struct {
 }
 
 func newSessionEventSink(emit func(SessionStreamEvent)) *sessionEventSink {
+	return newSessionEventSinkWithBounds(emit, defaultSessionEventSinkMessages, defaultSessionEventSinkBytes)
+}
+
+func newSessionEventSinkWithBounds(emit func(SessionStreamEvent), maxMessages, maxBytes int) *sessionEventSink {
+	if maxMessages <= 0 {
+		maxMessages = defaultSessionEventSinkMessages
+	}
+	if maxBytes <= 0 {
+		maxBytes = defaultSessionEventSinkBytes
+	}
 	s := &sessionEventSink{
-		emit: emit,
-		done: make(chan struct{}),
+		emit:        emit,
+		maxMessages: maxMessages,
+		maxBytes:    maxBytes,
+		done:        make(chan struct{}),
 	}
 	s.cond = sync.NewCond(&s.mu)
 	go s.run()
@@ -174,10 +203,23 @@ func (s *sessionEventSink) submit(event SessionStreamEvent) {
 				(!hasAssistantBinding || (last.assistantItemID == assistantItemID &&
 					(eventType != "text.delta" ||
 						(last.durableCheckpointed == durableCheckpointed && last.durableTextLength == durableTextLength)))) {
+				if s.queuedBytes > s.maxBytes-len(text) {
+					s.overflowLocked()
+					s.mu.Unlock()
+					return
+				}
 				last.text.WriteString(text)
+				last.bytes += len(text)
+				s.queuedBytes += len(text)
 				s.mu.Unlock()
 				return
 			}
+		}
+		bytes := sessionEventSinkEventBytes(event)
+		if !s.canAppendLocked(bytes) {
+			s.overflowLocked()
+			s.mu.Unlock()
+			return
 		}
 		builder := &strings.Builder{}
 		builder.WriteString(text)
@@ -187,16 +229,55 @@ func (s *sessionEventSink) submit(event SessionStreamEvent) {
 			turnID:              turnID,
 			agentIteration:      agentIteration,
 			text:                builder,
+			bytes:               bytes,
 			assistantItemID:     assistantItemID,
 			durableTextLength:   durableTextLength,
 			durableCheckpointed: durableCheckpointed,
 			hasAssistantBinding: hasAssistantBinding,
 		})
+		s.queuedBytes += bytes
 	} else {
+		bytes := sessionEventSinkEventBytes(event)
+		if !s.canAppendLocked(bytes) {
+			s.overflowLocked()
+			s.mu.Unlock()
+			return
+		}
 		s.ops = append(s.ops, sinkOp{event: event})
+		s.ops[len(s.ops)-1].bytes = bytes
+		s.queuedBytes += bytes
 	}
 	s.cond.Signal()
 	s.mu.Unlock()
+}
+
+func sessionEventSinkEventBytes(event SessionStreamEvent) int {
+	encoded, err := json.Marshal(event)
+	if err != nil {
+		return defaultSessionEventSinkBytes + 1
+	}
+	// Include a small allowance for accumulator metadata. The serialized source
+	// is the accounting unit, and the allowance covers the strings retained by
+	// sinkOp which are not present in the rebuilt delta map independently.
+	return len(encoded) + 128
+}
+
+func (s *sessionEventSink) canAppendLocked(bytes int) bool {
+	return bytes > 0 && bytes <= s.maxBytes && len(s.ops) < s.maxMessages && s.queuedBytes <= s.maxBytes-bytes
+}
+
+func (s *sessionEventSink) overflowLocked() {
+	if s.overflowed {
+		return
+	}
+	s.overflowed = true
+	s.closed = true
+	s.ops = nil
+	s.queuedBytes = 0
+	s.overflowMarker = NewSessionStreamEvent("run.resync_required", map[string]any{
+		"reason": "session stream producer overflow",
+	})
+	s.cond.Signal()
 }
 
 func (s *sessionEventSink) close() {
@@ -225,9 +306,13 @@ func (s *sessionEventSink) run() {
 		}
 		ops := s.ops
 		s.ops = nil
+		s.queuedBytes = 0
 		s.mu.Unlock()
 
 		for _, op := range ops {
+			if s.emit == nil {
+				continue
+			}
 			if op.isDelta {
 				fields := map[string]any{"turn_id": op.turnID, "text": op.text.String()}
 				if op.agentIteration > 0 {
@@ -247,6 +332,15 @@ func (s *sessionEventSink) run() {
 		}
 
 		s.mu.Lock()
+		if s.overflowed && !s.markerDelivered {
+			marker := s.overflowMarker
+			s.markerDelivered = true
+			s.mu.Unlock()
+			if marker != nil && s.emit != nil {
+				s.emit(marker)
+			}
+			continue
+		}
 		empty := len(s.ops) == 0 && s.closed
 		s.mu.Unlock()
 		if empty {
@@ -753,6 +847,15 @@ func sessionStreamEventFromModelEvent(turnID string, agentIteration int, event m
 			"tool_call_id": event.ToolCall.ID,
 			"name":         event.ToolCall.Name,
 			"arguments":    sessionToolDisplayArguments(event.ToolCall.Name, event.ToolCall.Arguments),
+		}), true
+	case model.ToolCallDeltaEvent:
+		if event.ID == "" || event.Name == "" || event.ArgumentsDelta == "" {
+			return nil, false
+		}
+		return modelSessionStreamEvent("tool.progress", turnID, agentIteration, map[string]any{
+			"tool_call_id":    event.ID,
+			"name":            event.Name,
+			"arguments_delta": event.ArgumentsDelta,
 		}), true
 	case model.ToolStartedEvent:
 		if event.ToolCall.Name == "" {

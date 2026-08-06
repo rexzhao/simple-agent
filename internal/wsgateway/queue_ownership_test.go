@@ -74,3 +74,67 @@ func TestOutboundOverflowPurgesOnlyOwnedChangesAndQueuesRecovery(t *testing.T) {
 		t.Fatalf("other subscription send=%v", err)
 	}
 }
+
+func ownedTransient(subscriptionID, sessionID string) protocol.SubscriptionEventMessage {
+	event := protocol.TransientSubscriptionEvent{
+		Type:      protocol.SubscriptionEventRunStarted,
+		SessionID: sessionID,
+		RunID:     "run-" + subscriptionID,
+		RunCursor: "1",
+		Status:    "running",
+	}
+	raw, err := json.Marshal(event)
+	if err != nil {
+		panic(err)
+	}
+	return protocol.SubscriptionEventMessage{
+		Envelope: protocol.Envelope{Version: 1, Type: protocol.MessageTypeSubscriptionEvent, ID: "event-" + subscriptionID},
+		Payload: protocol.SubscriptionEventPayload{
+			SubscriptionID: subscriptionID,
+			Resource:       protocol.ResourceKey{Type: protocol.ResourceTypeSessionContent, ID: sessionID},
+			Event:          raw,
+		},
+	}
+}
+
+func TestDesyncPurgesDurableAndTransientFramesButPreservesOtherOwners(t *testing.T) {
+	gateway, err := New(Options{Limits: Limits{MaxMessageBytes: 4096, MaxOutboundMessages: 6, MaxOutboundBytes: 4096}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	connection := newConnection(gateway, nil, TicketClaims{}, "owned-queue-data", nil)
+	for _, frame := range []outboundFrame{
+		{kind: frameMessage, payload: []byte("a-change"), subscriptionID: "a", purgeable: true},
+		{kind: frameMessage, payload: []byte("a-event"), subscriptionID: "a", purgeable: true},
+		{kind: frameMessage, payload: []byte("b-change"), subscriptionID: "b", purgeable: true},
+		{kind: frameMessage, payload: []byte("control")},
+	} {
+		if err := connection.queue.enqueue(frame); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := connection.queue.enqueue(outboundFrame{kind: frameMessage, payload: []byte("a-event-2"), subscriptionID: "a", purgeable: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := connection.desyncSubscription("a", ownedTransient("a", "session-a")); !errors.Is(err, ErrSubscriptionDesynced) {
+		t.Fatalf("desync error = %v, want ErrSubscriptionDesynced", err)
+	}
+	connection.queue.mu.Lock()
+	items := append([]outboundFrame(nil), connection.queue.items...)
+	connection.queue.mu.Unlock()
+	if len(items) != 3 {
+		t.Fatalf("remaining queue frames = %d, want B/control/recovery", len(items))
+	}
+	if string(items[0].payload) != "b-change" || string(items[1].payload) != "control" {
+		t.Fatalf("unrelated frames changed: %#v", items)
+	}
+	if err := connection.Send(ownedChange("a", "9", "8")); !errors.Is(err, ErrSubscriptionDesynced) {
+		t.Fatalf("desynced durable change = %v", err)
+	}
+	if err := connection.Send(ownedTransient("a", "session-a")); !errors.Is(err, ErrSubscriptionDesynced) {
+		t.Fatalf("desynced transient event = %v", err)
+	}
+	if err := connection.Send(ownedChange("b", "9", "8")); err != nil {
+		t.Fatalf("other subscription change = %v", err)
+	}
+}

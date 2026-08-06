@@ -32,6 +32,13 @@ type ResourceProvider interface {
 	Open(ctx context.Context, key protocol.ResourceKey, resume *protocol.ResumeToken) (OpenedResource, error)
 }
 
+// RunResumeProvider is an optional extension for resources that expose a
+// transient active-run stream. Keeping it optional preserves the durable-only
+// provider contract for every other resource type.
+type RunResumeProvider interface {
+	OpenWithRunResume(ctx context.Context, key protocol.ResourceKey, resume *protocol.ResumeToken, activeRunResume *protocol.RunResumeToken) (OpenedResource, error)
+}
+
 // OpenedResource is the complete result of the provider's atomic open
 // barrier. Decision.ToSequence and Sequence are the same barrier sequence.
 // Changes contains only JournalEntry values strictly after that sequence and
@@ -45,6 +52,9 @@ type OpenedResource struct {
 	LiveFromSequence uint64
 	Changes          <-chan JournalEntry
 	Terminal         <-chan LiveTerminal
+	TransientReplay  []TransientEvent
+	Transient        TransientDelivery
+	TransientResync  string
 	Close            func()
 }
 
