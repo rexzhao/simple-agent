@@ -10,7 +10,7 @@ import type {
   SessionCreateOptions,
   SessionCreateResult,
 } from '../commands/sessionCommands'
-import type { RunCancelResult, RunCommands, RunContinueOptions, RunContinueResult, RunStartOptions, RunStartResult, RunStatus } from '../commands/runCommands'
+import type { RunCancelResult, RunCommands, RunContinueOptions, RunContinueResult, RunPromptAppendOptions, RunPromptAppendResult, RunStartOptions, RunStartResult, RunStatus } from '../commands/runCommands'
 import { SyncReadError } from './errors'
 import type { RuntimeTransport } from './runtime'
 
@@ -55,6 +55,7 @@ export interface CommandFacadeOptions {
   requestIDGenerator?: () => string
   sessionIDGenerator?: () => string
   runIDGenerator?: () => string
+  operationIDGenerator?: () => string
   setTimeout?: (handler: () => void, timeout: number) => ReturnType<typeof globalThis.setTimeout>
   clearTimeout?: (handle: ReturnType<typeof globalThis.setTimeout>) => void
 }
@@ -75,6 +76,12 @@ function defaultRunID(): string {
   const randomUUID = globalThis.crypto?.randomUUID?.bind(globalThis.crypto)
   if (!randomUUID) throw new Error('cryptographic run ID generation is unavailable')
   return `run_${randomUUID()}`
+}
+
+function defaultOperationID(): string {
+  const randomUUID = globalThis.crypto?.randomUUID?.bind(globalThis.crypto)
+  if (!randomUUID) throw new Error('cryptographic operation ID generation is unavailable')
+  return `operation_${randomUUID()}`
 }
 
 function errorFromCommand(code: string, message: string, details?: unknown): CommandFacadeError {
@@ -178,6 +185,15 @@ function decodeRunContinueResult(value: unknown, sessionID: string, runID: strin
   return { session_id: resultSessionID, run_id: resultRunID, status: status as RunStatus }
 }
 
+function decodeRunPromptAppendResult(value: unknown, sessionID: string, runID: string, operationID: string): RunPromptAppendResult {
+  const object = exactObject(value, ['operation_id', 'session_id', 'run_id', 'accepted'])
+  const resultOperationID = resultString(object, 'operation_id')
+  const resultSessionID = resultString(object, 'session_id')
+  const resultRunID = resultString(object, 'run_id')
+  if (resultOperationID !== operationID || resultSessionID !== sessionID || resultRunID !== runID || object.accepted !== true) throw new Error('result identity does not match request')
+  return { operation_id: resultOperationID, session_id: resultSessionID, run_id: resultRunID, accepted: true }
+}
+
 /**
  * Typed application command boundary. A command result is only a promise
  * result; it never mutates a replica. Durable authority still arrives through
@@ -192,6 +208,7 @@ export class CommandFacade implements SessionCommands, RunCommands {
   private readonly requestIDGenerator: () => string
   private readonly sessionIDGenerator: () => string
   private readonly runIDGenerator: () => string
+  private readonly operationIDGenerator: () => string
   private readonly setTimer: NonNullable<CommandFacadeOptions['setTimeout']>
   private readonly clearTimer: NonNullable<CommandFacadeOptions['clearTimeout']>
   private pending = new Map<string, PendingCommand<unknown>>()
@@ -201,6 +218,8 @@ export class CommandFacade implements SessionCommands, RunCommands {
   private recentEntityIDOrder: string[] = []
   private recentRunIDs = new Set<string>()
   private recentRunIDOrder: string[] = []
+  private recentOperationIDs = new Set<string>()
+  private recentOperationIDOrder: string[] = []
   private detach: (() => void)[] = []
   private started = false
 
@@ -213,6 +232,7 @@ export class CommandFacade implements SessionCommands, RunCommands {
     this.requestIDGenerator = options.requestIDGenerator ?? defaultRequestID
     this.sessionIDGenerator = options.sessionIDGenerator ?? defaultSessionID
     this.runIDGenerator = options.runIDGenerator ?? defaultRunID
+    this.operationIDGenerator = options.operationIDGenerator ?? defaultOperationID
     this.setTimer = options.setTimeout ?? ((handler, timeout) => globalThis.setTimeout(handler, timeout))
     this.clearTimer = options.clearTimeout ?? ((handle) => globalThis.clearTimeout(handle))
     if (this.timeoutMS <= 0 || this.maxPendingCommands <= 0 || this.maxRecentRequestIDs <= 0 || this.maxRecentEntityIDs <= 0) throw new Error('command bounds must be positive')
@@ -327,6 +347,33 @@ export class CommandFacade implements SessionCommands, RunCommands {
     return this.submit('run.cancel', { run_id: cleanRunID }, false, (value) => decodeRunCancelResult(value, cleanRunID), options)
   }
 
+  appendPrompt(sessionID: string, runID: string, content: string, options: RunPromptAppendOptions = {}): Promise<RunPromptAppendResult> {
+    const cleanSessionID = this.cleanID(sessionID)
+    const cleanRunID = this.cleanID(runID)
+    if (!this.validSessionID(cleanSessionID) || !this.validRunID(cleanRunID)) return Promise.reject(new CommandFacadeError('invalid', 'session_id and run_id are invalid'))
+    if (typeof content !== 'string' || content.trim() === '' || this.utf8Bytes(content) > 64 * 1024) return Promise.reject(new CommandFacadeError('invalid', 'content is invalid'))
+
+    const explicitOperationID = options.operationID !== undefined
+    let operationID: string
+    if (explicitOperationID) {
+      if (typeof options.operationID !== 'string') return Promise.reject(new CommandFacadeError('invalid', 'operation_id is invalid'))
+      operationID = this.cleanID(options.operationID)
+      if (!this.validOperationID(operationID)) return Promise.reject(new CommandFacadeError('invalid', 'operation_id is invalid'))
+    } else {
+      try {
+        operationID = this.cleanID(this.operationIDGenerator())
+        if (!this.validOperationID(operationID)) throw new Error('operation ID is invalid')
+      } catch {
+        return Promise.reject(new CommandFacadeError('id_generation', 'cryptographic operation ID generation failed'))
+      }
+      if (this.recentOperationIDs.has(operationID)) return Promise.reject(new CommandFacadeError('id_generation', 'operation ID collided with an active or recently used command', { collision: true }))
+      this.rememberOperationID(operationID)
+    }
+    // Content is user data and is intentionally not trimmed. The exact text
+    // is part of the durable operation identity and is resent byte-for-byte.
+    return this.submit('run.prompt.append', { session_id: cleanSessionID, run_id: cleanRunID, operation_id: operationID, content }, true, (value) => decodeRunPromptAppendResult(value, cleanSessionID, cleanRunID, operationID), options)
+  }
+
   start(): void
   start(sessionID: string, content: string, options?: RunStartOptions): Promise<RunStartResult>
   start(sessionID?: string, content?: string, options: RunStartOptions = {}): void | Promise<RunStartResult> {
@@ -417,6 +464,10 @@ export class CommandFacade implements SessionCommands, RunCommands {
     return reservedKey !== 'blobs' && reservedKey !== '.session-claims'
   }
 
+  private validOperationID(value: string): boolean {
+    return this.validRunID(value)
+  }
+
   private utf8Bytes(value: string): number {
     return typeof TextEncoder === 'function' ? new TextEncoder().encode(value).byteLength : value.length
   }
@@ -484,6 +535,15 @@ export class CommandFacade implements SessionCommands, RunCommands {
     while (this.recentRunIDOrder.length > this.maxRecentEntityIDs) {
       const retired = this.recentRunIDOrder.shift()
       if (retired !== undefined) this.recentRunIDs.delete(retired)
+    }
+  }
+
+  private rememberOperationID(id: string): void {
+    this.recentOperationIDs.add(id)
+    this.recentOperationIDOrder.push(id)
+    while (this.recentOperationIDOrder.length > this.maxRecentEntityIDs) {
+      const retired = this.recentOperationIDOrder.shift()
+      if (retired !== undefined) this.recentOperationIDs.delete(retired)
     }
   }
 

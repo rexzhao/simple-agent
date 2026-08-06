@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 // RunClaim is the durable, server-wide identity claim for a command-owned
@@ -35,13 +36,21 @@ const (
 	runClaimsDatabaseDirectory = "run-claims.db"
 	runClaimsDatabaseFileName  = "claims.db"
 	runAdmissionLockDirectory  = ".run-admission-locks"
+	// Prompt append is deliberately smaller than the generic WebSocket frame
+	// limit.  The command carries text only; binary/image input has a separate
+	// contract and must not be smuggled through this operation claim.
+	MaxPromptAppendContentBytes      = 64 * 1024
+	PromptAppendStatusAdmitted       = "admitted"
+	PromptAppendStatusApplied        = "applied"
+	PromptAppendStatusNotApplied     = "not_applied"
+	PromptAppendStatusOutcomeUnknown = "outcome_unknown"
 )
 
-// RunAdmissionLock spans the shared claim and the per-session run row
-// admission. Unlike the session writer lock, its inode is keyed only by the
-// stable run identity, so independent coordinators cannot observe a claim-only
-// window and decide that the owner has died while it is still committing the
-// session row.
+// RunAdmissionLock is the private inode lock used by both run admission and
+// prompt-append admission. Unlike the session writer lock, its inode is keyed
+// only by the stable operation identity, so independent coordinators cannot
+// observe a claim-only window and decide that the owner has died while it is
+// still committing the associated durable boundary.
 type RunAdmissionLock struct {
 	file     *os.File
 	path     string
@@ -49,35 +58,49 @@ type RunAdmissionLock struct {
 }
 
 func (s *V2Store) AcquireRunAdmissionLock(ctx context.Context, runID string) (*RunAdmissionLock, error) {
+	return s.acquireIdentityAdmissionLock(ctx, runID, ValidateRunID, "run")
+}
+
+// AcquirePromptAppendAdmissionLock serializes one stable prompt operation
+// across server processes.  It intentionally uses the same private lock root
+// as run admission, but the inode is keyed by operation_id rather than by the
+// target run.  Two different append operations may therefore proceed in
+// parallel while retries of one operation have one owner.
+func (s *V2Store) AcquirePromptAppendAdmissionLock(ctx context.Context, operationID string) (*RunAdmissionLock, error) {
+	return s.acquireIdentityAdmissionLock(ctx, operationID, ValidateOperationID, "prompt append")
+}
+
+func (s *V2Store) acquireIdentityAdmissionLock(ctx context.Context, identity string, validate func(string) error, kind string) (*RunAdmissionLock, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	if err := s.requireRoot(); err != nil {
 		return nil, err
 	}
-	if err := ValidateRunID(runID); err != nil {
+	identity = strings.TrimSpace(identity)
+	if err := validate(identity); err != nil {
 		return nil, err
 	}
-	digest := sha256.Sum256([]byte(strings.TrimSpace(runID)))
+	digest := sha256.Sum256([]byte(identity))
 	if err := ensurePrivateDirectory(filepath.Join(s.root, sessionClaimsDirName)); err != nil {
-		return nil, fmt.Errorf("create session claims root for run lock: %w", err)
+		return nil, fmt.Errorf("create session claims root for %s lock: %w", kind, err)
 	}
 	lockDirectory := filepath.Join(s.root, sessionClaimsDirName, runAdmissionLockDirectory)
 	if err := ensurePrivateDirectory(lockDirectory); err != nil {
-		return nil, fmt.Errorf("create run admission lock directory: %w", err)
+		return nil, fmt.Errorf("create %s admission lock directory: %w", kind, err)
 	}
 	path := filepath.Join(lockDirectory, hex.EncodeToString(digest[:])+".lock")
 	file, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o600)
 	if err != nil {
-		return nil, fmt.Errorf("open run admission lock %q: %w", path, err)
+		return nil, fmt.Errorf("open %s admission lock %q: %w", kind, path, err)
 	}
 	if err := file.Chmod(0o600); err != nil {
 		_ = file.Close()
-		return nil, fmt.Errorf("chmod run admission lock %q: %w", path, err)
+		return nil, fmt.Errorf("chmod %s admission lock %q: %w", kind, path, err)
 	}
 	if err := lockSessionWriteFile(ctx, file); err != nil {
 		_ = file.Close()
-		return nil, fmt.Errorf("acquire run admission lock %q: %w", path, err)
+		return nil, fmt.Errorf("acquire %s admission lock %q: %w", kind, path, err)
 	}
 	return &RunAdmissionLock{file: file, path: path}, nil
 }
@@ -167,6 +190,208 @@ func (s *V2Store) ClaimRunWhileLocked(ctx context.Context, sessionID, runID, inp
 		return RunClaim{}, false, fmt.Errorf("commit run claim %q: %w", runID, err)
 	}
 	return RunClaim{RunID: runID, SessionID: sessionID, InputFingerprint: inputFingerprint, Status: RunStatusRunning, StartedAt: startedAt.UTC()}, true, nil
+}
+
+// PromptAppendClaim is the durable tombstone for one run.prompt.append
+// operation. The operation is admitted before the process-memory queue is
+// touched. A stale admitted row is outcome_unknown because the SQLite claim
+// cannot prove whether the in-memory queue mutation happened before a crash.
+// The content itself is never persisted in this server-wide index; only its
+// exact UTF-8 SHA-256 digest is retained.
+type PromptAppendClaim struct {
+	OperationID   string
+	SessionID     string
+	RunID         string
+	ContentSHA256 string
+	Status        string
+	AdmittedAt    time.Time
+	SettledAt     time.Time
+}
+
+// ClaimPromptAppendWhileLocked creates or resolves an operation tombstone.
+// The caller must hold AcquirePromptAppendAdmissionLock for operationID for
+// the complete claim -> queue append -> status transition sequence.
+func (s *V2Store) ClaimPromptAppendWhileLocked(ctx context.Context, sessionID, runID, operationID, content string, admittedAt time.Time) (PromptAppendClaim, bool, error) {
+	if err := s.requireRoot(); err != nil {
+		return PromptAppendClaim{}, false, err
+	}
+	if err := validateV2SessionID(sessionID); err != nil {
+		return PromptAppendClaim{}, false, err
+	}
+	if err := ValidateRunID(runID); err != nil {
+		return PromptAppendClaim{}, false, err
+	}
+	if err := ValidateOperationID(operationID); err != nil {
+		return PromptAppendClaim{}, false, err
+	}
+	if strings.TrimSpace(content) == "" || len(content) > MaxPromptAppendContentBytes {
+		return PromptAppendClaim{}, false, fmt.Errorf("prompt append content is invalid")
+	}
+	if !utf8.ValidString(content) {
+		return PromptAppendClaim{}, false, fmt.Errorf("prompt append content is not valid UTF-8")
+	}
+	contentSHA256 := PromptAppendContentSHA256(content)
+	if admittedAt.IsZero() {
+		admittedAt = s.now().UTC()
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	db, err := s.openRunClaimsDB(true)
+	if err != nil {
+		return PromptAppendClaim{}, false, err
+	}
+	defer db.Close()
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return PromptAppendClaim{}, false, fmt.Errorf("begin prompt append claim: %w", err)
+	}
+	defer tx.Rollback()
+	var claim PromptAppendClaim
+	var admitted, settled string
+	err = tx.QueryRow(`SELECT operation_id, session_id, run_id, content_sha256, status, admitted_at, settled_at FROM prompt_append_claims WHERE operation_id = ?`, operationID).
+		Scan(&claim.OperationID, &claim.SessionID, &claim.RunID, &claim.ContentSHA256, &claim.Status, &admitted, &settled)
+	if err == nil {
+		claim.AdmittedAt, err = time.Parse(time.RFC3339Nano, admitted)
+		if err == nil && settled != "" {
+			claim.SettledAt, err = time.Parse(time.RFC3339Nano, settled)
+		}
+		if err != nil {
+			return PromptAppendClaim{}, false, fmt.Errorf("parse prompt append claim %q: %w", operationID, err)
+		}
+		if err := validatePromptAppendClaimStatus(claim.Status); err != nil {
+			return PromptAppendClaim{}, false, fmt.Errorf("corrupt prompt append claim %q: %w", operationID, err)
+		}
+		if claim.SessionID != sessionID || claim.RunID != runID || claim.ContentSHA256 != contentSHA256 {
+			return PromptAppendClaim{}, false, fmt.Errorf("%w: prompt operation %q", ErrIdempotencyConflict, operationID)
+		}
+		// An admitted row can only be owned by the caller while its inode lock is
+		// held. Reaching this branch means that owner has released the lock, so
+		// the queue side is no longer knowable. Tombstone it permanently as
+		// outcome_unknown: it may already be in the queue.
+		if claim.Status == PromptAppendStatusAdmitted {
+			settled = s.now().UTC().Format(time.RFC3339Nano)
+			if _, err := tx.Exec(`UPDATE prompt_append_claims SET status = ?, settled_at = ? WHERE operation_id = ? AND status = ?`, PromptAppendStatusOutcomeUnknown, settled, operationID, PromptAppendStatusAdmitted); err != nil {
+				return PromptAppendClaim{}, false, fmt.Errorf("resolve prompt append claim %q: %w", operationID, err)
+			}
+			claim.Status = PromptAppendStatusOutcomeUnknown
+			claim.SettledAt, _ = time.Parse(time.RFC3339Nano, settled)
+		}
+		if err := tx.Commit(); err != nil {
+			return PromptAppendClaim{}, false, fmt.Errorf("commit prompt append claim resolution %q: %w", operationID, err)
+		}
+		return claim, false, nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return PromptAppendClaim{}, false, fmt.Errorf("read prompt append claim %q: %w", operationID, err)
+	}
+	admitted = admittedAt.UTC().Format(time.RFC3339Nano)
+	if _, err := tx.Exec(`INSERT INTO prompt_append_claims(operation_id, session_id, run_id, content_sha256, status, admitted_at, settled_at) VALUES(?, ?, ?, ?, ?, ?, '')`, operationID, sessionID, runID, contentSHA256, PromptAppendStatusAdmitted, admitted); err != nil {
+		return PromptAppendClaim{}, false, fmt.Errorf("insert prompt append claim %q: %w", operationID, err)
+	}
+	if err := tx.Commit(); err != nil {
+		return PromptAppendClaim{}, false, fmt.Errorf("commit prompt append claim %q: %w", operationID, err)
+	}
+	return PromptAppendClaim{OperationID: operationID, SessionID: sessionID, RunID: runID, ContentSHA256: contentSHA256, Status: PromptAppendStatusAdmitted, AdmittedAt: admittedAt.UTC()}, true, nil
+}
+
+func (s *V2Store) GetPromptAppendClaim(operationID string) (PromptAppendClaim, error) {
+	if err := s.requireRoot(); err != nil {
+		return PromptAppendClaim{}, err
+	}
+	if err := ValidateOperationID(operationID); err != nil {
+		return PromptAppendClaim{}, err
+	}
+	db, err := s.openRunClaimsDB(true)
+	if err != nil {
+		return PromptAppendClaim{}, err
+	}
+	defer db.Close()
+	var claim PromptAppendClaim
+	var admitted, settled string
+	err = db.QueryRow(`SELECT operation_id, session_id, run_id, content_sha256, status, admitted_at, settled_at FROM prompt_append_claims WHERE operation_id = ?`, strings.TrimSpace(operationID)).
+		Scan(&claim.OperationID, &claim.SessionID, &claim.RunID, &claim.ContentSHA256, &claim.Status, &admitted, &settled)
+	if errors.Is(err, sql.ErrNoRows) {
+		return PromptAppendClaim{}, fmt.Errorf("%w: prompt append claim %s", ErrNotFound, operationID)
+	}
+	if err != nil {
+		return PromptAppendClaim{}, err
+	}
+	claim.AdmittedAt, err = time.Parse(time.RFC3339Nano, admitted)
+	if err != nil {
+		return PromptAppendClaim{}, err
+	}
+	if settled != "" {
+		claim.SettledAt, err = time.Parse(time.RFC3339Nano, settled)
+		if err != nil {
+			return PromptAppendClaim{}, err
+		}
+	}
+	if err := validatePromptAppendClaimStatus(claim.Status); err != nil {
+		return PromptAppendClaim{}, fmt.Errorf("corrupt prompt append claim %q: %w", operationID, err)
+	}
+	return claim, nil
+}
+
+// SetPromptAppendClaimStatus is idempotent. Only admitted may move to a
+// terminal state; a terminal claim is never reopened by a retry.
+func (s *V2Store) SetPromptAppendClaimStatus(operationID, status string, settledAt time.Time) error {
+	if err := s.requireRoot(); err != nil {
+		return err
+	}
+	if err := ValidateOperationID(operationID); err != nil {
+		return err
+	}
+	if err := validatePromptAppendClaimStatus(status); err != nil {
+		return err
+	}
+	if status == PromptAppendStatusAdmitted {
+		return fmt.Errorf("prompt append claim cannot be reopened")
+	}
+	if settledAt.IsZero() {
+		settledAt = s.now().UTC()
+	}
+	db, err := s.openRunClaimsDB(false)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	result, err := db.Exec(`UPDATE prompt_append_claims SET status = ?, settled_at = ? WHERE operation_id = ? AND status = ?`, status, settledAt.UTC().Format(time.RFC3339Nano), strings.TrimSpace(operationID), PromptAppendStatusAdmitted)
+	if err != nil {
+		return err
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if changed == 1 {
+		return nil
+	}
+	claim, err := s.GetPromptAppendClaim(operationID)
+	if err != nil {
+		return err
+	}
+	if claim.Status == status {
+		return nil
+	}
+	return fmt.Errorf("prompt append claim %q is already terminal", operationID)
+}
+
+func validatePromptAppendClaimStatus(status string) error {
+	switch status {
+	case PromptAppendStatusAdmitted, PromptAppendStatusApplied, PromptAppendStatusNotApplied, PromptAppendStatusOutcomeUnknown:
+		return nil
+	default:
+		return fmt.Errorf("invalid prompt append claim status %q", status)
+	}
+}
+
+// PromptAppendContentSHA256 fingerprints the exact UTF-8 bytes of content.
+// SessionID and RunID remain separate durable columns and are compared as part
+// of the operation identity; the prompt body itself is not retained globally.
+func PromptAppendContentSHA256(content string) string {
+	digest := sha256.Sum256([]byte(content))
+	return hex.EncodeToString(digest[:])
 }
 
 // GetRunClaim reads the shared claim. ErrNotFound is used for consistency
@@ -366,6 +591,18 @@ func (s *V2Store) openRunClaimsDB(create bool) (*sql.DB, error) {
 			db.Close()
 			return nil, fmt.Errorf("initialize run claims database: %w", err)
 		}
+		if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS prompt_append_claims (
+			operation_id TEXT PRIMARY KEY,
+			session_id TEXT NOT NULL,
+			run_id TEXT NOT NULL,
+			content_sha256 TEXT NOT NULL,
+			status TEXT NOT NULL,
+			admitted_at TEXT NOT NULL,
+			settled_at TEXT NOT NULL DEFAULT ''
+		)`); err != nil {
+			db.Close()
+			return nil, fmt.Errorf("initialize prompt append claims database: %w", err)
+		}
 		if err := os.Chmod(path, 0o600); err != nil {
 			return nil, fmt.Errorf("chmod run claims database %q: %w", path, err)
 		}
@@ -389,6 +626,20 @@ func ValidateRunID(id string) error {
 	}
 	if len(id) > maxSessionCreateIDLength {
 		return fmt.Errorf("run id is too long")
+	}
+	return nil
+}
+
+// ValidateOperationID is the stable client-owned identity boundary for a
+// durable prompt append.  Operation IDs use the same path-safe alphabet as
+// run IDs because they are also used as namespaced lock identities, but they
+// are a distinct semantic key and are never substituted for request_id.
+func ValidateOperationID(id string) error {
+	if err := ValidateSessionID(id); err != nil {
+		return err
+	}
+	if len(id) > maxSessionCreateIDLength {
+		return fmt.Errorf("operation id is too long")
 	}
 	return nil
 }

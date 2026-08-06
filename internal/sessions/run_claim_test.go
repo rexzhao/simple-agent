@@ -10,6 +10,124 @@ import (
 	"time"
 )
 
+func TestPromptAppendClaimIsDurableAtMostOnceTombstone(t *testing.T) {
+	store := NewV2Store(t.TempDir())
+	const sessionID = "session-prompt-claim"
+	const runID = "run-prompt-claim"
+	const operationID = "operation-prompt-claim"
+	if _, err := store.SaveMetadata(SessionV2{ID: sessionID}); err != nil {
+		t.Fatal(err)
+	}
+
+	lock, err := store.AcquirePromptAppendAdmissionLock(context.Background(), operationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim, created, err := store.ClaimPromptAppendWhileLocked(context.Background(), sessionID, runID, operationID, "  exact  ", time.Time{})
+	if err != nil || !created || claim.Status != PromptAppendStatusAdmitted {
+		t.Fatalf("initial prompt claim=%#v created=%v err=%v", claim, created, err)
+	}
+	if err := store.SetPromptAppendClaimStatus(operationID, PromptAppendStatusApplied, time.Time{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := lock.Release(); err != nil {
+		t.Fatal(err)
+	}
+
+	lock, err = store.AcquirePromptAppendAdmissionLock(context.Background(), operationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	retry, created, err := store.ClaimPromptAppendWhileLocked(context.Background(), sessionID, runID, operationID, "  exact  ", time.Time{})
+	if err != nil || created || retry.Status != PromptAppendStatusApplied {
+		t.Fatalf("applied retry claim=%#v created=%v err=%v", retry, created, err)
+	}
+	if _, _, err := store.ClaimPromptAppendWhileLocked(context.Background(), sessionID, runID, operationID, "different", time.Time{}); !errors.Is(err, ErrIdempotencyConflict) {
+		t.Fatalf("different content error=%v, want idempotency conflict", err)
+	}
+	_ = lock.Release()
+
+	const crashedOperation = "operation-prompt-crash"
+	lock, err = store.AcquirePromptAppendAdmissionLock(context.Background(), crashedOperation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, created, err := store.ClaimPromptAppendWhileLocked(context.Background(), sessionID, runID, crashedOperation, "crash boundary", time.Time{}); err != nil || !created {
+		t.Fatalf("crash-boundary admission created=%v err=%v", created, err)
+	}
+	_ = lock.Release() // model a process death before queue append/status
+	lock, err = store.AcquirePromptAppendAdmissionLock(context.Background(), crashedOperation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recovered, created, err := store.ClaimPromptAppendWhileLocked(context.Background(), sessionID, runID, crashedOperation, "crash boundary", time.Time{})
+	if err != nil || created || recovered.Status != PromptAppendStatusOutcomeUnknown {
+		t.Fatalf("recovered claim=%#v created=%v err=%v, want outcome_unknown tombstone", recovered, created, err)
+	}
+	_ = lock.Release()
+}
+
+func TestPromptAppendClaimStoresOnlyContentDigest(t *testing.T) {
+	store := NewV2Store(t.TempDir())
+	const sessionID = "session-prompt-digest"
+	const runID = "run-prompt-digest"
+	const operationID = "operation-prompt-digest"
+	const sensitivePrompt = "sensitive prompt must not enter the global claim index"
+
+	lock, err := store.AcquirePromptAppendAdmissionLock(context.Background(), operationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim, created, err := store.ClaimPromptAppendWhileLocked(context.Background(), sessionID, runID, operationID, sensitivePrompt, time.Time{})
+	if err != nil || !created {
+		t.Fatalf("claim=%#v created=%v err=%v", claim, created, err)
+	}
+	if claim.ContentSHA256 != PromptAppendContentSHA256(sensitivePrompt) {
+		t.Fatalf("content digest=%q, want %q", claim.ContentSHA256, PromptAppendContentSHA256(sensitivePrompt))
+	}
+	if err := store.SetPromptAppendClaimStatus(operationID, PromptAppendStatusApplied, time.Time{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := lock.Release(); err != nil {
+		t.Fatal(err)
+	}
+
+	db, err := store.openRunClaimsDB(false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	rows, err := db.Query(`PRAGMA table_info(prompt_append_claims)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	seenDigest, seenContent := false, false
+	for rows.Next() {
+		var cid, notNull, primaryKey int
+		var name, columnType string
+		var defaultValue any
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &primaryKey); err != nil {
+			t.Fatal(err)
+		}
+		seenDigest = seenDigest || name == "content_sha256"
+		seenContent = seenContent || name == "content"
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if !seenDigest || seenContent {
+		t.Fatalf("prompt claim schema has digest=%v raw-content=%v", seenDigest, seenContent)
+	}
+	var storedDigest string
+	if err := db.QueryRow(`SELECT content_sha256 FROM prompt_append_claims WHERE operation_id = ?`, operationID).Scan(&storedDigest); err != nil {
+		t.Fatal(err)
+	}
+	if storedDigest == sensitivePrompt || storedDigest != PromptAppendContentSHA256(sensitivePrompt) {
+		t.Fatalf("stored content value=%q, want only SHA-256 digest", storedDigest)
+	}
+}
+
 func TestRunAdmissionLockSerializesClaimOnlyWindow(t *testing.T) {
 	root := t.TempDir()
 	firstStore := NewV2Store(root)

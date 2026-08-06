@@ -2,11 +2,13 @@ package webapp
 
 import (
 	"encoding/json"
+	"errors"
 	"reflect"
 	"strings"
 	"testing"
 
 	"github.com/rexzhao/simple-agent/internal/commands"
+	"github.com/rexzhao/simple-agent/internal/execution"
 )
 
 func TestSessionCommandSchemasAreStrict(t *testing.T) {
@@ -210,12 +212,41 @@ func TestRunContinueFingerprintNormalizesOnlyWireOperationAndSeparatesRunStart(t
 	}
 }
 
+func TestRunPromptAppendArgumentsAreStrictAndPreserveContentBytes(t *testing.T) {
+	content := "\n  keep both edges  \t"
+	arguments, err := decodeRunPromptAppendArguments(json.RawMessage(`{"session_id":"session-append","run_id":"run-append","operation_id":"operation-append","content":"\n  keep both edges  \t"}`))
+	if err != nil {
+		t.Fatalf("valid append arguments rejected: %v", err)
+	}
+	if arguments.Content != content {
+		t.Fatalf("content=%q, want exact whitespace=%q", arguments.Content, content)
+	}
+	invalid := []string{
+		`{"session_id":"session-append","run_id":"run-append","operation_id":"operation-append","content":"ok","extra":true}`,
+		`{"session_id":"session-append","run_id":"run-append","operation_id":"operation-append","operation_id":"other","content":"ok"}`,
+		`{"session_id":"session-append","run_id":"run-append","operation_id":"operation-append","content":"ok"} {}`,
+		`{"session_id":"session-append","run_id":"run-append","operation_id":"operation-append","content":[]}`,
+		`{"session_id":"session-append","run_id":"run-append","operation_id":"operation-append","content":"   \t"}`,
+		`{"session_id":"session-append","run_id":"run-append","operation_id":"operation-append","content":"ok","images":[]}`,
+		`{"session_id":"session-append","run_id":"run-append","operation_id":"operation-append","content":"ok","blob":"not-supported"}`,
+	}
+	for _, raw := range invalid {
+		if _, err := decodeRunPromptAppendArguments(json.RawMessage(raw)); err == nil {
+			t.Fatalf("invalid append arguments accepted: %s", raw)
+		}
+	}
+	tooLarge := `{"session_id":"session-append","run_id":"run-append","operation_id":"operation-append","content":"` + strings.Repeat("x", maxRunPromptAppendContentBytes+1) + `"}`
+	if _, err := decodeRunPromptAppendArguments(json.RawMessage(tooLarge)); err == nil {
+		t.Fatal("append content over byte bound was accepted")
+	}
+}
+
 func TestSessionCommandRegistryIsClosedAndFlagsAreExplicit(t *testing.T) {
 	registry, err := newSessionCommandRegistry(nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantNames := []string{"run.cancel", "run.continue", "run.start", "session.archive", "session.create", "session.mark_read", "session.rename", "session.restore", "session.set_debug", "session.set_full_access"}
+	wantNames := []string{"run.cancel", "run.continue", "run.prompt.append", "run.start", "session.archive", "session.create", "session.mark_read", "session.rename", "session.restore", "session.set_debug", "session.set_full_access"}
 	if got := registry.Names(); !reflect.DeepEqual(got, wantNames) {
 		t.Fatalf("registry names=%v, want %v", got, wantNames)
 	}
@@ -234,5 +265,26 @@ func TestSessionCommandRegistryIsClosedAndFlagsAreExplicit(t *testing.T) {
 		} else if !definition.CrossEpochRetrySafe {
 			t.Fatalf("%s must be cross-epoch safe", name)
 		}
+	}
+}
+
+func TestPromptAppendOutcomeErrorsRemainTypedFailures(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		code string
+		want string
+	}{
+		{name: "not applied", err: execution.ErrPromptAppendNotApplied, code: "operation_not_applied", want: "was not applied"},
+		{name: "outcome unknown", err: execution.ErrPromptAppendOutcomeUnknown, code: "operation_outcome_unknown", want: "may already have been applied"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			mapped := sessionCommandError(test.err)
+			var domain *commands.DomainError
+			if !errors.As(mapped, &domain) || domain == nil || domain.Code != test.code || !strings.Contains(domain.Message, test.want) {
+				t.Fatalf("mapped error=%#v, want %s containing %q", mapped, test.code, test.want)
+			}
+		})
 	}
 }

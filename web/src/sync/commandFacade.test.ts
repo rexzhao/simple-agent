@@ -477,4 +477,56 @@ describe('CommandFacade session.mark_read', () => {
     await expect(unsafe).rejects.toMatchObject({ code: 'outcome_unknown' })
     facade.stop()
   })
+
+  it('appends a stable prompt operation, resends the exact payload, and strictly decodes the acknowledgement', async () => {
+    const transport = new FakeCommandTransport()
+    let requestNumber = 0
+    const facade = new CommandFacade({
+      transport,
+      requestIDGenerator: () => `request_append_${++requestNumber}`,
+      operationIDGenerator: () => 'operation_append_stable',
+    })
+    const content = '\n  exact prompt  \t'
+    const pending = facade.appendPrompt('session_1', 'run_1', content)
+    const initial = transport.sent[0]
+    if (initial.type !== 'command') throw new Error('wrong initial command')
+    expect(initial.payload.name).toBe('run.prompt.append')
+    expect(initial.payload.arguments).toEqual({ session_id: 'session_1', run_id: 'run_1', operation_id: 'operation_append_stable', content })
+    expect(initial.payload.request_id).not.toBe(initial.payload.arguments.operation_id)
+
+    transport.connectionGeneration = 2
+    transport.emitReady('epoch_2', 'epoch_1')
+    const resent = transport.sent[1]
+    if (resent.type !== 'command') throw new Error('wrong resent command')
+    expect(resent.payload).toEqual(initial.payload)
+    transport.emit(commandMessage('command_result', resent.payload.request_id, {
+      status: 'succeeded', result: { operation_id: 'operation_append_stable', session_id: 'session_1', run_id: 'run_1', accepted: true },
+    }), 2)
+    await expect(pending).resolves.toEqual({ operation_id: 'operation_append_stable', session_id: 'session_1', run_id: 'run_1', accepted: true })
+
+    // Explicit operation IDs bypass the process-local collision cache and
+    // use a new request_id for a page-restore/timeout retry.
+    const explicit = facade.appendPrompt('session_1', 'run_1', content, { operationID: 'operation_append_stable' })
+    const retry = transport.sent[2]
+    if (retry.type !== 'command') throw new Error('wrong explicit retry')
+    expect(retry.payload.arguments).toEqual(initial.payload.arguments)
+    expect(retry.payload.request_id).not.toBe(initial.payload.request_id)
+    transport.emit(commandMessage('command_result', retry.payload.request_id, {
+      status: 'succeeded', result: { operation_id: 'operation_append_stable', session_id: 'session_1', run_id: 'run_1', accepted: true },
+    }), 2)
+    await expect(explicit).resolves.toMatchObject({ accepted: true })
+
+    await expect(facade.appendPrompt('session_1', 'run_1', 'different')).rejects.toMatchObject({ code: 'id_generation', details: { collision: true } })
+    await expect(facade.appendPrompt('session_1', 'run_1', '')).rejects.toMatchObject({ code: 'invalid' })
+    await expect(facade.appendPrompt('session_1', 'run_1', 'x'.repeat(64 * 1024 + 1), { operationID: 'operation_other' })).rejects.toMatchObject({ code: 'invalid' })
+
+    const malformed = facade.appendPrompt('session_1', 'run_1', 'ok', { operationID: 'operation_result_shape' })
+    const malformedMessage = transport.sent[3]
+    if (malformedMessage.type !== 'command') throw new Error('wrong malformed command')
+    transport.emit(commandMessage('command_result', malformedMessage.payload.request_id, {
+      status: 'succeeded', result: { operation_id: 'operation_result_shape', session_id: 'session_1', run_id: 'run_1', accepted: true, extra: true },
+    }))
+    await expect(malformed).rejects.toMatchObject({ code: 'invalid' })
+    facade.stop()
+  })
 })

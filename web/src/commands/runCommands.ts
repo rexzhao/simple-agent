@@ -31,6 +31,19 @@ export interface RunCancelResult {
   readonly status: RunStatus
 }
 
+export interface RunPromptAppendOptions {
+  /** Caller-owned stable identity. Reuse it for timeout/page/epoch retries. */
+  readonly operationID?: string
+  readonly signal?: AbortSignal
+}
+
+export interface RunPromptAppendResult {
+  readonly operation_id: string
+  readonly session_id: string
+  readonly run_id: string
+  readonly accepted: boolean
+}
+
 export interface RunCommands {
   /**
    * Starts the bounded text-only durable command. The command request_id is
@@ -49,4 +62,9 @@ export interface RunCommands {
    * unknown because active run handles are not durable yet.
    */
   cancelRun(runID: string, options?: { readonly signal?: AbortSignal }): Promise<RunCancelResult>
+  /**
+   * Durably admits text to the current active run. The operation_id is
+   * distinct from the gateway request_id and is the retry/idempotency key.
+   */
+  appendPrompt(sessionID: string, runID: string, content: string, options?: RunPromptAppendOptions): Promise<RunPromptAppendResult>
 }

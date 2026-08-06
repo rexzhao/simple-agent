@@ -68,6 +68,13 @@ type runContinueArguments struct {
 	RunID     string
 }
 
+type runPromptAppendArguments struct {
+	SessionID   string
+	RunID       string
+	OperationID string
+	Content     string
+}
+
 type sessionRenameResult struct {
 	SessionID   string `json:"session_id"`
 	DisplayName string `json:"display_name"`
@@ -149,6 +156,13 @@ type runContinueResult struct {
 	SessionID string `json:"session_id"`
 	RunID     string `json:"run_id"`
 	Status    string `json:"status"`
+}
+
+type runPromptAppendResult struct {
+	OperationID string `json:"operation_id"`
+	SessionID   string `json:"session_id"`
+	RunID       string `json:"run_id"`
+	Accepted    bool   `json:"accepted"`
 }
 
 func runStartFingerprint(request commands.CommandRequest, arguments runStartArguments) (string, error) {
@@ -326,6 +340,7 @@ const maxSessionCreateArgumentBytes = 4096
 // contract is specified. Unknown image/blob/content-block fields are rejected
 // rather than silently dropped.
 const maxRunStartContentBytes = 256 * 1024
+const maxRunPromptAppendContentBytes = sessions.MaxPromptAppendContentBytes
 
 func boundedCommandString(fields map[string]json.RawMessage, name, command string, maxBytes int) (*string, error) {
 	value, err := optionalCommandString(fields, name, command)
@@ -568,6 +583,34 @@ func decodeRunContinueArguments(raw json.RawMessage) (runContinueArguments, erro
 	return runContinueArguments{SessionID: sessionID, RunID: runID}, nil
 }
 
+func decodeRunPromptAppendArguments(raw json.RawMessage) (runPromptAppendArguments, error) {
+	const command = "run.prompt.append"
+	fields, err := strictCommandObject(raw, command)
+	if err != nil {
+		return runPromptAppendArguments{}, err
+	}
+	if err := requireExactFields(fields, command, "session_id", "run_id", "operation_id", "content"); err != nil {
+		return runPromptAppendArguments{}, err
+	}
+	sessionID, err := requiredCommandString(fields, "session_id", command)
+	if err != nil || sessions.ValidateSessionID(sessionID) != nil {
+		return runPromptAppendArguments{}, fmt.Errorf("invalid %s arguments", command)
+	}
+	runID, err := requiredCommandString(fields, "run_id", command)
+	if err != nil || sessions.ValidateRunID(runID) != nil {
+		return runPromptAppendArguments{}, fmt.Errorf("invalid %s arguments", command)
+	}
+	operationID, err := requiredCommandString(fields, "operation_id", command)
+	if err != nil || sessions.ValidateOperationID(operationID) != nil {
+		return runPromptAppendArguments{}, fmt.Errorf("invalid %s arguments", command)
+	}
+	content, err := requiredRunStartContent(fields, command, maxRunPromptAppendContentBytes)
+	if err != nil {
+		return runPromptAppendArguments{}, fmt.Errorf("invalid %s arguments", command)
+	}
+	return runPromptAppendArguments{SessionID: sessionID, RunID: runID, OperationID: operationID, Content: content}, nil
+}
+
 func validateSessionMarkReadArguments(raw json.RawMessage) error {
 	_, err := decodeSessionMarkReadArguments(raw)
 	return err
@@ -613,6 +656,11 @@ func validateRunContinueArguments(raw json.RawMessage) error {
 	return err
 }
 
+func validateRunPromptAppendArguments(raw json.RawMessage) error {
+	_, err := decodeRunPromptAppendArguments(raw)
+	return err
+}
+
 func sessionCommandError(err error) error {
 	if err == nil {
 		return nil
@@ -628,6 +676,18 @@ func sessionCommandError(err error) error {
 		return commands.NewDomainError("cancelled", "command was cancelled", err)
 	case errors.Is(err, execution.ErrSessionArchived):
 		return commands.NewDomainError("session_archived", "session is archived", err)
+	case errors.Is(err, execution.ErrPromptAppendRunNotFound):
+		return commands.NewDomainError("run_not_found", "target run not found", err)
+	case errors.Is(err, execution.ErrPromptAppendWrongSession):
+		return commands.NewDomainError("run_wrong_session", "target run belongs to another session", err)
+	case errors.Is(err, execution.ErrPromptAppendRunSettled):
+		return commands.NewDomainError("run_settled", "target run is settled", err)
+	case errors.Is(err, execution.ErrPromptAppendRunNotActive):
+		return commands.NewDomainError("run_not_active", "target run is not the active run", err)
+	case errors.Is(err, execution.ErrPromptAppendOutcomeUnknown):
+		return commands.NewDomainError("operation_outcome_unknown", "prompt append may already have been applied; it will not be replayed automatically", err)
+	case errors.Is(err, execution.ErrPromptAppendNotApplied):
+		return commands.NewDomainError("operation_not_applied", "prompt append was not applied; retrying will not replay it", err)
 	case errors.Is(err, sessions.ErrIdempotencyConflict):
 		return commands.NewDomainError("idempotency_conflict", "client identity conflicts with an existing durable operation", err)
 	default:
@@ -637,6 +697,32 @@ func sessionCommandError(err error) error {
 
 func newSessionCommandRegistry(service *execution.Service, runs *runRegistry) (*commands.Registry, error) {
 	return commands.NewRegistry(
+		commands.CommandDefinition{
+			Name: "run.prompt.append", SchemaVersion: 1, CrossEpochRetrySafe: true,
+			Validate: validateRunPromptAppendArguments,
+			Execute: func(ctx context.Context, request commands.CommandRequest) (json.RawMessage, error) {
+				arguments, err := decodeRunPromptAppendArguments(request.Arguments)
+				if err != nil {
+					return nil, err
+				}
+				if service == nil {
+					return nil, commands.NewDomainError("run_unavailable", "run execution is not configured", nil)
+				}
+				result, err := service.AppendPromptDurable(ctx, arguments.SessionID, arguments.RunID, arguments.OperationID, arguments.Content)
+				if err != nil {
+					return nil, sessionCommandError(err)
+				}
+				if !result.Accepted {
+					return nil, commands.NewDomainError("operation_outcome_unknown", "prompt append was not durably accepted; it will not be replayed automatically", nil)
+				}
+				return json.Marshal(runPromptAppendResult{
+					OperationID: result.OperationID,
+					SessionID:   result.SessionID,
+					RunID:       result.RunID,
+					Accepted:    result.Accepted,
+				})
+			},
+		},
 		commands.CommandDefinition{
 			Name: "run.start", SchemaVersion: 1, CrossEpochRetrySafe: true,
 			Validate: validateRunStartArguments,

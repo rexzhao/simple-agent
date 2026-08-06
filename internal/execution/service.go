@@ -16,6 +16,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/rexzhao/simple-agent/internal/agent"
 	"github.com/rexzhao/simple-agent/internal/config"
@@ -42,6 +43,10 @@ type Service struct {
 	turnRunner                SessionTurnRunner
 	compactPlanner            SessionCompactPlanner
 	sessionWriteLockTimeout   time.Duration
+
+	// promptAppendStatusWriter is nil in production. Tests use it to inject
+	// the completion-write failure after AppendActive has succeeded.
+	promptAppendStatusWriter func(string, string, time.Time) error
 
 	runCoordinatorMu sync.RWMutex
 	runCoordinator   *SessionRunCoordinator
@@ -384,6 +389,15 @@ var (
 	// falls back to a follow-up turn.
 	ErrSessionNotSteerable   = errors.New("session has no active turn accepting steer messages")
 	ErrUnsupportedModelInput = errors.New("model does not support the requested input")
+	// Prompt append has a separate target state machine.  In particular, a
+	// durable run row being present is not enough: the process-local
+	// coordinator must still own the same running handle.
+	ErrPromptAppendRunNotFound    = errors.New("prompt append target run was not found")
+	ErrPromptAppendWrongSession   = errors.New("prompt append target run belongs to another session")
+	ErrPromptAppendRunSettled     = errors.New("prompt append target run is settled")
+	ErrPromptAppendRunNotActive   = errors.New("prompt append target run is not active")
+	ErrPromptAppendNotApplied     = errors.New("prompt append was not applied")
+	ErrPromptAppendOutcomeUnknown = errors.New("prompt append outcome is unknown; it may already have been applied")
 )
 
 // turnFailure is the payload for a turn.failed session stream event. It
@@ -631,6 +645,177 @@ func (s *Service) sessionRunCoordinator() *SessionRunCoordinator {
 	s.runCoordinatorMu.RLock()
 	defer s.runCoordinatorMu.RUnlock()
 	return s.runCoordinator
+}
+
+func (s *Service) setPromptAppendClaimStatus(operationID, status string, settledAt time.Time) error {
+	if s != nil && s.promptAppendStatusWriter != nil {
+		return s.promptAppendStatusWriter(operationID, status, settledAt)
+	}
+	return s.sessionStore.SetPromptAppendClaimStatus(operationID, status, settledAt)
+}
+
+// PromptAppendResult is intentionally a small command acknowledgement.  The
+// prompt queue itself remains an execution-owned transient stream; callers
+// must observe it through the existing coordinator/session-content authority.
+type PromptAppendResult struct {
+	OperationID string
+	SessionID   string
+	RunID       string
+	Accepted    bool
+}
+
+// AppendPromptDurable admits one run.prompt.append operation in the shared
+// claims SQLite database before mutating SessionRun.activeQueue. SQLite and
+// the in-memory queue cannot be one transaction, so the claim is a tombstone:
+// an admitted operation which is later found without a durable completion is
+// permanently resolved as outcome_unknown. It is never replayed, which gives
+// at-most-once behavior across concurrent callers, process restarts, and
+// server epochs at the cost of a possible prompt loss at that crash edge.
+func (s *Service) AppendPromptDurable(ctx context.Context, sessionID, runID, operationID, content string) (PromptAppendResult, error) {
+	result := PromptAppendResult{OperationID: operationID, SessionID: sessionID, RunID: runID}
+	if s == nil || s.sessionStore == nil {
+		return result, fmt.Errorf("execution session store is not configured")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	sessionID = strings.TrimSpace(sessionID)
+	runID = strings.TrimSpace(runID)
+	operationID = strings.TrimSpace(operationID)
+	result.SessionID, result.RunID, result.OperationID = sessionID, runID, operationID
+	if err := sessions.ValidateSessionID(sessionID); err != nil {
+		return result, err
+	}
+	if err := sessions.ValidateRunID(runID); err != nil {
+		return result, err
+	}
+	if err := sessions.ValidateOperationID(operationID); err != nil {
+		return result, err
+	}
+	if strings.TrimSpace(content) == "" || len(content) > sessions.MaxPromptAppendContentBytes || !utf8.ValidString(content) {
+		return result, fmt.Errorf("prompt append content is invalid")
+	}
+
+	contentSHA256 := sessions.PromptAppendContentSHA256(content)
+
+	// Resolve an existing operation before checking the current target. An
+	// applied retry remains an acknowledgement even after the run settles;
+	// otherwise a legitimate response retry would be misreported as a new
+	// mutation against a dead run.
+	if existing, err := s.sessionStore.GetPromptAppendClaim(operationID); err == nil {
+		if existing.SessionID != sessionID || existing.RunID != runID || existing.ContentSHA256 != contentSHA256 {
+			return result, fmt.Errorf("%w: prompt operation %q", sessions.ErrIdempotencyConflict, operationID)
+		}
+		lock, err := s.sessionStore.AcquirePromptAppendAdmissionLock(ctx, operationID)
+		if err != nil {
+			return result, err
+		}
+		defer func() { _ = lock.Release() }()
+		claim, _, err := s.sessionStore.ClaimPromptAppendWhileLocked(context.Background(), sessionID, runID, operationID, content, time.Time{})
+		if err != nil {
+			return result, err
+		}
+		return resolvePromptAppendClaim(result, claim)
+	} else if !errors.Is(err, sessions.ErrNotFound) {
+		return result, err
+	}
+
+	active, err := s.activePromptAppendTarget(sessionID, runID)
+	if err != nil {
+		return result, err
+	}
+	lock, err := s.sessionStore.AcquirePromptAppendAdmissionLock(ctx, operationID)
+	if err != nil {
+		return result, err
+	}
+	defer func() { _ = lock.Release() }()
+	claim, created, err := s.sessionStore.ClaimPromptAppendWhileLocked(context.Background(), sessionID, runID, operationID, content, time.Time{})
+	if err != nil {
+		return result, err
+	}
+	if !created {
+		return resolvePromptAppendClaim(result, claim)
+	}
+
+	// Do not use ctx for the status transition. Once the durable admission is
+	// committed, the process must either record the known result or leave the
+	// admitted tombstone for recovery; it must not return a cancellable error
+	// which invites an unsafe replay.
+	if err := active.AppendActive(content); err != nil {
+		markErr := s.setPromptAppendClaimStatus(operationID, sessions.PromptAppendStatusNotApplied, time.Time{})
+		if markErr != nil {
+			return result, fmt.Errorf("%w: could not resolve failed append: %v", ErrPromptAppendNotApplied, markErr)
+		}
+		return result, fmt.Errorf("%w: %v", ErrPromptAppendNotApplied, err)
+	}
+	if err := s.setPromptAppendClaimStatus(operationID, sessions.PromptAppendStatusApplied, time.Time{}); err != nil {
+		// AppendActive has already linearized the queue mutation. The completion
+		// write failed, so the only honest result is outcome_unknown. Best effort
+		// terminalization makes that explicit now; if it also fails, the retry
+		// path resolves the still-admitted tombstone to the same state.
+		if unknownErr := s.sessionStore.SetPromptAppendClaimStatus(operationID, sessions.PromptAppendStatusOutcomeUnknown, time.Time{}); unknownErr != nil {
+			return result, fmt.Errorf("%w: could not persist outcome-unknown completion: %v", ErrPromptAppendOutcomeUnknown, unknownErr)
+		}
+		return result, ErrPromptAppendOutcomeUnknown
+	}
+	result.Accepted = true
+	return result, nil
+}
+
+func resolvePromptAppendClaim(result PromptAppendResult, claim sessions.PromptAppendClaim) (PromptAppendResult, error) {
+	switch claim.Status {
+	case sessions.PromptAppendStatusApplied:
+		result.Accepted = true
+		return result, nil
+	case sessions.PromptAppendStatusNotApplied:
+		return result, ErrPromptAppendNotApplied
+	case sessions.PromptAppendStatusOutcomeUnknown:
+		return result, ErrPromptAppendOutcomeUnknown
+	default:
+		// ClaimPromptAppendWhileLocked resolves admitted rows before returning;
+		// reaching this branch means the store contract was violated or was
+		// changed without updating this state machine.
+		return result, fmt.Errorf("%w: unresolved durable status %q", ErrPromptAppendOutcomeUnknown, claim.Status)
+	}
+}
+
+func (s *Service) activePromptAppendTarget(sessionID, runID string) (*CoordinatedSessionRun, error) {
+	// The shared run claim is the cross-session identity fence. Check it even
+	// when a same-named legacy/session-local row exists; otherwise a run ID
+	// claimed by session A could be accidentally treated as an active legacy
+	// run belonging to session B.
+	if claim, claimErr := s.sessionStore.GetRunClaim(runID); claimErr == nil {
+		if claim.SessionID != sessionID {
+			return nil, ErrPromptAppendWrongSession
+		}
+	} else if !errors.Is(claimErr, sessions.ErrNotFound) {
+		return nil, claimErr
+	}
+	durable, err := s.sessionStore.GetRun(sessionID, runID)
+	if err != nil {
+		if errors.Is(err, sessions.ErrNotFound) {
+			return nil, ErrPromptAppendRunNotFound
+		}
+		return nil, err
+	}
+	if durable.Status != sessions.RunStatusRunning {
+		return nil, ErrPromptAppendRunSettled
+	}
+	coordinator := s.sessionRunCoordinator()
+	if coordinator == nil {
+		return nil, ErrPromptAppendRunNotActive
+	}
+	active, ok := coordinator.ActiveForSession(sessionID)
+	if !ok {
+		return nil, ErrPromptAppendRunNotActive
+	}
+	if active.ID() != runID {
+		return nil, ErrPromptAppendRunNotActive
+	}
+	if !active.ActivePromptReady() {
+		return nil, ErrPromptAppendRunNotActive
+	}
+	return active, nil
 }
 
 func (s *Service) CreateProject(root, displayName string) (ProjectCreateResult, error) {
@@ -1831,6 +2016,15 @@ func (r *SessionRun) AppendActive(content string) error {
 	r.publishQueueSnapshotLocked()
 	r.mu.Unlock()
 	return nil
+}
+
+func (r *SessionRun) acceptsActivePrompt() bool {
+	if r == nil {
+		return false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.accepting
 }
 
 // TrySteer strictly appends content to the currently active turn. It is the

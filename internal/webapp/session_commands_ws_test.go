@@ -137,6 +137,278 @@ func TestDurableRunStartConcurrentSameIdentityExecutesOnce(t *testing.T) {
 	}
 }
 
+func TestDurablePromptAppendIsAtMostOnceAndOnlyActiveTarget(t *testing.T) {
+	runner := &blockingDurableWebRunner{entered: make(chan struct{}), release: make(chan struct{})}
+	_, service, app := newWebTestAppServerWithRunner(t, runner)
+	project, err := service.CreateProject(t.TempDir(), "prompt append project")
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := service.CreateSession(project.Project.ID, execution.SessionCreateMetadata{Provider: "fake", ModelProfile: "default", ModelID: "model"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	other, err := service.CreateSession(project.Project.ID, execution.SessionCreateMetadata{Provider: "fake", ModelProfile: "default", ModelID: "model"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	startDone := make(chan error, 1)
+	go func() {
+		_, startErr := app.runs.startDurable(session.ID, "initial", "run-prompt-append", "prompt-start-fingerprint")
+		startDone <- startErr
+	}()
+	select {
+	case <-runner.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("blocking runner did not reach active turn")
+	}
+	if err := <-startDone; err != nil {
+		t.Fatal(err)
+	}
+	// A failure before the durable operation claim is admitted is safe to
+	// retry with the same identity. Cancelling the admission lock is a
+	// deterministic gate; it must not leave a claim that would turn the later
+	// exact retry into an at-most-once tombstone.
+	heldAdmissionLock, err := service.SessionStore().AcquirePromptAppendAdmissionLock(context.Background(), "operation-pre-admission")
+	if err != nil {
+		t.Fatal(err)
+	}
+	preAdmissionContext, cancelPreAdmission := context.WithCancel(context.Background())
+	cancelPreAdmission()
+	if _, err := service.AppendPromptDurable(preAdmissionContext, session.ID, "run-prompt-append", "operation-pre-admission", "retry after admission failure"); !errors.Is(err, context.Canceled) {
+		_ = heldAdmissionLock.Release()
+		t.Fatalf("pre-admission failure=%v, want context cancellation", err)
+	}
+	if err := heldAdmissionLock.Release(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.SessionStore().GetPromptAppendClaim("operation-pre-admission"); !errors.Is(err, sessions.ErrNotFound) {
+		t.Fatalf("pre-admission failure left a durable claim: %v", err)
+	}
+	if result, err := service.AppendPromptDurable(context.Background(), session.ID, "run-prompt-append", "operation-pre-admission", "retry after admission failure"); err != nil || !result.Accepted {
+		t.Fatalf("exact pre-admission retry result=%#v err=%v", result, err)
+	}
+
+	results := make([]execution.PromptAppendResult, 2)
+	errorsByCall := make([]error, 2)
+	var group sync.WaitGroup
+	for index := range results {
+		group.Add(1)
+		go func(index int) {
+			defer group.Done()
+			results[index], errorsByCall[index] = service.AppendPromptDurable(context.Background(), session.ID, "run-prompt-append", "operation-prompt-append", "  queued exact  ")
+		}(index)
+	}
+	group.Wait()
+	for index := range results {
+		if errorsByCall[index] != nil || !results[index].Accepted {
+			t.Fatalf("append call %d result=%#v err=%v", index, results[index], errorsByCall[index])
+		}
+	}
+	claim, err := service.SessionStore().GetPromptAppendClaim("operation-prompt-append")
+	if err != nil || claim.Status != sessions.PromptAppendStatusApplied {
+		t.Fatalf("append claim=%#v err=%v, want applied", claim, err)
+	}
+
+	// The queue event is produced by the existing coordinator stream, not by
+	// the command result. Read that authority directly from the managed replay
+	// buffer without using a sleep-based concurrency gate.
+	managed, ok := app.runs.get("run-prompt-append")
+	if !ok {
+		t.Fatal("managed run missing")
+	}
+	deadline := time.NewTimer(5 * time.Second)
+	defer deadline.Stop()
+	for {
+		events, _, _, _, changed := managed.snapshot(0)
+		found := false
+		for _, event := range events {
+			var payload struct {
+				Type    string `json:"type"`
+				Prompts []struct {
+					Content string `json:"content"`
+				} `json:"prompts"`
+			}
+			if json.Unmarshal(event.Payload, &payload) == nil && payload.Type == "run.prompt_queue" {
+				for _, prompt := range payload.Prompts {
+					if prompt.Content == "  queued exact  " {
+						found = true
+					}
+				}
+			}
+		}
+		if found {
+			break
+		}
+		select {
+		case <-changed:
+		case <-deadline.C:
+			t.Fatal("authoritative prompt queue event was not observed")
+		}
+	}
+
+	// Reusing the operation ID for different content or a different run is a
+	// durable collision, even though the gateway request ID would be new.
+	if _, err := service.AppendPromptDurable(context.Background(), session.ID, "run-prompt-append", "operation-prompt-append", "different"); !errors.Is(err, sessions.ErrIdempotencyConflict) {
+		t.Fatalf("different content collision=%v, want idempotency conflict", err)
+	}
+	if _, err := service.AppendPromptDurable(context.Background(), other.ID, "run-prompt-append", "operation-prompt-append", "  queued exact  "); !errors.Is(err, sessions.ErrIdempotencyConflict) {
+		t.Fatalf("cross-session operation collision=%v, want idempotency conflict", err)
+	}
+	if _, err := service.AppendPromptDurable(context.Background(), other.ID, "run-prompt-append", "operation-other-session", "new"); !errors.Is(err, execution.ErrPromptAppendWrongSession) {
+		t.Fatalf("wrong-session target error=%v, want typed wrong session", err)
+	}
+	if _, err := service.AppendPromptDurable(context.Background(), session.ID, "missing-run", "operation-missing", "new"); !errors.Is(err, execution.ErrPromptAppendRunNotFound) {
+		t.Fatalf("missing target error=%v, want typed not found", err)
+	}
+
+	// A second active run proves the same operation cannot migrate to a new
+	// run identity. It is enough to admit it before the shared release gate.
+	if _, err := app.runs.startDurable(other.ID, "other initial", "run-prompt-append-other", "prompt-start-other"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.AppendPromptDurable(context.Background(), other.ID, "run-prompt-append-other", "operation-prompt-append", "  queued exact  "); !errors.Is(err, sessions.ErrIdempotencyConflict) {
+		t.Fatalf("cross-run operation collision=%v, want idempotency conflict", err)
+	}
+	close(runner.release)
+	managedOther, ok := app.runs.get("run-prompt-append-other")
+	if !ok {
+		t.Fatal("second managed run missing")
+	}
+	if _, err := managed.run.Wait(); err != nil && !errors.Is(err, context.Canceled) {
+		t.Fatal(err)
+	}
+	if _, err := managedOther.run.Wait(); err != nil && !errors.Is(err, context.Canceled) {
+		t.Fatal(err)
+	}
+	if _, err := service.AppendPromptDurable(context.Background(), session.ID, "run-prompt-append", "operation-after-settle", "new"); !errors.Is(err, execution.ErrPromptAppendRunSettled) {
+		t.Fatalf("settled target error=%v, want typed settled", err)
+	}
+}
+
+func TestDurablePromptAppendCommandCacheAndNewRequestRetry(t *testing.T) {
+	runner := &blockingDurableWebRunner{entered: make(chan struct{}), release: make(chan struct{})}
+	server, service, app := newWebTestAppServerWithRunner(t, runner)
+	project, err := service.CreateProject(t.TempDir(), "prompt append gateway project")
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := service.CreateSession(project.Project.ID, execution.SessionCreateMetadata{Provider: "fake", ModelProfile: "default", ModelID: "model"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	startDone := make(chan error, 1)
+	go func() {
+		_, startErr := app.runs.startDurable(session.ID, "initial", "run-prompt-gateway", "prompt-gateway-start")
+		startDone <- startErr
+	}()
+	select {
+	case <-runner.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("blocking runner did not reach active turn")
+	}
+	if err := <-startDone; err != nil {
+		t.Fatal(err)
+	}
+
+	connection := dialWebApp(t, server.URL, issueWebSocketTicket(t, server.URL), "http://"+strings.TrimPrefix(server.URL, "http://"))
+	defer connection.Close(websocket.StatusNormalClosure, "done")
+	writeWebAppHello(t, connection)
+	if _, ok := readWebAppMessage(t, connection).(protocol.WelcomeMessage); !ok {
+		t.Fatal("welcome missing")
+	}
+	arguments := json.RawMessage(`{"session_id":"` + session.ID + `","run_id":"run-prompt-gateway","operation_id":"operation-prompt-gateway","content":"  gateway exact  "}`)
+	type commandResponse struct {
+		result   protocol.CommandResultMessage
+		accepted bool
+	}
+	send := func(envelopeID, requestID string) commandResponse {
+		t.Helper()
+		message := protocol.CommandMessage{
+			Envelope: protocol.Envelope{Version: 1, Type: protocol.MessageTypeCommand, ID: envelopeID},
+			Payload:  protocol.CommandPayload{Name: "run.prompt.append", SchemaVersion: 1, RequestID: requestID, Arguments: arguments},
+		}
+		payload, err := protocol.EncodeMessage(message)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := connection.Write(context.Background(), websocket.MessageText, payload); err != nil {
+			t.Fatal(err)
+		}
+		response := commandResponse{}
+		for {
+			value := readWebAppMessage(t, connection)
+			switch value := value.(type) {
+			case protocol.CommandAcceptedMessage:
+				response.accepted = true
+			case protocol.CommandResultMessage:
+				if value.Payload.RequestID == requestID {
+					response.result = value
+					return response
+				}
+			}
+		}
+	}
+
+	first := send("append-command-first", "append-request-stable")
+	if first.result.Payload.Status != protocol.CommandStatusSucceeded || first.result.Payload.Error != nil || !first.accepted {
+		t.Fatalf("first append command=%#v accepted=%v", first.result, first.accepted)
+	}
+	var firstResult runPromptAppendResult
+	if err := json.Unmarshal(first.result.Payload.Result, &firstResult); err != nil {
+		t.Fatal(err)
+	}
+	if firstResult.OperationID != "operation-prompt-gateway" || firstResult.SessionID != session.ID || firstResult.RunID != "run-prompt-gateway" || !firstResult.Accepted {
+		t.Fatalf("first append result=%#v", firstResult)
+	}
+
+	// The completed gateway cache returns the exact command result without a
+	// second accepted/execution path. A new request ID then reaches the durable
+	// operation claim and also returns the same compact acknowledgement.
+	cached := send("append-command-cache-retry", "append-request-stable")
+	if cached.result.Payload.Status != protocol.CommandStatusSucceeded || cached.result.Payload.Error != nil || cached.accepted {
+		t.Fatalf("cached append command=%#v accepted=%v", cached.result, cached.accepted)
+	}
+	retry := send("append-command-new-request", "append-request-new")
+	if retry.result.Payload.Status != protocol.CommandStatusSucceeded || retry.result.Payload.Error != nil || !retry.accepted {
+		t.Fatalf("new-request append command=%#v accepted=%v", retry.result, retry.accepted)
+	}
+	claim, err := service.SessionStore().GetPromptAppendClaim("operation-prompt-gateway")
+	if err != nil || claim.Status != sessions.PromptAppendStatusApplied {
+		t.Fatalf("gateway append claim=%#v err=%v", claim, err)
+	}
+
+	managed, ok := app.runs.get("run-prompt-gateway")
+	if !ok {
+		t.Fatal("gateway managed run missing")
+	}
+	events, _, _, _, _ := managed.snapshot(0)
+	queueOccurrences := 0
+	for _, event := range events {
+		var payload struct {
+			Type    string `json:"type"`
+			Prompts []struct {
+				Content string `json:"content"`
+			} `json:"prompts"`
+		}
+		if json.Unmarshal(event.Payload, &payload) != nil || payload.Type != "run.prompt_queue" {
+			continue
+		}
+		for _, prompt := range payload.Prompts {
+			if prompt.Content == "  gateway exact  " {
+				queueOccurrences++
+			}
+		}
+	}
+	if queueOccurrences != 1 {
+		t.Fatalf("authoritative queue occurrences=%d, want one", queueOccurrences)
+	}
+	close(runner.release)
+	if _, err := managed.run.Wait(); err != nil && !errors.Is(err, context.Canceled) {
+		t.Fatal(err)
+	}
+}
+
 func TestDurableRunContinueUsesInterruptedTargetAndSharedAdmission(t *testing.T) {
 	runner := &blockingDurableWebRunner{entered: make(chan struct{}), release: make(chan struct{})}
 	_, service, app := newWebTestAppServerWithRunner(t, runner)

@@ -1273,6 +1273,18 @@ func (run *CoordinatedSessionRun) AppendActive(content string) error {
 	return sessionRun.AppendActive(content)
 }
 
+// ActivePromptReady reports whether the starter has installed a SessionRun
+// and that run still accepts active prompts. A provisional durable handle is
+// intentionally not ready: its Status is running for coordinator capacity,
+// but there is no queue owner to mutate until the starter returns.
+func (run *CoordinatedSessionRun) ActivePromptReady() bool {
+	if run == nil {
+		return false
+	}
+	sessionRun := run.sessionRun()
+	return sessionRun != nil && sessionRun.acceptsActivePrompt()
+}
+
 func (run *CoordinatedSessionRun) TrySteer(content string) error {
 	sessionRun := run.sessionRun()
 	if sessionRun == nil {
