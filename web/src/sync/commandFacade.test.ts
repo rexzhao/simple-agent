@@ -667,3 +667,79 @@ describe('CommandFacade session.mark_read', () => {
     facade.stop()
   })
 })
+
+describe('CommandFacade project commands', () => {
+  it('keeps project create path input untouched, uses a stable operation identity, and retries safely across epochs', async () => {
+    const transport = new FakeCommandTransport()
+    let requestNumber = 0
+    const facade = new CommandFacade({
+      transport,
+      requestIDGenerator: () => `request_project_${++requestNumber}`,
+      operationIDGenerator: () => 'operation_project_stable',
+    })
+    const pending = facade.createProject('  ./repo-link  ', ' Project ', {})
+    const initial = transport.sent[0]
+    if (initial.type !== 'command') throw new Error('wrong command')
+    expect(initial.payload.name).toBe('project.create')
+    expect(initial.payload.arguments).toEqual({ operation_id: 'operation_project_stable', root: '  ./repo-link  ', display_name: 'Project' })
+
+    transport.connectionGeneration = 2
+    transport.emitReady('epoch_2', 'epoch_1')
+    const resent = transport.sent[1]
+    if (resent.type !== 'command') throw new Error('wrong resent command')
+    expect(resent.payload).toEqual(initial.payload)
+    transport.emit(commandMessage('command_result', resent.payload.request_id, {
+      status: 'succeeded', result: { operation_id: 'operation_project_stable', project_id: 'project_1', created: true },
+    }), 2)
+    await expect(pending).resolves.toEqual({ operation_id: 'operation_project_stable', project_id: 'project_1', created: true })
+    await expect(facade.createProject('/other', 'Other')).rejects.toMatchObject({ code: 'id_generation', details: { collision: true } })
+    facade.stop()
+  })
+
+  it('strictly binds project identities and never replays delete after an epoch change', async () => {
+    const transport = new FakeCommandTransport()
+    const facade = new CommandFacade({ transport })
+    const malformedName = `bad${String.fromCharCode(0xd800)}`
+    await expect(facade.renameProject('project_1', malformedName)).rejects.toMatchObject({ code: 'invalid' })
+    expect(transport.sent).toHaveLength(0)
+
+    const rename = facade.renameProject('project_1', 'Renamed')
+    const renameCommand = transport.sent[0]
+    if (renameCommand.type !== 'command') throw new Error('wrong rename command')
+    transport.emit(commandMessage('command_result', renameCommand.payload.request_id, {
+      status: 'succeeded', result: { project_id: 'project_1', display_name: 'Renamed', unexpected: false },
+    }))
+    await expect(rename).rejects.toMatchObject({ code: 'invalid' })
+
+    const deleted = facade.deleteProject('project_1')
+    const deleteCommand = transport.sent[1]
+    if (deleteCommand.type !== 'command') throw new Error('wrong delete command')
+    transport.connectionGeneration = 2
+    transport.emitReady('epoch_2', 'epoch_1')
+    await expect(deleted).rejects.toMatchObject({ code: 'outcome_unknown' })
+    expect(transport.sent).toHaveLength(2)
+    facade.stop()
+  })
+
+  it('accepts explicit project operation IDs from the project namespace, including reserved session names', async () => {
+    const transport = new FakeCommandTransport()
+    const facade = new CommandFacade({ transport })
+    const pending = facade.createProject('/repo', 'Project', { operationID: 'blobs' })
+    const command = transport.sent[0]
+    if (command.type !== 'command') throw new Error('wrong command')
+    expect(command.payload.arguments).toEqual({ operation_id: 'blobs', root: '/repo', display_name: 'Project' })
+    transport.emit(commandMessage('command_result', command.payload.request_id, {
+      status: 'succeeded', result: { operation_id: 'blobs', project_id: 'project_1', created: true },
+    }))
+    await expect(pending).resolves.toEqual({ operation_id: 'blobs', project_id: 'project_1', created: true })
+    facade.stop()
+  })
+
+  it('reports operation ID entropy failure and collision without sending a command', async () => {
+    const failedTransport = new FakeCommandTransport()
+    const failed = new CommandFacade({ transport: failedTransport, operationIDGenerator: () => { throw new Error('no entropy') } })
+    await expect(failed.createProject('/repo', 'Project')).rejects.toMatchObject({ code: 'id_generation' })
+    expect(failedTransport.sent).toHaveLength(0)
+    failed.stop()
+  })
+})

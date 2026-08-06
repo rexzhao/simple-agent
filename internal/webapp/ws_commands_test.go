@@ -130,6 +130,135 @@ func TestSessionCommandSchemasAreStrict(t *testing.T) {
 	}
 }
 
+func TestProjectCommandSchemasAreStrict(t *testing.T) {
+	validCreate := json.RawMessage(`{"operation_id":"operation_project_1","root":"/tmp/project","display_name":"Project"}`)
+	if err := validateProjectCreateArguments(validCreate); err != nil {
+		t.Fatalf("valid project.create rejected: %v", err)
+	}
+	invalidCreates := []json.RawMessage{
+		json.RawMessage(`{"operation_id":"operation_project_1","root":"/tmp/project","display_name":"Project","unknown":true}`),
+		json.RawMessage(`{"operation_id":"operation_project_1","root":"/tmp/project","display_name":"Project","operation_id":"other"}`),
+		json.RawMessage(`{"operation_id":"operation_project_1","root":null,"display_name":"Project"}`),
+		json.RawMessage(`{"operation_id":"operation_project_1","root":"/tmp/project"}`),
+		json.RawMessage(`{"operation_id":"../escape","root":"/tmp/project","display_name":"Project"}`),
+		json.RawMessage(`{"operation_id":"operation_project_1","root":"/tmp/project","display_name":"Project"} trailing`),
+	}
+	for _, raw := range invalidCreates {
+		if err := validateProjectCreateArguments(raw); err == nil {
+			t.Fatalf("invalid project.create accepted: %s", raw)
+		}
+	}
+
+	for _, test := range []struct {
+		name     string
+		validate func(json.RawMessage) error
+		valid    json.RawMessage
+		invalid  []json.RawMessage
+	}{
+		{name: "rename", validate: validateProjectRenameArguments, valid: json.RawMessage(`{"project_id":"project_1","display_name":"Renamed"}`), invalid: []json.RawMessage{
+			json.RawMessage(`{"project_id":"project_1","display_name":1}`),
+			json.RawMessage(`{"project_id":"project_1","display_name":"Renamed","extra":true}`),
+		}},
+		{name: "archive", validate: func(raw json.RawMessage) error { return validateProjectIDArguments(raw, "project.archive") }, valid: json.RawMessage(`{"project_id":"project_1"}`), invalid: []json.RawMessage{
+			json.RawMessage(`{"project_id":null}`), json.RawMessage(`{"project_id":"project_1","extra":false}`),
+		}},
+		{name: "restore", validate: func(raw json.RawMessage) error { return validateProjectIDArguments(raw, "project.restore") }, valid: json.RawMessage(`{"project_id":"project_1"}`), invalid: []json.RawMessage{
+			json.RawMessage(`{"project_id":""}`), json.RawMessage(`{"project_id":"project_1"}{}`),
+		}},
+		{name: "delete", validate: func(raw json.RawMessage) error { return validateProjectIDArguments(raw, "project.delete") }, valid: json.RawMessage(`{"project_id":"project_1"}`), invalid: []json.RawMessage{
+			json.RawMessage(`{"project_id":"project_1","project_id":"other"}`), json.RawMessage(`{"project_id":1}`),
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if err := test.validate(test.valid); err != nil {
+				t.Fatalf("valid arguments rejected: %v", err)
+			}
+			for _, raw := range test.invalid {
+				if err := test.validate(raw); err == nil {
+					t.Fatalf("invalid arguments accepted: %s", raw)
+				}
+			}
+		})
+	}
+}
+
+func TestProjectCommandLifecycleUsesTypedExecutionRules(t *testing.T) {
+	service, err := execution.NewService(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	registry, err := newSessionCommandRegistry(service, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := t.TempDir()
+	execute := func(name string, arguments any) json.RawMessage {
+		t.Helper()
+		definition, err := registry.Definition(name, 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		raw, err := json.Marshal(arguments)
+		if err != nil {
+			t.Fatal(err)
+		}
+		result, err := definition.Execute(context.Background(), commands.CommandRequest{Name: name, SchemaVersion: 1, Arguments: raw})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return result
+	}
+	var created projectCreateResult
+	if err := json.Unmarshal(execute("project.create", map[string]string{
+		"operation_id": "operation_lifecycle", "root": root, "display_name": "Lifecycle",
+	}), &created); err != nil {
+		t.Fatal(err)
+	}
+	if !created.Created || created.ProjectID == "" || created.OperationID != "operation_lifecycle" {
+		t.Fatalf("project.create result = %#v", created)
+	}
+
+	var renamed projectRenameResult
+	if err := json.Unmarshal(execute("project.rename", map[string]string{"project_id": created.ProjectID, "display_name": "Renamed"}), &renamed); err != nil {
+		t.Fatal(err)
+	}
+	if renamed.ProjectID != created.ProjectID || renamed.DisplayName != "Renamed" {
+		t.Fatalf("project.rename result = %#v", renamed)
+	}
+	// Rename to the same value is a no-op domain operation and therefore safe
+	// to replay across a server epoch.
+	execute("project.rename", map[string]string{"project_id": created.ProjectID, "display_name": "Renamed"})
+
+	session, err := service.CreateSession(created.ProjectID, execution.SessionCreateMetadata{CreatedCWD: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	archive := projectArchiveResult{}
+	if err := json.Unmarshal(execute("project.archive", map[string]string{"project_id": created.ProjectID}), &archive); err != nil {
+		t.Fatal(err)
+	}
+	if !archive.Archived || archive.ProjectID != created.ProjectID {
+		t.Fatalf("project.archive result = %#v", archive)
+	}
+	var restored projectArchiveResult
+	if err := json.Unmarshal(execute("project.restore", map[string]string{"project_id": created.ProjectID}), &restored); err != nil {
+		t.Fatal(err)
+	}
+	if restored.Archived {
+		t.Fatalf("project.restore result = %#v", restored)
+	}
+	// Re-archive is idempotent; the session is idle, so this also verifies the
+	// archive/busy rule is delegated to execution rather than the command.
+	execute("project.archive", map[string]string{"project_id": created.ProjectID})
+	var removed projectDeleteResult
+	if err := json.Unmarshal(execute("project.delete", map[string]string{"project_id": created.ProjectID}), &removed); err != nil {
+		t.Fatal(err)
+	}
+	if removed.ProjectID != created.ProjectID || removed.Status != "removed" || removed.RemovedSessions != 1 || session.ID == "" {
+		t.Fatalf("project.delete result = %#v", removed)
+	}
+}
+
 func TestRunStartPreservesExactContentAndUsesUTF8ByteLimit(t *testing.T) {
 	exactContent := "  hello\n"
 	raw, err := json.Marshal(map[string]string{
@@ -338,7 +467,7 @@ func TestSessionCommandRegistryIsClosedAndFlagsAreExplicit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantNames := []string{"run.cancel", "run.continue", "run.prompt.append", "run.prompt.move", "run.prompt.remove", "run.prompt.steer", "run.start", "run.tool.cancel", "session.archive", "session.compact", "session.create", "session.delete", "session.history.read", "session.mark_read", "session.rename", "session.restore", "session.set_debug", "session.set_full_access"}
+	wantNames := []string{"project.archive", "project.create", "project.delete", "project.rename", "project.restore", "run.cancel", "run.continue", "run.prompt.append", "run.prompt.move", "run.prompt.remove", "run.prompt.steer", "run.start", "run.tool.cancel", "session.archive", "session.compact", "session.create", "session.delete", "session.history.read", "session.mark_read", "session.rename", "session.restore", "session.set_debug", "session.set_full_access"}
 	if got := registry.Names(); !reflect.DeepEqual(got, wantNames) {
 		t.Fatalf("registry names=%v, want %v", got, wantNames)
 	}
@@ -357,7 +486,7 @@ func TestSessionCommandRegistryIsClosedAndFlagsAreExplicit(t *testing.T) {
 		} else if definition.CachePolicy != commands.ResultCacheDurable {
 			t.Fatalf("%s unexpectedly has a volatile-result policy", name)
 		}
-		if name == "run.cancel" || name == "run.prompt.move" || name == "run.prompt.remove" || name == "run.prompt.steer" || name == "run.tool.cancel" || name == "session.compact" || name == "session.delete" {
+		if name == "run.cancel" || name == "run.prompt.move" || name == "run.prompt.remove" || name == "run.prompt.steer" || name == "run.tool.cancel" || name == "session.compact" || name == "session.delete" || name == "project.delete" {
 			if definition.CrossEpochRetrySafe {
 				t.Fatalf("%s must remain cross-epoch unsafe", name)
 			}

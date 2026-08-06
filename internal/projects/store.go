@@ -1,6 +1,7 @@
 package projects
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -42,8 +43,9 @@ type projectFile struct {
 }
 
 type Store struct {
-	root string
-	now  func() time.Time
+	root                        string
+	now                         func() time.Time
+	writeProjectOperationRecord func(string, []byte) error
 }
 
 type ListOptions struct {
@@ -63,8 +65,9 @@ func newStoreWithClock(root string, now func() time.Time) *Store {
 		root = filepath.Clean(root)
 	}
 	return &Store{
-		root: root,
-		now:  now,
+		root:                        root,
+		now:                         now,
+		writeProjectOperationRecord: writeProjectOperationRecord,
 	}
 }
 
@@ -107,6 +110,15 @@ func (s *Store) Create(root, displayName string) (Project, bool, error) {
 	if err != nil {
 		return Project{}, false, err
 	}
+	lock, err := s.acquireProjectCreateLock(context.Background(), projectIDForRoot(canonicalRoot))
+	if err != nil {
+		return Project{}, false, err
+	}
+	defer func() { _ = lock.Release() }()
+	return s.createCanonical(canonicalRoot, displayName)
+}
+
+func (s *Store) createCanonical(canonicalRoot, displayName string) (Project, bool, error) {
 
 	if existing, ok, err := s.findByRoot(canonicalRoot); err != nil {
 		return Project{}, false, err
@@ -294,6 +306,18 @@ func CanonicalRoot(root string) (string, error) {
 		return "", fmt.Errorf("project root %q is not a directory", canonical)
 	}
 	return filepath.Clean(canonical), nil
+}
+
+// CanonicalRootKey returns the exact identity key used by Store root
+// deduplication after CanonicalRoot applies absolute-path and symlink rules.
+// Windows uses the same case-folding path key as Store.Create; callers must
+// not reimplement that policy at a transport boundary.
+func CanonicalRootKey(root string) (string, error) {
+	canonical, err := CanonicalRoot(root)
+	if err != nil {
+		return "", err
+	}
+	return projectRootKey(canonical), nil
 }
 
 func (s *Store) listAll() ([]Project, error) {
@@ -491,6 +515,16 @@ func validateProjectID(id string) error {
 // ValidateProjectID exposes the same path-safe boundary used by the project
 // store to transport-neutral application adapters.
 func ValidateProjectID(id string) error { return validateProjectID(id) }
+
+// ValidateOperationID is the path-safe durable identity boundary used by
+// project.create claims. It intentionally shares the project ID alphabet so
+// operation IDs can never escape the claim namespace.
+func ValidateOperationID(id string) error {
+	if len(id) == 0 || len(id) > 128 || id != strings.TrimSpace(id) || id == "." || id == ".." {
+		return fmt.Errorf("invalid operation id")
+	}
+	return validateProjectID(id)
+}
 
 func projectRootKey(path string) string {
 	path = filepath.Clean(path)

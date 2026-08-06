@@ -388,6 +388,8 @@ var (
 	ErrSessionBusy           = errors.New("session is currently running a turn")
 	ErrSessionArchived       = errors.New("session is archived")
 	ErrSessionArchiveFirst   = errors.New("archive session before removing it")
+	ErrProjectArchived       = errors.New("project is archived")
+	ErrProjectArchiveFirst   = errors.New("archive project before removing it")
 	ErrTurnRunnerUnavailable = errors.New("turn runner is not configured")
 	ErrTurnFailed            = errors.New("turn failed")
 	ErrSessionRunSettled     = errors.New("session run is no longer accepting prompts")
@@ -929,6 +931,23 @@ func (s *Service) CreateProject(root, displayName string) (ProjectCreateResult, 
 	return ProjectCreateResult{Project: projectFromStore(project), Created: created}, nil
 }
 
+// CreateProjectIdempotent is the execution boundary for the WebSocket
+// project.create command. The project store owns the durable operation claim;
+// this layer owns the post-commit ProjectIndex publication.
+func (s *Service) CreateProjectIdempotent(ctx context.Context, operationID, fingerprint, root, displayName string) (ProjectCreateResult, error) {
+	if s == nil || s.projectStore == nil {
+		return ProjectCreateResult{}, fmt.Errorf("execution project store is not configured")
+	}
+	project, created, err := s.projectStore.CreateIdempotent(ctx, operationID, fingerprint, root, displayName)
+	if err != nil {
+		return ProjectCreateResult{}, err
+	}
+	if created && strings.TrimSpace(project.Root) != "" {
+		s.publishProjectIndexUpsert(project)
+	}
+	return ProjectCreateResult{Project: projectFromStore(project), Created: created}, nil
+}
+
 func (s *Service) ListProjects(options ProjectListOptions) ([]Project, error) {
 	if s == nil || s.projectStore == nil {
 		return nil, fmt.Errorf("execution project store is not configured")
@@ -1000,7 +1019,10 @@ func (s *Service) RenameProject(id, displayName string) (Project, error) {
 		return Project{}, err
 	}
 	if project.Archived {
-		return Project{}, fmt.Errorf("archived project cannot be renamed")
+		return Project{}, fmt.Errorf("archived project cannot be renamed: %w", ErrProjectArchived)
+	}
+	if project.DisplayName == strings.TrimSpace(displayName) {
+		return projectFromStore(project), nil
 	}
 	project, err = s.projectStore.Rename(project.ID, displayName)
 	if err != nil {
@@ -1062,7 +1084,7 @@ func (s *Service) RemoveProject(id string) (ProjectRemoveResult, error) {
 		return ProjectRemoveResult{}, err
 	}
 	if !project.Archived {
-		return ProjectRemoveResult{}, fmt.Errorf("archive project before removing it")
+		return ProjectRemoveResult{}, ErrProjectArchiveFirst
 	}
 	if err := s.ensureProjectSessionsIdle(project.ID); err != nil {
 		return ProjectRemoveResult{}, err

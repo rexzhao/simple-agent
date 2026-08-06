@@ -12,7 +12,7 @@ import (
 
 	"github.com/rexzhao/simple-agent/internal/commands"
 	"github.com/rexzhao/simple-agent/internal/execution"
-	"github.com/rexzhao/simple-agent/internal/projects"
+	projectstore "github.com/rexzhao/simple-agent/internal/projects"
 	"github.com/rexzhao/simple-agent/internal/protocol"
 	"github.com/rexzhao/simple-agent/internal/sessions"
 )
@@ -61,6 +61,21 @@ type sessionCreateArguments struct {
 	ModelProfile    *string
 	ReasoningLevel  *string
 	FullAccess      *bool
+}
+
+type projectCreateArguments struct {
+	OperationID string
+	Root        string
+	DisplayName string
+}
+
+type projectIDArguments struct {
+	ProjectID string
+}
+
+type projectRenameArguments struct {
+	ProjectID   string
+	DisplayName string
 }
 
 type runCancelArguments struct {
@@ -134,6 +149,28 @@ type sessionDebugResult struct {
 type sessionCreateResult struct {
 	SessionID string `json:"session_id"`
 	ProjectID string `json:"project_id"`
+}
+
+type projectCreateResult struct {
+	OperationID string `json:"operation_id"`
+	ProjectID   string `json:"project_id"`
+	Created     bool   `json:"created"`
+}
+
+type projectRenameResult struct {
+	ProjectID   string `json:"project_id"`
+	DisplayName string `json:"display_name"`
+}
+
+type projectArchiveResult struct {
+	ProjectID string `json:"project_id"`
+	Archived  bool   `json:"archived"`
+}
+
+type projectDeleteResult struct {
+	ProjectID       string `json:"project_id"`
+	Status          string `json:"status"`
+	RemovedSessions int    `json:"removed_sessions"`
 }
 
 type sessionDeleteResult struct {
@@ -485,7 +522,7 @@ func decodeSessionCreateArguments(raw json.RawMessage) (sessionCreateArguments, 
 		return sessionCreateArguments{}, fmt.Errorf("invalid %s arguments", command)
 	}
 	projectID, err := requiredCommandString(fields, "project_id", command)
-	if err != nil || len(projectID) > 128 || projects.ValidateProjectID(projectID) != nil {
+	if err != nil || len(projectID) > 128 || projectstore.ValidateProjectID(projectID) != nil {
 		return sessionCreateArguments{}, fmt.Errorf("invalid %s arguments", command)
 	}
 	displayName, err := boundedCommandString(fields, "display_name", command, maxSessionCreateArgumentBytes)
@@ -599,6 +636,103 @@ func decodeSessionIDArguments(raw json.RawMessage, command string) (sessionIDArg
 		return sessionIDArguments{}, fmt.Errorf("invalid %s arguments", command)
 	}
 	return sessionIDArguments{SessionID: sessionID}, nil
+}
+
+const (
+	maxProjectCommandPathBytes = 4096
+	maxProjectCommandNameBytes = 4096
+)
+
+func decodeProjectCreateArguments(raw json.RawMessage) (projectCreateArguments, error) {
+	const command = "project.create"
+	fields, err := strictCommandObject(raw, command)
+	if err != nil {
+		return projectCreateArguments{}, err
+	}
+	if err := requireExactFields(fields, command, "operation_id", "root", "display_name"); err != nil {
+		return projectCreateArguments{}, err
+	}
+	operationID, err := requiredCommandString(fields, "operation_id", command)
+	if err != nil || projectstore.ValidateOperationID(operationID) != nil {
+		return projectCreateArguments{}, fmt.Errorf("invalid %s arguments", command)
+	}
+	root, err := requiredCommandString(fields, "root", command)
+	if err != nil || len(root) > maxProjectCommandPathBytes || !utf8.ValidString(root) {
+		return projectCreateArguments{}, fmt.Errorf("invalid %s arguments", command)
+	}
+	displayName, err := requiredCommandString(fields, "display_name", command)
+	if err != nil || len(displayName) > maxProjectCommandNameBytes || !utf8.ValidString(displayName) {
+		return projectCreateArguments{}, fmt.Errorf("invalid %s arguments", command)
+	}
+	return projectCreateArguments{OperationID: operationID, Root: root, DisplayName: displayName}, nil
+}
+
+func decodeProjectIDArguments(raw json.RawMessage, command string) (projectIDArguments, error) {
+	fields, err := strictCommandObject(raw, command)
+	if err != nil {
+		return projectIDArguments{}, err
+	}
+	if err := requireExactFields(fields, command, "project_id"); err != nil {
+		return projectIDArguments{}, err
+	}
+	projectID, err := requiredCommandString(fields, "project_id", command)
+	if err != nil || len(projectID) > 128 || projectstore.ValidateProjectID(projectID) != nil {
+		return projectIDArguments{}, fmt.Errorf("invalid %s arguments", command)
+	}
+	return projectIDArguments{ProjectID: projectID}, nil
+}
+
+func decodeProjectRenameArguments(raw json.RawMessage) (projectRenameArguments, error) {
+	const command = "project.rename"
+	fields, err := strictCommandObject(raw, command)
+	if err != nil {
+		return projectRenameArguments{}, err
+	}
+	if err := requireExactFields(fields, command, "project_id", "display_name"); err != nil {
+		return projectRenameArguments{}, err
+	}
+	projectID, err := requiredCommandString(fields, "project_id", command)
+	if err != nil || len(projectID) > 128 || projectstore.ValidateProjectID(projectID) != nil {
+		return projectRenameArguments{}, fmt.Errorf("invalid %s arguments", command)
+	}
+	displayName, err := requiredCommandString(fields, "display_name", command)
+	if err != nil || len(displayName) > maxProjectCommandNameBytes || !utf8.ValidString(displayName) {
+		return projectRenameArguments{}, fmt.Errorf("invalid %s arguments", command)
+	}
+	return projectRenameArguments{ProjectID: projectID, DisplayName: displayName}, nil
+}
+
+func validateProjectCreateArguments(raw json.RawMessage) error {
+	_, err := decodeProjectCreateArguments(raw)
+	return err
+}
+
+func validateProjectRenameArguments(raw json.RawMessage) error {
+	_, err := decodeProjectRenameArguments(raw)
+	return err
+}
+
+func validateProjectIDArguments(raw json.RawMessage, command string) error {
+	_, err := decodeProjectIDArguments(raw, command)
+	return err
+}
+
+func normalizedProjectCreateFingerprint(request commands.CommandRequest, arguments projectCreateArguments) (string, error) {
+	canonicalRoot, err := projectstore.CanonicalRootKey(arguments.Root)
+	if err != nil {
+		return "", err
+	}
+	data, err := json.Marshal(map[string]string{
+		"operation_id": arguments.OperationID,
+		"root":         canonicalRoot,
+		"display_name": strings.TrimSpace(arguments.DisplayName),
+	})
+	if err != nil {
+		return "", err
+	}
+	normalizedRequest := request
+	normalizedRequest.Arguments = data
+	return commands.Fingerprint(normalizedRequest)
 }
 
 const (
@@ -1031,6 +1165,32 @@ func sessionCommandError(err error) error {
 	}
 }
 
+func projectCommandError(err error) error {
+	if err == nil {
+		return nil
+	}
+	switch {
+	case errors.Is(err, projectstore.ErrNotFound):
+		return commands.NewDomainError("project_not_found", "project not found", err)
+	case errors.Is(err, projectstore.ErrIdempotencyConflict):
+		return commands.NewDomainError("idempotency_conflict", "client identity conflicts with an existing durable operation", err)
+	case errors.Is(err, projectstore.ErrOperationOutcomeUnknown):
+		return commands.NewDomainError("operation_outcome_unknown", "project create outcome is unknown; it will not be replayed automatically", err)
+	case errors.Is(err, projectstore.ErrOperationNotApplied):
+		return commands.NewDomainError("operation_not_applied", "project create was not applied; retrying will not replay it", err)
+	case errors.Is(err, execution.ErrSessionBusy):
+		return commands.NewDomainError("session_busy", "project has a busy session", err)
+	case errors.Is(err, execution.ErrProjectArchived):
+		return commands.NewDomainError("project_archived", "project is archived", err)
+	case errors.Is(err, execution.ErrProjectArchiveFirst):
+		return commands.NewDomainError("archive_first", "project must be archived before removal", err)
+	case errors.Is(err, context.Canceled):
+		return commands.NewDomainError("cancelled", "command was cancelled", err)
+	default:
+		return commands.NewDomainError("command_failed", "project command failed", err)
+	}
+}
+
 type sessionHistoryBlobWriter interface {
 	Put(context.Context, string, []byte) (protocol.BlobDescriptor, error)
 }
@@ -1077,6 +1237,100 @@ func newSessionCommandRegistry(service *execution.Service, runs *runRegistry, hi
 		historyWriter = historyWriters[0]
 	}
 	return commands.NewRegistry(
+		commands.CommandDefinition{
+			Name: "project.create", SchemaVersion: 1, CrossEpochRetrySafe: true,
+			SupportsExpectedRevision: false, Validate: validateProjectCreateArguments,
+			Execute: func(ctx context.Context, request commands.CommandRequest) (json.RawMessage, error) {
+				arguments, err := decodeProjectCreateArguments(request.Arguments)
+				if err != nil {
+					return nil, err
+				}
+				fingerprint, err := normalizedProjectCreateFingerprint(request, arguments)
+				if err != nil {
+					return nil, commands.NewDomainError("invalid", "project root is invalid", err)
+				}
+				if service == nil {
+					return nil, commands.NewDomainError("project_unavailable", "project service is not configured", nil)
+				}
+				result, err := service.CreateProjectIdempotent(ctx, arguments.OperationID, fingerprint, arguments.Root, arguments.DisplayName)
+				if err != nil {
+					return nil, projectCommandError(err)
+				}
+				return json.Marshal(projectCreateResult{OperationID: arguments.OperationID, ProjectID: result.Project.ID, Created: result.Created})
+			},
+		},
+		commands.CommandDefinition{
+			Name: "project.rename", SchemaVersion: 1, CrossEpochRetrySafe: true,
+			Validate: validateProjectRenameArguments,
+			Execute: func(_ context.Context, request commands.CommandRequest) (json.RawMessage, error) {
+				arguments, err := decodeProjectRenameArguments(request.Arguments)
+				if err != nil {
+					return nil, err
+				}
+				if service == nil {
+					return nil, commands.NewDomainError("project_unavailable", "project service is not configured", nil)
+				}
+				result, err := service.RenameProject(arguments.ProjectID, arguments.DisplayName)
+				if err != nil {
+					return nil, projectCommandError(err)
+				}
+				return json.Marshal(projectRenameResult{ProjectID: result.ID, DisplayName: result.DisplayName})
+			},
+		},
+		commands.CommandDefinition{
+			Name: "project.archive", SchemaVersion: 1, CrossEpochRetrySafe: true,
+			Validate: func(raw json.RawMessage) error { return validateProjectIDArguments(raw, "project.archive") },
+			Execute: func(_ context.Context, request commands.CommandRequest) (json.RawMessage, error) {
+				arguments, err := decodeProjectIDArguments(request.Arguments, "project.archive")
+				if err != nil {
+					return nil, err
+				}
+				if service == nil {
+					return nil, commands.NewDomainError("project_unavailable", "project service is not configured", nil)
+				}
+				result, err := service.ArchiveProject(arguments.ProjectID)
+				if err != nil {
+					return nil, projectCommandError(err)
+				}
+				return json.Marshal(projectArchiveResult{ProjectID: result.ID, Archived: result.Archived})
+			},
+		},
+		commands.CommandDefinition{
+			Name: "project.restore", SchemaVersion: 1, CrossEpochRetrySafe: true,
+			Validate: func(raw json.RawMessage) error { return validateProjectIDArguments(raw, "project.restore") },
+			Execute: func(_ context.Context, request commands.CommandRequest) (json.RawMessage, error) {
+				arguments, err := decodeProjectIDArguments(request.Arguments, "project.restore")
+				if err != nil {
+					return nil, err
+				}
+				if service == nil {
+					return nil, commands.NewDomainError("project_unavailable", "project service is not configured", nil)
+				}
+				result, err := service.RestoreProject(arguments.ProjectID)
+				if err != nil {
+					return nil, projectCommandError(err)
+				}
+				return json.Marshal(projectArchiveResult{ProjectID: result.ID, Archived: result.Archived})
+			},
+		},
+		commands.CommandDefinition{
+			Name: "project.delete", SchemaVersion: 1, CrossEpochRetrySafe: false,
+			Validate: func(raw json.RawMessage) error { return validateProjectIDArguments(raw, "project.delete") },
+			Execute: func(_ context.Context, request commands.CommandRequest) (json.RawMessage, error) {
+				arguments, err := decodeProjectIDArguments(request.Arguments, "project.delete")
+				if err != nil {
+					return nil, err
+				}
+				if service == nil {
+					return nil, commands.NewDomainError("project_unavailable", "project service is not configured", nil)
+				}
+				result, err := service.RemoveProject(arguments.ProjectID)
+				if err != nil {
+					return nil, projectCommandError(err)
+				}
+				return json.Marshal(projectDeleteResult{ProjectID: result.ID, Status: result.Status, RemovedSessions: result.RemovedSessions})
+			},
+		},
 		commands.CommandDefinition{
 			Name: "run.prompt.remove", SchemaVersion: 1, CrossEpochRetrySafe: false,
 			Validate: validateRunPromptRemoveArguments,

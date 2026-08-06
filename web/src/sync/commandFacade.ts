@@ -19,6 +19,7 @@ import { isRFC3339Timestamp } from '../protocol/datetime'
 import { isCanonicalWireIdentifier, isWellFormedString } from '../protocol/identifiers'
 import type { ItemsPage } from '../types'
 import type { RunCancelResult, RunCommands, RunContinueOptions, RunContinueResult, RunControlOptions, RunPromptAppendOptions, RunPromptAppendResult, RunPromptMoveResult, RunPromptRemoveResult, RunPromptSteerResult, RunStartOptions, RunStartResult, RunStatus, RunToolCancelResult } from '../commands/runCommands'
+import type { ProjectArchiveResult, ProjectCommands, ProjectCreateOptions, ProjectCreateResult, ProjectDeleteResult, ProjectRenameResult } from '../commands/projectCommands'
 import { SyncReadError } from './errors'
 import type { RuntimeTransport } from './runtime'
 
@@ -154,6 +155,37 @@ function decodeDeleteResult(value: unknown, sessionID: string): SessionDeleteRes
   const removedSessions = resultSafeInteger(object, 'removed_sessions', 1, Number.MAX_SAFE_INTEGER)
   if (resultSessionID !== sessionID || status !== 'removed') throw new Error('result identity does not match request')
   return { session_id: resultSessionID, status: 'removed', removed_sessions: removedSessions }
+}
+
+function decodeProjectCreateResult(value: unknown, operationID: string): ProjectCreateResult {
+  const object = exactObject(value, ['operation_id', 'project_id', 'created'])
+  const resultOperationID = resultIdentifier(object, 'operation_id')
+  const projectID = resultIdentifier(object, 'project_id')
+  if (resultOperationID !== operationID || typeof object.created !== 'boolean') throw new Error('result identity does not match request')
+  return { operation_id: resultOperationID, project_id: projectID, created: object.created as boolean }
+}
+
+function decodeProjectRenameResult(value: unknown, projectID: string, displayName: string): ProjectRenameResult {
+  const object = exactObject(value, ['project_id', 'display_name'])
+  const resultProjectID = resultIdentifier(object, 'project_id')
+  const resultDisplayName = object.display_name
+  if (resultProjectID !== projectID || typeof resultDisplayName !== 'string' || resultDisplayName.trim() === '' || resultDisplayName !== displayName || !isWellFormedString(resultDisplayName) || new TextEncoder().encode(resultDisplayName).byteLength > 4096) throw new Error('result identity does not match request')
+  return { project_id: resultProjectID, display_name: resultDisplayName }
+}
+
+function decodeProjectArchiveResult(value: unknown, projectID: string, archived: boolean): ProjectArchiveResult {
+  const object = exactObject(value, ['project_id', 'archived'])
+  const resultProjectID = resultIdentifier(object, 'project_id')
+  if (resultProjectID !== projectID || object.archived !== archived) throw new Error('result identity does not match request')
+  return { project_id: resultProjectID, archived }
+}
+
+function decodeProjectDeleteResult(value: unknown, projectID: string): ProjectDeleteResult {
+  const object = exactObject(value, ['project_id', 'status', 'removed_sessions'])
+  const resultProjectID = resultIdentifier(object, 'project_id')
+  const removedSessions = resultSafeInteger(object, 'removed_sessions', 0, Number.MAX_SAFE_INTEGER)
+  if (resultProjectID !== projectID || object.status !== 'removed') throw new Error('result identity does not match request')
+  return { project_id: resultProjectID, status: 'removed', removed_sessions: removedSessions }
 }
 
 function decodeCompactResult(value: unknown, sessionID: string): SessionCompactResult {
@@ -384,7 +416,7 @@ function decodeRunToolCancelResult(value: unknown, sessionID: string, runID: str
  * result; it never mutates a replica. Durable authority still arrives through
  * the resource snapshot/change stream.
  */
-export class CommandFacade implements SessionCommands, RunCommands {
+export class CommandFacade implements SessionCommands, RunCommands, ProjectCommands {
   private readonly transport: RuntimeTransport
   private readonly timeoutMS: number
   private readonly maxPendingCommands: number
@@ -487,6 +519,57 @@ export class CommandFacade implements SessionCommands, RunCommands {
     }
     this.rememberEntityID(sessionID)
     return this.submit('session.create', args, true, (value) => decodeCreateResult(value, sessionID, cleanProjectID), commandOptions)
+  }
+
+  createProject(root: string, displayName: string, options: ProjectCreateOptions = {}, commandOptions: CommandOptions = {}): Promise<ProjectCreateResult> {
+    if (typeof root !== 'string' || root.trim() === '' || !isWellFormedString(root) || this.utf8Bytes(root) > 4096) return Promise.reject(new CommandFacadeError('invalid', 'root is invalid'))
+    if (typeof displayName !== 'string' || displayName.trim() === '' || !isWellFormedString(displayName) || this.utf8Bytes(displayName.trim()) > 4096) return Promise.reject(new CommandFacadeError('invalid', 'display_name is invalid'))
+    const cleanDisplayName = displayName.trim()
+    const explicitOperationID = options.operationID !== undefined
+    let operationID: string
+    if (explicitOperationID) {
+      if (typeof options.operationID !== 'string') return Promise.reject(new CommandFacadeError('invalid', 'operation_id is invalid'))
+      operationID = this.cleanID(options.operationID)
+      if (!this.validProjectOperationID(operationID)) return Promise.reject(new CommandFacadeError('invalid', 'operation_id is invalid'))
+    } else {
+      try {
+        operationID = this.cleanID(this.operationIDGenerator())
+        if (!this.validProjectOperationID(operationID)) throw new Error('operation ID is invalid')
+      } catch {
+        return Promise.reject(new CommandFacadeError('id_generation', 'cryptographic operation ID generation failed'))
+      }
+      if (this.recentOperationIDs.has(operationID)) return Promise.reject(new CommandFacadeError('id_generation', 'operation ID collided with an active or recently used command', { collision: true }))
+      this.rememberOperationID(operationID)
+    }
+    // Do not resolve, clean, or otherwise normalize a filesystem path on the
+    // client. CanonicalRoot on the server is the only authority for symlinks,
+    // case rules, and path identity.
+    return this.submit('project.create', { operation_id: operationID, root, display_name: cleanDisplayName }, true, (value) => decodeProjectCreateResult(value, operationID), commandOptions)
+  }
+
+  renameProject(projectID: string, displayName: string, options: CommandOptions = {}): Promise<ProjectRenameResult> {
+    const cleanProjectID = this.cleanID(projectID)
+    const cleanDisplayName = this.cleanID(displayName)
+    if (!this.validProjectID(cleanProjectID) || !cleanDisplayName || !isWellFormedString(cleanDisplayName) || this.utf8Bytes(cleanDisplayName) > 4096) return Promise.reject(new CommandFacadeError('invalid', 'project_id and display_name are invalid'))
+    return this.submit('project.rename', { project_id: cleanProjectID, display_name: cleanDisplayName }, true, (value) => decodeProjectRenameResult(value, cleanProjectID, cleanDisplayName), options)
+  }
+
+  archiveProject(projectID: string, options: CommandOptions = {}): Promise<ProjectArchiveResult> {
+    const cleanProjectID = this.cleanID(projectID)
+    if (!this.validProjectID(cleanProjectID)) return Promise.reject(new CommandFacadeError('invalid', 'project_id is invalid'))
+    return this.submit('project.archive', { project_id: cleanProjectID }, true, (value) => decodeProjectArchiveResult(value, cleanProjectID, true), options)
+  }
+
+  restoreProject(projectID: string, options: CommandOptions = {}): Promise<ProjectArchiveResult> {
+    const cleanProjectID = this.cleanID(projectID)
+    if (!this.validProjectID(cleanProjectID)) return Promise.reject(new CommandFacadeError('invalid', 'project_id is invalid'))
+    return this.submit('project.restore', { project_id: cleanProjectID }, true, (value) => decodeProjectArchiveResult(value, cleanProjectID, false), options)
+  }
+
+  deleteProject(projectID: string, options: CommandOptions = {}): Promise<ProjectDeleteResult> {
+    const cleanProjectID = this.cleanID(projectID)
+    if (!this.validProjectID(cleanProjectID)) return Promise.reject(new CommandFacadeError('invalid', 'project_id is invalid'))
+    return this.submit('project.delete', { project_id: cleanProjectID }, false, (value) => decodeProjectDeleteResult(value, cleanProjectID), options)
   }
 
   markRead(sessionID: string, runID: string, projectID?: string, options: CommandOptions = {}): Promise<SessionMarkReadResult> {
@@ -720,6 +803,10 @@ export class CommandFacade implements SessionCommands, RunCommands {
     return reservedKey !== 'blobs' && reservedKey !== '.session-claims'
   }
 
+  private validProjectID(value: string): boolean {
+    return value.length > 0 && value.length <= 128 && /^[A-Za-z0-9_.-]+$/.test(value) && value !== '.' && value !== '..'
+  }
+
   private validRunID(value: string): boolean {
     if (value.length === 0 || value.length > 128 || !/^[A-Za-z0-9_.-]+$/.test(value) || value === '.' || value === '..') return false
     const reservedKey = value.replace(/[. ]+$/g, '').toLowerCase()
@@ -728,6 +815,10 @@ export class CommandFacade implements SessionCommands, RunCommands {
 
   private validOperationID(value: string): boolean {
     return this.validRunID(value)
+  }
+
+  private validProjectOperationID(value: string): boolean {
+    return value.length > 0 && value.length <= 128 && /^[A-Za-z0-9_.-]+$/.test(value) && value !== '.' && value !== '..'
   }
 
   private cleanControlID(value: string): string {
