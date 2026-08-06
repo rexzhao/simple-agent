@@ -1118,6 +1118,23 @@ web streamRun
 
 保留 domain service、durable Session projector、item identity 和已经验证的业务规则；删除的是 transport/sync 结构，不是重写 Agent 执行语义。
 
+### 后续调试任务：固定项目的 `web.eval`
+
+原先把 Session Content 同步 Trace/回放作为后续调试任务的方案已由
+[`docs/web-eval-debug-tool-plan.md`](web-eval-debug-tool-plan.md) 取代。该任务独立于主同步
+cutover，使用固定项目 `project-f25c5aac78f681b52aabf5c0`，只有服务端 Debug 总开关开启且
+Session 属于该项目时才动态注册唯一的 Agent 工具 `web.eval`。
+
+工具只接收 `code` 和可选的 bounded `timeout_ms`；Agent 通过任意 JavaScript 使用统一的
+`window.__SAI_DEBUG__` 入口、当前页面的同源/DOM 能力以及其可读取的数据自行诊断。Go 侧只
+维护一个当前 Web debug executor，执行固定在单一连接；断线、刷新或 epoch 变化失败且不自动
+重放。该任务包含 executor lease、调试入口、broker/tool、bounded serializer、现有 HTTP Blob
+结果面和最小诊断日志，以及并发、断线、超时、权限、非目标项目过滤和任意 JS 切换
+Session/检查 DOM 与 Replica 的 E2E 验收。
+
+完整 deterministic sync trace/replay、baseline/barrier 录制和独立 replay runtime 不属于该
+后续任务交付目标。
+
 ## 11. 测试矩阵
 
 ### 11.1 协议
