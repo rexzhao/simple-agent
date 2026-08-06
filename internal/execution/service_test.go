@@ -1327,6 +1327,80 @@ func TestServiceCompactSessionUsesConfiguredPlanner(t *testing.T) {
 	}
 }
 
+func TestServiceCompactSessionPreservesPlannerCancellation(t *testing.T) {
+	home := t.TempDir()
+	entered := make(chan struct{})
+	planner := fakeExecutionCompactPlanner{plan: func(ctx context.Context, _ SessionCompactionRequest) (SessionCompactionResult, error) {
+		close(entered)
+		<-ctx.Done()
+		return SessionCompactionResult{}, ctx.Err()
+	}}
+	service, err := NewServiceWithOptions(home, ServiceOptions{
+		TurnRunner:     fakeExecutionTurnRunner{supports: true},
+		CompactPlanner: planner,
+	})
+	if err != nil {
+		t.Fatalf("NewServiceWithOptions() error = %v", err)
+	}
+	project, err := service.CreateProject(mkdirProjectRoot(t, "compact-cancel-project"), "Compact cancel project")
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := service.CreateSession(project.Project.ID, SessionCreateMetadata{CreatedCWD: project.Project.Root, Provider: "fake", ModelProfile: "default", ModelID: "model-default"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	resultCh := make(chan error, 1)
+	go func() {
+		_, compactErr := service.CompactSession(ctx, session.ID)
+		resultCh <- compactErr
+	}()
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("compact planner did not start")
+	}
+	cancel()
+	select {
+	case compactErr := <-resultCh:
+		if !errors.Is(compactErr, context.Canceled) {
+			t.Fatalf("CompactSession cancellation error=%v, want context.Canceled", compactErr)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("cancelled compact did not return")
+	}
+}
+
+func TestServiceCompactSessionBusyUsesTypedBusyError(t *testing.T) {
+	home := t.TempDir()
+	service, err := NewServiceWithOptions(home, ServiceOptions{
+		TurnRunner:              fakeExecutionTurnRunner{supports: true},
+		CompactPlanner:          fakeExecutionCompactPlanner{},
+		SessionWriteLockTimeout: 10 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("NewServiceWithOptions() error = %v", err)
+	}
+	project, err := service.CreateProject(mkdirProjectRoot(t, "compact-busy-project"), "Compact busy project")
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := service.CreateSession(project.Project.ID, SessionCreateMetadata{CreatedCWD: project.Project.Root, Provider: "fake", ModelProfile: "default", ModelID: "model-default"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	lock, err := service.SessionStore().AcquireSessionWriteLock(context.Background(), session.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lock.Release()
+	if _, err := service.CompactSession(context.Background(), session.ID); !errors.Is(err, ErrSessionBusy) {
+		t.Fatalf("CompactSession busy error=%v, want ErrSessionBusy", err)
+	}
+}
+
 func TestServiceSendSessionMessageRunsAutoCompactionBeforeTurn(t *testing.T) {
 	home := t.TempDir()
 	var planned bool

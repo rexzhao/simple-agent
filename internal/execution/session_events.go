@@ -613,6 +613,9 @@ func (s *Service) CompactSession(ctx context.Context, id string) (SessionCompact
 	})
 	if err != nil {
 		interruptOperation()
+		if errors.Is(err, context.Canceled) {
+			return SessionCompactResult{}, context.Canceled
+		}
 		return SessionCompactResult{}, ErrTurnFailed
 	}
 	if err := publishCompactionUsage(bus, result.Compaction.Usage); err != nil {

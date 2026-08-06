@@ -1,4 +1,5 @@
 import { isRFC3339Timestamp } from '../protocol/datetime'
+import { isCanonicalWireIdentifier, isWellFormedString } from '../protocol/identifiers'
 import { compareRunCursor, isRunCursor, isResourceRevision } from '../protocol/sequence'
 import type { ChangeOperation, SubscriptionEventData } from '../protocol/types'
 import type { ReplicaApplyContext, ResourceAdapter, TransientResumeToken } from './localReplica'
@@ -75,26 +76,13 @@ function exactKeys(value: Record<string, unknown>, required: readonly string[], 
 }
 
 function stringValue(value: unknown, name: string, allowEmpty = false): string {
-  if (typeof value !== 'string' || (!allowEmpty && value.trim() === '') || !wellFormed(value)) throw new Error(`${name} must be a valid string`)
+  if (typeof value !== 'string' || (!allowEmpty && value.trim() === '') || !isWellFormedString(value)) throw new Error(`${name} must be a valid string`)
   return value
 }
 
 function identifier(value: unknown, name: string, allowEmpty = false): string {
-  const result = stringValue(value, name, allowEmpty)
-  if (!allowEmpty && (result !== result.trim() || /[\u0000-\u001f\u007f\s]/u.test(result))) throw new Error(`${name} is not canonical`)
-  return result
-}
-
-function wellFormed(value: string): boolean {
-  for (let index = 0; index < value.length; index += 1) {
-    const code = value.charCodeAt(index)
-    if (code >= 0xd800 && code <= 0xdbff) {
-      const next = value.charCodeAt(index + 1)
-      if (!(next >= 0xdc00 && next <= 0xdfff)) return false
-      index += 1
-    } else if (code >= 0xdc00 && code <= 0xdfff) return false
-  }
-  return true
+  if (!isCanonicalWireIdentifier(value, allowEmpty)) throw new Error(`${name} is not canonical`)
+  return value
 }
 
 function booleanValue(value: unknown, name: string): boolean {
@@ -223,7 +211,7 @@ function cloneKey(value: unknown, name: string): SessionContentItemKey {
   const source = object(value, name)
   exactKeys(source, ['turn_id', 'agent_iteration', 'item_id'], [], name)
   return {
-    turn_id: stringValue(source.turn_id, `${name}.turn_id`, true),
+    turn_id: identifier(source.turn_id, `${name}.turn_id`, true),
     agent_iteration: integer(source.agent_iteration, `${name}.agent_iteration`, 0),
     item_id: identifier(source.item_id, `${name}.item_id`),
   }

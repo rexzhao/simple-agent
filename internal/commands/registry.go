@@ -21,6 +21,19 @@ import (
 // Arguments buffer.
 type CommandHandler func(context.Context, CommandRequest) (json.RawMessage, error)
 
+// ResultCachePolicy controls what a dispatcher may replay after a command has
+// completed. Durable results are replayed forever within the dispatcher
+// epoch. Volatile results retain their request fingerprint tombstone, but the
+// completed payload is regenerated for an exact retry. This is needed for
+// read commands whose successful result contains an expiring data-plane
+// capability (for example, a BlobDescriptor).
+type ResultCachePolicy uint8
+
+const (
+	ResultCacheDurable ResultCachePolicy = iota
+	ResultCacheVolatile
+)
+
 // CommandRequest is the transport-neutral command input passed to a command
 // definition. Principal is an opaque authenticated identity; this package does
 // not interpret it.
@@ -51,6 +64,10 @@ type CommandDefinition struct {
 	Name                string
 	SchemaVersion       int
 	CrossEpochRetrySafe bool
+	// CachePolicy is deliberately separate from CrossEpochRetrySafe. A
+	// read-only command can be safe to retry across epochs while still needing
+	// a fresh completed result because its descriptor or ticket expires.
+	CachePolicy ResultCachePolicy
 	// SupportsExpectedRevision is true only when Execute atomically checks the
 	// request revision as part of the mutation.  A dispatcher must reject an
 	// expected_revision for definitions which do not make that guarantee; it
@@ -146,7 +163,7 @@ func (r *Registry) add(definition CommandDefinition) error {
 	if r == nil {
 		return ErrInvalidDefinition
 	}
-	if strings.TrimSpace(definition.Name) == "" || definition.SchemaVersion < 1 || definition.Execute == nil {
+	if strings.TrimSpace(definition.Name) == "" || definition.SchemaVersion < 1 || definition.Execute == nil || definition.CachePolicy > ResultCacheVolatile {
 		return fmt.Errorf("%w: name, positive schema_version and execute are required", ErrInvalidDefinition)
 	}
 	key := definitionKey(definition.Name, definition.SchemaVersion)

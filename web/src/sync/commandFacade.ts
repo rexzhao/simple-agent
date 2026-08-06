@@ -9,7 +9,15 @@ import type {
   SessionRenameResult,
   SessionCreateOptions,
   SessionCreateResult,
+  SessionDeleteResult,
+  SessionCompactResult,
+  SessionHistoryReadOptions,
+  SessionHistoryReadResult,
 } from '../commands/sessionCommands'
+import type { BlobDescriptor } from '../protocol/types'
+import { isRFC3339Timestamp } from '../protocol/datetime'
+import { isCanonicalWireIdentifier, isWellFormedString } from '../protocol/identifiers'
+import type { ItemsPage } from '../types'
 import type { RunCancelResult, RunCommands, RunContinueOptions, RunContinueResult, RunControlOptions, RunPromptAppendOptions, RunPromptAppendResult, RunPromptMoveResult, RunPromptRemoveResult, RunPromptSteerResult, RunStartOptions, RunStartResult, RunStatus, RunToolCancelResult } from '../commands/runCommands'
 import { SyncReadError } from './errors'
 import type { RuntimeTransport } from './runtime'
@@ -100,6 +108,13 @@ function exactObject(value: unknown, keys: readonly string[]): Record<string, un
   return object
 }
 
+function objectWithAllowedKeys(value: unknown, keys: readonly string[]): Record<string, unknown> {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) throw new Error('result is not an object')
+  const object = value as Record<string, unknown>
+  if (Object.keys(object).some((key) => !keys.includes(key))) throw new Error('result has an unexpected shape')
+  return object
+}
+
 function resultString(object: Record<string, unknown>, key: string): string {
   const value = object[key]
   if (!nonEmptyString(value)) throw new Error('result string is invalid')
@@ -109,6 +124,140 @@ function resultString(object: Record<string, unknown>, key: string): string {
 function resultBoolean(object: Record<string, unknown>, key: string): boolean {
   if (typeof object[key] !== 'boolean') throw new Error('result boolean is invalid')
   return object[key] as boolean
+}
+
+function validWireID(value: unknown): value is string {
+  return isCanonicalWireIdentifier(value)
+}
+
+function resultIdentifier(object: Record<string, unknown>, key: string): string {
+  if (!validWireID(object[key])) throw new Error('result identifier is invalid')
+  return object[key] as string
+}
+
+function resultSafeInteger(object: Record<string, unknown>, key: string, min: number, max: number): number {
+  const value = object[key]
+  if (!Number.isSafeInteger(value) || (value as number) < min || (value as number) > max) throw new Error('result integer is invalid')
+  return value as number
+}
+
+const historyItemKinds = new Set(['message', 'compaction', 'runtime_context'])
+const historyVisibilities = new Set(['visible', 'hidden', 'debug'])
+const historyAudiences = new Set(['user', 'model', 'internal'])
+const historyStatuses = new Set(['pending', 'completed', 'error', 'interrupted'])
+const historyRoles = new Set(['system', 'developer', 'user', 'assistant', 'tool', 'provider'])
+
+function decodeDeleteResult(value: unknown, sessionID: string): SessionDeleteResult {
+  const object = exactObject(value, ['session_id', 'status', 'removed_sessions'])
+  const resultSessionID = resultString(object, 'session_id')
+  const status = object.status
+  const removedSessions = resultSafeInteger(object, 'removed_sessions', 1, Number.MAX_SAFE_INTEGER)
+  if (resultSessionID !== sessionID || status !== 'removed') throw new Error('result identity does not match request')
+  return { session_id: resultSessionID, status: 'removed', removed_sessions: removedSessions }
+}
+
+function decodeCompactResult(value: unknown, sessionID: string): SessionCompactResult {
+  const object = exactObject(value, ['session_id', 'status', 'compaction_id', 'summary_item_id', 'revision'])
+  const resultSessionID = resultString(object, 'session_id')
+  const compactionID = resultIdentifier(object, 'compaction_id')
+  const summaryItemID = resultIdentifier(object, 'summary_item_id')
+  const revision = resultString(object, 'revision')
+  if (resultSessionID !== sessionID || object.status !== 'committed' || !/^\d+$/.test(revision)) throw new Error('result identity does not match request')
+  return { session_id: resultSessionID, status: 'committed', compaction_id: compactionID, summary_item_id: summaryItemID, revision }
+}
+
+function decodeBlobDescriptor(value: unknown): BlobDescriptor {
+  const object = exactObject(value, ['id', 'url', 'content_type', 'size', 'sha256', 'etag', 'expires_at'])
+  const descriptor: BlobDescriptor = {
+    id: resultString(object, 'id'),
+    url: resultString(object, 'url'),
+    content_type: resultString(object, 'content_type'),
+    size: resultSafeInteger(object, 'size', 0, 16 * 1024 * 1024),
+    sha256: resultString(object, 'sha256'),
+    etag: resultString(object, 'etag'),
+    expires_at: resultString(object, 'expires_at'),
+  }
+  if (!isRFC3339Timestamp(descriptor.expires_at)) throw new Error('result blob expiry is invalid')
+  const expiresAt = Date.parse(descriptor.expires_at)
+  if (!Number.isFinite(expiresAt) || Date.now() >= expiresAt) throw new Error('result blob is expired')
+  return descriptor
+}
+
+function decodeHistoryPage(value: unknown): ItemsPage {
+  const object = exactObject(value, ['items', 'oldest_seq', 'newest_seq', 'has_more_before', 'has_more_after'])
+  if (!Array.isArray(object.items) || object.items.length > 4096) throw new Error('result history is invalid')
+  const oldestSeq = resultSafeInteger(object, 'oldest_seq', 0, Number.MAX_SAFE_INTEGER)
+  const newestSeq = resultSafeInteger(object, 'newest_seq', 0, Number.MAX_SAFE_INTEGER)
+  if (typeof object.has_more_before !== 'boolean' || typeof object.has_more_after !== 'boolean') throw new Error('result history is invalid')
+  for (const item of object.items) {
+    if (item === null || typeof item !== 'object' || Array.isArray(item)) throw new Error('result history item is invalid')
+    const itemObject = objectWithAllowedKeys(item, ['seq', 'id', 'turn_id', 'agent_iteration', 'created_at', 'kind', 'visibility', 'audience', 'status', 'message'])
+    if (!validWireID(itemObject.id) || !Number.isSafeInteger(itemObject.seq) || (itemObject.seq as number) < 1 || typeof itemObject.created_at !== 'string' || !isRFC3339Timestamp(itemObject.created_at) || typeof itemObject.kind !== 'string' || !historyItemKinds.has(itemObject.kind) || typeof itemObject.visibility !== 'string' || !historyVisibilities.has(itemObject.visibility) || typeof itemObject.audience !== 'string' || !historyAudiences.has(itemObject.audience)) {
+      throw new Error('result history item is invalid')
+    }
+    if (itemObject.turn_id !== undefined && !validWireID(itemObject.turn_id)) throw new Error('result history item is invalid')
+    if (itemObject.agent_iteration !== undefined && (!Number.isSafeInteger(itemObject.agent_iteration) || (itemObject.agent_iteration as number) < 0)) throw new Error('result history item is invalid')
+    if (itemObject.status !== undefined && (!nonEmptyString(itemObject.status) || !historyStatuses.has(itemObject.status))) throw new Error('result history item is invalid')
+    if (itemObject.message !== undefined) {
+      const message = objectWithAllowedKeys(itemObject.message, ['role', 'content', 'reasoning', 'images', 'tool_call_id', 'tool_calls', 'is_error'])
+      if (!nonEmptyString(message.role) || !historyRoles.has(message.role)) throw new Error('result history message is invalid')
+      if (message.content !== undefined) {
+        const content = objectWithAllowedKeys(message.content, ['inline', 'preview'])
+        if (content.inline !== undefined && (typeof content.inline !== 'string' || !isWellFormedString(content.inline))) throw new Error('result history content is invalid')
+        if (content.preview !== undefined && (typeof content.preview !== 'string' || !isWellFormedString(content.preview))) throw new Error('result history content is invalid')
+      }
+      if (message.reasoning !== undefined && (typeof message.reasoning !== 'string' || !isWellFormedString(message.reasoning))) throw new Error('result history reasoning is invalid')
+      if (message.tool_call_id !== undefined && !validWireID(message.tool_call_id)) throw new Error('result history tool call is invalid')
+      if (message.is_error !== undefined && typeof message.is_error !== 'boolean') throw new Error('result history error flag is invalid')
+      if (message.images !== undefined) {
+        if (!Array.isArray(message.images) || message.images.length > 64) throw new Error('result history images are invalid')
+        for (const image of message.images) {
+          const imageObject = objectWithAllowedKeys(image, ['hash', 'media_type', 'size_bytes'])
+          if (!validWireID(imageObject.hash) || !nonEmptyString(imageObject.media_type) || !Number.isSafeInteger(imageObject.size_bytes) || (imageObject.size_bytes as number) < 0) throw new Error('result history image is invalid')
+        }
+      }
+      if (message.tool_calls !== undefined) {
+        if (!Array.isArray(message.tool_calls) || message.tool_calls.length > 64) throw new Error('result history tool calls are invalid')
+        for (const toolCall of message.tool_calls) {
+          const toolCallObject = objectWithAllowedKeys(toolCall, ['id', 'name', 'arguments'])
+          if (!validWireID(toolCallObject.id) || !validWireID(toolCallObject.name) || (toolCallObject.arguments !== undefined && (typeof toolCallObject.arguments !== 'string' || !isWellFormedString(toolCallObject.arguments)))) throw new Error('result history tool call is invalid')
+        }
+      }
+    }
+  }
+  return {
+    items: object.items as ItemsPage['items'],
+    oldest_seq: oldestSeq,
+    newest_seq: newestSeq,
+    has_more_before: object.has_more_before as boolean,
+    has_more_after: object.has_more_after as boolean,
+  }
+}
+
+function decodeHistoryReadResult(value: unknown, sessionID: string, expectedCursor: number, expectedDirection: '' | 'before' | 'after', expectedLimit: number, expectedAlignTurn: boolean): SessionHistoryReadResult {
+  const object = exactObject(value, ['session_id', 'cursor', 'direction', 'limit', 'align_turn', 'history', 'blob'])
+  const resultSessionID = resultString(object, 'session_id')
+  const cursor = resultSafeInteger(object, 'cursor', 0, Number.MAX_SAFE_INTEGER)
+  const direction = object.direction
+  const limit = resultSafeInteger(object, 'limit', 1, 200)
+  if (resultSessionID !== sessionID || cursor !== expectedCursor || direction !== expectedDirection || limit !== expectedLimit || object.align_turn !== expectedAlignTurn || (direction !== '' && direction !== 'before' && direction !== 'after') || typeof object.align_turn !== 'boolean') throw new Error('result identity does not match request')
+  if (cursor === 0 && direction !== '') throw new Error('result cursor is invalid')
+  if (cursor > 0 && direction === '') throw new Error('result cursor is invalid')
+  const hasHistory = object.history !== null
+  const hasBlob = object.blob !== null
+  if (hasHistory === hasBlob) throw new Error('result history payload is invalid')
+  const history = hasHistory ? decodeHistoryPage(object.history) : null
+  const blob = hasBlob ? decodeBlobDescriptor(object.blob) : null
+  if (blob !== null && blob.content_type !== 'application/json') throw new Error('result history blob content type is invalid')
+  return {
+    session_id: resultSessionID,
+    cursor,
+    direction: direction as '' | 'before' | 'after',
+    limit,
+    align_turn: object.align_turn as boolean,
+    history,
+    blob,
+  }
 }
 
 function decodeMarkReadResult(value: unknown, sessionID: string, runID: string): SessionMarkReadResult {
@@ -363,6 +512,51 @@ export class CommandFacade implements SessionCommands, RunCommands {
 
   restore(sessionID: string, options: CommandOptions = {}): Promise<SessionArchiveResult> {
     return this.submitSessionToggle('session.restore', sessionID, false, options)
+  }
+
+  delete(sessionID: string, options: CommandOptions = {}): Promise<SessionDeleteResult> {
+    const cleanSessionID = this.cleanID(sessionID)
+    if (!this.validSessionID(cleanSessionID)) return Promise.reject(new CommandFacadeError('invalid', 'session_id is invalid'))
+    return this.submit('session.delete', { session_id: cleanSessionID }, false, (value) => decodeDeleteResult(value, cleanSessionID), options)
+  }
+
+  deleteSession(sessionID: string, options: CommandOptions = {}): Promise<SessionDeleteResult> {
+    return this.delete(sessionID, options)
+  }
+
+  compact(sessionID: string, options: CommandOptions = {}): Promise<SessionCompactResult> {
+    const cleanSessionID = this.cleanID(sessionID)
+    if (!this.validSessionID(cleanSessionID)) return Promise.reject(new CommandFacadeError('invalid', 'session_id is invalid'))
+    return this.submit('session.compact', { session_id: cleanSessionID }, false, (value) => decodeCompactResult(value, cleanSessionID), options)
+  }
+
+  historyRead(sessionID: string, historyOptions: SessionHistoryReadOptions = {}, commandOptions: CommandOptions = {}): Promise<SessionHistoryReadResult> {
+    const cleanSessionID = this.cleanID(sessionID)
+    if (!this.validSessionID(cleanSessionID) || historyOptions === null || typeof historyOptions !== 'object' || Array.isArray(historyOptions)) return Promise.reject(new CommandFacadeError('invalid', 'session_id or history options are invalid'))
+    const args: JsonObject = { session_id: cleanSessionID }
+    const cursor = historyOptions.cursor
+    const direction = historyOptions.direction
+    if (cursor !== undefined) {
+      if (!Number.isSafeInteger(cursor) || cursor <= 0) return Promise.reject(new CommandFacadeError('invalid', 'cursor is invalid'))
+      if (direction !== 'before' && direction !== 'after') return Promise.reject(new CommandFacadeError('invalid', 'direction is invalid'))
+      args.cursor = cursor
+      args.direction = direction
+    } else if (direction !== undefined) {
+      return Promise.reject(new CommandFacadeError('invalid', 'direction requires cursor'))
+    }
+    if (historyOptions.limit !== undefined) {
+      if (!Number.isSafeInteger(historyOptions.limit) || historyOptions.limit < 1 || historyOptions.limit > 200) return Promise.reject(new CommandFacadeError('invalid', 'limit is invalid'))
+      args.limit = historyOptions.limit
+    }
+    if (historyOptions.alignTurn !== undefined) {
+      if (typeof historyOptions.alignTurn !== 'boolean') return Promise.reject(new CommandFacadeError('invalid', 'align_turn is invalid'))
+      args.align_turn = historyOptions.alignTurn
+    }
+    return this.submit('session.history.read', args, true, (value) => decodeHistoryReadResult(value, cleanSessionID, cursor ?? 0, direction ?? '', historyOptions.limit ?? 50, historyOptions.alignTurn ?? false), commandOptions)
+  }
+
+  readHistory(sessionID: string, historyOptions: SessionHistoryReadOptions = {}, commandOptions: CommandOptions = {}): Promise<SessionHistoryReadResult> {
+    return this.historyRead(sessionID, historyOptions, commandOptions)
   }
 
   setFullAccess(sessionID: string, fullAccess: boolean, options: CommandOptions = {}): Promise<SessionFullAccessResult> {

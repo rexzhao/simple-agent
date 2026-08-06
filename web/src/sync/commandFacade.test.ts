@@ -416,6 +416,99 @@ describe('CommandFacade session.mark_read', () => {
     facade.stop()
   })
 
+  it('submits E7 commands with strict results and applies retry policy without replica patches', async () => {
+    const transport = new FakeCommandTransport()
+    const facade = new CommandFacade({ transport })
+    const deleted = facade.delete('session_1')
+    const compacted = facade.compact('session_2')
+    const history = facade.historyRead('session_3', { cursor: 12, direction: 'before', limit: 20, alignTurn: true })
+    expect(transport.sent.map((message) => message.type === 'command' ? [message.payload.name, message.payload.arguments] : null)).toEqual([
+      ['session.delete', { session_id: 'session_1' }],
+      ['session.compact', { session_id: 'session_2' }],
+      ['session.history.read', { session_id: 'session_3', cursor: 12, direction: 'before', limit: 20, align_turn: true }],
+    ])
+    const deleteCommand = transport.sent[0]
+    const compactCommand = transport.sent[1]
+    const historyCommand = transport.sent[2]
+    if (deleteCommand.type !== 'command' || compactCommand.type !== 'command' || historyCommand.type !== 'command') throw new Error('wrong command')
+    transport.emit(commandMessage('command_result', deleteCommand.payload.request_id, {
+      status: 'succeeded', result: { session_id: 'session_1', status: 'removed', removed_sessions: 2 },
+    }))
+    transport.emit(commandMessage('command_result', compactCommand.payload.request_id, {
+      status: 'succeeded', result: { session_id: 'session_2', status: 'committed', compaction_id: 'provider:compact/1', summary_item_id: 'provider:item/2', revision: '42' },
+    }))
+    transport.connectionGeneration = 2
+    transport.emitReady('epoch_2', 'epoch_1')
+    const resentHistory = transport.sent[3]
+    if (resentHistory.type !== 'command') throw new Error('history command was not retried')
+    expect(resentHistory.payload).toEqual(historyCommand.payload)
+    transport.emit(commandMessage('command_result', resentHistory.payload.request_id, {
+      status: 'succeeded', result: {
+        session_id: 'session_3', cursor: 12, direction: 'before', limit: 20, align_turn: true,
+        history: {
+          items: [{
+            seq: 1, id: 'provider:item/1', turn_id: 'turn/界', created_at: '2025-01-01T00:00:00Z',
+            kind: 'message', visibility: 'visible', audience: 'model',
+            message: { role: 'assistant', tool_call_id: 'call:1', tool_calls: [{ id: 'tool/1', name: 'provider/tool' }] },
+          }],
+          oldest_seq: 1, newest_seq: 1, has_more_before: false, has_more_after: false,
+        }, blob: null,
+      },
+    }), 2)
+    await expect(deleted).resolves.toEqual({ session_id: 'session_1', status: 'removed', removed_sessions: 2 })
+    await expect(compacted).resolves.toEqual({ session_id: 'session_2', status: 'committed', compaction_id: 'provider:compact/1', summary_item_id: 'provider:item/2', revision: '42' })
+    await expect(history).resolves.toMatchObject({ session_id: 'session_3', history: { items: [{ id: 'provider:item/1' }] }, blob: null })
+    facade.stop()
+  })
+
+  it('does not replay destructive E7 commands after an epoch change', async () => {
+    const transport = new FakeCommandTransport()
+    const facade = new CommandFacade({ transport })
+    const deleted = facade.delete('session_1')
+    const compacted = facade.compact('session_2')
+    expect(transport.sent).toHaveLength(2)
+    transport.connectionGeneration = 2
+    transport.emitReady('epoch_2', 'epoch_1')
+    expect(transport.sent).toHaveLength(2)
+    await expect(deleted).rejects.toMatchObject({ code: 'outcome_unknown' })
+    await expect(compacted).rejects.toMatchObject({ code: 'outcome_unknown' })
+    facade.stop()
+  })
+
+  it('rejects malformed compact, history, and blob command results', async () => {
+    const transport = new FakeCommandTransport()
+    const facade = new CommandFacade({ transport })
+    const compact = facade.compact('session_1')
+    const compactCommand = transport.sent[0]
+    if (compactCommand.type !== 'command') throw new Error('wrong compact command')
+    transport.emit(commandMessage('command_result', compactCommand.payload.request_id, {
+      status: 'succeeded', result: {
+        session_id: 'session_1', status: 'committed', compaction_id: 'compact/1', summary_item_id: 'item/1', revision: '4', extra: false,
+      },
+    }))
+    await expect(compact).rejects.toMatchObject({ code: 'invalid' })
+
+    const history = facade.historyRead('session_2')
+    const historyCommand = transport.sent[1]
+    if (historyCommand.type !== 'command') throw new Error('wrong history command')
+    transport.emit(commandMessage('command_result', historyCommand.payload.request_id, {
+      status: 'succeeded', result: { session_id: 'session_2', cursor: 0, direction: '', limit: 50, align_turn: false, history: null, blob: null },
+    }))
+    await expect(history).rejects.toMatchObject({ code: 'invalid' })
+
+    const blobHistory = facade.historyRead('session_3')
+    const blobCommand = transport.sent[2]
+    if (blobCommand.type !== 'command') throw new Error('wrong blob history command')
+    transport.emit(commandMessage('command_result', blobCommand.payload.request_id, {
+      status: 'succeeded', result: {
+        session_id: 'session_3', cursor: 0, direction: '', limit: 50, align_turn: false, history: null,
+        blob: { id: 'blob/1', url: '/api/blobs/blob/1', content_type: 'application/json', size: 10, sha256: 'hash', etag: 'etag', expires_at: '2025-01-01T00:00:00Z', extra: true },
+      },
+    }))
+    await expect(blobHistory).rejects.toMatchObject({ code: 'invalid' })
+    facade.stop()
+  })
+
   it('rejects typed business errors without exposing or translating a result payload', async () => {
     const transport = new FakeCommandTransport()
     const facade = new CommandFacade({ transport })

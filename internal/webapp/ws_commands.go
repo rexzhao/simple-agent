@@ -6,12 +6,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strconv"
 	"strings"
 	"unicode/utf8"
 
 	"github.com/rexzhao/simple-agent/internal/commands"
 	"github.com/rexzhao/simple-agent/internal/execution"
 	"github.com/rexzhao/simple-agent/internal/projects"
+	"github.com/rexzhao/simple-agent/internal/protocol"
 	"github.com/rexzhao/simple-agent/internal/sessions"
 )
 
@@ -28,6 +30,14 @@ type sessionRenameArguments struct {
 
 type sessionIDArguments struct {
 	SessionID string
+}
+
+type sessionHistoryReadArguments struct {
+	SessionID string
+	Cursor    *int64
+	Direction string
+	Limit     int
+	AlignTurn bool
 }
 
 type sessionFullAccessArguments struct {
@@ -124,6 +134,33 @@ type sessionDebugResult struct {
 type sessionCreateResult struct {
 	SessionID string `json:"session_id"`
 	ProjectID string `json:"project_id"`
+}
+
+type sessionDeleteResult struct {
+	SessionID       string `json:"session_id"`
+	Status          string `json:"status"`
+	RemovedSessions int    `json:"removed_sessions"`
+}
+
+type sessionCompactCommandResult struct {
+	SessionID     string `json:"session_id"`
+	Status        string `json:"status"`
+	CompactionID  string `json:"compaction_id"`
+	SummaryItemID string `json:"summary_item_id"`
+	Revision      string `json:"revision"`
+}
+
+// sessionHistoryReadResult is a descriptor boundary, not a second history
+// model. Inline history and blob history both carry the exact SessionItemsPage
+// DTO returned by the existing REST page endpoint.
+type sessionHistoryReadResult struct {
+	SessionID string                      `json:"session_id"`
+	Cursor    int64                       `json:"cursor"`
+	Direction string                      `json:"direction"`
+	Limit     int                         `json:"limit"`
+	AlignTurn bool                        `json:"align_turn"`
+	History   *execution.SessionItemsPage `json:"history"`
+	Blob      *protocol.BlobDescriptor    `json:"blob"`
 }
 
 func normalizedSessionCreateFingerprint(request commands.CommandRequest, arguments sessionCreateArguments) (string, error) {
@@ -383,6 +420,21 @@ func requiredCommandInt(fields map[string]json.RawMessage, name, command string,
 	return value, nil
 }
 
+func optionalCommandInt64(fields map[string]json.RawMessage, name, command string, min, max int64) (*int64, error) {
+	raw, ok := fields[name]
+	if !ok {
+		return nil, nil
+	}
+	if strings.TrimSpace(string(raw)) == "null" {
+		return nil, fmt.Errorf("invalid %s arguments", command)
+	}
+	var value int64
+	if err := json.Unmarshal(raw, &value); err != nil || value < min || value > max {
+		return nil, fmt.Errorf("invalid %s arguments", command)
+	}
+	return &value, nil
+}
+
 func optionalCommandBool(fields map[string]json.RawMessage, name, command string) (*bool, error) {
 	raw, ok := fields[name]
 	if !ok {
@@ -543,10 +595,75 @@ func decodeSessionIDArguments(raw json.RawMessage, command string) (sessionIDArg
 		return sessionIDArguments{}, err
 	}
 	sessionID, err := requiredCommandString(fields, "session_id", command)
-	if err != nil {
-		return sessionIDArguments{}, err
+	if err != nil || sessions.ValidateSessionID(sessionID) != nil {
+		return sessionIDArguments{}, fmt.Errorf("invalid %s arguments", command)
 	}
 	return sessionIDArguments{SessionID: sessionID}, nil
+}
+
+const (
+	maxSessionHistoryReadLimit = 200
+	// Command arguments cross the JSON/JavaScript boundary. Keep cursors in
+	// the protocol's precision-safe integer range even though the durable
+	// store represents sequence numbers as int64.
+	maxSessionHistoryCursor int64 = 9007199254740991
+)
+
+func decodeSessionHistoryReadArguments(raw json.RawMessage) (sessionHistoryReadArguments, error) {
+	const command = "session.history.read"
+	fields, err := strictCommandObject(raw, command)
+	if err != nil {
+		return sessionHistoryReadArguments{}, err
+	}
+	if err := requireExactFields(fields, command, "session_id", "cursor", "direction", "limit", "align_turn"); err != nil {
+		return sessionHistoryReadArguments{}, err
+	}
+	sessionID, err := requiredCommandString(fields, "session_id", command)
+	if err != nil || sessions.ValidateSessionID(sessionID) != nil {
+		return sessionHistoryReadArguments{}, fmt.Errorf("invalid %s arguments", command)
+	}
+	cursor, err := optionalCommandInt64(fields, "cursor", command, 1, maxSessionHistoryCursor)
+	if err != nil {
+		return sessionHistoryReadArguments{}, err
+	}
+	var direction *string
+	if rawDirection, ok := fields["direction"]; ok {
+		if strings.TrimSpace(string(rawDirection)) == "null" {
+			return sessionHistoryReadArguments{}, fmt.Errorf("invalid %s arguments", command)
+		}
+		var value string
+		if err := json.Unmarshal(rawDirection, &value); err != nil || (value != "before" && value != "after") {
+			return sessionHistoryReadArguments{}, fmt.Errorf("invalid %s arguments", command)
+		}
+		direction = &value
+	}
+	if cursor == nil {
+		if direction != nil {
+			return sessionHistoryReadArguments{}, fmt.Errorf("invalid %s arguments", command)
+		}
+	} else if direction == nil || (*direction != "before" && *direction != "after") {
+		return sessionHistoryReadArguments{}, fmt.Errorf("invalid %s arguments", command)
+	}
+	limit := 50
+	if _, ok := fields["limit"]; ok {
+		limit, err = requiredCommandInt(fields, "limit", command, 1, maxSessionHistoryReadLimit)
+		if err != nil {
+			return sessionHistoryReadArguments{}, err
+		}
+	}
+	alignTurn := false
+	if _, ok := fields["align_turn"]; ok {
+		alignTurn, err = requiredCommandBool(fields, "align_turn", command)
+		if err != nil {
+			return sessionHistoryReadArguments{}, err
+		}
+	}
+	arguments := sessionHistoryReadArguments{SessionID: sessionID, Limit: limit, AlignTurn: alignTurn}
+	if cursor != nil {
+		arguments.Cursor = cursor
+		arguments.Direction = *direction
+	}
+	return arguments, nil
 }
 
 func decodeSessionFullAccessArguments(raw json.RawMessage) (sessionFullAccessArguments, error) {
@@ -861,6 +978,11 @@ func validateRunToolCancelArguments(raw json.RawMessage) error {
 	return err
 }
 
+func validateSessionHistoryReadArguments(raw json.RawMessage) error {
+	_, err := decodeSessionHistoryReadArguments(raw)
+	return err
+}
+
 func sessionCommandError(err error) error {
 	if err == nil {
 		return nil
@@ -876,6 +998,8 @@ func sessionCommandError(err error) error {
 		return commands.NewDomainError("cancelled", "command was cancelled", err)
 	case errors.Is(err, execution.ErrSessionArchived):
 		return commands.NewDomainError("session_archived", "session is archived", err)
+	case errors.Is(err, execution.ErrSessionArchiveFirst):
+		return commands.NewDomainError("archive_first", "session must be archived before removal", err)
 	case errors.Is(err, execution.ErrPromptAppendRunNotFound):
 		return commands.NewDomainError("run_not_found", "target run not found", err)
 	case errors.Is(err, execution.ErrPromptAppendWrongSession):
@@ -907,7 +1031,51 @@ func sessionCommandError(err error) error {
 	}
 }
 
-func newSessionCommandRegistry(service *execution.Service, runs *runRegistry) (*commands.Registry, error) {
+type sessionHistoryBlobWriter interface {
+	Put(context.Context, string, []byte) (protocol.BlobDescriptor, error)
+}
+
+const (
+	maxSessionHistoryInlineBytes = 64 * 1024
+	maxSessionHistoryBlobBytes   = 16 * 1024 * 1024
+)
+
+func sessionDeleteCommandError(err error) error {
+	if errors.Is(err, execution.ErrSessionArchiveFirst) {
+		return commands.NewDomainError("archive_first", "session must be archived before removal", err)
+	}
+	return sessionCommandError(err)
+}
+
+func sessionCompactCommandError(err error) error {
+	if err == nil {
+		return nil
+	}
+	switch {
+	case errors.Is(err, context.Canceled):
+		return commands.NewDomainError("cancelled", "command was cancelled", err)
+	case errors.Is(err, execution.ErrTurnFailed):
+		return commands.NewDomainError("compact_failed", "session compaction failed", err)
+	default:
+		return sessionCommandError(err)
+	}
+}
+
+func sessionHistoryReadCommandError(err error) error {
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, context.Canceled) {
+		return commands.NewDomainError("cancelled", "command was cancelled", err)
+	}
+	return sessionCommandError(err)
+}
+
+func newSessionCommandRegistry(service *execution.Service, runs *runRegistry, historyWriters ...sessionHistoryBlobWriter) (*commands.Registry, error) {
+	var historyWriter sessionHistoryBlobWriter
+	if len(historyWriters) > 0 {
+		historyWriter = historyWriters[0]
+	}
 	return commands.NewRegistry(
 		commands.CommandDefinition{
 			Name: "run.prompt.remove", SchemaVersion: 1, CrossEpochRetrySafe: false,
@@ -1136,6 +1304,115 @@ func newSessionCommandRegistry(service *execution.Service, runs *runRegistry) (*
 					return nil, sessionCommandError(err)
 				}
 				return json.Marshal(sessionRenameResult{SessionID: result.ID, DisplayName: result.DisplayName})
+			},
+		},
+		commands.CommandDefinition{
+			Name: "session.delete", SchemaVersion: 1, CrossEpochRetrySafe: false,
+			Validate: func(raw json.RawMessage) error { return validateSessionIDArguments(raw, "session.delete") },
+			Execute: func(_ context.Context, request commands.CommandRequest) (json.RawMessage, error) {
+				arguments, err := decodeSessionIDArguments(request.Arguments, "session.delete")
+				if err != nil {
+					return nil, err
+				}
+				if service == nil {
+					return nil, commands.NewDomainError("session_unavailable", "session service is not configured", nil)
+				}
+				result, err := service.RemoveSession(arguments.SessionID)
+				if err != nil {
+					return nil, sessionDeleteCommandError(err)
+				}
+				return json.Marshal(sessionDeleteResult{
+					SessionID:       result.ID,
+					Status:          result.Status,
+					RemovedSessions: result.RemovedSessions,
+				})
+			},
+		},
+		commands.CommandDefinition{
+			Name: "session.compact", SchemaVersion: 1, CrossEpochRetrySafe: false,
+			Validate: func(raw json.RawMessage) error { return validateSessionIDArguments(raw, "session.compact") },
+			Execute: func(ctx context.Context, request commands.CommandRequest) (json.RawMessage, error) {
+				arguments, err := decodeSessionIDArguments(request.Arguments, "session.compact")
+				if err != nil {
+					return nil, err
+				}
+				if service == nil {
+					return nil, commands.NewDomainError("session_unavailable", "session service is not configured", nil)
+				}
+				result, err := service.CompactSession(ctx, arguments.SessionID)
+				if err != nil {
+					return nil, sessionCompactCommandError(err)
+				}
+				return json.Marshal(sessionCompactCommandResult{
+					SessionID:     arguments.SessionID,
+					Status:        result.Status,
+					CompactionID:  result.CompactionID,
+					SummaryItemID: result.SummaryItemID,
+					Revision:      strconv.FormatInt(result.LastSeq, 10),
+				})
+			},
+		},
+		commands.CommandDefinition{
+			Name: "session.history.read", SchemaVersion: 1, CrossEpochRetrySafe: true,
+			CachePolicy: commands.ResultCacheVolatile,
+			Validate:    validateSessionHistoryReadArguments,
+			Execute: func(ctx context.Context, request commands.CommandRequest) (json.RawMessage, error) {
+				arguments, err := decodeSessionHistoryReadArguments(request.Arguments)
+				if err != nil {
+					return nil, err
+				}
+				if service == nil {
+					return nil, commands.NewDomainError("session_unavailable", "session service is not configured", nil)
+				}
+				options := execution.SessionItemsOptions{Limit: arguments.Limit, AlignTurn: arguments.AlignTurn}
+				if arguments.Cursor != nil {
+					if arguments.Direction == "before" {
+						options.BeforeSeq = *arguments.Cursor
+					} else {
+						options.AfterSeq = *arguments.Cursor
+					}
+				}
+				page, err := service.GetSessionChatItemsPage(arguments.SessionID, options)
+				if err != nil {
+					return nil, sessionHistoryReadCommandError(err)
+				}
+				encoded, err := json.Marshal(page)
+				if err != nil {
+					return nil, commands.NewDomainError("history_read_failed", "session history could not be encoded", err)
+				}
+				result := sessionHistoryReadResult{
+					SessionID: arguments.SessionID,
+					Limit:     arguments.Limit,
+					AlignTurn: arguments.AlignTurn,
+					History:   nil,
+					Blob:      nil,
+				}
+				if arguments.Cursor != nil {
+					result.Cursor = *arguments.Cursor
+					result.Direction = arguments.Direction
+				}
+				if len(encoded) <= maxSessionHistoryInlineBytes {
+					result.History = &page
+					return json.Marshal(result)
+				}
+				if len(encoded) > maxSessionHistoryBlobBytes {
+					return nil, commands.NewDomainError("history_too_large", "session history page is too large", nil)
+				}
+				if historyWriter == nil {
+					return nil, commands.NewDomainError("history_blob_unavailable", "session history blob delivery is unavailable", nil)
+				}
+				descriptor, err := historyWriter.Put(ctx, "application/json", encoded)
+				if err != nil {
+					if errors.Is(err, context.Canceled) {
+						return nil, sessionHistoryReadCommandError(err)
+					}
+					return nil, commands.NewDomainError("history_blob_failed", "session history blob could not be created", err)
+				}
+				if descriptor.ContentType != "application/json" || descriptor.Size > maxSessionHistoryBlobBytes || protocol.ValidateBlobDescriptor(descriptor) != nil {
+					return nil, commands.NewDomainError("history_blob_failed", "session history blob descriptor is invalid", nil)
+				}
+				result.Blob = &descriptor
+				return json.Marshal(result)
 			},
 		},
 		commands.CommandDefinition{

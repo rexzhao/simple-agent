@@ -194,8 +194,9 @@ type SessionListOptions struct {
 }
 
 type SessionRemoveResult struct {
-	Status string `json:"status"`
-	ID     string `json:"id"`
+	Status          string `json:"status"`
+	ID              string `json:"id"`
+	RemovedSessions int    `json:"removed_sessions"`
 }
 
 type SessionMarkReadResult struct {
@@ -381,6 +382,7 @@ type SessionCompactionPlan struct {
 var (
 	ErrSessionBusy           = errors.New("session is currently running a turn")
 	ErrSessionArchived       = errors.New("session is archived")
+	ErrSessionArchiveFirst   = errors.New("archive session before removing it")
 	ErrTurnRunnerUnavailable = errors.New("turn runner is not configured")
 	ErrTurnFailed            = errors.New("turn failed")
 	ErrSessionRunSettled     = errors.New("session run is no longer accepting prompts")
@@ -1417,7 +1419,7 @@ func (s *Service) RemoveSession(id string) (SessionRemoveResult, error) {
 	if effective, err := s.sessionEffectivelyArchived(subtreeSessions[id]); err != nil {
 		return SessionRemoveResult{}, err
 	} else if !effective {
-		return SessionRemoveResult{}, fmt.Errorf("archive session before removing it")
+		return SessionRemoveResult{}, ErrSessionArchiveFirst
 	}
 	projectID := subtreeSessions[id].ProjectID
 	deleteOrder := make([]sessions.SessionV2, 0, len(subtreeSessions))
@@ -1481,7 +1483,7 @@ func (s *Service) RemoveSession(id string) (SessionRemoveResult, error) {
 		// deliver that notification without coupling deletion to the inbox DB.
 		go s.processCompletionInbox(parentID)
 	}
-	return SessionRemoveResult{Status: "removed", ID: id}, nil
+	return SessionRemoveResult{Status: "removed", ID: id, RemovedSessions: len(deleteOrder)}, nil
 }
 
 // sessionSubtreeIDs returns the sorted ids of the subtree rooted at rootID:

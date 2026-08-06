@@ -141,6 +141,53 @@ func TestDispatcherCommandCacheIsPrincipalScopedAcrossRunningAndCompleted(t *tes
 	}
 }
 
+func TestDispatcherVolatileResultRefreshRetainsRequestIDTombstone(t *testing.T) {
+	provider := newDispatcherFakeProvider(t)
+	var executions atomic.Int64
+	definition := commands.CommandDefinition{
+		Name: "fake.volatile", SchemaVersion: 1, CachePolicy: commands.ResultCacheVolatile,
+		Execute: func(context.Context, commands.CommandRequest) (json.RawMessage, error) {
+			count := executions.Add(1)
+			return json.Marshal(map[string]int64{"execution": count})
+		},
+	}
+	endpoint, _ := newDispatcherForTest(t, provider, definition)
+	connection := dialTest(t, endpoint, issueTestTicket(t, endpoint))
+	defer connection.Close(websocket.StatusNormalClosure, "done")
+	writeHello(t, connection, "volatile-client")
+	_ = readProtocol(t, connection)
+	writeProtocol(t, connection, commandMessage("volatile-first", "volatile-request", "fake.volatile", `{"value":1}`))
+	if message := readProtocol(t, connection); message.Kind() != protocol.MessageTypeCommandAccepted {
+		t.Fatalf("first accepted=%s", message.Kind())
+	}
+	first := readCommandResult(t, connection)
+	if string(first.Payload.Result) != `{"execution":1}` {
+		t.Fatalf("first volatile result=%s", first.Payload.Result)
+	}
+
+	// An exact retry regenerates the ephemeral result while preserving the
+	// original request-id reservation.
+	writeProtocol(t, connection, commandMessage("volatile-retry", "volatile-request", "fake.volatile", `{"value":1}`))
+	if message := readProtocol(t, connection); message.Kind() != protocol.MessageTypeCommandAccepted {
+		t.Fatalf("refresh accepted=%s", message.Kind())
+	}
+	second := readCommandResult(t, connection)
+	if string(second.Payload.Result) != `{"execution":2}` || executions.Load() != 2 {
+		t.Fatalf("refreshed volatile result=%s executions=%d", second.Payload.Result, executions.Load())
+	}
+
+	// The fingerprint tombstone still rejects a changed payload under the
+	// same request ID.
+	writeProtocol(t, connection, commandMessage("volatile-conflict", "volatile-request", "fake.volatile", `{"value":2}`))
+	conflict := readCommandResult(t, connection)
+	if conflict.Payload.Status != protocol.CommandStatusFailed || conflict.Payload.Error == nil || conflict.Payload.Error.Code != "idempotency_conflict" {
+		t.Fatalf("volatile conflict=%#v", conflict)
+	}
+	if executions.Load() != 2 {
+		t.Fatalf("conflicting volatile request executed: %d", executions.Load())
+	}
+}
+
 func TestDispatcherCommandCacheCapacityRejectsNewKeysButRetainsExisting(t *testing.T) {
 	provider := newDispatcherFakeProvider(t)
 	var executions atomic.Int64

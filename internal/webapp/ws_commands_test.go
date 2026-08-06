@@ -1,6 +1,7 @@
 package webapp
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"reflect"
@@ -57,6 +58,33 @@ func TestSessionCommandSchemasAreStrict(t *testing.T) {
 			name: "restore", validate: func(raw json.RawMessage) error { return validateSessionIDArguments(raw, "session.restore") },
 			valid:   json.RawMessage(`{"session_id":"s"}`),
 			invalid: []json.RawMessage{json.RawMessage(`{"session_id":"s","extra":true}`), json.RawMessage(`{"session_id":" "}`)},
+		},
+		{
+			name: "delete", validate: func(raw json.RawMessage) error { return validateSessionIDArguments(raw, "session.delete") },
+			valid:   json.RawMessage(`{"session_id":"s"}`),
+			invalid: []json.RawMessage{json.RawMessage(`{"session_id":"s","session_id":"other"}`), json.RawMessage(`{"session_id":"s","extra":true}`), json.RawMessage(`{"session_id":"../escape"}`), json.RawMessage(`{"session_id":1}`), json.RawMessage(`{"session_id":"s"} trailing`)},
+		},
+		{
+			name: "compact", validate: func(raw json.RawMessage) error { return validateSessionIDArguments(raw, "session.compact") },
+			valid:   json.RawMessage(`{"session_id":"s"}`),
+			invalid: []json.RawMessage{json.RawMessage(`{"session_id":""}`), json.RawMessage(`{"session_id":"."}`), json.RawMessage(`{"session_id":"s","unknown":false}`), json.RawMessage(`{"session_id":"s"}{}`)},
+		},
+		{
+			name: "history_read", validate: validateSessionHistoryReadArguments,
+			valid: json.RawMessage(`{"session_id":"s","cursor":12,"direction":"before","limit":20,"align_turn":true}`),
+			invalid: []json.RawMessage{
+				json.RawMessage(`{"session_id":"s","unknown":true}`),
+				json.RawMessage(`{"session_id":"s","session_id":"other"}`),
+				json.RawMessage(`{"session_id":"s","cursor":1}`),
+				json.RawMessage(`{"session_id":"s","direction":"after"}`),
+				json.RawMessage(`{"session_id":"s","cursor":0,"direction":"before"}`),
+				json.RawMessage(`{"session_id":"s","cursor":1,"direction":"sideways"}`),
+				json.RawMessage(`{"session_id":"s","limit":0}`),
+				json.RawMessage(`{"session_id":"s","limit":201}`),
+				json.RawMessage(`{"session_id":"s","align_turn":"yes"}`),
+				json.RawMessage(`{"session_id":"s"} trailing`),
+				json.RawMessage(`{"session_id":""}`),
+			},
 		},
 		{
 			name: "full_access", validate: validateSessionFullAccessArguments,
@@ -310,7 +338,7 @@ func TestSessionCommandRegistryIsClosedAndFlagsAreExplicit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantNames := []string{"run.cancel", "run.continue", "run.prompt.append", "run.prompt.move", "run.prompt.remove", "run.prompt.steer", "run.start", "run.tool.cancel", "session.archive", "session.create", "session.mark_read", "session.rename", "session.restore", "session.set_debug", "session.set_full_access"}
+	wantNames := []string{"run.cancel", "run.continue", "run.prompt.append", "run.prompt.move", "run.prompt.remove", "run.prompt.steer", "run.start", "run.tool.cancel", "session.archive", "session.compact", "session.create", "session.delete", "session.history.read", "session.mark_read", "session.rename", "session.restore", "session.set_debug", "session.set_full_access"}
 	if got := registry.Names(); !reflect.DeepEqual(got, wantNames) {
 		t.Fatalf("registry names=%v, want %v", got, wantNames)
 	}
@@ -322,7 +350,14 @@ func TestSessionCommandRegistryIsClosedAndFlagsAreExplicit(t *testing.T) {
 		if definition.SupportsExpectedRevision {
 			t.Fatalf("%s unexpectedly supports expected_revision", name)
 		}
-		if name == "run.cancel" || name == "run.prompt.move" || name == "run.prompt.remove" || name == "run.prompt.steer" || name == "run.tool.cancel" {
+		if name == "session.history.read" {
+			if definition.CachePolicy != commands.ResultCacheVolatile {
+				t.Fatalf("%s must retain a volatile-result policy", name)
+			}
+		} else if definition.CachePolicy != commands.ResultCacheDurable {
+			t.Fatalf("%s unexpectedly has a volatile-result policy", name)
+		}
+		if name == "run.cancel" || name == "run.prompt.move" || name == "run.prompt.remove" || name == "run.prompt.steer" || name == "run.tool.cancel" || name == "session.compact" || name == "session.delete" {
 			if definition.CrossEpochRetrySafe {
 				t.Fatalf("%s must remain cross-epoch unsafe", name)
 			}
@@ -348,6 +383,27 @@ func TestPromptAppendOutcomeErrorsRemainTypedFailures(t *testing.T) {
 			var domain *commands.DomainError
 			if !errors.As(mapped, &domain) || domain == nil || domain.Code != test.code || !strings.Contains(domain.Message, test.want) {
 				t.Fatalf("mapped error=%#v, want %s containing %q", mapped, test.code, test.want)
+			}
+		})
+	}
+}
+
+func TestSessionCompactCommandErrorsRemainTyped(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		code string
+	}{
+		{name: "busy", err: execution.ErrSessionBusy, code: "session_busy"},
+		{name: "planner cancellation", err: context.Canceled, code: "cancelled"},
+		{name: "planner failure", err: execution.ErrTurnFailed, code: "compact_failed"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			mapped := sessionCompactCommandError(test.err)
+			var domain *commands.DomainError
+			if !errors.As(mapped, &domain) || domain == nil || domain.Code != test.code {
+				t.Fatalf("mapped error=%#v, want code %q", mapped, test.code)
 			}
 		})
 	}

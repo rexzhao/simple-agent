@@ -201,7 +201,7 @@ func NewServer(options ServerOptions) (*Server, error) {
 				cleanupAssembly()
 				return nil, err
 			}
-			commandRegistry, err := newSessionCommandRegistry(options.Service, runs)
+			commandRegistry, err := newSessionCommandRegistry(options.Service, runs, blobStore)
 			if err != nil {
 				cleanupAssembly()
 				return nil, err

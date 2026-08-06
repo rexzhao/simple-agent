@@ -60,10 +60,12 @@ type DispatcherOptions struct {
 
 // Dispatcher is the combined command/subscription/ack handler. It stores
 // state per ConnectionID and removes it when the connection context ends.
-// maxCached is a hard capacity for this process/server epoch. Entries are
-// never evicted because evicting an unsafe command could cause a retry to
-// execute its side effect twice. Durable dedupe/outbox support belongs to a
-// later application stage.
+// maxCached is a hard capacity for this process/server epoch. Request
+// tombstones are never evicted because evicting an unsafe command could cause
+// a retry to execute its side effect twice. A volatile entry may replace only
+// its completed ephemeral payload after an exact fingerprint match; its
+// request-id tombstone remains in the map. Durable dedupe/outbox support
+// belongs to a later application stage.
 type Dispatcher struct {
 	engine               *syncengine.Engine
 	commands             *commands.Registry
@@ -889,6 +891,9 @@ func (d *Dispatcher) handleCommand(state *connectionState, message protocol.Comm
 			d.sendCommandFailure(state, request.RequestID, "idempotency_conflict", "request ID was used with different command content")
 			return nil
 		}
+		if existing.cachePolicy == commands.ResultCacheVolatile && existing.finished() {
+			return d.refreshVolatileCommand(state, existing, request)
+		}
 		return d.joinSharedCommand(state, existing, request)
 	}
 
@@ -934,7 +939,7 @@ func (d *Dispatcher) handleCommand(state *connectionState, message protocol.Comm
 		}
 		state.inflight[request.RequestID] = fingerprint
 		state.mu.Unlock()
-		shared = &sharedCommand{fingerprint: fingerprint, request: request.Clone(), definition: definition, done: make(chan struct{}), startedAt: time.Now()}
+		shared = &sharedCommand{fingerprint: fingerprint, request: request.Clone(), definition: definition, cachePolicy: definition.CachePolicy, done: make(chan struct{}), startedAt: time.Now()}
 		d.requests[cacheKey] = shared
 		d.commandsMu.Unlock()
 		// Delivery failure does not cancel the owner-scoped execution; another
@@ -947,8 +952,74 @@ func (d *Dispatcher) handleCommand(state *connectionState, message protocol.Comm
 		d.deliverResult(state, shared)
 		return nil
 	}
+	if shared != nil && shared.cachePolicy == commands.ResultCacheVolatile && shared.finished() {
+		d.commandsMu.Unlock()
+		return d.refreshVolatileCommand(state, shared, request)
+	}
 	d.commandsMu.Unlock()
 	return d.joinSharedCommand(state, shared, request)
+}
+
+// refreshVolatileCommand keeps the global request-id tombstone while
+// regenerating a completed ephemeral result. The fingerprint remains the
+// admission key: a different command payload can never replace this entry.
+// Only the completed payload is replaceable, which lets descriptor-bearing
+// read commands survive BlobStore expiry without weakening idempotency
+// conflict detection.
+func (d *Dispatcher) refreshVolatileCommand(state *connectionState, existing *sharedCommand, request commands.CommandRequest) error {
+	cacheKey := commandCacheKey{Principal: request.Principal, RequestID: request.RequestID}
+	d.commandsMu.Lock()
+	current := d.requests[cacheKey]
+	if current == nil || current.fingerprint != existing.fingerprint {
+		d.commandsMu.Unlock()
+		// The entry cannot normally disappear except during Close. Treat a
+		// concurrent replacement as a normal join so the request remains bound
+		// to the current tombstone.
+		if current != nil {
+			return d.joinSharedCommand(state, current, request)
+		}
+		return ErrConnectionClosed
+	}
+	if current != existing || current.cachePolicy != commands.ResultCacheVolatile || !current.finished() {
+		d.commandsMu.Unlock()
+		return d.joinSharedCommand(state, current, request)
+	}
+	state.mu.Lock()
+	if state.closed {
+		state.mu.Unlock()
+		d.commandsMu.Unlock()
+		return ErrConnectionClosed
+	}
+	if _, attached := state.inflight[request.RequestID]; attached {
+		state.mu.Unlock()
+		d.commandsMu.Unlock()
+		return d.joinSharedCommand(state, current, request)
+	}
+	if len(state.inflight) >= d.maxInflight {
+		state.mu.Unlock()
+		d.commandsMu.Unlock()
+		d.sendCommandFailure(state, request.RequestID, "inflight_limit", "inflight command limit exceeded")
+		return nil
+	}
+	state.inflight[request.RequestID] = current.fingerprint
+	state.mu.Unlock()
+	shared := &sharedCommand{
+		fingerprint: current.fingerprint,
+		request:     request.Clone(),
+		definition:  current.definition,
+		cachePolicy: current.cachePolicy,
+		done:        make(chan struct{}),
+		startedAt:   time.Now(),
+	}
+	d.requests[cacheKey] = shared
+	d.commandsMu.Unlock()
+	_ = d.sendCommandAccepted(state, request.RequestID)
+	d.observe(Event{Kind: EventCommandAccepted, CommandName: request.Name, RequestID: request.RequestID, ConnectionID: state.connection.Info().ConnectionID, InflightCommandsCurrent: state.inflightCount(), CommandCacheCurrent: d.CommandCacheCount()})
+	if !d.startTask(func() { d.executeCommand(shared) }) {
+		shared.finish(nil, &protocol.CommandError{Code: "dispatcher_closed", Message: "command execution was cancelled"})
+	}
+	d.deliverResult(state, shared)
+	return nil
 }
 
 func (d *Dispatcher) joinSharedCommand(state *connectionState, shared *sharedCommand, request commands.CommandRequest) error {
@@ -1328,6 +1399,7 @@ type sharedCommand struct {
 	fingerprint  string
 	request      commands.CommandRequest
 	definition   commands.CommandDefinition
+	cachePolicy  commands.ResultCachePolicy
 	done         chan struct{}
 	mu           sync.Mutex
 	finishedFlag bool
