@@ -7,9 +7,37 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/rexzhao/simple-agent/internal/projectindex"
+	projectstore "github.com/rexzhao/simple-agent/internal/projects"
 	"github.com/rexzhao/simple-agent/internal/sessionindex"
 	"github.com/rexzhao/simple-agent/internal/sessions"
 )
+
+func (s *Service) publishProjectIndexChange(change projectindex.CommittedChange) {
+	if s == nil {
+		return
+	}
+	for _, sink := range s.projectIndexChangeSinks() {
+		if err := sink.PublishCommitted(change); err != nil {
+			if invalidator, ok := sink.(projectindex.InvalidationSink); ok {
+				_ = invalidator.Invalidate("post_commit_projection")
+			}
+		}
+	}
+}
+
+func (s *Service) publishProjectIndexUpsert(project projectstore.Project) {
+	value := project
+	s.publishProjectIndexChange(projectindex.CommittedChange{
+		Kind: projectindex.CommittedProjectUpsert, ProjectID: project.ID, Project: &value,
+	})
+}
+
+func (s *Service) publishProjectIndexRemove(id string) {
+	s.publishProjectIndexChange(projectindex.CommittedChange{
+		Kind: projectindex.CommittedProjectRemove, ProjectID: id,
+	})
+}
 
 const (
 	LifecycleSessionCreated  = "session.created"

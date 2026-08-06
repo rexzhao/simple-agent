@@ -24,6 +24,7 @@ import (
 	"github.com/rexzhao/simple-agent/internal/eventbus"
 	"github.com/rexzhao/simple-agent/internal/model"
 	"github.com/rexzhao/simple-agent/internal/model/httpstream"
+	"github.com/rexzhao/simple-agent/internal/projectindex"
 	projectstore "github.com/rexzhao/simple-agent/internal/projects"
 	"github.com/rexzhao/simple-agent/internal/sessionindex"
 	"github.com/rexzhao/simple-agent/internal/sessionprojector"
@@ -36,6 +37,10 @@ type Service struct {
 	projectStore              *projectstore.Store
 	sessionStore              *sessions.V2Store
 	lifecycleHub              *LifecycleHub
+	projectIndexRegistrations map[uint64]projectindex.ChangeSink
+	projectIndexLegacyID      uint64
+	projectIndexNextID        uint64
+	projectIndexMu            sync.RWMutex
 	sessionIndexRegistrations map[uint64]sessionindex.ChangeSink
 	sessionIndexLegacyID      uint64
 	sessionIndexNextID        uint64
@@ -533,6 +538,87 @@ func (s *Service) SessionStore() *sessions.V2Store {
 	return s.sessionStore
 }
 
+// ProjectStore exposes the durable project state to the project index
+// provider. Mutations still go through Service, which is the only place that
+// emits the post-commit typed project-index callbacks.
+func (s *Service) ProjectStore() *projectstore.Store {
+	if s == nil {
+		return nil
+	}
+	return s.projectStore
+}
+
+// ProjectIndexSinkRegistration is an owner-scoped attachment. Unregister is
+// compare-and-swap: an old server cannot detach a newer server's sink.
+type ProjectIndexSinkRegistration struct {
+	service *Service
+	id      uint64
+	once    sync.Once
+}
+
+func (r *ProjectIndexSinkRegistration) Unregister() {
+	if r == nil || r.service == nil {
+		return
+	}
+	r.once.Do(func() {
+		r.service.projectIndexMu.Lock()
+		delete(r.service.projectIndexRegistrations, r.id)
+		r.service.projectIndexMu.Unlock()
+	})
+}
+
+// RegisterProjectIndexChangeSink installs a post-commit projection adapter.
+// The fanout is intentionally independent from the session-index sink.
+func (s *Service) RegisterProjectIndexChangeSink(sink projectindex.ChangeSink) *ProjectIndexSinkRegistration {
+	if s == nil || sink == nil {
+		return nil
+	}
+	s.projectIndexMu.Lock()
+	defer s.projectIndexMu.Unlock()
+	s.projectIndexNextID++
+	id := s.projectIndexNextID
+	if s.projectIndexRegistrations == nil {
+		s.projectIndexRegistrations = make(map[uint64]projectindex.ChangeSink)
+	}
+	s.projectIndexRegistrations[id] = sink
+	return &ProjectIndexSinkRegistration{service: s, id: id}
+}
+
+// SetProjectIndexChangeSink remains available to package-local legacy
+// adapters, while normal servers use owner-scoped registrations.
+func (s *Service) SetProjectIndexChangeSink(sink projectindex.ChangeSink) {
+	if s == nil {
+		return
+	}
+	s.projectIndexMu.Lock()
+	defer s.projectIndexMu.Unlock()
+	if s.projectIndexRegistrations == nil {
+		s.projectIndexRegistrations = make(map[uint64]projectindex.ChangeSink)
+	}
+	if s.projectIndexLegacyID != 0 {
+		delete(s.projectIndexRegistrations, s.projectIndexLegacyID)
+		s.projectIndexLegacyID = 0
+	}
+	if sink != nil {
+		s.projectIndexNextID++
+		s.projectIndexLegacyID = s.projectIndexNextID
+		s.projectIndexRegistrations[s.projectIndexLegacyID] = sink
+	}
+}
+
+func (s *Service) projectIndexChangeSinks() []projectindex.ChangeSink {
+	if s == nil {
+		return nil
+	}
+	s.projectIndexMu.RLock()
+	defer s.projectIndexMu.RUnlock()
+	sinks := make([]projectindex.ChangeSink, 0, len(s.projectIndexRegistrations))
+	for _, sink := range s.projectIndexRegistrations {
+		sinks = append(sinks, sink)
+	}
+	return sinks
+}
+
 // SessionIndexSinkRegistration is an owner-scoped attachment. Unregister is
 // compare-and-swap: an old server cannot detach a newer server's sink.
 type SessionIndexSinkRegistration struct {
@@ -837,6 +923,9 @@ func (s *Service) CreateProject(root, displayName string) (ProjectCreateResult, 
 	if err != nil {
 		return ProjectCreateResult{}, err
 	}
+	if created {
+		s.publishProjectIndexUpsert(project)
+	}
 	return ProjectCreateResult{Project: projectFromStore(project), Created: created}, nil
 }
 
@@ -917,6 +1006,7 @@ func (s *Service) RenameProject(id, displayName string) (Project, error) {
 	if err != nil {
 		return Project{}, err
 	}
+	s.publishProjectIndexUpsert(project)
 	return projectFromStore(project), nil
 }
 
@@ -938,6 +1028,7 @@ func (s *Service) ArchiveProject(id string) (Project, error) {
 	if err != nil {
 		return Project{}, err
 	}
+	s.publishProjectIndexUpsert(project)
 	s.publishProjectSessionIndex(project.ID)
 	return projectFromStore(project), nil
 }
@@ -957,6 +1048,7 @@ func (s *Service) RestoreProject(id string) (Project, error) {
 	if err != nil {
 		return Project{}, err
 	}
+	s.publishProjectIndexUpsert(project)
 	s.publishProjectSessionIndex(project.ID)
 	return projectFromStore(project), nil
 }
@@ -985,6 +1077,10 @@ func (s *Service) RemoveProject(id string) (ProjectRemoveResult, error) {
 		}
 		return ProjectRemoveResult{}, fmt.Errorf("remove project %s: %w", project.ID, err)
 	}
+	// The project-index removal is the single project lifecycle event. Session
+	// cascade notifications below belong exclusively to session_index/SSE and
+	// must never be interpreted as additional project-index mutations.
+	s.publishProjectIndexRemove(project.ID)
 	for _, cascade := range sessionDeletionCascades(removedSessionStates) {
 		// Project removal has committed both the session deletes and the
 		// project delete. Preserve the same root-plus-descendants contract as

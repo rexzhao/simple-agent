@@ -75,7 +75,85 @@ function changeMessage(subscriptionID: string, resourceID: string, operations: u
   return message({ version: 1, type: 'change', id: `change_${sequence}`, payload: { subscription_id: subscriptionID, resource: { type: 'session_index', id: resourceID }, stream_epoch: epoch, sequence, previous_sequence: previous, resource_revision: revision, operations } })
 }
 
+const projectSummary = (id: string, overrides: Record<string, unknown> = {}) => ({
+  id,
+  root: `/workspace/${id}`,
+  display_name: id,
+  archived: false,
+  created_at: '2025-01-01T00:00:00Z',
+  updated_at: '2025-01-01T00:00:00Z',
+  ...overrides,
+})
+
+function projectSubscribed(subscriptionID: string, epoch = 'stream_1', sequence = '0'): ProtocolMessage {
+  return message({ version: 1, type: 'subscribed', id: `project-subscribed-${sequence}`, payload: { subscription_id: subscriptionID, resource: { type: 'project_index', id: 'server' }, stream_epoch: epoch, sequence } })
+}
+
+function projectSnapshotMessage(subscriptionID: string, content: unknown, sequence = '0', epoch = 'stream_1', revision = '0'): ProtocolMessage {
+  return message({ version: 1, type: 'snapshot', id: `project-snapshot-${sequence}`, payload: { subscription_id: subscriptionID, resource: { type: 'project_index', id: 'server' }, stream_epoch: epoch, sequence, resource_revision: revision, content } })
+}
+
+function projectChangeMessage(subscriptionID: string, operations: unknown[], previous = '0', sequence = '1', epoch = 'stream_1', revision = '1'): ProtocolMessage {
+  return message({ version: 1, type: 'change', id: `project-change-${sequence}`, payload: { subscription_id: subscriptionID, resource: { type: 'project_index', id: 'server' }, stream_epoch: epoch, sequence, previous_sequence: previous, resource_revision: revision, operations } })
+}
+
 describe('SyncRuntime snapshot barrier and continuity', () => {
+  it('queues project_index changes behind a Blob snapshot and applies them in order', async () => {
+    const transport = new FakeTransport()
+    const blobResult: { resolve?: (value: unknown) => void } = {}
+    const blobClient = { getJSON: () => new Promise<unknown>((resolve) => { blobResult.resolve = resolve }) } as unknown as BlobClient
+    const runtime = new SyncRuntime({ transport, blobClient })
+    runtime.subscribe({ type: 'project_index', id: 'server' })
+    runtime.start()
+    const subscribe = transport.last('subscribe')
+    if (subscribe.type !== 'subscribe') throw new Error('wrong subscribe')
+    transport.emit(projectSubscribed(subscribe.payload.subscription_id))
+    transport.emit(projectSnapshotMessage(subscribe.payload.subscription_id, { blob: { id: 'project-blob', url: '/api/blobs/project-blob', content_type: 'application/json', size: 1, sha256: 'a', etag: '"a"', expires_at: '2099-01-01T00:00:00Z' } }))
+    transport.emit(projectChangeMessage(subscribe.payload.subscription_id, [{
+      op: 'upsert', key: 'project_b', value: projectSummary('project_b', { display_name: 'B renamed', updated_at: '2025-01-02T00:00:00Z' }),
+    }]))
+    expect(runtime.replica.get({ type: 'project_index', id: 'server' }).value).toBeUndefined()
+    blobResult.resolve?.({ projects: [projectSummary('project_a')] })
+    await Promise.resolve()
+    await Promise.resolve()
+    const value = runtime.replica.get<{ orderedIDs: readonly string[]; summariesByID: Record<string, { display_name: string }> }>({ type: 'project_index', id: 'server' }).value
+    expect(value?.orderedIDs).toEqual(['project_a', 'project_b'])
+    expect(value?.summariesByID.project_b.display_name).toBe('B renamed')
+    expect(transport.sent.filter((candidate) => candidate.type === 'ack')).toHaveLength(1)
+  })
+
+  it('does not let an old-generation Blob snapshot contaminate a reconnect', async () => {
+    const transport = new FakeTransport()
+    const blobResult: { resolve?: (value: unknown) => void; reject?: (reason?: unknown) => void } = {}
+    const blobClient = { getJSON: () => new Promise<unknown>((resolve, reject) => { blobResult.resolve = resolve; blobResult.reject = reject }) } as unknown as BlobClient
+    const runtime = new SyncRuntime({ transport, blobClient })
+    runtime.subscribe({ type: 'project_index', id: 'server' })
+    runtime.start()
+    const first = transport.last('subscribe')
+    if (first.type !== 'subscribe') throw new Error('wrong subscribe')
+    transport.emit(projectSubscribed(first.payload.subscription_id, 'stream_1', '0'))
+    transport.emit(projectSnapshotMessage(first.payload.subscription_id, { blob: { id: 'old-project-blob', url: '/blob', content_type: 'application/json', size: 1, sha256: 'a', etag: '"a"', expires_at: '2099-01-01T00:00:00Z' } }))
+    transport.emit(projectChangeMessage(first.payload.subscription_id, [{ op: 'upsert', key: 'old_project', value: projectSummary('old_project') }]))
+
+    transport.emitClose()
+    transport.connectionGeneration = 2
+    transport.isReady = true
+    transport.emitReady('server_2')
+    const reconnect = transport.sent.filter((candidate) => candidate.type === 'subscribe').at(-1)
+    if (reconnect?.type !== 'subscribe') throw new Error('missing reconnect subscribe')
+    blobResult.reject?.(new Error('old Blob failed after reconnect'))
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(runtime.replica.get({ type: 'project_index', id: 'server' }).initialized).toBe(false)
+
+    transport.emit(projectSubscribed(reconnect.payload.subscription_id, 'stream_2', '0'))
+    transport.emit(projectSnapshotMessage(reconnect.payload.subscription_id, { inline: { projects: [projectSummary('new_project')] } }, '0', 'stream_2', '0'))
+    await Promise.resolve()
+    await Promise.resolve()
+    const value = runtime.replica.get<{ orderedIDs: readonly string[] }>({ type: 'project_index', id: 'server' }).value
+    expect(value?.orderedIDs).toEqual(['new_project'])
+  })
+
   it('queues changes behind a blob snapshot and ACKs only after the queued change applies', async () => {
     const transport = new FakeTransport()
     const blobResult: { resolve?: (value: unknown) => void } = {}

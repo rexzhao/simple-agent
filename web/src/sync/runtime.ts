@@ -18,6 +18,7 @@ import { BlobClient } from './blobClient'
 import { asSyncReadError, SyncReadError } from './errors'
 import { LocalReplica, resourceKeyString } from './localReplica'
 import type { ResourceAdapter, StagedReplicaChange, TransientResumeToken } from './localReplica'
+import { ProjectIndexAdapter } from './projectIndexAdapter'
 import { SessionContentAdapter } from './sessionContentAdapter'
 import { SessionIndexAdapter } from './sessionIndexAdapter'
 import type { TransportCloseEvent, TransportReadyEvent, WebSocketTransport } from './transport'
@@ -777,6 +778,7 @@ export class SyncRuntime {
     if (factory) return factory(resource)
     if (resource.type === 'session_index') return new SessionIndexAdapter(resource.id) as ResourceAdapter<unknown, unknown>
     if (resource.type === 'session_content') return new SessionContentAdapter(resource.id) as ResourceAdapter<unknown, unknown>
+    if (resource.type === 'project_index') return new ProjectIndexAdapter(resource.id) as ResourceAdapter<unknown, unknown>
     throw new SyncReadError('invalid_snapshot', 'resource type is not registered', resourceKeyString(resource))
   }
 

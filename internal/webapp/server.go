@@ -19,6 +19,7 @@ import (
 
 	"github.com/rexzhao/simple-agent/internal/blobstore"
 	"github.com/rexzhao/simple-agent/internal/execution"
+	"github.com/rexzhao/simple-agent/internal/projectindex"
 	projectstore "github.com/rexzhao/simple-agent/internal/projects"
 	"github.com/rexzhao/simple-agent/internal/sessioncontent"
 	"github.com/rexzhao/simple-agent/internal/sessionindex"
@@ -43,6 +44,7 @@ type ServerOptions struct {
 	WSHandler            wsgateway.Handler
 	WSObserver           wsgateway.Observer
 	SessionIndexObserver sessionindex.Observer
+	ProjectIndexObserver projectindex.Observer
 	BlobStore            *blobstore.Store
 }
 
@@ -58,11 +60,13 @@ type Server struct {
 	wsTickets           *wsgateway.TicketStore
 	wsGateway           *wsgateway.Gateway
 	wsDispatcher        *wsgateway.Dispatcher
+	projectIndex        *projectindex.Provider
 	sessionIndex        *sessionindex.Provider
 	sessionContent      *sessioncontent.Provider
 	blobStore           *blobstore.Store
 	blobStoreOwned      bool
 	sinkRegistration    *execution.SessionIndexSinkRegistration
+	projectRegistration *execution.ProjectIndexSinkRegistration
 	contentRegistration *sessions.MutationSinkRegistration
 	contentRunObserver  func()
 }
@@ -100,7 +104,9 @@ func NewServer(options ServerOptions) (*Server, error) {
 	}
 	gateway := options.WebSocketGateway
 	var dispatcher *wsgateway.Dispatcher
+	var projectIndexProvider *projectindex.Provider
 	var sessionIndexProvider *sessionindex.Provider
+	var projectRegistration *execution.ProjectIndexSinkRegistration
 	var sessionContentProvider *sessioncontent.Provider
 	var sinkRegistration *execution.SessionIndexSinkRegistration
 	var contentRegistration *sessions.MutationSinkRegistration
@@ -115,11 +121,17 @@ func NewServer(options ServerOptions) (*Server, error) {
 		if sinkRegistration != nil {
 			sinkRegistration.Unregister()
 		}
+		if projectRegistration != nil {
+			projectRegistration.Unregister()
+		}
 		if dispatcher != nil {
 			dispatcher.Close()
 		}
 		if sessionIndexProvider != nil {
 			sessionIndexProvider.Close()
+		}
+		if projectIndexProvider != nil {
+			projectIndexProvider.Close()
 		}
 		if sessionContentProvider != nil {
 			sessionContentProvider.Close()
@@ -168,6 +180,25 @@ func NewServer(options ServerOptions) (*Server, error) {
 				cleanupAssembly()
 				return nil, fmt.Errorf("warm session index provider: %w", err)
 			}
+			projectIndexProvider, err = projectindex.NewProvider(options.Service.ProjectStore(), projectindex.ProviderOptions{
+				StreamEpoch:  serverEpoch,
+				OwnerContext: ctx,
+				Observer:     options.ProjectIndexObserver,
+				BlobWriter:   blobStore,
+			})
+			if err != nil {
+				cleanupAssembly()
+				return nil, err
+			}
+			projectRegistration = options.Service.RegisterProjectIndexChangeSink(projectIndexProvider)
+			if projectRegistration == nil {
+				cleanupAssembly()
+				return nil, fmt.Errorf("project index sink registration failed")
+			}
+			if err := projectIndexProvider.Warm(ctx); err != nil {
+				cleanupAssembly()
+				return nil, fmt.Errorf("warm project index provider: %w", err)
+			}
 			sessionContentProvider, err = sessioncontent.NewProvider(options.Service.SessionStore(), sessioncontent.ProviderOptions{
 				StreamEpoch:           serverEpoch,
 				OwnerContext:          ctx,
@@ -189,6 +220,10 @@ func NewServer(options ServerOptions) (*Server, error) {
 			}
 			providers := syncengine.NewProviderRegistry()
 			if err := providers.Register(sessionIndexProvider); err != nil {
+				cleanupAssembly()
+				return nil, err
+			}
+			if err := providers.Register(projectIndexProvider); err != nil {
 				cleanupAssembly()
 				return nil, err
 			}
@@ -233,11 +268,13 @@ func NewServer(options ServerOptions) (*Server, error) {
 		wsTickets:           ticketStore,
 		wsGateway:           gateway,
 		wsDispatcher:        dispatcher,
+		projectIndex:        projectIndexProvider,
 		sessionIndex:        sessionIndexProvider,
 		sessionContent:      sessionContentProvider,
 		blobStore:           blobStore,
 		blobStoreOwned:      blobStoreOwned,
 		sinkRegistration:    sinkRegistration,
+		projectRegistration: projectRegistration,
 		contentRegistration: contentRegistration,
 	}
 	server.runs = runs
@@ -299,11 +336,17 @@ func (s *Server) Close() {
 	if s.sinkRegistration != nil {
 		s.sinkRegistration.Unregister()
 	}
+	if s.projectRegistration != nil {
+		s.projectRegistration.Unregister()
+	}
 	if s.contentRegistration != nil {
 		s.contentRegistration.Unregister()
 	}
 	if s.sessionIndex != nil {
 		s.sessionIndex.Close()
+	}
+	if s.projectIndex != nil {
+		s.projectIndex.Close()
 	}
 	if s.sessionContent != nil {
 		s.sessionContent.Close()

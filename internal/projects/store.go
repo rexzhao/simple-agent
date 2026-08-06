@@ -157,7 +157,25 @@ func (s *Store) List() ([]Project, error) {
 }
 
 func (s *Store) ListWithOptions(options ListOptions) ([]Project, error) {
-	return s.list(options)
+	projects, err := s.listAll()
+	if err != nil {
+		return nil, err
+	}
+	filtered := make([]Project, 0, len(projects))
+	for _, project := range projects {
+		if project.Archived == options.Archived {
+			filtered = append(filtered, project)
+		}
+	}
+	return filtered, nil
+}
+
+// ListAll reads each project directory once and returns both active and
+// archived projects in one durable-store scan. Consumers that need a coherent
+// active/archived projection should use this boundary rather than composing
+// two independent ListWithOptions calls.
+func (s *Store) ListAll() ([]Project, error) {
+	return s.listAll()
 }
 
 func (s *Store) Rename(id, displayName string) (Project, error) {
@@ -278,7 +296,7 @@ func CanonicalRoot(root string) (string, error) {
 	return filepath.Clean(canonical), nil
 }
 
-func (s *Store) list(options ListOptions) ([]Project, error) {
+func (s *Store) listAll() ([]Project, error) {
 	if err := s.requireRoot(); err != nil {
 		return nil, err
 	}
@@ -311,9 +329,6 @@ func (s *Store) list(options ListOptions) ([]Project, error) {
 		}
 		if project.ID != id {
 			return nil, fmt.Errorf("project file %q contains id %q", id, project.ID)
-		}
-		if project.Archived != options.Archived {
-			continue
 		}
 		projects = append(projects, copyProject(project))
 	}
