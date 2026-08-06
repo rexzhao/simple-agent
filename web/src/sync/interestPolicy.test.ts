@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { createCurrentProjectSignal, createCurrentSessionSignal, SessionContentInterestPolicy, SessionIndexInterestPolicy } from './interestPolicy'
+import { createCurrentProjectSignal, createCurrentSessionSignal, createProviderSettingsApplicationStateSignal, ProviderSettingsInterestPolicy, SessionContentInterestPolicy, SessionIndexInterestPolicy } from './interestPolicy'
 
 describe('SessionIndexInterestPolicy', () => {
   it('keeps exactly the signal-selected resource subscribed independently of UI listeners', () => {
@@ -108,5 +108,46 @@ describe('SessionContentInterestPolicy', () => {
     expect(policy.sessionID).toBe('session_b')
     policy.stop()
     expect(releases).toEqual(['session_a', 'session_b'])
+  })
+})
+
+describe('ProviderSettingsInterestPolicy', () => {
+  it('subscribes only when page-independent settings/model state needs it', () => {
+    const signal = createProviderSettingsApplicationStateSignal()
+    const subscribed: string[] = []
+    const released: string[] = []
+    const runtime = {
+      subscribe: (resource: { type: 'provider_settings'; id: string }) => {
+        subscribed.push(`${resource.type}:${resource.id}`)
+        return () => released.push(`${resource.type}:${resource.id}`)
+      },
+    }
+    const policy = new ProviderSettingsInterestPolicy(runtime, signal)
+    policy.start()
+    expect(subscribed).toEqual([])
+    signal.set({ settingsEnabled: false, modelSelectionNeeded: true })
+    expect(policy.isDesired).toBe(true)
+    expect(subscribed).toEqual(['provider_settings:server'])
+    signal.set({ settingsEnabled: true, modelSelectionNeeded: false })
+    expect(subscribed).toHaveLength(1)
+    signal.set({ settingsEnabled: false, modelSelectionNeeded: false })
+    expect(released).toEqual(['provider_settings:server'])
+    expect(policy.isDesired).toBe(false)
+    policy.stop()
+  })
+
+  it('is leak-free and can evict the bounded singleton when released', () => {
+    const signal = createProviderSettingsApplicationStateSignal({ settingsEnabled: true })
+    let active = 0
+    const evicted: string[] = []
+    const policy = new ProviderSettingsInterestPolicy({
+      subscribe: () => { active += 1; return () => { active -= 1 } },
+      evict: (resource: { type: 'provider_settings'; id: string }) => evicted.push(resource.id),
+    }, signal, { retainReleased: false })
+    policy.start()
+    policy.stop()
+    expect(active).toBe(0)
+    expect(evicted).toEqual(['server'])
+    policy.stop()
   })
 })

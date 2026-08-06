@@ -21,6 +21,7 @@ import (
 	"github.com/rexzhao/simple-agent/internal/execution"
 	"github.com/rexzhao/simple-agent/internal/projectindex"
 	projectstore "github.com/rexzhao/simple-agent/internal/projects"
+	"github.com/rexzhao/simple-agent/internal/providersettings"
 	"github.com/rexzhao/simple-agent/internal/sessioncontent"
 	"github.com/rexzhao/simple-agent/internal/sessionindex"
 	"github.com/rexzhao/simple-agent/internal/sessions"
@@ -49,26 +50,28 @@ type ServerOptions struct {
 }
 
 type Server struct {
-	service             *execution.Service
-	token               string
-	cwd                 string
-	ctx                 context.Context
-	cancel              context.CancelFunc
-	mux                 *http.ServeMux
-	runs                *runRegistry
-	codexLogins         *codexLoginRegistry
-	wsTickets           *wsgateway.TicketStore
-	wsGateway           *wsgateway.Gateway
-	wsDispatcher        *wsgateway.Dispatcher
-	projectIndex        *projectindex.Provider
-	sessionIndex        *sessionindex.Provider
-	sessionContent      *sessioncontent.Provider
-	blobStore           *blobstore.Store
-	blobStoreOwned      bool
-	sinkRegistration    *execution.SessionIndexSinkRegistration
-	projectRegistration *execution.ProjectIndexSinkRegistration
-	contentRegistration *sessions.MutationSinkRegistration
-	contentRunObserver  func()
+	service                      *execution.Service
+	token                        string
+	cwd                          string
+	ctx                          context.Context
+	cancel                       context.CancelFunc
+	mux                          *http.ServeMux
+	runs                         *runRegistry
+	codexLogins                  *codexLoginRegistry
+	wsTickets                    *wsgateway.TicketStore
+	wsGateway                    *wsgateway.Gateway
+	wsDispatcher                 *wsgateway.Dispatcher
+	projectIndex                 *projectindex.Provider
+	providerSettings             *providersettings.Provider
+	sessionIndex                 *sessionindex.Provider
+	sessionContent               *sessioncontent.Provider
+	blobStore                    *blobstore.Store
+	blobStoreOwned               bool
+	sinkRegistration             *execution.SessionIndexSinkRegistration
+	projectRegistration          *execution.ProjectIndexSinkRegistration
+	providerSettingsRegistration *execution.ProviderSettingsSinkRegistration
+	contentRegistration          *sessions.MutationSinkRegistration
+	contentRunObserver           func()
 }
 
 func NewServer(options ServerOptions) (*Server, error) {
@@ -107,6 +110,8 @@ func NewServer(options ServerOptions) (*Server, error) {
 	var projectIndexProvider *projectindex.Provider
 	var sessionIndexProvider *sessionindex.Provider
 	var projectRegistration *execution.ProjectIndexSinkRegistration
+	var providerSettingsProvider *providersettings.Provider
+	var providerSettingsRegistration *execution.ProviderSettingsSinkRegistration
 	var sessionContentProvider *sessioncontent.Provider
 	var sinkRegistration *execution.SessionIndexSinkRegistration
 	var contentRegistration *sessions.MutationSinkRegistration
@@ -124,6 +129,9 @@ func NewServer(options ServerOptions) (*Server, error) {
 		if projectRegistration != nil {
 			projectRegistration.Unregister()
 		}
+		if providerSettingsRegistration != nil {
+			providerSettingsRegistration.Unregister()
+		}
 		if dispatcher != nil {
 			dispatcher.Close()
 		}
@@ -132,6 +140,9 @@ func NewServer(options ServerOptions) (*Server, error) {
 		}
 		if projectIndexProvider != nil {
 			projectIndexProvider.Close()
+		}
+		if providerSettingsProvider != nil {
+			providerSettingsProvider.Close()
 		}
 		if sessionContentProvider != nil {
 			sessionContentProvider.Close()
@@ -199,6 +210,24 @@ func NewServer(options ServerOptions) (*Server, error) {
 				cleanupAssembly()
 				return nil, fmt.Errorf("warm project index provider: %w", err)
 			}
+			providerSettingsProvider, err = providersettings.NewProvider(providersettings.ProviderOptions{
+				ConfigPath: options.Service.ConfigPath(), ServerRoot: options.Service.ServerRoot(),
+				StreamEpoch: serverEpoch, OwnerContext: ctx, BlobWriter: blobStore,
+				MaxChangeMessageBytes: wsgateway.DefaultMaxMessageBytes,
+			})
+			if err != nil {
+				cleanupAssembly()
+				return nil, err
+			}
+			providerSettingsRegistration = options.Service.RegisterProviderSettingsChangeSink(providerSettingsProvider)
+			if providerSettingsRegistration == nil {
+				cleanupAssembly()
+				return nil, fmt.Errorf("provider settings sink registration failed")
+			}
+			if err := providerSettingsProvider.Warm(ctx); err != nil {
+				cleanupAssembly()
+				return nil, fmt.Errorf("warm provider settings provider: %w", err)
+			}
 			sessionContentProvider, err = sessioncontent.NewProvider(options.Service.SessionStore(), sessioncontent.ProviderOptions{
 				StreamEpoch:           serverEpoch,
 				OwnerContext:          ctx,
@@ -224,6 +253,10 @@ func NewServer(options ServerOptions) (*Server, error) {
 				return nil, err
 			}
 			if err := providers.Register(projectIndexProvider); err != nil {
+				cleanupAssembly()
+				return nil, err
+			}
+			if err := providers.Register(providerSettingsProvider); err != nil {
 				cleanupAssembly()
 				return nil, err
 			}
@@ -259,23 +292,25 @@ func NewServer(options ServerOptions) (*Server, error) {
 		}
 	}
 	server := &Server{
-		service:             options.Service,
-		token:               options.Token,
-		cwd:                 options.CWD,
-		ctx:                 ctx,
-		cancel:              cancel,
-		mux:                 http.NewServeMux(),
-		wsTickets:           ticketStore,
-		wsGateway:           gateway,
-		wsDispatcher:        dispatcher,
-		projectIndex:        projectIndexProvider,
-		sessionIndex:        sessionIndexProvider,
-		sessionContent:      sessionContentProvider,
-		blobStore:           blobStore,
-		blobStoreOwned:      blobStoreOwned,
-		sinkRegistration:    sinkRegistration,
-		projectRegistration: projectRegistration,
-		contentRegistration: contentRegistration,
+		service:                      options.Service,
+		token:                        options.Token,
+		cwd:                          options.CWD,
+		ctx:                          ctx,
+		cancel:                       cancel,
+		mux:                          http.NewServeMux(),
+		wsTickets:                    ticketStore,
+		wsGateway:                    gateway,
+		wsDispatcher:                 dispatcher,
+		projectIndex:                 projectIndexProvider,
+		providerSettings:             providerSettingsProvider,
+		sessionIndex:                 sessionIndexProvider,
+		sessionContent:               sessionContentProvider,
+		blobStore:                    blobStore,
+		blobStoreOwned:               blobStoreOwned,
+		sinkRegistration:             sinkRegistration,
+		projectRegistration:          projectRegistration,
+		providerSettingsRegistration: providerSettingsRegistration,
+		contentRegistration:          contentRegistration,
 	}
 	server.runs = runs
 	if sessionContentProvider != nil && server.runs != nil && server.runs.coordinator != nil {
@@ -339,6 +374,9 @@ func (s *Server) Close() {
 	if s.projectRegistration != nil {
 		s.projectRegistration.Unregister()
 	}
+	if s.providerSettingsRegistration != nil {
+		s.providerSettingsRegistration.Unregister()
+	}
 	if s.contentRegistration != nil {
 		s.contentRegistration.Unregister()
 	}
@@ -347,6 +385,9 @@ func (s *Server) Close() {
 	}
 	if s.projectIndex != nil {
 		s.projectIndex.Close()
+	}
+	if s.providerSettings != nil {
+		s.providerSettings.Close()
 	}
 	if s.sessionContent != nil {
 		s.sessionContent.Close()

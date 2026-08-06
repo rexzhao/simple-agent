@@ -26,28 +26,33 @@ import (
 	"github.com/rexzhao/simple-agent/internal/model/httpstream"
 	"github.com/rexzhao/simple-agent/internal/projectindex"
 	projectstore "github.com/rexzhao/simple-agent/internal/projects"
+	"github.com/rexzhao/simple-agent/internal/providersettings"
 	"github.com/rexzhao/simple-agent/internal/sessionindex"
 	"github.com/rexzhao/simple-agent/internal/sessionprojector"
 	"github.com/rexzhao/simple-agent/internal/sessions"
 )
 
 type Service struct {
-	serverRoot                string
-	configPath                string
-	projectStore              *projectstore.Store
-	sessionStore              *sessions.V2Store
-	lifecycleHub              *LifecycleHub
-	projectIndexRegistrations map[uint64]projectindex.ChangeSink
-	projectIndexLegacyID      uint64
-	projectIndexNextID        uint64
-	projectIndexMu            sync.RWMutex
-	sessionIndexRegistrations map[uint64]sessionindex.ChangeSink
-	sessionIndexLegacyID      uint64
-	sessionIndexNextID        uint64
-	sessionIndexMu            sync.RWMutex
-	turnRunner                SessionTurnRunner
-	compactPlanner            SessionCompactPlanner
-	sessionWriteLockTimeout   time.Duration
+	serverRoot                    string
+	configPath                    string
+	projectStore                  *projectstore.Store
+	sessionStore                  *sessions.V2Store
+	lifecycleHub                  *LifecycleHub
+	projectIndexRegistrations     map[uint64]projectindex.ChangeSink
+	projectIndexLegacyID          uint64
+	projectIndexNextID            uint64
+	projectIndexMu                sync.RWMutex
+	providerSettingsRegistrations map[uint64]providersettings.ChangeSink
+	providerSettingsLegacyID      uint64
+	providerSettingsNextID        uint64
+	providerSettingsMu            sync.RWMutex
+	sessionIndexRegistrations     map[uint64]sessionindex.ChangeSink
+	sessionIndexLegacyID          uint64
+	sessionIndexNextID            uint64
+	sessionIndexMu                sync.RWMutex
+	turnRunner                    SessionTurnRunner
+	compactPlanner                SessionCompactPlanner
+	sessionWriteLockTimeout       time.Duration
 
 	// promptAppendStatusWriter is nil in production. Tests use it to inject
 	// the completion-write failure after AppendActive has succeeded.
@@ -616,6 +621,79 @@ func (s *Service) projectIndexChangeSinks() []projectindex.ChangeSink {
 	defer s.projectIndexMu.RUnlock()
 	sinks := make([]projectindex.ChangeSink, 0, len(s.projectIndexRegistrations))
 	for _, sink := range s.projectIndexRegistrations {
+		sinks = append(sinks, sink)
+	}
+	return sinks
+}
+
+// ProviderSettingsSinkRegistration is an owner-scoped attachment for the
+// typed provider-settings projection. It keeps the resource provider behind a
+// service publication boundary rather than coupling it to HTTP handlers.
+type ProviderSettingsSinkRegistration struct {
+	service *Service
+	id      uint64
+	once    sync.Once
+}
+
+func (r *ProviderSettingsSinkRegistration) Unregister() {
+	if r == nil || r.service == nil {
+		return
+	}
+	r.once.Do(func() {
+		r.service.providerSettingsMu.Lock()
+		delete(r.service.providerSettingsRegistrations, r.id)
+		r.service.providerSettingsMu.Unlock()
+	})
+}
+
+// RegisterProviderSettingsChangeSink installs the post-commit publication
+// boundary used by the WebSocket resource provider. Commands added in a later
+// phase must publish only after their durable config transaction succeeds.
+func (s *Service) RegisterProviderSettingsChangeSink(sink providersettings.ChangeSink) *ProviderSettingsSinkRegistration {
+	if s == nil || sink == nil {
+		return nil
+	}
+	s.providerSettingsMu.Lock()
+	defer s.providerSettingsMu.Unlock()
+	s.providerSettingsNextID++
+	id := s.providerSettingsNextID
+	if s.providerSettingsRegistrations == nil {
+		s.providerSettingsRegistrations = make(map[uint64]providersettings.ChangeSink)
+	}
+	s.providerSettingsRegistrations[id] = sink
+	return &ProviderSettingsSinkRegistration{service: s, id: id}
+}
+
+// SetProviderSettingsChangeSink is retained for package-local adapters and
+// tests. Normal servers use owner-scoped registrations above.
+func (s *Service) SetProviderSettingsChangeSink(sink providersettings.ChangeSink) {
+	if s == nil {
+		return
+	}
+	s.providerSettingsMu.Lock()
+	defer s.providerSettingsMu.Unlock()
+	if s.providerSettingsRegistrations == nil {
+		s.providerSettingsRegistrations = make(map[uint64]providersettings.ChangeSink)
+	}
+	if s.providerSettingsLegacyID != 0 {
+		delete(s.providerSettingsRegistrations, s.providerSettingsLegacyID)
+		s.providerSettingsLegacyID = 0
+	}
+	if sink != nil {
+		s.providerSettingsNextID++
+		s.providerSettingsLegacyID = s.providerSettingsNextID
+		s.providerSettingsRegistrations[s.providerSettingsLegacyID] = sink
+	}
+}
+
+func (s *Service) providerSettingsChangeSinks() []providersettings.ChangeSink {
+	if s == nil {
+		return nil
+	}
+	s.providerSettingsMu.RLock()
+	defer s.providerSettingsMu.RUnlock()
+	sinks := make([]providersettings.ChangeSink, 0, len(s.providerSettingsRegistrations))
+	for _, sink := range s.providerSettingsRegistrations {
 		sinks = append(sinks, sink)
 	}
 	return sinks

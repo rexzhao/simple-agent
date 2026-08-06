@@ -12,9 +12,11 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/rexzhao/simple-agent/internal/codexauth"
 	"github.com/rexzhao/simple-agent/internal/config"
+	"github.com/rexzhao/simple-agent/internal/providersettings"
 	"gopkg.in/yaml.v3"
 )
 
@@ -114,7 +116,7 @@ func (s *Service) CreateProviderSettings(input ProviderSettingsInput) (ProviderS
 }
 
 func (s *Service) UpdateProviderSettings(providerName string, input ProviderSettingsInput) (ProviderSettingsDocument, error) {
-	return s.saveProviderSettings(strings.TrimSpace(providerName), input)
+	return s.saveProviderSettings(providerName, input)
 }
 
 func (s *Service) saveProviderSettings(existingName string, input ProviderSettingsInput) (ProviderSettingsDocument, error) {
@@ -123,8 +125,15 @@ func (s *Service) saveProviderSettings(existingName string, input ProviderSettin
 	if err != nil {
 		return ProviderSettingsDocument{}, err
 	}
-	name := strings.TrimSpace(input.Name)
-	if err := validateProviderSettingsName(name); err != nil {
+	name := input.Name
+	if err := config.ValidateProviderName(name); err != nil {
+		return ProviderSettingsDocument{}, fmt.Errorf("provider name: %w", err)
+	}
+	if existingName != "" {
+		if err := config.ValidateProviderName(existingName); err != nil {
+			return ProviderSettingsDocument{}, fmt.Errorf("existing provider name: %w", err)
+		}
+	} else if err := validateProviderSettingsCreateFilename(name); err != nil {
 		return ProviderSettingsDocument{}, err
 	}
 	if existingName != "" && existingName != name {
@@ -254,7 +263,14 @@ func (s *Service) saveProviderSettings(existingName string, input ProviderSettin
 	if err := config.WriteProviderConfig(path, provider); err != nil {
 		return ProviderSettingsDocument{}, err
 	}
-	return s.ProviderSettings()
+	document, readErr := s.ProviderSettings()
+	// The provider file is durable at this point. Publish only the typed
+	// identity; the WebSocket projection reloads the safe snapshot from the
+	// same config authority and never receives this write DTO.
+	s.publishProviderSettingsChange(providersettings.CommittedChange{
+		Kind: providersettings.CommittedProviderUpsert, ProviderName: name,
+	})
+	return document, readErr
 }
 
 func (s *Service) UpdateDefaultProviderModel(providerName, modelProfile string) (ProviderSettingsDocument, error) {
@@ -269,7 +285,12 @@ func (s *Service) UpdateDefaultProviderModel(providerName, modelProfile string) 
 	if err := config.UpdateDefaultModel(configPath, strings.TrimSpace(providerName), strings.TrimSpace(modelProfile)); err != nil {
 		return ProviderSettingsDocument{}, err
 	}
-	return s.ProviderSettings()
+	document, readErr := s.ProviderSettings()
+	s.publishProviderSettingsChange(providersettings.CommittedChange{
+		Kind:            providersettings.CommittedDefaultChanged,
+		DefaultProvider: strings.TrimSpace(providerName), DefaultModel: strings.TrimSpace(modelProfile),
+	})
+	return document, readErr
 }
 
 func (s *Service) CodexAuthStatus(providerName string) (CodexAuthStatus, error) {
@@ -580,18 +601,39 @@ func (s *Service) codexProvider(providerName string) (config.ProviderConfig, err
 	return provider, nil
 }
 
-func validateProviderSettingsName(name string) error {
-	if name == "" {
-		return fmt.Errorf("provider name is required")
+// validateProviderSettingsCreateFilename is deliberately narrower than the
+// provider identity contract. Provider names are durable identities and may
+// contain internal spaces and Unicode; only creates need an additional
+// cross-platform filename check because they derive <name>.yaml. Updates use
+// the existing resolved path and therefore do not reinterpret the identity as
+// a new filename.
+func validateProviderSettingsCreateFilename(name string) error {
+	const extension = ".yaml"
+	const maxFilenameBytes = 255
+
+	if len([]byte(name))+len(extension) > maxFilenameBytes {
+		return fmt.Errorf("provider name is too long for a cross-platform provider filename")
 	}
-	if name == "." || name == ".." || filepath.Base(name) != name || strings.ContainsAny(name, `/\\`) {
-		return fmt.Errorf("provider name must not contain path separators")
+	characters := []rune(name)
+	if strings.HasSuffix(name, ".") || (len(characters) > 0 && unicode.IsSpace(characters[len(characters)-1])) {
+		return fmt.Errorf("provider name cannot end with a dot or space when creating a provider file")
 	}
-	for _, char := range name {
-		if (char >= 'a' && char <= 'z') || (char >= 'A' && char <= 'Z') || (char >= '0' && char <= '9') || char == '-' || char == '_' || char == '.' {
-			continue
-		}
-		return fmt.Errorf("provider name may contain only letters, numbers, '.', '_' and '-'")
+	if strings.ContainsAny(name, `<>:"|?*`) {
+		return fmt.Errorf("provider name contains a character that is invalid in a cross-platform filename")
+	}
+
+	// Windows device names remain reserved even when an extension is added.
+	// Check the portion before the first dot, matching the Win32 filename
+	// normalization rules (CON.yaml, for example, is still reserved).
+	deviceName := name
+	if dot := strings.IndexByte(deviceName, '.'); dot >= 0 {
+		deviceName = deviceName[:dot]
+	}
+	switch strings.ToUpper(deviceName) {
+	case "CON", "PRN", "AUX", "NUL", "CLOCK$",
+		"COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
+		"LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9":
+		return fmt.Errorf("provider name is reserved on Windows and cannot be used as a provider filename")
 	}
 	return nil
 }

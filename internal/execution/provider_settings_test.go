@@ -13,6 +13,7 @@ import (
 
 	"github.com/rexzhao/simple-agent/internal/codexauth"
 	"github.com/rexzhao/simple-agent/internal/config"
+	"github.com/rexzhao/simple-agent/internal/providersettings"
 )
 
 func TestServiceProviderSettingsLifecycleAndModelDiscovery(t *testing.T) {
@@ -108,6 +109,37 @@ func TestServiceProviderSettingsLifecycleAndModelDiscovery(t *testing.T) {
 	}
 }
 
+type providerSettingsRecordingSink struct {
+	changes []providersettings.CommittedChange
+}
+
+func (s *providerSettingsRecordingSink) PublishCommitted(change providersettings.CommittedChange) error {
+	s.changes = append(s.changes, change)
+	return nil
+}
+
+func TestServiceProviderSettingsPublishesTypedPostCommitChanges(t *testing.T) {
+	service := newProviderSettingsTestService(t)
+	sink := &providerSettingsRecordingSink{}
+	registration := service.RegisterProviderSettingsChangeSink(sink)
+	if registration == nil {
+		t.Fatal("provider settings registration is nil")
+	}
+	defer registration.Unregister()
+	if _, err := service.CreateProviderSettings(ProviderSettingsInput{Name: "remote", BaseURL: "https://provider.example.test/v1", APIKey: "must-not-cross-boundary", Models: []ProviderModelSettings{{Profile: "main", ID: "model"}}}); err != nil {
+		t.Fatal(err)
+	}
+	if len(sink.changes) != 1 || sink.changes[0].Kind != providersettings.CommittedProviderUpsert || sink.changes[0].ProviderName != "remote" {
+		t.Fatalf("create publication = %#v", sink.changes)
+	}
+	if _, err := service.UpdateDefaultProviderModel("remote", "main"); err != nil {
+		t.Fatal(err)
+	}
+	if len(sink.changes) != 2 || sink.changes[1].Kind != providersettings.CommittedDefaultChanged || sink.changes[1].DefaultProvider != "remote" || sink.changes[1].DefaultModel != "main" {
+		t.Fatalf("default publication = %#v", sink.changes)
+	}
+}
+
 func TestServiceProviderSettingsCodexAuthLifecycle(t *testing.T) {
 	service := newProviderSettingsTestService(t)
 	document, err := service.CreateProviderSettings(ProviderSettingsInput{
@@ -177,7 +209,7 @@ func TestServiceProviderSettingsRejectsInvalidDocuments(t *testing.T) {
 		mutate     func(*ProviderSettingsInput)
 		wantErrSub string
 	}{
-		{name: "path traversal name", mutate: func(input *ProviderSettingsInput) { input.Name = "../escape" }, wantErrSub: "path separators"},
+		{name: "path traversal name", mutate: func(input *ProviderSettingsInput) { input.Name = "../escape" }, wantErrSub: "path separator"},
 		{name: "missing base URL", mutate: func(input *ProviderSettingsInput) { input.BaseURL = "" }, wantErrSub: "base_url is required"},
 		{name: "missing models", mutate: func(input *ProviderSettingsInput) { input.Models = nil }, wantErrSub: "at least one model"},
 		{name: "duplicate model profile", mutate: func(input *ProviderSettingsInput) { input.Models = append(input.Models, input.Models[0]) }, wantErrSub: "duplicate model profile"},
@@ -199,6 +231,116 @@ func TestServiceProviderSettingsRejectsInvalidDocuments(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestServiceProviderSettingsMutationNameContract(t *testing.T) {
+	service := newProviderSettingsTestService(t)
+	providerDir := filepath.Join(service.ServerRoot(), "providers")
+
+	// These names are valid durable provider identities. Updating them must use
+	// the existing resolved path instead of applying the create-only filename
+	// policy or falling back to the old ASCII-only validator.
+	for _, name := range []string{"space provider", "供应商"} {
+		path := filepath.Join(providerDir, name+".yaml")
+		if err := config.WriteProviderConfig(path, config.ProviderConfig{
+			Name:    name,
+			BaseURL: "https://provider.example.test/v1",
+			Models:  map[string]config.ModelProfile{"main": {ID: "before"}},
+		}); err != nil {
+			t.Fatalf("WriteProviderConfig(%q) error = %v", name, err)
+		}
+
+		document, err := service.ProviderSettings()
+		if err != nil {
+			t.Fatalf("ProviderSettings(%q) error = %v", name, err)
+		}
+		if !containsProvider(document, name) {
+			t.Fatalf("ProviderSettings() did not expose provider %q: %#v", name, document.Providers)
+		}
+
+		updated, err := service.UpdateProviderSettings(name, ProviderSettingsInput{
+			Name:    name,
+			BaseURL: "https://provider.example.test/v2",
+			Models:  []ProviderModelSettings{{Profile: "main", ID: "after"}},
+		})
+		if err != nil {
+			t.Fatalf("UpdateProviderSettings(%q) error = %v", name, err)
+		}
+		provider := findProvider(updated, name)
+		if provider == nil || provider.Models[0].ID != "after" {
+			t.Fatalf("updated provider %q = %#v, want model after", name, provider)
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("ReadFile(%q) error = %v", path, err)
+		}
+		if !strings.Contains(string(data), "id: after") {
+			t.Fatalf("updated provider file %q = %s, want existing path updated", path, data)
+		}
+	}
+
+	beforeEntries, err := os.ReadDir(providerDir)
+	if err != nil {
+		t.Fatalf("ReadDir(before invalid creates) error = %v", err)
+	}
+	for _, name := range []string{"CON", "bad:name", "bad.", "bad "} {
+		_, err := service.CreateProviderSettings(ProviderSettingsInput{
+			Name:    name,
+			BaseURL: "https://provider.example.test/v1",
+			Models:  []ProviderModelSettings{{Profile: "main", ID: "model"}},
+		})
+		if err == nil {
+			t.Fatalf("CreateProviderSettings(%q) succeeded, want cross-platform filename rejection", name)
+		}
+		entries, readErr := os.ReadDir(providerDir)
+		if readErr != nil {
+			t.Fatalf("ReadDir(after invalid create %q) error = %v", name, readErr)
+		}
+		for _, entry := range entries {
+			if entry.Name() == name+".yaml" {
+				t.Fatalf("invalid create %q left a provider file", name)
+			}
+		}
+	}
+	afterEntries, err := os.ReadDir(providerDir)
+	if err != nil {
+		t.Fatalf("ReadDir(after invalid creates) error = %v", err)
+	}
+	if len(afterEntries) != len(beforeEntries) {
+		t.Fatalf("invalid creates changed provider directory: before=%v after=%v", beforeEntries, afterEntries)
+	}
+
+	// Ordinary ASCII creation remains the normal path and publishes only the
+	// typed post-commit identity, not the write DTO.
+	sink := &providerSettingsRecordingSink{}
+	registration := service.RegisterProviderSettingsChangeSink(sink)
+	if registration == nil {
+		t.Fatal("provider settings registration is nil")
+	}
+	defer registration.Unregister()
+	if _, err := service.CreateProviderSettings(ProviderSettingsInput{
+		Name:    "ordinary",
+		BaseURL: "https://provider.example.test/v1",
+		Models:  []ProviderModelSettings{{Profile: "main", ID: "model"}},
+	}); err != nil {
+		t.Fatalf("CreateProviderSettings(ordinary) error = %v", err)
+	}
+	if len(sink.changes) != 1 || sink.changes[0].Kind != providersettings.CommittedProviderUpsert || sink.changes[0].ProviderName != "ordinary" {
+		t.Fatalf("ordinary create publication = %#v", sink.changes)
+	}
+}
+
+func containsProvider(document ProviderSettingsDocument, name string) bool {
+	return findProvider(document, name) != nil
+}
+
+func findProvider(document ProviderSettingsDocument, name string) *ProviderSettings {
+	for index := range document.Providers {
+		if document.Providers[index].Name == name {
+			return &document.Providers[index]
+		}
+	}
+	return nil
 }
 
 func newProviderSettingsTestService(t *testing.T) *Service {

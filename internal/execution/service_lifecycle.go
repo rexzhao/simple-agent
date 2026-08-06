@@ -9,6 +9,7 @@ import (
 
 	"github.com/rexzhao/simple-agent/internal/projectindex"
 	projectstore "github.com/rexzhao/simple-agent/internal/projects"
+	"github.com/rexzhao/simple-agent/internal/providersettings"
 	"github.com/rexzhao/simple-agent/internal/sessionindex"
 	"github.com/rexzhao/simple-agent/internal/sessions"
 )
@@ -37,6 +38,27 @@ func (s *Service) publishProjectIndexRemove(id string) {
 	s.publishProjectIndexChange(projectindex.CommittedChange{
 		Kind: projectindex.CommittedProjectRemove, ProjectID: id,
 	})
+}
+
+func (s *Service) publishProviderSettingsChange(change providersettings.CommittedChange) {
+	if s == nil {
+		return
+	}
+	for _, sink := range s.providerSettingsChangeSinks() {
+		if err := sink.PublishCommitted(change); err != nil {
+			if invalidator, ok := sink.(providersettings.InvalidationSink); ok {
+				_ = invalidator.Invalidate("post_commit_projection")
+			}
+		}
+	}
+}
+
+// RefreshProviderSettings is the explicit boundary for durable config
+// changes made outside the current HTTP handlers (for example, a future
+// provider command or an external config watcher). The caller must invoke it
+// only after the durable write has succeeded.
+func (s *Service) RefreshProviderSettings() {
+	s.publishProviderSettingsChange(providersettings.CommittedChange{Kind: providersettings.CommittedProviderRefresh})
 }
 
 const (

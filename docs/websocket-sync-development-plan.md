@@ -707,7 +707,27 @@ Application command
 - provider 维护 sessionID -> subscribers 索引，无订阅者时不进行 Web 协议 JSON 编码；
 - run replay buffer 可保留，但通过 provider 暴露，不再暴露 SSE cursor endpoint。
 
-### 7.5 Connection 模型
+### 7.5 ProviderSettings provider（E10）
+
+`provider_settings/server` 使用与 ProjectIndex、SessionIndex、SessionContent 相同的
+owner/barrier/journal/live subscription 实现。snapshot 的 authority 是 `config.Load` 读取的
+当前 durable config/provider files；HTTP provider 配置写入成功后，execution 只发布不含配置
+正文的 typed committed identity，provider 在自己的 owner 中重新加载 authority。未来
+`provider.create/update/set_default/discover_models` command 也必须经过这个 publication
+boundary，本阶段不注册 command。
+
+wire DTO 是明确的安全白名单：provider/model/default、limits、reasoning 的 bounded scalar
+metadata、pricing/config metadata 和 `api_key_configured` 布尔值；不包含 API key、resolved key、
+任意 `parameters` map、Codex auth/token/login status。URL 去除 user-info/query/fragment，auth
+file 只保留相对位置。providers/models/reasoning levels 在编码边界排序，严格拒绝 unknown 或
+duplicate JSON fields。default-only 变化使用同一 durable journal 的 `default.replace` operation；
+无变化不推进 resource revision/sequence，overflow、invalidate、epoch 和 replay/resync 复用
+Sync Engine 语义。Provider name 使用本资源自己的 contract：UTF-8、最多 256 bytes、不得有
+首尾 whitespace、`/`、`\` 或 control character，但允许内部 whitespace/Unicode；Go/TS 不借用
+SessionContent identifier。所有 wire integer 为 `[0, 1_000_000_000]`，reasoning value 为保留
+原始类型的 bounded JSON scalar（string/number/bool/null），拒绝 object/array。
+
+### 7.6 Connection 模型
 
 每连接固定：
 
@@ -963,6 +983,10 @@ sessionRepository.observe(sessionID, listener)
 - 旧 `App.tsx` lifecycle/run reducer 必须全部拆除；
 - App 只维护导航/application state 和页面组合，不负责协议归并。
 
+Provider settings 同样采用独立 `ProviderSettingsAdapter`、Store 和 Repository。页面只看
+provider/model/default 的领域数据和 `availability`，不接触 subscription ID、sequence、raw
+wire DTO 或 Blob metadata；本阶段不把 App/旧 Provider HTTP UI 切到该 repository。
+
 ### 8.11 Command facade 与状态更新
 
 页面不调用字符串型通用 dispatcher：
@@ -1076,6 +1100,10 @@ D3 再实现前端 SessionContentStore/Repository cutover。
 
 ### 阶段 E：重建命令层
 
+E10 先交付 `provider_settings/server` read resource、typed safe snapshot/entity、durable
+publication boundary、bounded replay/resync，以及前端 adapter/store/repository 和
+page-independent interest policy。E10 不实现或注册 provider command，也不做 App 页面 cutover。
+
 交付所有 typed commands：
 
 ```text
@@ -1169,7 +1197,18 @@ Session/检查 DOM 与 Replica 的 E2E 验收。
 - 断线期间完成后 replay 或 snapshot 恢复；
 - 进程重启后新 epoch 从 durable store 恢复。
 
-### 11.4 Command
+### 11.4 ProviderSettings（E10）
+
+- 安全字段白名单、strict JSON、duplicate/unknown/trailing field rejection；
+- API key/token/任意 model parameters/Codex auth 不进入 snapshot、change 或 Blob；
+- provider upsert/remove、default-only change、重复/无变化 no-op；
+- provider/runtime 的真实 config authority 集成、重连 replay、invalidate/epoch rebuild；
+- bounded journal overflow 返回 resync；
+- 前端 atomic snapshot+operations、availability、domain selectors/repository 和 page-independent
+  interest policy；
+- provider settings publication boundary 测试确保只有 durable commit 后发布 typed identity。
+
+### 11.5 Command
 
 - 同 epoch result 丢失后重发不重复执行；
 - request ID 参数冲突被拒绝；
@@ -1178,7 +1217,7 @@ Session/检查 DOM 与 Replica 的 E2E 验收。
 - epoch 变化时 unsafe command 不自动重发；
 - command success 后订阅最终能观察到权威状态。
 
-### 11.5 E2E 和压力
+### 11.6 E2E 和压力
 
 ```text
 100 connections

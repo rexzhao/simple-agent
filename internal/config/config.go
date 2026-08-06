@@ -11,6 +11,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/rexzhao/simple-agent/internal/contextwindow"
 	"gopkg.in/yaml.v3"
@@ -93,6 +95,33 @@ type ProviderConfig struct {
 	MaxConcurrentRequests int                     `json:"max_concurrent_requests,omitempty" yaml:"max_concurrent_requests,omitempty"`
 	ResolvedAPIKey        string                  `json:"-" yaml:"-"`
 	Models                map[string]ModelProfile `json:"models" yaml:"models"`
+}
+
+// MaxProviderNameBytes and ValidateProviderName define the durable provider
+// name boundary shared by config.Load and the provider-settings wire DTO.
+// Internal whitespace/Unicode remains valid for existing configurations;
+// only path/control/ambiguous edges are rejected.
+const MaxProviderNameBytes = 256
+
+func ValidateProviderName(name string) error {
+	if name == "" {
+		return fmt.Errorf("provider name is required")
+	}
+	if !utf8.ValidString(name) {
+		return fmt.Errorf("provider name must be valid UTF-8")
+	}
+	if strings.TrimSpace(name) != name {
+		return fmt.Errorf("provider name must not have leading or trailing whitespace")
+	}
+	if name == "." || name == ".." || len([]byte(name)) > MaxProviderNameBytes {
+		return fmt.Errorf("provider name exceeds the wire boundary")
+	}
+	for _, r := range name {
+		if r == '/' || r == '\\' || unicode.IsControl(r) {
+			return fmt.Errorf("provider name contains a path separator or control character")
+		}
+	}
+	return nil
 }
 
 type ModelProfile struct {
@@ -813,8 +842,8 @@ func loadProviders(providerDir string) (map[string]ProviderConfig, error) {
 }
 
 func validateProvider(path string, provider ProviderConfig) error {
-	if provider.Name == "" {
-		return fmt.Errorf("provider file %q is missing name", path)
+	if err := ValidateProviderName(provider.Name); err != nil {
+		return fmt.Errorf("provider file %q: %w", path, err)
 	}
 	if provider.RequestTimeout != "" {
 		requestTimeout, err := time.ParseDuration(provider.RequestTimeout)
