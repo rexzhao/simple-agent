@@ -5,6 +5,7 @@ import remarkGfm from 'remark-gfm'
 import { api } from '../api'
 import type { ActiveRun, ItemsPage, QueuedPrompt, Session, SessionImageAttachment, SessionItem } from '../types'
 import type { SessionIndexStatus } from '../repositories/sessionIndex'
+import type { DataAvailability, DomainReadError } from '../repositories/sessionContent'
 import { addUsageBreakdown, contextRequestCount, contextUsageBreakdown, usageBreakdownFromEvents, usageCostBreakdown, usageEventCount } from '../lib/cost'
 import { buildConversationRows, conversationRowKey } from '../lib/conversationRows'
 import type { ConversationRow } from '../lib/conversationRows'
@@ -26,6 +27,9 @@ export const Conversation = memo(function Conversation(props: {
   sessionIndexStatus?: SessionIndexStatus
   admissionPending?: boolean
   compacting: boolean
+	contentAvailability?: DataAvailability
+	historyLoading?: boolean
+	historyError?: DomainReadError
 	draft: ComposerDraft
 	onDraftChange: (content: string) => void
 	onPastedTextAdd: (pastedText: PastedTextAttachment) => void
@@ -218,8 +222,9 @@ export const Conversation = memo(function Conversation(props: {
 	const conversationEmpty = <div className="conversation-empty"><SparkIcon /><h3>Start a new task</h3><p>Describe a goal, a problem, or the code you want to change.</p></div>
 	const listHeader = (
 		<div className="messages-header-slot">
+			{(props.contentAvailability?.status === 'stale' || props.contentAvailability?.status === 'error') && <div className="sync-status" role="status"><span>Session content is out of date.</span><button onClick={props.onRetryRefresh}>Retry synchronization</button></div>}
 			{props.page?.has_more_before
-				? <button className="load-older" disabled={loadingOlder} onClick={() => void loadOlder()}>{loadingOlder ? 'Loading earlier messages…' : 'Load earlier messages'}</button>
+				? <button className="load-older" disabled={loadingOlder || props.historyLoading} onClick={() => void loadOlder()}>{loadingOlder || props.historyLoading ? 'Loading earlier messages…' : props.historyError ? 'Retry earlier messages' : 'Load earlier messages'}</button>
 				: <span aria-hidden="true" />}
 		</div>
 	)
@@ -274,7 +279,7 @@ export const Conversation = memo(function Conversation(props: {
 			rows={conversationRows}
 			header={listHeader}
 			footer={listFooter}
-			emptyPlaceholder={!props.page ? <MessageSkeleton /> : conversationRows.length === 0 ? conversationEmpty : undefined}
+			emptyPlaceholder={props.contentAvailability?.status === 'error' ? <ContentUnavailable onRetry={props.onRetryRefresh} /> : !props.page ? <MessageSkeleton /> : conversationRows.length === 0 ? conversationEmpty : undefined}
 			renderRow={renderRow}
 			followOutput={followOutput}
 			onInteraction={markScrollInteraction}
@@ -310,6 +315,9 @@ export const Conversation = memo(function Conversation(props: {
   previous.activeRun === next.activeRun &&
   previous.admissionPending === next.admissionPending &&
   previous.compacting === next.compacting &&
+	previous.contentAvailability === next.contentAvailability &&
+	previous.historyLoading === next.historyLoading &&
+	previous.historyError === next.historyError &&
   previous.draft === next.draft &&
   previous.turnError === next.turnError &&
   previous.sessionNames === next.sessionNames &&
@@ -317,6 +325,10 @@ export const Conversation = memo(function Conversation(props: {
   previous.onContinue === next.onContinue &&
   previous.onRetryRefresh === next.onRetryRefresh &&
   previous.onDebug === next.onDebug)
+
+function ContentUnavailable(props: { onRetry: () => void }) {
+	return <div className="conversation-empty"><WarningIcon /><h3>Session content is unavailable</h3><p>The synchronized conversation could not be loaded.</p><button className="secondary-button" onClick={props.onRetry}>Retry</button></div>
+}
 
 function ContextUsage(props: { context: Session['context']; activeInputTokens?: number; activeCachedTokens?: number; activeCacheWriteTokens?: number; compactedContextTokens?: number }) {
 	const context = props.context
@@ -423,6 +435,8 @@ function renderConversationRow(row: ConversationRow, props: ConversationRowRende
 			return <ActiveProcessRow key={row.key} row={row} onCancelTool={props.onCancelTool} sessionNames={props.sessionNames} workspaceRoot={props.workspaceRoot} />
 		case 'active-cursor':
 			return <ActiveCursorRow key={row.key} run={row.run} />
+		case 'active-assistant':
+			return <ActiveAssistantRow key={row.key} text={row.text} running={row.run.status === 'running'} />
 		case 'active-compaction':
 			return <CompactionStatus key={row.key} trigger={row.compaction.trigger} status={row.compaction.status} activeContextTokens={row.compaction.activeContextTokens} contextWindow={row.compaction.contextWindow} />
 		case 'provider-retry':
@@ -615,6 +629,16 @@ function ActiveCursorRow({ run }: { run: ActiveRun }) {
 				{run.assistantText
 					? <MarkdownMessage text={run.assistantText} streaming cursor={running} />
 					: running && <div className="message-text assistant-stream"><span className="cursor" aria-hidden="true" /></div>}
+			</div>
+		</article>
+	)
+}
+
+function ActiveAssistantRow({ text, running }: { text: string; running: boolean }) {
+	return (
+		<article className="message assistant transient active-assistant">
+			<div className="message-content">
+				<MarkdownMessage text={text} streaming cursor={running} />
 			</div>
 		</article>
 	)

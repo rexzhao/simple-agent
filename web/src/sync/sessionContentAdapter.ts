@@ -867,6 +867,10 @@ export class SessionContentAdapter implements ResourceAdapter<SessionContentStat
     identifier(sessionID, 'session id')
   }
 
+  retainedWindowInvalidatedBySnapshot(): boolean {
+    return true
+  }
+
   validateResourceRevision(value: string): void {
     revision(value, 'resource_revision')
   }
@@ -888,6 +892,15 @@ export class SessionContentAdapter implements ResourceAdapter<SessionContentStat
     this.validateContext(context)
     if (previous.snapshot.session.id !== this.sessionID) throw new Error('resource/session identity mismatch')
     return applyDurableOperations(previous, operations, context)
+  }
+
+  shouldInvalidateRetainedWindow(operations: readonly ChangeOperation[]): boolean {
+    // An item upsert/remove and a descriptor-only publication can advance the
+    // live latest window while leaving a user-loaded older range valid.  A
+    // complete window replacement or compaction is different: the server may
+    // have removed/rebased history that the independent page cache still
+    // contains, so that range must not be reattached to the new authority.
+    return operations.some((operation) => operation.op === 'history.window.replace' || operation.op === 'compaction.replace')
   }
 
   applyTransient(previous: SessionContentState, event: SubscriptionEventData, context?: ReplicaApplyContext): SessionContentState {

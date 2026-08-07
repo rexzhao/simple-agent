@@ -8,6 +8,7 @@ import { createSyncApplication } from './sync/applicationComposition'
 import { ProjectIndexAdapter } from './sync/projectIndexAdapter'
 import type { SessionSummary } from './sync/sessionIndexAdapter'
 import { SessionIndexAdapter } from './sync/sessionIndexAdapter'
+import { SessionContentAdapter } from './sync/sessionContentAdapter'
 import type { ProjectSummary } from './repositories/projectIndex'
 import type { ProtocolMessage, JsonValue } from './protocol/types'
 import type { RuntimeTransport } from './sync/runtime'
@@ -225,31 +226,51 @@ function applySessionIndexAuthority(view: { application: ReturnType<typeof creat
   )
 }
 
-function applySessionCreateAuthority(view: { application: ReturnType<typeof createSyncApplication> }, sessionID: string): void {
-  applySessionIndexAuthority(view, {
-    session_id: sessionID,
-    project_id: 'project-1',
-    parent_session_id: null,
-    display_name: 'new root',
-    archived: false,
-    status: 'idle',
-    run_id: null,
-    resource_revision: '1',
-    updated_at: '2026-01-02T00:00:00Z',
-    has_unread_result: false,
-  })
+function applySessionContentAuthorityFor(view: { application: ReturnType<typeof createSyncApplication> }, sessionID: string, overrides: Record<string, unknown> = {}, sequence = '1', historyItems?: unknown[], activeRun: unknown = null): void {
+  const session = {
+    id: sessionID, version: 2, created_at: '2026-01-01T00:00:00Z', updated_at: '2026-01-01T00:00:00Z',
+    archived: false, last_used_at: '2026-01-01T00:00:00Z', has_unread_result: false, status: 'idle',
+    show_reasoning: false, full_access: false, debug: { request_bodies: false }, context: {}, save_tool_results: false,
+    provider: 'fake', model_profile: 'default', model_id: 'fake-model', project_id: 'project-1',
+    cwd: '/workspace/src', created_cwd: '/workspace', config_path: '/config', reasoning_level: 'medium',
+    ...overrides,
+  }
+  view.application.replica.applySnapshot(
+    { type: 'session_content', id: sessionID },
+    new SessionContentAdapter(sessionID),
+    {
+      schema_version: 1,
+      session,
+      history: {
+        items: historyItems ?? [{
+          key: { turn_id: 'turn-1', agent_iteration: 1, item_id: 'item-1' }, seq: 1,
+          created_at: '2026-01-01T00:00:01Z', kind: 'message', visibility: 'visible', audience: 'user',
+          message: { role: 'user', content: { inline: 'from session content' } },
+        }],
+        descriptor: { limit: 20, oldest_item_seq: '1', newest_item_seq: '1', align_turn: false, visible_only: true, has_more_before: false, has_more_after: false },
+      },
+      active_run: activeRun,
+      compaction: { checkpoints: [], truncated: false },
+    } as unknown as JsonValue,
+    { streamEpoch: 'test', sequence: sequence as never, resourceRevision: sequence, generation: 1 },
+  )
 }
 
-function respondToSessionCreate(view: { application: ReturnType<typeof createSyncApplication>; transport: AppTestTransport }, message: ProtocolMessage): void {
+function applySessionContentAuthority(view: { application: ReturnType<typeof createSyncApplication> }, overrides: Record<string, unknown> = {}, sequence = '1'): void {
+  applySessionContentAuthorityFor(view, 'session-1', overrides, sequence)
+}
+
+function respondToSessionCreate(view: { application: ReturnType<typeof createSyncApplication>; transport: AppTestTransport }, message: ProtocolMessage, sessionID?: string): void {
   if (message.type !== 'command' || message.payload.name !== 'session.create') return
-  const sessionID = String(message.payload.arguments.session_id ?? 'session-new')
+  const admittedSessionID = sessionID ?? String(message.payload.arguments.session_id ?? '')
   view.transport.emit({
-    version: 1,
-    type: 'command_result',
-    id: `result-${message.payload.request_id}`,
-    payload: { request_id: message.payload.request_id, status: 'succeeded', result: { session_id: sessionID, project_id: 'project-1' } },
+    version: 1, type: 'command_result', id: `result-${message.payload.request_id}`,
+    payload: { request_id: message.payload.request_id, status: 'succeeded', result: { session_id: admittedSessionID, project_id: 'project-1' } },
   } as unknown as ProtocolMessage)
-  applySessionCreateAuthority(view, sessionID)
+  applySessionIndexAuthority(view, {
+    session_id: admittedSessionID, project_id: 'project-1', parent_session_id: null, display_name: 'new root', archived: false,
+    status: 'idle', run_id: null, resource_revision: '1', updated_at: '2026-01-01T00:00:01Z', has_unread_result: false,
+  })
 }
 
 describe('App lifecycle bootstrap', () => {
@@ -272,6 +293,25 @@ describe('App lifecycle bootstrap', () => {
     resetApiMocks()
   })
 
+  async function renderContentReadyApp() {
+    mocks.api.activeRuns.mockResolvedValue({ runs: [] })
+    const view = renderApp()
+    await screen.findByRole('textbox')
+    await act(async () => { applySessionContentAuthority(view) })
+    await waitFor(() => expect(screen.getByText('from session content')).toBeTruthy())
+    return { view, composer: screen.getByRole('textbox') as HTMLTextAreaElement }
+  }
+
+  function respondToRunStart(view: { transport: AppTestTransport }, runID: string) {
+    view.transport.onSend = (message) => {
+      if (message.type !== 'command' || message.payload.name !== 'run.start') return
+      view.transport.emit({
+        version: 1, type: 'command_result', id: `result-${message.payload.request_id}`,
+        payload: { request_id: message.payload.request_id, status: 'succeeded', result: { session_id: 'session-1', run_id: runID, status: 'running' } },
+      } as unknown as ProtocolMessage)
+    }
+  }
+
   afterEach(() => {
     vi.useRealTimers()
     vi.clearAllMocks()
@@ -289,6 +329,17 @@ describe('App lifecycle bootstrap', () => {
     await act(async () => { await vi.advanceTimersByTimeAsync(5000) })
     expect(mocks.api.activeRuns).toHaveBeenCalledTimes(1)
     expect(mocks.api.sessions).not.toHaveBeenCalled()
+    view.unmount()
+  })
+
+  it('renders the opened detail and history from Session Content, not legacy session reads', async () => {
+    const view = renderApp()
+    await waitFor(() => expect(screen.getByText('session-1')).toBeTruthy())
+    await act(async () => { applySessionContentAuthority(view) })
+    await waitFor(() => expect(screen.getByText('from session content')).toBeTruthy())
+    expect(mocks.api.sessions).not.toHaveBeenCalled()
+    expect(mocks.api.session).not.toHaveBeenCalled()
+    expect(mocks.api.snapshot).not.toHaveBeenCalled()
     view.unmount()
   })
 
@@ -777,837 +828,306 @@ describe('App lifecycle bootstrap', () => {
     view.unmount()
   })
 
-  it('applies committed item projection events to the shared cached history without refreshing', async () => {
-    mocks.api.snapshot.mockResolvedValue({
-      session_id: 'session-1',
-      revision: '1',
-      session: { ...mocks.session, revision: '1', last_seq: 1 },
-      history: {
-        items: [{
-          id: 'initial-item',
-          seq: 1,
-          turn_id: 'turn-0',
-          created_at: '2026-01-01T00:00:00Z',
-          kind: 'message',
-          visibility: 'visible',
-          audience: 'user',
-          message: { role: 'user', content: { inline: 'initial' } },
-        }],
-        oldest_seq: 1,
-        newest_seq: 1,
-        has_more_before: false,
-        has_more_after: false,
-      },
-    })
-    mocks.streamRun.mockImplementation(async (_runID: string, onEvent: (event: unknown) => void | Promise<void>) => {
-      await onEvent({
-        type: 'item.appended',
-        session_id: 'session-1',
-        seq: 2,
-        revision: '2',
-        item_id: 'projected-item',
-        item: {
-          id: 'projected-item',
-          seq: 2,
-          turn_id: 'turn-2',
-          created_at: '2026-01-01T00:00:01Z',
-          kind: 'message',
-          visibility: 'visible',
-          audience: 'model',
-          message: { role: 'assistant', content: { inline: 'projected answer' } },
-        },
-      })
-      // A projection event for a session that has not been snapshotted must
-      // not cause App to manufacture history or refresh another page.
-      await onEvent({
-        type: 'item.appended',
-        session_id: 'uncached-session',
-        seq: 3,
-        revision: '3',
-        item_id: 'uncached-item',
-        item: {
-          id: 'uncached-item',
-          seq: 3,
-          created_at: '2026-01-01T00:00:02Z',
-          kind: 'message',
-          visibility: 'visible',
-          audience: 'model',
-          message: { role: 'assistant', content: { inline: 'must wait for snapshot' } },
-        },
-      })
-    })
-
-    const view = renderApp()
-    await waitFor(() => expect(screen.getByText('projected answer')).toBeTruthy())
-    expect(screen.queryByText('must wait for snapshot')).toBeNull()
-    expect(mocks.streamRun).toHaveBeenCalled()
-    expect(mocks.api.snapshot).toHaveBeenCalledTimes(1)
-    view.unmount()
-  })
-
-  const emptySnapshot = () => ({
-    session_id: 'session-1',
-    revision: '0',
-    session: { ...mocks.session, revision: '0' },
-    history: { items: [], oldest_seq: 0, newest_seq: 0, has_more_before: false, has_more_after: false },
-  })
-
-  async function renderSubmitReadyApp(
-    activeRuns: Array<{ run_id: string; session_id: string; turn_id?: string; started_at: string; status: string }> = [],
-    snapshot = emptySnapshot(),
-  ) {
-    mocks.api.activeRuns.mockResolvedValue({ runs: activeRuns })
-    mocks.api.snapshot.mockResolvedValue(snapshot)
-    mocks.streamRun.mockReset()
-    mocks.streamRun.mockResolvedValue(undefined)
-    const view = renderApp()
-    view.transport.onSend = (message) => respondToSessionCreate(view, message)
-    const composer = await screen.findByRole('textbox')
-    return { view, composer }
-  }
-
-  function configureCreatedRoot() {
-    const created = {
-      ...mocks.session,
-      id: 'session-new',
-      display_name: 'new root',
-      root_session_id: 'session-new',
-      parent_session_id: undefined,
-      spawn_depth: 0,
-    }
-    mocks.api.createSession.mockResolvedValue(created)
-    mocks.api.sessions.mockResolvedValue({ sessions: [mocks.session, created] })
-    return created
-  }
-
-  it('creates a configured root for exact /new without starting or appending a run', async () => {
-    const created = configureCreatedRoot()
-    const source = {
-      ...mocks.session,
-      reasoning_level: 'high',
-      full_access: true,
-      cwd: '/workspace/src',
-      config_path: '/config',
-      revision: '0',
-    }
-    const { view, composer } = await renderSubmitReadyApp([], {
-      ...emptySnapshot(),
-      session: source,
-    })
-
-    fireEvent.change(composer, { target: { value: '  /new  ' } })
-    fireEvent.click(screen.getByRole('button', { name: 'Send' }))
-
-    await waitFor(() => expect(view.transport.sent.some((message) => message.type === 'command' && message.payload.name === 'session.create')).toBe(true))
-    const createCommand = view.transport.sent.find((message) => message.type === 'command' && message.payload.name === 'session.create')
-    expect(createCommand && createCommand.type === 'command' ? createCommand.payload.arguments : null).toMatchObject({
-      project_id: 'project-1', provider: 'fake', model_profile: 'default', reasoning_level: 'high', full_access: true,
-      cwd: '/workspace/src', config_path: '/config',
-    })
-    expect(mocks.api.startRun).not.toHaveBeenCalled()
-    expect(mocks.api.appendRunMessage).not.toHaveBeenCalled()
-    expect(mocks.api.cancelRun).not.toHaveBeenCalled()
-    await waitFor(() => expect(screen.getByText('new root')).toBeTruthy())
-    const createdButton = screen.getByText('new root').closest('button')
-    expect(createdButton).not.toBeNull()
-    expect(createdButton?.parentElement?.className).toContain('selected')
-    expect(created.parent_session_id).toBeUndefined()
-    expect(created.root_session_id).toBe(created.id)
-    expect((composer as HTMLTextAreaElement).value).toBe('')
-    expect(mocks.api.sessions).not.toHaveBeenCalled()
-    view.unmount()
-  })
-
-  it('hydrates missing session creation fields from the authoritative session endpoint', async () => {
-    const created = configureCreatedRoot()
-    const authoritative = {
-      ...mocks.session,
-      provider: 'authoritative-provider',
-      model_profile: 'authoritative-model',
-      reasoning_level: 'low',
-      full_access: true,
-      cwd: '/workspace/authoritative',
-      config_path: '/config/authoritative.yaml',
-    }
-    const incomplete = {
-      ...mocks.session,
-      cwd: undefined,
-      config_path: undefined,
-      reasoning_level: undefined,
-      revision: '0',
-    } as unknown as ReturnType<typeof emptySnapshot>['session']
-    mocks.api.session.mockResolvedValue(authoritative)
-    const { view, composer } = await renderSubmitReadyApp([], {
-      ...emptySnapshot(),
-      session: incomplete,
-    })
-
-    fireEvent.change(composer, { target: { value: '/new' } })
-    fireEvent.click(screen.getByRole('button', { name: 'Send' }))
-
-    await waitFor(() => expect(mocks.api.session).toHaveBeenCalledWith('session-1'))
-    const createCommand = view.transport.sent.find((message) => message.type === 'command' && message.payload.name === 'session.create')
-    expect(createCommand && createCommand.type === 'command' ? createCommand.payload.arguments : null).toMatchObject({
-      project_id: 'project-1', provider: 'authoritative-provider', model_profile: 'authoritative-model', reasoning_level: 'low',
-      full_access: true, cwd: '/workspace/authoritative', config_path: '/config/authoritative.yaml',
-    })
-    expect(created.parent_session_id).toBeUndefined()
-    view.unmount()
-  })
-
-  it('allows /new while the source session has a running run without touching that run', async () => {
-    configureCreatedRoot()
-    const { view, composer } = await renderSubmitReadyApp([{
-      run_id: 'run-1', session_id: 'session-1', turn_id: 'turn-1', started_at: '', status: 'running',
-    }])
-
-    fireEvent.change(composer, { target: { value: '/new' } })
-    fireEvent.click(screen.getByRole('button', { name: 'Append to current run' }))
-
-    await waitFor(() => expect(view.transport.sent.some((message) => message.type === 'command' && message.payload.name === 'session.create')).toBe(true))
-    expect(mocks.api.startRun).not.toHaveBeenCalled()
-    expect(mocks.api.appendRunMessage).not.toHaveBeenCalled()
-    expect(mocks.api.cancelRun).not.toHaveBeenCalled()
-    view.unmount()
-  })
-
-  it('sends /new as normal run input when an image is attached', async () => {
-    mocks.api.startRun.mockResolvedValue(undefined)
-    const { view, composer } = await renderSubmitReadyApp()
-    const file = new File(['image'], 'image.png', { type: 'image/png' })
-    const clipboardItem = { kind: 'file', type: 'image/png', getAsFile: () => file }
-
-    fireEvent.paste(composer, {
-      clipboardData: { items: [clipboardItem], getData: () => '' },
-    })
-    await waitFor(() => expect(screen.getByAltText('Image to send #1')).toBeTruthy())
-    fireEvent.change(composer, { target: { value: '/new' } })
-    fireEvent.click(screen.getByRole('button', { name: 'Send' }))
-
-    await waitFor(() => expect(mocks.api.startRun).toHaveBeenCalledTimes(1))
-    expect(mocks.api.createSession).not.toHaveBeenCalled()
-    view.unmount()
-  })
-
-  it('does not treat /new extra as a session command', async () => {
-    mocks.api.startRun.mockResolvedValue(undefined)
-    const { view, composer } = await renderSubmitReadyApp()
-
-    fireEvent.change(composer, { target: { value: '/new extra' } })
-    fireEvent.click(screen.getByRole('button', { name: 'Send' }))
-
-    await waitFor(() => expect(mocks.api.startRun).toHaveBeenCalledTimes(1))
-    expect(mocks.api.createSession).not.toHaveBeenCalled()
-    view.unmount()
-  })
-
-  it('keeps /new in the composer when root creation fails', async () => {
-    const { view, composer } = await renderSubmitReadyApp()
+  it('parses exact /new, keeps the draft on failure, and uses the typed create command', async () => {
+    const { view, composer } = await renderContentReadyApp()
     view.transport.onSend = (message) => {
       if (message.type === 'command' && message.payload.name === 'session.create') failProjectCommand(view.transport, message, 'session_unavailable')
     }
-
-    fireEvent.change(composer, { target: { value: '/new' } })
+    fireEvent.change(composer, { target: { value: '  /new  ' } })
     fireEvent.click(screen.getByRole('button', { name: 'Send' }))
-
     await waitFor(() => expect(screen.getByRole('alert').textContent).toContain('Session operation failed.'))
-    expect((composer as HTMLTextAreaElement).value).toBe('/new')
-    expect(mocks.api.startRun).not.toHaveBeenCalled()
+    expect(composer.value).toBe('  /new  ')
+    expect(view.transport.sent.filter((message) => message.type === 'command').map((message) => message.payload.name)).toContain('session.create')
+    expect(mocks.api.createSession).not.toHaveBeenCalled()
     view.unmount()
   })
 
-  it('does not create two roots when /new is submitted twice before the first response', async () => {
-    const created = configureCreatedRoot()
-    const { view, composer } = await renderSubmitReadyApp()
-    let createCommand: ProtocolMessage | undefined
-    view.transport.onSend = (message) => { if (message.type === 'command' && message.payload.name === 'session.create') createCommand = message }
-
-    fireEvent.change(composer, { target: { value: '/new' } })
+  it('does not create two roots for a double submit and treats /new extra as normal input', async () => {
+    const first = await renderContentReadyApp()
+    let createRequest: ProtocolMessage | undefined
+    first.view.transport.onSend = (message) => { if (message.type === 'command' && message.payload.name === 'session.create') createRequest = message }
+    fireEvent.change(first.composer, { target: { value: '/new' } })
     fireEvent.click(screen.getByRole('button', { name: 'Send' }))
     fireEvent.click(screen.getByRole('button', { name: 'Send' }))
-    await waitFor(() => expect(createCommand).toBeTruthy())
+    await waitFor(() => expect(createRequest).toBeTruthy())
+    expect(first.view.transport.sent.filter((message) => message.type === 'command' && message.payload.name === 'session.create')).toHaveLength(1)
+    first.view.unmount()
 
-    respondToSessionCreate(view, createCommand!)
-    await waitFor(() => expect(screen.getByText('new root')).toBeTruthy())
-    expect(view.transport.sent.filter((message) => message.type === 'command' && message.payload.name === 'session.create')).toHaveLength(1)
-    view.unmount()
+    const second = await renderContentReadyApp()
+    mocks.api.startRun.mockResolvedValue({ run_id: 'image-less-run', session_id: 'session-1', status: 'running' })
+    fireEvent.change(second.composer, { target: { value: '/new extra' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+    await waitFor(() => expect(mocks.api.startRun).not.toHaveBeenCalled())
+    await waitFor(() => expect(second.view.transport.sent.some((message) => message.type === 'command' && message.payload.name === 'run.start')).toBe(true))
+    expect(second.view.transport.sent.some((message) => message.type === 'command' && message.payload.name === 'session.create')).toBe(false)
+    second.view.unmount()
   })
 
-  it('keeps the submitted source configuration when selection changes during creation', async () => {
-    const created = configureCreatedRoot()
-    const other = { ...mocks.session, id: 'session-2', display_name: 'other session' }
-    const source = {
-      ...mocks.session,
-      provider: 'source-provider',
-      model_profile: 'source-model',
-      reasoning_level: 'source-level',
-      full_access: true,
-      cwd: '/workspace/source',
-      config_path: '/config/source.yaml',
-      revision: '0',
+  it('captures source configuration across a selection race while /new is admitted', async () => {
+    const { view, composer } = await renderContentReadyApp()
+    const other: SessionSummary = {
+      session_id: 'session-2', project_id: 'project-1', parent_session_id: null, display_name: 'other session', archived: false,
+      status: 'idle', run_id: null, resource_revision: '2', updated_at: '2026-01-02T00:00:00Z', has_unread_result: false,
     }
-    const { view, composer } = await renderSubmitReadyApp([], { ...emptySnapshot(), session: source })
-    let createCommand: ProtocolMessage | undefined
-    view.transport.onSend = (message) => { if (message.type === 'command' && message.payload.name === 'session.create') createCommand = message }
-
+    await act(async () => { applySessionIndexAuthority(view, other, '2'); applySessionContentAuthorityFor(view, 'session-2', { display_name: 'other session' }, '1') })
+    await screen.findByText('other session')
+    let createRequest: ProtocolMessage | undefined
+    view.transport.onSend = (message) => { if (message.type === 'command' && message.payload.name === 'session.create') createRequest = message }
     fireEvent.change(composer, { target: { value: '/new' } })
     fireEvent.click(screen.getByRole('button', { name: 'Send' }))
-    await waitFor(() => expect(createCommand).toBeTruthy())
-
-    const sessionAdapter = new SessionIndexAdapter('project-1')
-    await act(async () => {
-      view.application.replica.applyChange(
-        { type: 'session_index', id: 'project-1' }, sessionAdapter,
-        [{ op: 'upsert', key: 'session-2', value: {
-          session_id: 'session-2', project_id: 'project-1', parent_session_id: null, display_name: 'other session',
-          archived: false, status: 'idle', run_id: null, resource_revision: '2', updated_at: '2026-01-02T00:00:00Z', has_unread_result: false,
-        } }],
-        { streamEpoch: 'test', sequence: '2' as never, resourceRevision: '2', generation: 0 },
-      )
+    await waitFor(() => expect(createRequest).toBeTruthy())
+    const createdSessionID = createRequest?.type === 'command' ? String(createRequest.payload.arguments.session_id) : ''
+    fireEvent.click(screen.getByText('other session'))
+    await waitFor(() => expect(view.application.signals.currentSession.get()).toBe('session-2'))
+    respondToSessionCreate(view, createRequest!)
+    await waitFor(() => expect(view.application.signals.currentSession.get()).toBe(createdSessionID))
+    expect(createRequest?.type === 'command' ? createRequest.payload.arguments : null).toMatchObject({
+      provider: 'fake', model_profile: 'default', reasoning_level: 'medium', full_access: false,
+      cwd: '/workspace/src', config_path: '/config',
     })
-
-    mocks.api.snapshot.mockResolvedValue({
-      ...emptySnapshot(),
-      session_id: 'session-2',
-      session: { ...other, revision: '0' },
-    })
-    const otherButton = screen.getByText('other session').closest('button')
-    expect(otherButton).not.toBeNull()
-    fireEvent.click(otherButton!)
-    await waitFor(() => expect(mocks.api.snapshot).toHaveBeenCalledWith('session-2'))
-
-    expect(createCommand && createCommand.type === 'command' ? createCommand.payload.arguments : null).toMatchObject({
-      project_id: 'project-1', provider: 'source-provider', model_profile: 'source-model', reasoning_level: 'source-level',
-      full_access: true, cwd: '/workspace/source', config_path: '/config/source.yaml',
-    })
-    respondToSessionCreate(view, createCommand!)
-    await waitFor(() => expect(screen.getByText('new root')).toBeTruthy())
-    const createdButton = screen.getByText('new root').closest('button')
-    expect(createdButton?.parentElement?.className).toContain('selected')
     view.unmount()
   })
 
-  async function renderSettlementApp(snapshots: Array<ReturnType<typeof emptySnapshot> & { revision: string }> = [emptySnapshot()]) {
-    mocks.api.activeRuns.mockResolvedValue({ runs: [{ run_id: 'settlement-run', session_id: 'session-1', turn_id: 'turn-1', started_at: '', status: 'running' }] })
-    mocks.api.snapshot.mockReset()
-    for (const response of snapshots) mocks.api.snapshot.mockResolvedValueOnce(response)
-    mocks.streamRun.mockReset()
-    let onEvent: ((event: unknown) => void | Promise<void>) | undefined
-    mocks.streamRun.mockImplementation(async (_runID: string, handler: (event: unknown) => void | Promise<void>) => {
-      onEvent = handler
-    })
-    const view = renderApp()
-    await screen.findByRole('textbox')
-    await waitFor(() => expect(onEvent).toBeDefined())
-    return { view, onEvent: onEvent! }
-  }
-
-  it('records one accepted or ignored decision for each settled event', async () => {
-    vi.spyOn(console, 'log').mockImplementation(() => {})
-    frontendProtocolLogger.setEnabled('session-1', true)
-    const { view, onEvent } = await renderSettlementApp()
-    const settled = { type: 'run.settled' as const, run_id: 'settlement-run', status: 'committed', committed_revision: '0' }
-
+  it('allows /new with optional Session Content fields absent and omits empty create arguments', async () => {
+    const { view, composer } = await renderContentReadyApp()
+    // This is a legal legacy/default-config projection. It deliberately has
+    // no cwd fallback, provider/model selection, config path, or reasoning
+    // level; the typed command must let the server choose its defaults.
     await act(async () => {
-      await onEvent(settled)
-      await onEvent(settled)
+      applySessionContentAuthority(view, {
+        provider: undefined,
+        model_profile: undefined,
+        model_id: undefined,
+        cwd: undefined,
+        created_cwd: undefined,
+        config_path: undefined,
+        reasoning_level: undefined,
+      }, '2')
     })
-
-    const decisions = frontendProtocolLogger.getSnapshot('session-1').records
-      .filter((record) => record.source === 'app.event_gate' && record.event_type === 'run.settled')
-      .map((record) => record.kind)
-    expect(decisions).toEqual(['accepted', 'ignored'])
+    let createRequest: ProtocolMessage | undefined
+    view.transport.onSend = (message) => {
+      if (message.type === 'command' && message.payload.name === 'session.create') {
+        createRequest = message
+        respondToSessionCreate(view, message)
+      }
+    }
+    fireEvent.change(composer, { target: { value: '/new' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+    await waitFor(() => expect(createRequest).toBeTruthy())
+    await waitFor(() => expect(view.application.signals.currentSession.get()).not.toBe('session-1'))
+    const argumentsPayload = createRequest?.type === 'command' ? createRequest.payload.arguments : {}
+    expect(argumentsPayload).toMatchObject({ project_id: 'project-1', full_access: false })
+    expect(argumentsPayload).not.toHaveProperty('cwd')
+    expect(argumentsPayload).not.toHaveProperty('config_path')
+    expect(argumentsPayload).not.toHaveProperty('provider')
+    expect(argumentsPayload).not.toHaveProperty('model_profile')
+    expect(argumentsPayload).not.toHaveProperty('reasoning_level')
+    expect(Object.values(argumentsPayload)).not.toContain('')
     view.unmount()
   })
 
-  const projection = (revision: string, text = 'durable answer') => ({
-    type: 'item.appended',
-    session_id: 'session-1',
-    run_id: 'settlement-run',
-    seq: 2,
-    revision,
-    item_id: `item-${revision}`,
-    item: {
-      id: `item-${revision}`,
-      seq: 2,
-      turn_id: 'turn-1',
-      created_at: '',
-      kind: 'message',
-      visibility: 'visible',
-      audience: 'model',
-      message: { role: 'assistant', content: { inline: text } },
-    },
-  })
-
-  it('waits for admitted run_id before connecting and renders only the committed user item once', async () => {
-    let resolveAdmission!: (value: { run_id: string; session_id: string; status: string }) => void
-    mocks.api.startRun.mockImplementation(() => new Promise((resolve) => { resolveAdmission = resolve }))
-    const { view, composer } = await renderSubmitReadyApp()
-
-    fireEvent.change(composer, { target: { value: 'submitted text' } })
+  it('keeps /new as ordinary image input and uses the explicit image REST fallback only there', async () => {
+    const { view, composer } = await renderContentReadyApp()
+    mocks.api.startRun.mockResolvedValue({ run_id: 'image-run', session_id: 'session-1', status: 'running' })
+    const file = new File(['image'], 'image.png', { type: 'image/png' })
+    fireEvent.paste(composer, { clipboardData: { items: [{ kind: 'file', type: 'image/png', getAsFile: () => file }], getData: () => '' } })
+    await screen.findByAltText('Image to send #1')
+    fireEvent.change(composer, { target: { value: '/new' } })
     fireEvent.click(screen.getByRole('button', { name: 'Send' }))
     await waitFor(() => expect(mocks.api.startRun).toHaveBeenCalledTimes(1))
-    const lifecycleHandler = mocks.streamLifecycle.mock.calls[0][0] as (event: unknown) => Promise<void>
-    await act(async () => {
-      await lifecycleHandler({ type: 'run.started', session_id: 'session-1', run_id: 'authoritative-run', turn_id: 'turn-1' })
-    })
-    expect(mocks.streamRun).not.toHaveBeenCalled()
-    expect((composer as HTMLTextAreaElement).disabled).toBe(true)
-    expect(view.container.querySelectorAll('.message.user')).toHaveLength(0)
+    expect(view.transport.sent.some((message) => message.type === 'command' && message.payload.name === 'run.start')).toBe(false)
+    expect(view.transport.sent.some((message) => message.type === 'command' && message.payload.name === 'session.create')).toBe(false)
+    view.unmount()
+  })
 
-    resolveAdmission({ run_id: 'authoritative-run', session_id: 'session-1', status: 'running' })
-    await waitFor(() => expect(mocks.streamRun).toHaveBeenCalledTimes(1))
-    expect(mocks.streamRun.mock.calls[0][0]).toBe('authoritative-run')
-    expect(mocks.streamRun.mock.calls[0][2]).toEqual(expect.objectContaining({ signal: expect.any(AbortSignal) }))
-    // The successful admission clears only the composer draft. It does not
-    // manufacture a conversation row while the stream is still quiet.
-    expect((composer as HTMLTextAreaElement).value).toBe('')
-    expect(screen.queryByRole('button', { name: 'Stop' })).toBeNull()
-    expect(view.container.querySelectorAll('.cursor')).toHaveLength(0)
-    expect((composer as HTMLTextAreaElement).disabled).toBe(true)
-    const blockedSend = screen.getByRole('button', { name: 'Send' }) as HTMLButtonElement
-    expect(blockedSend.disabled).toBe(true)
-    fireEvent.click(blockedSend)
-    expect(mocks.api.startRun).toHaveBeenCalledTimes(1)
-    expect(view.container.querySelectorAll('.message.user')).toHaveLength(0)
-
-    const onEvent = mocks.streamRun.mock.calls[0][1] as (event: unknown) => Promise<void> | void
-    const committedUserEvent = {
-      type: 'item.appended',
-      session_id: 'session-1',
-      run_id: 'authoritative-run',
-      seq: 1,
-      revision: '1',
-      item_id: 'backend-user-id',
-      item: {
-        id: 'backend-user-id',
-        seq: 1,
-        turn_id: 'turn-1',
-        created_at: '2026-01-01T00:00:00Z',
-        kind: 'message',
-        visibility: 'visible',
-        audience: 'user',
-        message: { role: 'user', content: { inline: 'submitted text' } },
-      },
+  it('waits for typed admission before connecting the run stream and does not manufacture a user row', async () => {
+    const { view, composer } = await renderContentReadyApp()
+    let resolveAdmission!: (value: unknown) => void
+    let admittedRunID = ''
+    view.transport.onSend = (message) => {
+      if (message.type === 'command' && message.payload.name === 'run.start') {
+        admittedRunID = String(message.payload.arguments.run_id)
+        resolveAdmission = (value) => view.transport.emit({ version: 1, type: 'command_result', id: 'run-result', payload: { request_id: message.payload.request_id, status: 'succeeded', result: value } } as unknown as ProtocolMessage)
+      }
     }
-    await act(async () => { await onEvent(committedUserEvent) })
-    expect(view.container.querySelectorAll('.message.user')).toHaveLength(1)
-    expect(screen.getByText('submitted text')).toBeTruthy()
-
-    // The replay, rather than the admission response, creates the transient
-    // run container. Subsequent deltas now have a place to accumulate.
-    await act(async () => {
-      await onEvent({ type: 'run.started', run_id: 'authoritative-run', session_id: 'session-1', turn_id: 'turn-1' })
-    })
-    expect(screen.getByRole('button', { name: 'Stop' })).toBeTruthy()
-    expect(view.container.querySelectorAll('.cursor')).toHaveLength(1)
-    expect(view.container.querySelectorAll('.reasoning-step')).toHaveLength(0)
-    expect((composer as HTMLTextAreaElement).disabled).toBe(false)
-    expect(screen.getByRole('button', { name: 'Append to current run' })).toBeTruthy()
-    await act(async () => {
-      await onEvent({ type: 'text.delta', turn_id: 'turn-1', agent_iteration: 1, text: 'assistant delta' })
-    })
-    await waitFor(() => expect(screen.getByText('assistant delta')).toBeTruthy())
-
-    // Replay/duplicate delivery is an upsert by the backend item id, not by
-    // message text or turn, and therefore remains one rendered item.
-    await act(async () => { await onEvent(committedUserEvent) })
-    expect(view.container.querySelectorAll('.message.user')).toHaveLength(1)
-    view.unmount()
-  })
-
-  it('tears down a covered settlement without an extra snapshot', async () => {
-    const { view, onEvent } = await renderSettlementApp()
-    await act(async () => {
-      await onEvent(projection('7'))
-      await onEvent({ type: 'run.settled', run_id: 'settlement-run', status: 'committed', committed_revision: '7' })
-      const lifecycleHandler = mocks.streamLifecycle.mock.calls[0][0] as (event: unknown) => Promise<void>
-      await lifecycleHandler({ type: 'run.settled', session_id: 'session-1', run_id: 'settlement-run', status: 'committed', committed_revision: '7' })
-    })
-    expect(mocks.api.snapshot).toHaveBeenCalledTimes(1)
-    await waitFor(() => expect(screen.queryByRole('button', { name: 'Stop' })).toBeNull())
-    expect(screen.getByText('durable answer')).toBeTruthy()
-    view.unmount()
-  })
-
-  it('applies covered settlement metadata to the shared store when the sidebar is stale', async () => {
-    const initial = {
-      ...emptySnapshot(),
-      session: {
-        ...mocks.session,
-        revision: '0',
-        last_seq: 0,
-        status: 'running',
-        current_run_id: 'settlement-run',
-        running_run_id: 'settlement-run',
-        running_turn_id: 'turn-1',
-      },
-    }
-    const { view, onEvent } = await renderSettlementApp([initial])
-    await act(async () => {
-      // This advances the shared projection/store revision, while the
-      // sidebar DTO remains at its older bootstrap revision.
-      await onEvent(projection('7'))
-      await onEvent({ type: 'run.settled', run_id: 'settlement-run', status: 'committed', committed_revision: '7' })
-    })
-    expect(mocks.api.snapshot).toHaveBeenCalledTimes(1)
-    await waitFor(() => expect(screen.getByLabelText('Session status: idle')).toBeTruthy())
-    expect(screen.queryByLabelText('Session status: running')).toBeNull()
-    view.unmount()
-  })
-
-  it('refreshes a lagging settlement and removes the run only after coverage', async () => {
-    const initial = emptySnapshot()
-    const repaired = {
-      ...emptySnapshot(),
-      revision: '2',
-      session: { ...mocks.session, revision: '2', last_seq: 2 },
-      history: {
-        items: [projection('2').item] as never[],
-        oldest_seq: 2,
-        newest_seq: 2,
-        has_more_before: false,
-        has_more_after: false,
-      },
-    }
-    const { view, onEvent } = await renderSettlementApp([initial, repaired])
-    await act(async () => {
-      await onEvent({ type: 'run.settled', run_id: 'settlement-run', status: 'committed', committed_revision: '2' })
-    })
-    await waitFor(() => expect(mocks.api.snapshot).toHaveBeenCalledTimes(2))
-    await waitFor(() => expect(screen.queryByRole('button', { name: 'Stop' })).toBeNull())
-    expect(screen.getByText('durable answer')).toBeTruthy()
-    view.unmount()
-  })
-
-  it('uses precision-safe comparison and keeps covered failed partial items', async () => {
-    const localRevision = '90071992547409929'
-    const committedRevision = '90071992547409930'
-    const initial = {
-      ...emptySnapshot(),
-      revision: localRevision,
-      session: { ...mocks.session, revision: localRevision, last_seq: 0 },
-    }
-    const { view, onEvent } = await renderSettlementApp([initial])
-    await act(async () => {
-      await onEvent(projection(committedRevision, 'partial answer'))
-      await onEvent({ type: 'run.settled', run_id: 'settlement-run', status: 'failed', committed_revision: committedRevision, message: 'failed after partial commit' })
-    })
-    expect(mocks.api.snapshot).toHaveBeenCalledTimes(1)
-    expect(screen.getByText('partial answer')).toBeTruthy()
-    await waitFor(() => expect(screen.queryByRole('button', { name: 'Stop' })).toBeNull())
-    view.unmount()
-  })
-
-  it('keeps covered cancelled partial items without a snapshot', async () => {
-    const { view, onEvent } = await renderSettlementApp([emptySnapshot()])
-    await act(async () => {
-      await onEvent(projection('4', 'cancelled partial'))
-      await onEvent({ type: 'run.settled', run_id: 'settlement-run', status: 'cancelled', committed_revision: '4' })
-    })
-    expect(mocks.api.snapshot).toHaveBeenCalledTimes(1)
-    expect(screen.getByText('cancelled partial')).toBeTruthy()
-    await waitFor(() => expect(screen.queryByRole('button', { name: 'Stop' })).toBeNull())
-    view.unmount()
-  })
-
-  it('conservatively refreshes an invalid settlement watermark and handles duplicate settlement', async () => {
-    const { view, onEvent } = await renderSettlementApp([emptySnapshot(), { ...emptySnapshot(), revision: '0' }])
-    await act(async () => {
-      await onEvent({ type: 'run.settled', run_id: 'settlement-run', status: 'committed', committed_revision: 'invalid' })
-      await onEvent({ type: 'run.settled', run_id: 'settlement-run', status: 'committed', committed_revision: 'invalid' })
-    })
-    await waitFor(() => expect(mocks.api.snapshot).toHaveBeenCalledTimes(2))
-    expect(screen.queryByRole('button', { name: 'Stop' })).toBeNull()
-    view.unmount()
-  })
-
-  it('receives an early item from the run replay without an optimistic active-run user row', async () => {
-    mocks.api.startRun.mockResolvedValue({ run_id: 'fast-run', session_id: 'session-1', status: 'running' })
-    const { view, composer } = await renderSubmitReadyApp()
-    mocks.streamRun.mockImplementation(async (_runID: string, onEvent: (event: unknown) => void | Promise<void>) => {
-      await onEvent({
-        type: 'item.appended', session_id: 'session-1', run_id: 'fast-run', seq: 1, revision: '1', item_id: 'fast-user-id',
-        item: {
-          id: 'fast-user-id', seq: 1, turn_id: 'turn-fast', created_at: '', kind: 'message', visibility: 'visible', audience: 'user',
-          message: { role: 'user', content: { inline: 'fast replay user' } },
-        },
-      })
-    })
-    fireEvent.change(composer, { target: { value: 'fast replay user' } })
+    mocks.streamRun.mockImplementation(() => new Promise<void>(() => {}))
+    fireEvent.change(composer, { target: { value: 'typed prompt' } })
     fireEvent.click(screen.getByRole('button', { name: 'Send' }))
-    await waitFor(() => expect(screen.getByText('fast replay user')).toBeTruthy())
-    expect(mocks.streamRun).toHaveBeenCalledTimes(1)
-    expect(mocks.streamRun.mock.calls[0][0]).toBe('fast-run')
+    await waitFor(() => expect(view.transport.sent.some((message) => message.type === 'command' && message.payload.name === 'run.start')).toBe(true))
+    expect(mocks.streamRun).not.toHaveBeenCalled()
     expect(view.container.querySelectorAll('.message.user')).toHaveLength(1)
+    resolveAdmission({ session_id: 'session-1', run_id: admittedRunID, status: 'running' })
+    await waitFor(() => expect(mocks.streamRun).toHaveBeenCalledTimes(1))
+    expect(mocks.streamRun.mock.calls[0][0]).toBe(admittedRunID)
+    expect(mocks.streamRun.mock.calls[0][2]).toEqual(expect.objectContaining({ signal: expect.any(AbortSignal) }))
     view.unmount()
   })
 
-  it('keeps the draft and does not connect or create a user row when admission fails', async () => {
-    mocks.api.startRun.mockRejectedValue(new Error('admission failed'))
-    const { view, composer } = await renderSubmitReadyApp()
+  it('does not connect or create a row when typed admission fails', async () => {
+    const { view, composer } = await renderContentReadyApp()
+    view.transport.onSend = (message) => { if (message.type === 'command' && message.payload.name === 'run.start') failProjectCommand(view.transport, message, 'admission_failed') }
     fireEvent.change(composer, { target: { value: 'retry me' } })
     fireEvent.click(screen.getByRole('button', { name: 'Send' }))
-
-    await waitFor(() => expect(screen.getByRole('alert').textContent).toContain('admission failed'))
+    await waitFor(() => expect(screen.getByRole('alert').textContent).toContain('Run operation failed.'))
     expect(mocks.streamRun).not.toHaveBeenCalled()
-    expect(view.container.querySelectorAll('.message.user')).toHaveLength(0)
-    expect((composer as HTMLTextAreaElement).value).toBe('retry me')
-    expect((composer as HTMLTextAreaElement).disabled).toBe(false)
+    expect(view.container.querySelectorAll('.message.user')).toHaveLength(1)
+    expect(composer.value).toBe('retry me')
     view.unmount()
   })
 
-  it('does not delete an existing run when a new admission fails during a lifecycle race', async () => {
-    const { view, composer } = await renderSubmitReadyApp([{
-      run_id: 'existing-run', session_id: 'session-1', turn_id: 'turn-existing', started_at: '', status: 'running',
-    }])
-    await waitFor(() => expect(mocks.streamRun).toHaveBeenCalledTimes(1))
-    const existingOnEvent = mocks.streamRun.mock.calls[0][1] as (event: unknown) => Promise<void> | void
-    await act(async () => {
-      await existingOnEvent({ type: 'turn.failed', turn_id: 'turn-existing', code: 'failed', message: 'existing run failed' })
-    })
-    await waitFor(() => expect(view.container.querySelector('.turn-error')).not.toBeNull())
-    expect(view.container.querySelectorAll('.message.assistant.transient')).toHaveLength(0)
-
-    let rejectAdmission!: (reason: unknown) => void
-    mocks.api.startRun.mockImplementation(() => new Promise((_resolve, reject) => { rejectAdmission = reject }))
-    fireEvent.change(composer, { target: { value: 'new attempt' } })
-    fireEvent.click(screen.getByRole('button', { name: 'Send' }))
-    await waitFor(() => expect(mocks.api.startRun).toHaveBeenCalledTimes(1))
-
-    const lifecycleHandler = mocks.streamLifecycle.mock.calls[0][0] as (event: unknown) => Promise<void>
-    await act(async () => {
-      await lifecycleHandler({ type: 'run.started', session_id: 'session-1', run_id: 'different-background-run', turn_id: 'turn-background' })
-    })
-    rejectAdmission(new Error('new admission failed'))
-    await waitFor(() => expect(view.container.querySelector('.error-banner')?.textContent).toContain('new admission failed'))
-
-    // Admission never owned existing-run, so its terminal error remains after
-    // the rejected attempt, without leaving an empty transient row.
-    expect(view.container.querySelector('.turn-error')).not.toBeNull()
-    expect(view.container.querySelectorAll('.message.assistant.transient')).toHaveLength(0)
-    view.unmount()
-  })
-
-  it('does not let a superseded run stream error pollute the current session', async () => {
+  it('gates old terminal replay while a newer typed admission is pending', async () => {
     mocks.api.activeRuns.mockResolvedValue({ runs: [{ run_id: 'old-run', session_id: 'session-1', turn_id: 'turn-old', started_at: '', status: 'running' }] })
-    mocks.api.snapshot.mockResolvedValue({
-      ...emptySnapshot(),
-      session: { ...mocks.session, status: 'running', current_run_id: 'old-run', running_run_id: 'old-run', running_turn_id: 'turn-old' },
-    })
-    mocks.api.startRun.mockResolvedValue({ run_id: 'new-run', session_id: 'session-1', status: 'running' })
-    mocks.streamRun.mockReset()
-    let rejectOld!: (reason: unknown) => void
-    mocks.streamRun.mockImplementation(async (runID: string, _handler: (event: unknown) => void | Promise<void>) => {
-      if (runID === 'old-run') return await new Promise<void>((_resolve, reject) => { rejectOld = reject })
-      return await new Promise<void>(() => {})
-    })
-
+    const handlers: Array<(event: unknown) => Promise<void> | void> = []
+    mocks.streamRun.mockImplementation(async (_runID: string, handler: (event: unknown) => Promise<void> | void) => { handlers.push(handler) })
     const view = renderApp()
-    applySessionIndexAuthority(view, {
-      session_id: 'session-1', project_id: 'project-1', parent_session_id: null, display_name: 'session-1',
-      archived: false, status: 'running', run_id: 'old-run', resource_revision: '1', updated_at: '2026-01-01T00:00:01Z', has_unread_result: false,
-    })
-    const composer = await screen.findByRole('textbox')
-    await waitFor(() => expect(mocks.streamRun).toHaveBeenCalledTimes(1))
-    const oldHandler = mocks.streamRun.mock.calls[0][1] as (event: unknown) => Promise<void> | void
-    await act(async () => { await oldHandler({ type: 'turn.failed', turn_id: 'turn-old', code: 'failed', message: 'old failure' }) })
-    await waitFor(() => expect(view.container.querySelector('.turn-error')).not.toBeNull())
-    expect(view.container.querySelectorAll('.message.assistant.transient')).toHaveLength(0)
-
-    fireEvent.change(composer, { target: { value: 'new attempt' } })
+    await screen.findByRole('textbox')
+    await act(async () => { applySessionContentAuthority(view) })
+    const composer = screen.getByRole('textbox') as HTMLTextAreaElement
+    await waitFor(() => expect(handlers).toHaveLength(1))
+    let resolveAdmission!: (value: unknown) => void
+    view.transport.onSend = (message) => {
+      if (message.type !== 'command' || message.payload.name !== 'run.start') return
+      resolveAdmission = (value) => view.transport.emit({ version: 1, type: 'command_result', id: 'new-result', payload: { request_id: message.payload.request_id, status: 'succeeded', result: value } } as unknown as ProtocolMessage)
+    }
+    await act(async () => { await handlers[0]({ type: 'run.settled', run_id: 'old-run', status: 'committed' }) })
+    fireEvent.change(composer, { target: { value: 'new prompt' } })
     fireEvent.click(screen.getByRole('button', { name: 'Send' }))
-    await waitFor(() => expect(mocks.streamRun).toHaveBeenCalledTimes(2))
-    const newHandler = mocks.streamRun.mock.calls[1][1] as (event: unknown) => Promise<void> | void
-    await act(async () => { await newHandler({ type: 'run.started', run_id: 'new-run', session_id: 'session-1', turn_id: 'turn-new' }) })
-
-    // A stale reader can still deliver events after the newer run has taken
-    // the session slot.  Transient terminal events are ignored, while a
-    // committed projection from this old stream remains valid durable data.
-    await act(async () => {
-      await oldHandler({
-        type: 'item.appended', session_id: 'session-1', run_id: 'old-run', seq: 1, revision: '1', item_id: 'old-durable-item',
-        item: {
-          id: 'old-durable-item', seq: 1, turn_id: 'turn-old', created_at: '', kind: 'message', visibility: 'visible', audience: 'model',
-          message: { role: 'assistant', content: { inline: 'durable old output' } },
-        },
-      })
-      await oldHandler({ type: 'turn.failed', turn_id: 'turn-old', code: 'failed', message: 'late old failure' })
-      await oldHandler({ type: 'run.settled', run_id: 'old-run', status: 'committed', committed_revision: '9', message: 'late old settlement' })
-    })
-    expect(screen.getByText('durable old output')).toBeTruthy()
-    expect(screen.queryByText('late old failure')).toBeNull()
-    expect(view.container.querySelector('.turn-error')).toBeNull()
-    expect(screen.queryByRole('alert')).toBeNull()
-    expect(screen.getByRole('button', { name: 'Stop' })).toBeTruthy()
-    expect(screen.getByLabelText('Session status: running')).toBeTruthy()
-
-    // The old reader rejects after the new authoritative run has taken over.
-    // It may clean up its own connection, but must not create a global error
-    // banner or alter the new run's transient state.
-    await act(async () => { rejectOld(new Error('old stream disconnected')) })
-    await waitFor(() => expect(screen.getByRole('button', { name: 'Stop' })).toBeTruthy())
-    expect(screen.queryByRole('alert')).toBeNull()
+    await waitFor(() => expect(view.transport.sent.filter((message) => message.type === 'command' && message.payload.name === 'run.start')).toHaveLength(1))
+    await act(async () => { await handlers[0]({ type: 'run.settled', run_id: 'old-run', status: 'committed' }) })
+    expect(composer.disabled).toBe(true)
+    const newRunCommand = view.transport.sent.filter((message) => message.type === 'command' && message.payload.name === 'run.start').at(-1)
+    const newRunID = newRunCommand?.type === 'command' ? String(newRunCommand.payload.arguments.run_id) : ''
+    resolveAdmission({ session_id: 'session-1', run_id: newRunID, status: 'running' })
+    await waitFor(() => expect(handlers).toHaveLength(2))
+    expect(mocks.streamRun.mock.calls[1][0]).toBe(newRunID)
     view.unmount()
   })
 
-  it('keeps a pending new admission gated when an old terminal replay arrives', async () => {
-    mocks.api.activeRuns.mockResolvedValue({ runs: [{ run_id: 'old-run', session_id: 'session-1', turn_id: 'turn-old', started_at: '', status: 'running' }] })
-    mocks.api.snapshot.mockResolvedValue({
-      ...emptySnapshot(),
-      session: { ...mocks.session, status: 'running', current_run_id: 'old-run', running_run_id: 'old-run', running_turn_id: 'turn-old' },
-    })
-    let resolveAdmission!: (value: { run_id: string; session_id: string; status: string }) => void
-    mocks.api.startRun.mockImplementation(() => new Promise((resolve) => { resolveAdmission = resolve }))
-    mocks.streamRun.mockReset()
-    let rejectOld!: (reason: unknown) => void
-    mocks.streamRun.mockImplementation(async (runID: string, _handler: (event: unknown) => void | Promise<void>) => {
-      if (runID === 'old-run') return await new Promise<void>((_resolve, reject) => { rejectOld = reject })
-      return await new Promise<void>(() => {})
-    })
-
+  it('lets Session Content, not the run adapter, publish partial failed/cancelled items and ignores duplicate settlement', async () => {
+    mocks.api.activeRuns.mockResolvedValue({ runs: [{ run_id: 'settle-run', session_id: 'session-1', turn_id: 'turn-1', started_at: '', status: 'running' }] })
+    const handlers: Array<(event: unknown) => Promise<void> | void> = []
+    mocks.streamRun.mockImplementation(async (_runID: string, handler: (event: unknown) => Promise<void> | void) => { handlers.push(handler) })
     const view = renderApp()
-    applySessionIndexAuthority(view, {
-      session_id: 'session-1', project_id: 'project-1', parent_session_id: null, display_name: 'session-1',
-      archived: false, status: 'running', run_id: 'old-run', resource_revision: '1', updated_at: '2026-01-01T00:00:01Z', has_unread_result: false,
+    await screen.findByRole('textbox')
+    await act(async () => { applySessionContentAuthority(view) })
+    await waitFor(() => expect(handlers).toHaveLength(1))
+    const partial = { key: { turn_id: 'turn-1', agent_iteration: 1, item_id: 'partial-item' }, seq: 1, created_at: '2026-01-01T00:00:01Z', kind: 'message', visibility: 'visible', audience: 'model', message: { role: 'assistant', content: { inline: 'partial authority' } } }
+    await act(async () => { applySessionContentAuthorityFor(view, 'session-1', { status: 'failed' }, '2', [partial]) })
+    await waitFor(() => expect(screen.getByText('partial authority')).toBeTruthy())
+    await act(async () => {
+      await handlers[0]({ type: 'run.settled', run_id: 'settle-run', status: 'failed', committed_revision: '2' })
+      await handlers[0]({ type: 'run.settled', run_id: 'settle-run', status: 'failed', committed_revision: '2' })
     })
-    const composer = await screen.findByRole('textbox')
-    await waitFor(() => expect(mocks.streamRun).toHaveBeenCalledTimes(1))
-    const oldHandler = mocks.streamRun.mock.calls[0][1] as (event: unknown) => Promise<void> | void
-    await act(async () => { await oldHandler({ type: 'turn.failed', turn_id: 'turn-old', code: 'failed', message: 'old failure' }) })
+    expect(screen.getAllByText('partial authority')).toHaveLength(1)
+    expect(view.application.repositories.sessionContent.get('session-1').history.items.some((item) => item.key.item_id === 'partial-item')).toBe(true)
+    view.unmount()
+  })
 
+  it('keeps a cancelled partial item in Session Content and does not project it from settlement', async () => {
+    mocks.api.activeRuns.mockResolvedValue({ runs: [{ run_id: 'cancel-run', session_id: 'session-1', turn_id: 'turn-cancel', started_at: '', status: 'running' }] })
+    const handlers: Array<(event: unknown) => Promise<void> | void> = []
+    mocks.streamRun.mockImplementation(async (_runID: string, handler: (event: unknown) => Promise<void> | void) => { handlers.push(handler) })
+    const view = renderApp()
+    await screen.findByRole('textbox')
+    await act(async () => { applySessionContentAuthority(view) })
+    await waitFor(() => expect(handlers).toHaveLength(1))
+    const partial = { key: { turn_id: 'turn-cancel', agent_iteration: 1, item_id: 'cancelled-item' }, seq: 1, created_at: '2026-01-01T00:00:01Z', kind: 'message', visibility: 'visible', audience: 'model', message: { role: 'assistant', content: { inline: 'cancelled authority' } } }
+    await act(async () => { applySessionContentAuthorityFor(view, 'session-1', { status: 'interrupted' }, '2', [partial]) })
+    await waitFor(() => expect(screen.getByText('cancelled authority')).toBeTruthy())
+    await act(async () => { await handlers[0]({ type: 'run.settled', run_id: 'cancel-run', status: 'cancelled', committed_revision: '2' }) })
+    expect(screen.getAllByText('cancelled authority')).toHaveLength(1)
+    expect(view.application.repositories.sessionContent.get('session-1').history.items.some((item) => item.key.item_id === 'cancelled-item')).toBe(true)
+    expect(mocks.api.snapshot).not.toHaveBeenCalled()
+    view.unmount()
+  })
+
+  it('keeps late superseded stream frames out of the current run-control UI', async () => {
+    mocks.api.activeRuns.mockResolvedValue({ runs: [{ run_id: 'old-run', session_id: 'session-1', turn_id: 'turn-old', started_at: '', status: 'running' }] })
+    const handlers: Array<(event: unknown) => Promise<void> | void> = []
+    mocks.streamRun.mockImplementation(async (_runID: string, handler: (event: unknown) => Promise<void> | void) => { handlers.push(handler) })
+    const view = renderApp()
+    await screen.findByRole('textbox')
+    await act(async () => { applySessionContentAuthority(view) })
+    await waitFor(() => expect(handlers).toHaveLength(1))
+    const composer = screen.getByRole('textbox') as HTMLTextAreaElement
+    view.transport.onSend = (message) => {
+      if (message.type !== 'command' || message.payload.name !== 'run.start') return
+      const runID = String(message.payload.arguments.run_id)
+      view.transport.emit({
+        version: 1, type: 'command_result', id: `run-result-${runID}`,
+        payload: { request_id: message.payload.request_id, status: 'succeeded', result: { session_id: 'session-1', run_id: runID, status: 'running' } },
+      } as unknown as ProtocolMessage)
+    }
+    await act(async () => { await handlers[0]({ type: 'turn.failed', turn_id: 'turn-old', message: 'old failure' }) })
+    await waitFor(() => expect(screen.getByRole('alert')).toBeTruthy())
     fireEvent.change(composer, { target: { value: 'new admission' } })
     fireEvent.click(screen.getByRole('button', { name: 'Send' }))
-    await waitFor(() => expect(mocks.api.startRun).toHaveBeenCalledTimes(1))
-    expect((composer as HTMLTextAreaElement).disabled).toBe(true)
-
-    // There is no ActiveRun for the new run yet.  The old
-    // terminal replay must not clear awaitingRunStarted or mark the sidebar
-    // idle, and a second click must not submit another POST.
-    await act(async () => { await oldHandler({ type: 'run.settled', run_id: 'old-run', status: 'committed', committed_revision: '9' }) })
-    expect((composer as HTMLTextAreaElement).disabled).toBe(true)
-    const lifecycleHandler = mocks.streamLifecycle.mock.calls[0][0] as (event: unknown) => Promise<void>
+    await waitFor(() => expect(handlers).toHaveLength(2))
+    await act(async () => { await handlers[1]({ type: 'run.started', run_id: String((view.transport.sent.filter((message) => message.type === 'command' && message.payload.name === 'run.start').at(-1) as Extract<ProtocolMessage, { type: 'command' }>)?.payload.arguments.run_id), session_id: 'session-1', turn_id: 'turn-new' }) })
     await act(async () => {
-      await lifecycleHandler({
-        type: 'run.settled', session_id: 'session-1', run_id: 'old-run', status: 'committed', committed_revision: '9',
-        session: { ...mocks.session, status: 'idle', current_run_id: undefined, running_run_id: undefined },
-      })
+      await handlers[0]({ type: 'item.appended', session_id: 'session-1', run_id: 'old-run', item_id: 'old-item', item: { id: 'old-item', seq: 2, turn_id: 'turn-old', kind: 'message', visibility: 'visible', audience: 'model', message: { role: 'assistant', content: { inline: 'old stream output' } } } })
+      await handlers[0]({ type: 'turn.failed', turn_id: 'turn-old', message: 'late old failure' })
+      await handlers[0]({ type: 'run.settled', run_id: 'old-run', status: 'committed' })
     })
-    expect(screen.getByLabelText('Session status: running')).toBeTruthy()
-    fireEvent.click(screen.getByRole('button', { name: 'Send' }))
-    expect(mocks.api.startRun).toHaveBeenCalledTimes(1)
-
-    resolveAdmission({ run_id: 'new-run', session_id: 'session-1', status: 'running' })
-    await waitFor(() => expect(mocks.streamRun).toHaveBeenCalledTimes(2))
-    expect(mocks.streamRun.mock.calls[1][0]).toBe('new-run')
-    const newHandler = mocks.streamRun.mock.calls[1][1] as (event: unknown) => Promise<void> | void
-    await act(async () => { await newHandler({ type: 'run.started', run_id: 'new-run', session_id: 'session-1', turn_id: 'turn-new' }) })
-    expect((composer as HTMLTextAreaElement).disabled).toBe(false)
-
-    await act(async () => { rejectOld(new Error('old stream closed')) })
+    expect(screen.queryByText('old stream output')).toBeNull()
+    expect(screen.queryByText('late old failure')).toBeNull()
     expect(screen.queryByRole('alert')).toBeNull()
+    // The current conversation's live controls are owned by Session Content;
+    // this legacy stream is intentionally not allowed to manufacture a
+    // second transient row after the authority cutover.
+    expect(screen.queryByRole('button', { name: 'Stop' })).toBeNull()
     view.unmount()
   })
 
-  it('keeps a lagging run through bounded refresh failures', async () => {
-    const { view, onEvent } = await renderSettlementApp([emptySnapshot()])
-    vi.useFakeTimers()
-    await act(async () => {
-      await onEvent({ type: 'run.settled', run_id: 'settlement-run', status: 'committed', committed_revision: '9' })
-    })
-    expect(mocks.api.snapshot).toHaveBeenCalledTimes(2)
-    expect(view.container.querySelectorAll('.message.assistant.transient')).toHaveLength(0)
-
-    await act(async () => { await vi.advanceTimersByTimeAsync(5000) })
-    // Initial refresh plus only the bounded retry budget. The overlay is
-    // still present; only the terminal timeout/manual action may clear it.
-    expect(mocks.api.snapshot.mock.calls.length).toBeGreaterThanOrEqual(2)
-    expect(mocks.api.snapshot.mock.calls.length).toBeLessThanOrEqual(4)
-    expect(view.container.querySelectorAll('.message.assistant.transient')).toHaveLength(0)
-    view.unmount()
-  })
-
-  it('shows a background completion from Session Index without a lifecycle or run settled event', async () => {
-    mocks.api.activeRuns.mockResolvedValue({ runs: [] })
+  it('keeps typed queue and tool controls on the run-control adapter without local content writes', async () => {
+    mocks.api.activeRuns.mockResolvedValue({ runs: [{ run_id: 'control-run', session_id: 'session-1', turn_id: 'turn-control', started_at: '', status: 'running' }] })
+    mocks.streamRun.mockResolvedValue(undefined)
     const view = renderApp()
     await screen.findByRole('textbox')
-    const lifecycleCalls = mocks.streamLifecycle.mock.calls.length
-    const runCalls = mocks.streamRun.mock.calls.length
-    await act(async () => { applySessionIndexAuthority(view, {
-      session_id: 'session-2', project_id: 'project-1', parent_session_id: null, display_name: 'background-session',
-      archived: false, status: 'running', run_id: 'background-run', resource_revision: '1',
-      updated_at: '2026-01-01T00:00:01Z', has_unread_result: false,
-    }) })
-    await screen.findByText('background-session')
-    await act(async () => { applySessionIndexAuthority(view, {
-      session_id: 'session-2', project_id: 'project-1', parent_session_id: null, display_name: 'background-session',
-      archived: false, status: 'completed', run_id: 'background-run', resource_revision: '2',
-      updated_at: '2026-01-01T00:00:02Z', has_unread_result: true,
-    }, '2') })
-    await waitFor(() => expect(screen.getByText('background-session completed in the background.')).toBeTruthy())
-    expect(mocks.streamLifecycle).toHaveBeenCalledTimes(lifecycleCalls)
-    expect(mocks.streamRun).toHaveBeenCalledTimes(runCalls)
+    const activeRun = { run_id: 'control-run', session_id: 'session-1', turn_id: 'turn-control', started_at: '2026-01-01T00:00:00Z', status: 'running', recoverable: true, run_epoch: 'epoch-control', run_cursor: '0', replay_available: false, recovery_required: false }
+    await act(async () => { applySessionContentAuthorityFor(view, 'session-1', { status: 'running', running_run_id: 'control-run', running_turn_id: 'turn-control' }, '1', undefined, activeRun) })
+    const composer = screen.getByRole('textbox') as HTMLTextAreaElement
+    const applyContentEvent = (event: Record<string, unknown>) => view.application.replica.applyTransient(
+      { type: 'session_content', id: 'session-1' }, new SessionContentAdapter('session-1'), event as never, 1,
+    )
+    view.transport.onSend = (message) => {
+      if (message.type !== 'command') return
+      const args = message.payload.arguments as Record<string, unknown>
+      let result: Record<string, unknown> = { session_id: 'session-1', run_id: String(args.run_id ?? ''), accepted: true }
+      if (message.payload.name === 'run.start') result = { session_id: 'session-1', run_id: String(args.run_id), status: 'running' }
+      if (message.payload.name === 'run.prompt.append') result = { operation_id: String(args.operation_id), session_id: 'session-1', run_id: String(args.run_id), accepted: true }
+      if (message.payload.name === 'run.prompt.remove') result = { session_id: 'session-1', run_id: String(args.run_id), prompt_id: String(args.prompt_id), removed: true }
+      if (message.payload.name === 'run.tool.cancel') result = { session_id: 'session-1', run_id: String(args.run_id), tool_call_id: String(args.tool_call_id), cancelled: true }
+      view.transport.emit({ version: 1, type: 'command_result', id: `control-result-${message.payload.request_id}`, payload: { request_id: message.payload.request_id, status: 'succeeded', result } } as unknown as ProtocolMessage)
+    }
+    await act(async () => {
+      applyContentEvent({ type: 'tool.requested', session_id: 'session-1', run_id: 'control-run', run_cursor: '1', turn_id: 'turn-control', agent_iteration: 1, tool_call_id: 'tool-1', name: 'shell', arguments: '{"command":"echo control"}' })
+      applyContentEvent({ type: 'tool.running', session_id: 'session-1', run_id: 'control-run', run_cursor: '2', turn_id: 'turn-control', agent_iteration: 1, tool_call_id: 'tool-1', name: 'shell', arguments: '{"command":"echo control"}' })
+      applyContentEvent({ type: 'run.prompt_queue', session_id: 'session-1', run_id: 'control-run', run_cursor: '3', turn_id: 'turn-control', prompts: [{ id: 'prompt-1', content: 'queued control', steer: false }] })
+    })
+    await waitFor(() => expect(screen.getByText('queued control')).toBeTruthy())
+    fireEvent.change(composer, { target: { value: 'follow-up' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Append to current run' }))
+    await waitFor(() => expect(view.transport.sent.some((message) => message.type === 'command' && message.payload.name === 'run.prompt.append')).toBe(true))
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel tool' }))
+    await waitFor(() => expect(view.transport.sent.some((message) => message.type === 'command' && message.payload.name === 'run.tool.cancel')).toBe(true))
+    fireEvent.click(screen.getByRole('button', { name: 'Remove queued message' }))
+    await waitFor(() => expect(view.transport.sent.some((message) => message.type === 'command' && message.payload.name === 'run.prompt.remove')).toBe(true))
+    expect(mocks.api.snapshot).not.toHaveBeenCalled()
     view.unmount()
   })
 
-  it('does not refresh the selected session for a covered background settlement', async () => {
-    const background = { ...mocks.session, id: 'session-2', display_name: 'background-session', revision: '5', last_seq: 5 }
-    let activeRunsCalls = 0
-    mocks.api.activeRuns.mockImplementation(async () => {
-      activeRunsCalls += 1
-      return activeRunsCalls === 1
-        ? { runs: [] }
-        : { runs: [{ run_id: 'background-run', session_id: 'session-2', turn_id: 'turn-2', started_at: '', status: 'running' }] }
-    })
-    // Coverage is only established by a snapshot. Prime the background
-    // session's empty history, then return to the selected session before its
-    // run settles; a pre-snapshot projection queue must not make this test
-    // accidentally prove coverage.
-    mocks.api.snapshot.mockReset().mockImplementation(async (sessionID: string) => sessionID === 'session-2'
-      ? {
-        session_id: 'session-2',
-        revision: '5',
-        session: background,
-        history: { items: [], oldest_seq: 0, newest_seq: 0, has_more_before: false, has_more_after: false },
-      }
-      : emptySnapshot())
-    mocks.streamRun.mockReset().mockImplementation(async (_runID: string, onEvent: (event: unknown) => void | Promise<void>) => {
-      await onEvent({
-        type: 'item.appended', session_id: 'session-2', seq: 1, revision: '5', item_id: 'background-item',
-        item: { id: 'background-item', seq: 1, kind: 'message', visibility: 'visible', audience: 'model', message: { role: 'assistant', content: { inline: 'background answer' } } },
-      })
-      await onEvent({ type: 'run.settled', run_id: 'background-run', status: 'committed', committed_revision: '5' })
-    })
-    const view = renderApp()
-    await screen.findByRole('textbox')
-    applySessionIndexAuthority(view, {
-      session_id: 'session-2', project_id: 'project-1', parent_session_id: null, display_name: 'background-session',
-      archived: false, status: 'running', run_id: 'background-run', resource_revision: '5', updated_at: '2026-01-01T00:00:05Z', has_unread_result: false,
-    })
-    await screen.findByText('background-session')
-    const snapshotsBeforeBackground = mocks.api.snapshot.mock.calls.length
-    fireEvent.click(screen.getByText('background-session'))
-    await waitFor(() => expect(mocks.api.snapshot.mock.calls.length).toBeGreaterThan(snapshotsBeforeBackground))
-    const snapshotsBeforeReturn = mocks.api.snapshot.mock.calls.length
-    fireEvent.click(screen.getByText('session-1'))
-    await waitFor(() => expect(mocks.api.snapshot.mock.calls.length).toBeGreaterThan(snapshotsBeforeReturn))
-    const snapshotsBeforeSettlement = mocks.api.snapshot.mock.calls.length
-    const lifecycleHandler = mocks.streamLifecycle.mock.calls[0][0] as (event: unknown) => Promise<void>
-    await act(async () => {
-      await lifecycleHandler({
-        type: 'run.started', session_id: 'session-2', run_id: 'background-run', status: 'running', session: background,
-      })
-    })
-    await waitFor(() => expect(mocks.streamRun).toHaveBeenCalledTimes(1))
-    applySessionIndexAuthority(view, {
-      session_id: 'session-2', project_id: 'project-1', parent_session_id: null, display_name: 'background-session',
-      archived: false, status: 'completed', run_id: 'background-run', resource_revision: '6', updated_at: '2026-01-01T00:00:06Z', has_unread_result: true,
-    }, '2')
-    await waitFor(() => expect(screen.getByText('background-session')).toBeTruthy())
-    expect(screen.getByLabelText('Unread result')).toBeTruthy()
-    expect(screen.getAllByText(/completed/).length).toBeGreaterThan(0)
-    expect(mocks.api.snapshot).toHaveBeenCalledTimes(snapshotsBeforeSettlement)
+  it('keeps background Session Index completion independent of current Session Content reads', async () => {
+    const { view } = await renderContentReadyApp()
+    const snapshotsBefore = mocks.api.snapshot.mock.calls.length
+    const background: SessionSummary = { session_id: 'session-2', project_id: 'project-1', parent_session_id: null, display_name: 'background', archived: false, status: 'running', run_id: 'background-run', resource_revision: '1', updated_at: '2026-01-01T00:00:01Z', has_unread_result: false }
+    await act(async () => { applySessionIndexAuthority(view, background, '1') })
+    await act(async () => { applySessionIndexAuthority(view, { ...background, status: 'completed', resource_revision: '2', has_unread_result: true }, '2') })
+    await waitFor(() => expect(screen.getByText('background completed in the background.')).toBeTruthy())
+    expect(mocks.api.snapshot.mock.calls.length).toBe(snapshotsBefore)
+    expect(view.application.repositories.sessionContent.get('session-1').session?.id).toBe('session-1')
     view.unmount()
   })
+
+
 })
-

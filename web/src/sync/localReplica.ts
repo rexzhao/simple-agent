@@ -29,6 +29,15 @@ export interface ResourceAdapter<T, TTransient = unknown> {
   validateResourceRevision?(revision: string): void
   decodeSnapshot(value: unknown, previous: T | undefined, context?: ReplicaApplyContext): T
   applyChange(previous: T, operations: readonly ChangeOperation[], context?: ReplicaApplyContext): T
+  /**
+   * A resource-level authority reset can make repository-retained ranges
+   * invalid even when the resource generation is unchanged.  This hook keeps
+   * that decision with the resource adapter instead of making LocalReplica
+   * understand history/compaction protocol details.
+   */
+  shouldInvalidateRetainedWindow?(operations: readonly ChangeOperation[]): boolean
+  /** A complete snapshot is itself a retained-window barrier for this resource. */
+  retainedWindowInvalidatedBySnapshot?(): boolean
   applyTransient?(previous: T, event: TTransient, context?: ReplicaApplyContext): T
   clearTransient?(previous: T): T
   getTransientResume?(previous: T): TransientResumeToken | undefined
@@ -81,7 +90,12 @@ export function resourceKeyFromString(value: string): ResourceKey | undefined {
   }
 }
 
-type ReplicaListener = (resource: ResourceKey) => void
+export interface ReplicaNotification {
+  /** The resource authority replaced a retained window or was evicted. */
+  readonly retainedWindowInvalidated?: boolean
+}
+
+type ReplicaListener = (resource: ResourceKey, notification?: ReplicaNotification) => void
 
 /**
  * Transactional normalized replica. Resource values are only replaced after
@@ -246,7 +260,14 @@ export class LocalReplica {
       },
     }
     this.records.set(key, next)
-    if (!sameReadModelState(current, next)) this.notify(resource)
+    // A resource may declare a complete snapshot to be an authority barrier.
+    // Retained page/blob ranges then belong to the previous snapshot even
+    // when the server reuses the same resource generation. Even an
+    // equal-looking replacement must be observable in that case.
+    const retainedWindowInvalidated = adapter.retainedWindowInvalidatedBySnapshot?.() ?? false
+    if (!sameReadModelState(current, next) || retainedWindowInvalidated) {
+      this.notify(resource, { retainedWindowInvalidated })
+    }
   }
 
   applyChange<T>(
@@ -259,8 +280,10 @@ export class LocalReplica {
     const current = this.records.get(key)
     if (!current?.initialized) throw new SyncReadError('invalid_change', 'change arrived before a resource snapshot', key)
     let value: T
+    let retainedWindowInvalidated = false
     try {
       adapter.validateResourceRevision?.(metadata.resourceRevision)
+      retainedWindowInvalidated = adapter.shouldInvalidateRetainedWindow?.(operations) ?? false
       value = adapter.applyChange(current.value as T, operations, {
         resource,
         resourceRevision: metadata.resourceRevision,
@@ -279,7 +302,7 @@ export class LocalReplica {
       },
     }
     this.records.set(key, next)
-    if (!sameReadModelState(current, next)) this.notify(resource)
+    if (!sameReadModelState(current, next) || retainedWindowInvalidated) this.notify(resource, { retainedWindowInvalidated })
   }
 
   /** Apply a transient subscription event without changing durable sequence metadata. */
@@ -363,18 +386,23 @@ export class LocalReplica {
     if (existing && !sameReadModelState(existing, next)) this.notify(resource)
   }
 
-  /** Remove an unowned normalized resource and notify only if its read model existed. */
+  /**
+   * Remove an unowned normalized resource.  Loading/error records are also
+   * observable state: a repository may retain a page operation independently
+   * of an initialized snapshot, and eviction must invalidate that operation's
+   * cached view rather than silently allowing it to reappear.
+   */
   evict(resource: ResourceKey): void {
     const key = resourceKeyString(resource)
     const old = this.records.get(key)
     if (!old) return
     this.records.delete(key)
-    if (old.initialized) this.notify(resource)
+    this.notify(resource, { retainedWindowInvalidated: true })
   }
 
-  private notify(resource: ResourceKey): void {
+  private notify(resource: ResourceKey, notification?: ReplicaNotification): void {
     for (const listener of [...this.listeners]) {
-      try { listener(resource) } catch { /* one observer cannot abort the commit */ }
+      try { listener(resource, notification) } catch { /* one observer cannot abort the commit */ }
     }
   }
 }

@@ -304,7 +304,16 @@ function decodeHistoryPage(value: unknown): ItemsPage {
   }
 }
 
-function decodeHistoryReadResult(value: unknown, sessionID: string, expectedCursor: number, expectedDirection: '' | 'before' | 'after', expectedLimit: number, expectedAlignTurn: boolean): SessionHistoryReadResult {
+function decodeHistoryReadResult(
+  value: unknown,
+  sessionID: string,
+  expectedCursor: number,
+  expectedDirection: '' | 'before' | 'after',
+  expectedLimit: number,
+  expectedAlignTurn: boolean,
+  blobClient?: BlobClient,
+  signal?: AbortSignal,
+): SessionHistoryReadResult | Promise<SessionHistoryReadResult> {
   const object = exactObject(value, ['session_id', 'cursor', 'direction', 'limit', 'align_turn', 'history', 'blob'])
   const resultSessionID = resultString(object, 'session_id')
   const cursor = resultSafeInteger(object, 'cursor', 0, Number.MAX_SAFE_INTEGER)
@@ -319,7 +328,7 @@ function decodeHistoryReadResult(value: unknown, sessionID: string, expectedCurs
   const history = hasHistory ? decodeHistoryPage(object.history) : null
   const blob = hasBlob ? decodeBlobDescriptor(object.blob) : null
   if (blob !== null && blob.content_type !== 'application/json') throw new Error('result history blob content type is invalid')
-  return {
+  const result = {
     session_id: resultSessionID,
     cursor,
     direction: direction as '' | 'before' | 'after',
@@ -328,6 +337,11 @@ function decodeHistoryReadResult(value: unknown, sessionID: string, expectedCurs
     history,
     blob,
   }
+  if (!blob) return result
+  if (!blobClient) throw new Error('result history blob has no data-plane client')
+  // Resolve the data-plane payload inside the typed command boundary. A page
+  // receives a normal history page and never receives or parses a descriptor.
+  return blobClient.getJSON(blob, { signal }).then((payload) => ({ ...result, history: decodeHistoryPage(payload) }))
 }
 
 function decodeMarkReadResult(value: unknown, sessionID: string, runID: string): SessionMarkReadResult {
@@ -746,7 +760,7 @@ export class CommandFacade implements SessionCommands, RunCommands, ProjectComma
       if (typeof historyOptions.alignTurn !== 'boolean') return Promise.reject(new CommandFacadeError('invalid', 'align_turn is invalid'))
       args.align_turn = historyOptions.alignTurn
     }
-    return this.submit('session.history.read', args, true, (value) => decodeHistoryReadResult(value, cleanSessionID, cursor ?? 0, direction ?? '', historyOptions.limit ?? 50, historyOptions.alignTurn ?? false), commandOptions)
+    return this.submit('session.history.read', args, true, (value, signal) => decodeHistoryReadResult(value, cleanSessionID, cursor ?? 0, direction ?? '', historyOptions.limit ?? 50, historyOptions.alignTurn ?? false, this.blobClient, signal), commandOptions)
   }
 
   readHistory(sessionID: string, historyOptions: SessionHistoryReadOptions = {}, commandOptions: CommandOptions = {}): Promise<SessionHistoryReadResult> {

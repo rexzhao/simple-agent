@@ -42,6 +42,14 @@ export type ConversationRow =
     run: ActiveRun
   })
   | (ConversationRowBase & {
+    /** One transient assistant identity for which the durable item has not
+     * arrived yet. Never aggregate these rows by text or array position. */
+    kind: 'active-assistant'
+    run: ActiveRun
+    identity: { turnID: string; agentIteration: number; itemID: string }
+    text: string
+  })
+  | (ConversationRowBase & {
     kind: 'active-compaction'
     compaction: NonNullable<ActiveRun['compaction']>
   })
@@ -98,6 +106,25 @@ export function buildConversationRows(input: BuildConversationRowsInput): Conver
     }
   })
   const assistantBinding = activeRun ? activeAssistantBinding(activeRun) : undefined
+  const contentTails = activeRun?.assistantTails ?? {}
+  const contentTailKeys = new Set(Object.keys(contentTails))
+  const durableAssistantItems = new Map(input.items
+    .filter((item) => item.message?.role === 'assistant')
+    .map((item) => [sessionItemIdentityKey(item), item]))
+  const durableAssistantKeys = new Set(durableAssistantItems.keys())
+  const contentTailMergedKeys = new Set([...contentTailKeys].filter((key) => {
+    const item = durableAssistantItems.get(key)
+    const tail = contentTails[key]
+    const inline = item?.message?.content?.inline
+    // The repository has already merged the checkpointed portion (and the
+    // remaining transient portion) into inline content.  Any increase beyond
+    // the identity's base watermark therefore means this row already owns the
+    // tail.  This is a protocol length check, not text matching; equality is
+    // the only state in which the repository has no inline tail to render.
+    // Blob/preview content cannot be concatenated by the page, so its keyed
+    // tail remains presentation-owned below.
+    return inline !== undefined && tail !== undefined && inline.length > tail.durableTextLength
+  }))
   // The binding is an explicit backend-provided item id. The page may not yet
   // contain that item during the append/snapshot race; only then do we retain
   // the process-row fallback. Never infer this relationship from text or turn
@@ -105,13 +132,33 @@ export function buildConversationRows(input: BuildConversationRowsInput): Conver
   const attachedAssistantIdentity = assistantBinding && historicalRows.some((row) =>
     row.kind === 'message' && sessionItemIdentityKey(row.item) === assistantIdentityKey(assistantBinding) && row.item.message?.role === 'assistant',
   ) ? assistantIdentityKey(assistantBinding) : undefined
+  // Every keyed tail that already has a durable assistant row is rendered by
+  // that row.  This includes a row whose durable projection is still behind
+  // the watermark: the row owns the remaining `assistantTail` below, so the
+  // process/cursor must not manufacture a second presentation owner.
+  const attachedContentTails = [...contentTailKeys].filter((key) => durableAssistantItems.has(key))
+  const hasAttachedAssistant = Boolean(attachedAssistantIdentity) || attachedContentTails.length > 0
   // A final assistant projection can arrive while the stream still contains
   // the reasoning deltas that produced it. Build the suppression set from
   // complete durable identities only; incomplete legacy events remain
   // transient until the durable projection is rendered after settlement.
   const durableReasoning = activeRun ? durableReasoningIdentities(input.items, activeRun) : emptyDurableReasoningIdentities()
   const rows = historicalRows.map((row): ConversationRow => {
-    if (row.kind !== 'message' || sessionItemIdentityKey(row.item) !== attachedAssistantIdentity) return row
+    if (row.kind !== 'message') return row
+    const identity = sessionItemIdentityKey(row.item)
+    if (contentTailKeys.has(identity) && row.item.message?.role === 'assistant') {
+      const tail = contentTails[identity]
+      // The sync repository owns a successfully checkpointed inline merge.
+      // If a durable window is still behind the transient watermark (or is a
+      // preview/blob descriptor), keep the exact identity's remaining tail in
+      // this one message row. It is still rendered exactly once.
+      return {
+        ...row,
+        ...(tail && !contentTailMergedKeys.has(identity) && tail.text ? { assistantTail: tail.text } : {}),
+        assistantStreaming: activeRun?.status === 'running',
+      }
+    }
+    if (identity !== attachedAssistantIdentity) return row
     return {
       ...row,
       assistantTail: activeRun?.assistantText || undefined,
@@ -149,10 +196,11 @@ export function buildConversationRows(input: BuildConversationRowsInput): Conver
     // when it has partial assistant text; otherwise it must not manufacture
     // an empty transient article.
     // Durable tools in an older turn must not suppress a fresh run's cursor.
-    const keepEmptyPresentationRow = activeRun.status === 'running' || Boolean(activeRun.assistantText)
+    const missingContentTails = Object.entries(contentTails).filter(([key, tail]) => !durableAssistantKeys.has(key) && Boolean(tail.text))
+    const keepEmptyPresentationRow = activeRun.status === 'running' || Boolean(activeRun.assistantText) || missingContentTails.length > 0
     const segments = hasLiveSteps
       ? filteredSegments
-      : attachedAssistantIdentity
+      : hasAttachedAssistant || missingContentTails.length > 0
         ? []
         : keepEmptyPresentationRow
           ? [{ steps: [], boundary: rawSegments[rawSegments.length - 1]?.boundary ?? 'initial' }]
@@ -175,11 +223,23 @@ export function buildConversationRows(input: BuildConversationRowsInput): Conver
             run: activeRun,
             steps: segment.steps,
             isLast: index === segments.length - 1,
-            assistantTailAttached: Boolean(attachedAssistantIdentity),
+            assistantTailAttached: hasAttachedAssistant,
           })
         })
       }
     }
+    // An append/snapshot race can expose a live identity before its durable
+    // item. Render each identity independently until the content projection
+    // arrives; it then disappears by exact key, without a text heuristic.
+    missingContentTails.forEach(([key, tail]) => {
+      rows.push({
+        kind: 'active-assistant',
+        key: rowKey(input.sessionID, 'active-assistant', activeRun.id, key),
+        run: activeRun,
+        identity: { turnID: tail.turnID, agentIteration: tail.agentIteration, itemID: tail.itemID },
+        text: tail.text,
+      })
+    })
     if (activeRun.providerRetry) {
       rows.push({
         kind: 'provider-retry',

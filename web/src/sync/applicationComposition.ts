@@ -22,6 +22,8 @@ import { ProviderSettingsStore } from './providerSettingsStore'
 import { CodexLoginStore } from './codexLoginStore'
 import { SyncRuntime, type RuntimeTransport } from './runtime'
 import { WebSocketTransport, type WebSocketTransportOptions } from './transport'
+import { sessionHistoryResultToDomain } from './sessionContentHistory'
+import type { SessionContentHistoryReadOptions, SessionContentHistoryWindow } from '../domain/sessionContent'
 
 // Keep the old infrastructure-facing names available while the page contract
 // itself remains in the pure application layer.
@@ -85,6 +87,9 @@ export interface SyncApplicationOptions {
   readonly initialSessionID?: string | null
   readonly initialProviderSettings?: Partial<ProviderSettingsApplicationState>
   readonly initialCodexLoginProvider?: string | null
+  /** Test seam for the application history reader; production uses the typed
+   * command/blob data plane below. */
+  readonly historyReader?: (sessionID: string, options: SessionContentHistoryReadOptions, signal?: AbortSignal) => Promise<SessionContentHistoryWindow>
 }
 
 function pageCommands(facade: CommandFacade): ApplicationCommands {
@@ -107,7 +112,13 @@ export function createSyncApplication(options: SyncApplicationOptions = {}): Syn
   const stores: SyncApplicationStores = {
     projectIndex: new ProjectIndexStore(replica, () => runtime.retry({ type: 'project_index', id: 'server' })),
     sessionIndex: new SyncSessionIndexRepository(replica, { retry: (projectID) => runtime.retry({ type: 'session_index', id: projectID }) }),
-    sessionContent: new SyncSessionContentRepository(replica),
+    sessionContent: new SyncSessionContentRepository(replica, {
+      historyReader: options.historyReader ?? (async (sessionID, historyOptions, signal) => {
+          const result = await commandFacade.historyRead(sessionID, historyOptions, { signal })
+          return sessionHistoryResultToDomain(result, historyOptions)
+        }),
+      retry: (sessionID) => runtime.retry({ type: 'session_content', id: sessionID }),
+    }),
     providerSettings: new ProviderSettingsStore(replica),
     codexLogin: new CodexLoginStore(replica),
   }

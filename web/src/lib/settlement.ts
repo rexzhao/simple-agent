@@ -1,4 +1,9 @@
-import { parseDecimalRevision } from './sessionStore'
+function parseDecimalRevision(value: unknown): string | null {
+  if (typeof value === 'number') return Number.isSafeInteger(value) && value >= 0 ? String(value) : null
+  if (typeof value !== 'string' || !/^\d+$/.test(value)) return null
+  const normalized = value.replace(/^0+(?=\d)/, '')
+  return normalized.length <= 309 ? normalized : null
+}
 
 /**
  * The committed session watermark carried by a settlement event.  New

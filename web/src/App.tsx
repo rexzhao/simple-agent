@@ -1,14 +1,13 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { api, streamLifecycle, streamRun } from './api'
-import type { ActiveRun, ActiveRunDescriptor, Bootstrap, ImageAttachmentInput, ItemsPage, LifecycleEvent, RunEvent, Session, SessionDebugSettings, SessionItem, SessionItemProjectionEvent, SessionModelOption } from './types'
+import type { ActiveRun, ActiveRunDescriptor, Bootstrap, ImageAttachmentInput, LifecycleEvent, RunEvent, Session, SessionDebugSettings, SessionModelOption } from './types'
 import { ProjectIndexObservationError, type ProjectIndexReadModel, type ProjectSummary } from './repositories/projectIndex'
 import { isBackgroundSessionCompletionTransition, sessionIndexCompletionNoticeKey, type SessionIndexCompletionObservation, type SessionIndexReadModel } from './repositories/sessionIndex'
 import type { SessionCreateOptions } from './commands/sessionCommands'
-import { errorMessage } from './lib/format'
 import { copyFrontendProtocolJSONL, downloadFrontendProtocolJSONL, frontendProtocolLogger, protocolLogIdentity, useFrontendProtocolLogging } from './lib/frontendProtocolLogger'
 import { reduceRunEvent } from './lib/runEventReducer'
 import { modelKey, navigationSession, projectName, sessionDescendantIDs, sessionName, sessionSubPanelContext, type SessionNavigation } from './lib/session'
-import { settlementRevision } from './lib/settlement'
+import { activeRunForConversation, itemsPageForConversation, sessionMetadataForConversation } from './lib/sessionContentPresentation'
 import { emptyComposerDraft } from './components/Composer'
 import type { PastedImageAttachment } from './components/Composer'
 import { Conversation } from './components/Conversation'
@@ -22,8 +21,7 @@ import { WorkspaceTree } from './components/WorkspaceTree'
 import { SessionSubPanel } from './components/SessionSubPanel'
 import { useComposerDrafts } from './hooks/useComposerDrafts'
 import { useRunRegistry } from './hooks/useRunRegistry'
-import { useSessionHistory } from './hooks/useSessionHistory'
-import { useSessionStore } from './hooks/useSessionStore'
+import { useSessionContentHistory } from './hooks/useSessionContentHistory'
 import { useSessionSelection } from './hooks/useSessionSelection'
 import { useProjectIndex, useSessionIndexes, useSyncCommands, useSyncRepositories, useSyncSignals } from './hooks/useSyncApplication'
 
@@ -53,11 +51,20 @@ function sessionMutationErrorMessage(reason: unknown): string {
   return 'Session operation failed.'
 }
 
+function runMutationErrorMessage(reason: unknown): string {
+  if (reason && typeof reason === 'object' && 'code' in reason) {
+    const code = String((reason as { code?: unknown }).code)
+    if (code === 'timeout') return 'Run command accepted; waiting for synchronization.'
+    if (code === 'cancelled') return 'Run operation was cancelled.'
+  }
+  return 'Run operation failed.'
+}
+
 function App() {
   const projectIndex = useProjectIndex()
-  const { project: projectCommands, session: sessionCommands } = useSyncCommands()
+  const { project: projectCommands, session: sessionCommands, run: runCommands } = useSyncCommands()
   const { currentProject, currentSession } = useSyncSignals()
-  const { projectIndex: projectIndexRepository, sessionIndex: sessionIndexRepository } = useSyncRepositories()
+  const { projectIndex: projectIndexRepository, sessionIndex: sessionIndexRepository, sessionContent: sessionContentRepository } = useSyncRepositories()
   const projects = projectIndex.active
   const sessionIndexes = useSessionIndexes(projects.map((project) => project.id))
   const [bootstrap, setBootstrap] = useState<Bootstrap | null>(null)
@@ -90,7 +97,6 @@ function App() {
   const [compactingSessionIDs, setCompactingSessionIDs] = useState<Record<string, boolean>>({})
   const [awaitingRunStartedBySession, setAwaitingRunStartedBySession] = useState<Record<string, boolean>>({})
   const { draftsBySession, updateDraft, addPastedText, removePastedText, addPastedImage, removePastedImage, clearDraft } = useComposerDrafts()
-  const sessionStore = useSessionStore()
   const frontendLogging = useFrontendProtocolLogging(debugSessionID)
 
   // Session id → display name across every known project, so tool rows can
@@ -102,11 +108,6 @@ function App() {
     }
     return names
   }, [sessionIndexes])
-  // Refs for reconciling timeout and backoff retry tracking.
-  const reconcileTimeoutRef = useRef<Record<string, number>>({})
-  const reconcileRetryCountRef = useRef<Record<string, number>>({})
-  const reconcileRetryTimerRef = useRef<Record<string, number>>({})
-  const refreshSessionRef = useRef<(sessionID: string) => Promise<Session | null>>(async () => null)
   const settledRunIDsRef = useRef(new Set<string>())
   // Local admission responses bind a run id until that run's replay delivers
   // run.started. This prevents the process-wide lifecycle hint from creating
@@ -117,7 +118,7 @@ function App() {
 
   const onSupersedeRunRef = useRef<(sessionID: string, oldRunID: string) => void>(() => {})
 
-  const { activeRunsBySession, activeRunsRef, runningSessionIDs, addActiveRun, syncActiveRuns, updateActiveRun, queueRunEvent, flushRunEvents } = useRunRegistry({ onSupersedeRun: (sessionID, oldRunID) => onSupersedeRunRef.current(sessionID, oldRunID) })
+  const { activeRunsRef, runningSessionIDs, addActiveRun, syncActiveRuns, updateActiveRun, queueRunEvent, flushRunEvents } = useRunRegistry({ onSupersedeRun: (sessionID, oldRunID) => onSupersedeRunRef.current(sessionID, oldRunID) })
 
   const clearTurnError = useCallback((sessionID: string) => {
     setTurnErrors((current) => {
@@ -269,13 +270,19 @@ function App() {
 
   useEffect(() => {
     void bootstrapApplication(false)
-      .catch((reason: unknown) => setError(errorMessage(reason)))
+      .catch(() => setError('Application synchronization is unavailable.'))
   }, [bootstrapApplication])
 
-  const reportError = useCallback((reason: unknown) => setError(errorMessage(reason)), [])
-  const { sessionDetail, itemsPage, selectedSessionRef, refreshSession, loadOlder } =
-    useSessionHistory(viewingSessionID, reportError, sessionStore)
-  refreshSessionRef.current = refreshSession
+  const selectedSessionRef = useRef(viewingSessionID)
+  selectedSessionRef.current = viewingSessionID
+  const { view: sessionContentView, historyState: sessionHistoryState, loadOlder, retry: retrySessionContent } = useSessionContentHistory(viewingSessionID, sessionContentRepository)
+  const sessionDetail = sessionContentView.session
+    ? sessionMetadataForConversation(sessionContentView.session, sessionContentView.history)
+    : null
+  const itemsPage = sessionContentView.session ? itemsPageForConversation(sessionContentView.history) : null
+  const controlRunFor = (sessionID: string): ActiveRun | null =>
+    activeRunsRef.current[sessionID]
+      ?? (sessionID === viewingSessionID ? activeRunForConversation(sessionContentView, sessionID) : null)
 
   // Tree selection is the authoritative navigation source. The viewing session
   // follows it so that normal navigation (tree click, bootstrap, create) keeps
@@ -339,99 +346,19 @@ function App() {
       .finally(() => markReadInFlightRef.current.delete(viewingSessionID))
   }, [sessionCommands, sessionIndexes, waitForSessionAuthority, viewingSessionID])
 
-  // Durable items are already in the session projection. Removing a run must
-  // therefore only tear down transient state; it must not copy its steps into
-  // a second, post-settlement history cache.
+  // The legacy run stream is retained only as a run-control adapter. Content
+  // and history are owned by session_content; settling a run must not patch a
+  // page cache or trigger a REST refresh.
   const removeRun = useCallback((sessionID: string, runID: string) => {
     const run = activeRunsRef.current[sessionID]
     if (!run || run.id !== runID) return
     setRecoveredRuns((current) => current.filter((r) => r.run_id !== runID))
-    // Clear reconciling timers for this session.
-    const timeout = reconcileTimeoutRef.current[sessionID]
-    if (timeout) { window.clearTimeout(timeout); delete reconcileTimeoutRef.current[sessionID] }
-    const retryTimer = reconcileRetryTimerRef.current[sessionID]
-    if (retryTimer) { window.clearTimeout(retryTimer); delete reconcileRetryTimerRef.current[sessionID] }
-    delete reconcileRetryCountRef.current[`${sessionID}:${runID}`]
     updateActiveRun(sessionID, runID, () => null)
   }, [updateActiveRun])
 
-  // A superseded run may still have a reconciliation request in flight. Keep
-  // that authoritative request, but do not preserve its transient steps.
   onSupersedeRunRef.current = useCallback((sessionID: string, oldRunID: string) => {
     removeRun(sessionID, oldRunID)
-    void refreshSessionRef.current(sessionID).catch(() => {})
   }, [removeRun])
-
-  // startReconcileTimeout: 60s timer → error_pending_refresh.
-  const startReconcileTimeout = useCallback((sessionID: string) => {
-    const existing = reconcileTimeoutRef.current[sessionID]
-    if (existing) window.clearTimeout(existing)
-    reconcileTimeoutRef.current[sessionID] = window.setTimeout(() => {
-      delete reconcileTimeoutRef.current[sessionID]
-      const run = activeRunsRef.current[sessionID]
-      if (run && run.status === 'reconciling') {
-        updateActiveRun(sessionID, run.id, (r) => ({ ...r, status: 'error_pending_refresh' }))
-      }
-    }, 60000)
-  }, [updateActiveRun])
-
-  // onSnapshotApplied: the only path that decides whether a settled run can
-  // be removed after a refresh. The store reader is synchronous and therefore
-  // includes projection events dispatched immediately before run.settled.
-  const onSnapshotApplied = useCallback((sessionID: string) => {
-    const run = activeRunsRef.current[sessionID]
-    if (!run) return
-    if (run.status !== 'reconciling' && run.status !== 'error_pending_refresh') return
-    if (!run.settledRevision || sessionStore.isRevisionCovered(sessionID, run.settledRevision)) {
-      removeRun(sessionID, run.id)
-      return
-    }
-    if (run.status === 'error_pending_refresh') {
-      updateActiveRun(sessionID, run.id, (r) => ({ ...r, status: 'reconciling' }))
-      // Re-entering reconciling needs a fresh terminal deadline: the
-      // original timeout already fired when the run entered error_pending.
-      startReconcileTimeout(sessionID)
-    }
-    scheduleReconcileRetry(sessionID, run.id)
-  }, [removeRun, sessionStore.isRevisionCovered, startReconcileTimeout, updateActiveRun])
-
-  // scheduleReconcileRetry: backoff refresh, max 2 retries.
-  const scheduleReconcileRetry = useCallback((sessionID: string, runID: string) => {
-    const key = `${sessionID}:${runID}`
-    const count = reconcileRetryCountRef.current[key] ?? 0
-    if (count >= 2) return
-    reconcileRetryCountRef.current[key] = count + 1
-    const existing = reconcileRetryTimerRef.current[sessionID]
-    if (existing) window.clearTimeout(existing)
-    reconcileRetryTimerRef.current[sessionID] = window.setTimeout(() => {
-      delete reconcileRetryTimerRef.current[sessionID]
-      void refreshSessionRef.current(sessionID)
-        .then(() => onSnapshotApplied(sessionID))
-        .catch(() => {
-          // A failed retry still consumes one bounded attempt, but should not
-          // strand a lagging run until the 60s deadline without the remaining
-          // retry opportunity.
-          if (activeRunsRef.current[sessionID]?.id === runID) scheduleReconcileRetry(sessionID, runID)
-        })
-    }, 2000)
-  }, [activeRunsRef, onSnapshotApplied])
-
-  // retryRefreshSession: manual "refresh to see latest" handler.
-  const retryRefreshSession = useCallback(async (sessionID: string) => {
-    const run = activeRunsRef.current[sessionID]
-    if (!run || run.status !== 'error_pending_refresh') return
-    try {
-      await refreshSessionRef.current(sessionID)
-      onSnapshotApplied(sessionID)
-    } catch { /* stay in error_pending_refresh */ }
-  }, [onSnapshotApplied])
-
-  // Auto-resolve pending reconciliation whenever fresh session detail
-  // arrives: navigating to a session with a stuck "Refresh needed" banner
-  // settles it without a manual click once the durable state has caught up.
-  useEffect(() => {
-    if (sessionDetail) onSnapshotApplied(sessionDetail.id)
-  }, [sessionDetail, onSnapshotApplied])
 
   useEffect(() => {
     if (!completionNotice) return
@@ -469,9 +396,9 @@ function App() {
         fullAccess: current.fullAccess,
         loading: false,
       } : current)
-    } catch (reason) {
+    } catch {
       setSessionCreator(null)
-      setError(errorMessage(reason))
+      setError('Session model options are unavailable.')
     }
   }, [selectedProjectID])
 
@@ -504,9 +431,9 @@ function App() {
     try {
       const document = await api.providerSettings()
       setProviderManager((current) => current ? { document, loading: false } : current)
-    } catch (reason) {
+    } catch {
       setProviderManager(null)
-      setError(errorMessage(reason))
+      setError('Provider settings are unavailable.')
     }
   }, [])
 
@@ -585,16 +512,19 @@ function App() {
     try {
       await sessionCommands.rename(session.id, displayName.trim())
       await waitForSessionAuthority(session.project_id, (index) => index.summaries.some((summary) => summary.session_id === session.id && summary.display_name === displayName.trim()))
-      if (selectedSessionRef.current === session.id) await refreshSession(session.id)
+      if (selectedSessionRef.current === session.id) {
+        await sessionContentRepository.waitFor(session.id, (view) => view.session?.display_name === displayName.trim(), { timeoutMS: 5000 })
+      }
     } catch (reason) { setError(sessionMutationErrorMessage(reason)) }
-  }, [refreshSession, selectedSessionRef, sessionCommands, waitForSessionAuthority])
+  }, [selectedSessionRef, sessionCommands, sessionContentRepository, waitForSessionAuthority])
 
   const toggleFullAccess = useCallback(async (session: Session) => {
     try {
-      await sessionCommands.setFullAccess(session.id, !session.full_access)
-      if (selectedSessionRef.current === session.id) await refreshSession(session.id)
+      const fullAccess = !session.full_access
+      await sessionCommands.setFullAccess(session.id, fullAccess)
+      if (selectedSessionRef.current === session.id) await sessionContentRepository.waitFor(session.id, (view) => view.session?.full_access === fullAccess, { timeoutMS: 5000 })
     } catch (reason) { setError(sessionMutationErrorMessage(reason)) }
-  }, [refreshSession, selectedSessionRef, sessionCommands])
+  }, [selectedSessionRef, sessionCommands, sessionContentRepository])
 
   const openDebugSettings = useCallback(() => {
     if (viewingSessionID) setDebugSessionID(viewingSessionID)
@@ -604,13 +534,13 @@ function App() {
     setSavingDebugSettings(true)
     try {
       await sessionCommands.setDebug(sessionID, settings.request_bodies)
-      if (selectedSessionRef.current === sessionID) await refreshSession(sessionID)
+      if (selectedSessionRef.current === sessionID) await sessionContentRepository.waitFor(sessionID, (view) => view.session?.debug.request_bodies === settings.request_bodies, { timeoutMS: 5000 })
       setDebugSessionID('')
     } catch (reason) {
       setError(sessionMutationErrorMessage(reason))
       throw reason
     } finally { setSavingDebugSettings(false) }
-  }, [refreshSession, selectedSessionRef, sessionCommands])
+  }, [selectedSessionRef, sessionCommands, sessionContentRepository])
 
   const archiveSession = useCallback(async (session: SessionNavigation) => {
     const index = sessionIndexes[session.project_id]
@@ -697,13 +627,10 @@ function App() {
     }
   }, [activeRunsRef, sessionIndexRepository, sessionIndexes, selectedSessionRef, sessionCommands, setSelectedProjectID, setSelectedSessionID, waitForSessionAuthority])
 
-  // Session Index owns navigation metadata and status. Lifecycle SSE is
-  // retained only as a run/content transition adapter until the content phase
-  // moves to its repository; it never writes the navigation read model.
-  const knownSession = useCallback((sessionID: string): Session | null => {
-    return sessionStore.state.sessionsByID[sessionID] ?? null
-  }, [sessionStore.state.sessionsByID])
-
+  // Session Index owns navigation metadata and status. Lifecycle SSE and the
+  // per-run stream are now retained only as the explicit run-control adapter:
+  // they admit/replay/control runs, but never write Session Content or the
+  // navigation read model. A later run-control cutover can remove this block.
   const handleRunEvent = useCallback(async (sessionID: string, runID: string, event: RunEvent) => {
     const payload = event as unknown as Record<string, unknown>
     const eventSessionID = typeof payload.session_id === 'string' ? payload.session_id : ''
@@ -801,22 +728,12 @@ function App() {
       case 'item.appended':
       case 'item.created':
       case 'item.updated':
-        // Projection events are already committed durable DTOs. Apply them
-        // directly to the shared store; unlike run settlement they do not
-        // require a full-page refresh.
-        const acceptedProjection = sessionStore.applyProjectionEvent(event as SessionItemProjectionEvent)
-        // Also hand an accepted projection's explicit assistant identity to
-        // the transient run reducer. A stale/replayed projection must not
-        // mutate the live binding; accepted items are matched by the full
-        // (turn, iteration, item) identity, never by text.
-        if (acceptedProjection) update((run) => reduceRunEvent(run, event))
+        // Durable item publication is owned by session_content. The legacy
+        // run stream remains a control/replay adapter and cannot write a
+        // second content reducer or projection cache.
         break
       case 'run.resync_required':
-        try {
-          await refreshSession(sessionID)
-        } catch (reason) {
-          setError(errorMessage(reason))
-        }
+        sessionContentRepository.retry(sessionID)
         break
       case 'turn.failed':
         // A late failure from a superseded stream must not surface as the
@@ -856,53 +773,20 @@ function App() {
         }
         logGate('accepted')
         const settledStatus = String(event.status)
-        const settledRevision = settlementRevision(event)
-        if (!settledRun || settledRun.id !== runID) {
-          // Lifecycle replay can contain only the terminal event. Do not
-          // refresh merely because the transient container is gone: the
-          // reducer may already have applied the final item projection.
-          if (!settledRevision || !sessionStore.isRevisionCovered(sessionID, settledRevision)) {
-            try { await refreshSession(sessionID) } catch (reason) {
-              if (selectedSessionRef.current === sessionID) setError(errorMessage(reason))
-            }
-          }
-          return
-        }
-
         if (settledStatus === 'failed') {
-          // turn.failed usually landed first with the real reason; fallback for late-attach.
+          // turn.failed usually landed first with the real reason; fallback
+          // for a late-attach run-control replay.
           setTurnErrors((current) => current[sessionID]
             ? current
             : { ...current, [sessionID]: { turnID: String(event.turn_id ?? ''), message: String(event.message ?? 'Run failed') } })
-        } else if (settledStatus === 'cancelled') {
-          // Keep the durable partial projection. It is only a refresh target
-          // when the terminal watermark is absent or not yet local.
         }
-
-        const covered = settledRevision !== undefined && sessionStore.isRevisionCovered(sessionID, settledRevision)
-        if (covered) {
-          removeRun(sessionID, runID)
-        } else {
-          // A missing watermark is the compatibility/defensive path. It is
-          // deliberately conservative, but still bounded and never deletes
-          // the run until an authoritative refresh succeeds.
-          update((run) => ({
-            ...run,
-            status: 'reconciling',
-            ...(settledRevision ? { settledRevision } : {}),
-          }))
-          startReconcileTimeout(sessionID)
-          try {
-            await refreshSession(sessionID)
-            onSnapshotApplied(sessionID)
-          } catch {
-            scheduleReconcileRetry(sessionID, runID)
-          }
-        }
+        // Session Content receives the settlement/transient barrier itself.
+        // Removing this run only affects the transitional control adapter.
+        if (!settledRun || settledRun.id === runID) removeRun(sessionID, runID)
         break
       }
     }
-  }, [activeRunsRef, addActiveRun, flushRunEvents, onSnapshotApplied, queueRunEvent, refreshSession, removeRun, scheduleReconcileRetry, sessionStore.applyProjectionEvent, sessionStore.isRevisionCovered, setAwaitingRunStarted, startReconcileTimeout, updateActiveRun])
+  }, [activeRunsRef, addActiveRun, flushRunEvents, queueRunEvent, removeRun, sessionContentRepository, setAwaitingRunStarted, updateActiveRun])
 
   // A run has at most one active connection by this App instance. streamRun
   // owns its replay cursor and reconnects internally; a later authoritative
@@ -938,7 +822,7 @@ function App() {
           updateActiveRun(sessionID, runID, (existing) => ({ ...existing, status: 'error_pending_refresh' }))
           setRecoveredRuns((current) => current.filter((item) => item.run_id !== runID))
         }
-        if (viewingSessionIDRef.current === sessionID) setError(errorMessage(reason))
+        if (viewingSessionIDRef.current === sessionID) setError('Run synchronization is unavailable.')
       })
       .finally(() => {
         runStreamsRef.current.delete(runID)
@@ -1035,7 +919,7 @@ function App() {
     try {
       await bootstrapApplication(true)
     } catch (reason) {
-      setError(errorMessage(reason))
+      setError('Application synchronization is unavailable.')
       throw reason
     }
   }
@@ -1046,7 +930,7 @@ function App() {
       (event) => lifecycleEventHandlerRef.current(event),
       { signal: controller.signal, onReconnect: () => reconcileLifecycleRef.current() },
     ).catch((reason: unknown) => {
-      if (!controller.signal.aborted) setError(errorMessage(reason))
+      if (!controller.signal.aborted) setError('Application synchronization is unavailable.')
     })
     return () => controller.abort()
   }, [])
@@ -1078,7 +962,12 @@ function App() {
       // Admission is the only source of the run identity for a new submit.
       // Do not construct a stream URL or attach to a session stream before
       // this response has supplied the authoritative run_id.
-      const started = await api.startRun(sessionID, content, imageInputs)
+      // Text admission uses the typed control-plane command. The image path
+      // remains a narrowly scoped transition until attachments have their own
+      // Blob upload command; neither path patches session content locally.
+      const started = imageInputs.length > 0
+        ? await api.startRun(sessionID, content, imageInputs)
+        : await runCommands.startRun(sessionID, content)
       if (!started.run_id || started.session_id !== sessionID) {
         throw new Error('Run admission response did not include the requested session and run_id')
       }
@@ -1092,7 +981,7 @@ function App() {
     } catch (reason) {
       pendingAdmissionSessionsRef.current.delete(sessionID)
       setAwaitingRunStarted(sessionID, false)
-      setError(errorMessage(reason))
+      setError(runMutationErrorMessage(reason))
       return false
     }
   }
@@ -1104,32 +993,28 @@ function App() {
   // available.
   const createRootSession = async (sourceSessionID: string): Promise<boolean> => {
     if (creatingRootSessionRef.current) return false
-    const listedSource = sessionDetail?.id === sourceSessionID ? sessionDetail : knownSession(sourceSessionID)
+    const listedSource = sessionDetail?.id === sourceSessionID ? sessionDetail : null
     if (!listedSource) {
       setError('The current session is still loading; try /new again')
       return false
     }
     creatingRootSessionRef.current = true
     try {
-      const source = listedSource.cwd && listedSource.config_path && listedSource.reasoning_level !== undefined
-        ? listedSource
-        : await api.session(sourceSessionID)
+      const source = listedSource
+      const cwd = source.cwd ?? source.created_cwd
+      // Session Content fields are an authority projection, not a legacy
+      // REST creation DTO.  Only values that are actually present are sent;
+      // omission deliberately delegates provider/model/config/reasoning
+      // defaults to the server.
       const options: SessionCreateOptions = {
-        provider: source.provider,
-        modelProfile: source.model_profile,
-        reasoningLevel: source.reasoning_level ?? '',
+        ...(cwd !== undefined ? { cwd } : {}),
+        ...(source.config_path !== undefined ? { configPath: source.config_path } : {}),
+        ...(source.provider !== undefined ? { provider: source.provider } : {}),
+        ...(source.model_profile !== undefined ? { modelProfile: source.model_profile } : {}),
+        ...(source.reasoning_level !== undefined ? { reasoningLevel: source.reasoning_level } : {}),
         fullAccess: source.full_access,
-        cwd: source.cwd ?? source.created_cwd,
-        configPath: source.config_path ?? '',
       }
-      const created = await sessionCommands.create(source.project_id, {
-        cwd: options.cwd,
-        configPath: options.configPath,
-        provider: options.provider,
-        modelProfile: options.modelProfile,
-        reasoningLevel: options.reasoningLevel,
-        fullAccess: options.fullAccess,
-      })
+      const created = await sessionCommands.create(source.project_id, options)
       await waitForSessionAuthority(source.project_id, (index) => index.active.some((summary) => summary.session_id === created.session_id))
       setSelectedProjectID(source.project_id)
       setSelectedSessionID(created.session_id)
@@ -1149,7 +1034,7 @@ function App() {
     if (content.trim() === '/new' && images.length === 0) {
       return createRootSession(sessionID)
     }
-    const activeRun = activeRunsRef.current[sessionID]
+    const activeRun = controlRunFor(sessionID)
     if (activeRun && activeRun.status === 'running') {
       // Append to the in-flight run: the message is queued and injected into
       // the active turn at the next safe checkpoint, or sent as a follow-up
@@ -1157,10 +1042,10 @@ function App() {
       // the run.prompt_queue stream event; no local echo is added.
       if (!content.trim()) return false
       try {
-        await api.appendRunMessage(activeRun.id, content, sessionID)
+        await runCommands.appendPrompt(sessionID, activeRun.id, content)
         return true
       } catch (reason) {
-        setError(errorMessage(reason))
+        setError(runMutationErrorMessage(reason))
         return false
       }
     }
@@ -1171,14 +1056,14 @@ function App() {
   const continueRun = useCallback(async (): Promise<boolean> => {
     if (!viewingSessionID) return false
     const sessionID = viewingSessionID
-    const activeRun = activeRunsRef.current[sessionID]
+    const activeRun = controlRunFor(sessionID)
     const detail = sessionDetail?.id === sessionID ? sessionDetail : undefined
     if (activeRun?.status === 'running' || !detail || (detail.status !== 'interrupted' && detail.status !== 'failed') || !detail.interrupted_run_id || !detail.interrupted_turn_id) {
       return false
     }
     pendingAdmissionSessionsRef.current.add(sessionID)
     try {
-      const started = await api.continueRun(sessionID)
+      const started = await runCommands.continueRun(sessionID)
       if (!started.run_id || started.session_id !== sessionID) {
         throw new Error('Run admission response did not include the requested session and run_id')
       }
@@ -1192,38 +1077,38 @@ function App() {
     } catch (reason) {
       pendingAdmissionSessionsRef.current.delete(sessionID)
       setAwaitingRunStarted(sessionID, false)
-      setError(errorMessage(reason))
+      setError(runMutationErrorMessage(reason))
       return false
     }
-  }, [clearTurnError, connectRunStream, viewingSessionID, sessionDetail, setAwaitingRunStarted])
+  }, [clearTurnError, connectRunStream, runCommands, viewingSessionID, sessionDetail, setAwaitingRunStarted])
 
   const cancelRun = async () => {
-    const run = activeRunsRef.current[viewingSessionID]
+    const run = controlRunFor(viewingSessionID)
     if (!run) return
     try {
-      await api.cancelRun(run.id, viewingSessionID)
+      await runCommands.cancelRun(run.id)
     } catch (reason) {
-      setError(errorMessage(reason))
+      setError(runMutationErrorMessage(reason))
     }
   }
 
   const cancelToolCall = useCallback(async (toolCallID: string) => {
-    const run = activeRunsRef.current[viewingSessionID]
+    const run = controlRunFor(viewingSessionID)
     if (!run) return
     try {
-      await api.cancelToolCall(run.id, toolCallID, viewingSessionID)
+      await runCommands.cancelTool(viewingSessionID, run.id, toolCallID)
     } catch (reason) {
-      setError(errorMessage(reason))
+      setError(runMutationErrorMessage(reason))
     }
-  }, [viewingSessionID])
+  }, [runCommands, viewingSessionID])
 
   const removeQueuedPrompt = async (promptID: string) => {
-    const run = activeRunsRef.current[viewingSessionID]
+    const run = controlRunFor(viewingSessionID)
     if (!run) return
     try {
-      await api.removeRunMessage(run.id, promptID, viewingSessionID)
+      await runCommands.removePrompt(viewingSessionID, run.id, promptID)
     } catch (reason) {
-      setError(errorMessage(reason))
+      setError(runMutationErrorMessage(reason))
     }
   }
 
@@ -1231,34 +1116,38 @@ function App() {
   // run.prompt_queue stream event, keeping the server the single source of
   // truth for queue order.
   const setQueuedPromptSteer = async (promptID: string, steer: boolean) => {
-    const run = activeRunsRef.current[viewingSessionID]
+    const run = controlRunFor(viewingSessionID)
     if (!run) return
     try {
-      await api.steerRunMessage(run.id, promptID, steer, viewingSessionID)
+      await runCommands.steerPrompt(viewingSessionID, run.id, promptID, steer)
     } catch (reason) {
-      setError(errorMessage(reason))
+      setError(runMutationErrorMessage(reason))
     }
   }
 
   const moveQueuedPrompt = async (promptID: string, direction: 'up' | 'down') => {
-    const run = activeRunsRef.current[viewingSessionID]
+    const run = controlRunFor(viewingSessionID)
     if (!run) return
     try {
-      await api.moveRunMessage(run.id, promptID, direction, viewingSessionID)
+      await runCommands.movePrompt(viewingSessionID, run.id, promptID, direction === 'up' ? -1 : 1)
     } catch (reason) {
-      setError(errorMessage(reason))
+      setError(runMutationErrorMessage(reason))
     }
   }
 
   const compactSession = async () => {
-    if (!viewingSessionID || sessionDetail?.status === 'running' || activeRunsRef.current[viewingSessionID]?.status === 'running') return
+    if (!viewingSessionID || sessionDetail?.status === 'running' || controlRunFor(viewingSessionID)?.status === 'running') return
     const sessionID = viewingSessionID
     setCompactingSessionIDs((current) => ({ ...current, [sessionID]: true }))
     try {
-      await sessionCommands.compact(sessionID)
-      await refreshSession(sessionID)
+      const result = await sessionCommands.compact(sessionID)
+      await sessionContentRepository.waitFor(sessionID, (view) =>
+        view.compaction.checkpoints.some((checkpoint) => checkpoint.id === result.compaction_id || checkpoint.summary_item_id === result.summary_item_id)
+        || view.history.items.some((item) => item.key.item_id === result.summary_item_id),
+        { timeoutMS: 5000 },
+      )
     } catch (reason) {
-      setError(errorMessage(reason))
+      setError(sessionMutationErrorMessage(reason))
     } finally {
       setCompactingSessionIDs((current) => {
         const next = { ...current }
@@ -1276,14 +1165,17 @@ function App() {
     ? (sessionIndexes[selectedProjectID]?.active.map(navigationSession) ?? [])
     : []
   const subPanelContext = viewingSessionID ? sessionSubPanelContext(selectedProjectSessions, viewingSessionID) : null
-  const selectedActiveRun = activeRunsBySession[viewingSessionID] ?? null
+  // session_content subscription_event is the opened session's transient
+  // content authority. The run registry below remains only for control
+  // admission/replay and background run visibility.
+  const selectedActiveRun = activeRunForConversation(sessionContentView, viewingSessionID)
   useEffect(() => {
     if (debugSessionID && debugSessionID !== viewingSessionID) setDebugSessionID('')
   }, [debugSessionID, viewingSessionID])
   const debugSession = debugSessionID
     ? sessionDetail?.id === debugSessionID
       ? sessionDetail
-      : sessionStore.state.sessionsByID[debugSessionID] ?? null
+      : null
     : null
   const indexedRunningSessionIDs = Object.values(sessionIndexes).flatMap((index) => index.summaries.filter((summary) => summary.status === 'running').map((summary) => summary.session_id))
   const visibleRunningSessionIDs = new Set([...indexedRunningSessionIDs, ...runningSessionIDs, ...Object.keys(compactingSessionIDs)])
@@ -1368,6 +1260,9 @@ function App() {
             activeRun={selectedActiveRun}
             admissionPending={Boolean(awaitingRunStartedBySession[viewingSessionID])}
             compacting={Boolean(compactingSessionIDs[viewingSessionID])}
+			contentAvailability={sessionContentView.availability}
+			historyLoading={sessionHistoryState.loading}
+			historyError={sessionHistoryState.error}
 			draft={draftsBySession[viewingSessionID] ?? emptyComposerDraft}
 			onDraftChange={(content) => updateDraft(viewingSessionID, content)}
 			onPastedTextAdd={(pastedText) => addPastedText(viewingSessionID, pastedText)}
@@ -1383,7 +1278,7 @@ function App() {
             onCancel={() => void cancelRun()}
             onCancelTool={(toolCallID) => void cancelToolCall(toolCallID)}
             onContinue={() => void continueRun()}
-            onRetryRefresh={() => void retryRefreshSession(viewingSessionID)}
+            onRetryRefresh={retrySessionContent}
             onDebug={openDebugSettings}
             onRemoveQueuedPrompt={(promptID) => void removeQueuedPrompt(promptID)}
             onSteerQueuedPrompt={(promptID, steer) => void setQueuedPromptSteer(promptID, steer)}

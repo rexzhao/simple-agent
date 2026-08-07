@@ -141,8 +141,8 @@ describe('domain-facing Session Index repository', () => {
       '../components/ProcessTimeline.tsx', '../components/ProviderManagerDialog.tsx', '../components/SessionModelDialog.tsx',
       '../components/SessionSubPanel.tsx', '../components/VirtualConversationList.tsx', '../components/WorkspaceTree.tsx',
       '../components/icons.tsx', '../components/misc.tsx',
-      '../hooks/useComposerDrafts.ts', '../hooks/useRunRegistry.ts', '../hooks/useSessionHistory.ts',
-      '../hooks/useSessionSelection.ts', '../hooks/useSessionStore.ts', '../hooks/useSessionIndex.ts',
+      '../hooks/useComposerDrafts.ts', '../hooks/useRunRegistry.ts', '../hooks/useSessionContentHistory.ts',
+      '../hooks/useSessionSelection.ts', '../hooks/useSessionIndex.ts',
     ]
     for (const file of pageFiles) {
       const source = readFileSync(new URL(file, import.meta.url), 'utf8')
@@ -157,5 +157,14 @@ describe('domain-facing Session Index repository', () => {
     expect(appSource).not.toMatch(/reduceLifecycleEvent|sessionsByProject|archivedSessionsByProject/)
     expect(appSource).toMatch(/sessionCommands\.(create|rename|archive|restore|deleteSession|markRead)/)
     expect(appSource).toMatch(/waitForSessionAuthority/)
+  })
+
+  it('cuts opened-session content over without snapshot/session/history REST reads', () => {
+    const appSource = readFileSync(new URL('../App.tsx', import.meta.url), 'utf8')
+    expect(appSource).not.toMatch(/api\.(snapshot|items|session)\s*\(/)
+    expect(appSource).not.toMatch(/useSession(Store|History)/)
+    expect(appSource).toMatch(/useSessionContentHistory/)
+    expect(appSource).toMatch(/sessionContentRepository\.waitFor/)
+    expect(appSource).not.toMatch(/sessionStore\.(applyProjectionEvent|isRevisionCovered)/)
   })
 })

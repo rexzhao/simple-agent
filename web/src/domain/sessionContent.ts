@@ -125,6 +125,22 @@ export interface SessionContentHistoryWindow {
   readonly descriptor: SessionContentHistoryDescriptor
 }
 
+/** A page read is an application operation, not a wire/blob operation. */
+export interface SessionContentHistoryReadOptions {
+  readonly cursor?: number
+  readonly direction?: 'before' | 'after'
+  readonly limit?: number
+  readonly alignTurn?: boolean
+}
+
+export interface SessionContentHistoryState {
+  readonly loading: boolean
+  /** Monotonic operation identity.  A history operation is observable even
+   * when the durable content resource itself did not change. */
+  readonly version: number
+  readonly error?: DomainReadError
+}
+
 export interface SessionContentActiveRun {
   readonly run_id: string
   readonly session_id: string
@@ -240,6 +256,7 @@ export interface SessionView {
   readonly dataAvailability: DataAvailability
   readonly session?: SessionContentMetadata
   readonly history: SessionContentHistoryWindow
+  readonly historyState: SessionContentHistoryState
   readonly activeRun: SessionContentActiveRun | null
   readonly compaction: SessionContentCompaction
   readonly runState?: SessionRunState

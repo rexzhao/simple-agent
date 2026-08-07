@@ -206,13 +206,14 @@ export interface Session {
   latest_run_id?: string
   last_run_id?: string
   last_run_status?: string
-  provider: string
-  model_profile: string
-  model_id: string
+  /** These are optional in Session Content; absence means server default. */
+  provider?: string
+  model_profile?: string
+  model_id?: string
   pricing?: ModelPricing
   reasoning_level?: string
   project_id: string
-  created_cwd: string
+  created_cwd?: string
   last_seq: number
   /** Precision-safe decimal form of the session last_seq watermark. */
   revision?: string
@@ -409,6 +410,10 @@ export interface ActiveRun {
 	/** Transient process boundaries for drained prompts; never a user item. */
 	processBoundaries?: Array<{ id: string; stepIndex: number }>
 	assistantText: string
+	/** Content-backed transient tails. Each entry is owned by exactly one full
+	 * (turn_id, agent_iteration, item_id) identity. It is intentionally a map,
+	 * never an unkeyed concatenated string. */
+	assistantTails?: Record<string, { turnID: string; agentIteration: number; itemID: string; text: string; durableTextLength: number }>
 	/** Explicit transient-to-durable assistant identity, keyed by turn/iteration. */
 	assistantItems?: Record<string, { itemID: string; durableTextLength: number }>
 	/** Full identity bindings. assistantItems remains a compatibility index. */

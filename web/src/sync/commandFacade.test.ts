@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import { decodeMessage } from '../protocol/decode'
 import type { ProtocolMessage } from '../protocol/types'
 import { CommandFacade, CommandFacadeError } from './commandFacade'
@@ -793,5 +793,35 @@ describe('CommandFacade project commands', () => {
     await expect(failed.createProject('/repo', 'Project')).rejects.toMatchObject({ code: 'id_generation' })
     expect(failedTransport.sent).toHaveLength(0)
     failed.stop()
+  })
+
+  it('resolves a history Blob inside the typed command boundary', async () => {
+    const transport = new FakeCommandTransport()
+    const page = {
+      items: [{
+        seq: 1, id: 'item_1', turn_id: 'turn_1', agent_iteration: 1,
+        created_at: '2025-01-01T00:00:00Z', kind: 'message', visibility: 'visible', audience: 'user',
+        message: { role: 'user', content: { inline: 'hello' } },
+      }],
+      oldest_seq: 1, newest_seq: 1, has_more_before: true, has_more_after: false,
+    }
+    const getJSON = vi.fn().mockResolvedValue(page)
+    const facade = new CommandFacade({ transport, blobClient: { getJSON } as never })
+    const pending = facade.historyRead('session_1', { cursor: 10, direction: 'before', limit: 20, alignTurn: true })
+    const command = transport.sent[0]
+    if (command.type !== 'command') throw new Error('wrong command')
+    expect(command.payload.name).toBe('session.history.read')
+    expect(command.payload.arguments).toEqual({ session_id: 'session_1', cursor: 10, direction: 'before', limit: 20, align_turn: true })
+    transport.emit(commandMessage('command_result', command.payload.request_id, {
+      status: 'succeeded',
+      result: {
+        session_id: 'session_1', cursor: 10, direction: 'before', limit: 20, align_turn: true,
+        history: null,
+        blob: { id: 'blob_1', url: '/api/blobs/blob_1', content_type: 'application/json', size: 2, sha256: 'opaque-hash', etag: '"opaque"', expires_at: '2999-01-01T00:00:00Z' },
+      },
+    }))
+    await expect(pending).resolves.toMatchObject({ history: page, blob: { id: 'blob_1' } })
+    expect(getJSON).toHaveBeenCalledOnce()
+    facade.stop()
   })
 })
