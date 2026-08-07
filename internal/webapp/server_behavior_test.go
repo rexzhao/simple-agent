@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/rexzhao/simple-agent/internal/codexauth"
 	"github.com/rexzhao/simple-agent/internal/execution"
 )
 
@@ -549,6 +550,71 @@ func TestServerProviderManagementDiscoveryAndCodexErrors(t *testing.T) {
 		if response.StatusCode != http.StatusUnprocessableEntity || responseErrorCode(t, response) != "request_failed" {
 			t.Fatalf("%s non-Codex login status = %d, want 422 request_failed", method, response.StatusCode)
 		}
+	}
+}
+
+func TestServerCodexUsageEndpoint(t *testing.T) {
+	usageServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/backend-api/wham/usage" {
+			t.Fatalf("path = %q, want /backend-api/wham/usage", r.URL.Path)
+		}
+		if !strings.HasPrefix(r.Header.Get("Authorization"), "Bearer ") {
+			t.Fatalf("Authorization = %q, want bearer", r.Header.Get("Authorization"))
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"user_id": "user-1",
+			"account_id": "user-1",
+			"email": "test@example.com",
+			"plan_type": "pro",
+			"rate_limit": {
+				"allowed": true, "limit_reached": false,
+				"primary_window": {"used_percent": 58, "limit_window_seconds": 604800, "reset_after_seconds": 261881, "reset_at": 1786255839},
+				"secondary_window": null
+			},
+			"credits": {"has_credits": false, "unlimited": false, "overage_limit_reached": false, "balance": "0"}
+		}`))
+	}))
+	defer usageServer.Close()
+
+	server, service := newWebTestServer(t)
+	input := execution.ProviderSettingsInput{
+		Name:    "codex",
+		BaseURL: usageServer.URL + "/backend-api/codex",
+		Models: []execution.ProviderModelSettings{{
+			Profile: "default",
+			ID:      "gpt-5.5",
+			Type:    "openai-codex",
+			Input:   []string{"text"},
+		}},
+	}
+	response := doJSONRequest(t, http.MethodPost, server.URL+"/api/providers", input)
+	if response.StatusCode != http.StatusCreated {
+		t.Fatalf("POST codex provider status = %d body=%s", response.StatusCode, readBody(response))
+	}
+	var document execution.ProviderSettingsDocument
+	decodeResponse(t, response, &document)
+	codex := providerSettingsByName(document.Providers, "codex")
+	if codex == nil || codex.AuthFile == "" {
+		t.Fatalf("created codex provider = %#v, want auth path", document.Providers)
+	}
+	if err := service.SaveCodexAuth("codex", codexauth.TokenFile{AccessToken: "codex-access-token"}); err != nil {
+		t.Fatalf("SaveCodexAuth() error = %v", err)
+	}
+
+	response = doJSONRequest(t, http.MethodGet, server.URL+"/api/providers/codex/codex-usage", nil)
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("GET codex-usage status = %d body=%s", response.StatusCode, readBody(response))
+	}
+	var usage execution.CodexUsage
+	decodeResponse(t, response, &usage)
+	if usage.PlanType != "pro" || usage.RateLimit == nil || usage.RateLimit.PrimaryWindow == nil || usage.RateLimit.PrimaryWindow.UsedPercent != 58 {
+		t.Fatalf("GET codex-usage = %#v, want pro plan with 58%% primary window", usage)
+	}
+
+	response = doJSONRequest(t, http.MethodGet, server.URL+"/api/providers/fake/codex-usage", nil)
+	if response.StatusCode != http.StatusUnprocessableEntity || responseErrorCode(t, response) != "request_failed" {
+		t.Fatalf("GET codex-usage on non-codex provider status = %d, want 422 request_failed", response.StatusCode)
 	}
 }
 

@@ -100,3 +100,12 @@ func (s *Server) handleClearCodexLogin(w http.ResponseWriter, r *http.Request) {
 	}
 	w.WriteHeader(http.StatusNoContent)
 }
+
+func (s *Server) handleCodexUsage(w http.ResponseWriter, r *http.Request) {
+	usage, err := s.service.CodexUsage(r.Context(), r.PathValue("providerName"))
+	if err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, usage)
+}

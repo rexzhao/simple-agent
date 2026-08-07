@@ -21,6 +21,7 @@ const (
 	DefaultIssuerURL = "https://auth.openai.com"
 	DefaultClientID  = "app_EMoamEEZ73f0CkXaXp7hrann"
 	DefaultScope     = "openid profile email offline_access"
+	DefaultUsageURL  = "https://chatgpt.com/backend-api/wham/usage"
 	defaultModelID   = "gpt-5.5"
 
 	deviceAuthUserCodePath = "/api/accounts/deviceauth/usercode"

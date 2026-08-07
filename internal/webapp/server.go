@@ -421,6 +421,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /api/providers/{providerName}/codex-login", s.handleStartCodexLogin)
 	s.mux.HandleFunc("GET /api/providers/{providerName}/codex-login", s.handleCodexLoginStatus)
 	s.mux.HandleFunc("DELETE /api/providers/{providerName}/codex-login", s.handleClearCodexLogin)
+	s.mux.HandleFunc("GET /api/providers/{providerName}/codex-usage", s.handleCodexUsage)
 	s.mux.HandleFunc("GET /api/projects/{projectID}/sessions", s.handleListSessions)
 	s.mux.HandleFunc("POST /api/projects/{projectID}/sessions", s.handleCreateSession)
 	s.mux.HandleFunc("GET /api/sessions/{sessionID}", s.handleGetSession)

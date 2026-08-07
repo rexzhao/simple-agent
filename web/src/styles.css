@@ -824,6 +824,22 @@ svg { width: 1.1em; height: 1.1em; fill: none; stroke: currentColor; stroke-widt
 .device-login > strong { padding: 5px 9px; color: #ffffff; background: #111111; font: 15px var(--font-mono); letter-spacing: .12em; }
 .device-login a { color: var(--purple); font-size: 10px; font-weight: 800; }
 .settings-error { color: var(--danger) !important; font-weight: 700; }
+.usage-block { margin-top: 12px; padding-top: 12px; border-top: 2px solid var(--border); }
+.usage-heading { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 8px; }
+.usage-heading > strong { font-size: 10px; font-weight: 850; text-transform: uppercase; letter-spacing: .04em; }
+.usage-view { display: flex; flex-direction: column; gap: 9px; }
+.usage-plan { margin: 0; color: var(--muted); font-size: 10px; }
+.usage-plan strong { color: var(--text); }
+.usage-muted { margin: 0; color: var(--muted); font-size: 10px; }
+.usage-row { display: flex; flex-direction: column; gap: 4px; }
+.usage-row-label { display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 9.5px; font-weight: 800; }
+.usage-percent { margin-left: auto; color: var(--text); font: 9.5px var(--font-mono); }
+.usage-badge { padding: 2px 6px; border: 1px solid var(--border); color: #ffffff; background: var(--danger); font-size: 8px; font-weight: 800; }
+.usage-reset { color: var(--faint); font-size: 8.5px; }
+.usage-meter { height: 8px; border: 2px solid var(--border); background: var(--panel); overflow: hidden; }
+.usage-meter > span { display: block; height: 100%; background: var(--accent); }
+.usage-meter.danger > span { background: var(--danger); }
+.usage-credits { margin: 0; color: var(--muted); font-size: 10px; }
 
 .setup-screen { height: 100%; display: grid; place-items: center; padding: 32px; overflow: auto; background: var(--panel); }
 .setup-card { width: min(500px, 100%); padding: 32px; border: 2px solid var(--border); background: #ffffff; box-shadow: var(--shadow-3); }

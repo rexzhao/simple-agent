@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from 'react'
 import { api } from '../api'
-import type { CodexAuthStatus, ModelPricing, ProviderModelSettings, ProviderSettings, ProviderSettingsDocument, ProviderSettingsInput } from '../types'
+import type { CodexAuthStatus, CodexUsage, CodexUsageCredits, CodexUsageWindow, CodexUsageWindowSet, ModelPricing, ProviderModelSettings, ProviderSettings, ProviderSettingsDocument, ProviderSettingsInput } from '../types'
 import { copyText, errorMessage, parseJSONRecord, prettyJSON } from '../lib/format'
 import { reasoningLevelLabel } from '../lib/session'
 import { PlusIcon } from './icons'
@@ -62,11 +62,16 @@ export function ProviderManagerDialog(props: {
   const [discovering, setDiscovering] = useState(false)
   const [discoveredModels, setDiscoveredModels] = useState<string[]>([])
   const [codexAuth, setCodexAuth] = useState<CodexAuthStatus | null>(null)
+  const [codexUsage, setCodexUsage] = useState<CodexUsage | null>(null)
+  const [usageLoading, setUsageLoading] = useState(false)
+  const [usageError, setUsageError] = useState<string | null>(null)
   const document = props.state.document
 
   const selectProvider = useCallback((provider: ProviderSettings) => {
     setDraft(providerDraft(provider))
     setCodexAuth(provider.codex_auth ?? null)
+    setCodexUsage(null)
+    setUsageError(null)
     setDiscoveredModels([])
   }, [])
 
@@ -143,8 +148,23 @@ export function ProviderManagerDialog(props: {
     try {
       await api.clearCodexLogin(draft.existingName)
       setCodexAuth({ status: 'signed_out' })
+      setCodexUsage(null)
+      setUsageError(null)
     } catch (reason) {
       props.onError(errorMessage(reason))
+    }
+  }
+
+  const refreshUsage = async () => {
+    if (!draft?.existingName || usageLoading) return
+    setUsageLoading(true)
+    setUsageError(null)
+    try {
+      setCodexUsage(await api.codexUsage(draft.existingName))
+    } catch (reason) {
+      setUsageError(errorMessage(reason))
+    } finally {
+      setUsageLoading(false)
     }
   }
 
@@ -208,7 +228,7 @@ export function ProviderManagerDialog(props: {
               {usesCodex && (
                 <section className="settings-section codex-auth-card">
                   <div className="settings-section-title"><h3>Codex sign-in</h3><span className={`auth-status ${codexAuth?.status ?? 'signed_out'}`}>{codexAuthLabel(codexAuth?.status)}</span></div>
-                  {codexAuth?.account_id && <p>Account: <code>{codexAuth.account_id}</code></p>}
+                  {codexAuth?.account_id && <p>Account: <code>{shortAccountID(codexAuth.account_id)}</code></p>}
                   {codexAuth?.expires_at && <p>Expires: {new Date(codexAuth.expires_at).toLocaleString()}</p>}
                   {codexAuth?.status === 'pending' && <div className="device-login"><strong>{codexAuth.user_code}</strong><button className="secondary-button" onClick={() => void copyText(codexAuth.user_code ?? '')}>Copy code</button>{codexAuth.verification_url && <a href={codexAuth.verification_url} target="_blank" rel="noreferrer">Open sign-in page</a>}</div>}
                   {codexAuth?.message && <p className="settings-error">{codexAuth.message}</p>}
@@ -217,6 +237,16 @@ export function ProviderManagerDialog(props: {
                     {(codexAuth?.status === 'signed_in' || codexAuth?.status === 'expired') && <button className="secondary-button" onClick={() => void clearCodexLogin()}>Sign out</button>}
                     {!savedCodexProvider && <small>Save the Codex provider before signing in.</small>}
                   </div>
+                  {(codexAuth?.status === 'signed_in' || codexAuth?.status === 'expired') && (
+                    <div className="usage-block">
+                      <div className="usage-heading">
+                        <strong>Usage</strong>
+                        <button className="secondary-button compact" disabled={usageLoading || !savedCodexProvider} onClick={() => void refreshUsage()}>{usageLoading ? 'Fetching…' : 'Refresh usage'}</button>
+                      </div>
+                      {usageError && <p className="settings-error">{usageError}</p>}
+                      {codexUsage && <CodexUsageView usage={codexUsage} />}
+                    </div>
+                  )}
                 </section>
               )}
 
@@ -445,4 +475,77 @@ function reasoningLevelOptions(value: string): string[] {
 
 function codexAuthLabel(status?: string): string {
   return { signed_out: 'Signed out', pending: 'Waiting for authorization', signed_in: 'Signed in', expired: 'Expired', error: 'Auth error' }[status ?? 'signed_out'] ?? status ?? 'Signed out'
+}
+
+function shortAccountID(accountID: string): string {
+  const trimmed = accountID.trim()
+  if (trimmed.length <= 12) return trimmed
+  return `${trimmed.slice(0, 8)}…${trimmed.slice(-4)}`
+}
+
+export function windowDurationLabel(seconds: number): string {
+  if (seconds <= 0) return 'usage'
+  if (seconds < 3600) return `${Math.round(seconds / 60)} min`
+  if (seconds < 86400) return `${Math.round(seconds / 3600)} h`
+  return `${Math.round(seconds / 86400)} d`
+}
+
+export function creditsLabel(credits: CodexUsageCredits): string {
+  if (credits.unlimited) return 'Unlimited'
+  if (!credits.has_credits) return 'no separate credits'
+  return `balance ${credits.balance}`
+}
+
+export function usageWindowRows(set?: CodexUsageWindowSet): { label: string; window?: CodexUsageWindow }[] {
+  if (!set) return []
+  const rows: { label: string; window?: CodexUsageWindow }[] = []
+  if (set.primary_window) rows.push({ label: `Window · ${windowDurationLabel(set.primary_window.limit_window_seconds)}`, window: set.primary_window })
+  if (set.secondary_window) rows.push({ label: `Window · ${windowDurationLabel(set.secondary_window.limit_window_seconds)}`, window: set.secondary_window })
+  return rows
+}
+
+function CodexUsageView({ usage }: { usage: CodexUsage }) {
+  const windows = usageWindowRows(usage.rate_limit)
+  const limited = usage.rate_limit?.limit_reached === true
+  return (
+    <div className="usage-view">
+      <p className="usage-plan">Plan: <strong>{capitalize(usage.plan_type)}</strong></p>
+      {usage.rate_limit && !usage.rate_limit.allowed && <p className="settings-error">Usage is currently restricted.</p>}
+      {windows.map((window) => (
+        <UsageWindowRow key={window.label} window={window.window} label={window.label} limited={limited} />
+      ))}
+      {!usage.rate_limit && <p className="usage-muted">No rate limit data available.</p>}
+      {usage.credits && <p className="usage-credits">Credits: {creditsLabel(usage.credits)}</p>}
+      {(usage.additional_rate_limits ?? []).map((additional) => (
+        <UsageWindowRow
+          key={additional.limit_name}
+          window={additional.rate_limit?.primary_window}
+          label={additional.limit_name}
+          limited={additional.rate_limit?.limit_reached === true}
+        />
+      ))}
+    </div>
+  )
+}
+
+function UsageWindowRow({ window, label, limited }: { window?: CodexUsageWindow; label: string; limited: boolean }) {
+  if (!window) return null
+  const percent = Math.max(0, Math.min(100, window.used_percent))
+  const danger = limited || percent >= 90
+  return (
+    <div className="usage-row">
+      <div className="usage-row-label">
+        <span>{label}</span>
+        <span className="usage-percent">{percent}%</span>
+        {danger && <span className="usage-badge">Limited</span>}
+      </div>
+      <div className={`usage-meter${danger ? ' danger' : ''}`}><span style={{ width: `${percent}%` }} /></div>
+      {window.reset_at > 0 && <small className="usage-reset">Resets {new Date(window.reset_at * 1000).toLocaleString()}</small>}
+    </div>
+  )
+}
+
+function capitalize(value: string): string {
+  if (!value) return value
+  return value.charAt(0).toUpperCase() + value.slice(1)
 }

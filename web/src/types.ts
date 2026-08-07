@@ -78,6 +78,45 @@ export interface CodexAuthStatus {
   verification_url?: string
 }
 
+export interface CodexUsageWindow {
+  used_percent: number
+  limit_window_seconds: number
+  reset_after_seconds: number
+  reset_at: number
+}
+
+export interface CodexUsageWindowSet {
+  allowed: boolean
+  limit_reached: boolean
+  primary_window?: CodexUsageWindow
+  secondary_window?: CodexUsageWindow | null
+}
+
+export interface CodexUsageAdditional {
+  limit_name: string
+  metered_feature: string
+  rate_limit?: CodexUsageWindowSet
+}
+
+export interface CodexUsageCredits {
+  has_credits: boolean
+  unlimited: boolean
+  overage_limit_reached: boolean
+  balance: string
+  approx_local_messages?: number[]
+  approx_cloud_messages?: number[]
+}
+
+export interface CodexUsage {
+  user_id: string
+  account_id: string
+  email: string
+  plan_type: string
+  rate_limit?: CodexUsageWindowSet
+  additional_rate_limits?: CodexUsageAdditional[]
+  credits?: CodexUsageCredits
+}
+
 export interface ProviderSettings {
   name: string
   base_url: string

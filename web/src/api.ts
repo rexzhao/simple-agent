@@ -1,4 +1,4 @@
-import type { ActiveRunDescriptor, Bootstrap, CodexAuthStatus, ImageAttachmentInput, ItemsPage, LifecycleEvent, Project, ProviderSettingsDocument, ProviderSettingsInput, RunAdmission, RunEvent, Session, SessionDebugSettings, SessionModelOptions, SessionSnapshot } from './types'
+import type { ActiveRunDescriptor, Bootstrap, CodexAuthStatus, CodexUsage, ImageAttachmentInput, ItemsPage, LifecycleEvent, Project, ProviderSettingsDocument, ProviderSettingsInput, RunAdmission, RunEvent, Session, SessionDebugSettings, SessionModelOptions, SessionSnapshot } from './types'
 import { frontendProtocolLogger, protocolLogIdentity } from './lib/frontendProtocolLogger'
 
 export interface CreateSessionOptions {
@@ -166,6 +166,7 @@ export const api = {
   }),
   codexLoginStatus: (providerName: string) => request<CodexAuthStatus>(`/api/providers/${encodeURIComponent(providerName)}/codex-login`),
   clearCodexLogin: (providerName: string) => request<void>(`/api/providers/${encodeURIComponent(providerName)}/codex-login`, { method: 'DELETE' }),
+  codexUsage: (providerName: string) => request<CodexUsage>(`/api/providers/${encodeURIComponent(providerName)}/codex-usage`),
   session: (sessionID: string) => request<Session>(`/api/sessions/${encodeURIComponent(sessionID)}`, {}, { sessionID }),
   snapshot: (sessionID: string) => request<SessionSnapshot>(`/api/sessions/${encodeURIComponent(sessionID)}/snapshot`, {}, { sessionID }),
   renameSession: (sessionID: string, displayName: string) => request<Session>(`/api/sessions/${encodeURIComponent(sessionID)}`, {
