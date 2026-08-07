@@ -6,6 +6,7 @@ import type { BlobClient } from './blobClient'
 import type { RuntimeTransport } from './runtime'
 import type { TransportCloseEvent, TransportReadyEvent } from './transport'
 import { decodeProviderDiscoverResult } from './providerCommandCodec'
+import { isProviderCreateName } from '../domain/providerIdentity'
 
 class ProviderCommandTransport implements RuntimeTransport {
   isReady = true
@@ -63,6 +64,100 @@ const target = {
 } as const
 
 describe('ProviderCommands', () => {
+  it('submits a complete create target, strictly checks result identity, and only retries in the same epoch', async () => {
+    const transport = new ProviderCommandTransport()
+    const facade = new CommandFacade({ transport, operationIDGenerator: () => 'operation_provider_create', requestIDGenerator: () => 'request_provider_create' })
+    const pending = facade.createProvider('created.provider', target, { operationID: 'operation_provider_create' })
+    const command = transport.sent[0]
+    if (command.type !== 'command') throw new Error('wrong command')
+    expect(command.payload.name).toBe('provider.create')
+    expect(command.payload.arguments).toMatchObject({ operation_id: 'operation_provider_create', provider: 'created.provider', api_key: 'secret-do-not-echo' })
+
+    transport.connectionGeneration = 2
+    transport.emitReady('epoch_1', 'epoch_1')
+    expect(transport.sent).toHaveLength(2)
+    expect(transport.sent[1]).toEqual(command)
+    const retry = transport.sent[1]
+    if (retry.type !== 'command') throw new Error('wrong retry')
+    transport.emitResult(retry.payload.request_id, { operation_id: 'operation_provider_create', provider: 'created.provider', status: 'applied' }, 2)
+    await expect(pending).resolves.toEqual({ operation_id: 'operation_provider_create', provider: 'created.provider', status: 'applied' })
+    facade.stop()
+
+    const unsafeTransport = new ProviderCommandTransport()
+    const unsafeFacade = new CommandFacade({ transport: unsafeTransport, requestIDGenerator: () => 'request_provider_create_unsafe' })
+    const unsafe = unsafeFacade.createProvider('created.provider', target, { operationID: 'operation_provider_create_unsafe' })
+    expect(unsafeTransport.sent).toHaveLength(1)
+    unsafeTransport.connectionGeneration = 2
+    unsafeTransport.emitReady('epoch_2', 'epoch_1')
+    expect(unsafeTransport.sent).toHaveLength(1)
+    await expect(unsafe).rejects.toMatchObject({ code: 'outcome_unknown' })
+    unsafeFacade.stop()
+  })
+
+  it('mirrors the execution create-only filename boundary and does not send invalid creates', async () => {
+    for (const name of ['CON', 'provider.', 'provider ', 'bad:name', 'provider?query', 'COM1.profile']) expect(isProviderCreateName(name)).toBe(false)
+    expect(isProviderCreateName('valid.provider')).toBe(true)
+    const tooLong = 'x'.repeat(253)
+    expect(isProviderCreateName(tooLong)).toBe(false)
+    for (const provider of ['CON', 'provider.', 'provider ', 'bad:name']) {
+      const transport = new ProviderCommandTransport()
+      const facade = new CommandFacade({ transport, requestIDGenerator: () => `request_invalid_create_${provider}` })
+      await expect(facade.createProvider(provider, target, { operationID: 'operation_invalid_create' })).rejects.toMatchObject({ code: 'invalid' })
+      expect(transport.sent).toHaveLength(0)
+      facade.stop()
+    }
+    const transport = new ProviderCommandTransport()
+    const facade = new CommandFacade({ transport, requestIDGenerator: () => 'request_invalid_create_target' })
+    await expect(facade.createProvider('valid.provider', { ...target, models: [] }, { operationID: 'operation_invalid_create_target' })).rejects.toMatchObject({ code: 'invalid' })
+    expect(transport.sent).toHaveLength(0)
+    facade.stop()
+  })
+
+  it('does not consume an automatically generated operation ID when target validation fails', async () => {
+    const transport = new ProviderCommandTransport()
+    let generated = 0
+    const facade = new CommandFacade({
+      transport,
+      operationIDGenerator: () => {
+        generated += 1
+        return 'operation_provider_reusable'
+      },
+      requestIDGenerator: () => 'request_provider_reusable',
+    })
+    await expect(facade.createProvider('provider-reusable', { ...target, models: [] })).rejects.toMatchObject({ code: 'invalid' })
+    expect(generated).toBe(0)
+    expect(transport.sent).toHaveLength(0)
+
+    const pending = facade.createProvider('provider-reusable', target)
+    expect(generated).toBe(1)
+    const command = transport.sent[0]
+    if (command.type !== 'command') throw new Error('wrong command')
+    expect(command.payload.arguments).toMatchObject({ operation_id: 'operation_provider_reusable' })
+    transport.emitResult(command.payload.request_id, { operation_id: 'operation_provider_reusable', provider: 'provider-reusable', status: 'applied' })
+    await expect(pending).resolves.toEqual({ operation_id: 'operation_provider_reusable', provider: 'provider-reusable', status: 'applied' })
+    facade.stop()
+  })
+
+  it('rejects create acknowledgements with extra fields or mismatched identity', async () => {
+    const transport = new ProviderCommandTransport()
+    const facade = new CommandFacade({ transport, requestIDGenerator: () => 'request_provider_create_result' })
+    const extra = facade.createProvider('provider-result', target, { operationID: 'operation_provider_result' })
+    const extraCommand = transport.sent[0]
+    if (extraCommand.type !== 'command') throw new Error('wrong command')
+    transport.emitResult(extraCommand.payload.request_id, { operation_id: 'operation_provider_result', provider: 'provider-result', status: 'applied', secret: 'must-not-be-accepted' })
+    await expect(extra).rejects.toMatchObject({ code: 'invalid' })
+    facade.stop()
+
+    const mismatchTransport = new ProviderCommandTransport()
+    const mismatchFacade = new CommandFacade({ transport: mismatchTransport, requestIDGenerator: () => 'request_provider_create_mismatch' })
+    const mismatch = mismatchFacade.createProvider('provider-result', target, { operationID: 'operation_provider_result' })
+    const mismatchCommand = mismatchTransport.sent[0]
+    if (mismatchCommand.type !== 'command') throw new Error('wrong command')
+    mismatchTransport.emitResult(mismatchCommand.payload.request_id, { operation_id: 'operation_other', provider: 'provider-result', status: 'applied' })
+    await expect(mismatch).rejects.toMatchObject({ code: 'invalid' })
+    mismatchFacade.stop()
+  })
+
   it('submits a complete Unicode target and never decodes a credential-bearing result', async () => {
     const transport = new ProviderCommandTransport()
     const facade = new CommandFacade({ transport, requestIDGenerator: () => 'request_provider_update' })

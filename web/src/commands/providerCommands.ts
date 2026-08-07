@@ -4,6 +4,11 @@ export interface ProviderCommandOptions {
   readonly signal?: AbortSignal
 }
 
+export interface ProviderCreateOptions extends ProviderCommandOptions {
+  /** Caller-owned identity for a create whose outcome may be uncertain. */
+  readonly operationID?: string
+}
+
 export interface ProviderReasoningConfig {
   readonly parameter?: string
   readonly default?: string
@@ -61,6 +66,12 @@ export interface ProviderMutationResult {
   readonly status: 'applied'
 }
 
+export interface ProviderCreateResult {
+  readonly operation_id: string
+  readonly provider: string
+  readonly status: 'applied'
+}
+
 export interface ProviderDefaultResult {
   readonly provider: string
   readonly model: string
@@ -73,6 +84,7 @@ export interface ProviderDiscoverModelsResult {
 }
 
 export interface ProviderCommands {
+  createProvider(provider: string, target: ProviderUpdateTarget, options?: ProviderCreateOptions): Promise<ProviderCreateResult>
   update(provider: string, target: ProviderUpdateTarget, options?: ProviderCommandOptions): Promise<ProviderMutationResult>
   setDefault(provider: string, model: string, options?: ProviderCommandOptions): Promise<ProviderDefaultResult>
   discoverModels(provider: string, options?: ProviderCommandOptions): Promise<ProviderDiscoverModelsResult>

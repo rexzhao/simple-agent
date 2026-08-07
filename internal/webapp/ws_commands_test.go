@@ -141,6 +141,11 @@ func providerUpdateTestArguments() json.RawMessage {
 	return json.RawMessage(`{"provider":"空 白 provider","base_url":"https://example.test/v1","api_key":"command-secret","keep_api_key":false,"auth_file":"","request_timeout":"30s","http_proxy":"","https_proxy":"","max_concurrent_requests":3,"models":[{"profile":"主 模型","id":"model-主","type":"","compatibility":"","input":["text"],"developer_role":"","context_window":1000,"input_limit":900,"output_limit":100,"parameters":{"temperature":0.2,"enabled":true,"nested":{"values":[null,2]}},"reasoning_config":{"parameter":"reasoning_effort","default":"medium","levels":{"low":"low","medium":2,"off":false,"none":null}},"pricing":{"input_cache_hit":0.1,"input_cache_miss":0.2,"cache_write":0.3,"output":0.4,"currency":"USD","long_context_threshold":10000,"long_context":null}}]}`)
 }
 
+func providerCreateTestArguments() json.RawMessage {
+	update := providerUpdateTestArguments()
+	return json.RawMessage(`{"operation_id":"operation-provider-create",` + string(update[1:]))
+}
+
 func TestProviderCommandSchemasAreStrictAndBounded(t *testing.T) {
 	valid := providerUpdateTestArguments()
 	if err := validateProviderUpdateArguments(valid); err != nil {
@@ -243,6 +248,36 @@ func TestProviderCommandSchemasAreStrictAndBounded(t *testing.T) {
 		if strings.Contains(string(redacted), secret) {
 			t.Fatalf("redacted command cache contains %q: %s", secret, redacted)
 		}
+	}
+
+	createValid := providerCreateTestArguments()
+	if err := validateProviderCreateArguments(createValid); err != nil {
+		t.Fatalf("valid provider.create arguments rejected: %v", err)
+	}
+	created, err := decodeProviderCreateArguments(createValid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if created.OperationID != "operation-provider-create" || created.Provider != "空 白 provider" || len(created.Input.Models) != 1 {
+		t.Fatalf("provider create identity/target was not preserved: %#v", created)
+	}
+	for _, raw := range []json.RawMessage{
+		json.RawMessage(`{"provider":"p","base_url":"https://example.test","api_key":"secret","keep_api_key":false,"auth_file":"","request_timeout":"","http_proxy":"","https_proxy":"","max_concurrent_requests":0,"models":[{"profile":"m"}]}`),
+		json.RawMessage(`{"operation_id":null,"provider":"p","base_url":"https://example.test","api_key":"secret","keep_api_key":false,"auth_file":"","request_timeout":"","http_proxy":"","https_proxy":"","max_concurrent_requests":0,"models":[{"profile":"m"}]}`),
+		json.RawMessage(`{"operation_id":"../escape","provider":"p","base_url":"https://example.test","api_key":"secret","keep_api_key":false,"auth_file":"","request_timeout":"","http_proxy":"","https_proxy":"","max_concurrent_requests":0,"models":[{"profile":"m"}]}`),
+		json.RawMessage(`{"operation_id":"operation-provider-create","provider":"p","base_url":"https://example.test","api_key":"secret","keep_api_key":false,"auth_file":"","request_timeout":"","http_proxy":"","https_proxy":"","max_concurrent_requests":0,"models":[{"profile":"m"}],"unknown":true}`),
+		json.RawMessage(`{"operation_id":"operation-provider-create","operation_id":"other","provider":"p","base_url":"https://example.test","api_key":"secret","keep_api_key":false,"auth_file":"","request_timeout":"","http_proxy":"","https_proxy":"","max_concurrent_requests":0,"models":[{"profile":"m"}]}`),
+		json.RawMessage(append([]byte(string(createValid)), []byte(` trailing`)...)),
+		json.RawMessage(strings.Replace(string(createValid), `"temperature":0.2`, `"temperature":"\ud800"`, 1)),
+		json.RawMessage(strings.Replace(string(createValid), `"temperature":0.2`, `"temperature":9007199254740992`, 1)),
+	} {
+		if err := validateProviderCreateArguments(raw); err == nil {
+			t.Fatalf("provider.create accepted invalid arguments: %q", raw)
+		}
+	}
+	createRedacted := redactProviderCreateArguments(createValid)
+	if string(createRedacted) != `{}` || strings.Contains(string(createRedacted), "command-secret") {
+		t.Fatalf("provider create cache tombstone = %s, secrets must be redacted", createRedacted)
 	}
 }
 
@@ -678,7 +713,7 @@ func TestSessionCommandRegistryIsClosedAndFlagsAreExplicit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantNames := []string{"project.archive", "project.create", "project.delete", "project.rename", "project.restore", "provider.discover_models", "provider.set_default", "provider.update", "run.cancel", "run.continue", "run.prompt.append", "run.prompt.move", "run.prompt.remove", "run.prompt.steer", "run.start", "run.tool.cancel", "session.archive", "session.compact", "session.create", "session.delete", "session.history.read", "session.mark_read", "session.rename", "session.restore", "session.set_debug", "session.set_full_access"}
+	wantNames := []string{"project.archive", "project.create", "project.delete", "project.rename", "project.restore", "provider.create", "provider.discover_models", "provider.set_default", "provider.update", "run.cancel", "run.continue", "run.prompt.append", "run.prompt.move", "run.prompt.remove", "run.prompt.steer", "run.start", "run.tool.cancel", "session.archive", "session.compact", "session.create", "session.delete", "session.history.read", "session.mark_read", "session.rename", "session.restore", "session.set_debug", "session.set_full_access"}
 	if got := registry.Names(); !reflect.DeepEqual(got, wantNames) {
 		t.Fatalf("registry names=%v, want %v", got, wantNames)
 	}
@@ -697,13 +732,17 @@ func TestSessionCommandRegistryIsClosedAndFlagsAreExplicit(t *testing.T) {
 		} else if definition.CachePolicy != commands.ResultCacheDurable {
 			t.Fatalf("%s unexpectedly has a volatile-result policy", name)
 		}
-		if name == "run.cancel" || name == "run.prompt.move" || name == "run.prompt.remove" || name == "run.prompt.steer" || name == "run.tool.cancel" || name == "session.compact" || name == "session.delete" || name == "project.delete" {
+		if name == "provider.create" || name == "run.cancel" || name == "run.prompt.move" || name == "run.prompt.remove" || name == "run.prompt.steer" || name == "run.tool.cancel" || name == "session.compact" || name == "session.delete" || name == "project.delete" {
 			if definition.CrossEpochRetrySafe {
 				t.Fatalf("%s must remain cross-epoch unsafe", name)
 			}
 		} else if !definition.CrossEpochRetrySafe {
 			t.Fatalf("%s must be cross-epoch safe", name)
 		}
+	}
+	createDefinition, err := registry.Definition("provider.create", 1)
+	if err != nil || createDefinition.RedactArguments == nil || string(createDefinition.RedactArguments(providerCreateTestArguments())) != `{}` {
+		t.Fatalf("provider.create must retain only a minimal cache tombstone: %#v", createDefinition)
 	}
 }
 

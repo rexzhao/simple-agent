@@ -20,9 +20,9 @@ import { isCanonicalWireIdentifier, isWellFormedString } from '../protocol/ident
 import type { ItemsPage } from '../types'
 import type { RunCancelResult, RunCommands, RunContinueOptions, RunContinueResult, RunControlOptions, RunPromptAppendOptions, RunPromptAppendResult, RunPromptMoveResult, RunPromptRemoveResult, RunPromptSteerResult, RunStartOptions, RunStartResult, RunStatus, RunToolCancelResult } from '../commands/runCommands'
 import type { ProjectArchiveResult, ProjectCommands, ProjectCreateOptions, ProjectCreateResult, ProjectDeleteResult, ProjectRenameResult } from '../commands/projectCommands'
-import type { ProviderCommands, ProviderDefaultResult, ProviderDiscoverModelsResult, ProviderMutationResult, ProviderUpdateTarget } from '../commands/providerCommands'
+import type { ProviderCommands, ProviderCreateOptions, ProviderCreateResult, ProviderDefaultResult, ProviderDiscoverModelsResult, ProviderMutationResult, ProviderUpdateTarget } from '../commands/providerCommands'
 import { encodeProviderTarget, decodeProviderDiscoverResult, validateProviderCommandJSON } from './providerCommandCodec'
-import { isProviderName } from '../domain/providerIdentity'
+import { isProviderCreateName, isProviderName } from '../domain/providerIdentity'
 import { SyncReadError } from './errors'
 import type { RuntimeTransport } from './runtime'
 import type { BlobClient } from './blobClient'
@@ -200,6 +200,14 @@ function decodeProviderMutationResult(value: unknown, provider: string): Provide
   const resultProvider = resultString(object, 'provider')
   if (resultProvider !== provider || object.status !== 'applied') throw new Error('provider result identity does not match request')
   return { provider: resultProvider, status: 'applied' }
+}
+
+function decodeProviderCreateResult(value: unknown, provider: string, operationID: string): ProviderCreateResult {
+  const object = exactObject(value, ['operation_id', 'provider', 'status'])
+  const resultOperationID = resultIdentifier(object, 'operation_id')
+  const resultProvider = resultString(object, 'provider')
+  if (resultOperationID !== operationID || resultProvider !== provider || object.status !== 'applied') throw new Error('provider create result identity does not match request')
+  return { operation_id: resultOperationID, provider: resultProvider, status: 'applied' }
 }
 
 function decodeProviderDefaultResult(value: unknown, provider: string, model: string): ProviderDefaultResult {
@@ -477,6 +485,45 @@ export class CommandFacade implements SessionCommands, RunCommands, ProjectComma
     this.setTimer = options.setTimeout ?? ((handler, timeout) => globalThis.setTimeout(handler, timeout))
     this.clearTimer = options.clearTimeout ?? ((handle) => globalThis.clearTimeout(handle))
     if (this.timeoutMS <= 0 || this.maxPendingCommands <= 0 || this.maxRecentRequestIDs <= 0 || this.maxRecentEntityIDs <= 0) throw new Error('command bounds must be positive')
+  }
+
+  createProvider(provider: string, target: ProviderUpdateTarget, options: ProviderCreateOptions = {}): Promise<ProviderCreateResult> {
+    if (!isProviderCreateName(provider)) return Promise.reject(new CommandFacadeError('invalid', 'provider create name is invalid'))
+    let encodedTarget: JsonObject
+    try {
+      encodedTarget = encodeProviderTarget(target)
+      validateProviderCommandJSON({ provider, ...encodedTarget })
+    } catch {
+      return Promise.reject(new CommandFacadeError('invalid', 'provider target is invalid'))
+    }
+    const explicitOperationID = options.operationID !== undefined
+    let operationID: string
+    if (explicitOperationID) {
+      if (typeof options.operationID !== 'string') return Promise.reject(new CommandFacadeError('invalid', 'operation_id is invalid'))
+      operationID = this.cleanID(options.operationID)
+      if (!this.validProjectOperationID(operationID)) return Promise.reject(new CommandFacadeError('invalid', 'operation_id is invalid'))
+    } else {
+      try {
+        operationID = this.cleanID(this.operationIDGenerator())
+        if (!this.validProjectOperationID(operationID)) throw new Error('operation ID is invalid')
+      } catch {
+        return Promise.reject(new CommandFacadeError('id_generation', 'cryptographic operation ID generation failed'))
+      }
+    }
+    const args: JsonObject = { operation_id: operationID, provider, ...encodedTarget }
+    try {
+      validateProviderCommandJSON(args)
+    } catch {
+      return Promise.reject(new CommandFacadeError('invalid', 'provider target is invalid'))
+    }
+    if (!explicitOperationID) {
+      if (this.recentOperationIDs.has(operationID)) return Promise.reject(new CommandFacadeError('id_generation', 'operation ID collided with an active or recently used command', { collision: true }))
+      this.rememberOperationID(operationID)
+    }
+    // Create has no durable execution claim, so a pending command is not
+    // replayed after a server epoch change. Same-epoch reconnects still use
+    // the gateway request cache and retain ordinary request-id dedupe.
+    return this.submit('provider.create', args, false, (value) => decodeProviderCreateResult(value, provider, operationID), options)
   }
 
   update(provider: string, target: ProviderUpdateTarget, options: CommandOptions = {}): Promise<ProviderMutationResult> {

@@ -134,11 +134,17 @@ type runToolCancelArguments struct {
 	ToolCallID string
 }
 
-// provider.update deliberately uses a flat, complete target document rather
-// than a patch.  The API key is the only sensitive member and is consumed
-// synchronously by the execution service; it is never included in a result or
-// in the durable command cache (the dispatcher applies the redactor on the
-// cache boundary).
+// Provider mutations deliberately use a flat, complete target document rather
+// than a patch. The create command adds a caller-owned operation identity to
+// that same document. The target may contain credentials and arbitrary model
+// parameters, so it is consumed synchronously by the execution service and is
+// never included in a result or command-cache tombstone.
+type providerCreateArguments struct {
+	OperationID string
+	Provider    string
+	Input       execution.ProviderSettingsInput
+}
+
 type providerUpdateArguments struct {
 	Provider string
 	Input    execution.ProviderSettingsInput
@@ -217,6 +223,12 @@ type sessionCompactCommandResult struct {
 type providerMutationResult struct {
 	Provider string `json:"provider"`
 	Status   string `json:"status"`
+}
+
+type providerCreateResult struct {
+	OperationID string `json:"operation_id"`
+	Provider    string `json:"provider"`
+	Status      string `json:"status"`
 }
 
 type providerDefaultResult struct {
@@ -1013,67 +1025,107 @@ func decodeProviderModel(raw json.RawMessage, command string) (execution.Provide
 	return result, nil
 }
 
+var providerTargetFields = []string{
+	"base_url", "api_key", "keep_api_key", "auth_file", "request_timeout",
+	"http_proxy", "https_proxy", "max_concurrent_requests", "models",
+}
+
+func decodeProviderTargetFields(fields map[string]json.RawMessage, command string, requireComplete bool) (string, execution.ProviderSettingsInput, error) {
+	if requireComplete {
+		for _, name := range providerTargetFields {
+			if _, ok := fields[name]; !ok {
+				return "", execution.ProviderSettingsInput{}, fmt.Errorf("invalid %s arguments", command)
+			}
+		}
+	}
+	provider, err := requiredProviderIdentity(fields, "provider", command)
+	if err != nil {
+		return "", execution.ProviderSettingsInput{}, err
+	}
+	baseURL, err := requiredProviderString(fields, "base_url", command)
+	if err != nil {
+		return "", execution.ProviderSettingsInput{}, err
+	}
+	input := execution.ProviderSettingsInput{Name: provider, BaseURL: baseURL}
+	for name, destination := range map[string]*string{"api_key": &input.APIKey, "auth_file": &input.AuthFile, "request_timeout": &input.RequestTimeout, "http_proxy": &input.HTTPProxy, "https_proxy": &input.HTTPSProxy} {
+		if value, ok := fields[name]; ok {
+			if strings.TrimSpace(string(value)) == "null" {
+				return "", execution.ProviderSettingsInput{}, fmt.Errorf("invalid %s arguments", command)
+			}
+			if err := json.Unmarshal(value, destination); err != nil || !utf8.ValidString(*destination) {
+				return "", execution.ProviderSettingsInput{}, fmt.Errorf("invalid %s arguments", command)
+			}
+		}
+	}
+	keepAPIKey, err := optionalCommandBool(fields, "keep_api_key", command)
+	if err != nil {
+		return "", execution.ProviderSettingsInput{}, err
+	}
+	if keepAPIKey != nil {
+		input.KeepAPIKey = *keepAPIKey
+	}
+	if value, ok := fields["max_concurrent_requests"]; ok {
+		if strings.TrimSpace(string(value)) == "null" {
+			return "", execution.ProviderSettingsInput{}, fmt.Errorf("invalid %s arguments", command)
+		}
+		if err := json.Unmarshal(value, &input.MaxConcurrentRequests); err != nil || input.MaxConcurrentRequests < 0 || input.MaxConcurrentRequests > providersettings.MaxWireInteger {
+			return "", execution.ProviderSettingsInput{}, fmt.Errorf("invalid %s arguments", command)
+		}
+	}
+	modelsRaw, ok := fields["models"]
+	if !ok {
+		return "", execution.ProviderSettingsInput{}, fmt.Errorf("invalid %s arguments", command)
+	}
+	var modelItems []json.RawMessage
+	decoder := json.NewDecoder(bytes.NewReader(modelsRaw))
+	if err := decoder.Decode(&modelItems); err != nil || len(modelItems) == 0 || len(modelItems) > maxCommandJSONCollectionLen {
+		return "", execution.ProviderSettingsInput{}, fmt.Errorf("invalid %s arguments", command)
+	}
+	input.Models = make([]execution.ProviderModelSettings, 0, len(modelItems))
+	for _, item := range modelItems {
+		model, err := decodeProviderModel(item, command)
+		if err != nil {
+			return "", execution.ProviderSettingsInput{}, err
+		}
+		input.Models = append(input.Models, model)
+	}
+	return provider, input, nil
+}
+
 func decodeProviderUpdateArguments(raw json.RawMessage) (providerUpdateArguments, error) {
 	const command = "provider.update"
 	fields, err := strictCommandObject(raw, command)
 	if err != nil {
 		return providerUpdateArguments{}, err
 	}
-	if err := requireExactFields(fields, command, "provider", "base_url", "api_key", "keep_api_key", "auth_file", "request_timeout", "http_proxy", "https_proxy", "max_concurrent_requests", "models"); err != nil {
+	if err := requireExactFields(fields, command, append([]string{"provider"}, providerTargetFields...)...); err != nil {
 		return providerUpdateArguments{}, err
 	}
-	provider, err := requiredProviderIdentity(fields, "provider", command)
+	provider, input, err := decodeProviderTargetFields(fields, command, false)
 	if err != nil {
 		return providerUpdateArguments{}, err
 	}
-	baseURL, err := requiredProviderString(fields, "base_url", command)
+	return providerUpdateArguments{Provider: provider, Input: input}, nil
+}
+
+func decodeProviderCreateArguments(raw json.RawMessage) (providerCreateArguments, error) {
+	const command = "provider.create"
+	fields, err := strictCommandObject(raw, command)
 	if err != nil {
-		return providerUpdateArguments{}, err
+		return providerCreateArguments{}, err
 	}
-	result := providerUpdateArguments{Provider: provider, Input: execution.ProviderSettingsInput{Name: provider, BaseURL: baseURL}}
-	for name, destination := range map[string]*string{"api_key": &result.Input.APIKey, "auth_file": &result.Input.AuthFile, "request_timeout": &result.Input.RequestTimeout, "http_proxy": &result.Input.HTTPProxy, "https_proxy": &result.Input.HTTPSProxy} {
-		if value, ok := fields[name]; ok {
-			if strings.TrimSpace(string(value)) == "null" {
-				return providerUpdateArguments{}, fmt.Errorf("invalid %s arguments", command)
-			}
-			if err := json.Unmarshal(value, destination); err != nil || !utf8.ValidString(*destination) {
-				return providerUpdateArguments{}, fmt.Errorf("invalid %s arguments", command)
-			}
-		}
+	if err := requireExactFields(fields, command, append([]string{"operation_id", "provider"}, providerTargetFields...)...); err != nil {
+		return providerCreateArguments{}, err
 	}
-	keepAPIKey, err := optionalCommandBool(fields, "keep_api_key", command)
+	operationID, err := requiredCommandString(fields, "operation_id", command)
+	if err != nil || projectstore.ValidateOperationID(operationID) != nil {
+		return providerCreateArguments{}, fmt.Errorf("invalid %s arguments", command)
+	}
+	provider, input, err := decodeProviderTargetFields(fields, command, true)
 	if err != nil {
-		return providerUpdateArguments{}, err
+		return providerCreateArguments{}, err
 	}
-	if keepAPIKey != nil {
-		result.Input.KeepAPIKey = *keepAPIKey
-	}
-	if value, ok := fields["max_concurrent_requests"]; ok {
-		if strings.TrimSpace(string(value)) == "null" {
-			return providerUpdateArguments{}, fmt.Errorf("invalid %s arguments", command)
-		}
-		if err := json.Unmarshal(value, &result.Input.MaxConcurrentRequests); err != nil || result.Input.MaxConcurrentRequests < 0 || result.Input.MaxConcurrentRequests > providersettings.MaxWireInteger {
-			return providerUpdateArguments{}, fmt.Errorf("invalid %s arguments", command)
-		}
-	}
-	modelsRaw, ok := fields["models"]
-	if !ok {
-		return providerUpdateArguments{}, fmt.Errorf("invalid %s arguments", command)
-	}
-	var modelItems []json.RawMessage
-	decoder := json.NewDecoder(bytes.NewReader(modelsRaw))
-	if err := decoder.Decode(&modelItems); err != nil || len(modelItems) == 0 || len(modelItems) > maxCommandJSONCollectionLen {
-		return providerUpdateArguments{}, fmt.Errorf("invalid %s arguments", command)
-	}
-	result.Input.Models = make([]execution.ProviderModelSettings, 0, len(modelItems))
-	for _, item := range modelItems {
-		model, err := decodeProviderModel(item, command)
-		if err != nil {
-			return providerUpdateArguments{}, err
-		}
-		result.Input.Models = append(result.Input.Models, model)
-	}
-	return result, nil
+	return providerCreateArguments{OperationID: operationID, Provider: provider, Input: input}, nil
 }
 
 func decodeProviderDefaultArguments(raw json.RawMessage) (providerDefaultArguments, error) {
@@ -1111,6 +1163,11 @@ func decodeProviderDiscoverArguments(raw json.RawMessage) (providerDiscoverArgum
 
 func validateProviderUpdateArguments(raw json.RawMessage) error {
 	_, err := decodeProviderUpdateArguments(raw)
+	return err
+}
+
+func validateProviderCreateArguments(raw json.RawMessage) error {
+	_, err := decodeProviderCreateArguments(raw)
 	return err
 }
 
@@ -1872,11 +1929,21 @@ func providerCommandError(err error) error {
 	return commands.NewDomainError("provider_command_failed", "provider command failed", nil)
 }
 
-// The durable command cache is an idempotency tombstone, not a second copy of
-// the target. Provider update arguments can contain credentials in any field
-// (including arbitrary model parameters), so retain no argument bytes at all.
-func redactProviderUpdateArguments(_ json.RawMessage) json.RawMessage {
+// The command cache is an idempotency tombstone, not a second copy of the
+// target. Provider arguments can contain credentials in any field (including
+// arbitrary model parameters), so retain no argument bytes at all. The
+// provider.create operation ID remains in the cache key/fingerprint, not in
+// cached arguments; the dispatcher retains only this minimal tombstone.
+func redactProviderArguments(_ json.RawMessage) json.RawMessage {
 	return json.RawMessage(`{}`)
+}
+
+func redactProviderCreateArguments(raw json.RawMessage) json.RawMessage {
+	return redactProviderArguments(raw)
+}
+
+func redactProviderUpdateArguments(raw json.RawMessage) json.RawMessage {
+	return redactProviderArguments(raw)
 }
 
 type sessionHistoryBlobWriter interface {
@@ -1943,6 +2010,33 @@ func newSessionCommandRegistry(service *execution.Service, runs *runRegistry, hi
 		historyWriter = historyWriters[0]
 	}
 	return commands.NewRegistry(
+		commands.CommandDefinition{
+			// CreateProviderSettings has no durable operation claim/outcome
+			// authority. The gateway cache deduplicates a request only within
+			// this server epoch; a pending create must therefore not be replayed
+			// automatically across an epoch. A later explicit create observes the
+			// execution-owned provider file: an exact duplicate and a conflicting
+			// target both fail with the same bounded public error.
+			Name: "provider.create", SchemaVersion: 1, CrossEpochRetrySafe: false,
+			CachePolicy: commands.ResultCacheDurable, SupportsExpectedRevision: false,
+			RedactArguments: redactProviderCreateArguments,
+			Validate:        validateProviderCreateArguments,
+			Execute: func(_ context.Context, request commands.CommandRequest) (json.RawMessage, error) {
+				arguments, err := decodeProviderCreateArguments(request.Arguments)
+				if err != nil {
+					return nil, err
+				}
+				if service == nil {
+					return nil, commands.NewDomainError("provider_unavailable", "provider service is not configured", nil)
+				}
+				if _, err := service.CreateProviderSettings(arguments.Input); err != nil {
+					return nil, providerCommandError(err)
+				}
+				// This is a bounded acknowledgement only. ProviderSettings is the
+				// authority and reaches the client through its resource stream.
+				return json.Marshal(providerCreateResult{OperationID: arguments.OperationID, Provider: arguments.Provider, Status: "applied"})
+			},
+		},
 		commands.CommandDefinition{
 			Name: "provider.update", SchemaVersion: 1, CrossEpochRetrySafe: true,
 			CachePolicy: commands.ResultCacheDurable, SupportsExpectedRevision: false,

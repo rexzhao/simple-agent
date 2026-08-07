@@ -1,4 +1,5 @@
 const maxProviderNameBytes = 256
+const maxProviderCreateFilenameBytes = 255
 
 function wellFormed(value: string): boolean {
   for (let index = 0; index < value.length; index += 1) {
@@ -37,5 +38,19 @@ export function isProviderName(value: unknown): value is string {
   const characters = [...value]
   if (isGoSpace(characters[0]) || isGoSpace(characters[characters.length - 1])) return false
   if (value.includes('/') || value.includes('\\') || /[\p{Cc}]/u.test(value)) return false
+  return true
+}
+
+/** Mirrors execution.validateProviderSettingsCreateFilename for early UX rejection. */
+export function isProviderCreateName(value: unknown): value is string {
+  if (!isProviderName(value) || utf8ByteLength(value) + utf8ByteLength('.yaml') > maxProviderCreateFilenameBytes) return false
+  const characters = [...value]
+  if (value.endsWith('.') || isGoSpace(characters[characters.length - 1])) return false
+  if (/[<>:"|?*]/u.test(value)) return false
+  let deviceName = value
+  const dot = deviceName.indexOf('.')
+  if (dot >= 0) deviceName = deviceName.slice(0, dot)
+  const upper = deviceName.toUpperCase()
+  if (new Set(['CON', 'PRN', 'AUX', 'NUL', 'CLOCK$', 'COM1', 'COM2', 'COM3', 'COM4', 'COM5', 'COM6', 'COM7', 'COM8', 'COM9', 'LPT1', 'LPT2', 'LPT3', 'LPT4', 'LPT5', 'LPT6', 'LPT7', 'LPT8', 'LPT9']).has(upper)) return false
   return true
 }
