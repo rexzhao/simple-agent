@@ -1,18 +1,68 @@
 import type { ResourceKey } from '../protocol/types'
 import { isProviderName } from '../domain/providerIdentity'
+import type {
+  CurrentCodexLoginProviderSignal,
+  CurrentProjectSignal,
+  CurrentSessionSignal,
+  MutableCurrentCodexLoginProviderSignal,
+  MutableCurrentProjectSignal,
+  MutableCurrentSessionSignal,
+  MutableProviderSettingsApplicationStateSignal,
+  ProviderSettingsApplicationState,
+  ProviderSettingsApplicationStateSignal,
+} from '../applicationServices'
+export type {
+  CurrentCodexLoginProviderSignal,
+  CurrentProjectSignal,
+  CurrentSessionSignal,
+  MutableCurrentCodexLoginProviderSignal,
+  MutableCurrentProjectSignal,
+  MutableCurrentSessionSignal,
+  MutableProviderSettingsApplicationStateSignal,
+  ProviderSettingsApplicationState,
+  ProviderSettingsApplicationStateSignal,
+} from '../applicationServices'
 import { SyncSubscriptionError, type SyncRuntime } from './runtime'
 
-/**
- * Application-owned navigation signal. It is intentionally not a React hook:
- * the policy must remain alive when the last page subscriber unmounts.
- */
-export interface CurrentProjectSignal {
-  get(): string | null
-  subscribe(listener: () => void): () => void
-}
+export interface ProjectIndexInterestPolicyOptions { retainReleased?: boolean }
 
-export interface MutableCurrentProjectSignal extends CurrentProjectSignal {
-  set(projectID: string | null): void
+/**
+ * The project index is application navigation state, not page state. It is
+ * therefore the one permanent resource interest owned by the composition
+ * root rather than by a selected-project signal.
+ */
+export class ProjectIndexInterestPolicy {
+  private readonly runtime: Pick<SyncRuntime, 'subscribe' | 'evict'> | { subscribe: SyncRuntime['subscribe']; evict?: SyncRuntime['evict'] }
+  private readonly retainReleased: boolean
+  private started = false
+  private releaseCurrent: (() => void) | null = null
+
+  constructor(runtime: Pick<SyncRuntime, 'subscribe' | 'evict'> | { subscribe: SyncRuntime['subscribe']; evict?: SyncRuntime['evict'] }, options: ProjectIndexInterestPolicyOptions = {}) {
+    this.runtime = runtime
+    this.retainReleased = options.retainReleased ?? true
+  }
+
+  start(): void {
+    if (this.started) return
+    this.started = true
+    try {
+      this.releaseCurrent = this.runtime.subscribe(
+        { type: 'project_index', id: 'server' },
+        { retainOnRelease: this.retainReleased },
+      )
+    } catch (reason) {
+      this.started = false
+      throw reason
+    }
+  }
+
+  stop(): void {
+    if (!this.started && !this.releaseCurrent) return
+    this.started = false
+    this.releaseCurrent?.()
+    if (!this.retainReleased) this.runtime.evict?.({ type: 'project_index', id: 'server' })
+    this.releaseCurrent = null
+  }
 }
 
 export interface SessionIndexInterestPolicyOptions {
@@ -35,25 +85,6 @@ export function createCurrentProjectSignal(initialProjectID: string | null = nul
       return () => listeners.delete(listener)
     },
   }
-}
-
-/**
- * Minimal application-level input for the provider-settings interest policy.
- * This is intentionally not a route or React signal: settings can be needed
- * by model selection before the settings page mounts.
- */
-export interface ProviderSettingsApplicationState {
-  readonly settingsEnabled: boolean
-  readonly modelSelectionNeeded: boolean
-}
-
-export interface ProviderSettingsApplicationStateSignal {
-  get(): ProviderSettingsApplicationState
-  subscribe(listener: () => void): () => void
-}
-
-export interface MutableProviderSettingsApplicationStateSignal extends ProviderSettingsApplicationStateSignal {
-  set(next: ProviderSettingsApplicationState): void
 }
 
 export function createProviderSettingsApplicationStateSignal(initial: Partial<ProviderSettingsApplicationState> = {}): MutableProviderSettingsApplicationStateSignal {
@@ -131,15 +162,6 @@ export class ProviderSettingsInterestPolicy {
       throw reason
     }
   }
-}
-
-export interface CurrentCodexLoginProviderSignal {
-  get(): string | null
-  subscribe(listener: () => void): () => void
-}
-
-export interface MutableCurrentCodexLoginProviderSignal extends CurrentCodexLoginProviderSignal {
-  set(provider: string | null): void
 }
 
 export function createCurrentCodexLoginProviderSignal(initialProvider: string | null = null): MutableCurrentCodexLoginProviderSignal {
@@ -289,15 +311,6 @@ export class SessionIndexInterestPolicy {
 }
 
 export const CurrentProjectInterestPolicy = SessionIndexInterestPolicy
-
-export interface CurrentSessionSignal {
-  get(): string | null
-  subscribe(listener: () => void): () => void
-}
-
-export interface MutableCurrentSessionSignal extends CurrentSessionSignal {
-  set(sessionID: string | null): void
-}
 
 export function createCurrentSessionSignal(initialSessionID: string | null = null): MutableCurrentSessionSignal {
   let current = initialSessionID

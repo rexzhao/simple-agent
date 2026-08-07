@@ -1,10 +1,27 @@
 import { StrictMode } from 'react'
 import { createRoot } from 'react-dom/client'
 import App from './App'
+import { SyncApplicationProvider } from './applicationContext'
+import { createSyncApplication } from './sync/applicationComposition'
 import './styles.css'
+
+// Keep the graph at application scope so StrictMode does not construct a
+// second transport/runtime/replica set. The pre-cutover App remains HTTP/SSE
+// driven; future page cutover can opt into startOnMount once it declares
+// application interest through the signals.
+const syncApplication = createSyncApplication()
+
+// React StrictMode only stops the singleton so it can be mounted again. HMR
+// is different: the module is being replaced, so the old graph must be fully
+// disposed before the replacement creates its application-scoped graph.
+if (import.meta.hot) {
+  import.meta.hot.dispose(() => syncApplication.dispose())
+}
 
 createRoot(document.getElementById('root')!).render(
   <StrictMode>
-    <App />
+    <SyncApplicationProvider application={syncApplication} startOnMount={false}>
+      <App />
+    </SyncApplicationProvider>
   </StrictMode>,
 )

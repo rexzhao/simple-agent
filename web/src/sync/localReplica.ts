@@ -92,6 +92,16 @@ export class LocalReplica {
   private records = new Map<string, ResourceRecord>()
   private listeners = new Set<ReplicaListener>()
 
+  /**
+   * Releases the process-local read model. A composition owns one replica;
+   * disposing the composition must not leave records or observers reachable
+   * through an otherwise dead application graph.
+   */
+  dispose(): void {
+    this.records.clear()
+    this.listeners.clear()
+  }
+
   subscribe(listener: ReplicaListener): () => void {
     this.listeners.add(listener)
     return () => this.listeners.delete(listener)
