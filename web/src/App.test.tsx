@@ -3,6 +3,13 @@ import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import App from './App'
 import { frontendProtocolLogger } from './lib/frontendProtocolLogger'
+import { SyncApplicationProvider } from './applicationContext'
+import { createSyncApplication } from './sync/applicationComposition'
+import { ProjectIndexAdapter } from './sync/projectIndexAdapter'
+import type { ProjectSummary } from './repositories/projectIndex'
+import type { ProtocolMessage } from './protocol/types'
+import type { RuntimeTransport } from './sync/runtime'
+import type { TransportCloseEvent, TransportReadyEvent } from './sync/transport'
 
 vi.mock('react-virtuoso', async () => {
   const React = await import('react')
@@ -87,6 +94,104 @@ vi.mock('./api', () => ({
   streamRun: mocks.streamRun,
 }))
 
+class AppTestTransport implements RuntimeTransport {
+  isReady = false
+  connectionGeneration = 0
+  serverEpoch = 'test-epoch'
+  sent: ProtocolMessage[] = []
+  startCalls = 0
+  onSend?: (message: ProtocolMessage) => void
+  private readonly messages = new Set<(message: ProtocolMessage, generation: number) => void>()
+  private readonly ready = new Set<(event: TransportReadyEvent) => void>()
+  private readonly closed = new Set<(event: TransportCloseEvent) => void>()
+
+  start(): void {
+    this.startCalls += 1
+    this.isReady = true
+    this.connectionGeneration += 1
+    const event: TransportReadyEvent = {
+      generation: this.connectionGeneration,
+      serverEpoch: this.serverEpoch,
+      connectionID: `test-connection-${this.connectionGeneration}`,
+      heartbeatIntervalMS: 15_000,
+      maxMessageBytes: 256 * 1024,
+    }
+    for (const listener of [...this.ready]) listener(event)
+  }
+
+  stop(): void {
+    if (!this.isReady) return
+    this.isReady = false
+    const event: TransportCloseEvent = { generation: this.connectionGeneration, willRetry: false }
+    for (const listener of [...this.closed]) listener(event)
+  }
+
+  send(message: ProtocolMessage): void {
+    this.sent.push(message)
+    this.onSend?.(message)
+  }
+  emit(message: ProtocolMessage): void {
+    for (const listener of [...this.messages]) listener(message, this.connectionGeneration)
+  }
+  emitClose(willRetry = true): void {
+    this.isReady = false
+    for (const listener of [...this.closed]) listener({ generation: this.connectionGeneration, willRetry })
+  }
+  onMessage(listener: (message: ProtocolMessage, generation: number) => void): () => void { this.messages.add(listener); return () => this.messages.delete(listener) }
+  onReady(listener: (event: TransportReadyEvent) => void): () => void { this.ready.add(listener); return () => this.ready.delete(listener) }
+  onClose(listener: (event: TransportCloseEvent) => void): () => void { this.closed.add(listener); return () => this.closed.delete(listener) }
+}
+
+const testApplications = new Set<ReturnType<typeof createSyncApplication>>()
+
+const defaultProject: ProjectSummary = {
+  id: 'project-1',
+  root: '/workspace',
+  display_name: 'project',
+  archived: false,
+  created_at: '2026-01-01T00:00:00Z',
+  updated_at: '2026-01-01T00:00:00Z',
+}
+
+function renderApp(projects: readonly ProjectSummary[] = [defaultProject]) {
+  const transport = new AppTestTransport()
+  const application = createSyncApplication({ transport })
+  const adapter = new ProjectIndexAdapter()
+  application.replica.applySnapshot(
+    { type: 'project_index', id: 'server' },
+    adapter,
+    { projects: [...projects] },
+    { streamEpoch: 'test', sequence: '0' as never, resourceRevision: '0', generation: 0 },
+  )
+  testApplications.add(application)
+  const view = render(
+    <SyncApplicationProvider application={application}>
+      <App />
+    </SyncApplicationProvider>,
+  )
+  return Object.assign(view, { application, transport })
+}
+
+function respondToProjectCommand(transport: AppTestTransport, message: ProtocolMessage, result: unknown): void {
+  if (message.type !== 'command') return
+  transport.emit({
+    version: 1,
+    type: 'command_result',
+    id: `result-${message.payload.request_id}`,
+    payload: { request_id: message.payload.request_id, status: 'succeeded', result },
+  } as unknown as ProtocolMessage)
+}
+
+function failProjectCommand(transport: AppTestTransport, message: ProtocolMessage, code = 'permission_denied'): void {
+  if (message.type !== 'command') return
+  transport.emit({
+    version: 1,
+    type: 'command_result',
+    id: `result-${message.payload.request_id}`,
+    payload: { request_id: message.payload.request_id, status: 'failed', error: { code, message: 'protocol-secret-not-for-ui' } },
+  } as unknown as ProtocolMessage)
+}
+
 describe('App lifecycle bootstrap', () => {
   function resetApiMocks() {
     mocks.api.bootstrap.mockReset().mockResolvedValue({ version: 'test', cwd: '/workspace', server_root: '/workspace', config_path: '/config' })
@@ -112,16 +217,294 @@ describe('App lifecycle bootstrap', () => {
     vi.clearAllMocks()
     vi.restoreAllMocks()
     frontendProtocolLogger.resetForTesting()
+    for (const application of testApplications) application.dispose()
+    testApplications.clear()
   })
 
   it('does not poll sessions or active runs while a run remains active', async () => {
-    const view = render(<App />)
+    const view = renderApp()
     await waitFor(() => expect(mocks.api.sessions).toHaveBeenCalledTimes(2))
 
     vi.useFakeTimers()
     await act(async () => { await vi.advanceTimersByTimeAsync(5000) })
     expect(mocks.api.activeRuns).toHaveBeenCalledTimes(1)
     expect(mocks.api.sessions).toHaveBeenCalledTimes(2)
+    view.unmount()
+  })
+
+  it('offers a retry for cached project data after terminal transport failure', async () => {
+    const view = renderApp()
+    await waitFor(() => expect(screen.getByText('project')).toBeTruthy())
+    const subscribeCountBeforeClose = view.transport.sent.filter((message) => message.type === 'subscribe' && message.payload.resource.type === 'project_index').length
+    const startCallsBeforeRetry = view.transport.startCalls
+
+    view.transport.emitClose(false)
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Retry project synchronization' })).toBeTruthy())
+    expect(view.application.repositories.projectIndex.getSnapshot().status).toBe('stale')
+
+    fireEvent.click(screen.getByRole('button', { name: 'Retry project synchronization' }))
+    await waitFor(() => expect(view.transport.startCalls).toBe(startCallsBeforeRetry + 1))
+    await waitFor(() => expect(view.transport.sent.filter((message) => message.type === 'subscribe' && message.payload.resource.type === 'project_index').length).toBeGreaterThan(subscribeCountBeforeClose))
+    view.unmount()
+  })
+
+  it('keeps project navigation on the authoritative index and selects the next project after removal', async () => {
+    const projects: ProjectSummary[] = [
+      defaultProject,
+      { ...defaultProject, id: 'project-2', root: '/workspace/project-2', display_name: 'project two', created_at: '2026-01-02T00:00:00Z' },
+      { ...defaultProject, id: 'project-3', root: '/workspace/project-3', display_name: 'project three', created_at: '2026-01-03T00:00:00Z' },
+    ]
+    const view = renderApp(projects)
+    await waitFor(() => expect(screen.getByText('project two')).toBeTruthy())
+
+    fireEvent.click(screen.getByText('project two'))
+    await waitFor(() => expect(view.application.signals.currentProject.get()).toBe('project-2'))
+
+    const adapter = new ProjectIndexAdapter()
+    await act(async () => {
+      view.application.replica.applyChange(
+        { type: 'project_index', id: 'server' },
+        adapter,
+        [{ op: 'upsert', key: 'project-2', value: { ...projects[1], display_name: 'project two renamed', updated_at: '2026-01-04T00:00:00Z' } }],
+        { streamEpoch: 'test', sequence: '1' as never, resourceRevision: '1', generation: 1 },
+      )
+    })
+    await waitFor(() => expect(screen.getByText('project two renamed')).toBeTruthy())
+    expect(view.application.signals.currentProject.get()).toBe('project-2')
+
+    await act(async () => {
+      view.application.replica.applyChange(
+        { type: 'project_index', id: 'server' },
+        adapter,
+        [{ op: 'remove', key: 'project-2' }],
+        { streamEpoch: 'test', sequence: '2' as never, resourceRevision: '2', generation: 1 },
+      )
+    })
+
+    await waitFor(() => {
+      const selectedProjectHeader = screen.getByText('project three').closest('.project-tree-header')
+      expect(selectedProjectHeader?.className).toContain('selected')
+      expect(view.application.signals.currentProject.get()).toBe('project-3')
+    })
+    expect(screen.queryByText('project two')).toBeNull()
+    // Project index IDs, not the legacy project endpoint, enumerate the
+    // temporary session REST projection.
+    expect(mocks.api.projects).not.toHaveBeenCalled()
+    view.unmount()
+  })
+
+  it('shows only active projects and selects deterministically across archive and restore changes', async () => {
+    const projects: ProjectSummary[] = [
+      defaultProject,
+      { ...defaultProject, id: 'project-2', root: '/workspace/project-2', display_name: 'project two', created_at: '2026-01-02T00:00:00Z' },
+      { ...defaultProject, id: 'project-3', root: '/workspace/project-3', display_name: 'project three', created_at: '2026-01-03T00:00:00Z' },
+    ]
+    const view = renderApp(projects)
+    await waitFor(() => expect(screen.getByText('project two')).toBeTruthy())
+    fireEvent.click(screen.getByText('project two'))
+    await waitFor(() => expect(view.application.signals.currentProject.get()).toBe('project-2'))
+    const adapter = new ProjectIndexAdapter()
+
+    await act(async () => {
+      view.application.replica.applyChange(
+        { type: 'project_index', id: 'server' },
+        adapter,
+        [{ op: 'upsert', key: 'project-2', value: { ...projects[1], archived: true, updated_at: '2026-01-04T00:00:00Z' } }],
+        { streamEpoch: 'test', sequence: '1' as never, resourceRevision: '1', generation: 1 },
+      )
+    })
+    await waitFor(() => {
+      expect(screen.queryByText('project two')).toBeNull()
+      expect(view.application.signals.currentProject.get()).toBe('project-3')
+    })
+
+    await act(async () => {
+      view.application.replica.applyChange(
+        { type: 'project_index', id: 'server' },
+        adapter,
+        [{ op: 'upsert', key: 'project-2', value: { ...projects[1], archived: false, updated_at: '2026-01-05T00:00:00Z' } }],
+        { streamEpoch: 'test', sequence: '2' as never, resourceRevision: '2', generation: 1 },
+      )
+    })
+    await waitFor(() => expect(screen.getByText('project two')).toBeTruthy())
+    expect(view.application.signals.currentProject.get()).toBe('project-3')
+    view.unmount()
+  })
+
+  it('enumerates legacy sessions for a project added by the authoritative active index', async () => {
+    const view = renderApp()
+    await waitFor(() => expect(mocks.api.sessions).toHaveBeenCalledTimes(2))
+    const callsBefore = mocks.api.sessions.mock.calls.filter(([projectID]) => projectID === 'project-2').length
+    const adapter = new ProjectIndexAdapter()
+    await act(async () => {
+      view.application.replica.applyChange(
+        { type: 'project_index', id: 'server' },
+        adapter,
+        [{ op: 'upsert', key: 'project-2', value: { ...defaultProject, id: 'project-2', root: '/workspace/project-2', display_name: 'arrived project' } }],
+        { streamEpoch: 'test', sequence: '1' as never, resourceRevision: '1', generation: 0 },
+      )
+    })
+    await waitFor(() => expect(mocks.api.sessions.mock.calls.filter(([projectID]) => projectID === 'project-2').length).toBe(callsBefore + 2))
+    expect(mocks.api.projects).not.toHaveBeenCalled()
+    view.unmount()
+  })
+
+  it('does not let an empty-state project form hide a project arriving from the authority, or close a manual form', async () => {
+    const emptyView = renderApp([])
+    await screen.findByText('Connect your first project')
+    const adapter = new ProjectIndexAdapter()
+    await act(async () => {
+      emptyView.application.replica.applyChange(
+        { type: 'project_index', id: 'server' },
+        adapter,
+        [{ op: 'upsert', key: 'project-1', value: { ...defaultProject } }],
+        { streamEpoch: 'test', sequence: '1' as never, resourceRevision: '1', generation: 0 },
+      )
+    })
+    await waitFor(() => {
+      expect(screen.getByText('project')).toBeTruthy()
+      expect(screen.queryByText('Connect your first project')).toBeNull()
+    })
+    emptyView.unmount()
+
+    const manualView = renderApp()
+    await waitFor(() => expect(screen.getByText('project')).toBeTruthy())
+    fireEvent.click(screen.getByRole('button', { name: 'Add project' }))
+    await screen.findByText('Add another project')
+    await act(async () => {
+      manualView.application.replica.applyChange(
+        { type: 'project_index', id: 'server' },
+        adapter,
+        [{ op: 'upsert', key: 'project-2', value: { ...defaultProject, id: 'project-2', display_name: 'unrelated project' } }],
+        { streamEpoch: 'test', sequence: '1' as never, resourceRevision: '1', generation: 0 },
+      )
+    })
+    await waitFor(() => expect(screen.getByText('Add another project')).toBeTruthy())
+    manualView.unmount()
+  })
+
+  it('keeps create and rename command acknowledgements separate from project authority changes', async () => {
+    const view = renderApp()
+    await waitFor(() => expect(screen.getByText('project')).toBeTruthy())
+    view.transport.onSend = (message) => {
+      if (message.type !== 'command') return
+      if (message.payload.name === 'project.create') {
+        respondToProjectCommand(view.transport, message, { operation_id: message.payload.arguments.operation_id, project_id: 'project-2', created: true })
+      }
+    }
+    fireEvent.click(screen.getByRole('button', { name: 'Add project' }))
+    fireEvent.change(screen.getByLabelText('Project directory'), { target: { value: '/workspace/project-2' } })
+    fireEvent.change(screen.getByLabelText(/Display name/), { target: { value: 'new project' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Connect project' }))
+    await waitFor(() => expect(view.transport.sent.some((message) => message.type === 'command' && message.payload.name === 'project.create')).toBe(true))
+    await Promise.resolve()
+    expect(screen.queryByText('new project')).toBeNull()
+    expect(view.application.repositories.projectIndex.getSnapshot().active.map((project) => project.id)).toEqual(['project-1'])
+
+    const adapter = new ProjectIndexAdapter()
+    await act(async () => {
+      view.application.replica.applyChange(
+        { type: 'project_index', id: 'server' },
+        adapter,
+        [{ op: 'upsert', key: 'project-2', value: { ...defaultProject, id: 'project-2', root: '/workspace/project-2', display_name: 'new project' } }],
+        { streamEpoch: 'test', sequence: '1' as never, resourceRevision: '1', generation: 0 },
+      )
+    })
+    await waitFor(() => expect(screen.getByText('new project')).toBeTruthy())
+
+    vi.spyOn(window, 'prompt').mockReturnValue('renamed project')
+    view.transport.onSend = (message) => {
+      if (message.type === 'command' && message.payload.name === 'project.rename') {
+        respondToProjectCommand(view.transport, message, { project_id: 'project-2', display_name: 'renamed project' })
+      }
+    }
+    fireEvent.click(screen.getByRole('button', { name: 'Rename new project' }))
+    await waitFor(() => expect(view.transport.sent.some((message) => message.type === 'command' && message.payload.name === 'project.rename')).toBe(true))
+    await Promise.resolve()
+    expect(screen.getByText('new project')).toBeTruthy()
+    // The public repository intentionally has no mutation-through-result API;
+    // the underlying replica still has the old authoritative name.
+    expect(view.application.repositories.projectIndex.getSnapshot().active.find((project) => project.id === 'project-2')?.display_name).toBe('new project')
+
+    await act(async () => {
+      view.application.replica.applyChange(
+        { type: 'project_index', id: 'server' },
+        adapter,
+        [{ op: 'upsert', key: 'project-2', value: { ...defaultProject, id: 'project-2', root: '/workspace/project-2', display_name: 'renamed project', updated_at: '2026-01-02T00:00:00Z' } }],
+        { streamEpoch: 'test', sequence: '2' as never, resourceRevision: '2', generation: 0 },
+      )
+    })
+    await waitFor(() => expect(screen.getByText('renamed project')).toBeTruthy())
+    view.unmount()
+  })
+
+  it('waits for authoritative archive and delete changes in order, without restoring on unknown outcome', async () => {
+    mocks.api.sessions.mockResolvedValue({ sessions: [] })
+    mocks.api.activeRuns.mockResolvedValue({ runs: [] })
+    const view = renderApp()
+    await waitFor(() => expect(screen.getByText('project')).toBeTruthy())
+    vi.spyOn(window, 'confirm').mockReturnValue(true)
+    view.transport.onSend = (message) => {
+      if (message.type !== 'command') return
+      if (message.payload.name === 'project.archive') {
+        respondToProjectCommand(view.transport, message, { project_id: 'project-1', archived: true })
+      } else if (message.payload.name === 'project.delete') {
+        failProjectCommand(view.transport, message, 'outcome_unknown')
+      }
+    }
+    fireEvent.click(screen.getByRole('button', { name: 'Delete project' }))
+    await waitFor(() => expect(view.transport.sent.filter((message) => message.type === 'command').map((message) => message.payload.name)).toEqual(['project.archive']))
+    expect(screen.getAllByText('project').length).toBeGreaterThan(0)
+
+    const adapter = new ProjectIndexAdapter()
+    await act(async () => {
+      view.application.replica.applyChange(
+        { type: 'project_index', id: 'server' },
+        adapter,
+        [{ op: 'upsert', key: 'project-1', value: { ...defaultProject, archived: true, updated_at: '2026-01-02T00:00:00Z' } }],
+        { streamEpoch: 'test', sequence: '1' as never, resourceRevision: '1', generation: 0 },
+      )
+    })
+    await waitFor(() => expect(view.transport.sent.filter((message) => message.type === 'command').map((message) => message.payload.name)).toEqual(['project.archive', 'project.delete']))
+    await waitFor(() => expect(screen.getAllByRole('alert').some((element) => element.textContent?.includes('Project operation failed.'))).toBe(true))
+    expect(view.transport.sent.some((message) => message.type === 'command' && message.payload.name === 'project.restore')).toBe(false)
+    expect(view.application.repositories.projectIndex.getSnapshot().summaries.find((project) => project.id === 'project-1')?.archived).toBe(true)
+    view.unmount()
+  })
+
+  it('does not mutate or restore when authoritative archive observation times out', async () => {
+    mocks.api.sessions.mockResolvedValue({ sessions: [] })
+    mocks.api.activeRuns.mockResolvedValue({ runs: [] })
+    const view = renderApp()
+    await waitFor(() => expect(screen.getByText('project')).toBeTruthy())
+    vi.spyOn(window, 'confirm').mockReturnValue(true)
+    view.transport.onSend = (message) => {
+      if (message.type === 'command' && message.payload.name === 'project.archive') {
+        respondToProjectCommand(view.transport, message, { project_id: 'project-1', archived: true })
+      }
+    }
+    vi.useFakeTimers()
+    fireEvent.click(screen.getByRole('button', { name: 'Delete project' }))
+    await act(async () => { await vi.advanceTimersByTimeAsync(5001) })
+    expect(view.transport.sent.filter((message) => message.type === 'command').map((message) => message.payload.name)).toEqual(['project.archive'])
+    expect(view.transport.sent.some((message) => message.type === 'command' && message.payload.name === 'project.restore')).toBe(false)
+    expect(view.application.repositories.projectIndex.getSnapshot().active[0]?.id).toBe('project-1')
+    expect(screen.getAllByRole('alert').some((element) => element.textContent?.includes('Project change accepted; waiting for synchronization.'))).toBe(true)
+    view.unmount()
+  })
+
+  it('surfaces project command failure safely and leaves the authoritative name unchanged', async () => {
+    const view = renderApp()
+    await waitFor(() => expect(screen.getAllByText('project').length).toBeGreaterThan(0))
+    vi.spyOn(window, 'prompt').mockReturnValue('should not apply')
+    view.transport.onSend = (message) => {
+      if (message.type === 'command' && message.payload.name === 'project.rename') failProjectCommand(view.transport, message)
+    }
+    fireEvent.click(screen.getByRole('button', { name: 'Rename project' }))
+    await waitFor(() => expect(screen.getAllByRole('alert').some((element) => element.textContent?.includes('Project operation failed.'))).toBe(true))
+    expect(screen.getAllByText('project').length).toBeGreaterThan(0)
+    expect(screen.queryByText('protocol-secret-not-for-ui')).toBeNull()
+    expect(view.application.repositories.projectIndex.getSnapshot().active[0]?.display_name).toBe('project')
     view.unmount()
   })
 
@@ -185,7 +568,7 @@ describe('App lifecycle bootstrap', () => {
       })
     })
 
-    const view = render(<App />)
+    const view = renderApp()
     await waitFor(() => expect(screen.getByText('projected answer')).toBeTruthy())
     expect(screen.queryByText('must wait for snapshot')).toBeNull()
     expect(mocks.streamRun).toHaveBeenCalled()
@@ -208,7 +591,7 @@ describe('App lifecycle bootstrap', () => {
     mocks.api.snapshot.mockResolvedValue(snapshot)
     mocks.streamRun.mockReset()
     mocks.streamRun.mockResolvedValue(undefined)
-    const view = render(<App />)
+    const view = renderApp()
     const composer = await screen.findByRole('textbox')
     return { view, composer }
   }
@@ -447,7 +830,7 @@ describe('App lifecycle bootstrap', () => {
     mocks.streamRun.mockImplementation(async (_runID: string, handler: (event: unknown) => void | Promise<void>) => {
       onEvent = handler
     })
-    const view = render(<App />)
+    const view = renderApp()
     await screen.findByRole('textbox')
     await waitFor(() => expect(onEvent).toBeDefined())
     return { view, onEvent: onEvent! }
@@ -754,7 +1137,7 @@ describe('App lifecycle bootstrap', () => {
       return await new Promise<void>(() => {})
     })
 
-    const view = render(<App />)
+    const view = renderApp()
     const composer = await screen.findByRole('textbox')
     await waitFor(() => expect(mocks.streamRun).toHaveBeenCalledTimes(1))
     const oldHandler = mocks.streamRun.mock.calls[0][1] as (event: unknown) => Promise<void> | void
@@ -813,7 +1196,7 @@ describe('App lifecycle bootstrap', () => {
       return await new Promise<void>(() => {})
     })
 
-    const view = render(<App />)
+    const view = renderApp()
     const composer = await screen.findByRole('textbox')
     await waitFor(() => expect(mocks.streamRun).toHaveBeenCalledTimes(1))
     const oldHandler = mocks.streamRun.mock.calls[0][1] as (event: unknown) => Promise<void> | void
@@ -899,7 +1282,7 @@ describe('App lifecycle bootstrap', () => {
       })
       await onEvent({ type: 'run.settled', run_id: 'background-run', status: 'committed', committed_revision: '5' })
     })
-    const view = render(<App />)
+    const view = renderApp()
     await screen.findByRole('textbox')
     fireEvent.click(screen.getByText('background-session'))
     await waitFor(() => expect(mocks.api.snapshot).toHaveBeenCalledTimes(2))

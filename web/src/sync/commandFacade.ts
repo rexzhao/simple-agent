@@ -634,7 +634,7 @@ export class CommandFacade implements SessionCommands, RunCommands, ProjectComma
 
   createProject(root: string, displayName: string, options: ProjectCreateOptions = {}, commandOptions: CommandOptions = {}): Promise<ProjectCreateResult> {
     if (typeof root !== 'string' || root.trim() === '' || !isWellFormedString(root) || this.utf8Bytes(root) > 4096) return Promise.reject(new CommandFacadeError('invalid', 'root is invalid'))
-    if (typeof displayName !== 'string' || displayName.trim() === '' || !isWellFormedString(displayName) || this.utf8Bytes(displayName.trim()) > 4096) return Promise.reject(new CommandFacadeError('invalid', 'display_name is invalid'))
+    if (typeof displayName !== 'string' || !isWellFormedString(displayName) || this.utf8Bytes(displayName.trim()) > 4096) return Promise.reject(new CommandFacadeError('invalid', 'display_name is invalid'))
     const cleanDisplayName = displayName.trim()
     const explicitOperationID = options.operationID !== undefined
     let operationID: string

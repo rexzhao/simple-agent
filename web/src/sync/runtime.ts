@@ -80,6 +80,8 @@ interface Subscription {
   resourceRevision?: string
   resume?: { stream_epoch: string; sequence: Sequence }
   phase: 'waiting' | 'snapshot' | 'resuming' | 'live' | 'error'
+  /** The transport, rather than this resource, is the reason it is waiting. */
+  transportTerminalError: boolean
   queue: Array<ChangeMessage | SubscriptionEventMessage>
   queueBytes: number
   snapshotBusy: boolean
@@ -219,6 +221,79 @@ export class SyncRuntime {
     this.transport.stop()
   }
 
+  /**
+   * Requests recovery for an errored resource through the existing transport.
+   * This is the page retry seam; it does not issue a REST reload or create a
+   * second runtime/socket.
+   */
+  retry(resource?: ResourceKey): void {
+    if (!this.started) return
+    const targets = resource
+      ? [...this.subscriptions.values()].filter((subscription) => resourceMatches(subscription.resource, resource))
+      : [...this.subscriptions.values()]
+    let wakeTransport = false
+    for (const subscription of targets) {
+      if (subscription.phase !== 'error' && !subscription.transportTerminalError) continue
+      const oldID = subscription.socketGeneration === undefined ? '' : subscription.subscriptionID
+      subscription.snapshotAbort?.abort()
+      subscription.snapshotAbort = null
+      subscription.snapshotBusy = false
+      subscription.queue = []
+      subscription.queueBytes = 0
+      subscription.socketGeneration = undefined
+      subscription.requestID = undefined
+      subscription.streamEpoch = undefined
+      subscription.sequence = undefined
+      subscription.subscribedBarrier = undefined
+      subscription.resourceRevision = undefined
+      subscription.phase = 'waiting'
+      subscription.transportTerminalError = false
+      subscription.resyncing = false
+      subscription.resyncAttempts = 0
+      subscription.resume = undefined
+      this.replica.markStale(subscription.resource, undefined, subscription.generation)
+      // Recovery is scoped to this resource. Never tear down the shared
+      // socket: doing so would invalidate unrelated subscriptions and make
+      // in-flight command outcomes unknown.
+      if (this.transport.isReady) {
+        if (oldID) {
+          const unsubscribe: UnsubscribeMessage = emptyPayloadMessage('unsubscribe', messageID('unsubscribe'), { subscription_id: oldID }) as UnsubscribeMessage
+          try { this.transport.send(unsubscribe) } catch { /* best effort */ }
+        }
+        this.sendSubscription(subscription, this.transport.connectionGeneration, true)
+      } else {
+        // A transport which exhausted its reconnect budget is no longer
+        // running.  start() is the idempotent wake-up seam for that case and
+        // is also a no-op while an ordinary reconnect is already in flight.
+        wakeTransport = true
+      }
+    }
+    if (wakeTransport) {
+      try {
+        this.transport.start()
+        // Test/embedded transports may become ready synchronously without
+        // emitting a separate ready callback.  Real WebSocketTransport stays
+        // connecting here and will call handleReady from its event.
+        if (this.transport.isReady) {
+          this.handleReady({
+            generation: this.transport.connectionGeneration,
+            serverEpoch: this.transport.serverEpoch ?? '',
+            connectionID: '',
+            heartbeatIntervalMS: 0,
+            maxMessageBytes: 0,
+          })
+        }
+      } catch (reason) {
+        for (const subscription of targets) {
+          if (subscription.phase !== 'waiting') continue
+          subscription.phase = 'error'
+          subscription.transportTerminalError = false
+          this.replica.markError(subscription.resource, asSyncReadError(reason, 'transport', subscription.key), subscription.generation)
+        }
+      }
+    }
+  }
+
   subscribe(resource: ResourceKey, options: SyncSubscribeOptions = {}): () => void {
     validateResourceKey(resource)
     const key = resourceKeyString(resource)
@@ -239,6 +314,7 @@ export class SyncRuntime {
       generation: 0,
       subscriptionID: '',
       phase: 'waiting',
+      transportTerminalError: false,
       queue: [],
       queueBytes: 0,
       snapshotBusy: false,
@@ -314,11 +390,19 @@ export class SyncRuntime {
   }
 
   private handleClose(event: TransportCloseEvent): void {
-    if (!this.started || ![...this.subscriptions.values()].some((subscription) => subscription.socketGeneration === event.generation)) return
+    if (!this.started) return
+    const hasMatchingSocket = [...this.subscriptions.values()].some((subscription) => subscription.socketGeneration === event.generation)
+    // A retrying close is only meaningful for subscriptions which were bound
+    // to that socket.  A terminal close is different: the transport can
+    // exhaust its budget before any subscription ever receives a socket
+    // generation, so it must still publish a resource error.
+    if (event.willRetry && !hasMatchingSocket) return
+    if (!event.willRetry && event.generation !== this.transport.connectionGeneration) return
     this.readyGeneration = undefined
     this.reconnectingTransport = false
     for (const subscription of this.subscriptions.values()) {
-      const terminal = subscription.phase === 'error'
+      const resourceTerminal = subscription.phase === 'error'
+      const sharedTransportTerminal = !event.willRetry && !resourceTerminal
       if (subscription.streamEpoch && subscription.sequence) {
         subscription.resume = { stream_epoch: subscription.streamEpoch, sequence: subscription.sequence }
       }
@@ -328,16 +412,20 @@ export class SyncRuntime {
       subscription.queue = []
       subscription.queueBytes = 0
       subscription.socketGeneration = undefined
-      subscription.phase = terminal ? 'error' : 'waiting'
-      this.replica.markStale(subscription.resource, new SyncReadError('transport', 'WebSocket disconnected'), subscription.generation)
+      subscription.phase = resourceTerminal ? 'error' : 'waiting'
+      subscription.transportTerminalError = sharedTransportTerminal
+      const reason = new SyncReadError('transport', 'WebSocket disconnected')
+      if (!event.willRetry) this.replica.markError(subscription.resource, reason, subscription.generation)
+      else this.replica.markStale(subscription.resource, reason, subscription.generation)
     }
   }
 
-  private sendSubscription(subscription: Subscription, socketGeneration = this.transport.connectionGeneration): void {
+  private sendSubscription(subscription: Subscription, socketGeneration = this.transport.connectionGeneration, isolatedRecovery = false): void {
     if (!this.started || !this.transport.isReady) return
     subscription.snapshotAbort?.abort()
     subscription.snapshotAbort = null
     subscription.snapshotBusy = false
+    subscription.transportTerminalError = false
     subscription.generation += 1
     const nextSubscriptionID = `${subscription.resource.type}/${subscription.resource.id}:${subscription.generation}`
     this.replica.markStale(subscription.resource, this.replica.get(subscription.resource).metadata.error, subscription.generation)
@@ -370,8 +458,15 @@ export class SyncRuntime {
     const message: SubscribeMessage = emptyPayloadMessage('subscribe', requestID, payload) as SubscribeMessage
     try {
       this.transport.send(message)
-    } catch {
-      this.transportFailure(subscription, new SyncReadError('transport', 'subscription could not be sent'))
+    } catch (reason) {
+      const failure = new SyncReadError('transport', 'subscription could not be sent', subscription.key)
+      if (isolatedRecovery) {
+        subscription.phase = 'error'
+        subscription.transportTerminalError = false
+        this.replica.markError(subscription.resource, asSyncReadError(reason, failure.code, subscription.key), subscription.generation)
+      } else {
+        this.transportFailure(subscription, failure)
+      }
     }
   }
 
@@ -760,6 +855,7 @@ export class SyncRuntime {
       }
       subscription.resyncing = false
       subscription.phase = 'error'
+      subscription.transportTerminalError = false
       this.replica.markError(subscription.resource, reason, subscription.generation)
       return
     }

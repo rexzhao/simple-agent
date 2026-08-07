@@ -385,6 +385,9 @@ func TestProjectCommandSchemasAreStrict(t *testing.T) {
 	if err := validateProjectCreateArguments(validCreate); err != nil {
 		t.Fatalf("valid project.create rejected: %v", err)
 	}
+	if err := validateProjectCreateArguments(json.RawMessage(`{"operation_id":"operation_project_empty","root":"/tmp/project-empty","display_name":""}`)); err != nil {
+		t.Fatalf("empty optional project display name rejected: %v", err)
+	}
 	invalidCreates := []json.RawMessage{
 		json.RawMessage(`{"operation_id":"operation_project_1","root":"/tmp/project","display_name":"Project","unknown":true}`),
 		json.RawMessage(`{"operation_id":"operation_project_1","root":"/tmp/project","display_name":"Project","operation_id":"other"}`),
@@ -466,6 +469,15 @@ func TestProjectCommandLifecycleUsesTypedExecutionRules(t *testing.T) {
 	}
 	if !created.Created || created.ProjectID == "" || created.OperationID != "operation_lifecycle" {
 		t.Fatalf("project.create result = %#v", created)
+	}
+	var emptyCreated projectCreateResult
+	if err := json.Unmarshal(execute("project.create", map[string]string{
+		"operation_id": "operation_empty_name", "root": t.TempDir(), "display_name": "",
+	}), &emptyCreated); err != nil {
+		t.Fatalf("empty-name project.create result decode: %v", err)
+	}
+	if !emptyCreated.Created || emptyCreated.ProjectID == "" || emptyCreated.OperationID != "operation_empty_name" {
+		t.Fatalf("empty-name project.create result = %#v", emptyCreated)
 	}
 
 	var renamed projectRenameResult

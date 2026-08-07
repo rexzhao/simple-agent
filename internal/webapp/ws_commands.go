@@ -669,6 +669,21 @@ func requiredCommandString(fields map[string]json.RawMessage, name, command stri
 	return value, nil
 }
 
+// requiredCommandStringAllowEmpty keeps the wire field required and applies
+// the same trimming/UTF-8 boundary as requiredCommandString, but permits the
+// empty value for domain fields whose empty value has an established meaning.
+func requiredCommandStringAllowEmpty(fields map[string]json.RawMessage, name, command string) (string, error) {
+	raw, ok := fields[name]
+	if !ok || strings.TrimSpace(string(raw)) == "null" || !utf8.Valid(raw) {
+		return "", fmt.Errorf("invalid %s arguments", command)
+	}
+	var value string
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return "", fmt.Errorf("invalid %s arguments", command)
+	}
+	return strings.TrimSpace(value), nil
+}
+
 // requiredRunStartContent is deliberately not implemented in terms of
 // requiredCommandString. Content is user data whose exact string value is
 // part of the durable run fingerprint; unlike IDs, leading/trailing
@@ -1418,7 +1433,7 @@ func decodeProjectCreateArguments(raw json.RawMessage) (projectCreateArguments, 
 	if err != nil || len(root) > maxProjectCommandPathBytes || !utf8.ValidString(root) {
 		return projectCreateArguments{}, fmt.Errorf("invalid %s arguments", command)
 	}
-	displayName, err := requiredCommandString(fields, "display_name", command)
+	displayName, err := requiredCommandStringAllowEmpty(fields, "display_name", command)
 	if err != nil || len(displayName) > maxProjectCommandNameBytes || !utf8.ValidString(displayName) {
 		return projectCreateArguments{}, fmt.Errorf("invalid %s arguments", command)
 	}

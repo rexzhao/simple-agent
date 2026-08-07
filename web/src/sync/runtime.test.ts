@@ -4,6 +4,7 @@ import type { ProtocolMessage } from '../protocol/types'
 import { LocalReplica } from './localReplica'
 import { BlobClient } from './blobClient'
 import { SyncRuntime, SyncSubscriptionError, type RuntimeTransport } from './runtime'
+import { CommandFacade } from './commandFacade'
 import { SessionIndexRepository } from './sessionIndexRepository'
 import { SessionIndexAdapter } from './sessionIndexAdapter'
 import type { TransportCloseEvent, TransportReadyEvent } from './transport'
@@ -16,10 +17,11 @@ class FakeTransport implements RuntimeTransport {
   failNextSends = 0
   startCalls = 0
   stopCalls = 0
+  startMakesReady = true
   private messageListeners = new Set<(message: ProtocolMessage, generation: number) => void>()
   private readyListeners = new Set<(event: TransportReadyEvent) => void>()
   private closeListeners = new Set<(event: TransportCloseEvent) => void>()
-  start(): void { this.startCalls += 1; this.isReady = true }
+  start(): void { this.startCalls += 1; if (this.startMakesReady) this.isReady = true }
   stop(): void { this.stopCalls += 1; this.isReady = false }
   send(message: ProtocolMessage): void {
     if (this.failNextSends > 0) { this.failNextSends -= 1; throw new Error('fake send failure') }
@@ -36,9 +38,9 @@ class FakeTransport implements RuntimeTransport {
     this.serverEpoch = epoch
     for (const listener of [...this.readyListeners]) listener({ generation: this.connectionGeneration, serverEpoch: epoch, connectionID: `connection_${this.connectionGeneration}`, heartbeatIntervalMS: 1000, maxMessageBytes: 1024 * 1024 })
   }
-  emitClose(): void {
+  emitClose(willRetry = true, generation = this.connectionGeneration): void {
     this.isReady = false
-    for (const listener of [...this.closeListeners]) listener({ generation: this.connectionGeneration, willRetry: true })
+    for (const listener of [...this.closeListeners]) listener({ generation, willRetry })
   }
   last(type: ProtocolMessage['type']): ProtocolMessage {
     const message = [...this.sent].reverse().find((candidate) => candidate.type === type)
@@ -436,6 +438,170 @@ describe('SyncRuntime snapshot barrier and continuity', () => {
     const record = runtime.replica.get({ type: 'session_index', id: 'project_a' })
     expect(record.metadata.readState).toBe('error')
     expect(record.metadata.error).toMatchObject({ code: 'server' })
+  })
+
+  it('publishes terminal error before the first socket is ready and wakes a terminated transport on retry', () => {
+    const transport = new FakeTransport()
+    transport.isReady = false
+    transport.startMakesReady = false
+    const runtime = new SyncRuntime({ transport })
+    const resource = { type: 'project_index' as const, id: 'server' }
+    runtime.subscribe(resource)
+    runtime.start()
+    expect(transport.sent.filter((candidate) => candidate.type === 'subscribe')).toHaveLength(0)
+
+    // No subscription was ever assigned a socket generation, matching a
+    // first-handshake reconnect exhaustion from WebSocketTransport.
+    transport.emitClose(false)
+    expect(runtime.replica.get(resource).metadata.readState).toBe('error')
+    expect(runtime.replica.get(resource).metadata.error).toMatchObject({ code: 'transport' })
+
+    const startsBeforeRetry = transport.startCalls
+    const stopsBeforeRetry = transport.stopCalls
+    runtime.retry(resource)
+    expect(transport.startCalls).toBe(startsBeforeRetry + 1)
+    expect(transport.stopCalls).toBe(stopsBeforeRetry)
+    expect(transport.sent.filter((candidate) => candidate.type === 'subscribe')).toHaveLength(0)
+
+    transport.connectionGeneration = 2
+    transport.isReady = true
+    transport.emitReady('server_2')
+    expect(transport.sent.filter((candidate) => candidate.type === 'subscribe')).toHaveLength(1)
+    runtime.stop()
+  })
+
+  it('keeps shared-transport waiting subscriptions recoverable while preserving resource terminal errors', async () => {
+    const transport = new FakeTransport()
+    const runtime = new SyncRuntime({ transport, maxResyncAttempts: 1 })
+    const projectResource = { type: 'project_index' as const, id: 'server' }
+    const sessionResource = { type: 'session_index' as const, id: 'project_a' }
+    const erroredSessionResource = { type: 'session_index' as const, id: 'project_b' }
+    runtime.subscribe(projectResource)
+    runtime.subscribe(sessionResource)
+    runtime.subscribe(erroredSessionResource)
+    runtime.start()
+
+    const subscribeFor = (resource: { type: string; id: string }) => [...transport.sent].reverse().find((candidate) => candidate.type === 'subscribe' && candidate.payload.resource.type === resource.type && candidate.payload.resource.id === resource.id)
+    const initialProject = subscribeFor(projectResource)
+    const initialSession = subscribeFor(sessionResource)
+    const initialErroredSession = subscribeFor(erroredSessionResource)
+    if (initialProject?.type !== 'subscribe' || initialSession?.type !== 'subscribe' || initialErroredSession?.type !== 'subscribe') throw new Error('missing initial subscriptions')
+
+    transport.emit(projectSubscribed(initialProject.payload.subscription_id, 'stream_1', '0'))
+    transport.emit(projectSnapshotMessage(initialProject.payload.subscription_id, { inline: { projects: [projectSummary('project_a')] } }))
+    transport.emit(subscribed(initialSession.payload.subscription_id, 'project_a'))
+    transport.emit(snapshotMessage(initialSession.payload.subscription_id, 'project_a', { inline: { sessions: [summary('session_a', 'project_a')] } }))
+    transport.emit(subscribed(initialErroredSession.payload.subscription_id, 'project_b'))
+    transport.emit(snapshotMessage(initialErroredSession.payload.subscription_id, 'project_b', { inline: { sessions: [summary('session_b', 'project_b')] } }))
+    await Promise.resolve()
+
+    const subscriptionError = (requestID: string, id: string) => message({ version: 1, type: 'error', id, payload: { code: 'subscribe_denied', message: 'denied', request_id: requestID } })
+    transport.emit(subscriptionError(initialErroredSession.id, 'session-b-error-1'))
+    const erroredSessionResubscribe = subscribeFor(erroredSessionResource)
+    if (erroredSessionResubscribe?.type !== 'subscribe') throw new Error('missing resource error resubscribe')
+    transport.emit(subscriptionError(erroredSessionResubscribe.id, 'session-b-error-2'))
+    expect(runtime.replica.get(erroredSessionResource).metadata.readState).toBe('stale')
+    expect(runtime.replica.get(erroredSessionResource).metadata.error).toMatchObject({ code: 'server' })
+
+    const projectSubscribeCountBeforeClose = transport.sent.filter((candidate) => candidate.type === 'subscribe' && candidate.payload.resource.type === 'project_index').length
+    const sessionSubscribeCountBeforeClose = transport.sent.filter((candidate) => candidate.type === 'subscribe' && candidate.payload.resource.type === 'session_index' && candidate.payload.resource.id === 'project_a').length
+    const erroredSessionSubscribeCountBeforeClose = transport.sent.filter((candidate) => candidate.type === 'subscribe' && candidate.payload.resource.type === 'session_index' && candidate.payload.resource.id === 'project_b').length
+    transport.emitClose(false)
+    expect(runtime.replica.get(projectResource).metadata.readState).toBe('stale')
+    expect(runtime.replica.get(sessionResource).metadata.readState).toBe('stale')
+    expect(runtime.replica.get(erroredSessionResource).metadata.readState).toBe('stale')
+
+    transport.startMakesReady = false
+    runtime.retry(projectResource)
+    expect(transport.startCalls).toBe(2)
+    expect(transport.sent.filter((candidate) => candidate.type === 'subscribe').length).toBe(
+      projectSubscribeCountBeforeClose + sessionSubscribeCountBeforeClose + erroredSessionSubscribeCountBeforeClose,
+    )
+
+    transport.connectionGeneration = 2
+    transport.isReady = true
+    transport.emitReady('server_2')
+    expect(transport.sent.filter((candidate) => candidate.type === 'subscribe' && candidate.payload.resource.type === 'project_index')).toHaveLength(projectSubscribeCountBeforeClose + 1)
+    expect(transport.sent.filter((candidate) => candidate.type === 'subscribe' && candidate.payload.resource.type === 'session_index' && candidate.payload.resource.id === 'project_a')).toHaveLength(sessionSubscribeCountBeforeClose + 1)
+    expect(transport.sent.filter((candidate) => candidate.type === 'subscribe' && candidate.payload.resource.type === 'session_index' && candidate.payload.resource.id === 'project_b')).toHaveLength(erroredSessionSubscribeCountBeforeClose)
+    runtime.stop()
+  })
+
+  it('retries one terminal resource on the shared socket without disturbing another resource or a pending command', async () => {
+    const transport = new FakeTransport()
+    const runtime = new SyncRuntime({ transport, maxResyncAttempts: 1 })
+    const projectResource = { type: 'project_index' as const, id: 'server' }
+    const sessionResource = { type: 'session_index' as const, id: 'project_a' }
+    runtime.subscribe(projectResource)
+    runtime.subscribe(sessionResource)
+    runtime.start()
+    const projectSubscribe = [...transport.sent].reverse().find((candidate) => candidate.type === 'subscribe' && candidate.payload.resource.type === 'project_index')
+    const sessionSubscribe = [...transport.sent].reverse().find((candidate) => candidate.type === 'subscribe' && candidate.payload.resource.type === 'session_index')
+    if (projectSubscribe?.type !== 'subscribe' || sessionSubscribe?.type !== 'subscribe') throw new Error('missing initial subscriptions')
+
+    const subscriptionError = (requestID: string, id: string) => message({ version: 1, type: 'error', id, payload: { code: 'subscribe_denied', message: 'denied', request_id: requestID } })
+    transport.emit(subscriptionError(projectSubscribe.id, 'project-error-1'))
+    const projectResubscribe = [...transport.sent].reverse().find((candidate) => candidate.type === 'subscribe' && candidate.payload.resource.type === 'project_index')
+    if (projectResubscribe?.type !== 'subscribe') throw new Error('missing bounded project resubscribe')
+    transport.emit(subscriptionError(projectResubscribe.id, 'project-error-2'))
+    expect(runtime.replica.get(projectResource).metadata.readState).toBe('error')
+    const sessionIDBeforeRetry = sessionSubscribe.payload.subscription_id
+    const startCalls = transport.startCalls
+    const stopCalls = transport.stopCalls
+    const sessionMessagesBeforeRetry = transport.sent.filter((candidate) => candidate.type === 'subscribe' && candidate.payload.resource.type === 'session_index').length
+
+    const commands = new CommandFacade({ transport, operationIDGenerator: () => 'operation_pending', requestIDGenerator: () => 'request_pending' })
+    commands.start()
+    const pending = commands.createProject('/workspace/pending', 'Pending', { operationID: 'operation_pending' })
+    const command = transport.last('command')
+    if (command.type !== 'command') throw new Error('missing pending command')
+    runtime.retry(projectResource)
+
+    expect(transport.startCalls).toBe(startCalls)
+    expect(transport.stopCalls).toBe(stopCalls)
+    const retriedProject = [...transport.sent].reverse().find((candidate) => candidate.type === 'subscribe' && candidate.payload.resource.type === 'project_index')
+    if (retriedProject?.type !== 'subscribe') throw new Error('missing isolated retry subscription')
+    expect(retriedProject.payload.subscription_id).not.toBe(projectResubscribe.payload.subscription_id)
+    const latestSessionSubscribe = [...transport.sent].reverse().find((candidate) => candidate.type === 'subscribe' && candidate.payload.resource.type === 'session_index')
+    if (latestSessionSubscribe?.type !== 'subscribe') throw new Error('missing unchanged session subscription')
+    expect(latestSessionSubscribe.payload.subscription_id).toBe(sessionIDBeforeRetry)
+    expect(transport.sent.filter((candidate) => candidate.type === 'subscribe' && candidate.payload.resource.type === 'session_index')).toHaveLength(sessionMessagesBeforeRetry)
+
+    transport.emit(message({ version: 1, type: 'command_result', id: 'command-result-pending', payload: {
+      request_id: command.payload.request_id, status: 'succeeded', result: { operation_id: 'operation_pending', project_id: 'project_pending', created: true },
+    }}))
+    await expect(pending).resolves.toEqual({ operation_id: 'operation_pending', project_id: 'project_pending', created: true })
+
+    // A send failure during the same resource's retry remains isolated too:
+    // the command on this shared socket must still be able to receive its
+    // result, while the target resource alone returns to terminal error.
+    const projectAfterRetry = retriedProject
+    transport.emit(subscriptionError(projectAfterRetry.id, 'project-error-3'))
+    const projectResubscribeAfterRetry = [...transport.sent].reverse().find((candidate) => candidate.type === 'subscribe' && candidate.payload.resource.type === 'project_index')
+    if (projectResubscribeAfterRetry?.type !== 'subscribe') throw new Error('missing second bounded project resubscribe')
+    transport.emit(subscriptionError(projectResubscribeAfterRetry.id, 'project-error-4'))
+    expect(runtime.replica.get(projectResource).metadata.readState).toBe('error')
+
+    const commandsAfterRetryFailure = new CommandFacade({ transport, operationIDGenerator: () => 'operation_pending_2', requestIDGenerator: () => 'request_pending_2' })
+    commandsAfterRetryFailure.start()
+    const pendingAfterRetryFailure = commandsAfterRetryFailure.createProject('/workspace/pending-2', 'Pending 2', { operationID: 'operation_pending_2' })
+    const commandAfterRetryFailure = transport.sent.filter((candidate) => candidate.type === 'command').at(-1)
+    if (commandAfterRetryFailure?.type !== 'command') throw new Error('missing second pending command')
+    transport.failNextSends = 2
+    runtime.retry(projectResource)
+    expect(transport.startCalls).toBe(startCalls)
+    expect(transport.stopCalls).toBe(stopCalls)
+    expect(runtime.replica.get(projectResource).metadata.readState).toBe('error')
+    const latestSessionAfterRetryFailure = [...transport.sent].reverse().find((candidate) => candidate.type === 'subscribe' && candidate.payload.resource.type === 'session_index')
+    if (latestSessionAfterRetryFailure?.type !== 'subscribe') throw new Error('missing unchanged session subscription after retry failure')
+    expect(latestSessionAfterRetryFailure.payload.subscription_id).toBe(sessionIDBeforeRetry)
+    transport.emit(message({ version: 1, type: 'command_result', id: 'command-result-pending-2', payload: {
+      request_id: commandAfterRetryFailure.payload.request_id, status: 'succeeded', result: { operation_id: 'operation_pending_2', project_id: 'project_pending_2', created: true },
+    }}))
+    await expect(pendingAfterRetryFailure).resolves.toEqual({ operation_id: 'operation_pending_2', project_id: 'project_pending_2', created: true })
+    commandsAfterRetryFailure.stop()
+    commands.stop()
+    runtime.stop()
   })
 
   it('resyncs overlapping snapshots and recovers from ACK send failure with a resume', async () => {

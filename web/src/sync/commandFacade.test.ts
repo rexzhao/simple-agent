@@ -736,6 +736,14 @@ describe('CommandFacade project commands', () => {
       status: 'succeeded', result: { operation_id: 'operation_project_stable', project_id: 'project_1', created: true },
     }), 2)
     await expect(pending).resolves.toEqual({ operation_id: 'operation_project_stable', project_id: 'project_1', created: true })
+    const emptyPending = facade.createProject('/repo-empty', '', { operationID: 'operation_empty_name' })
+    const emptyCommand = transport.sent[2]
+    if (emptyCommand.type !== 'command') throw new Error('wrong empty-name command')
+    expect(emptyCommand.payload.arguments).toEqual({ operation_id: 'operation_empty_name', root: '/repo-empty', display_name: '' })
+    transport.emit(commandMessage('command_result', emptyCommand.payload.request_id, {
+      status: 'succeeded', result: { operation_id: 'operation_empty_name', project_id: 'project_empty', created: true },
+    }))
+    await expect(emptyPending).resolves.toEqual({ operation_id: 'operation_empty_name', project_id: 'project_empty', created: true })
     await expect(facade.createProject('/other', 'Other')).rejects.toMatchObject({ code: 'id_generation', details: { collision: true } })
     facade.stop()
   })

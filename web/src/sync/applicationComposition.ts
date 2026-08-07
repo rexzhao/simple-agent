@@ -105,7 +105,7 @@ export function createSyncApplication(options: SyncApplicationOptions = {}): Syn
   const commandFacade = new CommandFacade({ transport, blobClient })
 
   const stores: SyncApplicationStores = {
-    projectIndex: new ProjectIndexStore(replica),
+    projectIndex: new ProjectIndexStore(replica, () => runtime.retry({ type: 'project_index', id: 'server' })),
     sessionIndex: new SyncSessionIndexRepository(replica),
     sessionContent: new SyncSessionContentRepository(replica),
     providerSettings: new ProviderSettingsStore(replica),

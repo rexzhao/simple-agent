@@ -1,11 +1,12 @@
 import { memo, useState } from 'react'
-import type { Project, Session } from '../types'
+import type { Session } from '../types'
+import type { ProjectSummary } from '../repositories/projectIndex'
 import { buildSessionTree, flattenSessionTree, projectName, sessionName, sessionTreeContains } from '../lib/session'
 import { relativeTime } from '../lib/format'
 import { ArchiveIcon, ChatIcon, ChevronIcon, EditIcon, LogoIcon, PlusIcon, RestoreIcon, SettingsIcon, TrashIcon } from './icons'
 
 export const WorkspaceTree = memo(function WorkspaceTree(props: {
-  projects: Project[]
+  projects: readonly ProjectSummary[]
   sessionsByProject: Record<string, Session[]>
   archivedSessionsByProject: Record<string, Session[]>
   selectedProjectID: string
@@ -16,8 +17,8 @@ export const WorkspaceTree = memo(function WorkspaceTree(props: {
   onSelectSession: (projectID: string, sessionID: string) => void
   onCreateSession: (projectID: string) => void
   onManageProviders: () => void
-  onRenameProject: (project: Project) => void
-  onDeleteProject: (project: Project) => void
+  onRenameProject: (project: ProjectSummary) => void
+  onDeleteProject: (project: ProjectSummary) => void
   onRenameSession: (session: Session) => void
   onArchiveSession: (session: Session) => void
   onRestoreSession: (session: Session) => void

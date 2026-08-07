@@ -33,9 +33,11 @@ export class ProjectIndexStore {
   private readonly models = new Map<string, CachedModel>()
   private readonly listeners = new Set<() => void>()
   private readonly unsubscribeReplica: () => void
+  private readonly retryResource: (() => void) | undefined
 
-  constructor(replica = new LocalReplica()) {
+  constructor(replica = new LocalReplica(), retry?: () => void) {
     this.replica = replica
+    this.retryResource = retry
     this.unsubscribeReplica = replica.subscribe((changed) => {
       if (changed.type !== 'project_index' || changed.id !== 'server') return
       this.models.delete(resourceKeyString(resource))
@@ -94,5 +96,9 @@ export class ProjectIndexStore {
 
   resourceKey(): string {
     return resourceKeyString(resource)
+  }
+
+  retry(): void {
+    this.retryResource?.()
   }
 }

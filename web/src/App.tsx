@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { api, streamLifecycle, streamRun } from './api'
 import type { CreateSessionOptions } from './api'
-import type { ActiveRun, ActiveRunDescriptor, Bootstrap, ImageAttachmentInput, ItemsPage, LifecycleEvent, Project, RunEvent, Session, SessionDebugSettings, SessionItem, SessionItemProjectionEvent, SessionModelOption } from './types'
+import type { ActiveRun, ActiveRunDescriptor, Bootstrap, ImageAttachmentInput, ItemsPage, LifecycleEvent, RunEvent, Session, SessionDebugSettings, SessionItem, SessionItemProjectionEvent, SessionModelOption } from './types'
+import { ProjectIndexObservationError, type ProjectIndexReadModel, type ProjectSummary } from './repositories/projectIndex'
 import { errorMessage } from './lib/format'
 import { copyFrontendProtocolJSONL, downloadFrontendProtocolJSONL, frontendProtocolLogger, protocolLogIdentity, useFrontendProtocolLogging } from './lib/frontendProtocolLogger'
 import { reduceLifecycleEvent, type SessionMaps } from './lib/lifecycleReducer'
@@ -24,19 +25,35 @@ import { useRunRegistry } from './hooks/useRunRegistry'
 import { useSessionHistory } from './hooks/useSessionHistory'
 import { useSessionStore } from './hooks/useSessionStore'
 import { useSessionSelection } from './hooks/useSessionSelection'
+import { useProjectIndex, useSyncCommands, useSyncRepositories, useSyncSignals } from './hooks/useSyncApplication'
 
 type BackgroundCompletionNotice = {
   sessionID: string
   sessionName: string
 }
 
+function isProjectObservationError(reason: unknown, code?: ProjectIndexObservationError['code']): reason is ProjectIndexObservationError {
+  return reason instanceof ProjectIndexObservationError && (code === undefined || reason.code === code)
+}
+
+function projectMutationErrorMessage(reason: unknown): string {
+  if (isProjectObservationError(reason, 'timeout')) return 'Project change accepted; waiting for synchronization.'
+  if (isProjectObservationError(reason, 'cancelled')) return 'Project operation was cancelled.'
+  // Command errors can contain server/protocol details. Keep those below the
+  // page boundary; the navigation surface only needs a safe retryable status.
+  return 'Project operation failed.'
+}
+
 function App() {
+  const projectIndex = useProjectIndex()
+  const { project: projectCommands } = useSyncCommands()
+  const { currentProject } = useSyncSignals()
+  const { projectIndex: projectIndexRepository } = useSyncRepositories()
+  const projects = projectIndex.active
   const [bootstrap, setBootstrap] = useState<Bootstrap | null>(null)
-  const [projects, setProjects] = useState<Project[]>([])
+  const [legacySessionEnumerationReady, setLegacySessionEnumerationReady] = useState(false)
   const [sessionsByProject, setSessionsByProject] = useState<Record<string, Session[]>>({})
   const [archivedSessionsByProject, setArchivedSessionsByProject] = useState<Record<string, Session[]>>({})
-  const projectsRef = useRef<Project[]>(projects)
-  projectsRef.current = projects
   const { selectedProjectID, selectedSessionID, selectedProjectRef, setSelectedProjectID, setSelectedSessionID } = useSessionSelection()
   const selectedSessionIDRef = useRef(selectedSessionID)
   selectedSessionIDRef.current = selectedSessionID
@@ -54,13 +71,13 @@ function App() {
   // one unit.  This is separate from the projection store's generation: these
   // maps are still the tree's presentation cache.
   const sessionListGenerationRef = useRef<Record<string, number>>({})
-  // Bootstrap and explicit project-list mutations share one generation.  A
-  // stale bootstrap must not restore a project that a newer mutation removed.
-  const projectListGenerationRef = useRef(0)
+  const legacyEnumeratedActiveProjectIDsRef = useRef(new Set<string>())
+  const projectObservationControllersRef = useRef(new Set<AbortController>())
   const [recoveredRuns, setRecoveredRuns] = useState<ActiveRunDescriptor[]>([])
-  const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
   const [showProjectForm, setShowProjectForm] = useState(false)
+  const autoProjectFormRef = useRef(false)
+  const projectFormUserOpenedRef = useRef(false)
   const [sessionCreator, setSessionCreator] = useState<SessionCreatorState | null>(null)
   const [providerManager, setProviderManager] = useState<ProviderManagerState | null>(null)
   const [debugSessionID, setDebugSessionID] = useState('')
@@ -141,60 +158,124 @@ function App() {
     })
   }, [])
 
-  const loadProjects = useCallback(async () => {
-    const generation = ++projectListGenerationRef.current
-    const payload = await api.projects()
-    if (projectListGenerationRef.current !== generation) return projectsRef.current
-    projectsRef.current = payload.projects
-    setProjects(payload.projects)
-    const maps = sessionMapsRef.current
-    setSessionMaps({
-      active: Object.fromEntries(payload.projects.map((project) => [project.id, maps.active[project.id] ?? []])),
-      archived: Object.fromEntries(payload.projects.map((project) => [project.id, maps.archived[project.id] ?? []])),
-    })
-    setSelectedProjectID((current) => {
-      if (current && payload.projects.some((project) => project.id === current)) return current
-      return payload.projects[0]?.id ?? ''
-    })
-    return payload.projects
-  }, [setSessionMaps])
+  // The project index is the only project navigation authority. Session maps
+  // are still legacy REST projections, so prune them whenever the authority
+  // removes a project; a late session response can then never resurrect it.
+  useEffect(() => {
+    const allowed = new Set(projects.map((project) => project.id))
+    const current = sessionMapsRef.current
+    const active = Object.fromEntries(Object.entries(current.active).filter(([projectID]) => allowed.has(projectID)))
+    const archived = Object.fromEntries(Object.entries(current.archived).filter(([projectID]) => allowed.has(projectID)))
+    if (Object.keys(active).length !== Object.keys(current.active).length || Object.keys(archived).length !== Object.keys(current.archived).length) {
+      setSessionMaps({ active, archived })
+    }
+  }, [projects, setSessionMaps])
+
+  // A selected project is application state, not a page-owned subscription.
+  // The policy engine observes this signal and owns Session Index interest.
+  const previousProjectIDsRef = useRef<readonly string[]>([])
+  useEffect(() => {
+    const previousIDs = previousProjectIDsRef.current
+    const currentID = selectedProjectRef.current
+    const currentIsValid = Boolean(currentID && projects.some((project) => project.id === currentID))
+    let nextID = currentIsValid ? currentID : ''
+    if (!currentIsValid) {
+      const oldIndex = currentID ? previousIDs.indexOf(currentID) : -1
+      const nextProject = projects[oldIndex] ?? projects[oldIndex - 1] ?? projects[0]
+      nextID = nextProject?.id ?? ''
+      setSelectedProjectID(nextID)
+      setSelectedSessionID(nextID ? sessionMapsRef.current.active[nextID]?.[0]?.id ?? '' : '')
+    }
+    if (projects.length === 0) {
+      if (!projectFormUserOpenedRef.current) {
+        autoProjectFormRef.current = true
+        setShowProjectForm(true)
+      }
+    } else if (autoProjectFormRef.current && !projectFormUserOpenedRef.current) {
+      autoProjectFormRef.current = false
+      setShowProjectForm(false)
+    }
+    previousProjectIDsRef.current = projects.map((project) => project.id)
+    // Publish the computed selection in the same effect pass. In particular,
+    // do not publish null for one render while a deleted project is being
+    // replaced by its deterministic neighbour.
+    currentProject.set(nextID || null)
+  }, [currentProject, projects, selectedProjectID, selectedProjectRef, setSelectedProjectID, setSelectedSessionID])
+
+  useEffect(() => () => {
+    for (const controller of projectObservationControllersRef.current) controller.abort()
+    projectObservationControllersRef.current.clear()
+  }, [])
+
+  const waitForProjectAuthority = useCallback(async (
+    projectID: string,
+    present: boolean,
+    predicate?: (project: ProjectSummary | undefined) => boolean,
+  ): Promise<ProjectIndexReadModel> => {
+    const controller = new AbortController()
+    projectObservationControllersRef.current.add(controller)
+    try {
+      return await projectIndexRepository.waitFor((model) => {
+        if (model.status === 'loading') return false
+        const project = model.summaries.find((summary) => summary.id === projectID)
+        return (project !== undefined) === present && (predicate ? predicate(project) : true)
+      }, { signal: controller.signal, timeoutMS: 5000 })
+    } finally {
+      projectObservationControllersRef.current.delete(controller)
+    }
+  }, [projectIndexRepository])
 
   const bootstrapInFlightRef = useRef<Promise<ActiveRunDescriptor[]> | null>(null)
   const bootstrapApplication = useCallback(async (preserveSelection: boolean): Promise<ActiveRunDescriptor[]> => {
     if (bootstrapInFlightRef.current) return bootstrapInFlightRef.current
-    const projectGeneration = ++projectListGenerationRef.current
     const operation = (async () => {
-      const [bootstrapPayload, projectsPayload, activeRunsPayload] = await Promise.all([api.bootstrap(), api.projects(), api.activeRuns()])
-      const sessionEntries = await Promise.all(projectsPayload.projects.map(async (project) => {
-        const listGeneration = sessionListGenerationRef.current[project.id] ?? 0
-        const [activePayload, archivedPayload] = await Promise.all([api.sessions(project.id), api.sessions(project.id, true)])
+      const bootstrapPayloadPromise = api.bootstrap()
+      const activeRunsPayloadPromise = api.activeRuns()
+      const projectModel = projectIndexRepository.getSnapshot().status === 'loading'
+        ? await projectIndexRepository.waitFor((model) => model.status !== 'loading', { timeoutMS: 15_000 })
+        : projectIndexRepository.getSnapshot()
+      const authoritativeProjects = projectModel.active
+      const authoritySignature = JSON.stringify(authoritativeProjects.map((project) => project.id))
+      const sessionProjectIDs = authoritativeProjects.map((project) => project.id)
+      const sessionEntries = await Promise.all(sessionProjectIDs.map(async (projectID) => {
+        const listGeneration = sessionListGenerationRef.current[projectID] ?? 0
+        const [activePayload, archivedPayload] = await Promise.all([api.sessions(projectID), api.sessions(projectID, true)])
         return {
-          projectID: project.id,
+          projectID,
           active: orderSessions(activePayload.sessions),
           archived: orderSessions(archivedPayload.sessions),
           listGeneration,
         }
       }))
-      // A newer project mutation/list bootstrap owns the project set.  Do
-      // not let this operation resurrect removed projects or overwrite the
-      // newer selection with its stale active-run snapshot.
-      if (projectListGenerationRef.current !== projectGeneration) return []
-      const currentMaps = sessionMapsRef.current
-      const maps: SessionMaps = {
-        active: Object.fromEntries(sessionEntries.map((entry) => [
-          entry.projectID,
-          (sessionListGenerationRef.current[entry.projectID] ?? 0) === entry.listGeneration
-            ? entry.active
-            : currentMaps.active[entry.projectID] ?? [],
-        ])),
-        archived: Object.fromEntries(sessionEntries.map((entry) => [
-          entry.projectID,
-          (sessionListGenerationRef.current[entry.projectID] ?? 0) === entry.listGeneration
-            ? entry.archived
-            : currentMaps.archived[entry.projectID] ?? [],
-        ])),
+      const [bootstrapPayload, activeRunsPayload] = await Promise.all([bootstrapPayloadPromise, activeRunsPayloadPromise])
+      // A newer project_index publication owns the project set. Do not let a
+      // legacy session response resurrect an archived/deleted project. Read
+      // the repository again at the apply boundary rather than mutating a
+      // generation ref during render.
+      const latestProjects = projectIndexRepository.getSnapshot().active
+      if (JSON.stringify(latestProjects.map((project) => project.id)) !== authoritySignature) {
+        // Let the post-bootstrap active-ID effect enumerate the newer set.
+        setLegacySessionEnumerationReady(true)
+        return []
       }
-      const recovered = activeRunsPayload.runs.filter((run) => projectsPayload.projects.some((project) => maps.active[project.id]?.some((session) => session.id === run.session_id)))
+      const projectsForApply = latestProjects
+      const currentMaps = sessionMapsRef.current
+      const entriesByProject = new Map(sessionEntries.map((entry) => [entry.projectID, entry]))
+      const maps: SessionMaps = {
+        active: Object.fromEntries(projectsForApply.map((project) => {
+          const entry = entriesByProject.get(project.id)
+          return [project.id, entry && (sessionListGenerationRef.current[project.id] ?? 0) === entry.listGeneration
+            ? entry.active
+            : currentMaps.active[project.id] ?? []]
+        })),
+        archived: Object.fromEntries(projectsForApply.map((project) => {
+          const entry = entriesByProject.get(project.id)
+          return [project.id, entry && (sessionListGenerationRef.current[project.id] ?? 0) === entry.listGeneration
+            ? entry.archived
+            : currentMaps.archived[project.id] ?? []]
+        })),
+      }
+      const recovered = activeRunsPayload.runs.filter((run) => projectsForApply.some((project) => maps.active[project.id]?.some((session) => session.id === run.session_id)))
       // A reconnect/bootstrap can overlap a local admission. Do not let the
       // authoritative active-run listing bypass the replay boundary by
       // creating the transient container for that pending session.
@@ -203,30 +284,29 @@ function App() {
         !pendingAdmissionSessionsRef.current.has(run.session_id) && !admissionBoundSessions.has(run.session_id),
       )
       const recoveredProject = recoveredForPresentation.length > 0
-        ? projectsPayload.projects.find((project) => maps.active[project.id]?.some((session) => session.id === recoveredForPresentation[0].session_id))
+        ? projectsForApply.find((project) => maps.active[project.id]?.some((session) => session.id === recoveredForPresentation[0].session_id))
         : null
       const currentProjectID = selectedProjectRef.current
       const currentSessionID = selectedSessionIDRef.current
-      const currentProject = projectsPayload.projects.find((project) => project.id === currentProjectID)
-      const currentSessionProject = projectsPayload.projects.find((project) =>
+      const currentProject = projectsForApply.find((project) => project.id === currentProjectID)
+      const currentSessionProject = projectsForApply.find((project) =>
         maps.active[project.id]?.some((session) => session.id === currentSessionID) ||
         maps.archived[project.id]?.some((session) => session.id === currentSessionID),
       )
       const firstProjectID = preserveSelection && currentProject
         ? currentProject.id
-        : recoveredProject?.id ?? projectsPayload.projects[0]?.id ?? ''
+        : recoveredProject?.id ?? projectsForApply[0]?.id ?? ''
       const firstSessionID = preserveSelection && currentSessionProject && currentSessionID
         ? currentSessionID
         : recoveredForPresentation[0]?.session_id ?? maps.active[firstProjectID]?.[0]?.id ?? ''
       setBootstrap(bootstrapPayload)
-      projectsRef.current = projectsPayload.projects
-      setProjects(projectsPayload.projects)
       setSessionMaps(maps)
       syncActiveRuns(recoveredForPresentation)
       setSelectedProjectID(firstProjectID)
       setSelectedSessionID(firstSessionID)
       setRecoveredRuns(recoveredForPresentation)
-      if (!preserveSelection || projectsPayload.projects.length === 0) setShowProjectForm(projectsPayload.projects.length === 0)
+      for (const project of projectsForApply) legacyEnumeratedActiveProjectIDsRef.current.add(project.id)
+      setLegacySessionEnumerationReady(true)
       return recoveredForPresentation
     })()
     bootstrapInFlightRef.current = operation
@@ -235,14 +315,11 @@ function App() {
     } finally {
       if (bootstrapInFlightRef.current === operation) bootstrapInFlightRef.current = null
     }
-  }, [setSessionMaps, syncActiveRuns])
+  }, [projectIndexRepository, setSessionMaps, syncActiveRuns])
 
   useEffect(() => {
-    let cancelled = false
     void bootstrapApplication(false)
       .catch((reason: unknown) => setError(errorMessage(reason)))
-      .finally(() => { if (!cancelled) setLoading(false) })
-    return () => { cancelled = true }
   }, [bootstrapApplication])
 
   const loadSessions = useCallback(async (projectID: string, preferredSessionID = '', preserveSelection = false) => {
@@ -254,11 +331,15 @@ function App() {
     // project list must not recreate that project's session maps.  In-flight
     // requests started before removal are additionally rejected by the
     // per-project generation check below.
-    if (!projectsRef.current.some((project) => project.id === projectID)) return []
+    if (!projectIndexRepository.getSnapshot().active.some((project) => project.id === projectID)) return []
     const generation = (sessionListGenerationRef.current[projectID] ?? 0) + 1
     sessionListGenerationRef.current[projectID] = generation
     const [payload, archivedPayload] = await Promise.all([api.sessions(projectID), api.sessions(projectID, true)])
     const ordered = orderSessions(payload.sessions)
+    // Re-check the active authority at the response boundary as well as at
+    // request admission. This closes the race where a project is archived or
+    // removed while the two legacy session responses are in flight.
+    if (!projectIndexRepository.getSnapshot().active.some((project) => project.id === projectID)) return ordered
     // Do not let an older pair of active/archived responses roll back a more
     // recent selection or mutation.  The caller still receives its response
     // for operation-local bookkeeping, but it cannot mutate the tree.
@@ -276,7 +357,24 @@ function App() {
       })
     }
     return ordered
-  }, [setSessionMaps])
+  }, [projectIndexRepository, setSessionMaps])
+
+  // Session Index is not cut over yet. Preserve the old REST sidebar behavior
+  // for projects that arrive later through the authoritative project stream,
+  // but enumerate only the current active IDs and never use the REST project
+  // list as a source of navigation state.
+  useEffect(() => {
+    const activeIDs = new Set(projects.map((project) => project.id))
+    for (const projectID of [...legacyEnumeratedActiveProjectIDsRef.current]) {
+      if (!activeIDs.has(projectID)) legacyEnumeratedActiveProjectIDsRef.current.delete(projectID)
+    }
+    if (!legacySessionEnumerationReady) return
+    for (const projectID of activeIDs) {
+      if (legacyEnumeratedActiveProjectIDsRef.current.has(projectID)) continue
+      legacyEnumeratedActiveProjectIDsRef.current.add(projectID)
+      void loadSessions(projectID).catch((reason: unknown) => setError(errorMessage(reason)))
+    }
+  }, [legacySessionEnumerationReady, loadSessions, projects])
 
   const reportError = useCallback((reason: unknown) => setError(errorMessage(reason)), [])
   const { sessionDetail, itemsPage, selectedSessionRef, refreshSession, loadOlder } =
@@ -391,14 +489,15 @@ function App() {
 
   const createProject = async (root: string, displayName: string) => {
     try {
-      const result = await api.createProject(root, displayName)
-      await loadProjects()
-      setSelectedProjectID(result.project.id)
+      const result = await projectCommands.createProject(root, displayName)
+      await waitForProjectAuthority(result.project_id, true)
+      setSelectedProjectID(result.project_id)
       setSelectedSessionID('')
-      await loadSessions(result.project.id)
+      projectFormUserOpenedRef.current = false
+      autoProjectFormRef.current = false
       setShowProjectForm(false)
     } catch (reason) {
-      setError(errorMessage(reason))
+      setError(projectMutationErrorMessage(reason))
     }
   }
 
@@ -438,6 +537,8 @@ function App() {
       setSelectedProjectID(projectID)
       await loadSessions(projectID, session.id)
       setSelectedSessionID(session.id)
+      projectFormUserOpenedRef.current = false
+      autoProjectFormRef.current = false
       setShowProjectForm(false)
       setSessionCreator(null)
     } catch (reason) {
@@ -461,16 +562,20 @@ function App() {
   const selectProject = useCallback((projectID: string) => {
     setSelectedProjectID(projectID)
     setSelectedSessionID(sessionsByProject[projectID]?.[0]?.id ?? '')
+    projectFormUserOpenedRef.current = false
+    autoProjectFormRef.current = false
     setShowProjectForm(false)
   }, [sessionsByProject, setSelectedProjectID, setSelectedSessionID])
 
   const selectSession = useCallback((projectID: string, sessionID: string) => {
     setSelectedProjectID(projectID)
     setSelectedSessionID(sessionID)
+    projectFormUserOpenedRef.current = false
+    autoProjectFormRef.current = false
     setShowProjectForm(false)
   }, [setSelectedProjectID, setSelectedSessionID])
 
-  const renameProject = useCallback(async (project: Project) => {
+  const renameProject = useCallback(async (project: ProjectSummary) => {
     const displayName = window.prompt('Rename project', projectName(project))
     if (displayName === null || displayName.trim() === project.display_name) return
     if (!displayName.trim()) {
@@ -478,46 +583,47 @@ function App() {
       return
     }
     try {
-      await api.renameProject(project.id, displayName.trim())
-      await loadProjects()
+      await projectCommands.renameProject(project.id, displayName.trim())
+      await waitForProjectAuthority(project.id, true, (current) => current?.display_name === displayName.trim())
     } catch (reason) {
-      setError(errorMessage(reason))
+      setError(projectMutationErrorMessage(reason))
     }
-  }, [loadProjects])
+  }, [projectCommands, waitForProjectAuthority])
 
-  const deleteProject = useCallback(async (project: Project) => {
+  const deleteProject = useCallback(async (project: ProjectSummary) => {
     const activeSessions = sessionsByProject[project.id] ?? []
     const archivedSessions = archivedSessionsByProject[project.id] ?? []
     if (activeSessions.some((session) => session.status === 'running' || activeRunsRef.current[session.id]?.status === 'running')) return
     const sessionCount = activeSessions.length + archivedSessions.length
     const message = `Permanently delete "${projectName(project)}" and ${sessionCount} saved ${sessionCount === 1 ? 'session' : 'sessions'}? All session history and attachments for this project will be removed. This action cannot be undone.`
     if (!window.confirm(message)) return
-    let archived = false
+    let archiveAcknowledged = false
     try {
-      await api.archiveProject(project.id)
-      archived = true
-      await api.deleteProject(project.id)
-      const remaining = await loadProjects()
-      const nextProject = remaining[0]
-      setSelectedProjectID(nextProject?.id ?? '')
-      setSelectedSessionID(nextProject ? sessionsByProject[nextProject.id]?.[0]?.id ?? '' : '')
-      setShowProjectForm(remaining.length === 0)
+      await projectCommands.archiveProject(project.id)
+      await waitForProjectAuthority(project.id, true, (current) => current?.archived === true)
+      archiveAcknowledged = true
+      await projectCommands.deleteProject(project.id)
+      await waitForProjectAuthority(project.id, false)
     } catch (reason) {
-      if (archived) {
+      // Preserve the old safe rollback, but keep it on the typed command path.
+      // It is only attempted after the archive itself was observed in the
+      // authoritative index; an unknown delete outcome is not treated as a
+      // reason to guess at replica state.
+      const reasonCode = typeof reason === 'object' && reason !== null && 'code' in reason
+        ? String((reason as { code?: unknown }).code)
+        : ''
+      const outcomeUnknown = reasonCode === 'outcome_unknown' || reasonCode === 'timeout' || reasonCode === 'transport'
+      if (archiveAcknowledged && !outcomeUnknown) {
         try {
-          await api.restoreProject(project.id)
+          await projectCommands.restoreProject(project.id)
+          await waitForProjectAuthority(project.id, true, (current) => current?.archived === false)
         } catch {
-          // Preserve the original removal error.
+          // Preserve the original delete/observation error.
         }
       }
-      try {
-        await loadProjects()
-      } catch {
-        // Preserve the original removal error.
-      }
-      setError(errorMessage(reason))
+      setError(projectMutationErrorMessage(reason))
     }
-  }, [activeRunsRef, archivedSessionsByProject, loadProjects, sessionsByProject, setSelectedProjectID, setSelectedSessionID])
+  }, [activeRunsRef, archivedSessionsByProject, projectCommands, sessionsByProject, waitForProjectAuthority])
 
   const renameSession = useCallback(async (session: Session) => {
     const displayName = window.prompt('Rename session', sessionName(session))
@@ -1272,9 +1378,17 @@ function App() {
       : Object.values(sessionsByProject).flat().find((session) => session.id === debugSessionID) ?? null
     : null
   const visibleRunningSessionIDs = new Set([...runningSessionIDs, ...Object.keys(compactingSessionIDs)])
-  const showAddProject = useCallback(() => setShowProjectForm(true), [])
+  const showAddProject = useCallback(() => {
+    projectFormUserOpenedRef.current = true
+    autoProjectFormRef.current = false
+    setShowProjectForm(true)
+  }, [])
+  const retryProjectIndex = useCallback(() => {
+    setError('')
+    projectIndexRepository.retry()
+  }, [projectIndexRepository])
 
-  if (loading) return <Splash />
+  if (projectIndex.status === 'loading') return <Splash />
 
   return (
     <div className="app-shell">
@@ -1310,13 +1424,26 @@ function App() {
         />
       )}
       <main className="conversation-panel">
+        {projectIndex.status === 'stale' && projects.length > 0 && (
+          <div className="sync-status" aria-live="polite">
+            <span>Project list is offline; showing the last synchronized list.</span>
+            {projectIndex.error && <button onClick={retryProjectIndex}>Retry project synchronization</button>}
+          </div>
+        )}
+        {projectIndex.status === 'error' && projects.length === 0 && (
+          <div className="error-banner" role="alert"><span>Project list is unavailable.</span><button onClick={retryProjectIndex}>Retry</button></div>
+        )}
         {error && <ErrorBanner message={error} onDismiss={() => setError('')} />}
         {completionNotice && <div className="completion-notice" role="status"><span>{completionNotice.sessionName} completed in the background.</span><button onClick={() => setCompletionNotice(null)} aria-label="Dismiss completion notification">×</button></div>}
         {showProjectForm ? (
           <ProjectSetup
             suggestedRoot={bootstrap?.cwd ?? ''}
             hasProjects={projects.length > 0}
-            onCancel={() => setShowProjectForm(false)}
+            onCancel={() => {
+              projectFormUserOpenedRef.current = false
+              autoProjectFormRef.current = false
+              setShowProjectForm(false)
+            }}
             onSubmit={(root, name) => void createProject(root, name)}
           />
         ) : viewingSessionID ? (
