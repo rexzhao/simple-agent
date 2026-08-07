@@ -66,8 +66,19 @@ export class ProjectIndexInterestPolicy {
 }
 
 export interface SessionIndexInterestPolicyOptions {
-  /** Keep the old project replica when switching; runtime bounds retained values. */
+  /** Keep a removed project replica; runtime bounds retained values. */
   retainReleased?: boolean
+}
+
+/**
+ * The project index is the navigation scope for Session Index interest.  It
+ * deliberately is not the current-project signal: a run in a background
+ * project must keep publishing enough state for the navigation tree to show
+ * it.
+ */
+export interface SessionIndexProjectSource {
+  getActiveProjectIDs(): readonly string[]
+  subscribe(listener: () => void): () => void
 }
 
 export function createCurrentProjectSignal(initialProjectID: string | null = null): MutableCurrentProjectSignal {
@@ -249,35 +260,36 @@ export class CodexLoginInterestPolicy {
  */
 export class SessionIndexInterestPolicy {
   private readonly runtime: Pick<SyncRuntime, 'subscribe' | 'evict'> | { subscribe: SyncRuntime['subscribe']; evict?: SyncRuntime['evict'] }
-  private readonly projectSignal: CurrentProjectSignal
+  private readonly projectSource: SessionIndexProjectSource | CurrentProjectSignal
   private readonly options: Required<SessionIndexInterestPolicyOptions>
   private started = false
   private detachSignal: (() => void) | null = null
-  private releaseCurrent: (() => void) | null = null
+  private readonly releases = new Map<string, () => void>()
   private currentProjectID: string | null = null
 
-  constructor(runtime: Pick<SyncRuntime, 'subscribe' | 'evict'> | { subscribe: SyncRuntime['subscribe']; evict?: SyncRuntime['evict'] }, projectSignal: CurrentProjectSignal, options: SessionIndexInterestPolicyOptions = {}) {
+  constructor(runtime: Pick<SyncRuntime, 'subscribe' | 'evict'> | { subscribe: SyncRuntime['subscribe']; evict?: SyncRuntime['evict'] }, projectSource: SessionIndexProjectSource | CurrentProjectSignal, options: SessionIndexInterestPolicyOptions = {}) {
     this.runtime = runtime
-    this.projectSignal = projectSignal
+    this.projectSource = projectSource
     this.options = { retainReleased: options.retainReleased ?? false }
   }
 
   start(): void {
     if (this.started) return
     this.started = true
-    this.detachSignal = this.projectSignal.subscribe(() => this.reconcile())
+    this.detachSignal = this.projectSource.subscribe(() => this.reconcile())
     this.reconcile()
   }
 
   stop(): void {
-    if (!this.started && !this.releaseCurrent && !this.detachSignal) return
+    if (!this.started && this.releases.size === 0 && !this.detachSignal) return
     this.started = false
     this.detachSignal?.()
     this.detachSignal = null
-    const oldProjectID = this.currentProjectID
-    this.releaseCurrent?.()
-    if (oldProjectID && !this.options.retainReleased) this.runtime.evict?.({ type: 'session_index', id: oldProjectID })
-    this.releaseCurrent = null
+    for (const [projectID, release] of this.releases) {
+      release()
+      if (!this.options.retainReleased) this.runtime.evict?.({ type: 'session_index', id: projectID })
+    }
+    this.releases.clear()
     this.currentProjectID = null
   }
 
@@ -287,26 +299,34 @@ export class SessionIndexInterestPolicy {
 
   private reconcile(): void {
     if (!this.started) return
-    const signaled = this.projectSignal.get()
-    const next = signaled || null
-    if (next !== null && next.trim() !== next) throw new SyncSubscriptionError('invalid_resource', 'current project id is not canonical')
-    if (next === this.currentProjectID) return
-    const oldProjectID = this.currentProjectID
-    this.releaseCurrent?.()
-    if (oldProjectID && !this.options.retainReleased) this.runtime.evict?.({ type: 'session_index', id: oldProjectID })
-    this.releaseCurrent = null
-    if (!next) {
-      this.currentProjectID = null
-      return
+    const source = this.projectSource as SessionIndexProjectSource
+    const legacySignal = !('getActiveProjectIDs' in this.projectSource)
+    const signaled = legacySignal ? (this.projectSource as CurrentProjectSignal).get() : null
+    const ids = legacySignal
+      ? (signaled ? [signaled] : [])
+      : [...new Set(source.getActiveProjectIDs())].sort()
+    for (const projectID of ids) {
+      if (projectID.trim() !== projectID) throw new SyncSubscriptionError('invalid_resource', 'project id is not canonical')
     }
-    const resource: ResourceKey = { type: 'session_index', id: next }
-    try {
-      this.releaseCurrent = this.runtime.subscribe(resource, { retainOnRelease: this.options.retainReleased })
-      this.currentProjectID = next
-    } catch (reason) {
-      this.currentProjectID = null
-      throw reason
+    const wanted = new Set(ids)
+    for (const [projectID, release] of this.releases) {
+      if (wanted.has(projectID)) continue
+      release()
+      if (!this.options.retainReleased) this.runtime.evict?.({ type: 'session_index', id: projectID })
+      this.releases.delete(projectID)
     }
+    for (const projectID of ids) {
+      if (this.releases.has(projectID)) continue
+      const resource: ResourceKey = { type: 'session_index', id: projectID }
+      try {
+        this.releases.set(projectID, this.runtime.subscribe(resource, { retainOnRelease: this.options.retainReleased }))
+      } catch (reason) {
+        // Keep already installed interests intact.  The next project-index
+        // publication or an application restart can retry this one.
+        throw reason
+      }
+    }
+    this.currentProjectID = legacySignal ? (ids[0] ?? null) : this.currentProjectID
   }
 }
 

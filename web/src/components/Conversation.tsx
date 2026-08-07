@@ -4,6 +4,7 @@ import type { Components } from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { api } from '../api'
 import type { ActiveRun, ItemsPage, QueuedPrompt, Session, SessionImageAttachment, SessionItem } from '../types'
+import type { SessionIndexStatus } from '../repositories/sessionIndex'
 import { addUsageBreakdown, contextRequestCount, contextUsageBreakdown, usageBreakdownFromEvents, usageCostBreakdown, usageEventCount } from '../lib/cost'
 import { buildConversationRows, conversationRowKey } from '../lib/conversationRows'
 import type { ConversationRow } from '../lib/conversationRows'
@@ -22,6 +23,7 @@ export const Conversation = memo(function Conversation(props: {
   detail: Session | null
   page: ItemsPage | null
   activeRun: ActiveRun | null
+  sessionIndexStatus?: SessionIndexStatus
   admissionPending?: boolean
   compacting: boolean
 	draft: ComposerDraft
@@ -55,6 +57,7 @@ export const Conversation = memo(function Conversation(props: {
 	const loadingOlderRef = useRef(false)
 	const [loadingOlder, setLoadingOlder] = useState(false)
 	const safeDetail = props.detail && props.detail.id === props.sessionID ? props.detail : null
+	const indexedStatus = props.sessionIndexStatus ?? safeDetail?.status
 
 	// Virtuoso's Scroller is the sole .messages element. Use its imperative API
 	// for explicit bottom requests instead of competing with its scroll model.
@@ -175,7 +178,7 @@ export const Conversation = memo(function Conversation(props: {
 			activeRun: props.activeRun,
 			compacting: props.compacting,
 			turnError: props.turnError,
-			sessionStatus: safeDetail?.status,
+			sessionStatus: indexedStatus,
 		})
 		// This is a real, stable final row rather than Virtuoso Footer padding.
 		// Aligning LAST with it gives the UI one unambiguous bottom geometry.
@@ -183,7 +186,7 @@ export const Conversation = memo(function Conversation(props: {
 		// represent the empty state instead of an invisible helper item.
 		if (rows.length > 0) rows.push({ kind: 'bottom-spacer', key: conversationRowKey(props.sessionID, 'bottom-spacer') })
 		return rows
-	}, [props.activeRun, props.compacting, props.page?.items, props.sessionID, props.turnError, safeDetail?.status])
+	}, [indexedStatus, props.activeRun, props.compacting, props.page?.items, props.sessionID, props.turnError])
 	const loadOlder = useCallback(async () => {
 		if (loadingOlderRef.current || !props.page?.has_more_before) return
 		loadingOlderRef.current = true
@@ -195,20 +198,22 @@ export const Conversation = memo(function Conversation(props: {
 			setLoadingOlder(false)
 		}
 	}, [props.onLoadOlder, props.page])
-  const headerStatus = props.compacting || props.activeRun?.status === 'running' || safeDetail?.status === 'running'
+  const headerStatus = props.compacting || props.activeRun?.status === 'running' || indexedStatus === 'running'
     ? 'running'
-    : safeDetail?.status === 'interrupted' || safeDetail?.status === 'failed' ? 'interrupted' : 'idle'
+    : indexedStatus === 'interrupted' || indexedStatus === 'failed' ? 'interrupted' : 'idle'
+
+	const canContinueForRows = Boolean(safeDetail && (indexedStatus === 'interrupted' || indexedStatus === 'failed') && !safeDetail.running_run_id && !safeDetail.running_turn_id && safeDetail.interrupted_run_id && safeDetail.interrupted_turn_id && !props.activeRun)
 
 	const renderRow = useCallback((row: ConversationRow) => renderConversationRow(row, {
 		sessionID: props.sessionID ?? '',
 		sessionNames: props.sessionNames,
 		workspaceRoot: safeDetail?.created_cwd,
-		canContinue: Boolean(safeDetail && (safeDetail.status === 'interrupted' || safeDetail.status === 'failed') && !safeDetail.running_run_id && !safeDetail.running_turn_id && safeDetail.interrupted_run_id && safeDetail.interrupted_turn_id && !props.activeRun),
+		canContinue: canContinueForRows,
 		onCancelTool: props.onCancelTool,
 		onContinue: props.onContinue,
 		onRetryRefresh: props.onRetryRefresh,
 		onDismissTurnError: props.onDismissTurnError,
-	}), [props.activeRun, props.onCancelTool, props.onContinue, props.onDismissTurnError, props.onRetryRefresh, props.sessionID, props.sessionNames, safeDetail?.created_cwd, safeDetail?.interrupted_run_id, safeDetail?.interrupted_turn_id, safeDetail?.running_run_id, safeDetail?.running_turn_id, safeDetail?.status])
+	}), [canContinueForRows, props.activeRun, props.onCancelTool, props.onContinue, props.onDismissTurnError, props.onRetryRefresh, props.sessionID, props.sessionNames, safeDetail?.created_cwd, safeDetail?.interrupted_run_id, safeDetail?.interrupted_turn_id, safeDetail?.running_run_id, safeDetail?.running_turn_id])
 
 	const conversationEmpty = <div className="conversation-empty"><SparkIcon /><h3>Start a new task</h3><p>Describe a goal, a problem, or the code you want to change.</p></div>
 	const listHeader = (
@@ -218,7 +223,7 @@ export const Conversation = memo(function Conversation(props: {
 				: <span aria-hidden="true" />}
 		</div>
 	)
-	const canContinue = Boolean(safeDetail && (safeDetail.status === 'interrupted' || safeDetail.status === 'failed') && !safeDetail.running_run_id && !safeDetail.running_turn_id && safeDetail.interrupted_run_id && safeDetail.interrupted_turn_id && !props.activeRun)
+	const canContinue = Boolean(safeDetail && (indexedStatus === 'interrupted' || indexedStatus === 'failed') && !safeDetail.running_run_id && !safeDetail.running_turn_id && safeDetail.interrupted_run_id && safeDetail.interrupted_turn_id && !props.activeRun)
 	const listFooter = canContinue && !props.turnError
 		? <div className="conversation-retry"><button className="message-tool-button" onClick={props.onContinue} title="Continue interrupted run"><RetryIcon />Continue</button></div>
 		: undefined

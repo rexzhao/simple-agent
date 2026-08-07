@@ -1,4 +1,38 @@
-import type { Project, Session, SessionItem, SessionModelOption } from '../types'
+import type { Project, SessionItem, SessionModelOption } from '../types'
+import type { SessionSummary } from '../repositories/sessionIndex'
+
+/** The smallest navigation shape shared by the Session Index and legacy
+ * session-content DTOs.  Navigation must not require the content snapshot's
+ * provider/history fields. */
+export interface SessionNavigation {
+  id: string
+  project_id: string
+  display_name: string
+  parent_session_id?: string | null
+  archived: boolean
+  status?: string
+  updated_at: string
+  created_at?: string
+  last_used_at?: string
+  has_unread_result?: boolean
+}
+
+/** Convert an index summary to the small shape used by the tree helpers.  It
+ * is intentionally a lossy view: provider/model/content fields remain owned
+ * by the opened-session snapshot. */
+export function navigationSession(summary: SessionSummary): SessionNavigation {
+  return {
+    id: summary.session_id,
+    project_id: summary.project_id,
+    display_name: summary.display_name,
+    parent_session_id: summary.parent_session_id,
+    archived: summary.archived,
+    status: summary.status,
+    updated_at: summary.updated_at,
+    last_used_at: summary.updated_at,
+    has_unread_result: summary.has_unread_result,
+  }
+}
 
 export function modelKey(model?: SessionModelOption): string {
   return model ? `${model.provider}/${model.model_profile}` : ''
@@ -13,21 +47,21 @@ export function projectName(project: Project): string {
   return project.root.split(/[\\/]/).filter(Boolean).pop() || project.root
 }
 
-export function sessionName(session: Session): string {
+export function sessionName(session: Pick<SessionNavigation, 'id' | 'display_name'>): string {
   return session.display_name || `Session ${session.id.slice(-6)}`
 }
 
-function sessionTimestamp(session: Session): number {
-  return new Date(session.last_used_at || session.updated_at || session.created_at).getTime()
+function sessionTimestamp(session: SessionNavigation): number {
+  return new Date(session.last_used_at || session.updated_at || session.created_at || '').getTime()
 }
 
-export function orderSessions(sessions: Session[]): Session[] {
+export function orderSessions<T extends SessionNavigation>(sessions: readonly T[]): T[] {
   return [...sessions].sort((a, b) => sessionTimestamp(b) - sessionTimestamp(a))
 }
 
-export interface SessionTreeNode {
-  session: Session
-  children: SessionTreeNode[]
+export interface SessionTreeNode<T extends SessionNavigation = SessionNavigation> {
+  session: T
+  children: SessionTreeNode<T>[]
   /** The session names a parent that is unavailable or would form a cycle. */
   orphaned: boolean
 }
@@ -38,17 +72,17 @@ export interface SessionTreeNode {
  * and corrupted cycles are broken into orphan roots. A descendant's recent
  * activity lifts its whole root branch in the ordering.
  */
-export function buildSessionTree(sessions: Session[]): SessionTreeNode[] {
+export function buildSessionTree<T extends SessionNavigation>(sessions: readonly T[]): SessionTreeNode<T>[] {
   const ordered = orderSessions(sessions)
   const sessionsByID = new Map(ordered.map((session) => [session.id, session]))
-  const nodesByID = new Map<string, SessionTreeNode>(ordered.map((session) => [session.id, {
+  const nodesByID = new Map<string, SessionTreeNode<T>>(ordered.map((session) => [session.id, {
     session,
     children: [],
     orphaned: false,
   }]))
-  const roots: SessionTreeNode[] = []
+  const roots: SessionTreeNode<T>[] = []
 
-  const parentWouldCycle = (session: Session): boolean => {
+  const parentWouldCycle = (session: T): boolean => {
     const seen = new Set([session.id])
     let parentID = session.parent_session_id
     while (parentID) {
@@ -71,11 +105,11 @@ export function buildSessionTree(sessions: Session[]): SessionTreeNode[] {
     roots.push(node)
   }
 
-  const branchTimestamp = (node: SessionTreeNode): number => Math.max(
+  const branchTimestamp = (node: SessionTreeNode<T>): number => Math.max(
     sessionTimestamp(node.session),
     ...node.children.map(branchTimestamp),
   )
-  const sortBranch = (nodes: SessionTreeNode[]) => {
+  const sortBranch = (nodes: SessionTreeNode<T>[]) => {
     for (const node of nodes) sortBranch(node.children)
     nodes.sort((a, b) => branchTimestamp(b) - branchTimestamp(a) || a.session.id.localeCompare(b.session.id))
   }
@@ -83,15 +117,15 @@ export function buildSessionTree(sessions: Session[]): SessionTreeNode[] {
   return roots
 }
 
-export function flattenSessionTree(nodes: SessionTreeNode[]): Session[] {
+export function flattenSessionTree<T extends SessionNavigation>(nodes: SessionTreeNode<T>[]): T[] {
   return nodes.flatMap((node) => [node.session, ...flattenSessionTree(node.children)])
 }
 
-export interface SessionSubPanelContext {
+export interface SessionSubPanelContext<T extends SessionNavigation = SessionNavigation> {
   /** The parent session shown at the top of the sub-panel. */
-  parent: Session
+  parent: T
   /** Direct children sorted newest-first by creation time. */
-  children: Session[]
+  children: T[]
 }
 
 /**
@@ -102,7 +136,7 @@ export interface SessionSubPanelContext {
  * children. Returns null when the selected session has no parent and no
  * children, meaning there is nothing to show in the sub-panel.
  */
-export function sessionSubPanelContext(sessions: Session[], selectedID: string): SessionSubPanelContext | null {
+export function sessionSubPanelContext<T extends SessionNavigation>(sessions: readonly T[], selectedID: string): SessionSubPanelContext<T> | null {
   const selected = sessions.find((s) => s.id === selectedID)
   if (!selected) return null
   const parentID = selected.parent_session_id
@@ -110,7 +144,7 @@ export function sessionSubPanelContext(sessions: Session[], selectedID: string):
   const effectiveParent = parent ?? selected
   const children = sessions
     .filter((s) => s.parent_session_id === effectiveParent.id)
-    .sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime())
+    .sort((a, b) => new Date(b.created_at || b.updated_at).getTime() - new Date(a.created_at || a.updated_at).getTime())
   if (children.length === 0) return null
   return { parent: effectiveParent, children }
 }
@@ -121,7 +155,7 @@ export function sessionSubPanelContext(sessions: Session[], selectedID: string):
  * The backend archives/removes a whole subtree together, so this count lets
  * confirmation dialogs spell out the cascade.
  */
-export function sessionDescendantIDs(sessions: Session[], rootID: string): string[] {
+export function sessionDescendantIDs<T extends SessionNavigation>(sessions: readonly T[], rootID: string): string[] {
   const childrenByParent = new Map<string, string[]>()
   for (const session of sessions) {
     if (!session.parent_session_id) continue

@@ -2,6 +2,7 @@
 import { fireEvent, render, screen } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { Project, Session } from '../types'
+import type { SessionIndexReadModel, SessionSummary } from '../repositories/sessionIndex'
 import { WorkspaceTree } from './WorkspaceTree'
 
 const project: Project = {
@@ -33,10 +34,24 @@ function session(id: string, name: string, options: Partial<Session> = {}): Sess
 
 function renderTree(sessions: Session[], runningSessionIDs: ReadonlySet<string> = new Set()) {
   const onSelectSession = vi.fn()
+  const summaries: SessionSummary[] = sessions.map((item) => ({
+    session_id: item.id,
+    project_id: item.project_id,
+    parent_session_id: item.parent_session_id ?? null,
+    display_name: item.display_name,
+    archived: item.archived,
+    status: (item.status === 'running' ? 'running' : item.status === 'interrupted' ? 'interrupted' : 'idle'),
+    run_id: item.status === 'running' ? item.running_run_id ?? 'run-test' : null,
+    resource_revision: item.revision ?? '0',
+    updated_at: item.updated_at,
+    has_unread_result: false,
+  }))
+  const sessionIndexes: Record<string, SessionIndexReadModel> = {
+    [project.id]: { status: 'ready', summaries, active: summaries, archived: [] },
+  }
   render(<WorkspaceTree
     projects={[project]}
-    sessionsByProject={{ [project.id]: sessions }}
-    archivedSessionsByProject={{ [project.id]: [] }}
+    sessionIndexes={sessionIndexes}
     selectedProjectID={project.id}
     selectedSessionID=""
     runningSessionIDs={runningSessionIDs}
@@ -51,6 +66,7 @@ function renderTree(sessions: Session[], runningSessionIDs: ReadonlySet<string> 
     onArchiveSession={vi.fn()}
     onRestoreSession={vi.fn()}
     onDeleteSession={vi.fn()}
+    onRetrySessionIndex={vi.fn()}
     onAdd={vi.fn()}
   />)
   return onSelectSession

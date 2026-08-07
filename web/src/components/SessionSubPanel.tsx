@@ -1,22 +1,21 @@
 import { memo, useState } from 'react'
-import type { Session } from '../types'
-import type { SessionSubPanelContext } from '../lib/session'
+import type { SessionSubPanelContext, SessionNavigation } from '../lib/session'
 import { sessionName } from '../lib/session'
 import { ArchiveIcon, ChevronIcon, EditIcon, TrashIcon } from './icons'
 
 export const SessionSubPanel = memo(function SessionSubPanel(props: {
-  context: SessionSubPanelContext
+  context: SessionSubPanelContext<SessionNavigation>
   viewingSessionID: string
   runningSessionIDs: ReadonlySet<string>
   onSelectSession: (sessionID: string) => void
-  onRenameSession: (session: Session) => void
-  onArchiveSession: (session: Session) => void
-  onDeleteSession: (session: Session) => void
+  onRenameSession: (session: SessionNavigation) => void
+  onArchiveSession: (session: SessionNavigation) => void
+  onDeleteSession: (session: SessionNavigation) => void
 }) {
   const [minimized, setMinimized] = useState(false)
   const { parent, children } = props.context
 
-  const renderTab = (session: Session, isParent: boolean) => {
+  const renderTab = (session: SessionNavigation, isParent: boolean) => {
     const running = session.status === 'running' || props.runningSessionIDs.has(session.id)
     const interrupted = !running && (session.status === 'interrupted' || session.status === 'failed')
     return (

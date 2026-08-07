@@ -2,11 +2,11 @@
 import { render } from '@testing-library/react'
 import { describe, expect, it, vi } from 'vitest'
 import { SyncApplicationProvider } from '../applicationContext'
-import { useProjectSessions, useSessionView } from './useSyncApplication'
+import { useSessionIndexes, useSessionView } from './useSyncApplication'
 import { createSyncApplication } from '../sync/applicationComposition'
 
 function Probe({ projectID, sessionID }: { projectID: string; sessionID: string }) {
-  useProjectSessions(projectID)
+  useSessionIndexes([projectID])
   useSessionView(sessionID)
   return null
 }
@@ -18,12 +18,12 @@ describe('page-facing sync selectors', () => {
     const sessionContent = application.repositories.sessionContent
     const projectReleases: string[] = []
     const sessionReleases: string[] = []
-    const originalProjectSubscribe = sessionIndex.subscribeProject.bind(sessionIndex)
+    const originalProjectSubscribe = sessionIndex.subscribeProjects.bind(sessionIndex)
     const originalSessionObserve = sessionContent.observe.bind(sessionContent)
-    const projectSubscribe = vi.spyOn(sessionIndex, 'subscribeProject').mockImplementation((projectID, listener) => {
-      const release = originalProjectSubscribe(projectID, listener)
+    const projectSubscribe = vi.spyOn(sessionIndex, 'subscribeProjects').mockImplementation((projectIDs, listener) => {
+      const release = originalProjectSubscribe(projectIDs, listener)
       return () => {
-        projectReleases.push(projectID)
+        projectReleases.push(projectIDs.join(','))
         release()
       }
     })

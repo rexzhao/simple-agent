@@ -224,6 +224,7 @@ svg { width: 1.1em; height: 1.1em; fill: none; stroke: currentColor; stroke-widt
 .session-tree-row.archived { opacity: .72; }
 .session-tree-row.archived:hover, .session-tree-row.archived:focus-within { opacity: 1; }
 .session-tree-button .status-dot { margin-left: auto; }
+.unread-badge { margin-left: auto; color: var(--accent); font-size: 15px; line-height: 1; }
 
 .session-tree-actions { display: flex; gap: 1px; padding-right: 3px; opacity: 0; }
 .session-tree-row:hover .session-tree-actions, .session-tree-row:focus-within .session-tree-actions { opacity: 1; }
@@ -264,6 +265,8 @@ svg { width: 1.1em; height: 1.1em; fill: none; stroke: currentColor; stroke-widt
 .archived-session-toggle { margin-top: 7px; }
 .archived-session-toggle > svg:first-child { transform: none; }
 .tree-empty { margin: 6px 0 4px 5px; color: rgba(0, 0, 0, .56); font-size: 10.5px; }
+.tree-error, .tree-stale { display: flex; align-items: center; justify-content: space-between; gap: 6px; margin: 5px 0; padding: 6px; border: 1px solid rgba(0, 0, 0, .2); color: rgba(0, 0, 0, .62); font-size: 10px; }
+.tree-error button, .tree-stale button { padding: 2px 5px; border: 1px solid var(--border); background: var(--accent); font-size: 9px; font-weight: 750; }
 
 .project-rail-footer { display: flex; flex-direction: column; gap: 10px; padding: 10px 4px 0; border-top: 2px solid rgba(0, 0, 0, .18); }
 .version { color: rgba(0, 0, 0, .55); font-family: var(--font-mono); font-size: 9.5px; text-align: center; }

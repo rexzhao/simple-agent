@@ -90,6 +90,15 @@ export class ProjectIndexStore {
     return data && Object.prototype.hasOwnProperty.call(data.summariesByID, id) ? data.summariesByID[id] : undefined
   }
 
+  /**
+   * Navigation consumers use the project index as the set of projects whose
+   * session indexes must stay live.  Keep this selector here rather than
+   * making the interest policy depend on a React/current-project signal.
+   */
+  getActiveProjectIDs(): readonly string[] {
+    return this.getSnapshot().active.map((project) => project.id)
+  }
+
   hasSnapshot(): boolean {
     return this.replica.get(resource).initialized
   }

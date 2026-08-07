@@ -27,6 +27,37 @@ export interface SessionIndexReadModel {
   readonly error?: DomainReadError
 }
 
+export type SessionIndexNavigationReadModels = Readonly<Record<string, SessionIndexReadModel>>
+
+export interface SessionIndexCompletionObservation {
+  readonly status: SessionIndexStatus
+  readonly hasUnreadResult: boolean
+  readonly runID: string | null
+}
+
+const terminalSessionStatuses = new Set<SessionIndexStatus>(['completed', 'failed', 'interrupted'])
+
+/**
+ * Session Index is the only navigation-level source for background completion.
+ * A missing previous observation is intentionally not a transition: the first
+ * snapshot may contain an old unread result and must not replay a notification.
+ */
+export function isBackgroundSessionCompletionTransition(
+  previous: SessionIndexCompletionObservation | undefined,
+  current: Pick<SessionSummary, 'session_id' | 'status' | 'has_unread_result'>,
+  currentSessionID: string,
+): boolean {
+  if (!previous || current.session_id === currentSessionID) return false
+  return (
+    previous.status === 'running' && terminalSessionStatuses.has(current.status)
+  ) || (!previous.hasUnreadResult && current.has_unread_result)
+}
+
+/** Keep status and unread updates for one run as one visible notice. */
+export function sessionIndexCompletionNoticeKey(summary: Pick<SessionSummary, 'session_id' | 'run_id'>): string {
+  return `${summary.session_id}\u0000${summary.run_id ?? 'no-run'}`
+}
+
 export interface SessionReadModel {
   readonly status: SessionIndexReadState
   readonly summary?: SessionSummary
@@ -41,6 +72,23 @@ export interface SessionIndexSource {
   getProjectReadModel(projectID: string): SessionIndexReadModel
   getSummary(projectID: string, sessionID: string): SessionSummary | undefined
   subscribeProject(projectID: string, listener: () => void): () => void
+  subscribeProjects?(projectIDs: readonly string[], listener: () => void): () => void
+  retry?(projectID: string): void
+}
+
+export interface SessionIndexObservationOptions {
+  readonly signal?: AbortSignal
+  readonly timeoutMS?: number
+}
+
+export class SessionIndexObservationError extends Error {
+  readonly code: 'timeout' | 'cancelled'
+
+  constructor(code: 'timeout' | 'cancelled') {
+    super(code === 'timeout' ? 'session index did not update in time' : 'session index observation was cancelled')
+    this.name = 'SessionIndexObservationError'
+    this.code = code
+  }
 }
 
 interface ProjectCache {
@@ -60,7 +108,9 @@ export interface SessionIndexRepositoryOptions {
 }
 
 function copyError(error: DomainReadError | undefined): DomainReadError | undefined {
-  return error ? { code: error.code, message: error.message } : undefined
+  // Protocol/transport diagnostics stay in infrastructure logs.  The page
+  // only receives a stable, safe recovery message.
+  return error ? { code: 'unavailable', message: 'Session list is temporarily unavailable.' } : undefined
 }
 
 /**
@@ -73,6 +123,11 @@ export class SessionIndexRepository {
   private readonly maxCachedProjects: number
   private readonly projectCaches = new Map<string, ProjectCache>()
   private readonly sessionCaches = new Map<string, SessionCache>()
+  private navigationCache: {
+    key: string
+    sourceModels: readonly SessionIndexReadModel[]
+    model: SessionIndexNavigationReadModels
+  } | null = null
 
   constructor(source: SessionIndexSource, options: SessionIndexRepositoryOptions = {}) {
     this.source = source
@@ -93,6 +148,21 @@ export class SessionIndexRepository {
     }
     this.projectCaches.set(projectID, { sourceModel, model })
     this.trimCaches()
+    return model
+  }
+
+  getProjectReadModels(projectIDs: readonly string[]): SessionIndexNavigationReadModels {
+    const ids = [...new Set(projectIDs)]
+    const key = ids.join('\u0000')
+    const sourceModels = ids.map((projectID) => this.getProjectReadModel(projectID))
+    const cached = this.navigationCache
+    if (cached && cached.key === key && cached.sourceModels.length === sourceModels.length && sourceModels.every((model, index) => model === cached.sourceModels[index])) {
+      return cached.model
+    }
+    const models: Record<string, SessionIndexReadModel> = {}
+    ids.forEach((projectID, index) => { models[projectID] = sourceModels[index] })
+    const model = Object.freeze(models)
+    this.navigationCache = { key, sourceModels, model }
     return model
   }
 
@@ -119,6 +189,52 @@ export class SessionIndexRepository {
     return this.source.subscribeProject(projectID, listener)
   }
 
+  subscribeProjects(projectIDs: readonly string[], listener: () => void): () => void {
+    if (this.source.subscribeProjects) return this.source.subscribeProjects(projectIDs, listener)
+    const releases = [...new Set(projectIDs)].map((projectID) => this.source.subscribeProject(projectID, listener))
+    return () => releases.forEach((release) => release())
+  }
+
+  retry(projectID: string): void {
+    this.source.retry?.(projectID)
+  }
+
+  waitFor(
+    projectID: string,
+    predicate: (model: SessionIndexReadModel) => boolean,
+    options: SessionIndexObservationOptions = {},
+  ): Promise<SessionIndexReadModel> {
+    const timeoutMS = options.timeoutMS ?? 5000
+    if (!Number.isFinite(timeoutMS) || timeoutMS <= 0) throw new Error('session observation timeout must be positive')
+    const initial = this.getProjectReadModel(projectID)
+    if (predicate(initial)) return Promise.resolve(initial)
+    if (options.signal?.aborted) return Promise.reject(new SessionIndexObservationError('cancelled'))
+    return new Promise((resolve, reject) => {
+      let settled = false
+      let timer: ReturnType<typeof globalThis.setTimeout> | undefined
+      let release: (() => void) | undefined
+      const finish = (action: () => void) => {
+        if (settled) return
+        settled = true
+        if (timer !== undefined) globalThis.clearTimeout(timer)
+        release?.()
+        options.signal?.removeEventListener('abort', onAbort)
+        action()
+      }
+      const onAbort = () => finish(() => reject(new SessionIndexObservationError('cancelled')))
+      const onChange = () => {
+        const model = this.getProjectReadModel(projectID)
+        if (predicate(model)) finish(() => resolve(model))
+      }
+      release = this.subscribeProject(projectID, onChange)
+      onChange()
+      if (settled) return
+      options.signal?.addEventListener('abort', onAbort, { once: true })
+      timer = globalThis.setTimeout(() => finish(() => reject(new SessionIndexObservationError('timeout'))), timeoutMS)
+      if (options.signal?.aborted) onAbort()
+    })
+  }
+
   subscribeSession(projectID: string, _sessionID: string, listener: () => void): () => void {
     // The source invalidates the project listener for any B update. The
     // session getSnapshot remains reference-stable for unchanged A, so
@@ -128,6 +244,7 @@ export class SessionIndexRepository {
 
   evictProject(projectID: string): void {
     this.projectCaches.delete(projectID)
+    this.navigationCache = null
     for (const key of this.sessionCaches.keys()) {
       if (key.startsWith(`${projectID}\u0000`)) this.sessionCaches.delete(key)
     }

@@ -106,7 +106,7 @@ export function createSyncApplication(options: SyncApplicationOptions = {}): Syn
 
   const stores: SyncApplicationStores = {
     projectIndex: new ProjectIndexStore(replica, () => runtime.retry({ type: 'project_index', id: 'server' })),
-    sessionIndex: new SyncSessionIndexRepository(replica),
+    sessionIndex: new SyncSessionIndexRepository(replica, { retry: (projectID) => runtime.retry({ type: 'session_index', id: projectID }) }),
     sessionContent: new SyncSessionContentRepository(replica),
     providerSettings: new ProviderSettingsStore(replica),
     codexLogin: new CodexLoginStore(replica),
@@ -127,7 +127,10 @@ export function createSyncApplication(options: SyncApplicationOptions = {}): Syn
   }
   const policies: SyncApplicationPolicies = {
     projectIndex: new ProjectIndexInterestPolicy(runtime),
-    sessionIndex: new SessionIndexInterestPolicy(runtime, signals.currentProject),
+    // Session Index is navigation state.  Keep every active project's index
+    // desired, rather than tying background completion visibility to the
+    // selected project signal.
+    sessionIndex: new SessionIndexInterestPolicy(runtime, stores.projectIndex),
     sessionContent: new SessionContentInterestPolicy(runtime, signals.currentSession),
     providerSettings: new ProviderSettingsInterestPolicy(runtime, signals.providerSettings),
     codexLogin: new CodexLoginInterestPolicy(runtime, signals.codexLoginProvider),

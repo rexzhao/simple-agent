@@ -14,6 +14,7 @@ export interface SessionIndexReadModel {
 
 export interface SessionIndexRepositoryOptions {
   maxCachedProjects?: number
+  retry?: (projectID: string) => void
 }
 
 type ProjectListener = () => void
@@ -44,11 +45,13 @@ export class SessionIndexRepository {
   private readonly projectListeners = new Map<string, Set<ProjectListener>>()
   private readonly models = new Map<string, CachedModel>()
   private readonly maxCachedProjects: number
+  private readonly retryResource: ((projectID: string) => void) | undefined
   private readonly unsubscribeReplica: () => void
 
   constructor(replica = new LocalReplica(), options: SessionIndexRepositoryOptions = {}) {
     this.replica = replica
     this.maxCachedProjects = options.maxCachedProjects ?? 64
+    this.retryResource = options.retry
     if (this.maxCachedProjects <= 0) throw new Error('maxCachedProjects must be positive')
     this.unsubscribeReplica = replica.subscribe((resource) => {
       if (resource.type !== 'session_index') return
@@ -71,6 +74,11 @@ export class SessionIndexRepository {
       listeners.delete(listener)
       if (listeners.size === 0) this.projectListeners.delete(projectID)
     }
+  }
+
+  subscribeProjects(projectIDs: readonly string[], listener: ProjectListener): () => void {
+    const releases = [...new Set(projectIDs)].map((projectID) => this.subscribeProject(projectID, listener))
+    return () => releases.forEach((release) => release())
   }
 
   getProjectReadModel(projectID: string): SessionIndexReadModel {
@@ -116,6 +124,10 @@ export class SessionIndexRepository {
 
   selectByID(projectID: string, sessionID: string): SessionSummary | undefined {
     return this.getSummary(projectID, sessionID)
+  }
+
+  retry(projectID: string): void {
+    this.retryResource?.(projectID)
   }
 
   /** Useful for runtime tests without leaking metadata through read models. */

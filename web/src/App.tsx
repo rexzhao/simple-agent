@@ -1,13 +1,13 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { api, streamLifecycle, streamRun } from './api'
-import type { CreateSessionOptions } from './api'
 import type { ActiveRun, ActiveRunDescriptor, Bootstrap, ImageAttachmentInput, ItemsPage, LifecycleEvent, RunEvent, Session, SessionDebugSettings, SessionItem, SessionItemProjectionEvent, SessionModelOption } from './types'
 import { ProjectIndexObservationError, type ProjectIndexReadModel, type ProjectSummary } from './repositories/projectIndex'
+import { isBackgroundSessionCompletionTransition, sessionIndexCompletionNoticeKey, type SessionIndexCompletionObservation, type SessionIndexReadModel } from './repositories/sessionIndex'
+import type { SessionCreateOptions } from './commands/sessionCommands'
 import { errorMessage } from './lib/format'
 import { copyFrontendProtocolJSONL, downloadFrontendProtocolJSONL, frontendProtocolLogger, protocolLogIdentity, useFrontendProtocolLogging } from './lib/frontendProtocolLogger'
-import { reduceLifecycleEvent, type SessionMaps } from './lib/lifecycleReducer'
 import { reduceRunEvent } from './lib/runEventReducer'
-import { modelKey, orderSessions, projectName, sessionDescendantIDs, sessionName, sessionSubPanelContext } from './lib/session'
+import { modelKey, navigationSession, projectName, sessionDescendantIDs, sessionName, sessionSubPanelContext, type SessionNavigation } from './lib/session'
 import { settlementRevision } from './lib/settlement'
 import { emptyComposerDraft } from './components/Composer'
 import type { PastedImageAttachment } from './components/Composer'
@@ -25,7 +25,7 @@ import { useRunRegistry } from './hooks/useRunRegistry'
 import { useSessionHistory } from './hooks/useSessionHistory'
 import { useSessionStore } from './hooks/useSessionStore'
 import { useSessionSelection } from './hooks/useSessionSelection'
-import { useProjectIndex, useSyncCommands, useSyncRepositories, useSyncSignals } from './hooks/useSyncApplication'
+import { useProjectIndex, useSessionIndexes, useSyncCommands, useSyncRepositories, useSyncSignals } from './hooks/useSyncApplication'
 
 type BackgroundCompletionNotice = {
   sessionID: string
@@ -44,16 +44,23 @@ function projectMutationErrorMessage(reason: unknown): string {
   return 'Project operation failed.'
 }
 
+function sessionMutationErrorMessage(reason: unknown): string {
+  if (reason && typeof reason === 'object' && 'code' in reason) {
+    const code = String((reason as { code?: unknown }).code)
+    if (code === 'timeout') return 'Session change accepted; waiting for synchronization.'
+    if (code === 'cancelled') return 'Session operation was cancelled.'
+  }
+  return 'Session operation failed.'
+}
+
 function App() {
   const projectIndex = useProjectIndex()
-  const { project: projectCommands } = useSyncCommands()
-  const { currentProject } = useSyncSignals()
-  const { projectIndex: projectIndexRepository } = useSyncRepositories()
+  const { project: projectCommands, session: sessionCommands } = useSyncCommands()
+  const { currentProject, currentSession } = useSyncSignals()
+  const { projectIndex: projectIndexRepository, sessionIndex: sessionIndexRepository } = useSyncRepositories()
   const projects = projectIndex.active
+  const sessionIndexes = useSessionIndexes(projects.map((project) => project.id))
   const [bootstrap, setBootstrap] = useState<Bootstrap | null>(null)
-  const [legacySessionEnumerationReady, setLegacySessionEnumerationReady] = useState(false)
-  const [sessionsByProject, setSessionsByProject] = useState<Record<string, Session[]>>({})
-  const [archivedSessionsByProject, setArchivedSessionsByProject] = useState<Record<string, Session[]>>({})
   const { selectedProjectID, selectedSessionID, selectedProjectRef, setSelectedProjectID, setSelectedSessionID } = useSessionSelection()
   const selectedSessionIDRef = useRef(selectedSessionID)
   selectedSessionIDRef.current = selectedSessionID
@@ -63,16 +70,8 @@ function App() {
   const [viewingSessionID, setViewingSessionID] = useState('')
   const viewingSessionIDRef = useRef(viewingSessionID)
   viewingSessionIDRef.current = viewingSessionID
-  const sessionMapsRef = useRef<SessionMaps>({ active: sessionsByProject, archived: archivedSessionsByProject })
-  sessionMapsRef.current = { active: sessionsByProject, archived: archivedSessionsByProject }
-  // Session-list requests are point-in-time reads.  A rename/archive/refresh
-  // can start another read before the first one returns, so keep a per-project
-  // generation outside React state and discard an older pair of responses as
-  // one unit.  This is separate from the projection store's generation: these
-  // maps are still the tree's presentation cache.
-  const sessionListGenerationRef = useRef<Record<string, number>>({})
-  const legacyEnumeratedActiveProjectIDsRef = useRef(new Set<string>())
   const projectObservationControllersRef = useRef(new Set<AbortController>())
+  const sessionObservationControllersRef = useRef(new Set<AbortController>())
   const [recoveredRuns, setRecoveredRuns] = useState<ActiveRunDescriptor[]>([])
   const [error, setError] = useState('')
   const [showProjectForm, setShowProjectForm] = useState(false)
@@ -85,6 +84,8 @@ function App() {
   const [creatingSession, setCreatingSession] = useState(false)
   const creatingRootSessionRef = useRef(false)
   const [completionNotice, setCompletionNotice] = useState<BackgroundCompletionNotice | null>(null)
+  const sessionIndexObservationsRef = useRef(new Map<string, SessionIndexCompletionObservation>())
+  const sessionIndexNoticeKeysRef = useRef(new Set<string>())
   const [turnErrors, setTurnErrors] = useState<Record<string, { turnID: string; message: string }>>({})
   const [compactingSessionIDs, setCompactingSessionIDs] = useState<Record<string, boolean>>({})
   const [awaitingRunStartedBySession, setAwaitingRunStartedBySession] = useState<Record<string, boolean>>({})
@@ -96,14 +97,11 @@ function App() {
   // label session_* calls with human-readable targets instead of raw ids.
   const sessionNames = useMemo(() => {
     const names: Record<string, string> = {}
-    for (const sessions of Object.values(archivedSessionsByProject)) {
-      for (const session of sessions) if (session.display_name) names[session.id] = session.display_name
-    }
-    for (const sessions of Object.values(sessionsByProject)) {
-      for (const session of sessions) if (session.display_name) names[session.id] = session.display_name
+    for (const index of Object.values(sessionIndexes)) {
+      for (const summary of index.summaries) if (summary.display_name) names[summary.session_id] = summary.display_name
     }
     return names
-  }, [sessionsByProject, archivedSessionsByProject])
+  }, [sessionIndexes])
   // Refs for reconciling timeout and backoff retry tracking.
   const reconcileTimeoutRef = useRef<Record<string, number>>({})
   const reconcileRetryCountRef = useRef<Record<string, number>>({})
@@ -115,29 +113,11 @@ function App() {
   // a transient run before the per-run replay boundary.
   const runStartedReplayBindingsRef = useRef(new Map<string, string>())
   const pendingAdmissionSessionsRef = useRef(new Set<string>())
+  const markReadInFlightRef = useRef(new Set<string>())
 
   const onSupersedeRunRef = useRef<(sessionID: string, oldRunID: string) => void>(() => {})
 
   const { activeRunsBySession, activeRunsRef, runningSessionIDs, addActiveRun, syncActiveRuns, updateActiveRun, queueRunEvent, flushRunEvents } = useRunRegistry({ onSupersedeRun: (sessionID, oldRunID) => onSupersedeRunRef.current(sessionID, oldRunID) })
-
-  const setSessionMaps = useCallback((maps: SessionMaps) => {
-    // Any direct map replacement (bootstrap, lifecycle reducer, or mutation
-    // reload) supersedes a list request that was in flight for one of these
-    // projects.  Invalidate both the old and new key sets, including a
-    // project that was removed by the replacement.
-    const projectIDs = new Set([
-      ...Object.keys(sessionMapsRef.current.active),
-      ...Object.keys(sessionMapsRef.current.archived),
-      ...Object.keys(maps.active),
-      ...Object.keys(maps.archived),
-    ])
-    for (const projectID of projectIDs) {
-      sessionListGenerationRef.current[projectID] = (sessionListGenerationRef.current[projectID] ?? 0) + 1
-    }
-    sessionMapsRef.current = maps
-    setSessionsByProject(maps.active)
-    setArchivedSessionsByProject(maps.archived)
-  }, [])
 
   const clearTurnError = useCallback((sessionID: string) => {
     setTurnErrors((current) => {
@@ -158,33 +138,33 @@ function App() {
     })
   }, [])
 
-  // The project index is the only project navigation authority. Session maps
-  // are still legacy REST projections, so prune them whenever the authority
-  // removes a project; a late session response can then never resurrect it.
-  useEffect(() => {
-    const allowed = new Set(projects.map((project) => project.id))
-    const current = sessionMapsRef.current
-    const active = Object.fromEntries(Object.entries(current.active).filter(([projectID]) => allowed.has(projectID)))
-    const archived = Object.fromEntries(Object.entries(current.archived).filter(([projectID]) => allowed.has(projectID)))
-    if (Object.keys(active).length !== Object.keys(current.active).length || Object.keys(archived).length !== Object.keys(current.archived).length) {
-      setSessionMaps({ active, archived })
-    }
-  }, [projects, setSessionMaps])
-
   // A selected project is application state, not a page-owned subscription.
-  // The policy engine observes this signal and owns Session Index interest.
+  // Session Index interest is owned by the composition root for every active
+  // project; this signal only controls the opened session content resource.
   const previousProjectIDsRef = useRef<readonly string[]>([])
+  const selectedProjectPositionRef = useRef(0)
   useEffect(() => {
     const previousIDs = previousProjectIDsRef.current
     const currentID = selectedProjectRef.current
     const currentIsValid = Boolean(currentID && projects.some((project) => project.id === currentID))
     let nextID = currentIsValid ? currentID : ''
     if (!currentIsValid) {
-      const oldIndex = currentID ? previousIDs.indexOf(currentID) : -1
+      const previousIndex = currentID ? previousIDs.indexOf(currentID) : -1
+      const oldIndex = previousIndex >= 0 ? previousIndex : selectedProjectPositionRef.current
       const nextProject = projects[oldIndex] ?? projects[oldIndex - 1] ?? projects[0]
       nextID = nextProject?.id ?? ''
+      selectedProjectPositionRef.current = Math.max(0, Math.min(oldIndex, Math.max(0, projects.length - 1)))
       setSelectedProjectID(nextID)
-      setSelectedSessionID(nextID ? sessionMapsRef.current.active[nextID]?.[0]?.id ?? '' : '')
+      setSelectedSessionID(nextID ? sessionIndexes[nextID]?.active[0]?.session_id ?? '' : '')
+    }
+    if (nextID) {
+      const nextPosition = projects.findIndex((project) => project.id === nextID)
+      if (nextPosition >= 0) selectedProjectPositionRef.current = nextPosition
+    }
+    const selectedIndex = nextID ? sessionIndexes[nextID] : undefined
+    const selectedStillActive = Boolean(selectedIndex?.active.some((summary) => summary.session_id === selectedSessionIDRef.current))
+    if (nextID && !selectedStillActive && selectedIndex?.status !== 'loading') {
+      setSelectedSessionID(selectedIndex?.active[0]?.session_id ?? '')
     }
     if (projects.length === 0) {
       if (!projectFormUserOpenedRef.current) {
@@ -200,11 +180,13 @@ function App() {
     // do not publish null for one render while a deleted project is being
     // replaced by its deterministic neighbour.
     currentProject.set(nextID || null)
-  }, [currentProject, projects, selectedProjectID, selectedProjectRef, setSelectedProjectID, setSelectedSessionID])
+  }, [currentProject, projects, selectedProjectID, selectedProjectRef, sessionIndexes, setSelectedProjectID, setSelectedSessionID])
 
   useEffect(() => () => {
     for (const controller of projectObservationControllersRef.current) controller.abort()
     projectObservationControllersRef.current.clear()
+    for (const controller of sessionObservationControllersRef.current) controller.abort()
+    sessionObservationControllersRef.current.clear()
   }, [])
 
   const waitForProjectAuthority = useCallback(async (
@@ -225,6 +207,19 @@ function App() {
     }
   }, [projectIndexRepository])
 
+  const waitForSessionAuthority = useCallback(async (
+    projectID: string,
+    predicate: (model: SessionIndexReadModel) => boolean,
+  ): Promise<SessionIndexReadModel> => {
+    const controller = new AbortController()
+    sessionObservationControllersRef.current.add(controller)
+    try {
+      return await sessionIndexRepository.waitFor(projectID, predicate, { signal: controller.signal, timeoutMS: 5000 })
+    } finally {
+      sessionObservationControllersRef.current.delete(controller)
+    }
+  }, [sessionIndexRepository])
+
   const bootstrapInFlightRef = useRef<Promise<ActiveRunDescriptor[]> | null>(null)
   const bootstrapApplication = useCallback(async (preserveSelection: boolean): Promise<ActiveRunDescriptor[]> => {
     if (bootstrapInFlightRef.current) return bootstrapInFlightRef.current
@@ -234,79 +229,34 @@ function App() {
       const projectModel = projectIndexRepository.getSnapshot().status === 'loading'
         ? await projectIndexRepository.waitFor((model) => model.status !== 'loading', { timeoutMS: 15_000 })
         : projectIndexRepository.getSnapshot()
-      const authoritativeProjects = projectModel.active
-      const authoritySignature = JSON.stringify(authoritativeProjects.map((project) => project.id))
-      const sessionProjectIDs = authoritativeProjects.map((project) => project.id)
-      const sessionEntries = await Promise.all(sessionProjectIDs.map(async (projectID) => {
-        const listGeneration = sessionListGenerationRef.current[projectID] ?? 0
-        const [activePayload, archivedPayload] = await Promise.all([api.sessions(projectID), api.sessions(projectID, true)])
-        return {
-          projectID,
-          active: orderSessions(activePayload.sessions),
-          archived: orderSessions(archivedPayload.sessions),
-          listGeneration,
-        }
-      }))
       const [bootstrapPayload, activeRunsPayload] = await Promise.all([bootstrapPayloadPromise, activeRunsPayloadPromise])
-      // A newer project_index publication owns the project set. Do not let a
-      // legacy session response resurrect an archived/deleted project. Read
-      // the repository again at the apply boundary rather than mutating a
-      // generation ref during render.
-      const latestProjects = projectIndexRepository.getSnapshot().active
-      if (JSON.stringify(latestProjects.map((project) => project.id)) !== authoritySignature) {
-        // Let the post-bootstrap active-ID effect enumerate the newer set.
-        setLegacySessionEnumerationReady(true)
-        return []
-      }
-      const projectsForApply = latestProjects
-      const currentMaps = sessionMapsRef.current
-      const entriesByProject = new Map(sessionEntries.map((entry) => [entry.projectID, entry]))
-      const maps: SessionMaps = {
-        active: Object.fromEntries(projectsForApply.map((project) => {
-          const entry = entriesByProject.get(project.id)
-          return [project.id, entry && (sessionListGenerationRef.current[project.id] ?? 0) === entry.listGeneration
-            ? entry.active
-            : currentMaps.active[project.id] ?? []]
-        })),
-        archived: Object.fromEntries(projectsForApply.map((project) => {
-          const entry = entriesByProject.get(project.id)
-          return [project.id, entry && (sessionListGenerationRef.current[project.id] ?? 0) === entry.listGeneration
-            ? entry.archived
-            : currentMaps.archived[project.id] ?? []]
-        })),
-      }
-      const recovered = activeRunsPayload.runs.filter((run) => projectsForApply.some((project) => maps.active[project.id]?.some((session) => session.id === run.session_id)))
-      // A reconnect/bootstrap can overlap a local admission. Do not let the
-      // authoritative active-run listing bypass the replay boundary by
-      // creating the transient container for that pending session.
+      const authoritativeProjects = projectModel.active
       const admissionBoundSessions = new Set(runStartedReplayBindingsRef.current.values())
-      const recoveredForPresentation = recovered.filter((run) =>
+      const recoveredForPresentation = activeRunsPayload.runs.filter((run) =>
         !pendingAdmissionSessionsRef.current.has(run.session_id) && !admissionBoundSessions.has(run.session_id),
       )
-      const recoveredProject = recoveredForPresentation.length > 0
-        ? projectsForApply.find((project) => maps.active[project.id]?.some((session) => session.id === recoveredForPresentation[0].session_id))
-        : null
       const currentProjectID = selectedProjectRef.current
       const currentSessionID = selectedSessionIDRef.current
-      const currentProject = projectsForApply.find((project) => project.id === currentProjectID)
-      const currentSessionProject = projectsForApply.find((project) =>
-        maps.active[project.id]?.some((session) => session.id === currentSessionID) ||
-        maps.archived[project.id]?.some((session) => session.id === currentSessionID),
-      )
+      const currentProject = authoritativeProjects.find((project) => project.id === currentProjectID)
       const firstProjectID = preserveSelection && currentProject
         ? currentProject.id
-        : recoveredProject?.id ?? projectsForApply[0]?.id ?? ''
-      const firstSessionID = preserveSelection && currentSessionProject && currentSessionID
+        : authoritativeProjects[0]?.id ?? ''
+      const firstIndex = firstProjectID ? sessionIndexRepository.getProjectReadModel(firstProjectID) : undefined
+      const selectedStillVisible = Boolean(firstIndex?.active.some((summary) => summary.session_id === currentSessionID))
+      const firstSessionID = preserveSelection && currentProject && selectedStillVisible
         ? currentSessionID
-        : recoveredForPresentation[0]?.session_id ?? maps.active[firstProjectID]?.[0]?.id ?? ''
+        : firstIndex?.active[0]?.session_id ?? ''
       setBootstrap(bootstrapPayload)
-      setSessionMaps(maps)
       syncActiveRuns(recoveredForPresentation)
-      setSelectedProjectID(firstProjectID)
-      setSelectedSessionID(firstSessionID)
       setRecoveredRuns(recoveredForPresentation)
-      for (const project of projectsForApply) legacyEnumeratedActiveProjectIDsRef.current.add(project.id)
-      setLegacySessionEnumerationReady(true)
+      // Bootstrap is a recovery hint, not a late authority for user
+      // selection. The first project/session effect already makes a
+      // deterministic initial choice; never overwrite a click that raced the
+      // bootstrap request.
+      if (preserveSelection || !selectedProjectRef.current) {
+        setSelectedProjectID(firstProjectID)
+        setSelectedSessionID(firstSessionID)
+      }
       return recoveredForPresentation
     })()
     bootstrapInFlightRef.current = operation
@@ -315,70 +265,16 @@ function App() {
     } finally {
       if (bootstrapInFlightRef.current === operation) bootstrapInFlightRef.current = null
     }
-  }, [projectIndexRepository, setSessionMaps, syncActiveRuns])
+  }, [projectIndexRepository, sessionIndexRepository, setSelectedProjectID, setSelectedSessionID, syncActiveRuns])
 
   useEffect(() => {
     void bootstrapApplication(false)
       .catch((reason: unknown) => setError(errorMessage(reason)))
   }, [bootstrapApplication])
 
-  const loadSessions = useCallback(async (projectID: string, preferredSessionID = '', preserveSelection = false) => {
-    if (!projectID) {
-      if (!preserveSelection) setSelectedSessionID('')
-      return []
-    }
-    // A response for a project that has already disappeared from the newest
-    // project list must not recreate that project's session maps.  In-flight
-    // requests started before removal are additionally rejected by the
-    // per-project generation check below.
-    if (!projectIndexRepository.getSnapshot().active.some((project) => project.id === projectID)) return []
-    const generation = (sessionListGenerationRef.current[projectID] ?? 0) + 1
-    sessionListGenerationRef.current[projectID] = generation
-    const [payload, archivedPayload] = await Promise.all([api.sessions(projectID), api.sessions(projectID, true)])
-    const ordered = orderSessions(payload.sessions)
-    // Re-check the active authority at the response boundary as well as at
-    // request admission. This closes the race where a project is archived or
-    // removed while the two legacy session responses are in flight.
-    if (!projectIndexRepository.getSnapshot().active.some((project) => project.id === projectID)) return ordered
-    // Do not let an older pair of active/archived responses roll back a more
-    // recent selection or mutation.  The caller still receives its response
-    // for operation-local bookkeeping, but it cannot mutate the tree.
-    if (sessionListGenerationRef.current[projectID] !== generation) return ordered
-    const maps = sessionMapsRef.current
-    setSessionMaps({
-      active: { ...maps.active, [projectID]: ordered },
-      archived: { ...maps.archived, [projectID]: orderSessions(archivedPayload.sessions) },
-    })
-    if (!preserveSelection && selectedProjectRef.current === projectID) {
-      setSelectedSessionID((current) => {
-        const preferred = preferredSessionID || current
-        if (preferred && ordered.some((session) => session.id === preferred)) return preferred
-        return ordered[0]?.id ?? ''
-      })
-    }
-    return ordered
-  }, [projectIndexRepository, setSessionMaps])
-
-  // Session Index is not cut over yet. Preserve the old REST sidebar behavior
-  // for projects that arrive later through the authoritative project stream,
-  // but enumerate only the current active IDs and never use the REST project
-  // list as a source of navigation state.
-  useEffect(() => {
-    const activeIDs = new Set(projects.map((project) => project.id))
-    for (const projectID of [...legacyEnumeratedActiveProjectIDsRef.current]) {
-      if (!activeIDs.has(projectID)) legacyEnumeratedActiveProjectIDsRef.current.delete(projectID)
-    }
-    if (!legacySessionEnumerationReady) return
-    for (const projectID of activeIDs) {
-      if (legacyEnumeratedActiveProjectIDsRef.current.has(projectID)) continue
-      legacyEnumeratedActiveProjectIDsRef.current.add(projectID)
-      void loadSessions(projectID).catch((reason: unknown) => setError(errorMessage(reason)))
-    }
-  }, [legacySessionEnumerationReady, loadSessions, projects])
-
   const reportError = useCallback((reason: unknown) => setError(errorMessage(reason)), [])
   const { sessionDetail, itemsPage, selectedSessionRef, refreshSession, loadOlder } =
-    useSessionHistory(viewingSessionID, loadSessions, reportError, sessionStore)
+    useSessionHistory(viewingSessionID, reportError, sessionStore)
   refreshSessionRef.current = refreshSession
 
   // Tree selection is the authoritative navigation source. The viewing session
@@ -386,6 +282,62 @@ function App() {
   // the conversation panel in sync. The sub-panel can then override it without
   // disturbing the tree's selected highlight.
   useEffect(() => { setViewingSessionID(selectedSessionID) }, [selectedSessionID])
+  useEffect(() => { currentSession.set(viewingSessionID || null) }, [currentSession, viewingSessionID])
+
+  // Completion notices are a page read-model derived from Session Index
+  // transitions.  Lifecycle/run streams remain content adapters and are not a
+  // second source of navigation notifications.
+  useEffect(() => {
+    const seen = new Set<string>()
+    let notice: BackgroundCompletionNotice | undefined
+    for (const [projectID, index] of Object.entries(sessionIndexes)) {
+      for (const summary of index.summaries) {
+        const key = `${projectID}\u0000${summary.session_id}`
+        seen.add(key)
+        const previous = sessionIndexObservationsRef.current.get(key)
+        if (!notice && isBackgroundSessionCompletionTransition(previous, summary, viewingSessionID)) {
+          const noticeKey = `${projectID}\u0000${sessionIndexCompletionNoticeKey(summary)}`
+          if (!sessionIndexNoticeKeysRef.current.has(noticeKey)) {
+            sessionIndexNoticeKeysRef.current.add(noticeKey)
+            notice = { sessionID: summary.session_id, sessionName: summary.display_name || `Session ${summary.session_id.slice(-6)}` }
+          }
+        }
+        sessionIndexObservationsRef.current.set(key, {
+          status: summary.status,
+          hasUnreadResult: summary.has_unread_result,
+          runID: summary.run_id,
+        })
+      }
+    }
+    for (const key of sessionIndexObservationsRef.current.keys()) {
+      if (!seen.has(key)) sessionIndexObservationsRef.current.delete(key)
+    }
+    if (notice) setCompletionNotice(notice)
+  }, [sessionIndexes, viewingSessionID])
+
+  // Reading a completed result is a typed command followed by an index
+  // observation.  The command ack never clears the badge locally; the
+  // Session Index publication does.
+  useEffect(() => {
+    if (!viewingSessionID) return
+    let target: { projectID: string; runID: string } | undefined
+    for (const [projectID, index] of Object.entries(sessionIndexes)) {
+      const summary = index.summaries.find((item) => item.session_id === viewingSessionID)
+      if (summary?.has_unread_result && summary.run_id) {
+        target = { projectID, runID: summary.run_id }
+        break
+      }
+    }
+    if (!target || markReadInFlightRef.current.has(viewingSessionID)) return
+    markReadInFlightRef.current.add(viewingSessionID)
+    void sessionCommands.markRead(viewingSessionID, target.runID, target.projectID)
+      .then(() => waitForSessionAuthority(target!.projectID, (index) => {
+        const summary = index.summaries.find((item) => item.session_id === viewingSessionID)
+        return summary?.has_unread_result === false
+      }))
+      .catch((reason: unknown) => setError(sessionMutationErrorMessage(reason)))
+      .finally(() => markReadInFlightRef.current.delete(viewingSessionID))
+  }, [sessionCommands, sessionIndexes, waitForSessionAuthority, viewingSessionID])
 
   // Durable items are already in the session projection. Removing a run must
   // therefore only tear down transient state; it must not copy its steps into
@@ -527,22 +479,21 @@ function App() {
     if (!projectID || creatingSession) return
     setCreatingSession(true)
     try {
-      const session = await api.createSession({
-        projectID,
+      const result = await sessionCommands.create(projectID, {
         provider: model.provider,
         modelProfile: model.model_profile,
         reasoningLevel: sessionCreator?.reasoningLevel ?? model.default_reasoning_level ?? '',
         fullAccess: sessionCreator?.fullAccess ?? false,
       })
       setSelectedProjectID(projectID)
-      await loadSessions(projectID, session.id)
-      setSelectedSessionID(session.id)
+      await waitForSessionAuthority(projectID, (index) => index.active.some((summary) => summary.session_id === result.session_id))
+      setSelectedSessionID(result.session_id)
       projectFormUserOpenedRef.current = false
       autoProjectFormRef.current = false
       setShowProjectForm(false)
       setSessionCreator(null)
     } catch (reason) {
-      setError(errorMessage(reason))
+      setError(sessionMutationErrorMessage(reason))
     } finally {
       setCreatingSession(false)
     }
@@ -560,12 +511,13 @@ function App() {
   }, [])
 
   const selectProject = useCallback((projectID: string) => {
+    selectedProjectPositionRef.current = Math.max(0, projects.findIndex((project) => project.id === projectID))
     setSelectedProjectID(projectID)
-    setSelectedSessionID(sessionsByProject[projectID]?.[0]?.id ?? '')
+    setSelectedSessionID(sessionIndexes[projectID]?.active[0]?.session_id ?? '')
     projectFormUserOpenedRef.current = false
     autoProjectFormRef.current = false
     setShowProjectForm(false)
-  }, [sessionsByProject, setSelectedProjectID, setSelectedSessionID])
+  }, [projects, sessionIndexes, setSelectedProjectID, setSelectedSessionID])
 
   const selectSession = useCallback((projectID: string, sessionID: string) => {
     setSelectedProjectID(projectID)
@@ -591,9 +543,10 @@ function App() {
   }, [projectCommands, waitForProjectAuthority])
 
   const deleteProject = useCallback(async (project: ProjectSummary) => {
-    const activeSessions = sessionsByProject[project.id] ?? []
-    const archivedSessions = archivedSessionsByProject[project.id] ?? []
-    if (activeSessions.some((session) => session.status === 'running' || activeRunsRef.current[session.id]?.status === 'running')) return
+    const index = sessionIndexes[project.id]
+    const activeSessions = index?.active ?? []
+    const archivedSessions = index?.archived ?? []
+    if (activeSessions.some((session) => session.status === 'running' || activeRunsRef.current[session.session_id]?.status === 'running')) return
     const sessionCount = activeSessions.length + archivedSessions.length
     const message = `Permanently delete "${projectName(project)}" and ${sessionCount} saved ${sessionCount === 1 ? 'session' : 'sessions'}? All session history and attachments for this project will be removed. This action cannot be undone.`
     if (!window.confirm(message)) return
@@ -623,33 +576,25 @@ function App() {
       }
       setError(projectMutationErrorMessage(reason))
     }
-  }, [activeRunsRef, archivedSessionsByProject, projectCommands, sessionsByProject, waitForProjectAuthority])
+  }, [activeRunsRef, projectCommands, sessionIndexes, waitForProjectAuthority])
 
-  const renameSession = useCallback(async (session: Session) => {
+  const renameSession = useCallback(async (session: SessionNavigation) => {
     const displayName = window.prompt('Rename session', sessionName(session))
     if (displayName === null || displayName.trim() === session.display_name) return
-    if (!displayName.trim()) {
-      setError('Session name cannot be empty')
-      return
-    }
+    if (!displayName.trim()) { setError('Session name cannot be empty'); return }
     try {
-      await api.renameSession(session.id, displayName.trim())
-      await loadSessions(session.project_id, session.id)
+      await sessionCommands.rename(session.id, displayName.trim())
+      await waitForSessionAuthority(session.project_id, (index) => index.summaries.some((summary) => summary.session_id === session.id && summary.display_name === displayName.trim()))
       if (selectedSessionRef.current === session.id) await refreshSession(session.id)
-    } catch (reason) {
-      setError(errorMessage(reason))
-    }
-  }, [loadSessions, refreshSession, selectedSessionRef])
+    } catch (reason) { setError(sessionMutationErrorMessage(reason)) }
+  }, [refreshSession, selectedSessionRef, sessionCommands, waitForSessionAuthority])
 
   const toggleFullAccess = useCallback(async (session: Session) => {
     try {
-      await api.setSessionFullAccess(session.id, !session.full_access)
-      await loadSessions(session.project_id, session.id)
+      await sessionCommands.setFullAccess(session.id, !session.full_access)
       if (selectedSessionRef.current === session.id) await refreshSession(session.id)
-    } catch (reason) {
-      setError(errorMessage(reason))
-    }
-  }, [loadSessions, refreshSession, selectedSessionRef])
+    } catch (reason) { setError(sessionMutationErrorMessage(reason)) }
+  }, [refreshSession, selectedSessionRef, sessionCommands])
 
   const openDebugSettings = useCallback(() => {
     if (viewingSessionID) setDebugSessionID(viewingSessionID)
@@ -658,22 +603,18 @@ function App() {
   const saveDebugSettings = useCallback(async (sessionID: string, settings: SessionDebugSettings) => {
     setSavingDebugSettings(true)
     try {
-      const updated = await api.setSessionDebug(sessionID, settings)
-      await loadSessions(updated.project_id, updated.id, true)
+      await sessionCommands.setDebug(sessionID, settings.request_bodies)
       if (selectedSessionRef.current === sessionID) await refreshSession(sessionID)
       setDebugSessionID('')
     } catch (reason) {
-      setError(errorMessage(reason))
+      setError(sessionMutationErrorMessage(reason))
       throw reason
-    } finally {
-      setSavingDebugSettings(false)
-    }
-  }, [loadSessions, refreshSession, selectedSessionRef])
+    } finally { setSavingDebugSettings(false) }
+  }, [refreshSession, selectedSessionRef, sessionCommands])
 
-  const archiveSession = useCallback(async (session: Session) => {
-    // The backend archives the whole subtree together, so guard and confirm
-    // against every descendant, not just the target.
-    const projectSessions = sessionsByProject[session.project_id] ?? []
+  const archiveSession = useCallback(async (session: SessionNavigation) => {
+    const index = sessionIndexes[session.project_id]
+    const projectSessions = [...(index?.active.map(navigationSession) ?? []), ...(index?.archived.map(navigationSession) ?? [])]
     const subtreeIDs = [session.id, ...sessionDescendantIDs(projectSessions, session.id)]
     const busyIDs = new Set(projectSessions.filter((item) => item.status === 'running').map((item) => item.id))
     if (subtreeIDs.some((id) => busyIDs.has(id) || activeRunsRef.current[id]?.status === 'running')) return
@@ -681,109 +622,87 @@ function App() {
     const childNote = childCount > 0 ? ` ${childCount} child ${childCount === 1 ? 'session' : 'sessions'} will also be archived.` : ''
     if (!window.confirm(`Archive "${sessionName(session)}"? It will be hidden from the current list.${childNote}`)) return
     try {
-      await api.archiveSession(session.id)
-      await loadSessions(session.project_id)
-    } catch (reason) {
-      setError(errorMessage(reason))
-    }
-  }, [activeRunsRef, loadSessions, sessionsByProject])
+      await sessionCommands.archive(session.id)
+      await waitForSessionAuthority(session.project_id, (next) => next.summaries.some((summary) => summary.session_id === session.id && summary.archived))
+      if (selectedSessionRef.current === session.id) {
+        const next = sessionIndexRepository.getProjectReadModel(session.project_id).active[0]
+        setSelectedSessionID(next?.session_id ?? '')
+      }
+    } catch (reason) { setError(sessionMutationErrorMessage(reason)) }
+  }, [activeRunsRef, sessionIndexRepository, sessionIndexes, selectedSessionRef, sessionCommands, setSelectedSessionID, waitForSessionAuthority])
 
-  const restoreSession = useCallback(async (session: Session) => {
+  const restoreSession = useCallback(async (session: SessionNavigation) => {
     try {
-      const restored = await api.restoreSession(session.id)
-      await loadSessions(session.project_id)
+      await sessionCommands.restore(session.id)
+      await waitForSessionAuthority(session.project_id, (index) => index.active.some((summary) => summary.session_id === session.id))
       setSelectedProjectID(session.project_id)
-      setSelectedSessionID(restored.id)
+      setSelectedSessionID(session.id)
       setShowProjectForm(false)
-    } catch (reason) {
-      setError(errorMessage(reason))
-    }
-  }, [loadSessions, setSelectedProjectID, setSelectedSessionID])
+    } catch (reason) { setError(sessionMutationErrorMessage(reason)) }
+  }, [sessionCommands, setSelectedProjectID, setSelectedSessionID, waitForSessionAuthority])
 
-  const deleteSession = useCallback(async (session: Session) => {
-    // The backend removes the whole subtree together: count descendants in
-    // both the active and archived lists, since every one of them is deleted.
-    const projectSessions = [...(sessionsByProject[session.project_id] ?? []), ...(archivedSessionsByProject[session.project_id] ?? [])]
+  const deleteSession = useCallback(async (session: SessionNavigation) => {
+    const index = sessionIndexes[session.project_id]
+    const projectSessions = [...(index?.active.map(navigationSession) ?? []), ...(index?.archived.map(navigationSession) ?? [])]
     const subtreeIDs = [session.id, ...sessionDescendantIDs(projectSessions, session.id)]
+    const initialArchivedByID = new Map(projectSessions.map((item) => [item.id, item.archived]))
     const busyIDs = new Set(projectSessions.filter((item) => item.status === 'running').map((item) => item.id))
     if (subtreeIDs.some((id) => busyIDs.has(id) || activeRunsRef.current[id]?.status === 'running')) return
     const childCount = subtreeIDs.length - 1
     const childNote = childCount > 0 ? ` ${childCount} child ${childCount === 1 ? 'session' : 'sessions'} will also be permanently deleted.` : ''
     if (!window.confirm(`Permanently delete "${sessionName(session)}"? This action cannot be undone.${childNote}`)) return
+    const subtreeIsArchived = (next: SessionIndexReadModel): boolean => subtreeIDs.every((sessionID) => {
+      const summary = next.summaries.find((item) => item.session_id === sessionID)
+      return summary !== undefined && summary.archived
+    })
+    let archiveAcknowledged = session.archived
     try {
-      await api.archiveSession(session.id)
-      await api.deleteSession(session.id)
-      await loadSessions(session.project_id)
-    } catch (reason) {
-      try {
-        await loadSessions(session.project_id)
-      } catch {
-        // Preserve the original operation error.
+      // RemoveSession deliberately enforces archive-first on the server.  The
+      // command ack is not the replica: do not issue delete until the index
+      // has published the effective archived state for every descendant.
+      if (!session.archived) {
+        await sessionCommands.archive(session.id)
+        await waitForSessionAuthority(session.project_id, subtreeIsArchived)
+        archiveAcknowledged = true
       }
-      setError(errorMessage(reason))
+      await sessionCommands.deleteSession(session.id)
+      await waitForSessionAuthority(session.project_id, (next) => !next.summaries.some((summary) => subtreeIDs.includes(summary.session_id)))
+      if (subtreeIDs.includes(selectedSessionRef.current)) {
+        const next = sessionIndexRepository.getProjectReadModel(session.project_id).active[0]
+        setSelectedProjectID(session.project_id)
+        setSelectedSessionID(next?.session_id ?? '')
+      }
+    } catch (reason) {
+      // Once archive authority is known, an explicit later command failure is
+      // safe to compensate.  A timeout/transport/outcome_unknown can mean the
+      // server already applied delete, so guessing with restore could recreate
+      // or mutate a resource after a successful operation.
+      const reasonCode = reason && typeof reason === 'object' && 'code' in reason
+        ? String((reason as { code?: unknown }).code)
+        : ''
+      const outcomeUnknown = reasonCode === 'outcome_unknown' || reasonCode === 'timeout' || reasonCode === 'transport'
+      if (archiveAcknowledged && !session.archived && !outcomeUnknown) {
+        try {
+          await sessionCommands.restore(session.id)
+          await waitForSessionAuthority(session.project_id, (next) => subtreeIDs.every((sessionID) => {
+            const summary = next.summaries.find((item) => item.session_id === sessionID)
+            return summary !== undefined && summary.archived === (initialArchivedByID.get(sessionID) ?? false)
+          }))
+        } catch {
+          // Preserve the original delete error; the authority remains the
+          // source of truth if compensation itself cannot be observed.
+        }
+      }
+      setError(sessionMutationErrorMessage(reason))
     }
-  }, [activeRunsRef, archivedSessionsByProject, loadSessions, sessionsByProject])
+  }, [activeRunsRef, sessionIndexRepository, sessionIndexes, selectedSessionRef, sessionCommands, setSelectedProjectID, setSelectedSessionID, waitForSessionAuthority])
 
-  const applyLifecycleSessionEvent = useCallback((event: LifecycleEvent, options: { updateStore?: boolean } = {}) => {
-    const eventSession = event.session && typeof event.session === 'object'
-      ? event.session
-      : event.metadata ?? event.session_metadata
-    if (eventSession && options.updateStore !== false) sessionStore.updateSessionMetadata(eventSession)
-    const current = sessionMapsRef.current
-    const next = reduceLifecycleEvent(current, event)
-    if (next === current) return
-    setSessionMaps(next)
-
-    if (event.type !== 'session.deleted') return
-    const deletedIDs = new Set([
-      typeof event.session === 'string' ? event.session : '',
-      event.session_id ?? '',
-      ...(event.descendants ?? []),
-    ])
-    if (!deletedIDs.has(selectedSessionIDRef.current)) return
-    const projectID = event.project_id ?? event.project ?? selectedProjectRef.current
-    const nextProjectID = next.active[projectID] || next.archived[projectID]
-      ? projectID
-      : Object.keys(next.active)[0] ?? ''
-    setSelectedProjectID(nextProjectID)
-    setSelectedSessionID(next.active[nextProjectID]?.[0]?.id ?? '')
-  }, [sessionStore.updateSessionMetadata, setSelectedProjectID, setSelectedSessionID, setSessionMaps])
-
+  // Session Index owns navigation metadata and status. Lifecycle SSE is
+  // retained only as a run/content transition adapter until the content phase
+  // moves to its repository; it never writes the navigation read model.
   const knownSession = useCallback((sessionID: string): Session | null => {
-    for (const sessions of Object.values(sessionMapsRef.current.active)) {
-      const session = sessions.find((item) => item.id === sessionID)
-      if (session) return session
-    }
-    for (const sessions of Object.values(sessionMapsRef.current.archived)) {
-      const session = sessions.find((item) => item.id === sessionID)
-      if (session) return session
-    }
-    return null
-  }, [])
-
-  const applySettledSidebarStatus = useCallback((sessionID: string, runID: string, status: string, turnID?: string, settlementRevision?: string) => {
-    const current = knownSession(sessionID)
-    if (!current) return
-    const failed = status === 'failed'
-    const nextSession: Session = {
-      ...current,
-      status: failed ? 'failed' : 'idle',
-      current_run_id: undefined,
-      running_run_id: undefined,
-      running_turn_id: undefined,
-      last_run_id: runID,
-      last_run_status: status,
-      ...(failed
-        ? { interrupted_run_id: current.interrupted_run_id ?? runID, interrupted_turn_id: current.interrupted_turn_id ?? turnID }
-        : { interrupted_run_id: undefined, interrupted_turn_id: undefined }),
-    }
-    // Update the sidebar from the synthetic terminal transition, but do not
-    // first feed its potentially stale DTO through the ordinary metadata
-    // merge. The explicit settlement reducer action below owns the terminal
-    // run fields when a valid watermark is available.
-    applyLifecycleSessionEvent({ type: 'session.updated', session: nextSession }, { updateStore: false })
-    if (settlementRevision) sessionStore.applySettlementMetadata(nextSession, settlementRevision)
-  }, [applyLifecycleSessionEvent, knownSession, sessionStore.applySettlementMetadata])
+    return sessionStore.state.sessionsByID[sessionID] ?? null
+  }, [sessionStore.state.sessionsByID])
 
   const handleRunEvent = useCallback(async (sessionID: string, runID: string, event: RunEvent) => {
     const payload = event as unknown as Record<string, unknown>
@@ -938,7 +857,6 @@ function App() {
         logGate('accepted')
         const settledStatus = String(event.status)
         const settledRevision = settlementRevision(event)
-        applySettledSidebarStatus(sessionID, runID, settledStatus, typeof event.turn_id === 'string' ? event.turn_id : undefined, settledRevision)
         if (!settledRun || settledRun.id !== runID) {
           // Lifecycle replay can contain only the terminal event. Do not
           // refresh merely because the transient container is gone: the
@@ -947,10 +865,6 @@ function App() {
             try { await refreshSession(sessionID) } catch (reason) {
               if (selectedSessionRef.current === sessionID) setError(errorMessage(reason))
             }
-          }
-          if (settledStatus === 'committed' && selectedSessionRef.current !== sessionID) {
-            const session = knownSession(sessionID)
-            setCompletionNotice({ sessionID, sessionName: session ? sessionName(session) : `Session ${sessionID.slice(-6)}` })
           }
           return
         }
@@ -985,17 +899,10 @@ function App() {
             scheduleReconcileRetry(sessionID, runID)
           }
         }
-        if (settledStatus === 'committed' && selectedSessionRef.current !== sessionID) {
-          const settledSession = knownSession(sessionID)
-          setCompletionNotice({
-            sessionID,
-            sessionName: settledSession ? sessionName(settledSession) : `Session ${sessionID.slice(-6)}`,
-          })
-        }
         break
       }
     }
-  }, [activeRunsRef, addActiveRun, applySettledSidebarStatus, flushRunEvents, knownSession, onSnapshotApplied, queueRunEvent, refreshSession, removeRun, scheduleReconcileRetry, sessionStore.applyProjectionEvent, sessionStore.isRevisionCovered, setAwaitingRunStarted, startReconcileTimeout, updateActiveRun])
+  }, [activeRunsRef, addActiveRun, flushRunEvents, onSnapshotApplied, queueRunEvent, refreshSession, removeRun, scheduleReconcileRetry, sessionStore.applyProjectionEvent, sessionStore.isRevisionCovered, setAwaitingRunStarted, startReconcileTimeout, updateActiveRun])
 
   // A run has at most one active connection by this App instance. streamRun
   // owns its replay cursor and reconnects internally; a later authoritative
@@ -1077,27 +984,17 @@ function App() {
       }
     }
     if (event.type !== 'run.started') logLifecycleGate('accepted')
-    if (event.type === 'session.created' || event.type === 'session.updated' || event.type === 'session.archived' || event.type === 'session.deleted' || event.type === 'run.settled') {
-      applyLifecycleSessionEvent(event)
-    }
+    // Session lifecycle frames are deliberately not merged into the
+    // navigation state. Session Index is the only authority for list,
+    // archive, unread, and status fields.
+    if (event.type === 'session.created' || event.type === 'session.updated' || event.type === 'session.archived' || event.type === 'session.deleted') return
 
     if (event.type === 'run.started') {
-      let session = eventSession ?? knownSession(sessionID)
-      if (!session && sessionID) {
-        try {
-          session = await api.session(sessionID)
-          applyLifecycleSessionEvent({ type: 'session.updated', session })
-        } catch {
-          // The event may race the initial project bootstrap. The next
-          // reconnect will reconcile it from the authoritative lists.
-        }
-      }
-      if (session) applyLifecycleSessionEvent({ type: 'session.updated', session: { ...session, status: 'running' } })
       if (sessionID && runID) {
-        // A lifecycle hint may race a local POST. It can update session
-        // metadata above, but it never creates a transient run or connects a
-        // stream. Local admission waits for its run replay; background runs
-        // are discovered through the authoritative active-run registry.
+        // A lifecycle hint may race a local POST. It never creates a
+        // navigation status transition or a transient run. Local admission
+        // waits for its run replay; background runs are discovered through
+        // the authoritative active-run registry and Session Index.
         if (pendingAdmissionSessionsRef.current.has(sessionID) || runStartedReplayBindingsRef.current.has(runID)) {
           logLifecycleGate('ignored', 'waiting for run replay binding')
           return
@@ -1129,7 +1026,7 @@ function App() {
         message: event.message,
       })
     }
-  }, [applyLifecycleSessionEvent, bootstrapApplication, handleRunEvent, knownSession])
+  }, [bootstrapApplication, handleRunEvent])
 
   const lifecycleEventHandlerRef = useRef<(event: LifecycleEvent) => Promise<void>>(async () => {})
   lifecycleEventHandlerRef.current = handleLifecycleEvent
@@ -1217,8 +1114,7 @@ function App() {
       const source = listedSource.cwd && listedSource.config_path && listedSource.reasoning_level !== undefined
         ? listedSource
         : await api.session(sourceSessionID)
-      const options: CreateSessionOptions = {
-        projectID: source.project_id,
+      const options: SessionCreateOptions = {
         provider: source.provider,
         modelProfile: source.model_profile,
         reasoningLevel: source.reasoning_level ?? '',
@@ -1226,14 +1122,21 @@ function App() {
         cwd: source.cwd ?? source.created_cwd,
         configPath: source.config_path ?? '',
       }
-      const session = await api.createSession(options)
-      await loadSessions(options.projectID, session.id)
-      setSelectedProjectID(options.projectID)
-      setSelectedSessionID(session.id)
+      const created = await sessionCommands.create(source.project_id, {
+        cwd: options.cwd,
+        configPath: options.configPath,
+        provider: options.provider,
+        modelProfile: options.modelProfile,
+        reasoningLevel: options.reasoningLevel,
+        fullAccess: options.fullAccess,
+      })
+      await waitForSessionAuthority(source.project_id, (index) => index.active.some((summary) => summary.session_id === created.session_id))
+      setSelectedProjectID(source.project_id)
+      setSelectedSessionID(created.session_id)
       setShowProjectForm(false)
       return true
     } catch (reason) {
-      setError(errorMessage(reason))
+      setError(sessionMutationErrorMessage(reason))
       return false
     } finally {
       creatingRootSessionRef.current = false
@@ -1352,7 +1255,7 @@ function App() {
     const sessionID = viewingSessionID
     setCompactingSessionIDs((current) => ({ ...current, [sessionID]: true }))
     try {
-      await api.compact(sessionID)
+      await sessionCommands.compact(sessionID)
       await refreshSession(sessionID)
     } catch (reason) {
       setError(errorMessage(reason))
@@ -1366,7 +1269,12 @@ function App() {
   }
 
   const selectedProject = projects.find((project) => project.id === selectedProjectID) ?? null
-  const selectedProjectSessions = selectedProjectID ? (sessionsByProject[selectedProjectID] ?? []) : []
+  const viewingSessionSummary = Object.values(sessionIndexes)
+    .flatMap((index) => index.summaries)
+    .find((summary) => summary.session_id === viewingSessionID)
+  const selectedProjectSessions = selectedProjectID
+    ? (sessionIndexes[selectedProjectID]?.active.map(navigationSession) ?? [])
+    : []
   const subPanelContext = viewingSessionID ? sessionSubPanelContext(selectedProjectSessions, viewingSessionID) : null
   const selectedActiveRun = activeRunsBySession[viewingSessionID] ?? null
   useEffect(() => {
@@ -1375,9 +1283,10 @@ function App() {
   const debugSession = debugSessionID
     ? sessionDetail?.id === debugSessionID
       ? sessionDetail
-      : Object.values(sessionsByProject).flat().find((session) => session.id === debugSessionID) ?? null
+      : sessionStore.state.sessionsByID[debugSessionID] ?? null
     : null
-  const visibleRunningSessionIDs = new Set([...runningSessionIDs, ...Object.keys(compactingSessionIDs)])
+  const indexedRunningSessionIDs = Object.values(sessionIndexes).flatMap((index) => index.summaries.filter((summary) => summary.status === 'running').map((summary) => summary.session_id))
+  const visibleRunningSessionIDs = new Set([...indexedRunningSessionIDs, ...runningSessionIDs, ...Object.keys(compactingSessionIDs)])
   const showAddProject = useCallback(() => {
     projectFormUserOpenedRef.current = true
     autoProjectFormRef.current = false
@@ -1387,6 +1296,10 @@ function App() {
     setError('')
     projectIndexRepository.retry()
   }, [projectIndexRepository])
+  const retrySessionIndex = useCallback((projectID: string) => {
+    setError('')
+    sessionIndexRepository.retry(projectID)
+  }, [sessionIndexRepository])
 
   if (projectIndex.status === 'loading') return <Splash />
 
@@ -1394,8 +1307,7 @@ function App() {
     <div className="app-shell">
       <WorkspaceTree
         projects={projects}
-        sessionsByProject={sessionsByProject}
-        archivedSessionsByProject={archivedSessionsByProject}
+        sessionIndexes={sessionIndexes}
         selectedProjectID={selectedProjectID}
         selectedSessionID={selectedSessionID}
 		runningSessionIDs={visibleRunningSessionIDs}
@@ -1409,6 +1321,7 @@ function App() {
         onArchiveSession={archiveSession}
         onRestoreSession={restoreSession}
         onDeleteSession={deleteSession}
+        onRetrySessionIndex={retrySessionIndex}
         onAdd={showAddProject}
         version={bootstrap?.version ?? ''}
       />
@@ -1450,6 +1363,7 @@ function App() {
           <Conversation
             sessionID={viewingSessionID}
             detail={sessionDetail}
+            sessionIndexStatus={viewingSessionSummary?.status}
             page={itemsPage}
             activeRun={selectedActiveRun}
             admissionPending={Boolean(awaitingRunStartedBySession[viewingSessionID])}

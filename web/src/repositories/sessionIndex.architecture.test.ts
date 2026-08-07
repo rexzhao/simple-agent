@@ -5,6 +5,7 @@ import { SessionIndexAdapter, type SessionSummary } from '../sync/sessionIndexAd
 import { LocalReplica } from '../sync/localReplica'
 import type { JsonObject } from '../protocol/types'
 import {
+  isBackgroundSessionCompletionTransition,
   SessionIndexRepository,
   selectSessionReadModel,
 } from './sessionIndex'
@@ -62,6 +63,58 @@ describe('domain-facing Session Index repository', () => {
     unsubscribe()
   })
 
+  it('keeps a background project visible through running to settled/unread changes', () => {
+    const replica = new LocalReplica()
+    const syncRepository = new SyncSessionIndexRepository(replica)
+    const domainRepository = new SessionIndexRepository(syncRepository)
+    const resourceA = { type: 'session_index' as const, id: 'project_a' }
+    const resourceB = { type: 'session_index' as const, id: 'project_b' }
+    const adapterA = new SessionIndexAdapter('project_a')
+    const adapterB = new SessionIndexAdapter('project_b')
+    const initialA = summary('a')
+    const initialB = summary('b', { project_id: 'project_b' })
+    replica.applySnapshot(resourceA, adapterA, { sessions: [wire(initialA)] }, { streamEpoch: 'epoch_1', sequence: '1' as never, resourceRevision: '1', generation: 1 })
+    replica.applySnapshot(resourceB, adapterB, { sessions: [wire(initialB)] }, { streamEpoch: 'epoch_1', sequence: '1' as never, resourceRevision: '1', generation: 1 })
+    const aBefore = domainRepository.getProjectReadModel('project_a')
+    let backgroundNotifications = 0
+    const unsubscribe = domainRepository.subscribeProject('project_b', () => { backgroundNotifications += 1 })
+
+    replica.applyChange(resourceB, adapterB, [{ op: 'upsert', key: 'b', value: wire(summary('b', {
+      project_id: 'project_b', status: 'running', run_id: 'run_b', resource_revision: '2',
+    })) }], { streamEpoch: 'epoch_1', sequence: '2' as never, resourceRevision: '2', generation: 1 })
+    expect(domainRepository.getProjectReadModel('project_b').active[0]).toMatchObject({ status: 'running', run_id: 'run_b' })
+    replica.applyChange(resourceB, adapterB, [{ op: 'upsert', key: 'b', value: wire(summary('b', {
+      project_id: 'project_b', status: 'completed', run_id: 'run_b', has_unread_result: true, resource_revision: '3',
+    })) }], { streamEpoch: 'epoch_1', sequence: '3' as never, resourceRevision: '3', generation: 1 })
+    expect(domainRepository.getProjectReadModel('project_b').active[0]).toMatchObject({ status: 'completed', has_unread_result: true })
+    expect(domainRepository.getProjectReadModel('project_a')).toBe(aBefore)
+    expect(backgroundNotifications).toBe(2)
+    unsubscribe()
+  })
+
+  it('derives background completion only from a known Session Index transition', () => {
+    const running = summary('background', { status: 'running', run_id: 'run-1' })
+    const completed = summary('background', { status: 'completed', run_id: 'run-1', has_unread_result: true })
+    const initialUnread = summary('background', { status: 'completed', run_id: 'run-1', has_unread_result: true })
+
+    expect(isBackgroundSessionCompletionTransition(undefined, initialUnread, 'current')).toBe(false)
+    expect(isBackgroundSessionCompletionTransition(
+      { status: running.status, hasUnreadResult: running.has_unread_result, runID: running.run_id },
+      completed,
+      'current',
+    )).toBe(true)
+    expect(isBackgroundSessionCompletionTransition(
+      { status: 'completed', hasUnreadResult: false, runID: 'run-1' },
+      completed,
+      'current',
+    )).toBe(true)
+    expect(isBackgroundSessionCompletionTransition(
+      { status: running.status, hasUnreadResult: running.has_unread_result, runID: running.run_id },
+      { ...completed, session_id: 'current' },
+      'current',
+    )).toBe(false)
+  })
+
   it('keeps the public entrypoint free of transport/protocol/sync details', () => {
     const entryFiles = [
       new URL('./sessionIndex.ts', import.meta.url),
@@ -95,5 +148,14 @@ describe('domain-facing Session Index repository', () => {
       const source = readFileSync(new URL(file, import.meta.url), 'utf8')
       expect(source, file).not.toMatch(/from ['"][^'"]*(?:sync|protocol|transport)/)
     }
+  })
+
+  it('cuts session navigation over without REST list or lifecycle-reducer writes', () => {
+    const appSource = readFileSync(new URL('../App.tsx', import.meta.url), 'utf8')
+    expect(appSource).not.toMatch(/api\.sessions\s*\(/)
+    expect(appSource).not.toMatch(/api\.(createSession|renameSession|archiveSession|restoreSession|deleteSession|setSessionFullAccess|setSessionDebug)\s*\(/)
+    expect(appSource).not.toMatch(/reduceLifecycleEvent|sessionsByProject|archivedSessionsByProject/)
+    expect(appSource).toMatch(/sessionCommands\.(create|rename|archive|restore|deleteSession|markRead)/)
+    expect(appSource).toMatch(/waitForSessionAuthority/)
   })
 })

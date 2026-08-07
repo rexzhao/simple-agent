@@ -69,6 +69,22 @@ function resources(transport: FakeTransport): string[] {
   return transport.subscriptions().map((message) => message.type === 'subscribe' ? `${message.payload.resource.type}:${message.payload.resource.id}` : '')
 }
 
+function seedProjectIndex(application: ReturnType<typeof createSyncApplication>, projectID = 'project_a'): void {
+  application.replica.applySnapshot(
+    { type: 'project_index', id: 'server' },
+    new ProjectIndexAdapter(),
+    { projects: [{
+      id: projectID,
+      root: `/workspace/${projectID}`,
+      display_name: projectID,
+      archived: false,
+      created_at: '2025-01-01T00:00:00Z',
+      updated_at: '2025-01-01T00:00:00Z',
+    }] },
+    { streamEpoch: 'test', sequence: '1' as never, resourceRevision: '1', generation: 0 },
+  )
+}
+
 describe('application sync composition root', () => {
   it('creates one shared replica/transport graph and exposes typed command groups', () => {
     const transport = new FakeTransport()
@@ -95,12 +111,13 @@ describe('application sync composition root', () => {
   it('starts and stops idempotently, with signals driving only desired resource interests', () => {
     const transport = new FakeTransport()
     const application = createSyncApplication({ transport })
+    seedProjectIndex(application)
 
     application.start()
     application.start()
     expect(application.started).toBe(true)
     expect(transport.starts).toBe(1)
-    expect(resources(transport)).toEqual(['project_index:server'])
+    expect(resources(transport)).toEqual(['project_index:server', 'session_index:project_a'])
 
     application.signals.currentProject.set('project_a')
     application.signals.currentSession.set('session_a')
@@ -157,6 +174,7 @@ describe('application sync composition root', () => {
   it('is safe across a StrictMode-like stop/remount and does not duplicate live interests', () => {
     const transport = new FakeTransport()
     const application = createSyncApplication({ transport, initialProjectID: 'project_a', initialSessionID: 'session_a' })
+    seedProjectIndex(application)
 
     application.start()
     application.stop()

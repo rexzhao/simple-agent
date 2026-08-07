@@ -54,10 +54,17 @@ export function useProjectIndex() {
   return useSyncExternalStore(subscribe, getSnapshot, getSnapshot)
 }
 
-export function useProjectSessions(projectID: string) {
+/**
+ * Navigation subscribes to the indexes for all active projects.  This is a
+ * repository snapshot, not a page-owned sessions map; inactive content still
+ * remains selected through the current-session signal only when explicitly
+ * opened.
+ */
+export function useSessionIndexes(projectIDs: readonly string[]) {
   const { sessionIndex } = useSyncRepositories()
-  const subscribe = useCallback((listener: () => void) => sessionIndex.subscribeProject(projectID, listener), [sessionIndex, projectID])
-  const getSnapshot = useCallback(() => sessionIndex.getProjectReadModel(projectID), [sessionIndex, projectID])
+  const projectKey = projectIDs.join('\u0000')
+  const subscribe = useCallback((listener: () => void) => sessionIndex.subscribeProjects(projectIDs, listener), [sessionIndex, projectKey])
+  const getSnapshot = useCallback(() => sessionIndex.getProjectReadModels(projectIDs), [sessionIndex, projectKey])
   return useSyncExternalStore(subscribe, getSnapshot, getSnapshot)
 }
 

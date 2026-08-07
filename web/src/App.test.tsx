@@ -6,8 +6,10 @@ import { frontendProtocolLogger } from './lib/frontendProtocolLogger'
 import { SyncApplicationProvider } from './applicationContext'
 import { createSyncApplication } from './sync/applicationComposition'
 import { ProjectIndexAdapter } from './sync/projectIndexAdapter'
+import type { SessionSummary } from './sync/sessionIndexAdapter'
+import { SessionIndexAdapter } from './sync/sessionIndexAdapter'
 import type { ProjectSummary } from './repositories/projectIndex'
-import type { ProtocolMessage } from './protocol/types'
+import type { ProtocolMessage, JsonValue } from './protocol/types'
 import type { RuntimeTransport } from './sync/runtime'
 import type { TransportCloseEvent, TransportReadyEvent } from './sync/transport'
 
@@ -163,6 +165,27 @@ function renderApp(projects: readonly ProjectSummary[] = [defaultProject]) {
     { projects: [...projects] },
     { streamEpoch: 'test', sequence: '0' as never, resourceRevision: '0', generation: 0 },
   )
+  for (const project of projects) {
+    const sessionAdapter = new SessionIndexAdapter(project.id)
+    const sessions = project.id === 'project-1' ? [{
+      session_id: mocks.session.id,
+      project_id: project.id,
+      parent_session_id: null,
+      display_name: mocks.session.display_name,
+      archived: false,
+      status: 'idle' as const,
+      run_id: null,
+      resource_revision: '0',
+      updated_at: mocks.session.updated_at,
+      has_unread_result: false,
+    }] : []
+    application.replica.applySnapshot(
+      { type: 'session_index', id: project.id },
+      sessionAdapter,
+      { sessions },
+      { streamEpoch: 'test', sequence: '0' as never, resourceRevision: '0', generation: 0 },
+    )
+  }
   testApplications.add(application)
   const view = render(
     <SyncApplicationProvider application={application}>
@@ -190,6 +213,43 @@ function failProjectCommand(transport: AppTestTransport, message: ProtocolMessag
     id: `result-${message.payload.request_id}`,
     payload: { request_id: message.payload.request_id, status: 'failed', error: { code, message: 'protocol-secret-not-for-ui' } },
   } as unknown as ProtocolMessage)
+}
+
+function applySessionIndexAuthority(view: { application: ReturnType<typeof createSyncApplication> }, summary: SessionSummary, sequence = '1'): void {
+  const adapter = new SessionIndexAdapter(summary.project_id)
+  view.application.replica.applyChange(
+    { type: 'session_index', id: summary.project_id },
+    adapter,
+    [{ op: 'upsert', key: summary.session_id, value: summary as unknown as JsonValue }],
+    { streamEpoch: 'test', sequence: sequence as never, resourceRevision: summary.resource_revision, generation: 0 },
+  )
+}
+
+function applySessionCreateAuthority(view: { application: ReturnType<typeof createSyncApplication> }, sessionID: string): void {
+  applySessionIndexAuthority(view, {
+    session_id: sessionID,
+    project_id: 'project-1',
+    parent_session_id: null,
+    display_name: 'new root',
+    archived: false,
+    status: 'idle',
+    run_id: null,
+    resource_revision: '1',
+    updated_at: '2026-01-02T00:00:00Z',
+    has_unread_result: false,
+  })
+}
+
+function respondToSessionCreate(view: { application: ReturnType<typeof createSyncApplication>; transport: AppTestTransport }, message: ProtocolMessage): void {
+  if (message.type !== 'command' || message.payload.name !== 'session.create') return
+  const sessionID = String(message.payload.arguments.session_id ?? 'session-new')
+  view.transport.emit({
+    version: 1,
+    type: 'command_result',
+    id: `result-${message.payload.request_id}`,
+    payload: { request_id: message.payload.request_id, status: 'succeeded', result: { session_id: sessionID, project_id: 'project-1' } },
+  } as unknown as ProtocolMessage)
+  applySessionCreateAuthority(view, sessionID)
 }
 
 describe('App lifecycle bootstrap', () => {
@@ -221,14 +281,37 @@ describe('App lifecycle bootstrap', () => {
     testApplications.clear()
   })
 
-  it('does not poll sessions or active runs while a run remains active', async () => {
+  it('does not poll legacy session REST or active runs while a run remains active', async () => {
     const view = renderApp()
-    await waitFor(() => expect(mocks.api.sessions).toHaveBeenCalledTimes(2))
+    await waitFor(() => expect(screen.getByText('session-1')).toBeTruthy())
 
     vi.useFakeTimers()
     await act(async () => { await vi.advanceTimersByTimeAsync(5000) })
     expect(mocks.api.activeRuns).toHaveBeenCalledTimes(1)
-    expect(mocks.api.sessions).toHaveBeenCalledTimes(2)
+    expect(mocks.api.sessions).not.toHaveBeenCalled()
+    view.unmount()
+  })
+
+  it('does not bootstrap or reload active runs when Session Index changes', async () => {
+    mocks.api.activeRuns.mockResolvedValue({ runs: [] })
+    const view = renderApp()
+    await waitFor(() => expect(screen.getByText('session-1')).toBeTruthy())
+    expect(mocks.api.bootstrap).toHaveBeenCalledTimes(1)
+    expect(mocks.api.activeRuns).toHaveBeenCalledTimes(1)
+
+    const running: SessionSummary = {
+      session_id: 'session-1', project_id: 'project-1', parent_session_id: null, display_name: 'session-1',
+      archived: false, status: 'running', run_id: 'background-run', resource_revision: '1',
+      updated_at: '2026-01-01T00:00:01Z', has_unread_result: false,
+    }
+    const completed = { ...running, status: 'completed' as const, resource_revision: '2', has_unread_result: true }
+    await act(async () => { applySessionIndexAuthority(view, running, '1') })
+    await act(async () => { applySessionIndexAuthority(view, completed, '2') })
+
+    await waitFor(() => expect(screen.getByLabelText('Unread result')).toBeTruthy())
+    expect(mocks.api.bootstrap).toHaveBeenCalledTimes(1)
+    expect(mocks.api.activeRuns).toHaveBeenCalledTimes(1)
+    expect(mocks.api.sessions).not.toHaveBeenCalled()
     view.unmount()
   })
 
@@ -287,8 +370,8 @@ describe('App lifecycle bootstrap', () => {
       expect(view.application.signals.currentProject.get()).toBe('project-3')
     })
     expect(screen.queryByText('project two')).toBeNull()
-    // Project index IDs, not the legacy project endpoint, enumerate the
-    // temporary session REST projection.
+    // Project index IDs, not the legacy project endpoint, enumerate project
+    // navigation; each project's sessions come from Session Index.
     expect(mocks.api.projects).not.toHaveBeenCalled()
     view.unmount()
   })
@@ -331,10 +414,9 @@ describe('App lifecycle bootstrap', () => {
     view.unmount()
   })
 
-  it('enumerates legacy sessions for a project added by the authoritative active index', async () => {
+  it('subscribes the Session Index for a project added by the authoritative active index', async () => {
     const view = renderApp()
-    await waitFor(() => expect(mocks.api.sessions).toHaveBeenCalledTimes(2))
-    const callsBefore = mocks.api.sessions.mock.calls.filter(([projectID]) => projectID === 'project-2').length
+    await waitFor(() => expect(screen.getByText('project')).toBeTruthy())
     const adapter = new ProjectIndexAdapter()
     await act(async () => {
       view.application.replica.applyChange(
@@ -344,7 +426,8 @@ describe('App lifecycle bootstrap', () => {
         { streamEpoch: 'test', sequence: '1' as never, resourceRevision: '1', generation: 0 },
       )
     })
-    await waitFor(() => expect(mocks.api.sessions.mock.calls.filter(([projectID]) => projectID === 'project-2').length).toBe(callsBefore + 2))
+    await waitFor(() => expect(view.transport.sent.some((message) => message.type === 'subscribe' && message.payload.resource.type === 'session_index' && message.payload.resource.id === 'project-2')).toBe(true))
+    expect(mocks.api.sessions).not.toHaveBeenCalled()
     expect(mocks.api.projects).not.toHaveBeenCalled()
     view.unmount()
   })
@@ -435,6 +518,192 @@ describe('App lifecycle bootstrap', () => {
       )
     })
     await waitFor(() => expect(screen.getByText('renamed project')).toBeTruthy())
+    view.unmount()
+  })
+
+  it('keeps session command acknowledgements separate from active/archive/restore/remove authority', async () => {
+    mocks.api.activeRuns.mockResolvedValue({ runs: [] })
+    const view = renderApp()
+    await waitFor(() => expect(screen.getByText('session-1')).toBeTruthy())
+    const authority = (overrides: Partial<SessionSummary> = {}): SessionSummary => ({
+      session_id: 'session-1', project_id: 'project-1', parent_session_id: null, display_name: 'session-1',
+      archived: false, status: 'idle', run_id: null, resource_revision: '1',
+      updated_at: '2026-01-01T00:00:01Z', has_unread_result: false, ...overrides,
+    })
+    const commands: string[] = []
+    view.transport.onSend = (message) => {
+      if (message.type !== 'command') return
+      commands.push(message.payload.name)
+      if (message.payload.name === 'session.rename') {
+        respondToProjectCommand(view.transport, message, { session_id: 'session-1', display_name: 'renamed session' })
+      } else if (message.payload.name === 'session.archive') {
+        respondToProjectCommand(view.transport, message, { session_id: 'session-1', archived: true })
+      } else if (message.payload.name === 'session.restore') {
+        respondToProjectCommand(view.transport, message, { session_id: 'session-1', archived: false })
+      } else if (message.payload.name === 'session.delete') {
+        respondToProjectCommand(view.transport, message, { session_id: 'session-1', status: 'removed', removed_sessions: 1 })
+      }
+    }
+    vi.spyOn(window, 'prompt').mockReturnValue('renamed session')
+    vi.spyOn(window, 'confirm').mockReturnValue(true)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Rename session-1' }))
+    await waitFor(() => expect(commands).toContain('session.rename'))
+    expect(screen.getByText('session-1')).toBeTruthy()
+    await act(async () => { applySessionIndexAuthority(view, authority({ display_name: 'renamed session', resource_revision: '2' }), '2') })
+    await waitFor(() => expect(screen.getByText('renamed session')).toBeTruthy())
+
+    fireEvent.click(screen.getByRole('button', { name: 'Archive renamed session' }))
+    await waitFor(() => expect(commands).toContain('session.archive'))
+    expect(screen.getByRole('button', { name: 'Archive renamed session' })).toBeTruthy()
+    await act(async () => { applySessionIndexAuthority(view, authority({ display_name: 'renamed session', archived: true, resource_revision: '3' }), '3') })
+    const archivedToggle = await screen.findByRole('button', { name: /Archived \(1\)/ })
+    fireEvent.click(archivedToggle)
+    fireEvent.click(screen.getByRole('button', { name: 'Restore renamed session' }))
+    await waitFor(() => expect(commands).toContain('session.restore'))
+    expect(screen.getByRole('button', { name: 'Restore renamed session' })).toBeTruthy()
+    await act(async () => { applySessionIndexAuthority(view, authority({ display_name: 'renamed session', resource_revision: '4' }), '4') })
+    await waitFor(() => expect(screen.queryByRole('button', { name: 'Restore renamed session' })).toBeNull())
+
+    fireEvent.click(screen.getByRole('button', { name: 'Delete renamed session' }))
+    await waitFor(() => expect(commands).toEqual(['session.rename', 'session.archive', 'session.restore', 'session.archive']))
+    expect(screen.getByRole('button', { name: 'Archive renamed session' })).toBeTruthy()
+    expect(commands).not.toContain('session.delete')
+    await act(async () => { applySessionIndexAuthority(view, authority({ display_name: 'renamed session', archived: true, resource_revision: '5' }), '5') })
+    await waitFor(() => expect(commands).toEqual(['session.rename', 'session.archive', 'session.restore', 'session.archive', 'session.delete']))
+    expect(screen.getByText('renamed session')).toBeTruthy()
+    await act(async () => {
+      view.application.replica.applyChange(
+        { type: 'session_index', id: 'project-1' },
+        new SessionIndexAdapter('project-1'),
+        [{ op: 'remove', key: 'session-1' }],
+        { streamEpoch: 'test', sequence: '5' as never, resourceRevision: '5', generation: 0 },
+      )
+    })
+    await waitFor(() => expect(screen.getAllByText('No sessions yet').length).toBeGreaterThan(0))
+    expect(mocks.api.sessions).not.toHaveBeenCalled()
+    view.unmount()
+  })
+
+  it('restores an active session only after an explicit archive-first delete failure', async () => {
+    mocks.api.activeRuns.mockResolvedValue({ runs: [] })
+    const view = renderApp()
+    await waitFor(() => expect(screen.getByText('session-1')).toBeTruthy())
+    vi.spyOn(window, 'confirm').mockReturnValue(true)
+    const commands: string[] = []
+    view.transport.onSend = (message) => {
+      if (message.type !== 'command') return
+      commands.push(message.payload.name)
+      if (message.payload.name === 'session.archive') {
+        respondToProjectCommand(view.transport, message, { session_id: 'session-1', archived: true })
+      } else if (message.payload.name === 'session.delete') {
+        failProjectCommand(view.transport, message, 'permission_denied')
+      } else if (message.payload.name === 'session.restore') {
+        respondToProjectCommand(view.transport, message, { session_id: 'session-1', archived: false })
+      }
+    }
+
+    fireEvent.click(screen.getByRole('button', { name: 'Delete session-1' }))
+    await waitFor(() => expect(commands).toEqual(['session.archive']))
+    await act(async () => { applySessionIndexAuthority(view, {
+      session_id: 'session-1', project_id: 'project-1', parent_session_id: null, display_name: 'session-1',
+      archived: true, status: 'idle', run_id: null, resource_revision: '1',
+      updated_at: '2026-01-01T00:00:01Z', has_unread_result: false,
+    }) })
+    await waitFor(() => expect(commands).toEqual(['session.archive', 'session.delete', 'session.restore']))
+    fireEvent.click(screen.getByRole('button', { name: 'Archived (1)' }))
+    expect(screen.getByRole('button', { name: 'Restore session-1' })).toBeTruthy()
+    expect(view.application.repositories.sessionIndex.getProjectReadModel('project-1').summaries).toHaveLength(1)
+    await act(async () => { applySessionIndexAuthority(view, {
+      session_id: 'session-1', project_id: 'project-1', parent_session_id: null, display_name: 'session-1',
+      archived: false, status: 'idle', run_id: null, resource_revision: '2',
+      updated_at: '2026-01-01T00:00:02Z', has_unread_result: false,
+    }, '2') })
+    await waitFor(() => expect(screen.queryByRole('button', { name: 'Restore session-1' })).toBeNull())
+    expect(screen.getByRole('alert').textContent).toContain('Session operation failed.')
+    view.unmount()
+  })
+
+  it('does not restore an active session after an unknown archive-first delete outcome', async () => {
+    mocks.api.activeRuns.mockResolvedValue({ runs: [] })
+    const view = renderApp()
+    await waitFor(() => expect(screen.getByText('session-1')).toBeTruthy())
+    vi.spyOn(window, 'confirm').mockReturnValue(true)
+    const commands: string[] = []
+    view.transport.onSend = (message) => {
+      if (message.type !== 'command') return
+      commands.push(message.payload.name)
+      if (message.payload.name === 'session.archive') {
+        respondToProjectCommand(view.transport, message, { session_id: 'session-1', archived: true })
+      } else if (message.payload.name === 'session.delete') {
+        failProjectCommand(view.transport, message, 'outcome_unknown')
+      }
+    }
+
+    fireEvent.click(screen.getByRole('button', { name: 'Delete session-1' }))
+    await waitFor(() => expect(commands).toEqual(['session.archive']))
+    await act(async () => { applySessionIndexAuthority(view, {
+      session_id: 'session-1', project_id: 'project-1', parent_session_id: null, display_name: 'session-1',
+      archived: true, status: 'idle', run_id: null, resource_revision: '1',
+      updated_at: '2026-01-01T00:00:01Z', has_unread_result: false,
+    }) })
+    await waitFor(() => expect(commands).toEqual(['session.archive', 'session.delete']))
+    fireEvent.click(screen.getByRole('button', { name: 'Archived (1)' }))
+    await waitFor(() => expect(screen.getByRole('alert').textContent).toContain('Session operation failed.'))
+    expect(commands).not.toContain('session.restore')
+    expect(screen.getByRole('button', { name: 'Restore session-1' })).toBeTruthy()
+    view.unmount()
+  })
+
+  it('deletes an already archived session directly without a second archive command', async () => {
+    mocks.api.activeRuns.mockResolvedValue({ runs: [] })
+    const view = renderApp()
+    await waitFor(() => expect(screen.getByText('session-1')).toBeTruthy())
+    vi.spyOn(window, 'confirm').mockReturnValue(true)
+    const commands: string[] = []
+    view.transport.onSend = (message) => {
+      if (message.type !== 'command') return
+      commands.push(message.payload.name)
+      if (message.payload.name === 'session.archive') {
+        respondToProjectCommand(view.transport, message, { session_id: 'session-1', archived: true })
+      } else if (message.payload.name === 'session.delete') {
+        respondToProjectCommand(view.transport, message, { session_id: 'session-1', status: 'removed', removed_sessions: 1 })
+      }
+    }
+
+    fireEvent.click(screen.getByRole('button', { name: 'Archive session-1' }))
+    await waitFor(() => expect(commands).toEqual(['session.archive']))
+    await act(async () => { applySessionIndexAuthority(view, {
+      session_id: 'session-1', project_id: 'project-1', parent_session_id: null, display_name: 'session-1',
+      archived: true, status: 'idle', run_id: null, resource_revision: '1',
+      updated_at: '2026-01-01T00:00:01Z', has_unread_result: false,
+    }) })
+    fireEvent.click(await screen.findByRole('button', { name: 'Archived (1)' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Delete session-1' }))
+    await waitFor(() => expect(commands).toEqual(['session.archive', 'session.delete']))
+    expect(commands.filter((name) => name === 'session.archive')).toHaveLength(1)
+    view.unmount()
+  })
+
+  it('clears an unread result only after the Session Index authority update', async () => {
+    const view = renderApp()
+    await waitFor(() => expect(screen.getByText('session-1')).toBeTruthy())
+    view.transport.onSend = (message) => {
+      if (message.type === 'command' && message.payload.name === 'session.mark_read') {
+        respondToProjectCommand(view.transport, message, { session_id: 'session-1', run_id: 'result-run', marked_read: true })
+      }
+    }
+    const completed = {
+      session_id: 'session-1', project_id: 'project-1', parent_session_id: null, display_name: 'session-1',
+      archived: false, status: 'completed' as const, run_id: 'result-run', resource_revision: '1',
+      updated_at: '2026-01-01T00:00:01Z', has_unread_result: true,
+    }
+    await act(async () => { applySessionIndexAuthority(view, completed, '1') })
+    await waitFor(() => expect(view.transport.sent.some((message) => message.type === 'command' && message.payload.name === 'session.mark_read')).toBe(true))
+    expect(screen.getByLabelText('Unread result')).toBeTruthy()
+    await act(async () => { applySessionIndexAuthority(view, { ...completed, resource_revision: '2', has_unread_result: false }, '2') })
+    await waitFor(() => expect(screen.queryByLabelText('Unread result')).toBeNull())
+    expect(mocks.api.sessions).not.toHaveBeenCalled()
     view.unmount()
   })
 
@@ -592,6 +861,7 @@ describe('App lifecycle bootstrap', () => {
     mocks.streamRun.mockReset()
     mocks.streamRun.mockResolvedValue(undefined)
     const view = renderApp()
+    view.transport.onSend = (message) => respondToSessionCreate(view, message)
     const composer = await screen.findByRole('textbox')
     return { view, composer }
   }
@@ -628,15 +898,11 @@ describe('App lifecycle bootstrap', () => {
     fireEvent.change(composer, { target: { value: '  /new  ' } })
     fireEvent.click(screen.getByRole('button', { name: 'Send' }))
 
-    await waitFor(() => expect(mocks.api.createSession).toHaveBeenCalledTimes(1))
-    expect(mocks.api.createSession).toHaveBeenCalledWith({
-      projectID: 'project-1',
-      provider: 'fake',
-      modelProfile: 'default',
-      reasoningLevel: 'high',
-      fullAccess: true,
-      cwd: '/workspace/src',
-      configPath: '/config',
+    await waitFor(() => expect(view.transport.sent.some((message) => message.type === 'command' && message.payload.name === 'session.create')).toBe(true))
+    const createCommand = view.transport.sent.find((message) => message.type === 'command' && message.payload.name === 'session.create')
+    expect(createCommand && createCommand.type === 'command' ? createCommand.payload.arguments : null).toMatchObject({
+      project_id: 'project-1', provider: 'fake', model_profile: 'default', reasoning_level: 'high', full_access: true,
+      cwd: '/workspace/src', config_path: '/config',
     })
     expect(mocks.api.startRun).not.toHaveBeenCalled()
     expect(mocks.api.appendRunMessage).not.toHaveBeenCalled()
@@ -648,7 +914,7 @@ describe('App lifecycle bootstrap', () => {
     expect(created.parent_session_id).toBeUndefined()
     expect(created.root_session_id).toBe(created.id)
     expect((composer as HTMLTextAreaElement).value).toBe('')
-    await waitFor(() => expect(mocks.api.sessions.mock.calls.length).toBeGreaterThanOrEqual(6))
+    expect(mocks.api.sessions).not.toHaveBeenCalled()
     view.unmount()
   })
 
@@ -680,14 +946,10 @@ describe('App lifecycle bootstrap', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Send' }))
 
     await waitFor(() => expect(mocks.api.session).toHaveBeenCalledWith('session-1'))
-    expect(mocks.api.createSession).toHaveBeenCalledWith({
-      projectID: 'project-1',
-      provider: 'authoritative-provider',
-      modelProfile: 'authoritative-model',
-      reasoningLevel: 'low',
-      fullAccess: true,
-      cwd: '/workspace/authoritative',
-      configPath: '/config/authoritative.yaml',
+    const createCommand = view.transport.sent.find((message) => message.type === 'command' && message.payload.name === 'session.create')
+    expect(createCommand && createCommand.type === 'command' ? createCommand.payload.arguments : null).toMatchObject({
+      project_id: 'project-1', provider: 'authoritative-provider', model_profile: 'authoritative-model', reasoning_level: 'low',
+      full_access: true, cwd: '/workspace/authoritative', config_path: '/config/authoritative.yaml',
     })
     expect(created.parent_session_id).toBeUndefined()
     view.unmount()
@@ -702,7 +964,7 @@ describe('App lifecycle bootstrap', () => {
     fireEvent.change(composer, { target: { value: '/new' } })
     fireEvent.click(screen.getByRole('button', { name: 'Append to current run' }))
 
-    await waitFor(() => expect(mocks.api.createSession).toHaveBeenCalledTimes(1))
+    await waitFor(() => expect(view.transport.sent.some((message) => message.type === 'command' && message.payload.name === 'session.create')).toBe(true))
     expect(mocks.api.startRun).not.toHaveBeenCalled()
     expect(mocks.api.appendRunMessage).not.toHaveBeenCalled()
     expect(mocks.api.cancelRun).not.toHaveBeenCalled()
@@ -740,13 +1002,15 @@ describe('App lifecycle bootstrap', () => {
   })
 
   it('keeps /new in the composer when root creation fails', async () => {
-    mocks.api.createSession.mockRejectedValue(new Error('create failed'))
     const { view, composer } = await renderSubmitReadyApp()
+    view.transport.onSend = (message) => {
+      if (message.type === 'command' && message.payload.name === 'session.create') failProjectCommand(view.transport, message, 'session_unavailable')
+    }
 
     fireEvent.change(composer, { target: { value: '/new' } })
     fireEvent.click(screen.getByRole('button', { name: 'Send' }))
 
-    await waitFor(() => expect(screen.getByRole('alert').textContent).toContain('create failed'))
+    await waitFor(() => expect(screen.getByRole('alert').textContent).toContain('Session operation failed.'))
     expect((composer as HTMLTextAreaElement).value).toBe('/new')
     expect(mocks.api.startRun).not.toHaveBeenCalled()
     view.unmount()
@@ -754,18 +1018,18 @@ describe('App lifecycle bootstrap', () => {
 
   it('does not create two roots when /new is submitted twice before the first response', async () => {
     const created = configureCreatedRoot()
-    let resolveCreate!: (session: typeof created) => void
-    mocks.api.createSession.mockImplementation(() => new Promise((resolve) => { resolveCreate = resolve }))
     const { view, composer } = await renderSubmitReadyApp()
+    let createCommand: ProtocolMessage | undefined
+    view.transport.onSend = (message) => { if (message.type === 'command' && message.payload.name === 'session.create') createCommand = message }
 
     fireEvent.change(composer, { target: { value: '/new' } })
     fireEvent.click(screen.getByRole('button', { name: 'Send' }))
     fireEvent.click(screen.getByRole('button', { name: 'Send' }))
-    await waitFor(() => expect(mocks.api.createSession).toHaveBeenCalledTimes(1))
+    await waitFor(() => expect(createCommand).toBeTruthy())
 
-    resolveCreate(created)
+    respondToSessionCreate(view, createCommand!)
     await waitFor(() => expect(screen.getByText('new root')).toBeTruthy())
-    expect(mocks.api.createSession).toHaveBeenCalledTimes(1)
+    expect(view.transport.sent.filter((message) => message.type === 'command' && message.payload.name === 'session.create')).toHaveLength(1)
     view.unmount()
   })
 
@@ -782,17 +1046,25 @@ describe('App lifecycle bootstrap', () => {
       config_path: '/config/source.yaml',
       revision: '0',
     }
-    let createdAvailable = false
-    mocks.api.sessions.mockImplementation(async (_projectID: string, archived = false) => ({
-      sessions: archived ? [] : [mocks.session, other, ...(createdAvailable ? [created] : [])],
-    }))
-    let resolveCreate!: (session: typeof created) => void
-    mocks.api.createSession.mockImplementation(() => new Promise((resolve) => { resolveCreate = resolve }))
     const { view, composer } = await renderSubmitReadyApp([], { ...emptySnapshot(), session: source })
+    let createCommand: ProtocolMessage | undefined
+    view.transport.onSend = (message) => { if (message.type === 'command' && message.payload.name === 'session.create') createCommand = message }
 
     fireEvent.change(composer, { target: { value: '/new' } })
     fireEvent.click(screen.getByRole('button', { name: 'Send' }))
-    await waitFor(() => expect(mocks.api.createSession).toHaveBeenCalledTimes(1))
+    await waitFor(() => expect(createCommand).toBeTruthy())
+
+    const sessionAdapter = new SessionIndexAdapter('project-1')
+    await act(async () => {
+      view.application.replica.applyChange(
+        { type: 'session_index', id: 'project-1' }, sessionAdapter,
+        [{ op: 'upsert', key: 'session-2', value: {
+          session_id: 'session-2', project_id: 'project-1', parent_session_id: null, display_name: 'other session',
+          archived: false, status: 'idle', run_id: null, resource_revision: '2', updated_at: '2026-01-02T00:00:00Z', has_unread_result: false,
+        } }],
+        { streamEpoch: 'test', sequence: '2' as never, resourceRevision: '2', generation: 0 },
+      )
+    })
 
     mocks.api.snapshot.mockResolvedValue({
       ...emptySnapshot(),
@@ -804,17 +1076,11 @@ describe('App lifecycle bootstrap', () => {
     fireEvent.click(otherButton!)
     await waitFor(() => expect(mocks.api.snapshot).toHaveBeenCalledWith('session-2'))
 
-    expect(mocks.api.createSession).toHaveBeenCalledWith({
-      projectID: 'project-1',
-      provider: 'source-provider',
-      modelProfile: 'source-model',
-      reasoningLevel: 'source-level',
-      fullAccess: true,
-      cwd: '/workspace/source',
-      configPath: '/config/source.yaml',
+    expect(createCommand && createCommand.type === 'command' ? createCommand.payload.arguments : null).toMatchObject({
+      project_id: 'project-1', provider: 'source-provider', model_profile: 'source-model', reasoning_level: 'source-level',
+      full_access: true, cwd: '/workspace/source', config_path: '/config/source.yaml',
     })
-    createdAvailable = true
-    resolveCreate(created)
+    respondToSessionCreate(view, createCommand!)
     await waitFor(() => expect(screen.getByText('new root')).toBeTruthy())
     const createdButton = screen.getByText('new root').closest('button')
     expect(createdButton?.parentElement?.className).toContain('selected')
@@ -1138,6 +1404,10 @@ describe('App lifecycle bootstrap', () => {
     })
 
     const view = renderApp()
+    applySessionIndexAuthority(view, {
+      session_id: 'session-1', project_id: 'project-1', parent_session_id: null, display_name: 'session-1',
+      archived: false, status: 'running', run_id: 'old-run', resource_revision: '1', updated_at: '2026-01-01T00:00:01Z', has_unread_result: false,
+    })
     const composer = await screen.findByRole('textbox')
     await waitFor(() => expect(mocks.streamRun).toHaveBeenCalledTimes(1))
     const oldHandler = mocks.streamRun.mock.calls[0][1] as (event: unknown) => Promise<void> | void
@@ -1197,6 +1467,10 @@ describe('App lifecycle bootstrap', () => {
     })
 
     const view = renderApp()
+    applySessionIndexAuthority(view, {
+      session_id: 'session-1', project_id: 'project-1', parent_session_id: null, display_name: 'session-1',
+      archived: false, status: 'running', run_id: 'old-run', resource_revision: '1', updated_at: '2026-01-01T00:00:01Z', has_unread_result: false,
+    })
     const composer = await screen.findByRole('textbox')
     await waitFor(() => expect(mocks.streamRun).toHaveBeenCalledTimes(1))
     const oldHandler = mocks.streamRun.mock.calls[0][1] as (event: unknown) => Promise<void> | void
@@ -1253,9 +1527,31 @@ describe('App lifecycle bootstrap', () => {
     view.unmount()
   })
 
+  it('shows a background completion from Session Index without a lifecycle or run settled event', async () => {
+    mocks.api.activeRuns.mockResolvedValue({ runs: [] })
+    const view = renderApp()
+    await screen.findByRole('textbox')
+    const lifecycleCalls = mocks.streamLifecycle.mock.calls.length
+    const runCalls = mocks.streamRun.mock.calls.length
+    await act(async () => { applySessionIndexAuthority(view, {
+      session_id: 'session-2', project_id: 'project-1', parent_session_id: null, display_name: 'background-session',
+      archived: false, status: 'running', run_id: 'background-run', resource_revision: '1',
+      updated_at: '2026-01-01T00:00:01Z', has_unread_result: false,
+    }) })
+    await screen.findByText('background-session')
+    await act(async () => { applySessionIndexAuthority(view, {
+      session_id: 'session-2', project_id: 'project-1', parent_session_id: null, display_name: 'background-session',
+      archived: false, status: 'completed', run_id: 'background-run', resource_revision: '2',
+      updated_at: '2026-01-01T00:00:02Z', has_unread_result: true,
+    }, '2') })
+    await waitFor(() => expect(screen.getByText('background-session completed in the background.')).toBeTruthy())
+    expect(mocks.streamLifecycle).toHaveBeenCalledTimes(lifecycleCalls)
+    expect(mocks.streamRun).toHaveBeenCalledTimes(runCalls)
+    view.unmount()
+  })
+
   it('does not refresh the selected session for a covered background settlement', async () => {
     const background = { ...mocks.session, id: 'session-2', display_name: 'background-session', revision: '5', last_seq: 5 }
-    mocks.api.sessions.mockImplementation(async (_projectID: string, archived = false) => ({ sessions: archived ? [] : [mocks.session, background] }))
     let activeRunsCalls = 0
     mocks.api.activeRuns.mockImplementation(async () => {
       activeRunsCalls += 1
@@ -1284,10 +1580,17 @@ describe('App lifecycle bootstrap', () => {
     })
     const view = renderApp()
     await screen.findByRole('textbox')
+    applySessionIndexAuthority(view, {
+      session_id: 'session-2', project_id: 'project-1', parent_session_id: null, display_name: 'background-session',
+      archived: false, status: 'running', run_id: 'background-run', resource_revision: '5', updated_at: '2026-01-01T00:00:05Z', has_unread_result: false,
+    })
+    await screen.findByText('background-session')
+    const snapshotsBeforeBackground = mocks.api.snapshot.mock.calls.length
     fireEvent.click(screen.getByText('background-session'))
-    await waitFor(() => expect(mocks.api.snapshot).toHaveBeenCalledTimes(2))
+    await waitFor(() => expect(mocks.api.snapshot.mock.calls.length).toBeGreaterThan(snapshotsBeforeBackground))
+    const snapshotsBeforeReturn = mocks.api.snapshot.mock.calls.length
     fireEvent.click(screen.getByText('session-1'))
-    await waitFor(() => expect(mocks.api.snapshot).toHaveBeenCalledTimes(3))
+    await waitFor(() => expect(mocks.api.snapshot.mock.calls.length).toBeGreaterThan(snapshotsBeforeReturn))
     const snapshotsBeforeSettlement = mocks.api.snapshot.mock.calls.length
     const lifecycleHandler = mocks.streamLifecycle.mock.calls[0][0] as (event: unknown) => Promise<void>
     await act(async () => {
@@ -1296,7 +1599,13 @@ describe('App lifecycle bootstrap', () => {
       })
     })
     await waitFor(() => expect(mocks.streamRun).toHaveBeenCalledTimes(1))
-    await waitFor(() => expect(screen.getByRole('status').textContent).toContain('background-session completed in the background'))
+    applySessionIndexAuthority(view, {
+      session_id: 'session-2', project_id: 'project-1', parent_session_id: null, display_name: 'background-session',
+      archived: false, status: 'completed', run_id: 'background-run', resource_revision: '6', updated_at: '2026-01-01T00:00:06Z', has_unread_result: true,
+    }, '2')
+    await waitFor(() => expect(screen.getByText('background-session')).toBeTruthy())
+    expect(screen.getByLabelText('Unread result')).toBeTruthy()
+    expect(screen.getAllByText(/completed/).length).toBeGreaterThan(0)
     expect(mocks.api.snapshot).toHaveBeenCalledTimes(snapshotsBeforeSettlement)
     view.unmount()
   })

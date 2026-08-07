@@ -2,6 +2,31 @@ import { describe, expect, it } from 'vitest'
 import { createCurrentCodexLoginProviderSignal, createCurrentProjectSignal, createCurrentSessionSignal, createProviderSettingsApplicationStateSignal, CodexLoginInterestPolicy, ProviderSettingsInterestPolicy, SessionContentInterestPolicy, SessionIndexInterestPolicy } from './interestPolicy'
 
 describe('SessionIndexInterestPolicy', () => {
+  it('keeps every active project index subscribed for background status visibility', () => {
+    let activeIDs = ['project_b', 'project_a']
+    const listeners = new Set<() => void>()
+    const subscribed: string[] = []
+    const released: string[] = []
+    const source = {
+      getActiveProjectIDs: () => activeIDs,
+      subscribe: (listener: () => void) => { listeners.add(listener); return () => listeners.delete(listener) },
+    }
+    const policy = new SessionIndexInterestPolicy({
+      subscribe: (resource: { type: 'session_index'; id: string }) => {
+        subscribed.push(resource.id)
+        return () => released.push(resource.id)
+      },
+    }, source)
+    policy.start()
+    expect(subscribed).toEqual(['project_a', 'project_b'])
+    activeIDs = ['project_b', 'project_c']
+    for (const listener of listeners) listener()
+    expect(released).toEqual(['project_a'])
+    expect(subscribed).toEqual(['project_a', 'project_b', 'project_c'])
+    policy.stop()
+    expect(released).toEqual(['project_a', 'project_b', 'project_c'])
+  })
+
   it('keeps exactly the signal-selected resource subscribed independently of UI listeners', () => {
     const signal = createCurrentProjectSignal('project_a')
     const subscribed: string[] = []

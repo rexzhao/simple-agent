@@ -10,9 +10,22 @@ import type { SessionStoreHook } from './useSessionStore'
  * store and triggers fetches on selection change. The store's LRU-capped
  * historyBySession replaces the old conversationCacheRef.
  */
+export function useSessionHistory(selectedSessionID: string, onError: (reason: unknown) => void, store: SessionStoreHook): ReturnType<typeof useSessionHistoryImpl>
+/** @deprecated The list reload callback is ignored; Session Index owns navigation. */
+export function useSessionHistory(selectedSessionID: string, _legacyLoadSessions: (projectID: string, preferredSessionID?: string) => Promise<Session[]>, onError: (reason: unknown) => void, store: SessionStoreHook): ReturnType<typeof useSessionHistoryImpl>
 export function useSessionHistory(
   selectedSessionID: string,
-  loadSessions: (projectID: string, preferredSessionID?: string) => Promise<Session[]>,
+  onErrorOrLegacy: ((reason: unknown) => void) | ((projectID: string, preferredSessionID?: string) => Promise<Session[]>),
+  storeOrError: SessionStoreHook | ((reason: unknown) => void),
+  legacyStore?: SessionStoreHook,
+) {
+  const onError = (legacyStore ? storeOrError : onErrorOrLegacy) as (reason: unknown) => void
+  const store = (legacyStore ?? storeOrError) as SessionStoreHook
+  return useSessionHistoryImpl(selectedSessionID, onError, store)
+}
+
+function useSessionHistoryImpl(
+  selectedSessionID: string,
   onError: (reason: unknown) => void,
   store: SessionStoreHook,
 ) {
@@ -31,19 +44,12 @@ export function useSessionHistory(
       // background sessions through this value, and suppressing it strands
       // their runs in reconciling until the manual-refresh banner appears.
       // Only the sidebar reload and surfaced errors stay selection-scoped.
-      if (selectedSessionRef.current === sessionID && session.project_id) {
-        try {
-          await loadSessions(session.project_id)
-        } catch (reason) {
-          if (selectedSessionRef.current === sessionID) throw reason
-        }
-      }
       return session
     } catch (reason) {
       if (selectedSessionRef.current !== sessionID) return null
       throw reason
     }
-  }, [loadSessions, storeRefresh])
+  }, [storeRefresh])
 
   useEffect(() => {
     if (!selectedSessionID) return
