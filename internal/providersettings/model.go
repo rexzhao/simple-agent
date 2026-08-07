@@ -329,6 +329,12 @@ type CommittedChange struct {
 	ProviderName    string
 	DefaultProvider string
 	DefaultModel    string
+	// PublicationExpected is set only when execution observed an actual durable
+	// target-state change.  It is deliberately not a request to publish: the
+	// projector still compares the safe snapshot and emits a redacted same-safe
+	// upsert only when the durable change is otherwise invisible.  A replay for
+	// an already equal target must leave this false.
+	PublicationExpected bool
 }
 
 type ChangeSink interface {

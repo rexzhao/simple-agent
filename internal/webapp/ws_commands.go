@@ -135,10 +135,12 @@ type runToolCancelArguments struct {
 }
 
 // Provider mutations deliberately use a flat, complete target document rather
-// than a patch. The create command adds a caller-owned operation identity to
-// that same document. The target may contain credentials and arbitrary model
-// parameters, so it is consumed synchronously by the execution service and is
-// never included in a result or command-cache tombstone.
+// than a patch. Opaque fields are nevertheless write intents: *_mode=preserve
+// tells execution to merge the durable value by provider/model identity, while
+// replace is explicit. The create command adds a caller-owned operation
+// identity to that same document. The target may contain credentials and
+// arbitrary model parameters, so it is consumed synchronously by the execution
+// service and is never included in a result or command-cache tombstone.
 type providerCreateArguments struct {
 	OperationID string
 	Provider    string
@@ -227,12 +229,14 @@ type sessionCompactCommandResult struct {
 type providerMutationResult struct {
 	Provider string `json:"provider"`
 	Status   string `json:"status"`
+	Changed  bool   `json:"changed"`
 }
 
 type providerCreateResult struct {
 	OperationID string `json:"operation_id"`
 	Provider    string `json:"provider"`
 	Status      string `json:"status"`
+	Changed     bool   `json:"changed"`
 }
 
 type providerDefaultResult struct {
@@ -982,7 +986,7 @@ func decodeProviderModel(raw json.RawMessage, command string) (execution.Provide
 	if err != nil {
 		return execution.ProviderModelSettings{}, err
 	}
-	if err := requireExactFields(fields, command+" model", "profile", "id", "type", "compatibility", "input", "developer_role", "context_window", "input_limit", "output_limit", "parameters", "reasoning_config", "pricing"); err != nil {
+	if err := requireExactFields(fields, command+" model", "profile", "id", "type", "compatibility", "input", "developer_role", "context_window", "input_limit", "output_limit", "parameters", "parameters_mode", "parameters_source_profile", "reasoning_config", "pricing"); err != nil {
 		return execution.ProviderModelSettings{}, err
 	}
 	profile, err := requiredProviderString(fields, "profile", command)
@@ -1005,7 +1009,26 @@ func decodeProviderModel(raw json.RawMessage, command string) (execution.Provide
 	if err != nil {
 		return execution.ProviderModelSettings{}, err
 	}
-	result := execution.ProviderModelSettings{Profile: profile, ID: id, Type: typeName, Compatibility: compatibility, DeveloperRole: developerRole}
+	result := execution.ProviderModelSettings{Profile: profile, ID: id, Type: typeName, Compatibility: compatibility, DeveloperRole: developerRole, ParametersMode: execution.ProviderWriteReplace}
+	parametersModeExplicit := false
+	if _, ok := fields["parameters_mode"]; ok {
+		parametersModeExplicit = true
+		mode, modeErr := decodeProviderWriteMode(fields["parameters_mode"], command)
+		if modeErr != nil {
+			return execution.ProviderModelSettings{}, modeErr
+		}
+		result.ParametersMode = mode
+	}
+	if !parametersModeExplicit {
+		return execution.ProviderModelSettings{}, fmt.Errorf("invalid %s arguments", command)
+	}
+	if _, ok := fields["parameters_source_profile"]; ok {
+		source, sourceErr := optionalProviderString(fields, "parameters_source_profile", command)
+		if sourceErr != nil || strings.TrimSpace(source) == "" {
+			return execution.ProviderModelSettings{}, fmt.Errorf("invalid %s arguments", command)
+		}
+		result.ParametersSourceProfile = strings.TrimSpace(source)
+	}
 	if value, ok := fields["input"]; ok {
 		result.Input, err = decodeProviderStringArray(value, command)
 		if err != nil {
@@ -1031,6 +1054,18 @@ func decodeProviderModel(raw json.RawMessage, command string) (execution.Provide
 			return execution.ProviderModelSettings{}, err
 		}
 	}
+	if result.ParametersMode == execution.ProviderWritePreserve {
+		if !parametersModeExplicit || result.ParametersSourceProfile == "" {
+			return execution.ProviderModelSettings{}, fmt.Errorf("invalid %s arguments", command)
+		}
+		if _, present := fields["parameters"]; present {
+			return execution.ProviderModelSettings{}, fmt.Errorf("invalid %s arguments", command)
+		}
+	} else if parametersModeExplicit {
+		if _, present := fields["parameters"]; !present || result.ParametersSourceProfile != "" {
+			return execution.ProviderModelSettings{}, fmt.Errorf("invalid %s arguments", command)
+		}
+	}
 	if value, ok := fields["reasoning_config"]; ok {
 		if string(bytes.TrimSpace(value)) == "null" {
 			return execution.ProviderModelSettings{}, fmt.Errorf("invalid %s arguments", command)
@@ -1054,6 +1089,28 @@ var providerTargetFields = []string{
 	"http_proxy", "https_proxy", "max_concurrent_requests", "models",
 }
 
+var providerTargetWriteModeFields = []string{"base_url_mode", "auth_file_mode", "http_proxy_mode", "https_proxy_mode"}
+
+func decodeProviderWriteMode(raw json.RawMessage, command string) (execution.ProviderWriteMode, error) {
+	var value string
+	if strings.TrimSpace(string(raw)) == "null" || json.Unmarshal(raw, &value) != nil || !utf8.ValidString(value) {
+		return "", fmt.Errorf("invalid %s arguments", command)
+	}
+	mode := execution.ProviderWriteMode(strings.TrimSpace(value))
+	if mode != execution.ProviderWritePreserve && mode != execution.ProviderWriteReplace {
+		return "", fmt.Errorf("invalid %s arguments", command)
+	}
+	return mode, nil
+}
+
+func optionalProviderWriteMode(fields map[string]json.RawMessage, name, command string) (execution.ProviderWriteMode, error) {
+	raw, ok := fields[name]
+	if !ok {
+		return execution.ProviderWriteReplace, nil
+	}
+	return decodeProviderWriteMode(raw, command)
+}
+
 func decodeProviderTargetFields(fields map[string]json.RawMessage, command string, requireComplete bool) (string, execution.ProviderSettingsInput, error) {
 	if requireComplete {
 		for _, name := range providerTargetFields {
@@ -1062,15 +1119,38 @@ func decodeProviderTargetFields(fields map[string]json.RawMessage, command strin
 			}
 		}
 	}
+	for _, name := range providerTargetWriteModeFields {
+		if _, ok := fields[name]; !ok {
+			return "", execution.ProviderSettingsInput{}, fmt.Errorf("invalid %s arguments", command)
+		}
+	}
 	provider, err := requiredProviderIdentity(fields, "provider", command)
 	if err != nil {
 		return "", execution.ProviderSettingsInput{}, err
 	}
-	baseURL, err := requiredProviderString(fields, "base_url", command)
+	baseURLMode, err := optionalProviderWriteMode(fields, "base_url_mode", command)
 	if err != nil {
 		return "", execution.ProviderSettingsInput{}, err
 	}
-	input := execution.ProviderSettingsInput{Name: provider, BaseURL: baseURL}
+	baseURL, err := requiredProviderString(fields, "base_url", command)
+	if baseURLMode == execution.ProviderWritePreserve && err != nil {
+		baseURL, err = requiredCommandStringAllowEmpty(fields, "base_url", command)
+	}
+	if err != nil {
+		return "", execution.ProviderSettingsInput{}, err
+	}
+	input := execution.ProviderSettingsInput{Name: provider, BaseURL: baseURL, BaseURLMode: baseURLMode}
+	for name, destination := range map[string]*execution.ProviderWriteMode{
+		"auth_file_mode":   &input.AuthFileMode,
+		"http_proxy_mode":  &input.HTTPProxyMode,
+		"https_proxy_mode": &input.HTTPSProxyMode,
+	} {
+		mode, modeErr := optionalProviderWriteMode(fields, name, command)
+		if modeErr != nil {
+			return "", execution.ProviderSettingsInput{}, modeErr
+		}
+		*destination = mode
+	}
 	for name, destination := range map[string]*string{"api_key": &input.APIKey, "auth_file": &input.AuthFile, "request_timeout": &input.RequestTimeout, "http_proxy": &input.HTTPProxy, "https_proxy": &input.HTTPSProxy} {
 		if value, ok := fields[name]; ok {
 			if strings.TrimSpace(string(value)) == "null" {
@@ -1122,7 +1202,7 @@ func decodeProviderUpdateArguments(raw json.RawMessage) (providerUpdateArguments
 	if err != nil {
 		return providerUpdateArguments{}, err
 	}
-	if err := requireExactFields(fields, command, append([]string{"provider"}, providerTargetFields...)...); err != nil {
+	if err := requireExactFields(fields, command, append(append([]string{"provider"}, providerTargetFields...), providerTargetWriteModeFields...)...); err != nil {
 		return providerUpdateArguments{}, err
 	}
 	provider, input, err := decodeProviderTargetFields(fields, command, false)
@@ -1138,7 +1218,7 @@ func decodeProviderCreateArguments(raw json.RawMessage) (providerCreateArguments
 	if err != nil {
 		return providerCreateArguments{}, err
 	}
-	if err := requireExactFields(fields, command, append([]string{"operation_id", "provider"}, providerTargetFields...)...); err != nil {
+	if err := requireExactFields(fields, command, append(append([]string{"operation_id", "provider"}, providerTargetFields...), providerTargetWriteModeFields...)...); err != nil {
 		return providerCreateArguments{}, err
 	}
 	operationID, err := requiredCommandString(fields, "operation_id", command)
@@ -2145,12 +2225,13 @@ func newSessionCommandRegistry(service *execution.Service, runs *runRegistry, op
 				if service == nil {
 					return nil, commands.NewDomainError("provider_unavailable", "provider service is not configured", nil)
 				}
-				if _, err := service.CreateProviderSettings(arguments.Input); err != nil {
+				write, err := service.CreateProviderSettingsWithResult(arguments.Input)
+				if err != nil {
 					return nil, providerCommandError(err)
 				}
 				// This is a bounded acknowledgement only. ProviderSettings is the
 				// authority and reaches the client through its resource stream.
-				return json.Marshal(providerCreateResult{OperationID: arguments.OperationID, Provider: arguments.Provider, Status: "applied"})
+				return json.Marshal(providerCreateResult{OperationID: arguments.OperationID, Provider: arguments.Provider, Status: "applied", Changed: write.Changed})
 			},
 		},
 		commands.CommandDefinition{
@@ -2166,10 +2247,11 @@ func newSessionCommandRegistry(service *execution.Service, runs *runRegistry, op
 				if service == nil {
 					return nil, commands.NewDomainError("provider_unavailable", "provider service is not configured", nil)
 				}
-				if _, err := service.UpdateProviderSettings(arguments.Provider, arguments.Input); err != nil {
+				write, err := service.UpdateProviderSettingsWithResult(arguments.Provider, arguments.Input)
+				if err != nil {
 					return nil, providerCommandError(err)
 				}
-				return json.Marshal(providerMutationResult{Provider: arguments.Provider, Status: "applied"})
+				return json.Marshal(providerMutationResult{Provider: arguments.Provider, Status: "applied", Changed: write.Changed})
 			},
 		},
 		commands.CommandDefinition{

@@ -300,12 +300,21 @@ func (p *Provider) Invalidate(reason string) error {
 func validateCommittedChange(change CommittedChange) error {
 	switch change.Kind {
 	case CommittedProviderRefresh:
+		if change.PublicationExpected {
+			return fmt.Errorf("provider refresh cannot expect a publication")
+		}
 		return nil
 	case CommittedProviderUpsert, CommittedProviderRemove:
 		if err := ValidateProviderName(change.ProviderName); err != nil {
 			return fmt.Errorf("provider name is not canonical: %w", err)
 		}
+		if change.PublicationExpected && change.Kind != CommittedProviderUpsert {
+			return fmt.Errorf("only a provider upsert can expect a publication")
+		}
 	case CommittedDefaultChanged:
+		if change.PublicationExpected {
+			return fmt.Errorf("default change cannot expect a publication")
+		}
 		if change.DefaultProvider != "" {
 			if err := ValidateProviderName(change.DefaultProvider); err != nil {
 				return fmt.Errorf("default provider is not canonical: %w", err)
@@ -564,7 +573,7 @@ func (o *owner) ensureInitializedForChange() error {
 	return o.rebuild()
 }
 
-func (o *owner) applyCommitted(_ CommittedChange) error {
+func (o *owner) applyCommitted(change CommittedChange) error {
 	if err := o.ensureInitializedForChange(); err != nil {
 		return err
 	}
@@ -587,13 +596,26 @@ func (o *owner) applyCommitted(_ CommittedChange) error {
 		return ErrProviderInvalid
 	}
 	previous := cloneSnapshot(o.snapshot)
-	if reflect.DeepEqual(previous, candidate) {
+	if reflect.DeepEqual(previous, candidate) && !change.PublicationExpected {
 		o.mu.Unlock()
 		return nil
 	}
 	currentRevision := o.resourceRevision
 	o.mu.Unlock()
 	operations := diffSnapshots(previous, candidate)
+	if len(operations) == 0 && change.PublicationExpected {
+		// The durable write changed only a field deliberately omitted from the
+		// safe resource (for example model parameters or URL user-info). Emit a
+		// valid, redacted upsert so the authority revision advances. The value is
+		// loaded from the safe candidate, never from the command or config.
+		for _, provider := range candidate.Providers {
+			if provider.Name == change.ProviderName {
+				value := provider
+				operations = append(operations, Operation{Op: OperationUpsertDefault, Key: provider.Name, Value: &value})
+				break
+			}
+		}
+	}
 	if len(operations) == 0 {
 		return nil
 	}
@@ -602,12 +624,12 @@ func (o *owner) applyCommitted(_ CommittedChange) error {
 		return fmt.Errorf("provider settings resource revision exhausted")
 	}
 	next := currentRevision + 1
-	change, err := (Change{ResourceRevision: strconv.FormatUint(next, 10), Operations: operations}).ToResourceChange()
+	resourceChange, err := (Change{ResourceRevision: strconv.FormatUint(next, 10), Operations: operations}).ToResourceChange()
 	if err != nil {
 		o.invalidate("encode_operation")
 		return err
 	}
-	encoded, err := json.Marshal(change)
+	encoded, err := json.Marshal(resourceChange)
 	if err != nil {
 		o.invalidate("encode_change")
 		return err
@@ -616,7 +638,7 @@ func (o *owner) applyCommitted(_ CommittedChange) error {
 		o.invalidate("change_too_large")
 		return fmt.Errorf("provider settings change exceeds maximum size")
 	}
-	entry, err := o.journal.Append(change)
+	entry, err := o.journal.Append(resourceChange)
 	if err != nil {
 		o.invalidate("journal_append")
 		return err

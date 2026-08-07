@@ -1,4 +1,4 @@
-import type { ActiveRunDescriptor, Bootstrap, CodexAuthStatus, CodexUsage, ImageAttachmentInput, ItemsPage, LifecycleEvent, Project, ProviderSettingsDocument, ProviderSettingsInput, RunAdmission, RunEvent, Session, SessionDebugSettings, SessionModelOptions, SessionSnapshot } from './types'
+import type { ActiveRunDescriptor, Bootstrap, CodexUsage, ImageAttachmentInput, ItemsPage, LifecycleEvent, Project, RunAdmission, RunEvent, Session, SessionDebugSettings, SessionModelOptions, SessionSnapshot } from './types'
 import { frontendProtocolLogger, protocolLogIdentity } from './lib/frontendProtocolLogger'
 
 export interface CreateSessionOptions {
@@ -146,26 +146,8 @@ export const api = {
       full_access: options.fullAccess,
     }),
   }),
-  providerSettings: () => request<ProviderSettingsDocument>('/api/provider-settings'),
-  createProvider: (input: ProviderSettingsInput) => request<ProviderSettingsDocument>('/api/providers', {
-    method: 'POST',
-    body: JSON.stringify(input),
-  }),
-  updateProvider: (providerName: string, input: ProviderSettingsInput) => request<ProviderSettingsDocument>(`/api/providers/${encodeURIComponent(providerName)}`, {
-    method: 'PUT',
-    body: JSON.stringify(input),
-  }),
-  updateProviderDefault: (provider: string, model: string) => request<ProviderSettingsDocument>('/api/provider-default', {
-    method: 'PATCH',
-    body: JSON.stringify({ provider, model }),
-  }),
-  discoverProviderModels: (providerName: string) => request<{ models: string[] }>(`/api/providers/${encodeURIComponent(providerName)}/models`),
-  startCodexLogin: (providerName: string) => request<CodexAuthStatus>(`/api/providers/${encodeURIComponent(providerName)}/codex-login`, {
-    method: 'POST',
-    body: '{}',
-  }),
-  codexLoginStatus: (providerName: string) => request<CodexAuthStatus>(`/api/providers/${encodeURIComponent(providerName)}/codex-login`),
-  clearCodexLogin: (providerName: string) => request<void>(`/api/providers/${encodeURIComponent(providerName)}/codex-login`, { method: 'DELETE' }),
+  // Temporary, bounded read-only compatibility path. Provider mutations and
+  // login state are owned by typed WebSocket commands/resources.
   codexUsage: (providerName: string) => request<CodexUsage>(`/api/providers/${encodeURIComponent(providerName)}/codex-usage`),
   session: (sessionID: string) => request<Session>(`/api/sessions/${encodeURIComponent(sessionID)}`, {}, { sessionID }),
   snapshot: (sessionID: string) => request<SessionSnapshot>(`/api/sessions/${encodeURIComponent(sessionID)}/snapshot`, {}, { sessionID }),

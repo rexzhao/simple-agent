@@ -32,6 +32,8 @@ export interface ProviderPricing {
   readonly long_context?: ProviderPricingTier | null
 }
 
+export type ProviderWriteMode = 'preserve' | 'replace'
+
 /** Complete model target. Optional members are encoded as their explicit zero/empty target. */
 export interface ProviderModelTarget {
   readonly profile: string
@@ -43,6 +45,13 @@ export interface ProviderModelTarget {
   readonly context_window?: number
   readonly input_limit?: number
   readonly output_limit?: number
+  /** Preserve is the default for a model already present in the durable
+   * provider file. Replace is explicit because the safe resource never
+   * contains arbitrary request parameters. */
+  readonly parameters_mode: ProviderWriteMode
+  /** Stable durable identity used when a preserved model is renamed. It is
+   * deliberately only a profile name, never the hidden parameter value. */
+  readonly parameters_source_profile?: string
   readonly parameters?: JsonObject
   readonly reasoning_config?: ProviderReasoningConfig
   readonly pricing?: ProviderPricing | null
@@ -50,12 +59,18 @@ export interface ProviderModelTarget {
 
 /** The API key is write-only. It is never present in a command result. */
 export interface ProviderUpdateTarget {
+  /** The safe resource projection is not a complete URL. Existing endpoint
+   * components are preserved unless the user explicitly replaces them. */
+  readonly base_url_mode: ProviderWriteMode
   readonly base_url: string
   readonly api_key?: string
   readonly keep_api_key?: boolean
+  readonly auth_file_mode: ProviderWriteMode
   readonly auth_file?: string
   readonly request_timeout?: string
+  readonly http_proxy_mode: ProviderWriteMode
   readonly http_proxy?: string
+  readonly https_proxy_mode: ProviderWriteMode
   readonly https_proxy?: string
   readonly max_concurrent_requests?: number
   readonly models: readonly ProviderModelTarget[]
@@ -64,12 +79,14 @@ export interface ProviderUpdateTarget {
 export interface ProviderMutationResult {
   readonly provider: string
   readonly status: 'applied'
+  readonly changed: boolean
 }
 
 export interface ProviderCreateResult {
   readonly operation_id: string
   readonly provider: string
   readonly status: 'applied'
+  readonly changed: boolean
 }
 
 export interface ProviderDefaultResult {

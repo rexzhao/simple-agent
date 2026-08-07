@@ -142,7 +142,7 @@ func TestSessionCommandSchemasAreStrict(t *testing.T) {
 }
 
 func providerUpdateTestArguments() json.RawMessage {
-	return json.RawMessage(`{"provider":"空 白 provider","base_url":"https://example.test/v1","api_key":"command-secret","keep_api_key":false,"auth_file":"","request_timeout":"30s","http_proxy":"","https_proxy":"","max_concurrent_requests":3,"models":[{"profile":"主 模型","id":"model-主","type":"","compatibility":"","input":["text"],"developer_role":"","context_window":1000,"input_limit":900,"output_limit":100,"parameters":{"temperature":0.2,"enabled":true,"nested":{"values":[null,2]}},"reasoning_config":{"parameter":"reasoning_effort","default":"medium","levels":{"low":"low","medium":2,"off":false,"none":null}},"pricing":{"input_cache_hit":0.1,"input_cache_miss":0.2,"cache_write":0.3,"output":0.4,"currency":"USD","long_context_threshold":10000,"long_context":null}}]}`)
+	return json.RawMessage(`{"provider":"空 白 provider","base_url":"https://example.test/v1","base_url_mode":"replace","api_key":"command-secret","keep_api_key":false,"auth_file":"","auth_file_mode":"replace","request_timeout":"30s","http_proxy":"","http_proxy_mode":"replace","https_proxy":"","https_proxy_mode":"replace","max_concurrent_requests":3,"models":[{"profile":"主 模型","id":"model-主","type":"","compatibility":"","input":["text"],"developer_role":"","context_window":1000,"input_limit":900,"output_limit":100,"parameters_mode":"replace","parameters":{"temperature":0.2,"enabled":true,"nested":{"values":[null,2]}},"reasoning_config":{"parameter":"reasoning_effort","default":"medium","levels":{"low":"low","medium":2,"off":false,"none":null}},"pricing":{"input_cache_hit":0.1,"input_cache_miss":0.2,"cache_write":0.3,"output":0.4,"currency":"USD","long_context_threshold":10000,"long_context":null}}]}`)
 }
 
 func providerCreateTestArguments() json.RawMessage {
@@ -154,6 +154,25 @@ func TestProviderCommandSchemasAreStrictAndBounded(t *testing.T) {
 	valid := providerUpdateTestArguments()
 	if err := validateProviderUpdateArguments(valid); err != nil {
 		t.Fatalf("valid provider.update arguments rejected: %v", err)
+	}
+	preserve := json.RawMessage(`{"provider":"p","base_url":"https://example.test","base_url_mode":"preserve","auth_file_mode":"preserve","http_proxy_mode":"preserve","https_proxy_mode":"preserve","models":[{"profile":"renamed","parameters_mode":"preserve","parameters_source_profile":"old"}]}`)
+	decodedPreserve, err := decodeProviderUpdateArguments(preserve)
+	if err != nil || decodedPreserve.Input.Models[0].ParametersMode != execution.ProviderWritePreserve || decodedPreserve.Input.Models[0].ParametersSourceProfile != "old" || decodedPreserve.Input.Models[0].Parameters != nil {
+		t.Fatalf("preserve provider target = %#v, err=%v", decodedPreserve, err)
+	}
+	emptyEndpoint := json.RawMessage(`{"provider":"p","base_url":"","base_url_mode":"preserve","auth_file_mode":"preserve","http_proxy_mode":"preserve","https_proxy_mode":"preserve","models":[{"profile":"m","parameters_mode":"preserve","parameters_source_profile":"m"}]}`)
+	if decoded, decodeErr := decodeProviderUpdateArguments(emptyEndpoint); decodeErr != nil || decoded.Input.BaseURL != "" || decoded.Input.BaseURLMode != execution.ProviderWritePreserve {
+		t.Fatalf("empty safe endpoint preserve target = %#v, err=%v", decoded, decodeErr)
+	}
+	for _, raw := range []json.RawMessage{
+		json.RawMessage(`{"provider":"p","base_url":"https://example.test","models":[{"profile":"m","parameters_mode":"preserve","parameters":{}}]}`),
+		json.RawMessage(`{"provider":"p","base_url":"https://example.test","models":[{"profile":"m","parameters_mode":"replace"}]}`),
+		json.RawMessage(`{"provider":"p","base_url":"https://example.test","models":[{"profile":"m","parameters_mode":"invalid","parameters":{}}]}`),
+		json.RawMessage(`{"provider":"p","base_url":"https://example.test","base_url_mode":"replace","auth_file_mode":"replace","http_proxy_mode":"replace","https_proxy_mode":"replace","models":[{"profile":"m","parameters":{}}]}`),
+	} {
+		if err := validateProviderUpdateArguments(raw); err == nil {
+			t.Fatalf("provider.update accepted unsafe parameter write intent: %s", raw)
+		}
 	}
 	decoded, err := decodeProviderUpdateArguments(valid)
 	if err != nil {
@@ -172,12 +191,12 @@ func TestProviderCommandSchemasAreStrictAndBounded(t *testing.T) {
 	if model.ReasoningConfig.Levels["off"] != false || model.ReasoningConfig.Levels["none"] != nil {
 		t.Fatalf("reasoning scalar union was not preserved: %#v", model.ReasoningConfig.Levels)
 	}
-	validSurrogate := json.RawMessage(`{"provider":"p","base_url":"https://example.test","models":[{"profile":"m","parameters":{"\ud83d\ude00":"\ud83d\ude00","nested":[1,0.25,1e-3]}}]}`)
+	validSurrogate := json.RawMessage(`{"provider":"p","base_url":"https://example.test","base_url_mode":"replace","auth_file_mode":"replace","http_proxy_mode":"replace","https_proxy_mode":"replace","models":[{"profile":"m","parameters_mode":"replace","parameters":{"\ud83d\ude00":"\ud83d\ude00","nested":[1,0.25,1e-3]}}]}`)
 	surrogateDecoded, err := decodeProviderUpdateArguments(validSurrogate)
 	if err != nil || surrogateDecoded.Input.Models[0].Parameters["😀"] != "😀" {
 		t.Fatalf("valid surrogate pair was rejected or changed: %#v / %v", surrogateDecoded, err)
 	}
-	validNumbers := json.RawMessage(`{"provider":"p","base_url":"https://example.test","models":[{"profile":"m","parameters":{"max":9007199254740991,"min":-9007199254740991,"fraction":0.125,"exponent":1e-3,"replacement":"\ufffd"},"reasoning_config":{"parameter":"","default":"","levels":{"max":9007199254740991,"fraction":0.5}}}]}`)
+	validNumbers := json.RawMessage(`{"provider":"p","base_url":"https://example.test","base_url_mode":"replace","auth_file_mode":"replace","http_proxy_mode":"replace","https_proxy_mode":"replace","models":[{"profile":"m","parameters_mode":"replace","parameters":{"max":9007199254740991,"min":-9007199254740991,"fraction":0.125,"exponent":1e-3,"replacement":"\ufffd"},"reasoning_config":{"parameter":"","default":"","levels":{"max":9007199254740991,"fraction":0.5}}}]}`)
 	numberDecoded, err := decodeProviderUpdateArguments(validNumbers)
 	if err != nil {
 		t.Fatalf("valid provider number boundaries rejected: %v", err)
@@ -282,6 +301,30 @@ func TestProviderCommandSchemasAreStrictAndBounded(t *testing.T) {
 	createRedacted := redactProviderCreateArguments(createValid)
 	if string(createRedacted) != `{}` || strings.Contains(string(createRedacted), "command-secret") {
 		t.Fatalf("provider create cache tombstone = %s, secrets must be redacted", createRedacted)
+	}
+}
+
+func TestProviderWriteIntentFingerprintIsStableAndConflictingModesDiffer(t *testing.T) {
+	preserveA := json.RawMessage(`{"provider":"p","base_url":"https://example.test","base_url_mode":"preserve","models":[{"profile":"m","parameters_mode":"preserve","parameters_source_profile":"m"}]}`)
+	preserveB := json.RawMessage(`{"models":[{"parameters_source_profile":"m","parameters_mode":"preserve","profile":"m"}],"base_url_mode":"preserve","base_url":"https://example.test","provider":"p"}`)
+	replace := json.RawMessage(`{"provider":"p","base_url":"https://example.test","base_url_mode":"preserve","models":[{"profile":"m","parameters_mode":"replace","parameters":{}}]}`)
+	left, err := commands.Fingerprint(commands.CommandRequest{Name: "provider.update", SchemaVersion: 1, RequestID: "request", Arguments: preserveA})
+	if err != nil {
+		t.Fatal(err)
+	}
+	right, err := commands.Fingerprint(commands.CommandRequest{Name: "provider.update", SchemaVersion: 1, RequestID: "request", Arguments: preserveB})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if left != right {
+		t.Fatalf("preserve fingerprint changed with object order: %q != %q", left, right)
+	}
+	conflict, err := commands.Fingerprint(commands.CommandRequest{Name: "provider.update", SchemaVersion: 1, RequestID: "request", Arguments: replace})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if left == conflict {
+		t.Fatal("preserve and replace write intents shared a fingerprint")
 	}
 }
 

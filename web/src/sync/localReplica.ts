@@ -14,6 +14,7 @@ export interface ResourceMetadata {
 
 export interface ReplicaApplyContext {
   readonly resource: ResourceKey
+  readonly streamEpoch?: string
   readonly resourceRevision: string
   readonly generation: number
 }
@@ -217,6 +218,7 @@ export class LocalReplica {
       adapter.validateResourceRevision?.(snapshotMetadata.resourceRevision)
       value = adapter.decodeSnapshot(content, current?.value as T | undefined, {
         resource,
+        streamEpoch: snapshotMetadata.streamEpoch,
         resourceRevision: snapshotMetadata.resourceRevision,
         generation: snapshotMetadata.generation,
       })
@@ -230,6 +232,7 @@ export class LocalReplica {
         adapter.validateResourceRevision?.(change.metadata.resourceRevision)
         value = adapter.applyChange(value, change.operations, {
           resource,
+          streamEpoch: change.metadata.streamEpoch,
           resourceRevision: change.metadata.resourceRevision,
           generation: change.metadata.generation,
         })

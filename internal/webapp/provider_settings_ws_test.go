@@ -49,7 +49,7 @@ func TestProviderSettingsWebSocketResourceUsesSafeDurableProjection(t *testing.T
 	}
 
 	command := protocol.CommandMessage{Envelope: protocol.Envelope{Version: 1, Type: protocol.MessageTypeCommand, ID: "provider-update"}, Payload: protocol.CommandPayload{
-		Name: "provider.update", SchemaVersion: 1, RequestID: "provider-update-request", Arguments: json.RawMessage(`{"provider":"fake","base_url":"http://127.0.0.1:1/v1","api_key":"command-secret","keep_api_key":false,"auth_file":"","request_timeout":"","http_proxy":"","https_proxy":"","max_concurrent_requests":0,"models":[{"profile":"fast","id":"fake-model","type":"","compatibility":"","input":["text","image"],"developer_role":"","context_window":32000,"input_limit":0,"output_limit":0,"parameters":{},"reasoning_config":{"parameter":"","default":"","levels":{}},"pricing":null},{"profile":"precise","id":"changed-model","type":"","compatibility":"","input":[],"developer_role":"","context_window":64000,"input_limit":0,"output_limit":0,"parameters":{},"reasoning_config":{"parameter":"","default":"","levels":{}},"pricing":null}]}`),
+		Name: "provider.update", SchemaVersion: 1, RequestID: "provider-update-request", Arguments: json.RawMessage(`{"provider":"fake","base_url":"http://127.0.0.1:1/v1","base_url_mode":"replace","api_key":"command-secret","keep_api_key":false,"auth_file":"","auth_file_mode":"replace","request_timeout":"","http_proxy":"","http_proxy_mode":"replace","https_proxy":"","https_proxy_mode":"replace","max_concurrent_requests":0,"models":[{"profile":"fast","id":"fake-model","type":"","compatibility":"","input":["text","image"],"developer_role":"","context_window":32000,"input_limit":0,"output_limit":0,"parameters_mode":"replace","parameters":{},"reasoning_config":{"parameter":"","default":"","levels":{}},"pricing":null},{"profile":"precise","id":"changed-model","type":"","compatibility":"","input":[],"developer_role":"","context_window":64000,"input_limit":0,"output_limit":0,"parameters_mode":"replace","parameters":{},"reasoning_config":{"parameter":"","default":"","levels":{}},"pricing":null}]}`),
 	}}
 	encoded, err = protocol.EncodeMessage(command)
 	if err != nil {
@@ -62,7 +62,7 @@ func TestProviderSettingsWebSocketResourceUsesSafeDurableProjection(t *testing.T
 		t.Fatal("provider.update accepted missing")
 	}
 	result, ok := readWebAppMessage(t, connection).(protocol.CommandResultMessage)
-	if !ok || result.Payload.Status != protocol.CommandStatusSucceeded || strings.Contains(string(result.Payload.Result), "command-secret") {
+	if !ok || result.Payload.Status != protocol.CommandStatusSucceeded || !strings.Contains(string(result.Payload.Result), `"changed":true`) || strings.Contains(string(result.Payload.Result), "command-secret") {
 		t.Fatalf("provider.update result = %#v, API key must not be returned", result.Payload)
 	}
 	change, ok := readWebAppMessage(t, connection).(protocol.ChangeMessage)
@@ -75,6 +75,25 @@ func TestProviderSettingsWebSocketResourceUsesSafeDurableProjection(t *testing.T
 	if strings.Contains(string(change.Payload.Operations[0].Raw), "test-key") {
 		t.Fatal("provider settings change leaked API key")
 	}
+	// Replaying the already durable target reports changed=false and must not
+	// create a second LocalReplica publication.
+	noOpCommand := command
+	noOpCommand.Envelope.ID = "provider-update-noop"
+	noOpCommand.Payload.RequestID = "provider-update-noop-request"
+	encoded, err = protocol.EncodeMessage(noOpCommand)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := connection.Write(context.Background(), websocket.MessageText, encoded); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := readWebAppMessage(t, connection).(protocol.CommandAcceptedMessage); !ok {
+		t.Fatal("provider.update no-op accepted missing")
+	}
+	noOpResult, ok := readWebAppMessage(t, connection).(protocol.CommandResultMessage)
+	if !ok || noOpResult.Payload.Status != protocol.CommandStatusSucceeded || string(noOpResult.Payload.Result) != `{"provider":"fake","status":"applied","changed":false}` {
+		t.Fatalf("provider.update no-op result = %#v", noOpResult.Payload)
+	}
 
 	createBaseURL := "https://create-base-user:create-base-pass@example.test/v1?create_query=create-query-secret"
 	createAPIKey := "create-api-key"
@@ -82,7 +101,7 @@ func TestProviderSettingsWebSocketResourceUsesSafeDurableProjection(t *testing.T
 	createHTTPProxy := "http://create-http-user:create-http-pass@proxy.example.test:8080"
 	createHTTPSProxy := "https://create-https-user:create-https-pass@proxy.example.test:8443"
 	createNestedSecret := "create-nested-secret"
-	createArguments := json.RawMessage(fmt.Sprintf(`{"operation_id":"operation-created-provider","provider":"created-provider","base_url":%q,"api_key":%q,"keep_api_key":false,"auth_file":%q,"request_timeout":"","http_proxy":%q,"https_proxy":%q,"max_concurrent_requests":0,"models":[{"profile":"fast","id":"created-model","type":"","compatibility":"","input":["text"],"developer_role":"","context_window":32000,"input_limit":0,"output_limit":0,"parameters":{"nested":%q},"reasoning_config":{"parameter":"","default":"","levels":{}},"pricing":null}]}`, createBaseURL, createAPIKey, createAuthFile, createHTTPProxy, createHTTPSProxy, createNestedSecret))
+	createArguments := json.RawMessage(fmt.Sprintf(`{"operation_id":"operation-created-provider","provider":"created-provider","base_url":%q,"base_url_mode":"replace","api_key":%q,"keep_api_key":false,"auth_file":%q,"auth_file_mode":"replace","request_timeout":"","http_proxy":%q,"http_proxy_mode":"replace","https_proxy":%q,"https_proxy_mode":"replace","max_concurrent_requests":0,"models":[{"profile":"fast","id":"created-model","type":"","compatibility":"","input":["text"],"developer_role":"","context_window":32000,"input_limit":0,"output_limit":0,"parameters_mode":"replace","parameters":{"nested":%q},"reasoning_config":{"parameter":"","default":"","levels":{}},"pricing":null}]}`, createBaseURL, createAPIKey, createAuthFile, createHTTPProxy, createHTTPSProxy, createNestedSecret))
 	createSensitiveValues := []string{createBaseURL, "create-base-user", "create-base-pass", "create-query-secret", createAuthFile, createHTTPProxy, "create-http-user", "create-http-pass", createHTTPSProxy, "create-https-user", "create-https-pass", createAPIKey, createNestedSecret}
 	assertNoCreateSecrets := func(label, payload string, values ...string) {
 		for _, secret := range values {
@@ -105,7 +124,7 @@ func TestProviderSettingsWebSocketResourceUsesSafeDurableProjection(t *testing.T
 		t.Fatal("provider.create accepted missing")
 	}
 	createdResult, ok := readWebAppMessage(t, connection).(protocol.CommandResultMessage)
-	if !ok || createdResult.Payload.Status != protocol.CommandStatusSucceeded || string(createdResult.Payload.Result) != `{"operation_id":"operation-created-provider","provider":"created-provider","status":"applied"}` {
+	if !ok || createdResult.Payload.Status != protocol.CommandStatusSucceeded || string(createdResult.Payload.Result) != `{"operation_id":"operation-created-provider","provider":"created-provider","status":"applied","changed":true}` {
 		t.Fatalf("provider.create result = %#v", createdResult.Payload)
 	}
 	createdChange, ok := readWebAppMessage(t, connection).(protocol.ChangeMessage)
@@ -201,7 +220,7 @@ func TestProviderSettingsWebSocketResourceUsesSafeDurableProjection(t *testing.T
 	// credential-bearing. In particular, endpoint credentials, auth paths,
 	// proxy credentials, and arbitrary model parameters must not cross the
 	// command error or protocol logging boundary.
-	unsafeErrorArguments := json.RawMessage(`{"provider":"fake","base_url":"https://user:base-error@example.test/v1","api_key":"error-api-key","keep_api_key":false,"auth_file":"/secret/path/provider.json","request_timeout":"","http_proxy":"http://user:proxy-error@proxy.example.test:8080","https_proxy":"","max_concurrent_requests":0,"models":[{"profile":"fast","id":"fake-model","type":"","compatibility":"","input":["text"],"developer_role":"","context_window":32000,"input_limit":0,"output_limit":0,"parameters":{"nested":{"token":"nested-error"}},"reasoning_config":{"parameter":"","default":"","levels":{}},"pricing":null}]}`)
+	unsafeErrorArguments := json.RawMessage(`{"provider":"fake","base_url":"https://user:base-error@example.test/v1","base_url_mode":"replace","api_key":"error-api-key","keep_api_key":false,"auth_file":"/secret/path/provider.json","auth_file_mode":"replace","request_timeout":"","http_proxy":"http://user:proxy-error@proxy.example.test:8080","http_proxy_mode":"replace","https_proxy":"","https_proxy_mode":"replace","max_concurrent_requests":0,"models":[{"profile":"fast","id":"fake-model","type":"anthropic-messages","compatibility":"openai","input":["text"],"developer_role":"","context_window":32000,"input_limit":0,"output_limit":0,"parameters_mode":"replace","parameters":{"nested":{"token":"nested-error"}},"reasoning_config":{"parameter":"","default":"","levels":{}},"pricing":null}]}`)
 	unsafeCommand := protocol.CommandMessage{Envelope: protocol.Envelope{Version: 1, Type: protocol.MessageTypeCommand, ID: "provider-update-error"}, Payload: protocol.CommandPayload{
 		Name: "provider.update", SchemaVersion: 1, RequestID: "provider-update-error-request", Arguments: unsafeErrorArguments,
 	}}

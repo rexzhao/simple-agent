@@ -54,6 +54,57 @@ describe('ProviderSettingsAdapter', () => {
     expect(() => adapter.applyChange(first, [{ op: 'default.replace', key: 'wrong', value: { provider: '', model: '' } }])).toThrow()
   })
 
+  it('keeps an authority publication observable when the safe projection is unchanged', () => {
+    const adapter = new ProviderSettingsAdapter()
+    const first = adapter.decodeSnapshot(snapshot([provider('alpha')]) as unknown as JsonObject, undefined, { resourceRevision: '10' })
+    const published = adapter.applyChange(first, [{ op: 'upsert', key: 'alpha', value: provider('alpha') as unknown as JsonObject }], { resourceRevision: '11' })
+    expect(published).not.toBe(first)
+    expect(published.authorityRevision.revision).toBe('11')
+    expect(published.providersByName.alpha).toBe(first.providersByName.alpha)
+  })
+
+  it('tracks the affected provider publication separately from unrelated providers', () => {
+    const adapter = new ProviderSettingsAdapter()
+    const first = adapter.decodeSnapshot(snapshot([provider('alpha'), provider('beta')]) as unknown as JsonObject, undefined, { resourceRevision: '10' })
+    const published = adapter.applyChange(first, [{ op: 'upsert', key: 'beta', value: provider('beta') as unknown as JsonObject }], { resourceRevision: '11' })
+    expect(published.providerAuthorityRevisions.alpha.revision).toBe('10')
+    expect(published.providerAuthorityRevisions.beta.revision).toBe('11')
+    expect(published.providerAuthorityRevisions.alpha.epoch).toBe('')
+  })
+
+  it('does not reuse an authority token across stream epochs', () => {
+    const adapter = new ProviderSettingsAdapter()
+    const first = adapter.decodeSnapshot(snapshot([provider('alpha')]) as unknown as JsonObject, undefined, { streamEpoch: 'epoch-1', resourceRevision: '4', generation: 1 })
+    const next = adapter.decodeSnapshot(snapshot([provider('alpha')]) as unknown as JsonObject, first, { streamEpoch: 'epoch-2', resourceRevision: '4', generation: 1 })
+    expect(next.authorityRevision).not.toEqual(first.authorityRevision)
+    expect(next.authorityRevision.revision).toBe(first.authorityRevision.revision)
+    expect(next.authorityRevision.epoch).not.toBe(first.authorityRevision.epoch)
+  })
+
+  it('keeps saving behind a real LocalReplica publication and accepts publication-before-ack', async () => {
+    const replica = new LocalReplica()
+    const adapter = new ProviderSettingsAdapter()
+    const store = new ProviderSettingsStore(replica)
+    const domain = new DomainRepository(store)
+    replica.applySnapshot(resource, adapter, snapshot([provider('alpha')]) as unknown as JsonObject, { streamEpoch: 'epoch-1', sequence: '0' as never, resourceRevision: '0', generation: 1 })
+    const previous = domain.captureAuthority()
+    let settled = false
+    const barrier = domain.waitForProviderPublication('alpha', previous, { timeoutMS: 100 }).then(() => { settled = true })
+    await Promise.resolve()
+    expect(settled).toBe(false)
+    replica.applySnapshotAndChanges(resource, adapter, snapshot([provider('alpha')]) as unknown as JsonObject, { streamEpoch: 'epoch-1', sequence: '1' as never, resourceRevision: '1', generation: 1 }, [{ operations: [{ op: 'upsert', key: 'alpha', value: provider('alpha') as unknown as JsonObject }], metadata: { streamEpoch: 'epoch-1', sequence: '2' as never, resourceRevision: '2', generation: 1 } }])
+    await expect(barrier).resolves.toBeUndefined()
+    // If publication wins the race with the command acknowledgement, capture
+    // the pre-command token and start observing only after the publication.
+    const beforeAck = domain.captureAuthority()
+    replica.applySnapshotAndChanges(resource, adapter, snapshot([provider('alpha')]) as unknown as JsonObject, { streamEpoch: 'epoch-1', sequence: '3' as never, resourceRevision: '3', generation: 1 }, [{ operations: [{ op: 'upsert', key: 'alpha', value: provider('alpha') as unknown as JsonObject }], metadata: { streamEpoch: 'epoch-1', sequence: '4' as never, resourceRevision: '4', generation: 1 } }])
+    await expect(domain.waitForProviderPublication('alpha', beforeAck, { timeoutMS: 100 })).resolves.toMatchObject({ status: 'ready' })
+    const oldEpoch = domain.captureAuthority()
+    replica.applySnapshot(resource, adapter, snapshot([provider('alpha')]) as unknown as JsonObject, { streamEpoch: 'epoch-2', sequence: '0' as never, resourceRevision: '4', generation: 1 })
+    await expect(domain.waitForProviderPublication('alpha', oldEpoch, { timeoutMS: 100 })).resolves.toMatchObject({ status: 'ready' })
+    store.dispose()
+  })
+
   it('publishes LocalReplica barriers atomically and exposes availability/selectors only through the repository', () => {
     const replica = new LocalReplica()
     const adapter = new ProviderSettingsAdapter()

@@ -14,7 +14,6 @@ import { Conversation } from './components/Conversation'
 import { DebugSettingsDialog } from './components/DebugSettingsDialog'
 import { EmptySession, ErrorBanner, ProjectSetup, Splash } from './components/misc'
 import { ProviderManagerDialog } from './components/ProviderManagerDialog'
-import type { ProviderManagerState } from './components/ProviderManagerDialog'
 import { SessionModelDialog } from './components/SessionModelDialog'
 import type { SessionCreatorState } from './components/SessionModelDialog'
 import { WorkspaceTree } from './components/WorkspaceTree'
@@ -23,7 +22,9 @@ import { useComposerDrafts } from './hooks/useComposerDrafts'
 import { useRunRegistry } from './hooks/useRunRegistry'
 import { useSessionContentHistory } from './hooks/useSessionContentHistory'
 import { useSessionSelection } from './hooks/useSessionSelection'
-import { useProjectIndex, useSessionIndexes, useSyncCommands, useSyncRepositories, useSyncSignals } from './hooks/useSyncApplication'
+import { useCodexLogin, useCurrentCodexLoginProvider, useProjectIndex, useProviderSettings, useSessionIndexes, useSyncCommands, useSyncRepositories, useSyncSignals } from './hooks/useSyncApplication'
+import type { ProviderUpdateTarget } from './commands/providerCommands'
+import { codexUsageDomain, type CodexUsageDomain } from './domain/codexUsage'
 
 type BackgroundCompletionNotice = {
   sessionID: string
@@ -60,11 +61,29 @@ function runMutationErrorMessage(reason: unknown): string {
   return 'Run operation failed.'
 }
 
+function providerOperationErrorMessage(reason: unknown, operation: 'save' | 'default' | 'discover' | 'login' | 'logout'): string {
+  if (reason && typeof reason === 'object' && 'code' in reason) {
+    const code = String((reason as { code?: unknown }).code)
+    if (code === 'timeout') return operation === 'login' || operation === 'logout' ? 'Codex command accepted; waiting for login synchronization.' : 'Provider command accepted; waiting for settings synchronization.'
+    if (code === 'cancelled') return 'Provider operation was cancelled.'
+  }
+  switch (operation) {
+    case 'default': return 'The default model could not be changed.'
+    case 'discover': return 'Provider model discovery failed.'
+    case 'login': return 'Codex sign-in could not be started.'
+    case 'logout': return 'Codex sign-out could not be completed.'
+    default: return 'Provider settings could not be saved.'
+  }
+}
+
 function App() {
   const projectIndex = useProjectIndex()
-  const { project: projectCommands, session: sessionCommands, run: runCommands } = useSyncCommands()
-  const { currentProject, currentSession } = useSyncSignals()
-  const { projectIndex: projectIndexRepository, sessionIndex: sessionIndexRepository, sessionContent: sessionContentRepository } = useSyncRepositories()
+  const { project: projectCommands, session: sessionCommands, run: runCommands, provider: providerCommands, codexLogin: codexLoginCommands } = useSyncCommands()
+  const { currentProject, currentSession, providerSettings: providerSettingsSignal, codexLoginProvider } = useSyncSignals()
+  const { projectIndex: projectIndexRepository, sessionIndex: sessionIndexRepository, sessionContent: sessionContentRepository, providerSettings: providerSettingsRepository, codexLogin: codexLoginRepository } = useSyncRepositories()
+  const providerSettings = useProviderSettings()
+  const currentCodexProvider = useCurrentCodexLoginProvider()
+  const codexLogin = useCodexLogin(currentCodexProvider ?? '')
   const projects = projectIndex.active
   const sessionIndexes = useSessionIndexes(projects.map((project) => project.id))
   const [bootstrap, setBootstrap] = useState<Bootstrap | null>(null)
@@ -85,7 +104,7 @@ function App() {
   const autoProjectFormRef = useRef(false)
   const projectFormUserOpenedRef = useRef(false)
   const [sessionCreator, setSessionCreator] = useState<SessionCreatorState | null>(null)
-  const [providerManager, setProviderManager] = useState<ProviderManagerState | null>(null)
+  const [providerManagerOpen, setProviderManagerOpen] = useState(false)
   const [debugSessionID, setDebugSessionID] = useState('')
   const [savingDebugSettings, setSavingDebugSettings] = useState(false)
   const [creatingSession, setCreatingSession] = useState(false)
@@ -426,14 +445,77 @@ function App() {
     }
   }
 
-  const openProviderManager = useCallback(async () => {
-    setProviderManager({ document: null, loading: true })
+  const openProviderManager = useCallback(() => {
+    setError('')
+    setProviderManagerOpen(true)
+    providerSettingsSignal.set({ settingsEnabled: true, modelSelectionNeeded: false })
+  }, [providerSettingsSignal])
+
+  const closeProviderManager = useCallback(() => {
+    setProviderManagerOpen(false)
+    providerSettingsSignal.set({ settingsEnabled: false, modelSelectionNeeded: false })
+    codexLoginProvider.set(null)
+  }, [codexLoginProvider, providerSettingsSignal])
+
+  const saveProvider = useCallback(async (provider: string, target: ProviderUpdateTarget, existing: boolean) => {
+    const previous = providerSettingsRepository.captureAuthority()
     try {
-      const document = await api.providerSettings()
-      setProviderManager((current) => current ? { document, loading: false } : current)
+      let changed = false
+      if (existing) {
+        changed = (await providerCommands.update(provider, target)).changed
+      } else {
+        changed = (await providerCommands.createProvider(provider, target)).changed
+      }
+      if (changed) await providerSettingsRepository.waitForProviderPublication(provider, previous, { timeoutMS: 5000 })
+    } catch (reason) {
+      throw new Error(providerOperationErrorMessage(reason, 'save'))
+    }
+  }, [providerCommands, providerSettingsRepository])
+
+  const setProviderDefault = useCallback(async (provider: string, model: string) => {
+    try {
+      await providerCommands.setDefault(provider, model)
+      await providerSettingsRepository.waitFor((settings) => settings.status === 'ready' && settings.defaultProvider === provider && settings.defaultModel === model, { timeoutMS: 5000 })
+    } catch (reason) {
+      throw new Error(providerOperationErrorMessage(reason, 'default'))
+    }
+  }, [providerCommands, providerSettingsRepository])
+
+  const discoverProviderModels = useCallback(async (provider: string): Promise<readonly string[]> => {
+    try {
+      const result = await providerCommands.discoverModels(provider)
+      return result.models
+    } catch (reason) {
+      throw new Error(providerOperationErrorMessage(reason, 'discover'))
+    }
+  }, [providerCommands])
+
+  const startCodexLogin = useCallback(async (provider: string) => {
+    const previous = codexLoginRepository.getSnapshot(provider)
+    try {
+      await codexLoginCommands.startCodexLogin(provider)
+      await codexLoginRepository.waitFor(provider, (model) => model.status === 'ready' && model.login?.status === 'pending' && (model !== previous || previous.login?.status === 'pending'), { timeoutMS: 10_000 })
+    } catch (reason) {
+      throw new Error(providerOperationErrorMessage(reason, 'login'))
+    }
+  }, [codexLoginCommands, codexLoginRepository])
+
+  const clearCodexLogin = useCallback(async (provider: string) => {
+    const previous = codexLoginRepository.getSnapshot(provider)
+    try {
+      await codexLoginCommands.clearCodexLogin(provider)
+      await codexLoginRepository.waitFor(provider, (model) => model.status === 'ready' && model.login?.status === 'signed_out' && (model !== previous || previous.login?.status === 'signed_out'), { timeoutMS: 10_000 })
+    } catch (reason) {
+      throw new Error(providerOperationErrorMessage(reason, 'logout'))
+    }
+  }, [codexLoginCommands, codexLoginRepository])
+
+  const refreshCodexUsage = useCallback(async (provider: string): Promise<CodexUsageDomain> => {
+    try {
+      const usage = await api.codexUsage(provider)
+      return codexUsageDomain(usage)
     } catch {
-      setProviderManager(null)
-      setError('Provider settings are unavailable.')
+      throw new Error('Codex usage is temporarily unavailable.')
     }
   }, [])
 
@@ -1192,6 +1274,13 @@ function App() {
     setError('')
     sessionIndexRepository.retry(projectID)
   }, [sessionIndexRepository])
+  const retryProviderSettings = useCallback(() => {
+    setError('')
+    providerSettingsRepository.retry()
+  }, [providerSettingsRepository])
+  const retryCodexLogin = useCallback(() => {
+    if (currentCodexProvider) codexLoginRepository.retry(currentCodexProvider)
+  }, [codexLoginRepository, currentCodexProvider])
 
   if (projectIndex.status === 'loading') return <Splash />
 
@@ -1313,11 +1402,20 @@ function App() {
           onCreate={(model) => void createSession(sessionCreator.projectID, model)}
         />
       )}
-      {providerManager && (
+      {providerManagerOpen && (
         <ProviderManagerDialog
-          state={providerManager}
-          onDocument={(document) => setProviderManager((current) => current ? { ...current, document, loading: false } : current)}
-          onClose={() => setProviderManager(null)}
+          state={providerSettings}
+          codexLogin={currentCodexProvider ? codexLogin : null}
+          onProviderChange={(provider) => codexLoginProvider.set(provider)}
+          onSave={saveProvider}
+          onSetDefault={setProviderDefault}
+          onDiscoverModels={discoverProviderModels}
+          onStartCodexLogin={startCodexLogin}
+          onClearCodexLogin={clearCodexLogin}
+          onRefreshUsage={refreshCodexUsage}
+          onRetrySettings={retryProviderSettings}
+          onRetryCodexLogin={retryCodexLogin}
+          onClose={closeProviderManager}
           onError={(message) => setError(message)}
         />
       )}

@@ -5,7 +5,7 @@ import { CommandFacade } from './commandFacade'
 import type { BlobClient } from './blobClient'
 import type { RuntimeTransport } from './runtime'
 import type { TransportCloseEvent, TransportReadyEvent } from './transport'
-import { decodeProviderDiscoverResult } from './providerCommandCodec'
+import { decodeProviderDiscoverResult, encodeProviderTarget } from './providerCommandCodec'
 import { isProviderCreateName } from '../domain/providerIdentity'
 
 class ProviderCommandTransport implements RuntimeTransport {
@@ -46,17 +46,22 @@ class RecordingBlobClient {
 }
 
 const target = {
+  base_url_mode: 'replace' as const,
   base_url: 'https://例.example/v1',
   api_key: 'secret-do-not-echo',
   keep_api_key: false,
+  auth_file_mode: 'replace' as const,
   auth_file: '',
   request_timeout: '30s',
+  http_proxy_mode: 'replace' as const,
   http_proxy: '',
+  https_proxy_mode: 'replace' as const,
   https_proxy: '',
   max_concurrent_requests: 2,
   models: [{
     profile: '主 模型', id: 'model-主', type: '', compatibility: '', input: ['text'], developer_role: '',
     context_window: 1000, input_limit: 900, output_limit: 100,
+    parameters_mode: 'replace' as const,
     parameters: { temperature: 0.2, enabled: true, nested: { value: null } },
     reasoning_config: { parameter: 'reasoning_effort', default: 'medium', levels: { low: 'low', medium: 2, off: false, none: null } },
     pricing: null,
@@ -64,6 +69,12 @@ const target = {
 } as const
 
 describe('ProviderCommands', () => {
+  it('permits an empty safe endpoint only for an existing-provider preserve target', () => {
+    const encoded = encodeProviderTarget({ ...target, base_url: '', base_url_mode: 'preserve' })
+    expect(encoded.base_url).toBe('')
+    expect(() => encodeProviderTarget({ ...target, base_url: '', base_url_mode: 'replace' })).toThrow()
+  })
+
   it('submits a complete create target, strictly checks result identity, and only retries in the same epoch', async () => {
     const transport = new ProviderCommandTransport()
     const facade = new CommandFacade({ transport, operationIDGenerator: () => 'operation_provider_create', requestIDGenerator: () => 'request_provider_create' })
@@ -79,8 +90,8 @@ describe('ProviderCommands', () => {
     expect(transport.sent[1]).toEqual(command)
     const retry = transport.sent[1]
     if (retry.type !== 'command') throw new Error('wrong retry')
-    transport.emitResult(retry.payload.request_id, { operation_id: 'operation_provider_create', provider: 'created.provider', status: 'applied' }, 2)
-    await expect(pending).resolves.toEqual({ operation_id: 'operation_provider_create', provider: 'created.provider', status: 'applied' })
+    transport.emitResult(retry.payload.request_id, { operation_id: 'operation_provider_create', provider: 'created.provider', status: 'applied', changed: true }, 2)
+    await expect(pending).resolves.toEqual({ operation_id: 'operation_provider_create', provider: 'created.provider', status: 'applied', changed: true })
     facade.stop()
 
     const unsafeTransport = new ProviderCommandTransport()
@@ -133,8 +144,8 @@ describe('ProviderCommands', () => {
     const command = transport.sent[0]
     if (command.type !== 'command') throw new Error('wrong command')
     expect(command.payload.arguments).toMatchObject({ operation_id: 'operation_provider_reusable' })
-    transport.emitResult(command.payload.request_id, { operation_id: 'operation_provider_reusable', provider: 'provider-reusable', status: 'applied' })
-    await expect(pending).resolves.toEqual({ operation_id: 'operation_provider_reusable', provider: 'provider-reusable', status: 'applied' })
+    transport.emitResult(command.payload.request_id, { operation_id: 'operation_provider_reusable', provider: 'provider-reusable', status: 'applied', changed: true })
+    await expect(pending).resolves.toEqual({ operation_id: 'operation_provider_reusable', provider: 'provider-reusable', status: 'applied', changed: true })
     facade.stop()
   })
 
@@ -153,7 +164,7 @@ describe('ProviderCommands', () => {
     const mismatch = mismatchFacade.createProvider('provider-result', target, { operationID: 'operation_provider_result' })
     const mismatchCommand = mismatchTransport.sent[0]
     if (mismatchCommand.type !== 'command') throw new Error('wrong command')
-    mismatchTransport.emitResult(mismatchCommand.payload.request_id, { operation_id: 'operation_other', provider: 'provider-result', status: 'applied' })
+    mismatchTransport.emitResult(mismatchCommand.payload.request_id, { operation_id: 'operation_other', provider: 'provider-result', status: 'applied', changed: true })
     await expect(mismatch).rejects.toMatchObject({ code: 'invalid' })
     mismatchFacade.stop()
   })
@@ -167,8 +178,8 @@ describe('ProviderCommands', () => {
     if (command.type !== 'command') throw new Error('wrong command')
     expect(command.payload.name).toBe('provider.update')
     expect(command.payload.arguments).toMatchObject({ provider: '空 白 provider', api_key: 'secret-do-not-echo', models: [{ parameters: target.models[0].parameters }] })
-    transport.emitResult(command.payload.request_id, { provider: '空 白 provider', status: 'applied' })
-    await expect(pending).resolves.toEqual({ provider: '空 白 provider', status: 'applied' })
+    transport.emitResult(command.payload.request_id, { provider: '空 白 provider', status: 'applied', changed: false })
+    await expect(pending).resolves.toEqual({ provider: '空 白 provider', status: 'applied', changed: false })
     facade.stop()
   })
 

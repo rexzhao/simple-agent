@@ -44,32 +44,49 @@ type ProviderSettings struct {
 }
 
 type ProviderModelSettings struct {
-	Profile         string                 `json:"profile"`
-	ID              string                 `json:"id"`
-	Type            string                 `json:"type"`
-	Compatibility   string                 `json:"compatibility,omitempty"`
-	Input           []string               `json:"input,omitempty"`
-	DeveloperRole   string                 `json:"developer_role,omitempty"`
-	ContextWindow   int                    `json:"context_window,omitempty"`
-	InputLimit      int                    `json:"input_limit,omitempty"`
-	OutputLimit     int                    `json:"output_limit,omitempty"`
-	Parameters      map[string]any         `json:"parameters,omitempty"`
-	ReasoningConfig config.ReasoningConfig `json:"reasoning_config,omitempty"`
-	Pricing         *config.ModelPricing   `json:"pricing,omitempty"`
+	Profile                 string                 `json:"profile"`
+	ID                      string                 `json:"id"`
+	Type                    string                 `json:"type"`
+	Compatibility           string                 `json:"compatibility,omitempty"`
+	Input                   []string               `json:"input,omitempty"`
+	DeveloperRole           string                 `json:"developer_role,omitempty"`
+	ContextWindow           int                    `json:"context_window,omitempty"`
+	InputLimit              int                    `json:"input_limit,omitempty"`
+	OutputLimit             int                    `json:"output_limit,omitempty"`
+	ParametersMode          ProviderWriteMode      `json:"parameters_mode,omitempty"`
+	ParametersSourceProfile string                 `json:"parameters_source_profile,omitempty"`
+	Parameters              map[string]any         `json:"parameters,omitempty"`
+	ReasoningConfig         config.ReasoningConfig `json:"reasoning_config,omitempty"`
+	Pricing                 *config.ModelPricing   `json:"pricing,omitempty"`
 }
 
 type ProviderSettingsInput struct {
 	Name                  string                  `json:"name"`
 	BaseURL               string                  `json:"base_url"`
+	BaseURLMode           ProviderWriteMode       `json:"base_url_mode,omitempty"`
 	APIKey                string                  `json:"api_key,omitempty"`
 	KeepAPIKey            bool                    `json:"keep_api_key,omitempty"`
+	AuthFileMode          ProviderWriteMode       `json:"auth_file_mode,omitempty"`
 	AuthFile              string                  `json:"auth_file,omitempty"`
 	RequestTimeout        string                  `json:"request_timeout,omitempty"`
+	HTTPProxyMode         ProviderWriteMode       `json:"http_proxy_mode,omitempty"`
 	HTTPProxy             string                  `json:"http_proxy,omitempty"`
+	HTTPSProxyMode        ProviderWriteMode       `json:"https_proxy_mode,omitempty"`
 	HTTPSProxy            string                  `json:"https_proxy,omitempty"`
 	MaxConcurrentRequests int                     `json:"max_concurrent_requests,omitempty"`
 	Models                []ProviderModelSettings `json:"models"`
 }
+
+// ProviderWriteMode is a write intent, not a value from the safe resource.
+// Preserve retains durable fields intentionally absent from (or normalized
+// by) the resource projection. Replace is explicit and consumes a replacement
+// value from the command target.
+type ProviderWriteMode string
+
+const (
+	ProviderWritePreserve ProviderWriteMode = "preserve"
+	ProviderWriteReplace  ProviderWriteMode = "replace"
+)
 
 type CodexAuthStatus struct {
 	Status      string    `json:"status"`
@@ -122,100 +139,194 @@ func (s *Service) ProviderSettings() (ProviderSettingsDocument, error) {
 }
 
 func (s *Service) CreateProviderSettings(input ProviderSettingsInput) (ProviderSettingsDocument, error) {
-	return s.saveProviderSettings("", input)
+	document, _, err := s.saveProviderSettings("", input)
+	return document, err
 }
 
 func (s *Service) UpdateProviderSettings(providerName string, input ProviderSettingsInput) (ProviderSettingsDocument, error) {
-	return s.saveProviderSettings(providerName, input)
+	document, _, err := s.saveProviderSettings(providerName, input)
+	return document, err
 }
 
-func (s *Service) saveProviderSettings(existingName string, input ProviderSettingsInput) (ProviderSettingsDocument, error) {
+// ProviderSettingsWriteResult is the command acknowledgement's durable
+// target-state fact. It is not a document projection and contains no secret
+// or opaque configuration.
+type ProviderSettingsWriteResult struct {
+	Document ProviderSettingsDocument
+	Changed  bool
+}
+
+func (s *Service) CreateProviderSettingsWithResult(input ProviderSettingsInput) (ProviderSettingsWriteResult, error) {
+	document, changed, err := s.saveProviderSettings("", input)
+	return ProviderSettingsWriteResult{Document: document, Changed: changed}, err
+}
+
+func (s *Service) UpdateProviderSettingsWithResult(providerName string, input ProviderSettingsInput) (ProviderSettingsWriteResult, error) {
+	document, changed, err := s.saveProviderSettings(providerName, input)
+	return ProviderSettingsWriteResult{Document: document, Changed: changed}, err
+}
+
+func (s *Service) saveProviderSettings(existingName string, input ProviderSettingsInput) (ProviderSettingsDocument, bool, error) {
 	s.providerConfigMu.Lock()
 	defer s.providerConfigMu.Unlock()
 
 	configPath := s.ConfigPath()
 	base, err := config.LoadBase(configPath)
 	if err != nil {
-		return ProviderSettingsDocument{}, err
+		return ProviderSettingsDocument{}, false, err
 	}
 	name := input.Name
 	if err := config.ValidateProviderName(name); err != nil {
-		return ProviderSettingsDocument{}, fmt.Errorf("provider name: %w", err)
+		return ProviderSettingsDocument{}, false, fmt.Errorf("provider name: %w", err)
 	}
 	if existingName != "" {
 		if err := config.ValidateProviderName(existingName); err != nil {
-			return ProviderSettingsDocument{}, fmt.Errorf("existing provider name: %w", err)
+			return ProviderSettingsDocument{}, false, fmt.Errorf("existing provider name: %w", err)
 		}
 	} else if err := validateProviderSettingsCreateFilename(name); err != nil {
-		return ProviderSettingsDocument{}, err
+		return ProviderSettingsDocument{}, false, err
 	}
 	if existingName != "" && existingName != name {
-		return ProviderSettingsDocument{}, fmt.Errorf("provider name cannot be changed; create a new provider instead")
+		return ProviderSettingsDocument{}, false, fmt.Errorf("provider name cannot be changed; create a new provider instead")
 	}
 	files, err := rawProviderFiles(base.ProviderDir)
 	if err != nil {
-		return ProviderSettingsDocument{}, err
+		return ProviderSettingsDocument{}, false, err
 	}
 	existing, exists := files[name]
 	if existingName == "" && exists {
-		return ProviderSettingsDocument{}, fmt.Errorf("provider %q already exists", name)
+		return ProviderSettingsDocument{}, false, fmt.Errorf("provider %q already exists", name)
 	}
 	if existingName != "" && !exists {
-		return ProviderSettingsDocument{}, fmt.Errorf("provider %q not found", name)
+		return ProviderSettingsDocument{}, false, fmt.Errorf("provider %q not found", name)
 	}
 	if len(input.Models) == 0 {
-		return ProviderSettingsDocument{}, fmt.Errorf("provider must contain at least one model")
+		return ProviderSettingsDocument{}, false, fmt.Errorf("provider must contain at least one model")
 	}
 	if strings.TrimSpace(input.BaseURL) == "" {
-		return ProviderSettingsDocument{}, fmt.Errorf("provider base_url is required")
+		if input.BaseURLMode != ProviderWritePreserve || !exists || strings.TrimSpace(existing.Provider.BaseURL) == "" {
+			return ProviderSettingsDocument{}, false, fmt.Errorf("provider base_url is required")
+		}
+	}
+	if err := validateProviderWriteMode(input.BaseURLMode, "base_url_mode"); err != nil {
+		return ProviderSettingsDocument{}, false, err
+	}
+	if err := validateProviderWriteMode(input.AuthFileMode, "auth_file_mode"); err != nil {
+		return ProviderSettingsDocument{}, false, err
+	}
+	if err := validateProviderWriteMode(input.HTTPProxyMode, "http_proxy_mode"); err != nil {
+		return ProviderSettingsDocument{}, false, err
+	}
+	if err := validateProviderWriteMode(input.HTTPSProxyMode, "https_proxy_mode"); err != nil {
+		return ProviderSettingsDocument{}, false, err
+	}
+	if !exists && (input.BaseURLMode == ProviderWritePreserve || input.AuthFileMode == ProviderWritePreserve || input.HTTPProxyMode == ProviderWritePreserve || input.HTTPSProxyMode == ProviderWritePreserve) {
+		return ProviderSettingsDocument{}, false, fmt.Errorf("preserve mode is only valid for an existing provider")
 	}
 	apiKey := strings.TrimSpace(input.APIKey)
 	if input.KeepAPIKey && exists {
 		apiKey = existing.Provider.APIKey
 	}
 	authFile := strings.TrimSpace(input.AuthFile)
-	if authFile == "" && exists {
+	if input.AuthFileMode == ProviderWritePreserve && exists {
 		authFile = existing.Provider.AuthFile
+	} else if authFile == "" && exists && input.AuthFileMode == "" {
+		authFile = existing.Provider.AuthFile
+	}
+	if input.AuthFileMode == ProviderWriteReplace && authFile != "" && !filepath.IsAbs(authFile) {
+		// The safe resource displays auth_file relative to auth_dir. Typed F5
+		// replacements use that same visible coordinate system, then convert it
+		// back to the provider-file coordinate system before persistence.
+		resolvedAuth := filepath.Join(base.AuthDir, filepath.FromSlash(authFile))
+		relative, relativeErr := filepath.Rel(base.ProviderDir, resolvedAuth)
+		if relativeErr != nil {
+			return ProviderSettingsDocument{}, false, fmt.Errorf("resolve auth_file path: %w", relativeErr)
+		}
+		authFile = filepath.ToSlash(relative)
+	}
+	baseURL := strings.TrimSpace(input.BaseURL)
+	if input.BaseURLMode == ProviderWritePreserve && exists {
+		baseURL = existing.Provider.BaseURL
+	}
+	httpProxy := strings.TrimSpace(input.HTTPProxy)
+	if input.HTTPProxyMode == ProviderWritePreserve && exists {
+		httpProxy = existing.Provider.HTTPProxy
+	}
+	httpsProxy := strings.TrimSpace(input.HTTPSProxy)
+	if input.HTTPSProxyMode == ProviderWritePreserve && exists {
+		httpsProxy = existing.Provider.HTTPSProxy
 	}
 	provider := config.ProviderConfig{
 		Name:                  name,
-		BaseURL:               strings.TrimSpace(input.BaseURL),
+		BaseURL:               baseURL,
 		APIKey:                apiKey,
 		AuthFile:              authFile,
 		RequestTimeout:        strings.TrimSpace(input.RequestTimeout),
-		HTTPProxy:             strings.TrimSpace(input.HTTPProxy),
-		HTTPSProxy:            strings.TrimSpace(input.HTTPSProxy),
+		HTTPProxy:             httpProxy,
+		HTTPSProxy:            httpsProxy,
 		MaxConcurrentRequests: input.MaxConcurrentRequests,
 		Models:                make(map[string]config.ModelProfile, len(input.Models)),
 	}
 	usesCodex := false
+	preservedProfiles := make(map[string]struct{})
 	for _, model := range input.Models {
 		profile := strings.TrimSpace(model.Profile)
 		if profile == "" {
-			return ProviderSettingsDocument{}, fmt.Errorf("model profile name is required")
+			return ProviderSettingsDocument{}, false, fmt.Errorf("model profile name is required")
 		}
 		if _, duplicate := provider.Models[profile]; duplicate {
-			return ProviderSettingsDocument{}, fmt.Errorf("duplicate model profile %q", profile)
+			return ProviderSettingsDocument{}, false, fmt.Errorf("duplicate model profile %q", profile)
+		}
+		parameters := copyParameterMap(model.Parameters)
+		parametersMode := model.ParametersMode
+		if parametersMode == "" {
+			// The compatibility REST DTO predates write intents. Its historical
+			// meaning was a complete replacement, while typed F5 commands always
+			// send an explicit mode.
+			parametersMode = ProviderWriteReplace
+		}
+		if err := validateProviderWriteMode(parametersMode, "parameters_mode"); err != nil {
+			return ProviderSettingsDocument{}, false, fmt.Errorf("model profile %q: %w", profile, err)
+		}
+		if parametersMode == ProviderWritePreserve {
+			if !exists {
+				return ProviderSettingsDocument{}, false, fmt.Errorf("model profile %q cannot preserve parameters for a new provider", profile)
+			}
+			sourceProfile := strings.TrimSpace(model.ParametersSourceProfile)
+			if sourceProfile == "" {
+				sourceProfile = profile
+			}
+			if _, duplicate := preservedProfiles[sourceProfile]; duplicate {
+				return ProviderSettingsDocument{}, false, fmt.Errorf("model parameter preserve identity is duplicated")
+			}
+			preservedProfiles[sourceProfile] = struct{}{}
+			source, ok := existing.Provider.Models[sourceProfile]
+			if !ok {
+				return ProviderSettingsDocument{}, false, fmt.Errorf("model parameter preserve identity is no longer available")
+			}
+			parameters = copyParameterMap(source.Parameters)
+		} else if model.ParametersSourceProfile != "" {
+			return ProviderSettingsDocument{}, false, fmt.Errorf("model parameter preserve identity is invalid")
 		}
 		modelType := strings.TrimSpace(model.Type)
 		usesCodex = usesCodex || modelType == config.ProviderTypeOpenAICodex
 		compatibility, err := config.NormalizeModelCompatibility(model.Compatibility)
 		if err != nil {
-			return ProviderSettingsDocument{}, fmt.Errorf("model profile %q: %w", profile, err)
+			return ProviderSettingsDocument{}, false, fmt.Errorf("model profile %q: %w", profile, err)
 		}
 		if compatibility != "" && modelType != "" && modelType != config.ProviderTypeOpenAIChat {
-			return ProviderSettingsDocument{}, fmt.Errorf("model profile %q: compatibility is only supported for %s models", profile, config.ProviderTypeOpenAIChat)
+			return ProviderSettingsDocument{}, false, fmt.Errorf("model profile %q: compatibility is only supported for %s models", profile, config.ProviderTypeOpenAIChat)
 		}
 		modelInput := append([]string(nil), model.Input...)
 		if len(modelInput) > 0 {
 			modelInput, err = config.NormalizeModelInput(modelInput)
 			if err != nil {
-				return ProviderSettingsDocument{}, fmt.Errorf("model profile %q: %w", profile, err)
+				return ProviderSettingsDocument{}, false, fmt.Errorf("model profile %q: %w", profile, err)
 			}
 		}
 		developerRole, err := config.NormalizeDeveloperRole(model.DeveloperRole)
 		if err != nil {
-			return ProviderSettingsDocument{}, fmt.Errorf("model profile %q: %w", profile, err)
+			return ProviderSettingsDocument{}, false, fmt.Errorf("model profile %q: %w", profile, err)
 		}
 		modelProfile := config.ModelProfile{
 			ID:              strings.TrimSpace(model.ID),
@@ -226,13 +337,13 @@ func (s *Service) saveProviderSettings(existingName string, input ProviderSettin
 			ContextWindow:   model.ContextWindow,
 			InputLimit:      model.InputLimit,
 			OutputLimit:     model.OutputLimit,
-			Parameters:      copyParameterMap(model.Parameters),
+			Parameters:      parameters,
 			ReasoningConfig: model.ReasoningConfig,
 			Pricing:         copyModelPricing(model.Pricing),
 		}
 		if modelProfile.Pricing != nil {
 			if err := modelProfile.Pricing.Validate(); err != nil {
-				return ProviderSettingsDocument{}, fmt.Errorf("model profile %q: %w", profile, err)
+				return ProviderSettingsDocument{}, false, fmt.Errorf("model profile %q: %w", profile, err)
 			}
 			if strings.TrimSpace(modelProfile.Pricing.Currency) == "" {
 				modelProfile.Pricing.Currency = "USD"
@@ -255,7 +366,7 @@ func (s *Service) saveProviderSettings(existingName string, input ProviderSettin
 		authPath := filepath.Join(base.AuthDir, name+".json")
 		relative, err := filepath.Rel(base.ProviderDir, authPath)
 		if err != nil {
-			return ProviderSettingsDocument{}, fmt.Errorf("resolve provider auth path: %w", err)
+			return ProviderSettingsDocument{}, false, fmt.Errorf("resolve provider auth path: %w", err)
 		}
 		provider.AuthFile = filepath.ToSlash(relative)
 	}
@@ -266,7 +377,7 @@ func (s *Service) saveProviderSettings(existingName string, input ProviderSettin
 		}
 		authRoot := base.AuthDir
 		if !isSameOrAncestorProjectPath(authRoot, resolvedAuth) {
-			return ProviderSettingsDocument{}, fmt.Errorf("auth_file must stay inside %q", authRoot)
+			return ProviderSettingsDocument{}, false, fmt.Errorf("auth_file must stay inside %q", authRoot)
 		}
 	}
 	// This is a target-state operation, not a write-intent operation. A
@@ -275,14 +386,15 @@ func (s *Service) saveProviderSettings(existingName string, input ProviderSettin
 	// durable provider already equals the requested target. The comparison is
 	// confined to this execution boundary and never serializes credentials.
 	if exists && providerConfigsEqual(existing.Provider, provider) {
-		return s.ProviderSettings()
+		document, readErr := s.ProviderSettings()
+		return document, false, readErr
 	}
 	path := filepath.Join(base.ProviderDir, name+".yaml")
 	if exists {
 		path = existing.Path
 	}
 	if err := config.WriteProviderConfig(path, provider); err != nil {
-		return ProviderSettingsDocument{}, err
+		return ProviderSettingsDocument{}, false, err
 	}
 	document, readErr := s.ProviderSettings()
 	// The provider file is durable at this point. Publish only the typed
@@ -290,8 +402,16 @@ func (s *Service) saveProviderSettings(existingName string, input ProviderSettin
 	// same config authority and never receives this write DTO.
 	s.publishProviderSettingsChange(providersettings.CommittedChange{
 		Kind: providersettings.CommittedProviderUpsert, ProviderName: name,
+		PublicationExpected: true,
 	})
-	return document, readErr
+	return document, true, readErr
+}
+
+func validateProviderWriteMode(mode ProviderWriteMode, field string) error {
+	if mode == "" || mode == ProviderWritePreserve || mode == ProviderWriteReplace {
+		return nil
+	}
+	return fmt.Errorf("%s is invalid", field)
 }
 
 func (s *Service) UpdateDefaultProviderModel(providerName, modelProfile string) (ProviderSettingsDocument, error) {

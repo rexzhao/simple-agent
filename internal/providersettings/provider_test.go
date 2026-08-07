@@ -293,6 +293,51 @@ models:
 		t.Fatalf("no-op resume = %#v", current.Decision)
 	}
 
+	// A typed replacement can intentionally change only a hidden durable field.
+	// It must still advance the authority revision, but the same-safe-value
+	// upsert must not put that field on the wire.
+	writeProviderFixture(t, fixture.root, "alpha", `name: alpha
+base_url: https://example.test/v1
+api_key: api-key-secret
+models:
+  fast:
+    id: alpha-fast
+    parameters:
+      hidden: replacement-secret
+  slow:
+    id: alpha-slow
+`)
+	if err := provider.PublishCommitted(CommittedChange{Kind: CommittedProviderUpsert, ProviderName: "alpha", PublicationExpected: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := provider.Flush(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	forced := <-opened.Changes
+	if forced.Sequence != 2 || forced.Change.ResourceRevision != "2" || len(forced.Change.Operations) != 1 || forced.Change.Operations[0].Op != OperationUpsertDefault {
+		t.Fatalf("forced hidden-field publication = %#v", forced)
+	}
+	if bytes.Contains(forced.Change.Operations[0].Raw, []byte("replacement-secret")) {
+		t.Fatal("forced hidden-field publication leaked the replacement")
+	}
+	// A cross-epoch target replay is reported by execution as unchanged. Even
+	// though the command used an explicit replacement mode, the projector must
+	// not manufacture a second resource publication.
+	if err := provider.PublishCommitted(CommittedChange{Kind: CommittedProviderUpsert, ProviderName: "alpha"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := provider.Flush(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	current, err = provider.Open(context.Background(), protocol.ResourceKey{Type: protocol.ResourceTypeProviderSettings, ID: ResourceID}, &protocol.ResumeToken{StreamEpoch: opened.StreamEpoch, Sequence: "2"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer current.Close()
+	if current.Sequence != 2 || current.Decision.Action != syncengine.SyncActionCurrent {
+		t.Fatalf("hidden replacement replay changed authority = %#v", current.Decision)
+	}
+
 	data, err := os.ReadFile(fixture.configPath)
 	if err != nil {
 		t.Fatal(err)

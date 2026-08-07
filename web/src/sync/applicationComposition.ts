@@ -119,8 +119,8 @@ export function createSyncApplication(options: SyncApplicationOptions = {}): Syn
         }),
       retry: (sessionID) => runtime.retry({ type: 'session_content', id: sessionID }),
     }),
-    providerSettings: new ProviderSettingsStore(replica),
-    codexLogin: new CodexLoginStore(replica),
+    providerSettings: new ProviderSettingsStore(replica, () => runtime.retry({ type: 'provider_settings', id: 'server' })),
+    codexLogin: new CodexLoginStore(replica, (provider) => runtime.retry({ type: 'codex_login', id: provider })),
   }
   const repositories: SyncApplicationRepositories = {
     projectIndex: new DomainProjectIndexRepository(stores.projectIndex),

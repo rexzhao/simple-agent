@@ -7,5 +7,7 @@ describe('domain-facing Provider Settings repository', () => {
     expect(source).not.toMatch(/from ['"][^'"]*(?:sync|protocol|transport|blob|lifecycle)/)
     expect(source).not.toMatch(/\b(?:ResourceKey|Sequence|BlobDescriptor|WebSocketTransport|SyncRuntime|SyncReadError)\b/)
     expect(source).not.toMatch(/\b(?:subscription_id|stream_epoch|resource_revision|raw wire)\b/)
+    expect(source).not.toContain('ProviderSettingsAuthorityReference')
+    expect(source).not.toContain('providerRevisions')
   })
 })

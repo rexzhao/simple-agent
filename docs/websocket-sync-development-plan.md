@@ -1125,6 +1125,17 @@ codex_login.start/clear
 - 删除轮询/重连 bootstrap 对账逻辑；
 - 所有页面改用 resource hooks；
 - 所有 mutation 改用 command client；
+- Provider complete-target command 对 safe projection 使用显式 write intent：现有
+  model parameters、URL user-info/query/fragment 和归一化 auth/proxy 路径默认
+  `preserve`，只有用户明确替换才发送 `replace` 值；这些字段不得进入 resource、snapshot
+  或 Blob。WebSocket provider target 必须显式携带各 endpoint/model 的 write mode；
+  缺少 mode 的旧形态不会进入 typed command execution。对于只改变隐藏 durable 字段的
+  `replace`，projection provider 发出不含隐藏值的 same-safe-value upsert，以便 authority
+  publication 仍可被可靠观察。provider create/update acknowledgement 带有 execution 计算的
+  `changed` 布尔值：`changed=false` 是 target-state no-op，`changed=true` 才等待该 provider
+  的 authority publication。barrier 使用包含 stream epoch/generation 的 opaque observation token，
+  而不是把 resource revision 暴露给页面或在浏览器重演 Go URL canonicalization；retry fingerprint
+  必须区分 preserve/replace。
 - 错误、loading、resync、offline UI 统一；
 - 清理旧 `api.ts` 中除 bootstrap/ticket/blob 外的路径。
 

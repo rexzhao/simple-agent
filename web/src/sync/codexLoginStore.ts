@@ -12,10 +12,15 @@ interface CachedModel {
 }
 
 function domainError(error: SyncReadError | undefined): CodexLoginReadError | undefined {
-  return error ? { code: error.code, message: error.message } : undefined
+  return error ? { code: 'unavailable', message: 'Codex login status is temporarily unavailable' } : undefined
 }
 
 function domainLogin(value: CodexLoginData): CodexLoginDomain {
+  const error = value.status === 'error'
+    ? { code: 'sign_in_failed', message: 'Codex sign-in failed.' }
+    : value.status === 'expired'
+      ? { code: 'session_expired', message: 'Codex sign-in has expired.' }
+      : { code: '', message: '' }
   return {
     provider: value.provider,
     status: value.status,
@@ -23,8 +28,8 @@ function domainLogin(value: CodexLoginData): CodexLoginDomain {
     userCode: value.userCode,
     verificationURL: value.verificationURL,
     refreshable: value.refreshable,
-    errorCode: value.errorCode,
-    errorMessage: value.errorMessage,
+    errorCode: error.code,
+    errorMessage: error.message,
   }
 }
 
@@ -36,7 +41,7 @@ export class CodexLoginStore implements CodexLoginSource {
   private readonly listeners = new Set<() => void>()
   private readonly unsubscribeReplica: () => void
 
-  constructor(replica = new LocalReplica()) {
+  constructor(replica = new LocalReplica(), private readonly retryResource?: (provider: string) => void) {
     this.replica = replica
     this.unsubscribeReplica = replica.subscribe((changed) => {
       if (changed.type !== 'codex_login') return
@@ -81,5 +86,6 @@ export class CodexLoginStore implements CodexLoginSource {
   }
 
   hasSnapshot(provider: string): boolean { return this.replica.get({ type: 'codex_login' as const, id: provider }).initialized }
+  retry(provider: string): void { this.retryResource?.(provider) }
   resourceKey(provider: string): string { return resourceKeyString({ type: 'codex_login' as const, id: provider }) }
 }

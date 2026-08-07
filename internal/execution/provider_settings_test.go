@@ -2,6 +2,7 @@ package execution
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -109,6 +110,57 @@ func TestServiceProviderSettingsLifecycleAndModelDiscovery(t *testing.T) {
 	}
 }
 
+func TestServiceProviderSettingsWriteIntentsPreserveOpaqueFields(t *testing.T) {
+	service := newProviderSettingsTestService(t)
+	originalParameters := map[string]any{"responses": map[string]any{"temperature": 0.2}, "opaque": "must-survive"}
+	if _, err := service.CreateProviderSettings(ProviderSettingsInput{
+		Name: "opaque", BaseURL: "https://user:password@example.test/v1?token=old#fragment", APIKey: "keep-me",
+		AuthFile: "../auth/opaque.json", HTTPProxy: "http://proxy-user:proxy-pass@proxy.example.test:8080?token=old",
+		Models: []ProviderModelSettings{{Profile: "primary", ID: "model", Parameters: originalParameters}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// A safe projection is a write intent, not a complete durable document.
+	if _, err := service.UpdateProviderSettings("opaque", ProviderSettingsInput{
+		Name: "opaque", BaseURL: "https://example.test/v1", BaseURLMode: ProviderWritePreserve,
+		KeepAPIKey: true, AuthFile: "opaque.json", AuthFileMode: ProviderWritePreserve,
+		HTTPProxy: "http://proxy.example.test:8080", HTTPProxyMode: ProviderWritePreserve,
+		HTTPSProxyMode: ProviderWritePreserve, RequestTimeout: "45s",
+		Models: []ProviderModelSettings{{Profile: "primary", ID: "model", ParametersMode: ProviderWritePreserve, ParametersSourceProfile: "primary"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(service.ConfigPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	updated := cfg.Providers["opaque"]
+	if updated.BaseURL != "https://user:password@example.test/v1?token=old#fragment" || updated.HTTPProxy != "http://proxy-user:proxy-pass@proxy.example.test:8080?token=old" || updated.AuthFile != filepath.Join(service.ServerRoot(), "auth", "opaque.json") {
+		t.Fatalf("preserve update changed opaque provider fields: %#v", updated)
+	}
+	if !reflect.DeepEqual(updated.Models["primary"].Parameters, originalParameters) || updated.RequestTimeout != "45s" {
+		t.Fatalf("preserve update parameters/timeout = %#v, want parameters retained and timeout changed", updated)
+	}
+
+	if _, err := service.UpdateProviderSettings("opaque", ProviderSettingsInput{
+		Name: "opaque", BaseURL: "https://new.example.test/v2", BaseURLMode: ProviderWriteReplace,
+		KeepAPIKey: true, AuthFile: "opaque.json", AuthFileMode: ProviderWritePreserve,
+		HTTPProxy: "", HTTPProxyMode: ProviderWriteReplace, HTTPSProxy: "", HTTPSProxyMode: ProviderWriteReplace,
+		RequestTimeout: "45s", Models: []ProviderModelSettings{{Profile: "primary", ID: "model", ParametersMode: ProviderWriteReplace, Parameters: map[string]any{"replacement": true}}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err = config.Load(service.ConfigPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	replaced := cfg.Providers["opaque"]
+	if replaced.BaseURL != "https://new.example.test/v2" || replaced.HTTPProxy != "" || !reflect.DeepEqual(replaced.Models["primary"].Parameters, map[string]any{"replacement": true}) {
+		t.Fatalf("replace update = %#v, want explicit endpoint/parameter replacement", replaced)
+	}
+}
+
 type providerSettingsRecordingSink struct {
 	changes []providersettings.CommittedChange
 }
@@ -154,6 +206,39 @@ func TestServiceProviderSettingsPublishesTypedPostCommitChanges(t *testing.T) {
 	}
 	if len(sink.changes) != 2 {
 		t.Fatalf("identical default update publication = %#v, want no additional change", sink.changes)
+	}
+}
+
+func TestServiceProviderSettingsChangedAcknowledgementTracksHiddenKeyReplacement(t *testing.T) {
+	service := newProviderSettingsTestService(t)
+	sink := &providerSettingsRecordingSink{}
+	registration := service.RegisterProviderSettingsChangeSink(sink)
+	defer registration.Unregister()
+	created, err := service.CreateProviderSettingsWithResult(ProviderSettingsInput{
+		Name: "key-authority", BaseURL: "https://example.test/v1", APIKey: "old-secret",
+		Models: []ProviderModelSettings{{Profile: "main", ID: "model"}},
+	})
+	if err != nil || !created.Changed || len(sink.changes) != 1 {
+		t.Fatalf("create result = %#v, changes = %#v, err = %v", created, sink.changes, err)
+	}
+	target := ProviderSettingsInput{Name: "key-authority", BaseURL: "https://example.test/v1", APIKey: "new-secret", Models: []ProviderModelSettings{{Profile: "main", ID: "model"}}}
+	replaced, err := service.UpdateProviderSettingsWithResult("key-authority", target)
+	if err != nil || !replaced.Changed || len(sink.changes) != 2 || !sink.changes[1].PublicationExpected {
+		t.Fatalf("replacement result = %#v, changes = %#v, err = %v", replaced, sink.changes, err)
+	}
+	encoded, marshalErr := json.Marshal(sink.changes)
+	if marshalErr != nil || strings.Contains(string(encoded), "old-secret") || strings.Contains(string(encoded), "new-secret") {
+		t.Fatalf("typed publication leaked API key: %s", encoded)
+	}
+	noOp, err := service.UpdateProviderSettingsWithResult("key-authority", target)
+	if err != nil || noOp.Changed || len(sink.changes) != 2 {
+		t.Fatalf("same replacement retry = %#v, changes = %#v, err = %v", noOp, sink.changes, err)
+	}
+	cleared, err := service.UpdateProviderSettingsWithResult("key-authority", ProviderSettingsInput{
+		Name: "key-authority", BaseURL: "https://example.test/v1", Models: []ProviderModelSettings{{Profile: "main", ID: "model"}},
+	})
+	if err != nil || !cleared.Changed || len(sink.changes) != 3 {
+		t.Fatalf("clear result = %#v, changes = %#v, err = %v", cleared, sink.changes, err)
 	}
 }
 

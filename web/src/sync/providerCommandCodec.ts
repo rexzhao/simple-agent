@@ -18,7 +18,8 @@ const maxProviderModels = 4096
 const maxProviderModelBytes = 4096
 const maxProviderResultBytes = 8 * 1024 * 1024
 const allowedTargetKeys = ['base_url', 'api_key', 'keep_api_key', 'auth_file', 'request_timeout', 'http_proxy', 'https_proxy', 'max_concurrent_requests', 'models'] as const
-const allowedModelKeys = ['profile', 'id', 'type', 'compatibility', 'input', 'developer_role', 'context_window', 'input_limit', 'output_limit', 'parameters', 'reasoning_config', 'pricing'] as const
+const allowedTargetWriteModeKeys = ['base_url_mode', 'auth_file_mode', 'http_proxy_mode', 'https_proxy_mode'] as const
+const allowedModelKeys = ['profile', 'id', 'type', 'compatibility', 'input', 'developer_role', 'context_window', 'input_limit', 'output_limit', 'parameters_mode', 'parameters_source_profile', 'parameters', 'reasoning_config', 'pricing'] as const
 const allowedReasoningKeys = ['parameter', 'default', 'levels'] as const
 const allowedPricingKeys = ['input_cache_hit', 'input_cache_miss', 'cache_write', 'output', 'currency', 'long_context_threshold', 'long_context'] as const
 const allowedPricingTierKeys = ['input_cache_hit', 'input_cache_miss', 'cache_write', 'output'] as const
@@ -53,6 +54,11 @@ function canonicalConfigString(value: unknown, allowEmpty = true): string {
   const result = requiredString(value, allowEmpty)
   if (result !== result.trim()) throw new Error('provider command string has ambiguous whitespace')
   return result
+}
+
+function writeMode(value: unknown): 'preserve' | 'replace' {
+  if (value !== 'preserve' && value !== 'replace') throw new Error('provider write mode is invalid')
+  return value
 }
 
 function boundedInteger(value: unknown, allowZero = true): number {
@@ -165,8 +171,15 @@ function encodeModel(value: unknown): JsonObject {
     if (modality !== '' && modality !== modality.toLowerCase()) throw new Error('provider model input is not canonical')
     return modality
   })
-  const parameters = source.parameters === undefined ? {} : source.parameters
-  if (!isRecord(parameters)) throw new Error('provider model parameters are invalid')
+  const parametersMode = writeMode(source.parameters_mode)
+  const hasParameters = hasOwn(source, 'parameters')
+  if (parametersMode === 'preserve' && hasParameters) throw new Error('preserved provider model parameters must not be sent')
+  if (parametersMode === 'replace' && !hasParameters) throw new Error('replacement provider model parameters are required')
+  const parameters = hasParameters ? source.parameters : undefined
+  if (parametersMode === 'replace' && !isRecord(parameters)) throw new Error('provider model parameters are invalid')
+  const sourceProfile = hasOwn(source, 'parameters_source_profile') ? canonicalConfigString(source.parameters_source_profile, false) : ''
+  if (parametersMode === 'preserve' && sourceProfile === '') throw new Error('preserved provider model identity is required')
+  if (parametersMode === 'replace' && sourceProfile !== '') throw new Error('replacement provider model identity is invalid')
   const type = canonicalConfigString(optionalString(source, 'type'))
   const compatibility = canonicalConfigString(optionalString(source, 'compatibility'))
   const developerRole = canonicalConfigString(optionalString(source, 'developer_role'))
@@ -182,7 +195,8 @@ function encodeModel(value: unknown): JsonObject {
     context_window: optionalInteger(source, 'context_window'),
     input_limit: optionalInteger(source, 'input_limit'),
     output_limit: optionalInteger(source, 'output_limit'),
-    parameters: parameters as JsonObject,
+    parameters_mode: parametersMode,
+    ...(parametersMode === 'preserve' ? { parameters_source_profile: sourceProfile } : { parameters: parameters as JsonObject }),
     reasoning_config: encodeReasoning(source.reasoning_config),
     pricing: encodePricing(source.pricing),
   }
@@ -194,18 +208,28 @@ export function validateProviderCommandJSON(value: unknown): void {
 
 /** Encodes and validates the complete target before the facade submits it. */
 export function encodeProviderTarget(target: ProviderUpdateTarget): JsonObject {
-  const source = knownObject(target, allowedTargetKeys)
+  const source = knownObject(target, [...allowedTargetKeys, ...allowedTargetWriteModeKeys])
   const modelsValue = source.models
   if (!Array.isArray(modelsValue) || modelsValue.length === 0 || modelsValue.length > maxProviderModels) throw new Error('provider model target list is invalid')
-  const baseURL = canonicalConfigString(source.base_url, false)
-  if (baseURL.trim() === '') throw new Error('provider base URL is invalid')
+  const baseURLMode = writeMode(source.base_url_mode)
+  // A preserve target intentionally carries no visible endpoint value. Only
+  // an explicit replacement requires a non-empty safe endpoint.
+  const baseURL = canonicalConfigString(source.base_url, baseURLMode === 'preserve')
+  if (baseURL.trim() === '' && baseURLMode === 'replace') throw new Error('provider base URL is invalid')
+  const authFileMode = writeMode(source.auth_file_mode)
+  const httpProxyMode = writeMode(source.http_proxy_mode)
+  const httpsProxyMode = writeMode(source.https_proxy_mode)
   const result: JsonObject = {
     base_url: baseURL,
+    base_url_mode: baseURLMode,
     api_key: canonicalConfigString(optionalString(source, 'api_key')),
     keep_api_key: hasOwn(source, 'keep_api_key') ? source.keep_api_key as boolean : false,
+    auth_file_mode: authFileMode,
     auth_file: canonicalConfigString(optionalString(source, 'auth_file')),
     request_timeout: canonicalConfigString(optionalString(source, 'request_timeout')),
+    http_proxy_mode: httpProxyMode,
     http_proxy: canonicalConfigString(optionalString(source, 'http_proxy')),
+    https_proxy_mode: httpsProxyMode,
     https_proxy: canonicalConfigString(optionalString(source, 'https_proxy')),
     max_concurrent_requests: optionalInteger(source, 'max_concurrent_requests'),
     models: modelsValue.map(encodeModel),

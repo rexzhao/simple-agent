@@ -1,5 +1,5 @@
 import { LocalReplica, resourceKeyString } from './localReplica'
-import type { ProviderSettingsData, ProviderSettingsEntity, ProviderModelSettings } from './providerSettingsAdapter'
+import type { ProviderSettingsData, ProviderSettingsEntity, ProviderModelSettings, ProviderAuthorityIdentity } from './providerSettingsAdapter'
 import { SyncReadError } from './errors'
 import type {
   DomainReadError,
@@ -24,7 +24,7 @@ interface CachedModel {
 }
 
 function domainError(error: SyncReadError | undefined): DomainReadError | undefined {
-  return error ? { code: error.code, message: error.message } : undefined
+  return error ? { code: 'unavailable', message: 'Provider settings are temporarily unavailable' } : undefined
 }
 
 function domainModel(value: ProviderModelSettings): ProviderModelDomain {
@@ -83,7 +83,7 @@ export class ProviderSettingsStore implements ProviderSettingsSource {
   private readonly listeners = new Set<() => void>()
   private readonly unsubscribeReplica: () => void
 
-  constructor(replica = new LocalReplica()) {
+  constructor(replica = new LocalReplica(), private readonly retryResource?: () => void) {
     this.replica = replica
     this.unsubscribeReplica = replica.subscribe((changed) => {
       if (changed.type !== resource.type || changed.id !== resource.id) return
@@ -129,6 +129,17 @@ export class ProviderSettingsStore implements ProviderSettingsSource {
   }
 
   getModel(providerName: string, profile: string): ProviderModelDomain | undefined { return this.getProvider(providerName)?.models.find((model) => model.profile === profile) }
+  retry(): void { this.retryResource?.() }
   hasSnapshot(): boolean { return this.replica.get(resource).initialized }
   resourceKey(): string { return resourceKeyString(resource) }
+  getAuthorityToken(): unknown {
+    const record = this.replica.get<ProviderSettingsData>(resource)
+    const data = record.value
+    const authority = data?.authorityRevision
+    const providers: Record<string, ProviderAuthorityIdentity> = Object.create(null) as Record<string, ProviderAuthorityIdentity>
+    for (const [name, token] of Object.entries(data?.providerAuthorityRevisions ?? {})) providers[name] = token
+    // Keep the sync identity opaque to the application/domain layer. A fresh
+    // object also prevents callers from mutating the store's local map.
+    return authority ? { epoch: authority.epoch, generation: authority.generation, revision: authority.revision, providers } : undefined
+  }
 }

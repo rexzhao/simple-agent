@@ -74,6 +74,24 @@ export interface ProviderSettingsSource {
   getSnapshot(): ProviderSettingsReadModel
   getProvider(name: string): ProviderSettingsDomain | undefined
   getModel(providerName: string, profile: string): ProviderModelDomain | undefined
+  retry?(): void
+  /** Opaque application observation identity; its shape belongs to sync. */
+  getAuthorityToken?(): unknown
+}
+
+export interface ProviderSettingsObservationOptions {
+  readonly signal?: AbortSignal
+  readonly timeoutMS?: number
+}
+
+export class ProviderSettingsObservationError extends Error {
+  readonly code: 'timeout' | 'cancelled'
+
+  constructor(code: 'timeout' | 'cancelled') {
+    super(code === 'timeout' ? 'provider settings did not update in time' : 'provider settings observation was cancelled')
+    this.name = 'ProviderSettingsObservationError'
+    this.code = code
+  }
 }
 
 interface CachedModel {
@@ -82,7 +100,7 @@ interface CachedModel {
 }
 
 function copyError(error: DomainReadError | undefined): DomainReadError | undefined {
-  return error ? { code: error.code, message: error.message } : undefined
+  return error ? { code: 'unavailable', message: 'Provider settings are temporarily unavailable' } : undefined
 }
 
 function copyAvailability(availability: ProviderSettingsAvailability): ProviderSettingsAvailability {
@@ -120,6 +138,78 @@ export class ProviderSettingsRepository {
 
   getProvider(name: string): ProviderSettingsDomain | undefined { return this.source.getProvider(name) }
   getModel(providerName: string, profile: string): ProviderModelDomain | undefined { return this.source.getModel(providerName, profile) }
+
+  captureAuthority(): unknown { return this.source.getAuthorityToken?.() }
+
+  retry(): void { this.source.retry?.() }
+
+  /** Waits for the provider resource publication which follows a typed
+   * provider write. Execution tells the application whether this barrier is
+   * needed; this repository only observes its opaque authority identity. */
+  waitForProviderPublication(providerName: string, previous: unknown, options: ProviderSettingsObservationOptions = {}): Promise<ProviderSettingsReadModel> {
+    return this.waitFor((model) => model.status === 'ready' && model.providers.some((item) => item.name === providerName) && authorityAdvanced(previous, this.source.getAuthorityToken?.(), providerName), options)
+  }
+
+  waitFor(
+    predicate: (model: ProviderSettingsReadModel) => boolean,
+    options: ProviderSettingsObservationOptions = {},
+  ): Promise<ProviderSettingsReadModel> {
+    const timeoutMS = options.timeoutMS ?? 5000
+    if (!Number.isFinite(timeoutMS) || timeoutMS <= 0) throw new Error('provider settings observation timeout must be positive')
+    const initial = this.getSnapshot()
+    if (predicate(initial)) return Promise.resolve(initial)
+    if (options.signal?.aborted) return Promise.reject(new ProviderSettingsObservationError('cancelled'))
+
+    return new Promise((resolve, reject) => {
+      let settled = false
+      let timer: ReturnType<typeof globalThis.setTimeout> | undefined
+      let release: (() => void) | undefined
+      const finish = (action: () => void) => {
+        if (settled) return
+        settled = true
+        if (timer !== undefined) globalThis.clearTimeout(timer)
+        release?.()
+        options.signal?.removeEventListener('abort', onAbort)
+        action()
+      }
+      const onAbort = () => finish(() => reject(new ProviderSettingsObservationError('cancelled')))
+      const onChange = () => {
+        const model = this.getSnapshot()
+        if (predicate(model)) finish(() => resolve(model))
+      }
+      release = this.subscribe(onChange)
+      onChange()
+      if (settled) return
+      options.signal?.addEventListener('abort', onAbort, { once: true })
+      timer = globalThis.setTimeout(() => finish(() => reject(new ProviderSettingsObservationError('timeout'))), timeoutMS)
+      if (options.signal?.aborted) onAbort()
+    })
+  }
+}
+
+interface AuthorityToken {
+  readonly epoch?: string
+  readonly generation?: number
+  readonly revision?: string
+  readonly providers?: Readonly<Record<string, unknown>>
+}
+
+function authorityAdvanced(previous: unknown, current: unknown, providerName: string): boolean {
+  const before = previous as AuthorityToken | undefined
+  const after = current as AuthorityToken | undefined
+  if (!after) return false
+  const beforeProvider = before?.providers?.[providerName]
+  const afterProvider = after.providers?.[providerName]
+  if (beforeProvider !== undefined || afterProvider !== undefined) return !sameAuthorityToken(beforeProvider, afterProvider)
+  return !sameAuthorityToken(before, after)
+}
+
+function sameAuthorityToken(left: unknown, right: unknown): boolean {
+  if (left === right) return true
+  if (!left || !right || typeof left !== 'object' || typeof right !== 'object') return false
+  const a = left as Record<string, unknown>
+  const b = right as Record<string, unknown>
+  return a.epoch === b.epoch && a.generation === b.generation && a.revision === b.revision
 }
 
 export function selectProviderSettings(repository: ProviderSettingsRepository): ProviderSettingsReadModel { return repository.getSnapshot() }

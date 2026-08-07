@@ -28,12 +28,6 @@ export interface SessionModelOptions {
   default_model: string
 }
 
-export interface ReasoningConfig {
-  parameter?: string
-  default?: string
-  levels?: Record<string, unknown>
-}
-
 /** Prices are currency units per one million tokens. */
 export interface ModelPricing {
   input_cache_hit: number
@@ -50,32 +44,6 @@ export interface ModelPricingTier {
   input_cache_miss: number
   cache_write: number
   output: number
-}
-
-export interface ProviderModelSettings {
-  profile: string
-  id: string
-  type: string
-  compatibility?: string
-  input?: string[]
-  developer_role?: string
-  context_window?: number
-  input_limit?: number
-  output_limit?: number
-  parameters?: Record<string, unknown>
-  reasoning_config?: ReasoningConfig
-  pricing?: ModelPricing
-}
-
-export interface CodexAuthStatus {
-  status: 'signed_out' | 'pending' | 'signed_in' | 'expired' | 'error' | string
-  account_id?: string
-  expires_at?: string
-  refreshable?: boolean
-  message?: string
-  login_id?: string
-  user_code?: string
-  verification_url?: string
 }
 
 export interface CodexUsageWindow {
@@ -115,41 +83,6 @@ export interface CodexUsage {
   rate_limit?: CodexUsageWindowSet
   additional_rate_limits?: CodexUsageAdditional[]
   credits?: CodexUsageCredits
-}
-
-export interface ProviderSettings {
-  name: string
-  base_url: string
-  api_key?: string
-  api_key_configured: boolean
-  auth_file?: string
-  request_timeout?: string
-  http_proxy?: string
-  https_proxy?: string
-  max_concurrent_requests?: number
-  models: ProviderModelSettings[]
-  codex_auth?: CodexAuthStatus
-}
-
-export interface ProviderSettingsInput {
-  name: string
-  base_url: string
-  api_key?: string
-  keep_api_key?: boolean
-  auth_file?: string
-  request_timeout?: string
-  http_proxy?: string
-  https_proxy?: string
-  max_concurrent_requests?: number
-  models: ProviderModelSettings[]
-}
-
-export interface ProviderSettingsDocument {
-  server_root: string
-  config_path: string
-  default_provider: string
-  default_model: string
-  providers: ProviderSettings[]
 }
 
 export interface ContextMetadata {

@@ -197,18 +197,18 @@ function decodeProjectDeleteResult(value: unknown, projectID: string): ProjectDe
 }
 
 function decodeProviderMutationResult(value: unknown, provider: string): ProviderMutationResult {
-  const object = exactObject(value, ['provider', 'status'])
+  const object = exactObject(value, ['provider', 'status', 'changed'])
   const resultProvider = resultString(object, 'provider')
-  if (resultProvider !== provider || object.status !== 'applied') throw new Error('provider result identity does not match request')
-  return { provider: resultProvider, status: 'applied' }
+  if (resultProvider !== provider || object.status !== 'applied' || typeof object.changed !== 'boolean') throw new Error('provider result identity does not match request')
+  return { provider: resultProvider, status: 'applied', changed: object.changed }
 }
 
 function decodeProviderCreateResult(value: unknown, provider: string, operationID: string): ProviderCreateResult {
-  const object = exactObject(value, ['operation_id', 'provider', 'status'])
+  const object = exactObject(value, ['operation_id', 'provider', 'status', 'changed'])
   const resultOperationID = resultIdentifier(object, 'operation_id')
   const resultProvider = resultString(object, 'provider')
-  if (resultOperationID !== operationID || resultProvider !== provider || object.status !== 'applied') throw new Error('provider create result identity does not match request')
-  return { operation_id: resultOperationID, provider: resultProvider, status: 'applied' }
+  if (resultOperationID !== operationID || resultProvider !== provider || object.status !== 'applied' || typeof object.changed !== 'boolean') throw new Error('provider create result identity does not match request')
+  return { operation_id: resultOperationID, provider: resultProvider, status: 'applied', changed: object.changed }
 }
 
 function decodeProviderDefaultResult(value: unknown, provider: string, model: string): ProviderDefaultResult {

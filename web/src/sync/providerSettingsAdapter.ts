@@ -59,6 +59,13 @@ export interface ProviderSettingsEntity {
   readonly models: readonly ProviderModelSettings[]
 }
 
+/** Sync-only identity. The repository exposes it only as an opaque token. */
+export interface ProviderAuthorityIdentity {
+  readonly epoch: string
+  readonly generation: number
+  readonly revision: string
+}
+
 export interface ProviderSettingsData {
   readonly server_root: string
   readonly config_path: string
@@ -66,6 +73,14 @@ export interface ProviderSettingsData {
   readonly default_model: string
   readonly providersByName: Readonly<Record<string, ProviderSettingsEntity>>
   readonly orderedProviderNames: readonly string[]
+  /** Local authority publication identity. It is not part of the wire
+   * snapshot and exists so a write that changes only hidden durable fields is
+   * still observable by an application authority barrier. */
+  readonly authorityRevision: ProviderAuthorityIdentity
+  /** Per-provider publication identities are also local-only. The resource is
+   * one document, but this prevents an unrelated provider publication from
+   * satisfying a hidden-field barrier for the provider being saved. */
+  readonly providerAuthorityRevisions: Readonly<Record<string, ProviderAuthorityIdentity>>
 }
 
 const MAX_PROVIDER_NAME_BYTES = 256
@@ -160,30 +175,36 @@ function equalReasoning(left: ReasoningMetadata, right: ReasoningMetadata): bool
 function equalPricing(left: PricingMetadata | null, right: PricingMetadata | null): boolean { if (left === right) return true; if (!left || !right) return false; return left.input_cache_hit === right.input_cache_hit && left.input_cache_miss === right.input_cache_miss && left.cache_write === right.cache_write && left.output === right.output && left.currency === right.currency && left.long_context_threshold === right.long_context_threshold && ((!left.long_context && !right.long_context) || (!!left.long_context && !!right.long_context && Object.keys(left.long_context).every((key) => left.long_context![key as keyof PricingTierMetadata] === right.long_context![key as keyof PricingTierMetadata]))) }
 function equalModel(left: ProviderModelSettings, right: ProviderModelSettings): boolean { return left.profile === right.profile && left.id === right.id && left.type === right.type && left.compatibility === right.compatibility && equalArray(left.input, right.input) && left.developer_role === right.developer_role && left.context_window === right.context_window && left.input_limit === right.input_limit && left.output_limit === right.output_limit && equalReasoning(left.reasoning_config, right.reasoning_config) && equalPricing(left.pricing, right.pricing) }
 function equalProvider(left: ProviderSettingsEntity, right: ProviderSettingsEntity): boolean { return left.name === right.name && left.base_url === right.base_url && left.api_key_configured === right.api_key_configured && left.auth_file === right.auth_file && left.request_timeout === right.request_timeout && left.http_proxy === right.http_proxy && left.https_proxy === right.https_proxy && left.max_concurrent_requests === right.max_concurrent_requests && left.models.length === right.models.length && left.models.every((item, index) => equalModel(item, right.models[index])) }
-function makeData(serverRoot: string, configPath: string, defaultProvider: string, defaultModel: string, providersByName: Record<string, ProviderSettingsEntity>, previous?: ProviderSettingsData): ProviderSettingsData { const orderedProviderNames = Object.keys(providersByName).sort(); if (previous && previous.server_root === serverRoot && previous.config_path === configPath && previous.default_provider === defaultProvider && previous.default_model === defaultModel && orderedProviderNames.length === previous.orderedProviderNames.length && orderedProviderNames.every((name, index) => name === previous.orderedProviderNames[index] && previous.providersByName[name] === providersByName[name])) return previous; return { server_root: serverRoot, config_path: configPath, default_provider: defaultProvider, default_model: defaultModel, providersByName, orderedProviderNames } }
+function sameIdentity(left: ProviderAuthorityIdentity | undefined, right: ProviderAuthorityIdentity | undefined): boolean { return left === right || (!!left && !!right && left.epoch === right.epoch && left.generation === right.generation && left.revision === right.revision) }
+function sameRevisionMap(left: Readonly<Record<string, ProviderAuthorityIdentity>>, right: Readonly<Record<string, ProviderAuthorityIdentity>>): boolean { const leftKeys = Object.keys(left).sort(); const rightKeys = Object.keys(right).sort(); return leftKeys.length === rightKeys.length && leftKeys.every((key, index) => key === rightKeys[index] && sameIdentity(left[key], right[key])) }
+function makeData(serverRoot: string, configPath: string, defaultProvider: string, defaultModel: string, providersByName: Record<string, ProviderSettingsEntity>, authorityRevision: ProviderAuthorityIdentity, providerAuthorityRevisions: Record<string, ProviderAuthorityIdentity>, previous?: ProviderSettingsData): ProviderSettingsData { const orderedProviderNames = Object.keys(providersByName).sort(); if (previous && sameIdentity(previous.authorityRevision, authorityRevision) && sameRevisionMap(previous.providerAuthorityRevisions, providerAuthorityRevisions) && previous.server_root === serverRoot && previous.config_path === configPath && previous.default_provider === defaultProvider && previous.default_model === defaultModel && orderedProviderNames.length === previous.orderedProviderNames.length && orderedProviderNames.every((name, index) => name === previous.orderedProviderNames[index] && previous.providersByName[name] === providersByName[name])) return previous; return { server_root: serverRoot, config_path: configPath, default_provider: defaultProvider, default_model: defaultModel, providersByName, orderedProviderNames, authorityRevision, providerAuthorityRevisions } }
 
 export class ProviderSettingsAdapter implements ResourceAdapter<ProviderSettingsData> {
   readonly resourceType = 'provider_settings' as const
   constructor(readonly resourceID = 'server') { if (resourceID !== 'server') throw new Error('provider settings resource id must be server') }
   validateResourceRevision(revision: string): void { if (!isDecimalString(revision)) throw new Error('resource_revision must be a decimal string') }
-  decodeSnapshot(value: unknown, previous: ProviderSettingsData | undefined): ProviderSettingsData {
+  decodeSnapshot(value: unknown, previous: ProviderSettingsData | undefined, context?: { streamEpoch?: string; resourceRevision: string; generation?: number }): ProviderSettingsData {
     const source = record(value, 'provider settings snapshot must be an object'); exactKeys(source, snapshotFields, 'provider settings snapshot'); if (!Array.isArray(source.providers)) throw new Error('providers must be an array')
     const providersByName: Record<string, ProviderSettingsEntity> = Object.create(null) as Record<string, ProviderSettingsEntity>
-    for (const raw of source.providers) { const item = provider(raw); if (own(providersByName, item.name)) throw new Error('provider snapshot contains duplicate name'); const old = previous && own(previous.providersByName, item.name) ? previous.providersByName[item.name] : undefined; providersByName[item.name] = old && equalProvider(old, item) ? old : item }
-    return makeData(stringValue(source.server_root, 'server_root', true), stringValue(source.config_path, 'config_path', true), providerName(source.default_provider, 'default provider', true), stringValue(source.default_model, 'default_model', true), providersByName, previous)
+    const providerAuthorityRevisions: Record<string, ProviderAuthorityIdentity> = Object.create(null) as Record<string, ProviderAuthorityIdentity>
+    const identity: ProviderAuthorityIdentity = { epoch: context?.streamEpoch ?? previous?.authorityRevision.epoch ?? '', generation: context?.generation ?? previous?.authorityRevision.generation ?? 0, revision: context?.resourceRevision ?? previous?.authorityRevision.revision ?? '' }
+    for (const raw of source.providers) { const item = provider(raw); if (own(providersByName, item.name)) throw new Error('provider snapshot contains duplicate name'); const old = previous && own(previous.providersByName, item.name) ? previous.providersByName[item.name] : undefined; providersByName[item.name] = old && equalProvider(old, item) ? old : item; providerAuthorityRevisions[item.name] = identity }
+    return makeData(stringValue(source.server_root, 'server_root', true), stringValue(source.config_path, 'config_path', true), providerName(source.default_provider, 'default provider', true), stringValue(source.default_model, 'default_model', true), providersByName, identity, providerAuthorityRevisions, previous)
   }
-  applyChange(previous: ProviderSettingsData, operations: readonly ChangeOperation[]): ProviderSettingsData {
+  applyChange(previous: ProviderSettingsData, operations: readonly ChangeOperation[], context?: { streamEpoch?: string; resourceRevision: string; generation?: number }): ProviderSettingsData {
     if (!Array.isArray(operations) || operations.length === 0) throw new Error('provider settings change must contain operations')
     const providersByName: Record<string, ProviderSettingsEntity> = Object.assign(Object.create(null) as Record<string, ProviderSettingsEntity>, previous.providersByName)
+    const providerAuthorityRevisions: Record<string, ProviderAuthorityIdentity> = Object.assign(Object.create(null) as Record<string, ProviderAuthorityIdentity>, previous.providerAuthorityRevisions)
+    const identity: ProviderAuthorityIdentity = { epoch: context?.streamEpoch ?? previous.authorityRevision.epoch, generation: context?.generation ?? previous.authorityRevision.generation, revision: context?.resourceRevision ?? previous.authorityRevision.revision }
     let defaultProvider = previous.default_provider; let defaultModel = previous.default_model
     for (const raw of operations) {
       const operation = record(raw, 'provider settings operation must be an object'); const op = stringValue(operation.op, 'operation op')
-      if (op === 'upsert') { exactKeys(operation, ['op', 'key', 'value'], 'provider upsert'); const key = providerName(operation.key, 'upsert key'); const item = provider(operation.value); if (item.name !== key) throw new Error('upsert key does not match provider name'); const old = own(providersByName, key) ? providersByName[key] : undefined; providersByName[key] = old && equalProvider(old, item) ? old : item
-      } else if (op === 'remove') { exactKeys(operation, ['op', 'key'], 'provider remove'); delete providersByName[providerName(operation.key, 'remove key')]
+      if (op === 'upsert') { exactKeys(operation, ['op', 'key', 'value'], 'provider upsert'); const key = providerName(operation.key, 'upsert key'); const item = provider(operation.value); if (item.name !== key) throw new Error('upsert key does not match provider name'); const old = own(providersByName, key) ? providersByName[key] : undefined; providersByName[key] = old && equalProvider(old, item) ? old : item; providerAuthorityRevisions[key] = identity
+      } else if (op === 'remove') { exactKeys(operation, ['op', 'key'], 'provider remove'); const key = providerName(operation.key, 'remove key'); delete providersByName[key]; delete providerAuthorityRevisions[key]
       } else if (op === 'default.replace') { exactKeys(operation, ['op', 'key', 'value'], 'provider default'); if (operation.key !== 'server') throw new Error('default key must be server'); const value = record(operation.value, 'default value must be an object'); exactKeys(value, ['provider', 'model'], 'default value'); defaultProvider = providerName(value.provider, 'default provider', true); defaultModel = stringValue(value.model, 'default model', true)
       } else throw new Error('provider settings operation is not supported')
     }
-    return makeData(previous.server_root, previous.config_path, defaultProvider, defaultModel, providersByName, previous)
+    return makeData(previous.server_root, previous.config_path, defaultProvider, defaultModel, providersByName, identity, providerAuthorityRevisions, previous)
   }
 }
 
