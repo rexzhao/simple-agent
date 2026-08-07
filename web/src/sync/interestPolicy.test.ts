@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { createCurrentProjectSignal, createCurrentSessionSignal, createProviderSettingsApplicationStateSignal, ProviderSettingsInterestPolicy, SessionContentInterestPolicy, SessionIndexInterestPolicy } from './interestPolicy'
+import { createCurrentCodexLoginProviderSignal, createCurrentProjectSignal, createCurrentSessionSignal, createProviderSettingsApplicationStateSignal, CodexLoginInterestPolicy, ProviderSettingsInterestPolicy, SessionContentInterestPolicy, SessionIndexInterestPolicy } from './interestPolicy'
 
 describe('SessionIndexInterestPolicy', () => {
   it('keeps exactly the signal-selected resource subscribed independently of UI listeners', () => {
@@ -149,5 +149,61 @@ describe('ProviderSettingsInterestPolicy', () => {
     expect(active).toBe(0)
     expect(evicted).toEqual(['server'])
     policy.stop()
+  })
+})
+
+describe('CodexLoginInterestPolicy', () => {
+  it('defaults to release and evict device capabilities on every lifecycle boundary', () => {
+    const signal = createCurrentCodexLoginProviderSignal('codex')
+    const options: boolean[] = []
+    const released: string[] = []
+    const evicted: string[] = []
+    const policy = new CodexLoginInterestPolicy({
+      subscribe: (resource: { type: 'codex_login'; id: string }, value?: { retainOnRelease?: boolean }) => {
+        options.push(value?.retainOnRelease === true)
+        return () => released.push(resource.id)
+      },
+      evict: (resource: { type: 'codex_login'; id: string }) => evicted.push(resource.id),
+    }, signal)
+
+    policy.start()
+    signal.set('other')
+    signal.set(null)
+    signal.set('codex')
+    policy.stop()
+
+    expect(options).toEqual([false, false, false])
+    expect(released).toEqual(['codex', 'other', 'codex'])
+    expect(evicted).toEqual(['codex', 'other', 'codex'])
+  })
+
+  it('switches one provider resource and releases/evicts on lifecycle stop', () => {
+    const signal = createCurrentCodexLoginProviderSignal('codex')
+    const subscribed: string[] = []
+    const released: string[] = []
+    const evicted: string[] = []
+    const policy = new CodexLoginInterestPolicy({
+      subscribe: (resource: { type: 'codex_login'; id: string }) => {
+        subscribed.push(resource.id)
+        return () => released.push(resource.id)
+      },
+      evict: (resource: { type: 'codex_login'; id: string }) => evicted.push(resource.id),
+    }, signal, { retainReleased: false })
+    policy.start()
+    expect(policy.provider).toBe('codex')
+    signal.set('other')
+    expect(subscribed).toEqual(['codex', 'other'])
+    expect(released).toEqual(['codex'])
+    policy.stop()
+    expect(released).toEqual(['codex', 'other'])
+    expect(evicted).toEqual(['codex', 'other'])
+  })
+
+  it('rejects malformed provider identity before sending interest', () => {
+    const signal = createCurrentCodexLoginProviderSignal('bad/provider')
+    let calls = 0
+    const policy = new CodexLoginInterestPolicy({ subscribe: () => { calls += 1; return () => undefined } }, signal)
+    expect(() => policy.start()).toThrow()
+    expect(calls).toBe(0)
   })
 })

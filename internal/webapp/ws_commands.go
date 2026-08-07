@@ -159,6 +159,10 @@ type providerDiscoverArguments struct {
 	Provider string
 }
 
+type codexLoginArguments struct {
+	Provider string
+}
+
 type sessionRenameResult struct {
 	SessionID   string `json:"session_id"`
 	DisplayName string `json:"display_name"`
@@ -240,6 +244,11 @@ type providerDefaultResult struct {
 type providerDiscoverInlineResult struct {
 	Provider string   `json:"provider"`
 	Models   []string `json:"models"`
+}
+
+type codexLoginResult struct {
+	Provider string `json:"provider"`
+	Status   string `json:"status"`
 }
 
 type providerDiscoverBlobResult struct {
@@ -1161,6 +1170,21 @@ func decodeProviderDiscoverArguments(raw json.RawMessage) (providerDiscoverArgum
 	return providerDiscoverArguments{Provider: provider}, err
 }
 
+func decodeCodexLoginArguments(raw json.RawMessage, command string) (codexLoginArguments, error) {
+	fields, err := strictCommandObject(raw, command)
+	if err != nil {
+		return codexLoginArguments{}, err
+	}
+	if err := requireExactFields(fields, command, "provider"); err != nil {
+		return codexLoginArguments{}, err
+	}
+	provider, err := requiredProviderIdentity(fields, "provider", command)
+	if err != nil {
+		return codexLoginArguments{}, err
+	}
+	return codexLoginArguments{Provider: provider}, nil
+}
+
 func validateProviderUpdateArguments(raw json.RawMessage) error {
 	_, err := decodeProviderUpdateArguments(raw)
 	return err
@@ -1178,6 +1202,16 @@ func validateProviderDefaultArguments(raw json.RawMessage) error {
 
 func validateProviderDiscoverArguments(raw json.RawMessage) error {
 	_, err := decodeProviderDiscoverArguments(raw)
+	return err
+}
+
+func validateCodexLoginStartArguments(raw json.RawMessage) error {
+	_, err := decodeCodexLoginArguments(raw, "codex_login.start")
+	return err
+}
+
+func validateCodexLoginClearArguments(raw json.RawMessage) error {
+	_, err := decodeCodexLoginArguments(raw, "codex_login.clear")
 	return err
 }
 
@@ -1929,6 +1963,16 @@ func providerCommandError(err error) error {
 	return commands.NewDomainError("provider_command_failed", "provider command failed", nil)
 }
 
+func codexLoginCommandError(err error) error {
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return commands.NewDomainError("cancelled", "command was cancelled", nil)
+	}
+	return commands.NewDomainError(codexLoginFailureCode(err), codexLoginFailureMessage(err), nil)
+}
+
 // The command cache is an idempotency tombstone, not a second copy of the
 // target. Provider arguments can contain credentials in any field (including
 // arbitrary model parameters), so retain no argument bytes at all. The
@@ -1946,8 +1990,21 @@ func redactProviderUpdateArguments(raw json.RawMessage) json.RawMessage {
 	return redactProviderArguments(raw)
 }
 
+func redactCodexLoginArguments(_ json.RawMessage) json.RawMessage {
+	return json.RawMessage(`{}`)
+}
+
 type sessionHistoryBlobWriter interface {
 	Put(context.Context, string, []byte) (protocol.BlobDescriptor, error)
+}
+
+// sessionCommandRegistryOptions is deliberately typed. The command registry
+// is a closed assembly boundary; silently accepting an arbitrary option (or
+// silently letting a duplicate option win) would make a missing dependency a
+// runtime behavior instead of a compile-time review point.
+type sessionCommandRegistryOptions struct {
+	HistoryWriter sessionHistoryBlobWriter
+	CodexLogins   *codexLoginRegistry
 }
 
 const (
@@ -2004,12 +2061,56 @@ func sessionHistoryReadCommandError(err error) error {
 	return sessionCommandError(err)
 }
 
-func newSessionCommandRegistry(service *execution.Service, runs *runRegistry, historyWriters ...sessionHistoryBlobWriter) (*commands.Registry, error) {
-	var historyWriter sessionHistoryBlobWriter
-	if len(historyWriters) > 0 {
-		historyWriter = historyWriters[0]
-	}
+func newSessionCommandRegistry(service *execution.Service, runs *runRegistry, options sessionCommandRegistryOptions) (*commands.Registry, error) {
+	historyWriter := options.HistoryWriter
+	codexLogins := options.CodexLogins
 	return commands.NewRegistry(
+		commands.CommandDefinition{
+			// Starting device login performs an external operation without a
+			// durable claim/outcome. It can join an existing pending login in
+			// this epoch, but a reconnect in a new epoch must not replay it.
+			Name: "codex_login.start", SchemaVersion: 1, CrossEpochRetrySafe: false,
+			CachePolicy: commands.ResultCacheDurable, SupportsExpectedRevision: false,
+			RedactArguments: redactCodexLoginArguments,
+			Validate:        validateCodexLoginStartArguments,
+			Execute: func(_ context.Context, request commands.CommandRequest) (json.RawMessage, error) {
+				arguments, err := decodeCodexLoginArguments(request.Arguments, "codex_login.start")
+				if err != nil {
+					return nil, err
+				}
+				if codexLogins == nil {
+					return nil, commands.NewDomainError("codex_provider_unavailable", "Codex provider is unavailable", nil)
+				}
+				if _, err := codexLogins.start(arguments.Provider); err != nil {
+					return nil, codexLoginCommandError(err)
+				}
+				// The resource, not this promise, carries device UI capability
+				// fields and all later auth outcomes.
+				return json.Marshal(codexLoginResult{Provider: arguments.Provider, Status: "accepted"})
+			},
+		},
+		commands.CommandDefinition{
+			// Clear is a target-state operation: os.Remove is idempotent and
+			// the resource owner suppresses unchanged signed_out publications.
+			// It is therefore safe to repeat after an epoch change.
+			Name: "codex_login.clear", SchemaVersion: 1, CrossEpochRetrySafe: true,
+			CachePolicy: commands.ResultCacheDurable, SupportsExpectedRevision: false,
+			RedactArguments: redactCodexLoginArguments,
+			Validate:        validateCodexLoginClearArguments,
+			Execute: func(_ context.Context, request commands.CommandRequest) (json.RawMessage, error) {
+				arguments, err := decodeCodexLoginArguments(request.Arguments, "codex_login.clear")
+				if err != nil {
+					return nil, err
+				}
+				if codexLogins == nil {
+					return nil, commands.NewDomainError("codex_provider_unavailable", "Codex provider is unavailable", nil)
+				}
+				if err := codexLogins.clear(arguments.Provider); err != nil {
+					return nil, codexLoginCommandError(err)
+				}
+				return json.Marshal(codexLoginResult{Provider: arguments.Provider, Status: "cleared"})
+			},
+		},
 		commands.CommandDefinition{
 			// CreateProviderSettings has no durable operation claim/outcome
 			// authority. The gateway cache deduplicates a request only within

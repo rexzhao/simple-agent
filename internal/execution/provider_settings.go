@@ -82,6 +82,15 @@ type CodexAuthStatus struct {
 	VerifyURL   string    `json:"verification_url,omitempty"`
 }
 
+// These errors are intentionally small and stable.  Callers which expose the
+// Codex login command/resource must not forward the detailed configuration or
+// filesystem errors returned by the lower-level provider helpers.
+var (
+	ErrCodexProviderNotFound   = errors.New("codex provider was not found")
+	ErrCodexProviderNotCodex   = errors.New("provider is not configured for Codex")
+	ErrCodexProviderNoAuthFile = errors.New("Codex provider has no auth file")
+)
+
 func (s *Service) ProviderSettings() (ProviderSettingsDocument, error) {
 	configPath := s.ConfigPath()
 	cfg, err := config.Load(configPath)
@@ -319,6 +328,28 @@ func (s *Service) CodexAuthStatus(providerName string) (CodexAuthStatus, error) 
 		return CodexAuthStatus{}, err
 	}
 	return codexAuthStatus(provider.AuthFile), nil
+}
+
+// ValidateCodexProvider checks only provider identity/configuration.  It does
+// not read the auth file and never returns credentials.  The detailed
+// codexProvider helper remains the compatibility path for the existing REST
+// handlers; this method is the bounded command/resource boundary.
+func (s *Service) ValidateCodexProvider(providerName string) error {
+	cfg, err := config.Load(s.ConfigPath())
+	if err != nil {
+		return err
+	}
+	provider, ok := cfg.Providers[strings.TrimSpace(providerName)]
+	if !ok {
+		return ErrCodexProviderNotFound
+	}
+	if !providerUsesCodex(provider) {
+		return ErrCodexProviderNotCodex
+	}
+	if strings.TrimSpace(provider.AuthFile) == "" {
+		return ErrCodexProviderNoAuthFile
+	}
+	return nil
 }
 
 func (s *Service) SaveCodexAuth(providerName string, token codexauth.TokenFile) error {
@@ -640,10 +671,10 @@ func codexAuthStatus(path string) CodexAuthStatus {
 		if errors.Is(err, os.ErrNotExist) {
 			return CodexAuthStatus{Status: "signed_out"}
 		}
-		return CodexAuthStatus{Status: "error", Message: err.Error()}
+		return CodexAuthStatus{Status: "error", Message: "Codex authentication status is unavailable"}
 	}
 	if strings.TrimSpace(token.AccessToken) == "" {
-		return CodexAuthStatus{Status: "error", Message: "认证文件中没有 access token"}
+		return CodexAuthStatus{Status: "error", Message: "Codex authentication file is invalid"}
 	}
 	status := "signed_in"
 	if !token.ExpiresAt.IsZero() && !token.ExpiresAt.After(time.Now().UTC()) && strings.TrimSpace(token.RefreshToken) == "" {

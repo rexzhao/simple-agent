@@ -15,6 +15,7 @@ import type {
   UnsubscribeMessage,
 } from '../protocol/types'
 import { BlobClient } from './blobClient'
+import { CodexLoginAdapter } from './codexLoginAdapter'
 import { asSyncReadError, SyncReadError } from './errors'
 import { LocalReplica, resourceKeyString } from './localReplica'
 import type { ResourceAdapter, StagedReplicaChange, TransientResumeToken } from './localReplica'
@@ -781,6 +782,7 @@ export class SyncRuntime {
     if (resource.type === 'session_content') return new SessionContentAdapter(resource.id) as ResourceAdapter<unknown, unknown>
     if (resource.type === 'project_index') return new ProjectIndexAdapter(resource.id) as ResourceAdapter<unknown, unknown>
     if (resource.type === 'provider_settings') return new ProviderSettingsAdapter(resource.id) as ResourceAdapter<unknown, unknown>
+    if (resource.type === 'codex_login') return new CodexLoginAdapter(resource.id) as ResourceAdapter<unknown, unknown>
     throw new SyncReadError('invalid_snapshot', 'resource type is not registered', resourceKeyString(resource))
   }
 

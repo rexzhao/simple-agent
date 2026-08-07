@@ -668,6 +668,50 @@ describe('CommandFacade session.mark_read', () => {
   })
 })
 
+describe('CommandFacade Codex login commands', () => {
+  it('sends strict identity-only arguments, decodes bounded acknowledgements, and never retries start across epochs', async () => {
+    const transport = new FakeCommandTransport()
+    const facade = new CommandFacade({ transport })
+    const start = facade.startCodexLogin('codex')
+    const startMessage = transport.sent[0]
+    if (startMessage.type !== 'command') throw new Error('wrong start command')
+    expect(startMessage.payload.name).toBe('codex_login.start')
+    expect(startMessage.payload.arguments).toEqual({ provider: 'codex' })
+    transport.connectionGeneration = 2
+    transport.emitReady('epoch_2', 'epoch_1')
+    await expect(start).rejects.toMatchObject({ code: 'outcome_unknown' })
+    expect(transport.sent).toHaveLength(1)
+
+    await expect(facade.startCodexLogin('bad/provider')).rejects.toMatchObject({ code: 'invalid' })
+    await expect(facade.startCodexLogin('\ud800')).rejects.toMatchObject({ code: 'invalid' })
+
+    const clear = facade.clearCodexLogin('codex')
+    const clearMessage = transport.sent[1]
+    if (clearMessage.type !== 'command') throw new Error('wrong clear command')
+    expect(clearMessage.payload.name).toBe('codex_login.clear')
+    expect(clearMessage.payload.arguments).toEqual({ provider: 'codex' })
+    transport.connectionGeneration = 3
+    transport.emitReady('epoch_3', 'epoch_2')
+    expect(transport.sent).toHaveLength(3)
+    const retry = transport.sent[2]
+    if (retry.type !== 'command') throw new Error('wrong clear retry')
+    transport.emit(commandMessage('command_result', retry.payload.request_id, { status: 'succeeded', result: { provider: 'codex', status: 'cleared' } }), 3)
+    await expect(clear).resolves.toEqual({ provider: 'codex', status: 'cleared' })
+    facade.stop()
+  })
+
+  it('rejects extra result fields and never writes a command result into a replica', async () => {
+    const transport = new FakeCommandTransport()
+    const facade = new CommandFacade({ transport })
+    const pending = facade.clearCodexLogin('codex')
+    const message = transport.sent[0]
+    if (message.type !== 'command') throw new Error('wrong command')
+    transport.emit(commandMessage('command_result', message.payload.request_id, { status: 'succeeded', result: { provider: 'codex', status: 'cleared', token: 'secret' } }))
+    await expect(pending).rejects.toMatchObject({ code: 'invalid' })
+    facade.stop()
+  })
+})
+
 describe('CommandFacade project commands', () => {
   it('keeps project create path input untouched, uses a stable operation identity, and retries safely across epochs', async () => {
     const transport = new FakeCommandTransport()

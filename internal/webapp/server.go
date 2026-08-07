@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/rexzhao/simple-agent/internal/blobstore"
+	"github.com/rexzhao/simple-agent/internal/codexlogin"
 	"github.com/rexzhao/simple-agent/internal/execution"
 	"github.com/rexzhao/simple-agent/internal/projectindex"
 	projectstore "github.com/rexzhao/simple-agent/internal/projects"
@@ -63,6 +64,7 @@ type Server struct {
 	wsDispatcher                 *wsgateway.Dispatcher
 	projectIndex                 *projectindex.Provider
 	providerSettings             *providersettings.Provider
+	codexLogin                   *codexlogin.Provider
 	sessionIndex                 *sessionindex.Provider
 	sessionContent               *sessioncontent.Provider
 	blobStore                    *blobstore.Store
@@ -112,6 +114,7 @@ func NewServer(options ServerOptions) (*Server, error) {
 	var projectRegistration *execution.ProjectIndexSinkRegistration
 	var providerSettingsProvider *providersettings.Provider
 	var providerSettingsRegistration *execution.ProviderSettingsSinkRegistration
+	var codexLoginProvider *codexlogin.Provider
 	var sessionContentProvider *sessioncontent.Provider
 	var sinkRegistration *execution.SessionIndexSinkRegistration
 	var contentRegistration *sessions.MutationSinkRegistration
@@ -119,6 +122,7 @@ func NewServer(options ServerOptions) (*Server, error) {
 	// use the same active-run owner as the REST adapter. It remains process
 	// local, therefore that command is deliberately not cross-epoch safe.
 	runs := newRunRegistry(ctx, options.Service, options.LogWriter)
+	codexLogins := newCodexLoginRegistry(ctx, options.Service)
 	cleanupAssembly := func() {
 		if contentRegistration != nil {
 			contentRegistration.Unregister()
@@ -143,6 +147,9 @@ func NewServer(options ServerOptions) (*Server, error) {
 		}
 		if providerSettingsProvider != nil {
 			providerSettingsProvider.Close()
+		}
+		if codexLoginProvider != nil {
+			codexLoginProvider.Close()
 		}
 		if sessionContentProvider != nil {
 			sessionContentProvider.Close()
@@ -247,6 +254,29 @@ func NewServer(options ServerOptions) (*Server, error) {
 				cleanupAssembly()
 				return nil, fmt.Errorf("warm session content provider: %w", err)
 			}
+			codexLoginProvider, err = codexlogin.NewProvider(codexlogin.ProviderOptions{
+				StreamEpoch: serverEpoch, OwnerContext: ctx,
+				ValidateProvider: func(providerName string) error {
+					err := options.Service.ValidateCodexProvider(providerName)
+					switch {
+					case errors.Is(err, execution.ErrCodexProviderNotFound):
+						return codexlogin.ErrProviderNotFound
+					case errors.Is(err, execution.ErrCodexProviderNotCodex), errors.Is(err, execution.ErrCodexProviderNoAuthFile):
+						return codexlogin.ErrProviderNotCodex
+					case err != nil:
+						return codexlogin.ErrProviderUnavailable
+					default:
+						return nil
+					}
+				},
+				Status:                codexLogins.status,
+				MaxChangeMessageBytes: wsgateway.DefaultMaxMessageBytes,
+			})
+			if err != nil {
+				cleanupAssembly()
+				return nil, err
+			}
+			codexLogins.setSink(codexLoginProvider)
 			providers := syncengine.NewProviderRegistry()
 			if err := providers.Register(sessionIndexProvider); err != nil {
 				cleanupAssembly()
@@ -264,12 +294,19 @@ func NewServer(options ServerOptions) (*Server, error) {
 				cleanupAssembly()
 				return nil, err
 			}
+			if err := providers.Register(codexLoginProvider); err != nil {
+				cleanupAssembly()
+				return nil, err
+			}
 			engine, err := syncengine.NewEngine(providers)
 			if err != nil {
 				cleanupAssembly()
 				return nil, err
 			}
-			commandRegistry, err := newSessionCommandRegistry(options.Service, runs, blobStore)
+			commandRegistry, err := newSessionCommandRegistry(options.Service, runs, sessionCommandRegistryOptions{
+				HistoryWriter: blobStore,
+				CodexLogins:   codexLogins,
+			})
 			if err != nil {
 				cleanupAssembly()
 				return nil, err
@@ -316,7 +353,8 @@ func NewServer(options ServerOptions) (*Server, error) {
 	if sessionContentProvider != nil && server.runs != nil && server.runs.coordinator != nil {
 		server.contentRunObserver = server.runs.coordinator.RegisterRunEventObserver(sessionContentProvider)
 	}
-	server.codexLogins = newCodexLoginRegistry(ctx, options.Service)
+	server.codexLogins = codexLogins
+	server.codexLogin = codexLoginProvider
 	server.routes()
 	return server, nil
 }
@@ -388,6 +426,9 @@ func (s *Server) Close() {
 	}
 	if s.providerSettings != nil {
 		s.providerSettings.Close()
+	}
+	if s.codexLogin != nil {
+		s.codexLogin.Close()
 	}
 	if s.sessionContent != nil {
 		s.sessionContent.Close()

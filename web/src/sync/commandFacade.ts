@@ -21,6 +21,7 @@ import type { ItemsPage } from '../types'
 import type { RunCancelResult, RunCommands, RunContinueOptions, RunContinueResult, RunControlOptions, RunPromptAppendOptions, RunPromptAppendResult, RunPromptMoveResult, RunPromptRemoveResult, RunPromptSteerResult, RunStartOptions, RunStartResult, RunStatus, RunToolCancelResult } from '../commands/runCommands'
 import type { ProjectArchiveResult, ProjectCommands, ProjectCreateOptions, ProjectCreateResult, ProjectDeleteResult, ProjectRenameResult } from '../commands/projectCommands'
 import type { ProviderCommands, ProviderCreateOptions, ProviderCreateResult, ProviderDefaultResult, ProviderDiscoverModelsResult, ProviderMutationResult, ProviderUpdateTarget } from '../commands/providerCommands'
+import type { CodexLoginClearResult, CodexLoginCommandOptions, CodexLoginCommands, CodexLoginStartResult } from '../commands/codexLoginCommands'
 import { encodeProviderTarget, decodeProviderDiscoverResult, validateProviderCommandJSON } from './providerCommandCodec'
 import { isProviderCreateName, isProviderName } from '../domain/providerIdentity'
 import { SyncReadError } from './errors'
@@ -216,6 +217,13 @@ function decodeProviderDefaultResult(value: unknown, provider: string, model: st
   const resultModel = resultString(object, 'model')
   if (resultProvider !== provider || resultModel !== model || object.status !== 'applied') throw new Error('provider result identity does not match request')
   return { provider: resultProvider, model: resultModel, status: 'applied' }
+}
+
+function decodeCodexLoginResult(value: unknown, provider: string, status: 'accepted' | 'cleared'): CodexLoginStartResult | CodexLoginClearResult {
+  const object = exactObject(value, ['provider', 'status'])
+  const resultProvider = resultString(object, 'provider')
+  if (resultProvider !== provider || object.status !== status) throw new Error('Codex login result identity does not match request')
+  return status === 'accepted' ? { provider: resultProvider, status } : { provider: resultProvider, status }
 }
 
 function decodeCompactResult(value: unknown, sessionID: string): SessionCompactResult {
@@ -446,7 +454,7 @@ function decodeRunToolCancelResult(value: unknown, sessionID: string, runID: str
  * result; it never mutates a replica. Durable authority still arrives through
  * the resource snapshot/change stream.
  */
-export class CommandFacade implements SessionCommands, RunCommands, ProjectCommands, ProviderCommands {
+export class CommandFacade implements SessionCommands, RunCommands, ProjectCommands, ProviderCommands, CodexLoginCommands {
   private readonly transport: RuntimeTransport
   private readonly blobClient?: BlobClient
   private readonly timeoutMS: number
@@ -546,6 +554,16 @@ export class CommandFacade implements SessionCommands, RunCommands, ProjectComma
   discoverModels(provider: string, options: CommandOptions = {}): Promise<ProviderDiscoverModelsResult> {
     if (!isProviderName(provider)) return Promise.reject(new CommandFacadeError('invalid', 'provider is invalid'))
     return this.submit('provider.discover_models', { provider }, true, (value, signal) => decodeProviderDiscoverResult(value, provider, this.blobClient, signal), options)
+  }
+
+  startCodexLogin(provider: string, options: CodexLoginCommandOptions = {}): Promise<CodexLoginStartResult> {
+    if (!isProviderName(provider)) return Promise.reject(new CommandFacadeError('invalid', 'provider is invalid'))
+    return this.submit('codex_login.start', { provider }, false, (value) => decodeCodexLoginResult(value, provider, 'accepted') as CodexLoginStartResult, options)
+  }
+
+  clearCodexLogin(provider: string, options: CodexLoginCommandOptions = {}): Promise<CodexLoginClearResult> {
+    if (!isProviderName(provider)) return Promise.reject(new CommandFacadeError('invalid', 'provider is invalid'))
+    return this.submit('codex_login.clear', { provider }, true, (value) => decodeCodexLoginResult(value, provider, 'cleared') as CodexLoginClearResult, options)
   }
 
   private ensureStarted(): void {

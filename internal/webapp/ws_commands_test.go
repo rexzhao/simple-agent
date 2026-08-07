@@ -11,8 +11,12 @@ import (
 	"net/http/httptest"
 	"reflect"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
+	"github.com/rexzhao/simple-agent/internal/codexauth"
 	"github.com/rexzhao/simple-agent/internal/commands"
 	"github.com/rexzhao/simple-agent/internal/config"
 	"github.com/rexzhao/simple-agent/internal/execution"
@@ -319,7 +323,7 @@ func TestProviderDiscoverCommandUsesBlobBoundaryAndRejectsOverage(t *testing.T) 
 		t.Fatal(err)
 	}
 	writer := &providerCommandTestBlobWriter{}
-	registry, err := newSessionCommandRegistry(service, nil, writer)
+	registry, err := newSessionCommandRegistry(service, nil, sessionCommandRegistryOptions{HistoryWriter: writer})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -433,7 +437,7 @@ func TestProjectCommandLifecycleUsesTypedExecutionRules(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	registry, err := newSessionCommandRegistry(service, nil)
+	registry, err := newSessionCommandRegistry(service, nil, sessionCommandRegistryOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -709,11 +713,11 @@ func TestActiveRunControlCommandSchemasAreStrict(t *testing.T) {
 }
 
 func TestSessionCommandRegistryIsClosedAndFlagsAreExplicit(t *testing.T) {
-	registry, err := newSessionCommandRegistry(nil, nil)
+	registry, err := newSessionCommandRegistry(nil, nil, sessionCommandRegistryOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantNames := []string{"project.archive", "project.create", "project.delete", "project.rename", "project.restore", "provider.create", "provider.discover_models", "provider.set_default", "provider.update", "run.cancel", "run.continue", "run.prompt.append", "run.prompt.move", "run.prompt.remove", "run.prompt.steer", "run.start", "run.tool.cancel", "session.archive", "session.compact", "session.create", "session.delete", "session.history.read", "session.mark_read", "session.rename", "session.restore", "session.set_debug", "session.set_full_access"}
+	wantNames := []string{"codex_login.clear", "codex_login.start", "project.archive", "project.create", "project.delete", "project.rename", "project.restore", "provider.create", "provider.discover_models", "provider.set_default", "provider.update", "run.cancel", "run.continue", "run.prompt.append", "run.prompt.move", "run.prompt.remove", "run.prompt.steer", "run.start", "run.tool.cancel", "session.archive", "session.compact", "session.create", "session.delete", "session.history.read", "session.mark_read", "session.rename", "session.restore", "session.set_debug", "session.set_full_access"}
 	if got := registry.Names(); !reflect.DeepEqual(got, wantNames) {
 		t.Fatalf("registry names=%v, want %v", got, wantNames)
 	}
@@ -732,7 +736,7 @@ func TestSessionCommandRegistryIsClosedAndFlagsAreExplicit(t *testing.T) {
 		} else if definition.CachePolicy != commands.ResultCacheDurable {
 			t.Fatalf("%s unexpectedly has a volatile-result policy", name)
 		}
-		if name == "provider.create" || name == "run.cancel" || name == "run.prompt.move" || name == "run.prompt.remove" || name == "run.prompt.steer" || name == "run.tool.cancel" || name == "session.compact" || name == "session.delete" || name == "project.delete" {
+		if name == "provider.create" || name == "codex_login.start" || name == "run.cancel" || name == "run.prompt.move" || name == "run.prompt.remove" || name == "run.prompt.steer" || name == "run.tool.cancel" || name == "session.compact" || name == "session.delete" || name == "project.delete" {
 			if definition.CrossEpochRetrySafe {
 				t.Fatalf("%s must remain cross-epoch unsafe", name)
 			}
@@ -743,6 +747,213 @@ func TestSessionCommandRegistryIsClosedAndFlagsAreExplicit(t *testing.T) {
 	createDefinition, err := registry.Definition("provider.create", 1)
 	if err != nil || createDefinition.RedactArguments == nil || string(createDefinition.RedactArguments(providerCreateTestArguments())) != `{}` {
 		t.Fatalf("provider.create must retain only a minimal cache tombstone: %#v", createDefinition)
+	}
+}
+
+func TestCodexLoginCommandSchemaIsStrictAndBounded(t *testing.T) {
+	registry, err := newSessionCommandRegistry(nil, nil, sessionCommandRegistryOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct {
+		name      string
+		valid     string
+		invalid   []string
+		crossSafe bool
+	}{
+		{name: "codex_login.start", valid: `{"provider":"codex"}`, invalid: []string{
+			`{}`, `null`, `{"provider":null}`, `{"provider":""}`, `{"provider":"bad/provider"}`,
+			`{"provider":"codex","extra":true}`, `{"provider":"codex","provider":"other"}`,
+			`{"provider":"codex"}{}`, `{"provider":"\ud800"}`,
+		}, crossSafe: false},
+		{name: "codex_login.clear", valid: `{"provider":"codex"}`, invalid: []string{
+			`{}`, `{"provider":null}`, `{"provider":false}`, `{"provider":"codex","extra":true}`,
+			`{"provider":"codex"} trailing`, `{"provider":"\ud800"}`,
+		}, crossSafe: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			definition, err := registry.Definition(test.name, 1)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if definition.CrossEpochRetrySafe != test.crossSafe || definition.RedactArguments == nil || string(definition.RedactArguments(json.RawMessage(test.valid))) != `{}` {
+				t.Fatalf("definition=%#v", definition)
+			}
+			if err := registry.Validate(definition, json.RawMessage(test.valid)); err != nil {
+				t.Fatalf("valid arguments rejected: %v", err)
+			}
+			for _, raw := range test.invalid {
+				if err := registry.Validate(definition, json.RawMessage(raw)); err == nil {
+					t.Fatalf("invalid arguments accepted: %s", raw)
+				}
+			}
+		})
+	}
+}
+
+func TestCodexLoginCommandsUseFakeDeviceFlowAndSafeResults(t *testing.T) {
+	var polls atomic.Int32
+	deviceServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/usercode":
+			_, _ = fmt.Fprint(w, `{"device_auth_id":"device-1","user_code":"USER-123","verification_uri":"https://example.test/device","interval":1,"expires_in":600}`)
+		case "/device-token":
+			polls.Add(1)
+			_, _ = fmt.Fprint(w, `{"authorization_code":"auth-code","code_verifier":"verifier"}`)
+		case "/oauth-token":
+			_, _ = fmt.Fprint(w, `{"access_token":"access-token-secret","refresh_token":"refresh-token-secret","expires_in":3600,"account_id":"account-1"}`)
+		default:
+			t.Fatalf("unexpected fake device path %q", r.URL.Path)
+		}
+	}))
+	defer deviceServer.Close()
+
+	server, service, _ := newWebTestAppServerWithRunner(t, webTestRunner{})
+	defer server.Close()
+	if _, err := service.CreateProviderSettings(execution.ProviderSettingsInput{
+		Name: "codex-command", BaseURL: "https://example.test/codex",
+		Models: []execution.ProviderModelSettings{{Profile: "default", ID: "gpt", Type: config.ProviderTypeOpenAICodex}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	registryState := newCodexLoginRegistry(context.Background(), service)
+	registryState.startDeviceLogin = func(ctx context.Context, _ string) (codexauth.PendingDeviceLogin, error) {
+		return codexauth.StartDeviceLogin(ctx, codexauth.DeviceLoginOptions{
+			UserCodeURL: deviceServer.URL + "/usercode", DeviceTokenURL: deviceServer.URL + "/device-token",
+			TokenURL: deviceServer.URL + "/oauth-token", RedirectURI: deviceServer.URL + "/callback",
+			HTTPClient: deviceServer.Client(), PollInterval: time.Millisecond,
+			Sleep: func(context.Context, time.Duration) error { return nil },
+		})
+	}
+	registry, err := newSessionCommandRegistry(service, nil, sessionCommandRegistryOptions{CodexLogins: registryState})
+	if err != nil {
+		t.Fatal(err)
+	}
+	startDefinition, err := registry.Definition("codex_login.start", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := startDefinition.Execute(context.Background(), commands.CommandRequest{Arguments: json.RawMessage(`{"provider":"codex-command"}`)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(result) != `{"provider":"codex-command","status":"accepted"}` || strings.Contains(string(result), "token") {
+		t.Fatalf("start result=%s", result)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		status, statusErr := registryState.status("codex-command")
+		if statusErr == nil && status.Status == "signed_in" {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	status, err := registryState.status("codex-command")
+	if err != nil || status.Status != "signed_in" || polls.Load() == 0 {
+		t.Fatalf("completed status=%#v polls=%d err=%v", status, polls.Load(), err)
+	}
+	if err := registryState.clear("codex-command"); err != nil {
+		t.Fatal(err)
+	}
+	status, err = registryState.status("codex-command")
+	if err != nil || status.Status != "signed_out" {
+		t.Fatalf("cleared status=%#v err=%v", status, err)
+	}
+	clearDefinition, err := registry.Definition("codex_login.clear", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	clearResult, err := clearDefinition.Execute(context.Background(), commands.CommandRequest{Arguments: json.RawMessage(`{"provider":"codex-command"}`)})
+	if err != nil || string(clearResult) != `{"provider":"codex-command","status":"cleared"}` {
+		t.Fatalf("signed-out clear result=%s err=%v", clearResult, err)
+	}
+
+	// An external failure is mapped to a fixed error and never echoes its
+	// diagnostic into the command result.
+	failing := newCodexLoginRegistry(context.Background(), service)
+	failing.startDeviceLogin = func(context.Context, string) (codexauth.PendingDeviceLogin, error) {
+		return codexauth.PendingDeviceLogin{}, errors.New("access-token-secret /raw/auth-file")
+	}
+	failingRegistry, err := newSessionCommandRegistry(service, nil, sessionCommandRegistryOptions{CodexLogins: failing})
+	if err != nil {
+		t.Fatal(err)
+	}
+	definition, err := failingRegistry.Definition("codex_login.start", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = definition.Execute(context.Background(), commands.CommandRequest{Arguments: json.RawMessage(`{"provider":"codex-command"}`)})
+	if err == nil || !strings.Contains(err.Error(), "Codex login could not be started") || strings.Contains(err.Error(), "access-token-secret") {
+		t.Fatalf("failure=%v", err)
+	}
+}
+
+func TestCodexLoginClearBlocksStaleCompletion(t *testing.T) {
+	completionStarted := make(chan struct{})
+	completionFinished := make(chan struct{})
+	var startedOnce sync.Once
+	var finishedOnce sync.Once
+	deviceServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/usercode":
+			_, _ = fmt.Fprint(w, `{"device_auth_id":"device-1","user_code":"USER-123","verification_uri":"https://example.test/device"}`)
+		default:
+			t.Fatalf("unexpected fake device path %q", r.URL.Path)
+		}
+	}))
+	defer deviceServer.Close()
+
+	server, service, _ := newWebTestAppServerWithRunner(t, webTestRunner{})
+	defer server.Close()
+	if _, err := service.CreateProviderSettings(execution.ProviderSettingsInput{
+		Name: "codex-race", BaseURL: "https://example.test/codex",
+		Models: []execution.ProviderModelSettings{{Profile: "default", ID: "gpt", Type: config.ProviderTypeOpenAICodex}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	registry := newCodexLoginRegistry(context.Background(), service)
+	registry.startDeviceLogin = func(ctx context.Context, _ string) (codexauth.PendingDeviceLogin, error) {
+		return codexauth.StartDeviceLogin(ctx, codexauth.DeviceLoginOptions{
+			UserCodeURL: deviceServer.URL + "/usercode", DeviceTokenURL: deviceServer.URL + "/device-token",
+			TokenURL: deviceServer.URL + "/oauth-token", RedirectURI: deviceServer.URL + "/callback",
+			HTTPClient: deviceServer.Client(), PollInterval: time.Millisecond,
+			Sleep: func(context.Context, time.Duration) error { return nil },
+		})
+	}
+	registry.completeDeviceLogin = func(ctx context.Context, _ codexauth.PendingDeviceLogin) (codexauth.DeviceLoginResult, error) {
+		startedOnce.Do(func() { close(completionStarted) })
+		<-ctx.Done()
+		finishedOnce.Do(func() { close(completionFinished) })
+		return codexauth.DeviceLoginResult{}, ctx.Err()
+	}
+	if _, err := registry.start("codex-race"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-completionStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("fake device flow did not reach completion")
+	}
+	if err := registry.clear("codex-race"); err != nil {
+		t.Fatal(err)
+	}
+	status, err := service.CodexAuthStatus("codex-race")
+	if err != nil || status.Status != "signed_out" {
+		t.Fatalf("status after clear=%#v err=%v", status, err)
+	}
+	// Wait for the completion hook to observe cancellation. This is the
+	// deterministic point at which the old completion can no longer proceed to
+	// token persistence; no fixed-duration sleep is used to prove the barrier.
+	select {
+	case <-completionFinished:
+	case <-time.After(2 * time.Second):
+		t.Fatal("stale completion did not observe clear cancellation")
+	}
+	status, err = service.CodexAuthStatus("codex-race")
+	if err != nil || status.Status != "signed_out" {
+		t.Fatalf("stale completion rewrote auth state: %#v err=%v", status, err)
 	}
 }
 

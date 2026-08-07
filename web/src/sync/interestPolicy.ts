@@ -1,4 +1,5 @@
 import type { ResourceKey } from '../protocol/types'
+import { isProviderName } from '../domain/providerIdentity'
 import { SyncSubscriptionError, type SyncRuntime } from './runtime'
 
 /**
@@ -127,6 +128,93 @@ export class ProviderSettingsInterestPolicy {
       this.desired = true
     } catch (reason) {
       this.desired = false
+      throw reason
+    }
+  }
+}
+
+export interface CurrentCodexLoginProviderSignal {
+  get(): string | null
+  subscribe(listener: () => void): () => void
+}
+
+export interface MutableCurrentCodexLoginProviderSignal extends CurrentCodexLoginProviderSignal {
+  set(provider: string | null): void
+}
+
+export function createCurrentCodexLoginProviderSignal(initialProvider: string | null = null): MutableCurrentCodexLoginProviderSignal {
+  let current = initialProvider
+  const listeners = new Set<() => void>()
+  return {
+    get: () => current,
+    set: (provider) => {
+      if (provider === current) return
+      current = provider
+      for (const listener of [...listeners]) listener()
+    },
+    subscribe: (listener) => { listeners.add(listener); return () => listeners.delete(listener) },
+  }
+}
+
+export interface CodexLoginInterestPolicyOptions { retainReleased?: boolean }
+
+/** Owns the selected Codex login resource independently of page lifetime.
+ * Device capabilities remain in the replica only while application interest
+ * exists (unless the caller explicitly requests bounded retention). */
+export class CodexLoginInterestPolicy {
+  private readonly runtime: Pick<SyncRuntime, 'subscribe' | 'evict'> | { subscribe: SyncRuntime['subscribe']; evict?: SyncRuntime['evict'] }
+  private readonly signal: CurrentCodexLoginProviderSignal
+  private readonly retainReleased: boolean
+  private started = false
+  private detachSignal: (() => void) | null = null
+  private releaseCurrent: (() => void) | null = null
+  private currentProvider: string | null = null
+
+  constructor(runtime: Pick<SyncRuntime, 'subscribe' | 'evict'> | { subscribe: SyncRuntime['subscribe']; evict?: SyncRuntime['evict'] }, signal: CurrentCodexLoginProviderSignal, options: CodexLoginInterestPolicyOptions = {}) {
+    this.runtime = runtime
+    this.signal = signal
+    this.retainReleased = options.retainReleased ?? false
+  }
+
+  start(): void {
+    if (this.started) return
+    this.started = true
+    this.detachSignal = this.signal.subscribe(() => this.reconcile())
+    this.reconcile()
+  }
+
+  stop(): void {
+    if (!this.started && !this.releaseCurrent && !this.detachSignal) return
+    this.started = false
+    this.detachSignal?.()
+    this.detachSignal = null
+    const old = this.currentProvider
+    this.releaseCurrent?.()
+    if (old && !this.retainReleased) this.runtime.evict?.({ type: 'codex_login', id: old })
+    this.releaseCurrent = null
+    this.currentProvider = null
+  }
+
+  get provider(): string | null { return this.currentProvider }
+
+  private reconcile(): void {
+    if (!this.started) return
+    const next = this.signal.get() || null
+    if (next !== null && !isProviderName(next)) throw new SyncSubscriptionError('invalid_resource', 'Codex login provider is invalid')
+    if (next === this.currentProvider) return
+    const old = this.currentProvider
+    this.releaseCurrent?.()
+    if (old && !this.retainReleased) this.runtime.evict?.({ type: 'codex_login', id: old })
+    this.releaseCurrent = null
+    if (!next) {
+      this.currentProvider = null
+      return
+    }
+    try {
+      this.releaseCurrent = this.runtime.subscribe({ type: 'codex_login', id: next }, { retainOnRelease: this.retainReleased })
+      this.currentProvider = next
+    } catch (reason) {
+      this.currentProvider = null
       throw reason
     }
   }
