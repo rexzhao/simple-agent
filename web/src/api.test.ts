@@ -9,32 +9,16 @@ describe('HTTP compatibility reads', () => {
     vi.restoreAllMocks()
   })
 
-  it('posts configured session creation fields as one typed options object', async () => {
-    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ id: 'session-new' }), { status: 201 }))
+  it('keeps bootstrap as the only ordinary application read', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ version: 'test', cwd: '/workspace', server_root: '/workspace', config_path: '/config' }), { status: 200 }))
     vi.stubGlobal('fetch', fetchMock)
 
-    await api.createSession({
-      projectID: 'project/1',
-      provider: 'fake',
-      modelProfile: 'precise',
-      reasoningLevel: 'high',
-      fullAccess: true,
-      cwd: '/workspace/src',
-      configPath: '/config/sai.yaml',
-    })
+    await expect(api.bootstrap()).resolves.toEqual({ version: 'test', cwd: '/workspace', server_root: '/workspace', config_path: '/config' })
 
     expect(fetchMock).toHaveBeenCalledTimes(1)
     const [path, init] = fetchMock.mock.calls[0] as [string, RequestInit]
-    expect(path).toBe('/api/projects/project%2F1/sessions')
-    expect(init.method).toBe('POST')
-    expect(JSON.parse(init.body as string)).toEqual({
-      cwd: '/workspace/src',
-      config_path: '/config/sai.yaml',
-      provider: 'fake',
-      model_profile: 'precise',
-      reasoning_level: 'high',
-      full_access: true,
-    })
+    expect(path).toBe('/api/bootstrap')
+    expect(init.method).toBeUndefined()
   })
 })
 

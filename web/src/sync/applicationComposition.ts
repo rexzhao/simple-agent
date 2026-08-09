@@ -158,10 +158,10 @@ export function createSyncApplication(options: SyncApplicationOptions = {}): Syn
       return { version: value.version, cwd: value.cwd, serverRoot: value.server_root, configPath: value.config_path }
     },
     sessionModels: async (projectID) => {
-      const value = await api.sessionModels(projectID)
+      const value = await commandFacade.readModels(projectID)
       return { models: value.models, defaultProvider: value.default_provider, defaultModel: value.default_model }
     },
-    codexUsage: async (provider) => codexUsageDomain(await api.codexUsage(provider)),
+    codexUsage: async (provider) => codexUsageDomain((await commandFacade.readCodexUsage(provider)).usage),
     loadSessionImage: async (sessionID, hash, signal) => {
       const image = await api.sessionImage(sessionID, hash, signal)
       return { bytes: await image.arrayBuffer(), contentType: image.type }

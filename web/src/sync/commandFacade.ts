@@ -19,8 +19,9 @@ import { isRFC3339Timestamp } from '../protocol/datetime'
 import { isCanonicalWireIdentifier, isWellFormedString } from '../protocol/identifiers'
 import type { ItemsPage } from '../types'
 import type { RunCancelResult, RunCommands, RunContinueOptions, RunContinueResult, RunControlOptions, RunPromptAppendOptions, RunPromptAppendResult, RunPromptMoveResult, RunPromptRemoveResult, RunPromptSteerResult, RunStartOptions, RunStartResult, RunStatus, RunToolCancelResult } from '../commands/runCommands'
-import type { ProjectArchiveResult, ProjectCommands, ProjectCreateOptions, ProjectCreateResult, ProjectDeleteResult, ProjectRenameResult } from '../commands/projectCommands'
-import type { ProviderCommands, ProviderCreateOptions, ProviderCreateResult, ProviderDefaultResult, ProviderDiscoverModelsResult, ProviderMutationResult, ProviderUpdateTarget } from '../commands/providerCommands'
+import type { ProjectArchiveResult, ProjectCommands, ProjectCreateOptions, ProjectCreateResult, ProjectDeleteResult, ProjectModelsResult, ProjectRenameResult } from '../commands/projectCommands'
+import type { ProviderCodexUsageResult, ProviderCommands, ProviderCreateOptions, ProviderCreateResult, ProviderDefaultResult, ProviderDiscoverModelsResult, ProviderMutationResult, ProviderUpdateTarget } from '../commands/providerCommands'
+import type { CodexUsage, CodexUsageWindow, CodexUsageWindowSet, SessionModelOption } from '../types'
 import type { CodexLoginClearResult, CodexLoginCommandOptions, CodexLoginCommands, CodexLoginStartResult } from '../commands/codexLoginCommands'
 import { encodeProviderTarget, decodeProviderDiscoverResult, validateProviderCommandJSON } from './providerCommandCodec'
 import { isProviderCreateName, isProviderName } from '../domain/providerIdentity'
@@ -344,6 +345,167 @@ function decodeHistoryReadResult(
   return blobClient.getJSON(blob, { signal }).then((payload) => ({ ...result, history: decodeHistoryPage(payload) }))
 }
 
+const maxSessionModelResultItems = 4096
+const maxSessionModelResultStringBytes = 4096
+const maxSessionModelResultBytes = 8 * 1024 * 1024
+const maxReadBlobBytes = 8 * 1024 * 1024
+
+function encodedResultBytes(value: unknown, label: string, maxBytes: number): number {
+  let encoded: string | undefined
+  try { encoded = JSON.stringify(value) } catch { throw new Error(`${label} is invalid`) }
+  if (encoded === undefined) throw new Error(`${label} is invalid`)
+  const size = new TextEncoder().encode(encoded).byteLength
+  if (size > maxBytes) throw new Error(`${label} is too large`)
+  return size
+}
+
+function boundedResultString(value: unknown, field: string, maxBytes = maxSessionModelResultStringBytes): string {
+  if (typeof value !== 'string' || !isWellFormedString(value) || new TextEncoder().encode(value).byteLength > maxBytes) throw new Error(`${field} is invalid`)
+  return value
+}
+
+function decodeSessionModelOptions(value: unknown): SessionModelOption[] {
+  if (!Array.isArray(value) || value.length > maxSessionModelResultItems) throw new Error('session model result is invalid')
+  const result = value.map((item) => {
+    const object = objectWithAllowedKeys(item, ['provider', 'model_profile', 'model_id', 'reasoning_levels', 'default_reasoning_level'])
+    const option: SessionModelOption = {
+      provider: boundedResultString(object.provider, 'provider'),
+      model_profile: boundedResultString(object.model_profile, 'model_profile'),
+      model_id: boundedResultString(object.model_id, 'model_id'),
+    }
+    if (object.reasoning_levels !== undefined) {
+      if (!Array.isArray(object.reasoning_levels) || object.reasoning_levels.length > 256) throw new Error('session model reasoning levels are invalid')
+      option.reasoning_levels = object.reasoning_levels.map((level) => boundedResultString(level, 'reasoning_level'))
+    }
+    if (object.default_reasoning_level !== undefined) option.default_reasoning_level = boundedResultString(object.default_reasoning_level, 'default_reasoning_level')
+    return option
+  })
+  let encoded: string | undefined
+  try { encoded = JSON.stringify(result) } catch { throw new Error('session model result is invalid') }
+  if (encoded === undefined || new TextEncoder().encode(encoded).byteLength > maxSessionModelResultBytes) throw new Error('session model result is too large')
+  return result
+}
+
+function decodeProjectModelsResult(value: unknown, projectID: string, blobClient?: BlobClient, signal?: AbortSignal): ProjectModelsResult | Promise<ProjectModelsResult> {
+  const object = exactObject(value, ['project_id', 'models', 'default_provider', 'default_model', 'blob'])
+  const resultProjectID = resultIdentifier(object, 'project_id')
+  if (resultProjectID !== projectID) throw new Error('project model result identity does not match request')
+  const defaultProvider = boundedResultString(object.default_provider, 'default_provider')
+  const defaultModel = boundedResultString(object.default_model, 'default_model')
+  const hasModels = object.models !== null
+  const hasBlob = object.blob !== null
+  if (hasModels === hasBlob) throw new Error('project model result payload is invalid')
+  if (hasModels) {
+    return {
+      project_id: resultProjectID,
+      models: decodeSessionModelOptions(object.models),
+      default_provider: defaultProvider,
+      default_model: defaultModel,
+    }
+  }
+  const descriptor = decodeBlobDescriptor(object.blob)
+  if (descriptor.size > maxReadBlobBytes) throw new Error('project model blob is too large')
+  if (descriptor.content_type !== 'application/json') throw new Error('project model blob content type is invalid')
+  if (!blobClient) throw new Error('project model result blob client is unavailable')
+  return blobClient.getJSON(descriptor, { signal }).then((payload) => {
+    encodedResultBytes(payload, 'project model result', maxReadBlobBytes)
+    return {
+      project_id: resultProjectID,
+      models: decodeSessionModelOptions(payload),
+      default_provider: defaultProvider,
+      default_model: defaultModel,
+    }
+  })
+}
+
+const codexUsageWindowMaxSeconds = 1_000_000_000
+const codexUsageResetAtMax = 10_000_000_000_000
+const codexUsageMaxAdditionalLimits = 64
+const codexUsageMaxArrayItems = 256
+
+function decodeCodexUsageWindow(value: unknown): CodexUsageWindow | null | undefined {
+  if (value === null) return null
+  if (value === undefined) return undefined
+  const object = exactObject(value, ['used_percent', 'limit_window_seconds', 'reset_after_seconds', 'reset_at'])
+  return {
+    used_percent: resultSafeInteger(object, 'used_percent', 0, 100),
+    limit_window_seconds: resultSafeInteger(object, 'limit_window_seconds', 0, codexUsageWindowMaxSeconds),
+    reset_after_seconds: resultSafeInteger(object, 'reset_after_seconds', 0, codexUsageWindowMaxSeconds),
+    reset_at: resultSafeInteger(object, 'reset_at', 0, codexUsageResetAtMax),
+  }
+}
+
+function decodeCodexUsageWindowSet(value: unknown): CodexUsageWindowSet | undefined {
+  if (value === null) return undefined
+  const object = exactObject(value, ['allowed', 'limit_reached', 'primary_window', 'secondary_window'])
+  if (typeof object.allowed !== 'boolean' || typeof object.limit_reached !== 'boolean') throw new Error('Codex usage rate limit is invalid')
+  return {
+    allowed: object.allowed,
+    limit_reached: object.limit_reached,
+    primary_window: decodeCodexUsageWindow(object.primary_window),
+    secondary_window: object.secondary_window === null ? null : decodeCodexUsageWindow(object.secondary_window),
+  }
+}
+
+function decodeCodexUsage(value: unknown): CodexUsage {
+  encodedResultBytes(value, 'Codex usage result', maxReadBlobBytes)
+  const object = exactObject(value, ['user_id', 'account_id', 'email', 'plan_type', 'rate_limit', 'additional_rate_limits', 'credits'])
+  const usage: CodexUsage = {
+    user_id: boundedResultString(object.user_id, 'user_id', 512),
+    account_id: boundedResultString(object.account_id, 'account_id', 512),
+    email: boundedResultString(object.email, 'email', 512),
+    plan_type: boundedResultString(object.plan_type, 'plan_type', 512),
+    rate_limit: decodeCodexUsageWindowSet(object.rate_limit),
+  }
+  if (object.additional_rate_limits !== null) {
+    if (!Array.isArray(object.additional_rate_limits) || object.additional_rate_limits.length > codexUsageMaxAdditionalLimits) throw new Error('Codex usage additional limits are invalid')
+    usage.additional_rate_limits = object.additional_rate_limits.map((item) => {
+      const additional = exactObject(item, ['limit_name', 'metered_feature', 'rate_limit'])
+      return {
+        limit_name: boundedResultString(additional.limit_name, 'limit_name', 512),
+        metered_feature: boundedResultString(additional.metered_feature, 'metered_feature', 512),
+        rate_limit: decodeCodexUsageWindowSet(additional.rate_limit),
+      }
+    })
+  }
+  if (object.credits !== null) {
+    const credits = exactObject(object.credits, ['has_credits', 'unlimited', 'overage_limit_reached', 'balance', 'approx_local_messages', 'approx_cloud_messages'])
+    if (typeof credits.has_credits !== 'boolean' || typeof credits.unlimited !== 'boolean' || typeof credits.overage_limit_reached !== 'boolean') throw new Error('Codex usage credits are invalid')
+    const decodeApprox = (value: unknown): number[] | undefined => {
+      if (value === null) return undefined
+      if (!Array.isArray(value) || value.length > codexUsageMaxArrayItems) throw new Error('Codex usage credit estimate is invalid')
+      return value.map((item) => {
+        if (!Number.isSafeInteger(item) || (item as number) < 0) throw new Error('Codex usage credit estimate is invalid')
+        return item as number
+      })
+    }
+    usage.credits = {
+      has_credits: credits.has_credits,
+      unlimited: credits.unlimited,
+      overage_limit_reached: credits.overage_limit_reached,
+      balance: boundedResultString(credits.balance, 'balance', 512),
+      approx_local_messages: decodeApprox(credits.approx_local_messages),
+      approx_cloud_messages: decodeApprox(credits.approx_cloud_messages),
+    }
+  }
+  return usage
+}
+
+function decodeProviderCodexUsageResult(value: unknown, provider: string, blobClient?: BlobClient, signal?: AbortSignal): ProviderCodexUsageResult | Promise<ProviderCodexUsageResult> {
+  const object = exactObject(value, ['provider', 'usage', 'blob'])
+  const resultProvider = resultString(object, 'provider')
+  if (resultProvider !== provider) throw new Error('Codex usage result identity does not match request')
+  const hasUsage = object.usage !== null
+  const hasBlob = object.blob !== null
+  if (hasUsage === hasBlob) throw new Error('Codex usage result payload is invalid')
+  if (hasUsage) return { provider: resultProvider, usage: decodeCodexUsage(object.usage) }
+  const descriptor = decodeBlobDescriptor(object.blob)
+  if (descriptor.size > maxReadBlobBytes) throw new Error('Codex usage blob is too large')
+  if (descriptor.content_type !== 'application/json') throw new Error('Codex usage blob content type is invalid')
+  if (!blobClient) throw new Error('Codex usage result blob client is unavailable')
+  return blobClient.getJSON(descriptor, { signal }).then((payload) => ({ provider: resultProvider, usage: decodeCodexUsage(payload) }))
+}
+
 function decodeMarkReadResult(value: unknown, sessionID: string, runID: string): SessionMarkReadResult {
   const object = exactObject(value, ['session_id', 'run_id', 'marked_read'])
   const resultSessionID = resultString(object, 'session_id')
@@ -570,6 +732,11 @@ export class CommandFacade implements SessionCommands, RunCommands, ProjectComma
     return this.submit('provider.discover_models', { provider }, true, (value, signal) => decodeProviderDiscoverResult(value, provider, this.blobClient, signal), options)
   }
 
+  readCodexUsage(provider: string, options: CommandOptions = {}): Promise<ProviderCodexUsageResult> {
+    if (!isProviderName(provider)) return Promise.reject(new CommandFacadeError('invalid', 'provider is invalid'))
+    return this.submit('provider.codex_usage.read', { provider }, true, (value, signal) => decodeProviderCodexUsageResult(value, provider, this.blobClient, signal), options)
+  }
+
   startCodexLogin(provider: string, options: CodexLoginCommandOptions = {}): Promise<CodexLoginStartResult> {
     if (!isProviderName(provider)) return Promise.reject(new CommandFacadeError('invalid', 'provider is invalid'))
     return this.submit('codex_login.start', { provider }, false, (value) => decodeCodexLoginResult(value, provider, 'accepted') as CodexLoginStartResult, options)
@@ -695,6 +862,12 @@ export class CommandFacade implements SessionCommands, RunCommands, ProjectComma
     const cleanProjectID = this.cleanID(projectID)
     if (!this.validProjectID(cleanProjectID)) return Promise.reject(new CommandFacadeError('invalid', 'project_id is invalid'))
     return this.submit('project.delete', { project_id: cleanProjectID }, false, (value) => decodeProjectDeleteResult(value, cleanProjectID), options)
+  }
+
+  readModels(projectID: string, options: CommandOptions = {}): Promise<ProjectModelsResult> {
+    const cleanProjectID = this.cleanID(projectID)
+    if (!this.validProjectID(cleanProjectID)) return Promise.reject(new CommandFacadeError('invalid', 'project_id is invalid'))
+    return this.submit('project.models.read', { project_id: cleanProjectID }, true, (value, signal) => decodeProjectModelsResult(value, cleanProjectID, this.blobClient, signal), options)
   }
 
   markRead(sessionID: string, runID: string, projectID?: string, options: CommandOptions = {}): Promise<SessionMarkReadResult> {

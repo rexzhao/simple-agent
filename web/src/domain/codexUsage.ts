@@ -1,6 +1,6 @@
 /**
- * Normalized, page-safe Codex usage data. The REST response is converted to
- * this shape at the application boundary while the sync protocol remains
+ * Normalized, page-safe Codex usage data. The typed command result is converted
+ * to this shape at the application boundary while transport details remain
  * uninvolved.
  */
 export interface CodexUsageWindowDomain {
@@ -98,7 +98,7 @@ function usageCredits(value: unknown): CodexUsageCreditsDomain | undefined {
 /**
  * Accept only the bounded fields that the page renders. Identity fields,
  * account information, and unknown future payload fields never cross this
- * REST compatibility boundary.
+ * application domain boundary.
  */
 export function codexUsageDomain(value: unknown): CodexUsageDomain {
   const source = record(value, 'Codex usage response is invalid')

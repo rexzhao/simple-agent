@@ -260,6 +260,20 @@ type providerDiscoverBlobResult struct {
 	Blob     *protocol.BlobDescriptor `json:"blob"`
 }
 
+type projectModelsReadResult struct {
+	ProjectID       string                         `json:"project_id"`
+	Models          []execution.SessionModelOption `json:"models"`
+	DefaultProvider string                         `json:"default_provider"`
+	DefaultModel    string                         `json:"default_model"`
+	Blob            *protocol.BlobDescriptor       `json:"blob"`
+}
+
+type providerCodexUsageReadResult struct {
+	Provider string                   `json:"provider"`
+	Usage    *execution.CodexUsage    `json:"usage"`
+	Blob     *protocol.BlobDescriptor `json:"blob"`
+}
+
 // sessionHistoryReadResult is a descriptor boundary, not a second history
 // model. Inline history and blob history both carry the exact SessionItemsPage
 // DTO returned by the existing REST page endpoint.
@@ -1265,6 +1279,23 @@ func decodeProviderDiscoverArguments(raw json.RawMessage) (providerDiscoverArgum
 	return providerDiscoverArguments{Provider: provider}, err
 }
 
+func decodeProjectModelsReadArguments(raw json.RawMessage) (projectIDArguments, error) {
+	return decodeProjectIDArguments(raw, "project.models.read")
+}
+
+func decodeProviderCodexUsageReadArguments(raw json.RawMessage) (providerDiscoverArguments, error) {
+	const command = "provider.codex_usage.read"
+	fields, err := strictCommandObject(raw, command)
+	if err != nil {
+		return providerDiscoverArguments{}, err
+	}
+	if err := requireExactFields(fields, command, "provider"); err != nil {
+		return providerDiscoverArguments{}, err
+	}
+	provider, err := requiredProviderIdentity(fields, "provider", command)
+	return providerDiscoverArguments{Provider: provider}, err
+}
+
 func decodeCodexLoginArguments(raw json.RawMessage, command string) (codexLoginArguments, error) {
 	fields, err := strictCommandObject(raw, command)
 	if err != nil {
@@ -1297,6 +1328,16 @@ func validateProviderDefaultArguments(raw json.RawMessage) error {
 
 func validateProviderDiscoverArguments(raw json.RawMessage) error {
 	_, err := decodeProviderDiscoverArguments(raw)
+	return err
+}
+
+func validateProjectModelsReadArguments(raw json.RawMessage) error {
+	_, err := decodeProjectModelsReadArguments(raw)
+	return err
+}
+
+func validateProviderCodexUsageReadArguments(raw json.RawMessage) error {
+	_, err := decodeProviderCodexUsageReadArguments(raw)
 	return err
 }
 
@@ -2058,6 +2099,29 @@ func providerCommandError(err error) error {
 	return commands.NewDomainError("provider_command_failed", "provider command failed", nil)
 }
 
+func projectModelsReadCommandError(err error) error {
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return commands.NewDomainError("cancelled", "command was cancelled", nil)
+	}
+	if errors.Is(err, projectstore.ErrNotFound) {
+		return commands.NewDomainError("project_not_found", "project not found", nil)
+	}
+	return commands.NewDomainError("project_models_read_failed", "project model options are unavailable", nil)
+}
+
+func providerCodexUsageReadCommandError(err error) error {
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return commands.NewDomainError("cancelled", "command was cancelled", nil)
+	}
+	return commands.NewDomainError("codex_usage_read_failed", "Codex usage is unavailable", nil)
+}
+
 func codexLoginCommandError(err error) error {
 	if err == nil {
 		return nil
@@ -2109,7 +2173,108 @@ const (
 	maxProviderDiscoverIDBytes   = 4096
 	maxProviderDiscoverBytes     = 8 * 1024 * 1024
 	maxProviderDiscoverInline    = 64 * 1024
+	maxProjectModels             = 4096
+	maxProjectModelsBytes        = 8 * 1024 * 1024
+	maxProjectModelsInline       = 64 * 1024
+	maxCodexUsageBytes           = 8 * 1024 * 1024
+	maxCodexUsageInline          = 64 * 1024
+	maxReadResultStringBytes     = 4096
+	maxCodexUsageStringBytes     = 512
+	maxCodexUsageAdditional      = 64
+	maxCodexUsageArrayItems      = 256
 )
+
+func validateReadBlobDescriptor(descriptor protocol.BlobDescriptor, content []byte, maxBytes int, label string) error {
+	if descriptor.ContentType != "application/json" || descriptor.Size != uint64(len(content)) || descriptor.Size > uint64(maxBytes) {
+		return fmt.Errorf("%s blob descriptor size or content type is invalid", label)
+	}
+	if err := protocol.ValidateBlobDescriptor(descriptor); err != nil {
+		return err
+	}
+	digest := sha256.Sum256(content)
+	if !strings.EqualFold(descriptor.SHA256, hex.EncodeToString(digest[:])) {
+		return fmt.Errorf("%s blob descriptor hash is invalid", label)
+	}
+	return nil
+}
+
+func validateReadResultString(value string, maxBytes int) bool {
+	return utf8.ValidString(value) && len([]byte(value)) <= maxBytes
+}
+
+func validateProjectModelsReadValue(options execution.SessionModelOptions) error {
+	if !validateReadResultString(options.DefaultProvider, maxReadResultStringBytes) || !validateReadResultString(options.DefaultModel, maxReadResultStringBytes) {
+		return errors.New("project model default is invalid")
+	}
+	if len(options.Models) > maxProjectModels {
+		return errors.New("project model count is outside the allowed bound")
+	}
+	for _, model := range options.Models {
+		if !validateReadResultString(model.Provider, maxReadResultStringBytes) ||
+			!validateReadResultString(model.ModelProfile, maxReadResultStringBytes) ||
+			!validateReadResultString(model.ModelID, maxReadResultStringBytes) ||
+			len(model.ReasoningLevels) > maxCodexUsageArrayItems ||
+			!validateReadResultString(model.DefaultReasoningLevel, maxReadResultStringBytes) {
+			return errors.New("project model option is invalid")
+		}
+		for _, level := range model.ReasoningLevels {
+			if !validateReadResultString(level, maxReadResultStringBytes) {
+				return errors.New("project model reasoning level is invalid")
+			}
+		}
+	}
+	return nil
+}
+
+func validateCodexUsageReadValue(usage execution.CodexUsage) error {
+	validText := func(value string) bool { return validateReadResultString(value, maxCodexUsageStringBytes) }
+	if !validText(usage.UserID) || !validText(usage.AccountID) || !validText(usage.Email) || !validText(usage.PlanType) {
+		return errors.New("Codex usage identity is invalid")
+	}
+	validateWindow := func(window *execution.CodexUsageWindow) error {
+		if window == nil {
+			return nil
+		}
+		if window.UsedPercent < 0 || window.UsedPercent > 100 || window.LimitWindowSeconds < 0 || window.LimitWindowSeconds > 1_000_000_000 || window.ResetAfterSeconds < 0 || window.ResetAfterSeconds > 1_000_000_000 || window.ResetAt < 0 || window.ResetAt > 10_000_000_000_000 {
+			return errors.New("Codex usage window is outside the allowed bound")
+		}
+		return nil
+	}
+	validateWindowSet := func(value *execution.CodexUsageWindowSet) error {
+		if value == nil {
+			return nil
+		}
+		if err := validateWindow(value.PrimaryWindow); err != nil {
+			return err
+		}
+		return validateWindow(value.SecondaryWindow)
+	}
+	if err := validateWindowSet(usage.RateLimit); err != nil {
+		return err
+	}
+	if len(usage.AdditionalRateLimits) > maxCodexUsageAdditional {
+		return errors.New("Codex usage additional limits exceed the allowed bound")
+	}
+	for _, additional := range usage.AdditionalRateLimits {
+		if !validText(additional.LimitName) || !validText(additional.MeteredFeature) {
+			return errors.New("Codex usage additional limit is invalid")
+		}
+		if err := validateWindowSet(additional.RateLimit); err != nil {
+			return err
+		}
+	}
+	if usage.Credits != nil {
+		if !validText(usage.Credits.Balance) || len(usage.Credits.ApproxLocalMessages) > maxCodexUsageArrayItems || len(usage.Credits.ApproxCloudMessages) > maxCodexUsageArrayItems {
+			return errors.New("Codex usage credits are invalid")
+		}
+		for _, value := range append(append([]int(nil), usage.Credits.ApproxLocalMessages...), usage.Credits.ApproxCloudMessages...) {
+			if value < 0 || int64(value) > 9_007_199_254_740_991 {
+				return errors.New("Codex usage credit estimate is outside the allowed bound")
+			}
+		}
+	}
+	return nil
+}
 
 func validateProviderDiscoverBlobDescriptor(descriptor protocol.BlobDescriptor, content []byte) error {
 	if descriptor.ContentType != "application/json" || descriptor.Size != uint64(len(content)) || descriptor.Size > maxProviderDiscoverBytes {
@@ -2336,6 +2501,100 @@ func newSessionCommandRegistry(service *execution.Service, runs *runRegistry, op
 					return nil, commands.NewDomainError("provider_result_invalid", "provider model result is invalid", nil)
 				}
 				return json.Marshal(providerDiscoverBlobResult{Provider: arguments.Provider, Blob: &descriptor})
+			},
+		},
+		commands.CommandDefinition{
+			Name: "provider.codex_usage.read", SchemaVersion: 1, CrossEpochRetrySafe: true,
+			CachePolicy: commands.ResultCacheVolatile, SupportsExpectedRevision: false,
+			Validate: validateProviderCodexUsageReadArguments,
+			Execute: func(ctx context.Context, request commands.CommandRequest) (json.RawMessage, error) {
+				arguments, err := decodeProviderCodexUsageReadArguments(request.Arguments)
+				if err != nil {
+					return nil, err
+				}
+				if service == nil {
+					return nil, commands.NewDomainError("provider_unavailable", "provider service is not configured", nil)
+				}
+				usage, err := service.CodexUsage(ctx, arguments.Provider)
+				if err != nil {
+					return nil, providerCodexUsageReadCommandError(err)
+				}
+				if err := validateCodexUsageReadValue(usage); err != nil {
+					return nil, commands.NewDomainError("codex_usage_result_invalid", "Codex usage result is invalid", nil)
+				}
+				usageBytes, err := json.Marshal(usage)
+				if err != nil || len(usageBytes) > maxCodexUsageBytes {
+					return nil, commands.NewDomainError("codex_usage_result_too_large", "Codex usage result is too large", nil)
+				}
+				inline, err := json.Marshal(providerCodexUsageReadResult{Provider: arguments.Provider, Usage: &usage, Blob: nil})
+				if err != nil {
+					return nil, commands.NewDomainError("codex_usage_result_invalid", "Codex usage result is invalid", nil)
+				}
+				if len(inline) <= maxCodexUsageInline || historyWriter == nil {
+					if historyWriter == nil && len(inline) > maxCodexUsageInline {
+						return nil, commands.NewDomainError("codex_usage_result_too_large", "Codex usage result is too large", nil)
+					}
+					return inline, nil
+				}
+				descriptor, err := historyWriter.Put(ctx, "application/json", usageBytes)
+				if err != nil {
+					return nil, providerCodexUsageReadCommandError(err)
+				}
+				if err := validateReadBlobDescriptor(descriptor, usageBytes, maxCodexUsageBytes, "Codex usage"); err != nil {
+					return nil, commands.NewDomainError("codex_usage_result_invalid", "Codex usage result is invalid", nil)
+				}
+				return json.Marshal(providerCodexUsageReadResult{Provider: arguments.Provider, Usage: nil, Blob: &descriptor})
+			},
+		},
+		commands.CommandDefinition{
+			Name: "project.models.read", SchemaVersion: 1, CrossEpochRetrySafe: true,
+			CachePolicy: commands.ResultCacheVolatile, SupportsExpectedRevision: false,
+			Validate: validateProjectModelsReadArguments,
+			Execute: func(ctx context.Context, request commands.CommandRequest) (json.RawMessage, error) {
+				arguments, err := decodeProjectModelsReadArguments(request.Arguments)
+				if err != nil {
+					return nil, err
+				}
+				if service == nil {
+					return nil, commands.NewDomainError("project_unavailable", "project service is not configured", nil)
+				}
+				options, err := service.ConfiguredSessionModels(arguments.ProjectID)
+				if err != nil {
+					return nil, projectModelsReadCommandError(err)
+				}
+				if err := validateProjectModelsReadValue(options); err != nil {
+					return nil, commands.NewDomainError("project_models_result_invalid", "project model result is invalid", nil)
+				}
+				modelBytes, err := json.Marshal(options.Models)
+				if err != nil || len(modelBytes) > maxProjectModelsBytes {
+					return nil, commands.NewDomainError("project_models_result_too_large", "project model result is too large", nil)
+				}
+				inline, err := json.Marshal(projectModelsReadResult{
+					ProjectID: arguments.ProjectID, Models: options.Models,
+					DefaultProvider: options.DefaultProvider, DefaultModel: options.DefaultModel,
+					Blob: nil,
+				})
+				if err != nil {
+					return nil, commands.NewDomainError("project_models_result_invalid", "project model result is invalid", nil)
+				}
+				if len(inline) <= maxProjectModelsInline || historyWriter == nil {
+					if historyWriter == nil && len(inline) > maxProjectModelsInline {
+						return nil, commands.NewDomainError("project_models_result_too_large", "project model result is too large", nil)
+					}
+					return inline, nil
+				}
+				descriptor, err := historyWriter.Put(ctx, "application/json", modelBytes)
+				if err != nil {
+					return nil, projectModelsReadCommandError(err)
+				}
+				if err := validateReadBlobDescriptor(descriptor, modelBytes, maxProjectModelsBytes, "project model"); err != nil {
+					return nil, commands.NewDomainError("project_models_result_invalid", "project model result is invalid", nil)
+				}
+				return json.Marshal(projectModelsReadResult{
+					ProjectID: arguments.ProjectID, Models: nil,
+					DefaultProvider: options.DefaultProvider, DefaultModel: options.DefaultModel,
+					Blob: &descriptor,
+				})
 			},
 		},
 		commands.CommandDefinition{

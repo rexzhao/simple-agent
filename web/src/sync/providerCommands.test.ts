@@ -68,6 +68,35 @@ const target = {
   }],
 } as const
 
+const readModel = {
+  provider: 'codex',
+  model_profile: 'fast',
+  model_id: 'gpt-5',
+  reasoning_levels: ['low', 'medium'],
+  default_reasoning_level: 'medium',
+}
+
+const readUsage = {
+  user_id: 'user_1',
+  account_id: 'account_1',
+  email: 'user@example.test',
+  plan_type: 'pro',
+  rate_limit: {
+    allowed: true,
+    limit_reached: false,
+    primary_window: { used_percent: 20, limit_window_seconds: 3600, reset_after_seconds: 1800, reset_at: 1_900_000_000 },
+    secondary_window: null,
+  },
+  additional_rate_limits: null,
+  credits: null,
+}
+
+const { additional_rate_limits: _unusedAdditionalRates, credits: _unusedCredits, ...decodedReadUsage } = readUsage
+const nullableReadUsage = {
+  ...readUsage,
+  rate_limit: { allowed: true, limit_reached: false, primary_window: null, secondary_window: null },
+}
+
 describe('ProviderCommands', () => {
   it('permits an empty safe endpoint only for an existing-provider preserve target', () => {
     const encoded = encodeProviderTarget({ ...target, base_url: '', base_url_mode: 'preserve' })
@@ -220,6 +249,151 @@ describe('ProviderCommands', () => {
     ]) {
       await expect(decodeProviderDiscoverResult({ provider: 'p', blob: invalid }, 'p', blobClient)).rejects.toThrow()
     }
+  })
+
+  it('reads project models and Codex usage through typed commands with target and blob validation', async () => {
+    const transport = new ProviderCommandTransport()
+    const blobClient = new RecordingBlobClient()
+    const facade = new CommandFacade({ transport, blobClient: blobClient as unknown as BlobClient })
+
+    const modelsPending = facade.readModels('project_1')
+    const modelsCommand = transport.sent[0]
+    if (modelsCommand.type !== 'command') throw new Error('wrong models command')
+    expect(modelsCommand.payload.name).toBe('project.models.read')
+    expect(modelsCommand.payload.schema_version).toBe(1)
+    expect(modelsCommand.payload.arguments).toEqual({ project_id: 'project_1' })
+    transport.emitResult(modelsCommand.payload.request_id, {
+      project_id: 'project_1',
+      models: [readModel],
+      default_provider: 'codex',
+      default_model: 'gpt-5',
+      blob: null,
+    })
+    await expect(modelsPending).resolves.toEqual({
+      project_id: 'project_1', models: [readModel], default_provider: 'codex', default_model: 'gpt-5',
+    })
+
+    const usagePending = facade.readCodexUsage('codex')
+    const usageCommand = transport.sent[1]
+    if (usageCommand.type !== 'command') throw new Error('wrong usage command')
+    expect(usageCommand.payload.name).toBe('provider.codex_usage.read')
+    expect(usageCommand.payload.schema_version).toBe(1)
+    expect(usageCommand.payload.arguments).toEqual({ provider: 'codex' })
+    transport.emitResult(usageCommand.payload.request_id, { provider: 'codex', usage: readUsage, blob: null })
+    await expect(usagePending).resolves.toEqual({ provider: 'codex', usage: decodedReadUsage })
+
+    const nullableUsagePending = facade.readCodexUsage('codex')
+    const nullableUsageCommand = transport.sent[2]
+    if (nullableUsageCommand.type !== 'command') throw new Error('wrong nullable usage command')
+    transport.emitResult(nullableUsageCommand.payload.request_id, { provider: 'codex', usage: nullableReadUsage, blob: null })
+    await expect(nullableUsagePending).resolves.toMatchObject({
+      provider: 'codex',
+      usage: { rate_limit: { allowed: true, limit_reached: false, primary_window: null, secondary_window: null } },
+    })
+    facade.stop()
+
+    const blobTransport = new ProviderCommandTransport()
+    const blobReader = new RecordingBlobClient()
+    const blobFacade = new CommandFacade({ transport: blobTransport, blobClient: blobReader as unknown as BlobClient })
+    const blobModels = blobFacade.readModels('project_1')
+    const blobModelsCommand = blobTransport.sent[0]
+    if (blobModelsCommand.type !== 'command') throw new Error('wrong blob models command')
+    blobTransport.emitResult(blobModelsCommand.payload.request_id, {
+      project_id: 'project_1', models: null, default_provider: 'codex', default_model: 'gpt-5', blob: blobDescriptor,
+    })
+    expect(blobReader.calls).toHaveLength(1)
+    blobReader.calls[0].resolve([readModel])
+    await expect(blobModels).resolves.toEqual({
+      project_id: 'project_1', models: [readModel], default_provider: 'codex', default_model: 'gpt-5',
+    })
+
+    const blobUsage = blobFacade.readCodexUsage('codex')
+    const blobUsageCommand = blobTransport.sent[1]
+    if (blobUsageCommand.type !== 'command') throw new Error('wrong blob usage command')
+    blobTransport.emitResult(blobUsageCommand.payload.request_id, { provider: 'codex', usage: null, blob: blobDescriptor })
+    expect(blobReader.calls).toHaveLength(2)
+    blobReader.calls[1].resolve(readUsage)
+    await expect(blobUsage).resolves.toEqual({ provider: 'codex', usage: decodedReadUsage })
+    blobFacade.stop()
+
+    const mismatchTransport = new ProviderCommandTransport()
+    const mismatchFacade = new CommandFacade({ transport: mismatchTransport })
+    const mismatchProject = mismatchFacade.readModels('project_1')
+    const mismatchProjectCommand = mismatchTransport.sent[0]
+    if (mismatchProjectCommand.type !== 'command') throw new Error('wrong mismatch project command')
+    mismatchTransport.emitResult(mismatchProjectCommand.payload.request_id, {
+      project_id: 'project_2', models: [readModel], default_provider: 'codex', default_model: 'gpt-5', blob: null,
+    })
+    await expect(mismatchProject).rejects.toMatchObject({ code: 'invalid' })
+    const extraUsage = mismatchFacade.readCodexUsage('codex')
+    const extraUsageCommand = mismatchTransport.sent[1]
+    if (extraUsageCommand.type !== 'command') throw new Error('wrong extra usage command')
+    mismatchTransport.emitResult(extraUsageCommand.payload.request_id, { provider: 'codex', usage: readUsage, blob: null, secret: 'must-reject' })
+    await expect(extraUsage).rejects.toMatchObject({ code: 'invalid' })
+    mismatchFacade.stop()
+  })
+
+  it('retries typed read blobs across epochs and aborts the stale blob read', async () => {
+    const transport = new ProviderCommandTransport()
+    const blobClient = new RecordingBlobClient()
+    const facade = new CommandFacade({ transport, blobClient: blobClient as unknown as BlobClient })
+    const pending = facade.readCodexUsage('codex')
+    const first = transport.sent[0]
+    if (first.type !== 'command') throw new Error('wrong first usage command')
+    transport.emitResult(first.payload.request_id, { provider: 'codex', usage: null, blob: blobDescriptor })
+    transport.connectionGeneration = 2
+    transport.emitReady('epoch_2', 'epoch_1')
+    const retry = transport.sent[1]
+    if (retry.type !== 'command') throw new Error('wrong retried usage command')
+    transport.emitResult(retry.payload.request_id, { provider: 'codex', usage: null, blob: blobDescriptor }, 2)
+    expect(blobClient.calls).toHaveLength(2)
+    expect(blobClient.calls[0].signal?.aborted).toBe(true)
+    blobClient.calls[0].resolve({ ...readUsage, user_id: 'stale' })
+    blobClient.calls[1].resolve(readUsage)
+    await expect(pending).resolves.toEqual({ provider: 'codex', usage: decodedReadUsage })
+    facade.stop()
+  })
+
+  it('rejects oversized read Blob descriptors before fetch and oversized decoded payloads', async () => {
+    const oversizedDescriptor = { ...blobDescriptor, size: 8 * 1024 * 1024 + 1 }
+    const descriptorTransport = new ProviderCommandTransport()
+    const descriptorBlobClient = new RecordingBlobClient()
+    const descriptorFacade = new CommandFacade({ transport: descriptorTransport, blobClient: descriptorBlobClient as unknown as BlobClient })
+
+    const projectPending = descriptorFacade.readModels('project_1')
+    const projectCommand = descriptorTransport.sent[0]
+    if (projectCommand.type !== 'command') throw new Error('wrong oversized project command')
+    descriptorTransport.emitResult(projectCommand.payload.request_id, {
+      project_id: 'project_1', models: null, default_provider: 'codex', default_model: 'gpt-5', blob: oversizedDescriptor,
+    })
+    await expect(projectPending).rejects.toMatchObject({ code: 'invalid' })
+    expect(descriptorBlobClient.calls).toHaveLength(0)
+
+    const usagePending = descriptorFacade.readCodexUsage('codex')
+    const usageCommand = descriptorTransport.sent[1]
+    if (usageCommand.type !== 'command') throw new Error('wrong oversized usage command')
+    descriptorTransport.emitResult(usageCommand.payload.request_id, { provider: 'codex', usage: null, blob: oversizedDescriptor })
+    await expect(usagePending).rejects.toMatchObject({ code: 'invalid' })
+    expect(descriptorBlobClient.calls).toHaveLength(0)
+    descriptorFacade.stop()
+
+    const payloadTransport = new ProviderCommandTransport()
+    const payloadBlobClient = new RecordingBlobClient()
+    const payloadFacade = new CommandFacade({ transport: payloadTransport, blobClient: payloadBlobClient as unknown as BlobClient })
+    const projectPayloadPending = payloadFacade.readModels('project_1')
+    const projectPayloadCommand = payloadTransport.sent[0]
+    if (projectPayloadCommand.type !== 'command') throw new Error('wrong oversized project payload command')
+    payloadTransport.emitResult(projectPayloadCommand.payload.request_id, { project_id: 'project_1', models: null, default_provider: 'codex', default_model: 'gpt-5', blob: blobDescriptor })
+    payloadBlobClient.calls[0].resolve([{ ...readModel, ignored: 'x'.repeat(8 * 1024 * 1024) }])
+    await expect(projectPayloadPending).rejects.toMatchObject({ code: 'invalid' })
+
+    const usagePayloadPending = payloadFacade.readCodexUsage('codex')
+    const usagePayloadCommand = payloadTransport.sent[1]
+    if (usagePayloadCommand.type !== 'command') throw new Error('wrong oversized usage payload command')
+    payloadTransport.emitResult(usagePayloadCommand.payload.request_id, { provider: 'codex', usage: null, blob: blobDescriptor })
+    payloadBlobClient.calls[1].resolve({ ...readUsage, ignored: 'x'.repeat(8 * 1024 * 1024) })
+    await expect(usagePayloadPending).rejects.toMatchObject({ code: 'invalid' })
+    payloadFacade.stop()
   })
 
   it('rejects target values that could be changed by JSON serialization before sending', async () => {

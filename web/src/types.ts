@@ -22,12 +22,6 @@ export interface SessionModelOption {
   default_reasoning_level?: string
 }
 
-export interface SessionModelOptions {
-  models: SessionModelOption[]
-  default_provider: string
-  default_model: string
-}
-
 /** Prices are currency units per one million tokens. */
 export interface ModelPricing {
   input_cache_hit: number
@@ -56,7 +50,7 @@ export interface CodexUsageWindow {
 export interface CodexUsageWindowSet {
   allowed: boolean
   limit_reached: boolean
-  primary_window?: CodexUsageWindow
+  primary_window?: CodexUsageWindow | null
   secondary_window?: CodexUsageWindow | null
 }
 

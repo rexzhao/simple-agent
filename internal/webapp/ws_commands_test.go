@@ -9,6 +9,8 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"sync"
@@ -263,6 +265,20 @@ func TestProviderCommandSchemasAreStrictAndBounded(t *testing.T) {
 	if err := validateProviderDiscoverArguments(json.RawMessage(`{"provider":"空 白 provider"}`)); err != nil {
 		t.Fatalf("valid provider.discover_models rejected: %v", err)
 	}
+	if err := validateProviderCodexUsageReadArguments(json.RawMessage(`{"provider":"空 白 provider"}`)); err != nil {
+		t.Fatalf("valid provider.codex_usage.read rejected: %v", err)
+	}
+	for _, raw := range []json.RawMessage{
+		json.RawMessage(`{}`),
+		json.RawMessage(`{"provider":null}`),
+		json.RawMessage(`{"provider":"空 白 provider","extra":true}`),
+		json.RawMessage(`{"provider":"空 白 provider","provider":"other"}`),
+		json.RawMessage(`{"provider":"空 白 provider"} trailing`),
+	} {
+		if err := validateProviderCodexUsageReadArguments(raw); err == nil {
+			t.Fatalf("provider.codex_usage.read accepted invalid arguments: %s", raw)
+		}
+	}
 	redacted := redactProviderUpdateArguments(valid)
 	if string(redacted) != `{}` {
 		t.Fatalf("provider update cache tombstone = %s, want {}", redacted)
@@ -423,6 +439,204 @@ func TestProviderDiscoverCommandUsesBlobBoundaryAndRejectsOverage(t *testing.T) 
 	}
 }
 
+func TestProjectModelsReadCommandUsesInlineAndBlobBoundaries(t *testing.T) {
+	root := t.TempDir()
+	writeWebTestConfig(t, root)
+	service, err := execution.NewService(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	projectRoot := t.TempDir()
+	project, err := service.CreateProject(projectRoot, "Models")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	registry, err := newSessionCommandRegistry(service, nil, sessionCommandRegistryOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	definition, err := registry.Definition("project.models.read", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := commands.CommandRequest{Name: "project.models.read", SchemaVersion: 1, Arguments: json.RawMessage(fmt.Sprintf(`{"project_id":%q}`, project.Project.ID))}
+	inline, err := definition.Execute(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var inlineResult projectModelsReadResult
+	if err := json.Unmarshal(inline, &inlineResult); err != nil {
+		t.Fatal(err)
+	}
+	if inlineResult.ProjectID != project.Project.ID || inlineResult.Blob != nil || len(inlineResult.Models) != 2 || inlineResult.DefaultProvider != "fake" || inlineResult.DefaultModel != "fast" {
+		t.Fatalf("inline project.models.read result = %#v", inlineResult)
+	}
+	if strings.Contains(string(inline), "test-key") {
+		t.Fatalf("project.models.read leaked provider secret: %s", inline)
+	}
+
+	var providerConfig strings.Builder
+	providerConfig.WriteString("name: fake\nbase_url: http://127.0.0.1:1/v1\napi_key: test-key\nmodels:\n")
+	const largeModelCount = 1500
+	for index := 0; index < largeModelCount; index++ {
+		fmt.Fprintf(&providerConfig, "  model_%04d:\n    id: %s\n    context_window: 32000\n", index, strings.Repeat(fmt.Sprintf("model-%04d-", index), 8))
+	}
+	if err := os.WriteFile(filepath.Join(root, "providers", "fake.yaml"), []byte(providerConfig.String()), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	writer := &providerCommandTestBlobWriter{}
+	registry, err = newSessionCommandRegistry(service, nil, sessionCommandRegistryOptions{HistoryWriter: writer})
+	if err != nil {
+		t.Fatal(err)
+	}
+	definition, err = registry.Definition("project.models.read", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	blobResultRaw, err := definition.Execute(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var blobResult projectModelsReadResult
+	if err := json.Unmarshal(blobResultRaw, &blobResult); err != nil {
+		t.Fatal(err)
+	}
+	if blobResult.ProjectID != project.Project.ID || blobResult.Models != nil || blobResult.Blob == nil || len(writer.content) <= maxProjectModelsInline {
+		t.Fatalf("blob project.models.read result=%s content=%d", blobResultRaw, len(writer.content))
+	}
+	if blobResult.Blob.ContentType != "application/json" || blobResult.Blob.Size != uint64(len(writer.content)) {
+		t.Fatalf("blob project.models.read descriptor=%#v content=%d", blobResult.Blob, len(writer.content))
+	}
+	var models []execution.SessionModelOption
+	if err := json.Unmarshal(writer.content, &models); err != nil || len(models) != largeModelCount {
+		t.Fatalf("project model blob len=%d err=%v", len(models), err)
+	}
+}
+
+func TestProviderCodexUsageReadCommandUsesInlineAndBlobBoundaries(t *testing.T) {
+	root := t.TempDir()
+	writeWebTestConfig(t, root)
+	secret := "codex-command-secret"
+	large := false
+	providerServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/backend-api/wham/usage" {
+			t.Fatalf("usage path=%q", r.URL.Path)
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer "+secret {
+			t.Fatalf("usage authorization=%q", got)
+		}
+		additional := []map[string]any(nil)
+		if large {
+			additional = make([]map[string]any, 64)
+			for index := range additional {
+				additional[index] = map[string]any{
+					"limit_name":      fmt.Sprintf("window-%04d-%s", index, strings.Repeat("x", 500)),
+					"metered_feature": strings.Repeat("codex", 102),
+					"rate_limit":      nil,
+				}
+			}
+		}
+		payload := map[string]any{
+			"user_id": "user-1", "account_id": "account-1", "email": "user@example.test", "plan_type": "pro",
+			"rate_limit":             map[string]any{"allowed": true, "limit_reached": false, "primary_window": nil, "secondary_window": nil},
+			"additional_rate_limits": additional, "credits": nil,
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(payload); err != nil {
+			t.Fatal(err)
+		}
+	}))
+	defer providerServer.Close()
+
+	service, err := execution.NewService(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	authFile := filepath.Join(root, "auth", "codex.json")
+	if _, err := service.CreateProviderSettings(execution.ProviderSettingsInput{
+		Name: "codex", BaseURL: providerServer.URL + "/backend-api/codex", AuthFile: authFile,
+		Models: []execution.ProviderModelSettings{{Profile: "gpt", ID: "gpt-5", Type: config.ProviderTypeOpenAICodex}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := (codexauth.Store{Path: authFile}).Save(codexauth.TokenFile{AccessToken: secret, ExpiresAt: time.Now().Add(time.Hour)}); err != nil {
+		t.Fatal(err)
+	}
+
+	writer := &providerCommandTestBlobWriter{}
+	registry, err := newSessionCommandRegistry(service, nil, sessionCommandRegistryOptions{HistoryWriter: writer})
+	if err != nil {
+		t.Fatal(err)
+	}
+	definition, err := registry.Definition("provider.codex_usage.read", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := commands.CommandRequest{Name: "provider.codex_usage.read", SchemaVersion: 1, Arguments: json.RawMessage(`{"provider":"codex"}`)}
+	inline, err := definition.Execute(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var inlineResult providerCodexUsageReadResult
+	if err := json.Unmarshal(inline, &inlineResult); err != nil {
+		t.Fatal(err)
+	}
+	if inlineResult.Provider != "codex" || inlineResult.Usage == nil || inlineResult.Blob != nil || inlineResult.Usage.UserID != "user-1" || inlineResult.Usage.RateLimit == nil || inlineResult.Usage.RateLimit.PrimaryWindow != nil || inlineResult.Usage.RateLimit.SecondaryWindow != nil || writer.content != nil {
+		t.Fatalf("inline provider.codex_usage.read result=%s parsed=%#v", inline, inlineResult)
+	}
+	if strings.Contains(string(inline), secret) {
+		t.Fatalf("provider.codex_usage.read leaked credential: %s", inline)
+	}
+
+	large = true
+	blob, err := definition.Execute(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var blobResult providerCodexUsageReadResult
+	if err := json.Unmarshal(blob, &blobResult); err != nil {
+		t.Fatal(err)
+	}
+	if blobResult.Provider != "codex" || blobResult.Usage != nil || blobResult.Blob == nil || len(writer.content) <= maxCodexUsageInline {
+		t.Fatalf("blob provider.codex_usage.read result=%s content=%d", blob, len(writer.content))
+	}
+	if strings.Contains(string(blob), secret) || strings.Contains(string(writer.content), secret) {
+		t.Fatal("provider.codex_usage.read leaked credential in result or blob")
+	}
+	var usage execution.CodexUsage
+	if err := json.Unmarshal(writer.content, &usage); err != nil || len(usage.AdditionalRateLimits) != 64 {
+		t.Fatalf("codex usage blob additional limits=%d err=%v", len(usage.AdditionalRateLimits), err)
+	}
+}
+
+func TestReadCommandErrorsAreStableAndDoNotExposeSecrets(t *testing.T) {
+	secret := "bearer-command-secret /private/auth/file"
+	for _, test := range []struct {
+		name string
+		got  error
+		code string
+	}{
+		{name: "project", got: projectModelsReadCommandError(errors.New(secret)), code: "project_models_read_failed"},
+		{name: "provider", got: providerCodexUsageReadCommandError(errors.New(secret)), code: "codex_usage_read_failed"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var domain *commands.DomainError
+			if !errors.As(test.got, &domain) || domain.Code != test.code {
+				t.Fatalf("error=%#v, want domain code %q", test.got, test.code)
+			}
+			if strings.Contains(test.got.Error(), secret) || strings.Contains(test.got.Error(), "auth") || strings.Contains(test.got.Error(), "private") {
+				t.Fatalf("domain error leaked secret details: %v", test.got)
+			}
+		})
+	}
+	var cancelled *commands.DomainError
+	if !errors.As(providerCodexUsageReadCommandError(context.Canceled), &cancelled) || cancelled.Code != "cancelled" {
+		t.Fatalf("cancelled provider usage error = %#v", cancelled)
+	}
+}
+
 func TestProjectCommandSchemasAreStrict(t *testing.T) {
 	validCreate := json.RawMessage(`{"operation_id":"operation_project_1","root":"/tmp/project","display_name":"Project"}`)
 	if err := validateProjectCreateArguments(validCreate); err != nil {
@@ -463,6 +677,9 @@ func TestProjectCommandSchemasAreStrict(t *testing.T) {
 		}},
 		{name: "delete", validate: func(raw json.RawMessage) error { return validateProjectIDArguments(raw, "project.delete") }, valid: json.RawMessage(`{"project_id":"project_1"}`), invalid: []json.RawMessage{
 			json.RawMessage(`{"project_id":"project_1","project_id":"other"}`), json.RawMessage(`{"project_id":1}`),
+		}},
+		{name: "models_read", validate: validateProjectModelsReadArguments, valid: json.RawMessage(`{"project_id":"project_1"}`), invalid: []json.RawMessage{
+			json.RawMessage(`{}`), json.RawMessage(`{"project_id":null}`), json.RawMessage(`{"project_id":"project_1","extra":true}`), json.RawMessage(`{"project_id":"project_1","project_id":"other"}`), json.RawMessage(`{"project_id":"project_1"} trailing`),
 		}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -772,7 +989,7 @@ func TestSessionCommandRegistryIsClosedAndFlagsAreExplicit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantNames := []string{"codex_login.clear", "codex_login.start", "project.archive", "project.create", "project.delete", "project.rename", "project.restore", "provider.create", "provider.discover_models", "provider.set_default", "provider.update", "run.cancel", "run.continue", "run.prompt.append", "run.prompt.move", "run.prompt.remove", "run.prompt.steer", "run.start", "run.tool.cancel", "session.archive", "session.compact", "session.create", "session.delete", "session.history.read", "session.mark_read", "session.rename", "session.restore", "session.set_debug", "session.set_full_access"}
+	wantNames := []string{"codex_login.clear", "codex_login.start", "project.archive", "project.create", "project.delete", "project.models.read", "project.rename", "project.restore", "provider.codex_usage.read", "provider.create", "provider.discover_models", "provider.set_default", "provider.update", "run.cancel", "run.continue", "run.prompt.append", "run.prompt.move", "run.prompt.remove", "run.prompt.steer", "run.start", "run.tool.cancel", "session.archive", "session.compact", "session.create", "session.delete", "session.history.read", "session.mark_read", "session.rename", "session.restore", "session.set_debug", "session.set_full_access"}
 	if got := registry.Names(); !reflect.DeepEqual(got, wantNames) {
 		t.Fatalf("registry names=%v, want %v", got, wantNames)
 	}
@@ -784,7 +1001,7 @@ func TestSessionCommandRegistryIsClosedAndFlagsAreExplicit(t *testing.T) {
 		if definition.SupportsExpectedRevision {
 			t.Fatalf("%s unexpectedly supports expected_revision", name)
 		}
-		if name == "session.history.read" || name == "provider.discover_models" {
+		if name == "session.history.read" || name == "provider.discover_models" || name == "project.models.read" || name == "provider.codex_usage.read" {
 			if definition.CachePolicy != commands.ResultCacheVolatile {
 				t.Fatalf("%s must retain a volatile-result policy", name)
 			}

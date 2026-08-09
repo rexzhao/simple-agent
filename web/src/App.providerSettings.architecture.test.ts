@@ -9,7 +9,6 @@ describe('Provider settings page cutover', () => {
     expect(source).not.toMatch(/api\.(?:createProvider|updateProvider|updateProviderDefault|discoverProviderModels|startCodexLogin|codexLoginStatus|clearCodexLogin)\s*\(/)
     expect(source).not.toMatch(/function providerAuthorityMatches|function providerModelAuthorityMatches|JSON\.stringify\(domainLevels\)/)
     expect(source).toContain('waitForProviderPublication')
-    expect(apiSource).not.toMatch(/\b(?:providerSettings|createProvider|updateProvider|updateProviderDefault|discoverProviderModels|startCodexLogin|codexLoginStatus|clearCodexLogin)\s*:/)
-    expect(apiSource).toMatch(/codexUsage\s*:/)
+    expect(apiSource).not.toMatch(/\b(?:providerSettings|createProvider|updateProvider|updateProviderDefault|discoverProviderModels|startCodexLogin|codexLoginStatus|clearCodexLogin|sessionModels|codexUsage|projects|sessions|session|createSession)\s*:/)
   })
 })

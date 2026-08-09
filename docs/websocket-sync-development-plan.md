@@ -1139,6 +1139,20 @@ codex_login.start/clear
 - 错误、loading、resync、offline UI 统一；
 - 清理旧 `api.ts` 中除 bootstrap/ticket/blob 外的路径。
 
+#### F7：剩余普通只读查询 typed command cutover（已完成）
+
+- 新增 schema v1 的 `project.models.read` 与 `provider.codex_usage.read` typed
+  WebSocket commands；两者均为只读、`CrossEpochRetrySafe=true`、
+  `ResultCacheVolatile`，且不接受 `expected_revision`。服务端错误在 command
+  domain boundary 统一为稳定且不含秘密的错误。
+- `sessionModels(projectID)` 与 `codexUsage(provider)` 已通过 typed command
+  facade/application composition 获取；Go/TS 均进行严格参数、结果、目标身份和
+  Blob descriptor/payload 校验，小结果 inline，超过 inline boundary 的结果复用现有
+  Blob store。页面 domain facade 不感知传输细节，并保留取消、重连和跨 epoch 语义。
+- 前端 `web/src/api.ts` 的普通产品 HTTP 表面只保留 bootstrap 与 session image；
+  独立的 WebSocket ticket/Blob client 边界仍按既有模式保留。旧 Go HTTP
+  routes/handlers 本阶段不删除，留待 Stage G；本项也不包含 `web.eval`。
+
 ### 阶段 G：删除旧系统并 cutover
 
 删除：

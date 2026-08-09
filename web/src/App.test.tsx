@@ -75,11 +75,7 @@ const mocks = vi.hoisted(() => {
   }
   const api = {
     bootstrap: vi.fn().mockResolvedValue({ version: 'test', cwd: '/workspace', server_root: '/workspace', config_path: '/config' }),
-    projects: vi.fn().mockResolvedValue({ projects: [{ id: 'project-1', root: '/workspace', display_name: 'project', archived: false, created_at: '', updated_at: '' }] }),
-    sessions: vi.fn().mockResolvedValue({ sessions: [session] }),
-    session: vi.fn().mockResolvedValue(session),
-    snapshot: vi.fn().mockImplementation(() => new Promise(() => {})),
-    createSession: vi.fn(),
+    sessionImage: vi.fn(),
   }
   return { api, session }
 })
@@ -306,10 +302,6 @@ function respondToSessionCreate(view: { application: ReturnType<typeof createSyn
 describe('App lifecycle bootstrap', () => {
   function resetApiMocks() {
     mocks.api.bootstrap.mockReset().mockResolvedValue({ version: 'test', cwd: '/workspace', server_root: '/workspace', config_path: '/config' })
-    mocks.api.projects.mockReset().mockResolvedValue({ projects: [{ id: 'project-1', root: '/workspace', display_name: 'project', archived: false, created_at: '', updated_at: '' }] })
-    mocks.api.sessions.mockReset().mockResolvedValue({ sessions: [mocks.session] })
-    mocks.api.session.mockReset().mockResolvedValue(mocks.session)
-    mocks.api.createSession.mockReset()
   }
 
   beforeEach(() => {
@@ -349,7 +341,6 @@ describe('App lifecycle bootstrap', () => {
 
     vi.useFakeTimers()
     await act(async () => { await vi.advanceTimersByTimeAsync(5000) })
-    expect(mocks.api.sessions).not.toHaveBeenCalled()
     view.unmount()
   })
 
@@ -358,8 +349,6 @@ describe('App lifecycle bootstrap', () => {
     await waitFor(() => expect(screen.getByText('session-1')).toBeTruthy())
     await act(async () => { applySessionContentAuthority(view) })
     await waitFor(() => expect(screen.getByText('from session content')).toBeTruthy())
-    expect(mocks.api.sessions).not.toHaveBeenCalled()
-    expect(mocks.api.session).not.toHaveBeenCalled()
     view.unmount()
   })
 
@@ -379,7 +368,6 @@ describe('App lifecycle bootstrap', () => {
 
     await waitFor(() => expect(screen.getByLabelText('Unread result')).toBeTruthy())
     expect(mocks.api.bootstrap).toHaveBeenCalledTimes(1)
-    expect(mocks.api.sessions).not.toHaveBeenCalled()
     view.unmount()
   })
 
@@ -438,9 +426,6 @@ describe('App lifecycle bootstrap', () => {
       expect(view.application.signals.currentProject.get()).toBe('project-3')
     })
     expect(screen.queryByText('project two')).toBeNull()
-    // Project index IDs, not the legacy project endpoint, enumerate project
-    // navigation; each project's sessions come from Session Index.
-    expect(mocks.api.projects).not.toHaveBeenCalled()
     view.unmount()
   })
 
@@ -495,8 +480,6 @@ describe('App lifecycle bootstrap', () => {
       )
     })
     await waitFor(() => expect(view.transport.sent.some((message) => message.type === 'subscribe' && message.payload.resource.type === 'session_index' && message.payload.resource.id === 'project-2')).toBe(true))
-    expect(mocks.api.sessions).not.toHaveBeenCalled()
-    expect(mocks.api.projects).not.toHaveBeenCalled()
     view.unmount()
   })
 
@@ -648,7 +631,6 @@ describe('App lifecycle bootstrap', () => {
       )
     })
     await waitFor(() => expect(screen.getAllByText('No sessions yet').length).toBeGreaterThan(0))
-    expect(mocks.api.sessions).not.toHaveBeenCalled()
     view.unmount()
   })
 
@@ -767,12 +749,10 @@ describe('App lifecycle bootstrap', () => {
     expect(screen.getByLabelText('Unread result')).toBeTruthy()
     await act(async () => { applySessionIndexAuthority(view, { ...completed, resource_revision: '2', has_unread_result: false }, '2') })
     await waitFor(() => expect(screen.queryByLabelText('Unread result')).toBeNull())
-    expect(mocks.api.sessions).not.toHaveBeenCalled()
     view.unmount()
   })
 
   it('waits for authoritative archive and delete changes in order, without restoring on unknown outcome', async () => {
-    mocks.api.sessions.mockResolvedValue({ sessions: [] })
     const view = renderApp()
     await waitFor(() => expect(screen.getByText('project')).toBeTruthy())
     vi.spyOn(window, 'confirm').mockReturnValue(true)
@@ -805,7 +785,6 @@ describe('App lifecycle bootstrap', () => {
   })
 
   it('does not mutate or restore when authoritative archive observation times out', async () => {
-    mocks.api.sessions.mockResolvedValue({ sessions: [] })
     const view = renderApp()
     await waitFor(() => expect(screen.getByText('project')).toBeTruthy())
     vi.spyOn(window, 'confirm').mockReturnValue(true)
@@ -849,7 +828,6 @@ describe('App lifecycle bootstrap', () => {
     await waitFor(() => expect(screen.getByRole('alert').textContent).toContain('Session operation failed.'))
     expect(composer.value).toBe('  /new  ')
     expect(view.transport.sent.filter((message) => message.type === 'command').map((message) => message.payload.name)).toContain('session.create')
-    expect(mocks.api.createSession).not.toHaveBeenCalled()
     view.unmount()
   })
 

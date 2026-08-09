@@ -1,4 +1,5 @@
 import type { JsonObject } from '../domain/json'
+import type { CodexUsage } from '../types'
 
 export interface ProviderCommandOptions {
   readonly signal?: AbortSignal
@@ -100,9 +101,15 @@ export interface ProviderDiscoverModelsResult {
   readonly models: readonly string[]
 }
 
+export interface ProviderCodexUsageResult {
+  readonly provider: string
+  readonly usage: CodexUsage
+}
+
 export interface ProviderCommands {
   createProvider(provider: string, target: ProviderUpdateTarget, options?: ProviderCreateOptions): Promise<ProviderCreateResult>
   update(provider: string, target: ProviderUpdateTarget, options?: ProviderCommandOptions): Promise<ProviderMutationResult>
   setDefault(provider: string, model: string, options?: ProviderCommandOptions): Promise<ProviderDefaultResult>
   discoverModels(provider: string, options?: ProviderCommandOptions): Promise<ProviderDiscoverModelsResult>
+  readCodexUsage(provider: string, options?: ProviderCommandOptions): Promise<ProviderCodexUsageResult>
 }
