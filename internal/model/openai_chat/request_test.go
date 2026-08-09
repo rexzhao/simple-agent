@@ -123,6 +123,78 @@ func TestBuildRequestBodyMapsToolsToOpenAIFunctionShape(t *testing.T) {
 	}`)
 }
 
+func TestOpenAIChatToolNameMapperRoundTripsCanonicalWebEval(t *testing.T) {
+	request := model.Request{
+		Model: "chat-model",
+		Messages: []model.Message{{
+			Role:      model.MessageRoleAssistant,
+			ToolCalls: []model.ToolCall{{ID: "call-1", Name: "web.eval", Arguments: `{"code":"1"}`}},
+		}},
+		Tools: []model.Tool{{Name: "web.eval", Description: "debug", InputSchema: map[string]any{"type": "object"}}},
+	}
+	body, err := BuildRequestBody(request, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded map[string]any
+	if err := json.Unmarshal(body, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	tools := decoded["tools"].([]any)
+	toolName := tools[0].(map[string]any)["function"].(map[string]any)["name"].(string)
+	if toolName == "web.eval" || toolName == "" || !isValidOpenAIChatToolName(toolName) {
+		t.Fatalf("provider tool name = %q, want legal non-canonical alias", toolName)
+	}
+
+	mapper := newToolNameMapper(request.Tools)
+	if got := mapper.internalName(mapper.providerName("web.eval")); got != "web.eval" {
+		t.Fatalf("tool name round trip = %q, want web.eval", got)
+	}
+	messages := decoded["messages"].([]any)
+	assistant := messages[0].(map[string]any)
+	callName := assistant["tool_calls"].([]any)[0].(map[string]any)["function"].(map[string]any)["name"]
+	if callName != toolName {
+		t.Fatalf("historical tool call name = %v, want request alias %q", callName, toolName)
+	}
+	compatibility, err := resolveCompatibility("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoder := newStreamEventDecoderWithCompatibility(compatibility, mapper)
+	chunk := []byte(`{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call-1","function":{"name":"` + toolName + `","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}`)
+	events, err := decoder.eventsFromChunk(chunk)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) < 2 {
+		t.Fatalf("mapped stream events = %#v", events)
+	}
+	call, ok := events[len(events)-1].(model.ToolCallDoneEvent)
+	if !ok || call.ToolCall.Name != "web.eval" {
+		t.Fatalf("mapped stream tool call = %#v, want canonical web.eval", events[len(events)-1])
+	}
+}
+
+func TestOpenAIChatToolNameMapperPreservesLegalNamesAndAvoidsAliasCollisions(t *testing.T) {
+	legal := newToolNameMapper([]model.Tool{{Name: "read_file"}})
+	if got := legal.providerName("read_file"); got != "read_file" || legal.internalName(got) != "read_file" {
+		t.Fatalf("legal tool round trip = %q -> %q, want read_file", got, legal.internalName(got))
+	}
+
+	mapper := newToolNameMapper([]model.Tool{{Name: "web.eval"}, {Name: "tool_0"}})
+	alias := mapper.providerName("web.eval")
+	if alias == "web.eval" || alias == "tool_0" || !isValidOpenAIChatToolName(alias) {
+		t.Fatalf("web.eval alias = %q, want deterministic legal non-conflicting alias", alias)
+	}
+	if mapper.providerName("web.eval") != alias || mapper.internalName(alias) != "web.eval" || mapper.internalName(mapper.providerName("tool_0")) != "tool_0" {
+		t.Fatalf("alias mapping did not round trip: alias=%q map=%#v", alias, mapper.toInternal)
+	}
+	other := newToolNameMapper([]model.Tool{{Name: "web.eval"}, {Name: "tool_0"}})
+	if other.providerName("web.eval") != alias {
+		t.Fatalf("alias was not deterministic: first=%q second=%q", alias, other.providerName("web.eval"))
+	}
+}
+
 func TestBuildRequestBodyMapsNilToolSchemaAndPreservesToolOrder(t *testing.T) {
 	body, err := BuildRequestBody(model.Request{
 		Model: "glm-5.2",

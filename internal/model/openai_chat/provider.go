@@ -96,7 +96,7 @@ func (p *Provider) Stream(ctx context.Context, request model.Request) (<-chan mo
 	go func() {
 		defer close(events)
 		defer response.Body.Close()
-		streamResponseEvents(ctx, response.Body, p.httpOptions.WithDefaults().StreamIdleTimeout, p.compatibility, events)
+		streamResponseEvents(ctx, response.Body, p.httpOptions.WithDefaults().StreamIdleTimeout, p.compatibility, events, newToolNameMapper(request.Tools))
 	}()
 	return events, nil
 }
@@ -108,8 +108,8 @@ func (p *Provider) apiKeyValue() (string, error) {
 	return "", fmt.Errorf("API key is required")
 }
 
-func streamResponseEvents(ctx context.Context, body io.Reader, idleTimeout time.Duration, compatibility chatCompatibility, events chan<- model.Event) {
-	decoder := newStreamEventDecoderWithCompatibility(compatibility)
+func streamResponseEvents(ctx context.Context, body io.Reader, idleTimeout time.Duration, compatibility chatCompatibility, events chan<- model.Event, toolNames ...*toolNameMapper) {
+	decoder := newStreamEventDecoderWithCompatibility(compatibility, toolNames...)
 	err := httpstream.ReadSSEFrames(ctx, body, idleTimeout, func(frame []byte) bool {
 		return emitSSEFrame(decoder, frame, events)
 	})

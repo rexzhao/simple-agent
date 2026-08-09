@@ -128,7 +128,7 @@ function runStateForConversation(state: SessionRunState, sessionID: string): Act
       id: tool.tool_call_id,
       name: tool.name,
       iteration: tool.agent_iteration,
-      arguments: tool.arguments,
+      arguments: presentationToolArguments(tool.name, tool.arguments),
       result: tool.content,
       status: tool.is_error ? 'error' as const : tool.status,
     })),
@@ -195,7 +195,35 @@ function toolCallForConversation(call: NonNullable<SessionContentMessage['tool_c
   return {
     id: call.id,
     name: call.name,
-    arguments: call.arguments ? readableText(call.arguments) : undefined,
+    arguments: call.arguments ? presentationToolArguments(call.name, readableText(call.arguments)) : undefined,
+  }
+}
+
+// web.eval source is intentionally retained in durable model history, but it
+// must never be copied into presentation arguments. Keep this summary stable,
+// useful for debugging, and limited to metadata about the request.
+function presentationToolArguments(name: string, argumentsText: string): string {
+  if (name !== 'web.eval') return argumentsText
+  try {
+    const value: unknown = JSON.parse(argumentsText)
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return '{"arguments":"redacted"}'
+    const input = value as { code?: unknown; code_bytes?: unknown; timeout_ms?: unknown; arguments?: unknown }
+    const summary: { timeout_ms?: number; code_bytes: number } = { code_bytes: 0 }
+    if (typeof input.code === 'string' && input.code !== '') {
+      summary.code_bytes = new TextEncoder().encode(input.code).byteLength
+    } else if (typeof input.code_bytes === 'number' && Number.isSafeInteger(input.code_bytes) && input.code_bytes > 0 && input.code_bytes <= 65536) {
+      summary.code_bytes = input.code_bytes
+    } else if (input.arguments === 'redacted') {
+      return '{"arguments":"redacted"}'
+    } else {
+      return '{"arguments":"redacted"}'
+    }
+    if (typeof input.code === 'string' && summary.code_bytes > 65536) return '{"arguments":"redacted"}'
+    if (input.timeout_ms !== undefined && (typeof input.timeout_ms !== 'number' || !Number.isInteger(input.timeout_ms) || input.timeout_ms < 100 || input.timeout_ms > 30000)) return '{"arguments":"redacted"}'
+    if (typeof input.timeout_ms === 'number') summary.timeout_ms = input.timeout_ms
+    return JSON.stringify(summary)
+  } catch {
+    return '{"arguments":"redacted"}'
   }
 }
 

@@ -3,6 +3,7 @@ package openaichat
 import (
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"strings"
 
 	"github.com/rexzhao/simple-agent/internal/model"
@@ -19,7 +20,8 @@ func buildRequestBody(request model.Request, stream bool, compatibility chatComp
 		body[key] = value
 	}
 
-	messages, err := buildMessages(request.Messages, request.DeveloperRole, compatibility)
+	toolNames := newToolNameMapper(request.Tools)
+	messages, err := buildMessages(request.Messages, request.DeveloperRole, compatibility, toolNames)
 	if err != nil {
 		return nil, err
 	}
@@ -28,20 +30,24 @@ func buildRequestBody(request model.Request, stream bool, compatibility chatComp
 	body["messages"] = messages
 	body["stream"] = stream
 	if len(request.Tools) > 0 {
-		body["tools"] = buildTools(request.Tools)
+		body["tools"] = buildTools(request.Tools, toolNames)
 	}
 	compatibility.prepareRequest(body, request, stream)
 
 	return json.Marshal(body)
 }
 
-func buildMessages(messages []model.Message, developerRole model.MessageRole, compatibility chatCompatibility) ([]map[string]any, error) {
+func buildMessages(messages []model.Message, developerRole model.MessageRole, compatibility chatCompatibility, toolNames ...*toolNameMapper) ([]map[string]any, error) {
 	switch developerRole {
 	case "", model.MessageRoleDeveloper, model.MessageRoleSystem:
 	default:
 		return nil, fmt.Errorf("unsupported OpenAI Chat developer role mapping %q", developerRole)
 	}
 	out := make([]map[string]any, 0, len(messages))
+	var mapper *toolNameMapper
+	if len(toolNames) > 0 {
+		mapper = toolNames[0]
+	}
 	for _, message := range messages {
 		content, err := openAIChatMessageContent(message)
 		if err != nil {
@@ -56,7 +62,7 @@ func buildMessages(messages []model.Message, developerRole model.MessageRole, co
 			"content": content,
 		}
 		if len(message.ToolCalls) > 0 {
-			item["tool_calls"] = buildMessageToolCalls(message.ToolCalls)
+			item["tool_calls"] = buildMessageToolCalls(message.ToolCalls, mapper)
 		}
 		if message.Role == model.MessageRoleTool {
 			item["tool_call_id"] = message.ToolCallID
@@ -105,14 +111,18 @@ func openAIChatMessageContent(message model.Message) (any, error) {
 	return content, nil
 }
 
-func buildMessageToolCalls(toolCalls []model.ToolCall) []map[string]any {
+func buildMessageToolCalls(toolCalls []model.ToolCall, toolNames ...*toolNameMapper) []map[string]any {
+	var mapper *toolNameMapper
+	if len(toolNames) > 0 {
+		mapper = toolNames[0]
+	}
 	out := make([]map[string]any, 0, len(toolCalls))
 	for _, toolCall := range toolCalls {
 		out = append(out, map[string]any{
 			"id":   toolCall.ID,
 			"type": "function",
 			"function": map[string]any{
-				"name":      toolCall.Name,
+				"name":      mapper.providerName(toolCall.Name),
 				"arguments": toolCall.Arguments,
 			},
 		})
@@ -120,7 +130,11 @@ func buildMessageToolCalls(toolCalls []model.ToolCall) []map[string]any {
 	return out
 }
 
-func buildTools(tools []model.Tool) []map[string]any {
+func buildTools(tools []model.Tool, toolNames ...*toolNameMapper) []map[string]any {
+	var mapper *toolNameMapper
+	if len(toolNames) > 0 {
+		mapper = toolNames[0]
+	}
 	out := make([]map[string]any, 0, len(tools))
 	for _, tool := range tools {
 		parameters := tool.InputSchema
@@ -131,11 +145,89 @@ func buildTools(tools []model.Tool) []map[string]any {
 		out = append(out, map[string]any{
 			"type": "function",
 			"function": map[string]any{
-				"name":        tool.Name,
+				"name":        mapper.providerName(tool.Name),
 				"description": tool.Description,
 				"parameters":  parameters,
 			},
 		})
 	}
 	return out
+}
+
+var openAIChatToolNamePattern = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
+
+type toolNameMapper struct {
+	toProvider map[string]string
+	toInternal map[string]string
+	used       map[string]struct{}
+	reserved   map[string]struct{}
+	nextAlias  int
+}
+
+func newToolNameMapper(tools []model.Tool) *toolNameMapper {
+	mapper := &toolNameMapper{
+		toProvider: make(map[string]string, len(tools)),
+		toInternal: make(map[string]string, len(tools)),
+		used:       make(map[string]struct{}, len(tools)),
+		reserved:   make(map[string]struct{}, len(tools)),
+	}
+	for _, tool := range tools {
+		if isValidOpenAIChatToolName(tool.Name) {
+			mapper.reserved[tool.Name] = struct{}{}
+		}
+	}
+	for _, tool := range tools {
+		mapper.providerName(tool.Name)
+	}
+	return mapper
+}
+
+func (m *toolNameMapper) providerName(internalName string) string {
+	if m == nil {
+		return internalName
+	}
+	if name, ok := m.toProvider[internalName]; ok {
+		return name
+	}
+	name := internalName
+	if !isValidOpenAIChatToolName(name) || m.isUsed(name) {
+		name = m.nextToolAlias()
+	}
+	m.toProvider[internalName] = name
+	m.toInternal[name] = internalName
+	m.used[name] = struct{}{}
+	return name
+}
+
+func (m *toolNameMapper) internalName(providerName string) string {
+	if m == nil {
+		return providerName
+	}
+	if name, ok := m.toInternal[providerName]; ok {
+		return name
+	}
+	return providerName
+}
+
+func (m *toolNameMapper) nextToolAlias() string {
+	for {
+		name := fmt.Sprintf("tool_%d", m.nextAlias)
+		m.nextAlias++
+		if m.isUsed(name) {
+			continue
+		}
+		if _, reserved := m.reserved[name]; reserved {
+			continue
+		}
+		return name
+	}
+}
+
+func (m *toolNameMapper) isUsed(name string) bool {
+	_, ok := m.used[name]
+	return ok
+}
+
+func isValidOpenAIChatToolName(name string) bool {
+	return len(name) > 0 && len(name) <= 64 && openAIChatToolNamePattern.MatchString(name)
 }

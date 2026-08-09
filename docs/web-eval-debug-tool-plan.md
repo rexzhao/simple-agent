@@ -1,6 +1,6 @@
 # `web.eval` 内部调试工具开发方案
 
-> **状态：阶段 1、2、3A 已完成并验收；阶段 3B Agent tool 尚未注册；阶段 4 Blob/诊断日志尚未实现。**本轮交付 3A，不把执行能力暴露为 Agent tool，也不引入 Blob 或 code/result 日志。
+> **状态：阶段 1、2、3A、3B 已完成并验收；阶段 4 Blob/诊断日志尚未实现。**本轮把 connection-bound Broker 接入 Agent，并仅在运行时条件满足时动态提供内部 `web.eval`；不引入 Blob 或独立 code/result 诊断日志。
 
 ## 1. 目标与边界
 
@@ -28,9 +28,12 @@ Agent 可以用它在当前 Web 调试页面中执行少量、有界的 JavaScri
 - 大量预定义 probe、selector 或领域专用调试工具；
 - 自动跨 epoch 重试或自动重放 JavaScript。
 
-## 2. 工具契约（3B 预留，尚未注册）
+## 2. 工具契约（3B 已完成并验收）
 
-以下是未来 Agent tool 的最小参数设计；3A 不注册此 tool，Broker 只提供给后续 3B 的内部执行 API：
+`web.eval` 是内部 canonical tool name。它不写入 `session.EnabledTools` 或配置的
+`tools.enabled`，而是在每次 Agent runtime 准备时按权威 SessionStore、目标项目、服务端
+`web_eval` 开关和 Service 上的 live executor attachment 动态追加到当次 model request。
+以下是本轮的最小参数设计：
 
 ```typescript
 interface WebEvalArguments {
@@ -38,6 +41,22 @@ interface WebEvalArguments {
   timeout_ms?: number // bounded；省略时使用服务端默认值
 }
 ```
+
+`code` 必须是非空、合法 UTF-8、最多 64 KiB UTF-8 bytes 的字符串；`timeout_ms` 默认为
+5000，范围为 100..30000 的整数；schema 禁止未知字段，工具实现还会独立严格校验参数。
+schema 的 `maxLength` 只能作为 provider-facing 提示，UTF-8 byte 上限以 runtime 校验为权威。
+描述明确这是高风险的任意同源 JavaScript，支持 async；表达式直接返回 completion value，
+statement 必须显式 `return`；不接受 page/session/connection selector，不 retry/replay，
+同步死循环无法由浏览器 timer 中断。
+
+运行时准备绑定当时的 Service registration generation/owner。真正调用前重新加载 caller
+session 并确认项目仍为目标项目、attachment 仍是同一个 current registration；关闭或替换
+后稳定失败，绝不迁移到新 executor。Broker 的 typed failure 以紧凑结构化 JSON 返回，
+浏览器成功/失败结果保留 execution identity、elapsed、value（包括 `null`）和可选 console。
+Go 和 Web presentation 都只显示 timeout/code bytes（或 hash）安全摘要，不显示 code 正文；
+Go 先对 requested/started/history DTO 做防御性摘要，Web 同时兼容原始参数和已摘要 shape，
+畸形输入 fail closed。正常 Agent tool 请求/结果仍按现有 durability 保存，这不等于阶段 4
+的独立诊断 logging。
 
 不要求也不接受 `session_id`、`page_instance_id`、`probe` 或 `selector`。Agent 通过任意 JavaScript 自行：
 
@@ -97,7 +116,11 @@ Go 侧只维护一个当前 Web debug executor，不让 Agent 选择页面或连
 - JavaScript exception/error 封装；
 - 执行耗时和必要的执行 identity。
 
-结果统一经过 bounded serializer。3A 只允许总预算 64 KiB 的 inline JSON 返回，协议结果显著低于现有 256 KiB frame；不会把大数据直接塞进协议，也没有 Blob descriptor。serializer 对深度、对象键、数组元素、字符串、console 条数和参数数均有硬界，并对循环引用、DOM Node、`Error`、`BigInt`、`Function`、`Symbol`、`undefined`、非有限数字和 `Window` 返回明确的 summary/error 标记。Blob 数据面是阶段 4 的后续工作。
+结果统一经过 bounded serializer。Broker wire 允许最多 64 KiB 的 inline JSON，最终 Agent tool content
+保持在现有 limiter 下方的 48 KiB；不会把大数据直接塞进协议，也没有 Blob descriptor。serializer
+对深度、对象键、数组元素、字符串、console 条数和参数数均有硬界，并对循环引用、DOM Node、
+`Error`、`BigInt`、`Function`、`Symbol`、`undefined`、非有限数字和 `Window` 返回明确的
+summary/error 标记。Blob 数据面是阶段 4 的后续工作。
 
 断线、超时、序列化失败和脚本异常必须保留可区分的 typed error/diagnostic 信息。除内部 lease 选择外，broker 不替 Agent 修改代码、重试或重放。
 
@@ -116,7 +139,13 @@ Go 侧只维护一个当前 Web debug executor，不让 Agent 选择页面或连
 
 ## 7. 观测与安全边界
 
-3A 不记录 `code`、result 正文或诊断日志，不暴露 capability/ticket。每次 Broker execution 开始时重新校验当前 lease 的 SessionStore authority；该校验不是执行期间的持续订阅。执行身份固定在开始时的 connection/page/epoch/session：focus/lease 切换不会取消、迁移或重放已经绑定的 execution。只有 refresh/re-register、unregister、connection disconnect/watcher cancel 或 Broker Close 会取消绑定执行。未来 3B 若接入 Agent session/config，必须在工具层再次校验。
+3A/3B 不记录 `code`、result 正文或独立诊断日志，不暴露 capability/ticket。每次 Broker execution
+开始时重新校验当前 lease 的 SessionStore authority；Agent tool 调用前还会重新加载 caller session、
+校验 target ProjectID 和同一 Service registration。该校验不是执行期间的持续订阅。执行身份固定在
+开始时的 connection/page/epoch/session：focus/lease 切换不会取消、迁移或重放已经绑定的 execution。
+只有 refresh/re-register、unregister、connection disconnect/watcher cancel 或 Broker Close 会取消
+绑定执行。Go 和 Web presentation 只保留不含 code 的安全摘要；正常 Agent tool durability 不等于
+阶段 4 的独立诊断 logging。
 
 ## 8. 分阶段实施
 
@@ -129,7 +158,7 @@ Go 侧只维护一个当前 Web debug executor，不让 Agent 选择页面或连
 - 当前实现范围包括每个 live connection 一个候选、全局唯一当前 lease，以及最近焦点优先、注销、连接 context 取消、刷新 epoch 和 broker Close 的确定性失效/回退；提供不带页面选择参数的 `Current` / `Acquire` API 和 `web_debug_not_connected` typed 错误。
 - 当前实现范围包括 debug handler 只消费 debug control 消息，现有 command/subscription 委托路径不变。
 
-阶段 2、3A 已完成并验收；阶段 3B Agent tool 尚未注册；阶段 4 Blob/serializer 增强/logging 尚未实现。3A 的 serializer v1 已完成并验收，但仍只服务于 inline execution result。
+阶段 2、3A、3B 已完成并验收；阶段 4 Blob/serializer 增强/logging 尚未实现。3A 的 serializer v1 已完成并验收，但仍只服务于 inline execution result。
 
 ### 阶段 2：`window.__SAI_DEBUG__`（已完成并验收；本轮实现）
 
@@ -147,10 +176,25 @@ Go 侧只维护一个当前 Web debug executor，不让 Agent 选择页面或连
 - serializer v1 对 primitive、undefined、非有限数字、BigInt、Function、Symbol、Error、循环引用、DOM Node 和 Window 做有界 inline summary；达到边界明确标记 truncated/summary，不调用 getter/toJSON，不因 getter/proxy 异常破坏清理。浏览器 timeout 只限制 async completion，同步死循环无法由同线程 timer 中断；Go 仍有独立 timeout。
 - CSP 默认保持 `script-src 'self'`；只有 server 启动时读取的 `debug.web_eval_enabled=true` 才对静态/SPA 响应增加 `'unsafe-eval'`，API 响应仍不放宽。任意 JS 是高风险同源能力，不是 sandbox。
 
-### 阶段 3B：Agent tool（未实现）
+### 阶段 3B：Agent tool（已完成并验收）
 
-- 尚未动态注册 `web.eval` Agent tool；尚未接入 Agent session/config 的工具层重校验。
-- 不改变 3A 的不带 connection/page/session 选择参数的 Broker API。
+- 已接入动态 runtime schema：仅目标 ProjectID、服务端开关开启且 Service 有 live Web
+  executor attachment 时可见；runtime 入口先从 `session.EnabledTools` 移除 canonical
+  `web.eval`，再做 child/builtin/session/MCP 选择，因此 child 不继承它，runtime metadata
+  也永不持久化它；动态 schema/executor 只由 attachment 和权威 target session 决定。
+- 已接入 owner/CAS-safe Service attachment 和 Server assembly/Close 生命周期；runtime
+  绑定准备时 registration，调用前重新加载 session 并拒绝删除、项目变化、关闭或替换后的
+  stale registration，不迁移、不 replay。
+- 已接入独立严格参数校验、Broker typed error 与浏览器 structured JSON result、context
+  cancellation、busy/closed/disconnected 语义，以及 Go/Web 两层防御性安全 presentation 摘要。
+  executor payload 在 adapter 边界重新校验 status、one-of、identity、value/error 和 console
+  JSON，不可信 payload 统一 fail closed 为稳定 generic error。OpenAI Chat 适配器补齐合法
+  provider name mapper；Responses/Anthropic 复用既有 mapper。
+- registration 的 current check 是调用线性化点：替换先发生则旧 owner 稳定失败；检查后替换
+  只允许已经绑定的旧 owner 完成一次，绝不迁移或 replay，也不跨浏览器执行持 Service 锁。
+- 本阶段仍只使用有界 inline output（Broker wire budget 为 64 KiB，最终 Agent tool content
+  保持在现有 limiter 下方的 48 KiB），不做 Blob、不增加独立 debug/diagnostic logging；
+  阶段 4 仍未实现。
 
 ### 阶段 4：Blob、增强 serializer 与诊断 logging（未实现）
 

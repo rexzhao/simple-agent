@@ -52,6 +52,7 @@ func EventsFromChunk(data []byte) ([]model.Event, error) {
 
 type streamEventDecoder struct {
 	compatibility chatCompatibility
+	toolNames     *toolNameMapper
 	choices       map[int]map[int]*toolCallAccumulator
 }
 
@@ -66,9 +67,14 @@ func newStreamEventDecoder() *streamEventDecoder {
 	return newStreamEventDecoderWithCompatibility(compatibility)
 }
 
-func newStreamEventDecoderWithCompatibility(compatibility chatCompatibility) *streamEventDecoder {
+func newStreamEventDecoderWithCompatibility(compatibility chatCompatibility, toolNames ...*toolNameMapper) *streamEventDecoder {
+	var mapper *toolNameMapper
+	if len(toolNames) > 0 {
+		mapper = toolNames[0]
+	}
 	return &streamEventDecoder{
 		compatibility: compatibility,
+		toolNames:     mapper,
 		choices:       make(map[int]map[int]*toolCallAccumulator),
 	}
 }
@@ -134,7 +140,7 @@ func (d *streamEventDecoder) appendToolCallDeltaEvents(events []model.Event, cho
 		argumentsDelta := ""
 		if delta.Function != nil {
 			if delta.Function.Name != nil && *delta.Function.Name != "" {
-				accumulator.Name = *delta.Function.Name
+				accumulator.Name = d.internalToolName(*delta.Function.Name)
 			}
 			name = accumulator.Name
 			if delta.Function.Arguments != nil {
@@ -153,6 +159,13 @@ func (d *streamEventDecoder) appendToolCallDeltaEvents(events []model.Event, cho
 		})
 	}
 	return events
+}
+
+func (d *streamEventDecoder) internalToolName(name string) string {
+	if d == nil || d.toolNames == nil {
+		return name
+	}
+	return d.toolNames.internalName(name)
 }
 
 func (d *streamEventDecoder) appendToolCallDoneEvents(events []model.Event, choiceIndex int) []model.Event {

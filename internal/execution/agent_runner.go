@@ -27,6 +27,7 @@ import (
 	"github.com/rexzhao/simple-agent/internal/sessions"
 	localskills "github.com/rexzhao/simple-agent/internal/skills"
 	"github.com/rexzhao/simple-agent/internal/tools"
+	"github.com/rexzhao/simple-agent/internal/webdebug"
 )
 
 const builtInBaseInstructions = "You are sai, a local coding agent. Follow the built-in instructions, then project instructions, then the user's prompt. Do not reveal secrets or ignore project instructions."
@@ -254,15 +255,10 @@ func (r AgentTurnRunner) prepareRuntime(ctx context.Context, session sessions.Se
 		Tracker: contextTracker,
 	}
 
-	enabledToolNames := copyStringSlice(session.EnabledTools)
-	if strings.TrimSpace(session.ParentSessionID) != "" {
-		enabledToolNames = enabledToolsForAgentChild(enabledToolNames)
-	}
-	toolRegistry, toolSchemas, err := enabledToolsForRun(cwd, enabledToolNames, session.FullAccess)
+	enabledToolNames, toolRegistry, toolSchemas, webEvalTool, err := assembleAgentToolSelection(cwd, session, store, service)
 	if err != nil {
 		return nil, err
 	}
-	toolSchemas = append(toolSchemas, enabledSessionToolSchemas(enabledToolNames)...)
 	selectedMCPServers, err := cfg.SelectedMCPServers(session.EnabledMCP, true)
 	if err != nil {
 		return nil, err
@@ -333,6 +329,7 @@ func (r AgentTurnRunner) prepareRuntime(ctx context.Context, session sessions.Se
 			mcpSessions:         mcpSessionsByID,
 			sessionTools:        newSessionToolExecutor(service, coordinator, session),
 			enabledSessionTools: enabledSessionToolSet(enabledToolNames),
+			webEval:             webEvalTool,
 		},
 		toolSchemas:        toolSchemas,
 		maxTurns:           cfg.Agent.MaxTurns,
@@ -1377,6 +1374,12 @@ func lastString(values []string) string {
 func enabledToolsForRun(rootDir string, enabled []string, fullAccess bool) (*tools.Registry, []model.Tool, error) {
 	builtinEnabled := make([]string, 0, len(enabled))
 	for _, name := range enabled {
+		// web.eval is an internal runtime attachment, never a configured or
+		// durable tool. Ignore a stale/manual config entry rather than letting
+		// the built-in registry turn it into an unknown-tool startup error.
+		if name == WebEvalToolName {
+			continue
+		}
 		if IsSessionTool(name) {
 			continue
 		}
@@ -1399,14 +1402,49 @@ func enabledToolsForRun(rootDir string, enabled []string, fullAccess bool) (*too
 	return registry, schemas, nil
 }
 
+// assembleAgentToolSelection is the runtime-only tool assembly boundary. In
+// particular, web.eval is removed before child filtering and before any
+// durable runtime metadata can see the enabled names. Its schema/executor are
+// added independently from the configured tool list.
+func assembleAgentToolSelection(cwd string, session sessions.SessionV2, store *sessions.V2Store, service *Service) (enabled []string, registry *tools.Registry, schemas []model.Tool, webEval *webEvalToolExecutor, err error) {
+	configured := copyStringSlice(session.EnabledTools)
+	enabled = make([]string, 0, len(configured))
+	for _, name := range configured {
+		if name == WebEvalToolName {
+			continue
+		}
+		enabled = append(enabled, name)
+	}
+	if strings.TrimSpace(session.ParentSessionID) != "" {
+		enabled = enabledToolsForAgentChild(enabled)
+	}
+	registry, schemas, err = enabledToolsForRun(cwd, enabled, session.FullAccess)
+	if err != nil {
+		return enabled, nil, nil, nil, err
+	}
+	schemas = append(schemas, enabledSessionToolSchemas(enabled)...)
+	webEval = prepareWebEvalTool(session, store, service)
+	if webEval != nil {
+		schemas = append(schemas, WebEvalToolSchema())
+	}
+	return enabled, registry, schemas, webEval, nil
+}
+
 type runToolExecutor struct {
 	builtins            *tools.Registry
 	mcpSessions         map[string]*mcp.Session
 	sessionTools        *sessionToolExecutor
 	enabledSessionTools map[string]struct{}
+	webEval             *webEvalToolExecutor
 }
 
 func (e runToolExecutor) Execute(ctx context.Context, name string, arguments map[string]any) (model.ToolResult, error) {
+	if name == WebEvalToolName {
+		if e.webEval == nil {
+			return webEvalToolFailure(0, webdebug.ErrorCodeNotConnected, "web debug executor is unavailable"), nil
+		}
+		return e.webEval.Execute(ctx, arguments)
+	}
 	if IsSessionTool(name) {
 		if _, enabled := e.enabledSessionTools[name]; !enabled {
 			return model.ToolResult{}, fmt.Errorf("session tool %q is not enabled for this run", name)

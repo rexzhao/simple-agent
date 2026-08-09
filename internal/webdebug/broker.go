@@ -51,6 +51,15 @@ func (e *Error) Error() string {
 	return e.Code
 }
 
+// WebEvalCode lets the execution adapter preserve the broker's stable public
+// error category without depending on broker internals or exposing details.
+func (e *Error) WebEvalCode() string {
+	if e == nil || e.Code == "" {
+		return ErrorCodeNotConnected
+	}
+	return e.Code
+}
+
 var (
 	ErrDisabled              = &Error{Code: ErrorCodeDisabled}
 	ErrClosed                = &Error{Code: ErrorCodeClosed}

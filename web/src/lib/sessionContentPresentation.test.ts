@@ -126,4 +126,46 @@ describe('Session Content transient assistant presentation ownership', () => {
     expect(message?.kind === 'message' ? message.item.message?.content?.inline : '').toBe('prefix+tail-')
     expect(message?.kind === 'message' ? message.assistantTail : undefined).toBeUndefined()
   })
+
+  it('redacts web.eval source from active tool presentation arguments', () => {
+    const state = {
+      runEpoch: 'epoch_1', runID: 'run_1', runCursor: '3', turnID: 'turn_1', status: 'running' as const,
+      text: {}, reasoning: {},
+      tools: {
+        call_1: {
+          tool_call_id: 'call_1', turn_id: 'turn_1', agent_iteration: 1, name: 'web.eval', status: 'running' as const,
+          arguments: JSON.stringify({ code: 'document.body.innerHTML', timeout_ms: 5000 }),
+        },
+      },
+      promptQueue: [], appendedPrompts: [], stale: false, recoveryRequired: false,
+    } satisfies SessionRunState
+    const active = activeRunForConversation(viewWithRun(state), 'session_1')
+    const tool = active?.steps.find((step) => step.kind === 'tool')
+    expect(tool?.kind).toBe('tool')
+    if (tool?.kind === 'tool') {
+      expect(tool.arguments).toBe('{"code_bytes":23,"timeout_ms":5000}')
+      expect(tool.arguments).not.toContain('document.body')
+    }
+  })
+
+  it('preserves Go safety summaries and fail-closed redaction', () => {
+    const makeState = (argumentsText: string) => ({
+      runEpoch: 'epoch_1', runID: 'run_1', runCursor: '3', turnID: 'turn_1', status: 'running' as const,
+      text: {}, reasoning: {},
+      tools: {
+        call_1: {
+          tool_call_id: 'call_1', turn_id: 'turn_1', agent_iteration: 1, name: 'web.eval', status: 'running' as const,
+          arguments: argumentsText,
+        },
+      },
+      promptQueue: [], appendedPrompts: [], stale: false, recoveryRequired: false,
+    } satisfies SessionRunState)
+    const summary = '{"code_bytes":23,"timeout_ms":5000}'
+    expect(activeRunForConversation(viewWithRun(makeState(summary)), 'session_1')?.steps.find((step) => step.kind === 'tool')?.arguments).toBe(summary)
+    expect(activeRunForConversation(viewWithRun(makeState('{"arguments":"redacted"}')), 'session_1')?.steps.find((step) => step.kind === 'tool')?.arguments).toBe('{"arguments":"redacted"}')
+    expect(activeRunForConversation(viewWithRun(makeState('{"code":"secret"}')), 'session_1')?.steps.find((step) => step.kind === 'tool')?.arguments).toBe('{"code_bytes":6}')
+    expect(activeRunForConversation(viewWithRun(makeState('{"code":""}')), 'session_1')?.steps.find((step) => step.kind === 'tool')?.arguments).toBe('{"arguments":"redacted"}')
+    expect(activeRunForConversation(viewWithRun(makeState(JSON.stringify({ code: '界'.repeat(32769) }))), 'session_1')?.steps.find((step) => step.kind === 'tool')?.arguments).toBe('{"arguments":"redacted"}')
+    expect(activeRunForConversation(viewWithRun(makeState('{"code_bytes":0}')), 'session_1')?.steps.find((step) => step.kind === 'tool')?.arguments).toBe('{"arguments":"redacted"}')
+  })
 })

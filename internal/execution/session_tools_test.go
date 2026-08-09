@@ -128,7 +128,7 @@ func TestSessionToolsStartInspectQueueAndWait(t *testing.T) {
 		ModelID:         "model-id-a",
 		ReasoningLevel:  "high",
 		ModelParameters: map[string]any{"temperature": 0.25, "reasoning_effort": "high"},
-		EnabledTools:    []string{ToolSessionStart, ToolSessionGet, ToolSessionSend, ToolSessionWait},
+		EnabledTools:    []string{ToolSessionStart, ToolSessionGet, ToolSessionSend, ToolSessionWait, WebEvalToolName},
 		EnabledMCP:      []string{"mcp-a"},
 		EnabledSkills:   []string{"skill-a"},
 		ShowReasoning:   &showReasoning,

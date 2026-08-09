@@ -12,6 +12,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/rexzhao/simple-agent/internal/eventbus"
 	"github.com/rexzhao/simple-agent/internal/model"
@@ -633,6 +634,9 @@ func executeToolCall(ctx context.Context, executor ToolExecutor, enabledTools ma
 }
 
 func parseToolArguments(raw string) (map[string]any, error) {
+	if !utf8.ValidString(raw) {
+		return nil, fmt.Errorf("must be valid UTF-8")
+	}
 	if strings.TrimSpace(raw) == "" {
 		return map[string]any{}, nil
 	}

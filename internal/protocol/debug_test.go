@@ -151,3 +151,27 @@ func TestEncodeRejectsUnboundedDebugExecutionResultShape(t *testing.T) {
 		t.Fatal("EncodeMessage() error = nil, want console arguments validation error")
 	}
 }
+
+func TestValidateDebugExecutionResultPayloadUsesPayloadBudgetAndKeepsNull(t *testing.T) {
+	payload := DebugExecutionResultPayload{
+		ExecutionID: "execution-1", PageID: "page-1", PageEpoch: "epoch-1", SessionID: "session-1",
+		Status: DebugExecutionStatusSucceeded, Value: json.RawMessage(`null`),
+	}
+	if err := ValidateDebugExecutionResultPayload(payload); err != nil {
+		t.Fatalf("null payload validation error = %v", err)
+	}
+
+	payload.Value = json.RawMessage(`"` + strings.Repeat("x", DebugExecutionResultMaxBytes-512) + `"`)
+	encoded, err := json.Marshal(payload)
+	if err != nil || len(encoded) >= DebugExecutionResultMaxBytes {
+		t.Fatalf("test payload size = %d, marshal error = %v; want under payload budget", len(encoded), err)
+	}
+	if err := ValidateDebugExecutionResultPayload(payload); err != nil {
+		t.Fatalf("bounded payload validation error = %v", err)
+	}
+
+	payload.ExecutionID = strings.Repeat("x", MaxWireIdentifierBytes+1)
+	if err := ValidateDebugExecutionResultPayload(payload); err == nil {
+		t.Fatal("overlong execution identity accepted by payload validator")
+	}
+}

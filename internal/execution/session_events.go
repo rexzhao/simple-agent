@@ -855,6 +855,13 @@ func sessionStreamEventFromModelEvent(turnID string, agentIteration int, event m
 		if event.ID == "" || event.Name == "" || event.ArgumentsDelta == "" {
 			return nil, false
 		}
+		if event.Name == WebEvalToolName {
+			// A delta is not a complete JSON object, so it cannot be summarized
+			// yet. Never put even a partial JavaScript source on the presentation
+			// stream; the completed requested/started event supplies the safe
+			// code-bytes summary.
+			return nil, false
+		}
 		return modelSessionStreamEvent("tool.progress", turnID, agentIteration, map[string]any{
 			"tool_call_id":    event.ID,
 			"name":            event.Name,
@@ -1106,6 +1113,9 @@ var sessionOrchestrationToolNames = map[string]bool{
 }
 
 func sessionToolDisplayArguments(name, arguments string) string {
+	if name == WebEvalToolName {
+		return webEvalPresentationArguments(arguments)
+	}
 	var parsed map[string]any
 	if json.Unmarshal([]byte(arguments), &parsed) != nil {
 		return ""

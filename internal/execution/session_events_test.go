@@ -417,6 +417,58 @@ func TestSessionToolDisplayArgumentsKeepsOnlyUsefulPresentationFields(t *testing
 	}
 }
 
+func TestWebEvalPresentationSummaryIsSharedByStreamAndHistory(t *testing.T) {
+	raw := `{"code":"你好","timeout_ms":5000}`
+	want := `{"code_bytes":6,"timeout_ms":5000}`
+	for _, event := range []model.Event{
+		model.ToolCallDoneEvent{ToolCall: model.ToolCall{ID: "requested", Name: WebEvalToolName, Arguments: raw}},
+		model.ToolStartedEvent{ToolCall: model.ToolCall{ID: "started", Name: WebEvalToolName, Arguments: raw}},
+	} {
+		mapped, ok := sessionStreamEventFromModelEvent("turn-1", 1, event, true)
+		if !ok {
+			t.Fatalf("sessionStreamEventFromModelEvent(%T) ok=false", event)
+		}
+		if got := mapped["arguments"]; got != want {
+			t.Fatalf("%T presentation arguments = %#v, want %q", event, got, want)
+		}
+	}
+
+	store := sessions.NewV2Store(t.TempDir())
+	service := &Service{sessionStore: store}
+	state, err := store.SaveMetadata(sessions.SessionV2{ID: "history-session", ShowReasoning: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dto, err := service.sessionItemDTOWithState(state.ID, sessions.SessionItem{
+		ID:      "assistant-item",
+		Message: &model.Message{Role: model.MessageRoleAssistant, ToolCalls: []model.ToolCall{{ID: "history", Name: WebEvalToolName, Arguments: raw}}},
+	}, state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dto.Message == nil || len(dto.Message.ToolCalls) != 1 || dto.Message.ToolCalls[0].Arguments != want {
+		t.Fatalf("history presentation DTO = %#v, want web.eval summary %q", dto.Message, want)
+	}
+
+	for _, input := range []string{`{`, `{"code":""}`, `{"code_bytes":0}`, `{"code_bytes":-1}`, `{"code":"secret","timeout_ms":99}`} {
+		if got := sessionToolDisplayArguments(WebEvalToolName, input); got != webEvalPresentationRedacted {
+			t.Fatalf("malformed web.eval presentation %q -> %q, want redacted", input, got)
+		}
+	}
+	if got := sessionToolDisplayArguments(WebEvalToolName, want); got != want {
+		t.Fatalf("summary was not idempotent: got %q, want %q", got, want)
+	}
+}
+
+func TestWebEvalToolProgressDoesNotProducePresentationEvent(t *testing.T) {
+	event, ok := sessionStreamEventFromModelEvent("turn-1", 1, model.ToolCallDeltaEvent{
+		ID: "call-1", Name: WebEvalToolName, ArgumentsDelta: `{"code":"secret"}`,
+	}, true)
+	if ok || event != nil {
+		t.Fatalf("web.eval progress event = %#v, ok=%v; want no presentation event", event, ok)
+	}
+}
+
 func sessionItemContents(items []SessionItem) []string {
 	contents := make([]string, 0, len(items))
 	for _, item := range items {

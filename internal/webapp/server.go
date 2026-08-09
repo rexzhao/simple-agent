@@ -64,6 +64,7 @@ type Server struct {
 	wsGateway                    *wsgateway.Gateway
 	wsDispatcher                 *wsgateway.Dispatcher
 	webDebugBroker               *webdebug.Broker
+	webEvalRegistration          *execution.WebEvalExecutorRegistration
 	webEvalEnabled               bool
 	projectIndex                 *projectindex.Provider
 	providerSettings             *providersettings.Provider
@@ -113,6 +114,7 @@ func NewServer(options ServerOptions) (*Server, error) {
 	gateway := options.WebSocketGateway
 	var dispatcher *wsgateway.Dispatcher
 	var debugBroker *webdebug.Broker
+	var webEvalRegistration *execution.WebEvalExecutorRegistration
 	var projectIndexProvider *projectindex.Provider
 	var sessionIndexProvider *sessionindex.Provider
 	var projectRegistration *execution.ProjectIndexSinkRegistration
@@ -139,6 +141,9 @@ func NewServer(options ServerOptions) (*Server, error) {
 		}
 		if providerSettingsRegistration != nil {
 			providerSettingsRegistration.Unregister()
+		}
+		if webEvalRegistration != nil {
+			webEvalRegistration.Unregister()
 		}
 		if debugBroker != nil {
 			debugBroker.Close()
@@ -373,6 +378,13 @@ func NewServer(options ServerOptions) (*Server, error) {
 		cleanupAssembly()
 		return nil, err
 	}
+	if debugBroker.Enabled() {
+		webEvalRegistration = options.Service.RegisterWebEvalExecutor(webEvalBrokerAdapter{broker: debugBroker})
+		if webEvalRegistration == nil {
+			cleanupAssembly()
+			return nil, fmt.Errorf("web eval executor registration failed")
+		}
+	}
 	server := &Server{
 		service:                      options.Service,
 		token:                        options.Token,
@@ -384,6 +396,7 @@ func NewServer(options ServerOptions) (*Server, error) {
 		wsGateway:                    gateway,
 		wsDispatcher:                 dispatcher,
 		webDebugBroker:               debugBroker,
+		webEvalRegistration:          webEvalRegistration,
 		webEvalEnabled:               baseConfig.WebEvalEnabled,
 		projectIndex:                 projectIndexProvider,
 		providerSettings:             providerSettingsProvider,
@@ -470,6 +483,9 @@ func (s *Server) Close() {
 		s.contentRunObserver()
 	}
 	if s.webDebugBroker != nil {
+		if s.webEvalRegistration != nil {
+			s.webEvalRegistration.Unregister()
+		}
 		s.webDebugBroker.Close()
 	}
 	if s.wsDispatcher != nil {

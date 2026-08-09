@@ -32,6 +32,17 @@ func TestToolCancellationRegistryCancelIsOneShot(t *testing.T) {
 	cleanup()
 }
 
+func TestParseToolArgumentsRejectsInvalidUTF8ForEveryTool(t *testing.T) {
+	raw := string([]byte{'{', '"', 'x', '"', ':', '"', 0xff, '"', '}'})
+	if _, err := parseToolArguments(raw); err == nil || !strings.Contains(err.Error(), "valid UTF-8") {
+		t.Fatalf("parseToolArguments(invalid UTF-8) error = %v, want UTF-8 validation", err)
+	}
+	arguments, err := parseToolArguments(`{"x":"ok"}`)
+	if err != nil || arguments["x"] != "ok" {
+		t.Fatalf("parseToolArguments(valid) = %#v, err=%v", arguments, err)
+	}
+}
+
 func TestStreamEmitsToolRequestedStartedFinishedInOrder(t *testing.T) {
 	provider := &fakeProvider{
 		turns: [][]model.Event{

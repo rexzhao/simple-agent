@@ -246,7 +246,7 @@ func enabledToolsForAgentChild(enabled []string) []string {
 	filtered := make([]string, 0, len(enabled))
 	for _, name := range enabled {
 		switch name {
-		case ToolSessionStart, ToolSessionSend:
+		case ToolSessionStart, ToolSessionSend, WebEvalToolName:
 			continue
 		default:
 			filtered = append(filtered, name)

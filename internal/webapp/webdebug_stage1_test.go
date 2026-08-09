@@ -8,6 +8,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/coder/websocket"
 	"github.com/rexzhao/simple-agent/internal/execution"
@@ -24,6 +25,9 @@ func TestProductionWebDebugAssemblyUsesConfigAndSessionStore(t *testing.T) {
 		defer connection.Close(websocket.StatusNormalClosure, "done")
 		message := sendStage1Register(t, connection, "stage1-disabled-session")
 		assertStage1Error(t, message, webdebug.ErrorCodeDisabled)
+		if service.CurrentWebEvalExecutor() != nil {
+			t.Fatal("disabled web_eval unexpectedly attached an Agent executor")
+		}
 		if _, err := appServer.webDebugBroker.Current(); !errors.Is(err, webdebug.ErrNotConnected) {
 			t.Fatalf("disabled broker Current() error = %v, want ErrNotConnected", err)
 		}
@@ -49,11 +53,19 @@ func TestProductionWebDebugAssemblyUsesConfigAndSessionStore(t *testing.T) {
 		if identity.SessionID != "stage1-target-session" {
 			t.Fatalf("current identity = %#v", identity)
 		}
+		registration := service.CurrentWebEvalExecutor()
+		if registration == nil || !registration.IsCurrent() {
+			t.Fatal("enabled web_eval did not attach a live executor")
+		}
 		if err := service.SessionStore().Delete("stage1-target-session"); err != nil {
 			t.Fatal(err)
 		}
 		if identity, err := appServer.webDebugBroker.Acquire(context.Background()); !errors.Is(err, webdebug.ErrNotConnected) || identity != (webdebug.LeaseIdentity{}) {
 			t.Fatalf("Acquire() after session deletion = %#v, %v, want empty ErrNotConnected", identity, err)
+		}
+		appServer.Close()
+		if service.CurrentWebEvalExecutor() != nil {
+			t.Fatal("Server.Close left a web_eval attachment behind")
 		}
 	})
 
@@ -73,6 +85,64 @@ func TestProductionWebDebugAssemblyUsesConfigAndSessionStore(t *testing.T) {
 			}
 		}
 	})
+}
+
+func TestWebEvalServiceAttachmentExecutesThroughProductionWebSocket(t *testing.T) {
+	service, _, httpServer := newStage1ProductionApp(t, true)
+	saveStage1Session(t, service, "stage3b-ws-session", webdebug.TargetProjectID)
+	connection := openStage1Connection(t, httpServer)
+	defer connection.Close(websocket.StatusNormalClosure, "done")
+	if _, ok := sendStage1Register(t, connection, "stage3b-ws-session").(protocol.DebugRegisteredMessage); !ok {
+		t.Fatal("debug page registration did not succeed")
+	}
+	registration := service.CurrentWebEvalExecutor()
+	if registration == nil {
+		t.Fatal("web server did not attach broker")
+	}
+
+	type executionResult struct {
+		payload protocol.DebugExecutionResultPayload
+		err     error
+	}
+	resultCh := make(chan executionResult, 1)
+	go func() {
+		payload, err := registration.Execute(context.Background(), "1", 1000)
+		resultCh <- executionResult{payload: payload, err: err}
+	}()
+	message := readWebAppMessage(t, connection)
+	executeMessage, ok := message.(protocol.DebugExecuteMessage)
+	if !ok {
+		t.Fatalf("browser did not receive debug_execute: %T", message)
+	}
+	if executeMessage.Payload.SessionID != "stage3b-ws-session" || executeMessage.Payload.Code != "1" {
+		t.Fatalf("debug_execute payload = %#v", executeMessage.Payload)
+	}
+	response := protocol.DebugExecutionResultMessage{
+		Envelope: protocol.Envelope{Version: 1, Type: protocol.MessageTypeDebugExecutionResult, ID: "stage3b-result"},
+		Payload: protocol.DebugExecutionResultPayload{
+			ExecutionID: executeMessage.Payload.ExecutionID,
+			PageID:      executeMessage.Payload.PageID,
+			PageEpoch:   executeMessage.Payload.PageEpoch,
+			SessionID:   executeMessage.Payload.SessionID,
+			Status:      protocol.DebugExecutionStatusSucceeded,
+			Value:       []byte("null"),
+		},
+	}
+	encoded, err := protocol.EncodeMessage(response)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := connection.Write(context.Background(), websocket.MessageText, encoded); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case result := <-resultCh:
+		if result.err != nil || result.payload.Status != protocol.DebugExecutionStatusSucceeded || string(result.payload.Value) != "null" {
+			t.Fatalf("broker result = %#v, err=%v", result.payload, result.err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("broker execution did not finish after browser result")
+	}
 }
 
 func TestProductionWebDebugConfigFailureDoesNotFailOpen(t *testing.T) {

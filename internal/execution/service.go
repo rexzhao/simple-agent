@@ -66,6 +66,10 @@ type Service struct {
 
 	runCoordinatorMu sync.RWMutex
 	runCoordinator   *SessionRunCoordinator
+
+	webEvalMu         sync.RWMutex
+	webEvalNextID     uint64
+	webEvalAttachment *WebEvalExecutorRegistration
 }
 
 type Project struct {

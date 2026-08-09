@@ -1001,37 +1001,46 @@ func (m DebugExecutionResultMessage) validate() error {
 	if len(m.Envelope.Payload) > DebugExecutionResultMaxBytes {
 		return invalidField("payload", "execution result exceeds the inline result budget")
 	}
-	if err := validateDebugExecutionIdentity(m.Payload.ExecutionID, m.Payload.PageID, m.Payload.PageEpoch, m.Payload.SessionID); err != nil {
+	return ValidateDebugExecutionResultPayload(m.Payload)
+}
+
+// ValidateDebugExecutionResultPayload validates the payload contract without
+// an envelope. The payload budget is measured from the payload JSON itself,
+// not from a complete protocol frame, so execution adapters can reuse this
+// validator without accidentally charging envelope framing against the
+// inline result budget.
+func ValidateDebugExecutionResultPayload(payload DebugExecutionResultPayload) error {
+	if err := validateDebugExecutionIdentity(payload.ExecutionID, payload.PageID, payload.PageEpoch, payload.SessionID); err != nil {
 		return err
 	}
-	switch m.Payload.Status {
+	switch payload.Status {
 	case DebugExecutionStatusSucceeded:
-		if len(m.Payload.Value) == 0 {
+		if len(payload.Value) == 0 {
 			return invalidField("payload.value", "is required for a succeeded execution")
 		}
-		if m.Payload.Error != nil {
+		if payload.Error != nil {
 			return invalidField("payload.error", "must be omitted for a succeeded execution")
 		}
 	case DebugExecutionStatusFailed:
-		if m.Payload.Error == nil {
+		if payload.Error == nil {
 			return invalidField("payload.error", "is required for a failed execution")
 		}
-		if len(m.Payload.Value) > 0 {
+		if len(payload.Value) > 0 {
 			return invalidField("payload.value", "must be omitted for a failed execution")
 		}
-		if err := m.Payload.Error.validate("payload.error"); err != nil {
+		if err := payload.Error.validate("payload.error"); err != nil {
 			return err
 		}
 	default:
 		return invalidField("payload.status", "must be succeeded or failed")
 	}
-	if len(m.Payload.Value) > 0 && !json.Valid(m.Payload.Value) {
+	if len(payload.Value) > 0 && !json.Valid(payload.Value) {
 		return invalidField("payload.value", "must be valid JSON")
 	}
-	if len(m.Payload.Console) > DebugExecutionMaxConsoleEntries {
+	if len(payload.Console) > DebugExecutionMaxConsoleEntries {
 		return invalidField("payload.console", "contains too many console entries")
 	}
-	for index, entry := range m.Payload.Console {
+	for index, entry := range payload.Console {
 		field := fmt.Sprintf("payload.console[%d]", index)
 		switch entry.Level {
 		case DebugConsoleLog, DebugConsoleInfo, DebugConsoleWarn, DebugConsoleError, DebugConsoleDebug:
@@ -1050,7 +1059,7 @@ func (m DebugExecutionResultMessage) validate() error {
 			}
 		}
 	}
-	encoded, err := json.Marshal(m.Payload)
+	encoded, err := json.Marshal(payload)
 	if err != nil {
 		return invalidField("payload", err.Error())
 	}
@@ -1074,7 +1083,7 @@ func (e DebugExecutionError) validate(field string) error {
 }
 
 func validateDebugExecutionIdentity(executionID, pageID, pageEpoch, sessionID string) error {
-	if err := requiredString("payload.execution_id", executionID); err != nil {
+	if err := validateDebugIdentifier("payload.execution_id", executionID); err != nil {
 		return err
 	}
 	return validateDebugExecutorIdentity(pageID, pageEpoch, sessionID)
@@ -1123,17 +1132,23 @@ func validateDebugExecutorIdentity(pageID, pageEpoch, sessionID string) error {
 		{field: "page_epoch", value: pageEpoch},
 		{field: "session_id", value: sessionID},
 	} {
-		field, value := item.field, item.value
-		if err := requiredString("payload."+field, value); err != nil {
+		if err := validateDebugIdentifier("payload."+item.field, item.value); err != nil {
 			return err
 		}
-		if strings.TrimSpace(value) != value {
-			return invalidField("payload."+field, "must not have leading or trailing whitespace")
-		}
-		for _, r := range value {
-			if unicode.IsControl(r) {
-				return invalidField("payload."+field, "must not contain control characters")
-			}
+	}
+	return nil
+}
+
+func validateDebugIdentifier(field, value string) error {
+	if err := requiredString(field, value); err != nil {
+		return err
+	}
+	if strings.TrimSpace(value) != value {
+		return invalidField(field, "must not have leading or trailing whitespace")
+	}
+	for _, r := range value {
+		if unicode.IsControl(r) {
+			return invalidField(field, "must not contain control characters")
 		}
 	}
 	return nil
