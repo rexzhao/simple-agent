@@ -36,6 +36,12 @@ const (
 	MessageTypeSubscriptionEvent MessageType = "subscription_event"
 	MessageTypeAck               MessageType = "ack"
 	MessageTypeResyncRequired    MessageType = "resync_required"
+	MessageTypeDebugRegister     MessageType = "debug_register"
+	MessageTypeDebugRegistered   MessageType = "debug_registered"
+	MessageTypeDebugFocus        MessageType = "debug_focus"
+	MessageTypeDebugFocused      MessageType = "debug_focused"
+	MessageTypeDebugUnregister   MessageType = "debug_unregister"
+	MessageTypeDebugUnregistered MessageType = "debug_unregistered"
 	MessageTypeError             MessageType = "error"
 )
 
@@ -196,6 +202,48 @@ func DecodeMessage(data []byte) (Message, error) {
 		}
 		message := ResyncRequiredMessage{Envelope: envelope, Payload: payload}
 		return message, message.validate()
+	case MessageTypeDebugRegister:
+		var payload DebugRegisterPayload
+		if err := decode(&payload); err != nil {
+			return nil, err
+		}
+		message := DebugRegisterMessage{Envelope: envelope, Payload: payload}
+		return message, message.validate()
+	case MessageTypeDebugRegistered:
+		var payload DebugRegisteredPayload
+		if err := decode(&payload); err != nil {
+			return nil, err
+		}
+		message := DebugRegisteredMessage{Envelope: envelope, Payload: payload}
+		return message, message.validate()
+	case MessageTypeDebugFocus:
+		var payload DebugFocusPayload
+		if err := decode(&payload); err != nil {
+			return nil, err
+		}
+		message := DebugFocusMessage{Envelope: envelope, Payload: payload}
+		return message, message.validate()
+	case MessageTypeDebugFocused:
+		var payload DebugFocusedPayload
+		if err := decode(&payload); err != nil {
+			return nil, err
+		}
+		message := DebugFocusedMessage{Envelope: envelope, Payload: payload}
+		return message, message.validate()
+	case MessageTypeDebugUnregister:
+		var payload DebugUnregisterPayload
+		if err := decode(&payload); err != nil {
+			return nil, err
+		}
+		message := DebugUnregisterMessage{Envelope: envelope, Payload: payload}
+		return message, message.validate()
+	case MessageTypeDebugUnregistered:
+		var payload DebugUnregisteredPayload
+		if err := decode(&payload); err != nil {
+			return nil, err
+		}
+		message := DebugUnregisteredMessage{Envelope: envelope, Payload: payload}
+		return message, message.validate()
 	case MessageTypeError:
 		var payload ErrorPayload
 		if err := decode(&payload); err != nil {
@@ -258,6 +306,10 @@ func validateOptionalFieldNullability(data []byte, envelope Envelope) error {
 		fields = []string{"error"}
 	case MessageTypeError:
 		fields = []string{"request_id"}
+	case MessageTypeDebugRegister, MessageTypeDebugRegistered,
+		MessageTypeDebugFocus, MessageTypeDebugFocused,
+		MessageTypeDebugUnregister, MessageTypeDebugUnregistered:
+		fields = []string{"focused"}
 	}
 	for _, field := range fields {
 		if err := rejectNullField(envelope.Payload, field, "payload."+field); err != nil {
@@ -314,7 +366,9 @@ func isKnownMessageType(messageType MessageType) bool {
 		MessageTypeSubscribe, MessageTypeSubscribed, MessageTypeUnsubscribe,
 		MessageTypeUnsubscribed, MessageTypeSnapshot, MessageTypeChange,
 		MessageTypeSubscriptionEvent, MessageTypeAck, MessageTypeResyncRequired,
-		MessageTypeError:
+		MessageTypeDebugRegister, MessageTypeDebugRegistered,
+		MessageTypeDebugFocus, MessageTypeDebugFocused,
+		MessageTypeDebugUnregister, MessageTypeDebugUnregistered, MessageTypeError:
 		return true
 	default:
 		return false

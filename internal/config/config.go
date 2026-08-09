@@ -29,6 +29,7 @@ type Config struct {
 	Prompt          PromptConfig               `json:"prompt" yaml:"prompt"`
 	Tools           ToolsConfig                `json:"tools" yaml:"tools"`
 	Logging         LoggingConfig              `json:"logging" yaml:"logging"`
+	Debug           DebugConfig                `json:"debug" yaml:"debug"`
 	Sessions        SessionsConfig             `json:"sessions" yaml:"sessions"`
 	Compaction      CompactionConfig           `json:"compaction" yaml:"compaction"`
 	MCPDir          string                     `json:"mcp_dir,omitempty" yaml:"mcp_dir,omitempty"`
@@ -67,6 +68,10 @@ type LoggingConfig struct {
 	// as a fallback for sessions written before debug settings became scoped to
 	// a conversation. The Web UI can override it per session.
 	RequestBodies bool `json:"request_bodies,omitempty" yaml:"request_bodies,omitempty"`
+}
+
+type DebugConfig struct {
+	WebEvalEnabled bool `json:"web_eval_enabled" yaml:"web_eval_enabled"`
 }
 
 type SessionsConfig struct {

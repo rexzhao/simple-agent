@@ -1,5 +1,6 @@
 import { isRFC3339Timestamp } from './datetime'
 import { ProtocolDecodeError } from './errors'
+import { isBoundedDebugIdentity } from './identifiers'
 import { compareRunCursor, isRunCursor, isSequence } from './sequence'
 import { unicodeCodePointLength } from './strings'
 import type {
@@ -26,6 +27,12 @@ const messageTypes = new Set([
   'subscription_event',
   'ack',
   'resync_required',
+  'debug_register',
+  'debug_registered',
+  'debug_focus',
+  'debug_focused',
+  'debug_unregister',
+  'debug_unregistered',
   'error',
 ])
 
@@ -172,6 +179,14 @@ function validatePayload(type: string, payload: RawObject): void {
       validateResource(payload.resource, 'payload.resource')
       requiredString(payload, 'reason', 'payload.reason')
       return
+    case 'debug_register':
+    case 'debug_registered':
+    case 'debug_focus':
+    case 'debug_focused':
+    case 'debug_unregister':
+    case 'debug_unregistered':
+      validateDebugExecutorPayload(payload)
+      return
     case 'error':
       requiredString(payload, 'code', 'payload.code')
       requiredString(payload, 'message', 'payload.message')
@@ -179,6 +194,21 @@ function validatePayload(type: string, payload: RawObject): void {
       return
     default:
       fail('unknown_type', `unknown message type ${JSON.stringify(type)}`, 'type')
+  }
+}
+
+function validateDebugExecutorPayload(payload: RawObject): void {
+  for (const key of ['page_id', 'page_epoch', 'session_id']) {
+    if (!isBoundedDebugIdentity(payload[key])) {
+      fail(
+        'invalid_field',
+        'must be a bounded non-empty identity without edge whitespace or control characters',
+        `payload.${key}`,
+      )
+    }
+  }
+  if (!has(payload, 'focused') || typeof payload.focused !== 'boolean') {
+    fail('invalid_field', 'must be a boolean', 'payload.focused')
   }
 }
 

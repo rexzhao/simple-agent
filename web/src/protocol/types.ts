@@ -18,6 +18,12 @@ export type MessageType =
   | 'subscription_event'
   | 'ack'
   | 'resync_required'
+  | 'debug_register'
+  | 'debug_registered'
+  | 'debug_focus'
+  | 'debug_focused'
+  | 'debug_unregister'
+  | 'debug_unregistered'
   | 'error'
 
 export type ResourceType =
@@ -37,6 +43,20 @@ export interface HelloPayload {
   supported_versions: number[]
   client_id: string
 }
+
+export interface DebugExecutorPayload {
+  page_id: string
+  page_epoch: string
+  session_id: string
+  focused: boolean
+}
+
+export type DebugRegisterPayload = DebugExecutorPayload
+export type DebugRegisteredPayload = DebugExecutorPayload
+export type DebugFocusPayload = DebugExecutorPayload
+export type DebugFocusedPayload = DebugExecutorPayload
+export type DebugUnregisterPayload = DebugExecutorPayload
+export type DebugUnregisteredPayload = DebugExecutorPayload
 
 export interface WelcomePayload {
   selected_version: 1
@@ -391,6 +411,12 @@ export type ChangeMessage = ProtocolEnvelope<'change', ChangePayload>
 export type SubscriptionEventMessage = ProtocolEnvelope<'subscription_event', SubscriptionEventPayload>
 export type AckMessage = ProtocolEnvelope<'ack', AckPayload>
 export type ResyncRequiredMessage = ProtocolEnvelope<'resync_required', ResyncRequiredPayload>
+export type DebugRegisterMessage = ProtocolEnvelope<'debug_register', DebugRegisterPayload>
+export type DebugRegisteredMessage = ProtocolEnvelope<'debug_registered', DebugRegisteredPayload>
+export type DebugFocusMessage = ProtocolEnvelope<'debug_focus', DebugFocusPayload>
+export type DebugFocusedMessage = ProtocolEnvelope<'debug_focused', DebugFocusedPayload>
+export type DebugUnregisterMessage = ProtocolEnvelope<'debug_unregister', DebugUnregisterPayload>
+export type DebugUnregisteredMessage = ProtocolEnvelope<'debug_unregistered', DebugUnregisteredPayload>
 export type ErrorMessage = ProtocolEnvelope<'error', ErrorPayload>
 
 export type ProtocolMessage =
@@ -410,6 +436,12 @@ export type ProtocolMessage =
   | SubscriptionEventMessage
   | AckMessage
   | ResyncRequiredMessage
+  | DebugRegisterMessage
+  | DebugRegisteredMessage
+  | DebugFocusMessage
+  | DebugFocusedMessage
+  | DebugUnregisterMessage
+  | DebugUnregisteredMessage
   | ErrorMessage
 
 // These brands keep the three decimal concepts distinct at compile time even

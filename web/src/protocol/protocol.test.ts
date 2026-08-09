@@ -29,6 +29,71 @@ describe('shared protocol golden fixtures', () => {
     expect(() => decodeMessage(JSON.stringify(fixture.message))).toThrow(ProtocolDecodeError)
   })
 
+  it('rejects shared debug fixtures for their malformed fields', () => {
+    const missingFocused = fixtures.invalid.find((fixture) => fixture.name === 'debug_missing_focused')
+    const invalidEpoch = fixtures.invalid.find((fixture) => fixture.name === 'debug_invalid_epoch')
+    expect(missingFocused).toBeDefined()
+    expect(invalidEpoch).toBeDefined()
+
+    expect(() => decodeMessage(JSON.stringify(missingFocused?.message))).toThrow(
+      expect.objectContaining({ code: 'invalid_field', field: 'payload.focused' }),
+    )
+    expect(() => decodeMessage(JSON.stringify(invalidEpoch?.message))).toThrow(
+      expect.objectContaining({ code: 'invalid_field', field: 'payload.page_epoch' }),
+    )
+  })
+
+  it.each([
+    'debug_register',
+    'debug_registered',
+    'debug_focus',
+    'debug_focused',
+    'debug_unregister',
+    'debug_unregistered',
+  ] as MessageType[])('decodes the stage-1 debug control message %s', (type) => {
+    const message = decodeMessage(JSON.stringify({
+      version: 1,
+      type,
+      id: `message-${type}`,
+      payload: {
+        page_id: 'page 1',
+        page_epoch: 'epoch-1',
+        session_id: 'session-1',
+        focused: false,
+        future_optional_field: 'ignored',
+      },
+    }))
+    expect(message.type).toBe(type)
+  })
+
+  it.each([
+    ['missing focused', 'focused', undefined],
+    ['null focused', 'focused', null],
+    ['string focused', 'focused', 'true'],
+    ['numeric focused', 'focused', 1],
+    ['empty page id', 'page_id', ''],
+    ['leading whitespace page epoch', 'page_epoch', ' epoch-1'],
+    ['trailing whitespace session id', 'session_id', 'session-1\n'],
+    ['control character page id', 'page_id', 'page\u0001'],
+    ['oversized session id', 'session_id', 'x'.repeat(4097)],
+  ] as [string, string, unknown][])('rejects malformed debug payload: %s', (_name, field, value) => {
+    const payload: Record<string, unknown> = {
+      page_id: 'page-1',
+      page_epoch: 'epoch-1',
+      session_id: 'session-1',
+      focused: true,
+    }
+    if (value === undefined) delete payload[field]
+    else payload[field] = value
+
+    expect(() => decodeMessage(JSON.stringify({
+      version: 1,
+      type: 'debug_register',
+      id: 'debug-malformed',
+      payload,
+    }))).toThrow(expect.objectContaining({ code: 'invalid_field', field: `payload.${field}` }))
+  })
+
   it('ignores unknown optional fields', () => {
     const message = decodeMessage(JSON.stringify({
       version: 1,

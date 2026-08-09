@@ -18,15 +18,19 @@ function wellFormed(value: string): boolean {
 // additional Latin-1 whitespace characters below. Keep this explicit rather
 // than using JavaScript's broader \s/trim set (which also treats U+FEFF as
 // whitespace while Go's validator does not).
+function isGoSpaceCodePoint(code: number): boolean {
+  return (
+    code === 0x0009 || code === 0x000a || code === 0x000b || code === 0x000c || code === 0x000d ||
+    code === 0x0020 || code === 0x0085 || code === 0x00a0 || code === 0x1680 ||
+    (code >= 0x2000 && code <= 0x200a) || code === 0x2028 || code === 0x2029 ||
+    code === 0x202f || code === 0x205f || code === 0x3000
+  )
+}
+
 function isGoSpace(value: string): boolean {
   for (const character of value) {
     const code = character.codePointAt(0) as number
-    if (
-      code === 0x0009 || code === 0x000a || code === 0x000b || code === 0x000c || code === 0x000d ||
-      code === 0x0020 || code === 0x0085 || code === 0x00a0 || code === 0x1680 ||
-      (code >= 0x2000 && code <= 0x200a) || code === 0x2028 || code === 0x2029 ||
-      code === 0x202f || code === 0x205f || code === 0x3000
-    ) return true
+    if (isGoSpaceCodePoint(code)) return true
   }
   return false
 }
@@ -41,6 +45,21 @@ export function isCanonicalWireIdentifier(value: unknown, allowEmpty = false): v
   if (typeof value !== 'string' || !wellFormed(value)) return false
   if (allowEmpty && value === '') return true
   if (value === '' || isGoSpace(value) || /\p{Cc}/u.test(value)) return false
+  return new TextEncoder().encode(value).byteLength <= maxWireIdentifierBytes
+}
+
+/**
+ * The stage-1 debug control identity boundary. Unlike durable identifiers,
+ * debug identities may contain internal whitespace; only edge whitespace is
+ * rejected to mirror the server's strings.TrimSpace check.
+ */
+export function isBoundedDebugIdentity(value: unknown): value is string {
+  if (typeof value !== 'string' || !wellFormed(value) || value === '') return false
+  const characters = Array.from(value)
+  const first = characters[0].codePointAt(0) as number
+  const last = characters[characters.length - 1].codePointAt(0) as number
+  if (isGoSpaceCodePoint(first) || isGoSpaceCodePoint(last)) return false
+  if (/\p{Cc}/u.test(value)) return false
   return new TextEncoder().encode(value).byteLength <= maxWireIdentifierBytes
 }
 

@@ -1,6 +1,6 @@
 # `web.eval` 内部调试工具开发方案
 
-> **状态：后续任务，暂不实施。**本任务在 WebSocket、Sync Engine、Local Replica、Resource Adapter 和 Repository 重构完成并验收后启动。它是一个面向固定内部调试项目的最小 Agent 调试入口，不扩展主同步协议，也不反向改变同步架构。
+> **状态：主同步重构已完成；阶段 1 已完成并验收（executor 注册与单 lease 基础）。**本轮只处理阶段 1，不提前实现阶段 2、3、4。它是一个面向固定内部调试项目的最小 Agent 调试入口，不扩展 resource subscription/数据同步语义，使用独立 debug control 通道，也不反向改变同步架构。
 
 ## 1. 目标与边界
 
@@ -142,12 +142,16 @@ Blob reference（如有）
 
 ## 8. 分阶段实施
 
-### 阶段 1：executor 注册与 lease
+### 阶段 1：executor 注册与 lease（已完成/已验收）
 
-- 定义符合条件页面的注册、注销、焦点更新和 connection/epoch identity；
-- 实现单一当前 executor lease；
-- 实现断线、刷新、焦点变化和无 executor 的 typed 状态；
-- 验证 Agent 不需要也不能选择页面。
+- 当前实现范围包括默认关闭的服务端 `debug.web_eval_enabled` 高危开关、Web server assembly 的 debug broker 注入，以及配置失败时不 fail-open 的启动边界。
+- 当前实现范围包括现有 WebSocket 上专用 typed 的注册、注销、焦点更新及服务端确认消息；字段仅包含 `page_id`、`page_epoch`、`session_id`、`focused`，并沿用协议的 Decode/Encode、校验、fixture 和边界规则。
+- 当前 Go/Web 两端共享的 V1 typed debug control contract 已接通；本轮仍只提供纯协议支持，不增加页面注册行为、React/UI 或 `window.__SAI_DEBUG__`。
+- 当前实现范围包括固定项目 `project-f25c5aac78f681b52aabf5c0` 的服务端 SessionStore 权威校验，不接受客户端 `project_id`；非目标、缺失、删除或畸形身份不能成为候选。
+- 当前实现范围包括每个 live connection 一个候选、全局唯一当前 lease，以及最近焦点优先、注销、连接 context 取消、刷新 epoch 和 broker Close 的确定性失效/回退；提供不带页面选择参数的 `Current` / `Acquire` API 和 `web_debug_not_connected` typed 错误。
+- 当前实现范围包括 debug handler 只消费 debug control 消息，现有 command/subscription 委托路径不变。
+
+阶段 2、3、4（`window.__SAI_DEBUG__`、`web.eval` 执行、JS/serializer/Blob/logging）本轮未实现。
 
 ### 阶段 2：`window.__SAI_DEBUG__`
 

@@ -432,6 +432,34 @@
           }
         }
       }
+    },
+    {
+      "name": "debug_register",
+      "message": {
+        "version": 1,
+        "type": "debug_register",
+        "id": "debug-register-1",
+        "payload": {
+          "page_id": "page-1",
+          "page_epoch": "epoch-1",
+          "session_id": "session-1",
+          "focused": true
+        }
+      }
+    },
+    {
+      "name": "debug_registered",
+      "message": {
+        "version": 1,
+        "type": "debug_registered",
+        "id": "debug-registered-1",
+        "payload": {
+          "page_id": "page-1",
+          "page_epoch": "epoch-1",
+          "session_id": "session-1",
+          "focused": false
+        }
+      }
     }
   ],
   "invalid": [
@@ -750,6 +778,33 @@
         "payload": {
           "request_id": "request_2",
           "status": "failed"
+        }
+      }
+    },
+    {
+      "name": "debug_missing_focused",
+      "message": {
+        "version": 1,
+        "type": "debug_register",
+        "id": "debug-invalid-1",
+        "payload": {
+          "page_id": "page-1",
+          "page_epoch": "epoch-1",
+          "session_id": "session-1"
+        }
+      }
+    },
+    {
+      "name": "debug_invalid_epoch",
+      "message": {
+        "version": 1,
+        "type": "debug_focus",
+        "id": "debug-invalid-2",
+        "payload": {
+          "page_id": "page-1",
+          "page_epoch": " ",
+          "session_id": "session-1",
+          "focused": true
         }
       }
     }

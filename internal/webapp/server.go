@@ -12,12 +12,14 @@ import (
 	"io/fs"
 	"net"
 	"net/http"
+	"os"
 	"path"
 	"strings"
 	"time"
 
 	"github.com/rexzhao/simple-agent/internal/blobstore"
 	"github.com/rexzhao/simple-agent/internal/codexlogin"
+	"github.com/rexzhao/simple-agent/internal/config"
 	"github.com/rexzhao/simple-agent/internal/execution"
 	"github.com/rexzhao/simple-agent/internal/projectindex"
 	"github.com/rexzhao/simple-agent/internal/providersettings"
@@ -25,6 +27,7 @@ import (
 	"github.com/rexzhao/simple-agent/internal/sessionindex"
 	"github.com/rexzhao/simple-agent/internal/sessions"
 	"github.com/rexzhao/simple-agent/internal/syncengine"
+	"github.com/rexzhao/simple-agent/internal/webdebug"
 	"github.com/rexzhao/simple-agent/internal/wsgateway"
 )
 
@@ -60,6 +63,7 @@ type Server struct {
 	wsTickets                    *wsgateway.TicketStore
 	wsGateway                    *wsgateway.Gateway
 	wsDispatcher                 *wsgateway.Dispatcher
+	webDebugBroker               *webdebug.Broker
 	projectIndex                 *projectindex.Provider
 	providerSettings             *providersettings.Provider
 	codexLogin                   *codexlogin.Provider
@@ -107,6 +111,7 @@ func NewServer(options ServerOptions) (*Server, error) {
 	}
 	gateway := options.WebSocketGateway
 	var dispatcher *wsgateway.Dispatcher
+	var debugBroker *webdebug.Broker
 	var projectIndexProvider *projectindex.Provider
 	var sessionIndexProvider *sessionindex.Provider
 	var projectRegistration *execution.ProjectIndexSinkRegistration
@@ -134,6 +139,9 @@ func NewServer(options ServerOptions) (*Server, error) {
 		if providerSettingsRegistration != nil {
 			providerSettingsRegistration.Unregister()
 		}
+		if debugBroker != nil {
+			debugBroker.Close()
+		}
 		if dispatcher != nil {
 			dispatcher.Close()
 		}
@@ -159,6 +167,35 @@ func NewServer(options ServerOptions) (*Server, error) {
 			blobStore.Close()
 		}
 		cancel()
+	}
+	baseConfig, err := loadWebDebugConfig(options.Service.ConfigPath())
+	if err != nil {
+		cleanupAssembly()
+		return nil, fmt.Errorf("load web server config: %w", err)
+	}
+	debugBroker, err = webdebug.NewBroker(webdebug.Options{
+		Enabled: baseConfig.WebEvalEnabled,
+		Eligibility: func(_ context.Context, sessionID string) error {
+			store := options.Service.SessionStore()
+			if store == nil {
+				return webdebug.ErrSessionUnavailable
+			}
+			session, err := store.LoadState(sessionID)
+			if errors.Is(err, sessions.ErrNotFound) {
+				return webdebug.ErrSessionNotFound
+			}
+			if err != nil {
+				return webdebug.ErrSessionUnavailable
+			}
+			if session.ProjectID != webdebug.TargetProjectID {
+				return webdebug.ErrProjectMismatch
+			}
+			return nil
+		},
+	})
+	if err != nil {
+		cleanupAssembly()
+		return nil, err
 	}
 	if gateway == nil {
 		if options.WSHandler != nil {
@@ -326,6 +363,15 @@ func NewServer(options ServerOptions) (*Server, error) {
 			}
 		}
 	}
+	if err := gateway.DecorateHandler(func(delegate wsgateway.Handler) wsgateway.Handler {
+		if delegate == nil {
+			delegate = options.WSHandler
+		}
+		return webdebug.NewHandler(debugBroker, delegate)
+	}); err != nil {
+		cleanupAssembly()
+		return nil, err
+	}
 	server := &Server{
 		service:                      options.Service,
 		token:                        options.Token,
@@ -336,6 +382,7 @@ func NewServer(options ServerOptions) (*Server, error) {
 		wsTickets:                    ticketStore,
 		wsGateway:                    gateway,
 		wsDispatcher:                 dispatcher,
+		webDebugBroker:               debugBroker,
 		projectIndex:                 projectIndexProvider,
 		providerSettings:             providerSettingsProvider,
 		sessionIndex:                 sessionIndexProvider,
@@ -355,6 +402,25 @@ func NewServer(options ServerOptions) (*Server, error) {
 	server.codexLogin = codexLoginProvider
 	server.routes()
 	return server, nil
+}
+
+func loadWebDebugConfig(configPath string) (config.DebugConfig, error) {
+	if strings.TrimSpace(configPath) == "" {
+		return config.DebugConfig{}, nil
+	}
+	if _, err := os.Stat(configPath); errors.Is(err, os.ErrNotExist) {
+		// Some in-process server tests intentionally assemble a service without
+		// a root config. Preserve that pre-existing startup behavior while
+		// remaining fail-closed for this high-risk capability.
+		return config.DebugConfig{}, nil
+	} else if err != nil {
+		return config.DebugConfig{}, err
+	}
+	cfg, err := config.LoadBase(configPath)
+	if err != nil {
+		return config.DebugConfig{}, err
+	}
+	return cfg.Debug, nil
 }
 
 func newServerEpoch() (string, error) {
@@ -400,6 +466,9 @@ func (s *Server) Close() {
 	}
 	if s.contentRunObserver != nil {
 		s.contentRunObserver()
+	}
+	if s.webDebugBroker != nil {
+		s.webDebugBroker.Close()
 	}
 	if s.wsDispatcher != nil {
 		s.wsDispatcher.Close()

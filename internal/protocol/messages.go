@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"strings"
+	"unicode"
 )
 
 // ResourceType is the closed V1 resource catalog. Resource keys are not
@@ -202,6 +204,23 @@ type ErrorPayload struct {
 	Details   json.RawMessage `json:"details,omitempty"`
 }
 
+// DebugExecutorPayload is the bounded identity carried by the stage-1 debug
+// control messages. Project identity is intentionally absent: the server
+// resolves session_id through its authoritative SessionStore.
+type DebugExecutorPayload struct {
+	PageID    string `json:"page_id"`
+	PageEpoch string `json:"page_epoch"`
+	SessionID string `json:"session_id"`
+	Focused   bool   `json:"focused"`
+}
+
+type DebugRegisterPayload = DebugExecutorPayload
+type DebugRegisteredPayload = DebugExecutorPayload
+type DebugFocusPayload = DebugExecutorPayload
+type DebugFocusedPayload = DebugExecutorPayload
+type DebugUnregisterPayload = DebugExecutorPayload
+type DebugUnregisteredPayload = DebugExecutorPayload
+
 // Concrete messages are discriminated by their embedded Envelope.Type.
 type HelloMessage struct {
 	Envelope
@@ -288,6 +307,36 @@ type ErrorMessage struct {
 	Payload ErrorPayload `json:"payload"`
 }
 
+type DebugRegisterMessage struct {
+	Envelope
+	Payload DebugRegisterPayload `json:"payload"`
+}
+
+type DebugRegisteredMessage struct {
+	Envelope
+	Payload DebugRegisteredPayload `json:"payload"`
+}
+
+type DebugFocusMessage struct {
+	Envelope
+	Payload DebugFocusPayload `json:"payload"`
+}
+
+type DebugFocusedMessage struct {
+	Envelope
+	Payload DebugFocusedPayload `json:"payload"`
+}
+
+type DebugUnregisterMessage struct {
+	Envelope
+	Payload DebugUnregisterPayload `json:"payload"`
+}
+
+type DebugUnregisteredMessage struct {
+	Envelope
+	Payload DebugUnregisteredPayload `json:"payload"`
+}
+
 // Short aliases keep the DTO names convenient without introducing a second
 // representation for any message.
 type Hello = HelloMessage
@@ -307,6 +356,12 @@ type SubscriptionEvent = SubscriptionEventMessage
 type Ack = AckMessage
 type ResyncRequired = ResyncRequiredMessage
 type Error = ErrorMessage
+type DebugRegister = DebugRegisterMessage
+type DebugRegistered = DebugRegisteredMessage
+type DebugFocus = DebugFocusMessage
+type DebugFocused = DebugFocusedMessage
+type DebugUnregister = DebugUnregisterMessage
+type DebugUnregistered = DebugUnregisteredMessage
 
 func (m HelloMessage) Kind() MessageType             { return MessageTypeHello }
 func (m WelcomeMessage) Kind() MessageType           { return MessageTypeWelcome }
@@ -325,6 +380,12 @@ func (m SubscriptionEventMessage) Kind() MessageType { return MessageTypeSubscri
 func (m AckMessage) Kind() MessageType               { return MessageTypeAck }
 func (m ResyncRequiredMessage) Kind() MessageType    { return MessageTypeResyncRequired }
 func (m ErrorMessage) Kind() MessageType             { return MessageTypeError }
+func (m DebugRegisterMessage) Kind() MessageType     { return MessageTypeDebugRegister }
+func (m DebugRegisteredMessage) Kind() MessageType   { return MessageTypeDebugRegistered }
+func (m DebugFocusMessage) Kind() MessageType        { return MessageTypeDebugFocus }
+func (m DebugFocusedMessage) Kind() MessageType      { return MessageTypeDebugFocused }
+func (m DebugUnregisterMessage) Kind() MessageType   { return MessageTypeDebugUnregister }
+func (m DebugUnregisteredMessage) Kind() MessageType { return MessageTypeDebugUnregistered }
 
 func (m HelloMessage) messageType() MessageType             { return MessageTypeHello }
 func (m WelcomeMessage) messageType() MessageType           { return MessageTypeWelcome }
@@ -343,6 +404,12 @@ func (m SubscriptionEventMessage) messageType() MessageType { return MessageType
 func (m AckMessage) messageType() MessageType               { return MessageTypeAck }
 func (m ResyncRequiredMessage) messageType() MessageType    { return MessageTypeResyncRequired }
 func (m ErrorMessage) messageType() MessageType             { return MessageTypeError }
+func (m DebugRegisterMessage) messageType() MessageType     { return MessageTypeDebugRegister }
+func (m DebugRegisteredMessage) messageType() MessageType   { return MessageTypeDebugRegistered }
+func (m DebugFocusMessage) messageType() MessageType        { return MessageTypeDebugFocus }
+func (m DebugFocusedMessage) messageType() MessageType      { return MessageTypeDebugFocused }
+func (m DebugUnregisterMessage) messageType() MessageType   { return MessageTypeDebugUnregister }
+func (m DebugUnregisteredMessage) messageType() MessageType { return MessageTypeDebugUnregistered }
 
 func validateTypedEnvelope(envelope Envelope, expected MessageType) error {
 	if envelope.Version != 1 {
@@ -803,6 +870,95 @@ func (m ErrorMessage) validate() error {
 		return invalidField("payload.details", "must be valid JSON")
 	}
 	return nil
+}
+
+func (m DebugRegisterMessage) validate() error {
+	return validateDebugMessage(m.Envelope, m.messageType(), m.Payload.PageID, m.Payload.PageEpoch, m.Payload.SessionID)
+}
+
+func (m DebugRegisteredMessage) validate() error {
+	return validateDebugMessage(m.Envelope, m.messageType(), m.Payload.PageID, m.Payload.PageEpoch, m.Payload.SessionID)
+}
+
+func (m DebugFocusMessage) validate() error {
+	return validateDebugMessage(m.Envelope, m.messageType(), m.Payload.PageID, m.Payload.PageEpoch, m.Payload.SessionID)
+}
+
+func (m DebugFocusedMessage) validate() error {
+	return validateDebugMessage(m.Envelope, m.messageType(), m.Payload.PageID, m.Payload.PageEpoch, m.Payload.SessionID)
+}
+
+func (m DebugUnregisterMessage) validate() error {
+	return validateDebugMessage(m.Envelope, m.messageType(), m.Payload.PageID, m.Payload.PageEpoch, m.Payload.SessionID)
+}
+
+func (m DebugUnregisteredMessage) validate() error {
+	return validateDebugMessage(m.Envelope, m.messageType(), m.Payload.PageID, m.Payload.PageEpoch, m.Payload.SessionID)
+}
+
+func validateDebugMessage(envelope Envelope, expected MessageType, pageID, pageEpoch, sessionID string) error {
+	if err := validateTypedEnvelope(envelope, expected); err != nil {
+		return err
+	}
+	if err := validateDebugExecutorIdentity(pageID, pageEpoch, sessionID); err != nil {
+		return err
+	}
+	if len(envelope.Payload) > 0 {
+		if err := validateDebugWirePayload(envelope.Payload); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateDebugWirePayload(payload json.RawMessage) error {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(payload, &fields); err != nil {
+		return invalidField("payload", "must be a JSON object")
+	}
+	focused, ok := fields["focused"]
+	if !ok {
+		return invalidField("payload.focused", "is required")
+	}
+	if bytes.Equal(bytes.TrimSpace(focused), []byte("null")) {
+		return invalidField("payload.focused", "must be a boolean")
+	}
+	var value bool
+	if err := json.Unmarshal(focused, &value); err != nil {
+		return invalidField("payload.focused", "must be a boolean")
+	}
+	return nil
+}
+
+func validateDebugExecutorIdentity(pageID, pageEpoch, sessionID string) error {
+	for _, item := range []struct {
+		field string
+		value string
+	}{
+		{field: "page_id", value: pageID},
+		{field: "page_epoch", value: pageEpoch},
+		{field: "session_id", value: sessionID},
+	} {
+		field, value := item.field, item.value
+		if err := requiredString("payload."+field, value); err != nil {
+			return err
+		}
+		if strings.TrimSpace(value) != value {
+			return invalidField("payload."+field, "must not have leading or trailing whitespace")
+		}
+		for _, r := range value {
+			if unicode.IsControl(r) {
+				return invalidField("payload."+field, "must not contain control characters")
+			}
+		}
+	}
+	return nil
+}
+
+// ValidateDebugExecutorIdentity validates the bounded identity shared by all
+// stage-1 debug control messages.
+func ValidateDebugExecutorIdentity(pageID, pageEpoch, sessionID string) error {
+	return validateDebugExecutorIdentity(pageID, pageEpoch, sessionID)
 }
 
 func validateResourceKey(field string, resource ResourceKey) error {

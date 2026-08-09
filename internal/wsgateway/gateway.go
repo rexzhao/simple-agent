@@ -34,11 +34,13 @@ const (
 )
 
 var (
-	ErrConnectionClosed     = errors.New("websocket connection is closed")
-	ErrOutboundQueueFull    = errors.New("websocket outbound queue is full")
-	ErrSubscriptionDesynced = errors.New("websocket subscription is desynced")
-	ErrMessageTooLarge      = errors.New("websocket message exceeds the configured limit")
-	ErrUnsupportedMessage   = errors.New("websocket message is unsupported")
+	ErrConnectionClosed        = errors.New("websocket connection is closed")
+	ErrOutboundQueueFull       = errors.New("websocket outbound queue is full")
+	ErrSubscriptionDesynced    = errors.New("websocket subscription is desynced")
+	ErrMessageTooLarge         = errors.New("websocket message exceeds the configured limit")
+	ErrUnsupportedMessage      = errors.New("websocket message is unsupported")
+	ErrGatewayAlreadyServing   = errors.New("websocket gateway has already started serving")
+	ErrInvalidHandlerDecorator = errors.New("websocket handler decorator is invalid")
 )
 
 // Limits are intentionally finite defaults. They bound both memory retained by
@@ -226,6 +228,8 @@ type Gateway struct {
 	clock              Clock
 	serverEpoch        string
 	handler            Handler
+	handlerMu          sync.RWMutex
+	serveStarted       bool
 	observer           Observer
 	idGenerator        func(prefix string) (string, error)
 	observerMu         sync.Mutex
@@ -270,6 +274,44 @@ func secureID(prefix string) (string, error) {
 	return prefix + "_" + hex.EncodeToString(raw), nil
 }
 
+// DecorateHandler atomically replaces the handler with the result of a narrow
+// pre-serve decorator. Once HTTPHandler begins serving, decoration is rejected
+// and the active handler cannot be replaced.
+func (g *Gateway) DecorateHandler(decorator func(Handler) Handler) error {
+	if g == nil || decorator == nil {
+		return ErrInvalidHandlerDecorator
+	}
+	g.handlerMu.Lock()
+	defer g.handlerMu.Unlock()
+	if g.serveStarted {
+		return ErrGatewayAlreadyServing
+	}
+	decorated := decorator(g.handler)
+	if decorated == nil {
+		return ErrInvalidHandlerDecorator
+	}
+	g.handler = decorated
+	return nil
+}
+
+func (g *Gateway) markServeStarted() {
+	if g == nil {
+		return
+	}
+	g.handlerMu.Lock()
+	g.serveStarted = true
+	g.handlerMu.Unlock()
+}
+
+func (g *Gateway) handlerSnapshot() Handler {
+	if g == nil {
+		return nil
+	}
+	g.handlerMu.RLock()
+	defer g.handlerMu.RUnlock()
+	return g.handler
+}
+
 // Serve accepts an already authenticated, already consumed ticket. Ticket
 // consumption deliberately lives in the HTTP boundary so it occurs before
 // websocket.Accept upgrades the request.
@@ -277,6 +319,7 @@ func (g *Gateway) HTTPHandler(ctx context.Context, w http.ResponseWriter, r *htt
 	if g == nil {
 		return
 	}
+	g.markServeStarted()
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -698,11 +741,12 @@ func (c *connection) reader(ctx, handlerCtx context.Context, done chan<- struct{
 			// dispatch it to business code, even when a handler is absent.
 			// Liveness was recorded immediately after validation above.
 		default:
-			if c.gateway.handler == nil {
+			handler := c.gateway.handlerSnapshot()
+			if handler == nil {
 				c.unsupportedMessage()
 				return
 			}
-			if err := c.gateway.handler.Handle(handlerCtx, c, message); err != nil {
+			if err := handler.Handle(handlerCtx, c, message); err != nil {
 				c.handleHandlerError(err)
 				return
 			}
@@ -717,7 +761,9 @@ func isClientMessage(messageType protocol.MessageType) bool {
 	switch messageType {
 	case protocol.MessageTypePing, protocol.MessageTypePong,
 		protocol.MessageTypeCommand, protocol.MessageTypeSubscribe,
-		protocol.MessageTypeUnsubscribe, protocol.MessageTypeAck:
+		protocol.MessageTypeUnsubscribe, protocol.MessageTypeAck,
+		protocol.MessageTypeDebugRegister, protocol.MessageTypeDebugFocus,
+		protocol.MessageTypeDebugUnregister:
 		return true
 	default:
 		return false

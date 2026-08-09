@@ -111,6 +111,30 @@ func TestLoadBaseDisablesDiagnosticLoggingByDefault(t *testing.T) {
 	}
 }
 
+func TestLoadBaseDisablesWebEvalByDefault(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "sai.yaml")
+	writeFile(t, path, "{}\n")
+	cfg, err := LoadBase(path)
+	if err != nil {
+		t.Fatalf("LoadBase() error = %v", err)
+	}
+	if cfg.Debug.WebEvalEnabled {
+		t.Fatal("Debug.WebEvalEnabled = true, want false by default")
+	}
+}
+
+func TestLoadBaseReadsWebEvalEnabledFromYAML(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "sai.yaml")
+	writeFile(t, path, "debug:\n  web_eval_enabled: true\n")
+	cfg, err := LoadBase(path)
+	if err != nil {
+		t.Fatalf("LoadBase() error = %v", err)
+	}
+	if !cfg.Debug.WebEvalEnabled {
+		t.Fatal("Debug.WebEvalEnabled = false, want true from YAML")
+	}
+}
+
 func TestEnsureRootConfigCreatesCoreLayoutWithoutLogs(t *testing.T) {
 	root := t.TempDir()
 	path := filepath.Join(root, "custom-agent.yaml")
