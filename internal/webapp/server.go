@@ -64,6 +64,7 @@ type Server struct {
 	wsGateway                    *wsgateway.Gateway
 	wsDispatcher                 *wsgateway.Dispatcher
 	webDebugBroker               *webdebug.Broker
+	webEvalEnabled               bool
 	projectIndex                 *projectindex.Provider
 	providerSettings             *providersettings.Provider
 	codexLogin                   *codexlogin.Provider
@@ -383,6 +384,7 @@ func NewServer(options ServerOptions) (*Server, error) {
 		wsGateway:                    gateway,
 		wsDispatcher:                 dispatcher,
 		webDebugBroker:               debugBroker,
+		webEvalEnabled:               baseConfig.WebEvalEnabled,
 		projectIndex:                 projectIndexProvider,
 		providerSettings:             providerSettingsProvider,
 		sessionIndex:                 sessionIndexProvider,
@@ -433,7 +435,7 @@ func newServerEpoch() (string, error) {
 
 func (s *Server) Handler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		setSecurityHeaders(w)
+		setSecurityHeaders(w, s.webEvalEnabled && r.URL.Path != "/api" && !strings.HasPrefix(r.URL.Path, "/api/"))
 		if !validLoopbackHost(r.Host) {
 			writeAPIError(w, http.StatusForbidden, "invalid_host", "request host is not allowed")
 			return
@@ -604,8 +606,12 @@ func (s *Server) handleBootstrap(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func setSecurityHeaders(w http.ResponseWriter) {
-	w.Header().Set("Content-Security-Policy", "default-src 'self'; connect-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'")
+func setSecurityHeaders(w http.ResponseWriter, allowUnsafeEval bool) {
+	scriptSource := "'self'"
+	if allowUnsafeEval {
+		scriptSource += " 'unsafe-eval'"
+	}
+	w.Header().Set("Content-Security-Policy", "default-src 'self'; connect-src 'self'; img-src 'self' data:; style-src 'self'; script-src "+scriptSource+"; base-uri 'none'; frame-ancestors 'none'; form-action 'self'")
 	w.Header().Set("Referrer-Policy", "no-referrer")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("X-Frame-Options", "DENY")

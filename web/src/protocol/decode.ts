@@ -1,6 +1,6 @@
 import { isRFC3339Timestamp } from './datetime'
 import { ProtocolDecodeError } from './errors'
-import { isBoundedDebugIdentity } from './identifiers'
+import { isBoundedDebugIdentity, isWellFormedString } from './identifiers'
 import { compareRunCursor, isRunCursor, isSequence } from './sequence'
 import { unicodeCodePointLength } from './strings'
 import type {
@@ -33,6 +33,8 @@ const messageTypes = new Set([
   'debug_focused',
   'debug_unregister',
   'debug_unregistered',
+  'debug_execute',
+  'debug_execution_result',
   'error',
 ])
 
@@ -187,6 +189,12 @@ function validatePayload(type: string, payload: RawObject): void {
     case 'debug_unregistered':
       validateDebugExecutorPayload(payload)
       return
+    case 'debug_execute':
+      validateDebugExecutionPayload(payload)
+      return
+    case 'debug_execution_result':
+      validateDebugExecutionResultPayload(payload)
+      return
     case 'error':
       requiredString(payload, 'code', 'payload.code')
       requiredString(payload, 'message', 'payload.message')
@@ -210,6 +218,74 @@ function validateDebugExecutorPayload(payload: RawObject): void {
   if (!has(payload, 'focused') || typeof payload.focused !== 'boolean') {
     fail('invalid_field', 'must be a boolean', 'payload.focused')
   }
+}
+
+function validateDebugExecutionPayload(payload: RawObject): void {
+  validateDebugExecutionIdentity(payload)
+  const code = payload.code
+  if (typeof code !== 'string' || code.length === 0 || !isWellFormedString(code)) {
+    fail('invalid_field', 'must be a non-empty well-formed string', 'payload.code')
+  }
+  if (new TextEncoder().encode(code).byteLength > 64 * 1024) {
+    fail('invalid_field', 'exceeds the maximum execution code length', 'payload.code')
+  }
+  boundedTimeout(payload.timeout_ms, 'payload.timeout_ms')
+}
+
+function validateDebugExecutionResultPayload(payload: RawObject): void {
+  validateDebugExecutionIdentity(payload)
+  const status = requiredString(payload, 'status', 'payload.status')
+  if (status !== 'succeeded' && status !== 'failed') {
+    fail('invalid_field', 'must be succeeded or failed', 'payload.status')
+  }
+  if (status === 'succeeded' && !has(payload, 'value')) {
+    fail('invalid_field', 'is required for a succeeded execution', 'payload.value')
+  }
+  if (status === 'failed') {
+    const error = object(payload.error, 'payload.error')
+    requiredString(error, 'code', 'payload.error.code')
+    requiredString(error, 'message', 'payload.error.message')
+    if (has(payload, 'value')) {
+      fail('invalid_field', 'must be omitted for a failed execution', 'payload.value')
+    }
+  } else if (has(payload, 'error')) {
+    fail('invalid_field', 'must be omitted for a succeeded execution', 'payload.error')
+  }
+  if (has(payload, 'console')) {
+    const consoleEntries = requiredArray(payload, 'console', 'payload.console')
+    if (consoleEntries.length > 128) fail('invalid_field', 'contains too many console entries', 'payload.console')
+    consoleEntries.forEach((value, index) => {
+      const entry = object(value, `payload.console[${index}]`)
+      const level = requiredString(entry, 'level', `payload.console[${index}].level`)
+      if (!['log', 'info', 'warn', 'error', 'debug'].includes(level)) {
+        fail('invalid_field', 'must be log, info, warn, error, or debug', `payload.console[${index}].level`)
+      }
+      const args = requiredArray(entry, 'arguments', `payload.console[${index}].arguments`)
+      if (args.length > 32) fail('invalid_field', 'contains too many arguments', `payload.console[${index}].arguments`)
+    })
+  }
+  if (jsonByteLength(payload) > 64 * 1024) {
+    fail('invalid_field', 'execution result exceeds the inline result budget', 'payload')
+  }
+}
+
+function validateDebugExecutionIdentity(payload: RawObject): void {
+  for (const key of ['execution_id', 'page_id', 'page_epoch', 'session_id']) {
+    if (!isBoundedDebugIdentity(payload[key])) {
+      fail('invalid_field', 'must be a bounded non-empty identity without edge whitespace or control characters', `payload.${key}`)
+    }
+  }
+}
+
+function boundedTimeout(value: unknown, field: string): void {
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 100 || value > 30_000) {
+    fail('invalid_field', 'must be between 100 and 30000 milliseconds', field)
+  }
+}
+
+function jsonByteLength(value: unknown): number {
+  const encoded = JSON.stringify(value)
+  return typeof encoded === 'string' ? new TextEncoder().encode(encoded).byteLength : Number.POSITIVE_INFINITY
 }
 
 function validateSubscriptionMetadata(payload: RawObject): void {

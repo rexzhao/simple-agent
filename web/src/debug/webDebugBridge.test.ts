@@ -2,7 +2,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { decodeMessage } from '../protocol/decode'
 import { encodeMessage } from '../protocol/encode'
-import type { ProtocolMessage } from '../protocol/types'
+import type { DebugExecutionResultPayload, ProtocolMessage } from '../protocol/types'
 import { ProjectIndexAdapter } from '../sync/projectIndexAdapter'
 import { SessionIndexAdapter } from '../sync/sessionIndexAdapter'
 import { SessionContentAdapter } from '../sync/sessionContentAdapter'
@@ -24,13 +24,19 @@ class FakeTransport implements RuntimeTransport {
   connectionGeneration = 1
   serverEpoch = 'server_1'
   readonly sent: ProtocolMessage[] = []
+  sendAttempts = 0
+  sendError?: Error
   private readonly messages = new Set<(message: ProtocolMessage, generation: number) => void>()
   private readonly ready = new Set<(event: TransportReadyEvent) => void>()
   private readonly closed = new Set<(event: TransportCloseEvent) => void>()
 
   start(): void { this.isReady = true }
   stop(): void { this.close(false) }
-  send(message: ProtocolMessage): void { this.sent.push(decodeMessage(encodeMessage(message))) }
+  send(message: ProtocolMessage): void {
+    this.sendAttempts += 1
+    if (this.sendError) throw this.sendError
+    this.sent.push(decodeMessage(encodeMessage(message)))
+  }
   onMessage(listener: (message: ProtocolMessage, generation: number) => void): () => void { this.messages.add(listener); return () => this.messages.delete(listener) }
   onReady(listener: (event: TransportReadyEvent) => void): () => void { this.ready.add(listener); return () => this.ready.delete(listener) }
   onClose(listener: (event: TransportCloseEvent) => void): () => void { this.closed.add(listener); return () => this.closed.delete(listener) }
@@ -501,5 +507,321 @@ describe('browser web debug bridge', () => {
     expect('transport' in application.page).toBe(false)
     expect('debugBridge' in application.page).toBe(false)
     application.dispose()
+  })
+
+  it('executes expression and async completion values with a typed inline result', async () => {
+    const setup = createBridge()
+    setup.bridge.start()
+    acknowledge(setup.transport)
+    setup.transport.emit({
+      version: 1,
+      type: 'debug_execute',
+      id: 'execute-1',
+      payload: {
+        execution_id: 'execution-1', page_id: 'page-id', page_epoch: 'page-epoch', session_id: 'session_a',
+        code: 'await Promise.resolve({ answer: 42 })', timeout_ms: 500,
+      },
+    })
+    await vi.waitFor(() => expect(setup.transport.last('debug_execution_result')).toBeDefined())
+    const result = setup.transport.last('debug_execution_result')
+    expect(result?.type).toBe('debug_execution_result')
+    if (result?.type !== 'debug_execution_result') throw new Error('execution result was not sent')
+    expect(result.payload).toMatchObject({ execution_id: 'execution-1', status: 'succeeded', value: { answer: 42 } })
+
+    setup.transport.emit({
+      version: 1,
+      type: 'debug_execute',
+      id: 'execute-2',
+      payload: {
+        execution_id: 'execution-2', page_id: 'page-id', page_epoch: 'page-epoch', session_id: 'session_a',
+        code: 'const value = 6; return value * 7', timeout_ms: 500,
+      },
+    })
+    await vi.waitFor(() => expect(setup.transport.count('debug_execution_result')).toBe(2))
+    const second = setup.transport.last('debug_execution_result')
+    if (second?.type !== 'debug_execution_result') throw new Error('second execution result was not sent')
+    expect(second.payload.value).toBe(42)
+    setup.bridge.dispose()
+    setup.application.dispose()
+  })
+
+  it('captures console output, restores console, and returns typed throws', async () => {
+    const setup = createBridge()
+    setup.bridge.start()
+    acknowledge(setup.transport)
+    const originalLog = window.console.log
+    setup.transport.emit({
+      version: 1,
+      type: 'debug_execute',
+      id: 'execute-console',
+      payload: {
+        execution_id: 'execution-console', page_id: 'page-id', page_epoch: 'page-epoch', session_id: 'session_a',
+        code: 'console.log("hello", 7); return 1', timeout_ms: 500,
+      },
+    })
+    await vi.waitFor(() => expect(setup.transport.count('debug_execution_result')).toBe(1))
+    const success = setup.transport.last('debug_execution_result')
+    if (success?.type !== 'debug_execution_result') throw new Error('console execution result was not sent')
+    expect(success.payload.console?.[0]).toMatchObject({ level: 'log', arguments: ['hello', 7] })
+    expect(success.payload.value).toBe(1)
+    expect(window.console.log).toBe(originalLog)
+
+    setup.transport.emit({
+      version: 1,
+      type: 'debug_execute',
+      id: 'execute-overwrite-success',
+      payload: {
+        execution_id: 'execution-overwrite-success', page_id: 'page-id', page_epoch: 'page-epoch', session_id: 'session_a',
+        code: 'console.log = () => {}; return 2', timeout_ms: 500,
+      },
+    })
+    await vi.waitFor(() => expect(setup.transport.count('debug_execution_result')).toBe(2))
+    expect(window.console.log).toBe(originalLog)
+
+    setup.transport.emit({
+      version: 1,
+      type: 'debug_execute',
+      id: 'execute-throw',
+      payload: {
+        execution_id: 'execution-throw', page_id: 'page-id', page_epoch: 'page-epoch', session_id: 'session_a',
+        code: 'throw new Error("boom")', timeout_ms: 500,
+      },
+    })
+    await vi.waitFor(() => expect(setup.transport.count('debug_execution_result')).toBe(3))
+    const failure = setup.transport.last('debug_execution_result')
+    if (failure?.type !== 'debug_execution_result') throw new Error('throw result was not sent')
+    expect(failure.payload).toMatchObject({ status: 'failed', error: { code: 'web_debug_execution_error', message: 'boom' } })
+    expect(window.console.log).toBe(originalLog)
+
+    setup.transport.emit({
+      version: 1,
+      type: 'debug_execute',
+      id: 'execute-overwrite-throw',
+      payload: {
+        execution_id: 'execution-overwrite-throw', page_id: 'page-id', page_epoch: 'page-epoch', session_id: 'session_a',
+        code: 'console.log = () => {}; throw new Error("overwrite boom")', timeout_ms: 500,
+      },
+    })
+    await vi.waitFor(() => expect(setup.transport.count('debug_execution_result')).toBe(4))
+    expect(window.console.log).toBe(originalLog)
+
+    const longMessage = '🦄'.repeat(5_000)
+    setup.transport.emit({
+      version: 1,
+      type: 'debug_execute',
+      id: 'execute-long-error',
+      payload: {
+        execution_id: 'execution-long-error', page_id: 'page-id', page_epoch: 'page-epoch', session_id: 'session_a',
+        code: `throw new Error(${JSON.stringify(longMessage)})`, timeout_ms: 500,
+      },
+    })
+    await vi.waitFor(() => expect(setup.transport.count('debug_execution_result')).toBe(5))
+    const longFailure = setup.transport.last('debug_execution_result')
+    if (longFailure?.type !== 'debug_execution_result') throw new Error('long error result was not sent')
+    expect(longFailure.payload.status).toBe('failed')
+    expect(longFailure.payload.error).toBeDefined()
+    expect(new TextEncoder().encode(longFailure.payload.error?.message ?? '').byteLength).toBeLessThanOrEqual(4096)
+    setup.bridge.dispose()
+    setup.application.dispose()
+  })
+
+  it('returns a browser timeout for async completion and restores console hooks', async () => {
+    const setup = createBridge()
+    setup.bridge.start()
+    acknowledge(setup.transport)
+    const originalWarn = window.console.warn
+    const late = window as unknown as { __saiDebugResolveLate?: () => void }
+    setup.transport.emit({
+      version: 1,
+      type: 'debug_execute',
+      id: 'execute-timeout',
+      payload: {
+        execution_id: 'execution-timeout', page_id: 'page-id', page_epoch: 'page-epoch', session_id: 'session_a',
+        code: 'console.warn("before timeout"); await new Promise(resolve => { window.__saiDebugResolveLate = resolve })', timeout_ms: 100,
+      },
+    })
+    await vi.waitFor(() => expect(setup.transport.count('debug_execution_result')).toBe(1), { timeout: 1000 })
+    const result = setup.transport.last('debug_execution_result')
+    if (result?.type !== 'debug_execution_result') throw new Error('timeout result was not sent')
+    expect(result.payload).toMatchObject({
+      execution_id: 'execution-timeout', status: 'failed', error: { code: 'web_debug_timeout' },
+    })
+    expect(window.console.warn).toBe(originalWarn)
+    expect(setup.transport.count('debug_execution_result')).toBe(1)
+
+    setup.transport.emit({
+      version: 1,
+      type: 'debug_execute',
+      id: 'execute-after-timeout',
+      payload: {
+        execution_id: 'execution-after-timeout', page_id: 'page-id', page_epoch: 'page-epoch', session_id: 'session_a',
+        code: 'return 7', timeout_ms: 500,
+      },
+    })
+    await vi.waitFor(() => expect(setup.transport.count('debug_execution_result')).toBe(2))
+    expect(setup.transport.last('debug_execution_result')).toMatchObject({
+      type: 'debug_execution_result',
+      payload: { execution_id: 'execution-after-timeout', status: 'succeeded', value: 7 },
+    })
+    late.__saiDebugResolveLate?.()
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    expect(setup.transport.count('debug_execution_result')).toBe(2)
+    delete late.__saiDebugResolveLate
+    setup.bridge.dispose()
+    expect(setup.transport.count('debug_execution_result')).toBe(2)
+    setup.application.dispose()
+  })
+
+  it('returns a typed stale result for an identity that is not the current registration', async () => {
+    const setup = createBridge()
+    setup.bridge.start()
+    acknowledge(setup.transport)
+    setup.transport.emit({
+      version: 1,
+      type: 'debug_execute',
+      id: 'execute-stale',
+      payload: {
+        execution_id: 'execution-stale', page_id: 'other-page', page_epoch: 'page-epoch', session_id: 'session_a',
+        code: '1 + 1', timeout_ms: 500,
+      },
+    })
+    await vi.waitFor(() => expect(setup.transport.count('debug_execution_result')).toBe(1))
+    expect(setup.transport.last('debug_execution_result')).toMatchObject({
+      type: 'debug_execution_result',
+      payload: { execution_id: 'execution-stale', status: 'failed', error: { code: 'web_debug_executor_stale' } },
+    })
+    setup.bridge.dispose()
+    setup.application.dispose()
+  })
+
+  it('validates result frames locally, uses one minimal fallback, and never retries transport failure', () => {
+    const setup = createBridge()
+    setup.bridge.start()
+    acknowledge(setup.transport)
+    const sendResult = (setup.bridge as unknown as {
+      sendExecutionResult: (request: {
+        execution_id: string
+        page_id: string
+        page_epoch: string
+        session_id: string
+      }, generation: number, result: DebugExecutionResultPayload) => void
+    }).sendExecutionResult.bind(setup.bridge)
+    const request = { execution_id: 'execution-local', page_id: 'page-id', page_epoch: 'page-epoch', session_id: 'session_a' }
+    const beforeSuccess = setup.transport.sendAttempts
+    sendResult(request, setup.transport.connectionGeneration, {
+      ...request,
+      status: 'succeeded',
+      value: 'x'.repeat(70 * 1024),
+    })
+    expect(setup.transport.sendAttempts - beforeSuccess).toBe(1)
+    expect(setup.transport.last('debug_execution_result')).toMatchObject({
+      type: 'debug_execution_result',
+      payload: { status: 'succeeded', value: { __sai_debug: 'summary', reason: 'budget' } },
+    })
+
+    const beforeInvalidSuccess = setup.transport.sendAttempts
+    sendResult(request, setup.transport.connectionGeneration, {
+      ...request,
+      status: 'succeeded',
+    } as unknown as DebugExecutionResultPayload)
+    expect(setup.transport.sendAttempts - beforeInvalidSuccess).toBe(1)
+    expect(setup.transport.last('debug_execution_result')).toMatchObject({
+      type: 'debug_execution_result',
+      payload: { status: 'succeeded', value: { __sai_debug: 'summary' } },
+    })
+
+    const beforeFailed = setup.transport.sendAttempts
+    sendResult(request, setup.transport.connectionGeneration, {
+      ...request,
+      status: 'failed',
+      value: null,
+    } as unknown as DebugExecutionResultPayload)
+    expect(setup.transport.sendAttempts - beforeFailed).toBe(1)
+    expect(setup.transport.last('debug_execution_result')).toMatchObject({
+      type: 'debug_execution_result',
+      payload: { status: 'failed', error: { code: 'web_debug_serializer_error' } },
+    })
+
+    const beforeFailedBudget = setup.transport.sendAttempts
+    sendResult(request, setup.transport.connectionGeneration, {
+      ...request,
+      status: 'failed',
+      error: { code: 'web_debug_execution_error', message: 'x'.repeat(70 * 1024) },
+    })
+    expect(setup.transport.sendAttempts - beforeFailedBudget).toBe(1)
+    expect(setup.transport.last('debug_execution_result')).toMatchObject({
+      type: 'debug_execution_result',
+      payload: { status: 'failed', error: { code: 'web_debug_serializer_error' } },
+    })
+
+    setup.transport.sendError = new Error('socket write failed')
+    const beforeTransportFailure = setup.transport.sendAttempts
+    sendResult(request, setup.transport.connectionGeneration, {
+      ...request,
+      status: 'succeeded',
+      value: 1,
+    })
+    expect(setup.transport.sendAttempts - beforeTransportFailure).toBe(1)
+    setup.bridge.dispose()
+    setup.application.dispose()
+  })
+
+  it('invalidates an active execution on transport close without a late replay', async () => {
+    const setup = createBridge()
+    setup.bridge.start()
+    acknowledge(setup.transport)
+    setup.transport.emit({
+      version: 1,
+      type: 'debug_execute',
+      id: 'execute-close',
+      payload: {
+        execution_id: 'execution-close', page_id: 'page-id', page_epoch: 'page-epoch', session_id: 'session_a',
+        code: 'await new Promise(() => {})', timeout_ms: 1000,
+      },
+    })
+    setup.transport.close(false)
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    // The socket is already unavailable, so the bridge cannot safely send the
+    // disconnected result; it must still suppress the late promise.
+    expect(setup.transport.count('debug_execution_result')).toBe(0)
+    setup.bridge.dispose()
+    setup.application.dispose()
+  })
+
+  it('enforces one browser execution, async timeout, identity checks, and no late replay', async () => {
+    const setup = createBridge()
+    setup.bridge.start()
+    acknowledge(setup.transport)
+    const never = {
+      version: 1 as const,
+      type: 'debug_execute' as const,
+      id: 'execute-never',
+      payload: {
+        execution_id: 'execution-never', page_id: 'page-id', page_epoch: 'page-epoch', session_id: 'session_a',
+        code: 'await new Promise(() => {})', timeout_ms: 1000,
+      },
+    }
+    setup.transport.emit(never)
+    setup.transport.emit({
+      ...never,
+      id: 'execute-busy',
+      payload: { ...never.payload, execution_id: 'execution-busy' },
+    })
+    await vi.waitFor(() => expect(setup.transport.count('debug_execution_result')).toBe(1))
+    const busy = setup.transport.last('debug_execution_result')
+    if (busy?.type !== 'debug_execution_result') throw new Error('busy result was not sent')
+    expect(busy.payload).toMatchObject({ execution_id: 'execution-busy', status: 'failed', error: { code: 'web_debug_busy' } })
+
+    const resultCountBeforeStop = setup.transport.count('debug_execution_result')
+    setup.bridge.stop()
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    expect(setup.transport.count('debug_execution_result')).toBe(resultCountBeforeStop + 1)
+    // The only post-stop result is the one best-effort stale/disconnected
+    // response; the unresolved promise cannot send a second result.
+    expect(setup.transport.last('debug_execution_result')).toMatchObject({
+      type: 'debug_execution_result',
+      payload: { execution_id: 'execution-never', status: 'failed', error: { code: 'web_debug_disconnected' } },
+    })
+    setup.application.dispose()
   })
 })

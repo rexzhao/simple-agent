@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 	"unicode"
+	"unicode/utf8"
 )
 
 // ResourceType is the closed V1 resource catalog. Resource keys are not
@@ -221,6 +222,63 @@ type DebugFocusedPayload = DebugExecutorPayload
 type DebugUnregisterPayload = DebugExecutorPayload
 type DebugUnregisteredPayload = DebugExecutorPayload
 
+const (
+	DebugExecutionCodeMaxBytes      = 64 * 1024
+	DebugExecutionResultMaxBytes    = 64 * 1024
+	DebugExecutionMinTimeoutMS      = 100
+	DebugExecutionMaxTimeoutMS      = 30_000
+	DebugExecutionMaxConsoleEntries = 128
+	DebugExecutionMaxConsoleArgs    = 32
+)
+
+type DebugExecutionPayload struct {
+	ExecutionID string `json:"execution_id"`
+	PageID      string `json:"page_id"`
+	PageEpoch   string `json:"page_epoch"`
+	SessionID   string `json:"session_id"`
+	Code        string `json:"code"`
+	TimeoutMS   int    `json:"timeout_ms"`
+}
+
+type DebugExecutionStatus string
+
+const (
+	DebugExecutionStatusSucceeded DebugExecutionStatus = "succeeded"
+	DebugExecutionStatusFailed    DebugExecutionStatus = "failed"
+)
+
+type DebugConsoleLevel string
+
+const (
+	DebugConsoleLog   DebugConsoleLevel = "log"
+	DebugConsoleInfo  DebugConsoleLevel = "info"
+	DebugConsoleWarn  DebugConsoleLevel = "warn"
+	DebugConsoleError DebugConsoleLevel = "error"
+	DebugConsoleDebug DebugConsoleLevel = "debug"
+)
+
+type DebugConsoleEntry struct {
+	Level     DebugConsoleLevel `json:"level"`
+	Arguments []json.RawMessage `json:"arguments"`
+}
+
+type DebugExecutionError struct {
+	Code    string          `json:"code"`
+	Message string          `json:"message"`
+	Details json.RawMessage `json:"details,omitempty"`
+}
+
+type DebugExecutionResultPayload struct {
+	ExecutionID string               `json:"execution_id"`
+	PageID      string               `json:"page_id"`
+	PageEpoch   string               `json:"page_epoch"`
+	SessionID   string               `json:"session_id"`
+	Status      DebugExecutionStatus `json:"status"`
+	Value       json.RawMessage      `json:"value,omitempty"`
+	Console     []DebugConsoleEntry  `json:"console,omitempty"`
+	Error       *DebugExecutionError `json:"error,omitempty"`
+}
+
 // Concrete messages are discriminated by their embedded Envelope.Type.
 type HelloMessage struct {
 	Envelope
@@ -337,6 +395,16 @@ type DebugUnregisteredMessage struct {
 	Payload DebugUnregisteredPayload `json:"payload"`
 }
 
+type DebugExecuteMessage struct {
+	Envelope
+	Payload DebugExecutionPayload `json:"payload"`
+}
+
+type DebugExecutionResultMessage struct {
+	Envelope
+	Payload DebugExecutionResultPayload `json:"payload"`
+}
+
 // Short aliases keep the DTO names convenient without introducing a second
 // representation for any message.
 type Hello = HelloMessage
@@ -362,30 +430,34 @@ type DebugFocus = DebugFocusMessage
 type DebugFocused = DebugFocusedMessage
 type DebugUnregister = DebugUnregisterMessage
 type DebugUnregistered = DebugUnregisteredMessage
+type DebugExecute = DebugExecuteMessage
+type DebugExecutionResult = DebugExecutionResultMessage
 
-func (m HelloMessage) Kind() MessageType             { return MessageTypeHello }
-func (m WelcomeMessage) Kind() MessageType           { return MessageTypeWelcome }
-func (m PingMessage) Kind() MessageType              { return MessageTypePing }
-func (m PongMessage) Kind() MessageType              { return MessageTypePong }
-func (m CommandMessage) Kind() MessageType           { return MessageTypeCommand }
-func (m CommandAcceptedMessage) Kind() MessageType   { return MessageTypeCommandAccepted }
-func (m CommandResultMessage) Kind() MessageType     { return MessageTypeCommandResult }
-func (m SubscribeMessage) Kind() MessageType         { return MessageTypeSubscribe }
-func (m SubscribedMessage) Kind() MessageType        { return MessageTypeSubscribed }
-func (m UnsubscribeMessage) Kind() MessageType       { return MessageTypeUnsubscribe }
-func (m UnsubscribedMessage) Kind() MessageType      { return MessageTypeUnsubscribed }
-func (m SnapshotMessage) Kind() MessageType          { return MessageTypeSnapshot }
-func (m ChangeMessage) Kind() MessageType            { return MessageTypeChange }
-func (m SubscriptionEventMessage) Kind() MessageType { return MessageTypeSubscriptionEvent }
-func (m AckMessage) Kind() MessageType               { return MessageTypeAck }
-func (m ResyncRequiredMessage) Kind() MessageType    { return MessageTypeResyncRequired }
-func (m ErrorMessage) Kind() MessageType             { return MessageTypeError }
-func (m DebugRegisterMessage) Kind() MessageType     { return MessageTypeDebugRegister }
-func (m DebugRegisteredMessage) Kind() MessageType   { return MessageTypeDebugRegistered }
-func (m DebugFocusMessage) Kind() MessageType        { return MessageTypeDebugFocus }
-func (m DebugFocusedMessage) Kind() MessageType      { return MessageTypeDebugFocused }
-func (m DebugUnregisterMessage) Kind() MessageType   { return MessageTypeDebugUnregister }
-func (m DebugUnregisteredMessage) Kind() MessageType { return MessageTypeDebugUnregistered }
+func (m HelloMessage) Kind() MessageType                { return MessageTypeHello }
+func (m WelcomeMessage) Kind() MessageType              { return MessageTypeWelcome }
+func (m PingMessage) Kind() MessageType                 { return MessageTypePing }
+func (m PongMessage) Kind() MessageType                 { return MessageTypePong }
+func (m CommandMessage) Kind() MessageType              { return MessageTypeCommand }
+func (m CommandAcceptedMessage) Kind() MessageType      { return MessageTypeCommandAccepted }
+func (m CommandResultMessage) Kind() MessageType        { return MessageTypeCommandResult }
+func (m SubscribeMessage) Kind() MessageType            { return MessageTypeSubscribe }
+func (m SubscribedMessage) Kind() MessageType           { return MessageTypeSubscribed }
+func (m UnsubscribeMessage) Kind() MessageType          { return MessageTypeUnsubscribe }
+func (m UnsubscribedMessage) Kind() MessageType         { return MessageTypeUnsubscribed }
+func (m SnapshotMessage) Kind() MessageType             { return MessageTypeSnapshot }
+func (m ChangeMessage) Kind() MessageType               { return MessageTypeChange }
+func (m SubscriptionEventMessage) Kind() MessageType    { return MessageTypeSubscriptionEvent }
+func (m AckMessage) Kind() MessageType                  { return MessageTypeAck }
+func (m ResyncRequiredMessage) Kind() MessageType       { return MessageTypeResyncRequired }
+func (m ErrorMessage) Kind() MessageType                { return MessageTypeError }
+func (m DebugRegisterMessage) Kind() MessageType        { return MessageTypeDebugRegister }
+func (m DebugRegisteredMessage) Kind() MessageType      { return MessageTypeDebugRegistered }
+func (m DebugFocusMessage) Kind() MessageType           { return MessageTypeDebugFocus }
+func (m DebugFocusedMessage) Kind() MessageType         { return MessageTypeDebugFocused }
+func (m DebugUnregisterMessage) Kind() MessageType      { return MessageTypeDebugUnregister }
+func (m DebugUnregisteredMessage) Kind() MessageType    { return MessageTypeDebugUnregistered }
+func (m DebugExecuteMessage) Kind() MessageType         { return MessageTypeDebugExecute }
+func (m DebugExecutionResultMessage) Kind() MessageType { return MessageTypeDebugExecutionResult }
 
 func (m HelloMessage) messageType() MessageType             { return MessageTypeHello }
 func (m WelcomeMessage) messageType() MessageType           { return MessageTypeWelcome }
@@ -410,6 +482,10 @@ func (m DebugFocusMessage) messageType() MessageType        { return MessageType
 func (m DebugFocusedMessage) messageType() MessageType      { return MessageTypeDebugFocused }
 func (m DebugUnregisterMessage) messageType() MessageType   { return MessageTypeDebugUnregister }
 func (m DebugUnregisteredMessage) messageType() MessageType { return MessageTypeDebugUnregistered }
+func (m DebugExecuteMessage) messageType() MessageType      { return MessageTypeDebugExecute }
+func (m DebugExecutionResultMessage) messageType() MessageType {
+	return MessageTypeDebugExecutionResult
+}
 
 func validateTypedEnvelope(envelope Envelope, expected MessageType) error {
 	if envelope.Version != 1 {
@@ -894,6 +970,114 @@ func (m DebugUnregisterMessage) validate() error {
 
 func (m DebugUnregisteredMessage) validate() error {
 	return validateDebugMessage(m.Envelope, m.messageType(), m.Payload.PageID, m.Payload.PageEpoch, m.Payload.SessionID)
+}
+
+func (m DebugExecuteMessage) validate() error {
+	if err := validateTypedEnvelope(m.Envelope, m.messageType()); err != nil {
+		return err
+	}
+	if err := validateDebugExecutionIdentity(m.Payload.ExecutionID, m.Payload.PageID, m.Payload.PageEpoch, m.Payload.SessionID); err != nil {
+		return err
+	}
+	if m.Payload.Code == "" {
+		return invalidField("payload.code", "must be a non-empty string")
+	}
+	if !utf8.ValidString(m.Payload.Code) {
+		return invalidField("payload.code", "must be valid UTF-8")
+	}
+	if len([]byte(m.Payload.Code)) > DebugExecutionCodeMaxBytes {
+		return invalidField("payload.code", "exceeds the maximum execution code length")
+	}
+	if m.Payload.TimeoutMS < DebugExecutionMinTimeoutMS || m.Payload.TimeoutMS > DebugExecutionMaxTimeoutMS {
+		return invalidField("payload.timeout_ms", "must be between 100 and 30000 milliseconds")
+	}
+	return validateSafeInteger("payload.timeout_ms", uint64(m.Payload.TimeoutMS))
+}
+
+func (m DebugExecutionResultMessage) validate() error {
+	if err := validateTypedEnvelope(m.Envelope, m.messageType()); err != nil {
+		return err
+	}
+	if len(m.Envelope.Payload) > DebugExecutionResultMaxBytes {
+		return invalidField("payload", "execution result exceeds the inline result budget")
+	}
+	if err := validateDebugExecutionIdentity(m.Payload.ExecutionID, m.Payload.PageID, m.Payload.PageEpoch, m.Payload.SessionID); err != nil {
+		return err
+	}
+	switch m.Payload.Status {
+	case DebugExecutionStatusSucceeded:
+		if len(m.Payload.Value) == 0 {
+			return invalidField("payload.value", "is required for a succeeded execution")
+		}
+		if m.Payload.Error != nil {
+			return invalidField("payload.error", "must be omitted for a succeeded execution")
+		}
+	case DebugExecutionStatusFailed:
+		if m.Payload.Error == nil {
+			return invalidField("payload.error", "is required for a failed execution")
+		}
+		if len(m.Payload.Value) > 0 {
+			return invalidField("payload.value", "must be omitted for a failed execution")
+		}
+		if err := m.Payload.Error.validate("payload.error"); err != nil {
+			return err
+		}
+	default:
+		return invalidField("payload.status", "must be succeeded or failed")
+	}
+	if len(m.Payload.Value) > 0 && !json.Valid(m.Payload.Value) {
+		return invalidField("payload.value", "must be valid JSON")
+	}
+	if len(m.Payload.Console) > DebugExecutionMaxConsoleEntries {
+		return invalidField("payload.console", "contains too many console entries")
+	}
+	for index, entry := range m.Payload.Console {
+		field := fmt.Sprintf("payload.console[%d]", index)
+		switch entry.Level {
+		case DebugConsoleLog, DebugConsoleInfo, DebugConsoleWarn, DebugConsoleError, DebugConsoleDebug:
+		default:
+			return invalidField(field+".level", "must be log, info, warn, error, or debug")
+		}
+		if len(entry.Arguments) > DebugExecutionMaxConsoleArgs {
+			return invalidField(field+".arguments", "contains too many arguments")
+		}
+		if entry.Arguments == nil {
+			return invalidField(field+".arguments", "must be an array")
+		}
+		for argumentIndex, argument := range entry.Arguments {
+			if !json.Valid(argument) {
+				return invalidField(fmt.Sprintf("%s.arguments[%d]", field, argumentIndex), "must be valid JSON")
+			}
+		}
+	}
+	encoded, err := json.Marshal(m.Payload)
+	if err != nil {
+		return invalidField("payload", err.Error())
+	}
+	if len(encoded) > DebugExecutionResultMaxBytes {
+		return invalidField("payload", "execution result exceeds the inline result budget")
+	}
+	return nil
+}
+
+func (e DebugExecutionError) validate(field string) error {
+	if err := requiredString(field+".code", e.Code); err != nil {
+		return err
+	}
+	if err := requiredString(field+".message", e.Message); err != nil {
+		return err
+	}
+	if len(e.Details) > 0 && !json.Valid(e.Details) {
+		return invalidField(field+".details", "must be valid JSON")
+	}
+	return nil
+}
+
+func validateDebugExecutionIdentity(executionID, pageID, pageEpoch, sessionID string) error {
+	if err := requiredString("payload.execution_id", executionID); err != nil {
+		return err
+	}
+	return validateDebugExecutorIdentity(pageID, pageEpoch, sessionID)
 }
 
 func validateDebugMessage(envelope Envelope, expected MessageType, pageID, pageEpoch, sessionID string) error {

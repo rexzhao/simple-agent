@@ -460,6 +460,41 @@
           "focused": false
         }
       }
+    },
+    {
+      "name": "debug_execute",
+      "message": {
+        "version": 1,
+        "type": "debug_execute",
+        "id": "debug-execute-1",
+        "payload": {
+          "execution_id": "execution-1",
+          "page_id": "page-1",
+          "page_epoch": "epoch-1",
+          "session_id": "session-1",
+          "code": "await Promise.resolve({ answer: 42 })",
+          "timeout_ms": 5000
+        }
+      }
+    },
+    {
+      "name": "debug_execution_result",
+      "message": {
+        "version": 1,
+        "type": "debug_execution_result",
+        "id": "debug-execution-result-1",
+        "payload": {
+          "execution_id": "execution-1",
+          "page_id": "page-1",
+          "page_epoch": "epoch-1",
+          "session_id": "session-1",
+          "status": "succeeded",
+          "value": { "answer": 42 },
+          "console": [
+            { "level": "log", "arguments": ["done", 42] }
+          ]
+        }
+      }
     }
   ],
   "invalid": [
@@ -805,6 +840,86 @@
           "page_epoch": " ",
           "session_id": "session-1",
           "focused": true
+        }
+      }
+    },
+    {
+      "name": "debug_execution_invalid_timeout",
+      "message": {
+        "version": 1,
+        "type": "debug_execute",
+        "id": "debug-invalid-execute-1",
+        "payload": {
+          "execution_id": "execution-1",
+          "page_id": "page-1",
+          "page_epoch": "epoch-1",
+          "session_id": "session-1",
+          "code": "1 + 1",
+          "timeout_ms": 99
+        }
+      }
+    },
+    {
+      "name": "debug_execution_invalid_status",
+      "message": {
+        "version": 1,
+        "type": "debug_execution_result",
+        "id": "debug-invalid-result-1",
+        "payload": {
+          "execution_id": "execution-1",
+          "page_id": "page-1",
+          "page_epoch": "epoch-1",
+          "session_id": "session-1",
+          "status": "pending"
+        }
+      }
+    },
+    {
+      "name": "debug_execution_failed_with_value",
+      "message": {
+        "version": 1,
+        "type": "debug_execution_result",
+        "id": "debug-invalid-result-2",
+        "payload": {
+          "execution_id": "execution-1",
+          "page_id": "page-1",
+          "page_epoch": "epoch-1",
+          "session_id": "session-1",
+          "status": "failed",
+          "value": null,
+          "error": { "code": "web_debug_execution_error", "message": "boom" }
+        }
+      }
+    },
+    {
+      "name": "debug_execution_succeeded_without_value",
+      "message": {
+        "version": 1,
+        "type": "debug_execution_result",
+        "id": "debug-invalid-result-3",
+        "payload": {
+          "execution_id": "execution-1",
+          "page_id": "page-1",
+          "page_epoch": "epoch-1",
+          "session_id": "session-1",
+          "status": "succeeded"
+        }
+      }
+    },
+    {
+      "name": "debug_execution_succeeded_with_error",
+      "message": {
+        "version": 1,
+        "type": "debug_execution_result",
+        "id": "debug-invalid-result-4",
+        "payload": {
+          "execution_id": "execution-1",
+          "page_id": "page-1",
+          "page_epoch": "epoch-1",
+          "session_id": "session-1",
+          "status": "succeeded",
+          "value": null,
+          "error": { "code": "web_debug_execution_error", "message": "boom" }
         }
       }
     }

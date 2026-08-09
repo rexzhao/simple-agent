@@ -1,10 +1,20 @@
 import type { ApplicationRepositories, ApplicationSignals } from '../applicationServices'
-import type { DebugFocusedMessage, DebugRegisteredMessage, DebugExecutorPayload, DebugUnregisteredMessage, ErrorMessage, ProtocolMessage } from '../protocol/types'
+import type {
+  DebugExecutionResultPayload,
+  DebugFocusedMessage,
+  DebugRegisteredMessage,
+  DebugExecutorPayload,
+  DebugUnregisteredMessage,
+  ErrorMessage,
+  ProtocolMessage,
+} from '../protocol/types'
 import { CommandFacade } from '../sync/commandFacade'
 import { LocalReplica } from '../sync/localReplica'
 import type { RuntimeTransport } from '../sync/runtime'
 import { SyncRuntime } from '../sync/runtime'
 import type { TransportCloseEvent, TransportReadyEvent } from '../sync/transport'
+import { boundDebugString, serializeDebugExecution } from './inlineSerializer'
+import { encodeMessage } from '../protocol/encode'
 
 export const WEB_DEBUG_TARGET_PROJECT_ID = 'project-f25c5aac78f681b52aabf5c0'
 
@@ -131,6 +141,27 @@ interface DebugOperation {
   readonly sessionID: string
 }
 
+interface CapturedConsoleEntry {
+  readonly level: 'log' | 'info' | 'warn' | 'error' | 'debug'
+  readonly arguments: unknown[]
+}
+
+interface ConsoleCapture {
+  readonly entries: CapturedConsoleEntry[]
+  readonly truncated: () => boolean
+  readonly restore: () => void
+}
+
+interface ActiveExecution {
+  readonly generation: number
+  readonly payload: Extract<ProtocolMessage, { type: 'debug_execute' }>['payload']
+  readonly consoleEntries: CapturedConsoleEntry[]
+  readonly consoleTruncated: () => boolean
+  readonly restoreConsole: () => void
+  timer?: ReturnType<typeof globalThis.setTimeout>
+  settled: boolean
+}
+
 type DebugBlockScope = 'generation' | 'eligibility'
 
 type BridgePhase = 'hidden' | 'pending' | 'registered' | 'blocked'
@@ -213,6 +244,7 @@ export class WebDebugBridge {
   private readonly detach: Array<() => void> = []
   private readonly waiters = new Set<Waiter>()
   private readonly operations = new Map<string, DebugOperation>()
+  private activeExecution?: ActiveExecution
 
   private pageIDValue?: string
   private pageEpochValue?: string
@@ -313,7 +345,7 @@ export class WebDebugBridge {
   stop(): void {
     if (!this.started) return
     // Keep the transport alive long enough for the best-effort unregister.
-    this.hide(true)
+    this.hide(true, undefined, 'web_debug_disconnected')
     this.started = false
     for (const release of this.detach.splice(0)) release()
     this.rejectWaiters(new WebDebugIdleError('stopped'))
@@ -333,7 +365,7 @@ export class WebDebugBridge {
     if (this.disposed) return
     if (this.started) {
       // Keep the transport alive long enough for the best-effort unregister.
-      this.hide(true)
+      this.hide(true, undefined, 'web_debug_disconnected')
       this.started = false
       for (const release of this.detach.splice(0)) release()
     }
@@ -354,7 +386,7 @@ export class WebDebugBridge {
   private handleReady(event: TransportReadyEvent): void {
     if (!this.started) return
     if (this.phase !== 'hidden' && this.phase !== 'blocked' && this.registration && this.registration.generation !== event.generation) {
-      this.hide(false)
+      this.hide(false, undefined, 'web_debug_disconnected')
     }
     if (this.blockedGeneration !== event.generation) {
       this.blockedGeneration = undefined
@@ -369,7 +401,7 @@ export class WebDebugBridge {
   private handleClose(event: TransportCloseEvent): void {
     if (!this.started) return
     if (this.registration && this.registration.generation !== event.generation) return
-    this.hide(false)
+    this.hide(false, undefined, 'web_debug_disconnected')
     this.clearOperationsForGeneration(event.generation)
     this.lastAttemptGeneration = undefined
     this.lastAttemptEligibilityVersion = undefined
@@ -466,6 +498,10 @@ export class WebDebugBridge {
   }
 
   private handleMessage(message: ProtocolMessage, generation: number): void {
+    if (message.type === 'debug_execute') {
+      this.handleExecute(message, generation)
+      return
+    }
     if (message.type === 'debug_registered') {
       this.handleRegistered(message, generation)
       return
@@ -480,6 +516,221 @@ export class WebDebugBridge {
     }
     if (isDebugControlError(message)) {
       this.handleDebugError(message, generation)
+    }
+  }
+
+  private handleExecute(message: Extract<ProtocolMessage, { type: 'debug_execute' }>, generation: number): void {
+    const payload = message.payload
+    const registration = this.registration
+    if (!registration || this.phase !== 'registered' || registration.generation !== generation || generation !== this.transport.connectionGeneration) return
+    const identityMatches = payload.page_id === this.pageID && payload.page_epoch === this.pageEpoch && payload.session_id === registration.sessionID
+    if (!identityMatches) {
+      this.sendExecutionFailure(payload, generation, 'web_debug_executor_stale', 'debug executor identity is stale')
+      return
+    }
+    if (this.activeExecution) {
+      this.sendExecutionFailure(payload, generation, 'web_debug_busy', 'debug executor is busy')
+      return
+    }
+    const capture = this.captureConsole()
+    const active: ActiveExecution = {
+      generation,
+      payload,
+      consoleEntries: capture.entries,
+      consoleTruncated: capture.truncated,
+      restoreConsole: capture.restore,
+      settled: false,
+    }
+    this.activeExecution = active
+    active.timer = this.setTimer(() => {
+      this.finishExecution(active, 'failed', undefined, { code: 'web_debug_timeout', message: 'debug execution timed out' })
+    }, payload.timeout_ms)
+    this.runExecution(active)
+  }
+
+  private runExecution(active: ActiveExecution): void {
+    let completion: Promise<unknown>
+    try {
+      const AsyncFunction = Object.getPrototypeOf(async function () { /* constructor probe */ }).constructor as new (...parts: string[]) => (thisArg?: unknown) => Promise<unknown>
+      let functionBody: string
+      try {
+        // The expression form preserves completion values and also permits
+        // `await` without forcing callers to add `return`.
+        functionBody = `return (${active.payload.code}\n)`
+        const expression = new AsyncFunction(functionBody)
+        completion = Promise.resolve(expression.call(this.scope ?? globalThis))
+      } catch (expressionError) {
+        // Statement bodies use normal AsyncFunction semantics: callers must
+        // write `return` when they want a completion value.
+        const body = new AsyncFunction(active.payload.code)
+        completion = Promise.resolve(body.call(this.scope ?? globalThis))
+        void expressionError
+      }
+    } catch (error) {
+      this.finishExecution(active, 'failed', undefined, this.executionError(error))
+      return
+    }
+    completion.then(
+      (value) => this.finishExecution(active, 'succeeded', value),
+      (error) => this.finishExecution(active, 'failed', undefined, this.executionError(error)),
+    )
+  }
+
+  private finishExecution(
+    active: ActiveExecution,
+    status: 'succeeded' | 'failed',
+    value?: unknown,
+    error?: { code: string; message: string },
+  ): void {
+    if (this.activeExecution !== active || active.settled) return
+    active.settled = true
+    if (active.timer !== undefined) this.clearTimer(active.timer)
+    this.activeExecution = undefined
+    try { active.restoreConsole() } catch { /* cleanup must not block result delivery */ }
+    if (status === 'succeeded') {
+      try {
+        const consoleEntries = active.consoleTruncated()
+          ? [...active.consoleEntries, { level: 'debug' as const, arguments: [{ __sai_debug: 'summary', reason: 'max_elements', type: 'console' }] }]
+          : active.consoleEntries
+        const serialized = serializeDebugExecution(value, consoleEntries, this.scope)
+        this.sendExecutionResult(active.payload, active.generation, {
+          status: 'succeeded', value: serialized.value, console: serialized.console,
+        })
+      } catch {
+        this.sendExecutionFailure(active.payload, active.generation, 'web_debug_serializer_error', 'debug result serialization failed')
+      }
+      return
+    }
+    this.sendExecutionFailure(active.payload, active.generation, error?.code ?? 'web_debug_execution_error', error?.message ?? 'debug execution failed')
+  }
+
+  private invalidateExecution(code: string): void {
+    const active = this.activeExecution
+    if (!active || active.settled) return
+    active.settled = true
+    if (active.timer !== undefined) this.clearTimer(active.timer)
+    this.activeExecution = undefined
+    try { active.restoreConsole() } catch { /* cleanup must not block lifecycle transition */ }
+    this.sendExecutionFailure(active.payload, active.generation, code, 'debug executor is no longer authoritative')
+  }
+
+  private sendExecutionFailure(
+    request: Extract<ProtocolMessage, { type: 'debug_execute' }>['payload'],
+    generation: number,
+    code: string,
+    message: string,
+  ): void {
+    this.sendExecutionResult(request, generation, {
+      status: 'failed',
+      error: { code, message },
+    })
+  }
+
+  private sendExecutionResult(
+    request: Extract<ProtocolMessage, { type: 'debug_execute' }>['payload'],
+    generation: number,
+    result: Pick<DebugExecutionResultPayload, 'status' | 'value' | 'console' | 'error'>,
+  ): void {
+    if (!this.transport.isReady || generation !== this.transport.connectionGeneration) return
+    const message: Extract<ProtocolMessage, { type: 'debug_execution_result' }> = {
+      version: 1,
+      type: 'debug_execution_result',
+      id: messageID(),
+      payload: {
+        execution_id: request.execution_id,
+        page_id: request.page_id,
+        page_epoch: request.page_epoch,
+        session_id: request.session_id,
+        ...result,
+      } as DebugExecutionResultPayload,
+    }
+    const fallbackPayload = (): DebugExecutionResultPayload => result.status === 'succeeded'
+      ? {
+          execution_id: request.execution_id,
+          page_id: request.page_id,
+          page_epoch: request.page_epoch,
+          session_id: request.session_id,
+          status: 'succeeded',
+          value: { __sai_debug: 'summary', reason: 'budget', type: 'result', truncated: true },
+          console: [],
+        }
+      : {
+          execution_id: request.execution_id,
+          page_id: request.page_id,
+          page_epoch: request.page_epoch,
+          session_id: request.session_id,
+          status: 'failed',
+          error: { code: 'web_debug_serializer_error', message: 'debug result could not be encoded' },
+        }
+    const makeMessage = (payload: DebugExecutionResultPayload): Extract<ProtocolMessage, { type: 'debug_execution_result' }> => ({
+        version: 1,
+        type: 'debug_execution_result',
+        id: messageID(),
+        payload,
+      })
+    const prepare = (candidate: Extract<ProtocolMessage, { type: 'debug_execution_result' }>): Extract<ProtocolMessage, { type: 'debug_execution_result' }> | undefined => {
+      try {
+        const encodedPayload = JSON.stringify(candidate.payload)
+        if (typeof encodedPayload !== 'string' || new TextEncoder().encode(encodedPayload).byteLength > 64 * 1024) return undefined
+        encodeMessage(candidate)
+        return candidate
+      } catch {
+        return undefined
+      }
+    }
+    const messageToSend = prepare(message) ?? prepare(makeMessage(fallbackPayload()))
+    if (!messageToSend) return
+    try {
+      // The local encode/validate above selects the only frame to attempt.
+      // A transport failure is not retried; connection lifecycle owns cleanup.
+      this.transport.send(messageToSend)
+    } catch { /* the gateway lifecycle owns disconnect cleanup */ }
+  }
+
+  private executionError(error: unknown): { code: string; message: string } {
+    let message = 'debug execution failed'
+    try {
+      if (error instanceof Error && error.message) message = error.message
+      else if (typeof error === 'string' && error) message = error
+    } catch { /* preserve the generic typed error */ }
+    const bounded = boundDebugString(message, 4096)
+    return { code: 'web_debug_execution_error', message: bounded.value }
+  }
+
+  private captureConsole(): ConsoleCapture {
+    const entries: CapturedConsoleEntry[] = []
+    let truncated = false
+    const target = (this.scope as unknown as { console?: Console } | undefined)?.console ?? (globalThis as unknown as { console?: Console }).console
+    if (!target) return { entries, truncated: () => false, restore: () => undefined }
+    const levels = ['log', 'info', 'warn', 'error', 'debug'] as const
+    const originals = new Map<string, unknown>()
+    for (const level of levels) {
+      try {
+        const original = target[level]
+        originals.set(level, original)
+        const wrapper = (...arguments_: unknown[]) => {
+          if (entries.length < 128) {
+            entries.push({ level, arguments: arguments_.slice(0, 32) })
+            if (arguments_.length > 32) truncated = true
+          } else truncated = true
+          try {
+            if (typeof original === 'function') Reflect.apply(original, target, arguments_)
+          } catch { /* console implementations are not part of execution semantics */ }
+        }
+        ;(target as unknown as Record<string, unknown>)[level] = wrapper
+      } catch { /* a frozen console simply has no capture for this level */ }
+    }
+    return {
+      entries,
+      truncated: () => truncated,
+      restore: () => {
+        for (const level of levels) {
+          try {
+            const original = originals.get(level)
+            if (originals.has(level)) (target as unknown as Record<string, unknown>)[level] = original
+          } catch { /* best effort restoration for hostile page objects */ }
+        }
+      },
     }
   }
 
@@ -551,7 +802,8 @@ export class WebDebugBridge {
     // handling; it belongs only to this bridge's owned control operation.
   }
 
-  private hide(sendUnregister: boolean, payload?: DebugExecutorPayload): void {
+  private hide(sendUnregister: boolean, payload?: DebugExecutorPayload, executionErrorCode = 'web_debug_executor_stale'): void {
+    this.invalidateExecution(executionErrorCode)
     const registration = this.registration
     const pageID = this.pageIDValue
     const pageEpoch = this.pageEpochValue

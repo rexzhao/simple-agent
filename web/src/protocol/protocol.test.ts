@@ -94,6 +94,43 @@ describe('shared protocol golden fixtures', () => {
     }))).toThrow(expect.objectContaining({ code: 'invalid_field', field: `payload.${field}` }))
   })
 
+  it('enforces the execution channel status, timeout, and inline result bounds', () => {
+    const execute = {
+      version: 1,
+      type: 'debug_execute',
+      id: 'execute-1',
+      payload: {
+        execution_id: 'execution-1', page_id: 'page-1', page_epoch: 'epoch-1', session_id: 'session-1',
+        code: '1 + 1', timeout_ms: 500,
+      },
+    }
+    expect(decodeMessage(JSON.stringify(execute)).type).toBe('debug_execute')
+    execute.payload.timeout_ms = 99
+    expect(() => decodeMessage(JSON.stringify(execute))).toThrow(
+      expect.objectContaining({ field: 'payload.timeout_ms' }),
+    )
+
+    const result = {
+      version: 1,
+      type: 'debug_execution_result',
+      id: 'result-1',
+      payload: {
+        execution_id: 'execution-1', page_id: 'page-1', page_epoch: 'epoch-1', session_id: 'session-1',
+        status: 'succeeded' as string, value: null as unknown,
+      },
+    }
+    expect(decodeMessage(JSON.stringify(result)).type).toBe('debug_execution_result')
+    result.payload.status = 'pending'
+    expect(() => decodeMessage(JSON.stringify(result))).toThrow(
+      expect.objectContaining({ field: 'payload.status' }),
+    )
+    result.payload.status = 'succeeded'
+    result.payload.value = 'x'.repeat(64 * 1024)
+    expect(() => decodeMessage(JSON.stringify(result))).toThrow(
+      expect.objectContaining({ field: 'payload' }),
+    )
+  })
+
   it('ignores unknown optional fields', () => {
     const message = decodeMessage(JSON.stringify({
       version: 1,

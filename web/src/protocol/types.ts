@@ -24,6 +24,8 @@ export type MessageType =
   | 'debug_focused'
   | 'debug_unregister'
   | 'debug_unregistered'
+  | 'debug_execute'
+  | 'debug_execution_result'
   | 'error'
 
 export type ResourceType =
@@ -57,6 +59,50 @@ export type DebugFocusPayload = DebugExecutorPayload
 export type DebugFocusedPayload = DebugExecutorPayload
 export type DebugUnregisterPayload = DebugExecutorPayload
 export type DebugUnregisteredPayload = DebugExecutorPayload
+
+export interface DebugExecutionPayload {
+  execution_id: string
+  page_id: string
+  page_epoch: string
+  session_id: string
+  code: string
+  timeout_ms: number
+}
+
+export type DebugExecutionStatus = 'succeeded' | 'failed'
+export type DebugConsoleLevel = 'log' | 'info' | 'warn' | 'error' | 'debug'
+
+export interface DebugConsoleEntry {
+  level: DebugConsoleLevel
+  arguments: JsonValue[]
+}
+
+export interface DebugExecutionError {
+  code: string
+  message: string
+  details?: JsonValue
+}
+
+interface DebugExecutionResultIdentity {
+  execution_id: string
+  page_id: string
+  page_epoch: string
+  session_id: string
+}
+
+export type DebugExecutionResultPayload =
+  | (DebugExecutionResultIdentity & {
+      status: 'succeeded'
+      value: JsonValue
+      console?: DebugConsoleEntry[]
+      error?: never
+    })
+  | (DebugExecutionResultIdentity & {
+      status: 'failed'
+      value?: never
+      console?: DebugConsoleEntry[]
+      error: DebugExecutionError
+    })
 
 export interface WelcomePayload {
   selected_version: 1
@@ -417,6 +463,8 @@ export type DebugFocusMessage = ProtocolEnvelope<'debug_focus', DebugFocusPayloa
 export type DebugFocusedMessage = ProtocolEnvelope<'debug_focused', DebugFocusedPayload>
 export type DebugUnregisterMessage = ProtocolEnvelope<'debug_unregister', DebugUnregisterPayload>
 export type DebugUnregisteredMessage = ProtocolEnvelope<'debug_unregistered', DebugUnregisteredPayload>
+export type DebugExecuteMessage = ProtocolEnvelope<'debug_execute', DebugExecutionPayload>
+export type DebugExecutionResultMessage = ProtocolEnvelope<'debug_execution_result', DebugExecutionResultPayload>
 export type ErrorMessage = ProtocolEnvelope<'error', ErrorPayload>
 
 export type ProtocolMessage =
@@ -442,6 +490,8 @@ export type ProtocolMessage =
   | DebugFocusedMessage
   | DebugUnregisterMessage
   | DebugUnregisteredMessage
+  | DebugExecuteMessage
+  | DebugExecutionResultMessage
   | ErrorMessage
 
 // These brands keep the three decimal concepts distinct at compile time even

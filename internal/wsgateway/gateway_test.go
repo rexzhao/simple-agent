@@ -537,6 +537,18 @@ func TestGatewayDirectionGateRejectsServerMessagesBeforeHandler(t *testing.T) {
 				})
 			},
 		},
+		{
+			name: "inbound debug execute",
+			write: func(t *testing.T, connection *websocket.Conn) {
+				writeProtocol(t, connection, protocol.DebugExecuteMessage{
+					Envelope: protocol.Envelope{Version: 1, Type: protocol.MessageTypeDebugExecute, ID: "execute-client"},
+					Payload: protocol.DebugExecutionPayload{
+						ExecutionID: "execution-1", PageID: "page-1", PageEpoch: "epoch-1", SessionID: "session-1",
+						Code: "1 + 1", TimeoutMS: 500,
+					},
+				})
+			},
+		},
 	}
 	for _, test := range cases {
 		t.Run(test.name, func(t *testing.T) {
@@ -567,6 +579,36 @@ func TestGatewayDirectionGateRejectsServerMessagesBeforeHandler(t *testing.T) {
 			default:
 			}
 		})
+	}
+}
+
+func TestGatewayDirectionGateAllowsExecutionResults(t *testing.T) {
+	calls := make(chan protocol.Message, 1)
+	endpoint := newTestEndpoint(t, Options{Handler: HandlerFunc(func(_ context.Context, _ Connection, message protocol.Message) error {
+		calls <- message
+		return nil
+	})})
+	connection := dialTest(t, endpoint, issueTestTicket(t, endpoint))
+	defer connection.Close(websocket.StatusNormalClosure, "test done")
+	writeHello(t, connection, "tab")
+	if _, ok := readProtocol(t, connection).(protocol.WelcomeMessage); !ok {
+		t.Fatal("handshake did not return welcome")
+	}
+	writeProtocol(t, connection, protocol.DebugExecutionResultMessage{
+		Envelope: protocol.Envelope{Version: 1, Type: protocol.MessageTypeDebugExecutionResult, ID: "result-client"},
+		Payload: protocol.DebugExecutionResultPayload{
+			ExecutionID: "execution-1", PageID: "page-1", PageEpoch: "epoch-1", SessionID: "session-1",
+			Status: protocol.DebugExecutionStatusFailed,
+			Error:  &protocol.DebugExecutionError{Code: "web_debug_execution_error", Message: "boom"},
+		},
+	})
+	select {
+	case message := <-calls:
+		if message.Kind() != protocol.MessageTypeDebugExecutionResult {
+			t.Fatalf("handler message = %s, want execution result", message.Kind())
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("execution result did not reach handler")
 	}
 }
 

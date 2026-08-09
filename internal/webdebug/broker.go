@@ -7,9 +7,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
+	"unicode/utf8"
 
 	"github.com/rexzhao/simple-agent/internal/protocol"
 	"github.com/rexzhao/simple-agent/internal/wsgateway"
@@ -18,17 +21,21 @@ import (
 const TargetProjectID = "project-f25c5aac78f681b52aabf5c0"
 
 const (
-	ErrorCodeDisabled             = "web_debug_disabled"
-	ErrorCodeClosed               = "web_debug_closed"
-	ErrorCodeNotConnected         = "web_debug_not_connected"
-	ErrorCodeInvalidConnection    = "web_debug_invalid_connection"
-	ErrorCodeInvalidIdentity      = "web_debug_invalid_identity"
-	ErrorCodeNotEligible          = "web_debug_not_eligible"
-	ErrorCodeSessionNotFound      = "web_debug_session_not_found"
-	ErrorCodeProjectMismatch      = "web_debug_project_mismatch"
-	ErrorCodeSessionUnavailable   = "web_debug_session_unavailable"
-	ErrorCodePageNotRegistered    = "web_debug_page_not_registered"
-	ErrorCodeConnectionNotAllowed = "web_debug_connection_not_allowed"
+	ErrorCodeDisabled              = "web_debug_disabled"
+	ErrorCodeClosed                = "web_debug_closed"
+	ErrorCodeNotConnected          = "web_debug_not_connected"
+	ErrorCodeInvalidConnection     = "web_debug_invalid_connection"
+	ErrorCodeInvalidIdentity       = "web_debug_invalid_identity"
+	ErrorCodeNotEligible           = "web_debug_not_eligible"
+	ErrorCodeSessionNotFound       = "web_debug_session_not_found"
+	ErrorCodeProjectMismatch       = "web_debug_project_mismatch"
+	ErrorCodeSessionUnavailable    = "web_debug_session_unavailable"
+	ErrorCodePageNotRegistered     = "web_debug_page_not_registered"
+	ErrorCodeConnectionNotAllowed  = "web_debug_connection_not_allowed"
+	ErrorCodeInvalidExecution      = "web_debug_invalid_execution"
+	ErrorCodeExecutionBusy         = "web_debug_busy"
+	ErrorCodeExecutionTimeout      = "web_debug_timeout"
+	ErrorCodeExecutionDisconnected = "web_debug_disconnected"
 )
 
 // Error is a stable, typed stage-1 broker error. It intentionally contains no
@@ -45,17 +52,23 @@ func (e *Error) Error() string {
 }
 
 var (
-	ErrDisabled           = &Error{Code: ErrorCodeDisabled}
-	ErrClosed             = &Error{Code: ErrorCodeClosed}
-	ErrNotConnected       = &Error{Code: ErrorCodeNotConnected}
-	ErrInvalidConnection  = &Error{Code: ErrorCodeInvalidConnection}
-	ErrInvalidIdentity    = &Error{Code: ErrorCodeInvalidIdentity}
-	ErrNotEligible        = &Error{Code: ErrorCodeNotEligible}
-	ErrPageNotRegistered  = &Error{Code: ErrorCodePageNotRegistered}
-	ErrSessionNotFound    = &Error{Code: ErrorCodeSessionNotFound}
-	ErrProjectMismatch    = &Error{Code: ErrorCodeProjectMismatch}
-	ErrSessionUnavailable = &Error{Code: ErrorCodeSessionUnavailable}
+	ErrDisabled              = &Error{Code: ErrorCodeDisabled}
+	ErrClosed                = &Error{Code: ErrorCodeClosed}
+	ErrNotConnected          = &Error{Code: ErrorCodeNotConnected}
+	ErrInvalidConnection     = &Error{Code: ErrorCodeInvalidConnection}
+	ErrInvalidIdentity       = &Error{Code: ErrorCodeInvalidIdentity}
+	ErrNotEligible           = &Error{Code: ErrorCodeNotEligible}
+	ErrPageNotRegistered     = &Error{Code: ErrorCodePageNotRegistered}
+	ErrSessionNotFound       = &Error{Code: ErrorCodeSessionNotFound}
+	ErrProjectMismatch       = &Error{Code: ErrorCodeProjectMismatch}
+	ErrSessionUnavailable    = &Error{Code: ErrorCodeSessionUnavailable}
+	ErrInvalidExecution      = &Error{Code: ErrorCodeInvalidExecution}
+	ErrExecutionBusy         = &Error{Code: ErrorCodeExecutionBusy}
+	ErrExecutionTimeout      = &Error{Code: ErrorCodeExecutionTimeout}
+	ErrExecutionDisconnected = &Error{Code: ErrorCodeExecutionDisconnected}
 )
+
+const DefaultExecutionTimeoutMS = 5_000
 
 // Eligibility is the server-side authority for session/project admission. A
 // client never supplies a project ID to the broker.
@@ -78,9 +91,20 @@ type LeaseIdentity struct {
 
 type candidate struct {
 	identity       LeaseIdentity
+	connection     wsgateway.Connection
 	focused        bool
 	registrationAt uint64
 	focusAt        uint64
+}
+
+type pendingExecution struct {
+	identity    LeaseIdentity
+	candidate   *candidate
+	connection  wsgateway.Connection
+	executionID string
+	done        chan struct{}
+	result      protocol.DebugExecutionResultPayload
+	err         error
 }
 
 type Broker struct {
@@ -95,6 +119,7 @@ type Broker struct {
 	watching      map[string]struct{}
 	watcherStarts uint64
 	current       LeaseIdentity
+	execution     *pendingExecution
 
 	done      chan struct{}
 	watchers  sync.WaitGroup
@@ -141,19 +166,113 @@ func (b *Broker) Current() (LeaseIdentity, error) {
 // never returns a snapshot that stopped being the current candidate while the
 // authority check was in flight.
 func (b *Broker) Acquire(ctx context.Context) (LeaseIdentity, error) {
+	identity, _, err := b.acquireCandidate(ctx)
+	return identity, err
+}
+
+// Execute binds one request to the current live page after rechecking session
+// authority. The caller supplies no connection, page, or session selector.
+// A zero timeout uses the server default; the wire message always carries the
+// resulting bounded timeout.
+func (b *Broker) Execute(ctx context.Context, code string, timeoutMS int) (protocol.DebugExecutionResultPayload, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return protocol.DebugExecutionResultPayload{}, err
+	}
+	if !b.Enabled() {
+		return protocol.DebugExecutionResultPayload{}, ErrDisabled
+	}
+	if b.isClosed() {
+		return protocol.DebugExecutionResultPayload{}, ErrClosed
+	}
+	if timeoutMS == 0 {
+		timeoutMS = DefaultExecutionTimeoutMS
+	}
+	if code == "" || !utf8.ValidString(code) || len([]byte(code)) > protocol.DebugExecutionCodeMaxBytes {
+		return protocol.DebugExecutionResultPayload{}, ErrInvalidExecution
+	}
+	if timeoutMS < protocol.DebugExecutionMinTimeoutMS || timeoutMS > protocol.DebugExecutionMaxTimeoutMS {
+		return protocol.DebugExecutionResultPayload{}, ErrInvalidExecution
+	}
+
+	identity, item, err := b.acquireCandidate(ctx)
+	if err != nil {
+		return protocol.DebugExecutionResultPayload{}, err
+	}
+	executionID, err := b.idGenerator("execution")
+	if err != nil {
+		return protocol.DebugExecutionResultPayload{}, err
+	}
+	pending := &pendingExecution{
+		identity: identity, candidate: item, connection: item.connection,
+		executionID: executionID, done: make(chan struct{}),
+	}
+	b.mu.Lock()
+	if b.closed {
+		b.mu.Unlock()
+		return protocol.DebugExecutionResultPayload{}, ErrClosed
+	}
+	if b.execution != nil {
+		b.mu.Unlock()
+		return protocol.DebugExecutionResultPayload{}, ErrExecutionBusy
+	}
+	current := b.candidates[identity.ConnectionID]
+	if current != item || !sameLeaseIdentity(b.current, identity) || current.connection == nil {
+		b.mu.Unlock()
+		return protocol.DebugExecutionResultPayload{}, ErrNotConnected
+	}
+	b.execution = pending
+	b.mu.Unlock()
+
+	message := protocol.DebugExecuteMessage{
+		Envelope: protocol.Envelope{Version: 1, Type: protocol.MessageTypeDebugExecute, ID: executionID},
+		Payload: protocol.DebugExecutionPayload{
+			ExecutionID: executionID,
+			PageID:      identity.PageID, PageEpoch: identity.PageEpoch,
+			SessionID: identity.SessionID, Code: code, TimeoutMS: timeoutMS,
+		},
+	}
+	if err := pending.connection.Send(message); err != nil {
+		b.failSend(pending)
+		return protocol.DebugExecutionResultPayload{}, ErrExecutionDisconnected
+	}
+
+	timer := time.NewTimer(time.Duration(timeoutMS) * time.Millisecond)
+	defer timer.Stop()
+	select {
+	case <-pending.done:
+		return pending.result, pending.err
+	case <-ctx.Done():
+		if b.finishPending(pending, protocol.DebugExecutionResultPayload{}, ctx.Err()) {
+			return protocol.DebugExecutionResultPayload{}, ctx.Err()
+		}
+		<-pending.done
+		return pending.result, pending.err
+	case <-timer.C:
+		if b.finishPending(pending, protocol.DebugExecutionResultPayload{}, ErrExecutionTimeout) {
+			return protocol.DebugExecutionResultPayload{}, ErrExecutionTimeout
+		}
+		<-pending.done
+		return pending.result, pending.err
+	}
+}
+
+func (b *Broker) acquireCandidate(ctx context.Context) (LeaseIdentity, *candidate, error) {
 	if ctx != nil {
 		select {
 		case <-ctx.Done():
-			return LeaseIdentity{}, ctx.Err()
+			return LeaseIdentity{}, nil, ctx.Err()
 		default:
 		}
 	}
 	identity, expectedCandidate, err := b.currentSnapshot()
 	if err != nil {
-		return LeaseIdentity{}, err
+		return LeaseIdentity{}, nil, err
 	}
 	if b.eligibility == nil {
-		return LeaseIdentity{}, ErrNotConnected
+		return LeaseIdentity{}, nil, ErrNotConnected
 	}
 	authorityContext := ctx
 	if authorityContext == nil {
@@ -161,18 +280,53 @@ func (b *Broker) Acquire(ctx context.Context) (LeaseIdentity, error) {
 	}
 	if err := b.eligibility(authorityContext, identity.SessionID); err != nil {
 		b.invalidateAcquireIdentity(identity, expectedCandidate)
-		return LeaseIdentity{}, ErrNotConnected
+		return LeaseIdentity{}, nil, ErrNotConnected
 	}
-	if err := contextError(ctx); err != nil {
-		return LeaseIdentity{}, err
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return LeaseIdentity{}, nil, err
+		}
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	item := b.candidates[identity.ConnectionID]
 	if b.closed || !sameLeaseIdentity(b.current, identity) || item == nil || item != expectedCandidate || !sameLeaseIdentity(item.identity, identity) {
-		return LeaseIdentity{}, ErrNotConnected
+		return LeaseIdentity{}, nil, ErrNotConnected
 	}
-	return identity, nil
+	return identity, item, nil
+}
+
+func (b *Broker) finishPending(pending *pendingExecution, result protocol.DebugExecutionResultPayload, err error) bool {
+	if b == nil || pending == nil {
+		return false
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.execution != pending {
+		return false
+	}
+	pending.result = result
+	pending.err = err
+	b.execution = nil
+	close(pending.done)
+	return true
+}
+
+func (b *Broker) failSend(pending *pendingExecution) {
+	if b == nil || pending == nil {
+		return
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.execution == pending {
+		pending.err = ErrExecutionDisconnected
+		b.execution = nil
+		close(pending.done)
+	}
+	if item := b.candidates[pending.identity.ConnectionID]; item == pending.candidate {
+		b.removeCandidateLocked(pending.identity.ConnectionID)
+		b.selectCurrentLocked()
+	}
 }
 
 func (b *Broker) currentSnapshot() (LeaseIdentity, *candidate, error) {
@@ -200,6 +354,12 @@ func (b *Broker) Close() {
 	b.closeOnce.Do(func() {
 		b.mu.Lock()
 		b.closed = true
+		if b.execution != nil {
+			pending := b.execution
+			pending.err = ErrClosed
+			b.execution = nil
+			close(pending.done)
+		}
 		close(b.done)
 		b.candidates = make(map[string]*candidate)
 		b.watching = make(map[string]struct{})
@@ -234,12 +394,37 @@ func (h *Handler) Handle(ctx context.Context, connection wsgateway.Connection, m
 		return h.broker.handleFocus(ctx, connection, typed)
 	case protocol.DebugUnregisterMessage:
 		return h.broker.handleUnregister(ctx, connection, typed)
+	case protocol.DebugExecutionResultMessage:
+		return h.broker.handleExecutionResult(connection, typed)
 	default:
 		if h.delegate == nil {
 			return wsgateway.ErrUnsupportedMessage
 		}
 		return h.delegate.Handle(ctx, connection, message)
 	}
+}
+
+func (b *Broker) handleExecutionResult(connection wsgateway.Connection, message protocol.DebugExecutionResultMessage) error {
+	connectionID, err := b.connectionID(connection)
+	if err != nil {
+		return nil
+	}
+	b.mu.Lock()
+	pending := b.execution
+	item := b.candidates[connectionID]
+	if pending == nil || item == nil || item != pending.candidate || !sameConnection(item.connection, connection) ||
+		pending.identity.ConnectionID != connectionID ||
+		pending.identity.PageID != message.Payload.PageID || pending.identity.PageEpoch != message.Payload.PageEpoch ||
+		pending.identity.SessionID != message.Payload.SessionID || pending.executionID != message.Payload.ExecutionID {
+		b.mu.Unlock()
+		return nil
+	}
+	pending.result = message.Payload
+	pending.err = nil
+	b.execution = nil
+	close(pending.done)
+	b.mu.Unlock()
+	return nil
 }
 
 func (b *Broker) handleRegister(ctx context.Context, connection wsgateway.Connection, message protocol.DebugRegisterMessage) error {
@@ -286,6 +471,7 @@ func (b *Broker) handleRegister(ctx context.Context, connection wsgateway.Connec
 			PageEpoch:    message.Payload.PageEpoch,
 			SessionID:    message.Payload.SessionID,
 		},
+		connection:     connection,
 		focused:        message.Payload.Focused,
 		registrationAt: b.sequence,
 	}
@@ -296,10 +482,14 @@ func (b *Broker) handleRegister(ctx context.Context, connection wsgateway.Connec
 	b.selectCurrentLocked()
 	b.ensureWatcherLocked(ctx, connectionID)
 	b.mu.Unlock()
-	return b.sendMessage(connection, protocol.DebugRegisteredMessage{
+	if err := b.sendMessage(connection, protocol.DebugRegisteredMessage{
 		Envelope: protocol.Envelope{Version: 1, Type: protocol.MessageTypeDebugRegistered},
 		Payload:  message.Payload,
-	})
+	}); err != nil {
+		b.removeCandidateIfCurrent(connectionID, item)
+		return err
+	}
+	return nil
 }
 
 func (b *Broker) handleFocus(ctx context.Context, connection wsgateway.Connection, message protocol.DebugFocusMessage) error {
@@ -433,7 +623,20 @@ func (b *Broker) removeCandidate(connectionID string) {
 	b.selectCurrentLocked()
 }
 
+func (b *Broker) removeCandidateIfCurrent(connectionID string, expected *candidate) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.candidates[connectionID] != expected {
+		return
+	}
+	b.removeCandidateLocked(connectionID)
+	b.selectCurrentLocked()
+}
+
 func (b *Broker) removeCandidateLocked(connectionID string) {
+	if item := b.candidates[connectionID]; item != nil {
+		b.failExecutionLocked(item.identity, ErrExecutionDisconnected)
+	}
 	delete(b.candidates, connectionID)
 	if b.current.ConnectionID == connectionID {
 		b.current = LeaseIdentity{}
@@ -445,6 +648,9 @@ func (b *Broker) removeCandidateLocked(connectionID string) {
 func (b *Broker) watcherStopped(connectionID string) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	if item := b.candidates[connectionID]; item != nil {
+		b.failExecutionLocked(item.identity, ErrExecutionDisconnected)
+	}
 	delete(b.candidates, connectionID)
 	delete(b.watching, connectionID)
 	b.selectCurrentLocked()
@@ -545,6 +751,33 @@ func (b *Broker) invalidateAcquireIdentity(identity LeaseIdentity, expectedCandi
 	}
 	b.removeCandidateLocked(identity.ConnectionID)
 	b.selectCurrentLocked()
+}
+
+func (b *Broker) failExecutionLocked(identity LeaseIdentity, err error) {
+	if b.execution == nil || b.execution.identity != identity {
+		return
+	}
+	pending := b.execution
+	pending.err = err
+	b.execution = nil
+	close(pending.done)
+}
+
+func sameConnection(left, right wsgateway.Connection) bool {
+	if left == nil || right == nil {
+		return left == nil && right == nil
+	}
+	leftValue, rightValue := reflect.ValueOf(left), reflect.ValueOf(right)
+	if leftValue.Type() != rightValue.Type() {
+		return false
+	}
+	if leftValue.Type().Comparable() {
+		return leftValue.Interface() == rightValue.Interface()
+	}
+	if leftValue.Kind() == reflect.Pointer || leftValue.Kind() == reflect.Map || leftValue.Kind() == reflect.Func || leftValue.Kind() == reflect.Slice {
+		return leftValue.Pointer() == rightValue.Pointer()
+	}
+	return false
 }
 
 func sameLeaseIdentity(left, right LeaseIdentity) bool {

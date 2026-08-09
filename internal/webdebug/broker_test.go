@@ -19,6 +19,7 @@ type fakeConnection struct {
 
 	mu       sync.Mutex
 	messages []protocol.Message
+	sendErr  error
 }
 
 func (c *fakeConnection) Info() wsgateway.ConnectionInfo { return c.info }
@@ -26,8 +27,9 @@ func (c *fakeConnection) Info() wsgateway.ConnectionInfo { return c.info }
 func (c *fakeConnection) Send(message protocol.Message) error {
 	c.mu.Lock()
 	c.messages = append(c.messages, message)
+	err := c.sendErr
 	c.mu.Unlock()
-	return nil
+	return err
 }
 
 func (c *fakeConnection) lastMessage(t *testing.T) protocol.Message {
@@ -38,6 +40,44 @@ func (c *fakeConnection) lastMessage(t *testing.T) protocol.Message {
 		t.Fatal("connection has no messages")
 	}
 	return c.messages[len(c.messages)-1]
+}
+
+func (c *fakeConnection) findMessage(t *testing.T, kind protocol.MessageType) protocol.Message {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		c.mu.Lock()
+		for index := len(c.messages) - 1; index >= 0; index-- {
+			message := c.messages[index]
+			if message.Kind() == kind {
+				c.mu.Unlock()
+				return message
+			}
+		}
+		c.mu.Unlock()
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("connection did not receive %s", kind)
+	return nil
+}
+
+func (c *fakeConnection) findNewExecution(t *testing.T, previous string) protocol.DebugExecuteMessage {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		c.mu.Lock()
+		for index := len(c.messages) - 1; index >= 0; index-- {
+			message, ok := c.messages[index].(protocol.DebugExecuteMessage)
+			if ok && message.Payload.ExecutionID != previous {
+				c.mu.Unlock()
+				return message
+			}
+		}
+		c.mu.Unlock()
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("connection did not receive a new execution")
+	return protocol.DebugExecuteMessage{}
 }
 
 func testIdentity(page, epoch, session string, focused bool) protocol.DebugExecutorPayload {
@@ -492,6 +532,279 @@ func TestBrokerCloseIsSafeWhileReadingCurrent(t *testing.T) {
 	}
 	broker.Close()
 	readers.Wait()
+}
+
+func executionResultMessage(payload protocol.DebugExecutionResultPayload) protocol.DebugExecutionResultMessage {
+	return protocol.DebugExecutionResultMessage{
+		Envelope: protocol.Envelope{Version: 1, Type: protocol.MessageTypeDebugExecutionResult, ID: "execution-result"},
+		Payload:  payload,
+	}
+}
+
+func TestBrokerExecuteBindsAndMatchesOneLiveConnection(t *testing.T) {
+	b := newTestBroker(t, func(context.Context, string) error { return nil })
+	h := NewHandler(b, nil)
+	connection := &fakeConnection{info: wsgateway.ConnectionInfo{ConnectionID: "execution-connection"}}
+	identity := testIdentity("page-1", "epoch-1", "session-1", true)
+	if err := h.Handle(context.Background(), connection, registerMessage(identity)); err != nil {
+		t.Fatal(err)
+	}
+	result := make(chan protocol.DebugExecutionResultPayload, 1)
+	errorsOut := make(chan error, 1)
+	go func() {
+		value, err := b.Execute(context.Background(), "1 + 1", 500)
+		result <- value
+		errorsOut <- err
+	}()
+	execute := connection.findMessage(t, protocol.MessageTypeDebugExecute).(protocol.DebugExecuteMessage)
+	if execute.Payload.TimeoutMS != 500 || execute.Payload.PageID != "page-1" || execute.Payload.SessionID != "session-1" {
+		t.Fatalf("execute payload = %#v", execute.Payload)
+	}
+	if err := h.Handle(context.Background(), connection, executionResultMessage(protocol.DebugExecutionResultPayload{
+		ExecutionID: execute.Payload.ExecutionID, PageID: "page-1", PageEpoch: "epoch-1", SessionID: "session-1",
+		Status: protocol.DebugExecutionStatusSucceeded, Value: []byte(`2`),
+	})); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-errorsOut; err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if got := string((<-result).Value); got != "2" {
+		t.Fatalf("Execute() value = %s, want 2", got)
+	}
+}
+
+func TestBrokerCommittedResultWinsTimeoutSettlement(t *testing.T) {
+	testExecutionSettlementWinner(t, ErrExecutionTimeout)
+}
+
+func TestBrokerCommittedResultWinsContextSettlement(t *testing.T) {
+	testExecutionSettlementWinner(t, context.Canceled)
+}
+
+func testExecutionSettlementWinner(t *testing.T, losingErr error) {
+	t.Helper()
+	b := newTestBroker(t, func(context.Context, string) error { return nil })
+	h := NewHandler(b, nil)
+	connection := &fakeConnection{info: wsgateway.ConnectionInfo{ConnectionID: "settlement-connection"}}
+	identity := testIdentity("page-1", "epoch-1", "session-1", true)
+	if err := h.Handle(context.Background(), connection, registerMessage(identity)); err != nil {
+		t.Fatal(err)
+	}
+	type outcome struct {
+		result protocol.DebugExecutionResultPayload
+		err    error
+	}
+	outcomes := make(chan outcome, 1)
+	go func() {
+		result, err := b.Execute(context.Background(), "1 + 1", 5000)
+		outcomes <- outcome{result: result, err: err}
+	}()
+	execute := connection.findMessage(t, protocol.MessageTypeDebugExecute).(protocol.DebugExecuteMessage)
+	b.mu.Lock()
+	pending := b.execution
+	b.mu.Unlock()
+	if pending == nil {
+		t.Fatal("execution did not create a pending settlement")
+	}
+	winner := protocol.DebugExecutionResultPayload{
+		ExecutionID: execute.Payload.ExecutionID, PageID: execute.Payload.PageID,
+		PageEpoch: execute.Payload.PageEpoch, SessionID: execute.Payload.SessionID,
+		Status: protocol.DebugExecutionStatusSucceeded, Value: []byte(`2`),
+	}
+	if err := h.Handle(context.Background(), connection, executionResultMessage(winner)); err != nil {
+		t.Fatal(err)
+	}
+	if b.finishPending(pending, protocol.DebugExecutionResultPayload{}, losingErr) {
+		t.Fatalf("losing settlement %v unexpectedly won", losingErr)
+	}
+	select {
+	case got := <-outcomes:
+		if got.err != nil || string(got.result.Value) != "2" {
+			t.Fatalf("Execute() outcome = %#v, want committed result", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Execute() did not settle from the committed result")
+	}
+}
+
+func TestBrokerExecutionResultRejectsForeignDuplicateAndStaleMessages(t *testing.T) {
+	b := newTestBroker(t, func(context.Context, string) error { return nil })
+	h := NewHandler(b, nil)
+	first := &fakeConnection{info: wsgateway.ConnectionInfo{ConnectionID: "execution-first"}}
+	foreign := &fakeConnection{info: wsgateway.ConnectionInfo{ConnectionID: "execution-foreign"}}
+	firstIdentity := testIdentity("page-1", "epoch-1", "session-1", true)
+	foreignIdentity := testIdentity("page-2", "epoch-1", "session-2", false)
+	if err := h.Handle(context.Background(), first, registerMessage(firstIdentity)); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Handle(context.Background(), foreign, registerMessage(foreignIdentity)); err != nil {
+		t.Fatal(err)
+	}
+	result := make(chan protocol.DebugExecutionResultPayload, 1)
+	errorsOut := make(chan error, 1)
+	go func() {
+		value, err := b.Execute(context.Background(), "({ ok: true })", 500)
+		result <- value
+		errorsOut <- err
+	}()
+	execute := first.findMessage(t, protocol.MessageTypeDebugExecute).(protocol.DebugExecuteMessage)
+	stale := protocol.DebugExecutionResultPayload{
+		ExecutionID: execute.Payload.ExecutionID, PageID: execute.Payload.PageID, PageEpoch: execute.Payload.PageEpoch, SessionID: execute.Payload.SessionID,
+		Status: protocol.DebugExecutionStatusSucceeded, Value: []byte(`"foreign"`),
+	}
+	if err := h.Handle(context.Background(), foreign, executionResultMessage(stale)); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Handle(context.Background(), first, executionResultMessage(protocol.DebugExecutionResultPayload{
+		ExecutionID: "other-execution", PageID: execute.Payload.PageID, PageEpoch: execute.Payload.PageEpoch, SessionID: execute.Payload.SessionID,
+		Status: protocol.DebugExecutionStatusSucceeded, Value: []byte(`"stale"`),
+	})); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Handle(context.Background(), first, executionResultMessage(stale)); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-errorsOut; err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if got := string((<-result).Value); got != `"foreign"` {
+		t.Fatalf("matched result = %s, want original result", got)
+	}
+	// A duplicate result after completion cannot become the next execution's
+	// result, even when the connection and page identity are reused.
+	secondResult := make(chan protocol.DebugExecutionResultPayload, 1)
+	secondError := make(chan error, 1)
+	go func() {
+		value, err := b.Execute(context.Background(), "3 + 3", 500)
+		secondResult <- value
+		secondError <- err
+	}()
+	second := first.findNewExecution(t, execute.Payload.ExecutionID)
+	if err := h.Handle(context.Background(), first, executionResultMessage(stale)); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Handle(context.Background(), first, executionResultMessage(protocol.DebugExecutionResultPayload{
+		ExecutionID: second.Payload.ExecutionID, PageID: second.Payload.PageID, PageEpoch: second.Payload.PageEpoch, SessionID: second.Payload.SessionID,
+		Status: protocol.DebugExecutionStatusSucceeded, Value: []byte(`6`),
+	})); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-secondError; err != nil {
+		t.Fatalf("second Execute() error = %v", err)
+	}
+	if got := string((<-secondResult).Value); got != "6" {
+		t.Fatalf("second matched result = %s, want 6", got)
+	}
+}
+
+func TestBrokerExecutionBusyTimeoutCancellationAndSendFailure(t *testing.T) {
+	b := newTestBroker(t, func(context.Context, string) error { return nil })
+	h := NewHandler(b, nil)
+	connection := &fakeConnection{info: wsgateway.ConnectionInfo{ConnectionID: "execution-connection"}}
+	identity := testIdentity("page-1", "epoch-1", "session-1", true)
+	if err := h.Handle(context.Background(), connection, registerMessage(identity)); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	firstError := make(chan error, 1)
+	go func() { _, err := b.Execute(ctx, "await new Promise(() => {})", 500); firstError <- err }()
+	_ = connection.findMessage(t, protocol.MessageTypeDebugExecute)
+	if _, err := b.Execute(context.Background(), "2", 500); !errors.Is(err, ErrExecutionBusy) {
+		t.Fatalf("busy Execute() error = %v", err)
+	}
+	cancel()
+	if err := <-firstError; !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled Execute() error = %v", err)
+	}
+	ctx2, cancel2 := context.WithTimeout(context.Background(), time.Second)
+	defer cancel2()
+	timeoutError := make(chan error, 1)
+	go func() { _, err := b.Execute(ctx2, "await new Promise(() => {})", 100); timeoutError <- err }()
+	_ = connection.findMessage(t, protocol.MessageTypeDebugExecute)
+	if err := <-timeoutError; !errors.Is(err, ErrExecutionTimeout) {
+		t.Fatalf("timed out Execute() error = %v", err)
+	}
+	connection.mu.Lock()
+	connection.sendErr = errors.New("send failed")
+	connection.mu.Unlock()
+	if _, err := b.Execute(context.Background(), "3", 500); !errors.Is(err, ErrExecutionDisconnected) {
+		t.Fatalf("send failure Execute() error = %v", err)
+	}
+	if _, err := b.Execute(context.Background(), "4", 500); !errors.Is(err, ErrNotConnected) {
+		t.Fatalf("Execute() after send failure error = %v, want ErrNotConnected", err)
+	}
+}
+
+func TestBrokerConnectionWatcherCancellationFailsExecutionImmediately(t *testing.T) {
+	b := newTestBroker(t, func(context.Context, string) error { return nil })
+	h := NewHandler(b, nil)
+	connectionContext, cancelConnection := context.WithCancel(context.Background())
+	defer cancelConnection()
+	connection := &fakeConnection{info: wsgateway.ConnectionInfo{ConnectionID: "watcher-execution-connection"}}
+	if err := h.Handle(connectionContext, connection, registerMessage(testIdentity("page-1", "epoch-1", "session-1", true))); err != nil {
+		t.Fatal(err)
+	}
+	waitForWatcherStats(t, b, 1, 1)
+	executionDone := make(chan error, 1)
+	go func() {
+		_, err := b.Execute(context.Background(), "await new Promise(() => {})", 5000)
+		executionDone <- err
+	}()
+	_ = connection.findMessage(t, protocol.MessageTypeDebugExecute)
+	started := time.Now()
+	cancelConnection()
+	select {
+	case err := <-executionDone:
+		if !errors.Is(err, ErrExecutionDisconnected) {
+			t.Fatalf("watcher cancellation error = %v, want ErrExecutionDisconnected", err)
+		}
+		if elapsed := time.Since(started); elapsed >= time.Second {
+			t.Fatalf("watcher cancellation took %s, want immediate failure", elapsed)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("watcher cancellation left execution pending until timeout")
+	}
+}
+
+func TestBrokerExecutionFailsImmediatelyOnRefreshUnregisterAndClose(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		invalidate func(*testing.T, *Broker, *Handler, *fakeConnection)
+	}{
+		{name: "refresh", invalidate: func(t *testing.T, _ *Broker, h *Handler, c *fakeConnection) {
+			if err := h.Handle(context.Background(), c, registerMessage(testIdentity("page-1", "epoch-2", "session-1", true))); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "unregister", invalidate: func(t *testing.T, _ *Broker, h *Handler, c *fakeConnection) {
+			if err := h.Handle(context.Background(), c, unregisterMessage(testIdentity("page-1", "epoch-1", "session-1", true))); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "close", invalidate: func(_ *testing.T, b *Broker, _ *Handler, _ *fakeConnection) { b.Close() }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			b := newTestBroker(t, func(context.Context, string) error { return nil })
+			h := NewHandler(b, nil)
+			connection := &fakeConnection{info: wsgateway.ConnectionInfo{ConnectionID: "execution-connection"}}
+			if err := h.Handle(context.Background(), connection, registerMessage(testIdentity("page-1", "epoch-1", "session-1", true))); err != nil {
+				t.Fatal(err)
+			}
+			executionError := make(chan error, 1)
+			go func() { _, err := b.Execute(context.Background(), "1", 5000); executionError <- err }()
+			_ = connection.findMessage(t, protocol.MessageTypeDebugExecute)
+			test.invalidate(t, b, h, connection)
+			err := <-executionError
+			if test.name == "close" {
+				if !errors.Is(err, ErrClosed) {
+					t.Fatalf("Close() execution error = %v", err)
+				}
+			} else if !errors.Is(err, ErrExecutionDisconnected) {
+				t.Fatalf("%s execution error = %v", test.name, err)
+			}
+		})
+	}
 }
 
 func waitForNotConnected(t *testing.T, broker *Broker) {

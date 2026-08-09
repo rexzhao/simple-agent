@@ -20,29 +20,31 @@ const MaxWireIdentifierBytes = 4096
 type MessageType string
 
 const (
-	MessageTypeHello             MessageType = "hello"
-	MessageTypeWelcome           MessageType = "welcome"
-	MessageTypePing              MessageType = "ping"
-	MessageTypePong              MessageType = "pong"
-	MessageTypeCommand           MessageType = "command"
-	MessageTypeCommandAccepted   MessageType = "command_accepted"
-	MessageTypeCommandResult     MessageType = "command_result"
-	MessageTypeSubscribe         MessageType = "subscribe"
-	MessageTypeSubscribed        MessageType = "subscribed"
-	MessageTypeUnsubscribe       MessageType = "unsubscribe"
-	MessageTypeUnsubscribed      MessageType = "unsubscribed"
-	MessageTypeSnapshot          MessageType = "snapshot"
-	MessageTypeChange            MessageType = "change"
-	MessageTypeSubscriptionEvent MessageType = "subscription_event"
-	MessageTypeAck               MessageType = "ack"
-	MessageTypeResyncRequired    MessageType = "resync_required"
-	MessageTypeDebugRegister     MessageType = "debug_register"
-	MessageTypeDebugRegistered   MessageType = "debug_registered"
-	MessageTypeDebugFocus        MessageType = "debug_focus"
-	MessageTypeDebugFocused      MessageType = "debug_focused"
-	MessageTypeDebugUnregister   MessageType = "debug_unregister"
-	MessageTypeDebugUnregistered MessageType = "debug_unregistered"
-	MessageTypeError             MessageType = "error"
+	MessageTypeHello                MessageType = "hello"
+	MessageTypeWelcome              MessageType = "welcome"
+	MessageTypePing                 MessageType = "ping"
+	MessageTypePong                 MessageType = "pong"
+	MessageTypeCommand              MessageType = "command"
+	MessageTypeCommandAccepted      MessageType = "command_accepted"
+	MessageTypeCommandResult        MessageType = "command_result"
+	MessageTypeSubscribe            MessageType = "subscribe"
+	MessageTypeSubscribed           MessageType = "subscribed"
+	MessageTypeUnsubscribe          MessageType = "unsubscribe"
+	MessageTypeUnsubscribed         MessageType = "unsubscribed"
+	MessageTypeSnapshot             MessageType = "snapshot"
+	MessageTypeChange               MessageType = "change"
+	MessageTypeSubscriptionEvent    MessageType = "subscription_event"
+	MessageTypeAck                  MessageType = "ack"
+	MessageTypeResyncRequired       MessageType = "resync_required"
+	MessageTypeDebugRegister        MessageType = "debug_register"
+	MessageTypeDebugRegistered      MessageType = "debug_registered"
+	MessageTypeDebugFocus           MessageType = "debug_focus"
+	MessageTypeDebugFocused         MessageType = "debug_focused"
+	MessageTypeDebugUnregister      MessageType = "debug_unregister"
+	MessageTypeDebugUnregistered    MessageType = "debug_unregistered"
+	MessageTypeDebugExecute         MessageType = "debug_execute"
+	MessageTypeDebugExecutionResult MessageType = "debug_execution_result"
+	MessageTypeError                MessageType = "error"
 )
 
 // Envelope is the wire envelope used by all V1 messages. Concrete message DTOs
@@ -244,6 +246,20 @@ func DecodeMessage(data []byte) (Message, error) {
 		}
 		message := DebugUnregisteredMessage{Envelope: envelope, Payload: payload}
 		return message, message.validate()
+	case MessageTypeDebugExecute:
+		var payload DebugExecutionPayload
+		if err := decode(&payload); err != nil {
+			return nil, err
+		}
+		message := DebugExecuteMessage{Envelope: envelope, Payload: payload}
+		return message, message.validate()
+	case MessageTypeDebugExecutionResult:
+		var payload DebugExecutionResultPayload
+		if err := decode(&payload); err != nil {
+			return nil, err
+		}
+		message := DebugExecutionResultMessage{Envelope: envelope, Payload: payload}
+		return message, message.validate()
 	case MessageTypeError:
 		var payload ErrorPayload
 		if err := decode(&payload); err != nil {
@@ -310,6 +326,10 @@ func validateOptionalFieldNullability(data []byte, envelope Envelope) error {
 		MessageTypeDebugFocus, MessageTypeDebugFocused,
 		MessageTypeDebugUnregister, MessageTypeDebugUnregistered:
 		fields = []string{"focused"}
+	case MessageTypeDebugExecute:
+		fields = []string{"execution_id", "page_id", "page_epoch", "session_id", "code", "timeout_ms"}
+	case MessageTypeDebugExecutionResult:
+		fields = []string{"execution_id", "page_id", "page_epoch", "session_id", "status", "console", "error"}
 	}
 	for _, field := range fields {
 		if err := rejectNullField(envelope.Payload, field, "payload."+field); err != nil {
@@ -368,7 +388,8 @@ func isKnownMessageType(messageType MessageType) bool {
 		MessageTypeSubscriptionEvent, MessageTypeAck, MessageTypeResyncRequired,
 		MessageTypeDebugRegister, MessageTypeDebugRegistered,
 		MessageTypeDebugFocus, MessageTypeDebugFocused,
-		MessageTypeDebugUnregister, MessageTypeDebugUnregistered, MessageTypeError:
+		MessageTypeDebugUnregister, MessageTypeDebugUnregistered,
+		MessageTypeDebugExecute, MessageTypeDebugExecutionResult, MessageTypeError:
 		return true
 	default:
 		return false

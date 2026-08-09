@@ -763,7 +763,7 @@ func isClientMessage(messageType protocol.MessageType) bool {
 		protocol.MessageTypeCommand, protocol.MessageTypeSubscribe,
 		protocol.MessageTypeUnsubscribe, protocol.MessageTypeAck,
 		protocol.MessageTypeDebugRegister, protocol.MessageTypeDebugFocus,
-		protocol.MessageTypeDebugUnregister:
+		protocol.MessageTypeDebugUnregister, protocol.MessageTypeDebugExecutionResult:
 		return true
 	default:
 		return false

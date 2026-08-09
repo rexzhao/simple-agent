@@ -3,8 +3,10 @@ package webapp
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/coder/websocket"
@@ -88,6 +90,32 @@ func TestProductionWebDebugConfigFailureDoesNotFailOpen(t *testing.T) {
 			app.Close()
 		}
 		t.Fatalf("malformed config assembly app=%#v err=%v, want startup error", app, err)
+	}
+}
+
+func TestWebDebugCSPIsStrictByDefaultAndOptInForStaticOnly(t *testing.T) {
+	for _, enabled := range []bool{false, true} {
+		t.Run(fmt.Sprintf("enabled_%t", enabled), func(t *testing.T) {
+			_, appServer, _ := newStage1ProductionApp(t, enabled)
+			for _, test := range []struct {
+				path      string
+				allowEval bool
+			}{
+				{path: "/", allowEval: enabled},
+				{path: "/api/bootstrap", allowEval: false},
+			} {
+				recorder := httptest.NewRecorder()
+				request := httptest.NewRequest("GET", "http://127.0.0.1"+test.path, nil)
+				appServer.Handler().ServeHTTP(recorder, request)
+				policy := recorder.Header().Get("Content-Security-Policy")
+				if strings.Contains(policy, "'unsafe-eval'") != test.allowEval {
+					t.Fatalf("path %s CSP = %q, unsafe-eval presence = %t, want %t", test.path, policy, strings.Contains(policy, "'unsafe-eval'"), test.allowEval)
+				}
+				if recorder.Header().Get("X-Content-Type-Options") != "nosniff" {
+					t.Fatalf("path %s lost API/static security headers", test.path)
+				}
+			}
+		})
 	}
 }
 
