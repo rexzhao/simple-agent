@@ -22,6 +22,7 @@ import { ProviderSettingsStore } from './providerSettingsStore'
 import { CodexLoginStore } from './codexLoginStore'
 import { SyncRuntime, type RuntimeTransport } from './runtime'
 import { WebSocketTransport, type WebSocketTransportOptions } from './transport'
+import { WebDebugBridge, type WebDebugBridgeOptions } from '../debug/webDebugBridge'
 import { sessionHistoryResultToDomain } from './sessionContentHistory'
 import type { SessionContentHistoryReadOptions, SessionContentHistoryWindow } from '../domain/sessionContent'
 import { api } from '../api'
@@ -64,6 +65,7 @@ export interface SyncApplication extends ApplicationLifecycle {
   readonly replica: LocalReplica
   readonly runtime: SyncRuntime
   readonly commandFacade: CommandFacade
+  readonly debugBridge: WebDebugBridge
   readonly commands: ApplicationCommands
   readonly stores: SyncApplicationStores
   readonly repositories: ApplicationRepositories
@@ -92,6 +94,7 @@ export interface SyncApplicationOptions {
   /** Test seam for the application history reader; production uses the typed
    * command/blob data plane below. */
   readonly historyReader?: (sessionID: string, options: SessionContentHistoryReadOptions, signal?: AbortSignal) => Promise<SessionContentHistoryWindow>
+  readonly debugBridgeOptions?: Pick<WebDebugBridgeOptions, 'pageIDGenerator' | 'pageEpochGenerator' | 'window' | 'document' | 'pollIntervalMS' | 'setTimeout' | 'clearTimeout'>
 }
 
 function pageCommands(facade: CommandFacade): ApplicationCommands {
@@ -168,6 +171,16 @@ export function createSyncApplication(options: SyncApplicationOptions = {}): Syn
     },
   }
 
+  const debugBridge = new WebDebugBridge({
+    ...options.debugBridgeOptions,
+    transport,
+    runtime,
+    replica,
+    repositories,
+    commandFacade,
+    signals,
+  })
+
   let lifecycle: 'stopped' | 'started' | 'disposed' = 'stopped'
 
   const stop = (): void => {
@@ -175,9 +188,9 @@ export function createSyncApplication(options: SyncApplicationOptions = {}): Syn
     if (lifecycle === 'stopped') return
     lifecycle = 'stopped'
 
-    // Release policy-owned references while the runtime and socket are still
-    // alive, so normal unsubscribe frames can be sent. Then stop command
-    // listeners, runtime listeners/socket, and finally the replica stores.
+    // The debug bridge unregisters while the transport is still alive, then
+    // the normal sync graph releases subscriptions and closes the socket.
+    debugBridge.stop()
     policies.codexLogin.stop()
     policies.providerSettings.stop()
     policies.sessionContent.stop()
@@ -199,6 +212,7 @@ export function createSyncApplication(options: SyncApplicationOptions = {}): Syn
       policies.sessionContent.start()
       policies.providerSettings.start()
       policies.codexLogin.start()
+      debugBridge.start()
       runtime.start()
       lifecycle = 'started'
     } catch (reason) {
@@ -208,6 +222,7 @@ export function createSyncApplication(options: SyncApplicationOptions = {}): Syn
       policies.sessionContent.stop()
       policies.sessionIndex.stop()
       policies.projectIndex.stop()
+      debugBridge.stop()
       commandFacade.stop()
       runtime.stop()
       throw reason
@@ -222,6 +237,7 @@ export function createSyncApplication(options: SyncApplicationOptions = {}): Syn
     stores.sessionContent.dispose()
     stores.sessionIndex.dispose()
     stores.projectIndex.dispose()
+    debugBridge.dispose()
     replica.dispose()
     lifecycle = 'disposed'
   }
@@ -232,6 +248,7 @@ export function createSyncApplication(options: SyncApplicationOptions = {}): Syn
     replica,
     runtime,
     commandFacade,
+    debugBridge,
     commands,
     stores,
     repositories,

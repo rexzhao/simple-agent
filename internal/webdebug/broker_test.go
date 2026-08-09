@@ -97,6 +97,56 @@ func assertErrorMessage(t *testing.T, connection *fakeConnection, want string) {
 	}
 }
 
+func assertErrorRequestID(t *testing.T, connection *fakeConnection, want string) {
+	t.Helper()
+	message, ok := connection.lastMessage(t).(protocol.ErrorMessage)
+	if !ok {
+		t.Fatalf("last message = %T, want ErrorMessage", connection.lastMessage(t))
+	}
+	if message.Payload.RequestID == nil || *message.Payload.RequestID != want {
+		t.Fatalf("error request_id = %v, want %q", message.Payload.RequestID, want)
+	}
+}
+
+func TestBrokerDebugErrorsCorrelateToControlRequest(t *testing.T) {
+	disabled, err := NewBroker(Options{Enabled: false, Eligibility: func(context.Context, string) error { return nil }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer disabled.Close()
+	disabledConnection := &fakeConnection{info: wsgateway.ConnectionInfo{ConnectionID: "disabled-connection"}}
+	if err := NewHandler(disabled, nil).Handle(context.Background(), disabledConnection, registerMessage(testIdentity("page-1", "epoch-1", "session-1", true))); err != nil {
+		t.Fatal(err)
+	}
+	assertErrorMessage(t, disabledConnection, ErrorCodeDisabled)
+	assertErrorRequestID(t, disabledConnection, "register-request")
+
+	broker := newTestBroker(t, func(context.Context, string) error { return nil })
+	handler := NewHandler(broker, nil)
+	connection := &fakeConnection{info: wsgateway.ConnectionInfo{ConnectionID: "connection-1"}}
+	if err := handler.Handle(context.Background(), connection, registerMessage(testIdentity("page-1", "epoch-1", "session-1", true))); err != nil {
+		t.Fatal(err)
+	}
+	if err := handler.Handle(context.Background(), connection, focusMessage(testIdentity("page-1", "old-epoch", "session-1", false))); err != nil {
+		t.Fatal(err)
+	}
+	assertErrorMessage(t, connection, ErrorCodePageNotRegistered)
+	assertErrorRequestID(t, connection, "focus-request")
+	if err := handler.Handle(context.Background(), connection, unregisterMessage(testIdentity("page-1", "old-epoch", "session-1", false))); err != nil {
+		t.Fatal(err)
+	}
+	assertErrorMessage(t, connection, ErrorCodePageNotRegistered)
+	assertErrorRequestID(t, connection, "unregister-request")
+
+	encoded, err := protocol.EncodeMessage(connection.lastMessage(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(encoded, []byte(`"session_id"`)) || bytes.Contains(encoded, []byte(`"project_id"`)) {
+		t.Fatalf("debug error wire unexpectedly contains session/project identity: %s", encoded)
+	}
+}
+
 func TestBrokerDisabledDoesNotCreateCandidate(t *testing.T) {
 	broker, err := NewBroker(Options{Enabled: false, Eligibility: func(context.Context, string) error {
 		t.Fatal("disabled broker called eligibility")

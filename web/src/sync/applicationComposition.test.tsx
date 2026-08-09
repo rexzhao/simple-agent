@@ -212,7 +212,7 @@ describe('application sync composition root', () => {
     expect(application.replica).toBe(graph.replica)
     expect(application.commandFacade).toBe(graph.commandFacade)
     expect(transport.starts).toBe(2)
-    expect(transport.listenerCount()).toBe(5)
+    expect(transport.listenerCount()).toBe(8)
     expect(resources(transport)).toHaveLength(2)
     expect(transport.unsubscriptions()).toHaveLength(1)
 
@@ -225,7 +225,7 @@ describe('application sync composition root', () => {
     )
     expect(transport.starts).toBe(2)
     expect(transport.unsubscriptions()).toHaveLength(1)
-    expect(transport.listenerCount()).toBe(5)
+    expect(transport.listenerCount()).toBe(8)
 
     view.unmount()
     expect(application.started).toBe(false)

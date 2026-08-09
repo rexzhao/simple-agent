@@ -1,6 +1,6 @@
 # `web.eval` 内部调试工具开发方案
 
-> **状态：主同步重构已完成；阶段 1 已完成并验收（executor 注册与单 lease 基础）。**本轮只处理阶段 1，不提前实现阶段 2、3、4。它是一个面向固定内部调试项目的最小 Agent 调试入口，不扩展 resource subscription/数据同步语义，使用独立 debug control 通道，也不反向改变同步架构。
+> **状态：主同步重构已完成；阶段 1 已完成并验收；阶段 2 已完成并验收。**本轮只实现浏览器侧 debug executor bridge、生命周期/焦点注册和统一 `window.__SAI_DEBUG__` surface，不实现阶段 3/4 的 Go→Web JavaScript 执行、Agent tool、serializer、Blob 或 logging。
 
 ## 1. 目标与边界
 
@@ -146,19 +146,20 @@ Blob reference（如有）
 
 - 当前实现范围包括默认关闭的服务端 `debug.web_eval_enabled` 高危开关、Web server assembly 的 debug broker 注入，以及配置失败时不 fail-open 的启动边界。
 - 当前实现范围包括现有 WebSocket 上专用 typed 的注册、注销、焦点更新及服务端确认消息；字段仅包含 `page_id`、`page_epoch`、`session_id`、`focused`，并沿用协议的 Decode/Encode、校验、fixture 和边界规则。
-- 当前 Go/Web 两端共享的 V1 typed debug control contract 已接通；本轮仍只提供纯协议支持，不增加页面注册行为、React/UI 或 `window.__SAI_DEBUG__`。
+- 当前 Go/Web 两端共享的 V1 typed debug control contract 已接通；阶段 1 只提供纯协议支持，不增加页面注册行为、React/UI 或 `window.__SAI_DEBUG__`。
 - 当前实现范围包括固定项目 `project-f25c5aac78f681b52aabf5c0` 的服务端 SessionStore 权威校验，不接受客户端 `project_id`；非目标、缺失、删除或畸形身份不能成为候选。
 - 当前实现范围包括每个 live connection 一个候选、全局唯一当前 lease，以及最近焦点优先、注销、连接 context 取消、刷新 epoch 和 broker Close 的确定性失效/回退；提供不带页面选择参数的 `Current` / `Acquire` API 和 `web_debug_not_connected` typed 错误。
 - 当前实现范围包括 debug handler 只消费 debug control 消息，现有 command/subscription 委托路径不变。
 
-阶段 2、3、4（`window.__SAI_DEBUG__`、`web.eval` 执行、JS/serializer/Blob/logging）本轮未实现。
+阶段 2、3、4（`window.__SAI_DEBUG__`、`web.eval` 执行、JS/serializer/Blob/logging）目前状态分别为已完成并验收、未实现、未实现。
 
-### 阶段 2：`window.__SAI_DEBUG__`
+### 阶段 2：`window.__SAI_DEBUG__`（已完成并验收；本轮实现）
 
-- 在模块闭包内组装 LocalReplica、SyncRuntime、repositories、command facade 和 app state；
-- 提供项目/Session 选择和 wait-idle 等必要控制能力；
-- 只在服务端总开关和固定项目过滤同时满足时暴露入口；
-- 明确任意 JS 的同源/DOM 权限，不引入虚假的 probe 沙箱。
+- 新增独立 `web/src/debug/webDebugBridge.ts` infrastructure 模块，由 `createSyncApplication` 组合进唯一应用对象图；复用现有 RuntimeTransport、signals、repositories、LocalReplica、SyncRuntime 和 CommandFacade。
+- 浏览器侧严格使用固定项目 `project-f25c5aac78f681b52aabf5c0`、非空当前 Session，以及目标 SessionIndex 的 ready authoritative summary 作为本地候选；监听项目/Session signals、目标 SessionIndex publication、WebSocket ready/close、focus/blur 和应用 stop/dispose。
+- 实现 crypto UUID 的稳定 `page_id` 与页面加载唯一 `page_epoch`（提供测试 generator seam）；按 connection generation、page、epoch、session 严格匹配 `debug_registered`，处理 pending focus reconcile、断线/切换/authority 失效/服务端 `web_debug_*` 错误和 best-effort unregister，避免无界重试。
+- 仅在匹配 server ack 后挂载唯一 `window.__SAI_DEBUG__`；surface 提供 `replica`、`runtime`、`repositories`、`commandFacade`、只读 `appState`、`selectProject`、`selectSession` 和有界/可取消/稳定观察点的 `waitIdle`。`waitIdle` 同时等待当前 ProjectIndex、SessionIndex、Session Content（含 data availability 与 history loading）不再 loading；stale/error 作为可观察的终态，不阻断 idle。导航只使用 ProjectIndex/SessionIndex authority 和现有 signals，不调用 DOM click 或新增 HTTP。
+- 为 runtime/command facade 增加 transport-neutral 的只读 debug snapshot seam；debug control error 在同步 runtime 和 command facade 中明确忽略，不改变普通 resource/command 路径或 `ApplicationPageServices`。
 
 ### 阶段 3：`web.eval` broker/tool
 

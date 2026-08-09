@@ -625,6 +625,11 @@ function decodeRunToolCancelResult(value: unknown, sessionID: string, runID: str
   return { session_id: resultSessionID, run_id: resultRunID, tool_call_id: resultToolCallID, cancelled: true }
 }
 
+export interface CommandFacadeDebugSnapshot {
+  readonly started: boolean
+  readonly pendingCount: number
+}
+
 /**
  * Typed application command boundary. A command result is only a promise
  * result; it never mutates a replica. Durable authority still arrives through
@@ -669,6 +674,11 @@ export class CommandFacade implements SessionCommands, RunCommands, ProjectComma
     this.setTimer = options.setTimeout ?? ((handler, timeout) => globalThis.setTimeout(handler, timeout))
     this.clearTimer = options.clearTimeout ?? ((handle) => globalThis.clearTimeout(handle))
     if (this.timeoutMS <= 0 || this.maxPendingCommands <= 0 || this.maxRecentRequestIDs <= 0 || this.maxRecentEntityIDs <= 0) throw new Error('command bounds must be positive')
+  }
+
+  /** Infrastructure-only observation for the browser debug bridge. */
+  getDebugSnapshot(): CommandFacadeDebugSnapshot {
+    return { started: this.started, pendingCount: this.pending.size }
   }
 
   createProvider(provider: string, target: ProviderUpdateTarget, options: ProviderCreateOptions = {}): Promise<ProviderCreateResult> {
@@ -1235,6 +1245,7 @@ export class CommandFacade implements SessionCommands, RunCommands, ProjectComma
   }
 
   private handleMessage(message: ProtocolMessage, generation: number): void {
+    if (message.type === 'error' && message.payload.code.startsWith('web_debug_')) return
     if (message.type === 'command_accepted') return
     if (message.type === 'command_result') {
       this.handleResult(message as CommandResultMessage, generation)

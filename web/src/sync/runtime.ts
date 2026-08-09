@@ -49,6 +49,14 @@ export interface SyncRuntimeOptions {
   adapters?: Partial<Record<ResourceKey['type'], (resource: ResourceKey) => ResourceAdapter<unknown, unknown>>>
 }
 
+export interface SyncRuntimeDebugSnapshot {
+  readonly started: boolean
+  readonly transportReady: boolean
+  readonly activeSubscriptions: number
+  readonly busySubscriptions: number
+  readonly busy: boolean
+}
+
 export type SyncSubscriptionErrorCode = 'invalid_resource' | 'capacity'
 
 export class SyncSubscriptionError extends Error {
@@ -182,6 +190,25 @@ export class SyncRuntime {
     this.maxResyncAttempts = options.maxResyncAttempts ?? 8
     this.adapterFactories = options.adapters ?? {}
     if (this.maxSubscriptions <= 0 || this.maxRetainedResources <= 0 || this.maxQueuedChanges <= 0 || this.maxQueuedBytes <= 0 || this.maxResyncAttempts <= 0) throw new Error('sync queue/resync bounds must be positive')
+  }
+
+  /**
+   * Infrastructure-only observation for the browser debug bridge. It reports
+   * whether active subscriptions still have snapshot, replay, or resync work;
+   * it is not part of the page-facing repository contract.
+   */
+  getDebugSnapshot(): SyncRuntimeDebugSnapshot {
+    let busySubscriptions = 0
+    for (const subscription of this.subscriptions.values()) {
+      if (subscription.snapshotBusy || subscription.resyncing || (subscription.phase !== 'live' && subscription.phase !== 'error')) busySubscriptions += 1
+    }
+    return {
+      started: this.started,
+      transportReady: this.transport.isReady,
+      activeSubscriptions: this.subscriptions.size,
+      busySubscriptions,
+      busy: busySubscriptions > 0,
+    }
   }
 
   start(): void {
@@ -484,7 +511,10 @@ export class SyncRuntime {
       case 'change': this.handleChange(message as ChangeMessage, socketGeneration); return
       case 'subscription_event': this.handleSubscriptionEvent(message as SubscriptionEventMessage, socketGeneration); return
       case 'resync_required': this.handleResync(message as ResyncRequiredMessage, socketGeneration); return
-      case 'error': this.handleSubscriptionError(message, socketGeneration); return
+      case 'error':
+        if (message.payload.code.startsWith('web_debug_')) return
+        this.handleSubscriptionError(message, socketGeneration)
+        return
       default: return
     }
   }

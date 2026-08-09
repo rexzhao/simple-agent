@@ -248,23 +248,23 @@ func (b *Broker) handleRegister(ctx context.Context, connection wsgateway.Connec
 	}
 	connectionID, err := b.connectionID(connection)
 	if err != nil {
-		return b.sendError(connection, err)
+		return b.sendError(connection, message.Envelope.ID, err)
 	}
 	if err := protocol.ValidateDebugExecutorIdentity(message.Payload.PageID, message.Payload.PageEpoch, message.Payload.SessionID); err != nil {
 		b.removeCandidate(connectionID)
-		return b.sendError(connection, ErrInvalidIdentity)
+		return b.sendError(connection, message.Envelope.ID, ErrInvalidIdentity)
 	}
 	if !b.Enabled() {
-		return b.sendError(connection, ErrDisabled)
+		return b.sendError(connection, message.Envelope.ID, ErrDisabled)
 	}
 	if b.isClosed() {
-		return b.sendError(connection, ErrClosed)
+		return b.sendError(connection, message.Envelope.ID, ErrClosed)
 	}
 	// A replacement registration invalidates the prior epoch before the new
 	// authority check. A failed refresh therefore cannot retain an old lease.
 	b.removeCandidate(connectionID)
 	if err := b.eligibility(ctx, message.Payload.SessionID); err != nil {
-		return b.sendError(connection, ErrNotEligible)
+		return b.sendError(connection, message.Envelope.ID, ErrNotEligible)
 	}
 	if ctx != nil {
 		select {
@@ -276,7 +276,7 @@ func (b *Broker) handleRegister(ctx context.Context, connection wsgateway.Connec
 	b.mu.Lock()
 	if b.closed {
 		b.mu.Unlock()
-		return b.sendError(connection, ErrClosed)
+		return b.sendError(connection, message.Envelope.ID, ErrClosed)
 	}
 	b.sequence++
 	item := &candidate{
@@ -308,23 +308,23 @@ func (b *Broker) handleFocus(ctx context.Context, connection wsgateway.Connectio
 	}
 	connectionID, err := b.connectionID(connection)
 	if err != nil {
-		return b.sendError(connection, err)
+		return b.sendError(connection, message.Envelope.ID, err)
 	}
 	if err := protocol.ValidateDebugExecutorIdentity(message.Payload.PageID, message.Payload.PageEpoch, message.Payload.SessionID); err != nil {
-		return b.sendError(connection, ErrInvalidIdentity)
+		return b.sendError(connection, message.Envelope.ID, ErrInvalidIdentity)
 	}
 	if !b.Enabled() {
-		return b.sendError(connection, ErrDisabled)
+		return b.sendError(connection, message.Envelope.ID, ErrDisabled)
 	}
 	b.mu.Lock()
 	if b.closed {
 		b.mu.Unlock()
-		return b.sendError(connection, ErrClosed)
+		return b.sendError(connection, message.Envelope.ID, ErrClosed)
 	}
 	item := b.candidates[connectionID]
 	if item == nil || item.identity.PageID != message.Payload.PageID || item.identity.PageEpoch != message.Payload.PageEpoch || item.identity.SessionID != message.Payload.SessionID {
 		b.mu.Unlock()
-		return b.sendError(connection, ErrPageNotRegistered)
+		return b.sendError(connection, message.Envelope.ID, ErrPageNotRegistered)
 	}
 	b.sequence++
 	item.focused = message.Payload.Focused
@@ -345,23 +345,23 @@ func (b *Broker) handleUnregister(ctx context.Context, connection wsgateway.Conn
 	}
 	connectionID, err := b.connectionID(connection)
 	if err != nil {
-		return b.sendError(connection, err)
+		return b.sendError(connection, message.Envelope.ID, err)
 	}
 	if err := protocol.ValidateDebugExecutorIdentity(message.Payload.PageID, message.Payload.PageEpoch, message.Payload.SessionID); err != nil {
-		return b.sendError(connection, ErrInvalidIdentity)
+		return b.sendError(connection, message.Envelope.ID, ErrInvalidIdentity)
 	}
 	if !b.Enabled() {
-		return b.sendError(connection, ErrDisabled)
+		return b.sendError(connection, message.Envelope.ID, ErrDisabled)
 	}
 	b.mu.Lock()
 	if b.closed {
 		b.mu.Unlock()
-		return b.sendError(connection, ErrClosed)
+		return b.sendError(connection, message.Envelope.ID, ErrClosed)
 	}
 	item := b.candidates[connectionID]
 	if item == nil || item.identity.PageID != message.Payload.PageID || item.identity.PageEpoch != message.Payload.PageEpoch || item.identity.SessionID != message.Payload.SessionID {
 		b.mu.Unlock()
-		return b.sendError(connection, ErrPageNotRegistered)
+		return b.sendError(connection, message.Envelope.ID, ErrPageNotRegistered)
 	}
 	b.removeCandidateLocked(connectionID)
 	b.selectCurrentLocked()
@@ -506,7 +506,7 @@ func (b *Broker) sendMessage(connection wsgateway.Connection, message protocol.M
 	}
 }
 
-func (b *Broker) sendError(connection wsgateway.Connection, err error) error {
+func (b *Broker) sendError(connection wsgateway.Connection, requestID string, err error) error {
 	if connection == nil {
 		return wsgateway.ErrConnectionClosed
 	}
@@ -515,9 +515,13 @@ func (b *Broker) sendError(connection wsgateway.Connection, err error) error {
 	if idErr != nil {
 		return idErr
 	}
+	payload := protocol.ErrorPayload{Code: status.Code, Message: status.Code}
+	if requestID != "" {
+		payload.RequestID = &requestID
+	}
 	return connection.Send(protocol.ErrorMessage{
 		Envelope: protocol.Envelope{Version: 1, Type: protocol.MessageTypeError, ID: id},
-		Payload:  protocol.ErrorPayload{Code: status.Code, Message: status.Code},
+		Payload:  payload,
 	})
 }
 
