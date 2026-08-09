@@ -3,6 +3,7 @@ package webapp
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"strconv"
 	"strings"
 	"sync"
@@ -12,10 +13,14 @@ import (
 	"github.com/rexzhao/simple-agent/internal/execution"
 )
 
-func TestContinueRequestRejectsNewContent(t *testing.T) {
-	if _, err := (startRunRequest{Continue: true, Content: "new input"}).messageInput(); err == nil {
-		t.Fatal("continue request with content was accepted")
-	}
+type fastFailureWebTestRunner struct{}
+
+func (fastFailureWebTestRunner) SupportsIncrementalSessionTurn(context.Context, execution.SessionTurnRequest) (bool, error) {
+	return true, nil
+}
+
+func (fastFailureWebTestRunner) RunSessionTurn(context.Context, execution.SessionTurnRequest) (execution.SessionTurnResult, error) {
+	return execution.SessionTurnResult{}, errors.New("fast runner failure")
 }
 
 func TestRunRegistryUsesExecutionCoordinatorCapacityError(t *testing.T) {
@@ -24,41 +29,74 @@ func TestRunRegistryUsesExecutionCoordinatorCapacityError(t *testing.T) {
 	}
 }
 
-func TestRunRegistryEvictsTerminalRunsByTTLAndLimit(t *testing.T) {
-	registry := newRunRegistryWithOptions(context.Background(), nil, nil, runRegistryOptions{
-		MaxTerminalRuns: 2,
-		TerminalRunTTL:  30 * time.Millisecond,
-	})
-	defer registry.Close()
+func TestStartDurableHandoffAllowsSettledFastRun(t *testing.T) {
+	tests := []struct {
+		name   string
+		runner execution.SessionTurnRunner
+	}{
+		{name: "committed", runner: webTestRunner{}},
+		{name: "failed", runner: fastFailureWebTestRunner{}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, service, app := newWebTestAppServerWithRunner(t, test.runner)
+			_, session := createWebProjectAndSession(t, service)
+			settled := make(chan struct{})
+			app.runs.options.beforeDurableAdmissionCheck = func(run *execution.CoordinatedSessionRun) {
+				result, runErr := run.Wait()
+				// This is the same presentation callback used by the coordinator.
+				// Invoke it synchronously before startDurable's post-admission
+				// check, forcing the exact fast-run ordering under test.
+				app.runs.settleRun(run, result, runErr)
+				close(settled)
+			}
 
-	first := registerTerminalRunForTest(registry, "run-first", time.Now().Add(-time.Second))
-	second := registerTerminalRunForTest(registry, "run-second", time.Now())
-	third := registerTerminalRunForTest(registry, "run-third", time.Now().Add(time.Second))
-	if _, ok := registry.get(first.id); ok {
-		t.Fatal("oldest terminal run remained after terminal run limit eviction")
+			runID := "run-fast-handoff-" + test.name
+			status, err := app.runs.startDurable(session.ID, "hello", runID, "fingerprint-"+test.name)
+			if err != nil {
+				t.Fatalf("startDurable() error = %v, want durable admission acknowledgement", err)
+			}
+			if status != string(execution.SessionRunRunning) {
+				t.Fatalf("startDurable() status = %q, want %q admission status", status, execution.SessionRunRunning)
+			}
+			select {
+			case <-settled:
+			default:
+				t.Fatal("settlement hook did not run before startDurable returned")
+			}
+			if _, ok := app.runs.get(runID); ok {
+				t.Fatal("settled run leaked into the process-local control map")
+			}
+		})
 	}
-	if _, ok := registry.get(second.id); !ok {
-		t.Fatal("second terminal run was unexpectedly evicted by terminal run limit")
-	}
-	if _, ok := registry.get(third.id); !ok {
-		t.Fatal("newest terminal run was unexpectedly evicted by terminal run limit")
+}
+
+func TestStartDurableHandoffHonorsClose(t *testing.T) {
+	_, service, app := newWebTestAppServerWithRunner(t, blockingWebTestRunner{})
+	_, session := createWebProjectAndSession(t, service)
+	closed := make(chan struct{})
+	app.runs.options.beforeDurableAdmissionCheck = func(*execution.CoordinatedSessionRun) {
+		app.runs.Close()
+		close(closed)
 	}
 
-	deadline := time.Now().Add(time.Second)
-	for time.Now().Before(deadline) {
-		_, secondPresent := registry.get(second.id)
-		_, thirdPresent := registry.get(third.id)
-		if !secondPresent && !thirdPresent {
-			return
-		}
-		time.Sleep(5 * time.Millisecond)
+	_, err := app.runs.startDurable(session.ID, "hello", "run-close-handoff", "close-fingerprint")
+	if !errors.Is(err, ErrRunRegistryClosed) {
+		t.Fatalf("startDurable() error = %v, want ErrRunRegistryClosed after handoff close", err)
 	}
-	t.Fatal("terminal runs were not evicted after their TTL")
+	select {
+	case <-closed:
+	default:
+		t.Fatal("close hook did not run")
+	}
+	if _, ok := app.runs.get("run-close-handoff"); ok {
+		t.Fatal("closed registry retained the handed-off run")
+	}
 }
 
 func TestRunSettledUsesOneDurableWatermarkWhenCancelledResultIsStale(t *testing.T) {
-	server, service, app := newWebTestAppServerWithRunner(t, blockingWebTestRunner{})
-	_, session := createWebProjectAndSession(t, server)
+	_, service, app := newWebTestAppServerWithRunner(t, blockingWebTestRunner{})
+	_, session := createWebProjectAndSession(t, service)
 	subscription := service.LifecycleHub().Subscribe()
 	defer subscription.Close()
 
@@ -75,7 +113,7 @@ func TestRunSettledUsesOneDurableWatermarkWhenCancelledResultIsStale(t *testing.
 	if err != nil {
 		t.Fatalf("coordinator.Start() error = %v", err)
 	}
-	managed := newManagedRun(run.ID(), session.ID, app.runs.options)
+	managed := newManagedRun(run.ID(), session.ID)
 	managed.run = run
 	app.runs.mu.Lock()
 	app.runs.byID[managed.id] = managed
@@ -121,9 +159,6 @@ func TestRunSettledUsesOneDurableWatermarkWhenCancelledResultIsStale(t *testing.
 		t.Fatalf("stale result LastSeq = %d, final durable LastSeq = %d", result.LastSeq, final.LastSeq)
 	}
 	app.runs.settleRun(run, result, runErr)
-	if !managed.isTerminal() {
-		t.Fatal("managed run is not terminal after settlement")
-	}
 
 	var payload map[string]any
 	deadline = time.Now().Add(5 * time.Second)
@@ -162,31 +197,49 @@ func TestRunRegistryLogsUnderlyingFailure(t *testing.T) {
 		t.Fatalf("NewServiceWithOptions() error = %v", err)
 	}
 
-	var logs strings.Builder
+	var logs synchronizedLogBuffer
 	registry := newRunRegistry(context.Background(), service, &logs)
 	defer registry.Close()
-	managed, err := registry.start("missing-session", "hello")
+	run, err := registry.coordinator.Start("missing-session", execution.SessionMessageInput{Content: "hello"}, nil)
 	if err != nil {
-		t.Fatalf("start() error = %v", err)
+		t.Fatalf("coordinator.Start() error = %v", err)
 	}
-	deadline := time.Now().Add(5 * time.Second)
-	for !managed.isTerminal() && time.Now().Before(deadline) {
-		time.Sleep(5 * time.Millisecond)
-	}
-	if !managed.isTerminal() {
-		t.Fatal("failed run did not become terminal")
+	if _, err := run.Wait(); err == nil {
+		t.Fatal("missing-session run unexpectedly succeeded")
 	}
 
-	got := logs.String()
-	if !strings.Contains(got, "missing-session") || !strings.Contains(got, "session not found") {
-		t.Fatalf("failure log = %q, want session id and underlying error", got)
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		got := logs.String()
+		if strings.Contains(got, "missing-session") && strings.Contains(got, "session not found") {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
+	t.Fatalf("failure log = %q, want session id and underlying error", logs.String())
+}
+
+type synchronizedLogBuffer struct {
+	mu sync.Mutex
+	b  strings.Builder
+}
+
+func (buffer *synchronizedLogBuffer) Write(value []byte) (int, error) {
+	buffer.mu.Lock()
+	defer buffer.mu.Unlock()
+	return buffer.b.Write(value)
+}
+
+func (buffer *synchronizedLogBuffer) String() string {
+	buffer.mu.Lock()
+	defer buffer.mu.Unlock()
+	return buffer.b.String()
 }
 
 func TestRunRegistryAdoptsAgentStartedCoordinatorRun(t *testing.T) {
 	runner := enteredBlockingWebTestRunner{entered: make(chan struct{}), once: &sync.Once{}}
-	server, _, app := newWebTestAppServerWithRunner(t, runner)
-	_, session := createWebProjectAndSession(t, server)
+	_, service, app := newWebTestAppServerWithRunner(t, runner)
+	_, session := createWebProjectAndSession(t, service)
 
 	run, err := app.runs.coordinator.Start(session.ID, execution.SessionMessageInput{Content: "agent-started"}, nil)
 	if err != nil {
@@ -202,29 +255,15 @@ func TestRunRegistryAdoptsAgentStartedCoordinatorRun(t *testing.T) {
 	if !ok || managed.run != run || managed.sessionID != session.ID {
 		t.Fatalf("adopted run = %#v/%t, want coordinator handle", managed, ok)
 	}
-	if managed.isTerminal() || run.Status() != execution.SessionRunRunning {
-		t.Fatalf("adopted run status = managed terminal:%t run:%s, want active", managed.isTerminal(), run.Status())
+	if run.Status() != execution.SessionRunRunning {
+		t.Fatalf("adopted run status = %s, want active", run.Status())
 	}
 
 	run.Cancel()
 	if _, err := run.Wait(); err == nil {
 		t.Fatal("cancelled agent-started run returned nil error")
 	}
-	deadline := time.Now().Add(5 * time.Second)
-	for !managed.isTerminal() && time.Now().Before(deadline) {
-		time.Sleep(5 * time.Millisecond)
+	if run.Status() != execution.SessionRunCancelled {
+		t.Fatalf("adopted run settled status = %s, want cancelled", run.Status())
 	}
-	if !managed.isTerminal() || run.Status() != execution.SessionRunCancelled {
-		t.Fatalf("adopted run settled state = terminal:%t status:%s", managed.isTerminal(), run.Status())
-	}
-}
-
-func registerTerminalRunForTest(registry *runRegistry, id string, finishedAt time.Time) *managedRun {
-	managed := newManagedRun(id, "session-"+id, registry.options)
-	managed.finish(finishedAt.UTC())
-	registry.mu.Lock()
-	registry.byID[managed.id] = managed
-	registry.retainTerminalLocked(managed)
-	registry.mu.Unlock()
-	return managed
 }

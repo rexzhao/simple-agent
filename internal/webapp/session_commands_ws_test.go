@@ -488,7 +488,7 @@ func TestActiveRunControlCommandsUseProcessLocalOwnerAndGatewayCache(t *testing.
 	// The Web adapter can retain a run identity during the short coordinator
 	// admission window before its SessionRun owner is installed. It must report
 	// not_active rather than searching a durable row or claiming the command.
-	inactive := newManagedRun("run-not-active", session.ID, app.runs.options)
+	inactive := newManagedRun("run-not-active", session.ID)
 	app.runs.mu.Lock()
 	app.runs.byID[inactive.id] = inactive
 	app.runs.mu.Unlock()
@@ -928,7 +928,7 @@ func TestRunCancelCommandCancelsActiveRun(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	active := app.runs.activeRuns()
+	active := app.runs.coordinator.ActiveRuns()
 	if len(active) != 1 || active[0].RunID == "" {
 		t.Fatalf("active runs=%#v", active)
 	}

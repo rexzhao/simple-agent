@@ -316,12 +316,12 @@ func TestCodexLoginRejectsUnsafeDeviceCapabilitiesAtEveryBoundary(t *testing.T) 
 
 			response := doJSONRequest(t, http.MethodPost, server.URL+"/api/providers/"+providerName+"/codex-login", map[string]string{})
 			body := readBody(response)
-			if response.StatusCode == http.StatusOK || strings.Contains(body, test.forbidden) || strings.Contains(body, "raw/auth-file") {
+			if response.StatusCode != http.StatusNotFound || strings.Contains(strings.ToLower(response.Header.Get("Content-Type")), "html") || strings.Contains(body, "<html") || strings.Contains(body, test.forbidden) || strings.Contains(body, "raw/auth-file") {
 				t.Fatalf("unsafe REST start status=%d body=%s", response.StatusCode, body)
 			}
 			statusResponse := doJSONRequest(t, http.MethodGet, server.URL+"/api/providers/"+providerName+"/codex-login", nil)
 			statusBody := readBody(statusResponse)
-			if statusResponse.StatusCode != http.StatusOK || strings.Contains(statusBody, test.forbidden) || strings.Contains(statusBody, "raw/auth-file") {
+			if statusResponse.StatusCode != http.StatusNotFound || strings.Contains(strings.ToLower(statusResponse.Header.Get("Content-Type")), "html") || strings.Contains(statusBody, "<html") || strings.Contains(statusBody, test.forbidden) || strings.Contains(statusBody, "raw/auth-file") {
 				t.Fatalf("unsafe REST status status=%d body=%s", statusResponse.StatusCode, statusBody)
 			}
 		})

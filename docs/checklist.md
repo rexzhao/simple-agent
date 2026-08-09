@@ -541,7 +541,7 @@
 ## M24：PromptEvent Input
 
 状态说明：M24 是历史 CLI/mailbox 里程碑。底层 execution runtime 已支持 active run 追加输入；
-M25 删除 mailbox 后，当前公开入口是 Web run prompt API。
+M25 删除 mailbox 后，当前公开入口是 WebSocket typed `run.prompt.*` command。
 
 - [x] 定义 PromptEvent 数据，包含 source、mode、content、关联
   mailbox task id 或 input id。
@@ -561,8 +561,8 @@ M25 删除 mailbox 后，当前公开入口是 Web run prompt API。
 - [x] 删除旧 CLI/TUI/mailbox 产品实现。
 - [x] 增加配置化 session 创建 execution API。
 - [x] 增加 session chat items 前后游标分页。
-- [x] 增加 project/session Web API。
-- [x] 增加 run registry、WebSocket sync integration 和 cancel API。
+- [x] 增加 project/session WebSocket resources/commands。
+- [x] 增加 run registry、WebSocket sync integration 和 typed cancel command。
 - [x] 增加 loopback、capability token、Host/Origin 和 CSP 防护。
 - [x] 实现 React/TypeScript 三栏 UI、流式输出、工具状态和停止操作。
 - [x] Vite 产物通过 `go:embed` 嵌入。
@@ -586,3 +586,17 @@ M25 删除 mailbox 后，当前公开入口是 Web run prompt API。
   provider 管理与 Codex auth 生命周期。
 - [ ] 使用真实构建出的单文件程序和 fake provider 完成发布 smoke。
 - [ ] 发布前通过完整 Go、race、frontend、Playwright、embed freshness 和 diff 检查。
+
+## Stage G / G2：HTTP clean break（已完成）
+
+- [x] 产品 HTTP surface 只保留静态 Web/SPA fallback、`GET /api/bootstrap`、
+  `POST /api/ws-ticket`、`GET /api/ws` upgrade、`GET /api/blobs/{blobID}` 和
+  `GET /api/sessions/{sessionID}/images/{hash}`。
+- [x] Blob/image 的标准 `HEAD` 仅返回受保护的 metadata；没有额外的 product
+  mutation/query route。
+- [x] 项目、Session、Provider/Codex、history/snapshot、run/control/prompt/tool/compact
+  的旧 REST routes、handlers、DTO 和纯 REST 测试已删除；业务行为由 execution/service、
+  durable projector 与 typed WebSocket command/resource 测试覆盖。
+- [x] 精确 `/api`、未知 API 路径和已授权旧 REST endpoint 返回 JSON/non-HTML 404；未授权
+  API 请求保持统一 401。
+- [x] 生产 route allowlist 与 `web/src/api.ts` guard 防止旧 REST product surface 回归。

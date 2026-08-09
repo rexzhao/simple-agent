@@ -1,3 +1,8 @@
+> 历史方案说明：本文记录的旧 Session detail/items/snapshot HTTP 迁移方案已由
+> WebSocket resource/command clean break supersede。文中的旧 REST endpoint、handler、
+> 前端 `api.session`/`api.items` 和 dual-fetch 只用于历史设计背景，不代表当前产品
+> surface；当前 HTTP 仅保留 bootstrap、ticket、upgrade、Blob 和 session image read。
+
 > **Stage 6 completed (HEAD review target).** The settlement state machine now
 > uses `run.settled.committed_revision` (with a legacy `last_seq` fallback) as
 > a precision-safe completeness watermark. A covered settlement tears down

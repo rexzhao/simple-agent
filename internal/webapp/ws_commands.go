@@ -276,7 +276,7 @@ type providerCodexUsageReadResult struct {
 
 // sessionHistoryReadResult is a descriptor boundary, not a second history
 // model. Inline history and blob history both carry the exact SessionItemsPage
-// DTO returned by the existing REST page endpoint.
+// DTO exposed by the typed history command.
 type sessionHistoryReadResult struct {
 	SessionID string                      `json:"session_id"`
 	Cursor    int64                       `json:"cursor"`
@@ -1383,9 +1383,8 @@ func optionalCommandBool(fields map[string]json.RawMessage, name, command string
 
 const maxSessionCreateArgumentBytes = 4096
 
-// run.start is intentionally a bounded text-only clean-break contract. The
-// existing REST endpoint retains its image/data-URL support; WebSocket
-// command frames do not carry blob bytes until a separate blob upload
+// run.start is intentionally a bounded text-only clean-break contract.
+// WebSocket command frames do not carry blob bytes until a separate blob upload
 // contract is specified. Unknown image/blob/content-block fields are rejected
 // rather than silently dropped.
 const maxRunStartContentBytes = 256 * 1024

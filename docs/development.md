@@ -23,7 +23,7 @@ cmd/sai
   default Web launcher
 
 internal/webapp
-  embedded static assets, loopback security, retained JSON API, WebSocket gateway
+  embedded static assets, loopback security, minimal HTTP boundary, WebSocket gateway
 
 internal/execution
   project/session lifecycle, configured session creation, run handles,
@@ -47,41 +47,46 @@ tool/MCP/skill loading, compaction, or storage logic.
 1. The launcher creates a capability token and a loopback listener.
 2. The browser receives the token in the URL fragment, moves it to tab-scoped
    session storage, and sends it as a bearer token.
-3. Project and session management use JSON HTTP endpoints.
-4. Starting a run returns a Web run ID immediately.
-5. The UI obtains a short-lived WebSocket ticket and opens the single ordered
+3. The UI obtains a short-lived WebSocket ticket and opens the single ordered
    sync connection.
-6. Typed session-content events update transient text/reasoning/tool state;
+4. Project, session, provider, history, compaction, and run control operations
+   use typed WebSocket commands/resources. Starting a run returns a command
+   acknowledgement and the ordered resource stream carries its lifecycle.
+5. Typed session-content events update transient text/reasoning/tool state;
    committed item projection events update the canonical session store.
-7. Session Content owns transient replay and durable revision barriers. A
+6. Session Content owns transient replay and durable revision barriers. A
    reconnect uses the WebSocket snapshot/replay contract rather than an HTTP
    run cursor or a second event source.
-8. Cancelling a run calls `SessionRun.Cancel` and interrupts only that run.
+7. Cancelling a run calls `SessionRun.Cancel` through the typed `run.cancel`
+   command and interrupts only that run.
 
 ## Web API
 
-Important routes:
+The product HTTP surface is intentionally a clean break. It contains only
+static assets/SPA fallback and these API routes:
 
 ```text
-GET    /api/bootstrap
-GET    /api/projects
-POST   /api/projects
-GET    /api/projects/{id}/sessions
-POST   /api/projects/{id}/sessions
-GET    /api/sessions/{id}
-GET    /api/sessions/{id}/items?before_seq=&after_seq=&limit=
-POST   /api/sessions/{id}/runs
-GET    /api/runs/active
-DELETE /api/runs/{id}
-POST   /api/sessions/{id}/compact
+GET  /api/bootstrap
+POST /api/ws-ticket
+GET  /api/ws                       (upgrade, one-time ticket)
+GET  /api/blobs/{blobID}
+GET  /api/sessions/{sessionID}/images/{hash}
 ```
 
-The WebSocket subscription contract includes typed `text.delta`,
+The Go `GET` registrations also provide the standard `HEAD` metadata response
+for Blob/image reads; no additional mutation/query route is registered. Blob
+`GET`/`HEAD` behavior is covered by the webapp route tests.
+
+Every other `/api` path, including exact `/api`, returns a JSON 404 and never
+participates in SPA fallback. API requests without the bearer capability remain
+401. The WebSocket subscription contract includes typed `text.delta`,
 `reasoning.delta`, tool lifecycle, prompt-queue, durable item, and settlement
 notifications. Session Content owns the bounded transient replay and
-resynchronization barrier; the durable session item API remains canonical.
-The retained REST routes above are compatibility/application routes, not a
-second live event transport.
+resynchronization barrier; typed resource snapshots and command results are the
+canonical project/session/provider/history/run application surface. The
+standalone WebSocket ticket and Blob clients are separate from
+`web/src/api.ts`; that ordinary API module contains only bootstrap and session
+image reads.
 
 ## Security
 

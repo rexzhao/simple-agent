@@ -1,5 +1,9 @@
 # Web 会话数据层彻底重构计划
 
+> 历史方案：本文的 Session detail/items/snapshot HTTP 设计已由 Stage G2 的
+> WebSocket resource/command clean break supersede。旧 endpoint 仅保留作设计背景，
+> 当前 HTTP surface 仅包含 bootstrap、ticket、upgrade、Blob 与 session image read。
+
 ## 目标
 
 建立一条唯一、可验证的会话数据链路：后端返回同一逻辑快照，前端按 session identity 和单调版本归并，React/DOM 仅消费状态而不充当业务数据源。

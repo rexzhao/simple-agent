@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"net/http"
 	"strings"
 	"sync"
 	"testing"
@@ -51,7 +50,7 @@ func (r *blockingTransientWebTestRunner) RunSessionTurn(ctx context.Context, req
 
 func TestSessionContentWebSocketTransientExecutionResumeAndSettlement(t *testing.T) {
 	runner := &blockingTransientWebTestRunner{started: make(chan struct{}), release: make(chan struct{})}
-	server, service, _ := newWebTestAppServerWithRunner(t, runner)
+	server, service, app := newWebTestAppServerWithRunner(t, runner)
 	project, err := service.CreateProject(t.TempDir(), "Transient content")
 	if err != nil {
 		t.Fatal(err)
@@ -79,15 +78,12 @@ func TestSessionContentWebSocketTransientExecutionResumeAndSettlement(t *testing
 		t.Fatal("snapshot missing")
 	}
 
-	response := doJSONRequest(t, http.MethodPost, server.URL+"/api/sessions/"+session.ID+"/runs", map[string]string{"content": "start"})
-	if response.StatusCode != http.StatusAccepted {
-		t.Fatalf("start run status = %d, body = %s", response.StatusCode, readBody(response))
+	run, err := app.runs.coordinator.Start(session.ID, execution.SessionMessageInput{Content: "start"}, nil)
+	if err != nil {
+		t.Fatalf("start run error = %v", err)
 	}
-	var accepted struct {
-		RunID string `json:"run_id"`
-	}
-	decodeResponse(t, response, &accepted)
-	if accepted.RunID == "" {
+	acceptedRunID := run.ID()
+	if acceptedRunID == "" {
 		t.Fatal("accepted run has no id")
 	}
 
@@ -103,7 +99,7 @@ func TestSessionContentWebSocketTransientExecutionResumeAndSettlement(t *testing
 			if decodeErr != nil {
 				t.Fatalf("live subscription event decode: %v", decodeErr)
 			}
-			if decoded.RunID != accepted.RunID || typed.Payload.Resource.ID != session.ID {
+			if decoded.RunID != acceptedRunID || typed.Payload.Resource.ID != session.ID {
 				t.Fatalf("live event identity = %#v/%#v", decoded, typed.Payload.Resource)
 			}
 			switch decoded.Type {
@@ -123,7 +119,7 @@ func TestSessionContentWebSocketTransientExecutionResumeAndSettlement(t *testing
 				if err := json.Unmarshal(operation.Raw, &body); err != nil {
 					t.Fatal(err)
 				}
-				if body.ActiveRun != nil && body.ActiveRun.RunID == accepted.RunID {
+				if body.ActiveRun != nil && body.ActiveRun.RunID == acceptedRunID {
 					activeDescriptor = *body.ActiveRun
 					gotActive = true
 				}
@@ -157,7 +153,7 @@ func TestSessionContentWebSocketTransientExecutionResumeAndSettlement(t *testing
 	}
 	writeContentSubscribeWithRunResume(t, second, session.ID, &protocol.ResumeToken{
 		StreamEpoch: subscribed.Payload.StreamEpoch, Sequence: snapshot.Payload.Sequence,
-	}, &protocol.RunResumeToken{RunEpoch: activeDescriptor.RunEpoch, RunID: accepted.RunID, RunCursor: "1"})
+	}, &protocol.RunResumeToken{RunEpoch: activeDescriptor.RunEpoch, RunID: acceptedRunID, RunCursor: "1"})
 	if _, ok := readWebAppMessage(t, second).(protocol.SubscribedMessage); !ok {
 		t.Fatal("second subscribed missing")
 	}
@@ -191,7 +187,7 @@ func TestSessionContentWebSocketTransientExecutionResumeAndSettlement(t *testing
 			}
 		}
 	}
-	if replayed.RunID != accepted.RunID || replayed.RunCursor != "2" || replayed.ItemID != "assistant-live" {
+	if replayed.RunID != acceptedRunID || replayed.RunCursor != "2" || replayed.ItemID != "assistant-live" {
 		detail, detailErr := service.GetSession(session.ID)
 		t.Fatalf("replayed transient event = %#v, want run cursor 2; messages=%v durable=%#v durable_err=%v", replayed, reconnectKinds, detail, detailErr)
 	}
@@ -204,7 +200,7 @@ func TestSessionContentWebSocketTransientExecutionResumeAndSettlement(t *testing
 	}
 	writeContentSubscribeWithRunResume(t, wrongEpoch, session.ID, &protocol.ResumeToken{
 		StreamEpoch: subscribed.Payload.StreamEpoch, Sequence: snapshot.Payload.Sequence,
-	}, &protocol.RunResumeToken{RunEpoch: "wrong-epoch", RunID: accepted.RunID, RunCursor: "1"})
+	}, &protocol.RunResumeToken{RunEpoch: "wrong-epoch", RunID: acceptedRunID, RunCursor: "1"})
 	if _, ok := readWebAppMessage(t, wrongEpoch).(protocol.SubscribedMessage); !ok {
 		t.Fatal("wrong-epoch subscribed missing")
 	}
@@ -256,7 +252,7 @@ func TestSessionContentWebSocketTransientExecutionResumeAndSettlement(t *testing
 			}
 		}
 	}
-	if settled.RunID != accepted.RunID || settled.RunCursor != "3" || settled.Settlement == nil {
+	if settled.RunID != acceptedRunID || settled.RunCursor != "3" || settled.Settlement == nil {
 		t.Fatalf("settlement event = %#v, want cursor 3 and watermark", settled)
 	}
 	if settled.Settlement.RunCursor != "2" || settled.Settlement.ResourceRevision == "" {
@@ -333,7 +329,7 @@ func (isolatedTransientWebTestRunner) RunSessionTurn(_ context.Context, request 
 }
 
 func TestSessionContentWebSocketDoesNotFanoutUnsubscribedRun(t *testing.T) {
-	server, service, _ := newWebTestAppServerWithRunner(t, isolatedTransientWebTestRunner{})
+	server, service, app := newWebTestAppServerWithRunner(t, isolatedTransientWebTestRunner{})
 	project, err := service.CreateProject(t.TempDir(), "Transient isolation")
 	if err != nil {
 		t.Fatal(err)
@@ -364,12 +360,9 @@ func TestSessionContentWebSocketDoesNotFanoutUnsubscribedRun(t *testing.T) {
 		t.Fatal("A snapshot missing")
 	}
 
-	response := doJSONRequest(t, http.MethodPost, server.URL+"/api/sessions/"+sessionB+"/runs", map[string]string{"content": "run B"})
-	if response.StatusCode != http.StatusAccepted {
-		t.Fatalf("B run status = %d, body = %s", response.StatusCode, readBody(response))
+	if _, err := app.runs.coordinator.Start(sessionB, execution.SessionMessageInput{Content: "run B"}, nil); err != nil {
+		t.Fatalf("B run error = %v", err)
 	}
-	_ = readBody(response)
-	// B has no owner/subscriber. Its execution event is accepted by the
 	// shared coordinator but must not be encoded or delivered to A.
 	assertWebSocketNoMessage(t, connection, 250*time.Millisecond)
 }

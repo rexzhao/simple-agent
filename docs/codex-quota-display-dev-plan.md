@@ -1,5 +1,9 @@
 # Codex 额度显示 — 开发计划
 
+> 历史方案说明：本文早期的 HTTP route/handler 示例已被 Stage G2
+> supersede。当前 Codex usage 通过 typed WebSocket `provider.codex_usage.read`
+> command/resource 提供；`web/src/api.ts` 不再包含 provider HTTP client。
+
 > 起因：需要展示当前 Codex 登录账号的额度 / 用量信息。最初设想是"auth 额外记录
 > `chatgpt_account_id` 给额度查询预留"。经实测确认：额度接口 `wham/usage` **只带
 > Bearer 即可返回 200**，不强制 `ChatGPT-Account-Id`；而 `chatgpt_account_id` 是

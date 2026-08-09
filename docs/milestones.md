@@ -980,7 +980,8 @@ MCP 向当前 session 投递 queued prompt，同时不恢复 HTTP/WS 产品层�
 ## M24：PromptEvent Input
 
 状态说明：M24 是历史 CLI/mailbox 里程碑。`enqueue_turn` 和底层 execution `append_active`
-均已实现；M25 删除 mailbox CLI 后，当前产品通过 Web run prompt API 使用追加输入能力。
+均已实现；M25 删除 mailbox CLI 后，当前产品通过 WebSocket typed `run.prompt.*`
+command 使用追加输入能力。
 
 目标：在不恢复 HTTP layer、不改变 execution library 边界的前提下，把 stdin 和 mailbox
 输入统一为 PromptEvent。

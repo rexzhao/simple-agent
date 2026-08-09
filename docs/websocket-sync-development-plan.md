@@ -14,7 +14,7 @@
    - `resource_revision`：资源本身版本和乐观并发；
    - `run_cursor`：Run 瞬时事件恢复。
 5. **不在 `App.tsx` 或页面组件内继续堆叠事件归并和订阅逻辑。**重建 transport、Sync Runtime、Local Replica、Repository 和 command facade；页面只读取领域 selector。
-6. **不保留 REST mutation 作为正式路径。**项目、Session、Run、Provider 操作统一走 WebSocket command；HTTP 只保留静态资源、bootstrap、WS ticket、Blob 和确有必要的外部认证回调。
+6. **不保留 REST mutation 作为正式路径。**项目、Session、Run、Provider 操作统一走 WebSocket command；HTTP 只保留静态资源、bootstrap、WS ticket、Blob 和 session image read。
 7. **不按现有 endpoint 逐个翻译命令。**先定义 application command registry，再让 UI 和业务服务依赖该 registry，避免 HTTP handler 结构进入新架构。
 8. **大数据边界提前进入协议。**所有 snapshot/result 都必须在序列化前判断 inline/Blob，不能等到后期再改消息结构。
 9. **重连不盲目重发所有命令。**同一 server epoch 内按 `request_id` 幂等重发；epoch 改变后先重建订阅并对账，只有声明为跨 epoch 安全的命令才自动重试。
@@ -310,7 +310,7 @@ GET  /api/bootstrap
 POST /api/ws-ticket
 GET  /api/ws?ticket=...
 GET  /api/blobs/{blobID}
-HEAD /api/blobs/{blobID}
+GET  /api/sessions/{sessionID}/images/{hash}
 ```
 
 浏览器先用当前 Bearer capability 调用 `/api/ws-ticket`，再使用 30 秒有效、一次性 ticket Upgrade。不能把长期 capability token 放在 WS URL 中。
@@ -711,7 +711,7 @@ Application command
 
 `provider_settings/server` 使用与 ProjectIndex、SessionIndex、SessionContent 相同的
 owner/barrier/journal/live subscription 实现。snapshot 的 authority 是 `config.Load` 读取的
-当前 durable config/provider files；HTTP provider 配置写入成功后，execution 只发布不含配置
+当前 durable config/provider files；typed provider command 配置写入成功后，execution 只发布不含配置
 正文的 typed committed identity，provider 在自己的 owner 中重新加载 authority。未来
 `provider.create/update/set_default/discover_models` command 也必须经过这个 publication
 boundary，本阶段不注册 command。
@@ -985,7 +985,7 @@ sessionRepository.observe(sessionID, listener)
 
 Provider settings 同样采用独立 `ProviderSettingsAdapter`、Store 和 Repository。页面只看
 provider/model/default 的领域数据和 `availability`，不接触 subscription ID、sequence、raw
-wire DTO 或 Blob metadata；本阶段不把 App/旧 Provider HTTP UI 切到该 repository。
+wire DTO 或 Blob metadata；Provider 页面通过 typed command/resource 访问该 repository。
 
 ### 8.11 Command facade 与状态更新
 
@@ -1016,12 +1016,17 @@ GET  /api/bootstrap            版本和启动所需最小信息
 POST /api/ws-ticket            WebSocket 一次性 ticket
 GET  /api/ws                   WebSocket upgrade
 GET  /api/blobs/{blobID}       Blob read
-HEAD /api/blobs/{blobID}       Blob metadata
-PUT/POST blob upload endpoints 仅在大型上传需求出现时增加
-外部 provider auth callback     仅协议无法替代的浏览器跳转回调
+GET  /api/sessions/{sessionID}/images/{hash}  session image read
 ```
 
-原项目、Session、Run mutation REST 路由全部删除。普通状态查询通过 resource snapshot；一次性分页/发现请求通过 command result，过大时返回 Blob descriptor。
+Go's method-aware `GET` registrations intentionally retain the standard
+`HEAD` metadata response for these read boundaries; this is not a separate
+product mutation/query surface and is covered by route tests.
+
+原项目、Session、Provider/Codex、history/snapshot、Run/control/prompt/tool/compact
+REST 路由全部删除。普通状态查询通过 resource snapshot；一次性分页/发现请求通过
+command result，过大时返回 Blob descriptor。精确 `/api` 和未知 API path 返回 JSON
+404，未授权 API 请求仍返回 401；这些 API path 不得进入 SPA fallback。
 
 Blob 要求：
 
@@ -1137,7 +1142,8 @@ codex_login.start/clear
   而不是把 resource revision 暴露给页面或在浏览器重演 Go URL canonicalization；retry fingerprint
   必须区分 preserve/replace。
 - 错误、loading、resync、offline UI 统一；
-- 清理旧 `api.ts` 中除 bootstrap/ticket/blob 外的路径。
+- 清理旧 `api.ts` 中除 bootstrap/session image 外的路径；ticket 与 Blob client
+  保持独立边界。
 
 #### F7：剩余普通只读查询 typed command cutover（已完成）
 
@@ -1150,10 +1156,10 @@ codex_login.start/clear
   Blob descriptor/payload 校验，小结果 inline，超过 inline boundary 的结果复用现有
   Blob store。页面 domain facade 不感知传输细节，并保留取消、重连和跨 epoch 语义。
 - 前端 `web/src/api.ts` 的普通产品 HTTP 表面只保留 bootstrap 与 session image；
-  独立的 WebSocket ticket/Blob client 边界仍按既有模式保留。旧 Go HTTP
-  routes/handlers 本阶段不删除，留待 Stage G；本项也不包含 `web.eval`。
+  独立的 WebSocket ticket/Blob client 边界仍按既有模式保留；本项也不包含
+  `web.eval`。
 
-### 阶段 G：删除旧系统并 cutover（进行中）
+### 阶段 G：删除旧系统并 cutover（已完成）
 
 #### G1：彻底删除 legacy SSE transport（已完成）
 
@@ -1164,18 +1170,27 @@ codex_login.start/clear
   `SessionRunEventObserver`。Project Index、Session Index、Session Content 与 run
   control 继续使用这些 transport-neutral authority；Session Content 自己持有
   WebSocket transient replay，而不是由 Webapp run registry 复制一份。
-- 保留所有其他旧 REST mutation/query handlers/routes；它们属于 G2，不在 G1 删除。
+- G1 之后的 G2 已删除其余旧 REST mutation/query surface；HTTP clean-break
+  allowlist 见第 9 节。
 - 增加生产 Webapp transport guard 与 route-level regression tests，防止 legacy SSE route、
   writer 或 `text/event-stream` 回归；bootstrap、WebSocket ticket/connection、Blob/image
   路径继续由各自的既有测试覆盖。
 - clean-break guard 同时扫描生产前端、Playwright E2E fixtures 和 embedded browser assets，
-  防止旧 endpoint、SSE framing 或 `EventSource` fixture 重新出现；这只表示 G1 完成，
-  不表示整个 Stage G 完成。
+  防止旧 endpoint、SSE framing 或 `EventSource` fixture 重新出现；HTTP route allowlist
+  另外锁定 Go registrations 与普通 `api.ts` surface。
 
-#### G2：删除其余旧 REST mutation/query surface（未开始）
+#### G2：删除其余旧 REST mutation/query surface（已完成）
 
-后续才处理旧 REST mutation/query handlers/routes、对应 DTO 和仅服务这些 routes 的测试，
-并完成剩余 clean-break 验收。G1 不代表 Stage G 或整个 WebSocket cutover 已完成。
+- 项目、Session、Provider/Codex、history/snapshot、run/control/prompt/tool/compact
+  的旧 REST routes、handlers、HTTP DTO/decode/query helpers 和纯 REST 测试已删除。
+- `runRegistry` 仍保留 coordinator admission、execution lifecycle、active control、
+  typed `run.*` command authority；删除的是 active-run REST snapshot/list 与 terminal
+  retention compatibility state。Provider/Codex registry、durable project/session
+  projector、Blob/image read、bootstrap、ticket/gateway 均保持。
+- 已授权旧 endpoint、精确 `/api` 与未知 API path 返回 JSON/non-HTML 404；未授权 API
+  仍统一 401。生产 route allowlist 和前端引用 guard、route-level tests 已加入。
+- G2 验收包含 backend/race、web unit/check/build、完整 Playwright、architecture guard
+  和 diff check；后续 `web.eval` 仍是独立调试任务，不在本阶段标记完成。
 
 保留 domain service、durable Session projector、item identity 和已经验证的业务规则；删除的是 transport/sync 结构，不是重写 Agent 执行语义。
 

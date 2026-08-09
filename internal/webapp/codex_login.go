@@ -11,8 +11,8 @@ import (
 )
 
 // codexLoginRegistry is the execution-owned lifecycle coordinator used by
-// both the legacy REST adapter and the typed command adapter. The sync
-// resource only receives identifier-only publications and reads the safe
+// the typed command adapter. The sync resource only receives identifier-only
+// publications and reads the safe
 // status projection through status; it never owns or copies the login state
 // machine or token.
 type codexLoginRegistry struct {
