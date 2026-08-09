@@ -152,6 +152,9 @@ func TestDurablePromptAppendIsAtMostOnceAndOnlyActiveTarget(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	observer := newPromptQueueObserver()
+	unregister := app.runs.coordinator.RegisterRunEventObserver(observer)
+	t.Cleanup(unregister)
 	startDone := make(chan error, 1)
 	go func() {
 		_, startErr := app.runs.startDurable(session.ID, "initial", "run-prompt-append", "prompt-start-fingerprint")
@@ -210,41 +213,19 @@ func TestDurablePromptAppendIsAtMostOnceAndOnlyActiveTarget(t *testing.T) {
 		t.Fatalf("append claim=%#v err=%v, want applied", claim, err)
 	}
 
-	// The queue event is produced by the existing coordinator stream, not by
-	// the command result. Read that authority directly from the managed replay
-	// buffer without using a sleep-based concurrency gate.
-	managed, ok := app.runs.get("run-prompt-append")
-	if !ok {
-		t.Fatal("managed run missing")
+	// The command's publication is the transport-neutral authority observed by
+	// the same coordinator event source used by Session Content. This keeps the
+	// test on the public execution observation seam without exposing a queue
+	// snapshot API from production execution types.
+	queued := waitForPromptContent(t, observer, "run-prompt-append", "  queued exact  ")
+	queuedMatches := 0
+	for _, prompt := range queued {
+		if prompt.Content == "  queued exact  " {
+			queuedMatches++
+		}
 	}
-	deadline := time.NewTimer(5 * time.Second)
-	defer deadline.Stop()
-	for {
-		events, _, _, _, changed := managed.snapshot(0)
-		found := false
-		for _, event := range events {
-			var payload struct {
-				Type    string `json:"type"`
-				Prompts []struct {
-					Content string `json:"content"`
-				} `json:"prompts"`
-			}
-			if json.Unmarshal(event.Payload, &payload) == nil && payload.Type == "run.prompt_queue" {
-				for _, prompt := range payload.Prompts {
-					if prompt.Content == "  queued exact  " {
-						found = true
-					}
-				}
-			}
-		}
-		if found {
-			break
-		}
-		select {
-		case <-changed:
-		case <-deadline.C:
-			t.Fatal("authoritative prompt queue event was not observed")
-		}
+	if queuedMatches != 1 {
+		t.Fatalf("prompt queue publication = %#v, want one appended prompt", queued)
 	}
 
 	// Reusing the operation ID for different content or a different run is a
@@ -269,6 +250,10 @@ func TestDurablePromptAppendIsAtMostOnceAndOnlyActiveTarget(t *testing.T) {
 	}
 	if _, err := service.AppendPromptDurable(context.Background(), other.ID, "run-prompt-append-other", "operation-prompt-append", "  queued exact  "); !errors.Is(err, sessions.ErrIdempotencyConflict) {
 		t.Fatalf("cross-run operation collision=%v, want idempotency conflict", err)
+	}
+	managed, ok := app.runs.get("run-prompt-append")
+	if !ok {
+		t.Fatal("managed run missing")
 	}
 	close(runner.release)
 	managedOther, ok := app.runs.get("run-prompt-append-other")
@@ -297,6 +282,9 @@ func TestDurablePromptAppendCommandCacheAndNewRequestRetry(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	observer := newPromptQueueObserver()
+	unregister := app.runs.coordinator.RegisterRunEventObserver(observer)
+	t.Cleanup(unregister)
 	startDone := make(chan error, 1)
 	go func() {
 		_, startErr := app.runs.startDurable(session.ID, "initial", "run-prompt-gateway", "prompt-gateway-start")
@@ -378,30 +366,13 @@ func TestDurablePromptAppendCommandCacheAndNewRequestRetry(t *testing.T) {
 		t.Fatalf("gateway append claim=%#v err=%v", claim, err)
 	}
 
+	queued := waitForPromptQueue(t, observer, "run-prompt-gateway", 1)
+	if queued[0].Content != "  gateway exact  " {
+		t.Fatalf("prompt queue publication = %#v, want one exact prompt", queued)
+	}
 	managed, ok := app.runs.get("run-prompt-gateway")
 	if !ok {
 		t.Fatal("gateway managed run missing")
-	}
-	events, _, _, _, _ := managed.snapshot(0)
-	queueOccurrences := 0
-	for _, event := range events {
-		var payload struct {
-			Type    string `json:"type"`
-			Prompts []struct {
-				Content string `json:"content"`
-			} `json:"prompts"`
-		}
-		if json.Unmarshal(event.Payload, &payload) != nil || payload.Type != "run.prompt_queue" {
-			continue
-		}
-		for _, prompt := range payload.Prompts {
-			if prompt.Content == "  gateway exact  " {
-				queueOccurrences++
-			}
-		}
-	}
-	if queueOccurrences != 1 {
-		t.Fatalf("authoritative queue occurrences=%d, want one", queueOccurrences)
 	}
 	close(runner.release)
 	if _, err := managed.run.Wait(); err != nil && !errors.Is(err, context.Canceled) {
@@ -424,6 +395,9 @@ func TestActiveRunControlCommandsUseProcessLocalOwnerAndGatewayCache(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
+	observer := newPromptQueueObserver()
+	unregister := app.runs.coordinator.RegisterRunEventObserver(observer)
+	t.Cleanup(unregister)
 
 	startDone := make(chan error, 1)
 	go func() {
@@ -566,29 +540,20 @@ func TestActiveRunControlCommandsUseProcessLocalOwnerAndGatewayCache(t *testing.
 	// plain priority group.
 	expectSucceeded(send("run.prompt.move", "move-cache", "move-request", moveArguments), false)
 
-	type queuePrompt struct {
-		ID    string `json:"id"`
-		Steer bool   `json:"steer"`
-	}
-	type queueEvent struct {
-		Type    string        `json:"type"`
-		Prompts []queuePrompt `json:"prompts"`
-	}
 	waitForQueue := func(wantIDs []string, steerID string) {
 		t.Helper()
 		want := strings.Join(wantIDs, ",")
-		deadline := time.NewTimer(5 * time.Second)
-		defer deadline.Stop()
-		for {
-			events, _, _, _, changed := managed.snapshot(0)
-			for _, event := range events {
-				var payload queueEvent
-				if json.Unmarshal(event.Payload, &payload) != nil || payload.Type != "run.prompt_queue" {
+		deadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) {
+			select {
+			case observation := <-observer.events:
+				if observation.runID != "run-control" || observation.event["type"] != "run.prompt_queue" {
 					continue
 				}
-				ids := make([]string, 0, len(payload.Prompts))
+				prompts := promptQueueFromEvent(observation.event)
+				ids := make([]string, 0, len(prompts))
 				steer := false
-				for _, prompt := range payload.Prompts {
+				for _, prompt := range prompts {
 					ids = append(ids, prompt.ID)
 					if prompt.ID == steerID {
 						steer = prompt.Steer
@@ -597,16 +562,14 @@ func TestActiveRunControlCommandsUseProcessLocalOwnerAndGatewayCache(t *testing.
 				if strings.Join(ids, ",") == want && (steerID == "" || steer) {
 					return
 				}
+			default:
 			}
-			select {
-			case <-changed:
-			case <-deadline.C:
-				t.Fatalf("authoritative queue snapshot %q was not observed", want)
-			}
+			time.Sleep(10 * time.Millisecond)
 		}
+		t.Fatalf("authoritative queue %q was not observed", want)
 	}
-	// This snapshot is emitted by SessionRun's queue owner; no command result
-	// or Web adapter replica is used to synthesize the queue ordering.
+	// The execution SessionRun remains the queue owner; no command result or
+	// Web adapter replica is used to synthesize the queue ordering.
 	waitForQueue([]string{"ap-2", "ap-4", "ap-3"}, "ap-2")
 	noMove := send("run.prompt.move", "move-clamped", "move-clamped-request", map[string]any{
 		"session_id": session.ID, "run_id": "run-control", "prompt_id": "ap-3", "delta": 64,

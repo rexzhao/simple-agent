@@ -2,6 +2,7 @@ package protocol
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 )
 
@@ -53,6 +54,38 @@ func TestSubscriptionEventMarshalRejectsVariantFieldsAndNilWatermarkItems(t *tes
 			CoveredItems: []TransientItemWatermark{{TurnID: "turn-1", AgentIteration: 1, ItemID: "item-1", RunCursor: "2"}},
 		}}); err == nil {
 		t.Fatal("settlement with a covered cursor after the watermark was marshaled")
+	}
+}
+
+func TestTurnFailedEventIsTypedAndBounded(t *testing.T) {
+	event := TransientSubscriptionEvent{
+		Type: SubscriptionEventTurnFailed, SessionID: "session-1", RunID: "run-1", RunCursor: "4",
+		TurnID: "turn-1", Code: "model_http_error", Message: "429: slow down and try again",
+	}
+	encoded, err := json.Marshal(event)
+	if err != nil {
+		t.Fatalf("marshal turn.failed: %v", err)
+	}
+	decoded, err := DecodeSubscriptionEvent(encoded)
+	if err != nil {
+		t.Fatalf("decode turn.failed: %v", err)
+	}
+	if decoded.Type != SubscriptionEventTurnFailed || decoded.Code != event.Code || decoded.Message != event.Message {
+		t.Fatalf("decoded turn.failed = %#v", decoded)
+	}
+	event.Message = strings.Repeat("🦄", MaxTransientFailureMessageRunes)
+	if _, err := json.Marshal(event); err != nil {
+		t.Fatalf("600-rune turn.failed message rejected: %v", err)
+	}
+	event.Message = strings.Repeat("🦄", MaxTransientFailureMessageRunes+1)
+	if _, err := json.Marshal(event); err == nil {
+		t.Fatal("601-rune turn.failed message was accepted")
+	}
+	if err := ValidateSubscriptionEvent(json.RawMessage(`{"type":"turn.failed","session_id":"session-1","run_id":"run-1","run_cursor":"4","turn_id":"turn-1","code":"provider_error","message":"` + strings.Repeat("x", MaxTransientFailureMessageRunes+1) + `"}`)); err == nil {
+		t.Fatal("oversized turn.failed message was accepted")
+	}
+	if err := ValidateSubscriptionEvent(json.RawMessage(`{"type":"text.delta","session_id":"session-1","run_id":"run-1","run_cursor":"4","turn_id":"turn-1","agent_iteration":1,"item_id":"item-1","delta":"ok","code":"provider_error"}`)); err == nil {
+		t.Fatal("turn.failed-only code field was accepted on text.delta")
 	}
 }
 

@@ -9,9 +9,9 @@ import (
 	"github.com/rexzhao/simple-agent/internal/protocol"
 )
 
-// subscriptionEventFromExecution is the only WebSocket event mapping. SSE
-// keeps its existing names and renderer; this mapper translates the shared
-// transport-neutral execution vocabulary into the strict D2 union.
+// subscriptionEventFromExecution is the only WebSocket event mapping. It
+// translates the shared execution vocabulary into the strict subscription
+// union.
 func subscriptionEventFromExecution(source execution.SessionStreamEvent, sessionID, runID string) (protocol.TransientSubscriptionEvent, bool, error) {
 	if source == nil {
 		return protocol.TransientSubscriptionEvent{}, false, nil
@@ -82,6 +82,13 @@ func subscriptionEventFromExecution(source execution.SessionStreamEvent, session
 		} else if err := json.Unmarshal(raw, &event.AppendedPrompts); err != nil {
 			return protocol.TransientSubscriptionEvent{}, false, fmt.Errorf("appended prompt list is invalid: %w", err)
 		}
+	case "turn.failed":
+		event.Type = protocol.SubscriptionEventTurnFailed
+		event.Code = stringValue(source, "code")
+		event.Message = stringValue(source, "message")
+		if event.TurnID == "" || event.Code == "" || event.Message == "" {
+			return protocol.TransientSubscriptionEvent{}, false, fmt.Errorf("turn failure lacks bounded diagnostic identity")
+		}
 	default:
 		// usage, provider retry, compaction and durable projection notices are
 		// intentionally not transient session-content events in D2. The durable
@@ -93,7 +100,7 @@ func subscriptionEventFromExecution(source execution.SessionStreamEvent, session
 
 // isTransientExecutionEvent is intentionally only a vocabulary check. It is
 // used on the producer's no-subscriber path so durable projection notices
-// (item.created, active_history.replaced, usage, and similar SSE events) do
+// (item.created, active_history.replaced, usage, and similar events) do
 // not manufacture a transient gap. A recognized but malformed transient
 // event still counts as a loss and is handled by the owner as recovery
 // required; silently ignoring it would claim a cursor continuity that was
@@ -107,7 +114,7 @@ func isTransientExecutionEvent(source execution.SessionStreamEvent) bool {
 		return false
 	}
 	switch typeName {
-	case "text.delta", "reasoning.delta", "tool.requested", "tool.started", "tool.running", "tool.progress", "tool.finished", "run.prompt_queue", "run.prompt_appended":
+	case "text.delta", "reasoning.delta", "tool.requested", "tool.started", "tool.running", "tool.progress", "tool.finished", "run.prompt_queue", "run.prompt_appended", "turn.failed":
 		return true
 	}
 	return false

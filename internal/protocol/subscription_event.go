@@ -10,8 +10,8 @@ import (
 )
 
 // SubscriptionEventType is the closed set of transient session-content event
-// types. These are deliberately not the SSE event vocabulary: the execution
-// source is shared, while this is the typed WebSocket projection.
+// types sent over WebSocket. The execution source is shared, while this is the
+// typed subscription projection.
 type SubscriptionEventType string
 
 const (
@@ -24,8 +24,11 @@ const (
 	SubscriptionEventPromptQueue    SubscriptionEventType = "run.prompt_queue"
 	SubscriptionEventPromptAppended SubscriptionEventType = "run.prompt_appended"
 	SubscriptionEventRunStarted     SubscriptionEventType = "run.started"
+	SubscriptionEventTurnFailed     SubscriptionEventType = "turn.failed"
 	SubscriptionEventRunSettled     SubscriptionEventType = "run.settled"
 )
+
+const MaxTransientFailureMessageRunes = 600
 
 type PromptQueueEntry struct {
 	ID      string `json:"id"`
@@ -77,6 +80,8 @@ type TransientSubscriptionEvent struct {
 	Prompts         []PromptQueueEntry          `json:"-"`
 	AppendedPrompts []string                    `json:"-"`
 	Status          string                      `json:"status,omitempty"`
+	Code            string                      `json:"code,omitempty"`
+	Message         string                      `json:"message,omitempty"`
 	Settlement      *DurableSettlementWatermark `json:"durable_settlement_watermark,omitempty"`
 }
 
@@ -124,6 +129,8 @@ func (e TransientSubscriptionEvent) MarshalJSON() ([]byte, error) {
 		fields["prompts"] = e.AppendedPrompts
 	case SubscriptionEventRunStarted:
 		fields["status"] = e.Status
+	case SubscriptionEventTurnFailed:
+		fields["code"], fields["message"] = e.Code, e.Message
 	case SubscriptionEventRunSettled:
 		fields["status"], fields["durable_settlement_watermark"] = e.Status, e.Settlement
 	}
@@ -223,10 +230,16 @@ func (e TransientSubscriptionEvent) Validate() error {
 	if err := reject("status", e.Status != ""); err != nil && e.Type != SubscriptionEventRunStarted && e.Type != SubscriptionEventRunSettled {
 		return err
 	}
+	if err := reject("code", e.Code != ""); err != nil && e.Type != SubscriptionEventTurnFailed {
+		return err
+	}
+	if err := reject("message", e.Message != ""); err != nil && e.Type != SubscriptionEventTurnFailed {
+		return err
+	}
 	if err := reject("durable_settlement_watermark", e.Settlement != nil); err != nil && e.Type != SubscriptionEventRunSettled {
 		return err
 	}
-	if e.Type != SubscriptionEventRunStarted && e.Type != SubscriptionEventRunSettled && e.TurnID == "" && e.Type != SubscriptionEventPromptQueue && e.Type != SubscriptionEventPromptAppended {
+	if e.Type != SubscriptionEventRunStarted && e.Type != SubscriptionEventTurnFailed && e.Type != SubscriptionEventRunSettled && e.TurnID == "" && e.Type != SubscriptionEventPromptQueue && e.Type != SubscriptionEventPromptAppended {
 		return fmt.Errorf("turn_id is required for %q", e.Type)
 	}
 	switch e.Type {
@@ -298,6 +311,19 @@ func (e TransientSubscriptionEvent) Validate() error {
 	case SubscriptionEventRunStarted:
 		if e.Status != "running" {
 			return fmt.Errorf("run.started status must be running")
+		}
+	case SubscriptionEventTurnFailed:
+		if err := requiredEventID("turn_id", e.TurnID); err != nil {
+			return err
+		}
+		if err := requiredEventID("code", e.Code); err != nil {
+			return err
+		}
+		if err := requiredEventText("message", e.Message); err != nil {
+			return err
+		}
+		if utf8.RuneCountInString(e.Message) > MaxTransientFailureMessageRunes {
+			return fmt.Errorf("message exceeds %d runes", MaxTransientFailureMessageRunes)
 		}
 	case SubscriptionEventRunSettled:
 		if e.Status != "committed" && e.Status != "failed" && e.Status != "interrupted" && e.Status != "cancelled" {
@@ -464,6 +490,12 @@ func decodeSubscriptionEvent(data []byte) (TransientSubscriptionEvent, error) {
 	if err := optionalString("status", &event.Status); err != nil {
 		return TransientSubscriptionEvent{}, err
 	}
+	if err := optionalString("code", &event.Code); err != nil {
+		return TransientSubscriptionEvent{}, err
+	}
+	if err := optionalString("message", &event.Message); err != nil {
+		return TransientSubscriptionEvent{}, err
+	}
 	if raw, ok := fields["prompts"]; ok {
 		if event.Type == SubscriptionEventPromptAppended {
 			if err := json.Unmarshal(raw, &event.AppendedPrompts); err != nil {
@@ -606,6 +638,9 @@ func rejectUnknownEventFields(eventType SubscriptionEventType, fields map[string
 		allowed["prompts"] = struct{}{}
 	case SubscriptionEventRunStarted:
 		allowed["status"] = struct{}{}
+	case SubscriptionEventTurnFailed:
+		allowed["code"] = struct{}{}
+		allowed["message"] = struct{}{}
 	case SubscriptionEventRunSettled:
 		allowed["status"] = struct{}{}
 		allowed["durable_settlement_watermark"] = struct{}{}
@@ -622,7 +657,7 @@ func rejectUnknownEventFields(eventType SubscriptionEventType, fields map[string
 
 func knownSubscriptionEventType(eventType SubscriptionEventType) bool {
 	switch eventType {
-	case SubscriptionEventTextDelta, SubscriptionEventReasoningDelta, SubscriptionEventToolRequested, SubscriptionEventToolRunning, SubscriptionEventToolProgress, SubscriptionEventToolFinished, SubscriptionEventPromptQueue, SubscriptionEventPromptAppended, SubscriptionEventRunStarted, SubscriptionEventRunSettled:
+	case SubscriptionEventTextDelta, SubscriptionEventReasoningDelta, SubscriptionEventToolRequested, SubscriptionEventToolRunning, SubscriptionEventToolProgress, SubscriptionEventToolFinished, SubscriptionEventPromptQueue, SubscriptionEventPromptAppended, SubscriptionEventRunStarted, SubscriptionEventTurnFailed, SubscriptionEventRunSettled:
 		return true
 	}
 	return false

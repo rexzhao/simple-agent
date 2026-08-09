@@ -562,7 +562,7 @@ M25 删除 mailbox 后，当前公开入口是 Web run prompt API。
 - [x] 增加配置化 session 创建 execution API。
 - [x] 增加 session chat items 前后游标分页。
 - [x] 增加 project/session Web API。
-- [x] 增加 run registry、SSE events 和 cancel API。
+- [x] 增加 run registry、WebSocket sync integration 和 cancel API。
 - [x] 增加 loopback、capability token、Host/Origin 和 CSP 防护。
 - [x] 实现 React/TypeScript 三栏 UI、流式输出、工具状态和停止操作。
 - [x] Vite 产物通过 `go:embed` 嵌入。

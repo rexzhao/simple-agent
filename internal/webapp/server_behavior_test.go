@@ -99,6 +99,37 @@ func TestServerSecurityBootstrapAndJSONContract(t *testing.T) {
 		t.Fatalf("GET SPA fallback = %d %q, want embedded UI", response.StatusCode, spaBody)
 	}
 
+	for _, route := range []string{"/api", "/api/events", "/api/runs/run-missing/events"} {
+		request, err := http.NewRequest(http.MethodGet, server.URL+route, nil)
+		if err != nil {
+			t.Fatalf("NewRequest(%s) error = %v", route, err)
+		}
+		request.Header.Set("Authorization", "Bearer "+testToken)
+		response, err := http.DefaultClient.Do(request)
+		if err != nil {
+			t.Fatalf("GET removed API route %s error = %v", route, err)
+		}
+		body, readErr := io.ReadAll(response.Body)
+		response.Body.Close()
+		if readErr != nil {
+			t.Fatalf("read removed API route %s response: %v", route, readErr)
+		}
+		if response.StatusCode != http.StatusNotFound || strings.Contains(strings.ToLower(response.Header.Get("Content-Type")), "text/html") || bytes.Contains(bytes.ToLower(body), []byte("<html")) {
+			t.Fatalf("GET removed API route %s = status:%d content-type:%q body:%q, want non-HTML 404", route, response.StatusCode, response.Header.Get("Content-Type"), body)
+		}
+	}
+	unauthorizedRequest, err := http.NewRequest(http.MethodGet, server.URL+"/api", nil)
+	if err != nil {
+		t.Fatalf("NewRequest(unauthorized /api) error = %v", err)
+	}
+	unauthorizedAPI, err := http.DefaultClient.Do(unauthorizedRequest)
+	if err != nil {
+		t.Fatalf("GET unauthorized /api error = %v", err)
+	}
+	if unauthorizedAPI.StatusCode != http.StatusUnauthorized || responseErrorCode(t, unauthorizedAPI) != "unauthorized" {
+		t.Fatalf("GET unauthorized /api status = %d, want 401 unauthorized", unauthorizedAPI.StatusCode)
+	}
+
 	for _, body := range []string{
 		`{"root":"ignored","unexpected":true}`,
 		`{"root":"ignored"} {"root":"second"}`,
@@ -269,6 +300,9 @@ func TestServerActivePromptQueueLifecycle(t *testing.T) {
 	runner := enteredBlockingWebTestRunner{entered: make(chan struct{}), once: &sync.Once{}}
 	server, _, app := newWebTestAppServerWithRunner(t, runner)
 	_, session := createWebProjectAndSession(t, server)
+	observer := newPromptQueueObserver()
+	unregister := app.runs.coordinator.RegisterRunEventObserver(observer)
+	t.Cleanup(unregister)
 
 	response := doJSONRequest(t, http.MethodPost, server.URL+"/api/sessions/"+session.ID+"/runs", map[string]string{"content": "block"})
 	if response.StatusCode != http.StatusAccepted {
@@ -293,7 +327,7 @@ func TestServerActivePromptQueueLifecycle(t *testing.T) {
 		t.Fatalf("POST active prompt status = %d body=%s", response.StatusCode, readBody(response))
 	}
 	response.Body.Close()
-	queued := waitForPromptQueue(t, managed, 1)
+	queued := waitForPromptQueue(t, observer, run.ID, 1)
 	if queued[0].ID == "" || queued[0].Content != "follow up" {
 		t.Fatalf("active prompt queue = %#v, want stable id and content", queued)
 	}
@@ -303,7 +337,7 @@ func TestServerActivePromptQueueLifecycle(t *testing.T) {
 		t.Fatalf("DELETE active prompt status = %d body=%s", response.StatusCode, readBody(response))
 	}
 	response.Body.Close()
-	waitForPromptQueue(t, managed, 0)
+	waitForPromptQueue(t, observer, run.ID, 0)
 
 	response = doJSONRequest(t, http.MethodPost, server.URL+"/api/runs/"+run.ID+"/prompts", map[string]string{"content": "   "})
 	if response.StatusCode != http.StatusBadRequest || responseErrorCode(t, response) != "invalid_content" {
@@ -330,6 +364,9 @@ func TestServerActivePromptSteerAndMove(t *testing.T) {
 	runner := enteredBlockingWebTestRunner{entered: make(chan struct{}), once: &sync.Once{}}
 	server, _, app := newWebTestAppServerWithRunner(t, runner)
 	_, session := createWebProjectAndSession(t, server)
+	observer := newPromptQueueObserver()
+	unregister := app.runs.coordinator.RegisterRunEventObserver(observer)
+	t.Cleanup(unregister)
 
 	response := doJSONRequest(t, http.MethodPost, server.URL+"/api/sessions/"+session.ID+"/runs", map[string]string{"content": "block"})
 	if response.StatusCode != http.StatusAccepted {
@@ -356,7 +393,7 @@ func TestServerActivePromptSteerAndMove(t *testing.T) {
 		}
 		response.Body.Close()
 	}
-	queued := waitForPromptQueueOrder(t, managed, []string{"first", "second", "third"})
+	queued := waitForPromptQueueOrder(t, observer, run.ID, []string{"first", "second", "third"})
 	if queued[0].Steer || queued[1].Steer || queued[2].Steer {
 		t.Fatalf("fresh queue steer flags = %#v, want all plain", queued)
 	}
@@ -371,7 +408,7 @@ func TestServerActivePromptSteerAndMove(t *testing.T) {
 		t.Fatalf("POST steer status = %d body=%s", response.StatusCode, readBody(response))
 	}
 	response.Body.Close()
-	queued = waitForPromptQueueOrder(t, managed, []string{"second", "first", "third"})
+	queued = waitForPromptQueueOrder(t, observer, run.ID, []string{"second", "first", "third"})
 	if !queued[0].Steer || queued[1].Steer || queued[2].Steer {
 		t.Fatalf("steer flags after promotion = %#v, want only second steered", queued)
 	}
@@ -382,7 +419,7 @@ func TestServerActivePromptSteerAndMove(t *testing.T) {
 		t.Fatalf("POST move status = %d body=%s", response.StatusCode, readBody(response))
 	}
 	response.Body.Close()
-	waitForPromptQueueOrder(t, managed, []string{"second", "third", "first"})
+	waitForPromptQueueOrder(t, observer, run.ID, []string{"second", "third", "first"})
 
 	// The plain group cannot climb above the steer: moving "third" up again is
 	// a clamped no-op.
@@ -391,7 +428,7 @@ func TestServerActivePromptSteerAndMove(t *testing.T) {
 		t.Fatalf("POST clamped move status = %d body=%s", response.StatusCode, readBody(response))
 	}
 	response.Body.Close()
-	waitForPromptQueueOrder(t, managed, []string{"second", "third", "first"})
+	waitForPromptQueueOrder(t, observer, run.ID, []string{"second", "third", "first"})
 
 	// Demote "second" back to the plain queue.
 	response = doJSONRequest(t, http.MethodPost, server.URL+"/api/runs/"+run.ID+"/prompts/"+byContent["second"]+"/steer", map[string]bool{"steer": false})
@@ -399,7 +436,7 @@ func TestServerActivePromptSteerAndMove(t *testing.T) {
 		t.Fatalf("POST demote status = %d body=%s", response.StatusCode, readBody(response))
 	}
 	response.Body.Close()
-	waitForPromptQueueOrder(t, managed, []string{"second", "third", "first"})
+	waitForPromptQueueOrder(t, observer, run.ID, []string{"second", "third", "first"})
 
 	// Error branches: invalid direction, missing prompt, missing run.
 	response = doJSONRequest(t, http.MethodPost, server.URL+"/api/runs/"+run.ID+"/prompts/"+byContent["first"]+"/move", map[string]string{"direction": "sideways"})
@@ -670,62 +707,120 @@ type queuedPromptPayload struct {
 	Steer   bool   `json:"steer"`
 }
 
-func waitForPromptQueue(t *testing.T, managed *managedRun, count int) []queuedPromptPayload {
+type promptQueueObservation struct {
+	runID string
+	event execution.SessionStreamEvent
+}
+
+type promptQueueObserver struct {
+	events chan promptQueueObservation
+	mu     sync.Mutex
+	latest map[string][]queuedPromptPayload
+}
+
+func newPromptQueueObserver() *promptQueueObserver {
+	return &promptQueueObserver{events: make(chan promptQueueObservation, 128), latest: make(map[string][]queuedPromptPayload)}
+}
+
+func (observer *promptQueueObserver) RunAdmitted(*execution.CoordinatedSessionRun)        {}
+func (observer *promptQueueObserver) RunAdmissionFailed(*execution.CoordinatedSessionRun) {}
+func (observer *promptQueueObserver) RunSettled(*execution.CoordinatedSessionRun, execution.SessionMessageResult, error) {
+}
+func (observer *promptQueueObserver) RunEvent(run *execution.CoordinatedSessionRun, event execution.SessionStreamEvent) {
+	if run == nil || event == nil || event["type"] != "run.prompt_queue" {
+		return
+	}
+	observation := promptQueueObservation{runID: run.ID(), event: event}
+	if prompts := promptQueueFromEvent(event); prompts != nil {
+		observer.mu.Lock()
+		observer.latest[run.ID()] = append([]queuedPromptPayload(nil), prompts...)
+		observer.mu.Unlock()
+	}
+	// Prompt-queue assertions are the only consumer of this channel. A full
+	// channel must never apply backpressure to the execution coordinator; the
+	// mutex-protected latest value above remains the authoritative observation.
+	select {
+	case observer.events <- observation:
+	default:
+	}
+}
+
+func (observer *promptQueueObserver) queue(runID string) ([]queuedPromptPayload, bool) {
+	observer.mu.Lock()
+	defer observer.mu.Unlock()
+	prompts, ok := observer.latest[runID]
+	if !ok {
+		return nil, false
+	}
+	return append([]queuedPromptPayload(nil), prompts...), true
+}
+
+func promptQueueFromEvent(event execution.SessionStreamEvent) []queuedPromptPayload {
+	raw, ok := event["prompts"]
+	if !ok {
+		return nil
+	}
+	encoded, err := json.Marshal(raw)
+	if err != nil {
+		return nil
+	}
+	var prompts []queuedPromptPayload
+	if json.Unmarshal(encoded, &prompts) != nil {
+		return nil
+	}
+	return prompts
+}
+
+func waitForPromptQueue(t *testing.T, observer *promptQueueObserver, runID string, count int) []queuedPromptPayload {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		events, _, _, _, changed := managed.snapshot(0)
-		for index := len(events) - 1; index >= 0; index-- {
-			var event struct {
-				Type    string                `json:"type"`
-				Prompts []queuedPromptPayload `json:"prompts"`
-			}
-			if json.Unmarshal(events[index].Payload, &event) == nil && event.Type == "run.prompt_queue" && len(event.Prompts) == count {
-				return event.Prompts
-			}
+		if prompts, ok := observer.queue(runID); ok && len(prompts) == count {
+			return prompts
 		}
-		select {
-		case <-changed:
-		case <-time.After(10 * time.Millisecond):
-		}
+		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatalf("run prompt queue did not reach %d items", count)
 	return nil
 }
 
-// waitForPromptQueueOrder polls until the newest run.prompt_queue snapshot
+// waitForPromptQueueOrder polls the authoritative execution queue until it
 // holds exactly the wanted contents in order, returning the full payload.
-func waitForPromptQueueOrder(t *testing.T, managed *managedRun, want []string) []queuedPromptPayload {
+func waitForPromptQueueOrder(t *testing.T, observer *promptQueueObserver, runID string, want []string) []queuedPromptPayload {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		events, _, _, _, changed := managed.snapshot(0)
-		for index := len(events) - 1; index >= 0; index-- {
-			var event struct {
-				Type    string                `json:"type"`
-				Prompts []queuedPromptPayload `json:"prompts"`
-			}
-			if json.Unmarshal(events[index].Payload, &event) != nil || event.Type != "run.prompt_queue" || len(event.Prompts) != len(want) {
-				continue
-			}
+		if prompts, ok := observer.queue(runID); ok && len(prompts) == len(want) {
 			matches := true
-			for i, content := range want {
-				if event.Prompts[i].Content != content {
+			for index, prompt := range prompts {
+				if prompt.Content != want[index] {
 					matches = false
-					break
 				}
 			}
 			if matches {
-				return event.Prompts
+				return prompts
 			}
-			break
 		}
-		select {
-		case <-changed:
-		case <-time.After(10 * time.Millisecond):
-		}
+		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatalf("run prompt queue order did not become %#v", want)
+	return nil
+}
+
+func waitForPromptContent(t *testing.T, observer *promptQueueObserver, runID, content string) []queuedPromptPayload {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if prompts, ok := observer.queue(runID); ok {
+			for _, prompt := range prompts {
+				if prompt.Content == content {
+					return prompts
+				}
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("run prompt queue did not publish %q", content)
 	return nil
 }
 
@@ -733,14 +828,10 @@ func waitForManagedRunTerminal(t *testing.T, managed *managedRun) {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		_, terminal, _, _, changed := managed.snapshot(0)
-		if terminal {
+		if managed != nil && managed.isTerminal() {
 			return
 		}
-		select {
-		case <-changed:
-		case <-time.After(10 * time.Millisecond):
-		}
+		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatal("managed run did not become terminal")
 }

@@ -65,9 +65,10 @@ const virtuosoComponents: Components<ConversationRow> = {
   EmptyPlaceholder: ConversationEmptyPlaceholder,
 }
 
-// Virtuoso item offsets include this fixed header, while the saved anchor
-// offset is measured against the visible .messages viewport.
-const messagesHeaderHeight = 94
+// Virtuoso item offsets include the 62px header slot. The 32px breathing room
+// is outside the list's measured item offsets, while the saved anchor offset
+// is measured against the visible .messages viewport.
+const messagesHeaderHeight = 62
 
 export interface VirtualConversationListProps {
   sessionID: string
@@ -97,6 +98,7 @@ type SessionListRecord = {
 type SessionScrollAnchor = {
   index: number
   offset: number
+  key?: string
 }
 
 function compatibleSessionModels(previous: SessionListState, next: SessionListState): boolean {
@@ -218,6 +220,7 @@ function SessionVirtuoso(props: {
   const lastScrollTopRef = useRef<number | null>(null)
   const lastAtBottomRef = useRef<boolean | null>(null)
   const pendingCaptureFrameRef = useRef<number | null>(null)
+  const pendingAnchorFrameRef = useRef<number | null>(null)
   const userScrollCandidateRef = useRef(false)
   const candidateExpiryTimerRef = useRef<number | null>(null)
   const savedState = props.savedState?.ranges.length ? props.savedState : undefined
@@ -225,7 +228,8 @@ function SessionVirtuoso(props: {
   const anchorRef = useRef<SessionScrollAnchor | null>(null)
   const renderedItemsRef = useRef<ListItem<ConversationRow>[]>([])
   const rangeStartRef = useRef<number | null>(null)
-  const restoreCorrectionRef = useRef<{ index: number; messageOffset: number } | null>(null)
+  const restoreCorrectionRef = useRef<{ index: number; messageOffset: number; key?: string } | null>(null)
+  const previousModelRef = useRef(props.model)
 
   const captureState = useCallback(() => {
     // The single bottom helper row is the empty-session model. Do not let its
@@ -279,19 +283,69 @@ function SessionVirtuoso(props: {
     const correction = restoreCorrectionRef.current
     const scroller = scrollerRef.current
     if (!correction || !scroller) return
+    if (correction.key) {
+      const row = [...scroller.querySelectorAll<HTMLElement>('.conversation-row')]
+        .find((candidate) => candidate.dataset.rowKey === correction.key)
+      if (row) {
+        const anchor = row.querySelector<HTMLElement>('.message[data-seq]') ?? row
+        const currentOffset = anchor.getBoundingClientRect().top - scroller.getBoundingClientRect().top
+        const delta = currentOffset - correction.messageOffset
+        if (Math.abs(delta) <= 1) {
+          return true
+        }
+        virtuosoRef.current?.scrollTo({ top: scroller.scrollTop + delta, behavior: 'auto' })
+        return false
+      }
+      // A keyed anchor can be outside the current virtualization window. Do
+      // not consume the correction with an index/measurement fallback before
+      // Virtuoso mounts that exact row.
+      return false
+    }
     const item = renderedItemsRef.current.find((entry) => entry.index === correction.index)
-    if (!item) return
+    if (!item) return false
     const targetScrollTop = item.offset + messagesHeaderHeight - correction.messageOffset
     if (Math.abs(scroller.scrollTop - targetScrollTop) <= 1) {
-      restoreCorrectionRef.current = null
-      return
+      return true
     }
     virtuosoRef.current?.scrollTo({ top: targetScrollTop, behavior: 'auto' })
+    return false
   }, [])
+  const scheduleAnchorCorrection = useCallback(() => {
+    let frames = 0
+    let stableFrames = 0
+    const retry = () => {
+      if (!restoreCorrectionRef.current) return
+      if (correctRestoredAnchor()) stableFrames += 1
+      else stableFrames = 0
+      frames += 1
+      if (!restoreCorrectionRef.current) return
+      if (stableFrames >= 12 || frames >= 90) {
+        restoreCorrectionRef.current = null
+        return
+      }
+      requestAnimationFrame(retry)
+    }
+    requestAnimationFrame(retry)
+  }, [correctRestoredAnchor])
   const updateAnchor = useCallback(() => {
     const scroller = scrollerRef.current
     const rangeStart = rangeStartRef.current
     if (!scroller || rangeStart === null) return
+    const viewportTop = scroller.getBoundingClientRect().top
+    const firstMessage = [...scroller.querySelectorAll<HTMLElement>('.message[data-seq]')]
+      .find((candidate) => candidate.getBoundingClientRect().bottom > viewportTop)
+    const firstRow = firstMessage?.closest<HTMLElement>('.conversation-row')
+    if (firstRow?.dataset.rowKey) {
+      const rendered = renderedItemsRef.current.find((item) => item.data?.key === firstRow.dataset.rowKey)
+      if (rendered) {
+        anchorRef.current = {
+          index: rendered.index,
+          offset: firstMessage ? firstMessage.getBoundingClientRect().top - viewportTop : firstRow.getBoundingClientRect().top - viewportTop,
+          key: firstRow.dataset.rowKey,
+        }
+        return
+      }
+    }
     const visible = renderedItemsRef.current.find((item) => item.index === rangeStart)
     if (visible) anchorRef.current = { index: visible.index, offset: visible.offset - scroller.scrollTop }
   }, [])
@@ -299,17 +353,30 @@ function SessionVirtuoso(props: {
     const scroller = scrollerRef.current
     if (!scroller) return
     const previousScrollTop = lastScrollTopRef.current
-    lastScrollTopRef.current = scroller.scrollTop
-    if (previousScrollTop === scroller.scrollTop) return
     const fromUserScroll = userScrollCandidateRef.current
+    lastScrollTopRef.current = scroller.scrollTop
     if (fromUserScroll) {
       clearInteractionCandidate()
       cancelRestore()
       props.onInteraction(props.sessionID)
-    } else {
+      // A browser can deliver the user-originated scroll signal after an
+      // imperative Virtuoso correction has already updated the cached offset.
+      // Do not lose the user's detach intent merely because the cached and
+      // current scrollTop happen to compare equal at this boundary.
+      if (previousScrollTop === scroller.scrollTop) return
+      updateAnchor()
+      if (typeof requestAnimationFrame !== 'undefined') {
+        if (pendingAnchorFrameRef.current !== null) cancelAnimationFrame(pendingAnchorFrameRef.current)
+        pendingAnchorFrameRef.current = requestAnimationFrame(() => {
+          pendingAnchorFrameRef.current = null
+          updateAnchor()
+          captureState()
+        })
+      }
+    } else if (previousScrollTop !== scroller.scrollTop) {
       correctRestoredAnchor()
     }
-    updateAnchor()
+    if (previousScrollTop === scroller.scrollTop) return
     captureStateAfterScroll()
     const atBottom = scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight <= 8
     if (lastAtBottomRef.current === atBottom) return
@@ -319,16 +386,16 @@ function SessionVirtuoso(props: {
     // lets a detached session re-engage when an explicit scroll lands at the
     // bottom, including imperative positioning used by the UI.
     props.onAtBottomStateChange(props.sessionID, atBottom, true)
-  }, [cancelRestore, captureStateAfterScroll, clearInteractionCandidate, correctRestoredAnchor, props.onAtBottomStateChange, props.onInteraction, props.sessionID, updateAnchor])
+  }, [cancelRestore, captureState, captureStateAfterScroll, clearInteractionCandidate, correctRestoredAnchor, props.onAtBottomStateChange, props.onInteraction, props.sessionID, updateAnchor])
   const handleItemsRendered = useCallback((items: ListItem<ConversationRow>[]) => {
     renderedItemsRef.current = items
-    updateAnchor()
     correctRestoredAnchor()
+    if (!restoreCorrectionRef.current && !restorePendingRef.current && lastAtBottomRef.current !== false) updateAnchor()
   }, [correctRestoredAnchor, updateAnchor])
   const handleRangeChanged = useCallback((range: { startIndex: number }) => {
     rangeStartRef.current = range.startIndex
-    updateAnchor()
     correctRestoredAnchor()
+    if (!restoreCorrectionRef.current && !restorePendingRef.current && lastAtBottomRef.current !== false) updateAnchor()
   }, [correctRestoredAnchor, updateAnchor])
   const handleTotalListHeightChanged = useCallback(() => {
     captureState()
@@ -339,7 +406,8 @@ function SessionVirtuoso(props: {
       if (props.savedAnchor) {
         restoreCorrectionRef.current = {
           index: props.savedAnchor.index,
-          messageOffset: props.savedAnchor.offset + messagesHeaderHeight,
+          messageOffset: props.savedAnchor.key ? props.savedAnchor.offset : props.savedAnchor.offset + messagesHeaderHeight,
+          key: props.savedAnchor.key,
         }
         virtuosoRef.current?.scrollToIndex({
           index: props.savedAnchor.index - props.firstItemIndex,
@@ -347,12 +415,13 @@ function SessionVirtuoso(props: {
           offset: 0,
           behavior: 'auto',
         })
+        scheduleAnchorCorrection()
       } else {
         virtuosoRef.current?.scrollTo({ top: savedState.scrollTop, behavior: 'auto' })
       }
     }
     props.onTotalListHeightChanged(props.sessionID)
-  }, [captureState, correctRestoredAnchor, props.firstItemIndex, props.onTotalListHeightChanged, props.savedAnchor, props.sessionID, savedState])
+  }, [captureState, correctRestoredAnchor, props.firstItemIndex, props.onTotalListHeightChanged, props.savedAnchor, props.sessionID, savedState, scheduleAnchorCorrection])
 
   const handlePointerDown = useCallback((event: PointerEvent) => {
     const target = event.target
@@ -400,12 +469,39 @@ function SessionVirtuoso(props: {
 
   useEffect(() => () => {
     if (pendingCaptureFrameRef.current !== null) cancelAnimationFrame(pendingCaptureFrameRef.current)
+    if (pendingAnchorFrameRef.current !== null) cancelAnimationFrame(pendingAnchorFrameRef.current)
     clearInteractionCandidate()
   }, [clearInteractionCandidate])
 
   // Scroll events keep the snapshot current. Capture once more in layout
   // cleanup, before React detaches the Virtuoso ref during a session switch.
-  useLayoutEffect(() => () => captureState(), [captureState])
+  useLayoutEffect(() => () => {
+    updateAnchor()
+    captureState()
+  }, [captureState, updateAnchor])
+
+  // Durable settlement can replace a bottom process row with its history
+  // projection while the user is reading an older visible item. Virtuoso's
+  // measured range may otherwise preserve the wrong pixel offset for one
+  // layout pass. Reuse the same keyed anchor correction as session restore;
+  // it is only armed for an in-place model update while the user is away from
+  // the bottom, never for a prepend or a session switch.
+  useLayoutEffect(() => {
+    const previousModel = previousModelRef.current
+    previousModelRef.current = props.model
+    if (previousModel === props.model || previousModel.firstItemIndex !== props.model.firstItemIndex) return
+    const previousHadActiveRun = previousModel.rows.some((row) => row.kind === 'active-process' || row.kind === 'active-cursor' || row.kind === 'active-assistant')
+    const nextHasActiveRun = props.model.rows.some((row) => row.kind === 'active-process' || row.kind === 'active-cursor' || row.kind === 'active-assistant')
+    if (!previousHadActiveRun || nextHasActiveRun) return
+    if (restorePendingRef.current || lastAtBottomRef.current !== false || restoreCorrectionRef.current || !anchorRef.current) return
+    restoreCorrectionRef.current = {
+      index: anchorRef.current.index,
+      messageOffset: anchorRef.current.key ? anchorRef.current.offset : anchorRef.current.offset + messagesHeaderHeight,
+      key: anchorRef.current.key,
+    }
+    correctRestoredAnchor()
+    scheduleAnchorCorrection()
+  }, [correctRestoredAnchor, props.model, scheduleAnchorCorrection])
 
   const handleScrollerRef = (element: HTMLElement | Window | null) => {
     const scroller = element instanceof HTMLElement ? element : null
@@ -427,9 +523,6 @@ function SessionVirtuoso(props: {
       itemContent={(_, row) => <div className="conversation-row" data-row-key={row.key}>{props.renderRow(row)}</div>}
       components={components}
       restoreStateFrom={savedState}
-      initialTopMostItemIndex={!savedState && props.rows.length > 1
-        ? { index: 'LAST', align: 'end' }
-        : undefined}
       followOutput={(isAtBottom) => props.followOutput(props.sessionID, isAtBottom)}
       itemsRendered={handleItemsRendered}
       rangeChanged={handleRangeChanged}

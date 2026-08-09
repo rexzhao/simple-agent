@@ -90,7 +90,7 @@ type SessionRunCoordinatorOptions struct {
 	DurableAdmitter SessionRunDurableAdmitter
 	// OnRunAdmitted is called after the coordinator reserves the run and
 	// before the starter is allowed to execute it. Presentation adapters use
-	// this phase to register a run-local replay buffer before the first event
+	// this phase to register a run-local control owner before the first event
 	// can be emitted.
 	OnRunAdmitted func(*CoordinatedSessionRun) error
 	// OnRunAdmissionFailed removes any adapter state created by OnRunAdmitted
@@ -105,10 +105,10 @@ type SessionRunCoordinatorOptions struct {
 	OnRunSettled func(*CoordinatedSessionRun, SessionMessageResult, error)
 }
 
-// SessionRunEventObserver is the transport-neutral source used by both the
-// legacy SSE adapter and the D2 session-content provider. It observes the
-// coordinator's single event production path; it does not receive HTTP/SSE
-// frames or own a second event producer.
+// SessionRunEventObserver is the transport-neutral source used by execution
+// projections such as the session-content provider. It observes the
+// coordinator's single event production path and does not own a second event
+// producer.
 type SessionRunEventObserver interface {
 	RunAdmitted(*CoordinatedSessionRun)
 	RunAdmissionFailed(*CoordinatedSessionRun)
@@ -165,8 +165,8 @@ type SessionRunDescriptor struct {
 
 // SessionRunCoordinator is the application-wide owner of active SessionRuns.
 // It enforces one active run per session and a global concurrency limit. Web
-// replay buffers and future agent tools are adapters over this shared owner;
-// they must not maintain competing active-run registries.
+// projections and agent tools are adapters over this shared owner; they must
+// not maintain competing active-run registries.
 type SessionRunCoordinator struct {
 	ctx     context.Context
 	cancel  context.CancelFunc
@@ -722,7 +722,7 @@ func (coordinator *SessionRunCoordinator) SetLifecycleCallbacks(
 // SetRunIdleCallback installs an observer which is called after a run has been
 // removed from the coordinator's active indexes. It is deliberately separate
 // from SetLifecycleCallbacks so installing the durable completion dispatcher
-// cannot replace the existing lifecycle/SSE callbacks (or the presentation
+// cannot replace the existing lifecycle callbacks (or the presentation
 // callbacks supplied in SessionRunCoordinatorOptions).
 func (coordinator *SessionRunCoordinator) SetRunIdleCallback(callback func(*CoordinatedSessionRun)) {
 	if coordinator == nil {

@@ -517,7 +517,7 @@ case 'run.settled': {
 **改造后**：所有 stream 启动处捕获 `boundRunID`，catch 中用绑定值：
 ```typescript
 const boundRunID = started.run_id
-void streamRun(boundRunID, (event) => handleRunEvent(sessionID, boundRunID, event))
+void subscribeSessionContent(sessionID, boundRunID, (event) => handleRunEvent(sessionID, boundRunID, event))
   .catch((reason) => {
     updateActiveRun(sessionID, boundRunID, (run) =>
       run ? { ...run, status: 'error_pending_refresh' } : null
@@ -833,7 +833,7 @@ WP-A（后端 snapshot）
    `last_seq`。前端只接受非负十进制值，使用 `BigInt`/等价的
    precision-safe 比较，绝不先转 `Number`。缺失或非法值走保守 snapshot
    resync。
-2. run SSE 的 replay 顺序保证 settled 之前的 item projection event 已经
+2. Session Content WebSocket replay 顺序保证 settled 之前的 item projection event 已经
    dispatch 到 store。`useSessionStore` 提供基于 `stateRef` 的
    `getSessionRevision`/`isRevisionCovered`，但只把已建立的 snapshot
    history entry（及其后应用的 events）视为完整 projection；未 snapshot
@@ -862,8 +862,8 @@ Stage 7 的 fault-injection/E2E 大规模收尾。
 
 Stage 7 is the final review-only verification stage.  The complete matrix,
 including the distinction between deterministic unit tests, Go integration
-tests, and browser E2E tests, is maintained in
-[`docs/session-projection-events.md` §8](session-projection-events.md#8-stage-7-fault-injection-and-e2e-acceptance-matrix).
+tests, and browser E2E tests, is maintained in the WebSocket sync plan's test
+matrix (`docs/websocket-sync-development-plan.md` §11).
 It covers the following acceptance risks rather than adding a second source
 of protocol truth:
 
@@ -871,7 +871,7 @@ of protocol truth:
   item is created before the 202 response, and an early projection is still
   rendered exactly once;
 - item projection, run settlement, lifecycle duplicates, terminal replay and
-  reconnect are idempotent and ordered by item identity/SSE cursor rather than
+  reconnect are idempotent and ordered by item identity/resource sequence rather than
   text, turn, or timing;
 - `committed_revision` is compared as a decimal string, with covered,
   lagging, malformed/missing, bounded-retry, and legacy `last_seq` paths;

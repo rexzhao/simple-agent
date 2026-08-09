@@ -1,6 +1,7 @@
 import { isRFC3339Timestamp } from './datetime'
 import { ProtocolDecodeError } from './errors'
 import { compareRunCursor, isRunCursor, isSequence } from './sequence'
+import { unicodeCodePointLength } from './strings'
 import type {
   ChangeOperation,
   ProtocolMessage,
@@ -284,6 +285,13 @@ function validateSubscriptionEvent(event: RawObject): void {
     case 'run.started':
       add('status')
       if (event.status !== 'running') fail('invalid_field', 'must be running', `${field}.status`)
+      break
+    case 'turn.failed':
+      requiredString(event, 'turn_id', `${field}.turn_id`)
+      requiredString(event, 'code', `${field}.code`)
+      requiredString(event, 'message', `${field}.message`)
+      if (unicodeCodePointLength(String(event.message)) > 600) fail('invalid_field', 'message is too long', `${field}.message`)
+      add('code', 'message')
       break
     case 'run.settled':
       add('status', 'durable_settlement_watermark')

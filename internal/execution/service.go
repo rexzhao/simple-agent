@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/http"
 	"path/filepath"
 	"runtime"
 	"sort"
@@ -429,13 +430,11 @@ var (
 )
 
 // turnFailure is the payload for a turn.failed session stream event. It
-// carries a stable code and a short message selected by the failing stage.
-// Provider-reported failures — HTTP statuses with response bodies and
-// in-stream error events — surface the provider's own message verbatim
-// (bounded): operators need it to act on rate limits, quota, and model
-// errors. Everything else stays canned: internal error text, auth data,
-// the prompt and tool results remain in logs and returned errors and are
-// never placed in a SessionStreamEvent.
+// carries a stable code and a short safe message selected by the failing
+// stage. Provider bodies and provider error strings are never copied into the
+// session stream: they may contain credentials, prompts, URLs, or arbitrary
+// HTML. The projection keeps only bounded categories such as HTTP 429/rate
+// limiting; detailed diagnostics remain in server-side logs.
 type turnFailure struct {
 	code    string
 	message string
@@ -1183,7 +1182,7 @@ func (s *Service) RemoveProject(id string) (ProjectRemoveResult, error) {
 		return ProjectRemoveResult{}, fmt.Errorf("remove project %s: %w", project.ID, err)
 	}
 	// The project-index removal is the single project lifecycle event. Session
-	// cascade notifications below belong exclusively to session_index/SSE and
+	// cascade notifications below belong exclusively to the session index and
 	// must never be interpreted as additional project-index mutations.
 	s.publishProjectIndexRemove(project.ID)
 	for _, cascade := range sessionDeletionCascades(removedSessionStates) {
@@ -3134,9 +3133,9 @@ func (s *Service) runSessionMessage(ctx context.Context, id string, input Sessio
 	// first so all mapped model/persisted events are submitted, then the terminal
 	// event (turn.failed or turn.committed) is submitted last, and the sink is
 	// flushed and joined before returning so no callback fires after return. The
-	// turn.failed payload carries only a stable code and a short canned message
-	// selected by the failing stage; it never includes the underlying error text,
-	// provider body, auth data, the prompt, or tool results.
+	// turn.failed carries only the stable safe code/message selected by the
+	// failing stage; it never includes provider bodies, auth data, the prompt,
+	// or tool results.
 	finalize := func() {
 		closeBridge()
 		if failure != nil {
@@ -3269,25 +3268,16 @@ func turnFailureForRunnerError(err error) turnFailure {
 
 	var statusErr *httpstream.StatusError
 	if errors.As(err, &statusErr) {
-		status := strings.TrimSpace(statusErr.Status)
-		if status == "" {
-			status = fmt.Sprintf("HTTP %d", statusErr.StatusCode)
-		}
-		message := fmt.Sprintf("model provider returned %s", status)
+		message := safeStatusFailureMessage(statusErr.StatusCode, statusErr.Status)
 		if statusErr.Attempts > 1 {
 			message = fmt.Sprintf("%s after %d attempts", message, statusErr.Attempts)
-		}
-		if body := strings.TrimSpace(statusErr.Body); body != "" {
-			message = fmt.Sprintf("%s: %s", message, truncateTurnFailureDetail(body, turnFailureDetailLimit))
 		}
 		return turnFailure{code: "model_http_error", message: message}
 	}
 
 	var providerErr *model.ProviderError
 	if errors.As(err, &providerErr) {
-		if message := strings.TrimSpace(providerErr.Message); message != "" {
-			return turnFailure{code: "model_provider_error", message: truncateTurnFailureDetail(message, turnFailureDetailLimit)}
-		}
+		return turnFailure{code: "model_provider_error", message: safeProviderFailureMessage(providerErr.Message)}
 	}
 
 	var requestTimeout *httpstream.RequestTimeoutError
@@ -3327,16 +3317,32 @@ func turnFailureForRunnerError(err error) turnFailure {
 	return turnFailureRunner
 }
 
-// turnFailureDetailLimit bounds provider error bodies so a multi-kilobyte
-// HTML error page cannot flood the session stream and the conversation UI.
-const turnFailureDetailLimit = 600
-
-func truncateTurnFailureDetail(text string, limit int) string {
-	runes := []rune(text)
-	if len(runes) <= limit {
-		return text
+func safeStatusFailureMessage(statusCode int, status string) string {
+	if statusCode == http.StatusTooManyRequests {
+		return "429: model provider asked us to slow down; try again later"
 	}
-	return string(runes[:limit]) + "…"
+	if statusCode >= 500 {
+		return fmt.Sprintf("model provider is temporarily unavailable (HTTP %d)", statusCode)
+	}
+	if statusCode > 0 {
+		return fmt.Sprintf("model provider returned HTTP %d", statusCode)
+	}
+	if strings.TrimSpace(status) != "" {
+		return "model provider returned an HTTP error"
+	}
+	return "model provider returned an HTTP error"
+}
+
+func safeProviderFailureMessage(detail string) string {
+	lower := strings.ToLower(detail)
+	switch {
+	case strings.Contains(lower, "rate_limit"), strings.Contains(lower, "rate limit"), strings.Contains(lower, "429"), strings.Contains(lower, "slow down"):
+		return "model provider asked us to slow down; try again later"
+	case strings.Contains(lower, "overloaded"), strings.Contains(lower, "server_error"), strings.Contains(lower, "temporarily unavailable"):
+		return "model provider is temporarily unavailable; try again later"
+	default:
+		return "model provider rejected the request"
+	}
 }
 
 func (s *Service) requireIncrementalSessionTurn(ctx context.Context, session sessions.SessionV2, input SessionMessageInput) error {

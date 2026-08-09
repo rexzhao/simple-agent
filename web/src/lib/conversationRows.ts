@@ -5,6 +5,7 @@ import { itemText, sessionItemIdentityKey } from './session'
  * actionable while the durable session is being refreshed. */
 export interface ConversationRowTurnError {
   turnID: string
+  code: string
   message: string
 }
 
@@ -58,7 +59,7 @@ export type ConversationRow =
     retry: NonNullable<ActiveRun['providerRetry']>
   })
   | (ConversationRowBase & { kind: 'manual-compaction' })
-  | (ConversationRowBase & { kind: 'turn-error'; message: string })
+  | (ConversationRowBase & { kind: 'turn-error'; code: string; message: string })
   | (ConversationRowBase & { kind: 'refresh-error' })
   | (ConversationRowBase & { kind: 'interrupted' })
   | (ConversationRowBase & { kind: 'bottom-spacer' })
@@ -258,6 +259,7 @@ export function buildConversationRows(input: BuildConversationRowsInput): Conver
     rows.push({
       kind: 'turn-error',
       key: rowKey(input.sessionID, 'turn-error', input.turnError.turnID || 'unknown'),
+      code: input.turnError.code,
       message: input.turnError.message,
     })
   }

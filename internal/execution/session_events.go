@@ -25,8 +25,8 @@ const (
 const maxSessionStreamToolContentRunes = 4096
 
 const (
-	// The callback sink is a presentation boundary shared by the legacy SSE
-	// path. It must not become an unbounded heap while a callback is slow.
+	// The callback sink is a presentation boundary shared by live projections.
+	// It must not become an unbounded heap while a callback is slow.
 	defaultSessionEventSinkMessages = 256
 	defaultSessionEventSinkBytes    = 2 * 1024 * 1024
 )
@@ -696,7 +696,7 @@ func (s *Service) emitPersistedSessionEventsThrough(sessionID, runID, turnID str
 	}
 	// Every DTO in this projection batch is converted from the same state
 	// snapshot. Loading state from sessionItemDTO for each item allowed a
-	// metadata update to make one SSE response expose mixed reasoning policy.
+	// metadata update to make one projection expose mixed reasoning policy.
 	state, err := s.sessionStore.LoadState(sessionID)
 	if err != nil {
 		return afterSeq
@@ -729,7 +729,7 @@ func (s *Service) sessionStreamEventFromPersistedEventWithState(sessionID, runID
 		if err != nil || !sessionItemVisibleInChat(item) {
 			// Hidden/model-only/provider-private records still advance the
 			// session watermark. They are deliberately absent from the
-			// projection stream; run SSE IDs remain the transport gap signal.
+			// projection stream; the run observer owns transient continuity.
 			return nil, false
 		}
 		dto, err := s.sessionItemDTOWithState(sessionID, item, state)

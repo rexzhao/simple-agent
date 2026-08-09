@@ -22,6 +22,7 @@ func TestSubscriptionEventFromExecutionMapsLiveRunSemantics(t *testing.T) {
 		{"finished", execution.NewSessionStreamEvent("tool.finished", map[string]any{"turn_id": "turn-1", "agent_iteration": 1, "tool_call_id": "call-1", "name": "shell", "is_error": false}), protocol.SubscriptionEventToolFinished, ""},
 		{"queue", execution.NewSessionStreamEvent("run.prompt_queue", map[string]any{"prompts": []map[string]any{{"id": "p-1", "content": "next", "steer": true}}}), protocol.SubscriptionEventPromptQueue, ""},
 		{"appended", execution.NewSessionStreamEvent("run.prompt_appended", map[string]any{"prompts": []string{"next"}}), protocol.SubscriptionEventPromptAppended, ""},
+		{"failure", execution.NewSessionStreamEvent("turn.failed", map[string]any{"turn_id": "turn-1", "code": "model_http_error", "message": "429: slow down and try again"}), protocol.SubscriptionEventTurnFailed, ""},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

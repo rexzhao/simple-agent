@@ -109,6 +109,11 @@ function runStateForConversation(state: SessionRunState, sessionID: string): Act
       durableTextLength: entry.baseLength,
     }
   }
+  // Text tails remain owned by the durable/active message rows for rendering.
+  // Keep a zero-width output step in the process stream as a structural
+  // boundary: it closes the preceding tool group without manufacturing a
+  // second copy of the text. The message row supplies the visible text.
+  const toolIterations = new Set(Object.values(state.tools).map((tool) => tool.agent_iteration))
   const steps = [
     ...Object.values(state.reasoning).map((entry) => ({
       kind: 'reasoning' as const,
@@ -126,6 +131,12 @@ function runStateForConversation(state: SessionRunState, sessionID: string): Act
       arguments: tool.arguments,
       result: tool.content,
       status: tool.is_error ? 'error' as const : tool.status,
+    })),
+    ...textEntries.filter((entry) => [...toolIterations].some((iteration) => iteration >= entry.key.agent_iteration)).map((entry) => ({
+      kind: 'output' as const,
+      id: `${state.runID}:output:${entry.key.item_id}:${entry.key.agent_iteration}`,
+      text: '',
+      iteration: entry.key.agent_iteration,
     })),
   ]
   const status: ActiveRun['status'] = state.recoveryRequired || state.stale

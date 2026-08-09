@@ -1110,7 +1110,7 @@ func TestSessionStreamTurnFailedSafePayloadByStage(t *testing.T) {
 			t,
 			events,
 			"model_http_error",
-			`model provider returned 429 Too Many Requests after 2 attempts: {"error":{"message":"slow down and try later"}}`,
+			`429: model provider asked us to slow down; try again later after 2 attempts`,
 			turnFailedSecret,
 		)
 	})
@@ -1134,7 +1134,7 @@ func TestSessionStreamTurnFailedSafePayloadByStage(t *testing.T) {
 		if !errors.Is(err, ErrTurnFailed) {
 			t.Fatalf("error = %v, want ErrTurnFailed", err)
 		}
-		assertSafeTurnFailedTerminal(t, events, "model_http_error", "model provider returned HTTP 500", turnFailedSecret)
+		assertSafeTurnFailedTerminal(t, events, "model_http_error", "model provider is temporarily unavailable (HTTP 500)", turnFailedSecret)
 	})
 
 	t.Run("model_provider_error", func(t *testing.T) {
@@ -1156,7 +1156,7 @@ func TestSessionStreamTurnFailedSafePayloadByStage(t *testing.T) {
 		if strings.Contains(err.Error(), turnFailedSecret) {
 			t.Fatalf("returned error leaks secret: %v", err)
 		}
-		assertSafeTurnFailedTerminal(t, events, "model_provider_error", "rate_limit_error: Your rate limit is exceeded (code 429)", turnFailedSecret)
+		assertSafeTurnFailedTerminal(t, events, "model_provider_error", "model provider asked us to slow down; try again later", turnFailedSecret)
 	})
 
 	t.Run("model_connection_failed", func(t *testing.T) {

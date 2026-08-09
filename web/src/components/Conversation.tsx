@@ -38,7 +38,7 @@ export const Conversation = memo(function Conversation(props: {
 	onDraftClear: () => void
   loadSessionImage?: (sessionID: string, hash: string, signal?: AbortSignal) => Promise<SessionImageData>
   sessionNames: Record<string, string>
-  turnError: { turnID: string; message: string } | null
+  turnError: { turnID: string; code: string; message: string } | null
   onDismissTurnError: () => void
   onLoadOlder: () => Promise<boolean>
   onSend: (content: string, images: PastedImageAttachment[]) => Promise<boolean>
@@ -464,7 +464,7 @@ function renderConversationRow(row: ConversationRow, props: ConversationRowRende
 		case 'manual-compaction':
 			return <CompactionStatus key={row.key} trigger="manual" status="running" />
 		case 'turn-error':
-			return <TurnErrorRow key={row.key} message={row.message} canContinue={props.canContinue} onContinue={props.onContinue} onDismiss={props.onDismissTurnError} />
+			return <TurnErrorRow key={row.key} code={row.code} message={row.message} canContinue={props.canContinue} onContinue={props.onContinue} onDismiss={props.onDismissTurnError} />
 		case 'refresh-error':
 			return <RefreshErrorRow key={row.key} onRetryRefresh={props.onRetryRefresh} />
 		case 'interrupted':
@@ -701,13 +701,13 @@ function CompactionStatus({ trigger, status, activeContextTokens, contextWindow 
   return <div className={`compaction-status ${status}`} role="status"><span />{detail}</div>
 }
 
-function TurnErrorRow({ message, canContinue, onContinue, onDismiss }: { message: string; canContinue: boolean; onContinue: () => void; onDismiss: () => void }) {
+function TurnErrorRow({ code, message, canContinue, onContinue, onDismiss }: { code: string; message: string; canContinue: boolean; onContinue: () => void; onDismiss: () => void }) {
 	return (
 		<div className="turn-error" role="alert">
 			<WarningIcon />
 			<div className="turn-error-copy">
 				<strong>Turn failed</strong>
-				<p>{message}</p>
+				<p><code>{code}</code>: {message}</p>
 			</div>
 			{canContinue && <button className="message-tool-button" onClick={onContinue} title="Continue interrupted run"><RetryIcon />Continue</button>}
 			<button className="turn-error-dismiss" onClick={onDismiss} aria-label="Dismiss error" title="Dismiss">×</button>

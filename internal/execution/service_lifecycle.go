@@ -216,8 +216,8 @@ func (s *Service) publishRunStarted(run *CoordinatedSessionRun) {
 		return
 	}
 	// The typed provider is notified at the durable CreateRun commit boundary
-	// in runSessionMessage. This callback remains the legacy SSE lifecycle
-	// compatibility path and must not be used as the index authority.
+	// in runSessionMessage. This lifecycle publication is not the index
+	// authority; typed provider changes remain authoritative for indexing.
 	if s.lifecycleHub == nil {
 		return
 	}
@@ -234,8 +234,9 @@ func (s *Service) publishRunSettled(run *CoordinatedSessionRun, result SessionMe
 	if s == nil || run == nil {
 		return
 	}
-	// Durable child completion delivery is independent of the best-effort SSE
-	// hub. Keep it on the lifecycle fanout even when no Web subscriber exists.
+	// Durable child completion delivery is independent of the best-effort
+	// lifecycle fanout. Keep it on that fanout even when no Web subscriber
+	// exists.
 	go s.onRunSettledForCompletion(run)
 	if s.lifecycleHub == nil {
 		return

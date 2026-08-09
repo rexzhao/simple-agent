@@ -227,6 +227,12 @@ export interface SessionPrompt {
   readonly steer: boolean
 }
 
+export interface SessionRunFailure {
+  readonly turnID: string
+  readonly code: string
+  readonly message: string
+}
+
 /** Domain-only transient run overlay. It contains execution identity/cursors,
  * but never subscription identifiers, stream sequences, generations or blobs. */
 export interface SessionRunState {
@@ -249,6 +255,7 @@ export interface SessionContentState {
   readonly snapshot: SessionContentSnapshot
   readonly durableResourceRevision: string
   readonly transientRun: SessionRunState | null
+  readonly turnFailure?: SessionRunFailure
 }
 
 export interface SessionView {
@@ -259,6 +266,7 @@ export interface SessionView {
   readonly historyState: SessionContentHistoryState
   readonly activeRun: SessionContentActiveRun | null
   readonly compaction: SessionContentCompaction
+  readonly turnFailure?: SessionRunFailure
   readonly runState?: SessionRunState
   readonly error?: DomainReadError
 }

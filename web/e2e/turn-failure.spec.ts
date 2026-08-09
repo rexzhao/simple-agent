@@ -1,144 +1,89 @@
-import { expect, test, type Page, type Route } from '@playwright/test'
+import { expect, test } from '@playwright/test'
+import { installSyncMock, messageItem, type WireProject, type WireSession } from './ws-fixture'
 
-const project = { id: 'project-1', root: '/fixture', display_name: 'Fixture', archived: false, created_at: '', updated_at: '' }
-const session = { id: 'session-1', project_id: project.id, display_name: 'Failure fixture', provider: 'fake', model_profile: 'fake', model_id: 'fake', status: 'idle', created_at: '', updated_at: '', last_used_at: '', created_cwd: '', last_seq: 0, archived: false }
-
-const failedUserItem = {
-  seq: 1, id: 'u1', turn_id: 'turn-1', created_at: new Date(1000).toISOString(), kind: 'message', visibility: 'normal', audience: 'user',
-  message: { role: 'user', content: { inline: 'fix the bug' } },
+const project: WireProject = { id: 'project-1', root: '/fixture', display_name: 'Fixture', archived: false, created_at: '2026-01-01T00:00:00Z', updated_at: '2026-01-01T00:00:00Z' }
+const session: WireSession = {
+  id: 'session-1',
+  project_id: project.id,
+  display_name: 'Failure fixture',
+  provider: 'fake',
+  model_profile: 'fast',
+  model_id: 'fake-model',
+  status: 'idle',
+  created_at: '2026-01-01T00:00:00Z',
+  updated_at: '2026-01-01T00:00:00Z',
+  last_used_at: '2026-01-01T00:00:00Z',
+  created_cwd: '/fixture',
+  last_seq: 0,
+  archived: false,
 }
 
-// After a run settles as failed, the durable session reports the interrupted
-// run/turn so the UI can offer Continue.
-function effectiveSession(options: { failedSession?: () => boolean }): typeof session {
-  if (options.failedSession?.()) {
-    return { ...session, status: 'failed', running_run_id: '', running_turn_id: '', interrupted_run_id: 'run-1', interrupted_turn_id: 'turn-1', last_run_status: 'failed' }
-  }
-  return session
-}
-
-type Gate = { release: (events: Array<Record<string, unknown>>) => void; promise: Promise<Array<Record<string, unknown>>> }
-function newGate(): Gate {
-  let release!: (events: Array<Record<string, unknown>>) => void
-  const promise = new Promise<Array<Record<string, unknown>>>((resolve) => { release = resolve })
-  return { release, promise }
-}
-function sse(events: Array<Record<string, unknown>>, startId = 1): string {
-  return events.map((event, index) => `id: ${startId + index}\ndata: ${JSON.stringify(event)}\n\n`).join('')
-}
-async function json(route: Route, body: unknown, status = 200) {
-  await route.fulfill({ status, contentType: 'application/json', body: JSON.stringify(body) })
-}
-
-// mockApp serves a session whose first run fails on demand. `committed`
-// flips the items endpoint to return the persisted user message, mirroring
-// the backend saving the turn input before the model runs.
-async function mockApp(page: Page, options: { gates: Gate[]; initialItems?: Array<Record<string, unknown>>; committedItems?: () => Array<Record<string, unknown>>; failedSession?: () => boolean }) {
-  let connection = 0
-  let runPosts = 0
-  const runBodies: Array<{ content?: string; images?: unknown[] }> = []
-  let continuePosts = 0
-  await page.route('**/api/**', async (route: Route) => {
-    const request = route.request()
-    const url = new URL(request.url())
-    if (url.pathname === '/api/events') {
-      await new Promise<never>(() => {})
-      return
-    }
-    if (url.pathname === '/api/bootstrap') return json(route, { version: 'e2e', cwd: '/fixture', server_root: '/fixture', config_path: '/fixture/config' })
-    if (url.pathname === '/api/projects') return json(route, { projects: [project] })
-    if (url.pathname === `/api/projects/${project.id}/sessions`) return json(route, { sessions: url.searchParams.get('archived') === 'true' ? [] : [session] })
-    if (url.pathname === '/api/runs/active') return json(route, { runs: [] })
-    if (url.pathname === `/api/sessions/${session.id}`) return json(route, effectiveSession(options))
-    if (url.pathname === `/api/sessions/${session.id}/snapshot`) {
-      const items = options.committedItems?.() ?? options.initialItems ?? []
-      const seqs = items.map((item) => Number((item as { seq?: number }).seq ?? 0)).filter(Boolean)
-      const lastSeq = seqs.at(-1) ?? 0
-      return json(route, { session_id: session.id, revision: String(lastSeq), session: { ...effectiveSession(options), last_seq: lastSeq }, history: { items, oldest_seq: seqs[0] ?? 0, newest_seq: seqs.at(-1) ?? 0, has_more_before: false, has_more_after: false } })
-    }
-    if (url.pathname === `/api/sessions/${session.id}/items`) {
-      const items = options.committedItems?.() ?? options.initialItems ?? []
-      const seqs = items.map((item) => Number((item as { seq?: number }).seq ?? 0)).filter(Boolean)
-      return json(route, { items, oldest_seq: seqs[0] ?? 0, newest_seq: seqs.at(-1) ?? 0, has_more_before: false, has_more_after: false })
-    }
-    if (url.pathname === `/api/sessions/${session.id}/runs` && request.method() === 'POST') {
-      runPosts++
-      runBodies.push(request.postDataJSON() as { content?: string; images?: unknown[] })
-      return json(route, { run_id: 'run-1', session_id: session.id, status: 'running' }, 202)
-    }
-    if (url.pathname === `/api/sessions/${session.id}/continue` && request.method() === 'POST') {
-      continuePosts++
-      return json(route, { run_id: 'run-2', session_id: session.id, status: 'running' }, 202)
-    }
-    if (url.pathname === '/api/runs/run-1/events' || url.pathname === '/api/runs/run-2/events') {
-      if (url.pathname.endsWith('run-2/events')) {
-        return route.fulfill({ status: 200, contentType: 'text/event-stream', body: sse([{ type: 'run.started', run_id: 'run-2', session_id: session.id, status: 'running' }, { type: 'run.settled', run_id: 'run-2', status: 'committed', turn_id: 'turn-2', last_seq: 2 }]) })
-      }
-      connection++
-      if (connection === 1) return route.fulfill({ status: 200, contentType: 'text/event-stream', body: sse([{ type: 'run.started', run_id: 'run-1', session_id: session.id, status: 'running' }, { type: 'turn.started', turn_id: 'turn-1' }]) })
-      const gate = options.gates[Math.min(connection - 2, options.gates.length - 1)] ?? newGate()
-      const events = await gate.promise
-      return route.fulfill({ status: 200, contentType: 'text/event-stream', body: sse(events, 100 * connection) })
-    }
-    return json(route, { error: { code: 'not_mocked', message: `${request.method()} ${url.pathname}` } }, 404)
+// turn.failed is a bounded typed diagnostic projected from execution. The
+// fixture exercises the same code/message path as the production adapter.
+test('shows a failed durable turn and continues without resending the user message', async ({ page }) => {
+  const server = await installSyncMock(page, {
+    projects: [project],
+    sessions: [session],
+    onCommand: (mock, command) => {
+      if (command.name !== 'run.start') return
+      void (async () => {
+        await new Promise<void>((resolve) => setTimeout(resolve, 80))
+        const sessionID = String(command.arguments.session_id)
+        const runID = String(command.arguments.run_id)
+        mock.settleRun(
+          sessionID,
+          runID,
+          'failed',
+          [messageItem(1, 'user', 'fix the bug', { id: 'u1', turn_id: 'turn-1' })],
+          { interrupted_run_id: runID, interrupted_turn_id: 'turn-1' },
+          {
+            code: 'model_http_error',
+            message: '429: slow down and try again',
+          },
+        )
+      })()
+    },
   })
-  return { runPosts: () => runPosts, continuePosts: () => continuePosts, runBodies }
-}
 
-test('shows the failure reason and continues without resending the user message', async ({ page }) => {
-  const fail = newGate()
-  const settle = newGate()
-  const hang = newGate()
-  let committed = false
-  let failed = false
-  const app = await mockApp(page, {
-    gates: [fail, settle, hang],
-    committedItems: () => committed ? [failedUserItem] : [],
-    failedSession: () => failed,
-  })
-  await page.goto('/')
+  await page.goto('/#token=e2e')
   await page.getByPlaceholder('Send a message to SAI').fill('fix the bug')
   await page.getByRole('button', { name: 'Send' }).click()
-  // The request is admitted, but this fixture does not emit the committed
-  // item until settlement; there is no optimistic user bubble.
-  await expect(page.getByText('fix the bug')).toHaveCount(0)
 
-  // The turn fails: the reason lands in the conversation, not the global banner.
-  fail.release([{ type: 'turn.failed', turn_id: 'turn-1', code: 'model_http_error', message: 'model provider returned 429 Too Many Requests: {"error":{"message":"slow down"}}' }])
-  const turnError = page.locator('.turn-error')
-  await expect(turnError).toBeVisible()
-  await expect(turnError).toContainText('429 Too Many Requests')
-  await expect(turnError).toContainText('slow down')
-  await expect(page.locator('.error-banner')).toHaveCount(0)
-  // The run is still attached: no Continue offer yet.
-  await expect(page.getByRole('button', { name: 'Continue' })).toHaveCount(0)
-
-  // The run settles: the persisted user message remains as the tail and the
-  // failure card offers Continue.
-  committed = true
-  failed = true
-  settle.release([{ type: 'run.settled', run_id: 'run-1', status: 'failed', turn_id: 'turn-1', last_seq: 1, message: 'run failed' }])
+  // Admission itself does not create a local user bubble; the typed durable
+  // item is the only source of the rendered message.
+  await page.waitForTimeout(10)
+  expect(await page.locator('.message.user.transient').count()).toBe(0)
   const continueButton = page.getByRole('button', { name: 'Continue' })
+  const turnError = page.locator('.turn-error')
   await expect(continueButton).toBeVisible()
-  await expect(turnError).toBeVisible()
   await expect(page.locator('.message.user .message-text').last()).toHaveText('fix the bug')
+  await expect(turnError).toContainText('model_http_error')
+  await expect(turnError).toContainText('429: slow down and try again')
+  await expect(page.locator('.error-banner')).toHaveCount(0)
 
-  // Continue uses its dedicated endpoint and sends no new user content.
+  // Settlement must not erase the safe failure reason. Continue starts a new
+  // typed run and therefore clears the old turn error without resending text.
+  const durableUserCount = await page.locator('.message.user:not(.transient)').count()
   await continueButton.click()
-  await expect.poll(app.continuePosts).toBe(1)
-  await expect(app.runBodies[0]?.content).toBe('fix the bug')
+  await expect.poll(() => server.commands.filter((command) => command.name === 'run.continue').length).toBe(1)
+  const continueCommand = server.commands.find((command) => command.name === 'run.continue')
+  expect(continueCommand?.arguments).not.toHaveProperty('content')
   await expect(turnError).toHaveCount(0)
+  await expect(page.locator('.message.user:not(.transient)')).toHaveCount(durableUserCount)
 })
 
 test('does not offer Continue when the session ends with an assistant message', async ({ page }) => {
-  await mockApp(page, {
-    gates: [],
-    initialItems: [
-      { seq: 1, id: 'u1', turn_id: 'turn-1', created_at: new Date(1000).toISOString(), kind: 'message', visibility: 'normal', audience: 'user', message: { role: 'user', content: { inline: 'question' } } },
-      { seq: 2, id: 'a1', turn_id: 'turn-1', created_at: new Date(2000).toISOString(), kind: 'message', visibility: 'normal', audience: 'model', message: { role: 'assistant', content: { inline: 'answer' } } },
-    ],
+  await installSyncMock(page, {
+    projects: [project],
+    sessions: [session],
+    contents: {
+      [session.id]: {
+        items: [messageItem(1, 'user', 'question'), messageItem(2, 'assistant', 'answer')],
+        hasMoreBefore: false,
+      },
+    },
   })
-  await page.goto('/')
+  await page.goto('/#token=e2e')
   await expect(page.locator('.message.assistant .message-text').last()).toHaveText('answer')
   await expect(page.getByRole('button', { name: 'Continue' })).toHaveCount(0)
   await expect(page.locator('.turn-error')).toHaveCount(0)

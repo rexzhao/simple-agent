@@ -374,7 +374,7 @@ func (s *Server) Handler() http.Handler {
 			writeAPIError(w, http.StatusForbidden, "invalid_host", "request host is not allowed")
 			return
 		}
-		if strings.HasPrefix(r.URL.Path, "/api/") {
+		if r.URL.Path == "/api" || strings.HasPrefix(r.URL.Path, "/api/") {
 			if r.URL.Path != "/api/ws" && !s.authorized(r) {
 				writeAPIError(w, http.StatusUnauthorized, "unauthorized", "valid capability token required")
 				return
@@ -446,7 +446,6 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /api/blobs/{blobID}", s.handleBlob)
 	s.mux.HandleFunc("POST /api/ws-ticket", s.handleWSTicket)
 	s.mux.HandleFunc("GET /api/ws", s.handleWebSocket)
-	s.mux.HandleFunc("GET /api/events", s.handleLifecycleEvents)
 	s.mux.HandleFunc("GET /api/projects", s.handleListProjects)
 	s.mux.HandleFunc("POST /api/projects", s.handleCreateProject)
 	s.mux.HandleFunc("PATCH /api/projects/{projectID}", s.handleRenameProject)
@@ -479,7 +478,6 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /api/sessions/{sessionID}/runs", s.handleStartRun)
 	s.mux.HandleFunc("POST /api/sessions/{sessionID}/continue", s.handleContinueRun)
 	s.mux.HandleFunc("GET /api/runs/active", s.handleListActiveRuns)
-	s.mux.HandleFunc("GET /api/runs/{runID}/events", s.handleRunEvents)
 	s.mux.HandleFunc("POST /api/runs/{runID}/prompts", s.handleAppendActive)
 	s.mux.HandleFunc("DELETE /api/runs/{runID}/prompts/{promptID}", s.handleRemoveActivePrompt)
 	s.mux.HandleFunc("POST /api/runs/{runID}/prompts/{promptID}/steer", s.handleSteerActivePrompt)
@@ -508,6 +506,13 @@ func (s *Server) staticHandler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet && r.Method != http.MethodHead {
 			http.NotFound(w, r)
+			return
+		}
+		// API paths never participate in the SPA fallback. In particular, a
+		// removed or misspelled route must remain an explicit API 404 rather
+		// than returning index.html with a successful status.
+		if r.URL.Path == "/api" || strings.HasPrefix(r.URL.Path, "/api/") {
+			writeAPIError(w, http.StatusNotFound, "not_found", "route not found")
 			return
 		}
 		assetPath := strings.TrimPrefix(path.Clean(r.URL.Path), "/")

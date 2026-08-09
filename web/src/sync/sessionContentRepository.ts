@@ -229,6 +229,7 @@ export class SessionContentRepository {
       historyState,
       activeRun: state.snapshot.active_run,
       compaction: state.snapshot.compaction,
+      ...(state.turnFailure ? { turnFailure: state.turnFailure } : {}),
       ...(state.transientRun ? { runState: state.transientRun } : {}),
       ...(record.metadata.error ? { error: { code: record.metadata.error.code, message: record.metadata.error.message } } : {}),
     } : {

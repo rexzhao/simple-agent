@@ -112,7 +112,7 @@ function App() {
   const [completionNotice, setCompletionNotice] = useState<BackgroundCompletionNotice | null>(null)
   const sessionIndexObservationsRef = useRef(new Map<string, SessionIndexCompletionObservation>())
   const sessionIndexNoticeKeysRef = useRef(new Set<string>())
-  const [turnErrors, setTurnErrors] = useState<Record<string, { turnID: string; message: string }>>({})
+  const [turnErrors, setTurnErrors] = useState<Record<string, { turnID: string; code: string; message: string }>>({})
   const [compactingSessionIDs, setCompactingSessionIDs] = useState<Record<string, boolean>>({})
   const [awaitingRunStartedBySession, setAwaitingRunStartedBySession] = useState<Record<string, boolean>>({})
   const { draftsBySession, updateDraft, addPastedText, removePastedText, addPastedImage, removePastedImage, clearDraft } = useComposerDrafts()
@@ -955,6 +955,15 @@ function App() {
   // session_content subscription_event is the opened session's transient
   // content authority. No page-local run registry or stream is consulted.
   const selectedActiveRun = activeRunForConversation(sessionContentView, viewingSessionID)
+  useEffect(() => {
+    if (!viewingSessionID || !sessionContentView.turnFailure) return
+    const failure = sessionContentView.turnFailure
+    setTurnErrors((current) => {
+      const previous = current[viewingSessionID]
+      if (previous?.turnID === failure.turnID && previous.code === failure.code && previous.message === failure.message) return current
+      return { ...current, [viewingSessionID]: failure }
+    })
+  }, [sessionContentView.turnFailure, viewingSessionID])
   useEffect(() => {
     if (!viewingSessionID) return
     const expectedRunID = pendingRunIDsRef.current.get(viewingSessionID)

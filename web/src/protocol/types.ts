@@ -338,6 +338,7 @@ export type SubscriptionEventData =
   | (SubscriptionEventBase & { type: 'run.prompt_queue'; turn_id?: string; prompts: { id: string; content: string; steer: boolean }[] })
   | (SubscriptionEventBase & { type: 'run.prompt_appended'; turn_id?: string; prompts: string[] })
   | (SubscriptionEventBase & { type: 'run.started'; status: 'running' })
+  | (SubscriptionEventBase & { type: 'turn.failed'; turn_id: string; code: string; message: string })
   | (SubscriptionEventBase & { type: 'run.settled'; status: 'committed' | 'failed' | 'interrupted' | 'cancelled'; durable_settlement_watermark: DurableSettlementWatermark })
 
 export interface SubscriptionEventPayload {

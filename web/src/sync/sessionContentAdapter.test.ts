@@ -127,12 +127,27 @@ describe('SessionContentAdapter', () => {
     expect(state.transientRun?.text[JSON.stringify(['turn_a', 1, 'item_a'])].text).toBe('hello')
     expect(state.transientRun?.tools.tool_a.status).toBe('finished')
     expect(state.transientRun?.promptQueue[0].id).toBe('p1')
-    state = adapter.applyTransient(state, event('9', 'run.settled', { status: 'committed', durable_settlement_watermark: { resource_revision: '9', run_cursor: '8', verified: false, covered_items: [] } }), { ...context, resourceRevision: '8' })
+    state = adapter.applyTransient(state, event('9', 'turn.failed', { turn_id: 'turn_a', code: 'model_http_error', message: '429: slow down and try again' }), context)
+    expect(state.turnFailure).toEqual({ turnID: 'turn_a', code: 'model_http_error', message: '429: slow down and try again' })
+    state = adapter.applyTransient(state, event('10', 'run.settled', { status: 'committed', durable_settlement_watermark: { resource_revision: '9', run_cursor: '9', verified: false, covered_items: [] } }), { ...context, resourceRevision: '8' })
     expect(state.transientRun?.status).toBe('committed')
     expect(state.transientRun?.recoveryRequired).toBe(true)
     state = adapter.applyChange(state, [{ op: 'item.upsert', item: item('item_a', 'hello') }], { ...context, resourceRevision: '9' })
     expect(state.transientRun).not.toBeNull()
-    expect(() => adapter.applyTransient(state, event('10', 'run.started', { status: 'running', run_id: 'run_a' }), { ...context, resourceRevision: '9' })).toThrow()
+    expect(() => adapter.applyTransient(state, event('11', 'run.started', { status: 'running', run_id: 'run_a' }), { ...context, resourceRevision: '9' })).toThrow()
+  })
+
+  it('counts turn failure message length by Unicode code points', () => {
+    const adapter = new SessionContentAdapter('session_a')
+    const context = { resource: { type: 'session_content' as const, id: 'session_a' }, resourceRevision: '1', generation: 1 }
+    const event = (cursor: string, message: string) => ({
+      type: 'turn.failed', session_id: 'session_a', run_id: 'run_a', run_cursor: cursor,
+      turn_id: 'turn_a', code: 'provider_error', message,
+    }) as unknown as SubscriptionEventData
+
+    const state = stateWithRunning()
+    expect(() => adapter.applyTransient(state, event('1', '🦄'.repeat(600)), context)).not.toThrow()
+    expect(() => adapter.applyTransient(state, event('1', '🦄'.repeat(601)), context)).toThrow('turn.failed.message is too long')
   })
 
   it('only clears a verified settlement after both revision and covered item identity are durable', () => {

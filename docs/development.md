@@ -23,7 +23,7 @@ cmd/sai
   default Web launcher
 
 internal/webapp
-  embedded static assets, loopback security, JSON API, SSE run streams
+  embedded static assets, loopback security, retained JSON API, WebSocket gateway
 
 internal/execution
   project/session lifecycle, configured session creation, run handles,
@@ -49,13 +49,13 @@ tool/MCP/skill loading, compaction, or storage logic.
    session storage, and sends it as a bearer token.
 3. Project and session management use JSON HTTP endpoints.
 4. Starting a run returns a Web run ID immediately.
-5. The UI reads its ordered server-sent event stream with `fetch`.
-6. Transient text/reasoning/tool events update the active UI block.
-7. Committed item projection events update the canonical session store directly.
-   `run.settled` carries a committed revision watermark: a local projection
-   that covers it needs no snapshot; only a missing/lagging watermark (or
-   `run.resync_required`) triggers an authoritative refresh. The legacy
-   `last_seq` settlement fallback remains for older servers.
+5. The UI obtains a short-lived WebSocket ticket and opens the single ordered
+   sync connection.
+6. Typed session-content events update transient text/reasoning/tool state;
+   committed item projection events update the canonical session store.
+7. Session Content owns transient replay and durable revision barriers. A
+   reconnect uses the WebSocket snapshot/replay contract rather than an HTTP
+   run cursor or a second event source.
 8. Cancelling a run calls `SessionRun.Cancel` and interrupts only that run.
 
 ## Web API
@@ -72,18 +72,16 @@ GET    /api/sessions/{id}
 GET    /api/sessions/{id}/items?before_seq=&after_seq=&limit=
 POST   /api/sessions/{id}/runs
 GET    /api/runs/active
-GET    /api/runs/{id}/events
 DELETE /api/runs/{id}
 POST   /api/sessions/{id}/compact
 ```
 
-The event contract includes `turn.started`, `text.delta`, `reasoning.delta`,
-`tool.requested`, `tool.started`, `tool.finished`, `usage.updated`, persisted
-item notifications, `turn.committed`, `turn.failed`, `run.resync_required`, and
-`run.settled`. Web run events are a bounded replay buffer for live rendering;
-the durable session item API remains canonical. A replay gap emits
-`run.resync_required`, and terminal runs retain only their settlement event for
-a short recovery window.
+The WebSocket subscription contract includes typed `text.delta`,
+`reasoning.delta`, tool lifecycle, prompt-queue, durable item, and settlement
+notifications. Session Content owns the bounded transient replay and
+resynchronization barrier; the durable session item API remains canonical.
+The retained REST routes above are compatibility/application routes, not a
+second live event transport.
 
 ## Security
 
@@ -94,7 +92,7 @@ a short recovery window.
 - CORS is not enabled.
 - Static responses use CSP, frame denial, no-referrer, and nosniff headers.
 - Provider errors, API keys, hidden session items, and raw tool results are not
-  added to Web run events.
+  added to WebSocket subscription payloads.
 
 ## Build and generated assets
 
@@ -123,7 +121,8 @@ tag injected into `webapp.Version`, verifies the version marker, generates
 
 - `go test ./internal/execution` covers project/session/run contracts.
 - `go test ./internal/webapp` covers capability auth, embedded assets, project
-  and configured session creation, SSE events, and durable results.
+  and configured session creation, API route boundaries, WebSocket sync, and
+  durable results.
 - `npm run build` performs strict TypeScript checking and a production bundle.
 - `npm run test:e2e` covers onboarding, session creation, streaming commit,
   cancellation, run recovery, archive/restore, and history scrolling in Chromium.

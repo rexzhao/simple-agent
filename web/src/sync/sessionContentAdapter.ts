@@ -1,6 +1,7 @@
 import { isRFC3339Timestamp } from '../protocol/datetime'
 import { isCanonicalWireIdentifier, isWellFormedString } from '../protocol/identifiers'
 import { compareRunCursor, isRunCursor, isResourceRevision } from '../protocol/sequence'
+import { unicodeCodePointLength } from '../protocol/strings'
 import type { ChangeOperation, SubscriptionEventData } from '../protocol/types'
 import type { ReplicaApplyContext, ResourceAdapter, TransientResumeToken } from './localReplica'
 import {
@@ -22,6 +23,7 @@ import {
   type SessionContentTransientItemWatermark,
   type SessionPrompt,
   type SessionRunState,
+  type SessionRunFailure,
   type SessionToolState,
   type SessionTransientText,
 } from '../domain/sessionContent'
@@ -441,8 +443,8 @@ function cloneSnapshot(value: unknown, sessionID: string): SessionContentSnapsho
   return { schema_version: 1, session, history, active_run: activeRun, compaction }
 }
 
-function copyState(snapshot: SessionContentSnapshot, revisionValue: string, transientRun: SessionRunState | null): SessionContentState {
-  return { snapshot, durableResourceRevision: revisionValue, transientRun }
+function copyState(snapshot: SessionContentSnapshot, revisionValue: string, transientRun: SessionRunState | null, turnFailure?: SessionRunFailure): SessionContentState {
+  return { snapshot, durableResourceRevision: revisionValue, transientRun, ...(turnFailure ? { turnFailure } : {}) }
 }
 
 function copyMap<T>(value: Readonly<Record<string, T>>): Record<string, T> {
@@ -480,7 +482,7 @@ function revisionCovers(current: string, target: string): boolean {
 function maybeClearSettled(state: SessionContentState, revisionValue: string): SessionContentState {
   const run = state.transientRun
   if (!run?.settlement || !run.settlement.verified || !revisionCovers(revisionValue, run.settlement.resource_revision) || !coveredByDurable(state.snapshot, run.settlement)) return state
-  return copyState(state.snapshot, revisionValue, null)
+  return copyState(state.snapshot, revisionValue, null, state.turnFailure)
 }
 
 function normalizeTextOverlay(snapshot: SessionContentSnapshot, run: SessionRunState | null): SessionRunState | null {
@@ -517,10 +519,10 @@ function eventObject(value: unknown): Record<string, unknown> {
   const type = stringValue(source.type, 'subscription event.type')
   exactKeys(source, ['type', 'session_id', 'run_id', 'run_cursor'], [
     'turn_id', 'agent_iteration', 'item_id', 'delta', 'durable_text_length', 'durable_checkpointed',
-    'tool_call_id', 'name', 'arguments', 'arguments_delta', 'content', 'is_error', 'prompts', 'status',
+    'tool_call_id', 'name', 'arguments', 'arguments_delta', 'content', 'is_error', 'prompts', 'status', 'code', 'message',
     'durable_settlement_watermark',
   ], 'subscription event')
-  if (!['text.delta', 'reasoning.delta', 'tool.requested', 'tool.running', 'tool.progress', 'tool.finished', 'run.prompt_queue', 'run.prompt_appended', 'run.started', 'run.settled'].includes(type)) throw new Error(`unknown subscription event type ${type}`)
+  if (!['text.delta', 'reasoning.delta', 'tool.requested', 'tool.running', 'tool.progress', 'tool.finished', 'run.prompt_queue', 'run.prompt_appended', 'run.started', 'turn.failed', 'run.settled'].includes(type)) throw new Error(`unknown subscription event type ${type}`)
   return source
 }
 
@@ -586,6 +588,14 @@ function validateEventVariant(event: Record<string, unknown>, identity: ReturnTy
       eventFields(event, ['status'], [], 'run.started')
       if (event.status !== 'running') throw new Error('run.started status must be running')
       break
+    case 'turn.failed': {
+      eventFields(event, ['code', 'message'], [], 'turn.failed')
+      if (!identity.turnID) throw new Error('turn.failed identity is incomplete')
+      identifier(event.code, 'turn.failed.code')
+      const failureMessage = stringValue(event.message, 'turn.failed.message')
+      if (unicodeCodePointLength(failureMessage) > 600) throw new Error('turn.failed.message is too long')
+      break
+    }
     case 'text.delta':
     case 'reasoning.delta':
       eventFields(event, ['item_id', 'delta'], ['durable_text_length', 'durable_checkpointed'], identity.type)
@@ -784,7 +794,10 @@ function updateRun(state: SessionContentState, event: Record<string, unknown>, s
       break
     }
   }
-  const updated = copyState(state.snapshot, context?.resourceRevision ?? state.durableResourceRevision, next)
+  const turnFailure = identity.type === 'turn.failed'
+    ? { turnID: identity.turnID ?? '', code: stringValue(event.code, 'turn.failed.code'), message: stringValue(event.message, 'turn.failed.message') }
+    : identity.type === 'run.started' ? undefined : state.turnFailure
+  const updated = copyState(state.snapshot, context?.resourceRevision ?? state.durableResourceRevision, next, turnFailure)
   return maybeClearSettled(updated, updated.durableResourceRevision)
 }
 
@@ -856,7 +869,7 @@ function applyDurableOperations(previous: SessionContentState, operations: reado
     previous.transientRun.runEpoch === '' && checked.active_run.run_epoch !== undefined
     ? { ...previous.transientRun, runEpoch: checked.active_run.run_epoch }
     : previous.transientRun
-  const next = copyState(checked, context?.resourceRevision ?? previous.durableResourceRevision, transientRun)
+  const next = copyState(checked, context?.resourceRevision ?? previous.durableResourceRevision, transientRun, previous.turnFailure)
   return maybeClearSettled({ ...next, transientRun: normalizeTextOverlay(checked, next.transientRun) }, next.durableResourceRevision)
 }
 
@@ -885,7 +898,7 @@ export class SessionContentAdapter implements ResourceAdapter<SessionContentStat
   decodeSnapshot(value: unknown, previous: SessionContentState | undefined, context?: ReplicaApplyContext): SessionContentState {
     this.validateContext(context)
     const snapshot = cloneSnapshot(value, this.sessionID)
-    return copyState(snapshot, context?.resourceRevision ?? previous?.durableResourceRevision ?? '', snapshotTransientBaseline(snapshot))
+    return copyState(snapshot, context?.resourceRevision ?? previous?.durableResourceRevision ?? '', snapshotTransientBaseline(snapshot), previous?.turnFailure)
   }
 
   applyChange(previous: SessionContentState, operations: readonly ChangeOperation[], context?: ReplicaApplyContext): SessionContentState {
@@ -913,7 +926,7 @@ export class SessionContentAdapter implements ResourceAdapter<SessionContentStat
 
   clearTransient(previous: SessionContentState): SessionContentState {
     if (!previous.transientRun) return previous
-    return copyState(previous.snapshot, previous.durableResourceRevision, null)
+    return copyState(previous.snapshot, previous.durableResourceRevision, null, previous.turnFailure)
   }
 
   getTransientResume(previous: SessionContentState): TransientResumeToken | undefined {

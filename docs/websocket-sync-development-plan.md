@@ -7,7 +7,7 @@
 彻底重构后，原渐进迁移方案需要做以下调整：
 
 1. **不再把现有 `LifecycleHub` 当作新同步层基础。**它只提供 best-effort fan-out，没有统一序列、原子 snapshot barrier 和通用资源模型。新建独立 Sync Engine，业务层只发布 typed domain changes。
-2. **不再复用 SSE wire event。**删除 `/api/events`、`/api/runs/{runID}/events` 以及前端 `streamLifecycle`、`streamRun`。旧事件可以作为 Go 内部适配输入短期存在，但不能进入新协议 DTO。
+2. **不再复用旧的 SSE wire event。**删除 `/api/events`、`/api/runs/{runID}/events` 以及前端 `streamLifecycle`、`streamRun`。执行层的 `SessionStreamEvent` 仍作为 transport-neutral 输入供 WebSocket projection 使用，但不再有 SSE adapter 或 SSE DTO。
 3. **不做 SSE/WS 双路并行。**双路会制造重复事件、两套恢复规则和两套权威 Store。新前端只能通过一个 WebSocket 实时连接驱动状态。
 4. **不再让 Session `LastSeq` 同时承担同步投递序列。**新协议明确分离：
    - `sequence`：订阅流连续性、replay 和 ACK；
@@ -1153,21 +1153,29 @@ codex_login.start/clear
   独立的 WebSocket ticket/Blob client 边界仍按既有模式保留。旧 Go HTTP
   routes/handlers 本阶段不删除，留待 Stage G；本项也不包含 `web.eval`。
 
-### 阶段 G：删除旧系统并 cutover
+### 阶段 G：删除旧系统并 cutover（进行中）
 
-删除：
+#### G1：彻底删除 legacy SSE transport（已完成）
 
-```text
-GET /api/events
-GET /api/runs/{runID}/events
-internal/webapp/lifecycle_events.go
-SSE frame writer/parser
-web streamLifecycle
-web streamRun
-旧 lifecycle DTO/reducer
-旧 REST mutation handlers/routes
-仅服务旧传输的测试和文档
-```
+- 删除 process-wide `/api/events` 与 per-run `/api/runs/{runID}/events` 路由及其
+  `internal/webapp` adapters、SSE framing helpers 和专属测试；未知 `/api/...` 不再走
+  SPA fallback，而是返回明确的非 HTML 404。
+- 保留 execution lifecycle hub/event、`SessionStreamEvent`、run coordinator 和
+  `SessionRunEventObserver`。Project Index、Session Index、Session Content 与 run
+  control 继续使用这些 transport-neutral authority；Session Content 自己持有
+  WebSocket transient replay，而不是由 Webapp run registry 复制一份。
+- 保留所有其他旧 REST mutation/query handlers/routes；它们属于 G2，不在 G1 删除。
+- 增加生产 Webapp transport guard 与 route-level regression tests，防止 legacy SSE route、
+  writer 或 `text/event-stream` 回归；bootstrap、WebSocket ticket/connection、Blob/image
+  路径继续由各自的既有测试覆盖。
+- clean-break guard 同时扫描生产前端、Playwright E2E fixtures 和 embedded browser assets，
+  防止旧 endpoint、SSE framing 或 `EventSource` fixture 重新出现；这只表示 G1 完成，
+  不表示整个 Stage G 完成。
+
+#### G2：删除其余旧 REST mutation/query surface（未开始）
+
+后续才处理旧 REST mutation/query handlers/routes、对应 DTO 和仅服务这些 routes 的测试，
+并完成剩余 clean-break 验收。G1 不代表 Stage G 或整个 WebSocket cutover 已完成。
 
 保留 domain service、durable Session projector、item identity 和已经验证的业务规则；删除的是 transport/sync 结构，不是重写 Agent 执行语义。
 

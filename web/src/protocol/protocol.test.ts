@@ -92,13 +92,36 @@ describe('shared protocol golden fixtures', () => {
     expect(() => decodeMessage(JSON.stringify(message))).toThrow(ProtocolDecodeError)
   })
 
+  it('decodes a bounded typed turn failure and rejects an oversized reason', () => {
+    const fixture = fixtures.valid.find((candidate) => candidate.name === 'subscription_event')
+    expect(fixture).toBeDefined()
+    const message = structuredClone(fixture?.message) as Record<string, any>
+    message.payload.event = {
+      type: 'turn.failed',
+      session_id: 'session_2',
+      run_id: 'run_1',
+      run_cursor: '3',
+      turn_id: 'turn-1',
+      code: 'model_http_error',
+      message: '429: slow down and try again',
+    }
+    const decoded = decodeMessage(JSON.stringify(message))
+    if (decoded.type !== 'subscription_event') throw new Error('wrong subscription event type')
+    expect(decoded.payload.event).toMatchObject({ type: 'turn.failed', code: 'model_http_error' })
+
+    message.payload.event.message = '🦄'.repeat(600)
+    expect(() => decodeMessage(JSON.stringify(message))).not.toThrow()
+    message.payload.event.message = 'x'.repeat(601)
+    expect(() => decodeMessage(JSON.stringify(message))).toThrow(ProtocolDecodeError)
+  })
+
   it('rejects an ambiguous settlement watermark', () => {
     const fixture = fixtures.valid.find((candidate) => candidate.name === 'subscription_event')
     expect(fixture).toBeDefined()
     const message = structuredClone(fixture?.message) as Record<string, any>
     message.payload.event = {
       type: 'run.settled',
-      session_id: 'session_1',
+      session_id: 'session_2',
       run_id: 'run_1',
       run_cursor: '3',
       status: 'committed',

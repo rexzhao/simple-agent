@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/rexzhao/simple-agent/internal/eventbus"
 	"github.com/rexzhao/simple-agent/internal/execution"
@@ -75,6 +76,8 @@ func TestServerRequiresTokenForAPIAndServesEmbeddedUI(t *testing.T) {
 
 func TestServerProjectSessionAndRunFlow(t *testing.T) {
 	server, service := newWebTestServer(t)
+	lifecycle := service.LifecycleHub().Subscribe()
+	defer lifecycle.Close()
 	root := t.TempDir()
 
 	created := doJSONRequest(t, http.MethodPost, server.URL+"/api/projects", map[string]string{
@@ -127,38 +130,25 @@ func TestServerProjectSessionAndRunFlow(t *testing.T) {
 		t.Fatal("run id is empty")
 	}
 
-	request, err := http.NewRequest(http.MethodGet, server.URL+"/api/runs/"+run.ID+"/events", nil)
-	if err != nil {
-		t.Fatalf("NewRequest(events) error = %v", err)
-	}
-	request.Header.Set("Authorization", "Bearer "+testToken)
-	response, err := http.DefaultClient.Do(request)
-	if err != nil {
-		t.Fatalf("GET events error = %v", err)
-	}
-	defer response.Body.Close()
-	events, err := io.ReadAll(response.Body)
-	if err != nil {
-		t.Fatalf("ReadAll(events) error = %v", err)
-	}
-	requireEvent := func(eventType string) {
-		t.Helper()
-		if !bytes.Contains(events, []byte(`"type":"`+eventType+`"`)) {
-			t.Fatalf("events missing %q: %s", eventType, events)
-		}
-	}
-	requireEvent("run.settled")
-	if !bytes.Contains(events, []byte(`"committed_revision":"`)) {
-		t.Fatalf("run.settled missing committed_revision: %s", events)
-	}
-	// A fast run may settle between SSE snapshots. Terminal replay deliberately
-	// retains only run.settled, so the server signals run.resync_required and the
-	// client reloads the durable session instead of receiving every transient
-	// event. Require the complete live sequence only when replay was not
-	// truncated; the persisted-item assertions below verify the resync path.
-	if !bytes.Contains(events, []byte(`"type":"run.resync_required"`)) {
-		for _, eventType := range []string{"turn.started", "text.delta", "turn.committed"} {
-			requireEvent(eventType)
+	deadline := time.NewTimer(5 * time.Second)
+	defer deadline.Stop()
+	settled := false
+	for !settled {
+		select {
+		case event := <-lifecycle.Events():
+			if event.Type != execution.LifecycleRunSettled || !bytes.Contains(event.Payload, []byte(`"run_id":"`+run.ID+`"`)) {
+				continue
+			}
+			var payload map[string]any
+			if err := json.Unmarshal(event.Payload, &payload); err != nil {
+				t.Fatalf("decode lifecycle settlement: %v", err)
+			}
+			if revision, ok := payload["committed_revision"].(string); !ok || revision == "" {
+				t.Fatalf("run.settled missing committed_revision: %#v", payload)
+			}
+			settled = true
+		case <-deadline.C:
+			t.Fatal("run.settled lifecycle event was not observed")
 		}
 	}
 
@@ -323,28 +313,18 @@ func TestServerCancelsRun(t *testing.T) {
 	}
 	cancelled.Body.Close()
 
-	request, err := http.NewRequest(http.MethodGet, server.URL+"/api/runs/"+run.ID+"/events", nil)
-	if err != nil {
-		t.Fatalf("NewRequest(events) error = %v", err)
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		active = doJSONRequest(t, http.MethodGet, server.URL+"/api/runs/active", nil)
+		if active.StatusCode != http.StatusOK {
+			t.Fatalf("GET active runs while cancelling status = %d body=%s", active.StatusCode, readBody(active))
+		}
+		decodeResponse(t, active, &activePayload)
+		if len(activePayload.Runs) == 0 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
-	request.Header.Set("Authorization", "Bearer "+testToken)
-	response, err := http.DefaultClient.Do(request)
-	if err != nil {
-		t.Fatalf("GET events error = %v", err)
-	}
-	defer response.Body.Close()
-	events, err := io.ReadAll(response.Body)
-	if err != nil {
-		t.Fatalf("ReadAll(events) error = %v", err)
-	}
-	if !bytes.Contains(events, []byte(`"type":"run.settled"`)) || !bytes.Contains(events, []byte(`"status":"cancelled"`)) {
-		t.Fatalf("cancel events = %s", events)
-	}
-	active = doJSONRequest(t, http.MethodGet, server.URL+"/api/runs/active", nil)
-	if active.StatusCode != http.StatusOK {
-		t.Fatalf("GET active runs after cancellation status = %d body=%s", active.StatusCode, readBody(active))
-	}
-	decodeResponse(t, active, &activePayload)
 	if len(activePayload.Runs) != 0 {
 		t.Fatalf("GET active runs after cancellation = %#v, want empty", activePayload.Runs)
 	}

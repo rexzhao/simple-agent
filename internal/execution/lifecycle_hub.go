@@ -9,9 +9,9 @@ import (
 const defaultLifecycleSubscriberBuffer = 64
 
 // LifecycleEvent is a durable-state or run lifecycle notification. Payload is
-// the complete JSON object sent to an SSE client; it includes Type as well as
-// the event-specific fields so consumers can use either the SSE event name or
-// the JSON body.
+// the complete JSON object delivered to lifecycle projections; it includes
+// Type as well as the event-specific fields so consumers can use either the
+// typed discriminator or the JSON body.
 type LifecycleEvent struct {
 	Type    string
 	Payload []byte
