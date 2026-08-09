@@ -79,6 +79,28 @@ describe('session-content repository selectors', () => {
     expect(Object.keys(view)).not.toContain('generation')
   })
 
+  it('observes terminal and durable run identities without requiring an active row', async () => {
+    const replica = new LocalReplica()
+    const syncRepository = new SyncSessionContentRepository(replica)
+    const repository = new SessionContentRepository(syncRepository)
+    const resource = { type: 'session_content' as const, id: 'session_run_authority' }
+    const current = snapshot(resource.id) as any
+    current.session.last_run_id = 'run_terminal'
+    current.session.latest_run_id = 'run_terminal'
+    replica.applySnapshot(resource, new SessionContentAdapter(resource.id), current, {
+      streamEpoch: 'stream_1', sequence: '1' as Sequence, resourceRevision: '1', generation: 1,
+    })
+
+    expect(repository.hasObservedRun(resource.id, 'run_terminal')).toBe(true)
+    expect(repository.hasObservedRun(resource.id, 'other_session_run')).toBe(false)
+    const pending = repository.waitForRunObserved(resource.id, 'run_next', { timeoutMS: 500 })
+    replica.applyChange(resource, new SessionContentAdapter(resource.id), [{
+      op: 'metadata.replace',
+      metadata: { ...current.session, current_run_id: 'run_next', last_run_id: 'run_terminal', latest_run_id: 'run_terminal' },
+    }], { streamEpoch: 'stream_1', sequence: '2' as Sequence, resourceRevision: '2', generation: 1 })
+    await expect(pending).resolves.toMatchObject({ session: { current_run_id: 'run_next' } })
+  })
+
   it('merges an older command page by stable identity and ignores a late old generation', async () => {
     const replica = new LocalReplica()
     let resolvePage: ((page: SessionContentHistoryWindow) => void) | undefined

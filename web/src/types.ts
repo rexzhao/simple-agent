@@ -159,57 +159,9 @@ export interface Session {
   context?: ContextMetadata
 }
 
-export interface ActiveRunDescriptor {
-  run_id: string
-  session_id: string
-  turn_id?: string
-  started_at: string
-  status: string
-}
-
-/** HTTP 202 response after the coordinator has admitted a run. */
-export interface RunAdmission {
-  run_id: string
-  session_id: string
-  status: string
-}
-
-export type LifecycleEventType =
-  | 'session.created'
-  | 'session.updated'
-  | 'session.archived'
-  | 'session.deleted'
-  | 'run.started'
-  | 'run.settled'
-
-/** Payload emitted by the process-wide /api/events SSE stream. */
-export interface LifecycleEvent {
-  type: LifecycleEventType
-  session?: Session | string
-  session_id?: string
-  project_id?: string
-  project?: string
-  descendants?: string[]
-  reason?: string
-  run?: string
-  run_id?: string
-  status?: string
-  last_seq?: number
-  committed_revision?: string
-  turn_id?: string
-  metadata?: Session
-  session_metadata?: Session
-  message?: string
-}
-
 export interface MessageContent {
   inline?: string
   preview?: string
-}
-
-export interface ImageAttachmentInput {
-  data_url: string
-  detail?: 'auto' | 'low' | 'high'
 }
 
 export interface SessionImageAttachment {
@@ -253,51 +205,6 @@ export interface ItemsPage {
   has_more_before: boolean
   has_more_after: boolean
 }
-
-export interface SessionSnapshot {
-  session_id: string
-  revision: string
-  session: Session
-  history: ItemsPage
-}
-
-export interface SessionItemProjectionEvent {
-  type: 'item.appended' | 'item.created' | 'item.updated'
-  session_id: string
-  run_id?: string
-  turn_id?: string
-  /** Full projection identity is (turn_id, agent_iteration, item_id). */
-  agent_iteration?: number
-  /** Durable record sequence that caused this notification. */
-  seq: number
-  /** Precision-safe session watermark after the committed transaction. */
-  revision: string
-  item_id: string
-  item: SessionItem
-  /** Present for assistant items; the full committed text length in runes. */
-  assistant_text_length?: number
-}
-
-export type RunEvent =
-  | { type: 'run.started'; run_id?: string; session_id?: string; turn_id?: string; status?: string }
-  | { type: 'turn.started'; turn_id: string }
-  | { type: 'compaction.started'; turn_id: string; trigger: 'auto' | 'manual' }
-  | { type: 'compaction.completed'; turn_id: string; trigger: 'auto' | 'manual'; compaction_id: string; active_context_tokens?: number; context_window?: number }
-  | { type: 'provider.retrying'; turn_id: string; agent_iteration: number; attempt: number; max_attempts: number; delay_ms: number; reason: string }
-	| { type: 'agent.iteration.started'; turn_id: string; agent_iteration: number }
-	| { type: 'text.delta'; turn_id: string; agent_iteration: number; text: string; item_id?: string; durable_text_length?: number; durable_checkpointed?: boolean }
-	| { type: 'reasoning.delta'; turn_id: string; agent_iteration: number; text: string; item_id?: string }
-	| { type: 'tool.requested' | 'tool.started'; turn_id: string; agent_iteration: number; tool_call_id: string; name: string; arguments?: string }
-	| { type: 'tool.finished'; turn_id: string; agent_iteration: number; tool_call_id: string; name: string; is_error: boolean; content?: string }
-	| { type: 'usage.updated'; turn_id: string; agent_iteration: number; input_tokens: number; output_tokens: number; total_tokens: number; cached_tokens: number; cache_write_tokens: number; reasoning_tokens: number }
-	| SessionItemProjectionEvent
-  | { type: 'run.prompt_queue'; turn_id?: string; prompts?: QueuedPrompt[] }
-  | { type: 'run.prompt_appended'; turn_id?: string; prompts?: string[] }
-  | { type: 'run.resync_required'; run_id: string; session_id: string; oldest_seq: number; oldest_stream_event_id?: number; required_revision?: string }
-  | { type: 'turn.committed'; turn_id: string; last_seq: number }
-  | { type: 'turn.failed'; turn_id: string; code: string; message: string }
-  | { type: 'run.settled'; run_id: string; status: string; turn_id?: string; last_seq?: number; committed_revision?: string; message?: string }
-  | { type: string; [key: string]: unknown }
 
 export interface ToolActivity {
 	kind: 'tool'

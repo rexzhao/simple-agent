@@ -2,10 +2,9 @@ import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useStat
 import Markdown from 'react-markdown'
 import type { Components } from 'react-markdown'
 import remarkGfm from 'remark-gfm'
-import { api } from '../api'
 import type { ActiveRun, ItemsPage, QueuedPrompt, Session, SessionImageAttachment, SessionItem } from '../types'
 import type { SessionIndexStatus } from '../repositories/sessionIndex'
-import type { DataAvailability, DomainReadError } from '../repositories/sessionContent'
+import type { DataAvailability, DomainReadError, SessionImageData } from '../repositories/sessionContent'
 import { addUsageBreakdown, contextRequestCount, contextUsageBreakdown, usageBreakdownFromEvents, usageCostBreakdown, usageEventCount } from '../lib/cost'
 import { buildConversationRows, conversationRowKey } from '../lib/conversationRows'
 import type { ConversationRow } from '../lib/conversationRows'
@@ -37,6 +36,7 @@ export const Conversation = memo(function Conversation(props: {
 	onPastedImageAdd: (pastedImage: PastedImageAttachment) => void
 	onPastedImageRemove: (pastedImageID: number) => void
 	onDraftClear: () => void
+  loadSessionImage?: (sessionID: string, hash: string, signal?: AbortSignal) => Promise<SessionImageData>
   sessionNames: Record<string, string>
   turnError: { turnID: string; message: string } | null
   onDismissTurnError: () => void
@@ -62,6 +62,7 @@ export const Conversation = memo(function Conversation(props: {
 	const [loadingOlder, setLoadingOlder] = useState(false)
 	const safeDetail = props.detail && props.detail.id === props.sessionID ? props.detail : null
 	const indexedStatus = props.sessionIndexStatus ?? safeDetail?.status
+	const loadSessionImage = props.loadSessionImage ?? (() => Promise.reject(new Error('session image reader is unavailable')))
 
 	// Virtuoso's Scroller is the sole .messages element. Use its imperative API
 	// for explicit bottom requests instead of competing with its scroll model.
@@ -210,6 +211,7 @@ export const Conversation = memo(function Conversation(props: {
 
 	const renderRow = useCallback((row: ConversationRow) => renderConversationRow(row, {
 		sessionID: props.sessionID ?? '',
+		loadSessionImage,
 		sessionNames: props.sessionNames,
 		workspaceRoot: safeDetail?.created_cwd,
 		canContinue: canContinueForRows,
@@ -217,7 +219,7 @@ export const Conversation = memo(function Conversation(props: {
 		onContinue: props.onContinue,
 		onRetryRefresh: props.onRetryRefresh,
 		onDismissTurnError: props.onDismissTurnError,
-	}), [canContinueForRows, props.activeRun, props.onCancelTool, props.onContinue, props.onDismissTurnError, props.onRetryRefresh, props.sessionID, props.sessionNames, safeDetail?.created_cwd, safeDetail?.interrupted_run_id, safeDetail?.interrupted_turn_id, safeDetail?.running_run_id, safeDetail?.running_turn_id])
+	}), [canContinueForRows, loadSessionImage, props.activeRun, props.onCancelTool, props.onContinue, props.onDismissTurnError, props.onRetryRefresh, props.sessionID, props.sessionNames, safeDetail?.created_cwd, safeDetail?.interrupted_run_id, safeDetail?.interrupted_turn_id, safeDetail?.running_run_id, safeDetail?.running_turn_id])
 
 	const conversationEmpty = <div className="conversation-empty"><SparkIcon /><h3>Start a new task</h3><p>Describe a goal, a problem, or the code you want to change.</p></div>
 	const listHeader = (
@@ -302,7 +304,7 @@ export const Conversation = memo(function Conversation(props: {
 		onPastedImageRemove={props.onPastedImageRemove}
 		onDraftClear={props.onDraftClear}
 		running={props.activeRun?.status === 'running'}
-		blocked={Boolean(props.admissionPending) || (!props.activeRun && (props.compacting || safeDetail?.status === 'running'))}
+		blocked={Boolean(props.admissionPending) || (!props.activeRun && (props.compacting || indexedStatus === 'running' || safeDetail?.status === 'running'))}
 		onSend={handleSend}
 		onCancel={props.onCancel}
 	  />
@@ -313,18 +315,35 @@ export const Conversation = memo(function Conversation(props: {
   previous.detail === next.detail &&
   previous.page === next.page &&
   previous.activeRun === next.activeRun &&
+  previous.sessionIndexStatus === next.sessionIndexStatus &&
   previous.admissionPending === next.admissionPending &&
   previous.compacting === next.compacting &&
 	previous.contentAvailability === next.contentAvailability &&
 	previous.historyLoading === next.historyLoading &&
 	previous.historyError === next.historyError &&
   previous.draft === next.draft &&
+  previous.loadSessionImage === next.loadSessionImage &&
   previous.turnError === next.turnError &&
   previous.sessionNames === next.sessionNames &&
+  previous.onDraftChange === next.onDraftChange &&
+  previous.onPastedTextAdd === next.onPastedTextAdd &&
+  previous.onPastedTextRemove === next.onPastedTextRemove &&
+  previous.onPastedImageAdd === next.onPastedImageAdd &&
+  previous.onPastedImageRemove === next.onPastedImageRemove &&
+  previous.onDraftClear === next.onDraftClear &&
+  previous.onLoadOlder === next.onLoadOlder &&
   previous.onCancelTool === next.onCancelTool &&
   previous.onContinue === next.onContinue &&
   previous.onRetryRefresh === next.onRetryRefresh &&
-  previous.onDebug === next.onDebug)
+  previous.onDebug === next.onDebug &&
+  previous.onCancel === next.onCancel &&
+  previous.onDismissTurnError === next.onDismissTurnError &&
+  previous.onSend === next.onSend &&
+  previous.onRemoveQueuedPrompt === next.onRemoveQueuedPrompt &&
+  previous.onSteerQueuedPrompt === next.onSteerQueuedPrompt &&
+  previous.onMoveQueuedPrompt === next.onMoveQueuedPrompt &&
+  previous.onCompact === next.onCompact &&
+  previous.onToggleFullAccess === next.onToggleFullAccess)
 
 function ContentUnavailable(props: { onRetry: () => void }) {
 	return <div className="conversation-empty"><WarningIcon /><h3>Session content is unavailable</h3><p>The synchronized conversation could not be loaded.</p><button className="secondary-button" onClick={props.onRetry}>Retry</button></div>
@@ -414,6 +433,7 @@ function CostUsage(props: { pricing?: Session['pricing']; context: Session['cont
 
 type ConversationRowRenderProps = {
 	sessionID: string
+	loadSessionImage: (sessionID: string, hash: string, signal?: AbortSignal) => Promise<SessionImageData>
 	sessionNames?: Record<string, string>
 	workspaceRoot?: string
 	onCancelTool?: (toolCallID: string) => void
@@ -426,7 +446,7 @@ type ConversationRowRenderProps = {
 function renderConversationRow(row: ConversationRow, props: ConversationRowRenderProps) {
 	switch (row.kind) {
 		case 'message':
-			return <Message key={row.key} item={row.item} sessionID={props.sessionID} assistantTail={row.assistantTail} assistantStreaming={row.assistantStreaming} />
+			return <Message key={row.key} item={row.item} sessionID={props.sessionID} loadSessionImage={props.loadSessionImage} assistantTail={row.assistantTail} assistantStreaming={row.assistantStreaming} />
 		case 'compaction':
 			return <CompactionRecord key={row.key} item={row.item} />
 		case 'process':
@@ -454,7 +474,7 @@ function renderConversationRow(row: ConversationRow, props: ConversationRowRende
 	}
 }
 
-const Message = memo(function Message({ item, sessionID, assistantTail = '', assistantStreaming = false }: { item: SessionItem; sessionID: string; assistantTail?: string; assistantStreaming?: boolean }) {
+const Message = memo(function Message({ item, sessionID, loadSessionImage, assistantTail = '', assistantStreaming = false }: { item: SessionItem; sessionID: string; loadSessionImage: (sessionID: string, hash: string, signal?: AbortSignal) => Promise<SessionImageData>; assistantTail?: string; assistantStreaming?: boolean }) {
 	const [copyStatus, setCopyStatus] = useState<'idle' | 'copied' | 'error'>('idle')
 	const copyResetTimerRef = useRef<number | null>(null)
 	useEffect(() => () => {
@@ -492,7 +512,7 @@ const Message = memo(function Message({ item, sessionID, assistantTail = '', ass
     <article className={`message ${role === 'user' ? 'user' : 'assistant'}`} data-seq={item.seq}>
       <div className="message-content">
         {role === 'user' && text && <div className="message-text">{text}</div>}
-        {role === 'user' && images.length > 0 && <StoredImageAttachments sessionID={sessionID} images={images} />}
+        {role === 'user' && images.length > 0 && <StoredImageAttachments sessionID={sessionID} images={images} loadSessionImage={loadSessionImage} />}
 		{role !== 'user' && (text || showCursor) && <MarkdownMessage text={text} streaming={showCursor} cursor={showCursor} />}
 		{role === 'assistant' && (text || images.length > 0) && (
 			<div className="message-tools" aria-label="Message actions">
@@ -506,30 +526,31 @@ const Message = memo(function Message({ item, sessionID, assistantTail = '', ass
   )
 })
 
-function StoredImageAttachments(props: { sessionID: string; images: SessionImageAttachment[] }) {
+function StoredImageAttachments(props: { sessionID: string; images: SessionImageAttachment[]; loadSessionImage: (sessionID: string, hash: string, signal?: AbortSignal) => Promise<SessionImageData> }) {
   return (
     <div className="message-image-grid" aria-label="Attached images">
-      {props.images.map((image) => <StoredImageAttachment key={image.hash} sessionID={props.sessionID} image={image} />)}
+      {props.images.map((image) => <StoredImageAttachment key={image.hash} sessionID={props.sessionID} image={image} loadSessionImage={props.loadSessionImage} />)}
     </div>
   )
 }
 
-function StoredImageAttachment(props: { sessionID: string; image: SessionImageAttachment }) {
+function StoredImageAttachment(props: { sessionID: string; image: SessionImageAttachment; loadSessionImage: (sessionID: string, hash: string, signal?: AbortSignal) => Promise<SessionImageData> }) {
   const [dataURL, setDataURL] = useState('')
   const [failed, setFailed] = useState(false)
 
   useEffect(() => {
     let active = true
-    void api.sessionImage(props.sessionID, props.image.hash)
-      .then(blobAsDataURL)
+    const controller = new AbortController()
+    void props.loadSessionImage(props.sessionID, props.image.hash, controller.signal)
+      .then((image) => blobAsDataURL(new Blob([image.bytes], { type: image.contentType })))
       .then((url) => {
         if (active) setDataURL(url)
       })
       .catch(() => {
         if (active) setFailed(true)
       })
-    return () => { active = false }
-  }, [props.image.hash, props.sessionID])
+    return () => { active = false; controller.abort() }
+  }, [props.image.hash, props.loadSessionImage, props.sessionID])
 
   if (failed) return <div className="message-image-unavailable">Image unavailable</div>
   if (!dataURL) return <div className="message-image-loading">Loading image…</div>

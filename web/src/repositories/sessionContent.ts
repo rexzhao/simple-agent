@@ -1,3 +1,4 @@
+import { hasObservedRun as hasObservedRunInView } from '../domain/sessionContent'
 import type {
   DataAvailability,
   SessionContentHistoryReadOptions,
@@ -8,6 +9,12 @@ import type {
 } from '../domain/sessionContent'
 
 export type { DataAvailability, DomainReadError, SessionContentMetadata, SessionContentActiveRun, SessionContentCompaction, SessionContentHistoryReadOptions, SessionContentHistoryState, SessionContentHistoryWindow, SessionRunState, SessionView } from '../domain/sessionContent'
+
+/** Bounded image bytes exposed by the application data-plane facade. */
+export interface SessionImageData {
+  readonly bytes: ArrayBuffer
+  readonly contentType: string
+}
 
 export interface SessionContentSource {
   get(sessionID: string): SessionView
@@ -97,6 +104,19 @@ export class SessionContentRepository {
 
   getRunState(sessionID: string): SessionRunState | undefined {
     return this.get(sessionID).runState
+  }
+
+  /** Returns true for running, terminal, or durable metadata evidence. */
+  hasObservedRun(sessionID: string, runID: string): boolean {
+    return hasObservedRunInView(this.get(sessionID), runID)
+  }
+
+  waitForRunObserved(
+    sessionID: string,
+    runID: string,
+    options: SessionContentObservationOptions = {},
+  ): Promise<SessionView> {
+    return this.waitFor(sessionID, (view) => hasObservedRunInView(view, runID), options)
   }
 
   select<T>(sessionID: string, selector: (view: SessionView) => T): T {

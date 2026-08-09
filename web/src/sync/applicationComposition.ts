@@ -24,6 +24,8 @@ import { SyncRuntime, type RuntimeTransport } from './runtime'
 import { WebSocketTransport, type WebSocketTransportOptions } from './transport'
 import { sessionHistoryResultToDomain } from './sessionContentHistory'
 import type { SessionContentHistoryReadOptions, SessionContentHistoryWindow } from '../domain/sessionContent'
+import { api } from '../api'
+import { codexUsageDomain } from '../domain/codexUsage'
 
 // Keep the old infrastructure-facing names available while the page contract
 // itself remains in the pure application layer.
@@ -147,7 +149,24 @@ export function createSyncApplication(options: SyncApplicationOptions = {}): Syn
     codexLogin: new CodexLoginInterestPolicy(runtime, signals.codexLoginProvider),
   }
   const commands = pageCommands(commandFacade)
-  const page: SyncApplicationPageServices = { repositories, commands, signals }
+  const page: SyncApplicationPageServices = {
+    repositories,
+    commands,
+    signals,
+    loadBootstrap: async () => {
+      const value = await api.bootstrap()
+      return { version: value.version, cwd: value.cwd, serverRoot: value.server_root, configPath: value.config_path }
+    },
+    sessionModels: async (projectID) => {
+      const value = await api.sessionModels(projectID)
+      return { models: value.models, defaultProvider: value.default_provider, defaultModel: value.default_model }
+    },
+    codexUsage: async (provider) => codexUsageDomain(await api.codexUsage(provider)),
+    loadSessionImage: async (sessionID, hash, signal) => {
+      const image = await api.sessionImage(sessionID, hash, signal)
+      return { bytes: await image.arrayBuffer(), contentType: image.type }
+    },
+  }
 
   let lifecycle: 'stopped' | 'started' | 'disposed' = 'stopped'
 

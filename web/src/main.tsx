@@ -6,9 +6,8 @@ import { createSyncApplication } from './sync/applicationComposition'
 import './styles.css'
 
 // Keep the graph at application scope so StrictMode does not construct a
-// second transport/runtime/replica set. Project navigation is driven by this
-// graph; the App keeps the legacy session/run bridges only where F2 has not
-// cut them over yet.
+// second transport/runtime/replica set. Project navigation, session content,
+// and run control are all owned by this application graph.
 const syncApplication = createSyncApplication()
 
 // React StrictMode only stops the singleton so it can be mounted again. HMR

@@ -8,6 +8,9 @@ import type { ProjectIndexRepository } from './repositories/projectIndex'
 import type { ProviderSettingsRepository } from './repositories/providerSettings'
 import type { SessionContentRepository } from './repositories/sessionContent'
 import type { SessionIndexRepository } from './repositories/sessionIndex'
+import type { SessionImageData } from './repositories/sessionContent'
+import type { SessionModelOption } from './types'
+import type { CodexUsageDomain } from './domain/codexUsage'
 
 /**
  * Pure application state used to express interest without exposing routing or
@@ -63,6 +66,21 @@ export interface ApplicationSignals {
   readonly codexLoginProvider: MutableCurrentCodexLoginProviderSignal
 }
 
+/** Small application read facades for the remaining non-sync startup/data
+ * plane reads. Their wire DTOs are normalized before crossing this boundary. */
+export interface ApplicationBootstrap {
+  readonly version: string
+  readonly cwd: string
+  readonly serverRoot: string
+  readonly configPath: string
+}
+
+export interface SessionModelCatalog {
+  readonly models: readonly SessionModelOption[]
+  readonly defaultProvider: string
+  readonly defaultModel: string
+}
+
 /**
  * Pure page contract. Infrastructure objects such as runtime, stores, replica,
  * transport, and Blob client are intentionally absent.
@@ -71,6 +89,10 @@ export interface ApplicationPageServices {
   readonly repositories: ApplicationRepositories
   readonly commands: ApplicationCommands
   readonly signals: ApplicationSignals
+  readonly loadBootstrap: () => Promise<ApplicationBootstrap>
+  readonly sessionModels: (projectID: string) => Promise<SessionModelCatalog>
+  readonly codexUsage: (provider: string) => Promise<CodexUsageDomain>
+  readonly loadSessionImage: (sessionID: string, hash: string, signal?: AbortSignal) => Promise<SessionImageData>
 }
 
 /** Lifecycle bridge consumed by the React Provider, also without sync types. */

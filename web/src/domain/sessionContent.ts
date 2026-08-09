@@ -263,6 +263,26 @@ export interface SessionView {
   readonly error?: DomainReadError
 }
 
+/**
+ * Returns whether Session Content has observed a run identity at any
+ * authority layer. A terminal run can have no live overlay after settlement,
+ * so admission barriers must not use the presentation-only active row as their
+ * completion condition.
+ */
+export function hasObservedRun(view: SessionView, runID: string): boolean {
+  if (!runID) return false
+  if (view.runState?.runID === runID || view.activeRun?.run_id === runID) return true
+  const metadata = view.session
+  if (!metadata) return false
+  return [
+    metadata.current_run_id,
+    metadata.running_run_id,
+    metadata.interrupted_run_id,
+    metadata.latest_run_id,
+    metadata.last_run_id,
+  ].includes(runID)
+}
+
 export const emptyHistoryDescriptor: SessionContentHistoryDescriptor = Object.freeze({
   limit: 0,
   align_turn: false,

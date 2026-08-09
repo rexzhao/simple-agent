@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { act, cleanup, render, screen, fireEvent } from '@testing-library/react'
+import { act, cleanup, render, screen, fireEvent, waitFor } from '@testing-library/react'
 import type { ReactElement } from 'react'
 
 // VirtuosoMockContext deliberately renders only the mocked viewport range.
@@ -101,6 +101,42 @@ const baseProps = {
 }
 
 describe('Conversation identity boundary', () => {
+  it('updates header, composer, and continue presentation from Session Index status alone', () => {
+    const detail = { ...session('s1'), status: 'idle', interrupted_run_id: 'run-interrupted', interrupted_turn_id: 'turn-interrupted' } as Session
+    const draft = { ...emptyComposerDraft, content: 'pending input' }
+    const view = renderConversation(<Conversation {...baseProps} sessionID="s1" detail={detail} draft={draft} sessionIndexStatus="idle" />)
+    expect(screen.getByLabelText('Session status: idle')).toBeDefined()
+    expect((screen.getByRole('textbox') as HTMLTextAreaElement).disabled).toBe(false)
+    expect(screen.queryByRole('button', { name: 'Continue' })).toBeNull()
+
+    view.rerender(<Conversation {...baseProps} sessionID="s1" detail={detail} draft={draft} sessionIndexStatus="running" />)
+    expect(screen.getByLabelText('Session status: running')).toBeDefined()
+    expect((screen.getByRole('textbox') as HTMLTextAreaElement).disabled).toBe(true)
+    expect(screen.queryByRole('button', { name: 'Continue' })).toBeNull()
+
+    view.rerender(<Conversation {...baseProps} sessionID="s1" detail={detail} draft={draft} sessionIndexStatus="interrupted" />)
+    expect(screen.getByLabelText('Session status: interrupted')).toBeDefined()
+    expect((screen.getByRole('textbox') as HTMLTextAreaElement).disabled).toBe(false)
+    expect(screen.getByRole('button', { name: 'Continue' })).toBeDefined()
+  })
+
+  it('uses a new image reader identity for subsequent stored-image loads', async () => {
+    const detail = session('s1')
+    const page: ItemsPage = {
+      items: [{
+        seq: 1, id: 'image-item', created_at: '', kind: 'message', visibility: 'visible', audience: 'user',
+        message: { role: 'user', images: [{ hash: 'hash-1', media_type: 'image/png', size_bytes: 1 }] },
+      }],
+      oldest_seq: 1, newest_seq: 1, has_more_before: false, has_more_after: false,
+    }
+    const firstReader = vi.fn().mockResolvedValue({ bytes: new Uint8Array([1]), contentType: 'image/png' })
+    const secondReader = vi.fn().mockResolvedValue({ bytes: new Uint8Array([2]), contentType: 'image/png' })
+    const view = renderConversation(<Conversation {...baseProps} sessionID="s1" detail={detail} page={page} loadSessionImage={firstReader} />)
+    await waitFor(() => expect(firstReader).toHaveBeenCalledWith('s1', 'hash-1', expect.any(AbortSignal)))
+    view.rerender(<Conversation {...baseProps} sessionID="s1" detail={detail} page={page} loadSessionImage={secondReader} />)
+    await waitFor(() => expect(secondReader).toHaveBeenCalledWith('s1', 'hash-1', expect.any(AbortSignal)))
+  })
+
   it('rerenders the composer when admissionPending toggles through the memo boundary', () => {
     const detail = session('s1')
     const draft = { ...emptyComposerDraft, content: 'pending input' }

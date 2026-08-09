@@ -3,6 +3,7 @@ import { decodeMessage } from '../protocol/decode'
 import type { ProtocolMessage } from '../protocol/types'
 import { LocalReplica } from './localReplica'
 import { BlobClient } from './blobClient'
+import { SyncReadError } from './errors'
 import { SyncRuntime, SyncSubscriptionError, type RuntimeTransport } from './runtime'
 import { CommandFacade } from './commandFacade'
 import { SessionIndexRepository } from './sessionIndexRepository'
@@ -438,6 +439,78 @@ describe('SyncRuntime snapshot barrier and continuity', () => {
     const record = runtime.replica.get({ type: 'session_index', id: 'project_a' })
     expect(record.metadata.readState).toBe('error')
     expect(record.metadata.error).toMatchObject({ code: 'server' })
+  })
+
+  it('resubscribes a live resource when its replica is stale and the page requests recovery', async () => {
+    const transport = new FakeTransport()
+    const runtime = new SyncRuntime({ transport })
+    const resource = { type: 'session_index' as const, id: 'project_a' }
+    runtime.subscribe(resource)
+    runtime.start()
+    const initial = transport.last('subscribe')
+    if (initial.type !== 'subscribe') throw new Error('wrong subscribe')
+    transport.emit(subscribed(initial.payload.subscription_id, 'project_a', 'stream_1', '1'))
+    transport.emit(snapshotMessage(initial.payload.subscription_id, 'project_a', { inline: { sessions: [summary('a', 'project_a')] } }))
+    await Promise.resolve()
+    runtime.replica.markStale(resource, new SyncReadError('sequence_gap', 'stale'), 1)
+    const beforeRetry = transport.sent.filter((candidate) => candidate.type === 'subscribe').length
+
+    runtime.retry(resource)
+
+    expect(transport.sent.filter((candidate) => candidate.type === 'unsubscribe')).toHaveLength(1)
+    expect(transport.sent.filter((candidate) => candidate.type === 'subscribe')).toHaveLength(beforeRetry + 1)
+    runtime.stop()
+  })
+
+  it('force-resubscribes only an explicitly targeted ready resource', async () => {
+    const transport = new FakeTransport()
+    const runtime = new SyncRuntime({ transport })
+    const resourceA = { type: 'session_index' as const, id: 'project_a' }
+    const resourceB = { type: 'session_index' as const, id: 'project_b' }
+    runtime.subscribe(resourceA)
+    runtime.subscribe(resourceB)
+    runtime.start()
+    const initialA = transport.sent.find((candidate) => candidate.type === 'subscribe' && candidate.payload.resource.id === 'project_a')
+    const initialB = transport.sent.find((candidate) => candidate.type === 'subscribe' && candidate.payload.resource.id === 'project_b')
+    if (initialA?.type !== 'subscribe' || initialB?.type !== 'subscribe') throw new Error('missing initial subscriptions')
+    transport.emit(subscribed(initialA.payload.subscription_id, 'project_a'))
+    transport.emit(snapshotMessage(initialA.payload.subscription_id, 'project_a', { inline: { sessions: [summary('a', 'project_a')] } }))
+    transport.emit(subscribed(initialB.payload.subscription_id, 'project_b'))
+    transport.emit(snapshotMessage(initialB.payload.subscription_id, 'project_b', { inline: { sessions: [summary('b', 'project_b')] } }))
+    await Promise.resolve()
+    transport.sent = []
+
+    runtime.retry(resourceA)
+
+    const unsubscribe = transport.sent.filter((candidate) => candidate.type === 'unsubscribe')
+    const resubscribe = transport.sent.filter((candidate) => candidate.type === 'subscribe')
+    expect(unsubscribe).toHaveLength(1)
+    expect(resubscribe).toHaveLength(1)
+    if (unsubscribe[0].type === 'unsubscribe') expect(unsubscribe[0].payload.subscription_id).toBe(initialA.payload.subscription_id)
+    if (resubscribe[0].type === 'subscribe') {
+      expect(resubscribe[0].payload.resource).toEqual(resourceA)
+      expect(resubscribe[0].payload.subscription_id).not.toBe(initialA.payload.subscription_id)
+    }
+    expect(runtime.replica.get(resourceB).metadata.readState).toBe('ready')
+    runtime.stop()
+  })
+
+  it('does not restart healthy resources for an unscoped retry', async () => {
+    const transport = new FakeTransport()
+    const runtime = new SyncRuntime({ transport })
+    runtime.subscribe({ type: 'session_index', id: 'project_a' })
+    runtime.start()
+    const initial = transport.last('subscribe')
+    if (initial.type !== 'subscribe') throw new Error('wrong subscribe')
+    transport.emit(subscribed(initial.payload.subscription_id, 'project_a'))
+    transport.emit(snapshotMessage(initial.payload.subscription_id, 'project_a', { inline: { sessions: [summary('a', 'project_a')] } }))
+    await Promise.resolve()
+    transport.sent = []
+
+    runtime.retry()
+
+    expect(transport.sent).toHaveLength(0)
+    runtime.stop()
   })
 
   it('publishes terminal error before the first socket is ready and wakes a terminated transport on retry', () => {

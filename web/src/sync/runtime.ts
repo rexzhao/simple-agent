@@ -222,18 +222,24 @@ export class SyncRuntime {
   }
 
   /**
-   * Requests recovery for an errored resource through the existing transport.
-   * This is the page retry seam; it does not issue a REST reload or create a
-   * second runtime/socket.
+   * Requests recovery for a resource through the existing transport.
+   *
+   * A targeted retry is an explicit force-resync seam: it rebuilds that
+   * desired subscription even when the resource still looks live and ready.
+   * The unscoped form remains conservative and only wakes resources which
+   * already report a recovery condition.
    */
   retry(resource?: ResourceKey): void {
     if (!this.started) return
+    const forceTarget = resource !== undefined
     const targets = resource
       ? [...this.subscriptions.values()].filter((subscription) => resourceMatches(subscription.resource, resource))
       : [...this.subscriptions.values()]
     let wakeTransport = false
     for (const subscription of targets) {
-      if (subscription.phase !== 'error' && !subscription.transportTerminalError) continue
+      const readState = this.replica.get(subscription.resource).metadata.readState
+      const replicaNeedsRecovery = readState === 'stale' || readState === 'error'
+      if (!forceTarget && subscription.phase !== 'error' && !subscription.transportTerminalError && !replicaNeedsRecovery) continue
       const oldID = subscription.socketGeneration === undefined ? '' : subscription.subscriptionID
       subscription.snapshotAbort?.abort()
       subscription.snapshotAbort = null

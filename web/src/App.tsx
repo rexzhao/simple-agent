@@ -1,11 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { api, streamLifecycle, streamRun } from './api'
-import type { ActiveRun, ActiveRunDescriptor, Bootstrap, ImageAttachmentInput, LifecycleEvent, RunEvent, Session, SessionDebugSettings, SessionModelOption } from './types'
+import type { Session, SessionDebugSettings, SessionModelOption } from './types'
+import type { ApplicationBootstrap } from './applicationServices'
 import { ProjectIndexObservationError, type ProjectIndexReadModel, type ProjectSummary } from './repositories/projectIndex'
 import { isBackgroundSessionCompletionTransition, sessionIndexCompletionNoticeKey, type SessionIndexCompletionObservation, type SessionIndexReadModel } from './repositories/sessionIndex'
 import type { SessionCreateOptions } from './commands/sessionCommands'
-import { copyFrontendProtocolJSONL, downloadFrontendProtocolJSONL, frontendProtocolLogger, protocolLogIdentity, useFrontendProtocolLogging } from './lib/frontendProtocolLogger'
-import { reduceRunEvent } from './lib/runEventReducer'
+import { copyFrontendProtocolJSONL, downloadFrontendProtocolJSONL, useFrontendProtocolLogging } from './lib/frontendProtocolLogger'
 import { modelKey, navigationSession, projectName, sessionDescendantIDs, sessionName, sessionSubPanelContext, type SessionNavigation } from './lib/session'
 import { activeRunForConversation, itemsPageForConversation, sessionMetadataForConversation } from './lib/sessionContentPresentation'
 import { emptyComposerDraft } from './components/Composer'
@@ -19,12 +18,11 @@ import type { SessionCreatorState } from './components/SessionModelDialog'
 import { WorkspaceTree } from './components/WorkspaceTree'
 import { SessionSubPanel } from './components/SessionSubPanel'
 import { useComposerDrafts } from './hooks/useComposerDrafts'
-import { useRunRegistry } from './hooks/useRunRegistry'
 import { useSessionContentHistory } from './hooks/useSessionContentHistory'
 import { useSessionSelection } from './hooks/useSessionSelection'
-import { useCodexLogin, useCurrentCodexLoginProvider, useProjectIndex, useProviderSettings, useSessionIndexes, useSyncCommands, useSyncRepositories, useSyncSignals } from './hooks/useSyncApplication'
+import { useCodexLogin, useCurrentCodexLoginProvider, useProjectIndex, useProviderSettings, useSessionIndexes, useSyncApplication, useSyncCommands, useSyncRepositories, useSyncSignals } from './hooks/useSyncApplication'
 import type { ProviderUpdateTarget } from './commands/providerCommands'
-import { codexUsageDomain, type CodexUsageDomain } from './domain/codexUsage'
+import type { CodexUsageDomain } from './domain/codexUsage'
 
 type BackgroundCompletionNotice = {
   sessionID: string
@@ -61,6 +59,8 @@ function runMutationErrorMessage(reason: unknown): string {
   return 'Run operation failed.'
 }
 
+const runAuthorityResyncMessage = 'Run accepted; automatic synchronization is in progress.'
+
 function providerOperationErrorMessage(reason: unknown, operation: 'save' | 'default' | 'discover' | 'login' | 'logout'): string {
   if (reason && typeof reason === 'object' && 'code' in reason) {
     const code = String((reason as { code?: unknown }).code)
@@ -77,6 +77,7 @@ function providerOperationErrorMessage(reason: unknown, operation: 'save' | 'def
 }
 
 function App() {
+  const { loadBootstrap, sessionModels, codexUsage, loadSessionImage } = useSyncApplication()
   const projectIndex = useProjectIndex()
   const { project: projectCommands, session: sessionCommands, run: runCommands, provider: providerCommands, codexLogin: codexLoginCommands } = useSyncCommands()
   const { currentProject, currentSession, providerSettings: providerSettingsSignal, codexLoginProvider } = useSyncSignals()
@@ -86,7 +87,7 @@ function App() {
   const codexLogin = useCodexLogin(currentCodexProvider ?? '')
   const projects = projectIndex.active
   const sessionIndexes = useSessionIndexes(projects.map((project) => project.id))
-  const [bootstrap, setBootstrap] = useState<Bootstrap | null>(null)
+  const [bootstrap, setBootstrap] = useState<ApplicationBootstrap | null>(null)
   const { selectedProjectID, selectedSessionID, selectedProjectRef, setSelectedProjectID, setSelectedSessionID } = useSessionSelection()
   const selectedSessionIDRef = useRef(selectedSessionID)
   selectedSessionIDRef.current = selectedSessionID
@@ -98,7 +99,6 @@ function App() {
   viewingSessionIDRef.current = viewingSessionID
   const projectObservationControllersRef = useRef(new Set<AbortController>())
   const sessionObservationControllersRef = useRef(new Set<AbortController>())
-  const [recoveredRuns, setRecoveredRuns] = useState<ActiveRunDescriptor[]>([])
   const [error, setError] = useState('')
   const [showProjectForm, setShowProjectForm] = useState(false)
   const autoProjectFormRef = useRef(false)
@@ -127,17 +127,15 @@ function App() {
     }
     return names
   }, [sessionIndexes])
-  const settledRunIDsRef = useRef(new Set<string>())
-  // Local admission responses bind a run id until that run's replay delivers
-  // run.started. This prevents the process-wide lifecycle hint from creating
-  // a transient run before the per-run replay boundary.
-  const runStartedReplayBindingsRef = useRef(new Map<string, string>())
+  // The command result is only an admission acknowledgement.  The selected
+  // Session Content projection must publish the matching run before the page
+  // considers the run visible or enables another admission.
+  const pendingRunIDsRef = useRef(new Map<string, string>())
   const pendingAdmissionSessionsRef = useRef(new Set<string>())
+  const pendingRunAuthorityWaitsRef = useRef(new Map<string, AbortController>())
   const markReadInFlightRef = useRef(new Set<string>())
 
-  const onSupersedeRunRef = useRef<(sessionID: string, oldRunID: string) => void>(() => {})
-
-  const { activeRunsRef, runningSessionIDs, addActiveRun, syncActiveRuns, updateActiveRun, queueRunEvent, flushRunEvents } = useRunRegistry({ onSupersedeRun: (sessionID, oldRunID) => onSupersedeRunRef.current(sessionID, oldRunID) })
+  const runAdmissionKey = (sessionID: string, runID: string) => `${sessionID}\u0000${runID}`
 
   const clearTurnError = useCallback((sessionID: string) => {
     setTurnErrors((current) => {
@@ -156,6 +154,57 @@ function App() {
       delete next[sessionID]
       return next
     })
+  }, [])
+
+  const isAdmissionPending = useCallback((sessionID: string) =>
+    pendingAdmissionSessionsRef.current.has(sessionID)
+    || pendingRunIDsRef.current.has(sessionID)
+    || Boolean(awaitingRunStartedBySession[sessionID]),
+  [awaitingRunStartedBySession])
+
+  const releaseRunAdmission = useCallback((sessionID: string, runID: string): boolean => {
+    if (pendingRunIDsRef.current.get(sessionID) !== runID) return false
+    pendingRunIDsRef.current.delete(sessionID)
+    const key = runAdmissionKey(sessionID, runID)
+    const controller = pendingRunAuthorityWaitsRef.current.get(key)
+    if (controller) {
+      pendingRunAuthorityWaitsRef.current.delete(key)
+      controller.abort()
+    }
+    setAwaitingRunStarted(sessionID, false)
+    setError((current) => current === runAuthorityResyncMessage ? '' : current)
+    return true
+  }, [setAwaitingRunStarted])
+
+  const observeRunAdmission = useCallback((sessionID: string, runID: string) => {
+    if (pendingRunIDsRef.current.get(sessionID) !== runID) return
+    if (sessionContentRepository.hasObservedRun(sessionID, runID)) {
+      releaseRunAdmission(sessionID, runID)
+      return
+    }
+    const key = runAdmissionKey(sessionID, runID)
+    if (pendingRunAuthorityWaitsRef.current.has(key)) return
+    const controller = new AbortController()
+    pendingRunAuthorityWaitsRef.current.set(key, controller)
+    void sessionContentRepository.waitForRunObserved(sessionID, runID, { signal: controller.signal, timeoutMS: 5000 })
+      .then(() => { releaseRunAdmission(sessionID, runID) })
+      .catch((reason: unknown) => {
+        if (controller.signal.aborted || (reason && typeof reason === 'object' && 'code' in reason && String((reason as { code?: unknown }).code) === 'cancelled')) return
+        if (pendingRunIDsRef.current.get(sessionID) !== runID) return
+        // The accepted command still owns this session. Reconnect/resubscribe
+        // the authority resource, but never permit a second admission merely
+        // because the observation timed out.
+        sessionContentRepository.retry(sessionID)
+        setError(runAuthorityResyncMessage)
+      })
+      .finally(() => {
+        if (pendingRunAuthorityWaitsRef.current.get(key) === controller) pendingRunAuthorityWaitsRef.current.delete(key)
+      })
+  }, [releaseRunAdmission, sessionContentRepository])
+
+  useEffect(() => () => {
+    for (const controller of pendingRunAuthorityWaitsRef.current.values()) controller.abort()
+    pendingRunAuthorityWaitsRef.current.clear()
   }, [])
 
   // A selected project is application state, not a page-owned subscription.
@@ -240,21 +289,16 @@ function App() {
     }
   }, [sessionIndexRepository])
 
-  const bootstrapInFlightRef = useRef<Promise<ActiveRunDescriptor[]> | null>(null)
-  const bootstrapApplication = useCallback(async (preserveSelection: boolean): Promise<ActiveRunDescriptor[]> => {
+  const bootstrapInFlightRef = useRef<Promise<void> | null>(null)
+  const bootstrapApplication = useCallback(async (preserveSelection: boolean): Promise<void> => {
     if (bootstrapInFlightRef.current) return bootstrapInFlightRef.current
     const operation = (async () => {
-      const bootstrapPayloadPromise = api.bootstrap()
-      const activeRunsPayloadPromise = api.activeRuns()
+      const bootstrapPayloadPromise = loadBootstrap()
       const projectModel = projectIndexRepository.getSnapshot().status === 'loading'
         ? await projectIndexRepository.waitFor((model) => model.status !== 'loading', { timeoutMS: 15_000 })
         : projectIndexRepository.getSnapshot()
-      const [bootstrapPayload, activeRunsPayload] = await Promise.all([bootstrapPayloadPromise, activeRunsPayloadPromise])
+      const bootstrapPayload = await bootstrapPayloadPromise
       const authoritativeProjects = projectModel.active
-      const admissionBoundSessions = new Set(runStartedReplayBindingsRef.current.values())
-      const recoveredForPresentation = activeRunsPayload.runs.filter((run) =>
-        !pendingAdmissionSessionsRef.current.has(run.session_id) && !admissionBoundSessions.has(run.session_id),
-      )
       const currentProjectID = selectedProjectRef.current
       const currentSessionID = selectedSessionIDRef.current
       const currentProject = authoritativeProjects.find((project) => project.id === currentProjectID)
@@ -267,8 +311,6 @@ function App() {
         ? currentSessionID
         : firstIndex?.active[0]?.session_id ?? ''
       setBootstrap(bootstrapPayload)
-      syncActiveRuns(recoveredForPresentation)
-      setRecoveredRuns(recoveredForPresentation)
       // Bootstrap is a recovery hint, not a late authority for user
       // selection. The first project/session effect already makes a
       // deterministic initial choice; never overwrite a click that raced the
@@ -277,7 +319,6 @@ function App() {
         setSelectedProjectID(firstProjectID)
         setSelectedSessionID(firstSessionID)
       }
-      return recoveredForPresentation
     })()
     bootstrapInFlightRef.current = operation
     try {
@@ -285,7 +326,7 @@ function App() {
     } finally {
       if (bootstrapInFlightRef.current === operation) bootstrapInFlightRef.current = null
     }
-  }, [projectIndexRepository, sessionIndexRepository, setSelectedProjectID, setSelectedSessionID, syncActiveRuns])
+  }, [loadBootstrap, projectIndexRepository, sessionIndexRepository, setSelectedProjectID, setSelectedSessionID])
 
   useEffect(() => {
     void bootstrapApplication(false)
@@ -299,9 +340,8 @@ function App() {
     ? sessionMetadataForConversation(sessionContentView.session, sessionContentView.history)
     : null
   const itemsPage = sessionContentView.session ? itemsPageForConversation(sessionContentView.history) : null
-  const controlRunFor = (sessionID: string): ActiveRun | null =>
-    activeRunsRef.current[sessionID]
-      ?? (sessionID === viewingSessionID ? activeRunForConversation(sessionContentView, sessionID) : null)
+  const controlRunFor = (sessionID: string) =>
+    sessionID === viewingSessionID ? activeRunForConversation(sessionContentView, sessionID) : null
 
   // Tree selection is the authoritative navigation source. The viewing session
   // follows it so that normal navigation (tree click, bootstrap, create) keeps
@@ -365,20 +405,6 @@ function App() {
       .finally(() => markReadInFlightRef.current.delete(viewingSessionID))
   }, [sessionCommands, sessionIndexes, waitForSessionAuthority, viewingSessionID])
 
-  // The legacy run stream is retained only as a run-control adapter. Content
-  // and history are owned by session_content; settling a run must not patch a
-  // page cache or trigger a REST refresh.
-  const removeRun = useCallback((sessionID: string, runID: string) => {
-    const run = activeRunsRef.current[sessionID]
-    if (!run || run.id !== runID) return
-    setRecoveredRuns((current) => current.filter((r) => r.run_id !== runID))
-    updateActiveRun(sessionID, runID, () => null)
-  }, [updateActiveRun])
-
-  onSupersedeRunRef.current = useCallback((sessionID: string, oldRunID: string) => {
-    removeRun(sessionID, oldRunID)
-  }, [removeRun])
-
   useEffect(() => {
     if (!completionNotice) return
     const timer = window.setTimeout(() => setCompletionNotice(null), 5000)
@@ -403,14 +429,14 @@ function App() {
     if (!projectID) return
     setSessionCreator({ projectID, models: [], selectedKey: '', defaultProvider: '', defaultModel: '', reasoningLevel: '', fullAccess: false, loading: true })
     try {
-      const options = await api.sessionModels(projectID)
-      const defaultModel = options.models.find((model) => model.provider === options.default_provider && model.model_profile === options.default_model)
+      const options = await sessionModels(projectID)
+      const defaultModel = options.models.find((model) => model.provider === options.defaultProvider && model.model_profile === options.defaultModel)
       setSessionCreator((current) => current?.projectID === projectID ? {
         projectID,
-        models: options.models,
+        models: [...options.models],
         selectedKey: modelKey(defaultModel ?? options.models[0]),
-        defaultProvider: options.default_provider,
-        defaultModel: options.default_model,
+        defaultProvider: options.defaultProvider,
+        defaultModel: options.defaultModel,
         reasoningLevel: defaultModel?.default_reasoning_level ?? options.models[0]?.default_reasoning_level ?? '',
         fullAccess: current.fullAccess,
         loading: false,
@@ -419,7 +445,7 @@ function App() {
       setSessionCreator(null)
       setError('Session model options are unavailable.')
     }
-  }, [selectedProjectID])
+  }, [selectedProjectID, sessionModels])
 
   const createSession = async (projectID: string, model: SessionModelOption) => {
     if (!projectID || creatingSession) return
@@ -512,12 +538,11 @@ function App() {
 
   const refreshCodexUsage = useCallback(async (provider: string): Promise<CodexUsageDomain> => {
     try {
-      const usage = await api.codexUsage(provider)
-      return codexUsageDomain(usage)
+      return await codexUsage(provider)
     } catch {
       throw new Error('Codex usage is temporarily unavailable.')
     }
-  }, [])
+  }, [codexUsage])
 
   const selectProject = useCallback((projectID: string) => {
     selectedProjectPositionRef.current = Math.max(0, projects.findIndex((project) => project.id === projectID))
@@ -555,7 +580,7 @@ function App() {
     const index = sessionIndexes[project.id]
     const activeSessions = index?.active ?? []
     const archivedSessions = index?.archived ?? []
-    if (activeSessions.some((session) => session.status === 'running' || activeRunsRef.current[session.session_id]?.status === 'running')) return
+    if (activeSessions.some((session) => session.status === 'running' || isAdmissionPending(session.session_id))) return
     const sessionCount = activeSessions.length + archivedSessions.length
     const message = `Permanently delete "${projectName(project)}" and ${sessionCount} saved ${sessionCount === 1 ? 'session' : 'sessions'}? All session history and attachments for this project will be removed. This action cannot be undone.`
     if (!window.confirm(message)) return
@@ -585,7 +610,7 @@ function App() {
       }
       setError(projectMutationErrorMessage(reason))
     }
-  }, [activeRunsRef, projectCommands, sessionIndexes, waitForProjectAuthority])
+  }, [isAdmissionPending, projectCommands, sessionIndexes, waitForProjectAuthority])
 
   const renameSession = useCallback(async (session: SessionNavigation) => {
     const displayName = window.prompt('Rename session', sessionName(session))
@@ -628,8 +653,8 @@ function App() {
     const index = sessionIndexes[session.project_id]
     const projectSessions = [...(index?.active.map(navigationSession) ?? []), ...(index?.archived.map(navigationSession) ?? [])]
     const subtreeIDs = [session.id, ...sessionDescendantIDs(projectSessions, session.id)]
-    const busyIDs = new Set(projectSessions.filter((item) => item.status === 'running').map((item) => item.id))
-    if (subtreeIDs.some((id) => busyIDs.has(id) || activeRunsRef.current[id]?.status === 'running')) return
+    const busyIDs = new Set(projectSessions.filter((item) => item.status === 'running' || isAdmissionPending(item.id)).map((item) => item.id))
+    if (subtreeIDs.some((id) => busyIDs.has(id))) return
     const childCount = subtreeIDs.length - 1
     const childNote = childCount > 0 ? ` ${childCount} child ${childCount === 1 ? 'session' : 'sessions'} will also be archived.` : ''
     if (!window.confirm(`Archive "${sessionName(session)}"? It will be hidden from the current list.${childNote}`)) return
@@ -641,7 +666,7 @@ function App() {
         setSelectedSessionID(next?.session_id ?? '')
       }
     } catch (reason) { setError(sessionMutationErrorMessage(reason)) }
-  }, [activeRunsRef, sessionIndexRepository, sessionIndexes, selectedSessionRef, sessionCommands, setSelectedSessionID, waitForSessionAuthority])
+  }, [isAdmissionPending, sessionIndexRepository, sessionIndexes, selectedSessionRef, sessionCommands, setSelectedSessionID, waitForSessionAuthority])
 
   const restoreSession = useCallback(async (session: SessionNavigation) => {
     try {
@@ -658,8 +683,8 @@ function App() {
     const projectSessions = [...(index?.active.map(navigationSession) ?? []), ...(index?.archived.map(navigationSession) ?? [])]
     const subtreeIDs = [session.id, ...sessionDescendantIDs(projectSessions, session.id)]
     const initialArchivedByID = new Map(projectSessions.map((item) => [item.id, item.archived]))
-    const busyIDs = new Set(projectSessions.filter((item) => item.status === 'running').map((item) => item.id))
-    if (subtreeIDs.some((id) => busyIDs.has(id) || activeRunsRef.current[id]?.status === 'running')) return
+    const busyIDs = new Set(projectSessions.filter((item) => item.status === 'running' || isAdmissionPending(item.id)).map((item) => item.id))
+    if (subtreeIDs.some((id) => busyIDs.has(id))) return
     const childCount = subtreeIDs.length - 1
     const childNote = childCount > 0 ? ` ${childCount} child ${childCount === 1 ? 'session' : 'sessions'} will also be permanently deleted.` : ''
     if (!window.confirm(`Permanently delete "${sessionName(session)}"? This action cannot be undone.${childNote}`)) return
@@ -707,368 +732,41 @@ function App() {
       }
       setError(sessionMutationErrorMessage(reason))
     }
-  }, [activeRunsRef, sessionIndexRepository, sessionIndexes, selectedSessionRef, sessionCommands, setSelectedProjectID, setSelectedSessionID, waitForSessionAuthority])
+  }, [isAdmissionPending, sessionIndexRepository, sessionIndexes, selectedSessionRef, sessionCommands, setSelectedProjectID, setSelectedSessionID, waitForSessionAuthority])
 
-  // Session Index owns navigation metadata and status. Lifecycle SSE and the
-  // per-run stream are now retained only as the explicit run-control adapter:
-  // they admit/replay/control runs, but never write Session Content or the
-  // navigation read model. A later run-control cutover can remove this block.
-  const handleRunEvent = useCallback(async (sessionID: string, runID: string, event: RunEvent) => {
-    const payload = event as unknown as Record<string, unknown>
-    const eventSessionID = typeof payload.session_id === 'string' ? payload.session_id : ''
-    const eventRunID = typeof payload.run_id === 'string' ? payload.run_id : ''
-    const projectionEvent = event.type === 'item.appended' || event.type === 'item.created' || event.type === 'item.updated'
-    const logGate = (kind: 'accepted' | 'ignored', reason?: string) => {
-      if (!frontendProtocolLogger.isEnabled(sessionID)) return
-      frontendProtocolLogger.log({
-        sessionID,
-        source: 'app.event_gate',
-        kind,
-        ...protocolLogIdentity(payload, runID),
-        reason,
-        bound_session_id: sessionID,
-        bound_run_id: runID,
-        event: payload,
-      })
-    }
-    // The stream callback is bound to (sessionID, runID), not to whatever an
-    // untrusted/replayed payload happens to claim.  A stale stream can finish
-    // after the user starts another run in the same session; accepting its
-    // lifecycle/terminal events would otherwise clear the newer run's
-    // sidebar state.  Committed projection events remain useful in that race,
-    // but they must still agree with the bound identity.
-    if ((eventSessionID && eventSessionID !== sessionID) || (eventRunID && eventRunID !== runID)) {
-      logGate('ignored', 'wrong binding')
-      return
-    }
-    const currentRun = activeRunsRef.current[sessionID]
-    const admissionBinding = runStartedReplayBindingsRef.current.get(runID) === sessionID
-    const newerAdmissionBinding = [...runStartedReplayBindingsRef.current.entries()]
-      .some(([boundRunID, boundSessionID]) => boundSessionID === sessionID && boundRunID !== runID)
-    // A new POST owns the session as soon as it is in flight, even before its
-    // response can establish a run binding.  An old terminal replay must not
-    // clear that admission gate or synthesize an idle sidebar transition.
-    // Once the old run is the only owner, terminal replay remains legitimate
-    // even when its transient ActiveRun was already removed.
-    if (event.type === 'run.settled' && !admissionBinding && (pendingAdmissionSessionsRef.current.has(sessionID) || newerAdmissionBinding)) {
-      logGate('ignored', 'stale run/no active run')
-      return
-    }
-    if (!projectionEvent && event.type !== 'run.settled' && !admissionBinding && (!currentRun || currentRun.id !== runID)) {
-      logGate('ignored', 'stale run/no active run')
-      return
-    }
-    if (!projectionEvent && currentRun && currentRun.id !== runID && !(event.type === 'run.started' && currentRun.status !== 'running')) {
-      logGate('ignored', 'stale run')
-      return
-    }
-    if (event.type !== 'run.settled') logGate('accepted')
-    if (event.type === 'text.delta' || event.type === 'reasoning.delta') {
-      queueRunEvent(sessionID, runID, event)
-      return
-    }
-    // Preserve stream ordering and ensure tool/settled events observe all deltas.
-    flushRunEvents(sessionID, runID)
-    const update = (updater: (run: ActiveRun) => ActiveRun | null) => updateActiveRun(sessionID, runID, updater)
-    switch (event.type) {
-      case 'run.started': {
-        // Admission only identifies the run stream. The replay's committed
-        // run.started event is the boundary that creates the transient run
-        // container for subsequent deltas, tools, and process UI.
-        runStartedReplayBindingsRef.current.delete(runID)
-        setAwaitingRunStarted(sessionID, false)
-        const turnID = typeof event.turn_id === 'string' ? event.turn_id : undefined
-        const existing = activeRunsRef.current[sessionID]
-        if (existing?.id === runID) {
-          update((run) => ({ ...run, turnID: turnID ?? run.turnID, status: 'running' }))
-        } else {
-          addActiveRun({
-            id: runID,
-            sessionID,
-            turnID,
-            assistantText: '',
-            steps: [],
-            agentIteration: 0,
-            status: 'running',
-          })
-        }
-        break
-      }
-      case 'turn.started':
-      case 'compaction.started':
-      case 'compaction.completed':
-      case 'provider.retrying':
-      case 'run.prompt_queue':
-      case 'run.prompt_appended':
-      case 'agent.iteration.started':
-      case 'tool.requested':
-      case 'tool.started':
-      case 'tool.finished':
-      case 'usage.updated':
-        update((run) => reduceRunEvent(run, event))
-        break
-      case 'item.appended':
-      case 'item.created':
-      case 'item.updated':
-        // Durable item publication is owned by session_content. The legacy
-        // run stream remains a control/replay adapter and cannot write a
-        // second content reducer or projection cache.
-        break
-      case 'run.resync_required':
-        sessionContentRepository.retry(sessionID)
-        break
-      case 'turn.failed':
-        // A late failure from a superseded stream must not surface as the
-        // current turn's error.  The identity guard above normally handles
-        // this; retain the explicit check for a terminal replay with no
-        // transient container.
-        if (activeRunsRef.current[sessionID]?.id !== runID && !admissionBinding) {
-          logGate('ignored', 'stale run/no active run')
-          return
-        }
-        update((run) => reduceRunEvent(run, event))
-        setTurnErrors((current) => ({
-          ...current,
-          [sessionID]: { turnID: String(event.turn_id ?? ''), message: String(event.message ?? 'Run failed') },
-        }))
-        break
-      case 'run.settled': {
-        if (settledRunIDsRef.current.has(runID)) {
-          logGate('ignored', 'duplicate settlement')
-          return
-        }
-        settledRunIDsRef.current.add(runID)
-        while (settledRunIDsRef.current.size > 256) {
-          const oldest = settledRunIDsRef.current.values().next().value as string | undefined
-          if (!oldest) break
-          settledRunIDsRef.current.delete(oldest)
-        }
-        runStartedReplayBindingsRef.current.delete(runID)
-        setAwaitingRunStarted(sessionID, false)
-        const settledRun = activeRunsRef.current[sessionID]
-        // A terminal event from a previous run is still a valid durable
-        // projection notification, but it is not allowed to settle or
-        // reconcile a newer run occupying this session.
-        if (settledRun && settledRun.id !== runID) {
-          logGate('ignored', 'stale run')
-          return
-        }
-        logGate('accepted')
-        const settledStatus = String(event.status)
-        if (settledStatus === 'failed') {
-          // turn.failed usually landed first with the real reason; fallback
-          // for a late-attach run-control replay.
-          setTurnErrors((current) => current[sessionID]
-            ? current
-            : { ...current, [sessionID]: { turnID: String(event.turn_id ?? ''), message: String(event.message ?? 'Run failed') } })
-        }
-        // Session Content receives the settlement/transient barrier itself.
-        // Removing this run only affects the transitional control adapter.
-        if (!settledRun || settledRun.id === runID) removeRun(sessionID, runID)
-        break
-      }
-    }
-  }, [activeRunsRef, addActiveRun, flushRunEvents, queueRunEvent, removeRun, sessionContentRepository, setAwaitingRunStarted, updateActiveRun])
+  // Session Index owns navigation metadata. Session Content owns the selected
+  // run projection; reconnect and replay are handled by the single sync
+  // runtime, never by a page-owned lifecycle or per-run stream.
 
-  // A run has at most one active connection by this App instance. streamRun
-  // owns its replay cursor and reconnects internally; a later authoritative
-  // recovery may retry a reader that has failed.
-  const runStreamsRef = useRef(new Set<string>())
-  const runStreamControllersRef = useRef(new Map<string, AbortController>())
-  const connectRunStream = useCallback((runID: string, sessionID: string) => {
-    if (!runID || !sessionID || runStreamsRef.current.has(runID) || settledRunIDsRef.current.has(runID)) return
-    runStreamsRef.current.add(runID)
-    const controller = new AbortController()
-    runStreamControllersRef.current.set(runID, controller)
-    void streamRun(runID, (event) => handleRunEvent(sessionID, runID, event), { signal: controller.signal, sessionID })
-      .catch((reason: unknown) => {
-        if (controller.signal.aborted) return
-        // The stream may outlive a superseded run or a completed run.  Only
-        // its own current run (or its still-awaiting admission binding) may
-        // transition transient UI or surface an error.  In particular, a
-        // late error from session A must not put a selected session B in an
-        // error state.
-        const currentRun = activeRunsRef.current[sessionID]
-        const ownsCurrentRun = currentRun?.id === runID
-        const ownsAdmission = runStartedReplayBindingsRef.current.get(runID) === sessionID
-        if (settledRunIDsRef.current.has(runID) || (!ownsCurrentRun && !ownsAdmission)) return
-        // streamRun already exhausted its own replay reconnects. Allow an
-        // authoritative background bootstrap to retry this failed reader,
-        // while keeping successful/settled runs permanently de-duplicated.
-        runStreamsRef.current.delete(runID)
-        if (ownsAdmission) {
-          runStartedReplayBindingsRef.current.delete(runID)
-          setAwaitingRunStarted(sessionID, false)
-        }
-        if (ownsCurrentRun) {
-          updateActiveRun(sessionID, runID, (existing) => ({ ...existing, status: 'error_pending_refresh' }))
-          setRecoveredRuns((current) => current.filter((item) => item.run_id !== runID))
-        }
-        if (viewingSessionIDRef.current === sessionID) setError('Run synchronization is unavailable.')
-      })
-      .finally(() => {
-        runStreamsRef.current.delete(runID)
-        runStreamControllersRef.current.delete(runID)
-      })
-  }, [activeRunsRef, handleRunEvent, setAwaitingRunStarted, updateActiveRun])
-
-  useEffect(() => () => {
-    for (const controller of runStreamControllersRef.current.values()) controller.abort()
-    runStreamControllersRef.current.clear()
-  }, [])
-
-  const handleLifecycleEvent = useCallback(async (event: LifecycleEvent): Promise<void> => {
-    const eventSession = event.session && typeof event.session === 'object'
-      ? event.session
-      : event.metadata ?? event.session_metadata
-    const sessionID = event.session_id ?? (typeof event.session === 'string' ? event.session : eventSession?.id) ?? ''
-    const runID = event.run_id ?? event.run ?? ''
-    const logLifecycleGate = (kind: 'accepted' | 'ignored', reason?: string) => {
-      if (!sessionID || !frontendProtocolLogger.isEnabled(sessionID)) return
-      const payload = event as unknown as Record<string, unknown>
-      frontendProtocolLogger.log({
-        sessionID,
-        source: 'app.lifecycle_gate',
-        kind,
-        ...protocolLogIdentity(payload, runID),
-        reason,
-        event: payload,
-      })
-    }
-    if (event.type === 'run.settled' && sessionID && runID) {
-      const currentRun = activeRunsRef.current[sessionID]
-      const admissionBinding = runStartedReplayBindingsRef.current.get(runID) === sessionID
-      const newerAdmissionBinding = [...runStartedReplayBindingsRef.current.entries()]
-        .some(([boundRunID, boundSessionID]) => boundSessionID === sessionID && boundRunID !== runID)
-      // Lifecycle settlement applies metadata before forwarding the terminal
-      // event to the run reducer. Apply the same ownership gate here, or an
-      // old frame carrying `metadata` could still mark the sidebar idle while
-      // a new POST is waiting for its run_id.
-      if (!admissionBinding && (pendingAdmissionSessionsRef.current.has(sessionID) || newerAdmissionBinding || (currentRun && currentRun.id !== runID))) {
-        logLifecycleGate('ignored', 'stale run/no active run')
-        return
-      }
-    }
-    if (event.type !== 'run.started') logLifecycleGate('accepted')
-    // Session lifecycle frames are deliberately not merged into the
-    // navigation state. Session Index is the only authority for list,
-    // archive, unread, and status fields.
-    if (event.type === 'session.created' || event.type === 'session.updated' || event.type === 'session.archived' || event.type === 'session.deleted') return
-
-    if (event.type === 'run.started') {
-      if (sessionID && runID) {
-        // A lifecycle hint may race a local POST. It never creates a
-        // navigation status transition or a transient run. Local admission
-        // waits for its run replay; background runs are discovered through
-        // the authoritative active-run registry and Session Index.
-        if (pendingAdmissionSessionsRef.current.has(sessionID) || runStartedReplayBindingsRef.current.has(runID)) {
-          logLifecycleGate('ignored', 'waiting for run replay binding')
-          return
-        }
-        if (activeRunsRef.current[sessionID]?.id === runID) {
-          logLifecycleGate('ignored', 'run already active')
-          return
-        }
-        logLifecycleGate('accepted')
-        void bootstrapApplication(true).catch(() => {})
-      } else {
-        logLifecycleGate('accepted')
-      }
-      return
-    }
-
-    if (event.type === 'run.settled' && sessionID && runID) {
-      // Feed lifecycle settlement through the same watermark gate as the run
-      // stream. This is idempotent when both channels carry the event and,
-      // importantly, does not turn a background status notification into a
-      // selected-session snapshot.
-      await handleRunEvent(sessionID, runID, {
-        type: 'run.settled',
-        run_id: runID,
-        status: event.status ?? 'committed',
-        turn_id: event.turn_id,
-        last_seq: event.last_seq,
-        committed_revision: event.committed_revision,
-        message: event.message,
-      })
-    }
-  }, [bootstrapApplication, handleRunEvent])
-
-  const lifecycleEventHandlerRef = useRef<(event: LifecycleEvent) => Promise<void>>(async () => {})
-  lifecycleEventHandlerRef.current = handleLifecycleEvent
-  const reconcileLifecycleRef = useRef<() => Promise<void>>(async () => {})
-  reconcileLifecycleRef.current = async () => {
-    try {
-      await bootstrapApplication(true)
-    } catch (reason) {
-      setError('Application synchronization is unavailable.')
-      throw reason
-    }
-  }
-
-  useEffect(() => {
-    const controller = new AbortController()
-    void streamLifecycle(
-      (event) => lifecycleEventHandlerRef.current(event),
-      { signal: controller.signal, onReconnect: () => reconcileLifecycleRef.current() },
-    ).catch((reason: unknown) => {
-      if (!controller.signal.aborted) setError('Application synchronization is unavailable.')
-    })
-    return () => controller.abort()
-  }, [])
-
-  useEffect(() => {
-    if (recoveredRuns.length === 0) return
-    for (const run of recoveredRuns) {
-      if (pendingAdmissionSessionsRef.current.has(run.session_id) || runStartedReplayBindingsRef.current.has(run.run_id)) continue
-      if (!activeRunsRef.current[run.session_id]) {
-        addActiveRun({
-          id: run.run_id,
-          sessionID: run.session_id,
-          turnID: run.turn_id,
-          assistantText: '',
-          steps: [],
-          agentIteration: 0,
-          status: 'running',
-        })
-      }
-      connectRunStream(run.run_id, run.session_id)
-    }
-  }, [activeRunsRef, addActiveRun, connectRunStream, recoveredRuns])
-
-  // startNewRun handles new composer input. A successful start clears the
-  // session's recorded turn failure.
-  const startNewRun = async (sessionID: string, content: string, imageInputs: ImageAttachmentInput[]): Promise<boolean> => {
+  // startNewRun handles text admission. The command result is never used to
+  // manufacture a row: Session Content must publish the matching transient
+  // projection before the pending UI gate is released.
+  const startNewRun = async (sessionID: string, content: string): Promise<boolean> => {
     pendingAdmissionSessionsRef.current.add(sessionID)
+    // Enter the visible barrier before the command leaves the page. This
+    // closes the double-submit and destructive-action race during in-flight
+    // command acknowledgement.
+    setAwaitingRunStarted(sessionID, true)
     try {
-      // Admission is the only source of the run identity for a new submit.
-      // Do not construct a stream URL or attach to a session stream before
-      // this response has supplied the authoritative run_id.
-      // Text admission uses the typed control-plane command. The image path
-      // remains a narrowly scoped transition until attachments have their own
-      // Blob upload command; neither path patches session content locally.
-      const started = imageInputs.length > 0
-        ? await api.startRun(sessionID, content, imageInputs)
-        : await runCommands.startRun(sessionID, content)
+      const started = await runCommands.startRun(sessionID, content)
       if (!started.run_id || started.session_id !== sessionID) {
         throw new Error('Run admission response did not include the requested session and run_id')
       }
       pendingAdmissionSessionsRef.current.delete(sessionID)
-      runStartedReplayBindingsRef.current.set(started.run_id, sessionID)
-      setAwaitingRunStarted(sessionID, true)
+      pendingRunIDsRef.current.set(sessionID, started.run_id)
+      observeRunAdmission(sessionID, started.run_id)
       clearTurnError(sessionID)
-      const boundRunID = started.run_id
-      connectRunStream(boundRunID, sessionID)
       return true
     } catch (reason) {
       pendingAdmissionSessionsRef.current.delete(sessionID)
+      pendingRunIDsRef.current.delete(sessionID)
       setAwaitingRunStarted(sessionID, false)
       setError(runMutationErrorMessage(reason))
       return false
     }
   }
 
-  // /new creates a user root through the configured-session API. Capture the
+  // /new creates a user root through the configured-session command facade. Capture the
   // source session id before the first await so a later selection change cannot
   // alter which configuration is cloned. Session-list entries do not carry
   // all creation fields, so hydrate one when the selected snapshot is not yet
@@ -1116,6 +814,15 @@ function App() {
     if (content.trim() === '/new' && images.length === 0) {
       return createRootSession(sessionID)
     }
+    if (isAdmissionPending(sessionID)) return false
+    if (images.length > 0) {
+      // Image admission is intentionally not sent through the removed REST
+      // run endpoint. A bounded Blob upload command is a separate data-plane
+      // slice; silently dropping an attachment would be worse than a safe
+      // explicit refusal.
+      setError('Image attachments are temporarily unavailable.')
+      return false
+    }
     const activeRun = controlRunFor(sessionID)
     if (activeRun && activeRun.status === 'running') {
       // Append to the in-flight run: the message is queued and injected into
@@ -1131,8 +838,7 @@ function App() {
         return false
       }
     }
-    const imageInputs: ImageAttachmentInput[] = images.map((image) => ({ data_url: image.dataURL, detail: 'auto' }))
-    return startNewRun(sessionID, content, imageInputs)
+    return startNewRun(sessionID, content)
   }
 
   const continueRun = useCallback(async (): Promise<boolean> => {
@@ -1140,29 +846,29 @@ function App() {
     const sessionID = viewingSessionID
     const activeRun = controlRunFor(sessionID)
     const detail = sessionDetail?.id === sessionID ? sessionDetail : undefined
-    if (activeRun?.status === 'running' || !detail || (detail.status !== 'interrupted' && detail.status !== 'failed') || !detail.interrupted_run_id || !detail.interrupted_turn_id) {
+    if (isAdmissionPending(sessionID) || activeRun?.status === 'running' || !detail || (detail.status !== 'interrupted' && detail.status !== 'failed') || !detail.interrupted_run_id || !detail.interrupted_turn_id) {
       return false
     }
     pendingAdmissionSessionsRef.current.add(sessionID)
+    setAwaitingRunStarted(sessionID, true)
     try {
       const started = await runCommands.continueRun(sessionID)
       if (!started.run_id || started.session_id !== sessionID) {
         throw new Error('Run admission response did not include the requested session and run_id')
       }
       pendingAdmissionSessionsRef.current.delete(sessionID)
-      runStartedReplayBindingsRef.current.set(started.run_id, sessionID)
-      setAwaitingRunStarted(sessionID, true)
+      pendingRunIDsRef.current.set(sessionID, started.run_id)
+      observeRunAdmission(sessionID, started.run_id)
       clearTurnError(sessionID)
-      const boundRunID = started.run_id
-      connectRunStream(boundRunID, sessionID)
       return true
     } catch (reason) {
       pendingAdmissionSessionsRef.current.delete(sessionID)
+      pendingRunIDsRef.current.delete(sessionID)
       setAwaitingRunStarted(sessionID, false)
       setError(runMutationErrorMessage(reason))
       return false
     }
-  }, [clearTurnError, connectRunStream, runCommands, viewingSessionID, sessionDetail, setAwaitingRunStarted])
+  }, [clearTurnError, isAdmissionPending, observeRunAdmission, runCommands, sessionDetail, setAwaitingRunStarted, viewingSessionID])
 
   const cancelRun = async () => {
     const run = controlRunFor(viewingSessionID)
@@ -1194,9 +900,8 @@ function App() {
     }
   }
 
-  // Steer/move mutations only call the API; the updated queue arrives via the
-  // run.prompt_queue stream event, keeping the server the single source of
-  // truth for queue order.
+  // Steer/move mutations only call the typed command facade; the updated queue arrives via the
+  // run.prompt_queue stream event, keeping the server the single source of truth for queue order.
   const setQueuedPromptSteer = async (promptID: string, steer: boolean) => {
     const run = controlRunFor(viewingSessionID)
     if (!run) return
@@ -1218,7 +923,7 @@ function App() {
   }
 
   const compactSession = async () => {
-    if (!viewingSessionID || sessionDetail?.status === 'running' || controlRunFor(viewingSessionID)?.status === 'running') return
+    if (!viewingSessionID || isAdmissionPending(viewingSessionID) || sessionDetail?.status === 'running' || controlRunFor(viewingSessionID)?.status === 'running') return
     const sessionID = viewingSessionID
     setCompactingSessionIDs((current) => ({ ...current, [sessionID]: true }))
     try {
@@ -1248,9 +953,16 @@ function App() {
     : []
   const subPanelContext = viewingSessionID ? sessionSubPanelContext(selectedProjectSessions, viewingSessionID) : null
   // session_content subscription_event is the opened session's transient
-  // content authority. The run registry below remains only for control
-  // admission/replay and background run visibility.
+  // content authority. No page-local run registry or stream is consulted.
   const selectedActiveRun = activeRunForConversation(sessionContentView, viewingSessionID)
+  useEffect(() => {
+    if (!viewingSessionID) return
+    const expectedRunID = pendingRunIDsRef.current.get(viewingSessionID)
+    if (!expectedRunID) return
+    // The barrier is deliberately a repository/domain selector, not the
+    // presentation-only active row. It accepts terminal/durable evidence too.
+    observeRunAdmission(viewingSessionID, expectedRunID)
+  }, [observeRunAdmission, sessionContentView, viewingSessionID])
   useEffect(() => {
     if (debugSessionID && debugSessionID !== viewingSessionID) setDebugSessionID('')
   }, [debugSessionID, viewingSessionID])
@@ -1260,7 +972,13 @@ function App() {
       : null
     : null
   const indexedRunningSessionIDs = Object.values(sessionIndexes).flatMap((index) => index.summaries.filter((summary) => summary.status === 'running').map((summary) => summary.session_id))
-  const visibleRunningSessionIDs = new Set([...indexedRunningSessionIDs, ...runningSessionIDs, ...Object.keys(compactingSessionIDs)])
+  const pendingAdmissionSessionIDs = Object.keys(awaitingRunStartedBySession)
+  const visibleRunningSessionIDs = new Set([
+    ...indexedRunningSessionIDs,
+    ...pendingAdmissionSessionIDs,
+    ...(selectedActiveRun?.status === 'running' && viewingSessionID ? [viewingSessionID] : []),
+    ...Object.keys(compactingSessionIDs),
+  ])
   const showAddProject = useCallback(() => {
     projectFormUserOpenedRef.current = true
     autoProjectFormRef.current = false
@@ -1359,6 +1077,7 @@ function App() {
 			onPastedImageAdd={(pastedImage) => addPastedImage(viewingSessionID, pastedImage)}
 			onPastedImageRemove={(pastedImageID) => removePastedImage(viewingSessionID, pastedImageID)}
 			onDraftClear={() => clearDraft(viewingSessionID)}
+            loadSessionImage={loadSessionImage}
             sessionNames={sessionNames}
             turnError={turnErrors[viewingSessionID] ?? null}
             onDismissTurnError={() => clearTurnError(viewingSessionID)}

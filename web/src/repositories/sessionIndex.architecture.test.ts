@@ -141,7 +141,7 @@ describe('domain-facing Session Index repository', () => {
       '../components/ProcessTimeline.tsx', '../components/ProviderManagerDialog.tsx', '../components/SessionModelDialog.tsx',
       '../components/SessionSubPanel.tsx', '../components/VirtualConversationList.tsx', '../components/WorkspaceTree.tsx',
       '../components/icons.tsx', '../components/misc.tsx',
-      '../hooks/useComposerDrafts.ts', '../hooks/useRunRegistry.ts', '../hooks/useSessionContentHistory.ts',
+      '../hooks/useComposerDrafts.ts', '../hooks/useSessionContentHistory.ts',
       '../hooks/useSessionSelection.ts', '../hooks/useSessionIndex.ts',
     ]
     for (const file of pageFiles) {
