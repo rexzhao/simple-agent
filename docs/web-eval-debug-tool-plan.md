@@ -1,6 +1,6 @@
 # `web.eval` 内部调试工具开发方案
 
-> **状态：阶段 1、2、3A、3B 已完成并验收；阶段 4 Blob/诊断日志尚未实现。**本轮把 connection-bound Broker 接入 Agent，并仅在运行时条件满足时动态提供内部 `web.eval`；不引入 Blob 或独立 code/result 诊断日志。
+> **状态：阶段 1、2、3A、3B 已完成并验收；主 WebSocket 同步 cutover 已完成；`web.eval` 即时调试工具主任务已完成。**阶段 4 仅保留为可选、尚未批准实施的大结果 Blob 数据面 / serializer 增强候选；当前不记录 `code`/result 正文。
 
 ## 1. 目标与边界
 
@@ -20,11 +20,12 @@ Agent 可以用它在当前 Web 调试页面中执行少量、有界的 JavaScri
 
 项目 ID 是**功能过滤条件**，不是 Debug 开关。服务端 Debug 总开关仍默认关闭；只有总开关开启并且 Session 确实属于上述项目时，才允许注册工具。
 
-本任务只做即时诊断，不做完整同步取证系统。以下内容不再是本任务的交付目标：
+本任务只做即时诊断，不做完整同步取证系统。以下内容明确不属于本任务交付，也不构成阶段 4 的 backlog 要求：
 
 - 完整 deterministic sync trace 或 replay bundle；
 - Session baseline、snapshot barrier 级别的 Trace 录制；
 - 独立 replay runtime、TraceReplayInput 或第二套同步归并实现；
+- 独立诊断日志或 `code`/result 正文日志；当前不记录 `code`/result 正文；
 - 大量预定义 probe、selector 或领域专用调试工具；
 - 自动跨 epoch 重试或自动重放 JavaScript。
 
@@ -55,8 +56,8 @@ session 并确认项目仍为目标项目、attachment 仍是同一个 current r
 浏览器成功/失败结果保留 execution identity、elapsed、value（包括 `null`）和可选 console。
 Go 和 Web presentation 都只显示 timeout/code bytes（或 hash）安全摘要，不显示 code 正文；
 Go 先对 requested/started/history DTO 做防御性摘要，Web 同时兼容原始参数和已摘要 shape，
-畸形输入 fail closed。正常 Agent tool 请求/结果仍按现有 durability 保存，这不等于阶段 4
-的独立诊断 logging。
+畸形输入 fail closed。正常 Agent tool 请求/结果仍按现有 durability 保存；当前不记录
+`code`/result 正文。
 
 不要求也不接受 `session_id`、`page_instance_id`、`probe` 或 `selector`。Agent 通过任意 JavaScript 自行：
 
@@ -120,7 +121,7 @@ Go 侧只维护一个当前 Web debug executor，不让 Agent 选择页面或连
 保持在现有 limiter 下方的 48 KiB；不会把大数据直接塞进协议，也没有 Blob descriptor。serializer
 对深度、对象键、数组元素、字符串、console 条数和参数数均有硬界，并对循环引用、DOM Node、
 `Error`、`BigInt`、`Function`、`Symbol`、`undefined`、非有限数字和 `Window` 返回明确的
-summary/error 标记。Blob 数据面是阶段 4 的后续工作。
+summary/error 标记。大结果 Blob 数据面仅是下文阶段 4 的可选候选，当前未实现。
 
 断线、超时、序列化失败和脚本异常必须保留可区分的 typed error/diagnostic 信息。除内部 lease 选择外，broker 不替 Agent 修改代码、重试或重放。
 
@@ -139,13 +140,13 @@ summary/error 标记。Blob 数据面是阶段 4 的后续工作。
 
 ## 7. 观测与安全边界
 
-3A/3B 不记录 `code`、result 正文或独立诊断日志，不暴露 capability/ticket。每次 Broker execution
+3A/3B 当前不记录 `code`/result 正文，不暴露 capability/ticket。每次 Broker execution
 开始时重新校验当前 lease 的 SessionStore authority；Agent tool 调用前还会重新加载 caller session、
 校验 target ProjectID 和同一 Service registration。该校验不是执行期间的持续订阅。执行身份固定在
 开始时的 connection/page/epoch/session：focus/lease 切换不会取消、迁移或重放已经绑定的 execution。
 只有 refresh/re-register、unregister、connection disconnect/watcher cancel 或 Broker Close 会取消
-绑定执行。Go 和 Web presentation 只保留不含 code 的安全摘要；正常 Agent tool durability 不等于
-阶段 4 的独立诊断 logging。
+绑定执行。Go 和 Web presentation 只保留不含 code 的安全摘要；正常 Agent tool durability 不改变
+上述正文不记录边界。
 
 ## 8. 分阶段实施
 
@@ -158,7 +159,8 @@ summary/error 标记。Blob 数据面是阶段 4 的后续工作。
 - 当前实现范围包括每个 live connection 一个候选、全局唯一当前 lease，以及最近焦点优先、注销、连接 context 取消、刷新 epoch 和 broker Close 的确定性失效/回退；提供不带页面选择参数的 `Current` / `Acquire` API 和 `web_debug_not_connected` typed 错误。
 - 当前实现范围包括 debug handler 只消费 debug control 消息，现有 command/subscription 委托路径不变。
 
-阶段 2、3A、3B 已完成并验收；阶段 4 Blob/serializer 增强/logging 尚未实现。3A 的 serializer v1 已完成并验收，但仍只服务于 inline execution result。
+阶段 2、3A、3B 已完成并验收；3A 的 serializer v1 已完成并验收，但仍只服务于 inline execution result。
+阶段 4 仅保留为下文所述的可选候选，不表示已批准或已排入实施。
 
 ### 阶段 2：`window.__SAI_DEBUG__`（已完成并验收；本轮实现）
 
@@ -193,13 +195,15 @@ summary/error 标记。Blob 数据面是阶段 4 的后续工作。
 - registration 的 current check 是调用线性化点：替换先发生则旧 owner 稳定失败；检查后替换
   只允许已经绑定的旧 owner 完成一次，绝不迁移或 replay，也不跨浏览器执行持 Service 锁。
 - 本阶段仍只使用有界 inline output（Broker wire budget 为 64 KiB，最终 Agent tool content
-  保持在现有 limiter 下方的 48 KiB），不做 Blob、不增加独立 debug/diagnostic logging；
-  阶段 4 仍未实现。
+  保持在现有 limiter 下方的 48 KiB）。当前不记录 `code`/result 正文。
 
-### 阶段 4：Blob、增强 serializer 与诊断 logging（未实现）
+### 阶段 4：大结果 Blob 数据面 / serializer 增强（可选候选，尚未批准实施）
 
-- 大结果 Blob descriptor/HTTP data plane 未接入。
-- Stage4 的 Blob 生命周期、serializer 增强和最小诊断日志未实现；本轮不记录 code/result 正文。
+- 本阶段不是当前任务，也未批准实施；现有 GET Blob endpoint 本身不能证明 `web.eval` 已具备大结果数据面。
+- 如果未来单独立项，必须先分别确定 browser→Go 的大结果写入路径、Blob descriptor 契约，以及
+  Agent 后续读取 / 分析这些结果的语义；本文不预设接口或实现方案。
+- 独立诊断日志、同步 Trace/回放和 `code`/result 正文日志不属于本阶段候选；当前不记录
+  `code`/result 正文。
 
 ## 9. 验收条件
 
@@ -211,10 +215,10 @@ summary/error 标记。Blob 数据面是阶段 4 的后续工作。
 3. 多标签页并发连接只存在一个当前 executor，推荐最近焦点页面，Agent 不需要页面参数；
 4. 一次执行固定在一个 connection；断线、刷新或 epoch 变化返回失败且不自动重放；无执行端返回
    `web_debug_not_connected`；
-5. 3A 中 async JS、正常返回、console、异常、Go/浏览器超时、断线和 bounded inline result 都可观察且类型可区分；Blob descriptor 属于未实现的阶段 4；
+5. 3A 中 async JS、正常返回、console、异常、Go/浏览器超时、断线和 bounded inline result 都可观察且类型可区分；大结果 Blob descriptor 仅属于尚未批准实施的阶段 4 可选候选；
 6. serializer v1 能处理循环对象、DOM Node、Error、BigInt、Function 和 Window，不递归溢出、不泄漏未界定的大结果；
 7. 权限测试证明任意 JS 的同源/DOM 能力按文档工作，同时非目标项目无法注册或调用工具；
 8. E2E 中 Agent 通过任意 JS 切换项目/Session，检查 DOM、LocalReplica 和可读取的执行层数据，并能调用 wait-idle 或等价调试能力；
 9. 并发执行、焦点切换、lease 抢占、页面断线、超时和大结果场景均不会跨页面串结果；
-10. 3A 不记录 code/result 正文，也不实现阶段 4 的诊断日志；未来阶段 4 的最小日志与 Blob 引用不能回溯补写本轮执行；
+10. 当前不记录 `code`/result 正文；不要求独立诊断日志、正文回溯或同步 Trace/Replay，且这些内容不属于阶段 4 可选候选；
 11. 非调试页面和正常 Session 页面不依赖 `__SAI_DEBUG__`，主同步路径不引入完整 Trace/Replay 运行时。

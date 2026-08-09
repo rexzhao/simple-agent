@@ -1,6 +1,8 @@
 # WebSocket 命令与数据同步彻底重构开发方案
 
-> 本文采用 clean break：新协议不兼容现有 lifecycle SSE、per-run SSE、前端 lifecycle reducer 或 REST mutation 语义。开发完成后一次切换，不提供双写、shadow、feature flag 或旧协议回退。
+> **状态：主 WebSocket 同步 cutover 已完成。**本文保留按依赖顺序组织的历史设计与交付记录；固定项目 `web.eval` 的 Stage 1、2、3A、3B 也已完成并验收，详见文末已完成的调试工具段落。
+
+> 本文采用 clean break：新协议不兼容现有 lifecycle SSE、per-run SSE、前端 lifecycle reducer 或 REST mutation 语义。已完成一次切换，不提供双写、shadow、feature flag 或旧协议回退。
 
 ## 1. 相对原方案的关键修改
 
@@ -1041,7 +1043,7 @@ Blob 要求：
 
 ## 10. 开发执行顺序
 
-本方案不做兼容迁移，但仍按依赖顺序开发。建议在独立重构分支完成，达到 cutover 条件后整体合并。
+本方案不做兼容迁移，已按依赖顺序完成开发并完成一次 cutover。以下阶段顺序保留为实现边界和交付记录，不表示当前仍等待再次 cutover。
 
 ### 阶段 A：协议和 Sync Engine 内核
 
@@ -1190,26 +1192,30 @@ codex_login.start/clear
 - 已授权旧 endpoint、精确 `/api` 与未知 API path 返回 JSON/non-HTML 404；未授权 API
   仍统一 401。生产 route allowlist 和前端引用 guard、route-level tests 已加入。
 - G2 验收包含 backend/race、web unit/check/build、完整 Playwright、architecture guard
-  和 diff check；后续 `web.eval` 仍是独立调试任务，不在本阶段标记完成。
+  和 diff check；`web.eval` 是独立于主同步 cutover 的调试任务，状态见下文，已单独完成并验收。
 
 保留 domain service、durable Session projector、item identity 和已经验证的业务规则；删除的是 transport/sync 结构，不是重写 Agent 执行语义。
 
-### 后续调试任务：固定项目的 `web.eval`
+### 已完成的调试工具：固定项目的 `web.eval`
 
 原先把 Session Content 同步 Trace/回放作为后续调试任务的方案已由
-[`docs/web-eval-debug-tool-plan.md`](web-eval-debug-tool-plan.md) 取代。该任务独立于主同步
-cutover，使用固定项目 `project-f25c5aac78f681b52aabf5c0`，只有服务端 Debug 总开关开启且
-Session 属于该项目时才动态注册唯一的 Agent 工具 `web.eval`。
+[`docs/web-eval-debug-tool-plan.md`](web-eval-debug-tool-plan.md) 取代。该任务独立于且不阻塞已完成的
+主同步 cutover，使用固定项目 `project-f25c5aac78f681b52aabf5c0`，只有服务端 Debug 总开关开启且
+Session 属于该项目时才动态注册唯一的 Agent 工具 `web.eval`。Stage 1、2、3A、3B 均已完成并验收：
+
+- **Stage 1：**交付 debug control 注册 / 注销 / 焦点协议、固定项目的 SessionStore 权威校验、单一当前 executor lease，以及连接、刷新、epoch 和 close 的确定性失效语义。
+- **Stage 2：**交付经服务端确认后才挂载的 `window.__SAI_DEBUG__`，包括 Replica、Runtime、repositories、command facade、只读 `appState`、项目 / Session 切换和有界 `waitIdle`。
+- **Stage 3A：**交付 connection-bound `debug_execute` / `debug_execution_result` channel、async JS、timeout / disconnect / exception / console 结果、无 replay 绑定语义和 bounded serializer v1 inline result。
+- **Stage 3B：**交付按权威 Session、固定项目、Debug 开关和 live attachment 动态注册的 Agent `web.eval`，以及 owner/CAS 生命周期、严格参数 / payload 校验、取消与 typed errors、结构化结果和安全摘要 presentation。
 
 工具只接收 `code` 和可选的 bounded `timeout_ms`；Agent 通过任意 JavaScript 使用统一的
-`window.__SAI_DEBUG__` 入口、当前页面的同源/DOM 能力以及其可读取的数据自行诊断。Go 侧只
+`window.__SAI_DEBUG__` 入口、当前页面的同源 / DOM 能力以及其可读取的数据自行诊断。Go 侧只
 维护一个当前 Web debug executor，执行固定在单一连接；断线、刷新或 epoch 变化失败且不自动
-重放。该任务包含 executor lease、调试入口、broker/tool、bounded serializer、现有 HTTP Blob
-结果面和最小诊断日志，以及并发、断线、超时、权限、非目标项目过滤和任意 JS 切换
-Session/检查 DOM 与 Replica 的 E2E 验收。
+重放。当前交付只使用 bounded inline result，不包含 `web.eval` 的大结果 Blob 数据面；现有
+GET Blob endpoint 本身不能证明该结果面已交付。当前不记录 `code`/result 正文。
 
-完整 deterministic sync trace/replay、baseline/barrier 录制和独立 replay runtime 不属于该
-后续任务交付目标。
+完整 deterministic sync trace/replay、baseline/barrier 录制和独立 replay runtime 仍明确不做，
+也不构成后续任务要求。
 
 ## 11. 测试矩阵
 
