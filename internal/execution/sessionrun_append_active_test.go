@@ -92,7 +92,7 @@ func TestAppendActiveDrainedIntoActiveTurn(t *testing.T) {
 
 	run := service.StartSessionRun(context.Background(), session.ID, "init", emit)
 	// Wait until the turn is blocked inside the runner before appending.
-	waitForRunningTurn(t, service, session.ID)
+	waitForRunningTurn(t, service, run, session.ID)
 
 	if err := run.AppendActive("follow-up question"); err != nil {
 		t.Fatalf("AppendActive() error = %v", err)
@@ -164,7 +164,7 @@ func TestAppendActiveRemainderRunsFollowUpTurn(t *testing.T) {
 
 	run := service.StartSessionRun(context.Background(), session.ID, "init", emit)
 	// Wait until the turn is blocked inside the runner before appending.
-	waitForRunningTurn(t, service, session.ID)
+	waitForRunningTurn(t, service, run, session.ID)
 
 	if err := run.AppendActive("first"); err != nil {
 		t.Fatalf("AppendActive(first) error = %v", err)
@@ -223,7 +223,7 @@ func TestAppendActiveDroppedOnFailure(t *testing.T) {
 	emit := collectQueueEvents(&mu2, &snapshots)
 
 	run := service.StartSessionRun(context.Background(), session.ID, "init", emit)
-	waitForRunningTurn(t, service, session.ID)
+	waitForRunningTurn(t, service, run, session.ID)
 
 	if err := run.AppendActive("never sent"); err != nil {
 		t.Fatalf("AppendActive() error = %v", err)
@@ -308,7 +308,7 @@ func TestAppendActiveRemoveQueued(t *testing.T) {
 
 	run := service.StartSessionRun(context.Background(), session.ID, "init", emit)
 	// Wait until the turn is blocked inside the runner before appending.
-	waitForRunningTurn(t, service, session.ID)
+	waitForRunningTurn(t, service, run, session.ID)
 
 	if err := run.AppendActive("keep"); err != nil {
 		t.Fatalf("AppendActive(keep) error = %v", err)
@@ -360,12 +360,13 @@ func TestAppendActiveRemoveQueued(t *testing.T) {
 	}
 }
 
-// waitForRunningTurn blocks until the session's running turn id is set, so the
-// test can AppendActive against an in-flight turn deterministically. The fake
+// waitForRunningTurn blocks until the session's running turn id is set and
+// the run has installed the active turn's queue-snapshot sink, so the test
+// can AppendActive against an in-flight turn deterministically. The fake
 // runner must hold the turn open (e.g. block on a release channel): a turn
 // that completes immediately only keeps the running marker for a few
 // milliseconds, and any poll interval can miss that transient window.
-func waitForRunningTurn(t *testing.T, service *Service, sessionID string) {
+func waitForRunningTurn(t *testing.T, service *Service, run *SessionRun, sessionID string) {
 	t.Helper()
 	// Every poll reloads metadata and replays the session ledger from disk,
 	// so keep the interval modest and the deadline generous: on a busy CI
@@ -374,7 +375,16 @@ func waitForRunningTurn(t *testing.T, service *Service, sessionID string) {
 	for time.Now().Before(deadline) {
 		session, err := service.sessionStore.LoadExecutionState(sessionID)
 		if err == nil && session.RunningTurnID != "" {
-			return
+			// The durable running marker is published before the run goroutine
+			// installs the active turn's snapshot sink. Queue mutations landing
+			// in that gap publish no snapshot (nil sink), which made the queue
+			// snapshot assertions flaky on loaded CI runners; wait for the sink.
+			run.mu.Lock()
+			ready := run.activeEmit != nil && run.activeTurnID != ""
+			run.mu.Unlock()
+			if ready {
+				return
+			}
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
