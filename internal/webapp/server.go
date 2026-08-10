@@ -40,6 +40,12 @@ type ServerOptions struct {
 	CWD       string
 	LogWriter io.Writer
 
+	// AllowNonLoopback relaxes the loopback-only Host header restriction. It
+	// must only be set when the listener is intentionally bound to a
+	// non-loopback interface; the bearer token and per-request Origin checks
+	// remain enforced.
+	AllowNonLoopback bool
+
 	// The gateway and ticket store hooks keep B1 independently testable. The
 	// production defaults use the secure bounded implementations.
 	WebSocketGateway     *wsgateway.Gateway
@@ -55,6 +61,7 @@ type Server struct {
 	service                      *execution.Service
 	token                        string
 	cwd                          string
+	allowNonLoopback             bool
 	ctx                          context.Context
 	cancel                       context.CancelFunc
 	mux                          *http.ServeMux
@@ -389,6 +396,7 @@ func NewServer(options ServerOptions) (*Server, error) {
 		service:                      options.Service,
 		token:                        options.Token,
 		cwd:                          options.CWD,
+		allowNonLoopback:             options.AllowNonLoopback,
 		ctx:                          ctx,
 		cancel:                       cancel,
 		mux:                          http.NewServeMux(),
@@ -449,7 +457,7 @@ func newServerEpoch() (string, error) {
 func (s *Server) Handler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		setSecurityHeaders(w, s.webEvalEnabled && r.URL.Path != "/api" && !strings.HasPrefix(r.URL.Path, "/api/"))
-		if !validLoopbackHost(r.Host) {
+		if !s.allowNonLoopback && !validLoopbackHost(r.Host) {
 			writeAPIError(w, http.StatusForbidden, "invalid_host", "request host is not allowed")
 			return
 		}

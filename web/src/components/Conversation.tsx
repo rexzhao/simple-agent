@@ -211,6 +211,7 @@ export const Conversation = memo(function Conversation(props: {
 
 	const renderRow = useCallback((row: ConversationRow) => renderConversationRow(row, {
 		sessionID: props.sessionID ?? '',
+		activeRun: props.activeRun,
 		loadSessionImage,
 		sessionNames: props.sessionNames,
 		workspaceRoot: safeDetail?.created_cwd,
@@ -433,6 +434,7 @@ function CostUsage(props: { pricing?: Session['pricing']; context: Session['cont
 
 type ConversationRowRenderProps = {
 	sessionID: string
+	activeRun: ActiveRun | null
 	loadSessionImage: (sessionID: string, hash: string, signal?: AbortSignal) => Promise<SessionImageData>
 	sessionNames?: Record<string, string>
 	workspaceRoot?: string
@@ -446,7 +448,7 @@ type ConversationRowRenderProps = {
 function renderConversationRow(row: ConversationRow, props: ConversationRowRenderProps) {
 	switch (row.kind) {
 		case 'message':
-			return <Message key={row.key} item={row.item} sessionID={props.sessionID} loadSessionImage={props.loadSessionImage} assistantTail={row.assistantTail} assistantStreaming={row.assistantStreaming} />
+			return <Message key={row.key} item={row.item} sessionID={props.sessionID} loadSessionImage={props.loadSessionImage} assistantTail={row.assistantTail} assistantStreaming={row.assistantStreaming} copyAvailable={!assistantItemBelongsToActiveRun(row.item, props.activeRun)} />
 		case 'compaction':
 			return <CompactionRecord key={row.key} item={row.item} />
 		case 'process':
@@ -474,7 +476,26 @@ function renderConversationRow(row: ConversationRow, props: ConversationRowRende
 	}
 }
 
-const Message = memo(function Message({ item, sessionID, loadSessionImage, assistantTail = '', assistantStreaming = false }: { item: SessionItem; sessionID: string; loadSessionImage: (sessionID: string, hash: string, signal?: AbortSignal) => Promise<SessionImageData>; assistantTail?: string; assistantStreaming?: boolean }) {
+function assistantItemBelongsToActiveRun(item: SessionItem, activeRun: ActiveRun | null): boolean {
+	if (!activeRun || item.message?.role !== 'assistant') return false
+	// Failed and cancelled are terminal run states: no more output can be
+	// appended, so the completed content may expose its actions even while the
+	// terminal descriptor is still visible until the durable clear arrives.
+	if (activeRun.status === 'failed' || activeRun.status === 'cancelled') return false
+	const turnID = item.turn_id?.trim() ?? ''
+	const agentIteration = item.agent_iteration ?? 0
+	if (turnID && turnID === activeRun.turnID?.trim()) return true
+	if (Object.values(activeRun.assistantItemBindings ?? {}).some((binding) =>
+		binding.turnID === turnID && binding.agentIteration === agentIteration && binding.itemID === item.id,
+	)) return true
+	if (Object.values(activeRun.assistantTails ?? {}).some((tail) =>
+		tail.turnID === turnID && tail.agentIteration === agentIteration && tail.itemID === item.id,
+	)) return true
+	const indexed = turnID && agentIteration > 0 ? activeRun.assistantItems?.[`${turnID}:${agentIteration}`] : undefined
+	return indexed?.itemID === item.id
+}
+
+const Message = memo(function Message({ item, sessionID, loadSessionImage, assistantTail = '', assistantStreaming = false, copyAvailable = true }: { item: SessionItem; sessionID: string; loadSessionImage: (sessionID: string, hash: string, signal?: AbortSignal) => Promise<SessionImageData>; assistantTail?: string; assistantStreaming?: boolean; copyAvailable?: boolean }) {
 	const [copyStatus, setCopyStatus] = useState<'idle' | 'copied' | 'error'>('idle')
 	const copyResetTimerRef = useRef<number | null>(null)
 	useEffect(() => () => {
@@ -514,7 +535,7 @@ const Message = memo(function Message({ item, sessionID, loadSessionImage, assis
         {role === 'user' && text && <div className="message-text">{text}</div>}
         {role === 'user' && images.length > 0 && <StoredImageAttachments sessionID={sessionID} images={images} loadSessionImage={loadSessionImage} />}
 		{role !== 'user' && (text || showCursor) && <MarkdownMessage text={text} streaming={showCursor} cursor={showCursor} />}
-		{role === 'assistant' && (text || images.length > 0) && (
+		{role === 'assistant' && copyAvailable && (text || images.length > 0) && (
 			<div className="message-tools" aria-label="Message actions">
 				<button className="message-tool-button" onClick={() => void copyMessage()} title="Copy full output">
 					<CopyIcon />{copyStatus === 'copied' ? 'Copied' : copyStatus === 'error' ? 'Copy failed' : 'Copy'}

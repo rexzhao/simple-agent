@@ -2,8 +2,10 @@ package webapp
 
 import (
 	"bytes"
+	"context"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
@@ -156,5 +158,47 @@ func assertJSONNotFound(t *testing.T, response *http.Response) {
 	body, _ := io.ReadAll(response.Body)
 	if strings.Contains(strings.ToLower(string(body)), "<html") {
 		t.Fatalf("404 body is HTML: %q", body)
+	}
+}
+
+func TestHTTPHostGateHonorsAllowNonLoopback(t *testing.T) {
+	newApp := func(t *testing.T, allowNonLoopback bool) *httptest.Server {
+		t.Helper()
+		home := t.TempDir()
+		service, err := execution.NewServiceWithOptions(home, execution.ServiceOptions{TurnRunner: webTestRunner{}})
+		if err != nil {
+			t.Fatalf("NewServiceWithOptions() error = %v", err)
+		}
+		writeWebTestConfig(t, home)
+		app, err := NewServer(ServerOptions{Context: context.Background(), Service: service, Token: testToken, CWD: home, AllowNonLoopback: allowNonLoopback})
+		if err != nil {
+			t.Fatalf("NewServer() error = %v", err)
+		}
+		t.Cleanup(app.Close)
+		server := httptest.NewServer(app.Handler())
+		t.Cleanup(server.Close)
+		return server
+	}
+	hostGateStatus := func(t *testing.T, server *httptest.Server) int {
+		t.Helper()
+		request, err := http.NewRequest(http.MethodGet, server.URL+"/api/bootstrap", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		request.Host = "example.internal:8080"
+		request.Header.Set("Authorization", "Bearer "+testToken)
+		response, err := http.DefaultClient.Do(request)
+		if err != nil {
+			t.Fatalf("request error = %v", err)
+		}
+		defer response.Body.Close()
+		return response.StatusCode
+	}
+
+	if status := hostGateStatus(t, newApp(t, false)); status != http.StatusForbidden {
+		t.Fatalf("default server status for non-loopback Host = %d, want 403", status)
+	}
+	if status := hostGateStatus(t, newApp(t, true)); status != http.StatusOK {
+		t.Fatalf("allow-non-loopback server status for non-loopback Host = %d, want 200", status)
 	}
 }

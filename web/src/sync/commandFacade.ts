@@ -25,6 +25,7 @@ import type { CodexUsage, CodexUsageWindow, CodexUsageWindowSet, SessionModelOpt
 import type { CodexLoginClearResult, CodexLoginCommandOptions, CodexLoginCommands, CodexLoginStartResult } from '../commands/codexLoginCommands'
 import { encodeProviderTarget, decodeProviderDiscoverResult, validateProviderCommandJSON } from './providerCommandCodec'
 import { isProviderCreateName, isProviderName } from '../domain/providerIdentity'
+import { randomID } from '../lib/randomId'
 import { SyncReadError } from './errors'
 import type { RuntimeTransport } from './runtime'
 import type { BlobClient } from './blobClient'
@@ -78,28 +79,22 @@ export interface CommandFacadeOptions {
   clearTimeout?: (handle: ReturnType<typeof globalThis.setTimeout>) => void
 }
 
+// randomID falls back to non-secure-context sources, so command IDs remain
+// available when the app is served over plain HTTP on a LAN address.
 function defaultRequestID(): string {
-  const randomUUID = globalThis.crypto?.randomUUID?.bind(globalThis.crypto)
-  if (!randomUUID) throw new Error('cryptographic request ID generation is unavailable')
-  return `request_${randomUUID()}`
+  return `request_${randomID()}`
 }
 
 function defaultSessionID(): string {
-  const randomUUID = globalThis.crypto?.randomUUID?.bind(globalThis.crypto)
-  if (!randomUUID) throw new Error('cryptographic session ID generation is unavailable')
-  return `session_${randomUUID()}`
+  return `session_${randomID()}`
 }
 
 function defaultRunID(): string {
-  const randomUUID = globalThis.crypto?.randomUUID?.bind(globalThis.crypto)
-  if (!randomUUID) throw new Error('cryptographic run ID generation is unavailable')
-  return `run_${randomUUID()}`
+  return `run_${randomID()}`
 }
 
 function defaultOperationID(): string {
-  const randomUUID = globalThis.crypto?.randomUUID?.bind(globalThis.crypto)
-  if (!randomUUID) throw new Error('cryptographic operation ID generation is unavailable')
-  return `operation_${randomUUID()}`
+  return `operation_${randomID()}`
 }
 
 function errorFromCommand(code: string, message: string, details?: unknown): CommandFacadeError {

@@ -22,23 +22,27 @@ import (
 	"github.com/rexzhao/simple-agent/internal/execution"
 )
 
-const usageText = `usage: sai [--listen 127.0.0.1:0] [--server-root dir] [--cwd dir] [--no-open]
+const usageText = `usage: sai [--listen 127.0.0.1:0] [--allow-non-loopback] [--server-root dir] [--cwd dir] [--no-open]
 
 Starts the local SAI Web application. With no arguments, SAI listens on a
 random loopback port and opens the application in the default browser.
 
 Options:
-  --listen addr      Loopback listen address (default 127.0.0.1:0)
-  --server-root dir  Configuration and durable data namespace root
-  --cwd dir          Initial working-directory hint shown in the Web UI
-  --no-open          Do not open the browser automatically
-  --version          Print version and exit
+  --listen addr          Loopback listen address (default 127.0.0.1:0)
+  --allow-non-loopback   Permit a non-loopback --listen address (INSECURE:
+                         the web UI is reachable by anyone who can reach
+                         the interface; use only on trusted networks)
+  --server-root dir      Configuration and durable data namespace root
+  --cwd dir              Initial working-directory hint shown in the Web UI
+  --no-open              Do not open the browser automatically
+  --version              Print version and exit
 `
 
 func Run(args []string, stdout, stderr io.Writer) int {
 	flags := flag.NewFlagSet("sai", flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
 	listenAddress := flags.String("listen", "127.0.0.1:0", "loopback listen address")
+	allowNonLoopback := flags.Bool("allow-non-loopback", false, "permit a non-loopback listen address")
 	serverRoot := flags.String("server-root", "", "storage root")
 	cwd := flags.String("cwd", "", "initial working directory")
 	noOpen := flags.Bool("no-open", false, "do not open browser")
@@ -90,12 +94,15 @@ func Run(args []string, stdout, stderr io.Writer) int {
 		return exitCode
 	}
 	defer instanceLock.Release()
-	listener, err := listenLoopback(*listenAddress)
+	listener, err := listen(*listenAddress, *allowNonLoopback)
 	if err != nil {
 		fmt.Fprintf(stderr, "sai: %v\n", err)
 		return 1
 	}
 	defer listener.Close()
+	if !isLoopbackAddress(*listenAddress) {
+		fmt.Fprintf(stderr, "sai: WARNING: listening on a non-loopback address; the web UI is reachable by other hosts on the network\n")
+	}
 
 	configPath := filepath.Join(root, basename+".yaml")
 	service, err := execution.NewServiceWithAgentRunner(root, configPath)
@@ -110,7 +117,7 @@ func Run(args []string, stdout, stderr io.Writer) int {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	app, err := NewServer(ServerOptions{Context: ctx, Service: service, Token: token, CWD: initialCWD, LogWriter: stderr})
+	app, err := NewServer(ServerOptions{Context: ctx, Service: service, Token: token, CWD: initialCWD, LogWriter: stderr, AllowNonLoopback: !isLoopbackAddress(*listenAddress)})
 	if err != nil {
 		fmt.Fprintf(stderr, "sai: %v\n", err)
 		return 1
@@ -252,15 +259,25 @@ func resolveInitialCWD(value string) (string, error) {
 	return filepath.Clean(abs), nil
 }
 
-func listenLoopback(address string) (net.Listener, error) {
+func isLoopbackAddress(address string) bool {
 	host, _, err := net.SplitHostPort(strings.TrimSpace(address))
 	if err != nil {
-		return nil, fmt.Errorf("invalid listen address %q: %w", address, err)
+		return false
 	}
 	host = strings.Trim(host, "[]")
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
 	ip := net.ParseIP(host)
-	if !strings.EqualFold(host, "localhost") && (ip == nil || !ip.IsLoopback()) {
-		return nil, fmt.Errorf("listen address must use a loopback host")
+	return ip != nil && ip.IsLoopback()
+}
+
+func listen(address string, allowNonLoopback bool) (net.Listener, error) {
+	if _, _, err := net.SplitHostPort(strings.TrimSpace(address)); err != nil {
+		return nil, fmt.Errorf("invalid listen address %q: %w", address, err)
+	}
+	if !isLoopbackAddress(address) && !allowNonLoopback {
+		return nil, fmt.Errorf("listen address must use a loopback host (use --allow-non-loopback to bind a non-loopback address)")
 	}
 	listener, err := net.Listen("tcp", address)
 	if err != nil {

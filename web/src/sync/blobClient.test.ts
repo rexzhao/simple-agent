@@ -1,6 +1,11 @@
-import { describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { BlobClient } from './blobClient'
+import { sha256Hex } from '../lib/sha256'
 import type { BlobDescriptor } from '../protocol/types'
+
+afterEach(() => {
+  vi.unstubAllGlobals()
+})
 
 const bytes = new TextEncoder().encode('{"sessions":[]}')
 
@@ -192,5 +197,27 @@ describe('BlobClient', () => {
     await expect(shortClient.get({ ...good, size: 8 })).rejects.toMatchObject({ code: 'blob_size' })
     expect(shortCancelled).toBe(1)
     expect(shortReleased).toBe(1)
+  })
+
+  it('verifies integrity without Web Crypto when the page is not a secure context', async () => {
+    // http pages on non-loopback addresses get no crypto.subtle; the client
+    // must still validate blob bytes instead of failing the whole sync read.
+    vi.stubGlobal('crypto', { getRandomValues: globalThis.crypto.getRandomValues.bind(globalThis.crypto) })
+    const good: BlobDescriptor = {
+      id: 'blob_1',
+      url: '/api/blobs/blob_1',
+      content_type: 'application/json',
+      size: bytes.byteLength,
+      sha256: sha256Hex(bytes),
+      etag: '"etag-1"',
+      expires_at: '2099-01-01T00:00:00Z',
+    }
+    const client = new BlobClient({
+      capabilityToken: () => 'capability',
+      baseURL: 'http://example.test',
+      fetcher: async () => response(bytes),
+    })
+    await expect(client.getJSON(good)).resolves.toEqual({ sessions: [] })
+    await expect(client.get({ ...good, sha256: '00'.repeat(32) })).rejects.toMatchObject({ code: 'blob_hash' })
   })
 })

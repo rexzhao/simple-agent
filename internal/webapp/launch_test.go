@@ -54,3 +54,36 @@ func TestResolveStorageRootUsesBasenameEnvironmentAndExplicitOverride(t *testing
 		t.Fatalf("resolveStorageRoot(explicit) = %q, want %q", got, want)
 	}
 }
+
+func TestIsLoopbackAddress(t *testing.T) {
+	loopback := []string{"127.0.0.1:0", "127.0.0.1:8080", "localhost:9000", "[::1]:8080"}
+	for _, address := range loopback {
+		if !isLoopbackAddress(address) {
+			t.Fatalf("isLoopbackAddress(%q) = false, want true", address)
+		}
+	}
+	nonLoopback := []string{"0.0.0.0:8080", "10.0.0.5:8080", "192.168.1.10:8080", "[::]:8080", "example.internal:8080", "not-an-address"}
+	for _, address := range nonLoopback {
+		if isLoopbackAddress(address) {
+			t.Fatalf("isLoopbackAddress(%q) = true, want false", address)
+		}
+	}
+}
+
+func TestListenRejectsNonLoopbackWithoutOptIn(t *testing.T) {
+	listener, err := listen("127.0.0.1:0", false)
+	if err != nil {
+		t.Fatalf("listen(loopback) error = %v", err)
+	}
+	_ = listener.Close()
+
+	if _, err := listen("0.0.0.0:0", false); err == nil {
+		t.Fatal("listen(0.0.0.0:0) without opt-in succeeded, want loopback error")
+	}
+
+	listener, err = listen("0.0.0.0:0", true)
+	if err != nil {
+		t.Fatalf("listen(0.0.0.0:0) with opt-in error = %v", err)
+	}
+	_ = listener.Close()
+}

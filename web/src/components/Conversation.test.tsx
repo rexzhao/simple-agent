@@ -244,6 +244,7 @@ describe('Conversation identity boundary', () => {
     expect(container.querySelectorAll('.message.assistant:not(.transient)')).toHaveLength(1)
     expect(container.querySelectorAll('.message.assistant.transient')).toHaveLength(0)
     expect(container.querySelector('.message.assistant:not(.transient)')?.textContent).toContain('ab')
+		expect(container.querySelector('[title="Copy full output"]')).toBeNull()
 
     const settledPage: ItemsPage = {
       ...page,
@@ -253,7 +254,35 @@ describe('Conversation identity boundary', () => {
     expect(container.querySelectorAll('.message.assistant:not(.transient)')).toHaveLength(1)
     expect(container.querySelectorAll('.message.assistant.transient')).toHaveLength(0)
     expect(container.querySelector('.message.assistant:not(.transient)')?.textContent).toContain('ab')
+		expect(container.querySelector('[title="Copy full output"]')).not.toBeNull()
   })
+
+	it('hides copy for every durable assistant item owned by the active run but keeps historical run actions', () => {
+		const detail = session('s1')
+		const page: ItemsPage = {
+			items: [
+				{ seq: 1, id: 'assistant-old', turn_id: 'turn-old', agent_iteration: 1, created_at: '', kind: 'message', visibility: 'visible', audience: 'model', message: { role: 'assistant', content: { inline: 'old answer' } } },
+				{ seq: 2, id: 'assistant-current-1', turn_id: 'turn-current', agent_iteration: 1, created_at: '', kind: 'message', visibility: 'visible', audience: 'model', message: { role: 'assistant', content: { inline: 'first current answer' } } },
+				{ seq: 3, id: 'assistant-current-2', turn_id: 'turn-current', agent_iteration: 2, created_at: '', kind: 'message', visibility: 'visible', audience: 'model', message: { role: 'assistant', content: { inline: 'second current answer' } } },
+			],
+			oldest_seq: 1, newest_seq: 3, has_more_before: false, has_more_after: false,
+		}
+		const activeRun: ActiveRun = {
+			id: 'run-current', sessionID: 's1', turnID: 'turn-current', assistantText: '', steps: [], agentIteration: 2, status: 'running',
+			assistantItems: {
+				'turn-current:1': { itemID: 'assistant-current-1', durableTextLength: 20 },
+				'turn-current:2': { itemID: 'assistant-current-2', durableTextLength: 21 },
+			},
+		}
+		const view = renderConversation(<Conversation {...baseProps} sessionID="s1" detail={detail} page={page} activeRun={activeRun} />)
+		expect(view.container.querySelectorAll('[title="Copy full output"]')).toHaveLength(1)
+		expect(view.container.querySelector('[data-seq="1"] [title="Copy full output"]')).not.toBeNull()
+		expect(view.container.querySelector('[data-seq="2"] [title="Copy full output"]')).toBeNull()
+		expect(view.container.querySelector('[data-seq="3"] [title="Copy full output"]')).toBeNull()
+
+		view.rerender(<Conversation {...baseProps} sessionID="s1" detail={detail} page={page} activeRun={null} />)
+		expect(view.container.querySelectorAll('[title="Copy full output"]')).toHaveLength(3)
+	})
 
   it('splits one turn into separate process groups around a compaction record without key collisions', () => {
     const detail = session('s1')

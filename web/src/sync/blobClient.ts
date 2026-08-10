@@ -1,5 +1,6 @@
 import { isRFC3339Timestamp } from '../protocol/datetime'
 import type { BlobDescriptor } from '../protocol/types'
+import { sha256Hex as sha256HexFallback } from '../lib/sha256'
 import { SyncReadError } from './errors'
 
 export interface BlobClientOptions {
@@ -84,7 +85,15 @@ function validateDescriptor(descriptor: BlobDescriptor, maxBytes: number, now: D
 async function sha256Hex(bytes: ArrayBuffer, signal?: AbortSignal): Promise<string> {
   if (signal?.aborted) throw new SyncReadError('aborted', 'blob request was aborted')
   const subtle = globalThis.crypto?.subtle
-  if (!subtle) throw new SyncReadError('blob_hash', 'Web Crypto is unavailable')
+  if (!subtle) {
+    // Pages served over plain HTTP on a non-loopback address are not secure
+    // contexts, so Web Crypto is withheld there. Fall back to the local
+    // implementation; the integrity guarantee is unchanged because the
+    // expected digest still comes from the authenticated descriptor.
+    const fallbackDigest = sha256HexFallback(new Uint8Array(bytes))
+    if (signal?.aborted) throw new SyncReadError('aborted', 'blob request was aborted')
+    return fallbackDigest
+  }
   let digest: ArrayBuffer
   try {
     digest = await subtle.digest('SHA-256', bytes)

@@ -1,3 +1,4 @@
+import { randomID } from '../lib/randomId'
 import { decodeMessage } from '../protocol/decode'
 import { encodeMessage as encodeProtocolMessage } from '../protocol/encode'
 import { ProtocolDecodeError } from '../protocol/errors'
@@ -75,10 +76,9 @@ function defaultCapabilityToken(): string {
 }
 
 function defaultClientID(): string {
-  const randomUUID = globalThis.crypto?.randomUUID?.bind(globalThis.crypto)
-  if (randomUUID) return `tab_${randomUUID()}`
-  localID += 1
-  return `tab_${localID}`
+  // randomID works outside secure contexts as well, so the tab identity is
+  // still unique when the app is served over plain HTTP on a LAN address.
+  return `tab_${randomID()}`
 }
 
 function defaultWebSocketURL(pathname: string, baseURL?: string): string {
