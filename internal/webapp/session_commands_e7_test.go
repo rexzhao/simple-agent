@@ -70,7 +70,7 @@ func (e7CancelingWebCompactRunner) PlanSessionCompaction(context.Context, execut
 	return execution.SessionCompactionResult{}, context.Canceled
 }
 
-func (e7BlockingWebCompactRunner) SupportsIncrementalSessionTurn(context.Context, execution.SessionTurnRequest) (bool, error) {
+func (runner *e7BlockingWebCompactRunner) SupportsIncrementalSessionTurn(context.Context, execution.SessionTurnRequest) (bool, error) {
 	return true, nil
 }
 
