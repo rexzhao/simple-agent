@@ -113,6 +113,20 @@ function resourceMatches(left: ResourceKey, right: ResourceKey): boolean {
   return left.type === right.type && left.id === right.id
 }
 
+/**
+ * Classifies a resync_required reason as a transient-only (active-run)
+ * recovery notice. These reasons mean the durable resource stream is intact
+ * and only the in-memory active-run overlay lost continuity, so the client
+ * must not tear down the durable subscription or force a whole-resource
+ * resync. This is a session_content-only protocol boundary: the active-run
+ * overlay exists solely on session_content resources, so the transient-only
+ * treatment is deliberately restricted to that resource type. Any other
+ * reason (or resource type) is treated as a durable whole-resource resync.
+ */
+function resourceTransientResync(resourceType: ResourceKey['type'], reason: string): boolean {
+  return resourceType === 'session_content' && (reason.startsWith('active_run_') || reason.startsWith('transient_'))
+}
+
 function sequenceAfter(previous: Sequence, current: Sequence): boolean {
   try { return parseSequence(current) === parseSequence(previous) + 1n } catch { return false }
 }
@@ -575,6 +589,25 @@ export class SyncRuntime {
   private handleResync(message: ResyncRequiredMessage, socketGeneration: number): void {
     const subscription = this.lookup(message.payload.subscription_id, socketGeneration)
     if (!subscription || !resourceMatches(subscription.resource, message.payload.resource)) return
+    const reason = message.payload.reason
+    // A transient-only recovery notice (active_run_* / transient_*) is
+    // resource-local: the durable snapshot/replay/live stream remains intact
+    // and only the active-run overlay lost continuity. Atomically clear the
+    // transient overlay without tearing down the durable subscription or
+    // marking the ready replica stale, and let the in-flight durable
+    // snapshot/replay/live phase complete normally. An eventual durable
+    // active_run.clear is what transitions the session back to a recoverable
+    // state. Any other reason keeps the existing whole-resource resync.
+    const transientOnly = resourceTransientResync(subscription.resource.type, reason)
+    if (transientOnly) {
+      // The durable snapshot/replay/live phase remains intact. Clear the
+      // transient overlay now; a fresh snapshot barrier rebuilds the durable
+      // baseline once it completes, and a live phase continues to receive
+      // durable changes. Do not tear down the subscription, advance resume, or
+      // mark the settled replica stale.
+      this.clearTransientOverlay(subscription)
+      return
+    }
     this.requestResync(subscription, socketGeneration, new SyncReadError('resync_required', 'server requested a resource resync'))
   }
 

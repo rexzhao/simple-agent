@@ -15,6 +15,7 @@ import (
 	"github.com/rexzhao/simple-agent/internal/model"
 	"github.com/rexzhao/simple-agent/internal/protocol"
 	"github.com/rexzhao/simple-agent/internal/sessioncontent"
+	"github.com/rexzhao/simple-agent/internal/sessions"
 )
 
 // blockingTransientWebTestRunner gives the integration test a real execution
@@ -215,19 +216,42 @@ func TestSessionContentWebSocketTransientExecutionResumeAndSettlement(t *testing
 	if wrongEpochResync.Payload.Reason != "active_run_epoch_mismatch" || wrongEpochResync.Payload.Resource.ID != session.ID {
 		t.Fatalf("wrong-epoch recovery = %#v", wrongEpochResync.Payload)
 	}
-	// The old subscription is terminal after resync_required; it must not send
-	// a snapshot tagged with the retired id. Control traffic on the same socket
-	// remains usable while the client creates its replacement subscription.
-	pingPayload, err := protocol.EncodeMessage(protocol.PingMessage{Envelope: protocol.Envelope{Version: 1, Type: protocol.MessageTypePing, ID: "wrong-epoch-ping"}, Payload: protocol.PingPayload{}})
-	if err != nil {
+	// A transient-only resync is resource-local: the durable subscription stays
+	// alive. Trigger a fresh durable mutation and verify the same subscription
+	// receives it (after the durable replay frames that precede it), proving
+	// the connection is still usable and the durable stream continues.
+	durableItem := sessions.SessionItemFromMessage("after-resync", model.Message{Role: model.MessageRoleUser, Content: "after-resync"})
+	durableItem.TurnID, durableItem.AgentIteration = "turn-resync", 1
+	if _, err := service.SessionStore().AppendItem(session.ID, durableItem); err != nil {
 		t.Fatal(err)
 	}
-	if err := wrongEpoch.Write(context.Background(), websocket.MessageText, pingPayload); err != nil {
-		t.Fatal(err)
+	var sawResyncChange bool
+	resyncDeadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(resyncDeadline) && !sawResyncChange {
+		message := readWebAppMessage(t, wrongEpoch)
+		change, ok := message.(protocol.ChangeMessage)
+		if !ok {
+			t.Fatalf("expected durable change after transient resync, got %T", message)
+		}
+		for _, operation := range change.Payload.Operations {
+			if operation.Op != sessioncontent.OpItemUpsert {
+				continue
+			}
+			var body struct {
+				Item sessioncontent.Item `json:"item"`
+			}
+			if err := json.Unmarshal(operation.Raw, &body); err != nil {
+				t.Fatal(err)
+			}
+			if body.Item.Key.ItemID == "after-resync" {
+				sawResyncChange = true
+			}
+		}
 	}
-	if _, ok := readWebAppMessage(t, wrongEpoch).(protocol.PongMessage); !ok {
-		t.Fatal("wrong-epoch WebSocket was not usable after resource recovery")
+	if !sawResyncChange {
+		t.Fatal("wrong-epoch subscription did not receive the durable mutation after transient resync")
 	}
+	// The same socket still accepts a fresh subscription for the same resource.
 	writeContentSubscribeWithRunResumeID(t, "session-content-recovery:"+session.ID, session.ID, wrongEpoch, nil, nil)
 	if _, ok := readWebAppMessage(t, wrongEpoch).(protocol.SubscribedMessage); !ok {
 		t.Fatal("replacement subscription missing")

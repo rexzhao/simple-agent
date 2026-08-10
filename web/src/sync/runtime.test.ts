@@ -768,3 +768,118 @@ describe('SyncRuntime snapshot barrier and continuity', () => {
 function transportChange(transport: FakeTransport, subscriptionID: string, sequence: number, previous = '1'): void {
   transport.emit(changeMessage(subscriptionID, 'project_a', [{ op: 'remove', key: `missing_${sequence}` }], previous, String(sequence)))
 }
+
+const sessionContentSnapshot = (overrides: Record<string, unknown> = {}) => ({
+  schema_version: 1,
+  session: { id: 'session_a', version: 2, created_at: '2025-01-01T00:00:00Z', updated_at: '2025-01-01T00:00:00Z', archived: false, last_used_at: '2025-01-01T00:00:00Z', has_unread_result: false, status: 'running', running_run_id: 'run_a', running_turn_id: 'turn_a', show_reasoning: false, full_access: false, debug: { request_bodies: false }, context: {}, save_tool_results: false },
+  history: { items: [], descriptor: { limit: 50, align_turn: false, visible_only: true, has_more_before: false, has_more_after: false } },
+  active_run: { run_id: 'run_a', session_id: 'session_a', turn_id: 'turn_a', started_at: '2025-01-01T00:00:00Z', status: 'running', recoverable: true, run_epoch: 'epoch_a', run_cursor: '0', replay_available: false, recovery_required: true },
+  compaction: { checkpoints: [], truncated: false },
+  ...overrides,
+})
+
+function sessionContentSnapshotMessage(subscriptionID: string, resourceID: string, content: unknown, sequence = '0', epoch = 'stream_1', revision = '1'): ProtocolMessage {
+  return message({ version: 1, type: 'snapshot', id: `sc-snapshot-${sequence}`, payload: { subscription_id: subscriptionID, resource: { type: 'session_content', id: resourceID }, stream_epoch: epoch, sequence, resource_revision: revision, content } })
+}
+
+function sessionContentSubscribed(subscriptionID: string, resourceID: string, epoch = 'stream_1', sequence = '0'): ProtocolMessage {
+  return message({ version: 1, type: 'subscribed', id: `sc-subscribed`, payload: { subscription_id: subscriptionID, resource: { type: 'session_content', id: resourceID }, stream_epoch: epoch, sequence } })
+}
+
+function transientResync(subscriptionID: string, resourceID: string, reason: string): ProtocolMessage {
+  return message({ version: 1, type: 'resync_required', id: `tr-${reason}`, payload: { subscription_id: subscriptionID, resource: { type: 'session_content', id: resourceID }, reason } })
+}
+
+describe('SyncRuntime transient-only active-run resync', () => {
+  it('does not resubscribe or mark a fresh snapshot stale when an active_run resync arrives during the snapshot phase', async () => {
+    const transport = new FakeTransport()
+    const runtime = new SyncRuntime({ transport })
+    const resource = { type: 'session_content' as const, id: 'session_a' }
+    runtime.subscribe(resource)
+    runtime.start()
+    const subscribe = transport.last('subscribe')
+    if (subscribe.type !== 'subscribe') throw new Error('wrong subscribe')
+    const id = subscribe.payload.subscription_id
+    transport.emit(sessionContentSubscribed(id, 'session_a'))
+    transport.emit(transientResync(id, 'session_a', 'active_run_recovery_required'))
+    // The special frame must not trigger a resubscribe or mark stale.
+    expect(transport.sent.filter((candidate) => candidate.type === 'unsubscribe')).toHaveLength(0)
+    expect(transport.sent.filter((candidate) => candidate.type === 'subscribe')).toHaveLength(1)
+    // The fresh snapshot still completes the snapshot phase and becomes ready.
+    transport.emit(sessionContentSnapshotMessage(id, 'session_a', { inline: sessionContentSnapshot() }))
+    await Promise.resolve()
+    expect(runtime.replica.get(resource).initialized).toBe(true)
+    expect(runtime.replica.get(resource).metadata.readState).toBe('ready')
+  })
+
+  it('clears the transient overlay on a live active_run resync without resubscribing or marking ready stale', async () => {
+    const transport = new FakeTransport()
+    const runtime = new SyncRuntime({ transport })
+    const resource = { type: 'session_content' as const, id: 'session_a' }
+    runtime.subscribe(resource)
+    runtime.start()
+    const subscribe = transport.last('subscribe')
+    if (subscribe.type !== 'subscribe') throw new Error('wrong subscribe')
+    const id = subscribe.payload.subscription_id
+    transport.emit(sessionContentSubscribed(id, 'session_a'))
+    transport.emit(sessionContentSnapshotMessage(id, 'session_a', { inline: sessionContentSnapshot() }))
+    await Promise.resolve()
+    expect(runtime.replica.get(resource).metadata.readState).toBe('ready')
+    // Apply a transient event so the overlay is populated.
+    transport.emit(message({ version: 1, type: 'subscription_event', id: 'se-1', payload: {
+      subscription_id: id, resource: { type: 'session_content', id: 'session_a' },
+      event: { type: 'run.started', session_id: 'session_a', run_id: 'run_a', run_cursor: '1', turn_id: 'turn_a', status: 'running' },
+    }}))
+    const withOverlay = runtime.replica.get<{ transientRun: unknown }>(resource).value
+    expect(withOverlay?.transientRun).not.toBeNull()
+    // A live transient-only resync clears the overlay but keeps the durable
+    // subscription and ready state.
+    transport.emit(transientResync(id, 'session_a', 'active_run_recovery_required'))
+    expect(transport.sent.filter((candidate) => candidate.type === 'unsubscribe')).toHaveLength(0)
+    expect(transport.sent.filter((candidate) => candidate.type === 'subscribe')).toHaveLength(1)
+    expect(runtime.replica.get(resource).metadata.readState).toBe('ready')
+    // The durable change after the transient resync is still applied live.
+    transport.emit(message({ version: 1, type: 'change', id: 'change-1', payload: {
+      subscription_id: id, resource: { type: 'session_content', id: 'session_a' }, stream_epoch: 'stream_1', sequence: '1', previous_sequence: '0', resource_revision: '2',
+      operations: [{ op: 'active_run.clear' }],
+    }}))
+    const after = runtime.replica.get<{ snapshot: { active_run: unknown } }>(resource).value
+    expect(after?.snapshot.active_run).toBeNull()
+  })
+
+  it('keeps whole-resource resync semantics for non-transient reasons', () => {
+    const transport = new FakeTransport()
+    const runtime = new SyncRuntime({ transport })
+    const resource = { type: 'session_content' as const, id: 'session_a' }
+    runtime.subscribe(resource)
+    runtime.start()
+    const subscribe = transport.last('subscribe')
+    if (subscribe.type !== 'subscribe') throw new Error('wrong subscribe')
+    const id = subscribe.payload.subscription_id
+    transport.emit(sessionContentSubscribed(id, 'session_a'))
+    transport.emit(transientResync(id, 'session_a', 'too_old'))
+    expect(transport.sent.filter((candidate) => candidate.type === 'subscribe')).toHaveLength(2)
+    expect(transport.sent.filter((candidate) => candidate.type === 'unsubscribe')).toHaveLength(1)
+  })
+
+  it('does not treat a non-session_content active_run resync as transient-only', () => {
+    const transport = new FakeTransport()
+    const runtime = new SyncRuntime({ transport })
+    const resource = { type: 'session_index' as const, id: 'project_a' }
+    runtime.subscribe(resource)
+    runtime.start()
+    const subscribe = transport.last('subscribe')
+    if (subscribe.type !== 'subscribe') throw new Error('wrong subscribe')
+    const id = subscribe.payload.subscription_id
+    transport.emit(subscribed(id, 'project_a'))
+    // Even though the reason matches the transient-only prefix, the
+    // transient-only classification is restricted to session_content. A
+    // session_index resource must still perform the whole-resource
+    // unsubscribe + subscribe resync.
+    transport.emit(message({ version: 1, type: 'resync_required', id: 'tr-index', payload: {
+      subscription_id: id, resource: { type: 'session_index', id: 'project_a' }, reason: 'active_run_recovery_required',
+    }}))
+    expect(transport.sent.filter((candidate) => candidate.type === 'unsubscribe')).toHaveLength(1)
+    expect(transport.sent.filter((candidate) => candidate.type === 'subscribe')).toHaveLength(2)
+  })
+})

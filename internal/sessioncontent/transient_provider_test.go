@@ -377,6 +377,48 @@ func TestLateOldRunEventCannotPoisonReplacementRun(t *testing.T) {
 	}
 }
 
+func TestDesyncedRunWithoutDurableActiveClearsOnReopen(t *testing.T) {
+	store, session := newContentTestStore(t, "transient-desynced-clear")
+	provider, err := NewProvider(store, ProviderOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer provider.Close()
+	opened := openContent(t, provider, session.ID, nil)
+	defer opened.Close()
+	provider.mu.Lock()
+	owner := provider.owners[session.ID]
+	provider.mu.Unlock()
+	if owner == nil {
+		t.Fatal("owner was not retained")
+	}
+	// Simulate a run that was admitted and then desynced while the durable
+	// active-run descriptor is still present (the normal poisoned state).
+	owner.handleRunAdmitted(runAdmission{runID: "run-desynced", sessionID: session.ID})
+	readTransientEvent(t, opened, protocol.SubscriptionEventRunStarted, "1")
+	owner.mu.Lock()
+	owner.transientRun.desynced = true
+	owner.mu.Unlock()
+	owner.desyncTransient(ErrProviderInvalid)
+
+	// Simulate the durable active-run descriptor being cleared while the owner
+	// stays initialized (no rebuild). The retained desynced run must not keep a
+	// later open permanently recovery-required.
+	owner.mu.Lock()
+	owner.projection.snapshot.ActiveRun = nil
+	owner.mu.Unlock()
+
+	recovered, err := provider.OpenWithRunResume(context.Background(), protocol.ResourceKey{Type: protocol.ResourceTypeSessionContent, ID: session.ID}, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recovered.TransientResync != "" {
+		recovered.Close()
+		t.Fatalf("reopen with cleared durable active run = %q, want no active-run recovery", recovered.TransientResync)
+	}
+	recovered.Close()
+}
+
 func TestNoSubscriberRunGapIsCoalescedAndReopenRequiresRecovery(t *testing.T) {
 	runner := &noSubscriberPressureRunner{started: make(chan struct{}), release: make(chan struct{})}
 	service, err := execution.NewServiceWithOptions(t.TempDir(), execution.ServiceOptions{TurnRunner: runner})
@@ -472,6 +514,34 @@ func TestNoSubscriberRunGapIsCoalescedAndReopenRequiresRecovery(t *testing.T) {
 	if gaps != 0 {
 		t.Fatalf("settled run left %d coalesced gap markers behind", gaps)
 	}
+	// The run settled and the durable active-run descriptor was cleared. A
+	// reopen must no longer be permanently recovery-required: the desynced
+	// in-memory run must not block the next open once the durable active run
+	// is gone.
+	serviceDeadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(serviceDeadline) {
+		state, stateErr := service.SessionStore().LoadState(session.ID)
+		if stateErr == nil && state.RunningRunID == "" {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	state, stateErr := service.SessionStore().LoadState(session.ID)
+	if stateErr != nil {
+		t.Fatal(stateErr)
+	}
+	if state.RunningRunID != "" {
+		t.Fatalf("settled run left durable RunningRunID = %q", state.RunningRunID)
+	}
+	recovered, err := provider.OpenWithRunResume(context.Background(), protocol.ResourceKey{Type: protocol.ResourceTypeSessionContent, ID: session.ID}, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recovered.TransientResync != "" {
+		recovered.Close()
+		t.Fatalf("reopen after durable clear = %q, want no active-run recovery", recovered.TransientResync)
+	}
+	recovered.Close()
 	coordinator.Close()
 }
 

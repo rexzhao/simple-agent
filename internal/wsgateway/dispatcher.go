@@ -561,17 +561,22 @@ func (d *Dispatcher) openSubscription(state *connectionState, message protocol.S
 		return
 	}
 	if opened.TransientResync != "" {
-		// This subscription is already an unrecoverable transient stream. Send
-		// only its terminal resource-local recovery instruction; in particular,
-		// do not queue a snapshot/replay under the id that the client is about to
-		// retire. A fresh subscribe owns the new durable/active-run baseline.
-		_ = d.send(state, protocol.ResyncRequiredMessage{
+		// A transient-only recovery notice: the durable resource continuity is
+		// intact (snapshot/replay/live below), only the active-run stream lost
+		// its continuity. Send the resource-local recovery instruction as a
+		// notice but keep the durable subscription alive. The client classifies
+		// active_run_*/transient_* reasons as transient-only and does not tear
+		// down the durable subscription; a later durable active_run.clear lets
+		// the session recover without an infinite resubscribe loop.
+		if err := d.send(state, protocol.ResyncRequiredMessage{
 			Envelope: protocol.Envelope{Version: 1, Type: protocol.MessageTypeResyncRequired, ID: d.nextID("resync")},
 			Payload:  protocol.ResyncRequiredPayload{SubscriptionID: sub.id, Resource: sub.resource, Reason: opened.TransientResync},
-		}, SendOptions{SubscriptionID: sub.id})
+		}, SendOptions{SubscriptionID: sub.id}); err != nil {
+			d.removeSubscription(state, sub, false)
+			return
+		}
 		d.observe(Event{Kind: EventSubscriptionResync, SubscriptionID: sub.id, ResourceType: sub.resource.Type, ResourceID: sub.resource.ID, Reason: opened.TransientResync, ConnectionID: state.connection.Info().ConnectionID})
-		d.removeSubscription(state, sub, false)
-		return
+		// Fall through: continue the durable snapshot/replay/live delivery.
 	}
 	if opened.Decision.Action == syncengine.SyncActionResync {
 		if err := d.send(state, protocol.ResyncRequiredMessage{
@@ -780,13 +785,25 @@ func (d *Dispatcher) pumpSubscription(state *connectionState, sub *subscription)
 				transientTerminal = nil
 				continue
 			}
-			_ = d.send(state, protocol.ResyncRequiredMessage{
+			// A mid-stream transient desync is a resource-local active-run
+			// recovery notice, not a durable stream failure. Notify the client
+			// so it clears its transient overlay, then keep the durable pump
+			// alive: durable changes continue to arrive and an eventual
+			// active_run.clear lets the session recover without an infinite
+			// resubscribe loop. Pending transient events after a desync must
+			// not be delivered as if the run were continuous. If the notice
+			// itself cannot be delivered, the subscription can no longer make a
+			// continuity claim and must be cleaned up.
+			if err := d.send(state, protocol.ResyncRequiredMessage{
 				Envelope: protocol.Envelope{Version: 1, Type: protocol.MessageTypeResyncRequired, ID: d.nextID("resync")},
 				Payload:  protocol.ResyncRequiredPayload{SubscriptionID: sub.id, Resource: sub.resource, Reason: transientReason(end.Reason)},
-			}, SendOptions{SubscriptionID: sub.id})
+			}, SendOptions{SubscriptionID: sub.id}); err != nil {
+				d.removeSubscription(state, sub, false)
+				return
+			}
 			d.observe(Event{Kind: EventSubscriptionResync, SubscriptionID: sub.id, ResourceType: sub.resource.Type, ResourceID: sub.resource.ID, Reason: transientReason(end.Reason), ConnectionID: state.connection.Info().ConnectionID})
-			d.removeSubscription(state, sub, false)
-			return
+			transient = nil
+			transientTerminal = nil
 		}
 	}
 	// A provider that closes both delivery channels without a terminal value

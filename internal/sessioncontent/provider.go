@@ -1044,6 +1044,14 @@ func (o *owner) snapshotWithTransientLocked(snapshot Snapshot) Snapshot {
 
 func (o *owner) captureTransientLocked(resume *protocol.RunResumeToken) ([]syncengine.TransientEvent, syncengine.TransientDelivery, string, *syncengine.TransientSubscription) {
 	active := o.projection.snapshot.ActiveRun
+	// If the durable active run is gone and the retained in-memory run state is
+	// no longer live (settled or desynced), it is stale and must not keep a
+	// later open permanently recovery-required. A live transient run is
+	// preserved: it may legitimately precede a durable projection that has not
+	// yet caught up (or the durable session has no run row at all in tests).
+	if active == nil && o.transientRun != nil && (o.transientRun.settled || o.transientRun.desynced) && !o.hasPendingRunAdmission(o.transientRun.runID) {
+		o.transientRun = nil
+	}
 	runID := ""
 	// The transport-neutral run source is ahead of the durable active-run
 	// mutation during admission. Prefer it while it is live; otherwise a
