@@ -192,6 +192,7 @@ svg { width: 1.1em; height: 1.1em; fill: none; stroke: currentColor; stroke-widt
 .session-tree-row { position: relative; min-width: 0; display: flex; align-items: center; border: 2px solid transparent; }
 .session-tree-row:hover { border-color: var(--border); background: #ffffff; box-shadow: var(--shadow-1); }
 .session-tree-row.selected { border-color: var(--border); color: #ffffff; background: #111111; box-shadow: var(--shadow-1); }
+.session-tree-row.running-descendant { border-style: dashed; border-color: var(--accent); background: var(--accent-soft); }
 .session-branch-toggle, .session-branch-toggle-spacer {
   width: 18px;
   height: 25px;
@@ -469,6 +470,7 @@ svg { width: 1.1em; height: 1.1em; fill: none; stroke: currentColor; stroke-widt
 .header-actions { display: flex; align-items: center; gap: 12px; }
 .status-dot { width: 8px; height: 8px; flex: 0 0 auto; border: 2px solid var(--border); background: #22c55e; align-self: center; }
 .status-dot.running { background: #ffffff; border-color: var(--accent); animation: pulse 1.2s infinite; }
+.status-dot.running-descendant { border-style: dashed; border-color: var(--accent); background: transparent; animation: pulse 1.2s infinite; }
 .status-dot.interrupted { background: var(--danger); border-color: var(--danger); }
 .compaction-status { width: min(700px, 100%); display: flex; align-items: center; gap: 9px; margin: 0 0 20px; padding: 10px 12px; border: 2px solid var(--border); background: var(--accent-soft); font-size: 11px; font-weight: 750; }
 .compaction-status span { width: 9px; height: 9px; flex: 0 0 auto; border: 2px solid var(--border); background: var(--accent); animation: pulse 1.2s infinite; }

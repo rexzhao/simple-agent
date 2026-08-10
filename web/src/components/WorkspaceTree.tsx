@@ -1,7 +1,7 @@
 import { memo, useState } from 'react'
 import type { ProjectSummary } from '../repositories/projectIndex'
 import type { SessionIndexReadModel } from '../repositories/sessionIndex'
-import { buildSessionTree, flattenSessionTree, navigationSession, projectName, sessionName, sessionTreeContains, type SessionNavigation } from '../lib/session'
+import { ancestorSessionIDs, buildSessionTree, flattenSessionTree, navigationSession, projectName, sessionName, sessionTreeContains, type SessionNavigation } from '../lib/session'
 import { relativeTime } from '../lib/format'
 import { ArchiveIcon, ChatIcon, ChevronIcon, EditIcon, LogoIcon, PlusIcon, RestoreIcon, SettingsIcon, TrashIcon } from './icons'
 
@@ -44,11 +44,12 @@ export const WorkspaceTree = memo(function WorkspaceTree(props: {
     })
   }
 
-  const renderSessionRow = (projectID: string, session: SessionNavigation, archived = false) => {
+  const renderSessionRow = (projectID: string, session: SessionNavigation, sessions: readonly SessionNavigation[], archived = false) => {
     const running = session.status === 'running' || props.runningSessionIDs.has(session.id)
+    const hasRunningDescendant = !running && ancestorSessionIDs(sessions, props.runningSessionIDs).has(session.id)
     return (
       <div className="session-tree-branch" key={session.id}>
-        <div className={`session-tree-row ${archived ? 'archived' : ''} ${session.id === props.selectedSessionID ? 'selected' : ''}`}>
+        <div className={`session-tree-row ${archived ? 'archived' : ''} ${session.id === props.selectedSessionID ? 'selected' : ''} ${hasRunningDescendant ? 'running-descendant' : ''}`}>
           <span className="session-branch-toggle-spacer" aria-hidden="true" />
           <button
             className="session-tree-button"
@@ -62,7 +63,8 @@ export const WorkspaceTree = memo(function WorkspaceTree(props: {
             </span>
             {session.has_unread_result && <span className="unread-badge" title="Unread result" aria-label="Unread result">●</span>}
             {!archived && running && <span className="status-dot running" title="Session running" aria-label="Session running" />}
-            {!archived && !running && (session.status === 'interrupted' || session.status === 'failed') && <span className="status-dot interrupted" title="Session interrupted" aria-label="Session interrupted" />}
+            {!archived && hasRunningDescendant && <span className="status-dot running-descendant" title="A sub-session is running" aria-label="A sub-session is running" />}
+            {!archived && !running && !hasRunningDescendant && (session.status === 'interrupted' || session.status === 'failed') && <span className="status-dot interrupted" title="Session interrupted" aria-label="Session interrupted" />}
           </button>
           <div className="session-tree-actions">
             {archived ? (
@@ -125,7 +127,7 @@ export const WorkspaceTree = memo(function WorkspaceTree(props: {
                 {index?.status === 'error' && <div className="tree-error"><span>Sessions unavailable.</span><button onClick={() => props.onRetrySessionIndex(project.id)}>Retry</button></div>}
                 {index?.status === 'stale' && <div className="tree-stale"><span>Showing the last known sessions.</span><button onClick={() => props.onRetrySessionIndex(project.id)}>Retry</button></div>}
                 {index?.status === 'loading' && <p className="tree-empty">Loading sessions…</p>}
-                {visibleRoots.map((node) => renderSessionRow(project.id, node.session))}
+                {visibleRoots.map((node) => renderSessionRow(project.id, node.session, sessions))}
                 {sessions.length === 0 && index?.status !== 'loading' && <p className="tree-empty">No sessions yet</p>}
                 {(expanded ? sessionRoots.length > 3 : hiddenSessionCount > 0) && (
                   <button className="tree-expand-button" onClick={() => toggleProject(project.id)}><ChevronIcon expanded={expanded} />{expanded ? 'Collapse' : `Show ${hiddenSessionCount} more sessions`}</button>
@@ -133,7 +135,7 @@ export const WorkspaceTree = memo(function WorkspaceTree(props: {
                 {archivedSessions.length > 0 && (
                   <>
                     <button className="tree-expand-button archived-session-toggle" onClick={() => toggleArchivedProject(project.id)} aria-expanded={archivedExpanded}><ArchiveIcon /> Archived ({archivedSessions.length}) <ChevronIcon expanded={archivedExpanded} /></button>
-                    {archivedExpanded && archivedSessionRoots.map((node) => renderSessionRow(project.id, node.session, true))}
+                    {archivedExpanded && archivedSessionRoots.map((node) => renderSessionRow(project.id, node.session, archivedSessions, true))}
                   </>
                 )}
               </div>

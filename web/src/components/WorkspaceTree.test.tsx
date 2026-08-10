@@ -106,6 +106,32 @@ describe('WorkspaceTree session list', () => {
     expect(screen.getByText('Idle').closest('.session-tree-row')?.querySelector('.status-dot')).toBeNull()
   })
 
+  it('shows a dashed running indicator on a root whose sub-session is running', () => {
+    const root = session('root', 'Root')
+    const child = session('child', 'Child', {
+      created_by: 'agent', parent_session_id: root.id, root_session_id: root.id, spawn_depth: 1,
+    })
+    renderTree([child, root], new Set([child.id]))
+
+    const rootRow = screen.getByText('Root').closest('.session-tree-row')!
+    // The root is not itself running, so it must not get the solid running dot.
+    expect(rootRow.querySelector('.status-dot.running')).toBeNull()
+    expect(rootRow.querySelector('.status-dot.running-descendant')).not.toBeNull()
+    expect(rootRow.classList.contains('running-descendant')).toBe(true)
+  })
+
+  it('does not mark a root with a running-descendant when it is itself running', () => {
+    const root = session('root', 'Root', { status: 'running' })
+    const child = session('child', 'Child', {
+      created_by: 'agent', parent_session_id: root.id, root_session_id: root.id, spawn_depth: 1,
+    })
+    renderTree([child, root], new Set([root.id, child.id]))
+
+    const rootRow = screen.getByText('Root').closest('.session-tree-row')!
+    expect(rootRow.querySelector('.status-dot.running')).not.toBeNull()
+    expect(rootRow.querySelector('.status-dot.running-descendant')).toBeNull()
+  })
+
   it('selects a root session when clicked', () => {
     const root = session('root', 'Root')
     const onSelectSession = renderTree([root])

@@ -182,6 +182,27 @@ export function sessionTreeContains(node: SessionTreeNode, sessionIDs: ReadonlyS
   return sessionIDs.has(node.session.id) || node.children.some((child) => sessionTreeContains(child, sessionIDs))
 }
 
+/**
+ * Returns the ids of every ancestor (parent/grandparent chain) of the given
+ * descendant ids, following parent links. Cycle-safe: a corrupted lineage
+ * cannot loop. Used to flag a session as indirectly active when one of its
+ * sub-sessions is running.
+ */
+export function ancestorSessionIDs<T extends SessionNavigation>(sessions: readonly T[], descendantIDs: ReadonlySet<string>): Set<string> {
+  const byID = new Map(sessions.map((session) => [session.id, session]))
+  const ancestors = new Set<string>()
+  for (const id of descendantIDs) {
+    let current = byID.get(id)
+    while (current?.parent_session_id) {
+      const parent = byID.get(current.parent_session_id)
+      if (!parent || ancestors.has(parent.id)) break
+      ancestors.add(parent.id)
+      current = parent
+    }
+  }
+  return ancestors
+}
+
 export function itemText(item: SessionItem): string {
 	return item.message?.content?.inline || item.message?.content?.preview || ''
 }
