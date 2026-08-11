@@ -587,7 +587,7 @@ function baseRunState(runEpoch: string, identity: ReturnType<typeof eventIdentit
 
 function snapshotTransientBaseline(snapshot: SessionContentSnapshot): SessionRunState | null {
   const active = snapshot.active_run
-  if (!active?.replay_available) return null
+  if (!active?.replay_available || active.recovery_required) return null
   // active_run.run_cursor is the server's current cursor, not the cursor
   // applied by this client. A fresh subscription starts immediately before
   // the retained replay window and advances from there as events arrive.
@@ -605,6 +605,45 @@ function snapshotTransientBaseline(snapshot: SessionContentSnapshot): SessionRun
     ...(active.turn_id === undefined ? {} : { turnID: active.turn_id }),
     status: 'running',
     text: {}, reasoning: {}, reasoningTimings: {}, tools: {}, stepOrder: [], promptQueue: [], appendedPrompts: [], stale: false, recoveryRequired: false,
+  }
+}
+
+/**
+ * A durable snapshot can be a reconnect barrier rather than a new run
+ * admission. In that case the server may have no transient frames after the
+ * client's resume cursor, while the snapshot still describes the same live
+ * run. Keep the already-authoritative overlay until the next transient frame
+ * (or an explicit recovery/settlement barrier) arrives. Replacing it with a
+ * fresh empty run here loses prompt_queue snapshots, which are intentionally
+ * transient and are not duplicated in the durable session snapshot.
+ */
+function transientOverlayFromSnapshot(snapshot: SessionContentSnapshot, previous: SessionContentState | undefined): SessionRunState | null {
+  const active = snapshot.active_run
+  const previousRun = previous?.transientRun
+  if (!active || !previousRun || previousRun.status !== 'running' || active.status !== 'running' || active.recovery_required) return null
+  if (active.run_id !== previousRun.runID) return null
+  if (active.run_epoch !== undefined && previousRun.runEpoch !== '' && active.run_epoch !== previousRun.runEpoch) return null
+  if (active.run_cursor === undefined) return null
+  const cursorRelation = compareRunCursor(active.run_cursor, previousRun.runCursor)
+  if (cursorRelation < 0) return null
+  if (cursorRelation > 0) {
+    const replayFrom = active.replay_from_cursor
+    const replayTo = active.replay_to_cursor
+    // A newer snapshot cursor is only safe when the retained replay window
+    // covers every transient cursor the previous overlay has not seen. With
+    // no replay (or a window that starts/ends inside that range), prompt
+    // queue/consumption/settlement events may have been missed, so fail closed
+    // instead of showing an old queue as if it were current.
+    if (!active.replay_available || replayFrom === undefined || replayTo === undefined) return null
+    const nextCursor = (BigInt(previousRun.runCursor) + 1n).toString()
+    if (compareRunCursor(replayFrom, nextCursor) > 0 || compareRunCursor(replayTo, active.run_cursor) < 0) return null
+  }
+  return {
+    ...previousRun,
+    ...(active.run_epoch !== undefined ? { runEpoch: active.run_epoch } : {}),
+    ...(active.turn_id !== undefined ? { turnID: active.turn_id } : {}),
+    stale: false,
+    recoveryRequired: false,
   }
 }
 
@@ -948,7 +987,10 @@ export class SessionContentAdapter implements ResourceAdapter<SessionContentStat
   decodeSnapshot(value: unknown, previous: SessionContentState | undefined, context?: ReplicaApplyContext): SessionContentState {
     this.validateContext(context)
     const snapshot = cloneSnapshot(value, this.sessionID)
-    return copyState(snapshot, context?.resourceRevision ?? previous?.durableResourceRevision ?? '', snapshotTransientBaseline(snapshot), previous?.turnFailure)
+    const transientRun = transientOverlayFromSnapshot(snapshot, previous) ?? snapshotTransientBaseline(snapshot)
+    const revisionValue = context?.resourceRevision ?? previous?.durableResourceRevision ?? ''
+    const normalized = normalizeTextOverlay(snapshot, transientRun)
+    return maybeClearSettled(copyState(snapshot, revisionValue, normalized, previous?.turnFailure), revisionValue)
   }
 
   applyChange(previous: SessionContentState, operations: readonly ChangeOperation[], context?: ReplicaApplyContext): SessionContentState {

@@ -143,6 +143,171 @@ describe('SessionContentAdapter', () => {
     expect(() => adapter.applyTransient(state, event('12', 'run.started', { status: 'running', run_id: 'run_a' }), { ...context, resourceRevision: '9' })).toThrow()
   })
 
+  it('retains the authoritative queue across a same-run snapshot barrier', () => {
+    const adapter = new SessionContentAdapter('session_a')
+    const context = { resource: { type: 'session_content' as const, id: 'session_a' }, resourceRevision: '1', generation: 1 }
+    let state = stateWithRunning()
+    const event = (cursor: string, type: string, fields: Record<string, unknown> = {}) => ({ type, session_id: 'session_a', run_id: 'run_a', run_cursor: cursor, ...fields }) as unknown as SubscriptionEventData
+    state = adapter.applyTransient(state, event('1', 'run.started', { status: 'running' }), context)
+    state = adapter.applyTransient(state, event('2', 'run.prompt_queue', { prompts: [{ id: 'p-queue', content: 'queued', steer: false }, { id: 'p-steer', content: 'steer', steer: true }] }), context)
+
+    // A reconnect can receive a durable snapshot whose active run is already
+    // at the resume cursor. There are no replay frames after that cursor, but
+    // prompt_queue is still authoritative transient state and must not vanish
+    // merely because the snapshot has no queue field.
+    const reconnected = adapter.decodeSnapshot(snapshot({
+      session: metadata({ status: 'running', running_run_id: 'run_a', running_turn_id: 'turn_a' }),
+      active_run: {
+        run_id: 'run_a', session_id: 'session_a', turn_id: 'turn_a', started_at: '2025-01-01T00:00:00Z', status: 'running', recoverable: true,
+        run_epoch: 'epoch_a', run_cursor: '2', replay_available: false, recovery_required: false,
+      },
+    }), state, { ...context, resourceRevision: '2' })
+    expect(reconnected.transientRun?.runCursor).toBe('2')
+    expect(reconnected.transientRun?.promptQueue).toEqual([
+      { id: 'p-queue', content: 'queued', steer: false },
+      { id: 'p-steer', content: 'steer', steer: true },
+    ])
+
+    const consumed = adapter.applyTransient(reconnected, event('3', 'run.prompt_appended', { prompts: ['queued'] }), { ...context, resourceRevision: '2' })
+    const cleared = adapter.applyTransient(consumed, event('4', 'run.prompt_queue', { prompts: [] }), { ...context, resourceRevision: '2' })
+    expect(cleared.transientRun?.promptQueue).toEqual([])
+  })
+
+  it('normalizes retained text and reasoning against durable reconnect history while keeping uncovered tails and queue', () => {
+    const adapter = new SessionContentAdapter('session_a')
+    const context = { resource: { type: 'session_content' as const, id: 'session_a' }, resourceRevision: '1', generation: 1 }
+    const initial = snapshot({
+      history: { items: [item('item_a', 'base')], descriptor: descriptor({ oldest_item_seq: '1', newest_item_seq: '1' }) },
+      session: metadata({ status: 'running', running_run_id: 'run_a', running_turn_id: 'turn_a' }),
+      active_run: {
+        run_id: 'run_a', session_id: 'session_a', turn_id: 'turn_a', started_at: '2025-01-01T00:00:00Z', status: 'running', recoverable: true,
+        run_epoch: 'epoch_a', run_cursor: '0', replay_available: false, recovery_required: false,
+      },
+    })
+    const event = (cursor: string, type: string, fields: Record<string, unknown> = {}) => ({ type, session_id: 'session_a', run_id: 'run_a', run_cursor: cursor, ...fields }) as unknown as SubscriptionEventData
+    let state = adapter.decodeSnapshot(initial, undefined, context)
+    state = adapter.applyTransient(state, event('1', 'run.started', { status: 'running' }), context)
+    state = adapter.applyTransient(state, event('2', 'text.delta', {
+      turn_id: 'turn_a', agent_iteration: 1, item_id: 'item_a', delta: 'tail', durable_text_length: 4, durable_checkpointed: true,
+    }), context)
+    state = adapter.applyTransient(state, event('3', 'reasoning.delta', {
+      turn_id: 'turn_a', agent_iteration: 1, item_id: 'item_a', delta: 'thinking',
+    }), context)
+    state = adapter.applyTransient(state, event('4', 'text.delta', {
+      turn_id: 'turn_a', agent_iteration: 1, item_id: 'item_b', delta: 'uncovered tail', durable_text_length: 0, durable_checkpointed: false,
+    }), context)
+    state = adapter.applyTransient(state, event('5', 'run.prompt_queue', {
+      prompts: [{ id: 'p-reconnect', content: 'keep me queued', steer: true }],
+    }), context)
+
+    const durableItem = item('item_a', 'base+tail', {
+      message: {
+        role: 'assistant',
+        content: { inline: 'base+tail', content_type: 'text/plain' },
+        reasoning: { inline: 'thinking', content_type: 'text/plain' },
+      },
+    })
+    const reconnected = adapter.decodeSnapshot(snapshot({
+      history: { items: [durableItem], descriptor: descriptor({ oldest_item_seq: '1', newest_item_seq: '1' }) },
+      session: metadata({ status: 'running', running_run_id: 'run_a', running_turn_id: 'turn_a' }),
+      active_run: {
+        run_id: 'run_a', session_id: 'session_a', turn_id: 'turn_a', started_at: '2025-01-01T00:00:00Z', status: 'running', recoverable: true,
+        run_epoch: 'epoch_a', run_cursor: '5', replay_available: false, recovery_required: false,
+      },
+    }), state, { ...context, resourceRevision: '2' })
+    const itemAKey = JSON.stringify(['turn_a', 1, 'item_a'])
+    const itemBKey = JSON.stringify(['turn_a', 1, 'item_b'])
+    expect(reconnected.transientRun?.text[itemAKey]).toBeUndefined()
+    expect(reconnected.transientRun?.reasoning[itemAKey]).toBeUndefined()
+    expect(reconnected.transientRun?.text[itemBKey]).toMatchObject({ text: 'uncovered tail', baseLength: 0 })
+    expect(reconnected.transientRun?.promptQueue).toEqual([{ id: 'p-reconnect', content: 'keep me queued', steer: true }])
+  })
+
+  it('drops an old queue when a snapshot advances without replay coverage', () => {
+    const adapter = new SessionContentAdapter('session_a')
+    const context = { resource: { type: 'session_content' as const, id: 'session_a' }, resourceRevision: '1', generation: 1 }
+    let state = stateWithRunning()
+    const event = (cursor: string, type: string, fields: Record<string, unknown> = {}) => ({ type, session_id: 'session_a', run_id: 'run_a', run_cursor: cursor, ...fields }) as unknown as SubscriptionEventData
+    state = adapter.applyTransient(state, event('1', 'run.started', { status: 'running' }), context)
+    state = adapter.applyTransient(state, event('2', 'run.prompt_queue', { prompts: [{ id: 'p-stale', content: 'stale queue', steer: true }] }), context)
+
+    const advanced = adapter.decodeSnapshot(snapshot({
+      session: metadata({ status: 'running', running_run_id: 'run_a', running_turn_id: 'turn_a' }),
+      active_run: {
+        run_id: 'run_a', session_id: 'session_a', turn_id: 'turn_a', started_at: '2025-01-01T00:00:00Z', status: 'running', recoverable: true,
+        run_epoch: 'epoch_a', run_cursor: '5', replay_available: false, recovery_required: false,
+      },
+    }), state, { ...context, resourceRevision: '2' })
+    expect(advanced.transientRun).toBeNull()
+  })
+
+  it('keeps an advanced queue only while the retained replay window covers it', () => {
+    const adapter = new SessionContentAdapter('session_a')
+    const context = { resource: { type: 'session_content' as const, id: 'session_a' }, resourceRevision: '1', generation: 1 }
+    let state = stateWithRunning()
+    const event = (cursor: string, type: string, fields: Record<string, unknown> = {}) => ({ type, session_id: 'session_a', run_id: 'run_a', run_cursor: cursor, ...fields }) as unknown as SubscriptionEventData
+    state = adapter.applyTransient(state, event('1', 'run.started', { status: 'running' }), context)
+    state = adapter.applyTransient(state, event('2', 'run.prompt_queue', { prompts: [{ id: 'p-replay', content: 'replay queue', steer: false }] }), context)
+
+    const reconnected = adapter.decodeSnapshot(snapshot({
+      session: metadata({ status: 'running', running_run_id: 'run_a', running_turn_id: 'turn_a' }),
+      active_run: {
+        run_id: 'run_a', session_id: 'session_a', turn_id: 'turn_a', started_at: '2025-01-01T00:00:00Z', status: 'running', recoverable: true,
+        run_epoch: 'epoch_a', run_cursor: '5', replay_available: true, replay_from_cursor: '3', replay_to_cursor: '5', recovery_required: false,
+      },
+    }), state, { ...context, resourceRevision: '2' })
+    expect(reconnected.transientRun?.promptQueue).toEqual([{ id: 'p-replay', content: 'replay queue', steer: false }])
+
+    const replayedQueue = adapter.applyTransient(reconnected, event('3', 'run.prompt_queue', { prompts: [{ id: 'p-replay', content: 'replay queue', steer: true }] }), { ...context, resourceRevision: '2' })
+    const consumed = adapter.applyTransient(replayedQueue, event('4', 'run.prompt_appended', { prompts: ['replay queue'] }), { ...context, resourceRevision: '2' })
+    const cleared = adapter.applyTransient(consumed, event('5', 'run.prompt_queue', { prompts: [] }), { ...context, resourceRevision: '2' })
+    expect(cleared.transientRun?.promptQueue).toEqual([])
+  })
+
+  it('drops an advanced queue when the retained replay window starts after the missing cursor', () => {
+    const adapter = new SessionContentAdapter('session_a')
+    const context = { resource: { type: 'session_content' as const, id: 'session_a' }, resourceRevision: '1', generation: 1 }
+    let state = stateWithRunning()
+    const event = (cursor: string, type: string, fields: Record<string, unknown> = {}) => ({ type, session_id: 'session_a', run_id: 'run_a', run_cursor: cursor, ...fields }) as unknown as SubscriptionEventData
+    state = adapter.applyTransient(state, event('1', 'run.started', { status: 'running' }), context)
+    state = adapter.applyTransient(state, event('2', 'run.prompt_queue', { prompts: [{ id: 'p-gap', content: 'gap queue', steer: false }] }), context)
+
+    const gap = adapter.decodeSnapshot(snapshot({
+      session: metadata({ status: 'running', running_run_id: 'run_a', running_turn_id: 'turn_a' }),
+      active_run: {
+        run_id: 'run_a', session_id: 'session_a', turn_id: 'turn_a', started_at: '2025-01-01T00:00:00Z', status: 'running', recoverable: true,
+        run_epoch: 'epoch_a', run_cursor: '5', replay_available: true, replay_from_cursor: '4', replay_to_cursor: '5', recovery_required: false,
+      },
+    }), state, { ...context, resourceRevision: '2' })
+    expect(gap.transientRun?.promptQueue).toEqual([])
+    expect(gap.transientRun?.runCursor).toBe('3')
+  })
+
+  it('does not carry queue state into a recovery-required or replacement run snapshot', () => {
+    const adapter = new SessionContentAdapter('session_a')
+    const context = { resource: { type: 'session_content' as const, id: 'session_a' }, resourceRevision: '1', generation: 1 }
+    let state = stateWithRunning()
+    const event = (cursor: string, type: string, fields: Record<string, unknown> = {}) => ({ type, session_id: 'session_a', run_id: 'run_a', run_cursor: cursor, ...fields }) as unknown as SubscriptionEventData
+    state = adapter.applyTransient(state, event('1', 'run.started', { status: 'running' }), context)
+    state = adapter.applyTransient(state, event('2', 'run.prompt_queue', { prompts: [{ id: 'p-queue', content: 'must not leak', steer: false }] }), context)
+    const recovery = adapter.decodeSnapshot(snapshot({
+      session: metadata({ status: 'running', running_run_id: 'run_a', running_turn_id: 'turn_a' }),
+      active_run: {
+        run_id: 'run_a', session_id: 'session_a', turn_id: 'turn_a', started_at: '2025-01-01T00:00:00Z', status: 'running', recoverable: true,
+        run_epoch: 'epoch_a', run_cursor: '2', replay_available: false, recovery_required: true,
+      },
+    }), state, { ...context, resourceRevision: '2' })
+    expect(recovery.transientRun).toBeNull()
+    const replacement = adapter.decodeSnapshot(snapshot({
+      session: metadata({ status: 'running', running_run_id: 'run_b', running_turn_id: 'turn_b' }),
+      active_run: {
+        run_id: 'run_b', session_id: 'session_a', turn_id: 'turn_b', started_at: '2025-01-01T00:00:00Z', status: 'running', recoverable: true,
+        run_epoch: 'epoch_b', run_cursor: '0', replay_available: false, recovery_required: false,
+      },
+    }), state, { ...context, resourceRevision: '3' })
+    expect(replacement.transientRun).toBeNull()
+  })
+
   it('counts turn failure message length by Unicode code points', () => {
     const adapter = new SessionContentAdapter('session_a')
     const context = { resource: { type: 'session_content' as const, id: 'session_a' }, resourceRevision: '1', generation: 1 }

@@ -247,7 +247,65 @@ describe('session-content transient runtime path', () => {
     expect(transport.lastSubscribe().payload.active_run_resume).toEqual({ run_epoch: 'epoch_a', run_id: 'run_a', run_cursor: '5' })
   })
 
-  it('starts a late-join replay at first_cursor minus one for a sliding window using safe decimal arithmetic', async () => {
+  it('keeps a queued prompt when reconnecting at the current transient cursor', async () => {
+    const transport = new FakeTransport()
+    const runtime = new SyncRuntime({ transport })
+    runtime.subscribe({ type: 'session_content', id: 'session_a' }, { retainOnRelease: true })
+    runtime.start()
+    const first = transport.lastSubscribe()
+    transport.emit(subscribed(first.payload.subscription_id, 'session_a'))
+    transport.emit(snapshot(first.payload.subscription_id, 'session_a', content('session_a')))
+    await settleSnapshot()
+    transport.emit(event(first.payload.subscription_id, 'session_a', '1', { type: 'run.started', status: 'running' }))
+    transport.emit(event(first.payload.subscription_id, 'session_a', '2', { type: 'run.prompt_queue', prompts: [{ id: 'prompt_a', content: 'survive reconnect', steer: true }] }))
+    expect(runtime.replica.get<SessionContentState>({ type: 'session_content', id: 'session_a' }).value?.transientRun?.promptQueue).toEqual([{ id: 'prompt_a', content: 'survive reconnect', steer: true }])
+
+    transport.emitClose()
+    transport.connectionGeneration = 2
+    transport.isReady = true
+    transport.emitReady('server_1')
+    const resumed = transport.lastSubscribe()
+    if (resumed.type !== 'subscribe') throw new Error('missing resumed subscribe')
+    expect(resumed.payload.active_run_resume).toEqual({ run_epoch: 'epoch_a', run_id: 'run_a', run_cursor: '2' })
+
+    // A durable sequence change forces the replay barrier. The active run is
+    // still at cursor 2, so the server has no transient replay after the
+    // resume token; the adapter must retain the prior queue snapshot.
+    transport.emit(subscribed(resumed.payload.subscription_id, 'session_a', '2'))
+    transport.emit(change(resumed.payload.subscription_id, 'session_a', item('durable change'), '1', '2', '2'))
+    await settleSnapshot()
+    expect(runtime.replica.get<SessionContentState>({ type: 'session_content', id: 'session_a' }).value?.transientRun?.promptQueue).toEqual([{ id: 'prompt_a', content: 'survive reconnect', steer: true }])
+  })
+
+  it('drops the retained queue when reconnect replay arrives with a cursor gap', async () => {
+    const transport = new FakeTransport()
+    const runtime = new SyncRuntime({ transport })
+    runtime.subscribe({ type: 'session_content', id: 'session_a' }, { retainOnRelease: true })
+    runtime.start()
+    const first = transport.lastSubscribe()
+    transport.emit(subscribed(first.payload.subscription_id, 'session_a'))
+    transport.emit(snapshot(first.payload.subscription_id, 'session_a', content('session_a')))
+    await settleSnapshot()
+    transport.emit(event(first.payload.subscription_id, 'session_a', '1', { type: 'run.started', status: 'running' }))
+    transport.emit(event(first.payload.subscription_id, 'session_a', '2', { type: 'run.prompt_queue', prompts: [{ id: 'prompt_gap', content: 'must be cleared', steer: true }] }))
+
+    transport.emitClose()
+    transport.connectionGeneration = 2
+    transport.isReady = true
+    transport.emitReady('server_1')
+    const resumed = transport.lastSubscribe()
+    if (resumed.type !== 'subscribe') throw new Error('missing resumed subscribe')
+    transport.emit(subscribed(resumed.payload.subscription_id, 'session_a', '2'))
+    // The barrier says the durable resource reached sequence 2, but the
+    // queued transient replay jumps from cursor 2 to 5. Draining it must
+    // invalidate the overlay rather than exposing the old prompt.
+    transport.emit(event(resumed.payload.subscription_id, 'session_a', '5', { type: 'run.prompt_queue', prompts: [] }))
+    transport.emit(change(resumed.payload.subscription_id, 'session_a', item('durable change'), '1', '2', '2'))
+    await settleSnapshot()
+    expect(runtime.replica.get<SessionContentState>({ type: 'session_content', id: 'session_a' }).value?.transientRun).toBeNull()
+  })
+
+  it('starts a late-join replay using safe decimal arithmetic', async () => {
     const transport = new FakeTransport()
     const runtime = new SyncRuntime({ transport })
     runtime.subscribe({ type: 'session_content', id: 'session_a' }, { retainOnRelease: true })

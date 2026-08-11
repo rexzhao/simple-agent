@@ -65,6 +65,34 @@ test('connects a first project, creates a session, and commits a streamed run', 
   expect(server.snapshotCount({ type: 'session_content', id: createdSessionID })).toBe(1)
 })
 
+test('keeps Queue and Steer prompts above the composer until the run consumes them', async ({ page }) => {
+  const runID = 'run-queued-prompts'
+  const server = await installExisting(page, {
+    contents: {
+      [session.id]: {
+        activeRun: { run_id: runID, session_id: session.id, turn_id: 'turn-queued-prompts', started_at: '2026-01-01T00:00:00Z', status: 'running', recoverable: true, run_epoch: 'queue-epoch', run_cursor: '0', replay_available: false, recovery_required: false },
+      },
+    },
+  })
+  await page.goto('/#token=e2e')
+  await expect(page.getByRole('heading', { name: session.display_name })).toBeVisible()
+
+  const composer = page.getByPlaceholder('Append a message to the current run…')
+  await composer.fill('queued from e2e')
+  await page.getByRole('button', { name: 'Append to current run' }).click()
+  await expect(composer).toHaveValue('')
+  await expect(page.getByLabel('Queued messages')).toContainText('queued from e2e')
+  await expect(page.getByText('Queued', { exact: true })).toBeVisible()
+
+  await page.getByRole('button', { name: 'Promote to steer message' }).click()
+  await expect(page.getByText('Steer', { exact: true })).toBeVisible()
+  await expect(composer).toHaveValue('')
+
+  server.sendTypedEvent(session.id, runID, { type: 'run.prompt_appended', prompts: ['queued from e2e'] })
+  server.sendTypedEvent(session.id, runID, { type: 'run.prompt_queue', prompts: [] })
+  await expect(page.getByLabel('Queued messages')).toHaveCount(0)
+})
+
 test('hands a durable assistant bubble through checkpointed and transient output', async ({ page }) => {
   let releaseTail!: () => void
   let releaseSettled!: () => void

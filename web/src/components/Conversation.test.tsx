@@ -463,6 +463,17 @@ describe('Conversation queued prompt list', () => {
     fireEvent.click(downs[1])
     expect(onMoveQueuedPrompt).toHaveBeenCalledWith('ap-1', 'down')
   })
+
+  it('does not carry the selected session queue into another session', () => {
+    const detail = session('s1')
+    const run = runWithQueue([{ id: 'ap-1', content: 'session one queue', steer: false }])
+    const view = renderConversation(<Conversation {...baseProps} sessionID="s1" detail={detail} activeRun={run} />)
+    expect(screen.getByText('session one queue')).toBeDefined()
+
+    view.rerender(<Conversation {...baseProps} sessionID="s2" detail={session('s2')} activeRun={null} />)
+    expect(screen.queryByLabelText('Queued messages')).toBeNull()
+    expect(screen.queryByText('session one queue')).toBeNull()
+  })
 })
 
 describe('Conversation live cursor', () => {

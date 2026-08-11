@@ -1248,6 +1248,67 @@ describe('App lifecycle bootstrap', () => {
     view.unmount()
   })
 
+  it('keeps queued and steer submissions in the Session Content list after clearing the composer', async () => {
+    const { view, composer } = await renderContentReadyApp()
+    const activeRun = { run_id: 'queue-run', session_id: 'session-1', turn_id: 'turn-queue', started_at: '2026-01-01T00:00:00Z', status: 'running', recoverable: true, run_epoch: 'epoch-queue', run_cursor: '0', replay_available: false, recovery_required: false }
+    await act(async () => { applySessionContentAuthorityFor(view, 'session-1', { status: 'running', running_run_id: 'queue-run', running_turn_id: 'turn-queue' }, '2', undefined, activeRun) })
+    const applyContentEvent = (event: Record<string, unknown>) => view.application.replica.applyTransient(
+      { type: 'session_content', id: 'session-1' }, new SessionContentAdapter('session-1'), event as never, 1,
+    )
+    await act(async () => {
+      applyContentEvent({ type: 'run.started', session_id: 'session-1', run_id: 'queue-run', run_cursor: '1', status: 'running', turn_id: 'turn-queue' })
+    })
+    view.transport.onSend = (message) => {
+      if (message.type !== 'command') return
+      const args = message.payload.arguments as Record<string, unknown>
+      const content = String(args.content ?? '')
+      if (message.payload.name === 'run.prompt.append') {
+        queueMicrotask(() => applyContentEvent({ type: 'run.prompt_queue', session_id: 'session-1', run_id: 'queue-run', run_cursor: '2', prompts: [{ id: 'prompt-queue', content, steer: false }] }))
+      }
+      if (message.payload.name === 'run.prompt.steer') {
+        queueMicrotask(() => applyContentEvent({ type: 'run.prompt_queue', session_id: 'session-1', run_id: 'queue-run', run_cursor: '3', prompts: [{ id: 'prompt-queue', content: 'queue submission', steer: true }] }))
+      }
+      const result = message.payload.name === 'run.prompt.append'
+        ? { operation_id: String(args.operation_id), session_id: 'session-1', run_id: 'queue-run', accepted: true }
+        : message.payload.name === 'run.prompt.steer'
+          ? { session_id: 'session-1', run_id: 'queue-run', prompt_id: String(args.prompt_id), steer: true, updated: true }
+          : { session_id: 'session-1', run_id: 'queue-run', accepted: true }
+      view.transport.emit({ version: 1, type: 'command_result', id: `queue-result-${message.payload.request_id}`, payload: { request_id: message.payload.request_id, status: 'succeeded', result } } as unknown as ProtocolMessage)
+    }
+
+    fireEvent.change(composer, { target: { value: 'queue submission' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Append to current run' }))
+    await waitFor(() => expect(composer.value).toBe(''))
+    await waitFor(() => expect(screen.getByText('queue submission')).toBeTruthy())
+    expect(screen.getByText('Queued')).toBeTruthy()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Promote to steer message' }))
+    await waitFor(() => expect(screen.getByText('Steer')).toBeTruthy())
+    expect(composer.value).toBe('')
+
+    await act(async () => {
+      applyContentEvent({ type: 'run.prompt_appended', session_id: 'session-1', run_id: 'queue-run', run_cursor: '4', prompts: ['queue submission'] })
+      applyContentEvent({ type: 'run.prompt_queue', session_id: 'session-1', run_id: 'queue-run', run_cursor: '5', prompts: [] })
+    })
+    await waitFor(() => expect(screen.queryByLabelText('Queued messages')).toBeNull())
+    view.unmount()
+  })
+
+  it('keeps a failed running append in the composer without creating a queue ghost', async () => {
+    const { view, composer } = await renderContentReadyApp()
+    const activeRun = { run_id: 'failed-queue-run', session_id: 'session-1', turn_id: 'turn-failed-queue', started_at: '2026-01-01T00:00:00Z', status: 'running', recoverable: true, run_epoch: 'epoch-failed-queue', run_cursor: '0', replay_available: false, recovery_required: false }
+    await act(async () => { applySessionContentAuthorityFor(view, 'session-1', { status: 'running', running_run_id: 'failed-queue-run', running_turn_id: 'turn-failed-queue' }, '2', undefined, activeRun) })
+    view.transport.onSend = (message) => {
+      if (message.type === 'command' && message.payload.name === 'run.prompt.append') failProjectCommand(view.transport, message, 'run_not_active')
+    }
+    fireEvent.change(composer, { target: { value: 'failed queue submission' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Append to current run' }))
+    await waitFor(() => expect(screen.getByRole('alert').textContent).toContain('Run operation failed.'))
+    expect(composer.value).toBe('failed queue submission')
+    expect(screen.queryByLabelText('Queued messages')).toBeNull()
+    view.unmount()
+  })
+
 
   it('keeps background Session Index completion independent of current Session Content reads', async () => {
     const { view } = await renderContentReadyApp()

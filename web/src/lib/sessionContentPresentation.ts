@@ -83,7 +83,7 @@ export function activeRunForConversation(view: SessionView, sessionID: string): 
     assistantText: '',
     steps: [],
     agentIteration: 0,
-    status: 'running',
+    status: active.recovery_required ? 'error_pending_refresh' : 'running',
   }
 }
 

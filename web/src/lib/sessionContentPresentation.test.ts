@@ -62,6 +62,34 @@ describe('Session Content transient assistant presentation ownership', () => {
     expect(rows.filter((row) => row.kind === 'active-assistant')).toHaveLength(0)
   })
 
+  it('presents only an uncovered tail and the durable reasoning after reconnect normalization', () => {
+    const uncoveredKey = key('turn_1', 1, 'item_2')
+    const state = {
+      runEpoch: 'epoch_1', runID: 'run_1', runCursor: '5', turnID: 'turn_1', status: 'running' as const,
+      text: {
+        [uncoveredKey]: { key: { turn_id: 'turn_1', agent_iteration: 1, item_id: 'item_2' }, text: 'uncovered tail', baseLength: 0, checkpointed: false },
+      },
+      reasoning: {}, tools: {}, stepOrder: [],
+      promptQueue: [{ id: 'prompt_1', content: 'queued after reconnect', steer: true }],
+      appendedPrompts: [], stale: false, recoveryRequired: false,
+    } satisfies SessionRunState
+    const durable = {
+      ...assistant('turn_1', 1, 'item_1', 'base+tail', 1),
+      message: {
+        role: 'assistant' as const,
+        content: { inline: 'base+tail' },
+        reasoning: 'durable reasoning',
+      },
+    }
+    const active = activeRunForConversation(viewWithRun(state), 'session_1')
+    expect(active?.queuedPrompts).toEqual([{ id: 'prompt_1', content: 'queued after reconnect', steer: true }])
+    const rows = buildConversationRows({ sessionID: 'session_1', items: [durable], activeRun: active })
+    expect(rows.filter((row) => row.kind === 'active-assistant').map((row) => row.text)).toEqual(['uncovered tail'])
+    const reasoning = rows.flatMap((row) => row.kind === 'process' || row.kind === 'active-process' ? row.steps : [])
+      .filter((step) => step.kind === 'reasoning')
+    expect(reasoning).toEqual([{ kind: 'reasoning', id: 'item_1-reasoning', text: 'durable reasoning', iteration: 1 }])
+  })
+
   it('keeps two assistant iterations on their complete identities', () => {
     const first = key('turn_1', 1, 'item_1')
     const second = key('turn_1', 2, 'item_2')
@@ -149,6 +177,36 @@ describe('Session Content transient assistant presentation ownership', () => {
     }
   })
 
+  it('does not render a transient tool a second time after its durable tool call arrives', () => {
+    const state = {
+      runEpoch: 'epoch_1', runID: 'run_1', runCursor: '2', turnID: 'turn_1', status: 'running' as const,
+      text: {}, reasoning: {},
+      tools: {
+        call_1: {
+          tool_call_id: 'call_1', turn_id: 'turn_1', agent_iteration: 1, name: 'shell', status: 'running' as const,
+          arguments: '{}',
+        },
+      },
+      stepOrder: [{ kind: 'tool' as const, key: 'call_1' }],
+      promptQueue: [], appendedPrompts: [], stale: false, recoveryRequired: false,
+    } satisfies SessionRunState
+    const active = activeRunForConversation(viewWithRun(state), 'session_1')
+    const durable = {
+      ...assistant('turn_1', 1, 'assistant-call', '', 1),
+      message: {
+        role: 'assistant' as const,
+        content: { inline: '' },
+        tool_calls: [{ id: 'call_1', name: 'shell' }],
+      },
+    }
+    const rows = buildConversationRows({ sessionID: 'session_1', items: [durable], activeRun: active })
+    const tools = rows.flatMap((row) => row.kind === 'process' || row.kind === 'active-process' ? row.steps : [])
+      .filter((step) => step.kind === 'tool' && step.id === 'call_1')
+    expect(tools).toHaveLength(1)
+    expect(tools[0]).toMatchObject({ kind: 'tool', status: 'running' })
+    expect(rows.filter((row) => row.kind === 'active-process')).toHaveLength(0)
+  })
+
   it('preserves the first-seen interleaving of reasoning and tools', () => {
     const reasoningA = key('turn_1', 1, 'reasoning_a')
     const reasoningB = key('turn_1', 1, 'reasoning_b')
@@ -198,5 +256,30 @@ describe('Session Content transient assistant presentation ownership', () => {
     expect(activeRunForConversation(viewWithRun(makeState('{"code":""}')), 'session_1')?.steps.find((step) => step.kind === 'tool')?.arguments).toBe('{"arguments":"redacted"}')
     expect(activeRunForConversation(viewWithRun(makeState(JSON.stringify({ code: '界'.repeat(32769) }))), 'session_1')?.steps.find((step) => step.kind === 'tool')?.arguments).toBe('{"arguments":"redacted"}')
     expect(activeRunForConversation(viewWithRun(makeState('{"code_bytes":0}')), 'session_1')?.steps.find((step) => step.kind === 'tool')?.arguments).toBe('{"arguments":"redacted"}')
+  })
+
+  it('hides a transient queue after cancellation instead of presenting stale prompts', () => {
+    const state = {
+      runEpoch: 'epoch_1', runID: 'run_1', runCursor: '4', turnID: 'turn_1', status: 'cancelled' as const,
+      text: {}, reasoning: {}, tools: {}, stepOrder: [],
+      promptQueue: [{ id: 'prompt_1', content: 'cancelled prompt', steer: true }], appendedPrompts: [], stale: false, recoveryRequired: false,
+    } satisfies SessionRunState
+    expect(activeRunForConversation(viewWithRun(state), 'session_1')).toBeNull()
+  })
+
+  it('maps an active snapshot requiring transient recovery to error_pending_refresh', () => {
+    const base = viewWithRun({
+      runEpoch: 'epoch_1', runID: 'run_1', runCursor: '0', turnID: 'turn_1', status: 'running' as const,
+      text: {}, reasoning: {}, tools: {}, stepOrder: [], promptQueue: [], appendedPrompts: [], stale: false, recoveryRequired: false,
+    })
+    const view: SessionView = {
+      ...base,
+      runState: undefined,
+      activeRun: {
+        run_id: 'run_1', session_id: 'session_1', turn_id: 'turn_1', started_at: '2025-01-01T00:00:00Z',
+        status: 'running', recoverable: true, replay_available: false, recovery_required: true,
+      },
+    }
+    expect(activeRunForConversation(view, 'session_1')?.status).toBe('error_pending_refresh')
   })
 })
