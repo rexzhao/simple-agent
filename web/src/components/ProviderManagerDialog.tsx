@@ -623,19 +623,27 @@ function CodexUsageView({ usage }: { usage: CodexUsageDomain }) {
 
 function UsageWindowRow({ window, label, limited }: { window?: CodexUsageWindowDomain; label: string; limited: boolean }) {
   if (!window) return null
-  const percent = Math.max(0, Math.min(100, window.usedPercent))
-  const danger = limited || percent >= 90
+  const remaining = remainingPercent(window.usedPercent)
+  const danger = limited || remaining <= 10
   return (
     <div className="usage-row">
       <div className="usage-row-label">
         <span>{label}</span>
-        <span className="usage-percent">{percent}%</span>
+        <span className="usage-percent">{limited ? '0% left' : `${remaining}% left`}</span>
         {danger && <span className="usage-badge">Limited</span>}
       </div>
-      <div className={`usage-meter${danger ? ' danger' : ''}`}><span style={{ width: `${percent}%` }} /></div>
+      <div className={`usage-meter${danger ? ' danger' : ''}`}><span style={{ width: `${remaining}%` }} /></div>
       {window.resetAt > 0 && <small className="usage-reset">Resets {new Date(window.resetAt * 1000).toLocaleString()}</small>}
     </div>
   )
+}
+
+// remainingPercent converts a used-percent (0..100, clamped) into the
+// percentage of quota still available, so the progress bar shows remaining
+// quota rather than consumption.
+export function remainingPercent(usedPercent: number): number {
+  const used = Math.max(0, Math.min(100, usedPercent))
+  return Math.round(100 - used)
 }
 
 function capitalize(value: string): string {

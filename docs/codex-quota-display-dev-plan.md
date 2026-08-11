@@ -197,12 +197,14 @@ func DecodeClaims(accessToken string) (Claims, error)
 │                                                        │
 │  Usage                              [Refresh usage]    │
 │  Plan: Pro                                             │
-│  Window · 7 days:   ▓▓▓▓▓▓▓░░░  58%   (重置于 8/9 14:10)
-│  Window · 5 hours:  ░░░░░░░░░░   0%   (重置于 …)       │  ← 服务端返回才显示
+│  Window · 7 days:   ▓▓▓▓▓▓░░░░░  42% left   (重置于 8/9 14:10)
+│  Window · 5 hours:  ░░░░░░░░░░  100% left  (重置于 …)   │  ← 服务端返回才显示
 │  Credits: balance 0   (无单独 credits)                 │
-│  GPT-5.3-Codex-Spark:  0%                             │
+│  GPT-5.3-Codex-Spark:  100% left                      │
 └────────────────────────────────────────────────────────┘
 ```
+
+> 进度条与数字都表示**剩余额度**（`100 - used_percent`），不是已用量。
 
 具体字段映射（来自 `CodexUsage`）：
 
@@ -211,16 +213,16 @@ func DecodeClaims(accessToken string) (Claims, error)
    - 遍历 `primary_window` 和（若存在）`secondary_window`，每个窗口渲染一行：
      - 窗口时长文案：`limit_window_seconds`（秒）→ 人性化（< 3600 用分钟，< 86400 用小时，
        否则用天；如 `604800` → `7 days`，`18000` → `5 hours`）；
-     - 进度条 + `used_percent%`；
+     - 进度条 + 剩余百分比 `(100 - used_percent)%`（如 `58%` 已用 → 显示 `42% left`）；
      - 重置时间：`reset_at`（unix 秒）→ `new Date(1000*reset_at).toLocaleString()`；
-     - 若该窗口 `limit_reached` 为 true，进度条红色并加「Limited」徽标。
+     - 若该窗口 `limit_reached` 为 true，显示 `0% left`，进度条红色并加「Limited」徽标。
    - 某窗口缺失或为 null 时跳过，不占位。
 3. **Credits** `credits`：
    - `has_credits` 为 true 时显示 `balance`（`Balance` 是字符串原样显示）；
    - 否则显示「无单独 credits」；`unlimited` 为 true 显示「Unlimited」。
-4. **附加额度** `additional_rate_limits[]`：每行 `limit_name: 百分比%`
-   （取该项 `rate_limit.primary_window.used_percent`；若该项也有 `secondary_window`，
-   同样按第 2 条规则补充显示）。
+4. **附加额度** `additional_rate_limits[]`：每行 `limit_name: 剩余百分比%`
+   （取该项 `rate_limit.primary_window.used_percent` 换算为剩余；若该项也有
+   `secondary_window`，同样按第 2 条规则补充显示）。
 5. 若 `rate_limit` 整体缺失或 `allowed=false`，显示对应提示行（"无额度数据"/"额度受限"），
    不崩溃。
 
@@ -231,8 +233,8 @@ func DecodeClaims(accessToken string) (Claims, error)
 ### 进度条样式（新增少量 CSS，复用现有 design token）
 - 复用 `settings-section` / `codex-auth-card` 排版；新增 `.usage-row`、`.usage-meter`、
   `.usage-meter > span`（填充）、`.usage-badge`（`Limited`/`Unlimited`）等类。
-- 进度条：外层 2px 边框 + 内层按百分比填充，颜色 `var(--accent)`；超 90% 或 `limit_reached`
-  用 `var(--danger)`。
+- 进度条：外层 2px 边框 + 内层按**剩余百分比**填充，颜色 `var(--accent)`；剩余 ≤ 10%
+  或 `limit_reached` 用 `var(--danger)`。
 - 与现有 `:root` 的 `--accent / --danger / --success / --muted / --border` 保持一致，
   字号沿用卡片内 9.5–10px 规格。
 
@@ -299,7 +301,7 @@ func DecodeClaims(accessToken string) (Claims, error)
 ## 6. 手工验证步骤
 
 1. 启动应用，进入 Provider 管理，选中 `codex` provider（已登录）。
-2. 点击 Usage 刷新，确认显示 `plan_type: pro`、`used_percent: 56`、重置时间、`balance: 0`。
+2. 点击 Usage 刷新，确认显示 `plan_type: pro`、剩余百分比（如 `42% left`）、重置时间、`balance: 0`。
 3. 对照 `curl 'https://chatgpt.com/backend-api/wham/usage' -H "Authorization: Bearer $TOKEN"`
    的原始输出，确认 UI 数据一致。
 4. 断开网络/改坏 auth 文件，确认错误提示不含 token、不崩溃。

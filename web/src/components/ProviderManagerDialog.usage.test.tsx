@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { describe, expect, it } from 'vitest'
-import { creditsLabel, usageWindowRows, windowDurationLabel } from './ProviderManagerDialog'
+import { creditsLabel, remainingPercent, usageWindowRows, windowDurationLabel } from './ProviderManagerDialog'
 import { codexUsageDomain } from '../domain/codexUsage'
 
 describe('Codex usage display helpers', () => {
@@ -31,6 +31,15 @@ describe('Codex usage display helpers', () => {
       secondaryWindow: { usedPercent: 5, limitWindowSeconds: 18000, resetAfterSeconds: 60, resetAt: 2 },
     })
     expect(both.map((row) => row.label)).toEqual(['Window · 7 d', 'Window · 5 h'])
+  })
+
+  it('converts used percent into remaining quota for the bar and label', () => {
+    expect(remainingPercent(58)).toBe(42)
+    expect(remainingPercent(0)).toBe(100)
+    expect(remainingPercent(100)).toBe(0)
+    expect(remainingPercent(120)).toBe(0)
+    expect(remainingPercent(-5)).toBe(100)
+    expect(remainingPercent(10)).toBe(90)
   })
 
   it('returns no rows when the rate limit set is absent', () => {
