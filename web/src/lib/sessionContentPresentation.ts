@@ -116,14 +116,18 @@ function runStateForConversation(state: SessionRunState, sessionID: string): Act
   for (const ref of state.stepOrder) {
     if (ref.kind === 'reasoning') {
       const entry = state.reasoning[ref.key]
-      if (entry) steps.push({
-        kind: 'reasoning',
-        id: `${state.runID}:reasoning:${entry.key.item_id}:${entry.key.agent_iteration}`,
-        text: entry.text,
-        iteration: entry.key.agent_iteration,
-        turnID: entry.key.turn_id,
-        itemID: entry.key.item_id,
-      })
+      if (entry) {
+        const reasoningTiming = state.reasoningTimings?.[JSON.stringify([entry.key.turn_id, entry.key.agent_iteration, entry.key.item_id])]
+        steps.push({
+          kind: 'reasoning',
+          id: `${state.runID}:reasoning:${entry.key.item_id}:${entry.key.agent_iteration}`,
+          text: entry.text,
+          iteration: entry.key.agent_iteration,
+          ...(reasoningTiming ? { reasoningTiming } : {}),
+          turnID: entry.key.turn_id,
+          itemID: entry.key.item_id,
+        })
+      }
       continue
     }
     const tool = state.tools[ref.key]

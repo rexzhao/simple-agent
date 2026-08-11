@@ -71,8 +71,8 @@ function snapshot(id: string, sessionID: string, value: unknown, sequence = '1',
   return protocol({ version: 1, type: 'snapshot', id: `snapshot_${id}`, payload: { subscription_id: id, resource: { type: 'session_content', id: sessionID }, stream_epoch: 'stream_1', sequence, resource_revision: revision, content: { inline: value } } })
 }
 
-function event(id: string, sessionID: string, runCursor: string, fields: Record<string, unknown>): ProtocolMessage {
-  return protocol({ version: 1, type: 'subscription_event', id: `event_${runCursor}`, payload: { subscription_id: id, resource: { type: 'session_content', id: sessionID }, event: { session_id: sessionID, run_id: 'run_a', run_cursor: runCursor, ...fields } } })
+function event(id: string, sessionID: string, runCursor: string, fields: Record<string, unknown>, timestamp?: string): ProtocolMessage {
+  return protocol({ version: 1, type: 'subscription_event', id: `event_${runCursor}`, ...(timestamp ? { timestamp } : {}), payload: { subscription_id: id, resource: { type: 'session_content', id: sessionID }, event: { session_id: sessionID, run_id: 'run_a', run_cursor: runCursor, ...fields } } })
 }
 
 function change(id: string, sessionID: string, value: unknown, previous = '1', sequence = '2', revision = '2'): ProtocolMessage {
@@ -111,6 +111,47 @@ describe('session-content transient runtime path', () => {
     const afterDurable = runtime.replica.get<SessionContentState>({ type: 'session_content', id: 'session_a' }).value!
     expect(afterDurable.transientRun?.text[JSON.stringify(['turn_a', 1, 'item_a'])]).toBeUndefined()
     expect(repository.get('session_a').history.items[0].message?.content?.inline).toBe('basetail!')
+  })
+
+  it('preserves envelope timestamps for live and snapshot-queued reasoning events', async () => {
+    const timingKey = JSON.stringify(['turn_a', 1, 'reasoning_a'])
+    const start = '2025-01-01T00:00:01.000Z'
+    const end = '2025-01-01T00:00:02.000Z'
+
+    const liveTransport = new FakeTransport()
+    const liveRuntime = new SyncRuntime({ transport: liveTransport })
+    liveRuntime.subscribe({ type: 'session_content', id: 'session_a' }, { retainOnRelease: true })
+    liveRuntime.start()
+    const liveSubscribe = liveTransport.lastSubscribe()
+    liveTransport.emit(subscribed(liveSubscribe.payload.subscription_id, 'session_a'))
+    liveTransport.emit(snapshot(liveSubscribe.payload.subscription_id, 'session_a', content('session_a')))
+    await settleSnapshot()
+    liveTransport.emit(event(liveSubscribe.payload.subscription_id, 'session_a', '1', { type: 'run.started', status: 'running' }, '2025-01-01T00:00:00.000Z'))
+    liveTransport.emit(event(liveSubscribe.payload.subscription_id, 'session_a', '2', { type: 'reasoning.delta', turn_id: 'turn_a', agent_iteration: 1, item_id: 'reasoning_a', delta: 'thinking' }, start))
+    liveTransport.emit(event(liveSubscribe.payload.subscription_id, 'session_a', '3', { type: 'tool.requested', turn_id: 'turn_a', agent_iteration: 1, tool_call_id: 'tool_a', name: 'shell' }, end))
+    const liveState = liveRuntime.replica.get<SessionContentState>({ type: 'session_content', id: 'session_a' }).value!
+    expect(liveState.transientRun?.reasoningTimings?.[timingKey]).toEqual({ startedAt: start, endedAt: end })
+
+    const queuedTransport = new FakeTransport()
+    let resolveBlob: ((value: unknown) => void) | undefined
+    const blobClient = { getJSON: () => new Promise<unknown>((resolve) => { resolveBlob = resolve }) } as unknown as BlobClient
+    const queuedRuntime = new SyncRuntime({ transport: queuedTransport, blobClient })
+    queuedRuntime.subscribe({ type: 'session_content', id: 'session_a' }, { retainOnRelease: true })
+    queuedRuntime.start()
+    const queuedSubscribe = queuedTransport.lastSubscribe()
+    queuedTransport.emit(subscribed(queuedSubscribe.payload.subscription_id, 'session_a'))
+    queuedTransport.emit(protocol({ version: 1, type: 'snapshot', id: 'queued_blob_snapshot', payload: {
+      subscription_id: queuedSubscribe.payload.subscription_id,
+      resource: { type: 'session_content', id: 'session_a' }, stream_epoch: 'stream_1', sequence: '1', resource_revision: '1',
+      content: { blob: { id: 'queued_blob', url: '/blob/queued', content_type: 'application/json', size: 1, sha256: 'a'.repeat(64), etag: 'a', expires_at: '2099-01-01T00:00:00Z' } },
+    } }))
+    queuedTransport.emit(event(queuedSubscribe.payload.subscription_id, 'session_a', '1', { type: 'run.started', status: 'running' }, '2025-01-01T00:00:00.000Z'))
+    queuedTransport.emit(event(queuedSubscribe.payload.subscription_id, 'session_a', '2', { type: 'reasoning.delta', turn_id: 'turn_a', agent_iteration: 1, item_id: 'reasoning_a', delta: 'thinking' }, start))
+    queuedTransport.emit(event(queuedSubscribe.payload.subscription_id, 'session_a', '3', { type: 'tool.requested', turn_id: 'turn_a', agent_iteration: 1, tool_call_id: 'tool_a', name: 'shell' }, end))
+    resolveBlob?.(content('session_a'))
+    await settleSnapshot()
+    const queuedState = queuedRuntime.replica.get<SessionContentState>({ type: 'session_content', id: 'session_a' }).value!
+    expect(queuedState.transientRun?.reasoningTimings?.[timingKey]).toEqual({ startedAt: start, endedAt: end })
   })
 
   it('keeps the run cursor resource-local, ignores old subscriptions, and resubscribes with an independent active-run resume', async () => {

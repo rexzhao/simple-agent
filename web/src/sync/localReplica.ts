@@ -17,6 +17,8 @@ export interface ReplicaApplyContext {
   readonly streamEpoch?: string
   readonly resourceRevision: string
   readonly generation: number
+  /** Timestamp from the protocol envelope that carried a transient event. */
+  readonly eventTimestamp?: string
 }
 
 export interface TransientResumeToken {
@@ -209,7 +211,7 @@ export class LocalReplica {
     content: unknown,
     snapshotMetadata: ReplicaApplyMetadata,
     changes: readonly StagedReplicaChange[],
-    transients: readonly TTransient[],
+    transients: readonly { event: TTransient; eventTimestamp?: string }[],
   ): void {
     const key = resourceKeyString(resource)
     const current = this.records.get(key)
@@ -240,10 +242,11 @@ export class LocalReplica {
       }
       if (adapter.applyTransient) {
         for (const transient of transients) {
-          value = adapter.applyTransient(value, transient, {
+          value = adapter.applyTransient(value, transient.event, {
             resource,
             resourceRevision: finalMetadata.resourceRevision,
             generation: finalMetadata.generation,
+            eventTimestamp: transient.eventTimestamp,
           })
         }
       } else if (transients.length > 0) {
@@ -314,6 +317,7 @@ export class LocalReplica {
     adapter: ResourceAdapter<T, TTransient>,
     event: TTransient,
     generation?: number,
+    eventTimestamp?: string,
   ): void {
     const key = resourceKeyString(resource)
     const current = this.records.get(key)
@@ -325,6 +329,7 @@ export class LocalReplica {
         resource,
         resourceRevision: current.metadata.resourceRevision ?? '',
         generation: generation ?? current.metadata.generation,
+        eventTimestamp,
       })
     } catch {
       throw new SyncReadError('invalid_change', 'resource transient event failed validation', key)

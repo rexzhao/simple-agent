@@ -25,6 +25,7 @@ import {
   type SessionRunState,
   type SessionRunStepRef,
   type SessionRunFailure,
+  type SessionReasoningTiming,
   type SessionToolState,
   type SessionTransientText,
 } from '../domain/sessionContent'
@@ -459,6 +460,27 @@ function appendStepRef(run: SessionRunState, ref: SessionRunStepRef): readonly S
     : [...order, ref]
 }
 
+function eventTimestamp(context?: ReplicaApplyContext): string | undefined {
+  const value = context?.eventTimestamp
+  return value !== undefined && isRFC3339Timestamp(value) && Number.isFinite(Date.parse(value)) ? value : undefined
+}
+
+function closeReasoningTimings(run: SessionRunState, endedAt: string): Readonly<Record<string, SessionReasoningTiming>> {
+  const timings = copyMap(run.reasoningTimings ?? {})
+  for (const [key, timing] of Object.entries(timings)) {
+    if (!timing.endedAt) timings[key] = { ...timing, endedAt }
+  }
+  return timings
+}
+
+function closeOtherReasoningTimings(run: SessionRunState, endedAt: string, currentKey: string): Readonly<Record<string, SessionReasoningTiming>> {
+  const timings = copyMap(run.reasoningTimings ?? {})
+  for (const [key, timing] of Object.entries(timings)) {
+    if (key !== currentKey && !timing.endedAt) timings[key] = { ...timing, endedAt }
+  }
+  return timings
+}
+
 function durableInlineLength(snapshot: SessionContentSnapshot, key: SessionContentItemKey, reasoning: boolean): number {
   const item = findItem(snapshot, key)
   const text = textValue(item, reasoning)
@@ -559,7 +581,7 @@ function baseRunState(runEpoch: string, identity: ReturnType<typeof eventIdentit
     runCursor: cursor,
     ...(turnID === undefined ? {} : { turnID }),
     status: 'running',
-    text: {}, reasoning: {}, tools: {}, stepOrder: [], promptQueue: [], appendedPrompts: [], stale: false, recoveryRequired: false,
+    text: {}, reasoning: {}, reasoningTimings: {}, tools: {}, stepOrder: [], promptQueue: [], appendedPrompts: [], stale: false, recoveryRequired: false,
   }
 }
 
@@ -582,7 +604,7 @@ function snapshotTransientBaseline(snapshot: SessionContentSnapshot): SessionRun
     runCursor: (first === 0n ? 0n : first - 1n).toString(),
     ...(active.turn_id === undefined ? {} : { turnID: active.turn_id }),
     status: 'running',
-    text: {}, reasoning: {}, tools: {}, stepOrder: [], promptQueue: [], appendedPrompts: [], stale: false, recoveryRequired: false,
+    text: {}, reasoning: {}, reasoningTimings: {}, tools: {}, stepOrder: [], promptQueue: [], appendedPrompts: [], stale: false, recoveryRequired: false,
   }
 }
 
@@ -691,6 +713,10 @@ function updateRun(state: SessionContentState, event: Record<string, unknown>, s
   if (BigInt(incomingCursor) !== BigInt(currentCursor) + 1n) throw new Error('run cursor is not contiguous')
   if (run.status !== 'running') throw new Error('terminal run received another event')
   let next: SessionRunState = { ...run, runCursor: incomingCursor, turnID: identity.turnID ?? run.turnID, stale: false }
+  const timestamp = eventTimestamp(context)
+  if (timestamp && ['text.delta', 'tool.requested', 'tool.running', 'tool.progress', 'tool.finished', 'turn.failed', 'run.settled'].includes(identity.type)) {
+    next = { ...next, reasoningTimings: closeReasoningTimings(next, timestamp) }
+  }
   switch (identity.type) {
     case 'run.started':
       eventFields(event, ['status'], [], 'run.started')
@@ -709,13 +735,20 @@ function updateRun(state: SessionContentState, event: Record<string, unknown>, s
       const checkpointed = event.durable_checkpointed === undefined ? old?.checkpointed ?? false : booleanValue(event.durable_checkpointed, `${identity.type}.durable_checkpointed`)
       const delta = stringValue(event.delta, `${identity.type}.delta`, true)
       const durableLength = durableInlineLength(state.snapshot, key, identity.type === 'reasoning.delta')
+      const timingBase = identity.type === 'reasoning.delta' && timestamp
+        ? closeOtherReasoningTimings(next, timestamp, keyString)
+        : next.reasoningTimings
+      const currentTiming = timingBase?.[keyString]
+      const reasoningTimings = identity.type === 'reasoning.delta' && timestamp && !currentTiming?.startedAt
+        ? { ...copyMap(timingBase ?? {}), [keyString]: { ...currentTiming, startedAt: timestamp } }
+        : timingBase
       // A committed checkpoint is published before its corresponding
       // transient delta. If the durable item already covers that checkpoint,
       // consume the frame without ever manufacturing a duplicate bubble.
       if (checkpointed && checkpointLength !== undefined && durableLength >= checkpointLength && old === undefined) {
         next = identity.type === 'text.delta'
           ? { ...next, text: map }
-          : { ...next, reasoning: map, stepOrder: appendStepRef(next, { kind: 'reasoning', key: keyString }) }
+          : { ...next, reasoning: map, reasoningTimings, stepOrder: appendStepRef(next, { kind: 'reasoning', key: keyString }) }
         break
       }
       const text = `${old?.text ?? ''}${delta}`
@@ -731,6 +764,7 @@ function updateRun(state: SessionContentState, event: Record<string, unknown>, s
         : {
           ...next,
           reasoning: map,
+          reasoningTimings,
           stepOrder: old ? next.stepOrder : appendStepRef(next, { kind: 'reasoning', key: keyString }),
         }
       break

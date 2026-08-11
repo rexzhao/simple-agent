@@ -208,6 +208,11 @@ export interface SessionTransientText {
   readonly checkpointed: boolean
 }
 
+export interface SessionReasoningTiming {
+  readonly startedAt?: string
+  readonly endedAt?: string
+}
+
 export type SessionToolStatus = 'requested' | 'running' | 'finished'
 
 export interface SessionToolState {
@@ -250,6 +255,7 @@ export interface SessionRunState {
   readonly status: 'running' | 'committed' | 'failed' | 'interrupted' | 'cancelled'
   readonly text: Readonly<Record<string, SessionTransientText>>
   readonly reasoning: Readonly<Record<string, SessionTransientText>>
+  readonly reasoningTimings?: Readonly<Record<string, SessionReasoningTiming>>
   readonly tools: Readonly<Record<string, SessionToolState>>
   readonly stepOrder: readonly SessionRunStepRef[]
   readonly promptQueue: readonly SessionPrompt[]

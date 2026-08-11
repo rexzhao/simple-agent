@@ -70,6 +70,11 @@ export function formatDuration(durationMS: number): string {
   return `${hours}h${minutes > 0 ? ` ${minutes}m` : ''}`
 }
 
+export function unicodeCodePointLength(value: string): number {
+  // JavaScript string length counts UTF-16 code units; the UI displays Unicode characters.
+  return Array.from(value).length
+}
+
 export function errorMessage(reason: unknown): string {
   return reason instanceof Error ? reason.message : 'An unknown error occurred'
 }

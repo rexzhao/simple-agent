@@ -664,14 +664,14 @@ export class SyncRuntime {
     if (!this.current(subscription, socketGeneration, generation)) return
     const queued = [...subscription.queue]
     const stagedChanges: StagedReplicaChange[] = []
-    const stagedTransients: SubscriptionEventMessage['payload']['event'][] = []
+    const stagedTransients: Array<{ event: SubscriptionEventMessage['payload']['event']; eventTimestamp?: string }> = []
     let previousSequence = message.payload.sequence
     let finalResourceRevision = message.payload.resource_revision
     try {
       for (const queuedMessage of queued) {
         if (queuedMessage.type === 'subscription_event') {
           if (!resourceMatches(subscription.resource, queuedMessage.payload.resource)) throw new SyncReadError('invalid_change', 'queued transient resource does not match subscription')
-          stagedTransients.push(queuedMessage.payload.event)
+          stagedTransients.push({ event: queuedMessage.payload.event, eventTimestamp: queuedMessage.timestamp })
           continue
         }
         const change = queuedMessage
@@ -795,7 +795,7 @@ export class SyncRuntime {
       return
     }
     try {
-      this.replica.applyTransient(subscription.resource, adapter, message.payload.event, subscription.generation)
+      this.replica.applyTransient(subscription.resource, adapter, message.payload.event, subscription.generation, message.timestamp)
     } catch (reason) {
       this.requestResync(subscription, socketGeneration, asSyncReadError(reason, 'sequence_gap', subscription.key))
     }
@@ -872,7 +872,7 @@ export class SyncRuntime {
         return false
       }
       try {
-        this.replica.applyTransient(subscription.resource, adapter, message.payload.event, generation)
+        this.replica.applyTransient(subscription.resource, adapter, message.payload.event, generation, message.timestamp)
       } catch (reason) {
         this.requestResync(subscription, socketGeneration, asSyncReadError(reason, 'sequence_gap', subscription.key))
         return false

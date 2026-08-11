@@ -665,10 +665,16 @@ type ActiveProcessRowModel = Extract<ConversationRow, { kind: 'active-process' }
 
 function ActiveProcessRow({ row, onCancelTool, sessionNames, workspaceRoot }: { row: ActiveProcessRowModel; onCancelTool?: (toolCallID: string) => void; sessionNames?: Record<string, string>; workspaceRoot?: string }) {
 	const run = row.run
-	// Once assistant text owns the live tail, process reasoning is no longer
-	// the active streaming step; keep its details collapsed while output grows.
-	const textStreaming = Boolean(run.assistantText) && !row.assistantTailAttached
 	const running = run.status === 'running'
+	// Assistant text is rendered outside the process timeline. Do not leave a
+	// reasoning dot on merely because the run is still open after reasoning has
+	// handed off to the assistant output stream. Tails carry the same handoff in
+	// the event-backed presentation model; only a tail from this process row's
+	// current iteration suppresses its reasoning marker.
+	const lastStep = row.steps[row.steps.length - 1]
+	const assistantOutputStreaming = Boolean(run.assistantText) || Object.values(run.assistantTails ?? {}).some((tail) => {
+		return Boolean(tail.text) && (!lastStep || tail.agentIteration === lastStep.iteration)
+	})
 	const tokenNote = row.isLast && run.totalTokens !== undefined && (
 		<div className="token-note">
 			This turn: {run.totalTokens.toLocaleString()} tokens
@@ -680,7 +686,7 @@ function ActiveProcessRow({ row, onCancelTool, sessionNames, workspaceRoot }: { 
 	return (
 		<article className="message assistant transient">
 			<div className="message-content">
-				<ProcessTimeline steps={row.steps} live={row.isLast && running && !textStreaming} onCancelTool={onCancelTool} sessionNames={sessionNames} workspaceRoot={workspaceRoot} />
+				<ProcessTimeline steps={row.steps} live={row.isLast && running && !assistantOutputStreaming} onCancelTool={onCancelTool} sessionNames={sessionNames} workspaceRoot={workspaceRoot} />
 				{row.isLast && !row.assistantTailAttached && run.assistantText && <MarkdownMessage text={run.assistantText} streaming cursor={running} />}
 				{row.isLast && !row.assistantTailAttached && running && !run.assistantText && <div className="message-text assistant-stream"><span className="cursor" aria-hidden="true" /></div>}
 				{tokenNote}

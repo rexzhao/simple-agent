@@ -215,6 +215,8 @@ export interface ReasoningActivity {
 	id: string
 	text: string
 	iteration: number
+	/** Event-envelope timing retained by the session-content overlay when available. */
+	reasoningTiming?: { startedAt?: string; endedAt?: string }
 	/** Explicit identity of the assistant request that produced this step. */
 	turnID?: string
 	itemID?: string

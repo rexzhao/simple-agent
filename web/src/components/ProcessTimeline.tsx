@@ -4,6 +4,7 @@ import Markdown from 'react-markdown'
 import type { Components } from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import type { ReasoningActivity, RunStep, ToolActivity } from '../types'
+import { formatDuration, unicodeCodePointLength } from '../lib/format'
 import { flattenProcessSteps } from '../lib/runSteps'
 import { isPathOutsideWorkspace } from '../lib/paths'
 import { isSessionToolName, prettyJSONText, sessionToolTarget } from '../lib/sessionTools'
@@ -43,12 +44,23 @@ export const ProcessTimeline = memo(function ProcessTimeline({ steps, live = fal
 // following new lines; scrolling further up pauses the auto-scroll.
 const reasoningFollowThresholdPX = 24
 
-// ReasoningStep streams expanded, follows the latest line while the user stays
-// at the bottom, and collapses by itself once the reasoning stream ends.
+// ReasoningStep keeps the detail collapsed by default. Its compact summary
+// carries the current state, Unicode character count, and event-observed
+// reasoning duration; the existing details control remains available for an
+// explicit inspection until the hover presentation is added.
 function ReasoningStep({ step, marker, streaming }: { step: ReasoningActivity; marker?: ReactNode; streaming: boolean }) {
-	const [expanded, setExpanded] = useState(streaming)
+	const [expanded, setExpanded] = useState(false)
+	const [nowMS, setNowMS] = useState(() => Date.now())
 	const preRef = useRef<HTMLPreElement>(null)
 	const followRef = useRef(true)
+
+	useEffect(() => {
+		const startedAt = parseTimestamp(step.reasoningTiming?.startedAt)
+		const endedAt = parseTimestamp(step.reasoningTiming?.endedAt)
+		if (!streaming || startedAt === undefined || endedAt !== undefined) return undefined
+		const timer = window.setInterval(() => setNowMS(Date.now()), 250)
+		return () => window.clearInterval(timer)
+	}, [step.reasoningTiming?.endedAt, step.reasoningTiming?.startedAt, streaming])
 
 	useEffect(() => {
 		const pre = preRef.current
@@ -69,13 +81,39 @@ function ReasoningStep({ step, marker, streaming }: { step: ReasoningActivity; m
 		if (open && streaming) followRef.current = true
 		setExpanded(open)
 	}
+	const durationMS = reasoningDurationMS(step.reasoningTiming, streaming, nowMS)
 
 	return (
 		<details className="reasoning-step" open={expanded} onToggle={toggle}>
-			<summary>{marker}<ChevronIcon expanded={expanded} /><span>{step.label || 'Reasoning'}</span></summary>
+			<summary>
+				{streaming && <ActivityStatusDot className="reasoning-status-dot running" label="Reasoning status: Thinking" />}
+				{marker}
+				<ChevronIcon expanded={expanded} />
+				<span className="reasoning-summary-status">{streaming ? 'Thinking' : 'Thinking complete'}</span>
+				<span className="reasoning-summary-meta">· {unicodeCodePointLength(step.text).toLocaleString()} chars · {durationMS === undefined ? '—' : formatDuration(durationMS)}</span>
+			</summary>
 			{expanded && <pre ref={preRef} onScroll={updateFollow}>{step.text}</pre>}
 		</details>
 	)
+}
+
+function parseTimestamp(value: string | undefined): number | undefined {
+	if (!value) return undefined
+	const parsed = Date.parse(value)
+	return Number.isFinite(parsed) ? parsed : undefined
+}
+
+function reasoningDurationMS(timing: ReasoningActivity['reasoningTiming'], streaming: boolean, nowMS: number): number | undefined {
+	const startedAt = parseTimestamp(timing?.startedAt)
+	if (startedAt === undefined) return undefined
+	const endedAt = parseTimestamp(timing?.endedAt)
+	const finishAt = endedAt ?? (streaming ? nowMS : undefined)
+	if (finishAt === undefined || finishAt < startedAt) return undefined
+	return finishAt - startedAt
+}
+
+function ActivityStatusDot({ className, label }: { className: string; label: string }) {
+	return <span className={`process-status-dot ${className}`} role="img" aria-label={label} />
 }
 
 function ToolRow({ tool, marker, onCancelTool, sessionNames, workspaceRoot }: { tool: ToolActivity; marker?: ReactNode; onCancelTool?: (toolCallID: string) => void; sessionNames?: Record<string, string>; workspaceRoot?: string }) {
@@ -102,7 +140,7 @@ function ToolRow({ tool, marker, onCancelTool, sessionNames, workspaceRoot }: { 
 	const cancelButton = tool.status === 'running' && onCancelTool
 		? <button className="tool-cancel-button" onClick={() => onCancelTool(tool.id)} title="Cancel this tool call" aria-label="Cancel tool">×</button>
 		: null
-	const header = <><ToolIcon /><strong>{tool.name}</strong>{target && <code title={target} className={outside ? 'outside-workspace' : undefined}>{target}</code>}{outside && <span className="outside-workspace-flag" title={`Outside workspace: ${outsideTargets.join(', ')}`}>!</span>}<small>{toolStatus(tool.status)}</small>{cancelButton}</>
+	const header = <><ActivityStatusDot className={`tool-status-dot ${tool.status}`} label={`Tool status: ${toolStatus(tool.status)}`} />{marker}<ToolIcon /><strong>{tool.name}</strong>{target && <code title={target} className={outside ? 'outside-workspace' : undefined}>{target}</code>}{outside && <span className="outside-workspace-flag" title={`Outside workspace: ${outsideTargets.join(', ')}`}>!</span>}{cancelButton}</>
 	const details = (
 		<div className="tool-details">
 			{command && <div><span>Command</span><pre>{command}</pre></div>}
@@ -113,11 +151,11 @@ function ToolRow({ tool, marker, onCancelTool, sessionNames, workspaceRoot }: { 
 		</div>
 	)
 	if (!showDetails) {
-		return <div className={`tool-row ${tool.status}`}><div className="tool-row-header">{marker}{header}</div></div>
+		return <div className={`tool-row ${tool.status}`}><div className="tool-row-header">{header}</div></div>
 	}
 	return (
 		<details className={`tool-row ${tool.status} expandable`}>
-			<summary className="tool-row-header">{marker}{header}</summary>
+			<summary className="tool-row-header">{header}</summary>
 			{details}
 		</details>
   )
@@ -248,5 +286,5 @@ function toolTarget(name: string, argumentsObject: Record<string, unknown>): str
 }
 
 function toolStatus(status: ToolActivity['status']): string {
-  return { requested: 'Pending', running: 'Running', finished: 'Done', error: 'Failed' }[status]
+  return { requested: 'Requested', running: 'Running', finished: 'Done', error: 'Failed' }[status]
 }

@@ -485,10 +485,23 @@ describe('Conversation live cursor', () => {
       activeRun={runWith({ steps: [{ kind: 'reasoning', id: 'r1', text: 'thinking', iteration: 1 }] })} />)
     expect(container.querySelectorAll('.cursor')).toHaveLength(1)
     expect(container.querySelectorAll('.reasoning-step')).toHaveLength(1)
-    expect(container.querySelectorAll('.reasoning-step pre')).toHaveLength(1)
+    expect(container.querySelectorAll('.reasoning-step pre')).toHaveLength(0)
+    expect(container.querySelector('.reasoning-step summary')?.textContent).toContain('Thinking')
+    expect(container.querySelector('[aria-label="Reasoning status: Thinking"]')).not.toBeNull()
     expect(container.querySelectorAll('.active-cursor')).toHaveLength(0)
     expect(container.querySelectorAll('.process-timeline')).toHaveLength(1)
     expect(container.querySelector('.message.assistant.transient .cursor')).not.toBeNull()
+  })
+
+  it('removes the reasoning dot when output owns the still-running tail', () => {
+    const { container } = renderConversation(<Conversation {...baseProps} sessionID="s1" detail={session('s1')}
+      activeRun={runWith({
+        assistantText: 'partial output',
+        steps: [{ kind: 'reasoning', id: 'r-output', text: 'thinking', iteration: 1 }],
+      })} />)
+    expect(container.querySelector('.reasoning-step')).not.toBeNull()
+    expect(container.querySelector('[aria-label="Reasoning status: Thinking"]')).toBeNull()
+    expect(container.querySelector('.assistant-stream')).not.toBeNull()
   })
 
   it('keeps one cursor and the live tool status for a requested tool', () => {

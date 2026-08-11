@@ -607,6 +607,7 @@ svg { width: 1.1em; height: 1.1em; fill: none; stroke: currentColor; stroke-widt
 .reasoning-step > summary > svg { width: 11px; height: 11px; flex: 0 0 auto; color: var(--muted); }
 .reasoning-step > summary > svg.expanded { transform: rotate(180deg); }
 .reasoning-step > summary > span { color: var(--muted); font-family: "Space Grotesk", "Segoe UI", sans-serif; font-size: 9.5px; font-weight: 800; text-transform: uppercase; letter-spacing: .05em; }
+.reasoning-step > summary > .reasoning-summary-meta { color: var(--faint); font-size: 9px; font-weight: 500; text-transform: none; letter-spacing: 0; }
 /* Mid-turn assistant output renders like the final assistant message, not as a
    process card. */
 .step-message { position: relative; }
@@ -622,15 +623,14 @@ svg { width: 1.1em; height: 1.1em; fill: none; stroke: currentColor; stroke-widt
 .tool-row-header svg { width: 15px; height: 15px; flex: 0 0 auto; color: var(--text); }
 .tool-row-header strong { flex: 0 0 auto; font-weight: 800; }
 .tool-row-header code { min-width: 0; overflow: hidden; color: var(--muted); font: 10px var(--font-mono); text-overflow: ellipsis; white-space: nowrap; }
-.tool-row-header small { flex: 0 0 auto; margin-left: auto; padding: 2px 5px; border: 1px solid var(--border); color: var(--text); background: var(--panel); font-size: 9px; font-weight: 800; }
+.process-status-dot { width: 6px; height: 6px; flex: 0 0 auto; border: 1px solid currentColor; border-radius: 50% !important; background: currentColor; }
+.process-status-dot.running { color: var(--accent-hover); background: var(--accent); animation: pulse 1.2s infinite; }
+.tool-status-dot.requested { color: #9ca3af; background: #d1d5db; }
+.tool-status-dot.running { color: var(--accent-hover); background: var(--accent); }
+.tool-status-dot.finished { color: var(--success); background: var(--success); animation: none; }
+.tool-status-dot.error { color: var(--danger); background: var(--danger); animation: none; }
 .tool-cancel-button { flex: 0 0 auto; display: flex; align-items: center; justify-content: center; width: 20px; height: 20px; margin-left: 4px; border: 1px solid var(--danger); border-radius: 4px; color: var(--danger); background: transparent; font-size: 13px; line-height: 1; cursor: pointer; }
 .tool-cancel-button:hover { background: var(--danger); color: #ffffff; }
-.tool-row.running .tool-row-header small { background: var(--accent); }
-.tool-row.running .tool-row-header svg { color: var(--accent-hover); animation: spin 1.3s linear infinite; }
-.tool-row.finished .tool-row-header small { color: #ffffff; background: var(--success); }
-.tool-row.finished .tool-row-header svg { color: var(--success); }
-.tool-row.error .tool-row-header small { color: #ffffff; background: var(--danger); }
-.tool-row.error .tool-row-header svg { color: var(--danger); }
 .tool-details { background: var(--panel); }
 .tool-details > div { padding: 0 9px 9px; }
 .tool-details > div:first-child { padding-top: 9px; }

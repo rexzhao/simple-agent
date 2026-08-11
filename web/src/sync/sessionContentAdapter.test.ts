@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import type { ChangeOperation, JsonObject, Sequence, SubscriptionEventData } from '../protocol/types'
 import { LocalReplica } from './localReplica'
 import { SessionContentAdapter } from './sessionContentAdapter'
@@ -154,6 +154,61 @@ describe('SessionContentAdapter', () => {
     const state = stateWithRunning()
     expect(() => adapter.applyTransient(state, event('1', '🦄'.repeat(600)), context)).not.toThrow()
     expect(() => adapter.applyTransient(state, event('1', '🦄'.repeat(601)), context)).toThrow('turn.failed.message is too long')
+  })
+
+  it('records reasoning event timing without resetting on later deltas', () => {
+    vi.useFakeTimers()
+    try {
+      const adapter = new SessionContentAdapter('session_a')
+      const context = { resource: { type: 'session_content' as const, id: 'session_a' }, resourceRevision: '1', generation: 1 }
+      const event = (cursor: string, type: string, fields: Record<string, unknown> = {}) => ({ type, session_id: 'session_a', run_id: 'run_a', run_cursor: cursor, ...fields }) as unknown as SubscriptionEventData
+      const apply = (state: SessionContentState, cursor: string, type: string, fields: Record<string, unknown> = {}): SessionContentState => {
+        return adapter.applyTransient(state, event(cursor, type, fields), { ...context, eventTimestamp: new Date().toISOString() })
+      }
+      vi.setSystemTime(new Date('2025-01-01T00:00:00.000Z'))
+      let state = apply(stateWithRunning(), '1', 'run.started', { status: 'running' })
+      vi.advanceTimersByTime(1000)
+      state = apply(state, '2', 'reasoning.delta', { turn_id: 'turn_a', agent_iteration: 1, item_id: 'reasoning_a', delta: 'first' })
+      vi.advanceTimersByTime(2000)
+      state = apply(state, '3', 'reasoning.delta', { turn_id: 'turn_a', agent_iteration: 1, item_id: 'reasoning_a', delta: ' second' })
+      expect(state.transientRun?.reasoningTimings?.[JSON.stringify(['turn_a', 1, 'reasoning_a'])]).toEqual({ startedAt: '2025-01-01T00:00:01.000Z' })
+      vi.advanceTimersByTime(1500)
+      state = apply(state, '4', 'tool.requested', { turn_id: 'turn_a', agent_iteration: 1, tool_call_id: 'tool_a', name: 'shell' })
+      expect(state.transientRun?.reasoningTimings?.[JSON.stringify(['turn_a', 1, 'reasoning_a'])]).toEqual({
+        startedAt: '2025-01-01T00:00:01.000Z', endedAt: '2025-01-01T00:00:04.500Z',
+      })
+      vi.advanceTimersByTime(500)
+      state = apply(state, '5', 'reasoning.delta', { turn_id: 'turn_a', agent_iteration: 1, item_id: 'reasoning_b', delta: 'next' })
+      vi.advanceTimersByTime(1000)
+      state = apply(state, '6', 'run.settled', {
+        status: 'committed',
+        durable_settlement_watermark: { resource_revision: '1', run_cursor: '6', verified: false, covered_items: [] },
+      })
+      expect(state.transientRun?.reasoningTimings?.[JSON.stringify(['turn_a', 1, 'reasoning_b'])]).toEqual({
+        startedAt: '2025-01-01T00:00:05.000Z', endedAt: '2025-01-01T00:00:06.000Z',
+      })
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('closes an earlier reasoning identity when another starts without an intervening tool or output', () => {
+    const adapter = new SessionContentAdapter('session_a')
+    const context = { resource: { type: 'session_content' as const, id: 'session_a' }, resourceRevision: '1', generation: 1 }
+    const event = (cursor: string, itemID: string, delta: string) => ({
+      type: 'reasoning.delta', session_id: 'session_a', run_id: 'run_a', run_cursor: cursor,
+      turn_id: 'turn_a', agent_iteration: 1, item_id: itemID, delta,
+    }) as unknown as SubscriptionEventData
+    let state = adapter.applyTransient(stateWithRunning(), { type: 'run.started', session_id: 'session_a', run_id: 'run_a', run_cursor: '1', status: 'running' } as unknown as SubscriptionEventData, context)
+    state = adapter.applyTransient(state, event('2', 'reasoning_a', 'first'), { ...context, eventTimestamp: '2025-01-01T00:00:01.000Z' })
+    state = adapter.applyTransient(state, event('3', 'reasoning_b', 'second'), { ...context, eventTimestamp: '2025-01-01T00:00:02.000Z' })
+    state = adapter.applyTransient(state, event('4', 'reasoning_b', ' delta'), { ...context, eventTimestamp: '2025-01-01T00:00:03.000Z' })
+    expect(state.transientRun?.reasoningTimings?.[JSON.stringify(['turn_a', 1, 'reasoning_a'])]).toEqual({
+      startedAt: '2025-01-01T00:00:01.000Z', endedAt: '2025-01-01T00:00:02.000Z',
+    })
+    expect(state.transientRun?.reasoningTimings?.[JSON.stringify(['turn_a', 1, 'reasoning_b'])]).toEqual({
+      startedAt: '2025-01-01T00:00:02.000Z',
+    })
   })
 
   it('only clears a verified settlement after both revision and covered item identity are durable', () => {

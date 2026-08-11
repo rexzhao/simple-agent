@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { cleanup, render, screen, fireEvent } from '@testing-library/react'
 import { ProcessTimeline } from './ProcessTimeline'
 import type { RunStep, ToolActivity } from '../types'
@@ -16,6 +16,80 @@ const tool = (overrides: Partial<ToolActivity>): ToolActivity => ({
 })
 
 describe('ProcessTimeline session tools', () => {
+	it('uses a colored leading dot and accessible status instead of trailing status text', () => {
+		const { container } = render(<ProcessTimeline steps={[
+			tool({ id: 'requested', status: 'requested' }),
+			tool({ id: 'running', status: 'running' }),
+			tool({ id: 'finished', status: 'finished' }),
+			tool({ id: 'error', status: 'error' }),
+		]} />)
+
+		expect(container.querySelectorAll('.tool-row-header small')).toHaveLength(0)
+		expect(container.querySelectorAll('.tool-status-dot')).toHaveLength(4)
+		expect(container.querySelector('.tool-status-dot.requested')).not.toBeNull()
+		expect(container.querySelector('.tool-status-dot.running')).not.toBeNull()
+		expect(container.querySelector('.tool-status-dot.finished')).not.toBeNull()
+		expect(container.querySelector('.tool-status-dot.error')).not.toBeNull()
+		expect(screen.getByRole('img', { name: 'Tool status: Requested' })).not.toBeNull()
+		expect(screen.getByRole('img', { name: 'Tool status: Running' })).not.toBeNull()
+		expect(screen.getByRole('img', { name: 'Tool status: Done' })).not.toBeNull()
+		expect(screen.getByRole('img', { name: 'Tool status: Failed' })).not.toBeNull()
+		expect(container.textContent).not.toMatch(/Requested|Running|Done|Failed/)
+	})
+
+	it('shows only a compact reasoning summary and marks only the current reasoning step as running', () => {
+		const reasoning: RunStep = { kind: 'reasoning', id: 'reason-a', text: '😀a中', iteration: 1 }
+		const view = render(<ProcessTimeline steps={[reasoning]} live />)
+
+		expect(view.container.querySelector('.reasoning-step summary')?.textContent).toContain('Thinking')
+		expect(view.container.querySelector('.reasoning-step summary')?.textContent).toContain('3 chars')
+		expect(view.container.querySelector('.reasoning-step summary')?.textContent).toContain('—')
+		expect(view.container.querySelector('.reasoning-step pre')).toBeNull()
+		expect(view.container.querySelector('[aria-label="Reasoning status: Thinking"]')).not.toBeNull()
+
+		view.rerender(<ProcessTimeline steps={[reasoning]} live={false} />)
+		expect(view.container.querySelector('.reasoning-step summary')?.textContent).toContain('Thinking complete')
+		expect(view.container.querySelector('[aria-label="Reasoning status: Thinking"]')).toBeNull()
+		expect(view.container.querySelector('.reasoning-step pre')).toBeNull()
+	})
+
+	it('does not mark an earlier reasoning step when a later tool is the current activity', () => {
+		const reasoning: RunStep = { kind: 'reasoning', id: 'reason-before-tool', text: 'thinking', iteration: 1 }
+		const { container } = render(<ProcessTimeline steps={[reasoning, tool({ id: 'tool-after-reasoning', status: 'running' })]} live />)
+
+		expect(container.querySelector('.reasoning-step [aria-label="Reasoning status: Thinking"]')).toBeNull()
+		expect(container.querySelector('.tool-status-dot.running')).not.toBeNull()
+	})
+
+	it('uses event timing for a handed-off reasoning step and keeps it after remount', () => {
+		vi.useFakeTimers()
+		try {
+			vi.setSystemTime(new Date('2025-01-01T00:00:00.000Z'))
+			const reasoning: RunStep = {
+				kind: 'reasoning', id: 'timed-reasoning', text: 'thinking', iteration: 1,
+				reasoningTiming: { startedAt: '2025-01-01T00:00:01.000Z', endedAt: '2025-01-01T00:00:02.500Z' },
+			}
+			const toolStep = tool({ id: 'after-reasoning', status: 'running' })
+			const view = render(<ProcessTimeline steps={[reasoning, toolStep]} live />)
+			expect(view.container.querySelector('.reasoning-step summary')?.textContent).toContain('1.5s')
+			expect(view.container.querySelector('[aria-label="Reasoning status: Thinking"]')).toBeNull()
+
+			view.unmount()
+			const remounted = render(<ProcessTimeline steps={[reasoning]} />)
+			expect(remounted.container.querySelector('.reasoning-step summary')?.textContent).toContain('1.5s')
+		} finally {
+			vi.useRealTimers()
+		}
+	})
+
+	it('does not invent a zero duration when history has no event timing', () => {
+		const reasoning: RunStep = { kind: 'reasoning', id: 'historical-reasoning', text: 'old', iteration: 1 }
+		const { container } = render(<ProcessTimeline steps={[reasoning]} />)
+		const summary = container.querySelector('.reasoning-step summary')?.textContent ?? ''
+		expect(summary).toContain('—')
+		expect(summary).not.toContain('0ms')
+	})
+
 	it('shows start_line and line_count on the read_file row', () => {
 		const steps: RunStep[] = [tool({
 			arguments: JSON.stringify({ path: 'notes.ts', start_line: 42, line_count: 10 }),
