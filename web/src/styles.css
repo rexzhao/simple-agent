@@ -656,6 +656,42 @@ svg { width: 1.1em; height: 1.1em; fill: none; stroke: currentColor; stroke-widt
 .tool-details > div:first-child { padding-top: 9px; }
 .tool-details > div > span { display: block; margin: 4px 0 5px; color: var(--muted); font-size: 9px; font-weight: 800; text-transform: uppercase; }
 .tool-details pre { max-height: 260px; margin: 0; padding: 9px 10px; overflow: auto; border: 2px solid var(--border); color: #f9fafb; background: #111111; font: 10.5px/1.6 var(--font-mono); white-space: pre-wrap; overflow-wrap: anywhere; }
+.ansi-output .ansi-fg-black { color: #6b7280; }
+.ansi-output .ansi-fg-red { color: #ef4444; }
+.ansi-output .ansi-fg-green { color: #22c55e; }
+.ansi-output .ansi-fg-yellow { color: #eab308; }
+.ansi-output .ansi-fg-blue { color: #3b82f6; }
+.ansi-output .ansi-fg-magenta { color: #d946ef; }
+.ansi-output .ansi-fg-cyan { color: #06b6d4; }
+.ansi-output .ansi-fg-white { color: #f8fafc; }
+.ansi-output .ansi-fg-bright-black { color: #9ca3af; }
+.ansi-output .ansi-fg-bright-red { color: #f87171; }
+.ansi-output .ansi-fg-bright-green { color: #4ade80; }
+.ansi-output .ansi-fg-bright-yellow { color: #fde047; }
+.ansi-output .ansi-fg-bright-blue { color: #60a5fa; }
+.ansi-output .ansi-fg-bright-magenta { color: #f0abfc; }
+.ansi-output .ansi-fg-bright-cyan { color: #67e8f9; }
+.ansi-output .ansi-fg-bright-white { color: #ffffff; }
+.ansi-output .ansi-bg-black { background-color: #000000; }
+.ansi-output .ansi-bg-red { background-color: #991b1b; }
+.ansi-output .ansi-bg-green { background-color: #166534; }
+.ansi-output .ansi-bg-yellow { background-color: #854d0e; }
+.ansi-output .ansi-bg-blue { background-color: #1e3a8a; }
+.ansi-output .ansi-bg-magenta { background-color: #86198f; }
+.ansi-output .ansi-bg-cyan { background-color: #155e75; }
+.ansi-output .ansi-bg-white { background-color: #f8fafc; }
+.ansi-output .ansi-bg-bright-black { background-color: #4b5563; }
+.ansi-output .ansi-bg-bright-red { background-color: #dc2626; }
+.ansi-output .ansi-bg-bright-green { background-color: #16a34a; }
+.ansi-output .ansi-bg-bright-yellow { background-color: #ca8a04; }
+.ansi-output .ansi-bg-bright-blue { background-color: #2563eb; }
+.ansi-output .ansi-bg-bright-magenta { background-color: #c026d3; }
+.ansi-output .ansi-bg-bright-cyan { background-color: #0891b2; }
+.ansi-output .ansi-bg-bright-white { background-color: #ffffff; }
+.ansi-output .ansi-bold { font-weight: 700; }
+.ansi-output .ansi-dim { opacity: .65; }
+.ansi-output .ansi-italic { font-style: italic; }
+.ansi-output .ansi-underline { text-decoration: underline; }
 .tool-details-empty { padding: 4px 0 2px; color: var(--muted); font: 10px/1.5 var(--font-mono); }
 .tool-edit-diff pre span { display: block; }
 .tool-edit-diff pre .diff-meta { color: #9ca3af; }

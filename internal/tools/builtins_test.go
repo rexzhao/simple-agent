@@ -644,6 +644,20 @@ func TestShellRunsInRootDir(t *testing.T) {
 	}
 }
 
+func TestShellPreservesANSIOutput(t *testing.T) {
+	registry := registerBuiltinsForTest(t, t.TempDir())
+	result, err := registry.Execute(context.Background(), BuiltinShell, map[string]any{
+		"command": "printf '\\033[31mstdout\\033[0m\\n'; printf '\\033[32mstderr\\033[0m\\n' >&2",
+	})
+	if err != nil {
+		t.Fatalf("Execute(shell) error = %v", err)
+	}
+	want := "\x1b[31mstdout\x1b[0m\n\x1b[32mstderr\x1b[0m\n"
+	if result.IsError || result.Content != want {
+		t.Fatalf("Execute(shell) result = %#v, want raw ANSI content %q", result, want)
+	}
+}
+
 func TestShellRunsBashSyntaxWhenBashIsAvailable(t *testing.T) {
 	config, err := resolveShellCommandConfig()
 	if err != nil {

@@ -270,6 +270,24 @@ describe('ProcessTimeline session tools', () => {
 		expect(popup.querySelector('img')).toBeNull()
 	})
 
+	it('renders shell SGR output as styled text without interpreting HTML', () => {
+		const output = '\x1b[31mred\x1b[1;4m bold\x1b[0m plain\n<img src=x onerror=alert(1)>'
+		const { container } = render(<ProcessTimeline steps={[tool({
+			name: 'shell',
+			arguments: JSON.stringify({ command: 'printf colored' }),
+			result: output,
+		})]} />)
+		const trigger = container.querySelector('.tool-row-header') as Element
+		fireEvent.mouseEnter(trigger)
+
+		const pre = screen.getByRole('tooltip').querySelector('pre.ansi-output')
+		expect(pre).not.toBeNull()
+		expect(pre?.textContent).toBe('red bold plain\n<img src=x onerror=alert(1)>')
+		expect(pre?.querySelector('.ansi-fg-red')?.textContent).toBe('red')
+		expect(pre?.querySelector('.ansi-bold.ansi-underline')?.textContent).toBe(' bold')
+		expect(pre?.querySelector('img')).toBeNull()
+	})
+
 	it('uses focus as an equivalent trigger and Escape closes the associated tooltip', () => {
 		const { container } = render(<ProcessTimeline steps={[{ kind: 'reasoning', id: 'keyboard-reasoning', text: 'private thoughts', iteration: 1 }]} />)
 		const trigger = container.querySelector('.reasoning-trigger') as HTMLElement

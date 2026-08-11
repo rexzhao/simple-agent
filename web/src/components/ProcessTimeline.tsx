@@ -9,6 +9,7 @@ import { formatDuration, unicodeCodePointLength } from '../lib/format'
 import { flattenProcessSteps } from '../lib/runSteps'
 import { isPathOutsideWorkspace } from '../lib/paths'
 import { isSessionToolName, prettyJSONText, sessionToolTarget } from '../lib/sessionTools'
+import { AnsiOutput } from './AnsiOutput'
 import { ToolIcon } from './icons'
 
 const markdownComponents: Components = {
@@ -365,7 +366,7 @@ function ToolRow({ tool, marker, onCancelTool, sessionNames, workspaceRoot }: { 
 			{showPatch && <AppliedPatchDiff patch={patch} />}
 			{showEditDiff && <EditFileDiff path={target} oldText={oldText} newText={newText} />}
 			{showArguments && <div><span>Arguments</span><pre>{prettyJSONText(tool.arguments ?? '')}</pre></div>}
-			{showResult && <div><span>{tool.name === 'edit_file' ? 'Error details' : 'Output'}</span><pre>{result}</pre></div>}
+			{showResult && <div><span>{tool.name === 'edit_file' ? 'Error details' : 'Output'}</span>{tool.name === 'shell' ? <AnsiOutput text={result ?? ''} /> : <pre>{result}</pre>}</div>}
 			{!command && !showPatch && !showEditDiff && !showArguments && !showResult && <div className="tool-details-empty">No additional details were recorded.</div>}
 		</div>
 	), [command, newText, oldText, patch, result, showArguments, showEditDiff, showPatch, showResult, target, tool.arguments, tool.name])
