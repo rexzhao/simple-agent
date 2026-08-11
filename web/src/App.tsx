@@ -370,7 +370,7 @@ function App() {
   // the conversation panel in sync. The sub-panel can then override it without
   // disturbing the tree's selected highlight.
   useEffect(() => {
-    if (preserveViewingForSelectedSessionIDRef.current === selectedSessionID) {
+    if (preserveViewingForSelectedSessionIDRef.current && preserveViewingForSelectedSessionIDRef.current === selectedSessionID) {
       preserveViewingForSelectedSessionIDRef.current = ''
       return
     }
