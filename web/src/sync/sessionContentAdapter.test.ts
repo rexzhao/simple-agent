@@ -33,6 +33,26 @@ function stateWithRunning(): SessionContentState {
 }
 
 describe('SessionContentAdapter', () => {
+  it.each([
+    { name: 'replay unavailable', replay_available: false },
+    { name: 'replay available', replay_available: true, run_epoch: 'epoch_a', run_cursor: '2', replay_from_cursor: '1', replay_to_cursor: '2' },
+    { name: 'recovery flag omitted', replay_available: false, omitRecovery: true },
+  ])('keeps a normal running snapshot out of recovery ($name)', ({ name: _name, omitRecovery, ...overrides }) => {
+    const adapter = new SessionContentAdapter('session_a')
+    const activeRun: Record<string, unknown> = {
+      run_id: 'run_a', session_id: 'session_a', turn_id: 'turn_a', started_at: '2025-01-01T00:00:00Z',
+      status: 'running', recoverable: true, replay_available: overrides.replay_available,
+      ...(overrides.run_cursor === undefined ? { run_epoch: 'epoch_a', run_cursor: '0' } : overrides),
+      ...(omitRecovery ? {} : { recovery_required: false }),
+    }
+    const state = adapter.decodeSnapshot(snapshot({
+      session: metadata({ status: 'running', running_run_id: 'run_a', running_turn_id: 'turn_a' }),
+      active_run: activeRun,
+    }), undefined, { resource: { type: 'session_content', id: 'session_a' }, resourceRevision: '1', generation: 1 })
+    expect(state.snapshot.active_run?.recovery_required).toBe(false)
+    expect(state.transientRun?.recoveryRequired ?? false).toBe(false)
+  })
+
   it('strictly applies a snapshot and every durable operation without partial state', () => {
     const resource = { type: 'session_content' as const, id: 'session_a' }
     const adapter = new SessionContentAdapter('session_a')

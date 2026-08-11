@@ -206,6 +206,17 @@ describe('Conversation identity boundary', () => {
     expect(screen.getByTitle('Refresh session')).toBeDefined()
   })
 
+  it('shows a real synchronization error and disables duplicate refresh clicks while pending', () => {
+    const detail = session('s1')
+    const run: ActiveRun = {
+      id: 'run-1', sessionID: 's1', assistantText: '', steps: [],
+      agentIteration: 0, status: 'error_pending_refresh',
+    }
+    renderConversation(<Conversation {...baseProps} sessionID="s1" detail={detail} activeRun={run} refreshing refreshError={{ code: 'invalid_snapshot', message: 'snapshot rejected' }} />)
+    expect(screen.getByText('invalid_snapshot: snapshot rejected')).toBeDefined()
+    expect((screen.getByRole('button', { name: 'Refreshing…' }) as HTMLButtonElement).disabled).toBe(true)
+  })
+
   it('renders a compaction item as a one-line record instead of a chat bubble', () => {
     const detail = session('s1')
     const page: ItemsPage = {

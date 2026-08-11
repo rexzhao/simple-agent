@@ -83,7 +83,11 @@ export function activeRunForConversation(view: SessionView, sessionID: string): 
     assistantText: '',
     steps: [],
     agentIteration: 0,
-    status: active.recovery_required ? 'error_pending_refresh' : 'running',
+    // active_run.recovery_required is a server-side recovery hint. Without a
+    // client-owned transient overlay there is no safe local state to refresh
+    // into, so keep the active fallback as an ordinary running row. Queue and
+    // Steer state remains fail-closed in the adapter.
+    status: 'running',
   }
 }
 
@@ -141,7 +145,7 @@ function runStateForConversation(state: SessionRunState, sessionID: string): Act
       status: tool.is_error ? 'error' : tool.status,
     })
   }
-  const status: ActiveRun['status'] = state.recoveryRequired || state.stale
+  const status: ActiveRun['status'] = state.recoveryRequired === true || state.stale === true
     ? 'error_pending_refresh'
     : state.status === 'failed' ? 'failed'
       : state.status === 'cancelled' ? 'cancelled'

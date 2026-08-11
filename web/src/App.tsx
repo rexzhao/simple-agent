@@ -357,7 +357,7 @@ function App() {
 
   const selectedSessionRef = useRef(viewingSessionID)
   selectedSessionRef.current = viewingSessionID
-  const { view: sessionContentView, historyState: sessionHistoryState, loadOlder, retry: retrySessionContent } = useSessionContentHistory(viewingSessionID, sessionContentRepository)
+  const { view: sessionContentView, historyState: sessionHistoryState, loadOlder, retry: retrySessionContent, retrying: retryingSessionContent } = useSessionContentHistory(viewingSessionID, sessionContentRepository)
   const sessionDetail = sessionContentView.session
     ? sessionMetadataForConversation(sessionContentView.session, sessionContentView.history)
     : null
@@ -1127,6 +1127,8 @@ function App() {
             admissionPending={Boolean(awaitingRunStartedBySession[viewingSessionID])}
             compacting={Boolean(compactingSessionIDs[viewingSessionID])}
 			contentAvailability={sessionContentView.availability}
+			refreshError={sessionContentView.error}
+			refreshing={retryingSessionContent}
 			historyLoading={sessionHistoryState.loading}
 			historyError={sessionHistoryState.error}
 			draft={draftsBySession[viewingSessionID] ?? emptyComposerDraft}

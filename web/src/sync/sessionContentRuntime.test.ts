@@ -7,18 +7,23 @@ import { SyncRuntime, type RuntimeTransport } from './runtime'
 import type { TransportCloseEvent, TransportReadyEvent } from './transport'
 import type { SessionContentState } from '../domain/sessionContent'
 import { SessionContentRepository } from './sessionContentRepository'
+import { activeRunForConversation } from '../lib/sessionContentPresentation'
 
 class FakeTransport implements RuntimeTransport {
   isReady = true
   connectionGeneration = 1
   serverEpoch: string | undefined = 'server_1'
   sent: ProtocolMessage[] = []
+  failNextSends = 0
   private messages = new Set<(message: ProtocolMessage, generation: number) => void>()
   private ready = new Set<(event: TransportReadyEvent) => void>()
   private closed = new Set<(event: TransportCloseEvent) => void>()
   start(): void { this.isReady = true }
   stop(): void { this.isReady = false }
-  send(message: ProtocolMessage): void { this.sent.push(message) }
+  send(message: ProtocolMessage): void {
+    if (this.failNextSends > 0) { this.failNextSends -= 1; throw new Error('fake send failure') }
+    this.sent.push(message)
+  }
   onMessage(listener: (message: ProtocolMessage, generation: number) => void): () => void { this.messages.add(listener); return () => this.messages.delete(listener) }
   onReady(listener: (event: TransportReadyEvent) => void): () => void { this.ready.add(listener); return () => this.ready.delete(listener) }
   onClose(listener: (event: TransportCloseEvent) => void): () => void { this.closed.add(listener); return () => this.closed.delete(listener) }
@@ -85,6 +90,65 @@ async function settleSnapshot(): Promise<void> {
 }
 
 describe('session-content transient runtime path', () => {
+  it('uses one targeted authoritative refresh, drops the stale overlay, and clears the banner after a valid snapshot', async () => {
+    const transport = new FakeTransport()
+    const runtime = new SyncRuntime({ transport })
+    const resource = { type: 'session_content' as const, id: 'session_a' }
+    runtime.subscribe(resource, { retainOnRelease: true })
+    runtime.start()
+    const first = transport.lastSubscribe()
+    transport.emit(subscribed(first.payload.subscription_id, 'session_a'))
+    transport.emit(snapshot(first.payload.subscription_id, 'session_a', content('session_a')))
+    await settleSnapshot()
+    transport.emit(event(first.payload.subscription_id, 'session_a', '1', { type: 'run.started', status: 'running' }))
+    transport.emit(event(first.payload.subscription_id, 'session_a', '2', { type: 'run.prompt_queue', prompts: [{ id: 'stale', content: 'old', steer: false }] }))
+    expect(runtime.replica.get<SessionContentState>(resource).value?.transientRun?.promptQueue).toHaveLength(1)
+
+    const subscribeCount = transport.sent.filter((message) => message.type === 'subscribe').length
+    runtime.retry(resource)
+    runtime.retry(resource)
+    expect(transport.sent.filter((message) => message.type === 'subscribe')).toHaveLength(subscribeCount + 1)
+    expect(runtime.replica.get<SessionContentState>(resource).value?.transientRun).toBeNull()
+    const refreshed = transport.lastSubscribe()
+    expect(refreshed.payload.active_run_resume).toBeUndefined()
+
+    transport.emit(subscribed(refreshed.payload.subscription_id, 'session_a'))
+    transport.emit(snapshot(refreshed.payload.subscription_id, 'session_a', content('session_a')))
+    await settleSnapshot()
+    const repository = new SessionContentRepository(runtime.replica)
+    const view = repository.get('session_a')
+    expect(activeRunForConversation(view, 'session_a')?.status).toBe('running')
+    repository.dispose()
+    runtime.stop()
+  })
+
+  it('keeps a failed refresh retryable and never treats the failed request as recovered', async () => {
+    const transport = new FakeTransport()
+    const runtime = new SyncRuntime({ transport })
+    const resource = { type: 'session_content' as const, id: 'session_a' }
+    runtime.subscribe(resource)
+    runtime.start()
+    const initial = transport.lastSubscribe()
+    transport.emit(subscribed(initial.payload.subscription_id, 'session_a'))
+    transport.emit(snapshot(initial.payload.subscription_id, 'session_a', content('session_a')))
+    await settleSnapshot()
+
+    // Both the best-effort unsubscribe and the new subscribe fail. The
+    // isolated target must publish an error without disturbing the socket.
+    transport.failNextSends = 2
+    runtime.retry(resource)
+    expect(runtime.replica.get(resource).metadata.readState).toBe('stale')
+    expect(runtime.replica.get(resource).metadata.error?.code).toBe('transport')
+
+    runtime.retry(resource)
+    const finalRetry = transport.lastSubscribe()
+    transport.emit(subscribed(finalRetry.payload.subscription_id, 'session_a'))
+    transport.emit(snapshot(finalRetry.payload.subscription_id, 'session_a', content('session_a')))
+    await settleSnapshot()
+    expect(runtime.replica.get(resource).metadata.readState).toBe('ready')
+    runtime.stop()
+  })
+
   it('routes transient events without ACK, merges keyed text, and clears the tail when durable content covers it', async () => {
     const transport = new FakeTransport()
     const runtime = new SyncRuntime({ transport })

@@ -742,18 +742,6 @@ export class SyncMockServer {
     this.publishIndexChange(session.project_id, [{ op: 'upsert', key: sessionID, value: sessionSummary(session, this.nextIndexRevision(session.project_id), indexRunID) }])
   }
 
-  /** Replaces only the next snapshot, modeling a recovery/resnapshot barrier. */
-  recoverRunFromSnapshot(sessionID: string, runID: string, items: WireItem[]): void {
-    const state = this.contents.get(sessionID)
-    const session = this.sessions.get(sessionID)
-    if (!state || !session || state.activeRun?.run_id !== runID) return
-    state.items = [...items]
-    state.activeRun = { ...state.activeRun, run_cursor: String(this.runCursors.get(runID) ?? 0), recovery_required: false, replay_available: false }
-    Object.assign(session, { status: 'running', last_seq: items.reduce((max, item) => Math.max(max, Number(item.seq ?? 0)), 0) })
-    const key = this.resourceKey({ type: 'session_content', id: sessionID })
-    this.resourceRevisions.set(key, (this.resourceRevisions.get(key) ?? 0) + 1)
-  }
-
   private publishIndexChange(projectID: string, operations: Record<string, unknown>[]): void {
     this.publishChange({ type: 'session_index', id: projectID }, operations)
   }

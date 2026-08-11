@@ -96,6 +96,8 @@ interface Subscription {
   snapshotAbort: AbortController | null
   resyncing: boolean
   resyncAttempts: number
+  /** Suppresses duplicate targeted Refresh clicks until its barrier ends. */
+  recoveryInFlight: boolean
   retainOnRelease: boolean
 }
 
@@ -256,6 +258,7 @@ export class SyncRuntime {
       subscription.snapshotBusy = false
       subscription.queue = []
       subscription.queueBytes = 0
+      subscription.recoveryInFlight = false
       subscription.socketGeneration = undefined
       this.replica.markStale(subscription.resource, new SyncReadError('runtime_stopped', 'synchronization runtime stopped'), subscription.generation)
     }
@@ -278,6 +281,7 @@ export class SyncRuntime {
       : [...this.subscriptions.values()]
     let wakeTransport = false
     for (const subscription of targets) {
+      if (subscription.recoveryInFlight) continue
       const readState = this.replica.get(subscription.resource).metadata.readState
       const replicaNeedsRecovery = readState === 'stale' || readState === 'error'
       if (!forceTarget && subscription.phase !== 'error' && !subscription.transportTerminalError && !replicaNeedsRecovery) continue
@@ -298,7 +302,13 @@ export class SyncRuntime {
       subscription.resyncing = false
       subscription.resyncAttempts = 0
       subscription.resume = undefined
-      this.replica.markStale(subscription.resource, undefined, subscription.generation)
+      subscription.recoveryInFlight = forceTarget
+      // A targeted Refresh is an authoritative replacement barrier. Do not
+      // send the old active_run_resume token back to the server: that token
+      // describes the overlay which caused the banner and can make a healthy
+      // snapshot look stale again. Drop it atomically with the stale mark.
+      if (subscription.resource.type === 'session_content') this.clearTransientAndMarkStale(subscription, undefined)
+      else this.replica.markStale(subscription.resource, undefined, subscription.generation)
       // Recovery is scoped to this resource. Never tear down the shared
       // socket: doing so would invalidate unrelated subscriptions and make
       // in-flight command outcomes unknown.
@@ -335,6 +345,7 @@ export class SyncRuntime {
           if (subscription.phase !== 'waiting') continue
           subscription.phase = 'error'
           subscription.transportTerminalError = false
+          subscription.recoveryInFlight = false
           this.replica.markError(subscription.resource, asSyncReadError(reason, 'transport', subscription.key), subscription.generation)
         }
       }
@@ -368,6 +379,7 @@ export class SyncRuntime {
       snapshotAbort: null,
       resyncing: false,
       resyncAttempts: 0,
+      recoveryInFlight: false,
       retainOnRelease: options.retainOnRelease === true,
     }
     this.subscriptions.set(key, subscription)
@@ -462,7 +474,10 @@ export class SyncRuntime {
       subscription.phase = resourceTerminal ? 'error' : 'waiting'
       subscription.transportTerminalError = sharedTransportTerminal
       const reason = new SyncReadError('transport', 'WebSocket disconnected')
-      if (!event.willRetry) this.replica.markError(subscription.resource, reason, subscription.generation)
+      if (!event.willRetry) {
+        subscription.recoveryInFlight = false
+        this.replica.markError(subscription.resource, reason, subscription.generation)
+      }
       else this.replica.markStale(subscription.resource, reason, subscription.generation)
     }
   }
@@ -510,6 +525,7 @@ export class SyncRuntime {
       if (isolatedRecovery) {
         subscription.phase = 'error'
         subscription.transportTerminalError = false
+        subscription.recoveryInFlight = false
         this.replica.markError(subscription.resource, asSyncReadError(reason, failure.code, subscription.key), subscription.generation)
       } else {
         this.transportFailure(subscription, failure)
@@ -731,6 +747,7 @@ export class SyncRuntime {
     subscription.resourceRevision = finalResourceRevision
     subscription.resume = { stream_epoch: subscription.streamEpoch, sequence: subscription.sequence }
     subscription.phase = 'live'
+    subscription.recoveryInFlight = false
     subscription.resyncAttempts = 0
     subscription.queue = []
     subscription.queueBytes = 0
@@ -925,6 +942,7 @@ export class SyncRuntime {
       subscription.resyncing = false
       subscription.phase = 'error'
       subscription.transportTerminalError = false
+      subscription.recoveryInFlight = false
       this.replica.markError(subscription.resource, reason, subscription.generation)
       return
     }
@@ -978,7 +996,7 @@ export class SyncRuntime {
     }
   }
 
-  private clearTransientAndMarkStale(subscription: Subscription, reason: SyncReadError): void {
+  private clearTransientAndMarkStale(subscription: Subscription, reason?: SyncReadError): void {
     try {
       const adapter = this.adapterFor(subscription.resource)
       this.replica.clearTransientAndMarkStale(subscription.resource, adapter, reason, subscription.generation)

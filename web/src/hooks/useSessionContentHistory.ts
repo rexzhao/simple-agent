@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import type { SessionContentRepository, SessionContentHistoryState, SessionView } from '../repositories/sessionContent'
 import { useSessionView } from './useSyncApplication'
 
@@ -7,6 +7,8 @@ export interface SessionContentHistoryHook {
   readonly historyState: SessionContentHistoryState
   readonly loadOlder: () => Promise<boolean>
   readonly retry: () => void
+  /** True until the targeted retry reaches a snapshot or error barrier. */
+  readonly retrying: boolean
 }
 
 /**
@@ -21,6 +23,8 @@ export function useSessionContentHistory(
   const view = useSessionView(sessionID)
   const selectedSessionRef = useRef(sessionID)
   const readAbortRef = useRef<AbortController | null>(null)
+  const retryingRef = useRef(false)
+  const [retrying, setRetrying] = useState(false)
   selectedSessionRef.current = sessionID
   // A page interest owns the HTTP/blob read. Changing selection or unmounting
   // releases that interest immediately instead of relying only on a later
@@ -28,6 +32,14 @@ export function useSessionContentHistory(
   useEffect(() => () => {
     readAbortRef.current?.abort()
     readAbortRef.current = null
+    retryingRef.current = false
+    setRetrying(false)
+  }, [repository, sessionID])
+  // Retry state is scoped to the selected resource. Do not let a late result
+  // from the previous session disable the new session's Refresh action.
+  useEffect(() => {
+    retryingRef.current = false
+    setRetrying(false)
   }, [repository, sessionID])
   const historyState = view.historyState
   const loadOlder = useCallback(async (): Promise<boolean> => {
@@ -45,6 +57,21 @@ export function useSessionContentHistory(
       if (readAbortRef.current === controller) readAbortRef.current = null
     }
   }, [repository, sessionID])
-  const retry = useCallback(() => repository.retry(sessionID), [repository, sessionID])
-  return { view, historyState, loadOlder, retry }
+  useEffect(() => {
+    if (!retryingRef.current || selectedSessionRef.current !== sessionID) return
+    // A ready resource means the authoritative snapshot/replay barrier
+    // committed. If the snapshot still says recovery_required, the banner is
+    // deliberately retained; that bit is server authority, not UI progress.
+    if (view.availability.status === 'ready' || view.error) {
+      retryingRef.current = false
+      setRetrying(false)
+    }
+  }, [sessionID, view.availability.status, view.error?.code, view.error?.message])
+  const retry = useCallback(() => {
+    if (!sessionID || selectedSessionRef.current !== sessionID || retryingRef.current) return
+    retryingRef.current = true
+    setRetrying(true)
+    repository.retry(sessionID)
+  }, [repository, sessionID])
+  return { view, historyState, loadOlder, retry, retrying }
 }

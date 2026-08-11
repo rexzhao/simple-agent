@@ -27,6 +27,8 @@ export const Conversation = memo(function Conversation(props: {
   admissionPending?: boolean
   compacting: boolean
 	contentAvailability?: DataAvailability
+	refreshError?: DomainReadError
+	refreshing?: boolean
 	historyLoading?: boolean
 	historyError?: DomainReadError
 	draft: ComposerDraft
@@ -224,13 +226,15 @@ export const Conversation = memo(function Conversation(props: {
 		onCancelTool: props.onCancelTool,
 		onContinue: props.onContinue,
 		onRetryRefresh: props.onRetryRefresh,
+		refreshing: props.refreshing,
+		error: props.refreshError,
 		onDismissTurnError: props.onDismissTurnError,
-	}), [canContinueForRows, completedTurns, loadSessionImage, props.activeRun, props.onCancelTool, props.onContinue, props.onDismissTurnError, props.onRetryRefresh, props.sessionID, props.sessionNames, safeDetail?.created_cwd, safeDetail?.interrupted_run_id, safeDetail?.interrupted_turn_id, safeDetail?.running_run_id, safeDetail?.running_turn_id])
+	}), [canContinueForRows, completedTurns, loadSessionImage, props.activeRun, props.onCancelTool, props.onContinue, props.onDismissTurnError, props.onRetryRefresh, props.refreshError, props.refreshing, props.sessionID, props.sessionNames, safeDetail?.created_cwd, safeDetail?.interrupted_run_id, safeDetail?.interrupted_turn_id, safeDetail?.running_run_id, safeDetail?.running_turn_id])
 
 	const conversationEmpty = <div className="conversation-empty"><SparkIcon /><h3>Start a new task</h3><p>Describe a goal, a problem, or the code you want to change.</p></div>
 	const listHeader = (
 		<div className="messages-header-slot">
-			{(props.contentAvailability?.status === 'stale' || props.contentAvailability?.status === 'error') && <div className="sync-status" role="status"><span>Session content is out of date.</span><button onClick={props.onRetryRefresh}>Retry synchronization</button></div>}
+			{(props.contentAvailability?.status === 'stale' || props.contentAvailability?.status === 'error') && <div className="sync-status" role="status"><span>Session content is out of date.</span><button disabled={props.refreshing} onClick={props.onRetryRefresh}>{props.refreshing ? 'Refreshing…' : 'Retry synchronization'}</button></div>}
 			{props.page?.has_more_before
 				? <button className="load-older" disabled={loadingOlder || props.historyLoading} onClick={() => void loadOlder()}>{loadingOlder || props.historyLoading ? 'Loading earlier messages…' : props.historyError ? 'Retry earlier messages' : 'Load earlier messages'}</button>
 				: <span aria-hidden="true" />}
@@ -288,7 +292,7 @@ export const Conversation = memo(function Conversation(props: {
 			rows={conversationRows}
 			header={listHeader}
 			footer={listFooter}
-			emptyPlaceholder={props.contentAvailability?.status === 'error' ? <ContentUnavailable onRetry={props.onRetryRefresh} /> : !props.page ? <MessageSkeleton /> : conversationRows.length === 0 ? conversationEmpty : undefined}
+			emptyPlaceholder={props.contentAvailability?.status === 'error' ? <ContentUnavailable onRetry={props.onRetryRefresh} disabled={props.refreshing} /> : !props.page ? <MessageSkeleton /> : conversationRows.length === 0 ? conversationEmpty : undefined}
 			renderRow={renderRow}
 			followOutput={followOutput}
 			onInteraction={markScrollInteraction}
@@ -327,6 +331,8 @@ export const Conversation = memo(function Conversation(props: {
   previous.admissionPending === next.admissionPending &&
   previous.compacting === next.compacting &&
 	previous.contentAvailability === next.contentAvailability &&
+	previous.refreshError === next.refreshError &&
+	previous.refreshing === next.refreshing &&
 	previous.historyLoading === next.historyLoading &&
 	previous.historyError === next.historyError &&
   previous.draft === next.draft &&
@@ -353,8 +359,8 @@ export const Conversation = memo(function Conversation(props: {
   previous.onCompact === next.onCompact &&
   previous.onToggleFullAccess === next.onToggleFullAccess)
 
-function ContentUnavailable(props: { onRetry: () => void }) {
-	return <div className="conversation-empty"><WarningIcon /><h3>Session content is unavailable</h3><p>The synchronized conversation could not be loaded.</p><button className="secondary-button" onClick={props.onRetry}>Retry</button></div>
+function ContentUnavailable(props: { onRetry: () => void; disabled?: boolean }) {
+	return <div className="conversation-empty"><WarningIcon /><h3>Session content is unavailable</h3><p>The synchronized conversation could not be loaded.</p><button className="secondary-button" disabled={props.disabled} onClick={props.onRetry}>{props.disabled ? 'Refreshing…' : 'Retry'}</button></div>
 }
 
 function ContextUsage(props: { context: Session['context']; activeInputTokens?: number; activeCachedTokens?: number; activeCacheWriteTokens?: number; compactedContextTokens?: number }) {
@@ -450,6 +456,8 @@ type ConversationRowRenderProps = {
 	canContinue: boolean
 	onContinue: () => void
 	onRetryRefresh: () => void
+	refreshing?: boolean
+	error?: DomainReadError
 	onDismissTurnError: () => void
 }
 
@@ -476,7 +484,7 @@ function renderConversationRow(row: ConversationRow, props: ConversationRowRende
 		case 'turn-error':
 			return <TurnErrorRow key={row.key} code={row.code} message={row.message} canContinue={props.canContinue} onContinue={props.onContinue} onDismiss={props.onDismissTurnError} />
 		case 'refresh-error':
-			return <RefreshErrorRow key={row.key} onRetryRefresh={props.onRetryRefresh} />
+			return <RefreshErrorRow key={row.key} onRetryRefresh={props.onRetryRefresh} refreshing={props.refreshing} error={props.error} />
 		case 'interrupted':
 			return <InterruptedRow key={row.key} onDismiss={props.onDismissTurnError} />
 		case 'bottom-spacer':
@@ -770,15 +778,15 @@ function TurnErrorRow({ code, message, canContinue, onContinue, onDismiss }: { c
 	)
 }
 
-function RefreshErrorRow({ onRetryRefresh }: { onRetryRefresh: () => void }) {
+function RefreshErrorRow({ onRetryRefresh, refreshing, error }: { onRetryRefresh: () => void; refreshing?: boolean; error?: DomainReadError }) {
 	return (
 		<div className="turn-error" role="alert">
 			<WarningIcon />
 			<div className="turn-error-copy">
 				<strong>Refresh needed</strong>
-				<p>The session state may be outdated. Refresh to see the latest.</p>
+				<p>{error ? `${error.code}: ${error.message}` : 'The session state may be outdated. Refresh to see the latest.'}</p>
 			</div>
-			<button className="message-tool-button" onClick={onRetryRefresh} title="Refresh session">Refresh</button>
+			<button className="message-tool-button" disabled={refreshing} onClick={onRetryRefresh} title="Refresh session">{refreshing ? 'Refreshing…' : 'Refresh'}</button>
 		</div>
 	)
 }

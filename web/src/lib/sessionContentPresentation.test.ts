@@ -267,7 +267,7 @@ describe('Session Content transient assistant presentation ownership', () => {
     expect(activeRunForConversation(viewWithRun(state), 'session_1')).toBeNull()
   })
 
-  it('maps an active snapshot requiring transient recovery to error_pending_refresh', () => {
+  it('does not turn an active snapshot recovery hint into a Refresh banner', () => {
     const base = viewWithRun({
       runEpoch: 'epoch_1', runID: 'run_1', runCursor: '0', turnID: 'turn_1', status: 'running' as const,
       text: {}, reasoning: {}, tools: {}, stepOrder: [], promptQueue: [], appendedPrompts: [], stale: false, recoveryRequired: false,
@@ -280,6 +280,26 @@ describe('Session Content transient assistant presentation ownership', () => {
         status: 'running', recoverable: true, replay_available: false, recovery_required: true,
       },
     }
-    expect(activeRunForConversation(view, 'session_1')?.status).toBe('error_pending_refresh')
+    expect(activeRunForConversation(view, 'session_1')?.status).toBe('running')
+  })
+
+  it.each([
+    { name: 'without replay', replay_available: false },
+    { name: 'with replay', replay_available: true, run_epoch: 'epoch_1', run_cursor: '2', replay_from_cursor: '1', replay_to_cursor: '2' },
+    { name: 'with an explicit recovery hint', replay_available: false, recovery_required: true },
+    { name: 'with an omitted recovery flag', replay_available: false, omitRecovery: true },
+  ])('does not show Refresh needed for a normal running snapshot ($name)', ({ name: _name, omitRecovery, ...activeOverrides }) => {
+    const base = viewWithRun({
+      runEpoch: 'epoch_1', runID: 'run_1', runCursor: '0', turnID: 'turn_1', status: 'running' as const,
+      text: {}, reasoning: {}, tools: {}, stepOrder: [], promptQueue: [], appendedPrompts: [], stale: false, recoveryRequired: false,
+    })
+    const active = {
+      run_id: 'run_1', session_id: 'session_1', turn_id: 'turn_1', started_at: '2025-01-01T00:00:00Z',
+      status: 'running' as const, recoverable: true,
+      ...activeOverrides,
+      ...(omitRecovery ? {} : { recovery_required: activeOverrides.recovery_required ?? false }),
+    }
+    const view: SessionView = { ...base, runState: undefined, activeRun: active as SessionView['activeRun'] }
+    expect(activeRunForConversation(view, 'session_1')?.status).toBe('running')
   })
 })

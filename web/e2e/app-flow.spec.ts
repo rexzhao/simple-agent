@@ -251,26 +251,68 @@ test('cancels an active run without persisting its transient turn', async ({ pag
   expect(server.snapshotCount({ type: 'session_content', id: session.id })).toBe(1)
 })
 
-test('resyncs a recovered run from durable session history', async ({ page }) => {
-  const recoveredItems = items('Before refresh', 'Recovered answer')
-  const partialItems = [messageItem(1, 'user', 'Before refresh')]
+test('does not show Refresh needed for an active snapshot recovery hint alone', async ({ page }) => {
   const server = await installSyncMock(page, {
     projects: [project], sessions: [session], contents: {
-      [session.id]: { items: partialItems, activeRun: { run_id: 'run-recovered', session_id: session.id, turn_id: 'turn-main', started_at: '2026-01-01T00:00:01Z', status: 'running', recoverable: true, run_epoch: 'epoch', run_cursor: '0', replay_available: false, recovery_required: true } },
+      [session.id]: { activeRun: { run_id: 'run-server-hint', session_id: session.id, turn_id: 'turn-main', started_at: '2026-01-01T00:00:01Z', status: 'running', recoverable: true, run_epoch: 'epoch', run_cursor: '0', replay_available: false, recovery_required: true } },
     },
   })
   await page.goto('/#token=e2e')
-  await expect(page.getByText('Before refresh', { exact: true })).toBeVisible()
+  await expect(page.getByRole('heading', { name: session.display_name })).toBeVisible()
+  await expect(page.getByRole('alert')).toHaveCount(0)
   expect(server.snapshotCount({ type: 'session_content', id: session.id })).toBe(1)
-  // A cursor-2 frame against the recovery-required cursor-0 snapshot is an
-  // actual transient sequence gap. The following snapshot is the only place
-  // where the complete durable history becomes authoritative.
-  server.sendTypedEvent(session.id, 'run-recovered', { type: 'text.delta', run_cursor: '2', turn_id: 'turn-main', agent_iteration: 1, item_id: 'assistant-recovered', delta: 'ignored gap' })
-  server.recoverRunFromSnapshot(session.id, 'run-recovered', recoveredItems)
-  await expect.poll(() => server.snapshotCount({ type: 'session_content', id: session.id })).toBe(2)
-  await expect(page.getByText('Recovered answer', { exact: true })).toBeVisible()
-  server.settleRun(session.id, 'run-recovered', 'committed', recoveredItems)
-  await expect(page.getByLabel('Session status: idle')).toBeVisible()
+})
+
+test('Refresh recovers a resource made stale by a transient cursor gap', async ({ page }) => {
+  const runID = 'run-refresh-gap'
+  const resource = { type: 'session_content', id: session.id }
+  const server = await installSyncMock(page, {
+    projects: [project], sessions: [session], contents: {
+      [session.id]: { activeRun: { run_id: runID, session_id: session.id, turn_id: 'turn-refresh', started_at: '2026-01-01T00:00:00Z', status: 'running', recoverable: true, run_epoch: 'epoch', run_cursor: '0', replay_available: false, recovery_required: false } },
+    },
+  })
+  await page.goto('/#token=e2e')
+  await expect(page.getByRole('heading', { name: session.display_name })).toBeVisible()
+  await expect.poll(() => server.activeSubscriptionID(resource)).toBeTruthy()
+  server.delaySnapshots(resource)
+  server.sendTypedEvent(session.id, runID, { type: 'run.started', run_cursor: '1', status: 'running' })
+  server.sendTypedEvent(session.id, runID, { type: 'text.delta', run_cursor: '2', turn_id: 'turn-refresh', agent_iteration: 1, item_id: 'assistant-gap', delta: 'before gap' })
+  server.sendTypedEvent(session.id, runID, { type: 'text.delta', run_cursor: '4', turn_id: 'turn-refresh', agent_iteration: 1, item_id: 'assistant-gap', delta: 'gap' })
+  const syncStatus = page.getByRole('status').filter({ hasText: 'Session content is out of date.' })
+  await expect(syncStatus).toBeVisible()
+  await syncStatus.getByRole('button', { name: 'Retry synchronization', exact: true }).click()
+  await expect(syncStatus.getByRole('button', { name: 'Refreshing…', exact: true })).toBeVisible()
+  server.releaseSnapshots(resource)
+  await expect.poll(() => server.snapshotCount(resource)).toBe(2)
+  await expect(syncStatus).toHaveCount(0)
+  await expect(page.getByRole('alert')).toHaveCount(0)
+})
+
+test('does not let an in-flight Refresh cross a session switch', async ({ page }) => {
+  const server = await installSyncMock(page, {
+    projects: [project], sessions: [session, secondarySession], contents: {
+      [session.id]: { activeRun: { run_id: 'run-refresh-switch', session_id: session.id, turn_id: 'turn-refresh', started_at: '2026-01-01T00:00:00Z', status: 'running', recoverable: true, run_epoch: 'epoch', run_cursor: '0', replay_available: false, recovery_required: false } },
+    },
+  })
+  await page.goto('/#token=e2e')
+  const resource = { type: 'session_content', id: session.id }
+  await expect.poll(() => server.activeSubscriptionID(resource)).toBeTruthy()
+  server.delaySnapshots(resource)
+  server.sendTypedEvent(session.id, 'run-refresh-switch', { type: 'run.started', run_cursor: '1', status: 'running' })
+  server.sendTypedEvent(session.id, 'run-refresh-switch', { type: 'text.delta', run_cursor: '2', turn_id: 'turn-refresh', agent_iteration: 1, item_id: 'assistant-switch', delta: 'before gap' })
+  server.sendTypedEvent(session.id, 'run-refresh-switch', { type: 'text.delta', run_cursor: '4', turn_id: 'turn-refresh', agent_iteration: 1, item_id: 'assistant-switch', delta: 'gap' })
+  const syncStatus = page.getByRole('status').filter({ hasText: 'Session content is out of date.' })
+  await expect(syncStatus).toBeVisible()
+  const oldSubscriptionID = server.activeSubscriptionID(resource)
+  await syncStatus.getByRole('button', { name: 'Retry synchronization', exact: true }).click()
+  await expect(syncStatus.getByRole('button', { name: 'Refreshing…', exact: true })).toBeVisible()
+
+  await page.getByText(secondarySession.display_name, { exact: true }).click()
+  await expect(page.getByRole('heading', { name: secondarySession.display_name })).toBeVisible()
+  await expect.poll(() => oldSubscriptionID ? server.isSubscriptionActive(oldSubscriptionID) : false).toBe(false)
+  await expect.poll(() => server.snapshotCount({ type: 'session_content', id: secondarySession.id })).toBe(1)
+  await expect(page.getByRole('alert')).toHaveCount(0)
+  server.releaseSnapshots(resource)
 })
 
 test('renames sessions and projects and confirms project-wide deletion', async ({ page }) => {
