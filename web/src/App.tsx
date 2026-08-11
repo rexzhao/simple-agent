@@ -61,6 +61,24 @@ function runMutationErrorMessage(reason: unknown): string {
 
 const runAuthorityResyncMessage = 'Run accepted; automatic synchronization is in progress.'
 
+function firstActiveRootSessionID(index: SessionIndexReadModel | undefined): string {
+  return index?.active.find((summary) => !summary.parent_session_id)?.session_id ?? ''
+}
+
+function rootSessionID(sessions: readonly SessionNavigation[], sessionID: string): string {
+  const byID = new Map(sessions.map((session) => [session.id, session]))
+  let current = byID.get(sessionID)
+  if (!current) return ''
+  const seen = new Set<string>()
+  while (current.parent_session_id && !seen.has(current.id)) {
+    seen.add(current.id)
+    const parent = byID.get(current.parent_session_id)
+    if (!parent) break
+    current = parent
+  }
+  return current.id
+}
+
 function providerOperationErrorMessage(reason: unknown, operation: 'save' | 'default' | 'discover' | 'login' | 'logout'): string {
   if (reason && typeof reason === 'object' && 'code' in reason) {
     const code = String((reason as { code?: unknown }).code)
@@ -97,6 +115,10 @@ function App() {
   const [viewingSessionID, setViewingSessionID] = useState('')
   const viewingSessionIDRef = useRef(viewingSessionID)
   viewingSessionIDRef.current = viewingSessionID
+  // A child selected from the floating panel may be viewed while the root
+  // remains selected in the rail. This ref prevents the normal tree-selection
+  // effect from replacing an explicit child view during a root change.
+  const preserveViewingForSelectedSessionIDRef = useRef('')
   const projectObservationControllersRef = useRef(new Set<AbortController>())
   const sessionObservationControllersRef = useRef(new Set<AbortController>())
   const [error, setError] = useState('')
@@ -224,16 +246,16 @@ function App() {
       nextID = nextProject?.id ?? ''
       selectedProjectPositionRef.current = Math.max(0, Math.min(oldIndex, Math.max(0, projects.length - 1)))
       setSelectedProjectID(nextID)
-      setSelectedSessionID(nextID ? sessionIndexes[nextID]?.active[0]?.session_id ?? '' : '')
+      setSelectedSessionID(nextID ? firstActiveRootSessionID(sessionIndexes[nextID]) : '')
     }
     if (nextID) {
       const nextPosition = projects.findIndex((project) => project.id === nextID)
       if (nextPosition >= 0) selectedProjectPositionRef.current = nextPosition
     }
     const selectedIndex = nextID ? sessionIndexes[nextID] : undefined
-    const selectedStillActive = Boolean(selectedIndex?.active.some((summary) => summary.session_id === selectedSessionIDRef.current))
+    const selectedStillActive = Boolean(selectedIndex?.active.some((summary) => !summary.parent_session_id && summary.session_id === selectedSessionIDRef.current))
     if (nextID && !selectedStillActive && selectedIndex?.status !== 'loading') {
-      setSelectedSessionID(selectedIndex?.active[0]?.session_id ?? '')
+      setSelectedSessionID(firstActiveRootSessionID(selectedIndex))
     }
     if (projects.length === 0) {
       if (!projectFormUserOpenedRef.current) {
@@ -306,10 +328,10 @@ function App() {
         ? currentProject.id
         : authoritativeProjects[0]?.id ?? ''
       const firstIndex = firstProjectID ? sessionIndexRepository.getProjectReadModel(firstProjectID) : undefined
-      const selectedStillVisible = Boolean(firstIndex?.active.some((summary) => summary.session_id === currentSessionID))
+      const selectedStillVisible = Boolean(firstIndex?.active.some((summary) => !summary.parent_session_id && summary.session_id === currentSessionID))
       const firstSessionID = preserveSelection && currentProject && selectedStillVisible
         ? currentSessionID
-        : firstIndex?.active[0]?.session_id ?? ''
+        : firstActiveRootSessionID(firstIndex)
       setBootstrap(bootstrapPayload)
       // Bootstrap is a recovery hint, not a late authority for user
       // selection. The first project/session effect already makes a
@@ -347,7 +369,14 @@ function App() {
   // follows it so that normal navigation (tree click, bootstrap, create) keeps
   // the conversation panel in sync. The sub-panel can then override it without
   // disturbing the tree's selected highlight.
-  useEffect(() => { setViewingSessionID(selectedSessionID) }, [selectedSessionID])
+  useEffect(() => {
+    if (preserveViewingForSelectedSessionIDRef.current === selectedSessionID) {
+      preserveViewingForSelectedSessionIDRef.current = ''
+      return
+    }
+    preserveViewingForSelectedSessionIDRef.current = ''
+    setViewingSessionID(selectedSessionID)
+  }, [selectedSessionID])
   useEffect(() => { currentSession.set(viewingSessionID || null) }, [currentSession, viewingSessionID])
 
   // Completion notices are a page read-model derived from Session Index
@@ -547,7 +576,7 @@ function App() {
   const selectProject = useCallback((projectID: string) => {
     selectedProjectPositionRef.current = Math.max(0, projects.findIndex((project) => project.id === projectID))
     setSelectedProjectID(projectID)
-    setSelectedSessionID(sessionIndexes[projectID]?.active[0]?.session_id ?? '')
+    setSelectedSessionID(firstActiveRootSessionID(sessionIndexes[projectID]))
     projectFormUserOpenedRef.current = false
     autoProjectFormRef.current = false
     setShowProjectForm(false)
@@ -662,8 +691,8 @@ function App() {
       await sessionCommands.archive(session.id)
       await waitForSessionAuthority(session.project_id, (next) => next.summaries.some((summary) => summary.session_id === session.id && summary.archived))
       if (selectedSessionRef.current === session.id) {
-        const next = sessionIndexRepository.getProjectReadModel(session.project_id).active[0]
-        setSelectedSessionID(next?.session_id ?? '')
+        const nextID = firstActiveRootSessionID(sessionIndexRepository.getProjectReadModel(session.project_id))
+        setSelectedSessionID(nextID)
       }
     } catch (reason) { setError(sessionMutationErrorMessage(reason)) }
   }, [isAdmissionPending, sessionIndexRepository, sessionIndexes, selectedSessionRef, sessionCommands, setSelectedSessionID, waitForSessionAuthority])
@@ -673,10 +702,18 @@ function App() {
       await sessionCommands.restore(session.id)
       await waitForSessionAuthority(session.project_id, (index) => index.active.some((summary) => summary.session_id === session.id))
       setSelectedProjectID(session.project_id)
-      setSelectedSessionID(session.id)
+      // Child sessions are selected from the floating panel and must not
+      // become a left-rail selection. Keep the root selected while showing
+      // the restored child in the conversation.
+      const index = sessionIndexRepository.getProjectReadModel(session.project_id)
+      const knownSessions = [...index.active, ...index.archived].map(navigationSession)
+      const rootID = rootSessionID(knownSessions, session.id) || firstActiveRootSessionID(index) || session.id
+      if (rootID !== selectedSessionIDRef.current) preserveViewingForSelectedSessionIDRef.current = rootID
+      setSelectedSessionID(rootID)
+      setViewingSessionID(session.parent_session_id ? session.id : rootID)
       setShowProjectForm(false)
     } catch (reason) { setError(sessionMutationErrorMessage(reason)) }
-  }, [sessionCommands, setSelectedProjectID, setSelectedSessionID, waitForSessionAuthority])
+  }, [sessionCommands, sessionIndexRepository, setSelectedProjectID, setSelectedSessionID, waitForSessionAuthority])
 
   const deleteSession = useCallback(async (session: SessionNavigation) => {
     const index = sessionIndexes[session.project_id]
@@ -704,10 +741,19 @@ function App() {
       }
       await sessionCommands.deleteSession(session.id)
       await waitForSessionAuthority(session.project_id, (next) => !next.summaries.some((summary) => subtreeIDs.includes(summary.session_id)))
-      if (subtreeIDs.includes(selectedSessionRef.current)) {
-        const next = sessionIndexRepository.getProjectReadModel(session.project_id).active[0]
+      if (subtreeIDs.includes(viewingSessionIDRef.current)) {
+        const nextIndex = sessionIndexRepository.getProjectReadModel(session.project_id)
+        const remainingSessions = [...nextIndex.active, ...nextIndex.archived].map(navigationSession)
+        const nextRootID = firstActiveRootSessionID(nextIndex)
+        const parent = session.parent_session_id
+          ? remainingSessions.find((item) => item.id === session.parent_session_id)
+          : undefined
+        const fallbackID = parent && !parent.archived ? parent.id : nextRootID
+        const nextSelectedRootID = rootSessionID(remainingSessions, fallbackID) || nextRootID
         setSelectedProjectID(session.project_id)
-        setSelectedSessionID(next?.session_id ?? '')
+        if (nextSelectedRootID !== selectedSessionIDRef.current) preserveViewingForSelectedSessionIDRef.current = nextSelectedRootID
+        setSelectedSessionID(nextSelectedRootID)
+        setViewingSessionID(fallbackID || nextSelectedRootID)
       }
     } catch (reason) {
       // Once archive authority is known, an explicit later command failure is
@@ -732,7 +778,7 @@ function App() {
       }
       setError(sessionMutationErrorMessage(reason))
     }
-  }, [isAdmissionPending, sessionIndexRepository, sessionIndexes, selectedSessionRef, sessionCommands, setSelectedProjectID, setSelectedSessionID, waitForSessionAuthority])
+  }, [isAdmissionPending, sessionIndexRepository, sessionIndexes, sessionCommands, setSelectedProjectID, setSelectedSessionID, waitForSessionAuthority, viewingSessionIDRef])
 
   // Session Index owns navigation metadata. Session Content owns the selected
   // run projection; reconnect and replay are handled by the single sync
@@ -949,7 +995,10 @@ function App() {
     .flatMap((index) => index.summaries)
     .find((summary) => summary.session_id === viewingSessionID)
   const selectedProjectSessions = selectedProjectID
-    ? (sessionIndexes[selectedProjectID]?.active.map(navigationSession) ?? [])
+    ? [
+        ...(sessionIndexes[selectedProjectID]?.active.map(navigationSession) ?? []),
+        ...(sessionIndexes[selectedProjectID]?.archived.map(navigationSession) ?? []),
+      ]
     : []
   const subPanelContext = viewingSessionID ? sessionSubPanelContext(selectedProjectSessions, viewingSessionID) : null
   // session_content subscription_event is the opened session's transient
@@ -1041,6 +1090,7 @@ function App() {
           onSelectSession={(sessionID) => setViewingSessionID(sessionID)}
           onRenameSession={renameSession}
           onArchiveSession={archiveSession}
+          onRestoreSession={restoreSession}
           onDeleteSession={deleteSession}
         />
       )}

@@ -279,6 +279,18 @@ func (e *sessionToolExecutor) Execute(ctx context.Context, name string, argument
 	if e == nil || e.service == nil {
 		return sessionToolError(name, "service_unavailable", "session service is not configured")
 	}
+	// All session operations other than model discovery are scoped to a live
+	// caller.  Re-read the caller instead of trusting the run's captured
+	// metadata so archiving its root takes effect immediately for already
+	// running agent code.  Fail closed with the same generic response used for
+	// an unknown target; the caller's archived state is not disclosed.
+	if name != ToolSessionModels && IsSessionTool(name) {
+		caller, err := e.service.GetSession(e.caller.ID)
+		if err != nil || caller.Archived {
+			result, _ := sessionToolError(name, "session_not_found", "session was not found")
+			return result, nil
+		}
+	}
 	switch name {
 	case ToolSessionModels:
 		return e.models(name)
@@ -396,8 +408,38 @@ func (e *sessionToolExecutor) start(toolName string, arguments map[string]any) (
 	if err != nil {
 		return sessionToolFailure(toolName, err)
 	}
-	run, err := e.coordinator.Start(child.ID, SessionMessageInput{Content: prompt}, nil)
+	input := SessionMessageInput{Content: prompt}
+	var run *CoordinatedSessionRun
+	if e.coordinator.options.DurableAdmitter != nil {
+		// The production coordinator has a store-backed admission boundary. Use
+		// it for agent-created children as well, so an archive between child
+		// creation and run start is rejected before this tool can return the
+		// child identity. The run id is intentionally fresh: session_start is
+		// not an idempotent command, but its admission still needs a durable
+		// archive/active-run decision.
+		runID, runIDErr := newServiceRunID()
+		if runIDErr != nil {
+			return sessionToolFailure(toolName, runIDErr)
+		}
+		var admission DurableRunAdmission
+		run, admission, err = e.coordinator.StartDurable(child.ID, input, runID, runID, nil)
+		if err == nil && run == nil && !admission.Created {
+			return sessionToolErrorFields(toolName, sessionToolErrorCode(ErrSessionBusy), safeSessionToolError(ErrSessionBusy), map[string]any{
+				"session_id": child.ID,
+				"created":    true,
+				"on_settle":  onSettle,
+			})
+		}
+	} else {
+		run, err = e.coordinator.Start(child.ID, input, nil)
+	}
 	if err != nil {
+		if errors.Is(err, ErrSessionArchived) {
+			// The child may have been created just before its root was archived.
+			// Do not return the created id or any other state that would turn this
+			// race into an existence oracle.
+			return sessionToolError(toolName, "session_not_found", "session was not found")
+		}
 		code := sessionToolErrorCode(err)
 		return sessionToolErrorFields(toolName, code, safeSessionToolError(err), map[string]any{
 			"session_id": child.ID,
@@ -452,8 +494,7 @@ func (e *sessionToolExecutor) search(toolName string, arguments map[string]any) 
 			return sessionToolError(toolName, "invalid_arguments", fmt.Sprintf("statuses contains unknown status %q", status))
 		}
 	}
-	includeArchived, err := optionalSessionBool(arguments, "include_archived", false)
-	if err != nil {
+	if _, err := optionalSessionBool(arguments, "include_archived", false); err != nil {
 		return sessionToolError(toolName, "invalid_arguments", err.Error())
 	}
 	limit, err := optionalSessionIntegerInRange(arguments, "limit", 0, 1, maximumSessionSearchLimit)
@@ -461,10 +502,13 @@ func (e *sessionToolExecutor) search(toolName string, arguments map[string]any) 
 		return sessionToolError(toolName, "invalid_arguments", err.Error())
 	}
 	result, err := e.service.SearchSessions(SessionSearchOptions{
-		ProjectID:       e.caller.ProjectID,
-		NameRegex:       pattern,
-		Statuses:        statuses,
-		IncludeArchived: includeArchived,
+		ProjectID: e.caller.ProjectID,
+		NameRegex: pattern,
+		Statuses:  statuses,
+		// The tool boundary never exposes archived sessions.  Keep the service
+		// option for non-tool callers that need an archive view, but do not let
+		// include_archived turn into a session existence oracle here.
+		IncludeArchived: false,
 		Limit:           limit,
 	})
 	if err != nil {
@@ -568,9 +612,6 @@ func (e *sessionToolExecutor) send(toolName string, arguments map[string]any) (m
 	target, result, ok := e.targetFromArguments(toolName, arguments)
 	if !ok {
 		return result, nil
-	}
-	if target.Archived {
-		return sessionToolError(toolName, "session_archived", "archived session cannot receive messages")
 	}
 	message, err := requiredRawSessionString(arguments, "message")
 	if err != nil {
@@ -784,6 +825,12 @@ func (e *sessionToolExecutor) targetFromArguments(toolName string, arguments map
 		result, _ := sessionToolFailure(toolName, err)
 		return SessionDetail{}, result, false
 	}
+	if target.Archived {
+		// Archive state is checked before project scope so an archived target
+		// cannot be distinguished by probing another project.
+		result, _ := sessionToolError(toolName, "session_not_found", "session was not found")
+		return SessionDetail{}, result, false
+	}
 	if target.ProjectID != e.caller.ProjectID {
 		result, _ := sessionToolError(toolName, "session_forbidden", "target session is outside the current project")
 		return SessionDetail{}, result, false
@@ -820,6 +867,8 @@ func sessionToolFailure(toolName string, err error) (model.ToolResult, error) {
 func sessionToolErrorCode(err error) string {
 	switch {
 	case errors.Is(err, sessions.ErrNotFound):
+		return "session_not_found"
+	case errors.Is(err, ErrSessionArchived):
 		return "session_not_found"
 	case errors.Is(err, ErrSessionNotSteerable):
 		return "session_not_steerable"

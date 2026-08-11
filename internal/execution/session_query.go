@@ -99,16 +99,22 @@ func (s *Service) SearchSessions(options SessionSearchOptions) (SessionSearchRes
 		}
 	}
 
-	states, err := s.sessionStore.ListStates(sessions.V2ListOptions{
-		Archived: options.IncludeArchived,
-		All:      options.IncludeArchived,
-	})
+	// Load the complete project-local forest so archive state inherited from a
+	// root is reflected in search results. The service API keeps its explicit
+	// IncludeArchived view for the UI, while the session-tool boundary forces
+	// that option off because archived sessions are never tool targets.
+	states, err := s.sessionStore.ListStates(sessions.V2ListOptions{All: true})
 	if err != nil {
 		return SessionSearchResult{}, err
 	}
+	effectiveArchived := computeEffectiveArchived(states)
 	result := SessionSearchResult{Matches: []SessionSearchMatch{}}
 	for _, session := range states {
 		if session.ProjectID != project.ID {
+			continue
+		}
+		isArchived := effectiveArchived[session.ID]
+		if isArchived && !options.IncludeArchived {
 			continue
 		}
 		name := CanonicalSessionName(session.ID, session.DisplayName)
@@ -116,6 +122,7 @@ func (s *Service) SearchSessions(options SessionSearchOptions) (SessionSearchRes
 			continue
 		}
 		metadata := sessionMetadataFromStore(session)
+		metadata.Archived = isArchived
 		if len(statuses) > 0 {
 			if _, ok := statuses[metadata.Status]; !ok {
 				continue

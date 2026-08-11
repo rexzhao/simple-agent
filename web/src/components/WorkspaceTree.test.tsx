@@ -46,8 +46,10 @@ function renderTree(sessions: Session[], runningSessionIDs: ReadonlySet<string> 
     updated_at: item.updated_at,
     has_unread_result: false,
   }))
+  const active = summaries.filter((summary) => !summary.archived)
+  const archived = summaries.filter((summary) => summary.archived)
   const sessionIndexes: Record<string, SessionIndexReadModel> = {
-    [project.id]: { status: 'ready', summaries, active: summaries, archived: [] },
+    [project.id]: { status: 'ready', summaries, active, archived },
   }
   render(<WorkspaceTree
     projects={[project]}
@@ -84,6 +86,18 @@ describe('WorkspaceTree session list', () => {
 
     expect(screen.getByText('Root')).not.toBeNull()
     expect(screen.queryByText('Child')).toBeNull()
+  })
+
+  it('keeps archived children out of the project rail', () => {
+    const root = session('root', 'Root')
+    const archivedChild = session('archived-child', 'Archived child', {
+      created_by: 'agent', parent_session_id: root.id, root_session_id: root.id, spawn_depth: 1, archived: true,
+    })
+    renderTree([root, archivedChild])
+
+    expect(screen.getByText('Root')).not.toBeNull()
+    expect(screen.queryByText('Archived child')).toBeNull()
+    expect(screen.queryByRole('button', { name: /Archived \(1\)/ })).toBeNull()
   })
 
   it('keeps a running root visible when it is outside the collapsed top three', () => {

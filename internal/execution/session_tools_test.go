@@ -692,6 +692,150 @@ func TestSessionHistoryAlignTurn(t *testing.T) {
 	}
 }
 
+func TestSessionToolsRejectArchivedChildAcrossReadAndControlOperations(t *testing.T) {
+	service, parent, child, outside := newSessionToolTestSessions(t, t.TempDir(), fakeExecutionTurnRunner{supports: true})
+	if _, err := service.ArchiveSession(child.ID); err != nil {
+		t.Fatalf("ArchiveSession(child) error = %v", err)
+	}
+	if _, err := service.ArchiveSession(outside.ID); err != nil {
+		t.Fatalf("ArchiveSession(outside) error = %v", err)
+	}
+	executor := &sessionToolExecutor{service: service, caller: parent}
+
+	for _, tool := range []string{ToolSessionGet, ToolSessionHistory, ToolSessionSend, ToolSessionWait, ToolSessionStop} {
+		arguments := map[string]any{"session_id": child.ID}
+		if tool == ToolSessionSend {
+			arguments["mode"] = "queue"
+			arguments["message"] = "should not arrive"
+		}
+		result := executeSessionTool(t, executor, tool, arguments)
+		assertSessionToolErrorCode(t, result, "session_not_found")
+		if strings.Contains(result.Content, child.ID) {
+			t.Fatalf("%s leaked archived child id: %s", tool, result.Content)
+		}
+	}
+	crossProject := executeSessionTool(t, executor, ToolSessionGet, map[string]any{"session_id": outside.ID})
+	assertSessionToolErrorCode(t, crossProject, "session_not_found")
+	if strings.Contains(crossProject.Content, outside.ID) {
+		t.Fatalf("cross-project archived target leaked id: %s", crossProject.Content)
+	}
+	search := executeSessionTool(t, executor, ToolSessionSearch, map[string]any{
+		"name_regex": ".*", "include_archived": true,
+	})
+	searchPayload := decodeSessionToolPayload(t, search)
+	for _, match := range searchPayload["matches"].([]any) {
+		if match.(map[string]any)["id"] == child.ID {
+			t.Fatalf("archived child appeared in search matches: %#v", searchPayload["matches"])
+		}
+	}
+}
+
+type archiveBeforeSessionRunLookup struct {
+	service  *Service
+	parentID string
+	once     sync.Once
+	err      error
+}
+
+func (admitter *archiveBeforeSessionRunLookup) LookupSessionRun(ctx context.Context, sessionID string, input SessionMessageInput, runID, fingerprint string) (DurableRunAdmission, bool, error) {
+	admitter.once.Do(func() {
+		_, admitter.err = admitter.service.ArchiveSession(admitter.parentID)
+	})
+	if admitter.err != nil {
+		return DurableRunAdmission{}, false, admitter.err
+	}
+	return admitter.service.LookupSessionRun(ctx, sessionID, input, runID, fingerprint)
+}
+
+func (admitter *archiveBeforeSessionRunLookup) AdmitSessionRun(ctx context.Context, sessionID string, input SessionMessageInput, runID, fingerprint string) (DurableRunAdmission, error) {
+	return admitter.service.AdmitSessionRun(ctx, sessionID, input, runID, fingerprint)
+}
+
+func (admitter *archiveBeforeSessionRunLookup) FailAdmittedSessionRun(ctx context.Context, sessionID, runID string) error {
+	return admitter.service.FailAdmittedSessionRun(ctx, sessionID, runID)
+}
+
+func TestSessionStartDoesNotExposeChildWhenRootArchivesBeforeAdmission(t *testing.T) {
+	service, parent, _, _ := newSessionToolTestSessions(t, t.TempDir(), fakeExecutionTurnRunner{supports: true})
+	admitter := &archiveBeforeSessionRunLookup{service: service, parentID: parent.ID}
+	coordinator := NewSessionRunCoordinator(context.Background(), service, SessionRunCoordinatorOptions{DurableAdmitter: admitter})
+	service.SetSessionRunCoordinator(coordinator)
+	defer func() {
+		service.ClearSessionRunCoordinator(coordinator)
+		coordinator.Close()
+	}()
+	executor := &sessionToolExecutor{service: service, coordinator: coordinator, caller: parent}
+
+	result := executeSessionTool(t, executor, ToolSessionStart, map[string]any{"prompt": "must not start"})
+	assertSessionToolErrorCode(t, result, "session_not_found")
+	if strings.Contains(result.Content, "session_id") {
+		t.Fatalf("archive-raced session_start leaked child identity: %s", result.Content)
+	}
+}
+
+func TestSessionToolsRejectDescendantOfArchivedRootEvenWhenChildFlagIsClear(t *testing.T) {
+	service, parent, child, _ := newSessionToolTestSessions(t, t.TempDir(), fakeExecutionTurnRunner{supports: true})
+	liveCaller, err := service.CreateSession(parent.ProjectID, SessionCreateMetadata{
+		CreatedCWD: parent.CreatedCWD, Provider: parent.Provider, ModelProfile: parent.ModelProfile, ModelID: parent.ModelID,
+	})
+	if err != nil {
+		t.Fatalf("CreateSession(live caller) error = %v", err)
+	}
+	if _, err := service.ArchiveSession(parent.ID); err != nil {
+		t.Fatalf("ArchiveSession(root) error = %v", err)
+	}
+	rawChild, err := service.sessionStore.LoadState(child.ID)
+	if err != nil {
+		t.Fatalf("LoadState(child) error = %v", err)
+	}
+	if rawChild.Archived {
+		t.Fatal("root archive unexpectedly set the child's own archived flag")
+	}
+	childDetail, err := service.GetSession(child.ID)
+	if err != nil {
+		t.Fatalf("GetSession(child) error = %v", err)
+	}
+	if !childDetail.Archived {
+		t.Fatal("child is not effectively archived through its root")
+	}
+
+	executor := &sessionToolExecutor{service: service, caller: liveCaller}
+	for _, tool := range []string{ToolSessionGet, ToolSessionHistory, ToolSessionSend, ToolSessionWait, ToolSessionStop} {
+		arguments := map[string]any{"session_id": child.ID}
+		if tool == ToolSessionSend {
+			arguments["mode"] = "queue"
+			arguments["message"] = "should not arrive"
+		}
+		result := executeSessionTool(t, executor, tool, arguments)
+		assertSessionToolErrorCode(t, result, "session_not_found")
+		if strings.Contains(result.Content, child.ID) {
+			t.Fatalf("%s leaked descendant of archived root id: %s", tool, result.Content)
+		}
+	}
+	search := executeSessionTool(t, executor, ToolSessionSearch, map[string]any{
+		"name_regex": ".*", "include_archived": true,
+	})
+	for _, match := range decodeSessionToolPayload(t, search)["matches"].([]any) {
+		if match.(map[string]any)["id"] == child.ID {
+			t.Fatalf("archived-root descendant appeared in search matches: %#v", match)
+		}
+	}
+
+	// A stale executor whose caller belongs to the archived root cannot start
+	// another child, even though its captured detail still says it is active.
+	staleCaller := &sessionToolExecutor{service: service, caller: parent}
+	start := executeSessionTool(t, staleCaller, ToolSessionStart, map[string]any{"prompt": "must be rejected"})
+	assertSessionToolErrorCode(t, start, "session_not_found")
+
+	_, err = service.CreateSession(parent.ProjectID, SessionCreateMetadata{
+		ParentSessionID: parent.ID, CreatedCWD: parent.CreatedCWD,
+		Provider: parent.Provider, ModelProfile: parent.ModelProfile, ModelID: parent.ModelID,
+	})
+	if !errors.Is(err, ErrSessionArchived) {
+		t.Fatalf("CreateSession(archived parent) error = %v, want ErrSessionArchived", err)
+	}
+}
+
 // Agents started before the cursor/direction contract still call with the
 // retired before_seq/after_seq pair; the conflict error must teach the
 // current contract so the next call self-corrects.

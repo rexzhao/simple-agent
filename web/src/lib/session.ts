@@ -124,8 +124,10 @@ export function flattenSessionTree<T extends SessionNavigation>(nodes: SessionTr
 export interface SessionSubPanelContext<T extends SessionNavigation = SessionNavigation> {
   /** The parent session shown at the top of the sub-panel. */
   parent: T
-  /** Direct children sorted newest-first by creation time. */
+  /** Unarchived direct children sorted newest-first by creation time. */
   children: T[]
+  /** Archived direct children, kept separate from the active list. */
+  archivedChildren?: T[]
 }
 
 /**
@@ -133,8 +135,9 @@ export interface SessionSubPanelContext<T extends SessionNavigation = SessionNav
  *
  * If the selected session has children, it is the parent. If it is itself a
  * child, its parent is the parent and its siblings (including itself) are the
- * children. Returns null when the selected session has no parent and no
- * children, meaning there is nothing to show in the sub-panel.
+ * children. Archived children are returned separately so the presentation can
+ * keep them out of the active list. Returns null when the selected session has
+ * no parent and no children, meaning there is nothing to show in the sub-panel.
  */
 export function sessionSubPanelContext<T extends SessionNavigation>(sessions: readonly T[], selectedID: string): SessionSubPanelContext<T> | null {
   const selected = sessions.find((s) => s.id === selectedID)
@@ -144,9 +147,13 @@ export function sessionSubPanelContext<T extends SessionNavigation>(sessions: re
   const effectiveParent = parent ?? selected
   const children = sessions
     .filter((s) => s.parent_session_id === effectiveParent.id)
+    .filter((s) => !effectiveParent.archived && !s.archived)
     .sort((a, b) => new Date(b.created_at || b.updated_at).getTime() - new Date(a.created_at || a.updated_at).getTime())
-  if (children.length === 0) return null
-  return { parent: effectiveParent, children }
+  const archivedChildren = sessions
+    .filter((s) => s.parent_session_id === effectiveParent.id && (effectiveParent.archived || s.archived))
+    .sort((a, b) => new Date(b.created_at || b.updated_at).getTime() - new Date(a.created_at || a.updated_at).getTime())
+  if (children.length === 0 && archivedChildren.length === 0) return null
+  return { parent: effectiveParent, children, archivedChildren }
 }
 
 /**

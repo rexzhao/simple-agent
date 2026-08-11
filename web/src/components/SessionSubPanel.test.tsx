@@ -3,7 +3,7 @@ import { cleanup, fireEvent, render, screen } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { Session } from '../types'
 import { SessionSubPanel } from './SessionSubPanel'
-import type { SessionSubPanelContext } from '../lib/session'
+import { sessionSubPanelContext, type SessionSubPanelContext } from '../lib/session'
 
 function session(id: string, name: string, options: Partial<Session> = {}): Session {
   return {
@@ -36,6 +36,7 @@ function renderPanel(ctx: SessionSubPanelContext, viewingID: string, runningIDs:
     onSelectSession={onSelectSession}
     onRenameSession={vi.fn()}
     onArchiveSession={vi.fn()}
+    onRestoreSession={vi.fn()}
     onDeleteSession={vi.fn()}
   />)
   return onSelectSession
@@ -117,5 +118,52 @@ describe('SessionSubPanel', () => {
 
     const childTab = tabByLabel('Child 1').closest('button')
     expect(childTab?.querySelector('.status-dot.running')).not.toBeNull()
+  })
+
+  it('keeps archived children in a collapsed group with restore and delete actions', () => {
+    const parent = session('parent', 'Parent')
+    const activeChild = session('active-child', 'Active child', { parent_session_id: 'parent', root_session_id: 'parent', spawn_depth: 1 })
+    const archivedChild = session('archived-child', 'Archived child', { parent_session_id: 'parent', root_session_id: 'parent', spawn_depth: 1, archived: true })
+    const onRestore = vi.fn()
+    const onDelete = vi.fn()
+    render(<SessionSubPanel
+      context={{ parent, children: [activeChild], archivedChildren: [archivedChild] }}
+      viewingSessionID="parent"
+      runningSessionIDs={new Set()}
+      onSelectSession={vi.fn()}
+      onRenameSession={vi.fn()}
+      onArchiveSession={vi.fn()}
+      onRestoreSession={onRestore}
+      onDeleteSession={onDelete}
+    />)
+
+    expect(tabByLabel('Active child')).not.toBeNull()
+    expect(screen.queryByText('Archived child', { selector: '.sub-panel-tab-label' })).toBeNull()
+    const archivedToggle = screen.getByRole('button', { name: /Archived \(1\)/ })
+    expect(archivedToggle.getAttribute('aria-expanded')).toBe('false')
+
+    fireEvent.click(archivedToggle)
+    expect(screen.getByText('Archived child', { selector: '.sub-panel-tab-label' })).not.toBeNull()
+    fireEvent.click(screen.getByRole('button', { name: 'Restore Archived child' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Delete Archived child' }))
+    expect(onRestore).toHaveBeenCalledWith(archivedChild)
+    expect(onDelete).toHaveBeenCalledWith(archivedChild)
+  })
+
+  it('does not offer child restore while the root is archived', () => {
+    const parent = session('archived-parent', 'Archived parent', { archived: true })
+    const descendant = session('descendant', 'Descendant', {
+      parent_session_id: parent.id, root_session_id: parent.id, spawn_depth: 1, archived: false,
+    })
+    const context = sessionSubPanelContext([parent, descendant], parent.id)
+    expect(context?.children).toEqual([])
+    expect(context?.archivedChildren).toEqual([descendant])
+
+    renderPanel(context!, parent.id)
+    fireEvent.click(screen.getByRole('button', { name: /Archived \(1\)/ }))
+    const restore = screen.getByRole('button', { name: 'Restore Descendant' })
+    expect(restore.hasAttribute('disabled')).toBe(true)
+    expect(restore.getAttribute('title')).toBe('Restore the root session first')
+    expect(screen.getByRole('button', { name: 'Delete Descendant' })).not.toBeNull()
   })
 })

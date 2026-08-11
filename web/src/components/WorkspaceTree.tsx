@@ -1,7 +1,7 @@
 import { memo, useState } from 'react'
 import type { ProjectSummary } from '../repositories/projectIndex'
 import type { SessionIndexReadModel } from '../repositories/sessionIndex'
-import { ancestorSessionIDs, buildSessionTree, flattenSessionTree, navigationSession, projectName, sessionName, sessionTreeContains, type SessionNavigation } from '../lib/session'
+import { ancestorSessionIDs, navigationSession, projectName, sessionName, type SessionNavigation } from '../lib/session'
 import { relativeTime } from '../lib/format'
 import { ArchiveIcon, ChatIcon, ChevronIcon, EditIcon, LogoIcon, PlusIcon, RestoreIcon, SettingsIcon, TrashIcon } from './icons'
 
@@ -94,24 +94,29 @@ export const WorkspaceTree = memo(function WorkspaceTree(props: {
           const index = props.sessionIndexes[project.id]
           const sessions = index?.active.map(navigationSession) ?? []
           const archivedSessions = index?.archived.map(navigationSession) ?? []
-          const sessionRoots = buildSessionTree(sessions)
-          const archivedSessionRoots = buildSessionTree(archivedSessions)
+          // The rail is deliberately a root-session navigation surface. Child
+          // sessions, including archived children, belong only to the
+          // floating SessionSubPanel.
+          const sessionRoots = sessions.filter((session) => !session.parent_session_id)
+          const archivedSessionRoots = archivedSessions.filter((session) => !session.parent_session_id)
           const expanded = expandedProjects.has(project.id)
           const archivedExpanded = expandedArchivedProjects.has(project.id)
           const attentionSessionIDs = new Set(props.runningSessionIDs)
           if (props.selectedProjectID === project.id && props.selectedSessionID) attentionSessionIDs.add(props.selectedSessionID)
-          const collapsedRoots = new Set(sessionRoots.slice(0, 3).map((node) => node.session.id))
+          const attentionAncestors = ancestorSessionIDs(sessions, attentionSessionIDs)
+          for (const sessionID of attentionAncestors) attentionSessionIDs.add(sessionID)
+          const collapsedRoots = new Set(sessionRoots.slice(0, 3).map((session) => session.id))
           const visibleRoots = expanded
             ? sessionRoots
-            : sessionRoots.filter((node) => collapsedRoots.has(node.session.id) || sessionTreeContains(node, attentionSessionIDs))
-          const hiddenSessionCount = sessions.length - flattenSessionTree(visibleRoots).length
+            : sessionRoots.filter((session) => collapsedRoots.has(session.id) || attentionSessionIDs.has(session.id))
+          const hiddenSessionCount = sessionRoots.length - visibleRoots.length
           return (
             <section className="project-tree-group" key={project.id}>
               <div className={`project-tree-header ${project.id === props.selectedProjectID ? 'selected' : ''}`}>
                 <button className="project-node" onClick={() => props.onSelectProject(project.id)} title={project.root}>
                   <span className="project-avatar">{projectName(project).slice(0, 1).toUpperCase()}</span>
                   <span className="project-button-copy"><strong>{projectName(project)}</strong><small>{project.root}</small></span>
-                  <span className="project-session-count">{sessions.length}</span>
+                  <span className="project-session-count">{sessionRoots.length}</span>
                 </button>
                 <button className="tree-icon-button" onClick={() => props.onRenameProject(project)} aria-label={`Rename ${projectName(project)}`} title="Rename project"><EditIcon /></button>
                 <button className="tree-icon-button" onClick={() => props.onCreateSession(project.id)} aria-label={`New session in ${projectName(project)}`} title="New session"><PlusIcon /></button>
@@ -127,15 +132,15 @@ export const WorkspaceTree = memo(function WorkspaceTree(props: {
                 {index?.status === 'error' && <div className="tree-error"><span>Sessions unavailable.</span><button onClick={() => props.onRetrySessionIndex(project.id)}>Retry</button></div>}
                 {index?.status === 'stale' && <div className="tree-stale"><span>Showing the last known sessions.</span><button onClick={() => props.onRetrySessionIndex(project.id)}>Retry</button></div>}
                 {index?.status === 'loading' && <p className="tree-empty">Loading sessions…</p>}
-                {visibleRoots.map((node) => renderSessionRow(project.id, node.session, sessions))}
-                {sessions.length === 0 && index?.status !== 'loading' && <p className="tree-empty">No sessions yet</p>}
+                {visibleRoots.map((session) => renderSessionRow(project.id, session, sessions))}
+                {sessionRoots.length === 0 && index?.status !== 'loading' && <p className="tree-empty">No sessions yet</p>}
                 {(expanded ? sessionRoots.length > 3 : hiddenSessionCount > 0) && (
                   <button className="tree-expand-button" onClick={() => toggleProject(project.id)}><ChevronIcon expanded={expanded} />{expanded ? 'Collapse' : `Show ${hiddenSessionCount} more sessions`}</button>
                 )}
                 {archivedSessions.length > 0 && (
                   <>
-                    <button className="tree-expand-button archived-session-toggle" onClick={() => toggleArchivedProject(project.id)} aria-expanded={archivedExpanded}><ArchiveIcon /> Archived ({archivedSessions.length}) <ChevronIcon expanded={archivedExpanded} /></button>
-                    {archivedExpanded && archivedSessionRoots.map((node) => renderSessionRow(project.id, node.session, archivedSessions, true))}
+                    {archivedSessionRoots.length > 0 && <button className="tree-expand-button archived-session-toggle" onClick={() => toggleArchivedProject(project.id)} aria-expanded={archivedExpanded}><ArchiveIcon /> Archived ({archivedSessionRoots.length}) <ChevronIcon expanded={archivedExpanded} /></button>}
+                    {archivedExpanded && archivedSessionRoots.map((session) => renderSessionRow(project.id, session, archivedSessions, true))}
                   </>
                 )}
               </div>

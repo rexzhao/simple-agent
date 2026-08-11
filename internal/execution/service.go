@@ -1202,6 +1202,11 @@ func (s *Service) CreateSession(projectID string, metadata SessionCreateMetadata
 	if s == nil || s.sessionStore == nil {
 		return SessionDetail{}, fmt.Errorf("execution session store is not configured")
 	}
+	parentLocks, err := s.acquireSessionParentMutationLocks(metadata.ParentSessionID)
+	if err != nil {
+		return SessionDetail{}, err
+	}
+	defer releaseSessionMutationLocks(parentLocks)
 	session, err := s.buildSession(projectID, metadata, "")
 	if err != nil {
 		return SessionDetail{}, err
@@ -1222,7 +1227,16 @@ func (s *Service) CreateSessionIdempotent(ctx context.Context, projectID, sessio
 	if s == nil || s.sessionStore == nil {
 		return SessionDetail{}, false, fmt.Errorf("execution session store is not configured")
 	}
+	var parentLocks []*sessions.SessionWriteLock
+	defer func() { releaseSessionMutationLocks(parentLocks) }()
 	saved, created, err := s.createSessionIdempotent(ctx, sessionID, fingerprint, func(_ context.Context) (sessions.SessionV2, error) {
+		if strings.TrimSpace(metadata.ParentSessionID) != "" {
+			locks, lockErr := s.acquireSessionParentMutationLocks(metadata.ParentSessionID)
+			if lockErr != nil {
+				return sessions.SessionV2{}, lockErr
+			}
+			parentLocks = locks
+		}
 		return s.buildSession(projectID, metadata, sessionID)
 	})
 	if err != nil {
@@ -1265,6 +1279,11 @@ func (s *Service) buildSession(projectID string, metadata SessionCreateMetadata,
 		if parent.ProjectID != project.ID {
 			return sessions.SessionV2{}, fmt.Errorf("parent session belongs to a different project")
 		}
+		if effective, err := s.sessionEffectivelyArchived(parent); err != nil {
+			return sessions.SessionV2{}, err
+		} else if effective {
+			return sessions.SessionV2{}, fmt.Errorf("archived parent session cannot create a child: %w", ErrSessionArchived)
+		}
 		session.CreatedBy = sessions.SessionCreatedByAgent
 		session.RootSessionID = strings.TrimSpace(parent.RootSessionID)
 		if session.RootSessionID == "" {
@@ -1282,6 +1301,46 @@ func (s *Service) buildSession(projectID string, metadata SessionCreateMetadata,
 		session.CWD = session.CreatedCWD
 	}
 	return session, nil
+}
+
+// Child creation and subtree archive both mutate the parent lineage. Holding
+// the parent lineage locks across validation and commit prevents a child from
+// being created in the gap between an archive's subtree scan and its lock
+// acquisition. The non-idempotent path acquires them before building; all
+// idempotent builders acquire them only after the durable primitive confirms a
+// new identity, so retries still skip all parent/configuration work.
+func (s *Service) acquireSessionParentMutationLocks(parentID string) ([]*sessions.SessionWriteLock, error) {
+	parentID = strings.TrimSpace(parentID)
+	if parentID == "" {
+		return nil, nil
+	}
+	// A live ancestor already holds its writer lock for the turn's execution,
+	// and an archive of that subtree would be rejected as busy. Child creation
+	// therefore need not wait behind an active lineage; skipping the extra
+	// locks preserves the existing ability to spawn while working while the
+	// builder's effective-archive check remains authoritative.
+	ids := make([]string, 0, 2)
+	seen := make(map[string]struct{})
+	for currentID := parentID; currentID != ""; {
+		if _, ok := seen[currentID]; ok {
+			break
+		}
+		seen[currentID] = struct{}{}
+		parent, err := s.sessionStore.LoadState(currentID)
+		if err != nil {
+			return nil, err
+		}
+		if sessionHasActiveRun(parent) {
+			// An active ancestor cannot be locked without waiting for its run,
+			// and archive already rejects that active run. Keep the locks for
+			// the nearer idle parents collected so far; they still close the
+			// archive/create window for this child lineage.
+			break
+		}
+		ids = append(ids, currentID)
+		currentID = strings.TrimSpace(parent.ParentSessionID)
+	}
+	return s.acquireSessionMutationLocks(ids)
 }
 
 func (s *Service) ListSessions(options SessionListOptions) ([]SessionMetadata, error) {
@@ -1528,14 +1587,14 @@ func (s *Service) SetSessionDebug(id string, debug sessions.DebugSettings) (Sess
 // flag is set. The subtree is still locked so a running turn on any
 // descendant rejects the operation before anything changes.
 func (s *Service) ArchiveSession(id string) (SessionDetail, error) {
+	return s.archiveSession(id, nil)
+}
+
+func (s *Service) archiveSession(id string, afterScan func()) (SessionDetail, error) {
 	if s == nil || s.sessionStore == nil {
 		return SessionDetail{}, fmt.Errorf("execution session store is not configured")
 	}
-	subtree, err := s.sessionSubtreeIDs(id)
-	if err != nil {
-		return SessionDetail{}, err
-	}
-	locks, err := s.acquireSessionMutationLocks(subtree)
+	subtree, locks, err := s.acquireStableSessionSubtreeLocks(id, afterScan)
 	if err != nil {
 		return SessionDetail{}, err
 	}
@@ -1603,14 +1662,14 @@ func (s *Service) RestoreSession(id string) (SessionDetail, error) {
 // is locked while validating, so a running turn anywhere in it rejects the
 // removal before anything changes.
 func (s *Service) RemoveSession(id string) (SessionRemoveResult, error) {
+	return s.removeSession(id, nil)
+}
+
+func (s *Service) removeSession(id string, afterScan func()) (SessionRemoveResult, error) {
 	if s == nil || s.sessionStore == nil {
 		return SessionRemoveResult{}, fmt.Errorf("execution session store is not configured")
 	}
-	subtree, err := s.sessionSubtreeIDs(id)
-	if err != nil {
-		return SessionRemoveResult{}, err
-	}
-	locks, err := s.acquireSessionMutationLocks(subtree)
+	subtree, locks, err := s.acquireStableSessionSubtreeLocks(id, afterScan)
 	if err != nil {
 		return SessionRemoveResult{}, err
 	}
@@ -1834,6 +1893,54 @@ func (s *Service) acquireSessionMutationLock(id string) (*sessions.SessionWriteL
 		return nil, err
 	}
 	return locks[0], nil
+}
+
+// acquireStableSessionSubtreeLocks returns a complete subtree snapshot and
+// locks for that exact snapshot. A child can be inserted after the first
+// scan but before the locks are acquired, so the subtree is scanned again
+// while the candidate locks are held. If it changed, all locks are released
+// before retrying with the larger (or smaller) set. Once the scan is stable,
+// every existing descendant has its writer lock and every future child is
+// blocked by the locked parent lineage.
+//
+// afterScan is only used by deterministic service tests to insert a descendant
+// in the scan-to-lock window; production callers pass nil.
+func (s *Service) acquireStableSessionSubtreeLocks(rootID string, afterScan func()) ([]string, []*sessions.SessionWriteLock, error) {
+	for {
+		subtree, err := s.sessionSubtreeIDs(rootID)
+		if err != nil {
+			return nil, nil, err
+		}
+		if afterScan != nil {
+			afterScan()
+			afterScan = nil
+		}
+		locks, err := s.acquireSessionMutationLocks(subtree)
+		if err != nil {
+			return nil, nil, err
+		}
+		current, err := s.sessionSubtreeIDs(rootID)
+		if err != nil {
+			releaseSessionMutationLocks(locks)
+			return nil, nil, err
+		}
+		if sameSessionIDList(subtree, current) {
+			return current, locks, nil
+		}
+		releaseSessionMutationLocks(locks)
+	}
+}
+
+func sameSessionIDList(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index] != right[index] {
+			return false
+		}
+	}
+	return true
 }
 
 // acquireSessionMutationLocks acquires the per-session writer locks for ids

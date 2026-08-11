@@ -143,7 +143,7 @@ const defaultProject: ProjectSummary = {
   updated_at: '2026-01-01T00:00:00Z',
 }
 
-function renderApp(projects: readonly ProjectSummary[] = [defaultProject]) {
+function renderApp(projects: readonly ProjectSummary[] = [defaultProject], additionalSessions: readonly SessionSummary[] = []) {
   const transport = new AppTestTransport()
   const application = createSyncApplication({ transport })
   const adapter = new ProjectIndexAdapter()
@@ -166,7 +166,7 @@ function renderApp(projects: readonly ProjectSummary[] = [defaultProject]) {
       resource_revision: '0',
       updated_at: mocks.session.updated_at,
       has_unread_result: false,
-    }] : []
+    }, ...additionalSessions] : []
     application.replica.applySnapshot(
       { type: 'session_index', id: project.id },
       sessionAdapter,
@@ -349,6 +349,99 @@ describe('App lifecycle bootstrap', () => {
     await waitFor(() => expect(screen.getByText('session-1')).toBeTruthy())
     await act(async () => { applySessionContentAuthority(view) })
     await waitFor(() => expect(screen.getByText('from session content')).toBeTruthy())
+    view.unmount()
+  })
+
+  it('keeps child sessions out of the rail and splits archived children below a collapsed panel group', async () => {
+    const childSummaries: SessionSummary[] = [
+      {
+        session_id: 'child-active', project_id: 'project-1', parent_session_id: 'session-1', display_name: 'active child',
+        archived: false, status: 'idle', run_id: null, resource_revision: '1', updated_at: '2026-01-02T00:00:00Z', has_unread_result: false,
+      },
+      {
+        session_id: 'child-archived', project_id: 'project-1', parent_session_id: 'session-1', display_name: 'archived child',
+        archived: true, status: 'idle', run_id: null, resource_revision: '1', updated_at: '2026-01-03T00:00:00Z', has_unread_result: false,
+      },
+    ]
+    const view = renderApp([defaultProject], childSummaries)
+    await waitFor(() => expect(screen.getByText('active child')).toBeTruthy())
+
+    expect(screen.getByText('session-1', { selector: '.session-tree-row strong' }).closest('.session-tree-row')).not.toBeNull()
+    expect(screen.getByText('active child').closest('.session-tree-row')).toBeNull()
+    expect(screen.queryByText('archived child', { selector: '.sub-panel-tab-label' })).toBeNull()
+
+    const archivedToggle = screen.getByRole('button', { name: 'Archived (1)' })
+    expect(archivedToggle.getAttribute('aria-expanded')).toBe('false')
+    fireEvent.click(archivedToggle)
+    expect(screen.getByText('archived child', { selector: '.sub-panel-tab-label' })).not.toBeNull()
+    view.unmount()
+  })
+
+  it('returns to the parent after deleting the child currently shown by the sub-panel', async () => {
+    const child: SessionSummary = {
+      session_id: 'child-delete', project_id: 'project-1', parent_session_id: 'session-1', display_name: 'child to delete',
+      archived: false, status: 'idle', run_id: null, resource_revision: '1', updated_at: '2026-01-02T00:00:00Z', has_unread_result: false,
+    }
+    const view = renderApp([defaultProject], [child])
+    await waitFor(() => expect(screen.getByText('child to delete')).toBeTruthy())
+    vi.spyOn(window, 'confirm').mockReturnValue(true)
+    const commands: string[] = []
+    view.transport.onSend = (message) => {
+      if (message.type !== 'command') return
+      commands.push(message.payload.name)
+      if (message.payload.name === 'session.archive') {
+        respondToProjectCommand(view.transport, message, { session_id: child.session_id, archived: true })
+      } else if (message.payload.name === 'session.delete') {
+        respondToProjectCommand(view.transport, message, { session_id: child.session_id, status: 'removed', removed_sessions: 1 })
+      }
+    }
+
+    fireEvent.click(screen.getByText('child to delete'))
+    await waitFor(() => expect(view.application.signals.currentSession.get()).toBe(child.session_id))
+    fireEvent.click(screen.getByRole('button', { name: 'Delete child to delete' }))
+    await waitFor(() => expect(commands).toEqual(['session.archive']))
+
+    await act(async () => { applySessionIndexAuthority(view, { ...child, archived: true, resource_revision: '2' }, '2') })
+    await waitFor(() => expect(commands).toEqual(['session.archive', 'session.delete']))
+    await act(async () => {
+      view.application.replica.applyChange(
+        { type: 'session_index', id: 'project-1' },
+        new SessionIndexAdapter('project-1'),
+        [{ op: 'remove', key: child.session_id }],
+        { streamEpoch: 'test', sequence: '3' as never, resourceRevision: '3', generation: 0 },
+      )
+    })
+    await waitFor(() => {
+      expect(view.application.signals.currentSession.get()).toBe('session-1')
+      expect(view.application.repositories.sessionIndex.getProjectReadModel('project-1').summaries.some((item) => item.session_id === child.session_id)).toBe(false)
+    })
+    expect(commands).toEqual(['session.archive', 'session.delete'])
+    view.unmount()
+  })
+
+  it('restores an archived child without letting root selection overwrite the child view', async () => {
+    const child: SessionSummary = {
+      session_id: 'child-restore', project_id: 'project-1', parent_session_id: 'session-1', display_name: 'child to restore',
+      archived: true, status: 'idle', run_id: null, resource_revision: '1', updated_at: '2026-01-02T00:00:00Z', has_unread_result: false,
+    }
+    const view = renderApp([defaultProject], [child])
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Archived (1)' })).toBeTruthy())
+    vi.spyOn(window, 'confirm').mockReturnValue(true)
+    view.transport.onSend = (message) => {
+      if (message.type === 'command' && message.payload.name === 'session.restore') {
+        respondToProjectCommand(view.transport, message, { session_id: child.session_id, archived: false })
+      }
+    }
+
+    fireEvent.click(screen.getByRole('button', { name: 'Archived (1)' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Restore child to restore' }))
+    await waitFor(() => expect(view.transport.sent.some((message) => message.type === 'command' && message.payload.name === 'session.restore')).toBe(true))
+    await act(async () => { applySessionIndexAuthority(view, { ...child, archived: false, resource_revision: '2' }, '2') })
+    await waitFor(() => {
+      expect(view.application.signals.currentProject.get()).toBe('project-1')
+      expect(view.application.signals.currentSession.get()).toBe(child.session_id)
+    })
+    expect(screen.getByText('session-1', { selector: '.session-tree-row strong' }).closest('.session-tree-row')?.className).toContain('selected')
     view.unmount()
   })
 

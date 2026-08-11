@@ -379,6 +379,7 @@ svg { width: 1.1em; height: 1.1em; fill: none; stroke: currentColor; stroke-widt
   border-color: var(--rule);
 }
 .sub-panel-tab.parent { font-weight: 700; color: var(--text); }
+.sub-panel-tab.archived { color: var(--faint); opacity: .9; }
 .sub-panel-tab-main {
   min-width: 0;
   flex: 1;
@@ -432,6 +433,24 @@ svg { width: 1.1em; height: 1.1em; fill: none; stroke: currentColor; stroke-widt
   background: var(--rule);
   opacity: .3;
 }
+.sub-panel-archived-toggle {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  padding: 5px 7px;
+  border: 0;
+  color: var(--muted);
+  background: transparent;
+  font: 800 9.5px var(--font-mono);
+  letter-spacing: .04em;
+  text-align: left;
+  text-transform: uppercase;
+  cursor: pointer;
+}
+.sub-panel-archived-toggle:hover { color: var(--text); background: var(--panel-soft); }
+.sub-panel-archived-toggle span { flex: 1; }
+.sub-panel-archived-toggle svg { width: 13px; height: 13px; }
 .conversation { height: 100%; display: grid; grid-template-rows: auto minmax(0, 1fr) auto auto; }
 
 .conversation-header {

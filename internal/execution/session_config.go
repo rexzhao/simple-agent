@@ -85,10 +85,19 @@ func (s *Service) CreateConfiguredSession(projectID string, options ConfiguredSe
 // original frozen provider/model metadata even if server configuration has
 // changed or is temporarily unavailable.
 func (s *Service) CreateConfiguredSessionIdempotent(ctx context.Context, projectID, sessionID, fingerprint string, options ConfiguredSessionOptions) (SessionDetail, bool, error) {
+	var parentLocks []*sessions.SessionWriteLock
+	defer func() { releaseSessionMutationLocks(parentLocks) }()
 	saved, created, err := s.createSessionIdempotent(ctx, sessionID, fingerprint, func(_ context.Context) (sessions.SessionV2, error) {
 		resolvedProjectID, metadata, err := s.resolveConfiguredSessionMetadata(projectID, options)
 		if err != nil {
 			return sessions.SessionV2{}, err
+		}
+		if strings.TrimSpace(metadata.ParentSessionID) != "" {
+			locks, lockErr := s.acquireSessionParentMutationLocks(metadata.ParentSessionID)
+			if lockErr != nil {
+				return sessions.SessionV2{}, lockErr
+			}
+			parentLocks = locks
 		}
 		return s.buildSession(resolvedProjectID, metadata, sessionID)
 	})
@@ -230,7 +239,14 @@ func (s *Service) CreateInheritedSession(parentID, displayName string) (SessionD
 // against the parent before the first commit; a committed retry returns the
 // frozen child without needing to rebuild the parent-derived metadata.
 func (s *Service) CreateInheritedSessionIdempotent(ctx context.Context, projectID, parentID, displayName, sessionID, fingerprint string) (SessionDetail, bool, error) {
+	var parentLocks []*sessions.SessionWriteLock
+	defer func() { releaseSessionMutationLocks(parentLocks) }()
 	saved, created, err := s.createSessionIdempotent(ctx, sessionID, fingerprint, func(_ context.Context) (sessions.SessionV2, error) {
+		locks, lockErr := s.acquireSessionParentMutationLocks(parentID)
+		if lockErr != nil {
+			return sessions.SessionV2{}, lockErr
+		}
+		parentLocks = locks
 		parent, err := s.GetSession(parentID)
 		if err != nil {
 			return sessions.SessionV2{}, err
