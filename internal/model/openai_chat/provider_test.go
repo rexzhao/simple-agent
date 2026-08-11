@@ -79,7 +79,52 @@ func TestProviderStreamPostsChatCompletionsRequest(t *testing.T) {
 			{"role": "user", "content": "Hello"}
 		],
 		"stream": true,
+		"stream_options": {"include_usage": true},
 		"temperature": 0.6
+	}`)
+}
+
+func TestProviderStreamPostsKimiChatCompletionsRequestWithUsageOptions(t *testing.T) {
+	bodies := make(chan []byte, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("ReadAll() error = %v", err)
+		}
+		bodies <- body
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: [DONE]\n\n")
+	}))
+	defer server.Close()
+
+	provider, err := NewProvider(ProviderConfig{
+		BaseURL:       server.URL,
+		APIKey:        "test-key",
+		Compatibility: CompatibilityKimi,
+		HTTPClient:    server.Client(),
+	})
+	if err != nil {
+		t.Fatalf("NewProvider() error = %v", err)
+	}
+
+	events, err := provider.Stream(context.Background(), model.Request{
+		Model:     "kimi-k3",
+		SessionID: "session-123",
+		Messages:  []model.Message{{Role: model.MessageRoleUser, Content: "Hello"}},
+	})
+	if err != nil {
+		t.Fatalf("Stream() error = %v", err)
+	}
+	if got := collectEvents(t, events); len(got) != 0 {
+		t.Fatalf("events = %#v, want none", got)
+	}
+
+	assertJSONEqual(t, <-bodies, `{
+		"model": "kimi-k3",
+		"messages": [{"role": "user", "content": "Hello"}],
+		"stream": true,
+		"prompt_cache_key": "session-123",
+		"stream_options": {"include_usage": true}
 	}`)
 }
 
@@ -125,7 +170,8 @@ func TestProviderStreamRecordsChatCompletionsRequest(t *testing.T) {
 		"messages": [
 			{"role": "user", "content": "Hello"}
 		],
-		"stream": true
+		"stream": true,
+		"stream_options": {"include_usage": true}
 	}`)
 }
 

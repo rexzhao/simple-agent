@@ -13,14 +13,14 @@ const (
 )
 
 type chatCompatibility interface {
-	prepareRequest(body map[string]any, request model.Request, stream bool)
+	prepareRequest(body map[string]any, request model.Request)
 	prepareMessage(item map[string]any, message model.Message)
 	usage(chunk chatCompletionChunk) *chatCompletionUsage
 }
 
 type openAICompatibility struct{}
 
-func (openAICompatibility) prepareRequest(map[string]any, model.Request, bool) {}
+func (openAICompatibility) prepareRequest(map[string]any, model.Request) {}
 
 func (openAICompatibility) prepareMessage(map[string]any, model.Message) {}
 
@@ -32,30 +32,12 @@ type kimiCompatibility struct {
 	openAICompatibility
 }
 
-func (kimiCompatibility) prepareRequest(body map[string]any, request model.Request, stream bool) {
+func (kimiCompatibility) prepareRequest(body map[string]any, request model.Request) {
 	if _, configured := body["prompt_cache_key"]; !configured {
 		if sessionID := strings.TrimSpace(request.SessionID); sessionID != "" {
 			body["prompt_cache_key"] = sessionID
 		}
 	}
-	if !stream {
-		return
-	}
-
-	rawOptions, configured := body["stream_options"]
-	if !configured {
-		body["stream_options"] = map[string]any{"include_usage": true}
-		return
-	}
-	options, ok := rawOptions.(map[string]any)
-	if !ok {
-		return
-	}
-	options = copyAnyMap(options)
-	if _, configured := options["include_usage"]; !configured {
-		options["include_usage"] = true
-	}
-	body["stream_options"] = options
 }
 
 func (kimiCompatibility) prepareMessage(item map[string]any, message model.Message) {
@@ -85,12 +67,4 @@ func resolveCompatibility(value string) (chatCompatibility, error) {
 	default:
 		return nil, fmt.Errorf("unsupported OpenAI Chat compatibility %q", value)
 	}
-}
-
-func copyAnyMap(values map[string]any) map[string]any {
-	copied := make(map[string]any, len(values))
-	for key, value := range values {
-		copied[key] = value
-	}
-	return copied
 }

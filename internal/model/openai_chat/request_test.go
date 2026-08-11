@@ -32,6 +32,7 @@ func TestBuildRequestBodyMapsMessagesStreamAndParameters(t *testing.T) {
 			{"role": "user", "content": "Hello"}
 		],
 		"stream": true,
+		"stream_options": {"include_usage": true},
 		"temperature": 0.6,
 		"max_tokens": 4096
 	}`)
@@ -59,7 +60,8 @@ func TestBuildRequestBodyMapsConfiguredDeveloperRole(t *testing.T) {
 			{"role": "system", "content": "Follow project rules."},
 			{"role": "user", "content": "Hello"}
 		],
-		"stream": true
+		"stream": true,
+		"stream_options": {"include_usage": true}
 	}`)
 }
 
@@ -228,6 +230,7 @@ func TestBuildRequestBodyMapsNilToolSchemaAndPreservesToolOrder(t *testing.T) {
 			{"role": "user", "content": "Use tools"}
 		],
 		"stream": true,
+		"stream_options": {"include_usage": true},
 		"tools": [
 			{
 				"type": "function",
@@ -293,7 +296,8 @@ func TestBuildRequestBodyMapsAssistantToolCallsAndToolMessages(t *testing.T) {
 			},
 			{"role": "tool", "content": "file body", "tool_call_id": "call_1"}
 		],
-		"stream": true
+		"stream": true,
+		"stream_options": {"include_usage": true}
 	}`)
 }
 
@@ -346,7 +350,7 @@ func TestBuildRequestBodyAppliesKimiCompatibility(t *testing.T) {
 	}`)
 }
 
-func TestBuildRequestBodyPreservesExplicitKimiCacheAndUsageSettings(t *testing.T) {
+func TestBuildRequestBodyPreservesExplicitKimiCacheAndEnablesUsage(t *testing.T) {
 	compatibility, err := resolveCompatibility(CompatibilityKimi)
 	if err != nil {
 		t.Fatalf("resolveCompatibility() error = %v", err)
@@ -369,6 +373,26 @@ func TestBuildRequestBodyPreservesExplicitKimiCacheAndUsageSettings(t *testing.T
 		"messages": [{"role": "user", "content": "Hello"}],
 		"stream": true,
 		"prompt_cache_key": "configured-key",
+		"stream_options": {"include_usage": true}
+	}`)
+}
+
+func TestBuildRequestBodyDoesNotAddStreamOptionsToNonStreamingRequests(t *testing.T) {
+	body, err := BuildRequestBody(model.Request{
+		Model:    "chat-model",
+		Messages: []model.Message{{Role: model.MessageRoleUser, Content: "Hello"}},
+		Parameters: map[string]any{
+			"stream_options": map[string]any{"include_usage": false},
+		},
+	}, false)
+	if err != nil {
+		t.Fatalf("BuildRequestBody() error = %v", err)
+	}
+
+	assertJSONEqual(t, body, `{
+		"model": "chat-model",
+		"messages": [{"role": "user", "content": "Hello"}],
+		"stream": false,
 		"stream_options": {"include_usage": false}
 	}`)
 }
@@ -432,7 +456,8 @@ func TestBuildRequestBodyMapsUserImageContentBlocks(t *testing.T) {
 				{"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBORw0KGgo=", "detail": "high"}}
 			]
 		}],
-		"stream": true
+		"stream": true,
+		"stream_options": {"include_usage": true}
 	}`)
 }
 

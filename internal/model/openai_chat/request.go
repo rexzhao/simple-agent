@@ -32,9 +32,27 @@ func buildRequestBody(request model.Request, stream bool, compatibility chatComp
 	if len(request.Tools) > 0 {
 		body["tools"] = buildTools(request.Tools, toolNames)
 	}
-	compatibility.prepareRequest(body, request, stream)
+	compatibility.prepareRequest(body, request)
+	if stream {
+		includeStreamUsage(body)
+	}
 
 	return json.Marshal(body)
+}
+
+func includeStreamUsage(body map[string]any) {
+	options, ok := body["stream_options"].(map[string]any)
+	if !ok {
+		options = make(map[string]any, 1)
+	} else {
+		copied := make(map[string]any, len(options)+1)
+		for key, value := range options {
+			copied[key] = value
+		}
+		options = copied
+	}
+	options["include_usage"] = true
+	body["stream_options"] = options
 }
 
 func buildMessages(messages []model.Message, developerRole model.MessageRole, compatibility chatCompatibility, toolNames ...*toolNameMapper) ([]map[string]any, error) {
