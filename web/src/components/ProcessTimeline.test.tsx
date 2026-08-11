@@ -1,10 +1,13 @@
 // @vitest-environment jsdom
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { cleanup, render, screen, fireEvent } from '@testing-library/react'
-import { ProcessTimeline } from './ProcessTimeline'
+import { act, cleanup, render, screen, fireEvent } from '@testing-library/react'
+import { PROCESS_HOVER_HIDE_DELAY_MS, PROCESS_HOVER_REPLACE_DELAY_MS, ProcessTimeline } from './ProcessTimeline'
 import type { RunStep, ToolActivity } from '../types'
 
-afterEach(cleanup)
+afterEach(() => {
+	vi.useRealTimers()
+	cleanup()
+})
 
 const tool = (overrides: Partial<ToolActivity>): ToolActivity => ({
 	kind: 'tool',
@@ -14,6 +17,13 @@ const tool = (overrides: Partial<ToolActivity>): ToolActivity => ({
 	status: 'finished',
 	...overrides,
 })
+
+function mockRect(element: Element, top: number, left = 80, width = 220, height = 32): void {
+	vi.spyOn(element, 'getBoundingClientRect').mockReturnValue({
+		top, bottom: top + height, left, right: left + width, width, height,
+		x: left, y: top, toJSON: () => ({}),
+	} as DOMRect)
+}
 
 describe('ProcessTimeline session tools', () => {
 	it('uses a colored leading dot and accessible status instead of trailing status text', () => {
@@ -37,18 +47,29 @@ describe('ProcessTimeline session tools', () => {
 		expect(container.textContent).not.toMatch(/Requested|Running|Done|Failed/)
 	})
 
+	it('keeps Cancel outside the hover trigger while preserving mouse hover and click access', () => {
+		const onCancelTool = vi.fn()
+		const { container } = render(<ProcessTimeline steps={[tool({ id: 'cancel-me', status: 'running' })]} onCancelTool={onCancelTool} />)
+		const cancel = screen.getByRole('button', { name: 'Cancel tool' })
+		expect(cancel.closest('[role="button"]')).toBeNull()
+		fireEvent.mouseEnter(container.querySelector('.tool-row-main') as Element)
+		expect(screen.getByRole('tooltip')).not.toBeNull()
+		fireEvent.click(cancel)
+		expect(onCancelTool).toHaveBeenCalledWith('cancel-me')
+	})
+
 	it('shows only a compact reasoning summary and marks only the current reasoning step as running', () => {
 		const reasoning: RunStep = { kind: 'reasoning', id: 'reason-a', text: '😀a中', iteration: 1 }
 		const view = render(<ProcessTimeline steps={[reasoning]} live />)
 
-		expect(view.container.querySelector('.reasoning-step summary')?.textContent).toContain('Thinking')
-		expect(view.container.querySelector('.reasoning-step summary')?.textContent).toContain('3 chars')
-		expect(view.container.querySelector('.reasoning-step summary')?.textContent).toContain('—')
+		expect(view.container.querySelector('.reasoning-trigger')?.textContent).toContain('Thinking')
+		expect(view.container.querySelector('.reasoning-trigger')?.textContent).toContain('3 chars')
+		expect(view.container.querySelector('.reasoning-trigger')?.textContent).toContain('—')
 		expect(view.container.querySelector('.reasoning-step pre')).toBeNull()
 		expect(view.container.querySelector('[aria-label="Reasoning status: Thinking"]')).not.toBeNull()
 
 		view.rerender(<ProcessTimeline steps={[reasoning]} live={false} />)
-		expect(view.container.querySelector('.reasoning-step summary')?.textContent).toContain('Thinking complete')
+		expect(view.container.querySelector('.reasoning-trigger')?.textContent).toContain('Thinking complete')
 		expect(view.container.querySelector('[aria-label="Reasoning status: Thinking"]')).toBeNull()
 		expect(view.container.querySelector('.reasoning-step pre')).toBeNull()
 	})
@@ -71,12 +92,12 @@ describe('ProcessTimeline session tools', () => {
 			}
 			const toolStep = tool({ id: 'after-reasoning', status: 'running' })
 			const view = render(<ProcessTimeline steps={[reasoning, toolStep]} live />)
-			expect(view.container.querySelector('.reasoning-step summary')?.textContent).toContain('1.5s')
+			expect(view.container.querySelector('.reasoning-trigger')?.textContent).toContain('1.5s')
 			expect(view.container.querySelector('[aria-label="Reasoning status: Thinking"]')).toBeNull()
 
 			view.unmount()
 			const remounted = render(<ProcessTimeline steps={[reasoning]} />)
-			expect(remounted.container.querySelector('.reasoning-step summary')?.textContent).toContain('1.5s')
+			expect(remounted.container.querySelector('.reasoning-trigger')?.textContent).toContain('1.5s')
 		} finally {
 			vi.useRealTimers()
 		}
@@ -85,7 +106,7 @@ describe('ProcessTimeline session tools', () => {
 	it('does not invent a zero duration when history has no event timing', () => {
 		const reasoning: RunStep = { kind: 'reasoning', id: 'historical-reasoning', text: 'old', iteration: 1 }
 		const { container } = render(<ProcessTimeline steps={[reasoning]} />)
-		const summary = container.querySelector('.reasoning-step summary')?.textContent ?? ''
+		const summary = container.querySelector('.reasoning-trigger')?.textContent ?? ''
 		expect(summary).toContain('—')
 		expect(summary).not.toContain('0ms')
 	})
@@ -121,7 +142,7 @@ describe('ProcessTimeline session tools', () => {
 		expect(screen.getByText('"Review" · grok-4.5')).not.toBeNull()
 	})
 
-	it('shows request arguments and the result when the session tool row expands', () => {
+	it('shows request arguments and the result in the session tool hover popup', () => {
 		const args = JSON.stringify({ session_id: 'sess-1', mode: 'steer', message: 'please retry' })
 		const steps: RunStep[] = [tool({
 			name: 'session_send',
@@ -133,9 +154,9 @@ describe('ProcessTimeline session tools', () => {
 		// Collapsed summary resolves the session display name and snippets the message.
 		expect(screen.getByText(/Review session/)).not.toBeNull()
 
-		const summary = screen.getByText('session_send').closest('summary')
-		expect(summary).not.toBeNull()
-		fireEvent.click(summary as Element)
+		const trigger = screen.getByText('session_send').closest('.tool-row-header')
+		expect(trigger).not.toBeNull()
+		fireEvent.mouseEnter(trigger as Element)
 
 		expect(screen.getByText('Arguments')).not.toBeNull()
 		expect(screen.getByText(/"mode": "steer"/)).not.toBeNull()
@@ -143,7 +164,7 @@ describe('ProcessTimeline session tools', () => {
 		expect(screen.getByText(/"ok": true/)).not.toBeNull()
 	})
 
-	it('keeps session tool rows expandable on pending results without output', () => {
+	it('shows a popup for pending session tools without output', () => {
 		const steps: RunStep[] = [tool({
 			name: 'session_wait',
 			arguments: JSON.stringify({ session_id: 'sess-9', timeout_ms: 1000 }),
@@ -153,7 +174,113 @@ describe('ProcessTimeline session tools', () => {
 
 		expect(screen.getByText('session_wait')).not.toBeNull()
 		expect(screen.getByText('sess-9')).not.toBeNull()
+		fireEvent.mouseEnter(screen.getByText('session_wait').closest('.tool-row-header') as Element)
 		expect(screen.queryByText('Output')).toBeNull()
+		expect(screen.getByRole('tooltip').textContent).toContain('Arguments')
+	})
+
+	it('places the portal below an upper trigger and above a lower trigger', () => {
+		vi.useFakeTimers()
+		const { container } = render(<ProcessTimeline steps={[
+			tool({ id: 'upper', name: 'shell', arguments: JSON.stringify({ command: 'upper command' }) }),
+			tool({ id: 'lower', name: 'shell', arguments: JSON.stringify({ command: 'lower command' }) }),
+		]} />)
+		const triggers = Array.from(container.querySelectorAll('.tool-row-header'))
+		mockRect(triggers[0], 300)
+		mockRect(triggers[1], 680)
+
+		fireEvent.mouseEnter(triggers[0])
+		const below = screen.getByRole('tooltip')
+		const belowTop = Number.parseFloat(below.style.top)
+		const belowMaxHeight = Number.parseFloat(below.style.maxHeight)
+		const upperBottom = 332
+		const viewportHeight = window.innerHeight
+		expect(below.getAttribute('data-placement')).toBe('below')
+		expect(belowTop).toBeGreaterThanOrEqual(upperBottom + 8)
+		expect(belowTop).toBe(upperBottom + 8)
+		expect(belowMaxHeight).toBe(Math.min(520, viewportHeight - 12 - upperBottom - 8))
+		expect(belowTop + belowMaxHeight).toBeLessThanOrEqual(viewportHeight - 12)
+		expect(below.textContent).toContain('upper command')
+		fireEvent.mouseEnter(triggers[1])
+		expect(screen.getByRole('tooltip').textContent).toContain('upper command')
+		act(() => { vi.advanceTimersByTime(PROCESS_HOVER_REPLACE_DELAY_MS) })
+		const above = screen.getByRole('tooltip')
+		const aboveTop = Number.parseFloat(above.style.top)
+		const aboveMaxHeight = Number.parseFloat(above.style.maxHeight)
+		const lowerTop = 680
+		expect(above.getAttribute('data-placement')).toBe('above')
+		expect(aboveTop + aboveMaxHeight).toBeLessThanOrEqual(lowerTop - 8)
+		expect(aboveTop).toBe(lowerTop - 8 - aboveMaxHeight)
+		expect(above.textContent).toContain('lower command')
+	})
+
+	it('keeps the popup during trigger-leave delay and hides after popup-leave delay', () => {
+		vi.useFakeTimers()
+		const { container } = render(<ProcessTimeline steps={[tool({ id: 'delayed', name: 'shell', arguments: JSON.stringify({ command: 'copy me' }) })]} />)
+		const trigger = container.querySelector('.tool-row-header') as Element
+		mockRect(trigger, 100)
+		fireEvent.mouseEnter(trigger)
+		fireEvent.mouseLeave(trigger)
+		act(() => { vi.advanceTimersByTime(PROCESS_HOVER_HIDE_DELAY_MS - 1) })
+		expect(screen.getByRole('tooltip')).not.toBeNull()
+		act(() => { vi.advanceTimersByTime(1) })
+		expect(screen.queryByRole('tooltip')).toBeNull()
+	})
+
+	it('keeps the popup while the pointer enters it, then delays its final removal', () => {
+		vi.useFakeTimers()
+		const { container } = render(<ProcessTimeline steps={[tool({ id: 'copy', name: 'shell', arguments: JSON.stringify({ command: 'copyable output' }) })]} />)
+		const trigger = container.querySelector('.tool-row-header') as Element
+		mockRect(trigger, 100)
+		fireEvent.mouseEnter(trigger)
+		fireEvent.mouseLeave(trigger)
+		const popup = screen.getByRole('tooltip')
+		fireEvent.mouseEnter(popup)
+		act(() => { vi.advanceTimersByTime(PROCESS_HOVER_HIDE_DELAY_MS + 20) })
+		expect(screen.getByRole('tooltip')).toBe(popup)
+		fireEvent.mouseLeave(popup)
+		act(() => { vi.advanceTimersByTime(PROCESS_HOVER_HIDE_DELAY_MS - 1) })
+		expect(screen.getByRole('tooltip')).toBe(popup)
+		act(() => { vi.advanceTimersByTime(1) })
+		expect(screen.queryByRole('tooltip')).toBeNull()
+	})
+
+	it('delays replacement, permits entering the old popup, and keeps detail text selectable', () => {
+		vi.useFakeTimers()
+		const { container } = render(<ProcessTimeline steps={[
+			tool({ id: 'old', name: 'shell', arguments: JSON.stringify({ command: 'old details' }) }),
+			tool({ id: 'new', name: 'shell', arguments: JSON.stringify({ command: 'new details <img>' }) }),
+		]} />)
+		const triggers = Array.from(container.querySelectorAll('.tool-row-header'))
+		mockRect(triggers[0], 100)
+		mockRect(triggers[1], 120)
+		fireEvent.mouseEnter(triggers[0])
+		const popup = screen.getByRole('tooltip')
+		fireEvent.mouseEnter(triggers[1])
+		expect(screen.getByRole('tooltip')).toBe(popup)
+		expect(screen.getByRole('tooltip').textContent).toContain('old details')
+		fireEvent.mouseEnter(popup)
+		act(() => { vi.advanceTimersByTime(PROCESS_HOVER_REPLACE_DELAY_MS + 20) })
+		expect(screen.getByRole('tooltip')).toBe(popup)
+		expect(screen.getByRole('tooltip').textContent).toContain('old details')
+		// The portal is outside the timeline DOM and its content is plain text,
+		// so copying it cannot turn tool output into markup.
+		expect(container.querySelector('.process-hover-popover')).toBeNull()
+		expect(popup.querySelector('pre')?.textContent).toContain('old details')
+		expect(popup.querySelector('img')).toBeNull()
+	})
+
+	it('uses focus as an equivalent trigger and Escape closes the associated tooltip', () => {
+		const { container } = render(<ProcessTimeline steps={[{ kind: 'reasoning', id: 'keyboard-reasoning', text: 'private thoughts', iteration: 1 }]} />)
+		const trigger = container.querySelector('.reasoning-trigger') as HTMLElement
+		mockRect(trigger, 100)
+		fireEvent.focus(trigger)
+		expect(trigger.getAttribute('aria-expanded')).toBe('true')
+		expect(trigger.getAttribute('aria-haspopup')).toBeNull()
+		expect(trigger.getAttribute('aria-describedby')).toBe('process-hover-details')
+		expect(screen.getByRole('tooltip').textContent).toContain('private thoughts')
+		fireEvent.keyDown(trigger, { key: 'Escape' })
+		expect(screen.queryByRole('tooltip')).toBeNull()
 	})
 
 	it('renders interleaved tool and reasoning as separate rows in input order', () => {

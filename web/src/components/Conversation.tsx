@@ -13,7 +13,7 @@ import { itemText, sessionName } from '../lib/session'
 import { Composer } from './Composer'
 import type { ComposerDraft, PastedImageAttachment, PastedTextAttachment } from './Composer'
 import { MessageSkeleton } from './misc'
-import { ProcessTimeline } from './ProcessTimeline'
+import { ProcessHoverProvider, ProcessTimeline } from './ProcessTimeline'
 import { BugIcon, CopyIcon, RetryIcon, SparkIcon, WarningIcon } from './icons'
 import { VirtualConversationList } from './VirtualConversationList'
 import type { VirtuosoHandle } from 'react-virtuoso'
@@ -242,6 +242,7 @@ export const Conversation = memo(function Conversation(props: {
 		: undefined
 
   return (
+    <ProcessHoverProvider scopeKey={props.sessionID}>
     <div className="conversation">
       <header className="conversation-header">
         <div className="conversation-left-group">
@@ -315,6 +316,7 @@ export const Conversation = memo(function Conversation(props: {
 		onCancel={props.onCancel}
 	  />
     </div>
+    </ProcessHoverProvider>
   )
 }, (previous, next) =>
   previous.sessionID === next.sessionID &&

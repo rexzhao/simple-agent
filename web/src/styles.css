@@ -602,24 +602,25 @@ svg { width: 1.1em; height: 1.1em; fill: none; stroke: currentColor; stroke-widt
 .process-timeline { display: flex; flex-direction: column; gap: 8px; margin: 3px 0 14px; padding-left: 22px; }
 .iteration-marker { position: absolute; top: 9px; right: 100%; margin-right: 9px; color: var(--faint); font-family: var(--font-mono); font-size: 9px; font-weight: 500; font-style: normal; line-height: 1; pointer-events: none; }
 .reasoning-step { position: relative; padding: 7px 9px 8px 11px; border-left: 4px solid var(--accent); background: var(--panel-soft); }
-.reasoning-step > summary { display: flex; align-items: center; gap: 5px; list-style: none; cursor: pointer; }
-.reasoning-step > summary::-webkit-details-marker { display: none; }
-.reasoning-step > summary > svg { width: 11px; height: 11px; flex: 0 0 auto; color: var(--muted); }
-.reasoning-step > summary > svg.expanded { transform: rotate(180deg); }
-.reasoning-step > summary > span { color: var(--muted); font-family: "Space Grotesk", "Segoe UI", sans-serif; font-size: 9.5px; font-weight: 800; text-transform: uppercase; letter-spacing: .05em; }
-.reasoning-step > summary > .reasoning-summary-meta { color: var(--faint); font-size: 9px; font-weight: 500; text-transform: none; letter-spacing: 0; }
+.reasoning-trigger { display: flex; align-items: center; gap: 5px; cursor: pointer; outline-offset: 3px; }
+.reasoning-trigger:focus-visible { outline: 2px solid var(--accent); }
+.reasoning-trigger > span { color: var(--muted); font-family: "Space Grotesk", "Segoe UI", sans-serif; font-size: 9.5px; font-weight: 800; text-transform: uppercase; letter-spacing: .05em; }
+.reasoning-trigger > .reasoning-summary-meta { color: var(--faint); font-size: 9px; font-weight: 500; text-transform: none; letter-spacing: 0; }
 /* Mid-turn assistant output renders like the final assistant message, not as a
    process card. */
 .step-message { position: relative; }
 .step-message.assistant .message-text { max-width: 680px; color: var(--text); font-size: 13.5px; line-height: 1.72; overflow-wrap: anywhere; }
-.reasoning-step pre { max-height: 280px; margin: 6px 0 0; overflow: auto; color: #374151; font: 10.5px/1.65 var(--font-mono); white-space: pre-wrap; overflow-wrap: anywhere; }
+.process-hover-popover { position: fixed; z-index: 1000; box-sizing: border-box; width: min(680px, calc(100vw - 24px)); max-width: calc(100vw - 24px); max-height: min(520px, 70vh); overflow: auto; padding: 10px; border: 2px solid var(--border); color: var(--text); background: #ffffff; box-shadow: var(--shadow-3); user-select: text; }
+.process-hover-popover-heading { margin: 0 0 8px; color: var(--muted); font: 800 9px "Space Grotesk", "Segoe UI", sans-serif; letter-spacing: .08em; text-transform: uppercase; }
+.process-hover-reasoning pre { max-height: none; margin: 0; overflow: visible; color: #374151; font: 10.5px/1.65 var(--font-mono); white-space: pre-wrap; overflow-wrap: anywhere; user-select: text; }
 
 .tool-row { position: relative; width: min(660px, 100%); border: 2px solid var(--border); color: var(--text); background: #ffffff; font-family: "Space Grotesk", "Segoe UI", sans-serif; font-size: 10.5px; }
-.tool-row-header { min-height: 35px; display: flex; align-items: center; gap: 8px; padding: 6px 9px; list-style: none; }
+.tool-row-main { display: flex; align-items: stretch; }
+.tool-row-header { min-width: 0; min-height: 35px; flex: 1; display: flex; align-items: center; gap: 8px; padding: 6px 9px; list-style: none; }
 .tool-row-header::-webkit-details-marker { display: none; }
-.tool-row.expandable > .tool-row-header { cursor: pointer; }
-.tool-row.expandable > .tool-row-header:hover { background: var(--accent-soft); }
-.tool-row.expandable[open] > .tool-row-header { border-bottom: 2px solid var(--border); background: var(--panel); }
+.tool-row-header { cursor: pointer; outline-offset: 3px; }
+.tool-row-header:hover { background: var(--accent-soft); }
+.tool-row-header:focus-visible { outline: 2px solid var(--accent); }
 .tool-row-header svg { width: 15px; height: 15px; flex: 0 0 auto; color: var(--text); }
 .tool-row-header strong { flex: 0 0 auto; font-weight: 800; }
 .tool-row-header code { min-width: 0; overflow: hidden; color: var(--muted); font: 10px var(--font-mono); text-overflow: ellipsis; white-space: nowrap; }
@@ -636,6 +637,7 @@ svg { width: 1.1em; height: 1.1em; fill: none; stroke: currentColor; stroke-widt
 .tool-details > div:first-child { padding-top: 9px; }
 .tool-details > div > span { display: block; margin: 4px 0 5px; color: var(--muted); font-size: 9px; font-weight: 800; text-transform: uppercase; }
 .tool-details pre { max-height: 260px; margin: 0; padding: 9px 10px; overflow: auto; border: 2px solid var(--border); color: #f9fafb; background: #111111; font: 10.5px/1.6 var(--font-mono); white-space: pre-wrap; overflow-wrap: anywhere; }
+.tool-details-empty { padding: 4px 0 2px; color: var(--muted); font: 10px/1.5 var(--font-mono); }
 .tool-edit-diff pre span { display: block; }
 .tool-edit-diff pre .diff-meta { color: #9ca3af; }
 .tool-edit-diff pre .diff-context { color: #e5e7eb; }

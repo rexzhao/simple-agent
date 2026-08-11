@@ -486,7 +486,7 @@ describe('Conversation live cursor', () => {
     expect(container.querySelectorAll('.cursor')).toHaveLength(1)
     expect(container.querySelectorAll('.reasoning-step')).toHaveLength(1)
     expect(container.querySelectorAll('.reasoning-step pre')).toHaveLength(0)
-    expect(container.querySelector('.reasoning-step summary')?.textContent).toContain('Thinking')
+    expect(container.querySelector('.reasoning-step .reasoning-trigger')?.textContent).toContain('Thinking')
     expect(container.querySelector('[aria-label="Reasoning status: Thinking"]')).not.toBeNull()
     expect(container.querySelectorAll('.active-cursor')).toHaveLength(0)
     expect(container.querySelectorAll('.process-timeline')).toHaveLength(1)
