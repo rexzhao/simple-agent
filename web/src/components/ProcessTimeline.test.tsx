@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { act, cleanup, render, screen, fireEvent } from '@testing-library/react'
-import { PROCESS_HOVER_HIDE_DELAY_MS, PROCESS_HOVER_REPLACE_DELAY_MS, ProcessTimeline } from './ProcessTimeline'
+import { PROCESS_HOVER_HIDE_DELAY_MS, PROCESS_HOVER_POPOVER_GAP_PX, PROCESS_HOVER_REPLACE_DELAY_MS, ProcessTimeline } from './ProcessTimeline'
 import type { RunStep, ToolActivity } from '../types'
 
 afterEach(() => {
@@ -186,14 +186,15 @@ describe('ProcessTimeline session tools', () => {
 			tool({ id: 'lower', name: 'shell', arguments: JSON.stringify({ command: 'lower command' }) }),
 		]} />)
 		const triggers = Array.from(container.querySelectorAll('.tool-row-header'))
-		mockRect(triggers[0], 300)
-		mockRect(triggers[1], 680)
+		const rows = Array.from(container.querySelectorAll('.tool-row'))
+		mockRect(rows[0], 300, 80, 660, 39)
+		mockRect(rows[1], 680, 80, 660, 39)
 
 		fireEvent.mouseEnter(triggers[0])
 		const below = screen.getByRole('tooltip')
 		const belowTop = Number.parseFloat(below.style.top)
 		const belowMaxHeight = Number.parseFloat(below.style.maxHeight)
-		const upperBottom = 332
+		const upperBottom = 339
 		const viewportHeight = window.innerHeight
 		expect(below.getAttribute('data-placement')).toBe('below')
 		expect(belowTop).toBeGreaterThanOrEqual(upperBottom + 8)
@@ -212,6 +213,39 @@ describe('ProcessTimeline session tools', () => {
 		expect(aboveTop + aboveMaxHeight).toBeLessThanOrEqual(lowerTop - 8)
 		expect(aboveTop).toBe(lowerTop - 8 - aboveMaxHeight)
 		expect(above.textContent).toContain('lower command')
+	})
+
+	it('uses the same non-edge gap for tool and reasoning popovers', () => {
+		vi.useFakeTimers()
+		const reasoning: RunStep = { kind: 'reasoning', id: 'reasoning-anchor', text: 'private thoughts', iteration: 1 }
+		const { container } = render(<ProcessTimeline steps={[reasoning, tool({ id: 'tool-anchor', name: 'shell', arguments: JSON.stringify({ command: 'details' }) })]} />)
+		const reasoningTrigger = container.querySelector('.reasoning-trigger') as Element
+		const reasoningOuter = container.querySelector('.reasoning-step') as Element
+		const toolTrigger = container.querySelector('.tool-row-header') as Element
+		const toolOuter = container.querySelector('.tool-row') as Element
+		const reasoningOuterBottom = 327
+		const toolOuterBottom = 339
+		// Model the real boxes: reasoning has inner padding, while the tool row
+		// has a border and a taller header. The hover anchor is the visible row
+		// in both cases, not the differently sized inner trigger.
+		mockRect(reasoningOuter, 300, 80, 420, 27)
+		mockRect(reasoningTrigger, 307, 90, 400, 12)
+		mockRect(toolOuter, 300, 80, 500, 39)
+		mockRect(toolTrigger, 302, 82, 496, 35)
+
+		fireEvent.mouseEnter(reasoningTrigger)
+		const reasoningPopup = screen.getByRole('tooltip')
+		const reasoningGap = Number.parseFloat(reasoningPopup.style.top) - reasoningOuterBottom
+		expect(reasoningPopup.getAttribute('data-placement')).toBe('below')
+
+		fireEvent.mouseEnter(toolTrigger)
+		act(() => { vi.advanceTimersByTime(PROCESS_HOVER_REPLACE_DELAY_MS) })
+		const toolPopup = screen.getByRole('tooltip')
+		const toolGap = Number.parseFloat(toolPopup.style.top) - toolOuterBottom
+		expect(toolPopup.getAttribute('data-placement')).toBe('below')
+		expect(reasoningGap).toBe(PROCESS_HOVER_POPOVER_GAP_PX)
+		expect(toolGap).toBe(PROCESS_HOVER_POPOVER_GAP_PX)
+		expect(toolGap).toBe(reasoningGap)
 	})
 
 	it('keeps the popup during trigger-leave delay and hides after popup-leave delay', () => {

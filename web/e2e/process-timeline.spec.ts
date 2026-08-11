@@ -1,4 +1,4 @@
-import { expect, test, type Page } from '@playwright/test'
+import { expect, test, type Locator, type Page } from '@playwright/test'
 import { installSyncMock, messageItem, type SyncMockServer, type WireProject, type WireSession } from './ws-fixture'
 
 const project: WireProject = { id: 'project-main', root: '/workspace/project', display_name: 'Main project', archived: false, created_at: '2026-01-01T00:00:00Z', updated_at: '2026-01-01T00:00:00Z' }
@@ -184,4 +184,65 @@ test('failed tool rows stay individually visible once settled', async ({ page })
   await expect(page.getByLabel('Session status: idle')).toBeVisible()
   await expect(page.locator('.message.assistant:not(.transient)').last()).toContainText('One read failed.')
   await expect(page.locator('.tool-row.error')).toHaveCount(1)
+})
+
+test('keeps tool and reasoning popovers offset from their visible row frames', async ({ page }) => {
+  const hold = newGate()
+  const initial = [
+    { type: 'reasoning.delta', turn_id: 'turn-main', agent_iteration: 1, item_id: 'reasoning-below', delta: 'reasoning details' },
+    { type: 'tool.requested', turn_id: 'turn-main', agent_iteration: 1, tool_call_id: 'tool-below', name: 'shell', arguments: '{"command":"tool details"}' },
+    ...Array.from({ length: 14 }, (_, index) => ({ type: 'tool.requested', turn_id: 'turn-main', agent_iteration: 1, tool_call_id: `tool-filler-${index}`, name: 'shell', arguments: `{"command":"filler ${index}"}` })),
+    { type: 'reasoning.delta', turn_id: 'turn-main', agent_iteration: 1, item_id: 'reasoning-above', delta: 'reasoning details above' },
+    { type: 'tool.requested', turn_id: 'turn-main', agent_iteration: 1, tool_call_id: 'tool-above', name: 'shell', arguments: '{"command":"tool details above"}' },
+  ]
+  await installTimeline(page, initial, [hold])
+  await page.goto('/#token=e2e')
+  await page.getByPlaceholder('Send a message to SAI').fill('Measure hover geometry')
+  await page.getByRole('button', { name: 'Send' }).click()
+  await expect(page.locator('.reasoning-trigger')).toHaveCount(2)
+  await expect(page.locator('.tool-row-header')).toHaveCount(16)
+  const reasoningBelow = page.locator('.reasoning-trigger').nth(0)
+  const targetTool = page.locator('.tool-row-header').nth(0)
+  const box = async (locator: Locator) => {
+    const result = await locator.boundingBox()
+    if (!result) throw new Error(`Missing visible box for ${await locator.evaluate((element) => element.className)}`)
+    return result
+  }
+  const geometry = async (trigger: Locator, outer: Locator) => ({ trigger: await box(trigger), outer: await box(outer), popup: await box(page.locator('.process-hover-popover')) })
+
+  await reasoningBelow.hover()
+  await expect(page.locator('.process-hover-popover')).toBeVisible()
+  const reasoningGeometry = await geometry(reasoningBelow, page.locator('.reasoning-step').nth(0))
+
+  await targetTool.evaluate((element) => {
+    element.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }))
+    element.dispatchEvent(new MouseEvent('mouseenter', { bubbles: true }))
+  })
+  await page.waitForTimeout(250)
+  await expect(page.locator('.process-hover-popover')).toContainText('tool details')
+  const toolGeometry = await geometry(targetTool, page.locator('.tool-row').nth(0))
+  const reasoningBelowGap = reasoningGeometry.popup.y - (reasoningGeometry.outer.y + reasoningGeometry.outer.height)
+  const toolBelowGap = toolGeometry.popup.y - (toolGeometry.outer.y + toolGeometry.outer.height)
+  expect(reasoningBelowGap).toBeCloseTo(8, 4)
+  expect(toolBelowGap).toBeCloseTo(8, 4)
+  expect(toolBelowGap).toBeCloseTo(reasoningBelowGap, 4)
+
+  await page.locator('.process-hover-popover').evaluate((element) => element.dispatchEvent(new MouseEvent('mouseleave', { bubbles: true })))
+  await page.waitForTimeout(220)
+  await page.locator('.messages').evaluate((element) => { element.scrollTop = element.scrollHeight - element.clientHeight })
+  const reasoningAbove = page.locator('.reasoning-trigger').nth(1)
+  await reasoningAbove.hover()
+  await expect(page.locator('.process-hover-popover')).toHaveAttribute('data-placement', 'above')
+  const reasoningAboveGeometry = await geometry(reasoningAbove, page.locator('.reasoning-step').nth(1))
+  const toolAbove = page.locator('.tool-row-header').nth(15)
+  await toolAbove.hover()
+  await page.waitForTimeout(220)
+  await expect(page.locator('.process-hover-popover')).toHaveAttribute('data-placement', 'above')
+  const toolAboveGeometry = await geometry(toolAbove, page.locator('.tool-row').nth(15))
+  const reasoningAboveGap = reasoningAboveGeometry.outer.y - (reasoningAboveGeometry.popup.y + reasoningAboveGeometry.popup.height)
+  const toolAboveGap = toolAboveGeometry.outer.y - (toolAboveGeometry.popup.y + toolAboveGeometry.popup.height)
+  expect(reasoningAboveGap).toBeCloseTo(8, 4)
+  expect(toolAboveGap).toBeCloseTo(8, 4)
+  expect(toolAboveGap).toBeCloseTo(reasoningAboveGap, 4)
+  hold.release([])
 })

@@ -18,6 +18,7 @@ const markdownComponents: Components = {
 
 export const PROCESS_HOVER_HIDE_DELAY_MS = 180
 export const PROCESS_HOVER_REPLACE_DELAY_MS = 140
+export const PROCESS_HOVER_POPOVER_GAP_PX = 8
 
 const processHoverPopoverID = 'process-hover-details'
 
@@ -229,7 +230,6 @@ export function calculatePopoverPosition(trigger: ViewportRect, popup?: Viewport
 	const viewportWidth = typeof window === 'undefined' ? 1024 : Math.max(1, window.innerWidth || document.documentElement.clientWidth || 1024)
 	const viewportHeight = typeof window === 'undefined' ? 768 : Math.max(1, window.innerHeight || document.documentElement.clientHeight || 768)
 	const margin = 12
-	const gap = 8
 	const fallbackWidth = Math.max(1, Math.min(680, viewportWidth - margin * 2))
 	const fallbackHeight = Math.max(1, Math.min(520, viewportHeight - margin * 2))
 	const popupWidth = popup?.width ? Math.max(1, Math.min(popup.width, viewportWidth - margin * 2)) : fallbackWidth
@@ -238,14 +238,16 @@ export function calculatePopoverPosition(trigger: ViewportRect, popup?: Viewport
 	const center = trigger.top + triggerHeight / 2
 	const placement = center < viewportHeight / 2 ? 'below' : 'above'
 	const sideSpace = placement === 'below'
-		? viewportHeight - margin - trigger.bottom - gap
-		: trigger.top - gap - margin
+		? viewportHeight - margin - trigger.bottom - PROCESS_HOVER_POPOVER_GAP_PX
+		: trigger.top - PROCESS_HOVER_POPOVER_GAP_PX - margin
 	const maxHeight = Math.max(1, Math.min(fallbackHeight, sideSpace))
 	const popupHeight = popup?.height ? Math.min(popup.height, maxHeight) : maxHeight
 	// Do not clamp across the trigger. The selected side owns both the top
 	// coordinate and the available height; overflow inside the popup is safer
 	// than overlapping the row that opened it.
-	const top = placement === 'below' ? trigger.bottom + gap : trigger.top - gap - popupHeight
+	const top = placement === 'below'
+		? trigger.bottom + PROCESS_HOVER_POPOVER_GAP_PX
+		: trigger.top - PROCESS_HOVER_POPOVER_GAP_PX - popupHeight
 	const desiredLeft = trigger.left + (triggerWidth - popupWidth) / 2
 	const left = clamp(desiredLeft, margin, Math.max(margin, viewportWidth - popupWidth - margin))
 	return { top, left, maxHeight, placement }
@@ -261,6 +263,8 @@ function clamp(value: number, minimum: number, maximum: number): number {
 function ReasoningStep({ step, marker, streaming }: { step: ReasoningActivity; marker?: ReactNode; streaming: boolean }) {
 	const [nowMS, setNowMS] = useState(() => Date.now())
 	const hover = useContext(ProcessHoverContext)
+	// The painted row is the geometry anchor. Using the compact inner trigger
+	// here would make its padding contribute to the visible popup gap.
 	const triggerRef = useRef<HTMLDivElement>(null)
 	const id = `reasoning-${step.id}`
 	const durationMS = reasoningDurationMS(step.reasoningTiming, streaming, nowMS)
@@ -294,9 +298,8 @@ function ReasoningStep({ step, marker, streaming }: { step: ReasoningActivity; m
 	}
 
 	return (
-		<div className="reasoning-step">
+		<div ref={triggerRef} className="reasoning-step">
 			<div
-				ref={triggerRef}
 				className="reasoning-trigger"
 				role="button"
 				tabIndex={0}
@@ -338,6 +341,8 @@ function ActivityStatusDot({ className, label }: { className: string; label: str
 
 function ToolRow({ tool, marker, onCancelTool, sessionNames, workspaceRoot }: { tool: ToolActivity; marker?: ReactNode; onCancelTool?: (toolCallID: string) => void; sessionNames?: Record<string, string>; workspaceRoot?: string }) {
 	const hover = useContext(ProcessHoverContext)
+	// The painted row is the geometry anchor. The header has a different
+	// border/padding box than reasoning's inner trigger.
 	const triggerRef = useRef<HTMLDivElement>(null)
 	const argumentsObject = parseToolArguments(tool.arguments)
 	const isSessionTool = isSessionToolName(tool.name)
@@ -394,14 +399,13 @@ function ToolRow({ tool, marker, onCancelTool, sessionNames, workspaceRoot }: { 
 		}
 	}
 	return (
-		<div className={`tool-row ${tool.status}`}>
+		<div ref={triggerRef} className={`tool-row ${tool.status}`}>
 			<div
 				className="tool-row-main"
 				onMouseEnter={show}
 				onMouseLeave={leave}
 			>
 				<div
-					ref={triggerRef}
 					className="tool-row-header"
 					role="button"
 					tabIndex={0}
