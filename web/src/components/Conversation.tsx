@@ -665,9 +665,8 @@ type ActiveProcessRowModel = Extract<ConversationRow, { kind: 'active-process' }
 
 function ActiveProcessRow({ row, onCancelTool, sessionNames, workspaceRoot }: { row: ActiveProcessRowModel; onCancelTool?: (toolCallID: string) => void; sessionNames?: Record<string, string>; workspaceRoot?: string }) {
 	const run = row.run
-	// Streaming text soft-seals the live tail: once the model starts writing,
-	// the trailing tool group collapses instead of staying open until the
-	// output step flushes at the next tool call (or until the run settles).
+	// Once assistant text owns the live tail, process reasoning is no longer
+	// the active streaming step; keep its details collapsed while output grows.
 	const textStreaming = Boolean(run.assistantText) && !row.assistantTailAttached
 	const running = run.status === 'running'
 	const tokenNote = row.isLast && run.totalTokens !== undefined && (

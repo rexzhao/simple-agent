@@ -1,8 +1,8 @@
 // Presentation helpers for the session orchestration tools (session_*):
-// one-line summaries for collapsed tool rows, folded-group phrases, and
-// pretty-printing for their JSON arguments and results. Keeping this logic
-// pure (no React) lets the timeline rendering stay declarative and lets the
-// summaries be unit-tested without a DOM.
+// one-line summaries for collapsed tool rows and pretty-printing for their
+// JSON arguments and results. Keeping this logic pure (no React) lets the
+// timeline rendering stay declarative and lets the summaries be unit-tested
+// without a DOM.
 
 const sessionToolNames = new Set([
 	'session_models',
@@ -68,32 +68,6 @@ export function sessionToolTarget(name: string, args: Record<string, unknown>, s
 		}
 		default:
 			return ''
-	}
-}
-
-// sessionToolPhrase summarizes session tool calls inside a folded tool group,
-// mirroring the phrasing style of the file/shell tools.
-export function sessionToolPhrase(name: string, count: number): string {
-	const plural = count === 1 ? '' : 's'
-	switch (name) {
-		case 'session_models':
-			return 'Listed session models'
-		case 'session_start':
-			return `Started ${count} session${plural}`
-		case 'session_search':
-			return count === 1 ? 'Searched sessions' : `Searched sessions ×${count}`
-		case 'session_get':
-			return count === 1 ? 'Inspected a session' : `Inspected sessions ×${count}`
-		case 'session_history':
-			return count === 1 ? 'Read session history' : `Read session history ×${count}`
-		case 'session_send':
-			return `Sent ${count} session message${plural}`
-		case 'session_wait':
-			return count === 1 ? 'Waited on a session' : `Waited on sessions ×${count}`
-		case 'session_stop':
-			return `Stopped ${count} session${plural}`
-		default:
-			return count > 1 ? `${name} ×${count}` : name
 	}
 }
 

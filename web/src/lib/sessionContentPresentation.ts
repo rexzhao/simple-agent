@@ -110,35 +110,33 @@ function runStateForConversation(state: SessionRunState, sessionID: string): Act
     }
   }
   // Text tails remain owned by the durable/active message rows for rendering.
-  // Keep a zero-width output step in the process stream as a structural
-  // boundary: it closes the preceding tool group without manufacturing a
-  // second copy of the text. The message row supplies the visible text.
-  const toolIterations = new Set(Object.values(state.tools).map((tool) => tool.agent_iteration))
-  const steps = [
-    ...Object.values(state.reasoning).map((entry) => ({
-      kind: 'reasoning' as const,
-      id: `${state.runID}:reasoning:${entry.key.item_id}:${entry.key.agent_iteration}`,
-      text: entry.text,
-      iteration: entry.key.agent_iteration,
-      turnID: entry.key.turn_id,
-      itemID: entry.key.item_id,
-    })),
-    ...Object.values(state.tools).map((tool) => ({
-      kind: 'tool' as const,
+  // Process identities are ordered by their first event; lifecycle updates
+  // only replace the existing keyed entry and never move or duplicate it.
+  const steps = [] as ActiveRun['steps']
+  for (const ref of state.stepOrder) {
+    if (ref.kind === 'reasoning') {
+      const entry = state.reasoning[ref.key]
+      if (entry) steps.push({
+        kind: 'reasoning',
+        id: `${state.runID}:reasoning:${entry.key.item_id}:${entry.key.agent_iteration}`,
+        text: entry.text,
+        iteration: entry.key.agent_iteration,
+        turnID: entry.key.turn_id,
+        itemID: entry.key.item_id,
+      })
+      continue
+    }
+    const tool = state.tools[ref.key]
+    if (tool) steps.push({
+      kind: 'tool',
       id: tool.tool_call_id,
       name: tool.name,
       iteration: tool.agent_iteration,
       arguments: presentationToolArguments(tool.name, tool.arguments),
       result: tool.content,
-      status: tool.is_error ? 'error' as const : tool.status,
-    })),
-    ...textEntries.filter((entry) => [...toolIterations].some((iteration) => iteration >= entry.key.agent_iteration)).map((entry) => ({
-      kind: 'output' as const,
-      id: `${state.runID}:output:${entry.key.item_id}:${entry.key.agent_iteration}`,
-      text: '',
-      iteration: entry.key.agent_iteration,
-    })),
-  ]
+      status: tool.is_error ? 'error' : tool.status,
+    })
+  }
   const status: ActiveRun['status'] = state.recoveryRequired || state.stale
     ? 'error_pending_refresh'
     : state.status === 'failed' ? 'failed'

@@ -81,4 +81,20 @@ describe('ProcessTimeline session tools', () => {
 		expect(screen.getByText('sess-9')).not.toBeNull()
 		expect(screen.queryByText('Output')).toBeNull()
 	})
+
+	it('renders interleaved tool and reasoning as separate rows in input order', () => {
+		const { container } = render(<ProcessTimeline steps={[
+			tool({ id: 'tool-a', iteration: 1 }),
+			{ kind: 'reasoning', id: 'reason-a', text: 'between', iteration: 1 },
+			tool({ id: 'tool-b', name: 'shell', iteration: 2 }),
+			{ kind: 'reasoning', id: 'reason-b', text: 'after', iteration: 1 },
+		]} />)
+
+		expect(container.querySelector('.tool-group')).toBeNull()
+		expect(Array.from(container.querySelectorAll('.process-timeline > *')).map((element) => element.classList[0])).toEqual([
+			'tool-row', 'reasoning-step', 'tool-row', 'reasoning-step',
+		])
+		expect(container.querySelectorAll('.tool-row')).toHaveLength(2)
+		expect(container.querySelectorAll('.reasoning-step')).toHaveLength(2)
+	})
 })

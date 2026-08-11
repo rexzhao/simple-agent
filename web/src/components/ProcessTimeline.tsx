@@ -4,10 +4,9 @@ import Markdown from 'react-markdown'
 import type { Components } from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import type { ReasoningActivity, RunStep, ToolActivity } from '../types'
-import { foldToolGroups } from '../lib/runSteps'
-import type { FlatProcessStep } from '../lib/runSteps'
+import { flattenProcessSteps } from '../lib/runSteps'
 import { isPathOutsideWorkspace } from '../lib/paths'
-import { isSessionToolName, prettyJSONText, sessionToolPhrase, sessionToolTarget } from '../lib/sessionTools'
+import { isSessionToolName, prettyJSONText, sessionToolTarget } from '../lib/sessionTools'
 import { ChevronIcon, ToolIcon } from './icons'
 
 const markdownComponents: Components = {
@@ -15,17 +14,12 @@ const markdownComponents: Components = {
 }
 
 export const ProcessTimeline = memo(function ProcessTimeline({ steps, live = false, onCancelTool, sessionNames, workspaceRoot }: { steps: RunStep[]; live?: boolean; onCancelTool?: (toolCallID: string) => void; sessionNames?: Record<string, string>; workspaceRoot?: string }) {
-	const nodes = foldToolGroups(steps)
-	const lastNode = nodes[nodes.length - 1]
-	const lastFlat = lastNode ? (lastNode.kind === 'tool-group' ? lastNode.flats[lastNode.flats.length - 1] : lastNode.flat) : undefined
+	const nodes = flattenProcessSteps(steps)
+	const lastFlat = nodes[nodes.length - 1]
 	const lastStepID = lastFlat?.step.id
 	return (
 		<div className="process-timeline">
-			{nodes.map((node, nodeIndex) => {
-				if (node.kind === 'tool-group') {
-					return <ToolGroupRow key={node.id} flats={node.flats} live={live && nodeIndex === nodes.length - 1} onCancelTool={onCancelTool} sessionNames={sessionNames} workspaceRoot={workspaceRoot} />
-				}
-				const { step, iteration, iterationStart } = node.flat
+			{nodes.map(({ step, iteration, iterationStart }) => {
 				const marker = iterationStart ? <i className="iteration-marker">{iteration}</i> : null
 				if (step.kind === 'reasoning') {
 					return <ReasoningStep key={step.id} step={step} marker={marker} streaming={live && step.id === lastStepID} />
@@ -44,127 +38,6 @@ export const ProcessTimeline = memo(function ProcessTimeline({ steps, live = fal
 		</div>
 	)
 })
-
-// ToolGroupRow renders a folded run of consecutive tool calls as one
-// aggregated row. The row stays expanded while it is the live in-flight tail
-// — even between tool batches — and collapses only once a run-breaking step
-// seals it or the run settles. While live, it re-expands whenever a member
-// tool fails; historical groups always start collapsed, failed or not — a
-// finished session should not greet the reader with walls of tool output.
-// Reasoning steps inside the run stay individually collapsed.
-function ToolGroupRow({ flats, live, onCancelTool, sessionNames, workspaceRoot }: { flats: FlatProcessStep[]; live: boolean; onCancelTool?: (toolCallID: string) => void; sessionNames?: Record<string, string>; workspaceRoot?: string }) {
-	const tools = flats.map((flat) => flat.step).filter((step): step is ToolActivity => step.kind === 'tool')
-	const failed = tools.filter((tool) => tool.status === 'error').length
-	const pending = tools.filter((tool) => tool.status === 'requested' || tool.status === 'running').length
-	const active = live
-	const hasError = failed > 0
-	const [expanded, setExpanded] = useState(active || (live && hasError))
-	useEffect(() => {
-		if (live && hasError) setExpanded(true)
-	}, [live, hasError])
-	useEffect(() => {
-		if (!active && !(live && hasError)) setExpanded(false)
-	}, [active, live, hasError])
-
-	const toggle = (event: SyntheticEvent<HTMLDetailsElement>) => {
-		setExpanded(event.currentTarget.open)
-	}
-
-	// A collapsed group is marked with the latest iteration it contains, so
-	// the marker tracks progress. An expanded group instead marks each round
-	// on the row where the round actually begins: the first tool or
-	// reasoning step of that round inside the group. Rounds that begin with
-	// an output step outside the group keep their marker there and are not
-	// repeated inside.
-	let markerIteration: number | undefined
-	for (const flat of flats) {
-		if (flat.iterationStart) markerIteration = flat.iteration
-	}
-	const topMarker = expanded ? undefined : markerIteration
-	const status = hasError ? 'error' : pending > 0 ? 'running' : 'finished'
-	const badge = hasError ? `${failed} failed` : pending > 0 ? `${tools.length - pending}/${tools.length}` : 'Done'
-	const summary = toolGroupSummary(tools)
-	const targets = toolGroupTargets(tools)
-
-	return (
-		<details className={`tool-group ${status}`} open={expanded} onToggle={toggle}>
-			<summary>
-				{topMarker !== undefined && <i className="iteration-marker">{topMarker}</i>}
-				<ChevronIcon expanded={expanded} />
-				<ToolIcon />
-				<span className="tool-group-summary" title={summary}>{summary}</span>
-				{targets.map((target) => (
-					<code key={target} title={workspaceRoot && isPathOutsideWorkspace(workspaceRoot, target) ? `Outside workspace: ${target}` : target} className={workspaceRoot && isPathOutsideWorkspace(workspaceRoot, target) ? 'outside-workspace' : undefined}>{target}</code>
-				))}
-				<small>{badge}</small>
-			</summary>
-			{expanded && (
-				<div className="tool-group-body">
-					{flats.map(({ step, iteration, iterationStart }, index) => {
-						const marker = iterationStart ? <i className="iteration-marker">{iteration}</i> : undefined
-						if (step.kind === 'reasoning') {
-							// Reasoning still streaming inside a live group renders
-							// expanded and follows new lines, exactly like an
-							// ungrouped streaming reasoning block.
-							return <ReasoningStep key={step.id} step={step} marker={marker} streaming={live && index === flats.length - 1} />
-						}
-						if (step.kind === 'tool') return <ToolRow key={step.id} tool={step} marker={marker} onCancelTool={onCancelTool} sessionNames={sessionNames} workspaceRoot={workspaceRoot} />
-						return null
-					})}
-				</div>
-			)}
-		</details>
-	)
-}
-
-function toolGroupSummary(tools: ToolActivity[]): string {
-	const counts = new Map<string, number>()
-	for (const tool of tools) counts.set(tool.name, (counts.get(tool.name) ?? 0) + 1)
-	return [...counts.entries()].map(([name, count]) => toolPhrase(name, count)).join(' · ')
-}
-
-function toolPhrase(name: string, count: number): string {
-	if (isSessionToolName(name)) return sessionToolPhrase(name, count)
-	const plural = count === 1 ? '' : 's'
-	switch (name) {
-		case 'read_file': return `Read ${count} file${plural}`
-		case 'write_file': return `Wrote ${count} file${plural}`
-		case 'edit_file': return `Edited ${count} file${plural}`
-		case 'apply_patch': return `Applied ${count} patch${count === 1 ? '' : 'es'}`
-		case 'shell': return `Ran ${count} command${plural}`
-		case 'grep_files': return `Ran ${count} search${count === 1 ? '' : 'es'}`
-		case 'glob_files': return `Ran ${count} glob${plural}`
-		case 'list_files': return `Listed ${count} ${count === 1 ? 'directory' : 'directories'}`
-		default: return count > 1 ? `${name} ×${count}` : name
-	}
-}
-
-// toolGroupTargets names the files a run modified so that write operations
-// stay visible even while the group is collapsed.
-function toolGroupTargets(tools: ToolActivity[]): string[] {
-	const targets: string[] = []
-	for (const tool of tools) {
-		for (const target of toolWriteTargets(tool)) {
-			if (!targets.includes(target)) targets.push(target)
-		}
-	}
-	return targets
-}
-
-function toolWriteTargets(tool: ToolActivity): string[] {
-	const argumentsObject = parseToolArguments(tool.arguments)
-	if (tool.name === 'apply_patch') {
-		return stringField(argumentsObject, 'patch')
-			.split('\n')
-			.map((line) => /^\*\*\* (?:Add File|Update File|Delete File|Move to):\s*(.+)$/.exec(line)?.[1].trim() ?? '')
-			.filter(Boolean)
-	}
-	if (tool.name === 'write_file' || tool.name === 'edit_file') {
-		const target = toolTarget(tool.name, argumentsObject)
-		return target ? [target] : []
-	}
-	return []
-}
 
 // Distance from the bottom within which a streaming reasoning block keeps
 // following new lines; scrolling further up pauses the auto-scroll.

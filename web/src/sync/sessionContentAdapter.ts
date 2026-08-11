@@ -23,6 +23,7 @@ import {
   type SessionContentTransientItemWatermark,
   type SessionPrompt,
   type SessionRunState,
+  type SessionRunStepRef,
   type SessionRunFailure,
   type SessionToolState,
   type SessionTransientText,
@@ -451,6 +452,13 @@ function copyMap<T>(value: Readonly<Record<string, T>>): Record<string, T> {
   return { ...value }
 }
 
+function appendStepRef(run: SessionRunState, ref: SessionRunStepRef): readonly SessionRunStepRef[] {
+  const order = run.stepOrder
+  return order.some((current) => current.kind === ref.kind && current.key === ref.key)
+    ? order
+    : [...order, ref]
+}
+
 function durableInlineLength(snapshot: SessionContentSnapshot, key: SessionContentItemKey, reasoning: boolean): number {
   const item = findItem(snapshot, key)
   const text = textValue(item, reasoning)
@@ -551,7 +559,7 @@ function baseRunState(runEpoch: string, identity: ReturnType<typeof eventIdentit
     runCursor: cursor,
     ...(turnID === undefined ? {} : { turnID }),
     status: 'running',
-    text: {}, reasoning: {}, tools: {}, promptQueue: [], appendedPrompts: [], stale: false, recoveryRequired: false,
+    text: {}, reasoning: {}, tools: {}, stepOrder: [], promptQueue: [], appendedPrompts: [], stale: false, recoveryRequired: false,
   }
 }
 
@@ -574,7 +582,7 @@ function snapshotTransientBaseline(snapshot: SessionContentSnapshot): SessionRun
     runCursor: (first === 0n ? 0n : first - 1n).toString(),
     ...(active.turn_id === undefined ? {} : { turnID: active.turn_id }),
     status: 'running',
-    text: {}, reasoning: {}, tools: {}, promptQueue: [], appendedPrompts: [], stale: false, recoveryRequired: false,
+    text: {}, reasoning: {}, tools: {}, stepOrder: [], promptQueue: [], appendedPrompts: [], stale: false, recoveryRequired: false,
   }
 }
 
@@ -705,7 +713,9 @@ function updateRun(state: SessionContentState, event: Record<string, unknown>, s
       // transient delta. If the durable item already covers that checkpoint,
       // consume the frame without ever manufacturing a duplicate bubble.
       if (checkpointed && checkpointLength !== undefined && durableLength >= checkpointLength && old === undefined) {
-        next = identity.type === 'text.delta' ? { ...next, text: map } : { ...next, reasoning: map }
+        next = identity.type === 'text.delta'
+          ? { ...next, text: map }
+          : { ...next, reasoning: map, stepOrder: appendStepRef(next, { kind: 'reasoning', key: keyString }) }
         break
       }
       const text = `${old?.text ?? ''}${delta}`
@@ -716,7 +726,13 @@ function updateRun(state: SessionContentState, event: Record<string, unknown>, s
         ...(checkpointLength === undefined ? {} : { checkpointLength }),
         checkpointed,
       }
-      next = identity.type === 'text.delta' ? { ...next, text: map } : { ...next, reasoning: map }
+      next = identity.type === 'text.delta'
+        ? { ...next, text: map }
+        : {
+          ...next,
+          reasoning: map,
+          stepOrder: old ? next.stepOrder : appendStepRef(next, { kind: 'reasoning', key: keyString }),
+        }
       break
     }
     case 'tool.requested':
@@ -732,7 +748,7 @@ function updateRun(state: SessionContentState, event: Record<string, unknown>, s
         name: identifier(event.name, `${identity.type}.name`), status: identity.type === 'tool.requested' ? 'requested' : 'running',
         arguments: event.arguments === undefined ? old?.arguments ?? '' : stringValue(event.arguments, `${identity.type}.arguments`, true),
       }
-      next = { ...next, tools }
+      next = { ...next, tools, stepOrder: old ? next.stepOrder : appendStepRef(next, { kind: 'tool', key: toolID }) }
       break
     }
     case 'tool.progress': {
@@ -747,7 +763,7 @@ function updateRun(state: SessionContentState, event: Record<string, unknown>, s
         name: identifier(event.name, 'tool.progress.name'), status: old?.status ?? 'running',
         arguments: `${old?.arguments ?? ''}${stringValue(event.arguments_delta, 'tool.progress.arguments_delta', true)}`,
       }
-      next = { ...next, tools }
+      next = { ...next, tools, stepOrder: old ? next.stepOrder : appendStepRef(next, { kind: 'tool', key: toolID }) }
       break
     }
     case 'tool.finished': {
@@ -763,7 +779,7 @@ function updateRun(state: SessionContentState, event: Record<string, unknown>, s
         ...(event.content === undefined ? {} : { content: stringValue(event.content, 'tool.finished.content', true) }),
         is_error: booleanValue(event.is_error, 'tool.finished.is_error'),
       }
-      next = { ...next, tools }
+      next = { ...next, tools, stepOrder: old ? next.stepOrder : appendStepRef(next, { kind: 'tool', key: toolID }) }
       break
     }
     case 'run.prompt_queue': {

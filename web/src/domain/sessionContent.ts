@@ -227,6 +227,13 @@ export interface SessionPrompt {
   readonly steer: boolean
 }
 
+/** First-seen order of live process identities. Lifecycle updates reuse the
+ * same entry so status/content changes do not duplicate a rendered row. */
+export interface SessionRunStepRef {
+  readonly kind: 'reasoning' | 'tool'
+  readonly key: string
+}
+
 export interface SessionRunFailure {
   readonly turnID: string
   readonly code: string
@@ -244,6 +251,7 @@ export interface SessionRunState {
   readonly text: Readonly<Record<string, SessionTransientText>>
   readonly reasoning: Readonly<Record<string, SessionTransientText>>
   readonly tools: Readonly<Record<string, SessionToolState>>
+  readonly stepOrder: readonly SessionRunStepRef[]
   readonly promptQueue: readonly SessionPrompt[]
   readonly appendedPrompts: readonly string[]
   readonly settlement?: SessionContentSettlementWatermark

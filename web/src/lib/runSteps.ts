@@ -1,60 +1,24 @@
 import type { RunStep } from '../types'
 
-export function groupProcessSteps(steps: RunStep[]): Array<{ number: number; steps: RunStep[] }> {
-	const groups = new Map<number, RunStep[]>()
-	for (const step of steps) {
-		const iteration = normalizedAgentIteration(step.iteration)
-		groups.set(iteration, [...(groups.get(iteration) ?? []), step])
-	}
-	const rank = (step: RunStep) => step.kind === 'reasoning' ? 0 : step.kind === 'output' ? 1 : 2
-	return [...groups.entries()]
-		.sort(([left], [right]) => left - right)
-		.map(([number, turnSteps]) => ({ number, steps: [...turnSteps].sort((left, right) => rank(left) - rank(right)) }))
-}
-
 export interface FlatProcessStep {
 	step: RunStep
 	iteration: number
 	iterationStart: boolean
 }
 
-export type ProcessDisplayNode =
-	| { kind: 'step'; flat: FlatProcessStep }
-	| { kind: 'tool-group'; id: string; flats: FlatProcessStep[] }
-
-// foldToolGroups collapses maximal runs of consecutive tool steps into one
-// display group, across agent iterations. Reasoning counts as part of a tool
-// run and never breaks it; assistant output does. A run folds when it holds
-// at least one tool call and two steps —
-// shorter runs render as individual rows.
-export function foldToolGroups(steps: RunStep[]): ProcessDisplayNode[] {
-	const flats: FlatProcessStep[] = []
-	for (const iteration of groupProcessSteps(steps)) {
-		iteration.steps.forEach((step, index) => {
-			flats.push({ step, iteration: iteration.number, iterationStart: index === 0 })
-		})
-	}
-	const nodes: ProcessDisplayNode[] = []
-	let run: FlatProcessStep[] = []
-	const flush = () => {
-		const toolCount = run.filter((flat) => flat.step.kind === 'tool').length
-		if (run.length >= 2 && toolCount >= 1) {
-			nodes.push({ kind: 'tool-group', id: `tool-group-${run[0].step.id}`, flats: run })
-		} else {
-			for (const flat of run) nodes.push({ kind: 'step', flat })
+/** Adds display metadata without changing the provider/event order. */
+export function flattenProcessSteps(steps: RunStep[]): FlatProcessStep[] {
+	let previousIteration: number | undefined
+	return steps.map((step) => {
+		const iteration = normalizedAgentIteration(step.iteration)
+		const flat = {
+			step,
+			iteration,
+			iterationStart: previousIteration !== iteration,
 		}
-		run = []
-	}
-	for (const flat of flats) {
-		if (flat.step.kind === 'tool' || flat.step.kind === 'reasoning') {
-			run.push(flat)
-			continue
-		}
-		flush()
-		nodes.push({ kind: 'step', flat })
-	}
-	flush()
-	return nodes
+		previousIteration = iteration
+		return flat
+	})
 }
 
 function normalizedAgentIteration(iteration: number): number {

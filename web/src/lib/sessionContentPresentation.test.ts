@@ -97,7 +97,7 @@ describe('Session Content transient assistant presentation ownership', () => {
         [key('turn_1', 1, 'item_1')]: { key: { turn_id: 'turn_1', agent_iteration: 1, item_id: 'item_1' }, text: 'remaining', baseLength: 13, checkpointed: true },
         [key('turn_1', 2, 'item_2')]: { key: { turn_id: 'turn_1', agent_iteration: 2, item_id: 'item_2' }, text: 'other', baseLength: 3, checkpointed: false },
       },
-      reasoning: {}, tools: {}, promptQueue: [], appendedPrompts: [], stale: false, recoveryRequired: false,
+      reasoning: {}, tools: {}, stepOrder: [], promptQueue: [], appendedPrompts: [], stale: false, recoveryRequired: false,
     } satisfies SessionRunState
     const active = activeRunForConversation(viewWithRun(state), 'session_1')
     expect(active?.assistantText).toBe('')
@@ -137,6 +137,7 @@ describe('Session Content transient assistant presentation ownership', () => {
           arguments: JSON.stringify({ code: 'document.body.innerHTML', timeout_ms: 5000 }),
         },
       },
+      stepOrder: [{ kind: 'tool', key: 'call_1' }],
       promptQueue: [], appendedPrompts: [], stale: false, recoveryRequired: false,
     } satisfies SessionRunState
     const active = activeRunForConversation(viewWithRun(state), 'session_1')
@@ -146,6 +147,35 @@ describe('Session Content transient assistant presentation ownership', () => {
       expect(tool.arguments).toBe('{"code_bytes":23,"timeout_ms":5000}')
       expect(tool.arguments).not.toContain('document.body')
     }
+  })
+
+  it('preserves the first-seen interleaving of reasoning and tools', () => {
+    const reasoningA = key('turn_1', 1, 'reasoning_a')
+    const reasoningB = key('turn_1', 1, 'reasoning_b')
+    const state = {
+      runEpoch: 'epoch_1', runID: 'run_1', runCursor: '6', turnID: 'turn_1', status: 'running' as const,
+      text: {},
+      reasoning: {
+        [reasoningA]: { key: { turn_id: 'turn_1', agent_iteration: 1, item_id: 'reasoning_a' }, text: 'first', baseLength: 0, checkpointed: false },
+        [reasoningB]: { key: { turn_id: 'turn_1', agent_iteration: 1, item_id: 'reasoning_b' }, text: 'third', baseLength: 0, checkpointed: false },
+      },
+      tools: {
+        tool_a: { tool_call_id: 'tool_a', turn_id: 'turn_1', agent_iteration: 1, name: 'shell', status: 'finished' as const, arguments: '{}', content: 'ok', is_error: false },
+        tool_b: { tool_call_id: 'tool_b', turn_id: 'turn_1', agent_iteration: 1, name: 'read_file', status: 'running' as const, arguments: '{"path":"a.ts"}' },
+      },
+      stepOrder: [
+        { kind: 'reasoning' as const, key: reasoningA },
+        { kind: 'tool' as const, key: 'tool_a' },
+        { kind: 'reasoning' as const, key: reasoningB },
+        { kind: 'tool' as const, key: 'tool_b' },
+      ],
+      promptQueue: [], appendedPrompts: [], stale: false, recoveryRequired: false,
+    } satisfies SessionRunState
+
+    const active = activeRunForConversation(viewWithRun(state), 'session_1')
+    expect(active?.steps.map((step) => step.kind === 'reasoning' ? step.text : step.id)).toEqual([
+      'first', 'tool_a', 'third', 'tool_b',
+    ])
   })
 
   it('preserves Go safety summaries and fail-closed redaction', () => {
@@ -158,6 +188,7 @@ describe('Session Content transient assistant presentation ownership', () => {
           arguments: argumentsText,
         },
       },
+      stepOrder: [{ kind: 'tool', key: 'call_1' }],
       promptQueue: [], appendedPrompts: [], stale: false, recoveryRequired: false,
     } satisfies SessionRunState)
     const summary = '{"code_bytes":23,"timeout_ms":5000}'

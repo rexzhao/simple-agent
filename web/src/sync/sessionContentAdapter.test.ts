@@ -121,20 +121,26 @@ describe('SessionContentAdapter', () => {
     state = adapter.applyTransient(state, event('3', 'reasoning.delta', { turn_id: 'turn_a', agent_iteration: 1, item_id: 'item_a', delta: 'thinking' }), context)
     state = adapter.applyTransient(state, event('4', 'tool.requested', { turn_id: 'turn_a', agent_iteration: 1, tool_call_id: 'tool_a', name: 'shell', arguments: '{}' }), context)
     state = adapter.applyTransient(state, event('5', 'tool.progress', { turn_id: 'turn_a', agent_iteration: 1, tool_call_id: 'tool_a', name: 'shell', arguments_delta: 'x' }), context)
-    state = adapter.applyTransient(state, event('6', 'tool.finished', { turn_id: 'turn_a', agent_iteration: 1, tool_call_id: 'tool_a', name: 'shell', is_error: false, content: 'ok' }), context)
-    state = adapter.applyTransient(state, event('7', 'run.prompt_queue', { prompts: [{ id: 'p1', content: 'next', steer: false }] }), context)
-    state = adapter.applyTransient(state, event('8', 'run.prompt_appended', { prompts: ['later'] }), context)
+    state = adapter.applyTransient(state, event('6', 'reasoning.delta', { turn_id: 'turn_a', agent_iteration: 1, item_id: 'item_b', delta: 'next thought' }), context)
+    state = adapter.applyTransient(state, event('7', 'tool.finished', { turn_id: 'turn_a', agent_iteration: 1, tool_call_id: 'tool_a', name: 'shell', is_error: false, content: 'ok' }), context)
+    state = adapter.applyTransient(state, event('8', 'run.prompt_queue', { prompts: [{ id: 'p1', content: 'next', steer: false }] }), context)
+    state = adapter.applyTransient(state, event('9', 'run.prompt_appended', { prompts: ['later'] }), context)
     expect(state.transientRun?.text[JSON.stringify(['turn_a', 1, 'item_a'])].text).toBe('hello')
     expect(state.transientRun?.tools.tool_a.status).toBe('finished')
     expect(state.transientRun?.promptQueue[0].id).toBe('p1')
-    state = adapter.applyTransient(state, event('9', 'turn.failed', { turn_id: 'turn_a', code: 'model_http_error', message: '429: slow down and try again' }), context)
+    state = adapter.applyTransient(state, event('10', 'turn.failed', { turn_id: 'turn_a', code: 'model_http_error', message: '429: slow down and try again' }), context)
     expect(state.turnFailure).toEqual({ turnID: 'turn_a', code: 'model_http_error', message: '429: slow down and try again' })
-    state = adapter.applyTransient(state, event('10', 'run.settled', { status: 'committed', durable_settlement_watermark: { resource_revision: '9', run_cursor: '9', verified: false, covered_items: [] } }), { ...context, resourceRevision: '8' })
+    state = adapter.applyTransient(state, event('11', 'run.settled', { status: 'committed', durable_settlement_watermark: { resource_revision: '10', run_cursor: '10', verified: false, covered_items: [] } }), { ...context, resourceRevision: '8' })
     expect(state.transientRun?.status).toBe('committed')
     expect(state.transientRun?.recoveryRequired).toBe(true)
+    expect(state.transientRun?.stepOrder).toEqual([
+      { kind: 'reasoning', key: JSON.stringify(['turn_a', 1, 'item_a']) },
+      { kind: 'tool', key: 'tool_a' },
+      { kind: 'reasoning', key: JSON.stringify(['turn_a', 1, 'item_b']) },
+    ])
     state = adapter.applyChange(state, [{ op: 'item.upsert', item: item('item_a', 'hello') }], { ...context, resourceRevision: '9' })
     expect(state.transientRun).not.toBeNull()
-    expect(() => adapter.applyTransient(state, event('11', 'run.started', { status: 'running', run_id: 'run_a' }), { ...context, resourceRevision: '9' })).toThrow()
+    expect(() => adapter.applyTransient(state, event('12', 'run.started', { status: 'running', run_id: 'run_a' }), { ...context, resourceRevision: '9' })).toThrow()
   })
 
   it('counts turn failure message length by Unicode code points', () => {

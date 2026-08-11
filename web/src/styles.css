@@ -601,11 +601,6 @@ svg { width: 1.1em; height: 1.1em; fill: none; stroke: currentColor; stroke-widt
    9px gap. */
 .process-timeline { display: flex; flex-direction: column; gap: 8px; margin: 3px 0 14px; padding-left: 22px; }
 .iteration-marker { position: absolute; top: 9px; right: 100%; margin-right: 9px; color: var(--faint); font-family: var(--font-mono); font-size: 9px; font-weight: 500; font-style: normal; line-height: 1; pointer-events: none; }
-/* Tool group markers sit 2px further left so their digits align with the
-   assistant body text edge. Markers on rows inside an expanded group body
-   align to that same edge, accounting for the 10px body inset. */
-.tool-group .iteration-marker { margin-right: 11px; }
-.tool-group-body .iteration-marker { margin-right: 21px; }
 .reasoning-step { position: relative; padding: 7px 9px 8px 11px; border-left: 4px solid var(--accent); background: var(--panel-soft); }
 .reasoning-step > summary { display: flex; align-items: center; gap: 5px; list-style: none; cursor: pointer; }
 .reasoning-step > summary::-webkit-details-marker { display: none; }
@@ -652,25 +647,6 @@ svg { width: 1.1em; height: 1.1em; fill: none; stroke: currentColor; stroke-widt
 .tool-apply-patch pre .diff-context { color: #e5e7eb; }
 .tool-apply-patch pre .diff-removed { color: #fecaca; background: rgba(220, 38, 38, .24); }
 .tool-apply-patch pre .diff-added { color: #bbf7d0; background: rgba(21, 128, 61, .28); }
-
-/* A folded run of consecutive tool calls: one aggregated row that expands to
-   the member rows. */
-.tool-group { position: relative; width: min(660px, 100%); border: 2px solid var(--border); color: var(--text); background: #ffffff; font-family: "Space Grotesk", "Segoe UI", sans-serif; font-size: 10.5px; }
-.tool-group > summary { min-height: 35px; display: flex; align-items: center; gap: 8px; padding: 6px 9px; list-style: none; cursor: pointer; }
-.tool-group > summary::-webkit-details-marker { display: none; }
-.tool-group > summary:hover { background: var(--accent-soft); }
-.tool-group[open] > summary { border-bottom: 2px solid var(--border); background: var(--panel); }
-.tool-group > summary > svg { width: 15px; height: 15px; flex: 0 0 auto; color: var(--text); }
-.tool-group > summary > svg:nth-of-type(1) { width: 11px; height: 11px; color: var(--muted); }
-.tool-group > summary > svg.expanded { transform: rotate(180deg); }
-.tool-group-summary { min-width: 0; overflow: hidden; font-weight: 800; text-overflow: ellipsis; white-space: nowrap; }
-.tool-group > summary code { min-width: 0; overflow: hidden; color: var(--muted); font: 10px var(--font-mono); text-overflow: ellipsis; white-space: nowrap; }
-.tool-group > summary small { flex: 0 0 auto; margin-left: auto; padding: 2px 5px; border: 1px solid var(--border); color: var(--text); background: var(--panel); font-size: 9px; font-weight: 800; }
-.tool-group.running > summary small { background: var(--accent); }
-.tool-group.running > summary > svg:nth-of-type(2) { color: var(--accent-hover); animation: spin 1.3s linear infinite; }
-.tool-group.finished > summary small { color: #ffffff; background: var(--success); }
-.tool-group.error > summary small { color: #ffffff; background: var(--danger); }
-.tool-group-body { display: flex; flex-direction: column; gap: 8px; padding: 8px; background: var(--panel); }
 
 .compaction-record { display: flex; align-items: center; gap: 10px; margin: 0 0 30px; padding: 0 6px; color: var(--faint); font-size: 11.5px; }
 .compaction-record-rule { flex: 1; border-top: 1px solid var(--faint); opacity: .3; }
@@ -929,5 +905,5 @@ svg { width: 1.1em; height: 1.1em; fill: none; stroke: currentColor; stroke-widt
 .full-access-choice input { width: 16px; height: 16px; margin: 1px 0 0; accent-color: var(--accent-hover); }
 .full-access-choice span { display: grid; gap: 3px; }
 .full-access-choice small { color: var(--muted); font-size: 9px; font-weight: 500; line-height: 1.4; }
-.tool-row-header code.outside-workspace, .tool-group code.outside-workspace { color: #92610a; background: var(--accent-soft); font-weight: 700; }
+.tool-row-header code.outside-workspace { color: #92610a; background: var(--accent-soft); font-weight: 700; }
 .outside-workspace-flag { flex: 0 0 auto; display: inline-flex; align-items: center; justify-content: center; width: 15px; height: 15px; border: 1.5px solid var(--border); background: var(--accent); color: var(--text); font-size: 10px; font-weight: 800; }

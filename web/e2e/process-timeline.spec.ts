@@ -35,8 +35,6 @@ async function installTimeline(page: Page, initial: Array<Record<string, unknown
   return installSyncMock(page, { projects: [project], sessions: [session], onCommand: runFixture(initial, gates, settledItems) })
 }
 
-function groupStates(page: Page) { return page.locator('details.tool-group').evaluateAll((els) => els.map((el) => ({ open: (el as HTMLDetailsElement).open, summary: el.querySelector('.tool-group-summary')?.textContent }))) }
-
 async function expectMarkerVisible(page: Page) {
   const marker = page.locator('.iteration-marker').first()
   await expect(marker).toBeAttached()
@@ -51,7 +49,7 @@ async function expectMarkerVisible(page: Page) {
   expect(probe).toBe('I.iteration-marker')
 }
 
-test('iteration markers are painted next to live tool groups', async ({ page }) => {
+test('iteration markers are painted next to flat live tool rows', async ({ page }) => {
   const hold = newGate()
   await installTimeline(page, [
     { type: 'tool.requested', turn_id: 'turn-main', agent_iteration: 1, tool_call_id: 't1', name: 'read_file', arguments: '{"path":"a.ts"}' },
@@ -63,14 +61,14 @@ test('iteration markers are painted next to live tool groups', async ({ page }) 
   await page.goto('/#token=e2e')
   await page.getByPlaceholder('Send a message to SAI').fill('Run tools')
   await page.getByRole('button', { name: 'Send' }).click()
-  await expect(page.locator('details.tool-group')).toHaveCount(1)
+  await expect(page.locator('.tool-group')).toHaveCount(0)
+  await expect(page.locator('.tool-row')).toHaveCount(3)
   await expectMarkerVisible(page)
-  expect(await page.locator('.tool-group-body .iteration-marker').allTextContents()).toEqual(['1', '2'])
-  expect(await page.locator('.tool-group-body .iteration-marker').first().evaluate((el) => getComputedStyle(el).marginRight)).toBe('21px')
+  expect(await page.locator('.iteration-marker').allTextContents()).toEqual(['1', '2'])
   hold.release([])
 })
 
-test('typed live tool batches remain coherent around streamed text', async ({ page }) => {
+test('typed live tool and reasoning rows remain in event order around streamed text', async ({ page }) => {
   const hold = newGate()
   await installTimeline(page, [
     { type: 'tool.requested', turn_id: 'turn-main', agent_iteration: 1, tool_call_id: 't1', name: 'read_file', arguments: '{"path":"a.ts"}' },
@@ -85,17 +83,14 @@ test('typed live tool batches remain coherent around streamed text', async ({ pa
   await page.goto('/#token=e2e')
   await page.getByPlaceholder('Send a message to SAI').fill('Run tools')
   await page.getByRole('button', { name: 'Send' }).click()
-  await expect(page.locator('details.tool-group')).toHaveCount(2)
+  await expect(page.locator('.tool-group')).toHaveCount(0)
+  await expect(page.locator('.tool-row')).toHaveCount(4)
   await expect(page.locator('.assistant-stream').last()).toContainText('I have both files, now editing.')
-  expect(await groupStates(page)).toEqual([
-    { open: false, summary: 'Read 2 files' },
-    { open: true, summary: 'Edited 2 files' },
-  ])
   expect(await page.locator('.iteration-marker').allTextContents()).toEqual(['1', '2'])
   hold.release([])
 })
 
-test('tool batches without intermediate text keep the live group open', async ({ page }) => {
+test('tool rows without intermediate text remain individually visible', async ({ page }) => {
   const hold = newGate()
   await installTimeline(page, [
     { type: 'tool.requested', turn_id: 'turn-main', agent_iteration: 1, tool_call_id: 't1', name: 'read_file', arguments: '{"path":"a.ts"}' },
@@ -107,13 +102,13 @@ test('tool batches without intermediate text keep the live group open', async ({
   await page.goto('/#token=e2e')
   await page.getByPlaceholder('Send a message to SAI').fill('Run tools')
   await page.getByRole('button', { name: 'Send' }).click()
-  await expect(page.locator('details.tool-group')).toHaveCount(1)
-  await page.waitForTimeout(200)
-  expect(await groupStates(page)).toEqual([{ open: true, summary: 'Read 2 files · Ran 1 command' }])
+  await expect(page.locator('.tool-group')).toHaveCount(0)
+  await expect(page.locator('.tool-row')).toHaveCount(3)
+  await expect(page.locator('.tool-row.requested')).toHaveCount(1)
   hold.release([])
 })
 
-test('round markers remain visible when typed tool batches share one live group', async ({ page }) => {
+test('round markers remain visible on flat tool rows', async ({ page }) => {
   const hold = newGate()
   await installTimeline(page, [
     { type: 'tool.requested', turn_id: 'turn-main', agent_iteration: 1, tool_call_id: 't1', name: 'read_file', arguments: '{"path":"a.ts"}' }, { type: 'tool.finished', turn_id: 'turn-main', agent_iteration: 1, tool_call_id: 't1', name: 'read_file', is_error: false, content: 'a' },
@@ -126,13 +121,9 @@ test('round markers remain visible when typed tool batches share one live group'
   await page.goto('/#token=e2e')
   await page.getByPlaceholder('Send a message to SAI').fill('Run tools')
   await page.getByRole('button', { name: 'Send' }).click()
-  await expect(page.locator('details.tool-group')).toHaveCount(2)
-  expect(await groupStates(page)).toEqual([
-    { open: false, summary: 'Read 2 files' },
-    { open: true, summary: 'Ran 3 commands' },
-  ])
-  expect(await page.locator('.step-message .iteration-marker').allTextContents()).toEqual(['2'])
-  expect(await page.locator('details.tool-group').nth(1).locator('.tool-group-body .iteration-marker').allTextContents()).toEqual(['3'])
+  await expect(page.locator('.tool-group')).toHaveCount(0)
+  await expect(page.locator('.tool-row')).toHaveCount(5)
+  expect(await page.locator('.iteration-marker').allTextContents()).toEqual(['1', '2', '3'])
   hold.release([])
 })
 
@@ -153,7 +144,7 @@ function settledToolItems(failed = false) {
   ]
 }
 
-test('groups render collapsed with visible markers after the run settles', async ({ page }) => {
+test('settled tool calls render as separate rows with visible markers', async ({ page }) => {
   const settle = newGate()
   let committed = false
   const server = await installTimeline(page, [
@@ -164,18 +155,19 @@ test('groups render collapsed with visible markers after the run settles', async
   await page.goto('/#token=e2e')
   await page.getByPlaceholder('Send a message to SAI').fill('Run tools')
   await page.getByRole('button', { name: 'Send' }).click()
-  await expect(page.locator('details.tool-group')).toHaveCount(1)
+  await expect(page.locator('.tool-group')).toHaveCount(0)
+  await expect(page.locator('.tool-row')).toHaveCount(2)
   committed = true
   settle.release([])
   await expect(page.getByLabel('Session status: idle')).toBeVisible()
   await expect(page.locator('.message.assistant:not(.transient)').last()).toContainText('All done.')
-  expect(await groupStates(page)).toEqual([{ open: false, summary: 'Read 2 files · Ran 1 command' }])
+  await expect(page.locator('.process-message .tool-row')).toHaveCount(3)
   await expectMarkerVisible(page)
-  expect(await page.locator('.tool-group > summary > .iteration-marker').first().evaluate((el) => getComputedStyle(el).marginRight)).toBe('11px')
+  expect(await page.locator('.iteration-marker').allTextContents()).toEqual(['1', '2'])
   void server
 })
 
-test('failed tools expand the live group but stay collapsed once settled', async ({ page }) => {
+test('failed tool rows stay individually visible once settled', async ({ page }) => {
   const settle = newGate()
   let committed = false
   await installTimeline(page, [
@@ -185,12 +177,11 @@ test('failed tools expand the live group but stay collapsed once settled', async
   await page.goto('/#token=e2e')
   await page.getByPlaceholder('Send a message to SAI').fill('Run tools')
   await page.getByRole('button', { name: 'Send' }).click()
-  await expect(page.locator('details.tool-group')).toHaveCount(1)
-  expect(await groupStates(page)).toEqual([{ open: true, summary: 'Read 2 files' }])
+  await expect(page.locator('.tool-group')).toHaveCount(0)
+  await expect(page.locator('.tool-row')).toHaveCount(2)
   committed = true
   settle.release([])
   await expect(page.getByLabel('Session status: idle')).toBeVisible()
   await expect(page.locator('.message.assistant:not(.transient)').last()).toContainText('One read failed.')
-  expect(await groupStates(page)).toEqual([{ open: false, summary: 'Read 2 files' }])
-  await expect(page.locator('.tool-group > summary small')).toHaveText('1 failed')
+  await expect(page.locator('.tool-row.error')).toHaveCount(1)
 })

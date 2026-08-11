@@ -301,7 +301,7 @@ test('restores the previous scroll position when switching back to a session', a
   expect(await distanceFromBottom(page)).toBeGreaterThan(100)
 })
 
-test('loads finished sessions with failed tool groups collapsed', async ({ page }) => {
+test('loads finished sessions with failed tool rows individually visible', async ({ page }) => {
   const stamp = (seq: number) => new Date(seq * 1000).toISOString()
   const toolItems = [
     { seq: 101, id: 'i1', turn_id: 'turn-1', created_at: stamp(101), kind: 'message', visibility: 'visible', audience: 'user', message: { role: 'user', content: { inline: 'Run tools' } } },
@@ -312,10 +312,9 @@ test('loads finished sessions with failed tool groups collapsed', async ({ page 
   ]
   await installSyncMock(page, { projects: [project], sessions: [session], contents: { [session.id]: { items: toolItems, hasMoreBefore: false } } })
   await page.goto('/#token=e2e')
-  await expect(page.locator('details.tool-group')).toHaveCount(1)
-  expect(await page.locator('details.tool-group').evaluate((element) => (element as HTMLDetailsElement).open)).toBe(false)
-  await expect(page.locator('.tool-group-summary')).toHaveText('Read 2 files')
-  await expect(page.locator('.tool-group > summary small')).toHaveText('1 failed')
+  await expect(page.locator('.tool-group')).toHaveCount(0)
+  await expect(page.locator('.process-message .tool-row')).toHaveCount(2)
+  await expect(page.locator('.process-message .tool-row.error')).toHaveCount(1)
 })
 
 function firstVisible(page: Page) {

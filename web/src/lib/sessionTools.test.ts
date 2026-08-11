@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { isSessionToolName, prettyJSONText, sessionToolPhrase, sessionToolTarget } from './sessionTools'
+import { isSessionToolName, prettyJSONText, sessionToolTarget } from './sessionTools'
 
 const sessionNames = {
 	'20260729T031859.164118400Z-ff61fe47': 'M10 compilation boundary fix review',
@@ -74,25 +74,6 @@ describe('sessionToolTarget', () => {
 
 	it('returns an empty summary for session_models', () => {
 		expect(sessionToolTarget('session_models', {})).toBe('')
-	})
-})
-
-describe('sessionToolPhrase', () => {
-	it('phrases singular and plural counts', () => {
-		expect(sessionToolPhrase('session_start', 1)).toBe('Started 1 session')
-		expect(sessionToolPhrase('session_start', 3)).toBe('Started 3 sessions')
-		expect(sessionToolPhrase('session_search', 1)).toBe('Searched sessions')
-		expect(sessionToolPhrase('session_get', 2)).toBe('Inspected sessions ×2')
-		expect(sessionToolPhrase('session_history', 1)).toBe('Read session history')
-		expect(sessionToolPhrase('session_send', 2)).toBe('Sent 2 session messages')
-		expect(sessionToolPhrase('session_wait', 1)).toBe('Waited on a session')
-		expect(sessionToolPhrase('session_stop', 2)).toBe('Stopped 2 sessions')
-		expect(sessionToolPhrase('session_models', 2)).toBe('Listed session models')
-	})
-
-	it('falls back to the raw name for unknown tools', () => {
-		expect(sessionToolPhrase('mystery', 1)).toBe('mystery')
-		expect(sessionToolPhrase('mystery', 4)).toBe('mystery ×4')
 	})
 })
 

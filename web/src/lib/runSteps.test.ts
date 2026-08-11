@@ -1,20 +1,18 @@
 import { describe, expect, it } from 'vitest'
 import type { RunStep } from '../types'
-import { foldToolGroups } from './runSteps'
+import { flattenProcessSteps } from './runSteps'
 
-describe('foldToolGroups', () => {
-  it('merges tool activity across agent iterations', () => {
+describe('flattenProcessSteps', () => {
+  it('keeps interleaved tool and reasoning steps in provider order', () => {
     const steps: RunStep[] = [
       { kind: 'tool', id: 'one', name: 'read', iteration: 1, status: 'finished' },
-      { kind: 'reasoning', id: 'reason', text: 'next', iteration: 2 },
+      { kind: 'reasoning', id: 'reason-one', text: 'between', iteration: 1 },
       { kind: 'tool', id: 'two', name: 'write', iteration: 2, status: 'running' },
+      { kind: 'reasoning', id: 'reason-two', text: 'after', iteration: 1 },
     ]
 
-    const nodes = foldToolGroups(steps)
-    expect(nodes).toHaveLength(1)
-    expect(nodes[0]).toMatchObject({ kind: 'tool-group' })
-    if (nodes[0].kind === 'tool-group') {
-      expect(nodes[0].flats.map((flat) => flat.step.id)).toEqual(['one', 'reason', 'two'])
-    }
+    const flat = flattenProcessSteps(steps)
+    expect(flat.map((entry) => entry.step.id)).toEqual(['one', 'reason-one', 'two', 'reason-two'])
+    expect(flat.map((entry) => entry.iterationStart)).toEqual([true, false, true, true])
   })
 })
