@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { act, cleanup, render, screen, fireEvent } from '@testing-library/react'
-import { PROCESS_HOVER_HIDE_DELAY_MS, PROCESS_HOVER_POPOVER_GAP_PX, PROCESS_HOVER_REPLACE_DELAY_MS, ProcessTimeline } from './ProcessTimeline'
+import { calculatePopoverPosition, PROCESS_HOVER_HIDE_DELAY_MS, PROCESS_HOVER_REPLACE_DELAY_MS, ProcessTimeline } from './ProcessTimeline'
 import type { RunStep, ToolActivity } from '../types'
 
 afterEach(() => {
@@ -186,15 +186,14 @@ describe('ProcessTimeline session tools', () => {
 			tool({ id: 'lower', name: 'shell', arguments: JSON.stringify({ command: 'lower command' }) }),
 		]} />)
 		const triggers = Array.from(container.querySelectorAll('.tool-row-header'))
-		const rows = Array.from(container.querySelectorAll('.tool-row'))
-		mockRect(rows[0], 300, 80, 660, 39)
-		mockRect(rows[1], 680, 80, 660, 39)
+		mockRect(triggers[0], 300)
+		mockRect(triggers[1], 680)
 
 		fireEvent.mouseEnter(triggers[0])
 		const below = screen.getByRole('tooltip')
 		const belowTop = Number.parseFloat(below.style.top)
 		const belowMaxHeight = Number.parseFloat(below.style.maxHeight)
-		const upperBottom = 339
+		const upperBottom = 332
 		const viewportHeight = window.innerHeight
 		expect(below.getAttribute('data-placement')).toBe('below')
 		expect(belowTop).toBeGreaterThanOrEqual(upperBottom + 8)
@@ -215,7 +214,7 @@ describe('ProcessTimeline session tools', () => {
 		expect(above.textContent).toContain('lower command')
 	})
 
-	it('uses the same non-edge gap for tool and reasoning popovers', () => {
+	it('uses the same positive horizontal offset for tool and reasoning popovers', () => {
 		vi.useFakeTimers()
 		const reasoning: RunStep = { kind: 'reasoning', id: 'reasoning-anchor', text: 'private thoughts', iteration: 1 }
 		const { container } = render(<ProcessTimeline steps={[reasoning, tool({ id: 'tool-anchor', name: 'shell', arguments: JSON.stringify({ command: 'details' }) })]} />)
@@ -223,11 +222,11 @@ describe('ProcessTimeline session tools', () => {
 		const reasoningOuter = container.querySelector('.reasoning-step') as Element
 		const toolTrigger = container.querySelector('.tool-row-header') as Element
 		const toolOuter = container.querySelector('.tool-row') as Element
-		const reasoningOuterBottom = 327
-		const toolOuterBottom = 339
+		const timeline = container.querySelector('.process-timeline') as Element
 		// Model the real boxes: reasoning has inner padding, while the tool row
-		// has a border and a taller header. The hover anchor is the visible row
-		// in both cases, not the differently sized inner trigger.
+		// has a border and a taller header. Both rows use the shared timeline
+		// frame for horizontal positioning, not their differently sized widths.
+		mockRect(timeline, 300, 80, 878, 100)
 		mockRect(reasoningOuter, 300, 80, 420, 27)
 		mockRect(reasoningTrigger, 307, 90, 400, 12)
 		mockRect(toolOuter, 300, 80, 500, 39)
@@ -235,17 +234,24 @@ describe('ProcessTimeline session tools', () => {
 
 		fireEvent.mouseEnter(reasoningTrigger)
 		const reasoningPopup = screen.getByRole('tooltip')
-		const reasoningGap = Number.parseFloat(reasoningPopup.style.top) - reasoningOuterBottom
+		const reasoningOffset = Number.parseFloat(reasoningPopup.style.left) - 80
 		expect(reasoningPopup.getAttribute('data-placement')).toBe('below')
 
 		fireEvent.mouseEnter(toolTrigger)
 		act(() => { vi.advanceTimersByTime(PROCESS_HOVER_REPLACE_DELAY_MS) })
 		const toolPopup = screen.getByRole('tooltip')
-		const toolGap = Number.parseFloat(toolPopup.style.top) - toolOuterBottom
+		const toolOffset = Number.parseFloat(toolPopup.style.left) - 80
 		expect(toolPopup.getAttribute('data-placement')).toBe('below')
-		expect(reasoningGap).toBe(PROCESS_HOVER_POPOVER_GAP_PX)
-		expect(toolGap).toBe(PROCESS_HOVER_POPOVER_GAP_PX)
-		expect(toolGap).toBe(reasoningGap)
+		expect(reasoningOffset).toBeGreaterThan(0)
+		expect(toolOffset).toBe(reasoningOffset)
+		expect(reasoningOffset).toBe((878 - 680) / 2)
+
+		const clamped = calculatePopoverPosition(
+			{ top: 300, bottom: 332, left: 80, right: 736, width: 656, height: 32 },
+			{ top: 0, bottom: 100, left: 0, right: 680, width: 680, height: 100 },
+			{ top: 300, bottom: 400, left: 900, right: 1778, width: 878, height: 100 },
+		)
+		expect(clamped.left).toBe(window.innerWidth - 680 - 12)
 	})
 
 	it('keeps the popup during trigger-leave delay and hides after popup-leave delay', () => {

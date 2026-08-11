@@ -1,6 +1,6 @@
 import { createPortal } from 'react-dom'
 import { createContext, memo, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
-import type { KeyboardEvent, ReactNode } from 'react'
+import type { KeyboardEvent, ReactNode, RefObject } from 'react'
 import Markdown from 'react-markdown'
 import type { Components } from 'react-markdown'
 import remarkGfm from 'remark-gfm'
@@ -26,6 +26,7 @@ type ProcessHoverEntry = {
 	id: string
 	kind: 'reasoning' | 'tool'
 	trigger: HTMLElement
+	horizontalReference: HTMLElement
 	content: ReactNode
 	label: string
 }
@@ -157,12 +158,13 @@ function ProcessTimelineContent({ steps, live = false, onCancelTool, sessionName
 	const nodes = flattenProcessSteps(steps)
 	const lastFlat = nodes[nodes.length - 1]
 	const lastStepID = lastFlat?.step.id
+	const timelineRef = useRef<HTMLDivElement>(null)
 	return (
-		<div className="process-timeline">
+		<div ref={timelineRef} className="process-timeline">
 			{nodes.map(({ step, iteration, iterationStart }) => {
 				const marker = iterationStart ? <i className="iteration-marker">{iteration}</i> : null
 				if (step.kind === 'reasoning') {
-					return <ReasoningStep key={step.id} step={step} marker={marker} streaming={live && step.id === lastStepID} />
+					return <ReasoningStep key={step.id} step={step} marker={marker} streaming={live && step.id === lastStepID} horizontalReferenceRef={timelineRef} />
 				}
 				if (step.kind === 'output') {
 					// Mid-turn assistant output renders like the final assistant
@@ -173,7 +175,7 @@ function ProcessTimelineContent({ steps, live = false, onCancelTool, sessionName
 						</div>
 					)
 				}
-				return <ToolRow key={step.id} tool={step} marker={marker} onCancelTool={onCancelTool} sessionNames={sessionNames} workspaceRoot={workspaceRoot} />
+				return <ToolRow key={step.id} tool={step} marker={marker} onCancelTool={onCancelTool} sessionNames={sessionNames} workspaceRoot={workspaceRoot} horizontalReferenceRef={timelineRef} />
 			})}
 		</div>
 	)
@@ -181,16 +183,16 @@ function ProcessTimelineContent({ steps, live = false, onCancelTool, sessionName
 
 function ProcessHoverPopover({ entry, onEnter, onLeave, onClose }: { entry: ProcessHoverEntry; onEnter: () => void; onLeave: () => void; onClose: () => void }) {
 	const popoverRef = useRef<HTMLDivElement>(null)
-	const [position, setPosition] = useState(() => calculatePopoverPosition(entry.trigger.getBoundingClientRect()))
+	const [position, setPosition] = useState(() => calculatePopoverPosition(entry.trigger.getBoundingClientRect(), undefined, horizontalReferenceRect(entry.horizontalReference)))
 
 	const reposition = useCallback(() => {
-		if (!entry.trigger.isConnected) {
+		if (!entry.trigger.isConnected || !entry.horizontalReference.isConnected) {
 			onClose()
 			return
 		}
-		const next = calculatePopoverPosition(entry.trigger.getBoundingClientRect(), popoverRef.current?.getBoundingClientRect())
+		const next = calculatePopoverPosition(entry.trigger.getBoundingClientRect(), popoverRef.current?.getBoundingClientRect(), horizontalReferenceRect(entry.horizontalReference))
 		setPosition((previous) => previous.top === next.top && previous.left === next.left && previous.maxHeight === next.maxHeight && previous.placement === next.placement ? previous : next)
-	}, [entry.trigger, onClose])
+	}, [entry.horizontalReference, entry.trigger, onClose])
 
 	useLayoutEffect(() => {
 		reposition()
@@ -226,15 +228,38 @@ function ProcessHoverPopover({ entry, onEnter, onLeave, onClose }: { entry: Proc
 type ViewportRect = Pick<DOMRect, 'top' | 'bottom' | 'left' | 'right' | 'width' | 'height'>
 type PopoverPosition = { top: number; left: number; maxHeight: number; placement: 'above' | 'below' }
 
-export function calculatePopoverPosition(trigger: ViewportRect, popup?: ViewportRect): PopoverPosition {
+function horizontalReferenceRect(element: HTMLElement): ViewportRect {
+	const rect = element.getBoundingClientRect()
+	const styles = typeof window === 'undefined' ? undefined : window.getComputedStyle(element)
+	const paddingLeft = styles ? pixelValue(styles.paddingLeft) : 0
+	const paddingRight = styles ? pixelValue(styles.paddingRight) : 0
+	return {
+		top: rect.top,
+		bottom: rect.bottom,
+		left: rect.left + paddingLeft,
+		right: rect.right - paddingRight,
+		width: Math.max(0, rect.width - paddingLeft - paddingRight),
+		height: rect.height,
+	}
+}
+
+function pixelValue(value: string): number {
+	const parsed = Number.parseFloat(value)
+	return Number.isFinite(parsed) ? parsed : 0
+}
+
+// `trigger` owns placement and the vertical gap. `horizontalReference` is a
+// shared content frame so padding, borders, and per-row widths do not change
+// the horizontal offset.
+export function calculatePopoverPosition(trigger: ViewportRect, popup?: ViewportRect, horizontalReference: ViewportRect = trigger): PopoverPosition {
 	const viewportWidth = typeof window === 'undefined' ? 1024 : Math.max(1, window.innerWidth || document.documentElement.clientWidth || 1024)
 	const viewportHeight = typeof window === 'undefined' ? 768 : Math.max(1, window.innerHeight || document.documentElement.clientHeight || 768)
 	const margin = 12
 	const fallbackWidth = Math.max(1, Math.min(680, viewportWidth - margin * 2))
 	const fallbackHeight = Math.max(1, Math.min(520, viewportHeight - margin * 2))
 	const popupWidth = popup?.width ? Math.max(1, Math.min(popup.width, viewportWidth - margin * 2)) : fallbackWidth
-	const triggerWidth = trigger.width || Math.max(0, trigger.right - trigger.left)
 	const triggerHeight = trigger.height || Math.max(0, trigger.bottom - trigger.top)
+	const referenceWidth = horizontalReference.width || Math.max(0, horizontalReference.right - horizontalReference.left)
 	const center = trigger.top + triggerHeight / 2
 	const placement = center < viewportHeight / 2 ? 'below' : 'above'
 	const sideSpace = placement === 'below'
@@ -248,7 +273,7 @@ export function calculatePopoverPosition(trigger: ViewportRect, popup?: Viewport
 	const top = placement === 'below'
 		? trigger.bottom + PROCESS_HOVER_POPOVER_GAP_PX
 		: trigger.top - PROCESS_HOVER_POPOVER_GAP_PX - popupHeight
-	const desiredLeft = trigger.left + (triggerWidth - popupWidth) / 2
+	const desiredLeft = horizontalReference.left + (referenceWidth - popupWidth) / 2
 	const left = clamp(desiredLeft, margin, Math.max(margin, viewportWidth - popupWidth - margin))
 	return { top, left, maxHeight, placement }
 }
@@ -260,11 +285,11 @@ function clamp(value: number, minimum: number, maximum: number): number {
 // ReasoningStep exposes only the compact summary in the list. The full text is
 // rendered by the shared body portal, so no inline details can be clipped by
 // the virtual scroller.
-function ReasoningStep({ step, marker, streaming }: { step: ReasoningActivity; marker?: ReactNode; streaming: boolean }) {
+function ReasoningStep({ step, marker, streaming, horizontalReferenceRef }: { step: ReasoningActivity; marker?: ReactNode; streaming: boolean; horizontalReferenceRef: RefObject<HTMLDivElement | null> }) {
 	const [nowMS, setNowMS] = useState(() => Date.now())
 	const hover = useContext(ProcessHoverContext)
-	// The painted row is the geometry anchor. Using the compact inner trigger
-	// here would make its padding contribute to the visible popup gap.
+	// Keep the compact trigger as the vertical/hover anchor; the shared timeline
+	// frame supplies horizontal positioning so row widths do not change it.
 	const triggerRef = useRef<HTMLDivElement>(null)
 	const id = `reasoning-${step.id}`
 	const durationMS = reasoningDurationMS(step.reasoningTiming, streaming, nowMS)
@@ -279,10 +304,14 @@ function ReasoningStep({ step, marker, streaming }: { step: ReasoningActivity; m
 	}, [step.reasoningTiming?.endedAt, step.reasoningTiming?.startedAt, streaming])
 
 	useEffect(() => {
-		if (triggerRef.current) hover?.update({ id, kind: 'reasoning', trigger: triggerRef.current, content, label: 'Reasoning' })
-	}, [content, hover, id])
+		const trigger = triggerRef.current
+		const horizontalReference = horizontalReferenceRef.current
+		if (trigger && horizontalReference) hover?.update({ id, kind: 'reasoning', trigger, horizontalReference, content, label: 'Reasoning' })
+	}, [content, horizontalReferenceRef, hover, id])
 	const show = () => {
-		if (triggerRef.current) hover?.show({ id, kind: 'reasoning', trigger: triggerRef.current, content, label: 'Reasoning' })
+		const trigger = triggerRef.current
+		const horizontalReference = horizontalReferenceRef.current
+		if (trigger && horizontalReference) hover?.show({ id, kind: 'reasoning', trigger, horizontalReference, content, label: 'Reasoning' })
 	}
 	const leave = () => {
 		if (triggerRef.current) hover?.leaveTrigger(triggerRef.current)
@@ -298,8 +327,9 @@ function ReasoningStep({ step, marker, streaming }: { step: ReasoningActivity; m
 	}
 
 	return (
-		<div ref={triggerRef} className="reasoning-step">
+		<div className="reasoning-step">
 			<div
+				ref={triggerRef}
 				className="reasoning-trigger"
 				role="button"
 				tabIndex={0}
@@ -339,10 +369,10 @@ function ActivityStatusDot({ className, label }: { className: string; label: str
 	return <span className={`process-status-dot ${className}`} role="img" aria-label={label} />
 }
 
-function ToolRow({ tool, marker, onCancelTool, sessionNames, workspaceRoot }: { tool: ToolActivity; marker?: ReactNode; onCancelTool?: (toolCallID: string) => void; sessionNames?: Record<string, string>; workspaceRoot?: string }) {
+function ToolRow({ tool, marker, onCancelTool, sessionNames, workspaceRoot, horizontalReferenceRef }: { tool: ToolActivity; marker?: ReactNode; onCancelTool?: (toolCallID: string) => void; sessionNames?: Record<string, string>; workspaceRoot?: string; horizontalReferenceRef: RefObject<HTMLDivElement | null> }) {
 	const hover = useContext(ProcessHoverContext)
-	// The painted row is the geometry anchor. The header has a different
-	// border/padding box than reasoning's inner trigger.
+	// Keep the header as the vertical/hover anchor; the shared timeline frame
+	// supplies horizontal positioning so row borders/widths do not change it.
 	const triggerRef = useRef<HTMLDivElement>(null)
 	const argumentsObject = parseToolArguments(tool.arguments)
 	const isSessionTool = isSessionToolName(tool.name)
@@ -377,7 +407,9 @@ function ToolRow({ tool, marker, onCancelTool, sessionNames, workspaceRoot }: { 
 	), [command, newText, oldText, patch, result, showArguments, showEditDiff, showPatch, showResult, target, tool.arguments, tool.name])
 	const id = `tool-${tool.id}`
 	const show = () => {
-		if (triggerRef.current) hover?.show({ id, kind: 'tool', trigger: triggerRef.current, content: details, label: tool.name })
+		const trigger = triggerRef.current
+		const horizontalReference = horizontalReferenceRef.current
+		if (trigger && horizontalReference) hover?.show({ id, kind: 'tool', trigger, horizontalReference, content: details, label: tool.name })
 	}
 	const leave = () => {
 		if (triggerRef.current) hover?.leaveTrigger(triggerRef.current)
@@ -387,8 +419,10 @@ function ToolRow({ tool, marker, onCancelTool, sessionNames, workspaceRoot }: { 
 		: null
 	const header = <><ActivityStatusDot className={`tool-status-dot ${tool.status}`} label={`Tool status: ${toolStatus(tool.status)}`} />{marker}<ToolIcon /><strong>{tool.name}</strong>{target && <code title={target} className={outside ? 'outside-workspace' : undefined}>{target}</code>}{outside && <span className="outside-workspace-flag" title={`Outside workspace: ${outsideTargets.join(', ')}`}>!</span>}</>
 	useEffect(() => {
-		if (triggerRef.current) hover?.update({ id, kind: 'tool', trigger: triggerRef.current, content: details, label: tool.name })
-	}, [details, hover, id, tool.name])
+		const trigger = triggerRef.current
+		const horizontalReference = horizontalReferenceRef.current
+		if (trigger && horizontalReference) hover?.update({ id, kind: 'tool', trigger, horizontalReference, content: details, label: tool.name })
+	}, [details, horizontalReferenceRef, hover, id, tool.name])
 	const handleKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
 		if (event.key === 'Escape') {
 			event.preventDefault()
@@ -399,13 +433,14 @@ function ToolRow({ tool, marker, onCancelTool, sessionNames, workspaceRoot }: { 
 		}
 	}
 	return (
-		<div ref={triggerRef} className={`tool-row ${tool.status}`}>
+		<div className={`tool-row ${tool.status}`}>
 			<div
 				className="tool-row-main"
 				onMouseEnter={show}
 				onMouseLeave={leave}
 			>
 				<div
+					ref={triggerRef}
 					className="tool-row-header"
 					role="button"
 					tabIndex={0}

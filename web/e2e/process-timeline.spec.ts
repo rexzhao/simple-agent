@@ -213,6 +213,7 @@ test('keeps tool and reasoning popovers offset from their visible row frames', a
   await reasoningBelow.hover()
   await expect(page.locator('.process-hover-popover')).toBeVisible()
   const reasoningGeometry = await geometry(reasoningBelow, page.locator('.reasoning-step').nth(0))
+  const timelineGeometry = await box(page.locator('.process-timeline'))
 
   await targetTool.evaluate((element) => {
     element.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }))
@@ -221,11 +222,18 @@ test('keeps tool and reasoning popovers offset from their visible row frames', a
   await page.waitForTimeout(250)
   await expect(page.locator('.process-hover-popover')).toContainText('tool details')
   const toolGeometry = await geometry(targetTool, page.locator('.tool-row').nth(0))
-  const reasoningBelowGap = reasoningGeometry.popup.y - (reasoningGeometry.outer.y + reasoningGeometry.outer.height)
-  const toolBelowGap = toolGeometry.popup.y - (toolGeometry.outer.y + toolGeometry.outer.height)
-  expect(reasoningBelowGap).toBeCloseTo(8, 4)
-  expect(toolBelowGap).toBeCloseTo(8, 4)
-  expect(toolBelowGap).toBeCloseTo(reasoningBelowGap, 4)
+  const timelinePadding = await page.locator('.process-timeline').evaluate((element) => {
+    const styles = getComputedStyle(element)
+    return { left: Number.parseFloat(styles.paddingLeft) || 0, right: Number.parseFloat(styles.paddingRight) || 0 }
+  })
+  const referenceLeft = timelineGeometry.x + timelinePadding.left
+  const referenceWidth = timelineGeometry.width - timelinePadding.left - timelinePadding.right
+  const expectedHorizontalOffset = referenceLeft - reasoningGeometry.outer.x + (referenceWidth - reasoningGeometry.popup.width) / 2
+  const reasoningBelowOffset = reasoningGeometry.popup.x - reasoningGeometry.outer.x
+  const toolBelowOffset = toolGeometry.popup.x - toolGeometry.outer.x
+  expect(reasoningBelowOffset).toBeGreaterThan(0)
+  expect(reasoningBelowOffset).toBeCloseTo(expectedHorizontalOffset, 4)
+  expect(toolBelowOffset).toBeCloseTo(reasoningBelowOffset, 4)
 
   await page.locator('.process-hover-popover').evaluate((element) => element.dispatchEvent(new MouseEvent('mouseleave', { bubbles: true })))
   await page.waitForTimeout(220)
@@ -239,10 +247,10 @@ test('keeps tool and reasoning popovers offset from their visible row frames', a
   await page.waitForTimeout(220)
   await expect(page.locator('.process-hover-popover')).toHaveAttribute('data-placement', 'above')
   const toolAboveGeometry = await geometry(toolAbove, page.locator('.tool-row').nth(15))
-  const reasoningAboveGap = reasoningAboveGeometry.outer.y - (reasoningAboveGeometry.popup.y + reasoningAboveGeometry.popup.height)
-  const toolAboveGap = toolAboveGeometry.outer.y - (toolAboveGeometry.popup.y + toolAboveGeometry.popup.height)
-  expect(reasoningAboveGap).toBeCloseTo(8, 4)
-  expect(toolAboveGap).toBeCloseTo(8, 4)
-  expect(toolAboveGap).toBeCloseTo(reasoningAboveGap, 4)
+  const reasoningAboveOffset = reasoningAboveGeometry.popup.x - reasoningAboveGeometry.outer.x
+  const toolAboveOffset = toolAboveGeometry.popup.x - toolAboveGeometry.outer.x
+  expect(reasoningAboveOffset).toBeGreaterThan(0)
+  expect(reasoningAboveOffset).toBeCloseTo(expectedHorizontalOffset, 4)
+  expect(toolAboveOffset).toBeCloseTo(reasoningAboveOffset, 4)
   hold.release([])
 })
