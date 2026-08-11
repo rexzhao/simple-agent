@@ -49,7 +49,7 @@ export const WorkspaceTree = memo(function WorkspaceTree(props: {
     const hasRunningDescendant = !running && ancestorSessionIDs(sessions, props.runningSessionIDs).has(session.id)
     return (
       <div className="session-tree-branch" key={session.id}>
-        <div className={`session-tree-row ${archived ? 'archived' : ''} ${session.id === props.selectedSessionID ? 'selected' : ''} ${hasRunningDescendant ? 'running-descendant' : ''}`}>
+        <div className={`session-tree-row ${archived ? 'archived' : ''} ${session.id === props.selectedSessionID ? 'selected' : ''}`}>
           <span className="session-branch-toggle-spacer" aria-hidden="true" />
           <button
             className="session-tree-button"

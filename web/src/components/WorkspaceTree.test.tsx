@@ -131,7 +131,9 @@ describe('WorkspaceTree session list', () => {
     // The root is not itself running, so it must not get the solid running dot.
     expect(rootRow.querySelector('.status-dot.running')).toBeNull()
     expect(rootRow.querySelector('.status-dot.running-descendant')).not.toBeNull()
-    expect(rootRow.classList.contains('running-descendant')).toBe(true)
+    expect(rootRow.classList.contains('running-descendant')).toBe(false)
+    expect(rootRow.classList.contains('selected')).toBe(false)
+    expect(rootRow.classList.contains('hover')).toBe(false)
   })
 
   it('does not mark a root with a running-descendant when it is itself running', () => {

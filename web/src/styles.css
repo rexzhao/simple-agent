@@ -192,7 +192,6 @@ svg { width: 1.1em; height: 1.1em; fill: none; stroke: currentColor; stroke-widt
 .session-tree-row { position: relative; min-width: 0; display: flex; align-items: center; border: 2px solid transparent; }
 .session-tree-row:hover { border-color: var(--border); background: #ffffff; box-shadow: var(--shadow-1); }
 .session-tree-row.selected { border-color: var(--border); color: #ffffff; background: #111111; box-shadow: var(--shadow-1); }
-.session-tree-row.running-descendant { border-style: dashed; border-color: var(--accent); background: var(--accent-soft); }
 .session-branch-toggle, .session-branch-toggle-spacer {
   width: 18px;
   height: 25px;
