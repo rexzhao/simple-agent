@@ -284,6 +284,35 @@ describe('Conversation identity boundary', () => {
 		expect(view.container.querySelectorAll('[title="Copy full output"]')).toHaveLength(3)
 	})
 
+	it('shows completion time and total duration to the right of the final copy action', () => {
+		const page: ItemsPage = {
+			items: [
+				{ seq: 1, id: 'user-1', turn_id: 'turn-1', created_at: '2026-01-01T00:00:00.000Z', kind: 'message', visibility: 'visible', audience: 'user', message: { role: 'user', content: { inline: 'question' } } },
+				{ seq: 2, id: 'assistant-tool', turn_id: 'turn-1', created_at: '2026-01-01T00:00:01.000Z', kind: 'message', visibility: 'visible', audience: 'model', message: { role: 'assistant', content: { inline: 'planning' }, tool_calls: [{ id: 'tool-1', name: 'shell' }] } },
+				{ seq: 3, id: 'tool-result', turn_id: 'turn-1', created_at: '2026-01-01T00:00:01.500Z', kind: 'tool', visibility: 'visible', audience: 'user', message: { role: 'tool', content: { inline: 'done' }, tool_call_id: 'tool-1' } },
+				{ seq: 4, id: 'assistant-final', turn_id: 'turn-1', created_at: '2026-01-01T00:00:02.000Z', kind: 'message', visibility: 'visible', audience: 'model', message: { role: 'assistant', content: { inline: 'answer' } } },
+			],
+			oldest_seq: 1, newest_seq: 4, has_more_before: false, has_more_after: false,
+		}
+		const view = renderConversation(<Conversation {...baseProps} sessionID="s1" detail={session('s1')} page={page} />)
+		const { container } = view
+		const finalMessage = container.querySelector('[data-seq="4"]')
+		const tools = finalMessage?.querySelector('.message-tools')
+
+		expect(finalMessage?.querySelector('.message-completion')).not.toBeNull()
+		expect(finalMessage?.querySelector('.message-completion')?.textContent).toContain('Completed')
+		expect(finalMessage?.querySelector('.message-completion')?.textContent).toContain('Duration 2s')
+		expect(tools?.firstElementChild?.getAttribute('title')).toBe('Copy full output')
+		expect(container.querySelector('[data-seq="2"] .message-completion')).toBeNull()
+
+		const activeRun = { id: 'run-active', sessionID: 's1', turnID: 'turn-1', assistantText: '', steps: [], agentIteration: 1, status: 'running' as const }
+		view.rerender(<Conversation {...baseProps} sessionID="s1" detail={session('s1')} page={page} activeRun={activeRun} />)
+		expect(view.container.querySelector('[data-seq="4"] .message-completion')).toBeNull()
+
+		view.rerender(<Conversation {...baseProps} sessionID="s1" detail={session('s1')} page={page} activeRun={{ ...activeRun, status: 'failed' }} />)
+		expect(view.container.querySelector('[data-seq="4"] .message-completion')).toBeNull()
+	})
+
   it('splits one turn into separate process groups around a compaction record without key collisions', () => {
     const detail = session('s1')
     const toolCallItem = (seq: number, callID: string) => ({

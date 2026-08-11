@@ -35,6 +35,41 @@ export function formatTime(value: string): string {
   return Number.isFinite(date.getTime()) ? date.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' }) : ''
 }
 
+export function formatCompletionTime(value: string): string {
+  const date = new Date(value)
+  if (!Number.isFinite(date.getTime())) return ''
+  return date.toLocaleString('en-US', {
+    year: 'numeric',
+    month: 'short',
+    day: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+  })
+}
+
+export function formatDuration(durationMS: number): string {
+  if (!Number.isFinite(durationMS) || durationMS < 0) return ''
+  if (durationMS < 1000) return `${Math.round(durationMS)}ms`
+
+  const totalSeconds = durationMS / 1000
+  if (totalSeconds < 60) {
+    const seconds = totalSeconds < 10 ? totalSeconds.toFixed(1).replace(/\.0$/, '') : Math.round(totalSeconds).toString()
+    return `${seconds}s`
+  }
+
+  const roundedSeconds = Math.round(totalSeconds)
+  const totalMinutes = Math.floor(roundedSeconds / 60)
+  if (totalMinutes < 60) {
+    const minutes = Math.floor(roundedSeconds / 60)
+    const seconds = roundedSeconds % 60
+    return `${minutes}m${seconds > 0 ? ` ${seconds}s` : ''}`
+  }
+
+  const hours = Math.floor(totalMinutes / 60)
+  const minutes = totalMinutes % 60
+  return `${hours}h${minutes > 0 ? ` ${minutes}m` : ''}`
+}
+
 export function errorMessage(reason: unknown): string {
   return reason instanceof Error ? reason.message : 'An unknown error occurred'
 }

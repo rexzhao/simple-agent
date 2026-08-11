@@ -9,6 +9,58 @@ export interface ConversationRowTurnError {
   message: string
 }
 
+export interface TurnCompletion {
+  completedAt: string
+  durationMS: number
+}
+
+function isCompletedAssistant(item: SessionItem): boolean {
+  const message = item.message
+  if (!message || message.role !== 'assistant' || message.is_error) return false
+  if ((message.tool_calls?.length ?? 0) > 0) return false
+  if (item.status && item.status !== 'completed') return false
+  return Boolean(message.content?.inline || message.content?.preview || message.images?.length)
+}
+
+export function completedTurnByAssistantItem(items: readonly SessionItem[]): ReadonlyMap<string, TurnCompletion> {
+  const turns = new Map<string, { firstUser?: SessionItem; lastAssistant?: SessionItem }>()
+  let legacyTurnID: string | undefined
+
+  for (const item of [...items].sort((a, b) => a.seq - b.seq)) {
+    const explicitTurnID = item.turn_id?.trim()
+    if (item.message?.role === 'user') {
+      legacyTurnID = explicitTurnID ? undefined : `legacy:${item.id}`
+    }
+    const turnID = explicitTurnID || legacyTurnID
+    if (!turnID) continue
+
+    const turn = turns.get(turnID) ?? {}
+    if (item.message?.role === 'user' && Number.isFinite(Date.parse(item.created_at))) {
+      if (!turn.firstUser || item.seq < turn.firstUser.seq) turn.firstUser = item
+    }
+    if (item.message?.role === 'assistant' && (!turn.lastAssistant || item.seq > turn.lastAssistant.seq)) {
+      turn.lastAssistant = item
+    }
+    turns.set(turnID, turn)
+  }
+
+  const completions = new Map<string, TurnCompletion>()
+  for (const turn of turns.values()) {
+    if (!turn.firstUser || !turn.lastAssistant || !isCompletedAssistant(turn.lastAssistant)) continue
+
+    const startedAt = Date.parse(turn.firstUser.created_at)
+    const completedAt = Date.parse(turn.lastAssistant.created_at)
+    if (!Number.isFinite(startedAt) || !Number.isFinite(completedAt) || completedAt < startedAt) continue
+
+    completions.set(turn.lastAssistant.id, {
+      completedAt: turn.lastAssistant.created_at,
+      durationMS: completedAt - startedAt,
+    })
+  }
+
+  return completions
+}
+
 interface ConversationRowBase {
   /** Stable for the lifetime of this row in this session. Never an array index. */
   key: string

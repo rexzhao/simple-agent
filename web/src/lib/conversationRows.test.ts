@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import type { ActiveRun, RunStep, SessionItem } from '../types'
-import { buildConversationRows, conversationRowItemKey, getConversationFirstItemIndex, prependedConversationRowCount } from './conversationRows'
+import { buildConversationRows, completedTurnByAssistantItem, conversationRowItemKey, getConversationFirstItemIndex, prependedConversationRowCount } from './conversationRows'
 
 function item(id: string, seq: number, role: string, content: string, options: Partial<SessionItem> = {}): SessionItem {
   return {
@@ -34,6 +34,30 @@ function keys(rows: ReturnType<typeof buildConversationRows>): string[] {
 }
 
 describe('buildConversationRows stable identities', () => {
+	it('calculates completion timing for the final assistant output in a complete turn', () => {
+		const completions = completedTurnByAssistantItem([
+			item('user-1', 1, 'user', 'question', { turn_id: 'turn-1', created_at: '2026-01-01T00:00:00.000Z' }),
+			item('assistant-tool', 2, 'assistant', 'planning', {
+				turn_id: 'turn-1',
+				created_at: '2026-01-01T00:00:01.000Z',
+				message: { role: 'assistant', content: { inline: 'planning' }, tool_calls: [{ id: 'tool-1', name: 'shell' }] },
+			}),
+			item('assistant-final', 3, 'assistant', 'answer', { turn_id: 'turn-1', created_at: '2026-01-01T00:00:02.000Z' }),
+		])
+
+		expect(completions.get('assistant-final')).toEqual({
+			completedAt: '2026-01-01T00:00:02.000Z',
+			durationMS: 2000,
+		})
+		expect(completions.has('assistant-tool')).toBe(false)
+
+		const legacyCompletions = completedTurnByAssistantItem([
+			item('legacy-user', 4, 'user', 'question', { created_at: '2026-01-01T00:01:00.000Z' }),
+			item('legacy-final', 5, 'assistant', 'answer', { created_at: '2026-01-01T00:01:03.000Z' }),
+		])
+		expect(legacyCompletions.get('legacy-final')?.durationMS).toBe(3000)
+	})
+
 	it('uses the row key for virtualization and counts grouped rows, not raw items, on prepend', () => {
 		const previous = buildConversationRows({
 			sessionID: 'session-1',

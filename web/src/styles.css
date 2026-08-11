@@ -546,6 +546,7 @@ svg { width: 1.1em; height: 1.1em; fill: none; stroke: currentColor; stroke-widt
 .cursor { display: inline-block; width: 8px; height: 16px; background: var(--accent); animation: blink .8s steps(2) infinite; vertical-align: -2px; }
 .token-note { margin-top: 9px; color: var(--faint); font-family: var(--font-mono); font-size: 9.5px; }
 .message-tools { min-height: 27px; display: flex; align-items: center; gap: 5px; margin-top: 9px; }
+.message-completion { display: inline-flex; align-items: center; gap: 5px; color: var(--faint); font: 9px var(--font-mono); white-space: nowrap; }
 .message-tool-button { min-height: 25px; display: inline-flex; align-items: center; gap: 5px; padding: 3px 7px; border: 2px solid transparent; color: var(--faint); background: transparent; cursor: pointer; font-size: 9.5px; font-weight: 750; }
 .message-tool-button svg { width: 13px; height: 13px; }
 .message-tool-button:hover { border-color: var(--border); color: var(--text); background: #ffffff; box-shadow: var(--shadow-1); }

@@ -6,9 +6,9 @@ import type { ActiveRun, ItemsPage, QueuedPrompt, Session, SessionImageAttachmen
 import type { SessionIndexStatus } from '../repositories/sessionIndex'
 import type { DataAvailability, DomainReadError, SessionImageData } from '../repositories/sessionContent'
 import { addUsageBreakdown, contextRequestCount, contextUsageBreakdown, usageBreakdownFromEvents, usageCostBreakdown, usageEventCount } from '../lib/cost'
-import { buildConversationRows, conversationRowKey } from '../lib/conversationRows'
-import type { ConversationRow } from '../lib/conversationRows'
-import { blobAsDataURL, copyText, formatCost, formatTokenCount } from '../lib/format'
+import { buildConversationRows, completedTurnByAssistantItem, conversationRowKey } from '../lib/conversationRows'
+import type { ConversationRow, TurnCompletion } from '../lib/conversationRows'
+import { blobAsDataURL, copyText, formatCompletionTime, formatCost, formatDuration, formatTokenCount } from '../lib/format'
 import { itemText, sessionName } from '../lib/session'
 import { Composer } from './Composer'
 import type { ComposerDraft, PastedImageAttachment, PastedTextAttachment } from './Composer'
@@ -192,6 +192,10 @@ export const Conversation = memo(function Conversation(props: {
 		if (rows.length > 0) rows.push({ kind: 'bottom-spacer', key: conversationRowKey(props.sessionID, 'bottom-spacer') })
 		return rows
 	}, [indexedStatus, props.activeRun, props.compacting, props.page?.items, props.sessionID, props.turnError])
+	const completedTurns = useMemo(
+		() => completedTurnByAssistantItem(props.page?.items ?? []),
+		[props.page?.items],
+	)
 	const loadOlder = useCallback(async () => {
 		if (loadingOlderRef.current || !props.page?.has_more_before) return
 		loadingOlderRef.current = true
@@ -216,11 +220,12 @@ export const Conversation = memo(function Conversation(props: {
 		sessionNames: props.sessionNames,
 		workspaceRoot: safeDetail?.created_cwd,
 		canContinue: canContinueForRows,
+		completedTurns,
 		onCancelTool: props.onCancelTool,
 		onContinue: props.onContinue,
 		onRetryRefresh: props.onRetryRefresh,
 		onDismissTurnError: props.onDismissTurnError,
-	}), [canContinueForRows, loadSessionImage, props.activeRun, props.onCancelTool, props.onContinue, props.onDismissTurnError, props.onRetryRefresh, props.sessionID, props.sessionNames, safeDetail?.created_cwd, safeDetail?.interrupted_run_id, safeDetail?.interrupted_turn_id, safeDetail?.running_run_id, safeDetail?.running_turn_id])
+	}), [canContinueForRows, completedTurns, loadSessionImage, props.activeRun, props.onCancelTool, props.onContinue, props.onDismissTurnError, props.onRetryRefresh, props.sessionID, props.sessionNames, safeDetail?.created_cwd, safeDetail?.interrupted_run_id, safeDetail?.interrupted_turn_id, safeDetail?.running_run_id, safeDetail?.running_turn_id])
 
 	const conversationEmpty = <div className="conversation-empty"><SparkIcon /><h3>Start a new task</h3><p>Describe a goal, a problem, or the code you want to change.</p></div>
 	const listHeader = (
@@ -438,6 +443,7 @@ type ConversationRowRenderProps = {
 	loadSessionImage: (sessionID: string, hash: string, signal?: AbortSignal) => Promise<SessionImageData>
 	sessionNames?: Record<string, string>
 	workspaceRoot?: string
+	completedTurns: ReadonlyMap<string, TurnCompletion>
 	onCancelTool?: (toolCallID: string) => void
 	canContinue: boolean
 	onContinue: () => void
@@ -448,7 +454,7 @@ type ConversationRowRenderProps = {
 function renderConversationRow(row: ConversationRow, props: ConversationRowRenderProps) {
 	switch (row.kind) {
 		case 'message':
-			return <Message key={row.key} item={row.item} sessionID={props.sessionID} loadSessionImage={props.loadSessionImage} assistantTail={row.assistantTail} assistantStreaming={row.assistantStreaming} copyAvailable={!assistantItemBelongsToActiveRun(row.item, props.activeRun)} />
+			return <Message key={row.key} item={row.item} sessionID={props.sessionID} loadSessionImage={props.loadSessionImage} assistantTail={row.assistantTail} assistantStreaming={row.assistantStreaming} completion={completionForAssistantItem(row.item, props.activeRun, props.completedTurns)} copyAvailable={!assistantItemBelongsToActiveRun(row.item, props.activeRun)} />
 		case 'compaction':
 			return <CompactionRecord key={row.key} item={row.item} />
 		case 'process':
@@ -495,7 +501,17 @@ function assistantItemBelongsToActiveRun(item: SessionItem, activeRun: ActiveRun
 	return indexed?.itemID === item.id
 }
 
-const Message = memo(function Message({ item, sessionID, loadSessionImage, assistantTail = '', assistantStreaming = false, copyAvailable = true }: { item: SessionItem; sessionID: string; loadSessionImage: (sessionID: string, hash: string, signal?: AbortSignal) => Promise<SessionImageData>; assistantTail?: string; assistantStreaming?: boolean; copyAvailable?: boolean }) {
+function completionForAssistantItem(item: SessionItem, activeRun: ActiveRun | null, completions: ReadonlyMap<string, TurnCompletion>): TurnCompletion | undefined {
+	const activeTurnID = activeRun?.turnID?.trim()
+	const itemTurnID = item.turn_id?.trim()
+	// ActiveRun has no completed status. Even terminal/reconciling states may
+	// still be settling the durable projection, so completion belongs only
+	// after the matching run has disappeared.
+	if (activeTurnID && itemTurnID && activeTurnID === itemTurnID) return undefined
+	return completions.get(item.id)
+}
+
+const Message = memo(function Message({ item, sessionID, loadSessionImage, assistantTail = '', assistantStreaming = false, completion, copyAvailable = true }: { item: SessionItem; sessionID: string; loadSessionImage: (sessionID: string, hash: string, signal?: AbortSignal) => Promise<SessionImageData>; assistantTail?: string; assistantStreaming?: boolean; completion?: TurnCompletion; copyAvailable?: boolean }) {
 	const [copyStatus, setCopyStatus] = useState<'idle' | 'copied' | 'error'>('idle')
 	const copyResetTimerRef = useRef<number | null>(null)
 	useEffect(() => () => {
@@ -540,6 +556,17 @@ const Message = memo(function Message({ item, sessionID, loadSessionImage, assis
 				<button className="message-tool-button" onClick={() => void copyMessage()} title="Copy full output">
 					<CopyIcon />{copyStatus === 'copied' ? 'Copied' : copyStatus === 'error' ? 'Copy failed' : 'Copy'}
 				</button>
+				{completion && (
+					<span
+						className="message-completion"
+						aria-label={`Completed ${formatCompletionTime(completion.completedAt)}; duration ${formatDuration(completion.durationMS)}`}
+						title={`Completed ${formatCompletionTime(completion.completedAt)}; total duration ${formatDuration(completion.durationMS)}`}
+					>
+						<span>Completed {formatCompletionTime(completion.completedAt)}</span>
+						<span aria-hidden="true">·</span>
+						<span>Duration {formatDuration(completion.durationMS)}</span>
+					</span>
+				)}
 			</div>
 		)}
       </div>
