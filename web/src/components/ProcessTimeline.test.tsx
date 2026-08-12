@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { act, cleanup, render, screen, fireEvent } from '@testing-library/react'
-import { calculatePopoverPosition, PROCESS_HOVER_HIDE_DELAY_MS, PROCESS_HOVER_REPLACE_DELAY_MS, ProcessTimeline } from './ProcessTimeline'
+import { calculatePopoverPosition, PROCESS_HOVER_HIDE_DELAY_MS, PROCESS_HOVER_REPLACE_DELAY_MS, PROCESS_POINTER_POPOVER_GAP_PX, ProcessTimeline } from './ProcessTimeline'
 import type { RunStep, ToolActivity } from '../types'
 
 afterEach(() => {
@@ -47,15 +47,14 @@ describe('ProcessTimeline session tools', () => {
 		expect(container.textContent).not.toMatch(/Requested|Running|Done|Failed/)
 	})
 
-	it('keeps Cancel outside the hover trigger while preserving mouse hover and click access', () => {
+	it('keeps Cancel outside the click trigger without opening details', () => {
 		const onCancelTool = vi.fn()
 		const { container } = render(<ProcessTimeline steps={[tool({ id: 'cancel-me', status: 'running' })]} onCancelTool={onCancelTool} />)
 		const cancel = screen.getByRole('button', { name: 'Cancel tool' })
 		expect(cancel.closest('[role="button"]')).toBeNull()
-		fireEvent.mouseEnter(container.querySelector('.tool-row-main') as Element)
-		expect(screen.getByRole('tooltip')).not.toBeNull()
 		fireEvent.click(cancel)
 		expect(onCancelTool).toHaveBeenCalledWith('cancel-me')
+		expect(screen.queryByRole('tooltip')).toBeNull()
 	})
 
 	it('shows only a compact reasoning summary and marks only the current reasoning step as running', () => {
@@ -72,6 +71,16 @@ describe('ProcessTimeline session tools', () => {
 		expect(view.container.querySelector('.reasoning-trigger')?.textContent).toContain('Thinking complete')
 		expect(view.container.querySelector('[aria-label="Reasoning status: Thinking"]')).toBeNull()
 		expect(view.container.querySelector('.reasoning-step pre')).toBeNull()
+	})
+
+	it('does not open tool details on hover or focus, but opens them on click', () => {
+		const { container } = render(<ProcessTimeline steps={[tool({ name: 'shell', arguments: JSON.stringify({ command: 'show me' }) })]} />)
+		const trigger = container.querySelector('.tool-row-header') as HTMLElement
+		fireEvent.mouseEnter(trigger)
+		fireEvent.focus(trigger)
+		expect(screen.queryByRole('tooltip')).toBeNull()
+		fireEvent.click(trigger)
+		expect(screen.getByRole('tooltip').textContent).toContain('show me')
 	})
 
 	it('does not mark an earlier reasoning step when a later tool is the current activity', () => {
@@ -156,7 +165,7 @@ describe('ProcessTimeline session tools', () => {
 
 		const trigger = screen.getByText('session_send').closest('.tool-row-header')
 		expect(trigger).not.toBeNull()
-		fireEvent.mouseEnter(trigger as Element)
+		fireEvent.click(trigger as Element)
 
 		expect(screen.getByText('Arguments')).not.toBeNull()
 		expect(screen.getByText(/"mode": "steer"/)).not.toBeNull()
@@ -174,7 +183,7 @@ describe('ProcessTimeline session tools', () => {
 
 		expect(screen.getByText('session_wait')).not.toBeNull()
 		expect(screen.getByText('sess-9')).not.toBeNull()
-		fireEvent.mouseEnter(screen.getByText('session_wait').closest('.tool-row-header') as Element)
+		fireEvent.click(screen.getByText('session_wait').closest('.tool-row-header') as Element)
 		expect(screen.queryByText('Output')).toBeNull()
 		expect(screen.getByRole('tooltip').textContent).toContain('Arguments')
 	})
@@ -189,7 +198,7 @@ describe('ProcessTimeline session tools', () => {
 		mockRect(triggers[0], 300)
 		mockRect(triggers[1], 680)
 
-		fireEvent.mouseEnter(triggers[0])
+		fireEvent.click(triggers[0])
 		const below = screen.getByRole('tooltip')
 		const belowTop = Number.parseFloat(below.style.top)
 		const belowMaxHeight = Number.parseFloat(below.style.maxHeight)
@@ -201,7 +210,7 @@ describe('ProcessTimeline session tools', () => {
 		expect(belowMaxHeight).toBe(Math.min(520, viewportHeight - 12 - upperBottom - 8))
 		expect(belowTop + belowMaxHeight).toBeLessThanOrEqual(viewportHeight - 12)
 		expect(below.textContent).toContain('upper command')
-		fireEvent.mouseEnter(triggers[1])
+		fireEvent.click(triggers[1])
 		expect(screen.getByRole('tooltip').textContent).toContain('upper command')
 		act(() => { vi.advanceTimersByTime(PROCESS_HOVER_REPLACE_DELAY_MS) })
 		const above = screen.getByRole('tooltip')
@@ -214,44 +223,41 @@ describe('ProcessTimeline session tools', () => {
 		expect(above.textContent).toContain('lower command')
 	})
 
-	it('uses the same positive horizontal offset for tool and reasoning popovers', () => {
+	it('anchors clicked tool and reasoning popovers to the same pointer offset', () => {
 		vi.useFakeTimers()
 		const reasoning: RunStep = { kind: 'reasoning', id: 'reasoning-anchor', text: 'private thoughts', iteration: 1 }
 		const { container } = render(<ProcessTimeline steps={[reasoning, tool({ id: 'tool-anchor', name: 'shell', arguments: JSON.stringify({ command: 'details' }) })]} />)
 		const reasoningTrigger = container.querySelector('.reasoning-trigger') as Element
-		const reasoningOuter = container.querySelector('.reasoning-step') as Element
 		const toolTrigger = container.querySelector('.tool-row-header') as Element
-		const toolOuter = container.querySelector('.tool-row') as Element
-		const timeline = container.querySelector('.process-timeline') as Element
-		// Model the real boxes: reasoning has inner padding, while the tool row
-		// has a border and a taller header. Both rows use the shared timeline
-		// frame for horizontal positioning, not their differently sized widths.
-		mockRect(timeline, 300, 80, 878, 100)
-		mockRect(reasoningOuter, 300, 80, 420, 27)
-		mockRect(reasoningTrigger, 307, 90, 400, 12)
-		mockRect(toolOuter, 300, 80, 500, 39)
-		mockRect(toolTrigger, 302, 82, 496, 35)
+		mockRect(reasoningTrigger, 300, 80, 400, 12)
+		mockRect(toolTrigger, 340, 82, 496, 35)
 
-		fireEvent.mouseEnter(reasoningTrigger)
+		fireEvent.click(reasoningTrigger, { clientX: 200, clientY: 306 })
 		const reasoningPopup = screen.getByRole('tooltip')
-		const reasoningOffset = Number.parseFloat(reasoningPopup.style.left) - 80
+		const reasoningLeft = Number.parseFloat(reasoningPopup.style.left)
 		expect(reasoningPopup.getAttribute('data-placement')).toBe('below')
+		expect(reasoningLeft).toBe(200 + PROCESS_POINTER_POPOVER_GAP_PX)
 
-		fireEvent.mouseEnter(toolTrigger)
+		fireEvent.click(toolTrigger, { clientX: 200, clientY: 346 })
 		act(() => { vi.advanceTimersByTime(PROCESS_HOVER_REPLACE_DELAY_MS) })
 		const toolPopup = screen.getByRole('tooltip')
-		const toolOffset = Number.parseFloat(toolPopup.style.left) - 80
+		const toolLeft = Number.parseFloat(toolPopup.style.left)
 		expect(toolPopup.getAttribute('data-placement')).toBe('below')
-		expect(reasoningOffset).toBeGreaterThan(0)
-		expect(toolOffset).toBe(reasoningOffset)
-		expect(reasoningOffset).toBe((878 - 680) / 2)
+		expect(toolLeft).toBe(reasoningLeft)
+	})
 
-		const clamped = calculatePopoverPosition(
-			{ top: 300, bottom: 332, left: 80, right: 736, width: 656, height: 32 },
-			{ top: 0, bottom: 100, left: 0, right: 680, width: 680, height: 100 },
-			{ top: 300, bottom: 400, left: 900, right: 1778, width: 878, height: 100 },
-		)
-		expect(clamped.left).toBe(window.innerWidth - 680 - 12)
+	it('uses the right-side pointer gap, flips left when needed, and keeps vertical placement trigger-based', () => {
+		const trigger = { top: 100, bottom: 132, left: 80, right: 300, width: 220, height: 32 }
+		const popup = { top: 0, bottom: 100, left: 0, right: 300, width: 300, height: 100 }
+		const reference = { top: 100, bottom: 132, left: 80, right: 600, width: 520, height: 32 }
+		const right = calculatePopoverPosition(trigger, popup, reference, { clientX: 200, clientY: 110 })
+		expect(right.left).toBe(200 + PROCESS_POINTER_POPOVER_GAP_PX)
+		const flipped = calculatePopoverPosition(trigger, popup, reference, { clientX: window.innerWidth - 40, clientY: 110 })
+		expect(flipped.left).toBe(window.innerWidth - 40 - PROCESS_POINTER_POPOVER_GAP_PX - popup.width)
+		expect(flipped.left + popup.width).toBeLessThanOrEqual(window.innerWidth - 12)
+		expect(calculatePopoverPosition(trigger, popup, reference, { clientX: 200, clientY: 700 }).top).toBe(right.top)
+		const keyboardFallback = calculatePopoverPosition(trigger, popup, reference)
+		expect(keyboardFallback.left).toBe(reference.left + (reference.width - popup.width) / 2)
 	})
 
 	it('keeps the popup during trigger-leave delay and hides after popup-leave delay', () => {
@@ -259,7 +265,7 @@ describe('ProcessTimeline session tools', () => {
 		const { container } = render(<ProcessTimeline steps={[tool({ id: 'delayed', name: 'shell', arguments: JSON.stringify({ command: 'copy me' }) })]} />)
 		const trigger = container.querySelector('.tool-row-header') as Element
 		mockRect(trigger, 100)
-		fireEvent.mouseEnter(trigger)
+		fireEvent.click(trigger)
 		fireEvent.mouseLeave(trigger)
 		act(() => { vi.advanceTimersByTime(PROCESS_HOVER_HIDE_DELAY_MS - 1) })
 		expect(screen.getByRole('tooltip')).not.toBeNull()
@@ -272,7 +278,7 @@ describe('ProcessTimeline session tools', () => {
 		const { container } = render(<ProcessTimeline steps={[tool({ id: 'copy', name: 'shell', arguments: JSON.stringify({ command: 'copyable output' }) })]} />)
 		const trigger = container.querySelector('.tool-row-header') as Element
 		mockRect(trigger, 100)
-		fireEvent.mouseEnter(trigger)
+		fireEvent.click(trigger)
 		fireEvent.mouseLeave(trigger)
 		const popup = screen.getByRole('tooltip')
 		fireEvent.mouseEnter(popup)
@@ -294,9 +300,9 @@ describe('ProcessTimeline session tools', () => {
 		const triggers = Array.from(container.querySelectorAll('.tool-row-header'))
 		mockRect(triggers[0], 100)
 		mockRect(triggers[1], 120)
-		fireEvent.mouseEnter(triggers[0])
+		fireEvent.click(triggers[0])
 		const popup = screen.getByRole('tooltip')
-		fireEvent.mouseEnter(triggers[1])
+		fireEvent.click(triggers[1])
 		expect(screen.getByRole('tooltip')).toBe(popup)
 		expect(screen.getByRole('tooltip').textContent).toContain('old details')
 		fireEvent.mouseEnter(popup)
@@ -318,7 +324,7 @@ describe('ProcessTimeline session tools', () => {
 			result: output,
 		})]} />)
 		const trigger = container.querySelector('.tool-row-header') as Element
-		fireEvent.mouseEnter(trigger)
+		fireEvent.click(trigger)
 
 		const pre = screen.getByRole('tooltip').querySelector('pre.ansi-output')
 		expect(pre).not.toBeNull()
@@ -328,17 +334,23 @@ describe('ProcessTimeline session tools', () => {
 		expect(pre?.querySelector('img')).toBeNull()
 	})
 
-	it('uses focus as an equivalent trigger and Escape closes the associated tooltip', () => {
+	it('does not open on hover or focus, opens on keyboard activation, and Escape closes the tooltip', () => {
 		const { container } = render(<ProcessTimeline steps={[{ kind: 'reasoning', id: 'keyboard-reasoning', text: 'private thoughts', iteration: 1 }]} />)
 		const trigger = container.querySelector('.reasoning-trigger') as HTMLElement
 		mockRect(trigger, 100)
+		fireEvent.mouseEnter(trigger)
 		fireEvent.focus(trigger)
+		expect(trigger.getAttribute('aria-expanded')).toBe('false')
+		expect(screen.queryByRole('tooltip')).toBeNull()
+		fireEvent.keyDown(trigger, { key: 'Enter' })
 		expect(trigger.getAttribute('aria-expanded')).toBe('true')
 		expect(trigger.getAttribute('aria-haspopup')).toBeNull()
 		expect(trigger.getAttribute('aria-describedby')).toBe('process-hover-details')
 		expect(screen.getByRole('tooltip').textContent).toContain('private thoughts')
 		fireEvent.keyDown(trigger, { key: 'Escape' })
 		expect(screen.queryByRole('tooltip')).toBeNull()
+		fireEvent.keyDown(trigger, { key: ' ' })
+		expect(screen.getByRole('tooltip')).not.toBeNull()
 	})
 
 	it('renders interleaved tool and reasoning as separate rows in input order', () => {

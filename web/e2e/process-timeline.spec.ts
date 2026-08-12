@@ -186,7 +186,7 @@ test('failed tool rows stay individually visible once settled', async ({ page })
   await expect(page.locator('.tool-row.error')).toHaveCount(1)
 })
 
-test('keeps tool and reasoning popovers offset from their visible row frames', async ({ page }) => {
+test('anchors clicked tool and reasoning popovers to the pointer while preserving vertical placement', async ({ page }) => {
   const hold = newGate()
   const initial = [
     { type: 'reasoning.delta', turn_id: 'turn-main', agent_iteration: 1, item_id: 'reasoning-below', delta: 'reasoning details' },
@@ -211,46 +211,45 @@ test('keeps tool and reasoning popovers offset from their visible row frames', a
   const geometry = async (trigger: Locator, outer: Locator) => ({ trigger: await box(trigger), outer: await box(outer), popup: await box(page.locator('.process-hover-popover')) })
 
   await reasoningBelow.hover()
+  await expect(page.locator('.process-hover-popover')).toHaveCount(0)
+  await reasoningBelow.click({ position: { x: 40, y: 8 } })
   await expect(page.locator('.process-hover-popover')).toBeVisible()
   const reasoningGeometry = await geometry(reasoningBelow, page.locator('.reasoning-step').nth(0))
-  const timelineGeometry = await box(page.locator('.process-timeline'))
-
-  await targetTool.evaluate((element) => {
-    element.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }))
-    element.dispatchEvent(new MouseEvent('mouseenter', { bubbles: true }))
+  const reasoningPointer = await reasoningBelow.evaluate((element) => {
+    const rect = element.getBoundingClientRect()
+    return { x: rect.left + 40, y: rect.top + 8 }
   })
-  await page.waitForTimeout(250)
+  expect(reasoningGeometry.popup.x).toBe(reasoningPointer.x + 14)
+  expect(reasoningGeometry.popup.y).toBeGreaterThan(reasoningGeometry.trigger.y + reasoningGeometry.trigger.height)
+
+  await targetTool.hover()
+  await expect(page.locator('.process-hover-popover')).toContainText('reasoning details')
+  await targetTool.click({ position: { x: 40, y: 8 } })
   await expect(page.locator('.process-hover-popover')).toContainText('tool details')
   const toolGeometry = await geometry(targetTool, page.locator('.tool-row').nth(0))
-  const timelinePadding = await page.locator('.process-timeline').evaluate((element) => {
-    const styles = getComputedStyle(element)
-    return { left: Number.parseFloat(styles.paddingLeft) || 0, right: Number.parseFloat(styles.paddingRight) || 0 }
+  const toolPointer = await targetTool.evaluate((element) => {
+    const rect = element.getBoundingClientRect()
+    return { x: rect.left + 40, y: rect.top + 8 }
   })
-  const referenceLeft = timelineGeometry.x + timelinePadding.left
-  const referenceWidth = timelineGeometry.width - timelinePadding.left - timelinePadding.right
-  const expectedHorizontalOffset = referenceLeft - reasoningGeometry.outer.x + (referenceWidth - reasoningGeometry.popup.width) / 2
-  const reasoningBelowOffset = reasoningGeometry.popup.x - reasoningGeometry.outer.x
-  const toolBelowOffset = toolGeometry.popup.x - toolGeometry.outer.x
-  expect(reasoningBelowOffset).toBeGreaterThan(0)
-  expect(reasoningBelowOffset).toBeCloseTo(expectedHorizontalOffset, 4)
-  expect(toolBelowOffset).toBeCloseTo(reasoningBelowOffset, 4)
+  expect(toolGeometry.popup.x).toBe(toolPointer.x + 14)
+  expect(toolGeometry.popup.y).toBeGreaterThan(toolGeometry.trigger.y + toolGeometry.trigger.height)
 
   await page.locator('.process-hover-popover').evaluate((element) => element.dispatchEvent(new MouseEvent('mouseleave', { bubbles: true })))
   await page.waitForTimeout(220)
   await page.locator('.messages').evaluate((element) => { element.scrollTop = element.scrollHeight - element.clientHeight })
   const reasoningAbove = page.locator('.reasoning-trigger').nth(1)
   await reasoningAbove.hover()
+  await expect(page.locator('.process-hover-popover')).toHaveCount(0)
+  await reasoningAbove.click({ position: { x: 40, y: 8 } })
   await expect(page.locator('.process-hover-popover')).toHaveAttribute('data-placement', 'above')
   const reasoningAboveGeometry = await geometry(reasoningAbove, page.locator('.reasoning-step').nth(1))
   const toolAbove = page.locator('.tool-row-header').nth(15)
   await toolAbove.hover()
-  await page.waitForTimeout(220)
+  await expect(page.locator('.process-hover-popover')).toContainText('reasoning details above')
+  await toolAbove.click({ position: { x: 40, y: 8 } })
   await expect(page.locator('.process-hover-popover')).toHaveAttribute('data-placement', 'above')
   const toolAboveGeometry = await geometry(toolAbove, page.locator('.tool-row').nth(15))
-  const reasoningAboveOffset = reasoningAboveGeometry.popup.x - reasoningAboveGeometry.outer.x
-  const toolAboveOffset = toolAboveGeometry.popup.x - toolAboveGeometry.outer.x
-  expect(reasoningAboveOffset).toBeGreaterThan(0)
-  expect(reasoningAboveOffset).toBeCloseTo(expectedHorizontalOffset, 4)
-  expect(toolAboveOffset).toBeCloseTo(reasoningAboveOffset, 4)
+  expect(reasoningAboveGeometry.popup.y + reasoningAboveGeometry.popup.height).toBeLessThanOrEqual(reasoningAboveGeometry.trigger.y)
+  expect(toolAboveGeometry.popup.y + toolAboveGeometry.popup.height).toBeLessThanOrEqual(toolAboveGeometry.trigger.y)
   hold.release([])
 })
