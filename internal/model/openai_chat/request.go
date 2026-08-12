@@ -32,9 +32,10 @@ func buildRequestBody(request model.Request, stream bool, compatibility chatComp
 	if len(request.Tools) > 0 {
 		body["tools"] = buildTools(request.Tools, toolNames)
 	}
-	if _, configured := body["max_tokens"]; !configured && request.MaxTokens > 0 {
-		body["max_tokens"] = request.MaxTokens
-	}
+	// max_tokens is optional in Chat Completions and newer OpenAI reasoning
+	// models (gpt-5, o-series) reject it with HTTP 400 in favor of
+	// max_completion_tokens, so it is never injected automatically; callers
+	// opt in through parameters.
 	compatibility.prepareRequest(body, request)
 	if stream {
 		includeStreamUsage(body)

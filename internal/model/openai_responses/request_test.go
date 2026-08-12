@@ -788,6 +788,25 @@ func TestBuildProviderRequestUsesPreviousResponseIDOnlyForMatchingStoredState(t 
 	assertJSONOmitsKey(t, body, "previous_response_id")
 }
 
+func TestBuildRequestBodyOmitsMaxOutputTokensWhenDisabled(t *testing.T) {
+	// The Codex backend enforces a strict parameter allowlist and answers
+	// HTTP 400 to max_output_tokens, so Codex providers must opt out of the
+	// output_limit injection.
+	body, _, _, err := buildProviderRequest(model.Request{
+		Model:     "gpt-5.1-codex",
+		MaxTokens: 128000,
+	}, true, requestBodyOptions{omitMaxOutputTokens: true, forceStoreFalse: true})
+	if err != nil {
+		t.Fatalf("buildProviderRequest() error = %v", err)
+	}
+	assertJSONEqual(t, body, `{
+		"model": "gpt-5.1-codex",
+		"input": [],
+		"stream": true,
+		"store": false
+	}`)
+}
+
 func TestBuildRequestBodyInjectsMaxOutputTokensFromRequest(t *testing.T) {
 	body, _, _, err := buildProviderRequest(model.Request{
 		Model:     "gpt-5.5",

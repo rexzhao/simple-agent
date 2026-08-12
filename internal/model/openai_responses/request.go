@@ -19,7 +19,11 @@ func buildRequestBody(request model.Request, stream bool) ([]byte, *toolNameMapp
 }
 
 type requestBodyOptions struct {
-	forceStoreFalse     bool
+	forceStoreFalse bool
+	// omitMaxOutputTokens skips the max_output_tokens injection. The Codex
+	// backend enforces a strict parameter allowlist and answers 400 to
+	// max_output_tokens, so Codex providers must opt out.
+	omitMaxOutputTokens bool
 	origin              string
 	disableContinuation bool
 }
@@ -31,6 +35,7 @@ func buildRequestBodyWithOptions(request model.Request, stream bool, options req
 
 func buildCompactionRequestBody(request model.Request, options requestBodyOptions) ([]byte, providerRequestMetadata, error) {
 	body, _, metadata, err := buildProviderRequest(request, false, requestBodyOptions{
+		omitMaxOutputTokens: options.omitMaxOutputTokens,
 		origin:              options.origin,
 		disableContinuation: true,
 	})
@@ -122,7 +127,7 @@ func buildProviderRequest(request model.Request, stream bool, options requestBod
 	if err != nil {
 		return nil, nil, providerRequestMetadata{}, err
 	}
-	if _, configured := body["max_output_tokens"]; !configured && request.MaxTokens > 0 {
+	if _, configured := body["max_output_tokens"]; !configured && !options.omitMaxOutputTokens && request.MaxTokens > 0 {
 		body["max_output_tokens"] = clampMinimumOutputTokens(request.MaxTokens)
 	}
 

@@ -318,9 +318,13 @@ and `reasoning.budget_tokens` to `{"reasoning":{"budget_tokens":...}}`.
 
 Anthropic Messages requests require `max_tokens`; when a model profile does not
 set it explicitly, SAI injects the configured `output_limit` (or a 4096 default)
-so a new Anthropic model works without manual request parameters. OpenAI Chat
-injects `max_tokens` and OpenAI Responses injects `max_output_tokens` (clamped
-to a 16-token minimum) the same way.
+so a new Anthropic model works without manual request parameters. OpenAI
+Responses injects `max_output_tokens` (clamped to a 16-token minimum) the same
+way, except for Codex profiles: the Codex backend enforces a strict parameter
+allowlist and answers HTTP 400 to `max_output_tokens`, so it is never sent
+there. OpenAI Chat never injects `max_tokens` automatically — newer OpenAI
+reasoning models (gpt-5, o-series) reject the field with HTTP 400 — set it
+explicitly in `parameters` when an endpoint needs it.
 
 The Server Root settings page can search the public models.dev catalog by model
 ID and fill a model card's context/limits, pricing, image support, and reasoning

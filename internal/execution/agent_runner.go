@@ -1626,8 +1626,12 @@ func openAICodexProviderConfig(provider config.ProviderConfig, httpClient *http.
 	return openairesponses.ProviderConfig{
 		BaseURL:         provider.BaseURL,
 		ForceStoreFalse: true,
-		HTTPClient:      httpClient,
-		HTTPOptions:     httpOptions,
+		// The Codex backend enforces a strict parameter allowlist and rejects
+		// max_output_tokens with HTTP 400, so the runner-level output limit
+		// must stay client-side only.
+		OmitMaxOutputTokens: true,
+		HTTPClient:          httpClient,
+		HTTPOptions:         httpOptions,
 		TokenSource: codexResponsesTokenSource{
 			source: &codexauth.TokenSource{
 				Store:      codexauth.Store{Path: provider.AuthFile},

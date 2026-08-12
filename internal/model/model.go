@@ -29,9 +29,11 @@ type Request struct {
 	Parameters    map[string]any
 	SessionID     string
 	DeveloperRole MessageRole
-	// MaxTokens is the provider-required output token cap. Providers that
-	// require it (Anthropic) inject it into the request body when the caller
-	// did not already set max_tokens/max_output_tokens in Parameters.
+	// MaxTokens is the provider-required output token cap. Anthropic Messages
+	// injects it as max_tokens (the API requires the field) and OpenAI
+	// Responses as max_output_tokens when the caller did not already set them
+	// in Parameters. Codex and OpenAI Chat never inject it: their endpoints
+	// reject the parameter with HTTP 400.
 	MaxTokens int
 }
 

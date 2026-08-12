@@ -21,9 +21,12 @@ type ProviderConfig struct {
 	APIKey          string
 	TokenSource     TokenSource
 	ForceStoreFalse bool
-	HTTPClient      *http.Client
-	HTTPOptions     httpstream.Options
-	RecordRequest   func(endpoint string, body []byte) error
+	// OmitMaxOutputTokens disables the max_output_tokens injection for
+	// backends with a strict parameter allowlist (Codex answers 400).
+	OmitMaxOutputTokens bool
+	HTTPClient          *http.Client
+	HTTPOptions         httpstream.Options
+	RecordRequest       func(endpoint string, body []byte) error
 }
 
 type TokenSource interface {
@@ -36,15 +39,16 @@ type AccessToken struct {
 }
 
 type Provider struct {
-	baseURL         string
-	apiKey          string
-	tokenSource     TokenSource
-	forceStoreFalse bool
-	httpClient      *http.Client
-	httpOptions     httpstream.Options
-	recordRequest   func(endpoint string, body []byte) error
-	turnStateMu     sync.Mutex
-	turnState       string
+	baseURL             string
+	apiKey              string
+	tokenSource         TokenSource
+	forceStoreFalse     bool
+	omitMaxOutputTokens bool
+	httpClient          *http.Client
+	httpOptions         httpstream.Options
+	recordRequest       func(endpoint string, body []byte) error
+	turnStateMu         sync.Mutex
+	turnState           string
 }
 
 var _ model.Provider = (*Provider)(nil)
@@ -62,13 +66,14 @@ func NewProvider(config ProviderConfig) (*Provider, error) {
 	}
 
 	return &Provider{
-		baseURL:         baseURL,
-		apiKey:          strings.TrimSpace(config.APIKey),
-		tokenSource:     config.TokenSource,
-		forceStoreFalse: config.ForceStoreFalse,
-		httpClient:      httpClient,
-		httpOptions:     config.HTTPOptions,
-		recordRequest:   config.RecordRequest,
+		baseURL:             baseURL,
+		apiKey:              strings.TrimSpace(config.APIKey),
+		tokenSource:         config.TokenSource,
+		forceStoreFalse:     config.ForceStoreFalse,
+		omitMaxOutputTokens: config.OmitMaxOutputTokens,
+		httpClient:          httpClient,
+		httpOptions:         config.HTTPOptions,
+		recordRequest:       config.RecordRequest,
 	}, nil
 }
 
@@ -79,8 +84,9 @@ func (p *Provider) Stream(ctx context.Context, request model.Request) (<-chan mo
 	}
 
 	body, toolNames, metadata, err := buildProviderRequest(request, true, requestBodyOptions{
-		forceStoreFalse: p.forceStoreFalse,
-		origin:          p.baseURL,
+		forceStoreFalse:     p.forceStoreFalse,
+		omitMaxOutputTokens: p.omitMaxOutputTokens,
+		origin:              p.baseURL,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("build OpenAI Responses request body: %w", err)
@@ -90,6 +96,7 @@ func (p *Provider) Stream(ctx context.Context, request model.Request) (<-chan mo
 	if shouldRetryWithoutContinuation(err, metadata) {
 		body, toolNames, metadata, err = buildProviderRequest(request, true, requestBodyOptions{
 			forceStoreFalse:     p.forceStoreFalse,
+			omitMaxOutputTokens: p.omitMaxOutputTokens,
 			origin:              p.baseURL,
 			disableContinuation: true,
 		})
@@ -122,7 +129,7 @@ func (p *Provider) Compact(ctx context.Context, request model.Request) (model.Co
 	if err != nil {
 		return model.CompactionResult{}, err
 	}
-	body, metadata, err := buildCompactionRequestBody(request, requestBodyOptions{origin: p.baseURL})
+	body, metadata, err := buildCompactionRequestBody(request, requestBodyOptions{omitMaxOutputTokens: p.omitMaxOutputTokens, origin: p.baseURL})
 	if err != nil {
 		return model.CompactionResult{}, fmt.Errorf("build OpenAI Responses compact request body: %w", err)
 	}

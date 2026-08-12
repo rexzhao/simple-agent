@@ -474,24 +474,26 @@ func TestBuildRequestBodyRejectsNonUserContentBlocks(t *testing.T) {
 	}
 }
 
-func TestBuildRequestBodyInjectsMaxTokensFromRequest(t *testing.T) {
+func TestBuildRequestBodyDoesNotInjectMaxTokens(t *testing.T) {
+	// max_tokens is optional in Chat Completions and newer OpenAI reasoning
+	// models answer HTTP 400 to it, so the runner-level output limit must
+	// never leak into the request body.
 	body, err := BuildRequestBody(model.Request{
-		Model:     "glm-5.2",
-		MaxTokens: 4096,
+		Model:     "gpt-5",
+		MaxTokens: 128000,
 	}, true)
 	if err != nil {
 		t.Fatalf("BuildRequestBody() error = %v", err)
 	}
 	assertJSONEqual(t, body, `{
-		"model": "glm-5.2",
+		"model": "gpt-5",
 		"messages": [],
 		"stream": true,
-		"stream_options": {"include_usage": true},
-		"max_tokens": 4096
+		"stream_options": {"include_usage": true}
 	}`)
 }
 
-func TestBuildRequestBodyKeepsExplicitMaxTokensOverInjection(t *testing.T) {
+func TestBuildRequestBodyKeepsExplicitMaxTokens(t *testing.T) {
 	body, err := BuildRequestBody(model.Request{
 		Model:     "glm-5.2",
 		MaxTokens: 4096,
