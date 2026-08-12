@@ -21,6 +21,7 @@ import (
 	"github.com/rexzhao/simple-agent/internal/codexlogin"
 	"github.com/rexzhao/simple-agent/internal/config"
 	"github.com/rexzhao/simple-agent/internal/execution"
+	"github.com/rexzhao/simple-agent/internal/modelcatalog"
 	"github.com/rexzhao/simple-agent/internal/projectindex"
 	"github.com/rexzhao/simple-agent/internal/providersettings"
 	"github.com/rexzhao/simple-agent/internal/sessioncontent"
@@ -45,6 +46,11 @@ type ServerOptions struct {
 	// non-loopback interface; the bearer token and per-request Origin checks
 	// remain enforced.
 	AllowNonLoopback bool
+
+	// ModelCatalog supplies the models.dev-backed model metadata used by the
+	// model_catalog.search command. It is optional; when omitted the server
+	// creates a default catalog bound to the public models.dev endpoint.
+	ModelCatalog *modelcatalog.Catalog
 
 	// The gateway and ticket store hooks keep B1 independently testable. The
 	// production defaults use the secure bounded implementations.
@@ -80,6 +86,7 @@ type Server struct {
 	sessionContent               *sessioncontent.Provider
 	blobStore                    *blobstore.Store
 	blobStoreOwned               bool
+	modelCatalog                 *modelcatalog.Catalog
 	sinkRegistration             *execution.SessionIndexSinkRegistration
 	projectRegistration          *execution.ProjectIndexSinkRegistration
 	providerSettingsRegistration *execution.ProviderSettingsSinkRegistration
@@ -117,6 +124,10 @@ func NewServer(options ServerOptions) (*Server, error) {
 			cancel()
 			return nil, err
 		}
+	}
+	modelCatalog := options.ModelCatalog
+	if modelCatalog == nil {
+		modelCatalog = modelcatalog.New(modelcatalog.Options{})
 	}
 	gateway := options.WebSocketGateway
 	var dispatcher *wsgateway.Dispatcher
@@ -354,6 +365,7 @@ func NewServer(options ServerOptions) (*Server, error) {
 			commandRegistry, err := newSessionCommandRegistry(options.Service, runs, sessionCommandRegistryOptions{
 				HistoryWriter: blobStore,
 				CodexLogins:   codexLogins,
+				ModelCatalog:  modelCatalog,
 			})
 			if err != nil {
 				cleanupAssembly()
@@ -412,6 +424,7 @@ func NewServer(options ServerOptions) (*Server, error) {
 		sessionContent:               sessionContentProvider,
 		blobStore:                    blobStore,
 		blobStoreOwned:               blobStoreOwned,
+		modelCatalog:                 modelCatalog,
 		sinkRegistration:             sinkRegistration,
 		projectRegistration:          projectRegistration,
 		providerSettingsRegistration: providerSettingsRegistration,

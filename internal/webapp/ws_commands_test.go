@@ -989,7 +989,7 @@ func TestSessionCommandRegistryIsClosedAndFlagsAreExplicit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantNames := []string{"codex_login.clear", "codex_login.start", "project.archive", "project.create", "project.delete", "project.models.read", "project.rename", "project.restore", "provider.codex_usage.read", "provider.create", "provider.discover_models", "provider.set_default", "provider.update", "run.cancel", "run.continue", "run.prompt.append", "run.prompt.move", "run.prompt.remove", "run.prompt.steer", "run.start", "run.tool.cancel", "session.archive", "session.compact", "session.create", "session.delete", "session.history.read", "session.mark_read", "session.rename", "session.restore", "session.set_debug", "session.set_full_access"}
+	wantNames := []string{"codex_login.clear", "codex_login.start", "model_catalog.search", "project.archive", "project.create", "project.delete", "project.models.read", "project.rename", "project.restore", "provider.codex_usage.read", "provider.create", "provider.discover_models", "provider.set_default", "provider.update", "run.cancel", "run.continue", "run.prompt.append", "run.prompt.move", "run.prompt.remove", "run.prompt.steer", "run.start", "run.tool.cancel", "session.archive", "session.compact", "session.create", "session.delete", "session.history.read", "session.mark_read", "session.rename", "session.restore", "session.set_debug", "session.set_full_access"}
 	if got := registry.Names(); !reflect.DeepEqual(got, wantNames) {
 		t.Fatalf("registry names=%v, want %v", got, wantNames)
 	}
@@ -1001,7 +1001,7 @@ func TestSessionCommandRegistryIsClosedAndFlagsAreExplicit(t *testing.T) {
 		if definition.SupportsExpectedRevision {
 			t.Fatalf("%s unexpectedly supports expected_revision", name)
 		}
-		if name == "session.history.read" || name == "provider.discover_models" || name == "project.models.read" || name == "provider.codex_usage.read" {
+		if name == "session.history.read" || name == "provider.discover_models" || name == "project.models.read" || name == "provider.codex_usage.read" || name == "model_catalog.search" {
 			if definition.CachePolicy != commands.ResultCacheVolatile {
 				t.Fatalf("%s must retain a volatile-result policy", name)
 			}

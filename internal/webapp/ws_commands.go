@@ -19,6 +19,7 @@ import (
 	"github.com/rexzhao/simple-agent/internal/commands"
 	"github.com/rexzhao/simple-agent/internal/config"
 	"github.com/rexzhao/simple-agent/internal/execution"
+	"github.com/rexzhao/simple-agent/internal/modelcatalog"
 	projectstore "github.com/rexzhao/simple-agent/internal/projects"
 	"github.com/rexzhao/simple-agent/internal/protocol"
 	"github.com/rexzhao/simple-agent/internal/providersettings"
@@ -248,6 +249,17 @@ type providerDefaultResult struct {
 type providerDiscoverInlineResult struct {
 	Provider string   `json:"provider"`
 	Models   []string `json:"models"`
+}
+
+type modelCatalogSearchArguments struct {
+	Query string `json:"query"`
+	Limit int    `json:"limit,omitempty"`
+}
+
+type modelCatalogSearchResult struct {
+	Query  string                  `json:"query"`
+	Models []modelcatalog.Model    `json:"models"`
+	Blob   *protocol.BlobDescriptor `json:"blob"`
 }
 
 type codexLoginResult struct {
@@ -1296,6 +1308,58 @@ func decodeProviderCodexUsageReadArguments(raw json.RawMessage) (providerDiscove
 	return providerDiscoverArguments{Provider: provider}, err
 }
 
+func decodeModelCatalogSearchArguments(raw json.RawMessage) (modelCatalogSearchArguments, error) {
+	const command = "model_catalog.search"
+	fields, err := strictCommandObject(raw, command)
+	if err != nil {
+		return modelCatalogSearchArguments{}, err
+	}
+	if err := requireExactFields(fields, command, "query", "limit"); err != nil {
+		return modelCatalogSearchArguments{}, err
+	}
+	result := modelCatalogSearchArguments{}
+	query, err := requiredCommandString(fields, "query", command)
+	if err != nil || len([]byte(query)) > maxModelCatalogQueryBytes || !utf8.ValidString(query) {
+		return modelCatalogSearchArguments{}, fmt.Errorf("invalid %s arguments", command)
+	}
+	result.Query = query
+	if rawLimit, ok := fields["limit"]; ok && strings.TrimSpace(string(rawLimit)) != "null" {
+		limit, err := requiredCommandInt(fields, "limit", command, 1, maxModelCatalogModels)
+		if err != nil {
+			return modelCatalogSearchArguments{}, fmt.Errorf("invalid %s arguments", command)
+		}
+		result.Limit = limit
+	}
+	return result, nil
+}
+
+func validateModelCatalogSearchArguments(raw json.RawMessage) error {
+	_, err := decodeModelCatalogSearchArguments(raw)
+	return err
+}
+
+func validateModelCatalogResult(models []modelcatalog.Model) error {
+	if len(models) > maxModelCatalogModels {
+		return fmt.Errorf("model catalog result exceeds limit")
+	}
+	for _, model := range models {
+		if !utf8.ValidString(model.ID) || len([]byte(model.ID)) == 0 || len([]byte(model.ID)) > maxModelCatalogIDBytes {
+			return fmt.Errorf("model catalog id is invalid")
+		}
+		if !utf8.ValidString(model.Provider) || len([]byte(model.Provider)) > maxModelCatalogIDBytes {
+			return fmt.Errorf("model catalog provider is invalid")
+		}
+	}
+	return nil
+}
+
+func modelCatalogCommandError(err error) error {
+	if err == nil {
+		return nil
+	}
+	return commands.NewDomainError("model_catalog_failed", "model catalog search failed", err)
+}
+
 func decodeCodexLoginArguments(raw json.RawMessage, command string) (codexLoginArguments, error) {
 	fields, err := strictCommandObject(raw, command)
 	if err != nil {
@@ -2163,6 +2227,7 @@ type sessionHistoryBlobWriter interface {
 type sessionCommandRegistryOptions struct {
 	HistoryWriter sessionHistoryBlobWriter
 	CodexLogins   *codexLoginRegistry
+	ModelCatalog  *modelcatalog.Catalog
 }
 
 const (
@@ -2175,6 +2240,11 @@ const (
 	maxProjectModels             = 4096
 	maxProjectModelsBytes        = 8 * 1024 * 1024
 	maxProjectModelsInline       = 64 * 1024
+	maxModelCatalogModels        = 50
+	maxModelCatalogBytes         = 8 * 1024 * 1024
+	maxModelCatalogInline        = 64 * 1024
+	maxModelCatalogIDBytes       = 4096
+	maxModelCatalogQueryBytes    = 256
 	maxCodexUsageBytes           = 8 * 1024 * 1024
 	maxCodexUsageInline          = 64 * 1024
 	maxReadResultStringBytes     = 4096
@@ -2323,6 +2393,7 @@ func sessionHistoryReadCommandError(err error) error {
 func newSessionCommandRegistry(service *execution.Service, runs *runRegistry, options sessionCommandRegistryOptions) (*commands.Registry, error) {
 	historyWriter := options.HistoryWriter
 	codexLogins := options.CodexLogins
+	modelCatalog := options.ModelCatalog
 	return commands.NewRegistry(
 		commands.CommandDefinition{
 			// Starting device login performs an external operation without a
@@ -2500,6 +2571,52 @@ func newSessionCommandRegistry(service *execution.Service, runs *runRegistry, op
 					return nil, commands.NewDomainError("provider_result_invalid", "provider model result is invalid", nil)
 				}
 				return json.Marshal(providerDiscoverBlobResult{Provider: arguments.Provider, Blob: &descriptor})
+			},
+		},
+		commands.CommandDefinition{
+			Name: "model_catalog.search", SchemaVersion: 1, CrossEpochRetrySafe: true,
+			CachePolicy: commands.ResultCacheVolatile, SupportsExpectedRevision: false,
+			Validate: validateModelCatalogSearchArguments,
+			Execute: func(ctx context.Context, request commands.CommandRequest) (json.RawMessage, error) {
+				arguments, err := decodeModelCatalogSearchArguments(request.Arguments)
+				if err != nil {
+					return nil, err
+				}
+				if modelCatalog == nil {
+					return nil, commands.NewDomainError("model_catalog_unavailable", "model catalog is not configured", nil)
+				}
+				models, err := modelCatalog.Search(ctx, arguments.Query, modelcatalog.SearchOptions{Limit: arguments.Limit})
+				if err != nil {
+					return nil, commands.NewDomainError("model_catalog_failed", "model catalog search failed", err)
+				}
+				if err := validateModelCatalogResult(models); err != nil {
+					return nil, commands.NewDomainError("model_catalog_result_invalid", "model catalog result is invalid", nil)
+				}
+				modelsBytes, err := json.Marshal(models)
+				if err != nil {
+					return nil, commands.NewDomainError("model_catalog_result_invalid", "model catalog result is invalid", nil)
+				}
+				if len(modelsBytes) > maxModelCatalogBytes {
+					return nil, commands.NewDomainError("model_catalog_result_too_large", "model catalog result is too large", nil)
+				}
+				inline, err := json.Marshal(modelCatalogSearchResult{Query: arguments.Query, Models: models})
+				if err != nil {
+					return nil, commands.NewDomainError("model_catalog_result_invalid", "model catalog result is invalid", nil)
+				}
+				if len(inline) <= maxModelCatalogInline || historyWriter == nil {
+					if historyWriter == nil && len(inline) > maxModelCatalogInline {
+						return nil, commands.NewDomainError("model_catalog_result_too_large", "model catalog result is too large", nil)
+					}
+					return inline, nil
+				}
+				descriptor, err := historyWriter.Put(ctx, "application/json", modelsBytes)
+				if err != nil {
+					return nil, modelCatalogCommandError(err)
+				}
+				if err := validateProviderDiscoverBlobDescriptor(descriptor, modelsBytes); err != nil {
+					return nil, commands.NewDomainError("model_catalog_result_invalid", "model catalog result is invalid", nil)
+				}
+				return json.Marshal(modelCatalogSearchResult{Query: arguments.Query, Models: models, Blob: &descriptor})
 			},
 		},
 		commands.CommandDefinition{

@@ -84,6 +84,9 @@ type ProviderModelSettings struct {
 // scalar union; structured/arbitrary provider extensions are not copied into
 // the resource.
 type ReasoningMetadata struct {
+	// Type mirrors config.ReasoningConfig.Type: empty/effort for string-level
+	// mappings, budget_tokens for numeric token budgets.
+	Type      string           `json:"type"`
 	Parameter string           `json:"parameter"`
 	Default   string           `json:"default"`
 	Levels    []ReasoningLevel `json:"levels"`
@@ -445,7 +448,7 @@ func modelFromConfig(value config.ModelProfile, profile, providerName, baseURL s
 	if len(reasoningConfig.Levels) == 0 && strings.TrimSpace(reasoningConfig.Parameter) == "" {
 		reasoningConfig = config.DefaultReasoningConfig(providerName, baseURL, value)
 	}
-	reasoning := ReasoningMetadata{Parameter: strings.TrimSpace(reasoningConfig.Parameter), Default: strings.TrimSpace(reasoningConfig.Default), Levels: []ReasoningLevel{}}
+	reasoning := ReasoningMetadata{Type: config.NormalizeReasoningType(reasoningConfig.Type), Parameter: strings.TrimSpace(reasoningConfig.Parameter), Default: strings.TrimSpace(reasoningConfig.Default), Levels: []ReasoningLevel{}}
 	levelNames := make([]string, 0, len(reasoningConfig.Levels))
 	for name := range reasoningConfig.Levels {
 		levelNames = append(levelNames, name)
@@ -572,8 +575,13 @@ func (m ProviderModelSettings) Validate() error {
 }
 
 func (r ReasoningMetadata) Validate() error {
-	if !boundedReasoningString(r.Parameter) || !boundedReasoningString(r.Default) {
+	if !boundedReasoningString(r.Parameter) || !boundedReasoningString(r.Default) || !boundedReasoningString(r.Type) {
 		return fmt.Errorf("reasoning metadata is invalid")
+	}
+	switch config.NormalizeReasoningType(r.Type) {
+	case "", config.ReasoningTypeBudgetTokens, config.ReasoningTypeEffort:
+	default:
+		return fmt.Errorf("reasoning metadata type %q is invalid", r.Type)
 	}
 	seen := map[string]struct{}{}
 	for _, level := range r.Levels {
@@ -814,11 +822,16 @@ func (r *ReasoningMetadata) UnmarshalJSON(data []byte) error {
 	if r == nil {
 		return fmt.Errorf("reasoning metadata is nil")
 	}
-	fields, err := strictObject(data, "reasoning metadata", []string{"parameter", "default", "levels"}, true)
+	fields, err := strictObject(data, "reasoning metadata", []string{"type", "parameter", "default", "levels"}, true)
 	if err != nil {
 		return err
 	}
 	result := ReasoningMetadata{}
+	if rawType, ok := fields["type"]; ok && len(rawType) > 0 && !isNull(rawType) {
+		if result.Type, err = requiredString(rawType, "type", true); err != nil {
+			return err
+		}
+	}
 	if result.Parameter, err = requiredString(fields["parameter"], "parameter", true); err != nil {
 		return err
 	}
