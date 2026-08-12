@@ -324,15 +324,16 @@ export async function decodeModelCatalogSearchResult(
 ): Promise<ModelCatalogSearchResult> {
   if (value === null || typeof value !== 'object' || Array.isArray(value)) throw new Error('model catalog result is not an object')
   const object = value as Record<string, unknown>
-  if (Object.keys(object).length !== 2) throw new Error('model catalog result shape is invalid')
+  const keys = Object.keys(object).sort()
+  const inlineShape = keys.length === 2 && keys[0] === 'models' && keys[1] === 'query'
+  const blobShape = keys.length === 3 && keys[0] === 'blob' && keys[1] === 'models' && keys[2] === 'query'
+  if (!inlineShape && !blobShape) throw new Error('model catalog result shape is invalid')
   if (typeof object.query !== 'string' || object.query !== query) throw new Error('model catalog result identity is invalid')
-  const hasModels = Object.prototype.hasOwnProperty.call(object, 'models')
-  const hasBlob = Object.prototype.hasOwnProperty.call(object, 'blob')
-  if (hasModels === hasBlob) throw new Error('model catalog result shape is invalid')
-  if (hasModels) {
+  if (inlineShape) {
     if (!Array.isArray(object.models)) throw new Error('model catalog result is invalid')
     return { query, models: decodeCatalogModels(object.models) }
   }
+  if (object.blob === null || object.blob === undefined) throw new Error('model catalog result shape is invalid')
   const descriptor = decodeBlobDescriptor(object.blob)
   if (!blobClient) throw new Error('model catalog blob client is unavailable')
   const blob = await blobClient.getJSON(descriptor, { signal })

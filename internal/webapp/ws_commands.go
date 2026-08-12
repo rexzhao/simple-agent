@@ -257,9 +257,9 @@ type modelCatalogSearchArguments struct {
 }
 
 type modelCatalogSearchResult struct {
-	Query  string                  `json:"query"`
-	Models []modelcatalog.Model    `json:"models"`
-	Blob   *protocol.BlobDescriptor `json:"blob"`
+	Query  string                   `json:"query"`
+	Models []modelcatalog.Model     `json:"models"`
+	Blob   *protocol.BlobDescriptor `json:"blob,omitempty"`
 }
 
 type codexLoginResult struct {

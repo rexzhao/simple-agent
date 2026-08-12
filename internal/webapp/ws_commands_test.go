@@ -22,6 +22,7 @@ import (
 	"github.com/rexzhao/simple-agent/internal/commands"
 	"github.com/rexzhao/simple-agent/internal/config"
 	"github.com/rexzhao/simple-agent/internal/execution"
+	"github.com/rexzhao/simple-agent/internal/modelcatalog"
 	"github.com/rexzhao/simple-agent/internal/protocol"
 )
 
@@ -1268,5 +1269,53 @@ func TestSessionCompactCommandErrorsRemainTyped(t *testing.T) {
 				t.Fatalf("mapped error=%#v, want code %q", mapped, test.code)
 			}
 		})
+	}
+}
+
+func TestModelCatalogSearchCommandInlineShape(t *testing.T) {
+	// A small catalog served locally so the command returns an inline result
+	// (well under the blob threshold) with exactly query+models and no blob.
+	catalogServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"deepseek":{"models":{"deepseek-v4-flash":{"name":"DeepSeek V4 Flash","reasoning":true,"reasoning_options":[{"type":"effort","values":["low","high","max"]}],"modalities":{"input":["text"]},"limit":{"context":1000000,"output":384000}}}}}`))
+	}))
+	defer catalogServer.Close()
+
+	catalog := modelcatalog.New(modelcatalog.Options{URL: catalogServer.URL, TTL: 0})
+	registry, err := newSessionCommandRegistry(nil, nil, sessionCommandRegistryOptions{ModelCatalog: catalog})
+	if err != nil {
+		t.Fatalf("newSessionCommandRegistry() error = %v", err)
+	}
+	definition, err := registry.Definition("model_catalog.search", 1)
+	if err != nil {
+		t.Fatalf("Definition(model_catalog.search) error = %v", err)
+	}
+	result, err := definition.Execute(context.Background(), commands.CommandRequest{
+		Name: "model_catalog.search", SchemaVersion: 1, Arguments: json.RawMessage(`{"query":"deepseek","limit":5}`),
+	})
+	if err != nil {
+		t.Fatalf("Execute(model_catalog.search) error = %v", err)
+	}
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal(result, &payload); err != nil {
+		t.Fatalf("unmarshal result error = %v", err)
+	}
+	// Inline results must be exactly {query, models}; the frontend decoder
+	// rejects any extra key (including the old blob:null).
+	if len(payload) != 2 {
+		t.Fatalf("inline result keys = %d (%v), want exactly query+models", len(payload), payload)
+	}
+	if _, ok := payload["blob"]; ok {
+		t.Fatalf("inline result must not carry a blob key: %s", result)
+	}
+	var models []modelcatalog.Model
+	if err := json.Unmarshal(payload["models"], &models); err != nil {
+		t.Fatalf("unmarshal models error = %v", err)
+	}
+	if len(models) != 1 || models[0].ID != "deepseek-v4-flash" {
+		t.Fatalf("models = %#v, want deepseek-v4-flash", models)
+	}
+	if models[0].OutputLimit != 384000 {
+		t.Fatalf("output_limit = %d, want 384000", models[0].OutputLimit)
 	}
 }

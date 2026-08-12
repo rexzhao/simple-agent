@@ -5,7 +5,7 @@ import { CommandFacade } from './commandFacade'
 import type { BlobClient } from './blobClient'
 import type { RuntimeTransport } from './runtime'
 import type { TransportCloseEvent, TransportReadyEvent } from './transport'
-import { decodeProviderDiscoverResult, encodeProviderTarget } from './providerCommandCodec'
+import { decodeProviderDiscoverResult, decodeModelCatalogSearchResult, encodeProviderTarget } from './providerCommandCodec'
 import { isProviderCreateName } from '../domain/providerIdentity'
 
 class ProviderCommandTransport implements RuntimeTransport {
@@ -249,6 +249,32 @@ describe('ProviderCommands', () => {
     ]) {
       await expect(decodeProviderDiscoverResult({ provider: 'p', blob: invalid }, 'p', blobClient)).rejects.toThrow()
     }
+  })
+
+  it('decodes model catalog inline results with exactly query+models', async () => {
+    const inline = await decodeModelCatalogSearchResult({
+      query: 'deepseek',
+      models: [{ id: 'deepseek-v4-flash', name: 'DeepSeek V4 Flash', provider: 'deepseek', input: ['text'], output_limit: 384000 }],
+    }, 'deepseek')
+    expect(inline.query).toBe('deepseek')
+    expect(inline.models).toHaveLength(1)
+    expect(inline.models[0].id).toBe('deepseek-v4-flash')
+    expect(inline.models[0].output_limit).toBe(384000)
+  })
+
+  it('decodes model catalog blob results and rejects the old null-blob shape', async () => {
+    const blobClient = { getJSON: async () => [{ id: 'gemini-2.5-flash', name: 'Gemini', provider: 'google', input: ['text', 'image'] }] } as unknown as BlobClient
+    const blob = await decodeModelCatalogSearchResult({ query: 'gemini', models: [], blob: blobDescriptor }, 'gemini', blobClient)
+    expect(blob.models[0].id).toBe('gemini-2.5-flash')
+    // The pre-fix backend emitted blob:null even for inline results. That
+    // shape must be rejected rather than silently accepted.
+    await expect(decodeModelCatalogSearchResult({ query: 'gemini', models: [], blob: null }, 'gemini', blobClient)).rejects.toThrow()
+  })
+
+  it('rejects model catalog results with a mismatched query or unknown shape', async () => {
+    await expect(decodeModelCatalogSearchResult({ query: 'a', models: [] }, 'b')).rejects.toThrow()
+    await expect(decodeModelCatalogSearchResult({ query: 'a', models: [], extra: 1 }, 'a')).rejects.toThrow()
+    await expect(decodeModelCatalogSearchResult({ query: 'a' }, 'a')).rejects.toThrow()
   })
 
   it('reads project models and Codex usage through typed commands with target and blob validation', async () => {
