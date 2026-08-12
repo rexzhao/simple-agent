@@ -79,7 +79,7 @@ function rootSessionID(sessions: readonly SessionNavigation[], sessionID: string
   return current.id
 }
 
-function providerOperationErrorMessage(reason: unknown, operation: 'save' | 'default' | 'discover' | 'login' | 'logout'): string {
+function providerOperationErrorMessage(reason: unknown, operation: 'save' | 'default' | 'discover' | 'catalog' | 'login' | 'logout'): string {
   if (reason && typeof reason === 'object' && 'code' in reason) {
     const code = String((reason as { code?: unknown }).code)
     if (code === 'timeout') return operation === 'login' || operation === 'logout' ? 'Codex command accepted; waiting for login synchronization.' : 'Provider command accepted; waiting for settings synchronization.'
@@ -88,6 +88,7 @@ function providerOperationErrorMessage(reason: unknown, operation: 'save' | 'def
   switch (operation) {
     case 'default': return 'The default model could not be changed.'
     case 'discover': return 'Provider model discovery failed.'
+    case 'catalog': return 'Model catalog search failed.'
     case 'login': return 'Codex sign-in could not be started.'
     case 'logout': return 'Codex sign-out could not be completed.'
     default: return 'Provider settings could not be saved.'
@@ -542,6 +543,15 @@ function App() {
       return result.models
     } catch (reason) {
       throw new Error(providerOperationErrorMessage(reason, 'discover'))
+    }
+  }, [providerCommands])
+
+  const searchModelCatalog = useCallback(async (query: string): Promise<import('./commands/providerCommands').ModelCatalogModel[]> => {
+    try {
+      const result = await providerCommands.searchModelCatalog(query)
+      return [...result.models]
+    } catch (reason) {
+      throw new Error(providerOperationErrorMessage(reason, 'catalog'))
     }
   }, [providerCommands])
 
@@ -1190,6 +1200,7 @@ function App() {
           onSave={saveProvider}
           onSetDefault={setProviderDefault}
           onDiscoverModels={discoverProviderModels}
+          onSearchModelCatalog={searchModelCatalog}
           onStartCodexLogin={startCodexLogin}
           onClearCodexLogin={clearCodexLogin}
           onRefreshUsage={refreshCodexUsage}

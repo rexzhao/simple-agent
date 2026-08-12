@@ -2,6 +2,8 @@ import type { BlobDescriptor } from '../protocol/types'
 import { isRFC3339Timestamp } from '../protocol/datetime'
 import type { JsonObject } from '../domain/json'
 import type {
+  ModelCatalogModel,
+  ModelCatalogSearchResult,
   ProviderDiscoverModelsResult,
   ProviderUpdateTarget,
 } from '../commands/providerCommands'
@@ -20,7 +22,7 @@ const maxProviderResultBytes = 8 * 1024 * 1024
 const allowedTargetKeys = ['base_url', 'api_key', 'keep_api_key', 'auth_file', 'request_timeout', 'http_proxy', 'https_proxy', 'max_concurrent_requests', 'models'] as const
 const allowedTargetWriteModeKeys = ['base_url_mode', 'auth_file_mode', 'http_proxy_mode', 'https_proxy_mode'] as const
 const allowedModelKeys = ['profile', 'id', 'type', 'compatibility', 'input', 'developer_role', 'context_window', 'input_limit', 'output_limit', 'parameters_mode', 'parameters_source_profile', 'parameters', 'reasoning_config', 'pricing'] as const
-const allowedReasoningKeys = ['parameter', 'default', 'levels'] as const
+const allowedReasoningKeys = ['type', 'parameter', 'default', 'levels'] as const
 const allowedPricingKeys = ['input_cache_hit', 'input_cache_miss', 'cache_write', 'output', 'currency', 'long_context_threshold', 'long_context'] as const
 const allowedPricingTierKeys = ['input_cache_hit', 'input_cache_miss', 'cache_write', 'output'] as const
 
@@ -122,11 +124,12 @@ function knownObject(source: unknown, keys: readonly string[]): RecordValue {
 }
 
 function encodeReasoning(value: unknown): JsonObject {
-  if (value === undefined) return { parameter: '', default: '', levels: {} }
+  if (value === undefined) return { type: '', parameter: '', default: '', levels: {} }
   const source = knownObject(value, allowedReasoningKeys)
   const levels = source.levels === undefined ? {} : source.levels
   if (!isRecord(levels)) throw new Error('provider reasoning levels are invalid')
   const result: JsonObject = {
+    type: canonicalConfigString(optionalString(source, 'type')),
     parameter: canonicalConfigString(optionalString(source, 'parameter')),
     default: canonicalConfigString(optionalString(source, 'default')),
     levels: levels as JsonObject,
@@ -311,4 +314,94 @@ function decodeBlobDescriptor(value: unknown): BlobDescriptor {
   if (!Number.isSafeInteger(object.size) || (object.size as number) < 0 || (object.size as number) > maxProviderResultBytes) throw new Error('provider blob descriptor is invalid')
   if (!isRFC3339Timestamp(object.expires_at) || Date.now() >= Date.parse(object.expires_at as string)) throw new Error('provider blob descriptor is expired')
   return object as unknown as BlobDescriptor
+}
+
+export async function decodeModelCatalogSearchResult(
+  value: unknown,
+  query: string,
+  blobClient?: BlobClient,
+  signal?: AbortSignal,
+): Promise<ModelCatalogSearchResult> {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) throw new Error('model catalog result is not an object')
+  const object = value as Record<string, unknown>
+  if (Object.keys(object).length !== 2) throw new Error('model catalog result shape is invalid')
+  if (typeof object.query !== 'string' || object.query !== query) throw new Error('model catalog result identity is invalid')
+  const hasModels = Object.prototype.hasOwnProperty.call(object, 'models')
+  const hasBlob = Object.prototype.hasOwnProperty.call(object, 'blob')
+  if (hasModels === hasBlob) throw new Error('model catalog result shape is invalid')
+  if (hasModels) {
+    if (!Array.isArray(object.models)) throw new Error('model catalog result is invalid')
+    return { query, models: decodeCatalogModels(object.models) }
+  }
+  const descriptor = decodeBlobDescriptor(object.blob)
+  if (!blobClient) throw new Error('model catalog blob client is unavailable')
+  const blob = await blobClient.getJSON(descriptor, { signal })
+  if (!Array.isArray(blob)) throw new Error('model catalog blob is invalid')
+  return { query, models: decodeCatalogModels(blob) }
+}
+
+const maxModelCatalogModels = 50
+const maxModelCatalogFieldBytes = 4096
+
+function decodeCatalogModels(value: unknown[]): ModelCatalogModel[] {
+  if (value.length > maxModelCatalogModels) throw new Error('model catalog result is too large')
+  return value.map((item) => decodeCatalogModel(item))
+}
+
+function decodeCatalogModel(item: unknown): ModelCatalogModel {
+  if (item === null || typeof item !== 'object' || Array.isArray(item)) throw new Error('model catalog model is invalid')
+  const object = item as Record<string, unknown>
+  if (typeof object.id !== 'string' || object.id.length === 0 || !isWellFormedString(object.id) || utf8ByteLength(object.id) > maxModelCatalogFieldBytes) throw new Error('model catalog model id is invalid')
+  if (typeof object.provider !== 'string' || !isWellFormedString(object.provider) || utf8ByteLength(object.provider) > maxModelCatalogFieldBytes) throw new Error('model catalog model provider is invalid')
+  const reasoning = object.reasoning !== null && typeof object.reasoning === 'object'
+    ? (() => {
+        const source = object.reasoning as Record<string, unknown>
+        const normalized: {
+          enabled?: boolean
+          effort_levels?: string[]
+          supports_toggle?: boolean
+          budget_min?: number | null
+          budget_max?: number | null
+        } = {}
+        if (typeof source.enabled === 'boolean') normalized.enabled = source.enabled
+        if (Array.isArray(source.effort_levels)) normalized.effort_levels = source.effort_levels.filter((item): item is string => typeof item === 'string')
+        if (typeof source.supports_toggle === 'boolean') normalized.supports_toggle = source.supports_toggle
+        if (source.budget_min === null || typeof source.budget_min === 'number') normalized.budget_min = source.budget_min as number | null
+        if (source.budget_max === null || typeof source.budget_max === 'number') normalized.budget_max = source.budget_max as number | null
+        return normalized
+      })()
+    : undefined
+  const pricing = object.pricing !== null && typeof object.pricing === 'object'
+    ? (() => {
+        const source = object.pricing as Record<string, unknown>
+        const normalized: {
+          input?: number
+          output?: number
+          cache_read?: number
+          cache_write?: number
+          long_context_threshold?: number
+          input_long?: number
+          output_long?: number
+          cache_read_long?: number
+          cache_write_long?: number
+        } = {}
+        for (const key of ['input', 'output', 'cache_read', 'cache_write', 'input_long', 'output_long', 'cache_read_long', 'cache_write_long'] as const) {
+          if (typeof source[key] === 'number' && Number.isFinite(source[key])) normalized[key] = source[key]
+        }
+        if (typeof source.long_context_threshold === 'number' && Number.isSafeInteger(source.long_context_threshold)) normalized.long_context_threshold = source.long_context_threshold
+        return normalized
+      })()
+    : undefined
+  return {
+    id: object.id,
+    name: typeof object.name === 'string' ? object.name : object.id,
+    provider: object.provider,
+    description: typeof object.description === 'string' ? object.description : undefined,
+    context_window: typeof object.context_window === 'number' && Number.isSafeInteger(object.context_window) ? object.context_window : undefined,
+    input_limit: typeof object.input_limit === 'number' && Number.isSafeInteger(object.input_limit) ? object.input_limit : undefined,
+    output_limit: typeof object.output_limit === 'number' && Number.isSafeInteger(object.output_limit) ? object.output_limit : undefined,
+    input: Array.isArray(object.input) ? object.input.filter((item): item is string => typeof item === 'string') : [],
+    reasoning,
+    pricing,
+  }
 }

@@ -833,6 +833,20 @@ svg { width: 1.1em; height: 1.1em; fill: none; stroke: currentColor; stroke-widt
 .settings-grid input:focus, .settings-grid select:focus, .settings-grid textarea:focus { background: #fffbea; }
 .settings-grid .model-catalog-select { padding: 8px; border: 2px solid var(--border); color: var(--text); background: var(--accent-soft); }
 .settings-grid .model-catalog-select select { background: #ffffff; }
+.model-catalog-search { padding: 8px; border: 2px solid var(--border); background: var(--accent-soft); }
+.model-catalog-search > label { display: flex; align-items: center; gap: 8px; color: var(--text); font-size: 9.5px; font-weight: 800; }
+.model-catalog-search > label input { flex: 1; min-width: 0; height: 34px; padding: 0 9px; border: 2px solid var(--border); color: var(--text); background: #ffffff; font: 10px var(--font-mono); }
+.catalog-results { display: flex; flex-direction: column; gap: 5px; margin-top: 8px; }
+.catalog-results > span { color: var(--muted); font-size: 9px; font-weight: 800; }
+.catalog-result { display: flex; flex-direction: column; gap: 2px; padding: 6px 8px; border: 1px solid var(--border); color: var(--text); background: #ffffff; text-align: left; cursor: pointer; }
+.catalog-result:hover { background: var(--accent); }
+.catalog-result code { font: 10px var(--font-mono); }
+.catalog-result small { color: var(--muted); font-size: 8.5px; }
+.catalog-result:hover small { color: rgba(0, 0, 0, .65); }
+.model-advanced { grid-column: 1 / -1; border: 2px solid var(--border); background: #ffffff; }
+.model-advanced > summary { padding: 8px 10px; cursor: pointer; font-size: 9.5px; font-weight: 800; }
+.model-advanced[open] > summary { border-bottom: 2px solid var(--border); background: var(--panel); }
+.model-advanced > .model-grid { padding: 10px; border-top: 1px solid var(--border); background: var(--panel); }
 .settings-grid .checkbox-field { flex-direction: row; align-items: center; }
 .settings-grid .checkbox-field input { width: 15px; height: 15px; accent-color: var(--accent); }
 .inline-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }

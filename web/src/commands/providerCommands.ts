@@ -11,6 +11,7 @@ export interface ProviderCreateOptions extends ProviderCommandOptions {
 }
 
 export interface ProviderReasoningConfig {
+  readonly type?: 'effort' | 'budget_tokens' | ''
   readonly parameter?: string
   readonly default?: string
   readonly levels?: JsonObject
@@ -101,6 +102,41 @@ export interface ProviderDiscoverModelsResult {
   readonly models: readonly string[]
 }
 
+/** One models.dev catalog entry, normalized for the provider UI. */
+export interface ModelCatalogModel {
+  readonly id: string
+  readonly name: string
+  readonly provider: string
+  readonly description?: string
+  readonly context_window?: number
+  readonly input_limit?: number
+  readonly output_limit?: number
+  readonly input: readonly string[]
+  readonly reasoning?: {
+    readonly enabled?: boolean
+    readonly effort_levels?: readonly string[]
+    readonly budget_min?: number | null
+    readonly budget_max?: number | null
+    readonly supports_toggle?: boolean
+  }
+  readonly pricing?: {
+    readonly input?: number
+    readonly output?: number
+    readonly cache_read?: number
+    readonly cache_write?: number
+    readonly long_context_threshold?: number
+    readonly input_long?: number
+    readonly output_long?: number
+    readonly cache_read_long?: number
+    readonly cache_write_long?: number
+  }
+}
+
+export interface ModelCatalogSearchResult {
+  readonly query: string
+  readonly models: readonly ModelCatalogModel[]
+}
+
 export interface ProviderCodexUsageResult {
   readonly provider: string
   readonly usage: CodexUsage
@@ -112,4 +148,5 @@ export interface ProviderCommands {
   setDefault(provider: string, model: string, options?: ProviderCommandOptions): Promise<ProviderDefaultResult>
   discoverModels(provider: string, options?: ProviderCommandOptions): Promise<ProviderDiscoverModelsResult>
   readCodexUsage(provider: string, options?: ProviderCommandOptions): Promise<ProviderCodexUsageResult>
+  searchModelCatalog(query: string, options?: ProviderCommandOptions): Promise<ModelCatalogSearchResult>
 }

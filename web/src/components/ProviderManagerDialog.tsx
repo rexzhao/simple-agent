@@ -22,6 +22,7 @@ interface EditableProviderModel {
   parametersSourceProfile: string
   parametersJSON: string
   reasoningParameter: string
+  reasoningType: 'effort' | 'budget_tokens' | ''
   reasoningDefault: string
   reasoningLevelsJSON: string
   pricingCurrency: string
@@ -73,6 +74,7 @@ export function ProviderManagerDialog(props: {
   onSave: (provider: string, target: ProviderUpdateTarget, existing: boolean) => Promise<void>
   onSetDefault: (provider: string, model: string) => Promise<void>
   onDiscoverModels: (provider: string) => Promise<readonly string[]>
+  onSearchModelCatalog: (query: string) => Promise<import('../commands/providerCommands').ModelCatalogModel[]>
   onStartCodexLogin: (provider: string) => Promise<void>
   onClearCodexLogin: (provider: string) => Promise<void>
   onRefreshUsage: (provider: string) => Promise<CodexUsageDomain>
@@ -87,6 +89,10 @@ export function ProviderManagerDialog(props: {
   const [defaultingProfile, setDefaultingProfile] = useState<string | null>(null)
   const [discovering, setDiscovering] = useState(false)
   const [discoveredModels, setDiscoveredModels] = useState<string[]>([])
+  const [catalogQuery, setCatalogQuery] = useState('')
+  const [catalogResults, setCatalogResults] = useState<import('../commands/providerCommands').ModelCatalogModel[]>([])
+  const [catalogSearching, setCatalogSearching] = useState(false)
+  const [catalogError, setCatalogError] = useState<string | null>(null)
   const [codexAction, setCodexAction] = useState<'starting' | 'clearing' | null>(null)
   const [codexUsage, setCodexUsage] = useState<CodexUsageDomain | null>(null)
   const [usageLoading, setUsageLoading] = useState(false)
@@ -154,6 +160,76 @@ export function ProviderManagerDialog(props: {
     } finally {
       setDiscovering(false)
     }
+  }
+
+  const searchCatalog = async () => {
+    const query = catalogQuery.trim()
+    if (!query || catalogSearching) return
+    const generation = providerSelectionGeneration.current
+    setCatalogSearching(true)
+    setCatalogError(null)
+    try {
+      const models = await props.onSearchModelCatalog(query)
+      if (generation === providerSelectionGeneration.current) {
+        setCatalogResults(models)
+        if (models.length === 0) setCatalogError('No models matched the query.')
+      }
+    } catch (reason) {
+      if (generation === providerSelectionGeneration.current) setCatalogError('Model catalog search failed.')
+    } finally {
+      if (generation === providerSelectionGeneration.current) setCatalogSearching(false)
+    }
+  }
+
+  const clearCatalog = () => {
+    setCatalogQuery('')
+    setCatalogResults([])
+    setCatalogError(null)
+  }
+
+  const applyCatalogModel = (index: number, model: import('../commands/providerCommands').ModelCatalogModel) => {
+    setDraft((current) => {
+      if (!current) return current
+      const target = current.models[index]
+      if (!target) return current
+      const patch: Partial<EditableProviderModel> = {
+        id: model.id,
+        profile: !target.profile || target.profile === target.id ? model.id : target.profile,
+        contextWindow: model.context_window ? String(model.context_window) : '',
+        inputLimit: model.input_limit ? String(model.input_limit) : '',
+        outputLimit: model.output_limit ? String(model.output_limit) : '',
+        supportsImages: model.input.includes('image'),
+        parametersMode: 'replace',
+        parametersSourceProfile: '',
+        parametersJSON: '{}',
+      }
+      if (model.pricing) {
+        patch.pricingCurrency = 'USD'
+        patch.inputCacheMissPrice = model.pricing.input !== undefined ? String(model.pricing.input) : ''
+        patch.inputCacheHitPrice = model.pricing.cache_read !== undefined ? String(model.pricing.cache_read) : ''
+        patch.cacheWritePrice = model.pricing.cache_write !== undefined ? String(model.pricing.cache_write) : ''
+        patch.outputPrice = model.pricing.output !== undefined ? String(model.pricing.output) : ''
+        if (model.pricing.long_context_threshold) {
+          patch.longContextThreshold = String(model.pricing.long_context_threshold)
+          patch.longInputCacheMissPrice = model.pricing.input_long !== undefined ? String(model.pricing.input_long) : ''
+          patch.longInputCacheHitPrice = model.pricing.cache_read_long !== undefined ? String(model.pricing.cache_read_long) : ''
+          patch.longCacheWritePrice = model.pricing.cache_write_long !== undefined ? String(model.pricing.cache_write_long) : ''
+          patch.longOutputPrice = model.pricing.output_long !== undefined ? String(model.pricing.output_long) : ''
+        }
+      }
+      if (model.reasoning) {
+        const reasoning = applyCatalogReasoning(model)
+        if (reasoning) {
+          patch.reasoningParameter = reasoning.parameter
+          patch.reasoningType = reasoning.type
+          patch.reasoningDefault = reasoning.default
+          patch.reasoningLevelsJSON = prettyJSON(reasoning.levels)
+        }
+      }
+      const models = current.models.map((item, itemIndex) => itemIndex === index ? { ...item, ...patch } : item)
+      return { ...current, models }
+    })
+    clearCatalog()
   }
 
   const setDefault = async (profile: string) => {
@@ -329,12 +405,30 @@ export function ProviderManagerDialog(props: {
                           const selectedID = event.target.value
                           if (selectedID) updateModel(index, { id: selectedID, profile: !model.profile || model.profile === model.id ? selectedID : model.profile })
                         }}><option value="">Select a model ({discoveredModels.length} fetched)</option>{discoveredModels.map((modelID) => <option value={modelID} key={modelID}>{modelID}</option>)}</select></label>}
+                        <div className="wide model-catalog-search">
+                          <label>Search models.dev<input value={catalogQuery} onChange={(event) => setCatalogQuery(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter') { event.preventDefault(); void searchCatalog() } }} placeholder="e.g. claude or gpt-5.5" /><button className="secondary-button compact" disabled={!catalogQuery.trim() || catalogSearching} onClick={() => void searchCatalog()}>{catalogSearching ? 'Searching…' : 'Search'}</button></label>
+                          {catalogError && <p className="settings-error">{catalogError}</p>}
+                          {catalogResults.length > 0 && (
+                            <div className="catalog-results">
+                              <span>Matches for "{catalogQuery.trim()}":</span>
+                              {catalogResults.map((catalogModel) => (
+                                <button key={`${catalogModel.provider}/${catalogModel.id}`} className="catalog-result" onClick={() => applyCatalogModel(index, catalogModel)}>
+                                  <code>{catalogModel.id}</code>
+                                  <small>{catalogModel.provider}{catalogModel.context_window ? ` · ${catalogModel.context_window.toLocaleString()} ctx` : ''}{catalogModel.reasoning?.budget_max ? ' · budget' : ''}</small>
+                                </button>
+                              ))}
+                            </div>
+                          )}
+                        </div>
                         <label>Profile name<input value={model.profile} onChange={(event) => updateModel(index, { profile: event.target.value })} placeholder="gpt-5.5" /></label>
                         <label>Model ID<input value={model.id} onChange={(event) => updateModel(index, { id: event.target.value })} placeholder="Or enter manually" /></label>
                         <label>API type<select value={model.type || 'openai-chat'} onChange={(event) => {
                           const type = event.target.value
                           updateModel(index, { type, compatibility: type === 'openai-chat' ? model.compatibility : '' })
                         }}><option value="openai-chat">OpenAI Chat</option><option value="openai-responses">OpenAI Responses</option><option value="openai-codex">OpenAI Codex</option><option value="anthropic-messages">Anthropic Messages</option></select></label>
+                        <details className="model-advanced">
+                          <summary>Detailed parameters</summary>
+                          <div className="settings-grid model-grid">
                         <label>Compatibility<select value={model.compatibility} disabled={model.type !== 'openai-chat'} onChange={(event) => updateModel(index, { compatibility: event.target.value })}><option value="">Provider default</option><option value="openai">Standard OpenAI</option><option value="kimi">Kimi</option></select></label>
                         <label className="checkbox-field"><input type="checkbox" checked={model.supportsImages} onChange={(event) => updateModel(index, { supportsImages: event.target.checked })} /> Supports image input</label>
                         <label>Developer role<select value={model.developerRole} onChange={(event) => updateModel(index, { developerRole: event.target.value })}><option value="">Keep developer</option><option value="system">Map to system</option></select></label>
@@ -359,10 +453,13 @@ export function ProviderManagerDialog(props: {
                         </div>
                         <label className="checkbox-field wide"><input type="checkbox" checked={model.parametersMode === 'replace'} onChange={(event) => updateModel(index, event.target.checked ? { parametersMode: 'replace', parametersJSON: model.parametersJSON || '{}' } : { parametersMode: 'preserve', parametersJSON: '' })} /> Replace hidden request parameters</label>
                         <label className="wide">Extra request parameters (JSON)<textarea value={model.parametersJSON} disabled={model.parametersMode === 'preserve'} placeholder={model.parametersMode === 'preserve' ? 'Hidden; preserved unless replacement is enabled' : '{}'} onChange={(event) => updateModel(index, { parametersMode: 'replace', parametersJSON: event.target.value })} rows={3} spellCheck={false} /></label>
+                          </div>
+                        </details>
                       </div>
                       <details className="reasoning-config" open={Boolean(model.reasoningParameter)}>
                         <summary>Reasoning config {model.reasoningParameter ? <code>{model.reasoningParameter}</code> : <small>Leave empty to use Pi recommended defaults</small>}</summary>
                         <div className="settings-grid model-grid">
+                          <label>Type<select value={model.reasoningType || 'effort'} onChange={(event) => updateModel(index, { reasoningType: event.target.value === 'budget_tokens' ? 'budget_tokens' : 'effort' })}><option value="effort">Effort levels</option><option value="budget_tokens">Token budget</option></select></label>
                           <label>Parameter path<input value={model.reasoningParameter} onChange={(event) => updateModel(index, { reasoningParameter: event.target.value })} placeholder="reasoning.effort" /></label>
                           <label>Default level<select value={reasoningLevels.includes(model.reasoningDefault) ? model.reasoningDefault : ''} disabled={reasoningLevels.length === 0} onChange={(event) => updateModel(index, { reasoningDefault: event.target.value })}><option value="">{reasoningLevels.length === 0 ? 'Fill in the level mapping first' : 'No default level'}</option>{reasoningLevels.map((level) => <option value={level} key={level}>{reasoningLevelLabel(level)} ({level})</option>)}</select></label>
                           <label className="wide">Level mapping (JSON)<textarea value={model.reasoningLevelsJSON} onChange={(event) => updateModel(index, { reasoningLevelsJSON: event.target.value })} rows={4} spellCheck={false} placeholder={'{"low":"low","high":"high"}'} /></label>
@@ -427,6 +524,7 @@ function editableProviderModel(model: ProviderModelDomain): EditableProviderMode
     parametersSourceProfile: model.profile,
     parametersJSON: '',
     reasoningParameter: model.reasoningConfig.parameter,
+    reasoningType: model.reasoningConfig.type === 'budget_tokens' ? 'budget_tokens' : 'effort',
     reasoningDefault: model.reasoningConfig.default,
     reasoningLevelsJSON: prettyJSON(Object.fromEntries(model.reasoningConfig.levels.map((level) => [level.name, level.value]))),
     pricingCurrency: model.pricing?.currency ?? '',
@@ -453,7 +551,7 @@ function duplicateProfileName(profile: string, models: EditableProviderModel[]):
 }
 
 function emptyProviderModel(): EditableProviderModel {
-  return { profile: '', id: '', type: 'openai-chat', compatibility: '', supportsImages: false, developerRole: '', contextWindow: '', inputLimit: '', outputLimit: '', parametersMode: 'replace', parametersSourceProfile: '', parametersJSON: '{}', reasoningParameter: '', reasoningDefault: '', reasoningLevelsJSON: '{}', pricingCurrency: 'USD', inputCacheHitPrice: '', inputCacheMissPrice: '', cacheWritePrice: '', outputPrice: '', longContextThreshold: '', longInputCacheHitPrice: '', longInputCacheMissPrice: '', longCacheWritePrice: '', longOutputPrice: '' }
+  return { profile: '', id: '', type: 'openai-chat', compatibility: '', supportsImages: false, developerRole: '', contextWindow: '', inputLimit: '', outputLimit: '', parametersMode: 'replace', parametersSourceProfile: '', parametersJSON: '{}', reasoningParameter: '', reasoningType: '', reasoningDefault: '', reasoningLevelsJSON: '{}', pricingCurrency: 'USD', inputCacheHitPrice: '', inputCacheMissPrice: '', cacheWritePrice: '', outputPrice: '', longContextThreshold: '', longInputCacheHitPrice: '', longInputCacheMissPrice: '', longCacheWritePrice: '', longOutputPrice: '' }
 }
 
 function providerInput(draft: ProviderDraft): ProviderUpdateTarget {
@@ -513,6 +611,7 @@ function providerInput(draft: ProviderDraft): ProviderUpdateTarget {
         output_limit: model.outputLimit ? Number(model.outputLimit) : 0,
         parameters_mode: model.parametersMode,
         reasoning_config: {
+          type: model.reasoningType,
           parameter: model.reasoningParameter.trim(),
           default: model.reasoningDefault.trim(),
           levels: reasoningLevels as JsonObject,
@@ -564,6 +663,38 @@ function reasoningLevelOptions(value: string): string[] {
 
 function codexAuthLabel(status?: string): string {
   return { signed_out: 'Signed out', pending: 'Waiting for authorization', signed_in: 'Signed in', expired: 'Expired', error: 'Auth error' }[status ?? 'signed_out'] ?? status ?? 'Signed out'
+}
+
+// applyCatalogReasoning maps a models.dev reasoning option to the provider UI's
+// reasoning_config shape. Effort mappings become identity levels written to
+// the provider-appropriate effort path; budget_tokens mappings become numeric
+// levels. Returns null when the model advertises no usable reasoning control.
+function applyCatalogReasoning(model: import('../commands/providerCommands').ModelCatalogModel): { type: 'effort' | 'budget_tokens'; parameter: string; default: string; levels: Record<string, unknown> } | null {
+  const reasoning = model.reasoning
+  if (!reasoning || !reasoning.enabled) return null
+  if (reasoning.effort_levels && reasoning.effort_levels.length > 0) {
+    const levels: Record<string, unknown> = {}
+    for (const level of reasoning.effort_levels) levels[level] = level
+    const parameter = model.provider === 'anthropic' ? 'output_config.effort' : 'reasoning.effort'
+    const defaultLevel = preferredLevel(['high', ...reasoning.effort_levels])
+    return { type: 'effort', parameter, default: defaultLevel, levels }
+  }
+  if (reasoning.budget_max !== undefined && reasoning.budget_max !== null) {
+    const max = reasoning.budget_max
+    const levels: Record<string, unknown> = {
+      low: Math.max(1024, Math.floor(max / 8)),
+      medium: Math.max(2048, Math.floor(max / 4)),
+      high: Math.max(4096, Math.floor(max / 2)),
+    }
+    const parameter = model.provider === 'anthropic' ? 'thinking.budget_tokens' : 'reasoning.budget_tokens'
+    return { type: 'budget_tokens', parameter, default: 'high', levels }
+  }
+  return null
+}
+
+function preferredLevel(candidates: string[]): string {
+  for (const candidate of candidates) if (candidates.includes(candidate)) return candidate
+  return candidates[0] ?? ''
 }
 
 function codexStatusLabel(status: string | undefined, readState: string | undefined, action: 'starting' | 'clearing' | null): string {

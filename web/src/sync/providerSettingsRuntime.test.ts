@@ -44,7 +44,7 @@ const resource = { type: 'provider_settings' as const, id: 'server' }
 function provider(modelID: string): Record<string, unknown> {
   return {
     name: 'alpha', base_url: 'https://example.test/v1', api_key_configured: true, auth_file: '', request_timeout: '', http_proxy: '', https_proxy: '', max_concurrent_requests: 0,
-    models: [{ profile: 'fast', id: modelID, type: '', compatibility: '', input: ['text'], developer_role: '', context_window: 32000, input_limit: 0, output_limit: 0, reasoning_config: { parameter: 'budget_tokens', default: 'medium', levels: [{ name: 'budget_tokens', value: 1234 }] }, pricing: null }],
+    models: [{ profile: 'fast', id: modelID, type: '', compatibility: '', input: ['text'], developer_role: '', context_window: 32000, input_limit: 0, output_limit: 0, reasoning_config: { type: 'budget_tokens', parameter: 'budget_tokens', default: 'medium', levels: [{ name: 'budget_tokens', value: 1234 }] }, pricing: null }],
   }
 }
 

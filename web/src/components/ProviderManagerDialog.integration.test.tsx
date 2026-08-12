@@ -17,7 +17,7 @@ function model(profile: string, type = 'openai-chat') {
   return {
     profile, id: `${profile}-id`, type, compatibility: '', input: ['text'] as const,
     developerRole: '', contextWindow: 32000, inputLimit: 0, outputLimit: 0,
-    reasoningConfig: { parameter: '', default: '', levels: [] as const }, pricing: null,
+    reasoningConfig: { type: '', parameter: '', default: '', levels: [] as const }, pricing: null,
   }
 }
 
@@ -48,7 +48,7 @@ function renderDialog(overrides: Partial<ComponentProps<typeof ProviderManagerDi
   const onError = vi.fn()
   const props: ComponentProps<typeof ProviderManagerDialog> = {
     state: state(), codexLogin: null, onProviderChange: vi.fn(),
-    onSave: vi.fn<ComponentProps<typeof ProviderManagerDialog>['onSave']>(async () => {}), onSetDefault: vi.fn(async () => {}), onDiscoverModels: vi.fn(async () => ['alpha-model']),
+    onSave: vi.fn<ComponentProps<typeof ProviderManagerDialog>['onSave']>(async () => {}), onSetDefault: vi.fn(async () => {}), onDiscoverModels: vi.fn(async () => ['alpha-model']), onSearchModelCatalog: vi.fn(async () => []),
     onStartCodexLogin: vi.fn(async () => {}), onClearCodexLogin: vi.fn(async () => {}), onRefreshUsage: vi.fn(async () => ({ planType: 'pro' as const, rateLimit: undefined, additionalRateLimits: [], credits: undefined })),
     onRetrySettings: vi.fn(), onRetryCodexLogin: vi.fn(), onClose: vi.fn(), onError, ...overrides,
   }

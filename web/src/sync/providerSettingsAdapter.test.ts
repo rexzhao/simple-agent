@@ -9,7 +9,7 @@ import { ProviderSettingsStore } from './providerSettingsStore'
 const model = (profile: string, id = `${profile}-id`) => ({
   profile, id, type: '', compatibility: '', input: ['text'], developer_role: '', context_window: 32000,
   input_limit: 0, output_limit: 0,
-  reasoning_config: { parameter: 'effort', default: 'medium', levels: [{ name: 'low', value: 'low' }, { name: 'medium', value: 'medium' }] as Array<{ name: string; value: string | number | boolean | null }> },
+  reasoning_config: { type: '', parameter: 'effort', default: 'medium', levels: [{ name: 'low', value: 'low' }, { name: 'medium', value: 'medium' }] as Array<{ name: string; value: string | number | boolean | null }> },
   pricing: null,
 })
 
@@ -35,7 +35,7 @@ describe('ProviderSettingsAdapter', () => {
     const same = adapter.decodeSnapshot(snapshot([provider('alpha'), provider('space provider')]) as unknown as JsonObject, first)
     expect(same).toBe(first)
     expect(same.providersByName.alpha).toBe(first.providersByName.alpha)
-    const scalarModel = { ...model('fast'), reasoning_config: { parameter: 'budget_tokens', default: 'max_tokens', levels: [{ name: 'budget_tokens', value: 1234 }, { name: 'max_tokens', value: true }, { name: 'unlimited', value: null }] as Array<{ name: string; value: string | number | boolean | null }> } }
+    const scalarModel = { ...model('fast'), reasoning_config: { type: 'budget_tokens', parameter: 'budget_tokens', default: 'max_tokens', levels: [{ name: 'budget_tokens', value: 1234 }, { name: 'max_tokens', value: true }, { name: 'unlimited', value: null }] as Array<{ name: string; value: string | number | boolean | null }> } }
     const scalarSnapshot = snapshot([{ ...provider('alpha'), models: [scalarModel] }])
     const scalar = adapter.decodeSnapshot(scalarSnapshot as unknown as JsonObject, undefined)
     expect(scalar.providersByName.alpha.models[0].reasoning_config.levels.map((level) => level.value)).toEqual([1234, true, null])

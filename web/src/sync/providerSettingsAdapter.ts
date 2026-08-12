@@ -11,6 +11,7 @@ export interface ReasoningLevel {
 export type ReasoningScalar = string | number | boolean | null
 
 export interface ReasoningMetadata {
+  readonly type: string
   readonly parameter: string
   readonly default: string
   readonly levels: readonly ReasoningLevel[]
@@ -90,7 +91,7 @@ const MAX_REASONING_NUMBER = Number.MAX_SAFE_INTEGER
 const snapshotFields = ['server_root', 'config_path', 'default_provider', 'default_model', 'providers'] as const
 const providerFields = ['name', 'base_url', 'api_key_configured', 'auth_file', 'request_timeout', 'http_proxy', 'https_proxy', 'max_concurrent_requests', 'models'] as const
 const modelFields = ['profile', 'id', 'type', 'compatibility', 'input', 'developer_role', 'context_window', 'input_limit', 'output_limit', 'reasoning_config', 'pricing'] as const
-const reasoningFields = ['parameter', 'default', 'levels'] as const
+const reasoningFields = ['type', 'parameter', 'default', 'levels'] as const
 const levelFields = ['name', 'value'] as const
 const pricingFields = ['input_cache_hit', 'input_cache_miss', 'cache_write', 'output', 'currency', 'long_context_threshold', 'long_context'] as const
 const tierFields = ['input_cache_hit', 'input_cache_miss', 'cache_write', 'output'] as const
@@ -144,7 +145,7 @@ function reasoning(value: unknown): ReasoningMetadata {
   if (!Array.isArray(source.levels)) throw new Error('reasoning levels must be an array')
   const levels = source.levels.map((raw, index) => { const level = record(raw, `reasoning level ${index} must be an object`); exactKeys(level, levelFields, 'reasoning level'); return { name: reasoningText(level.name, 'reasoning level name'), value: reasoningScalar(level.value, 'reasoning level value') } })
   const names = new Set<string>(); for (const level of levels) { if (names.has(level.name)) throw new Error('duplicate reasoning level'); names.add(level.name) }
-  return { parameter: reasoningText(source.parameter, 'reasoning parameter', true), default: reasoningText(source.default, 'reasoning default', true), levels }
+  return { type: reasoningText(source.type, 'reasoning type', true), parameter: reasoningText(source.parameter, 'reasoning parameter', true), default: reasoningText(source.default, 'reasoning default', true), levels }
 }
 
 function pricingTier(value: unknown): PricingTierMetadata {

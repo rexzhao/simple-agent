@@ -20,10 +20,10 @@ import { isCanonicalWireIdentifier, isWellFormedString } from '../protocol/ident
 import type { ItemsPage } from '../types'
 import type { RunCancelResult, RunCommands, RunContinueOptions, RunContinueResult, RunControlOptions, RunPromptAppendOptions, RunPromptAppendResult, RunPromptMoveResult, RunPromptRemoveResult, RunPromptSteerResult, RunStartOptions, RunStartResult, RunStatus, RunToolCancelResult } from '../commands/runCommands'
 import type { ProjectArchiveResult, ProjectCommands, ProjectCreateOptions, ProjectCreateResult, ProjectDeleteResult, ProjectModelsResult, ProjectRenameResult } from '../commands/projectCommands'
-import type { ProviderCodexUsageResult, ProviderCommands, ProviderCreateOptions, ProviderCreateResult, ProviderDefaultResult, ProviderDiscoverModelsResult, ProviderMutationResult, ProviderUpdateTarget } from '../commands/providerCommands'
+import type { ProviderCodexUsageResult, ProviderCommands, ProviderCreateOptions, ProviderCreateResult, ProviderDefaultResult, ProviderDiscoverModelsResult, ModelCatalogSearchResult, ProviderMutationResult, ProviderUpdateTarget } from '../commands/providerCommands'
 import type { CodexUsage, CodexUsageWindow, CodexUsageWindowSet, SessionModelOption } from '../types'
 import type { CodexLoginClearResult, CodexLoginCommandOptions, CodexLoginCommands, CodexLoginStartResult } from '../commands/codexLoginCommands'
-import { encodeProviderTarget, decodeProviderDiscoverResult, validateProviderCommandJSON } from './providerCommandCodec'
+import { encodeProviderTarget, decodeProviderDiscoverResult, decodeModelCatalogSearchResult, validateProviderCommandJSON } from './providerCommandCodec'
 import { isProviderCreateName, isProviderName } from '../domain/providerIdentity'
 import { randomID } from '../lib/randomId'
 import { SyncReadError } from './errors'
@@ -735,6 +735,12 @@ export class CommandFacade implements SessionCommands, RunCommands, ProjectComma
   discoverModels(provider: string, options: CommandOptions = {}): Promise<ProviderDiscoverModelsResult> {
     if (!isProviderName(provider)) return Promise.reject(new CommandFacadeError('invalid', 'provider is invalid'))
     return this.submit('provider.discover_models', { provider }, true, (value, signal) => decodeProviderDiscoverResult(value, provider, this.blobClient, signal), options)
+  }
+
+  searchModelCatalog(query: string, options: CommandOptions = {}): Promise<ModelCatalogSearchResult> {
+    if (typeof query !== 'string' || query.trim().length === 0 || !isWellFormedString(query) || this.utf8Bytes(query) > 256) return Promise.reject(new CommandFacadeError('invalid', 'model catalog query is invalid'))
+    const normalized = query.trim()
+    return this.submit('model_catalog.search', { query: normalized, limit: 50 }, true, (value, signal) => decodeModelCatalogSearchResult(value, normalized, this.blobClient, signal), options)
   }
 
   readCodexUsage(provider: string, options: CommandOptions = {}): Promise<ProviderCodexUsageResult> {

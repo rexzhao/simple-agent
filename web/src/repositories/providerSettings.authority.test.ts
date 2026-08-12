@@ -7,8 +7,8 @@ function provider(baseURL: string, requestTimeout = '30s'): ProviderSettingsDoma
     name: 'alpha', baseURL, apiKeyConfigured: true, authFile: 'token.json', requestTimeout,
     httpProxy: 'http://proxy.example.test:8080', httpsProxy: '', maxConcurrentRequests: 2,
     models: [
-      { profile: 'slow', id: 'slow-id', type: 'openai-chat', compatibility: '', input: ['image', 'text'], developerRole: '', contextWindow: 1000, inputLimit: 900, outputLimit: 100, reasoningConfig: { parameter: 'effort', default: 'low', levels: [{ name: 'medium', value: 2 }, { name: 'low', value: 'low' }] }, pricing: null },
-      { profile: 'fast', id: 'fast-id', type: 'openai-chat', compatibility: '', input: ['text'], developerRole: '', contextWindow: 2000, inputLimit: 1800, outputLimit: 200, reasoningConfig: { parameter: '', default: '', levels: [] }, pricing: null },
+      { profile: 'slow', id: 'slow-id', type: 'openai-chat', compatibility: '', input: ['image', 'text'], developerRole: '', contextWindow: 1000, inputLimit: 900, outputLimit: 100, reasoningConfig: { type: '', parameter: 'effort', default: 'low', levels: [{ name: 'medium', value: 2 }, { name: 'low', value: 'low' }] }, pricing: null },
+      { profile: 'fast', id: 'fast-id', type: 'openai-chat', compatibility: '', input: ['text'], developerRole: '', contextWindow: 2000, inputLimit: 1800, outputLimit: 200, reasoningConfig: { type: '', parameter: '', default: '', levels: [] }, pricing: null },
     ],
   }
 }

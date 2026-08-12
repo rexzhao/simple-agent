@@ -53,6 +53,7 @@ function domainModel(value: ProviderModelSettings): ProviderModelDomain {
     inputLimit: value.input_limit,
     outputLimit: value.output_limit,
     reasoningConfig: {
+      type: value.reasoning_config.type,
       parameter: value.reasoning_config.parameter,
       default: value.reasoning_config.default,
       levels: value.reasoning_config.levels.map((level) => ({ name: level.name, value: level.value })),

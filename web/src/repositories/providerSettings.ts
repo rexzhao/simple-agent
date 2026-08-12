@@ -39,6 +39,7 @@ export interface ProviderModelDomain {
   readonly inputLimit: number
   readonly outputLimit: number
   readonly reasoningConfig: {
+    readonly type: string
     readonly parameter: string
     readonly default: string
     readonly levels: readonly ProviderReasoningLevelDomain[]
