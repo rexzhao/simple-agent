@@ -108,6 +108,41 @@ test('tool rows without intermediate text remain individually visible', async ({
   hold.release([])
 })
 
+test('running tool dots have a visible green pulse until the tool finishes', async ({ page }) => {
+  const running = newGate()
+  const finished = newGate()
+  const settle = newGate()
+  await installTimeline(page, [
+    { type: 'tool.requested', turn_id: 'turn-main', agent_iteration: 1, tool_call_id: 't1', name: 'shell', arguments: '{"command":"echo hi"}' },
+  ], [running, finished, settle])
+  await page.goto('/#token=e2e')
+  await page.getByPlaceholder('Send a message to SAI').fill('Run a tool')
+  await page.getByRole('button', { name: 'Send' }).click()
+  await expect(page.locator('.tool-row.requested')).toBeVisible()
+
+  running.release([{ type: 'tool.running', turn_id: 'turn-main', agent_iteration: 1, tool_call_id: 't1', name: 'shell' }])
+  await expect(page.locator('.tool-row.running')).toBeVisible()
+  const dot = page.locator('.tool-status-dot.running')
+  await expect.poll(async () => dot.evaluate((element) => {
+    const style = getComputedStyle(element)
+    return { animationName: style.animationName, animationIterationCount: style.animationIterationCount, color: style.color, backgroundColor: style.backgroundColor }
+  })).toEqual({ animationName: 'tool-status-pulse', animationIterationCount: 'infinite', color: 'rgb(21, 128, 61)', backgroundColor: 'rgb(21, 128, 61)' })
+
+  const firstFrame = await dot.evaluate((element) => {
+    const style = getComputedStyle(element)
+    return { opacity: style.opacity, transform: style.transform, boxShadow: style.boxShadow }
+  })
+  await expect.poll(async () => dot.evaluate((element, baseline) => {
+    const style = getComputedStyle(element)
+    return style.opacity !== baseline.opacity || style.transform !== baseline.transform || style.boxShadow !== baseline.boxShadow
+  }, firstFrame)).toBe(true)
+
+  finished.release([{ type: 'tool.finished', turn_id: 'turn-main', agent_iteration: 1, tool_call_id: 't1', name: 'shell', is_error: false, content: 'hi' }])
+  await expect(page.locator('.tool-row.finished')).toBeVisible()
+  await expect.poll(async () => page.locator('.tool-status-dot.finished').evaluate((element) => getComputedStyle(element).animationName)).toBe('none')
+  settle.release([])
+})
+
 test('round markers remain visible on flat tool rows', async ({ page }) => {
   const hold = newGate()
   await installTimeline(page, [
