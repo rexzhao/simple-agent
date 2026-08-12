@@ -286,13 +286,46 @@ attempt produced no text, reasoning, usage, or tool-call events. Once any model
 progress is observed, the request is never replayed automatically.
 
 `reasoning_config` maps the reasoning names shown by SAI to the value expected
-by that model. `parameter` is a dot-separated request path, `default` is the
-level selected for a new session, and `levels` may contain string, number,
-boolean, or object values. SAI follows Pi's common level vocabulary:
+by that model. `type` selects the control shape: `effort` (the default; string
+level names) or `budget_tokens` (numeric token budgets). `parameter` is a
+dot-separated request path, `default` is the level selected for a new session,
+and `levels` may contain string, number, boolean, or object values. For
+`budget_tokens`, every `levels` value must be a number and the mapped value is
+sent as the token budget.
+
+SAI follows Pi's common level vocabulary:
 `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, and `max`. Known GPT-5,
 OpenRouter, GLM-5.2, DeepSeek-v4 (including the `deepseek-v4-flash` tier), and
 adaptive Claude models receive Pi-compatible defaults when a model is saved
 without an explicit mapping. Unknown models are left unconfigured.
+
+Anthropic budgets are sent as the native nested block:
+
+```yaml
+reasoning_config:
+  type: budget_tokens
+  parameter: thinking.budget_tokens
+  default: high
+  levels:
+    low: 2048
+    medium: 8192
+    high: 128000
+```
+
+OpenAI Responses and Codex fold `reasoning.*` parameters into the nested
+`reasoning` object, so `reasoning.effort` maps to `{"reasoning":{"effort":...}}`
+and `reasoning.budget_tokens` to `{"reasoning":{"budget_tokens":...}}`.
+
+Anthropic Messages requests require `max_tokens`; when a model profile does not
+set it explicitly, SAI injects the configured `output_limit` (or a 4096 default)
+so a new Anthropic model works without manual request parameters. OpenAI Chat
+injects `max_tokens` and OpenAI Responses injects `max_output_tokens` (clamped
+to a 16-token minimum) the same way.
+
+The Server Root settings page can search the public models.dev catalog by model
+ID and fill a model card's context/limits, pricing, image support, and reasoning
+config in one click; the matched data is provider-agnostic defaults and can be
+edited before saving.
 
 The generated Codex subscription profile uses an OAuth token file and is
 equivalent to:
