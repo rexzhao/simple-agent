@@ -277,7 +277,7 @@ const sessionB: WireSession = { ...session, id: 'session-2', display_name: 'Seco
 test('restores the previous scroll position when switching back to a session', async ({ page }) => {
   await installSyncMock(page, { projects: [project], sessions: [session, sessionB], contents: { [session.id]: { items: items(101, 150), hasMoreBefore: false }, [sessionB.id]: { items: items(1, 3), hasMoreBefore: false } } })
   await page.goto('/#token=e2e')
-  await page.getByRole('button', { name: /^History fixture/ }).click()
+  await page.getByRole('button', { name: /^Session idle History fixture/ }).click()
   await expect(page.getByText('message-150', { exact: true })).toBeAttached()
   await settleViewport(page)
   await interruptSettle(page)
@@ -286,9 +286,9 @@ test('restores the previous scroll position when switching back to a session', a
   const remembered = await firstVisible(page)
   expect(remembered).not.toBeNull()
   expect(await distanceFromBottom(page)).toBeGreaterThan(100)
-  await page.getByRole('button', { name: /^Second session/ }).click()
+  await page.getByRole('button', { name: /^Session idle Second session/ }).click()
   await expect(page.getByText('message-1', { exact: true })).toBeAttached()
-  await page.getByRole('button', { name: /^History fixture/ }).click()
+  await page.getByRole('button', { name: /^Session idle History fixture/ }).click()
   await settleViewport(page)
   await expect.poll(async () => (await firstVisible(page))?.seq).toBe(remembered?.seq)
   await expect.poll(async () => {
