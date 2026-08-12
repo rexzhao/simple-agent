@@ -141,6 +141,8 @@ describe('SessionContentAdapter', () => {
     state = adapter.applyTransient(state, event('3', 'reasoning.delta', { turn_id: 'turn_a', agent_iteration: 1, item_id: 'item_a', delta: 'thinking' }), context)
     state = adapter.applyTransient(state, event('4', 'tool.requested', { turn_id: 'turn_a', agent_iteration: 1, tool_call_id: 'tool_a', name: 'shell', arguments: '{}' }), context)
     state = adapter.applyTransient(state, event('5', 'tool.progress', { turn_id: 'turn_a', agent_iteration: 1, tool_call_id: 'tool_a', name: 'shell', arguments_delta: 'x' }), context)
+    expect(state.transientRun?.tools.tool_a.status).toBe('running')
+    expect(state.transientRun?.tools.tool_a.arguments).toBe('{}x')
     state = adapter.applyTransient(state, event('6', 'reasoning.delta', { turn_id: 'turn_a', agent_iteration: 1, item_id: 'item_b', delta: 'next thought' }), context)
     state = adapter.applyTransient(state, event('7', 'tool.finished', { turn_id: 'turn_a', agent_iteration: 1, tool_call_id: 'tool_a', name: 'shell', is_error: false, content: 'ok' }), context)
     state = adapter.applyTransient(state, event('8', 'run.prompt_queue', { prompts: [{ id: 'p1', content: 'next', steer: false }] }), context)

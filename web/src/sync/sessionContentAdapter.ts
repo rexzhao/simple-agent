@@ -833,7 +833,7 @@ function updateRun(state: SessionContentState, event: Record<string, unknown>, s
       const tools = copyMap(next.tools)
       tools[toolID] = {
         tool_call_id: toolID, turn_id: identity.turnID, agent_iteration: identity.iteration,
-        name: identifier(event.name, 'tool.progress.name'), status: old?.status ?? 'running',
+        name: identifier(event.name, 'tool.progress.name'), status: 'running',
         arguments: `${old?.arguments ?? ''}${stringValue(event.arguments_delta, 'tool.progress.arguments_delta', true)}`,
       }
       next = { ...next, tools, stepOrder: old ? next.stepOrder : appendStepRef(next, { kind: 'tool', key: toolID }) }
