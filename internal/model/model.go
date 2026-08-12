@@ -29,6 +29,10 @@ type Request struct {
 	Parameters    map[string]any
 	SessionID     string
 	DeveloperRole MessageRole
+	// MaxTokens is the provider-required output token cap. Providers that
+	// require it (Anthropic) inject it into the request body when the caller
+	// did not already set max_tokens/max_output_tokens in Parameters.
+	MaxTokens int
 }
 
 type MessageRole string

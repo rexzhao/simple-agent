@@ -1,12 +1,41 @@
 package config
 
 import (
+	"encoding/json"
 	"fmt"
 	"sort"
 	"strings"
 )
 
 var canonicalReasoningLevels = []string{"off", "minimal", "low", "medium", "high", "xhigh", "max"}
+
+// ReasoningConfig type constants. The empty value means effort mapping for
+// backward compatibility with existing provider files.
+const (
+	ReasoningTypeEffort       = "effort"
+	ReasoningTypeBudgetTokens = "budget_tokens"
+)
+
+// NormalizeReasoningType canonicalizes a reasoning config type. It returns the
+// empty string for unrecognized values so validation can report a precise
+// error instead of silently downgrading.
+func NormalizeReasoningType(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "", ReasoningTypeEffort:
+		return ""
+	case ReasoningTypeBudgetTokens:
+		return ReasoningTypeBudgetTokens
+	default:
+		return value
+	}
+}
+
+// normalizeReasoningConfig fills the Type field when it is empty and freezes
+// the canonical form used by equality and persistence.
+func normalizeReasoningConfig(reasoning ReasoningConfig) ReasoningConfig {
+	reasoning.Type = NormalizeReasoningType(reasoning.Type)
+	return reasoning
+}
 
 // DefaultReasoningConfig returns common provider/model mappings based on Pi's
 // thinking-level catalog. Unknown models remain unconfigured so an unsupported
@@ -25,7 +54,7 @@ func DefaultReasoningConfig(providerName, baseURL string, model ModelProfile) Re
 		levels["off"] = "none"
 		levels["minimal"] = "low"
 		addOpenAIExtendedLevels(levels, modelID)
-		return ReasoningConfig{Parameter: "reasoning.effort", Default: preferredOpenAIDefault(levels), Levels: levels}
+		return normalizeReasoningConfig(ReasoningConfig{Parameter: "reasoning.effort", Default: preferredOpenAIDefault(levels), Levels: levels})
 	}
 
 	if modelType == ProviderTypeOpenAIResponses && strings.HasPrefix(modelID, "gpt-5") {
@@ -37,7 +66,7 @@ func DefaultReasoningConfig(providerName, baseURL string, model ModelProfile) Re
 			}
 		}
 		addOpenAIExtendedLevels(levels, modelID)
-		return ReasoningConfig{Parameter: "reasoning.effort", Default: preferredOpenAIDefault(levels), Levels: levels}
+		return normalizeReasoningConfig(ReasoningConfig{Parameter: "reasoning.effort", Default: preferredOpenAIDefault(levels), Levels: levels})
 	}
 
 	if modelType == ProviderTypeAnthropicMessages && isAdaptiveClaudeModel(modelID) {
@@ -47,7 +76,7 @@ func DefaultReasoningConfig(providerName, baseURL string, model ModelProfile) Re
 		if supportsClaudeXHigh(modelID) {
 			levels["xhigh"] = "xhigh"
 		}
-		return ReasoningConfig{Parameter: "output_config.effort", Default: "high", Levels: levels}
+		return normalizeReasoningConfig(ReasoningConfig{Parameter: "output_config.effort", Default: "high", Levels: levels})
 	}
 
 	if modelType != ProviderTypeOpenAIChat {
@@ -69,17 +98,17 @@ func DefaultReasoningConfig(providerName, baseURL string, model ModelProfile) Re
 				levels["medium"] = "high"
 			}
 		}
-		return ReasoningConfig{
+		return normalizeReasoningConfig(ReasoningConfig{
 			Parameter: parameter,
 			Default:   "high",
 			Levels:    levels,
-		}
+		})
 	}
 	if strings.HasPrefix(modelID, "gpt-5") || strings.HasPrefix(modelID, "o1") || strings.HasPrefix(modelID, "o3") || strings.HasPrefix(modelID, "o4") {
 		levels := commonEffortLevels()
 		levels["off"] = "none"
 		addOpenAIExtendedLevels(levels, modelID)
-		return ReasoningConfig{Parameter: parameter, Default: preferredOpenAIDefault(levels), Levels: levels}
+		return normalizeReasoningConfig(ReasoningConfig{Parameter: parameter, Default: preferredOpenAIDefault(levels), Levels: levels})
 	}
 	return ReasoningConfig{}
 }
@@ -188,6 +217,13 @@ func ApplyReasoningLevel(parameters map[string]any, reasoning ReasoningConfig, s
 	if !ok {
 		return nil, fmt.Errorf("unknown reasoning level %q", selected)
 	}
+	if reasoning.Type == ReasoningTypeBudgetTokens {
+		number, ok := numericLevelValue(value)
+		if !ok {
+			return nil, fmt.Errorf("reasoning level %q must map to a number for budget_tokens type", selected)
+		}
+		value = number
+	}
 	path := strings.TrimSpace(reasoning.Parameter)
 	if path == "" {
 		return nil, fmt.Errorf("reasoning parameter path is required")
@@ -213,4 +249,28 @@ func ApplyReasoningLevel(parameters map[string]any, reasoning ReasoningConfig, s
 		current = next
 	}
 	return result, nil
+}
+
+// numericLevelValue converts a reasoning level value to its numeric form for
+// budget_tokens mappings. It accepts int, int64, float64, and json.Number so
+// YAML and JSON decoders keep the same target value.
+func numericLevelValue(value any) (any, bool) {
+	switch value := value.(type) {
+	case int:
+		return value, true
+	case int64:
+		return value, true
+	case float64:
+		return value, true
+	case json.Number:
+		if parsed, err := value.Int64(); err == nil {
+			return parsed, true
+		}
+		if parsed, err := value.Float64(); err == nil {
+			return parsed, true
+		}
+		return nil, false
+	default:
+		return nil, false
+	}
 }

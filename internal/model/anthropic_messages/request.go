@@ -22,6 +22,7 @@ func buildRequestBody(request model.Request, stream bool) ([]byte, *toolNameMapp
 	for key, value := range request.Parameters {
 		body[key] = value
 	}
+	applyAnthropicThinking(body)
 
 	messages, system, err := buildMessages(request.Messages, toolNames)
 	if err != nil {
@@ -37,12 +38,42 @@ func buildRequestBody(request model.Request, stream bool) ([]byte, *toolNameMapp
 	if len(request.Tools) > 0 {
 		body["tools"] = buildTools(request.Tools, toolNames)
 	}
+	if _, configured := body["max_tokens"]; !configured && request.MaxTokens > 0 {
+		body["max_tokens"] = request.MaxTokens
+	}
 
 	data, err := json.Marshal(body)
 	if err != nil {
 		return nil, nil, err
 	}
 	return data, toolNames, nil
+}
+
+// applyAnthropicThinking converts dot-separated thinking.* parameters into the
+// nested Anthropic thinking block. Values are written as the canonical
+// {type: enabled, budget_tokens: N} shape so a budget_tokens reasoning config
+// sends the native structure instead of a flat thinking field. An explicit
+// thinking.type value (enabled/disabled/adaptive) is preserved; budget_tokens
+// only fills in the default enabled type when no type was provided.
+func applyAnthropicThinking(body map[string]any) {
+	rawBudget, hasBudget := body["thinking.budget_tokens"]
+	rawType, hasType := body["thinking.type"]
+	if !hasBudget && !hasType {
+		return
+	}
+	delete(body, "thinking.budget_tokens")
+	delete(body, "thinking.type")
+	thinking := map[string]any{}
+	if hasType {
+		thinking["type"] = rawType
+	}
+	if hasBudget {
+		if !hasType {
+			thinking["type"] = "enabled"
+		}
+		thinking["budget_tokens"] = rawBudget
+	}
+	body["thinking"] = thinking
 }
 
 func buildMessages(messages []model.Message, toolNames *toolNameMapper) ([]map[string]any, string, error) {

@@ -788,6 +788,82 @@ func TestBuildProviderRequestUsesPreviousResponseIDOnlyForMatchingStoredState(t 
 	assertJSONOmitsKey(t, body, "previous_response_id")
 }
 
+func TestBuildRequestBodyInjectsMaxOutputTokensFromRequest(t *testing.T) {
+	body, _, _, err := buildProviderRequest(model.Request{
+		Model:     "gpt-5.5",
+		MaxTokens: 4096,
+	}, true, requestBodyOptions{})
+	if err != nil {
+		t.Fatalf("buildProviderRequest() error = %v", err)
+	}
+	assertJSONEqual(t, body, `{
+		"model": "gpt-5.5",
+		"input": [],
+		"stream": true,
+		"store": false,
+		"max_output_tokens": 4096
+	}`)
+}
+
+func TestBuildRequestBodyKeepsExplicitMaxOutputTokensOverInjection(t *testing.T) {
+	body, _, _, err := buildProviderRequest(model.Request{
+		Model:     "gpt-5.5",
+		MaxTokens: 4096,
+		Parameters: map[string]any{
+			"max_output_tokens": 1024,
+		},
+	}, true, requestBodyOptions{})
+	if err != nil {
+		t.Fatalf("buildProviderRequest() error = %v", err)
+	}
+	assertJSONEqual(t, body, `{
+		"model": "gpt-5.5",
+		"input": [],
+		"stream": true,
+		"store": false,
+		"max_output_tokens": 1024
+	}`)
+}
+
+func TestBuildRequestBodyKeepsExplicitMaxTokensOverInjection(t *testing.T) {
+	body, _, _, err := buildProviderRequest(model.Request{
+		Model:     "gpt-5.5",
+		MaxTokens: 4096,
+		Parameters: map[string]any{
+			"max_tokens": 2048,
+		},
+	}, true, requestBodyOptions{})
+	if err != nil {
+		t.Fatalf("buildProviderRequest() error = %v", err)
+	}
+	assertJSONEqual(t, body, `{
+		"model": "gpt-5.5",
+		"input": [],
+		"stream": true,
+		"store": false,
+		"max_output_tokens": 2048
+	}`)
+}
+
+func TestBuildRequestBodyReasoningEffortNested(t *testing.T) {
+	body, _, _, err := buildProviderRequest(model.Request{
+		Model: "gpt-5.5",
+		Parameters: map[string]any{
+			"reasoning.effort": "high",
+		},
+	}, true, requestBodyOptions{})
+	if err != nil {
+		t.Fatalf("buildProviderRequest() error = %v", err)
+	}
+	assertJSONEqual(t, body, `{
+		"model": "gpt-5.5",
+		"input": [],
+		"stream": true,
+		"store": false,
+		"reasoning": {"effort": "high"}
+	}`)
+}
+
 func assertJSONEqual(t *testing.T, got []byte, want string) {
 	t.Helper()
 

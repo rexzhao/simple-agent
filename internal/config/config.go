@@ -239,6 +239,10 @@ func (p ModelPricing) PricingTierForInput(inputTokens int) ModelPricingTier {
 }
 
 type ReasoningConfig struct {
+	// Type selects the reasoning control shape. An empty value or "effort"
+	// means string-level effort mapping (the historical behavior). "budget_tokens"
+	// means numeric token budgets whose levels map names to numbers.
+	Type      string         `json:"type,omitempty" yaml:"type,omitempty"`
 	Parameter string         `json:"parameter,omitempty" yaml:"parameter,omitempty"`
 	Default   string         `json:"default,omitempty" yaml:"default,omitempty"`
 	Levels    map[string]any `json:"levels,omitempty" yaml:"levels,omitempty"`
@@ -899,6 +903,13 @@ func validateProvider(path string, provider ProviderConfig) error {
 				return fmt.Errorf("provider file %q model %q reasoning_config.default %q is not present in levels", path, profileName, defaultLevel)
 			}
 		}
+		if profile.ReasoningConfig.Type == ReasoningTypeBudgetTokens {
+			for level, value := range profile.ReasoningConfig.Levels {
+				if _, ok := numericLevelValue(value); !ok {
+					return fmt.Errorf("provider file %q model %q reasoning_config level %q must map to a number for budget_tokens type", path, profileName, level)
+				}
+			}
+		}
 	}
 	return nil
 }
@@ -916,6 +927,7 @@ func normalizeProvider(provider ProviderConfig, providerFileDir string) Provider
 		profile.ID = strings.TrimSpace(profile.ID)
 		profile.Type = strings.TrimSpace(profile.Type)
 		profile.Compatibility = strings.ToLower(strings.TrimSpace(profile.Compatibility))
+		profile.ReasoningConfig = normalizeReasoningConfig(profile.ReasoningConfig)
 		if profile.Pricing != nil {
 			profile.Pricing = copyModelPricing(profile.Pricing)
 		}

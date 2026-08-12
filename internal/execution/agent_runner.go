@@ -514,6 +514,7 @@ func (r *agentRunnerRuntime) runSessionTurn(ctx context.Context, prompt string, 
 		Parameters:    r.parameters,
 		SessionID:     r.session.ID,
 		DeveloperRole: r.developerRole,
+		MaxTokens:     r.outputLimit,
 	}
 	activeTurnID := options.turnID
 	events, results, err := agent.StreamWithResult(turnCtx, request, agent.Options{

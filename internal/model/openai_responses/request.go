@@ -122,6 +122,9 @@ func buildProviderRequest(request model.Request, stream bool, options requestBod
 	if err != nil {
 		return nil, nil, providerRequestMetadata{}, err
 	}
+	if _, configured := body["max_output_tokens"]; !configured && request.MaxTokens > 0 {
+		body["max_output_tokens"] = clampMinimumOutputTokens(request.MaxTokens)
+	}
 
 	store, err := effectiveStore(body, responsesOptions, options.forceStoreFalse)
 	if err != nil {
@@ -192,6 +195,7 @@ func buildProviderRequest(request model.Request, stream bool, options requestBod
 
 func buildParameters(parameters map[string]any, toolNames *toolNameMapper) (map[string]any, error) {
 	body := make(map[string]any, len(parameters)+3)
+	var reasoning map[string]any
 	for key, value := range parameters {
 		if key == "responses" {
 			continue
@@ -213,7 +217,30 @@ func buildParameters(parameters map[string]any, toolNames *toolNameMapper) (map[
 			body[key] = mapToolChoice(value, toolNames)
 			continue
 		}
+		if key == "reasoning" {
+			nested, ok := value.(map[string]any)
+			if !ok {
+				return nil, fmt.Errorf("OpenAI Responses reasoning must be an object")
+			}
+			if reasoning == nil {
+				reasoning = make(map[string]any, len(nested))
+			}
+			for name, item := range nested {
+				reasoning[name] = item
+			}
+			continue
+		}
+		if strings.HasPrefix(key, "reasoning.") {
+			if reasoning == nil {
+				reasoning = make(map[string]any)
+			}
+			reasoning[strings.TrimPrefix(key, "reasoning.")] = value
+			continue
+		}
 		body[key] = value
+	}
+	if reasoning != nil {
+		body["reasoning"] = reasoning
 	}
 	return body, nil
 }

@@ -216,3 +216,75 @@ func TestBuildRequestBodyRejectsUnsupportedImageMediaType(t *testing.T) {
 		t.Fatal("BuildRequestBody() error = nil, want unsupported media type error")
 	}
 }
+
+func TestBuildRequestBodyInjectsMaxTokensFromRequest(t *testing.T) {
+	body, err := BuildRequestBody(model.Request{
+		Model:     "claude-sonnet-5",
+		MaxTokens: 4096,
+	}, true)
+	if err != nil {
+		t.Fatalf("BuildRequestBody() error = %v", err)
+	}
+	assertJSONEqual(t, body, `{
+		"model": "claude-sonnet-5",
+		"messages": [],
+		"stream": true,
+		"max_tokens": 4096
+	}`)
+}
+
+func TestBuildRequestBodyKeepsExplicitMaxTokensOverInjection(t *testing.T) {
+	body, err := BuildRequestBody(model.Request{
+		Model:     "claude-sonnet-5",
+		MaxTokens: 4096,
+		Parameters: map[string]any{
+			"max_tokens": 1024,
+		},
+	}, true)
+	if err != nil {
+		t.Fatalf("BuildRequestBody() error = %v", err)
+	}
+	assertJSONEqual(t, body, `{
+		"model": "claude-sonnet-5",
+		"messages": [],
+		"stream": true,
+		"max_tokens": 1024
+	}`)
+}
+
+func TestBuildRequestBodyMapsThinkingBudgetTokens(t *testing.T) {
+	body, err := BuildRequestBody(model.Request{
+		Model: "claude-sonnet-5",
+		Parameters: map[string]any{
+			"thinking.budget_tokens": int64(8192),
+		},
+	}, true)
+	if err != nil {
+		t.Fatalf("BuildRequestBody() error = %v", err)
+	}
+	assertJSONEqual(t, body, `{
+		"model": "claude-sonnet-5",
+		"messages": [],
+		"stream": true,
+		"thinking": {"type": "enabled", "budget_tokens": 8192}
+	}`)
+}
+
+func TestBuildRequestBodyMapsThinkingTypeAndBudget(t *testing.T) {
+	body, err := BuildRequestBody(model.Request{
+		Model: "claude-sonnet-5",
+		Parameters: map[string]any{
+			"thinking.type":          "disabled",
+			"thinking.budget_tokens": int64(0),
+		},
+	}, true)
+	if err != nil {
+		t.Fatalf("BuildRequestBody() error = %v", err)
+	}
+	assertJSONEqual(t, body, `{
+		"model": "claude-sonnet-5",
+		"messages": [],
+		"stream": true,
+		"thinking": {"type": "disabled", "budget_tokens": 0}
+	}`)
+}

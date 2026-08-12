@@ -191,3 +191,63 @@ func TestApplyReasoningLevelSetsNestedValueWithoutMutatingDefaults(t *testing.T)
 		t.Fatalf("input effort mutated to %#v", original)
 	}
 }
+
+func TestApplyReasoningLevelBudgetTokensWritesNumber(t *testing.T) {
+	got, err := ApplyReasoningLevel(map[string]any{}, ReasoningConfig{
+		Type:      ReasoningTypeBudgetTokens,
+		Parameter: "thinking.budget_tokens",
+		Default:   "high",
+		Levels:    map[string]any{"low": int64(2048), "high": int64(8192)},
+	}, "low")
+	if err != nil {
+		t.Fatalf("ApplyReasoningLevel() error = %v", err)
+	}
+	thinking, ok := got["thinking"].(map[string]any)
+	if !ok {
+		t.Fatalf("thinking = %#v, want nested map", got["thinking"])
+	}
+	if thinking["budget_tokens"] != int64(2048) {
+		t.Fatalf("budget_tokens = %#v, want 2048", thinking["budget_tokens"])
+	}
+}
+
+func TestApplyReasoningLevelBudgetTokensRejectsNonNumeric(t *testing.T) {
+	_, err := ApplyReasoningLevel(map[string]any{}, ReasoningConfig{
+		Type:      ReasoningTypeBudgetTokens,
+		Parameter: "thinking.budget_tokens",
+		Default:   "high",
+		Levels:    map[string]any{"high": "high"},
+	}, "high")
+	if err == nil {
+		t.Fatal("ApplyReasoningLevel() error = nil, want numeric-level rejection")
+	}
+}
+
+func TestNormalizeReasoningType(t *testing.T) {
+	tests := []struct {
+		value string
+		want  string
+	}{
+		{value: "", want: ""},
+		{value: "effort", want: ""},
+		{value: "EFFORT", want: ""},
+		{value: "budget_tokens", want: "budget_tokens"},
+		{value: "BUDGET_TOKENS", want: "budget_tokens"},
+		{value: "unknown", want: "unknown"},
+	}
+	for _, test := range tests {
+		if got := NormalizeReasoningType(test.value); got != test.want {
+			t.Fatalf("NormalizeReasoningType(%q) = %q, want %q", test.value, got, test.want)
+		}
+	}
+}
+
+func TestDefaultReasoningConfigAnthropicKeepsEffortDefault(t *testing.T) {
+	// The adaptive-Claude default stays on the effort mapping so existing
+	// sessions keep their historical reasoning behavior. budget_tokens is
+	// enabled explicitly by the user or models.dev fill, never by surprise.
+	got := DefaultReasoningConfig("anthropic", "", ModelProfile{ID: "claude-opus-4-7", Type: ProviderTypeAnthropicMessages})
+	if got.Type != "" || got.Parameter != "output_config.effort" || got.Default != "high" {
+		t.Fatalf("DefaultReasoningConfig() = %#v, want effort default", got)
+	}
+}

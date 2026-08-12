@@ -32,6 +32,9 @@ func buildRequestBody(request model.Request, stream bool, compatibility chatComp
 	if len(request.Tools) > 0 {
 		body["tools"] = buildTools(request.Tools, toolNames)
 	}
+	if _, configured := body["max_tokens"]; !configured && request.MaxTokens > 0 {
+		body["max_tokens"] = request.MaxTokens
+	}
 	compatibility.prepareRequest(body, request)
 	if stream {
 		includeStreamUsage(body)

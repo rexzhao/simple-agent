@@ -650,8 +650,20 @@ func providerConfigsEqual(left, right config.ProviderConfig) bool {
 		}
 		leftParameters, rightParameters := leftModel.Parameters, rightModel.Parameters
 		leftLevels, rightLevels := leftModel.ReasoningConfig.Levels, rightModel.ReasoningConfig.Levels
+		leftReasoningType, rightReasoningType := leftModel.ReasoningConfig.Type, rightModel.ReasoningConfig.Type
 		leftModel.Parameters, rightModel.Parameters = nil, nil
 		leftModel.ReasoningConfig.Levels, rightModel.ReasoningConfig.Levels = nil, nil
+		// The empty type and "effort" are the same historical target. A
+		// provider file written before the reasoning type field existed loads
+		// with an empty type, while the UI may normalize it to "effort"; treat
+		// them as one value so a retry never produces a spurious write.
+		if leftReasoningType == "" {
+			leftReasoningType = config.ReasoningTypeEffort
+		}
+		if rightReasoningType == "" {
+			rightReasoningType = config.ReasoningTypeEffort
+		}
+		leftModel.ReasoningConfig.Type, rightModel.ReasoningConfig.Type = leftReasoningType, rightReasoningType
 		if len(leftModel.Input) == 0 {
 			leftModel.Input = nil
 		}

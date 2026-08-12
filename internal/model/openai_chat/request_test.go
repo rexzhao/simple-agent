@@ -473,3 +473,40 @@ func TestBuildRequestBodyRejectsNonUserContentBlocks(t *testing.T) {
 		t.Fatal("BuildRequestBody() error = nil, want non-user content block error")
 	}
 }
+
+func TestBuildRequestBodyInjectsMaxTokensFromRequest(t *testing.T) {
+	body, err := BuildRequestBody(model.Request{
+		Model:     "glm-5.2",
+		MaxTokens: 4096,
+	}, true)
+	if err != nil {
+		t.Fatalf("BuildRequestBody() error = %v", err)
+	}
+	assertJSONEqual(t, body, `{
+		"model": "glm-5.2",
+		"messages": [],
+		"stream": true,
+		"stream_options": {"include_usage": true},
+		"max_tokens": 4096
+	}`)
+}
+
+func TestBuildRequestBodyKeepsExplicitMaxTokensOverInjection(t *testing.T) {
+	body, err := BuildRequestBody(model.Request{
+		Model:     "glm-5.2",
+		MaxTokens: 4096,
+		Parameters: map[string]any{
+			"max_tokens": 1024,
+		},
+	}, true)
+	if err != nil {
+		t.Fatalf("BuildRequestBody() error = %v", err)
+	}
+	assertJSONEqual(t, body, `{
+		"model": "glm-5.2",
+		"messages": [],
+		"stream": true,
+		"stream_options": {"include_usage": true},
+		"max_tokens": 1024
+	}`)
+}
