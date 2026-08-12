@@ -17,6 +17,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/rexzhao/simple-agent/internal/model"
 )
@@ -1361,7 +1362,14 @@ func truncateBytes(text string, maxBytes int) (string, bool) {
 	if maxBytes <= 0 || len([]byte(text)) <= maxBytes {
 		return text, false
 	}
-	return string([]byte(text)[:maxBytes]), true
+	cut := []byte(text)[:maxBytes]
+	// Back off to the nearest valid UTF-8 boundary so a multi-byte character
+	// is never split in the middle. Otherwise a truncated snippet can carry an
+	// incomplete encoding that fails later strict UTF-8 validation.
+	for len(cut) > 0 && !utf8.Valid(cut) {
+		cut = cut[:len(cut)-1]
+	}
+	return string(cut), true
 }
 
 func optionalStringArgument(arguments map[string]any, name string, defaultValue string) (string, error) {
