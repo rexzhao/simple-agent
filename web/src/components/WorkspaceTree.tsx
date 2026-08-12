@@ -47,6 +47,32 @@ export const WorkspaceTree = memo(function WorkspaceTree(props: {
   const renderSessionRow = (projectID: string, session: SessionNavigation, sessions: readonly SessionNavigation[], archived = false) => {
     const running = session.status === 'running' || props.runningSessionIDs.has(session.id)
     const hasRunningDescendant = !running && ancestorSessionIDs(sessions, props.runningSessionIDs).has(session.id)
+    const iconStatus = archived
+      ? ''
+      : running
+        ? 'running'
+        : hasRunningDescendant
+          ? 'running-descendant'
+          : session.status === 'completed'
+            ? 'completed'
+            : session.status === 'failed'
+              ? 'failed'
+              : session.status === 'interrupted'
+                ? 'interrupted'
+                : 'idle'
+    const iconLabel = archived
+      ? 'Archived session'
+      : running
+        ? 'Session running'
+        : hasRunningDescendant
+          ? 'A sub-session is running'
+          : session.status === 'completed'
+            ? 'Session completed'
+            : session.status === 'failed'
+              ? 'Session failed'
+              : session.status === 'interrupted'
+                ? 'Session interrupted'
+                : 'Session idle'
     return (
       <div className="session-tree-branch" key={session.id}>
         <div className={`session-tree-row ${archived ? 'archived' : ''} ${session.id === props.selectedSessionID ? 'selected' : ''}`}>
@@ -56,15 +82,12 @@ export const WorkspaceTree = memo(function WorkspaceTree(props: {
             disabled={archived}
             onClick={archived ? undefined : () => props.onSelectSession(projectID, session.id)}
           >
-            <span className="session-icon">{archived ? <ArchiveIcon /> : <ChatIcon />}</span>
+            <span className={`session-icon ${iconStatus}`} role="img" aria-label={iconLabel} title={iconLabel}>{archived ? <ArchiveIcon /> : <ChatIcon />}</span>
             <span className="session-copy">
               <strong>{sessionName(session)}</strong>
               <small>{archived ? 'Archived' : relativeTime(session.updated_at)} · {session.status ?? 'idle'}</small>
             </span>
             {session.has_unread_result && <span className="unread-badge" title="Unread result" aria-label="Unread result">●</span>}
-            {!archived && running && <span className="status-dot running" title="Session running" aria-label="Session running" />}
-            {!archived && hasRunningDescendant && <span className="status-dot running-descendant" title="A sub-session is running" aria-label="A sub-session is running" />}
-            {!archived && !running && !hasRunningDescendant && (session.status === 'interrupted' || session.status === 'failed') && <span className="status-dot interrupted" title="Session interrupted" aria-label="Session interrupted" />}
           </button>
           <div className="session-tree-actions">
             {archived ? (

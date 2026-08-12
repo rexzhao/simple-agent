@@ -218,12 +218,15 @@ svg { width: 1.1em; height: 1.1em; fill: none; stroke: currentColor; stroke-widt
 
 .session-icon { width: 25px; height: 25px; flex: 0 0 auto; display: grid; place-items: center; border: 2px solid currentColor; color: #111111; background: var(--accent); }
 .session-icon.agent-session-icon { background: #bfdbfe; }
-.session-tree-branch.orphaned > .session-tree-row > .session-tree-button > .session-icon { background: #e5e7eb; }
+.session-tree-branch.orphaned > .session-tree-row > .session-tree-button > .session-icon.idle { background: #e5e7eb; }
 .session-icon svg { width: 13px; height: 13px; }
-.session-tree-row.selected .session-icon { color: #111111; background: var(--accent); }
+.session-icon.idle { color: #111111; background: #fef3c7; border-color: #111111; }
+.session-icon.running { color: #ffffff; background: #2563eb; border-color: #111111; --session-icon-glow: rgba(37, 99, 235, .48); animation: session-icon-pulse 1.2s ease-in-out infinite; }
+.session-icon.running-descendant { color: #5b21b6; background: #ede9fe; border-color: #6d28d9; border-style: dashed; --session-icon-glow: rgba(109, 40, 217, .42); animation: session-icon-pulse 1.2s ease-in-out infinite; }
+.session-icon.completed { color: #166534; background: #dcfce7; border-color: #166534; }
+.session-icon.failed, .session-icon.interrupted { color: #991b1b; background: #fee2e2; border-color: #991b1b; }
 .session-tree-row.archived { opacity: .72; }
 .session-tree-row.archived:hover, .session-tree-row.archived:focus-within { opacity: 1; }
-.session-tree-button .status-dot { margin-left: auto; }
 .unread-badge { margin-left: auto; color: var(--accent); font-size: 15px; line-height: 1; }
 
 .session-tree-actions { display: flex; gap: 1px; padding-right: 3px; opacity: 0; }
@@ -488,7 +491,6 @@ svg { width: 1.1em; height: 1.1em; fill: none; stroke: currentColor; stroke-widt
 .header-actions { display: flex; align-items: center; gap: 12px; }
 .status-dot { width: 8px; height: 8px; flex: 0 0 auto; border: 2px solid var(--border); background: #22c55e; align-self: center; }
 .status-dot.running { background: #ffffff; border-color: var(--accent); animation: pulse 1.2s infinite; }
-.status-dot.running-descendant { border-style: dashed; border-color: var(--accent); background: transparent; animation: pulse 1.2s infinite; }
 .status-dot.interrupted { background: var(--danger); border-color: var(--danger); }
 .compaction-status { width: min(700px, 100%); display: flex; align-items: center; gap: 9px; margin: 0 0 20px; padding: 10px 12px; border: 2px solid var(--border); background: var(--accent-soft); font-size: 11px; font-weight: 750; }
 .compaction-status span { width: 9px; height: 9px; flex: 0 0 auto; border: 2px solid var(--border); background: var(--accent); animation: pulse 1.2s infinite; }
@@ -924,6 +926,7 @@ svg { width: 1.1em; height: 1.1em; fill: none; stroke: currentColor; stroke-widt
 .skeleton i:nth-child(3) { width: 54%; }
 
 @keyframes pulse { 50% { opacity: .32; } }
+@keyframes session-icon-pulse { 50% { box-shadow: 0 0 0 3px var(--session-icon-glow); } }
 @keyframes blink { 50% { opacity: 0; } }
 @keyframes spin { to { transform: rotate(360deg); } }
 @keyframes breathe { 50% { transform: translate(2px, 2px); box-shadow: var(--shadow-1); } }

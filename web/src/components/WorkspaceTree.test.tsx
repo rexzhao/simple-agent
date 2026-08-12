@@ -32,7 +32,7 @@ function session(id: string, name: string, options: Partial<Session> = {}): Sess
   }
 }
 
-function renderTree(sessions: Session[], runningSessionIDs: ReadonlySet<string> = new Set()) {
+function renderTree(sessions: Session[], runningSessionIDs: ReadonlySet<string> = new Set(), selectedSessionID = '') {
   const onSelectSession = vi.fn()
   const summaries: SessionSummary[] = sessions.map((item) => ({
     session_id: item.id,
@@ -40,7 +40,7 @@ function renderTree(sessions: Session[], runningSessionIDs: ReadonlySet<string> 
     parent_session_id: item.parent_session_id ?? null,
     display_name: item.display_name,
     archived: item.archived,
-    status: (item.status === 'running' ? 'running' : item.status === 'interrupted' ? 'interrupted' : 'idle'),
+    status: item.status === 'running' || item.status === 'completed' || item.status === 'failed' || item.status === 'interrupted' ? item.status : 'idle',
     run_id: item.status === 'running' ? item.running_run_id ?? 'run-test' : null,
     resource_revision: item.revision ?? '0',
     updated_at: item.updated_at,
@@ -55,7 +55,7 @@ function renderTree(sessions: Session[], runningSessionIDs: ReadonlySet<string> 
     projects={[project]}
     sessionIndexes={sessionIndexes}
     selectedProjectID={project.id}
-    selectedSessionID=""
+    selectedSessionID={selectedSessionID}
     runningSessionIDs={runningSessionIDs}
     version="test"
     onSelectProject={vi.fn()}
@@ -108,19 +108,26 @@ describe('WorkspaceTree session list', () => {
     renderTree(roots, new Set([roots[3].id]))
 
     expect(screen.getByText('Root 4')).not.toBeNull()
-    expect(screen.getByText('Root 4').closest('.session-tree-row')?.querySelector('.status-dot.running')).not.toBeNull()
+    expect(screen.getByText('Root 4').closest('.session-tree-row')?.querySelector('.session-icon.running')).not.toBeNull()
+    expect(screen.getByText('Root 4').closest('.session-tree-row')?.querySelector('.status-dot')).toBeNull()
   })
 
-  it('shows a red interrupted indicator on failed sessions in the list', () => {
+  it('uses the session icon for completed, idle, failed, and interrupted results', () => {
+    const completed = session('completed', 'Completed', { status: 'completed' })
     const failed = session('failed', 'Failed', { status: 'interrupted' })
+    const failedRun = session('failed-run', 'Failed run', { status: 'failed' })
     const idle = session('idle', 'Idle', { status: 'idle' })
-    renderTree([failed, idle])
+    renderTree([completed, failed, failedRun, idle])
+    fireEvent.click(screen.getByRole('button', { name: /Show 1 more sessions/ }))
 
-    expect(screen.getByText('Failed').closest('.session-tree-row')?.querySelector('.status-dot.interrupted')).not.toBeNull()
-    expect(screen.getByText('Idle').closest('.session-tree-row')?.querySelector('.status-dot')).toBeNull()
+    expect(screen.getByText('Completed').closest('.session-tree-row')?.querySelector('.session-icon.completed')).not.toBeNull()
+    expect(screen.getByText('Failed').closest('.session-tree-row')?.querySelector('.session-icon.interrupted')).not.toBeNull()
+    expect(screen.getByText('Failed run').closest('.session-tree-row')?.querySelector('.session-icon.failed')).not.toBeNull()
+    expect(screen.getByText('Idle').closest('.session-tree-row')?.querySelector('.session-icon.idle')).not.toBeNull()
+    expect(document.querySelectorAll('.session-tree-button .status-dot')).toHaveLength(0)
   })
 
-  it('shows a dashed running indicator on a root whose sub-session is running', () => {
+  it('shows a dashed running icon on a root whose sub-session is running', () => {
     const root = session('root', 'Root')
     const child = session('child', 'Child', {
       created_by: 'agent', parent_session_id: root.id, root_session_id: root.id, spawn_depth: 1,
@@ -128,9 +135,11 @@ describe('WorkspaceTree session list', () => {
     renderTree([child, root], new Set([child.id]))
 
     const rootRow = screen.getByText('Root').closest('.session-tree-row')!
-    // The root is not itself running, so it must not get the solid running dot.
-    expect(rootRow.querySelector('.status-dot.running')).toBeNull()
-    expect(rootRow.querySelector('.status-dot.running-descendant')).not.toBeNull()
+    // The root is not itself running, so it must not get the solid running icon.
+    expect(rootRow.querySelector('.session-icon.running')).toBeNull()
+    expect(rootRow.querySelector('.session-icon.running-descendant')).not.toBeNull()
+    expect(rootRow.querySelector('.session-icon')?.getAttribute('aria-label')).toBe('A sub-session is running')
+    expect(rootRow.querySelector('.status-dot')).toBeNull()
     expect(rootRow.classList.contains('running-descendant')).toBe(false)
     expect(rootRow.classList.contains('selected')).toBe(false)
     expect(rootRow.classList.contains('hover')).toBe(false)
@@ -144,8 +153,32 @@ describe('WorkspaceTree session list', () => {
     renderTree([child, root], new Set([root.id, child.id]))
 
     const rootRow = screen.getByText('Root').closest('.session-tree-row')!
-    expect(rootRow.querySelector('.status-dot.running')).not.toBeNull()
-    expect(rootRow.querySelector('.status-dot.running-descendant')).toBeNull()
+    expect(rootRow.querySelector('.session-icon.running')).not.toBeNull()
+    expect(rootRow.querySelector('.session-icon.running-descendant')).toBeNull()
+    expect(rootRow.querySelector('.status-dot')).toBeNull()
+  })
+
+  it('keeps the status icon legible on a selected session row', () => {
+    const running = session('running', 'Running', { status: 'running' })
+    renderTree([running], new Set([running.id]), running.id)
+
+    const row = screen.getByText('Running').closest('.session-tree-row')!
+    const icon = row.querySelector('.session-icon')!
+    expect(row.classList.contains('selected')).toBe(true)
+    expect(icon.classList.contains('running')).toBe(true)
+    expect(icon.classList.contains('running-descendant')).toBe(false)
+    expect(row.querySelector('.status-dot')).toBeNull()
+  })
+
+  it('keeps the archive icon separate from chat status styling', () => {
+    const archived = session('archived', 'Archived', { archived: true, status: 'failed' })
+    renderTree([archived])
+
+    fireEvent.click(screen.getByRole('button', { name: /Archived \(1\)/ }))
+    const row = screen.getByText('Archived').closest('.session-tree-row')!
+    expect(row.querySelector('.session-icon')?.classList.contains('session-icon')).toBe(true)
+    expect(row.querySelector('.session-icon')?.classList.contains('failed')).toBe(false)
+    expect(row.querySelector('.session-icon svg')).not.toBeNull()
   })
 
   it('selects a root session when clicked', () => {

@@ -21,6 +21,12 @@ test('a run settling on a background session reconciles without a manual refresh
     items: bgItems,
     activeRun: { run_id: 'run-bg', session_id: sessionBg.id, turn_id: 'turn-bg', started_at: '2026-01-01T00:00:00Z', status: 'running', recoverable: true, run_epoch: 'epoch', run_cursor: '0', replay_available: false, recovery_required: false },
   })
+  const selectedIdleIcon = page.locator('.session-tree-row.selected .session-icon.idle')
+  await expect(selectedIdleIcon).toHaveCount(1)
+  await expect(selectedIdleIcon).toHaveCSS('background-color', 'rgb(254, 243, 199)')
+  const backgroundIcon = page.locator('.session-tree-button').filter({ hasText: sessionBg.display_name }).locator('.session-icon.running')
+  await expect(backgroundIcon).toHaveCount(1)
+  await expect(backgroundIcon).toHaveCSS('animation-name', 'session-icon-pulse')
   server.settleRun(sessionBg.id, 'run-bg', 'committed', bgItems)
 
   // The background session stays unopened. Its Session Index publication must
@@ -28,7 +34,8 @@ test('a run settling on a background session reconciles without a manual refresh
   // on the main session.
   await expect(page.getByRole('heading', { name: sessionMain.display_name })).toBeVisible()
   await expect(page.getByText('Refresh needed')).toHaveCount(0)
-  await expect(page.locator('.session-tree-button').filter({ hasText: sessionBg.display_name }).locator('.status-dot.running')).toHaveCount(0)
+  await expect(page.locator('.session-tree-button').filter({ hasText: sessionBg.display_name }).locator('.session-icon.running')).toHaveCount(0)
+  await expect(page.locator('.session-tree-button').filter({ hasText: sessionBg.display_name }).locator('.status-dot')).toHaveCount(0)
 
   // Opening after settlement must reconcile the snapshot/history, rather
   // than depending on a live run event that was never observed while closed.
