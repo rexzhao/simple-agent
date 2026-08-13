@@ -257,12 +257,22 @@ func TestProviderSettingsWebSocketResourceUsesSafeDurableProjection(t *testing.T
 	if _, ok := readWebAppMessage(t, connection).(protocol.CommandAcceptedMessage); !ok {
 		t.Fatal("provider.set_default accepted missing")
 	}
-	defaultResult, ok := readWebAppMessage(t, connection).(protocol.CommandResultMessage)
-	if !ok || defaultResult.Payload.Status != protocol.CommandStatusSucceeded || string(defaultResult.Payload.Result) != `{"provider":"fake","model":"precise","status":"applied"}` {
+	var defaultResult protocol.CommandResultMessage
+	var defaultChange protocol.ChangeMessage
+	for range 2 {
+		switch message := readWebAppMessage(t, connection).(type) {
+		case protocol.CommandResultMessage:
+			defaultResult = message
+		case protocol.ChangeMessage:
+			defaultChange = message
+		default:
+			t.Fatalf("provider.set_default unexpected message = %#v", message)
+		}
+	}
+	if defaultResult.Payload.Status != protocol.CommandStatusSucceeded || string(defaultResult.Payload.Result) != `{"provider":"fake","model":"precise","status":"applied"}` {
 		t.Fatalf("provider.set_default result = %#v", defaultResult.Payload)
 	}
-	defaultChange, ok := readWebAppMessage(t, connection).(protocol.ChangeMessage)
-	if !ok || len(defaultChange.Payload.Operations) != 1 || defaultChange.Payload.Operations[0].Op != providersettings.OperationReplaceDefault {
+	if len(defaultChange.Payload.Operations) != 1 || defaultChange.Payload.Operations[0].Op != providersettings.OperationReplaceDefault {
 		t.Fatalf("provider.set_default authoritative change = %#v", defaultChange)
 	}
 }
