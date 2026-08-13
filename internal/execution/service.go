@@ -3229,7 +3229,15 @@ func (s *Service) runSessionMessage(ctx context.Context, id string, input Sessio
 			return
 		}
 		if err := bus.Publish(eventbus.TurnInterrupted{TurnID: turnID}); err != nil {
-			_, _ = s.sessionStore.MarkTurnInterrupted(id, turnID)
+			// Fall back to a durable interrupt when the projector is unreachable.
+			// Use the run-scoped variant so InterruptedRunID is populated; the
+			// bare MarkTurnInterrupted would leave it empty and poison the
+			// session's open/continue state.
+			if runID := runIDForRequest(run); runID != "" {
+				_, _ = s.sessionStore.InterruptTurnForRun(id, runID, turnID)
+			} else {
+				_, _ = s.sessionStore.MarkTurnInterrupted(id, turnID)
+			}
 		}
 		turnClosed = true
 	}

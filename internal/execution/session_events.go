@@ -586,7 +586,12 @@ func (s *Service) CompactSession(ctx context.Context, id string) (SessionCompact
 			return
 		}
 		if err := bus.Publish(eventbus.TurnInterrupted{TurnID: operationID}); err != nil {
-			_, _ = s.sessionStore.MarkTurnInterrupted(id, operationID)
+			// A compaction turn is a virtual operation, not a real run. Only
+			// clear the running-turn marker instead of writing a run-scoped
+			// interrupted state: MarkTurnInterrupted would leave
+			// InterruptedRunID empty while setting InterruptedTurnID/At, which
+			// poisons the session so it can no longer be opened or continued.
+			_, _ = s.sessionStore.ClearRunningTurn(id, operationID)
 		}
 		operationClosed = true
 	}

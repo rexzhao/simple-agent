@@ -674,8 +674,12 @@ func TestProjectorInterruptsPendingTools(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
 	}
-	if loaded.RunningTurnID != "" || loaded.InterruptedTurnID != "turn-1" {
-		t.Fatalf("lifecycle = running %q interrupted %q, want interrupted turn-1", loaded.RunningTurnID, loaded.InterruptedTurnID)
+	// A no-run projector (compaction) interruption only clears the running-turn
+	// marker. It must not write a run-scoped interrupted state because there is
+	// no run to back InterruptedRunID; doing so would poison session open and
+	// continue. Pending tool items are still marked interrupted.
+	if loaded.RunningTurnID != "" || loaded.InterruptedTurnID != "" || loaded.InterruptedRunID != "" {
+		t.Fatalf("lifecycle = running %q interrupted %q/%q, want both empty", loaded.RunningTurnID, loaded.InterruptedTurnID, loaded.InterruptedRunID)
 	}
 	if got := itemStatusesByToolCall(loaded.Items); !reflect.DeepEqual(got, map[string]string{
 		"call-a": sessions.ItemStatusInterrupted,

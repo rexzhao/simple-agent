@@ -662,7 +662,12 @@ func (p *Projector) handleTurnInterrupted(event eventbus.TurnInterrupted) error 
 		}
 		metadata, err = runStore.InterruptTurnForRun(p.session.ID, p.runID, turnID)
 	} else {
-		metadata, err = p.store.MarkTurnInterrupted(p.session.ID, turnID)
+		// A compaction turn is a virtual operation, not a real run. Interrupting
+		// it must clear the running-turn marker without writing a run-scoped
+		// interrupted state: MarkTurnInterrupted would leave InterruptedRunID
+		// empty while setting InterruptedTurnID/InterruptedAt, which poisons the
+		// session so it can no longer be opened or continued.
+		metadata, err = p.store.ClearRunningTurn(p.session.ID, turnID)
 	}
 	if err != nil {
 		return err
