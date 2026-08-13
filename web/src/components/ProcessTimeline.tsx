@@ -1,20 +1,14 @@
 import { createPortal } from 'react-dom'
 import { createContext, memo, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import type { KeyboardEvent, MouseEvent, ReactNode, RefObject } from 'react'
-import Markdown from 'react-markdown'
-import type { Components } from 'react-markdown'
-import remarkGfm from 'remark-gfm'
 import type { ReasoningActivity, RunStep, ToolActivity } from '../types'
 import { formatDuration, unicodeCodePointLength } from '../lib/format'
 import { flattenProcessSteps } from '../lib/runSteps'
 import { isPathOutsideWorkspace } from '../lib/paths'
 import { isSessionToolName, prettyJSONText, sessionToolTarget } from '../lib/sessionTools'
 import { AnsiOutput } from './AnsiOutput'
+import { AssistantMarkdown } from './AssistantMarkdown'
 import { ToolIcon } from './icons'
-
-const markdownComponents: Components = {
-	a: ({ node: _node, ...props }) => <a {...props} target="_blank" rel="noreferrer noopener" />,
-}
 
 export const PROCESS_HOVER_HIDE_DELAY_MS = 180
 export const PROCESS_HOVER_REPLACE_DELAY_MS = 140
@@ -173,7 +167,7 @@ function ProcessTimelineContent({ steps, live = false, onCancelTool, sessionName
 	return (
 		<div ref={timelineRef} className="process-timeline">
 			{nodes.map(({ step, iteration, iterationStart }) => {
-				const marker = iterationStart ? <i className="iteration-marker">{iteration}</i> : null
+				const marker = iterationStart ? <i className="iteration-marker" aria-label={`Agent iteration ${iteration}`}>{iteration}</i> : null
 				if (step.kind === 'reasoning') {
 					return <ReasoningStep key={step.id} step={step} marker={marker} streaming={live && step.id === lastStepID} horizontalReferenceRef={timelineRef} />
 				}
@@ -182,7 +176,7 @@ function ProcessTimelineContent({ steps, live = false, onCancelTool, sessionName
 					// message: plain markdown body, no process card chrome.
 					return (
 						<div className="step-message assistant" key={step.id}>{marker}
-							<div className="message-text markdown-body"><Markdown remarkPlugins={[remarkGfm]} components={markdownComponents} skipHtml>{step.text}</Markdown></div>
+							<AssistantMarkdown text={step.text} />
 						</div>
 					)
 				}

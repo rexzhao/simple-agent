@@ -90,6 +90,44 @@ test('typed live tool and reasoning rows remain in event order around streamed t
   hold.release([])
 })
 
+test('intermediate output keeps the final-answer text axis when durable tools classify it', async ({ page }) => {
+  const settle = newGate()
+  let committed = false
+  await installTimeline(page, [
+    { type: 'assistant.message.updated', turn_id: 'turn-main', agent_iteration: 1, item_id: 'assistant-tool', message_revision: '1', content: 'I will inspect the file.', tool_calls: [] },
+    { type: 'tool.requested', turn_id: 'turn-main', agent_iteration: 1, tool_call_id: 'read-1', name: 'read_file', arguments: '{"path":"a.ts"}' },
+    { type: 'tool.finished', turn_id: 'turn-main', agent_iteration: 1, tool_call_id: 'read-1', name: 'read_file', is_error: false, content: 'contents' },
+  ], [settle], () => committed ? [
+    messageItem(1, 'user', 'Inspect', { turn_id: 'turn-main' }),
+    { seq: 2, id: 'assistant-tool', turn_id: 'turn-main', agent_iteration: 1, created_at: '2026-01-01T00:00:02Z', kind: 'message', visibility: 'visible', audience: 'model', message: { role: 'assistant', content: { inline: 'I will inspect the file.' }, tool_calls: [{ id: 'read-1', name: 'read_file', arguments: { inline: '{"path":"a.ts"}' } }] } },
+    { seq: 3, id: 'tool-result', turn_id: 'turn-main', agent_iteration: 1, created_at: '2026-01-01T00:00:03Z', kind: 'message', visibility: 'visible', audience: 'model', message: { role: 'tool', tool_call_id: 'read-1', content: { inline: 'contents' } } },
+  ] : [])
+  await page.goto('/#token=e2e')
+  await page.getByPlaceholder('Send a message to SAI').fill('Inspect')
+  await page.getByRole('button', { name: 'Send' }).click()
+
+  const liveBody = page.locator('.active-assistant .assistant-markdown')
+  await expect(liveBody).toContainText('I will inspect the file.')
+  const liveX = (await liveBody.boundingBox())?.x
+  expect(liveX).toBeDefined()
+
+  committed = true
+  settle.release([{ type: 'assistant.message.completed', turn_id: 'turn-main', agent_iteration: 1, item_id: 'assistant-tool', message_revision: '2', content: 'I will inspect the file.', tool_calls: [{ id: 'read-1', name: 'read_file', arguments: '{"path":"a.ts"}' }] }])
+  await expect(page.getByLabel('Session status: idle')).toBeVisible()
+  const durableBody = page.locator('.process-message .step-message .assistant-markdown')
+  await expect(durableBody).toContainText('I will inspect the file.')
+  const durableX = (await durableBody.boundingBox())?.x
+  expect(durableX).toBeDefined()
+  expect(Math.abs((durableX ?? 0) - (liveX ?? 0))).toBeLessThanOrEqual(1)
+  const marker = page.getByLabel('Agent iteration 1')
+  await expect(marker).toBeVisible()
+  const [bodyBox, markerBox] = await Promise.all([durableBody.boundingBox(), marker.boundingBox()])
+  expect(bodyBox).not.toBeNull()
+  expect(markerBox).not.toBeNull()
+  expect(Math.abs((markerBox?.y ?? 0) - (bodyBox?.y ?? 0))).toBeLessThanOrEqual(4)
+  await expect.poll(async () => page.locator('.process-timeline').first().evaluate((element) => getComputedStyle(element, '::before').content)).toBe('none')
+})
+
 test('tool rows without intermediate text remain individually visible', async ({ page }) => {
   const hold = newGate()
   await installTimeline(page, [

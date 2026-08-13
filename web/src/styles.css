@@ -599,7 +599,7 @@ svg { width: 1.1em; height: 1.1em; fill: none; stroke: currentColor; stroke-widt
 .markdown-body img { max-width: 100%; border: 2px solid var(--border); box-shadow: var(--shadow-2); }
 .markdown-body input[type="checkbox"] { width: 14px; height: 14px; margin: 0 6px 0 0; accent-color: var(--accent); vertical-align: -2px; }
 
-.process-message { margin-bottom: 20px; }
+.process-message { margin-bottom: 10px; }
 .process-card { width: min(700px, 100%); border: 2px solid var(--border); background: #ffffff; }
 .process-card:hover { box-shadow: var(--shadow-3); }
 .process-card[open] { box-shadow: var(--shadow-3); }
@@ -616,34 +616,33 @@ svg { width: 1.1em; height: 1.1em; fill: none; stroke: currentColor; stroke-widt
 .process-iteration > .process-timeline { margin: 0; }
 .process-card > .process-iterations { gap: 0; }
 .process-card > .process-iterations .process-iteration { width: 100%; }
-/* The left gutter keeps iteration markers — which hang left of their row via
-   right: 100% — inside the .message paint box. 22px fits two digits plus the
-   9px gap. */
-.process-timeline { display: flex; flex-direction: column; gap: 8px; margin: 3px 0 14px; padding-left: 22px; }
-.iteration-marker { position: absolute; top: 9px; right: 100%; margin-right: 9px; color: var(--faint); font-family: var(--font-mono); font-size: 9px; font-weight: 500; font-style: normal; line-height: 1; pointer-events: none; }
-.reasoning-step { position: relative; padding: 7px 9px 8px 11px; border-left: 4px solid var(--accent); background: var(--panel-soft); }
+/* Process prose and final prose share the same x-axis. Iteration labels hang
+   in the existing message-list padding, so classifying streamed prose as
+   intermediate output never moves its body. */
+.process-timeline { position: relative; display: flex; flex-direction: column; gap: 5px; margin: 2px 0 7px; }
+.iteration-marker { position: absolute; z-index: 1; top: 9px; right: calc(100% + 9px); min-width: 13px; padding: 2px 0; color: var(--faint); font-family: var(--font-mono); font-size: 9px; font-weight: 650; font-style: normal; line-height: 1; text-align: center; pointer-events: none; }
+.reasoning-step { position: relative; min-height: 26px; display: flex; align-items: center; padding: 3px 0; }
 .reasoning-trigger { display: flex; align-items: center; gap: 5px; cursor: pointer; outline-offset: 3px; }
 .reasoning-trigger:focus-visible { outline: 2px solid var(--accent); }
-.reasoning-trigger > span { color: var(--muted); font-family: "Space Grotesk", "Segoe UI", sans-serif; font-size: 9.5px; font-weight: 800; text-transform: uppercase; letter-spacing: .05em; }
+.reasoning-trigger > span { color: var(--muted); font-family: "Space Grotesk", "Segoe UI", sans-serif; font-size: 9.5px; font-weight: 750; }
 .reasoning-trigger > .reasoning-summary-meta { color: var(--faint); font-size: 9px; font-weight: 500; text-transform: none; letter-spacing: 0; }
 /* Mid-turn assistant output renders like the final assistant message, not as a
    process card. */
-.step-message { position: relative; }
-.step-message.assistant .message-text { max-width: 680px; color: var(--text); font-size: 13.5px; line-height: 1.72; overflow-wrap: anywhere; }
+.step-message { position: relative; padding: 7px 0 9px; }
 .process-hover-popover { position: fixed; z-index: 1000; box-sizing: border-box; width: min(680px, calc(100vw - 24px)); max-width: calc(100vw - 24px); max-height: min(520px, 70vh); overflow: auto; padding: 10px; border: 2px solid var(--border); color: var(--text); background: #ffffff; box-shadow: var(--shadow-3); user-select: text; }
 .process-hover-popover-heading { margin: 0 0 8px; color: var(--muted); font: 800 9px "Space Grotesk", "Segoe UI", sans-serif; letter-spacing: .08em; text-transform: uppercase; }
 .process-hover-reasoning pre { max-height: none; margin: 0; overflow: visible; color: #374151; font: 10.5px/1.65 var(--font-mono); white-space: pre-wrap; overflow-wrap: anywhere; user-select: text; }
 
-.tool-row { position: relative; width: min(660px, 100%); border: 2px solid var(--border); color: var(--text); background: #ffffff; font-family: "Space Grotesk", "Segoe UI", sans-serif; font-size: 10.5px; }
+.tool-row { position: relative; width: min(680px, 100%); color: var(--text); background: transparent; font-family: "Space Grotesk", "Segoe UI", sans-serif; font-size: 11px; }
 .tool-row-main { display: flex; align-items: stretch; }
-.tool-row-header { min-width: 0; min-height: 35px; flex: 1; display: flex; align-items: center; gap: 8px; padding: 6px 9px; list-style: none; }
+.tool-row-header { min-width: 0; min-height: 28px; flex: 1; display: flex; align-items: center; gap: 6px; padding: 3px 0; list-style: none; }
 .tool-row-header::-webkit-details-marker { display: none; }
 .tool-row-header { cursor: pointer; outline-offset: 3px; }
-.tool-row-header:hover { background: var(--accent-soft); }
+.tool-row-header:hover { background: linear-gradient(90deg, var(--accent-soft), transparent 72%); }
 .tool-row-header:focus-visible { outline: 2px solid var(--accent); }
-.tool-row-header svg { width: 15px; height: 15px; flex: 0 0 auto; color: var(--text); }
+.tool-row-header svg { width: 14px; height: 14px; flex: 0 0 auto; color: var(--text); }
 .tool-row-header strong { flex: 0 0 auto; font-weight: 800; }
-.tool-row-header code { min-width: 0; overflow: hidden; color: var(--muted); font: 10px var(--font-mono); text-overflow: ellipsis; white-space: nowrap; }
+.tool-row-header code { min-width: 0; overflow: hidden; color: var(--muted); font: 10.5px var(--font-mono); text-overflow: ellipsis; white-space: nowrap; }
 .process-status-dot { width: 6px; height: 6px; flex: 0 0 auto; border: 1px solid currentColor; border-radius: 50% !important; background: currentColor; }
 .process-status-dot.running { color: var(--accent-hover); background: var(--accent); animation: pulse 1.2s infinite; }
 .tool-status-dot.requested { color: #9ca3af; background: #d1d5db; }

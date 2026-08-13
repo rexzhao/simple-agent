@@ -26,6 +26,18 @@ function mockRect(element: Element, top: number, left = 80, width = 220, height 
 }
 
 describe('ProcessTimeline session tools', () => {
+	it('uses the shared assistant body and keeps iteration chrome outside it', () => {
+		const { container } = render(<ProcessTimeline steps={[
+			{ kind: 'output', id: 'output-1', text: 'Shared **markdown** body', iteration: 2 },
+		]} />)
+
+		const body = container.querySelector('.assistant-markdown')
+		expect(body).not.toBeNull()
+		expect(body?.textContent).toContain('Shared markdown body')
+		expect(body?.querySelector('.iteration-marker')).toBeNull()
+		expect(screen.getByLabelText('Agent iteration 2')).not.toBeNull()
+	})
+
 	it('uses a colored leading dot and accessible status instead of trailing status text', () => {
 		const { container } = render(<ProcessTimeline steps={[
 			tool({ id: 'requested', status: 'requested' }),
