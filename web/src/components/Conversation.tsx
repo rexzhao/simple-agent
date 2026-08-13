@@ -501,14 +501,9 @@ function assistantItemBelongsToActiveRun(item: SessionItem, activeRun: ActiveRun
 	const turnID = item.turn_id?.trim() ?? ''
 	const agentIteration = item.agent_iteration ?? 0
 	if (turnID && turnID === activeRun.turnID?.trim()) return true
-	if (Object.values(activeRun.assistantItemBindings ?? {}).some((binding) =>
-		binding.turnID === turnID && binding.agentIteration === agentIteration && binding.itemID === item.id,
-	)) return true
-	if (Object.values(activeRun.assistantTails ?? {}).some((tail) =>
-		tail.turnID === turnID && tail.agentIteration === agentIteration && tail.itemID === item.id,
-	)) return true
-	const indexed = turnID && agentIteration > 0 ? activeRun.assistantItems?.[`${turnID}:${agentIteration}`] : undefined
-	return indexed?.itemID === item.id
+	return Object.values(activeRun.messages ?? {}).some((message) =>
+		message.turnID === turnID && message.agentIteration === agentIteration && message.itemID === item.id,
+	)
 }
 
 function completionForAssistantItem(item: SessionItem, activeRun: ActiveRun | null, completions: ReadonlyMap<string, TurnCompletion>): TurnCompletion | undefined {
@@ -682,8 +677,8 @@ function ActiveProcessRow({ row, onCancelTool, sessionNames, workspaceRoot }: { 
 	// the event-backed presentation model; only a tail from this process row's
 	// current iteration suppresses its reasoning marker.
 	const lastStep = row.steps[row.steps.length - 1]
-	const assistantOutputStreaming = Boolean(run.assistantText) || Object.values(run.assistantTails ?? {}).some((tail) => {
-		return Boolean(tail.text) && (!lastStep || tail.agentIteration === lastStep.iteration)
+	const assistantOutputStreaming = Object.values(run.messages ?? {}).some((message) => {
+		return Boolean(message.text) && message.status === 'streaming' && (!lastStep || message.agentIteration === lastStep.iteration)
 	})
 	const tokenNote = row.isLast && run.totalTokens !== undefined && (
 		<div className="token-note">

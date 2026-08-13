@@ -145,16 +145,14 @@ func TestStreamCheckpointsVisibleAssistantOutputWithoutAppendingTwice(t *testing
 	if ready.Message.Content != "abc" {
 		t.Fatalf("final assistant content = %q, want abc", ready.Message.Content)
 	}
-	var deltas []model.TextDeltaEvent
+	var updates []model.AssistantMessageUpdatedEvent
 	for _, event := range got {
-		if delta, ok := event.(model.TextDeltaEvent); ok {
-			if delta.Text != "" {
-				deltas = append(deltas, delta)
-			}
+		if update, ok := event.(model.AssistantMessageUpdatedEvent); ok && update.Message.Content != "" {
+			updates = append(updates, update)
 		}
 	}
-	if len(deltas) != 3 || !deltas[0].DurableCheckpointed || deltas[1].DurableCheckpointed || !deltas[2].DurableCheckpointed {
-		t.Fatalf("delta checkpoint markers = %#v, want true,false,true", deltas)
+	if len(updates) != 2 || updates[0].Message.Content != "a" || updates[1].Message.Content != "abc" {
+		t.Fatalf("message updates = %#v, want snapshots at durable checkpoint boundaries", updates)
 	}
 }
 
@@ -178,18 +176,58 @@ func TestStreamStopsBeforeTransientDeltaWhenAssistantCheckpointFails(t *testing.
 		}
 	}
 	foundError := false
+	foundFailed := false
 	for _, event := range got {
 		if errEvent, ok := event.(model.ErrorEvent); ok && errEvent.Message == "persist assistant output" {
 			foundError = true
+		}
+		if failed, ok := event.(model.AssistantMessageFailedEvent); ok && failed.ItemID != "" && failed.Message.Content == "partial" {
+			foundFailed = true
 		}
 	}
 	if !foundError {
 		t.Fatalf("events = %#v, want persistence error", got)
 	}
+	if !foundFailed {
+		t.Fatalf("events = %#v, want failed assistant lifecycle terminal", got)
+	}
 	for _, event := range publisher.events {
 		if _, ok := event.(eventbus.AssistantReady); ok {
 			t.Fatalf("published AssistantReady after checkpoint failure")
 		}
+	}
+}
+
+func TestAssistantCheckpointDefersCumulativeSnapshotMaterializationUntilDue(t *testing.T) {
+	publisher := &checkpointingPublisher{fakePublisher: &fakePublisher{}}
+	checkpoint := newAssistantOutputCheckpoint(publisher, "turn-1", 1, "assistant-1", &AssistantCheckpointPolicy{
+		MinInterval: time.Hour,
+		MinNewRunes: 100,
+	})
+	materialized := 0
+	content := func(length int) func() string {
+		return func() string {
+			materialized++
+			return strings.Repeat("a", length)
+		}
+	}
+
+	if _, committed, err := checkpoint(content(1), 1, true, false); err != nil || !committed {
+		t.Fatalf("first checkpoint = committed %v, err %v; want immediate commit", committed, err)
+	}
+	for length := 2; length <= 50; length++ {
+		if _, committed, err := checkpoint(content(length), length, true, false); err != nil || committed {
+			t.Fatalf("checkpoint at length %d = committed %v, err %v; want deferred", length, committed, err)
+		}
+	}
+	if materialized != 1 {
+		t.Fatalf("materialized snapshots = %d, want only the first committed snapshot", materialized)
+	}
+	if _, committed, err := checkpoint(content(50), 50, true, true); err != nil || !committed {
+		t.Fatalf("forced checkpoint = committed %v, err %v; want commit", committed, err)
+	}
+	if materialized != 2 {
+		t.Fatalf("materialized snapshots = %d, want first and forced snapshots", materialized)
 	}
 }
 
@@ -215,7 +253,7 @@ func TestStreamDoesNotCheckpointModelOnlyReasoning(t *testing.T) {
 	firstErrorEvent(t, got)
 }
 
-func TestStreamBindsReasoningDeltasToPreallocatedAssistantItem(t *testing.T) {
+func TestStreamBindsReasoningSnapshotsToPreallocatedAssistantItem(t *testing.T) {
 	provider := &fakeProvider{turns: [][]model.Event{{
 		model.ReasoningDeltaEvent{Text: "inspect first"},
 		model.TextDeltaEvent{Text: "final answer"},
@@ -240,14 +278,14 @@ func TestStreamBindsReasoningDeltasToPreallocatedAssistantItem(t *testing.T) {
 		t.Fatalf("AssistantReady = %#v, want an assistant item identity", ready)
 	}
 	for _, event := range got {
-		if reasoning, ok := event.(model.ReasoningDeltaEvent); ok {
-			if reasoning.AssistantItemID != ready.ItemID {
-				t.Fatalf("reasoning item id = %q, want AssistantReady item id %q", reasoning.AssistantItemID, ready.ItemID)
+		if update, ok := event.(model.AssistantMessageUpdatedEvent); ok && update.Message.ReasoningContent != "" {
+			if update.ItemID != ready.ItemID {
+				t.Fatalf("reasoning snapshot item id = %q, want AssistantReady item id %q", update.ItemID, ready.ItemID)
 			}
 			return
 		}
 	}
-	t.Fatalf("events = %#v, want a reasoning delta", got)
+	t.Fatalf("events = %#v, want a reasoning message snapshot", got)
 }
 
 func TestStreamGivesEachAssistantIterationItsOwnItemIdentity(t *testing.T) {

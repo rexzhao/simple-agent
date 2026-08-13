@@ -7,15 +7,18 @@ import (
 )
 
 func TestSubscriptionEventRejectsUnknownAndVariantFields(t *testing.T) {
-	valid := json.RawMessage(`{"type":"text.delta","session_id":"session-1","run_id":"run-1","run_cursor":"2","turn_id":"turn-1","agent_iteration":1,"item_id":"item-1","delta":"hello"}`)
+	valid := json.RawMessage(`{"type":"assistant.message.updated","session_id":"session-1","run_id":"run-1","run_cursor":"2","turn_id":"turn-1","agent_iteration":1,"item_id":"item-1","message_revision":"1","content":"hello"}`)
 	if err := ValidateSubscriptionEvent(valid); err != nil {
 		t.Fatalf("valid event rejected: %v", err)
 	}
 	for name, raw := range map[string]json.RawMessage{
-		"unknown field":       json.RawMessage(`{"type":"text.delta","session_id":"session-1","run_id":"run-1","run_cursor":"2","turn_id":"turn-1","agent_iteration":1,"item_id":"item-1","delta":"hello","future":true}`),
-		"noncanonical cursor": json.RawMessage(`{"type":"text.delta","session_id":"session-1","run_id":"run-1","run_cursor":"02","turn_id":"turn-1","agent_iteration":1,"item_id":"item-1","delta":"hello"}`),
-		"wrong variant field": json.RawMessage(`{"type":"text.delta","session_id":"session-1","run_id":"run-1","run_cursor":"2","turn_id":"turn-1","agent_iteration":1,"item_id":"item-1","delta":"hello","name":"shell"}`),
-		"null boolean":        json.RawMessage(`{"type":"tool.finished","session_id":"session-1","run_id":"run-1","run_cursor":"2","turn_id":"turn-1","agent_iteration":1,"tool_call_id":"call-1","name":"shell","is_error":null}`),
+		"unknown field":         json.RawMessage(`{"type":"assistant.message.updated","session_id":"session-1","run_id":"run-1","run_cursor":"2","turn_id":"turn-1","agent_iteration":1,"item_id":"item-1","message_revision":"1","content":"hello","future":true}`),
+		"noncanonical cursor":   json.RawMessage(`{"type":"assistant.message.updated","session_id":"session-1","run_id":"run-1","run_cursor":"02","turn_id":"turn-1","agent_iteration":1,"item_id":"item-1","message_revision":"1","content":"hello"}`),
+		"wrong variant field":   json.RawMessage(`{"type":"assistant.message.updated","session_id":"session-1","run_id":"run-1","run_cursor":"2","turn_id":"turn-1","agent_iteration":1,"item_id":"item-1","message_revision":"1","content":"hello","name":"shell"}`),
+		"null boolean":          json.RawMessage(`{"type":"tool.finished","session_id":"session-1","run_id":"run-1","run_cursor":"2","turn_id":"turn-1","agent_iteration":1,"tool_call_id":"call-1","name":"shell","is_error":null}`),
+		"missing content":       json.RawMessage(`{"type":"assistant.message.updated","session_id":"session-1","run_id":"run-1","run_cursor":"2","turn_id":"turn-1","agent_iteration":1,"item_id":"item-1","message_revision":"1"}`),
+		"leading zero revision": json.RawMessage(`{"type":"assistant.message.updated","session_id":"session-1","run_id":"run-1","run_cursor":"2","turn_id":"turn-1","agent_iteration":1,"item_id":"item-1","message_revision":"01","content":"x"}`),
+		"invalid tool call":     json.RawMessage(`{"type":"assistant.message.updated","session_id":"session-1","run_id":"run-1","run_cursor":"2","turn_id":"turn-1","agent_iteration":1,"item_id":"item-1","message_revision":"1","content":"x","tool_calls":[{"id":"","name":"shell","future":true}]}`),
 	} {
 		t.Run(name, func(t *testing.T) {
 			if err := ValidateSubscriptionEvent(raw); err == nil {
@@ -27,8 +30,8 @@ func TestSubscriptionEventRejectsUnknownAndVariantFields(t *testing.T) {
 
 func TestSubscriptionEventMarshalRejectsVariantFieldsAndNilWatermarkItems(t *testing.T) {
 	if _, err := json.Marshal(TransientSubscriptionEvent{
-		Type: SubscriptionEventTextDelta, SessionID: "session-1", RunID: "run-1", RunCursor: "1",
-		TurnID: "turn-1", AgentIteration: 1, ItemID: "item-1", Delta: "hello", Name: "unexpected",
+		Type: SubscriptionEventAssistantMessageUpdated, SessionID: "session-1", RunID: "run-1", RunCursor: "1",
+		TurnID: "turn-1", AgentIteration: 1, ItemID: "item-1", MessageRevision: "1", AssistantContent: "hello", Name: "unexpected",
 	}); err == nil {
 		t.Fatal("typed event with a variant-only field was marshaled")
 	}
@@ -84,8 +87,8 @@ func TestTurnFailedEventIsTypedAndBounded(t *testing.T) {
 	if err := ValidateSubscriptionEvent(json.RawMessage(`{"type":"turn.failed","session_id":"session-1","run_id":"run-1","run_cursor":"4","turn_id":"turn-1","code":"provider_error","message":"` + strings.Repeat("x", MaxTransientFailureMessageRunes+1) + `"}`)); err == nil {
 		t.Fatal("oversized turn.failed message was accepted")
 	}
-	if err := ValidateSubscriptionEvent(json.RawMessage(`{"type":"text.delta","session_id":"session-1","run_id":"run-1","run_cursor":"4","turn_id":"turn-1","agent_iteration":1,"item_id":"item-1","delta":"ok","code":"provider_error"}`)); err == nil {
-		t.Fatal("turn.failed-only code field was accepted on text.delta")
+	if err := ValidateSubscriptionEvent(json.RawMessage(`{"type":"assistant.message.updated","session_id":"session-1","run_id":"run-1","run_cursor":"4","turn_id":"turn-1","agent_iteration":1,"item_id":"item-1","message_revision":"1","content":"ok","code":"provider_error"}`)); err == nil {
+		t.Fatal("turn.failed-only code field was accepted on assistant.message.updated")
 	}
 }
 

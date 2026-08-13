@@ -79,6 +79,31 @@ describe('session-content repository selectors', () => {
     expect(Object.keys(view)).not.toContain('generation')
   })
 
+  it('keeps durable content when a terminal lifecycle omitted its only snapshot', () => {
+    const replica = new LocalReplica()
+    const syncRepository = new SyncSessionContentRepository(replica)
+    const repository = new SessionContentRepository(syncRepository)
+    const resource = { type: 'session_content' as const, id: 'session_a' }
+    const initial = snapshot(resource.id) as any
+    initial.session.status = 'running'
+    initial.session.running_run_id = 'run_a'
+    initial.session.running_turn_id = 'turn_a'
+    initial.history.items = [{
+      key: { turn_id: 'turn_a', agent_iteration: 1, item_id: 'item_large' }, seq: 1,
+      created_at: '2025-01-01T00:00:00Z', kind: 'message', visibility: 'visible', audience: 'user', status: 'completed',
+      message: { role: 'assistant', content: { inline: 'durable large response' } },
+    }]
+    initial.history.descriptor = { ...initial.history.descriptor, oldest_item_seq: '1', newest_item_seq: '1' }
+    initial.active_run = { run_id: 'run_a', session_id: 'session_a', turn_id: 'turn_a', started_at: '2025-01-01T00:00:00Z', status: 'running', recoverable: true, run_epoch: 'epoch_a', run_cursor: '0', replay_available: false, recovery_required: false }
+    const adapter = new SessionContentAdapter(resource.id)
+    replica.applySnapshot(resource, adapter, initial, { streamEpoch: 'stream_1', sequence: '1' as Sequence, resourceRevision: '1', generation: 1 })
+    replica.applyTransient(resource, adapter, { type: 'run.started', session_id: 'session_a', run_id: 'run_a', run_cursor: '1', status: 'running' } as SubscriptionEventData, 1)
+    replica.applyTransient(resource, adapter, { type: 'assistant.message.started', session_id: 'session_a', run_id: 'run_a', run_cursor: '2', turn_id: 'turn_a', agent_iteration: 1, item_id: 'item_large', message_revision: '0' } as SubscriptionEventData, 1)
+    replica.applyTransient(resource, adapter, { type: 'assistant.message.completed', session_id: 'session_a', run_id: 'run_a', run_cursor: '3', turn_id: 'turn_a', agent_iteration: 1, item_id: 'item_large', message_revision: '1', snapshot_omitted: true } as SubscriptionEventData, 1)
+
+    expect(repository.get(resource.id).history.items[0].message?.content?.inline).toBe('durable large response')
+  })
+
   it('observes terminal and durable run identities without requiring an active row', async () => {
     const replica = new LocalReplica()
     const syncRepository = new SyncSessionContentRepository(replica)

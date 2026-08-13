@@ -228,11 +228,12 @@ func run(ctx context.Context, request model.Request, options Options, maxTurns i
 		events <- model.AgentIterationStartedEvent{Iteration: iteration}
 
 		assistantItemID := newAssistantItemID()
+		events <- model.AssistantMessageStartedEvent{ItemID: assistantItemID, AgentIteration: iteration}
 		var checkpoint assistantOutputCheckpoint
 		if publisher, ok := options.Publisher.(eventbus.AssistantCheckpointPublisher); ok {
 			checkpoint = newAssistantOutputCheckpoint(publisher, turnID, iteration, assistantItemID, options.AssistantCheckpoint)
 		}
-		assistantContent, reasoningContent, toolCalls, responseState, stopped := streamModelTurn(ctx, options.Provider, request, events, assistantItemID, checkpoint)
+		assistantContent, reasoningContent, toolCalls, responseState, messageRevision, stopped := streamModelTurn(ctx, options.Provider, request, events, assistantItemID, iteration, checkpoint)
 		if stopped {
 			return
 		}
@@ -245,12 +246,18 @@ func run(ctx context.Context, request model.Request, options Options, maxTurns i
 			ResponseState:    responseState,
 		}
 		if len(toolCalls) == 0 && strings.TrimSpace(assistantContent) == "" {
+			events <- model.AssistantMessageFailedEvent{ItemID: assistantItemID, AgentIteration: iteration, Revision: messageRevision + 1, Message: assistantMessage}
 			events <- model.ErrorEvent{Err: fmt.Errorf("agent returned empty final response")}
 			return
 		}
-		if !publishDurable(events, options.Publisher, eventbus.AssistantReady{TurnID: turnID, AgentIteration: iteration, ItemID: assistantItemID, Message: assistantMessage}, "persist assistant") {
-			return
+		if options.Publisher != nil {
+			if err := options.Publisher.Publish(eventbus.AssistantReady{TurnID: turnID, AgentIteration: iteration, ItemID: assistantItemID, Message: assistantMessage}); err != nil {
+				events <- model.AssistantMessageFailedEvent{ItemID: assistantItemID, AgentIteration: iteration, Revision: messageRevision + 1, Message: assistantMessage}
+				events <- model.ErrorEvent{Err: err, Message: "persist assistant"}
+				return
+			}
 		}
+		events <- model.AssistantMessageCompletedEvent{ItemID: assistantItemID, AgentIteration: iteration, Revision: messageRevision + 1, Message: assistantMessage}
 		messages = append(messages, assistantMessage)
 		if len(toolCalls) == 0 {
 			// Checkpoint: after a no-tool assistant response, drain queued active
@@ -392,7 +399,7 @@ func newAssistantItemID() string {
 	return fmt.Sprintf("assistant-%d-%d", time.Now().UnixNano(), atomic.AddUint64(&assistantFallbackID, 1))
 }
 
-type assistantOutputCheckpoint func(content string, force bool) (length int, committed bool, err error)
+type assistantOutputCheckpoint func(content func() string, length int, hasNonWhitespace bool, force bool) (committedLength int, committed bool, err error)
 
 func newAssistantOutputCheckpoint(publisher eventbus.AssistantCheckpointPublisher, turnID string, iteration int, itemID string, policy *AssistantCheckpointPolicy) assistantOutputCheckpoint {
 	if publisher == nil {
@@ -404,11 +411,10 @@ func newAssistantOutputCheckpoint(publisher eventbus.AssistantCheckpointPublishe
 	}
 	lastLength := 0
 	lastCheckpointAt := time.Time{}
-	return func(content string, force bool) (int, bool, error) {
-		if strings.TrimSpace(content) == "" {
+	return func(content func() string, length int, hasNonWhitespace bool, force bool) (int, bool, error) {
+		if !hasNonWhitespace {
 			return lastLength, false, nil
 		}
-		length := runeCount(content)
 		if length == lastLength && lastLength > 0 {
 			return lastLength, false, nil
 		}
@@ -420,7 +426,7 @@ func newAssistantOutputCheckpoint(publisher eventbus.AssistantCheckpointPublishe
 				return lastLength, false, nil
 			}
 		}
-		if err := publisher.PublishAssistantCheckpoint(turnID, iteration, itemID, content); err != nil {
+		if err := publisher.PublishAssistantCheckpoint(turnID, iteration, itemID, content()); err != nil {
 			return lastLength, false, err
 		}
 		lastLength = length
@@ -429,35 +435,70 @@ func newAssistantOutputCheckpoint(publisher eventbus.AssistantCheckpointPublishe
 	}
 }
 
-func runeCount(value string) int {
-	return len([]rune(value))
-}
-
-func streamModelTurn(ctx context.Context, provider model.Provider, request model.Request, out chan<- model.Event, assistantItemID string, checkpoint assistantOutputCheckpoint) (string, string, []model.ToolCall, *model.ResponseState, bool) {
+func streamModelTurn(ctx context.Context, provider model.Provider, request model.Request, out chan<- model.Event, assistantItemID string, agentIteration int, checkpoint assistantOutputCheckpoint) (string, string, []model.ToolCall, *model.ResponseState, uint64, bool) {
 	var assistantContent strings.Builder
+	var assistantRunes int
+	var assistantHasNonWhitespace bool
 	var reasoningContent strings.Builder
 	var toolCalls []model.ToolCall
 	var responseState *model.ResponseState
+	var messageRevision uint64
+	var lastPublishedBytes int
+	var lastPublishedAt time.Time
+	const snapshotPublishBytes = 16 * 1024
+	const snapshotPublishInterval = 50 * time.Millisecond
+	messageSnapshot := func() model.Message {
+		return model.Message{
+			Role: model.MessageRoleAssistant, Content: assistantContent.String(), ReasoningContent: reasoningContent.String(),
+			ToolCalls: append([]model.ToolCall(nil), toolCalls...), ResponseState: responseState,
+		}
+	}
+	messageBytes := func() int {
+		total := assistantContent.Len() + reasoningContent.Len()
+		for _, call := range toolCalls {
+			total += len(call.ID) + len(call.Name) + len(call.Arguments)
+		}
+		return total
+	}
+	publishMessageUpdate := func(force bool) {
+		now := time.Now()
+		currentBytes := messageBytes()
+		if !force && currentBytes == lastPublishedBytes {
+			return
+		}
+		if !force && messageRevision > 0 && currentBytes-lastPublishedBytes < snapshotPublishBytes && now.Sub(lastPublishedAt) < snapshotPublishInterval {
+			return
+		}
+		messageRevision++
+		out <- model.AssistantMessageUpdatedEvent{
+			ItemID: assistantItemID, AgentIteration: agentIteration, Revision: messageRevision,
+			Message: messageSnapshot(),
+		}
+		lastPublishedBytes = currentBytes
+		lastPublishedAt = now
+	}
+	publishMessageFailure := func() {
+		messageRevision++
+		out <- model.AssistantMessageFailedEvent{ItemID: assistantItemID, AgentIteration: agentIteration, Revision: messageRevision, Message: messageSnapshot()}
+	}
 	const maxAttempts = 5
 	var idleRetried bool
-	lastDurableTextLength := 0
 	flushAssistant := func() error {
 		if checkpoint == nil || assistantContent.Len() == 0 {
 			return nil
 		}
-		length, _, err := checkpoint(assistantContent.String(), true)
-		if err == nil {
-			lastDurableTextLength = length
-		}
+		_, _, err := checkpoint(assistantContent.String, assistantRunes, assistantHasNonWhitespace, true)
 		return err
 	}
-	failAfterPartialOutput := func(err error, message string) (string, string, []model.ToolCall, *model.ResponseState, bool) {
+	failAfterPartialOutput := func(err error, message string) (string, string, []model.ToolCall, *model.ResponseState, uint64, bool) {
 		if flushErr := flushAssistant(); flushErr != nil {
+			publishMessageFailure()
 			out <- model.ErrorEvent{Err: flushErr, Message: "persist assistant output"}
-			return assistantContent.String(), reasoningContent.String(), nil, nil, true
+			return assistantContent.String(), reasoningContent.String(), nil, nil, messageRevision, true
 		}
+		publishMessageFailure()
 		out <- model.ErrorEvent{Err: err, Message: message}
-		return assistantContent.String(), reasoningContent.String(), nil, nil, true
+		return assistantContent.String(), reasoningContent.String(), nil, nil, messageRevision, true
 	}
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		stream, err := provider.Stream(ctx, request)
@@ -489,36 +530,28 @@ func streamModelTurn(ctx context.Context, provider model.Provider, request model
 			case model.TextDeltaEvent:
 				madeProgress = true
 				assistantContent.WriteString(event.Text)
+				assistantRunes += utf8.RuneCountInString(event.Text)
+				assistantHasNonWhitespace = assistantHasNonWhitespace || strings.TrimSpace(event.Text) != ""
 				checkpointed := false
 				if checkpoint != nil {
-					length, committed, err := checkpoint(assistantContent.String(), false)
+					_, checkpointed, err = checkpoint(assistantContent.String, assistantRunes, assistantHasNonWhitespace, false)
 					if err != nil {
+						publishMessageFailure()
 						out <- model.ErrorEvent{Err: err, Message: "persist assistant output"}
-						return assistantContent.String(), reasoningContent.String(), nil, nil, true
+						return assistantContent.String(), reasoningContent.String(), nil, nil, messageRevision, true
 					}
-					lastDurableTextLength = length
-					checkpointed = committed
 				}
-				if checkpoint != nil {
-					event.AssistantItemID = assistantItemID
-					event.DurableTextLength = lastDurableTextLength
-					event.DurableCheckpointed = checkpointed
-					outputEvent = event
-				}
+				publishMessageUpdate(checkpointed)
 			case model.ReasoningDeltaEvent:
 				madeProgress = true
 				reasoningContent.WriteString(event.Text)
-				// The assistant item is allocated before the provider stream
-				// starts. Carry that identity on every reasoning delta just as
-				// the visible text deltas carry it, so replay can reconcile the
-				// transient step with the durable assistant projection.
-				event.AssistantItemID = assistantItemID
-				outputEvent = event
+				publishMessageUpdate(false)
 			case model.ToolCallDeltaEvent:
 				madeProgress = true
 			case model.ToolCallDoneEvent:
 				madeProgress = true
 				toolCalls = append(toolCalls, event.ToolCall)
+				publishMessageUpdate(true)
 			case model.MessageDoneEvent, model.UsageEvent:
 				madeProgress = true
 			case model.ResponseStateEvent:
@@ -556,10 +589,11 @@ func streamModelTurn(ctx context.Context, provider model.Provider, request model
 			return failAfterPartialOutput(err, "stream model")
 		}
 		if err := flushAssistant(); err != nil {
+			publishMessageFailure()
 			out <- model.ErrorEvent{Err: err, Message: "persist assistant output"}
-			return assistantContent.String(), reasoningContent.String(), nil, nil, true
+			return assistantContent.String(), reasoningContent.String(), nil, nil, messageRevision, true
 		}
-		return assistantContent.String(), reasoningContent.String(), toolCalls, responseState, false
+		return assistantContent.String(), reasoningContent.String(), toolCalls, responseState, messageRevision, false
 	}
 	panic("unreachable")
 }

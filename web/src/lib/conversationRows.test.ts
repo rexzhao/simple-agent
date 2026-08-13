@@ -29,6 +29,10 @@ function run(overrides: Partial<ActiveRun> = {}): ActiveRun {
   }
 }
 
+function live(turnID: string, agentIteration: number, itemID: string, text: string): NonNullable<ActiveRun['messages']> {
+  return { [JSON.stringify([turnID, agentIteration, itemID])]: { turnID, agentIteration, itemID, revision: '1', status: 'streaming', text } }
+}
+
 function keys(rows: ReturnType<typeof buildConversationRows>): string[] {
   return rows.map((row) => row.key)
 }
@@ -214,7 +218,7 @@ describe('buildConversationRows stable identities', () => {
     expect(new Set(keys(first)).size).toBe(first.length)
   })
 
-  it('attaches an uncheckpointed tail to the loaded durable assistant item', () => {
+  it('marks the loaded durable assistant item as the same streaming entity', () => {
     const durable = item('assistant-1', 2, 'assistant', 'a', {
       turn_id: 'turn-live',
       agent_iteration: 1,
@@ -223,24 +227,23 @@ describe('buildConversationRows stable identities', () => {
       sessionID: 'session-1',
       items: [durable],
       activeRun: run({
-        assistantText: 'b',
-        assistantItems: { 'turn-live:1': { itemID: 'assistant-1', durableTextLength: 1 } },
+        messages: live('turn-live', 1, 'assistant-1', 'ab'),
       }),
     })
     const messages = rows.filter((row) => row.kind === 'message')
     expect(messages).toHaveLength(1)
-    expect(messages[0]).toMatchObject({ item: { id: 'assistant-1' }, assistantTail: 'b' })
+    expect(messages[0]).toMatchObject({ item: { id: 'assistant-1' }, assistantStreaming: true })
     expect(rows.filter((row) => row.kind === 'active-process')).toHaveLength(0)
 
     const afterCheckpoint = buildConversationRows({
       sessionID: 'session-1',
       items: [item('assistant-1', 2, 'assistant', 'ab', { turn_id: 'turn-live', agent_iteration: 1 })],
       activeRun: run({
-        assistantItems: { 'turn-live:1': { itemID: 'assistant-1', durableTextLength: 2 } },
+        messages: live('turn-live', 1, 'assistant-1', 'ab'),
       }),
     })
     expect(afterCheckpoint.filter((row) => row.kind === 'message')).toHaveLength(1)
-    expect(afterCheckpoint.filter((row) => row.kind === 'message')[0]).toMatchObject({ assistantTail: undefined })
+    expect(afterCheckpoint.filter((row) => row.kind === 'message')[0]).toMatchObject({ assistantStreaming: true })
   })
 
   it('does not double-render a durable tool while retaining transient reasoning', () => {
@@ -347,7 +350,7 @@ describe('buildConversationRows stable identities', () => {
         turnID: 'turn-live',
         agentIteration: 1,
         steps: [{ kind: 'reasoning', id: 'reasoning-live', text: 'stale transient copy.', iteration: 1, turnID: 'turn-live', itemID: 'assistant-1' }],
-        assistantItems: { 'turn-live:1': { itemID: 'assistant-1', durableTextLength: 6 } },
+        messages: live('turn-live', 1, 'assistant-1', 'answer'),
       }),
     })
 
@@ -387,11 +390,11 @@ describe('buildConversationRows stable identities', () => {
           { kind: 'reasoning', id: 'current-transient', text: 'current not durable yet', iteration: 2, turnID: 'turn-current', itemID: 'assistant-current-2' },
           { kind: 'tool', id: 'current-tool', name: 'shell', status: 'requested', iteration: 2 },
         ],
-        assistantItems: {
-          'turn-old:1': { itemID: 'assistant-old-1', durableTextLength: 12 },
-          'turn-old:2': { itemID: 'assistant-old-2', durableTextLength: 12 },
-          'turn-current:1': { itemID: 'assistant-current', durableTextLength: 14 },
-        },
+		messages: {
+			...live('turn-old', 1, 'assistant-old-1', 'old answer 1'),
+			...live('turn-old', 2, 'assistant-old-2', 'old answer 2'),
+			...live('turn-current', 1, 'assistant-current', 'current answer'),
+		},
       }),
     })
 
@@ -417,7 +420,7 @@ describe('buildConversationRows stable identities', () => {
       })],
       activeRun: run({
         steps: [{ kind: 'reasoning', id: 'other-item', text: 'same reasoning', iteration: 1, turnID: 'turn-live', itemID: 'assistant-other' }],
-        assistantItems: { 'turn-live:1': { itemID: 'assistant-durable', durableTextLength: 6 } },
+        messages: live('turn-live', 1, 'assistant-durable', 'answer'),
       }),
     })
 
@@ -439,7 +442,6 @@ describe('buildConversationRows stable identities', () => {
         turnID: 'turn-current',
         agentIteration: 1,
         steps: [{ kind: 'reasoning', id: 'old-transient', text: 'old transient', iteration: 1, turnID: 'turn-old', itemID: 'assistant-old' }],
-        assistantItems: { 'turn-old:1': { itemID: 'assistant-old', durableTextLength: 10 } },
       }),
     })
 
@@ -468,7 +470,7 @@ describe('buildConversationRows stable identities', () => {
           { kind: 'reasoning', id: 'reasoning-current', text: 'Current turn reasoning.', iteration: 1 },
         ],
         processBoundaries: [{ id: 'prompt-boundary', stepIndex: 1 }],
-        assistantItems: { 'turn-current:1': { itemID: 'assistant-current', durableTextLength: 6 } },
+        messages: live('turn-current', 1, 'assistant-current', 'answer'),
       }),
     })
 
@@ -512,12 +514,11 @@ describe('buildConversationRows stable identities', () => {
       sessionID: 'session-1',
       items: [],
       activeRun: run({
-        assistantText: 'tail',
-        assistantItems: { 'turn-live:1': { itemID: 'assistant-not-on-page', durableTextLength: 1 } },
+        messages: live('turn-live', 1, 'assistant-not-on-page', 'tail'),
       }),
     })
-    expect(rows.filter((row) => row.kind === 'message')).toHaveLength(0)
-    expect(rows.filter((row) => row.kind === 'active-cursor')).toHaveLength(1)
+		expect(rows.filter((row) => row.kind === 'active-assistant')).toHaveLength(1)
+		expect(rows.filter((row) => row.kind === 'active-cursor')).toHaveLength(0)
     expect(rows.filter((row) => row.kind === 'active-process')).toHaveLength(0)
   })
 

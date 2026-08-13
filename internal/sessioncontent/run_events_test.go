@@ -14,8 +14,8 @@ func TestSubscriptionEventFromExecutionMapsLiveRunSemantics(t *testing.T) {
 		wantType   protocol.SubscriptionEventType
 		wantItemID string
 	}{
-		{"text", execution.NewSessionStreamEvent("text.delta", map[string]any{"turn_id": "turn-1", "agent_iteration": 1, "item_id": "item-1", "text": "hello"}), protocol.SubscriptionEventTextDelta, "item-1"},
-		{"reasoning", execution.NewSessionStreamEvent("reasoning.delta", map[string]any{"turn_id": "turn-1", "agent_iteration": 1, "item_id": "item-1", "text": "think"}), protocol.SubscriptionEventReasoningDelta, "item-1"},
+		{"started", execution.NewSessionStreamEvent("assistant.message.started", map[string]any{"turn_id": "turn-1", "agent_iteration": 1, "item_id": "item-1", "message_revision": "0"}), protocol.SubscriptionEventAssistantMessageStarted, "item-1"},
+		{"updated", execution.NewSessionStreamEvent("assistant.message.updated", map[string]any{"turn_id": "turn-1", "agent_iteration": 1, "item_id": "item-1", "message_revision": "1", "content": "hello", "reasoning": "think", "tool_calls": []map[string]any{}}), protocol.SubscriptionEventAssistantMessageUpdated, "item-1"},
 		{"requested", execution.NewSessionStreamEvent("tool.requested", map[string]any{"turn_id": "turn-1", "agent_iteration": 1, "tool_call_id": "call-1", "name": "shell", "arguments": "{}"}), protocol.SubscriptionEventToolRequested, ""},
 		{"running", execution.NewSessionStreamEvent("tool.started", map[string]any{"turn_id": "turn-1", "agent_iteration": 1, "tool_call_id": "call-1", "name": "shell"}), protocol.SubscriptionEventToolRunning, ""},
 		{"progress", execution.NewSessionStreamEvent("tool.progress", map[string]any{"turn_id": "turn-1", "agent_iteration": 1, "tool_call_id": "call-1", "name": "shell", "arguments_delta": "x"}), protocol.SubscriptionEventToolProgress, ""},
@@ -44,12 +44,25 @@ func TestSubscriptionEventFromExecutionMapsLiveRunSemantics(t *testing.T) {
 	}
 }
 
-func TestSubscriptionEventFromExecutionRejectsTextWithoutStableItem(t *testing.T) {
-	_, ok, err := subscriptionEventFromExecution(execution.NewSessionStreamEvent("text.delta", map[string]any{
-		"turn_id": "turn-1", "agent_iteration": 1, "text": "cannot fabricate an id",
+func TestSubscriptionEventFromExecutionRejectsMessageWithoutStableItem(t *testing.T) {
+	_, ok, err := subscriptionEventFromExecution(execution.NewSessionStreamEvent("assistant.message.updated", map[string]any{
+		"turn_id": "turn-1", "agent_iteration": 1, "message_revision": "1", "content": "cannot fabricate an id",
 	}), "session-1", "run-1")
 	if ok || err == nil {
 		t.Fatalf("text without item identity = ok %t, err %v; want conservative rejection", ok, err)
+	}
+}
+
+func TestSubscriptionEventFromExecutionPreservesOmittedTerminalSnapshot(t *testing.T) {
+	got, ok, err := subscriptionEventFromExecution(execution.NewSessionStreamEvent("assistant.message.completed", map[string]any{
+		"turn_id": "turn-1", "agent_iteration": 1, "item_id": "item-1", "message_revision": "2", "snapshot_omitted": true,
+	}), "session-1", "run-1")
+	if err != nil || !ok || !got.SnapshotOmitted || got.AssistantContent != "" || got.ToolCalls != nil {
+		t.Fatalf("mapped omitted terminal = %#v/%t/%v", got, ok, err)
+	}
+	got.RunCursor = "1"
+	if err := got.Validate(); err != nil {
+		t.Fatalf("omitted terminal validation: %v", err)
 	}
 }
 

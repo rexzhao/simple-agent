@@ -149,7 +149,7 @@ describe('session-content transient runtime path', () => {
     runtime.stop()
   })
 
-  it('routes transient events without ACK, merges keyed text, and clears the tail when durable content covers it', async () => {
+  it('routes revisioned message snapshots without ACK and reconciles durable content', async () => {
     const transport = new FakeTransport()
     const runtime = new SyncRuntime({ transport })
     runtime.subscribe({ type: 'session_content', id: 'session_a' }, { retainOnRelease: true })
@@ -161,19 +161,19 @@ describe('session-content transient runtime path', () => {
 
     const ackCount = transport.sent.filter((message) => message.type === 'ack').length
     transport.emit(event(first.payload.subscription_id, 'session_a', '1', { type: 'run.started', status: 'running' }))
-    transport.emit(event(first.payload.subscription_id, 'session_a', '2', { type: 'text.delta', turn_id: 'turn_a', agent_iteration: 1, item_id: 'item_a', delta: 'tail', durable_text_length: 4, durable_checkpointed: false }))
+    transport.emit(event(first.payload.subscription_id, 'session_a', '2', { type: 'assistant.message.updated', turn_id: 'turn_a', agent_iteration: 1, item_id: 'item_a', message_revision: '1', content: 'basetail', tool_calls: [] }))
     const stateAfterText = runtime.replica.get<SessionContentState>({ type: 'session_content', id: 'session_a' }).value!
-    expect(stateAfterText.transientRun?.text[JSON.stringify(['turn_a', 1, 'item_a'])].text).toBe('tail')
+    expect(stateAfterText.transientRun?.messages[JSON.stringify(['turn_a', 1, 'item_a'])].message.content?.inline).toBe('basetail')
     expect(transport.sent.filter((message) => message.type === 'ack')).toHaveLength(ackCount)
 
     const repository = new SessionContentRepository(runtime.replica)
     expect(repository.get('session_a').history.items[0].message?.content?.inline).toBe('basetail')
-    transport.emit(event(first.payload.subscription_id, 'session_a', '3', { type: 'text.delta', turn_id: 'turn_a', agent_iteration: 1, item_id: 'item_a', delta: '!', durable_text_length: 9, durable_checkpointed: true }))
+    transport.emit(event(first.payload.subscription_id, 'session_a', '3', { type: 'assistant.message.updated', turn_id: 'turn_a', agent_iteration: 1, item_id: 'item_a', message_revision: '2', content: 'basetail!', tool_calls: [] }))
     expect(repository.get('session_a').history.items[0].message?.content?.inline).toBe('basetail!')
 
     transport.emit(change(first.payload.subscription_id, 'session_a', item('basetail!')))
     const afterDurable = runtime.replica.get<SessionContentState>({ type: 'session_content', id: 'session_a' }).value!
-    expect(afterDurable.transientRun?.text[JSON.stringify(['turn_a', 1, 'item_a'])]).toBeUndefined()
+    expect(afterDurable.transientRun?.messages[JSON.stringify(['turn_a', 1, 'item_a'])]).toBeDefined()
     expect(repository.get('session_a').history.items[0].message?.content?.inline).toBe('basetail!')
   })
 
@@ -191,7 +191,7 @@ describe('session-content transient runtime path', () => {
     liveTransport.emit(snapshot(liveSubscribe.payload.subscription_id, 'session_a', content('session_a')))
     await settleSnapshot()
     liveTransport.emit(event(liveSubscribe.payload.subscription_id, 'session_a', '1', { type: 'run.started', status: 'running' }, '2025-01-01T00:00:00.000Z'))
-    liveTransport.emit(event(liveSubscribe.payload.subscription_id, 'session_a', '2', { type: 'reasoning.delta', turn_id: 'turn_a', agent_iteration: 1, item_id: 'reasoning_a', delta: 'thinking' }, start))
+    liveTransport.emit(event(liveSubscribe.payload.subscription_id, 'session_a', '2', { type: 'assistant.message.updated', turn_id: 'turn_a', agent_iteration: 1, item_id: 'reasoning_a', message_revision: '1', content: '', reasoning: 'thinking', tool_calls: [] }, start))
     liveTransport.emit(event(liveSubscribe.payload.subscription_id, 'session_a', '3', { type: 'tool.requested', turn_id: 'turn_a', agent_iteration: 1, tool_call_id: 'tool_a', name: 'shell' }, end))
     const liveState = liveRuntime.replica.get<SessionContentState>({ type: 'session_content', id: 'session_a' }).value!
     expect(liveState.transientRun?.reasoningTimings?.[timingKey]).toEqual({ startedAt: start, endedAt: end })
@@ -210,7 +210,7 @@ describe('session-content transient runtime path', () => {
       content: { blob: { id: 'queued_blob', url: '/blob/queued', content_type: 'application/json', size: 1, sha256: 'a'.repeat(64), etag: 'a', expires_at: '2099-01-01T00:00:00Z' } },
     } }))
     queuedTransport.emit(event(queuedSubscribe.payload.subscription_id, 'session_a', '1', { type: 'run.started', status: 'running' }, '2025-01-01T00:00:00.000Z'))
-    queuedTransport.emit(event(queuedSubscribe.payload.subscription_id, 'session_a', '2', { type: 'reasoning.delta', turn_id: 'turn_a', agent_iteration: 1, item_id: 'reasoning_a', delta: 'thinking' }, start))
+    queuedTransport.emit(event(queuedSubscribe.payload.subscription_id, 'session_a', '2', { type: 'assistant.message.updated', turn_id: 'turn_a', agent_iteration: 1, item_id: 'reasoning_a', message_revision: '1', content: '', reasoning: 'thinking', tool_calls: [] }, start))
     queuedTransport.emit(event(queuedSubscribe.payload.subscription_id, 'session_a', '3', { type: 'tool.requested', turn_id: 'turn_a', agent_iteration: 1, tool_call_id: 'tool_a', name: 'shell' }, end))
     resolveBlob?.(content('session_a'))
     await settleSnapshot()
@@ -233,7 +233,7 @@ describe('session-content transient runtime path', () => {
     transport.emit(snapshot(b.payload.subscription_id, 'session_b', content('session_b')))
     await settleSnapshot()
     transport.emit(event(a.payload.subscription_id, 'session_a', '1', { type: 'run.started', status: 'running' }))
-    transport.emit(event(a.payload.subscription_id, 'session_a', '2', { type: 'text.delta', turn_id: 'turn_a', agent_iteration: 1, item_id: 'item_a', delta: 'A', durable_text_length: 4, durable_checkpointed: false }))
+    transport.emit(event(a.payload.subscription_id, 'session_a', '2', { type: 'assistant.message.updated', turn_id: 'turn_a', agent_iteration: 1, item_id: 'item_a', message_revision: '1', content: 'baseA', tool_calls: [] }))
     expect(runtime.replica.get<SessionContentState>({ type: 'session_content', id: 'session_b' }).value?.transientRun).toBeNull()
 
     transport.emitClose()
@@ -245,7 +245,7 @@ describe('session-content transient runtime path', () => {
     expect(resumed.payload.resume).toEqual({ stream_epoch: 'stream_1', sequence: '1' })
     expect(resumed.payload.active_run_resume).toEqual({ run_epoch: 'epoch_a', run_id: 'run_a', run_cursor: '2' })
 
-    transport.emit(event(a.payload.subscription_id, 'session_a', '3', { type: 'text.delta', turn_id: 'turn_a', agent_iteration: 1, item_id: 'item_a', delta: 'old', durable_text_length: 0, durable_checkpointed: false }), 1)
+    transport.emit(event(a.payload.subscription_id, 'session_a', '3', { type: 'assistant.message.updated', turn_id: 'turn_a', agent_iteration: 1, item_id: 'item_a', message_revision: '2', content: 'old', tool_calls: [] }), 1)
     expect(runtime.replica.get<SessionContentState>({ type: 'session_content', id: 'session_a' }).value?.transientRun?.runCursor).toBe('2')
   })
 
@@ -271,7 +271,7 @@ describe('session-content transient runtime path', () => {
       const record = runtime.replica.get<SessionContentState>(resource)
       observations.push({ readState: record.metadata.readState, hasOverlay: record.value?.transientRun !== null && record.value?.transientRun !== undefined })
     })
-    transport.emit(event(first.payload.subscription_id, 'session_a', '3', { type: 'text.delta', turn_id: 'turn_a', agent_iteration: 1, item_id: 'item_a', delta: 'gap', durable_text_length: 0, durable_checkpointed: false }))
+    transport.emit(event(first.payload.subscription_id, 'session_a', '3', { type: 'assistant.message.updated', turn_id: 'turn_a', agent_iteration: 1, item_id: 'item_a', message_revision: '1', content: 'gap', tool_calls: [] }))
     unsubscribe()
     const fresh = transport.lastSubscribe()
     expect(fresh.payload.resume).toBeUndefined()
@@ -295,13 +295,13 @@ describe('session-content transient runtime path', () => {
     // The snapshot advertises the server's latest cursor (5), but the client
     // has applied none of the replay yet. Cursor 1 must therefore be accepted.
     transport.emit(event(first.payload.subscription_id, 'session_a', '1', { type: 'run.started', status: 'running' }))
-    transport.emit(event(first.payload.subscription_id, 'session_a', '2', { type: 'text.delta', turn_id: 'turn_a', agent_iteration: 1, item_id: 'item_a', delta: 'replayed', durable_text_length: 4, durable_checkpointed: false }))
-    transport.emit(event(first.payload.subscription_id, 'session_a', '3', { type: 'text.delta', turn_id: 'turn_a', agent_iteration: 1, item_id: 'item_a', delta: '!', durable_text_length: 4, durable_checkpointed: false }))
+    transport.emit(event(first.payload.subscription_id, 'session_a', '2', { type: 'assistant.message.updated', turn_id: 'turn_a', agent_iteration: 1, item_id: 'item_a', message_revision: '1', content: 'replayed', tool_calls: [] }))
+    transport.emit(event(first.payload.subscription_id, 'session_a', '3', { type: 'assistant.message.updated', turn_id: 'turn_a', agent_iteration: 1, item_id: 'item_a', message_revision: '2', content: 'replayed!', tool_calls: [] }))
     transport.emit(event(first.payload.subscription_id, 'session_a', '4', { type: 'run.prompt_appended', prompts: ['prompt'] }))
     transport.emit(event(first.payload.subscription_id, 'session_a', '5', { type: 'run.prompt_queue', prompts: [] }))
     const state = runtime.replica.get<SessionContentState>({ type: 'session_content', id: 'session_a' }).value!
     expect(state.transientRun?.runCursor).toBe('5')
-    expect(state.transientRun?.text[JSON.stringify(['turn_a', 1, 'item_a'])].text).toBe('replayed!')
+    expect(state.transientRun?.messages[JSON.stringify(['turn_a', 1, 'item_a'])].message.content?.inline).toBe('replayed!')
     expect(state.transientRun?.appendedPrompts).toEqual(['prompt'])
 
     transport.emitClose()
@@ -380,12 +380,12 @@ describe('session-content transient runtime path', () => {
       run_cursor: '9007199254740993', replay_available: true, replay_from_cursor: '9007199254740991', replay_to_cursor: '9007199254740993',
     })))
     await settleSnapshot()
-    transport.emit(event(first.payload.subscription_id, 'session_a', '9007199254740991', { type: 'text.delta', turn_id: 'turn_a', agent_iteration: 1, item_id: 'item_a', delta: 'a', durable_text_length: 4, durable_checkpointed: false }))
-    transport.emit(event(first.payload.subscription_id, 'session_a', '9007199254740992', { type: 'text.delta', turn_id: 'turn_a', agent_iteration: 1, item_id: 'item_a', delta: 'b', durable_text_length: 4, durable_checkpointed: false }))
-    transport.emit(event(first.payload.subscription_id, 'session_a', '9007199254740993', { type: 'text.delta', turn_id: 'turn_a', agent_iteration: 1, item_id: 'item_a', delta: 'c', durable_text_length: 4, durable_checkpointed: false }))
+    transport.emit(event(first.payload.subscription_id, 'session_a', '9007199254740991', { type: 'assistant.message.updated', turn_id: 'turn_a', agent_iteration: 1, item_id: 'item_a', message_revision: '1', content: 'a', tool_calls: [] }))
+    transport.emit(event(first.payload.subscription_id, 'session_a', '9007199254740992', { type: 'assistant.message.updated', turn_id: 'turn_a', agent_iteration: 1, item_id: 'item_a', message_revision: '2', content: 'ab', tool_calls: [] }))
+    transport.emit(event(first.payload.subscription_id, 'session_a', '9007199254740993', { type: 'assistant.message.updated', turn_id: 'turn_a', agent_iteration: 1, item_id: 'item_a', message_revision: '3', content: 'abc', tool_calls: [] }))
     const state = runtime.replica.get<SessionContentState>({ type: 'session_content', id: 'session_a' }).value!
     expect(state.transientRun?.runCursor).toBe('9007199254740993')
-    expect(state.transientRun?.text[JSON.stringify(['turn_a', 1, 'item_a'])].text).toBe('abc')
+    expect(state.transientRun?.messages[JSON.stringify(['turn_a', 1, 'item_a'])].message.content?.inline).toBe('abc')
   })
 
   it('atomically clears the overlay when the server epoch changes', async () => {

@@ -92,25 +92,22 @@ export function activeRunForConversation(view: SessionView, sessionID: string): 
 }
 
 function runStateForConversation(state: SessionRunState, sessionID: string): ActiveRun {
-  const assistantItems: Record<string, { itemID: string; durableTextLength: number }> = {}
-  const assistantItemBindings: Record<string, { turnID: string; agentIteration: number; itemID: string; durableTextLength: number }> = {}
-  const assistantTails: Record<string, { turnID: string; agentIteration: number; itemID: string; text: string; durableTextLength: number }> = {}
-  const textEntries = Object.values(state.text)
-  for (const entry of textEntries) {
-    const key = `${entry.key.turn_id}:${entry.key.agent_iteration}`
-    assistantItems[key] = { itemID: entry.key.item_id, durableTextLength: entry.baseLength }
-    assistantItemBindings[assistantItemKey(entry.key.turn_id, entry.key.agent_iteration, entry.key.item_id)] = {
+  // A lifecycle-only entry (started followed by an omitted terminal snapshot)
+  // carries status/revision but no content authority. Keep it in domain state
+  // for settlement, but do not expose it as a renderable live message that
+  // could replace the durable item with an empty string.
+  const liveEntries = Object.values(state.messages).filter((entry) => entry.snapshotAvailable !== false)
+  const messages: NonNullable<ActiveRun['messages']> = {}
+  for (const entry of liveEntries) {
+    messages[assistantItemKey(entry.key.turn_id, entry.key.agent_iteration, entry.key.item_id)] = {
       turnID: entry.key.turn_id,
       agentIteration: entry.key.agent_iteration,
       itemID: entry.key.item_id,
-      durableTextLength: entry.baseLength,
-    }
-    assistantTails[assistantItemKey(entry.key.turn_id, entry.key.agent_iteration, entry.key.item_id)] = {
-      turnID: entry.key.turn_id,
-      agentIteration: entry.key.agent_iteration,
-      itemID: entry.key.item_id,
-      text: entry.text,
-      durableTextLength: entry.baseLength,
+      revision: entry.revision,
+      status: entry.status,
+      text: readableText(entry.message.content),
+      ...(entry.message.reasoning ? { reasoning: readableText(entry.message.reasoning) } : {}),
+      ...(entry.message.tool_calls ? { toolCalls: entry.message.tool_calls.map(toolCallForConversation) } : {}),
     }
   }
   // Text tails remain owned by the durable/active message rows for rendering.
@@ -119,13 +116,13 @@ function runStateForConversation(state: SessionRunState, sessionID: string): Act
   const steps = [] as ActiveRun['steps']
   for (const ref of state.stepOrder) {
     if (ref.kind === 'reasoning') {
-      const entry = state.reasoning[ref.key]
+      const entry = state.messages[ref.key]
       if (entry) {
-        const reasoningTiming = state.reasoningTimings?.[JSON.stringify([entry.key.turn_id, entry.key.agent_iteration, entry.key.item_id])]
+        const reasoningTiming = state.reasoningTimings?.[ref.key]
         steps.push({
           kind: 'reasoning',
           id: `${state.runID}:reasoning:${entry.key.item_id}:${entry.key.agent_iteration}`,
-          text: entry.text,
+          text: readableText(entry.message.reasoning),
           iteration: entry.key.agent_iteration,
           ...(reasoningTiming ? { reasoningTiming } : {}),
           turnID: entry.key.turn_id,
@@ -155,16 +152,10 @@ function runStateForConversation(state: SessionRunState, sessionID: string): Act
     sessionID,
     turnID: state.turnID,
     queuedPrompts: state.promptQueue.map((prompt) => ({ id: prompt.id, content: prompt.content, steer: prompt.steer })),
-    // SessionContentRepository owns the merge for a durable item. Keeping an
-    // unkeyed aggregate here would render that same tail a second time and
-    // would attach iteration N's text to whichever item happens to be last.
-    // Missing durable identities are rendered from assistantTails below.
     assistantText: '',
-    assistantItems,
-    assistantItemBindings,
-    assistantTails,
+    messages,
     steps,
-    agentIteration: Math.max(0, ...textEntries.map((entry) => entry.key.agent_iteration), ...Object.values(state.tools).map((tool) => tool.agent_iteration)),
+    agentIteration: Math.max(0, ...liveEntries.map((entry) => entry.key.agent_iteration), ...Object.values(state.tools).map((tool) => tool.agent_iteration)),
     status,
     ...(state.settlement ? { settledRevision: state.settlement.resource_revision } : {}),
   }
@@ -240,8 +231,8 @@ function textForConversation(value: SessionContentText): MessageContent {
   }
 }
 
-function readableText(value: SessionContentText): string {
-  return value.inline ?? value.preview ?? ''
+function readableText(value: SessionContentText | undefined): string {
+  return value?.inline ?? value?.preview ?? ''
 }
 
 function safeSeq(value: string | undefined): number {

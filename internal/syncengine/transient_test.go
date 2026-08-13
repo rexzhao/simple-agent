@@ -30,19 +30,19 @@ func TestTransientSubscriptionKeepsRunCursorIndependentAndRejectsGaps(t *testing
 		t.Fatal("run.started was rejected")
 	}
 	text := transientTestEvent(t, protocol.TransientSubscriptionEvent{
-		Type: protocol.SubscriptionEventTextDelta, SessionID: "session-1", RunID: "run-1", RunCursor: "2",
-		TurnID: "turn-1", AgentIteration: 1, ItemID: "item-1", Delta: "hello",
+		Type: protocol.SubscriptionEventAssistantMessageUpdated, SessionID: "session-1", RunID: "run-1", RunCursor: "2",
+		TurnID: "turn-1", AgentIteration: 1, ItemID: "item-1", MessageRevision: "1", AssistantContent: "hello",
 	})
 	if !sub.Offer(text) {
-		t.Fatal("text.delta was rejected")
+		t.Fatal("assistant message update was rejected")
 	}
 	if got := sub.RunCursor(); got != "2" {
 		t.Fatalf("RunCursor() = %q, want 2", got)
 	}
 
 	wrongRun := transientTestEvent(t, protocol.TransientSubscriptionEvent{
-		Type: protocol.SubscriptionEventTextDelta, SessionID: "session-1", RunID: "run-old", RunCursor: "3",
-		TurnID: "turn-1", AgentIteration: 1, ItemID: "item-1", Delta: "late",
+		Type: protocol.SubscriptionEventAssistantMessageUpdated, SessionID: "session-1", RunID: "run-old", RunCursor: "3",
+		TurnID: "turn-1", AgentIteration: 1, ItemID: "item-1", MessageRevision: "2", AssistantContent: "hello late",
 	})
 	if sub.Offer(wrongRun) {
 		t.Fatal("wrong-run event was accepted")

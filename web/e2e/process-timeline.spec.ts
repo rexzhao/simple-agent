@@ -75,7 +75,7 @@ test('typed live tool and reasoning rows remain in event order around streamed t
     { type: 'tool.finished', turn_id: 'turn-main', agent_iteration: 1, tool_call_id: 't1', name: 'read_file', is_error: false, content: 'a' },
     { type: 'tool.requested', turn_id: 'turn-main', agent_iteration: 1, tool_call_id: 't2', name: 'read_file', arguments: '{"path":"b.ts"}' },
     { type: 'tool.finished', turn_id: 'turn-main', agent_iteration: 1, tool_call_id: 't2', name: 'read_file', is_error: false, content: 'b' },
-    { type: 'text.delta', turn_id: 'turn-main', agent_iteration: 2, item_id: 'live', delta: 'I have both files, now editing. ' },
+    { type: 'assistant.message.updated', turn_id: 'turn-main', agent_iteration: 2, item_id: 'live', message_revision: '1', content: 'I have both files, now editing. ', tool_calls: [] },
     { type: 'tool.requested', turn_id: 'turn-main', agent_iteration: 2, tool_call_id: 't3', name: 'edit_file', arguments: '{"path":"a.ts"}' },
     { type: 'tool.finished', turn_id: 'turn-main', agent_iteration: 2, tool_call_id: 't3', name: 'edit_file', is_error: false, content: 'edited' },
     { type: 'tool.requested', turn_id: 'turn-main', agent_iteration: 2, tool_call_id: 't4', name: 'edit_file', arguments: '{"path":"b.ts"}' },
@@ -148,7 +148,7 @@ test('round markers remain visible on flat tool rows', async ({ page }) => {
   await installTimeline(page, [
     { type: 'tool.requested', turn_id: 'turn-main', agent_iteration: 1, tool_call_id: 't1', name: 'read_file', arguments: '{"path":"a.ts"}' }, { type: 'tool.finished', turn_id: 'turn-main', agent_iteration: 1, tool_call_id: 't1', name: 'read_file', is_error: false, content: 'a' },
     { type: 'tool.requested', turn_id: 'turn-main', agent_iteration: 1, tool_call_id: 't2', name: 'read_file', arguments: '{"path":"b.ts"}' }, { type: 'tool.finished', turn_id: 'turn-main', agent_iteration: 1, tool_call_id: 't2', name: 'read_file', is_error: false, content: 'b' },
-    { type: 'text.delta', turn_id: 'turn-main', agent_iteration: 2, item_id: 'live-2', delta: 'Round two. ' },
+    { type: 'assistant.message.updated', turn_id: 'turn-main', agent_iteration: 2, item_id: 'live-2', message_revision: '1', content: 'Round two. ', tool_calls: [] },
     { type: 'tool.requested', turn_id: 'turn-main', agent_iteration: 2, tool_call_id: 't3', name: 'shell', arguments: '{"command":"ls"}' }, { type: 'tool.finished', turn_id: 'turn-main', agent_iteration: 2, tool_call_id: 't3', name: 'shell', is_error: false, content: 'ok' },
     { type: 'tool.requested', turn_id: 'turn-main', agent_iteration: 3, tool_call_id: 't4', name: 'shell', arguments: '{"command":"pwd"}' }, { type: 'tool.finished', turn_id: 'turn-main', agent_iteration: 3, tool_call_id: 't4', name: 'shell', is_error: false, content: 'ok' },
     { type: 'tool.requested', turn_id: 'turn-main', agent_iteration: 3, tool_call_id: 't5', name: 'shell', arguments: '{"command":"git status"}' },
@@ -185,7 +185,7 @@ test('settled tool calls render as separate rows with visible markers', async ({
   const server = await installTimeline(page, [
     { type: 'tool.requested', turn_id: 'turn-main', agent_iteration: 1, tool_call_id: 't1', name: 'read_file', arguments: '{"path":"a.ts"}' }, { type: 'tool.finished', turn_id: 'turn-main', agent_iteration: 1, tool_call_id: 't1', name: 'read_file', is_error: false, content: 'a' },
     { type: 'tool.requested', turn_id: 'turn-main', agent_iteration: 2, tool_call_id: 't3', name: 'shell', arguments: '{"command":"ls"}' }, { type: 'tool.finished', turn_id: 'turn-main', agent_iteration: 2, tool_call_id: 't3', name: 'shell', is_error: false, content: 'ok' },
-    { type: 'text.delta', turn_id: 'turn-main', agent_iteration: 3, item_id: 'live', delta: 'All done.' },
+    { type: 'assistant.message.updated', turn_id: 'turn-main', agent_iteration: 3, item_id: 'live', message_revision: '1', content: 'All done.', tool_calls: [] },
   ], [settle], () => committed ? settledToolItems() : [])
   await page.goto('/#token=e2e')
   await page.getByPlaceholder('Send a message to SAI').fill('Run tools')
@@ -224,10 +224,10 @@ test('failed tool rows stay individually visible once settled', async ({ page })
 test('anchors clicked tool and reasoning popovers to the pointer while preserving vertical placement', async ({ page }) => {
   const hold = newGate()
   const initial = [
-    { type: 'reasoning.delta', turn_id: 'turn-main', agent_iteration: 1, item_id: 'reasoning-below', delta: 'reasoning details' },
+    { type: 'assistant.message.updated', turn_id: 'turn-main', agent_iteration: 1, item_id: 'reasoning-below', message_revision: '1', content: '', reasoning: 'reasoning details', tool_calls: [] },
     { type: 'tool.requested', turn_id: 'turn-main', agent_iteration: 1, tool_call_id: 'tool-below', name: 'shell', arguments: '{"command":"tool details"}' },
     ...Array.from({ length: 14 }, (_, index) => ({ type: 'tool.requested', turn_id: 'turn-main', agent_iteration: 1, tool_call_id: `tool-filler-${index}`, name: 'shell', arguments: `{"command":"filler ${index}"}` })),
-    { type: 'reasoning.delta', turn_id: 'turn-main', agent_iteration: 1, item_id: 'reasoning-above', delta: 'reasoning details above' },
+    { type: 'assistant.message.updated', turn_id: 'turn-main', agent_iteration: 1, item_id: 'reasoning-above', message_revision: '1', content: '', reasoning: 'reasoning details above', tool_calls: [] },
     { type: 'tool.requested', turn_id: 'turn-main', agent_iteration: 1, tool_call_id: 'tool-above', name: 'shell', arguments: '{"command":"tool details above"}' },
   ]
   await installTimeline(page, initial, [hold])

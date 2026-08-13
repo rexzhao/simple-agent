@@ -998,7 +998,8 @@ func TestServiceSendSessionMessageWithEventsEmitsDirectStreamEvents(t *testing.T
 	runner := fakeExecutionTurnRunner{
 		supports: true,
 		run: func(ctx context.Context, request SessionTurnRequest) (SessionTurnResult, error) {
-			request.Emit(model.TextDeltaEvent{Text: "streamed"})
+			request.Emit(model.AssistantMessageStartedEvent{ItemID: "assistant-direct", AgentIteration: 1})
+			request.Emit(model.AssistantMessageUpdatedEvent{ItemID: "assistant-direct", AgentIteration: 1, Revision: 1, Message: model.Message{Role: model.MessageRoleAssistant, Content: "streamed"}})
 			request.Emit(model.ToolCallDoneEvent{ToolCall: model.ToolCall{ID: "call-1", Name: "read_file", Arguments: `{"path":"notes.txt"}`}})
 			request.Emit(model.ToolStartedEvent{ToolCall: model.ToolCall{ID: "call-1", Name: "read_file", Arguments: `{"path":"notes.txt"}`}})
 			request.Emit(model.ToolResultEvent{Result: model.ToolResult{ToolCallID: "call-1", Name: "read_file", Content: "file contents"}})
@@ -1006,6 +1007,7 @@ func TestServiceSendSessionMessageWithEventsEmitsDirectStreamEvents(t *testing.T
 			if err := request.Publisher.Publish(eventAssistant(request.TurnID, "answer")); err != nil {
 				return SessionTurnResult{}, err
 			}
+			request.Emit(model.AssistantMessageCompletedEvent{ItemID: "assistant-direct", AgentIteration: 1, Revision: 2, Message: model.Message{Role: model.MessageRoleAssistant, Content: "streamed"}})
 			return SessionTurnResult{Incremental: true}, nil
 		},
 	}
@@ -1025,7 +1027,7 @@ func TestServiceSendSessionMessageWithEventsEmitsDirectStreamEvents(t *testing.T
 	if len(types) < 7 || types[0] != "turn.started" || types[len(types)-1] != "turn.committed" {
 		t.Fatalf("event types = %#v, want turn.started first and turn.committed last", types)
 	}
-	for _, want := range []string{"item.created", "text.delta", "tool.requested", "tool.started", "tool.finished", "usage.updated"} {
+	for _, want := range []string{"item.created", "assistant.message.updated", "tool.requested", "tool.started", "tool.finished", "usage.updated"} {
 		if !stringSliceContains(types, want) {
 			t.Fatalf("event types = %#v, want contain %q", types, want)
 		}
@@ -1051,8 +1053,8 @@ func TestServiceSendSessionMessageWithEventsEmitsDirectStreamEvents(t *testing.T
 			t.Fatalf("item projection complete DTO = %#v, want SessionItem matching item_id", event["item"])
 		}
 	}
-	if !sessionStreamEventsContain(events, "text.delta", "text", "streamed") {
-		t.Fatalf("events = %#v, want streamed text delta", events)
+	if !sessionStreamEventsContain(events, "assistant.message.updated", "content", "streamed") {
+		t.Fatalf("events = %#v, want assistant message snapshot", events)
 	}
 	if !sessionStreamEventsContain(events, "usage.updated", "total_tokens", 18) {
 		t.Fatalf("events = %#v, want usage.updated total_tokens", events)
@@ -1078,21 +1080,19 @@ func TestServiceStreamsDurableAssistantItemBeforeTransientDelta(t *testing.T) {
 			if err := checkpointPublisher.PublishAssistantCheckpoint(request.TurnID, 1, itemID, "hello"); err != nil {
 				return SessionTurnResult{}, err
 			}
-			request.Emit(model.TextDeltaEvent{
-				Text: "hello", AssistantItemID: itemID, DurableTextLength: 5, DurableCheckpointed: true,
-			})
+			request.Emit(model.AssistantMessageStartedEvent{ItemID: itemID, AgentIteration: 1})
+			request.Emit(model.AssistantMessageUpdatedEvent{ItemID: itemID, AgentIteration: 1, Revision: 1, Message: model.Message{Role: model.MessageRoleAssistant, Content: "hello"}})
 			if err := checkpointPublisher.PublishAssistantCheckpoint(request.TurnID, 1, itemID, "hello world"); err != nil {
 				return SessionTurnResult{}, err
 			}
-			request.Emit(model.TextDeltaEvent{
-				Text: " world", AssistantItemID: itemID, DurableTextLength: 11, DurableCheckpointed: true,
-			})
+			request.Emit(model.AssistantMessageUpdatedEvent{ItemID: itemID, AgentIteration: 1, Revision: 2, Message: model.Message{Role: model.MessageRoleAssistant, Content: "hello world"}})
 			if err := request.Publisher.Publish(eventbus.AssistantReady{
 				TurnID: request.TurnID, AgentIteration: 1, ItemID: itemID,
 				Message: model.Message{Role: model.MessageRoleAssistant, Content: "hello world"},
 			}); err != nil {
 				return SessionTurnResult{}, err
 			}
+			request.Emit(model.AssistantMessageCompletedEvent{ItemID: itemID, AgentIteration: 1, Revision: 3, Message: model.Message{Role: model.MessageRoleAssistant, Content: "hello world"}})
 			return SessionTurnResult{Incremental: true}, nil
 		},
 	}
@@ -1134,9 +1134,6 @@ func TestServiceStreamsDurableAssistantItemBeforeTransientDelta(t *testing.T) {
 	if updatedItem.Message == nil || updatedItem.Message.Content == nil || updatedItem.Message.Content.Inline != "hello world" {
 		t.Fatalf("updated assistant DTO = %#v, want complete text", updatedItem)
 	}
-	if assistantUpdates[0]["assistant_text_length"] != 11 {
-		t.Fatalf("assistant text length = %#v, want 11", assistantUpdates[0]["assistant_text_length"])
-	}
 	appendSeq, appendSeqOK := assistantCreates[0]["seq"].(int64)
 	updateSeq, updateSeqOK := assistantUpdates[0]["seq"].(int64)
 	appendRevision, appendRevisionOK := assistantCreates[0]["revision"].(string)
@@ -1148,9 +1145,9 @@ func TestServiceStreamsDurableAssistantItemBeforeTransientDelta(t *testing.T) {
 		t.Fatalf("assistant durable ordering = seq %v/%v revision %q/%q, want monotonically increasing", assistantCreates[0]["seq"], assistantUpdates[0]["seq"], appendRevision, updateRevision)
 	}
 	appendIndex := indexOfSessionStreamEvent(events, "item.created", itemID)
-	firstDeltaIndex := indexOfSessionStreamEvent(events, "text.delta", itemID)
+	firstDeltaIndex := indexOfSessionStreamEvent(events, "assistant.message.updated", itemID)
 	updateIndex := indexOfSessionStreamEvent(events, "item.updated", itemID)
-	secondDeltaIndex := nthIndexOfSessionStreamEvent(events, "text.delta", itemID, 2)
+	secondDeltaIndex := nthIndexOfSessionStreamEvent(events, "assistant.message.updated", itemID, 2)
 	if appendIndex < 0 || firstDeltaIndex < 0 || updateIndex < 0 || secondDeltaIndex < 0 ||
 		appendIndex > firstDeltaIndex || updateIndex > secondDeltaIndex {
 		t.Fatalf("projection/transient order = create %d, first delta %d, update %d, second delta %d; events = %#v", appendIndex, firstDeltaIndex, updateIndex, secondDeltaIndex, events)
@@ -1171,7 +1168,8 @@ func TestServiceSendSessionMessageWithEventsReasoningFollowsSessionSetting(t *te
 			runner := fakeExecutionTurnRunner{
 				supports: true,
 				run: func(ctx context.Context, request SessionTurnRequest) (SessionTurnResult, error) {
-					request.Emit(model.ReasoningDeltaEvent{Text: "thinking"})
+					request.Emit(model.AssistantMessageStartedEvent{ItemID: "assistant-reasoning", AgentIteration: 1})
+					request.Emit(model.AssistantMessageUpdatedEvent{ItemID: "assistant-reasoning", AgentIteration: 1, Revision: 1, Message: model.Message{Role: model.MessageRoleAssistant, ReasoningContent: "thinking"}})
 					if err := request.Publisher.Publish(eventAssistant(request.TurnID, "answer")); err != nil {
 						return SessionTurnResult{}, err
 					}
@@ -1208,9 +1206,9 @@ func TestServiceSendSessionMessageWithEventsReasoningFollowsSessionSetting(t *te
 			if err != nil {
 				t.Fatalf("SendSessionMessageWithEvents() error = %v", err)
 			}
-			gotReasoning := sessionStreamEventsContain(events, "reasoning.delta", "text", "thinking")
+			gotReasoning := sessionStreamEventsContain(events, "assistant.message.updated", "reasoning", "thinking")
 			if gotReasoning != tt.wantReasoning {
-				t.Fatalf("reasoning.delta present = %t, want %t; events = %#v", gotReasoning, tt.wantReasoning, events)
+				t.Fatalf("assistant reasoning snapshot present = %t, want %t; events = %#v", gotReasoning, tt.wantReasoning, events)
 			}
 		})
 	}

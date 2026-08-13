@@ -336,14 +336,12 @@ function validateSubscriptionEvent(event: RawObject): void {
   if (has(event, 'turn_id')) requiredString(event, 'turn_id', `${field}.turn_id`)
   if (has(event, 'agent_iteration')) positiveInteger(event.agent_iteration, `${field}.agent_iteration`)
   const add = (...keys: string[]) => keys.forEach((key) => allowed.add(key))
-  const requireDelta = () => {
+  const requireMessageIdentity = () => {
     requiredString(event, 'turn_id', `${field}.turn_id`)
     positiveInteger(event.agent_iteration, `${field}.agent_iteration`)
     requiredString(event, 'item_id', `${field}.item_id`)
-    requiredString(event, 'delta', `${field}.delta`)
-    add('item_id', 'delta', 'durable_text_length', 'durable_checkpointed')
-    if (has(event, 'durable_text_length')) nonNegativeInteger(event.durable_text_length, `${field}.durable_text_length`)
-    if (has(event, 'durable_checkpointed') && typeof event.durable_checkpointed !== 'boolean') fail('invalid_field', 'must be boolean', `${field}.durable_checkpointed`)
+	if (typeof event.message_revision !== 'string' || !/^(0|[1-9][0-9]*)$/u.test(event.message_revision) || BigInt(event.message_revision) > 18446744073709551615n) fail('invalid_field', 'must be a canonical uint64 decimal', `${field}.message_revision`)
+    add('item_id', 'message_revision')
   }
   const requireToolIdentity = () => {
     requiredString(event, 'turn_id', `${field}.turn_id`)
@@ -353,9 +351,29 @@ function validateSubscriptionEvent(event: RawObject): void {
     add('tool_call_id', 'name')
   }
   switch (type) {
-    case 'text.delta':
-    case 'reasoning.delta':
-      requireDelta()
+    case 'assistant.message.started':
+      requireMessageIdentity()
+	  if (event.message_revision !== '0') fail('invalid_field', 'must be zero', `${field}.message_revision`)
+      break
+    case 'assistant.message.updated':
+    case 'assistant.message.completed':
+    case 'assistant.message.failed':
+      requireMessageIdentity(); add('content', 'reasoning', 'tool_calls', 'snapshot_omitted')
+	  if (event.message_revision === '0') fail('invalid_field', 'must be positive', `${field}.message_revision`)
+	  if (type === 'assistant.message.updated' && has(event, 'snapshot_omitted')) fail('invalid_field', 'is only valid for terminal messages', `${field}.snapshot_omitted`)
+      if (has(event, 'snapshot_omitted') && event.snapshot_omitted !== true) fail('invalid_field', 'must be true', `${field}.snapshot_omitted`)
+      if (event.snapshot_omitted !== true && typeof event.content !== 'string') fail('invalid_field', 'must be a string', `${field}.content`)
+      if (event.snapshot_omitted === true && (has(event, 'content') || has(event, 'reasoning') || has(event, 'tool_calls'))) fail('invalid_field', 'omitted snapshot cannot carry message fields', field)
+      if (has(event, 'reasoning') && typeof event.reasoning !== 'string') fail('invalid_field', 'must be a string', `${field}.reasoning`)
+      if (has(event, 'tool_calls')) {
+        requiredArray(event, 'tool_calls', `${field}.tool_calls`).forEach((value, index) => {
+          const call = object(value, `${field}.tool_calls[${index}]`)
+          for (const key of Object.keys(call)) if (!['id', 'name', 'arguments'].includes(key)) fail('invalid_field', `unknown field ${key}`, `${field}.tool_calls[${index}]`)
+          requiredString(call, 'id', `${field}.tool_calls[${index}].id`)
+          requiredString(call, 'name', `${field}.tool_calls[${index}].name`)
+          if (has(call, 'arguments') && typeof call.arguments !== 'string') fail('invalid_field', 'must be a string', `${field}.tool_calls[${index}].arguments`)
+        })
+      }
       break
     case 'tool.requested':
     case 'tool.running':
@@ -499,4 +517,3 @@ function has(source: RawObject, key: string): boolean {
 function fail(code: 'invalid_field' | 'unsupported_version' | 'unknown_type', message: string, field?: string): never {
   throw new ProtocolDecodeError(code, message, field)
 }
-

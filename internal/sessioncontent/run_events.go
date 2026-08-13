@@ -2,12 +2,15 @@ package sessioncontent
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 
 	"github.com/rexzhao/simple-agent/internal/execution"
 	"github.com/rexzhao/simple-agent/internal/protocol"
 )
+
+var errTransientFrameTooLarge = errors.New("transient event exceeds frame bound")
 
 // subscriptionEventFromExecution is the only WebSocket event mapping. It
 // translates the shared execution vocabulary into the strict subscription
@@ -19,26 +22,24 @@ func subscriptionEventFromExecution(source execution.SessionStreamEvent, session
 	typeName, _ := source["type"].(string)
 	event := protocol.TransientSubscriptionEvent{Type: protocol.SubscriptionEventType(typeName), SessionID: sessionID, RunID: runID, TurnID: stringValue(source, "turn_id"), AgentIteration: intValue(source, "agent_iteration")}
 	switch typeName {
-	case "text.delta", "reasoning.delta":
+	case "assistant.message.started", "assistant.message.updated", "assistant.message.completed", "assistant.message.failed":
 		event.Type = protocol.SubscriptionEventType(typeName)
 		event.ItemID = stringValue(source, "item_id")
-		event.Delta = stringValue(source, "text")
-		if event.ItemID == "" || event.Delta == "" || event.AgentIteration <= 0 {
-			return protocol.TransientSubscriptionEvent{}, false, fmt.Errorf("%s lacks stable item identity or delta", typeName)
+		event.MessageRevision = stringValue(source, "message_revision")
+		if event.ItemID == "" || event.MessageRevision == "" || event.AgentIteration <= 0 {
+			return protocol.TransientSubscriptionEvent{}, false, fmt.Errorf("%s lacks stable message identity or revision", typeName)
 		}
-		if value, ok := source["durable_text_length"]; ok {
-			n, valid := integerValue(value)
-			if !valid {
-				return protocol.TransientSubscriptionEvent{}, false, fmt.Errorf("durable_text_length is invalid")
+		if typeName != "assistant.message.started" {
+			event.SnapshotOmitted, _ = source["snapshot_omitted"].(bool)
+			event.AssistantContent = stringValueAllowEmpty(source, "content")
+			event.Reasoning = stringValueAllowEmpty(source, "reasoning")
+			if event.SnapshotOmitted {
+				event.AssistantContent, event.Reasoning, event.ToolCalls = "", "", nil
+			} else if raw, err := json.Marshal(source["tool_calls"]); err != nil {
+				return protocol.TransientSubscriptionEvent{}, false, err
+			} else if err := json.Unmarshal(raw, &event.ToolCalls); err != nil {
+				return protocol.TransientSubscriptionEvent{}, false, fmt.Errorf("assistant tool calls are invalid: %w", err)
 			}
-			event.DurableTextLength = &n
-		}
-		if value, ok := source["durable_checkpointed"]; ok {
-			b, valid := value.(bool)
-			if !valid {
-				return protocol.TransientSubscriptionEvent{}, false, fmt.Errorf("durable_checkpointed is invalid")
-			}
-			event.DurableCheckpointed = &b
 		}
 	case "tool.requested", "tool.started", "tool.running":
 		if typeName == "tool.requested" {
@@ -59,7 +60,7 @@ func subscriptionEventFromExecution(source execution.SessionStreamEvent, session
 		}
 	case "tool.finished":
 		event.Type = protocol.SubscriptionEventToolFinished
-		event.ToolCallID, event.Name, event.Content = stringValue(source, "tool_call_id"), stringValue(source, "name"), stringValue(source, "content")
+		event.ToolCallID, event.Name, event.ToolContent = stringValue(source, "tool_call_id"), stringValue(source, "name"), stringValue(source, "content")
 		value, ok := source["is_error"].(bool)
 		if !ok {
 			return protocol.TransientSubscriptionEvent{}, false, fmt.Errorf("tool finished is_error is invalid")
@@ -114,13 +115,18 @@ func isTransientExecutionEvent(source execution.SessionStreamEvent) bool {
 		return false
 	}
 	switch typeName {
-	case "text.delta", "reasoning.delta", "tool.requested", "tool.started", "tool.running", "tool.progress", "tool.finished", "run.prompt_queue", "run.prompt_appended", "turn.failed":
+	case "assistant.message.started", "assistant.message.updated", "assistant.message.completed", "assistant.message.failed", "tool.requested", "tool.started", "tool.running", "tool.progress", "tool.finished", "run.prompt_queue", "run.prompt_appended", "turn.failed":
 		return true
 	}
 	return false
 }
 
 func stringValue(fields map[string]any, key string) string {
+	value, _ := fields[key].(string)
+	return value
+}
+
+func stringValueAllowEmpty(fields map[string]any, key string) string {
 	value, _ := fields[key].(string)
 	return value
 }
@@ -181,7 +187,7 @@ func preflightSubscriptionEventFrame(event json.RawMessage, sessionID string) (i
 		return 0, fmt.Errorf("preflight transient subscription event: %w", err)
 	}
 	if len(encoded) > protocol.DefaultMaxMessageBytes {
-		return 0, fmt.Errorf("transient event exceeds %d-byte frame bound", protocol.DefaultMaxMessageBytes)
+		return 0, fmt.Errorf("%w: %d bytes", errTransientFrameTooLarge, protocol.DefaultMaxMessageBytes)
 	}
 	return len(encoded), nil
 }

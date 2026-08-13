@@ -30,7 +30,7 @@ test('connects a first project, creates a session, and commits a streamed run', 
         const sessionID = String(command.arguments.session_id)
         const runID = String(command.arguments.run_id)
         mock.sendEvents(sessionID, runID, [
-          { type: 'text.delta', turn_id: 'turn-fixture', agent_iteration: 1, item_id: 'assistant-live', delta: 'Streamed answer' },
+          { type: 'assistant.message.updated', turn_id: 'turn-fixture', agent_iteration: 1, item_id: 'assistant-live', message_revision: '1', content: 'Streamed answer', tool_calls: [] },
         ])
         await finished
         mock.settleRun(sessionID, runID, 'committed', items('Build the feature', 'Streamed answer'))
@@ -93,7 +93,7 @@ test('keeps Queue and Steer prompts above the composer until the run consumes th
   await expect(page.getByLabel('Queued messages')).toHaveCount(0)
 })
 
-test('hands a durable assistant bubble through checkpointed and transient output', async ({ page }) => {
+test('keeps one assistant bubble while live snapshots converge with durable output', async ({ page }) => {
   let releaseTail!: () => void
   let releaseSettled!: () => void
   const tail = new Promise<void>((resolve) => { releaseTail = resolve })
@@ -111,13 +111,13 @@ test('hands a durable assistant bubble through checkpointed and transient output
           { op: 'item.upsert', item: contentItem(assistantA) },
           { op: 'history.window.descriptor.replace', descriptor: { limit: 200, oldest_item_seq: '2', newest_item_seq: '2', align_turn: false, visible_only: true, has_more_before: false, has_more_after: false } },
         ])
-        // The projection change and the transient event are distinct ordered
-        // authorities. Let the bounded fixture deliver the durable change
-        // before exercising checkpoint de-duplication.
+        // The projection change and transient lifecycle are distinct ordered
+        // authorities. Deliver the durable change first and verify that the
+        // same message identity still renders once.
         await new Promise<void>((resolve) => setTimeout(resolve, 0))
-        mock.sendEvents(sessionID, runID, [{ type: 'text.delta', turn_id: 'turn-stream', agent_iteration: 1, item_id: 'assistant-stream', delta: 'a', durable_text_length: 1, durable_checkpointed: true }])
+        mock.sendEvents(sessionID, runID, [{ type: 'assistant.message.updated', turn_id: 'turn-stream', agent_iteration: 1, item_id: 'assistant-stream', message_revision: '1', content: 'a', tool_calls: [] }])
         await tail
-        mock.sendEvents(sessionID, runID, [{ type: 'text.delta', turn_id: 'turn-stream', agent_iteration: 1, item_id: 'assistant-stream', delta: 'b', durable_text_length: 1, durable_checkpointed: false }])
+        mock.sendEvents(sessionID, runID, [{ type: 'assistant.message.updated', turn_id: 'turn-stream', agent_iteration: 1, item_id: 'assistant-stream', message_revision: '2', content: 'ab', tool_calls: [] }])
         await settled
         mock.settleRun(sessionID, runID, 'committed', [messageItem(1, 'user', 'stream durable output'), assistantAB])
       })()
@@ -276,8 +276,8 @@ test('Refresh recovers a resource made stale by a transient cursor gap', async (
   await expect.poll(() => server.activeSubscriptionID(resource)).toBeTruthy()
   server.delaySnapshots(resource)
   server.sendTypedEvent(session.id, runID, { type: 'run.started', run_cursor: '1', status: 'running' })
-  server.sendTypedEvent(session.id, runID, { type: 'text.delta', run_cursor: '2', turn_id: 'turn-refresh', agent_iteration: 1, item_id: 'assistant-gap', delta: 'before gap' })
-  server.sendTypedEvent(session.id, runID, { type: 'text.delta', run_cursor: '4', turn_id: 'turn-refresh', agent_iteration: 1, item_id: 'assistant-gap', delta: 'gap' })
+  server.sendTypedEvent(session.id, runID, { type: 'assistant.message.updated', run_cursor: '2', turn_id: 'turn-refresh', agent_iteration: 1, item_id: 'assistant-gap', message_revision: '1', content: 'before gap', tool_calls: [] })
+  server.sendTypedEvent(session.id, runID, { type: 'assistant.message.updated', run_cursor: '4', turn_id: 'turn-refresh', agent_iteration: 1, item_id: 'assistant-gap', message_revision: '2', content: 'gap', tool_calls: [] })
   const syncStatus = page.getByRole('status').filter({ hasText: 'Session content is out of date.' })
   await expect(syncStatus).toBeVisible()
   await syncStatus.getByRole('button', { name: 'Retry synchronization', exact: true }).click()
@@ -299,8 +299,8 @@ test('does not let an in-flight Refresh cross a session switch', async ({ page }
   await expect.poll(() => server.activeSubscriptionID(resource)).toBeTruthy()
   server.delaySnapshots(resource)
   server.sendTypedEvent(session.id, 'run-refresh-switch', { type: 'run.started', run_cursor: '1', status: 'running' })
-  server.sendTypedEvent(session.id, 'run-refresh-switch', { type: 'text.delta', run_cursor: '2', turn_id: 'turn-refresh', agent_iteration: 1, item_id: 'assistant-switch', delta: 'before gap' })
-  server.sendTypedEvent(session.id, 'run-refresh-switch', { type: 'text.delta', run_cursor: '4', turn_id: 'turn-refresh', agent_iteration: 1, item_id: 'assistant-switch', delta: 'gap' })
+  server.sendTypedEvent(session.id, 'run-refresh-switch', { type: 'assistant.message.updated', run_cursor: '2', turn_id: 'turn-refresh', agent_iteration: 1, item_id: 'assistant-switch', message_revision: '1', content: 'before gap', tool_calls: [] })
+  server.sendTypedEvent(session.id, 'run-refresh-switch', { type: 'assistant.message.updated', run_cursor: '4', turn_id: 'turn-refresh', agent_iteration: 1, item_id: 'assistant-switch', message_revision: '2', content: 'gap', tool_calls: [] })
   const syncStatus = page.getByRole('status').filter({ hasText: 'Session content is out of date.' })
   await expect(syncStatus).toBeVisible()
   const oldSubscriptionID = server.activeSubscriptionID(resource)

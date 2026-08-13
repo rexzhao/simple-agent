@@ -538,7 +538,7 @@ func TestSessionRunCoordinatorObserverMailboxReportsLossAndPreservesOrder(t *tes
 		t.Fatal("observer did not enter admitted callback")
 	}
 	for index := 0; index < 8; index++ {
-		coordinator.notifyRunEventObservers(run, NewSessionStreamEvent("text.delta", map[string]any{
+		coordinator.notifyRunEventObservers(run, NewSessionStreamEvent("test.event", map[string]any{
 			"turn_id": "turn", "text": fmt.Sprintf("%d", index),
 		}))
 	}
@@ -580,9 +580,9 @@ func TestSessionRunCoordinatorObserverMailboxLossCoversDiscardedRuns(t *testing.
 	case <-time.After(time.Second):
 		t.Fatal("observer did not enter admitted callback")
 	}
-	coordinator.notifyRunEventObservers(runA, NewSessionStreamEvent("text.delta", map[string]any{"text": "a"}))
-	coordinator.notifyRunEventObservers(runB, NewSessionStreamEvent("text.delta", map[string]any{"text": "b"}))
-	coordinator.notifyRunEventObservers(runB, NewSessionStreamEvent("text.delta", map[string]any{"text": "overflow"}))
+	coordinator.notifyRunEventObservers(runA, NewSessionStreamEvent("test.event", map[string]any{"text": "a"}))
+	coordinator.notifyRunEventObservers(runB, NewSessionStreamEvent("test.event", map[string]any{"text": "b"}))
+	coordinator.notifyRunEventObservers(runB, NewSessionStreamEvent("test.event", map[string]any{"text": "overflow"}))
 	close(observer.block)
 
 	seen := make(map[string]bool)
@@ -600,7 +600,7 @@ func TestSessionRunCoordinatorObserverMailboxLossCoversDiscardedRuns(t *testing.
 	// A loss poisons only the affected runs. Once their terminal callbacks have
 	// crossed the mailbox, the same registration must continue serving a later
 	// run instead of leaving a stopped worker behind in coordinator.observers.
-	coordinator.notifyRunEventObservers(runA, NewSessionStreamEvent("text.delta", map[string]any{"text": "poisoned"}))
+	coordinator.notifyRunEventObservers(runA, NewSessionStreamEvent("test.event", map[string]any{"text": "poisoned"}))
 	time.Sleep(20 * time.Millisecond)
 	observer.mu.Lock()
 	if containsObserverOrder(observer.order, "event:"+runA.ID()) {
@@ -615,7 +615,7 @@ func TestSessionRunCoordinatorObserverMailboxLossCoversDiscardedRuns(t *testing.
 	runC := &CoordinatedSessionRun{id: "run-loss-future", sessionID: "session-loss-future"}
 	coordinator.notifyRunAdmittedObservers(runC)
 	waitForObserverOrder(t, observer, "admitted:"+runC.ID())
-	coordinator.notifyRunEventObservers(runC, NewSessionStreamEvent("text.delta", map[string]any{"text": "future"}))
+	coordinator.notifyRunEventObservers(runC, NewSessionStreamEvent("test.event", map[string]any{"text": "future"}))
 	waitForObserverOrder(t, observer, "event:"+runC.ID())
 	coordinator.notifyRunSettledObservers(runC, SessionMessageResult{}, nil)
 	waitForObserverOrder(t, observer, "settled:"+runC.ID())
@@ -650,7 +650,7 @@ func TestSessionRunCoordinatorObserverMailboxTerminalTriggerIsRetainedAfterLoss(
 	}
 	// The event fills the mailbox. The settled delivery is the operation which
 	// detects overflow, so it must not disappear with the discarded suffix.
-	coordinator.notifyRunEventObservers(run, NewSessionStreamEvent("text.delta", map[string]any{"text": "queued"}))
+	coordinator.notifyRunEventObservers(run, NewSessionStreamEvent("test.event", map[string]any{"text": "queued"}))
 	coordinator.notifyRunSettledObservers(run, SessionMessageResult{Status: "committed"}, errors.New("terminal error that must not be retained"))
 	close(observer.block)
 	select {
@@ -697,8 +697,8 @@ func TestSessionRunCoordinatorObserverMailboxQueuedTerminalSurvivesLaterOverflow
 	// worker is still blocked in admission; overflow must retain that queued
 	// terminal before replacing the queue with loss.
 	coordinator.notifyRunSettledObservers(run, SessionMessageResult{Status: "committed"}, nil)
-	coordinator.notifyRunEventObservers(run, NewSessionStreamEvent("text.delta", map[string]any{"text": "one"}))
-	coordinator.notifyRunEventObservers(run, NewSessionStreamEvent("text.delta", map[string]any{"text": "overflow"}))
+	coordinator.notifyRunEventObservers(run, NewSessionStreamEvent("test.event", map[string]any{"text": "one"}))
+	coordinator.notifyRunEventObservers(run, NewSessionStreamEvent("test.event", map[string]any{"text": "overflow"}))
 	close(observer.block)
 	select {
 	case <-observer.losses:
@@ -741,7 +741,7 @@ func TestSessionRunCoordinatorObserverMailboxOverflowTerminalCleanupStaysBounded
 		case <-time.After(time.Second):
 			t.Fatalf("observer did not block run %s", run.ID())
 		}
-		coordinator.notifyRunEventObservers(run, NewSessionStreamEvent("text.delta", map[string]any{"text": "queued"}))
+		coordinator.notifyRunEventObservers(run, NewSessionStreamEvent("test.event", map[string]any{"text": "queued"}))
 		// With one queue slot, this terminal is itself the overflow trigger.
 		coordinator.notifyRunSettledObservers(run, SessionMessageResult{}, nil)
 		close(gate)
@@ -753,7 +753,7 @@ func TestSessionRunCoordinatorObserverMailboxOverflowTerminalCleanupStaysBounded
 		run := &CoordinatedSessionRun{id: id, sessionID: id}
 		coordinator.notifyRunAdmittedObservers(run)
 		waitForObserverOrder(t, observer, "admitted:"+id)
-		coordinator.notifyRunEventObservers(run, NewSessionStreamEvent("text.delta", map[string]any{"text": id}))
+		coordinator.notifyRunEventObservers(run, NewSessionStreamEvent("test.event", map[string]any{"text": id}))
 		waitForObserverOrder(t, observer, "event:"+id)
 		coordinator.notifyRunSettledObservers(run, SessionMessageResult{}, nil)
 		waitForObserverOrder(t, observer, "settled:"+id)
@@ -896,7 +896,7 @@ func TestSessionRunCoordinatorObserverUnregisterConcurrentWithNotifications(t *t
 		go func() {
 			defer wg.Done()
 			for event := 0; event < 32; event++ {
-				coordinator.notifyRunEventObservers(run, NewSessionStreamEvent("text.delta", map[string]any{"n": event}))
+				coordinator.notifyRunEventObservers(run, NewSessionStreamEvent("test.event", map[string]any{"n": event}))
 			}
 		}()
 	}

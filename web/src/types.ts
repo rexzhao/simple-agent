@@ -246,14 +246,18 @@ export interface ActiveRun {
 	/** Transient process boundaries for drained prompts; never a user item. */
 	processBoundaries?: Array<{ id: string; stepIndex: number }>
 	assistantText: string
-	/** Content-backed transient tails. Each entry is owned by exactly one full
-	 * (turn_id, agent_iteration, item_id) identity. It is intentionally a map,
-	 * never an unkeyed concatenated string. */
-	assistantTails?: Record<string, { turnID: string; agentIteration: number; itemID: string; text: string; durableTextLength: number }>
-	/** Explicit transient-to-durable assistant identity, keyed by turn/iteration. */
-	assistantItems?: Record<string, { itemID: string; durableTextLength: number }>
-	/** Full identity bindings. assistantItems remains a compatibility index. */
-	assistantItemBindings?: Record<string, { turnID: string; agentIteration: number; itemID: string; durableTextLength: number }>
+	/** Live assistant messages are complete, revisioned snapshots keyed by their
+	 * durable identity. The same itemID is used by the final SessionItem. */
+	messages?: Record<string, {
+		turnID: string
+		agentIteration: number
+		itemID: string
+		revision: string
+		status: 'streaming' | 'complete' | 'incomplete'
+		text: string
+		reasoning?: string
+		toolCalls?: SessionToolCall[]
+	}>
 	steps: RunStep[]
   agentIteration: number
   inputTokens?: number

@@ -1383,11 +1383,10 @@ func (o *owner) appendTransientLocked(event protocol.TransientSubscriptionEvent)
 	parts := []protocol.TransientSubscriptionEvent{event}
 	splitValue := ""
 	switch event.Type {
-	case protocol.SubscriptionEventTextDelta, protocol.SubscriptionEventReasoningDelta:
-		if !utf8.ValidString(event.Delta) {
-			return nil, nil, fmt.Errorf("transient text delta is not valid UTF-8")
+	case protocol.SubscriptionEventAssistantMessageUpdated, protocol.SubscriptionEventAssistantMessageCompleted, protocol.SubscriptionEventAssistantMessageFailed:
+		if !utf8.ValidString(event.AssistantContent) || !utf8.ValidString(event.Reasoning) {
+			return nil, nil, fmt.Errorf("assistant message snapshot is not valid UTF-8")
 		}
-		splitValue = event.Delta
 	case protocol.SubscriptionEventToolProgress:
 		if !utf8.ValidString(event.ArgumentsDelta) {
 			return nil, nil, fmt.Errorf("transient tool arguments delta is not valid UTF-8")
@@ -1410,32 +1409,48 @@ func (o *owner) appendTransientLocked(event protocol.TransientSubscriptionEvent)
 				cut = size
 			}
 			part := event
-			if event.Type == protocol.SubscriptionEventToolProgress {
-				part.ArgumentsDelta, remaining = remaining[:cut], remaining[cut:]
-			} else {
-				part.Delta, remaining = remaining[:cut], remaining[cut:]
-			}
+			part.ArgumentsDelta, remaining = remaining[:cut], remaining[cut:]
 			parts = append(parts, part)
 		}
 	}
 	entries := make([]syncengine.TransientEvent, 0, len(parts))
+	acceptedParts := make([]protocol.TransientSubscriptionEvent, 0, len(parts))
 	nextCursor := o.transientRun.cursor
 	for _, part := range parts {
-		nextCursor++
-		part.RunCursor = protocol.RunCursor(strconv.FormatUint(nextCursor, 10))
+		candidateCursor := nextCursor + 1
+		part.RunCursor = protocol.RunCursor(strconv.FormatUint(candidateCursor, 10))
 		raw, err := json.Marshal(part)
 		if err != nil {
 			return nil, nil, err
 		}
 		frameBytes, frameErr := preflightSubscriptionEventFrame(raw, o.sessionID)
 		if frameErr != nil {
-			return nil, nil, frameErr
+			if errors.Is(frameErr, errTransientFrameTooLarge) && part.Type == protocol.SubscriptionEventAssistantMessageUpdated {
+				// A cumulative live snapshot can exceed the negotiated frame size.
+				// Skip this revision without consuming a cursor; a later compact
+				// terminal event and durable projection still close the lifecycle.
+				continue
+			}
+			if errors.Is(frameErr, errTransientFrameTooLarge) && (part.Type == protocol.SubscriptionEventAssistantMessageCompleted || part.Type == protocol.SubscriptionEventAssistantMessageFailed) {
+				part.AssistantContent, part.Reasoning, part.ToolCalls = "", "", nil
+				part.SnapshotOmitted = true
+				raw, err = json.Marshal(part)
+				if err != nil {
+					return nil, nil, err
+				}
+				frameBytes, frameErr = preflightSubscriptionEventFrame(raw, o.sessionID)
+			}
+			if frameErr != nil {
+				return nil, nil, frameErr
+			}
 		}
 		entry := syncengine.TransientEvent{RunEpoch: o.transientRun.epoch, RunID: o.transientRun.runID, Cursor: part.RunCursor, Event: raw, Bytes: frameBytes}
 		if entry.Bytes > o.provider.options.TransientReplayBytes {
 			return nil, nil, fmt.Errorf("single transient event exceeds replay byte bound")
 		}
 		entries = append(entries, entry)
+		acceptedParts = append(acceptedParts, part)
+		nextCursor = candidateCursor
 	}
 	o.transientRun.cursor = nextCursor
 	for index, entry := range entries {
@@ -1458,13 +1473,15 @@ func (o *owner) appendTransientLocked(event protocol.TransientSubscriptionEvent)
 		}
 		o.transientRun.replay = append(o.transientRun.replay, entry)
 		o.transientRun.replayBytes += entry.Bytes
-		part := parts[index]
+		part := acceptedParts[index]
 		switch part.Type {
-		case protocol.SubscriptionEventTextDelta, protocol.SubscriptionEventReasoningDelta:
+		case protocol.SubscriptionEventAssistantMessageStarted, protocol.SubscriptionEventAssistantMessageUpdated, protocol.SubscriptionEventAssistantMessageCompleted:
 			if part.ItemID != "" {
 				o.transientRun.itemCursors[ItemKey{TurnID: part.TurnID, AgentIteration: part.AgentIteration, ItemID: part.ItemID}] = entry.Cursor
 			}
-		case protocol.SubscriptionEventRunStarted, protocol.SubscriptionEventRunSettled:
+		case protocol.SubscriptionEventAssistantMessageFailed:
+			delete(o.transientRun.itemCursors, ItemKey{TurnID: part.TurnID, AgentIteration: part.AgentIteration, ItemID: part.ItemID})
+		case protocol.SubscriptionEventRunStarted, protocol.SubscriptionEventTurnFailed, protocol.SubscriptionEventRunSettled:
 		default:
 			// Tool calls and prompt queue mutations have stable transient
 			// identities, but the current durable projection has no atomic

@@ -37,17 +37,17 @@ func TestSessionStreamUsageEventIncludesCacheDetails(t *testing.T) {
 	}
 }
 
-func TestSessionStreamReasoningDeltaCarriesAssistantItemBinding(t *testing.T) {
-	event, ok := sessionStreamEventFromModelEvent("turn-1", 2, model.ReasoningDeltaEvent{
-		Text:            "thinking",
-		AssistantItemID: "assistant-2",
+func TestSessionStreamMessageSnapshotCarriesAssistantItemBinding(t *testing.T) {
+	event, ok := sessionStreamEventFromModelEvent("turn-1", 2, model.AssistantMessageUpdatedEvent{
+		ItemID: "assistant-2", AgentIteration: 2, Revision: 1,
+		Message: model.Message{Role: model.MessageRoleAssistant, ReasoningContent: "thinking"},
 	}, true)
 	if !ok {
 		t.Fatal("sessionStreamEventFromModelEvent() ok = false, want true")
 	}
 	for key, want := range map[string]any{
-		"type": "reasoning.delta", "turn_id": "turn-1", "agent_iteration": 2,
-		"text": "thinking", "item_id": "assistant-2",
+		"type": "assistant.message.updated", "turn_id": "turn-1", "agent_iteration": 2,
+		"reasoning": "thinking", "item_id": "assistant-2", "message_revision": "1",
 	} {
 		if got := event[key]; got != want {
 			t.Fatalf("event[%q] = %#v, want %#v; event = %#v", key, got, want, event)
@@ -155,10 +155,11 @@ func TestSessionStreamBlockedCallbackDoesNotBlockRunner(t *testing.T) {
 	runner := fakeExecutionTurnRunner{
 		supports: true,
 		run: func(ctx context.Context, request SessionTurnRequest) (SessionTurnResult, error) {
+			request.Emit(model.AssistantMessageStartedEvent{ItemID: "assistant-blocked", AgentIteration: 1})
 			for i := 0; i < deltaCount; i++ {
 				chunk := fmt.Sprintf("[%d]", i)
 				expectedText += chunk
-				request.Emit(model.TextDeltaEvent{Text: chunk})
+				request.Emit(model.AssistantMessageUpdatedEvent{ItemID: "assistant-blocked", AgentIteration: 1, Revision: uint64(i + 1), Message: model.Message{Role: model.MessageRoleAssistant, Content: expectedText}})
 			}
 			if err := request.Publisher.Publish(eventAssistant(request.TurnID, "final")); err != nil {
 				return SessionTurnResult{}, err
@@ -226,11 +227,11 @@ func TestSessionStreamBlockedCallbackDoesNotBlockRunner(t *testing.T) {
 	if types[len(types)-1] != "turn.committed" {
 		t.Fatalf("last event = %#v, want turn.committed", types)
 	}
-	if got := countString(types, "text.delta"); got > 2 {
-		t.Fatalf("text.delta count = %d, want at most 2 (coalesced while blocked)", got)
+	if got := countString(types, "assistant.message.updated"); got > 2 {
+		t.Fatalf("assistant message update count = %d, want at most 2", got)
 	}
-	if got := joinSessionStreamEventTexts(events, "text.delta"); got != expectedText {
-		t.Fatalf("combined text = %q, want exact concatenation %q", got, expectedText)
+	if !sessionStreamEventsContain(events, "assistant.message.updated", "content", expectedText) {
+		t.Fatalf("events do not contain final assistant snapshot %q", expectedText)
 	}
 
 	// No callback fires after Send returns.
@@ -486,8 +487,9 @@ func TestSessionStreamFailureOrdersTurnFailedAfterPriorEvents(t *testing.T) {
 	runner := fakeExecutionTurnRunner{
 		supports: true,
 		run: func(ctx context.Context, request SessionTurnRequest) (SessionTurnResult, error) {
-			request.Emit(model.TextDeltaEvent{Text: "partial "})
-			request.Emit(model.TextDeltaEvent{Text: "output"})
+			request.Emit(model.AssistantMessageStartedEvent{ItemID: "assistant-failed", AgentIteration: 1})
+			request.Emit(model.AssistantMessageUpdatedEvent{ItemID: "assistant-failed", AgentIteration: 1, Revision: 1, Message: model.Message{Role: model.MessageRoleAssistant, Content: "partial "}})
+			request.Emit(model.AssistantMessageUpdatedEvent{ItemID: "assistant-failed", AgentIteration: 1, Revision: 2, Message: model.Message{Role: model.MessageRoleAssistant, Content: "partial output"}})
 			return SessionTurnResult{}, errors.New("provider exploded")
 		},
 	}
@@ -511,14 +513,14 @@ func TestSessionStreamFailureOrdersTurnFailedAfterPriorEvents(t *testing.T) {
 	if failedIdx != len(types)-1 {
 		t.Fatalf("turn.failed index = %d, want last; events = %#v", failedIdx, types)
 	}
-	textIdx := indexOfString(types, "text.delta")
+	textIdx := indexOfString(types, "assistant.message.updated")
 	if textIdx < 0 || textIdx >= failedIdx {
-		t.Fatalf("text.delta(%d) must precede turn.failed(%d): %#v", textIdx, failedIdx, types)
+		t.Fatalf("assistant.message.updated(%d) must precede turn.failed(%d): %#v", textIdx, failedIdx, types)
 	}
 	// The exact coalescing of the two text deltas depends on drain timing; what
 	// must hold is that no text is lost and the combined text is exact.
-	if got := joinSessionStreamEventTexts(events, "text.delta"); got != "partial output" {
-		t.Fatalf("combined text = %q, want %q", got, "partial output")
+	if !sessionStreamEventsContain(events, "assistant.message.updated", "content", "partial output") {
+		t.Fatalf("events = %#v, want final partial snapshot", events)
 	}
 	appendIdx := indexOfString(types, "item.created")
 	if appendIdx < 0 || appendIdx >= failedIdx {
@@ -527,24 +529,22 @@ func TestSessionStreamFailureOrdersTurnFailedAfterPriorEvents(t *testing.T) {
 }
 
 // TestSessionStreamCoalescesOnlyConsecutiveSameTypeDeltas verifies end-to-end
-// that, while presentation is blocked, only queued consecutive text.delta /
-// reasoning.delta events with the same turn_id and type are merged via exact
-// concatenation; every other event is delivered verbatim and in order.
-func TestSessionStreamCoalescesOnlyConsecutiveSameTypeDeltas(t *testing.T) {
+// that, while presentation is blocked, queued consecutive message snapshots
+// for one item are replaced by the newest revision; every other event remains
+// ordered.
+func TestSessionStreamCoalescesOnlyConsecutiveMessageSnapshots(t *testing.T) {
 	home := t.TempDir()
 	runnerDone := make(chan struct{})
 	runner := fakeExecutionTurnRunner{
 		supports: true,
 		run: func(ctx context.Context, request SessionTurnRequest) (SessionTurnResult, error) {
 			request.Emit(model.AgentIterationStartedEvent{Iteration: 2})
-			request.Emit(model.TextDeltaEvent{Text: "a"})
-			request.Emit(model.TextDeltaEvent{Text: "b"})
-			request.Emit(model.ReasoningDeltaEvent{Text: "r1"})
-			request.Emit(model.ReasoningDeltaEvent{Text: "r2"})
-			request.Emit(model.TextDeltaEvent{Text: "c"})
+			request.Emit(model.AssistantMessageStartedEvent{ItemID: "assistant-coalesce", AgentIteration: 2})
+			request.Emit(model.AssistantMessageUpdatedEvent{ItemID: "assistant-coalesce", AgentIteration: 2, Revision: 1, Message: model.Message{Role: model.MessageRoleAssistant, Content: "a"}})
+			request.Emit(model.AssistantMessageUpdatedEvent{ItemID: "assistant-coalesce", AgentIteration: 2, Revision: 2, Message: model.Message{Role: model.MessageRoleAssistant, Content: "ab", ReasoningContent: "r1r2"}})
+			request.Emit(model.AssistantMessageUpdatedEvent{ItemID: "assistant-coalesce", AgentIteration: 2, Revision: 3, Message: model.Message{Role: model.MessageRoleAssistant, Content: "abc", ReasoningContent: "r1r2"}})
 			request.Emit(model.ToolCallDoneEvent{ToolCall: model.ToolCall{ID: "call-1", Name: "read_file"}})
-			request.Emit(model.TextDeltaEvent{Text: "d"})
-			request.Emit(model.TextDeltaEvent{Text: "e"})
+			request.Emit(model.AssistantMessageUpdatedEvent{ItemID: "assistant-coalesce", AgentIteration: 2, Revision: 4, Message: model.Message{Role: model.MessageRoleAssistant, Content: "abcde", ReasoningContent: "r1r2"}})
 			if err := request.Publisher.Publish(eventAssistant(request.TurnID, "answer")); err != nil {
 				return SessionTurnResult{}, err
 			}
@@ -632,14 +632,8 @@ func TestSessionStreamCoalescesOnlyConsecutiveSameTypeDeltas(t *testing.T) {
 	// turn.started before blocking; what must hold is exact text preservation in
 	// submission order. The precise one-op-per-run invariant is covered by the
 	// sink unit test.
-	if got := joinSessionStreamEventTexts(events, "text.delta"); got != "abcde" {
-		t.Fatalf("combined text.delta text = %q, want %q", got, "abcde")
-	}
-	if got := joinSessionStreamEventTexts(events, "reasoning.delta"); got != "r1r2" {
-		t.Fatalf("combined reasoning.delta text = %q, want %q", got, "r1r2")
-	}
-	if countString(gotTypes, "text.delta") > 4 {
-		t.Fatalf("text.delta count = %d, want at most 4 (coalesced runs)", countString(gotTypes, "text.delta"))
+	if !sessionStreamEventsContain(events, "assistant.message.updated", "content", "abcde") {
+		t.Fatalf("events = %#v, want latest cumulative snapshot", events)
 	}
 	if got := countString(gotTypes, "tool.requested"); got != 1 {
 		t.Fatalf("tool.requested count = %d, want 1", got)
@@ -650,7 +644,7 @@ func TestSessionStreamCoalescesOnlyConsecutiveSameTypeDeltas(t *testing.T) {
 	for _, event := range events {
 		eventType, _ := event["type"].(string)
 		switch eventType {
-		case "agent.iteration.started", "text.delta", "reasoning.delta", "tool.requested":
+		case "agent.iteration.started", "assistant.message.started", "assistant.message.updated", "tool.requested":
 			if got, _ := event["agent_iteration"].(int); got != 2 {
 				t.Fatalf("%s agent_iteration = %#v, want 2", eventType, event["agent_iteration"])
 			}
@@ -735,11 +729,9 @@ func joinSessionStreamEventTexts(events []SessionStreamEvent, eventType string) 
 	return sb.String()
 }
 
-// TestSessionEventSinkCoalescesAtSubmitTime verifies that consecutive same
-// type+turn text.delta events are folded into a single queued op at submit time
-// (under the queue mutex) while emit is blocked on an earlier non-delta event,
-// so the queue does not grow by one map per delta. It inspects the sink queue
-// directly, then releases, closes, waits and verifies delivery.
+// TestSessionEventSinkCoalescesAtSubmitTime verifies that consecutive snapshots
+// for the same assistant item are replaced by the newest revision while emit is
+// blocked on an earlier event.
 func TestSessionEventSinkCoalescesAtSubmitTime(t *testing.T) {
 	release := make(chan struct{})
 	blocked := make(chan struct{}, 1)
@@ -762,40 +754,31 @@ func TestSessionEventSinkCoalescesAtSubmitTime(t *testing.T) {
 	sink.submit(NewSessionStreamEvent("turn.started", map[string]any{"turn_id": "turn-1"}))
 	<-blocked
 
-	const deltaCount = 200
-	var want strings.Builder
-	for i := 0; i < deltaCount; i++ {
-		chunk := fmt.Sprintf("[%d]", i)
-		want.WriteString(chunk)
-		sink.submit(NewSessionStreamEvent("text.delta", map[string]any{
-			"turn_id": "turn-1",
-			"text":    chunk,
+	const updateCount = 200
+	for i := 0; i < updateCount; i++ {
+		sink.submit(NewSessionStreamEvent("assistant.message.updated", map[string]any{
+			"turn_id": "turn-1", "item_id": "assistant-1",
+			"message_revision": fmt.Sprintf("%d", i+1), "content": fmt.Sprintf("[%d]", i),
 		}))
 	}
 
 	// A different turn_id breaks the run; it must not merge into the prior run.
-	sink.submit(NewSessionStreamEvent("text.delta", map[string]any{
-		"turn_id": "turn-2",
-		"text":    "other",
+	sink.submit(NewSessionStreamEvent("assistant.message.updated", map[string]any{
+		"turn_id": "turn-2", "item_id": "assistant-2", "message_revision": "1", "content": "other",
 	}))
 	// A non-delta event also breaks the run.
 	sink.submit(NewSessionStreamEvent("usage.updated", map[string]any{"turn_id": "turn-1"}))
 
 	sink.mu.Lock()
-	deltaOps := 0
-	var queuedText string
+	updateOps := 0
 	for _, op := range sink.ops {
-		if op.isDelta && op.eventType == "text.delta" && op.turnID == "turn-1" {
-			deltaOps++
-			queuedText = op.text.String()
+		if op.event["type"] == "assistant.message.updated" && op.event["item_id"] == "assistant-1" {
+			updateOps++
 		}
 	}
 	sink.mu.Unlock()
-	if deltaOps != 1 {
-		t.Fatalf("queued turn-1 text.delta ops = %d, want 1 (coalesced at submit time)", deltaOps)
-	}
-	if queuedText != want.String() {
-		t.Fatalf("queued coalesced text = %q, want exact concatenation %q", queuedText, want.String())
+	if updateOps != 1 {
+		t.Fatalf("queued assistant-1 updates = %d, want 1", updateOps)
 	}
 
 	close(release)
@@ -805,9 +788,9 @@ func TestSessionEventSinkCoalescesAtSubmitTime(t *testing.T) {
 	mu.Lock()
 	defer mu.Unlock()
 	types := sessionStreamEventTypes(delivered)
-	// turn.started (blocked), then the single coalesced text.delta, then the
-	// other-turn delta, then usage.updated.
-	wantTypes := []string{"turn.started", "text.delta", "text.delta", "usage.updated"}
+	// turn.started (blocked), then the latest snapshot, the other-turn snapshot,
+	// and usage.updated.
+	wantTypes := []string{"turn.started", "assistant.message.updated", "assistant.message.updated", "usage.updated"}
 	if len(types) != len(wantTypes) {
 		t.Fatalf("delivered types = %#v, want %#v", types, wantTypes)
 	}
@@ -816,8 +799,8 @@ func TestSessionEventSinkCoalescesAtSubmitTime(t *testing.T) {
 			t.Fatalf("delivered types[%d] = %q, want %q; full = %#v", i, types[i], want, types)
 		}
 	}
-	if got, _ := delivered[1]["text"].(string); got != want.String() {
-		t.Fatalf("delivered coalesced text = %q, want %q", got, want.String())
+	if delivered[1]["message_revision"] != "200" || delivered[1]["content"] != "[199]" {
+		t.Fatalf("delivered latest snapshot = %#v", delivered[1])
 	}
 	if got, _ := delivered[2]["turn_id"].(string); got != "turn-2" {
 		t.Fatalf("delivered other-turn delta turn_id = %q, want turn-2", got)
@@ -888,13 +871,13 @@ func TestSessionEventSinkCoalescedDeltaBytesCanOverflow(t *testing.T) {
 			<-release
 		})
 		events <- event
-	}, 16, 300)
+	}, 16, 800)
 	// The first delta is admitted; repeated coalescing must charge the added
 	// UTF-8 bytes rather than only the one queued message.
-	sink.submit(NewSessionStreamEvent("text.delta", map[string]any{"turn_id": "turn-1", "text": strings.Repeat("a", 80)}))
+	sink.submit(NewSessionStreamEvent("assistant.message.updated", map[string]any{"turn_id": "turn-1", "item_id": "assistant-1", "message_revision": "1", "content": strings.Repeat("a", 80)}))
 	<-started
-	sink.submit(NewSessionStreamEvent("text.delta", map[string]any{"turn_id": "turn-1", "text": strings.Repeat("b", 80)}))
-	sink.submit(NewSessionStreamEvent("text.delta", map[string]any{"turn_id": "turn-1", "text": strings.Repeat("c", 80)}))
+	sink.submit(NewSessionStreamEvent("assistant.message.updated", map[string]any{"turn_id": "turn-1", "item_id": "assistant-1", "message_revision": "2", "content": strings.Repeat("b", 160)}))
+	sink.submit(NewSessionStreamEvent("assistant.message.updated", map[string]any{"turn_id": "turn-1", "item_id": "assistant-1", "message_revision": "3", "content": strings.Repeat("c", 400)}))
 	sink.close()
 	close(release)
 	sink.wait()
@@ -907,7 +890,7 @@ func TestSessionEventSinkCoalescedDeltaBytesCanOverflow(t *testing.T) {
 				got = append(got, typeName)
 			}
 		default:
-			if len(got) != 2 || got[0] != "text.delta" || got[1] != "run.resync_required" {
+			if len(got) != 2 || got[0] != "assistant.message.updated" || got[1] != "run.resync_required" {
 				t.Fatalf("byte overflow delivered types = %#v", got)
 			}
 			return
@@ -915,7 +898,7 @@ func TestSessionEventSinkCoalescedDeltaBytesCanOverflow(t *testing.T) {
 	}
 }
 
-func TestSessionEventSinkPreservesAssistantCheckpointBinding(t *testing.T) {
+func TestSessionEventSinkKeepsLatestAssistantRevision(t *testing.T) {
 	release := make(chan struct{})
 	blocked := make(chan struct{}, 1)
 	var mu sync.Mutex
@@ -932,19 +915,14 @@ func TestSessionEventSinkPreservesAssistantCheckpointBinding(t *testing.T) {
 	})
 	sink.submit(NewSessionStreamEvent("turn.started", map[string]any{"turn_id": "turn-1"}))
 	<-blocked
-	// A checkpoint marker is a semantic boundary: merging the next tail into
-	// it would make the reducer append committed text a second time.
-	sink.submit(NewSessionStreamEvent("text.delta", map[string]any{
-		"turn_id": "turn-1", "agent_iteration": 1, "text": "a", "item_id": "assistant-1",
-		"durable_text_length": 1, "durable_checkpointed": true,
+	sink.submit(NewSessionStreamEvent("assistant.message.updated", map[string]any{
+		"turn_id": "turn-1", "agent_iteration": 1, "content": "a", "item_id": "assistant-1", "message_revision": "1",
 	}))
-	sink.submit(NewSessionStreamEvent("text.delta", map[string]any{
-		"turn_id": "turn-1", "agent_iteration": 1, "text": "b", "item_id": "assistant-1",
-		"durable_text_length": 1, "durable_checkpointed": false,
+	sink.submit(NewSessionStreamEvent("assistant.message.updated", map[string]any{
+		"turn_id": "turn-1", "agent_iteration": 1, "content": "ab", "item_id": "assistant-1", "message_revision": "2",
 	}))
-	sink.submit(NewSessionStreamEvent("text.delta", map[string]any{
-		"turn_id": "turn-1", "agent_iteration": 1, "text": "c", "item_id": "assistant-1",
-		"durable_text_length": 1, "durable_checkpointed": false,
+	sink.submit(NewSessionStreamEvent("assistant.message.updated", map[string]any{
+		"turn_id": "turn-1", "agent_iteration": 1, "content": "abc", "item_id": "assistant-1", "message_revision": "3",
 	}))
 	close(release)
 	sink.close()
@@ -952,18 +930,47 @@ func TestSessionEventSinkPreservesAssistantCheckpointBinding(t *testing.T) {
 
 	mu.Lock()
 	defer mu.Unlock()
-	if len(delivered) != 3 {
-		t.Fatalf("delivered events = %#v, want turn.started plus append and tail deltas", delivered)
+	if len(delivered) != 2 {
+		t.Fatalf("delivered events = %#v, want turn.started plus latest snapshot", delivered)
 	}
-	if delivered[1]["durable_checkpointed"] != true || delivered[1]["text"] != "a" {
-		t.Fatalf("append delta = %#v, want committed a", delivered[1])
-	}
-	if delivered[2]["durable_checkpointed"] != false || delivered[2]["text"] != "bc" || delivered[2]["item_id"] != "assistant-1" {
-		t.Fatalf("tail delta = %#v, want coalesced uncheckpointed bc with identity", delivered[2])
+	if delivered[1]["message_revision"] != "3" || delivered[1]["content"] != "abc" || delivered[1]["item_id"] != "assistant-1" {
+		t.Fatalf("latest snapshot = %#v", delivered[1])
 	}
 }
 
-func TestSessionEventSinkPreservesReasoningItemBindingAcrossReplay(t *testing.T) {
+func TestSessionEventSinkUsesCompleteMessageIdentityAndMonotonicRevision(t *testing.T) {
+	release := make(chan struct{})
+	blocked := make(chan struct{}, 1)
+	var delivered []SessionStreamEvent
+	var mu sync.Mutex
+	sink := newSessionEventSink(func(event SessionStreamEvent) {
+		select {
+		case blocked <- struct{}{}:
+		default:
+		}
+		<-release
+		mu.Lock()
+		delivered = append(delivered, event)
+		mu.Unlock()
+	})
+	sink.submit(NewSessionStreamEvent("turn.started", map[string]any{"turn_id": "turn-0"}))
+	<-blocked
+	sink.submit(NewSessionStreamEvent("assistant.message.updated", map[string]any{"turn_id": "turn-1", "agent_iteration": 1, "item_id": "same", "message_revision": "2", "content": "new"}))
+	// Older revision for the same identity cannot replace the queued snapshot.
+	sink.submit(NewSessionStreamEvent("assistant.message.updated", map[string]any{"turn_id": "turn-1", "agent_iteration": 1, "item_id": "same", "message_revision": "1", "content": "old"}))
+	// The same item ID in another turn is a distinct message and cannot merge.
+	sink.submit(NewSessionStreamEvent("assistant.message.updated", map[string]any{"turn_id": "turn-2", "agent_iteration": 1, "item_id": "same", "message_revision": "1", "content": "other"}))
+	close(release)
+	sink.close()
+	sink.wait()
+	mu.Lock()
+	defer mu.Unlock()
+	if len(delivered) != 3 || delivered[1]["content"] != "new" || delivered[2]["content"] != "other" {
+		t.Fatalf("delivered snapshots = %#v", delivered)
+	}
+}
+
+func TestSessionEventSinkPreservesMessageIdentityAcrossReplay(t *testing.T) {
 	release := make(chan struct{})
 	blocked := make(chan struct{}, 1)
 	var mu sync.Mutex
@@ -980,16 +987,16 @@ func TestSessionEventSinkPreservesReasoningItemBindingAcrossReplay(t *testing.T)
 	})
 	sink.submit(NewSessionStreamEvent("turn.started", map[string]any{"turn_id": "turn-1"}))
 	<-blocked
-	sink.submit(NewSessionStreamEvent("reasoning.delta", map[string]any{
-		"turn_id": "turn-1", "agent_iteration": 1, "item_id": "assistant-1", "text": "old ",
+	sink.submit(NewSessionStreamEvent("assistant.message.updated", map[string]any{
+		"turn_id": "turn-1", "agent_iteration": 1, "item_id": "assistant-1", "message_revision": "1", "reasoning": "old ", "content": "",
 	}))
-	sink.submit(NewSessionStreamEvent("reasoning.delta", map[string]any{
-		"turn_id": "turn-1", "agent_iteration": 1, "item_id": "assistant-1", "text": "reasoning",
+	sink.submit(NewSessionStreamEvent("assistant.message.updated", map[string]any{
+		"turn_id": "turn-1", "agent_iteration": 1, "item_id": "assistant-1", "message_revision": "2", "reasoning": "old reasoning", "content": "",
 	}))
 	// A new assistant item is a new logical reasoning stream even when the
 	// provider text and turn/iteration happen to be identical.
-	sink.submit(NewSessionStreamEvent("reasoning.delta", map[string]any{
-		"turn_id": "turn-1", "agent_iteration": 1, "item_id": "assistant-2", "text": "same",
+	sink.submit(NewSessionStreamEvent("assistant.message.updated", map[string]any{
+		"turn_id": "turn-1", "agent_iteration": 1, "item_id": "assistant-2", "message_revision": "1", "reasoning": "same", "content": "",
 	}))
 	close(release)
 	sink.close()
@@ -998,12 +1005,12 @@ func TestSessionEventSinkPreservesReasoningItemBindingAcrossReplay(t *testing.T)
 	mu.Lock()
 	defer mu.Unlock()
 	if len(delivered) != 3 {
-		t.Fatalf("delivered events = %#v, want turn.started plus two reasoning deltas", delivered)
+		t.Fatalf("delivered events = %#v, want turn.started plus two message snapshots", delivered)
 	}
-	if delivered[1]["item_id"] != "assistant-1" || delivered[1]["text"] != "old reasoning" {
+	if delivered[1]["item_id"] != "assistant-1" || delivered[1]["reasoning"] != "old reasoning" {
 		t.Fatalf("first reasoning replay = %#v, want assistant-1 with coalesced text", delivered[1])
 	}
-	if delivered[2]["item_id"] != "assistant-2" || delivered[2]["text"] != "same" {
+	if delivered[2]["item_id"] != "assistant-2" || delivered[2]["reasoning"] != "same" {
 		t.Fatalf("second reasoning replay = %#v, want assistant-2 identity", delivered[2])
 	}
 }

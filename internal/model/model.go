@@ -120,18 +120,22 @@ type ToolResult struct {
 type EventType string
 
 const (
-	EventTypeAgentIterationStarted EventType = "agent_iteration_started"
-	EventTypeTextDelta             EventType = "text_delta"
-	EventTypeReasoningDelta        EventType = "reasoning_delta"
-	EventTypeMessageDone           EventType = "message_done"
-	EventTypeToolCallDelta         EventType = "tool_call_delta"
-	EventTypeToolCallDone          EventType = "tool_call_done"
-	EventTypeToolStarted           EventType = "tool_started"
-	EventTypeToolResult            EventType = "tool_result"
-	EventTypeUsage                 EventType = "usage"
-	EventTypeResponseState         EventType = "response_state"
-	EventTypeProviderRetry         EventType = "provider_retry"
-	EventTypeError                 EventType = "error"
+	EventTypeAgentIterationStarted     EventType = "agent_iteration_started"
+	EventTypeAssistantMessageStarted   EventType = "assistant_message_started"
+	EventTypeAssistantMessageUpdated   EventType = "assistant_message_updated"
+	EventTypeAssistantMessageCompleted EventType = "assistant_message_completed"
+	EventTypeAssistantMessageFailed    EventType = "assistant_message_failed"
+	EventTypeTextDelta                 EventType = "text_delta"
+	EventTypeReasoningDelta            EventType = "reasoning_delta"
+	EventTypeMessageDone               EventType = "message_done"
+	EventTypeToolCallDelta             EventType = "tool_call_delta"
+	EventTypeToolCallDone              EventType = "tool_call_done"
+	EventTypeToolStarted               EventType = "tool_started"
+	EventTypeToolResult                EventType = "tool_result"
+	EventTypeUsage                     EventType = "usage"
+	EventTypeResponseState             EventType = "response_state"
+	EventTypeProviderRetry             EventType = "provider_retry"
+	EventTypeError                     EventType = "error"
 )
 
 type Event interface {
@@ -142,19 +146,66 @@ type AgentIterationStartedEvent struct {
 	Iteration int
 }
 
+// AssistantMessageStartedEvent establishes the stable identity of one
+// assistant message before provider streaming begins. Provider deltas remain
+// internal input to the agent accumulator; consumers update this entity by
+// ItemID instead of manufacturing an unbound text tail.
+type AssistantMessageStartedEvent struct {
+	ItemID         string
+	AgentIteration int
+}
+
+func (AssistantMessageStartedEvent) Type() EventType {
+	return EventTypeAssistantMessageStarted
+}
+
+// AssistantMessageUpdatedEvent carries the complete accumulated message at a
+// monotonic revision. Complete snapshots make delivery idempotent: a later
+// update repairs a missed earlier frame without replaying provider deltas.
+type AssistantMessageUpdatedEvent struct {
+	ItemID         string
+	AgentIteration int
+	Revision       uint64
+	Message        Message
+}
+
+func (AssistantMessageUpdatedEvent) Type() EventType {
+	return EventTypeAssistantMessageUpdated
+}
+
+// AssistantMessageCompletedEvent is emitted only after the final durable
+// AssistantReady projection succeeds, so the public lifecycle cannot claim a
+// completed message that failed to commit.
+type AssistantMessageCompletedEvent struct {
+	ItemID         string
+	AgentIteration int
+	Revision       uint64
+	Message        Message
+}
+
+func (AssistantMessageCompletedEvent) Type() EventType {
+	return EventTypeAssistantMessageCompleted
+}
+
+// AssistantMessageFailedEvent closes a message lifecycle that was started but
+// could not be durably completed. Message is the latest accumulated snapshot.
+type AssistantMessageFailedEvent struct {
+	ItemID         string
+	AgentIteration int
+	Revision       uint64
+	Message        Message
+}
+
+func (AssistantMessageFailedEvent) Type() EventType {
+	return EventTypeAssistantMessageFailed
+}
+
 func (AgentIterationStartedEvent) Type() EventType {
 	return EventTypeAgentIterationStarted
 }
 
 type TextDeltaEvent struct {
 	Text string
-	// AssistantItemID and the checkpoint fields are populated by the agent
-	// after its durable checkpoint attempt. Provider implementations do not
-	// set them. They let the UI attach transient text to the durable item
-	// without comparing message contents.
-	AssistantItemID     string
-	DurableTextLength   int
-	DurableCheckpointed bool
 }
 
 func (TextDeltaEvent) Type() EventType {
@@ -163,11 +214,6 @@ func (TextDeltaEvent) Type() EventType {
 
 type ReasoningDeltaEvent struct {
 	Text string
-	// AssistantItemID is assigned by the agent after it allocates the
-	// assistant item for this provider request. Provider implementations do
-	// not set it; it lets the run stream identify the durable reasoning item
-	// without comparing its text.
-	AssistantItemID string
 }
 
 func (ReasoningDeltaEvent) Type() EventType {

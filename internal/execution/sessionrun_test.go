@@ -212,7 +212,8 @@ func TestSessionRunSyncSendPreservesEventsAndResult(t *testing.T) {
 	runner := fakeExecutionTurnRunner{
 		supports: true,
 		run: func(ctx context.Context, request SessionTurnRequest) (SessionTurnResult, error) {
-			request.Emit(model.TextDeltaEvent{Text: "streamed"})
+			request.Emit(model.AssistantMessageStartedEvent{ItemID: "assistant-sync", AgentIteration: 1})
+			request.Emit(model.AssistantMessageUpdatedEvent{ItemID: "assistant-sync", AgentIteration: 1, Revision: 1, Message: model.Message{Role: model.MessageRoleAssistant, Content: "streamed"}})
 			if err := request.Publisher.Publish(eventAssistant(request.TurnID, "answer")); err != nil {
 				return SessionTurnResult{}, err
 			}
@@ -235,11 +236,11 @@ func TestSessionRunSyncSendPreservesEventsAndResult(t *testing.T) {
 	if len(types) < 4 || types[0] != "turn.started" || types[len(types)-1] != "turn.committed" {
 		t.Fatalf("event types = %#v, want turn.started first and turn.committed last", types)
 	}
-	if !stringSliceContains(types, "text.delta") {
-		t.Fatalf("event types = %#v, want contain text.delta", types)
+	if !stringSliceContains(types, "assistant.message.updated") {
+		t.Fatalf("event types = %#v, want contain assistant.message.updated", types)
 	}
-	if !sessionStreamEventsContain(events, "text.delta", "text", "streamed") {
-		t.Fatalf("events = %#v, want streamed text delta", events)
+	if !sessionStreamEventsContain(events, "assistant.message.updated", "content", "streamed") {
+		t.Fatalf("events = %#v, want streamed message snapshot", events)
 	}
 }
 

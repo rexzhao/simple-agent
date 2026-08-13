@@ -375,15 +375,15 @@
             "id": "session_2"
           },
           "event": {
-            "type": "text.delta",
+            "type": "assistant.message.updated",
             "session_id": "session_2",
             "run_id": "run_9",
             "run_cursor": "17",
             "turn_id": "turn_3",
             "agent_iteration": 1,
             "item_id": "item_3",
-            "durable_text_length": 128,
-            "delta": "..."
+            "message_revision": "17",
+            "content": "..."
           }
         }
       }
@@ -643,14 +643,15 @@
           "subscription_id": "session-content:session_2",
           "resource": { "type": "session_content", "id": "session_2" },
           "event": {
-            "type": "text.delta",
+            "type": "assistant.message.updated",
             "session_id": "session_2",
             "run_id": "run_9",
             "run_cursor": "18",
             "turn_id": "turn_3",
             "agent_iteration": 1,
             "item_id": "item_3",
-            "delta": "x",
+            "message_revision": "18",
+            "content": "x",
             "future_field": true
           }
         }

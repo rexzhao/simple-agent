@@ -171,12 +171,13 @@ describe('shared protocol golden fixtures', () => {
       reason: 'archived',
     })
     expect(event.payload.event).toMatchObject({
-      type: 'text.delta',
+      type: 'assistant.message.updated',
       session_id: 'session_2',
       run_id: 'run_9',
       run_cursor: '17',
       item_id: 'item_3',
-      delta: '...',
+      message_revision: '17',
+      content: '...',
     })
   })
 
@@ -184,6 +185,25 @@ describe('shared protocol golden fixtures', () => {
     expect(() => decodeMessage('{"version":1')).toThrowError(
       expect.objectContaining({ code: 'invalid_json' }),
     )
+  })
+
+  it('strictly validates assistant revisions, nested calls, and omitted terminals', () => {
+    const fixture = structuredClone(fixtures.valid.find((candidate) => candidate.name === 'subscription_event')?.message) as Record<string, any>
+    fixture.payload.event.message_revision = '01'
+    expect(() => decodeMessage(JSON.stringify(fixture))).toThrow(ProtocolDecodeError)
+	fixture.payload.event.message_revision = '0'
+	expect(() => decodeMessage(JSON.stringify(fixture))).toThrow(ProtocolDecodeError)
+	fixture.payload.event = { ...fixture.payload.event, type: 'assistant.message.started', message_revision: '1' }
+	delete fixture.payload.event.content
+	delete fixture.payload.event.tool_calls
+	expect(() => decodeMessage(JSON.stringify(fixture))).toThrow(ProtocolDecodeError)
+    fixture.payload.event.message_revision = '1'
+    fixture.payload.event.tool_calls = [{ id: 'call', name: 'shell', future: true }]
+    expect(() => decodeMessage(JSON.stringify(fixture))).toThrow(ProtocolDecodeError)
+    fixture.payload.event = { ...fixture.payload.event, type: 'assistant.message.completed', message_revision: '2', snapshot_omitted: true }
+    delete fixture.payload.event.content
+    delete fixture.payload.event.tool_calls
+    expect(() => decodeMessage(JSON.stringify(fixture))).not.toThrow()
   })
 
   it('rejects a session-content event whose identity names another resource', () => {

@@ -31,7 +31,8 @@ func (runner *openBarrierExecutionRunner) SupportsIncrementalSessionTurn(context
 
 func (runner *openBarrierExecutionRunner) RunSessionTurn(ctx context.Context, request execution.SessionTurnRequest) (execution.SessionTurnResult, error) {
 	request.Emit(model.AgentIterationStartedEvent{Iteration: 1})
-	request.Emit(model.TextDeltaEvent{Text: "after barrier", AssistantItemID: "item-barrier"})
+	request.Emit(model.AssistantMessageStartedEvent{ItemID: "item-barrier", AgentIteration: 1})
+	request.Emit(model.AssistantMessageUpdatedEvent{ItemID: "item-barrier", AgentIteration: 1, Revision: 1, Message: model.Message{Role: model.MessageRoleAssistant, Content: "after barrier"}})
 	close(runner.started)
 	select {
 	case <-runner.release:
@@ -55,7 +56,7 @@ func (runner *noSubscriberPressureRunner) RunSessionTurn(ctx context.Context, _ 
 	}
 }
 
-func TestTransientRunSplitsUTF8AndDoesNotAdvanceDurableSequence(t *testing.T) {
+func TestTransientMessageSnapshotPreservesUTF8AndDoesNotAdvanceDurableSequence(t *testing.T) {
 	store, session := newContentTestStore(t, "transient-split")
 	provider, err := NewProvider(store, ProviderOptions{TransientReplayEntries: 16, TransientReplayBytes: 2 * 1024 * 1024})
 	if err != nil {
@@ -74,23 +75,91 @@ func TestTransientRunSplitsUTF8AndDoesNotAdvanceDurableSequence(t *testing.T) {
 	owner.handleRunAdmitted(runAdmission{runID: "run-split", sessionID: session.ID})
 	readTransientEvent(t, opened, protocol.SubscriptionEventRunStarted, "1")
 
-	want := strings.Repeat("界", 100000)
-	owner.handleRunEvent(runEventInput{runID: "run-split", sessionID: session.ID, event: execution.NewSessionStreamEvent("text.delta", map[string]any{
-		"turn_id": "turn-1", "agent_iteration": 1, "item_id": "item-1", "text": want,
+	want := strings.Repeat("界", 80000)
+	owner.handleRunEvent(runEventInput{runID: "run-split", sessionID: session.ID, event: execution.NewSessionStreamEvent("assistant.message.updated", map[string]any{
+		"turn_id": "turn-1", "agent_iteration": 1, "item_id": "item-1", "message_revision": "1", "content": want, "tool_calls": []map[string]any{},
 	})})
-	var got strings.Builder
-	for cursor := uint64(2); cursor <= 4; cursor++ {
-		event := readTransientEvent(t, opened, protocol.SubscriptionEventTextDelta, strconv.FormatUint(cursor, 10))
-		if !utf8.ValidString(event.Delta) {
-			t.Fatalf("split delta at cursor %s is not valid UTF-8", event.RunCursor)
-		}
-		got.WriteString(event.Delta)
-	}
-	if got.String() != want {
-		t.Fatalf("split delta reconstructed %d bytes, want %d", got.Len(), len(want))
+	event := readTransientEvent(t, opened, protocol.SubscriptionEventAssistantMessageUpdated, "2")
+	if !utf8.ValidString(event.AssistantContent) || event.AssistantContent != want {
+		t.Fatalf("message snapshot contained invalid or incomplete UTF-8")
 	}
 	if got := owner.journal.LastSequence(); got != opened.Sequence {
 		t.Fatalf("transient run advanced durable sequence to %d, baseline was %d", got, opened.Sequence)
+	}
+}
+
+func TestOversizedAssistantSnapshotDoesNotDesyncRun(t *testing.T) {
+	store, session := newContentTestStore(t, "transient-oversized-message")
+	provider, err := NewProvider(store, ProviderOptions{TransientReplayEntries: 16, TransientReplayBytes: 2 * 1024 * 1024})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer provider.Close()
+	opened := openContent(t, provider, session.ID, nil)
+	defer opened.Close()
+	provider.mu.Lock()
+	owner := provider.owners[session.ID]
+	provider.mu.Unlock()
+	owner.handleRunAdmitted(runAdmission{runID: "run-large", sessionID: session.ID})
+	readTransientEvent(t, opened, protocol.SubscriptionEventRunStarted, "1")
+	large := strings.Repeat("界", 100000)
+	owner.handleRunEvent(runEventInput{runID: "run-large", sessionID: session.ID, event: execution.NewSessionStreamEvent("assistant.message.updated", map[string]any{
+		"turn_id": "turn-large", "agent_iteration": 1, "item_id": "item-large", "message_revision": "1", "content": large, "tool_calls": []map[string]any{},
+	})})
+	owner.handleRunEvent(runEventInput{runID: "run-large", sessionID: session.ID, event: execution.NewSessionStreamEvent("assistant.message.completed", map[string]any{
+		"turn_id": "turn-large", "agent_iteration": 1, "item_id": "item-large", "message_revision": "2", "content": large, "tool_calls": []map[string]any{},
+	})})
+	completed := readTransientEvent(t, opened, protocol.SubscriptionEventAssistantMessageCompleted, "2")
+	if !completed.SnapshotOmitted || completed.AssistantContent != "" {
+		t.Fatalf("oversized completion = %#v", completed)
+	}
+	owner.mu.Lock()
+	desynced := owner.transientRun == nil || owner.transientRun.desynced
+	owner.mu.Unlock()
+	if desynced {
+		t.Fatal("oversized snapshot desynced transient run")
+	}
+}
+
+func TestFailedAssistantDoesNotRequireImpossibleDurableCoverage(t *testing.T) {
+	store, session := newContentTestStore(t, "transient-failed-message")
+	provider, err := NewProvider(store, ProviderOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer provider.Close()
+	opened := openContent(t, provider, session.ID, nil)
+	defer opened.Close()
+	provider.mu.Lock()
+	owner := provider.owners[session.ID]
+	provider.mu.Unlock()
+	owner.handleRunAdmitted(runAdmission{runID: "run-failed", sessionID: session.ID})
+	readTransientEvent(t, opened, protocol.SubscriptionEventRunStarted, "1")
+	owner.handleRunEvent(runEventInput{runID: "run-failed", sessionID: session.ID, event: execution.NewSessionStreamEvent("assistant.message.started", map[string]any{
+		"turn_id": "turn-failed", "agent_iteration": 1, "item_id": "item-failed", "message_revision": "0",
+	})})
+	readTransientEvent(t, opened, protocol.SubscriptionEventAssistantMessageStarted, "2")
+	owner.handleRunEvent(runEventInput{runID: "run-failed", sessionID: session.ID, event: execution.NewSessionStreamEvent("assistant.message.failed", map[string]any{
+		"turn_id": "turn-failed", "agent_iteration": 1, "item_id": "item-failed", "message_revision": "1", "content": "", "tool_calls": []map[string]any{},
+	})})
+	readTransientEvent(t, opened, protocol.SubscriptionEventAssistantMessageFailed, "3")
+	owner.mu.Lock()
+	_, covered := owner.transientRun.itemCursors[ItemKey{TurnID: "turn-failed", AgentIteration: 1, ItemID: "item-failed"}]
+	owner.mu.Unlock()
+	if covered {
+		t.Fatal("failed non-durable message remained in settlement coverage")
+	}
+	owner.handleRunEvent(runEventInput{runID: "run-failed", sessionID: session.ID, event: execution.NewSessionStreamEvent("turn.failed", map[string]any{
+		"turn_id": "turn-failed", "code": "provider_error", "message": "request model",
+	})})
+	readTransientEvent(t, opened, protocol.SubscriptionEventTurnFailed, "4")
+	owner.handleRunSettled(runSettlement{
+		runID: "run-failed", sessionID: session.ID, turnID: "turn-failed", status: "failed",
+		result: execution.SessionMessageResult{Status: "failed", RunID: "run-failed", TurnID: "turn-failed", LastSeq: session.LastSeq},
+	})
+	settled := readTransientEvent(t, opened, protocol.SubscriptionEventRunSettled, "5")
+	if settled.Settlement == nil || !settled.Settlement.Verified {
+		t.Fatalf("failed run settlement = %#v, want verified without impossible item coverage", settled.Settlement)
 	}
 }
 
@@ -164,10 +233,10 @@ func TestTransientReplayRetentionIsSlidingAndLiveRemainsContinuous(t *testing.T)
 	owner.handleRunAdmitted(runAdmission{runID: "run-retention", sessionID: session.ID})
 	readTransientEvent(t, opened, protocol.SubscriptionEventRunStarted, "1")
 	for cursor := uint64(2); cursor <= 8; cursor++ {
-		owner.handleRunEvent(runEventInput{runID: "run-retention", sessionID: session.ID, event: execution.NewSessionStreamEvent("text.delta", map[string]any{
-			"turn_id": "turn-1", "agent_iteration": 1, "item_id": "item-1", "text": "x",
+		owner.handleRunEvent(runEventInput{runID: "run-retention", sessionID: session.ID, event: execution.NewSessionStreamEvent("assistant.message.updated", map[string]any{
+			"turn_id": "turn-1", "agent_iteration": 1, "item_id": "item-1", "message_revision": strconv.FormatUint(cursor-1, 10), "content": strings.Repeat("x", int(cursor-1)),
 		})})
-		readTransientEvent(t, opened, protocol.SubscriptionEventTextDelta, strconv.FormatUint(cursor, 10))
+		readTransientEvent(t, opened, protocol.SubscriptionEventAssistantMessageUpdated, strconv.FormatUint(cursor, 10))
 	}
 	if got := owner.journal.LastSequence(); got != opened.Sequence {
 		t.Fatalf("transient retention advanced durable sequence to %d, baseline was %d", got, opened.Sequence)
@@ -221,10 +290,10 @@ func TestTransientReplayByteRetentionEvictsOldEntriesWithoutBreakingLive(t *test
 	owner.handleRunAdmitted(runAdmission{runID: "run-byte-retention", sessionID: session.ID})
 	readTransientEvent(t, opened, protocol.SubscriptionEventRunStarted, "1")
 	for cursor := uint64(2); cursor <= 9; cursor++ {
-		owner.handleRunEvent(runEventInput{runID: "run-byte-retention", sessionID: session.ID, event: execution.NewSessionStreamEvent("text.delta", map[string]any{
-			"turn_id": "turn-byte", "agent_iteration": 1, "item_id": "item-byte", "text": "byte-window",
+		owner.handleRunEvent(runEventInput{runID: "run-byte-retention", sessionID: session.ID, event: execution.NewSessionStreamEvent("assistant.message.updated", map[string]any{
+			"turn_id": "turn-byte", "agent_iteration": 1, "item_id": "item-byte", "message_revision": strconv.FormatUint(cursor-1, 10), "content": strings.Repeat("byte-window", 200),
 		})})
-		readTransientEvent(t, opened, protocol.SubscriptionEventTextDelta, strconv.FormatUint(cursor, 10))
+		readTransientEvent(t, opened, protocol.SubscriptionEventAssistantMessageUpdated, strconv.FormatUint(cursor, 10))
 	}
 	owner.mu.Lock()
 	if owner.transientRun.replayBytes > provider.options.TransientReplayBytes || len(owner.transientRun.replay) >= 16 {
@@ -320,8 +389,9 @@ func TestTransientEventDuringOpenBarrierIsDeliveredAfterRegistration(t *testing.
 	}
 	defer opened.Close()
 	readTransientEvent(t, opened, protocol.SubscriptionEventRunStarted, "1")
-	text := readTransientEvent(t, opened, protocol.SubscriptionEventTextDelta, "2")
-	if text.RunID != run.ID() || text.Delta != "after barrier" {
+	readTransientEvent(t, opened, protocol.SubscriptionEventAssistantMessageStarted, "2")
+	text := readTransientEvent(t, opened, protocol.SubscriptionEventAssistantMessageUpdated, "3")
+	if text.RunID != run.ID() || text.AssistantContent != "after barrier" {
 		t.Fatalf("barrier text event = %#v, want run %q and cursor 2", text, run.ID())
 	}
 	close(runner.release)
@@ -347,8 +417,8 @@ func TestLateOldRunEventCannotPoisonReplacementRun(t *testing.T) {
 	// A late event after the previous durable active run has already cleared
 	// must not create a poisoned desynced run state which would reject the next
 	// admission.
-	owner.handleRunEvent(runEventInput{runID: "run-old", sessionID: session.ID, event: execution.NewSessionStreamEvent("text.delta", map[string]any{
-		"turn_id": "turn-old", "agent_iteration": 1, "item_id": "old-item", "text": "late",
+	owner.handleRunEvent(runEventInput{runID: "run-old", sessionID: session.ID, event: execution.NewSessionStreamEvent("assistant.message.updated", map[string]any{
+		"turn_id": "turn-old", "agent_iteration": 1, "item_id": "old-item", "message_revision": "1", "content": "late",
 	})})
 	owner.mu.Lock()
 	if owner.transientRun != nil {
@@ -360,8 +430,8 @@ func TestLateOldRunEventCannotPoisonReplacementRun(t *testing.T) {
 	owner.projection.snapshot.ActiveRun = &ActiveRunDescriptor{RunID: "run-new", SessionID: session.ID, Status: "running", Recoverable: true}
 	owner.mu.Unlock()
 
-	owner.handleRunEvent(runEventInput{runID: "run-old", sessionID: session.ID, event: execution.NewSessionStreamEvent("text.delta", map[string]any{
-		"turn_id": "turn-old", "agent_iteration": 1, "item_id": "old-item", "text": "late",
+	owner.handleRunEvent(runEventInput{runID: "run-old", sessionID: session.ID, event: execution.NewSessionStreamEvent("assistant.message.updated", map[string]any{
+		"turn_id": "turn-old", "agent_iteration": 1, "item_id": "old-item", "message_revision": "1", "content": "late",
 	})})
 	owner.mu.Lock()
 	if owner.transientRun != nil {
@@ -459,8 +529,8 @@ func TestNoSubscriberRunGapIsCoalescedAndReopenRequiresRecovery(t *testing.T) {
 
 	start := time.Now()
 	for index := 0; index < 10000; index++ {
-		provider.RunEvent(run, execution.NewSessionStreamEvent("text.delta", map[string]any{
-			"turn_id": "turn-pressure", "agent_iteration": 1, "item_id": "item-pressure", "text": "x",
+		provider.RunEvent(run, execution.NewSessionStreamEvent("assistant.message.updated", map[string]any{
+			"turn_id": "turn-pressure", "agent_iteration": 1, "item_id": "item-pressure", "message_revision": strconv.Itoa(index + 1), "content": "x",
 		}))
 	}
 	if elapsed := time.Since(start); elapsed > time.Second {
@@ -573,8 +643,8 @@ func TestTransientOwnerQueueOverflowIsNonBlockingAndSignalsResourceRecovery(t *t
 	for index := 0; index < 8; index++ {
 		overflowErr = owner.enqueue(ownerTask{runEvent: &runEventInput{
 			runID: "run-owner-overflow", sessionID: session.ID,
-			event: execution.NewSessionStreamEvent("text.delta", map[string]any{
-				"turn_id": "turn-1", "agent_iteration": 1, "item_id": "item-1", "text": "queued",
+			event: execution.NewSessionStreamEvent("assistant.message.updated", map[string]any{
+				"turn_id": "turn-1", "agent_iteration": 1, "item_id": "item-1", "message_revision": strconv.Itoa(index + 1), "content": "queued",
 			}),
 		}, bytes: 256})
 		if overflowErr == ErrQueueFull {

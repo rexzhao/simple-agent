@@ -152,7 +152,7 @@ test('stops following output when the user scrolls up, resumes at the bottom', a
   const finale = newGate()
   const server = await installSyncMock(page, {
     projects: [project], sessions: [session], contents: { [session.id]: { items: items(101, 150), hasMoreBefore: true } },
-    onCommand: runHook([{ type: 'text.delta', turn_id: 'turn-1', agent_iteration: 1, item_id: 'item-live', delta: 'First chunk. ' }], [more, finale]),
+    onCommand: runHook([{ type: 'assistant.message.updated', turn_id: 'turn-1', agent_iteration: 1, item_id: 'item-live', message_revision: '1', content: 'First chunk. ', tool_calls: [] }], [more, finale]),
   })
   await page.goto('/#token=e2e')
   const messages = page.locator('.messages')
@@ -161,7 +161,7 @@ test('stops following output when the user scrolls up, resumes at the bottom', a
   await page.getByPlaceholder('Send a message to SAI').fill('hi')
   await page.getByRole('button', { name: 'Send' }).click()
   await expect(page.getByText(/First chunk/)).toBeAttached()
-  more.release([{ type: 'text.delta', turn_id: 'turn-1', agent_iteration: 1, item_id: 'item-live', delta: 'Second chunk, deliberately padded. '.repeat(20) }])
+  more.release([{ type: 'assistant.message.updated', turn_id: 'turn-1', agent_iteration: 1, item_id: 'item-live', message_revision: '2', content: `First chunk. ${'Second chunk, deliberately padded. '.repeat(20)}`, tool_calls: [] }])
   await expect(page.getByText(/Second chunk/)).toBeAttached()
   await twoFrames(page)
   await messages.hover()
@@ -169,7 +169,7 @@ test('stops following output when the user scrolls up, resumes at the bottom', a
   await expect.poll(() => distanceFromBottom(page)).toBeGreaterThan(100)
   await twoFrames(page)
   const awayBeforeFinal = await messages.evaluate((element) => element.scrollTop)
-  finale.release([{ type: 'text.delta', turn_id: 'turn-1', agent_iteration: 1, item_id: 'item-live', delta: 'Final chunk. ' }])
+  finale.release([{ type: 'assistant.message.updated', turn_id: 'turn-1', agent_iteration: 1, item_id: 'item-live', message_revision: '3', content: `First chunk. ${'Second chunk, deliberately padded. '.repeat(20)}Final chunk. `, tool_calls: [] }])
   // New typed output must not move a user who has explicitly left the bottom.
   await twoFrames(page)
   await expect.poll(async () => Math.abs(await messages.evaluate((element) => element.scrollTop) - awayBeforeFinal)).toBeLessThanOrEqual(4)
@@ -213,7 +213,7 @@ test('a settling run keeps loaded older history and the viewport anchor', async 
         await new Promise<void>((resolve) => setTimeout(resolve, 0))
         const sid = String(command.arguments.session_id)
         const rid = String(command.arguments.run_id)
-        mock.sendEvents(sid, rid, [{ type: 'text.delta', turn_id: 'turn-1', agent_iteration: 1, item_id: 'live', delta: 'Working… ' }])
+        mock.sendEvents(sid, rid, [{ type: 'assistant.message.updated', turn_id: 'turn-1', agent_iteration: 1, item_id: 'live', message_revision: '1', content: 'Working… ', tool_calls: [] }])
         await settle.promise
         settled = true
         mock.settleRun(sid, rid, 'committed', tail())

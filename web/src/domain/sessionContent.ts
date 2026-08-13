@@ -199,13 +199,13 @@ export interface SessionContentSnapshot {
   readonly compaction: SessionContentCompaction
 }
 
-export interface SessionTransientText {
+export interface SessionLiveMessage {
   readonly key: SessionContentItemKey
-  readonly text: string
-  /** Length of the durable prefix when this transient tail was opened. */
-  readonly baseLength: number
-  readonly checkpointLength?: number
-  readonly checkpointed: boolean
+  readonly revision: string
+  readonly status: 'streaming' | 'complete' | 'incomplete'
+  /** False when only lifecycle metadata is available and the wire snapshot was omitted. */
+  readonly snapshotAvailable?: boolean
+  readonly message: SessionContentMessage
 }
 
 export interface SessionReasoningTiming {
@@ -253,8 +253,7 @@ export interface SessionRunState {
   readonly runCursor: string
   readonly turnID?: string
   readonly status: 'running' | 'committed' | 'failed' | 'interrupted' | 'cancelled'
-  readonly text: Readonly<Record<string, SessionTransientText>>
-  readonly reasoning: Readonly<Record<string, SessionTransientText>>
+  readonly messages: Readonly<Record<string, SessionLiveMessage>>
   readonly reasoningTimings?: Readonly<Record<string, SessionReasoningTiming>>
   readonly tools: Readonly<Record<string, SessionToolState>>
   readonly stepOrder: readonly SessionRunStepRef[]

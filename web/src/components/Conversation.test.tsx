@@ -249,7 +249,7 @@ describe('Conversation identity boundary', () => {
     const activeRun: ActiveRun = {
       id: 'run-1', sessionID: 's1', turnID: 'turn-live', assistantText: 'b', steps: [],
       agentIteration: 1, status: 'running',
-      assistantItems: { 'turn-live:1': { itemID: 'assistant-stream', durableTextLength: 1 } },
+      messages: { '["turn-live",1,"assistant-stream"]': { turnID: 'turn-live', agentIteration: 1, itemID: 'assistant-stream', revision: '1', status: 'streaming', text: 'ab' } },
     }
     const { container, rerender } = renderConversation(<Conversation {...baseProps} sessionID="s1" detail={detail} page={page} activeRun={activeRun} />)
     expect(container.querySelectorAll('.message.assistant:not(.transient)')).toHaveLength(1)
@@ -280,9 +280,9 @@ describe('Conversation identity boundary', () => {
 		}
 		const activeRun: ActiveRun = {
 			id: 'run-current', sessionID: 's1', turnID: 'turn-current', assistantText: '', steps: [], agentIteration: 2, status: 'running',
-			assistantItems: {
-				'turn-current:1': { itemID: 'assistant-current-1', durableTextLength: 20 },
-				'turn-current:2': { itemID: 'assistant-current-2', durableTextLength: 21 },
+			messages: {
+				'["turn-current",1,"assistant-current-1"]': { turnID: 'turn-current', agentIteration: 1, itemID: 'assistant-current-1', revision: '1', status: 'streaming', text: 'first current answer' },
+				'["turn-current",2,"assistant-current-2"]': { turnID: 'turn-current', agentIteration: 2, itemID: 'assistant-current-2', revision: '1', status: 'streaming', text: 'second current answer' },
 			},
 		}
 		const view = renderConversation(<Conversation {...baseProps} sessionID="s1" detail={detail} page={page} activeRun={activeRun} />)
@@ -518,7 +518,7 @@ describe('Conversation live cursor', () => {
   it('removes the reasoning dot when output owns the still-running tail', () => {
     const { container } = renderConversation(<Conversation {...baseProps} sessionID="s1" detail={session('s1')}
       activeRun={runWith({
-        assistantText: 'partial output',
+        messages: { '["turn-live",1,"assistant-live"]': { turnID: 'turn-live', agentIteration: 1, itemID: 'assistant-live', revision: '1', status: 'streaming', text: 'partial output' } },
         steps: [{ kind: 'reasoning', id: 'r-output', text: 'thinking', iteration: 1 }],
       })} />)
     expect(container.querySelector('.reasoning-step')).not.toBeNull()
@@ -536,7 +536,7 @@ describe('Conversation live cursor', () => {
 
   it('shows the cursor after transient text in the same text container', () => {
     const { container } = renderConversation(<Conversation {...baseProps} sessionID="s1" detail={session('s1')}
-      activeRun={runWith({ assistantText: 'partial output' })} />)
+      activeRun={runWith({ messages: { '["turn-live",1,"assistant-live"]': { turnID: 'turn-live', agentIteration: 1, itemID: 'assistant-live', revision: '1', status: 'streaming', text: 'partial output' } } })} />)
     const stream = container.querySelector('.assistant-stream')
     expect(stream).not.toBeNull()
     expect(stream?.querySelectorAll('.cursor')).toHaveLength(1)
@@ -552,7 +552,7 @@ describe('Conversation live cursor', () => {
     expect(view.container.querySelectorAll('.cursor')).toHaveLength(1)
     expect(view.container.querySelector('.tool-row.running')).not.toBeNull()
     view.rerender(<Conversation {...baseProps} sessionID="s1" detail={session('s1')}
-      activeRun={runWith({ assistantText: 'partial output' })} />)
+      activeRun={runWith({ messages: { '["turn-live",1,"assistant-live"]': { turnID: 'turn-live', agentIteration: 1, itemID: 'assistant-live', revision: '1', status: 'streaming', text: 'partial output' } } })} />)
     expect(view.container.querySelectorAll('.cursor')).toHaveLength(1)
   })
 
@@ -569,7 +569,7 @@ describe('Conversation live cursor', () => {
       activeRun={runWith({
         turnID: 'turn-live', agentIteration: 1, assistantText: ' tail',
         steps: [{ kind: 'reasoning', id: 'stale-reasoning', text: 'stale', iteration: 1, turnID: 'turn-live', itemID: 'assistant-1' }],
-        assistantItems: { 'turn-live:1': { itemID: 'assistant-1', durableTextLength: 6 } },
+        messages: { '["turn-live",1,"assistant-1"]': { turnID: 'turn-live', agentIteration: 1, itemID: 'assistant-1', revision: '1', status: 'streaming', text: 'answer tail' } },
       })} />)
     const message = container.querySelector('.message.assistant:not(.transient)')
     expect(container.querySelectorAll('.cursor')).toHaveLength(1)
@@ -594,9 +594,9 @@ describe('Conversation live cursor', () => {
     expect(container.querySelectorAll('.active-cursor')).toHaveLength(0)
     expect(container.querySelectorAll('.message.assistant.transient')).toHaveLength(0)
     rerender(<Conversation {...baseProps} sessionID="s1" detail={session('s1')}
-      activeRun={runWith({ assistantText: 'partial output', status: 'reconciling' })} />)
+      activeRun={runWith({ messages: { '["turn-live",1,"assistant-live"]': { turnID: 'turn-live', agentIteration: 1, itemID: 'assistant-live', revision: '1', status: 'streaming', text: 'partial output' } }, status: 'reconciling' })} />)
     expect(container.querySelectorAll('.cursor')).toHaveLength(0)
-    expect(container.querySelectorAll('.active-cursor')).toHaveLength(1)
-    expect(container.querySelector('.active-cursor')?.textContent).toContain('partial output')
+    expect(container.querySelectorAll('.active-cursor')).toHaveLength(0)
+    expect(container.querySelector('.message.assistant.transient')?.textContent).toContain('partial output')
   })
 })

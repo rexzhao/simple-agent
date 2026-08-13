@@ -15,17 +15,19 @@ import (
 type SubscriptionEventType string
 
 const (
-	SubscriptionEventTextDelta      SubscriptionEventType = "text.delta"
-	SubscriptionEventReasoningDelta SubscriptionEventType = "reasoning.delta"
-	SubscriptionEventToolRequested  SubscriptionEventType = "tool.requested"
-	SubscriptionEventToolRunning    SubscriptionEventType = "tool.running"
-	SubscriptionEventToolProgress   SubscriptionEventType = "tool.progress"
-	SubscriptionEventToolFinished   SubscriptionEventType = "tool.finished"
-	SubscriptionEventPromptQueue    SubscriptionEventType = "run.prompt_queue"
-	SubscriptionEventPromptAppended SubscriptionEventType = "run.prompt_appended"
-	SubscriptionEventRunStarted     SubscriptionEventType = "run.started"
-	SubscriptionEventTurnFailed     SubscriptionEventType = "turn.failed"
-	SubscriptionEventRunSettled     SubscriptionEventType = "run.settled"
+	SubscriptionEventAssistantMessageStarted   SubscriptionEventType = "assistant.message.started"
+	SubscriptionEventAssistantMessageUpdated   SubscriptionEventType = "assistant.message.updated"
+	SubscriptionEventAssistantMessageCompleted SubscriptionEventType = "assistant.message.completed"
+	SubscriptionEventAssistantMessageFailed    SubscriptionEventType = "assistant.message.failed"
+	SubscriptionEventToolRequested             SubscriptionEventType = "tool.requested"
+	SubscriptionEventToolRunning               SubscriptionEventType = "tool.running"
+	SubscriptionEventToolProgress              SubscriptionEventType = "tool.progress"
+	SubscriptionEventToolFinished              SubscriptionEventType = "tool.finished"
+	SubscriptionEventPromptQueue               SubscriptionEventType = "run.prompt_queue"
+	SubscriptionEventPromptAppended            SubscriptionEventType = "run.prompt_appended"
+	SubscriptionEventRunStarted                SubscriptionEventType = "run.started"
+	SubscriptionEventTurnFailed                SubscriptionEventType = "turn.failed"
+	SubscriptionEventRunSettled                SubscriptionEventType = "run.settled"
 )
 
 const MaxTransientFailureMessageRunes = 600
@@ -34,6 +36,12 @@ type PromptQueueEntry struct {
 	ID      string `json:"id"`
 	Content string `json:"content"`
 	Steer   bool   `json:"steer"`
+}
+
+type AssistantToolCall struct {
+	ID        string `json:"id"`
+	Name      string `json:"name"`
+	Arguments string `json:"arguments,omitempty"`
 }
 
 type TransientItemWatermark struct {
@@ -63,18 +71,20 @@ type TransientSubscriptionEvent struct {
 	RunID     string                `json:"run_id"`
 	RunCursor RunCursor             `json:"run_cursor"`
 
-	TurnID              string `json:"turn_id,omitempty"`
-	AgentIteration      int    `json:"agent_iteration,omitempty"`
-	ItemID              string `json:"item_id,omitempty"`
-	Delta               string `json:"delta,omitempty"`
-	DurableTextLength   *int   `json:"durable_text_length,omitempty"`
-	DurableCheckpointed *bool  `json:"durable_checkpointed,omitempty"`
+	TurnID           string              `json:"turn_id,omitempty"`
+	AgentIteration   int                 `json:"agent_iteration,omitempty"`
+	ItemID           string              `json:"item_id,omitempty"`
+	MessageRevision  string              `json:"message_revision,omitempty"`
+	AssistantContent string              `json:"content,omitempty"`
+	Reasoning        string              `json:"reasoning,omitempty"`
+	ToolCalls        []AssistantToolCall `json:"tool_calls,omitempty"`
+	SnapshotOmitted  bool                `json:"snapshot_omitted,omitempty"`
 
 	ToolCallID     string `json:"tool_call_id,omitempty"`
 	Name           string `json:"name,omitempty"`
 	Arguments      string `json:"arguments,omitempty"`
 	ArgumentsDelta string `json:"arguments_delta,omitempty"`
-	Content        string `json:"content,omitempty"`
+	ToolContent    string `json:"-"`
 	IsError        *bool  `json:"is_error,omitempty"`
 
 	Prompts         []PromptQueueEntry          `json:"-"`
@@ -103,13 +113,20 @@ func (e TransientSubscriptionEvent) MarshalJSON() ([]byte, error) {
 		fields["item_id"] = e.ItemID
 	}
 	switch e.Type {
-	case SubscriptionEventTextDelta, SubscriptionEventReasoningDelta:
-		fields["delta"] = e.Delta
-		if e.DurableTextLength != nil {
-			fields["durable_text_length"] = *e.DurableTextLength
+	case SubscriptionEventAssistantMessageStarted:
+		fields["message_revision"] = e.MessageRevision
+	case SubscriptionEventAssistantMessageUpdated, SubscriptionEventAssistantMessageCompleted, SubscriptionEventAssistantMessageFailed:
+		fields["message_revision"] = e.MessageRevision
+		if e.SnapshotOmitted {
+			fields["snapshot_omitted"] = true
+		} else {
+			fields["content"] = e.AssistantContent
 		}
-		if e.DurableCheckpointed != nil {
-			fields["durable_checkpointed"] = *e.DurableCheckpointed
+		if e.Reasoning != "" {
+			fields["reasoning"] = e.Reasoning
+		}
+		if e.ToolCalls != nil {
+			fields["tool_calls"] = e.ToolCalls
 		}
 	case SubscriptionEventToolRequested, SubscriptionEventToolRunning:
 		fields["tool_call_id"], fields["name"] = e.ToolCallID, e.Name
@@ -120,8 +137,8 @@ func (e TransientSubscriptionEvent) MarshalJSON() ([]byte, error) {
 		fields["tool_call_id"], fields["name"], fields["arguments_delta"] = e.ToolCallID, e.Name, e.ArgumentsDelta
 	case SubscriptionEventToolFinished:
 		fields["tool_call_id"], fields["name"], fields["is_error"] = e.ToolCallID, e.Name, *e.IsError
-		if e.Content != "" {
-			fields["content"] = e.Content
+		if e.ToolContent != "" {
+			fields["content"] = e.ToolContent
 		}
 	case SubscriptionEventPromptQueue:
 		fields["prompts"] = e.Prompts
@@ -179,9 +196,6 @@ func (e TransientSubscriptionEvent) Validate() error {
 			return err
 		}
 	}
-	if e.DurableTextLength != nil && *e.DurableTextLength < 0 {
-		return fmt.Errorf("durable_text_length must be non-negative")
-	}
 	if e.AgentIteration < 0 {
 		return fmt.Errorf("agent_iteration must be non-negative")
 	}
@@ -191,16 +205,22 @@ func (e TransientSubscriptionEvent) Validate() error {
 		}
 		return nil
 	}
-	if err := reject("item_id", e.ItemID != ""); err != nil && e.Type != SubscriptionEventTextDelta && e.Type != SubscriptionEventReasoningDelta {
+	if err := reject("item_id", e.ItemID != ""); err != nil && !isAssistantMessageEvent(e.Type) {
 		return err
 	}
-	if err := reject("delta", e.Delta != ""); err != nil && e.Type != SubscriptionEventTextDelta && e.Type != SubscriptionEventReasoningDelta {
+	if err := reject("message_revision", e.MessageRevision != ""); err != nil && !isAssistantMessageEvent(e.Type) {
 		return err
 	}
-	if err := reject("durable_text_length", e.DurableTextLength != nil); err != nil && e.Type != SubscriptionEventTextDelta && e.Type != SubscriptionEventReasoningDelta {
+	if err := reject("assistant content", e.AssistantContent != ""); err != nil && !isAssistantMessageSnapshotEvent(e.Type) {
 		return err
 	}
-	if err := reject("durable_checkpointed", e.DurableCheckpointed != nil); err != nil && e.Type != SubscriptionEventTextDelta && e.Type != SubscriptionEventReasoningDelta {
+	if err := reject("reasoning", e.Reasoning != ""); err != nil && !isAssistantMessageSnapshotEvent(e.Type) {
+		return err
+	}
+	if err := reject("tool_calls", e.ToolCalls != nil); err != nil && !isAssistantMessageSnapshotEvent(e.Type) {
+		return err
+	}
+	if err := reject("snapshot_omitted", e.SnapshotOmitted); err != nil && e.Type != SubscriptionEventAssistantMessageCompleted && e.Type != SubscriptionEventAssistantMessageFailed {
 		return err
 	}
 	if err := reject("tool_call_id", e.ToolCallID != ""); err != nil && e.Type != SubscriptionEventToolRequested && e.Type != SubscriptionEventToolRunning && e.Type != SubscriptionEventToolProgress && e.Type != SubscriptionEventToolFinished {
@@ -215,7 +235,7 @@ func (e TransientSubscriptionEvent) Validate() error {
 	if err := reject("arguments_delta", e.ArgumentsDelta != ""); err != nil && e.Type != SubscriptionEventToolProgress {
 		return err
 	}
-	if err := reject("content", e.Content != ""); err != nil && e.Type != SubscriptionEventToolFinished {
+	if err := reject("content", e.ToolContent != ""); err != nil && e.Type != SubscriptionEventToolFinished {
 		return err
 	}
 	if err := reject("is_error", e.IsError != nil); err != nil && e.Type != SubscriptionEventToolFinished {
@@ -243,15 +263,35 @@ func (e TransientSubscriptionEvent) Validate() error {
 		return fmt.Errorf("turn_id is required for %q", e.Type)
 	}
 	switch e.Type {
-	case SubscriptionEventTextDelta, SubscriptionEventReasoningDelta:
+	case SubscriptionEventAssistantMessageStarted, SubscriptionEventAssistantMessageUpdated, SubscriptionEventAssistantMessageCompleted, SubscriptionEventAssistantMessageFailed:
 		if e.ItemID == "" {
 			return fmt.Errorf("item_id is required for %q", e.Type)
 		}
 		if e.AgentIteration <= 0 {
 			return fmt.Errorf("agent_iteration is required for %q", e.Type)
 		}
-		if err := requiredEventText("delta", e.Delta); err != nil {
-			return err
+		if !isCanonicalUint64(e.MessageRevision) {
+			return fmt.Errorf("message_revision must be an unsigned decimal integer")
+		}
+		if e.Type == SubscriptionEventAssistantMessageStarted && e.MessageRevision != "0" {
+			return fmt.Errorf("assistant.message.started revision must be zero")
+		}
+		if e.Type != SubscriptionEventAssistantMessageStarted && e.MessageRevision == "0" {
+			return fmt.Errorf("%s revision must be positive", e.Type)
+		}
+		if e.SnapshotOmitted && (e.AssistantContent != "" || e.Reasoning != "" || e.ToolCalls != nil) {
+			return fmt.Errorf("omitted assistant snapshot cannot carry message fields")
+		}
+		for i, call := range e.ToolCalls {
+			if err := requiredEventID("tool_calls["+strconv.Itoa(i)+"].id", call.ID); err != nil {
+				return err
+			}
+			if err := requiredEventID("tool_calls["+strconv.Itoa(i)+"].name", call.Name); err != nil {
+				return err
+			}
+			if call.Arguments != "" && !utf8.ValidString(call.Arguments) {
+				return fmt.Errorf("tool_calls[%d].arguments is not valid UTF-8", i)
+			}
 		}
 	case SubscriptionEventToolRequested, SubscriptionEventToolRunning:
 		if e.ToolCallID == "" || e.Name == "" {
@@ -282,8 +322,8 @@ func (e TransientSubscriptionEvent) Validate() error {
 		if e.AgentIteration <= 0 {
 			return fmt.Errorf("agent_iteration is required for %q", e.Type)
 		}
-		if e.Content != "" {
-			if err := requiredEventText("content", e.Content); err != nil {
+		if e.ToolContent != "" {
+			if err := requiredEventText("content", e.ToolContent); err != nil {
 				return err
 			}
 		}
@@ -439,28 +479,28 @@ func decodeSubscriptionEvent(data []byte) (TransientSubscriptionEvent, error) {
 	if err := optionalString("item_id", &event.ItemID); err != nil {
 		return TransientSubscriptionEvent{}, err
 	}
-	if err := optionalString("delta", &event.Delta); err != nil {
+	if err := optionalString("message_revision", &event.MessageRevision); err != nil {
 		return TransientSubscriptionEvent{}, err
 	}
-	if raw, ok := fields["durable_text_length"]; ok {
-		if isJSONNull(raw) {
-			return TransientSubscriptionEvent{}, fmt.Errorf("durable_text_length must be an integer")
+	decodeOptionalText := func(key string, dst *string) error {
+		raw, ok := fields[key]
+		if !ok {
+			return nil
 		}
-		var value int
-		if err := json.Unmarshal(raw, &value); err != nil {
-			return TransientSubscriptionEvent{}, fmt.Errorf("durable_text_length must be an integer")
+		if isJSONNull(raw) || json.Unmarshal(raw, dst) != nil || !utf8.ValidString(*dst) {
+			return fmt.Errorf("%s must be a UTF-8 string", key)
 		}
-		event.DurableTextLength = &value
+		return nil
 	}
-	if raw, ok := fields["durable_checkpointed"]; ok {
-		if isJSONNull(raw) {
-			return TransientSubscriptionEvent{}, fmt.Errorf("durable_checkpointed must be boolean")
+	if err := decodeOptionalText("reasoning", &event.Reasoning); err != nil {
+		return TransientSubscriptionEvent{}, err
+	}
+	if raw, ok := fields["tool_calls"]; ok {
+		toolCalls, err := decodeAssistantToolCalls(raw)
+		if err != nil {
+			return TransientSubscriptionEvent{}, err
 		}
-		var value bool
-		if err := json.Unmarshal(raw, &value); err != nil {
-			return TransientSubscriptionEvent{}, fmt.Errorf("durable_checkpointed must be boolean")
-		}
-		event.DurableCheckpointed = &value
+		event.ToolCalls = toolCalls
 	}
 	if err := optionalString("tool_call_id", &event.ToolCallID); err != nil {
 		return TransientSubscriptionEvent{}, err
@@ -474,7 +514,19 @@ func decodeSubscriptionEvent(data []byte) (TransientSubscriptionEvent, error) {
 	if err := optionalString("arguments_delta", &event.ArgumentsDelta); err != nil {
 		return TransientSubscriptionEvent{}, err
 	}
-	if err := optionalString("content", &event.Content); err != nil {
+	if isAssistantMessageSnapshotEvent(event.Type) {
+		if raw, ok := fields["snapshot_omitted"]; ok {
+			if isJSONNull(raw) || json.Unmarshal(raw, &event.SnapshotOmitted) != nil || !event.SnapshotOmitted {
+				return TransientSubscriptionEvent{}, fmt.Errorf("snapshot_omitted must be true")
+			}
+		}
+		if _, present := fields["content"]; !present && !event.SnapshotOmitted {
+			return TransientSubscriptionEvent{}, fmt.Errorf("content is required for %q", event.Type)
+		}
+		if err := decodeOptionalText("content", &event.AssistantContent); err != nil {
+			return TransientSubscriptionEvent{}, err
+		}
+	} else if err := decodeOptionalText("content", &event.ToolContent); err != nil {
 		return TransientSubscriptionEvent{}, err
 	}
 	if raw, ok := fields["is_error"]; ok {
@@ -559,6 +611,40 @@ func decodePromptQueue(raw []byte) ([]PromptQueueEntry, error) {
 	return result, nil
 }
 
+func decodeAssistantToolCalls(raw []byte) ([]AssistantToolCall, error) {
+	if isJSONNull(raw) {
+		return nil, fmt.Errorf("tool_calls must be an array")
+	}
+	var values []json.RawMessage
+	if err := json.Unmarshal(raw, &values); err != nil {
+		return nil, fmt.Errorf("tool_calls must be an array")
+	}
+	result := make([]AssistantToolCall, len(values))
+	for index, value := range values {
+		var fields map[string]json.RawMessage
+		if !isJSONObject(value) || json.Unmarshal(value, &fields) != nil {
+			return nil, fmt.Errorf("tool_calls[%d] must be an object", index)
+		}
+		for key := range fields {
+			if key != "id" && key != "name" && key != "arguments" {
+				return nil, fmt.Errorf("unknown tool_calls[%d] field %q", index, key)
+			}
+		}
+		if err := json.Unmarshal(fields["id"], &result[index].ID); err != nil || strings.TrimSpace(result[index].ID) == "" {
+			return nil, fmt.Errorf("tool_calls[%d].id is required", index)
+		}
+		if err := json.Unmarshal(fields["name"], &result[index].Name); err != nil || strings.TrimSpace(result[index].Name) == "" {
+			return nil, fmt.Errorf("tool_calls[%d].name is required", index)
+		}
+		if rawArguments, ok := fields["arguments"]; ok {
+			if isJSONNull(rawArguments) || json.Unmarshal(rawArguments, &result[index].Arguments) != nil || !utf8.ValidString(result[index].Arguments) {
+				return nil, fmt.Errorf("tool_calls[%d].arguments must be a UTF-8 string", index)
+			}
+		}
+	}
+	return result, nil
+}
+
 func decodeSettlementWatermark(raw []byte) (DurableSettlementWatermark, error) {
 	var fields map[string]json.RawMessage
 	if !isJSONObject(raw) || json.Unmarshal(raw, &fields) != nil {
@@ -617,10 +703,14 @@ func isJSONNull(raw []byte) bool {
 func rejectUnknownEventFields(eventType SubscriptionEventType, fields map[string]json.RawMessage) error {
 	allowed := map[string]struct{}{"type": {}, "session_id": {}, "run_id": {}, "run_cursor": {}, "turn_id": {}, "agent_iteration": {}, "item_id": {}}
 	switch eventType {
-	case SubscriptionEventTextDelta, SubscriptionEventReasoningDelta:
-		allowed["delta"] = struct{}{}
-		allowed["durable_text_length"] = struct{}{}
-		allowed["durable_checkpointed"] = struct{}{}
+	case SubscriptionEventAssistantMessageStarted:
+		allowed["message_revision"] = struct{}{}
+	case SubscriptionEventAssistantMessageUpdated, SubscriptionEventAssistantMessageCompleted, SubscriptionEventAssistantMessageFailed:
+		allowed["message_revision"] = struct{}{}
+		allowed["content"] = struct{}{}
+		allowed["reasoning"] = struct{}{}
+		allowed["tool_calls"] = struct{}{}
+		allowed["snapshot_omitted"] = struct{}{}
 	case SubscriptionEventToolRequested, SubscriptionEventToolRunning:
 		allowed["tool_call_id"] = struct{}{}
 		allowed["name"] = struct{}{}
@@ -657,10 +747,26 @@ func rejectUnknownEventFields(eventType SubscriptionEventType, fields map[string
 
 func knownSubscriptionEventType(eventType SubscriptionEventType) bool {
 	switch eventType {
-	case SubscriptionEventTextDelta, SubscriptionEventReasoningDelta, SubscriptionEventToolRequested, SubscriptionEventToolRunning, SubscriptionEventToolProgress, SubscriptionEventToolFinished, SubscriptionEventPromptQueue, SubscriptionEventPromptAppended, SubscriptionEventRunStarted, SubscriptionEventTurnFailed, SubscriptionEventRunSettled:
+	case SubscriptionEventAssistantMessageStarted, SubscriptionEventAssistantMessageUpdated, SubscriptionEventAssistantMessageCompleted, SubscriptionEventAssistantMessageFailed, SubscriptionEventToolRequested, SubscriptionEventToolRunning, SubscriptionEventToolProgress, SubscriptionEventToolFinished, SubscriptionEventPromptQueue, SubscriptionEventPromptAppended, SubscriptionEventRunStarted, SubscriptionEventTurnFailed, SubscriptionEventRunSettled:
 		return true
 	}
 	return false
+}
+
+func isAssistantMessageEvent(eventType SubscriptionEventType) bool {
+	return eventType == SubscriptionEventAssistantMessageStarted || isAssistantMessageSnapshotEvent(eventType)
+}
+
+func isAssistantMessageSnapshotEvent(eventType SubscriptionEventType) bool {
+	return eventType == SubscriptionEventAssistantMessageUpdated || eventType == SubscriptionEventAssistantMessageCompleted || eventType == SubscriptionEventAssistantMessageFailed
+}
+
+func isCanonicalUint64(value string) bool {
+	if value == "" || (len(value) > 1 && value[0] == '0') {
+		return false
+	}
+	_, err := strconv.ParseUint(value, 10, 64)
+	return err == nil
 }
 
 func requiredEventID(field, value string) error {

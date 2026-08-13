@@ -9,7 +9,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-	"unicode/utf8"
 
 	"github.com/rexzhao/simple-agent/internal/eventbus"
 	"github.com/rexzhao/simple-agent/internal/model"
@@ -69,7 +68,7 @@ type SessionItemMessage struct {
 	Content *SessionItemMessageContent `json:"content,omitempty"`
 	// Reasoning is included only when the session's show_reasoning setting is
 	// enabled. It is persisted on the assistant message, so terminal history
-	// does not depend on the transient reasoning.delta stream.
+	// does not depend on the transient assistant-message reasoning snapshot.
 	Reasoning  string                       `json:"reasoning,omitempty"`
 	Images     []SessionItemImageAttachment `json:"images,omitempty"`
 	ToolCallID string                       `json:"tool_call_id,omitempty"`
@@ -116,10 +115,9 @@ func NewSessionStreamEvent(eventType string, fields map[string]any) SessionStrea
 // on emit, and a dedicated goroutine drains the queue serially.
 //
 // Coalescing happens at submit time under the queue mutex: a queued, consecutive
-// text.delta / reasoning.delta with the same turn_id and type is folded into the
-// trailing queued delta via exact concatenation, so a blocked emit cannot grow
-// the queue by one map per delta. Caller-owned event maps are never mutated; a
-// merged delta is rebuilt from its accumulator when drained. Every other event
+// assistant.message.updated with the same item_id is replaced by the newer
+// complete snapshot, so a blocked emit cannot grow the queue by one map per
+// provider delta. Every other event
 // is delivered verbatim, in submission order, until a hard messages/bytes bound
 // is reached. On overflow the pending queue is discarded and one explicit
 // run.resync_required marker is emitted after any already-drained batch; this is
@@ -143,17 +141,8 @@ type sessionEventSink struct {
 }
 
 type sinkOp struct {
-	event               SessionStreamEvent // verbatim event for non-delta ops
-	isDelta             bool
-	eventType           string
-	turnID              string
-	agentIteration      int
-	text                *strings.Builder // accumulator for delta ops
-	bytes               int
-	assistantItemID     string
-	durableTextLength   int
-	durableCheckpointed bool
-	hasAssistantBinding bool
+	event SessionStreamEvent
+	bytes int
 }
 
 func newSessionEventSink(emit func(SessionStreamEvent)) *sessionEventSink {
@@ -188,70 +177,68 @@ func (s *sessionEventSink) submit(event SessionStreamEvent) {
 		s.mu.Unlock()
 		return
 	}
-	if eventType == "text.delta" || eventType == "reasoning.delta" {
-		text, _ := event["text"].(string)
+	if eventType == "assistant.message.updated" {
 		turnID, _ := event["turn_id"].(string)
-		agentIteration, _ := event["agent_iteration"].(int)
-		assistantItemID, _ := event["item_id"].(string)
-		hasAssistantBinding := assistantItemID != ""
-		durableTextLength, _ := sessionStreamInteger(event["durable_text_length"])
-		durableCheckpointed, _ := event["durable_checkpointed"].(bool)
+		iteration, _ := event["agent_iteration"].(int)
+		itemID, _ := event["item_id"].(string)
+		revision, revisionOK := sessionMessageRevision(event)
 		if n := len(s.ops); n > 0 {
 			last := &s.ops[n-1]
-			if last.isDelta && last.eventType == eventType && last.turnID == turnID && last.agentIteration == agentIteration &&
-				last.hasAssistantBinding == hasAssistantBinding &&
-				(!hasAssistantBinding || (last.assistantItemID == assistantItemID &&
-					(eventType != "text.delta" ||
-						(last.durableCheckpointed == durableCheckpointed && last.durableTextLength == durableTextLength)))) {
-				if s.queuedBytes > s.maxBytes-len(text) {
+			lastType, _ := last.event["type"].(string)
+			lastTurnID, _ := last.event["turn_id"].(string)
+			lastIteration, _ := last.event["agent_iteration"].(int)
+			lastItemID, _ := last.event["item_id"].(string)
+			lastRevision, lastRevisionOK := sessionMessageRevision(last.event)
+			if lastType == eventType && lastTurnID == turnID && lastIteration == iteration && lastItemID == itemID && revisionOK && lastRevisionOK && revision <= lastRevision {
+				s.mu.Unlock()
+				return
+			}
+			if lastType == eventType && lastTurnID == turnID && lastIteration == iteration && lastItemID == itemID && revisionOK && lastRevisionOK {
+				bytes := sessionEventSinkEventBytes(event)
+				if s.queuedBytes-last.bytes > s.maxBytes-bytes {
 					s.overflowLocked()
 					s.mu.Unlock()
 					return
 				}
-				last.text.WriteString(text)
-				last.bytes += len(text)
-				s.queuedBytes += len(text)
+				s.queuedBytes += bytes - last.bytes
+				last.event = event
+				last.bytes = bytes
 				s.mu.Unlock()
 				return
 			}
 		}
-		bytes := sessionEventSinkEventBytes(event)
-		if !s.canAppendLocked(bytes) {
-			s.overflowLocked()
-			s.mu.Unlock()
-			return
-		}
-		builder := &strings.Builder{}
-		builder.WriteString(text)
-		s.ops = append(s.ops, sinkOp{
-			isDelta:             true,
-			eventType:           eventType,
-			turnID:              turnID,
-			agentIteration:      agentIteration,
-			text:                builder,
-			bytes:               bytes,
-			assistantItemID:     assistantItemID,
-			durableTextLength:   durableTextLength,
-			durableCheckpointed: durableCheckpointed,
-			hasAssistantBinding: hasAssistantBinding,
-		})
-		s.queuedBytes += bytes
-	} else {
-		bytes := sessionEventSinkEventBytes(event)
-		if !s.canAppendLocked(bytes) {
-			s.overflowLocked()
-			s.mu.Unlock()
-			return
-		}
-		s.ops = append(s.ops, sinkOp{event: event})
-		s.ops[len(s.ops)-1].bytes = bytes
-		s.queuedBytes += bytes
 	}
+	bytes := sessionEventSinkEventBytes(event)
+	if !s.canAppendLocked(bytes) {
+		s.overflowLocked()
+		s.mu.Unlock()
+		return
+	}
+	s.ops = append(s.ops, sinkOp{event: event, bytes: bytes})
+	s.queuedBytes += bytes
 	s.cond.Signal()
 	s.mu.Unlock()
 }
 
 func sessionEventSinkEventBytes(event SessionStreamEvent) int {
+	if eventType, _ := event["type"].(string); strings.HasPrefix(eventType, "assistant.message.") {
+		bytes := 512
+		for _, field := range []string{"turn_id", "item_id", "message_revision", "content", "reasoning"} {
+			if value, ok := event[field].(string); ok {
+				bytes += len(value)
+			}
+		}
+		if calls, ok := event["tool_calls"].([]map[string]any); ok {
+			for _, call := range calls {
+				for _, field := range []string{"id", "name", "arguments"} {
+					if value, ok := call[field].(string); ok {
+						bytes += len(value)
+					}
+				}
+			}
+		}
+		return bytes
+	}
 	encoded, err := json.Marshal(event)
 	if err != nil {
 		return defaultSessionEventSinkBytes + 1
@@ -260,6 +247,15 @@ func sessionEventSinkEventBytes(event SessionStreamEvent) int {
 	// is the accounting unit, and the allowance covers the strings retained by
 	// sinkOp which are not present in the rebuilt delta map independently.
 	return len(encoded) + 128
+}
+
+func sessionMessageRevision(event SessionStreamEvent) (uint64, bool) {
+	value, ok := event["message_revision"].(string)
+	if !ok || value == "" || (len(value) > 1 && value[0] == '0') {
+		return 0, false
+	}
+	revision, err := strconv.ParseUint(value, 10, 64)
+	return revision, err == nil
 }
 
 func (s *sessionEventSink) canAppendLocked(bytes int) bool {
@@ -313,22 +309,7 @@ func (s *sessionEventSink) run() {
 			if s.emit == nil {
 				continue
 			}
-			if op.isDelta {
-				fields := map[string]any{"turn_id": op.turnID, "text": op.text.String()}
-				if op.agentIteration > 0 {
-					fields["agent_iteration"] = op.agentIteration
-				}
-				if op.hasAssistantBinding {
-					fields["item_id"] = op.assistantItemID
-					if op.eventType == "text.delta" {
-						fields["durable_text_length"] = op.durableTextLength
-						fields["durable_checkpointed"] = op.durableCheckpointed
-					}
-				}
-				s.emit(NewSessionStreamEvent(op.eventType, fields))
-			} else {
-				s.emit(op.event)
-			}
+			s.emit(op.event)
 		}
 
 		s.mu.Lock()
@@ -346,22 +327,6 @@ func (s *sessionEventSink) run() {
 		if empty {
 			return
 		}
-	}
-}
-
-func sessionStreamInteger(value any) (int, bool) {
-	switch value := value.(type) {
-	case int:
-		return value, true
-	case int64:
-		return int(value), true
-	case float64:
-		if value != float64(int(value)) {
-			return 0, false
-		}
-		return int(value), true
-	default:
-		return 0, false
 	}
 }
 
@@ -762,14 +727,6 @@ func (s *Service) sessionStreamEventFromPersistedEventWithState(sessionID, runID
 		if strings.TrimSpace(runID) != "" {
 			fields["run_id"] = runID
 		}
-		if item.Message != nil && item.Message.Role == model.MessageRoleAssistant {
-			// The public DTO may contain only a preview for blob-backed content;
-			// this additive length lets the transient projection discard exactly
-			// the committed prefix without inspecting or matching text.
-			if content, err := s.sessionItemFullContent(sessionID, item); err == nil {
-				fields["assistant_text_length"] = utf8.RuneCountInString(content)
-			}
-		}
 		eventType := "item.created"
 		if event.Type == sessions.RecordTypeItemUpdated {
 			eventType = "item.updated"
@@ -825,28 +782,37 @@ func sessionStreamEventFromModelEvent(turnID string, agentIteration int, event m
 			return nil, false
 		}
 		return modelSessionStreamEvent("agent.iteration.started", turnID, event.Iteration, nil), true
-	case model.TextDeltaEvent:
-		if event.Text == "" {
+	case model.AssistantMessageStartedEvent:
+		if event.ItemID == "" || event.AgentIteration <= 0 {
 			return nil, false
 		}
-		fields := map[string]any{
-			"text": event.Text,
-		}
-		if event.AssistantItemID != "" {
-			fields["item_id"] = event.AssistantItemID
-			fields["durable_text_length"] = event.DurableTextLength
-			fields["durable_checkpointed"] = event.DurableCheckpointed
-		}
-		return modelSessionStreamEvent("text.delta", turnID, agentIteration, fields), true
-	case model.ReasoningDeltaEvent:
-		if !showReasoning || event.Text == "" {
+		return modelSessionStreamEvent("assistant.message.started", turnID, event.AgentIteration, map[string]any{
+			"item_id": event.ItemID, "message_revision": "0",
+		}), true
+	case model.AssistantMessageUpdatedEvent:
+		if event.ItemID == "" || event.AgentIteration <= 0 || event.Revision == 0 {
 			return nil, false
 		}
-		fields := map[string]any{"text": event.Text}
-		if event.AssistantItemID != "" {
-			fields["item_id"] = event.AssistantItemID
+		if assistantMessageSnapshotBytes(event.Message, showReasoning) > 192*1024 {
+			return nil, false
 		}
-		return modelSessionStreamEvent("reasoning.delta", turnID, agentIteration, fields), true
+		return assistantMessageSessionStreamEvent("assistant.message.updated", turnID, event.AgentIteration, event.ItemID, event.Revision, event.Message, showReasoning, false), true
+	case model.AssistantMessageCompletedEvent:
+		if event.ItemID == "" || event.AgentIteration <= 0 || event.Revision == 0 {
+			return nil, false
+		}
+		omitted := assistantMessageSnapshotBytes(event.Message, showReasoning) > 192*1024
+		return assistantMessageSessionStreamEvent("assistant.message.completed", turnID, event.AgentIteration, event.ItemID, event.Revision, event.Message, showReasoning, omitted), true
+	case model.AssistantMessageFailedEvent:
+		if event.ItemID == "" || event.AgentIteration <= 0 || event.Revision == 0 {
+			return nil, false
+		}
+		omitted := assistantMessageSnapshotBytes(event.Message, showReasoning) > 192*1024
+		return assistantMessageSessionStreamEvent("assistant.message.failed", turnID, event.AgentIteration, event.ItemID, event.Revision, event.Message, showReasoning, omitted), true
+	case model.TextDeltaEvent, model.ReasoningDeltaEvent:
+		// Provider deltas are internal accumulator input. Public consumers receive
+		// idempotent assistant-message snapshots above.
+		return nil, false
 	case model.ToolCallDoneEvent:
 		if event.ToolCall.Name == "" {
 			return nil, false
@@ -910,6 +876,37 @@ func sessionStreamEventFromModelEvent(turnID string, agentIteration int, event m
 	default:
 		return nil, false
 	}
+}
+
+func assistantMessageSessionStreamEvent(eventType, turnID string, agentIteration int, itemID string, revision uint64, message model.Message, showReasoning, omitted bool) SessionStreamEvent {
+	if omitted {
+		return modelSessionStreamEvent(eventType, turnID, agentIteration, map[string]any{
+			"item_id": itemID, "message_revision": strconv.FormatUint(revision, 10), "snapshot_omitted": true,
+		})
+	}
+	toolCalls := make([]map[string]any, 0, len(message.ToolCalls))
+	for _, call := range message.ToolCalls {
+		toolCalls = append(toolCalls, map[string]any{"id": call.ID, "name": call.Name, "arguments": sessionToolDisplayArguments(call.Name, call.Arguments)})
+	}
+	fields := map[string]any{
+		"item_id": itemID, "message_revision": strconv.FormatUint(revision, 10),
+		"content": message.Content, "tool_calls": toolCalls,
+	}
+	if showReasoning && message.ReasoningContent != "" {
+		fields["reasoning"] = message.ReasoningContent
+	}
+	return modelSessionStreamEvent(eventType, turnID, agentIteration, fields)
+}
+
+func assistantMessageSnapshotBytes(message model.Message, showReasoning bool) int {
+	total := len(message.Content)
+	if showReasoning {
+		total += len(message.ReasoningContent)
+	}
+	for _, call := range message.ToolCalls {
+		total += len(call.ID) + len(call.Name) + len(call.Arguments) + 64
+	}
+	return total
 }
 
 func modelSessionStreamEvent(eventType, turnID string, agentIteration int, fields map[string]any) SessionStreamEvent {

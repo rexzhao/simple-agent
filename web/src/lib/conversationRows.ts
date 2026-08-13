@@ -158,65 +158,25 @@ export function buildConversationRows(input: BuildConversationRowsInput): Conver
       }),
     }
   })
-  const assistantBinding = activeRun ? activeAssistantBinding(activeRun) : undefined
-  const contentTails = activeRun?.assistantTails ?? {}
-  const contentTailKeys = new Set(Object.keys(contentTails))
+  const liveMessages = activeRun?.messages ?? {}
+  const liveMessageKeys = new Set(Object.keys(liveMessages))
   const durableAssistantItems = new Map(input.items
     .filter((item) => item.message?.role === 'assistant')
     .map((item) => [sessionItemIdentityKey(item), item]))
   const durableAssistantKeys = new Set(durableAssistantItems.keys())
-  const contentTailMergedKeys = new Set([...contentTailKeys].filter((key) => {
-    const item = durableAssistantItems.get(key)
-    const tail = contentTails[key]
-    const inline = item?.message?.content?.inline
-    // The repository has already merged the checkpointed portion (and the
-    // remaining transient portion) into inline content.  Any increase beyond
-    // the identity's base watermark therefore means this row already owns the
-    // tail.  This is a protocol length check, not text matching; equality is
-    // the only state in which the repository has no inline tail to render.
-    // Blob/preview content cannot be concatenated by the page, so its keyed
-    // tail remains presentation-owned below.
-    return inline !== undefined && tail !== undefined && inline.length > tail.durableTextLength
-  }))
-  // The binding is an explicit backend-provided item id. The page may not yet
-  // contain that item during the append/snapshot race; only then do we retain
-  // the process-row fallback. Never infer this relationship from text or turn
-  // content, since identical output can be two distinct assistant messages.
-  const attachedAssistantIdentity = assistantBinding && historicalRows.some((row) =>
-    row.kind === 'message' && sessionItemIdentityKey(row.item) === assistantIdentityKey(assistantBinding) && row.item.message?.role === 'assistant',
-  ) ? assistantIdentityKey(assistantBinding) : undefined
-  // Every keyed tail that already has a durable assistant row is rendered by
-  // that row.  This includes a row whose durable projection is still behind
-  // the watermark: the row owns the remaining `assistantTail` below, so the
-  // process/cursor must not manufacture a second presentation owner.
-  const attachedContentTails = [...contentTailKeys].filter((key) => durableAssistantItems.has(key))
-  const hasAttachedAssistant = Boolean(attachedAssistantIdentity) || attachedContentTails.length > 0
-  // A final assistant projection can arrive while the stream still contains
-  // the reasoning deltas that produced it. Build the suppression set from
-  // complete durable identities only; incomplete legacy events remain
-  // transient until the durable projection is rendered after settlement.
-  const durableReasoning = activeRun ? durableReasoningIdentities(input.items, activeRun) : emptyDurableReasoningIdentities()
+  const hasAttachedAssistant = [...liveMessageKeys].some((key) => durableAssistantItems.has(key))
+  const durableReasoning = durableReasoningIdentities(input.items)
   const rows = historicalRows.map((row): ConversationRow => {
     if (row.kind !== 'message') return row
     const identity = sessionItemIdentityKey(row.item)
-    if (contentTailKeys.has(identity) && row.item.message?.role === 'assistant') {
-      const tail = contentTails[identity]
-      // The sync repository owns a successfully checkpointed inline merge.
-      // If a durable window is still behind the transient watermark (or is a
-      // preview/blob descriptor), keep the exact identity's remaining tail in
-      // this one message row. It is still rendered exactly once.
-      return {
-        ...row,
-        ...(tail && !contentTailMergedKeys.has(identity) && tail.text ? { assistantTail: tail.text } : {}),
-        assistantStreaming: activeRun?.status === 'running',
-      }
-    }
-    if (identity !== attachedAssistantIdentity) return row
-    return {
-      ...row,
-      assistantTail: activeRun?.assistantText || undefined,
-      assistantStreaming: activeRun?.status === 'running',
-    }
+    const live = liveMessages[identity]
+    return live && row.item.message?.role === 'assistant'
+      ? {
+          ...row,
+          item: { ...row.item, message: { ...row.item.message, content: { inline: live.text } } },
+          assistantStreaming: live.status === 'streaming',
+        }
+      : row
   })
 
   if (activeRun) {
@@ -249,11 +209,11 @@ export function buildConversationRows(input: BuildConversationRowsInput): Conver
     // when it has partial assistant text; otherwise it must not manufacture
     // an empty transient article.
     // Durable tools in an older turn must not suppress a fresh run's cursor.
-    const missingContentTails = Object.entries(contentTails).filter(([key, tail]) => !durableAssistantKeys.has(key) && Boolean(tail.text))
-    const keepEmptyPresentationRow = activeRun.status === 'running' || Boolean(activeRun.assistantText) || missingContentTails.length > 0
+    const missingMessages = Object.entries(liveMessages).filter(([key, message]) => !durableAssistantKeys.has(key) && Boolean(message.text))
+    const keepEmptyPresentationRow = activeRun.status === 'running' || missingMessages.length > 0
     const segments = hasLiveSteps
       ? filteredSegments
-      : hasAttachedAssistant || missingContentTails.length > 0
+      : hasAttachedAssistant || missingMessages.length > 0
         ? []
         : keepEmptyPresentationRow
           ? [{ steps: [], boundary: rawSegments[rawSegments.length - 1]?.boundary ?? 'initial' }]
@@ -281,16 +241,15 @@ export function buildConversationRows(input: BuildConversationRowsInput): Conver
         })
       }
     }
-    // An append/snapshot race can expose a live identity before its durable
-    // item. Render each identity independently until the content projection
-    // arrives; it then disappears by exact key, without a text heuristic.
-    missingContentTails.forEach(([key, tail]) => {
+    // A live message can precede its first durable checkpoint. Render the same
+    // stable entity independently until the durable projection appears.
+    missingMessages.forEach(([key, message]) => {
       rows.push({
         kind: 'active-assistant',
         key: rowKey(input.sessionID, 'active-assistant', activeRun.id, key),
         run: activeRun,
-        identity: { turnID: tail.turnID, agentIteration: tail.agentIteration, itemID: tail.itemID },
-        text: tail.text,
+        identity: { turnID: message.turnID, agentIteration: message.agentIteration, itemID: message.itemID },
+        text: message.text,
       })
     })
     if (activeRun.providerRetry) {
@@ -327,18 +286,6 @@ export function buildConversationRows(input: BuildConversationRowsInput): Conver
   return rows
 }
 
-function activeAssistantBinding(run: ActiveRun): { itemID: string; turnID: string; agentIteration: number; durableTextLength: number } | undefined {
-  const turnID = run.turnID?.trim()
-  if (!turnID || run.agentIteration <= 0) return undefined
-  const invocationKey = `${turnID}:${run.agentIteration}`
-  const indexed = run.assistantItems?.[invocationKey]
-  if (!indexed) return undefined
-  // assistantItems is only a compatibility/current-invocation index. Resolve
-  // the actual entity through the complete identity binding when available.
-  const binding = run.assistantItemBindings?.[assistantItemIdentityKey(turnID, run.agentIteration, indexed.itemID)]
-  return binding ?? { ...indexed, turnID, agentIteration: run.agentIteration }
-}
-
 interface DurableReasoningIdentities {
   identities: Set<string>
 }
@@ -347,19 +294,13 @@ function emptyDurableReasoningIdentities(): DurableReasoningIdentities {
   return { identities: new Set() }
 }
 
-function durableReasoningIdentities(items: SessionItem[], run: ActiveRun): DurableReasoningIdentities {
+function durableReasoningIdentities(items: SessionItem[]): DurableReasoningIdentities {
   const identities = emptyDurableReasoningIdentities()
   for (const item of items) {
     if (item.message?.role !== 'assistant' || !item.message.reasoning) continue
     const turnID = item.turn_id?.trim() ?? ''
     const iteration = item.agent_iteration ?? 0
     if (!turnID || !item.id.trim() || !Number.isInteger(iteration) || iteration <= 0) continue
-    const binding = run.assistantItemBindings?.[assistantItemIdentityKey(turnID, iteration, item.id)]
-      ?? run.assistantItems?.[`${turnID}:${iteration}`]
-    // A durable reasoning item is authoritative for a transient step only
-    // when the run's explicit turn/iteration binding points at this exact
-    // item. A page item alone is not enough to identify a live step.
-    if (binding?.itemID !== item.id) continue
     identities.identities.add(reasoningIdentityKey(turnID, iteration, item.id))
   }
   return identities
@@ -382,14 +323,6 @@ function reasoningTurnIterationKey(turnID: string, iteration: number): string {
 
 function reasoningIdentityKey(turnID: string, iteration: number, itemID: string): string {
   return `${reasoningTurnIterationKey(turnID, iteration)}\u0000${itemID}`
-}
-
-function assistantIdentityKey(binding: { turnID: string; agentIteration: number; itemID: string }): string {
-  return assistantItemIdentityKey(binding.turnID, binding.agentIteration, binding.itemID)
-}
-
-function assistantItemIdentityKey(turnID: string, agentIteration: number, itemID: string): string {
-  return JSON.stringify([turnID, agentIteration, itemID])
 }
 
 type ActiveRunSegment = { steps: RunStep[]; boundary: string }

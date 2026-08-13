@@ -33,13 +33,15 @@ func (r *blockingTransientWebTestRunner) SupportsIncrementalSessionTurn(context.
 
 func (r *blockingTransientWebTestRunner) RunSessionTurn(ctx context.Context, request execution.SessionTurnRequest) (execution.SessionTurnResult, error) {
 	request.Emit(model.AgentIterationStartedEvent{Iteration: 1})
-	request.Emit(model.TextDeltaEvent{Text: "live text", AssistantItemID: "assistant-live", DurableTextLength: 9, DurableCheckpointed: true})
+	request.Emit(model.AssistantMessageStartedEvent{ItemID: "assistant-live", AgentIteration: 1})
+	request.Emit(model.AssistantMessageUpdatedEvent{ItemID: "assistant-live", AgentIteration: 1, Revision: 1, Message: model.Message{Role: model.MessageRoleAssistant, Content: "live text"}})
 	if err := request.Publisher.Publish(eventbus.AssistantReady{
 		TurnID: request.TurnID, AgentIteration: 1, ItemID: "assistant-live",
 		Message: model.Message{Role: model.MessageRoleAssistant, Content: "live text"},
 	}); err != nil {
 		return execution.SessionTurnResult{}, err
 	}
+	request.Emit(model.AssistantMessageCompletedEvent{ItemID: "assistant-live", AgentIteration: 1, Revision: 2, Message: model.Message{Role: model.MessageRoleAssistant, Content: "live text"}})
 	r.startedOnce.Do(func() { close(r.started) })
 	select {
 	case <-r.release:
@@ -106,7 +108,7 @@ func TestSessionContentWebSocketTransientExecutionResumeAndSettlement(t *testing
 			switch decoded.Type {
 			case protocol.SubscriptionEventRunStarted:
 				startedEvent = decoded
-			case protocol.SubscriptionEventTextDelta:
+			case protocol.SubscriptionEventAssistantMessageUpdated:
 				textEvent = decoded
 			}
 		case protocol.ChangeMessage:
@@ -130,8 +132,8 @@ func TestSessionContentWebSocketTransientExecutionResumeAndSettlement(t *testing
 	if startedEvent.Type != protocol.SubscriptionEventRunStarted || startedEvent.RunCursor != "1" {
 		t.Fatalf("run.started = %#v, want cursor 1", startedEvent)
 	}
-	if textEvent.Type != protocol.SubscriptionEventTextDelta || textEvent.RunCursor != "2" || textEvent.ItemID != "assistant-live" {
-		t.Fatalf("text.delta = %#v, want stable item at cursor 2", textEvent)
+	if textEvent.Type != protocol.SubscriptionEventAssistantMessageUpdated || textEvent.RunCursor != "3" || textEvent.ItemID != "assistant-live" || textEvent.AssistantContent != "live text" {
+		t.Fatalf("assistant message update = %#v, want stable snapshot at cursor 3", textEvent)
 	}
 	if !gotActive || activeDescriptor.RunEpoch == "" || !activeDescriptor.ReplayAvailable {
 		t.Fatalf("active recovery descriptor = %#v, want run epoch and replay availability", activeDescriptor)
@@ -183,12 +185,12 @@ func TestSessionContentWebSocketTransientExecutionResumeAndSettlement(t *testing
 			if decodeErr != nil {
 				t.Fatalf("replayed event decode: %v", decodeErr)
 			}
-			if decoded.Type == protocol.SubscriptionEventTextDelta {
+			if decoded.Type == protocol.SubscriptionEventAssistantMessageUpdated {
 				replayed = decoded
 			}
 		}
 	}
-	if replayed.RunID != acceptedRunID || replayed.RunCursor != "2" || replayed.ItemID != "assistant-live" {
+	if replayed.RunID != acceptedRunID || replayed.RunCursor != "3" || replayed.ItemID != "assistant-live" {
 		detail, detailErr := service.GetSession(session.ID)
 		t.Fatalf("replayed transient event = %#v, want run cursor 2; messages=%v durable=%#v durable_err=%v", replayed, reconnectKinds, detail, detailErr)
 	}
@@ -276,11 +278,11 @@ func TestSessionContentWebSocketTransientExecutionResumeAndSettlement(t *testing
 			}
 		}
 	}
-	if settled.RunID != acceptedRunID || settled.RunCursor != "3" || settled.Settlement == nil {
-		t.Fatalf("settlement event = %#v, want cursor 3 and watermark", settled)
+	if settled.RunID != acceptedRunID || settled.RunCursor != "5" || settled.Settlement == nil {
+		t.Fatalf("settlement event = %#v, want cursor 5 and watermark", settled)
 	}
-	if settled.Settlement.RunCursor != "2" || settled.Settlement.ResourceRevision == "" {
-		t.Fatalf("settlement watermark = %#v, want durable revision covering cursor 2", settled.Settlement)
+	if settled.Settlement.RunCursor != "4" || settled.Settlement.ResourceRevision == "" {
+		t.Fatalf("settlement watermark = %#v, want durable revision covering cursor 4", settled.Settlement)
 	}
 	if !settled.Settlement.Verified || len(settled.Settlement.CoveredItems) == 0 {
 		t.Fatalf("settlement watermark = %#v, want verified item coverage", settled.Settlement)
@@ -342,13 +344,15 @@ func (isolatedTransientWebTestRunner) SupportsIncrementalSessionTurn(context.Con
 
 func (isolatedTransientWebTestRunner) RunSessionTurn(_ context.Context, request execution.SessionTurnRequest) (execution.SessionTurnResult, error) {
 	request.Emit(model.AgentIterationStartedEvent{Iteration: 1})
-	request.Emit(model.TextDeltaEvent{Text: "B only", AssistantItemID: "b-item", DurableTextLength: 5, DurableCheckpointed: true})
+	request.Emit(model.AssistantMessageStartedEvent{ItemID: "b-item", AgentIteration: 1})
+	request.Emit(model.AssistantMessageUpdatedEvent{ItemID: "b-item", AgentIteration: 1, Revision: 1, Message: model.Message{Role: model.MessageRoleAssistant, Content: "B only"}})
 	if err := request.Publisher.Publish(eventbus.AssistantReady{
 		TurnID: request.TurnID, AgentIteration: 1, ItemID: "b-item",
 		Message: model.Message{Role: model.MessageRoleAssistant, Content: "B only"},
 	}); err != nil {
 		return execution.SessionTurnResult{}, err
 	}
+	request.Emit(model.AssistantMessageCompletedEvent{ItemID: "b-item", AgentIteration: 1, Revision: 2, Message: model.Message{Role: model.MessageRoleAssistant, Content: "B only"}})
 	return execution.SessionTurnResult{Incremental: true}, nil
 }
 

@@ -132,7 +132,7 @@ func TestEncodePreservesResourceSpecificRawFields(t *testing.T) {
 				t.Fatal("encoded change lost resource-specific reason field")
 			}
 		} else {
-			for _, field := range []string{"session_id", "run_id", "run_cursor", "item_id", "delta"} {
+			for _, field := range []string{"session_id", "run_id", "run_cursor", "item_id", "message_revision", "content"} {
 				if _, ok := wire.Payload.Event[field]; !ok {
 					t.Fatalf("encoded event lost resource-specific %s field", field)
 				}

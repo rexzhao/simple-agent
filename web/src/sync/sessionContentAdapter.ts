@@ -26,8 +26,8 @@ import {
   type SessionRunStepRef,
   type SessionRunFailure,
   type SessionReasoningTiming,
+  type SessionLiveMessage,
   type SessionToolState,
-  type SessionTransientText,
 } from '../domain/sessionContent'
 
 export type { DataAvailability, SessionRunState } from '../domain/sessionContent'
@@ -109,6 +109,12 @@ function decimal(value: unknown, name: string, canonical = false): string {
   const result = stringValue(value, name)
   if (!/^[0-9]+$/u.test(result) || (canonical && result.length > 1 && result.startsWith('0'))) throw new Error(`${name} must be a decimal string`)
   return result
+}
+
+function messageRevision(value: unknown, name: string): string {
+	const result = decimal(value, name, true)
+	if (BigInt(result) > 18446744073709551615n) throw new Error(`${name} exceeds uint64`)
+	return result
 }
 
 function historyCursor(value: unknown, name: string): string {
@@ -481,23 +487,12 @@ function closeOtherReasoningTimings(run: SessionRunState, endedAt: string, curre
   return timings
 }
 
-function durableInlineLength(snapshot: SessionContentSnapshot, key: SessionContentItemKey, reasoning: boolean): number {
-  const item = findItem(snapshot, key)
-  const text = textValue(item, reasoning)
-  return text === undefined ? 0 : text.length
-}
-
 function keyEqual(left: SessionContentItemKey, right: SessionContentItemKey): boolean {
   return left.turn_id === right.turn_id && left.agent_iteration === right.agent_iteration && left.item_id === right.item_id
 }
 
 function findItem(snapshot: SessionContentSnapshot, key: SessionContentItemKey): SessionContentItem | undefined {
   return snapshot.history.items.find((item) => keyEqual(item.key, key))
-}
-
-function textValue(item: SessionContentItem | undefined, reasoning: boolean): string | undefined {
-  const text = reasoning ? item?.message?.reasoning : item?.message?.content
-  return text?.inline
 }
 
 function coveredByDurable(snapshot: SessionContentSnapshot, watermark: SessionContentSettlementWatermark): boolean {
@@ -515,44 +510,15 @@ function maybeClearSettled(state: SessionContentState, revisionValue: string): S
   return copyState(state.snapshot, revisionValue, null, state.turnFailure)
 }
 
-function normalizeTextOverlay(snapshot: SessionContentSnapshot, run: SessionRunState | null): SessionRunState | null {
-  if (!run) return null
-  const text = copyMap(run.text)
-  const reasoning = copyMap(run.reasoning)
-  const normalize = (map: Record<string, SessionTransientText>, isReasoning: boolean): void => {
-    for (const key of Object.keys(map)) {
-      const entry = map[key]
-      const item = findItem(snapshot, entry.key)
-      const durable = textValue(item, isReasoning)
-      if (durable === undefined) continue
-      // Reasoning has no durable checkpoint marker in D2. Once the durable
-      // item for the stable identity exists, it is authoritative; this is an
-      // identity lookup, never a text-based bubble match.
-      if (isReasoning && entry.checkpointLength === undefined) {
-        delete map[key]
-        continue
-      }
-      if (!entry.checkpointed) continue
-      const consumed = Math.max(0, Math.min(entry.text.length, durable.length - entry.baseLength))
-      const tail = entry.text.slice(consumed)
-      if (tail.length === 0) delete map[key]
-      else map[key] = { ...entry, text: tail, baseLength: durable.length }
-    }
-  }
-  normalize(text, false)
-  normalize(reasoning, true)
-  return { ...run, text, reasoning }
-}
-
 function eventObject(value: unknown): Record<string, unknown> {
   const source = object(value, 'subscription event')
   const type = stringValue(source.type, 'subscription event.type')
   exactKeys(source, ['type', 'session_id', 'run_id', 'run_cursor'], [
-    'turn_id', 'agent_iteration', 'item_id', 'delta', 'durable_text_length', 'durable_checkpointed',
+    'turn_id', 'agent_iteration', 'item_id', 'message_revision', 'reasoning', 'tool_calls',
     'tool_call_id', 'name', 'arguments', 'arguments_delta', 'content', 'is_error', 'prompts', 'status', 'code', 'message',
-    'durable_settlement_watermark',
+    'durable_settlement_watermark', 'snapshot_omitted',
   ], 'subscription event')
-  if (!['text.delta', 'reasoning.delta', 'tool.requested', 'tool.running', 'tool.progress', 'tool.finished', 'run.prompt_queue', 'run.prompt_appended', 'run.started', 'turn.failed', 'run.settled'].includes(type)) throw new Error(`unknown subscription event type ${type}`)
+  if (!['assistant.message.started', 'assistant.message.updated', 'assistant.message.completed', 'assistant.message.failed', 'tool.requested', 'tool.running', 'tool.progress', 'tool.finished', 'run.prompt_queue', 'run.prompt_appended', 'run.started', 'turn.failed', 'run.settled'].includes(type)) throw new Error(`unknown subscription event type ${type}`)
   return source
 }
 
@@ -581,7 +547,7 @@ function baseRunState(runEpoch: string, identity: ReturnType<typeof eventIdentit
     runCursor: cursor,
     ...(turnID === undefined ? {} : { turnID }),
     status: 'running',
-    text: {}, reasoning: {}, reasoningTimings: {}, tools: {}, stepOrder: [], promptQueue: [], appendedPrompts: [], stale: false, recoveryRequired: false,
+    messages: {}, reasoningTimings: {}, tools: {}, stepOrder: [], promptQueue: [], appendedPrompts: [], stale: false, recoveryRequired: false,
   }
 }
 
@@ -604,7 +570,7 @@ function snapshotTransientBaseline(snapshot: SessionContentSnapshot): SessionRun
     runCursor: (first === 0n ? 0n : first - 1n).toString(),
     ...(active.turn_id === undefined ? {} : { turnID: active.turn_id }),
     status: 'running',
-    text: {}, reasoning: {}, reasoningTimings: {}, tools: {}, stepOrder: [], promptQueue: [], appendedPrompts: [], stale: false, recoveryRequired: false,
+    messages: {}, reasoningTimings: {}, tools: {}, stepOrder: [], promptQueue: [], appendedPrompts: [], stale: false, recoveryRequired: false,
   }
 }
 
@@ -665,15 +631,36 @@ function validateEventVariant(event: Record<string, unknown>, identity: ReturnTy
       if (unicodeCodePointLength(failureMessage) > 600) throw new Error('turn.failed.message is too long')
       break
     }
-    case 'text.delta':
-    case 'reasoning.delta':
-      eventFields(event, ['item_id', 'delta'], ['durable_text_length', 'durable_checkpointed'], identity.type)
+    case 'assistant.message.started':
+      eventFields(event, ['item_id', 'message_revision'], [], identity.type)
       if (!identity.turnID || identity.iteration <= 0) throw new Error(`${identity.type} identity is incomplete`)
       identifier(event.item_id, `${identity.type}.item_id`)
-      stringValue(event.delta, `${identity.type}.delta`)
-      if (event.durable_text_length !== undefined) integer(event.durable_text_length, `${identity.type}.durable_text_length`, 0)
-      if (event.durable_checkpointed !== undefined) booleanValue(event.durable_checkpointed, `${identity.type}.durable_checkpointed`)
+      if (messageRevision(event.message_revision, `${identity.type}.message_revision`) !== '0') throw new Error('assistant.message.started revision must be zero')
       break
+    case 'assistant.message.updated':
+    case 'assistant.message.completed':
+    case 'assistant.message.failed': {
+      eventFields(event, ['item_id', 'message_revision'], ['content', 'reasoning', 'tool_calls', 'snapshot_omitted'], identity.type)
+	  if (identity.type === 'assistant.message.updated' && event.snapshot_omitted !== undefined) throw new Error('assistant.message.updated cannot omit its snapshot')
+      if (!identity.turnID || identity.iteration <= 0) throw new Error(`${identity.type} identity is incomplete`)
+      identifier(event.item_id, `${identity.type}.item_id`)
+      if (messageRevision(event.message_revision, `${identity.type}.message_revision`) === '0') throw new Error(`${identity.type} revision must be positive`)
+      if (event.snapshot_omitted !== undefined && event.snapshot_omitted !== true) throw new Error(`${identity.type}.snapshot_omitted must be true`)
+      if (event.snapshot_omitted !== true) stringValue(event.content, `${identity.type}.content`, true)
+      if (event.snapshot_omitted === true && (event.content !== undefined || event.reasoning !== undefined || event.tool_calls !== undefined)) throw new Error(`${identity.type} omitted snapshot carries message fields`)
+      if (event.reasoning !== undefined) stringValue(event.reasoning, `${identity.type}.reasoning`, true)
+      if (event.tool_calls !== undefined) {
+        if (!Array.isArray(event.tool_calls)) throw new Error(`${identity.type}.tool_calls must be an array`)
+        event.tool_calls.forEach((value, index) => {
+          const call = object(value, `${identity.type}.tool_calls[${index}]`)
+          exactKeys(call, ['id', 'name'], ['arguments'], `${identity.type}.tool_calls[${index}]`)
+          identifier(call.id, `${identity.type}.tool_calls[${index}].id`)
+          identifier(call.name, `${identity.type}.tool_calls[${index}].name`)
+          if (call.arguments !== undefined) stringValue(call.arguments, `${identity.type}.tool_calls[${index}].arguments`, true)
+        })
+      }
+      break
+    }
     case 'tool.requested':
     case 'tool.running':
       eventFields(event, ['tool_call_id', 'name'], ['arguments'], identity.type)
@@ -753,7 +740,7 @@ function updateRun(state: SessionContentState, event: Record<string, unknown>, s
   if (run.status !== 'running') throw new Error('terminal run received another event')
   let next: SessionRunState = { ...run, runCursor: incomingCursor, turnID: identity.turnID ?? run.turnID, stale: false }
   const timestamp = eventTimestamp(context)
-  if (timestamp && ['text.delta', 'tool.requested', 'tool.running', 'tool.progress', 'tool.finished', 'turn.failed', 'run.settled'].includes(identity.type)) {
+  if (timestamp && ['tool.requested', 'tool.running', 'tool.progress', 'tool.finished', 'turn.failed', 'run.settled'].includes(identity.type)) {
     next = { ...next, reasoningTimings: closeReasoningTimings(next, timestamp) }
   }
   switch (identity.type) {
@@ -762,50 +749,60 @@ function updateRun(state: SessionContentState, event: Record<string, unknown>, s
       if (event.status !== 'running') throw new Error('run.started status must be running')
       next = { ...next, status: 'running' }
       break
-    case 'text.delta':
-    case 'reasoning.delta': {
-      eventFields(event, ['item_id', 'delta'], ['durable_text_length', 'durable_checkpointed'], identity.type)
+    case 'assistant.message.started':
+    case 'assistant.message.updated':
+    case 'assistant.message.completed':
+    case 'assistant.message.failed': {
       if (!identity.turnID || identity.iteration <= 0) throw new Error(`${identity.type} identity is incomplete`)
       const key: SessionContentItemKey = { turn_id: identity.turnID, agent_iteration: identity.iteration, item_id: identifier(event.item_id, `${identity.type}.item_id`) }
-      const map = identity.type === 'text.delta' ? copyMap(next.text) : copyMap(next.reasoning)
       const keyString = sessionContentItemKeyString(key)
-      const old = map[keyString]
-      const checkpointLength = event.durable_text_length === undefined ? old?.checkpointLength : integer(event.durable_text_length, `${identity.type}.durable_text_length`, 0)
-      const checkpointed = event.durable_checkpointed === undefined ? old?.checkpointed ?? false : booleanValue(event.durable_checkpointed, `${identity.type}.durable_checkpointed`)
-      const delta = stringValue(event.delta, `${identity.type}.delta`, true)
-      const durableLength = durableInlineLength(state.snapshot, key, identity.type === 'reasoning.delta')
-      const timingBase = identity.type === 'reasoning.delta' && timestamp
-        ? closeOtherReasoningTimings(next, timestamp, keyString)
-        : next.reasoningTimings
-      const currentTiming = timingBase?.[keyString]
-      const reasoningTimings = identity.type === 'reasoning.delta' && timestamp && !currentTiming?.startedAt
-        ? { ...copyMap(timingBase ?? {}), [keyString]: { ...currentTiming, startedAt: timestamp } }
-        : timingBase
-      // A committed checkpoint is published before its corresponding
-      // transient delta. If the durable item already covers that checkpoint,
-      // consume the frame without ever manufacturing a duplicate bubble.
-      if (checkpointed && checkpointLength !== undefined && durableLength >= checkpointLength && old === undefined) {
-        next = identity.type === 'text.delta'
-          ? { ...next, text: map }
-          : { ...next, reasoning: map, reasoningTimings, stepOrder: appendStepRef(next, { kind: 'reasoning', key: keyString }) }
-        break
+      const messages = copyMap(next.messages)
+      const old = messages[keyString]
+      const revision = messageRevision(event.message_revision, `${identity.type}.message_revision`)
+      if (old && BigInt(revision) <= BigInt(old.revision)) break
+	  if (event.snapshot_omitted === true) {
+		messages[keyString] = old
+		  ? { ...old, revision, status: identity.type === 'assistant.message.completed' ? 'complete' : 'incomplete' }
+		  : { key, revision, status: identity.type === 'assistant.message.completed' ? 'complete' : 'incomplete', snapshotAvailable: false, message: { role: 'assistant', content: { inline: '' } } }
+		next = { ...next, messages }
+		break
+	  }
+      const content = identity.type === 'assistant.message.started' ? '' : stringValue(event.content, `${identity.type}.content`, true)
+      const reasoning = identity.type === 'assistant.message.started' || event.reasoning === undefined ? '' : stringValue(event.reasoning, `${identity.type}.reasoning`, true)
+      const toolCalls = identity.type === 'assistant.message.started' || event.tool_calls === undefined
+        ? []
+        : (event.tool_calls as unknown[]).map((value, index) => {
+          const call = object(value, `${identity.type}.tool_calls[${index}]`)
+          return {
+            id: identifier(call.id, `${identity.type}.tool_calls[${index}].id`),
+            name: identifier(call.name, `${identity.type}.tool_calls[${index}].name`),
+            ...(call.arguments === undefined ? {} : { arguments: { inline: stringValue(call.arguments, `${identity.type}.tool_calls[${index}].arguments`, true) } }),
+          }
+        })
+      const message: SessionContentMessage = {
+        role: 'assistant',
+        content: { inline: content },
+        ...(reasoning ? { reasoning: { inline: reasoning } } : {}),
+        ...(toolCalls.length > 0 ? { tool_calls: toolCalls } : {}),
       }
-      const text = `${old?.text ?? ''}${delta}`
-      map[keyString] = {
-        key,
-        text,
-        baseLength: old?.baseLength ?? durableLength,
-        ...(checkpointLength === undefined ? {} : { checkpointLength }),
-        checkpointed,
+      messages[keyString] = {
+        key, revision,
+        status: identity.type === 'assistant.message.completed' ? 'complete' : identity.type === 'assistant.message.failed' ? 'incomplete' : 'streaming',
+        snapshotAvailable: identity.type !== 'assistant.message.started',
+        message,
+      } satisfies SessionLiveMessage
+      let reasoningTimings = next.reasoningTimings
+      let stepOrder = next.stepOrder
+      if (reasoning && !old?.message.reasoning) {
+        reasoningTimings = timestamp
+          ? { ...closeOtherReasoningTimings(next, timestamp, keyString), [keyString]: { startedAt: timestamp } }
+          : reasoningTimings
+        stepOrder = appendStepRef(next, { kind: 'reasoning', key: keyString })
       }
-      next = identity.type === 'text.delta'
-        ? { ...next, text: map }
-        : {
-          ...next,
-          reasoning: map,
-          reasoningTimings,
-          stepOrder: old ? next.stepOrder : appendStepRef(next, { kind: 'reasoning', key: keyString }),
-        }
+      if (timestamp && content && reasoningTimings?.[keyString] && !reasoningTimings[keyString].endedAt) {
+        reasoningTimings = { ...reasoningTimings, [keyString]: { ...reasoningTimings[keyString], endedAt: timestamp } }
+      }
+      next = { ...next, messages, reasoningTimings, stepOrder }
       break
     }
     case 'tool.requested':
@@ -959,7 +956,7 @@ function applyDurableOperations(previous: SessionContentState, operations: reado
     ? { ...previous.transientRun, runEpoch: checked.active_run.run_epoch }
     : previous.transientRun
   const next = copyState(checked, context?.resourceRevision ?? previous.durableResourceRevision, transientRun, previous.turnFailure)
-  return maybeClearSettled({ ...next, transientRun: normalizeTextOverlay(checked, next.transientRun) }, next.durableResourceRevision)
+  return maybeClearSettled(next, next.durableResourceRevision)
 }
 
 export class SessionContentAdapter implements ResourceAdapter<SessionContentState, SubscriptionEventData> {
@@ -989,8 +986,7 @@ export class SessionContentAdapter implements ResourceAdapter<SessionContentStat
     const snapshot = cloneSnapshot(value, this.sessionID)
     const transientRun = transientOverlayFromSnapshot(snapshot, previous) ?? snapshotTransientBaseline(snapshot)
     const revisionValue = context?.resourceRevision ?? previous?.durableResourceRevision ?? ''
-    const normalized = normalizeTextOverlay(snapshot, transientRun)
-    return maybeClearSettled(copyState(snapshot, revisionValue, normalized, previous?.turnFailure), revisionValue)
+    return maybeClearSettled(copyState(snapshot, revisionValue, transientRun, previous?.turnFailure), revisionValue)
   }
 
   applyChange(previous: SessionContentState, operations: readonly ChangeOperation[], context?: ReplicaApplyContext): SessionContentState {

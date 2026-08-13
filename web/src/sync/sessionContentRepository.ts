@@ -51,38 +51,11 @@ interface HistoryCache {
 
 const emptyRunState = undefined
 
-function mergeText(base: SessionContentText | undefined, transient: { text: string; baseLength: number; checkpointLength?: number } | undefined): SessionContentText | undefined {
-  if (!transient) return base
-  const text = transient.text
-  if (!base) return { inline: text }
-  if (base.inline !== undefined) {
-    // The adapter stores a stable tail and the durable prefix length at the
-    // moment that identity first became transient.  A durable checkpoint may
-    // consume none, part, or all of that tail before the next transient frame
-    // arrives.  Consume by the protocol's length watermark only; never search
-    // for text or attach an unkeyed tail to the last array item.
-    const durableProgress = base.inline.length - transient.baseLength
-    if (durableProgress < 0) return { ...base }
-    const consumed = Math.min(text.length, durableProgress)
-    return { ...base, inline: `${base.inline}${text.slice(consumed)}` }
-  }
-  // A Blob/preview-backed durable value cannot be concatenated locally. Do
-  // not turn a partial overlay into a duplicate durable bubble.
-  return base
-}
-
 function mergeMessage(item: SessionContentItem, run: SessionRunState | null): SessionContentItem {
-  if (!item.message || !run) return item
-  const textKey = JSON.stringify([item.key.turn_id, item.key.agent_iteration, item.key.item_id])
-  const textOverlay = run.text[textKey]
-  const reasoningOverlay = run.reasoning[textKey]
-  if (!textOverlay && !reasoningOverlay) return item
-  const message: SessionContentMessage = {
-    ...item.message,
-    ...(textOverlay ? { content: mergeText(item.message.content, textOverlay) } : {}),
-    ...(reasoningOverlay ? { reasoning: mergeText(item.message.reasoning, reasoningOverlay) } : {}),
-  }
-  return { ...item, message }
+  if (!run) return item
+  const live = run.messages[JSON.stringify([item.key.turn_id, item.key.agent_iteration, item.key.item_id])]
+  if (!live || live.snapshotAvailable === false) return item
+  return { ...item, status: live.status === 'complete' ? 'completed' : live.status === 'incomplete' ? 'interrupted' : 'pending', message: live.message }
 }
 
 function mergedHistory(state: SessionContentState, run: SessionRunState | null, page?: HistoryCache): SessionContentHistoryWindow {

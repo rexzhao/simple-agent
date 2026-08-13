@@ -397,7 +397,34 @@ export interface SubscriptionEventBase {
 }
 
 export type SubscriptionEventData =
-  | (SubscriptionEventBase & { type: 'text.delta' | 'reasoning.delta'; item_id: string; delta: string; durable_text_length?: number; durable_checkpointed?: boolean })
+  | (SubscriptionEventBase & { type: 'assistant.message.started'; item_id: string; message_revision: string })
+  | (SubscriptionEventBase & {
+      type: 'assistant.message.updated'
+      item_id: string
+      message_revision: string
+      content: string
+      snapshot_omitted?: never
+      reasoning?: string
+      tool_calls?: { id: string; name: string; arguments?: string }[]
+    })
+  | (SubscriptionEventBase & {
+      type: 'assistant.message.completed' | 'assistant.message.failed'
+      item_id: string
+      message_revision: string
+    } & (
+      | {
+          content: string
+          snapshot_omitted?: never
+          reasoning?: string
+          tool_calls?: { id: string; name: string; arguments?: string }[]
+        }
+      | {
+          snapshot_omitted: true
+          content?: never
+          reasoning?: never
+          tool_calls?: never
+        }
+    ))
   | (SubscriptionEventBase & { type: 'tool.requested' | 'tool.running'; tool_call_id: string; name: string; arguments?: string })
   | (SubscriptionEventBase & { type: 'tool.progress'; tool_call_id: string; name: string; arguments_delta: string })
   | (SubscriptionEventBase & { type: 'tool.finished'; tool_call_id: string; name: string; is_error: boolean; content?: string })
