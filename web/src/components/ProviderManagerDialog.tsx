@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import type { ProviderUpdateTarget } from '../commands/providerCommands'
+import type { ModelCatalogModel } from '../commands/providerCommands'
 import type { JsonObject } from '../domain/json'
 import type { CodexUsageDomain, CodexUsageCreditsDomain, CodexUsageWindowDomain, CodexUsageWindowSetDomain } from '../domain/codexUsage'
 import type { CodexLoginReadModel } from '../repositories/codexLogin'
@@ -89,6 +90,13 @@ export function ProviderManagerDialog(props: {
   const [defaultingProfile, setDefaultingProfile] = useState<string | null>(null)
   const [discovering, setDiscovering] = useState(false)
   const [discoveredModels, setDiscoveredModels] = useState<string[]>([])
+  const [selectedModelIndex, setSelectedModelIndex] = useState<number | null>(null)
+  const [addModelOpen, setAddModelOpen] = useState(false)
+  const [newModelID, setNewModelID] = useState('')
+  const [newModelProfile, setNewModelProfile] = useState('')
+  const [newModelProfileEdited, setNewModelProfileEdited] = useState(false)
+  const [catalogModelIndex, setCatalogModelIndex] = useState<number | null>(null)
+  const [selectedCatalogKey, setSelectedCatalogKey] = useState('')
   const [catalogQuery, setCatalogQuery] = useState('')
   const [catalogResults, setCatalogResults] = useState<import('../commands/providerCommands').ModelCatalogModel[]>([])
   const [catalogSearching, setCatalogSearching] = useState(false)
@@ -111,6 +119,9 @@ export function ProviderManagerDialog(props: {
     setUsageLoading(false)
     setUsageError(null)
     setDiscoveredModels([])
+    setSelectedModelIndex(null)
+    setAddModelOpen(false)
+    setCatalogModelIndex(null)
     props.onProviderChange(provider.models.some((model) => model.type === 'openai-codex') ? provider.name : null)
   }, [props.onProviderChange])
 
@@ -162,8 +173,8 @@ export function ProviderManagerDialog(props: {
     }
   }
 
-  const searchCatalog = async () => {
-    const query = catalogQuery.trim()
+  const searchCatalogFor = async (rawQuery: string) => {
+    const query = rawQuery.trim()
     if (!query || catalogSearching) return
     const generation = providerSelectionGeneration.current
     setCatalogSearching(true)
@@ -187,21 +198,23 @@ export function ProviderManagerDialog(props: {
     setCatalogError(null)
   }
 
-  const applyCatalogModel = (index: number, model: import('../commands/providerCommands').ModelCatalogModel) => {
+  const applyCatalogModel = (index: number, model: ModelCatalogModel, preserveIdentity = false) => {
     setDraft((current) => {
       if (!current) return current
       const target = current.models[index]
       if (!target) return current
       const patch: Partial<EditableProviderModel> = {
-        id: model.id,
-        profile: !target.profile || target.profile === target.id ? model.id : target.profile,
         contextWindow: model.context_window ? String(model.context_window) : '',
         inputLimit: model.input_limit ? String(model.input_limit) : '',
         outputLimit: model.output_limit ? String(model.output_limit) : '',
         supportsImages: model.input.includes('image'),
-        parametersMode: 'replace',
-        parametersSourceProfile: '',
-        parametersJSON: '{}',
+      }
+      if (!preserveIdentity) {
+        patch.id = model.id
+        patch.profile = !target.profile || target.profile === target.id ? model.id : target.profile
+        patch.parametersMode = 'replace'
+        patch.parametersSourceProfile = ''
+        patch.parametersJSON = '{}'
       }
       if (model.pricing) {
         patch.pricingCurrency = 'USD'
@@ -231,6 +244,40 @@ export function ProviderManagerDialog(props: {
     })
     clearCatalog()
   }
+
+  const searchCatalog = async () => searchCatalogFor(catalogQuery)
+
+  const openAddModel = () => {
+    setNewModelID('')
+    setNewModelProfile('')
+    setNewModelProfileEdited(false)
+    setAddModelOpen(true)
+  }
+
+  const addModel = () => {
+    const id = newModelID.trim()
+    const profile = newModelProfile.trim()
+    if (!id || !profile) return
+    setDraft((current) => current ? { ...current, models: [...current.models, { ...emptyProviderModel(), id, profile }] } : current)
+    setSelectedModelIndex(draft?.models.length ?? 0)
+    setAddModelOpen(false)
+  }
+
+  const openCatalog = (index: number) => {
+    const model = draft?.models[index]
+    if (!model) return
+    const query = model.id || model.profile
+    setCatalogModelIndex(index)
+    setCatalogQuery(query)
+    setCatalogResults([])
+    setCatalogError(null)
+    setSelectedCatalogKey('')
+    void searchCatalogFor(query)
+  }
+
+  const catalogCandidates = catalogModelIndex === null || !draft?.models[catalogModelIndex]
+    ? []
+    : rankCatalogMatches(draft.models[catalogModelIndex], catalogResults, draft.name)
 
   const setDefault = async (profile: string) => {
     if (!draft?.existingName || defaultingProfile !== null) return
@@ -336,17 +383,30 @@ export function ProviderManagerDialog(props: {
         ) : (
           <div className="provider-dialog-body">
             {settings.status === 'stale' && <div className="sync-status" role="status"><span>Provider settings are offline; showing the last synchronized settings.</span><button onClick={props.onRetrySettings}>Retry synchronization</button></div>}
-            <aside className="provider-list">
+            <aside className="provider-list" aria-label="Providers and models">
               {settings.providers.map((provider) => (
-                <button className={draft.existingName === provider.name ? 'selected' : ''} onClick={() => selectProvider(provider)} key={provider.name}>
-                  <strong>{provider.name}</strong>
-                  <small>{provider.models.length} {provider.models.length === 1 ? 'model' : 'models'}</small>
-                </button>
+                <div className={`provider-tree-group ${draft.existingName === provider.name ? 'expanded' : ''}`} key={provider.name}>
+                  <button className={draft.existingName === provider.name && selectedModelIndex === null ? 'selected provider-tree-provider' : 'provider-tree-provider'} onClick={() => { selectProvider(provider); setSelectedModelIndex(null) }}>
+                    <span aria-hidden="true">{draft.existingName === provider.name ? '▾' : '▸'}</span>
+                    <span><strong>{provider.name}</strong><small>{provider.models.length} {provider.models.length === 1 ? 'model' : 'models'}</small></span>
+                  </button>
+                  {draft.existingName === provider.name && (
+                    <div className="provider-tree-children">
+                      <button className={selectedModelIndex === null ? 'selected tree-connection' : 'tree-connection'} onClick={() => setSelectedModelIndex(null)}>Connection & authentication</button>
+                      {draft.models.map((model, index) => {
+                        const isDefault = draft.existingName === settings.defaultProvider && model.profile === settings.defaultModel
+                        return <button className={selectedModelIndex === index ? 'selected tree-model' : 'tree-model'} onClick={() => setSelectedModelIndex(index)} key={`${index}-${model.profile}`}><span aria-hidden="true">{isDefault ? '★' : '○'}</span><span><strong>{model.profile || `Model ${index + 1}`}</strong><small>{model.id || 'Model ID not set'}</small></span></button>
+                      })}
+                      <button className="tree-add-model" onClick={openAddModel}><PlusIcon /> Add model</button>
+                    </div>
+                  )}
+                </div>
               ))}
-              <button className={!draft.existingName ? 'selected add-provider' : 'add-provider'} onClick={() => { providerSelectionGeneration.current += 1; setSelectedProviderName(null); props.onProviderChange(null); setDraft(emptyProviderDraft()); setCodexAction(null); setDefaultingProfile(null); setCodexUsage(null); setUsageLoading(false); setUsageError(null); setDiscoveredModels([]) }}><PlusIcon /> Add provider</button>
+              {!draft.existingName && <div className="provider-tree-group expanded new-provider-tree"><button className={selectedModelIndex === null ? 'selected provider-tree-provider' : 'provider-tree-provider'} onClick={() => setSelectedModelIndex(null)}><span aria-hidden="true">▾</span><span><strong>{draft.name || 'New provider'}</strong><small>Unsaved</small></span></button><div className="provider-tree-children"><button className={selectedModelIndex === null ? 'selected tree-connection' : 'tree-connection'} onClick={() => setSelectedModelIndex(null)}>Connection</button>{draft.models.map((model, index) => <button className={selectedModelIndex === index ? 'selected tree-model' : 'tree-model'} onClick={() => setSelectedModelIndex(index)} key={`new-${index}`}><span aria-hidden="true">○</span><span><strong>{model.profile || `Model ${index + 1}`}</strong><small>{model.id || 'Model ID not set'}</small></span></button>)}<button className="tree-add-model" onClick={openAddModel}><PlusIcon /> Add model</button></div></div>}
+              <button className="add-provider" onClick={() => { providerSelectionGeneration.current += 1; setSelectedProviderName(null); props.onProviderChange(null); setDraft(emptyProviderDraft()); setSelectedModelIndex(null); setCodexAction(null); setDefaultingProfile(null); setCodexUsage(null); setUsageLoading(false); setUsageError(null); setDiscoveredModels([]) }}><PlusIcon /> Add provider</button>
             </aside>
             <div className="provider-editor">
-              <section className="settings-section">
+              {selectedModelIndex === null && <section className="settings-section provider-connection-editor">
                 <div className="settings-section-title"><div><h3>Connection</h3><p>Proxy settings apply to every model in this provider.</p></div>{draft.existingName && <code>{draft.existingName}.yaml</code>}</div>
                 {draft.existingName && <p className="field-help">Existing endpoint and auth-file details that are hidden or normalized by the safe settings view are preserved unless you change their visible value.</p>}
                 <div className="settings-grid">
@@ -359,9 +419,9 @@ export function ProviderManagerDialog(props: {
                   <label className="wide">API key / environment variable<input value={draft.apiKey} onChange={(event) => setDraft({ ...draft, apiKey: event.target.value, keepAPIKey: false })} placeholder={draft.apiKeyConfigured ? 'Configured; leave empty and keep the option below to leave unchanged' : '$OPENAI_API_KEY'} /></label>
                   {draft.apiKeyConfigured && <label className="checkbox-field wide"><input type="checkbox" checked={draft.keepAPIKey} onChange={(event) => setDraft({ ...draft, keepAPIKey: event.target.checked })} /> Keep current API key</label>}
                 </div>
-              </section>
+              </section>}
 
-              {savedCodexProvider && (
+              {selectedModelIndex === null && savedCodexProvider && (
                 <section className="settings-section codex-auth-card">
                   <div className="settings-section-title"><h3>Codex sign-in</h3><span className={`auth-status ${codexAction ?? codexAuth?.status ?? codexReadState ?? 'signed_out'}`}>{codexStatusLabel(codexAuth?.status, codexReadState, codexAction)}</span></div>
                   {codexReadState === 'stale' && <p className="sync-status"><span>Codex sign-in status is offline; showing the last synchronized status.</span><button onClick={props.onRetryCodexLogin}>Retry synchronization</button></p>}
@@ -386,48 +446,30 @@ export function ProviderManagerDialog(props: {
                 </section>
               )}
 
-              <section className="settings-section">
+              {selectedModelIndex !== null && draft.models[selectedModelIndex] && <section className="settings-section model-detail-editor">
                 <div className="settings-section-title">
-                  <div><h3>Models</h3><p>Reasoning levels use unified display names; mapped values can be strings, numbers, booleans, or objects.</p></div>
+                  <div><span className="editor-breadcrumb">{draft.name || 'New provider'} / Models</span><h3>{draft.models[selectedModelIndex].profile || `Model ${selectedModelIndex + 1}`}</h3><p>Edit one model at a time. Online metadata never changes its local identity.</p></div>
                   <div className="inline-actions">
-                    <button className="secondary-button compact" disabled={!draft.existingName || discovering || settings.status !== 'ready'} onClick={() => void discoverModels()}>{discovering ? 'Fetching…' : 'Fetch from provider'}</button>
-                    <button className="secondary-button compact" onClick={() => setDraft({ ...draft, models: [...draft.models, emptyProviderModel()] })}><PlusIcon /> Add model</button>
+                    <button className="secondary-button compact" onClick={() => openCatalog(selectedModelIndex)}>Find configuration online</button>
+                    <button className="secondary-button compact" onClick={() => duplicateModel(selectedModelIndex)}>Duplicate</button>
                   </div>
                 </div>
                 <div className="provider-models">
                   {draft.models.map((model, index) => {
+                    if (index !== selectedModelIndex) return null
                     const isDefault = draft.existingName === settings.defaultProvider && model.profile === settings.defaultModel
                     const reasoningLevels = reasoningLevelOptions(model.reasoningLevelsJSON)
                     return <article className="provider-model-card" key={`${index}-${model.profile}`}>
-                      <div className="provider-model-heading"><strong>{model.profile || `Model ${index + 1}`}</strong><div className="inline-actions">{isDefault ? <span className="default-badge">Default</span> : <button className="plain-button" disabled={!draft.existingName || !model.profile || settings.status !== 'ready' || defaultingProfile !== null} onClick={() => void setDefault(model.profile)}>{defaultingProfile === model.profile ? 'Setting…' : 'Set as default'}</button>}<button className="plain-button" onClick={() => duplicateModel(index)}>Duplicate</button><button className="plain-button danger" disabled={draft.models.length === 1} onClick={() => setDraft({ ...draft, models: draft.models.filter((_, modelIndex) => index !== modelIndex) })}>Remove</button></div></div>
+                      <div className="provider-model-heading"><strong>Identity</strong><div className="inline-actions">{isDefault ? <span className="default-badge">★ Default</span> : <button className="plain-button" disabled={!draft.existingName || !model.profile || settings.status !== 'ready' || defaultingProfile !== null} onClick={() => void setDefault(model.profile)}>{defaultingProfile === model.profile ? 'Setting…' : '☆ Make default'}</button>}<button className="plain-button danger" disabled={draft.models.length === 1} onClick={() => { setDraft({ ...draft, models: draft.models.filter((_, modelIndex) => index !== modelIndex) }); setSelectedModelIndex(Math.max(0, index - 1)) }}>Remove</button></div></div>
                       <div className="settings-grid model-grid">
-                        {discoveredModels.length > 0 && <label className="wide model-catalog-select">Choose from model list<select value={discoveredModels.includes(model.id) ? model.id : ''} onChange={(event) => {
-                          const selectedID = event.target.value
-                          if (selectedID) updateModel(index, { id: selectedID, profile: !model.profile || model.profile === model.id ? selectedID : model.profile })
-                        }}><option value="">Select a model ({discoveredModels.length} fetched)</option>{discoveredModels.map((modelID) => <option value={modelID} key={modelID}>{modelID}</option>)}</select></label>}
-                        <div className="wide model-catalog-search">
-                          <label>Search models.dev<input value={catalogQuery} onChange={(event) => setCatalogQuery(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter') { event.preventDefault(); void searchCatalog() } }} placeholder="e.g. claude or gpt-5.5" /><button className="secondary-button compact" disabled={!catalogQuery.trim() || catalogSearching} onClick={() => void searchCatalog()}>{catalogSearching ? 'Searching…' : 'Search'}</button></label>
-                          {catalogError && <p className="settings-error">{catalogError}</p>}
-                          {catalogResults.length > 0 && (
-                            <div className="catalog-results">
-                              <span>Matches for "{catalogQuery.trim()}":</span>
-                              {catalogResults.map((catalogModel) => (
-                                <button key={`${catalogModel.provider}/${catalogModel.id}`} className="catalog-result" onClick={() => applyCatalogModel(index, catalogModel)}>
-                                  <code>{catalogModel.id}</code>
-                                  <small>{catalogModel.provider}{catalogModel.context_window ? ` · ${catalogModel.context_window.toLocaleString()} ctx` : ''}{catalogModel.reasoning?.budget_max ? ' · budget' : ''}</small>
-                                </button>
-                              ))}
-                            </div>
-                          )}
-                        </div>
-                        <label>Profile name<input value={model.profile} onChange={(event) => updateModel(index, { profile: event.target.value })} placeholder="gpt-5.5" /></label>
-                        <label>Model ID<input value={model.id} onChange={(event) => updateModel(index, { id: event.target.value })} placeholder="Or enter manually" /></label>
+                        <label>Profile name<span className="field-caption">Displayed inside SAI</span><input aria-label="Profile name" value={model.profile} onChange={(event) => updateModel(index, { profile: event.target.value })} placeholder="gpt-5.5" /></label>
+                        <label>Provider model ID<span className="field-caption">Sent to the provider API</span><input aria-label="Model ID" value={model.id} onChange={(event) => updateModel(index, { id: event.target.value })} placeholder="Enter manually" /></label>
                         <label>API type<select value={model.type || 'openai-chat'} onChange={(event) => {
                           const type = event.target.value
                           updateModel(index, { type, compatibility: type === 'openai-chat' ? model.compatibility : '' })
                         }}><option value="openai-chat">OpenAI Chat</option><option value="openai-responses">OpenAI Responses</option><option value="openai-codex">OpenAI Codex</option><option value="anthropic-messages">Anthropic Messages</option></select></label>
                         <details className="model-advanced">
-                          <summary>Detailed parameters</summary>
+                          <summary>Capabilities, limits, pricing & request parameters</summary>
                           <div className="settings-grid model-grid">
                         <label>Compatibility<select value={model.compatibility} disabled={model.type !== 'openai-chat'} onChange={(event) => updateModel(index, { compatibility: event.target.value })}><option value="">Provider default</option><option value="openai">Standard OpenAI</option><option value="kimi">Kimi</option></select></label>
                         <label className="checkbox-field"><input type="checkbox" checked={model.supportsImages} onChange={(event) => updateModel(index, { supportsImages: event.target.checked })} /> Supports image input</label>
@@ -468,11 +510,47 @@ export function ProviderManagerDialog(props: {
                     </article>
                   })}
                 </div>
-              </section>
+              </section>}
             </div>
           </div>
         )}
-        <footer className="model-dialog-actions"><button className="secondary-button" disabled={saving || defaultingProfile !== null || codexAction !== null} onClick={props.onClose}>Cancel</button><button className="primary-button" disabled={!draft || saving || defaultingProfile !== null || settings.status !== 'ready'} onClick={() => void save()}>{saving ? 'Saving…' : 'Save settings'}</button></footer>
+        {addModelOpen && draft && <div className="provider-subdialog-backdrop" role="presentation">
+          <section className="provider-subdialog add-model-dialog" role="dialog" aria-modal="true" aria-labelledby="add-model-title">
+            <header><div><span className="eyebrow">{draft.name || 'New provider'}</span><h3 id="add-model-title">Add model</h3></div><button className="model-dialog-close" onClick={() => setAddModelOpen(false)} aria-label="Close add model">×</button></header>
+            <div className="provider-subdialog-body">
+              <label>Provider model ID<span>Type any ID, or choose one returned by the provider.</span><input aria-label="New model ID" list="provider-model-options" value={newModelID} onChange={(event) => { const id = event.target.value; setNewModelID(id); if (!newModelProfileEdited) setNewModelProfile(id) }} placeholder="e.g. deepseek-v4-flash" /></label>
+              <datalist id="provider-model-options">{discoveredModels.map((modelID) => <option value={modelID} key={modelID} />)}</datalist>
+              <label>Profile name<span>The name shown and referenced inside SAI.</span><input aria-label="New profile name" value={newModelProfile} onChange={(event) => { setNewModelProfile(event.target.value); setNewModelProfileEdited(true) }} placeholder="Defaults to the model ID" /></label>
+              <div className="model-discovery-action"><button className="secondary-button" disabled={!draft.existingName || discovering || settings.status !== 'ready'} onClick={() => void discoverModels()}>{discovering ? 'Fetching models…' : discoveredModels.length > 0 ? 'Refresh models from provider' : 'Fetch models from provider'}</button>{discoveredModels.length > 0 && <span>{discoveredModels.length} model IDs available. Manual entry is still allowed.</span>}{!draft.existingName && <span>Save the provider before fetching its model list.</span>}</div>
+            </div>
+            <footer><button className="secondary-button" onClick={() => setAddModelOpen(false)}>Cancel</button><button className="primary-button" disabled={!newModelID.trim() || !newModelProfile.trim()} onClick={addModel}>Add model</button></footer>
+          </section>
+        </div>}
+        {catalogModelIndex !== null && draft?.models[catalogModelIndex] && <div className="provider-subdialog-backdrop" role="presentation">
+          <section className="provider-subdialog catalog-match-dialog" role="dialog" aria-modal="true" aria-labelledby="catalog-match-title">
+            <header><div><span className="eyebrow">Online model catalog</span><h3 id="catalog-match-title">Find configuration online</h3><p>Matches are suggestions. Choose the record whose developer and model family are correct.</p></div><button className="model-dialog-close" onClick={() => setCatalogModelIndex(null)} aria-label="Close online configuration">×</button></header>
+            <div className="catalog-search-bar"><input aria-label="Online model search" value={catalogQuery} onChange={(event) => setCatalogQuery(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter') { event.preventDefault(); void searchCatalog() } }} placeholder="Model ID or profile name" /><button className="primary-button" disabled={!catalogQuery.trim() || catalogSearching} onClick={() => void searchCatalog()}>{catalogSearching ? 'Searching…' : 'Search'}</button></div>
+            <div className="catalog-match-body">
+              <div className="catalog-candidate-list" role="radiogroup" aria-label="Matching configurations">
+                {catalogError && <p className="settings-error">{catalogError}</p>}
+                {!catalogSearching && catalogResults.length > 0 && catalogCandidates.length === 0 && <p className="catalog-empty">No bidirectional name matches. Try a shorter model family name.</p>}
+                {catalogCandidates.map(({ model, developerLikely, exact }) => {
+                  const key = `${model.provider}/${model.id}`
+                  return <label className={selectedCatalogKey === key ? 'catalog-candidate selected' : 'catalog-candidate'} key={key}><input type="radio" name="catalog-model" value={key} checked={selectedCatalogKey === key} onChange={() => setSelectedCatalogKey(key)} /><span><strong>{model.name || model.id}</strong><code>{model.provider}/{model.id}</code><small>{developerLikely ? 'Likely model developer' : model.provider === draft.name ? 'Current provider' : 'Catalog provider'}{exact ? ' · exact ID' : ' · name contains match'}{model.context_window ? ` · ${model.context_window.toLocaleString()} context` : ''}</small></span></label>
+                })}
+              </div>
+              <div className="catalog-preview">
+                {(() => {
+                  const candidate = catalogCandidates.find(({ model }) => `${model.provider}/${model.id}` === selectedCatalogKey)?.model
+                  if (!candidate) return <p>Select a match to preview the imported configuration.</p>
+                  return <><h4>Configuration preview</h4><dl><div><dt>Local identity</dt><dd>{draft.models[catalogModelIndex].profile}<small>kept unchanged</small></dd></div><div><dt>Context window</dt><dd>{candidate.context_window?.toLocaleString() || 'Not provided'}</dd></div><div><dt>Output limit</dt><dd>{candidate.output_limit?.toLocaleString() || 'Not provided'}</dd></div><div><dt>Image input</dt><dd>{candidate.input.includes('image') ? 'Supported' : 'Not listed'}</dd></div><div><dt>Reasoning</dt><dd>{candidate.reasoning?.enabled ? 'Supported' : 'Not listed'}</dd></div><div><dt>Pricing</dt><dd>{candidate.pricing ? 'Available' : 'Not provided'}</dd></div></dl><p>API type, compatibility, request parameters, Provider model ID and Profile name are preserved.</p></>
+                })()}
+              </div>
+            </div>
+            <footer><button className="secondary-button" onClick={() => setCatalogModelIndex(null)}>Cancel</button><button className="primary-button" disabled={!selectedCatalogKey} onClick={() => { const candidate = catalogCandidates.find(({ model }) => `${model.provider}/${model.id}` === selectedCatalogKey)?.model; if (candidate) { applyCatalogModel(catalogModelIndex, candidate, true); setCatalogModelIndex(null) } }}>Use selected configuration</button></footer>
+          </section>
+        </div>}
+        <footer className="model-dialog-actions"><span className="unsaved-note">Changes are saved together for this provider.</span><button className="secondary-button" disabled={saving || defaultingProfile !== null || codexAction !== null} onClick={props.onClose}>Cancel</button><button className="primary-button" disabled={!draft || saving || defaultingProfile !== null || settings.status !== 'ready'} onClick={() => void save()}>{saving ? 'Saving…' : 'Save settings'}</button></footer>
       </section>
     </div>
   )
@@ -659,6 +737,31 @@ function reasoningLevelOptions(value: string): string[] {
   } catch {
     return []
   }
+}
+
+function normalizedModelName(value: string): string {
+  const withoutOwner = value.trim().toLowerCase().split('/').pop() ?? ''
+  return withoutOwner.replace(/[\s_-]+/g, '')
+}
+
+function rankCatalogMatches(local: Pick<EditableProviderModel, 'id' | 'profile'>, models: readonly ModelCatalogModel[], currentProvider: string): Array<{ model: ModelCatalogModel; exact: boolean; developerLikely: boolean }> {
+  const localNames = [local.id, local.profile].map(normalizedModelName).filter((value) => value.length >= 4)
+  const providerName = normalizedModelName(currentProvider)
+  return models
+    .map((model) => {
+      const candidateNames = [model.id, model.name].map(normalizedModelName).filter((value) => value.length >= 4)
+      const exact = localNames.some((localName) => candidateNames.includes(localName))
+      const matched = exact || localNames.some((localName) => candidateNames.some((candidate) => localName.includes(candidate) || candidate.includes(localName)))
+      const developerName = normalizedModelName(model.provider)
+      const developerLikely = developerName.length >= 3 && candidateNames.some((candidate) => candidate.includes(developerName))
+      return { model, exact, matched, developerLikely }
+    })
+    .filter((candidate) => candidate.matched)
+    .sort((left, right) => Number(right.developerLikely) - Number(left.developerLikely)
+      || Number(right.exact) - Number(left.exact)
+      || Number(normalizedModelName(right.model.provider) === providerName) - Number(normalizedModelName(left.model.provider) === providerName)
+      || normalizedModelName(left.model.id).length - normalizedModelName(right.model.id).length)
+    .map(({ model, exact, developerLikely }) => ({ model, exact, developerLikely }))
 }
 
 function codexAuthLabel(status?: string): string {

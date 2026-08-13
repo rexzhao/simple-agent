@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { cleanup, fireEvent, render, screen } from '@testing-library/react'
+import { cleanup, fireEvent, render, screen, within } from '@testing-library/react'
 import type { ComponentProps } from 'react'
 import { ProviderManagerDialog } from './ProviderManagerDialog'
 import type { CodexLoginReadModel } from '../repositories/codexLogin'
@@ -79,6 +79,7 @@ describe('ProviderManagerDialog application integration', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Add provider' }))
     fireEvent.change(screen.getByRole('textbox', { name: 'Name' }), { target: { value: 'new-provider' } })
     fireEvent.change(screen.getByRole('textbox', { name: 'Base URL' }), { target: { value: 'https://new.example.test/v1' } })
+    fireEvent.click(screen.getByRole('button', { name: /Model 1/ }))
     fireEvent.change(screen.getByRole('textbox', { name: 'Profile name' }), { target: { value: 'default' } })
     fireEvent.change(screen.getByRole('textbox', { name: 'Model ID' }), { target: { value: 'new-model' } })
     fireEvent.click(screen.getByRole('button', { name: 'Save settings' }))
@@ -93,18 +94,20 @@ describe('ProviderManagerDialog application integration', () => {
     const onSetDefault = vi.fn<ComponentProps<typeof ProviderManagerDialog>['onSetDefault']>(() => pending.promise)
     const alpha = provider('alpha', [model('fast'), model('slow')])
     renderDialog({ state: state('ready', [alpha]), onSetDefault })
-    await vi.waitFor(() => expect(screen.getByRole('button', { name: 'Set as default' })).toBeTruthy())
-    fireEvent.click(screen.getByRole('button', { name: 'Set as default' }))
+    fireEvent.click(screen.getByRole('button', { name: /slow/ }))
+    await vi.waitFor(() => expect(screen.getByRole('button', { name: /Make default/ })).toBeTruthy())
+    fireEvent.click(screen.getByRole('button', { name: /Make default/ }))
     await vi.waitFor(() => expect(screen.getByRole('button', { name: 'Setting…' })).toBeTruthy())
     expect(onSetDefault).toHaveBeenCalledWith('alpha', 'slow')
     pending.resolve()
-    await vi.waitFor(() => expect(screen.getByRole('button', { name: 'Set as default' })).toBeTruthy())
+    await vi.waitFor(() => expect(screen.getByRole('button', { name: /Make default/ })).toBeTruthy())
   })
 
   it('uses preserve intents for safe projections and explicit replace for hidden parameters and API keys', async () => {
     const onSave = vi.fn<ComponentProps<typeof ProviderManagerDialog>['onSave']>(async () => {})
     renderDialog({ onSave })
     await vi.waitFor(() => expect(screen.getByDisplayValue('30s')).toBeTruthy())
+    fireEvent.click(screen.getByRole('button', { name: /fast/ }))
     expect((screen.getByRole('textbox', { name: 'Extra request parameters (JSON)' }) as HTMLTextAreaElement).value).toBe('')
     expect((screen.getByRole('textbox', { name: 'Extra request parameters (JSON)' }) as HTMLTextAreaElement).disabled).toBe(true)
     expect(screen.getByText('Existing request parameters are hidden and will be preserved when saving this provider.')).toBeTruthy()
@@ -119,10 +122,14 @@ describe('ProviderManagerDialog application integration', () => {
     expect(preserved.api_key).toBe('')
     expect(preserved.keep_api_key).toBe(true)
 
+    // The authority refresh returns to the provider editor. Change the
+    // provider secret there, then select the model for its hidden parameters.
+    await vi.waitFor(() => expect(screen.getByRole('button', { name: 'Save settings' })).toBeTruthy())
+    fireEvent.change(screen.getByRole('textbox', { name: 'API key / environment variable' }), { target: { value: 'new-secret' } })
+    fireEvent.click(screen.getByRole('button', { name: /fast/ }))
     // A user action explicitly opts into replacing the hidden value.
     fireEvent.click(screen.getByRole('checkbox', { name: 'Replace hidden request parameters' }))
     fireEvent.change(screen.getByRole('textbox', { name: 'Extra request parameters (JSON)' }), { target: { value: '{"temperature":0.2}' } })
-    fireEvent.change(screen.getByRole('textbox', { name: 'API key / environment variable' }), { target: { value: 'new-secret' } })
     fireEvent.click(screen.getByRole('button', { name: 'Save settings' }))
     await vi.waitFor(() => expect(onSave).toHaveBeenCalledTimes(2))
     const replaced = onSave.mock.calls[1]![1]
@@ -150,7 +157,8 @@ describe('ProviderManagerDialog application integration', () => {
     const onDiscoverModels = vi.fn(() => pending.promise)
     renderDialog({ state: state('ready', [provider('alpha'), second]), onDiscoverModels })
     await vi.waitFor(() => expect(screen.getByDisplayValue('30s')).toBeTruthy())
-    fireEvent.click(screen.getByRole('button', { name: 'Fetch from provider' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Add model' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Fetch models from provider' }))
     fireEvent.click(screen.getByRole('button', { name: /^beta/ }))
     pending.resolve(['late-secret-model'])
     await vi.waitFor(() => expect(screen.queryByText('late-secret-model')).toBeNull())
@@ -172,7 +180,8 @@ describe('ProviderManagerDialog application integration', () => {
     const failing = vi.fn(async () => { throw new Error('server message api_key=attacker-secret https://attacker.example.test/?token=x') })
     cleanup()
     const wrapper = renderDialog({ onDiscoverModels: failing })
-    fireEvent.click(screen.getByRole('button', { name: 'Fetch from provider' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Add model' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Fetch models from provider' }))
     await vi.waitFor(() => expect(wrapper.onError).toHaveBeenCalledWith('Provider model discovery failed.'))
     expect(wrapper.onError).not.toHaveBeenCalledWith(expect.stringContaining('attacker-secret'))
     expect(document.body.textContent).not.toContain('attacker-secret')
@@ -195,5 +204,40 @@ describe('ProviderManagerDialog application integration', () => {
     expect(screen.queryByText(/account|expiry|expires/i)).toBeNull()
     fireEvent.click(screen.getByRole('button', { name: /^beta/ }))
     expect(screen.queryByText('ABCD-EFGH')).toBeNull()
+  })
+
+  it('adds a manually entered model even when provider discovery is unavailable', async () => {
+    const onSave = vi.fn<ComponentProps<typeof ProviderManagerDialog>['onSave']>(async () => {})
+    renderDialog({ onSave, onDiscoverModels: vi.fn(async () => { throw new Error('unsupported') }) })
+    fireEvent.click(screen.getByRole('button', { name: 'Add model' }))
+    const dialog = screen.getByRole('dialog', { name: 'Add model' })
+    fireEvent.change(within(dialog).getByRole('combobox', { name: 'New model ID' }), { target: { value: 'vendor/private-model' } })
+    expect((within(dialog).getByRole('textbox', { name: 'New profile name' }) as HTMLInputElement).value).toBe('vendor/private-model')
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Add model' }))
+    expect(screen.getByRole('button', { name: /vendor\/private-model/ })).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: 'Save settings' }))
+    await vi.waitFor(() => expect(onSave).toHaveBeenCalledTimes(1))
+    expect(onSave.mock.calls[0]![1].models.at(-1)).toMatchObject({ profile: 'vendor/private-model', id: 'vendor/private-model' })
+  })
+
+  it('requires a manual online match choice and imports details without replacing local identity', async () => {
+    const local = provider('gateway', [{ ...model('deepseek-v4-flash'), id: 'deepseek-v4-flash' }])
+    const onSave = vi.fn<ComponentProps<typeof ProviderManagerDialog>['onSave']>(async () => {})
+    const onSearchModelCatalog = vi.fn(async () => [
+      { id: 'deepseek-v4-flash', name: 'DeepSeek V4 Flash', provider: 'gateway', context_window: 64000, input: ['text'] as const },
+      { id: 'deepseek-v4', name: 'DeepSeek V4', provider: 'deepseek', context_window: 128000, output_limit: 16000, input: ['text', 'image'] as const, reasoning: { enabled: true, effort_levels: ['low', 'high'] } },
+    ])
+    renderDialog({ state: state('ready', [local]), onSave, onSearchModelCatalog })
+    fireEvent.click(screen.getByRole('button', { name: /deepseek-v4-flash/ }))
+    fireEvent.click(screen.getByRole('button', { name: 'Find configuration online' }))
+    const dialog = screen.getByRole('dialog', { name: 'Find configuration online' })
+    await vi.waitFor(() => expect(within(dialog).getAllByRole('radio')).toHaveLength(2))
+    expect((within(dialog).getByRole('button', { name: 'Use selected configuration' }) as HTMLButtonElement).disabled).toBe(true)
+    const developer = within(dialog).getByText('Likely model developer', { exact: false }).closest('label')!
+    fireEvent.click(developer)
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Use selected configuration' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Save settings' }))
+    await vi.waitFor(() => expect(onSave).toHaveBeenCalledTimes(1))
+    expect(onSave.mock.calls[0]![1].models[0]).toMatchObject({ profile: 'deepseek-v4-flash', id: 'deepseek-v4-flash', context_window: 128000, output_limit: 16000, input: ['text', 'image'], parameters_mode: 'preserve' })
   })
 })
