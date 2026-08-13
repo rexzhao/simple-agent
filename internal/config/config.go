@@ -171,7 +171,7 @@ type ModelPricing struct {
 type ModelPricingTier struct {
 	InputCacheHit  float64 `json:"input_cache_hit" yaml:"input_cache_hit"`
 	InputCacheMiss float64 `json:"input_cache_miss" yaml:"input_cache_miss"`
-	CacheWrite     float64 `json:"cache_write" yaml:"cache_write"`
+	CacheWrite     float64 `json:"cache_write,omitempty" yaml:"cache_write,omitempty"`
 	Output         float64 `json:"output" yaml:"output"`
 }
 

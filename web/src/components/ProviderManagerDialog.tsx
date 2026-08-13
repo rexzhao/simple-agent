@@ -592,7 +592,7 @@ function providerInput(draft: ProviderDraft): ProviderUpdateTarget {
               long_context: {
                 input_cache_hit: priceNumber(model.longInputCacheHitPrice, 'Long cache-hit price'),
                 input_cache_miss: priceNumber(model.longInputCacheMissPrice, 'Long cache-miss price'),
-                cache_write: priceNumber(model.longCacheWritePrice, 'Long cache-write price'),
+                ...(model.longCacheWritePrice.trim() ? { cache_write: priceNumber(model.longCacheWritePrice, 'Long cache-write price') } : {}),
                 output: priceNumber(model.longOutputPrice, 'Long output price'),
               },
             } : {}),

@@ -1319,3 +1319,34 @@ func TestModelCatalogSearchCommandInlineShape(t *testing.T) {
 		t.Fatalf("output_limit = %d, want 384000", models[0].OutputLimit)
 	}
 }
+
+func TestDecodeProviderPricingAllowsOmittedCacheWrite(t *testing.T) {
+	// A pricing object whose long_context omits cache_write (models.dev cost
+	// entries such as grok-4.6 never carry cache_write) must decode without
+	// error and keep the other long prices.
+	pricing, err := decodeProviderPricing(json.RawMessage(`{
+		"currency": "USD",
+		"input_cache_hit": 1,
+		"input_cache_miss": 2,
+		"cache_write": 3,
+		"output": 6,
+		"long_context_threshold": 200000,
+		"long_context": {
+			"input_cache_hit": 1,
+			"input_cache_miss": 4,
+			"output": 12
+		}
+	}`), "provider.update")
+	if err != nil {
+		t.Fatalf("decodeProviderPricing() error = %v", err)
+	}
+	if pricing == nil || pricing.LongContext == nil {
+		t.Fatalf("decodeProviderPricing() = %#v, want long_context", pricing)
+	}
+	if pricing.LongContext.InputCacheMiss != 4 || pricing.LongContext.Output != 12 {
+		t.Fatalf("long pricing = %#v, want input_cache_miss 4 output 12", pricing.LongContext)
+	}
+	if pricing.LongContext.CacheWrite != 0 {
+		t.Fatalf("long cache_write = %v, want 0 (omitted)", pricing.LongContext.CacheWrite)
+	}
+}
