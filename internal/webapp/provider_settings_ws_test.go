@@ -47,6 +47,21 @@ func TestProviderSettingsWebSocketResourceUsesSafeDurableProjection(t *testing.T
 	if len(snapshot.Providers) != 1 || !snapshot.Providers[0].APIKeyConfigured {
 		t.Fatalf("safe provider snapshot = %#v", snapshot)
 	}
+	readMutationOutcome := func(command string) (protocol.CommandResultMessage, protocol.ChangeMessage) {
+		var result protocol.CommandResultMessage
+		var change protocol.ChangeMessage
+		for range 2 {
+			switch message := readWebAppMessage(t, connection).(type) {
+			case protocol.CommandResultMessage:
+				result = message
+			case protocol.ChangeMessage:
+				change = message
+			default:
+				t.Fatalf("%s unexpected message = %#v", command, message)
+			}
+		}
+		return result, change
+	}
 
 	command := protocol.CommandMessage{Envelope: protocol.Envelope{Version: 1, Type: protocol.MessageTypeCommand, ID: "provider-update"}, Payload: protocol.CommandPayload{
 		Name: "provider.update", SchemaVersion: 1, RequestID: "provider-update-request", Arguments: json.RawMessage(`{"provider":"fake","base_url":"http://127.0.0.1:1/v1","base_url_mode":"replace","api_key":"command-secret","keep_api_key":false,"auth_file":"","auth_file_mode":"replace","request_timeout":"","http_proxy":"","http_proxy_mode":"replace","https_proxy":"","https_proxy_mode":"replace","max_concurrent_requests":0,"models":[{"profile":"fast","id":"fake-model","type":"","compatibility":"","input":["text","image"],"developer_role":"","context_window":32000,"input_limit":0,"output_limit":0,"parameters_mode":"replace","parameters":{},"reasoning_config":{"parameter":"","default":"","levels":{}},"pricing":null},{"profile":"precise","id":"changed-model","type":"","compatibility":"","input":[],"developer_role":"","context_window":64000,"input_limit":0,"output_limit":0,"parameters_mode":"replace","parameters":{},"reasoning_config":{"parameter":"","default":"","levels":{}},"pricing":null}]}`),
@@ -61,13 +76,9 @@ func TestProviderSettingsWebSocketResourceUsesSafeDurableProjection(t *testing.T
 	if _, ok := readWebAppMessage(t, connection).(protocol.CommandAcceptedMessage); !ok {
 		t.Fatal("provider.update accepted missing")
 	}
-	result, ok := readWebAppMessage(t, connection).(protocol.CommandResultMessage)
-	if !ok || result.Payload.Status != protocol.CommandStatusSucceeded || !strings.Contains(string(result.Payload.Result), `"changed":true`) || strings.Contains(string(result.Payload.Result), "command-secret") {
+	result, change := readMutationOutcome("provider.update")
+	if result.Payload.Status != protocol.CommandStatusSucceeded || !strings.Contains(string(result.Payload.Result), `"changed":true`) || strings.Contains(string(result.Payload.Result), "command-secret") {
 		t.Fatalf("provider.update result = %#v, API key must not be returned", result.Payload)
-	}
-	change, ok := readWebAppMessage(t, connection).(protocol.ChangeMessage)
-	if !ok {
-		t.Fatal("provider settings change missing")
 	}
 	if len(change.Payload.Operations) != 1 || change.Payload.Operations[0].Op != providersettings.OperationUpsertDefault {
 		t.Fatalf("provider settings operations = %#v", change.Payload.Operations)
@@ -123,12 +134,11 @@ func TestProviderSettingsWebSocketResourceUsesSafeDurableProjection(t *testing.T
 	if _, ok := readWebAppMessage(t, connection).(protocol.CommandAcceptedMessage); !ok {
 		t.Fatal("provider.create accepted missing")
 	}
-	createdResult, ok := readWebAppMessage(t, connection).(protocol.CommandResultMessage)
-	if !ok || createdResult.Payload.Status != protocol.CommandStatusSucceeded || string(createdResult.Payload.Result) != `{"operation_id":"operation-created-provider","provider":"created-provider","status":"applied","changed":true}` {
+	createdResult, createdChange := readMutationOutcome("provider.create")
+	if createdResult.Payload.Status != protocol.CommandStatusSucceeded || string(createdResult.Payload.Result) != `{"operation_id":"operation-created-provider","provider":"created-provider","status":"applied","changed":true}` {
 		t.Fatalf("provider.create result = %#v", createdResult.Payload)
 	}
-	createdChange, ok := readWebAppMessage(t, connection).(protocol.ChangeMessage)
-	if !ok || len(createdChange.Payload.Operations) != 1 || createdChange.Payload.Operations[0].Op != providersettings.OperationUpsertDefault {
+	if len(createdChange.Payload.Operations) != 1 || createdChange.Payload.Operations[0].Op != providersettings.OperationUpsertDefault {
 		t.Fatalf("provider.create authoritative change = %#v", createdChange)
 	}
 	assertNoCreateSecrets("result", string(createdResult.Payload.Result), createSensitiveValues...)
@@ -257,18 +267,7 @@ func TestProviderSettingsWebSocketResourceUsesSafeDurableProjection(t *testing.T
 	if _, ok := readWebAppMessage(t, connection).(protocol.CommandAcceptedMessage); !ok {
 		t.Fatal("provider.set_default accepted missing")
 	}
-	var defaultResult protocol.CommandResultMessage
-	var defaultChange protocol.ChangeMessage
-	for range 2 {
-		switch message := readWebAppMessage(t, connection).(type) {
-		case protocol.CommandResultMessage:
-			defaultResult = message
-		case protocol.ChangeMessage:
-			defaultChange = message
-		default:
-			t.Fatalf("provider.set_default unexpected message = %#v", message)
-		}
-	}
+	defaultResult, defaultChange := readMutationOutcome("provider.set_default")
 	if defaultResult.Payload.Status != protocol.CommandStatusSucceeded || string(defaultResult.Payload.Result) != `{"provider":"fake","model":"precise","status":"applied"}` {
 		t.Fatalf("provider.set_default result = %#v", defaultResult.Payload)
 	}
