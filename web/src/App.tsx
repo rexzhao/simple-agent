@@ -96,7 +96,7 @@ function providerOperationErrorMessage(reason: unknown, operation: 'save' | 'def
 }
 
 function App() {
-  const { loadBootstrap, sessionModels, codexUsage, loadSessionImage } = useSyncApplication()
+  const { loadBootstrap, sessionModels, codexUsage, loadSessionImage, uploadSessionImage } = useSyncApplication()
   const projectIndex = useProjectIndex()
   const { project: projectCommands, session: sessionCommands, run: runCommands, provider: providerCommands, codexLogin: codexLoginCommands } = useSyncCommands()
   const { currentProject, currentSession, providerSettings: providerSettingsSignal, codexLoginProvider } = useSyncSignals()
@@ -797,14 +797,22 @@ function App() {
   // startNewRun handles text admission. The command result is never used to
   // manufacture a row: Session Content must publish the matching transient
   // projection before the pending UI gate is released.
-  const startNewRun = async (sessionID: string, content: string): Promise<boolean> => {
+  const startNewRun = async (sessionID: string, content: string, images: PastedImageAttachment[] = []): Promise<boolean> => {
     pendingAdmissionSessionsRef.current.add(sessionID)
     // Enter the visible barrier before the command leaves the page. This
     // closes the double-submit and destructive-action race during in-flight
     // command acknowledgement.
     setAwaitingRunStarted(sessionID, true)
     try {
-      const started = await runCommands.startRun(sessionID, content)
+      const uploaded = await Promise.all(images.map(async (image) => {
+        const comma = image.dataURL.indexOf(',')
+        if (comma < 0) throw new Error('Invalid image attachment')
+        const raw = atob(image.dataURL.slice(comma + 1))
+        const bytes = new Uint8Array(raw.length)
+        for (let index = 0; index < raw.length; index++) bytes[index] = raw.charCodeAt(index)
+        return uploadSessionImage(sessionID, new Blob([bytes], { type: image.mediaType }))
+      }))
+      const started = await runCommands.startRun(sessionID, content, { images: uploaded })
       if (!started.run_id || started.session_id !== sessionID) {
         throw new Error('Run admission response did not include the requested session and run_id')
       }
@@ -871,20 +879,16 @@ function App() {
       return createRootSession(sessionID)
     }
     if (isAdmissionPending(sessionID)) return false
-    if (images.length > 0) {
-      // Image admission is intentionally not sent through the removed REST
-      // run endpoint. A bounded Blob upload command is a separate data-plane
-      // slice; silently dropping an attachment would be worse than a safe
-      // explicit refusal.
-      setError('Image attachments are temporarily unavailable.')
-      return false
-    }
     const activeRun = controlRunFor(sessionID)
     if (activeRun && activeRun.status === 'running') {
       // Append to the in-flight run: the message is queued and injected into
       // the active turn at the next safe checkpoint, or sent as a follow-up
       // turn. It is never sent as a new run here. The queued state arrives via
       // the run.prompt_queue stream event; no local echo is added.
+      if (images.length > 0) {
+        setError('Images cannot be appended while a run is active; wait for it to finish.')
+        return false
+      }
       if (!content.trim()) return false
       try {
         await runCommands.appendPrompt(sessionID, activeRun.id, content)
@@ -894,7 +898,7 @@ function App() {
         return false
       }
     }
-    return startNewRun(sessionID, content)
+    return startNewRun(sessionID, content, images)
   }
 
   const continueRun = useCallback(async (): Promise<boolean> => {

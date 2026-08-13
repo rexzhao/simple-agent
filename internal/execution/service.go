@@ -2814,6 +2814,37 @@ func (s *Service) ValidateSessionMessageInput(id string, input SessionMessageInp
 	return s.validateSessionMessageInput(session, input)
 }
 
+// StoreSessionImage writes one validated composer attachment while holding the
+// same session write lock used by deletion and run admission. This prevents an
+// upload racing deletion from recreating an otherwise deleted session folder.
+func (s *Service) StoreSessionImage(ctx context.Context, id, mediaType string, raw []byte) (model.BlobRef, error) {
+	if s == nil || s.sessionStore == nil {
+		return model.BlobRef{}, fmt.Errorf("execution session store is not configured")
+	}
+	mediaType, supported := model.NormalizeImageMediaType(mediaType)
+	if !supported || len(raw) == 0 || len(raw) > model.MaxImageInputBytes || !model.ImageBytesMatchMediaType(mediaType, raw) {
+		return model.BlobRef{}, fmt.Errorf("invalid image attachment")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	lock, err := s.sessionStore.AcquireSessionWriteLock(ctx, strings.TrimSpace(id))
+	if err != nil {
+		return model.BlobRef{}, err
+	}
+	defer func() { _ = lock.Release() }()
+	session, err := s.sessionStore.LoadState(id)
+	if err != nil {
+		return model.BlobRef{}, err
+	}
+	if effective, err := s.sessionEffectivelyArchived(session); err != nil {
+		return model.BlobRef{}, err
+	} else if effective {
+		return model.BlobRef{}, ErrSessionArchived
+	}
+	return s.sessionStore.WriteBlobForSession(id, raw, "binary", mediaType)
+}
+
 // ValidateContinue checks the durable session state, not an in-memory stream.
 // This makes Continue work after a process restart and prevents a second run
 // from being created while the session still has an active run.
@@ -2988,6 +3019,28 @@ func (s *Service) AdmitSessionRun(ctx context.Context, id string, input SessionM
 	if input.Continue {
 		payloadInput.ContinueTargetRunID = session.InterruptedRunID
 		payloadInput.ContinueTargetTurnID = session.InterruptedTurnID
+	} else if len(input.ContentBlocks) > 0 {
+		// The run row is durable admission metadata, not a second attachment
+		// store. Replace inline data URLs with the session-owned blob references
+		// before marshaling so a 12 MiB upload is not retained again as ~16 MiB
+		// of base64 JSON. The in-memory input remains materialized for the runner.
+		payloadInput.ContentBlocks = append([]model.InputContentBlock(nil), input.ContentBlocks...)
+		for index := range payloadInput.ContentBlocks {
+			block := &payloadInput.ContentBlocks[index]
+			if block.Type != "input_image" || block.ImageBlob != nil {
+				continue
+			}
+			mediaType, raw, parseErr := model.ParseSupportedImageDataURL(block.ImageURL)
+			if parseErr != nil {
+				return DurableRunAdmission{}, parseErr
+			}
+			ref, writeErr := s.sessionStore.WriteBlobForSession(id, raw, "binary", mediaType)
+			if writeErr != nil {
+				return DurableRunAdmission{}, writeErr
+			}
+			block.ImageURL = ""
+			block.ImageBlob = &ref
+		}
 	}
 	payload, err := json.Marshal(payloadInput)
 	if err != nil {

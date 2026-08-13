@@ -5,7 +5,15 @@ export type RunStatus = 'running' | 'committed' | 'failed' | 'interrupted' | 'ca
 export interface RunStartOptions {
   /** Caller-owned stable identity. Reuse it for a timeout/page-restore retry. */
   readonly runID?: string
+  readonly images?: readonly RunImageReference[]
   readonly signal?: AbortSignal
+}
+
+export interface RunImageReference {
+  readonly hash: string
+  readonly media_type: string
+  readonly size_bytes: number
+  readonly detail?: 'auto' | 'low' | 'high'
 }
 
 export interface RunStartResult {

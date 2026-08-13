@@ -1040,7 +1040,15 @@ export class CommandFacade implements SessionCommands, RunCommands, ProjectComma
     if (typeof sessionID !== 'string' || typeof content !== 'string') return Promise.reject(new CommandFacadeError('invalid', 'session_id and content are required'))
     const cleanSessionID = this.cleanID(sessionID)
     if (!this.validSessionID(cleanSessionID)) return Promise.reject(new CommandFacadeError('invalid', 'session_id is invalid'))
-    if (typeof content !== 'string' || content.trim() === '' || this.utf8Bytes(content) > 256 * 1024) return Promise.reject(new CommandFacadeError('invalid', 'content is invalid'))
+    const images = (options.images ?? []).map((image) => ({
+      hash: image.hash,
+      media_type: image.media_type,
+      size_bytes: image.size_bytes,
+      ...(image.detail !== undefined ? { detail: image.detail } : {}),
+    }))
+    if (typeof content !== 'string' || (content.trim() === '' && images.length === 0) || this.utf8Bytes(content) > 256 * 1024) return Promise.reject(new CommandFacadeError('invalid', 'content is invalid'))
+    if (!Array.isArray(images) || images.length > 5 || images.some((image) => !/^[0-9a-f]{64}$/u.test(image.hash) || !['image/png', 'image/jpeg', 'image/gif', 'image/webp'].includes(image.media_type) || !Number.isSafeInteger(image.size_bytes) || image.size_bytes <= 0 || image.size_bytes > 4 * 1024 * 1024 || (image.detail !== undefined && !['auto', 'low', 'high'].includes(image.detail)))) return Promise.reject(new CommandFacadeError('invalid', 'images are invalid'))
+    if (images.reduce((total, image) => total + image.size_bytes, 0) > 12 * 1024 * 1024) return Promise.reject(new CommandFacadeError('invalid', 'images are invalid'))
 
     const explicitRunID = options.runID !== undefined
     let runID: string
@@ -1060,7 +1068,7 @@ export class CommandFacade implements SessionCommands, RunCommands, ProjectComma
     }
     // Do not trim content in the wire payload: text is the normalized input
     // and its exact bytes are part of the durable run fingerprint.
-    return this.submit('run.start', { session_id: cleanSessionID, run_id: runID, content }, true, (value) => decodeRunStartResult(value, cleanSessionID, runID), options)
+    return this.submit('run.start', { session_id: cleanSessionID, run_id: runID, content, ...(images.length > 0 ? { images } : {}) }, true, (value) => decodeRunStartResult(value, cleanSessionID, runID), options)
   }
 
   startRun(sessionID: string, content: string, options: RunStartOptions = {}): Promise<RunStartResult> {

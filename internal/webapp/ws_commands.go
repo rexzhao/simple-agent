@@ -19,6 +19,7 @@ import (
 	"github.com/rexzhao/simple-agent/internal/commands"
 	"github.com/rexzhao/simple-agent/internal/config"
 	"github.com/rexzhao/simple-agent/internal/execution"
+	"github.com/rexzhao/simple-agent/internal/model"
 	"github.com/rexzhao/simple-agent/internal/modelcatalog"
 	projectstore "github.com/rexzhao/simple-agent/internal/projects"
 	"github.com/rexzhao/simple-agent/internal/protocol"
@@ -95,6 +96,14 @@ type runStartArguments struct {
 	SessionID string
 	RunID     string
 	Content   string
+	Images    []runStartImageReference
+}
+
+type runStartImageReference struct {
+	Hash      string `json:"hash"`
+	MediaType string `json:"media_type"`
+	SizeBytes int64  `json:"size_bytes"`
+	Detail    string `json:"detail,omitempty"`
 }
 
 type runContinueArguments struct {
@@ -393,10 +402,11 @@ type runToolCancelResult struct {
 }
 
 func runStartFingerprint(request commands.CommandRequest, arguments runStartArguments) (string, error) {
-	fingerprintArgs, err := json.Marshal(map[string]string{
-		"session_id": arguments.SessionID,
-		"content":    arguments.Content,
-	})
+	fingerprintArgs, err := json.Marshal(struct {
+		SessionID string                   `json:"session_id"`
+		Content   string                   `json:"content"`
+		Images    []runStartImageReference `json:"images,omitempty"`
+	}{arguments.SessionID, arguments.Content, arguments.Images})
 	if err != nil {
 		return "", err
 	}
@@ -1468,10 +1478,8 @@ func optionalCommandBool(fields map[string]json.RawMessage, name, command string
 
 const maxSessionCreateArgumentBytes = 4096
 
-// run.start is intentionally a bounded text-only clean-break contract.
-// WebSocket command frames do not carry blob bytes until a separate blob upload
-// contract is specified. Unknown image/blob/content-block fields are rejected
-// rather than silently dropped.
+// run.start carries only bounded content-addressed image references. Raw bytes
+// use the authenticated session image upload data plane.
 const maxRunStartContentBytes = 256 * 1024
 const maxRunPromptAppendContentBytes = sessions.MaxPromptAppendContentBytes
 
@@ -1840,7 +1848,7 @@ func decodeRunStartArguments(raw json.RawMessage) (runStartArguments, error) {
 	if err != nil {
 		return runStartArguments{}, err
 	}
-	if err := requireExactFields(fields, command, "session_id", "run_id", "content"); err != nil {
+	if err := requireExactFields(fields, command, "session_id", "run_id", "content", "images"); err != nil {
 		return runStartArguments{}, err
 	}
 	sessionID, err := requiredCommandString(fields, "session_id", command)
@@ -1851,11 +1859,58 @@ func decodeRunStartArguments(raw json.RawMessage) (runStartArguments, error) {
 	if err != nil || sessions.ValidateRunID(runID) != nil {
 		return runStartArguments{}, fmt.Errorf("invalid %s arguments", command)
 	}
-	content, err := requiredRunStartContent(fields, command, maxRunStartContentBytes)
-	if err != nil {
+	content := ""
+	if contentRaw, ok := fields["content"]; ok {
+		if err := json.Unmarshal(contentRaw, &content); err != nil || !utf8.ValidString(content) || len(content) > maxRunStartContentBytes {
+			return runStartArguments{}, fmt.Errorf("invalid %s arguments", command)
+		}
+	}
+	images, err := decodeRunStartImages(fields["images"], command)
+	if err != nil || (strings.TrimSpace(content) == "" && len(images) == 0) {
 		return runStartArguments{}, fmt.Errorf("invalid %s arguments", command)
 	}
-	return runStartArguments{SessionID: sessionID, RunID: runID, Content: content}, nil
+	return runStartArguments{SessionID: sessionID, RunID: runID, Content: content, Images: images}, nil
+}
+
+func decodeRunStartImages(raw json.RawMessage, command string) ([]runStartImageReference, error) {
+	if len(raw) == 0 {
+		return nil, nil
+	}
+	var values []json.RawMessage
+	if err := json.Unmarshal(raw, &values); err != nil || len(values) == 0 || len(values) > model.MaxImageInputAttachments {
+		return nil, fmt.Errorf("invalid %s arguments", command)
+	}
+	images := make([]runStartImageReference, 0, len(values))
+	var total int64
+	for _, value := range values {
+		fields, err := strictCommandObject(value, command+" image")
+		if err != nil || requireExactFields(fields, command+" image", "hash", "media_type", "size_bytes", "detail") != nil {
+			return nil, fmt.Errorf("invalid %s arguments", command)
+		}
+		var image runStartImageReference
+		if err := json.Unmarshal(value, &image); err != nil || len(image.Hash) != 64 {
+			return nil, fmt.Errorf("invalid %s arguments", command)
+		}
+		if _, err := hex.DecodeString(image.Hash); err != nil {
+			return nil, fmt.Errorf("invalid %s arguments", command)
+		}
+		image.Hash = strings.ToLower(image.Hash)
+		mediaType, supported := model.NormalizeImageMediaType(image.MediaType)
+		image.Detail = strings.ToLower(strings.TrimSpace(image.Detail))
+		if image.Detail == "" {
+			image.Detail = "auto"
+		}
+		if !supported || image.SizeBytes <= 0 || image.SizeBytes > model.MaxImageInputBytes || (image.Detail != "auto" && image.Detail != "low" && image.Detail != "high") {
+			return nil, fmt.Errorf("invalid %s arguments", command)
+		}
+		image.MediaType = mediaType
+		total += image.SizeBytes
+		if total > model.MaxImageInputTotalBytes {
+			return nil, fmt.Errorf("invalid %s arguments", command)
+		}
+		images = append(images, image)
+	}
+	return images, nil
 }
 
 func decodeRunContinueArguments(raw json.RawMessage) (runContinueArguments, error) {
@@ -2938,7 +2993,16 @@ func newSessionCommandRegistry(service *execution.Service, runs *runRegistry, op
 				if runs == nil {
 					return nil, commands.NewDomainError("run_unavailable", "run execution is not configured", nil)
 				}
-				status, err := runs.startDurable(arguments.SessionID, arguments.Content, arguments.RunID, fingerprint)
+				blocks := make([]model.InputContentBlock, 0, len(arguments.Images))
+				for _, image := range arguments.Images {
+					ref := model.BlobRef{Hash: image.Hash, SizeBytes: image.SizeBytes, Encoding: "binary", MediaType: image.MediaType}
+					raw, readErr := service.SessionStore().ReadBlobForSession(arguments.SessionID, ref)
+					if readErr != nil || !model.ImageBytesMatchMediaType(image.MediaType, raw) {
+						return nil, commands.NewDomainError("invalid_image_attachment", "uploaded image attachment is unavailable or invalid", readErr)
+					}
+					blocks = append(blocks, model.InputContentBlock{Type: "input_image", ImageURL: model.ImageDataURL(image.MediaType, raw), Detail: image.Detail})
+				}
+				status, err := runs.startDurableWithInput(arguments.SessionID, execution.SessionMessageInput{Content: arguments.Content, ContentBlocks: blocks}, arguments.RunID, fingerprint)
 				if err != nil {
 					return nil, sessionCommandError(err)
 				}

@@ -1,4 +1,5 @@
 import type { Bootstrap } from './types'
+import type { RunImageReference } from './commands/runCommands'
 import { frontendProtocolLogger, protocolLogIdentity } from './lib/frontendProtocolLogger'
 
 const tokenStorageKey = 'sai-capability-token'
@@ -103,6 +104,31 @@ async function request<T>(path: string, init: RequestInit = {}, context: Protoco
 
 export const api = {
   bootstrap: () => request<Bootstrap>('/api/bootstrap'),
+  uploadSessionImage: async (sessionID: string, image: Blob, signal?: AbortSignal): Promise<RunImageReference> => {
+    const response = await fetch(`/api/sessions/${encodeURIComponent(sessionID)}/images`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${token}`, 'Content-Type': image.type },
+      body: image,
+      signal,
+    })
+    if (!response.ok) {
+      let code = 'request_failed'
+      let message = `Image upload failed (${response.status})`
+      try {
+        const payload = await response.json() as { error?: { code?: string; message?: string } }
+        code = payload.error?.code ?? code
+        message = payload.error?.message ?? message
+      } catch { /* retain safe fallback */ }
+      throw new APIError(response.status, code, message)
+    }
+    const value = await response.json() as Partial<RunImageReference>
+    if (typeof value.hash !== 'string' || !/^[0-9a-f]{64}$/u.test(value.hash)
+      || typeof value.media_type !== 'string' || !['image/png', 'image/jpeg', 'image/gif', 'image/webp'].includes(value.media_type)
+      || !Number.isSafeInteger(value.size_bytes) || Number(value.size_bytes) <= 0 || Number(value.size_bytes) > 4 * 1024 * 1024) {
+      throw new APIError(response.status, 'invalid_response', 'Image upload returned an invalid reference')
+    }
+    return { hash: value.hash, media_type: value.media_type, size_bytes: Number(value.size_bytes) }
+  },
   sessionImage: async (sessionID: string, hash: string, signal?: AbortSignal): Promise<Blob> => {
     const requestID = `http-${++requestSequence}`
     const imageURL = `/api/sessions/${encodeURIComponent(sessionID)}/images/${encodeURIComponent(hash)}`

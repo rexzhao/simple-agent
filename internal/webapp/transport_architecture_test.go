@@ -95,6 +95,7 @@ func TestProductionHTTPRouteAllowlist(t *testing.T) {
 		"HandleFunc POST /api/ws-ticket":                         true,
 		"HandleFunc GET /api/ws":                                 true,
 		"HandleFunc GET /api/blobs/{blobID}":                     true,
+		"HandleFunc POST /api/sessions/{sessionID}/images":       true,
 		"HandleFunc GET /api/sessions/{sessionID}/images/{hash}": true,
 		"Handle /": true,
 	}

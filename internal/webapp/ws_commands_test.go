@@ -870,6 +870,40 @@ func TestRunStartPreservesExactContentAndUsesUTF8ByteLimit(t *testing.T) {
 	}
 }
 
+func TestRunStartAcceptsBoundedImageReferencesAndFingerprintsThem(t *testing.T) {
+	hash := strings.Repeat("ab", 32)
+	raw := json.RawMessage(`{"session_id":"session","run_id":"run-images","content":"","images":[{"hash":"` + hash + `","media_type":"IMAGE/PNG","size_bytes":8}]}`)
+	arguments, err := decodeRunStartArguments(raw)
+	if err != nil {
+		t.Fatalf("decodeRunStartArguments() error=%v", err)
+	}
+	if arguments.Content != "" || len(arguments.Images) != 1 || arguments.Images[0].MediaType != "image/png" || arguments.Images[0].Detail != "auto" {
+		t.Fatalf("decoded image arguments=%#v", arguments)
+	}
+	request := commands.CommandRequest{Name: "run.start", SchemaVersion: 1, Arguments: raw}
+	first, err := runStartFingerprint(request, arguments)
+	if err != nil {
+		t.Fatal(err)
+	}
+	arguments.Images[0].Hash = strings.Repeat("cd", 32)
+	second, err := runStartFingerprint(request, arguments)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first == second {
+		t.Fatal("run.start fingerprint ignored image reference")
+	}
+	for _, invalid := range []json.RawMessage{
+		json.RawMessage(`{"session_id":"session","run_id":"run","content":"","images":[]}`),
+		json.RawMessage(`{"session_id":"session","run_id":"run","content":"","images":[{"hash":"bad","media_type":"image/png","size_bytes":8}]}`),
+		json.RawMessage(`{"session_id":"session","run_id":"run","content":"","images":[{"hash":"` + hash + `","media_type":"image/bmp","size_bytes":8}]}`),
+	} {
+		if _, err := decodeRunStartArguments(invalid); err == nil {
+			t.Errorf("accepted invalid image reference: %s", invalid)
+		}
+	}
+}
+
 func TestRunContinueFingerprintNormalizesOnlyWireOperationAndSeparatesRunStart(t *testing.T) {
 	request := commands.CommandRequest{Name: "run.continue", SchemaVersion: 1, Arguments: json.RawMessage(`{"session_id":"session","run_id":"run-a"}`)}
 	first, err := runContinueFingerprint(request, runContinueArguments{SessionID: "session", RunID: "run-a"})

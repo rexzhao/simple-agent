@@ -169,6 +169,7 @@ export function createSyncApplication(options: SyncApplicationOptions = {}): Syn
       const image = await api.sessionImage(sessionID, hash, signal)
       return { bytes: await image.arrayBuffer(), contentType: image.type }
     },
+    uploadSessionImage: (sessionID, image, signal) => api.uploadSessionImage(sessionID, image, signal),
   }
 
   const debugBridge = new WebDebugBridge({

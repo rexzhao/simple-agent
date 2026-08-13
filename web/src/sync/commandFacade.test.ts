@@ -226,6 +226,23 @@ describe('CommandFacade session.mark_read', () => {
     facade.stop()
   })
 
+  it('starts image-only runs with bounded uploaded references', async () => {
+    const transport = new FakeCommandTransport()
+    const facade = new CommandFacade({ transport, runIDGenerator: () => 'run_image_test' })
+    const image = { hash: 'ab'.repeat(32), media_type: 'image/png', size_bytes: 8 } as const
+    const pending = facade.startRun('session_1', '', { images: [image] })
+    ;(image as { size_bytes: number }).size_bytes = 999
+    const command = transport.sent[0]
+    if (command.type !== 'command') throw new Error('wrong command')
+    expect(command.payload.arguments).toEqual({ session_id: 'session_1', run_id: 'run_image_test', content: '', images: [{ hash: 'ab'.repeat(32), media_type: 'image/png', size_bytes: 8 }] })
+    transport.emit(commandMessage('command_result', command.payload.request_id, {
+      status: 'succeeded', result: { session_id: 'session_1', run_id: 'run_image_test', status: 'running' },
+    }))
+    await expect(pending).resolves.toMatchObject({ run_id: 'run_image_test' })
+    await expect(facade.startRun('session_1', '', { runID: 'run_bad_image', images: [{ ...image, hash: 'bad' }] })).rejects.toMatchObject({ code: 'invalid' })
+    facade.stop()
+  })
+
   it('continues with only session/run identity, separates request IDs, and retries the exact payload', async () => {
     const transport = new FakeCommandTransport()
     let requestNumber = 0

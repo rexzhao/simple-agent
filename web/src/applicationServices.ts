@@ -11,6 +11,7 @@ import type { SessionIndexRepository } from './repositories/sessionIndex'
 import type { SessionImageData } from './repositories/sessionContent'
 import type { SessionModelOption } from './types'
 import type { CodexUsageDomain } from './domain/codexUsage'
+import type { RunImageReference } from './commands/runCommands'
 
 /**
  * Pure application state used to express interest without exposing routing or
@@ -93,6 +94,8 @@ export interface ApplicationPageServices {
   readonly sessionModels: (projectID: string) => Promise<SessionModelCatalog>
   readonly codexUsage: (provider: string) => Promise<CodexUsageDomain>
   readonly loadSessionImage: (sessionID: string, hash: string, signal?: AbortSignal) => Promise<SessionImageData>
+  /** Bounded binary attachment data plane. */
+  readonly uploadSessionImage: (sessionID: string, image: Blob, signal?: AbortSignal) => Promise<RunImageReference>
 }
 
 /** Lifecycle bridge consumed by the React Provider, also without sync types. */

@@ -551,10 +551,11 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /api/bootstrap", s.handleBootstrap)
 	s.mux.HandleFunc("POST /api/ws-ticket", s.handleWSTicket)
 	s.mux.HandleFunc("GET /api/ws", s.handleWebSocket)
-	// Session images are a read boundary for blobs referenced by durable
-	// content. All project/session/provider/run control is carried by typed WS
-	// commands/resources; it deliberately has no parallel REST surface.
+	// Images use a bounded session-scoped binary data plane for upload/read.
+	// Project/session/provider/run control remains on typed WS commands and has
+	// no parallel REST surface.
 	s.mux.HandleFunc("GET /api/blobs/{blobID}", s.handleBlob)
+	s.mux.HandleFunc("POST /api/sessions/{sessionID}/images", s.handleUploadSessionImage)
 	s.mux.HandleFunc("GET /api/sessions/{sessionID}/images/{hash}", s.handleSessionImage)
 	s.mux.Handle("/", s.staticHandler())
 }
