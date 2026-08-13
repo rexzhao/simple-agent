@@ -923,7 +923,11 @@ func decodeProviderReasoning(raw json.RawMessage, command string) (config.Reason
 	if err != nil {
 		return config.ReasoningConfig{}, err
 	}
-	if err := requireExactFields(fields, command+" reasoning_config", "parameter", "default", "levels"); err != nil {
+	if err := requireExactFields(fields, command+" reasoning_config", "type", "parameter", "default", "levels"); err != nil {
+		return config.ReasoningConfig{}, err
+	}
+	reasoningType, err := optionalProviderString(fields, "type", command)
+	if err != nil {
 		return config.ReasoningConfig{}, err
 	}
 	parameter, err := optionalProviderString(fields, "parameter", command)
@@ -941,7 +945,24 @@ func decodeProviderReasoning(raw json.RawMessage, command string) (config.Reason
 			return config.ReasoningConfig{}, err
 		}
 	}
-	return config.ReasoningConfig{Parameter: parameter, Default: defaultLevel, Levels: levels}, nil
+	if !boundedReasoningType(reasoningType) {
+		return config.ReasoningConfig{}, fmt.Errorf("invalid %s arguments", command)
+	}
+	reasoningType = config.NormalizeReasoningType(reasoningType)
+	return config.ReasoningConfig{Type: reasoningType, Parameter: parameter, Default: defaultLevel, Levels: levels}, nil
+}
+
+// boundedReasoningType accepts the reasoning config types the frontend emits.
+// The historical empty value is preserved and effort is normalized to empty
+// by the caller so provider files written before the type field stay the
+// same on disk.
+func boundedReasoningType(value string) bool {
+	switch value {
+	case "", config.ReasoningTypeEffort, config.ReasoningTypeBudgetTokens:
+		return true
+	default:
+		return false
+	}
 }
 
 func decodeProviderPricing(raw json.RawMessage, command string) (*config.ModelPricing, error) {

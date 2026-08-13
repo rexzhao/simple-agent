@@ -266,3 +266,42 @@ func TestProviderSettingsWebSocketResourceUsesSafeDurableProjection(t *testing.T
 		t.Fatalf("provider.set_default authoritative change = %#v", defaultChange)
 	}
 }
+
+func TestProviderSettingsReasoningTypeAcceptedOverWebSocket(t *testing.T) {
+	// The frontend encodes reasoning_config with an explicit type field
+	// (''/effort or budget_tokens). The command boundary must accept it;
+	// otherwise every models.dev catalog fill that carries a reasoning type
+	// fails with "Provider settings could not be saved."
+	server, _, _ := newWebTestAppServerWithRunner(t, webTestRunner{})
+	connection := dialWebApp(t, server.URL, issueWebSocketTicket(t, server.URL), "http://"+strings.TrimPrefix(server.URL, "http://"))
+	defer connection.Close(websocket.StatusNormalClosure, "done")
+	writeWebAppHello(t, connection)
+	if _, ok := readWebAppMessage(t, connection).(protocol.WelcomeMessage); !ok {
+		t.Fatal("welcome missing")
+	}
+
+	command := protocol.CommandMessage{Envelope: protocol.Envelope{Version: 1, Type: protocol.MessageTypeCommand, ID: "provider-create-type"}, Payload: protocol.CommandPayload{
+		Name: "provider.create", SchemaVersion: 1, RequestID: "provider-create-type-request", Arguments: json.RawMessage(`{
+			"operation_id":"operation-provider-create-type","provider":"type-probe",
+			"base_url":"https://type-probe.example/v1","base_url_mode":"replace","api_key":"k","keep_api_key":false,
+			"auth_file":"","auth_file_mode":"replace","request_timeout":"60s",
+			"http_proxy":"","http_proxy_mode":"replace","https_proxy":"","https_proxy_mode":"replace",
+			"max_concurrent_requests":0,
+			"models":[{"profile":"m","id":"m","type":"openai-chat","compatibility":"","input":["text"],"developer_role":"","context_window":1000,"input_limit":0,"output_limit":0,"parameters_mode":"replace","parameters":{},"reasoning_config":{"type":"budget_tokens","parameter":"thinking.budget_tokens","default":"high","levels":{"low":2048,"high":8192}},"pricing":null}]
+		}`),
+	}}
+	encoded, err := protocol.EncodeMessage(command)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := connection.Write(context.Background(), websocket.MessageText, encoded); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := readWebAppMessage(t, connection).(protocol.CommandAcceptedMessage); !ok {
+		t.Fatal("provider.create accepted missing")
+	}
+	result, ok := readWebAppMessage(t, connection).(protocol.CommandResultMessage)
+	if !ok || result.Payload.Status != protocol.CommandStatusSucceeded {
+		t.Fatalf("provider.create result = %#v, want success", result.Payload)
+	}
+}

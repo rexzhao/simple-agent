@@ -1320,6 +1320,43 @@ func TestModelCatalogSearchCommandInlineShape(t *testing.T) {
 	}
 }
 
+func TestDecodeProviderReasoningAcceptsTypeField(t *testing.T) {
+	// The frontend encodes reasoning_config with an explicit type ('' or
+	// 'effort' for string mappings, 'budget_tokens' for numeric budgets). The
+	// command decoder must accept it and normalize effort to the empty type so
+	// provider files written before the field keep their on-disk shape.
+	tests := []struct {
+		name     string
+		raw      string
+		wantType string
+	}{
+		{name: "missing type", raw: `{"parameter":"reasoning_effort","default":"high","levels":{"high":"high"}}`, wantType: ""},
+		{name: "empty type", raw: `{"type":"","parameter":"reasoning_effort","default":"high","levels":{"high":"high"}}`, wantType: ""},
+		{name: "effort type", raw: `{"type":"effort","parameter":"reasoning_effort","default":"high","levels":{"high":"high"}}`, wantType: ""},
+		{name: "budget_tokens type", raw: `{"type":"budget_tokens","parameter":"thinking.budget_tokens","default":"high","levels":{"low":2048,"high":8192}}`, wantType: "budget_tokens"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			reasoning, err := decodeProviderReasoning(json.RawMessage(test.raw), "provider.update")
+			if err != nil {
+				t.Fatalf("decodeProviderReasoning() error = %v", err)
+			}
+			if reasoning.Type != test.wantType {
+				t.Fatalf("reasoning.Type = %q, want %q", reasoning.Type, test.wantType)
+			}
+		})
+	}
+	invalid := []string{
+		`{"type":"bogus","parameter":"p","default":"d","levels":{}}`,
+		`{"type":null,"parameter":"p","default":"d","levels":{}}`,
+	}
+	for _, raw := range invalid {
+		if _, err := decodeProviderReasoning(json.RawMessage(raw), "provider.update"); err == nil {
+			t.Fatalf("decodeProviderReasoning(%s) error = nil, want rejection", raw)
+		}
+	}
+}
+
 func TestDecodeProviderPricingAllowsOmittedCacheWrite(t *testing.T) {
 	// A pricing object whose long_context omits cache_write (models.dev cost
 	// entries such as grok-4.6 never carry cache_write) must decode without
