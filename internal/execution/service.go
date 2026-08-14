@@ -171,6 +171,7 @@ type SessionDetail struct {
 	EnabledSkills     []string               `json:"enabled_skills,omitempty"`
 	ShowReasoning     bool                   `json:"show_reasoning"`
 	FullAccess        bool                   `json:"full_access"`
+	AutoCompactOff    bool                   `json:"-"`
 	Context           contextwindow.Metadata `json:"context"`
 	SaveToolResults   bool                   `json:"save_tool_results"`
 	Debug             sessions.DebugSettings `json:"debug"`
@@ -202,6 +203,7 @@ type SessionCreateMetadata struct {
 	EnabledSkills   []string
 	ShowReasoning   *bool
 	FullAccess      bool
+	AutoCompactOff  bool
 	Context         *contextwindow.Metadata
 	SaveToolResults *bool
 	Debug           *sessions.DebugSettings
@@ -3707,6 +3709,7 @@ func applySessionCreateMetadata(session sessions.SessionV2, metadata SessionCrea
 		session.ShowReasoning = *metadata.ShowReasoning
 	}
 	session.FullAccess = metadata.FullAccess
+	session.AutoCompactOff = metadata.AutoCompactOff
 	if metadata.Context != nil {
 		session.Context = *metadata.Context
 	}
@@ -3859,6 +3862,7 @@ func sessionDetailFromStore(session sessions.SessionV2) SessionDetail {
 		EnabledSkills:     copyStrings(session.EnabledSkills),
 		ShowReasoning:     session.ShowReasoning,
 		FullAccess:        session.FullAccess,
+		AutoCompactOff:    session.AutoCompactOff,
 		Debug:             session.Debug,
 		Context:           session.Context,
 		SaveToolResults:   session.SaveToolResults,

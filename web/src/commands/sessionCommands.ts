@@ -40,6 +40,7 @@ export interface SessionCreateOptions {
   readonly modelProfile?: string
   readonly reasoningLevel?: string
   readonly fullAccess?: boolean
+  readonly automaticCompaction?: boolean
 }
 
 export interface SessionCreateResult {

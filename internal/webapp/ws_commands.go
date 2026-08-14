@@ -61,16 +61,17 @@ type sessionDebugArguments struct {
 }
 
 type sessionCreateArguments struct {
-	SessionID       string
-	ProjectID       string
-	DisplayName     *string
-	ParentSessionID *string
-	CWD             *string
-	ConfigPath      *string
-	Provider        *string
-	ModelProfile    *string
-	ReasoningLevel  *string
-	FullAccess      *bool
+	SessionID           string
+	ProjectID           string
+	DisplayName         *string
+	ParentSessionID     *string
+	CWD                 *string
+	ConfigPath          *string
+	Provider            *string
+	ModelProfile        *string
+	ReasoningLevel      *string
+	FullAccess          *bool
+	AutomaticCompaction *bool
 }
 
 type projectCreateArguments struct {
@@ -314,7 +315,8 @@ func normalizedSessionCreateFingerprint(request commands.CommandRequest, argumen
 		"project_id": arguments.ProjectID,
 		// false is the business default, so omitted and explicit false are
 		// one normalized operation rather than two claims for one entity.
-		"full_access": false,
+		"full_access":          false,
+		"automatic_compaction": true,
 	}
 	if arguments.DisplayName != nil {
 		normalized["display_name"] = *arguments.DisplayName
@@ -339,6 +341,9 @@ func normalizedSessionCreateFingerprint(request commands.CommandRequest, argumen
 	}
 	if arguments.FullAccess != nil {
 		normalized["full_access"] = *arguments.FullAccess
+	}
+	if arguments.AutomaticCompaction != nil {
+		normalized["automatic_compaction"] = *arguments.AutomaticCompaction
 	}
 	data, err := json.Marshal(normalized)
 	if err != nil {
@@ -1500,7 +1505,7 @@ func decodeSessionCreateArguments(raw json.RawMessage) (sessionCreateArguments, 
 	if err != nil {
 		return sessionCreateArguments{}, err
 	}
-	if err := requireExactFields(fields, command, "session_id", "project_id", "display_name", "parent_session_id", "cwd", "config_path", "provider", "model_profile", "reasoning_level", "full_access"); err != nil {
+	if err := requireExactFields(fields, command, "session_id", "project_id", "display_name", "parent_session_id", "cwd", "config_path", "provider", "model_profile", "reasoning_level", "full_access", "automatic_compaction"); err != nil {
 		return sessionCreateArguments{}, err
 	}
 	sessionID, err := requiredCommandString(fields, "session_id", command)
@@ -1548,20 +1553,25 @@ func decodeSessionCreateArguments(raw json.RawMessage) (sessionCreateArguments, 
 	if err != nil {
 		return sessionCreateArguments{}, err
 	}
+	automaticCompaction, err := optionalCommandBool(fields, "automatic_compaction", command)
+	if err != nil {
+		return sessionCreateArguments{}, err
+	}
 	// Parent-only creates use the existing inherited-session semantics: the
 	// child's provider/capability snapshot comes from the parent. Do not make
 	// the same wire shape ambiguously mean either "inherit" or "resolve the
 	// current server config" depending on which optional override happened to
 	// be supplied. Configured root creates may use the other fields; inherited
 	// overrides remain a later, separately specified command contract.
-	if parentID != nil && (cwd != nil || configPath != nil || provider != nil || modelProfile != nil || reasoningLevel != nil || fullAccess != nil) {
+	if parentID != nil && (cwd != nil || configPath != nil || provider != nil || modelProfile != nil || reasoningLevel != nil || fullAccess != nil || automaticCompaction != nil) {
 		return sessionCreateArguments{}, fmt.Errorf("invalid %s arguments", command)
 	}
 	return sessionCreateArguments{
 		SessionID: sessionID, ProjectID: projectID, DisplayName: displayName,
 		ParentSessionID: parentID, CWD: cwd, ConfigPath: configPath,
 		Provider: provider, ModelProfile: modelProfile, ReasoningLevel: reasoningLevel,
-		FullAccess: fullAccess,
+		FullAccess:          fullAccess,
+		AutomaticCompaction: automaticCompaction,
 	}, nil
 }
 
@@ -3079,6 +3089,9 @@ func newSessionCommandRegistry(service *execution.Service, runs *runRegistry, op
 				}
 				if arguments.FullAccess != nil {
 					options.FullAccess = *arguments.FullAccess
+				}
+				if arguments.AutomaticCompaction != nil {
+					options.AutoCompactOff = !*arguments.AutomaticCompaction
 				}
 				result, _, err := service.CreateConfiguredSessionIdempotent(ctx, arguments.ProjectID, arguments.SessionID, fingerprint, options)
 				if err != nil {

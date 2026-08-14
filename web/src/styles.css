@@ -1060,5 +1060,9 @@ svg { width: 1.1em; height: 1.1em; fill: none; stroke: currentColor; stroke-widt
 .full-access-choice input { width: 16px; height: 16px; margin: 1px 0 0; accent-color: var(--accent-hover); }
 .full-access-choice span { display: grid; gap: 3px; }
 .full-access-choice small { color: var(--muted); font-size: 9px; font-weight: 500; line-height: 1.4; }
+.session-option-choice { display: flex; align-items: flex-start; gap: 10px; padding: 12px 22px; border-top: 1px solid var(--border); background: #ffffff; font-size: 11px; }
+.session-option-choice input { width: 16px; height: 16px; margin: 1px 0 0; accent-color: var(--accent-hover); }
+.session-option-choice span { display: grid; gap: 3px; }
+.session-option-choice small { color: var(--muted); font-size: 9px; font-weight: 500; line-height: 1.4; }
 .tool-row-header code.outside-workspace { color: #92610a; background: var(--accent-soft); font-weight: 700; }
 .outside-workspace-flag { flex: 0 0 auto; display: inline-flex; align-items: center; justify-content: center; width: 15px; height: 15px; border: 1.5px solid var(--border); background: var(--accent); color: var(--text); font-size: 10px; font-weight: 800; }

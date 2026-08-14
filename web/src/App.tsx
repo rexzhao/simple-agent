@@ -457,7 +457,7 @@ function App() {
 
   const openSessionCreator = useCallback(async (projectID = selectedProjectID) => {
     if (!projectID) return
-    setSessionCreator({ projectID, models: [], selectedKey: '', defaultProvider: '', defaultModel: '', reasoningLevel: '', fullAccess: false, loading: true })
+    setSessionCreator({ projectID, models: [], selectedKey: '', defaultProvider: '', defaultModel: '', reasoningLevel: '', fullAccess: false, automaticCompaction: true, loading: true })
     try {
       const options = await sessionModels(projectID)
       const defaultModel = options.models.find((model) => model.provider === options.defaultProvider && model.model_profile === options.defaultModel)
@@ -469,6 +469,7 @@ function App() {
         defaultModel: options.defaultModel,
         reasoningLevel: defaultModel?.default_reasoning_level ?? options.models[0]?.default_reasoning_level ?? '',
         fullAccess: current.fullAccess,
+        automaticCompaction: current.automaticCompaction,
         loading: false,
       } : current)
     } catch {
@@ -486,6 +487,7 @@ function App() {
         modelProfile: model.model_profile,
         reasoningLevel: sessionCreator?.reasoningLevel ?? model.default_reasoning_level ?? '',
         fullAccess: sessionCreator?.fullAccess ?? false,
+        automaticCompaction: sessionCreator?.automaticCompaction ?? true,
       })
       setSelectedProjectID(projectID)
       await waitForSessionAuthority(projectID, (index) => index.active.some((summary) => summary.session_id === result.session_id))
@@ -1192,6 +1194,7 @@ function App() {
           })}
           onReasoningLevel={(reasoningLevel) => setSessionCreator((current) => current ? { ...current, reasoningLevel } : current)}
           onFullAccess={(fullAccess) => setSessionCreator((current) => current ? { ...current, fullAccess } : current)}
+          onAutomaticCompaction={(automaticCompaction) => setSessionCreator((current) => current ? { ...current, automaticCompaction } : current)}
           onCancel={() => { if (!creatingSession) setSessionCreator(null) }}
           onCreate={(model) => void createSession(sessionCreator.projectID, model)}
         />

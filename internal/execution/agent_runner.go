@@ -591,7 +591,7 @@ func (r *agentRunnerRuntime) planAutoCompactBeforeTurn(ctx context.Context, mess
 	if err := ctx.Err(); err != nil {
 		return nil, nil, err
 	}
-	if r == nil || r.config == nil || !r.config.Compaction.Enabled {
+	if r == nil || r.config == nil || !r.config.Compaction.Enabled || r.session.AutoCompactOff {
 		return messages, nil, nil
 	}
 	if r.sessionStore == nil || strings.TrimSpace(r.session.ID) == "" {
@@ -630,7 +630,7 @@ func (r *agentRunnerRuntime) autoCompactAfterToolBatch(ctx context.Context, mess
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if r == nil || r.config == nil || !r.config.Compaction.Enabled || r.sessionStore == nil || publisher == nil {
+	if r == nil || r.config == nil || !r.config.Compaction.Enabled || r.session.AutoCompactOff || r.sessionStore == nil || publisher == nil {
 		return messages, nil
 	}
 	if !r.autoCompactionPressure(messages) {

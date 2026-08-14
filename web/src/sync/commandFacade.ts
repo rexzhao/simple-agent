@@ -820,6 +820,10 @@ export class CommandFacade implements SessionCommands, RunCommands, ProjectComma
       if (typeof options.fullAccess !== 'boolean') return Promise.reject(new CommandFacadeError('invalid', 'full_access is invalid'))
       args.full_access = options.fullAccess
     }
+    if (options.automaticCompaction !== undefined) {
+      if (typeof options.automaticCompaction !== 'boolean') return Promise.reject(new CommandFacadeError('invalid', 'automatic_compaction is invalid'))
+      args.automatic_compaction = options.automaticCompaction
+    }
     this.rememberEntityID(sessionID)
     return this.submit('session.create', args, true, (value) => decodeCreateResult(value, sessionID, cleanProjectID), commandOptions)
   }

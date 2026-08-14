@@ -301,6 +301,32 @@ func TestServiceSessionFullAccessLifecycle(t *testing.T) {
 	}
 }
 
+func TestServiceSessionAutoCompactionSettingPersistsAndIsInherited(t *testing.T) {
+	service, err := NewService(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewService() error = %v", err)
+	}
+	projectRoot := mkdirProjectRoot(t, "repo")
+	project, err := service.CreateProject(projectRoot, "Repo")
+	if err != nil {
+		t.Fatalf("CreateProject() error = %v", err)
+	}
+	parent, err := service.CreateSession(project.Project.ID, SessionCreateMetadata{
+		CreatedCWD: project.Project.Root, AutoCompactOff: true,
+	})
+	if err != nil {
+		t.Fatalf("CreateSession() error = %v", err)
+	}
+	loaded, err := service.GetSession(parent.ID)
+	if err != nil || !loaded.AutoCompactOff {
+		t.Fatalf("GetSession() = %#v, %v; want automatic compaction disabled", loaded, err)
+	}
+	child, err := service.CreateInheritedSession(parent.ID, "Child")
+	if err != nil || !child.AutoCompactOff {
+		t.Fatalf("CreateInheritedSession() = %#v, %v; want inherited setting", child, err)
+	}
+}
+
 func TestServiceSessionDebugLifecycle(t *testing.T) {
 	home := t.TempDir()
 	service, err := NewService(home)

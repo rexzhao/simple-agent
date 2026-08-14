@@ -836,7 +836,7 @@ func TestSessionCreateCommandIsDurableAndProjectsOnlyThroughSessionIndex(t *test
 	}
 
 	sessionID := "session-ws-durable-create"
-	arguments := json.RawMessage(`{"session_id":"` + sessionID + `","project_id":"` + project.Project.ID + `","display_name":"Created from command"}`)
+	arguments := json.RawMessage(`{"session_id":"` + sessionID + `","project_id":"` + project.Project.ID + `","display_name":"Created from command","automatic_compaction":false}`)
 	queuedChanges := make([]protocol.ChangeMessage, 0, 1)
 	send := func(requestID string, args json.RawMessage) protocol.CommandResultMessage {
 		t.Helper()
@@ -880,7 +880,7 @@ func TestSessionCreateCommandIsDurableAndProjectsOnlyThroughSessionIndex(t *test
 		t.Fatalf("created index summary=%#v", summary)
 	}
 	stored, err := service.SessionStore().LoadState(sessionID)
-	if err != nil || stored.DisplayName != "Created from command" || stored.Provider == "" || stored.ModelProfile == "" || stored.ModelID == "" {
+	if err != nil || stored.DisplayName != "Created from command" || stored.Provider == "" || stored.ModelProfile == "" || stored.ModelID == "" || !stored.AutoCompactOff {
 		t.Fatalf("created durable state=%#v err=%v", stored, err)
 	}
 
@@ -903,7 +903,7 @@ func TestSessionCreateCommandIsDurableAndProjectsOnlyThroughSessionIndex(t *test
 		t.Fatalf("inherited create result=%#v", child)
 	}
 	childState, err := service.SessionStore().LoadState(childID)
-	if err != nil || childState.ParentSessionID != sessionID || childState.RootSessionID != sessionID || childState.CreatedBy != "agent" {
+	if err != nil || childState.ParentSessionID != sessionID || childState.RootSessionID != sessionID || childState.CreatedBy != "agent" || !childState.AutoCompactOff {
 		t.Fatalf("inherited durable state=%#v err=%v", childState, err)
 	}
 	conflict := send("create-request-3", json.RawMessage(`{"session_id":"`+sessionID+`","project_id":"`+project.Project.ID+`","display_name":"Different"}`))

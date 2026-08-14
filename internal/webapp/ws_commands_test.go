@@ -45,12 +45,13 @@ func TestSessionCommandSchemasAreStrict(t *testing.T) {
 		},
 		{
 			name: "create", validate: validateSessionCreateArguments,
-			valid: json.RawMessage(`{"session_id":"session_s","project_id":"project_p","display_name":"new","full_access":false}`),
+			valid: json.RawMessage(`{"session_id":"session_s","project_id":"project_p","display_name":"new","full_access":false,"automatic_compaction":false}`),
 			invalid: []json.RawMessage{
 				json.RawMessage(`{"session_id":"session_s","project_id":"project_p","unknown":true}`),
 				json.RawMessage(`{"session_id":"session_s","project_id":"project_p","session_id":"other"}`),
 				json.RawMessage(`{"session_id":"../escape","project_id":"project_p"}`),
 				json.RawMessage(`{"session_id":"session_s","project_id":"project_p"} trailing`),
+				json.RawMessage(`{"session_id":"session_s","project_id":"project_p","automatic_compaction":"no"}`),
 			},
 		},
 		{

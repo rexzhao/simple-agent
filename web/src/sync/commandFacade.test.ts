@@ -94,12 +94,12 @@ describe('CommandFacade session.mark_read', () => {
       requestIDGenerator: () => `request_create_${++requestNumber}`,
       sessionIDGenerator: () => 'session_create_stable',
     })
-    const pending = facade.create('project_1', { displayName: 'Created', fullAccess: false })
+    const pending = facade.create('project_1', { displayName: 'Created', fullAccess: false, automaticCompaction: false })
     const initial = transport.sent[0]
     if (initial.type !== 'command') throw new Error('wrong initial command')
     expect(initial.payload.name).toBe('session.create')
     expect(initial.payload.arguments).toEqual({
-      session_id: 'session_create_stable', project_id: 'project_1', display_name: 'Created', full_access: false,
+      session_id: 'session_create_stable', project_id: 'project_1', display_name: 'Created', full_access: false, automatic_compaction: false,
     })
     expect(initial.payload.request_id).toBe('request_create_1')
     expect(initial.payload.request_id).not.toBe(initial.payload.arguments.session_id)

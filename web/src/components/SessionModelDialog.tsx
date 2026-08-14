@@ -10,6 +10,7 @@ export interface SessionCreatorState {
   defaultModel: string
   reasoningLevel: string
   fullAccess: boolean
+  automaticCompaction: boolean
   loading: boolean
 }
 
@@ -20,6 +21,7 @@ export function SessionModelDialog(props: {
   onSelect: (key: string) => void
   onReasoningLevel: (level: string) => void
   onFullAccess: (fullAccess: boolean) => void
+  onAutomaticCompaction: (enabled: boolean) => void
   onCancel: () => void
   onCreate: (model: SessionModelOption) => void
 }) {
@@ -76,6 +78,13 @@ export function SessionModelDialog(props: {
           <span>
             <strong>Full access</strong>
             <small>File tools may read and write outside the workspace. Out-of-workspace paths are flagged in the conversation. Applies from the first turn; child sessions inherit it.</small>
+          </span>
+        </label>
+        <label className="session-option-choice">
+          <input type="checkbox" checked={props.state.automaticCompaction} disabled={props.creating} onChange={(event) => props.onAutomaticCompaction(event.target.checked)} />
+          <span>
+            <strong>Automatic context compaction</strong>
+            <small>Summarize older context automatically when the model approaches its limit. Manual compaction remains available when this is off.</small>
           </span>
         </label>
         <div className="model-dialog-actions">

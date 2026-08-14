@@ -207,6 +207,7 @@ type SessionV2 struct {
 	EnabledSkills        []string               `json:"enabled_skills,omitempty"`
 	ShowReasoning        bool                   `json:"show_reasoning"`
 	FullAccess           bool                   `json:"full_access,omitempty"`
+	AutoCompactOff       bool                   `json:"auto_compaction_disabled,omitempty"`
 	Debug                DebugSettings          `json:"debug,omitempty"`
 	DebugConfigured      bool                   `json:"debug_configured,omitempty"`
 	InstructionsSnapshot []model.Message        `json:"instructions_snapshot,omitempty"`

@@ -23,6 +23,7 @@ type ConfiguredSessionOptions struct {
 	ModelProfile    string
 	ReasoningLevel  string
 	FullAccess      bool
+	AutoCompactOff  bool
 }
 
 type SessionModelOption struct {
@@ -184,6 +185,7 @@ func (s *Service) resolveConfiguredSessionMetadata(projectID string, options Con
 		EnabledSkills:   skillIDs(selectedSkills),
 		ShowReasoning:   &showReasoning,
 		FullAccess:      options.FullAccess,
+		AutoCompactOff:  options.AutoCompactOff,
 		Debug:           &debugSettings,
 		Context:         &contextMetadata,
 		SaveToolResults: &saveToolResults,
@@ -228,6 +230,7 @@ func (s *Service) CreateInheritedSession(parentID, displayName string) (SessionD
 		EnabledSkills:   copyStringSlice(parent.EnabledSkills),
 		ShowReasoning:   &showReasoning,
 		FullAccess:      parent.FullAccess,
+		AutoCompactOff:  parent.AutoCompactOff,
 		Debug:           debugSettingsPointer(parent.Debug),
 		Context:         &contextMetadata,
 		SaveToolResults: &saveToolResults,
@@ -274,6 +277,7 @@ func (s *Service) CreateInheritedSessionIdempotent(ctx context.Context, projectI
 			EnabledSkills:   copyStringSlice(parent.EnabledSkills),
 			ShowReasoning:   boolPointer(parent.ShowReasoning),
 			FullAccess:      parent.FullAccess,
+			AutoCompactOff:  parent.AutoCompactOff,
 			Debug:           debugSettingsPointer(parent.Debug),
 			Context: &contextwindow.Metadata{
 				ContextWindow:           parent.Context.ContextWindow,
