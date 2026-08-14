@@ -260,7 +260,11 @@ func (r AgentTurnRunner) prepareRuntime(ctx context.Context, session sessions.Se
 		Tracker: contextTracker,
 	}
 
-	enabledToolNames, toolRegistry, toolSchemas, webEvalTool, err := assembleAgentToolSelection(cwd, session, store, service)
+	skillDirs, err := cfg.ResolveSkillDirs(cwd)
+	if err != nil {
+		return nil, err
+	}
+	enabledToolNames, toolRegistry, toolSchemas, webEvalTool, err := assembleAgentToolSelectionWithReadRoots(cwd, session, store, service, skillDirs)
 	if err != nil {
 		return nil, err
 	}
@@ -1525,6 +1529,10 @@ func lastString(values []string) string {
 }
 
 func enabledToolsForRun(rootDir string, enabled []string, fullAccess bool) (*tools.Registry, []model.Tool, error) {
+	return enabledToolsForRunWithReadRoots(rootDir, enabled, fullAccess, nil)
+}
+
+func enabledToolsForRunWithReadRoots(rootDir string, enabled []string, fullAccess bool, extraReadRoots []string) (*tools.Registry, []model.Tool, error) {
 	builtinEnabled := make([]string, 0, len(enabled))
 	for _, name := range enabled {
 		// web.eval is an internal runtime attachment, never a configured or
@@ -1545,7 +1553,7 @@ func enabledToolsForRun(rootDir string, enabled []string, fullAccess bool) (*too
 	}
 
 	registry := tools.NewRegistry()
-	if err := tools.RegisterBuiltins(registry, rootDir, fullAccess); err != nil {
+	if err := tools.RegisterBuiltinsWithReadRoots(registry, rootDir, fullAccess, extraReadRoots); err != nil {
 		return nil, nil, fmt.Errorf("register built-in tools: %w", err)
 	}
 	schemas, err := registry.EnabledSchemas(builtinEnabled)
@@ -1560,6 +1568,10 @@ func enabledToolsForRun(rootDir string, enabled []string, fullAccess bool) (*too
 // durable runtime metadata can see the enabled names. Its schema/executor are
 // added independently from the configured tool list.
 func assembleAgentToolSelection(cwd string, session sessions.SessionV2, store *sessions.V2Store, service *Service) (enabled []string, registry *tools.Registry, schemas []model.Tool, webEval *webEvalToolExecutor, err error) {
+	return assembleAgentToolSelectionWithReadRoots(cwd, session, store, service, nil)
+}
+
+func assembleAgentToolSelectionWithReadRoots(cwd string, session sessions.SessionV2, store *sessions.V2Store, service *Service, extraReadRoots []string) (enabled []string, registry *tools.Registry, schemas []model.Tool, webEval *webEvalToolExecutor, err error) {
 	configured := copyStringSlice(session.EnabledTools)
 	enabled = make([]string, 0, len(configured))
 	for _, name := range configured {
@@ -1571,7 +1583,7 @@ func assembleAgentToolSelection(cwd string, session sessions.SessionV2, store *s
 	if strings.TrimSpace(session.ParentSessionID) != "" {
 		enabled = enabledToolsForAgentChild(enabled)
 	}
-	registry, schemas, err = enabledToolsForRun(cwd, enabled, session.FullAccess)
+	registry, schemas, err = enabledToolsForRunWithReadRoots(cwd, enabled, session.FullAccess, extraReadRoots)
 	if err != nil {
 		return enabled, nil, nil, nil, err
 	}

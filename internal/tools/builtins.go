@@ -55,6 +55,13 @@ const (
 // outside rootDir; relative paths stay anchored at rootDir either way. The
 // shell tool is never path-confined and is unaffected by fullAccess.
 func RegisterBuiltins(registry *Registry, rootDir string, fullAccess bool) error {
+	return RegisterBuiltinsWithReadRoots(registry, rootDir, fullAccess, nil)
+}
+
+// RegisterBuiltinsWithReadRoots registers the built-ins while allowing
+// read_file to read absolute paths under additional read-only roots. Other
+// file tools retain their normal workspace/full-access boundaries.
+func RegisterBuiltinsWithReadRoots(registry *Registry, rootDir string, fullAccess bool, extraReadRoots []string) error {
 	if registry == nil {
 		return fmt.Errorf("registry must not be nil")
 	}
@@ -77,6 +84,10 @@ func RegisterBuiltins(registry *Registry, rootDir string, fullAccess bool) error
 	if err != nil {
 		return fmt.Errorf("resolve rootDir %q: %w", rootDir, err)
 	}
+	canonicalReadRoots, err := canonicalExistingDirectories(extraReadRoots)
+	if err != nil {
+		return err
+	}
 
 	builtins := []Entry{
 		{
@@ -84,8 +95,8 @@ func RegisterBuiltins(registry *Registry, rootDir string, fullAccess bool) error
 			Executor:   newListFilesExecutor(canonicalRoot, fullAccess),
 		},
 		{
-			Definition: readFileDefinition(fullAccess),
-			Executor:   newReadFileExecutor(canonicalRoot, fullAccess),
+			Definition: readFileDefinition(fullAccess, len(canonicalReadRoots) > 0),
+			Executor:   newReadFileExecutor(canonicalRoot, fullAccess, canonicalReadRoots),
 		},
 		{
 			Definition: globFilesDefinition(fullAccess),
@@ -143,12 +154,15 @@ func listFilesDefinition(fullAccess bool) model.Tool {
 	}
 }
 
-func readFileDefinition(fullAccess bool) model.Tool {
+func readFileDefinition(fullAccess, hasExtraReadRoots bool) model.Tool {
 	description := "Read a text file under the workspace."
 	pathDescription := "File path relative to the workspace."
 	if fullAccess {
 		description = "Read a text file under the workspace or any absolute path."
 		pathDescription = "File path: absolute, or relative to the workspace."
+	} else if hasExtraReadRoots {
+		description = "Read a text file under the workspace or a configured skill directory."
+		pathDescription = "File path relative to the workspace, or an absolute path under a configured skill directory."
 	}
 	return model.Tool{
 		Name:        BuiltinReadFile,
@@ -405,7 +419,7 @@ func newListFilesExecutor(rootDir string, fullAccess bool) Executor {
 	})
 }
 
-func newReadFileExecutor(rootDir string, fullAccess bool) Executor {
+func newReadFileExecutor(rootDir string, fullAccess bool, extraReadRoots []string) Executor {
 	return ExecutorFunc(func(ctx context.Context, arguments map[string]any) (model.ToolResult, error) {
 		path, err := requiredStringArgument(arguments, "path")
 		if err != nil {
@@ -423,7 +437,7 @@ func newReadFileExecutor(rootDir string, fullAccess bool) Executor {
 		if err != nil {
 			return model.ToolResult{}, err
 		}
-		resolved, err := resolveToolReadPath(rootDir, path, fullAccess)
+		resolved, err := resolveReadFilePath(rootDir, path, fullAccess, extraReadRoots)
 		if err != nil {
 			return model.ToolResult{}, err
 		}
@@ -1553,6 +1567,58 @@ func requiredNonEmptyStringArgument(arguments map[string]any, name string) (stri
 		return "", fmt.Errorf("%s must not be empty", name)
 	}
 	return text, nil
+}
+
+func canonicalExistingDirectories(paths []string) ([]string, error) {
+	roots := make([]string, 0, len(paths))
+	seen := map[string]struct{}{}
+	for _, path := range paths {
+		if strings.TrimSpace(path) == "" {
+			continue
+		}
+		abs, err := filepath.Abs(path)
+		if err != nil {
+			return nil, fmt.Errorf("resolve extra read root %q: %w", path, err)
+		}
+		info, err := os.Stat(abs)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return nil, fmt.Errorf("stat extra read root %q: %w", path, err)
+		}
+		if !info.IsDir() {
+			return nil, fmt.Errorf("extra read root %q must be a directory", path)
+		}
+		canonical, err := filepath.EvalSymlinks(abs)
+		if err != nil {
+			return nil, fmt.Errorf("resolve extra read root %q: %w", path, err)
+		}
+		if _, duplicate := seen[canonical]; duplicate {
+			continue
+		}
+		seen[canonical] = struct{}{}
+		roots = append(roots, canonical)
+	}
+	return roots, nil
+}
+
+func resolveReadFilePath(rootDir, path string, fullAccess bool, extraReadRoots []string) (string, error) {
+	if fullAccess || !filepath.IsAbs(path) {
+		return resolveToolReadPath(rootDir, path, fullAccess)
+	}
+
+	resolved, workspaceErr := resolveRootPath(rootDir, path)
+	if workspaceErr == nil {
+		return resolved, nil
+	}
+	for _, readRoot := range extraReadRoots {
+		resolved, err := resolveRootPath(readRoot, path)
+		if err == nil {
+			return resolved, nil
+		}
+	}
+	return "", workspaceErr
 }
 
 // resolveToolReadPath resolves a read-side file-tool path against rootDir.

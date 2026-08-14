@@ -99,6 +99,45 @@ func TestReadFileOutputsFileContent(t *testing.T) {
 	}
 }
 
+func TestReadFileAcceptsConfiguredExternalReadRootOnly(t *testing.T) {
+	parent := t.TempDir()
+	workspace := filepath.Join(parent, "workspace")
+	skillDir := filepath.Join(parent, "skills")
+	otherDir := filepath.Join(parent, "other")
+	mkdirTestDir(t, workspace)
+	mkdirTestDir(t, skillDir)
+	mkdirTestDir(t, filepath.Join(skillDir, "review"))
+	mkdirTestDir(t, otherDir)
+	writeTestFile(t, filepath.Join(skillDir, "review", "SKILL.md"), "skill instructions")
+	writeTestFile(t, filepath.Join(otherDir, "secret.txt"), "secret")
+
+	registry := NewRegistry()
+	if err := RegisterBuiltinsWithReadRoots(registry, workspace, false, []string{skillDir}); err != nil {
+		t.Fatalf("RegisterBuiltinsWithReadRoots() error = %v", err)
+	}
+	result, err := registry.Execute(context.Background(), BuiltinReadFile, map[string]any{
+		"path": filepath.Join(skillDir, "review", "SKILL.md"),
+	})
+	if err != nil {
+		t.Fatalf("Execute(read_file external skill) error = %v", err)
+	}
+	if result.Content != "skill instructions" {
+		t.Fatalf("Execute(read_file external skill) content = %q", result.Content)
+	}
+
+	if _, err := registry.Execute(context.Background(), BuiltinReadFile, map[string]any{
+		"path": filepath.Join(otherDir, "secret.txt"),
+	}); err == nil {
+		t.Fatal("Execute(read_file unrelated external file) error = nil, want error")
+	}
+	if _, err := registry.Execute(context.Background(), BuiltinWriteFile, map[string]any{
+		"path":    filepath.Join(skillDir, "review", "created.txt"),
+		"content": "not allowed",
+	}); err == nil {
+		t.Fatal("Execute(write_file external skill) error = nil, want error")
+	}
+}
+
 func TestReadFileLineRanges(t *testing.T) {
 	root := t.TempDir()
 	writeTestFile(t, filepath.Join(root, "notes.txt"), "one\ntwo\nthree\nfour\n")
