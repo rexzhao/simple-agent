@@ -698,7 +698,11 @@ function App() {
     if (subtreeIDs.some((id) => busyIDs.has(id))) return
     const childCount = subtreeIDs.length - 1
     const childNote = childCount > 0 ? ` ${childCount} child ${childCount === 1 ? 'session' : 'sessions'} will also be archived.` : ''
-    if (!window.confirm(`Archive "${sessionName(session)}"? It will be hidden from the current list.${childNote}`)) return
+    // Sub-sessions are archived from the floating sub-panel; skip the confirm
+    // dialog for those, since archiving is a soft hide that can be undone.
+    if (!session.parent_session_id) {
+      if (!window.confirm(`Archive "${sessionName(session)}"? It will be hidden from the current list.${childNote}`)) return
+    }
     try {
       await sessionCommands.archive(session.id)
       await waitForSessionAuthority(session.project_id, (next) => next.summaries.some((summary) => summary.session_id === session.id && summary.archived))

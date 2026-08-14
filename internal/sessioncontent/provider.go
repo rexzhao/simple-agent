@@ -1931,7 +1931,8 @@ func (p *Provider) displayContent(ctx context.Context, sessionID string, item se
 		return item.Content.Inline, "", nil
 	}
 	if item.Content.Blob != nil {
-		raw, err := p.store.ReadBlobForSession(sessionID, *item.Content.Blob)
+		ref := *item.Content.Blob
+		raw, err := p.store.ReadBlobForSession(sessionID, ref)
 		if err != nil {
 			return "", "", err
 		}
@@ -1939,6 +1940,13 @@ func (p *Provider) displayContent(ctx context.Context, sessionID string, item se
 		case <-ctx.Done():
 			return "", "", ctx.Err()
 		default:
+		}
+		if !utf8.Valid(raw) && item.Message != nil && item.Message.Role == model.MessageRoleTool && strings.EqualFold(strings.TrimSpace(ref.Encoding), "utf-8") && strings.EqualFold(strings.TrimSpace(ref.MediaType), "text/plain") {
+			// Some historical Windows tool results contain console-code-page
+			// bytes despite being labelled UTF-8. Keep the durable blob intact,
+			// but make this narrowly scoped presentation projection valid so one
+			// malformed tool result cannot prevent the session from opening.
+			return strings.ToValidUTF8(string(raw), "\uFFFD"), "", nil
 		}
 		return string(raw), "", nil
 	}

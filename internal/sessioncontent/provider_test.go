@@ -146,6 +146,55 @@ func TestSnapshotSchemaIdentityAndOrder(t *testing.T) {
 	}
 }
 
+func TestSnapshotReplacesInvalidUTF8FromDurableTextBlob(t *testing.T) {
+	store, session := newContentTestStore(t, "session-invalid-text-blob")
+	ref, err := store.WriteBlobForSession(session.ID, []byte{'a', 0xff, 'b'}, "utf-8", "text/plain")
+	if err != nil {
+		t.Fatal(err)
+	}
+	item := sessions.SessionItemFromMessage("tool-invalid-text", model.Message{Role: model.MessageRoleTool})
+	item.Content = &sessions.StoredContent{Blob: &ref}
+	if _, err := store.AppendItem(session.ID, item); err != nil {
+		t.Fatal(err)
+	}
+	provider, err := NewProvider(store, ProviderOptions{HistoryLimit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer provider.Close()
+
+	snapshot := decodeSnapshot(t, openContent(t, provider, session.ID, nil))
+	if len(snapshot.History.Items) != 1 || snapshot.History.Items[0].Message == nil || snapshot.History.Items[0].Message.Content == nil {
+		t.Fatalf("snapshot history = %#v", snapshot.History.Items)
+	}
+	if got := snapshot.History.Items[0].Message.Content.Inline; got != "a\uFFFDb" {
+		t.Fatalf("projected content = %q, want replacement character", got)
+	}
+}
+
+func TestSnapshotRejectsInvalidUTF8OutsideDurableToolTextBlob(t *testing.T) {
+	store, session := newContentTestStore(t, "session-invalid-user-text-blob")
+	ref, err := store.WriteBlobForSession(session.ID, []byte{'a', 0xff, 'b'}, "utf-8", "text/plain")
+	if err != nil {
+		t.Fatal(err)
+	}
+	item := sessions.SessionItemFromMessage("user-invalid-text", model.Message{Role: model.MessageRoleUser})
+	item.Content = &sessions.StoredContent{Blob: &ref}
+	if _, err := store.AppendItem(session.ID, item); err != nil {
+		t.Fatal(err)
+	}
+	provider, err := NewProvider(store, ProviderOptions{HistoryLimit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer provider.Close()
+
+	_, err = provider.Open(context.Background(), protocol.ResourceKey{Type: protocol.ResourceTypeSessionContent, ID: session.ID}, nil)
+	if err == nil || !strings.Contains(err.Error(), "content text is not valid UTF-8") {
+		t.Fatalf("Open() error = %v, want invalid UTF-8", err)
+	}
+}
+
 func TestDurableOperationsAndActiveRunBaseline(t *testing.T) {
 	store, session := newContentTestStore(t, "session-ops")
 	p, err := NewProvider(store, ProviderOptions{})

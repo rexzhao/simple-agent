@@ -419,6 +419,31 @@ describe('App lifecycle bootstrap', () => {
     view.unmount()
   })
 
+  it('archives a sub-session without a confirmation dialog', async () => {
+    const child: SessionSummary = {
+      session_id: 'child-archive', project_id: 'project-1', parent_session_id: 'session-1', display_name: 'child to archive',
+      archived: false, status: 'idle', run_id: null, resource_revision: '1', updated_at: '2026-01-02T00:00:00Z', has_unread_result: false,
+    }
+    const view = renderApp([defaultProject], [child])
+    await waitFor(() => expect(screen.getByText('child to archive')).toBeTruthy())
+    const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(true)
+    const commands: string[] = []
+    view.transport.onSend = (message) => {
+      if (message.type !== 'command') return
+      commands.push(message.payload.name)
+      if (message.payload.name === 'session.archive') {
+        respondToProjectCommand(view.transport, message, { session_id: child.session_id, archived: true })
+      }
+    }
+
+    fireEvent.click(screen.getByText('child to archive'))
+    await waitFor(() => expect(view.application.signals.currentSession.get()).toBe(child.session_id))
+    fireEvent.click(screen.getByRole('button', { name: 'Archive child to archive' }))
+    await waitFor(() => expect(commands).toEqual(['session.archive']))
+    expect(confirmSpy).not.toHaveBeenCalled()
+    view.unmount()
+  })
+
   it('restores an archived child without letting root selection overwrite the child view', async () => {
     const child: SessionSummary = {
       session_id: 'child-restore', project_id: 'project-1', parent_session_id: 'session-1', display_name: 'child to restore',
