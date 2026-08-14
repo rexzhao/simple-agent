@@ -1834,7 +1834,7 @@ func promptDeveloperMessagesForRun(cfg *config.Config, cwd string) ([]string, er
 }
 
 func chatBaseMessages(project projectcontext.Project, enabledSkills []localskills.Skill, developerMessages []string) []model.Message {
-	instructions := projectcontext.ComposeInstructions(builtInBaseInstructions, project, "")
+	instructions := projectcontext.ComposeInstructions(builtInInstructions(enabledSkills), project, "")
 	messages := make([]model.Message, 0, len(instructions)+len(developerMessages)+len(enabledSkills))
 	for _, instruction := range instructions {
 		if instruction.Source == projectcontext.InstructionSourceUser {
@@ -1860,6 +1860,21 @@ func chatBaseMessages(project projectcontext.Project, enabledSkills []localskill
 		}
 	}
 	return messages
+}
+
+func builtInInstructions(enabledSkills []localskills.Skill) string {
+	if len(enabledSkills) == 0 {
+		return builtInBaseInstructions
+	}
+
+	var builder strings.Builder
+	builder.WriteString(builtInBaseInstructions)
+	builder.WriteString("\n\nUse only the registered skill files below for skill discovery. Do not scan the current working directory for skills:")
+	for _, skill := range enabledSkills {
+		builder.WriteString("\n- ")
+		builder.WriteString(skill.Path)
+	}
+	return builder.String()
 }
 
 func chatInstructionSources(project projectcontext.Project, enabledSkills []localskills.Skill) []sessions.InstructionSource {

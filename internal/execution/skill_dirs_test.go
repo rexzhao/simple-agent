@@ -3,9 +3,11 @@ package execution
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/rexzhao/simple-agent/internal/config"
+	localskills "github.com/rexzhao/simple-agent/internal/skills"
 )
 
 func TestEnabledSkillsForRunResolvesRepoAndCWDPlaceholders(t *testing.T) {
@@ -57,6 +59,28 @@ func TestEnabledSkillsForRunDeduplicatesRepoAndCWDAtRepoRoot(t *testing.T) {
 	}
 	if len(got) != 1 || got[0].ID != "hello" {
 		t.Fatalf("enabledSkillsForRun() = %#v, want one hello skill", got)
+	}
+}
+
+func TestBuiltInInstructionsListsRegisteredSkillFiles(t *testing.T) {
+	first := filepath.Join(t.TempDir(), "first", "SKILL.md")
+	second := filepath.Join(t.TempDir(), "second", "SKILL.md")
+
+	got := builtInInstructions([]localskills.Skill{
+		{ID: "first", Path: first},
+		{ID: "second", Path: second},
+	})
+
+	for _, want := range []string{first, second, "Do not scan the current working directory for skills"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("builtInInstructions() = %q, want contain %q", got, want)
+		}
+	}
+}
+
+func TestBuiltInInstructionsOmitsSkillDiscoveryWithoutSkills(t *testing.T) {
+	if got := builtInInstructions(nil); got != builtInBaseInstructions {
+		t.Fatalf("builtInInstructions(nil) = %q, want %q", got, builtInBaseInstructions)
 	}
 }
 
