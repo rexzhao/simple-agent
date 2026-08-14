@@ -247,6 +247,11 @@ func (r AgentTurnRunner) prepareRuntime(ctx context.Context, session sessions.Se
 		Tokens: resolved.ContextWindow,
 		Source: contextwindow.ParseWindowSource(resolved.ContextWindowSource),
 	}, session.Context)
+	contextBudget := resolveEffectiveContextBudget(resolved.ContextWindow, resolved.InputLimit, resolved.OutputLimit, cfg.Compaction.Reserved, cfg.Compaction.ThresholdPercent)
+	if contextBudget.HardInputLimit <= 0 {
+		return nil, fmt.Errorf("model context capabilities leave no usable input budget: context_window=%d input_limit=%d output_limit=%d", resolved.ContextWindow, resolved.InputLimit, resolved.OutputLimit)
+	}
+	contextTracker.SetHardInputLimit(contextBudget.HardInputLimit)
 	if resolved.Pricing != nil {
 		contextTracker.SetLongContextTokenThreshold(resolved.Pricing.LongContextThreshold)
 	}
@@ -342,6 +347,7 @@ func (r AgentTurnRunner) prepareRuntime(ctx context.Context, session sessions.Se
 		sessionStore:       store,
 		activeItemIDs:      copyStringSlice(session.ActiveHistory),
 		contextTracker:     contextTracker,
+		contextBudget:      contextBudget,
 		logger:             logger,
 		recordRequest:      recordRequest,
 		mcpSessions:        mcpSessions,
@@ -379,6 +385,7 @@ type agentRunnerRuntime struct {
 	sessionStore        *sessions.V2Store
 	activeItemIDs       []string
 	contextTracker      *contextwindow.Tracker
+	contextBudget       effectiveContextBudget
 	logger              *eventlog.Logger
 	recordRequest       func(endpoint string, body []byte) error
 	mcpSessions         []*mcp.Session
@@ -587,6 +594,28 @@ type compactionPlan struct {
 	context     *contextwindow.Metadata
 }
 
+type compactionPressureLevel uint8
+
+const (
+	compactionPressureNone compactionPressureLevel = iota
+	compactionPressureSoft
+	compactionPressureHard
+)
+
+type compactionPressure struct {
+	level                compactionPressureLevel
+	estimatedTokens      int
+	requestBytes         int
+	requestLimitExceeded bool
+}
+
+func (p compactionPressure) reason() string {
+	if p.requestLimitExceeded {
+		return "request_size_limit"
+	}
+	return "context_limit"
+}
+
 func (r *agentRunnerRuntime) planAutoCompactBeforeTurn(ctx context.Context, messages []model.Message, pendingInput model.Message) ([]model.Message, *compactionPlan, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, nil, err
@@ -608,20 +637,29 @@ func (r *agentRunnerRuntime) planAutoCompactBeforeTurn(ctx context.Context, mess
 	if pendingInput.Role != "" {
 		pressureMessages = append(pressureMessages, pendingInput)
 	}
-	if !r.autoCompactionPressure(pressureMessages) {
+	pressure := r.currentCompactionPressure(pressureMessages)
+	if pressure.level == compactionPressureNone {
 		return messages, nil, nil
 	}
-	if r.onCompactionStarted != nil {
-		r.onCompactionStarted("auto")
+	if pressure.level == compactionPressureSoft && softCompactionCooldownActive(r.session) {
+		return messages, nil, nil
 	}
-
 	plan, err := r.planCompactionCheckpoint(ctx, compactionCheckpointOptions{
-		reason:  "context_limit",
+		reason:  pressure.reason(),
 		phase:   "pre_turn",
 		trigger: "auto",
 	})
 	if err != nil {
 		return nil, nil, fmt.Errorf("auto compact failed: %w", err)
+	}
+	if err := r.validateAutomaticCompactionResult(plan, pendingInput); err != nil {
+		return nil, nil, err
+	}
+	if pressure.level == compactionPressureSoft && !compactionReclaimsEnough(pressure.estimatedTokens, r.compactionReplacementEstimate(plan, pendingInput)) {
+		return messages, nil, nil
+	}
+	if r.onCompactionStarted != nil {
+		r.onCompactionStarted("auto")
 	}
 	return plan.messages, &plan, nil
 }
@@ -633,7 +671,8 @@ func (r *agentRunnerRuntime) autoCompactAfterToolBatch(ctx context.Context, mess
 	if r == nil || r.config == nil || !r.config.Compaction.Enabled || r.session.AutoCompactOff || r.sessionStore == nil || publisher == nil {
 		return messages, nil
 	}
-	if !r.autoCompactionPressure(messages) {
+	pressure := r.currentCompactionPressure(messages)
+	if pressure.level == compactionPressureNone {
 		return messages, nil
 	}
 
@@ -643,16 +682,25 @@ func (r *agentRunnerRuntime) autoCompactAfterToolBatch(ctx context.Context, mess
 	}
 	r.session = latest
 	r.activeItemIDs = copyStringSlice(latest.ActiveHistory)
-	if r.onCompactionStarted != nil {
-		r.onCompactionStarted("auto")
+	if pressure.level == compactionPressureSoft && softCompactionCooldownActive(r.session) {
+		return messages, nil
 	}
 	plan, err := r.planCompactionCheckpoint(ctx, compactionCheckpointOptions{
-		reason:  "context_limit",
+		reason:  pressure.reason(),
 		phase:   "mid_turn",
 		trigger: "auto",
 	})
 	if err != nil {
 		return nil, fmt.Errorf("mid-turn auto compact failed: %w", err)
+	}
+	if err := r.validateAutomaticCompactionResult(plan, model.Message{}); err != nil {
+		return nil, err
+	}
+	if pressure.level == compactionPressureSoft && !compactionReclaimsEnough(pressure.estimatedTokens, r.compactionReplacementEstimate(plan, model.Message{})) {
+		return messages, nil
+	}
+	if r.onCompactionStarted != nil {
+		r.onCompactionStarted("auto")
 	}
 	if err := publishCompactionUsage(publisher, plan.usage); err != nil {
 		return nil, fmt.Errorf("publish mid-turn compaction usage: %w", err)
@@ -675,65 +723,86 @@ func (r *agentRunnerRuntime) autoCompactAfterToolBatch(ctx context.Context, mess
 }
 
 func (r *agentRunnerRuntime) autoCompactionPressure(messages []model.Message) bool {
-	if r == nil || r.config == nil || r.contextTracker == nil {
+	return r.currentCompactionPressure(messages).level != compactionPressureNone
+}
+
+func (r *agentRunnerRuntime) currentCompactionPressure(messages []model.Message) compactionPressure {
+	if r == nil || r.config == nil {
+		return compactionPressure{}
+	}
+	request := model.Request{
+		Model: r.modelID, Messages: messages, Tools: r.toolSchemas,
+		Parameters: r.parameters, SessionID: r.session.ID,
+		DeveloperRole: r.developerRole, MaxTokens: r.outputLimit,
+	}
+	estimated := contextwindow.EstimateRequestTokens(request)
+	if r.contextTracker != nil {
+		estimated = r.contextTracker.EstimateRequest(request).InputTokens
+	}
+	requestBytes := r.autoCompactionRequestBytes(messages)
+	requestLimitExceeded := r.config.Compaction.MaxRequestBytes > 0 && requestBytes >= r.config.Compaction.MaxRequestBytes
+	if (r.contextBudget.HardInputLimit > 0 && estimated >= r.contextBudget.HardInputLimit) || requestLimitExceeded {
+		return compactionPressure{level: compactionPressureHard, estimatedTokens: estimated, requestBytes: requestBytes, requestLimitExceeded: requestLimitExceeded}
+	}
+	if r.contextBudget.SoftInputLimit > 0 && estimated >= r.contextBudget.SoftInputLimit {
+		return compactionPressure{level: compactionPressureSoft, estimatedTokens: estimated, requestBytes: requestBytes}
+	}
+	return compactionPressure{estimatedTokens: estimated, requestBytes: requestBytes}
+}
+
+func (r *agentRunnerRuntime) validateAutomaticCompactionResult(plan compactionPlan, pending model.Message) error {
+	messages := copyMessageSlice(plan.messages)
+	if pending.Role != "" {
+		messages = append(messages, pending)
+	}
+	pressure := r.currentCompactionPressure(messages)
+	if pressure.level == compactionPressureHard {
+		return fmt.Errorf("automatic compaction could not reclaim enough context: replacement estimate %d tokens and %d request bytes still exceed the safe request budget", pressure.estimatedTokens, pressure.requestBytes)
+	}
+	return nil
+}
+
+func (r *agentRunnerRuntime) compactionReplacementEstimate(plan compactionPlan, pending model.Message) int {
+	messages := copyMessageSlice(plan.messages)
+	if pending.Role != "" {
+		messages = append(messages, pending)
+	}
+	request := model.Request{Model: r.modelID, Messages: messages, Tools: r.toolSchemas, Parameters: r.parameters, SessionID: r.session.ID, DeveloperRole: r.developerRole, MaxTokens: r.outputLimit}
+	return contextwindow.EstimateRequestTokens(request)
+}
+
+func compactionReclaimsEnough(before, after int) bool {
+	if before <= 0 || after <= 0 {
+		return true
+	}
+	reclaimed := before - after
+	return reclaimed >= maxInt(2*1024, before/20)
+}
+
+const minimumCompleteTurnsBetweenSoftCompactions = 2
+
+func softCompactionCooldownActive(session sessions.SessionV2) bool {
+	if len(session.Compactions) == 0 {
 		return false
 	}
-	contextMetadata := r.contextTracker.Metadata()
-	usageCount := autoCompactionUsageCount(contextMetadata)
-	threshold := autoCompactionThreshold(
-		r.inputLimit,
-		contextMetadata.ContextWindow,
-		r.outputLimit,
-		r.config.Compaction.Reserved,
-		r.config.Compaction.ThresholdPercent,
-	)
-	tokenPressure := usageCount > 0 && threshold > 0 && usageCount >= threshold
-	requestPressure := r.config.Compaction.MaxRequestBytes > 0 &&
-		r.autoCompactionRequestBytes(messages) >= r.config.Compaction.MaxRequestBytes
-	return tokenPressure || requestPressure
-}
-
-func autoCompactionUsageCount(metadata contextwindow.Metadata) int64 {
-	if metadata.LastUsageSource != string(contextwindow.UsageSourceProvider) {
-		return 0
-	}
-	if metadata.LastUsageCountTokens > 0 {
-		return int64(metadata.LastUsageCountTokens)
-	}
-	if metadata.LastTotalTokens > 0 {
-		return int64(metadata.LastTotalTokens)
-	}
-	return int64(metadata.LastInputTokens) +
-		int64(metadata.LastOutputTokens) +
-		int64(metadata.LastCachedTokens) +
-		int64(metadata.LastCacheWriteTokens)
-}
-
-func autoCompactionThreshold(inputLimit, contextWindow, outputLimit, reserved, thresholdPercent int) int64 {
-	if inputLimit > 0 {
-		if reserved == 0 {
-			reserved = 20_000
-			if outputLimit > 0 && outputLimit < reserved {
-				reserved = outputLimit
-			}
+	checkpoint := session.Compactions[len(session.Compactions)-1]
+	toIndex := -1
+	for index, item := range session.Items {
+		if item.ID == checkpoint.ToItemID {
+			toIndex = index
+			break
 		}
-		threshold := int64(inputLimit) - int64(reserved)
-		if threshold > 0 {
-			return threshold
+	}
+	if toIndex < 0 {
+		return false
+	}
+	completeTurns := 0
+	for _, item := range session.Items[toIndex+1:] {
+		if item.Visibility == sessions.ItemVisibilityVisible && item.Message != nil && item.Message.Role == model.MessageRoleAssistant && len(item.Message.ToolCalls) == 0 {
+			completeTurns++
 		}
-		return 0
 	}
-	if contextWindow > 0 && outputLimit > 0 {
-		threshold := int64(contextWindow) - int64(outputLimit)
-		if threshold > 0 {
-			return threshold
-		}
-		return 0
-	}
-	if contextWindow <= 0 || thresholdPercent <= 0 {
-		return 0
-	}
-	return (int64(contextWindow)*int64(thresholdPercent) + 99) / 100
+	return completeTurns < minimumCompleteTurnsBetweenSoftCompactions
 }
 
 func (r *agentRunnerRuntime) planCompactionCheckpoint(ctx context.Context, checkpointOptions compactionCheckpointOptions) (compactionPlan, error) {
@@ -794,7 +863,11 @@ func (r *agentRunnerRuntime) planSummaryCompactionCheckpoint(ctx context.Context
 	if err != nil {
 		return compactionPlan{}, err
 	}
-	summaryInput, err := buildCompactionSummaryInput(summarySession, summaryModel)
+	summaryBudget := resolveEffectiveContextBudget(summaryModel.ContextWindow, summaryModel.InputLimit, summaryModel.OutputLimit, r.config.Compaction.Reserved, r.config.Compaction.ThresholdPercent)
+	if summaryBudget.HardInputLimit <= 0 {
+		return compactionPlan{}, fmt.Errorf("compaction summary model has no usable input budget")
+	}
+	summaryInput, err := buildCompactionSummaryInput(summarySession, summaryModel, summaryBudget.HardInputLimit)
 	if err != nil {
 		return compactionPlan{}, err
 	}
@@ -819,7 +892,7 @@ func (r *agentRunnerRuntime) planSummaryCompactionCheckpoint(ctx context.Context
 		Audience:   sessions.ItemAudienceModel,
 		Message:    &summaryMessage,
 	}
-	replacementHistory, err := replacementHistoryAfterCompaction(summarySession, summaryItemID)
+	replacementHistory, err := r.replacementHistoryAfterSummaryCompaction(summarySession, summaryItem)
 	if err != nil {
 		return compactionPlan{}, err
 	}
@@ -1073,7 +1146,7 @@ type compactionSummaryInput struct {
 	Messages []model.Message
 }
 
-func buildCompactionSummaryInput(session sessions.SessionV2, resolved config.ResolvedModel) (compactionSummaryInput, error) {
+func buildCompactionSummaryInput(session sessions.SessionV2, resolved config.ResolvedModel, hardInputLimit int) (compactionSummaryInput, error) {
 	activeItems, err := activeHistoryItems(session)
 	if err != nil {
 		return compactionSummaryInput{}, err
@@ -1088,11 +1161,11 @@ func buildCompactionSummaryInput(session sessions.SessionV2, resolved config.Res
 			DeveloperRole: model.MessageRole(resolved.DeveloperRole),
 		}
 		estimated := contextwindow.EstimateRequestTokens(request)
-		if resolved.ContextWindow <= 0 || estimated < resolved.ContextWindow {
+		if hardInputLimit <= 0 || estimated < hardInputLimit {
 			return compactionSummaryInput{Messages: messages}, nil
 		}
 	}
-	return compactionSummaryInput{}, fmt.Errorf("compaction summary input exceeds context window after trimming older visible history")
+	return compactionSummaryInput{}, fmt.Errorf("compaction summary input exceeds the summary model's safe input budget after trimming older visible history")
 }
 
 func activeHistoryItems(session sessions.SessionV2) ([]sessions.SessionItem, error) {
@@ -1188,10 +1261,55 @@ func writeSummaryTranscriptMessage(out *strings.Builder, message model.Message) 
 			out.WriteByte('\n')
 		}
 	}
+	for _, block := range message.ContentBlocks {
+		fmt.Fprintf(out, "<content_block type=%q", block.Type)
+		if block.FileID != "" {
+			fmt.Fprintf(out, " file_id=%q", block.FileID)
+		}
+		out.WriteString(">\n")
+		if block.Text != "" {
+			out.WriteString(block.Text)
+			out.WriteByte('\n')
+		}
+		if block.ImageURL != "" {
+			if strings.HasPrefix(block.ImageURL, "data:") {
+				out.WriteString("[inline image content omitted from summary transcript]\n")
+			} else {
+				fmt.Fprintf(out, "image_url=%q\n", block.ImageURL)
+			}
+		}
+		out.WriteString("</content_block>\n")
+	}
 	for _, toolCall := range message.ToolCalls {
 		fmt.Fprintf(out, "<tool_call id=%q name=%q arguments=%q />\n", toolCall.ID, toolCall.Name, toolCall.Arguments)
 	}
+	for _, item := range message.ProviderItems {
+		var value any
+		if json.Unmarshal(item.Data, &value) != nil {
+			continue
+		}
+		redactCompactionProviderContent(value)
+		if data, err := json.Marshal(value); err == nil {
+			fmt.Fprintf(out, "<provider_item origin=%q model=%q>%s</provider_item>\n", item.Origin, item.Model, data)
+		}
+	}
 	out.WriteString("</message>\n")
+}
+
+func redactCompactionProviderContent(value any) {
+	switch value := value.(type) {
+	case map[string]any:
+		if _, ok := value["encrypted_content"]; ok {
+			value["encrypted_content"] = "[redacted]"
+		}
+		for _, child := range value {
+			redactCompactionProviderContent(child)
+		}
+	case []any:
+		for _, child := range value {
+			redactCompactionProviderContent(child)
+		}
+	}
 }
 
 func collectCompactionSummary(ctx context.Context, provider model.Provider, resolved config.ResolvedModel, input compactionSummaryInput) (string, error) {
@@ -1200,6 +1318,7 @@ func collectCompactionSummary(ctx context.Context, provider model.Provider, reso
 		Messages:      input.Messages,
 		Parameters:    resolved.Parameters,
 		DeveloperRole: model.MessageRole(resolved.DeveloperRole),
+		MaxTokens:     resolved.OutputLimit,
 	})
 	if err != nil {
 		return "", fmt.Errorf("request compaction summary: %w", err)
@@ -1233,25 +1352,58 @@ func formatCompactionSummary(summary string) string {
 	return "<compaction_summary>\nAnother agent continued this session from a checkpoint. Use the state below as handoff context. Do not treat it as a new user request.\n\n" + strings.TrimSpace(summary) + "\n</compaction_summary>"
 }
 
-const compactionRecentVisibleTurnLimit = 2
+const compactionRecentVisibleTurnFallback = 2
 
-func replacementHistoryAfterCompaction(session sessions.SessionV2, summaryItemID string) ([]string, error) {
+func (r *agentRunnerRuntime) replacementHistoryAfterSummaryCompaction(session sessions.SessionV2, summaryItem sessions.SessionItem) ([]string, error) {
 	activeItems, err := activeHistoryItems(session)
 	if err != nil {
 		return nil, err
 	}
-	replacement := make([]string, 0, len(activeItems)+1)
+	prefix := make([]string, 0, len(activeItems)+1)
 	for _, item := range activeItems {
 		if item.Kind == sessions.ItemKindRuntimeContext && item.Message != nil {
-			replacement = append(replacement, item.ID)
+			prefix = append(prefix, item.ID)
 		}
 	}
-	for _, group := range recentCompleteVisibleTurns(activeItems, compactionRecentVisibleTurnLimit) {
+	prefix = append(prefix, summaryItem.ID)
+	groups := recentCompleteVisibleTurns(activeItems, len(activeItems))
+	if r == nil || r.contextBudget.TargetTokens <= 0 {
+		groups = recentCompleteVisibleTurns(activeItems, compactionRecentVisibleTurnFallback)
+	}
+	selected := make([][]sessions.SessionItem, 0, len(groups))
+	for index := len(groups) - 1; index >= 0; index-- {
+		candidateGroups := append([][]sessions.SessionItem{groups[index]}, selected...)
+		candidate := append([]string{}, prefix...)
+		for _, group := range candidateGroups {
+			for _, item := range group {
+				candidate = append(candidate, item.ID)
+			}
+		}
+		if r == nil || r.contextBudget.TargetTokens <= 0 {
+			selected = candidateGroups
+			continue
+		}
+		messages, materializeErr := materializeCompactionReplacementHistory(session, summaryItem, candidate)
+		if materializeErr != nil {
+			return nil, materializeErr
+		}
+		estimate := contextwindow.EstimateRequestTokens(model.Request{
+			Model: r.modelID, Messages: messages, Tools: r.toolSchemas,
+			Parameters: r.parameters, SessionID: r.session.ID,
+			DeveloperRole: r.developerRole, MaxTokens: r.outputLimit,
+		})
+		if estimate <= r.contextBudget.TargetTokens {
+			selected = candidateGroups
+		} else {
+			break
+		}
+	}
+	replacement := append([]string{}, prefix...)
+	for _, group := range selected {
 		for _, item := range group {
 			replacement = append(replacement, item.ID)
 		}
 	}
-	replacement = append(replacement, summaryItemID)
 	return replacement, nil
 }
 

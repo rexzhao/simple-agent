@@ -20,9 +20,8 @@
 
 ## 非目标
 
-MVP 不实现：
+当前仍不实现：
 
-- mid-turn 自动压缩。
 - 模型切换兼容性检测，例如 compaction compatibility hash。
 - Responses `context_management` 自动压缩和 Codex 私有 `compaction_trigger` 协议。
 - session-history 查询工具。
@@ -255,12 +254,8 @@ GUI + server 是独立功能，完整设计见 `docs/server-gui.md`。
 
 ## 触发策略
 
-MVP 只实现：
-
-1. 手动 `/compact`。
-2. pre-turn 自动压缩。
-
-暂不实现 mid-turn 自动压缩。
+当前实现包含手动压缩、pre-turn 自动压缩，以及完整 tool-call/tool-result 批次之后的
+mid-turn 自动压缩。会话可以在创建时关闭自动压缩；该开关不禁止手动压缩。
 
 ### 手动 `/compact`
 
@@ -275,32 +270,38 @@ MVP 只实现：
 
 ### Pre-turn 自动压缩
 
-每次新用户消息真正提交前，读取上一轮模型响应持久化的 usage：
+每次新用户消息真正提交前，计算本次完整请求的输入压力。Provider usage 与产生该 usage
+的请求前缀绑定；当前请求延续相同前缀时，使用：
 
 ```text
-count = total_tokens
-     or input_tokens + output_tokens + cached_tokens + cache_write_tokens
-
-有 input_limit:
-  threshold = input_limit - reserved
-
-无 input_limit:
-  threshold = context_window - output_limit
+estimated input = authoritative provider usage + anchored message delta
 ```
 
-未显式配置 `reserved` 时默认使用 `min(20000, output_limit)`。当
-`count >= threshold` 时：
+前缀无法验证时退化为全量本地估算。模型限制语义为：`context_window` 是输入输出共享容量，
+`input_limit` 是独立最大输入，`output_limit` 是单次最大输出。因此有效预算是：
+
+```text
+capacity = min(context_window - reserved_output, input_limit if present)
+hard     = capacity - bounded safety margin
+soft     = hard - bounded soft headroom
+target   = soft - bounded soft headroom
+```
+
+`input_limit` 不再重复扣除 output reserve。Safety margin 使用 2%，最少 512、最多 8192
+tokens；soft headroom 根据 `threshold_percent` 计算，最少 2048、最多 32768 tokens，避免
+大窗口按固定百分比浪费数十万 token。达到 soft pressure 时执行收益和 cooldown 判断；达到
+hard pressure 时必须回收上下文，且不受 cooldown 限制。压缩后仍超过 hard budget 会明确失败，
+不会请求主模型。
+
+当达到压力时：
 
 1. 先 compact。
 2. compact 成功后，再把新用户消息加入 active history 并跑模型。
 3. compact 失败时，本轮直接失败，不请求主模型。
 4. compact 失败时，不保存 turn，不更新 `ActiveHistory`。
 
-没有配置模型 output limit 的旧 profile 继续使用
-`context_window * threshold_percent` 作为兼容回退。
-
-暂不做 mid-turn 的原因：工具链中途压缩要处理 assistant tool call / tool result 的合法性，
-风险较高。MVP 如果工具结果追加后下一次请求超窗，先返回清晰错误。
+工具批次之后使用同一决策模型。压缩、裁剪 recent raw history 和 cooldown 都以完整 visible
+turn 为单位，不会拆开 assistant tool call 与 tool result。
 
 ## Summary 生成模型
 
@@ -321,13 +322,14 @@ compaction:
   summary_model: ""
 ```
 
-`max_request_bytes` 是 OpenAI Responses / Codex 的 pre-turn replay 压力保护线。
+`max_request_bytes` 是 OpenAI Responses / Codex 的 pre-turn 与 mid-turn replay 压力保护线。
 序列化请求达到该大小时，即使尚未达到 token 阈值也会先压缩；设为 `0` 可关闭此保护。
 
 语义：
 
-- `enabled` 默认 `false`；启用后才执行手动 `/compact` 和 pre-turn 自动压缩。
-- `reserved` 为 `0` 或省略时，按模型 output limit 自动保留最多 20000 tokens。
+- `enabled` 默认 `false`；启用后才执行手动和自动压缩。
+- 优先使用模型 `output_limit` 作为输出预留；没有时使用显式 `reserved`；两者都没有时按
+  context window 动态预留，最少 4096、最多 20000 tokens。
 - `summary_provider` 和 `summary_model` 为空：使用当前 provider/model。
 - 只配置 `summary_model`：默认在当前 provider 下找该 model profile。
 - 同时配置 `summary_provider` 和 `summary_model`：使用指定 provider/profile。

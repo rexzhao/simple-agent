@@ -20,114 +20,88 @@ import (
 	"github.com/rexzhao/simple-agent/internal/sessions"
 )
 
-func TestAutoCompactionUsageCountUsesPreviousProviderUsage(t *testing.T) {
-	tests := []struct {
-		name     string
-		metadata contextwindow.Metadata
-		want     int64
-	}{
-		{
-			name: "recorded count",
-			metadata: contextwindow.Metadata{
-				LastUsageSource:      string(contextwindow.UsageSourceProvider),
-				LastUsageCountTokens: 252000,
-				LastTotalTokens:      240000,
-			},
-			want: 252000,
-		},
-		{
-			name: "legacy provider total",
-			metadata: contextwindow.Metadata{
-				LastUsageSource: string(contextwindow.UsageSourceProvider),
-				LastTotalTokens: 252000,
-			},
-			want: 252000,
-		},
-		{
-			name: "component fallback",
-			metadata: contextwindow.Metadata{
-				LastUsageSource:      string(contextwindow.UsageSourceProvider),
-				LastInputTokens:      200000,
-				LastOutputTokens:     10000,
-				LastCachedTokens:     40000,
-				LastCacheWriteTokens: 2000,
-			},
-			want: 252000,
-		},
-		{
-			name: "local estimate is not a model response",
-			metadata: contextwindow.Metadata{
-				LastUsageSource:      string(contextwindow.UsageSourceEstimated),
-				LastUsageCountTokens: 300000,
-			},
-			want: 0,
-		},
+func TestCurrentCompactionPressureUsesObservedUsagePlusNewInput(t *testing.T) {
+	base := []model.Message{{Role: model.MessageRoleUser, Content: "previous"}}
+	tracker := contextwindow.NewTracker(contextwindow.Window{Tokens: 10_000, Source: contextwindow.WindowSourceConfigured}, contextwindow.Metadata{})
+	tracker.RecordProviderUsageForRequest(model.Usage{InputTokens: 80, OutputTokens: 20, TotalTokens: 100}, model.Request{Model: "model", Messages: base})
+	runtime := &agentRunnerRuntime{
+		config:         &config.Config{},
+		modelID:        "model",
+		contextTracker: tracker,
+		contextBudget:  effectiveContextBudget{SoftInputLimit: 500, HardInputLimit: 900},
 	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := autoCompactionUsageCount(tt.metadata); got != tt.want {
-				t.Fatalf("autoCompactionUsageCount() = %d, want %d", got, tt.want)
-			}
-		})
+	messages := append(append([]model.Message{}, base...),
+		model.Message{Role: model.MessageRoleAssistant, Content: "previous answer"},
+		model.Message{Role: model.MessageRoleUser, Content: strings.Repeat("x", 2_000)},
+	)
+	pressure := runtime.currentCompactionPressure(messages)
+	if pressure.level != compactionPressureSoft || pressure.estimatedTokens < 500 || pressure.estimatedTokens >= 900 {
+		t.Fatalf("pressure = %#v, want anchored soft pressure", pressure)
+	}
+	messages[len(messages)-1].Content = strings.Repeat("x", 4_000)
+	if pressure = runtime.currentCompactionPressure(messages); pressure.level != compactionPressureHard {
+		t.Fatalf("pressure = %#v, want anchored hard pressure", pressure)
 	}
 }
 
-func TestAutoCompactionThresholdUsesModelLimits(t *testing.T) {
-	tests := []struct {
-		name             string
-		inputLimit       int
-		contextWindow    int
-		outputLimit      int
-		reserved         int
-		thresholdPercent int
-		want             int64
-	}{
-		{
-			name:             "input limit with default reserve",
-			inputLimit:       272000,
-			contextWindow:    400000,
-			outputLimit:      128000,
-			thresholdPercent: 80,
-			want:             252000,
+func TestSoftCompactionCooldownDoesNotAffectHardClassification(t *testing.T) {
+	session := sessions.SessionV2{
+		Items: []sessions.SessionItem{
+			{ID: "assistant-old", Visibility: sessions.ItemVisibilityVisible, Message: &model.Message{Role: model.MessageRoleAssistant, Content: "done"}},
+			{ID: "user-new", Visibility: sessions.ItemVisibilityVisible, Message: &model.Message{Role: model.MessageRoleUser, Content: "next"}},
 		},
-		{
-			name:             "input limit with configured reserve",
-			inputLimit:       272000,
-			contextWindow:    400000,
-			outputLimit:      128000,
-			reserved:         12000,
-			thresholdPercent: 80,
-			want:             260000,
-		},
-		{
-			name:             "context minus output without input limit",
-			contextWindow:    400000,
-			outputLimit:      128000,
-			thresholdPercent: 80,
-			want:             272000,
-		},
-		{
-			name:             "legacy percent fallback without model limits",
-			contextWindow:    400000,
-			thresholdPercent: 80,
-			want:             320000,
-		},
+		Compactions: []sessions.CompactionCheckpoint{{ToItemID: "assistant-old"}},
 	}
+	if !softCompactionCooldownActive(session) {
+		t.Fatal("softCompactionCooldownActive() = false, want cooldown before two complete turns")
+	}
+	session.Items = append(session.Items,
+		sessions.SessionItem{ID: "assistant-new", Visibility: sessions.ItemVisibilityVisible, Message: &model.Message{Role: model.MessageRoleAssistant, Content: "done"}},
+		sessions.SessionItem{ID: "assistant-next", Visibility: sessions.ItemVisibilityVisible, Message: &model.Message{Role: model.MessageRoleAssistant, Content: "done"}},
+	)
+	if softCompactionCooldownActive(session) {
+		t.Fatal("softCompactionCooldownActive() = true after two complete turns")
+	}
+}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := autoCompactionThreshold(
-				tt.inputLimit,
-				tt.contextWindow,
-				tt.outputLimit,
-				tt.reserved,
-				tt.thresholdPercent,
-			)
-			if got != tt.want {
-				t.Fatalf("autoCompactionThreshold() = %d, want %d", got, tt.want)
-			}
-		})
+func TestSummaryReplacementUsesTokenBudgetAndCompleteTurns(t *testing.T) {
+	item := func(id string, role model.MessageRole, content string) sessions.SessionItem {
+		return sessions.SessionItem{ID: id, Kind: sessions.ItemKindMessage, Visibility: sessions.ItemVisibilityVisible, Message: &model.Message{Role: role, Content: content}}
+	}
+	session := sessions.SessionV2{ID: "session-budget", Items: []sessions.SessionItem{
+		item("user-old", model.MessageRoleUser, strings.Repeat("o", 4_000)),
+		item("assistant-old", model.MessageRoleAssistant, "old answer"),
+		item("user-new", model.MessageRoleUser, "new question"),
+		item("assistant-new", model.MessageRoleAssistant, "new answer"),
+	}}
+	session.ActiveHistory = []string{"user-old", "assistant-old", "user-new", "assistant-new"}
+	summary := sessions.SessionItem{ID: "summary-1", Kind: sessions.ItemKindMessage, Message: &model.Message{Role: model.MessageRoleDeveloper, Content: "summary"}}
+	runtime := &agentRunnerRuntime{modelID: "model", session: session, contextBudget: effectiveContextBudget{TargetTokens: 300}}
+	replacement, err := runtime.replacementHistoryAfterSummaryCompaction(session, summary)
+	if err != nil {
+		t.Fatalf("replacementHistoryAfterSummaryCompaction() error = %v", err)
+	}
+	want := []string{"summary-1", "user-new", "assistant-new"}
+	if !reflect.DeepEqual(replacement, want) {
+		t.Fatalf("replacement = %#v, want %#v", replacement, want)
+	}
+}
+
+func TestSummaryTranscriptPreservesMultimodalReferencesAndRedactsEncryptedProviderData(t *testing.T) {
+	var transcript strings.Builder
+	writeSummaryTranscriptMessage(&transcript, model.Message{
+		Role:          model.MessageRoleUser,
+		ContentBlocks: []model.InputContentBlock{{Type: "input_file", Text: "details", FileID: "file-1"}, {Type: "input_image", ImageURL: "data:image/png;base64,secret"}},
+		ProviderItems: []model.ProviderItem{{Origin: "provider", Model: "model", Data: json.RawMessage(`{"type":"reasoning","encrypted_content":"secret","id":"item-1"}`)}},
+	})
+	text := transcript.String()
+	for _, want := range []string{`file_id="file-1"`, "details", "inline image content omitted", `"id":"item-1"`, `"encrypted_content":"[redacted]"`} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("transcript = %s, want contain %q", text, want)
+		}
+	}
+	if strings.Contains(text, "base64,secret") || strings.Contains(text, `"encrypted_content":"secret"`) {
+		t.Fatalf("transcript leaked protected content: %s", text)
 	}
 }
 
@@ -298,6 +272,30 @@ func TestAutoCompactionRequestBytesMeasuresResponsesReplay(t *testing.T) {
 	large := runtime.autoCompactionRequestBytes([]model.Message{{Role: model.MessageRoleUser, Content: strings.Repeat("x", 4096)}})
 	if small <= 0 || large <= small+4000 {
 		t.Fatalf("request sizes small=%d large=%d, want serialized replay growth", small, large)
+	}
+}
+
+func TestSessionCanDisableAutomaticCompaction(t *testing.T) {
+	messages := []model.Message{{Role: model.MessageRoleUser, Content: "keep me"}}
+	runtime := &agentRunnerRuntime{
+		config:  &config.Config{Compaction: config.CompactionConfig{Enabled: true, MaxRequestBytes: 1}},
+		session: sessions.SessionV2{ID: "session-no-auto-compact", AutoCompactOff: true},
+	}
+
+	planned, plan, err := runtime.planAutoCompactBeforeTurn(context.Background(), messages, model.Message{})
+	if err != nil {
+		t.Fatalf("planAutoCompactBeforeTurn() error = %v", err)
+	}
+	if plan != nil || !reflect.DeepEqual(planned, messages) {
+		t.Fatalf("planAutoCompactBeforeTurn() = %#v, %#v; want unchanged messages and no plan", planned, plan)
+	}
+
+	afterTools, err := runtime.autoCompactAfterToolBatch(context.Background(), messages, &compactionApplyingPublisher{}, "turn-1")
+	if err != nil {
+		t.Fatalf("autoCompactAfterToolBatch() error = %v", err)
+	}
+	if !reflect.DeepEqual(afterTools, messages) {
+		t.Fatalf("autoCompactAfterToolBatch() = %#v, want %#v", afterTools, messages)
 	}
 }
 

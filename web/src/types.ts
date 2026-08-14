@@ -107,6 +107,11 @@ export interface ContextMetadata {
   total_long_output_tokens?: number
   total_long_cached_tokens?: number
   total_long_cache_write_tokens?: number
+  last_request_duration_ms?: number
+  last_time_to_first_event_ms?: number
+  total_request_duration_ms?: number
+  total_time_to_first_event_ms?: number
+  request_timing_samples?: number
   warning_issued?: boolean
 }
 

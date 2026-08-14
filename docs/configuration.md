@@ -530,13 +530,25 @@ metadata; they are not sent as provider request parameters. If `context_window`
 is omitted, SAI uses a conservative estimated default. The Web UI shows usage
 events and exposes manual compaction.
 
-When compaction is enabled, the next user turn checks the previous model
-response usage. The provider's `total_tokens` is preferred; if it is absent,
-SAI uses input + output + cache-read + cache-write tokens. With an
-`input_limit`, the trigger is `input_limit - reserved`; an omitted or zero
-`reserved` defaults to `min(20000, output_limit)`. Without an `input_limit`, the
-trigger is `context_window - output_limit`. `threshold_percent` remains the
-compatibility fallback for profiles that do not define output limits.
+When compaction is enabled, SAI evaluates the complete next request before a
+new turn and after every complete tool-result batch. Provider usage is anchored
+to the exact request that produced it and combined with locally estimated new
+messages; if the anchor no longer matches, SAI estimates the complete request.
+
+`context_window` is the shared input-plus-output capacity. `input_limit`, when
+present, is an independent maximum input and is not reduced by the output
+reserve a second time. SAI derives an effective hard input limit from the
+smaller of that input limit and `context_window - output_limit`, then subtracts
+a bounded estimation safety margin. A bounded soft headroom derived from
+`threshold_percent` triggers normal automatic compaction before the hard limit;
+large context windows therefore do not reserve an unbounded percentage. If
+`output_limit` is absent, explicit `reserved` is used, followed by a dynamic
+4096-to-20000-token fallback.
+
+Soft compaction uses a lower post-compaction target, a minimum reclaim check,
+and a two-complete-turn cooldown. Hard pressure ignores the cooldown. Every
+provider request also has a final hard-budget preflight, so a request that could
+not be reclaimed to a safe size is rejected locally.
 
 Compaction defaults to the provider-neutral local summary implementation. An
 OpenAI Responses or Codex model profile can explicitly opt into the public
@@ -555,7 +567,7 @@ SAI rebuilds the complete history from the append-only session ledger and falls
 back to the configured local summary model. Compatible third-party endpoints
 are never assumed to support remote compaction. `context_management` and the
 Codex-specific `compaction_trigger` protocol are not enabled by this option.
-When compaction is enabled, `max_request_bytes` adds a pre-turn replay-pressure
+When compaction is enabled, `max_request_bytes` adds a pre-turn and mid-turn replay-pressure
 guard for OpenAI Responses and Codex requests. SAI compacts before the turn when
 either the token threshold or this serialized request-size threshold is reached.
 Set it to `0` to disable the byte-size guard.

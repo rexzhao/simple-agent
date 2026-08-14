@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/rexzhao/simple-agent/internal/model"
 )
@@ -261,6 +262,32 @@ func TestTrackingProviderRejectsOverBudgetBeforeProviderRequest(t *testing.T) {
 	}
 	if called {
 		t.Fatal("inner provider was called for an over-budget request")
+	}
+}
+
+func TestTrackingProviderUsesEffectiveHardInputLimit(t *testing.T) {
+	called := false
+	tracker := NewTracker(Window{Tokens: 10_000, Source: WindowSourceConfigured}, Metadata{})
+	tracker.SetHardInputLimit(100)
+	provider := TrackingProvider{Inner: fakeProvider{called: &called}, Tracker: tracker}
+	_, err := provider.Stream(context.Background(), model.Request{Messages: []model.Message{{Role: model.MessageRoleUser, Content: strings.Repeat("x", 500)}}})
+	var budgetErr *BudgetExceededError
+	if !errors.As(err, &budgetErr) || budgetErr.HardInputLimit != 100 {
+		t.Fatalf("Stream() error = %#v, want effective hard limit 100", err)
+	}
+	if called {
+		t.Fatal("inner provider was called above effective hard input limit")
+	}
+}
+
+func TestTrackerRecordsRequestTimingTelemetry(t *testing.T) {
+	tracker := NewTracker(Window{Tokens: 1_000, Source: WindowSourceConfigured}, Metadata{})
+	tracker.RecordRequestTiming(25*time.Millisecond, 7*time.Millisecond)
+	tracker.RecordRequestTiming(35*time.Millisecond, 9*time.Millisecond)
+	metadata := tracker.Metadata()
+	if metadata.LastRequestDurationMillis != 35 || metadata.LastTimeToFirstEventMillis != 9 ||
+		metadata.TotalRequestDurationMillis != 60 || metadata.TotalTimeToFirstEventMillis != 16 || metadata.RequestTimingSamples != 2 {
+		t.Fatalf("timing metadata = %#v", metadata)
 	}
 }
 

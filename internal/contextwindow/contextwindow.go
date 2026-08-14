@@ -9,6 +9,7 @@ import (
 	"math"
 	"strings"
 	"sync"
+	"time"
 	"unicode/utf8"
 
 	"github.com/rexzhao/simple-agent/internal/model"
@@ -61,50 +62,58 @@ type Metadata struct {
 	// above intentionally remain the most recent provider request because the
 	// context-window meter uses that request, while cost reporting uses these
 	// totals.
-	TotalInputTokens           int  `json:"total_input_tokens,omitempty"`
-	TotalOutputTokens          int  `json:"total_output_tokens,omitempty"`
-	TotalTokens                int  `json:"total_tokens,omitempty"`
-	TotalRequests              int  `json:"total_requests,omitempty"`
-	TotalCachedTokens          int  `json:"total_cached_tokens,omitempty"`
-	TotalCacheWriteTokens      int  `json:"total_cache_write_tokens,omitempty"`
-	TotalReasoningTokens       int  `json:"total_reasoning_tokens,omitempty"`
-	TotalShortInputTokens      int  `json:"total_short_input_tokens,omitempty"`
-	TotalShortOutputTokens     int  `json:"total_short_output_tokens,omitempty"`
-	TotalShortCachedTokens     int  `json:"total_short_cached_tokens,omitempty"`
-	TotalShortCacheWriteTokens int  `json:"total_short_cache_write_tokens,omitempty"`
-	TotalLongInputTokens       int  `json:"total_long_input_tokens,omitempty"`
-	TotalLongOutputTokens      int  `json:"total_long_output_tokens,omitempty"`
-	TotalLongCachedTokens      int  `json:"total_long_cached_tokens,omitempty"`
-	TotalLongCacheWriteTokens  int  `json:"total_long_cache_write_tokens,omitempty"`
-	WarningIssued              bool `json:"warning_issued,omitempty"`
+	TotalInputTokens            int   `json:"total_input_tokens,omitempty"`
+	TotalOutputTokens           int   `json:"total_output_tokens,omitempty"`
+	TotalTokens                 int   `json:"total_tokens,omitempty"`
+	TotalRequests               int   `json:"total_requests,omitempty"`
+	TotalCachedTokens           int   `json:"total_cached_tokens,omitempty"`
+	TotalCacheWriteTokens       int   `json:"total_cache_write_tokens,omitempty"`
+	TotalReasoningTokens        int   `json:"total_reasoning_tokens,omitempty"`
+	TotalShortInputTokens       int   `json:"total_short_input_tokens,omitempty"`
+	TotalShortOutputTokens      int   `json:"total_short_output_tokens,omitempty"`
+	TotalShortCachedTokens      int   `json:"total_short_cached_tokens,omitempty"`
+	TotalShortCacheWriteTokens  int   `json:"total_short_cache_write_tokens,omitempty"`
+	TotalLongInputTokens        int   `json:"total_long_input_tokens,omitempty"`
+	TotalLongOutputTokens       int   `json:"total_long_output_tokens,omitempty"`
+	TotalLongCachedTokens       int   `json:"total_long_cached_tokens,omitempty"`
+	TotalLongCacheWriteTokens   int   `json:"total_long_cache_write_tokens,omitempty"`
+	LastRequestDurationMillis   int64 `json:"last_request_duration_ms,omitempty"`
+	LastTimeToFirstEventMillis  int64 `json:"last_time_to_first_event_ms,omitempty"`
+	TotalRequestDurationMillis  int64 `json:"total_request_duration_ms,omitempty"`
+	TotalTimeToFirstEventMillis int64 `json:"total_time_to_first_event_ms,omitempty"`
+	RequestTimingSamples        int   `json:"request_timing_samples,omitempty"`
+	WarningIssued               bool  `json:"warning_issued,omitempty"`
 }
 
 type RequestEstimate struct {
 	InputTokens             int
 	ContextWindow           int
+	HardInputLimit          int
 	WarningThresholdPercent int
 }
 
 type BudgetExceededError struct {
 	EstimatedInputTokens int
 	ContextWindow        int
+	HardInputLimit       int
 }
 
 func (e *BudgetExceededError) Error() string {
 	if e == nil {
 		return "context window budget exceeded"
 	}
-	return fmt.Sprintf(
-		"context window budget exceeded: estimated input tokens %d >= context window %d; refusing to send provider request; no context was truncated",
-		e.EstimatedInputTokens,
-		e.ContextWindow,
-	)
+	limit := e.HardInputLimit
+	if limit <= 0 {
+		limit = e.ContextWindow
+	}
+	return fmt.Sprintf("context input budget exceeded: estimated input tokens %d >= safe input limit %d; refusing to send provider request; no context was truncated", e.EstimatedInputTokens, limit)
 }
 
 type Tracker struct {
 	mu                        sync.Mutex
 	metadata                  Metadata
 	longContextTokenThreshold int
+	hardInputLimit            int
 }
 
 type TrackingProvider struct {
@@ -160,37 +169,61 @@ func (t *Tracker) SetLongContextTokenThreshold(threshold int) {
 	t.longContextTokenThreshold = threshold
 }
 
-func (t *Tracker) CheckRequest(request model.Request) (RequestEstimate, bool, error) {
+// SetHardInputLimit installs the effective per-request input ceiling after
+// output reserve and estimation safety margin have been applied.
+func (t *Tracker) SetHardInputLimit(limit int) {
 	if t == nil {
-		return RequestEstimate{}, false, nil
+		return
 	}
-	fullEstimate := EstimateRequestTokens(request)
-
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	t.hardInputLimit = limit
+}
 
+// EstimateRequest returns the best current input estimate without mutating
+// warning or request accounting state. A provider usage anchor is used when
+// the request extends the exact request that produced that usage; otherwise
+// the complete request is estimated locally.
+func (t *Tracker) EstimateRequest(request model.Request) RequestEstimate {
+	if t == nil {
+		return RequestEstimate{InputTokens: EstimateRequestTokens(request)}
+	}
+	fullEstimate := EstimateRequestTokens(request)
+	t.mu.Lock()
+	defer t.mu.Unlock()
 	inputTokens := fullEstimate
 	if anchoredEstimate, ok := t.estimateFromProviderUsage(request); ok {
 		inputTokens = anchoredEstimate
 	}
-	estimate := RequestEstimate{
+	return RequestEstimate{
 		InputTokens:             inputTokens,
 		ContextWindow:           t.metadata.ContextWindow,
+		HardInputLimit:          t.hardInputLimit,
 		WarningThresholdPercent: t.metadata.WarningThresholdPercent,
 	}
-	t.metadata.LastRequestTokens = inputTokens
+}
+
+func (t *Tracker) CheckRequest(request model.Request) (RequestEstimate, bool, error) {
+	if t == nil {
+		return RequestEstimate{}, false, nil
+	}
+	estimate := t.EstimateRequest(request)
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.metadata.LastRequestTokens = estimate.InputTokens
+	limit := estimate.HardInputLimit
+	if limit <= 0 {
+		limit = estimate.ContextWindow
+	}
+	if limit > 0 && estimate.InputTokens >= limit {
+		return estimate, false, &BudgetExceededError{EstimatedInputTokens: estimate.InputTokens, ContextWindow: estimate.ContextWindow, HardInputLimit: limit}
+	}
 	if estimate.ContextWindow <= 0 {
 		return estimate, false, nil
 	}
-	if inputTokens >= estimate.ContextWindow {
-		return estimate, false, &BudgetExceededError{
-			EstimatedInputTokens: inputTokens,
-			ContextWindow:        estimate.ContextWindow,
-		}
-	}
 
 	threshold := int(math.Ceil(float64(estimate.ContextWindow) * float64(estimate.WarningThresholdPercent) / 100))
-	shouldWarn := threshold > 0 && inputTokens >= threshold && !t.metadata.WarningIssued
+	shouldWarn := threshold > 0 && estimate.InputTokens >= threshold && !t.metadata.WarningIssued
 	if shouldWarn {
 		t.metadata.WarningIssued = true
 	}
@@ -232,6 +265,21 @@ func (t *Tracker) RecordEstimatedContextUsage(inputTokens, outputTokens int) {
 		OutputTokens: outputTokens,
 		TotalTokens:  totalTokens,
 	}, nil, false)
+}
+
+func (t *Tracker) RecordRequestTiming(duration, timeToFirstEvent time.Duration) {
+	if t == nil {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	durationMillis := duration.Milliseconds()
+	firstEventMillis := timeToFirstEvent.Milliseconds()
+	t.metadata.LastRequestDurationMillis = durationMillis
+	t.metadata.LastTimeToFirstEventMillis = firstEventMillis
+	t.metadata.TotalRequestDurationMillis += durationMillis
+	t.metadata.TotalTimeToFirstEventMillis += firstEventMillis
+	t.metadata.RequestTimingSamples++
 }
 
 type usageAnchor struct {
@@ -310,8 +358,11 @@ func (p TrackingProvider) Stream(ctx context.Context, request model.Request) (<-
 		}
 	}
 
+	startedAt := time.Now()
 	stream, err := p.Inner.Stream(ctx, request)
 	if err != nil {
+		duration := time.Since(startedAt)
+		p.Tracker.RecordRequestTiming(duration, duration)
 		return nil, err
 	}
 
@@ -323,7 +374,11 @@ func (p TrackingProvider) Stream(ctx context.Context, request model.Request) (<-
 		sawError := false
 		var providerUsage model.Usage
 		outputTokens := 0
+		var firstEventAt time.Time
 		for event := range stream {
+			if firstEventAt.IsZero() {
+				firstEventAt = time.Now()
+			}
 			switch event := event.(type) {
 			case model.UsageEvent:
 				sawUsage = true
@@ -348,6 +403,11 @@ func (p TrackingProvider) Stream(ctx context.Context, request model.Request) (<-
 		} else if !sawUsage && !sawError && ctx.Err() == nil {
 			p.Tracker.RecordEstimatedUsage(estimate.InputTokens, outputTokens)
 		}
+		finishedAt := time.Now()
+		if firstEventAt.IsZero() {
+			firstEventAt = finishedAt
+		}
+		p.Tracker.RecordRequestTiming(finishedAt.Sub(startedAt), firstEventAt.Sub(startedAt))
 	}()
 	return events, nil
 }
