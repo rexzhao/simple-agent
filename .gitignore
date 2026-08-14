@@ -12,3 +12,4 @@
 /coverage/
 __pycache__/
 /.mcp_cli_discovery.py
+/dist/*~
