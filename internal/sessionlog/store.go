@@ -36,22 +36,34 @@ func OpenStore(root string) (*Store, error) {
 // Root returns the session root directory.
 func (s *Store) Root() string { return s.root }
 
-// Create creates a new session and returns it with its session.created record
-// already appended.
+// Create returns a new session. Creation is lazy: nothing touches the
+// disk, so an empty session (one never sent a message) leaves no directory
+// and never appears in List. The first Append materializes the log and
+// writes the session.created record ahead of the appended one.
 func (s *Store) Create(provider, model, cwd string) (*Session, error) {
 	id := newSessionID()
-	dir := filepath.Join(s.root, id)
-	log, err := OpenLog(filepath.Join(dir, logFileName))
-	if err != nil {
-		return nil, err
+	createdAt := newTime()
+	state := newState(id)
+	state.Provider = provider
+	state.Model = model
+	state.CWD = cwd
+	if created, err := time.Parse(time.RFC3339Nano, createdAt); err == nil {
+		state.CreatedAt = created
+		state.UpdatedAt = created
 	}
-	session := &Session{id: id, log: log, state: newState(id)}
-	if _, err := session.Append(Record{Type: TypeSessionCreated, Provider: provider, Model: model, CWD: cwd}); err != nil {
-		log.Close()
-		return nil, err
-	}
-	return session, nil
+	return &Session{
+		id:    id,
+		store: s,
+		state: state,
+		pending: &pendingMeta{
+			provider: provider, model: model, cwd: cwd, createdAt: createdAt,
+		},
+	}, nil
 }
+
+// SessionDir returns the on-disk directory of a session ID. The directory
+// exists only once the session has been materialized by its first record.
+func (s *Store) SessionDir(id string) string { return filepath.Join(s.root, id) }
 
 // Open loads an existing session, recovering its folded state from the log.
 // Any run left in the running state by a crash is healed with an appended
@@ -155,8 +167,12 @@ func (s *Store) List() ([]Summary, error) {
 // Append writes a record and advances the fold atomically under the session
 // lock; Snapshot returns a deep copy safe for any reader.
 type Session struct {
-	id  string
-	log *Log
+	id    string
+	store *Store
+	log   *Log
+	// pending carries the creation metadata of a session which has not
+	// touched the disk yet; it is consumed by the first Append.
+	pending *pendingMeta
 
 	mu              sync.RWMutex
 	state           *State
@@ -164,18 +180,32 @@ type Session struct {
 	subs            map[chan struct{}]struct{}
 }
 
+type pendingMeta struct {
+	provider  string
+	model     string
+	cwd       string
+	createdAt string
+}
+
 // ID returns the session ID.
 func (s *Session) ID() string { return s.id }
 
 // Append stores one record and advances the folded state, then notifies
-// subscribers. Collection and delivery of the notification signal happen
-// under the session lock so an unsubscribing reader can never race a
-// concurrent send on a channel being closed.
+// subscribers. The first append on a lazily created session materializes the
+// log and writes session.created first, so an empty session never exists on
+// disk. Collection and delivery of the notification signal happen under the
+// session lock so an unsubscribing reader can never race a concurrent send
+// on a channel being closed.
 func (s *Session) Append(record Record) (Record, error) {
 	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.log == nil {
+		if err := s.materializeLocked(); err != nil {
+			return Record{}, err
+		}
+	}
 	stored, err := s.log.Append(record)
 	if err != nil {
-		s.mu.Unlock()
 		return Record{}, err
 	}
 	fold(s.state, stored)
@@ -185,8 +215,31 @@ func (s *Session) Append(record Record) (Record, error) {
 		default:
 		}
 	}
-	s.mu.Unlock()
 	return stored, nil
+}
+
+// materializeLocked creates the session directory and log and writes the
+// session.created record carrying the creation metadata. Callers hold s.mu.
+func (s *Session) materializeLocked() error {
+	log, err := OpenLog(filepath.Join(s.store.root, s.id, logFileName))
+	if err != nil {
+		return err
+	}
+	created, err := log.Append(Record{
+		Type:     TypeSessionCreated,
+		Provider: s.pending.provider,
+		Model:    s.pending.model,
+		CWD:      s.pending.cwd,
+		Time:     s.pending.createdAt,
+	})
+	if err != nil {
+		log.Close()
+		return err
+	}
+	fold(s.state, created)
+	s.log = log
+	s.pending = nil
+	return nil
 }
 
 // Snapshot returns a deep copy of the folded state.
@@ -219,8 +272,40 @@ func (s *Session) Subscribe() (<-chan struct{}, func()) {
 	return ch, unsubscribe
 }
 
-// Close closes the underlying log. The session must not be appended to after.
-func (s *Session) Close() error { return s.log.Close() }
+// Close closes the underlying log. A session which never materialized has
+// nothing on disk and nothing to close. The session must not be appended to
+// after.
+func (s *Session) Close() error {
+	s.mu.Lock()
+	log := s.log
+	s.mu.Unlock()
+	if log == nil {
+		return nil
+	}
+	return log.Close()
+}
+
+// RecordsAfter returns every stored record with a sequence greater than
+// seq, in sequence order. A session which has not materialized yet has no
+// records. It is the tailing primitive for consumers which replay the log
+// (such as a CLI printing the JSONL stream).
+func (s *Session) RecordsAfter(seq int64) ([]Record, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.log == nil {
+		return nil, nil
+	}
+	records, err := s.log.Records()
+	if err != nil {
+		return nil, err
+	}
+	for index, record := range records {
+		if record.Seq > seq {
+			return records[index:], nil
+		}
+	}
+	return nil, nil
+}
 
 // setCurrentRun sets the run ID the publisher stamps on records. It is
 // publisher-private state kept on the session so a session has exactly one

@@ -154,6 +154,10 @@ func (a *App) ListSessions() ([]sessionlog.Summary, error) { return a.store.List
 // SessionStoreRoot returns the sessions directory (diagnostics and tests).
 func (a *App) SessionStoreRoot() string { return a.store.Root() }
 
+// SessionDir returns the on-disk directory of a stored session, for
+// revealing it in the system file manager.
+func (a *App) SessionDir(id string) string { return a.store.SessionDir(id) }
+
 // Config returns the loaded configuration (read-only use).
 func (a *App) Config() *config.Config { return a.cfg }
 

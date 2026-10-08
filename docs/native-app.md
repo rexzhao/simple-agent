@@ -25,6 +25,12 @@ sessionlog.State
 cmd/sai-native（mygo 原生窗口）
 ```
 
+### 空会话不落盘
+
+`Store.Create` 是懒创建：不写任何东西到磁盘。首次 `Append` 才物化日志
+（先写 `session.created` 再写该记录）。启动、`/clear` 产生的空会话既不占
+目录也不出现在 `/resume` 列表里。
+
 ### 事件词汇
 
 | 类型 | 载荷 | 说明 |
@@ -55,30 +61,33 @@ durable 共享同一身份，不存在映射层。
   因此 `turn.started`/`turn.completed` 实际不会出现在日志里（事件表中
   保留它们是为了词汇完整性）。
 
-## 使用
+## 使用（命令行）
 
 ```sh
-go run ./cmd/sai-native
+go run ./cmd/sai [session-id]
 ```
 
 参数：
 
 ```text
---server-root dir   配置根目录；解析顺序：--server-root > $SAI_SERVER_ROOT > ./.sai/sai.yaml（存在时）> <user config>/sai
+--server-root dir   配置根目录；解析顺序：--server-root > $SAI_SERVER_ROOT > ./.<app>/sai.yaml（存在时）> <user config>/<app>。<app> 取可执行文件名第一个 - 之前的部分（sai-windows-amd64.exe → sai）
 --cwd dir           工具工作目录（默认进程 cwd）
 --provider name     覆盖 default_provider
 --model name        覆盖 default_model（模型 profile 名）
 --full-access       文件工具允许读写 cwd 之外
 ```
 
-界面：顶部会话 ID 与运行状态，中部会话内容（流式输出带 ▌ 光标），
-底部单行输入框。
+交互：`sai> ` 提示符读入一行输入；运行期间 stderr 显示 `.` `..` `...`
+循环光标；运行结束后该 run 追加的全部 JSONL 记录一次性打印到 stdout。
+控制信息（提示符、通知、会话列表）只走 stderr，stdout 是纯记录流，
+可以直接重定向留存。
 
 命令：
 
-- `/clear` 新会话
-- `/resume` 列出并选择已存会话（双击或 Enter 打开）
-- `/stop` 停止当前运行
+- `/clear` 新会话（空会话不落盘，反复 clear 不产生任何磁盘写入）
+- `/resume` 列出已存会话；`/resume <id>` 打开指定会话（先回放其全部
+  JSONL 再继续）
+- `/stop` 停止当前运行（Ctrl+C 同效；空闲时 Ctrl+C 退出）
 - `/help` 命令帮助
 
 ## 后续

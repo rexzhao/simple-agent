@@ -1,12 +1,12 @@
 # simple-agent
 
 `sai` is a local agent application packaged as a single Go executable with a
-native UI. Start the executable and a window opens for chatting with a model
-that can read, search, and edit files and run shell commands in your project.
+command-line interface. Type a message, the agent answers; it can read,
+search, and edit files and run shell commands in your project.
 
-The window never reads session files or provider credentials directly. The
-Go process owns the execution library, storage, tools, and model connections;
-the native window is only the presentation layer.
+While a run streams, a dot spinner shows progress; when the run settles, the
+session's appended JSONL records print to stdout, one line each. Control
+messages go to stderr, so stdout stays a pure session-record stream.
 
 ## Storage model
 
@@ -24,7 +24,7 @@ policy, and crash recovery.
 ## Run
 
 ```powershell
-go run ./cmd/sai-native
+go run ./cmd/sai [session-id]
 ```
 
 Options:
@@ -38,13 +38,12 @@ Options:
 --version           print version
 ```
 
-The window shows the conversation (streaming assistant output included) and
-takes input at the bottom. Slash commands:
+An optional positional argument resumes a stored session. Slash commands:
 
-- `/clear` — start a new session
-- `/resume` — pick and reopen a stored session
-- `/stop` — stop the active run
-- `/help` — list commands
+- `/clear` — start a new session (empty sessions are never written to disk)
+- `/resume` — list stored sessions; `/resume <id>` opens one
+- `/stop` — stop the active run (Ctrl+C does the same)
+- `/quit` — exit (a second Ctrl+C when idle also exits)
 
 ## Server root and configuration
 
@@ -53,9 +52,13 @@ credentials, and sessions. Resolution order:
 
 1. the `--server-root` flag
 2. the `SAI_SERVER_ROOT` environment variable
-3. a `.sai` directory in the current working directory (when it contains
+3. a `.<app>` directory in the current working directory (when it contains
    `sai.yaml`), so a checkout can carry its own configuration
-4. the OS user configuration directory under `sai` (the default)
+4. the OS user configuration directory under `<app>` (the default)
+
+`<app>` derives from the executable's base name: everything before the first
+`-`. `sai.exe` and `sai-windows-amd64.exe` both use `sai`; renaming the
+executable to `myagent-v2.exe` switches it to its own `myagent` namespace.
 
 The root config is `<server-root>/sai.yaml`:
 
@@ -104,7 +107,7 @@ schema.
 
 ## Build
 
-Building requires Go 1.27.1+ (the toolchain downloads automatically).
+Building requires Go 1.22+.
 
 Windows:
 
@@ -120,9 +123,9 @@ sh scripts/build.sh
 
 The build cross-compiles:
 
-- `dist/sai-native-windows-amd64.exe`
-- `dist/sai-native-linux-amd64`
-- `dist/sai-native-darwin-arm64`
+- `dist/sai.exe`
+- `dist/sai-linux-amd64`
+- `dist/sai-darwin-arm64`
 
 Pushing a `v*` tag runs the release workflow: it validates the backend, builds
 all three binaries, and publishes them with a `SHA256SUMS` manifest.
@@ -136,7 +139,7 @@ go test ./...
 ## Project layout
 
 ```
-cmd/sai-native       native UI (mygo window)
+cmd/sai              command-line interface (JSONL stream on stdout)
 internal/sessionlog  append-only JSONL session store + fold
 internal/chatapp     minimal orchestration (provider, tools, runs)
 internal/agent       transport-neutral agent loop

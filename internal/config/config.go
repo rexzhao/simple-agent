@@ -838,6 +838,11 @@ func loadProviders(providerDir string) (map[string]ProviderConfig, error) {
 		if err := yaml.Unmarshal(data, &provider); err != nil {
 			return nil, fmt.Errorf("parse provider file %q: %w", path, err)
 		}
+		// The provider name defaults to the file's base name, so a minimal
+		// profile can omit it entirely: providers/paperhub.yaml is "paperhub".
+		if strings.TrimSpace(provider.Name) == "" {
+			provider.Name = strings.TrimSuffix(entry.Name(), filepath.Ext(entry.Name()))
+		}
 		provider = normalizeProvider(provider, filepath.Dir(path))
 		if err := validateProvider(path, provider); err != nil {
 			return nil, err

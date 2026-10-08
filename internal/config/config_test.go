@@ -1816,3 +1816,32 @@ func TestDefaultSkillDirsLayerUserRepoAndCWD(t *testing.T) {
 		t.Fatalf("ResolveSkillDirs(outside repo) = %#v, want %#v", got, want)
 	}
 }
+
+func TestProviderNameDefaultsFromFileName(t *testing.T) {
+	dir := t.TempDir()
+	// A minimal profile without an explicit name.
+	profile := "base_url: http://127.0.0.1:1/v1\napi_key: k\nmodels:\n  m:\n    id: m\n    type: openai-chat\n"
+	if err := os.WriteFile(filepath.Join(dir, "paperhub.yaml"), []byte(profile), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	providers, err := LoadProviderConfigs(dir)
+	if err != nil {
+		t.Fatalf("LoadProviderConfigs failed on a nameless profile: %v", err)
+	}
+	if _, ok := providers["paperhub"]; !ok {
+		t.Fatalf("providers = %v, want paperhub derived from the file name", providers)
+	}
+
+	// An explicit name still wins.
+	named := "name: explicit\nbase_url: http://127.0.0.1:1/v1\napi_key: k\nmodels:\n  m:\n    id: m\n    type: openai-chat\n"
+	if err := os.WriteFile(filepath.Join(dir, "other.yaml"), []byte(named), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	providers, err = LoadProviderConfigs(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := providers["explicit"]; !ok {
+		t.Fatalf("providers = %v, want explicit name preserved", providers)
+	}
+}

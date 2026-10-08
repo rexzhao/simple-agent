@@ -41,9 +41,9 @@ jobs:
           VERSION: ${{ github.ref_name }}
         run: |
           for artifact in \
-            dist/sai-native-windows-amd64.exe \
-            dist/sai-native-linux-amd64 \
-            dist/sai-native-darwin-arm64
+            dist/sai.exe \
+            dist/sai-linux-amd64 \
+            dist/sai-darwin-arm64
           do
             strings "$artifact" | grep -Fx -- "$VERSION"
           done
@@ -52,9 +52,9 @@ jobs:
         working-directory: dist
         run: |
           sha256sum \
-            sai-native-windows-amd64.exe \
-            sai-native-linux-amd64 \
-            sai-native-darwin-arm64 > SHA256SUMS
+            sai.exe \
+            sai-linux-amd64 \
+            sai-darwin-arm64 > SHA256SUMS
           sha256sum --check SHA256SUMS
 
       - name: Publish GitHub release
@@ -63,9 +63,9 @@ jobs:
           VERSION: ${{ github.ref_name }}
         run: |
           artifacts=(
-            dist/sai-native-windows-amd64.exe
-            dist/sai-native-linux-amd64
-            dist/sai-native-darwin-arm64
+            dist/sai.exe
+            dist/sai-linux-amd64
+            dist/sai-darwin-arm64
             dist/SHA256SUMS
           )
           if gh release view "$VERSION" >/dev/null 2>&1; then

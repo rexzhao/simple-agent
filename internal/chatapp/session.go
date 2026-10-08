@@ -39,6 +39,12 @@ func (s *Session) ID() string { return s.log.ID() }
 // Snapshot returns the folded session state.
 func (s *Session) Snapshot() sessionlog.State { return s.log.Snapshot() }
 
+// RecordsAfter returns the session's stored records after seq, for tailing
+// the JSONL stream from outside.
+func (s *Session) RecordsAfter(seq int64) ([]sessionlog.Record, error) {
+	return s.log.RecordsAfter(seq)
+}
+
 // Subscribe notifies the caller after every durable append.
 func (s *Session) Subscribe() (<-chan struct{}, func()) { return s.log.Subscribe() }
 

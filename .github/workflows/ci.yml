@@ -34,4 +34,4 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
-      - run: go build ./cmd/sai-native
+      - run: go build ./cmd/sai

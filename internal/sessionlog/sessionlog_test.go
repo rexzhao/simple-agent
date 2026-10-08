@@ -286,3 +286,124 @@ func TestNewSessionIDsUniqueAndSorted(t *testing.T) {
 		last = id[:9]
 	}
 }
+
+func TestLazyCreateTouchesNoDisk(t *testing.T) {
+	root := t.TempDir()
+	store, _ := OpenStore(root)
+	session, err := store.Create("paperhub", "glm-5.2", `F:\demo`)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Nothing on disk, nothing listed, and Close is a no-op.
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("lazy create wrote %d entries, want 0", len(entries))
+	}
+	if err := session.Close(); err != nil {
+		t.Fatal(err)
+	}
+	summaries, err := store.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(summaries) != 0 {
+		t.Fatalf("lazy session listed: %+v", summaries)
+	}
+
+	// The in-memory snapshot still carries the creation metadata for the UI.
+	state := session.Snapshot()
+	if state.Provider != "paperhub" || state.Model != "glm-5.2" || state.CWD != `F:\demo` {
+		t.Fatalf("lazy state meta = %+v", state)
+	}
+	if state.CreatedAt.IsZero() {
+		t.Fatal("lazy state has no CreatedAt")
+	}
+}
+
+func TestFirstAppendMaterializes(t *testing.T) {
+	root := t.TempDir()
+	store, _ := OpenStore(root)
+	session, _ := store.Create("paperhub", "glm-5.2", "cwd")
+	if _, err := session.Append(Record{Type: TypeUserInput, RunID: "r1", Content: "hello"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := session.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	records, err := readRecords(filepath.Join(store.SessionDir(session.ID()), logFileName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 2 {
+		t.Fatalf("records = %d, want 2 (session.created + user.input)", len(records))
+	}
+	if records[0].Type != TypeSessionCreated || records[0].Seq != 1 || records[0].Provider != "paperhub" {
+		t.Fatalf("materialized header = %+v", records[0])
+	}
+	if records[1].Type != TypeUserInput || records[1].Seq != 2 {
+		t.Fatalf("appended record = %+v", records[1])
+	}
+
+	reopened, err := store.Open(session.ID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	state := reopened.Snapshot()
+	if state.Provider != "paperhub" || state.Title != "hello" {
+		t.Fatalf("reopened state = %+v", state)
+	}
+}
+
+func TestManyEmptySessionsLeaveNoDirectories(t *testing.T) {
+	root := t.TempDir()
+	store, _ := OpenStore(root)
+	// Simulate /clear churn: sessions created and abandoned without input.
+	for i := 0; i < 5; i++ {
+		session, _ := store.Create("p", "m", "")
+		session.Close()
+	}
+	entries, _ := os.ReadDir(root)
+	if len(entries) != 0 {
+		t.Fatalf("empty sessions left %d directories, want 0", len(entries))
+	}
+}
+
+func TestRecordsAfter(t *testing.T) {
+	root := t.TempDir()
+	store, _ := OpenStore(root)
+	// Lazy session: no records before materialization.
+	session, _ := store.Create("p", "m", "")
+	defer session.Close()
+	if records, err := session.RecordsAfter(0); err != nil || len(records) != 0 {
+		t.Fatalf("lazy RecordsAfter = %v, %v", records, err)
+	}
+	appendRecord(t, session, Record{Type: TypeUserInput, RunID: "r", Content: "one"})
+	appendRecord(t, session, Record{Type: TypeRunStarted, RunID: "r"})
+	appendRecord(t, session, Record{Type: TypeRunSettled, RunID: "r", Status: RunStatusCommitted})
+
+	// seq 1 is the materialized session.created.
+	all, err := session.RecordsAfter(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all) != 4 || all[0].Type != TypeSessionCreated {
+		t.Fatalf("RecordsAfter(0) = %d records, first %s", len(all), all[0].Type)
+	}
+	tail, err := session.RecordsAfter(2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tail) != 2 || tail[0].Seq != 3 || tail[1].Seq != 4 {
+		t.Fatalf("RecordsAfter(2) = %+v", tail)
+	}
+	none, err := session.RecordsAfter(4)
+	if err != nil || len(none) != 0 {
+		t.Fatalf("RecordsAfter(4) = %v, %v", none, err)
+	}
+}
