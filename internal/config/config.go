@@ -51,7 +51,6 @@ type ProviderConfig struct {
 	RequestTimeout        string                  `json:"request_timeout,omitempty" yaml:"request_timeout,omitempty"`
 	HTTPProxy             string                  `json:"http_proxy,omitempty" yaml:"http_proxy,omitempty"`
 	HTTPSProxy            string                  `json:"https_proxy,omitempty" yaml:"https_proxy,omitempty"`
-	MaxConcurrentRequests int                     `json:"max_concurrent_requests,omitempty" yaml:"max_concurrent_requests,omitempty"`
 	ResolvedAPIKey        string                  `json:"-" yaml:"-"`
 	Models                map[string]ModelProfile `json:"models" yaml:"models"`
 }
@@ -140,7 +139,6 @@ func (p ProviderConfig) MarshalJSON() ([]byte, error) {
 		RequestTimeout        string                  `json:"request_timeout,omitempty"`
 		HTTPProxy             string                  `json:"http_proxy,omitempty"`
 		HTTPSProxy            string                  `json:"https_proxy,omitempty"`
-		MaxConcurrentRequests int                     `json:"max_concurrent_requests,omitempty"`
 		Models                map[string]ModelProfile `json:"models"`
 	}
 
@@ -155,7 +153,6 @@ func (p ProviderConfig) MarshalJSON() ([]byte, error) {
 		RequestTimeout:        p.RequestTimeout,
 		HTTPProxy:             p.HTTPProxy,
 		HTTPSProxy:            p.HTTPSProxy,
-		MaxConcurrentRequests: p.MaxConcurrentRequests,
 		Models:                p.Models,
 	}); err != nil {
 		return nil, err
@@ -196,9 +193,6 @@ func LoadBase(configPath string) (*Config, error) {
 	}
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
 		return nil, fmt.Errorf("parse config file %q: %w", absConfigPath, err)
-	}
-	if err := validateConfig(cfg); err != nil {
-		return nil, fmt.Errorf("validate config file %q: %w", absConfigPath, err)
 	}
 
 	cfg.ConfigPath = absConfigPath
@@ -497,10 +491,6 @@ func parseModelTokenLimit(name string, value any) (int, error) {
 	return tokens, nil
 }
 
-func validateConfig(cfg Config) error {
-	return nil
-}
-
 func defaultConfig() Config {
 	return Config{
 		ProviderDir: "providers",
@@ -565,9 +555,6 @@ func validateProvider(path string, provider ProviderConfig) error {
 		if err != nil || requestTimeout <= 0 {
 			return fmt.Errorf("provider file %q request_timeout must be a positive duration", path)
 		}
-	}
-	if provider.MaxConcurrentRequests < 0 {
-		return fmt.Errorf("provider file %q max_concurrent_requests must not be negative", path)
 	}
 	if err := validateProviderProxyURL(path, "http_proxy", provider.HTTPProxy); err != nil {
 		return err
@@ -684,17 +671,6 @@ func resolvePath(baseDir, path string) string {
 		return filepath.Clean(path)
 	}
 	return filepath.Clean(filepath.Join(baseDir, path))
-}
-
-func resolvePaths(baseDir string, paths []string) []string {
-	if paths == nil {
-		return nil
-	}
-	resolved := make([]string, 0, len(paths))
-	for _, path := range paths {
-		resolved = append(resolved, resolvePath(baseDir, path))
-	}
-	return resolved
 }
 
 func resolveAPIKey(value string) (string, error) {

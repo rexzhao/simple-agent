@@ -418,20 +418,6 @@ models:
 	assertErrorContains(t, err, "request_timeout must be a positive duration")
 }
 
-func TestLoadRejectsNegativeProviderMaxConcurrentRequests(t *testing.T) {
-	dir := writeConfigFixture(t)
-	writeFile(t, filepath.Join(dir, "providers", "negative-concurrency.yaml"), `name: negative-concurrency
-base_url: http://localhost:8080/v1
-max_concurrent_requests: -1
-
-models:
-  default:
-    id: model-default
-`)
-
-	_, err := Load(rootConfigPath(dir))
-	assertErrorContains(t, err, "max_concurrent_requests must not be negative")
-}
 
 func TestLoadRejectsInvalidProviderProxyURLs(t *testing.T) {
 	tests := []struct {
@@ -511,9 +497,6 @@ func TestResolveModelExplicitProviderModel(t *testing.T) {
 	}
 	if got.Provider.RequestTimeout != "45s" {
 		t.Fatalf("Provider.RequestTimeout = %q, want 45s", got.Provider.RequestTimeout)
-	}
-	if got.Provider.MaxConcurrentRequests != 5 {
-		t.Fatalf("Provider.MaxConcurrentRequests = %d, want 5", got.Provider.MaxConcurrentRequests)
 	}
 	if got.Provider.HTTPProxy != "http://127.0.0.1:7890" || got.Provider.HTTPSProxy != "https://proxy.example.test:8443" {
 		t.Fatalf("Provider proxies = %q/%q, want configured HTTP/HTTPS proxies", got.Provider.HTTPProxy, got.Provider.HTTPSProxy)
@@ -815,7 +798,6 @@ logging:
 base_url: https://tc-paperhub.diezhi.net/v1
 api_key: $PAPERHUB_API_KEY
 request_timeout: 45s
-max_concurrent_requests: 5
 http_proxy: http://127.0.0.1:7890
 https_proxy: https://proxy.example.test:8443
 

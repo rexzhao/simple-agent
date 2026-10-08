@@ -1,8 +1,8 @@
 # simple-agent
 
 `sai` is a local agent application packaged as a single Go executable with a
-command-line interface. Type a message, the agent answers; it can read,
-and edit files in your project — all through its single tool: a Bash shell.
+command-line interface. Type a message, the agent answers; it can read and
+edit files in your project — all through its single tool: a Bash shell.
 
 While a run streams, the reply renders character by character as the model
 generates it (reasoning lines marked with `·`); a dot spinner marks only
@@ -63,9 +63,7 @@ credentials, and sessions. Resolution order:
 
 1. the `--server-root` flag
 2. the `SAI_SERVER_ROOT` environment variable
-3. a `.<app>` directory in the current working directory (when it contains
-   `sai.yaml`), so a checkout can carry its own configuration
-4. the OS user configuration directory under `<app>` (the default)
+3. the OS user configuration directory under `<app>` (the default)
 
 `<app>` derives from the executable's base name: everything before the first
 `-`. `sai.exe` and `sai-windows-amd64.exe` both use `sai`; renaming the
@@ -79,7 +77,7 @@ default_model: glm-5.2
 provider_dir: providers
 
 agent:
-  max_turns: 8
+  max_iterations: 8
 ```
 
 Provider profile:

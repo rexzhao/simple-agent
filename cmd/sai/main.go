@@ -261,9 +261,9 @@ type cliApp struct {
 	// liveMu guards liveShown and parked: assistant messages rendered
 	// live by the event drain (their committed records must not print
 	// twice) and records parked pending that decision.
-	liveMu   sync.Mutex
+	liveMu    sync.Mutex
 	liveShown map[string]struct{}
-	parked   []storage.Record
+	parked    []storage.Record
 }
 
 // dispatch handles one input line. It returns true when the REPL should

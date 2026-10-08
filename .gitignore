@@ -8,5 +8,5 @@
 __pycache__/
 /.mcp_cli_discovery.py
 /.pi/
-/sai.exe
+*.exe
 /sai
