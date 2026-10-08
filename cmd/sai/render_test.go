@@ -27,6 +27,11 @@ func TestFormatRecordCommonHeaderAndBodies(t *testing.T) {
 			want:   []string{header("session") + " paperhub/glm-5 · F:\\work"},
 		},
 		{
+			name:   "session header shows provider alone when model is absent",
+			record: storage.Record{Type: storage.TypeSessionCreated, Time: stamp, Provider: "paperhub"},
+			want:   []string{header("session") + " paperhub"},
+		},
+		{
 			name:   "user input shows only the text",
 			record: storage.Record{Type: storage.TypeUserInput, Time: stamp, RunID: "run-1", ItemID: "u1", Content: "fix the bug"},
 			want:   []string{header("user") + " fix the bug"},
@@ -185,17 +190,24 @@ func TestRenderReasoningTruncation(t *testing.T) {
 	if !strings.Contains(got, "thought-0") {
 		t.Fatalf("reasoning head missing: %q", got)
 	}
-	if !strings.Contains(got, "… +5 more lines") {
+	if !strings.Contains(got, fmt.Sprintf("showing head: %d of %d lines", displayReasoningLines, displayReasoningLines+5)) {
 		t.Fatalf("elision notice missing: %q", got)
 	}
 	if strings.Contains(got, "thought-"+itoa(displayReasoningLines+4)) {
 		t.Fatalf("reasoning tail should be elided: %q", got)
 	}
 
-	// A single huge line trips the byte bound and must not emit broken UTF-8.
+	// A single huge line trips the byte bound: never a nonsensical
+	// "+0 more lines", and both dimensions are reported.
 	huge := strings.Repeat("界", displayReasoningBytes) // 3-byte runes
 	got = renderReasoning(huge)
 	if !utf8Valid(got) {
 		t.Fatal("byte-bound reasoning cut produced invalid UTF-8")
+	}
+	if strings.Contains(got, "+0 more lines") {
+		t.Fatalf("notice lies about the byte cut: %q", got)
+	}
+	if !strings.Contains(got, "showing head: 1 of 1 lines") || !strings.Contains(got, displaySize(len(huge))) {
+		t.Fatalf("byte-bound notice missing its dimensions: %q", got)
 	}
 }

@@ -29,7 +29,9 @@ const (
 	displayReasoningLines = 8
 	displayReasoningBytes = 2 * 1024
 	// displayInlineRunes bounds the single-line body rendered inline on the
-	// header line instead of as an indented block.
+	// header line instead of as an indented block. Counted in runes, not
+	// display width: CJK and emoji render about twice as wide, so wide
+	// content may occupy roughly double the columns.
 	displayInlineRunes = 120
 )
 
@@ -71,9 +73,18 @@ func recordHeader(record storage.Record) string {
 	header := fmt.Sprintf("[%s] %-*s", recordClock(record.Time), recordLabelWidth, label)
 	switch record.Type {
 	case storage.TypeSessionCreated:
+		var identity string
+		switch {
+		case record.Provider != "" && record.Model != "":
+			identity = record.Provider + "/" + record.Model
+		case record.Provider != "":
+			identity = record.Provider
+		case record.Model != "":
+			identity = record.Model
+		}
 		var meta []string
-		if record.Provider != "" && record.Model != "" {
-			meta = append(meta, record.Provider+"/"+record.Model)
+		if identity != "" {
+			meta = append(meta, identity)
 		}
 		if record.CWD != "" {
 			meta = append(meta, record.CWD)
@@ -172,12 +183,12 @@ func truncateResultBody(content string) string {
 		body = "…" + trimToRuneStart(body[len(body)-displayResultBytes:])
 	}
 	return fmt.Sprintf("[… showing tail: %d of %d lines, %s of %s]",
-		len(kept), len(lines), displaySize(len(body)), displaySize(len(content))) + "\n" + body
+		strings.Count(body, "\n")+1, len(lines), displaySize(len(body)), displaySize(len(content))) + "\n" + body
 }
 
-// renderReasoning truncates long reasoning behind a notice of what was
-// elided. Unlike tool results, the head is kept: a reasoning's opening
-// frames the problem it is working through.
+// renderReasoning truncates long reasoning behind a notice reporting what
+// is actually kept. Unlike tool results, the head is kept: a reasoning's
+// opening frames the problem it is working through.
 func renderReasoning(reasoning string) string {
 	lines := strings.Split(reasoning, "\n")
 	if len(lines) <= displayReasoningLines && len(reasoning) <= displayReasoningBytes {
@@ -191,7 +202,8 @@ func renderReasoning(reasoning string) string {
 	if len(body) > displayReasoningBytes {
 		body = trimToRuneEnd(body[:displayReasoningBytes])
 	}
-	return body + fmt.Sprintf("\n[… +%d more lines]", len(lines)-len(kept))
+	return body + fmt.Sprintf("\n[… showing head: %d of %d lines, %s of %s]",
+		strings.Count(body, "\n")+1, len(lines), displaySize(len(body)), displaySize(len(reasoning)))
 }
 
 // prefixLines marks every line of the reasoning so it stays visually

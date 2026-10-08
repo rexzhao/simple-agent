@@ -347,7 +347,11 @@ func (s *Session) streamingSnapshot(itemID string, responseState *model.Response
 		message.ResponseState = responseState
 		return message
 	}
-	return model.Message{ResponseState: responseState}
+	// The fallback keeps an assistant role too: the snapshot is always an
+	// assistant message, even if the slot was cleared mid-stream by a
+	// future feature (compaction, /clear) — a zero role is a provider-side
+	// HTTP 400.
+	return model.Message{Role: model.MessageRoleAssistant, ResponseState: responseState}
 }
 
 // commitAssistantMessage commits the finished message and clears the
