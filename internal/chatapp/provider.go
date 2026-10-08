@@ -8,9 +8,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/rexzhao/simple-agent/internal/codexauth"
 	"github.com/rexzhao/simple-agent/internal/config"
 	"github.com/rexzhao/simple-agent/internal/model"
-	"github.com/rexzhao/simple-agent/internal/codexauth"
 	"github.com/rexzhao/simple-agent/internal/model/anthropic_messages"
 	"github.com/rexzhao/simple-agent/internal/model/httpstream"
 	"github.com/rexzhao/simple-agent/internal/model/openai_chat"

@@ -8,6 +8,7 @@
 package chatapp
 
 import (
+	"context"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -33,19 +34,19 @@ type Options struct {
 
 // App is one running application instance bound to a server root.
 type App struct {
-	cfg            *config.Config
-	resolved       config.ResolvedModel
-	provider       model.Provider
-	developerRole  model.MessageRole
-	parameters     map[string]any
-	outputLimit    int
-	maxTurns       int
-	cwd            string
-	project        string
-	systemPrompt   string
-	toolRegistry *tools.Registry
-	toolSchemas  []model.Tool
-	store *sessionlog.Store
+	cfg           *config.Config
+	resolved      config.ResolvedModel
+	provider      model.Provider
+	developerRole model.MessageRole
+	parameters    map[string]any
+	outputLimit   int
+	maxTurns      int
+	cwd           string
+	project       string
+	systemPrompt  string
+	shell         model.Tool
+	shellExec     namedExecutor
+	store         *sessionlog.Store
 }
 
 // New loads the server-root configuration and prepares the provider, tools,
@@ -94,17 +95,16 @@ func New(options Options) (*App, error) {
 	}
 
 	app := &App{
-		cfg:            cfg,
-		resolved:       resolved,
-		provider:       provider,
-		developerRole:  developerRole,
-		parameters:     parameters,
-		outputLimit:    resolved.OutputLimit,
-		maxTurns:       maxTurns,
-		cwd:            cwd,
-		project:        sessionlog.ProjectID(cwd),
-		toolRegistry: tools.NewRegistry(),
-		store:        store,
+		cfg:           cfg,
+		resolved:      resolved,
+		provider:      provider,
+		developerRole: developerRole,
+		parameters:    parameters,
+		outputLimit:   resolved.OutputLimit,
+		maxTurns:      maxTurns,
+		cwd:           cwd,
+		project:       sessionlog.ProjectID(cwd),
+		store:         store,
 	}
 	if err := app.buildTools(); err != nil {
 		return nil, err
@@ -147,15 +147,26 @@ func (a *App) Project() string { return a.project }
 func (a *App) Config() *config.Config { return a.cfg }
 
 func (a *App) buildTools() error {
-	if err := tools.RegisterShell(a.toolRegistry, a.cwd); err != nil {
+	definition, executor, err := tools.Shell(a.cwd)
+	if err != nil {
 		return fmt.Errorf("register tools: %w", err)
 	}
-	schemas, err := a.toolRegistry.EnabledSchemas([]string{tools.BuiltinShell})
-	if err != nil {
-		return fmt.Errorf("resolve enabled tools: %w", err)
-	}
-	a.toolSchemas = schemas
+	a.shell = definition
+	a.shellExec = namedExecutor{exec: executor}
 	return nil
+}
+
+// namedExecutor adapts the single-tool executor to the agent loop's
+// name-dispatching ToolExecutor interface.
+type namedExecutor struct {
+	exec tools.Executor
+}
+
+func (n namedExecutor) Execute(ctx context.Context, name string, arguments map[string]any) (model.ToolResult, error) {
+	if name != tools.BuiltinShell {
+		return model.ToolResult{}, fmt.Errorf("unknown tool %q", name)
+	}
+	return n.exec.Execute(ctx, arguments)
 }
 
 func (a *App) buildSystemPrompt() (string, error) {

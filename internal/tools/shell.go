@@ -23,21 +23,31 @@ import (
 // BuiltinShell is the shell tool name.
 const BuiltinShell = "shell"
 
-// RegisterShell registers the shell tool rooted at rootDir. Every command
-// runs with rootDir as its working directory; the shell itself is never
-// path confined.
-func RegisterShell(registry *Registry, rootDir string) error {
-	if registry == nil {
-		return fmt.Errorf("registry must not be nil")
-	}
+// Executor executes one tool call. It is the interface the agent loop's
+// ToolExecutor expects.
+type Executor interface {
+	Execute(ctx context.Context, arguments map[string]any) (model.ToolResult, error)
+}
+
+// ExecutorFunc adapts a function to Executor.
+type ExecutorFunc func(ctx context.Context, arguments map[string]any) (model.ToolResult, error)
+
+func (f ExecutorFunc) Execute(ctx context.Context, arguments map[string]any) (model.ToolResult, error) {
+	return f(ctx, arguments)
+}
+
+// Shell returns the shell tool: its provider-facing definition and the
+// executor. Every command runs with rootDir as its working directory; the
+// shell itself is never path confined.
+func Shell(rootDir string) (model.Tool, Executor, error) {
 	if strings.TrimSpace(rootDir) == "" {
-		return fmt.Errorf("rootDir must not be blank")
+		return model.Tool{}, nil, fmt.Errorf("rootDir must not be blank")
 	}
 	root, err := filepath.Abs(rootDir)
 	if err != nil {
-		return fmt.Errorf("resolve rootDir: %w", err)
+		return model.Tool{}, nil, fmt.Errorf("resolve rootDir: %w", err)
 	}
-	return registry.Register(shellDefinition(), newShellExecutor(root))
+	return shellDefinition(), newShellExecutor(root), nil
 }
 
 func shellDefinition() model.Tool {

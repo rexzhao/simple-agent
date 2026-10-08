@@ -50,22 +50,14 @@ func TestAppendAndReopenFold(t *testing.T) {
 	if state.Title != "hello world this is a long first message" {
 		t.Fatalf("title = %q", state.Title)
 	}
-	kinds := make([]string, 0, len(state.Items))
-	for _, item := range state.Items {
-		kinds = append(kinds, item.Kind)
+	if state.Context[1].Content != "final answer" || state.Context[1].ReasoningContent != "thinking" {
+		t.Fatalf("assistant context message = %+v", state.Context[1])
 	}
-	want := []string{ItemKindUser, ItemKindAssistant, ItemKindTool}
-	if strings.Join(kinds, ",") != strings.Join(want, ",") {
-		t.Fatalf("item kinds = %v, want %v", kinds, want)
+	if len(state.Context[1].ToolCalls) != 1 || state.Context[1].ToolCalls[0].Name != "read_file" {
+		t.Fatalf("tool calls not folded: %+v", state.Context[1].ToolCalls)
 	}
-	if state.Items[1].Content != "final answer" || state.Items[1].Reasoning != "thinking" {
-		t.Fatalf("assistant item = %+v", state.Items[1])
-	}
-	if len(state.Items[1].ToolCalls) != 1 || state.Items[1].ToolCalls[0].Name != "read_file" {
-		t.Fatalf("tool calls not folded: %+v", state.Items[1].ToolCalls)
-	}
-	if state.Items[2].ToolCallID != "call-1" || state.Items[2].Status != ToolStatusCompleted {
-		t.Fatalf("tool item not folded: %+v", state.Items[2])
+	if state.Context[2].ToolCallID != "call-1" {
+		t.Fatalf("tool context message = %+v", state.Context[2])
 	}
 
 	// The model context must mirror the wire order.
@@ -152,13 +144,9 @@ func TestRunFailedCreatesErrorItem(t *testing.T) {
 	appendRecord(t, session, Record{Type: TypeUserInput, RunID: "run-9", Content: "hi"})
 	appendRecord(t, session, Record{Type: TypeRunFailed, RunID: "run-9", Error: "provider exploded"})
 	state := session.Snapshot()
-	last := state.Items[len(state.Items)-1]
-	if last.Kind != ItemKindError || last.Content != "provider exploded" {
-		t.Fatalf("error item = %+v", last)
-	}
 	// A failure is context-free: only the unanswered user message.
-	if len(state.Context) != 1 {
-		t.Fatalf("context = %d messages, want 1", len(state.Context))
+	if len(state.Context) != 1 || state.Context[0].Content != "hi" {
+		t.Fatalf("context after failure = %+v", state.Context)
 	}
 }
 
@@ -191,8 +179,8 @@ func TestUnknownRecordTypeIgnoredByFold(t *testing.T) {
 	defer session.Close()
 	appendRecord(t, session, Record{Type: "future.event", Content: "irrelevant"})
 	state := session.Snapshot()
-	if len(state.Items) != 0 {
-		t.Fatalf("unknown type changed the fold: %+v", state.Items)
+	if len(state.Context) != 0 {
+		t.Fatalf("unknown type changed the fold: %+v", state.Context)
 	}
 	if state.LastSeq != 2 {
 		t.Fatalf("last seq = %d, want 2", state.LastSeq)
@@ -250,9 +238,6 @@ func TestLegacyAssistantReadyStillFolds(t *testing.T) {
 	appendRecord(t, session, Record{Type: TypeUserInput, RunID: "r", Content: "q"})
 	appendRecord(t, session, Record{Type: TypeAssistantReady, RunID: "r", ItemID: "a-1", Content: "old spelling"})
 	state := session.Snapshot()
-	if len(state.Items) != 2 || state.Items[1].Content != "old spelling" {
-		t.Fatalf("legacy assistant item = %+v", state.Items)
-	}
 	if len(state.Context) != 2 || state.Context[1].Content != "old spelling" {
 		t.Fatalf("legacy context = %+v", state.Context)
 	}

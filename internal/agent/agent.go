@@ -50,22 +50,9 @@ var DefaultAssistantCheckpointPolicy = AssistantCheckpointPolicy{
 	MinNewRunes: 64,
 }
 
-type TurnResult struct {
-	Messages []model.Message
-}
-
 func Stream(ctx context.Context, request model.Request, options Options) (<-chan model.Event, error) {
-	events, _, err := stream(ctx, request, options, false)
-	return events, err
-}
-
-func StreamWithResult(ctx context.Context, request model.Request, options Options) (<-chan model.Event, <-chan TurnResult, error) {
-	return stream(ctx, request, options, true)
-}
-
-func stream(ctx context.Context, request model.Request, options Options, includeResult bool) (<-chan model.Event, <-chan TurnResult, error) {
 	if options.Provider == nil {
-		return nil, nil, fmt.Errorf("agent provider is required")
+		return nil, fmt.Errorf("agent provider is required")
 	}
 
 	maxTurns := options.MaxTurns
@@ -74,19 +61,12 @@ func stream(ctx context.Context, request model.Request, options Options, include
 	}
 
 	events := make(chan model.Event)
-	var results chan TurnResult
-	if includeResult {
-		results = make(chan TurnResult, 1)
-	}
-	go run(ctx, request, options, maxTurns, events, results)
-	return events, results, nil
+	go run(ctx, request, options, maxTurns, events)
+	return events, nil
 }
 
-func run(ctx context.Context, request model.Request, options Options, maxTurns int, events chan<- model.Event, results chan<- TurnResult) {
+func run(ctx context.Context, request model.Request, options Options, maxTurns int, events chan<- model.Event) {
 	defer close(events)
-	if results != nil {
-		defer close(results)
-	}
 
 	turnID := strings.TrimSpace(options.TurnID)
 	if options.Publisher != nil && turnID == "" {
@@ -103,7 +83,7 @@ func run(ctx context.Context, request model.Request, options Options, maxTurns i
 
 		assistantItemID := newAssistantItemID()
 		events <- model.AssistantMessageStartedEvent{ItemID: assistantItemID, AgentIteration: iteration}
-		assistantContent, reasoningContent, toolCalls, responseState, messageRevision, stopped := streamModelTurn(ctx, options.Provider, request, events, assistantItemID, iteration)
+		assistantContent, reasoningContent, toolCalls, responseState, stopped := streamModelTurn(ctx, options.Provider, request, events, assistantItemID, iteration)
 		if stopped {
 			return
 		}
@@ -116,21 +96,20 @@ func run(ctx context.Context, request model.Request, options Options, maxTurns i
 			ResponseState:    responseState,
 		}
 		if len(toolCalls) == 0 && strings.TrimSpace(assistantContent) == "" {
-			events <- model.AssistantMessageFailedEvent{ItemID: assistantItemID, AgentIteration: iteration, Revision: messageRevision + 1, Message: assistantMessage}
+			events <- model.AssistantMessageFailedEvent{ItemID: assistantItemID, AgentIteration: iteration, Message: assistantMessage}
 			events <- model.ErrorEvent{Err: fmt.Errorf("agent returned empty final response")}
 			return
 		}
 		if options.Publisher != nil {
 			if err := options.Publisher.Publish(eventbus.AssistantReady{TurnID: turnID, AgentIteration: iteration, ItemID: assistantItemID, Message: assistantMessage}); err != nil {
-				events <- model.AssistantMessageFailedEvent{ItemID: assistantItemID, AgentIteration: iteration, Revision: messageRevision + 1, Message: assistantMessage}
+				events <- model.AssistantMessageFailedEvent{ItemID: assistantItemID, AgentIteration: iteration, Message: assistantMessage}
 				events <- model.ErrorEvent{Err: err, Message: "persist assistant"}
 				return
 			}
 		}
-		events <- model.AssistantMessageCompletedEvent{ItemID: assistantItemID, AgentIteration: iteration, Revision: messageRevision + 1, Message: assistantMessage}
+		events <- model.AssistantMessageCompletedEvent{ItemID: assistantItemID, AgentIteration: iteration, Message: assistantMessage}
 		messages = append(messages, assistantMessage)
 		if len(toolCalls) == 0 {
-			sendResult(results, messages)
 			return
 		}
 
@@ -168,33 +147,6 @@ func publishDurable(out chan<- model.Event, publisher eventbus.Publisher, event 
 	return true
 }
 
-func sendResult(results chan<- TurnResult, messages []model.Message) {
-	if results == nil {
-		return
-	}
-	results <- TurnResult{Messages: copyMessages(messages)}
-}
-
-func copyMessages(messages []model.Message) []model.Message {
-	copied := append([]model.Message(nil), messages...)
-	for i := range copied {
-		copied[i].ContentBlocks = append([]model.InputContentBlock(nil), messages[i].ContentBlocks...)
-		for blockIndex := range copied[i].ContentBlocks {
-			if copied[i].ContentBlocks[blockIndex].ImageBlob != nil {
-				ref := *copied[i].ContentBlocks[blockIndex].ImageBlob
-				copied[i].ContentBlocks[blockIndex].ImageBlob = &ref
-			}
-		}
-		copied[i].ToolCalls = append([]model.ToolCall(nil), messages[i].ToolCalls...)
-		copied[i].ProviderItems = copyProviderItems(messages[i].ProviderItems)
-		if messages[i].ResponseState != nil {
-			state := copyResponseState(*messages[i].ResponseState)
-			copied[i].ResponseState = &state
-		}
-	}
-	return copied
-}
-
 func newAssistantItemID() string {
 	var raw [12]byte
 	if _, err := cryptorand.Read(raw[:]); err == nil {
@@ -206,58 +158,28 @@ func newAssistantItemID() string {
 	return fmt.Sprintf("assistant-%d-%d", time.Now().UnixNano(), atomic.AddUint64(&assistantFallbackID, 1))
 }
 
-func streamModelTurn(ctx context.Context, provider model.Provider, request model.Request, out chan<- model.Event, assistantItemID string, agentIteration int) (string, string, []model.ToolCall, *model.ResponseState, uint64, bool) {
+func streamModelTurn(ctx context.Context, provider model.Provider, request model.Request, out chan<- model.Event, assistantItemID string, agentIteration int) (string, string, []model.ToolCall, *model.ResponseState, bool) {
 	var assistantContent strings.Builder
 	var assistantRunes int
 	var assistantHasNonWhitespace bool
 	var reasoningContent strings.Builder
 	var toolCalls []model.ToolCall
 	var responseState *model.ResponseState
-	var messageRevision uint64
-	var lastPublishedBytes int
-	var lastPublishedAt time.Time
-	const snapshotPublishBytes = 16 * 1024
-	const snapshotPublishInterval = 50 * time.Millisecond
 	messageSnapshot := func() model.Message {
 		return model.Message{
 			Role: model.MessageRoleAssistant, Content: assistantContent.String(), ReasoningContent: reasoningContent.String(),
 			ToolCalls: append([]model.ToolCall(nil), toolCalls...), ResponseState: responseState,
 		}
 	}
-	messageBytes := func() int {
-		total := assistantContent.Len() + reasoningContent.Len()
-		for _, call := range toolCalls {
-			total += len(call.ID) + len(call.Name) + len(call.Arguments)
-		}
-		return total
-	}
-	publishMessageUpdate := func(force bool) {
-		now := time.Now()
-		currentBytes := messageBytes()
-		if !force && currentBytes == lastPublishedBytes {
-			return
-		}
-		if !force && messageRevision > 0 && currentBytes-lastPublishedBytes < snapshotPublishBytes && now.Sub(lastPublishedAt) < snapshotPublishInterval {
-			return
-		}
-		messageRevision++
-		out <- model.AssistantMessageUpdatedEvent{
-			ItemID: assistantItemID, AgentIteration: agentIteration, Revision: messageRevision,
-			Message: messageSnapshot(),
-		}
-		lastPublishedBytes = currentBytes
-		lastPublishedAt = now
-	}
 	publishMessageFailure := func() {
-		messageRevision++
-		out <- model.AssistantMessageFailedEvent{ItemID: assistantItemID, AgentIteration: agentIteration, Revision: messageRevision, Message: messageSnapshot()}
+		out <- model.AssistantMessageFailedEvent{ItemID: assistantItemID, AgentIteration: agentIteration, Message: messageSnapshot()}
 	}
 	const maxAttempts = 5
 	var idleRetried bool
-	failAfterPartialOutput := func(err error, message string) (string, string, []model.ToolCall, *model.ResponseState, uint64, bool) {
+	failAfterPartialOutput := func(err error, message string) (string, string, []model.ToolCall, *model.ResponseState, bool) {
 		publishMessageFailure()
 		out <- model.ErrorEvent{Err: err, Message: message}
-		return assistantContent.String(), reasoningContent.String(), nil, nil, messageRevision, true
+		return assistantContent.String(), reasoningContent.String(), nil, nil, true
 	}
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		stream, err := provider.Stream(ctx, request)
@@ -291,17 +213,14 @@ func streamModelTurn(ctx context.Context, provider model.Provider, request model
 				assistantContent.WriteString(event.Text)
 				assistantRunes += utf8.RuneCountInString(event.Text)
 				assistantHasNonWhitespace = assistantHasNonWhitespace || strings.TrimSpace(event.Text) != ""
-				publishMessageUpdate(false)
 			case model.ReasoningDeltaEvent:
 				madeProgress = true
 				reasoningContent.WriteString(event.Text)
-				publishMessageUpdate(false)
 			case model.ToolCallDeltaEvent:
 				madeProgress = true
 			case model.ToolCallDoneEvent:
 				madeProgress = true
 				toolCalls = append(toolCalls, event.ToolCall)
-				publishMessageUpdate(true)
 			case model.MessageDoneEvent, model.UsageEvent:
 				madeProgress = true
 			case model.ResponseStateEvent:
@@ -338,7 +257,7 @@ func streamModelTurn(ctx context.Context, provider model.Provider, request model
 		if err := ctx.Err(); err != nil {
 			return failAfterPartialOutput(err, "stream model")
 		}
-		return assistantContent.String(), reasoningContent.String(), toolCalls, responseState, messageRevision, false
+		return assistantContent.String(), reasoningContent.String(), toolCalls, responseState, false
 	}
 	panic("unreachable")
 }

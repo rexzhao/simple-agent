@@ -10,18 +10,6 @@ type Provider interface {
 	Stream(ctx context.Context, request Request) (<-chan Event, error)
 }
 
-// CompactionProvider is implemented by providers that expose a stateless
-// compaction endpoint. The returned items are provider-owned and must be
-// persisted and replayed without interpreting their payload.
-type CompactionProvider interface {
-	Compact(ctx context.Context, request Request) (CompactionResult, error)
-}
-
-type CompactionResult struct {
-	Items []ProviderItem
-	Usage Usage
-}
-
 type Request struct {
 	Model         string
 	Messages      []Message
@@ -122,7 +110,6 @@ type EventType string
 const (
 	EventTypeAgentIterationStarted     EventType = "agent_iteration_started"
 	EventTypeAssistantMessageStarted   EventType = "assistant_message_started"
-	EventTypeAssistantMessageUpdated   EventType = "assistant_message_updated"
 	EventTypeAssistantMessageCompleted EventType = "assistant_message_completed"
 	EventTypeAssistantMessageFailed    EventType = "assistant_message_failed"
 	EventTypeTextDelta                 EventType = "text_delta"
@@ -159,27 +146,12 @@ func (AssistantMessageStartedEvent) Type() EventType {
 	return EventTypeAssistantMessageStarted
 }
 
-// AssistantMessageUpdatedEvent carries the complete accumulated message at a
-// monotonic revision. Complete snapshots make delivery idempotent: a later
-// update repairs a missed earlier frame without replaying provider deltas.
-type AssistantMessageUpdatedEvent struct {
-	ItemID         string
-	AgentIteration int
-	Revision       uint64
-	Message        Message
-}
-
-func (AssistantMessageUpdatedEvent) Type() EventType {
-	return EventTypeAssistantMessageUpdated
-}
-
 // AssistantMessageCompletedEvent is emitted only after the final durable
 // AssistantReady projection succeeds, so the public lifecycle cannot claim a
 // completed message that failed to commit.
 type AssistantMessageCompletedEvent struct {
 	ItemID         string
 	AgentIteration int
-	Revision       uint64
 	Message        Message
 }
 
@@ -192,7 +164,6 @@ func (AssistantMessageCompletedEvent) Type() EventType {
 type AssistantMessageFailedEvent struct {
 	ItemID         string
 	AgentIteration int
-	Revision       uint64
 	Message        Message
 }
 

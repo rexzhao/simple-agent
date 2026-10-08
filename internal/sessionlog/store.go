@@ -192,8 +192,8 @@ func (s *Store) List(projectID string) ([]Summary, error) {
 			fold(state, record)
 		}
 		messages := 0
-		for _, item := range state.Items {
-			if item.Kind == ItemKindUser || item.Kind == ItemKindAssistant {
+		for _, message := range state.Context {
+			if message.Role == model.MessageRoleUser || message.Role == model.MessageRoleAssistant {
 				messages++
 			}
 		}
@@ -381,10 +381,6 @@ func (s *Session) currentRun() string {
 
 func copyState(state *State) State {
 	copied := *state
-	copied.Items = append([]Item(nil), state.Items...)
-	for i := range copied.Items {
-		copied.Items[i].ToolCalls = append([]model.ToolCall(nil), state.Items[i].ToolCalls...)
-	}
 	copied.Context = append([]model.Message(nil), state.Context...)
 	for i := range copied.Context {
 		copied.Context[i].ToolCalls = append([]model.ToolCall(nil), state.Context[i].ToolCalls...)

@@ -137,7 +137,7 @@ func (s *Session) Close() error {
 func (s *Session) pump(ctx context.Context, runID string, request model.Request, events chan model.Event) {
 	stream, err := agent.Stream(ctx, request, agent.Options{
 		Provider:     s.app.provider,
-		ToolExecutor: s.app.toolRegistry,
+		ToolExecutor: s.app.shellExec,
 		MaxTurns:     s.app.maxTurns,
 		TurnID:       newID("turn"),
 		Publisher:    s.pub,
@@ -180,7 +180,7 @@ func (a *App) request(context []model.Message) model.Request {
 	return model.Request{
 		Model:         a.resolved.ModelID,
 		Messages:      messages,
-		Tools:         a.toolSchemas,
+		Tools:         []model.Tool{a.shell},
 		Parameters:    a.parameters,
 		DeveloperRole: a.developerRole,
 		MaxTokens:     a.outputLimit,
@@ -265,7 +265,7 @@ func sanitizeContext(context []model.Message) []model.Message {
 			for i, call := range pending {
 				if call.ID == message.ToolCallID {
 					pending = append(pending[:i], pending[i+1:]...)
-				break
+					break
 				}
 			}
 			result = append(result, message)

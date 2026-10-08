@@ -3,7 +3,6 @@ package openairesponses
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -52,7 +51,6 @@ type Provider struct {
 }
 
 var _ model.Provider = (*Provider)(nil)
-var _ model.CompactionProvider = (*Provider)(nil)
 
 func NewProvider(config ProviderConfig) (*Provider, error) {
 	baseURL := strings.TrimRight(strings.TrimSpace(config.BaseURL), "/")
@@ -75,6 +73,14 @@ func NewProvider(config ProviderConfig) (*Provider, error) {
 		httpOptions:         config.HTTPOptions,
 		recordRequest:       config.RecordRequest,
 	}, nil
+}
+
+func shouldRetryWithoutContinuation(err error, metadata providerRequestMetadata) bool {
+	if !metadata.UsedContinuation || err == nil {
+		return false
+	}
+	var statusErr *httpstream.StatusError
+	return errors.As(err, &statusErr) && statusErr.StatusCode == http.StatusBadRequest && strings.Contains(strings.ToLower(statusErr.Body), "previous_response_id")
 }
 
 func (p *Provider) Stream(ctx context.Context, request model.Request) (<-chan model.Event, error) {
@@ -122,79 +128,6 @@ func (p *Provider) Stream(ctx context.Context, request model.Request) (<-chan mo
 		})
 	}()
 	return events, nil
-}
-
-func (p *Provider) Compact(ctx context.Context, request model.Request) (model.CompactionResult, error) {
-	token, err := p.authToken(ctx)
-	if err != nil {
-		return model.CompactionResult{}, err
-	}
-	body, metadata, err := buildCompactionRequestBody(request, requestBodyOptions{omitMaxOutputTokens: p.omitMaxOutputTokens, origin: p.baseURL})
-	if err != nil {
-		return model.CompactionResult{}, fmt.Errorf("build OpenAI Responses compact request body: %w", err)
-	}
-	// The compact endpoint has no session-level retry loop above it, so allow
-	// one retry for transient failures. Status codes are not retried by the
-	// transport layer (MaxRetryAttempts is 1 in production wiring); each
-	// attempt may still perform the transport's quick timeout retry.
-	const maxCompactAttempts = 2
-	var response *http.Response
-	for attempt := 1; attempt <= maxCompactAttempts; attempt++ {
-		response, err = p.doRequestTo(ctx, token, body, metadata, "/responses/compact")
-		if err == nil {
-			break
-		}
-		if attempt < maxCompactAttempts && ctx.Err() == nil && model.IsRetryableProviderError(err) {
-			if waitErr := waitForCompactRetry(ctx, compactRetryBackoff); waitErr != nil {
-				return model.CompactionResult{}, waitErr
-			}
-			continue
-		}
-		if _, ok := err.(*httpstream.StatusError); ok {
-			return model.CompactionResult{}, fmt.Errorf("OpenAI Responses compact request failed: %w", err)
-		}
-		return model.CompactionResult{}, fmt.Errorf("send OpenAI Responses compact request: %w", err)
-	}
-	defer response.Body.Close()
-
-	var compacted struct {
-		Object string            `json:"object"`
-		Output []json.RawMessage `json:"output"`
-		Usage  *responseUsage    `json:"usage"`
-	}
-	if err := json.NewDecoder(response.Body).Decode(&compacted); err != nil {
-		return model.CompactionResult{}, fmt.Errorf("decode OpenAI Responses compact response: %w", err)
-	}
-	if compacted.Object != "" && compacted.Object != "response.compaction" {
-		return model.CompactionResult{}, fmt.Errorf("OpenAI Responses compact response object is %q", compacted.Object)
-	}
-	if len(compacted.Output) == 0 {
-		return model.CompactionResult{}, fmt.Errorf("OpenAI Responses compact response output is empty")
-	}
-
-	result := model.CompactionResult{Items: make([]model.ProviderItem, 0, len(compacted.Output))}
-	hasCompaction := false
-	for index, raw := range compacted.Output {
-		var item struct {
-			Type string `json:"type"`
-		}
-		if err := json.Unmarshal(raw, &item); err != nil || strings.TrimSpace(item.Type) == "" {
-			return model.CompactionResult{}, fmt.Errorf("OpenAI Responses compact output item %d is invalid", index)
-		}
-		hasCompaction = hasCompaction || item.Type == "compaction" || item.Type == "compaction_summary"
-		result.Items = append(result.Items, model.ProviderItem{
-			Origin: p.baseURL,
-			Model:  request.Model,
-			Data:   append(json.RawMessage(nil), raw...),
-		})
-	}
-	if !hasCompaction {
-		return model.CompactionResult{}, fmt.Errorf("OpenAI Responses compact response has no compaction item")
-	}
-	if compacted.Usage != nil {
-		result.Usage = usageFromResponse(compacted.Usage)
-	}
-	return result, nil
 }
 
 func (p *Provider) doRequest(ctx context.Context, token AccessToken, body []byte, metadata providerRequestMetadata) (*http.Response, error) {
@@ -268,28 +201,6 @@ func (p *Provider) captureTurnState(value string) {
 	if p.turnState == "" {
 		p.turnState = value
 	}
-}
-
-// compactRetryBackoff is a var so tests can shrink the wait.
-var compactRetryBackoff = time.Second
-
-func waitForCompactRetry(ctx context.Context, delay time.Duration) error {
-	timer := time.NewTimer(delay)
-	defer timer.Stop()
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-timer.C:
-		return nil
-	}
-}
-
-func shouldRetryWithoutContinuation(err error, metadata providerRequestMetadata) bool {
-	if !metadata.UsedContinuation || err == nil {
-		return false
-	}
-	var statusErr *httpstream.StatusError
-	return errors.As(err, &statusErr) && statusErr.StatusCode == http.StatusBadRequest && strings.Contains(strings.ToLower(statusErr.Body), "previous_response_id")
 }
 
 func (p *Provider) authToken(ctx context.Context) (AccessToken, error) {

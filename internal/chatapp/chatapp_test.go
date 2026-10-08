@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"github.com/rexzhao/simple-agent/internal/model"
-	"github.com/rexzhao/simple-agent/internal/sessionlog"
 )
 
 // scriptedProvider plays a fixed sequence of provider responses across the
@@ -105,11 +104,11 @@ func TestSendRunSettlesAndPersists(t *testing.T) {
 	waitForSettle(t, session)
 
 	state := session.Snapshot()
-	if len(state.Items) != 2 {
-		t.Fatalf("items = %d, want 2 (user + assistant)", len(state.Items))
+	if len(state.Context) != 2 {
+		t.Fatalf("context = %d messages, want 2 (user + assistant)", len(state.Context))
 	}
-	if state.Items[1].Content != "hello there" {
-		t.Fatalf("assistant item = %+v", state.Items[1])
+	if state.Context[1].Content != "hello there" {
+		t.Fatalf("assistant message = %+v", state.Context[1])
 	}
 	if len(state.Context) != 2 {
 		t.Fatalf("context = %d messages, want 2", len(state.Context))
@@ -142,13 +141,13 @@ func TestToolRoundTripPersistsContext(t *testing.T) {
 	waitForSettle(t, session)
 
 	state := session.Snapshot()
-	kinds := make([]string, 0, len(state.Items))
-	for _, item := range state.Items {
-		kinds = append(kinds, item.Kind)
+	roles := make([]string, 0, len(state.Context))
+	for _, message := range state.Context {
+		roles = append(roles, string(message.Role))
 	}
 	want := "user,assistant,tool,assistant"
-	if strings.Join(kinds, ",") != want {
-		t.Fatalf("item kinds = %v, want %v", kinds, strings.Split(want, ","))
+	if strings.Join(roles, ",") != want {
+		t.Fatalf("context roles = %v, want %v", roles, strings.Split(want, ","))
 	}
 
 	// The second provider request must carry the tool call and its result in
@@ -157,14 +156,14 @@ func TestToolRoundTripPersistsContext(t *testing.T) {
 		t.Fatalf("provider calls = %d, want 2", len(scripted.requests))
 	}
 	second := scripted.requests[1].Messages
-	roles := make([]string, 0, len(second))
+	secondRoles := make([]string, 0, len(second))
 	for _, message := range second {
-		roles = append(roles, string(message.Role))
+		secondRoles = append(secondRoles, string(message.Role))
 	}
 	// system, user, assistant, tool, assistant(from iteration 1's final? no—
 	// iteration 2 request has: system, user, assistant(tool calls), tool
-	if strings.Join(roles, ",") != "system,user,assistant,tool" {
-		t.Fatalf("second request roles = %v", roles)
+	if strings.Join(secondRoles, ",") != "system,user,assistant,tool" {
+		t.Fatalf("second request roles = %v", secondRoles)
 	}
 	if second[2].ToolCalls[0].ID != "call-1" || second[3].ToolCallID != "call-1" {
 		t.Fatalf("tool exchange not in context: %+v", second[2:])
@@ -234,12 +233,9 @@ func TestStopInterruptsRun(t *testing.T) {
 
 	state := session.Snapshot()
 	// An interrupted run needs no record: the user input simply stays
-	// unanswered, and no failure item appears.
-	if len(state.Items) != 1 || state.Items[0].Kind != sessionlog.ItemKindUser {
-		t.Fatalf("interrupted items = %+v", state.Items)
-	}
-	if len(state.Context) != 1 {
-		t.Fatalf("interrupted context = %d messages, want 1", len(state.Context))
+	// unanswered, with nothing after it.
+	if len(state.Context) != 1 || state.Context[0].Role != model.MessageRoleUser {
+		t.Fatalf("interrupted context = %+v", state.Context)
 	}
 	session.Close()
 }
@@ -352,11 +348,9 @@ func TestFailedRunRecordsFailure(t *testing.T) {
 	waitForSettle(t, session)
 
 	state := session.Snapshot()
-	last := state.Items[len(state.Items)-1]
-	if last.Kind != sessionlog.ItemKindError || last.Content == "" {
-		t.Fatalf("failure item = %+v", last)
-	}
-	// The failure stays out of the model context.
+	// The failure stays out of the model context: the unanswered user input
+	// is all that remains. The error itself is visible in the record stream
+	// (run.failed) which the CLI prints.
 	if len(state.Context) != 1 {
 		t.Fatalf("context = %d messages, want 1", len(state.Context))
 	}
