@@ -224,7 +224,9 @@ func readRecords(path string) ([]storage.Record, error) {
 // maxTornTailBytes is the largest discard a crash mid-append can produce:
 // one buffered record just above the frame limit. Recovering more than
 // this means the file was damaged by something other than a torn append.
-// It is a variable so tests can lower the threshold.
+// It is a variable so tests can lower the threshold; that seam (and the
+// stderr redirect in the tests) requires this package's tests to stay
+// non-parallel.
 var maxTornTailBytes int64 = 2 * storage.MaxRecordBytes
 
 func dirOf(path string) string {

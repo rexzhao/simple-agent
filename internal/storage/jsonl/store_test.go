@@ -236,7 +236,9 @@ func TestRecoverDiscardWarningNamesLastValidItem(t *testing.T) {
 }
 
 // captureStderr runs fn with os.Stderr redirected to a temp file and
-// returns what was written.
+// returns what was written. The redirect (like the maxTornTailBytes
+// variable) is a package-global seam: this package's tests must not run
+// in parallel while it exists.
 func captureStderr(t *testing.T, fn func()) string {
 	t.Helper()
 	tmp, err := os.CreateTemp(t.TempDir(), "stderr")
