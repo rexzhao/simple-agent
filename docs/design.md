@@ -215,6 +215,11 @@ session    会话：一个 log.jsonl
 | 重连 | Snapshot 一次 + 继续事件流 |
 | 落盘 | 对 UI 只是终态事件的等价副本 |
 
+CLI 的在场渲染：delta 逐字写终端（reasoning 带 `·` 行标记），assistant
+消息的身份在 started 事件时就已标记，落盘记录按 ItemID 过滤不重复打印
+（记录流与事件流分属两个 channel，无法证明顺序时的克录记录先暂存，
+事件排干后统一裁决）。spinner 只标记静默阶段（等首 token、工具执行中）。
+
 WebUI 将来的桥只做一件事：把事件流按序转发（WebSocket/SSE），UI 端按
 ItemID upsert、按 RunID 分组。CLI 现在直接消费同一事件流，零额外成本。
 

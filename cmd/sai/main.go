@@ -20,7 +20,6 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/rexzhao/simple-agent/internal/agent"
@@ -240,12 +239,31 @@ func (p *spinnerPrinter) line(line string) {
 	fmt.Println(line)
 }
 
+// write prints streaming text without a trailing newline, clearing the
+// spinner first.
+func (p *spinnerPrinter) write(text string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.shown {
+		fmt.Fprint(os.Stderr, "\r  \r")
+		p.shown = false
+	}
+	fmt.Print(text)
+}
+
 // cliApp holds the active session.
 type cliApp struct {
 	agent   *agent.Agent
 	session *agent.Session
 	printer *spinnerPrinter
 	unwatch func()
+
+	// liveMu guards liveShown and parked: assistant messages rendered
+	// live by the event drain (their committed records must not print
+	// twice) and records parked pending that decision.
+	liveMu   sync.Mutex
+	liveShown map[string]struct{}
+	parked   []storage.Record
 }
 
 // dispatch handles one input line. It returns true when the REPL should
@@ -278,50 +296,105 @@ func (c *cliApp) dispatch(text string) bool {
 	return false
 }
 
-// send runs one agent turn: records print as they are committed, and the
-// spinner shows only while the model streams.
+// send runs one agent turn. The reply streams character by character via
+// the live writer; the dot spinner marks only the quiet phases (waiting
+// for the first token, running tools). Records print as they are
+// committed, except assistant messages already rendered live.
 func (c *cliApp) send(text string) error {
 	if err := c.session.Send(text); err != nil {
 		return err
 	}
 
-	// Drain the run's transient events to know when the model streams. The
-	// assistant message window (started → completed/failed) is exactly the
-	// streaming window; waiting for the first token and running tools are
-	// silent by design.
-	streaming := &atomic.Bool{}
+	// The drain goroutine renders the run's transient events; each
+	// message's start event marks its ItemID before the record can commit,
+	// so the watcher's record print is filtered by identity.
+	live := &liveWriter{printer: c.printer}
 	events := c.session.Events()
 	drained := make(chan struct{})
 	go func() {
 		defer close(drained)
 		for event := range events {
-			switch event.(type) {
-			case model.AssistantMessageStartedEvent:
-				streaming.Store(true)
-			case model.AssistantMessageCompletedEvent, model.AssistantMessageFailedEvent:
-				streaming.Store(false)
+			if started, ok := event.(model.AssistantMessageStartedEvent); ok {
+				c.markLiveShown(started.ItemID)
 			}
+			live.handle(event)
 		}
+		live.settle()
 	}()
 
 	frame := 0
 	for c.session.Running() {
 		time.Sleep(spinnerInterval)
-		if streaming.Load() {
+		if live.inMessage.Load() && live.sawOutput.Load() {
+			// Text is flowing: the output itself is the progress.
+			c.printer.clear()
+		} else {
 			c.printer.frame(spinnerFrames[frame%len(spinnerFrames)])
 			frame++
-		} else {
-			c.printer.clear()
 		}
 	}
 	c.printer.clear()
 	<-drained
+	// The skip set is final now: any assistant record parked mid-run
+	// (its start event not yet processed when the record arrived) prints
+	// here unless it was live-rendered after all.
+	c.reconcileParked()
 	return nil
 }
 
+// markLiveShown records an assistant message the live writer will
+// render; its committed record would duplicate it.
+func (c *cliApp) markLiveShown(itemID string) {
+	c.liveMu.Lock()
+	if c.liveShown == nil {
+		c.liveShown = make(map[string]struct{})
+	}
+	c.liveShown[itemID] = struct{}{}
+	c.liveMu.Unlock()
+}
+
+// liveShownHas reports whether the item was marked, consuming the mark.
+func (c *cliApp) liveShownHas(itemID string) bool {
+	c.liveMu.Lock()
+	defer c.liveMu.Unlock()
+	_, shown := c.liveShown[itemID]
+	delete(c.liveShown, itemID)
+	return shown
+}
+
+// reconcileParked prints assistant records that were parked mid-run and
+// turn out not to have been live-rendered once the event drain finished
+// (the skip set is final by then). Normally nothing is parked: the drain
+// processes each message's start event long before its record commits.
+func (c *cliApp) reconcileParked() {
+	c.liveMu.Lock()
+	parked := c.parked
+	c.parked = nil
+	c.liveMu.Unlock()
+	for _, record := range parked {
+		if !c.liveShownHas(record.ItemID) {
+			c.printer.line(formatRecord(record))
+		}
+	}
+}
+
 // printRecord renders one committed record. A user input opens a new run:
-// the blank line keeps runs visually separated.
+// the blank line keeps runs visually separated. An assistant message
+// rendered live by the event drain is skipped; one arriving mid-run
+// before its start event was processed is parked and decided at
+// reconcileParked.
 func (c *cliApp) printRecord(record storage.Record) {
+	if record.Type == storage.TypeAssistantMessage {
+		if c.liveShownHas(record.ItemID) {
+			return
+		}
+		if c.session.Running() {
+			c.liveMu.Lock()
+			c.parked = append(c.parked, record)
+			c.liveMu.Unlock()
+			return
+		}
+	}
 	if record.Type == storage.TypeUserInput {
 		c.printer.line("")
 	}

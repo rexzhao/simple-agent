@@ -4,11 +4,13 @@
 command-line interface. Type a message, the agent answers; it can read,
 and edit files in your project — all through its single tool: a Bash shell.
 
-While a run streams, a dot spinner shows progress; committed records
-render to stdout as human-readable blocks — a common header line (local
-time and record kind, e.g. `[10:06:21] assistant …`) followed by the
-content: message text, marked reasoning, tool calls and truncated tool
-output. Control messages go to stderr.
+While a run streams, the reply renders character by character as the model
+generates it (reasoning lines marked with `·`); a dot spinner marks only
+the quiet phases — waiting for the first token and running tools.
+Committed records render as human-readable blocks — a common header line
+(local time and record kind, e.g. `[10:06:21] tool shell · ok`) followed
+by the content; an assistant message already streamed live is not printed
+again. Control messages go to stderr.
 
 ## Storage model
 
