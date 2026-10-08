@@ -363,6 +363,13 @@ func (c *cliApp) send(text string) error {
 			if started, ok := event.(model.AssistantMessageStartedEvent); ok {
 				c.markLiveShown(started.ItemID)
 			}
+			// Budget notices are control messages, like every other
+			// 'sai:' notice: stderr, not the rendered record stream.
+			if pressure, ok := event.(model.ContextPressureEvent); ok {
+				fmt.Fprintf(os.Stderr, "sai: context exceeds the estimated budget (%d ≥ %d tokens); no compaction possible, sending anyway\n",
+					pressure.EstimatedTokens, pressure.HardInputLimit)
+				continue
+			}
 			live.handle(event)
 		}
 		live.settle()

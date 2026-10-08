@@ -1,7 +1,6 @@
 package main
 
 import (
-	"fmt"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -85,9 +84,6 @@ func (w *liveWriter) handle(event model.Event) {
 		w.headerPending = false
 		w.endMessage()
 		w.inMessage.Store(false)
-	case model.ContextPressureEvent:
-		w.printer.line(fmt.Sprintf("[warning] context exceeds the estimated budget (%d ≥ %d tokens); no compaction possible, sending anyway",
-			event.EstimatedTokens, event.HardInputLimit))
 	}
 }
 

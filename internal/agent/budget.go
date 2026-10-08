@@ -17,7 +17,7 @@ import (
 const (
 	requestOverheadTokens = 16
 	messageOverheadTokens = 8
-	estimatedImageTokens   = 1_000
+	estimatedImageTokens  = 1_000
 
 	// Budget derivation bounds (matching the previous stack).
 	contextSafetyPercent = 2
@@ -116,6 +116,12 @@ func resolveContextBudget(contextWindow, maxOutputTokens int) contextBudget {
 		capacity = contextWindow - contextWindow/4
 	}
 	safety := clampInt((capacity*contextSafetyPercent+99)/100, contextSafetyMin, contextSafetyMax)
+	// A tiny capacity must not be eaten entirely by the safety floor:
+	// cap it at half the capacity so a budget never collapses to zero
+	// (a zero budget would silently disable auto-compaction).
+	if safety > capacity/2 {
+		safety = capacity / 2
+	}
 	hard := capacity - safety
 	if hard <= 0 {
 		return contextBudget{}

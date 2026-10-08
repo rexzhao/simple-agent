@@ -459,9 +459,9 @@ func (s *Session) compactContext(ctx context.Context, itemID string, pressure co
 		s.mu.Unlock()
 	}()
 
-	summary, err := s.agent.summarizeContext(ctx, request, func(retryErr error, attempt int, delay time.Duration) {
+	summary, err := s.agent.summarizeContext(ctx, request, func(retryErr error, attempt, maxAttempts int, delay time.Duration) {
 		sendEvent(ctx, events, model.ProviderRetryEvent{
-			Attempt: attempt + 1, MaxAttempts: 5, Delay: delay, Reason: model.RetryReason(retryErr),
+			Attempt: attempt + 1, MaxAttempts: maxAttempts, Delay: delay, Reason: model.RetryReason(retryErr),
 		})
 	})
 	if err != nil {

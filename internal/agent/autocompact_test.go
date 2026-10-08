@@ -70,6 +70,13 @@ func TestResolveContextBudget(t *testing.T) {
 	if oversized.HardInputLimit <= 0 || oversized.SoftInputLimit <= 0 {
 		t.Fatalf("oversized-output budget degenerate: %+v", oversized)
 	}
+	// Windows smaller than the safety floor must not collapse to a zero
+	// budget either: the safety margin yields to half the capacity.
+	for _, window := range []int{200, 400, 600} {
+		if budget := resolveContextBudget(window, 0); budget.HardInputLimit <= 0 {
+			t.Fatalf("window %d budget degenerate: %+v", window, budget)
+		}
+	}
 }
 
 func TestCompactionReclaimsEnough(t *testing.T) {
@@ -311,7 +318,6 @@ func TestSummarizeContextRetriesTransientFailures(t *testing.T) {
 		t.Fatalf("compactions = %d, want 1 after retry", got)
 	}
 }
-
 
 func TestAutoCompactTriggersMidTurnAfterToolBatch(t *testing.T) {
 	provider := &fakeProvider{turns: [][]model.Event{

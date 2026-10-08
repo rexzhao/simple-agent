@@ -242,7 +242,7 @@ func (a *Agent) buildCompactionRequest(context []model.Message) model.Request {
 // provider failures with the same backoff as a normal turn: an automatic
 // compaction must not die to one hiccup while the context is already
 // large. onRetry (optional) is notified before each backoff wait.
-func (a *Agent) summarizeContext(ctx context.Context, request model.Request, onRetry func(err error, attempt int, delay time.Duration)) (string, error) {
+func (a *Agent) summarizeContext(ctx context.Context, request model.Request, onRetry func(err error, attempt, maxAttempts int, delay time.Duration)) (string, error) {
 	const maxAttempts = 5
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		summary, retryable, err := a.summarizeOnce(ctx, request)
@@ -254,7 +254,7 @@ func (a *Agent) summarizeContext(ctx context.Context, request model.Request, onR
 		}
 		delay := providerRetryBackoff(attempt)
 		if onRetry != nil {
-			onRetry(err, attempt, delay)
+			onRetry(err, attempt, maxAttempts, delay)
 		}
 		if err := waitForProviderRetry(ctx, delay); err != nil {
 			return "", err

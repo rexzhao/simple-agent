@@ -418,7 +418,6 @@ models:
 	assertErrorContains(t, err, "request_timeout must be a positive duration")
 }
 
-
 func TestLoadRejectsInvalidProviderProxyURLs(t *testing.T) {
 	tests := []struct {
 		name  string
